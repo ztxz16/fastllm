@@ -330,7 +330,9 @@ int main(int argc, char **argv) {
                         return FastllmCudaMergeMOEGGUFHost(gpuInput, gate, workspace, gpuOutput,
                             weights.data(), experts, ids.data(), scores.data(), topk, selected, true, v4, 10.f, block);
                     };
-                    if (launch(false) || launch(true, 128) || gpuOutput.cudaData)
+                    // Block 128 is now supported by the separate GLM path.
+                    // Keep testing an unsupported activation mode here.
+                    if (launch(false) || launch(true, 64) || gpuOutput.cudaData)
                         throw std::runtime_error("unsupported grouped math changed output");
                     for (int rejected : {32, 4097}) {
                         gpuInput.Resize({rejected, hidden});

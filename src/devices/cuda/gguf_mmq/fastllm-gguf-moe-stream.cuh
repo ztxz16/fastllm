@@ -14,7 +14,8 @@ size_t StreamedMoeWorkspaceBytes(int rows, int hidden, int inter, int topk, int 
 bool RunStreamedMoe(StreamedMoePhase phase, const fastllm::Data &input,
     fastllm::Data &gate, fastllm::Data &output, void *workspace, int capacity,
     int hidden, int inter, int topk, int gateType, int downType,
-    const StreamedMoeBatch &batch, const float *scores);
+    const StreamedMoeBatch &batch, const float *scores, bool glm5 = false,
+    float swigluLimit = 0.0f, const int32_t *indices = nullptr);
 
 // Streamed experts can upload down weights while gate/up is computing.
 // A null event means all weights are already ready on the calling stream.

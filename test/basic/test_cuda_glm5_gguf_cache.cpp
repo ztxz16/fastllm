@@ -351,6 +351,72 @@ static void CheckExpertCache(std::vector<Data *> *weights, int tables, int hidde
         "PASS: GLM GGUF EP cache, whole experts, modulo ownership, frequency, replacement, rows 1-9, bitwise all-hit");
 }
 
+static void CheckHostPrefill(std::vector<Data *> *tables, int count, int hidden, bool noCache) {
+    constexpr int topk=6;
+    const int experts=(tables[0].size()-2)/2;
+    float worst=0;
+    Cuda(cudaSetDevice(0));
+    for (int rows : {33,65,129,257,1025,4096}) for (int t=0;t<count;++t) {
+        if (tables[t][3]->ggmlType==GGML_TYPE_IQ4_XS) continue;
+        Data x(BFLOAT16,{rows,hidden}),ids(INT32,{rows,topk}),scores(FLOAT32,{rows,topk}),reference;
+        x.Allocate();ids.Allocate();scores.Allocate();
+        for (int i=0;i<rows*hidden;++i) reinterpret_cast<uint16_t *>(x.cpuData)[i]=
+            Float32ToBFloat16RNEBits(i/hidden%5==0 ? 0.f : float((i*17)%73-36)/23.f);
+        std::unordered_set<int> selected;
+        for (int row=0;row<rows;++row) for (int k=0;k<topk;++k) {
+            const int e=(row+7*(k==3 ? 2 : k))%experts;
+            reinterpret_cast<int *>(ids.cpuData)[row*topk+k]=e;
+            reinterpret_cast<float *>(scores.cpuData)[row*topk+k]=k==0 ? 0.f : k==1 ? -.125f : .3125f;
+            selected.insert(e+1);
+        }
+        // Include a GPU subset with missing routes. The CPU oracle zeros only
+        // those scores; its arithmetic and routing remain independent.
+        Data oracleScores; oracleScores.CopyFrom(scores);
+        if (rows==65) {
+            for (int e=1;e<=experts;++e) if (e%4==0) selected.erase(e);
+            for (int i=0;i<rows*topk;++i)
+                if (!selected.count(reinterpret_cast<int *>(ids.cpuData)[i]+1))
+                    reinterpret_cast<float *>(oracleScores.cpuData)[i]=0;
+        }
+        // CPU-only input gives an independent NUMA arithmetic oracle.
+        OrdinaryNumas(x,ids,oracleScores,reference,tables[t],t);
+        reference.ToDevice(CPU);
+        std::vector<float> expected(rows*hidden);
+        for (size_t i=0;i<expected.size();++i)
+            expected[i]=BFloat16BitsToFloat32(reinterpret_cast<uint16_t *>(reference.cpuData)[i]);
+        x.ToDevice(CUDA,std::vector<int>{0});
+        Data activation,workspace,output(BFLOAT16,{rows,hidden});
+        output.ToDevice(CUDA,std::vector<int>{0});output.Allocate(false);
+        std::vector<uint16_t> first;
+        for (int pass=0;pass<2;++pass) {
+            Require(FastllmCudaMergeMOEGGUFHost(x,activation,workspace,output,tables[t].data(),experts,
+                reinterpret_cast<int32_t *>(ids.cpuData),reinterpret_cast<float *>(scores.cpuData),
+                topk,selected,true,true,.125f,128),"GLM host prefill did not select grouped MMQ");
+            std::vector<uint16_t> bits(rows*hidden);
+            Cuda(cudaMemcpy(bits.data(),output.cudaData,bits.size()*2,cudaMemcpyDeviceToHost));
+            std::vector<float> actual(bits.size());
+            for (size_t i=0;i<bits.size();++i) actual[i]=BFloat16BitsToFloat32(bits[i]);
+            worst=std::max(worst,Compare(actual,expected,"GLM streamed MMQ vs NUMA"));
+            if (!pass) first=bits;
+            else Require(bits==first,"GLM cached prefill changed streamed MMQ arithmetic");
+            FastllmCudaMoePrefillResidents view;
+            if (noCache) {
+                uint64_t stats[5]{};
+                Require(fastllm_moe_cuda_cache_stats(0,stats,false) && stats[2]==0 && stats[3]==0,
+                    "zero-cache prefill allocated resident payload");
+            } else {
+                Require(FastllmCudaGetMoePrefillResidents(tables[t].data(),experts,view,false) && !view.nativeGlm,
+                    "single-GPU canonical prefill cache unavailable");
+                int resident=0;
+                for (int e:selected) resident+=view.weights[2*(e-1)]!=nullptr;
+                Require(resident==int(selected.size()),"single-GPU prefill failed to fill selected experts");
+            }
+        }
+    }
+    std::printf("PASS: GLM GGUF streamed prefill, single GPU, cache=%d, >3 expert batches, rows 33/65/129/257/1025/4096; max relative L2 %.8f\n",
+        !noCache,worst);
+}
+
 static void CheckExpertPrefill(std::vector<Data *> *tables, int count, int hidden, bool numa=false) {
     constexpr int topk=6;
     const int experts=(tables[0].size()-2)/2;
@@ -458,6 +524,7 @@ static void CheckExpertPrefill(std::vector<Data *> *tables, int count, int hidde
 int main(int argc, char **argv) {
     try {
         const std::string option=argc>1 ? argv[1] : "";
+        const bool hostPrefill=option=="--host-prefill" || option=="--host-prefill-no-cache";
         const bool numaPrefill=option=="--ep-numa-prefill";
         const bool expertPrefill=numaPrefill || option=="--ep-prefill";
         const bool expertCache=expertPrefill || option=="--ep-cache";
@@ -467,13 +534,15 @@ int main(int argc, char **argv) {
         else if(option=="--verify-no-cache") cacheMode=ExpertCacheTestMode::VerifyNoCache;
         else if(option=="--verify-full-cache") cacheMode=ExpertCacheTestMode::VerifyFullCache;
         const bool verify=cacheMode!=ExpertCacheTestMode::Parallel;
-        const bool noCache=option=="--no-cache" || cacheMode==ExpertCacheTestMode::VerifyNoCache;
+        const bool noCache=option=="--no-cache" || option=="--host-prefill-no-cache" ||
+            cacheMode==ExpertCacheTestMode::VerifyNoCache;
         const bool frequency=noCache || option=="--frequency";
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices || (expertCache && devices<2)) {
             std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: CUDA unavailable"); return 0;
         }
-        constexpr int hidden=512, experts=24, topk=6, tables=8;
+        constexpr int hidden=512, topk=6, tables=8;
+        const int experts=hostPrefill ? 56 : 24;
         const int inter=resident ? 512 : 256;
         SetThreads(8);
         // Exercise both prefill GPU workers without relying on timing-based
@@ -527,6 +596,7 @@ int main(int argc, char **argv) {
         int cacheSlots=tables*(frequency ? 16 : 4);
         if(verify) cacheSlots=tables*8;
         if(cacheMode==ExpertCacheTestMode::VerifyFullCache) cacheSlots=tables*experts;
+        if(hostPrefill) cacheSlots=tables*experts;
         SetMoeCudaCacheBytes(noCache ? 0 : stride*cacheSlots);
         if (resident) {
             for (int t=0;t<tables;++t) for (size_t i=2;i<weights[t].size();++i) {
@@ -571,6 +641,11 @@ int main(int argc, char **argv) {
                 CheckVerifyCpu(weights[t],hidden,t);
             }
             std::puts("PASS: GLM direct NUMA layout and scored CPU verify rows 1/2/3/4/7/9/17");
+        }
+        if(hostPrefill) {
+            CheckHostPrefill(weights,tables,hidden,noCache);
+            FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size());
+            ClearNumasMoeRuntimeCache();return 0;
         }
         if(expertCache || verify) {
             if(expertPrefill) CheckExpertPrefill(weights,tables,hidden,numaPrefill);

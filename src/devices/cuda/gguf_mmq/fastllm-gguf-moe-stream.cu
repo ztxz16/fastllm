@@ -1,5 +1,6 @@
 #include "fastllm-gguf-mmq-common.cuh"
 #include "fastllm-gguf-moe-stream.cuh"
+#include "fastllm-gguf-moe-glm5.h"
 #include "../moe/fastllm-moe-gguf-common.cuh"
 #include "../moe/fastllm-moe-gguf-restore.cuh"
 
@@ -15,7 +16,7 @@ struct WeightCopy {
 static int Ordinary(int type) {
     type = fastllm_gguf_restore::Ordinary(type);
     switch (type) {
-        case GGML_TYPE_Q2_K: case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ1_M: case GGML_TYPE_Q2_0:
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
@@ -105,17 +106,18 @@ static Pipeline &GetPipeline(int device) {
 static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
         fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
         int expertCount, const int32_t *indices, const float *scores, int topk,
-        const std::unordered_set<int> &experts, bool cross, int gt, int dt, int inter) {
+        const std::unordered_set<int> &experts, bool cross, int gt, int dt, int inter,
+        bool glm5, float swigluLimit) {
     using namespace fastllm_gguf_mmq;
     using fastllm_gguf_moe::AllocateTensor;
     const int device = FastllmCudaGetDevice(), rows = input.dims[0], hidden = input.dims[1];
     auto &pipeline = GetPipeline(device);
     std::lock_guard<std::mutex> lock(pipeline.mutex);
     FastllmCudaMoePrefillResidents resident;
-    FastllmCudaGetMoePrefillResidents(weights, expertCount, resident);
+    FastllmCudaGetMoePrefillResidents(weights, expertCount, resident, glm5);
     // Generic probes can share a GLM weight table, but this pipeline restores
     // canonical records. Never read or publish those in a native NUMA cache.
-    if (resident.nativeGlm) return false;
+    if (resident.nativeGlm && !glm5) return false;
     std::vector<std::vector<int>> routes(expertCount);
     for (int r = 0; r < rows * topk; ++r) {
         const int e = indices[r];
@@ -162,10 +164,14 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     const size_t gateWeightBytes = Align(gu->GetBytes());
     const size_t stride = gateWeightBytes + Align(down->GetBytes());
     const bool misses = std::any_of(order.begin(), order.end(), [&](int e) { return !cached(e); });
-    const size_t ringBytes = misses ? Pipeline::groups * Pipeline::experts * stride : 0;
+    // Native EP residents remain R4 in cache. Restore their bounded working
+    // group on the GPU, just as for misses, without changing cache ownership.
+    const size_t ringBytes = misses || resident.nativeGlm
+        ? Pipeline::groups * Pipeline::experts * stride : 0;
     const size_t rawOffset = 0, canonicalOffset = ringBytes, metaOffset = 2 * ringBytes;
     const size_t descOffset = reserve(2 * order.size() * sizeof(WeightCopy));
     const size_t scoreOffset = reserve(size_t(rows) * topk * sizeof(float));
+    const size_t indexOffset = reserve(glm5 ? size_t(rows) * topk * sizeof(int32_t) : 0);
     const size_t computeOffset = metaOffset + metaBytes;
     const size_t bytes = Align(computeOffset + StreamedMoeWorkspaceBytes(rows, hidden, inter, topk, capacity));
     const size_t gateBytes = size_t(rows) * topk * inter * (input.dataType == fastllm::FLOAT32 ? 4 : 2);
@@ -212,15 +218,23 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
             const int e = batch.experts[j];
             for (int part = 0; part < 2; ++part) {
                 const auto &w = *weights[2 * (e + 1) + part];
-                if (cached(e)) { pointers.push_back(resident.weights[2 * e + part]); continue; }
+                const bool hit = cached(e);
+                if (hit && !resident.nativeGlm) { pointers.push_back(resident.weights[2 * e + part]); continue; }
                 const size_t offset = ((g % Pipeline::groups) * Pipeline::experts + j) * stride +
                     (part ? gateWeightBytes : 0);
-                auto *destination = 2 * e + part < int(admission.weights.size()) && admission.weights[2 * e + part]
-                    ? static_cast<uint8_t *>(admission.weights[2 * e + part]) : base + canonicalOffset + offset;
-                pointers.push_back(destination);
+                auto *admitted = 2 * e + part < int(admission.weights.size())
+                    ? static_cast<uint8_t *>(admission.weights[2 * e + part]) : nullptr;
                 const bool restore = (cross && part == 0) || Ordinary(w.ggmlType) != w.ggmlType;
+                auto *destination = !resident.nativeGlm && admitted
+                    ? admitted : base + canonicalOffset + offset;
                 auto *target = restore ? base + rawOffset + offset : destination;
-                uploads[g].push_back({&w, target});
+                if (resident.nativeGlm) {
+                    target = hit ? const_cast<uint8_t *>(static_cast<const uint8_t *>(resident.weights[2 * e + part]))
+                                 : admitted ? admitted : base + rawOffset + offset;
+                    if (!restore) destination = target;
+                }
+                pointers.push_back(destination);
+                if (!hit) uploads[g].push_back({&w, target});
                 if (restore) copies.push_back({target, destination, w.ggmlType, w.dims[0], w.dims[1],
                     int(cross && part == 0), int(ggml_blck_size((ggml_type)Ordinary(w.ggmlType))),
                     int(ggml_type_size((ggml_type)Ordinary(w.ggmlType)))});
@@ -235,6 +249,7 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     }
     if (!copies.empty()) put(descOffset, copies.data(), copies.size() * sizeof(WeightCopy));
     put(scoreOffset, scores, size_t(rows) * topk * sizeof(float));
+    if (glm5) put(indexOffset, indices, size_t(rows) * topk * sizeof(int32_t));
     const auto stream = cudaStreamPerThread;
     CUDA_CHECK(cudaMemcpyAsync(base + metaOffset, metadata.data(), metaBytes, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaEventRecord(pipeline.metadata, stream));
@@ -242,7 +257,9 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     auto run = [&](StreamedMoePhase phase, const StreamedMoeBatch &batch) {
         fastllm::AssertInFastLLM(RunStreamedMoe(phase, input, gate, output, base + computeOffset,
             capacity, hidden, inter, topk, gt, dt, batch,
-            reinterpret_cast<const float *>(base + metaOffset + scoreOffset)), "Streamed GGUF prefill failed.");
+            reinterpret_cast<const float *>(base + metaOffset + scoreOffset), glm5, swigluLimit,
+            glm5 ? reinterpret_cast<const int32_t *>(base + metaOffset + indexOffset) : nullptr),
+            "Streamed GGUF prefill failed.");
     };
     run(StreamedMoePhase::Prepare, {});
     const int maxBlocks = std::max(gu->dims[0] * (hidden / int(ggml_blck_size((ggml_type)gt))),
@@ -288,9 +305,9 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
         expertCount <= 0 || expertCount > 1024 || experts.empty() || experts.count(0) ||
         input.dataDevice != fastllm::CUDA || !input.cudaData ||
         !fastllm_gguf_moe::IsActivationType(input.dataType)) return false;
-    // V4.1's FP8 block-32 and BF16 boundaries are implemented for the
-    // Q2_K gate / Q4_K down pair. V4 block-128 retains its existing fallback.
-    if (deepSeekV4Mode && (activationQuantBlock != 32 ||
+    const bool glm5 = deepSeekV4Mode && activationQuantBlock == 128;
+    // GLM keeps positive Q8_K scales without V4.1's FP8 block-32 conversion.
+    if (deepSeekV4Mode && ((activationQuantBlock != 32 && !glm5) ||
         input.dataType != fastllm::BFLOAT16)) return false;
     const int device = FastllmCudaGetDevice(), rows = input.dims[0], hidden = input.dims[1];
     cudaStreamCaptureStatus capture;
@@ -326,7 +343,7 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
                     [](const uint8_t *p) { return p == nullptr; })))) return false;
             // Ordinary GGUF builds only its small streamed batches below.
             // These full-subset descriptors belong to the V4.1 path.
-            if (!deepSeekV4Mode) continue;
+            if (!deepSeekV4Mode || glm5) continue;
             const bool restore = (crossSwiglu && part == 0) || Ordinary(w->ggmlType) != w->ggmlType;
             const size_t weightBytes = Align(w->GetBytes());
             const int slot = 2*(e-1)+part;
@@ -341,11 +358,12 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     // prefill, the existing per-expert GEMM reuses these weights much better.
     // Keep that implementation until a matrix IQ1_M gate kernel is available.
     if (gt == GGML_TYPE_IQ1_M) return false;
-    const size_t mmqBytes = FastllmCudaMoeGGUFGroupedWorkspaceBytes(
+    const size_t mmqBytes = glm5 ? fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(
+        gt, dt, rows, hidden, inter, expertCount, topk) : FastllmCudaMoeGGUFGroupedWorkspaceBytes(
         gt, dt, rows, hidden, inter, expertCount, topk, deepSeekV4Mode);
     if (!mmqBytes) return false;
-    if (!deepSeekV4Mode) return RunPipelined(input, gate, workspace, output, weights,
-        expertCount, indices, scores, topk, experts, crossSwiglu, gt, dt, inter);
+    if (!deepSeekV4Mode || glm5) return RunPipelined(input, gate, workspace, output, weights,
+        expertCount, indices, scores, topk, experts, crossSwiglu, gt, dt, inter, glm5, swigluLimit);
     // Two bounded upload slots: gate and down restore on separate streams.
     // Canonical weights and routing live through both projections.
     // Never alias in-flight DMA with MMQ scratch.

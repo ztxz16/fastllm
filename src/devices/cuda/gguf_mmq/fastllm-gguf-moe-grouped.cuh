@@ -351,7 +351,11 @@ struct StreamedWorkspace {
             void *p = base ? static_cast<char *>(base) + used : nullptr;
             used += Align(n); return p;
         };
-        input = static_cast<block_q8_1 *>(take(size_t(rows) * (hidden / 32) * sizeof(block_q8_1)));
+        // GLM uses Q8_K with FP32 scale and 16-value sums; it is slightly
+        // larger than eight ordinary Q8_1 blocks. Reuse the same allocation.
+        input = static_cast<block_q8_1 *>(take(std::max(
+            size_t(rows) * (hidden / 32) * sizeof(block_q8_1),
+            size_t(rows) * (hidden / 256) * sizeof(block_q8_K))));
         quantized = static_cast<block_q8_1_mmq *>(take(size_t(capacity) *
             (((std::max(hidden, inter) + 255) / 256) * 2) * sizeof(block_q8_1_mmq)));
         products = static_cast<float *>(take(size_t(capacity) * std::max(2 * inter, hidden) * sizeof(float)));
@@ -409,10 +413,17 @@ __global__ void ReduceStreamed(const float *products, T *output,
     output[i] = mmq_io<T>::from_float(sum);
 }
 
+#include "fastllm-gguf-moe-glm5-stream.cuh"
+
 template<class T>
 static bool RunStreamed(StreamedMoePhase phase, const T *input, T *gate, T *output,
         void *workspace, int capacity, int rows, int hidden, int inter, int topk,
-        int gt, int dt, const StreamedMoeBatch &batch, const float *scores) {
+        int gt, int dt, const StreamedMoeBatch &batch, const float *scores,
+        bool glm5, float swigluLimit, const int32_t *indices) {
+    if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+        if (glm5) return RunGlm5Streamed(phase, input, gate, output, workspace,
+            capacity, rows, hidden, inter, topk, gt, dt, batch, scores, indices, swigluLimit);
+    }
     const auto stream = cudaStreamPerThread;
     StreamedWorkspace s(workspace, rows, hidden, inter, topk, capacity);
     if (phase == StreamedMoePhase::Prepare) {

@@ -52,6 +52,9 @@
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
+#ifndef USE_ROCM
+#include "../cuda/gguf_mmq/fastllm-gguf-moe-glm5.h"
+#endif
 #endif
 
 namespace fastllm {
@@ -322,7 +325,7 @@ namespace fastllm {
         bool pinnedWeight;
     };
 
-    // 普通 GGUF 和 GLM 紧凑 NVFP4 prefill 默认使用实测反馈。
+    // 普通 GGUF 和 GLM GGUF/紧凑 NVFP4 prefill 默认使用实测反馈。
     // 以下开关为其他格式启用相同策略。
     //   FT_MOE_ASSIST_BALANCE=1  按各卡实测的每专家耗时分配 GPU 专家，而不是
     //                            固定按 route 数均分。
@@ -4276,7 +4279,7 @@ namespace fastllm {
                 return false;
             }
             // DATA_GGUF_FORMAT alone does not establish CUDA support: some
-            // NUMA R4 layouts have no GPU dequantizer (for example Q3_K_R4).
+            // NUMA R4 layouts must also have a matching GPU dequantizer.
             // Retain these experts on NUMA instead of failing after upload.
             if (weightType == DataType::DATA_GGUF_FORMAT) {
                 auto type = static_cast<ggml_type>(weights[i]->ggmlType);
@@ -9487,9 +9490,19 @@ namespace fastllm {
                          weights[2]->dataType == DATA_GGUF_FORMAT);
                     if (!FastllmCudaGetMoePrefillResidents(weights, m, view,
                             nativeGlm && (i == 0 || weights[2]->dataType == DATA_GGUF_FORMAT))) continue;
-                    if (!view.nativeGlm && (view.weightType == DATA_GGUF_FORMAT ?
-                        !FastllmCudaMoeGGUFGroupedWorkspaceBytes(view.gateType, view.downType,
-                            bs, view.hidden, view.inter, m, topk) : !nativeGlm)) continue;
+                    if (!view.nativeGlm) {
+                        size_t groupedBytes = 0;
+                        if (view.weightType == DATA_GGUF_FORMAT) {
+#ifndef USE_ROCM
+                            if (nativeGlm) groupedBytes = fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(
+                                view.gateType, view.downType, bs, view.hidden, view.inter, m, topk);
+                            else
+#endif
+                            groupedBytes = FastllmCudaMoeGGUFGroupedWorkspaceBytes(view.gateType,
+                                view.downType, bs, view.hidden, view.inter, m, topk);
+                        }
+                        if (view.weightType == DATA_GGUF_FORMAT ? !groupedBytes : !nativeGlm) continue;
+                    }
                     cacheOwnerRanks[i] = view.ownerRank;
                     cacheOwnerCounts[i] = view.ownerCount;
                     for (int e = 1; e <= m; ++e) {
@@ -9510,7 +9523,8 @@ namespace fastllm {
                 weights[2]->dataType == FP8_E4M3_BLOCK_128 ||
                 weights[2]->dataType == FP8_E4M3_PERCHANNEL);
             const bool measuredPrefill = measuredNativePrefill || (weights[2] && weights[3] &&
-                ((!deepSeekV4Mode && weights[2]->dataType == DATA_GGUF_FORMAT) ||
+                (((!deepSeekV4Mode || activationQuantBlock == 128) &&
+                  weights[2]->dataType == DATA_GGUF_FORMAT) ||
                  (deepSeekV4Mode && activationQuantBlock == 128 &&
                   weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED &&
                   weights[3]->dataType == NVFP4_BLOCK_16_E4M3_PACKED)));

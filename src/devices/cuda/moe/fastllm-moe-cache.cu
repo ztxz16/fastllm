@@ -2136,7 +2136,7 @@ bool FastllmCudaGetMoePrefillResidents(fastllm::Data **weights, int experts,
     }
     const auto &layout = group->LayerLayout(table);
     const bool supported = (layout.weightType == fastllm::DATA_GGUF_FORMAT &&
-        !layout.deepSeekV41 && !layout.glm5) || (layout.glm5 && NativeSharedRecords(*group)) ||
+        !layout.deepSeekV41) || (layout.glm5 && NativeSharedRecords(*group)) ||
         NativeGlmGGUFRecords(*group);
     if (!supported || experts > layout.experts) return false;
     if (create && !GetDeviceCache(*group)) return false;
@@ -2663,8 +2663,9 @@ void FastllmCudaPlanMoePrefill(fastllm::Data **weights, int experts,
         group = it->second.group; table = it->second.layer;
     }
     const auto &layout = group->LayerLayout(table);
-    const bool supported = ((layout.weightType == fastllm::DATA_GGUF_FORMAT || group->sharedLayout.shards) &&
-        !layout.deepSeekV41 && !layout.glm5) || (layout.glm5 && NativeSharedRecords(*group)) ||
+    const bool supported = (layout.weightType == fastllm::DATA_GGUF_FORMAT && !layout.deepSeekV41) ||
+        (group->sharedLayout.shards && !layout.deepSeekV41 && !layout.glm5) ||
+        (layout.glm5 && NativeSharedRecords(*group)) ||
         NativeGlmGGUFRecords(*group);
     if (!supported || experts > layout.experts) return;
     std::lock_guard<std::mutex> lock(group->mutex);

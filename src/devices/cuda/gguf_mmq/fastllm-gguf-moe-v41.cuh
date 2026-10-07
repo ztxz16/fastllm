@@ -66,7 +66,8 @@ __global__ void ReduceV41(const float *products, __nv_bfloat16 *output,
     }
     float sum = 0;
     for (int k = 0; k < topk; ++k) {
-        const int group = routeGroups[base+order[k]];
+        const int route = base+order[k];
+        const int group = routeGroups ? routeGroups[route] : route;
         if (group >= 0) sum = __fadd_rn(sum, __bfloat162float(__float2bfloat16_rn(
             products[size_t(group)*hidden+i%hidden])));
     }

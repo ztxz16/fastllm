@@ -110,12 +110,14 @@ size_t fastllm_gguf_mmq::StreamedMoeWorkspaceBytes(int rows, int hidden, int int
 bool fastllm_gguf_mmq::RunStreamedMoe(StreamedMoePhase phase, const fastllm::Data &input,
         fastllm::Data &gate, fastllm::Data &output, void *workspace, int capacity,
         int hidden, int inter, int topk, int gateType, int downType,
-        const StreamedMoeBatch &batch, const float *scores) {
+        const StreamedMoeBatch &batch, const float *scores, bool glm5,
+        float swigluLimit, const int32_t *indices) {
+    if (glm5 && (input.dataType != fastllm::BFLOAT16 || !indices)) return false;
     switch (input.dataType) {
 #define STREAMED_RUN(DType, T) case fastllm::DType: return grouped_moe::RunStreamed( \
         phase, static_cast<const T *>(input.cudaData), static_cast<T *>(gate.cudaData), \
         static_cast<T *>(output.cudaData), workspace, capacity, input.dims[0], hidden, inter, topk, \
-        gateType, downType, batch, scores);
+        gateType, downType, batch, scores, glm5, swigluLimit, indices);
         STREAMED_RUN(FLOAT32, float)
         STREAMED_RUN(FLOAT16, half)
         STREAMED_RUN(BFLOAT16, __nv_bfloat16)
