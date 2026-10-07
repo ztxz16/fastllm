@@ -1024,3 +1024,20 @@ Temporary upload/workspace buffers still use VRAM, but have zero persistent
 expert slots and perform no cache admission. Supported GGUF layouts borrow
 the registered NUMA weight shards; any required GPU layout restoration uses
 bounded staging storage rather than a full host snapshot.
+
+GLM GGUF NUMA hybrid inference with multiple TP devices also shards cached
+experts across those devices for IQ2_XXS/IQ2_S gate/up and IQ3_XXS/IQ4_XS down.
+One frequency policy owns the logical slots and updates every shard together.
+The smallest available per-device budget determines the common slot count;
+the aggregate payload holds distinct portions of each expert. Both projections
+split output rows, exchanging BF16 activations between them, so each dot
+product retains its full reduction dimension and the existing rounding order.
+Pinned host buffers support devices without peer access. Cache misses retain
+the NUMA/multi-GPU dynamic dispatcher. Admission covers decode and small-batch
+verify (up to 9 rows); large prefill does not populate this TP cache yet.
+
+Logical route counters attribute each TP cache hit once to the coordinator.
+`fastllm_moe_cuda_cache_tp_stats(device, values)` separately reports the rank
+count, logical slots, occupied slots, this rank's payload bytes, computed hit
+routes and cumulative shard-upload bytes. The last two counters show physical
+work on every GPU; summing them across ranks is not a logical cache hit rate.

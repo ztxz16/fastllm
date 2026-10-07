@@ -3855,7 +3855,8 @@ namespace fastllm {
                     if (decodeCaches.states.count(device) == 0) {
                         FastllmCudaSetDevice(device);
                         if (void *state = FastllmCudaBeginMoeDecode(
-                                experts.data(), experts.size(), num_experts_per_tok)) {
+                                experts.data(), experts.size(), num_experts_per_tok,
+                                threadTpRank >= 0 ? &threadTpOwner->devices : nullptr)) {
                             decodeCaches.states.emplace(device, state);
                         }
                     }

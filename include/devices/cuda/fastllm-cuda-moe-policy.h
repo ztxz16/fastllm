@@ -9,6 +9,10 @@ namespace fastllm { class Data; }
 // keep their existing meaning. Begin/End bracket a complete sampled token.
 bool FastllmCudaUseMoeHybrid(fastllm::Data **weights, int weightsBatch);
 void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int topk);
+// A supported TP group shares one frequency policy and row-sharded experts.
+// Other formats and zero-cache configurations retain ordinary hybrid execution.
+void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int topk,
+                              const std::vector<int> *devices);
 void FastllmCudaEndMoeDecode(void *state);
 
 // The caller hands off these devices' compute streams before borrowing them.

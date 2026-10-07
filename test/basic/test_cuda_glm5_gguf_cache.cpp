@@ -179,13 +179,140 @@ static void CheckVerifyCpu(std::vector<Data *> &weights, int hidden, int layer) 
     }
 }
 
+static void CheckTensorCache(std::vector<Data *> *weights, int tables, int hidden, int inter) {
+    constexpr int topk=6;
+    const int experts=(weights[0].size()-2)/2;
+    const std::vector<int> devices{0,1};
+    std::vector<std::unique_ptr<Data>> records;
+    std::vector<size_t> strides, gateBytes;
+    for(int t=0;t<tables;++t) {
+        const size_t gate=weights[t][2]->GetBytes(), down=weights[t][3]->GetBytes(), stride=gate+down;
+        std::vector<uint8_t> packed(experts*stride);
+        for(int e=0;e<experts;++e) for(int part=0;part<2;++part) {
+            const auto &shards=weights[t][2+2*e+part]->numasData;
+            const size_t bytes=(part ? down : gate)/shards.size();
+            for(size_t n=0;n<shards.size();++n)
+                std::memcpy(packed.data()+e*stride+(part ? gate : 0)+n*bytes,shards[n],bytes);
+        }
+        auto data=std::make_unique<Data>(INT8,std::vector<int>{int(packed.size())},CPU,packed.data());
+        data->ToDevice(CUDA,std::vector<int>{0}); records.push_back(std::move(data));
+        strides.push_back(stride);gateBytes.push_back(gate);
+    }
+    bool allHit=false,mixed=false,evicted=false;
+    uint64_t previousUploads=0;
+    for(int step=0;step<96;++step) {
+        const int t=step%tables, rows=std::vector<int>{1,2,3,4,5,7,8,9}[(step/tables)%8];
+        const int origin=step%2, count=rows*topk, first=step<48 ? 0 : 12;
+        std::vector<uint16_t> x(rows*hidden);
+        std::vector<int32_t> ids(count);
+        std::vector<float> scores(count);
+        for(int i=0;i<rows*hidden;++i)x[i]=Float32ToBFloat16RNEBits((i/hidden)%3==1 ? 0.f : float((i*17)%67-33)/21.f);
+        for(int row=0;row<rows;++row)for(int k=0;k<topk;++k) {
+            ids[row*topk+k]=first+(k+row)%8;
+            scores[row*topk+k]=k==0 ? 0.f : k==1 ? -.125f : .3125f;
+        }
+        for(int row=0;row<rows;++row) ids[row*topk+2]=ids[row*topk+3];
+        // Same packed records and complete reduction dimension as the ordinary
+        // unsharded GPU adapter. All-hit TP output must be bitwise identical.
+        Cuda(cudaSetDevice(0));
+        Data rx(BFLOAT16,{rows,hidden},CPU,x.data()),ri(INT32,{count},CPU,ids.data()),
+             rs(FLOAT32,{count},CPU,scores.data()),scratch(FLOAT32,{rows*(hidden+topk*inter)}),
+             per(FLOAT32,{count,hidden}),activation;
+        rx.ToDevice(CUDA,std::vector<int>{0});
+        ri.ToDevice(CUDA,std::vector<int>{0});
+        rs.ToDevice(CUDA,std::vector<int>{0});
+        scratch.ToDevice(CUDA,std::vector<int>{0});scratch.Allocate(false);
+        per.ToDevice(CUDA,std::vector<int>{0});per.Allocate(false);
+        const int gate=weights[t][2]->ggmlType,down=weights[t][3]->ggmlType;
+        auto ordinary=[](int type) {
+            switch(type){case GGML_TYPE_IQ2_XXS_R4:return int(GGML_TYPE_IQ2_XXS);
+                case GGML_TYPE_IQ2_S_R4:return int(GGML_TYPE_IQ2_S);
+                case GGML_TYPE_IQ3_XXS_R4:return int(GGML_TYPE_IQ3_XXS);default:return type;}
+        };
+        FastllmCudaMoeGGUFCacheView v{static_cast<uint8_t *>(records[t]->cudaData),
+            static_cast<int32_t *>(ri.cudaData),strides[t],gateBytes[t],ordinary(gate),ordinary(down),
+            hidden,inter,scratch.cudaData,size_t(scratch.GetBytes())};
+        v.numaGateType=gate;v.numaDownType=down;
+        Require(FastllmCudaMoeGlm5GGUFCacheCompute(rx,activation,v,static_cast<float *>(rs.cudaData),topk,.125f,
+            static_cast<float *>(per.cudaData)),"TP oracle rejected");
+        per.ToDevice(CPU);std::vector<uint16_t> expected(rows*hidden);
+        for(int row=0;row<rows;++row) {
+            std::vector<int> order(topk);for(int k=0;k<topk;++k)order[k]=k;
+            std::stable_sort(order.begin(),order.end(),[&](int a,int b){return ids[row*topk+a]<ids[row*topk+b];});
+            for(int c=0;c<hidden;++c) {
+                float sum=0;for(int k:order)sum+=reinterpret_cast<float *>(per.cpuData)[(row*topk+k)*hidden+c];
+                expected[row*hidden+c]=Float32ToBFloat16RNEBits(sum);
+            }
+        }
+        Cuda(cudaSetDevice(origin));
+        Data input(BFLOAT16,{rows,hidden},CPU,x.data()),index(INT32,{rows,topk},CPU,ids.data()),
+             score(FLOAT32,{rows,topk},CPU,scores.data()),output;
+        input.ToDevice(CUDA,std::vector<int>{origin});
+        index.ToDevice(CUDA,std::vector<int>{origin});
+        score.ToDevice(CUDA,std::vector<int>{origin});
+        void *state=FastllmCudaBeginMoeDecode(weights[t].data(),weights[t].size(),topk,&devices);
+        Require(state!=nullptr,"TP cache scope unavailable");
+        uint64_t before[2][8]{},after[2][8]{},beforeCache[2][5]{};
+        for(int d=0;d<2;++d) {
+            Require(fastllm_moe_cuda_cache_route_stats(d,before[d]),"TP before routes");
+            Require(fastllm_moe_cuda_cache_stats(d,beforeCache[d],false),"TP before cache counters");
+        }
+        Cuda(cudaSetDevice(origin));int callbacks=0;
+        Require(FastllmCudaMergeMOEHybridOnDevices(input,index,score,output,weights[t].data(),weights[t].size(),
+            t,devices,[&]{++callbacks;Cuda(cudaSetDevice(1-origin));}),"TP cache dispatch rejected");
+        Require(callbacks==1 && FastllmCudaGetDevice()==origin,"TP callback or device restoration");
+        FastllmCudaEndMoeDecode(state);
+        uint64_t routes=0,hits=0,computed=0,queries=0,queryHits=0;
+        for(int d=0;d<2;++d) {
+            Require(fastllm_moe_cuda_cache_route_stats(d,after[d]),"TP after routes");
+            routes+=after[d][1]-before[d][1];hits+=after[d][2]-before[d][2];
+            computed+=after[d][4]-before[d][4]+after[d][5]-before[d][5];
+            uint64_t cache[5]{};
+            Require(fastllm_moe_cuda_cache_stats(d,cache,false),"TP cache counters");
+            queryHits+=cache[0]-beforeCache[d][0];
+            queries+=cache[0]-beforeCache[d][0]+cache[1]-beforeCache[d][1];
+        }
+        Require(routes==count && computed==count && hits<=routes,"TP duplicated or lost logical routes");
+        Require(queries==routes && queryHits==hits,"TP cache query counters lost shared hits");
+        output.ToDevice(CPU);
+        if(hits==routes) {
+            allHit=true;
+            Require(std::memcmp(output.cpuData,expected.data(),expected.size()*2)==0,"TP all-hit differs from unsharded GPU output");
+        } else {
+            mixed|=hits>0;
+            std::vector<float> a(expected.size()),b(expected.size());
+            for(size_t i=0;i<a.size();++i){a[i]=BFloat16BitsToFloat32(reinterpret_cast<uint16_t *>(output.cpuData)[i]);b[i]=BFloat16BitsToFloat32(expected[i]);}
+            Compare(a,b,"TP CPU/miss/cached mixture vs GPU oracle");
+        }
+        uint64_t stats[2][6]{};
+        for(int d=0;d<2;++d)Require(fastllm_moe_cuda_cache_tp_stats(d,stats[d]),"TP physical counters");
+        Require(stats[0][0]==2 && stats[1][0]==2 && stats[0][1]==stats[1][1] &&
+            stats[0][2]==stats[1][2] && stats[0][3]==stats[1][3] && stats[0][4]==stats[1][4],"TP cache ranks diverged");
+        Require(stats[0][1]<uint64_t(tables*experts),"TP eviction test unexpectedly fits all experts");
+        if(step==47) {
+            Require(stats[0][2]==stats[0][1],"TP replacement test did not fill the cache");
+            previousUploads=stats[0][5];
+        }
+        if(step==95)evicted=stats[0][5]>previousUploads && stats[0][4]>0;
+    }
+    Require(allHit && mixed && evicted,"TP test missed hits, mixed routes or replacement");
+    for(int d=0;d<2;++d) {
+        uint64_t cache[5]{};
+        Require(fastllm_moe_cuda_cache_stats(d,cache,true),"TP counter reset");
+        Require(fastllm_moe_cuda_cache_stats(d,cache,false) && cache[0]==0 && cache[1]==0 &&
+            cache[2]>0 && cache[3]>0,"TP reset changed capacity or left stale counts");
+    }
+    std::puts("PASS: GLM GGUF TP cache, both shards, shared frequency, replacement, rows 1/2/3/4/5/7/8/9, bitwise all-hit");
+}
+
 int main(int argc, char **argv) {
     try {
+        const bool tensorCache = argc > 1 && std::string(argv[1]) == "--tp-cache";
         const bool resident = argc > 1 && std::string(argv[1]) == "--resident";
         const bool noCache = argc > 1 && std::string(argv[1]) == "--no-cache";
         const bool frequency = noCache || (argc > 1 && std::string(argv[1]) == "--frequency");
         int devices = 0;
-        if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) {
+        if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices || (tensorCache && devices<2)) {
             std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: CUDA unavailable"); return 0;
         }
         constexpr int hidden=512, experts=24, topk=6, tables=4;
@@ -227,7 +354,7 @@ int main(int argc, char **argv) {
         stride=(stride+127)/128*128;
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");
-        SetMoeCudaCacheBytes(noCache ? 0 : stride*(frequency ? 64 : 16));
+        SetMoeCudaCacheBytes(noCache ? 0 : stride*(tensorCache ? 16 : frequency ? 64 : 16));
         if (resident) {
             for (int t=0;t<tables;++t) for (size_t i=2;i<weights[t].size();++i) {
                 auto &w = *weights[t][i];
@@ -271,6 +398,11 @@ int main(int argc, char **argv) {
                 CheckVerifyCpu(weights[t],hidden,t);
             }
             std::puts("PASS: GLM direct NUMA layout and scored CPU verify rows 1/2/3/4/7/9/17");
+        }
+        if(tensorCache) {
+            CheckTensorCache(weights,tables,hidden,inter);
+            FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size());
+            ClearNumasMoeRuntimeCache();return 0;
         }
         float worst=0;
         bool sawCpu=false, sawMixed=false, sawGpu=false, sawStaged=false;

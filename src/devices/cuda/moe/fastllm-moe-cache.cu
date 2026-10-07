@@ -355,6 +355,7 @@ struct DeviceCache {
 };
 
 struct Glm5MultiGpuHybrid;
+struct Glm5TensorCache;
 struct OffloadGroup {
     OffloadLayout layout;
     // GGUF layers keep their actual record size in host storage and share
@@ -376,6 +377,7 @@ struct OffloadGroup {
     std::vector<fastllm_gguf_restore::Record> ggufSources;
     std::unordered_map<int, std::unique_ptr<DeviceCache> > deviceCaches;
     std::shared_ptr<Glm5MultiGpuHybrid> cooperativeHybrid;
+    std::shared_ptr<Glm5TensorCache> tensorCache;
     std::mutex mutex;
 
     const OffloadLayout &LayerLayout(int tableId) const {
@@ -1072,7 +1074,9 @@ DeviceCache *GetDeviceCache(OffloadGroup &group) {
     }
     cache.attempted = true;
 
-    const uint64_t budgetBytes = DeviceCacheBudgetBytes(device);
+    // A TP cache owns the persistent payload. These ordinary per-device
+    // workspaces continue to serve dynamically uploaded, complete misses.
+    const uint64_t budgetBytes = group.tensorCache ? 0 : DeviceCacheBudgetBytes(device);
     // A zero per-device budget can still execute streamed decode misses. No
     // resident payload or slots are allocated; all route lookups miss.
     const bool streamOnly = budgetBytes == 0 && group.cpuDecodeReady &&
@@ -2142,6 +2146,7 @@ void FastllmCudaReleaseMoeCache(
     int originalDevice = -1;
     cudaGetDevice(&originalDevice);
     released->cooperativeHybrid.reset();
+    released->tensorCache.reset();
     for (auto &cache : released->deviceCaches) {
         PrintDeviceCacheStats(*cache.second, released->layout.weightType);
         ReleaseDeviceCache(*cache.second);
@@ -2367,12 +2372,13 @@ __global__ void LookupFrequencyRoutes(const int32_t *indices, const int32_t *key
 __global__ void TouchResidentRoutes(const int32_t *slots, const int32_t *routes,
         unsigned long long *lastUsed, unsigned long long *step,
         unsigned long long *hitCount, int hits, int rows, int topk,
-        unsigned long long *missCount = nullptr, int misses = 0) {
+        unsigned long long *missCount = nullptr, int misses = 0, int sharedHits = 0) {
     __shared__ unsigned long long base;
     if (threadIdx.x == 0) {
         base = *step;
         *step = base + rows;
-        *hitCount += hits;
+        // Shared TP hits have no slot in this device's ordinary cache.
+        *hitCount += hits + sharedHits;
         if (missCount) *missCount += misses;
     }
     __syncthreads();
@@ -3176,12 +3182,35 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
 #endif
 }
 
+#ifdef USE_NUMAS
+#include "fastllm-moe-glm5-tp-cache.cuh"
+#endif
+
 void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int topk) {
+    return FastllmCudaBeginMoeDecode(weights, weightsBatch, topk, nullptr);
+}
+
+void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int topk,
+                              const std::vector<int> *devices) {
     if (topk < 1 || topk > kMaxTopK) return nullptr;
     auto *group = FindHybridGroup(weights, weightsBatch);
     if (!group) return nullptr;
+#ifdef USE_NUMAS
+    const bool tensorCache = devices && devices->size() > 1 &&
+        PrepareGlm5TensorCache(*group, *devices);
+#endif
     auto *cache = GetDeviceCache(*group);
     if (!cache) return nullptr;
+#ifdef USE_NUMAS
+    if (tensorCache) {
+        // The shared policy owns admissions; a zero-slot device cache only
+        // supplies miss workspaces and must not track the same routes again.
+        group->tensorCache->Begin();
+        cache->frequencyGroup = group;
+        cache->frequencyActive = true;
+        return cache;
+    }
+#endif
     if ((group->layout.weightType == fastllm::DataType::DATA_GGUF_FORMAT ||
          (group->layout.glm5 && NativeSharedRecords(*group))) &&
         cache->slots < int(group->totalRecords)) {
@@ -3203,8 +3232,15 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
 void FastllmCudaEndMoeDecode(void *state) {
     if (!state) return;
     auto &cache = *static_cast<DeviceCache *>(state);
+    cache.frequencyActive = false;
+#ifdef USE_NUMAS
+    if (cache.frequencyGroup && cache.frequencyGroup->tensorCache &&
+        cache.frequencyGroup->tensorCache->active) {
+        cache.frequencyGroup->tensorCache->End();
+        return;
+    }
+#endif
     if (cache.frequency) {
-        cache.frequencyActive = false;
         const auto admissions = cache.frequency->EndStep();
         if (admissions.empty()) return;
         auto &group = *cache.frequencyGroup;
@@ -4171,6 +4207,12 @@ extern "C" bool fastllm_moe_cuda_cache_stats(int device, uint64_t *values, bool 
         values[0] += counts[0]; values[1] += counts[1];
         values[2] += cache.recordBytes;
         values[3] += cache.slots; values[4] += group->totalRecords;
+#ifdef USE_NUMAS
+        if (group->tensorCache) for (const auto &rank : group->tensorCache->ranks) if (rank->device == device) {
+            values[2] += group->tensorCache->plan.bytes;
+            values[3] += group->tensorCache->plan.offsets.size();
+        }
+#endif
         if (reset) {
             ok &= cudaMemset(cache.hitCount, 0, sizeof(counts[0])) == cudaSuccess;
             ok &= cudaMemset(cache.totalMissCount, 0, sizeof(counts[1])) == cudaSuccess;
@@ -4178,4 +4220,33 @@ extern "C" bool fastllm_moe_cuda_cache_stats(int device, uint64_t *values, bool 
     }
     ok &= cudaSetDevice(previous) == cudaSuccess;
     return ok;
+}
+
+extern "C" bool fastllm_moe_cuda_cache_tp_stats(int device, uint64_t *values) {
+    if (!values || device < 0) return false;
+    std::fill_n(values, 6, uint64_t(0));
+#ifdef USE_NUMAS
+    int previous = 0;
+    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(device) != cudaSuccess) return false;
+    bool ok = cudaDeviceSynchronize() == cudaSuccess;
+    std::lock_guard<std::mutex> guard(RegistryMutex());
+    for (const auto &group : Groups()) {
+        std::lock_guard<std::mutex> lock(group->mutex);
+        if (!group->tensorCache) continue;
+        const auto &cache = *group->tensorCache;
+        for (const auto &rank : cache.ranks) if (rank->device == device) {
+            values[0] = std::max(values[0], uint64_t(cache.ranks.size()));
+            values[1] += cache.plan.offsets.size();
+            for (size_t key = 0; key < group->totalRecords; ++key)
+                values[2] += cache.frequency->Slot(key) >= 0;
+            values[3] += cache.plan.bytes;
+            values[4] += rank->computedRoutes;
+            values[5] += rank->uploadedBytes;
+        }
+    }
+    ok &= cudaSetDevice(previous) == cudaSuccess;
+    return ok;
+#else
+    return true;
+#endif
 }

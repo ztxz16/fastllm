@@ -779,6 +779,56 @@ bool FastllmCudaMoeGlm5GGUFCacheCompute(const fastllm::Data &input, fastllm::Dat
         swigluLimit, perExpert, view.q8InputPrepared);
 }
 
+bool FastllmCudaMoeGlm5GGUFCacheGate(const fastllm::Data &input,
+        fastllm::Data &activation, const FastllmCudaMoeGGUFCacheView &view,
+        const float *scores, int topk, float limit) {
+    const int rows = input.dims.size() == 2 ? input.dims[0] : 0;
+    if (input.dataDevice != fastllm::CUDA || input.dataType != fastllm::BFLOAT16 ||
+        !input.cudaData || rows <= 0 || input.dims[1] != view.hidden ||
+        view.hidden % QK_K || view.inter <= 0 || topk < 1 || topk > 16 ||
+        !view.records || !view.routeSlots || !scores || !view.workspace ||
+        view.workspaceBytes < size_t(rows) * view.hidden * sizeof(float) ||
+        (view.gateType != GGML_TYPE_IQ2_XXS && view.gateType != GGML_TYPE_IQ2_S) ||
+        (view.numaGateType >= 0 && NumaOrdinary(view.numaGateType) != view.gateType)) return false;
+    const int routes = ActiveRoutes(view, rows * topk);
+    if (routes <= 0 || routes > rows * topk || routes > 65535) return false;
+    fastllm_gguf_moe::AllocateTensor(activation, fastllm::BFLOAT16,
+        {routes, view.inter}, FastllmCudaGetDevice());
+    auto *x = static_cast<float *>(view.workspace);
+    glm5_gguf_cache::Quantize<<<dim3(view.hidden / QK_K, rows), 256, 0, cudaStreamPerThread>>>(
+        static_cast<const __nv_bfloat16 *>(input.cudaData), x, view.hidden);
+    if (view.gateType == GGML_TYPE_IQ2_XXS)
+        glm5_gguf_cache::Gate<GGML_TYPE_IQ2_XXS><<<dim3(view.inter, routes), 128, 0, cudaStreamPerThread>>>(
+            x, static_cast<__nv_bfloat16 *>(activation.cudaData), view, scores, limit, topk);
+    else
+        glm5_gguf_cache::Gate<GGML_TYPE_IQ2_S><<<dim3(view.inter, routes), 128, 0, cudaStreamPerThread>>>(
+            x, static_cast<__nv_bfloat16 *>(activation.cudaData), view, scores, limit, topk);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaMoeGlm5GGUFCacheDown(const fastllm::Data &activation,
+        const FastllmCudaMoeGGUFCacheView &view, float *perExpert) {
+    const int routes = activation.dims.size() == 2 ? activation.dims[0] : 0;
+    if (activation.dataDevice != fastllm::CUDA || activation.dataType != fastllm::BFLOAT16 ||
+        !activation.cudaData || routes <= 0 || routes > 65535 || activation.dims[1] != view.inter ||
+        view.inter <= 0 || view.inter % QK_K || view.hidden <= 0 || view.routeMap ||
+        !view.records || !view.routeSlots || !perExpert ||
+        (view.downType != GGML_TYPE_IQ3_XXS && view.downType != GGML_TYPE_IQ4_XS) ||
+        (view.numaDownType >= 0 && NumaOrdinary(view.numaDownType) != view.downType)) return false;
+    if (view.downType == GGML_TYPE_IQ3_XXS) {
+        if (!view.workspace || view.workspaceBytes < size_t(routes) * view.inter * sizeof(float)) return false;
+        auto *x = static_cast<float *>(view.workspace);
+        glm5_gguf_cache::Quantize<<<dim3(view.inter / QK_K, routes), 256, 0, cudaStreamPerThread>>>(
+            static_cast<const __nv_bfloat16 *>(activation.cudaData), x, view.inter);
+        glm5_gguf_cache::Down<GGML_TYPE_IQ3_XXS><<<dim3((view.hidden + 3) / 4, routes), 128, 0, cudaStreamPerThread>>>(
+            x, perExpert, view);
+    } else {
+        glm5_gguf_cache::Down<GGML_TYPE_IQ4_XS><<<dim3((view.hidden + 3) / 4, routes), 128, 0, cudaStreamPerThread>>>(
+            static_cast<const __nv_bfloat16 *>(activation.cudaData), perExpert, view);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool FastllmCudaMergeMOEGlm5GGUFResident(
         const fastllm::Data &input, fastllm::Data &activation,
         fastllm::Data &workspace, fastllm::Data &output,

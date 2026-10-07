@@ -168,6 +168,9 @@ bool TryGlm5MultiGpuHybrid(OffloadGroup &group, DeviceCache &origin, int table,
     checkCudaErrors("GLM routing ready", cudaStreamSynchronize(cudaStreamPerThread));
     for (int i = 0; i < routes; ++i) if (r.Indices()[i] < 0 || r.Indices()[i] >= layout.experts) return false;
 
+    auto *tensorCache = group.tensorCache && group.tensorCache->active ? group.tensorCache.get() : nullptr;
+    const int tensorHits = tensorCache ? tensorCache->Lookup(table, r.Indices(), routes) : 0;
+
     std::vector<int> hits(work.size(), 0), gpuRoutes(work.size(), 0);
     std::vector<int> misses, reuse;
     for (auto *device : work) {
@@ -176,8 +179,16 @@ bool TryGlm5MultiGpuHybrid(OffloadGroup &group, DeviceCache &origin, int table,
         std::copy_n(r.Indices(), routes, w.Indices());
         std::copy_n(r.Scores(), routes, w.Scores());
     }
+    int nextTensorHit = 0;
     for (int i = 0; i < routes; ++i) {
         r.Owners()[i] = -1;
+        if (nextTensorHit < tensorHits && tensorCache->selectedRoutes[nextTensorHit] == i) {
+            // All ranks own a shard; the origin assembles the exact result.
+            // A distinct owner prevents temporary miss gathering overwriting it.
+            r.Owners()[i] = work.size();
+            ++nextTensorHit;
+            continue;
+        }
         for (size_t d = 0; d < work.size(); ++d) {
             auto &w = work[d]->rank;
             w.Resident()[i] = w.cache->hostKeyToSlot[base + r.Indices()[i]];
@@ -195,9 +206,10 @@ bool TryGlm5MultiGpuHybrid(OffloadGroup &group, DeviceCache &origin, int table,
     for (size_t d = 0; d < work.size(); ++d) {
         auto &w = *work[d];
         auto *overlap = w.rank.overlap.get();
-        plans.push_back({overlap ? &overlap->layers[timingLayer] : nullptr, hits[d],
+        plans.push_back({overlap ? &overlap->layers[timingLayer] : nullptr, hits[d] + (tensorHits > 0),
             overlap ? int(overlap->expertReady.size()) : 0,
-            d ? rows * (w.inputPerRow.us + w.returnPerRow.us + root.mergePerRow.us) : 0});
+            (d ? rows * (w.inputPerRow.us + w.returnPerRow.us + root.mergePerRow.us) : 0) +
+            (tensorHits ? tensorCache->EstimateUs(table, rows) : 0)});
     }
     const auto owners = Scheduler::AssignSharedMisses(plans, state.cpu[timingLayer].cpuExpert, reuse,
         state.cpu[timingLayer].calls++, rows == 1 ? &state.cpu[timingLayer] : nullptr);
@@ -250,9 +262,10 @@ bool TryGlm5MultiGpuHybrid(OffloadGroup &group, DeviceCache &origin, int table,
     allocate(r.owners, INT32, {rows, topk}, origin.device);
     allocate(root.received, FLOAT32, {routes, hidden}, origin.device);
     allocate(output, BFLOAT16, {rows, hidden}, origin.device);
-    // Cache admission still observes the origin layer exactly once. A helper
-    // uses existing residents/temporary slots without changing cache placement.
-    origin.frequency->Observe(base, r.Indices(), routes);
+    // Observe each layer once. The shared TP policy counts each verifier row;
+    // the legacy per-device policy still owns ordinary, unsharded residents.
+    if (tensorCache) tensorCache->Observe(table, r.Indices(), rows, topk);
+    else if (origin.frequency) origin.frequency->Observe(base, r.Indices(), routes);
     auto launchShared = [&] {
         if (launchParallel) launchParallel();
         checkCudaErrors("GLM restore origin", cudaSetDevice(origin.device));
@@ -262,6 +275,8 @@ bool TryGlm5MultiGpuHybrid(OffloadGroup &group, DeviceCache &origin, int table,
     if (rows > 1) launchShared();
     auto submitGpu = [&] {
         if (rows == 1) launchShared();
+        if (tensorHits) tensorCache->Compute(table, rows, topk,
+            reinterpret_cast<const uint16_t *>(r.host), r.Scores(), r.GpuOutput(), origin.device);
         for (size_t d = 0; d < work.size(); ++d) {
             auto &w = work[d]->rank;
             auto *overlap = w.overlap.get();
@@ -286,7 +301,8 @@ bool TryGlm5MultiGpuHybrid(OffloadGroup &group, DeviceCache &origin, int table,
             TouchResidentRoutes<<<1, 256, 0, cudaStreamPerThread>>>(
                 static_cast<int32_t *>(w.batchSlots.cudaData), static_cast<int32_t *>(w.batchRoutes.cudaData),
                 w.cache->lastUsed, w.cache->step, w.cache->hitCount, hits[d], rows, topk,
-                w.cache->totalMissCount, count - hits[d] + (d == 0 ? cpuRoutes : 0));
+                w.cache->totalMissCount, count - hits[d] + (d == 0 ? cpuRoutes : 0),
+                d == 0 ? tensorHits : 0);
             if (staged) overlap->PrepareCopy(0);
             const auto &activation = d ? work[d]->input : input;
             bool inputPrepared = false;
@@ -386,9 +402,13 @@ bool TryGlm5MultiGpuHybrid(OffloadGroup &group, DeviceCache &origin, int table,
     state.previousRoot = &root;
     for (size_t d = 0; d < work.size(); ++d) {
         auto &stats = caches[d]->cooperativeStats;
-        const int cpu = d == 0 ? cpuRoutes : 0, total = gpuRoutes[d] + cpu;
-        stats[0] += d == 0; stats[1] += total; stats[2] += hits[d];
-        stats[3] += total - hits[d]; stats[4] += gpuRoutes[d]; stats[5] += cpu; stats[6] += hits[d];
+        // Logical cache hits count once, on the coordinator. TP shard work is
+        // exposed separately, so summing route counters never doubles hits.
+        const int cached = hits[d] + (d == 0 ? tensorHits : 0);
+        const int cpu = d == 0 ? cpuRoutes : 0, gpu = gpuRoutes[d] + (d == 0 ? tensorHits : 0);
+        const int total = gpu + cpu;
+        stats[0] += d == 0; stats[1] += total; stats[2] += cached;
+        stats[3] += total - cached; stats[4] += gpu; stats[5] += cpu; stats[6] += cached;
     }
     return true;
 }
