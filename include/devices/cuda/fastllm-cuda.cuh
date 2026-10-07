@@ -1798,18 +1798,24 @@ struct FastllmCudaMoeGGUFResidents {
 bool FastllmCudaGetMoeGGUFResidents(fastllm::Data **weights, int experts,
                                   FastllmCudaMoeGGUFResidents &view);
 
-// Reservations exclude all currently active resident experts. Upload directly
-// into these canonical gate/down destinations, then publish on the same stream
-// after both projections are ready. The model serializes calls on each device.
-struct FastllmCudaMoeGGUFPrefillPlan {
+// Reservations exclude all currently active resident experts. GGUF uploads
+// directly into these canonical destinations; native NUMA uploads are converted
+// with StoreMoePrefillExpert. Publish after both projections are ready on the
+// same stream. The model serializes calls on each device.
+struct FastllmCudaMoePrefillPlan {
     std::vector<void *> weights;
     std::vector<int> keys, slots;
     void *cache = nullptr;
+    int table = -1;
 };
-void FastllmCudaPlanMoeGGUFPrefill(fastllm::Data **weights, int experts,
+void FastllmCudaPlanMoePrefill(fastllm::Data **weights, int experts,
     const int32_t *indices, const float *scores, int rows, int topk,
-    const std::unordered_set<int> &selected, FastllmCudaMoeGGUFPrefillPlan &plan);
-void FastllmCudaPublishMoeGGUFPrefill(const FastllmCudaMoeGGUFPrefillPlan &plan);
+    const std::unordered_set<int> &selected, FastllmCudaMoePrefillPlan &plan);
+void FastllmCudaPublishMoePrefill(const FastllmCudaMoePrefillPlan &plan);
+// Retain an already-uploaded NUMA expert without uploading its weights again.
+// The source tensors remain valid until the current compute stream completes.
+void FastllmCudaStoreMoePrefillExpert(const FastllmCudaMoePrefillPlan &plan,
+    int expert, const fastllm::Data &gate, const fastllm::Data &down);
 
 struct FastllmCudaMoeGGUFCacheView {
     const uint8_t *records;
@@ -1862,7 +1868,7 @@ bool FastllmCudaMoeGGUFCacheCompute(
         const float *scores, int topk, float *perExpert = nullptr);
 // Gate weights are already ready on the calling stream. Down weights may
 // still be uploading; optional timing events exclude that wait from compute.
-struct FastllmCudaMoeGGUFStageEvents {
+struct FastllmCudaMoeStageEvents {
     // Keep this host-facing header independent of CUDA runtime types.
     void *downReady = nullptr, *gateDone = nullptr, *downStart = nullptr;
 };
@@ -1870,7 +1876,7 @@ bool FastllmCudaMoeGGUFCacheComputeStaged(
         const fastllm::Data &input, fastllm::Data &gateOutput,
         fastllm::Data &output, const FastllmCudaMoeGGUFCacheView &view,
         const float *scores, int topk, float *perExpert,
-        const FastllmCudaMoeGGUFStageEvents &events);
+        const FastllmCudaMoeStageEvents &events);
 // perExpert, when provided, receives unweighted FP32 [rows, topk, hidden]
 // results; missing route slots write zero. The caller owns the final reduction.
 // Use the same fused kernels with immutable GPU weight pointers. Routing stays
@@ -1962,6 +1968,11 @@ bool FastllmCudaMoeFP8CacheCompute(
         fastllm::Data &output, const FastllmCudaMoeFP8CacheView &view,
         const int32_t *slots, const float *scores, int topk,
         float *perExpert = nullptr);
+bool FastllmCudaMoeFP8CacheComputeStaged(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &output, const FastllmCudaMoeFP8CacheView &view,
+        const int32_t *slots, const float *scores, int topk, float *perExpert,
+        const FastllmCudaMoeStageEvents &events);
 #endif
 bool FastllmCudaNVFP4E4M3GroupedMoeSupported(int device);
 bool FastllmCudaHalfMatMulFloatInt4Group128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);

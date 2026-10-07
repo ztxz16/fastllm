@@ -1,5 +1,6 @@
 #include "fastllm.h"
 #include "devices/moe_decode_scheduler.h"
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
 #include "fastllm-cuda.cuh"
 #include "fastllm-cuda-shared-weight.cuh"
 #include "devices/cpu/cpudevice.h"
@@ -456,8 +457,11 @@ static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
                 Check(cudaSetDevice(reverseDevices ? 1 - rank : rank));
                 Data empty;
                 if (singleDeviceHybrid) {
+                    void *policy = rows == 1 && !reject
+                        ? FastllmCudaBeginMoeDecode(weights.data(), weights.size(), topk) : nullptr;
                     accepted[rank] = FastllmCudaMergeMOEHybrid(inputs[rank], ids, scores, results[rank],
                         weights.data(), weights.size(), 0, [&] { ++callbacks[rank]; });
+                    FastllmCudaEndMoeDecode(policy);
                 } else {
                     accepted[rank] = FastllmCudaMergeMOEExpertParallel(*context, rank, inputs[rank],
                         rank == 0 ? ids : empty, rank == 0 ? scores : empty, results[rank],
@@ -480,6 +484,11 @@ static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
             Require(callbacks[rank] == int(!reject), "EP shared expert callback count changed");
         }
         if (reject) continue;
+        if (!singleDeviceHybrid) {
+            Check(cudaSetDevice(reverseDevices ? 1 : 0));
+            Require(FastllmCudaBeginMoeDecode(weights.data(), weights.size(), topk) == nullptr,
+                    "outer decode scope advanced an EP-owned frequency step");
+        }
         const auto after = FastllmCudaGetMoeExpertParallelStats(*context);
         Require(singleDeviceHybrid || after.cpuRoutes - before.cpuRoutes +
             after.gpuRoutes[0] - before.gpuRoutes[0] + after.gpuRoutes[1] - before.gpuRoutes[1] == routes,
@@ -516,10 +525,15 @@ static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
     const auto stats = FastllmCudaGetMoeExpertParallelStats(*context);
     if (disableSecondDevice) {
         Require(stats.gpuRoutes[reverseDevices ? 0 : 1] == 0, "disabled EP device executed experts");
+        Require(stats.admissions[reverseDevices ? 0 : 1] == 0, "disabled EP device admitted experts");
         Require(stats.gpuRoutes[reverseDevices ? 1 : 0] > 0, "EP disabled both devices");
     } else if (!singleDeviceHybrid) {
         Require(stats.gpuRoutes[0] && stats.gpuRoutes[1] && stats.multiGpuSteps,
                 "EP never computed one layer on both GPUs");
+        // The first two-rank run starts with a cold second device. Its
+        // frequency-based fills must be visible in the public statistics.
+        if (maxRows == 1 && !reverseDevices)
+            Require(stats.admissions[1] > 0, "EP frequency admissions were not counted");
     }
     context.reset();
     if (hadOverride) setenv(overrideName, previousValue.c_str(), 1); else unsetenv(overrideName);
@@ -684,6 +698,26 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
         Check(cudaMemcpy(input.cudaData, activation.data(), activation.size() * sizeof(T), cudaMemcpyHostToDevice));
         Check(cudaMemcpy(ids.cudaData, indices.data(), indices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
         Check(cudaMemcpy(scores.cudaData, routes.data(), routes.size() * sizeof(float), cudaMemcpyHostToDevice));
+        if (step == 0) {
+            // Exercise the prefill handoff with real uploaded NUMA layouts.
+            // The following cache kernels must read these admitted records,
+            // and agree bitwise with the independent canonical snapshot.
+            std::unordered_set<int> selected;
+            for (int expert : indices) selected.insert(expert + 1);
+            FastllmCudaMoePrefillPlan plan;
+            FastllmCudaPlanMoePrefill(weights[1][table].data(), experts,
+                indices.data(), routes.data(), batch, topk, selected, plan);
+            Require(!plan.keys.empty(), "NUMA prefill did not reserve cache slots");
+            for (int expert : selected) {
+                auto &gate = *weights[1][table][2 * expert];
+                auto &down = *weights[1][table][2 * expert + 1];
+                gate.ToCudaTemporary({}, true); down.ToCudaTemporary({}, true);
+                FastllmCudaStoreMoePrefillExpert(plan, expert - 1, gate, down);
+                Check(cudaStreamSynchronize(cudaStreamPerThread));
+                gate.FreeCudaTemporary({}, false); down.FreeCudaTemporary({}, false);
+            }
+            FastllmCudaPublishMoePrefill(plan);
+        }
         for (int backend = 0; backend < 2; ++backend) {
             auto launch = [&] {
                 Require(FastllmCudaMergeMOECache(input, gate[backend][table], output[backend][table],

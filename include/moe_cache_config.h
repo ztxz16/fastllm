@@ -6,7 +6,7 @@
 
 namespace fastllm {
 
-// GGUF single-token hybrid decode admission. Configure before loading a model;
+// Hybrid decode admission for registered expert caches. Configure before loading a model;
 // each cache takes a snapshot, so changing this does not mutate a live policy.
 struct MoeCacheConfig {
     float halfLife = 128;       // Decode steps; 0 disables frequency decay.

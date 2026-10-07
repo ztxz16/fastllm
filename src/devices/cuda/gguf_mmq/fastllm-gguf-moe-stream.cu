@@ -194,8 +194,8 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     AllocateTensor(gate, input.dataType, {rows * topk, inter}, device);
     AllocateTensor(output, input.dataType, {rows, hidden}, device);
     auto *base = static_cast<uint8_t *>(workspace.cudaData);
-    FastllmCudaMoeGGUFPrefillPlan admission;
-    FastllmCudaPlanMoeGGUFPrefill(weights, expertCount, indices, scores, rows, topk, experts, admission);
+    FastllmCudaMoePrefillPlan admission;
+    FastllmCudaPlanMoePrefill(weights, expertCount, indices, scores, rows, topk, experts, admission);
     struct Upload { const fastllm::Data *weight; uint8_t *target; };
     std::vector<std::vector<Upload>> uploads(batches.size());
     std::vector<WeightCopy> copies;
@@ -266,7 +266,7 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
         CUDA_CHECK(cudaEventRecord(pipeline.released[slot], stream));
     }
     run(StreamedMoePhase::Finish, {});
-    FastllmCudaPublishMoeGGUFPrefill(admission);
+    FastllmCudaPublishMoePrefill(admission);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     return true;
 }

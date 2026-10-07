@@ -6,6 +6,7 @@
 #include "gguf.h"
 #include "../fastllm-gguf-gemv.cuh"
 #include "fastllm-cuda.cuh"
+#include "fastllm-moe-stages.cuh"
 #include "fastllm-moe-gguf-common.cuh"
 #include "fastllm-moe-gguf-q8.cuh"
 #include "fastllm-moe-deepseekv41-cache.cuh"
@@ -348,7 +349,7 @@ __global__ void Down(const T *gateOutput, T *output, View view,
 template<typename T, typename View>
 bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &output,
              const View &view, const float *scores, int topk, float *perExpert = nullptr,
-             bool q8InputPrepared = false, const FastllmCudaMoeGGUFStageEvents *events = nullptr) {
+             bool q8InputPrepared = false, const FastllmCudaMoeStageEvents *events = nullptr) {
     const int rows = input.dims[0], routes = ActiveRoutes(view, rows * topk);
     const int stages = view.workspace && view.workspaceBytes >= Q8WorkspaceBytes(rows, view.hidden, view.inter, topk)
         ? Q8Stages(view.gateType, view.downType, view.hidden, view.inter, rows) : 0;
@@ -392,11 +393,7 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
             static_cast<const T *>(gate.cudaData), qGate, view.inter);
     // Gate/up and activation quantization do not read down weights. Run them
     // during the remaining DMA, and keep its wait out of scheduler timings.
-    if (events) {
-        if (events->gateDone && cudaEventRecord(static_cast<cudaEvent_t>(events->gateDone), cudaStreamPerThread) != cudaSuccess) return false;
-        if (events->downReady && cudaStreamWaitEvent(cudaStreamPerThread, static_cast<cudaEvent_t>(events->downReady), 0) != cudaSuccess) return false;
-        if (events->downStart && cudaEventRecord(static_cast<cudaEvent_t>(events->downStart), cudaStreamPerThread) != cudaSuccess) return false;
-    }
+    if (events && !FastllmMoeWaitDown(*events)) return false;
     if (stages & 2) {
         switch (downType) {
 #define Q8_DOWN(name) case GGML_TYPE_##name: \
@@ -561,7 +558,7 @@ bool FastllmCudaMoeGGUFCacheCompute(const fastllm::Data &input, fastllm::Data &g
 bool FastllmCudaMoeGGUFCacheComputeStaged(const fastllm::Data &input, fastllm::Data &gate,
         fastllm::Data &output, const FastllmCudaMoeGGUFCacheView &view,
         const float *scores, int topk, float *perExpert,
-        const FastllmCudaMoeGGUFStageEvents &events) {
+        const FastllmCudaMoeStageEvents &events) {
     if (input.dims.size() != 2 || input.dims[0] <= 0 || input.dims[1] != view.hidden ||
         topk <= 0 || topk > 32 || input.dims[0] > INT_MAX / topk ||
         !scores || !view.records || !view.routeSlots ||

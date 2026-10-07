@@ -647,11 +647,12 @@ def set_moe_cuda_cache(bytes_: int):
 def set_moe_cache_policy(*, half_life=128., update_interval=1, max_replacements=96,
                          max_bytes=0, min_heat=1., margin=1., factor=1.,
                          min_residence=0, prefill_prior=0., rank_by_bytes=False):
-    """Configure GGUF single-token hybrid decode admission before model loading.
+    """Configure GGUF/NVFP4/FP8 hybrid decode admission before model loading.
 
-    Counts and byte limits apply per update, across all layers. max_bytes=0
+    Counts and byte limits apply per device/update, across all layers. max_bytes=0
     imposes no byte cap; max_replacements=0 disables decode admission.
-    half_life=0 disables decay. prefill_prior weights rescaled prompt heat and
+    One decode step may verify several speculative tokens. half_life=0 disables
+    decay. prefill_prior weights rescaled prompt heat and
     does not discard resident payloads. Existing cache policies keep their config.
     """
     for name, value, minimum in (("update_interval", update_interval, 1),

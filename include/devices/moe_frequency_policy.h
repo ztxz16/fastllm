@@ -97,7 +97,8 @@ public:
         for (int r = 0; r < count; ++r) {
             const int64_t key = int64_t(base) + experts[r];
             if (experts[r] < 0 || key < 0 || key >= int64_t(keys.size())) continue;
-            // One observation per token/expert, including duplicate TopK routes.
+            // One observation per expert in this decode step, deduplicating
+            // TopK routes and repeated experts across speculative rows.
             bool duplicate = false;
             for (int i = 0; i < r; ++i) duplicate |= experts[i] == experts[r];
             if (duplicate) continue;
@@ -107,8 +108,8 @@ public:
         }
     }
 
-    // Plan only after the whole token has been observed. Applying these
-    // admissions cannot improve the hit count of the token that selected them.
+    // Plan only after the whole decode step has been observed. Applying these
+    // admissions cannot improve the hit count of the step that selected them.
     // Returned slots are reserved in the policy; the caller publishes payload
     // and device residency together before the next cache lookup.
     std::vector<Admission> EndStep() {
