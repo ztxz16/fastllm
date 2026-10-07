@@ -9,6 +9,7 @@
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "devices/numas/numasdevice.h"
 #include "devices/numas/numas.h"
+#include "cuda_delayed_down_upload.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -121,6 +122,36 @@ struct DirectLayoutFixture {
                     Require(FastllmCudaMoeGlm5GGUFCacheCompute(input,activation,view,
                         static_cast<const float *>(ds.cudaData),topk,.125f,static_cast<float *>(result.cudaData)),
                         "GLM direct layout computation rejected");
+                }
+                // Delay down weights on a separate stream. Gate/up must finish
+                // before that upload, and the staged result must be bit-exact
+                // with the complete-record path, for both layouts and row maps.
+                if (rows==1 || rows==3 || rows==17) {
+                    std::vector<float> reference(routes*hidden), staged(reference.size());
+                    Cuda(cudaMemcpy(reference.data(),result.cudaData,result.GetBytes(),cudaMemcpyDeviceToHost));
+                    Data partial(INT8,{int(canonical.size())});
+                    partial.ToDevice(CUDA);partial.Allocate(false);
+                    Cuda(cudaMemset(partial.cudaData,0,partial.GetBytes()));
+                    for (int e=0;e<2;++e)
+                        Cuda(cudaMemcpy(static_cast<uint8_t *>(partial.cudaData)+e*stride,
+                            view.records+e*stride,gateBytes,cudaMemcpyDeviceToDevice));
+                    fastllm_test::DelayedDownUpload upload;
+                    upload.Hold();
+                    for (int e=0;e<2;++e)
+                        Cuda(cudaMemcpyAsync(static_cast<uint8_t *>(partial.cudaData)+e*stride+gateBytes,
+                            view.records+e*stride+gateBytes,downBytes,cudaMemcpyDeviceToDevice,upload.stream));
+                    Cuda(cudaEventRecord(upload.downReady,upload.stream));
+                    view.records=static_cast<const uint8_t *>(partial.cudaData);
+                    Require(FastllmCudaMoeGlm5GGUFCacheComputeStaged(input,activation,view,
+                        static_cast<const float *>(ds.cudaData),topk,.125f,static_cast<float *>(result.cudaData),
+                        {upload.downReady,upload.gateDone,upload.downStart}),"GLM staged layout computation rejected");
+                    Cuda(cudaEventSynchronize(upload.gateDone));
+                    const bool earlyGate=!upload.timedOut && cudaEventQuery(upload.downReady)==cudaErrorNotReady;
+                    upload.release=true;
+                    Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                    Cuda(cudaMemcpy(staged.data(),result.cudaData,result.GetBytes(),cudaMemcpyDeviceToHost));
+                    Require(staged==reference,"GLM split-stage arithmetic changed");
+                    Require(earlyGate,"GLM gate waited for down upload");
                 }
                 result.ToDevice(CPU);
                 output[variant].assign(reinterpret_cast<float *>(result.cpuData),

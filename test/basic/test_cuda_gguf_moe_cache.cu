@@ -8,8 +8,8 @@
 #include <cuda_bf16.h>
 #include "../../src/devices/cuda/moe/fastllm-moe-gguf-restore.cuh"
 #include "../../src/devices/cuda/fastllm-gguf-mmvq-dispatch.cuh"
+#include "cuda_delayed_down_upload.h"
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -20,7 +20,6 @@
 #include <stdexcept>
 #include <vector>
 #include <thread>
-#include <chrono>
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
 #include "devices/cpu/computeutils.h"
@@ -455,39 +454,6 @@ template<class T> static void RunReusedInput(ggml_type type, fastllm::DataType d
     std::printf("PASS reused Q8 input type=%d dtype=%d: exact results, changed tokens, independent scratch\n", type, dtype);
 }
 
-// Hold the down upload on its own stream until gate computation completes.
-// Poisoned down weights catch an omitted wait; the timeout catches a gate
-// completion event incorrectly placed after that wait.
-struct DelayedDownUpload {
-    cudaStream_t stream = nullptr;
-    cudaEvent_t gateReady = nullptr, downReady = nullptr, gateDone = nullptr, downStart = nullptr;
-    uint8_t *host = nullptr;
-    std::atomic<bool> release{false}, timedOut{false};
-    explicit DelayedDownUpload(size_t bytes) {
-        Cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        for (auto *e : {&gateReady, &downReady, &gateDone, &downStart}) Cuda(cudaEventCreate(e));
-        Cuda(cudaMallocHost(&host, bytes));
-    }
-    void Hold() {
-        release = false; timedOut = false;
-        Cuda(cudaLaunchHostFunc(stream, [](void *opaque) {
-            auto &self = *static_cast<DelayedDownUpload *>(opaque);
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-            while (!self.release.load()) {
-                if (std::chrono::steady_clock::now() > deadline) { self.timedOut = true; break; }
-                std::this_thread::sleep_for(std::chrono::microseconds(20));
-            }
-        }, this));
-    }
-    ~DelayedDownUpload() {
-        release = true;
-        if (stream) cudaStreamSynchronize(stream);
-        for (auto e : {gateReady, downReady, gateDone, downStart}) if (e) cudaEventDestroy(e);
-        if (stream) cudaStreamDestroy(stream);
-        cudaFreeHost(host);
-    }
-};
-
 template<class T> static void RunSplitUpload(ggml_type type, fastllm::DataType dtype, bool numa) {
     using namespace fastllm;
     constexpr int hidden = 2560, inter = 640;
@@ -509,7 +475,7 @@ template<class T> static void RunSplitUpload(ggml_type type, fastllm::DataType d
     for (auto *v : {&records,&workspace,&input,&gate,&output,&slots,&scores,&partial}) Gpu(*v);
     Cuda(cudaMemset(slots.cudaData,0,sizeof(int32_t)));
     const float score = 1; Cuda(cudaMemcpy(scores.cudaData,&score,sizeof(score),cudaMemcpyHostToDevice));
-    DelayedDownUpload upload(stride);
+    fastllm_test::DelayedDownUpload upload(stride);
     std::memcpy(upload.host,g->cpuData,g->GetBytes());
     std::memcpy(upload.host+offset,d->cpuData,d->GetBytes());
     FastllmCudaMoeGGUFCacheView view{static_cast<uint8_t *>(records.cudaData),

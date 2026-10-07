@@ -761,7 +761,8 @@ __global__ void Down(const T *activation, float *output, View view) {
 template<class View>
 bool Compute(const fastllm::Data &input, fastllm::Data &activation,
         const View &view, const float *scores, int topk, float swigluLimit,
-        float *perExpert, bool q8InputPrepared = false) {
+        float *perExpert, bool q8InputPrepared = false,
+        const FastllmCudaMoeStageEvents *events = nullptr) {
     const int rows = input.dims[0];
     auto *x = static_cast<float *>(view.workspace);
     auto *y = x + size_t(rows) * view.hidden;
@@ -784,6 +785,7 @@ bool Compute(const fastllm::Data &input, fastllm::Data &activation,
     if (view.downType != GGML_TYPE_IQ4_XS) {
         glm5_gguf_cache::Quantize<<<dim3(view.inter / QK_K, routes), 256, 0, cudaStreamPerThread>>>(
             static_cast<const __nv_bfloat16 *>(activation.cudaData), y, view.inter);
+        if (events && !FastllmMoeWaitDown(*events)) return false;
         switch (view.downType) {
 #define GLM5_DOWN(name) case GGML_TYPE_##name: \
             glm5_gguf_cache::Down<GGML_TYPE_##name><<<dim3((view.hidden + 3) / 4, routes), 128, 0, cudaStreamPerThread>>>( \
@@ -793,6 +795,7 @@ bool Compute(const fastllm::Data &input, fastllm::Data &activation,
             default: return false;
         }
     } else {
+        if (events && !FastllmMoeWaitDown(*events)) return false;
         glm5_gguf_cache::Down<GGML_TYPE_IQ4_XS><<<dim3((view.hidden + 3) / 4, routes), 128, 0, cudaStreamPerThread>>>(
             static_cast<const __nv_bfloat16 *>(activation.cudaData), perExpert, view);
     }
@@ -826,6 +829,13 @@ bool FastllmCudaMoeGlm5GGUFCacheNumaSupported(int gateType, int downType, int hi
 bool FastllmCudaMoeGlm5GGUFCacheCompute(const fastllm::Data &input, fastllm::Data &activation,
         const FastllmCudaMoeGGUFCacheView &view, const float *scores, int topk,
         float swigluLimit, float *perExpert) {
+    return FastllmCudaMoeGlm5GGUFCacheComputeStaged(input, activation, view,
+        scores, topk, swigluLimit, perExpert, {});
+}
+
+bool FastllmCudaMoeGlm5GGUFCacheComputeStaged(const fastllm::Data &input, fastllm::Data &activation,
+        const FastllmCudaMoeGGUFCacheView &view, const float *scores, int topk,
+        float swigluLimit, float *perExpert, const FastllmCudaMoeStageEvents &events) {
     const int rows = input.dims.size() == 2 ? input.dims[0] : 0;
     if (input.dataDevice != fastllm::CUDA || input.dataType != fastllm::BFLOAT16 ||
         rows <= 0 || input.dims[1] != view.hidden || !input.cudaData || topk < 1 || topk > 16 ||
@@ -838,7 +848,7 @@ bool FastllmCudaMoeGlm5GGUFCacheCompute(const fastllm::Data &input, fastllm::Dat
         (NumaOrdinary(view.numaGateType) != view.gateType || NumaOrdinary(view.numaDownType) != view.downType ||
          !FastllmCudaMoeGlm5GGUFCacheNumaSupported(view.numaGateType, view.numaDownType, view.hidden, view.inter))) return false;
     return glm5_gguf_cache::Compute(input, activation, view, scores, topk,
-        swigluLimit, perExpert, view.q8InputPrepared);
+        swigluLimit, perExpert, view.q8InputPrepared, &events);
 }
 
 bool FastllmCudaMergeMOEGlm5GGUFResident(

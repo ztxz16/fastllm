@@ -322,6 +322,37 @@ static void TestDecodeOverlap() {
     decode.calls = 253;
     Require(decode.SelectDecodeMisses(8, 0) == 1,
             "decode stopped probing an unused GPU path");
+
+    fastllm::MoeDecodeOverlapScheduler submission;
+    submission.ObserveDecodeCpu(7, 439);
+    submission.ObserveDecodeCpu(6, 376);
+    submission.copiedExpert.Observe(312);
+    submission.stagedExpert.Observe(40);
+    submission.dispatch.Observe(103);
+    Require(submission.SelectDecodeMisses(7, 1) == 0,
+            "unmeasured submission lost its conservative fallback");
+    submission.decodeLaunch.Observe(28);
+    Require(submission.SelectDecodeMisses(7, 1) == 1,
+            "decode counted overlapping host submission twice");
+    submission.dispatch = {};
+    submission.dispatch.Observe(500);
+    Require(submission.SelectDecodeMisses(7, 1) == 0,
+            "decode ignored a host submission bottleneck");
+    submission.dispatch = {};
+    submission.dispatch.Observe(103);
+    submission.decodeCpu[7] = {};
+    submission.ObserveDecodeCpu(7, 390);
+    submission.decodeCpu[6] = {};
+    submission.ObserveDecodeCpu(6, 330);
+    Require(submission.SelectDecodeMisses(7, 1) == 0,
+            "unsplit pipeline underestimated completion time");
+    submission.gateCopy.Observe(208);
+    submission.gateCompute.Observe(25);
+    Require(submission.SelectDecodeMisses(7, 1) == 1,
+            "decode did not overlap gate computation with down DMA");
+    submission.residentExpert.Observe(1000);
+    Require(submission.SelectDecodeMisses(7, 1) == 0,
+            "split stages ignored preceding resident work");
 }
 
 static void TestParallelOverlap() {

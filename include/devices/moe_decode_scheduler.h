@@ -60,6 +60,10 @@ class MoeDecodeOverlapScheduler {
 public:
     using Estimate = MoeDecodeScheduler::Estimate;
     Estimate cpuExpert, residentExpert, copiedExpert, stagedExpert, dispatch;
+    // Decode submits CUDA work while the CPU workers are already active.
+    // Only the delay before DMA starts is serialized with the GPU pipeline;
+    // the full host submission time is a separate completion bound.
+    Estimate decodeLaunch, gateCopy, gateCompute;
     std::array<Estimate, MoeDecodeScheduler::maxExperts + 1> decodeCpu;
     uint64_t calls = 0;
 
@@ -97,9 +101,15 @@ public:
         double best = std::max(DecodeCpuUs(misses), gpu);
         int selected = 0;
         for (int n = 1; n <= misses; ++n) {
-            gpu = std::max(gpu, n * copiedExpert.us) + stagedExpert.us;
-            // CPU workers are already active during host GPU submission.
-            const double cost = std::max(DecodeCpuUs(misses - n), dispatch.us + gpu);
+            if (gateCopy.initialized && gateCompute.initialized) {
+                gpu = std::max(gpu, (n - 1) * copiedExpert.us + gateCopy.us) + gateCompute.us;
+                gpu = std::max(gpu, n * copiedExpert.us) + std::max(0.0, stagedExpert.us - gateCompute.us);
+            } else {
+                gpu = std::max(gpu, n * copiedExpert.us) + stagedExpert.us;
+            }
+            const double finish = decodeLaunch.initialized
+                ? std::max(dispatch.us, decodeLaunch.us + gpu) : dispatch.us + gpu;
+            const double cost = std::max(DecodeCpuUs(misses - n), finish);
             if (cost < best * .97) { best = cost; selected = n; }
         }
         if (calls % 127 == 126) return selected ? 0 : 1;

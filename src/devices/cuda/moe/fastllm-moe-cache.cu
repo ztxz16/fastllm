@@ -117,6 +117,8 @@ struct DecodeOverlapWorkspace {
     cudaStream_t copyStream = nullptr;
     cudaEvent_t copyStart = nullptr, copyDone = nullptr;
     cudaEvent_t metadataReady = nullptr;
+    cudaEvent_t decodeSubmit = nullptr;
+    double decodeSubmitHostUs = -1;
     cudaEvent_t residentStart = nullptr, residentDone = nullptr;
     std::vector<cudaEvent_t> expertReady, stagedStart, stagedDone;
     std::vector<cudaEvent_t> gateReady, gateDone, downStart;
@@ -146,13 +148,13 @@ struct DecodeOverlapWorkspace {
         slots = reinterpret_cast<int32_t *>(records + recordBytes);
         if (restore) upload = records + capacity * stride;
         if (cudaEventCreateWithFlags(&metadataReady, cudaEventDisableTiming) != cudaSuccess) return false;
-        for (auto *event : {&copyStart, &copyDone, &residentStart, &residentDone})
+        for (auto *event : {&copyStart, &copyDone, &residentStart, &residentDone, &decodeSubmit})
             if (cudaEventCreate(event) != cudaSuccess) return false;
         for (int i = 0; i < capacity; ++i) {
             if (cudaEventCreateWithFlags(&expertReady[i], cudaEventDisableTiming) != cudaSuccess ||
                 cudaEventCreate(&stagedStart[i]) != cudaSuccess ||
                 cudaEventCreate(&stagedDone[i]) != cudaSuccess) return false;
-            if (split && (cudaEventCreateWithFlags(&gateReady[i], cudaEventDisableTiming) != cudaSuccess ||
+            if (split && (cudaEventCreate(&gateReady[i]) != cudaSuccess ||
                 cudaEventCreate(&gateDone[i]) != cudaSuccess ||
                 cudaEventCreate(&downStart[i]) != cudaSuccess)) return false;
         }
@@ -192,18 +194,29 @@ struct DecodeOverlapWorkspace {
             checkCudaErrors("Decode PCIe timing", cudaEventElapsedTime(&ms, copyStart, copyDone));
             timing.copiedExpert.Observe(ms * 1000 / previousMisses);
             // Exclude waits for the next expert's DMA from compute cost.
-            double computeMs = 0;
+            double computeMs = 0, gateMs = 0;
             for (int i = 0; i < previousMisses; ++i) {
                 checkCudaErrors("Decode staged timing", cudaEventElapsedTime(
                     &ms, stagedStart[i], previousSplitStages ? gateDone[i] : stagedDone[i]));
                 computeMs += ms;
                 if (previousSplitStages) {
+                    gateMs += ms;
                     checkCudaErrors("Decode down timing", cudaEventElapsedTime(&ms, downStart[i], stagedDone[i]));
                     computeMs += ms;
                 }
             }
             timing.stagedExpert.Observe(computeMs * 1000 / previousStagedRoutes);
+            if (decodeSubmitHostUs >= 0) {
+                checkCudaErrors("Decode launch timing", cudaEventElapsedTime(&ms, decodeSubmit, copyStart));
+                timing.decodeLaunch.Observe(decodeSubmitHostUs + ms * 1000);
+                if (previousSplitStages) {
+                    checkCudaErrors("Decode gate DMA timing", cudaEventElapsedTime(&ms, copyStart, gateReady[0]));
+                    timing.gateCopy.Observe(ms * 1000);
+                    timing.gateCompute.Observe(gateMs * 1000 / previousStagedRoutes);
+                }
+            }
         }
+        decodeSubmitHostUs = -1;
         previousLayer = -1;
     }
     ~DecodeOverlapWorkspace() {
@@ -212,7 +225,7 @@ struct DecodeOverlapWorkspace {
         cudaFree(sharedUpload);
         cudaFree(fp8Pointers);
         cudaFreeHost(hostSlots);
-        for (auto event : {copyStart, copyDone, residentStart, residentDone, metadataReady})
+        for (auto event : {copyStart, copyDone, residentStart, residentDone, metadataReady, decodeSubmit})
             if (event) cudaEventDestroy(event);
         for (size_t i = 0; i < expertReady.size(); ++i)
             for (auto event : {expertReady[i], stagedStart[i], stagedDone[i]})
@@ -2368,14 +2381,16 @@ bool GGUFHybridShape(const OffloadLayout &layout) {
 
 bool ComputeGGUFExperts(const fastllm::Data &input, fastllm::Data &gateOutput,
         fastllm::Data &output, const OffloadLayout &layout, const FastllmCudaMoeGGUFCacheView &view,
-        const float *scores, int topk, float *perExpert) {
+        const float *scores, int topk, float *perExpert,
+        const FastllmCudaMoeStageEvents &events = {}) {
     if (layout.deepSeekV41)
         return FastllmCudaMoeV41GGUFCacheCompute(input, gateOutput, view,
             scores, topk, layout.swigluLimit, perExpert);
     if (layout.glm5)
-        return FastllmCudaMoeGlm5GGUFCacheCompute(input, gateOutput, view,
-            scores, topk, layout.swigluLimit, perExpert);
-    return FastllmCudaMoeGGUFCacheCompute(input, gateOutput, output, view, scores, topk, perExpert);
+        return FastllmCudaMoeGlm5GGUFCacheComputeStaged(input, gateOutput, view,
+            scores, topk, layout.swigluLimit, perExpert, events);
+    return FastllmCudaMoeGGUFCacheComputeStaged(input, gateOutput, output, view,
+        scores, topk, perExpert, events);
 }
 
 bool ComputeGGUFCache(const fastllm::Data &input, fastllm::Data &gateOutput,
@@ -4185,15 +4200,18 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
     auto submitGpu = [&]() {
         const double submitStart = overlap && staged ? HybridNowUs() : 0;
         if (staged) {
+            checkCudaErrors("Decode submission timing", cudaEventRecord(overlap->decodeSubmit, cudaStreamPerThread));
+            overlap->decodeSubmitHostUs = HybridNowUs() - submitStart;
             // The NUMA gate/up workers are already running when this callback
             // executes. DMA starts before resident kernels and does not wait
             // for them. The packed temporary records do not alter residency.
             std::array<int, kMaxTopK> experts;
             for (int i = 0; i < staged; ++i) experts[i] = hostIndices[order[hits + i]];
-            // Only ordinary records can expose gate weights independently.
-            // Restored layouts and model-specific fused stages retain the
-            // complete-record dependency.
-            overlap->splitStages = !layout.deepSeekV41 && !layout.glm5 &&
+            // GGUF can consume gate/up before down DMA completes, including
+            // GLM's scored arithmetic. Whole-record restores and native GLM
+            // keep their existing complete-record dependency.
+            overlap->splitStages = !layout.deepSeekV41 &&
+                (!layout.glm5 || layout.weightType == fastllm::DATA_GGUF_FORMAT) &&
                 (group->ggufSources.empty() || overlap->numaGateType >= 0);
             overlap->CopyExperts(*group, tableId, experts.data(), staged, topk);
         }
@@ -4277,9 +4295,8 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
                     ComputeGlm5Experts(input, gateOutput, layout, overlap->records,
                         temporary.routeSlots, routeScore, 1, routeOutput) :
                     layout.weightType == fastllm::DATA_GGUF_FORMAT ?
-                    (overlap->splitStages ? FastllmCudaMoeGGUFCacheComputeStaged(
-                        input, gateOutput, output, temporary, routeScore, 1, routeOutput, events) :
-                        ComputeGGUFExperts(input, gateOutput, output, layout, temporary, routeScore, 1, routeOutput)) :
+                    ComputeGGUFExperts(input, gateOutput, output, layout, temporary,
+                        routeScore, 1, routeOutput, events) :
                     ComputeStagedNativeExpert(input, gateOutput, output, layout, *overlap,
                         overlap->slots + route, routeScore, routeOutput, events);
                 fastllm::AssertInFastLLM(computed, "Staged decode CUDA expert failed.\n");

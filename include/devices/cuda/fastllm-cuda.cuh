@@ -1908,6 +1908,11 @@ struct FastllmCudaMoeStageEvents {
     // Keep this host-facing header independent of CUDA runtime types.
     void *downReady = nullptr, *gateDone = nullptr, *downStart = nullptr;
 };
+bool FastllmCudaMoeGlm5GGUFCacheComputeStaged(
+        const fastllm::Data &input, fastllm::Data &activation,
+        const FastllmCudaMoeGGUFCacheView &view,
+        const float *scores, int topk, float swigluLimit, float *perExpert,
+        const FastllmCudaMoeStageEvents &events);
 bool FastllmCudaMoeGGUFCacheComputeStaged(
         const fastllm::Data &input, fastllm::Data &gateOutput,
         fastllm::Data &output, const FastllmCudaMoeGGUFCacheView &view,
