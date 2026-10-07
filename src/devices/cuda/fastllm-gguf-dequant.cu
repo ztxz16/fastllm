@@ -11,6 +11,7 @@
 #include "gguf.h"
 #include "fastllm-gguf-dequant.cuh"
 #include "fastllm-gguf-gemv.cuh"
+#include "fastllm-gguf-k-r4.cuh"
 
 // Device function
 __device__ inline void get_scale_min_k4_device(int j, const uint8_t * __restrict__ q,
@@ -555,6 +556,22 @@ static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t n
     dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
 }
 
+// Q3_K R4 has the same four-row block layout used by the NUMA cache path.
+template<typename T>
+static __global__ void dequantize_block_q3_K_r4(const void *input, T *output, int columns) {
+    const int row=threadIdx.x/32, lane=threadIdx.x%32;
+    const int blocks=columns/QK_K;
+    const auto *source=static_cast<const uint8_t *>(input)+size_t(blockIdx.x)*sizeof(block_q3_k_r4);
+    const size_t offset=(size_t(blockIdx.x/blocks)*4+row)*columns+(blockIdx.x%blocks)*QK_K;
+    for (int c=lane; c<QK_K; c+=32)
+        output[offset+c]=DequantizeCast<T>::cast(FastllmGgufKRegroupedValue<GGML_TYPE_Q3_K>(source,row,c));
+}
+template<typename T>
+static void dequantize_row_q3_K_r4_cuda(const void *input, T *output,
+        int64_t rows, int64_t columns, cudaStream_t stream) {
+    dequantize_block_q3_K_r4<<<(rows/4)*(columns/QK_K),128,0,stream>>>(input,output,columns);
+}
+
 // Dequantize block_q4_k_r4: each block packs 4 rows of QK_K(=256) elements.
 // 128 threads per CUDA block (32 threads per row x 4 rows), each thread decodes 8 elements.
 template<typename dst_t>
@@ -979,6 +996,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_q4_K_r4_cuda;
         case GGML_TYPE_Q2_K_R4:
             return dequantize_row_q2_K_r4_cuda;
+        case GGML_TYPE_Q3_K_R4:
+            return dequantize_row_q3_K_r4_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q5_K_R4:
@@ -1053,6 +1072,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_q4_K_r4_cuda;
         case GGML_TYPE_Q2_K_R4:
             return dequantize_row_q2_K_r4_cuda;
+        case GGML_TYPE_Q3_K_R4:
+            return dequantize_row_q3_K_r4_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q5_K_R4:
@@ -1164,6 +1185,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_q4_K_r4_cuda;
         case GGML_TYPE_Q2_K_R4:
             return dequantize_row_q2_K_r4_cuda;
+        case GGML_TYPE_Q3_K_R4:
+            return dequantize_row_q3_K_r4_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q5_K_R4:

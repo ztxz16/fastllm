@@ -212,9 +212,9 @@ static void CheckExpertCache(std::vector<Data *> *weights, int tables, int hidde
     }
     bool allHit=false,mixed=false,evicted=false,sawCpu=false,sawStaged=false;
     uint64_t previousUploads=0;
-    for(int step=0;step<96;++step) {
+    for(int step=0;step<24*tables;++step) {
         const int t=step%tables, rows=1+(step/tables)%9;
-        const int origin=single ? 0 : step%2, count=rows*topk, first=step<48 ? 0 : 12;
+        const int origin=single ? 0 : step%2, count=rows*topk, first=step<12*tables ? 0 : 12;
         std::vector<uint16_t> x(rows*hidden);
         std::vector<int32_t> ids(count);
         std::vector<float> scores(count);
@@ -238,6 +238,9 @@ static void CheckExpertCache(std::vector<Data *> *weights, int tables, int hidde
         const int gate=weights[t][2]->ggmlType,down=weights[t][3]->ggmlType;
         auto ordinary=[](int type) {
             switch(type){case GGML_TYPE_IQ2_XXS_R4:return int(GGML_TYPE_IQ2_XXS);
+                case GGML_TYPE_Q2_K_R4:return int(GGML_TYPE_Q2_K);
+                case GGML_TYPE_Q3_K_R4:return int(GGML_TYPE_Q3_K);
+                case GGML_TYPE_Q4_K_R4:return int(GGML_TYPE_Q4_K);
                 case GGML_TYPE_IQ2_S_R4:return int(GGML_TYPE_IQ2_S);
                 case GGML_TYPE_IQ3_XXS_R4:return int(GGML_TYPE_IQ3_XXS);default:return type;}
         };
@@ -326,11 +329,11 @@ static void CheckExpertCache(std::vector<Data *> *weights, int tables, int hidde
                 Require(e%2==1-d && residents.weights[e*2+1],"EP expert stored on the wrong device");
         }
         Require(stats[0][1]<uint64_t(tables*experts),"EP eviction test unexpectedly fits all experts");
-        if(step==47) {
+        if(step==12*tables-1) {
             Require(stats[0][2]==stats[0][1],"EP replacement test did not fill the cache");
             previousUploads=stats[0][5];
         }
-        if(step==95)evicted=stats[0][5]>previousUploads && stats[0][4]>0;
+        if(step==24*tables-1)evicted=stats[0][5]>previousUploads && stats[0][4]>0;
     }
     if(single) {
         if(!noCache) Require(allHit,"verify test missed all-hit execution");
@@ -470,7 +473,7 @@ int main(int argc, char **argv) {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices || (expertCache && devices<2)) {
             std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: CUDA unavailable"); return 0;
         }
-        constexpr int hidden=512, experts=24, topk=6, tables=4;
+        constexpr int hidden=512, experts=24, topk=6, tables=8;
         const int inter=resident ? 512 : 256;
         SetThreads(8);
         // Exercise both prefill GPU workers without relying on timing-based
@@ -489,17 +492,25 @@ int main(int argc, char **argv) {
         for (int t=0;t<tables;++t) {
             weights[t].resize(2*(experts+1)); dense[t].resize(2*experts);
             for (int e=0;e<experts;++e) for (int part=0;part<2;++part) {
-                const auto type=part ? (t%2 ? GGML_TYPE_IQ4_XS : GGML_TYPE_IQ3_XXS) :
-                                      (t<2 ? GGML_TYPE_IQ2_XXS : GGML_TYPE_IQ2_S);
+                const auto type=t<4 ? (part ? (t%2 ? GGML_TYPE_IQ4_XS : GGML_TYPE_IQ3_XXS) :
+                                      (t<2 ? GGML_TYPE_IQ2_XXS : GGML_TYPE_IQ2_S)) :
+                    t==4 ? GGML_TYPE_Q2_K : t==5 ? GGML_TYPE_Q3_K :
+                    t==6 || part ? GGML_TYPE_Q4_K : GGML_TYPE_Q2_K;
                 const int rows=part ? hidden : 2*inter, cols=part ? inter : hidden;
                 auto w=std::make_unique<Data>(DATA_GGUF_FORMAT,type,std::vector<int>{rows,cols});
                 w->isModelWeight=true; w->isGGUFData=true;
                 w->forceGGUFFp32Dequant=expertPrefill && t%2; w->Allocate(false);
-                for (size_t i=0;i<w->GetBytes();++i) w->cpuData[i]=rng()>>24;
-                const size_t block=ggml_type_size(type);
-                for (size_t off=0;off<w->GetBytes();off+=block) {
-                    const uint16_t scale=float_to_half(std::ldexp(resident ? (1.f + float(rng()%37)/64.f) : 1.f,-12+int(rng()%3)));
-                    memcpy(w->cpuData+off,&scale,2);
+                if (t>=4) {
+                    std::vector<float> source(rows*cols);
+                    for (auto &v:source) v=float(int(rng()%199)-99)/4096.f;
+                    ggml_type_from_float_ref(type)(source.data(),w->cpuData,source.size());
+                } else {
+                    for (size_t i=0;i<w->GetBytes();++i) w->cpuData[i]=rng()>>24;
+                    const size_t block=ggml_type_size(type);
+                    for (size_t off=0;off<w->GetBytes();off+=block) {
+                        const uint16_t scale=float_to_half(std::ldexp(resident ? (1.f + float(rng()%37)/64.f) : 1.f,-12+int(rng()%3)));
+                        memcpy(w->cpuData+off,&scale,2);
+                    }
                 }
                 auto &matrix=dense[t][2*e+part];matrix.resize(rows*cols);
                 ggml_type_to_float(type)(w->cpuData,matrix.data(),matrix.size());
@@ -513,8 +524,8 @@ int main(int argc, char **argv) {
         stride=(stride+127)/128*128;
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");
-        int cacheSlots=frequency ? 64 : 16;
-        if(verify) cacheSlots=32;
+        int cacheSlots=tables*(frequency ? 16 : 4);
+        if(verify) cacheSlots=tables*8;
         if(cacheMode==ExpertCacheTestMode::VerifyFullCache) cacheSlots=tables*experts;
         SetMoeCudaCacheBytes(noCache ? 0 : stride*cacheSlots);
         if (resident) {
@@ -553,7 +564,7 @@ int main(int argc, char **argv) {
             },noCache),"GLM GGUF registration rejected");
             Require(FastllmCudaCanRunMoeHybrid(weights[0].data(),weights[0].size()),"hybrid unavailable");
             Require(!FastllmCudaCanRunMoeCache(weights[0].data(),weights[0].size()),"generic unscored math admitted");
-            Require(!FastllmCudaMoeGlm5GGUFCacheSupported(GGML_TYPE_Q4_K,GGML_TYPE_IQ4_XS,hidden,inter),
+            Require(!FastllmCudaMoeGlm5GGUFCacheSupported(GGML_TYPE_Q5_K,GGML_TYPE_IQ4_XS,hidden,inter),
                     "unsupported GLM pair admitted");
             for (int t=0;t<tables;++t) {
                 directFixtures[t].Check(weights[t],hidden,inter);
@@ -597,7 +608,7 @@ int main(int argc, char **argv) {
                     const float a=std::min(Bf(gate),.125f), b=std::clamp(Bf(up),-.125f,.125f);
                     mid[row]=Bf((a/(1+std::exp(-a)))*b*scores[r]);
                 }
-                if (t%2==0) Q8(mid);
+                if (t%2==0 || t>=4) Q8(mid);
                 for (int row=0;row<hidden;++row) {
                     double v=0;for(int c=0;c<inter;++c) v+=double(d[row*inter+c])*mid[c];
                     per[r*hidden+row]=Bf(v);
@@ -635,7 +646,8 @@ int main(int argc, char **argv) {
                         hidden,inter,experts,topk);
                     if (rows>32 && grouped) Require(workspace.GetBytes()==grouped,
                         "supported prefill did not select grouped workspace");
-                    if (t%2) Require(grouped==0,"IQ4_XS BF16 down admitted to Q8 grouped path");
+                    if (weights[t][3]->ggmlType==GGML_TYPE_IQ4_XS)
+                        Require(grouped==0,"IQ4_XS BF16 down admitted to Q8 grouped path");
                     out.ToDevice(CPU);
                     std::vector<float> actual(rows*hidden);
                     for (int c=0;c<rows*hidden;++c)
@@ -821,7 +833,7 @@ int main(int argc, char **argv) {
         for(int device=0;device<std::min(2,devices);++device) {
             uint64_t stats[5]={};Require(fastllm_moe_cuda_cache_stats(device,stats,false),"query counters");
             Require(noCache ? stats[0]==0 && stats[1]>0 && stats[2]==0 && stats[3]==0 :
-                stats[0] && stats[1] && (frequency ? stats[3]>=64 && stats[3]<tables*experts : stats[3]==16),
+                stats[0] && stats[1] && (frequency ? stats[3]>=uint64_t(tables*16) && stats[3]<tables*experts : stats[3]==uint64_t(tables*4)),
                     "cache cold/hot/eviction or compact slots missing");
         }
         if (frequency) Require(sawCpu && sawMixed && (noCache || sawGpu) && sawStaged,

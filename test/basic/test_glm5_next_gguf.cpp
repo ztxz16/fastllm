@@ -419,9 +419,8 @@ int main(int argc, char **argv) {
         if (argc == 2 && std::string(argv[1]) == "--prefill-formats") {
             for (auto type : {BFLOAT16, FLOAT16, FLOAT32}) {
                 for (int quant : {GGML_TYPE_IQ2_XXS_R4, GGML_TYPE_IQ2_S_R4, GGML_TYPE_IQ3_XXS_R4,
-                                  GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K_R4, GGML_TYPE_Q3_K})
+                                  GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K_R4, GGML_TYPE_Q3_K, GGML_TYPE_Q3_K_R4})
                     Check(FastllmCudaGGUFPrefillSupported(type, quant), "supported GGUF CUDA prefill rejected");
-                Check(!FastllmCudaGGUFPrefillSupported(type, GGML_TYPE_Q3_K_R4), "unsupported Q3_K_R4 uploaded to CUDA");
             }
             std::cout<<"PASS GGUF NUMA prefill CUDA format dispatch\n";return 0;
         }

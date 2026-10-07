@@ -11,6 +11,7 @@ constexpr int kWarpsPerBlock = kRestoreThreads / 32;
 __host__ __device__ inline int Ordinary(int type) {
     switch (type) {
         case GGML_TYPE_Q2_K_R4: return GGML_TYPE_Q2_K;
+        case GGML_TYPE_Q3_K_R4: return GGML_TYPE_Q3_K;
         case GGML_TYPE_Q4_K_R4: return GGML_TYPE_Q4_K;
         case GGML_TYPE_IQ2_XXS_R4: return GGML_TYPE_IQ2_XXS;
         case GGML_TYPE_IQ2_XS_R4: return GGML_TYPE_IQ2_XS;
@@ -45,6 +46,36 @@ __device__ inline void Block(const uint8_t *source, uint8_t *destination,
                 packed |= ((q >> (2*((p%16)/4))) & 3) << (2*k);
             }
             d.qs[b] = packed;
+        }
+    } else if (type == GGML_TYPE_Q3_K_R4) {
+        const auto &s = reinterpret_cast<const block_q3_k_r4 *>(source)[r4];
+        auto &d = reinterpret_cast<block_q3_K *>(destination)[i];
+        if (lane == 0) d.d = s.d[rlane];
+        if (lane < 4) {
+            unsigned scales[4];
+            for (int g=0; g<4; ++g) {
+                const int index=4*(lane+4*g)+rlane;
+                scales[g]=((s.scales_l[index%32] >> (4*(index/32))) & 15) |
+                    (((s.scales_h[index%16] >> (2*(index/16))) & 3) << 4);
+            }
+            d.scales[lane]=(scales[0]&15) | ((scales[2]&15)<<4);
+            d.scales[lane+4]=(scales[1]&15) | ((scales[3]&15)<<4);
+            d.scales[lane+8]=(scales[0]>>4) | ((scales[1]>>4)<<2) |
+                ((scales[2]>>4)<<4) | ((scales[3]>>4)<<6);
+        }
+        unsigned high=0;
+        for (int g=0; g<8; ++g) {
+            high |= ((s.qh[16*g+4*rlane+lane%4] >> (lane/4)) & 1) << g;
+        }
+        d.hmask[lane]=high;
+        for (int b=lane; b<64; b+=32) {
+            unsigned packed=0;
+            for (int k=0; k<4; ++k) {
+                const int c=(b/32)*128+b%32+k*32, p=c%32;
+                const unsigned q=s.qs[32*(c/32)+4*rlane+p%4+16*(p/16)];
+                packed |= ((q >> (2*((p%16)/4))) & 3) << (2*k);
+            }
+            d.qs[b]=packed;
         }
     } else if (type == GGML_TYPE_Q4_K_R4) {
         const auto &s = reinterpret_cast<const block_q4_k_r4 *>(source)[r4];
@@ -268,6 +299,7 @@ static __global__ void Records(Record layout, void *const *pointers,
         } else {
             switch (w.type) {
                 case GGML_TYPE_Q2_K_R4: PackedRows<GGML_TYPE_Q2_K_R4, block_q2_k_r4>(w, sources, output, shards, part == 0, tile); break;
+                case GGML_TYPE_Q3_K_R4: PackedRows<GGML_TYPE_Q3_K_R4, block_q3_k_r4>(w, sources, output, shards, part == 0, tile); break;
                 case GGML_TYPE_Q4_K_R4: PackedRows<GGML_TYPE_Q4_K_R4, block_q4_k_r4>(w, sources, output, shards, part == 0, tile); break;
                 case GGML_TYPE_IQ2_XXS_R4: PackedRows<GGML_TYPE_IQ2_XXS_R4, block_iq2_xxs_r4>(w, sources, output, shards, part == 0, tile); break;
                 case GGML_TYPE_IQ2_XS_R4: PackedRows<GGML_TYPE_IQ2_XS_R4, block_iq2_xs_r4>(w, sources, output, shards, part == 0, tile); break;

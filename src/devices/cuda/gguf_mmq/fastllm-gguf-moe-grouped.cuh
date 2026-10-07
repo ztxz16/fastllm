@@ -280,7 +280,7 @@ static void Matrix(int type, const uint8_t *const *weights, int part, Workspace 
         else LaunchMatrix<GGML_TYPE_##T>(weights, part, w, experts, columns, width, stream); break;
         GROUPED_CASE(Q2_0) GROUPED_CASE(IQ2_XXS) GROUPED_CASE(IQ2_XS) GROUPED_CASE(IQ2_S)
         GROUPED_CASE(IQ3_XXS) GROUPED_CASE(IQ3_S) GROUPED_CASE(IQ4_NL) GROUPED_CASE(IQ4_XS)
-        GROUPED_CASE(Q8_0) GROUPED_CASE(Q2_K) GROUPED_CASE(Q4_K)
+        GROUPED_CASE(Q8_0) GROUPED_CASE(Q2_K) GROUPED_CASE(Q3_K) GROUPED_CASE(Q4_K)
 #undef GROUPED_CASE
     }
 }

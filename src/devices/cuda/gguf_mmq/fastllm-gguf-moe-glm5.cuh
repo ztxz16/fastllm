@@ -21,7 +21,7 @@ __global__ void QuantizeGlm5(const __nv_bfloat16 *input, block_q8_K *output, int
 
 static void RunGlm5(const __nv_bfloat16 *input, __nv_bfloat16 *gate, __nv_bfloat16 *output,
                     const uint8_t *const *weights, const int *indices, const float *scores,
-                    Workspace &w, int gateType, int rows, int hidden, int inter,
+                    Workspace &w, int gateType, int downType, int rows, int hidden, int inter,
                     int experts, int topk, float limit) {
     const auto stream = cudaStreamPerThread;
     const int routes = rows*topk;
@@ -37,7 +37,7 @@ static void RunGlm5(const __nv_bfloat16 *input, __nv_bfloat16 *gate, __nv_bfloat
     QuantizeGlm5<<<dim3(inter/256, routes), 256, 0, stream>>>(gate, q, inter);
     GatherV41<<<dim3((w.capacity+7)/8, inter/128), 256, 0, stream>>>(
         q, w.quantized, w.groupRoutes, w.offsets+experts, inter, w.capacity, 1);
-    Matrix(GGML_TYPE_IQ3_XXS, weights, 1, w, experts, inter, hidden, stream);
+    Matrix(downType, weights, 1, w, experts, inter, hidden, stream);
     ReduceV41<<<(rows*hidden+255)/256, 256, 0, stream>>>(w.products, output,
         w.routeGroups, indices, rows, hidden, topk);
 }

@@ -1871,7 +1871,7 @@ bool FastllmCudaMoeGGUFCacheNumaSupported(int gateType, int downType,
     int hidden, int inter, int rows);
 bool FastllmCudaMoeGlm5GGUFCacheSupported(int gateType, int downType, int hidden, int inter);
 bool FastllmCudaMoeGlm5GGUFCacheNumaSupported(int gateType, int downType, int hidden, int inter);
-// Canonical or supported NUMA IQ2 gate/up + IQ3/IQ4 down records. Match GLM GGUF's Q8_K
+// Canonical or supported NUMA IQ/K-quant records. Match GLM GGUF's Q8_K
 // activations, asymmetric clamp, score placement and BF16 boundaries.
 bool FastllmCudaMoeGlm5GGUFCacheCompute(
         const fastllm::Data &input, fastllm::Data &activation,

@@ -22,8 +22,11 @@ size_t fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(int gateType, int downType,
     using namespace fastllm_gguf_mmq;
     // IQ4_XS down uses a BF16 dot in GLM. Quantizing it to Q8 would change
     // the model's arithmetic, so retain GEMV for that type pair.
-    if ((gateType != GGML_TYPE_IQ2_XXS && gateType != GGML_TYPE_IQ2_S) ||
-        downType != GGML_TYPE_IQ3_XXS || rows <= 0 || rows > 4096 ||
+    const auto kType = [](int type) {
+        return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K;
+    };
+    if ((gateType != GGML_TYPE_IQ2_XXS && gateType != GGML_TYPE_IQ2_S && !kType(gateType)) ||
+        (downType != GGML_TYPE_IQ3_XXS && !kType(downType)) || rows <= 0 || rows > 4096 ||
         hidden <= 0 || hidden > 24576 || hidden%256 ||
         inter <= 0 || inter > 24576 || inter%256 ||
         experts <= 0 || experts > 1024 || topk <= 0 || topk > 16 ||
@@ -46,7 +49,7 @@ bool fastllm_gguf_mmq::RunGlm5Grouped(const fastllm::Data &input, fastllm::Data 
     grouped_moe::PrepareRoutes(weights, indices, w, rows*topk, experts, cudaStreamPerThread);
     grouped_moe::RunGlm5(static_cast<const __nv_bfloat16 *>(input.cudaData),
         static_cast<__nv_bfloat16 *>(gate.cudaData), static_cast<__nv_bfloat16 *>(output.cudaData),
-        weights, indices, scores, w, gateType, rows, hidden, inter, experts, topk, swigluLimit);
+        weights, indices, scores, w, gateType, downType, rows, hidden, inter, experts, topk, swigluLimit);
     return cudaGetLastError() == cudaSuccess;
 }
 
