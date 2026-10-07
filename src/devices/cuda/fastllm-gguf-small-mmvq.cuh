@@ -665,10 +665,14 @@ static void LaunchBatchTokens(const void *weights, const block_q8_1 *input, Outp
         }
     } else {
         constexpr int largeBatch = Type == GGML_TYPE_Q4_K ? 4 : 5;
-        if (Tokens >= largeBatch && rows >= 4096) {
-            LaunchRows<Type, Tokens, 16, Output, StoreMode>(weights, input, output, columns, rows, inputStride, outputStride,
-                                         stream);
-            return;
+        // Discard the larger CTA at compile time for small token batches;
+        // a runtime condition still instantiates its unreachable CUDA kernel.
+        if constexpr (Tokens >= largeBatch) {
+            if (rows >= 4096) {
+                LaunchRows<Type, Tokens, 16, Output, StoreMode>(
+                    weights, input, output, columns, rows, inputStride, outputStride, stream);
+                return;
+            }
         }
     }
     LaunchRows<Type, Tokens, 8, Output, StoreMode>(weights, input, output, columns, rows, inputStride, outputStride, stream);

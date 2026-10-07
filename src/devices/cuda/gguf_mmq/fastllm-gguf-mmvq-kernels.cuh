@@ -244,10 +244,13 @@ static void launch_extended_mmvq_rows(
     const dim3 blocks(
         (output_rows + rows_per_block - 1) / rows_per_block, 1, 1);
     const dim3 threads(threads_x, nwarps, 1);
+    // The caller always selects four warps for 1..4 rows.
 #define FASTLLM_LAUNCH_MMVQ_ROWS(row_count)                              \
-    mul_mat_vec_extended<type, row_count, nwarps, OutputType, StoreMode>            \
-        <<<blocks, threads, 0, stream>>>(                                 \
-            weight, input, output, input_columns, output_rows)
+    if constexpr (row_count > 4 || nwarps == 4) {                       \
+        mul_mat_vec_extended<type, row_count, nwarps, OutputType, StoreMode> \
+            <<<blocks, threads, 0, stream>>>(                          \
+                weight, input, output, input_columns, output_rows);    \
+    }
     switch (rows) {
         case 1: FASTLLM_LAUNCH_MMVQ_ROWS(1); break;
         case 2: FASTLLM_LAUNCH_MMVQ_ROWS(2); break;
@@ -271,11 +274,14 @@ static void launch_extended_gate_up_rows(
     const dim3 blocks(
         (output_rows + rows_per_block - 1) / rows_per_block, 1, 1);
     const dim3 threads(WARP_SIZE, nwarps, 1);
+    // Match launch_extended_gate_up_type's warp selection before instantiation.
 #define FASTLLM_LAUNCH_GATE_UP_ROWS(row_count)                           \
-    mul_mat_vec_gate_up_extended<type, row_count, nwarps>                \
-        <<<blocks, threads, 0, stream>>>(                                 \
-            gate_weight, up_weight, input, output,                       \
-            input_columns, output_rows)
+    if constexpr (row_count > 4 || nwarps == 4) {                       \
+        mul_mat_vec_gate_up_extended<type, row_count, nwarps>            \
+            <<<blocks, threads, 0, stream>>>(                          \
+                gate_weight, up_weight, input, output,                 \
+                input_columns, output_rows);                          \
+    }
     switch (rows) {
         case 1: FASTLLM_LAUNCH_GATE_UP_ROWS(1); break;
         case 2: FASTLLM_LAUNCH_GATE_UP_ROWS(2); break;

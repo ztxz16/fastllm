@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include "../../src/devices/cuda/moe/fastllm-moe-gguf-restore.cuh"
+#include "../../src/devices/cuda/fastllm-gguf-mmvq-dispatch.cuh"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -289,6 +290,62 @@ template<class T> static void Run(ggml_type type, fastllm::DataType dtype, int b
 }
 // Validate FP32 MMQ/MMVQ against CPU-decoded weights and an independent Q8
 // activation oracle. Exact activations also cover the FP16 metadata layouts.
+// Call the declaration-only MMVQ interface with its original default template
+// arguments. This catches missing explicit instantiations after CUDA splitting
+// and keeps the multi-matrix/indirect-expert path covered by a CPU oracle.
+static void RunLegacyMmvqDispatch() {
+    constexpr int columns = 256, width = 47, matrices = 2;
+    auto weight = Weight(GGML_TYPE_Q5_0, matrices * width, columns, 5, true);
+    const auto decoded = Decode(*weight);
+    weight->ToDevice(fastllm::CUDA, {0}, true);
+    const int previous = fastllm::FastllmCudaGetLinearExactBatchThreshold();
+    for (int batch = 1; batch <= 8; ++batch) {
+        std::vector<block_q8_1> input(matrices * batch * (columns / QK8_1));
+        for (size_t b = 0; b < input.size(); ++b) {
+            auto &q = input[b];
+            q.d = __half_as_ushort(__float2half_rn(1.0f / 64));
+            int sum = 0;
+            for (int j = 0; j < QK8_1; ++j) {
+                q.qs[j] = int((b * 13 + j * 7) % 63) - 31;
+                sum += q.qs[j];
+            }
+            q.s = __half_as_ushort(__float2half_rn(sum / 64.0f));
+        }
+        fastllm::Data x(fastllm::FLOAT32, {int(input.size() * sizeof(block_q8_1) / sizeof(float))});
+        fastllm::Data y(fastllm::FLOAT32, {matrices, batch, width}), ids(fastllm::INT32, {matrices});
+        Gpu(x); Gpu(y); Gpu(ids);
+        const int selected[] = {1, 0};
+        Cuda(cudaMemcpy(x.cudaData, input.data(), input.size() * sizeof(block_q8_1), cudaMemcpyHostToDevice));
+        Cuda(cudaMemcpy(ids.cudaData, selected, sizeof(selected), cudaMemcpyHostToDevice));
+        for (int groups : {1, matrices}) for (int threshold : {0, 9}) {
+            fastllm::FastllmCudaSetLinearExactBatchThreshold(threshold);
+            mul_mat_vec_q_cuda<GGML_TYPE_Q5_0, float>(
+                weight->cudaData, x.cudaData, static_cast<float *>(y.cudaData),
+                groups == 1 ? nullptr : static_cast<const char *>(ids.cudaData),
+                columns, width, columns, batch, width, groups,
+                width * ggml_row_size(GGML_TYPE_Q5_0, columns),
+                batch * (columns / QK8_1) * sizeof(block_q8_1),
+                batch * width * sizeof(float), sizeof(int), cudaStreamPerThread);
+            Cuda(cudaGetLastError());
+            std::vector<float> actual(groups * batch * width);
+            Cuda(cudaMemcpy(actual.data(), y.cudaData, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int g = 0; g < groups; ++g) for (int t = 0; t < batch; ++t) for (int row = 0; row < width; ++row) {
+                const int expert = groups == 1 ? 0 : selected[g];
+                double reference = 0, magnitude = 0;
+                for (int c = 0; c < columns; ++c) {
+                    const auto &q = input[(g * batch + t) * (columns / QK8_1) + c / QK8_1];
+                    const double term = decoded[(expert * width + row) * columns + c] *
+                        (double(q.qs[c % QK8_1]) / 64);
+                    reference += term; magnitude += std::fabs(term);
+                }
+                Require(std::fabs(actual[(g * batch + t) * width + row] - reference) <=
+                        2e-5 * std::max(1.0, magnitude), "legacy MMVQ dispatch disagrees with CPU oracle");
+            }
+        }
+    }
+    fastllm::FastllmCudaSetLinearExactBatchThreshold(previous);
+}
+
 static void RunFloatGgufMatmul(ggml_type type, int batch, int columns, int width, bool exactActivation = false) {
     const auto matmul = batch <= 8 ? FastllmCudaFloatMatMulGGUFMMVQ : FastllmCudaFloatMatMulGGUFMMQ;
     auto weight = Weight(type, width, columns, 5, true);
@@ -1661,6 +1718,7 @@ int main(int argc, char **argv) {
             if (properties.major*10+properties.minor < 75) {
                 std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: MMQ requires SM75+"); return 0;
             }
+            RunLegacyMmvqDispatch();
             // Exercise the separately compiled MMVQ kernels, especially the
             // IQ1 table initialization, against the CPU oracle on first use.
             for (auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M})

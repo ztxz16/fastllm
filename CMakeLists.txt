@@ -388,6 +388,7 @@ if (USE_CUDA)
         src/devices/cuda/fastllm-gguf-planar.cu
         src/devices/cuda/fastllm-gguf-planar-mixed.cu
         src/devices/cuda/gguf_mmq/fastllm-gguf-mmq.cu
+        src/devices/cuda/gguf_mmq/fastllm-gguf-mmq-output.cu
         src/devices/cuda/gguf_mmq/fastllm-gguf-mmvq-q.cu
         src/devices/cuda/gguf_mmq/fastllm-gguf-mmvq-iq1.cu
         src/devices/cuda/gguf_mmq/fastllm-gguf-mmvq-iq2.cu
