@@ -184,10 +184,17 @@ static void CheckVerifyCpu(std::vector<Data *> &weights, int hidden, int layer) 
     }
 }
 
-static void CheckExpertCache(std::vector<Data *> *weights, int tables, int hidden, int inter) {
+enum class ExpertCacheTestMode { Parallel, Verify, VerifyNoCache, VerifyFullCache };
+
+static void CheckExpertCache(std::vector<Data *> *weights, int tables, int hidden, int inter,
+                             ExpertCacheTestMode mode) {
     constexpr int topk=6;
+    const bool single=mode!=ExpertCacheTestMode::Parallel;
+    const bool noCache=mode==ExpertCacheTestMode::VerifyNoCache;
+    const bool fullCache=mode==ExpertCacheTestMode::VerifyFullCache;
     const int experts=(weights[0].size()-2)/2;
-    const std::vector<int> devices{1,0};
+    const std::vector<int> devices=single ? std::vector<int>{0} : std::vector<int>{1,0};
+    const std::vector<int> noDevices;
     std::vector<std::unique_ptr<Data>> records;
     std::vector<size_t> strides, gateBytes;
     for(int t=0;t<tables;++t) {
@@ -203,11 +210,11 @@ static void CheckExpertCache(std::vector<Data *> *weights, int tables, int hidde
         data->ToDevice(CUDA,std::vector<int>{0}); records.push_back(std::move(data));
         strides.push_back(stride);gateBytes.push_back(gate);
     }
-    bool allHit=false,mixed=false,evicted=false;
+    bool allHit=false,mixed=false,evicted=false,sawCpu=false,sawStaged=false;
     uint64_t previousUploads=0;
     for(int step=0;step<96;++step) {
-        const int t=step%tables, rows=std::vector<int>{1,2,3,4,5,7,8,9}[(step/tables)%8];
-        const int origin=step%2, count=rows*topk, first=step<48 ? 0 : 12;
+        const int t=step%tables, rows=1+(step/tables)%9;
+        const int origin=single ? 0 : step%2, count=rows*topk, first=step<48 ? 0 : 12;
         std::vector<uint16_t> x(rows*hidden);
         std::vector<int32_t> ids(count);
         std::vector<float> scores(count);
@@ -218,7 +225,7 @@ static void CheckExpertCache(std::vector<Data *> *weights, int tables, int hidde
         }
         for(int row=0;row<rows;++row) ids[row*topk+2]=ids[row*topk+3];
         // Same packed records and complete reduction dimension as the ordinary
-        // unsharded GPU adapter. All-hit EP output must be bitwise identical.
+        // unsharded GPU adapter. All-hit output must be bitwise identical.
         Cuda(cudaSetDevice(0));
         Data rx(BFLOAT16,{rows,hidden},CPU,x.data()),ri(INT32,{count},CPU,ids.data()),
              rs(FLOAT32,{count},CPU,scores.data()),scratch(FLOAT32,{rows*(hidden+topk*inter)}),
@@ -239,7 +246,7 @@ static void CheckExpertCache(std::vector<Data *> *weights, int tables, int hidde
             hidden,inter,scratch.cudaData,size_t(scratch.GetBytes())};
         v.numaGateType=gate;v.numaDownType=down;
         Require(FastllmCudaMoeGlm5GGUFCacheCompute(rx,activation,v,static_cast<float *>(rs.cudaData),topk,.125f,
-            static_cast<float *>(per.cudaData)),"EP oracle rejected");
+            static_cast<float *>(per.cudaData)),"GGUF oracle rejected");
         per.ToDevice(CPU);std::vector<uint16_t> expected(rows*hidden);
         for(int row=0;row<rows;++row) {
             std::vector<int> order(topk);for(int k=0;k<topk;++k)order[k]=k;
@@ -255,40 +262,56 @@ static void CheckExpertCache(std::vector<Data *> *weights, int tables, int hidde
         input.ToDevice(CUDA,std::vector<int>{origin});
         index.ToDevice(CUDA,std::vector<int>{origin});
         score.ToDevice(CUDA,std::vector<int>{origin});
-        void *state=FastllmCudaBeginMoeDecode(weights[t].data(),weights[t].size(),topk,&devices);
-        Require(state!=nullptr,"EP cache scope unavailable");
+        // Exercise both implicit and explicit device selection for every quantization pair.
+        const auto &requestedDevices=single && (step/tables)%2 ? noDevices : devices;
+        void *state=FastllmCudaBeginMoeDecode(weights[t].data(),weights[t].size(),topk,
+            requestedDevices.empty() ? nullptr : &requestedDevices);
+        Require(state!=nullptr,"GGUF cache scope unavailable");
         uint64_t before[2][8]{},after[2][8]{},beforeCache[2][5]{};
-        for(int d=0;d<2;++d) {
-            Require(fastllm_moe_cuda_cache_route_stats(d,before[d]),"EP before routes");
-            Require(fastllm_moe_cuda_cache_stats(d,beforeCache[d],false),"EP before cache counters");
+        for(int d:devices) {
+            Require(fastllm_moe_cuda_cache_route_stats(d,before[d]),"GGUF before routes");
+            Require(fastllm_moe_cuda_cache_stats(d,beforeCache[d],false),"GGUF before cache counters");
         }
         Cuda(cudaSetDevice(origin));int callbacks=0;
         Require(FastllmCudaMergeMOEHybridOnDevices(input,index,score,output,weights[t].data(),weights[t].size(),
-            t,devices,[&]{++callbacks;Cuda(cudaSetDevice(1-origin));}),"EP cache dispatch rejected");
-        Require(callbacks==1 && FastllmCudaGetDevice()==origin,"EP callback or device restoration");
+            t,requestedDevices,
+            [&]{++callbacks;Cuda(cudaSetDevice(single ? origin : 1-origin));}),"GGUF cache dispatch rejected");
+        Require(callbacks==1 && FastllmCudaGetDevice()==origin,"GGUF callback or device restoration");
         FastllmCudaEndMoeDecode(state);
         uint64_t routes=0,hits=0,computed=0,queries=0,queryHits=0;
-        for(int d=0;d<2;++d) {
-            Require(fastllm_moe_cuda_cache_route_stats(d,after[d]),"EP after routes");
+        for(int d:devices) {
+            Require(fastllm_moe_cuda_cache_route_stats(d,after[d]),"GGUF after routes");
             routes+=after[d][1]-before[d][1];hits+=after[d][2]-before[d][2];
             computed+=after[d][4]-before[d][4]+after[d][5]-before[d][5];
+            sawCpu|=after[d][5]>before[d][5];
+            sawStaged|=after[d][4]-before[d][4]>after[d][2]-before[d][2];
             uint64_t cache[5]{};
-            Require(fastllm_moe_cuda_cache_stats(d,cache,false),"EP cache counters");
+            Require(fastllm_moe_cuda_cache_stats(d,cache,false),"GGUF cache counters");
             queryHits+=cache[0]-beforeCache[d][0];
             queries+=cache[0]-beforeCache[d][0]+cache[1]-beforeCache[d][1];
+            if(single) {
+                if(noCache) Require(cache[2]==0 && cache[3]==0 && cache[0]==0,
+                    "zero-cache verify allocated resident experts or reported hits");
+                else {
+                    Require(cache[2]>0 && cache[3]>0,"verify cache is empty");
+                    Require(fullCache ? cache[3]==cache[4] : cache[3]<cache[4],
+                        "verify cache capacity does not match the test mode");
+                }
+            }
         }
-        Require(routes==count && computed==count && hits<=routes,"EP duplicated or lost logical routes");
-        Require(queries==routes && queryHits==hits,"EP cache query counters differ from logical routes");
+        Require(routes==count && computed==count && hits<=routes,"GGUF duplicated or lost logical routes");
+        Require(queries==routes && queryHits==hits,"GGUF cache query counters differ from logical routes");
         output.ToDevice(CPU);
         if(hits==routes) {
             allHit=true;
-            Require(std::memcmp(output.cpuData,expected.data(),expected.size()*2)==0,"EP all-hit differs from unsharded GPU output");
+            Require(std::memcmp(output.cpuData,expected.data(),expected.size()*2)==0,"GGUF all-hit differs from unsharded GPU output");
         } else {
             mixed|=hits>0;
             std::vector<float> a(expected.size()),b(expected.size());
             for(size_t i=0;i<a.size();++i){a[i]=BFloat16BitsToFloat32(reinterpret_cast<uint16_t *>(output.cpuData)[i]);b[i]=BFloat16BitsToFloat32(expected[i]);}
-            Compare(a,b,"EP CPU/miss/cached mixture vs GPU oracle");
+            Compare(a,b,"GGUF CPU/miss/cached mixture vs GPU oracle");
         }
+        if(single) continue;
         uint64_t stats[2][6]{};
         for(int d=0;d<2;++d)Require(fastllm_moe_cuda_cache_ep_stats(d,stats[d]),"EP physical counters");
         Require(stats[0][0]==2 && stats[1][0]==2 && stats[0][1]==stats[1][1] &&
@@ -309,14 +332,20 @@ static void CheckExpertCache(std::vector<Data *> *weights, int tables, int hidde
         }
         if(step==95)evicted=stats[0][5]>previousUploads && stats[0][4]>0;
     }
-    Require(allHit && mixed && evicted,"EP test missed hits, mixed routes or replacement");
-    for(int d=0;d<2;++d) {
+    if(single) {
+        if(!noCache) Require(allHit,"verify test missed all-hit execution");
+        if(!fullCache) Require(sawCpu && sawStaged,"verify test missed CPU or streamed GPU routes");
+        if(!noCache && !fullCache) Require(mixed,"verify test missed mixed hit/miss execution");
+    } else Require(allHit && mixed && evicted,"EP test missed hits, mixed routes or replacement");
+    for(int d:devices) {
         uint64_t cache[5]{};
-        Require(fastllm_moe_cuda_cache_stats(d,cache,true),"EP counter reset");
+        Require(fastllm_moe_cuda_cache_stats(d,cache,true),"GGUF counter reset");
         Require(fastllm_moe_cuda_cache_stats(d,cache,false) && cache[0]==0 && cache[1]==0 &&
-            cache[2]>0 && cache[3]>0,"EP reset changed capacity or left stale counts");
+            (noCache ? cache[2]==0 && cache[3]==0 : cache[2]>0 && cache[3]>0),
+            "cache reset changed capacity or left stale counts");
     }
-    std::puts("PASS: GLM GGUF EP cache, whole experts, modulo ownership, frequency, replacement, rows 1/2/3/4/5/7/8/9, bitwise all-hit");
+    std::puts(single ? "PASS: GLM GGUF verify, rows 1-9, output, routing and cache capacity" :
+        "PASS: GLM GGUF EP cache, whole experts, modulo ownership, frequency, replacement, rows 1-9, bitwise all-hit");
 }
 
 static void CheckExpertPrefill(std::vector<Data *> *tables, int count, int hidden, bool numa=false) {
@@ -425,12 +454,18 @@ static void CheckExpertPrefill(std::vector<Data *> *tables, int count, int hidde
 
 int main(int argc, char **argv) {
     try {
-        const bool numaPrefill = argc > 1 && std::string(argv[1]) == "--ep-numa-prefill";
-        const bool expertPrefill = numaPrefill || (argc > 1 && std::string(argv[1]) == "--ep-prefill");
-        const bool expertCache = expertPrefill || (argc > 1 && std::string(argv[1]) == "--ep-cache");
-        const bool resident = argc > 1 && std::string(argv[1]) == "--resident";
-        const bool noCache = argc > 1 && std::string(argv[1]) == "--no-cache";
-        const bool frequency = noCache || (argc > 1 && std::string(argv[1]) == "--frequency");
+        const std::string option=argc>1 ? argv[1] : "";
+        const bool numaPrefill=option=="--ep-numa-prefill";
+        const bool expertPrefill=numaPrefill || option=="--ep-prefill";
+        const bool expertCache=expertPrefill || option=="--ep-cache";
+        const bool resident=option=="--resident";
+        ExpertCacheTestMode cacheMode=ExpertCacheTestMode::Parallel;
+        if(option=="--verify") cacheMode=ExpertCacheTestMode::Verify;
+        else if(option=="--verify-no-cache") cacheMode=ExpertCacheTestMode::VerifyNoCache;
+        else if(option=="--verify-full-cache") cacheMode=ExpertCacheTestMode::VerifyFullCache;
+        const bool verify=cacheMode!=ExpertCacheTestMode::Parallel;
+        const bool noCache=option=="--no-cache" || cacheMode==ExpertCacheTestMode::VerifyNoCache;
+        const bool frequency=noCache || option=="--frequency";
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices || (expertCache && devices<2)) {
             std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: CUDA unavailable"); return 0;
@@ -478,7 +513,10 @@ int main(int argc, char **argv) {
         stride=(stride+127)/128*128;
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");
-        SetMoeCudaCacheBytes(noCache ? 0 : stride*(frequency ? 64 : 16));
+        int cacheSlots=frequency ? 64 : 16;
+        if(verify) cacheSlots=32;
+        if(cacheMode==ExpertCacheTestMode::VerifyFullCache) cacheSlots=tables*experts;
+        SetMoeCudaCacheBytes(noCache ? 0 : stride*cacheSlots);
         if (resident) {
             for (int t=0;t<tables;++t) for (size_t i=2;i<weights[t].size();++i) {
                 auto &w = *weights[t][i];
@@ -523,9 +561,9 @@ int main(int argc, char **argv) {
             }
             std::puts("PASS: GLM direct NUMA layout and scored CPU verify rows 1/2/3/4/7/9/17");
         }
-        if(expertCache) {
+        if(expertCache || verify) {
             if(expertPrefill) CheckExpertPrefill(weights,tables,hidden,numaPrefill);
-            else CheckExpertCache(weights,tables,hidden,inter);
+            else CheckExpertCache(weights,tables,hidden,inter,cacheMode);
             FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size());
             ClearNumasMoeRuntimeCache();return 0;
         }

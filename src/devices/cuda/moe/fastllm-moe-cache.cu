@@ -3281,15 +3281,17 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
         checkCudaErrors("MoE EP begin restore", cudaSetDevice(previous));
         return cache;
     }
+    // GGUF verification also needs an active scope when all experts fit.
     if ((group->layout.weightType == fastllm::DataType::DATA_GGUF_FORMAT ||
          (group->layout.glm5 && NativeSharedRecords(*group))) &&
-        cache->slots < int(group->totalRecords)) {
+        (cache->slots < int(group->totalRecords) ||
+         (group->layout.glm5 && group->layout.weightType == fastllm::DATA_GGUF_FORMAT))) {
         PrepareFrequencyPolicy(group, cache);
         cache->frequency->BeginStep();
         cache->frequencyActive = true;
         return cache;
     }
-    // GLM's fully resident cache retains its existing scheduler.
+    // Fully resident compact NVFP4 retains its existing scheduler.
     if (group->layout.glm5) return nullptr;
     if (!cache->decode) {
         cache->decode = std::make_unique<DecodePolicyState>(
@@ -3712,6 +3714,11 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
         if (!group) return false;
         if (input.dataType == fastllm::DataType::BFLOAT16 && group->layout.deepSeekV41)
             return TryV41VerifyHybrid(input, index, score, output, weights, weightsBatch, layer, launchParallel);
+        if (group->layout.glm5 && group->layout.weightType == fastllm::DATA_GGUF_FORMAT) {
+            auto *cache = GetDeviceCache(*group);
+            return cache && TryGlm5MultiGpuHybrid(*group, *cache, table,
+                input, index, score, output, weights, weightsBatch, layer, launchParallel, devices);
+        }
         if (group->layout.deepSeekV41 || (group->layout.glm5 ?
             input.dataType != fastllm::DataType::BFLOAT16 || !NativeSharedRecords(*group) :
             input.dataType != fastllm::DataType::FLOAT32)) return false;

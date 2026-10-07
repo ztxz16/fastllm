@@ -121,7 +121,9 @@ bool TryGlm5MultiGpuHybrid(OffloadGroup &group, DeviceCache &origin, int table,
                 entry.second->hostKeyToSlot && (!allowedDevices ||
                 std::find(allowedDevices->begin(), allowedDevices->end(), entry.first) != allowedDevices->end()))
                 caches.push_back(entry.second.get());
-        if (caches.size() < 2) return false;
+        // GGUF verification shares the resident/miss scheduler even with one
+        // GPU. Keep the existing single-row and compact NVFP4 dispatch paths.
+        if (caches.size() < 2 && (rows == 1 || layout.weightType != DATA_GGUF_FORMAT)) return false;
         if (!group.cooperativeHybrid) group.cooperativeHybrid = std::make_shared<Glm5MultiGpuHybrid>();
         shared = group.cooperativeHybrid;
     }
@@ -248,7 +250,7 @@ bool TryGlm5MultiGpuHybrid(OffloadGroup &group, DeviceCache &origin, int table,
     checkCudaErrors("GLM output device", cudaSetDevice(origin.device));
     allocate(r.ids, INT32, {rows, topk}, origin.device);
     allocate(r.owners, INT32, {rows, topk}, origin.device);
-    allocate(root.received, FLOAT32, {routes, hidden}, origin.device);
+    if (work.size() > 1) allocate(root.received, FLOAT32, {routes, hidden}, origin.device);
     allocate(output, BFLOAT16, {rows, hidden}, origin.device);
     // Only the expert's permanent owner updates its frequency. Temporary
     // miss offload may still choose any device independently of cache placement.
