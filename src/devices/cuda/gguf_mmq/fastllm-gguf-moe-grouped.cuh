@@ -97,7 +97,7 @@ static bool MatrixType(int type, int columns) {
 }
 static size_t Align(size_t x) { return (x+255)&~size_t(255); }
 struct Workspace {
-    int capacity, inputRows;
+    int capacity, inputRows, activeRows;
     int *counts, *offsets, *cursors, *tileExperts, *groupRoutes, *routeGroups;
     block_q8_1_mmq *quantized;
     float *products;
@@ -105,6 +105,7 @@ struct Workspace {
     Workspace(void *base, int rows, int hidden, int inter, int experts, int topk) : inputRows(rows) {
         const int routes = rows*topk;
         capacity = ((routes+experts*(kTile-1)+kTile-1)/kTile)*kTile;
+        activeRows = capacity;
         size_t used = 0;
         auto take = [&](size_t n) -> void * {
             void *p = base ? static_cast<char *>(base)+used : nullptr;
@@ -304,16 +305,22 @@ static void LaunchMatrix(const uint8_t *const *weights, int part, Workspace &w,
     std::call_once(initialized[device], [shared]() {
         CUDA_CHECK(cudaFuncSetAttribute(Matmul<Type, Tile>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared));
     });
-    Matmul<Type, Tile><<<dim3((width+get_mmq_y_host(cc)-1)/get_mmq_y_host(cc), w.capacity/kTile),
+    Matmul<Type, Tile><<<dim3((width+get_mmq_y_host(cc)-1)/get_mmq_y_host(cc), w.activeRows/kTile),
         dim3(32, MMQ_NWARPS), shared, stream>>>(weights, part, w.quantized, w.products,
             w.counts, w.offsets, w.tileExperts, experts, columns, width, w.capacity,
             int(ggml_row_size(Type, columns)));
 }
 static void Matrix(int type, const uint8_t *const *weights, int part, Workspace &w,
                     int experts, int columns, int width, cudaStream_t stream) {
+    // Short expert batches waste half of a 64-row tile on Turing. Use a
+    // narrower tile based on the routed batch, independent of model dimensions.
+    const bool compactTuring = w.inputRows >= 1024 &&
+        int64_t(w.activeRows) <= int64_t(experts) * 48 &&
+        ggml_cuda_info().devices[ggml_cuda_get_device()].cc == CC_TURING;
     switch (type) {
 #define GROUPED_CASE(T) case GGML_TYPE_##T: \
-        if (w.inputRows >= 1024) LaunchMatrix<GGML_TYPE_##T, 64>(weights, part, w, experts, columns, width, stream); \
+        if (compactTuring) LaunchMatrix<GGML_TYPE_##T, 32>(weights, part, w, experts, columns, width, stream); \
+        else if (w.inputRows >= 1024) LaunchMatrix<GGML_TYPE_##T, 64>(weights, part, w, experts, columns, width, stream); \
         else LaunchMatrix<GGML_TYPE_##T>(weights, part, w, experts, columns, width, stream); break;
         GROUPED_CASE(Q2_0) GROUPED_CASE(IQ2_XXS) GROUPED_CASE(IQ2_XS) GROUPED_CASE(IQ2_S)
         GROUPED_CASE(IQ3_XXS) GROUPED_CASE(IQ3_S) GROUPED_CASE(IQ4_NL) GROUPED_CASE(IQ4_XS)
@@ -381,7 +388,6 @@ struct StreamedWorkspace {
     block_q8_1 *input;
     block_q8_1_mmq *quantized;
     float *products, *routes;
-    void *gate;
     size_t bytes;
     StreamedWorkspace(void *base, int rows, int hidden, int inter, int topk, int capacity) {
         size_t used = 0;
@@ -393,26 +399,35 @@ struct StreamedWorkspace {
         quantized = static_cast<block_q8_1_mmq *>(take(size_t(capacity) *
             (((std::max(hidden, inter) + 255) / 256) * 2) * sizeof(block_q8_1_mmq)));
         products = static_cast<float *>(take(size_t(capacity) * std::max(2 * inter, hidden) * sizeof(float)));
-        gate = take(size_t(capacity) * inter * sizeof(float));
         routes = static_cast<float *>(take(size_t(rows) * topk * hidden * sizeof(float)));
         bytes = used;
     }
 };
 
+// Preserve the projection and activation rounding, then quantize the value
+// still in registers. Padding participates as zero in the same 32-value max.
 template<class T>
-__global__ void ActivateStreamed(const float *products, T *packed, T *gate,
-        const int *routes, int rows, int inter) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * inter) return;
-    const int row = i / inter, col = i % inter, route = routes[row];
+__global__ void ActivateQuantizeStreamed(const float *products,
+        block_q8_1_mmq *output, T *gate, const int *routes,
+        int inter, int capacity) {
+    const int row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= ((inter + 255) / 256) * 256) return;
+    const int route = routes[row];
     T value = mmq_io<T>::from_float(0);
-    if (route >= 0) {
+    if (route >= 0 && col < inter) {
         const float g = mmq_io<T>::to_float(mmq_io<T>::from_float(products[size_t(row) * 2 * inter + col]));
         const float u = mmq_io<T>::to_float(mmq_io<T>::from_float(products[size_t(row) * 2 * inter + inter + col]));
         value = mmq_io<T>::from_float(g / (1 + expf(-g)) * u);
         gate[size_t(route) * inter + col] = value;
     }
-    packed[i] = value;
+    const float x = mmq_io<T>::to_float(value);
+    float maximum = fabsf(x);
+#pragma unroll
+    for (int m = 16; m; m >>= 1) maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, m));
+    const float scale = maximum / 127.0f;
+    auto &q = output[size_t(col / 128) * capacity + row];
+    q.qs[col % 128] = maximum == 0 ? 0 : int8_t(roundf(x / scale));
+    if (col % 32 == 0) q.d4[(col % 128) / 32] = __half2float(__float2half_rn(scale));
 }
 
 template<class T>
@@ -452,17 +467,15 @@ static bool RunStreamed(StreamedMoePhase phase, const T *input, T *gate, T *outp
         ReduceStreamed<<<(rows * hidden + 255) / 256, 256, 0, stream>>>(s.routes, output, scores, rows, hidden, topk);
     } else {
         Workspace w(nullptr, rows, hidden, inter, batch.experts, topk);
-        w.capacity = capacity;
+        w.capacity = capacity; w.activeRows = batch.rows;
         w.counts = const_cast<int *>(batch.counts); w.offsets = const_cast<int *>(batch.offsets);
         w.tileExperts = const_cast<int *>(batch.tileExperts); w.groupRoutes = const_cast<int *>(batch.routes);
         w.quantized = s.quantized; w.products = s.products;
         GatherQuantized<<<dim3((batch.rows + 7) / 8, ((hidden + 255) / 256) * 2), 256, 0, stream>>>(
             s.input, s.quantized, batch.routes, batch.offsets + batch.experts, hidden, capacity, topk);
         Matrix(gt, batch.weights, 0, w, batch.experts, hidden, 2 * inter, stream);
-        ActivateStreamed<<<(batch.rows * inter + 255) / 256, 256, 0, stream>>>(
-            s.products, static_cast<T *>(s.gate), gate, batch.routes, batch.rows, inter);
-        Quantize<<<dim3((inter + 255) / 256, batch.rows), 256, 0, stream>>>(
-            static_cast<const T *>(s.gate), s.quantized, nullptr, batch.offsets + batch.experts, inter, capacity);
+        ActivateQuantizeStreamed<<<dim3((inter + 255) / 256, batch.rows), 256, 0, stream>>>(
+            s.products, s.quantized, gate, batch.routes, inter, capacity);
         Matrix(dt, batch.weights, 1, w, batch.experts, inter, hidden, stream);
         ScatterStreamed<T><<<(batch.rows * hidden + 255) / 256, 256, 0, stream>>>(
             s.products, s.routes, batch.routes, batch.rows, hidden);

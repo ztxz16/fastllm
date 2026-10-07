@@ -42,6 +42,8 @@ namespace fastllm {
                 const std::string &weightName) const override;
         bool ShouldDelaySpecialWeightCudaMove(
                 const std::string &weightName) const override;
+        std::string SelectSpecialWeightDevice(const std::string &weightName,
+                int layerId) const override;
 
         int Forward(
                 const Data &inputIds,

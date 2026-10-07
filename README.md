@@ -312,6 +312,8 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--ori` | 读取部分 GGUF 时指定原模型配置和 tokenizer 目录 |
 | `--mmproj` | Qwen3.5 架构族 GGUF 的配套视觉模块文件；配置要求与示例见 [GGUF 多模态](docs/qwen3.md#gguf-multimodal) |
 
+Qwen4 单卡 CUDA 推理默认将 MTP 草稿专家常驻 GPU，独立于 `--moe_cuda_cache` 的目标模型专家缓存预算，需要额外的草稿专家显存。显存紧张时，可在启动前设置 `FASTLLM_QWEN4_MTP_GPU_EXPERTS=0`，让草稿专家继续使用 MoE 设备配置；TP、多设备流水线和 CPU 推理沿用原有放置策略。
+
 Qwen3.5 系列的 MTP 和 DFlash 草稿支持以下设置。启用相应的草稿算法后，兼容路径默认使用 NVFP4；环境变量可在启动前覆盖默认值：
 
 | 环境变量 | 默认值 | 说明 |

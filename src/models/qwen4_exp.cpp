@@ -1573,9 +1573,7 @@ namespace fastllm {
 
     int Qwen4ExpModel::StreamingThreadTpExpertLayer(const std::string &name) const {
 #ifdef USE_CUDA
-        const auto arch = weight.dicts.find("gguf_architecture");
-        if (!threadTpState || threadTpRank >= 0 ||
-            arch == weight.dicts.end() || arch->second != "qwen4exp") return -1;
+        if (!threadTpState || threadTpRank >= 0) return -1;
         if (Qwen4StartsWith(name, kMtpExpertPrefix)) {
             return threadTpState->hostMoeLayers.back() ? -1 : block_cnt;
         }
@@ -1595,9 +1593,7 @@ namespace fastllm {
 
     int Qwen4ExpModel::StreamingThreadTpReplicaLayer(const std::string &name) const {
 #ifdef USE_CUDA
-        const auto arch = weight.dicts.find("gguf_architecture");
         if (!threadTpState || threadTpRank >= 0 ||
-            arch == weight.dicts.end() || arch->second != "qwen4exp" ||
             (!Qwen4StartsWith(name, languagePrefix) && !Qwen4StartsWith(name, "mtp."))) return -1;
         // These projections are replicated unchanged on every TP rank. Keep
         // norms and lookup tables on the host for PrepareWeights and sharing.
@@ -1758,6 +1754,27 @@ namespace fastllm {
     bool Qwen4ExpModel::ShouldDelaySpecialWeightCudaMove(const std::string &) const {
         // Splitting directly from host storage avoids loading all experts on rank 0.
         return threadTpState != nullptr;
+    }
+
+    std::string Qwen4ExpModel::SelectSpecialWeightDevice(
+            const std::string &weightName, int layerId) const {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        // The small draft stack runs repeatedly between target windows.
+        // Keep its experts on the single target GPU, outside the target's
+        // bounded expert cache. TP and pipeline placement retain their policy.
+        if (threadTpState == nullptr && threadTpRank < 0 &&
+            Qwen4StartsWith(weightName, kMtpExpertPrefix) &&
+            Qwen4EnvFlagEnabled("FASTLLM_QWEN4_MTP_GPU_EXPERTS", true) &&
+            deviceMap.size() == 1) {
+            const std::string &device = deviceMap.begin()->first;
+            if (device == "cuda" || device.compare(0, 5, "cuda:") == 0) {
+                std::map<int, int> ratios;
+                if (ParseDeviceIds(device, "cuda", ratios).size() <= 1)
+                    return device;
+            }
+        }
+#endif
+        return Qwen3NextModel::SelectSpecialWeightDevice(weightName, layerId);
     }
 
     bool Qwen4ExpModel::RetainCudaWorkspace() const {
@@ -3571,11 +3588,14 @@ namespace fastllm {
             if (hasMtpWeights && !weights.empty() && weights[0].size() > 2 &&
                 weights[0][2]->isGGUFData && mtpMoeWeights[2]->isGGUFData) {
                 // Original table addresses must be retained as cache keys.
-                // Main and draft experts share one budget and LRU pool.
+                // Only host-placed experts share the bounded cache. A
+                // GPU-resident draft table is kept outside this budget.
                 std::vector<FastllmCudaMoeCacheLayer> cacheLayers;
                 bool allNuma = true;
                 for (int layer = 0; layer <= block_cnt; ++layer) {
-                    const std::string device = SelectMoeDeviceForLayer(std::min(layer, block_cnt - 1));
+                    const std::string device = layer == block_cnt
+                        ? SelectSpecialWeightDevice(kMtpExpertPrefix + "0.gateup_proj.weight", block_cnt - 1)
+                        : SelectMoeDeviceForLayer(layer);
                     if (device != "cpu" && device != "numa" && device.compare(0, 5, "numa:") != 0) continue;
                     allNuma = allNuma && device != "cpu";
                     const auto &table = layer == block_cnt ? mtpMoeWeights : weights[layer];
@@ -6779,7 +6799,8 @@ namespace fastllm {
 
         const bool hostMoe = threadTpRank >= 0 && threadTpOwner->hostMoeLayers[deviceLayer];
         const bool runRoutedExperts = !hostMoe || threadTpRank == 0;
-        const std::string moeDevice = SelectMoeDeviceForLayer(deviceLayer);
+        const std::string moeDevice = SelectSpecialWeightDevice(
+            mlp + "experts.0.gateup_proj.weight", deviceLayer);
         Data routerLogits, expertIndex, expertScore, sharedOutput;
         if (runRoutedExperts) {
             Linear(flattened, this->weight[mlp + "gate.weight"],
@@ -6963,8 +6984,8 @@ namespace fastllm {
         // output transfer and ownership for serial layer transitions.
         const bool writeRoutedDirectly = hostMoe || useMoeCudaCache ||
             moeDevice == outputDevice;
-        if (!useMoeCudaCache) {
-            this->ApplyMoeDeviceMapForLayer(deviceLayer);
+        if (!useMoeCudaCache && !moeDevice.empty()) {
+            ApplyDeviceMap({{moeDevice, 1}}, 1, 1);
         }
 
         Data routed;

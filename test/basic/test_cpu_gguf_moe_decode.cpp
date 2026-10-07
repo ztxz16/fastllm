@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 #ifdef __linux__
 #include <pthread.h>
@@ -95,6 +96,54 @@ static void TestScoredSmallBlocks() {
     }
 }
 
+static void BatchCases(std::vector<Data *> &weights, int hidden, int experts) {
+    constexpr int topk = 5;
+    for (int rows : {1, 2, 3, 4, 8, 9}) for (int pattern = 0; pattern < 4; ++pattern) {
+        std::vector<float> x(rows * hidden), scores(rows * topk, .125f);
+        std::vector<int32_t> ids(rows * topk), gpu(rows * topk);
+        std::vector<float> expected(rows * topk * hidden, 123456.f), actual(expected);
+        for (int i = 0; i < rows * hidden; ++i) x[i] = std::sin(float(i * 7 + pattern)) * .03125f;
+        for (int r = 0; r < rows * topk; ++r) {
+            // Shared experts, duplicates within a row, and ownership that
+            // differs between rows must all preserve the original route slots.
+            ids[r] = pattern == 3 ? 0 : (r % topk + (r / topk) / 2) % experts;
+            gpu[r] = pattern == 0 ? 0 : pattern == 1 ? -1 : (r % 3 == 0 ? 0 : -1);
+            if (gpu[r] < 0) Reference(x.data() + (r / topk) * hidden,
+                expected.data() + r * hidden, *weights[2 * (ids[r] + 1)], *weights[3 + 2 * ids[r]]);
+        }
+        int submitted = 0;
+        auto run = [&] {
+            NumasMoeDecodeExpertsBatchWithOverlap(x.data(), actual.data(), rows,
+                weights.data(), weights.size(), ids.data(), gpu.data(), scores.data(), topk,
+                pattern % 2, [&] { ++submitted; });
+        };
+        run(); Check(submitted == 1, "batch callback count changed");
+        for (size_t i = 0; i < actual.size(); ++i) {
+            if (gpu[i / hidden] >= 0) Check(actual[i] == 123456.f, "batch wrote a GPU-owned route");
+            else if (!std::isfinite(actual[i]) || std::abs(actual[i] - expected[i]) >=
+                         3e-5f * (1 + std::abs(expected[i]))) {
+                std::fprintf(stderr, "batch mismatch rows=%d pattern=%d at=%zu actual=%g expected=%g\n",
+                    rows, pattern, i, actual[i], expected[i]);
+                Check(false, "batch differs from serial reference");
+            }
+        }
+        if (rows == 4 && pattern == 2) {
+            bool caught = false;
+            try {
+                NumasMoeDecodeExpertsBatchWithOverlap(x.data(), actual.data(), rows,
+                    weights.data(), weights.size(), ids.data(), gpu.data(), scores.data(), topk,
+                    pattern % 2, [] { throw std::runtime_error("expected batch callback failure"); });
+            } catch (const std::runtime_error &) { caught = true; }
+            Check(caught, "batch callback failure swallowed");
+            std::fill(actual.begin(), actual.end(), 123456.f);
+            run();
+            for (size_t i = 0; i < actual.size(); ++i)
+                Check(std::abs(actual[i] - expected[i]) < 3e-5f * (1 + std::abs(expected[i])),
+                      "batch callback recovery changed output");
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     try {
         SetThreads(argc > 1 ? std::atoi(argv[1]) : 4);
@@ -105,10 +154,11 @@ int main(int argc, char **argv) {
         TestScoredSmallBlocks();
         constexpr int experts = 8, topk = 9;
         for (auto gateType : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
-                             GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS})
+                             GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+                             GGML_TYPE_Q2_0, GGML_TYPE_IQ4_NL})
         for (auto downType : {GGML_TYPE_Q2_0, GGML_TYPE_IQ4_NL})
-        for (int inter : {256, 640}) {
-            const int hidden = inter == 640 ? 2560 : 256;
+        for (const auto dims : {std::pair<int, int>{256, 256}, {768, 384}, {2560, 640}}) {
+            const int hidden = dims.first, inter = dims.second;
             std::vector<std::unique_ptr<Data>> owned;
             std::vector<Data *> weights(2 * (experts + 1), nullptr);
             for (int e = 1; e <= experts; ++e) for (int part = 0; part < 2; ++part) {
@@ -180,6 +230,7 @@ int main(int argc, char **argv) {
                     run(); check();
                 }
             }
+            BatchCases(weights, hidden, experts);
             ClearNumasMoeRuntimeCache();
             std::printf("PASS gate=%d down=%d hidden=%d inter=%d\n", gateType, downType, hidden, inter);
         }

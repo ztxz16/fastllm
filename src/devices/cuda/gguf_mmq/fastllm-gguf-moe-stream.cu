@@ -169,16 +169,31 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     const size_t computeOffset = metaOffset + metaBytes;
     const size_t bytes = Align(computeOffset + StreamedMoeWorkspaceBytes(rows, hidden, inter, topk, capacity));
     const size_t gateBytes = size_t(rows) * topk * inter * (input.dataType == fastllm::FLOAT32 ? 4 : 2);
-    // Query the driver only when either persistent allocation must grow.
-    if (!workspace.cudaData || workspace.expansionBytes < bytes || !gate.cudaData || gate.expansionBytes < gateBytes) {
+    // This eager-only workspace persists across layers. Tiny routing-driven
+    // growth used to leave each retired hundreds-of-MiB block in the general
+    // tensor pool. Own it directly so growth releases the old allocation;
+    // RunPipelined synchronizes every consumer before returning.
+    if (workspace.isFake || workspace.cudaDataBorrowed) return false;
+    size_t reservedBytes = std::max(bytes, workspace.expansionBytes);
+    if (!workspace.cudaData || workspace.expansionBytes < bytes ||
+        !gate.cudaData || gate.expansionBytes < gateBytes || !workspace.directMemory) {
         size_t freeBytes = 0, totalBytes = 0;
         CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
         const size_t reusable = (workspace.cudaData ? workspace.expansionBytes : 0) +
             (gate.cudaData ? gate.expansionBytes : 0);
-        if (bytes + gateBytes + 256 * size_t(1024 * 1024) > freeBytes + reusable) return false;
+        const size_t reserve = 256 * size_t(1024 * 1024);
+        if (bytes + gateBytes + reserve > freeBytes + reusable) return false;
+        // Bound slack while avoiding another cudaMalloc for a few more routes.
+        constexpr size_t quantum = 16 * size_t(1024 * 1024);
+        const size_t rounded = (reservedBytes + quantum - 1) / quantum * quantum;
+        if (rounded + gateBytes + reserve <= freeBytes + reusable) reservedBytes = rounded;
     }
-    if (bytes / 256 > size_t(INT32_MAX)) return false;
-    AllocateTensor(workspace, fastllm::INT8, {int(bytes / 256), 256}, device);
+    if (reservedBytes / 256 > size_t(INT32_MAX)) return false;
+    if (!workspace.directMemory) {
+        workspace.FreeSpace();
+        workspace.directMemory = true;
+    }
+    AllocateTensor(workspace, fastllm::INT8, {int(reservedBytes / 256), 256}, device);
     AllocateTensor(gate, input.dataType, {rows * topk, inter}, device);
     AllocateTensor(output, input.dataType, {rows, hidden}, device);
     auto *base = static_cast<uint8_t *>(workspace.cudaData);

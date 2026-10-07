@@ -5542,6 +5542,12 @@ namespace fastllm {
                     floatParams.find("scale")->second, output)) {
                 return;
             }
+            if (FastllmCudaQwen4SparsePrefill(
+                    query, key, value, indices, output,
+                    intParams.find("group")->second,
+                    floatParams.find("scale")->second)) {
+                return;
+            }
             output.Allocate(false);
             const int tileRows = std::min(
                 sequence, kQwen4SparsePrefillTileRows);
@@ -9203,6 +9209,14 @@ namespace fastllm {
         void *computeDoneEvent = FastllmCudaEventCreate();
         int curExpert = findNextValidExpert(-1);
 
+#ifndef USE_ROCM
+        // GGUF cache admission belongs to the packed host-prefill backend.
+        // Its generic fallback does not have the native NUMA byte layout.
+        if (setZero && isCrossSwiglu && !deepSeekV4Mode && gateType == MoeGateSwiglu &&
+            weights[2]->dataType != DATA_GGUF_FORMAT && !weights[2]->isGGUFData)
+            FastllmCudaPlanMoePrefill(weights, m, indexData, scoreData, batch, topk, experts, admission);
+#endif
+
         if (curExpert >= 0) {
             uploadWeight(curExpert * 2);
             uploadWeight(curExpert * 2 + 1);
@@ -9314,6 +9328,10 @@ namespace fastllm {
                 );
             }
 
+#ifndef USE_ROCM
+            if (!resident.nativeGlm)
+                FastllmCudaStoreMoePrefillExpert(admission, i - 1, *weights[i * 2], *weights[i * 2 + 1]);
+#endif
             FastllmCudaEventRecord(computeDoneEvent);
             FastllmCudaStreamWaitEvent(copyStream, computeDoneEvent);
 
@@ -9335,6 +9353,12 @@ namespace fastllm {
             releaseWeight(weights[prevExpert * 2]);
             releaseWeight(weights[prevExpert * 2 + 1]);
         }
+#ifndef USE_ROCM
+        FastllmCudaPublishMoePrefill(admission);
+        // DoCudaMergeMOEFromCPU also serves short-lived prefill workers. Their
+        // per-thread stream must publish residency before the worker exits.
+        if (!admission.keys.empty()) FastllmCudaSyncCurrentThreadStream();
+#endif
         if (accurateFp8Moe || deepSeekV41Mode) {
             FastllmFloatToBF16(
                 floatOutput.cudaData, output.cudaData,
@@ -9342,9 +9366,6 @@ namespace fastllm {
         }
         FastllmCudaEventDestroy(computeDoneEvent);
         FastllmCudaStreamDestroy(copyStream);
-#ifndef USE_ROCM
-        FastllmCudaPublishMoePrefill(admission);
-#endif
 
         FastllmCudaFree(cudaIndex);
         FastllmCudaFree(cudaScales);

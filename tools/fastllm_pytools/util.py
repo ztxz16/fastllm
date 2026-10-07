@@ -902,9 +902,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         dest = 'moe_cuda_cache', type = _memory_size_bytes,
                         default = 0,
                         help = '混合推理时用于缓存MoE专家的CUDA显存，如3g；0表示关闭')
-    cache_policy = parser.add_argument_group('GGUF单token混合decode缓存更新（加载模型前设置）')
+    cache_policy = parser.add_argument_group('GGUF/NVFP4/FP8混合decode缓存更新（加载模型前设置）')
     for name, kind, default, help_text in (
-        ('half_life', _moe_cache_float, 128., 'decode热度半衰期，单位token；0不衰减，默认128'),
+        ('half_life', _moe_cache_float, 128., 'decode热度半衰期，单位解码步（可验证多个推测token）；0不衰减，默认128'),
         ('update_interval', _moe_cache_interval, 1, '每多少个decode步更新一次，默认1'),
         ('max_replacements', _moe_cache_int, 96, '每次更新跨层换入专家数上限；0关闭decode换入，默认96'),
         ('max_bytes', _memory_size_bytes, 0, '每次更新换入字节上限，如30m；0不另设字节上限'),
