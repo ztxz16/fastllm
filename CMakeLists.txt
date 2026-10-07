@@ -1515,7 +1515,9 @@ if (UNIT_TEST)
             fastllm_add_checked_test(cuda_glm5_gguf_cache cuda_glm5_gguf_cache_test "PASS: GLM GGUF cache" 120)
             fastllm_add_checked_test(cuda_glm5_gguf_frequency cuda_glm5_gguf_cache_test "PASS: GLM GGUF cache" 120 --frequency)
             fastllm_add_checked_test(cuda_glm5_gguf_no_cache cuda_glm5_gguf_cache_test "PASS: GLM GGUF cache" 120 --no-cache)
-            set_tests_properties(cuda_glm5_gguf_cache cuda_glm5_gguf_frequency cuda_glm5_gguf_no_cache PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE
+            fastllm_add_checked_test(cuda_glm5_gguf_resident cuda_glm5_gguf_cache_test "PASS: GLM GGUF resident" 120 --resident)
+            set_tests_properties(cuda_glm5_gguf_cache cuda_glm5_gguf_frequency cuda_glm5_gguf_no_cache
+                cuda_glm5_gguf_resident PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE
                 ENVIRONMENT "FT_NUMAS=1;FT_THREADS=8")
 
         endif()

@@ -61,8 +61,10 @@ copy in host memory. Quantized values and projection arithmetic are unchanged.
 Selection uses each projection's type, shape and batch dispatch; unsupported
 R4 formats or batches retain lossless restoration. Persistent cache entries
 remain canonical: promotion from a temporary NUMA record restores it in VRAM
-without transferring the expert over PCIe again. This applies to generic GGUF
-decode and verification; GLM/V4.1's specialized arithmetic keeps its own path.
+without transferring the expert over PCIe again. GLM GGUF also reads its
+IQ2_XXS/IQ2_S gate and IQ3_XXS/IQ4_XS down NUMA layouts directly, using its
+own Q8_K/BF16 projections, clamp and score placement. V4.1 retains its
+specialized path.
 
 The GGUF fast path quantizes input and SwiGLU activations to Q8_1 and uses
 DP4A integer dots for Q2_0, IQ1_M, IQ2_XXS, IQ2_XS and IQ2_S projections.

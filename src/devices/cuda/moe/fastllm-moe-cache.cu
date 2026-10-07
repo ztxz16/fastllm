@@ -414,10 +414,14 @@ void CopyNativeSharedExpert(const OffloadGroup &group, int table, int expert,
 void DecodeOverlapWorkspace::ConfigureLayout(const OffloadGroup &group, int table, int rows) {
     numaGateType = numaDownType = -1;
     const auto &layout = group.LayerLayout(table);
-    if (group.ggufSources.empty() || layout.glm5 || layout.deepSeekV41) return;
+    if (group.ggufSources.empty() || layout.deepSeekV41) return;
     const auto &source = group.ggufSources[table];
-    if (FastllmCudaMoeGGUFCacheNumaSupported(source.weights[0].type,
-            source.weights[1].type, layout.hidden, layout.inter, rows)) {
+    const bool supported = layout.glm5
+        ? FastllmCudaMoeGlm5GGUFCacheNumaSupported(source.weights[0].type,
+            source.weights[1].type, layout.hidden, layout.inter)
+        : FastllmCudaMoeGGUFCacheNumaSupported(source.weights[0].type,
+            source.weights[1].type, layout.hidden, layout.inter, rows);
+    if (supported) {
         numaGateType = source.weights[0].type;
         numaDownType = source.weights[1].type;
     }

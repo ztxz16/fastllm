@@ -321,15 +321,8 @@ static void Matrix(int type, const uint8_t *const *weights, int part, Workspace 
 #undef GROUPED_CASE
     }
 }
-#include "fastllm-gguf-moe-v41.cuh"
-template<class T>
-static bool Run(const T *input, T *gate, T *output, const uint8_t *const *weights,
-                 const int *indices, const float *scores, void *workspace,
-                 int gt, int dt, int rows, int hidden, int inter, int experts, int topk,
-                 bool deepSeekV41, float swigluLimit, cudaEvent_t downWeightsReady) {
-    const auto stream = cudaStreamPerThread;
-    Workspace w(workspace, rows, hidden, inter, experts, topk);
-    const int routes = rows*topk;
+static void PrepareRoutes(const uint8_t *const *weights, const int *indices,
+                          Workspace &w, int routes, int experts, cudaStream_t stream) {
     CUDA_CHECK(cudaMemsetAsync(w.counts, 0, experts*sizeof(int), stream));
     CUDA_CHECK(cudaMemsetAsync(w.cursors, 0, experts*sizeof(int), stream));
     CUDA_CHECK(cudaMemsetAsync(w.groupRoutes, 0xff, w.capacity*sizeof(int), stream));
@@ -339,6 +332,18 @@ static bool Run(const T *input, T *gate, T *output, const uint8_t *const *weight
     Prefix<<<1, threads, 0, stream>>>(w.counts, w.offsets, w.tileExperts, experts);
     Scatter<<<(routes+255)/256, 256, 0, stream>>>(indices, weights, w.offsets, w.cursors,
         w.groupRoutes, w.routeGroups, routes, experts);
+}
+#include "fastllm-gguf-moe-v41.cuh"
+#include "fastllm-gguf-moe-glm5.cuh"
+template<class T>
+static bool Run(const T *input, T *gate, T *output, const uint8_t *const *weights,
+                 const int *indices, const float *scores, void *workspace,
+                 int gt, int dt, int rows, int hidden, int inter, int experts, int topk,
+                 bool deepSeekV41, float swigluLimit, cudaEvent_t downWeightsReady) {
+    const auto stream = cudaStreamPerThread;
+    Workspace w(workspace, rows, hidden, inter, experts, topk);
+    const int routes = rows*topk;
+    PrepareRoutes(weights, indices, w, routes, experts, stream);
     if constexpr (std::is_same<T, __nv_bfloat16>::value) {
         if (deepSeekV41) {
             RunV41(input, gate, output, weights, indices, scores, w,

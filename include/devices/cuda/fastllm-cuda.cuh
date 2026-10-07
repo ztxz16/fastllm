@@ -1836,12 +1836,20 @@ bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
 bool FastllmCudaMoeGGUFCacheNumaSupported(int gateType, int downType,
     int hidden, int inter, int rows);
 bool FastllmCudaMoeGlm5GGUFCacheSupported(int gateType, int downType, int hidden, int inter);
-// Ordinary IQ2 gate/up + IQ3/IQ4 down records. Match GLM GGUF's Q8_K
+bool FastllmCudaMoeGlm5GGUFCacheNumaSupported(int gateType, int downType, int hidden, int inter);
+// Canonical or supported NUMA IQ2 gate/up + IQ3/IQ4 down records. Match GLM GGUF's Q8_K
 // activations, asymmetric clamp, score placement and BF16 boundaries.
 bool FastllmCudaMoeGlm5GGUFCacheCompute(
         const fastllm::Data &input, fastllm::Data &activation,
         const FastllmCudaMoeGGUFCacheView &view,
         const float *scores, int topk, float swigluLimit, float *perExpert);
+// GPU-only GLM GGUF experts; shares the scored cache arithmetic and keeps
+// routing on CUDA. Long prefills are tiled with bounded scratch storage.
+bool FastllmCudaMergeMOEGlm5GGUFResident(
+        const fastllm::Data &input, fastllm::Data &activation,
+        fastllm::Data &workspace, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores, int topk, float swigluLimit);
 // V4.1 cache records borrow NUMA's cross-interleaved Q2_K/Q4_K R4 blocks.
 // Input already has the model's block-32 FP8 boundary. Scores precede
 // down-input quantization, and per-expert outputs are rounded to BF16.
@@ -1863,7 +1871,7 @@ bool FastllmCudaMoeGGUFCacheCompute(
 // Gate weights are already ready on the calling stream. Down weights may
 // still be uploading; optional timing events exclude that wait from compute.
 struct FastllmCudaMoeGGUFStageEvents {
-    cudaEvent_t downReady = nullptr, gateDone = nullptr, downStart = nullptr;
+    void *downReady = nullptr, *gateDone = nullptr, *downStart = nullptr;
 };
 bool FastllmCudaMoeGGUFCacheComputeStaged(
         const fastllm::Data &input, fastllm::Data &gateOutput,

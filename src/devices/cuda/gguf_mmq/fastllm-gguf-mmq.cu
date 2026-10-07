@@ -3,6 +3,7 @@
 #include "../fastllm-gguf-store.cuh"
 #include "fastllm-gguf-mmq-common.cuh"
 #include "fastllm-gguf-moe-stream.cuh"
+#include "fastllm-gguf-moe-glm5.h"
 #include "../moe/fastllm-moe-v41-q8.cuh"
 
 #include <cuda_bf16.h>
@@ -1260,6 +1261,39 @@ bool FastllmCudaHalfGgufGateUpSiluMulMMVQ(
         static_cast<const half *>(input), gate_weight, up_weight,
         static_cast<half *>(output), static_cast<ggml_type>(weight_type),
         n, m, k, reinterpret_cast<cudaStream_t>(stream));
+}
+
+size_t fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(int gateType, int downType,
+        int rows, int hidden, int inter, int experts, int topk) {
+    using namespace fastllm_gguf_mmq;
+    // IQ4_XS down uses a BF16 dot in GLM. Quantizing it to Q8 would change
+    // the model's arithmetic, so retain GEMV for that type pair.
+    if ((gateType != GGML_TYPE_IQ2_XXS && gateType != GGML_TYPE_IQ2_S) ||
+        downType != GGML_TYPE_IQ3_XXS || rows <= 0 || rows > 4096 ||
+        hidden <= 0 || hidden > 24576 || hidden%256 ||
+        inter <= 0 || inter > 24576 || inter%256 ||
+        experts <= 0 || experts > 1024 || topk <= 0 || topk > 16 ||
+        rows*topk + experts*(grouped_moe::kTile-1) + grouped_moe::kTile-1 > 65535 ||
+        !int8_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) return 0;
+    return grouped_moe::Workspace(nullptr, rows, hidden, inter, experts, topk).bytes;
+}
+
+bool fastllm_gguf_mmq::RunGlm5Grouped(const fastllm::Data &input, fastllm::Data &gate,
+        fastllm::Data &output, const void *weightPointers, const int32_t *indices,
+        const float *scores, void *workspace, int gateType, int downType,
+        int hidden, int inter, int experts, int topk, float swigluLimit) {
+    if (input.dataType != fastllm::BFLOAT16 || input.dataDevice != fastllm::CUDA ||
+        input.dims.size() != 2 || input.dims[1] != hidden || !input.cudaData ||
+        !gate.cudaData || !output.cudaData || !weightPointers || !indices || !scores || !workspace ||
+        !Glm5GroupedWorkspaceBytes(gateType, downType, input.dims[0], hidden, inter, experts, topk)) return false;
+    const int rows = input.dims[0];
+    grouped_moe::Workspace w(workspace, rows, hidden, inter, experts, topk);
+    const auto *weights = static_cast<const uint8_t *const *>(weightPointers);
+    grouped_moe::PrepareRoutes(weights, indices, w, rows*topk, experts, cudaStreamPerThread);
+    grouped_moe::RunGlm5(static_cast<const __nv_bfloat16 *>(input.cudaData),
+        static_cast<__nv_bfloat16 *>(gate.cudaData), static_cast<__nv_bfloat16 *>(output.cudaData),
+        weights, indices, scores, w, gateType, rows, hidden, inter, experts, topk, swigluLimit);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 size_t FastllmCudaMoeGGUFGroupedWorkspaceBytes(int gateType, int downType,
