@@ -172,6 +172,9 @@ namespace fastllm {
                                     std::shared_ptr<PagedCacheManager>>;
             std::vector<Pools> layers;
             Pools mtp;
+            // One warmup allocation per layer, moved into the first request
+            // that needs it. Mutable QSA history is never shared by requests.
+            std::map<int, std::shared_ptr<QsaHostMirrorTransfer>> qsaHostMirrors;
         };
         std::shared_ptr<ServingCache> servingCache;
         void ClearWarmupCache(std::vector<std::pair<Data, Data>> &cache);

@@ -4986,6 +4986,15 @@ namespace fastllm {
     std::shared_ptr<Qwen4ExpModel::QsaHostMirrorTransfer> &
     Qwen4ExpModel::GetQsaHostMirror(RequestState &state, int layer) {
         auto &mirror = state.indexerHostMirrorTransfers[layer];
+        if (!mirror && servingCache) {
+            std::lock_guard<std::mutex> guard(stateMutex);
+            auto &spares = servingCache->qsaHostMirrors;
+            const auto found = spares.find(layer);
+            if (found != spares.end()) {
+                mirror = std::move(found->second);
+                spares.erase(found);
+            }
+        }
         if (!mirror) mirror = std::make_shared<QsaHostMirrorTransfer>();
         return mirror;
     }
@@ -12841,6 +12850,30 @@ namespace fastllm {
             FastllmCudaSetDevice(item.first);
             ForceDeviceSync();
         }
+        // Keep only the pinned QSA capacity from the final warmup, not its
+        // history or GPU cache/graph allocations. Otherwise the first serving
+        // request allocates two pinned buffers per attention layer again.
+        // Each rank transfers at most one buffer pair per layer; consuming it
+        // below moves ownership into one request rather than retaining a copy.
+        std::vector<std::map<int, std::shared_ptr<QsaHostMirrorTransfer>>>
+            hostMirrors(targets.size());
+        for (size_t rank = 0; rank < targets.size(); ++rank) {
+            auto *model = targets[rank].first;
+            auto state = model->requestStates.find(&targets[rank].second->front().first);
+            if (state == model->requestStates.end()) continue;
+            auto retain = [&](RequestState &source) {
+                for (auto &item : source.indexerHostMirrorTransfers) {
+                    if (!item.second || item.second.use_count() != 1) continue;
+                    // All warmup devices were synchronized above, including
+                    // the streams that wrote these host mirrors.
+                    item.second->MarkDeviceSynchronized();
+                    item.second->Rollback(0);
+                    hostMirrors[rank].emplace(item.first, std::move(item.second));
+                }
+            };
+            retain(state->second);
+            if (state->second.mtpState) retain(state->second.mtpState->attentionState);
+        }
         ClearWarmupCache(warmupCache);
         const auto freeBytes = FastllmCudaGetFreeSizes();
         const auto deviceBytes = FastllmCudaGetTotalSizes();
@@ -12878,6 +12911,7 @@ namespace fastllm {
         std::vector<std::shared_ptr<ServingCache>> reservations;
         for (size_t rank = 0; rank < targets.size(); ++rank) {
             auto reserved = std::make_shared<ServingCache>();
+            reserved->qsaHostMirrors = std::move(hostMirrors[rank]);
             reserved->layers.resize(block_cnt);
             for (int layer = 0; layer < (int)shapes[rank].size(); ++layer) {
                 const bool linear = layer < block_cnt && IsLinearAttentionLayer(layer);

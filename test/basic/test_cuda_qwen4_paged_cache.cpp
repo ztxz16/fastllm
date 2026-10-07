@@ -248,6 +248,79 @@ void TestSlots(int device) {
 }
 namespace fastllm {
 struct Qwen4PrefixCacheTestAccess {
+    static void TestWarmupMirrors(int device) {
+        Qwen4ExpModel model;
+        model.block_cnt = 1;
+        model.linearLayers = {false};
+        model.maxBatch = 2;
+        model.max_positions = model.tokensLimit = 1024;
+        model.kvCacheLimit = 0;
+        model.dataType = FLOAT32;
+        model.indexerHeads = model.indexerKvHeads = 1;
+        model.indexerHeadDim = 128;
+        model.indexerCompressRatio = 4;
+        const std::string prefix = "model.language_model.layers.0.self_attn.";
+        Tensor(model.weight[prefix + "indexer.index_qk_proj.weight"],
+               FLOAT32, {256, 4}, std::vector<float>(256 * 4, 0.25f), device);
+        for (const auto *name : {"q_layernorm.weight", "k_layernorm.weight"}) {
+            Tensor(model.weight[prefix + "indexer." + name], FLOAT32,
+                   {128}, std::vector<float>(128, 1.0f), device);
+        }
+        model.qsaKeyNormValues[0].assign(128, 1.0f);
+        auto append = [&](Qwen4ExpModel::RequestState &state, int previous,
+                          int count, float value) {
+            Data input, positions, mask, indices;
+            std::vector<float> pos(count);
+            std::iota(pos.begin(), pos.end(), (float)previous);
+            Tensor(input, FLOAT32, {1, count, 4}, std::vector<float>(count * 4, value), device);
+            Tensor(positions, FLOAT32, {1, count}, pos, device);
+            model.BuildQSAMask(0, prefix, input, Data(), positions, previous,
+                               true, state, mask, indices);
+        };
+        auto checkHistory = [&](Qwen4ExpModel::RequestState &state,
+                                const std::vector<float> &values) {
+            model.MaterializeQsaHostHistory(0, (int)values.size(), state);
+            const auto &keys = state.indexerRawKeys.at(0);
+            const auto &positions = state.indexerPositions.at(0);
+            Check(keys.size() == values.size() * 128 && positions.size() == values.size(),
+                  "reused QSA mirror retained warmup history length");
+            for (size_t row = 0; row < values.size(); ++row) {
+                Check(positions[row] == (float)row, "reused QSA positions differ");
+                for (int column = 0; column < 128; ++column)
+                    Check(keys[row * 128 + column] == values[row],
+                          "QSA mirror contains another request's history");
+            }
+        };
+        std::vector<std::pair<Data, Data>> warmup(1);
+        Input(warmup[0].first, warmup[0].second, FLOAT16, 1, 8, 0, device);
+        auto &warmupState = model.requestStates[&warmup[0].first];
+        append(warmupState, 0, 8, 99.0f);
+        std::weak_ptr<Qwen4ExpModel::QsaHostMirrorTransfer> warmed =
+            warmupState.indexerHostMirrorTransfers.at(0);
+        model.ReserveServingCache(warmup);
+        Check(warmup.empty() && !warmed.expired(), "warmup QSA allocation was released");
+        Check(model.servingCache->qsaHostMirrors.size() == 1,
+              "startup retained more than one QSA mirror per layer");
+        {
+            Qwen4ExpModel::RequestState first, peer;
+            append(first, 0, 7, 3.0f);
+            Check(first.indexerHostMirrorTransfers.at(0) == warmed.lock(),
+                  "first request did not consume warmup QSA storage");
+            Check(model.servingCache->qsaHostMirrors.empty(), "startup kept an extra QSA owner");
+            append(peer, 0, 8, 7.0f);
+            Check(first.indexerHostMirrorTransfers.at(0) != peer.indexerHostMirrorTransfers.at(0),
+                  "active requests share a mutable QSA mirror");
+            checkHistory(first, std::vector<float>(7, 3.0f));
+            checkHistory(peer, std::vector<float>(8, 7.0f));
+            append(first, 7, 1, 5.0f);
+            std::vector<float> expected(8, 3.0f); expected.back() = 5.0f;
+            checkHistory(first, expected);
+            checkHistory(peer, std::vector<float>(8, 7.0f));
+        }
+        Check(warmed.expired(), "consumed startup QSA storage outlived its request");
+        std::cout << "WARMUP_MIRRORS_PASS device=" << device << '\n';
+    }
+
     static void TestPools(int device) {
         Qwen4ExpModel model;
         model.block_cnt = 2;
@@ -332,6 +405,7 @@ int main() {
                 TestFused(device, type);
             }
             TestSlots(device); TestGraph(device); TestAttention(device);
+            Qwen4PrefixCacheTestAccess::TestWarmupMirrors(device);
             Qwen4PrefixCacheTestAccess::TestPools(device);
         }
         std::cout << "ALL_PASS\n";
