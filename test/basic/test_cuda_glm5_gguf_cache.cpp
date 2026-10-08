@@ -552,6 +552,115 @@ static void CheckExpertPrefill(std::vector<Data *> *tables, int count, int hidde
         "PASS: GLM GGUF EP prefill, reversed devices, native bytes, bitwise cached output, rows 2/33/129");
 }
 
+static void CheckPackedIQ(int devices) {
+    constexpr int experts = 3, topk = 4;
+    std::mt19937 rng(71443);
+    int checks = 0;
+    for (int device = 0; device < devices; ++device) {
+        Cuda(cudaSetDevice(device));
+        for (int hidden : {4096, 2048}) {
+            constexpr int inter = 2048;
+            const size_t gateRow = hidden / QK_K * sizeof(block_iq2_xxs);
+            const size_t gateBytes = 2 * inter * gateRow;
+            const size_t downBytes = size_t(hidden) * inter / QK_K * sizeof(block_iq3_xxs);
+            const size_t stride = gateBytes + downBytes;
+            std::vector<uint8_t> canonical(experts * stride), native(canonical.size());
+            for (int e = 0; e < experts; ++e) {
+                auto *g = reinterpret_cast<block_iq2_xxs *>(canonical.data() + e * stride);
+                for (size_t b = 0; b < gateBytes / sizeof(*g); ++b) {
+                    g[b].d = 0x1400 + (rng() & 1023); // Finite positive FP16 scales.
+                    for (auto &q : g[b].qs) q = rng();
+                }
+                auto *d = reinterpret_cast<block_iq3_xxs *>(canonical.data() + e * stride + gateBytes);
+                for (size_t b = 0; b < downBytes / sizeof(*d); ++b) {
+                    d[b].d = 0x1400 + (rng() & 1023);
+                    for (auto &q : d[b].qs) q = rng();
+                }
+                for (int row = 0; row < inter; ++row) for (int part = 0; part < 2; ++part)
+                    memcpy(native.data() + e * stride + (2 * row + part) * gateRow,
+                        canonical.data() + e * stride + (row + part * inter) * gateRow, gateRow);
+                memcpy(native.data() + e * stride + gateBytes, canonical.data() + e * stride + gateBytes, downBytes);
+            }
+            Data records(INT8, {int(canonical.size())}, CPU, canonical.data());
+            Data interleaved(INT8, {int(native.size())}, CPU, native.data());
+            records.ToDevice(CUDA); interleaved.ToDevice(CUDA);
+            for (int rows : {1, 2, 32, 33}) for (bool compact : {false, true}) {
+                const int total = rows * topk;
+                std::vector<uint16_t> x(rows * hidden);
+                std::vector<float> scores(total);
+                std::vector<int32_t> slots, map;
+                for (int i = 0; i < rows * hidden; ++i)
+                    x[i] = Float32ToBFloat16RNEBits(i / hidden % 2 ? 0.f : float(int(rng() % 127) - 63) / 31.f);
+                for (int r = total - 1; r >= 0; --r) {
+                    scores[r] = r % 3 == 0 ? 0.f : r % 3 == 1 ? -.125f : .3125f;
+                    if (!compact || r % topk != 1) { map.push_back(r); slots.push_back(r % (experts + 1) - 1); }
+                }
+                const int routes = slots.size();
+                Data input(BFLOAT16, {rows, hidden}, CPU, x.data()), ds(FLOAT32, {total}, CPU, scores.data());
+                Data di(INT32, {routes}, CPU, slots.data()), dm(INT32, {routes}, CPU, map.data());
+                input.ToDevice(CUDA); ds.ToDevice(CUDA); di.ToDevice(CUDA); dm.ToDevice(CUDA);
+                const size_t minimum = size_t(rows) * (hidden + topk * inter);
+                const size_t capacity = minimum + std::max(size_t(rows) * hidden, size_t(routes) * inter);
+                Data scratch(FLOAT32, {int(capacity + 1)}), result(FLOAT32, {total, hidden}), activation;
+                scratch.ToDevice(CUDA); scratch.Allocate(false); result.ToDevice(CUDA); result.Allocate(false);
+                std::vector<float> reference, prefix, output(total * hidden), quantized(rows * hidden);
+                std::vector<uint16_t> gateReference, gate(routes * inter);
+                for (int variant = 0; variant < 4; ++variant) {
+                    // Minimal scratch selects the generic reference without an
+                    // environment override. Check extra scratch, unaligned
+                    // scratch, and native interleaved gate/up against it.
+                    auto *workspace = static_cast<float *>(scratch.cudaData) + (variant == 2 ? 1 : 0);
+                    FastllmCudaMoeGGUFCacheView view{
+                        static_cast<const uint8_t *>(variant == 3 ? interleaved.cudaData : records.cudaData),
+                        static_cast<const int32_t *>(di.cudaData), stride, gateBytes,
+                        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS, hidden, inter,
+                        workspace, (variant == 0 ? minimum : capacity) * sizeof(float)};
+                    if (compact) { view.routeMap = static_cast<const int32_t *>(dm.cudaData); view.routeCount = routes; }
+                    if (variant == 3) { view.numaGateType = view.gateType; view.numaDownType = view.downType; }
+                    for (int reuse = 0; reuse < 2; ++reuse) {
+                        view.q8InputPrepared = reuse != 0;
+                        Cuda(cudaMemset(result.cudaData, 0x5a, result.GetBytes()));
+                        Require(FastllmCudaMoeGlm5GGUFCacheCompute(input, activation, view,
+                            static_cast<const float *>(ds.cudaData), topk, compact ? 0.f : 7.f,
+                            static_cast<float *>(result.cudaData)), "packed IQ dispatch rejected");
+                        Cuda(cudaMemcpy(output.data(), result.cudaData, result.GetBytes(), cudaMemcpyDeviceToHost));
+                        Cuda(cudaMemcpy(gate.data(), activation.cudaData, gate.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+                        Cuda(cudaMemcpy(quantized.data(), workspace, quantized.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                        if (variant == 0 && reuse == 0) { reference = output; gateReference = gate; prefix = quantized; }
+                        Require(!memcmp(output.data(), reference.data(), output.size() * sizeof(float)) &&
+                            gate == gateReference, "packed IQ differs from generic arithmetic");
+                        Require(!memcmp(quantized.data(), prefix.data(), quantized.size() * sizeof(float)),
+                            "packed IQ overwrote reusable canonical input");
+                        ++checks;
+                    }
+                    if (hidden == 4096 && rows == 1 && !compact && variant == 1) {
+                        Data partial(INT8, {int(canonical.size())}); partial.ToDevice(CUDA); partial.Allocate(false);
+                        for (int e = 0; e < experts; ++e)
+                            Cuda(cudaMemcpy(static_cast<uint8_t *>(partial.cudaData) + e * stride,
+                                view.records + e * stride, gateBytes, cudaMemcpyDeviceToDevice));
+                        fastllm_test::DelayedDownUpload upload;
+                        upload.Hold();
+                        for (int e = 0; e < experts; ++e)
+                            Cuda(cudaMemcpyAsync(static_cast<uint8_t *>(partial.cudaData) + e * stride + gateBytes,
+                                view.records + e * stride + gateBytes, downBytes, cudaMemcpyDeviceToDevice, upload.stream));
+                        Cuda(cudaEventRecord(upload.downReady, upload.stream)); view.records = static_cast<const uint8_t *>(partial.cudaData);
+                        Require(FastllmCudaMoeGlm5GGUFCacheComputeStaged(input, activation, view,
+                            static_cast<const float *>(ds.cudaData), topk, 7.f, static_cast<float *>(result.cudaData),
+                            {upload.downReady, upload.gateDone, upload.downStart}), "packed IQ staged dispatch rejected");
+                        Cuda(cudaEventSynchronize(upload.gateDone));
+                        const bool earlyGate = !upload.timedOut && cudaEventQuery(upload.downReady) == cudaErrorNotReady;
+                        upload.release = true; Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                        Cuda(cudaMemcpy(output.data(), result.cudaData, result.GetBytes(), cudaMemcpyDeviceToHost));
+                        Require(earlyGate && !memcmp(output.data(), reference.data(), output.size() * sizeof(float)),
+                            "packed IQ delayed down upload changed ordering or output");
+                    }
+                }
+            }
+        }
+    }
+    std::printf("PASS: GLM GGUF packed IQ, %d exact checks, both layouts, scratch alignment/capacity, input reuse and staged upload\n", checks);
+}
+
 int main(int argc, char **argv) {
     try {
         const std::string option=argc>1 ? argv[1] : "";
@@ -572,6 +681,7 @@ int main(int argc, char **argv) {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices || (expertCache && devices<2)) {
             std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: CUDA unavailable"); return 0;
         }
+        if (option == "--packed-iq") { CheckPackedIQ(devices); return 0; }
         constexpr int hidden=512, topk=6, tables=8;
         const int experts=hostPrefill ? 56 : 24;
         const int inter=resident ? 512 : 256;

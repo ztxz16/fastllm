@@ -698,7 +698,8 @@ __device__ __forceinline__ float NumaDot(const uint8_t *record, int row,
 // Match iqk_quantize_row_q8_K on the CPU: one FP32 positive scale per
 // 256 elements and nearest-even integer rounding. Keep the dequantized
 // activation in scratch; original expert weights remain packed in VRAM.
-__global__ void Quantize(const __nv_bfloat16 *input, float *output, int columns) {
+template<bool Packed = false>
+__global__ void Quantize(const __nv_bfloat16 *input, float *output, int columns, float *packed = nullptr) {
     __shared__ float maxima[8];
     const int c = blockIdx.x * 256 + threadIdx.x;
     const size_t offset = size_t(blockIdx.y) * columns + c;
@@ -712,7 +713,17 @@ __global__ void Quantize(const __nv_bfloat16 *input, float *output, int columns)
     for (int i = 0; i < 8; ++i) amax = fmaxf(amax, maxima[i]);
     const float inverse = amax == 0 ? 0 : __fdiv_rn(127.f, amax);
     const int q = __float2int_rn(__fmul_rn(x, inverse));
-    output[offset] = __fmul_rn(__fdiv_rn(amax, 127.f), float(q));
+    const float value = __fmul_rn(__fdiv_rn(amax, 127.f), float(q));
+    if constexpr (Packed) {
+        // Keep canonical gate input for subsequent staged experts. Down input
+        // only needs the layout consumed by the vector loads.
+        if (output) output[offset] = value;
+        const int t = threadIdx.x, lane = (t % 32 / 8) * 8 + t / 32;
+        packed[size_t(blockIdx.y) * columns + blockIdx.x * 256 +
+            (t % 8 / 4) * 128 + lane * 4 + t % 4] = value;
+    } else {
+        output[offset] = value;
+    }
 }
 
 template<ggml_type Type, class View>
@@ -758,6 +769,27 @@ __global__ void Down(const T *activation, float *output, View view) {
     if (threadIdx.x % 32 == 0)
         output[size_t(OriginalRoute(view, route)) * view.hidden + row] = __bfloat162float(__float2bfloat16_rn(value));
 }
+#include "fastllm-moe-glm5-iq.cuh"
+
+bool Sm75IQSupported() {
+    const int device = FastllmCudaGetDevice();
+    static thread_local std::map<int, bool> supported;
+    const auto it = supported.find(device);
+    if (it != supported.end()) return it->second;
+    int major = 0, minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) return false;
+    return supported[device] = (major == 7 && minor == 5);
+}
+
+template<bool GateStage, class View> bool CanonicalIQ(const View &) { return true; }
+template<bool GateStage> bool CanonicalIQ(const FastllmCudaMoeGGUFCacheView &view) {
+    // Native NUMA gate/up rows are interleaved, including ordinary IQ types.
+    // Down rows are canonical only for the ordinary type, never its R4 form.
+    if constexpr (GateStage) return view.numaGateType < 0;
+    return view.numaDownType < 0 || view.numaDownType == view.downType;
+}
+
 template<class View>
 bool Compute(const fastllm::Data &input, fastllm::Data &activation,
         const View &view, const float *scores, int topk, float swigluLimit,
@@ -767,11 +799,28 @@ bool Compute(const fastllm::Data &input, fastllm::Data &activation,
     auto *x = static_cast<float *>(view.workspace);
     auto *y = x + size_t(rows) * view.hidden;
     const int routes = ActiveRoutes(view, rows * topk);
+    const size_t xElements = size_t(rows) * view.hidden, yElements = size_t(routes) * view.inter;
+    const bool sm75 = rows > 0 && rows <= 32 && routes > 0 && view.hidden == 4096 && view.inter == 2048 &&
+        (view.gateType == GGML_TYPE_IQ2_XXS || view.downType == GGML_TYPE_IQ3_XXS) &&
+        reinterpret_cast<uintptr_t>(view.workspace) % 16 == 0 &&
+        view.workspaceBytes >= (xElements + yElements + std::max(xElements, yElements)) * sizeof(float) &&
+        Sm75IQSupported();
+    const bool packedGate = sm75 && view.gateType == GGML_TYPE_IQ2_XXS && CanonicalIQ<true>(view);
+    const bool packedDown = sm75 && view.downType == GGML_TYPE_IQ3_XXS && CanonicalIQ<false>(view);
+    auto *packed = y + yElements;
     fastllm_gguf_moe::AllocateTensor(activation, fastllm::BFLOAT16,
         std::vector<int>({routes, view.inter}), FastllmCudaGetDevice());
-    if (!q8InputPrepared) glm5_gguf_cache::Quantize<<<dim3(view.hidden / QK_K, rows), 256, 0, cudaStreamPerThread>>>(
+    if (!q8InputPrepared && !packedGate) glm5_gguf_cache::Quantize<<<dim3(view.hidden / QK_K, rows), 256, 0, cudaStreamPerThread>>>(
         static_cast<const __nv_bfloat16 *>(input.cudaData), x, view.hidden);
-    switch (view.gateType) {
+    if (packedGate) {
+        if (q8InputPrepared)
+            PackIQActivation<<<dim3(view.hidden / 256, rows), 256, 0, cudaStreamPerThread>>>(x, packed, view.hidden);
+        else
+            Quantize<true><<<dim3(view.hidden / 256, rows), 256, 0, cudaStreamPerThread>>>(
+                static_cast<const __nv_bfloat16 *>(input.cudaData), x, view.hidden, packed);
+        GateIQ2XXSSm75<<<dim3(view.inter / 2, routes), 128, 0, cudaStreamPerThread>>>(packed,
+            static_cast<__nv_bfloat16 *>(activation.cudaData), view, scores, swigluLimit, topk);
+    } else switch (view.gateType) {
 #define GLM5_GATE(name) case GGML_TYPE_##name: \
         glm5_gguf_cache::Gate<GGML_TYPE_##name><<<dim3(view.inter, routes), 128, 0, cudaStreamPerThread>>>( \
             x, static_cast<__nv_bfloat16 *>(activation.cudaData), view, scores, swigluLimit, topk); break;
@@ -783,10 +832,16 @@ bool Compute(const fastllm::Data &input, fastllm::Data &activation,
     // fallback, including BF16 rounding of each decoded weight in Dot<T>.
     // GGUF applies neither NVFP4's block-128 nor V4.1's block-32 FP8 step.
     if (view.downType != GGML_TYPE_IQ4_XS) {
-        glm5_gguf_cache::Quantize<<<dim3(view.inter / QK_K, routes), 256, 0, cudaStreamPerThread>>>(
-            static_cast<const __nv_bfloat16 *>(activation.cudaData), y, view.inter);
+        if (packedDown)
+            Quantize<true><<<dim3(view.inter / 256, routes), 256, 0, cudaStreamPerThread>>>(
+                static_cast<const __nv_bfloat16 *>(activation.cudaData), nullptr, view.inter, packed);
+        else
+            glm5_gguf_cache::Quantize<<<dim3(view.inter / QK_K, routes), 256, 0, cudaStreamPerThread>>>(
+                static_cast<const __nv_bfloat16 *>(activation.cudaData), y, view.inter);
         if (events && !FastllmMoeWaitDown(*events)) return false;
-        switch (view.downType) {
+        if (packedDown) {
+            DownIQ3XXSSm75<<<dim3(view.hidden / 4, routes), 128, 0, cudaStreamPerThread>>>(packed, perExpert, view);
+        } else switch (view.downType) {
 #define GLM5_DOWN(name) case GGML_TYPE_##name: \
             glm5_gguf_cache::Down<GGML_TYPE_##name><<<dim3((view.hidden + 3) / 4, routes), 128, 0, cudaStreamPerThread>>>( \
                 y, perExpert, view); break;
