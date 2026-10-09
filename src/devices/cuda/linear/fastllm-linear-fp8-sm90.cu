@@ -80,16 +80,18 @@ static bool MakeTma(cute::TmaDescriptor &desc, CUtensorMapDataType dtype,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
-template <typename Out, int BlockM>
+template <typename Out, int BlockM, int BlockN = kBlockN,
+          int Stages = (BlockM == 256 ? 3 : 4), int Workers = kWorkers>
 static auto Kernel() {
     return &sm90_fp8_gemm_1d2d_impl<
         cute::UMMA::Major::K, 0, 0, 0, 1,
-        BlockM, kBlockN, 128, 128, 128, 128, (BlockM == 256 ? 3 : 4),
-        128, (BlockM == 64 ? 128 : 256), (BlockM == 256 ? 2 : 1), true, kWorkers, GemmType::Normal, Out,
+        BlockM, BlockN, 128, 128, 128, (BlockN % 64 == 0 ? 128 : 0), Stages,
+        128, (BlockM == 64 ? 128 : 256), (BlockM == 256 ? 2 : 1), true, Workers, GemmType::Normal, Out,
         epilogue::transform::EpilogueIdentity>;
 }
 
-template <typename Out, int BlockM>
+template <typename Out, int BlockM, int BlockN = kBlockN,
+          int Stages = (BlockM == 256 ? 3 : 4), int Workers = kWorkers>
 static bool Launch(void *input, void *weight, float *sa, float *sb,
                    void *output, int rows, int cols, int outCols,
                    int scaleRows, cudaStream_t stream) {
@@ -97,18 +99,20 @@ static bool Launch(void *input, void *weight, float *sa, float *sb,
     if (!MakeTma(a, CU_TENSOR_MAP_DATA_TYPE_UINT8, input, cols, rows,
                  cols, 128, BlockM, CU_TENSOR_MAP_SWIZZLE_128B) ||
         !MakeTma(b, CU_TENSOR_MAP_DATA_TYPE_UINT8, weight, cols, outCols,
-                 cols, 128, kBlockN, CU_TENSOR_MAP_SWIZZLE_128B) ||
+                 cols, 128, BlockN, CU_TENSOR_MAP_SWIZZLE_128B) ||
         !MakeTma(d, cute::is_same_v<Out, cutlass::half_t>
                      ? CU_TENSOR_MAP_DATA_TYPE_FLOAT16 : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
                  output, outCols, rows,
-                 outCols * 2, 64, BlockM, CU_TENSOR_MAP_SWIZZLE_128B) ||
+                 outCols * 2, (BlockN % 64 == 0 ? 64 : BlockN), BlockM,
+                 (BlockN % 64 == 0 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE)) ||
         !MakeTma(sfa, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, sa, scaleRows, cols / 128,
                  scaleRows * 4, BlockM, 1, CU_TENSOR_MAP_SWIZZLE_NONE)) return false;
-    constexpr int kStages = BlockM == 256 ? 3 : 4;
-    const int sharedBytes = BlockM * kBlockN * 2 +
-        kStages * (BlockM * 128 + kBlockN * 128 + BlockM * 4) +
-        ((cols / 128 * 4 + 7) / 8) * 8 + kStages * 16;
-    auto kernel = Kernel<Out, BlockM>();
+    // A non-divisor N tile can cross a 128-column weight-scale boundary.
+    // Reserve two scale rows, and use unswizzled output TMA for narrow tiles.
+    const int sharedBytes = BlockM * BlockN * 2 +
+        Stages * (BlockM * 128 + BlockN * 128 + BlockM * 4) +
+        ((cols / 128 * 4 * (128 % BlockN == 0 ? 1 : 2) + 7) / 8) * 8 + Stages * 16;
+    auto kernel = Kernel<Out, BlockM, BlockN, Stages, Workers>();
     if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              sharedBytes) != cudaSuccess) {
         cudaGetLastError();
@@ -120,7 +124,7 @@ static bool Launch(void *input, void *weight, float *sa, float *sb,
         attr.val.clusterDim.x = 2;
         attr.val.clusterDim.y = attr.val.clusterDim.z = 1;
         cudaLaunchConfig_t config{};
-        config.gridDim = dim3(kWorkers);
+        config.gridDim = dim3(Workers);
         config.blockDim = dim3(384);
         config.dynamicSmemBytes = sharedBytes;
         config.stream = stream;
@@ -131,7 +135,7 @@ static bool Launch(void *input, void *weight, float *sa, float *sb,
         const cudaError_t lastError = cudaGetLastError();
         return status == cudaSuccess && lastError == cudaSuccess;
     } else {
-        kernel<<<kWorkers, (BlockM == 64 ? 256 : 384), sharedBytes, stream>>>(sb, nullptr, rows, outCols, cols, a, b, d, sfa);
+        kernel<<<Workers, (BlockM == 64 ? 256 : 384), sharedBytes, stream>>>(sb, nullptr, rows, outCols, cols, a, b, d, sfa);
     }
     return cudaGetLastError() == cudaSuccess;
 }
@@ -140,7 +144,7 @@ template <typename In, typename Out>
 static bool Run(
         const void *input, void *weight, float *weightScales, const float *bias,
         void *output, int rows, int cols, int outCols, Scratch &scratch,
-        cudaStreamCaptureStatus capture) {
+        cudaStreamCaptureStatus capture, bool tunedDecode) {
     const cudaStream_t stream = cudaStreamPerThread;
     const int scaleRows = (rows + 3) / 4 * 4;
     const size_t inputBytes = ((size_t)rows * cols + 255) / 256 * 256;
@@ -159,11 +163,26 @@ static bool Run(
     const size_t tasks = (size_t)scaleRows * (cols / 128);
     Quantize<<<(tasks + 7) / 8, 256, 0, stream>>>(static_cast<const In *>(input), quant, scales, rows, cols, scaleRows);
     if (cudaGetLastError() != cudaSuccess) return false;
-    bool ok = rows >= 1024
-        ? Launch<Out, 256>(quant, weight, scales, weightScales, output, rows, cols, outCols, scaleRows, stream)
-        : rows <= 128
-        ? Launch<Out, 64>(quant, weight, scales, weightScales, output, rows, cols, outCols, scaleRows, stream)
-        : Launch<Out, 128>(quant, weight, scales, weightScales, output, rows, cols, outCols, scaleRows, stream);
+    auto launch = rows >= 1024 ? Launch<Out, 256>
+        : rows <= 128 ? Launch<Out, 64> : Launch<Out, 128>;
+    // H20 (78 SMs), FP16 decode only. Other shapes keep the original dispatch.
+    // Narrow N tiles match TRT-LLM for one M tile; two M tiles favor BN128
+    // for gate/up and full-attention QKV in the measured sweep.
+    if constexpr (cute::is_same_v<Out, cutlass::half_t>) {
+        if (tunedDecode) {
+            if (outCols == 5120 && (cols == 17408 || cols == 6144)) {
+                launch = Launch<Out, 64, 72, 6, 78>;
+            } else if (cols == 5120 && (outCols == 34816 || outCols == 16384)) {
+                launch = rows > 64 && outCols == 34816
+                    ? Launch<Out, 64, 128, 6, 78> : Launch<Out, 64, 112, 6, 78>;
+            } else if (cols == 5120 && outCols == 14336) {
+                launch = rows > 64
+                    ? Launch<Out, 64, 128, 6, 78> : Launch<Out, 64, 96, 6, 78>;
+            }
+        }
+    }
+    bool ok = launch(quant, weight, scales, weightScales,
+                     output, rows, cols, outCols, scaleRows, stream);
     if (ok && bias) {
         const size_t count = (size_t)rows * outCols;
         AddBias<<<(count + 255) / 256, 256, 0, stream>>>(static_cast<In *>(output), bias, count, outCols);
@@ -173,9 +192,13 @@ static bool Run(
 }
 }  // namespace
 
+bool FastllmCudaDeepGemmDecodeFp8Sm90(
+        const fastllm::Data &, fastllm::Data &, const fastllm::Data &, fastllm::Data &, int, int, int);
+
 bool FastllmCudaDeepGemmLinearFp8Sm90(
         const fastllm::Data &input, fastllm::Data &weight,
         const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    if (n > 0 && n < 32) return FastllmCudaDeepGemmDecodeFp8Sm90(input, weight, bias, output, n, m, k);
     if (n < std::max(32, fastllm::FastllmCudaGetLinearExactBatchThreshold()) ||
         m <= 0 || k <= 0 || m % 128 || k % 128 ||
         !input.cudaData || !weight.cudaData || !output.cudaData ||
@@ -203,8 +226,14 @@ bool FastllmCudaDeepGemmLinearFp8Sm90(
     if (weight.extraCudaData.empty() || !weight.extraCudaData[0]) return false;
     auto run = input.dataType == fastllm::DataType::BFLOAT16
         ? Run<__nv_bfloat16, cutlass::bfloat16_t> : Run<half, cutlass::half_t>;
+    int smCount = 0;
+    const bool tunedDecode = n >= 32 && n <= 128 &&
+        input.dataType == fastllm::DataType::FLOAT16 &&
+        fastllm::FastllmCudaGetLinearExactBatchThreshold() == 0 &&
+        cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
+        smCount == 78;
     return run(input.cudaData, weight.cudaData,
         static_cast<float *>(weight.extraCudaData[0]),
         bias.dims.empty() ? nullptr : static_cast<const float *>(bias.cudaData),
-        output.cudaData, n, m, k, scratchByDevice[device], capture);
+        output.cudaData, n, m, k, scratchByDevice[device], capture, tunedDecode);
 }

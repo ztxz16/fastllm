@@ -449,7 +449,9 @@ if (USE_CUDA)
     if (FASTLLM_DEEPGEMM_FP8_SM90_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
         CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
         EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h")
-        set(FASTLLM_CUDA_SM90_SOURCES src/devices/cuda/linear/fastllm-linear-fp8-sm90.cu)
+        set(FASTLLM_CUDA_SM90_SOURCES
+            src/devices/cuda/linear/fastllm-linear-fp8-sm90.cu
+            src/devices/cuda/linear/fastllm-linear-fp8-decode-sm90.cu)
         set_property(SOURCE src/devices/cuda/cudadevice.cpp
             src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DEEPGEMM_FP8_SM90)
@@ -666,6 +668,7 @@ if (FASTLLM_CUDA_SM90_SOURCES)
         CUDA_ARCHITECTURES "90a" POSITION_INDEPENDENT_CODE ON)
     target_include_directories(fastllm_cuda_sm90 BEFORE PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/trtllm_deep_gemm/include"
         "${FASTLLM_CUTLASS_DIR}/include")
     set(FASTLLM_CUDA_SM90_OBJECTS $<TARGET_OBJECTS:fastllm_cuda_sm90>)
 endif()
