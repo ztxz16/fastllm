@@ -4,6 +4,9 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+#include "fastllm-bf16-lt.cuh"
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -1916,9 +1919,26 @@ bool FastllmCudaQwen4HyperProject(
     return cudaGetLastError() == cudaSuccess;
 }
 
+static bool TryFastllmCudaHopperFp16Head(half *input, half *weight, half *output,
+                                        half *bias, int n, int m, int k, bool addTo) {
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+    // Keep this specialization on the validated Hopper vocabulary projection.
+    // Bias/accumulation, exact verification and unwarmed graph capture retain
+    // the existing fallback. Both native and cuBLAS entry points reach here.
+    if (n > 0 && n < 32 && m == 5120 && k == 248320 && bias == nullptr && !addTo &&
+        fastllm::FastllmCudaGetLinearExactBatchThreshold() == 0 &&
+        FastllmCudaRuntimeArch() == 90) {
+        return fastllm_bf16_lt::Matmul(input, weight, output, n, m, k, CUDA_R_16F);
+    }
+#endif
+    return false;
+}
+
 void LaunchFastllmGemmFp16Fp16(half *input, half *weight, half *output, half *bias,
                                int n, int m, int k, bool addTo,
                                bool allowRouterSpecialization) {
+    if (TryFastllmCudaHopperFp16Head(input, weight, output, bias, n, m, k, addTo)) return;
+
     // DFlash verification must retain the compensated reduction state of each
     // q1 row independently.  A PART=n launch still lets those rows share each
     // weight read without changing their per-row accumulation order.
@@ -2038,6 +2058,7 @@ namespace {
     static bool RunFastllmCudaLinearFp16Cublas(
             half *input, half *weight, half *output, half *bias,
             int n, int m, int k, bool addTo) {
+        if (TryFastllmCudaHopperFp16Head(input, weight, output, bias, n, m, k, addTo)) return true;
         auto fastllmCublasHandle = getFastllmCublasHandle();
         cublasStatus_t status;
 #ifdef CUDA_NO_TENSOR_CORE

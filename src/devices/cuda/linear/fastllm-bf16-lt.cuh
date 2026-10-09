@@ -21,7 +21,7 @@ constexpr size_t maxPlans = 64;
 constexpr size_t maxWorkspacesPerDevice = 16; // 128 MiB, including graph-held buffers
 constexpr int maxCandidates = 8;
 constexpr int timingRepeats = 8;
-using Key = std::array<int, 6>; // M, N, K, alignment(A), alignment(B), alignment(C/D)
+using Key = std::array<int, 7>; // M, N, K, alignment(A), alignment(B), alignment(C/D), storage type
 
 inline void CheckCuda(cudaError_t status) {
     if (status != cudaSuccess) {
@@ -240,12 +240,13 @@ inline bool Run(State &s, Plan &p, const cublasLtMatmulAlgo_t &algo,
 inline void MakePlan(State &s, Plan &p, const Key &key,
                      const void *weight, const void *input, void *output) {
     const int M = key[0], N = key[1], K = key[2];
+    const auto dtype = static_cast<cudaDataType_t>(key[6]);
     cublasOperation_t trans = CUBLAS_OP_T;
     if (!CheckBlas(cublasLtMatmulDescCreate(&p.op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) ||
         !CheckBlas(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &trans, sizeof(trans))) ||
-        !CheckBlas(cublasLtMatrixLayoutCreate(&p.a, CUDA_R_16BF, K, N, K)) ||
-        !CheckBlas(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_16BF, K, M, K)) ||
-        !CheckBlas(cublasLtMatrixLayoutCreate(&p.c, CUDA_R_16BF, N, M, N))) return;
+        !CheckBlas(cublasLtMatrixLayoutCreate(&p.a, dtype, K, N, K)) ||
+        !CheckBlas(cublasLtMatrixLayoutCreate(&p.b, dtype, K, M, K)) ||
+        !CheckBlas(cublasLtMatrixLayoutCreate(&p.c, dtype, N, M, N))) return;
 
     SearchResources search;
     if (!CheckBlas(cublasLtMatmulPreferenceCreate(&search.preference))) return;
@@ -298,16 +299,24 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
     }
 }
 
-inline bool Matmul(const void *input, const void *weight, void *output, int M, int K, int N) {
+inline bool Matmul(const void *input, const void *weight, void *output, int M, int K, int N,
+                   cudaDataType_t storage = CUDA_R_16BF) {
     // This bounds tuning cost, not model/architecture-specific dispatch.
-    if (M < 8 || M > 32 || N <= 0 || K <= 0) return false;
+    if (N <= 0 || K <= 0) return false;
+    if (storage == CUDA_R_16BF) {
+        if (M < 8 || M > 32) return false;
+    } else if (storage == CUDA_R_16F) {
+        // Large decode heads amortize tuning and saturate Hopper bandwidth.
+        // Other shapes retain their native GEMV and exact-row reduction tree.
+        if (M < 1 || M >= 32 || N < 65536 || (N % 8) || (K % 8)) return false;
+    } else return false;
     cudaStreamCaptureStatus capture;
     CheckCuda(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
     int device = 0;
     CheckCuda(cudaGetDevice(&device));
     State *s = GetState(device, capture != cudaStreamCaptureStatusNone);
     if (!s) return false;
-    Key key{M, N, K, Alignment(weight), Alignment(input), Alignment(output)};
+    Key key{M, N, K, Alignment(weight), Alignment(input), Alignment(output), static_cast<int>(storage)};
     auto found = s->plans.find(key);
     if (found == s->plans.end()) {
         if (capture != cudaStreamCaptureStatusNone) return false;
