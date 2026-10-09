@@ -7812,8 +7812,9 @@ namespace fastllm {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         output.Allocate();
-        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16, 
-                "Exp error: Data's type should be float32 or float16\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                "Exp error: Data's type should be float32, float16 or bfloat16\n");
         FastllmCudaExp(input, output);
     }
 
@@ -7930,8 +7931,9 @@ namespace fastllm {
         Data &aLogData = *(datas.find("aLog")->second);
         Data &dtBiasData = *(datas.find("dtBias")->second);
         output.Allocate();
-        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
-                        "CudaMambaSoftplusOp error: Data's type should be float32 or float16.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "CudaMambaSoftplusOp error: Data's type should be float32, float16 or bfloat16.\n");
         AssertInFastLLM(aLogData.dataType == DataType::FLOAT32 && dtBiasData.dataType == DataType::FLOAT32,
                         "CudaMambaSoftplusOp error: alog's type and dtbias's type should be float32.\n");
         
@@ -7948,8 +7950,9 @@ namespace fastllm {
         Data &aLogData = *(datas.find("aLog")->second);
         Data &dtBiasData = *(datas.find("dtBias")->second);
         AssertInFastLLM(sigmoidInputOutput.dataType == DataType::FLOAT32 ||
-                        sigmoidInputOutput.dataType == DataType::FLOAT16,
-                        "CudaSigmoidMambaSoftplusOp error: input type should be float32 or float16.\n");
+                        sigmoidInputOutput.dataType == DataType::FLOAT16 ||
+                        sigmoidInputOutput.dataType == DataType::BFLOAT16,
+                        "CudaSigmoidMambaSoftplusOp error: input type should be float32, float16 or bfloat16.\n");
         AssertInFastLLM(softplusInput.dataType == sigmoidInputOutput.dataType,
                         "CudaSigmoidMambaSoftplusOp error: sigmoid and softplus input types should match.\n");
         AssertInFastLLM(aLogData.dataType == DataType::FLOAT32 && dtBiasData.dataType == DataType::FLOAT32,
@@ -8673,6 +8676,20 @@ namespace fastllm {
         int base = intParams.find("base") != intParams.end() ? intParams.find("base")->second : 0;
         float maskValue = floatParams.find("maskValue") != floatParams.end() ? floatParams.find("maskValue")->second : -10000.0;
         FastllmCudaCausalMask(input, base, maskValue);
+    }
+
+    void CudaMakeDecayMaskOp::Reshape(const std::string &opType, const DataDict &datas,
+                                     const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &output = *datas.find("output")->second;
+        // CUDA supports BF16; the inherited CPU reshape only permits FP32/FP16.
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                       input.dataType == DataType::FLOAT16 || input.dataType == DataType::BFLOAT16,
+                       "CudaMakeDecayMaskOp input must be float32, float16 or bfloat16.\n");
+        std::vector<int> dims = input.dims;
+        dims.push_back(dims.back());
+        output.dataType = input.dataType;
+        output.Resize(dims);
     }
 
     void CudaMakeDecayMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,

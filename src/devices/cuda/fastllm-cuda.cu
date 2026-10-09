@@ -7,6 +7,7 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-gdn.h"
 #include "fastllm-cuda-rope.cuh"
 #include "devices/cuda/cudaworkspace.h"
 #include "fastllm-cuda-mtp.cuh"
@@ -1719,6 +1720,13 @@ __global__ void FastllmSiluKernel(__nv_bfloat16 *a, __nv_bfloat16 *b,
     }
 }
 
+__global__ void FastllmExpKernel(__nv_bfloat16* a, __nv_bfloat16* b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        b[idx] = __float2bfloat16_rn(expf(__bfloat162float(a[idx])));
+    }
+}
+
 __global__ void FastllmSigmoidKernel(float* a, float *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -1895,6 +1903,16 @@ __global__ void FastllmMambaSoftplusKernel(half* inputData, half *outputData, fl
     }
 }
 
+__global__ void FastllmMambaSoftplusKernel(__nv_bfloat16* inputData, __nv_bfloat16* outputData,
+                                         float* aLog, float* dtBias, int channels, float outputScale) {
+    int o = blockIdx.x;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        int idx = o * channels + i;
+        outputData[idx] = __float2bfloat16_rn(outputScale * -expf(aLog[i]) *
+            softplus(__bfloat162float(inputData[idx]) + dtBias[i]));
+    }
+}
+
 __global__ void FastllmSigmoidMambaSoftplusKernel(float *sigmoidData, const float *softplusInputData, float *softplusOutputData,
                                                   const float *aLog, const float *dtBias, int channels) {
     int o = blockIdx.x;
@@ -1919,6 +1937,19 @@ __global__ void FastllmSigmoidMambaSoftplusKernel(half *sigmoidData, const half 
         sigmoidData[idx] = __hdiv(__float2half(1.0f), __hadd(__float2half(1.0f), hexp(-x)));
 #endif
         softplusOutputData[idx] = __float2half(-exp((double)aLog[i]) * softplus(__half2float(softplusInputData[idx]) + dtBias[i]));
+    }
+}
+
+__global__ void FastllmSigmoidMambaSoftplusKernel(
+        __nv_bfloat16* sigmoidData, const __nv_bfloat16* softplusInputData,
+        __nv_bfloat16* softplusOutputData, const float* aLog, const float* dtBias, int channels) {
+    int o = blockIdx.x;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        int idx = o * channels + i;
+        float x = __bfloat162float(sigmoidData[idx]);
+        sigmoidData[idx] = __float2bfloat16_rn(1.0f / (1.0f + expf(-x)));
+        softplusOutputData[idx] = __float2bfloat16_rn(-expf(aLog[i]) *
+            softplus(__bfloat162float(softplusInputData[idx]) + dtBias[i]));
     }
 }
 
@@ -6564,6 +6595,9 @@ bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output) {
         FastllmExpKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
         FastllmExpKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, len);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmExpKernel<<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(
+            (__nv_bfloat16*)cudaInput, (__nv_bfloat16*)cudaOutput, len);
     } else {
         printf("Exp datatype error.\n");
         exit(0);
@@ -6743,6 +6777,9 @@ bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output,
         FastllmMambaSoftplusKernel <<< outer, threadPerBlock >>> (cudaInput, cudaOutput, aLog, dtBias, channels, outputScale);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
         FastllmMambaSoftplusKernel <<< outer, threadPerBlock >>> ((half*)cudaInput, (half*)cudaOutput, aLog, dtBias, channels, outputScale);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmMambaSoftplusKernel<<<outer, threadPerBlock>>>(
+            (__nv_bfloat16*)cudaInput, (__nv_bfloat16*)cudaOutput, aLog, dtBias, channels, outputScale);
     }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishInput(aLogData, aLog);
@@ -6773,6 +6810,11 @@ bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fa
         FastllmSigmoidMambaSoftplusKernel<<<outer, threadPerBlock>>>(
             (half *) sigmoidInputOutput.cudaData, (const half *) softplusInput.cudaData,
             (half *) softplusOutput.cudaData, (const float *) aLogData.cudaData, (const float *) dtBiasData.cudaData, channels);
+    } else if (sigmoidInputOutput.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmSigmoidMambaSoftplusKernel<<<outer, threadPerBlock>>>(
+            (__nv_bfloat16*)sigmoidInputOutput.cudaData, (const __nv_bfloat16*)softplusInput.cudaData,
+            (__nv_bfloat16*)softplusOutput.cudaData, (const float*)aLogData.cudaData,
+            (const float*)dtBiasData.cudaData, channels);
     } else {
         return false;
     }
@@ -9863,6 +9905,338 @@ __global__ __launch_bounds__(32*Warps) void FastllmRMSNormSiluMulHalf128HeadMajo
 #endif
         output2[index] = __halves2half2(out0, out1);
     }
+}
+
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+// Keep the KV state layout and BF16 rounding points of the unfused path.
+// A CTA owns 32 V columns; its warps partition K and keep the state in registers.
+template<bool SLOTS = false>
+__global__ void FastllmGdnNormBaBf16KV128Kernel(
+        __nv_bfloat16 *state, const __nv_bfloat16 *q, const __nv_bfloat16 *k,
+        const __nv_bfloat16 *v, const __nv_bfloat16 *a, const __nv_bfloat16 *b,
+        const float *norm, const float *aLog, const float *dtBias,
+        __nv_bfloat16 *output, int group, float eps, float qScale,
+        const int *slotIds = nullptr, int keyHeads = 0, int valueHeads = 0, int capacity = 0) {
+    constexpr int K_WARPS = 8;
+    if constexpr (SLOTS) {
+        const int batch = blockIdx.z;
+        const int slot = slotIds[batch];
+        if (slot < 0 || slot >= capacity) return;
+        const size_t convOffset = (size_t)batch * (2 * keyHeads + valueHeads) * 128;
+        q += convOffset; k += convOffset; v += convOffset;
+        a += (size_t)batch * valueHeads * 2;
+        b += (size_t)batch * valueHeads * 2;
+        state += (size_t)slot * valueHeads * 128 * 128;
+        output += (size_t)batch * valueHeads * 128;
+    }
+    const int head = blockIdx.x;
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int column = blockIdx.y * 32 + lane;
+    const int qkBase = (head / group) * 128;
+    __shared__ float qn[128], kn[128], sums[4], scales[2], gate[2];
+    __shared__ float partial[K_WARPS][32], delta[32];
+    if (threadIdx.x < 64) {
+        const int j = threadIdx.x * 2;
+        float q0 = __bfloat162float(q[qkBase+j]);
+        float q1 = __bfloat162float(q[qkBase+j+1]);
+        float k0 = __bfloat162float(k[qkBase+j]);
+        float k1 = __bfloat162float(k[qkBase+j+1]);
+        float sq = q0*q0+q1*q1, sk = k0*k0+k1*k1;
+#pragma unroll
+        for (int offset=16; offset>0; offset>>=1) {
+            sq += __shfl_down_sync(0xffffffffu,sq,offset);
+            sk += __shfl_down_sync(0xffffffffu,sk,offset);
+        }
+        if (lane==0) { sums[warp]=sq; sums[warp+2]=sk; }
+    }
+    if (threadIdx.x==64) {
+        float br = __bfloat162float(b[head]);
+        float ar = __bfloat162float(a[head]);
+        gate[0] = __bfloat162float(__float2bfloat16_rn(1.0f/(1.0f+expf(-br))));
+        float g = -expf(aLog[head])*softplus(ar+dtBias[head]);
+        gate[1] = expf(__bfloat162float(__float2bfloat16_rn(g)));
+    }
+    __syncthreads();
+    if (threadIdx.x==0) {
+        scales[0]=rsqrtf((sums[0]+sums[1])/128.0f+eps);
+        scales[1]=rsqrtf((sums[2]+sums[3])/128.0f+eps);
+    }
+    __syncthreads();
+    if (threadIdx.x<128) {
+        const int j=threadIdx.x;
+        float qv=__bfloat162float(__float2bfloat16_rn(
+            __bfloat162float(q[qkBase+j])*scales[0]*norm[j]));
+        qn[j]=__bfloat162float(__float2bfloat16_rn(qv*qScale));
+        kn[j]=__bfloat162float(__float2bfloat16_rn(
+            __bfloat162float(k[qkBase+j])*scales[1]*norm[j]));
+    }
+    __syncthreads();
+    constexpr int ITEMS=128/K_WARPS;
+    float values[ITEMS], sum=0.0f;
+#pragma unroll
+    for (int item=0;item<ITEMS;++item) {
+        int j=warp+item*K_WARPS;
+        values[item]=__bfloat162float(__float2bfloat16_rn(
+            __bfloat162float(state[(size_t)head*128*128+j*128+column])*gate[1]));
+        sum += values[item]*kn[j];
+    }
+    partial[warp][lane]=sum;
+    __syncthreads();
+    if (warp==0) {
+        float total=0.0f;
+#pragma unroll
+        for (int i=0;i<K_WARPS;++i) total+=partial[i][lane];
+        delta[lane]=(__bfloat162float(v[head*128+column])-total)*gate[0];
+    }
+    __syncthreads();
+    sum=0.0f;
+#pragma unroll
+    for (int item=0;item<ITEMS;++item) {
+        int j=warp+item*K_WARPS;
+        __nv_bfloat16 updated=__float2bfloat16_rn(values[item]+kn[j]*delta[lane]);
+        state[(size_t)head*128*128+j*128+column]=updated;
+        sum += __bfloat162float(updated)*qn[j];
+    }
+    partial[warp][lane]=sum;
+    __syncthreads();
+    if (warp==0) {
+        float total=0.0f;
+#pragma unroll
+        for (int i=0;i<K_WARPS;++i) total+=partial[i][lane];
+        output[head*128+column]=__float2bfloat16_rn(total);
+    }
+}
+
+// Two independent warp reductions reproduce the original 64-thread RMSNorm.
+// Round RMSNorm and SiLU separately to BF16 before their final multiplication.
+__global__ __launch_bounds__(32) void FastllmRMSNormSiluMulBf16KV128Kernel(
+        const __nv_bfloat16 *input, const float *weight,
+        const __nv_bfloat16 *gate, __nv_bfloat16 *output, float eps) {
+    const int lane=threadIdx.x;
+    input+=(size_t)blockIdx.x*128;
+    gate+=(size_t)blockIdx.x*128;
+    output+=(size_t)blockIdx.x*128;
+    float values[4], gates[4];
+#pragma unroll
+    for (int i=0;i<4;++i) {
+        int j=lane*2+(i/2)*64+i%2;
+        values[i]=__bfloat162float(input[j]);
+        gates[i]=__bfloat162float(gate[j]);
+    }
+    float sum0=values[0]*values[0]+values[1]*values[1];
+    float sum1=values[2]*values[2]+values[3]*values[3];
+#pragma unroll
+    for (int offset=16;offset>0;offset>>=1) {
+        sum0+=__shfl_down_sync(0xffffffffu,sum0,offset);
+        sum1+=__shfl_down_sync(0xffffffffu,sum1,offset);
+    }
+    float scale=rsqrtf(__shfl_sync(0xffffffffu,sum0+sum1,0)/128.0f+eps);
+#pragma unroll
+    for (int i=0;i<4;++i) {
+        int j=lane*2+(i/2)*64+i%2;
+        float rms=__bfloat162float(__float2bfloat16_rn(values[i]*scale*weight[j]));
+        float silu=__bfloat162float(__float2bfloat16_rn(gates[i]/(1.0f+expf(-gates[i]))));
+        output[j]=__float2bfloat16_rn(rms*silu);
+    }
+}
+
+static bool FastllmGdnResidentContiguous(const fastllm::Data &data,
+                                       fastllm::DataType dtype, int device) {
+    if (data.dataDevice != fastllm::DataDevice::CUDA || data.dataType != dtype ||
+        data.cudaData == nullptr || data.multiDeviceData || data.dims.empty() ||
+        data.strides.size() != data.dims.size() ||
+        (!data.dataDeviceIds.empty() && data.dataDeviceIds != std::vector<int>{device})) {
+        return false;
+    }
+    uint64_t stride = 1;
+    for (int i = (int)data.dims.size() - 1; i >= 0; --i) {
+        if (data.dims[i] <= 0 || data.strides[i] != stride) return false;
+        stride *= data.dims[i];
+    }
+    return true;
+}
+#endif
+
+bool FastllmCudaRMSNormSiluMulBFloat16(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &gateInput, fastllm::Data &output, float eps) {
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+    using namespace fastllm;
+    if (FastllmCudaRuntimeArch() != 90 || FastllmCudaGetLinearExactBatchThreshold() != 0) return false;
+    const int device = FastllmCudaGetDevice();
+    if (!FastllmGdnResidentContiguous(input, BFLOAT16, device) ||
+        !FastllmGdnResidentContiguous(gateInput, BFLOAT16, device) ||
+        !FastllmGdnResidentContiguous(output, BFLOAT16, device) ||
+        !FastllmGdnResidentContiguous(weight, FLOAT32, device) ||
+        input.dims != gateInput.dims || output.dims != input.dims ||
+        input.dims.back() != 128 || weight.dims != std::vector<int>{128}) return false;
+    const uint64_t rows = input.Count(0) / 128;
+    if (rows == 0 || rows > INT_MAX) return false;
+    FastllmRMSNormSiluMulBf16KV128Kernel<<<(int)rows, 32, 0, cudaStreamPerThread>>>(
+        (const __nv_bfloat16 *)input.cudaData, (const float *)weight.cudaData,
+        (const __nv_bfloat16 *)gateInput.cudaData, (__nv_bfloat16 *)output.cudaData, eps);
+    checkCudaErrors("Error: CUDA error in FastllmCudaRMSNormSiluMulBFloat16.", cudaGetLastError());
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool FastllmRecurrentGatedDeltaRuleNormBaBFloat16(
+        fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+        fastllm::Data &a, fastllm::Data &b, fastllm::Data &normWeight,
+        fastllm::Data &aLog, fastllm::Data &dtBias, fastllm::Data &state,
+        fastllm::Data &output, float eps, float qScale) {
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+    using namespace fastllm;
+    if (FastllmCudaRuntimeArch() != 90 || FastllmCudaGetLinearExactBatchThreshold() != 0 ||
+        state.isLinearAttentionTransposed) return false;
+    const int device = FastllmCudaGetDevice();
+    for (const Data *data : {&q, &k, &v, &a, &b, &state}) {
+        if (!FastllmGdnResidentContiguous(*data, BFLOAT16, device)) return false;
+    }
+    for (const Data *data : {&normWeight, &aLog, &dtBias}) {
+        if (!FastllmGdnResidentContiguous(*data, FLOAT32, device)) return false;
+    }
+    // Single-token token-major Q/K/V; recurrent state remains [1,Hv,K,V].
+    if (state.dims.size() != 4 || q.dims.size() != 4 ||
+        state.dims[0] != 1 || state.dims[2] != 128 || state.dims[3] != 128) return false;
+    const int heads = state.dims[1], keyHeads = q.dims[2];
+    if (keyHeads <= 0 || heads % keyHeads != 0 ||
+        q.dims != std::vector<int>({1, 1, keyHeads, 128}) || k.dims != q.dims ||
+        v.dims != std::vector<int>({1, 1, heads, 128}) ||
+        a.dims != std::vector<int>({1, 1, heads}) || b.dims != a.dims ||
+        normWeight.dims != std::vector<int>{128} ||
+        aLog.dims != std::vector<int>{heads} || dtBias.dims != aLog.dims) return false;
+    output.dataType = BFLOAT16;
+    output.dataDevice = DataDevice::CUDA;
+    output.dataDeviceIds = state.dataDeviceIds;
+    output.Resize({1, 1, heads, 128});
+    output.Allocate(false);
+    FastllmGdnNormBaBf16KV128Kernel<><<<dim3(heads, 4), 256, 0, cudaStreamPerThread>>>(
+        (__nv_bfloat16 *)state.cudaData, (const __nv_bfloat16 *)q.cudaData,
+        (const __nv_bfloat16 *)k.cudaData, (const __nv_bfloat16 *)v.cudaData,
+        (const __nv_bfloat16 *)a.cudaData, (const __nv_bfloat16 *)b.cudaData,
+        (const float *)normWeight.cudaData, (const float *)aLog.cudaData,
+        (const float *)dtBias.cudaData, (__nv_bfloat16 *)output.cudaData,
+        heads / keyHeads, eps, qScale);
+    checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleNormBaBFloat16.", cudaGetLastError());
+    return true;
+#else
+    return false;
+#endif
+}
+
+// CUDA Graph must index persistent state pools at replay time. It must never
+// capture a request's temporary cache view or reinterpret BF16 state as FP16.
+bool FastllmCudaBFloat16GdnGraphSupported() {
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+    return FastllmCudaRuntimeArch() == 90 && fastllm::FastllmCudaGetLinearExactBatchThreshold() == 0;
+#else
+    return false;
+#endif
+}
+
+bool FastllmRecurrentGatedDeltaRuleBFloat16Slots(
+        const fastllm::Data &conv, const fastllm::Data &ba,
+        const fastllm::Data &norm, const fastllm::Data &aLog, const fastllm::Data &dtBias,
+        fastllm::Data &statePool, const fastllm::Data &slotIds, fastllm::Data &output,
+        int batch, int keyHeads, int valueHeads, float eps, float qScale) {
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+    using namespace fastllm;
+    if (!FastllmCudaBFloat16GdnGraphSupported() || batch <= 0 || batch > 65535 ||
+        keyHeads <= 0 || valueHeads <= 0 || valueHeads % keyHeads != 0 ||
+        statePool.isLinearAttentionTransposed) return false;
+    const int device = FastllmCudaGetDevice();
+    for (const Data *data : {&conv, &ba, (const Data *)&statePool}) {
+        if (!FastllmGdnResidentContiguous(*data, BFLOAT16, device)) return false;
+    }
+    for (const Data *data : {&norm, &aLog, &dtBias}) {
+        if (!FastllmGdnResidentContiguous(*data, FLOAT32, device)) return false;
+    }
+    if (!FastllmGdnResidentContiguous(slotIds, INT32, device) || slotIds.Count(0) != (uint64_t)batch ||
+        statePool.dims.size() != 4 || statePool.dims[0] < batch ||
+        statePool.dims[1] != valueHeads || statePool.dims[2] != 128 || statePool.dims[3] != 128 ||
+        conv.dims.back() != (2 * keyHeads + valueHeads) * 128 ||
+        conv.Count(0) != (uint64_t)batch * conv.dims.back() ||
+        ba.dims.back() != valueHeads * 2 || ba.Count(0) != (uint64_t)batch * valueHeads * 2 ||
+        norm.dims != std::vector<int>{128} || aLog.dims != std::vector<int>{valueHeads} ||
+        dtBias.dims != aLog.dims) return false;
+    output.dataType = BFLOAT16;
+    output.dataDevice = DataDevice::CUDA;
+    output.dataDeviceIds = statePool.dataDeviceIds;
+    output.Resize({batch, valueHeads, 1, 128});
+    output.Allocate(false);
+    const auto *q = (const __nv_bfloat16 *)conv.cudaData;
+    const auto *b = (const __nv_bfloat16 *)ba.cudaData;
+    FastllmGdnNormBaBf16KV128Kernel<true><<<dim3(valueHeads, 4, batch), 256, 0, cudaStreamPerThread>>>(
+        (__nv_bfloat16 *)statePool.cudaData, q, q + keyHeads * 128, q + 2 * keyHeads * 128,
+        b + valueHeads, b, (const float *)norm.cudaData, (const float *)aLog.cudaData,
+        (const float *)dtBias.cudaData, (__nv_bfloat16 *)output.cudaData,
+        valueHeads / keyHeads, eps, qScale, (const int *)slotIds.cudaData,
+        keyHeads, valueHeads, statePool.dims[0]);
+    checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleBFloat16Slots.", cudaGetLastError());
+    return true;
+#else
+    return false;
+#endif
+}
+
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+__global__ void FastllmBFloat16ConvSiluSlotsKernel(
+        __nv_bfloat16 *pool, const int *slots, const __nv_bfloat16 *input,
+        const float *weight, const float *bias, __nv_bfloat16 *output,
+        int batch, int channels, int capacity) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= batch * channels) return;
+    const int channel = row % channels, slot = slots[row / channels];
+    if (slot < 0 || slot >= capacity) return;
+    auto *cache = pool + ((size_t)slot * channels + channel) * 4;
+    __nv_bfloat16 x0 = cache[1], x1 = cache[2], x2 = cache[3], x3 = input[row];
+    cache[0] = x0; cache[1] = x1; cache[2] = x2; cache[3] = x3;
+    float value = bias ? bias[channel] : 0.0f;
+    value += __bfloat162float(x0) * weight[channel * 4];
+    value += __bfloat162float(x1) * weight[channel * 4 + 1];
+    value += __bfloat162float(x2) * weight[channel * 4 + 2];
+    value += __bfloat162float(x3) * weight[channel * 4 + 3];
+    float conv = __bfloat162float(__float2bfloat16_rn(value));
+    output[row] = __float2bfloat16_rn(conv / (1.0f + expf(-conv)));
+}
+#endif
+
+bool FastllmCudaBFloat16ConvSiluSlots(
+        fastllm::Data &pool, const fastllm::Data &slots, const fastllm::Data &input,
+        const fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int batch) {
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+    using namespace fastllm;
+    if (!FastllmCudaBFloat16GdnGraphSupported() || batch <= 0) return false;
+    const int device = FastllmCudaGetDevice();
+    if (!FastllmGdnResidentContiguous(pool, BFLOAT16, device) ||
+        !FastllmGdnResidentContiguous(input, BFLOAT16, device) ||
+        !FastllmGdnResidentContiguous(weight, FLOAT32, device) ||
+        !FastllmGdnResidentContiguous(slots, INT32, device) || slots.Count(0) != (uint64_t)batch ||
+        pool.dims.size() != 4 || pool.dims[0] < batch || pool.dims[1] != 1 || pool.dims[3] != 4) return false;
+    const int channels = pool.dims[2];
+    if (input.dims != std::vector<int>({batch, channels, 1}) ||
+        (uint64_t)batch * channels > INT_MAX ||
+        (weight.dims != std::vector<int>({channels, 4}) &&
+         weight.dims != std::vector<int>({channels, 1, 4})) ||
+        (!bias.dims.empty() && (!FastllmGdnResidentContiguous(bias, FLOAT32, device) ||
+                               bias.dims != std::vector<int>{channels}))) return false;
+    output.dataType = BFLOAT16;
+    output.dataDevice = DataDevice::CUDA;
+    output.dataDeviceIds = pool.dataDeviceIds;
+    output.Resize({batch, channels, 1});
+    output.Allocate(false);
+    FastllmBFloat16ConvSiluSlotsKernel<<<(batch * channels + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        (__nv_bfloat16 *)pool.cudaData, (const int *)slots.cudaData, (const __nv_bfloat16 *)input.cudaData,
+        (const float *)weight.cudaData, bias.dims.empty() ? nullptr : (const float *)bias.cudaData,
+        (__nv_bfloat16 *)output.cudaData, batch, channels, pool.dims[0]);
+    checkCudaErrors("Error: CUDA error in FastllmCudaBFloat16ConvSiluSlots.", cudaGetLastError());
+    return true;
+#else
+    return false;
+#endif
 }
 
 static bool LaunchFastllmRMSNormSiluMulFloat16(
@@ -17366,6 +17740,13 @@ bool FastllmCudaConv1DPerChannelFloat32(
                 inputLength, outputLength,
                 kernelSize, stride, padding, groups
         );
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        Conv1DPerChannelKernel<__nv_bfloat16> <<<blocksPerGrid, threadsPerBlock>>>(
+                (__nv_bfloat16*)d_input, d_weight, d_bias, (__nv_bfloat16*)d_output,
+                batchSize, inputChannels, outputChannels,
+                inputLength, outputLength,
+                kernelSize, stride, padding, groups
+        );
     }
 
     DeviceSync();
@@ -20540,8 +20921,13 @@ void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm:
                 n0, n1, n2, n3, group, qScale
             );
         }
+    } else if (q.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmRecurrentGatedDeltaRuleKernel<__nv_bfloat16><<<gridDim, threadsPerBlock, sharedMemSize>>>(
+            (__nv_bfloat16*)d_last_state, (__nv_bfloat16*)d_g, (__nv_bfloat16*)d_k,
+            (__nv_bfloat16*)d_v, (__nv_bfloat16*)d_b, (__nv_bfloat16*)d_q, (__nv_bfloat16*)d_out,
+            n0, n1, n2, n3, group, qScale);
     }
-    
+
     checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRule.", cudaGetLastError());
 }
 
@@ -20835,6 +21221,11 @@ bool FastllmRecurrentGatedDeltaRuleBatchDevicePointers(
                 batch, n1, n2, n3, group, qScale
             );
         }
+    } else if (q.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmRecurrentGatedDeltaRuleBatchPointerKernel<__nv_bfloat16><<<gridDim, threadsPerBlock, sharedMemSize>>>(
+            (__nv_bfloat16**)cudaStatePointers, (__nv_bfloat16*)g.cudaData, (__nv_bfloat16*)k.cudaData,
+            (__nv_bfloat16*)v.cudaData, (__nv_bfloat16*)b.cudaData, (__nv_bfloat16*)q.cudaData,
+            (__nv_bfloat16*)core_attn_out.cudaData, batch, n1, n2, n3, group, qScale);
     } else {
         return false;
     }

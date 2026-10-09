@@ -72,3 +72,19 @@ For BN72/96/112, weight tiles can span two 128-column scaling groups.
 Shared memory includes both scale rows; output TMA disables swizzling
 when the tile is not divisible by 64. Neither the quantization rule nor
 the FP32 accumulation / FP16 output precision changes.
+
+BF16 GDN and CUDA Graph support
+
+The fused BF16 Q/K norm, gate preparation, GDN recurrence and gated RMSNorm
+require SM90, K=V=128 and exact-row verification disabled. CUDA_NO_TENSOR_CORE
+and ROCm builds use the existing fallback. BF16 recurrent state stays in KV
+layout; FP16 graph state keeps its existing VK layout. Graph pool keys include
+the compute dtype, and slot IDs remain replay-time inputs.
+Generic BF16 Exp/MambaSoftplus/SigmoidMambaSoftplus and recurrent fallback
+dispatch are available to other CUDA architectures; existing FP16/FP32 paths
+are unchanged. No additional environment variables are required.
+
+Validation (use --output to retain the JSON results):
+    python test/ops/check_bf16_compat.py --output /tmp/bf16-compat.json
+    python test/ops/check_bf16_gdn_fusion.py --output /tmp/bf16-gdn.json
+    python test/ops/check_bf16_graph_slots.py --output /tmp/bf16-slots.json
