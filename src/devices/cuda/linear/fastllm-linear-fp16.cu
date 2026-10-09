@@ -2510,7 +2510,51 @@ __global__ void FastllmCudaBf16ToHalfKernelFP16(const __nv_bfloat16 *src, half *
         dst[idx] = __float2half_rn(__bfloat162float(src[idx]));
 }
 
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+// Hopper batch-1 lm_head: four independent output rows per CTA, one warp
+// per row. Keep BF16 activations and FP16 weights in their original formats;
+// vector loads and FP32 FMA avoid the generic GEMV's shared-memory reduction.
+static __global__ void FastllmGemvBf16Fp16HopperHead(
+        const __nv_bfloat16 *input, const half *weight, __nv_bfloat16 *output) {
+    constexpr int K = 5120;
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * 4 + threadIdx.x / 32;
+    float acc[4] = {};
+    for (int column = lane * 8; column < K; column += 32 * 8) {
+        union __align__(16) {
+            uint4 in;
+            __nv_bfloat16 values[8];
+        } a;
+        union_half8 b;
+        a.in = *reinterpret_cast<const uint4 *>(input + column);
+        b.in = *reinterpret_cast<const uint4 *>(weight + (size_t)row * K + column);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            acc[i % 4] = fmaf(__bfloat162float(a.values[i]),
+                              __half2float(b.out[i]), acc[i % 4]);
+        }
+    }
+    float sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) output[row] = __float2bfloat16_rn(sum);
+}
+#endif
+
 void LaunchFastllmGemmBf16Fp16(__nv_bfloat16 *input, half *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+    if (n == 1 && m == 5120 && k == 248320 && bias == nullptr &&
+        fastllm::FastllmCudaGetLinearExactBatchThreshold() == 0 &&
+        FastllmCudaRuntimeArch() == 90 &&
+        (reinterpret_cast<uintptr_t>(input) & 15) == 0 &&
+        (reinterpret_cast<uintptr_t>(weight) & 15) == 0) {
+        FastllmGemvBf16Fp16HopperHead<<<k / 4, 128, 0, cudaStreamPerThread>>>(
+            input, weight, output);
+        return;
+    }
+#endif
     if (n == 1) {
         FastllmGemvBf16Fp16Kernel2MultiRow<256, 1> <<< k, 256 >>>(input, weight, output, bias, m, k);
     } else if (n == 2) {

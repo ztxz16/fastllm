@@ -7,12 +7,19 @@ the FP16 route is excluded from ROCm and CUDA_NO_TENSOR_CORE builds.
 
 FP8 targets (N,K): (34816,5120), (5120,17408), (5120,6144),
 (16384,5120) for linear-attention QKVZ and (14336,5120) for full-attention Q+gate/K/V.
-Input/output: FP16. Weights: E4M3, row-major, 128x128 block scaling.
+Input/output: FP16 or BF16. Weights: E4M3, row-major, 128x128 block scaling.
 The new path quantizes activations in groups of 128 to FP8 E4M3, then uses
 swapped-operand WGMMA with TMA/persistent scheduling adapted from TensorRT-LLM.
-This changes numerical results relative to native W8A16. Output stays FP16.
+This changes numerical results relative to native W8A16. Output retains the input dtype.
 FP16 lm_head (1 <= M < 32,N=248320,K=5120), without bias or addTo, uses autotuned
 cuBLASLt with FP32 accumulation. Other FP16 shapes keep native dispatch.
+BF16-input/FP16-weight lm_head (M=1,N=248320,K=5120), without bias,
+uses a four-warp native GEMV on SM90. It preserves both storage formats,
+accumulates in FP32 and rounds to BF16. Its reduction order differs from the
+legacy GEMV, so exact-row verification retains the original path. Input and
+weight require 16-byte alignment; other batches/shapes retain native dispatch.
+Validation: python test/ops/check_hopper_mixed_head.py --output /tmp/mixed-head.json
+
 Both paths require SM90 and no exact-row verification threshold. Unsupported
 shapes/layouts and unwarmed graph capture retain the existing fallback.
 Rows 32..128 use the tuned ordinary GEMM for the validated shapes on 78-SM
@@ -53,6 +60,9 @@ nodes, excluding model load, warmup and prefill.
 
 Ordinary FP8 GEMM parameters (rows 32..128)
 
+Applies to FP16 and BF16 input/output; the activation quantization and
+FP32 accumulation are the same. H20 (78-SM SM90), rows32..128 and the listed
+projection shapes are required; other architectures/shapes keep existing dispatch.
 All tuned configurations use BM64, BK128, six pipeline stages and 78 workers.
 The scheduler's compile-time worker count and launch grid must agree.
 
@@ -71,7 +81,13 @@ The mainloop remains FastLLM's existing vendored DeepGEMM implementation.
 For BN72/96/112, weight tiles can span two 128-column scaling groups.
 Shared memory includes both scale rows; output TMA disables swizzling
 when the tile is not divisible by 64. Neither the quantization rule nor
-the FP32 accumulation / FP16 output precision changes.
+the FP32 accumulation / selected output precision changes.
+
+BF16 large-batch validation (including 31/32, 64/65 and 128/129 boundaries):
+    python test/ops/check_hopper_decode.py --dtype bf16 --fp8-only --rows 1,31,32,33,63,64,65,100,127,128,129
+The same command with --dtype fp16 checks the existing FP16 path. BF16 checks
+include wide-range inputs, bias, per-row scales, FP32 reference, graph replay,
+scratch growth and an output canary row.
 
 BF16 GDN and CUDA Graph support
 

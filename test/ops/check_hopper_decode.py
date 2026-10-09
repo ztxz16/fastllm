@@ -19,7 +19,11 @@ def main():
     parser.add_argument('--output',type=Path,help='Optional JSON results file')
     parser.add_argument('--library',type=Path,default=LIB,help='Native library to test')
     parser.add_argument('--fallback-only',action='store_true',help='Check unchanged fallback outputs against a saved library')
+    parser.add_argument('--dtype', choices=['fp16','bf16'], default='fp16', help='FP8 activation/output dtype')
+    parser.add_argument('--fp8-only', action='store_true', help='Skip the unrelated FP16 lm_head/fallback tests')
+    parser.add_argument('--rows', help='Optional comma-separated FP8 row counts')
     args_cli=parser.parse_args()
+    dtype=torch.bfloat16 if args_cli.dtype=='bf16' else torch.float16
     torch.manual_seed(42)
     torch.backends.cuda.matmul.allow_tf32=False
     with tempfile.TemporaryDirectory() as tmp:
@@ -47,18 +51,21 @@ def main():
             cases=[(rows,N,K) for rows in [*range(1,32),32,33,63,64,65,100,127,128,129]
                    for N,K in [(5120,6144),(34816,5120),(5120,17408),
                                (16384,5120),(14336,5120)]]
+            if args_cli.rows:
+                selected_rows={int(n) for n in args_cli.rows.split(',')}
+                cases=[case for case in cases if case[0] in selected_rows]
             if args_cli.fallback_only:cases=[]
             for rows,N,K in cases:
                 for with_bias in [False,True]:
-                    x=torch.randn(rows,K,device='cuda',dtype=torch.float16)*.3
+                    x=torch.randn(rows,K,device='cuda',dtype=dtype)*.3
                     x.mul_(torch.linspace(.2,5,rows,device='cuda').view(-1,1))  # Independent row scales.
                     w=torch.randn(N,K,device='cuda').clamp(-3,3).to(torch.float8_e4m3fn)
                     s=torch.rand(N//128,K//128,device='cuda')*.1+.002
                     bias=torch.randn(N,device='cuda')*.02 if with_bias else None
-                    storage=torch.full((rows+1,N),17.,device='cuda',dtype=torch.float16)
+                    storage=torch.full((rows+1,N),17.,device='cuda',dtype=dtype)
                     y=storage[:rows]
                     y.fill_(float('nan'))
-                    args=[x.data_ptr(),w.data_ptr(),s.data_ptr(),bias.data_ptr() if bias is not None else 0,y.data_ptr(),rows,K,N,False,0]
+                    args=[x.data_ptr(),w.data_ptr(),s.data_ptr(),bias.data_ptr() if bias is not None else 0,y.data_ptr(),rows,K,N,args_cli.dtype=='bf16',0]
                     assert fn(*args)
                     torch.cuda.synchronize()
                     g,ex=C.c_void_p(),C.c_void_p()
@@ -72,10 +79,11 @@ def main():
             for ex,x,w,s,bias,y,args,guard in graphs:
                 N,K=w.shape
                 rows=x.shape[0]
-                modes=['random','changed']+(['row_zero'] if rows>1 else [])+['zero']
+                modes=['random','changed']+(['row_zero'] if rows>1 else [])+(['bf16_wide'] if dtype==torch.bfloat16 and (rows==1 or 32<=rows<=128) else [])+['zero']
                 for mode in modes:
                     if mode=='changed':x[0].mul_(.7)
                     if mode=='row_zero':x[0].zero_();x[-1].mul_(-.5)
+                    if mode=='bf16_wide':x.mul_(1e6)  # Must not overflow through a hidden FP16 intermediate.
                     if mode=='zero':x.zero_()
                     y.fill_(float('nan'))
                     assert lib.FastllmCudaGraphLaunch(ex)
@@ -84,10 +92,10 @@ def main():
                     xs=(xf.abs().amax(-1,keepdim=True)/448).clamp_min(1e-10)
                     xq=((xf/xs).to(torch.float8_e4m3fn).float()*xs).reshape(rows,K)
                     wf=w.float()*s.repeat_interleave(128,0).repeat_interleave(128,1)
-                    ref=(xq@wf.T).half().float()
+                    ref=(xq@wf.T).to(dtype).float()
                     native=x.float()@wf.T
                     if bias is not None:
-                        ref=(ref+bias).half().float();native+=bias
+                        ref=(ref+bias).to(dtype).float();native+=bias
                     diff=y.float()-ref
                     nrmse=(diff.norm()/ref.norm().clamp_min(1e-8)).item()
                     row_nrmse=(diff.norm(dim=1)/ref.norm(dim=1).clamp_min(1e-8)).tolist()
@@ -95,16 +103,17 @@ def main():
                     quant_nrmse=((y.float()-native).norm()/native.norm().clamp_min(1e-8)).item()
                     assert torch.isfinite(y).all()
                     assert torch.all(guard==17), 'TMA store wrote beyond the last row'
-                    assert nrmse<.002 and max_relative<.006,(N,K,mode,nrmse,max_relative)
-                    assert max(row_nrmse)<.002,(rows,N,K,mode,row_nrmse)
+                    tolerance=.008 if dtype==torch.bfloat16 else .002
+                    assert nrmse<tolerance and max_relative<tolerance*3,(N,K,mode,nrmse,max_relative)
+                    assert max(row_nrmse)<tolerance,(rows,N,K,mode,row_nrmse)
                     assert quant_nrmse<.04,(N,K,mode,quant_nrmse)
-                    record=dict(rows=rows,N=N,K=K,bias=bias is not None,mode=mode,nrmse=nrmse,row_nrmse=row_nrmse,max_relative=max_relative,quant_nrmse=quant_nrmse)
+                    record=dict(dtype=args_cli.dtype,sha256=hashlib.sha256(y.view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),rows=rows,N=N,K=K,bias=bias is not None,mode=mode,nrmse=nrmse,row_nrmse=row_nrmse,max_relative=max_relative,quant_nrmse=quant_nrmse)
                     records.append(record);print(json.dumps(record),flush=True)
                 y.fill_(17)
                 for invalid in [1,2,3,4,5,6,8,9]:
                     bad=args.copy();bad[-1]=invalid
                     assert not fn(*bad),invalid
-                for index,value in [(5,0),(6,K-1),(7,N-1)]+([(8,True)] if rows<32 else []):
+                for index,value in [(5,0),(6,K-1),(7,N-1)]:
                     bad=args.copy();bad[index]=value
                     assert not fn(*bad),(index,value)
                 if bias is not None:
@@ -117,6 +126,11 @@ def main():
                     lib.HopperTestSetExactThreshold(previous)
                 assert torch.all(y==17), 'rejected calls modified output'
                 lib.FastllmCudaGraphExecDestroy(ex)
+            if args_cli.fp8_only:
+                if args_cli.output:
+                    args_cli.output.write_text(json.dumps(records,indent=2))
+                print('PASS: production FP8 decode, oracle, graph replay, bias and rejection guards',flush=True)
+                return
             # Production lm_head dispatch, full model dimensions, FP32 oracle.
             N,K=248320,5120
             w=(torch.randn(N,K,device='cuda',dtype=torch.float16)*.02)

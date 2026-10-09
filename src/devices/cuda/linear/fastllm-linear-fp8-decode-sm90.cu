@@ -79,7 +79,7 @@ static bool MakeTma(CUtensorMap &desc, CUtensorMapDataType dtype,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
-template <int N, int K, int BN, int stages>
+template <typename T, int N, int K, int BN, int stages>
 bool LaunchSwap(void *input, void *weight, float *inputScales,
                 float *weightScales, void *output, int rows, int scaleRows,
                 int workers, cudaStream_t stream) {
@@ -92,25 +92,26 @@ bool LaunchSwap(void *input, void *weight, float *inputScales,
             CU_TENSOR_MAP_DATA_TYPE_UINT8, input, K, rows, K,
             128, BN, CU_TENSOR_MAP_SWIZZLE_128B) ||
         !MakeTma(d,
-            CU_TENSOR_MAP_DATA_TYPE_FLOAT16, output, N, rows, N * 2,
+            std::is_same_v<T, half> ? CU_TENSOR_MAP_DATA_TYPE_FLOAT16 : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            output, N, rows, N * sizeof(T),
             BM, std::min(rows, BN), CU_TENSOR_MAP_SWIZZLE_NONE) ||
         !MakeTma(sfa,
             CU_TENSOR_MAP_DATA_TYPE_FLOAT32, inputScales, scaleRows, K / 128,
             scaleRows * 4, BN, 1, CU_TENSOR_MAP_SWIZZLE_NONE)) return false;
     using Scheduler = NormalSchedulerSwapAB<N, BM, BN, 1, 1>;
     auto kernel = fp8_gemm_kernel_swapAB<N, K, BM, BN, 128, 1, stages,
-        128, 128, 1, Scheduler, NormalSchedulerInputSwapAB>;
+        128, 128, 1, Scheduler, NormalSchedulerInputSwapAB, T>;
     constexpr int smem = BM * BN * 2 + stages * (BM * 128 + BN * 128 + 128)
         + ((K / 128 * 4 + 7) / 8) * 8 + stages * 16;
     if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                             smem) != cudaSuccess) return false;
     NormalSchedulerInputSwapAB params{static_cast<uint32_t>(rows), nullptr};
-    kernel<<<workers, 384, smem, stream>>>(static_cast<half *>(output),
+    kernel<<<workers, 384, smem, stream>>>(static_cast<T *>(output),
         weightScales, params, a, b, sfa, d);
     return cudaGetLastError() == cudaSuccess;
 }
 
-template <int N, int K>
+template <typename T, int N, int K>
 bool LaunchForRows(void *input, void *weight, float *inputScales,
                    float *weightScales, void *output, int rows, int scaleRows,
                    int workers, cudaStream_t stream) {
@@ -130,14 +131,15 @@ bool LaunchForRows(void *input, void *weight, float *inputScales,
             bestUtil = util;
         }
     }
-    if (bestN == 16) return LaunchSwap<N, K, 16, 8>(input, weight, inputScales,
+    if (bestN == 16) return LaunchSwap<T, N, K, 16, 8>(input, weight, inputScales,
         weightScales, output, rows, scaleRows, workers, stream);
-    if (bestN == 24) return LaunchSwap<N, K, 24, 6>(input, weight, inputScales,
+    if (bestN == 24) return LaunchSwap<T, N, K, 24, 6>(input, weight, inputScales,
         weightScales, output, rows, scaleRows, workers, stream);
-    return LaunchSwap<N, K, 32, 8>(input, weight, inputScales,
+    return LaunchSwap<T, N, K, 32, 8>(input, weight, inputScales,
         weightScales, output, rows, scaleRows, workers, stream);
 }
 
+template <typename T>
 static bool Run(
         const void *input, void *weight, float *weightScales, const float *bias,
         void *output, int rows, int cols, int outCols, Scratch &scratch,
@@ -158,28 +160,28 @@ static bool Run(
     auto *quant = static_cast<__nv_fp8_e4m3 *>(scratch.data);
     auto *scales = reinterpret_cast<float *>(static_cast<char *>(scratch.data) + inputBytes);
     const size_t tasks = (size_t)scaleRows * (cols / 128);
-    Quantize<<<(tasks + 7) / 8, 256, 0, stream>>>(static_cast<const half *>(input), quant, scales, rows, cols, scaleRows);
+    Quantize<<<(tasks + 7) / 8, 256, 0, stream>>>(static_cast<const T *>(input), quant, scales, rows, cols, scaleRows);
     if (cudaGetLastError() != cudaSuccess) return false;
     bool ok = false;
     if (outCols == 34816 && cols == 5120) {
-        ok = LaunchForRows<34816, 5120>(quant, weight, scales, weightScales,
+        ok = LaunchForRows<T, 34816, 5120>(quant, weight, scales, weightScales,
             output, rows, scaleRows, workers, stream);
     } else if (outCols == 5120 && cols == 17408) {
-        ok = LaunchForRows<5120, 17408>(quant, weight, scales, weightScales,
+        ok = LaunchForRows<T, 5120, 17408>(quant, weight, scales, weightScales,
             output, rows, scaleRows, workers, stream);
     } else if (outCols == 5120 && cols == 6144) {
-        ok = LaunchForRows<5120, 6144>(quant, weight, scales, weightScales,
+        ok = LaunchForRows<T, 5120, 6144>(quant, weight, scales, weightScales,
             output, rows, scaleRows, workers, stream);
     } else if (outCols == 16384 && cols == 5120) {
-        ok = LaunchForRows<16384, 5120>(quant, weight, scales, weightScales,
+        ok = LaunchForRows<T, 16384, 5120>(quant, weight, scales, weightScales,
             output, rows, scaleRows, workers, stream);
     } else if (outCols == 14336 && cols == 5120) {
-        ok = LaunchForRows<14336, 5120>(quant, weight, scales, weightScales,
+        ok = LaunchForRows<T, 14336, 5120>(quant, weight, scales, weightScales,
             output, rows, scaleRows, workers, stream);
     }
     if (ok && bias) {
         const size_t count = (size_t)rows * outCols;
-        AddBias<<<(count + 255) / 256, 256, 0, stream>>>(static_cast<half *>(output), bias, count, outCols);
+        AddBias<<<(count + 255) / 256, 256, 0, stream>>>(static_cast<T *>(output), bias, count, outCols);
         ok = cudaGetLastError() == cudaSuccess;
     }
     return ok;
@@ -201,7 +203,8 @@ bool FastllmCudaDeepGemmDecodeFp8Sm90(
         weight.dataType != fastllm::DataType::FP8_E4M3 ||
         weight.blockM != 128 || weight.blockK != 128 ||
         weight.dims.size() != 2 || weight.dims[0] != k || weight.dims[1] != m ||
-        input.dataType != fastllm::DataType::FLOAT16 ||
+        (input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::BFLOAT16) ||
         output.dataType != input.dataType ||
         weight.scales.size() != (size_t)(m / 128) * (k / 128) ||
         FastllmCudaHasFp8MarlinLayout(weight) ||
@@ -220,7 +223,9 @@ bool FastllmCudaDeepGemmDecodeFp8Sm90(
     int workers = 0;
     if (cudaDeviceGetAttribute(&workers, cudaDevAttrMultiProcessorCount,
                               device) != cudaSuccess || workers <= 0) return false;
-    return Run(input.cudaData, weight.cudaData,
+    auto run = input.dataType == fastllm::DataType::BFLOAT16
+        ? Run<__nv_bfloat16> : Run<half>;
+    return run(input.cudaData, weight.cudaData,
         static_cast<float *>(weight.extraCudaData[0]),
         bias.dims.empty() ? nullptr : static_cast<const float *>(bias.cudaData),
         output.cudaData, n, m, k, scratchByDevice[device], capture, workers);

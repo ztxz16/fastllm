@@ -7,7 +7,7 @@ FastLLM modifications:
 - Retain swapAB, its normal scheduler and MMA widths 16/24/32 only.
 - Isolate symbols in fastllm_trtllm_deep_gemm to avoid ODR conflicts with
   the separately vendored DeepGEMM implementation.
-- Store FP16 instead of BF16; restrict the device body to SM90.
+- Support FP16 and BF16 output; restrict the device body to SM90.
 - Use the existing CUTLASS headers for nvcc; omit NVRTC compatibility code
   and unused host-side TMA descriptor helpers.
 FP8 WGMMA, FP32 accumulation and the retained scheduling are unchanged.

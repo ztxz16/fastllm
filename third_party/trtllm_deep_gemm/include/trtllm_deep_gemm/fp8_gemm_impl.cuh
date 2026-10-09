@@ -16,6 +16,8 @@
  */
 
 #pragma once
+#include <cuda_bf16.h>
+#include <type_traits>
 #include "mma_utils.cuh"
 #include "scheduler.cuh"
 #include "tma_utils.cuh"
@@ -31,15 +33,28 @@ __device__ __host__ constexpr int get_num_threads_per_sm(int block_m)
     return (block_m == 64 ? 1 : 2) * kNumMathThreadsPerGroup + kNumTMAThreads;
 }
 
-template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t NUM_WARPS_PER_BLOCK>
-static __device__ __forceinline__ void write_result_to_gmem(half* gmem_d_this_block,
-    half const* smem_d, uint32_t const m_offset, uint32_t const m_boundary, uint32_t const n_offset,
+// Preserve the FP16 epilogue and also permit BF16 without an intermediate cast.
+template <typename T>
+static __device__ __forceinline__ auto float2_to_output(float2 value)
+{
+    if constexpr (std::is_same_v<T, half>)
+        return __float22half2_rn(value);
+    else
+    {
+        static_assert(std::is_same_v<T, __nv_bfloat16>, "Only FP16/BF16 output is supported");
+        return __float22bfloat162_rn(value);
+    }
+}
+
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t NUM_WARPS_PER_BLOCK, typename OutputType>
+static __device__ __forceinline__ void write_result_to_gmem(OutputType* gmem_d_this_block,
+    OutputType const* smem_d, uint32_t const m_offset, uint32_t const m_boundary, uint32_t const n_offset,
     uint32_t const shape_n, uint32_t const ld_output)
 {
     int warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     int lane_idx = threadIdx.x % 32;
-    constexpr int int4_per_tile_line = BLOCK_N * sizeof(half) / sizeof(int4);
-    int int4_per_global_line = shape_n * sizeof(half) / sizeof(int4);
+    constexpr int int4_per_tile_line = BLOCK_N * sizeof(OutputType) / sizeof(int4);
+    int int4_per_global_line = shape_n * sizeof(OutputType) / sizeof(int4);
     constexpr auto num_lines = BLOCK_M;
     constexpr auto num_warps = NUM_WARPS_PER_BLOCK;
     int4 const* smem_d_int4 = reinterpret_cast<int4 const*>(smem_d);
@@ -65,9 +80,9 @@ static __device__ __forceinline__ void write_result_to_gmem(half* gmem_d_this_bl
 
 template <uint32_t SHAPE_M, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t kNumGroups,
     uint32_t kNumStages, uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup, uint32_t kNumTMAMulticast,
-    typename SchedulerType, typename InputType>
+    typename SchedulerType, typename InputType, typename OutputType = half>
 __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
-    fp8_gemm_kernel_swapAB(half* gmem_d, float* scales_a, InputType problem_input,
+    fp8_gemm_kernel_swapAB(OutputType* gmem_d, float* scales_a, InputType problem_input,
         const __grid_constant__ CUtensorMap tensor_map_a,        // weight (previously act)
         const __grid_constant__ CUtensorMap tensor_map_b,        // act (previously weight)
         const __grid_constant__ CUtensorMap tensor_map_scales_b, // act scales (previously tensor_map_scales_a)
@@ -80,11 +95,12 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
 
     // Types
     using WGMMA = typename FP8MMASelector<BLOCK_N>::type;
+    using OutputPair = decltype(float2_to_output<OutputType>(float2{}));
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     // Shared memory
     DG_STATIC_ASSERT(BLOCK_K % BLOCK_M == 0, "BLOCK_M should be 64 or 128 and BLOCK_K should be 128");
-    static constexpr uint32_t SMEM_D_SIZE = BLOCK_N * BLOCK_M * sizeof(half);
+    static constexpr uint32_t SMEM_D_SIZE = BLOCK_N * BLOCK_M * sizeof(OutputType);
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_SCALES_B_SIZE_PER_STAGE = BLOCK_N * sizeof(float); // B matrix (act) scales
@@ -117,7 +133,7 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
     DG_STATIC_ASSERT(SMEM_D_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
 
     // Data on shared memory
-    auto smem_d = reinterpret_cast<half*>(smem_buffer);
+    auto smem_d = reinterpret_cast<OutputType*>(smem_buffer);
     __nv_fp8_e4m3* smem_a[kNumStages]; // weight
     __nv_fp8_e4m3* smem_b[kNumStages]; // act
     float* smem_scales_b[kNumStages];  // act scales
@@ -416,18 +432,18 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
 #pragma unroll
             for (auto i = 0; i < WGMMA::kNumAccum / 8; ++i)
             {
-                SM90_U32x4_STSM_T<half2>::copy(
-                    __float22half2_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
-                    __float22half2_rn({final_accum[i * 8 + 2], final_accum[i * 8 + 3]}),
-                    __float22half2_rn({final_accum[i * 8 + 4], final_accum[i * 8 + 5]}),
-                    __float22half2_rn({final_accum[i * 8 + 6], final_accum[i * 8 + 7]}),
+                SM90_U32x4_STSM_T<OutputPair>::copy(
+                    float2_to_output<OutputType>({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
+                    float2_to_output<OutputType>({final_accum[i * 8 + 2], final_accum[i * 8 + 3]}),
+                    float2_to_output<OutputType>({final_accum[i * 8 + 4], final_accum[i * 8 + 5]}),
+                    float2_to_output<OutputType>({final_accum[i * 8 + 6], final_accum[i * 8 + 7]}),
                     smem_d + warp_idx * 16 + i * 16 * BLOCK_M + tid);
             }
             if constexpr (WGMMA::kNumAccum % 8 != 0)
             {
-                SM90_U32x2_STSM_T<half2>::copy(__float22half2_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 0],
+                SM90_U32x2_STSM_T<OutputPair>::copy(float2_to_output<OutputType>({final_accum[WGMMA::kNumAccum / 8 * 8 + 0],
                                                           final_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
-                    __float22half2_rn(
+                    float2_to_output<OutputType>(
                         {final_accum[WGMMA::kNumAccum / 8 * 8 + 2], final_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
                     smem_d + warp_idx * 16 + WGMMA::kNumAccum / 8 * 16 * BLOCK_M + tid);
             }
@@ -450,7 +466,7 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                 }
                 else
                 {
-                    half* gmem_d_this_block = gmem_d + n_global_idx * SHAPE_M;
+                    OutputType* gmem_d_this_block = gmem_d + n_global_idx * SHAPE_M;
                     constexpr int NUM_WARPS
                         = (get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M) - 128) / 32;
                     write_result_to_gmem<BLOCK_N, BLOCK_M, NUM_WARPS>(gmem_d_this_block, smem_d, n_global_idx,
@@ -460,7 +476,7 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
             else if constexpr (SchedulerType::gemm_type == GemmType::StridedBatched)
             {
                 cutlass::arch::NamedBarrier(kNumMathThreads).sync();
-                half* gmem_d_this_block;
+                OutputType* gmem_d_this_block;
                 auto n_global_idx = scheduler.get_global_n_idx(n_block_idx);
                 gmem_d_this_block = gmem_d + scheduler.curr_group_idx * problem_input.stride_d
                     + (n_block_idx * BLOCK_N) * problem_input.ld_d;

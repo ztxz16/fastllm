@@ -43,3 +43,24 @@ extern "C" bool HopperTestFp16Fallback(void *x, void *w, void *b, void *y,
                                       int rows, int cols, int outCols, bool addTo) {
     return RunFp16(x, w, b, y, rows, cols, outCols, addTo);
 }
+
+// BF16 activations with the FP16 lm_head weights used by the model loader.
+extern "C" bool FastllmCudaBFloat16MatMulFloat16(
+    const fastllm::Data &, fastllm::Data &, const fastllm::Data &,
+    fastllm::Data &, int, int, int);
+
+extern "C" bool HopperTestBf16Fp16(void *x, void *w, void *b, void *y,
+                                   int rows, int cols, int outCols) {
+    using namespace fastllm;
+    Data input(BFLOAT16, {rows, cols}), weight(FLOAT16, {outCols, cols});
+    Data bias(FLOAT32), output(BFLOAT16, {rows, outCols});
+    if (b) bias.Resize({outCols});
+    for (Data *data : {&input, &weight, &bias, &output}) {
+        data->isFake = true;
+        data->dataDevice = DataDevice::CUDA;
+    }
+    input.cudaData = x; weight.cudaData = w; output.cudaData = y;
+    weight.extraCudaData = {nullptr, b}; // Already prepared BF16 bias cache.
+    return FastllmCudaBFloat16MatMulFloat16(
+        input, weight, bias, output, rows, cols, outCols);
+}

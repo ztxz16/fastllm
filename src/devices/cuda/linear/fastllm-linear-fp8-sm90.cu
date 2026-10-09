@@ -165,20 +165,18 @@ static bool Run(
     if (cudaGetLastError() != cudaSuccess) return false;
     auto launch = rows >= 1024 ? Launch<Out, 256>
         : rows <= 128 ? Launch<Out, 64> : Launch<Out, 128>;
-    // H20 (78 SMs), FP16 decode only. Other shapes keep the original dispatch.
+    // H20 (78 SMs), FP16/BF16 decode. Other shapes keep the original dispatch.
     // Narrow N tiles match TRT-LLM for one M tile; two M tiles favor BN128
     // for gate/up and full-attention QKV in the measured sweep.
-    if constexpr (cute::is_same_v<Out, cutlass::half_t>) {
-        if (tunedDecode) {
-            if (outCols == 5120 && (cols == 17408 || cols == 6144)) {
-                launch = Launch<Out, 64, 72, 6, 78>;
-            } else if (cols == 5120 && (outCols == 34816 || outCols == 16384)) {
-                launch = rows > 64 && outCols == 34816
-                    ? Launch<Out, 64, 128, 6, 78> : Launch<Out, 64, 112, 6, 78>;
-            } else if (cols == 5120 && outCols == 14336) {
-                launch = rows > 64
-                    ? Launch<Out, 64, 128, 6, 78> : Launch<Out, 64, 96, 6, 78>;
-            }
+    if (tunedDecode) {
+        if (outCols == 5120 && (cols == 17408 || cols == 6144)) {
+            launch = Launch<Out, 64, 72, 6, 78>;
+        } else if (cols == 5120 && (outCols == 34816 || outCols == 16384)) {
+            launch = rows > 64 && outCols == 34816
+                ? Launch<Out, 64, 128, 6, 78> : Launch<Out, 64, 112, 6, 78>;
+        } else if (cols == 5120 && outCols == 14336) {
+            launch = rows > 64
+                ? Launch<Out, 64, 128, 6, 78> : Launch<Out, 64, 96, 6, 78>;
         }
     }
     bool ok = launch(quant, weight, scales, weightScales,
@@ -228,7 +226,6 @@ bool FastllmCudaDeepGemmLinearFp8Sm90(
         ? Run<__nv_bfloat16, cutlass::bfloat16_t> : Run<half, cutlass::half_t>;
     int smCount = 0;
     const bool tunedDecode = n >= 32 && n <= 128 &&
-        input.dataType == fastllm::DataType::FLOAT16 &&
         fastllm::FastllmCudaGetLinearExactBatchThreshold() == 0 &&
         cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
         smCount == 78;
