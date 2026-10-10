@@ -51,6 +51,7 @@ using namespace fastllm;
 class Fixture : public NaiveN05FlashModel {
   public:
     Fixture() {
+        const bool fp8 = std::getenv("FASTLLM_TEST_NAIVE_FP8") != nullptr;
         setenv("FASTLLM_TP", "cuda:0,1,2,3,4,5,6,7", 1);
         deviceMap = {{"cuda:0", 1}};
         moeDeviceMap = deviceMap;
@@ -73,12 +74,27 @@ class Fixture : public NaiveN05FlashModel {
                         {"n_routed_experts", "8"},
                         {"num_experts_per_tok", "2"},
                         {"max_position_embeddings", "8192"}};
+        if (fp8) weight.dicts["moe_layer_freq"] = "[0,1]";
         InitParams();
+        if (fp8) SetMoeAtype(FLOAT16);
         SetSaveHistoryChat(false);
         maxBatch = 1;
         unsigned seed = 7;
         auto add = [&](std::string name, std::vector<int> dims, DataType type, float scale,
                        bool norm = false) {
+            if (fp8 && name.find(".mlp.experts.") != std::string::npos) {
+                weight.AddEmptyWeight(name, dims, FP8_E4M3);
+                auto &w = weight[name];
+                w.blockK = w.blockM = 128;
+                w.scales.assign(((dims[0] + 127) / 128) * ((dims[1] + 127) / 128), scale);
+                w.Allocate(false);
+                for (int j = 0; j < w.Count(0); ++j) {
+                    seed = seed * 1664525 + 1013904223;
+                    // Finite, signed E4M3 values with nonuniform magnitudes.
+                    w.cpuData[j] = uint8_t(32 + ((seed >> 16) & 31)) | ((seed >> 24) & 128);
+                }
+                return;
+            }
             weight.AddEmptyWeight(name, dims, type);
             auto &w = weight[name];
             w.Allocate();
@@ -115,9 +131,19 @@ class Fixture : public NaiveN05FlashModel {
                 add(ap + "indexer.k_norm.weight", {128}, FLOAT32, 0, true);
                 add(ap + "indexer.k_norm.bias", {128}, FLOAT32, .01f);
             }
-            add(p + ".mlp.gate_proj.weight", {1024, 256}, BFLOAT16, .02f);
-            add(p + ".mlp.up_proj.weight", {1024, 256}, BFLOAT16, .02f);
-            add(p + ".mlp.down_proj.weight", {256, 1024}, BFLOAT16, .02f);
+            if (fp8 && i == 1) {
+                add(p + ".mlp.gate.weight", {8, 256}, FLOAT32, .2f);
+                add(p + ".mlp.gate.e_score_correction_bias", {8}, FLOAT32, .01f);
+                for (int e = 0; e < 8; ++e) {
+                    auto ep = p + ".mlp.experts." + std::to_string(e) + ".";
+                    add(ep + "gateup_proj.weight", {2048, 256}, FP8_E4M3, .02f);
+                    add(ep + "down_proj.weight", {256, 1024}, FP8_E4M3, .02f);
+                }
+            } else {
+                add(p + ".mlp.gate_proj.weight", {1024, 256}, BFLOAT16, .02f);
+                add(p + ".mlp.up_proj.weight", {1024, 256}, BFLOAT16, .02f);
+                add(p + ".mlp.down_proj.weight", {256, 1024}, BFLOAT16, .02f);
+            }
         }
     }
     void Run(const char *path, bool graphs) {

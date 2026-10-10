@@ -66,6 +66,47 @@ FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/MiMo-V2-DSA \
 42.87 GiB 显存、201.79 W。它验证的是限流后的 200 路 HTTP 服务，不代表
 200 个请求同时在 GPU 解码；这些硬件活动指标也不等于模型 FLOPS 利用率。
 
+### MiMo FP8 BS1 CUDA Graph
+
+`FASTLLM_CUDA_GRAPH=1` 现在允许 GPU 常驻的 FP8 E4M3 专家进入单行 TP
+解码图路径，保留 FP16 专家激活、BF16 attention/KV 的现有算术。专家指针表
+在预热阶段初始化；若 MoE 退回需要 CPU 读取路由的实现，则禁用该缓存的图捕获。
+FP8 多行合批和 speculative verification 仍使用原有 eager 路径。
+
+8×H20 的完整 MiMo 对照覆盖 127、254、2047、2048、2049-token 输入，
+共 128 个输出位置，每个位置比较全部 152576 维 FP32 logits。Graph 与 eager
+逐字节一致，最大绝对误差及 RMSE 均为 0；另有 6 次 256-token 测速请求的
+输出 token 序列一致。
+
+Linux CTest `naive_n05_tp_graph`、`naive_n05_tp_fp8_graph` 覆盖长度边界、
+请求缓存复用、采样模式切换、capture begin / instantiate 失败回退。
+两个测试固定 `FASTLLM_CUDA_CUSTOM_ALLREDUCE=1`，使跨进程比较采用相同的
+通信归约顺序；未固定时自动调优可能选择不同后端，连 prefill logits 也会出现
+小幅差异。正常服务继续保留原有自动调优设置。
+
+Nsight 在每张卡上确认每 token 一次 `cudaGraphLaunch`。GPU 0 的每步
+kernel 数从此前的 947 减至 849（946 是普通 kernel 发射 API 次数），专家 gate/up+SwiGLU 与 down+reduce 仍为
+约 1.258 / 1.453 ms/token，与原 eager 的 1.263 / 1.458 ms 接近。
+原始波形、logits、测速脚本及结果保存在 `/root/fastllm/run/cuda_graph/`；
+本地结果目录为 `mimo_results/cuda_graph/`。
+
+同一进程内切换 Graph 开关，保持输入、权重、精度和通信后端一致，预热后
+按 eager / graph / graph / eager / eager / graph 顺序各测 3 次。
+完全不加载 Nsight，2048 输入、强制 256 输出，排除首 token 的结果如下：
+
+| 路径 | 三次解码 token/s | 中位数 token/s | 中位数 ms/token |
+| --- | --- | ---: | ---: |
+| eager | 108.07 / 112.96 / 111.90 | 111.90 | 8.937 |
+| CUDA Graph | 133.38 / 140.61 / 135.74 | 135.74 | 7.367 |
+
+本组完整解码段吞吐提升 21.3%；排除前 16 个输出 token 后，Graph 稳定段
+中位数为 140.61 token/s。
+
+另一次已注入 Nsight、尚未开启采集的进程测得 eager / graph 中位数为
+97.38 / 74.48 token/s，且通信自动调优结果也发生变化；不能把这组数据当作
+无 profiler 的吞吐。正式性能结论采用 `cuda_graph/plain/results.json`；
+逐 kernel 采集数据用于确认图回放和归因，不用其墙钟时间推算生产速度。
+
 ## 编译与启动
 
 ```bash

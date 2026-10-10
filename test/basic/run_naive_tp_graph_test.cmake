@@ -1,8 +1,8 @@
 file(MAKE_DIRECTORY "${TEST_DIRECTORY}")
-# Six length/boundary cases and eight executed lifecycle requests; each
+# Six length/boundary cases and eight lifecycle requests at each of two batch limits; each
 # emits seven steps of 256 FP32 logits. The pre-forward abort emits nothing.
 # Greedy/sampling mode switches additionally emit 102 checked token IDs.
-math(EXPR expected_bytes "(6 + 8) * 7 * 256 * 4 + 102 * 4")
+math(EXPR expected_bytes "(6 + 8 * 2) * 7 * 256 * 4 + 102 * 4")
 foreach(mode eager graph failbegin failinstantiate)
     set(output "${TEST_DIRECTORY}/${mode}.bin")
     file(REMOVE "${output}")

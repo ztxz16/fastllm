@@ -13,6 +13,11 @@
 
 namespace fastllm {
 
+#ifdef USE_CUDA
+void FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+bool FastllmCudaMergeMOEUsedGraphUnsafeFallback();
+#endif
+
 namespace {
 // Expanded BF16 KV caches keep physical strides/capacity when logical length
 // changes. Other layouts retain Data::Resize and its layout invalidation rules.
@@ -317,7 +322,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     if (!GetFastllmEnv().cudaGraph || inputIds.dims != std::vector<int>({1, rows}) ||
         inputIds.dataType != FLOAT32 || isIntermediateChunkedPrefill ||
         !GetCudaEmbedding() || GetLowMemMode() || dataType != BFLOAT16 ||
-        kvCacheDataType != BFLOAT16 || moeAtype != BFLOAT16 ||
+        kvCacheDataType != BFLOAT16 || (moeAtype != BFLOAT16 && moeAtype != FLOAT16) ||
         indexHeads != 16 || indexDim != 128 || indexTopK != 2048 ||
         window < 2 || window > 128 || key(0, 0).dims.size() != 3)
         return false;
@@ -405,15 +410,32 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
         auto it = embedding.multiDeviceDatas.find(tpDevices[rank]);
         if (it == embedding.multiDeviceDatas.end() || !it->second->cudaData ||
             it->second->dataType != BFLOAT16) return false;
-        // Other MoE implementations can read routing results on the host. The
-        // packed BF16 backend keeps routes and intermediate storage on device.
+        // Only resident indexed MoE paths are eligible. The BS1 FP8 backend
+        // keeps routing on device and warms its pointer tables before capture.
+        // Keep FP8 multi-row/verification on the existing eager path for now.
         for (int layer = 0; layer < block_cnt; ++layer) {
             if (!moeLayers[layer]) continue;
-            if (!FastllmCudaNVFP4E4M3GroupedMoeSupported(tpDevices[rank])) return false;
             auto &weights = tpMoeWeights[rank][layer];
-            for (Data *w : weights)
-                if (w && w->dataType != NVFP4_BLOCK_16_E4M3_PACKED) return false;
-            if (!FastllmCudaPrepareNVFP4E4M3Moe(weights.data(), weights.size())) return false;
+            if (weights.size() < 4 || !weights[2] || !weights[3]) return false;
+            if (weights[2]->dataType == FP8_E4M3) {
+                if (rows != 1 || verifying || weights[0] || weights[1]) return false;
+                const int inter = weights[3]->dims.size() == 2 ? weights[3]->dims[1] : 0;
+                if (inter <= 0) return false;
+                for (size_t i = 2; i < weights.size(); ++i) {
+                    Data *w = weights[i];
+                    const std::vector<int> dims = i % 2 == 0
+                        ? std::vector<int>{inter * 2, embed_dim} : std::vector<int>{embed_dim, inter};
+                    if (!w || w->dataType != FP8_E4M3 || w->dataDevice != DataDevice::CUDA ||
+                        !w->cudaData || w->dims != dims || w->blockM <= 0 || w->blockK <= 0)
+                        return false;
+                }
+            } else {
+                if (moeAtype != BFLOAT16 ||
+                    !FastllmCudaNVFP4E4M3GroupedMoeSupported(tpDevices[rank])) return false;
+                for (Data *w : weights)
+                    if (w && w->dataType != NVFP4_BLOCK_16_E4M3_PACKED) return false;
+                if (!FastllmCudaPrepareNVFP4E4M3Moe(weights.data(), weights.size())) return false;
+            }
         }
         if (rank >= (int)state->ranks.size())
             state->ranks.emplace_back(new TPDecodeState::Rank());
@@ -510,8 +532,10 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
         AssertInFastLLM(FastllmCudaGraphLaunch(r.exec), "Naive TP decode graph launch failed.");
     } else {
         if (state.mode == TPDecodeState::Warm) r.communicationPointers.clear();
+        FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
         RunTarget(buf.inputIds, buf.positions, kv, config,
                   state.verifying || state.collectHidden ? &r.features : nullptr, rank, embedding, &buf, batch);
+        if (FastllmCudaMergeMOEUsedGraphUnsafeFallback()) r.ok = false;
         if (state.selection.count)
             FastllmCudaNaiveLogitsSelect(buf.logits, tpVocabRanges[rank].first,
                 state.selection.count, state.selection.greedy, state.selection.invTemperature,
@@ -761,6 +785,13 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     forwardRanks();
     if (graphDecode) {
         tpDecodeState->warmed = true;
+        if (!std::all_of(tpDecodeState->ranks.begin(), tpDecodeState->ranks.end(),
+                         [](const auto &r) { return r->ok; })) {
+            // Warmup already executed this token. Commit its KV metadata below,
+            // then use eager on the next token instead of capturing host routes.
+            tpDecodeState->disabled = true;
+            fprintf(stderr, "[Fastllm] Naive TP MoE warmup used a graph-unsafe path; using eager for this cache.\n");
+        }
         for (int sequence = 0; sequence < sequences; ++sequence) {
             int oldLength = key(sequence, 0).dims[1];
             int nextLength = oldLength + (batch ? 1 : tpDecodeState->rows);
