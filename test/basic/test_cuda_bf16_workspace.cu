@@ -13,6 +13,9 @@
 #include <thread>
 #include <vector>
 
+// Inject failures only into temporary tuning captures on this test worker.
+static thread_local cublasStatus_t injectedStatus = CUBLAS_STATUS_SUCCESS;
+static thread_local int injectedCalls = 0;
 static std::mutex observedMutex;
 static std::map<unsigned long long, std::set<void *>> observed;
 static cublasStatus_t ObserveMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t op, const void *alpha,
@@ -25,6 +28,12 @@ static cublasStatus_t ObserveMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t op,
     unsigned long long id = 0;
     if (cudaStreamGetCaptureInfo(stream, &status, &id) == cudaSuccess &&
         status == cudaStreamCaptureStatusActive) {
+        if (injectedStatus != CUBLAS_STATUS_SUCCESS) {
+            ++injectedCalls;
+            cudaError_t invalidated = cudaStreamSynchronize(stream);
+            cudaGetLastError();
+            return invalidated == cudaSuccess ? CUBLAS_STATUS_INTERNAL_ERROR : injectedStatus;
+        }
         std::lock_guard<std::mutex> lock(observedMutex);
         observed[id].insert(workspace);
     }
@@ -45,6 +54,7 @@ struct Pack {
     void *input = nullptr, *weight = nullptr, *output = nullptr;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
+    unsigned long long captureId = 0;
     std::vector<unsigned short> reference;
     void init(int seed) {
         cu(cudaSetDevice(0));
@@ -67,6 +77,8 @@ struct Pack {
     }
     void capture() {
         cu(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        cudaStreamCaptureStatus status;
+        cu(cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, &captureId));
         need(lt::Matmul(input, weight, output, M, K, N), "Lt capture unavailable");
         cu(cudaStreamEndCapture(cudaStreamPerThread, &graph));
         cu(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
@@ -136,11 +148,14 @@ int main() {
         owner.join();
         if (error)
             std::rethrow_exception(error);
-        need(observed.size() == 2, "missing capture records");
         std::set<void *> scratch;
-        for (auto &e : observed) {
-            need(e.second.size() == 1, "capture changed scratch");
-            scratch.insert(*e.second.begin());
+        // Autotuning may record temporary graphs too. Inspect the two user
+        // graphs whose leases must remain independent after their owner exits.
+        for (int i = 0; i < 2; ++i) {
+            auto found = observed.find(p[i].captureId);
+            need(found != observed.end(), "missing capture records");
+            need(found->second.size() == 1, "capture changed scratch");
+            scratch.insert(*found->second.begin());
         }
         bool separate = scratch.size() == 2;
         need(separate, "independent captures share workspace");
@@ -245,6 +260,50 @@ int main() {
         if (error)
             std::rethrow_exception(error);
         waitBusy(0);
+        // Unsupported tuning candidates may invalidate their temporary capture.
+        // They must fall back cleanly; actual BLAS execution errors must propagate.
+        std::thread tuningFailure([&]() {
+            try {
+                cu(cudaSetDevice(0));
+                auto *s = lt::GetState(0, false);
+                lt::Key key{M, N, K, lt::Alignment(p[2].weight), lt::Alignment(p[2].input),
+                            lt::Alignment(p[2].output), static_cast<int>(CUDA_R_16BF)};
+                for (auto status : {CUBLAS_STATUS_NOT_SUPPORTED, CUBLAS_STATUS_EXECUTION_FAILED}) {
+                    injectedStatus = status;
+                    injectedCalls = 0;
+                    lt::Plan plan;
+                    bool threw = false;
+                    try {
+                        lt::MakePlan(*s, plan, key, p[2].weight, p[2].input, p[2].output);
+                    } catch (const std::runtime_error &e) {
+                        threw = true;
+                        need(std::string(e.what()) == "BF16 cuBLASLt status " +
+                                 std::to_string(static_cast<int>(status)), "unexpected tuning error");
+                    }
+                    need(injectedCalls > 0, "tuning failure was not exercised");
+                    need(threw == (status == CUBLAS_STATUS_EXECUTION_FAILED),
+                         "tuning failure incorrectly handled");
+                    need(!plan.valid, "failed candidate was cached");
+                    cudaStreamCaptureStatus capture;
+                    cu(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
+                    need(capture == cudaStreamCaptureStatusNone, "tuning left capture active");
+                    cudaGetLastError();
+                }
+                injectedStatus = CUBLAS_STATUS_SUCCESS;
+                p[2].warm();
+                p[2].capture();
+                cu(cudaGraphLaunch(p[2].exec, cudaStreamPerThread));
+                cu(cudaStreamSynchronize(cudaStreamPerThread));
+                p[2].check();
+                p[2].close();
+            } catch (...) {
+                error = std::current_exception();
+            }
+        });
+        tuningFailure.join();
+        if (error)
+            std::rethrow_exception(error);
+        waitBusy(0);
         // All leases, including graph-held leases, count towards one bounded pool;
         // exhaustion is temporary and immediately recovers after a return.
         std::vector<lt::Workspace *> leases;
@@ -263,7 +322,7 @@ int main() {
         for (auto s : streams)
             cu(cudaStreamDestroy(s));
         puts("PASS independent captures, cross-thread replay/eager, graph lifetime, 24 worker "
-             "recreations, capture failure, bounded reusable leases");
+             "recreations, capture/tuning failures, bounded reusable leases");
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "FAIL %s\n", e.what());

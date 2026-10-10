@@ -20,7 +20,8 @@ constexpr size_t workspaceBytes = 8ull << 20;
 constexpr size_t maxPlans = 64;
 constexpr size_t maxWorkspacesPerDevice = 16; // 128 MiB, including graph-held buffers
 constexpr int maxCandidates = 8;
-constexpr int timingRepeats = 8;
+constexpr int timingRepeats = 32;
+constexpr int timingSamples = 2;
 using Key = std::array<int, 7>; // M, N, K, alignment(A), alignment(B), alignment(C/D), storage type
 
 inline void CheckCuda(cudaError_t status) {
@@ -60,6 +61,20 @@ struct SearchResources {
         if (begin) cudaEventDestroy(begin);
         if (end) cudaEventDestroy(end);
         if (preference) cublasLtMatmulPreferenceDestroy(preference);
+    }
+};
+
+struct SearchGraph {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    bool capturing = false;
+
+    ~SearchGraph() {
+        // Run may throw while recording a candidate. End that capture before
+        // returning to the caller so its stream remains usable.
+        if (capturing) cudaStreamEndCapture(cudaStreamPerThread, &graph);
+        if (executable) cudaGraphExecDestroy(executable);
+        if (graph) cudaGraphDestroy(graph);
     }
 };
 
@@ -277,9 +292,15 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
             candidates[i].workspaceSize > workspaceBytes) continue;
         const auto &algo = candidates[i].algo;
         if (!Run(s, p, algo, weight, input, output, s.eager->data)) continue;
-        // First use only, outside capture. Inputs and weights must not alias
-        // output; each trial overwrites the same Linear output with beta = 0.
-        CheckCuda(cudaEventRecord(search.begin, cudaStreamPerThread));
+        // First use only, before the caller's model capture. Timing individual
+        // launches also measures CPU submission gaps, which can reorder these
+        // few-microsecond GEMMs when TP workers tune concurrently. Submit the
+        // repetitions as one graph, then discard all temporary graph resources.
+        // Inputs/weights must not alias output; every GEMM uses beta = 0 and
+        // shares the existing eager workspace on the same stream.
+        SearchGraph trial;
+        CheckCuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        trial.capturing = true;
         bool success = true;
         for (int repeat = 0; repeat < timingRepeats; ++repeat) {
             if (!Run(s, p, algo, weight, input, output, s.eager->data)) {
@@ -287,11 +308,34 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
                 break;
             }
         }
-        CheckCuda(cudaEventRecord(search.end, cudaStreamPerThread));
-        CheckCuda(cudaEventSynchronize(search.end));
-        float ms = 0.0f;
-        CheckCuda(cudaEventElapsedTime(&ms, search.begin, search.end));
-        if (success && ms < best) {
+        cudaError_t captured = cudaStreamEndCapture(cudaStreamPerThread, &trial.graph);
+        trial.capturing = false;
+        if (!success && captured == cudaErrorStreamCaptureInvalidated) {
+            // An unsupported BLAS candidate may invalidate its capture. End it
+            // and clear only that expected error before trying another candidate.
+            cudaError_t pending = cudaGetLastError();
+            if (pending != cudaSuccess && pending != cudaErrorStreamCaptureInvalidated)
+                CheckCuda(pending);
+            continue;
+        }
+        CheckCuda(captured);
+        if (!success) continue;
+        CheckCuda(cudaGraphInstantiate(&trial.executable, trial.graph, nullptr, nullptr, 0));
+        // Exclude first-launch graph setup. Repeated samples reduce transient
+        // scheduling noise without adding any persistent device allocation.
+        CheckCuda(cudaGraphLaunch(trial.executable, cudaStreamPerThread));
+        CheckCuda(cudaStreamSynchronize(cudaStreamPerThread));
+        float ms = std::numeric_limits<float>::max();
+        for (int sample = 0; sample < timingSamples; ++sample) {
+            CheckCuda(cudaEventRecord(search.begin, cudaStreamPerThread));
+            CheckCuda(cudaGraphLaunch(trial.executable, cudaStreamPerThread));
+            CheckCuda(cudaEventRecord(search.end, cudaStreamPerThread));
+            CheckCuda(cudaEventSynchronize(search.end));
+            float elapsed = 0.0f;
+            CheckCuda(cudaEventElapsedTime(&elapsed, search.begin, search.end));
+            ms = std::min(ms, elapsed);
+        }
+        if (ms < best) {
             best = ms;
             p.algo = algo;
             p.valid = true;
