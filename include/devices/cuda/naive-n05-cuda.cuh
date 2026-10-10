@@ -1,5 +1,6 @@
 #pragma once
 #include "fastllm.h"
+#include "devices/cuda/naive-n05-dsa.h"
 
 // Match the full-vocabulary CUDA Top1's 256-lane reduction order on ties.
 // Global IDs are essential: shards need not start at a multiple of 256.
@@ -133,6 +134,14 @@ struct FastllmNaiveDecodeScratch {
     fastllm::Data indexQuery, indexScale, indexScores, topk;
     fastllm::Data attentionScores, attentionPartial, windowKey, windowValue;
 };
+// One query per independent sequence, up to 2048 selected keys. KV stays in
+// place, and descriptors are kernel arguments. Graph replay reads device lengths
+// without copying metadata. Preserve BF16 score/probability rounding and the
+// original PV accumulation order; Hopper fusion uses shared memory only.
+void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
+    const fastllm::Data &sink, const std::vector<FastllmNaiveDSARow> &rows,
+    int heads, int kvHeads, int dim, int valueDim,
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
 bool FastllmCudaNaiveDecodeGraphSupported();
 // BF16 rows; update each residual and preserve RMSNorm rounding.
 void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,

@@ -2,6 +2,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "utils.h"
 #include "naive-n05-topk.cuh"
+#include "naive-n05-dsa-decode.cuh"
 #include <cuda_bf16.h>
 #include <nccl.h>
 #include <cuda_fp8.h>
@@ -2596,6 +2597,111 @@ void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
             AssertInFastLLM(false, "Naive decode graph TopK launch failed.");
     }
     naive_topk::Sort<<<1, naive_topk::kThreads>>>(candidates, state, (int *)indices.cudaData);
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
+        const fastllm::Data &sink, const std::vector<FastllmNaiveDSARow> &rows,
+        int heads, int kvHeads, int dim, int valueDim,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+    using namespace fastllm;
+    namespace dsa = naive_dsa_decode;
+    AssertInFastLLM(!rows.empty() && heads > 0 && kvHeads > 0 && heads % kvHeads == 0 &&
+        dim > 0 && dim <= 256 && (valueDim == 128 || valueDim == 256) &&
+        query.dataType == BFLOAT16, "Unsupported batched DSA decode shape.");
+    int count = 0;
+    bool sparse = heads >= 4, dense = true;
+    bool hopper = FastllmCudaRuntimeArch() == 90 && dim == 192 && valueDim == 128;
+    for (const auto &row : rows) {
+        AssertInFastLLM(row.key && row.value && row.capacity >= 0 &&
+            row.keyStride >= kvHeads * dim && row.selectedCount >= 0,
+            "Invalid batched DSA cache.");
+        count = std::max(count, row.indices ? row.selectedCount : row.capacity);
+        sparse = sparse && row.indices && row.selectedCount == 2048;
+        dense = dense && !row.indices;
+        hopper = hopper && (uintptr_t)row.value % 16 == 0;
+    }
+    AssertInFastLLM(count <= 2048, "Batched DSA supports at most 2048 selected keys.");
+    hopper = hopper && count >= 512;
+    if (hopper) {
+        // Configure opt-in shared memory once per device, before graph capture.
+        static thread_local std::map<int, bool> supported;
+        const int device = FastllmCudaGetDevice();
+        auto found = supported.find(device);
+        if (found == supported.end()) {
+            auto small = cudaFuncSetAttribute(dsa::SoftmaxSparseValues<2048, 16>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(dsa::SparseStorage<2048, 16>));
+            auto large = cudaFuncSetAttribute(dsa::SoftmaxSparseValues<2048, 32>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(dsa::SparseStorage<2048, 32>));
+            auto grouped = cudaFuncSetAttribute(dsa::GroupedValues<2048, 2, 8, true>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(dsa::GroupStorage<2048, 2, 8>));
+            bool available = small == cudaSuccess && large == cudaSuccess && grouped == cudaSuccess;
+            if (!available) cudaGetLastError();
+            found = supported.emplace(device, available).first;
+        }
+        hopper = found->second;
+    }
+    Output(output, BFLOAT16, {1, (int)rows.size(), heads * valueDim});
+    const int chunkSize = std::min((int)rows.size(), FastllmNaiveDSABatchLimit);
+    // Reuse the score workspace. Fusion and sparse partials only use shared memory.
+    Output(scratch.attentionScores, FLOAT32, {chunkSize, heads, std::max(1, count)});
+    const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+    for (int first = 0; first < (int)rows.size(); first += FastllmNaiveDSABatchLimit) {
+        int batch = std::min(FastllmNaiveDSABatchLimit, (int)rows.size() - first);
+        FastllmNaiveDSABatch descriptors{};
+        std::copy_n(rows.begin() + first, batch, descriptors.rows);
+        auto *q = (const BF16 *)query.cudaData + (size_t)first * heads * dim;
+        auto *out = (BF16 *)output.cudaData + (size_t)first * heads * valueDim;
+        auto *scores = (float *)scratch.attentionScores.cudaData;
+        if (hopper) {
+            dsa::DirectScores<4, 4><<<dim3(heads, (count + 15) / 16, batch), 128>>>(
+                q, descriptors, scores, heads, kvHeads, count);
+            // These shapes were measured on TP8 H20: sharing V is beneficial
+            // for one/two rows, while larger batches keep per-head tiling.
+            const bool sharedHeads = heads == 8 && kvHeads == 1;
+            if (sharedHeads && sparse && batch == 1)
+                dsa::GroupedValues<2048, 2, 8, true><<<dim3(heads / 2, 16, batch), 512,
+                    sizeof(dsa::GroupStorage<2048, 2, 8>)>>>(scores, bias, descriptors, out,
+                    heads, kvHeads, count);
+            else if (sharedHeads && dense && count <= 1024 && batch == 1)
+                dsa::GroupedValues<1024, 2, 8, false><<<dim3(heads / 2, 16, batch), 512,
+                    sizeof(dsa::GroupStorage<1024, 2, 8>)>>>(scores, bias, descriptors, out,
+                    heads, kvHeads, count);
+            else if (sharedHeads && dense && count <= 1024 && batch == 2)
+                dsa::GroupedValues<1024, 4, 8, false><<<dim3(heads / 4, 16, batch), 1024,
+                    sizeof(dsa::GroupStorage<1024, 4, 8>)>>>(scores, bias, descriptors, out,
+                    heads, kvHeads, count);
+            else if (sparse && batch == 1)
+                dsa::SoftmaxSparseValues<2048, 16><<<dim3(heads, 8, batch), 512,
+                    sizeof(dsa::SparseStorage<2048, 16>)>>>(scores, bias, descriptors, out,
+                    heads, kvHeads, count);
+            else if (sparse)
+                dsa::SoftmaxSparseValues<2048, 32><<<dim3(heads, 4, batch), 1024,
+                    sizeof(dsa::SparseStorage<2048, 32>)>>>(scores, bias, descriptors, out,
+                    heads, kvHeads, count);
+            else if (count <= 1024)
+                dsa::SoftmaxTransposedValues<1024, 16><<<dim3(heads, 8, batch), 256,
+                    sizeof(dsa::TransposedStorage<1024, 16>)>>>(scores, bias, descriptors, out,
+                    heads, kvHeads, count);
+            else
+                dsa::SoftmaxTransposedValues<2048, 8><<<dim3(heads, 16, batch), 256,
+                    sizeof(dsa::TransposedStorage<2048, 8>)>>>(scores, bias, descriptors, out,
+                    heads, kvHeads, count);
+        } else {
+            dim3 grid(heads, (std::max(1, count) + 63) / 64, batch);
+            if (dim == 192)
+                dsa::Scores<192><<<grid, 256>>>(q, descriptors, scores, heads, kvHeads, dim, count);
+            else
+                dsa::Scores<><<<grid, 256>>>(q, descriptors, scores, heads, kvHeads, dim, count);
+            dsa::Softmax<<<batch * heads, 256>>>(scores, bias, descriptors, heads, count);
+            if (valueDim == 128)
+                dsa::Values<128><<<dim3(heads, 16, batch), 128>>>(scores, descriptors, out,
+                    heads, kvHeads, count);
+            else
+                dsa::Values<256><<<dim3(heads, 32, batch), 128>>>(scores, descriptors, out,
+                    heads, kvHeads, count);
+        }
+    }
     CheckLaunch();
 }
 

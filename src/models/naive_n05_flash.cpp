@@ -491,6 +491,16 @@ Data NaiveN05FlashModel::RunTarget(
         AssertInFastLLM(q.dataDevice == DataDevice::CUDA,
                         "Naive-N0.5 attention requires --device cuda.");
         positions.ToDevice(q.dataDevice, q.dataDeviceIds);
+        // Prepare all independent caches/index lists first, then attend to the
+        // complete decode batch in one call. Prefill and verification retain
+        // their causal multi-query paths.
+        const bool batchedDSA = !slidingLayers[layer] && !graphVerify &&
+            (!capture || !capture->verifying) && indexTopK <= 2048 && cfg.headDim <= 256 &&
+            (cfg.valueDim == 128 || cfg.valueDim == 256) &&
+            (batch ? std::all_of(batch->lengths.begin(), batch->lengths.end(),
+                [](int count) { return count == 1; }) : length == 1);
+        std::vector<FastllmNaiveDSARow> dsaRows;
+        if (batchedDSA) dsaRows.reserve(batch ? batch->Size() : 1);
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &pastKey, Data &pastValue,
                           TargetWorkspace &buf, int length, int reserveCapacity, Data &attn, HistoryChunk *historyChunk) {
@@ -586,7 +596,18 @@ Data NaiveN05FlashModel::RunTarget(
                 ToDataType(sink, DataType::FLOAT32);
                 sink.ToDevice(q.dataDevice, q.dataDeviceIds);
             }
-            if (decodeWorkspace) {
+            if (batchedDSA) {
+                FastllmNaiveDSARow row;
+                row.key = pastKey.cudaData;
+                row.value = pastValue.cudaData;
+                row.indices = selected->dims.empty() ? nullptr : (const int *)selected->cudaData;
+                row.liveKeys = decodeWorkspace ? (const int *)buf.liveKeys.cudaData : nullptr;
+                row.length = localPast + length;
+                row.capacity = decodeWorkspace ? buf.capacity : pastKey.dims[1];
+                row.keyStride = pastKey.dims[2];
+                row.selectedCount = row.indices ? selected->dims.back() : 0;
+                dsaRows.push_back(row);
+            } else if (decodeWorkspace) {
                 if (graphVerify) FastllmCudaNaiveGraphVerifyAttention(q, pastKey, pastValue, *selected, sink,
                     buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                     slidingLayers[layer] ? window : 0, buf.decode, attn);
@@ -647,6 +668,9 @@ Data NaiveN05FlashModel::RunTarget(
             auto &pastValue = tensorParallel ? *pastKeyValues[layer].second.multiDeviceDatas.at(gpu) : pastKeyValues[layer].second;
             attend(normed, q, k, v, qkv, positions, pastKey, pastValue, buf, length, reserveCapacity, attn, historyChunk.get());
         }
+        if (batchedDSA)
+            FastllmCudaNaiveBatchDSADecode(q, localWeight(ap + "attention_sink_bias"), dsaRows,
+                cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim, buf.decode, attn);
         Linear(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
         reduce(projected);
         if (decodeWorkspace) {

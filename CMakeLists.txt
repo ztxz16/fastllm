@@ -1663,6 +1663,13 @@ if (UNIT_TEST)
         set_tests_properties(naive_n05_decode_graph PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "DECODE GRAPH PASS")
 
+        add_executable(naive_n05_dsa_batch_test test/basic/test_naive_n05_dsa_batch.cpp)
+        target_link_libraries(naive_n05_dsa_batch_test PRIVATE fastllm)
+        target_include_directories(naive_n05_dsa_batch_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_dsa_batch COMMAND naive_n05_dsa_batch_test)
+        set_tests_properties(naive_n05_dsa_batch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "BATCH DSA PASS")
+
         add_executable(cuda_verify_multirow_test test/basic/test_cuda_verify_multirow.cu)
         target_link_libraries(cuda_verify_multirow_test PRIVATE fastllm)
         set_target_properties(cuda_verify_multirow_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
