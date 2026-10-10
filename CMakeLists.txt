@@ -446,6 +446,15 @@ if (USE_CUDA)
 
     set_source_files_properties(src/devices/cuda/models/deepseekv41-reference.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
 
+    # NVCC 13.0 + libstdc++ 13 ICEs in std::destroy_at for the cuBLASLt
+    # algorithm vector in C++20 mode. This translation unit only needs C++17.
+    if (CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA" AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0 AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
+        set_property(SOURCE src/devices/cuda/linear/fastllm-native-lowbit-prefill.cu
+            APPEND PROPERTY COMPILE_OPTIONS "--std=c++17")
+    endif()
+
     if (FASTLLM_DEEPGEMM_FP8_SM90_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
         CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
         EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h")
