@@ -183,6 +183,9 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
     };
     auto split = [&](const std::string &name, DivisionScheme scheme, int axis,
                      const std::string &biasName = "") {
+        auto found = weight.weight.find(name);
+        AssertInFastLLM(found != weight.weight.end() && found->second.dims.size() == 2,
+                        "Naive TP: missing or invalid matrix " + name);
         Data emptyBias;
         weight[name].tpLinearType = axis == 0 ? TP_LINEAR_ROW : TP_LINEAR_COLUMN;
         Data &bias = biasName.empty() ? emptyBias : weight[biasName];

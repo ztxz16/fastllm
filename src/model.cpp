@@ -5265,6 +5265,15 @@ namespace fastllm {
                         for (auto &it : tensorMap[tensorName]) {
                             auto oriDataType = DataType::FLOAT32;
                             std::string weightName = it.first;
+                            // Other workers merge/erase entries in this unordered_map.
+                            // Resolve an element under the same mutex, then import its
+                            // payload in parallel. It cannot be consumed until this
+                            // worker publishes weightName in allFinishNames below.
+                            Data *destinationWeight = nullptr;
+                            {
+                                std::lock_guard<std::mutex> weightGuard(locker);
+                                destinationWeight = &model->weight.weight.at(weightName);
+                            }
                             auto dataType = it.second;
                             int ggmlType = -1;
 
@@ -5373,7 +5382,7 @@ namespace fastllm {
                                     ErrorInFastLLM("Disk device does not support AWQ/lora lazy weight yet: " + weightName + "\n");
                                 }
                                 if (tensor.dtype == "fastllm") {
-                                    SetDiskFastllmWeightMeta(model->weight[weightName], tensor,
+                                    SetDiskFastllmWeightMeta(*destinationWeight, tensor,
                                                             diskLazyWeightType);
                                 } else {
                                     SafeTensorItem *scaleTensor = nullptr;
@@ -5417,7 +5426,7 @@ namespace fastllm {
                                             scale2.ClearBuffer();
                                         }
                                     }
-                                    SetDiskWeightMeta(model->weight[weightName], tensor, diskDataType,
+                                    SetDiskWeightMeta(*destinationWeight, tensor, diskDataType,
                                                       scaleTensor, diskLazyWeightType, globalScale);
                                     if (scaleTensor != nullptr) {
                                         scaleTensor->ClearBuffer();
@@ -5543,12 +5552,12 @@ namespace fastllm {
                                 }
 
                                 if (tensor.dtype == "fastllm") {
-                                    model->weight[weightName].CreateFromFastllmFormat(tensor.buffer, tensor.bytes);
+                                    destinationWeight->CreateFromFastllmFormat(tensor.buffer, tensor.bytes);
                                 } else {
                                     if (it.second == DATA_AUTO_CONV) {
                                         tensor.Transpose(oriDataType);
                                     }
-                                    Data &loadedWeight = model->weight[weightName];
+                                    Data &loadedWeight = *destinationWeight;
                                     if (!TryAdoptSafeTensorBuffer(
                                             loadedWeight, tensor, oriDataType,
                                             tensorMap[tensorName].size() == 1,
@@ -5563,15 +5572,16 @@ namespace fastllm {
                                     }
                                 }
                                 if (it.second == DATA_AUTO_LINEAR || it.second == DATA_AUTO_CONV)
-                                    model->weight[weightName].CalcWeightSum();
+                                    destinationWeight->CalcWeightSum();
                             }
                             tensor.ClearBuffer();
 
-                            locker.lock();
+                            // Match the GGUF loader: publish, merge, erase and
+                            // register weights as one map mutation transaction.
+                            std::lock_guard<std::mutex> weightGuard(locker);
                             allFinishNames.insert(weightName);
                             model->OnWeightLoaded(weightName, allFinishNames);
                             if (model->IsWeightConsumedAfterLoad(weightName)) {
-                                locker.unlock();
                                 continue;
                             }
                             // 检查是否需要合并权重
@@ -5621,7 +5631,6 @@ namespace fastllm {
                                     continue;
                                 }
 
-                                locker.unlock();
                                 for (auto &it : rule.rules) {
                                     if (allWeightNames.find(it.inputs[0]) == allWeightNames.end()) {
                                         continue;
@@ -5694,10 +5703,8 @@ namespace fastllm {
 #ifdef USE_TFACC
                                             try {
                                                 if (model->ShouldRegisterSpecialWeightForDeviceType(mergeName, "tfacc")) {
-                                                    locker.lock();
                                                     mergeData.weightSum.resize(1);
                                                     RegisterFastllmData(&mergeData, it.type);
-                                                    locker.unlock();
                                                 }
                                             } catch (...) {
                                             }
@@ -5715,26 +5722,20 @@ namespace fastllm {
                                         }
                                     }
 
-                                    locker.lock();
                                     allFinishNames.insert(mergedWeightName);
                                     model->OnWeightLoaded(mergedWeightName, allFinishNames);
-                                    locker.unlock();
                                     for (auto input : it.inputs) {
                                         model->weight.weight.erase(input);
                                     }
                                 }
-                                locker.lock();
                             }
-                            locker.unlock();
 #ifdef USE_TFACC
                             try {
                                 if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "tfacc")) {
                                     auto weightIt = model->weight.weight.find(weightName);
                                     if (weightIt != model->weight.weight.end()) {
-                                        locker.lock();
                                         weightIt->second.weightSum.resize(1);
                                         RegisterFastllmData(&weightIt->second, model->specialWeights[weightName]);
-                                        locker.unlock();
                                     }
                                 }
                             } catch (...) {

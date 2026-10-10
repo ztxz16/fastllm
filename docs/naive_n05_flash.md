@@ -31,6 +31,9 @@ FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/MiMo-V2-DSA \
 激活和 KV cache 使用 BF16，专家保留 checkpoint 的 FP8。CUDA 13.0 的
 低比特 prefill 编译单元单独使用 C++17，规避 NVCC 与 libstdc++ 13 在
 `std::destroy_at` 上的 C++20 内部编译错误，其余 CUDA 单元保持原有标准。
+加载器还修复了并行合并专家权重时对 `unordered_map` 的无锁插入/删除：
+读取数据保持并行，权重发布、合并、注册与删除共用互斥锁，避免偶发丢失
+`gateup_proj.weight`。`hf_parallel_merge` 回归会连续加载并核对所有合并内容。
 
 回归覆盖 MiMo 模型识别、配置拒绝、CLI 的 BF16/TP 默认值、注意力和 8 卡
 计算；完整模型验证覆盖算术、排序、代码生成及 4377/9957-token 的长文检索。

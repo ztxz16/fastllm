@@ -1062,6 +1062,11 @@ if (UNIT_TEST)
             PASS_REGULAR_EXPRESSION "FastLLM Error: MiMo" TIMEOUT 30)
     endforeach()
 
+    add_executable(hf_parallel_merge_test test/basic/test_hf_parallel_merge.cpp)
+    target_link_libraries(hf_parallel_merge_test PRIVATE fastllm)
+    fastllm_add_checked_test(hf_parallel_merge hf_parallel_merge_test
+        "PASS parallel HF weight merging" 180)
+
     add_executable(qwen4_multimodal_cache_test test/basic/test_qwen4_multimodal_cache.cpp)
     target_link_libraries(qwen4_multimodal_cache_test PRIVATE fastllm)
     add_test(NAME qwen4_multimodal_cache COMMAND qwen4_multimodal_cache_test)
