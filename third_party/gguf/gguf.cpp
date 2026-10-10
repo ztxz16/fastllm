@@ -1,8 +1,11 @@
 #include <map>
 #include <limits>
+#include <memory>
+#include <stdexcept>
 
 #include <assert.h>
 #include "gguf.h"
+#include "ggufdirectmerge.h"
 
 typedef uint16_t ggml_fp16_t;
 GGML_API float       ggml_fp16_to_fp32(ggml_fp16_t);
@@ -750,6 +753,82 @@ namespace fastllm {
 
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
 
+    bool GetGGUFDirectMergeLayout(const std::vector<const ReadGGUFTask*> &inputs,
+                                  std::vector<int> &dims, uint64_t &bytes) {
+        dims.clear();
+        bytes = 0;
+        if (inputs.size() < 2 || inputs.front() == nullptr) return false;
+        const auto &first = inputs.front()->tensor;
+        if (first.dims.empty() || first.dims.size() > 2) return false;
+        const auto traits = type_traits.find(first.type);
+        if (traits == type_traits.end() || traits->second.nrows > 1 ||
+            traits->second.row_meta_size != 0 ||
+            (traits->second.is_quantized && traits->second.to_float == nullptr)) return false;
+        // Formats without a row decoder may already interleave multiple rows;
+        // byte strides alone cannot establish safe concatenation boundaries.
+        const int64_t block = traits->second.blck_size;
+        const size_t unit = traits->second.type_size;
+        if (block <= 0 || unit == 0) return false;
+        std::vector<int> merged = first.dims;
+        int64_t rows = 0;
+        uint64_t total = 0;
+        for (const auto *input : inputs) {
+            if (input == nullptr || input->replaceType !=
+                    GGUFWeightReplaceRule::GGUFWeightReplaceDirect) return false;
+            const auto &tensor = input->tensor;
+            if (tensor.type != first.type || tensor.dims.size() != merged.size()) return false;
+            for (size_t d = 0; d < merged.size(); ++d) {
+                if (tensor.dims[d] <= 0 || (d != 0 && tensor.dims[d] != merged[d])) return false;
+            }
+            // Require dense rows containing complete quantization blocks.
+            uint64_t stride = unit;
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                const int64_t n = d < (int)tensor.dims.size() ?
+                    tensor.dims[tensor.dims.size() - 1 - d] : 1;
+                if (tensor.ne[d] != n ||
+                    (d < (int)tensor.dims.size() && tensor.nb[d] != stride)) return false;
+                if (d == 0 && n % block != 0) return false;
+                const uint64_t factor = d == 0 ? n / block : n;
+                if (factor > std::numeric_limits<uint64_t>::max() / stride) return false;
+                stride *= factor;
+            }
+            if (ggml_nbytes(&tensor) != stride ||
+                stride > std::numeric_limits<uint64_t>::max() - total) return false;
+            total += stride;
+            rows += tensor.dims[0];
+            if (rows > std::numeric_limits<int>::max()) return false;
+        }
+        if (total > std::numeric_limits<size_t>::max()) return false;
+        merged[0] = (int)rows;
+        dims = std::move(merged);
+        bytes = total;
+        return true;
+    }
+
+    void ReadGGUFTensorBytes(const std::string &fileName, uint64_t offset,
+                             uint8_t *destination, uint64_t bytes) {
+        struct CloseFile { void operator()(FILE *file) const { fclose(file); } };
+        std::unique_ptr<FILE, CloseFile> file(fopen(fileName.c_str(), "rb"));
+        if (!file) throw std::runtime_error("Cannot open GGUF weight file: " + fileName);
+        if (offset > (uint64_t)std::numeric_limits<int64_t>::max())
+            throw std::runtime_error("GGUF weight offset is out of range: " + fileName);
+#if defined(_WIN32) || defined(_WIN64)
+        const int seekResult = _fseeki64(file.get(), (int64_t)offset, SEEK_SET);
+#else
+        if (offset > (uint64_t)std::numeric_limits<off_t>::max())
+            throw std::runtime_error("GGUF weight offset exceeds platform range: " + fileName);
+        const int seekResult = fseeko(file.get(), (off_t)offset, SEEK_SET);
+#endif
+        if (seekResult != 0) throw std::runtime_error("Cannot seek GGUF weight file: " + fileName);
+        while (bytes != 0) {
+            const size_t chunk = (size_t)std::min<uint64_t>(bytes, 1ULL << 30);
+            if (fread(destination, 1, chunk, file.get()) != chunk)
+                throw std::runtime_error("Truncated GGUF weight file: " + fileName);
+            destination += chunk;
+            bytes -= chunk;
+        }
+    }
+
     void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
                                 GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType) {
         // Keep the source-format marker even when a GGUF tensor is imported as
@@ -779,14 +858,7 @@ namespace fastllm {
                 (*(ggml_tensor*)weight->ggmlTensor) = *tensor;
             }
 
-            FILE *fi = fopen(fileName.c_str(), "rb");
-    #if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fi, offset, 0);
-    #else
-            fseek(fi, offset, 0);
-    #endif
-            int ret = fread(weight->cpuData, 1, ggml_nbytes(tensor), fi);
-            fclose(fi);
+            ReadGGUFTensorBytes(fileName, offset, weight->cpuData, ggml_nbytes(tensor));
 
         } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
                    replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
@@ -797,16 +869,7 @@ namespace fastllm {
 
             const size_t bytes = ggml_nbytes(tensor);
             std::vector<uint8_t> original(bytes);
-            FILE *fi = fopen(fileName.c_str(), "rb");
-            AssertInFastLLM(fi != nullptr, "WeightImportGGUFTensor: cannot open " + fileName);
-    #if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fi, offset, 0);
-    #else
-            fseek(fi, offset, 0);
-    #endif
-            const size_t bytesRead = fread(original.data(), 1, bytes, fi);
-            fclose(fi);
-            AssertInFastLLM(bytesRead == bytes, "WeightImportGGUFTensor: truncated weight " + tensor->name);
+            ReadGGUFTensorBytes(fileName, offset, original.data(), bytes);
 
             const auto toFloat = ggml_type_to_float(tensor->type);
             AssertInFastLLM(tensor->type == GGML_TYPE_F32 || toFloat != nullptr,

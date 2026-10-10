@@ -956,6 +956,11 @@ if (UNIT_TEST)
                 ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4")
         endif()
 
+        add_executable(gguf_direct_merge_test test/basic/test_gguf_direct_merge.cpp)
+        target_link_libraries(gguf_direct_merge_test PRIVATE fastllm)
+        fastllm_add_checked_test(gguf_direct_merge gguf_direct_merge_test
+            "PASS: generic GGUF direct merge" 60)
+
         add_executable(qwen4_gguf_test test/basic/test_qwen4_gguf.cpp)
         target_link_libraries(qwen4_gguf_test PRIVATE fastllm)
         fastllm_add_checked_test(qwen4_gguf qwen4_gguf_test "PASS: Qwen4 three-shard GGUF" 60)
