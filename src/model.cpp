@@ -936,7 +936,11 @@ namespace fastllm {
         } else if (modelType == "deepseek_v41" || modelType == "deepseek_v41_text") {
             model = (basellm*)(new DeepSeekV41Model());
             model->model_type = modelType;
-        } else if (modelType == "naive_n05_flash") {
+        } else if (modelType == "naive_n05_flash" || modelType == "mimo_v2" ||
+                   modelType == "MiMoV2ForCausalLM" || modelType == "MiMoV2DSAForCausalLM") {
+            // MiMo-V2 DSA uses the same split QKV, sparse indexer and MoE
+            // layout. Keep the runtime family so TP/cache dispatch is shared;
+            // InitParams validates the original checkpoint configuration.
             model = new NaiveN05FlashModel();
         } else if (modelType == "dots3_note") {
             model = (basellm*)(new Dots3NoteModel());

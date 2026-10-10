@@ -822,6 +822,14 @@ def _configure_sm89_fp8_linear_triton(args) -> str:
     )
     return detected
 
+def _is_naive_n05_family(config) -> bool:
+    if config.get("model_type") == "naive_n05_flash":
+        return True
+    return (config.get("enable_dsa") is True and
+            (config.get("model_type") == "mimo_v2" or
+             any(a in ("MiMoV2ForCausalLM", "MiMoV2DSAForCausalLM")
+                 for a in config.get("architectures", []))))
+
 def _is_moe_architecture(architecture: str, model_type: str = "", text_model_type: str = "") -> bool:
     return (architecture in [
         "DeepseekV3ForCausalLM",
@@ -846,10 +854,12 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "KimiK3ForConditionalGeneration",
         "Dots3NoteForCausalLM",
         "Glm5NextForConditionalGeneration",
+        "MiMoV2ForCausalLM",
+        "MiMoV2DSAForCausalLM",
     ] or model_type in [
         "deepseek_v4", "deepseek_v41", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
         "kimi_k3", "dots3_note", "naive_n05_flash", "glm5_next", "glm5_next_text", "qwen4_exp",
-        "qwen3_8_flash_next",
+        "qwen3_8_flash_next", "mimo_v2",
     ] or text_model_type in [
         "deepseek_v41_text", "qwen3_5_moe_text", "glm5_next_text", "qwen4_exp_text",
         "qwen3_8_flash_next_text",
@@ -1341,7 +1351,7 @@ def make_normal_llm_model(args, startup_progress = None):
             architectures = config.get("architectures", [])
             architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")
-            is_naive_n05_model = model_type == "naive_n05_flash"
+            is_naive_n05_model = _is_naive_n05_family(config)
             if is_naive_n05_model:
                 is_thread_tp_moe_model = True
             is_laguna_model = (architecture == 'LagunaForCausalLM' or
@@ -1392,7 +1402,7 @@ def make_normal_llm_model(args, startup_progress = None):
             if speculative_algorithm == "dspark":
                 if speculative_draft_path:
                     if (architecture != "KimiK3ForConditionalGeneration" and
-                            model_type not in ("kimi_k3", "naive_n05_flash")):
+                            model_type != "kimi_k3" and not is_naive_n05_model):
                         raise ValueError(
                             "external DSpark draft checkpoints currently target "
                             "Kimi-K3 / Naive-N0.5, got architecture=%s model_type=%s" %

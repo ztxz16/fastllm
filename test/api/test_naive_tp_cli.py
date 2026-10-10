@@ -10,14 +10,15 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
-from fastllm_pytools.util import make_normal_llm_model, make_normal_parser
+from fastllm_pytools.util import make_normal_llm_model, make_normal_parser, _is_naive_n05_family
 
 
 class NaiveTensorParallelCliTest(unittest.TestCase):
-    def configure(self, options, model_type="naive_n05_flash", saved=None):
+    def configure(self, options, model_type="naive_n05_flash", saved=None, config=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "config.json").write_text(json.dumps({"model_type": model_type}))
+            (root / "config.json").write_text(json.dumps(
+                {"model_type": model_type, **(config or {})}))
             model_path = str(root)
             if saved is not None:
                 path = root / "launch.json"
@@ -50,6 +51,20 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
     def test_saved_explicit_zero(self):
         args = self.configure([], saved={"tp": "8", "cuda_slab": 0})
         self.assertEqual(args.cuda_slab, 0)
+
+    def test_mimo_dsa_tp_defaults(self):
+        args = self.configure(["--tp", "8"], model_type="mimo_v2", config={
+            "architectures": ["MiMoV2ForCausalLM"], "enable_dsa": True})
+        self.assertEqual(args.atype, "bfloat16")
+        self.assertEqual(args.cuda_slab, 16)
+        self.assertEqual(args.cache_history, "true")
+
+    def test_mimo_family_requires_dsa(self):
+        for enabled in (None, False, "true"):
+            self.assertFalse(_is_naive_n05_family(
+                {"model_type": "mimo_v2", "enable_dsa": enabled}))
+        self.assertTrue(_is_naive_n05_family({
+            "architectures": ["MiMoV2DSAForCausalLM"], "enable_dsa": True}))
 
     def test_serial_and_single_device_defaults(self):
         for options in ([], ["--tp", "1"], ["--device", '["cuda:0", "cuda:1"]']):

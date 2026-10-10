@@ -1,5 +1,68 @@
 # Naive-N0.5-Flash-FP8 混合推理
 
+## MiMo-V2 DSA checkpoint
+
+`model_type=mimo_v2`、`enable_dsa=true` 的 split-QKV checkpoint 复用
+`NaiveN05FlashModel`。原始 `config.json` 和 safetensors 无需改名或转换。
+模型工厂同时识别 `MiMoV2ForCausalLM` / `MiMoV2DSAForCausalLM` 架构名；
+运行时仍使用 `naive_n05_flash` 分派 TP、KV 缓存、思考与工具解析。
+非 DSA、融合 QKV、全局 attention sink 或带共享专家的 MiMo 配置会明确报错。
+
+已对照的 MiMo checkpoint 为 48 层、hidden size 4096，含 9 个 DSA 全局层和
+39 个滑窗层；Q/K 为 192 维、V 为 128 维，前 64 维使用 RoPE。全局/SWA
+分别有 4/8 个 KV heads，滑窗为 128。首层为 dense MLP，其余 47 层每层有
+256 个专家、每 token 选 8 个；索引器为 16 heads × 128 维、top-k 2048。
+这些结构和权重名称与 Naive 的现有实现一致，FP8 专家权重可直接复用加载路径。
+`attention_value_scale=0.707`、不同的全局/SWA RoPE theta 和滑窗 sink
+均从原始配置或权重读取。配置未给出的索引器尺寸使用上述默认值，并已核对权重形状。
+
+8 张 H20（SM90）部署示例：
+
+```bash
+export CUDA_HOME=/usr/local/cuda
+export PATH="$CUDA_HOME/bin:$PATH"
+bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=90
+FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/MiMo-V2-DSA \
+  --model_name mimo-fastllm --tp 8 --dtype auto --atype bfloat16 \
+  --cuda_embedding --max_batch 32 --tokens 1048576 --threads 16 \
+  --cache_history false --enable_thinking false --port 8000
+```
+
+激活和 KV cache 使用 BF16，专家保留 checkpoint 的 FP8。CUDA 13.0 的
+低比特 prefill 编译单元单独使用 C++17，规避 NVCC 与 libstdc++ 13 在
+`std::destroy_at` 上的 C++20 内部编译错误，其余 CUDA 单元保持原有标准。
+
+回归覆盖 MiMo 模型识别、配置拒绝、CLI 的 BF16/TP 默认值、注意力和 8 卡
+计算；完整模型验证覆盖算术、排序、代码生成及 4377/9957-token 的长文检索。
+生成的质数函数另通过 2023 个输入用例；OpenAI 兼容 API 的 8 路并发对话、
+工具调用及工具结果续写、流式输出等 12 项检查通过。
+这些测试未覆盖 checkpoint 配置中的完整 1M 上下文。
+
+### MiMo 在 8×H20-3e 上的实测
+
+在上述 TP8 / FP8 专家 / BF16 激活与 KV 配置下，完整 checkpoint 加载约
+145 秒。原生接口使用 2048 个随机输入 token、256 个固定输出 token，关闭
+历史缓存，结果如下。总吞吐包含 prefill；解码速度为请求级中位数。
+
+| 同时提交请求数 | 总输出吞吐（token/s） | 解码速度（token/s/请求） | 首 token 中位数（秒） |
+| --- | --- | --- | --- |
+| 1（两次） | 70.5–81.0 | 103.0–109.3 | 0.68–1.30 |
+| 8 | 107.1 | 18.19 | 4.27 |
+| 32 | 110.6 | 4.79 | 16.76 |
+
+`max_batch=200` 的同类测试在生成完成前发生 `cudaErrorMemoryAllocation`，
+当时 device 0 仍报告约 90 GiB 空闲；尚未确认根因，不能将它解释为显存容量
+耗尽，也不能报告为完成的 200 并发结果。部署示例因此使用 `max_batch=32`。
+原生测速为保证长度使用 `min_length=256`，会走全词表采样路径。
+
+另一次 HTTP 排队测试使用 `max_batch=32`，同时提交 200 个不同的数字串
+聊天请求，每请求实际输入 3097 token、固定输出 32 token，200/200 成功。
+整轮耗时 368.17 秒，总输出 6400 token（17.38 token/s，包含输入处理与排队），
+请求延迟中位数 242.42 秒。8 卡整轮平均 GPU 忙碌率 69.49%、SM 活跃度
+37.42%、Tensor Core 活跃度 1.43%、显存带宽活跃度 1.72%；每卡平均
+42.87 GiB 显存、201.79 W。它验证的是限流后的 200 路 HTTP 服务，不代表
+200 个请求同时在 GPU 解码；这些硬件活动指标也不等于模型 FLOPS 利用率。
+
 ## 编译与启动
 
 ```bash

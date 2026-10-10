@@ -98,6 +98,17 @@ NaiveN05FlashModel::~NaiveN05FlashModel() {
 }
 
 void NaiveN05FlashModel::InitParams() {
+    const bool mimo = weight.dicts["model_type"] == "mimo_v2" ||
+        weight.dicts["architectures"].find("\"MiMoV2ForCausalLM\"") != std::string::npos ||
+        weight.dicts["architectures"].find("\"MiMoV2DSAForCausalLM\"") != std::string::npos;
+    if (mimo) {
+        AssertInFastLLM(weight.dicts["enable_dsa"] == "true",
+                        "MiMo-V2 currently requires enable_dsa=true (DSA checkpoint).");
+        AssertInFastLLM(weight.dicts["attention_projection_layout"] == "split" &&
+                        weight.dicts["add_full_attention_sink_bias"] != "true" &&
+                        ConfigNumber(weight, "n_shared_experts", 0) == 0,
+                        "MiMo-V2 DSA requires split QKV, no full-attention sink and no shared experts.");
+    }
     basellm::InitParams();
     auto number = [&](const std::string &name, float fallback) {
         return ConfigNumber(weight, name, fallback);

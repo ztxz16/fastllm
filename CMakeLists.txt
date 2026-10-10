@@ -1050,6 +1050,18 @@ if (UNIT_TEST)
     add_test(NAME naive_n05_history COMMAND naive_n05_history_test)
     set_tests_properties(naive_n05_history PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
 
+    add_executable(mimo_dsa_config_test test/basic/test_mimo_dsa_config.cpp)
+    target_link_libraries(mimo_dsa_config_test PRIVATE fastllm)
+    add_test(NAME mimo_dsa_config COMMAND mimo_dsa_config_test)
+    set_tests_properties(mimo_dsa_config PROPERTIES
+        PASS_REGULAR_EXPRESSION "PASS MiMo-V2 DSA configuration" TIMEOUT 30)
+    foreach(mimo_invalid_config no_dsa fused_qkv shared_experts)
+        add_test(NAME mimo_dsa_reject_${mimo_invalid_config}
+            COMMAND mimo_dsa_config_test ${mimo_invalid_config})
+        set_tests_properties(mimo_dsa_reject_${mimo_invalid_config} PROPERTIES
+            PASS_REGULAR_EXPRESSION "FastLLM Error: MiMo" TIMEOUT 30)
+    endforeach()
+
     add_executable(qwen4_multimodal_cache_test test/basic/test_qwen4_multimodal_cache.cpp)
     target_link_libraries(qwen4_multimodal_cache_test PRIVATE fastllm)
     add_test(NAME qwen4_multimodal_cache COMMAND qwen4_multimodal_cache_test)
