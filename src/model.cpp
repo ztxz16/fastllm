@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <mutex>
+#include <unordered_map>
 #if defined(__linux__) && defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -634,7 +635,35 @@ namespace fastllm {
         return std::atoi(weightName.substr(begin, end - begin).c_str());
     }
 
-    static std::string GetMoeWeightSelectedDevice(const basellm *model, const std::string &weightName) {
+    // Build after model callbacks define the rules, then share read-only across
+    // loader threads. Preserve rule order and all matches for shared inputs.
+    class WeightMergeIndex {
+    public:
+        explicit WeightMergeIndex(const std::vector<WeightMergeRule> &rules) {
+            size_t inputCount = 0;
+            for (const auto &rule : rules) {
+                inputCount += rule.allInputs.size();
+            }
+            rulesByInput.reserve(inputCount);
+            for (size_t i = 0; i < rules.size(); ++i) {
+                for (const auto &input : rules[i].allInputs) {
+                    rulesByInput[input].push_back(i);
+                }
+            }
+        }
+
+        const std::vector<size_t> &Find(const std::string &weightName) const {
+            static const std::vector<size_t> empty;
+            auto it = rulesByInput.find(weightName);
+            return it == rulesByInput.end() ? empty : it->second;
+        }
+
+    private:
+        std::unordered_map<std::string, std::vector<size_t>> rulesByInput;
+    };
+
+    static std::string GetMoeWeightSelectedDevice(const basellm *model, const std::string &weightName,
+                                                 const WeightMergeIndex &mergeIndex) {
         if (model == nullptr) {
             return "";
         }
@@ -645,7 +674,8 @@ namespace fastllm {
         if (model->moeLinears.find(weightName) == model->moeLinears.end()) {
             return "";
         }
-        for (auto &mergeRule : model->weightMergeRules) {
+        for (size_t ruleId : mergeIndex.Find(weightName)) {
+            const auto &mergeRule = model->weightMergeRules[ruleId];
             for (auto &rule : mergeRule.rules) {
                 if (std::find(rule.inputs.begin(), rule.inputs.end(), weightName) == rule.inputs.end()) {
                     continue;
@@ -2215,10 +2245,11 @@ namespace fastllm {
         return true;
     }
 
-    static bool IsDiskMoeWeight(basellm *model, const std::string &weightName) {
+    static bool IsDiskMoeWeight(basellm *model, const std::string &weightName,
+                                const WeightMergeIndex &mergeIndex) {
         return model != nullptr &&
                model->moeLinears.find(weightName) != model->moeLinears.end() &&
-               DeviceNameMatchesType(GetMoeWeightSelectedDevice(model, weightName), "disk");
+               DeviceNameMatchesType(GetMoeWeightSelectedDevice(model, weightName, mergeIndex), "disk");
     }
 
     static bool IsPureDiskDeviceMap(const std::map<std::string, int> &deviceMap) {
@@ -2248,7 +2279,8 @@ namespace fastllm {
 
     static WeightType GetDiskLazyWeightType(basellm *model,
                                             const std::string &weightName,
-                                            uint64_t sourceBytes) {
+                                            uint64_t sourceBytes,
+                                            const WeightMergeIndex &mergeIndex) {
         if (model == nullptr) {
             return WeightType::NONE;
         }
@@ -2256,7 +2288,7 @@ namespace fastllm {
             model->ngramWeights.find(weightName) != model->ngramWeights.end()) {
             return WeightType::EMBEDDING;
         }
-        if (IsDiskMoeWeight(model, weightName)) {
+        if (IsDiskMoeWeight(model, weightName, mergeIndex)) {
             return WeightType::LINEAR;
         }
         if (!IsPureDiskDeviceMap(model->deviceMap)) {
@@ -4299,6 +4331,7 @@ namespace fastllm {
                             "No DFlash tensors were mapped for the GGUF target.");
         }
         model->OnWeightsCreated(allWeightNames);
+        const WeightMergeIndex mergeIndex(model->weightMergeRules);
         ReportModelLoadProgress("weights_prepare", 1, 1);
         std::stable_sort(tensors.begin(), tensors.end(),
                          [&](const std::string &a, const std::string &b) {
@@ -4338,7 +4371,7 @@ namespace fastllm {
                         if (readGGUFTaskDict.find(weightName) != readGGUFTaskDict.end()) {
                             auto *task = readGGUFTaskDict[weightName];
                             tensorBytes = ggml_nbytes(&task->tensor);
-                            const WeightType diskType = GetDiskLazyWeightType(model, weightName, tensorBytes);
+                            const WeightType diskType = GetDiskLazyWeightType(model, weightName, tensorBytes, mergeIndex);
                             if (diskType != WeightType::NONE &&
                                 task->replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
                                 SetDiskGGUFWeightMeta(*task->weight, task->tensor, task->fileName, task->offset);
@@ -4395,10 +4428,8 @@ namespace fastllm {
                             allFinishNames.insert(weightName);
                             // 检查是否需要合并权重
                             bool needMerge = false;
-                            for (auto &rule : model->weightMergeRules) {
-                                if (rule.allInputs.find(weightName) == rule.allInputs.end()) {
-                                    continue;
-                                }
+                            for (size_t ruleId : mergeIndex.Find(weightName)) {
+                                auto &rule = model->weightMergeRules[ruleId];
                                 needMerge = true;
                                 bool canMerge = true;
                                 for (auto &name : rule.allInputs) {
@@ -4971,6 +5002,9 @@ namespace fastllm {
         // 如果有需要，为moe设置特定的量化参数。AWQ 的专家权重使用
         // .qweight 保存，即使名称模式未把它识别成普通 LINEAR，也必须走
         // 全局线性量化类型；否则会按普通 I32 参数加载。
+#if defined(__aarch64__)
+        const WeightMergeIndex earlyMergeIndex(model->weightMergeRules);
+#endif
         bool awqArmCpuMoeInt8Fallback = false;
         if (model->moeLinears.size() > 0 && (useMoeDataType || isAwqModel)) {
             for (auto &it : tensorMap) {
@@ -4980,7 +5014,7 @@ namespace fastllm {
                             weight.second = moeDataType;
                         } else if (dtypeConfigString.empty()) {
 #if defined(__aarch64__)
-                            std::string selectedDevice = GetMoeWeightSelectedDevice(model, weight.first);
+                            std::string selectedDevice = GetMoeWeightSelectedDevice(model, weight.first, earlyMergeIndex);
                             if (isAwqModel && model->model_struct == "qwen3_5" &&
                                 (DeviceNameMatchesType(selectedDevice, "cpu") ||
                                  DeviceNameMatchesType(selectedDevice, "numa"))) {
@@ -5142,6 +5176,7 @@ namespace fastllm {
             ReportModelLoadProgress("weights_prepare", 1, 1);
         }
         model->OnWeightsCreated(allWeightNames);
+        const WeightMergeIndex mergeIndex(model->weightMergeRules);
         std::stable_sort(tensors.begin(), tensors.end(),
                          [&](const std::string &a, const std::string &b) {
                              return model->GetWeightLoadPriority(a, tensorMap[a]) <
@@ -5357,7 +5392,7 @@ namespace fastllm {
                             }
 
                             WeightType diskLazyWeightType = GetDiskLazyWeightType(
-                                model, weightName, tensor.bytes);
+                                model, weightName, tensor.bytes, mergeIndex);
                             bool diskLazyWeight = diskLazyWeightType != WeightType::NONE;
                             if (diskLazyWeight) {
                                 if (packedInt4Info.isAffine) {
@@ -5572,10 +5607,8 @@ namespace fastllm {
                             }
                             // 检查是否需要合并权重
                             bool needMerge = false;
-                            for (auto &rule : model->weightMergeRules) {
-                                if (rule.allInputs.find(weightName) == rule.allInputs.end()) {
-                                    continue;
-                                }
+                            for (size_t ruleId : mergeIndex.Find(weightName)) {
+                                auto &rule = model->weightMergeRules[ruleId];
                                 needMerge = true;
                                 bool canMerge = true;
                                 for (auto &name : rule.allInputs) {
