@@ -5,6 +5,7 @@
 // Compiled into FastLLM by the SM90 object target. No external adapter is loaded.
 extern "C" {
 const char *fastllm_ep8_mega_moe_error();
+int fastllm_ep8_mega_moe_max_rows();
 size_t fastllm_ep8_mega_moe_workspace_bytes();
 int fastllm_ep8_mega_moe_init_workspace(void *, size_t, const int *, int);
 int fastllm_ep8_mega_moe_supported();

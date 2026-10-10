@@ -9,7 +9,7 @@ p.add_argument("--lib", required=True)
 p.add_argument("--output", required=True)
 a = p.parse_args()
 torch.manual_seed(1026)
-R, E, H, I, K, C = 8, 256, 4096, 2048, 8, 128
+R, E, H, I, K, C = 8, 256, 4096, 2048, 8, 512
 ptr = ctypes.c_void_p
 P = ctypes.POINTER(ptr)
 lib = ctypes.CDLL(a.lib)
@@ -32,7 +32,9 @@ lib.fastllm_ep8_mega_moe_create.restype = ptr
 lib.fastllm_ep8_mega_moe_run.argtypes = [ptr, ptr, ptr, ptr, ptr, ctypes.c_int]
 lib.fastllm_ep8_mega_moe_destroy.argtypes = [ptr]
 size = lib.fastllm_ep8_mega_moe_workspace_bytes()
-assert size <= 16 * 1024**2
+assert size <= 48 * 1024**2
+lib.fastllm_ep8_mega_moe_max_rows.restype = ctypes.c_int
+assert lib.fastllm_ep8_mega_moe_max_rows() == 64
 print("WORKSPACE_BYTES", size, flush=True)
 torch.cuda.set_device(0)
 w1 = torch.randn(E, 2 * I, H, device="cuda", dtype=torch.bfloat16).to(
@@ -46,11 +48,14 @@ devices = (ctypes.c_int * R)(*range(R))
 for r in range(R):
     torch.cuda.set_device(r)
     weights = [v[r * 32 : (r + 1) * 32].to(r) for v in [w1, w2, s1, s2]]
-    scratch = torch.empty(size, device=r, dtype=torch.uint8)
+    # Keep a guard immediately after the arena, especially for the routing
+    # pattern that fills its final aligned expert tile.
+    allocation = torch.full((size + 4096,), 165, device=r, dtype=torch.uint8)
+    scratch = allocation[:size]
     assert lib.fastllm_ep8_mega_moe_init_workspace(
         scratch.data_ptr(), size, devices, r
     ), lib.fastllm_ep8_mega_moe_error()
-    ranks.append(dict(weights=weights, scratch=scratch))
+    ranks.append(dict(weights=weights, scratch=scratch, guard=allocation[size:]))
 peers = (ptr * R)(*[v["scratch"].data_ptr() for v in ranks])
 for r, v in enumerate(ranks):
     torch.cuda.set_device(r)
@@ -59,6 +64,10 @@ for r, v in enumerate(ranks):
         *arrays, v["scratch"].data_ptr(), size, peers, r, 0
     )
     assert v["handle"], lib.fastllm_ep8_mega_moe_error()
+    for invalid_rows in (0, 65):
+        assert not lib.fastllm_ep8_mega_moe_run(
+            v["handle"], None, None, None, None, invalid_rows
+        )
 torch.cuda.set_device(0)
 refbytes, slicer = dg._C.get_symm_buffer_size_for_sm90_mega_moe(
     1, E, C, K, H, I, True, "swiglu"
@@ -81,13 +90,36 @@ for N, scenario in [
     (2, "different_ranks"),
     (8, "different_ranks"),
     (8, "one_owner"),
+    (9, "different_ranks"),
+    (16, "different_ranks"),
+    (32, "different_ranks"),
+    (63, "different_ranks"),
+    (64, "different_ranks"),
+    (64, "one_owner"),
+    (1, "replicated_spread"),
+    (64, "pool_bound"),
 ]:
+    if scenario == "pool_bound":
+        # 31 experts receive 129 rows and one receives 97. Their BM=64
+        # aligned spans occupy exactly 6080 rows: the compiled pool bound.
+        remaining = [129] * 31 + [97]
+        routes = []
+        for _ in range(N * R):
+            chosen = sorted(range(32), key=lambda e: (-remaining[e], e))[:K]
+            assert all(remaining[e] > 0 for e in chosen)
+            for e in chosen:
+                remaining[e] -= 1
+            routes.append(chosen)
+        assert not any(remaining)
+        pool_routes = torch.tensor(routes, dtype=torch.int32)
     for r, v in enumerate(ranks):
         torch.cuda.set_device(r)
         x = torch.randn(N, H, device=r, dtype=torch.bfloat16) * 0.1
         idx = torch.stack(
             [torch.randperm(E, device=r, dtype=torch.int32)[:K] for _ in range(N)]
         )
+        if scenario == "pool_bound":
+            idx = pool_routes[r * N : (r + 1) * N].to(r)
         if scenario == "one_owner":
             idx = torch.arange(K, device=r, dtype=torch.int32).repeat(N, 1)
         if scenario == "replicated_spread":
@@ -127,11 +159,12 @@ for N, scenario in [
         views[2],
         views[3],
         N * R,
-        C,
+        128,  # FP8 quantization group size, independent of buffer capacity
     )
     dg.fp8_mega_moe(ref, l1, l2, sym, recipe=(128, 128, 128))
     torch.cuda.synchronize()
     y = torch.cat([v["y"].to(0) for v in ranks])
+    assert all(bool((v["guard"] == 165).all()) for v in ranks), "Workspace overflow"
     delta = y.float() - ref.float()
     nrmse = float(delta.square().mean().sqrt() / ref.float().square().mean().sqrt())
     assert torch.isfinite(y).all() and nrmse < 0.003, (N, scenario, nrmse)
@@ -184,6 +217,7 @@ for repeat in range(3):
 torch.cuda.set_device(0)
 graph_y = torch.cat([v["y"].to(0) for v in ranks])
 assert torch.equal(graph_y, ref), "EP8 Graph output differs from reference"
+assert all(bool((v["guard"] == 165).all()) for v in ranks), "Graph workspace overflow"
 print("EP8_CUDA_GRAPH_PASS", flush=True)
 for r, (g, ex) in enumerate(graphs):
     torch.cuda.set_device(r)

@@ -62,14 +62,21 @@ Scope and layout:
   changes in request order/count, KV addresses/capacity or attention region
   invalidate the existing batch graph rather than retaining one per shape.
   Verification and batches larger than four retain eager execution.
-  Prefill runs in chunks of at most eight rows to bound temporary storage.
+  Prefill runs in chunks of at most 64 rows to bound temporary storage.
+  The host queries the compiled kernel capacity; there is no runtime flag.
   The model's TP worker serializes calls on cudaStreamPerThread.
 
 Memory and precision:
   Original weight bytes stay in their native layout. Gate/up tiles are
   interleaved in shared memory, not in an extra GPU weight buffer.
-  FastLLM owns 14,779,648 bytes (14.09 MiB) of persistent symmetric workspace
-  per card, capped at 16 MiB. This includes all layer descriptors; no
+  FastLLM owns 46,050,048 bytes (43.92 MiB) of persistent symmetric workspace
+  per card, capped at 48 MiB. This is 29.82 MiB more than the original eight-row
+  path, and is shared across all layers/chunks and both prefill and decode.
+  The 32 local experts share 6080 token slots instead of reserving 512 slots
+  per expert. The bound is floor((8*64*8 + 32*(64-1))/64)*64: total possible
+  routes plus at most 63 padding slots per expert, rounded down because the
+  sum of aligned expert spans is itself a multiple of 64. Scaling-factor
+  storage uses 128 rows per 64-row tile. This includes all layer descriptors; no
   per-layer H2D descriptor uploads occur during decode. This storage must
   not alias transient attention scratch or be zeroed between calls.
   EP allocates only expert scales, avoiding TP's unused expert bias caches.
@@ -80,6 +87,7 @@ Memory and precision:
   FP8, and output is BF16. It is not numerically equivalent to native W8A16;
   logits and generated tokens can change. Selecting --ep 8 selects W8A8.
   Unit checks compare all eight ranks to installed DeepGEMM W8A8 with the
-  same weights/routes and cover 1/2/8 rows, spread/one-owner routes, repeated
-  calls and CUDA Graph replay. Full-model logits need a separate regression
+  same weights/routes and cover 1/2/8/9/16/32/63/64 rows, spread/one-owner routes,
+  a pattern filling all 6080 pool slots, repeated calls, allocation guards and
+  CUDA Graph replay. Full-model logits need a separate regression
   check because these unit checks do not establish W8A16 equivalence.

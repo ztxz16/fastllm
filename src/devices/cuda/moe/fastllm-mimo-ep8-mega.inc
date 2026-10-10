@@ -36,7 +36,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     // Dedicated control storage must survive attention/cuBLAS calls. Sharing
     // the old transient scratch would race remote dispatch writes against a
     // later rank's memset. Bound it; retain no duplicate/repacked FP8 weights.
-    AssertInFastLLM(bytes > 0 && bytes <= 16 * 1024 * 1024,
+    AssertInFastLLM(bytes > 0 && bytes <= 48 * 1024 * 1024,
                    "MiMo EP8 symmetric workspace exceeds its memory budget.");
     auto state = std::make_shared<FastllmCudaMimoEp8Mega>();
     state->devices = devices;
@@ -82,8 +82,8 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
                 rank.workspace.cudaData, bytes, peers.data(), r, l);
             AssertInFastLLM(rank.layers[l] != nullptr, fastllm_ep8_mega_moe_error());
         }
-        printf("MIMO_EP8_MEGA gpu=%d experts=32 inter=2048 W8A8 workspace=%zu replicated_input Graph-ready backend=builtin\n",
-               devices[r], bytes);
+        printf("MIMO_EP8_MEGA gpu=%d experts=32 inter=2048 W8A8 workspace=%zu max_rows=%d replicated_input Graph-ready backend=builtin\n",
+               devices[r], bytes, fastllm_ep8_mega_moe_max_rows());
     }
     FastllmCudaSetDevice(previous);
     return state;
@@ -101,10 +101,11 @@ void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     output.Allocate(false);
     void *handle = state.ranks.at(rank)->layers.at(layer);
     AssertInFastLLM(handle != nullptr, "Missing MiMo EP8 layer handle.");
-    // A bounded workspace supports arbitrary prefill length without increasing
-    // its capacity. Decode uses one call, and attention keeps true BS1.
-    for (int start = 0; start < input.dims[0]; start += 8) {
-        const int rows = std::min(8, input.dims[0] - start);
+    // Reuse the same bounded workspace across chunks and all MoE layers.
+    // Obtain the limit from the kernel so host chunking cannot drift from it.
+    const int capacity = fastllm_ep8_mega_moe_max_rows();
+    for (int start = 0; start < input.dims[0]; start += capacity) {
+        const int rows = std::min(capacity, input.dims[0] - start);
         if (!fastllm_ep8_mega_moe_run(handle, (const uint16_t *)input.cudaData + (size_t)start * 4096,
             (uint16_t *)output.cudaData + (size_t)start * 4096,
             (const int32_t *)index.cudaData + start * 8,

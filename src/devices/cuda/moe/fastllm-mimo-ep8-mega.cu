@@ -15,10 +15,15 @@
 static constexpr float inf = __builtin_inff();
 namespace {
 using namespace fastllm_ep8_deep_gemm;
-constexpr int H = 4096, I = 2048, E = 256, R = 8, LOCAL_E = E / R, K = 8, CAP = 8;
+constexpr int H = 4096, I = 2048, E = 256, R = 8, LOCAL_E = E / R, K = 8, CAP = 64;
 constexpr int BM = 64, BN = 128, BK = 128, STAGES = 8, SMS = 78;
-// At most 8 ranks x 8 rows = 64 received rows/expert: one BM tile per local expert.
-constexpr int POOL = LOCAL_E * BM, SFPOOL = LOCAL_E * 128;
+// All local experts share a compact token pool. Across ranks there are at most
+// R * CAP * K routes in total; each expert adds at most BM-1 alignment slots.
+// The sum of aligned expert spans is a multiple of BM, so rounding this bound
+// down is safe. Do not reserve R * CAP rows separately for every local expert.
+constexpr int POOL = (R * CAP * K + LOCAL_E * (BM - 1)) / BM * BM;
+constexpr int SFPOOL = (POOL / BM) * 128;
+static_assert(POOL == 6080 && SFPOOL == 12160, "Unexpected EP8 pool capacity");
 thread_local std::string error;
 void check(cudaError_t c) {
     if (c != cudaSuccess)
@@ -95,6 +100,9 @@ struct Layer {
 } // namespace
 extern "C" const char *fastllm_ep8_mega_moe_error() {
     return error.c_str();
+}
+extern "C" int fastllm_ep8_mega_moe_max_rows() {
+    return CAP;
 }
 extern "C" size_t fastllm_ep8_mega_moe_workspace_bytes() {
     Scratch s{};
@@ -184,8 +192,8 @@ extern "C" void *fastllm_ep8_mega_moe_create(const void *const *gate, const void
 extern "C" int fastllm_ep8_mega_moe_run(void *handle, const void *x, void *y, const int32_t *idx,
                                     const float *scores, int rows) {
     try {
-        if (!handle || rows < 1 || rows > 8)
-            throw std::runtime_error("MegaMoE supports 1..8 rows");
+        if (!handle || rows < 1 || rows > CAP)
+            throw std::runtime_error("MegaMoE row count exceeds its compiled capacity");
         auto &l = *static_cast<Layer *>(handle);
         auto &s = l.scratch;
         int device;
