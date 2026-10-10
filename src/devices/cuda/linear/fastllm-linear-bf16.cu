@@ -911,7 +911,14 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
     __nv_bfloat16 *weightPtr = (__nv_bfloat16 *)weight.cudaData;
 
     if (n < 8) {
-        LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, cudaBiasData, n, m, k);
+        // Hopper tensor cores amortize their setup on wide decode projections.
+        // Keep narrow projections, exact-row mode and the GEMV bias rounding
+        // contract on their existing path. An unwarmed graph also falls back.
+        const bool useLt = n > 0 && m >= 1024 && k >= 1024 && bias.dims.empty() &&
+            FastllmCudaRuntimeArch() == 90 && fastllm::FastllmCudaGetLinearExactBatchThreshold() == 0;
+        if (!useLt || !fastllm_bf16_lt::Matmul(cudaInput, weightPtr, cudaOutput, n, m, k)) {
+            LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, cudaBiasData, n, m, k);
+        }
     } else if (n == 8 && m > 0 && m <= 256 && m % 8 == 0) {
         LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, nullptr, n, m, k);
         // Match the GEMM branch: round the dot product before adding bias.

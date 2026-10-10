@@ -4325,7 +4325,7 @@ namespace fastllm {
             QWEN35_LINEAR_SLOT_RECURRENT = 1
         };
 
-        using Qwen35LinearSlotPoolKey = std::tuple<const Qwen3_5Model*, int, int, int, int>;
+        using Qwen35LinearSlotPoolKey = std::tuple<const Qwen3_5Model*, int, int, int, int, int>;
 
         static std::mutex &Qwen35LinearSlotPoolsMutex() {
             static std::mutex *mutex = new std::mutex();
@@ -4500,7 +4500,8 @@ namespace fastllm {
                 const std::vector<int> &managerDims) {
             AssertInFastLLM(!managerDims.empty() && managerDims[0] > 0,
                             "Qwen3.5 linear slot pool got invalid manager dims.\n");
-            auto key = std::make_tuple(model, gpuId, layer, (int)kind, managerDims[0]);
+            auto key = std::make_tuple(model, gpuId, layer, (int)kind, managerDims[0],
+                                       (int)ResolveQwen35ThreadTpComputeType(model->dataType));
             auto &pools = Qwen35LinearSlotPools();
             auto it = pools.find(key);
             if (it != pools.end()) {
@@ -4517,7 +4518,7 @@ namespace fastllm {
             std::unique_ptr<PagedCacheManager> manager(new PagedCacheManager());
             manager->type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE;
             manager->pageLen = 1;
-            ((Data*)manager.get())->dataType = DataType::FLOAT16;
+            ((Data*)manager.get())->dataType = ResolveQwen35ThreadTpComputeType(model->dataType);
             ((Data*)manager.get())->UpdateUnitSize();
             ((Data*)manager.get())->directMemory = true;
             ((Data*)manager.get())->dataDevice = DataDevice::CUDA;
@@ -4539,7 +4540,8 @@ namespace fastllm {
                 Qwen35LinearSlotPoolKind kind,
                 const std::vector<int> &managerDims) {
             auto &pools = Qwen35LinearSlotPools();
-            auto it = pools.find(std::make_tuple(model, gpuId, layer, (int)kind, managerDims[0]));
+            auto it = pools.find(std::make_tuple(model, gpuId, layer, (int)kind, managerDims[0],
+                                       (int)ResolveQwen35ThreadTpComputeType(model->dataType)));
             if (it == pools.end() || it->second == nullptr) {
                 return nullptr;
             }
@@ -4598,6 +4600,7 @@ namespace fastllm {
                 bool transposed,
                 bool alreadyPicked) {
             if (manager == nullptr || manager->cudaData == nullptr ||
+                cache.dataType != manager->dataType ||
                 slot < 0 || slot >= manager->maxPages) {
                 return false;
             }
@@ -4646,7 +4649,7 @@ namespace fastllm {
             cache.isLinearAttention = true;
             cache.isLinearAttentionTransposed = transposed;
             cache.lockInCPU = false;
-            cache.dataType = DataType::FLOAT16;
+            cache.dataType = manager->dataType;
             cache.UpdateUnitSize();
             cache.dataDevice = DataDevice::CUDA;
             cache.dataDeviceIds = manager->dataDeviceIds;
@@ -4696,7 +4699,8 @@ namespace fastllm {
                                 Qwen35LinearSlotPoolKind kind)
                                 -> PagedCacheManager* {
                 auto it = pools.find(std::make_tuple(
-                    model, gpuId, layer, (int)kind, slotCapacity));
+                    model, gpuId, layer, (int)kind, slotCapacity,
+                    (int)ResolveQwen35ThreadTpComputeType(model->dataType)));
                 return it == pools.end() || it->second == nullptr
                     ? nullptr : it->second.get();
             };
@@ -4772,13 +4776,12 @@ namespace fastllm {
                         pastKeyValues[b * blockCnt + item.layer].second;
                     std::vector<int> convView = {
                         1, item.conv->dims[2], item.conv->dims[3]};
-                    // The pool is physically [V, Dv, Dk] for graph decode,
-                    // while chunk prefill starts in logical [V, Dk, Dv].
-                    // Both layouts have the same byte size; prefill transposes
-                    // its batch tensor before SplitBatchFirstDim writes here.
+                    // Prefill starts in KV layout. FP16 graph pools use VK;
+                    // BF16 pools retain KV, matching the BF16 recurrent kernel.
                     std::vector<int> stateView = {
                         1, item.state->dims[1],
-                        item.state->dims[3], item.state->dims[2]};
+                        item.state->dims[item.state->dataType == DataType::BFLOAT16 ? 2 : 3],
+                        item.state->dims[item.state->dataType == DataType::BFLOAT16 ? 3 : 2]};
                     if (!Qwen35AttachLinearSlot(
                             *conv, item.conv, slot, convView, false, false) ||
                         !Qwen35AttachLinearSlot(
@@ -4798,7 +4801,8 @@ namespace fastllm {
                 int slotCapacity) {
             std::lock_guard<std::mutex> guard(Qwen35LinearSlotPoolsMutex());
             auto &pools = Qwen35LinearSlotPools();
-            auto it = pools.find(std::make_tuple(model, gpuId, layer, (int)kind, slotCapacity));
+            auto it = pools.find(std::make_tuple(model, gpuId, layer, (int)kind, slotCapacity,
+                    (int)ResolveQwen35ThreadTpComputeType(model->dataType)));
             return it == pools.end() || it->second == nullptr ? nullptr : it->second.get();
         }
 
@@ -5357,6 +5361,8 @@ namespace fastllm {
                 slotIdsHost.clear();
                 return true;
             }
+            const DataType cacheType = ResolveQwen35ThreadTpComputeType(model->dataType);
+            const bool transposed = cacheType == DataType::FLOAT16;
             int firstLinearLayer = linearLayers.front();
             int slotCapacity = Qwen35LinearSlotCapacity(model, batch);
             slotIdsHost.assign(batch, 0);
@@ -5367,7 +5373,7 @@ namespace fastllm {
                 if (ownerCache == nullptr || ownerCache->dims.size() != 3 ||
                     ownerCache->dims[0] != 1 || ownerCache->dims[2] != 4 ||
                     ownerCache->dataDevice != DataDevice::CUDA ||
-                    ownerCache->dataType != DataType::FLOAT16 ||
+                    ownerCache->dataType != cacheType ||
                     ownerCache->cudaData == nullptr) {
                     return false;
                 }
@@ -5398,11 +5404,11 @@ namespace fastllm {
                         recurrentState->dims.size() != 4 || recurrentState->dims[0] != 1 ||
                         convCache->dataDevice != DataDevice::CUDA ||
                         recurrentState->dataDevice != DataDevice::CUDA ||
-                        convCache->dataType != DataType::FLOAT16 ||
-                        recurrentState->dataType != DataType::FLOAT16 ||
+                        convCache->dataType != cacheType ||
+                        recurrentState->dataType != cacheType ||
                         convCache->cudaData == nullptr ||
                         recurrentState->cudaData == nullptr ||
-                        !recurrentState->isLinearAttentionTransposed) {
+                        recurrentState->isLinearAttentionTransposed != transposed) {
                         return false;
                     }
 
@@ -5411,8 +5417,8 @@ namespace fastllm {
                         {slotCapacity, 1, convCache->dims[1], 4});
                     PagedCacheManager *statePool = Qwen35FindLinearSlotPoolLocked(
                         model, gpuId, layer, QWEN35_LINEAR_SLOT_RECURRENT,
-                        {slotCapacity, recurrentState->dims[1], recurrentState->dims[3],
-                         recurrentState->dims[2]});
+                        {slotCapacity, recurrentState->dims[1], recurrentState->dims[transposed ? 3 : 2],
+                         recurrentState->dims[transposed ? 2 : 3]});
                     if (convPool == nullptr || statePool == nullptr) {
                         return false;
                     }
@@ -5427,7 +5433,7 @@ namespace fastllm {
                                                 {1, recurrentState->dims[1],
                                                  recurrentState->dims[2],
                                                  recurrentState->dims[3]},
-                                                true, false)) {
+                                                transposed, false)) {
                         return false;
                     }
                 }
@@ -5441,6 +5447,7 @@ namespace fastllm {
         // every token; fall back to the full preparation path whenever a new
         // request/cache has not been attached yet.
         static bool Qwen35CollectExistingLinearSlotCaches(
+                DataType cacheType,
                 int gpuId,
                 int batch,
                 int blockCnt,
@@ -5451,6 +5458,7 @@ namespace fastllm {
                 slotIdsHost.clear();
                 return true;
             }
+            const bool transposed = cacheType == DataType::FLOAT16;
             slotIdsHost.resize(batch);
             int firstLinearLayer = linearLayers.front();
             for (int b = 0; b < batch; b++) {
@@ -5486,11 +5494,11 @@ namespace fastllm {
                         recurrentState->dataDeviceIds.empty() ||
                         convCache->dataDeviceIds[0] != gpuId ||
                         recurrentState->dataDeviceIds[0] != gpuId ||
-                        convCache->dataType != DataType::FLOAT16 ||
-                        recurrentState->dataType != DataType::FLOAT16 ||
+                        convCache->dataType != cacheType ||
+                        recurrentState->dataType != cacheType ||
                         convCache->cudaData == nullptr ||
                         recurrentState->cudaData == nullptr ||
-                        !recurrentState->isLinearAttentionTransposed) {
+                        recurrentState->isLinearAttentionTransposed != transposed) {
                         return false;
                     }
                 }
@@ -5875,9 +5883,9 @@ namespace fastllm {
             if (input.dataDevice != DataDevice::CUDA ||
                 gateInput.dataDevice != DataDevice::CUDA ||
                 output.dataDevice != DataDevice::CUDA ||
-                input.dataType != DataType::FLOAT16 ||
-                gateInput.dataType != DataType::FLOAT16 ||
-                output.dataType != DataType::FLOAT16) {
+                (input.dataType != DataType::FLOAT16 && input.dataType != DataType::BFLOAT16) ||
+                gateInput.dataType != input.dataType ||
+                output.dataType != input.dataType) {
                 return false;
             }
             if (weight.dataDevice != DataDevice::CUDA) {
@@ -5892,6 +5900,9 @@ namespace fastllm {
                 input.dims != gateInput.dims ||
                 input.dims != output.dims) {
                 return false;
+            }
+            if (input.dataType == DataType::BFLOAT16) {
+                return FastllmCudaRMSNormSiluMulBFloat16(input, weight, gateInput, output, eps);
             }
             return FastllmCudaRMSNormSiluMulFloat16(input, weight, gateInput, output, eps);
         }
@@ -8699,11 +8710,11 @@ namespace fastllm {
             v.dataDevice != DataDevice::CUDA ||
             a.dataDevice != DataDevice::CUDA ||
             b.dataDevice != DataDevice::CUDA ||
-            q.dataType != DataType::FLOAT16 ||
-            k.dataType != DataType::FLOAT16 ||
-            v.dataType != DataType::FLOAT16 ||
-            a.dataType != DataType::FLOAT16 ||
-            b.dataType != DataType::FLOAT16 ||
+            (q.dataType != DataType::FLOAT16 && q.dataType != DataType::BFLOAT16) ||
+            k.dataType != q.dataType ||
+            v.dataType != q.dataType ||
+            a.dataType != q.dataType ||
+            b.dataType != q.dataType ||
             q.dims.size() != 4 || k.dims.size() != 4 || v.dims.size() != 4 ||
             a.dims.size() != 3 || b.dims.size() != 3 ||
             q.dims[0] != 1 || k.dims[0] != 1 || v.dims[0] != 1 ||
@@ -8714,7 +8725,7 @@ namespace fastllm {
             q.dims[2] <= 0 || q.dims[2] != k.dims[2] ||
             v.dims[2] <= 0 || a.dims[2] != v.dims[2] || b.dims[2] != v.dims[2] ||
             lastRecurrentState.dataDevice != DataDevice::CUDA ||
-            lastRecurrentState.dataType != DataType::FLOAT16 ||
+            lastRecurrentState.dataType != q.dataType ||
             lastRecurrentState.dims.size() != 4 ||
             lastRecurrentState.dims[0] != 1 ||
             lastRecurrentState.dims[1] != v.dims[2] ||
@@ -8749,6 +8760,12 @@ namespace fastllm {
             aLog.dims[0] != v.dims[2] ||
             dtBias.dims[0] != v.dims[2]) {
             return false;
+        }
+
+        if (q.dataType == DataType::BFLOAT16) {
+            return FastllmRecurrentGatedDeltaRuleNormBaBFloat16(
+                q, k, v, a, b, normWeight, aLog, dtBias, lastRecurrentState,
+                coreAttnOut, eps, 1.0f / std::sqrt((float)q.dims.back()));
         }
 
         SwapSingleTokenSeqHeadByReshape(q);
@@ -10632,6 +10649,15 @@ namespace fastllm {
             return;
         }
 
+        const DataType cacheType = ResolveQwen35ThreadTpComputeType(this->dataType);
+        if (cacheType != DataType::FLOAT16 && cacheType != DataType::BFLOAT16) return;
+        if (cacheType == DataType::BFLOAT16) {
+            if (head_k_dim != 128 || head_v_dim != 128) return;
+            for (int gpuId : devices) {
+                FastllmCudaSetDevice(gpuId);
+                if (!FastllmCudaBFloat16GdnGraphSupported()) return;
+            }
+        }
         bool tensorParallel = devices.size() > 1;
 
         std::lock_guard<std::mutex> guard(Qwen35LinearSlotPoolsMutex());
@@ -10665,7 +10691,9 @@ namespace fastllm {
                     {slotCapacity, 1, convDim, 4});
                 Qwen35GetLinearSlotPoolLocked(
                     this, gpuId, layer, QWEN35_LINEAR_SLOT_RECURRENT,
-                    {slotCapacity, localValueHeads, head_v_dim, head_k_dim});
+                    {slotCapacity, localValueHeads,
+                     cacheType == DataType::BFLOAT16 ? head_k_dim : head_v_dim,
+                     cacheType == DataType::BFLOAT16 ? head_v_dim : head_k_dim});
             }
         }
 #else
@@ -11112,6 +11140,16 @@ namespace fastllm {
             return finishGraphEligibility(false);
         }
 
+        const DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
+        if (computeType == DataType::BFLOAT16) {
+            FastllmCudaSetDevice(gpuId);
+            if (!FastllmCudaBFloat16GdnGraphSupported() ||
+                head_k_dim != 128 || head_v_dim != 128 ||
+                num_k_heads <= 0 || num_v_heads % num_k_heads != 0) {
+                return finishGraphEligibility(false);
+            }
+        }
+
         std::vector<int> attentionLayers;
         std::vector<int> linearLayers;
         attentionLayers.reserve(block_cnt);
@@ -11329,12 +11367,14 @@ namespace fastllm {
         int linearSlotCapacity = Qwen35LinearSlotCapacity(this, batch);
         bool linearCacheReady = true;
         if (!Qwen35CollectExistingLinearSlotCaches(
-                gpuId, batch, block_cnt, linearLayers,
+                computeType, gpuId, batch, block_cnt, linearLayers,
                 pastKeyValues, linearSlotIdsHost)) {
             for (int layer : linearLayers) {
                 for (int b = 0; b < batch; b++) {
-                    if (!Qwen35EnsureCudaLinearAttnStateTransposed(
-                            *pastKeyValues[b * block_cnt + layer].second)) {
+                    Data &recurrent = *pastKeyValues[b * block_cnt + layer].second;
+                    if (computeType == DataType::BFLOAT16
+                            ? recurrent.dataType != DataType::BFLOAT16 || recurrent.isLinearAttentionTransposed
+                            : !Qwen35EnsureCudaLinearAttnStateTransposed(recurrent)) {
                         linearCacheReady = false;
                         break;
                     }
@@ -11675,7 +11715,6 @@ namespace fastllm {
             state.lastPastKeyHosts = currentPastKeyHosts;
         }
 
-        const DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
         const DataType threadTpMoeAtype = this->useCustomMoeAtype ? this->moeAtype : computeType;
         auto &moeWeightsByDevice = tensorParallel ? threadTpMoeWeights : singleGpuMoeWeights;
         auto &moeBiassByDevice = tensorParallel ? threadTpMoeBiass : singleGpuMoeBiass;
@@ -12011,7 +12050,15 @@ namespace fastllm {
                         this, gpuId, i, QWEN35_LINEAR_SLOT_CONV,
                         linearSlotCapacity);
                     if (!projectedConvBlock && linearConvPool != nullptr && workspace.linearSlotIds.cudaData != nullptr) {
-                        directBatchDecodeConvSilu =
+                        if (computeType == DataType::BFLOAT16) {
+                            directBatchDecodeConvSilu = FastllmCudaBFloat16ConvSiluSlots(
+                                *linearConvPool, workspace.linearSlotIds, activeQkvConvInput,
+                                *requireLocal(weight[conv1dWeightName], conv1dWeightName),
+                                *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
+                                buf.convOutput, batch);
+                            AssertInFastLLM(directBatchDecodeConvSilu,
+                                "Qwen3.5 BF16 graph requires slot-indexed convolution.\n");
+                        } else directBatchDecodeConvSilu =
                             FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchSlots(
                                 linearConvPool->cudaData, workspace.linearSlotIds.cudaData,
                                 batch, *buf.linearConvCaches[0], activeQkvConvInput,
@@ -12073,7 +12120,17 @@ namespace fastllm {
                     bool fusedBatchRecurrentFromConvBa = false;
                     if (linearStatePool != nullptr && workspace.linearSlotIds.cudaData != nullptr) {
                         float recurrentQScale = 1.0f / std::sqrt((float)head_k_dim);
-                        fusedBatchRecurrentFromConvBa =
+                        if (computeType == DataType::BFLOAT16) {
+                            fusedBatchRecurrentFromConvBa = FastllmRecurrentGatedDeltaRuleBFloat16Slots(
+                                buf.convOutput, activeBa,
+                                *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                *requireLocal(weight[aLogName], aLogName),
+                                *requireLocal(weight[dtBiasName], dtBiasName),
+                                *linearStatePool, workspace.linearSlotIds, buf.coreAttnOut,
+                                batch, localKeyHeads, localValueHeads, rms_norm_eps, recurrentQScale);
+                            AssertInFastLLM(fusedBatchRecurrentFromConvBa,
+                                "Qwen3.5 BF16 graph requires slot-indexed recurrent state.\n");
+                        } else fusedBatchRecurrentFromConvBa =
                             FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
                                 buf.convOutput, activeBa,
                                 *requireLocal(inv_scale_data, "linear_attn.inv_scale"),

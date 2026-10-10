@@ -1,0 +1,14 @@
+TensorRT-LLM v1.3.0rc28, commit fca831eac3da515461e148b05e0663c29ab6aaa5
+Source: cpp/include/tensorrt_llm/deep_gemm/
+https://github.com/NVIDIA/TensorRT-LLM/tree/v1.3.0rc28/cpp/include/tensorrt_llm/deep_gemm
+
+Files retain their upstream SPDX notices (Apache-2.0 and, where present, MIT).
+FastLLM modifications:
+- Retain swapAB, its normal scheduler and MMA widths 16/24/32 only.
+- Isolate symbols in fastllm_trtllm_deep_gemm to avoid ODR conflicts with
+  the separately vendored DeepGEMM implementation.
+- Support FP16 and BF16 output; restrict the device body to SM90.
+- Use the existing CUTLASS headers for nvcc; omit NVRTC compatibility code
+  and unused host-side TMA descriptor helpers.
+FP8 WGMMA, FP32 accumulation and the retained scheduling are unchanged.
+This backend is compiled in a separate SM90a translation unit.
