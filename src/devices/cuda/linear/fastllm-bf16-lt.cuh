@@ -284,14 +284,26 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
     int count = 0;
     if (!CheckBlas(cublasLtMatmulAlgoGetHeuristic(s.handle, p.op, p.a, p.b, p.c, p.c,
             search.preference, maxCandidates, candidates, &count)) || count == 0) return;
-    CheckCuda(cudaEventCreate(&search.begin));
-    CheckCuda(cudaEventCreate(&search.end));
+    // Single-token BF16 decode values reproducibility across TP ranks and
+    // restarts. Timing near-tied algorithms (especially under a profiler) can
+    // change both latency and the reduction tree. Use the library's first
+    // supported heuristic within the same FP32/workspace/alignment constraints.
+    const bool singleRowBf16 = M == 1 && dtype == CUDA_R_16BF;
+    if (!singleRowBf16) {
+        CheckCuda(cudaEventCreate(&search.begin));
+        CheckCuda(cudaEventCreate(&search.end));
+    }
     float best = std::numeric_limits<float>::max();
     for (int i = 0; i < count; ++i) {
         if (candidates[i].state != CUBLAS_STATUS_SUCCESS ||
             candidates[i].workspaceSize > workspaceBytes) continue;
         const auto &algo = candidates[i].algo;
         if (!Run(s, p, algo, weight, input, output, s.eager->data)) continue;
+        if (singleRowBf16) {
+            p.algo = algo;
+            p.valid = true;
+            return;
+        }
         // First use only, before the caller's model capture. Timing individual
         // launches also measures CPU submission gaps, which can reorder these
         // few-microsecond GEMMs when TP workers tune concurrently. Submit the
@@ -301,6 +313,11 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
         SearchGraph trial;
         CheckCuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
         trial.capturing = true;
+#if CUDART_VERSION >= 11030
+        // Capture real event nodes so host submission gaps are outside the
+        // measured interval, even when cudaGraphLaunch itself is instrumented.
+        CheckCuda(cudaEventRecordWithFlags(search.begin, cudaStreamPerThread, cudaEventRecordExternal));
+#endif
         bool success = true;
         for (int repeat = 0; repeat < timingRepeats; ++repeat) {
             if (!Run(s, p, algo, weight, input, output, s.eager->data)) {
@@ -308,6 +325,10 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
                 break;
             }
         }
+#if CUDART_VERSION >= 11030
+        if (success)
+            CheckCuda(cudaEventRecordWithFlags(search.end, cudaStreamPerThread, cudaEventRecordExternal));
+#endif
         cudaError_t captured = cudaStreamEndCapture(cudaStreamPerThread, &trial.graph);
         trial.capturing = false;
         if (!success && captured == cudaErrorStreamCaptureInvalidated) {
@@ -327,10 +348,14 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
         CheckCuda(cudaStreamSynchronize(cudaStreamPerThread));
         float ms = std::numeric_limits<float>::max();
         for (int sample = 0; sample < timingSamples; ++sample) {
+#if CUDART_VERSION < 11030
             CheckCuda(cudaEventRecord(search.begin, cudaStreamPerThread));
+#endif
             CheckCuda(cudaGraphLaunch(trial.executable, cudaStreamPerThread));
+#if CUDART_VERSION < 11030
             CheckCuda(cudaEventRecord(search.end, cudaStreamPerThread));
-            CheckCuda(cudaEventSynchronize(search.end));
+#endif
+            CheckCuda(cudaStreamSynchronize(cudaStreamPerThread));
             float elapsed = 0.0f;
             CheckCuda(cudaEventElapsedTime(&elapsed, search.begin, search.end));
             ms = std::min(ms, elapsed);
