@@ -10,6 +10,7 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/cpu/alivethreadpool.h"
 #include "persistent_worker_group.h"
+#include "utils/hostbufferreclaim.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -3151,6 +3152,19 @@ namespace fastllm {
             const std::function<void(size_t)> &onProgress) {
         auto *config = GetNumaConfig();
         const bool usePinned = MoeEnvConfig::GetInstance().GetPinnedWeight();
+        bool registered = false;
+        size_t retainedReleaseBytes = 0;
+        // Most payload pages are returned directly. Bound the remaining edge
+        // pages (or failed discards) instead of repeatedly scanning every arena.
+        constexpr size_t retainedReleaseLimit = 8ULL * 1024 * 1024;
+        auto trimReleasedBuffers = [&](bool force) {
+#if defined(__linux__) && defined(__GLIBC__)
+            if (force || retainedReleaseBytes >= retainedReleaseLimit) {
+                malloc_trim(0);
+                retainedReleaseBytes = 0;
+            }
+#endif
+        };
         struct Entry {
             Data *weight;
             size_t offset, shardBytes;
@@ -3170,6 +3184,22 @@ namespace fastllm {
                     memcpy(weight->cpuData, reordered.data(), rows * rowBytes);
                 } else {
                     weight->Repack();
+                }
+            }
+        };
+        struct ReleaseSourceOp : MultiThreadBaseOp {
+            const std::vector<Entry> &entries;
+            size_t begin, end, retainedBytes = 0;
+            ReleaseSourceOp(const std::vector<Entry> &entries, size_t begin, size_t end)
+                : entries(entries), begin(begin), end(end) {}
+            void Run() override {
+                for (size_t i = begin; i < end; ++i) {
+                    Data *weight = entries[i].weight;
+                    const size_t sourceBytes = weight->GetBytes();
+                    retainedBytes += sourceBytes -
+                        detail::DiscardUnusedHostBufferPages(weight->cpuData, sourceBytes);
+                    delete[] weight->cpuData;
+                    weight->cpuData = nullptr;
                 }
             }
         };
@@ -3212,20 +3242,56 @@ namespace fastllm {
                 AssertInFastLLM(arena->nodes[node] != nullptr,
                                "NUMA MoE weight arena allocation failed.\n");
             }
-            // Populate pages by copying first, then pin each complete arena.
-            // This avoids a separate CUDA registration for every small tensor.
-            {
-                std::vector<std::vector<MultiThreadBaseOp*>> copyOps(config->numaCnt);
-                for (const Entry &entry : entries) {
-                    for (int node = 0; node < config->numaCnt; ++node) {
-                        copyOps[node].push_back(new NumasBatchMemcpyOp(
-                            arena->nodes[node] + entry.offset,
-                            entry.weight->cpuData + node * entry.shardBytes,
-                            entry.shardBytes));
+            // Copy and retire sources in smaller waves. An entire arena still
+            // gets one CUDA registration, but no longer needs to coexist with
+            // all of its source pages. This leaves headroom for unreleased edge
+            // pages without raising the previous 256 MiB duplication budget.
+            constexpr size_t copyWaveBytes = 32ULL * 1024 * 1024;
+            for (size_t begin = 0; begin < entries.size();) {
+                size_t end = begin, waveBytes = 0;
+                do {
+                    waveBytes += entries[end].shardBytes * config->numaCnt;
+                    ++end;
+                } while (end < entries.size() && waveBytes < copyWaveBytes &&
+                         entries[end].shardBytes * config->numaCnt <= copyWaveBytes - waveBytes);
+                {
+                    std::vector<std::vector<MultiThreadBaseOp*>> copyOps(config->numaCnt);
+                    for (size_t i = begin; i < end; ++i) {
+                        const Entry &entry = entries[i];
+                        for (int node = 0; node < config->numaCnt; ++node) {
+                            copyOps[node].push_back(new NumasBatchMemcpyOp(
+                                arena->nodes[node] + entry.offset,
+                                entry.weight->cpuData + node * entry.shardBytes,
+                                entry.shardBytes));
+                        }
                     }
+                    DynamicScheduleTasks(copyOps, true);
                 }
-                DynamicScheduleTasks(copyOps, true);
+                {
+                    // All node copies have joined before any source is touched.
+                    // Independent source allocations can return their pages in
+                    // parallel using the existing workers (no new thread pool).
+                    // A few coarse tasks amortize scheduling and limit the
+                    // number of concurrent kernel page-reclamation operations.
+                    const size_t maxTasks = 4 * config->numaCnt;
+                    const size_t perTask = (end - begin + maxTasks - 1) / maxTasks;
+                    std::vector<ReleaseSourceOp> storage;
+                    storage.reserve(maxTasks);
+                    std::vector<std::vector<MultiThreadBaseOp*>> releaseOps(config->numaCnt);
+                    size_t task = 0;
+                    for (size_t i = begin; i < end; i += perTask) {
+                        storage.emplace_back(entries, i, std::min(end, i + perTask));
+                        releaseOps[task++ % config->numaCnt].push_back(&storage.back());
+                    }
+                    DynamicScheduleTasks(releaseOps, false);
+                    for (const ReleaseSourceOp &op : storage) {
+                        retainedReleaseBytes += op.retainedBytes;
+                    }
+                    trimReleasedBuffers(false);
+                }
+                begin = end;
             }
+            // Populate pages before pinning the complete arena, as before.
 #ifdef USE_CUDA
             if (usePinned) {
                 for (int node = 0; node < config->numaCnt; ++node) {
@@ -3237,27 +3303,21 @@ namespace fastllm {
                                             [](bool value) { return value; });
             {
                 auto &owners = GetNumasMoeWeightArenaOwners();
-                {
-                    std::lock_guard<std::mutex> guard(owners.mutex);
-                    owners.weights.reserve(owners.weights.size() + entries.size());
-                    for (const Entry &entry : entries) {
-                        Data *weight = entry.weight;
-                        weight->numasData.resize(config->numaCnt);
-                        owners.weights.emplace(weight, arena);
-                        for (int node = 0; node < config->numaCnt; ++node) {
-                            weight->numasData[node] = arena->nodes[node] + entry.offset;
-                        }
-                        weight->numasNVFP4AllScalesFuseMagic = false;
-                        weight->expansionBytes = weight->GetBytes();
-                        weight->isPinned = pinned;
-                        delete[] weight->cpuData;
-                        weight->cpuData = nullptr;
+                std::lock_guard<std::mutex> guard(owners.mutex);
+                owners.weights.reserve(owners.weights.size() + entries.size());
+                for (const Entry &entry : entries) {
+                    Data *weight = entry.weight;
+                    weight->numasData.resize(config->numaCnt);
+                    owners.weights.emplace(weight, arena);
+                    for (int node = 0; node < config->numaCnt; ++node) {
+                        weight->numasData[node] = arena->nodes[node] + entry.offset;
                     }
+                    weight->numasNVFP4AllScalesFuseMagic = false;
+                    weight->expansionBytes = weight->GetBytes();
+                    weight->isPinned = pinned;
                 }
-#if defined(__linux__) && defined(__GLIBC__)
-                malloc_trim(0);
-#endif
             }
+            registered = true;
             entries.clear();
             arenaBytes = 0;
         };
@@ -3291,6 +3351,7 @@ namespace fastllm {
             arenaBytes += sourceBytes / config->numaCnt;
         }
         flush();
+        if (registered) trimReleasedBuffers(true);
         if (onProgress) onProgress(weights.size());
     }
 

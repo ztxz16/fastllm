@@ -2,6 +2,7 @@
 #include "gguf.h"
 #include "devices/numas/numasdevice.h"
 #include "devices/numas/numas.h"
+#include "utils/hostbufferreclaim.h"
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -13,6 +14,49 @@ using namespace fastllm;
 namespace fastllm { void RegisterNumas(Data *weight, std::string type); }
 static void Check(bool value, const char *message) {
     if (!value) throw std::runtime_error(message);
+}
+// Exercise page-aligned, unaligned and sub-page ranges while live canaries
+// occupy both neighbours. A locked mapping must take the fallback path.
+static void TestSourcePageReclaim() {
+#if defined(__linux__) && defined(__GLIBC__)
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t total = 8 * page;
+    auto *mapping = static_cast<uint8_t*>(mmap(nullptr, total, PROT_READ | PROT_WRITE,
+                                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    Check(mapping != MAP_FAILED, "reclaim test mmap failed");
+    for (size_t offset : {size_t(0), size_t(1), size_t(63), page - 1}) {
+        for (size_t bytes : {size_t(1), page - 1, page, 3 * page, 3 * page + 17}) {
+            std::memset(mapping, 0x5a, total);
+            uint8_t *buffer = mapping + page + offset;
+            const size_t discarded = detail::DiscardUnusedHostBufferPages(buffer, bytes);
+            size_t zeros = 0;
+            for (size_t i = 0; i < total; ++i) {
+                if (mapping + i < buffer || mapping + i >= buffer + bytes)
+                    Check(mapping[i] == 0x5a, "reclaim changed a live neighbour");
+                else {
+                    Check(mapping[i] == 0 || mapping[i] == 0x5a, "unexpected reclaimed byte");
+                    zeros += mapping[i] == 0;
+                }
+            }
+            Check(buffer[0] == 0x5a, "reclaim destroyed allocation prefix");
+            Check(zeros == discarded, "reclaimed byte accounting mismatch");
+            Check(discarded % page == 0, "reclaim must operate on whole pages");
+            if (bytes >= 3 * page) Check(discarded >= 2 * page, "large buffer was not reclaimed");
+        }
+    }
+    // Locked anonymous pages reject MADV_DONTNEED. The caller must be able to
+    // fall back to ordinary deletion/trim without losing or changing data.
+    std::memset(mapping, 0x5a, total);
+    if (mlock(mapping, total) == 0) {
+        Check(detail::DiscardUnusedHostBufferPages(mapping, total) == 0, "locked page reclaim should fail");
+        for (size_t i = 0; i < total; ++i) Check(mapping[i] == 0x5a, "failed reclaim changed data");
+        Check(munlock(mapping, total) == 0, "reclaim fallback test munlock failed");
+    } else {
+        std::puts("SKIP: locked-page reclaim check (mlock unavailable)");
+    }
+    Check(munmap(mapping, total) == 0, "reclaim test munmap failed");
+#endif
+    Check(detail::DiscardUnusedHostBufferPages(nullptr, 0) == 0, "empty reclaim failed");
 }
 static std::unique_ptr<Data> MakeWeight(int seed) {
     const ggml_type types[] = {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
@@ -74,6 +118,7 @@ static void TestChunkBoundaries() {
 }
 int main(int argc, char **argv) {
     try {
+        TestSourcePageReclaim();
 #ifdef USE_CUDA
         int devices = 0;
         if (NumasMoeWeightsArePinned() &&
