@@ -73,6 +73,13 @@ namespace fastllm {
     bool IsNumasLinearWeightRegistered(const Data *weight);
     // CUDA can borrow expert shards only when NUMA registration pins them.
     bool NumasMoeWeightsArePinned();
+    // Bounded arenas for GGUF expert weights, including gate/up row interleave
+    // and one CUDA host registration per arena. Other formats use RegisterNumas.
+    void RegisterNumasMoeWeightBatch(
+        const std::vector<std::pair<Data*, std::string>> &weights,
+        const std::function<void(size_t)> &onProgress = {});
+    // Retire only arenas owned by the batch path; borrowed NUMA views are ignored.
+    void ReleaseNumasMoeWeightArena(Data *weight);
 
     // Single-token SwiGLU subsets using already registered NUMA shards. Each
     // selected route writes its unweighted FP32 result at route * hidden.

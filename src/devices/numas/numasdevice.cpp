@@ -20,6 +20,7 @@
 #include <thread>
 #include <mutex>
 #include <memory>
+#include <unordered_map>
 #include <chrono>
 #if defined(__linux__) && defined(__GLIBC__)
 #include <malloc.h>
@@ -3079,6 +3080,220 @@ namespace fastllm {
         RegisterNumasImpl(data, weightType, true);
     }
 
+    void DynamicScheduleTasks(std::vector<std::vector<MultiThreadBaseOp*>> &ops, bool deleteTasks);
+
+    namespace {
+        struct NumasBatchMemcpyOp : MultiThreadBaseOp {
+            uint8_t *dst;
+            const uint8_t *src;
+            size_t bytes;
+
+            NumasBatchMemcpyOp(uint8_t *dst, const uint8_t *src, size_t bytes)
+                : dst(dst), src(src), bytes(bytes) {}
+
+            void Run() override {
+                memcpy(dst, src, bytes);
+            }
+        };
+
+        struct NumasMoeWeightArena {
+            size_t bytes;
+            std::vector<uint8_t*> nodes;
+            std::vector<bool> pinned;
+
+            NumasMoeWeightArena(size_t bytes, int count)
+                : bytes(bytes), nodes(count, nullptr), pinned(count, false) {}
+
+            ~NumasMoeWeightArena() {
+                for (size_t node = 0; node < nodes.size(); ++node) {
+                    if (nodes[node] == nullptr) continue;
+#ifdef USE_CUDA
+                    if (pinned[node]) FastllmCudaHostUnregister(nodes[node]);
+#endif
+                    // allocate_aligned_numa reserves 63 extra bytes for alignment.
+                    free_aligned_numa(nodes[node], bytes + 63);
+                }
+            }
+        };
+
+        struct NumasMoeWeightArenaOwners {
+            std::mutex mutex;
+            std::unordered_map<const Data*, std::shared_ptr<NumasMoeWeightArena>> weights;
+        };
+
+        NumasMoeWeightArenaOwners &GetNumasMoeWeightArenaOwners() {
+            // Data can be destroyed during static teardown. Keep the registry
+            // alive; each arena is released when its last owning Data retires.
+            static auto *owners = new NumasMoeWeightArenaOwners;
+            return *owners;
+        }
+    }
+
+    void ReleaseNumasMoeWeightArena(Data *weight) {
+        if (weight == nullptr || weight->numasData.empty()) return;
+        auto &owners = GetNumasMoeWeightArenaOwners();
+        std::shared_ptr<NumasMoeWeightArena> retired;
+        {
+            std::lock_guard<std::mutex> guard(owners.mutex);
+            auto it = owners.weights.find(weight);
+            if (it == owners.weights.end()) return;
+            retired = std::move(it->second);
+            owners.weights.erase(it);
+        }
+        weight->numasData.clear();
+        weight->isPinned = false;
+        // Unregister/free outside the registry lock. Other tensors may still
+        // own slices of this arena, so never free an individual slice.
+    }
+
+    void RegisterNumasMoeWeightBatch(
+            const std::vector<std::pair<Data*, std::string>> &weights,
+            const std::function<void(size_t)> &onProgress) {
+        auto *config = GetNumaConfig();
+        const bool usePinned = MoeEnvConfig::GetInstance().GetPinnedWeight();
+        struct Entry {
+            Data *weight;
+            size_t offset, shardBytes;
+            bool interleave;
+        };
+        struct PrepareWeightOp : MultiThreadBaseOp {
+            Data *weight;
+            bool interleave;
+            PrepareWeightOp(Data *weight, bool interleave)
+                : weight(weight), interleave(interleave) {}
+            void Run() override {
+                if (interleave) {
+                    const int rows = weight->dims[0], columns = weight->dims[1];
+                    const size_t rowBytes = GetDataBytes(weight->GetDataType(), 1, columns);
+                    std::vector<uint8_t> reordered;
+                    CrossSwigluReorder(weight->cpuData, rows, rowBytes, reordered);
+                    memcpy(weight->cpuData, reordered.data(), rows * rowBytes);
+                } else {
+                    weight->Repack();
+                }
+            }
+        };
+        std::vector<Entry> entries;
+        size_t arenaBytes = 0;
+        std::set<Data*> seen;
+        // Bound temporary duplication while replacing the source allocations.
+        // A tensor larger than the budget gets an arena of its own.
+        constexpr size_t batchBytes = 256ULL * 1024 * 1024;
+        auto flush = [&]() {
+            if (entries.empty()) return;
+            // Each task owns a distinct tensor. Keep the interleave -> repack
+            // ordering, while preparing independent experts on NUMA workers.
+            auto prepare = [&](bool interleave) {
+                std::vector<PrepareWeightOp> storage;
+                storage.reserve(entries.size());
+                std::vector<std::vector<MultiThreadBaseOp*>> ops(config->numaCnt);
+                size_t task = 0;
+                for (const Entry &entry : entries) {
+                    if (interleave && !entry.interleave) continue;
+                    storage.emplace_back(entry.weight, interleave);
+                    ops[task++ % config->numaCnt].push_back(&storage.back());
+                }
+                if (task != 0) DynamicScheduleTasks(ops, false);
+            };
+            prepare(true);
+            prepare(false);
+            // Recompute the shard layout after repack, as in RegisterNumas.
+            arenaBytes = 0;
+            for (Entry &entry : entries) {
+                arenaBytes = (arenaBytes + 63) & ~(size_t)63;
+                entry.offset = arenaBytes;
+                entry.shardBytes = (entry.weight->dims[0] / config->numaCnt) *
+                    GetDataBytes(entry.weight->GetDataType(), 1, entry.weight->dims[1]);
+                arenaBytes += entry.shardBytes;
+            }
+            auto arena = std::make_shared<NumasMoeWeightArena>(arenaBytes, config->numaCnt);
+            for (int node = 0; node < config->numaCnt; ++node) {
+                arena->nodes[node] = (uint8_t*)allocate_aligned_numa(arenaBytes, node);
+                AssertInFastLLM(arena->nodes[node] != nullptr,
+                               "NUMA MoE weight arena allocation failed.\n");
+            }
+            // Populate pages by copying first, then pin each complete arena.
+            // This avoids a separate CUDA registration for every small tensor.
+            {
+                std::vector<std::vector<MultiThreadBaseOp*>> copyOps(config->numaCnt);
+                for (const Entry &entry : entries) {
+                    for (int node = 0; node < config->numaCnt; ++node) {
+                        copyOps[node].push_back(new NumasBatchMemcpyOp(
+                            arena->nodes[node] + entry.offset,
+                            entry.weight->cpuData + node * entry.shardBytes,
+                            entry.shardBytes));
+                    }
+                }
+                DynamicScheduleTasks(copyOps, true);
+            }
+#ifdef USE_CUDA
+            if (usePinned) {
+                for (int node = 0; node < config->numaCnt; ++node) {
+                    arena->pinned[node] = FastllmCudaHostRegister(arena->nodes[node], arenaBytes);
+                }
+            }
+#endif
+            const bool pinned = std::all_of(arena->pinned.begin(), arena->pinned.end(),
+                                            [](bool value) { return value; });
+            {
+                auto &owners = GetNumasMoeWeightArenaOwners();
+                {
+                    std::lock_guard<std::mutex> guard(owners.mutex);
+                    owners.weights.reserve(owners.weights.size() + entries.size());
+                    for (const Entry &entry : entries) {
+                        Data *weight = entry.weight;
+                        weight->numasData.resize(config->numaCnt);
+                        owners.weights.emplace(weight, arena);
+                        for (int node = 0; node < config->numaCnt; ++node) {
+                            weight->numasData[node] = arena->nodes[node] + entry.offset;
+                        }
+                        weight->numasNVFP4AllScalesFuseMagic = false;
+                        weight->expansionBytes = weight->GetBytes();
+                        weight->isPinned = pinned;
+                        delete[] weight->cpuData;
+                        weight->cpuData = nullptr;
+                    }
+                }
+#if defined(__linux__) && defined(__GLIBC__)
+                malloc_trim(0);
+#endif
+            }
+            entries.clear();
+            arenaBytes = 0;
+        };
+        for (size_t i = 0; i < weights.size(); ++i) {
+            Data *weight = weights[i].first;
+            if (weight == nullptr || !weight->numasData.empty() || !seen.insert(weight).second) {
+                if (onProgress && entries.empty()) onProgress(i + 1);
+                continue;
+            }
+            const std::string &type = weights[i].second;
+            if (weight->dataType != DATA_GGUF_FORMAT ||
+                (type != "linearSwiglu" && type != "linearColumn" && type != "linear")) {
+                flush();
+                RegisterNumas(weight, type);
+#if defined(__linux__) && defined(__GLIBC__)
+                if ((i + 1) % 256 == 0) malloc_trim(0);
+#endif
+                if (onProgress) onProgress(i + 1);
+                continue;
+            }
+            AssertInFastLLM(!weight->isDiskWeight && weight->cpuData != nullptr &&
+                           weight->dims.size() == 2 && weight->dims[0] % config->numaCnt == 0,
+                           "NUMA MoE batch requires resident, evenly shardable GGUF weights.\n");
+            const size_t sourceBytes = weight->GetBytes();
+            if (!entries.empty() && arenaBytes * config->numaCnt + sourceBytes > batchBytes) {
+                flush();
+                if (onProgress) onProgress(i);
+            }
+            arenaBytes = (arenaBytes + 63) & ~(size_t)63;
+            entries.push_back({weight, 0, 0, type == "linearSwiglu"});
+            arenaBytes += sourceBytes / config->numaCnt;
+        }
+        flush();
+        if (onProgress) onProgress(weights.size());
+    }
+
     bool NumasMoeWeightsArePinned() {
         return MoeEnvConfig::GetInstance().GetPinnedWeight();
     }
@@ -4516,19 +4731,6 @@ namespace fastllm {
     }
 
     namespace {
-        struct NumasBatchMemcpyOp : MultiThreadBaseOp {
-            uint8_t *dst;
-            const uint8_t *src;
-            size_t bytes;
-
-            NumasBatchMemcpyOp(uint8_t *dst, const uint8_t *src, size_t bytes)
-                : dst(dst), src(src), bytes(bytes) {}
-
-            void Run() override {
-                memcpy(dst, src, bytes);
-            }
-        };
-
         size_t AlignNumaArenaOffset(size_t value) {
             return (value + 63) & ~(size_t)63;
         }

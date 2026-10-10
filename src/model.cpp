@@ -76,6 +76,9 @@
 namespace fastllm {
 #if defined(USE_NUMAS)
     void RegisterNumas(fastllm::Data *data, std::string weightType);
+    void RegisterNumasMoeWeightBatch(
+        const std::vector<std::pair<Data*, std::string>> &weights,
+        const std::function<void(size_t)> &onProgress);
 #endif
     extern BF16ToFP16Manager bf16tofp16;
 
@@ -702,11 +705,7 @@ namespace fastllm {
 
     void basellm::WarmupNumaMoeWeights() {
 #if defined(USE_NUMAS)
-        struct PendingNumaWeight {
-            Data *data;
-            std::string weightType;
-        };
-        std::vector<PendingNumaWeight> pending;
+        std::vector<std::pair<Data*, std::string>> pending;
         uint64_t totalBytes = 0;
         int moeSpecialCount = 0;
         int numaSelectedCount = 0;
@@ -780,20 +779,14 @@ namespace fastllm {
                pending.size(), totalBytes / 1024.0 / 1024.0 / 1024.0);
         fflush(stdout);
         int lastProgress = -1;
-        for (int i = 0; i < (int)pending.size(); i++) {
-            RegisterNumas(pending[i].data, pending[i].weightType);
-#if defined(__linux__) && defined(__GLIBC__)
-            if ((i + 1) % 256 == 0) {
-                malloc_trim(0);
-            }
-#endif
-            int progress = (i + 1) * 100 / (int)pending.size();
+        RegisterNumasMoeWeightBatch(pending, [&](size_t completed) {
+            int progress = (int)(completed * 100 / pending.size());
             if (progress != lastProgress) {
                 printf("\r[Fastllm] AutoWarmup NUMA MoE: %d%%", progress);
                 fflush(stdout);
                 lastProgress = progress;
             }
-        }
+        });
 #if defined(__linux__) && defined(__GLIBC__)
         malloc_trim(0);
 #endif

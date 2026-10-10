@@ -1060,6 +1060,22 @@ if (UNIT_TEST)
     set_tests_properties(reduce_batch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
 
     if (USE_NUMAS)
+        add_executable(numas_moe_batch_register_test test/basic/test_numas_moe_batch_register.cpp)
+        target_link_libraries(numas_moe_batch_register_test PRIVATE fastllm)
+        fastllm_add_checked_test(numas_moe_batch_register numas_moe_batch_register_test "PASS: bounded NUMA arenas" 120)
+        fastllm_add_checked_test(numas_moe_batch_register_boundaries numas_moe_batch_register_test "PASS: bounded NUMA arenas" 120 --chunk-boundary)
+        fastllm_add_checked_test(numas_moe_batch_register_unpinned numas_moe_batch_register_test "PASS: bounded NUMA arenas" 120)
+        fastllm_add_checked_test(numas_moe_batch_register_dual_numa numas_moe_batch_register_test "PASS: bounded NUMA arenas" 120)
+        set_tests_properties(numas_moe_batch_register numas_moe_batch_register_boundaries PROPERTIES
+            ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_PINNED_WEIGHT=1" RUN_SERIAL TRUE)
+        set_tests_properties(numas_moe_batch_register_unpinned PROPERTIES
+            ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_PINNED_WEIGHT=0" RUN_SERIAL TRUE)
+        set_tests_properties(numas_moe_batch_register_dual_numa PROPERTIES
+            ENVIRONMENT "FT_NUMAS=2;FT_THREADS=4;FT_PINNED_WEIGHT=1" RUN_SERIAL TRUE)
+        if (USE_CUDA)
+            target_include_directories(numas_moe_batch_register_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            set_tests_properties(numas_moe_batch_register numas_moe_batch_register_boundaries numas_moe_batch_register_dual_numa PROPERTIES LABELS cuda)
+        endif()
         add_executable(numas_v41_q2_moe_test test/basic/test_numas_v41_q2_moe.cpp)
         target_link_libraries(numas_v41_q2_moe_test PRIVATE fastllm)
         add_test(NAME numas_v41_q2_moe COMMAND numas_v41_q2_moe_test)
