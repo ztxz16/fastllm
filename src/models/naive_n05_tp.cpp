@@ -335,6 +335,9 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         }
     }
     if (tpEp8Mega) tpEp8MegaState = FastllmCudaCreateMimoEp8Mega(tpDevices, tpMoeWeights);
+    tpSwaRingCache = GetFastllmEnv().cudaGraph && kvCacheDataType == BFLOAT16 &&
+        window == 128 && sliding.headDim == 192 && sliding.valueDim == 128 &&
+        sliding.heads / ranks < 64;
     tpPrepared = true;
 #endif
 }
@@ -700,6 +703,14 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         runRanks([&](int rank) {
             for (const auto &item : restored)
                 RestoreTensorParallelHistoryRank(*item.cache, item.layer, item.value, item.capacity, rank);
+            if (tpSwaRingCache) {
+                for (int sequence = 0; sequence < sequences; ++sequence)
+                for (int layer = 0; layer < block_cnt; ++layer) {
+                    if (!slidingLayers[layer] || key(sequence, layer).dataDevice != DataDevice::CPU) continue;
+                    FastllmCudaNaiveSwaCacheLayout(*key(sequence, layer).multiDeviceDatas.at(tpDevices[rank]),
+                        *value(sequence, layer).multiDeviceDatas.at(tpDevices[rank]), key(sequence, 0).dims[1], true);
+                }
+            }
         });
         for (const auto &item : restored) {
             item.cache->FreeSpace();
@@ -714,6 +725,16 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     // One bounded graph state for full verification blocks, separate from
     // ordinary decode. Smaller blocks and region boundaries remain eager.
     const bool verify = capture && capture->verifying;
+    if (verify && tpSwaRingCache) {
+        runRanks([&](int rank) {
+            FastllmCudaSetDevice(tpDevices[rank]);
+            const int past = key(0, 0).dims.empty() ? 0 : key(0, 0).dims[1];
+            for (int layer = 0; layer < block_cnt; ++layer)
+                if (slidingLayers[layer]) FastllmCudaNaiveSwaCacheLayout(
+                    *key(0, layer).multiDeviceDatas.at(tpDevices[rank]),
+                    *value(0, layer).multiDeviceDatas.at(tpDevices[rank]), past, false);
+        });
+    }
     struct RestoreState {
         std::shared_ptr<TPDecodeState> &active, &saved;
         bool swapped;
@@ -875,8 +896,10 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                         Data &root = part ? value(sequence, layer) : key(sequence, layer);
                         Data &local = *root.multiDeviceDatas.at(tpDevices[rank]);
                         size_t size = (size_t)chunk->length * local.dims[2] * 2;
+                        const int first = tpSwaRingCache && slidingLayers[layer] && !verify
+                            ? key(sequence, 0).dims[1] & (window - 1) : local.dims[1] - added;
                         const void *ptr = (const uint8_t *)local.cudaData +
-                            (size_t)(local.dims[1] - added) * local.dims[2] * 2;
+                            (size_t)first * local.dims[2] * 2;
                         slices.push_back({ptr, part ? &chunk->layers[layer].second : &chunk->layers[layer].first,
                                           layer, part, chunk->length, local.dims[2], bytes, size});
                         bytes += size;

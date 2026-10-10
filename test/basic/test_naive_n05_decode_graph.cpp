@@ -351,6 +351,70 @@ static void TestDraftAttention(int dim, int rows, int window, bool shortAttentio
     }
 }
 
+// Exercise the production append/attention kernels across multiple wraps, then
+// leave/re-enter the ring as prefill, verification and history restore do.
+static void TestSwaRing(int heads, int kvHeads, bool fused) {
+    const int kc = kvHeads * 192, vc = kvHeads * 128;
+    Data q(BFLOAT16), packed(BFLOAT16), nk(BFLOAT16), nv(BFLOAT16), pos(FLOAT32), live(INT32), sink(FLOAT32);
+    Data oldK(BFLOAT16), oldV(BFLOAT16), ringK(BFLOAT16), ringV(BFLOAT16), expected, actual, none;
+    Upload(q, {1, 1, heads * 192}, 71);
+    Upload(packed, {1, 1, (heads + kvHeads) * 192 + vc}, 72);
+    Upload(nk, {1, 1, kc}, 73); Upload(nv, {1, 1, vc}, 74);
+    Upload(pos, {1, 1}, 75); Upload(live, {1}, 76); Upload(sink, {heads}, 77);
+    Upload(oldK, {1, 256, kc}, 78); Upload(oldV, {1, 256, vc}, 79);
+    oldK.Expansion({1, 256, kc}); oldV.Expansion({1, 256, vc});
+    ringK.CopyFrom(oldK); ringV.CopyFrom(oldV);
+    ringK.Expansion({1, 256, kc}); ringV.Expansion({1, 256, vc});
+    const auto initialK = Read<uint16_t>(oldK), initialV = Read<uint16_t>(oldV);
+    FastllmNaiveDecodeScratch oldScratch, ringScratch;
+    int length = 128;
+    Cuda(cudaMemcpy(live.cudaData, &length, sizeof(length), cudaMemcpyHostToDevice));
+    auto invoke = [&](bool ring) {
+        Data &k = ring ? ringK : oldK, &v = ring ? ringV : oldV;
+        if (fused) Require(FastllmCudaNaiveRopeAppendCache(q, nk, nv, none, pos, k, v,
+            live, heads, kvHeads, 192, 128, 64, 10000.f, .75f, 128, &packed, ring), "fused ring append");
+        else FastllmCudaNaiveAppendDecodeCache(k, v, nk, nv, live, 128, ring);
+        FastllmCudaNaiveDecodeAttention(q, k, v, none, sink, live, 256, heads, kvHeads,
+            192, 128, 128, ring ? ringScratch : oldScratch, ring ? actual : expected, ring);
+        if (!ring) FastllmCudaNaiveTrimDecodeCache(k, v, live, 128);
+    };
+    Graph graph;
+    graph.Capture([&]() { invoke(false); invoke(true); });
+    auto rows = [](const Data &d) {
+        std::vector<uint16_t> result((size_t)d.dims[1] * d.dims[2]);
+        Cuda(cudaMemcpy(result.data(), d.cudaData, result.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        return result;
+    };
+    for (int prefix : {0, 126, 127, 128, 707, 2047}) {
+        for (Data *k : {&oldK, &ringK})
+            Cuda(cudaMemcpy(k->cudaData, initialK.data(), initialK.size() * 2, cudaMemcpyHostToDevice));
+        for (Data *v : {&oldV, &ringV})
+            Cuda(cudaMemcpy(v->cudaData, initialV.data(), initialV.size() * 2, cudaMemcpyHostToDevice));
+        auto resize = [&](int past) {
+            for (Data *k : {&oldK, &ringK}) k->Resize({1, std::min(past, 127), kc});
+            for (Data *v : {&oldV, &ringV}) v->Resize({1, std::min(past, 127), vc});
+        };
+        resize(prefix);
+        FastllmCudaNaiveSwaCacheLayout(ringK, ringV, prefix, true);
+        for (int step = 0; step < 260; ++step) {
+            length = prefix + step + 1;
+            float position = length - 1;
+            Cuda(cudaMemcpy(live.cudaData, &length, sizeof(length), cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(pos.cudaData, &position, sizeof(position), cudaMemcpyHostToDevice));
+            graph.Run();
+            Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "SWA ring output mismatch");
+            resize(length);
+            // Conversion itself must preserve every retained row, including at
+            // wrap boundaries. This also simulates leaving/re-entering decode.
+            FastllmCudaNaiveSwaCacheLayout(ringK, ringV, length, false);
+            Require(rows(ringK) == rows(oldK), "SWA ring key mismatch");
+            Require(rows(ringV) == rows(oldV), "SWA ring value mismatch");
+            FastllmCudaNaiveSwaCacheLayout(ringK, ringV, length, true);
+            ++checks;
+        }
+    }
+}
+
 int main() {
     try {
         int devices = 0;
@@ -359,6 +423,8 @@ int main() {
         FastllmCudaSetDevice(0);
         if (!FastllmCudaNaiveDecodeGraphSupported())
             return 77;
+        for (int heads : {4, 8, 16})
+            for (bool fused : {false, true}) TestSwaRing(heads, heads == 16 ? 2 : 1, fused);
         for (int ch : {1, 127, 256, 1024, 2048, 4096, 5120})
             TestResidualNorm(ch);
         for (int ch : {127, 256, 4096})

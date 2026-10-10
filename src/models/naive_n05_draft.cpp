@@ -649,6 +649,8 @@ void NaiveN05FlashModel::CommitTargetCache(std::vector<std::pair<Data, Data>> &k
             if (slidingLayers[layer]) {
                 FastllmCudaSetDevice(key.dataDeviceIds.at(0));
                 FastllmCudaNaiveTrimCache(key, value, window - 1);
+                if (device >= 0 && tpSwaRingCache)
+                    FastllmCudaNaiveSwaCacheLayout(key, value, past + count, true);
             }
         }
     };

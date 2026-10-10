@@ -96,7 +96,7 @@ static void CheckLogitComparison() {
 class Fixture : public NaiveN05FlashModel {
   public:
     int ranks;
-    explicit Fixture(int ranks, bool packed = false, bool graph = false) : ranks(ranks) {
+    explicit Fixture(int ranks, bool packed = false, bool graph = false, bool swaRing = false) : ranks(ranks) {
         setenv("FASTLLM_TP", ranks > 1 ? std::to_string(ranks).c_str() : "false", 1);
         deviceMap = {{"cuda:0", 1}};
         moeDeviceMap = deviceMap;
@@ -122,6 +122,12 @@ class Fixture : public NaiveN05FlashModel {
         if (graph) {
             weight.dicts["index_top_k"] = "2048";
             weight.dicts["max_position_embeddings"] = "8192";
+        }
+        if (swaRing) {
+            weight.dicts["swa_num_attention_heads"] = "64";
+            weight.dicts["swa_head_dim"] = "192";
+            weight.dicts["swa_v_head_dim"] = "128";
+            weight.dicts["sliding_window"] = "128";
         }
         InitParams();
         SetSaveHistoryChat(false);
@@ -173,14 +179,15 @@ class Fixture : public NaiveN05FlashModel {
         for (int i = 0; i < 2; ++i) {
             auto p = "model.layers." + std::to_string(i);
             auto ap = p + ".self_attn.";
-            int kv = i ? 8 : 4;
+            const int heads = i && swaRing ? 64 : 16, kv = i ? 8 : 4;
+            const int dim = i && swaRing ? 192 : 32, valueDim = i && swaRing ? 128 : 16;
             add(p + ".input_layernorm.weight", {256}, FLOAT32, 0, true);
             add(p + ".post_attention_layernorm.weight", {256}, FLOAT32, 0, true);
-            add(ap + "q_proj.weight", {512, 256}, BFLOAT16, .03f);
-            add(ap + "k_proj.weight", {kv * 32, 256}, BFLOAT16, .03f);
-            add(ap + "v_proj.weight", {kv * 16, 256}, BFLOAT16, .03f);
-            add(ap + "o_proj.weight", {256, 256}, BFLOAT16, .03f);
-            add(ap + "attention_sink_bias", {16}, FLOAT32, .1f);
+            add(ap + "q_proj.weight", {heads * dim, 256}, BFLOAT16, .03f);
+            add(ap + "k_proj.weight", {kv * dim, 256}, BFLOAT16, .03f);
+            add(ap + "v_proj.weight", {kv * valueDim, 256}, BFLOAT16, .03f);
+            add(ap + "o_proj.weight", {256, heads * valueDim}, BFLOAT16, .03f);
+            add(ap + "attention_sink_bias", {heads}, FLOAT32, .1f);
             if (i == 0) {
                 add(ap + "indexer.wq.weight", {2048, 256}, BFLOAT16, .03f);
                 add(ap + "indexer.wk.weight", {128, 256}, BFLOAT16, .03f);
@@ -203,6 +210,72 @@ class Fixture : public NaiveN05FlashModel {
     }
     bool UseModelSpecificScheduler() const override { return true; }
     void RunModelSpecificScheduler() override {}
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+    void RingGraphToggleChecks(bool initialGraph) {
+        int checks = 0, graphLaunches = 0;
+        const std::vector<bool> modes = {true, true, false, false, true, true, false, true};
+        GenerationConfig config;
+        config.top_k = 1; config.output_logits = true; config.output_token_limit = 64;
+        for (int prefix : {126, 255, 707}) {
+            std::vector<std::pair<Data, Data>> reference(2), candidate(2);
+            config.input_token_length = prefix;
+            auto forward = [&](std::vector<std::pair<Data, Data>> &kv, int past, int rows) {
+                std::vector<float> ids(rows), positions(rows), logits;
+                for (int i = 0; i < rows; ++i) { ids[i] = (past + i) * 3 % 251; positions[i] = past + i; }
+                Data input(FLOAT32, {1, rows}, ids), pos(FLOAT32, {1, rows}, positions);
+                Forward(input, Data(), pos, kv, config, LastTokensManager(), &logits);
+                return logits;
+            };
+            // The first prefill fixes the layout. Subsequent changes to graph
+            // execution must preserve it across wraps and eager fallback.
+            SetCudaGraph(initialGraph);
+            forward(reference, 0, prefix); forward(candidate, 0, prefix);
+            std::vector<std::vector<float>> expected;
+            for (int step = 0; step < (int)modes.size(); ++step)
+                expected.push_back(forward(reference, prefix + step, 1));
+            int past = prefix;
+            for (int step = 0; step < (int)modes.size(); ++step) {
+                const bool graph = modes[step];
+                SetCudaGraph(graph);
+                const int launches = verifyGraphLaunches;
+                const auto actual = forward(candidate, past, 1);
+                if (actual.size() != expected[step].size()) throw std::runtime_error("ring toggle logits missing");
+                RequireCloseLogits(actual.data(), expected[step], "ring graph toggle logits");
+                if (!graph && verifyGraphLaunches != launches)
+                    throw std::runtime_error("ring toggle launched a disabled graph");
+                graphLaunches += verifyGraphLaunches - launches;
+                ++past; ++checks;
+            }
+            for (int layer = 0; layer < 2; ++layer) for (bool value : {false, true}) {
+                const auto &a = value ? candidate[layer].second : candidate[layer].first;
+                const auto &e = value ? reference[layer].second : reference[layer].first;
+                for (int device = 0; device < ranks; ++device) {
+                    FastllmCudaSetDevice(device);
+                    const Data &actual = *a.multiDeviceDatas.at(device), &expected = *e.multiDeviceDatas.at(device);
+                    if (actual.dims != expected.dims) throw std::runtime_error("ring toggle KV shape mismatch");
+                    const int rows = actual.dims[1], columns = actual.dims[2];
+                    const bool ring = initialGraph && layer == 1;
+                    const int storage = ring ? 128 : rows;
+                    std::vector<uint16_t> av(storage * columns), ev(storage * columns);
+                    FastllmCudaCopyFromDeviceToHost(av.data(), actual.cudaData, av.size() * sizeof(uint16_t));
+                    FastllmCudaCopyFromDeviceToHost(ev.data(), expected.cudaData, ev.size() * sizeof(uint16_t));
+                    std::vector<float> af(rows * columns), ef(rows * columns);
+                    for (int row = 0; row < rows; ++row) for (int col = 0; col < columns; ++col) {
+                        int offset = (ring ? ((past - rows + row) & 127) : row) * columns + col;
+                        uint32_t x = uint32_t(av[offset]) << 16, y = uint32_t(ev[offset]) << 16;
+                        std::memcpy(&af[row * columns + col], &x, 4);
+                        std::memcpy(&ef[row * columns + col], &y, 4);
+                    }
+                    RequireCloseLogits(af.data(), ef, "ring graph toggle KV contents");
+                    ++checks;
+                }
+            }
+        }
+        if (!graphLaunches) throw std::runtime_error("ring toggle did not replay a graph");
+        std::cout << "SWA RING TOGGLE PASS initial_graph=" << initialGraph << " checks=" << checks
+                  << " relative=" << largestLogitRelative << std::endl;
+    }
+#endif
     void HistoryChecks(bool graph) {
         auto require = [](bool ok, const char *message) {
             if (!ok) throw std::runtime_error(message);
@@ -1347,6 +1420,13 @@ int main(int argc, char **argv) {
             return 0;
         }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (argc > 2 && std::string(argv[2]) == "swa_ring_toggle") {
+            const bool graph = argc <= 3 || std::string(argv[3]) != "eager";
+            SetCudaEmbedding(true); SetCudaGraph(graph);
+            Fixture fixture(ranks, true, true, true);
+            fixture.RingGraphToggleChecks(graph);
+            return 0;
+        }
         const std::string draftMode = argc > 2 ? argv[2] : "";
         if (draftMode == "draft_tp" || draftMode == "draft_mlp_tp" ||
             draftMode == "draft_mlp_tp_mqa" || draftMode == "draft_mlp_tp_offset") {

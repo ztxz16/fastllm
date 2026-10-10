@@ -194,6 +194,9 @@ namespace fastllm {
                                    LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
         std::vector<int> tpDevices;
         bool tpPrepared = false;
+        // Fixed at TP preparation so toggling CUDA Graph cannot change live KV
+        // layout. Prefill/eager and verify temporarily use chronological rows.
+        bool tpSwaRingCache = false;
         bool tpEp8Mega = false;
         std::shared_ptr<FastllmCudaMimoEp8Mega> tpEp8MegaState;
         std::vector<std::shared_ptr<TargetWorkspace>> tpVerifyWorkspaces;

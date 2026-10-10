@@ -29,6 +29,7 @@
 
 namespace {
 using BF16 = __nv_bfloat16;
+constexpr int kSwaWindow = 128;
 // Decode graphs keep launch geometry fixed while the live KV length changes.
 // Ordinary launches retain the int specialization, with no device-side branch.
 struct DecodeKeys {
@@ -245,6 +246,28 @@ constexpr int kTrimMaxRows = 128;
 // A CTA owns a disjoint 64-byte column tile and stages all retained rows
 // before writing. The barrier makes overlapping suffix moves safe while rows
 // are copied in parallel; other CTAs never read or write these columns.
+template <bool ToRing>
+__global__ void SwaCacheLayout(BF16 *key, BF16 *value, int kc, int vc, int count, int first) {
+    constexpr int columns = kTrimTileBytes / sizeof(BF16);
+    __shared__ BF16 rows[kSwaWindow * columns];
+    int keyBlocks = (kc + columns - 1) / columns;
+    bool isKey = blockIdx.x < keyBlocks;
+    BF16 *data = isKey ? key : value;
+    int stride = isKey ? kc : vc;
+    int column = (isKey ? blockIdx.x : blockIdx.x - keyBlocks) * columns;
+    for (int i = threadIdx.x; i < count * columns; i += blockDim.x) {
+        int row = i / columns, col = column + i % columns;
+        int source = ToRing ? row : ((first + row) & (kSwaWindow - 1));
+        if (col < stride) rows[i] = data[(size_t)source * stride + col];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < count * columns; i += blockDim.x) {
+        int row = i / columns, col = column + i % columns;
+        int dest = ToRing ? ((first + row) & (kSwaWindow - 1)) : row;
+        if (col < stride) data[(size_t)dest * stride + col] = rows[i];
+    }
+}
+
 template <typename T, bool Dynamic = false>
 __global__ void TrimCachePairTiled(T *key, T *value, int keyColumns,
                                  int valueColumns, int drop, int keep, const int *decodeKeys = nullptr) {
@@ -567,11 +590,11 @@ __global__ void RopeAppendCache(BF16 *q, const BF16 *k, const BF16 *v,
         const BF16 *indexKey, const float *positions, BF16 *key, BF16 *value,
         const int *length, int heads, int kvHeads, int dim, int valueDim,
         int indexDim, int rotaryDim, float theta, BF16 valueScale, int window,
-        int keyRows, int valueRows, int cachePast, const BF16 *qkv) {
+        int keyRows, int valueRows, int cachePast, const BF16 *qkv, bool ring) {
     const int totalHeads = heads + 2 * kvHeads + (indexDim != 0);
     const int token = blockIdx.x / totalHeads, head = blockIdx.x % totalHeads;
     const int past = length ? (window ? min(*length - 1, window - 1) : *length - 1) : cachePast;
-    const int row = past + token;
+    const int row = ring ? ((*length - 1) & (kSwaWindow - 1)) : past + token;
     if (past < 0 || row >= keyRows || row >= valueRows) return;
     const size_t base = (size_t)token * ((heads + kvHeads) * dim + kvHeads * valueDim);
     if (head < heads) {
@@ -1202,7 +1225,6 @@ __global__ void AttentionShort(const BF16 *q, const BF16 *k, const BF16 *v,
     }
 }
 
-constexpr int kSwaWindow = 128;
 constexpr int kSwaQkDim = 192;
 constexpr int kSwaValueDim = 128;
 constexpr int kSwaOutputTile = 32;
@@ -1212,7 +1234,7 @@ constexpr int kSwaThreads = 256;
 // output slices spread the work across SMs; cooperative V loads avoid the
 // reference kernel's dependent global load for every output/slot pair.
 // The softmax tree, BF16 rounding and slot-ordered FP32 FMAs are unchanged.
-template <int MaxKeys, typename Length = int, bool Verify = false, int Threads = kSwaThreads, int OutputTile = kSwaOutputTile>
+template <int MaxKeys, typename Length = int, bool Verify = false, int Threads = kSwaThreads, int OutputTile = kSwaOutputTile, bool Ring = false>
 __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v,
         const float *sink, BF16 *out, int heads, int kvHeads, int keyStride, Length liveKeys) {
     if constexpr (Verify) {
@@ -1229,22 +1251,26 @@ __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v
         }
     }
     int keys = Verify ? min(VerifyCount(liveKeys, blockIdx.y), MaxKeys) : (int)liveKeys;
+    int firstKey = 0;
+    if constexpr (Ring) firstKey = max(0, *liveKeys.length - kSwaWindow);
     __shared__ float scores[MaxKeys], scratch[kSwaThreads], maximum, denominator;
     __shared__ BF16 values[MaxKeys][OutputTile];
     int h = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
     int kvHead = h / (heads / kvHeads), firstDim = blockIdx.z * OutputTile;
     for (int i = t; i < keys * OutputTile; i += Threads) {
         int row = i / OutputTile, col = i % OutputTile;
-        values[row][col] = v[((size_t)row * kvHeads + kvHead) * kSwaValueDim + firstDim + col];
+        const int physical = Ring ? ((firstKey + row) & (kSwaWindow - 1)) : row;
+        values[row][col] = v[((size_t)physical * kvHeads + kvHead) * kSwaValueDim + firstDim + col];
     }
     float query[kSwaQkDim / 32];
     #pragma unroll
     for (int i = 0; i < kSwaQkDim / 32; ++i) query[i] = (float)q[(size_t)h * kSwaQkDim + lane + i * 32];
     for (int slot = warp; slot < keys; slot += Threads / 32) {
+        const int physical = Ring ? ((firstKey + slot) & (kSwaWindow - 1)) : slot;
         float dot = 0;
         #pragma unroll
         for (int i = 0; i < kSwaQkDim / 32; ++i)
-            dot += query[i] * (float)k[(size_t)slot * keyStride + kvHead * kSwaQkDim + lane + i * 32];
+            dot += query[i] * (float)k[(size_t)physical * keyStride + kvHead * kSwaQkDim + lane + i * 32];
         dot = WarpSum(dot);
         if (lane == 0) scores[slot] = RoundBF16(RoundBF16(dot) * rsqrtf((float)kSwaQkDim));
     }
@@ -1306,7 +1332,7 @@ __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v
 template <bool Verify>
 void LaunchShortAttention(const BF16 *q, const BF16 *k, const BF16 *v,
         const float *bias, BF16 *out, int rows, int heads, int kvHeads,
-        int keyStride, DecodeKeys keys, bool sliding) {
+        int keyStride, DecodeKeys keys, bool sliding, bool ring = false) {
     int threads = kSwaThreads, tile = kSwaOutputTile;
     auto kernel = sliding ? AttentionShortDecode<kSwaWindow, DecodeKeys, Verify>
                           : AttentionShortDecode<256, DecodeKeys, Verify>;
@@ -1329,6 +1355,11 @@ void LaunchShortAttention(const BF16 *q, const BF16 *k, const BF16 *v,
             kernel = sliding ? AttentionShortDecode<kSwaWindow, DecodeKeys, false, 1024>
                              : AttentionShortDecode<256, DecodeKeys, false, 1024>;
         }
+    }
+    if constexpr (!Verify) {
+        if (ring) kernel = threads == 1024
+            ? AttentionShortDecode<kSwaWindow, DecodeKeys, false, 1024, kSwaOutputTile, true>
+            : AttentionShortDecode<kSwaWindow, DecodeKeys, false, kSwaThreads, kSwaOutputTile, true>;
     }
     kernel<<<dim3(heads, rows, kSwaValueDim / tile), threads>>>(
         q, k, v, bias, out, heads, kvHeads, keyStride, keys);
@@ -1950,7 +1981,7 @@ bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, const fastllm::Data &indexKey,
         const fastllm::Data &positions, fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
-        int rotaryDim, float theta, float valueScale, int window, const fastllm::Data *packedQkv) {
+        int rotaryDim, float theta, float valueScale, int window, const fastllm::Data *packedQkv, bool ring) {
     using namespace fastllm;
     const std::vector<int> device{FastllmCudaGetDevice()};
     const bool dynamicLength = !liveKeys.dims.empty();
@@ -1972,6 +2003,7 @@ bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
         !resident(positions, FLOAT32) || positions.Count(0) < (uint64_t)q.dims[1] ||
         (dynamicLength && (!resident(liveKeys, INT32) || liveKeys.Count(0) < 1))) return false;
     const int rows = q.dims[1];
+    if (ring && (!dynamicLength || rows != 1 || window != kSwaWindow)) return false;
     if (packedQkv && (!matrix(*packedQkv, (int64_t)(heads + kvHeads) * dim + (int64_t)kvHeads * valueDim) ||
                      packedQkv->dims[1] != rows)) return false;
     int indexDim = 0;
@@ -2002,7 +2034,7 @@ bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
         (const float *)positions.cudaData, (BF16 *)key.cudaData, (BF16 *)value.cudaData,
         dynamicLength ? (const int *)liveKeys.cudaData : nullptr, heads, kvHeads, dim, valueDim, indexDim,
         rotaryDim, theta, __float2bfloat16_rn(valueScale), window, keyRows, valueRows, cachePast,
-        packedQkv ? (const BF16 *)packedQkv->cudaData : nullptr);
+        packedQkv ? (const BF16 *)packedQkv->cudaData : nullptr, ring);
     CheckLaunch();
     return true;
 }
@@ -2436,10 +2468,10 @@ __global__ void DraftInput(const float *id, const BF16 *embedding, const BF16 *m
 
 __global__ void AppendDecodeKV(BF16 *key, BF16 *value, const BF16 *newKey,
         const BF16 *newValue, const int *length, int keyColumns, int valueColumns,
-        int window) {
+        int window, bool ring) {
     int column = blockIdx.x * blockDim.x + threadIdx.x;
     int row = *length - 1;
-    if (window) row = min(row, window - 1);
+    if (window) row = ring ? (row & (kSwaWindow - 1)) : min(row, window - 1);
     if (column < keyColumns) key[(size_t)row * keyColumns + column] = newKey[column];
     else if ((column -= keyColumns) < valueColumns)
         value[(size_t)row * valueColumns + column] = newValue[column];
@@ -2533,11 +2565,33 @@ void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
 
 void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &newKey, const fastllm::Data &newValue,
-        const fastllm::Data &liveKeys, int window) {
+        const fastllm::Data &liveKeys, int window, bool ring) {
+    fastllm::AssertInFastLLM(!ring || window == kSwaWindow, "Invalid SWA ring window.");
     int kc = key.dims[2], vc = value.dims[2];
     AppendDecodeKV<<<(kc + vc + 255) / 256, 256>>>((BF16 *)key.cudaData,
         (BF16 *)value.cudaData, (const BF16 *)newKey.cudaData,
-        (const BF16 *)newValue.cudaData, (const int *)liveKeys.cudaData, kc, vc, window);
+        (const BF16 *)newValue.cudaData, (const int *)liveKeys.cudaData, kc, vc, window, ring);
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveSwaCacheLayout(fastllm::Data &key, fastllm::Data &value,
+        int past, bool toRing) {
+    using namespace fastllm;
+    const int count = std::min(past, kSwaWindow - 1);
+    const int first = (past - count) & (kSwaWindow - 1);
+    if (!count || !first) return;
+    AssertInFastLLM(key.dataType == BFLOAT16 && value.dataType == BFLOAT16 &&
+        key.dataDevice == DataDevice::CUDA && value.dataDevice == DataDevice::CUDA &&
+        key.dims.size() == 3 && value.dims.size() == 3 && key.dims[0] == 1 && value.dims[0] == 1 &&
+        key.dims[1] == count && value.dims[1] == count &&
+        key.expansionDims.size() == 3 && value.expansionDims.size() == 3 &&
+        key.expansionDims[1] >= kSwaWindow && value.expansionDims[1] >= kSwaWindow,
+        "Invalid SWA ring cache layout.");
+    constexpr int columns = kTrimTileBytes / sizeof(BF16);
+    int kc = key.dims[2], vc = value.dims[2];
+    int blocks = (kc + columns - 1) / columns + (vc + columns - 1) / columns;
+    auto kernel = toRing ? SwaCacheLayout<true> : SwaCacheLayout<false>;
+    kernel<<<blocks, 256>>>((BF16 *)key.cudaData, (BF16 *)value.cudaData, kc, vc, count, first);
     CheckLaunch();
 }
 
@@ -2710,8 +2764,10 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
         const fastllm::Data &indices, const fastllm::Data &sink,
         const fastllm::Data &liveKeys, int capacity, int heads, int kvHeads,
         int dim, int valueDim, int window,
-        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output, bool ring) {
     using namespace fastllm;
+    AssertInFastLLM(!ring || (window == kSwaWindow && dim == kSwaQkDim && valueDim == kSwaValueDim),
+                   "Unsupported SWA ring attention shape.");
     DecodeKeys keys{(const int *)liveKeys.cudaData, window};
     auto *q = (const BF16 *)query.cudaData;
     auto *k = (const BF16 *)key.cudaData;
@@ -2725,7 +2781,7 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
         // Bound the live length to the capacity captured for this graph.
         DecodeKeys shortKeys{(const int *)liveKeys.cudaData, window ? window : capacity};
         LaunchShortAttention<false>(q, k, v, bias, out, 1, heads, kvHeads,
-            key.dims[2], shortKeys, window != 0);
+            key.dims[2], shortKeys, window != 0, ring);
     } else if (window || capacity <= 256) {
         int count = window ? window : capacity;
         AttentionShort<<<heads, 256>>>(q, k, v, selected, bias, out, heads, kvHeads,

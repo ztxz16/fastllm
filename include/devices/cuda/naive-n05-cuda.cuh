@@ -90,7 +90,11 @@ bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     const fastllm::Data &positions, fastllm::Data &key, fastllm::Data &value,
     const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
     int rotaryDim, float theta, float valueScale, int window,
-    const fastllm::Data *packedQkv = nullptr);
+    const fastllm::Data *packedQkv = nullptr, bool ring = false);
+// Convert the retained suffix between chronological and 128-slot ring layout.
+// Uses shared memory only, preserves allocations and host dimensions.
+void FastllmCudaNaiveSwaCacheLayout(fastllm::Data &key, fastllm::Data &value,
+    int past, bool toRing);
 // Keep the allocation and logical row order when retaining a sliding suffix.
 void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int keep);
 // Exact descending score / ascending position order for each query row.
@@ -150,7 +154,7 @@ void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
 
 void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,
     const fastllm::Data &newKey, const fastllm::Data &newValue,
-    const fastllm::Data &liveKeys, int window);
+    const fastllm::Data &liveKeys, int window, bool ring = false);
 void FastllmCudaNaiveTrimDecodeCache(fastllm::Data &key, fastllm::Data &value,
     const fastllm::Data &liveKeys, int window);
 void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
@@ -162,7 +166,7 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
     const fastllm::Data &indices, const fastllm::Data &sink,
     const fastllm::Data &liveKeys, int capacity, int heads, int kvHeads,
     int dim, int valueDim, int window,
-    FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &output, bool ring = false);
 
 // Fixed-shape verification graphs keep one live prefix length per query.
 void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,

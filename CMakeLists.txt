@@ -1534,6 +1534,13 @@ if (UNIT_TEST)
                 fastllm_tools ${NAIVE_TP_GRAPH_CUDART} ${CMAKE_DL_LIBS})
             set_target_properties(naive_n05_verify_graph_test PROPERTIES ENABLE_EXPORTS ON LINKER_LANGUAGE CUDA)
             target_include_directories(naive_n05_verify_graph_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            foreach(NAIVE_RING_INITIAL_MODE eager graph)
+                add_test(NAME naive_n05_swa_ring_toggle_${NAIVE_RING_INITIAL_MODE}
+                    COMMAND naive_n05_verify_graph_test 8 swa_ring_toggle ${NAIVE_RING_INITIAL_MODE})
+                set_tests_properties(naive_n05_swa_ring_toggle_${NAIVE_RING_INITIAL_MODE}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                    PASS_REGULAR_EXPRESSION "SWA RING TOGGLE PASS")
+            endforeach()
             add_test(NAME naive_n05_verify_selection_graph COMMAND naive_n05_verify_graph_test 8 selection)
             set_tests_properties(naive_n05_verify_selection_graph
                 PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240

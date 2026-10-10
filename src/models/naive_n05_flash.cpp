@@ -334,7 +334,8 @@ Data NaiveN05FlashModel::RunTarget(
                     "Naive-N0.5 expects one unpadded sequence and a complete KV cache.");
     const bool tensorParallel = tpRank >= 0;
     const bool decodeWorkspace = workspace && workspace->capacity > 0;
-    const bool graphVerify = decodeWorkspace && capture && capture->verifying;
+    const bool verifying = capture && capture->verifying;
+    const bool graphVerify = decodeWorkspace && verifying;
     const int gpu = tensorParallel ? tpDevices.at(tpRank) : -1;
     Data emptyWeight;
     auto localWeight = [&](const std::string &name) -> Data & {
@@ -503,10 +504,17 @@ Data NaiveN05FlashModel::RunTarget(
         if (batchedDSA) dsaRows.reserve(batch ? batch->Size() : 1);
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &pastKey, Data &pastValue,
-                          TargetWorkspace &buf, int length, int reserveCapacity, Data &attn, HistoryChunk *historyChunk) {
+                          TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, HistoryChunk *historyChunk) {
             Data &packed = buf.packed, &indexKey = buf.indexKey, &indexQ = buf.indexQ;
             Data &indexWeights = buf.indexWeights, &indices = buf.indices;
             int localPast = pastKey.dims.empty() ? 0 : pastKey.dims[1];
+            const bool ringCache = tensorParallel && slidingLayers[layer] && tpSwaRingCache;
+            // Graph replay reads/writes the ring directly. Eager prefill/fallback
+            // uses the existing contiguous kernels and restores the ring once.
+            // Verify was linearized outside capture by ForwardTensorParallel.
+            if (ringCache && !decodeWorkspace && !verifying)
+                FastllmCudaNaiveSwaCacheLayout(pastKey, pastValue, globalPast, false);
+            const bool ringDecode = ringCache && decodeWorkspace && !graphVerify;
             // Sliding layers retain only window-1 rows between chunks. Keep their
             // reservation bounded even when the full request is very long.
             const int layerCapacity = slidingLayers[layer]
@@ -534,7 +542,7 @@ Data NaiveN05FlashModel::RunTarget(
                 FastllmCudaNaiveRopeAppendCache(q, k, v, slidingLayers[layer] ? noIndexKey : indexKey,
                     positions, pastKey, pastValue, decodeWorkspace ? buf.liveKeys : noLiveKeys, cfg.heads, cfg.kvHeads,
                     cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale,
-                    slidingLayers[layer] ? window : 0, mergedQkv ? &qkv : nullptr);
+                    slidingLayers[layer] ? window : 0, mergedQkv ? &qkv : nullptr, ringDecode);
             if (fusedCache && !decodeWorkspace) {
                 pastKey.Resize({1, localPast + length, pastKey.dims[2]});
                 pastValue.Resize({1, localPast + length, pastValue.dims[2]});
@@ -563,7 +571,7 @@ Data NaiveN05FlashModel::RunTarget(
                     if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, packed, v,
                         buf.liveKeys, slidingLayers[layer] ? window : 0);
                     else FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, packed, v,
-                        buf.liveKeys, slidingLayers[layer] ? window : 0);
+                        buf.liveKeys, slidingLayers[layer] ? window : 0, ringDecode);
                 } else {
                     AppendCache(pastKey, packed, layerCapacity);
                     AppendCache(pastValue, v, layerCapacity);
@@ -613,19 +621,21 @@ Data NaiveN05FlashModel::RunTarget(
                     slidingLayers[layer] ? window : 0, buf.decode, attn);
                 else FastllmCudaNaiveDecodeAttention(q, pastKey, pastValue, *selected, sink,
                     buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
-                    slidingLayers[layer] ? window : 0, buf.decode, attn);
-                if (slidingLayers[layer] && !graphVerify)
+                    slidingLayers[layer] ? window : 0, buf.decode, attn, ringDecode);
+                if (slidingLayers[layer] && !graphVerify && !ringDecode)
                     FastllmCudaNaiveTrimDecodeCache(pastKey, pastValue, buf.liveKeys, window);
             } else {
-                if (capture && capture->verifying && length <= 8)
+                if (verifying && length <= 8)
                     FastllmCudaNaiveVerifyAttention(q, pastKey, pastValue, *selected, sink,
                         cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                         localPast, slidingLayers[layer] ? window : 0, attn);
                 else FastllmCudaNaiveAttention(q, pastKey, pastValue, *selected, sink,
                                                cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                                                localPast, slidingLayers[layer] ? window : 0, attn);
-                if (slidingLayers[layer] && (!capture || !capture->verifying))
+                if (slidingLayers[layer] && !verifying)
                     FastllmCudaNaiveTrimCache(pastKey, pastValue, window - 1);
+                if (ringCache && !verifying)
+                    FastllmCudaNaiveSwaCacheLayout(pastKey, pastValue, globalPast + length, true);
             }
         };
         if (batch) {
@@ -659,6 +669,7 @@ Data NaiveN05FlashModel::RunTarget(
                 attend(rowNorm, rowQ, rowK, rowV, rowQkv, rowPositions,
                        *batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
                        *batch->Value(sequence, layer).multiDeviceDatas.at(gpu), part, count,
+                       batch->Key(sequence, 0).dims.empty() ? 0 : batch->Key(sequence, 0).dims[1],
                        CacheReserveCapacity(batch->configs[sequence]), rowAttention,
                        capture && !capture->batchHistory.empty() ? capture->batchHistory[sequence].get() : nullptr);
                 offset += count;
@@ -666,7 +677,7 @@ Data NaiveN05FlashModel::RunTarget(
         } else {
             auto &pastKey = tensorParallel ? *pastKeyValues[layer].first.multiDeviceDatas.at(gpu) : pastKeyValues[layer].first;
             auto &pastValue = tensorParallel ? *pastKeyValues[layer].second.multiDeviceDatas.at(gpu) : pastKeyValues[layer].second;
-            attend(normed, q, k, v, qkv, positions, pastKey, pastValue, buf, length, reserveCapacity, attn, historyChunk.get());
+            attend(normed, q, k, v, qkv, positions, pastKey, pastValue, buf, length, pastLength, reserveCapacity, attn, historyChunk.get());
         }
         if (batchedDSA)
             FastllmCudaNaiveBatchDSADecode(q, localWeight(ap + "attention_sink_bias"), dsaRows,
