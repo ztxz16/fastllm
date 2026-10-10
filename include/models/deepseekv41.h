@@ -32,12 +32,14 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace fastllm {
@@ -61,6 +63,31 @@ namespace fastllm {
         int start = 0;
         int length = 0;
         Data embeds;                      // CPU FLOAT32 [length, dim]
+    };
+
+    // 带图历史缓存里"单张图"的身份：直接用第 1 层图像缓存产出的结果数组（视觉嵌入）
+    // 自身作为内容身份。第 1 层保证"同图 → 同嵌入数组"，因此这块内容完全一致即等价于
+    // 图像内容完全一致（零哈希、零碰撞）。start/length 记录位置布局，用于整体判等。
+    struct DeepSeekV41ImageIdentity {
+        int start = 0;
+        int length = 0;
+        Data embeds;                      // CPU FLOAT32 [length, dim]，内容身份
+        bool operator==(const DeepSeekV41ImageIdentity &o) const {
+            if (start != o.start || length != o.length) {
+                return false;
+            }
+            if (embeds.dims != o.embeds.dims || embeds.dataType != o.embeds.dataType) {
+                return false;
+            }
+            const size_t n = embeds.GetBytes();
+            if (n != o.embeds.GetBytes()) {
+                return false;
+            }
+            const uint8_t *a = (const uint8_t*)embeds.cpuData;
+            const uint8_t *b = (const uint8_t*)o.embeds.cpuData;
+            return (a == nullptr && b == nullptr) ||
+                   (a != nullptr && b != nullptr && memcmp(a, b, n) == 0);
+        }
     };
 
     // ==================== DSpark 投机解码 ====================
@@ -134,6 +161,10 @@ namespace fastllm {
         int totalLen = 0;
         std::vector<DeepSeekV41LayerCache> layers;
         std::vector<int> engramHistory;
+        // 带图历史缓存：按 prompt 顺序排列的每张图身份（内容=第 1 层结果数组 + 位置）。
+        // 空 = 纯文本记录。恢复时新请求必须与该序列整体完全一致（数量/顺序/位置/内容
+        // 逐张相同）才允许继续做文本 LCP；任何一张图不同则整条不命中。
+        std::vector<DeepSeekV41ImageIdentity> imageIds;
         long long flushTime = 0;
         int recordTimes = 0;
     };
@@ -150,6 +181,49 @@ namespace fastllm {
         // 可截断性由模型侧检查
         std::vector<std::pair<std::shared_ptr<DeepSeekV41HistoryMemory>, int> > GetCandidates(
                 const std::vector<int> &inputTokens);
+    };
+
+    // ==================== 第 1 层：图像 -> 视觉嵌入缓存 ====================
+    //
+    // EncodeImage（deepseekv41_vision.cpp）是纯函数：输入 (patches 像素, nVitH, nVitW)，
+    // 输出 CPU FLOAT32 [blocks, dim] 的视觉嵌入。同一张图（相同像素 + 相同尺寸）多次出现时
+    // 不必重跑 ViT + aligner，可直接复用上次的嵌入。此层与 cache_history / 前缀缓存完全解耦。
+    //
+    // key = 原始 FLOAT32 像素字节 + 尺寸。哈希仅用于查表定位，Get 内再做逐字节比对
+    // （pixels 相等 + 尺寸相等）以完全排除哈希碰撞造成的误命中。
+    struct DeepSeekV41ImageCacheKey {
+        std::vector<uint8_t> pixels;   // 原始像素（FLOAT32 字节）
+        int nVitH = 0;
+        int nVitW = 0;
+        bool operator==(const DeepSeekV41ImageCacheKey &o) const {
+            return nVitH == o.nVitH && nVitW == o.nVitW && pixels == o.pixels;
+        }
+    };
+
+    struct DeepSeekV41ImageCacheKeyHash {
+        size_t operator()(const DeepSeekV41ImageCacheKey &k) const;
+    };
+
+    struct DeepSeekV41ImageCacheEntry {
+        Data embeds;              // CPU FLOAT32 [blocks, dim]
+        long long flushTime = 0;
+    };
+
+    struct DeepSeekV41ImageCache {
+        std::mutex locker;
+        long long flushTime = 0;
+        // 默认关闭：仅在 FASTLLM_DSV41_IMAGE_CACHE_MAX_RECORDS 显式设为 > 0 正整数时启用。
+        // <= 0 或未指定均视为关闭。此上限亦用于淘汰。
+        size_t maxEntries = 0;
+        std::unordered_map<DeepSeekV41ImageCacheKey, DeepSeekV41ImageCacheEntry,
+                           DeepSeekV41ImageCacheKeyHash> entries;
+
+        // 是否启用：读取 FASTLLM_DSV41_IMAGE_CACHE_MAX_RECORDS，> 0 才启用；并同步 maxEntries。
+        bool Enabled();
+        // 命中：把嵌入深拷贝到 outEmbeds 并返回 true；否则返回 false。关闭时恒返回 false。
+        bool Get(const void *pixels, size_t nbytes, int nVitH, int nVitW, Data &outEmbeds);
+        // 写入一条；超过上限按最久未用（flushTime）淘汰。关闭时不写入。
+        void Put(const void *pixels, size_t nbytes, int nVitH, int nVitW, Data &&embeds);
     };
 
     // 一次前向中的一个序列片段：属于哪个请求、从哪个位置开始、多少个 token、在拼接输入中的偏移
@@ -240,6 +314,11 @@ namespace fastllm {
         long long KVCacheBytesPerToken() const;
 
         bool TryRestoreHistoryCache(std::vector<int> &inputTokens, int &cacheLen) override;
+        // 多模态历史缓存：仅 FASTLLM_DSV41_IMAGE_HISTORY_CACHE=1 时启用（叠加在
+        // --cache_history 之上）。恢复前先对图像编码取得身份，整体判等后再做文本 LCP。
+        bool AllowMultimodalHistoryCache() override;
+        bool TryRestoreHistoryCacheMultimodal(std::vector<int> &inputTokens, int &cacheLen,
+                                              const std::map<std::string, std::vector<Data*> > &multimodalInput) override;
         void TryRecordHistoryCache(const std::vector<int> &allTokens) override;
         void TryRecordResponseContext(ResponseContext *context) override;
         void OnResponseContextCreated(ResponseContext *context) override;
@@ -280,10 +359,14 @@ namespace fastllm {
         bool IsVisionTensor(const std::string &name) const;
         // ViT + aligner：patches FLOAT32 [nVitH * nVitW, 3 * patch * patch]，
         // 输出 CPU FLOAT32 [ceil(nVitH / r) * ceil(nVitW / r), dim]
-        void EncodeImage(const Data &patches, int nVitH, int nVitW, Data &output, const std::string &dumpPrefix = "");
+        // cachePeekOnly == true 时只查第 1 层图像缓存：命中则填 output 并返回 true，
+        // 未命中则 output 保持为空并返回 false（绝不跑 GPU ViT，用于调度线程上的安全探测）。
+        bool EncodeImage(const Data &patches, int nVitH, int nVitW, Data &output,
+                         const std::string &dumpPrefix = "", bool cachePeekOnly = false);
         // 编码 multimodalInput 中的全部图像，得到每个 span 的嵌入（分隔符 + aligner 输出）并存入 state
-        void EncodeImageSpans(const std::map <std::string, std::vector <Data*> > &multimodalInput,
-                              DeepSeekV41RequestState &state);
+        // cachePeekOnly == true 时只读第 1 层缓存；任一图像未命中则返回 false 且不写 state.imageSpans。
+        bool EncodeImageSpans(const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                              DeepSeekV41RequestState &state, bool cachePeekOnly = false);
         // 若本块 [startPos, startPos + seqlen) 与某个图像 span 重叠：embeds = 文本嵌入并写入图像嵌入
         //（CPU FLOAT32 [1, seqlen, dim]），imageMask[i] = 1 表示图像 token；返回是否有重叠
         bool PrepareImageEmbeds(const Data &inputIds, int startPos, DeepSeekV41RequestState &state,
@@ -320,6 +403,8 @@ namespace fastllm {
         std::shared_ptr<DeepSeekV41RequestState> v41PendingRestoredState;   // TryRestoreHistoryCache 产生，
                                                                              // OnResponseContextCreated 接管
         DeepSeekV41HistoryCacheManager v41HistoryCache;
+        // 第 1 层：图像 -> 视觉嵌入缓存（跨请求 / 跨会话复用同一张图的编码结果）
+        DeepSeekV41ImageCache v41ImageCache;
 
         // -------- decode / DSpark 校验的 CUDA Graph --------
         // 每种 token 数一份图与工作区，跨请求复用；KV 更新与回滚留在图外。

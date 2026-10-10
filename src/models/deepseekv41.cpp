@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2216,6 +2217,16 @@ namespace fastllm {
             return atoi(v);
         }
 
+        // 带图历史缓存开关：仅 FASTLLM_DSV41_IMAGE_HISTORY_CACHE=1 时启用（默认关闭）。
+        // 它是叠加开关，仍要求 --cache_history（saveHistoryChat）且未禁用前缀缓存。
+        bool V41ImageHistoryCacheEnabled() {
+            static const bool enabled = []() {
+                const char *v = std::getenv("FASTLLM_DSV41_IMAGE_HISTORY_CACHE");
+                return v != nullptr && v[0] != '\0' && strcmp(v, "1") == 0;
+            }();
+            return enabled;
+        }
+
         // 快照：深拷贝到 CPU（保留 expansion 容量，restore 后可继续追加）
         void V41SnapshotTensor(Data &dst, const Data &src) {
             if (src.dims.size() == 0 || src.Count(0) == 0) {
@@ -2367,6 +2378,18 @@ namespace fastllm {
                 }
             }
         }
+        // 带图历史缓存：按 prompt 顺序深拷贝第 1 层产出的嵌入数组作为图像身份。
+        // 只有当 switch 开启且记录里确实有图像 span 时才收集，供恢复侧整体判等。
+        memory->imageIds.clear();
+        if (V41ImageHistoryCacheEnabled()) {
+            for (const auto &span : state.imageSpans) {
+                DeepSeekV41ImageIdentity id;
+                id.start = span.start;
+                id.length = span.length;
+                id.embeds.CopyFrom(span.embeds);
+                memory->imageIds.push_back(std::move(id));
+            }
+        }
         return memory;
     }
 
@@ -2430,8 +2453,11 @@ namespace fastllm {
         if (!state || state->totalLen <= 0 || context->allTokens.empty()) {
             return;
         }
-        // 图文请求的状态不进前缀缓存（原因同 TryRestoreHistoryCache）
-        if (!context->multimodalInput.empty() || V41HasImageToken(context->allTokens, image_token_id)) {
+        // 图文请求的状态：默认不进前缀缓存（占位 token 与图像内容无关）。
+        // 仅当带图历史缓存开关开启时才允许记录，并把第 1 层产出的图像身份一并快照。
+        bool hasImageToken = V41HasImageToken(context->allTokens, image_token_id);
+        if (!V41ImageHistoryCacheEnabled() &&
+            (!context->multimodalInput.empty() || hasImageToken)) {
             return;
         }
         auto memory = SnapshotState(*state, context->allTokens);
@@ -2445,8 +2471,13 @@ namespace fastllm {
         }
         v41HistoryCache.Record(memory);
         if (V41PrefixCacheDebug()) {
-            printf("[fastllm-dsv41-prefix-cache] record tokens=%d records=%d\n",
-                   memory->totalLen, (int)v41HistoryCache.memorys.size());
+            printf("[fastllm-dsv41-prefix-cache] record tokens=%d records=%d imageIds=%zu",
+                   memory->totalLen, (int)v41HistoryCache.memorys.size(), memory->imageIds.size());
+            for (size_t i = 0; i < memory->imageIds.size(); i++) {
+                const auto &id = memory->imageIds[i];
+                printf(" img%zu{start=%d,len=%d,bytes=%zu}", i, id.start, id.length, id.embeds.GetBytes());
+            }
+            printf(" stateImageSpans=%zu\n", state->imageSpans.size());
             fflush(stdout);
         }
     }
@@ -2460,7 +2491,8 @@ namespace fastllm {
         if ((int)inputTokens.size() <= minTokens) {
             return false;
         }
-        // 图文请求不复用前缀：图像占位 token 的 id 与图像内容无关，同样的文字配不同的图会误命中
+        // 图文请求：纯文本入口（multimodalInput 为空）本不应出现 image token，保守返回。
+        // 带图历史缓存走 TryRestoreHistoryCacheMultimodal，见下。
         if (V41HasImageToken(inputTokens, image_token_id)) {
             return false;
         }
@@ -2514,6 +2546,195 @@ namespace fastllm {
     void DeepSeekV41Model::TryRecordHistoryCache(const std::vector<int> &allTokens) {
         // 状态与 ResponseContext 绑定，记录在 TryRecordResponseContext 中完成
         (void)allTokens;
+    }
+
+    bool DeepSeekV41Model::AllowMultimodalHistoryCache() {
+        return V41ImageHistoryCacheEnabled();
+    }
+
+    bool DeepSeekV41Model::TryRestoreHistoryCacheMultimodal(
+            std::vector<int> &inputTokens, int &cacheLen,
+            const std::map<std::string, std::vector<Data*> > &multimodalInput) {
+        cacheLen = 0;
+        // 带图历史缓存未开启：保持原行为（多模态不恢复）。
+        if (!V41ImageHistoryCacheEnabled() || !this->saveHistoryChat || V41PrefixCacheDisabled()) {
+            return false;
+        }
+        // 防御：没有视觉塔的 checkpoint 不可能有真正的图像，不应进入多模态恢复。
+        if (!VisionEnabled()) {
+            return false;
+        }
+        const int minTokens = std::max(1, V41EnvInt("FASTLLM_DSV41_PREFIX_CACHE_MIN_TOKENS", 16));
+        if ((int)inputTokens.size() <= minTokens || V41HasImageToken(inputTokens, image_token_id) == false) {
+            return false;
+        }
+
+        // 会话语义：图像必须整体完全一致（内容=第 1 层结果数组 + 数量 + 顺序 + 位置布局）。
+        // 因此先在请求状态里把图像编码出来取得身份（第 1 层命中则几乎零成本），供判等。
+        // 该临时状态只用于构建身份与命中后的恢复，prefill 时仍会重新编码（可再次命中第 1 层）。
+        //
+        // 关键线程安全约束：本函数运行在“请求提交线程”（LaunchResponseTokens），可能与该请求/
+        // 其它请求的 prefill worker 并发下发 CUDA。因此必须用 cachePeekOnly 只读第 1 层图像缓存，
+        // 绝不在此线程触发 GPU ViT（miss 直接放弃本次多模态历史恢复，让 worker 线程去编码）。
+        DeepSeekV41RequestState scratch;
+        scratch.pendingMultimodal = &multimodalInput;
+        if (!EncodeImageSpans(multimodalInput, scratch, /*cachePeekOnly=*/true)) {
+            if (V41PrefixCacheDebug()) {
+                printf("[fastllm-dsv41-prefix-cache] multimodal skip: an image is not in layer-1 cache "
+                       "(no ViT on caller thread) input_tokens=%d\n", (int)inputTokens.size());
+                fflush(stdout);
+            }
+            return false;
+        }
+        // 新请求的身份序列（按 prompt 顺序）：由编码产出的 imageSpans 构建。
+        std::vector<DeepSeekV41ImageIdentity> newIds;
+        for (const auto &span : scratch.imageSpans) {
+            DeepSeekV41ImageIdentity id;
+            id.start = span.start;
+            id.length = span.length;
+            id.embeds.CopyFrom(span.embeds);
+            newIds.push_back(std::move(id));
+        }
+        if (newIds.empty()) {
+            return false;   // 没有图片数据，不应走多模态恢复
+        }
+
+        // 恢复点必须落在"图像 span 整体之外"的安全位置，不能从图中间断开。
+        auto lenOutsideSpans = [&](int cur) {
+            for (const auto &span : newIds) {
+                if (span.start < cur && cur < span.start + span.length) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        auto candidates = v41HistoryCache.GetCandidates(inputTokens);
+        std::shared_ptr<DeepSeekV41HistoryMemory> memory;
+        int len = 0;
+        for (auto &candidate : candidates) {
+            if (candidate.second < minTokens) {
+                if (V41PrefixCacheDebug()) {
+                    printf("[fastllm-dsv41-prefix-cache]  cand lcp=%d below minTokens=%d -> skip\n",
+                           candidate.second, minTokens);
+                    fflush(stdout);
+                }
+                break;
+            }
+            // 图像整体判等：内容 + 数量 + 顺序 + 位置布局必须逐张完全一致。
+            const auto &recIds = candidate.first->imageIds;
+            if (recIds.size() != newIds.size()) {
+                if (V41PrefixCacheDebug()) {
+                    printf("[fastllm-dsv41-prefix-cache]  cand lcp=%d recIds=%zu != newIds=%zu -> count mismatch\n",
+                           candidate.second, recIds.size(), newIds.size());
+                    fflush(stdout);
+                }
+                continue;
+            }
+            bool imagesEqual = true;
+            size_t badIdx = (size_t)-1;
+            const char *badWhy = "";
+            for (size_t i = 0; i < recIds.size() && imagesEqual; i++) {
+                const auto &r = recIds[i];
+                const auto &g = newIds[i];
+                if (r.start != g.start) {
+                    imagesEqual = false; badIdx = i; badWhy = "start";
+                } else if (r.length != g.length) {
+                    imagesEqual = false; badIdx = i; badWhy = "length";
+                } else if (r.embeds.dims != g.embeds.dims) {
+                    imagesEqual = false; badIdx = i; badWhy = "dims";
+                } else if (r.embeds.dataType != g.embeds.dataType) {
+                    imagesEqual = false; badIdx = i; badWhy = "dataType";
+                } else if (r.embeds.GetBytes() != g.embeds.GetBytes()) {
+                    imagesEqual = false; badIdx = i; badWhy = "nbytes";
+                } else {
+                    const size_t n = r.embeds.GetBytes();
+                    const uint8_t *a = (const uint8_t*)r.embeds.cpuData;
+                    const uint8_t *b = (const uint8_t*)g.embeds.cpuData;
+                    size_t firstDiff = 0;
+                    bool contentEqual = (a == nullptr && b == nullptr);
+                    if (a != nullptr && b != nullptr) {
+                        contentEqual = true;
+                        for (size_t k = 0; k < n; k++) {
+                            if (a[k] != b[k]) { firstDiff = k; contentEqual = false; break; }
+                        }
+                    }
+                    if (!contentEqual) {
+                        imagesEqual = false; badIdx = i;
+                        char buf[64];
+                        snprintf(buf, sizeof(buf), "content a=%p b=%p firstDiff=%zu", (const void*)a, (const void*)b, firstDiff);
+                        badWhy = buf;
+                    }
+                }
+            }
+            if (!imagesEqual) {
+                if (V41PrefixCacheDebug()) {
+                    printf("[fastllm-dsv41-prefix-cache]  cand lcp=%d image[%zu] mismatch (%s) "
+                           "recStart=%d newStart=%d recLen=%d newLen=%d recBytes=%zu newBytes=%zu -> reject\n",
+                           candidate.second, badIdx, badWhy,
+                           badIdx < recIds.size() ? recIds[badIdx].start : -1,
+                           badIdx < newIds.size() ? newIds[badIdx].start : -1,
+                           badIdx < recIds.size() ? recIds[badIdx].length : -1,
+                           badIdx < newIds.size() ? newIds[badIdx].length : -1,
+                           badIdx < recIds.size() ? recIds[badIdx].embeds.GetBytes() : 0,
+                           badIdx < newIds.size() ? newIds[badIdx].embeds.GetBytes() : 0);
+                    fflush(stdout);
+                }
+                continue;   // 任何一张图不同 / 顺序不同 / 位置不同 → 整条不命中
+            }
+            if (V41PrefixCacheDebug()) {
+                printf("[fastllm-dsv41-prefix-cache]  cand lcp=%d images matched (%zu), "
+                       "probing truncate from cur=%d\n",
+                       candidate.second, newIds.size(), candidate.second);
+                fflush(stdout);
+            }
+
+            // 文本 LCP：恢复点必须落在"图像 span 整体之外"的安全位置，不能从图中间断开。
+            int cur = candidate.second;
+            while (cur >= minTokens && (!CanTruncateHistory(*candidate.first, cur) || !lenOutsideSpans(cur))) {
+                if (V41PrefixCacheDebug()) {
+                    printf("[fastllm-dsv41-prefix-cache]    cur=%d canTrunc=%d outsideSpans=%d -> step down\n",
+                           cur, (int)CanTruncateHistory(*candidate.first, cur), (int)lenOutsideSpans(cur));
+                    fflush(stdout);
+                }
+                cur--;
+            }
+            if (cur >= minTokens && CanTruncateHistory(*candidate.first, cur) && lenOutsideSpans(cur)) {
+                memory = candidate.first;
+                len = cur;
+                break;
+            }
+            if (V41PrefixCacheDebug()) {
+                printf("[fastllm-dsv41-prefix-cache]  cand lcp=%d no valid restore point (cur=%d) -> reject\n",
+                       candidate.second, cur);
+                fflush(stdout);
+            }
+        }
+        if (!memory) {
+            if (V41PrefixCacheDebug()) {
+                printf("[fastllm-dsv41-prefix-cache] multimodal miss input_tokens=%d candidates=%d\n",
+                       (int)inputTokens.size(), (int)candidates.size());
+                fflush(stdout);
+            }
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> guard(v41HistoryCache.locker);
+            memory->flushTime = ++v41HistoryCache.flushTime;
+        }
+        auto state = RestoreState(*memory, len);
+        {
+            std::lock_guard<std::mutex> guard(v41StateMutex);
+            v41PendingRestoredState = state;
+        }
+        inputTokens.erase(inputTokens.begin(), inputTokens.begin() + len);
+        cacheLen = len;
+        if (V41PrefixCacheDebug()) {
+            printf("[fastllm-dsv41-prefix-cache] multimodal hit len=%d images=%zu remaining=%d\n",
+                   len, newIds.size(), (int)inputTokens.size());
+            fflush(stdout);
+        }
+        return true;
     }
 
     // ==================== 前向 ====================
