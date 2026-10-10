@@ -38,7 +38,7 @@ MegaMoE 开关或 `.so` 路径。`--ep 1` 使用原来的 MoE TP 路径；省略
 ```bash
 FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/MiMo-V2-DSA \
   --tp 8 --ep 8 --dtype fp8_e4m3 --atype bfloat16 \
-  --cuda_embedding --max_batch 1 --threads 16 --cache_history false
+  --cuda_embedding --max_batch 4 --threads 16 --cache_history false
 ```
 
 SM90 构建默认将 kernel 编入 FastLLM 主库。源码改编自 DeepGEMM，固定版本的
@@ -46,8 +46,10 @@ SM90 构建默认将 kernel 编入 FastLLM 主库。源码改编自 DeepGEMM，�
 推理均不需要安装 DeepGEMM Python 包或加载独立适配器。明确请求 `--ep 8`
 但卡数、硬件或构建不支持时会报错。EP 必须在加载模型前选定。
 
-内核沿用已有的权重布局和 14.09 MiB/卡持久工作区，支持 BS1 CUDA Graph。
-TP/EP 边界目前由每张卡提交一份复制的 hidden state；多行/verify 保留 eager。
+内核沿用已有的权重布局和 14.09 MiB/卡持久工作区，支持 1～4 路解码 CUDA Graph。
+合批 Graph 沿用每个请求独立的 KV 缓存；请求数量、顺序、缓存地址/容量或
+Attention 区间改变时重新校验并捕获，不为每个 batch size 保留一套 Graph。
+TP/EP 边界目前由每张卡提交一份复制的 hidden state；超过 4 路及 verify 保留 eager。
 W8A8 与原 W8A16 并非数值等价，可能改变 logits。详细限制和独立校验命令见
 [`USAGE.txt`](../tools/mega_moe_sm90/USAGE.txt)。
 

@@ -56,9 +56,12 @@ Scope and layout:
   are not sharded at the TP/EP boundary. The fused combine returns a result
   to each rank, avoiding a separate MoE all-reduce.
 
-  True BS1 attention decode supports CUDA Graph. The graph eligibility
-  check accepts the resident EP state instead of requiring every expert
-  TP shard on every card. Verification/multiple rows retain eager execution.
+  Attention decode supports CUDA Graph for 1..4 concurrent requests. The
+  graph eligibility check accepts the resident EP state instead of requiring
+  every expert TP shard on every card. Each request retains its own KV cache;
+  changes in request order/count, KV addresses/capacity or attention region
+  invalidate the existing batch graph rather than retaining one per shape.
+  Verification and batches larger than four retain eager execution.
   Prefill runs in chunks of at most eight rows to bound temporary storage.
   The model's TP worker serializes calls on cudaStreamPerThread.
 

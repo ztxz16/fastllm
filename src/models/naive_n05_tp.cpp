@@ -449,6 +449,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     state->cachePointers = std::move(pointers);
     state->cacheCapacities = std::move(capacities);
     state->ncclGeneration = generation;
+    if (tpEp8MegaState && (rows > 4 || verifying)) return false;
     for (int rank = 0; rank < ranks; ++rank) {
         FastllmCudaSetDevice(tpDevices[rank]);
         if (!FastllmCudaNaiveDecodeGraphSupported()) return false;
@@ -456,19 +457,10 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
         auto it = embedding.multiDeviceDatas.find(tpDevices[rank]);
         if (it == embedding.multiDeviceDatas.end() || !it->second->cudaData ||
             it->second->dataType != BFLOAT16) return false;
-        // Only resident indexed MoE paths are eligible. The BS1 FP8 backend
-        // keeps routing on device and warms its pointer tables before capture.
-        // Keep FP8 multi-row/verification on the existing eager path for now.
-        for (int layer = 0; layer < block_cnt; ++layer) {
+        // EP8 weights/descriptors were validated when its state was created.
+        // The remaining checks apply only to resident indexed TP experts.
+        for (int layer = 0; !tpEp8MegaState && layer < block_cnt; ++layer) {
             if (!moeLayers[layer]) continue;
-            if (tpEp8MegaState) {
-                // EP owns only 32 complete experts on each rank. Its weights,
-                // scales and persistent descriptors were validated when the
-                // state was created; remote expert slots are intentionally
-                // null. The TP shard checks below do not apply to this layout.
-                if (rows != 1 || verifying) return false;
-                continue;
-            }
             auto &weights = tpMoeWeights[rank][layer];
             if (weights.size() < 4 || !weights[2] || !weights[3]) return false;
             if (weights[2]->dataType == FP8_E4M3) {
