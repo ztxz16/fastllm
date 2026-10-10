@@ -83,7 +83,14 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
     float diff[PART];
 #pragma unroll
     for (int x = 0; x < PART; x++) diff[x] = 0.0f;
-    for (unsigned int s = THREAD_PER_BLOCK / 2; s >= (PART > 1 ? 32 : 1); s >>= 1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+    // Hopper single-row decode can use the same compensated warp tree as
+    // small batches; no product, reduction order or BF16 rounding changes.
+    constexpr bool warpReduce = true;
+#else
+    constexpr bool warpReduce = PART > 1;
+#endif
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s >= (warpReduce ? 32 : 1); s >>= 1) {
         if (tid < s) {
 #pragma unroll
             for (int x = 0; x < PART; x++) {
@@ -96,7 +103,7 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
         __syncthreads();
     }
 
-    if constexpr (PART > 1) {
+    if constexpr (warpReduce) {
         // Complete the same compensated binary tree within warp zero. The
         // 128/64/32 stages above preserve both each lane's sum and correction;
         // shuffles replace only the remaining shared-memory exchanges.
@@ -691,7 +698,66 @@ static void LaunchFastllmGemmBf16Bf16SmallBatch(__nv_bfloat16 *input, __nv_bfloa
     }
 }
 
+// Map the original 256 logical lanes onto one warp per output. Each lane
+// keeps eight independent partials and reproduces the original 128/64/32
+// compensated tree in registers before the warp tree. This packs four
+// outputs per CTA without changing products, sum order or weight storage.
+template <int K>
+__global__ void FastllmGemvBf16Bf16WarpRows(const __nv_bfloat16 *input,
+        const __nv_bfloat16 *weight, __nv_bfloat16 *output,
+        const __nv_bfloat16 *bias, int outputs) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 4 + threadIdx.x / 32;
+    if (row >= outputs) return;
+    float values[8] = {}, correction[8] = {};
+    #pragma unroll
+    for (int part = 0; part < 8; ++part) {
+        #pragma unroll
+        for (int column = (lane + part * 32) * 8; column < K; column += 256 * 8) {
+            union_bf16_8 a, b;
+            a.in = *reinterpret_cast<const uint4 *>(input + column);
+            b.in = *reinterpret_cast<const uint4 *>(weight + (size_t)row * K + column);
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                sum += __bfloat162float(a.out[i]) * __bfloat162float(b.out[i]);
+            values[part] += sum;
+        }
+    }
+    #pragma unroll
+    for (int stride = 4; stride > 0; stride >>= 1) {
+        #pragma unroll
+        for (int part = 0; part < stride; ++part) {
+            float other = values[part + stride] - correction[part];
+            float sum = values[part] + other;
+            correction[part] = (sum - values[part]) - other;
+            values[part] = sum;
+        }
+    }
+    float value = values[0], diff = correction[0];
+    #pragma unroll
+    for (int stride = 16; stride > 0; stride >>= 1) {
+        float peer = __shfl_down_sync(0xffffffffu, value, stride);
+        if (lane < stride) {
+            float other = peer - diff;
+            float sum = value + other;
+            diff = (sum - value) - other;
+            value = sum;
+        }
+    }
+    if (lane == 0) output[row] = __float2bfloat16_rn(
+        bias ? value + __bfloat162float(bias[row]) : value);
+}
+
 void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
+    if (n == 1 && k >= 256 && (m == 1024 || m == 2048 || m == 4096) &&
+        (reinterpret_cast<uintptr_t>(input) & 15) == 0 &&
+        (reinterpret_cast<uintptr_t>(weight) & 15) == 0 && FastllmCudaRuntimeArch() == 90) {
+        if (m == 1024) FastllmGemvBf16Bf16WarpRows<1024><<<(k + 3) / 4, 128>>>(input, weight, output, bias, k);
+        else if (m == 2048) FastllmGemvBf16Bf16WarpRows<2048><<<(k + 3) / 4, 128>>>(input, weight, output, bias, k);
+        else FastllmGemvBf16Bf16WarpRows<4096><<<(k + 3) / 4, 128>>>(input, weight, output, bias, k);
+        return;
+    }
     if (n >= 1 && n <= 8) {
         if (m > 0 && m <= 256 && m % 8 == 0) {
             // Only one warp loads data in these short, aligned projections.

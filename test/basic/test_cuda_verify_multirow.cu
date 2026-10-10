@@ -120,7 +120,7 @@ int main() {
             return 77;
         FastllmCudaSetDevice(0);
         for (int rows = 1; rows <= 8; ++rows) {
-            for (int m : {127, 128, 192, 1536, 2048, 4096, 5120})
+            for (int m : {127, 128, 192, 256, 1024, 1536, 2048, 4096, 5120})
                 for (bool bias : {false, true})
                     for (int pattern : {0, 1})
                         Linear(rows, m, 257, bias, pattern);

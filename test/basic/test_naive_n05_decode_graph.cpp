@@ -365,6 +365,13 @@ int main() {
             TestResidualNorm(ch, 8);
         for (int w : {0, 8, 128})
             TestCache(w);
+        // Dense decode uses replay-time length, including decreases and the
+        // 64-key staging tail; keep the optimized path bitwise equal to eager.
+        for (int heads : {1, 8, 16, 32})
+            for (bool sink : {false, true})
+                TestAttention(heads, 192, 128, 0, 896,
+                              {1, 63, 64, 65, 707, 748, 895, 896, 257}, true, sink);
+        TestAttention(8, 192, 128, 0, 2048, {257, 1024, 2047, 2048, 513}, true);
         for (int heads : {2, 4, 8, 16}) {
             for (bool sink : {false, true})
                 TestAttention(heads, 192, 128, 0, 256, {1, 2, 127, 128, 129, 255, 256, 3}, true,

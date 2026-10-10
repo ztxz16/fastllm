@@ -1545,6 +1545,38 @@ __global__ void AttentionValuesTiled(const float *prob, const BF16 *v,
     }
     if (t < 32 && d < dim) out[((size_t)query * heads + h) * dim + d] = __float2bfloat16(sum);
 }
+
+// Contiguous single-query KV needs neither an index tile nor a causal test
+// per FMA. Narrow output tiles give small TP head counts more independent
+// CTAs. Keep the original ascending-key FP32 accumulation and final BF16
+// rounding; all staging is shared memory, with no global partial buffer.
+template <int Columns>
+__global__ void AttentionValuesDecodeDense(const float *prob, const BF16 *value,
+        BF16 *output, const int *liveKeys, int capacity, int heads, int kvHeads) {
+    constexpr int Dim = 128, Keys = 64;
+    const int head = blockIdx.x, firstColumn = blockIdx.y * Columns;
+    const int t = threadIdx.x, count = *liveKeys;
+    const int validCount = min(count, capacity), kvHead = head / (heads / kvHeads);
+    const float *p = prob + (size_t)head * count;
+    __shared__ float probabilities[Keys];
+    __shared__ BF16 values[Keys][Columns];
+    float sum = 0.0f;
+    for (int first = 0; first < validCount; first += Keys) {
+        const int rows = min(Keys, validCount - first);
+        if (t < rows) probabilities[t] = p[first + t];
+        for (int i = t; i < rows * Columns; i += blockDim.x) {
+            const int row = i / Columns, column = i % Columns;
+            values[row][column] = value[((size_t)(first + row) * kvHeads + kvHead) * Dim + firstColumn + column];
+        }
+        __syncthreads();
+        if (t < Columns) {
+            for (int row = 0; row < rows; ++row)
+                sum += probabilities[row] * (float)values[row][t];
+        }
+        __syncthreads();
+    }
+    if (t < Columns) output[(size_t)head * Dim + firstColumn + t] = __float2bfloat16(sum);
+}
 }
 
 namespace {
@@ -2602,9 +2634,15 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
                 q, k, selected, scores, heads, kvHeads, dim, key.dims[2],
                 keys, keys, capacity - 1, 0, true);
             AttentionSoftmax<<<heads, 256>>>(scores, bias, heads, keys);
-            AttentionValuesTiled<<<dim3(heads, 1, (valueDim + 31) / 32), 256>>>(
-                scores, v, selected, out, heads, kvHeads, valueDim,
-                keys, keys, capacity - 1, 0, true);
+            if (valueDim == 128 && heads <= 16 && capacity <= 2048 &&
+                FastllmCudaRuntimeArch() == 90) {
+                AttentionValuesDecodeDense<8><<<dim3(heads, 16), 128>>>(
+                    scores, v, out, (const int *)liveKeys.cudaData, capacity, heads, kvHeads);
+            } else {
+                AttentionValuesTiled<<<dim3(heads, 1, (valueDim + 31) / 32), 256>>>(
+                    scores, v, selected, out, heads, kvHeads, valueDim,
+                    keys, keys, capacity - 1, 0, true);
+            }
         } else {
             bool split = heads >= 4 && valueDim == kDecodePVValueDim;
             bool grouped = heads % kvHeads == 0 && (heads / kvHeads) % 4 == 0;
