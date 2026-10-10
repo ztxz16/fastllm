@@ -8,6 +8,8 @@
 #include <random>
 #include "utils/persistent_worker_group.h"
 
+struct FastllmCudaMimoEp8Mega;
+
 namespace fastllm {
     class NaiveN05FlashModel : public basellm {
     protected:
@@ -51,6 +53,11 @@ namespace fastllm {
         void AddPromptCache(const std::vector<int> &tokens) override;
         int GetKVCacheRetainedTokens(int layer) const override;
         void WarmUp() override;
+        int Ep8ExpertDevice(int expert, const std::vector<int> &loadDevices) const {
+            AssertInFastLLM(tpEp8Mega && loadDevices == tpDevices && expert >= 0 && expert < 256,
+                           "MiMo EP8 expert loading must use the same ordered eight devices as TP.");
+            return tpDevices.at(expert / 32);
+        }
         std::string MakeInput(const std::string &history, int,
                               const std::string &input) override { return history + input; }
         std::string MakeHistory(const std::string &history, int,
@@ -187,6 +194,8 @@ namespace fastllm {
                                    LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
         std::vector<int> tpDevices;
         bool tpPrepared = false;
+        bool tpEp8Mega = false;
+        std::shared_ptr<FastllmCudaMimoEp8Mega> tpEp8MegaState;
         std::vector<std::shared_ptr<TargetWorkspace>> tpVerifyWorkspaces;
         std::vector<std::shared_ptr<TargetWorkspace>> tpBatchWorkspaces;
         std::vector<Data> tpDraftHeadInputs, tpDraftHeadLogits;

@@ -28,6 +28,29 @@ FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/MiMo-V2-DSA \
   --cache_history false --enable_thinking false --port 8000
 ```
 
+### EP8 与内置 MegaMoE
+
+MiMo FP8 在 8 张 H20 上可直接使用 `--tp 8 --ep 8`：Attention 保持 TP8，
+MoE 每卡放置 32 个完整专家，默认调用内置 MegaMoE W8A8，无需额外的
+MegaMoE 开关或 `.so` 路径。`--ep 1` 使用原来的 MoE TP 路径；省略 `--ep`
+时默认也是该路径（显式环境配置除外）。启动 JSON 支持 `"ep": 8`。
+
+```bash
+FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/MiMo-V2-DSA \
+  --tp 8 --ep 8 --dtype fp8_e4m3 --atype bfloat16 \
+  --cuda_embedding --max_batch 1 --threads 16 --cache_history false
+```
+
+SM90 构建默认将 kernel 编入 FastLLM 主库。源码改编自 DeepGEMM，固定版本的
+头文件、MIT 许可证和原始文件哈希位于 `third_party/deep_gemm_ep8`；构建和
+推理均不需要安装 DeepGEMM Python 包或加载独立适配器。明确请求 `--ep 8`
+但卡数、硬件或构建不支持时会报错。EP 必须在加载模型前选定。
+
+内核沿用已有的权重布局和 14.09 MiB/卡持久工作区，支持 BS1 CUDA Graph。
+TP/EP 边界目前由每张卡提交一份复制的 hidden state；多行/verify 保留 eager。
+W8A8 与原 W8A16 并非数值等价，可能改变 logits。详细限制和独立校验命令见
+[`USAGE.txt`](../tools/mega_moe_sm90/USAGE.txt)。
+
 激活和 KV cache 使用 BF16，专家保留 checkpoint 的 FP8。CUDA 13.0 的
 低比特 prefill 编译单元单独使用 C++17，规避 NVCC 与 libstdc++ 13 在
 `std::destroy_at` 上的 C++20 内部编译错误，其余 CUDA 单元保持原有标准。

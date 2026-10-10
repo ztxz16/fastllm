@@ -521,6 +521,27 @@ def _explain_thread_tp_arg(original, normalized):
     else:
         print(f"[tp] --tp {spec}: completed as CUDA device list => {normalized}")
 
+def _configure_expert_parallel(args, is_naive_n05_model):
+    # Run after saved settings/model metadata and TP device normalization,
+    # before importing/creating the native model. Explicit CLI settings beat
+    # the EP environment setting used by native callers.
+    value = getattr(args, "ep", None)
+    if value is None:
+        value = os.environ.get("FASTLLM_EP", "")
+    if value == "" or value is None:
+        return
+    if str(value) not in ("1", "8"):
+        raise ValueError("--ep supports 1 (MoE TP) or 8 (MiMo MegaMoE EP8)")
+    ep = int(value)
+    if ep == 8:
+        if not is_naive_n05_model:
+            raise ValueError("--ep 8 currently supports MiMo DSA / Naive-N0.5 FP8 models")
+        if _thread_tp_cuda_device_count(getattr(args, "tp", "")) != 8:
+            raise ValueError("--ep 8 requires --tp 8 (exactly eight TP devices)")
+        print("[ep] --ep 8: 32 complete experts/GPU; built-in MegaMoE W8A8")
+    os.environ["FASTLLM_EP"] = str(ep)
+    args.ep = ep
+
 def apply_page_size_default(args):
     if (getattr(args, "page_size", -1) <= 0 and
         (_uses_multicuda_device(getattr(args, "device", "")) or
@@ -906,6 +927,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--multimodal', action = 'store_true',
                         help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
+    parser.add_argument('--ep', type = int, choices = (1, 8), default = None,
+                        help = '专家并行数；1为原MoE TP路径（默认），8为MiMo FP8/H20的EP8，默认使用内置MegaMoE W8A8；需配合--tp 8')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = int, default = -1, help = '后面多少层moe使用moe_device，-1表示全部moe层使用moe_device')
     parser.add_argument('--moe_cuda_cache', '--moe-cuda-cache',
@@ -1595,6 +1618,7 @@ def make_normal_llm_model(args, startup_progress = None):
     if raw_tp_arg != "" and normalized_tp_arg != raw_tp_arg:
         args.tp = normalized_tp_arg
     _explain_thread_tp_arg(raw_tp_arg, normalized_tp_arg)
+    _configure_expert_parallel(args, is_naive_n05_model)
 
     if (_uses_thread_tp(getattr(args, "tp", ""))):
         tp_device = _first_thread_tp_cuda_device(args.tp)

@@ -14,8 +14,10 @@ namespace fs = std::filesystem;
 int main() {
 #ifdef _WIN32
     _putenv_s("FASTLLM_TP", "false");
+    _putenv_s("FASTLLM_EP", "1");
 #else
     setenv("FASTLLM_TP", "false", 1);
+    setenv("FASTLLM_EP", "1", 1);
 #endif
     SetDeviceMap({{"cpu", 1}});
     SetMoeDeviceMap({{"cpu", 1}});

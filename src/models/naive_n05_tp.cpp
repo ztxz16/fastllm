@@ -8,6 +8,7 @@
 #include <set>
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -133,12 +134,21 @@ void NaiveN05FlashModel::RecycleTensorParallelCache(ResponseContext *context) {
 }
 
 bool NaiveN05FlashModel::InitTensorParallel() {
+    const char *epValue = std::getenv("FASTLLM_EP");
+    const std::string ep = epValue ? epValue : "";
+    AssertInFastLLM(ep.empty() || ep == "1" || ep == "8",
+                   "MiMo --ep supports 1 (MoE TP) or 8 (MegaMoE EP8).");
+    const bool explicitEp8 = ep == "8";
+    tpEp8Mega = false;
 #ifdef USE_CUDA
     // Use the existing --tp setting; ordinary lists of layer devices retain
     // the serial path. All ranks in this implementation have equal widths.
     const char *value = std::getenv("FASTLLM_TP");
     std::string spec = value ? value : "";
-    if (spec.empty() || spec == "false" || spec == "off" || spec == "none") return false;
+    if (spec.empty() || spec == "false" || spec == "off" || spec == "none") {
+        AssertInFastLLM(!explicitEp8, "MiMo --ep 8 requires --tp 8.");
+        return false;
+    }
     tpDevices.clear();
     std::map<int, int> ratios;
     if (spec == "auto" || spec == "true" || spec == "on" ||
@@ -158,6 +168,8 @@ bool NaiveN05FlashModel::InitTensorParallel() {
         AssertInFastLLM(ratios.empty() || ratios[device] == ratios[tpDevices[0]],
                         "Naive TP requires equal device ratios.");
     }
+    AssertInFastLLM(!explicitEp8 || tpDevices.size() == 8,
+                   "MiMo --ep 8 requires exactly eight TP devices.");
     if (tpDevices.size() <= 1) { tpDevices.clear(); return false; }
     const int ranks = tpDevices.size();
     for (auto cfg : {full, sliding}) {
@@ -165,8 +177,16 @@ bool NaiveN05FlashModel::InitTensorParallel() {
             (cfg.kvHeads % ranks == 0 || ranks % cfg.kvHeads == 0),
             "Naive TP requires complete Q heads and divisible or replicated KV groups.");
     }
+    // Resolve once, before weight registration/loading.
+    tpEp8Mega = explicitEp8 && FastllmCudaMimoEp8MegaSupported(tpDevices);
+    AssertInFastLLM(!explicitEp8 || tpEp8Mega,
+        "MiMo --ep 8 requires eight H20 SM90/78-SM GPUs and a FastLLM build with built-in SM90 MegaMoE.");
+    AssertInFastLLM(!tpEp8Mega || (embed_dim == 4096 && num_experts == 256 &&
+                   num_experts_per_tok == 8 && block_cnt <= 48),
+                   "MiMo EP8 requires hidden=4096, experts=256, topk=8 and at most 48 layers.");
     return true;
 #else
+    AssertInFastLLM(!explicitEp8, "MiMo --ep 8 requires a CUDA build with SM90 MegaMoE.");
     return false;
 #endif
 }
@@ -176,6 +196,20 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
     if (tpPrepared) return;
     const int ranks = tpDevices.size();
     AssertInFastLLM(ranks > 1 && !GetKVCacheInCPU(), "Naive TP requires CUDA KV cache.");
+    if (tpEp8Mega) {
+        for (int layer = 0; layer < block_cnt; ++layer) if (moeLayers[layer]) {
+            for (int e = 0; e < num_experts; ++e) {
+                std::string base = "model.layers." + std::to_string(layer) + ".mlp.experts." + std::to_string(e) + ".";
+                for (auto part : {std::make_pair("gateup_proj.weight", std::vector<int>{4096,4096}),
+                                  std::make_pair("down_proj.weight", std::vector<int>{4096,2048})}) {
+                    auto it = weight.weight.find(base + part.first);
+                    AssertInFastLLM(it != weight.weight.end() && it->second.dataType == FP8_E4M3 &&
+                        it->second.dims == part.second && it->second.blockM == 128 && it->second.blockK == 128,
+                        "MiMo EP8 MegaMoE requires original complete FP8 expert weights.");
+                }
+            }
+        }
+    }
     AssertInFastLLM(FastllmInitNccl(tpDevices), "Naive TP: NCCL initialization failed.");
     auto rangeScheme = [&](int total, int copies = 1) {
         AssertInFastLLM(total % ranks == 0, "Naive TP: projection width must divide the rank count.");
@@ -253,8 +287,15 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
             for (int e = 0; e < num_experts; ++e) {
                 std::string base = prefix + ".mlp.experts." + std::to_string(e) + ".";
                 int mid = weight[base + "down_proj.weight"].dims[1];
-                split(base + "gateup_proj.weight", rangeScheme(mid, 2), 0);
-                split(base + "down_proj.weight", rangeScheme(mid), 1);
+                if (tpEp8Mega) {
+                    const int owner = tpDevices[e / (num_experts / ranks)];
+                    for (const char *name : {"gateup_proj.weight", "down_proj.weight"})
+                        AssertInFastLLM(PlaceMultiCudaWeightOnDevice(weight[base + name], tpDevices, owner),
+                                       "MiMo EP8 expert placement failed.");
+                } else {
+                    split(base + "gateup_proj.weight", rangeScheme(mid, 2), 0);
+                    split(base + "down_proj.weight", rangeScheme(mid), 1);
+                }
             }
         } else {
             int mid = weight[prefix + ".mlp.down_proj.weight"].dims[1];
@@ -283,12 +324,17 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
             weights = {nullptr, nullptr};
             for (int e = 0; e < num_experts; ++e) {
                 std::string base = "model.layers." + std::to_string(layer) + ".mlp.experts." + std::to_string(e) + ".";
-                for (const char *name : {"gateup_proj.weight", "down_proj.weight"})
-                    weights.push_back(weight[base + name].multiDeviceDatas.at(tpDevices[r]));
+                for (const char *name : {"gateup_proj.weight", "down_proj.weight"}) {
+                    auto &locals = weight[base + name].multiDeviceDatas;
+                    auto it = locals.find(tpDevices[r]);
+                    weights.push_back(it == locals.end() ? nullptr : it->second);
+                    AssertInFastLLM(tpEp8Mega || weights.back() != nullptr, "Missing TP expert shard.");
+                }
             }
             tpMoeBiases[r][layer].resize(weights.size(), nullptr);
         }
     }
+    if (tpEp8Mega) tpEp8MegaState = FastllmCudaCreateMimoEp8Mega(tpDevices, tpMoeWeights);
     tpPrepared = true;
 #endif
 }
@@ -415,6 +461,14 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
         // Keep FP8 multi-row/verification on the existing eager path for now.
         for (int layer = 0; layer < block_cnt; ++layer) {
             if (!moeLayers[layer]) continue;
+            if (tpEp8MegaState) {
+                // EP owns only 32 complete experts on each rank. Its weights,
+                // scales and persistent descriptors were validated when the
+                // state was created; remote expert slots are intentionally
+                // null. The TP shard checks below do not apply to this layout.
+                if (rows != 1 || verifying) return false;
+                continue;
+            }
             auto &weights = tpMoeWeights[rank][layer];
             if (weights.size() < 4 || !weights[2] || !weights[3]) return false;
             if (weights[2]->dataType == FP8_E4M3) {

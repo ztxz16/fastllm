@@ -485,6 +485,16 @@ namespace fastllm {
         Data emptyBias;
         bool explicitDeviceRatios = HasExplicitRatiosForAllDevices(devices, ratios);
         std::lock_guard<std::mutex> guard(multiCudaTpLoadSplitLock);
+        if (typeIt->second == "mimoEp8Expert") {
+            const auto *mimo = dynamic_cast<const NaiveN05FlashModel *>(model);
+            const std::string marker = ".mlp.experts.";
+            const auto start = weightName.find(marker);
+            AssertInFastLLM(mimo && start != std::string::npos && data.dataType == FP8_E4M3 &&
+                           data.blockM == 128 && data.blockK == 128,
+                           "MiMo EP8 loader requires original FP8 experts.");
+            const int expert = std::stoi(weightName.substr(start + marker.size()));
+            return PlaceMultiCudaWeightOnDevice(data, devices, mimo->Ep8ExpertDevice(expert, devices));
+        }
         // DeepSeek-V4.1 继承 DeepSeekV4Model，注意力权重的切分单位（o_groups 对齐）
         // 与 V4 完全一致，直接复用同一套 split unit。
         const DeepSeekV4Model *deepseekV4 =

@@ -1,0 +1,25 @@
+{
+  "upstream": "https://github.com/deepseek-ai/DeepGEMM",
+  "source": "Header snapshot from the installed DeepGEMM used for the validated EP8 adapter; exact upstream commit unavailable.",
+  "original_sha256": {
+    "deep_gemm/ptx/utils.cuh": "6171463c0d99abd68aca09385ef55421b82e04cefca105f57f68020485658e64",
+    "deep_gemm/ptx/ld_st.cuh": "88315beae47c80cbfee7f6d15158b71cc731f94d798f567e44f0bd19c8e7b9c9",
+    "deep_gemm/ptx/wgmma.cuh": "dad341b3c4d2a1ea3a68c6028b454c72c6ce6105e86dfcdea6aaef243164ec1b",
+    "deep_gemm/ptx/tma.cuh": "acb09376785eeb15828aa6fa45265450df6dd6cf61c5cbccb1f491c032d6366e",
+    "deep_gemm/layout/mega_moe.cuh": "5eb3239d2e790ff3dcf16a6cb9d259acc37775294cbb1117d6eaff188f3e388d",
+    "deep_gemm/layout/sym_buffer.cuh": "b157512fd62a20bf09a8fab489d4dc209751d0560c1343829e78374dbf6578cb",
+    "deep_gemm/scheduler/mega_moe.cuh": "5f0a0e891de27aa4bc41a2ad721bc019f3dca9d8f98e176e23e92555fbfabda6",
+    "deep_gemm/impls/sm90_fp8_mega_moe.cuh": "04a46bd0f4e23d44c508aa2781c509ef0eead4aeab2b162904eb01a847c83009",
+    "deep_gemm/impls/sm90_mega_moe_pre_dispatch.cuh": "9cf6b398826f8710a7d25100e946910ac016e23eecf7958756f2b30332fe34b3",
+    "deep_gemm/comm/barrier.cuh": "36eb53dda0a8451ec665d407446217b475486034afa5e7fdb17674b3e721a202",
+    "deep_gemm/mma/sm90.cuh": "548fe0c63d7f36527a3d2b87d5ee8f1330c6fb5cc98bec1bc4bd9e20735482ff",
+    "deep_gemm/common/utils.cuh": "55e53fc49a096c6b24774b0c99ce947dbb3f81a55ccf61a20581ed78a9c98702",
+    "deep_gemm/common/types.cuh": "abb8046be87db4f924f62a01478121cc213f527a81f2504825646245048cd298",
+    "deep_gemm/common/exception.cuh": "ab6b2bd75c06c054fbbe97d5897efa7909d380ad531620770c031b3debdf2123",
+    "deep_gemm/common/math.cuh": "ff8e801e1530637e2bcf9c3d4f78fe4d20b3a0b14952dcde0f4fd7644509be22",
+    "deep_gemm/common/compile.cuh": "a13373053608b286c1ac39ce771cdd6ab133f44ec4f016bd6fcbc5032132a1a9",
+    "deep_gemm/common/tma_copy.cuh": "a9e96e9aa57d2a18162f57b7ffd7646b3d29209a3a6c919fd81f7864561936cc",
+    "deep_gemm/common/cute_tie.cuh": "872af0b873a9b367c01eaf68c321ddcd9d0f3c26ce7b8d3abfc8a66d89b8ad65"
+  },
+  "adaptation_script": "tools/mega_moe_sm90/direct_weights.py"
+}

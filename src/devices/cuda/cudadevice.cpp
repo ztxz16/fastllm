@@ -51,6 +51,8 @@ bool FastllmCudaDeepGemmLinearFp8Sm90(const fastllm::Data &input, fastllm::Data 
     const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 #endif
 
+#include "moe/fastllm-mimo-ep8-mega.inc"
+
 namespace fastllm {
     // CUDA graph replay cannot reuse a MergeMOE path that picked experts on CPU.
     static thread_local bool cudaMergeMOEUsedGraphUnsafeFallback = false;

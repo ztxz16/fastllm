@@ -467,6 +467,19 @@ if (USE_CUDA)
         message(STATUS "Hopper SM90 DeepGEMM FP8 linear: ON")
     endif()
 
+    # EP8 uses an isolated, pinned DeepGEMM source subset. Compile the kernel
+    # directly into FastLLM; no Python package or external adapter is needed.
+    if (UNIX AND NOT APPLE AND NOT USE_ROCM AND NOT CUDA_NO_TENSOR_CORE AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
+        (FASTLLM_DEEPGEMM_FP8_SM90_ENABLED OR
+         ("native" IN_LIST FASTLLM_CUDA_ARCHITECTURES AND
+          "90" IN_LIST CMAKE_CUDA_ARCHITECTURES_NATIVE)))
+        set(FASTLLM_MIMO_EP8_MEGA_ENABLED ON)
+        set_property(SOURCE src/devices/cuda/cudadevice.cpp
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_MIMO_EP8_MEGA)
+        message(STATUS "MiMo H20 EP8 MegaMoE: built-in")
+    endif()
+
     # FlashInfer's DeepSeek-V4 sparse MLA decode kernel uses SM120-only
     # block-scaled FP8 MMA instructions.  Compile it as a separate fatbin so a
     # multi-architecture FastLLM build keeps the generic sparse-attention path
@@ -694,6 +707,19 @@ if (FASTLLM_CUDA_SM120_SOURCES)
     set(FASTLLM_CUDA_SM120_OBJECTS $<TARGET_OBJECTS:fastllm_cuda_sm120>)
 endif()
 
+if (FASTLLM_MIMO_EP8_MEGA_ENABLED)
+    add_library(fastllm_mimo_ep8_mega OBJECT
+        src/devices/cuda/moe/fastllm-mimo-ep8-mega.cu)
+    set_target_properties(fastllm_mimo_ep8_mega PROPERTIES
+        CUDA_ARCHITECTURES "90a" CUDA_STANDARD 20 POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_mimo_ep8_mega BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm_ep8/include"
+        "${FASTLLM_CUTLASS_DIR}/include")
+    target_compile_options(fastllm_mimo_ep8_mega PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=--register-usage-level=10>)
+    set(FASTLLM_MIMO_EP8_MEGA_OBJECTS $<TARGET_OBJECTS:fastllm_mimo_ep8_mega>)
+endif()
+
 if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
     add_library(fastllm_glm53_flashinfer_sm120 OBJECT
         src/devices/cuda/models/glm5-next-dsa-sm120.cu)
@@ -721,7 +747,7 @@ if (PY_API)
 
     include_directories(third_party/pybind11/include)
     file(GLOB FASTLLM_CXX_HEADERS include/**/*.h)
-    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
+    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_MIMO_EP8_MEGA_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
@@ -736,6 +762,9 @@ add_library(fastllm OBJECT
 # Compile the core once for executables and the Python shared library.
 set_target_properties(fastllm PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(fastllm PUBLIC ${FASTLLM_LINKED_LIBS})
+if (FASTLLM_MIMO_EP8_MEGA_ENABLED)
+    target_link_libraries(fastllm INTERFACE ${FASTLLM_MIMO_EP8_MEGA_OBJECTS})
+endif()
 if (FASTLLM_CUDA_SM90_SOURCES)
     target_link_libraries(fastllm INTERFACE $<TARGET_OBJECTS:fastllm_cuda_sm90>)
 endif()
@@ -1055,7 +1084,7 @@ if (UNIT_TEST)
     add_test(NAME mimo_dsa_config COMMAND mimo_dsa_config_test)
     set_tests_properties(mimo_dsa_config PROPERTIES
         PASS_REGULAR_EXPRESSION "PASS MiMo-V2 DSA configuration" TIMEOUT 30)
-    foreach(mimo_invalid_config no_dsa fused_qkv shared_experts)
+    foreach(mimo_invalid_config no_dsa fused_qkv shared_experts invalid_ep ep_without_tp)
         add_test(NAME mimo_dsa_reject_${mimo_invalid_config}
             COMMAND mimo_dsa_config_test ${mimo_invalid_config})
         set_tests_properties(mimo_dsa_reject_${mimo_invalid_config} PROPERTIES

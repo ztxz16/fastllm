@@ -8,10 +8,13 @@ using namespace fastllm;
 
 int main(int argc, char **argv) {
     const std::string mode = argc > 1 ? argv[1] : "valid";
+    const char *ep = mode == "invalid_ep" ? "4" : mode == "ep_without_tp" ? "8" : "1";
 #ifdef _WIN32
     _putenv_s("FASTLLM_TP", "false");
+    _putenv_s("FASTLLM_EP", ep);
 #else
     setenv("FASTLLM_TP", "false", 1);
+    setenv("FASTLLM_EP", ep, 1);
 #endif
     for (const char *alias : {"mimo_v2", "MiMoV2ForCausalLM", "MiMoV2DSAForCausalLM"}) {
         auto model = CreateEmptyLLMModel(alias);

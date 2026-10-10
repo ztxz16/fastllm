@@ -9,6 +9,7 @@
 #include "devices/cuda/naive-n05-cuda.cuh"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -95,6 +96,7 @@ NaiveN05FlashModel::~NaiveN05FlashModel() {
     tpDecodeState.reset();
     tpVerifyState.reset();
     tpBatchState.reset();
+    tpEp8MegaState.reset();
 }
 
 void NaiveN05FlashModel::InitParams() {
@@ -171,8 +173,8 @@ void NaiveN05FlashModel::InitParams() {
             weightMergeRules.push_back(WeightMergeRule({WeightMergeRuleSingle(
                 {base + "gate_proj.weight", base + "up_proj.weight"},
                 base + "gateup_proj.weight", "linearSwiglu")}));
-            AddSpecialWeight(base + "gateup_proj.weight", "linearSwiglu", layer);
-            AddSpecialWeight(base + "down_proj.weight", "linearColumn", layer);
+            AddSpecialWeight(base + "gateup_proj.weight", tpEp8Mega ? "mimoEp8Expert" : "linearSwiglu", layer);
+            AddSpecialWeight(base + "down_proj.weight", tpEp8Mega ? "mimoEp8Expert" : "linearColumn", layer);
             for (auto kind : {"gate", "up", "down"})
                 moeLinears.insert(base + kind + "_proj.weight");
         }
@@ -705,7 +707,10 @@ Data NaiveN05FlashModel::RunTarget(
             }
             normed.Reshape({length, embed_dim});
             if (!tensorParallel) ApplyMoeDeviceMapForLayer(layer);
-            if (executor.firstDevice.find("numa") == 0 &&
+            if (tensorParallel && tpEp8MegaState) {
+                FastllmCudaRunMimoEp8Mega(*tpEp8MegaState, tpRank, layer, normed,
+                                        expertIndex, expertScore, moeOutput);
+            } else if (executor.firstDevice.find("numa") == 0 &&
                 (moeWeights[layer][2]->dataType == DataType::FP8_E4M3 ||
                  moeWeights[layer][2]->dataType == DataType::FP8_E4M3_BLOCK_128)) {
                 // The released checkpoint uses W8A8 and rounds each expert
@@ -777,7 +782,7 @@ Data NaiveN05FlashModel::RunTarget(
             }
             if (!tensorParallel) ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
             moeOutput.Reshape(hidden.dims);
-            reduce(moeOutput);
+            if (!(tensorParallel && tpEp8MegaState)) reduce(moeOutput);
             addMlpResidual(moeOutput);
         }
         if (capture && capture->collectHidden &&
