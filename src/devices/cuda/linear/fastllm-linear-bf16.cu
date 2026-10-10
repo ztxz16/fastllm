@@ -702,60 +702,74 @@ static void LaunchFastllmGemmBf16Bf16SmallBatch(__nv_bfloat16 *input, __nv_bfloa
 // keeps eight independent partials and reproduces the original 128/64/32
 // compensated tree in registers before the warp tree. This packs four
 // outputs per CTA without changing products, sum order or weight storage.
-template <int K>
+// Two input rows share weight loads and keep independent reduction state.
+template <int K, int ROWS = 1>
 __global__ void FastllmGemvBf16Bf16WarpRows(const __nv_bfloat16 *input,
         const __nv_bfloat16 *weight, __nv_bfloat16 *output,
         const __nv_bfloat16 *bias, int outputs) {
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * 4 + threadIdx.x / 32;
     if (row >= outputs) return;
-    float values[8] = {}, correction[8] = {};
+    float values[ROWS][8] = {}, correction[ROWS][8] = {};
     #pragma unroll
     for (int part = 0; part < 8; ++part) {
         #pragma unroll
         for (int column = (lane + part * 32) * 8; column < K; column += 256 * 8) {
-            union_bf16_8 a, b;
-            a.in = *reinterpret_cast<const uint4 *>(input + column);
+            union_bf16_8 b;
             b.in = *reinterpret_cast<const uint4 *>(weight + (size_t)row * K + column);
-            float sum = 0.0f;
             #pragma unroll
-            for (int i = 0; i < 8; ++i)
-                sum += __bfloat162float(a.out[i]) * __bfloat162float(b.out[i]);
-            values[part] += sum;
+            for (int batch = 0; batch < ROWS; ++batch) {
+                union_bf16_8 a;
+                a.in = *reinterpret_cast<const uint4 *>(input + batch * K + column);
+                float sum = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    sum += __bfloat162float(a.out[i]) * __bfloat162float(b.out[i]);
+                values[batch][part] += sum;
+            }
         }
     }
     #pragma unroll
-    for (int stride = 4; stride > 0; stride >>= 1) {
+    for (int batch = 0; batch < ROWS; ++batch) {
         #pragma unroll
-        for (int part = 0; part < stride; ++part) {
-            float other = values[part + stride] - correction[part];
-            float sum = values[part] + other;
-            correction[part] = (sum - values[part]) - other;
-            values[part] = sum;
+        for (int stride = 4; stride > 0; stride >>= 1) {
+            #pragma unroll
+            for (int part = 0; part < stride; ++part) {
+                float other = values[batch][part + stride] - correction[batch][part];
+                float sum = values[batch][part] + other;
+                correction[batch][part] = (sum - values[batch][part]) - other;
+                values[batch][part] = sum;
+            }
         }
-    }
-    float value = values[0], diff = correction[0];
-    #pragma unroll
-    for (int stride = 16; stride > 0; stride >>= 1) {
-        float peer = __shfl_down_sync(0xffffffffu, value, stride);
-        if (lane < stride) {
-            float other = peer - diff;
-            float sum = value + other;
-            diff = (sum - value) - other;
-            value = sum;
+        float value = values[batch][0], diff = correction[batch][0];
+        #pragma unroll
+        for (int stride = 16; stride > 0; stride >>= 1) {
+            float peer = __shfl_down_sync(0xffffffffu, value, stride);
+            if (lane < stride) {
+                float other = peer - diff;
+                float sum = value + other;
+                diff = (sum - value) - other;
+                value = sum;
+            }
         }
+        if (lane == 0) output[batch * outputs + row] = __float2bfloat16_rn(
+            bias ? value + __bfloat162float(bias[row]) : value);
     }
-    if (lane == 0) output[row] = __float2bfloat16_rn(
-        bias ? value + __bfloat162float(bias[row]) : value);
 }
 
 void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
-    if (n == 1 && k >= 256 && (m == 1024 || m == 2048 || m == 4096) &&
+    if ((n == 1 || n == 2) && k >= 256 && (m == 1024 || m == 2048 || m == 4096) &&
         (reinterpret_cast<uintptr_t>(input) & 15) == 0 &&
         (reinterpret_cast<uintptr_t>(weight) & 15) == 0 && FastllmCudaRuntimeArch() == 90) {
-        if (m == 1024) FastllmGemvBf16Bf16WarpRows<1024><<<(k + 3) / 4, 128>>>(input, weight, output, bias, k);
-        else if (m == 2048) FastllmGemvBf16Bf16WarpRows<2048><<<(k + 3) / 4, 128>>>(input, weight, output, bias, k);
-        else FastllmGemvBf16Bf16WarpRows<4096><<<(k + 3) / 4, 128>>>(input, weight, output, bias, k);
+        if (n == 1) {
+            if (m == 1024) FastllmGemvBf16Bf16WarpRows<1024><<<(k + 3) / 4, 128>>>(input, weight, output, bias, k);
+            else if (m == 2048) FastllmGemvBf16Bf16WarpRows<2048><<<(k + 3) / 4, 128>>>(input, weight, output, bias, k);
+            else FastllmGemvBf16Bf16WarpRows<4096><<<(k + 3) / 4, 128>>>(input, weight, output, bias, k);
+        } else {
+            if (m == 1024) FastllmGemvBf16Bf16WarpRows<1024, 2><<<(k + 3) / 4, 128>>>(input, weight, output, bias, k);
+            else if (m == 2048) FastllmGemvBf16Bf16WarpRows<2048, 2><<<(k + 3) / 4, 128>>>(input, weight, output, bias, k);
+            else FastllmGemvBf16Bf16WarpRows<4096, 2><<<(k + 3) / 4, 128>>>(input, weight, output, bias, k);
+        }
         return;
     }
     if (n >= 1 && n <= 8) {
