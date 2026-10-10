@@ -43,6 +43,8 @@ Scope and layout:
   Linux CUDA, eight H20 GPUs, compute capability 9.0 and 78 SMs per GPU,
   with all-to-all CUDA peer access. Explicit --ep 8 on unsupported hardware
   raises an error instead of silently using TP.
+  Token sharding is implemented only in this backend; other models, GPU
+  architectures and EP sizes do not automatically use it.
   MiMo hidden=4096, intermediate=2048, experts=256, top-k=8, SwiGLU,
   FP8 E4M3 expert weights with 128x128 block scales, BF16 activations/KV.
   Attention and dense layers remain TP8. Each card owns 32 complete experts.
@@ -50,11 +52,18 @@ Scope and layout:
   create eight TP shards or retain a second packed copy of the weights.
   Select EP before model creation; changing placement requires a reload.
 
-  Each TP rank submits its replicated hidden state to MegaMoE. Logical BS1
-  therefore sends eight copies of the token into the MoE dispatch. Expert
-  weights are genuinely distributed across eight ranks, but input tokens
-  are not sharded at the TP/EP boundary. The fused combine returns a result
-  to each rank, avoiding a separate MoE all-reduce.
+  Inputs larger than 64 rows are split into eight disjoint contiguous token
+  ranges. Each token is dispatched once, and each rank processes its range
+  in local chunks of at most 64 rows. Balanced shard lengths differ by at
+  most one row; idle sources still enter each EP round with zero rows.
+  Completed shards are gathered with NVLink peer copies directly into the
+  existing output tensors. Host rendezvous and per-thread stream completion
+  ensure all sources are ready and remain alive until every reader finishes.
+  This eager-only path allocates no padded output, activation scratch,
+  collective workspace or larger EP arena; uneven tails need no padding.
+  Inputs of at most 64 rows retain the replicated, collective-free path:
+  logical BS1 decode still dispatches eight copies to avoid adding a gather
+  to its latency-sensitive graph. Router projection remains replicated.
 
   Attention decode supports CUDA Graph for 1..4 concurrent requests. The
   graph eligibility check accepts the resident EP state instead of requiring
@@ -62,7 +71,8 @@ Scope and layout:
   changes in request order/count, KV addresses/capacity or attention region
   invalidate the existing batch graph rather than retaining one per shape.
   Verification and batches larger than four retain eager execution.
-  Prefill runs in chunks of at most 64 rows to bound temporary storage.
+  Large prefill processes up to 512 distinct tokens per EP round across the
+  eight 64-row shards, using the same bounded temporary storage.
   The host queries the compiled kernel capacity; there is no runtime flag.
   The model's TP worker serializes calls on cudaStreamPerThread.
 
@@ -88,6 +98,7 @@ Memory and precision:
   logits and generated tokens can change. Selecting --ep 8 selects W8A8.
   Unit checks compare all eight ranks to installed DeepGEMM W8A8 with the
   same weights/routes and cover 1/2/8/9/16/32/63/64 rows, spread/one-owner routes,
-  a pattern filling all 6080 pool slots, repeated calls, allocation guards and
+  idle source ranks, uneven row counts, a pattern filling all 6080 pool slots,
+  untouched idle-output guards, repeated calls, allocation guards and
   CUDA Graph replay. Full-model logits need a separate regression
   check because these unit checks do not establish W8A16 equivalence.

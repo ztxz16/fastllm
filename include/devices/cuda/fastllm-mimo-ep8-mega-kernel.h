@@ -11,6 +11,8 @@ int fastllm_ep8_mega_moe_init_workspace(void *, size_t, const int *, int);
 int fastllm_ep8_mega_moe_supported();
 void *fastllm_ep8_mega_moe_create(const void *const *, const void *const *,
     const void *const *, const void *const *, void *, size_t, const void *const *, int, int);
+// Every rank must participate. Zero rows represent an idle source rank;
+// pointers must remain non-null, and no output rows are written for that rank.
 int fastllm_ep8_mega_moe_run(void *, const void *, void *, const int32_t *, const float *, int);
 void fastllm_ep8_mega_moe_destroy(void *);
 }

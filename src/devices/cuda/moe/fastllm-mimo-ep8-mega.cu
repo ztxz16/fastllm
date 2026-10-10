@@ -192,8 +192,8 @@ extern "C" void *fastllm_ep8_mega_moe_create(const void *const *gate, const void
 extern "C" int fastllm_ep8_mega_moe_run(void *handle, const void *x, void *y, const int32_t *idx,
                                     const float *scores, int rows) {
     try {
-        if (!handle || rows < 1 || rows > CAP)
-            throw std::runtime_error("MegaMoE row count exceeds its compiled capacity");
+        if (!handle || !x || !y || !idx || !scores || rows < 0 || rows > CAP)
+            throw std::runtime_error("MegaMoE requires valid pointers and 0..capacity rows");
         auto &l = *static_cast<Layer *>(handle);
         auto &s = l.scratch;
         int device;
@@ -202,6 +202,8 @@ extern "C" int fastllm_ep8_mega_moe_run(void *handle, const void *x, void *y, co
             throw std::runtime_error("MegaMoE device mismatch");
         // Persistent symmetric workspace is zeroed once before any rank runs.
         // MegaMoE cleans its control state collectively; never memset between ranks.
+        // Zero-token ranks still dispatch a fully masked table and participate
+        // in expert computation/barriers. Their combine writes no output rows.
         int padBlocks = ((CAP - rows) * K + (H / 8) - 1) / (H / 8);
         sm90_mega_moe_pre_dispatch_kernel<128, false><<<rows + padBlocks, H / 8, 0, cudaStreamPerThread>>>(
             static_cast<const __nv_bfloat16 *>(x), idx, scores,

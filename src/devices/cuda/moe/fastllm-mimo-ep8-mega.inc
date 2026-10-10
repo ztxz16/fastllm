@@ -1,19 +1,43 @@
 // MiMo EP8 keeps exactly one full copy of each expert across the eight ranks.
-// Attention remains TP8. Inputs are replicated at this boundary, so each rank
-// submits its own copy and receives its result through MegaMoE's fused combine.
-// No separate MoE all-reduce is needed. This also avoids padding attention to 8.
+// Attention remains TP8. Large inputs are partitioned into disjoint token
+// ranges before EP dispatch, then merged in-place into the existing output.
+// Small inputs keep the collective-free replicated path for decode/verification.
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega-kernel.h"
 #if defined(FASTLLM_ENABLE_MIMO_EP8_MEGA) && !defined(_WIN32) && !defined(USE_ROCM)
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 struct FastllmCudaMimoEp8Mega {
     struct Rank {
         fastllm::Data workspace{fastllm::INT8};
         std::vector<std::unique_ptr<fastllm::Data>> scales;
         std::vector<void *> layers;
+        void *output = nullptr; // Borrowed only during the prefill exchange.
         ~Rank() { for (void *layer : layers) if (layer) fastllm_ep8_mega_moe_destroy(layer); }
     };
     std::vector<int> devices;
     std::vector<std::unique_ptr<Rank>> ranks;
+    // Publish completed outputs, then keep them alive until all peers finish.
+    std::mutex outputMutex;
+    std::condition_variable outputReady;
+    int arrivals = 0;
+    uint64_t generation = 0;
+    bool exchangeFailed = false;
+    void WaitForOutputs() {
+        std::unique_lock<std::mutex> lock(outputMutex);
+        const uint64_t current = generation;
+        if (++arrivals == (int)devices.size()) {
+            arrivals = 0;
+            ++generation;
+            outputReady.notify_all();
+        } else if (!outputReady.wait_for(lock, std::chrono::seconds(60),
+                [&] { return generation != current || exchangeFailed; })) {
+            exchangeFailed = true;
+            outputReady.notify_all();
+        }
+        if (exchangeFailed) throw std::runtime_error("MiMo EP8 output exchange timed out.");
+    }
 };
 bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &devices) {
     if (devices.size() != 8) return false;
@@ -82,7 +106,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
                 rank.workspace.cudaData, bytes, peers.data(), r, l);
             AssertInFastLLM(rank.layers[l] != nullptr, fastllm_ep8_mega_moe_error());
         }
-        printf("MIMO_EP8_MEGA gpu=%d experts=32 inter=2048 W8A8 workspace=%zu max_rows=%d replicated_input Graph-ready backend=builtin\n",
+        printf("MIMO_EP8_MEGA gpu=%d experts=32 inter=2048 W8A8 workspace=%zu max_rows=%d prefill=token_sharded small_rows=replicated Graph-ready backend=builtin\n",
                devices[r], bytes, fastllm_ep8_mega_moe_max_rows());
     }
     FastllmCudaSetDevice(previous);
@@ -101,17 +125,49 @@ void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     output.Allocate(false);
     void *handle = state.ranks.at(rank)->layers.at(layer);
     AssertInFastLLM(handle != nullptr, "Missing MiMo EP8 layer handle.");
-    // Reuse the same bounded workspace across chunks and all MoE layers.
-    // Obtain the limit from the kernel so host chunking cannot drift from it.
     const int capacity = fastllm_ep8_mega_moe_max_rows();
-    for (int start = 0; start < input.dims[0]; start += capacity) {
-        const int rows = std::min(capacity, input.dims[0] - start);
+    const int total = input.dims[0];
+    auto run = [&](int start, int rows) {
         if (!fastllm_ep8_mega_moe_run(handle, (const uint16_t *)input.cudaData + (size_t)start * 4096,
             (uint16_t *)output.cudaData + (size_t)start * 4096,
             (const int32_t *)index.cudaData + start * 8,
             (const float *)score.cudaData + start * 8, rows))
             throw std::runtime_error(std::string("MiMo EP8 launch failed: ") + fastllm_ep8_mega_moe_error());
+    };
+    if (total <= capacity) {
+        run(0, total);
+        return;
     }
+
+    // Each token is dispatched by exactly one source rank. Balance contiguous
+    // shards without padding; every rank executes the same number of rounds.
+    // Reuse the existing 64-row arena: up to 8*64 distinct tokens per round,
+    // without padding output storage or allocating another activation buffer.
+    const int ranks = (int)state.devices.size();
+    const int begin = (int)((int64_t)total * rank / ranks);
+    const int shard = (int)((int64_t)total * (rank + 1) / ranks) - begin;
+    const int rounds = (int)(((int64_t)total + ranks * capacity - 1) / (ranks * capacity));
+    for (int round = 0; round < rounds; ++round) {
+        const int start = round * capacity;
+        run(begin + std::min(start, shard), std::max(0, std::min(capacity, shard - start)));
+    }
+    // Publish completed shards, then gather directly into the existing output.
+    // All sources stay alive until every peer finishes reading them. This
+    // eager-only path needs neither zero padding nor another collective arena.
+    state.ranks[rank]->output = output.cudaData;
+    FastllmCudaSyncCurrentThreadStream();
+    state.WaitForOutputs();
+    for (int step = 1; step < ranks; ++step) {
+        const int peer = (rank + step) % ranks;
+        const size_t first = (int64_t)total * peer / ranks;
+        const size_t rows = (int64_t)total * (peer + 1) / ranks - first;
+        AssertInFastLLM(FastllmCudaMemcpyPeerAsyncCurrentThread(state.devices[rank],
+            (uint16_t *)output.cudaData + first * 4096, state.devices[peer],
+            (const uint16_t *)state.ranks[peer]->output + first * 4096,
+            rows * 4096 * sizeof(uint16_t)), "MiMo EP8 peer output copy failed.");
+    }
+    FastllmCudaSyncCurrentThreadStream();
+    state.WaitForOutputs();
 }
 #else
 struct FastllmCudaMimoEp8Mega {};

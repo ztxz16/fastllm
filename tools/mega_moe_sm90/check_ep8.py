@@ -64,9 +64,13 @@ for r, v in enumerate(ranks):
         *arrays, v["scratch"].data_ptr(), size, peers, r, 0
     )
     assert v["handle"], lib.fastllm_ep8_mega_moe_error()
-    for invalid_rows in (0, 65):
+    # Idle ranks still need valid pointers. Test row bounds separately so
+    # null-pointer rejection cannot hide a missing capacity check.
+    assert not lib.fastllm_ep8_mega_moe_run(v["handle"], None, None, None, None, 0)
+    scratch = v["scratch"].data_ptr()
+    for invalid_rows in (-1, 65):
         assert not lib.fastllm_ep8_mega_moe_run(
-            v["handle"], None, None, None, None, invalid_rows
+            v["handle"], scratch, scratch, scratch, scratch, invalid_rows
         )
 torch.cuda.set_device(0)
 refbytes, slicer = dg._C.get_symm_buffer_size_for_sm90_mega_moe(
@@ -96,7 +100,12 @@ for N, scenario in [
     (63, "different_ranks"),
     (64, "different_ranks"),
     (64, "one_owner"),
+    # A small call after full-capacity calls checks reused control state.
     (1, "replicated_spread"),
+    (1, "idle_ranks"),
+    (7, "idle_ranks"),
+    (64, "idle_ranks"),
+    (64, "uneven_rows"),
     (64, "pool_bound"),
 ]:
     if scenario == "pool_bound":
@@ -128,7 +137,9 @@ for N, scenario in [
         if scenario == "replicated_spread" and r:
             x = ranks[0]["x"].to(r)
             score = ranks[0]["score"].to(r)
-        v.update(x=x, idx=idx, score=score, y=torch.empty_like(x))
+        active = (N if r == 0 else 0) if scenario == "idle_ranks" else (
+            [64, 63, 1, 0, 7, 0, 31, 2][r] if scenario == "uneven_rows" else N)
+        v.update(x=x, idx=idx, score=score, y=torch.full_like(x, 777), active=active)
     for r in range(R):
         torch.cuda.synchronize(r)
     # No allocations or synchronization between launches: every peer must enter.
@@ -141,14 +152,14 @@ for N, scenario in [
                 v["y"].data_ptr(),
                 v["idx"].data_ptr(),
                 v["score"].data_ptr(),
-                N,
+                v["active"],
             ), lib.fastllm_ep8_mega_moe_error()
         for r in range(R):
             torch.cuda.synchronize(r)
     torch.cuda.set_device(0)
-    x = torch.cat([v["x"].to(0) for v in ranks])
-    idx = torch.cat([v["idx"].to(0) for v in ranks])
-    score = torch.cat([v["score"].to(0) for v in ranks])
+    x = torch.cat([v["x"][:v["active"]].to(0) for v in ranks])
+    idx = torch.cat([v["idx"][:v["active"]].to(0) for v in ranks])
+    score = torch.cat([v["score"][:v["active"]].to(0) for v in ranks])
     ref = torch.empty_like(x)
     dg.mega_moe_pre_dispatch_sm90(
         x,
@@ -158,18 +169,20 @@ for N, scenario in [
         views[1],
         views[2],
         views[3],
-        N * R,
+        x.shape[0],
         128,  # FP8 quantization group size, independent of buffer capacity
     )
     dg.fp8_mega_moe(ref, l1, l2, sym, recipe=(128, 128, 128))
     torch.cuda.synchronize()
-    y = torch.cat([v["y"].to(0) for v in ranks])
+    y = torch.cat([v["y"][:v["active"]].to(0) for v in ranks])
+    assert all(bool((v["y"][v["active"]:] == 777).all()) for v in ranks), "Idle output overwritten"
     assert all(bool((v["guard"] == 165).all()) for v in ranks), "Workspace overflow"
     delta = y.float() - ref.float()
     nrmse = float(delta.square().mean().sqrt() / ref.float().square().mean().sqrt())
     assert torch.isfinite(y).all() and nrmse < 0.003, (N, scenario, nrmse)
     item = dict(
         rows_per_rank=N,
+        active_rows_per_rank=[v["active"] for v in ranks],
         scenario=scenario,
         nrmse=nrmse,
         max_abs=float(delta.abs().max()),
