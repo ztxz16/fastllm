@@ -32,6 +32,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <memory>
@@ -62,6 +63,31 @@ namespace fastllm {
         int start = 0;
         int length = 0;
         Data embeds;                      // CPU FLOAT32 [length, dim]
+    };
+
+    // 带图历史缓存里"单张图"的身份：直接用第 1 层图像缓存产出的结果数组（视觉嵌入）
+    // 自身作为内容身份。第 1 层保证"同图 → 同嵌入数组"，因此这块内容完全一致即等价于
+    // 图像内容完全一致（零哈希、零碰撞）。start/length 记录位置布局，用于整体判等。
+    struct DeepSeekV41ImageIdentity {
+        int start = 0;
+        int length = 0;
+        Data embeds;                      // CPU FLOAT32 [length, dim]，内容身份
+        bool operator==(const DeepSeekV41ImageIdentity &o) const {
+            if (start != o.start || length != o.length) {
+                return false;
+            }
+            if (embeds.dims != o.embeds.dims || embeds.dataType != o.embeds.dataType) {
+                return false;
+            }
+            const size_t n = embeds.GetBytes();
+            if (n != o.embeds.GetBytes()) {
+                return false;
+            }
+            const uint8_t *a = (const uint8_t*)embeds.cpuData;
+            const uint8_t *b = (const uint8_t*)o.embeds.cpuData;
+            return (a == nullptr && b == nullptr) ||
+                   (a != nullptr && b != nullptr && memcmp(a, b, n) == 0);
+        }
     };
 
     // ==================== DSpark 投机解码 ====================
@@ -135,6 +161,10 @@ namespace fastllm {
         int totalLen = 0;
         std::vector<DeepSeekV41LayerCache> layers;
         std::vector<int> engramHistory;
+        // 带图历史缓存：按 prompt 顺序排列的每张图身份（内容=第 1 层结果数组 + 位置）。
+        // 空 = 纯文本记录。恢复时新请求必须与该序列整体完全一致（数量/顺序/位置/内容
+        // 逐张相同）才允许继续做文本 LCP；任何一张图不同则整条不命中。
+        std::vector<DeepSeekV41ImageIdentity> imageIds;
         long long flushTime = 0;
         int recordTimes = 0;
     };
@@ -284,6 +314,11 @@ namespace fastllm {
         long long KVCacheBytesPerToken() const;
 
         bool TryRestoreHistoryCache(std::vector<int> &inputTokens, int &cacheLen) override;
+        // 多模态历史缓存：仅 FASTLLM_DSV41_IMAGE_HISTORY_CACHE=1 时启用（叠加在
+        // --cache_history 之上）。恢复前先对图像编码取得身份，整体判等后再做文本 LCP。
+        bool AllowMultimodalHistoryCache() override;
+        bool TryRestoreHistoryCacheMultimodal(std::vector<int> &inputTokens, int &cacheLen,
+                                              const std::map<std::string, std::vector<Data*> > &multimodalInput) override;
         void TryRecordHistoryCache(const std::vector<int> &allTokens) override;
         void TryRecordResponseContext(ResponseContext *context) override;
         void OnResponseContextCreated(ResponseContext *context) override;
@@ -324,10 +359,14 @@ namespace fastllm {
         bool IsVisionTensor(const std::string &name) const;
         // ViT + aligner：patches FLOAT32 [nVitH * nVitW, 3 * patch * patch]，
         // 输出 CPU FLOAT32 [ceil(nVitH / r) * ceil(nVitW / r), dim]
-        void EncodeImage(const Data &patches, int nVitH, int nVitW, Data &output, const std::string &dumpPrefix = "");
+        // cachePeekOnly == true 时只查第 1 层图像缓存：命中则填 output 并返回 true，
+        // 未命中则 output 保持为空并返回 false（绝不跑 GPU ViT，用于调度线程上的安全探测）。
+        bool EncodeImage(const Data &patches, int nVitH, int nVitW, Data &output,
+                         const std::string &dumpPrefix = "", bool cachePeekOnly = false);
         // 编码 multimodalInput 中的全部图像，得到每个 span 的嵌入（分隔符 + aligner 输出）并存入 state
-        void EncodeImageSpans(const std::map <std::string, std::vector <Data*> > &multimodalInput,
-                              DeepSeekV41RequestState &state);
+        // cachePeekOnly == true 时只读第 1 层缓存；任一图像未命中则返回 false 且不写 state.imageSpans。
+        bool EncodeImageSpans(const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                              DeepSeekV41RequestState &state, bool cachePeekOnly = false);
         // 若本块 [startPos, startPos + seqlen) 与某个图像 span 重叠：embeds = 文本嵌入并写入图像嵌入
         //（CPU FLOAT32 [1, seqlen, dim]），imageMask[i] = 1 表示图像 token；返回是否有重叠
         bool PrepareImageEmbeds(const Data &inputIds, int startPos, DeepSeekV41RequestState &state,

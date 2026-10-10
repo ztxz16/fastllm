@@ -291,8 +291,8 @@ namespace fastllm {
                name == "image_start" || name == "image_end" || name == "image_newline";
     }
 
-    void DeepSeekV41Model::EncodeImage(const Data &patches, int nVitH, int nVitW, Data &output,
-                                       const std::string &dumpPrefix) {
+    bool DeepSeekV41Model::EncodeImage(const Data &patches, int nVitH, int nVitW, Data &output,
+                                       const std::string &dumpPrefix, bool cachePeekOnly) {
         AssertInFastLLM(VisionEnabled(), "DeepSeekV41: this checkpoint has no vision tower (vision_n_layers == 0).");
         const int n = nVitH * nVitW;
         const int dim = vision_dim;
@@ -316,11 +316,12 @@ namespace fastllm {
         // 跳过整个 ViT + aligner 前向。仅当像素已落到 CPU 且为 FLOAT32 时才可作缓存 key。
         const bool cacheablePixel = (patchInput.cpuData != nullptr && patchInput.dataType == DataType::FLOAT32);
         VisionCacheLog("EncodeImage() n=%d dims=[%d,%d] patches_dtype=%d cpuData=0x%p dataType=%d "
-                       "cacheablePixel=%d enabled=%d entries=%u",
+                       "cacheablePixel=%d enabled=%d entries=%u cachePeek=%d",
                        n, (int)patches.dims.size() >= 2 ? (int)patches.dims[0] : -1,
                        (int)patches.dims.size() >= 2 ? (int)patches.dims[1] : -1,
                        (int)patches.dataType, (void*)patchInput.cpuData, (int)patchInput.dataType,
-                       (int)cacheablePixel, (int)v41ImageCache.Enabled(), (unsigned)v41ImageCache.entries.size());
+                       (int)cacheablePixel, (int)v41ImageCache.Enabled(), (unsigned)v41ImageCache.entries.size(),
+                       (int)cachePeekOnly);
         if (cacheablePixel &&
             v41ImageCache.Get(patchInput.cpuData, patchInput.GetBytes(), nVitH, nVitW, output)) {
             if (!dumpPrefix.empty()) {
@@ -330,7 +331,14 @@ namespace fastllm {
             }
             VisionCacheLog("EncodeImage() CACHE-HIT, skip ViT, records=%u",
                            (unsigned)v41ImageCache.entries.size());
-            return;
+            return true;
+        }
+        // cachePeekOnly：仅允许“第 1 层命中”这一条路，绝不在此线程跑 GPU ViT（调度线程安全）。
+        if (cachePeekOnly) {
+            VisionCacheLog("EncodeImage() cache peek MISS, bail (no ViT on caller thread), records=%u",
+                           (unsigned)v41ImageCache.entries.size());
+            output = Data();
+            return false;
         }
         VisionCacheLog("EncodeImage() cache miss, running ViT, records=%u",
                        (unsigned)v41ImageCache.entries.size());
@@ -459,10 +467,11 @@ namespace fastllm {
             VisionCacheLog("EncodeImage() finished ViT, SKIP Put (cacheablePixel=%d enabled=%d)",
                            (int)cacheablePixel, (int)v41ImageCache.Enabled());
         }
+        return true;
     }
 
-    void DeepSeekV41Model::EncodeImageSpans(const std::map <std::string, std::vector <Data*> > &multimodalInput,
-                                            DeepSeekV41RequestState &state) {
+    bool DeepSeekV41Model::EncodeImageSpans(const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                                            DeepSeekV41RequestState &state, bool cachePeekOnly) {
         AssertInFastLLM(VisionEnabled(), "DeepSeekV41: this checkpoint has no vision tower (vision_n_layers == 0).");
         const int dim = embed_dim;
         const int r = vision_downsample_ratio;
@@ -472,7 +481,7 @@ namespace fastllm {
         auto gridIt = multimodalInput.find("image_grid");
         if (pixelIt == multimodalInput.end() || gridIt == multimodalInput.end() || gridIt->second.empty() ||
             gridIt->second[0] == nullptr) {
-            return;   // 没有图像数据（例如其它模型格式的 payload），按纯文本处理
+            return true;   // 没有图像数据（例如其它模型格式的 payload），按纯文本处理
         }
         std::vector<int> grid = VisionReadInts(*gridIt->second[0]);
         const int numImages = (int)grid.size() / 3;
@@ -494,7 +503,13 @@ namespace fastllm {
             AssertInFastLLM(start >= 0 && nVitH > 0 && nVitW > 0,
                             "DeepSeekV41 multimodal: invalid image_grid entry for image " + std::to_string(i) + ".");
             Data feats;
-            EncodeImage(*pixelIt->second[i], nVitH, nVitW, feats, dump ? "fl_image" + std::to_string(i) : "");
+            if (!EncodeImage(*pixelIt->second[i], nVitH, nVitW, feats,
+                             dump ? "fl_image" + std::to_string(i) : "", cachePeekOnly)) {
+                // cachePeekOnly 下任一图像未命中：整条不编码（调度线程不得跑 GPU ViT），返回 false。
+                state.imageSpans.clear();
+                state.imagesEncoded = false;
+                return false;
+            }
             if (dump) {
                 VisionDump(feats, "fl_image" + std::to_string(i) + "_embeds");
             }
@@ -519,6 +534,7 @@ namespace fastllm {
             AssertInFastLLM(pos == span, "DeepSeekV41 multimodal: internal span layout error.");
             state.imageSpans.push_back(std::move(spanData));
         }
+        return true;
     }
 
     bool DeepSeekV41Model::PrepareImageEmbeds(const Data &inputIds, int startPos, DeepSeekV41RequestState &state,

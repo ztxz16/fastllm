@@ -460,6 +460,20 @@ namespace fastllm {
         // 模型可覆盖这三个 hook 来管理不兼容通用 pair<Data, Data> 的历史缓存。
         virtual bool TryRestoreHistoryCache(std::vector<int> &inputTokens, int &cacheLen) { return false; }
 
+        // 多模态历史缓存开关：默认禁止。需要多模态前缀恢复的模型（如 DeepSeek-V4.1
+        // 带图历史缓存）覆盖并返回 true，base 管道才会把多模态请求交给下面的 hook。
+        virtual bool AllowMultimodalHistoryCache() { return false; }
+
+        // 多模态请求的前缀恢复入口。默认委托给纯文本版（返回 false 即可，因为
+        // AllowMultimodalHistoryCache 默认关）。实现方必须在恢复前完成图像编码，
+        // 用上模型侧的内容身份做图像整体判等，避免占位 token 误命中。
+        virtual bool TryRestoreHistoryCacheMultimodal(
+                std::vector<int> &inputTokens, int &cacheLen,
+                const std::map<std::string, std::vector<Data*> > &multimodalInput) {
+            (void)multimodalInput;
+            return this->TryRestoreHistoryCache(inputTokens, cacheLen);
+        }
+
         virtual void TryRecordHistoryCache(const std::vector<int> &allTokens) {}
 
         virtual void TryRecordResponseContext(ResponseContext *context);
