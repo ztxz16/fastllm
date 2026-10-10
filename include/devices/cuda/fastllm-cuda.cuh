@@ -1877,6 +1877,13 @@ bool FastllmCudaMoeGlm5GGUFCacheCompute(
         const fastllm::Data &input, fastllm::Data &activation,
         const FastllmCudaMoeGGUFCacheView &view,
         const float *scores, int topk, float swigluLimit, float *perExpert);
+// Two-rank row TP: each record contains half the gate/up rows
+// and half the down output rows. Gate activations must be all-gathered before
+// the down stage; outputs retain full strides and original BF16 boundaries.
+bool FastllmCudaMoeGlm5GGUFTpStage(bool down, int rank,
+        const fastllm::Data &input, fastllm::Data &activation,
+        const FastllmCudaMoeGGUFCacheView &view, const float *scores,
+        int topk, float swigluLimit, float *perExpert);
 // GPU-only GLM GGUF experts; shares the scored cache arithmetic and keeps
 // routing on CUDA. Long prefills are tiled with bounded scratch storage.
 bool FastllmCudaMergeMOEGlm5GGUFResident(

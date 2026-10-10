@@ -2406,9 +2406,9 @@ namespace fastllm {
         // Resident TP ranks compute their own intermediate-channel slice.
         // The caller's FFN AllReduce combines routed and shared partials.
         if (threadTpRank >= 0 && !shardedRouted) {
-            const bool localNumasDecode = sequence == 1 && routedOnNumas;
-            if (!localNumasDecode || threadTpRank != 0) runShared();
-            if (localNumasDecode) {
+            const bool localNumasBatch = sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH && routedOnNumas;
+            if (!localNumasBatch || threadTpRank != 0) runShared();
+            if (localNumasBatch) {
                 // Publish peer shared-expert completion without draining its
                 // GPU on the host. The owner borrows a separate per-thread
                 // stream; the following AllReduce waits for the owner on CPU.
@@ -2699,6 +2699,18 @@ namespace fastllm {
                 CanUseNumasMoeExactSmallBatch(rows)) {
                 continue;
             }
+#ifndef USE_ROCM
+            if (moeDevice.rfind("numa", 0) == 0 && moeAtype == DataType::BFLOAT16 &&
+                layer < (int)expertWeights.size()) {
+                const auto &experts = expertWeights[layer];
+                // The prepared GGUF hybrid path preserves decode arithmetic
+                // on AVX2, including the multi-row TP expert-cache adapter.
+                if (CanUseNumasMoeExactGgufBatch(rows, experts.data(), (int)experts.size()) &&
+                    FastllmCudaCanRunMoeHybrid(const_cast<Data **>(experts.data()), (int)experts.size())) {
+                    continue;
+                }
+            }
+#endif
 #endif
             return false;
         }
@@ -3266,6 +3278,11 @@ namespace fastllm {
         const bool useBatchedVerifier =
             CanUseExactBatchedMtpVerification(
                 (int)candidateTokens.size());
+        if (verbose && state.verifySteps == 0) {
+            std::cout << "[GLM-5.3 MTP verifier] mode="
+                      << (useBatchedVerifier ? "batched" : "sequential")
+                      << " rows=" << candidateTokens.size() << "\n";
+        }
 
 #ifdef USE_CUDA
         // Verification is logically a sequence of decode rows. Force every

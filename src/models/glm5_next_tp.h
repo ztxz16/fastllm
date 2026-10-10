@@ -38,6 +38,9 @@ namespace fastllm {
         std::vector<void *> moeReady, callerReady;
         std::vector<bool> shardedMoeLayers;
         int loadingLayer = -1;
+#ifdef USE_CUDA
+        std::vector<std::vector<Data>> reductionBuffers;
+#endif
 
         ~ThreadTpState() {
             workers.Stop();
@@ -293,6 +296,14 @@ namespace fastllm {
         }
 #endif
         AssertInFastLLM(FastllmInitNccl(devices), "GLM TP NCCL initialization failed.");
+        tp.reductionBuffers.resize(count);
+        for (auto &buffers : tp.reductionBuffers) buffers.resize(8);
+#ifdef USE_NUMAS
+        for (int layer = 0; layer < block_cnt; ++layer) if (!denseMlpLayers[layer]) {
+            auto &experts = expertWeights[layer];
+            FastllmCudaPrepareMoeTensorParallel(experts.data(), experts.size(), devices);
+        }
+#endif
         for (int d : devices) {
             FastllmCudaSetDevice(d);
             tp.moeReady.push_back(d == devices[0] ? nullptr : FastllmCudaEventCreate());
@@ -427,6 +438,20 @@ namespace fastllm {
             (rows > 1 && rows < (uint64_t)FastllmCudaGetLinearExactBatchThreshold());
         const int hostSpinUs = decodeOrVerify &&
             threadTpOwner->workerBoundToSpareCores[threadTpRank] ? 1000 : 0;
+        // Reuse the existing correctness-tested, topology-tuned peer path.
+        // Unsupported messages retain NCCL and its submission rendezvous.
+        if (decodeOrVerify && rows <= 8) {
+            // Keep a stable pointer tuple for each verification width. Registering transient
+            // layer outputs drains both devices and pins allocator blocks.
+            auto &buffer = threadTpOwner->reductionBuffers[threadTpRank][rows - 1];
+            buffer.CopyFrom(data);
+            if (FastllmCudaCustomAllReduceWithSpin(buffer.cudaData, buffer.cudaData, buffer.Count(0), buffer.dataType,
+                    threadTpOwner->devices[threadTpRank], hostSpinUs)) {
+                AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                    data.cudaData, buffer.cudaData, data.GetBytes()), "GLM TP reduction copy failed.");
+                return;
+            }
+        }
         FastllmNcclAllReduceNoCustomWithSpin(data.cudaData, data.cudaData, data.Count(0), data.dataType,
             threadTpOwner->devices[threadTpRank], hostSpinUs);
 #endif
@@ -471,7 +496,7 @@ namespace fastllm {
         auto &replays = tp.replays[&pastKeyValues];
         if (kdaReplay) {
             replays.resize(tp.devices.size());
-            for (auto &replay : replays) { replay.clear(); replay.resize(block_cnt); }
+            for (auto &replay : replays) replay.resize(block_cnt);
         }
         const int exactThreshold = FastllmCudaGetLinearExactBatchThreshold();
         // MTP produces input slices and restores recurrent state on the caller's

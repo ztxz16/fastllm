@@ -20129,7 +20129,15 @@ int FastllmCudaGetHostNumaNode(int device) {
         domain, bus, slot, function);
     int node = -1;
     std::ifstream file(path);
-    if (file >> node) return node;
+    if ((file >> node) && node >= 0) return node;
+    // Firmware can omit PCI NUMA affinity even on a single-node machine.
+    // Only a single online node gives an unambiguous fallback.
+    std::ifstream nodes("/sys/devices/system/node/online");
+    std::string online;
+    if ((nodes >> online) && !online.empty() &&
+        online.find_first_not_of("0123456789") == std::string::npos) {
+        try { return std::stoi(online); } catch (const std::exception &) {}
+    }
 #endif
     return -1;
 }

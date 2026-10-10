@@ -1795,6 +1795,8 @@ if (UNIT_TEST)
             target_include_directories(cuda_glm5_gguf_cache_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             fastllm_add_checked_test(cuda_glm5_gguf_cache cuda_glm5_gguf_cache_test "PASS: GLM GGUF cache" 120)
             fastllm_add_checked_test(cuda_glm5_gguf_packed_iq cuda_glm5_gguf_cache_test "PASS: GLM GGUF packed IQ" 180 --packed-iq)
+            fastllm_add_checked_test(cuda_glm5_gguf_tp_batch cuda_glm5_gguf_cache_test "PASS: GLM TP batch" 180 --tp-batch)
+            fastllm_add_checked_test(cuda_glm5_gguf_iq4_down cuda_glm5_gguf_cache_test "PASS: IQ4_XS TP down" 60 --iq4-down)
             fastllm_add_checked_test(cuda_glm5_gguf_frequency cuda_glm5_gguf_cache_test "PASS: GLM GGUF cache" 120 --frequency)
             fastllm_add_checked_test(cuda_glm5_gguf_no_cache cuda_glm5_gguf_cache_test "PASS: GLM GGUF cache" 120 --no-cache)
             fastllm_add_checked_test(cuda_glm5_gguf_verify cuda_glm5_gguf_cache_test "PASS: GLM GGUF verify" 180 --verify)
@@ -1806,7 +1808,8 @@ if (UNIT_TEST)
             fastllm_add_checked_test(cuda_glm5_gguf_ep_cache cuda_glm5_gguf_cache_test "PASS: GLM GGUF EP cache" 180 --ep-cache)
             fastllm_add_checked_test(cuda_glm5_gguf_ep_prefill cuda_glm5_gguf_cache_test "PASS: GLM GGUF EP prefill" 180 --ep-prefill)
             fastllm_add_checked_test(cuda_glm5_gguf_ep_numa_prefill cuda_glm5_gguf_cache_test "PASS: GLM GGUF EP prefill" 180 --ep-numa-prefill)
-            set_tests_properties(cuda_glm5_gguf_cache cuda_glm5_gguf_packed_iq cuda_glm5_gguf_frequency cuda_glm5_gguf_no_cache
+            set_tests_properties(cuda_glm5_gguf_cache cuda_glm5_gguf_packed_iq cuda_glm5_gguf_tp_batch
+                cuda_glm5_gguf_iq4_down cuda_glm5_gguf_frequency cuda_glm5_gguf_no_cache
                 cuda_glm5_gguf_verify cuda_glm5_gguf_verify_no_cache cuda_glm5_gguf_verify_full_cache
                 cuda_glm5_gguf_resident cuda_glm5_gguf_host_prefill cuda_glm5_gguf_host_prefill_no_cache
                 cuda_glm5_gguf_ep_cache cuda_glm5_gguf_ep_prefill

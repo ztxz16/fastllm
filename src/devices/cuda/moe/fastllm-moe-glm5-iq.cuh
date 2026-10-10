@@ -28,15 +28,16 @@ struct IQ2XXSBlock {
     }
 };
 
-template<class View>
+template<class View, bool Tp = false>
 __global__ void GateIQ2XXSSm75(const float *__restrict__ input, __nv_bfloat16 *activation,
-        View view, const float *scores, float limit, int topk) {
+        View view, const float *scores, float limit, int topk, int rank = 0) {
     const int localRow = threadIdx.x / 64, row = blockIdx.x * 2 + localRow;
+    const int outputRow = row + (Tp ? rank * 1024 : 0);
     const int route = blockIdx.y, lane = threadIdx.x % 32, warp = threadIdx.x / 32 % 2;
     const int original = OriginalRoute(view, route);
     const auto *record = ExpertWeight<true>(view, route);
     if (!record) {
-        if (threadIdx.x % 64 == 0) activation[size_t(route) * 2048 + row] = __float2bfloat16_rn(0);
+        if (threadIdx.x % 64 == 0) activation[size_t(route) * 2048 + outputRow] = __float2bfloat16_rn(0);
         return;
     }
     __shared__ uint64_t table[256];
@@ -44,7 +45,7 @@ __global__ void GateIQ2XXSSm75(const float *__restrict__ input, __nv_bfloat16 *a
     __syncthreads();
     input += size_t(original / topk) * 4096;
     const auto *g = reinterpret_cast<const block_iq2_xxs *>(record) + row * 16;
-    const auto *u = g + 2048 * 16;
+    const auto *u = g + (Tp ? 1024 : 2048) * 16;
     // Two physical warps retain the original four logical accumulators and
     // their FMA/reduction order, including the final BF16 rounding boundary.
     float gs[2] = {}, us[2] = {};
@@ -93,12 +94,13 @@ __global__ void GateIQ2XXSSm75(const float *__restrict__ input, __nv_bfloat16 *a
         up = __bfloat162float(__float2bfloat16_rn(up));
         if (limit > 0) { gate = fminf(gate, limit); up = fmaxf(-limit, fminf(up, limit)); }
         const float value = __fmul_rn(__fmul_rn(gate / (1.f + expf(-gate)), up), scores[original]);
-        activation[size_t(route) * 2048 + row] = __float2bfloat16_rn(value);
+        activation[size_t(route) * 2048 + outputRow] = __float2bfloat16_rn(value);
     }
 }
 
-template<class View>
-__global__ __launch_bounds__(128, 8) void DownIQ3XXSSm75(const float *__restrict__ input, float *output, View view) {
+template<class View, bool Tp = false>
+__global__ __launch_bounds__(128, 8) void DownIQ3XXSSm75(const float *__restrict__ input, float *output, View view,
+        int rank = 0) {
     const int row = blockIdx.x * 4 + threadIdx.x / 32, route = blockIdx.y, lane = threadIdx.x % 32;
     const auto *record = ExpertWeight<false>(view, route);
     float sum = 0;
@@ -136,5 +138,6 @@ __global__ __launch_bounds__(128, 8) void DownIQ3XXSSm75(const float *__restrict
         for (int mask = 16; mask; mask >>= 1) sum += __shfl_down_sync(0xffffffff, sum, mask);
     }
     if (lane == 0)
-        output[size_t(OriginalRoute(view, route)) * 4096 + row] = __bfloat162float(__float2bfloat16_rn(sum));
+        output[size_t(OriginalRoute(view, route)) * 4096 + row + (Tp ? rank * 2048 : 0)] =
+            __bfloat162float(__float2bfloat16_rn(sum));
 }

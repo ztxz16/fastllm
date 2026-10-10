@@ -325,6 +325,7 @@ struct VerifyWorkspace {
 };
 
 struct DeviceCache {
+    OffloadGroup *tensorParallelOwner = nullptr;
     bool attempted = false;
     bool ready = false;
     int device = -1;
@@ -374,6 +375,7 @@ struct DeviceCache {
 };
 
 struct Glm5MultiGpuHybrid;
+struct Glm5TensorParallel;
 struct OffloadGroup {
     OffloadLayout layout;
     // GGUF layers keep their actual record size in host storage and share
@@ -395,6 +397,8 @@ struct OffloadGroup {
     std::vector<fastllm_gguf_restore::Record> ggufSources;
     std::unordered_map<int, std::unique_ptr<DeviceCache> > deviceCaches;
     std::shared_ptr<Glm5MultiGpuHybrid> cooperativeHybrid;
+    bool tensorParallelRequested = false;
+    std::shared_ptr<Glm5TensorParallel> tensorParallel;
     std::vector<int> expertDevices;
     std::mutex mutex;
 
@@ -1147,6 +1151,7 @@ std::unique_ptr<DecodeOverlapWorkspace> MakeDecodeOverlap(const OffloadGroup &gr
 }
 
 DeviceCache *GetDeviceCache(OffloadGroup &group) {
+    if (group.tensorParallelRequested) return nullptr;
     int device = -1;
     if (cudaGetDevice(&device) != cudaSuccess || device < 0) {
         return nullptr;
@@ -2259,6 +2264,7 @@ void FastllmCudaReleaseMoeCache(
     int originalDevice = -1;
     cudaGetDevice(&originalDevice);
     released->cooperativeHybrid.reset();
+    released->tensorParallel.reset();
     for (auto &cache : released->deviceCaches) {
         PrintDeviceCacheStats(*cache.second, released->layout.weightType);
         ReleaseDeviceCache(*cache.second);
@@ -3432,6 +3438,41 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
 #endif
 }
 
+#ifdef USE_NUMAS
+#include "fastllm-moe-glm5-tp.cuh"
+#endif
+
+bool FastllmCudaPrepareMoeTensorParallel(fastllm::Data **weights, int weightsBatch,
+                                       const std::vector<int> &devices) {
+#ifdef USE_NUMAS
+    if (devices != std::vector<int>({0,1}) || FastllmCudaGetDeviceCount() != 2) return false;
+    auto *group = FindHybridGroup(weights, weightsBatch);
+    if (!group || !group->layout.glm5 || group->layout.weightType != fastllm::DATA_GGUF_FORMAT ||
+        group->ggufSources.empty() || !group->cpuDecodeReady) return false;
+    std::lock_guard<std::mutex> lock(group->mutex);
+    if (group->tensorParallelRequested) return true;
+    if (!group->deviceCaches.empty() || !group->expertDevices.empty()) return false;
+    size_t maximum = 0;
+    for (const auto &layout : group->layerLayouts) {
+        if (layout.hidden != 4096 || layout.inter != 2048 ||
+            layout.gateBytes % 64 || layout.downBytes % 32) return false;
+        maximum = std::max(maximum, layout.gateBytes/2 + layout.downBytes/2);
+    }
+    for (int d : devices) {
+        cudaDeviceProp prop;
+        int peer = 0;
+        if (cudaGetDeviceProperties(&prop, d) != cudaSuccess || prop.major != 7 || prop.minor != 5 ||
+            cudaDeviceCanAccessPeer(&peer, d, 1-d) != cudaSuccess || !peer ||
+            DeviceCacheBudgetBytes(d) < kMaxTopK * maximum) return false;
+    }
+    group->tensorParallelRequested = true;
+    std::fprintf(stderr, "[GLM TP] NUMA expert cache uses paired tensor shards on both GPUs.\n");
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool FastllmCudaPrepareMoeExpertCache(fastllm::Data **weights, int weightsBatch,
                                     const std::vector<int> &devices) {
     if (devices.size() < 2) return false;
@@ -3439,6 +3480,7 @@ bool FastllmCudaPrepareMoeExpertCache(fastllm::Data **weights, int weightsBatch,
     if (!group || !group->layout.glm5 || group->layout.weightType != fastllm::DATA_GGUF_FORMAT ||
         group->ggufSources.empty() || !group->cpuDecodeReady) return false;
     std::lock_guard<std::mutex> lock(group->mutex);
+    if (group->tensorParallelRequested) return true;
     if (!group->expertDevices.empty()) return group->expertDevices == devices;
     if (std::set<int>(devices.begin(), devices.end()).size() != devices.size()) return false;
     bool anyBudget = false;
@@ -3467,6 +3509,9 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
     if (topk < 1 || topk > kMaxTopK) return nullptr;
     auto *group = FindHybridGroup(weights, weightsBatch);
     if (!group) return nullptr;
+#ifdef USE_NUMAS
+    if (group->tensorParallelRequested) return BeginGlm5Tp(*group);
+#endif
     if (devices) FastllmCudaPrepareMoeExpertCache(weights, weightsBatch, *devices);
     auto *cache = GetDeviceCache(*group);
     if (!cache) return nullptr;
@@ -3607,6 +3652,9 @@ static void EndDeviceMoeDecode(DeviceCache &cache) {
 void FastllmCudaEndMoeDecode(void *state) {
     if (!state) return;
     auto &cache = *static_cast<DeviceCache *>(state);
+#ifdef USE_NUMAS
+    if (cache.tensorParallelOwner) { EndGlm5Tp(*cache.tensorParallelOwner); return; }
+#endif
     auto *group = cache.frequencyGroup;
     if (group && !group->expertDevices.empty()) {
         for (int device : group->expertDevices) {
@@ -3912,6 +3960,12 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
         const std::function<void()> &launchParallel, const std::vector<int> *devices) {
 #ifdef USE_NUMAS
+    {
+        int table = -1;
+        auto *group = FindHybridGroup(weights, weightsBatch, &table);
+        if (group && group->tensorParallelRequested)
+            return RunGlm5Tp(*group, table, input, index, score, output, weights, weightsBatch, layer, launchParallel);
+    }
     if (devices && devices->size() > 1 && SupportedCacheInput(input) &&
         input.dataType == fastllm::BFLOAT16) {
         int table = -1;
@@ -4462,6 +4516,20 @@ extern "C" bool fastllm_moe_cuda_cache_route_stats(int device, uint64_t *values)
     std::lock_guard<std::mutex> guard(RegistryMutex());
     for (const auto &group : Groups()) {
         std::lock_guard<std::mutex> lock(group->mutex);
+#ifdef USE_NUMAS
+        if (group->tensorParallel && device < 2) {
+            const auto &tp = *group->tensorParallel;
+            values[0] += tp.calls;
+            values[1] += tp.residentRoutes + tp.streamedRoutes + tp.cpuRoutes;
+            values[2] += tp.residentRoutes;
+            values[3] += tp.streamedRoutes + tp.cpuRoutes;
+            values[4] += tp.residentRoutes + tp.streamedRoutes;
+            values[5] += tp.cpuRoutes;
+            values[6] += tp.residentRoutes;
+            values[7] += tp.admissions;
+            continue;
+        }
+#endif
         auto it = group->deviceCaches.find(device);
         if (it == group->deviceCaches.end() || !it->second || !it->second->ready) continue;
         for (int i = 0; i < 8; ++i) values[i] += it->second->cooperativeStats[i];

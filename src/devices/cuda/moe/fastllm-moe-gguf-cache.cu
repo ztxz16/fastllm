@@ -588,7 +588,7 @@ bool FastllmCudaMoeGGUFCacheComputeStaged(const fastllm::Data &input, fastllm::D
 
 namespace glm5_gguf_cache {
 #define GLM5_GATE_TYPES(M) M(IQ2_XXS) M(IQ2_S) M(Q2_K) M(Q3_K) M(Q4_K)
-#define GLM5_DOWN_Q8_TYPES(M) M(IQ3_XXS) M(Q2_K) M(Q3_K) M(Q4_K)
+#define GLM5_DOWN_Q8_TYPES(M) M(IQ3_XXS) M(IQ4_XS) M(Q2_K) M(Q3_K) M(Q4_K)
 
 template<ggml_type Type> constexpr size_t BlockBytes() {
     if constexpr (Type == GGML_TYPE_Q2_K) return sizeof(block_q2_K);
@@ -726,15 +726,16 @@ __global__ void Quantize(const __nv_bfloat16 *input, float *output, int columns,
     }
 }
 
-template<ggml_type Type, class View>
+template<ggml_type Type, class View, bool Tp = false>
 __global__ void Gate(const float *input, __nv_bfloat16 *activation,
-                    View view, const float *scores, float limit, int topk) {
+                    View view, const float *scores, float limit, int topk, int rank = 0) {
     const int row = blockIdx.x, route = blockIdx.y;
+    const int outputRow = row + (Tp ? rank * (view.inter / 2) : 0);
     const int original = OriginalRoute(view, route);
     input += size_t(original / topk) * view.hidden;
     const auto *record = ExpertWeight<true>(view, route);
     if (!record) {
-        if (threadIdx.x == 0) activation[size_t(route) * view.inter + row] = __float2bfloat16_rn(0);
+        if (threadIdx.x == 0) activation[size_t(route) * view.inter + outputRow] = __float2bfloat16_rn(0);
         return;
     }
     const size_t pitch = size_t(view.hidden / QK_K) * BlockBytes<Type>();
@@ -742,7 +743,7 @@ __global__ void Gate(const float *input, __nv_bfloat16 *activation,
     const int storage = NumaType<true>(view);
     float gate = NumaDot<Type>(record, storage >= 0 ? 2 * row : row,
         pitch, storage, input, view.hidden, warp, 4);
-    float up = NumaDot<Type>(record, storage >= 0 ? 2 * row + 1 : row + view.inter,
+    float up = NumaDot<Type>(record, storage >= 0 ? 2 * row + 1 : row + view.inter / (Tp ? 2 : 1),
         pitch, storage, input, view.hidden, warp, 4);
     __shared__ float gates[4], ups[4];
     if (threadIdx.x % 32 == 0) { gates[warp] = gate; ups[warp] = up; }
@@ -754,12 +755,12 @@ __global__ void Gate(const float *input, __nv_bfloat16 *activation,
         up = __bfloat162float(__float2bfloat16_rn(up));
         if (limit > 0) { gate = fminf(gate, limit); up = fmaxf(-limit, fminf(up, limit)); }
         const float value = __fmul_rn(__fmul_rn(gate / (1.f + expf(-gate)), up), scores[original]);
-        activation[size_t(route) * view.inter + row] = __float2bfloat16_rn(value);
+        activation[size_t(route) * view.inter + outputRow] = __float2bfloat16_rn(value);
     }
 }
 
-template<ggml_type Type, typename T, class View>
-__global__ void Down(const T *activation, float *output, View view) {
+template<ggml_type Type, typename T, class View, bool Tp = false>
+__global__ void Down(const T *activation, float *output, View view, int rank = 0) {
     const int row = blockIdx.x * 4 + threadIdx.x / 32, route = blockIdx.y;
     if (row >= view.hidden) return;
     const auto *record = ExpertWeight<false>(view, route);
@@ -767,7 +768,8 @@ __global__ void Down(const T *activation, float *output, View view) {
     const float value = record ? NumaDot<Type>(record, row, pitch, NumaType<false>(view),
         activation + size_t(route) * view.inter, view.inter, 0, 1) : 0;
     if (threadIdx.x % 32 == 0)
-        output[size_t(OriginalRoute(view, route)) * view.hidden + row] = __bfloat162float(__float2bfloat16_rn(value));
+        output[size_t(OriginalRoute(view, route)) * view.hidden + row + (Tp ? rank * (view.hidden / 2) : 0)] =
+            __bfloat162float(__float2bfloat16_rn(value));
 }
 #include "fastllm-moe-glm5-iq.cuh"
 
@@ -828,10 +830,9 @@ bool Compute(const fastllm::Data &input, fastllm::Data &activation,
 #undef GLM5_GATE
         default: return false;
     }
-    // IQ3 and K-quants use the CPU's Q8_K down-input boundary. IQ4_XS uses the BF16
-    // fallback, including BF16 rounding of each decoded weight in Dot<T>.
-    // GGUF applies neither NVFP4's block-128 nor V4.1's block-32 FP8 step.
-    if (view.downType != GGML_TYPE_IQ4_XS) {
+    // Match the CPU GGUF dot kernels, including IQ4_XS: quantize the BF16
+    // activation to Q8_K before down projection. Decoded weights stay FP32.
+    {
         if (packedDown)
             Quantize<true><<<dim3(view.inter / 256, routes), 256, 0, cudaStreamPerThread>>>(
                 static_cast<const __nv_bfloat16 *>(activation.cudaData), nullptr, view.inter, packed);
@@ -849,10 +850,6 @@ bool Compute(const fastllm::Data &input, fastllm::Data &activation,
 #undef GLM5_DOWN
             default: return false;
         }
-    } else {
-        if (events && !FastllmMoeWaitDown(*events)) return false;
-        glm5_gguf_cache::Down<GGML_TYPE_IQ4_XS><<<dim3((view.hidden + 3) / 4, routes), 128, 0, cudaStreamPerThread>>>(
-            static_cast<const __nv_bfloat16 *>(activation.cudaData), perExpert, view);
     }
     return cudaGetLastError() == cudaSuccess;
 }
@@ -865,13 +862,68 @@ bool FastllmCudaMoeGlm5GGUFCacheSupported(int gateType, int downType, int hidden
         default: return false;
     }
     switch (downType) {
-        GLM5_DOWN_Q8_TYPES(GLM5_CASE) case GGML_TYPE_IQ4_XS: break;
+        GLM5_DOWN_Q8_TYPES(GLM5_CASE) break;
         default: return false;
     }
 #undef GLM5_CASE
     return hidden > 0 && inter > 0 && hidden % QK_K == 0 && inter % QK_K == 0 &&
            FastllmCudaMoeGGUFCacheWorkspaceBytes(hidden, inter) >=
                (size_t(hidden) + 16 * size_t(inter)) * sizeof(float);
+}
+bool FastllmCudaMoeGlm5GGUFTpStage(bool down, int rank,
+        const fastllm::Data &input, fastllm::Data &activation,
+        const FastllmCudaMoeGGUFCacheView &view, const float *scores,
+        int topk, float swigluLimit, float *perExpert) {
+    using namespace glm5_gguf_cache;
+    using View = FastllmCudaMoeGGUFCacheView;
+    const int rows = input.dims.size() == 2 ? input.dims[0] : 0;
+    const int routes = ActiveRoutes(view, rows * topk);
+    if (rank < 0 || rank > 1 || rows < 1 || rows > 9 || routes < 1 ||
+        topk < 1 || topk > 16 || view.hidden != 4096 || view.inter != 2048 ||
+        input.dataType != fastllm::BFLOAT16 || !input.cudaData ||
+        !view.records || !view.routeSlots || !scores || !perExpert ||
+        view.numaGateType >= 0 || view.numaDownType >= 0 ||
+        !view.workspace || reinterpret_cast<uintptr_t>(view.workspace) % 16 ||
+        view.workspaceBytes < std::max(size_t(rows) * view.hidden, size_t(routes) * view.inter) * sizeof(float) ||
+        !FastllmCudaMoeGlm5GGUFCacheSupported(view.gateType, view.downType, view.hidden, view.inter) ||
+        !Sm75IQSupported()) return false;
+    auto *scratch = static_cast<float *>(view.workspace);
+    if (!down) {
+        fastllm_gguf_moe::AllocateTensor(activation, fastllm::BFLOAT16, {routes, view.inter}, FastllmCudaGetDevice());
+        if (view.gateType == GGML_TYPE_IQ2_XXS) {
+            Quantize<true><<<dim3(16, rows), 256, 0, cudaStreamPerThread>>>(
+                static_cast<const __nv_bfloat16 *>(input.cudaData), nullptr, view.hidden, scratch);
+            GateIQ2XXSSm75<View, true><<<dim3(512, routes), 128, 0, cudaStreamPerThread>>>(scratch,
+                static_cast<__nv_bfloat16 *>(activation.cudaData), view, scores, swigluLimit, topk, rank);
+        } else {
+            Quantize<<<dim3(16, rows), 256, 0, cudaStreamPerThread>>>(
+                static_cast<const __nv_bfloat16 *>(input.cudaData), scratch, view.hidden);
+            switch (view.gateType) {
+#define GLM5_TP_GATE(name) case GGML_TYPE_##name: \
+                Gate<GGML_TYPE_##name, View, true><<<dim3(1024, routes), 128, 0, cudaStreamPerThread>>>( \
+                    scratch, static_cast<__nv_bfloat16 *>(activation.cudaData), view, scores, swigluLimit, topk, rank); break;
+                GLM5_GATE_TYPES(GLM5_TP_GATE)
+#undef GLM5_TP_GATE
+                default: return false;
+            }
+        }
+    } else if (view.downType == GGML_TYPE_IQ3_XXS) {
+        Quantize<true><<<dim3(8, routes), 256, 0, cudaStreamPerThread>>>(
+            static_cast<const __nv_bfloat16 *>(activation.cudaData), nullptr, view.inter, scratch);
+        DownIQ3XXSSm75<View, true><<<dim3(512, routes), 128, 0, cudaStreamPerThread>>>(scratch, perExpert, view, rank);
+    } else {
+        Quantize<<<dim3(8, routes), 256, 0, cudaStreamPerThread>>>(
+            static_cast<const __nv_bfloat16 *>(activation.cudaData), scratch, view.inter);
+        switch (view.downType) {
+#define GLM5_TP_DOWN(name) case GGML_TYPE_##name: \
+            Down<GGML_TYPE_##name, float, View, true><<<dim3(512, routes), 128, 0, cudaStreamPerThread>>>( \
+                scratch, perExpert, view, rank); break;
+            GLM5_DOWN_Q8_TYPES(GLM5_TP_DOWN)
+#undef GLM5_TP_DOWN
+            default: return false;
+        }
+    }
+    return cudaGetLastError() == cudaSuccess;
 }
 #undef GLM5_GATE_TYPES
 #undef GLM5_DOWN_Q8_TYPES

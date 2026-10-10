@@ -20,8 +20,8 @@ namespace fastllm_gguf_mmq {
 size_t fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(int gateType, int downType,
         int rows, int hidden, int inter, int experts, int topk) {
     using namespace fastllm_gguf_mmq;
-    // IQ4_XS down uses a BF16 dot in GLM. Quantizing it to Q8 would change
-    // the model's arithmetic, so retain GEMV for that type pair.
+    // Keep IQ4_XS on the existing GEMV fallback until its grouped prefill
+    // path has independent numerical coverage.
     const auto kType = [](int type) {
         return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K;
     };

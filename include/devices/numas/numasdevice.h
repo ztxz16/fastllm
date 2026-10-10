@@ -174,6 +174,10 @@ namespace fastllm {
     // for a grouped MoE batch of this size.
     bool CanUseNumasMoeExactSmallBatch(int rows);
 
+    // GGUF verification also preserves the single-row dot and scored BF16/Q8
+    // boundaries on AVX2. Native formats retain the AVX512-BF16 requirement.
+    bool CanUseNumasMoeExactGgufBatch(int rows, Data *const *weights, int weightsBatch);
+
     // Begin copying a contiguous CUDA MoE decode/verification batch to the
     // reusable pinned NUMA staging buffers.  The eventual MergeMOE call
     // consumes the pending copy.  This lets an independent CUDA shared-expert
