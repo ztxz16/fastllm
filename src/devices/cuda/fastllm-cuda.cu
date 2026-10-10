@@ -1875,6 +1875,31 @@ __global__ void FastllmSigmoidMulToKernel(
     }
 }
 
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+
+// Aligned BF16 vectors preserve the scalar rounding points for residuals and gates.
+template<bool SIGMOID>
+__global__ void FastllmBFloat16ElementwisePackedKernel(
+        __nv_bfloat16 *input, const __nv_bfloat16 *other, int len, __nv_bfloat16 alpha) {
+    const int index = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (index >= len) return;
+    union Packed { uint2 raw; __nv_bfloat16 values[4]; } a, b, y;
+    a.raw = *reinterpret_cast<const uint2 *>(input + index);
+    b.raw = *reinterpret_cast<const uint2 *>(other + index);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        if constexpr (SIGMOID) {
+            y.values[i] = FastllmSigmoidMulToProduct(
+                a.values[i], FastllmSigmoidMulToProbability(b.values[i]));
+        } else {
+            y.values[i] = __float2bfloat16_rn(__bfloat162float(a.values[i]) +
+                __bfloat162float(b.values[i]) * __bfloat162float(alpha));
+        }
+    }
+    *reinterpret_cast<uint2 *>(input + index) = y.raw;
+}
+#endif
+
 __device__ float softplus(float x) {
     return  x > 20.0f ? x : log1p(expf(x));
 }
@@ -2009,6 +2034,23 @@ __global__ void FastllmSwigluKernel(__nv_bfloat16* __restrict__ a, __nv_bfloat16
         float x = __bfloat162float(a[id]), y = __bfloat162float(a[id + mid]);
         b[idx] = __float2bfloat16((x / (1.0f + expf(-x))) * y);
     }
+}
+
+// Four adjacent outputs share address arithmetic and use aligned vector loads.
+__global__ void FastllmSwigluBFloat16PackedKernel(
+        const __nv_bfloat16 *input, __nv_bfloat16 *output, int len, int spatial, int mid) {
+    const int index=(blockIdx.x*blockDim.x+threadIdx.x)*4;
+    if (index>=len) return;
+    const int source=index/mid*spatial+index%mid;
+    union Packed { uint2 raw; __nv_bfloat16 values[4]; } a, b, result;
+    a.raw=*reinterpret_cast<const uint2 *>(input+source);
+    b.raw=*reinterpret_cast<const uint2 *>(input+source+mid);
+#pragma unroll
+    for (int i=0;i<4;++i) {
+        float x=__bfloat162float(a.values[i]), y=__bfloat162float(b.values[i]);
+        result.values[i]=__float2bfloat16_rn((x/(1.0f+expf(-x)))*y);
+    }
+    *reinterpret_cast<uint2 *>(output+index)=result.raw;
 }
 
 __global__ void FastllmGegluKernel(float* __restrict__ a, float* __restrict__ b, int len, int spatial, int mid) {
@@ -6753,9 +6795,21 @@ bool FastllmCudaSigmoidMulTo(fastllm::Data &input,
             (half*)inputData, gateData, gate.dataType,
             len, gateLen, channelLen, blocks, threads);
     } else if (input.dataType == fastllm::DataType::BFLOAT16) {
-        launched = FastllmCudaLaunchSigmoidMulTo(
-            (__nv_bfloat16*)inputData, gateData, gate.dataType,
-            len, gateLen, channelLen, blocks, threads);
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+        if (FastllmCudaRuntimeArch() == 90 && len >= 131072 && len % 4 == 0 &&
+            gate.dataType == fastllm::DataType::BFLOAT16 && gateLen == len &&
+            (reinterpret_cast<uintptr_t>(inputData) & 7) == 0 &&
+            (reinterpret_cast<uintptr_t>(gateData) & 7) == 0) {
+            FastllmBFloat16ElementwisePackedKernel<true><<<(len - 1) / 1024 + 1, 256>>>(
+                (__nv_bfloat16*)inputData, (const __nv_bfloat16*)gateData, len, __float2bfloat16_rn(1.0f));
+            launched = true;
+        } else
+#endif
+        {
+            launched = FastllmCudaLaunchSigmoidMulTo(
+                (__nv_bfloat16*)inputData, gateData, gate.dataType,
+                len, gateLen, channelLen, blocks, threads);
+        }
     }
     FastllmCudaFinishInput(gate, gateData);
     FastllmCudaFinishOutput(input, inputData);
@@ -6906,7 +6960,13 @@ bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
         FastllmSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, len, spatial, mid);
     } else if (input.dataType == fastllm::DataType::BFLOAT16) {
-        FastllmSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((__nv_bfloat16*)cudaInput, (__nv_bfloat16*)cudaOutput, len, spatial, mid);
+        if (FastllmCudaRuntimeArch() == 90 && len >= 262144 && len % 4 == 0 && mid % 4 == 0 && spatial % 4 == 0 &&
+            ((reinterpret_cast<uintptr_t>(cudaInput) | reinterpret_cast<uintptr_t>(cudaOutput)) & 7) == 0) {
+            FastllmSwigluBFloat16PackedKernel<<<(len - 1) / 1024 + 1, 256>>>(
+                (const __nv_bfloat16 *)cudaInput, (__nv_bfloat16 *)cudaOutput, len, spatial, mid);
+        } else {
+            FastllmSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((__nv_bfloat16*)cudaInput, (__nv_bfloat16*)cudaOutput, len, spatial, mid);
+        }
     }
 
     FastllmCudaFinishInput(input, cudaInput);
@@ -6999,7 +7059,17 @@ bool FastllmCudaAddTo(fastllm::Data &input0, const fastllm::Data &input1, float 
     } else if (input0.dataType == fastllm::DataType::FLOAT16) {
         FastllmAddToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaData, (half*)input1Data, __float2half_rn(alpha), len);
     } else if (input0.dataType == fastllm::DataType::BFLOAT16) {
-        FastllmAddToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((__nv_bfloat16*)cudaData, (__nv_bfloat16*)input1Data, __float2bfloat16_rn(alpha), len);
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+        if (FastllmCudaRuntimeArch() == 90 && len >= 131072 && len % 4 == 0 &&
+            (reinterpret_cast<uintptr_t>(cudaData) & 7) == 0 &&
+            (reinterpret_cast<uintptr_t>(input1Data) & 7) == 0) {
+            FastllmBFloat16ElementwisePackedKernel<false><<<(len - 1) / 1024 + 1, 256>>>(
+                (__nv_bfloat16*)cudaData, (const __nv_bfloat16*)input1Data, len, __float2bfloat16_rn(alpha));
+        } else
+#endif
+        {
+            FastllmAddToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((__nv_bfloat16*)cudaData, (__nv_bfloat16*)input1Data, __float2bfloat16_rn(alpha), len);
+        }
     }
 
     FastllmCudaFinishInput(input1, input1Data);
@@ -8086,7 +8156,8 @@ static bool LaunchFastllmRMSNormBFloat16(
         FastllmRMSNormUnalignedKernel<__nv_bfloat16><<<outer, 256>>>(input, weight, output, channels, eps);
         return true;
     }
-    if (threadCount == 0 && channels == 5120 && outer > 0 && outer <= 8) {
+    if (threadCount == 0 && channels == 5120 && outer > 0 &&
+        (outer <= 8 || (outer <= 128 && FastllmCudaRuntimeArch() == 90))) {
         FastllmRMSNormBFloat16Decode5120Kernel<512><<<outer, 512>>>(input, weight, output, eps);
         return true;
     }
@@ -9909,8 +9980,9 @@ __global__ __launch_bounds__(32*Warps) void FastllmRMSNormSiluMulHalf128HeadMajo
 
 #if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
 // Keep the KV state layout and BF16 rounding points of the unfused path.
-// A CTA owns 32 V columns; its warps partition K and keep the state in registers.
-template<bool SLOTS = false>
+// Warps partition K; large batches reuse Q/K normalization across both V tiles.
+// Packed pairs improve state bandwidth without changing either reduction tree.
+template<bool SLOTS = false, int VEC = 1, bool LOOP = false>
 __global__ void FastllmGdnNormBaBf16KV128Kernel(
         __nv_bfloat16 *state, const __nv_bfloat16 *q, const __nv_bfloat16 *k,
         const __nv_bfloat16 *v, const __nv_bfloat16 *a, const __nv_bfloat16 *b,
@@ -9931,10 +10003,9 @@ __global__ void FastllmGdnNormBaBf16KV128Kernel(
     }
     const int head = blockIdx.x;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const int column = blockIdx.y * 32 + lane;
     const int qkBase = (head / group) * 128;
     __shared__ float qn[128], kn[128], sums[4], scales[2], gate[2];
-    __shared__ float partial[K_WARPS][32], delta[32];
+    __shared__ float partial[VEC][K_WARPS][32], delta[VEC][32];
     if (threadIdx.x < 64) {
         const int j = threadIdx.x * 2;
         float q0 = __bfloat162float(q[qkBase+j]);
@@ -9971,51 +10042,90 @@ __global__ void FastllmGdnNormBaBf16KV128Kernel(
             __bfloat162float(k[qkBase+j])*scales[1]*norm[j]));
     }
     __syncthreads();
-    constexpr int ITEMS=128/K_WARPS;
-    float values[ITEMS], sum=0.0f;
+#pragma unroll 1
+    for (int tile = 0; tile < (LOOP ? 2 : 1); ++tile) {
+        const int column = (LOOP ? tile : blockIdx.y) * 32 * VEC + lane * VEC;
+        constexpr int ITEMS=128/K_WARPS;
+        using Raw = typename std::conditional<VEC == 1, unsigned short, unsigned int>::type;
+        union Packed { Raw raw; __nv_bfloat16 value[VEC]; __nv_bfloat162 pair; };
+        float values[ITEMS][VEC], sum[VEC] = {};
 #pragma unroll
-    for (int item=0;item<ITEMS;++item) {
-        int j=warp+item*K_WARPS;
-        values[item]=__bfloat162float(__float2bfloat16_rn(
-            __bfloat162float(state[(size_t)head*128*128+j*128+column])*gate[1]));
-        sum += values[item]*kn[j];
-    }
-    partial[warp][lane]=sum;
-    __syncthreads();
-    if (warp==0) {
-        float total=0.0f;
+        for (int item=0;item<ITEMS;++item) {
+            int j=warp+item*K_WARPS;
+            Packed loaded;
+            loaded.raw = *reinterpret_cast<const Raw *>(state+(size_t)head*128*128+j*128+column);
+            if constexpr (VEC == 2) {
+                const float2 x = __bfloat1622float2(loaded.pair);
+                const float2 decayed = __bfloat1622float2(
+                    __floats2bfloat162_rn(x.x * gate[1], x.y * gate[1]));
+                values[item][0] = decayed.x; values[item][1] = decayed.y;
+                sum[0] += decayed.x * kn[j]; sum[1] += decayed.y * kn[j];
+            } else {
+                values[item][0] = __bfloat162float(__float2bfloat16_rn(
+                    __bfloat162float(loaded.value[0]) * gate[1]));
+                sum[0] += values[item][0] * kn[j];
+            }
+        }
 #pragma unroll
-        for (int i=0;i<K_WARPS;++i) total+=partial[i][lane];
-        delta[lane]=(__bfloat162float(v[head*128+column])-total)*gate[0];
-    }
-    __syncthreads();
-    sum=0.0f;
+        for (int c=0;c<VEC;++c) partial[c][warp][lane]=sum[c];
+        __syncthreads();
+        if (warp==0) {
 #pragma unroll
-    for (int item=0;item<ITEMS;++item) {
-        int j=warp+item*K_WARPS;
-        __nv_bfloat16 updated=__float2bfloat16_rn(values[item]+kn[j]*delta[lane]);
-        state[(size_t)head*128*128+j*128+column]=updated;
-        sum += __bfloat162float(updated)*qn[j];
-    }
-    partial[warp][lane]=sum;
-    __syncthreads();
-    if (warp==0) {
-        float total=0.0f;
+            for (int c=0;c<VEC;++c) {
+                float total=0.0f;
 #pragma unroll
-        for (int i=0;i<K_WARPS;++i) total+=partial[i][lane];
-        output[head*128+column]=__float2bfloat16_rn(total);
+                for (int i=0;i<K_WARPS;++i) total+=partial[c][i][lane];
+                delta[c][lane]=(__bfloat162float(v[head*128+column+c])-total)*gate[0];
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int c=0;c<VEC;++c) sum[c]=0.0f;
+#pragma unroll
+        for (int item=0;item<ITEMS;++item) {
+            int j=warp+item*K_WARPS;
+            Packed updated;
+            if constexpr (VEC == 2) {
+                updated.pair = __floats2bfloat162_rn(
+                    values[item][0] + kn[j] * delta[0][lane],
+                    values[item][1] + kn[j] * delta[1][lane]);
+                const float2 x = __bfloat1622float2(updated.pair);
+                sum[0] += x.x * qn[j]; sum[1] += x.y * qn[j];
+            } else {
+                updated.value[0] = __float2bfloat16_rn(values[item][0] + kn[j] * delta[0][lane]);
+                sum[0] += __bfloat162float(updated.value[0]) * qn[j];
+            }
+            *reinterpret_cast<Raw *>(state+(size_t)head*128*128+j*128+column)=updated.raw;
+        }
+#pragma unroll
+        for (int c=0;c<VEC;++c) partial[c][warp][lane]=sum[c];
+        __syncthreads();
+        if (warp==0) {
+            Packed result;
+#pragma unroll
+            for (int c=0;c<VEC;++c) {
+                float total=0.0f;
+#pragma unroll
+                for (int i=0;i<K_WARPS;++i) total+=partial[c][i][lane];
+                result.value[c]=__float2bfloat16_rn(total);
+            }
+            *reinterpret_cast<Raw *>(output+head*128+column)=result.raw;
+        }
+        if constexpr (LOOP) __syncthreads();
     }
 }
 
 // Two independent warp reductions reproduce the original 64-thread RMSNorm.
 // Round RMSNorm and SiLU separately to BF16 before their final multiplication.
-__global__ __launch_bounds__(32) void FastllmRMSNormSiluMulBf16KV128Kernel(
+__global__ __launch_bounds__(128) void FastllmRMSNormSiluMulBf16KV128Kernel(
         const __nv_bfloat16 *input, const float *weight,
-        const __nv_bfloat16 *gate, __nv_bfloat16 *output, float eps) {
-    const int lane=threadIdx.x;
-    input+=(size_t)blockIdx.x*128;
-    gate+=(size_t)blockIdx.x*128;
-    output+=(size_t)blockIdx.x*128;
+        const __nv_bfloat16 *gate, __nv_bfloat16 *output, float eps, int rows) {
+    const int row=blockIdx.x*4+threadIdx.x/32;
+    if (row>=rows) return;
+    const int lane=threadIdx.x%32;
+    input+=(size_t)row*128;
+    gate+=(size_t)row*128;
+    output+=(size_t)row*128;
     float values[4], gates[4];
 #pragma unroll
     for (int i=0;i<4;++i) {
@@ -10072,9 +10182,9 @@ bool FastllmCudaRMSNormSiluMulBFloat16(
         input.dims.back() != 128 || weight.dims != std::vector<int>{128}) return false;
     const uint64_t rows = input.Count(0) / 128;
     if (rows == 0 || rows > INT_MAX) return false;
-    FastllmRMSNormSiluMulBf16KV128Kernel<<<(int)rows, 32, 0, cudaStreamPerThread>>>(
+    FastllmRMSNormSiluMulBf16KV128Kernel<<<(rows + 3) / 4, 128, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16 *)input.cudaData, (const float *)weight.cudaData,
-        (const __nv_bfloat16 *)gateInput.cudaData, (__nv_bfloat16 *)output.cudaData, eps);
+        (const __nv_bfloat16 *)gateInput.cudaData, (__nv_bfloat16 *)output.cudaData, eps, (int)rows);
     checkCudaErrors("Error: CUDA error in FastllmCudaRMSNormSiluMulBFloat16.", cudaGetLastError());
     return true;
 #else
@@ -10169,7 +10279,12 @@ bool FastllmRecurrentGatedDeltaRuleBFloat16Slots(
     output.Allocate(false);
     const auto *q = (const __nv_bfloat16 *)conv.cudaData;
     const auto *b = (const __nv_bfloat16 *)ba.cudaData;
-    FastllmGdnNormBaBf16KV128Kernel<true><<<dim3(valueHeads, 4, batch), 256, 0, cudaStreamPerThread>>>(
+    const bool packed = batch >= 4 &&
+        ((reinterpret_cast<uintptr_t>(statePool.cudaData) | reinterpret_cast<uintptr_t>(output.cudaData)) & 3) == 0;
+    const bool loop = packed && batch >= 32;
+    auto kernel = loop ? FastllmGdnNormBaBf16KV128Kernel<true, 2, true> :
+        (packed ? FastllmGdnNormBaBf16KV128Kernel<true, 2> : FastllmGdnNormBaBf16KV128Kernel<true>);
+    kernel<<<dim3(valueHeads, loop ? 1 : (packed ? 2 : 4), batch), 256, 0, cudaStreamPerThread>>>(
         (__nv_bfloat16 *)statePool.cudaData, q, q + keyHeads * 128, q + 2 * keyHeads * 128,
         b + valueHeads, b, (const float *)norm.cudaData, (const float *)aLog.cudaData,
         (const float *)dtBias.cudaData, (__nv_bfloat16 *)output.cudaData,
@@ -10183,22 +10298,37 @@ bool FastllmRecurrentGatedDeltaRuleBFloat16Slots(
 }
 
 #if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+template<bool PACKED = false>
 __global__ void FastllmBFloat16ConvSiluSlotsKernel(
         __nv_bfloat16 *pool, const int *slots, const __nv_bfloat16 *input,
         const float *weight, const float *bias, __nv_bfloat16 *output,
         int batch, int channels, int capacity) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= batch * channels) return;
-    const int channel = row % channels, slot = slots[row / channels];
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = PACKED ? blockIdx.y * channels + index : index;
+    if (PACKED ? index >= channels : row >= batch * channels) return;
+    const int channel = PACKED ? index : row % channels;
+    const int slot = slots[PACKED ? blockIdx.y : row / channels];
     if (slot < 0 || slot >= capacity) return;
     auto *cache = pool + ((size_t)slot * channels + channel) * 4;
-    __nv_bfloat16 x0 = cache[1], x1 = cache[2], x2 = cache[3], x3 = input[row];
-    cache[0] = x0; cache[1] = x1; cache[2] = x2; cache[3] = x3;
+    __nv_bfloat16 x0, x1, x2, x3 = input[row];
+    float4 w;
+    if constexpr (PACKED) {
+        union Packed { uint2 raw; __nv_bfloat16 values[4]; } old, next;
+        old.raw=*reinterpret_cast<const uint2 *>(cache);
+        x0=old.values[1]; x1=old.values[2]; x2=old.values[3];
+        next.values[0]=x0; next.values[1]=x1; next.values[2]=x2; next.values[3]=x3;
+        *reinterpret_cast<uint2 *>(cache)=next.raw;
+        w=*reinterpret_cast<const float4 *>(weight+channel*4);
+    } else {
+        x0=cache[1]; x1=cache[2]; x2=cache[3];
+        cache[0]=x0; cache[1]=x1; cache[2]=x2; cache[3]=x3;
+        w=make_float4(weight[channel*4],weight[channel*4+1],weight[channel*4+2],weight[channel*4+3]);
+    }
     float value = bias ? bias[channel] : 0.0f;
-    value += __bfloat162float(x0) * weight[channel * 4];
-    value += __bfloat162float(x1) * weight[channel * 4 + 1];
-    value += __bfloat162float(x2) * weight[channel * 4 + 2];
-    value += __bfloat162float(x3) * weight[channel * 4 + 3];
+    value += __bfloat162float(x0) * w.x;
+    value += __bfloat162float(x1) * w.y;
+    value += __bfloat162float(x2) * w.z;
+    value += __bfloat162float(x3) * w.w;
     float conv = __bfloat162float(__float2bfloat16_rn(value));
     output[row] = __float2bfloat16_rn(conv / (1.0f + expf(-conv)));
 }
@@ -10228,7 +10358,11 @@ bool FastllmCudaBFloat16ConvSiluSlots(
     output.dataDeviceIds = pool.dataDeviceIds;
     output.Resize({batch, channels, 1});
     output.Allocate(false);
-    FastllmBFloat16ConvSiluSlotsKernel<<<(batch * channels + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+    const bool packed = batch <= 65535 && (reinterpret_cast<uintptr_t>(pool.cudaData) & 7) == 0 &&
+        (reinterpret_cast<uintptr_t>(weight.cudaData) & 15) == 0;
+    auto kernel = packed ? FastllmBFloat16ConvSiluSlotsKernel<true> : FastllmBFloat16ConvSiluSlotsKernel<>;
+    const dim3 grid = packed ? dim3((channels - 1) / 128 + 1, batch) : dim3((batch * channels + 255) / 256);
+    kernel<<<grid, packed ? 128 : 256, 0, cudaStreamPerThread>>>(
         (__nv_bfloat16 *)pool.cudaData, (const int *)slots.cudaData, (const __nv_bfloat16 *)input.cudaData,
         (const float *)weight.cudaData, bias.dims.empty() ? nullptr : (const float *)bias.cudaData,
         (__nv_bfloat16 *)output.cudaData, batch, channels, pool.dims[0]);
@@ -14809,6 +14943,106 @@ bool FastllmCudaQwen35QGateKVPrefill(
 //   K -> RMSNorm + RoPE -> paged K cache
 //   V -> paged V cache
 // ============================================================
+// Hopper BF16 decode: one warp per 256-wide head. Preserve the legacy
+// reduction tree and BF16 rounding while keeping Q/K values in registers.
+__global__ void FastllmQwen35QGateKVBFloat16WarpKernel(
+    __nv_bfloat16 *qgatekvData,
+    float *qNormWeight,
+    float *kNormWeight,
+    float *positionIds,
+    __nv_bfloat16 *qOutputData,
+    __nv_bfloat16 *gateOutputData,
+    __nv_bfloat16 *pagedKData,
+    __nv_bfloat16 *pagedVData,
+    int32_t *insertIndexs,
+    int32_t *insertPositions,
+    int32_t *lastPageLens,
+    int outer,
+    int totalDim,
+    int qHeads,
+    int kHeads,
+    int seqlen,
+    int positionStride,
+    int sectionH,
+    int sectionW,
+    int useInterleavedRope,
+    float eps,
+    float ropeTheta,
+    float ropeScale,
+    int pageLen,
+    int batch,
+    int doQKNorm) {
+
+    constexpr int DIM=256, ROTARY=64, WARPS=4;
+    const int lane=threadIdx.x%32;
+    const int totalHeads=qHeads+2*kHeads;
+    const int blockId=blockIdx.x*WARPS+threadIdx.x/32;
+    if(blockId>=batch*totalHeads)return;
+    const int token=blockId/totalHeads,head=blockId%totalHeads;
+    const int physB=token/seqlen,physL=token%seqlen;
+    if(lastPageLens && head==0 && lane==0)lastPageLens[token]=insertPositions[token]+1;
+    const bool isQ=head<qHeads,isK=head>=qHeads&&head<qHeads+kHeads;
+    const int kh=head-qHeads;
+    auto *base=qgatekvData+(size_t)token*totalDim+(isQ?head*DIM*2:qHeads*DIM*2+kh*DIM);
+    if(isQ||isK){
+        float values[8];
+#pragma unroll
+        for(int i=0;i<8;++i)values[i]=__bfloat162float(base[lane+i*32]);
+        if(doQKNorm){
+            float squares[8];
+#pragma unroll
+            for(int i=0;i<8;++i)squares[i]=__fmul_rn(values[i],values[i]);
+            float sum=__fadd_rn(__fadd_rn(squares[0],squares[4]),__fadd_rn(squares[2],squares[6]));
+            sum=__fadd_rn(sum,__fadd_rn(__fadd_rn(squares[1],squares[5]),__fadd_rn(squares[3],squares[7])));
+#pragma unroll
+            for(int offset=16;offset>0;offset>>=1)sum+=__shfl_down_sync(0xffffffffu,sum,offset);
+            float scale=1.0f/sqrtf(__shfl_sync(0xffffffffu,sum,0)/DIM+eps);
+            const float *weight=isQ?qNormWeight:kNormWeight;
+#pragma unroll
+            for(int i=0;i<8;++i)values[i]=__bfloat162float(__float2bfloat16_rn(values[i]*scale*weight[lane+i*32]));
+        }
+        // Rotary width 64 pairs lane with lane + 32 in a 256-wide head.
+        float rawPosition;
+        if(useInterleavedRope){
+            int row=0;
+            if(lane%3==1&&lane<sectionH*3)row=1;
+            else if(lane%3==2&&lane<sectionW*3)row=2;
+            int logicalL=(outer==batch&&batch>1)?token:physL;
+            rawPosition=positionIds[row*positionStride+logicalL];
+        }else{
+            int positionOffset=physB*positionStride+physL;
+            if(outer==batch&&batch>1)positionOffset=positionStride==1?physB:token;
+            rawPosition=positionIds[positionOffset];
+        }
+        float position=rawPosition/ropeScale;
+        float freq=position/powf(ropeTheta,(float)(2*lane)/ROTARY);
+        float sn=sinf(freq),cs=cosf(freq),a=values[0],b=values[1];
+        values[0]=__bfloat162float(__float2bfloat16_rn(a*cs-b*sn));
+        values[1]=__bfloat162float(__float2bfloat16_rn(a*sn+b*cs));
+#pragma unroll
+        for(int i=0;i<8;++i){
+            int j=lane+i*32;
+            __nv_bfloat16 value=__float2bfloat16_rn(values[i]);
+            base[j]=value;
+            if(isQ){
+                qOutputData[((physB*qHeads+head)*seqlen+physL)*DIM+j]=value;
+                gateOutputData[((size_t)token*qHeads+head)*DIM+j]=base[DIM+j];
+            }else{
+                size_t target=((size_t)insertIndexs[token]*pageLen+insertPositions[token])*kHeads*DIM+kh*DIM+j;
+                pagedKData[target]=value;
+            }
+        }
+    }else{
+        int vh=head-qHeads-kHeads;
+#pragma unroll
+        for(int i=0;i<8;++i){
+            int j=lane+i*32;
+            size_t target=((size_t)insertIndexs[token]*pageLen+insertPositions[token])*kHeads*DIM+vh*DIM+j;
+            pagedVData[target]=base[j];
+        }
+    }
+}
+
 template <int THREAD_PER_BLOCK, typename T, typename TKV>
 __global__ void FastllmQwen35QGateKVRMSNormRopeSplitAppendPagedCacheKernel(
     T *qgatekvData,
@@ -15026,6 +15260,19 @@ bool FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache(
     auto launch = [&](auto TPB, auto *qgatekvPtr, auto *qOutputPtr, auto *gateOutputPtr, auto *pagedTag) {
         using QT = std::remove_pointer_t<decltype(qgatekvPtr)>;
         using KVT = std::remove_pointer_t<decltype(pagedTag)>;
+        if constexpr (std::is_same<QT, __nv_bfloat16>::value && std::is_same<KVT, __nv_bfloat16>::value) {
+            if (headDim == 256 && rotaryDim == 64 && batch >= 32 && !useYarn && FastllmCudaRuntimeArch() == 90) {
+                FastllmQwen35QGateKVBFloat16WarpKernel<<<(gridSize - 1) / 4 + 1, 128>>>(
+                    qgatekvPtr, (float*)qNormWeight.cudaData, (float*)kNormWeight.cudaData,
+                    cudaPositionIds, qOutputPtr, gateOutputPtr,
+                    (KVT*)pagedKData, (KVT*)pagedVData,
+                    insertIndexs, insertPositions, lastPageLens,
+                    outer, totalDim, qHeads, kHeads, seqlen, positionStride,
+                    sectionH, sectionW, useInterleavedRope,
+                    eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm);
+                return;
+            }
+        }
         FastllmQwen35QGateKVRMSNormRopeSplitAppendPagedCacheKernel<decltype(TPB)::value, QT, KVT>
             <<<gridSize, decltype(TPB)::value>>>(
                 qgatekvPtr, (float*)qNormWeight.cudaData, (float*)kNormWeight.cudaData,
