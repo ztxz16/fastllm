@@ -2711,10 +2711,17 @@ namespace fastllm {
             TargetRuntimeCheckpoint &checkpoint) {
         if (threadTpState) {
             auto &tp = *threadTpState;
+#ifdef USE_CUDA
+            // ApplyDeviceMap changes executor routing, not the active CUDA device.
+            Glm5NextCudaDeviceScope restoreDevice;
+#endif
             std::lock_guard<std::mutex> lock(tp.forwardMutex);
             auto &caches = tp.requests.at(&pastKeyValues);
             checkpoint.ranks.resize(tp.ranks.size());
             for (size_t r = 0; r < tp.ranks.size(); ++r) {
+#ifdef USE_CUDA
+                FastllmCudaSetDevice(tp.devices[r]);
+#endif
                 ApplyDeviceMap(tp.ranks[r]->deviceMap, 0, block_cnt);
                 tp.ranks[r]->CaptureTargetRuntimeCheckpoint(r == 0 ? pastKeyValues : caches[r], checkpoint.ranks[r]);
 #ifdef USE_CUDA
@@ -2770,11 +2777,18 @@ namespace fastllm {
             int verificationInputs) {
         if (threadTpState) {
             auto &tp = *threadTpState;
+#ifdef USE_CUDA
+            // ApplyDeviceMap changes executor routing, not the active CUDA device.
+            Glm5NextCudaDeviceScope restoreDevice;
+#endif
             std::lock_guard<std::mutex> lock(tp.forwardMutex);
             auto &caches = tp.requests.at(&pastKeyValues);
             auto &replays = tp.replays.at(&pastKeyValues);
             AssertInFastLLM(checkpoint.ranks.size() == tp.ranks.size(), "GLM TP MTP checkpoint is incomplete.");
             for (size_t r = 0; r < tp.ranks.size(); ++r) {
+#ifdef USE_CUDA
+                FastllmCudaSetDevice(tp.devices[r]);
+#endif
                 ApplyDeviceMap(tp.ranks[r]->deviceMap, 0, block_cnt);
                 tp.ranks[r]->CommitTargetVerificationPrefix(r == 0 ? pastKeyValues : caches[r],
                     checkpoint.ranks[r], replays[r], committedInputs, verificationInputs);

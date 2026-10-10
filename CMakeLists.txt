@@ -1333,6 +1333,12 @@ if (UNIT_TEST)
         target_include_directories(glm5_next_dsa_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME glm5_next_dsa COMMAND glm5_next_dsa_test)
         add_test(NAME glm5_next_dsa_mtp_rollback COMMAND glm5_next_dsa_test --rollback)
+        add_executable(glm5_next_tp_stream_test test/basic/test_glm5_next_tp_stream.cpp)
+        target_link_libraries(glm5_next_tp_stream_test PRIVATE fastllm)
+        target_include_directories(glm5_next_tp_stream_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME glm5_next_tp_stream COMMAND glm5_next_tp_stream_test)
+        set_tests_properties(glm5_next_tp_stream PROPERTIES LABELS "cuda;tp;mtp"
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
         set_tests_properties(glm5_next_dsa_mtp_rollback PROPERTIES LABELS cuda SKIP_RETURN_CODE 77
             RUN_SERIAL TRUE TIMEOUT 180 PASS_REGULAR_EXPRESSION "PASS GLM DSA MTP rollback on all CUDA devices")
         set_tests_properties(glm5_next_dsa PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)

@@ -13,6 +13,14 @@
 #endif
 
 namespace fastllm {
+#ifdef USE_CUDA
+    namespace {
+        struct Glm5NextCudaDeviceScope {
+            int previous = FastllmCudaGetDevice();
+            ~Glm5NextCudaDeviceScope() { FastllmCudaSetDevice(previous); }
+        };
+    }
+#endif
     struct Glm5NextModel::ThreadTpState {
         using Cache = std::vector<std::pair<Data, Data>>;
         std::vector<int> devices;
@@ -27,7 +35,7 @@ namespace fastllm {
         int arrived = 0;
         bool failed = false;
         PersistentWorkerGroup workers;
-        std::vector<void *> moeReady;
+        std::vector<void *> moeReady, callerReady;
         std::vector<bool> shardedMoeLayers;
         int loadingLayer = -1;
 
@@ -38,6 +46,10 @@ namespace fastllm {
             for (size_t r = 0; r < moeReady.size(); ++r) if (moeReady[r]) {
                 FastllmCudaSetDevice(devices[r]);
                 FastllmCudaEventDestroy(moeReady[r]);
+            }
+            for (size_t r = 0; r < callerReady.size(); ++r) if (callerReady[r]) {
+                FastllmCudaSetDevice(devices[r]);
+                FastllmCudaEventDestroy(callerReady[r]);
             }
             FastllmCudaSetDevice(previous);
 #endif
@@ -149,10 +161,7 @@ namespace fastllm {
             (expertLayer >= 0 && !threadTpState->shardedMoeLayers[expertLayer])) return;
         auto &devices = threadTpState->devices;
         const int count = devices.size();
-        struct RestoreDevice {
-            int previous = FastllmCudaGetDevice();
-            ~RestoreDevice() { FastllmCudaSetDevice(previous); }
-        } restore;
+        Glm5NextCudaDeviceScope restore;
         auto equalScheme = [&](int width, int parts = 1) {
             AssertInFastLLM(width % count == 0, "GLM TP weight dimension is not divisible.");
             DivisionScheme scheme;
@@ -287,6 +296,7 @@ namespace fastllm {
         for (int d : devices) {
             FastllmCudaSetDevice(d);
             tp.moeReady.push_back(d == devices[0] ? nullptr : FastllmCudaEventCreate());
+            tp.callerReady.push_back(FastllmCudaEventCreate());
             AssertInFastLLM(FastllmCudaGraphPrepareCaptureDevice(),
                 "GLM TP CUDA device initialization failed.");
         }
@@ -464,6 +474,18 @@ namespace fastllm {
             for (auto &replay : replays) { replay.clear(); replay.resize(block_cnt); }
         }
         const int exactThreshold = FastllmCudaGetLinearExactBatchThreshold();
+        // MTP produces input slices and restores recurrent state on the caller's
+        // per-thread streams. A host worker rendezvous does not publish that
+        // CUDA work. Fence each producer stream before its TP rank consumes it.
+        const bool publishCaller = mtpEnabled || inputIds.dataDevice == DataDevice::CUDA;
+        if (publishCaller) {
+            const int previous = FastllmCudaGetDevice();
+            for (size_t r = 0; r < tp.devices.size(); ++r) {
+                FastllmCudaSetDevice(tp.devices[r]);
+                FastllmCudaEventRecordCurrentThread(tp.callerReady[r]);
+            }
+            FastllmCudaSetDevice(previous);
+        }
         std::vector<Data> hidden(tp.devices.size());
         std::vector<std::exception_ptr> errors(tp.devices.size());
         int result = 0;
@@ -478,6 +500,7 @@ namespace fastllm {
             }
 #endif
             FastllmCudaSetDevice(tp.devices[r]);
+            if (publishCaller) FastllmCudaCurrentThreadStreamWaitEvent(tp.callerReady[r]);
             struct RestoreExactThreshold {
                 int old = FastllmCudaGetLinearExactBatchThreshold();
                 ~RestoreExactThreshold() { FastllmCudaSetLinearExactBatchThreshold(old); }
