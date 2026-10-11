@@ -93,10 +93,10 @@ __global__ void RouterSigmoid4096(const BF16 *input, const float *weight,
     }
 }
 
-// Reuse each expert's weights across a few verify rows while preserving the
-// exact GEMV accumulation order. Sigmoid is fused with multi-row selection.
+// Reuse each expert's weights across decode/verify rows with exact GEMV
+// accumulation. Each expert applies sigmoid before the batched TopK launch.
 template <int Rows>
-__global__ void VerifyRouter4096(const BF16 *input, const float *weight,
+__global__ void BatchRouterSigmoid4096(const BF16 *input, const float *weight,
         float *output, int rows, int experts) {
     const int t = threadIdx.x, first = blockIdx.y * Rows, expert = blockIdx.x;
     __shared__ float sums[Rows][8];
@@ -122,17 +122,17 @@ __global__ void VerifyRouter4096(const BF16 *input, const float *weight,
         if (t % 32 == 0) sums[row][t / 32] = partial[row];
     }
     __syncthreads();
-    if (t < 32) {
+    // Independent warps finish different rows, including the expensive sigmoid.
+    // Keep the reference GEMV's reduction and zero-bias addition exactly.
+    const int row = t / 32, lane = t % 32;
+    if (row < Rows) {
+        float value = lane < 8 ? sums[row][lane] : 0;
         #pragma unroll
-        for (int row = 0; row < Rows; ++row) {
-            float value = t < 8 ? sums[row][t] : 0;
-            #pragma unroll
-            for (int stride = 1; stride < 8; stride *= 2)
-                value += __shfl_down_sync(0xffffffffu, value, stride);
-            // Keep the reference GEMV's zero-bias addition, including signed zero.
-            if (t == 0 && first + row < rows)
-                output[(size_t)(first + row) * experts + expert] = value + 0.0f;
-        }
+        for (int stride = 1; stride < 8; stride *= 2)
+            value += __shfl_down_sync(0xffffffffu, value, stride);
+        if (lane == 0 && first + row < rows)
+            output[(size_t)(first + row) * experts + expert] =
+                1.0 / (1.0 + expf(-(value + 0.0f)));
     }
 }
 
@@ -2538,31 +2538,21 @@ int DecodeTopKBlocks() {
 bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
         const fastllm::Data &weight, fastllm::Data &output) {
     using namespace fastllm;
-    if (RouterRows(input, weight, output) != 1) return false;
-    auto dims = input.dims;
-    dims.back() = weight.dims[0];
-    Output(output, FLOAT32, dims);
-    RouterSigmoid4096<<<weight.dims[0], 256>>>((const BF16 *)input.cudaData,
-        (const float *)weight.cudaData, (float *)output.cudaData);
-    CheckLaunch();
-    return true;
-}
-
-bool FastllmCudaNaiveRouterVerify(const fastllm::Data &input,
-        const fastllm::Data &weight, fastllm::Data &output) {
-    using namespace fastllm;
     const int rows = RouterRows(input, weight, output);
-    if (rows < 2 || rows >= FastllmCudaGetLinearExactBatchThreshold()) return false;
+    if (!rows || (rows > 1 && rows >= FastllmCudaGetLinearExactBatchThreshold())) return false;
     auto dims = input.dims;
     dims.back() = weight.dims[0];
     Output(output, FLOAT32, dims);
     const int experts = weight.dims[0];
-    if (rows >= 4)
-        VerifyRouter4096<4><<<dim3(experts, (rows + 3) / 4), 256>>>(
+    if (rows == 1)
+        RouterSigmoid4096<<<experts, 256>>>((const BF16 *)input.cudaData,
+            (const float *)weight.cudaData, (float *)output.cudaData);
+    else if (rows >= 4)
+        BatchRouterSigmoid4096<4><<<dim3(experts, (rows + 3) / 4), 256>>>(
             (const BF16 *)input.cudaData, (const float *)weight.cudaData,
             (float *)output.cudaData, rows, experts);
     else
-        VerifyRouter4096<2><<<dim3(experts, (rows + 1) / 2), 256>>>(
+        BatchRouterSigmoid4096<2><<<dim3(experts, (rows + 1) / 2), 256>>>(
             (const BF16 *)input.cudaData, (const float *)weight.cudaData,
             (float *)output.cudaData, rows, experts);
     CheckLaunch();

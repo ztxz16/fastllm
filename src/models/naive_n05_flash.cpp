@@ -722,19 +722,18 @@ Data NaiveN05FlashModel::RunTarget(
             addMlpResidual(w2);
         } else {
             Data &routerWeight = localWeight(prefix + ".mlp.gate.weight");
-            bool hasRouterProbabilities = length == 1 &&
+            bool hasRouterProbabilities =
                 FastllmCudaNaiveRouterSigmoid(normed, routerWeight, router);
-            if (!hasRouterProbabilities &&
-                !FastllmCudaNaiveRouterVerify(normed, routerWeight, router)) {
+            if (!hasRouterProbabilities) {
                 ToDataType(normed, routerInput, DataType::FLOAT32);
                 Linear(routerInput, routerWeight, Data(), router);
             }
             Data &routerBias = localWeight(prefix + ".mlp.gate.e_score_correction_bias");
             auto &executor = *(Executor *)GetExecutor();
             bool fusedRouter = false;
-            // The warp-fused sigmoid amortizes selection for multiple rows;
-            // a single row already has sigmoid fused into its router projection.
-            if (length > 1 && router.dataDevice == DataDevice::CUDA) {
+            // Small decode/verify batches already include sigmoid in their shared
+            // router projection. Other multi-row paths fuse it with selection.
+            if (!hasRouterProbabilities && length > 1 && router.dataDevice == DataDevice::CUDA) {
                 DataDict routerData = {{"logits", &router}, {"index", &expertIndex},
                                        {"score", &expertScore}, {"gateBias", &routerBias}};
                 FloatDict routerFloats = {{"routeScale", routed_scaling_factor}};

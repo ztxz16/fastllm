@@ -452,6 +452,42 @@ static void TestSwaBatch(int batch, int heads, int kvHeads) {
     }
 }
 
+static void TestRouterBatch(int batch, bool tied) {
+    Data input(BFLOAT16), weight(FLOAT32), bias(FLOAT32), actual, expected(FLOAT32);
+    Data indices(INT32), scores(FLOAT32), referenceIndices(INT32), referenceScores(FLOAT32);
+    Upload(input, {1, batch, 4096}, 181); Upload(weight, {256, 4096}, 182);
+    Upload(bias, {256}, 183); Upload(expected, {1, batch, 256}, 184);
+    Upload(indices, {batch, 8}, 185); Upload(scores, {batch, 8}, 186);
+    Upload(referenceIndices, {batch, 8}, 187); Upload(referenceScores, {batch, 8}, 188);
+    if (tied) {
+        Cuda(cudaMemset(weight.cudaData, 0, weight.GetBytes()));
+        Cuda(cudaMemset(bias.cudaData, 0, bias.GetBytes()));
+    }
+    int previous = FastllmCudaGetLinearExactBatchThreshold();
+    FastllmCudaSetLinearExactBatchThreshold(9);
+    Graph graph;
+    graph.Capture([&]() {
+        Require(FastllmCudaNaiveRouterSigmoid(input, weight, actual), "batch router unsupported");
+        Require(FastllmCudaSelectExpert(actual, &bias, indices, scores, 8, true, 1.7f), "batch experts unsupported");
+    });
+    for (int replay = 0; replay < 2; ++replay) {
+        if (replay) Cuda(cudaMemset(input.cudaData, 0, input.GetBytes()));
+        graph.Run();
+        for (int b = 0; b < batch; ++b) {
+            Data row, result;
+            row.Resize({1, 1, 4096}); row.FakeFrom(input, (size_t)b * 4096 * 2);
+            result.Resize({1, 1, 256}); result.FakeFrom(expected, (size_t)b * 256 * 4);
+            Require(FastllmCudaNaiveRouterSigmoid(row, weight, result), "reference router unsupported");
+        }
+        Require(Read<float>(actual) == Read<float>(expected), "batch router probabilities changed");
+        Require(FastllmCudaSelectExpert(expected, &bias, referenceIndices, referenceScores, 8, true, 1.7f), "reference experts unsupported");
+        Require(Read<int>(indices) == Read<int>(referenceIndices), "batch router expert order changed");
+        Require(Read<float>(scores) == Read<float>(referenceScores), "batch router expert scores changed");
+        ++checks;
+    }
+    FastllmCudaSetLinearExactBatchThreshold(previous);
+}
+
 int main() {
     try {
         int devices = 0;
@@ -460,6 +496,8 @@ int main() {
         FastllmCudaSetDevice(0);
         if (!FastllmCudaNaiveDecodeGraphSupported())
             return 77;
+        for (int batch : {1, 2, 3, 4, 7, 8})
+            for (bool tied : {false, true}) TestRouterBatch(batch, tied);
         for (int batch : {1, 2, 3, 4, 17})
             for (int heads : {4, 8, 16})
                 TestSwaBatch(batch, heads, heads == 16 ? 2 : 1);
