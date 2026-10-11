@@ -380,7 +380,7 @@ Data NaiveN05FlashModel::RunTarget(
     } restoreExactThreshold{previousExactThreshold};
     // Keep the decode reduction order for paths honoring this threshold,
     // especially the FP32 router where rounding can change expert selection.
-    // BF16-to-BF16 batches of eight or more rows use cuBLAS and allow bounded
+    // BF16 tensor-core projections can use cuBLAS and allow bounded
     // floating-point differences from independent single-row decoding.
     if ((batch && batch->Decode()) || (capture && capture->verifying))
         FastllmCudaSetLinearExactBatchThreshold(std::max(previousExactThreshold, length + 1));

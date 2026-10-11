@@ -991,11 +991,13 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
     __nv_bfloat16 *weightPtr = (__nv_bfloat16 *)weight.cudaData;
 
     if (n < 8) {
-        // Hopper tensor cores amortize their setup on wide decode projections.
-        // Keep narrow projections, exact-row mode and the GEMV bias rounding
-        // contract on their existing path. An unwarmed graph also falls back.
+        // Wide Hopper BF16 projections use FP32-accumulating Lt, including batched
+        // decode/verify. The exact-row policy still applies to FP32 routers;
+        // BF16 results may differ in rounding from the GEMV reduction tree.
+        // Narrow projections are faster with GEMV. Preserve its fused bias
+        // rounding and the unwarmed/unsupported fallbacks as well.
         const bool useLt = n > 0 && m >= 1024 && k >= 1024 && bias.dims.empty() &&
-            FastllmCudaRuntimeArch() == 90 && fastllm::FastllmCudaGetLinearExactBatchThreshold() == 0;
+            FastllmCudaRuntimeArch() == 90;
         if (!useLt || !fastllm_bf16_lt::Matmul(cudaInput, weightPtr, cudaOutput, n, m, k)) {
             LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, cudaBiasData, n, m, k);
         }

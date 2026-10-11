@@ -152,13 +152,19 @@ inline Workspace *AcquireWorkspace(int device) {
 
 struct State {
     int device;
+    int arch;
     cublasLtHandle_t handle = nullptr;
     Workspace *eager = nullptr, *spare = nullptr;
     unsigned long long captureId = 0;
     Workspace *captured = nullptr; // borrowed only while captureId is active
     std::map<Key, std::unique_ptr<Plan>> plans;
 
-    explicit State(int device) : device(device) {}
+    explicit State(int device) : device(device) {
+        int major = 0, minor = 0;
+        CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+        CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+        arch = major * 10 + minor;
+    }
     ~State() {
         int previous = -1;
         cudaGetDevice(&previous);
@@ -284,12 +290,12 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
     int count = 0;
     if (!CheckBlas(cublasLtMatmulAlgoGetHeuristic(s.handle, p.op, p.a, p.b, p.c, p.c,
             search.preference, maxCandidates, candidates, &count)) || count == 0) return;
-    // Single-token BF16 decode values reproducibility across TP ranks and
+    // BF16 decode on Hopper values reproducibility across TP ranks and
     // restarts. Timing near-tied algorithms (especially under a profiler) can
     // change both latency and the reduction tree. Use the library's first
     // supported heuristic within the same FP32/workspace/alignment constraints.
-    const bool singleRowBf16 = M == 1 && dtype == CUDA_R_16BF;
-    if (!singleRowBf16) {
+    const bool stableBf16 = dtype == CUDA_R_16BF && (M == 1 || s.arch == 90);
+    if (!stableBf16) {
         CheckCuda(cudaEventCreate(&search.begin));
         CheckCuda(cudaEventCreate(&search.end));
     }
@@ -299,7 +305,7 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
             candidates[i].workspaceSize > workspaceBytes) continue;
         const auto &algo = candidates[i].algo;
         if (!Run(s, p, algo, weight, input, output, s.eager->data)) continue;
-        if (singleRowBf16) {
+        if (stableBf16) {
             p.algo = algo;
             p.valid = true;
             return;

@@ -266,8 +266,10 @@ int main() {
             try {
                 cu(cudaSetDevice(0));
                 auto *s = lt::GetState(0, false);
+                // Hopper BF16 uses deterministic heuristics without timing
+                // captures. Exercise capture failures through the FP16 search.
                 lt::Key key{M, N, K, lt::Alignment(p[2].weight), lt::Alignment(p[2].input),
-                            lt::Alignment(p[2].output), static_cast<int>(CUDA_R_16BF)};
+                            lt::Alignment(p[2].output), static_cast<int>(CUDA_R_16F)};
                 for (auto status : {CUBLAS_STATUS_NOT_SUPPORTED, CUBLAS_STATUS_EXECUTION_FAILED}) {
                     injectedStatus = status;
                     injectedCalls = 0;
