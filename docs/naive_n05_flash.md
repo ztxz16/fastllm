@@ -28,6 +28,23 @@ FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/MiMo-V2-DSA \
   --cache_history false --enable_thinking false --port 8000
 ```
 
+### 启动时预分配 KV
+
+普通 BF16 KV 的多卡 TP 路径在预热结束时为每张卡建立一个固定容量的 KV 池，
+不依赖 Hopper、EP8 或 CUDA Graph，也不需要额外环境变量。`--tokens` 控制全局层
+的总 token 预算；`--max_batch` 与 `--chunked_prefill_size` 控制滑窗层及分块
+prefill 的容量预算。未指定 `--tokens` 时取各 TP 卡中最小空闲显存的 75% 为预算，
+扣除滑窗及对齐空间后计算 token 容量；剩余显存留给工作区。未指定 `--max_batch`
+时按 512 路预留，不会因显存不足自动下调。配置超出预算会在启动时报错。
+
+请求的 K/V 仍是互不重叠的连续视图，直接复用现有 DSA/SWA 算子。首次请求、
+长上下文扩容及 CPU 历史恢复都从池内领取空间，结束后归还并合并空闲区间；
+运行期间不为这些 KV 调用 `cudaMalloc`。各 TP rank 在进入计算和通信前完成申请；
+池耗尽时终止本轮选中的请求并返回容量错误，后续请求仍可处理，不向池外分配。
+池内采用连续区间，未改为分页 attention；极端混合长度仍可能造成池内碎片。
+CUDA Graph、采样和临时算子工作区有各自的分配策略，不属于这项 KV 保证。
+CPU、按层串行、非 BF16 KV、草稿模型及跳过预热的直接调用保留原路径。
+
 ### EP8 与内置 MegaMoE
 
 MiMo FP8 在 8 张 H20 上可直接使用 `--tp 8 --ep 8`：Attention 保持 TP8，

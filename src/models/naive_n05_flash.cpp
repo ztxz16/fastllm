@@ -9,6 +9,7 @@
 #include "devices/cuda/naive-n05-cuda.cuh"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
@@ -56,10 +57,43 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, int reserveCapaci
     const int64_t wanted = std::max(length, reserveCapacity);
     if (cache.expansionDims.empty() || cache.expansionDims[1] < wanted) {
         const int capacity = (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128);
-        cache.Expansion({1, capacity, input.dims[2]});
+        ReserveCache(cache, capacity, input.dims[2]);
     }
     CatDirect(cache, input, 1);
     cache.isKVCache = true;
+}
+
+void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width) {
+    if (cache.expansionDims.size() == 3 && cache.expansionDims[1] >= capacity) return;
+#ifdef USE_CUDA
+    auto pool = cache.dataDevice == DataDevice::CUDA && cache.dataDeviceIds.size() == 1
+        ? tpKVPool.find(cache.dataDeviceIds[0]) : tpKVPool.end();
+    if (pool != tpKVPool.end()) {
+        AssertInFastLLM(cache.dataType == BFLOAT16 && !cache.isFake && !cache.cudaDataBorrowed &&
+            (cache.dims.empty() || (cache.dims.size() == 3 && cache.dims[0] == 1 &&
+                                   cache.dims[2] == width && cache.dims[1] <= capacity)),
+            "Naive KV pool: invalid contiguous cache.");
+        Data storage(BFLOAT16, {1, capacity, width});
+        storage.dataDevice = DataDevice::CUDA;
+        storage.dataDeviceIds = cache.dataDeviceIds;
+        storage.directMemory = true;
+        storage.cudaData = AllocateCudaWorkspace(pool->second, storage.GetBytes());
+        if (!storage.cudaData)
+            throw CudaWorkspaceExhausted("Naive KV pool exhausted; reduce concurrent context/output lengths or increase --tokens before startup.");
+        if (cache.cudaData && !cache.dims.empty() && cache.dims[1] > 0)
+            FastllmCudaCopyFromDeviceToDevice(storage.cudaData, cache.cudaData, cache.GetBytes());
+        cache.FreeSpace();
+        cache.cudaData = storage.cudaData;
+        storage.cudaData = nullptr;
+        cache.directMemory = true;
+        cache.expansionDims = storage.dims;
+        cache.expansionSize = storage.Count(0);
+        cache.expansionBytes = storage.GetBytes();
+        cache.strides = storage.strides;
+        return;
+    }
+#endif
+    cache.Expansion({1, capacity, width});
 }
 
 void NaiveN05FlashModel::TrimCache(Data &cache, int length) {
@@ -992,5 +1026,56 @@ void NaiveN05FlashModel::WarmUp() {
             elementsInKVCachePerToken += cache[layer].first.dims[2] + cache[layer].second.dims[2];
         }
     }
+    cache.clear();
+    InitTensorParallelKVPool();
+}
+
+void NaiveN05FlashModel::InitTensorParallelKVPool() {
+#ifdef USE_CUDA
+    // Keep CPU/layer-serial and speculative execution on their existing cache
+    // paths. This pool serves ordinary BF16 TP, independently of GPU generation
+    // and whether CUDA Graph is enabled.
+    if (!tpKVPool.empty() || !tpPrepared || tpDevices.size() <= 1 ||
+        GetKVCacheInCPU() || kvCacheDataType != BFLOAT16 || draftEnabled ||
+        elementsInKVCachePerToken <= 0) return;
+    const int ranks = tpDevices.size();
+    const int batch = maxBatch > 0 ? maxBatch : 512;
+    const int chunk = std::max(1, GetChunkedPrefillSize());
+    const int64_t swaCapacity = ((int64_t)window - 1 + chunk + 127) / 128 * 128;
+    int64_t fullBytesPerToken = 0, fixedBytes = 0;
+    for (int layer = 0; layer < block_cnt; ++layer) {
+        const auto &cfg = slidingLayers[layer] ? sliding : full;
+        const int64_t width = std::max(1, cfg.kvHeads / ranks) *
+            (cfg.headDim + cfg.valueDim) + (slidingLayers[layer] ? 0 : indexDim);
+        if (slidingLayers[layer]) fixedBytes += width * 2 * swaCapacity * batch;
+        else fullBytesPerToken += width * 2;
+    }
+    AssertInFastLLM(fullBytesPerToken > 0, "Naive KV pool requires full-attention layers.");
+    auto freeSizes = FastllmCudaGetFreeSizes();
+    int64_t budget = INT64_MAX;
+    for (int device : tpDevices) {
+        // Leave room for prefill activations, graph workspaces and collectives.
+        int64_t free = freeSizes.at(device);
+        budget = std::min(budget, free * 3 / 4);
+    }
+    if (kvCacheLimit > 0) budget = std::min(budget, (int64_t)kvCacheLimit / ranks);
+    int64_t tokens = GetMaxTokens() > 0 ? GetMaxTokens() :
+        std::min<int64_t>((int64_t)max_positions * batch,
+                         (budget - fixedBytes) / fullBytesPerToken - (int64_t)batch * 127);
+    if (tokensLimit > 0) tokens = std::min<int64_t>(tokens, tokensLimit);
+    tokens = std::min<int64_t>(tokens, INT_MAX - 127);
+    // Each request rounds its contiguous full-attention cache to 128 rows.
+    const int64_t bytes = fixedBytes + (tokens + (int64_t)batch * 127) * fullBytesPerToken;
+    AssertInFastLLM(tokens >= 128 && bytes > 0 && bytes <= budget,
+        "Naive startup KV pool exceeds the memory budget; reduce --tokens/--max_batch or prefill chunk size.");
+    std::map<int, std::shared_ptr<CudaWorkspace>> pools;
+    for (int device : tpDevices)
+        pools.emplace(device, std::make_shared<CudaWorkspace>(device, bytes));
+    tpKVPool.swap(pools);
+    tokensLimit = (int)tokens;
+    printf("[Naive KV pool] preallocated %.2f MiB/GPU, %lld total tokens, batch %d, SWA capacity %lld rows/request. No serving-time KV cudaMalloc.\n",
+        bytes / 1048576.0, (long long)tokens, batch, (long long)swaCapacity);
+    fflush(stdout);
+#endif
 }
 }

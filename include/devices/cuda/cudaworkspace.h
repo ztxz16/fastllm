@@ -4,10 +4,15 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 
 namespace fastllm {
-// A bounded CUDA arena for serial, non-graph work. Outstanding allocations
-// retain their owner, so tensors may safely outlive an allocation scope.
+class CudaWorkspaceExhausted : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+// A bounded CUDA arena. Allocate/release outside graph capture and order device
+// work before reusing freed storage. Outstanding allocations retain their owner.
 class CudaWorkspace {
 public:
     CudaWorkspace(int device, size_t bytes);
@@ -31,6 +36,9 @@ private:
 
 std::shared_ptr<CudaWorkspace> SetCudaWorkspace(std::shared_ptr<CudaWorkspace> workspace);
 bool TryAllocateCudaWorkspace(int device, size_t bytes, void **pointer);
+// Explicit allocation for persistent storage, without redirecting scratch
+// allocations on the calling thread. The allocation retains its arena owner.
+void *AllocateCudaWorkspace(const std::shared_ptr<CudaWorkspace> &workspace, size_t bytes);
 bool IsCudaWorkspacePointer(void *pointer);
 bool TryFreeCudaWorkspace(void *pointer);
 

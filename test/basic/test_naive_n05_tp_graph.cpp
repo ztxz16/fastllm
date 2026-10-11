@@ -147,6 +147,7 @@ class Fixture : public NaiveN05FlashModel {
         }
     }
     void Run(const char *path, bool graphs) {
+        WarmUp();
         std::ofstream out(path, std::ios::binary);
         for (int prompt : {3, 125, 254, 510, 2046, 2049}) {
             std::vector<std::pair<Data, Data>> kv;

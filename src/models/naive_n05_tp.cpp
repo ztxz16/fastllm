@@ -3,6 +3,7 @@
 #include "executor.h"
 #include "utils.h"
 #include <algorithm>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <set>
@@ -874,6 +875,37 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             fprintf(stderr, "[Fastllm] Naive TP decode graph capture failed; using eager for this cache.\n");
             graphDecode = false;
         } else state.captured = true;
+    }
+    if (!graphDecode && !tpKVPool.empty()) {
+        // Graph preparation already validates every rank's existing capacity.
+        // Eager paths must finish all KV allocations before any collective, so
+        // one exhausted rank cannot leave the others waiting in all-reduce.
+        struct Reservation { Data *cache; int capacity, width; };
+        std::vector<Reservation> reservations;
+        for (int sequence = 0; sequence < sequences; ++sequence) {
+            const int length = batch ? batch->lengths[sequence] : inputIds.dims[1];
+            const int reserve = CacheReserveCapacity(batch ? batch->configs[sequence] : config);
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                const auto &cfg = slidingLayers[layer] ? sliding : full;
+                for (Data *cache : {&key(sequence, layer), &value(sequence, layer)}) {
+                    const int64_t past = cache->dims.empty() ? 0 : cache->dims[1];
+                    const int64_t wanted = std::max<int64_t>(past + length,
+                        slidingLayers[layer] ? std::min<int64_t>(reserve, (int64_t)window - 1 + length) : reserve);
+                    if (cache->expansionDims.size() == 3 && cache->expansionDims[1] >= wanted) continue;
+                    const bool isValue = cache == &value(sequence, layer);
+                    const int width = std::max(1, cfg.kvHeads / (int)tpDevices.size()) *
+                        (isValue ? cfg.valueDim : cfg.headDim) +
+                        (!isValue && !slidingLayers[layer] ? indexDim : 0);
+                    reservations.push_back({cache,
+                        (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128), width});
+                }
+            }
+        }
+        if (!reservations.empty()) runRanks([&](int rank) {
+            FastllmCudaSetDevice(tpDevices[rank]);
+            for (const auto &item : reservations)
+                ReserveCache(*item.cache->multiDeviceDatas.at(tpDevices[rank]), item.capacity, item.width);
+        });
     }
     if (graphDecode)
         tpDecodeState->mode = tpDecodeState->captured ? TPDecodeState::Replay : TPDecodeState::Warm;

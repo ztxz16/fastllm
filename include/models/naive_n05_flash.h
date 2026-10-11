@@ -11,6 +11,7 @@
 struct FastllmCudaMimoEp8Mega;
 
 namespace fastllm {
+    class CudaWorkspace;
     class NaiveN05FlashModel : public basellm {
     protected:
         struct TargetCapture;
@@ -130,7 +131,8 @@ namespace fastllm {
                        TargetCapture *capture, int tpRank = -1, const Data *embedding = nullptr,
                        TargetWorkspace *workspace = nullptr, const TargetBatch *batch = nullptr);
         int CacheReserveCapacity(const GenerationConfig &config) const;
-        static void AppendCache(Data &cache, Data &input, int reserveCapacity = 0);
+        void AppendCache(Data &cache, Data &input, int reserveCapacity = 0);
+        void ReserveCache(Data &cache, int capacity, int width);
         static void TrimCache(Data &cache, int length);
         int SampleTarget(Data &logits, std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
@@ -177,6 +179,7 @@ namespace fastllm {
         void RecycleTensorParallelCache(ResponseContext *context);
         bool InitTensorParallel();
         void PrepareTensorParallel();
+        void InitTensorParallelKVPool();
         struct TPDecodeState;
         std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState, tpBatchState;
         bool HasVerificationGraph() const;
@@ -193,6 +196,7 @@ namespace fastllm {
                                    const GenerationConfig &config, TargetCapture *capture = nullptr,
                                    LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
         std::vector<int> tpDevices;
+        std::map<int, std::shared_ptr<CudaWorkspace>> tpKVPool;
         bool tpPrepared = false;
         // Fixed at TP preparation so toggling CUDA Graph cannot change live KV
         // layout. Prefill/eager and verify temporarily use chronological rows.

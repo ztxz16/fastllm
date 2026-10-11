@@ -17,6 +17,7 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/cudaworkspace.h"
 #endif
 
 namespace fastllm {
@@ -3117,6 +3118,9 @@ namespace fastllm {
                                 ClearProfiler();
                             }
                             auto prefillStartTime = std::chrono::steady_clock::now();
+#ifdef USE_CUDA
+                            try {
+#endif
                             if (seqLens.size() > 1) {
                                 if (!model->canDoBatchForward) {
                                     dictLocker.lock();
@@ -3192,6 +3196,25 @@ namespace fastllm {
                             if (printProfile) {
                                 PrintLoopProfile("old", seqLens, (int)ret.size(), profileStartTime);
                             }
+#ifdef USE_CUDA
+                            } catch (const CudaWorkspaceExhausted &error) {
+                                forwardLocker.unlock();
+                                if (!dictLocker.owns_lock()) dictLocker.lock();
+                                fprintf(stderr, "[Fastllm] %s\n", error.what());
+                                for (int handle : handles) {
+                                    auto *context = model->responseContextDict.GetHandle(handle);
+                                    if (context) {
+                                        context->isEnding = true;
+                                        context->error = ResponseContextErrorPromptTooLong;
+                                    }
+                                }
+                                model->dictCV.notify_all();
+                                ReleasePendingResultLogits(logits);
+                                for (auto *mask : attentionMasks) delete mask;
+                                for (auto *position : positionIds) delete position;
+                                continue;
+                            }
+#endif
                             forwardLocker.unlock();
                             dictLocker.lock();
 

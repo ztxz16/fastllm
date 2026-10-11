@@ -1,4 +1,5 @@
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/cudaworkspace.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "models/naive_n05_flash.h"
 #include "models/speculative_sampling.h"
@@ -12,6 +13,12 @@
 #include <atomic>
 #include <dlfcn.h>
 static std::atomic<int> verifyGraphLaunches{0}, verifyGraphCaptures{0};
+static std::atomic<int> directAllocations{0};
+extern "C" void *FastllmCudaDirectMalloc(size_t bytes) {
+    ++directAllocations;
+    static auto fn = (void *(*)(size_t))dlsym(RTLD_NEXT, "FastllmCudaDirectMalloc");
+    return fn(bytes);
+}
 static bool failVerifyBegin = false, failVerifyInstantiate = false, expectVerifyGraph = true;
 static int failGraphDevice = 3;
 extern "C" bool FastllmCudaGraphLaunch(void *exec) {
@@ -96,6 +103,7 @@ static void CheckLogitComparison() {
 class Fixture : public NaiveN05FlashModel {
   public:
     int ranks;
+    bool useRealScheduler = false;
     explicit Fixture(int ranks, bool packed = false, bool graph = false, bool swaRing = false) : ranks(ranks) {
         setenv("FASTLLM_TP", ranks > 1 ? std::to_string(ranks).c_str() : "false", 1);
         deviceMap = {{"cuda:0", 1}};
@@ -208,7 +216,7 @@ class Fixture : public NaiveN05FlashModel {
             }
         }
     }
-    bool UseModelSpecificScheduler() const override { return true; }
+    bool UseModelSpecificScheduler() const override { return !useRealScheduler; }
     void RunModelSpecificScheduler() override {}
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
     void RingGraphToggleChecks(bool initialGraph) {
@@ -277,6 +285,7 @@ class Fixture : public NaiveN05FlashModel {
     }
 #endif
     void HistoryChecks(bool graph) {
+        WarmUp();
         auto require = [](bool ok, const char *message) {
             if (!ok) throw std::runtime_error(message);
         };
@@ -718,6 +727,69 @@ class Fixture : public NaiveN05FlashModel {
         }
         std::cout << "PACKED PREFILL PASS ranks=" << ranks << " relative=" << largestLogitRelative << std::endl;
     }
+
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+    void CachePoolChecks() {
+        maxBatch = 4;
+        SetMaxTokens(8192);
+        WarmUp();
+        FastllmCudaSetDevice(0);
+        int before = directAllocations;
+        Data cache(BFLOAT16);
+        cache.dataDevice = DataDevice::CUDA;
+        cache.dataDeviceIds = {0};
+        cache.isKVCache = true;
+        ReserveCache(cache, 128, 16);
+        if (!IsCudaWorkspacePointer(cache.cudaData)) throw std::runtime_error("KV escaped startup pool");
+        cache.Resize({1, 127, 16});
+        std::vector<uint16_t> input(127 * 16), output(input.size());
+        for (size_t i = 0; i < input.size(); ++i) input[i] = uint16_t(i);
+        FastllmCudaCopyFromHostToDevice(cache.cudaData, input.data(), input.size() * 2);
+        ReserveCache(cache, 512, 16);
+        FastllmCudaCopyFromDeviceToHost(output.data(), cache.cudaData, output.size() * 2);
+        if (input != output || cache.dims != std::vector<int>({1, 127, 16}))
+            throw std::runtime_error("pool growth corrupted KV or logical length");
+        void *pointer = cache.cudaData;
+        bool exhausted = false;
+        try { ReserveCache(cache, 1 << 24, 16); }
+        catch (const CudaWorkspaceExhausted &) { exhausted = true; }
+        if (!exhausted || cache.cudaData != pointer)
+            throw std::runtime_error("pool exhaustion did not preserve existing KV");
+        cache.FreeSpace();
+        if (IsCudaWorkspacePointer(pointer)) throw std::runtime_error("KV lease was not released");
+        cache.dims.clear();
+        cache.expansionDims.clear();
+        ReserveCache(cache, 640, 16);
+        if (!IsCudaWorkspacePointer(cache.cudaData) || directAllocations != before)
+            throw std::runtime_error("KV growth/reuse allocated CUDA memory after startup");
+        // Exhaust only rank 0. Other ranks must not enter collectives while
+        // this rank rejects the allocation, and the next request must recover.
+        std::vector<std::unique_ptr<Data>> pressure;
+        try {
+            for (;;) {
+                auto block = std::make_unique<Data>(BFLOAT16);
+                block->dataDevice = DataDevice::CUDA;
+                block->dataDeviceIds = {0};
+                ReserveCache(*block, 128, 16);
+                pressure.push_back(std::move(block));
+            }
+        } catch (const CudaWorkspaceExhausted &) {}
+        eos_token_id = -1;
+        useRealScheduler = true;
+        GenerationConfig config;
+        config.top_k = 1;
+        config.output_token_limit = 4;
+        int failed = LaunchResponseTokens({1, 2, 3}, config);
+        if (FetchResponseTokens(failed) != -2)
+            throw std::runtime_error("scheduler lost KV capacity error");
+        pressure.clear();
+        int handle = LaunchResponseTokens({1, 2, 3}, config), count = 0, token;
+        while ((token = FetchResponseTokens(handle)) >= 0) ++count;
+        if (token != -1 || count != 4)
+            throw std::runtime_error("scheduler failed after KV exhaustion");
+        std::cout << "KV POOL PASS ranks=" << ranks << std::endl;
+    }
+#endif
 
     std::vector<std::vector<float>> Run() {
         if (RetainCudaWorkspace() != (ranks > 1))
@@ -1425,6 +1497,11 @@ int main(int argc, char **argv) {
             SetCudaEmbedding(true); SetCudaGraph(graph);
             Fixture fixture(ranks, true, true, true);
             fixture.RingGraphToggleChecks(graph);
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "kv_pool") {
+            Fixture fixture(ranks);
+            fixture.CachePoolChecks();
             return 0;
         }
         const std::string draftMode = argc > 2 ? argv[2] : "";

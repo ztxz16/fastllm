@@ -32,7 +32,7 @@ CudaWorkspace::CudaWorkspace(int device, size_t bytes)
     FastllmCudaSetDevice(device);
     base = FastllmCudaDirectMalloc(capacity);
     FastllmCudaSetDevice(previous);
-    if (!base) throw std::runtime_error("Cannot allocate multimodal CUDA workspace before KV cache sizing");
+    if (!base) throw std::runtime_error("Cannot allocate CUDA workspace");
     available.emplace(0, capacity);
 }
 
@@ -104,17 +104,22 @@ std::shared_ptr<CudaWorkspace> SetCudaWorkspace(std::shared_ptr<CudaWorkspace> w
 bool TryAllocateCudaWorkspace(int device, size_t bytes, void **pointer) {
     auto owner = currentWorkspace;
     if (!owner || owner->Device() != device) return false;
-    *pointer = owner->Allocate(bytes);
-    if (*pointer) {
+    *pointer = AllocateCudaWorkspace(owner, bytes);
+    return true;
+}
+
+void *AllocateCudaWorkspace(const std::shared_ptr<CudaWorkspace> &owner, size_t bytes) {
+    void *pointer = owner->Allocate(bytes);
+    if (pointer) {
         auto &owners = Owners();
         std::lock_guard<std::mutex> guard(owners.mutex);
-        owners.allocations.emplace(*pointer, std::move(owner));
+        owners.allocations.emplace(pointer, owner);
         workspacePointers.fetch_add(1, std::memory_order_release);
     } else {
-        fprintf(stderr, "[Vision] CUDA workspace exhausted: request %.2f MiB, live %.2f MiB, capacity %.2f MiB.\n",
+        fprintf(stderr, "[Fastllm] CUDA arena exhausted: request %.2f MiB, live %.2f MiB, capacity %.2f MiB.\n",
                 bytes / 1048576.0, owner->LiveBytes() / 1048576.0, owner->Capacity() / 1048576.0);
     }
-    return true;
+    return pointer;
 }
 
 bool IsCudaWorkspacePointer(void *pointer) {

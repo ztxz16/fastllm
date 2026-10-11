@@ -132,7 +132,7 @@ void NaiveN05FlashModel::RestoreTensorParallelHistoryRank(Data &cache, int layer
     // Preserve adopted allocations and graph addresses when they already fit.
     if (local->expansionDims.size() != 3 || local->expansionDims[1] < required) {
         if (!local->dims.empty()) local->Resize({1, 0, width + index});
-        local->Expansion({1, required, width + index});
+        ReserveCache(*local, required, width + index);
     }
     local->Resize(host.dims);
     FastllmCudaCopyFromHostToDevice(local->cudaData, host.cpuData, host.GetBytes());
@@ -289,7 +289,8 @@ void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
 
 void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
     std::lock_guard<std::mutex> guard(historyMutex);
-    if (!saveHistoryChat || !context || !context->multimodalInput.empty()) return;
+    if (!saveHistoryChat || !context || context->error != ResponseContextErrorNone ||
+        !context->multimodalInput.empty()) return;
     auto active = activeHistory.find(&context->pastKeyValues.front().first);
     if (active == activeHistory.end() || active->second.length <= 0) return;
     // A speculative block may have committed KV ahead of the scheduler when
