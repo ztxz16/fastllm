@@ -8,6 +8,7 @@
 #include "device.h"
 #include "devices/cpu/cpudevice.h"
 #include <functional>
+#include <mutex>
 
 namespace fastllm {
     int GetNumasMoeShardCount();
@@ -20,6 +21,18 @@ namespace fastllm {
         ~NumasMoeCudaAssistScope();
         NumasMoeCudaAssistScope(const NumasMoeCudaAssistScope &) = delete;
         NumasMoeCudaAssistScope &operator=(const NumasMoeCudaAssistScope &) = delete;
+    };
+    // A pipeline stage owns private staging while sharing the CPU worker pool.
+    // The caller holds cpuLock during preparation/CPU work; GPU completion can
+    // continue after the NUMA prefill backend releases that lock.
+    class NumasMoePipelineScope {
+        int previousWorkspace;
+        std::unique_lock<std::mutex> *previousLock;
+    public:
+        NumasMoePipelineScope(int workspace, std::unique_lock<std::mutex> *cpuLock);
+        ~NumasMoePipelineScope();
+        NumasMoePipelineScope(const NumasMoePipelineScope &) = delete;
+        NumasMoePipelineScope &operator=(const NumasMoePipelineScope &) = delete;
     };
     // Plan local CPU sets for CUDA submission, excluding expert-worker cores
     // and respecting the caller's affinity. Empty sets preserve OS placement.

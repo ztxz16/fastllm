@@ -144,6 +144,26 @@ namespace fastllm {
             });
     }
 
+    static thread_local int numasMoePipelineWorkspace = -1;
+    static thread_local std::unique_lock<std::mutex> *numasMoePipelineCpuLock = nullptr;
+
+    NumasMoePipelineScope::NumasMoePipelineScope(
+            int workspace, std::unique_lock<std::mutex> *cpuLock)
+        : previousWorkspace(numasMoePipelineWorkspace), previousLock(numasMoePipelineCpuLock) {
+        numasMoePipelineWorkspace = cpuLock ? workspace : -1;
+        numasMoePipelineCpuLock = cpuLock;
+    }
+
+    NumasMoePipelineScope::~NumasMoePipelineScope() {
+        numasMoePipelineWorkspace = previousWorkspace;
+        numasMoePipelineCpuLock = previousLock;
+    }
+
+    static void LockNumasMoePipelineCpu() {
+        if (numasMoePipelineCpuLock && numasMoePipelineCpuLock->mutex() &&
+            !numasMoePipelineCpuLock->owns_lock()) numasMoePipelineCpuLock->lock();
+    }
+
     static thread_local const std::vector<int> *numasMoeCudaAssistDevices = nullptr;
 
     NumasMoeCudaAssistScope::NumasMoeCudaAssistScope(const std::vector<int> *devices)
@@ -2340,6 +2360,17 @@ namespace fastllm {
                     nullptr, FastllmCudaEventDestroyDeleter {}
                 };
             bool decodeOutputCopyPending = false;
+            std::unique_ptr<void, FastllmCudaEventDestroyDeleter>
+                prefillOutputCopyEvent {
+                    nullptr, FastllmCudaEventDestroyDeleter {}
+                };
+
+            void WaitPrefillOutputCopy(void *stream, int device) {
+                void *event = EnsureEvent(prefillOutputCopyEvent, device);
+                FastllmCudaEventRecord(event, stream);
+                FastllmCudaCurrentThreadStreamWaitEvent(event);
+            }
+
             // assist 卡的重叠资源。事件与 staging 缓冲都按设备缓存，跨层复用，
             // 避免每层 create/destroy。
             struct AssistDeviceResources {
@@ -2526,9 +2557,9 @@ namespace fastllm {
             }
 
             uint8_t *EnsurePinnedOutput(size_t bytes) {
-                // A decode H2D copy reads this reusable host buffer after
-                // MergeMOE returns.  Do not let a later device/thread write or
-                // reallocate it until that copy has actually completed.
+                // Decode H2D or a pipelined prefill reduction can still use
+                // this workspace after MergeMOE returns. Wait before reusing
+                // its pinned output or the associated GPU staging buffer.
                 SynchronizeDecodeOutputCopy();
                 if (pinnedOutputBytes < bytes || pinnedOutput.get() == nullptr) {
                     pinnedOutput.reset(FastllmCudaHostMalloc(bytes));
@@ -2684,6 +2715,13 @@ namespace fastllm {
         return *cache;
     }
 
+    static FastllmMoeDataManagerNumas &GetNumasMoeRuntimeWorkspace(int workspace) {
+        static std::mutex mutex;
+        std::lock_guard<std::mutex> lock(mutex);
+        // References remain valid when another stage inserts its own slot.
+        return GetNumasMoeRuntimeCache()[workspace];
+    }
+
     void ClearNumasMoeRuntimeCache() {
 #ifdef USE_CUDA
         FastllmCudaNaiveClearExpertPrefill();
@@ -2755,7 +2793,7 @@ namespace fastllm {
         }
 
         FastllmMoeDataManagerNumas &workspace =
-            GetNumasMoeRuntimeCache()[layer % 2];
+            GetNumasMoeRuntimeWorkspace(layer % 2);
         auto &pending = workspace.decodeInputPrefetch;
         if (pending.active) {
             // A pending copy should normally be consumed by the immediately
@@ -3892,7 +3930,7 @@ namespace fastllm {
         auto finishCpu = [&] {
             if (cpuElapsedUs) *cpuElapsedUs = cpuWorkUs + NumasProfileNowMs() * 1000 - cpuHostStart;
         };
-        auto &work = GetNumasMoeRuntimeCache()[layer % 2];
+        auto &work = GetNumasMoeRuntimeWorkspace(layer % 2);
         auto *config = GetNumaConfig();
         auto *pool = GetAlivePool();
         auto &routes = work.activeExperts;
@@ -6860,6 +6898,9 @@ namespace fastllm {
         float *perRouteOutput, bool fp8EagerMode,
         const std::function<void()> *submitGpu
     ) {
+#ifdef USE_CUDA
+        LockNumasMoePipelineCpu();
+#endif
         int bs = input.dims[0];
         int m = weightsBatch / 2 - 1; // num experts
         int32_t *indexData = (int32_t*)index.cpuData;
@@ -7936,7 +7977,7 @@ namespace fastllm {
         int topk, int layer, const std::function<void()> *submitGpu, double *cpuElapsedUs) {
         double cpuHostStart = cpuElapsedUs ? NumasProfileNowMs() * 1000 : 0;
         double cpuWorkUs = 0;
-        auto &work = GetNumasMoeRuntimeCache()[layer % 2];
+        auto &work = GetNumasMoeRuntimeWorkspace(layer % 2);
         auto &routes = work.activeExperts;
         auto &groups = work.groupedGemmExperts;
         routes.clear(); groups.clear();
@@ -8081,7 +8122,7 @@ namespace fastllm {
         Data routes(FLOAT32, {rows, topk}, DataDevice::CPU, (void *)scores);
         Data result(FLOAT32, {rows, hidden}, DataDevice::CPU, output);
         DoNumasMergeMOEOnCPU(x, result, ids, routes, weights, nullptr, 1.0f,
-            weightsBatch, topk, cpuExperts, GetNumasMoeRuntimeCache()[layer % 2],
+            weightsBatch, topk, cpuExperts, GetNumasMoeRuntimeWorkspace(layer % 2),
             nullptr, 0.0f, false, 128, false, output);
         if (cpuElapsedUs) *cpuElapsedUs = NumasProfileNowMs() * 1000 - start;
     }
@@ -8117,7 +8158,7 @@ namespace fastllm {
         const float *scores, int topk, int layer, float swigluLimit,
         const std::function<void()> &submitted, double *cpuElapsedUs) {
         double hostStart = cpuElapsedUs ? NumasProfileNowMs() * 1000 : 0, workUs = 0;
-        auto &work = GetNumasMoeRuntimeCache()[layer % 2];
+        auto &work = GetNumasMoeRuntimeWorkspace(layer % 2);
         auto &routes = work.activeExperts;
         auto &groups = work.groupedGemmExperts;
         auto &experts = work.selectedExperts;
@@ -8274,7 +8315,7 @@ namespace fastllm {
                         firstGateSubmitted, cpuElapsedUs);
                     return;
                 }
-                auto &rowInput = GetNumasMoeRuntimeCache()[layer % 2].inputFloat32;
+                auto &rowInput = GetNumasMoeRuntimeWorkspace(layer % 2).inputFloat32;
                 rowInput.resize(hidden);
                 bool submitted = false;
                 const std::function<void()> noSubmit;
@@ -8341,7 +8382,7 @@ namespace fastllm {
             return;
         }
         DoNumasMergeMOEOnCPU(x, result, ids, routes, weights, nullptr, 1.0f,
-            weightsBatch, topk, cpuExperts, GetNumasMoeRuntimeCache()[layer % 2],
+            weightsBatch, topk, cpuExperts, GetNumasMoeRuntimeWorkspace(layer % 2),
             nullptr, swigluLimit, true, activationQuantBlock, false,
             perRoute ? (float*)output : nullptr, false, submitGpu ? &submitGpu : nullptr);
     }
@@ -8581,7 +8622,7 @@ namespace fastllm {
         int layer = intParams.find("layer") != intParams.end() ? intParams.find("layer")->second : 0;
         auto &layerWeights = GetNumasFusedMoeLayerWeights(layer, gate, up, down);
         FastllmMoeDataManagerNumas &manager =
-            GetNumasMoeRuntimeCache()[layer % 2];
+            GetNumasMoeRuntimeWorkspace(layer % 2);
 
         output.dataType = input.dataType;
         output.expansionDims.clear();
@@ -8612,8 +8653,33 @@ namespace fastllm {
         Data &rawScore = *(datas.find("score")->second);
         int layer = intParams.find("layer") != intParams.end() ?
             intParams.find("layer")->second : 0;
+        int workspace = layer % 2;
+#ifdef USE_CUDA
+        // Registered GGUF records are immutable. Route copies, partitioning and
+        // GPU uploads use private stage storage, so only CPU jobs need the pool
+        // guard. Other formats retain serialization during lazy registration.
+        Data **pipelineWeights = (Data **)datas.at("weights");
+        const int pipelineWeightCount = intParams.count("weights___batch")
+            ? intParams.at("weights___batch") : 0;
+        const auto cudaTensor = [](const Data &data) {
+            return data.dataDevice == CUDA && data.cudaData && !data.multiDeviceData;
+        };
+        const bool independentGpuPrep = numasMoePipelineCpuLock &&
+            rawInput.dims.size() == 2 && rawInput.dims[0] >= 32 &&
+            cudaTensor(rawInput) && cudaTensor(rawIndex) && cudaTensor(rawScore) &&
+            pipelineWeightCount > 0 &&
+            std::all_of(pipelineWeights, pipelineWeights + pipelineWeightCount, [](const Data *w) {
+                return !w || (w->dataType == DATA_GGUF_FORMAT && !w->numasData.empty());
+            });
+        if (independentGpuPrep) {
+            if (numasMoePipelineCpuLock->owns_lock()) numasMoePipelineCpuLock->unlock();
+        } else LockNumasMoePipelineCpu();
+        // Private per-stage storage must outlive the CPU lock: a preceding
+        // stage can still be uploading its pinned buffers or reducing on CUDA.
+        if (numasMoePipelineWorkspace >= 0) workspace = 2 + numasMoePipelineWorkspace;
+#endif
         FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas =
-            GetNumasMoeRuntimeCache()[layer % 2];
+            GetNumasMoeRuntimeWorkspace(workspace);
         const NumasMoeAssistConfig &assistConfig = GetNumasMoeAssistConfig();
 
         Data cpuIndex, cpuScore;
@@ -9998,6 +10064,7 @@ namespace fastllm {
                     profileInput.cudaData = profileReplica.cudaData;
                     profileInput.cudaDataBorrowed = true;
                     profileInput.dataDeviceIds = {profileReplica.deviceId};
+                    LockNumasMoePipelineCpu();
                     expertLimit =
                         MoeExpertSpeedEstimator::GetInstance().GetDynamicExpertLimit(
                             profileInput, output, w1, w2, w3,
@@ -10356,6 +10423,10 @@ namespace fastllm {
             phaseLap(phaseCpuMs);
 #ifdef USE_CUDA
             if (gpuPrefill && !gpuExperts.empty()) {
+                // CPU jobs have joined, and the remaining operations use only
+                // this stage's private staging and its exclusively owned GPU.
+                if (numasMoePipelineCpuLock && numasMoePipelineCpuLock->owns_lock())
+                    numasMoePipelineCpuLock->unlock();
                 for (std::thread &gpuThread : gpuThreads) {
                     gpuThread.join();
                 }
@@ -10364,8 +10435,15 @@ namespace fastllm {
                 Data gpuOutputAlias(
                     output.dataType, output.dims,
                     DataDevice::CUDA, output.cudaData);
+                const bool pipelineOutput = numasMoePipelineWorkspace >= 0 &&
+                    gpuOutputPartials.size() == 1;
                 if (cpuOutputStaging != nullptr) {
-                    FastllmCudaStreamSynchronize(cpuOutputCopyStream);
+                    if (pipelineOutput) {
+                        fastllmMoeDataManagerNumas.WaitPrefillOutputCopy(
+                            cpuOutputCopyStream, gpuId);
+                    } else {
+                        FastllmCudaStreamSynchronize(cpuOutputCopyStream);
+                    }
                     Data cpuOutputAlias(output.dataType, output.dims, DataDevice::CUDA, cpuOutputStaging);
                     FastllmCudaAddTo(gpuOutputAlias, cpuOutputAlias, 1.0f);
                 }
@@ -10386,8 +10464,14 @@ namespace fastllm {
                 }
                 // 重叠路径把中间的每一次同步都省掉了，这里统一同步一次：
                 // partial 与各 staging 缓冲要等归约真正读完才能释放/复用。
-                if (cpuOutputStaging != nullptr ||
-                    gpuOutputPartials.size() > 1) {
+                if (pipelineOutput && cpuOutputStaging != nullptr) {
+                    // The stage's next kernels follow this reduction on the
+                    // same stream. Reuse/free of its private pinned output
+                    // already waits for this event in EnsurePinnedOutput and
+                    // ClearNumasMoeRuntimeCache, including shape changes.
+                    fastllmMoeDataManagerNumas.RecordDecodeOutputCopy(gpuId);
+                } else if (cpuOutputStaging != nullptr ||
+                           gpuOutputPartials.size() > 1) {
                     FastllmCudaSyncCurrentThreadStream();
                 }
                 output.dataDevice = DataDevice::CUDA;

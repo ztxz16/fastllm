@@ -19,6 +19,7 @@
 #include <vector>
 
 namespace fastllm {
+    class CudaChunkedPrefillPipeline;
     class Qwen4ExpModel : public Qwen3NextModel {
     public:
         Qwen4ExpModel();
@@ -73,6 +74,12 @@ namespace fastllm {
                 const GenerationConfig &generationConfig = GenerationConfig(),
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector<std::vector<float> *> *logits = nullptr) override;
+
+        bool TryForwardChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask, const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken) override;
 
         void WarmUp() override;
         PagedCacheManager *GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
@@ -167,13 +174,24 @@ namespace fastllm {
             bool mtpDisabled = false;
         };
 
-#if defined(USE_CUDA) && !defined(USE_ROCM)
+        struct PrefillStageContext {
+            int firstLayer = 0, endLayer = 0;
+            bool sampleOutput = false;
+            Data *hidden = nullptr;
+            std::mutex *hostExpertMutex = nullptr;
+            RequestState *state = nullptr;
+        };
+#ifdef USE_CUDA
+        std::unique_ptr<CudaChunkedPrefillPipeline> prefillPipeline;
+#ifndef USE_ROCM
         struct PipelineMoeState;
         std::unique_ptr<PipelineMoeState> pipelineMoe;
         bool TryRunPipelineMoe(int layer, const Data &input, const Data &index,
                 const Data &score, Data &output, std::vector<Data *> &moeWeights,
                 const std::function<void()> &sharedExpert);
 #endif
+#endif
+        std::map<int, Data> prefillLinearInvScales;
 
         struct ServingCache {
             using Pools = std::pair<std::shared_ptr<PagedCacheManager>,
@@ -473,13 +491,13 @@ namespace fastllm {
                                 Data *betaCapture = nullptr,
                                 Data *recurrentStateOutput = nullptr);
         void RunMoE(int layer, const Data &input, Data &output,
-                    bool reduceOutput = true);
+                    bool reduceOutput = true, PrefillStageContext *prefill = nullptr);
         void RunMoEWithPrefix(int deviceLayer,
                               const std::string &mlpPrefix,
                               std::vector<Data *> &moeWeights,
                               std::vector<Data *> &moeBiass,
                               const Data &input, Data &output,
-                              bool reduceOutput = true);
+                              bool reduceOutput = true, PrefillStageContext *prefill = nullptr);
 
         bool HasMtpWeights() const;
         bool MtpSupportsGenerationConfig(
@@ -543,7 +561,8 @@ namespace fastllm {
             bool decodeEquivalentGdn,
             const std::vector<int> *hostInputTokens = nullptr,
             bool materializeCausalMaskOnGraphFallback = false,
-            const Data *precomputedEmbedding = nullptr);
+            const Data *precomputedEmbedding = nullptr,
+            PrefillStageContext *prefill = nullptr);
 
         bool TryRunThreadTpPrefixCudaGraph(
             Data &hiddenStates,

@@ -1141,6 +1141,13 @@ if (UNIT_TEST)
             ENVIRONMENT "FT_NUMAS=2;FT_THREADS=6;FT_GPU_PREFILL=0"
             SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         if (USE_CUDA)
+            add_executable(numas_moe_pipeline_test test/basic/test_numas_moe_pipeline.cpp)
+            target_link_libraries(numas_moe_pipeline_test PRIVATE fastllm)
+            target_include_directories(numas_moe_pipeline_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(numas_moe_pipeline numas_moe_pipeline_test "PASS: NUMA pipeline private staging" 120)
+            set_tests_properties(numas_moe_pipeline PROPERTIES
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=1;FT_EXPERT_LIMIT=32"
+                LABELS "cuda;numa;multigpu" RUN_SERIAL TRUE)
             add_executable(numas_nvfp4_hybrid_cold_test test/basic/test_numas_nvfp4_hybrid_cold.cpp)
             target_link_libraries(numas_nvfp4_hybrid_cold_test PRIVATE fastllm)
             target_include_directories(numas_nvfp4_hybrid_cold_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
