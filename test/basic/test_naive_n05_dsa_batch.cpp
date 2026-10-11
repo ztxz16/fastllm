@@ -211,6 +211,10 @@ int main() {
         FastllmCudaSetDevice(0);
         Test(1, 8, 1, 192, 128, 896, false, true);
         Test(2, 8, 1, 192, 128, 896, false, true);
+        for (int batch : {3, 4, 8}) {
+            Test(batch, 8, 1, 192, 128, 896, false, true);
+            Test(batch, 8, 1, 192, 128, 2047, false, false);
+        }
         Test(1, 8, 1, 192, 128, 4097, true, true);
         Test(4, 8, 1, 192, 128, 4097, true, true);
         Test(2, 16, 2, 192, 128, 896, false, false);

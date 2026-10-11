@@ -453,16 +453,21 @@ static void TestSwaBatch(int batch, int heads, int kvHeads) {
     }
 }
 
-static void TestRouterBatch(int batch, bool tied) {
+static void TestRouterBatch(int batch, int pattern) {
     Data input(BFLOAT16), weight(FLOAT32), bias(FLOAT32), actual, expected(FLOAT32);
     Data indices(INT32), scores(FLOAT32), referenceIndices(INT32), referenceScores(FLOAT32);
     Upload(input, {1, batch, 4096}, 181); Upload(weight, {256, 4096}, 182);
     Upload(bias, {256}, 183); Upload(expected, {1, batch, 256}, 184);
     Upload(indices, {batch, 8}, 185); Upload(scores, {batch, 8}, 186);
     Upload(referenceIndices, {batch, 8}, 187); Upload(referenceScores, {batch, 8}, 188);
-    if (tied) {
+    if (pattern == 1) {
         Cuda(cudaMemset(weight.cudaData, 0, weight.GetBytes()));
         Cuda(cudaMemset(bias.cudaData, 0, bias.GetBytes()));
+    }
+    if (pattern == 2) {
+        auto values = Read<float>(weight);
+        for (auto &value : values) value *= .01f;
+        Cuda(cudaMemcpy(weight.cudaData, values.data(), weight.GetBytes(), cudaMemcpyHostToDevice));
     }
     int previous = FastllmCudaGetLinearExactBatchThreshold();
     FastllmCudaSetLinearExactBatchThreshold(9);
@@ -529,8 +534,8 @@ int main() {
         for (int rows : {1, 2, 3, 4, 8, 33}) TestIndexerKeyNorm(rows);
         if (!FastllmCudaNaiveDecodeGraphSupported())
             return 77;
-        for (int batch : {1, 2, 3, 4, 7, 8})
-            for (bool tied : {false, true}) TestRouterBatch(batch, tied);
+        for (int batch = 1; batch <= 8; ++batch)
+            for (int pattern = 0; pattern < 3; ++pattern) TestRouterBatch(batch, pattern);
         for (int batch : {1, 2, 3, 4, 17})
             for (int heads : {4, 8, 16})
                 TestSwaBatch(batch, heads, heads == 16 ? 2 : 1);

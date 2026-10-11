@@ -136,6 +136,55 @@ __global__ void BatchRouterSigmoid4096(const BF16 *input, const float *weight,
     }
 }
 
+// Vector loads pair adjacent lanes of the original 256-thread GEMV. Retain
+// each lane's 16-term accumulation, then combine the first shuffle stage
+// locally. Four rows share each weight; the remaining tree and sigmoid are exact.
+__global__ void BatchRouterSigmoid4096Vector(const BF16 *input, const float *weight,
+        float *output, int rows, int experts) {
+    const int t = threadIdx.x, first = blockIdx.y * 4, expert = blockIdx.x;
+    __shared__ float sums[4][8];
+    float2 weights[16];
+    float values[4][16][2], partial[4][2]{};
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int column = t * 2 + i * 256;
+        weights[i] = *(const float2 *)(weight + (size_t)expert * 4096 + column);
+        #pragma unroll
+        for (int row = 0; row < 4; ++row) {
+            __align__(4) BF16 fragment[2];
+            *(unsigned *)fragment = first + row < rows
+                ? *(const unsigned *)(input + (size_t)(first + row) * 4096 + column) : 0;
+            values[row][i][0] = (float)fragment[0];
+            values[row][i][1] = (float)fragment[1];
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        #pragma unroll
+        for (int row = 0; row < 4; ++row) {
+            partial[row][0] += values[row][i][0] * weights[i].x;
+            partial[row][1] += values[row][i][1] * weights[i].y;
+        }
+    }
+    #pragma unroll
+    for (int row = 0; row < 4; ++row) {
+        float total = partial[row][0] + partial[row][1];
+        #pragma unroll
+        for (int stride = 1; stride < 16; stride *= 2)
+            total += __shfl_down_sync(0xffffffffu, total, stride);
+        if (t % 16 == 0) sums[row][t / 16] = total;
+    }
+    __syncthreads();
+    const int row = t / 32, lane = t % 32;
+    float total = lane < 8 ? sums[row][lane] : 0;
+    #pragma unroll
+    for (int stride = 1; stride < 8; stride *= 2)
+        total += __shfl_down_sync(0xffffffffu, total, stride);
+    if (lane == 0 && first + row < rows)
+        output[(size_t)(first + row) * experts + expert] =
+            1.0 / (1.0 + expf(-(total + 0.0f)));
+}
+
 constexpr int kDraftKVLayersPerLaunch = 16;
 struct DraftKVWeights { const void *data[kDraftKVLayersPerLaunch]; };
 __global__ void DraftKVPointerTable(DraftKVWeights weights, const void *input,
@@ -2686,6 +2735,11 @@ bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
     if (rows == 1)
         RouterSigmoid4096<<<experts, 256>>>((const BF16 *)input.cudaData,
             (const float *)weight.cudaData, (float *)output.cudaData);
+    else if (rows >= 3 && FastllmCudaRuntimeArch() == 90 &&
+             (uintptr_t)input.cudaData % 4 == 0 && (uintptr_t)weight.cudaData % 8 == 0)
+        BatchRouterSigmoid4096Vector<<<dim3(experts, (rows + 3) / 4), 128>>>(
+            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
+            (float *)output.cudaData, rows, experts);
     else if (rows >= 4)
         BatchRouterSigmoid4096<4><<<dim3(experts, (rows + 3) / 4), 256>>>(
             (const BF16 *)input.cudaData, (const float *)weight.cudaData,
@@ -2837,7 +2891,12 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(dsa::SparseStorage<2048, 32>));
             auto grouped = cudaFuncSetAttribute(dsa::GroupedValues<2048, 2, 8, true>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(dsa::GroupStorage<2048, 2, 8>));
-            bool available = small == cudaSuccess && large == cudaSuccess && grouped == cudaSuccess;
+            auto denseSmall = cudaFuncSetAttribute(dsa::GroupedValues<1024, 4, 16, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(dsa::GroupStorage<1024, 4, 16>));
+            auto denseLarge = cudaFuncSetAttribute(dsa::GroupedValues<2048, 4, 16, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(dsa::GroupStorage<2048, 4, 16>));
+            bool available = small == cudaSuccess && large == cudaSuccess && grouped == cudaSuccess &&
+                denseSmall == cudaSuccess && denseLarge == cudaSuccess;
             if (!available) cudaGetLastError();
             found = supported.emplace(device, available).first;
         }
@@ -2858,10 +2917,18 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
         if (hopper) {
             dsa::DirectScores<4, 4><<<dim3(heads, (count + 15) / 16, batch), 128>>>(
                 q, descriptors, scores, heads, kvHeads, count);
-            // These shapes were measured on TP8 H20: sharing V is beneficial
-            // for one/two rows, while larger batches keep per-head tiling.
+            // Share V across heads, with wider output tiles for larger dense
+            // batches. Each head retains the original softmax/PV arithmetic.
             const bool sharedHeads = heads == 8 && kvHeads == 1;
-            if (sharedHeads && sparse && batch == 1)
+            if (sharedHeads && dense && batch >= 3 && count <= 1024)
+                dsa::GroupedValues<1024, 4, 16, false><<<dim3(heads / 4, 8, batch), 1024,
+                    sizeof(dsa::GroupStorage<1024, 4, 16>)>>>(scores, bias, descriptors, out,
+                    heads, kvHeads, count);
+            else if (sharedHeads && dense && batch >= 3)
+                dsa::GroupedValues<2048, 4, 16, false><<<dim3(heads / 4, 8, batch), 1024,
+                    sizeof(dsa::GroupStorage<2048, 4, 16>)>>>(scores, bias, descriptors, out,
+                    heads, kvHeads, count);
+            else if (sharedHeads && sparse && batch == 1)
                 dsa::GroupedValues<2048, 2, 8, true><<<dim3(heads / 2, 16, batch), 512,
                     sizeof(dsa::GroupStorage<2048, 2, 8>)>>>(scores, bias, descriptors, out,
                     heads, kvHeads, count);
