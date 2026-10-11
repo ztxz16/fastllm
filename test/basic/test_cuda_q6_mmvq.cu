@@ -5,13 +5,13 @@ static void Linear(Data &x, Data &w, Data &y, int t, int k, int n) {
     Check(x.dataType == FLOAT32 ? FastllmCudaMatMulFloatGGUF(x, w, bias, y, t, k, n)
                               : FastllmCudaHalfMatMulGGUF(x, w, bias, y, t, k, n), "linear rejected");
 }
-template <typename T> static void Test(int t, int k, int n) {
+template <typename T> static void Test(int t, int k, int n, ggml_type format = GGML_TYPE_Q6_K) {
     const DataType dtype = sizeof(T) == 4 ? FLOAT32 : FLOAT16;
-    Data x(dtype, {t, k}), w(DATA_GGUF_FORMAT, int(GGML_TYPE_Q6_K), {n, k});
+    Data x(dtype, {t, k}), w(DATA_GGUF_FORMAT, int(format), {n, k});
     Data storage(dtype, {t * n + 8}), y(dtype), reference(dtype, {t, n});
     for (Data *d : {&x, &w, &storage, &reference}) Allocate(*d);
     w.strides = {1}; w.forceGGUFFp32Dequant = true;
-    Upload(w, Weights(GGML_TYPE_Q6_K, n, k));
+    Upload(w, Weights(format, n, k));
     y.FakeFrom(storage, 0); y.Resize({t, n}); y.dataDeviceIds = {0};
     auto prepare = [&](int seed) {
         std::vector<T> input(t * k);
@@ -69,6 +69,12 @@ int main() {
                     Test<float>(t, k, n);
                     Test<half>(t, k, n); cases += 2;
                 }
+        for (auto format : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            const int n = format == GGML_TYPE_Q5_K ? 2049 : 32769;
+            Test<float>(2, 2560, n, format);
+            Test<half>(2, 2560, n, format);
+            cases += 2;
+        }
         std::cout << "PASS Q6 multi-row cases=" << cases << " with changed-input graph replays\n";
     } catch (const std::exception &e) { std::cerr << e.what() << '\n'; return 1; }
 }

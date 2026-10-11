@@ -180,6 +180,35 @@ static void mul_mat_vec_q_cuda_T(
 #include "fastllm-gguf-small-mmvq.cuh"
 #endif
 
+// Pack independent decode outputs into one CTA while retaining the legacy
+// four-warp dot-product and reduction order in four virtual warp groups.
+// This reduces CTA scheduling overhead for broad Q5_K/Q6_K projections.
+template <ggml_type type, typename Output>
+static __global__ void FastllmGgufMmvqWarpRows(
+        const void * __restrict__ weights, const block_q8_1 * __restrict__ input,
+        Output * __restrict__ output, int columns, int rows) {
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int blocksPerIter = vdr * 4 * WARP_SIZE / qi;
+    constexpr vec_dot_q_cuda_t dot = get_vec_dot_q_cuda(type);
+    const int row = blockIdx.x * 4 + threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (row >= rows) return;
+    float partial[4];
+#pragma unroll
+    for (int warp = 0; warp < 4; ++warp) {
+        const int tid = warp * WARP_SIZE + lane;
+        float sum = 0;
+        for (int block = tid / (qi / vdr); block < columns / qk; block += blocksPerIter)
+            sum += dot(weights, input + block * (qk / QK8_1),
+                row * (columns / qk) + block, vdr * (tid % (qi / vdr)));
+        partial[warp] = sum;
+    }
+    const float sum = warp_reduce_sum(((partial[0] + partial[1]) + partial[2]) + partial[3]);
+    if (lane == 0) FastllmGgufStore<0>(output + row, sum);
+}
+
 template <ggml_type type, typename OType, int StoreMode>
 void mul_mat_vec_q_cuda(
     const void * vx, const void * vy, OType * dst, const char * ids_data,
@@ -187,6 +216,20 @@ void mul_mat_vec_q_cuda(
     const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, const int64_t ids_nb0,
     cudaStream_t stream) {
 #if !defined(USE_ROCM)
+    if constexpr (StoreMode == 0 && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
+        if (ncols_y == 1 && ne2 == 1 && !ids_data && nrows_dst >= nrows_x &&
+            ncols_x == 2560 && nrows_x >= (type == GGML_TYPE_Q5_K ? 2048 : 32768)) {
+            int major = 0, minor = 0;
+            const int device = FastllmCudaGetDevice();
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
+                major == 7 && minor == 5) {
+                FastllmGgufMmvqWarpRows<type><<<(nrows_x + 3) / 4, 128, 0, stream>>>(
+                    vx, static_cast<const block_q8_1 *>(vy), dst, ncols_x, nrows_x);
+                return;
+            }
+        }
+    }
     if constexpr (type == GGML_TYPE_Q3_K) {
         if (ncols_y == 1 && ne2 == 1 && ids_data == nullptr && nrows_dst >= nrows_x &&
             fastllm_gguf_q3_k::Supports(vy, ncols_x, nrows_x)) {

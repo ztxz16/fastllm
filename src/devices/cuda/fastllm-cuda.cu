@@ -11624,24 +11624,19 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
     useLegacyMerge = __shfl_sync(FULL_WARP_MASK, useLegacyMerge, 0);
 
     if (!useLegacyMerge) {
-        if (lane == 0) {
-            float selectedSum = 1.0f;
-            if (needNorm) {
-                selectedSum = 0.0f;
+        float selectedSum = 1.0f;
+        if (lane == 0 && needNorm) {
+            selectedSum = 0.0f;
 #pragma unroll
-                for (int rank = 0; rank < TOPK; ++rank) {
-                    selectedSum += selectedProbabilities[rank];
-                }
-                if (!isfinite(selectedSum) || fabsf(selectedSum) < 1.0e-20f) {
-                    selectedSum = 1.0f;
-                }
-            }
-#pragma unroll
-            for (int rank = 0; rank < TOPK; ++rank) {
-                index[rank] = selectedIds[rank];
-                score[rank] = selectedProbabilities[rank] /
-                              selectedSum * routeScale;
-            }
+            for (int rank = 0; rank < TOPK; ++rank)
+                selectedSum += selectedProbabilities[rank];
+            if (!isfinite(selectedSum) || fabsf(selectedSum) < 1.0e-20f)
+                selectedSum = 1.0f;
+        }
+        selectedSum = __shfl_sync(FULL_WARP_MASK, selectedSum, 0);
+        if (lane < TOPK) {
+            index[lane] = selectedIds[lane];
+            score[lane] = selectedProbabilities[lane] / selectedSum * routeScale;
         }
         return;
     }
