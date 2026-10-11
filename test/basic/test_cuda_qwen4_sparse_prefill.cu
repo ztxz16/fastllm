@@ -49,7 +49,7 @@ template <class F> static float Time(F f, int n) {
     C(cudaEventDestroy(b));
     return ms / n;
 }
-static void Sparse(int rows, int kh, int group, int dim, int width, int length, int rounds) {
+static void Sparse(int rows, int kh, int group, int dim, int width, int length, int rounds, bool decode = false) {
     int qh = kh * group;
     Data q(FLOAT16, {qh, rows, dim}), k(FLOAT16), v(FLOAT16), ids(INT32, {rows, width});
     GPU(q);
@@ -79,6 +79,13 @@ static void Sparse(int rows, int kh, int group, int dim, int width, int length, 
     GPU(b);
     float scale = 1 / std::sqrt(float(dim));
     auto old = [&] {
+        if (decode) {
+            Data ck(FLOAT16, {kh, width, dim}), cv(FLOAT16, ck.dims), mask;
+            GPU(ck); GPU(cv);
+            Check(FastllmCudaQwen4GatherKV(k, v, ids, ck, cv), "decode gather");
+            DoCudaAttention(q, ck, cv, mask, a, group, scale, 1);
+            return;
+        }
         for (int start = 0; start < rows; start += 128) {
             int n = std::min(128, rows - start);
             Data pq(FLOAT16, {n * qh, 1, dim}), ck(FLOAT16, {n * kh, width, dim}),
@@ -91,11 +98,25 @@ static void Sparse(int rows, int kh, int group, int dim, int width, int length, 
             Check(FastllmCudaQwen4UnpackSparseBatch(o, a, start, n), "unpack");
         }
     };
-    auto now = [&] {
-        Check(FastllmCudaQwen4SparsePrefill(q, k, v, ids, b, group, scale), "new sparse rejected");
+    auto dispatch = [&](const Data &key, const Data &value, Data &out,
+                        const int32_t *meta = nullptr) {
+        return decode ? FastllmCudaQwen4SparseDecode(q, key, value, ids, out, group, scale, meta)
+                      : FastllmCudaQwen4SparsePrefill(q, key, value, ids, out, group, scale);
     };
+    auto now = [&] { Check(dispatch(k, v, b), "indexed sparse rejected"); };
     old();
     now();
+    if (decode) {
+        Data dispatched;
+        Qwen4SparseAttention(q, k, v, ids, group, scale, dispatched);
+        std::vector<half> direct(q.Count(0)), throughExecutor(direct.size());
+        C(cudaMemcpy(direct.data(), b.cudaData, direct.size()*2, cudaMemcpyDeviceToHost));
+        C(cudaMemcpy(throughExecutor.data(), dispatched.cudaData, throughExecutor.size()*2,
+                     cudaMemcpyDeviceToHost));
+        Check(std::memcmp(direct.data(), throughExecutor.data(), direct.size()*2) == 0,
+              "decode dispatcher differs from direct kernel");
+    }
+
     std::vector<half> av(q.Count(0)), bv(av.size());
     C(cudaMemcpy(av.data(), a.cudaData, av.size() * 2, cudaMemcpyDeviceToHost));
     C(cudaMemcpy(bv.data(), b.cudaData, bv.size() * 2, cudaMemcpyDeviceToHost));
@@ -133,7 +154,7 @@ static void Sparse(int rows, int kh, int group, int dim, int width, int length, 
                            __half2float(hk[(head / group) * k.strides[0] + token * dim + c]);
             scores[t] = token >= 0 && token < length
                             ? __half2float(__float2half_rn(float(dot * hs)))
-                            : -10000.f;
+                            : (decode ? 0.f : -10000.f);
             maximum = std::max(maximum, scores[t]);
         }
         double denominator = 0;
@@ -194,7 +215,7 @@ static void Sparse(int rows, int kh, int group, int dim, int width, int length, 
         view.pageLen = pageLen;
     }
     GPU(pagedOut);
-    Check(FastllmCudaQwen4SparsePrefill(q, pk, pv, ids, pagedOut, group, scale),
+    Check(dispatch(pk, pv, pagedOut),
           "paged sparse rejected");
     std::vector<half> pagedValues(bv.size());
     C(cudaMemcpy(pagedValues.data(), pagedOut.cudaData, pagedValues.size() * 2,
@@ -210,28 +231,56 @@ static void Sparse(int rows, int kh, int group, int dim, int width, int length, 
     untouched.dataDeviceIds = {0};
     void *savedKey = k.cudaData;
     k.cudaData = static_cast<char *>(savedKey) + sizeof(half);
-    const bool unaligned = FastllmCudaQwen4SparsePrefill(q, k, v, ids, untouched, group, scale);
+    const bool unaligned = dispatch(k, v, untouched);
     k.cudaData = savedKey;
     Check(!unaligned && !untouched.cudaData, "unaligned fallback allocated output");
     // Unsupported decode size/type must leave the old dispatcher available.
     auto savedDims = q.dims;
-    q.dims[1] = 1;
-    Check(!FastllmCudaQwen4SparsePrefill(q, k, v, ids, pagedOut, group, scale),
+    q.dims[1] = decode ? 2 : 1;
+    Check(!dispatch(k, v, pagedOut),
           "decode fallback missing");
     q.dims = savedDims;
     q.dataType = FLOAT32;
-    Check(!FastllmCudaQwen4SparsePrefill(q, k, v, ids, pagedOut, group, scale),
+    Check(!dispatch(k, v, pagedOut),
           "type fallback missing");
     q.dataType = FLOAT16;
-    Check(FastllmCudaGraphPrepareCaptureDevice(), "graph prepare");
-    Check(FastllmCudaGraphBeginCapture(), "graph begin");
-    bool dispatched = FastllmCudaQwen4SparsePrefill(q, k, v, ids, pagedOut, group, scale);
-    void *graph = nullptr;
-    bool ended = FastllmCudaGraphEndCapture(&graph);
-    Check(!dispatched && ended, "graph fallback missing");
-    FastllmCudaGraphDestroy(graph);
+    if (decode) {
+        Data meta(INT32, {1, 1}), replay(FLOAT16, q.dims), eager(FLOAT16, q.dims);
+        GPU(meta); GPU(replay); GPU(eager);
+        int previous = length - 1;
+        C(cudaMemcpy(meta.cudaData, &previous, 4, cudaMemcpyHostToDevice));
+        Check(FastllmCudaGraphPrepareCaptureDevice(), "decode graph prepare");
+        Check(FastllmCudaGraphBeginCapture(), "decode graph begin");
+        Check(FastllmCudaQwen4SparseDecode(q, k, v, ids, replay, group, scale,
+                                          (const int32_t *)meta.cudaData), "decode graph dispatch");
+        void *graph = nullptr, *exec = nullptr;
+        Check(FastllmCudaGraphEndCapture(&graph), "decode graph end");
+        Check(FastllmCudaGraphInstantiate(graph, &exec), "decode graph instantiate");
+        for (int active : {length, length / 2, 1, length - 1}) {
+            previous = active - 1;
+            C(cudaMemcpy(meta.cudaData, &previous, 4, cudaMemcpyHostToDevice));
+            Check(FastllmCudaGraphLaunch(exec), "decode graph replay");
+            k.Resize({kh, active, dim}); v.Resize(k.dims);
+            Check(FastllmCudaQwen4SparseDecode(q, k, v, ids, eager, group, scale), "decode eager");
+            std::vector<half> x(q.Count(0)), y(x.size());
+            C(cudaMemcpy(x.data(), replay.cudaData, x.size()*2, cudaMemcpyDeviceToHost));
+            C(cudaMemcpy(y.data(), eager.cudaData, y.size()*2, cudaMemcpyDeviceToHost));
+            Check(std::memcmp(x.data(), y.data(), x.size()*2) == 0, "dynamic graph length mismatch");
+        }
+        k.Resize({kh, length, dim}); v.Resize(k.dims);
+        FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+        printf("DECODE_GRAPH kh=%d group=%d dim=%d width=%d PASS\n", kh, group, dim, width);
+    } else {
+        Check(FastllmCudaGraphPrepareCaptureDevice(), "graph prepare");
+        Check(FastllmCudaGraphBeginCapture(), "graph begin");
+        bool dispatched = dispatch(k, v, pagedOut);
+        void *graph = nullptr;
+        bool ended = FastllmCudaGraphEndCapture(&graph);
+        Check(!dispatched && ended, "graph fallback missing");
+        FastllmCudaGraphDestroy(graph);
+    }
     double nrms = std::sqrt(err2 / std::max(ref2, 1e-30));
-    printf("SPARSE rows=%d kh=%d group=%d dim=%d width=%d max=%g nrms=%g bad=%d", rows, kh, group,
+    printf("SPARSE decode=%d rows=%d kh=%d group=%d dim=%d width=%d max=%g nrms=%g bad=%d", int(decode), rows, kh, group,
            dim, width, max, nrms, bad);
     fflush(stdout);
     Check(!bad && nrms < 0.003, "sparse numerical mismatch");
@@ -329,6 +378,13 @@ int main() {
         Sparse(2048, 1, 16, 256, 2064, 16384, 3);
         Sparse(2048, 1, 32, 256, 2064, 16384, 3);
         Sparse(33, 1, 17, 80, 3071, 4096, 3);
+        Sparse(1, 1, 1, 16, 128, 171, 10, true);
+        Sparse(1, 2, 7, 48, 129, 171, 10, true);
+        Sparse(1, 2, 24, 128, 257, 1024, 10, true);
+        Sparse(1, 2, 12, 256, 2050, 4096, 10, true);
+        Sparse(1, 2, 16, 256, 2064, 65536, 10, true);
+        Sparse(1, 1, 32, 256, 2064, 4096, 10, true);
+        Sparse(1, 1, 17, 80, 3071, 4096, 10, true);
         puts("PASS Qwen4 indexed sparse prefill and HyperMix");
         return 0;
     } catch (const std::exception &e) {

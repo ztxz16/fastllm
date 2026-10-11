@@ -2041,6 +2041,47 @@ namespace {
         }
     }
 
+    // Coalesced key loads for one decode query. Shared-memory transposition
+    // retains the original serial FP32 dot order and ordered head reduction,
+    // including exact score ties, while avoiding strided global loads.
+    template <typename T>
+    __global__ void Qwen4QSAScoreDecodeKernel(
+            const T *query, const float *compressedKeys, float *scores,
+            int blocks, float inverseSqrt, int queryStart, int compressRatio,
+            const int32_t *decodeMeta) {
+        constexpr int tileKeys = 32, heads = 4, dim = 128;
+        __shared__ float keys[dim][tileKeys + 1];
+        __shared__ float queries[dim][heads + 1];
+        const int position = queryStart == -2 && decodeMeta ? decodeMeta[0] : queryStart;
+        const int actual = position >= 0 ? (position + 1) / compressRatio :
+            (decodeMeta ? (decodeMeta[0] + 1) / compressRatio : blocks);
+        const int valid = min(blocks, actual);
+        const int firstKey = blockIdx.x * tileKeys;
+        if (firstKey >= valid) return;
+        #pragma unroll
+        for (int i = threadIdx.x; i < tileKeys * dim; i += tileKeys * heads) {
+            const int key = i / dim, column = i % dim;
+            keys[column][key] = firstKey + key < valid
+                ? compressedKeys[(uint64_t)(firstKey + key) * dim + column] : 0.0f;
+        }
+        #pragma unroll
+        for (int i = threadIdx.x; i < heads * dim; i += tileKeys * heads)
+            queries[i % dim][i / dim] = Qwen4CudaToFloat(query[i]);
+        __syncthreads();
+        const int head = threadIdx.x % heads;
+        const int key = threadIdx.x / heads;
+        float dot = 0.0f;
+#pragma unroll
+        for (int column = 0; column < dim; ++column)
+            dot += queries[column][head] * keys[column][key];
+        float score = 0.0f;
+#pragma unroll
+        for (int h = 0; h < heads; ++h)
+            score += fmaxf(__shfl_sync(0xffffffffu, dot, h, heads), 0.0f);
+        if (head == 0 && firstKey + key < valid)
+            scores[firstKey + key] = score * inverseSqrt;
+    }
+
     // Reuse each compressed key across four prefill queries. Transposed,
     // padded shared tiles make global loads contiguous without changing the
     // serial FP32 accumulation order within any head (including Top-K ties).
@@ -3510,6 +3551,16 @@ static bool FastllmCudaQwen4QSASelectLaunch(
     }
     auto launchScore = [&](const auto *typedQuery) {
         using T = std::remove_cv_t<std::remove_pointer_t<decltype(typedQuery)>>;
+        if (rows == 1 && heads == 4 && headDim == 128) {
+            Qwen4QSAScoreDecodeKernel<<<(scoreCapacity + 31) / 32, 128, 0, cudaStreamPerThread>>>(
+                typedQuery, (const float *)compressedKeys.cudaData, scores,
+                scoreCapacity, inverseSqrt, queryStart, compressRatio, decodeMeta);
+            const cudaError_t error = cudaGetLastError();
+            if (error == cudaSuccess) return true;
+            if (error != cudaErrorInvalidConfiguration && error != cudaErrorLaunchOutOfResources &&
+                error != cudaErrorNoKernelImageForDevice && error != cudaErrorInvalidDeviceFunction)
+                return false;
+        }
         if (tiledPrefill) {
             const dim3 grid((activeBlocks + 63) / 64, (rows + 3) / 4);
             Qwen4QSAScorePrefillKernel<<<grid, threads, 0, cudaStreamPerThread>>>(
@@ -5060,6 +5111,82 @@ bool FastllmCudaQwen4SparsePrefill(const fastllm::Data &query, const fastllm::Da
     }
     AssertInFastLLM(cudaGetLastError() == cudaSuccess, "Qwen4 sparse prefill launch failed.");
     FastllmCudaSyncCurrentThreadStream();
+    return true;
+#endif
+}
+
+// Single-query QSA keeps the same FP16 score/probability boundaries as the
+// gather + attention path, including zero K/V for invalid selected positions.
+// decodeMeta makes cache length dynamic during CUDA graph replay.
+bool FastllmCudaQwen4SparseDecode(const fastllm::Data &query, const fastllm::Data &key,
+                                 const fastllm::Data &value, const fastllm::Data &indices,
+                                 fastllm::Data &output, int groups, float scale,
+                                 const int32_t *decodeMeta) {
+#if defined(USE_ROCM) || defined(CUDA_NO_TENSOR_CORE)
+    return false;
+#else
+    using namespace fastllm;
+    if (query.dataType != FLOAT16 || key.dataType != FLOAT16 || value.dataType != FLOAT16 ||
+        indices.dataType != INT32 || query.dims.size() != 3 || key.dims.size() != 3 ||
+        value.dims != key.dims || indices.dims.size() != 2 || groups <= 0 || groups > 32 ||
+        int64_t(query.dims[0]) != int64_t(key.dims[0]) * groups || query.dims[1] != 1 ||
+        indices.dims[0] != 1 || query.dims[2] != key.dims[2] || query.dims[2] <= 0 ||
+        query.dims[2] > 256 || query.dims[2] % 16 || key.dims[0] <= 0 || key.dims[1] <= 0 ||
+        indices.dims[1] < 128 || indices.dims[1] > 3072 ||
+        query.dataDevice != CUDA || key.dataDevice != CUDA || value.dataDevice != CUDA ||
+        indices.dataDevice != CUDA || !query.cudaData || !key.cudaData || !value.cudaData ||
+        !indices.cudaData || query.strides.size() != 3 || key.strides.size() != 3 ||
+        value.strides.size() != 3 || indices.strides.size() != 2 || query.strides[2] != 1 ||
+        query.strides[0] != uint64_t(query.dims[2]) || query.strides[1] != query.strides[0] ||
+        key.strides[2] != 1 || value.strides[2] != 1 || key.strides[1] != key.dims[2] ||
+        value.strides[1] != value.dims[2] || key.strides[0] % 8 || value.strides[0] % 8 ||
+        indices.strides[0] != indices.dims[1] || indices.strides[1] != 1 ||
+        (reinterpret_cast<uintptr_t>(query.cudaData) & 15))
+        return false;
+    const int device = FastllmCudaGetDevice();
+    int major = 0, minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess ||
+        major * 10 + minor < 75)
+        return false;
+    const int heads = query.dims[0], dim = query.dims[2], width = indices.dims[1];
+    const uint64_t headTiles = uint64_t(key.dims[0]) * ((uint64_t(groups) + 15) / 16);
+    if (headTiles > 65535 || uint64_t(heads) * dim > INT_MAX)
+        return false;
+    const auto address = Qwen4GetCacheAddress(key, value);
+    const auto *keyData = static_cast<const half *>(Qwen4CachePayload(key));
+    const auto *valueData = static_cast<const half *>(Qwen4CachePayload(value));
+    if (!keyData || !valueData || (reinterpret_cast<uintptr_t>(keyData) & 15) ||
+        (reinterpret_cast<uintptr_t>(valueData) & 15))
+        return false;
+    const int splits = (width + 127) / 128;
+    Data scores(FLOAT16, {heads, width}), partials(FLOAT32, {splits, heads, dim});
+    for (Data *tensor : {&scores, &partials}) {
+        tensor->dataDevice = CUDA;
+        tensor->dataDeviceIds = {device};
+        tensor->Allocate(false);
+    }
+    output.dataType = FLOAT16;
+    output.UpdateUnitSize();
+    output.Resize(query.dims);
+    output.ToDevice(CUDA, std::vector<int>{device}, false);
+    output.Allocate(false);
+    Qwen4SparseQK<true><<<dim3((width + 63) / 64, 1, headTiles), 128,
+                         (16 + 64) * (dim + 8) * sizeof(half) + 1024 * sizeof(float),
+                         cudaStreamPerThread>>>(
+        (const half *)query.cudaData, keyData, (const int32_t *)indices.cudaData,
+        (half *)scores.cudaData, 1, heads, groups, key.dims[1], dim, width, 0,
+        key.strides[0], __half2float(__float2half_rn(scale)), address, decodeMeta);
+    FastllmCudaSoftmax(scores, scores, -1);
+    Qwen4SparsePV<true><<<dim3((dim + 63) / 64, splits, headTiles), 128, 0,
+                         cudaStreamPerThread>>>(
+        (const half *)scores.cudaData, valueData, (const int32_t *)indices.cudaData,
+        (float *)partials.cudaData, 1, heads, groups, key.dims[1], dim, width, 0,
+        value.strides[0], address, decodeMeta);
+    Qwen4SparseDecodeReduce<<<(heads * dim + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        (const float *)partials.cudaData, (half *)output.cudaData, heads * dim, splits);
+    AssertInFastLLM(cudaGetLastError() == cudaSuccess, "Qwen4 sparse decode launch failed.");
+    DeviceSync();
     return true;
 #endif
 }

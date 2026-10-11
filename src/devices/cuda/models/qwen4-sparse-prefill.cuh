@@ -1,9 +1,10 @@
 // Indexed FP16 attention. A tile shares one KV head among up to 16 query
 // heads. KV remains in its original cache; only the scores are materialized.
+template <bool DECODE = false>
 __global__ void Qwen4SparseQK(const half *query, const half *key, const int32_t *indices,
                               half *scores, int sequence, int queryHeads, int groups, int length,
                               int dim, int width, int rowStart, uint64_t keyStride, float scale,
-                              Qwen4CacheAddress address) {
+                              Qwen4CacheAddress address, const int32_t *decodeMeta = nullptr) {
 #if __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     extern __shared__ __align__(32) unsigned char shared[];
@@ -11,7 +12,8 @@ __global__ void Qwen4SparseQK(const half *query, const half *key, const int32_t 
     const int pitch = dim + 8;
     auto *k = q + 16 * pitch;
     auto *dots = reinterpret_cast<float *>(k + 64 * pitch);
-    const int row = blockIdx.y + rowStart;
+    const int row = DECODE ? 0 : blockIdx.y + rowStart;
+    if (DECODE && decodeMeta) length = decodeMeta[0] + 1;
     const int headTiles = (groups + 15) / 16;
     const int kvHead = blockIdx.z / headTiles;
     const int firstHead = kvHead * groups + (blockIdx.z % headTiles) * 16;
@@ -52,21 +54,23 @@ __global__ void Qwen4SparseQK(const half *query, const half *key, const int32_t 
             const int token = indices[uint64_t(row) * width + selected];
             scores[(uint64_t(blockIdx.y) * queryHeads + firstHead + h) * width + selected] =
                 __float2half_rn(token >= 0 && token < length ? dots[warp * 256 + i] * scale
-                                                             : -10000.0f);
+                                                             : (DECODE ? 0.0f : -10000.0f));
         }
     }
 #endif
 }
 
+template <bool DECODE = false, typename Output = half>
 __global__ void Qwen4SparsePV(const half *probabilities, const half *value, const int32_t *indices,
-                              half *output, int sequence, int queryHeads, int groups, int length,
+                              Output *output, int sequence, int queryHeads, int groups, int length,
                               int dim, int width, int rowStart, uint64_t valueStride,
-                              Qwen4CacheAddress address) {
+                              Qwen4CacheAddress address, const int32_t *decodeMeta = nullptr) {
 #if __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     __shared__ __align__(32) half p[16 * 24], v[16 * 72];
     __shared__ __align__(32) float result[4 * 16 * 16];
-    const int row = blockIdx.y + rowStart;
+    const int row = DECODE ? 0 : blockIdx.y + rowStart;
+    if (DECODE && decodeMeta) length = decodeMeta[0] + 1;
     const int headTiles = (groups + 15) / 16;
     const int kvHead = blockIdx.z / headTiles;
     const int firstHead = kvHead * groups + (blockIdx.z % headTiles) * 16;
@@ -76,12 +80,16 @@ __global__ void Qwen4SparsePV(const half *probabilities, const half *value, cons
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
     wmma::fill_fragment(c, 0.0f);
-    for (int selected = 0; selected < width; selected += 16) {
+    // Decode splits the selected tokens across CTAs. Prefill has enough query
+    // rows to keep the GPU busy and retains its original accumulation order.
+    const int begin = DECODE ? blockIdx.y * 128 : 0;
+    const int end = DECODE ? min(width, begin + 128) : width;
+    for (int selected = begin; selected < end; selected += 16) {
         for (int i = threadIdx.x; i < 256; i += blockDim.x) {
             const int h = i / 16, column = selected + i % 16;
             p[h * 24 + i % 16] =
                 h < heads && column < width
-                    ? probabilities[(uint64_t(blockIdx.y) * queryHeads + firstHead + h) * width +
+                    ? probabilities[(uint64_t(DECODE ? 0 : blockIdx.y) * queryHeads + firstHead + h) * width +
                                     column]
                     : half(0);
         }
@@ -105,9 +113,22 @@ __global__ void Qwen4SparsePV(const half *probabilities, const half *value, cons
     __syncwarp();
     for (int i = lane; i < 256; i += 32) {
         const int h = i / 16, col = blockIdx.x * 64 + warp * 16 + i % 16;
-        if (h < heads && col < dim)
-            output[(uint64_t(firstHead + h) * sequence + row) * dim + col] =
-                __float2half_rn(result[warp * 256 + i]);
+        if (h < heads && col < dim) {
+            const uint64_t offset = DECODE
+                ? (uint64_t(blockIdx.y) * queryHeads + firstHead + h) * dim + col
+                : (uint64_t(firstHead + h) * sequence + row) * dim + col;
+            output[offset] = Output(result[warp * 256 + i]);
+        }
     }
 #endif
+}
+
+__global__ void Qwen4SparseDecodeReduce(const float *partials, half *output, int count, int splits) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        float sum = 0;
+        for (int split = 0; split < splits; ++split)
+            sum += partials[uint64_t(split) * count + i];
+        output[i] = __float2half_rn(sum);
+    }
 }

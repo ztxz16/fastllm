@@ -774,8 +774,13 @@ bool FastllmCudaQwen4GatherKV(const fastllm::Data &key,
                              const fastllm::Data &indices,
                              fastllm::Data &compactKey,
                              fastllm::Data &compactValue);
-// Indexed FP16 prefill without expanded KV tensors. Returns false for
-// unsupported layouts, devices, or graph capture so the caller can fall back.
+// Indexed FP16 single-query attention; decodeMeta supplies the graph replay position.
+bool FastllmCudaQwen4SparseDecode(const fastllm::Data &query, const fastllm::Data &key,
+                                 const fastllm::Data &value, const fastllm::Data &indices,
+                                 fastllm::Data &output, int groups, float scale,
+                                 const int32_t *decodeMeta = nullptr);
+
+// Indexed FP16 prefill; unsupported layouts and graph capture use the fallback.
 bool FastllmCudaQwen4SparsePrefill(
     const fastllm::Data &query, const fastllm::Data &key,
     const fastllm::Data &value, const fastllm::Data &indices,
