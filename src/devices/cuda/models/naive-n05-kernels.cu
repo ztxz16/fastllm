@@ -653,6 +653,36 @@ __global__ void BatchRopeAppendCache(RopeCacheBatch batch, int heads, int kvHead
         dim, valueDim, indexDim, rotaryDim, theta, valueScale, window, ring);
 }
 
+// Same 64-lane FP32 tree and epsilon as LayerNorm(FP32), with BF16 I/O.
+__global__ void IndexerKeyNorm(BF16 *input, const float *weight, const float *bias) {
+    const int t = threadIdx.x;
+    input += blockIdx.x * 128;
+    __shared__ float sum[64], square[64], mean, deviation;
+    float total = 0, totalSquare = 0;
+    for (int i = t; i < 128; i += 64) {
+        float x = (float)input[i];
+        total += x;
+        totalSquare += x * x;
+    }
+    sum[t] = total; square[t] = totalSquare;
+    __syncthreads();
+    for (int stride = 32; stride; stride >>= 1) {
+        if (t < stride) {
+            sum[t] += sum[t + stride];
+            square[t] += square[t + stride];
+        }
+        __syncthreads();
+    }
+    if (!t) {
+        mean = sum[0] / 128;
+        deviation = square[0] + mean * mean * 128 - 2 * mean * 128 * mean;
+        deviation = sqrt(deviation / 128 + 1e-10);
+    }
+    __syncthreads();
+    for (int i = t; i < 128; i += 64)
+        input[i] = __float2bfloat16_rn(((float)input[i] - mean) / deviation * weight[i] + bias[i]);
+}
+
 __global__ void RoundIndexer(const BF16 *input, float *output, int stride,
                              int offset, bool fp8) {
     __shared__ float maximum[128];
@@ -2145,6 +2175,24 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
             heads, kvHeads, dim, valueDim, indexDim, rotaryDim, theta,
             __float2bfloat16_rn(valueScale), window, ring);
     }
+    CheckLaunch();
+    return true;
+}
+
+bool FastllmCudaNaiveIndexerKeyNorm(fastllm::Data &input,
+        const fastllm::Data &weight, const fastllm::Data &bias) {
+    using namespace fastllm;
+    const std::vector<int> device{FastllmCudaGetDevice()};
+    auto resident = [&](const Data &x, DataType type) {
+        return x.dataType == type && x.dataDevice == DataDevice::CUDA &&
+            x.dataDeviceIds == device && x.cudaData;
+    };
+    if (!resident(input, BFLOAT16) || !resident(weight, FLOAT32) || !resident(bias, FLOAT32) ||
+        input.dims.size() != 3 || input.dims[0] != 1 || input.dims[1] <= 0 ||
+        input.dims[2] != 128 || input.strides.size() != 3 || input.strides[1] != 128 ||
+        input.strides[2] != 1 || weight.Count(0) != 128 || bias.Count(0) != 128) return false;
+    IndexerKeyNorm<<<input.dims[1], 64>>>((BF16 *)input.cudaData,
+        (const float *)weight.cudaData, (const float *)bias.cudaData);
     CheckLaunch();
     return true;
 }

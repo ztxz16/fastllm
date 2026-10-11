@@ -4,6 +4,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "fastllm.h"
+#include "blocks/baseblock.h"
 #include "utils/utils.h"
 #include <algorithm>
 #include <cstdio>
@@ -488,12 +489,44 @@ static void TestRouterBatch(int batch, bool tied) {
     FastllmCudaSetLinearExactBatchThreshold(previous);
 }
 
+static void TestIndexerKeyNorm(int rows) {
+    Data input(BFLOAT16), weight(FLOAT32), bias(FLOAT32), reference, expected;
+    Upload(input, {1, rows, 128}, 917);
+    Upload(weight, {128}, 918); Upload(bias, {128}, 919);
+    auto original = Read<uint16_t>(input);
+    Graph graph;
+    graph.Capture([&] {
+        Require(FastllmCudaNaiveIndexerKeyNorm(input, weight, bias), "Indexer norm layout rejected");
+    });
+    for (int pattern = 0; pattern < 4; ++pattern) {
+        auto values = original;
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (pattern == 1) values[i] = Float32ToBFloat16RNEBits(2.f);
+            if (pattern == 2) values[i] = Float32ToBFloat16RNEBits((i % 2 ? -1.f : 1.f) * (i % 7 ? .001f : 100.f));
+            if (pattern == 3) values[i] = Float32ToBFloat16RNEBits(1.f + (i % 5) / 128.f);
+        }
+        Cuda(cudaMemcpy(input.cudaData, values.data(), values.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+        ToDataType(input, reference, FLOAT32);
+        LayerNorm(reference, weight, bias, -1, reference);
+        ToDataType(reference, expected, BFLOAT16);
+        graph.Run();
+        Require(Read<uint16_t>(input) == Read<uint16_t>(expected), "Indexer BF16 norm differs bitwise");
+        ++checks;
+    }
+    auto before = Read<uint16_t>(input);
+    input.strides[1]++;
+    Require(!FastllmCudaNaiveIndexerKeyNorm(input, weight, bias), "Indexer norm accepted invalid stride");
+    input.strides[1]--;
+    Require(Read<uint16_t>(input) == before, "unsupported Indexer norm changed input");
+}
+
 int main() {
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
             return 77;
         FastllmCudaSetDevice(0);
+        for (int rows : {1, 2, 3, 4, 8, 33}) TestIndexerKeyNorm(rows);
         if (!FastllmCudaNaiveDecodeGraphSupported())
             return 77;
         for (int batch : {1, 2, 3, 4, 7, 8})

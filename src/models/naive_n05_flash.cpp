@@ -507,22 +507,23 @@ Data NaiveN05FlashModel::RunTarget(
         std::vector<FastllmNaiveSWARow> swaRows;
         if (batchedSWA) swaRows.reserve(batch->Size());
         auto prepareIndexKey = [&](Data &normed, TargetWorkspace &buf) {
+            if (slidingLayers[layer]) return;
             Data &indexKey = buf.indexKey;
-            if (!slidingLayers[layer]) {
-                std::string ip = ap + "indexer.";
-                Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
-                // LayerNorm accumulates in FP32; the generic CUDA operation does
-                // not accept BF16 storage, so round only its final result.
-                if (decodeWorkspace) {
-                    ToDataType(indexKey, buf.indexKeyFloat, DataType::FLOAT32);
-                    LayerNorm(buf.indexKeyFloat, localWeight(ip + "k_norm.weight"),
-                              localWeight(ip + "k_norm.bias"), -1, buf.indexKeyFloat);
-                    ToDataType(buf.indexKeyFloat, indexKey, DataType::BFLOAT16);
-                } else {
-                    ToDataType(indexKey, DataType::FLOAT32);
-                    LayerNorm(indexKey, localWeight(ip + "k_norm.weight"), localWeight(ip + "k_norm.bias"), -1, indexKey);
-                    ToDataType(indexKey, DataType::BFLOAT16);
-                }
+            const std::string ip = ap + "indexer.";
+            Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
+            if (decodeWorkspace && FastllmCudaNaiveIndexerKeyNorm(indexKey,
+                    localWeight(ip + "k_norm.weight"), localWeight(ip + "k_norm.bias"))) return;
+            // LayerNorm accumulates in FP32; the generic CUDA operation does
+            // not accept BF16 storage, so round only its final result.
+            if (decodeWorkspace) {
+                ToDataType(indexKey, buf.indexKeyFloat, DataType::FLOAT32);
+                LayerNorm(buf.indexKeyFloat, localWeight(ip + "k_norm.weight"),
+                          localWeight(ip + "k_norm.bias"), -1, buf.indexKeyFloat);
+                ToDataType(buf.indexKeyFloat, indexKey, DataType::BFLOAT16);
+            } else {
+                ToDataType(indexKey, DataType::FLOAT32);
+                LayerNorm(indexKey, localWeight(ip + "k_norm.weight"), localWeight(ip + "k_norm.bias"), -1, indexKey);
+                ToDataType(indexKey, DataType::BFLOAT16);
             }
         };
         bool batchRopePrepared = false;
@@ -534,26 +535,41 @@ Data NaiveN05FlashModel::RunTarget(
             !graphVerify && (!capture || (!capture->verifying && capture->batchHistory.empty()))) {
             std::vector<FastllmNaiveRopeCacheRow> caches;
             caches.reserve(batch->Size());
+            // Project/normalize the complete batch, then borrow individual K rows.
+            // Cache descriptors retain the addresses, not these temporary views.
+            prepareIndexKey(normed, buf);
+            std::vector<Data> indexKeys(batch->Size());
             for (int sequence = 0; sequence < batch->Size(); ++sequence) {
-                auto &part = *buf.sequences[sequence];
-                Data rowNorm;
-                rowNorm.Resize({1, 1, embed_dim});
-                rowNorm.FakeFrom(normed, (size_t)sequence * embed_dim * normed.unitSize);
-                prepareIndexKey(rowNorm, part);
+                if (!slidingLayers[layer]) {
+                    indexKeys[sequence].Resize({1, 1, indexDim});
+                    indexKeys[sequence].FakeFrom(buf.indexKey,
+                        (size_t)sequence * indexDim * buf.indexKey.unitSize);
+                }
                 caches.push_back({batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
                     batch->Value(sequence, layer).multiDeviceDatas.at(gpu),
-                    slidingLayers[layer] ? nullptr : &part.indexKey});
+                    slidingLayers[layer] ? nullptr : &indexKeys[sequence]});
             }
             batchRopePrepared = FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions,
                 caches, buf.liveKeys, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                 rotaryDim, cfg.theta, valueScale, slidingLayers[layer] ? window : 0,
                 mergedQkv ? &qkv : nullptr, slidingLayers[layer] && tpSwaRingCache);
         }
+        auto prepareIndexQuery = [&](Data &normed, Data &positions, Data &indexQ, Data &indexWeights) {
+            const std::string ip = ap + "indexer.";
+            Linear(normed, localWeight(ip + "wq.weight"), Data(), indexQ);
+            FastllmCudaNaiveRope(indexQ, positions, indexHeads, indexDim, rotaryDim, cfg.theta);
+            Linear(normed, localWeight(ip + "weights_proj.weight"), Data(), indexWeights);
+            Mul(indexWeights, 1.0f / std::sqrt((float)indexHeads), indexWeights);
+        };
+        const bool batchIndexPrepared = batchRopePrepared && !slidingLayers[layer] &&
+            std::any_of(buf.sequences.begin(), buf.sequences.begin() + batch->Size(),
+                [&](const std::unique_ptr<TargetWorkspace> &part) { return part->capacity > indexTopK; });
+        Data &batchIndexQ = buf.indexQ, &batchIndexWeights = buf.indexWeights;
+        if (batchIndexPrepared) prepareIndexQuery(normed, positions, batchIndexQ, batchIndexWeights);
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &pastKey, Data &pastValue,
-                          TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, HistoryChunk *historyChunk) {
-            Data &packed = buf.packed, &indexKey = buf.indexKey, &indexQ = buf.indexQ;
-            Data &indexWeights = buf.indexWeights, &indices = buf.indices;
+                          TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, HistoryChunk *historyChunk, int sequence = 0) {
+            Data &packed = buf.packed, &indexKey = buf.indexKey, &indices = buf.indices;
             int localPast = pastKey.dims.empty() ? 0 : pastKey.dims[1];
             const bool ringCache = tensorParallel && slidingLayers[layer] && tpSwaRingCache;
             // Graph replay reads/writes the ring directly. Eager prefill/fallback
@@ -612,11 +628,15 @@ Data NaiveN05FlashModel::RunTarget(
             Data noIndices;
             Data *selected = &noIndices;
             if (!slidingLayers[layer] && (decodeWorkspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
-                std::string ip = ap + "indexer.";
-                Linear(normed, localWeight(ip + "wq.weight"), Data(), indexQ);
-                FastllmCudaNaiveRope(indexQ, positions, indexHeads, indexDim, rotaryDim, cfg.theta);
-                Linear(normed, localWeight(ip + "weights_proj.weight"), Data(), indexWeights);
-                Mul(indexWeights, 1.0f / std::sqrt((float)indexHeads), indexWeights);
+                Data rowIndexQ, rowIndexWeights;
+                Data &indexQ = batchIndexPrepared ? rowIndexQ : buf.indexQ;
+                Data &indexWeights = batchIndexPrepared ? rowIndexWeights : buf.indexWeights;
+                if (batchIndexPrepared) {
+                    indexQ.Resize({1, 1, indexHeads * indexDim});
+                    indexQ.FakeFrom(batchIndexQ, (size_t)sequence * indexHeads * indexDim * batchIndexQ.unitSize);
+                    indexWeights.Resize({1, 1, indexHeads});
+                    indexWeights.FakeFrom(batchIndexWeights, (size_t)sequence * indexHeads * batchIndexWeights.unitSize);
+                } else prepareIndexQuery(normed, positions, indexQ, indexWeights);
                 if (decodeWorkspace) {
                     if (graphVerify) FastllmCudaNaiveGraphVerifyIndexer(indexQ, indexWeights, pastKey,
                         buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
@@ -703,7 +723,7 @@ Data NaiveN05FlashModel::RunTarget(
                        *batch->Value(sequence, layer).multiDeviceDatas.at(gpu), part, count,
                        batch->Key(sequence, 0).dims.empty() ? 0 : batch->Key(sequence, 0).dims[1],
                        CacheReserveCapacity(batch->configs[sequence]), rowAttention,
-                       capture && !capture->batchHistory.empty() ? capture->batchHistory[sequence].get() : nullptr);
+                       capture && !capture->batchHistory.empty() ? capture->batchHistory[sequence].get() : nullptr, sequence);
                 offset += count;
             }
         } else {
