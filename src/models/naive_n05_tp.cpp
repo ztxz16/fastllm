@@ -365,7 +365,8 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     // addresses/capacities and the collective generation below.
     if (tpDecodeState) tpDecodeState->active = false;
     const int rows = batch ? batch->Size() : verifying ? 8 : 1;
-    if (batch && (!batch->Decode() || rows > 8)) return false;
+    const int maxBatchRows = tpEp8MegaState ? 256 : 8;
+    if (batch && (!batch->Decode() || rows > maxBatchRows)) return false;
     auto key = [&](int sequence, int layer) -> Data & { return batch ? batch->Key(sequence, layer) : kv[layer].first; };
     auto value = [&](int sequence, int layer) -> Data & { return batch ? batch->Value(sequence, layer) : kv[layer].second; };
     if (!GetFastllmEnv().cudaGraph || inputIds.dims != std::vector<int>({1, rows}) ||
@@ -452,7 +453,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     state->cachePointers = std::move(pointers);
     state->cacheCapacities = std::move(capacities);
     state->ncclGeneration = generation;
-    if (tpEp8MegaState && (rows > 4 || verifying)) return false;
+    if (tpEp8MegaState && verifying) return false;
     for (int rank = 0; rank < ranks; ++rank) {
         FastllmCudaSetDevice(tpDevices[rank]);
         if (!FastllmCudaNaiveDecodeGraphSupported()) return false;
@@ -533,7 +534,6 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
             buf.liveKeys.Resize({state.rows});
         }
         if (hostInputs && !r.inputStorage.dims.empty()) {
-            // Graphs accept up to eight request or verification rows.
             // Copy integer lengths as bytes, preserving their representation.
             r.hostInput.resize(3 * rowBytes);
             unsigned char *input = r.hostInput.data();
@@ -563,7 +563,7 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
             Data localPositions(positions);
             ToDataType(localPositions, FLOAT32);
             copyInput(buf.positions, localPositions);
-            int lengths[8];
+            std::vector<int> lengths(state.rows);
             for (int row = 0; row < state.rows; ++row) lengths[row] = batch ? batch->Key(row, 0).dims[1] + 1 : kv[0].first.dims[1] + row + 1;
             if (buf.liveKeys.dims.empty()) {
                 buf.liveKeys.dataType = INT32;
@@ -573,7 +573,7 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
                 buf.liveKeys.Resize({state.rows});
                 buf.liveKeys.Allocate();
             }
-            FastllmCudaCopyFromHostToDevice(buf.liveKeys.cudaData, lengths, state.rows * sizeof(int));
+            FastllmCudaCopyFromHostToDevice(buf.liveKeys.cudaData, lengths.data(), state.rows * sizeof(int));
         }
         if (state.mode == TPDecodeState::Prepare) return Data();
     }

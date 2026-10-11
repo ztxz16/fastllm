@@ -5,6 +5,7 @@
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega-kernel.h"
 #if defined(FASTLLM_ENABLE_MIMO_EP8_MEGA) && !defined(_WIN32) && !defined(USE_ROCM)
+#include "devices/multicuda/fastllm-multicuda.cuh"
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -114,7 +115,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
 }
 void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int layer,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
-        fastllm::Data &output) {
+        fastllm::Data &output, bool graphDecode) {
     using namespace fastllm;
     AssertInFastLLM(input.dataType == BFLOAT16 && input.dims.size() == 2 &&
         input.dims[1] == 4096 && index.dims == std::vector<int>({input.dims[0], 8}),
@@ -144,12 +145,28 @@ void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     // Reuse the existing 64-row arena: up to 8*64 distinct tokens per round,
     // without padding output storage or allocating another activation buffer.
     const int ranks = (int)state.devices.size();
+    // Uneven decode batches can replay bounded replicated chunks without
+    // padding or another output allocation. Uniform shards use AllGather below.
+    if (graphDecode && total % ranks != 0) {
+        for (int first = 0; first < total; first += capacity)
+            run(first, std::min(capacity, total - first));
+        return;
+    }
     const int begin = (int)((int64_t)total * rank / ranks);
     const int shard = (int)((int64_t)total * (rank + 1) / ranks) - begin;
     const int rounds = (int)(((int64_t)total + ranks * capacity - 1) / (ranks * capacity));
     for (int round = 0; round < rounds; ++round) {
         const int start = round * capacity;
         run(begin + std::min(start, shard), std::max(0, std::min(capacity, shard - start)));
+    }
+    if (graphDecode) {
+        // Each rank has written its slice in-place. NCCL records the exchange
+        // on the same stream, retaining the existing 64-row MoE workspace.
+        AssertInFastLLM(FastllmNcclAllGather(
+            (const uint16_t *)output.cudaData + (size_t)begin * 4096,
+            output.cudaData, shard * 4096, BFLOAT16, state.devices[rank]),
+            "MiMo EP8 decode AllGather failed.");
+        return;
     }
     // Publish completed shards, then gather directly into the existing output.
     // All sources stay alive until every peer finishes reading them. This
@@ -175,7 +192,7 @@ bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &) { return false; }
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(const std::vector<int> &,
     const std::vector<std::vector<std::vector<fastllm::Data *>>> &) { return {}; }
 void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &, int, int, const fastllm::Data &,
-    const fastllm::Data &, const fastllm::Data &, fastllm::Data &) {
+    const fastllm::Data &, const fastllm::Data &, fastllm::Data &, bool) {
     throw std::runtime_error("MiMo EP8 MegaMoE requires a Linux CUDA build containing the SM90 backend.");
 }
 #endif

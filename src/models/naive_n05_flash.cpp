@@ -798,7 +798,7 @@ Data NaiveN05FlashModel::RunTarget(
             if (!tensorParallel) ApplyMoeDeviceMapForLayer(layer);
             if (tensorParallel && tpEp8MegaState) {
                 FastllmCudaRunMimoEp8Mega(*tpEp8MegaState, tpRank, layer, normed,
-                                        expertIndex, expertScore, moeOutput);
+                                        expertIndex, expertScore, moeOutput, decodeWorkspace);
             } else if (executor.firstDevice.find("numa") == 0 &&
                 (moeWeights[layer][2]->dataType == DataType::FP8_E4M3 ||
                  moeWeights[layer][2]->dataType == DataType::FP8_E4M3_BLOCK_128)) {

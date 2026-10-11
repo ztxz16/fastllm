@@ -11,4 +11,4 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     const std::vector<std::vector<std::vector<fastllm::Data *>>> &weights);
 void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int layer,
     const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
-    fastllm::Data &output);
+    fastllm::Data &output, bool graphDecode);
