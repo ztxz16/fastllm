@@ -56,6 +56,7 @@
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #ifndef USE_ROCM
 #include "../cuda/gguf_mmq/fastllm-gguf-moe-glm5.h"
+#include "devices/cuda/fastllm-moe-prefetch.h"
 #endif
 #endif
 
@@ -8774,6 +8775,13 @@ namespace fastllm {
                 FastllmCudaEventRecordCurrentThread(sourceReadyEvent);
                 FastllmCudaStreamWaitEvent(inputCopyStream, sourceReadyEvent);
                 FastllmCudaStreamWaitEvent(routeCopyStream, sourceReadyEvent);
+#ifndef USE_ROCM
+                // Concurrent bulk expert H2D and activation D2H can contend
+                // on the host link. Keep routing/GPU submission independent;
+                // only the large CPU input waits on the prefetch stream.
+                if (independentGpuPrep && inputOnCuda)
+                    FastllmCudaWaitMoeGGUFHostPrefetch(inputCopyStream);
+#endif
                 if (inputOnCuda) {
                     AssertInFastLLM(
                         FastllmCudaCopyFromDeviceToPinnedHostAsync(

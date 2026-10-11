@@ -210,6 +210,16 @@ bool Qwen4ExpModel::TryForwardChunkedPrefill(
                     stages.size(), chunks, chunkSize);
         std::fflush(stdout);
     }
+    struct ClearPrefetch {
+        const std::vector<int> &devices;
+        ~ClearPrefetch() {
+            Qwen4CudaDeviceGuard guard;
+            for (int device : devices) {
+                FastllmCudaSetDevice(device);
+                FastllmCudaClearMoeGGUFHostPrefetch();
+            }
+        }
+    } clearPrefetch{devices};
     prefillPipeline->Run(devices, chunks, type, {1, chunkSize, hcCount * embed_dim},
         [&](int rank, int chunk, Data &hidden) {
 #ifdef USE_NUMAS

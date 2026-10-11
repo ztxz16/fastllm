@@ -26,6 +26,7 @@
 #include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/cuda/fastllm-moe-prefetch.h"
 #endif
 #include "fastllm-multicuda.cuh"
 #endif
@@ -12265,8 +12266,18 @@ namespace fastllm {
 #endif
             return positionIds;
         };
+        auto prefetchExperts = [&](int layer) {
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+            if (!prefill || inputIds.dims[1] < 1024 || layer >= endLayer) return;
+            const auto moe = SelectMoeDeviceForLayer(layer);
+            if (moe != "numa" && moe.rfind("numa:", 0) != 0) return;
+            auto &table = this->weights[layer];
+            FastllmCudaPrefetchMoeGGUFHost(table.data(), int(table.size()) / 2 - 1);
+#endif
+        };
         for (int layer = firstLayer; layer < endLayer; layer++) {
             ApplyDeviceMap(this->deviceMap, layer + 1, this->block_cnt);
+            if (layer == firstLayer) prefetchExperts(layer);
 
             if (layer == 0 && allowDecodeCudaGraph &&
                 verificationCapture == nullptr &&
@@ -12435,6 +12446,7 @@ namespace fastllm {
             mlpNorm.FreeSpace();
             mlpProjection.FreeSpace();
             RunMoE(layer, mlpInput, mlpOutput, true, prefill);
+            prefetchExperts(layer + 1);
             if (layer + 1 == this->block_cnt) {
                 const std::string finalHyperPrefix =
                     languagePrefix + "hyper_connection_mixer.";

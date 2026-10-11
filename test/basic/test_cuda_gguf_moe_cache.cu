@@ -1,6 +1,7 @@
 #include "fastllm.h"
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/cuda/fastllm-moe-prefetch.h"
 #include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "gguf.h"
@@ -952,23 +953,47 @@ template<class T> static void RunHost(ggml_type type, fastllm::DataType dtype,
     Require(!launch(),"host uploads admitted during graph capture");
     Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph)); Cuda(cudaGraphDestroy(graph));
     if (batch >= 1024) {
+        Require(!FastllmCudaPrefetchMoeGGUFHost(table.data(), experts), "cold prefetch admitted");
         // Grow a previously used transfer/compute arena. The previous DMA
         // must finish before its backing allocation can be released.
         input.Resize({33, hidden});
         Require(launch(), "host prefill growth warmup rejected");
         input.Resize({batch, hidden});
     }
-    for (int pass = 0; pass < 3; ++pass) {
+    for (int pass = 0; pass < (batch >= 1024 ? 4 : 3); ++pass) {
         selected = pass == 0 ? std::unordered_set<int>{1,3} :
             pass == 1 ? std::unordered_set<int>{2,4} : std::unordered_set<int>{1,2,3,4};
-        if (pass == 2) for (int e = 1; e <= experts; ++e) selected.insert(e);
+        if (pass >= 2) for (int e = 1; e <= experts; ++e) selected.insert(e);
         // Alias two immutable NUMA shards; restore ownership before assertions.
         std::vector<uint8_t *> originals;
         for (auto &w : owned) {
             originals.push_back(w->cpuData);
             if (pass) { w->numasData = {w->cpuData,w->cpuData+w->GetBytes()/2}; w->cpuData = nullptr; }
         }
+        std::vector<uint8_t *> pinned;
+        if (pass == 3) {
+            for (size_t i = 0; i < owned.size(); ++i) {
+                auto &w = *owned[i]; uint8_t *p = nullptr;
+                Cuda(cudaHostAlloc(&p, w.GetBytes(), cudaHostAllocPortable));
+                std::memcpy(p, originals[i], w.GetBytes());
+                w.numasData = {p, p + w.GetBytes() / 2};
+                pinned.push_back(p);
+            }
+            Require(FastllmCudaPrefetchMoeGGUFHost(table.data(), experts), "pinned prefetch rejected");
+            // Reuse while the previous DMA may still be pending.
+            Require(FastllmCudaPrefetchMoeGGUFHost(table.data(), experts), "prefetch reuse rejected");
+            // Exercise consumer ordering across streams, then the empty
+            // prefetch state after clearing the completed uploads below.
+            FastllmCudaWaitMoeGGUFHostPrefetch(cudaStreamPerThread);
+        } else if (batch >= 1024 && pass == 1) {
+            Require(!FastllmCudaPrefetchMoeGGUFHost(table.data(), experts), "pageable prefetch admitted");
+        }
         const bool ok = launch();
+        if (pass == 3) {
+            FastllmCudaClearMoeGGUFHostPrefetch();
+            FastllmCudaWaitMoeGGUFHostPrefetch(cudaStreamPerThread);
+        }
+        for (auto *p : pinned) Cuda(cudaFreeHost(p));
         for (size_t i = 0; i < owned.size(); ++i) {
             owned[i]->cpuData = originals[i]; owned[i]->numasData.clear();
         }
@@ -985,6 +1010,7 @@ template<class T> static void RunHost(ggml_type type, fastllm::DataType dtype,
                 "host packed weights were modified");
         }
     }
+    FastllmCudaClearMoeGGUFHostPrefetch();
     std::printf("PASS GGUF host type=%d dtype=%d rows=%d inter=%d cross=%d device=%d\n",type,dtype,batch,inter,cross,device);
 }
 
