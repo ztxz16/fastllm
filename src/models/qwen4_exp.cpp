@@ -19,6 +19,7 @@
 #include "utils.h"
 #include "utils/cuda_cache_budget.h"
 #include "utils/persistent_worker_group.h"
+#include "utils/cuda_chunked_prefill.h"
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -2534,6 +2535,8 @@ namespace fastllm {
         tp.caches.erase(found);
     }
 
+#include "qwen4_exp_pp.h"
+
     Qwen4ExpModel::Qwen4ExpModel() : Qwen3NextModel() {
         this->canDoBatchForward = false;
         this->model_type = "qwen4_exp";
@@ -2608,6 +2611,11 @@ namespace fastllm {
     Qwen4ExpModel::~Qwen4ExpModel() {
         ShutdownRuntime();
         threadTpState.reset();
+#ifdef USE_CUDA
+#ifndef USE_ROCM
+        pipelineMoe.reset();
+#endif
+#endif
         {
             std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
             this->pendingPrefixRestores.clear();
@@ -6918,6 +6926,17 @@ namespace fastllm {
             AddTo(output, sharedOutput);
             if (reduceOutput) ThreadTpAllReduce(output);
         };
+#if defined(USE_NUMAS)
+        if (threadTpRank < 0 && numaMoe && batch * sequence == 1 &&
+            FastllmCudaMoeCacheRequested()) {
+            selectExperts();
+            if (TryRunPipelineMoe(deviceLayer, flattened, expertIndex, expertScore,
+                    output, moeWeights, [&] { runSharedExpert(sharedOutput); })) {
+                finishHybrid();
+                return;
+            }
+        }
+#endif
         if (hostMoe && threadTpOwner->expertParallel &&
             batch * sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
             MoeCudaCacheRequested()) {

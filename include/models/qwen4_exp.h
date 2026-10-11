@@ -167,6 +167,14 @@ namespace fastllm {
             bool mtpDisabled = false;
         };
 
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        struct PipelineMoeState;
+        std::unique_ptr<PipelineMoeState> pipelineMoe;
+        bool TryRunPipelineMoe(int layer, const Data &input, const Data &index,
+                const Data &score, Data &output, std::vector<Data *> &moeWeights,
+                const std::function<void()> &sharedExpert);
+#endif
+
         struct ServingCache {
             using Pools = std::pair<std::shared_ptr<PagedCacheManager>,
                                     std::shared_ptr<PagedCacheManager>>;

@@ -2602,7 +2602,7 @@ __global__ void ReduceHybridExperts(const float *cpu, const float *gpu,
 
 __global__ void ReduceExpertParallel(const float *cpu, const float *gpu,
         const int32_t *owners, const float *scores, float *output,
-        int hidden, int topk, int rank) {
+        int hidden, int topk, int rank, int routingRank) {
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= hidden) return;
     const int row = blockIdx.y;
@@ -2613,7 +2613,7 @@ __global__ void ReduceExpertParallel(const float *cpu, const float *gpu,
     output += row * hidden;
     float sum = 0;
     for (int r = 0; r < topk; ++r) {
-        if (owners[r] == rank || (owners[r] < 0 && rank == 0)) {
+        if (owners[r] == rank || (owners[r] < 0 && rank == routingRank)) {
             const float value = (owners[r] < 0 ? cpu : gpu)[r * hidden + col];
             // Preserve NUMA's fused FP32 weighted accumulation. Splitting the
             // product and sum adds a rounding even when every route is on CPU.
@@ -2921,13 +2921,14 @@ static int EndMoeFrequencyStep(DeviceCache &cache);
 bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int rank,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
-        const std::function<void()> &launchParallel) {
+        const std::function<void()> &launchParallel, int routingRank) {
 #ifdef USE_NUMAS
     using namespace fastllm;
     const int count = state.ranks.size();
     AssertInFastLLM(rank >= 0 && rank < count, "Invalid MoE EP rank.\n");
     auto &work = *state.ranks[rank];
-    auto &root = *state.ranks[0];
+    AssertInFastLLM(routingRank >= 0 && routingRank < count, "Invalid MoE routing rank.");
+    auto &root = *state.ranks[routingRank];
     constexpr int maxRoutes = FastllmCudaMoeExpertParallel::maxRoutes;
     cudaStreamCaptureStatus capture;
     int device = -1;
@@ -2969,7 +2970,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         work.cache->prefillOwnerRank = rank;
         work.cache->prefillOwnerCount = count;
     }
-    if (rank == 0 && work.ready) {
+    if (rank == routingRank && work.ready) {
         work.ready = PackedCacheRows(index) && PackedCacheRows(score) &&
             index.dims[0] == work.rows && index.dims == score.dims &&
             index.dims[1] > 0 && index.dims[1] <= kMaxTopK &&
@@ -2989,10 +2990,10 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
                 work.ready &= work.Indices()[r] >= 0 && work.Indices()[r] < work.group->layout.experts;
         }
     }
-    if (rank != 0 && work.cache && work.cache->hostKeyToSlot) {
+    if (rank != routingRank && work.cache && work.cache->hostKeyToSlot) {
         // The last EP event alone is insufficient: prefill or a replayed
         // ordinary cache graph may have changed residency since that event.
-        // Rank 0 already drains this stream with the input/route readback.
+        // The routing rank drains this stream with the input/route readback.
         checkCudaErrors("EP host residency", cudaStreamSynchronize(cudaStreamPerThread));
     }
     state.Barrier();
@@ -3047,7 +3048,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     allocate(work.scores, FLOAT32, {rows, topk});
     allocate(work.owners, INT32, {rows, topk});
     allocate(work.lookup, INT32, {2 * maxRoutes});
-    if (rank != 0) {
+    if (rank != routingRank) {
         std::copy(root.Scores(), root.Scores() + routes, work.Scores());
         std::copy(root.Indices(), root.Indices() + routes, work.Indices());
     }
@@ -3159,7 +3160,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     if (launchParallel) launchParallel();
     checkCudaErrors("EP restore device", cudaSetDevice(device));
     state.Barrier();
-    if (rank == 0) {
+    if (rank == routingRank) {
         if (count == 1) {
             if (overlap) plan.selected = overlap->layers[timingLayer].SelectMisses(reuse.size(), hits, reuse.data());
         } else {
@@ -3180,7 +3181,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     const int stagedRoutes = std::count_if(stagedSlot.begin(), stagedSlot.begin() + routes,
         [](int slot) { return slot >= 0; });
     int cpuCount = 0, activeRanks = 0;
-    if (rank == 0) {
+    if (rank == routingRank) {
         for (const auto &other : state.plans)
             activeRanks += other.hits > 0 || other.selected > 0;
     }
@@ -3352,7 +3353,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     // process verifier rows separately: time their CPU work after submission
     // so GPU dispatch cannot inflate the CPU estimate and cause over-offload.
     // Asynchronous DMA/GPU computation still overlaps those CPU rows.
-    const bool overlapCpu = batchExperts && rank == 0 && cpuCount > 0;
+    const bool overlapCpu = batchExperts && rank == routingRank && cpuCount > 0;
     double cpuStart = 0;
     double cpuElapsedUs = 0;
     if (overlapCpu) {
@@ -3366,7 +3367,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     } else {
         submitGpu();
     }
-    if (rank == 0) {
+    if (rank == routingRank) {
         const double start = HybridNowUs();
         if (cpuCount) {
             if (!overlapCpu)
@@ -3390,7 +3391,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     else ReduceExpertParallel<<<dim3((hidden + 255) / 256, rows), 256, 0, cudaStreamPerThread>>>(
         work.device, work.GpuOutput(),
         static_cast<int32_t *>(work.owners.cudaData), static_cast<float *>(work.scores.cudaData),
-        static_cast<float *>(output.cudaData), hidden, topk, rank);
+        static_cast<float *>(output.cudaData), hidden, topk, rank, routingRank);
     checkCudaErrors("EP reduction", cudaGetLastError());
     checkCudaErrors("EP done", cudaEventRecord(work.done, cudaStreamPerThread));
     if (!glmBatch && frequency && work.table + 1 == int(work.group->tableKeys.size()))

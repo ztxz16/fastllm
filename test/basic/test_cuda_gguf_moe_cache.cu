@@ -1339,6 +1339,17 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
             Cuda(cudaMemcpy(ids.cudaData,route.data(),route.size()*4,cudaMemcpyHostToDevice));
         }
         Cuda(cudaMemcpy(scores.cudaData, score.data(), score.size()*4, cudaMemcpyHostToDevice));
+        // PP attention ownership alternates without changing physical expert
+        // ownership. Verify both routing roots against the same CPU/GPU oracle.
+        const int routingRank = single ? 0 : step % ranks;
+        Data movedIds, movedScores;
+        if (routingRank != 0) {
+            movedIds.CopyFrom(ids); movedScores.CopyFrom(scores);
+            movedIds.ToDevice(CUDA, std::vector<int>{routingRank});
+            movedScores.ToDevice(CUDA, std::vector<int>{routingRank});
+        }
+        const Data &routedIds = routingRank == 0 ? ids : movedIds;
+        const Data &routedScores = routingRank == 0 ? scores : movedScores;
         std::exception_ptr errors[2]; bool accepted[2]{};
         auto run = [&](int rank) {
             try {
@@ -1355,13 +1366,13 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                         table.data(), table.size(), layer, parallel) && callbacks == 0,
                         "rejected hybrid launched its shared branch");
                 }
-                if (!single && step == 0 && inputType != FLOAT32) {
+                if (!single && step < ranks && inputType != FLOAT32) {
                     Data invalidIds;
-                    invalidIds.FakeFrom(ids, 0);
+                    invalidIds.FakeFrom(routedIds, 0);
                     invalidIds.Resize({rows, 0});
                     Require(!FastllmCudaMergeMOEExpertParallel(*context, rank, input[rank],
-                        rank == 0 ? invalidIds : empty, rank == 0 ? scores : empty,
-                        output[rank], table.data(), table.size(), layer, [] {}),
+                        rank == routingRank ? invalidIds : empty, rank == routingRank ? routedScores : empty,
+                        output[rank], table.data(), table.size(), layer, [] {}, routingRank),
                         "EP accepted invalid routes");
                 }
                 cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
@@ -1406,8 +1417,8 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                 } else if (single) accepted[rank] = FastllmCudaMergeMOEHybrid(input[rank], ids, scores, output[rank],
                     table.data(), table.size(), layer, parallel);
                 else accepted[rank] = FastllmCudaMergeMOEExpertParallel(*context, rank, input[rank],
-                    rank == 0 ? ids : empty, rank == 0 ? scores : empty, output[rank],
-                    table.data(), table.size(), layer, [] {});
+                    rank == routingRank ? routedIds : empty, rank == routingRank ? routedScores : empty, output[rank],
+                    table.data(), table.size(), layer, [] {}, routingRank);
                 if (exec) {
                     Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
                     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
