@@ -22,6 +22,106 @@
 #include <vector>
 
 namespace {
+    // FP32 sequence recurrence with independent column tiles and register state.
+    __global__ void Qwen4PrefillNormalizeKernel(const float *qkv, float *qk,
+            int keyHeads, int valueHeads, float eps, float inv) {
+        const int head = blockIdx.x % keyHeads, row = blockIdx.x / keyHeads;
+        const int lane = threadIdx.x;
+        const size_t channels = size_t(2 * keyHeads + valueHeads) * 128;
+        const float *qp = qkv + size_t(row) * channels + head * 128;
+        const float *kp = qp + keyHeads * 128;
+        float4 q = reinterpret_cast<const float4 *>(qp)[lane];
+        float4 k = reinterpret_cast<const float4 *>(kp)[lane];
+        float qs = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
+        float ks = k.x*k.x + k.y*k.y + k.z*k.z + k.w*k.w;
+        for (int shift = 16; shift; shift >>= 1) {
+            qs += __shfl_down_sync(0xffffffffu, qs, shift);
+            ks += __shfl_down_sync(0xffffffffu, ks, shift);
+        }
+        const float qn = rsqrtf(__shfl_sync(0xffffffffu, qs, 0) / 128 + eps);
+        const float kn = rsqrtf(__shfl_sync(0xffffffffu, ks, 0) / 128 + eps);
+        q.x = (q.x * qn * inv) * inv; q.y = (q.y * qn * inv) * inv;
+        q.z = (q.z * qn * inv) * inv; q.w = (q.w * qn * inv) * inv;
+        k.x = k.x * kn * inv; k.y = k.y * kn * inv;
+        k.z = k.z * kn * inv; k.w = k.w * kn * inv;
+        float *target = qk + size_t(blockIdx.x) * 256;
+        reinterpret_cast<float4 *>(target)[lane] = q;
+        reinterpret_cast<float4 *>(target + 128)[lane] = k;
+    }
+
+    template<typename T>
+    __global__ void Qwen4PrefillGatesKernel(const T *alpha, const T *beta,
+            const float *aLog, const float *dtBias, float2 *gates,
+            int heads, size_t count) {
+        for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+             i < count; i += size_t(gridDim.x) * blockDim.x) {
+            const int h = i % heads;
+            const float x = float(alpha[i]) + dtBias[h];
+            const float sp = x > 20.f ? x : log1p(expf(x));
+            gates[i] = make_float2(expf(-expf((double)aLog[h]) * sp),
+                                   1.0 / (1.0 + expf(-float(beta[i]))));
+        }
+    }
+
+    __global__ __launch_bounds__(128)
+    void Qwen4PrefillRecurrentKernel(const float *qkv, const float *qk,
+            const float2 *gates, const float *initial, float *state, float *output,
+            int keyHeads, int valueHeads, int sequence) {
+        const int head = blockIdx.x / 4 % valueHeads;
+        const int batch = blockIdx.x / (4 * valueHeads);
+        const int first = (blockIdx.x % 4) * 32;
+        const int tid = threadIdx.x, col = tid % 32, group = tid / 32;
+        const int keyHead = head / (valueHeads / keyHeads);
+        const size_t channels = size_t(2 * keyHeads + valueHeads) * 128;
+        const size_t stateBase = (size_t(batch) * valueHeads + head) * 128 * 128;
+        __shared__ float query[128], key[128], memoryPart[4][32], outputPart[4][32];
+        float values[32];
+        #pragma unroll
+        for (int i = 0; i < 32; ++i)
+            values[i] = initial[stateBase + (group * 32 + i) * 128 + first + col];
+        size_t row = size_t(batch) * sequence;
+        const float *norm = qk + (row * keyHeads + keyHead) * 256;
+        float nextQ = norm[tid], nextK = norm[128 + tid];
+        float nextV = qkv[row * channels + (2 * keyHeads + head) * 128 + first + col];
+        float2 nextGate = gates[row * valueHeads + head];
+        for (int t = 0; t < sequence; ++t, ++row) {
+            query[tid] = nextQ; key[tid] = nextK;
+            const float v = nextV, decay = nextGate.x, beta = nextGate.y;
+            __syncthreads();
+            if (t + 1 < sequence) {
+                norm = qk + ((row + 1) * keyHeads + keyHead) * 256;
+                nextQ = norm[tid]; nextK = norm[128 + tid];
+                nextV = qkv[(row + 1) * channels + (2 * keyHeads + head) * 128 + first + col];
+                nextGate = gates[(row + 1) * valueHeads + head];
+            }
+            float memory = 0;
+            #pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                values[i] *= decay;
+                memory += values[i] * key[group * 32 + i];
+            }
+            memoryPart[group][col] = memory;
+            __syncthreads();
+            const float sum = ((memoryPart[0][col] + memoryPart[1][col]) +
+                               memoryPart[2][col]) + memoryPart[3][col];
+            const float delta = (v - sum) * beta;
+            float result = 0;
+            #pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                values[i] += key[group * 32 + i] * delta;
+                result += values[i] * query[group * 32 + i];
+            }
+            outputPart[group][col] = result;
+            __syncthreads();
+            if (group == 0)
+                output[(row * valueHeads + head) * 128 + first + col] =
+                    ((outputPart[0][col] + outputPart[1][col]) + outputPart[2][col]) + outputPart[3][col];
+        }
+        #pragma unroll
+        for (int i = 0; i < 32; ++i)
+            state[stateBase + (group * 32 + i) * 128 + first + col] = values[i];
+    }
+
     __global__ void Qwen4TopProbabilityKernel(
             const float *logits, float *output, int vocabulary, float maximum) {
         __shared__ float partial[32];
@@ -4458,6 +4558,45 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
     // from state reuse and additional independent blocks, not an ISA or a
     // particular speculative width. Single-token decode keeps its mapping.
     const bool useValueTile = sequence > 1;
+    if (sequence >= 64) {
+        cudaStreamCaptureStatus capture;
+        const auto status = cudaStreamIsCapturing(cudaStreamPerThread, &capture);
+        if (status != cudaSuccess) return false;
+        const size_t rows = size_t(batch) * sequence;
+        const size_t normBytes = rows * keyHeads * 256 * sizeof(float);
+        const size_t gateCount = rows * valueHeads;
+        const size_t need = normBytes + gateCount * sizeof(float2);
+        if (capture == cudaStreamCaptureStatusNone && need <= (size_t(256) << 20)) {
+            size_t available = 0;
+            bool own = false;
+            void *scratch = FastllmBorrowCudaTempBuffer(need, &available, &own);
+            if (scratch && available >= need) {
+                auto *normalized = static_cast<float *>(scratch);
+                auto *gates = reinterpret_cast<float2 *>(static_cast<uint8_t *>(scratch) + normBytes);
+                Qwen4PrefillNormalizeKernel<<<rows * keyHeads, 32, 0, cudaStreamPerThread>>>(
+                    (const float *)qkv.cudaData, normalized, keyHeads, valueHeads, recurrentEps, inverseHead);
+                const int gateBlocks = int(std::min(size_t(1024), (gateCount + 255) / 256));
+                auto prepareGates = [&](auto *typedAlpha) {
+                    using T = std::remove_cv_t<std::remove_pointer_t<decltype(typedAlpha)>>;
+                    Qwen4PrefillGatesKernel<T><<<gateBlocks, 256, 0, cudaStreamPerThread>>>(
+                        typedAlpha, (const T *)beta.cudaData, (const float *)aLog.cudaData,
+                        (const float *)dtBias.cudaData, gates, valueHeads, gateCount);
+                };
+                if (alpha.dataType == fastllm::FLOAT32) prepareGates((const float *)alpha.cudaData);
+                else if (alpha.dataType == fastllm::FLOAT16) prepareGates((const half *)alpha.cudaData);
+                else prepareGates((const __nv_bfloat16 *)alpha.cudaData);
+                Qwen4PrefillRecurrentKernel<<<blocks * 4, 128, 0, cudaStreamPerThread>>>(
+                    (const float *)qkv.cudaData, normalized, gates, (const float *)state.cudaData,
+                    (float *)(stateOutput ? stateOutput->cudaData : state.cudaData),
+                    (float *)output.cudaData, keyHeads, valueHeads, sequence);
+                const auto launch = cudaGetLastError();
+                FastllmReleaseCudaTempBuffer(scratch, own);
+                DeviceSync();
+                return launch == cudaSuccess;
+            }
+            FastllmReleaseCudaTempBuffer(scratch, own);
+        }
+    }
     if (alpha.dataType == fastllm::DataType::FLOAT32) {
         if (stateOutput == nullptr) {
             Qwen4LaunchGatedDeltaRule<float, false>(

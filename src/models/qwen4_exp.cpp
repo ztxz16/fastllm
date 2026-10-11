@@ -6452,6 +6452,15 @@ namespace fastllm {
                 batch, (sequence + chunkSize - 1) / chunkSize,
                 chunkSize, this->head_k_dim, this->head_v_dim, true);
 #endif
+        bool recurrentPrefill = false;
+#ifdef USE_CUDA
+        // The native FP32 recurrence avoids chunk-GDN's intermediate matrices
+        // on devices where the mixed-precision prefill path is unavailable.
+        recurrentPrefill = !mixedGdnPrefill && sequence >= 64 &&
+            qkv.dataDevice == DataDevice::CUDA &&
+            this->head_k_dim == 128 && this->head_v_dim == 128;
+#endif
+        const bool sequentialGdn = sequentialMtpDecode || recurrentPrefill;
         if (!fusedDecode && !mixedGdnPrefill) {
             ToDataType(qkv, DataType::FLOAT32);
         }
@@ -6515,7 +6524,7 @@ namespace fastllm {
         // float32 as required by the checkpoint. Single-token FP16 decode
         // also fuses the output norm/gate and its optional GGUF head layout,
         // retaining the established rounding boundaries.
-        if (fusedDecode || sequentialMtpDecode) {
+        if (fusedDecode || sequentialGdn) {
 #ifdef USE_CUDA
             if (fusedDecode && this->dataType == DataType::FLOAT16 &&
                 currentConvolved.dataDevice == DataDevice::CUDA &&
@@ -6562,7 +6571,7 @@ namespace fastllm {
             Data gatedCore;
             Data *outputCore = &core;
 #ifdef USE_CUDA
-            if ((fusedDecode || sequentialMtpDecode) &&
+            if ((fusedDecode || sequentialGdn) &&
                 this->dataType == DataType::FLOAT16 &&
                 core.dataDevice == DataDevice::CUDA &&
                 core.dataType == DataType::FLOAT32 &&
