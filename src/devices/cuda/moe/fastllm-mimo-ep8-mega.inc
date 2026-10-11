@@ -1,7 +1,7 @@
 // MiMo EP8 keeps exactly one full copy of each expert across the eight ranks.
 // Attention remains TP8. Large inputs are partitioned into disjoint token
 // ranges before EP dispatch, then merged in-place into the existing output.
-// Small inputs keep the collective-free replicated path for decode/verification.
+// Small or uneven decode batches and verification retain replicated dispatch.
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega-kernel.h"
 #if defined(FASTLLM_ENABLE_MIMO_EP8_MEGA) && !defined(_WIN32) && !defined(USE_ROCM)
@@ -107,7 +107,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
                 rank.workspace.cudaData, bytes, peers.data(), r, l);
             AssertInFastLLM(rank.layers[l] != nullptr, fastllm_ep8_mega_moe_error());
         }
-        printf("MIMO_EP8_MEGA gpu=%d experts=32 inter=2048 W8A8 workspace=%zu max_rows=%d prefill=token_sharded small_rows=replicated Graph-ready backend=builtin\n",
+        printf("MIMO_EP8_MEGA gpu=%d experts=32 inter=2048 W8A8 workspace=%zu max_rows=%d Graph-ready backend=builtin\n",
                devices[r], bytes, fastllm_ep8_mega_moe_max_rows());
     }
     FastllmCudaSetDevice(previous);
@@ -118,8 +118,14 @@ void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
         fastllm::Data &output, bool graphDecode) {
     using namespace fastllm;
     AssertInFastLLM(input.dataType == BFLOAT16 && input.dims.size() == 2 &&
-        input.dims[1] == 4096 && index.dims == std::vector<int>({input.dims[0], 8}),
-        "Invalid MiMo EP8 input or routing shape.");
+        input.dims[1] == 4096, "Invalid MiMo EP8 input shape.");
+    const int ranks = (int)state.devices.size();
+    const int total = input.dims[0];
+    const int begin = (int)((int64_t)total * rank / ranks);
+    const bool localRouting = total >= ranks && total % ranks == 0 &&
+        index.dims == std::vector<int>({total / ranks, 8});
+    AssertInFastLLM((localRouting || index.dims == std::vector<int>({total, 8})) &&
+        score.dims == index.dims, "Invalid MiMo EP8 routing shape.");
     output.dataType = BFLOAT16;
     output.Resize(input.dims);
     output.ToDevice(DataDevice::CUDA, {state.devices.at(rank)}, false);
@@ -127,32 +133,28 @@ void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     void *handle = state.ranks.at(rank)->layers.at(layer);
     AssertInFastLLM(handle != nullptr, "Missing MiMo EP8 layer handle.");
     const int capacity = fastllm_ep8_mega_moe_max_rows();
-    const int total = input.dims[0];
     auto run = [&](int start, int rows) {
+        const int routeStart = localRouting ? start - begin : start;
         if (!fastllm_ep8_mega_moe_run(handle, (const uint16_t *)input.cudaData + (size_t)start * 4096,
             (uint16_t *)output.cudaData + (size_t)start * 4096,
-            (const int32_t *)index.cudaData + start * 8,
-            (const float *)score.cudaData + start * 8, rows))
+            (const int32_t *)index.cudaData + routeStart * 8,
+            (const float *)score.cudaData + routeStart * 8, rows))
             throw std::runtime_error(std::string("MiMo EP8 launch failed: ") + fastllm_ep8_mega_moe_error());
     };
-    if (total <= capacity) {
+    if (total <= capacity && !localRouting) {
         run(0, total);
         return;
     }
 
-    // Each token is dispatched by exactly one source rank. Balance contiguous
-    // shards without padding; every rank executes the same number of rounds.
-    // Reuse the existing 64-row arena: up to 8*64 distinct tokens per round,
-    // without padding output storage or allocating another activation buffer.
-    const int ranks = (int)state.devices.size();
     // Uneven decode batches can replay bounded replicated chunks without
-    // padding or another output allocation. Uniform shards use AllGather below.
+    // padding. Equal shards use graph-compatible AllGather below.
     if (graphDecode && total % ranks != 0) {
         for (int first = 0; first < total; first += capacity)
             run(first, std::min(capacity, total - first));
         return;
     }
-    const int begin = (int)((int64_t)total * rank / ranks);
+    // Dispatch each token from one rank, using the existing 64-row arena.
+    // All ranks execute the same number of rounds, including empty shards.
     const int shard = (int)((int64_t)total * (rank + 1) / ranks) - begin;
     const int rounds = (int)(((int64_t)total + ranks * capacity - 1) / (ranks * capacity));
     for (int round = 0; round < rounds; ++round) {
@@ -160,6 +162,9 @@ void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
         run(begin + std::min(start, shard), std::max(0, std::min(capacity, shard - start)));
     }
     if (graphDecode) {
+        if (localRouting && FastllmCudaCustomAllGatherRows(output.cudaData,
+                total * 4096, 4096, BFLOAT16, state.devices[rank]))
+            return;
         // Each rank has written its slice in-place. NCCL records the exchange
         // on the same stream, retaining the existing 64-row MoE workspace.
         AssertInFastLLM(FastllmNcclAllGather(

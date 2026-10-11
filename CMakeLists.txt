@@ -2082,6 +2082,15 @@ if (UNIT_TEST)
         target_include_directories(customAllReduceRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
         if (UNIX)
+            add_executable(customAllGatherRegression test/ops/customAllGatherRegression.cu)
+            target_link_libraries(customAllGatherRegression PRIVATE fastllm)
+            foreach(gather_ranks IN ITEMS 2 4 6 8)
+                add_test(NAME custom_all_gather_${gather_ranks}
+                         COMMAND customAllGatherRegression ${gather_ranks})
+                set_tests_properties(custom_all_gather_${gather_ranks} PROPERTIES
+                    LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            endforeach()
+
             add_executable(customArRegistrationRegression test/ops/customArRegistrationRegression.cu)
             target_link_libraries(customArRegistrationRegression PRIVATE fastllm_tools)
             add_test(NAME custom_ar_registration COMMAND customArRegistrationRegression)

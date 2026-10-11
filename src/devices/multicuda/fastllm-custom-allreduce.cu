@@ -296,6 +296,27 @@ __device__ __forceinline__ void CustomArBarrierPublish(
     }
 }
 
+// Owned slices are never overwritten, so peers can copy them directly without
+// a staging buffer or arithmetic. Matching start/final barriers publish prior
+// writes and prevent the next operator from reusing a source before all reads.
+template <int Ranks>
+__global__ __launch_bounds__(kCustomArThreads, 1)
+void FastllmCustomAllGatherInplaceKernel(CustomArRankData *rankData,
+        CustomArRankSignals allSignals, CustomArSignal *selfSignal,
+        uint4 *output, int rank, int part) {
+    CustomArRankData pointers = *rankData;
+    CustomArBarrierStart<Ranks>(allSignals, selfSignal, rank);
+    for (int offset = blockIdx.x * blockDim.x + threadIdx.x;
+         offset < part; offset += gridDim.x * blockDim.x) {
+#pragma unroll
+        for (int source = 0; source < Ranks; ++source)
+            if (source != rank)
+                output[source * part + offset] =
+                    reinterpret_cast<const uint4 *>(pointers.ptrs[source])[source * part + offset];
+    }
+    CustomArBarrierFinal<Ranks>(allSignals, selfSignal, rank);
+}
+
 template <typename T, int Ranks>
 __global__ __launch_bounds__(kCustomArThreads, 1)
 void FastllmCustomAllReduceKernel(CustomArRankData *rankData,
@@ -2616,6 +2637,50 @@ bool FastllmCudaCustomAllReduceRows(void *data, void *dest, int count,
                                     int rowElements, int dataType, int deviceId) {
     if (rowElements <= 0) return false;
     return RunCustomArCandidate(data, dest, count, dataType, deviceId, true, rowElements);
+}
+
+bool FastllmCudaCustomAllGatherRows(void *data, int count, int rowElements,
+                                   int dataType, int deviceId) {
+    if (count <= 0 || rowElements <= 0 || count % rowElements) return false;
+    const size_t typeBytes = CustomArTypeBytes(dataType);
+    const size_t bytes = (size_t)count * typeBytes;
+    const size_t policyBytes = (size_t)rowElements * typeBytes;
+    if (!typeBytes || bytes > CustomArMaxBytes() || policyBytes % 16) return false;
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    if (!lease.Acquire(state, policyBytes, dataType, deviceId, true, rank)) return false;
+    const int ranks = (int)state.devices.size();
+    if (bytes % (ranks * 16)) return false;
+    CustomArRankData *rankData = nullptr;
+    if (!FindOrRegisterCustomArPointers(state, rank, data, count, dataType,
+            data && ((uintptr_t)data & 15u) == 0, rankData)) return false;
+    const int part = bytes / (ranks * 16);
+    const int blocks = std::max(1, std::min(kCustomArMaxBlocks,
+        (part + kCustomArThreads - 1) / kCustomArThreads));
+#define CUSTOM_AG_RANK_CASE(RANKS)                                           \
+    case RANKS:                                                             \
+        FastllmCustomAllGatherInplaceKernel<RANKS>                            \
+            <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(           \
+                rankData, state.allSignals, state.allSignals.signals[rank],  \
+                reinterpret_cast<uint4 *>(data), rank, part);                \
+        break
+    switch (ranks) {
+        CUSTOM_AG_RANK_CASE(2);
+        CUSTOM_AG_RANK_CASE(4);
+        CUSTOM_AG_RANK_CASE(6);
+        CUSTOM_AG_RANK_CASE(8);
+        default: return false;
+    }
+#undef CUSTOM_AG_RANK_CASE
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        std::fprintf(stderr, "[Fastllm] custom all-gather launch failed on GPU %d: %s.\n",
+                     deviceId, cudaGetErrorString(status));
+        return false;
+    }
+    return true;
 }
 
 bool FastllmCudaCustomAllReducePairAdd(void *first, void *second, void *dest,

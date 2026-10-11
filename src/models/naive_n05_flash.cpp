@@ -372,6 +372,8 @@ Data NaiveN05FlashModel::RunTarget(
         } else FastllmNcclAllReduce(data.cudaData, data.cudaData, data.Count(0), data.dataType, gpu);
     };
     int length = inputIds.dims[1];
+    const bool shardMoe = tensorParallel && tpEp8MegaState && decodeWorkspace &&
+        !verifying && length >= 8 && length % 8 == 0;
     const int reserveCapacity = CacheReserveCapacity(config);
     const int previousExactThreshold = FastllmCudaGetLinearExactBatchThreshold();
     struct RestoreExactThreshold {
@@ -427,7 +429,9 @@ Data NaiveN05FlashModel::RunTarget(
     Data &w3 = buf.w3;
     Data &tempInput = buf.tempInput;
     Data &tempOutput = buf.tempOutput;
-    Data &moeOutput = buf.moeOutput;
+    // Attention has consumed projected before MoE starts. Reuse that full
+    // output and its already-registered peer pointer tuple for decode gather.
+    Data &moeOutput = shardMoe ? projected : buf.moeOutput;
     Data &moeInputTemp = buf.moeInputTemp;
     Data &moeOutputTemp = buf.moeOutputTemp;
     Data &positions = buf.positions;
@@ -767,11 +771,19 @@ Data NaiveN05FlashModel::RunTarget(
             reduce(w2);
             addMlpResidual(w2);
         } else {
+            // Decode ranks route only their contiguous token shard. Borrow the
+            // normalized activation; MegaMoE gathers into its existing output.
+            Data routedInput;
+            if (shardMoe) {
+                routedInput.Resize({length / 8, embed_dim});
+                routedInput.FakeFrom(normed, (size_t)tpRank * (length / 8) * embed_dim * normed.unitSize);
+            }
+            Data &routerSource = shardMoe ? routedInput : normed;
             Data &routerWeight = localWeight(prefix + ".mlp.gate.weight");
             bool hasRouterProbabilities =
-                FastllmCudaNaiveRouterSigmoid(normed, routerWeight, router);
+                FastllmCudaNaiveRouterSigmoid(routerSource, routerWeight, router);
             if (!hasRouterProbabilities) {
-                ToDataType(normed, routerInput, DataType::FLOAT32);
+                ToDataType(routerSource, routerInput, DataType::FLOAT32);
                 Linear(routerInput, routerWeight, Data(), router);
             }
             Data &routerBias = localWeight(prefix + ".mlp.gate.e_score_correction_bias");

@@ -47,6 +47,10 @@ bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
 // False means the caller must reduce rows separately with its ordinary path.
 bool FastllmCudaCustomAllReduceRows(void* data, void* dest, int count,
                                     int rowElements, int dataType, int deviceId);
+// Each rank owns its equal contiguous slice of the full tensor. Gather the
+// other slices in-place, reusing the existing peer-access signals and policy.
+bool FastllmCudaCustomAllGatherRows(void* data, int count,
+                                  int rowElements, int dataType, int deviceId);
 // Reduces two independent rank-local tensors, rounds each reduction to the
 // destination type, then adds the rounded values into dest.  Keeping the two
 // reduction accumulators separate preserves the result of
