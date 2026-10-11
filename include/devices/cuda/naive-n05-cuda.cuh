@@ -91,6 +91,17 @@ bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
     int rotaryDim, float theta, float valueScale, int window,
     const fastllm::Data *packedQkv = nullptr, bool ring = false);
+// One decode token per independent cache. Descriptors are captured as kernel
+// arguments, and liveKeys/positions are read on replay; no GPU metadata buffer.
+struct FastllmNaiveRopeCacheRow {
+    fastllm::Data *key, *value;
+    const fastllm::Data *indexKey;
+};
+bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
+    const fastllm::Data &v, const fastllm::Data &positions,
+    const std::vector<FastllmNaiveRopeCacheRow> &rows, const fastllm::Data &liveKeys,
+    int heads, int kvHeads, int dim, int valueDim, int rotaryDim, float theta,
+    float valueScale, int window, const fastllm::Data *packedQkv = nullptr, bool ring = false);
 // Convert the retained suffix between chronological and 128-slot ring layout.
 // Uses shared memory only, preserves allocations and host dimensions.
 void FastllmCudaNaiveSwaCacheLayout(fastllm::Data &key, fastllm::Data &value,

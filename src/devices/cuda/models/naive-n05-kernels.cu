@@ -586,14 +586,25 @@ __global__ void RopeQKScaleV(BF16 *q, BF16 *k, BF16 *v, const float *positions,
     }
 }
 
+struct RopeCacheRow {
+    BF16 *q, *key, *value;
+    const BF16 *k, *v, *indexKey, *qkv;
+    const float *positions;
+    const int *length;
+    int keyRows, valueRows, cachePast;
+};
+constexpr int kRopeCacheBatch = 32;
+struct RopeCacheBatch { RopeCacheRow rows[kRopeCacheBatch]; };
+
 template <bool Packed>
-__global__ void RopeAppendCache(BF16 *q, const BF16 *k, const BF16 *v,
-        const BF16 *indexKey, const float *positions, BF16 *key, BF16 *value,
-        const int *length, int heads, int kvHeads, int dim, int valueDim,
-        int indexDim, int rotaryDim, float theta, BF16 valueScale, int window,
-        int keyRows, int valueRows, int cachePast, const BF16 *qkv, bool ring) {
-    const int totalHeads = heads + 2 * kvHeads + (indexDim != 0);
-    const int token = blockIdx.x / totalHeads, head = blockIdx.x % totalHeads;
+__device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
+        int heads, int kvHeads, int dim, int valueDim, int indexDim, int rotaryDim,
+        float theta, BF16 valueScale, int window, bool ring) {
+    BF16 *q = r.q, *key = r.key, *value = r.value;
+    const BF16 *k = r.k, *v = r.v, *indexKey = r.indexKey, *qkv = r.qkv;
+    const float *positions = r.positions;
+    const int *length = r.length;
+    const int keyRows = r.keyRows, valueRows = r.valueRows, cachePast = r.cachePast;
     const int past = length ? (window ? min(*length - 1, window - 1) : *length - 1) : cachePast;
     const int row = ring ? ((*length - 1) & (kSwaWindow - 1)) : past + token;
     if (past < 0 || row >= keyRows || row >= valueRows) return;
@@ -623,6 +634,23 @@ __global__ void RopeAppendCache(BF16 *q, const BF16 *k, const BF16 *v,
         for (int d = threadIdx.x; d < valueDim; d += blockDim.x)
             dst[d] = __float2bfloat16_rn((float)src[d] * (float)valueScale);
     }
+}
+
+template <bool Packed>
+__global__ void RopeAppendCache(RopeCacheRow row, int heads, int kvHeads, int dim,
+        int valueDim, int indexDim, int rotaryDim, float theta, BF16 valueScale,
+        int window, bool ring) {
+    const int totalHeads = heads + 2 * kvHeads + (indexDim != 0);
+    AppendRopeCacheRow<Packed>(row, blockIdx.x / totalHeads, blockIdx.x % totalHeads,
+        heads, kvHeads, dim, valueDim, indexDim, rotaryDim, theta, valueScale, window, ring);
+}
+
+template <bool Packed>
+__global__ void BatchRopeAppendCache(RopeCacheBatch batch, int heads, int kvHeads, int dim,
+        int valueDim, int indexDim, int rotaryDim, float theta, BF16 valueScale,
+        int window, bool ring) {
+    AppendRopeCacheRow<Packed>(batch.rows[blockIdx.y], 0, blockIdx.x, heads, kvHeads,
+        dim, valueDim, indexDim, rotaryDim, theta, valueScale, window, ring);
 }
 
 __global__ void RoundIndexer(const BF16 *input, float *output, int stride,
@@ -1996,11 +2024,11 @@ void FastllmCudaNaiveRopeQKScaleV(fastllm::Data &q, fastllm::Data &k,
     CheckLaunch();
 }
 
-bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
+static bool PrepareRopeCache(fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, const fastllm::Data &indexKey,
         const fastllm::Data &positions, fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
-        int rotaryDim, float theta, float valueScale, int window, const fastllm::Data *packedQkv, bool ring) {
+        int rotaryDim, float theta, float valueScale, int window, const fastllm::Data *packedQkv, bool ring, RopeCacheRow &row, int &indexDim) {
     using namespace fastllm;
     const std::vector<int> device{FastllmCudaGetDevice()};
     const bool dynamicLength = !liveKeys.dims.empty();
@@ -2025,7 +2053,7 @@ bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     if (ring && (!dynamicLength || rows != 1 || window != kSwaWindow)) return false;
     if (packedQkv && (!matrix(*packedQkv, (int64_t)(heads + kvHeads) * dim + (int64_t)kvHeads * valueDim) ||
                      packedQkv->dims[1] != rows)) return false;
-    int indexDim = 0;
+    indexDim = 0;
     if (!indexKey.dims.empty()) {
         if (indexKey.dims.size() != 3 || indexKey.dims[2] < rotaryDim ||
             !matrix(indexKey, indexKey.dims[2]) || indexKey.dims[1] != rows) return false;
@@ -2046,14 +2074,77 @@ bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     const int cachePast = key.dims[1];
     if (!dynamicLength && (cachePast != value.dims[1] ||
         (int64_t)cachePast + rows > std::min(keyRows, valueRows))) return false;
-    auto kernel = packedQkv ? RopeAppendCache<true> : RopeAppendCache<false>;
-    kernel<<<rows * (heads + 2 * kvHeads + (indexDim != 0)), 128>>>(
-        (BF16 *)q.cudaData, (const BF16 *)k.cudaData, (const BF16 *)v.cudaData,
+    row = {(BF16 *)q.cudaData, (BF16 *)key.cudaData, (BF16 *)value.cudaData,
+        (const BF16 *)k.cudaData, (const BF16 *)v.cudaData,
         indexDim ? (const BF16 *)indexKey.cudaData : nullptr,
-        (const float *)positions.cudaData, (BF16 *)key.cudaData, (BF16 *)value.cudaData,
-        dynamicLength ? (const int *)liveKeys.cudaData : nullptr, heads, kvHeads, dim, valueDim, indexDim,
-        rotaryDim, theta, __float2bfloat16_rn(valueScale), window, keyRows, valueRows, cachePast,
-        packedQkv ? (const BF16 *)packedQkv->cudaData : nullptr, ring);
+        packedQkv ? (const BF16 *)packedQkv->cudaData : nullptr,
+        (const float *)positions.cudaData, dynamicLength ? (const int *)liveKeys.cudaData : nullptr,
+        keyRows, valueRows, cachePast};
+    return true;
+}
+
+bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &indexKey,
+        const fastllm::Data &positions, fastllm::Data &key, fastllm::Data &value,
+        const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
+        int rotaryDim, float theta, float valueScale, int window, const fastllm::Data *packedQkv, bool ring) {
+    RopeCacheRow row{};
+    int indexDim = 0;
+    if (!PrepareRopeCache(q, k, v, indexKey, positions, key, value, liveKeys,
+            heads, kvHeads, dim, valueDim, rotaryDim, theta, valueScale, window,
+            packedQkv, ring, row, indexDim)) return false;
+    auto kernel = packedQkv ? RopeAppendCache<true> : RopeAppendCache<false>;
+    kernel<<<q.dims[1] * (heads + 2 * kvHeads + (indexDim != 0)), 128>>>(row,
+        heads, kvHeads, dim, valueDim, indexDim, rotaryDim, theta,
+        __float2bfloat16_rn(valueScale), window, ring);
+    CheckLaunch();
+    return true;
+}
+
+bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &positions,
+        const std::vector<FastllmNaiveRopeCacheRow> &rows, const fastllm::Data &liveKeys,
+        int heads, int kvHeads, int dim, int valueDim, int rotaryDim, float theta,
+        float valueScale, int window, const fastllm::Data *packedQkv, bool ring) {
+    using namespace fastllm;
+    const int count = rows.size();
+    if (!count || q.dims.size() != 3 || q.dims[1] != count || k.dims.size() != 3 ||
+        k.dims[1] != count || v.dims.size() != 3 || v.dims[1] != count ||
+        positions.Count(0) < (uint64_t)count || liveKeys.Count(0) < (uint64_t)count ||
+        (packedQkv && (packedQkv->dims.size() != 3 || packedQkv->dims[1] != count))) return false;
+    std::vector<RopeCacheRow> descriptors(count);
+    int indexDim = 0;
+    for (int b = 0; b < count; ++b) {
+        if (!rows[b].key || !rows[b].value) return false;
+        auto view = [b](Data &dst, const Data &src) {
+            auto dims = src.dims;
+            dims[1] = 1;
+            dst.Resize(dims);
+            dst.strides = src.strides;
+            dst.FakeFrom(src, (size_t)b * src.dims.back() * src.unitSize);
+        };
+        Data rq, rk, rv, rp, rl, packed, empty;
+        view(rq, q); view(rk, k); view(rv, v);
+        rp.Resize({1, 1}); rp.FakeFrom(positions, b * sizeof(float));
+        rl.Resize({1}); rl.FakeFrom(liveKeys, b * sizeof(int));
+        if (packedQkv) view(packed, *packedQkv);
+        int width = 0;
+        if (!PrepareRopeCache(rq, rk, rv, rows[b].indexKey ? *rows[b].indexKey : empty,
+                rp, *rows[b].key, *rows[b].value, rl, heads, kvHeads, dim, valueDim,
+                rotaryDim, theta, valueScale, window, packedQkv ? &packed : nullptr,
+                ring, descriptors[b], width) || (b && width != indexDim)) return false;
+        indexDim = width;
+    }
+    // Validate every cache before launching, so a fallback cannot double-rotate Q.
+    for (int first = 0; first < count; first += kRopeCacheBatch) {
+        const int batchSize = std::min(kRopeCacheBatch, count - first);
+        RopeCacheBatch batch{};
+        std::copy_n(descriptors.begin() + first, batchSize, batch.rows);
+        auto kernel = packedQkv ? BatchRopeAppendCache<true> : BatchRopeAppendCache<false>;
+        kernel<<<dim3(heads + 2 * kvHeads + (indexDim != 0), batchSize), 128>>>(batch,
+            heads, kvHeads, dim, valueDim, indexDim, rotaryDim, theta,
+            __float2bfloat16_rn(valueScale), window, ring);
+    }
     CheckLaunch();
     return true;
 }

@@ -506,6 +506,49 @@ Data NaiveN05FlashModel::RunTarget(
             batch && batch->Decode() && tpSwaRingCache;
         std::vector<FastllmNaiveSWARow> swaRows;
         if (batchedSWA) swaRows.reserve(batch->Size());
+        auto prepareIndexKey = [&](Data &normed, TargetWorkspace &buf) {
+            Data &indexKey = buf.indexKey;
+            if (!slidingLayers[layer]) {
+                std::string ip = ap + "indexer.";
+                Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
+                // LayerNorm accumulates in FP32; the generic CUDA operation does
+                // not accept BF16 storage, so round only its final result.
+                if (decodeWorkspace) {
+                    ToDataType(indexKey, buf.indexKeyFloat, DataType::FLOAT32);
+                    LayerNorm(buf.indexKeyFloat, localWeight(ip + "k_norm.weight"),
+                              localWeight(ip + "k_norm.bias"), -1, buf.indexKeyFloat);
+                    ToDataType(buf.indexKeyFloat, indexKey, DataType::BFLOAT16);
+                } else {
+                    ToDataType(indexKey, DataType::FLOAT32);
+                    LayerNorm(indexKey, localWeight(ip + "k_norm.weight"), localWeight(ip + "k_norm.bias"), -1, indexKey);
+                    ToDataType(indexKey, DataType::BFLOAT16);
+                }
+            }
+        };
+        bool batchRopePrepared = false;
+        if (batch) {
+            while ((int)buf.sequences.size() < batch->Size())
+                buf.sequences.emplace_back(new TargetWorkspace());
+        }
+        if (batch && batch->Size() > 1 && batch->Decode() && decodeWorkspace &&
+            !graphVerify && (!capture || (!capture->verifying && capture->batchHistory.empty()))) {
+            std::vector<FastllmNaiveRopeCacheRow> caches;
+            caches.reserve(batch->Size());
+            for (int sequence = 0; sequence < batch->Size(); ++sequence) {
+                auto &part = *buf.sequences[sequence];
+                Data rowNorm;
+                rowNorm.Resize({1, 1, embed_dim});
+                rowNorm.FakeFrom(normed, (size_t)sequence * embed_dim * normed.unitSize);
+                prepareIndexKey(rowNorm, part);
+                caches.push_back({batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
+                    batch->Value(sequence, layer).multiDeviceDatas.at(gpu),
+                    slidingLayers[layer] ? nullptr : &part.indexKey});
+            }
+            batchRopePrepared = FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions,
+                caches, buf.liveKeys, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                rotaryDim, cfg.theta, valueScale, slidingLayers[layer] ? window : 0,
+                mergedQkv ? &qkv : nullptr, slidingLayers[layer] && tpSwaRingCache);
+        }
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &pastKey, Data &pastValue,
                           TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, HistoryChunk *historyChunk) {
@@ -524,29 +567,14 @@ Data NaiveN05FlashModel::RunTarget(
             const int layerCapacity = slidingLayers[layer]
                 ? (int)std::min<int64_t>(reserveCapacity, (int64_t)window - 1 + length)
                 : reserveCapacity;
-            if (!slidingLayers[layer]) {
-                std::string ip = ap + "indexer.";
-                Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
-                // LayerNorm accumulates in FP32; the generic CUDA operation does
-                // not accept BF16 storage, so round only its final result.
-                if (decodeWorkspace) {
-                    ToDataType(indexKey, buf.indexKeyFloat, DataType::FLOAT32);
-                    LayerNorm(buf.indexKeyFloat, localWeight(ip + "k_norm.weight"),
-                              localWeight(ip + "k_norm.bias"), -1, buf.indexKeyFloat);
-                    ToDataType(buf.indexKeyFloat, indexKey, DataType::BFLOAT16);
-                } else {
-                    ToDataType(indexKey, DataType::FLOAT32);
-                    LayerNorm(indexKey, localWeight(ip + "k_norm.weight"), localWeight(ip + "k_norm.bias"), -1, indexKey);
-                    ToDataType(indexKey, DataType::BFLOAT16);
-                }
-            }
+            if (!batchRopePrepared) prepareIndexKey(normed, buf);
             Data noIndexKey, noLiveKeys;
-            bool fusedCache = !historyChunk &&
+            bool fusedCache = batchRopePrepared || (!historyChunk &&
                 (decodeWorkspace || (!tensorParallel && length <= 8 && localPast > 0)) &&
                 FastllmCudaNaiveRopeAppendCache(q, k, v, slidingLayers[layer] ? noIndexKey : indexKey,
                     positions, pastKey, pastValue, decodeWorkspace ? buf.liveKeys : noLiveKeys, cfg.heads, cfg.kvHeads,
                     cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale,
-                    slidingLayers[layer] ? window : 0, mergedQkv ? &qkv : nullptr, ringDecode);
+                    slidingLayers[layer] ? window : 0, mergedQkv ? &qkv : nullptr, ringDecode));
             if (fusedCache && !decodeWorkspace) {
                 pastKey.Resize({1, localPast + length, pastKey.dims[2]});
                 pastValue.Resize({1, localPast + length, pastValue.dims[2]});
@@ -645,8 +673,6 @@ Data NaiveN05FlashModel::RunTarget(
             }
         };
         if (batch) {
-            while ((int)buf.sequences.size() < batch->Size())
-                buf.sequences.emplace_back(new TargetWorkspace());
             attn.dataType = BFLOAT16;
             attn.Resize({1, length, cfg.heads * cfg.valueDim});
             attn.ToDevice(q.dataDevice, q.dataDeviceIds, false);
