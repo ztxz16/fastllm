@@ -155,8 +155,9 @@ struct FastllmNaiveDecodeScratch {
 };
 // One query per independent sequence, up to 2048 selected keys. KV stays in
 // place, and descriptors are kernel arguments. Graph replay reads device lengths
-// without copying metadata. Preserve BF16 score/probability rounding and the
-// original PV accumulation order; Hopper fusion uses shared memory only.
+// without copying metadata. Preserve BF16 score/probability rounding. Large
+// batches use Tensor Cores with FP32 accumulation; unsupported shapes retain
+// the existing CUDA kernels.
 void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
     const fastllm::Data &sink, const std::vector<FastllmNaiveDSARow> &rows,
     int heads, int kvHeads, int dim, int valueDim,

@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "naive-n05-topk.cuh"
 #include "naive-n05-dsa-decode.cuh"
+#include "naive-n05-attention-hopper.cuh"
 #include <cuda_bf16.h>
 #include <nccl.h>
 #include <cuda_fp8.h>
@@ -2856,6 +2857,66 @@ void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
     CheckLaunch();
 }
 
+namespace {
+template <class Kernel> bool BulkKernelSupported(Kernel kernel, size_t shared, int minArch) {
+    // Set attributes before capture and cache both success and unsupported images.
+    static thread_local std::map<std::pair<int, const void *>, bool> cache;
+    auto key = std::make_pair(FastllmCudaGetDevice(), (const void *)kernel);
+    auto found = cache.find(key);
+    if (found == cache.end()) {
+        cudaFuncAttributes attr{};
+        bool ok = FastllmCudaRuntimeArch() >= minArch &&
+            cudaFuncGetAttributes(&attr, kernel) == cudaSuccess && attr.ptxVersion >= minArch &&
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared) == cudaSuccess;
+        if (!ok) cudaGetLastError();
+        found = cache.emplace(key, ok).first;
+    }
+    return found->second;
+}
+
+template <int Max, bool Ring>
+bool BulkAttention(const fastllm::Data &query, const float *bias,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, fastllm::Data &output) {
+    namespace bulk = naive_attention_bulk;
+    if (!BulkKernelSupported(bulk::Decode<Max, Ring>, sizeof(bulk::Storage<Max>), 80)) return false;
+    for (int first = 0; first < (int)rows.size(); first += bulk::BatchLimit) {
+        int n = std::min(bulk::BatchLimit, (int)rows.size() - first);
+        bulk::Batch batch{};
+        std::copy_n(rows.begin() + first, n, batch.rows);
+        bulk::Decode<Max, Ring><<<dim3(n, heads / 8), 256, sizeof(bulk::Storage<Max>)>>>(
+            (const BF16 *)query.cudaData + (size_t)first * heads * 192, batch, bias,
+            (BF16 *)output.cudaData + (size_t)first * heads * 128, heads, kvHeads);
+    }
+    return true;
+}
+
+#if CUDART_VERSION >= 12010
+template <int Max>
+bool HopperBulkAttention(const fastllm::Data &query, const float *bias,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, fastllm::Data &output) {
+    namespace bulk = naive_attention_bulk;
+    if (FastllmCudaRuntimeArch() != 90 ||
+        !BulkKernelSupported(bulk::HopperDecode<Max>, sizeof(bulk::TmaStorage<Max>), 90)) return false;
+    // Encode every row before launching anything: unsupported TMA layouts can
+    // fall back without partially writing output. No H2D copy or global buffer.
+    std::vector<bulk::TmaBatch> batches((rows.size() + bulk::TmaBatchLimit - 1) / bulk::TmaBatchLimit);
+    for (int first = 0; first < (int)rows.size(); first += bulk::TmaBatchLimit) {
+        int n = std::min(bulk::TmaBatchLimit, (int)rows.size() - first);
+        if (!bulk::PrepareTmaBatch(batches[first / bulk::TmaBatchLimit], rows.data() + first, n))
+            return false;
+    }
+    for (int first = 0; first < (int)rows.size(); first += bulk::TmaBatchLimit) {
+        int n = std::min(bulk::TmaBatchLimit, (int)rows.size() - first);
+        bulk::HopperDecode<Max><<<dim3(n, heads / 8), 256, sizeof(bulk::TmaStorage<Max>)>>>(
+            (const BF16 *)query.cudaData + (size_t)first * heads * 192,
+            batches[first / bulk::TmaBatchLimit], bias,
+            (BF16 *)output.cudaData + (size_t)first * heads * 128, heads);
+    }
+    return true;
+}
+#endif
+} // namespace
+
 void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
         const fastllm::Data &sink, const std::vector<FastllmNaiveDSARow> &rows,
         int heads, int kvHeads, int dim, int valueDim,
@@ -2878,6 +2939,27 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
         hopper = hopper && (uintptr_t)row.value % 16 == 0;
     }
     AssertInFastLLM(count <= 2048, "Batched DSA supports at most 2048 selected keys.");
+    // Keep the established small-batch kernels. Eight heads share KV only
+    // when the complete GQA group and cache vectors satisfy the MMA layout.
+    bool bulk = rows.size() >= 32 && dim == 192 && valueDim == 128 &&
+        (heads / kvHeads) % 8 == 0 && count > 0;
+    for (const auto &row : rows)
+        bulk = bulk && row.keyStride % 8 == 0 && (uintptr_t)row.key % 16 == 0 &&
+            (uintptr_t)row.value % 16 == 0;
+    if (bulk) {
+        Output(output, BFLOAT16, {1, (int)rows.size(), heads * valueDim});
+        const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        bool launched = false;
+#if CUDART_VERSION >= 12010
+        if (dense && kvHeads == 1)
+            launched = count <= 1024 ? HopperBulkAttention<1024>(query, bias, rows, heads, output)
+                                     : HopperBulkAttention<2048>(query, bias, rows, heads, output);
+#endif
+        if (!launched)
+            launched = count <= 1024 ? BulkAttention<1024, false>(query, bias, rows, heads, kvHeads, output)
+                                     : BulkAttention<2048, false>(query, bias, rows, heads, kvHeads, output);
+        if (launched) { CheckLaunch(); return; }
+    }
     hopper = hopper && count >= 512;
     if (hopper) {
         // Configure opt-in shared memory once per device, before graph capture.
@@ -2983,6 +3065,21 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
         query.dataType == BFLOAT16 && query.dims == std::vector<int>({1, (int)rows.size(), heads * kSwaQkDim}) &&
         liveKeys.dataType == INT32 && liveKeys.Count(0) == rows.size(), "Invalid batched SWA decode shape.");
     Output(output, BFLOAT16, {1, (int)rows.size(), heads * kSwaValueDim});
+    if (rows.size() >= 32 && (heads / kvHeads) % 8 == 0) {
+        std::vector<FastllmNaiveDSARow> descriptors(rows.size());
+        bool aligned = true;
+        for (int i = 0; i < (int)rows.size(); ++i) {
+            auto &r = descriptors[i];
+            r.key = rows[i].key; r.value = rows[i].value;
+            r.liveKeys = (const int *)liveKeys.cudaData + i;
+            r.capacity = kSwaWindow; r.keyStride = kvHeads * kSwaQkDim;
+            aligned = aligned && r.key && r.value && (uintptr_t)r.key % 16 == 0 && (uintptr_t)r.value % 16 == 0;
+        }
+        const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        if (aligned && BulkAttention<128, true>(query, bias, descriptors, heads, kvHeads, output)) {
+            CheckLaunch(); return;
+        }
+    }
     const int threads = heads == 8 || heads == 16 ? 1024 : kSwaThreads;
     auto kernel = threads == 1024
         ? AttentionShortDecode<kSwaWindow, BatchSwaKeys, false, 1024, kSwaOutputTile, true>
