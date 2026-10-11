@@ -1136,7 +1136,7 @@ static void RunSharedGGUFRecords() {
 
 static void RunHybrid(ggml_type format, int rows, bool single = false, bool frequency = false,
                       fastllm::DataType inputType = fastllm::FLOAT32, bool noCache = false,
-                      bool large = false, bool verifyDynamic = false) {
+                      bool large = false, bool verifyDynamic = false, bool stableWidth = false) {
     using namespace fastllm;
     constexpr int experts = 24, topk = 7, steps = 18;
     int hidden = 256;
@@ -1151,7 +1151,8 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
     size_t stride = 0;
     for (int layer = 0; layer < 2; ++layer) {
         const int inter = large ? 768 + layer * 256 : (layer + 1) * 256;
-        const int width = large ? 2560 + layer * 512 : (layer + 1) * 256;
+        const int width = stableWidth ? (large ? 2560 : 256) :
+            (large ? 2560 + layer * 512 : (layer + 1) * 256);
         tables[layer].resize(2 * (experts + 1));
         if (noCache) oracleTables[layer].resize(tables[layer].size());
         for (int e = 0; e < experts; ++e) for (int part = 0; part < 2; ++part) {
@@ -1191,6 +1192,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
         Require(CanRunNumasMoeDecodeExperts(table.data(), table.size()), "GGUF CPU subset unavailable");
     std::shared_ptr<FastllmCudaMoeExpertParallel> context;
     if (!single) context = FastllmCudaCreateMoeExpertParallel(ranks);
+    const bool peerAccess = !single && FastllmCudaPeerAccessInit({0, 1});
     Data input[2]{{inputType, {rows, hidden}}, {inputType, {rows, hidden}}}, output[2], referenceInput;
     for (int rank = 0; rank < ranks; ++rank) {
         Cuda(cudaSetDevice(rank)); input[rank].ToDevice(CUDA, std::vector<int>{rank}); input[rank].Allocate(false);
@@ -1380,6 +1382,9 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
         auto run = [&](int rank) {
             try {
                 Cuda(cudaSetDevice(rank)); Data empty;
+                // Alternate local and peer inputs, exercising both PP routing
+                // owners and FP32/FP16/BF16 conversion against the same oracle.
+                const Data &rankInput = peerAccess && step % 4 >= 2 ? input[routingRank] : input[rank];
                 Data sharedScratch(FLOAT32, {1, hidden}); Gpu(sharedScratch);
                 int callbacks = 0;
                 auto parallel = [&] {
@@ -1396,7 +1401,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                     Data invalidIds;
                     invalidIds.FakeFrom(routedIds, 0);
                     invalidIds.Resize({rows, 0});
-                    Require(!FastllmCudaMergeMOEExpertParallel(*context, rank, input[rank],
+                    Require(!FastllmCudaMergeMOEExpertParallel(*context, rank, rankInput,
                         rank == routingRank ? invalidIds : empty, rank == routingRank ? routedScores : empty,
                         output[rank], table.data(), table.size(), layer, [] {}, routingRank),
                         "EP accepted invalid routes");
@@ -1442,9 +1447,35 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                     }
                 } else if (single) accepted[rank] = FastllmCudaMergeMOEHybrid(input[rank], ids, scores, output[rank],
                     table.data(), table.size(), layer, parallel);
-                else accepted[rank] = FastllmCudaMergeMOEExpertParallel(*context, rank, input[rank],
-                    rank == routingRank ? routedIds : empty, rank == routingRank ? routedScores : empty, output[rank],
-                    table.data(), table.size(), layer, [] {}, routingRank);
+                else {
+                    cudaGraph_t readGraph = nullptr;
+                    cudaGraphExec_t readExec = nullptr;
+                    bool preparedReadback = false;
+                    if (rows == 1 && !noCache && step >= ranks &&
+                            rank == routingRank && GetFastllmEnv().cudaGraph) {
+                        Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+                        preparedReadback = FastllmCudaMoeExpertParallelReadback(*context, rank,
+                            rankInput, routedIds, routedScores);
+                        Cuda(cudaStreamEndCapture(cudaStreamPerThread, &readGraph));
+                        // Changing hidden width needs the ordinary Prepare() path;
+                        // stable widths must capture and use the mapped readback.
+                        Require(preparedReadback == stableWidth, "graph readback shape guard failed");
+                        if (preparedReadback) {
+                            Cuda(cudaGraphInstantiate(&readExec, readGraph, nullptr, nullptr, 0));
+                            Cuda(cudaGraphLaunch(readExec, cudaStreamPerThread));
+                            Cuda(cudaGraphLaunch(readExec, cudaStreamPerThread));
+                        } else {
+                            Cuda(cudaGraphDestroy(readGraph)); readGraph = nullptr;
+                        }
+                    }
+                    accepted[rank] = FastllmCudaMergeMOEExpertParallel(*context, rank, rankInput,
+                        rank == routingRank ? routedIds : empty, rank == routingRank ? routedScores : empty,
+                        output[rank], table.data(), table.size(), layer, [] {}, routingRank, preparedReadback);
+                    if (readExec) {
+                        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                        Cuda(cudaGraphExecDestroy(readExec)); Cuda(cudaGraphDestroy(readGraph));
+                    }
+                }
                 if (exec) {
                     Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
                     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1457,6 +1488,9 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                 if (accepted[rank]) Cuda(cudaMemcpy(actual[rank].data(), output[rank].cudaData,
                     actual[rank].size()*4, cudaMemcpyDeviceToHost));
                 if (single) Require(callbacks == (frequency ? 3 : 1), "hybrid shared callback count changed");
+            } catch (const std::exception &error) {
+                std::fprintf(stderr, "EP fixture rank %d step %d: %s\n", rank, step, error.what());
+                errors[rank] = std::current_exception();
             } catch (...) { errors[rank] = std::current_exception(); }
         };
         if (single) run(0);
@@ -1464,6 +1498,15 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
         for (int rank = 0; rank < ranks; ++rank) {
             if (errors[rank]) std::rethrow_exception(errors[rank]);
             Require(accepted[rank], "GGUF EP hybrid path rejected");
+        }
+        if (peerAccess) {
+            Cuda(cudaSetDevice(routingRank));
+            Require(FastllmCudaAddTo(output[routingRank], output[1-routingRank], 1.0f),
+                    "peer result addition rejected");
+            std::vector<float> sum(rows * hidden);
+            Cuda(cudaMemcpy(sum.data(), output[routingRank].cudaData, sum.size()*4, cudaMemcpyDeviceToHost));
+            for (size_t c = 0; c < sum.size(); ++c)
+                Require(sum[c] == actual[0][c] + actual[1][c], "peer result addition changed values");
         }
         for (size_t c = 0; c < lower.size(); ++c) {
             const float v = actual[0][c] + (single ? 0 : actual[1][c]);
@@ -1624,6 +1667,11 @@ int main(int argc, char **argv) {
             for (int rows : {1, 2, 3, 4, 5, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH}) {
                 RunHybrid(GGML_TYPE_IQ3_S, rows, false, false, fastllm::FLOAT32, false, false, true);
                 RunHybrid(GGML_TYPE_IQ3_S, rows, false, false, fastllm::FLOAT16, true, true, true);
+            }
+            if (fastllm::GetFastllmEnv().cudaGraph) {
+                for (auto type : {fastllm::FLOAT32, fastllm::FLOAT16, fastllm::BFLOAT16})
+                    RunHybrid(GGML_TYPE_IQ3_S, 1, false, false, type, false, false, true, true);
+                std::puts("PASS: captured EP readback both routing roots and FP32/FP16/BF16");
             }
             std::puts("PASS: parallel dynamic resident/staged/NUMA experts and numerical references"); return 0;
         }

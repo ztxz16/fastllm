@@ -415,9 +415,11 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
                 partial, static_cast<T *>(output.cudaData), scores, view.hidden, topk);
     } else {
         switch (downType) {
+        // Per-expert kernels never access the combined output. Do not retain
+        // that caller-owned temporary address in a reusable resident graph.
 #define LAUNCH_DOWN(name) case GGML_TYPE_##name: \
             Down<GGML_TYPE_##name><<<dim3(view.hidden, (routes+topk-1)/topk), topk*32, topk*sizeof(float), cudaStreamPerThread>>>( \
-                static_cast<const T *>(gate.cudaData), static_cast<T *>(output.cudaData), \
+                static_cast<const T *>(gate.cudaData), perExpert ? nullptr : static_cast<T *>(output.cudaData), \
                 view, scores, topk, ggml_row_size(downType, view.inter), perExpert, routes); break;
             GGUF_CACHE_TYPES(LAUNCH_DOWN)
 #undef LAUNCH_DOWN

@@ -188,7 +188,8 @@ namespace fastllm {
         std::unique_ptr<PipelineMoeState> pipelineMoe;
         bool TryRunPipelineMoe(int layer, const Data &input, const Data &index,
                 const Data &score, Data &output, std::vector<Data *> &moeWeights,
-                const std::function<void()> &sharedExpert);
+                const std::function<void()> &sharedExpert, Data **deferredPeer, bool preparedReadback);
+        bool TryPipelineMoeReadback(const Data &input, const Data &index, const Data &score);
 #endif
 #endif
         std::map<int, Data> prefillLinearInvScales;
@@ -490,14 +491,29 @@ namespace fastllm {
                                 Data *alphaCapture = nullptr,
                                 Data *betaCapture = nullptr,
                                 Data *recurrentStateOutput = nullptr);
+        struct MoEGpuInputs {
+            Data index, score, sharedOutput;
+            Data *outputTarget = nullptr;
+            Data *peerOutput = nullptr;
+            bool sharedDeferred = false;
+            bool readbackPrepared = false;
+        };
+        void SelectMoEExperts(Data &routerLogits, Data &index, Data &score);
+        void RunSharedExpert(const std::string &mlp, Data &input,
+                             Data &gateUp, Data &hidden, Data &gate, Data &output);
+        void PrepareMoERouting(int layer, const Data &input, MoEGpuInputs &prepared);
         void RunMoE(int layer, const Data &input, Data &output,
-                    bool reduceOutput = true, PrefillStageContext *prefill = nullptr);
+                   bool reduceOutput = true, PrefillStageContext *prefill = nullptr,
+                   MoEGpuInputs *prepared = nullptr,
+                   const std::function<void()> &sharedGraph = {});
         void RunMoEWithPrefix(int deviceLayer,
                               const std::string &mlpPrefix,
                               std::vector<Data *> &moeWeights,
                               std::vector<Data *> &moeBiass,
                               const Data &input, Data &output,
-                              bool reduceOutput = true, PrefillStageContext *prefill = nullptr);
+                              bool reduceOutput = true, PrefillStageContext *prefill = nullptr,
+                              MoEGpuInputs *prepared = nullptr,
+                              const std::function<void()> &sharedGraph = {});
 
         bool HasMtpWeights() const;
         bool MtpSupportsGenerationConfig(
@@ -580,7 +596,8 @@ namespace fastllm {
             RequestState &requestState,
             Data &logits,
             Data *targetMultiHidden,
-            TargetVerificationCapture *verificationCapture);
+            TargetVerificationCapture *verificationCapture,
+            int graphEndLayer = -1, Data *stageOutput = nullptr);
 
         std::shared_ptr<PrefixSnapshot> FindPrefixSnapshotLocked(
             const std::vector<int> &tokens, int maxCachedLen,

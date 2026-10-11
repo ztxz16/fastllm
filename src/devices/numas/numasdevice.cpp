@@ -627,10 +627,16 @@ namespace fastllm {
             nodes.push_back(node);
             ++ranksPerNode[node];
         }
+        std::map<int, int> nextRank;
         for (size_t rank = 0; rank < devices.size(); ++rank) {
             const int node = nodes[rank];
+            const int localRank = nextRank[node]++;
             if (node >= 0 && available[node].size() >= (size_t)ranksPerNode[node]) {
-                result[rank] = available[node];
+                // CUDA submitters on one NUMA node must not compete for the
+                // same spare core while waiting for one another's work.
+                const auto &cpus = available[node];
+                for (size_t i = localRank; i < cpus.size(); i += ranksPerNode[node])
+                    result[rank].push_back(cpus[i]);
             }
         }
 #endif

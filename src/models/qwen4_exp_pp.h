@@ -1,18 +1,42 @@
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 struct Qwen4ExpModel::PipelineMoeState {
     std::vector<int> devices;
+    std::vector<std::vector<int>> workerCpus;
+    std::thread::id boundPeerThread;
+    bool peerAccess = false;
     PersistentWorkerGroup workers;
     std::shared_ptr<FastllmCudaMoeExpertParallel> experts;
     Data peerInput[2], peerOutput[2], sum[2];
     void *ready[2] = {nullptr, nullptr}, *done[2] = {nullptr, nullptr};
 
+#if defined(USE_NUMAS) && defined(__linux__)
+    struct CallerAffinity {
+        cpu_set_t original;
+        bool restore = false;
+        explicit CallerAffinity(PipelineMoeState *state) {
+            // The persistent peer must already exist before narrowing the
+            // caller's mask, otherwise it would inherit the caller's cores.
+            if (state && state->workerCpus.size() == 2 && state->workers.HasWorkers() &&
+                sched_getaffinity(0, sizeof(original), &original) == 0) {
+                restore = BindNumasWorkerCpuSet(state->workerCpus[0]);
+            }
+        }
+        ~CallerAffinity() {
+            if (restore) sched_setaffinity(0, sizeof(original), &original);
+        }
+    };
+#endif
+
     explicit PipelineMoeState(const std::vector<CudaPrefillStage> &stages) {
         if (stages.size() != 2) return;
         Qwen4CudaDeviceGuard guard;
         for (const auto &stage : stages) devices.push_back(stage.device);
+#ifdef USE_NUMAS
+        workerCpus = GetNumasCudaWorkerCpuSets(devices);
+#endif
         // Peer copies otherwise silently stage through host memory, even with
         // NVLink present. Failure leaves the existing staged-copy fallback.
-        FastllmCudaPeerAccessInit(devices);
+        peerAccess = FastllmCudaPeerAccessInit(devices);
         experts = FastllmCudaCreateMoeExpertParallel(2);
         for (int rank = 0; rank < 2; ++rank) {
             FastllmCudaSetDevice(devices[rank]);
@@ -35,9 +59,22 @@ struct Qwen4ExpModel::PipelineMoeState {
     }
 };
 
+bool Qwen4ExpModel::TryPipelineMoeReadback(const Data &input, const Data &index, const Data &score) {
+#ifdef USE_NUMAS
+    if (threadTpState || threadTpRank >= 0 || Qwen4MtpDraftsPerStep() != 0 || !pipelineMoe)
+        return false;
+    const auto &devices = pipelineMoe->devices;
+    const auto found = std::find(devices.begin(), devices.end(), FastllmCudaGetDevice());
+    return found != devices.end() && FastllmCudaMoeExpertParallelReadback(
+        *pipelineMoe->experts, found - devices.begin(), input, index, score);
+#else
+    return false;
+#endif
+}
+
 bool Qwen4ExpModel::TryRunPipelineMoe(int layer, const Data &input,
         const Data &index, const Data &score, Data &output,
-        std::vector<Data *> &moeWeights, const std::function<void()> &sharedExpert) {
+        std::vector<Data *> &moeWeights, const std::function<void()> &sharedExpert, Data **deferredPeer, bool preparedReadback) {
 #ifdef USE_NUMAS
     if (threadTpState || threadTpRank >= 0 || Qwen4MtpDraftsPerStep() != 0 ||
         input.dataDevice != CUDA ||
@@ -62,28 +99,39 @@ bool Qwen4ExpModel::TryRunPipelineMoe(int layer, const Data &input,
         data.ToDevice(CUDA, std::vector<int>{target}, false);
         data.Allocate(false);
     };
-    prepare(state.peerInput[peer], state.devices[peer], input.dataType);
-    prepare(state.sum[owner], device, FLOAT32);
     FastllmCudaEventRecordCurrentThread(state.ready[owner]);
+    const bool borrowInput = state.peerAccess && input.dataDeviceIds == std::vector<int>{device};
     bool accepted[2] = {false, false};
     std::vector<std::exception_ptr> errors(2);
     // Keep physical rank/expert ownership stable as the PP layer owner moves.
     // Only the narrow normalized activation and the reduced MoE result travel.
     state.workers.RunWithCaller({0, 1}, [&](int worker) {
+        const auto thread = std::this_thread::get_id();
+        if (worker != 0 && state.boundPeerThread != thread) {
+            BindNumasWorkerCpuSet(state.workerCpus[worker]);
+            state.boundPeerThread = thread;
+        }
         const int rank = worker == 0 ? owner : peer;
         const int target = state.devices[rank];
         void *previous = GetExecutor();
         struct RestoreExecutor {
             void *previous;
-            ~RestoreExecutor() { SetCurrentThreadExecutor(previous); }
-        } restore{previous};
+            bool previousCaptureMode;
+            ~RestoreExecutor() {
+                SetCurrentThreadExecutor(previous);
+                FastllmCudaGraphSetManagedCaptureOnly(previousCaptureMode);
+            }
+        } restore{previous, FastllmCudaGraphSetManagedCaptureOnly(true)};
         FastllmCudaSetDevice(target);
         if (worker != 0) {
+            // Allocate on the thread that owns the peer stream, avoiding a
+            // switch to the peer device and back on every owner submission.
+            if (!borrowInput) prepare(state.peerInput[peer], target, input.dataType);
             static thread_local std::unique_ptr<Executor> executor(new Executor());
             executor->SetFirstDevice("cuda:" + std::to_string(target));
             SetCurrentThreadExecutor(executor.get());
             FastllmCudaCurrentThreadStreamWaitEvent(state.ready[owner]);
-            if (!FastllmCudaMemcpyPeerAsyncCurrentThread(target,
+            if (!borrowInput && !FastllmCudaMemcpyPeerAsyncCurrentThread(target,
                     state.peerInput[peer].cudaData, device, input.cudaData, input.GetBytes())) {
                 FastllmCudaEventSynchronize(state.ready[owner]);
                 FastllmCudaMemcpyBetweenDevices(target, state.peerInput[peer].cudaData,
@@ -91,11 +139,12 @@ bool Qwen4ExpModel::TryRunPipelineMoe(int layer, const Data &input,
             }
         }
         accepted[rank] = FastllmCudaMergeMOEExpertParallel(*state.experts, rank,
-            worker == 0 ? input : state.peerInput[peer], index, score,
+            worker == 0 || borrowInput ? input : state.peerInput[peer], index, score,
             worker == 0 ? output : state.peerOutput[peer],
             moeWeights.data(), int(moeWeights.size()), layer,
-            worker == 0 ? sharedExpert : std::function<void()>(), owner);
-        FastllmCudaEventRecordCurrentThread(state.done[rank]);
+            worker == 0 ? sharedExpert : std::function<void()>(), owner,
+            preparedReadback && worker == 0);
+        if (worker != 0) FastllmCudaEventRecordCurrentThread(state.done[rank]);
         // The persistent peer keeps its stream alive. The owner's event wait
         // below joins GPU completion; do not also block its CPU worker here.
     }, errors);
@@ -104,6 +153,20 @@ bool Qwen4ExpModel::TryRunPipelineMoe(int layer, const Data &input,
     AssertInFastLLM(accepted[0] == accepted[1], "PP MoE collective rejection mismatch.");
     if (!accepted[owner]) return false;
     FastllmCudaCurrentThreadStreamWaitEvent(state.done[peer]);
+    if (state.peerAccess && output.dataType == FLOAT32 &&
+        state.peerOutput[peer].dataType == FLOAT32 &&
+        output.dims == state.peerOutput[peer].dims) {
+        // Both allocations are peer-accessible. The event protects the remote
+        // read; the next input-ready event protects it from peer reuse.
+        if (deferredPeer) {
+            // The per-rank output stays at a stable address. Consume it in
+            // the next dense graph, after this stream's peer-completion wait.
+            *deferredPeer = &state.peerOutput[peer];
+            return true;
+        }
+        return FastllmCudaAddTo(output, state.peerOutput[peer], 1.0f);
+    }
+    prepare(state.sum[owner], device, FLOAT32);
     if (!FastllmCudaMemcpyPeerAsyncCurrentThread(device, state.sum[owner].cudaData,
             state.devices[peer], state.peerOutput[peer].cudaData, state.sum[owner].GetBytes())) {
         FastllmCudaEventSynchronize(state.done[peer]);

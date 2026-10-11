@@ -1993,10 +1993,15 @@ std::shared_ptr<FastllmCudaMoeExpertParallel> FastllmCudaCreateMoeExpertParallel
 // Read only between calls, after all ranks have finished expert dispatch.
 FastllmCudaMoeExpertParallelStats FastllmCudaGetMoeExpertParallelStats(
         const FastllmCudaMoeExpertParallel &state);
+// Capture the single-row routing readback after an established EP warmup.
+// Buffers remain owned by state; callers must retain it for the graph lifetime.
+bool FastllmCudaMoeExpertParallelReadback(FastllmCudaMoeExpertParallel &state, int rank,
+        const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score);
 bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int rank,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
-        const std::function<void()> &launchParallel = {}, int routingRank = 0);
+        const std::function<void()> &launchParallel = {}, int routingRank = 0,
+        bool preparedReadback = false);
 bool FastllmCudaCanRunMoeCacheSmallBatch(
         const fastllm::Data &input, const fastllm::Data &index,
         const fastllm::Data &score, fastllm::Data **weights,
