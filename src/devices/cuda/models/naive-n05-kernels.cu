@@ -13,6 +13,7 @@
 #include <climits>
 #include <algorithm>
 #include <cmath>
+#include <type_traits>
 #include <vector>
 
 #if !defined(FASTLLM_CUDA_LEGACY_ONLY) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
@@ -1229,6 +1230,12 @@ constexpr int kSwaQkDim = 192;
 constexpr int kSwaValueDim = 128;
 constexpr int kSwaOutputTile = 32;
 constexpr int kSwaThreads = 256;
+constexpr int kSwaBatchLimit = 16;
+struct BatchSwaKeys {
+    FastllmNaiveSWARow rows[kSwaBatchLimit];
+    const int *length;
+    __device__ operator int() const { return min(length[blockIdx.y], kSwaWindow); }
+};
 
 // Single-query attention with head dimensions 192/128 and up to 256 keys. Four
 // output slices spread the work across SMs; cooperative V loads avoid the
@@ -1236,7 +1243,14 @@ constexpr int kSwaThreads = 256;
 // The softmax tree, BF16 rounding and slot-ordered FP32 FMAs are unchanged.
 template <int MaxKeys, typename Length = int, bool Verify = false, int Threads = kSwaThreads, int OutputTile = kSwaOutputTile, bool Ring = false>
 __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v,
-        const float *sink, BF16 *out, int heads, int kvHeads, int keyStride, Length liveKeys) {
+        const float *sink, BF16 *out, int heads, int kvHeads, int keyStride, const Length liveKeys) {
+    if constexpr (std::is_same<Length, BatchSwaKeys>::value) {
+        const int row = blockIdx.y;
+        q += (size_t)row * heads * kSwaQkDim;
+        out += (size_t)row * heads * kSwaValueDim;
+        k = (const BF16 *)liveKeys.rows[row].key;
+        v = (const BF16 *)liveKeys.rows[row].value;
+    }
     if constexpr (Verify) {
         const int row = blockIdx.y;
         q += (size_t)row * heads * kSwaQkDim;
@@ -1250,9 +1264,14 @@ __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v
             v += (size_t)begin * kvHeads * kSwaValueDim;
         }
     }
-    int keys = Verify ? min(VerifyCount(liveKeys, blockIdx.y), MaxKeys) : (int)liveKeys;
+    int keys = liveKeys;
+    if constexpr (Verify) keys = min(VerifyCount(liveKeys, blockIdx.y), MaxKeys);
     int firstKey = 0;
-    if constexpr (Ring) firstKey = max(0, *liveKeys.length - kSwaWindow);
+    if constexpr (Ring) {
+        if constexpr (std::is_same<Length, BatchSwaKeys>::value)
+            firstKey = max(0, liveKeys.length[blockIdx.y] - kSwaWindow);
+        else firstKey = max(0, *liveKeys.length - kSwaWindow);
+    }
     __shared__ float scores[MaxKeys], scratch[kSwaThreads], maximum, denominator;
     __shared__ BF16 values[MaxKeys][OutputTile];
     int h = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
@@ -2755,6 +2774,33 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
                 dsa::Values<256><<<dim3(heads, 32, batch), 128>>>(scores, descriptors, out,
                     heads, kvHeads, count);
         }
+    }
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
+        const fastllm::Data &sink, const std::vector<FastllmNaiveSWARow> &rows,
+        const fastllm::Data &liveKeys, int heads, int kvHeads,
+        fastllm::Data &output) {
+    using namespace fastllm;
+    AssertInFastLLM(!rows.empty() && heads > 0 && kvHeads > 0 && heads % kvHeads == 0 &&
+        query.dataType == BFLOAT16 && query.dims == std::vector<int>({1, (int)rows.size(), heads * kSwaQkDim}) &&
+        liveKeys.dataType == INT32 && liveKeys.Count(0) == rows.size(), "Invalid batched SWA decode shape.");
+    Output(output, BFLOAT16, {1, (int)rows.size(), heads * kSwaValueDim});
+    const int threads = heads == 8 || heads == 16 ? 1024 : kSwaThreads;
+    auto kernel = threads == 1024
+        ? AttentionShortDecode<kSwaWindow, BatchSwaKeys, false, 1024, kSwaOutputTile, true>
+        : AttentionShortDecode<kSwaWindow, BatchSwaKeys, false, kSwaThreads, kSwaOutputTile, true>;
+    const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+    for (int first = 0; first < (int)rows.size(); first += kSwaBatchLimit) {
+        const int count = std::min(kSwaBatchLimit, (int)rows.size() - first);
+        BatchSwaKeys keys{};
+        std::copy_n(rows.begin() + first, count, keys.rows);
+        keys.length = (const int *)liveKeys.cudaData + first;
+        kernel<<<dim3(heads, count, kSwaValueDim / kSwaOutputTile), threads>>>(
+            (const BF16 *)query.cudaData + (size_t)first * heads * kSwaQkDim,
+            nullptr, nullptr, bias, (BF16 *)output.cudaData + (size_t)first * heads * kSwaValueDim,
+            heads, kvHeads, kvHeads * kSwaQkDim, keys);
     }
     CheckLaunch();
 }

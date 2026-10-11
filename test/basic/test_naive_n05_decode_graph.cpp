@@ -415,6 +415,43 @@ static void TestSwaRing(int heads, int kvHeads, bool fused) {
     }
 }
 
+static void TestSwaBatch(int batch, int heads, int kvHeads) {
+    Data query(BFLOAT16), sink(FLOAT32), live(INT32), actual, expected(BFLOAT16), none;
+    Upload(query, {1, batch, heads * 192}, 91);
+    Upload(sink, {heads}, 92);
+    Upload(live, {batch}, 93);
+    Upload(expected, {1, batch, heads * 128}, 94);
+    std::vector<Data> keys(batch, Data(BFLOAT16)), values(batch, Data(BFLOAT16));
+    std::vector<FastllmNaiveSWARow> rows;
+    for (int b = 0; b < batch; ++b) {
+        Upload(keys[b], {1, 128, kvHeads * 192}, 95 + b);
+        Upload(values[b], {1, 128, kvHeads * 128}, 125 + b);
+        rows.push_back({keys[b].cudaData, values[b].cudaData});
+    }
+    std::vector<int> lengths(batch, 128);
+    Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+    Graph graph;
+    graph.Capture([&]() {
+        FastllmCudaNaiveBatchSWADecode(query, sink, rows, live, heads, kvHeads, actual);
+    });
+    for (int prefix : {1, 127, 707}) {
+        for (int b = 0; b < batch; ++b) lengths[b] = prefix + b;
+        Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+        graph.Run();
+        for (int b = 0; b < batch; ++b) {
+            Data q, length, result;
+            q.Resize({1, 1, heads * 192}); q.FakeFrom(query, (size_t)b * heads * 192 * 2);
+            length.Resize({1}); length.FakeFrom(live, b * sizeof(int));
+            result.Resize({1, 1, heads * 128}); result.FakeFrom(expected, (size_t)b * heads * 128 * 2);
+            FastllmNaiveDecodeScratch scratch;
+            FastllmCudaNaiveDecodeAttention(q, keys[b], values[b], none, sink, length,
+                128, heads, kvHeads, 192, 128, 128, scratch, result, true);
+        }
+        Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "batched SWA differs from individual rows");
+        ++checks;
+    }
+}
+
 int main() {
     try {
         int devices = 0;
@@ -423,6 +460,9 @@ int main() {
         FastllmCudaSetDevice(0);
         if (!FastllmCudaNaiveDecodeGraphSupported())
             return 77;
+        for (int batch : {1, 2, 3, 4, 17})
+            for (int heads : {4, 8, 16})
+                TestSwaBatch(batch, heads, heads == 16 ? 2 : 1);
         for (int heads : {4, 8, 16})
             for (bool fused : {false, true}) TestSwaRing(heads, heads == 16 ? 2 : 1, fused);
         for (int ch : {1, 127, 256, 1024, 2048, 4096, 5120})

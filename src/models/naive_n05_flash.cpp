@@ -502,6 +502,10 @@ Data NaiveN05FlashModel::RunTarget(
                 [](int count) { return count == 1; }) : length == 1);
         std::vector<FastllmNaiveDSARow> dsaRows;
         if (batchedDSA) dsaRows.reserve(batch ? batch->Size() : 1);
+        const bool batchedSWA = slidingLayers[layer] && decodeWorkspace && !graphVerify &&
+            batch && batch->Decode() && tpSwaRingCache;
+        std::vector<FastllmNaiveSWARow> swaRows;
+        if (batchedSWA) swaRows.reserve(batch->Size());
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &pastKey, Data &pastValue,
                           TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, HistoryChunk *historyChunk) {
@@ -615,6 +619,8 @@ Data NaiveN05FlashModel::RunTarget(
                 row.keyStride = pastKey.dims[2];
                 row.selectedCount = row.indices ? selected->dims.back() : 0;
                 dsaRows.push_back(row);
+            } else if (batchedSWA) {
+                swaRows.push_back({pastKey.cudaData, pastValue.cudaData});
             } else if (decodeWorkspace) {
                 if (graphVerify) FastllmCudaNaiveGraphVerifyAttention(q, pastKey, pastValue, *selected, sink,
                     buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
@@ -682,6 +688,9 @@ Data NaiveN05FlashModel::RunTarget(
         if (batchedDSA)
             FastllmCudaNaiveBatchDSADecode(q, localWeight(ap + "attention_sink_bias"), dsaRows,
                 cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim, buf.decode, attn);
+        if (batchedSWA)
+            FastllmCudaNaiveBatchSWADecode(q, localWeight(ap + "attention_sink_bias"), swaRows,
+                buf.liveKeys, cfg.heads, cfg.kvHeads, attn);
         Linear(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
         reduce(projected);
         if (decodeWorkspace) {

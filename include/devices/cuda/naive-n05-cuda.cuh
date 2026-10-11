@@ -146,6 +146,13 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
     const fastllm::Data &sink, const std::vector<FastllmNaiveDSARow> &rows,
     int heads, int kvHeads, int dim, int valueDim,
     FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
+// Independent 128-token SWA rings (QK=192, V=128). Cache descriptors are
+// kernel arguments; liveKeys contains one absolute length per sequence.
+struct FastllmNaiveSWARow { const void *key, *value; };
+void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
+    const fastllm::Data &sink, const std::vector<FastllmNaiveSWARow> &rows,
+    const fastllm::Data &liveKeys, int heads, int kvHeads,
+    fastllm::Data &output);
 bool FastllmCudaNaiveDecodeGraphSupported();
 // BF16 rows; update each residual and preserve RMSNorm rounding.
 void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
