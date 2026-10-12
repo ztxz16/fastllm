@@ -1871,6 +1871,10 @@ struct FastllmCudaMoeGGUFCacheView {
     // Optional device table of separately allocated canonical records. Disk
     // caches can batch resident experts without copying them into one arena.
     const uint8_t *const *recordPointers = nullptr;
+    // Optional device-side count for compact perExpert calls. routeCount is
+    // the launch bound; only the first *activeRouteCount entries are read or
+    // written. Keep this count and the routing arrays alive through replay.
+    const int32_t *activeRouteCount = nullptr;
 };
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
 bool FastllmCudaMoeGGUFCacheNumaSupported(int gateType, int downType,

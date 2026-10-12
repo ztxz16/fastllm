@@ -532,8 +532,8 @@ template<class T> static void RunRoutedBatch(ggml_type gateType, ggml_type downT
     int numaGateType = -1, numaDownType = -1;
     Data input(dtype, {rows, hidden}), gate(dtype, {routes, inter}), output(dtype, {rows, hidden});
     Data slots(INT32, {routes}), map(INT32, {routes}), scores(FLOAT32, {routes});
-    Data partial(FLOAT32, {routes, hidden});
-    for (auto *d : {&records, &workspace, &input, &gate, &output, &slots, &map, &scores, &partial}) Gpu(*d);
+    Data partial(FLOAT32, {routes, hidden}), activeCount(INT32, {1});
+    for (auto *d : {&records, &workspace, &input, &gate, &output, &slots, &map, &scores, &partial, &activeCount}) Gpu(*d);
     if (numa) Gpu(numaRecords);
     for (int e = 0; e < experts; ++e) {
         auto g = Weight(gateType, 2 * inter, hidden, 11 * e + 1, true);
@@ -601,6 +601,48 @@ template<class T> static void RunRoutedBatch(ggml_type gateType, ggml_type downT
         Require(actual == reference, "compact dispatch changed expert arithmetic or row mapping");
         Require(previous.empty() || actual != previous, "compact dispatch reused stale input");
         previous = actual;
+        // Reuse one graph as the live route count shrinks and grows, including
+        // zero. Poison inactive descriptors so a stale count cannot silently
+        // overwrite another expert or read a valid but unintended record.
+        view.routeSlots = static_cast<int32_t *>(slots.cudaData);
+        view.routeMap = static_cast<int32_t *>(map.cudaData);
+        view.routeCount = routes;
+        view.q8InputPrepared = false;
+        view.activeRouteCount = static_cast<int32_t *>(activeCount.cudaData);
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        const float untouched = 1234.25f;
+        for (int count : {0, 1, routes, topk, routes - 1, 0, routes}) {
+            auto liveSlots = compactSlots, liveRoutes = compactRoutes;
+            std::fill(liveSlots.begin() + count, liveSlots.end(), 0x7fffffff);
+            std::fill(liveRoutes.begin() + count, liveRoutes.end(), 0x7fffffff);
+            std::vector<float> expected(actual.size(), untouched);
+            for (int i = 0; i < count; ++i)
+                std::copy_n(reference.data() + compactRoutes[i] * hidden, hidden,
+                            expected.data() + compactRoutes[i] * hidden);
+            std::fill(actual.begin(), actual.end(), untouched);
+            Cuda(cudaMemcpy(slots.cudaData, liveSlots.data(), routes * sizeof(int32_t), cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(map.cudaData, liveRoutes.data(), routes * sizeof(int32_t), cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(activeCount.cudaData, &count, sizeof(count), cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(partial.cudaData, actual.data(), actual.size() * sizeof(float), cudaMemcpyHostToDevice));
+            if (!exec) {
+                auto compute = [&] {
+                    Require(FastllmCudaMoeGGUFCacheCompute(input, gate, output, view,
+                        static_cast<float *>(scores.cudaData), topk,
+                        static_cast<float *>(partial.cudaData)), "dynamic compact batch rejected");
+                };
+                compute();
+                Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+                compute();
+                Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+                Cuda(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+            }
+            Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+            Cuda(cudaMemcpy(actual.data(), partial.cudaData, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            Require(actual == expected, "dynamic graph changed active routes or touched inactive routes");
+        }
+        Cuda(cudaGraphExecDestroy(exec));
+        Cuda(cudaGraphDestroy(graph));
         Require(!FastllmCudaMoeGGUFCacheCompute(input, gate, output, view,
             static_cast<float *>(scores.cudaData), topk, nullptr), "compact dispatch accepted a dense reduction");
     }
@@ -1451,7 +1493,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                     cudaGraph_t readGraph = nullptr;
                     cudaGraphExec_t readExec = nullptr;
                     bool preparedReadback = false;
-                    if (rows == 1 && !noCache && step >= ranks &&
+                    if (!noCache && step >= ranks &&
                             rank == routingRank && GetFastllmEnv().cudaGraph) {
                         Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
                         preparedReadback = FastllmCudaMoeExpertParallelReadback(*context, rank,
@@ -1669,8 +1711,9 @@ int main(int argc, char **argv) {
                 RunHybrid(GGML_TYPE_IQ3_S, rows, false, false, fastllm::FLOAT16, true, true, true);
             }
             if (fastllm::GetFastllmEnv().cudaGraph) {
-                for (auto type : {fastllm::FLOAT32, fastllm::FLOAT16, fastllm::BFLOAT16})
-                    RunHybrid(GGML_TYPE_IQ3_S, 1, false, false, type, false, false, true, true);
+                for (int rows : {1, 3, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH})
+                    for (auto type : {fastllm::FLOAT32, fastllm::FLOAT16, fastllm::BFLOAT16})
+                        RunHybrid(GGML_TYPE_IQ3_S, rows, false, false, type, false, false, true, true);
                 std::puts("PASS: captured EP readback both routing roots and FP32/FP16/BF16");
             }
             std::puts("PASS: parallel dynamic resident/staged/NUMA experts and numerical references"); return 0;

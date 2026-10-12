@@ -109,6 +109,16 @@ int ActiveRoutes(const View &, int routes) { return routes; }
 int ActiveRoutes(const FastllmCudaMoeGGUFCacheView &view, int routes) {
     return view.routeMap ? view.routeCount : routes;
 }
+template<class View>
+__host__ __device__ const int32_t *DeviceRouteCount(const View &) { return nullptr; }
+__host__ __device__ const int32_t *DeviceRouteCount(const FastllmCudaMoeGGUFCacheView &view) {
+    return view.activeRouteCount;
+}
+template<class View>
+__device__ __forceinline__ bool ActiveRoute(const View &view, int route) {
+    const auto *count = DeviceRouteCount(view);
+    return !count || route < *count;
+}
 
 template<bool IsGate, class View>
 __device__ __forceinline__ int NumaType(const View &) { return -1; }
@@ -163,7 +173,9 @@ __device__ __forceinline__ const uint8_t *ExpertWeight(
 }
 
 template<typename T>
-__global__ void QuantizeQ8(const T *input, block_q8_1 *output, int columns) {
+__global__ void QuantizeQ8(const T *input, block_q8_1 *output, int columns,
+                          const int32_t *activeRoutes = nullptr) {
+    if (activeRoutes && blockIdx.y >= *activeRoutes) return;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     // A complete warp owns a Q8_1 block. columns is divisible by 32.
     if (c >= columns) return;
@@ -187,6 +199,7 @@ __global__ void Q8Projection(const block_q8_1 *input, T *gate, float *partial,
     __shared__ uint64_t grid[F::gridSize ? F::gridSize : 1];
     extern __shared__ uint32_t activation[];
     const int route = blockIdx.y;
+    if (!ActiveRoute(view, route)) return;
     const int columns = IsGate ? view.hidden : view.inter;
     const auto *x = input + size_t(IsGate ? OriginalRoute(view, route)/topk : route)*(columns/32);
     gguf_cache_q8::StageGrid<Type>(grid);
@@ -230,6 +243,14 @@ __global__ void Q8Projection(const block_q8_1 *input, T *gate, float *partial,
 template<ggml_type Type, typename T, typename View>
 void LaunchQ8Down(const block_q8_1 *input, T *gate, float *partial,
                   const View &view, int topk, int routes, size_t rowBytes) {
+    if constexpr (Type == GGML_TYPE_IQ4_NL || Type == GGML_TYPE_IQ4_XS) {
+        if (view.inter <= 1024) {
+            Q8Projection<Type, T, false, View, 16><<<dim3((view.hidden+15)/16, routes), 256,
+                view.inter/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
+                    input, gate, partial, view, topk, rowBytes);
+            return;
+        }
+    }
     if constexpr (Type == GGML_TYPE_Q2_0) {
         // Eight lanes reproduce the original 32-lane sum for up to sixteen
         // Q8 blocks, and let one CTA cover 32 rather than eight output rows.
@@ -302,6 +323,7 @@ template<ggml_type type, typename T, typename View>
 __global__ void Gate(const T *input, T *gateOutput, View view,
                      int topk, size_t rowBytes) {
     const int row = blockIdx.x, route = blockIdx.y;
+    if (!ActiveRoute(view, route)) return;
     const uint8_t *record = ExpertWeight<true>(view, route);
     if (record == nullptr) {
         if (threadIdx.x == 0) gateOutput[route * view.inter + row] = DequantizeCast<T>::cast(0);
@@ -331,7 +353,7 @@ __global__ void Down(const T *gateOutput, T *output, View view,
     const int route = blockIdx.y*topk + localRoute;
     // A compact last block can be partial. Compact calls always write
     // perExpert, so these inactive warps never participate in a block barrier.
-    if (route >= routes) return;
+    if (route >= routes || !ActiveRoute(view, route)) return;
     const uint8_t *record = ExpertWeight<false>(view, route);
     float value = 0;
     if (record != nullptr) {
@@ -397,7 +419,7 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
     }
     if (stages & 2)
         QuantizeQ8<<<dim3((view.inter+255)/256, routes), 256, 0, cudaStreamPerThread>>>(
-            static_cast<const T *>(gate.cudaData), qGate, view.inter);
+            static_cast<const T *>(gate.cudaData), qGate, view.inter, DeviceRouteCount(view));
     // Gate/up and activation quantization do not read down weights. Run them
     // during the remaining DMA, and keep its wait out of scheduler timings.
     if (events && !FastllmMoeWaitDown(*events)) return false;
@@ -571,6 +593,7 @@ bool FastllmCudaMoeGGUFCacheComputeStaged(const fastllm::Data &input, fastllm::D
     if (input.dims.size() != 2 || input.dims[0] <= 0 || input.dims[1] != view.hidden ||
         topk <= 0 || topk > 32 || input.dims[0] > INT_MAX / topk ||
         !scores || !view.records || !view.routeSlots ||
+        (view.activeRouteCount && !view.routeMap) ||
         (view.routeMap && (!perExpert || view.routeCount <= 0 || view.routeCount > input.dims[0]*topk)) ||
         !FastllmCudaMoeGGUFCacheSupported(view.gateType, view.hidden) ||
         !FastllmCudaMoeGGUFCacheSupported(view.downType, view.inter)) return false;

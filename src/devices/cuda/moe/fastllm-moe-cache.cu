@@ -2575,26 +2575,31 @@ __global__ void TouchResidentRoutes(const int32_t *slots, const int32_t *routes,
 __global__ void UploadExpertParallelRoutes(const int32_t *host, int stride,
         float *scores, int32_t *owners, int32_t *slots, int32_t *routes,
         unsigned long long *lastUsed, unsigned long long *step,
-        unsigned long long *hitCount, int topk, int gpuCount, int hits) {
+        unsigned long long *hitCount, int rows, int topk, int gpuCount, int hits,
+        int32_t *activeRoutes) {
     __shared__ unsigned long long base;
-    const int i = threadIdx.x;
-    if (i == 0 && hits) {
-        base = *step;
-        *step = base + 1;
-        *hitCount += hits;
+    __shared__ int gpuRoutes, residentRoutes;
+    if (threadIdx.x == 0) {
+        gpuRoutes = activeRoutes ? host[8 * stride] : gpuCount;
+        residentRoutes = activeRoutes ? host[8 * stride + 1] : hits;
+        if (activeRoutes) *activeRoutes = residentRoutes;
+        if (residentRoutes) {
+            base = *step;
+            *step = base + rows;
+            *hitCount += residentRoutes;
+        }
     }
-    if (i < topk) {
+    for (int i = threadIdx.x; i < rows * topk; i += blockDim.x) {
         scores[i] = reinterpret_cast<const float *>(host + 2 * stride)[i];
         owners[i] = host[4 * stride + i];
     }
-    int slot = -1;
-    if (i < gpuCount) {
-        slot = host[6 * stride + i];
+    __syncthreads();
+    for (int i = threadIdx.x; i < gpuRoutes; i += blockDim.x) {
+        const int slot = host[6 * stride + i];
         slots[i] = slot;
         routes[i] = host[7 * stride + i];
+        if (i < residentRoutes) atomicMax(lastUsed + slot, base + routes[i] / topk + 1);
     }
-    __syncthreads();
-    if (i < hits) atomicMax(lastUsed + slot, base + 1);
 }
 
 __global__ void TouchSparseResidentRoutes(const int32_t *ids, const int32_t *slots,
@@ -2878,9 +2883,9 @@ struct FastllmCudaMoeExpertParallel {
                 if (graph) FastllmCudaGraphDestroy(graph);
             }
         };
-        // The compact route count determines launch dimensions. Pointers and
-        // layout are part of the key; cache replacement only changes payloads.
-        using ResidentGraphKey = std::array<uint64_t, 23>;
+        // Mapped route counts are graph inputs, so changing cache hits does
+        // not consume another entry. Layouts and captured pointers stay keyed.
+        using ResidentGraphKey = std::array<uint64_t, 24>;
         std::map<ResidentGraphKey, std::unique_ptr<ResidentGraph>> residentGraphs;
 
         template <class Compute>
@@ -2986,7 +2991,7 @@ struct FastllmCudaMoeExpertParallel {
             // Peers read Selected() until the next routing rendezvous. Keep
             // routing storage stable when activation workspaces change size.
             if (!routes) {
-                if (cudaMallocHost(&routes, 8 * maxRoutes * sizeof(int32_t)) != cudaSuccess) return false;
+                if (cudaMallocHost(&routes, (8 * maxRoutes + 2) * sizeof(int32_t)) != cudaSuccess) return false;
                 if (cudaHostGetDevicePointer(&mappedRoutes, routes, 0) != cudaSuccess) {
                     mappedRoutes = nullptr;
                     (void)cudaGetLastError();
@@ -3072,23 +3077,31 @@ bool FastllmCudaMoeExpertParallelReadback(FastllmCudaMoeExpertParallel &state, i
     if (rank < 0 || rank >= int(state.ranks.size())) return false;
     auto &work = *state.ranks[rank];
     if (!work.ready || !work.group || work.group->layout.glm5 ||
-        work.rows != 1 || work.hidden <= 0 || work.cudaDevice != FastllmCudaGetDevice() ||
+        work.hidden <= 0 || work.cudaDevice != FastllmCudaGetDevice() ||
         !work.mappedHost || !work.mappedRoutes || !work.inputFloat.cudaData ||
         input.dataDevice != fastllm::CUDA || !input.cudaData || input.dims.empty() ||
         (input.dataType != fastllm::FLOAT32 && input.dataType != fastllm::FLOAT16 &&
          input.dataType != fastllm::BFLOAT16) ||
-        input.Count(0) != uint64_t(work.hidden) || input.dims.back() != work.hidden ||
+        input.dims.back() != work.hidden ||
         !PackedCacheRows(index) || !PackedCacheRows(score) || index.dims != score.dims ||
-        index.dims[0] != 1 || index.dims[1] <= 0 || index.dims[1] > kMaxTopK ||
+        index.dims[0] < 1 || index.dims[0] > FastllmCudaMoeExpertParallel::maxRows ||
+        input.Count(0) != uint64_t(index.dims[0]) * work.hidden ||
+        work.inputFloat.expansionBytes < input.Count(0) * sizeof(float) ||
+        index.dims[1] <= 0 || index.dims[1] > kMaxTopK ||
         index.dataDevice != fastllm::CUDA || index.dataType != fastllm::INT32 || !index.cudaData ||
         score.dataDevice != fastllm::CUDA || score.dataType != fastllm::FLOAT32 || !score.cudaData)
         return false;
+    // A width change replaces the mapped activation allocation. Graphs may
+    // retain it only when every layer sharing this workspace has one width.
+    if (std::any_of(work.group->layerLayouts.begin(), work.group->layerLayouts.end(),
+            [&](const OffloadLayout &layout) { return layout.hidden != work.hidden; })) return false;
     constexpr int maxRoutes = FastllmCudaMoeExpertParallel::maxRoutes;
-    MoeReadbackKernel<<<(std::max(work.hidden, index.dims[1]) + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+    const int width = index.dims[0] * work.hidden, routes = index.dims[0] * index.dims[1];
+    MoeReadbackKernel<<<(std::max(width, routes) + 255) / 256, 256, 0, cudaStreamPerThread>>>(
         input.cudaData, input.dataType, static_cast<const int32_t *>(index.cudaData),
         static_cast<const float *>(score.cudaData), static_cast<float *>(work.inputFloat.cudaData),
         work.mappedHost, work.mappedRoutes, reinterpret_cast<float *>(work.mappedRoutes + 2 * maxRoutes),
-        work.hidden, index.dims[1]);
+        width, routes);
     checkCudaErrors("EP graph readback", cudaGetLastError());
     return true;
 }
@@ -3129,16 +3142,19 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     // completion event; both CPU and GPU experts then see the same values.
     const Data *expertInput = &input;
     const bool mappedReadback = work.ready && rank == routingRank && !glmBatch &&
-        work.rows == 1 && work.mappedHost && work.mappedRoutes;
+        work.mappedHost && work.mappedRoutes;
     const bool stableGraphInput = work.ready && GetFastllmEnv().cudaGraph &&
-        work.group->layout.weightType == DATA_GGUF_FORMAT && input.dims[0] == 1;
+        work.group->layout.weightType == DATA_GGUF_FORMAT;
     // PP may borrow the other device's activation when peer access is enabled.
     // Stage it directly into the local expert buffer, including the eager path.
     const bool remoteInput = input.dataDeviceIds.size() == 1 && input.dataDeviceIds[0] != device;
     if (work.ready && !glmBatch && (input.dataType != FLOAT32 || stableGraphInput || remoteInput)) {
-        work.inputFloat.Resize(input.dims);
+        // Verifier row counts alternate. Reserve every small-batch row once
+        // so dense graphs may retain this readback destination across lengths.
+        work.inputFloat.Resize({FastllmCudaMoeExpertParallel::maxRows, work.hidden});
         work.inputFloat.ToDevice(CUDA, std::vector<int>{device}, false);
         work.inputFloat.Allocate(false);
+        work.inputFloat.Resize(input.dims);
         // Dense graphs own distinct inputs for every layer/request. Stage an
         // FP32 input too, so the resident graph cache is bounded by layouts
         // and route counts rather than temporary activation addresses.
@@ -3150,7 +3166,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
                 : FastllmBF16ToFloat(input.cudaData, work.inputFloat.cudaData, input.Count(0));
         expertInput = &work.inputFloat;
     }
-    const bool overlapAdmissions = work.ready && !glmBatch && work.rows == 1 &&
+    const bool overlapAdmissions = work.ready && !glmBatch &&
         work.group->layout.weightType == DATA_GGUF_FORMAT;
     work.cache = work.ready ? GetDeviceCache(*work.group, !overlapAdmissions) : nullptr;
     if (work.cache && overlapAdmissions && (!work.cache->hostKeyToSlot ||
@@ -3177,12 +3193,12 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             work.topk = index.dims[1];
             const int routes = work.rows * work.topk;
             if (mappedReadback) {
-                if (!preparedReadback) MoeReadbackKernel<<<(std::max(work.hidden, routes) + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                if (!preparedReadback) MoeReadbackKernel<<<(std::max(work.rows * work.hidden, routes) + 255) / 256, 256, 0, cudaStreamPerThread>>>(
                     input.cudaData, input.dataType,
                     static_cast<const int32_t *>(index.cudaData), static_cast<const float *>(score.cudaData),
                     expertInput == &input ? nullptr : static_cast<float *>(expertInput->cudaData),
                     work.mappedHost, work.mappedRoutes,
-                    reinterpret_cast<float *>(work.mappedRoutes + 2 * maxRoutes), work.hidden, routes);
+                    reinterpret_cast<float *>(work.mappedRoutes + 2 * maxRoutes), work.rows * work.hidden, routes);
                 checkCudaErrors("EP mapped readback", cudaGetLastError());
             } else {
                 checkCudaErrors("EP routes", cudaMemcpyAsync(work.Indices(), index.cudaData,
@@ -3233,7 +3249,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     checkCudaErrors("EP restore device", cudaSetDevice(device));
     const int topk = root.topk, hidden = root.hidden;
     const int rows = root.rows, routes = rows * topk;
-    const bool mappedCpuOutput = rank == routingRank && !glmBatch && rows == 1 && work.mappedHost;
+    const bool mappedCpuOutput = rank == routingRank && !glmBatch && work.mappedHost;
     const auto &layout = root.group->LayerLayout(root.table);
     const bool batchGGUF = layout.weightType == DATA_GGUF_FORMAT;
     const bool batchExperts = batchGGUF || glmBatch;
@@ -3426,7 +3442,8 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             }
             stagedOffsets[i + 1] = at;
         }
-        allocate(work.batchSlots, INT32, {routes});
+        // The final slot holds a dynamic resident count for graph replay.
+        allocate(work.batchSlots, INT32, {maxRoutes + 1});
         allocate(work.batchRoutes, INT32, {routes});
         const size_t bytes = FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(hidden, layout.inter, rows, topk);
         if (batchGGUF && bytes) allocate(work.batchWorkspace, INT8, {int(bytes)});
@@ -3436,8 +3453,11 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         checkCudaErrors("EP admission stream", cudaStreamCreateWithFlags(
             &work.cache->admissionStream, cudaStreamNonBlocking));
     }
-    const bool mappedUpload = batchGGUF && !glmBatch && rows == 1 &&
+    const bool mappedUpload = batchGGUF && !glmBatch &&
         work.cache && work.mappedRoutes;
+    const bool dynamicResident = GetFastllmEnv().cudaGraph && mappedUpload && hits;
+    work.routes[8 * maxRoutes] = gpuCount;
+    work.routes[8 * maxRoutes + 1] = hits;
     auto submitGpu = [&] {
         const double dispatchStart = HybridNowUs();
         allocate(output, glmBatch ? BFLOAT16 : FLOAT32, {rows, hidden});
@@ -3452,21 +3472,27 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
                 layout.gateGgmlType, layout.downGgmlType, hidden, layout.inter,
                 work.batchWorkspace.cudaData, size_t(work.batchWorkspace.GetBytes()), work.cache->slotOffsets};
             batchView.routeMap = static_cast<int32_t *>(work.batchRoutes.cudaData);
-            batchView.routeCount = hits;
+            // At most two graph bounds per shape, instead of one per hit
+            // count. The smaller bound avoids launching mostly empty grids.
+            batchView.routeCount = dynamicResident ?
+                (hits <= (routes + 1) / 2 ? (routes + 1) / 2 : routes) : hits;
+            if (dynamicResident)
+                batchView.activeRouteCount = static_cast<int32_t *>(work.batchSlots.cudaData) + maxRoutes;
         }
         // Allocate before starting DMA: a growing scratch buffer may call
         // cudaMalloc, which must not turn the first batch into a serial copy.
         if (gpuCount) allocate(work.gate, glmBatch ? BFLOAT16 : FLOAT32, {batchExperts ? routes : topk, layout.inter});
         auto upload = [&] {
             if (mappedUpload) {
-                UploadExpertParallelRoutes<<<1, 64, 0, cudaStreamPerThread>>>(
+                UploadExpertParallelRoutes<<<1, 256, 0, cudaStreamPerThread>>>(
                     work.mappedRoutes, maxRoutes,
                     static_cast<float *>(work.scores.cudaData),
                     static_cast<int32_t *>(work.owners.cudaData),
                     static_cast<int32_t *>(work.batchSlots.cudaData),
                     static_cast<int32_t *>(work.batchRoutes.cudaData),
                     work.cache->lastUsed, work.cache->step, work.cache->hitCount,
-                    topk, gpuCount, hits);
+                    rows, topk, gpuCount, hits,
+                    dynamicResident ? static_cast<int32_t *>(work.batchSlots.cudaData) + maxRoutes : nullptr);
                 checkCudaErrors("EP mapped route upload", cudaGetLastError());
                 return;
             }
@@ -3532,10 +3558,11 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
                 return true;
             };
             bool computed;
-            if (GetFastllmEnv().cudaGraph && batchGGUF && !glmBatch && rows == 1 && !staged) {
+            if (GetFastllmEnv().cudaGraph && batchGGUF && !glmBatch && (!staged || dynamicResident)) {
                 auto ptr = [](const void *p) { return uint64_t(reinterpret_cast<uintptr_t>(p)); };
                 const FastllmCudaMoeExpertParallel::Rank::ResidentGraphKey key{
-                    uint64_t(hidden), uint64_t(layout.inter), uint64_t(topk), uint64_t(hits),
+                    uint64_t(rows), uint64_t(hidden), uint64_t(layout.inter), uint64_t(topk),
+                    uint64_t(batchView.routeCount) | (uint64_t(dynamicResident) << 32),
                     uint64_t(layout.gateGgmlType), uint64_t(layout.downGgmlType),
                     uint64_t(layout.recordStride), uint64_t(layout.downOffset),
                     ptr(expertInput->cudaData), ptr(work.gate.cudaData),
