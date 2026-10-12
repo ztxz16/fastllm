@@ -1187,6 +1187,12 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         for (const auto &item : restored) {
             item.cache->FreeSpace();
             item.cache->dataDevice = DataDevice::CUDA;
+            // The host archive only reserves its saved prefix. Publish the
+            // actual rank capacity before graph validation, just as the normal
+            // forward does below; otherwise an aligned prefix spuriously falls
+            // back to eager on its first appended token.
+            item.cache->expansionDims[1] =
+                item.cache->multiDeviceDatas.at(tpDevices[0])->expansionDims[1];
         }
     }
     // CPU embedding uses the shared CPU worker pool, so compute it once on

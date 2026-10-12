@@ -225,6 +225,48 @@ class Fixture : public NaiveN05FlashModel {
     bool UseModelSpecificScheduler() const override { return !useRealScheduler; }
     void RunModelSpecificScheduler() override {}
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+    void HistoryServingChecks() {
+        maxBatch = 4; SetMaxTokens(16384); WarmUp();
+        useRealScheduler = true;
+        eos_token_id = -1; eos_token_ids.clear();
+        const int captures = verifyGraphCaptures;
+        auto infer = [&](const std::vector<int> &tokens, int count,
+                         std::vector<std::vector<float>> &logits) {
+            GenerationConfig cfg;
+            cfg.top_k = 1; cfg.output_logits = true;
+            cfg.output_token_limit = count;
+            cfg.input_token_length = tokens.size();
+            int handle = LaunchResponseTokens(tokens, cfg);
+            std::vector<int> sampled;
+            for (int i = 0; i < count; ++i) {
+                logits.emplace_back();
+                int token = FetchResponseLogits(handle, logits.back());
+                if (token < 0) throw std::runtime_error("history serving response ended early");
+                sampled.push_back(token);
+            }
+            std::vector<float> unused;
+            if (FetchResponseLogits(handle, unused) >= 0)
+                throw std::runtime_error("history serving response did not end");
+            return sampled;
+        };
+        // Aligned prefixes used to retain the smaller host capacity on the
+        // root descriptor, preventing graph replay on the restored first step.
+        for (int prefix : {128, 256, 2048, 4096}) {
+            SetSaveHistoryChat(false); SetSaveHistoryChat(true);
+            std::vector<int> tokens(prefix);
+            for (int i = 0; i < prefix; ++i) tokens[i] = i * 3 % 251;
+            std::vector<std::vector<float>> uninterrupted, restored;
+            auto sampled = infer(tokens, 2, uninterrupted);
+            tokens.push_back(sampled[0]);
+            const int before = verifyGraphLaunches;
+            infer(tokens, 1, restored);
+            if (verifyGraphLaunches - before != ranks || verifyGraphCaptures != captures)
+                throw std::runtime_error("restored prefix did not replay its prepared graph");
+            if (restored[0] != uninterrupted[1])
+                throw std::runtime_error("restored serving graph changed logits");
+        }
+        std::cout << "TP HISTORY SERVING PASS ranks=" << ranks << std::endl;
+    }
     void ServingGraphInvalidationChecks() {
         maxBatch = 4; SetMaxTokens(16384); WarmUp();
         const int captures = verifyGraphCaptures;
@@ -1611,6 +1653,14 @@ int main(int argc, char **argv) {
         SetThreads(4);
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (argc > 2 && std::string(argv[2]) == "history_serving") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            Fixture fixture(ranks, false, true, true, true);
+            fixture.HistoryServingChecks();
+            return 0;
+        }
+#endif
         if (argc > 2 && std::string(argv[2]) == "feature_graph") {
             SetCudaEmbedding(true);
             Fixture fixture(ranks, true, true);
