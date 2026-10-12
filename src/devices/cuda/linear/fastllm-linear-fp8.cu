@@ -993,8 +993,7 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
         return false;
     // The eight-row MMA path also amortizes weight loads across wide
     // vocabulary projections.
-    if (batch != 1 && (batch < 2 || batch > 8 || K % 256 ||
-        (N > 65536 && batch != 8)))
+    if (batch != 1 && (batch < 2 || batch > 32 || K % 256))
         return false;
     if (K < 512 || K > 32768 || N < (batch == 1 ? 4096 : 512) || blockM < K || blockK != 1 || !input ||
         !weight || !output || !scales || reinterpret_cast<uintptr_t>(input) % 4 ||
@@ -1016,8 +1015,12 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess)
         return false;
-    if (batch > 1)
+    if (batch > 1) {
+        if (N > 65536 && batch != 8 &&
+            (!__is_same(T, half) || !fastllm::fp8small::UseSm75Mma(device)))
+            return false;
         return fastllm::fp8small::CanRun<T>(device, K, N, batch);
+    }
     static thread_local std::map<int, bool> available;
     auto it = available.find(device);
     if (it == available.end()) {
@@ -1035,6 +1038,16 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
 template <class T>
 static bool TryFastllmRowFP8(T *input, uint8_t *weight, T *output, T *bias, float *scales, int batch, int K,
                              int N, int blockM, int blockK) {
+    if constexpr (__is_same(T, half)) {
+        int device = 0;
+        if (batch == 1 && K % 256 == 0 && cudaGetDevice(&device) == cudaSuccess &&
+            fastllm::fp8small::UseSm75Mma(device) &&
+            CanRunFastllmRowFP8<T, 8>(input, weight, output, bias, scales, batch, K, N, blockM, blockK) &&
+            fastllm::fp8small::CanRun<T>(device, K, N, batch)) {
+            return fastllm::fp8small::Dispatch<T>(input, weight, scales, bias, output,
+                                                K, N, batch, cudaStreamPerThread, device);
+        }
+    }
     if (batch > 1) {
         if (!CanRunFastllmRowFP8<T, 8>(input, weight, output, bias, scales, batch, K, N, blockM, blockK))
             return false;
