@@ -40,7 +40,7 @@ public:
         std::lock_guard<std::mutex> guard(forwardLocker);
         return Create(tokens);
     }
-    void Feed(ResponseContext *context, int past, int count, size_t accountedBytes = 0) {
+    void Feed(ResponseContext *context, int past, int count) {
         auto chunk = BeginHistoryChunk(context->pastKeyValues, past, count);
         Require(chunk && chunk->length == count, "History recording was unavailable");
         for (int layer = 0; layer < block_cnt; ++layer) {
@@ -53,18 +53,54 @@ public:
                 CopyHistoryTensor(input, part ? chunk->layers[layer].second : chunk->layers[layer].first, count);
             }
         }
-        // Exercise budget eviction without allocating GiB-sized test tensors.
-        if (accountedBytes) chunk->bytes = accountedBytes;
         FinishHistoryChunk(context->pastKeyValues, chunk);
     }
     void CheckBound(ResponseContext *context) {
         auto chunk = BeginHistoryChunk(context->pastKeyValues, 0, 100000000);
-        Require(chunk && chunk->length < 100000000 && chunk->bytes <= (8ULL << 30),
+        Require(chunk && chunk->length < 100000000 && chunk->bytes <= chunk->budget->limit,
                 "Archive capacity did not limit an oversized request");
     }
     void CheckFull(ResponseContext *context, int past) {
         Require(!BeginHistoryChunk(context->pastKeyValues, past, 1),
                 "Full history archive exceeded its byte limit");
+    }
+    void Drop(ResponseContext *context) {
+        for (const auto &entry : responseContextDict.dicts) {
+            if (entry.second == context) {
+                RemoveResponseContext(entry.first);
+                return;
+            }
+        }
+        throw std::runtime_error("Unknown response context");
+    }
+    std::shared_ptr<HistoryBudget> ledger;
+    size_t rowBytes = 0;
+    void Budget(size_t rows) {
+        SetSaveHistoryChat(false);
+        SetSaveHistoryChat(true);
+        auto *probe = Create({7000, 20});
+        auto chunk = BeginHistoryChunk(probe->pastKeyValues, 0, 1);
+        Require(chunk != nullptr, "History budget probe was unavailable");
+        ledger = chunk->budget;
+        rowBytes = chunk->bytes;
+        Drop(probe);
+        chunk.reset();
+        Require(ledger->used == 0, "History references leaked after clearing");
+        ledger->limit = rows * rowBytes;
+    }
+    size_t UsedRows() const { return ledger->used / rowBytes; }
+    void CheckReservation() {
+        auto *ctx = Create({4000, 20, 30, 40});
+        auto chunk = BeginHistoryChunk(ctx->pastKeyValues, 0, 8);
+        Require(chunk && UsedRows() == 8, "In-flight capture was not charged");
+        chunk->length = 4;
+        chunk->bytes = 4 * rowBytes;
+        FinishHistoryChunk(ctx->pastKeyValues, chunk);
+        Require(UsedRows() == 4, "Truncated verification did not release unused reservation");
+        Drop(ctx);
+        Require(UsedRows() == 4, "Live capture lost its reservation on request removal");
+        chunk.reset();
+        Require(UsedRows() == 0, "Cancelled capture leaked its reservation");
     }
     void CheckRestored(ResponseContext *context, int expected) {
         Require(context->cacheLen == expected, "Incorrect cached prefix length");
@@ -162,19 +198,50 @@ int main() {
         Require(model.Create({1003, 20, 30})->cacheLen == 0, "Recording a covered prefix did not refresh LRU");
         model.CheckRestored(model.Create({1002, 20, 30}), 2);
 
-        // A short title request must not evict a main record at the per-record
-        // byte limit. Their token prefixes are independent, as in Codex.
-        model.SetSaveHistoryChat(false);
-        model.SetSaveHistoryChat(true);
-        auto *mainRequest = model.Create({2000, 20});
-        model.Feed(mainRequest, 0, 2, 8ULL << 30);
-        model.CheckFull(mainRequest, 2);
+        // A large main record and a small title share one budget. Use a small
+        // budget so real allocations exercise eviction and ownership cheaply.
+        model.Budget(12);
+        std::vector<int> longTokens(10);
+        std::iota(longTokens.begin(), longTokens.end(), 2000);
+        auto *mainRequest = model.Create(longTokens);
+        model.Feed(mainRequest, 0, 10);
         model.TryRecordResponseContext(mainRequest);
+        model.Drop(mainRequest);
         auto *titleRequest = model.Create({3000, 20});
-        model.Feed(titleRequest, 0, 2, 1ULL << 30);
+        model.Feed(titleRequest, 0, 2);
         model.TryRecordResponseContext(titleRequest);
-        model.CheckRestored(model.Create({2000, 20, 30}), 2);
+        model.Drop(titleRequest);
+        Require(model.UsedRows() == 12, "Archive accounting differs from unique stored chunks");
+        auto hit = longTokens;
+        hit.push_back(900);
+        auto *held = model.Create(hit);
+        model.CheckRestored(held, 10);
+        Require(model.UsedRows() == 12, "A shared prefix was counted twice");
+        model.Drop(held);
+        auto *titleHit = model.Create({3000, 20, 30});
+        model.CheckRestored(titleHit, 2);
+        model.Drop(titleHit);
+        auto *replacement = model.Create({5000, 20});
+        model.Feed(replacement, 0, 2);
+        model.TryRecordResponseContext(replacement);
+        model.Drop(replacement);
+        Require(model.UsedRows() == 4, "LRU eviction did not release the old long record");
+        Require(model.Create(hit)->cacheLen == 0, "Evicted long record still matched");
         model.CheckRestored(model.Create({3000, 20, 30}), 2);
+
+        // Evicting a completed record cannot free chunks still held by an
+        // active request; publishing that request again remains safe.
+        model.Budget(10);
+        mainRequest = model.Create(longTokens);
+        model.Feed(mainRequest, 0, 10);
+        model.TryRecordResponseContext(mainRequest);
+        replacement = model.Create({6000, 20});
+        model.CheckFull(replacement, 0);
+        Require(model.UsedRows() == 10, "Eviction freed an active request's chunks");
+        model.TryRecordResponseContext(mainRequest);
+        model.CheckRestored(model.Create(hit), 10);
+        model.Budget(8);
+        model.CheckReservation();
 
         std::cout << "Naive history prefix, fork, sliding, index, isolation and LRU: PASS\n";
     } catch (const std::exception &e) {

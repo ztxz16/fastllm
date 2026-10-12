@@ -1,6 +1,9 @@
 #include "models/naive_n05_flash.h"
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
+#include <fstream>
+#include <limits>
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
 #endif
@@ -15,8 +18,47 @@ bool NaiveN05FlashModel::SetSaveHistoryChat(bool save) {
         history.clear();
         pendingHistory.reset();
         activeHistory.clear();
+        historyBudget->limit = 0;
+        historyBudget->warned = false;
     }
     return true;
+}
+
+void NaiveN05FlashModel::InitHistoryBudget() {
+    if (historyBudget->limit) return;
+    const size_t fallback = 40ULL << 30;
+    size_t hostLimit = fallback;
+#ifdef __linux__
+    // MemAvailable accounts for reclaimable pages and already-loaded weights.
+    // Leave most host memory for serving, restored KV and other applications.
+    std::ifstream memory("/proc/meminfo");
+    std::string line;
+    while (std::getline(memory, line)) {
+        unsigned long long available = 0;
+        if (std::sscanf(line.c_str(), "MemAvailable: %llu kB", &available) == 1) {
+            hostLimit = available * 1024ULL / 4;
+            break;
+        }
+    }
+    // Container limits can be lower than the host's MemAvailable.
+    for (const auto &paths : {
+            std::pair<const char *, const char *>{"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"},
+            {"/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"}}) {
+        unsigned long long limit = 0, used = 0;
+        std::ifstream limitFile(paths.first), usedFile(paths.second);
+        if (limitFile >> limit && usedFile >> used)
+            hostLimit = std::min<size_t>(hostLimit, limit > used ? (limit - used) / 4 : 0);
+    }
+#endif
+    const size_t tokens = std::max(0, tokensLimit > 0 ? tokensLimit : max_positions);
+    const size_t wanted = tokens > std::numeric_limits<size_t>::max() / historyBytesPerToken
+        ? std::numeric_limits<size_t>::max() : tokens * historyBytesPerToken;
+    historyBudget->limit = std::min(hostLimit, std::max<size_t>(8ULL << 30, wanted));
+    if (verbose) {
+        printf("[Naive history cache] shared host budget %.2f GiB, %zu bytes/token, %zu serving tokens.\n",
+               historyBudget->limit / double(1ULL << 30), historyBytesPerToken, tokens);
+        fflush(stdout);
+    }
 }
 
 std::shared_ptr<NaiveN05FlashModel::HistoryChunk> NaiveN05FlashModel::BeginHistoryChunk(
@@ -28,14 +70,29 @@ std::shared_ptr<NaiveN05FlashModel::HistoryChunk> NaiveN05FlashModel::BeginHisto
         const Data &key, int past, int length) {
     std::lock_guard<std::mutex> guard(historyMutex);
     auto it = activeHistory.find(&key);
-    if (!saveHistoryChat || it == activeHistory.end() ||
+    if (!saveHistoryChat || it == activeHistory.end() || length <= 0 ||
         it->second.length != past || historyBytesPerToken == 0) return nullptr;
-    auto &state = it->second;
-    int rows = std::min<size_t>(length, (historyRecordByteLimit - state.bytes) / historyBytesPerToken);
+    InitHistoryBudget();
+    auto available = [&]() {
+        size_t used = historyBudget->used.load(std::memory_order_relaxed);
+        return used < historyBudget->limit ? historyBudget->limit - used : 0;
+    };
+    size_t wanted = std::min<size_t>(length, historyBudget->limit / historyBytesPerToken) * historyBytesPerToken;
+    // Eviction only drops completed-record references. Active requests and a
+    // restore in progress retain their immutable chunks and their budget charge.
+    while (available() < wanted && !history.empty()) history.erase(history.begin());
+    int rows = std::min<size_t>(length, available() / historyBytesPerToken);
+    if (rows < length && !historyBudget->warned) {
+        fprintf(stderr, "[Naive history cache] host budget exhausted; retaining the recorded prefix.\n");
+        historyBudget->warned = true;
+    }
     if (rows <= 0) return nullptr;
     auto chunk = std::make_shared<HistoryChunk>();
     chunk->length = rows;
     chunk->bytes = rows * historyBytesPerToken;
+    chunk->budget = historyBudget;
+    chunk->reservedBytes = chunk->bytes;
+    historyBudget->used.fetch_add(chunk->reservedBytes, std::memory_order_relaxed);
     chunk->layers.resize(block_cnt);
     if (!tpDevices.empty()) {
         // Ranks write disjoint KV-head columns into one canonical host archive.
@@ -149,12 +206,16 @@ void NaiveN05FlashModel::FinishHistoryChunk(const Data &key,
         const std::shared_ptr<HistoryChunk> &chunk) {
     if (!chunk) return;
     std::lock_guard<std::mutex> guard(historyMutex);
+    // Speculative verification can trim a captured chunk before publishing it.
+    if (chunk->reservedBytes > chunk->bytes) {
+        chunk->budget->used.fetch_sub(chunk->reservedBytes - chunk->bytes, std::memory_order_relaxed);
+        chunk->reservedBytes = chunk->bytes;
+    }
     auto it = activeHistory.find(&key);
     if (it == activeHistory.end()) return;
     auto &state = it->second;
     state.spans.push_back({chunk, chunk->length});
     state.length += chunk->length;
-    state.bytes += chunk->bytes;
 }
 
 bool NaiveN05FlashModel::TryRestoreHistoryCache(std::vector<int> &tokens, int &cacheLen) {
@@ -203,7 +264,6 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
             int length = std::min(remaining, span.length);
             state.spans.push_back({span.chunk, length});
             state.length += length;
-            state.bytes += span.chunk->bytes;
             remaining -= length;
         }
         AssertInFastLLM(remaining == 0, "Incomplete Naive history archive.");
@@ -311,14 +371,12 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
     }
     auto memory = std::make_shared<HistoryMemory>(active->second);
     memory->length = length;
-    memory->bytes = 0;
     int remaining = length;
     size_t count = 0;
     for (auto &span : memory->spans) {
         if (!remaining) break;
         span.length = std::min(span.length, remaining);
         remaining -= span.length;
-        memory->bytes += span.chunk->bytes;
         ++count;
     }
     memory->spans.resize(count);
@@ -330,8 +388,7 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
             std::equal(entry->tokens.begin(), entry->tokens.end(), memory->tokens.begin());
     }), history.end());
     history.push_back(std::move(memory));
-    // BeginHistoryChunk bounds each record; limiting the count also bounds
-    // the completed archives to historyRecordLimit * historyRecordByteLimit.
+    // The byte budget is global; this additionally bounds record metadata.
     while (history.size() > historyRecordLimit) {
         history.erase(history.begin());
     }

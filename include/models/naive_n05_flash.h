@@ -81,9 +81,22 @@ namespace fastllm {
             Data &Key(int sequence, int layer) const { return *kv[sequence * layers + layer].first; }
             Data &Value(int sequence, int layer) const { return *kv[sequence * layers + layer].second; }
         };
+        struct HistoryBudget {
+            std::atomic<size_t> used{0};
+            size_t limit = 0;
+            bool warned = false;
+        };
         struct HistoryChunk {
+            HistoryChunk() = default;
+            HistoryChunk(const HistoryChunk &) = delete;
+            HistoryChunk &operator=(const HistoryChunk &) = delete;
+            ~HistoryChunk() {
+                if (budget) budget->used.fetch_sub(reservedBytes, std::memory_order_relaxed);
+            }
             int length = 0;
             size_t bytes = 0;
+            size_t reservedBytes = 0;
+            std::shared_ptr<HistoryBudget> budget;
             std::vector<std::pair<Data, Data>> layers;
             Data draftHidden;
         };
@@ -228,14 +241,14 @@ namespace fastllm {
             std::vector<int> tokens;
             std::vector<HistorySpan> spans;
             int length = 0;
-            size_t bytes = 0;
         };
         // Archives use host memory, never a second persistent GPU KV copy.
-        // Bound each record independently so a small auxiliary request does
-        // not evict the main conversation's nearly-full archive.
         static constexpr size_t historyRecordLimit = 5;
-        // Enough for the usual 32K local-agent context, including draft state.
-        static constexpr size_t historyRecordByteLimit = 8ULL << 30;
+        // Shared chunks are charged once, including active and pending users.
+        // The host-only budget follows the serving token pool, capped by host
+        // memory; a long conversation can use space released by LRU entries.
+        std::shared_ptr<HistoryBudget> historyBudget = std::make_shared<HistoryBudget>();
+        void InitHistoryBudget();
         size_t historyBytesPerToken = 0;
         std::mutex historyMutex;
         // Oldest first; completed records and their chunks are immutable.
