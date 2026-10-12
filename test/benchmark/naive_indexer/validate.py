@@ -2,6 +2,8 @@
 
 No model or third-party Indexer implementation is imported. Timing uses CUDA
 Graphs, two measured repetitions, and reports microseconds per DSA layer.
+Timing compares batched fallback scoring (old) with runtime selection (batch),
+sharing the quantization and TopK stages. Precision uses the committed reference.
 """
 import argparse
 import ctypes as C
@@ -58,10 +60,10 @@ class Case:
             self.rows.append((Row * batch)(*[Row(self.k[b].data_ptr(), self.live[b].data_ptr(),
                 *[x[b].data_ptr() for x in data], b, stride) for b in range(batch)]))
     def run(self, old=0, stage=0):
-        check(lib.run(self.q.data_ptr(), self.w.data_ptr(), self.rows[old], self.batch, self.capacity, old, stage,
+        check(lib.run(self.q.data_ptr(), self.w.data_ptr(), self.rows[int(bool(old))], self.batch, self.capacity, old, stage,
                       torch.cuda.current_stream().cuda_stream))
-    def compare(self):
-        self.run(1); self.run(); torch.cuda.synchronize()
+    def compare(self, old=1):
+        self.run(old); self.run(); torch.cuda.synchronize()
         for name, a, b in zip(('quantized_q', 'scale', 'scores', 'workspace', 'indices'), *self.buffers):
             if name == 'workspace': continue
             if not torch.equal(a, b):
@@ -89,6 +91,7 @@ if __name__ == '__main__':
     for batch, n, stride in [(1,2049,320),(2,4095,321),(4,8193,320),(32,8576,320),(65,16385,320),(256,8320,320),(257,4097,320)]:
         c = Case(batch, n, stride)
         c.compare()
+        c.compare(2)
         # Graph replay must read new per-row lengths, not captured host values.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph): c.run()
@@ -108,6 +111,19 @@ if __name__ == '__main__':
         report['precision'].append({'batch':batch,'capacity':n,'stride':stride,'bitwise_equal':True,'graph_dynamic_lengths':True})
         print('PASS scoring/TopK', batch,n,stride,flush=True)
         del graph, c
+    # Exercise cancellation, mixed magnitudes, ties, and scalar cache loads.
+    for kind in ('scaled', 'zero_weights', 'uniform_keys', 'strided_keys'):
+        c = Case(4, 4097, 321 if kind == 'strided_keys' else 320)
+        if kind == 'scaled':
+            c.q.mul_(torch.logspace(-6, 4, 16, device='cuda').view(1, 16, 1))
+            c.k.mul_(torch.logspace(-3, 3, 320, device='cuda'))
+            c.w.mul_(torch.logspace(-3, 3, 16, device='cuda'))
+        elif kind == 'zero_weights': c.w.zero_()
+        elif kind == 'uniform_keys': c.k.copy_(c.k[:, :1].clone().expand_as(c.k))
+        c.compare()
+        report['precision'].append({'scoring_edge':kind,'bitwise_equal':True})
+        print('PASS scoring edge',kind,flush=True)
+        del c
     rng = np.random.default_rng(4321)
     for n in (2049,8192,16385,65536,262144):
         c = Case(8, n)
@@ -127,9 +143,9 @@ if __name__ == '__main__':
     if args.bench:
         for n in (8320,16448):
             for batch in (1,2,4,8,16,32,64,128,256):
-                c = Case(batch,n); c.run(1); c.run(); torch.cuda.synchronize()
+                c = Case(batch,n); c.run(2); c.run(); torch.cuda.synchronize()
                 row = {'batch':batch,'keys':n}
-                for old,name in ((1,'old'),(0,'batch')):
+                for old,name in ((2,'old'),(0,'batch')):
                     for stage,part in ((1,'quantize'),(2,'scores'),(3,'topk'),(0,'total')):
                         row[f'{name}_{part}_us'] = timing(lambda: c.run(old,stage))
                 report['timings'].append(row)
