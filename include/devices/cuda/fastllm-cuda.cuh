@@ -698,6 +698,9 @@ bool FastllmCudaQwen4MergeTpGreedy(const float *candidates, int *output,
 // selection. Output is one device float, without materializing a softmax row.
 bool FastllmCudaQwen4TopProbability(const float *logits, float *output,
                                    int vocabulary, float maxLogit);
+// Preserve TopK's token id and compute confidence without a host round trip.
+bool FastllmCudaQwen4TopProbabilityFromTopK(const float *logits, float *output,
+                                           int vocabulary, const float *top);
 bool FastllmCudaQwen4QSASelect(const fastllm::Data &query,
                                const fastllm::Data &compressedKeys,
                                fastllm::Data &indices, int keyLength,
@@ -860,7 +863,7 @@ bool FastllmCudaQwen4ReplayLinearAttentionBatch(
         std::vector<uint8_t> &pointerCache,
         int sequence, int convKernel, bool silu,
         int keyHeads, int valueHeads, int keyDim, int valueDim,
-        float recurrentEps);
+        float recurrentEps, bool batchRecurrent = true, bool synchronize = true);
 bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim, float ropeBase, int startPos,
                                        int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
                                        float eps);

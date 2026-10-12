@@ -122,8 +122,11 @@ namespace {
             state[stateBase + (group * 32 + i) * 128 + first + col] = values[i];
     }
 
+    template<bool DeviceTop>
     __global__ void Qwen4TopProbabilityKernel(
-            const float *logits, float *output, int vocabulary, float maximum) {
+            const float *logits, float *output, int vocabulary, float maximum,
+            const float *top) {
+        if constexpr (DeviceTop) maximum = top[1];
         __shared__ float partial[32];
         float sum = 0.0f;
         float correction = 0.0f;
@@ -146,7 +149,9 @@ namespace {
                 sum += __shfl_down_sync(0xffffffff, sum, offset);
             if (threadIdx.x == 0) {
                 const float probability = 1.0f / sum;
-                *output = isfinite(maximum) && isfinite(probability) ? probability : 0.0f;
+                if constexpr (DeviceTop) output[0] = top[0];
+                output[DeviceTop ? 1 : 0] =
+                    isfinite(maximum) && isfinite(probability) ? probability : 0.0f;
             }
         }
     }
@@ -1280,6 +1285,24 @@ namespace {
             const float *input, const float *weight, const half *gate,
             half *output, float eps);
 
+    struct Qwen4LinearReplayPointers {
+        const void *convInput;
+        const float *convWeight;
+        const float *convCheckpoint;
+        float *convState;
+        float *convolved;
+        const void *alpha;
+        const void *beta;
+        const float *aLog;
+        const float *dtBias;
+        const float *recurrentCheckpoint;
+        float *recurrentState;
+        float *coreOutput;
+    };
+
+    static_assert(sizeof(Qwen4LinearReplayPointers) == 12 * sizeof(void*),
+                  "Qwen4 replay pointer table must not contain padding");
+
     template <typename T, bool OUT_OF_PLACE_STATE, bool FUSE_OUTPUT = false>
     __global__ __launch_bounds__(128) void Qwen4GatedDeltaRuleDecodeKernel(
             const float *qkv, const T *alpha, const T *beta,
@@ -1432,19 +1455,39 @@ namespace {
         }
     }
 
+    struct Qwen4LinearReplaySequenceBatch {
+        static constexpr int MAX_LAYERS = 32;
+        Qwen4LinearReplayPointers layers[MAX_LAYERS];
+    };
+    struct Qwen4NoLinearReplayBatch {};
+
     // Sequence state tiling. A warp owns 32 adjacent value
     // channels, so each lane retains the generic kernel's strictly increasing
     // K reduction order.  Four independent blocks per value head expose the
     // same 128 lanes to four times as many SMs while caching each state tile
     // across all speculative tokens.
-    template <typename T, bool OUT_OF_PLACE_STATE>
+    template <typename T, bool OUT_OF_PLACE_STATE, bool BATCHED_REPLAY = false>
     __global__ __launch_bounds__(32)
     void Qwen4GatedDeltaRuleSequenceValueTileKernel(
             const float *qkv, const T *alpha, const T *beta,
             const float *aLog, const float *dtBias, float *state,
             float *stateOutput, float *output,
             int keyHeads, int valueHeads,
-            int sequence, float recurrentEps, float inverseHead) {
+            int sequence, float recurrentEps, float inverseHead,
+            typename std::conditional<BATCHED_REPLAY,
+                Qwen4LinearReplaySequenceBatch, Qwen4NoLinearReplayBatch>::type
+                layers = {}) {
+        static_assert(!BATCHED_REPLAY || !OUT_OF_PLACE_STATE);
+        if constexpr (BATCHED_REPLAY) {
+            const auto &layer = layers.layers[blockIdx.y];
+            qkv = layer.convolved;
+            alpha = static_cast<const T *>(layer.alpha);
+            beta = static_cast<const T *>(layer.beta);
+            aLog = layer.aLog;
+            dtBias = layer.dtBias;
+            state = layer.recurrentState;
+            output = layer.coreOutput;
+        }
         constexpr int KEY_DIM = 128;
         constexpr int VALUE_DIM = 128;
         constexpr int VALUE_TILE = 32;
@@ -1660,24 +1703,6 @@ namespace {
         Qwen4GdnOutputGateExactDevice(input + offset, weight, gate + offset,
                                     output + offset, eps);
     }
-
-    struct Qwen4LinearReplayPointers {
-        const void *convInput;
-        const float *convWeight;
-        const float *convCheckpoint;
-        float *convState;
-        float *convolved;
-        const void *alpha;
-        const void *beta;
-        const float *aLog;
-        const float *dtBias;
-        const float *recurrentCheckpoint;
-        float *recurrentState;
-        float *coreOutput;
-    };
-
-    static_assert(sizeof(Qwen4LinearReplayPointers) == 12 * sizeof(void*),
-                  "Qwen4 replay pointer table must not contain padding");
 
     __global__ void Qwen4LinearReplayRestoreKernel(
             const Qwen4LinearReplayPointers *layers,
@@ -2912,6 +2937,32 @@ namespace {
         }
     }
 
+    template <typename T>
+    void Qwen4LaunchLinearReplaySequence(
+            const std::vector<FastllmCudaQwen4LinearReplayItem> &items,
+            int keyHeads, int valueHeads, int sequence, float recurrentEps) {
+        Qwen4LinearReplaySequenceBatch layers{};
+        for (size_t i = 0; i < items.size(); ++i) {
+            auto &layer = layers.layers[i];
+            const auto &item = items[i];
+            layer.convolved = (float*)item.convolved->cudaData;
+            layer.alpha = item.alpha->cudaData;
+            layer.beta = item.beta->cudaData;
+            layer.aLog = (float*)item.aLog->cudaData;
+            layer.dtBias = (float*)item.dtBias->cudaData;
+            layer.recurrentState = (float*)item.recurrentState->cudaData;
+            layer.coreOutput = (float*)item.coreOutput->cudaData;
+        }
+        const float inverseHead = 1.0f / std::sqrt(128.0f);
+        // Only the pointer source and independent layer grid differ from
+        // separate sequence replays; retain the same kernel and lane mapping.
+        Qwen4GatedDeltaRuleSequenceValueTileKernel<T, false, true><<<
+            dim3(valueHeads * 4, items.size()), 32, 0, cudaStreamPerThread>>>(
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, keyHeads, valueHeads, sequence,
+            recurrentEps, inverseHead, layers);
+    }
+
     bool Qwen4CanRunGatedDeltaRule(
             const fastllm::Data &qkv, const fastllm::Data &alpha,
             const fastllm::Data &beta,
@@ -2957,8 +3008,18 @@ namespace {
 bool FastllmCudaQwen4TopProbability(const float *logits, float *output,
                                    int vocabulary, float maxLogit) {
     if (logits == nullptr || output == nullptr || vocabulary <= 0) return false;
-    Qwen4TopProbabilityKernel<<<1, 1024, 0, cudaStreamPerThread>>>(
-        logits, output, vocabulary, maxLogit);
+    Qwen4TopProbabilityKernel<false><<<1, 1024, 0, cudaStreamPerThread>>>(
+        logits, output, vocabulary, maxLogit, nullptr);
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4TopProbabilityFromTopK(const float *logits, float *output,
+                                           int vocabulary, const float *top) {
+    if (logits == nullptr || output == nullptr || top == nullptr || vocabulary <= 0)
+        return false;
+    Qwen4TopProbabilityKernel<true><<<1, 1024, 0, cudaStreamPerThread>>>(
+        logits, output, vocabulary, 0.0f, top);
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }
@@ -4793,7 +4854,7 @@ bool FastllmCudaQwen4ReplayLinearAttentionBatch(
         std::vector<uint8_t> &pointerCache,
         int sequence, int convKernel, bool silu,
         int keyHeads, int valueHeads, int keyDim, int valueDim,
-        float recurrentEps) {
+        float recurrentEps, bool batchRecurrent, bool synchronize) {
     if (items.empty() || sequence <= 0 || convKernel <= 0 ||
         keyHeads <= 0 || valueHeads <= 0 ||
         valueHeads % keyHeads != 0 ||
@@ -5018,6 +5079,39 @@ bool FastllmCudaQwen4ReplayLinearAttentionBatch(
             convKernel);
     }
 
+    if (!batchRecurrent) {
+        // Preserve the sequence kernel's reduction order on pipeline stages.
+        if (sequence > 1 && sequence <= 4 &&
+            items.size() <= Qwen4LinearReplaySequenceBatch::MAX_LAYERS) {
+            if (gateType == fastllm::DataType::FLOAT32) {
+                Qwen4LaunchLinearReplaySequence<float>(items,
+                    keyHeads, valueHeads, sequence, recurrentEps);
+            } else if (gateType == fastllm::DataType::FLOAT16) {
+                Qwen4LaunchLinearReplaySequence<half>(items,
+                    keyHeads, valueHeads, sequence, recurrentEps);
+            } else {
+                Qwen4LaunchLinearReplaySequence<__nv_bfloat16>(items,
+                    keyHeads, valueHeads, sequence, recurrentEps);
+            }
+        } else {
+            // Keep the established per-layer recurrence arithmetic for placement
+            // paths that previously replayed through GatedDeltaRuleSequence.
+            // Batched restore/convolution still remove their copies and slicing.
+            for (const auto &item : items) {
+                fastllm::Data alpha, beta;
+                alpha.FakeFrom(*item.alpha, 0);
+                beta.FakeFrom(*item.beta, 0);
+                alpha.Resize({1, sequence, valueHeads});
+                beta.Resize({1, sequence, valueHeads});
+                if (!FastllmCudaQwen4GatedDeltaRuleDecode(
+                        *item.convolved, alpha, beta, *item.aLog, *item.dtBias,
+                        *item.recurrentState, *item.coreOutput, keyHeads, valueHeads,
+                        keyDim, valueDim, recurrentEps, nullptr)) return false;
+            }
+        }
+        if (synchronize) ForceDeviceSync();
+        return cudaGetLastError() == cudaSuccess;
+    }
     const int recurrentBlocks = (int)items.size() * valueHeads;
     const float inverseHead = 1.0f / std::sqrt((float)keyDim);
     if (gateType == fastllm::DataType::FLOAT32) {
@@ -5039,7 +5133,7 @@ bool FastllmCudaQwen4ReplayLinearAttentionBatch(
     // The model executor may dispatch the following layer on another host
     // thread (and therefore another per-thread CUDA stream).  Complete this
     // rejected-prefix transition before publishing the restored caches.
-    ForceDeviceSync();
+    if (synchronize) ForceDeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }
 

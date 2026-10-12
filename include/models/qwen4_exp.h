@@ -246,10 +246,14 @@ namespace fastllm {
             TargetRuntimeCheckpoint *runtimeCheckpoint = nullptr;
             std::vector<Data> linearReplayOutputs;
             std::vector<Data> linearReplayCoreOutputs;
-            Data linearReplayPointerWorkspace;
-            std::vector<uint8_t> linearReplayPointerCache;
+            struct LinearReplayWorkspace {
+                Data pointers;
+                std::vector<uint8_t> cache;
+            };
+            std::map<int, LinearReplayWorkspace> linearReplayWorkspaces;
             std::map<int, Data> qsaRawKeys;
             Data pleInput;
+            Data pleNormalized;
             Data greedyTokenIds;
             Data greedyTokenValues;
         };
@@ -449,7 +453,10 @@ namespace fastllm {
         void RunPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output,
                     const std::vector<int> *hostInputTokens = nullptr,
-                    const DiskEmbeddingRowReader::Ticket *prefetched = nullptr);
+                    const DiskEmbeddingRowReader::Ticket *prefetched = nullptr,
+                    Data *normalizedCapture = nullptr);
+        bool TryCommitPLEPrefix(RequestState &state, const Data &normalized,
+                                const std::vector<int> &tokens, int count);
         void RunThreadTpPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output,
                     const std::vector<int> *hostInputTokens,

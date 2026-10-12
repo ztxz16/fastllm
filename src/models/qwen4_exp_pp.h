@@ -61,7 +61,12 @@ struct Qwen4ExpModel::PipelineMoeState {
 
 bool Qwen4ExpModel::TryPipelineMoeReadback(const Data &input, const Data &index, const Data &score) {
 #ifdef USE_NUMAS
-    if (threadTpState || threadTpRank >= 0 || Qwen4MtpDraftsPerStep() != 0 || !pipelineMoe)
+    if (threadTpRank >= 0) {
+        return threadTpRank == 0 && threadTpOwner && threadTpOwner->expertParallel &&
+            FastllmCudaMoeExpertParallelReadback(
+                *threadTpOwner->expertParallel, threadTpRank, input, index, score);
+    }
+    if (threadTpState || !pipelineMoe)
         return false;
     const auto &devices = pipelineMoe->devices;
     const auto found = std::find(devices.begin(), devices.end(), FastllmCudaGetDevice());
@@ -76,9 +81,10 @@ bool Qwen4ExpModel::TryRunPipelineMoe(int layer, const Data &input,
         const Data &index, const Data &score, Data &output,
         std::vector<Data *> &moeWeights, const std::function<void()> &sharedExpert, Data **deferredPeer, bool preparedReadback) {
 #ifdef USE_NUMAS
-    if (threadTpState || threadTpRank >= 0 || Qwen4MtpDraftsPerStep() != 0 ||
+    if (threadTpState || threadTpRank >= 0 ||
         input.dataDevice != CUDA ||
-        input.dims.size() != 2 || input.dims[0] != 1 ||
+        input.dims.size() != 2 || input.dims[0] < 1 ||
+        input.dims[0] > FASTLLM_CUDA_MOE_CACHE_MAX_BATCH ||
         !MoeCudaCacheRequested() || FastllmCudaGraphIsCapturingFast()) return false;
     if (!pipelineMoe) {
         std::vector<CudaPrefillStage> stages;
@@ -95,9 +101,10 @@ bool Qwen4ExpModel::TryRunPipelineMoe(int layer, const Data &input,
     auto prepare = [&](Data &data, int target, DataType type) {
         FastllmCudaSetDevice(target);
         data.dataType = type;
-        data.Resize(input.dims);
+        data.Resize({FASTLLM_CUDA_MOE_CACHE_MAX_BATCH, input.dims[1]});
         data.ToDevice(CUDA, std::vector<int>{target}, false);
         data.Allocate(false);
+        data.Resize(input.dims);
     };
     FastllmCudaEventRecordCurrentThread(state.ready[owner]);
     const bool borrowInput = state.peerAccess && input.dataDeviceIds == std::vector<int>{device};
@@ -124,6 +131,9 @@ bool Qwen4ExpModel::TryRunPipelineMoe(int layer, const Data &input,
         } restore{previous, FastllmCudaGraphSetManagedCaptureOnly(true)};
         FastllmCudaSetDevice(target);
         if (worker != 0) {
+            // Dense graph variants retain this peer output across changing
+            // verifier lengths. Its allocation must not grow on a later row.
+            prepare(state.peerOutput[peer], target, FLOAT32);
             // Allocate on the thread that owns the peer stream, avoiding a
             // switch to the peer device and back on every owner submission.
             if (!borrowInput) prepare(state.peerInput[peer], target, input.dataType);
