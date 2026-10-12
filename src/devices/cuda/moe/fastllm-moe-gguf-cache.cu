@@ -1016,8 +1016,8 @@ __device__ float Dot(const uint8_t *weight, const block_q8_K *input, int row, in
                 const int q = (packed >> (2 * ((pos % 16) / 4))) & 0x03030303;
                 const int s = w.scales[4 * (c / 16) + r];
                 const int x = *reinterpret_cast<const int *>(input[b].qs + c);
-                dot += (s & 15) * __dp4a(q, x, 0);
-                bias += (s >> 4) * __dp4a(0x01010101, x, 0);
+                dot += (s & 15) * gguf_cache_q8::ggml_cuda_dp4a(q, x, 0);
+                bias += (s >> 4) * gguf_cache_q8::ggml_cuda_dp4a(0x01010101, x, 0);
             }
         } else {
             const auto &w = reinterpret_cast<const block_q4_k_r4 *>(weight)[size_t(row / 4) * blocks + b];
@@ -1032,8 +1032,8 @@ __device__ float Dot(const uint8_t *weight, const block_q8_K *input, int row, in
                     w.qs + 64 * (c / 32) + 4 * r + 32 * ((pos % 8) / 4) + 16 * (pos / 16));
                 const int q = (packed >> (4 * ((pos % 16) / 8))) & 0x0f0f0f0f;
                 const int x = *reinterpret_cast<const int *>(input[b].qs + c);
-                dot += ((low & 15) + 16 * (high & 3)) * __dp4a(q, x, 0);
-                bias += ((low >> 4) + 16 * (high >> 2)) * __dp4a(0x01010101, x, 0);
+                dot += ((low & 15) + 16 * (high & 3)) * gguf_cache_q8::ggml_cuda_dp4a(q, x, 0);
+                bias += ((low >> 4) + 16 * (high >> 2)) * gguf_cache_q8::ggml_cuda_dp4a(0x01010101, x, 0);
             }
         }
         for (int mask = 16; mask; mask >>= 1) {

@@ -1,5 +1,7 @@
 # 使用 Ubuntu 20.04 作为基础镜像
 FROM ubuntu:20.04
+ARG BUILD_JOBS=32
+ARG NCCL_VERSION=2.28.3
 
 # 设置非交互式安装环境
 ENV DEBIAN_FRONTEND=noninteractive
@@ -33,7 +35,7 @@ RUN apt-get update && apt-get install -y gnupg2 \
 RUN apt-get install -y cuda-toolkit-12-9
 
 # 配置 CUDA 环境变量（默认使用 12.9）
-ENV PATH=/usr/local/cuda-12.9/bin:${PATH}
+ENV PATH=/opt/binutils-2.38/bin:/usr/local/cuda-12.9/bin:${PATH}
 ENV LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:${LD_LIBRARY_PATH}
 
 # 创建默认 CUDA 软链接
@@ -43,42 +45,31 @@ RUN ln -sf /usr/local/cuda-12.9 /usr/local/cuda
 RUN g++ --version
 RUN nvcc --version
 
-RUN apt-get update
-RUN apt-get install cmake -y
-RUN apt-get install libnuma-dev -y
-RUN apt-get install python3-pip -y
-RUN pip install setuptools wheel
-
-RUN apt remove --purge cmake -y
-RUN pip install cmake==3.25.0 -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+# Python 3.8 用于构建，运行 wheel 需要 Python >= 3.10。
+RUN apt-get update && apt-get install -y libnuma-dev python3-pip \
+    && python3 -m pip install cmake==3.25.0 setuptools==75.3.2 wheel==0.45.1
 
 # -----------------------------------------------------------------
 # 新增部分：编译安装 Binutils 2.38 以升级 'as' (汇编器)
 # -----------------------------------------------------------------
 # 1. 安装编译 binutils 依赖的 texinfo 和 bison (虽然后面编译时不包含文档可以跳过texinfo，但为了保险起见加上)
-RUN apt-get update && apt-get install -y texinfo bison flex
+RUN apt-get update && apt-get install -y texinfo bison flex xz-utils
 # 2. 下载 Binutils 2.38 源码，编译并安装
 RUN cd /tmp \
-    && wget https://ftp.gnu.org/gnu/binutils/binutils-2.38.tar.gz \
-    && tar -xzf binutils-2.38.tar.gz \
-    && cd binutils-2.38 \
-    && ./configure --prefix=/usr --disable-multilib --disable-werror --enable-gold \
-    && make -j$(nproc) \
+    && wget --timeout=30 --tries=3 https://mirrors.kernel.org/gnu/binutils/binutils-2.38.tar.xz \
+    && echo 'e316477a914f567eccc34d5d29785b8b0f5a10208d36bbacedcc39048ecfe024  binutils-2.38.tar.xz' | sha256sum -c - \
+    && tar -xf binutils-2.38.tar.xz && mkdir binutils-build && cd binutils-build \
+    && ../binutils-2.38/configure --prefix=/opt/binutils-2.38 --disable-multilib --disable-werror --disable-nls --enable-gold \
+    && make -j"${BUILD_JOBS}" \
     && make install \
     && cd /tmp \
-    && rm -rf binutils-2.38 binutils-2.38.tar.gz
+    && rm -rf binutils-2.38 binutils-2.38.tar.xz binutils-build
 # 3. 验证 'as' 版本 (预期输出包含 2.38)
 RUN as --version
 
-# 安装最新 CUDA 12.9 对应 NCCL
-RUN apt-get update && apt-get install -y "libnccl2=*+cuda12.9" "libnccl-dev=*+cuda12.9" \
-    && rm -rf /var/lib/apt/lists/*
-# 创建 NCCL 符号链接以便 CUDA 12.9 找到
-RUN ln -sf /usr/lib/x86_64-linux-gnu/libnccl* /usr/local/cuda-12.9/lib64/ 2>/dev/null || true \
-    && ln -sf /usr/include/nccl.h /usr/local/cuda-12.9/include/ 2>/dev/null || true
-# 设置 NCCL 环境变量
-ENV NCCL_HOME=/usr
-ENV NCCL_INCLUDE_DIR=/usr/include
-ENV NCCL_LIB_DIR=/usr/lib/x86_64-linux-gnu
-# 验证 NCCL 安装
-RUN ls -la /usr/include/nccl.h && ls -la /usr/lib/x86_64-linux-gnu/libnccl*
+# 固定已验证的便携版 NCCL；避免引入新系统 glibc 依赖。
+RUN python3 -m pip install --no-deps --target /opt/nccl "nvidia-nccl-cu12==${NCCL_VERSION}" \
+    && ln -s /opt/nccl/nvidia/nccl/include/nccl.h /usr/local/cuda-12.9/include/nccl.h \
+    && ln -s /opt/nccl/nvidia/nccl/lib/libnccl.so.2 /usr/local/cuda-12.9/lib64/libnccl.so.2 \
+    && ln -s libnccl.so.2 /usr/local/cuda-12.9/lib64/libnccl.so
+ENV NCCL_HOME=/opt/nccl/nvidia/nccl

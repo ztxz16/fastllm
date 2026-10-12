@@ -103,8 +103,8 @@ __device__ __forceinline__ void Dot(const void *w, int block, int group, const u
             int lo = 0, hi = 0;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                lo = __dp4a(v[j], a[t][j], lo);
-                hi = __dp4a(v[j + 4], a[t][j + 4], hi);
+                lo = ggml_cuda_dp4a(v[j], a[t][j], lo);
+                hi = ggml_cuda_dp4a(v[j + 4], a[t][j + 4], hi);
             }
             if constexpr (Type == GGML_TYPE_Q2_K)
                 sum[t] += d * (dx[t] * (lo * (sc0 & 15) + hi * (sc1 & 15))) -
@@ -120,7 +120,7 @@ __device__ __forceinline__ void Dot(const void *w, int block, int group, const u
             int dot = 0;
 #pragma unroll
             for (int j = 0; j < 8; ++j)
-                dot = __dp4a(v[j], a[t][j], dot);
+                dot = ggml_cuda_dp4a(v[j], a[t][j], dot);
             if constexpr (Type == GGML_TYPE_Q4_K)
                 sum[t] += d * (dx[t] * (dot * scale)) - dmin * (dx[t] * ((loSum[t] + hiSum[t]) * minimum));
             else {

@@ -1,0 +1,6 @@
+# Tested CUDA/Python runtime combination. Use with pip install -c FILE WHEEL.
+# These constraints affect installation, not the CUDA architecture list.
+nvidia-cuda-runtime-cu12==12.9.79
+nvidia-cublas-cu12==12.9.2.10
+nvidia-nccl-cu12==2.28.3
+triton==3.6.0

@@ -260,10 +260,20 @@ if (USE_CUDA)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
     if (CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
-        # The default fatbinary heuristic leaves many smaller cubins uncompressed.
-        # Compress every image so splitting CUDA units does not inflate the library;
-        # both native machine code and PTX remain available.
-        add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all>)
+        # Preserve legacy compression for normal builds; wheel releases opt in
+        # to CUDA 12.4+ compression. All cubins and PTX are retained.
+        set(FASTLLM_CUDA_COMPRESSION "legacy" CACHE STRING "CUDA fatbinary compression mode")
+        set_property(CACHE FASTLLM_CUDA_COMPRESSION PROPERTY STRINGS legacy size speed balance default none)
+        if (FASTLLM_CUDA_COMPRESSION STREQUAL "legacy")
+            add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all>)
+        elseif (FASTLLM_CUDA_COMPRESSION MATCHES "^(size|speed|balance|default|none)$")
+            if (CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
+                message(FATAL_ERROR "FASTLLM_CUDA_COMPRESSION requires CUDA 12.8+; use legacy with older compilers")
+            endif()
+            add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--compress-mode=${FASTLLM_CUDA_COMPRESSION}>)
+        else()
+            message(FATAL_ERROR "Unknown FASTLLM_CUDA_COMPRESSION: ${FASTLLM_CUDA_COMPRESSION}")
+        endif()
     endif()
     set(FASTLLM_CUDA_ARCHITECTURES ${CUDA_ARCH})
     if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
