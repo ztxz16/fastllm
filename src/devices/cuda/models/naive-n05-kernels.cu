@@ -2870,6 +2870,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         query.dims.empty() || query.dims.back() != heads * dim ||
         weights.dims.empty() || weights.dims.back() != heads ||
         !FastllmCudaFlashInferDataTypeSupported(BFLOAT16)) return false;
+    bool hopper = FastllmCudaRuntimeArch() == 90;
     int maxCapacity = 0;
     for (const auto &row : rows) {
         if (!row.key || !row.scratch || !row.indices || row.key->dataType != BFLOAT16 ||
@@ -2878,6 +2879,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             row.sequence < 0 || row.sequence >= liveKeys.Count(0) ||
             (size_t)(row.sequence + 1) * heads * dim > query.Count(0) ||
             (size_t)(row.sequence + 1) * heads > weights.Count(0)) return false;
+        hopper = hopper && row.key->dims[2] % 8 == 0 && (uintptr_t)row.key->cudaData % 16 == 0;
         maxCapacity = std::max(maxCapacity, row.capacity);
     }
     // A CTA scans each row. Keep cooperative selection when there are too few
@@ -2903,9 +2905,9 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             capacity = std::max(capacity, row.capacity);
         }
         batch::Quantize<<<dim3(heads, count), dim>>>((const BF16 *)query.cudaData, descriptors);
-        batch::Scores<<<dim3((capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, count),
-            naive_dsa_mma::kThreads>>>(
-            (const BF16 *)weights.cudaData, descriptors);
+        const dim3 grid((capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, count);
+        if (hopper) batch::HopperScores<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+        else batch::Scores<<<grid, naive_dsa_mma::kThreads>>>((const BF16 *)weights.cudaData, descriptors);
         batch::Select<<<count, naive_topk::kThreads>>>(descriptors);
         batch::Sort<<<count, naive_topk::kThreads>>>(descriptors);
     }

@@ -45,6 +45,88 @@ __global__ void Scores(const BF16 *weights, Batch batch) {
         ScoreOutput{row.scores}, row.stride, n, n - 1);
 }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+template<bool CacheL1>
+__device__ __forceinline__ void LoadScoreVector(void *destination, const void *source, bool valid) {
+    unsigned address = static_cast<unsigned>(__cvta_generic_to_shared(destination));
+    int bytes = valid ? 16 : 0;
+    if constexpr (CacheL1)
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
+            :: "r"(address), "l"(source), "r"(bytes) : "memory");
+    else
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+            :: "r"(address), "l"(source), "r"(bytes) : "memory");
+}
+#endif
+
+// K occupies the MMA row dimension: each warp produces sixteen key scores.
+// Cache the reused Q in L1, while streaming K directly to shared memory.
+// The caller guarantees 16-byte alignment and retains Scores as the fallback.
+__global__ void HopperScores(const BF16 *weights, Batch batch) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using namespace naive_dsa_mma;
+    constexpr int Threads = 128;
+    const Row &r = batch.rows[blockIdx.y];
+    const int n = *r.live, first = blockIdx.x * kKeys;
+    if (first >= n) return;
+    __shared__ __align__(16) BF16 qs[kHeads][kIndexerDim + 8], ks[kKeys][kIndexerDim + 8];
+    __shared__ float scales[kHeads], weightsF[kHeads];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    for (int i = t; i < kHeads * (kIndexerDim / 8); i += Threads) {
+        int h = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
+        LoadScoreVector<true>(&qs[h][d], r.query + h * kIndexerDim + d, true);
+    }
+    for (int i = t; i < kKeys * (kIndexerDim / 8); i += Threads) {
+        int key = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
+        const BF16 *p = r.key + (size_t)(first + key) * r.stride + r.stride - kIndexerDim + d;
+        LoadScoreVector<false>(&ks[key][d], p, first + key < n);
+    }
+    if (t < kHeads) {
+        scales[t] = r.scale[t];
+        weightsF[t] = (float)weights[r.sequence * kHeads + t];
+    }
+    asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+    float dot[2][4] = {};
+#pragma unroll
+    for (int d = 0; d < kIndexerDim; d += 16) {
+        uint32_t a[4];
+        Load4(a, &ks[warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8][d + (lane >> 4) * 8]);
+#pragma unroll
+        for (int group = 0; group < 2; ++group) {
+            uint32_t b[2];
+            Load2(b, &qs[group * 8 + (lane & 7)][d + ((lane >> 3) & 1) * 8]);
+            Mma(dot[group], a, b);
+        }
+    }
+    // Each lane scales only its own head values, before exchanging them.
+#pragma unroll
+    for (int group = 0; group < 2; ++group)
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            dot[group][i] = fmaxf(dot[group][i] * scales[group * 8 + (lane & 3) * 2 + i % 2], 0.f);
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        float sum = 0.f;
+#pragma unroll
+        for (int group = 0; group < 2; ++group) {
+            const int h = group * 8 + (lane & 3) * 2;
+            float w0 = weightsF[h], w1 = weightsF[h + 1];
+            // Pass the accumulator through each pair of heads in ascending
+            // order. This halves the shuffles without reassociating the sum.
+#pragma unroll
+            for (int part = 0; part < 4; ++part) {
+                float value = fmaf(dot[group][half * 2], w0, sum);
+                value = fmaf(dot[group][half * 2 + 1], w1, value);
+                sum = __shfl_sync(0xffffffff, value, (lane & ~3) + part);
+            }
+        }
+        int key = first + warp * 16 + (lane >> 2) + half * 8;
+        if ((lane & 3) == 0 && key < n) r.scores[key] = naive_topk::OrderedScoreBits(sum);
+    }
+#endif
+}
+
 // A request owns one CTA instead of a cooperative grid. Independent requests
 // fill the GPU together. Refine a radix threshold until at most 4096 candidates
 // remain, then compact in position order for the existing stable block sort.
