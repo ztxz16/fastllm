@@ -14,11 +14,13 @@ using BF = __nv_bfloat16;
 #if CUDART_VERSION >= 12010
 constexpr int BatchLimit = 256;
 #else
-constexpr int BatchLimit = 64;
+constexpr int BatchLimit = (4096 - 128) / sizeof(FastllmNaiveDSARow);
 #endif
 struct Batch {
     FastllmNaiveDSARow rows[BatchLimit];
 };
+static_assert(sizeof(Batch) + 128 <= (CUDART_VERSION >= 12010 ? 32764 : 4096),
+              "Attention arguments exceed CUDA parameter space");
 __device__ inline int index(const FastllmNaiveDSARow &r, int i, int length, bool ring) {
     if (ring)
         return i < min(length, 128) ? ((max(0, length - 128) + i) & 127) : -1;
@@ -118,7 +120,7 @@ __global__ __launch_bounds__(256) void Decode(const BF *q, Batch batch, const fl
     auto &s = *(Storage<Max> *)buffer;
     const int row = blockIdx.x, group = blockIdx.y, head = group * 8, t = threadIdx.x, l = t % 32,
               w = t / 32, kh = head / (heads / kvHeads);
-    auto r = batch.rows[row];
+    auto r = FastllmNaiveResolveDSARow(batch.rows[row]);
     int len = Ring ? (r.liveKeys ? *r.liveKeys : r.length) : Length(r);
     int n = Ring ? min(len, 128) : (r.indices ? r.selectedCount : len);
     for (int i = t; i < 8 * 24; i += 256) {

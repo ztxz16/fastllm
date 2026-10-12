@@ -247,7 +247,8 @@ __device__ __forceinline__ void IndexerDecodeScoresRow(const BF16 *q, const BF16
 template <typename ScoreOutput, typename Length = int, bool Verify = false>
 __global__ void IndexerDecodeScores(const BF16 *q, const BF16 *packedKeys,
         const float *qscale, const BF16 *weights, ScoreOutput scores,
-        int stride, Length liveKeys, int past) {
+        int stride, Length liveKeys, int past, const void *const *cache = nullptr) {
+    if (cache) packedKeys = (const BF16 *)cache[0];
     if constexpr (Verify) {
         const int row = blockIdx.y;
         q += (size_t)row * kHeads * kIndexerDim;

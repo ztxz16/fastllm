@@ -13,6 +13,7 @@ struct Row {
     naive_topk::Workspace *workspace;
     int *indices;
     int sequence, stride;
+    const void *const *cache;
 };
 // CUDA 12.1 raised the kernel-argument limit from 4 KiB to 32,764 bytes.
 #if CUDART_VERSION >= 12010
@@ -23,7 +24,7 @@ constexpr int BatchLimit = 32;
 struct Batch { Row rows[BatchLimit]; };
 
 // Descriptors travel in the launch arguments and remain fixed in a graph.
-// Only device lengths change during replay; all scratch belongs to the caller.
+// Device lengths and optional KV bindings change without rebinding scratch.
 __global__ void Quantize(const BF16 *query, Batch batch) {
     const Row &row = batch.rows[blockIdx.y];
     naive_dsa_mma::QuantizeIndexerRow(query + (size_t)row.sequence *
@@ -40,7 +41,7 @@ __global__ void Scores(const BF16 *weights, Batch batch) {
     const Row &row = batch.rows[blockIdx.y];
     int n = *row.live;
     if (blockIdx.x * naive_dsa_mma::kKeys >= n) return;
-    naive_dsa_mma::IndexerDecodeScoresRow(row.query, row.key, row.scale,
+    naive_dsa_mma::IndexerDecodeScoresRow(row.query, row.cache ? (const BF16 *)row.cache[0] : row.key, row.scale,
         weights + (size_t)row.sequence * naive_dsa_mma::kHeads,
         ScoreOutput{row.scores}, row.stride, n, n - 1);
 }
@@ -66,7 +67,8 @@ __global__ void HopperScores(const BF16 *weights, Batch batch) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_dsa_mma;
     constexpr int Threads = 128;
-    const Row &r = batch.rows[blockIdx.y];
+    Row r = batch.rows[blockIdx.y];
+    if (r.cache) r.key = (const BF16 *)r.cache[0];
     const int n = *r.live, first = blockIdx.x * kKeys;
     if (first >= n) return;
     __shared__ __align__(16) BF16 qs[kHeads][kIndexerDim + 8], ks[kKeys][kIndexerDim + 8];

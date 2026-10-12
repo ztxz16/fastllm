@@ -1596,6 +1596,23 @@ if (UNIT_TEST)
                     PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                     PASS_REGULAR_EXPRESSION "BATCH PASS")
             endforeach()
+            foreach(NAIVE_SERVING_RANKS 2 8)
+                add_test(NAME naive_n05_serving_graph_${NAIVE_SERVING_RANKS}
+                    COMMAND naive_n05_verify_graph_test ${NAIVE_SERVING_RANKS} serving_graph)
+                set_tests_properties(naive_n05_serving_graph_${NAIVE_SERVING_RANKS}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "SERVING GRAPH PASS")
+            endforeach()
+            add_test(NAME naive_n05_serving_invalidation
+                COMMAND naive_n05_verify_graph_test 2 serving_invalidation)
+            set_tests_properties(naive_n05_serving_invalidation
+                PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                PASS_REGULAR_EXPRESSION "SERVING INVALIDATION PASS")
+            add_test(NAME naive_n05_serving_graph_fallback
+                COMMAND naive_n05_verify_graph_test 2 serving_graph failinstantiate)
+            set_tests_properties(naive_n05_serving_graph_fallback
+                PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                PASS_REGULAR_EXPRESSION "SERVING GRAPH PASS")
             add_test(NAME naive_n05_batch_separate_qkv COMMAND naive_n05_verify_graph_test 8 batch graph separate)
             set_tests_properties(naive_n05_batch_separate_qkv
                 PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240

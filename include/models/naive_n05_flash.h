@@ -3,6 +3,7 @@
 
 #include "basellm.h"
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <deque>
 #include <random>
@@ -182,6 +183,14 @@ namespace fastllm {
         void InitTensorParallelKVPool();
         struct TPDecodeState;
         std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState, tpBatchState;
+        struct TPServingState;
+        std::shared_ptr<TPServingState> tpServingState;
+        std::atomic<uint64_t> tpCacheEpoch{0};
+        bool CanReuseTensorParallelServingCache(const TargetBatch *batch) const;
+        void PrepareTensorParallelServing();
+        bool PrepareTensorParallelServingDecode(const Data &inputIds,
+            const LogitsSelection &selection, std::vector<int *> &cacheLengths,
+            const TargetBatch *batch, bool collectHidden);
         bool HasVerificationGraph() const;
         bool PrepareTensorParallelDecode(const Data &inputIds,
                                         std::vector<std::pair<Data, Data>> &kv, bool verifying,

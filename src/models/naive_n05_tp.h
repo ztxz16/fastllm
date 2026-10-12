@@ -12,21 +12,33 @@ struct NaiveN05FlashModel::TargetWorkspace {
     Data last, logits, logitsBf16, inputIds, liveKeys;
     Data denseGate, denseUp, denseDown;
     FastllmNaiveDecodeScratch decode;
+    const void *const *cacheTable = nullptr;
+    const unsigned char *cacheMaps = nullptr;
+    int tableRows = 0;
     int capacity = 0;
     std::vector<std::unique_ptr<TargetWorkspace>> sequences;
 };
 
 struct NaiveN05FlashModel::TPDecodeState {
     enum Mode { Warm, Prepare, Capture, Replay } mode = Warm;
-    struct Rank {
-        // Own the allocation longer than its input/position/length views.
-        Data inputStorage;
+    struct Storage {
+        // All pre-captured shapes share these allocations. Inputs and the KV
+        // table keep their maximum-batch strides even for smaller graphs.
+        Data inputStorage, cacheTable, cacheMaps, indexScores;
         std::vector<unsigned char> hostInput;
+        std::vector<void *> hostCache;
+        std::vector<unsigned char> hostMaps;
+        bool cacheDirty = false, mapsDirty = false;
+        int maxRows = 0;
         TargetWorkspace buffers;
-        TargetCapture features;
         Data logitsPartial, logitsCandidates;
-        // Bounded staging for one decode/verify block.
         Data historyDevice{BFLOAT16}, historyHost{BFLOAT16};
+    };
+    struct Rank {
+        explicit Rank(std::shared_ptr<Storage> workspace = std::make_shared<Storage>())
+            : storage(std::move(workspace)) {}
+        std::shared_ptr<Storage> storage;
+        TargetCapture features;
         void *graph = nullptr, *exec = nullptr;
         bool ok = true;
         std::vector<void *> communicationPointers;
@@ -43,6 +55,16 @@ struct NaiveN05FlashModel::TPDecodeState {
     bool warmed = false, captured = false, disabled = false, active = false;
     void ClearGraphs();
     ~TPDecodeState();
+};
+struct NaiveN05FlashModel::TPServingState {
+    bool preparing = false, capturing = false, sealed = false;
+    int prepareCapacity = 0;
+    DataType moeType = BFLOAT16;
+    uint64_t generation = 0, cacheEpoch = UINT64_MAX;
+    std::vector<const Data *> requests;
+    std::vector<int> expectedLengths, capacityLimits;
+    std::vector<int *> cacheLengths;
+    std::map<std::pair<int, int>, std::shared_ptr<TPDecodeState>> graphs;
 };
 }
 #endif

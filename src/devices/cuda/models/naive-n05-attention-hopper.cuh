@@ -1,8 +1,8 @@
 #pragma once
 // Hopper dense-KV specialization. TMA reads a swizzled tile directly;
 // eight heads share it without gathering or materializing global scores.
-// Each row needs two immutable tensor maps. Model launches capture them as
-// constant kernel arguments, avoiding an additional device metadata allocation.
+// Eager launches carry tensor maps by value. Serving graphs can instead read
+// fixed device descriptors refreshed when the request-to-KV binding changes.
 // Sparse or unsupported layouts use Decode in the companion CUDA header.
 #include "naive-n05-attention-bulk.cuh"
 #if CUDART_VERSION >= 12010
@@ -42,32 +42,31 @@ template <int Max> struct TmaStorage {
     BF prob[8][Max + 8];
     unsigned long long barrier;
 };
-// 64 rows plus maps fit the 32-KiB parameter limit. Graph nodes own immutable
-// copies, so cache address/capacity changes follow the existing graph lifetime.
+// Direct and indirect descriptors both fit the 32-KiB parameter limit.
 constexpr int TmaBatchLimit = 64;
 struct TmaBatch {
     FastllmNaiveDSARow rows[TmaBatchLimit];
     CUtensorMap maps[TmaBatchLimit * 2];
 };
 static_assert(sizeof(TmaBatch) + 128 < 32764, "TMA arguments exceed CUDA parameter space");
-// Shared by production and standalone tests; tensor maps live in kernel
-// arguments, so CUDA Graph replay needs no metadata buffer or H2D update.
+static_assert(sizeof(CUtensorMap) * 2 == FastllmNaiveDSAMapBytes, "Unexpected tensor map size");
+inline bool EncodeMaps(CUtensorMap *maps, const void *key, const void *value, int capacity, int stride) {
+    for (int j = 0; j < 2; ++j) {
+        uint64_t shape[3] = {64, (uint64_t)(j ? 2 : 3), (uint64_t)capacity};
+        uint64_t strides[2] = {128, (uint64_t)(j ? 128 : stride) * 2};
+        uint32_t box[3] = {64, (uint32_t)(j ? 2 : 3), 128}, steps[3] = {1, 1, 1};
+        if (cuTensorMapEncodeTiled(maps + j, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3,
+            (void *)(j ? value : key), shape, strides, box, steps,
+            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS) return false;
+    }
+    return true;
+}
 inline bool PrepareTmaBatch(TmaBatch &batch, const FastllmNaiveDSARow *rows, int count) {
     for (int i = 0; i < count; ++i) {
         const auto &r = batch.rows[i] = rows[i];
-        if (r.indices || r.capacity <= 0)
-            return false;
-        for (int j = 0; j < 2; ++j) {
-            uint64_t shape[3] = {64, (uint64_t)(j ? 2 : 3), (uint64_t)r.capacity};
-            uint64_t strides[2] = {128, (uint64_t)(j ? 128 : r.keyStride) * 2};
-            uint32_t box[3] = {64, (uint32_t)(j ? 2 : 3), 128}, steps[3] = {1, 1, 1};
-            if (cuTensorMapEncodeTiled(&batch.maps[i * 2 + j], CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3,
-                                       (void *)(j ? r.value : r.key), shape, strides, box, steps,
-                                       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                                       CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                                       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
-                return false;
-        }
+        if (r.indices || r.capacity <= 0 || (r.cache && !r.tensorMaps)) return false;
+        if (!r.tensorMaps && !EncodeMaps(batch.maps + i * 2, r.key, r.value, r.capacity, r.keyStride)) return false;
     }
     return true;
 }
@@ -83,6 +82,11 @@ __global__ __launch_bounds__(256) void HopperDecode(const BF *q,
               w = t / 32;
     auto r = batch.rows[row];
     const int n = Length(r);
+    const auto *maps = r.tensorMaps ? (const CUtensorMap *)r.tensorMaps : batch.maps + row * 2;
+    if (t == 0 && r.tensorMaps) {
+        asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" :: "l"(maps) : "memory");
+        asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" :: "l"(maps + 1) : "memory");
+    }
     for (int i = t; i < 8 * 24; i += 256) {
         int h = i / 24, d = i % 24 * 8;
         *(uint4 *)&s.qs[h][d] = *(const uint4 *)(q + ((size_t)row * heads + head + h) * 192 + d);
@@ -98,7 +102,7 @@ __global__ __launch_bounds__(256) void HopperDecode(const BF *q,
     const int ar = (l & 7) + ((l >> 3) & 1) * 8, ac = (l >> 4) * 8;
     for (int first = 0; first < n; first += 128) {
         if (t == 0)
-            tma_load(s.tile.keys, batch.maps + row * 2, &s.barrier, first, 128 * 192 * 2);
+            tma_load(s.tile.keys, maps, &s.barrier, first, 128 * 192 * 2);
         tma_wait(&s.barrier, phase);
         phase ^= 1;
         __syncthreads();
@@ -125,7 +129,7 @@ __global__ __launch_bounds__(256) void HopperDecode(const BF *q,
     float acc[4] = {};
     for (int first = 0; first < n; first += 128) {
         if (t == 0)
-            tma_load(s.tile.values, batch.maps + row * 2 + 1, &s.barrier, first, 128 * 128 * 2);
+            tma_load(s.tile.values, maps + 1, &s.barrier, first, 128 * 128 * 2);
         tma_wait(&s.barrier, phase);
         phase ^= 1;
         if (first + 128 > n)

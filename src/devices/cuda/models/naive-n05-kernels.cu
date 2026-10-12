@@ -643,6 +643,7 @@ struct RopeCacheRow {
     const float *positions;
     const int *length;
     int keyRows, valueRows, cachePast;
+    const void *const *cache = nullptr;
 };
 constexpr int kRopeCacheBatch = 32;
 struct RopeCacheBatch { RopeCacheRow rows[kRopeCacheBatch]; };
@@ -651,7 +652,8 @@ template <bool Packed>
 __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
         int heads, int kvHeads, int dim, int valueDim, int indexDim, int rotaryDim,
         float theta, BF16 valueScale, int window, bool ring) {
-    BF16 *q = r.q, *key = r.key, *value = r.value;
+    BF16 *q = r.q, *key = r.cache ? (BF16 *)r.cache[0] : r.key,
+        *value = r.cache ? (BF16 *)r.cache[1] : r.value;
     const BF16 *k = r.k, *v = r.v, *indexKey = r.indexKey, *qkv = r.qkv;
     const float *positions = r.positions;
     const int *length = r.length;
@@ -776,7 +778,9 @@ __global__ void IndexScores(const float *q, const float *k, const BF16 *weights,
 // registers across the 16 heads, avoiding a full temporary K.
 template <typename ScoreOutput, typename Length = int, bool Verify = false>
 __global__ void IndexScoresDecode(const float *q, const BF16 *packedKeys,
-        const BF16 *weights, ScoreOutput scores, int stride, Length liveKeys, int queryStart) {
+        const BF16 *weights, ScoreOutput scores, int stride, Length liveKeys, int queryStart,
+        const void *const *cache = nullptr) {
+    if (cache) packedKeys = (const BF16 *)cache[0];
     if constexpr (Verify) {
         const int row = blockIdx.y;
         q += (size_t)row * 16 * 128;
@@ -1357,8 +1361,9 @@ __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v
         const int row = blockIdx.y;
         q += (size_t)row * heads * kSwaQkDim;
         out += (size_t)row * heads * kSwaValueDim;
-        k = (const BF16 *)liveKeys.rows[row].key;
-        v = (const BF16 *)liveKeys.rows[row].value;
+        const auto &cache = liveKeys.rows[row];
+        k = (const BF16 *)(cache.cache ? cache.cache[0] : cache.key);
+        v = (const BF16 *)(cache.cache ? cache.cache[1] : cache.value);
     }
     if constexpr (Verify) {
         const int row = blockIdx.y;
@@ -2215,6 +2220,7 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
                 rotaryDim, theta, valueScale, window, packedQkv ? &packed : nullptr,
                 ring, descriptors[b], width) || (b && width != indexDim)) return false;
         indexDim = width;
+        descriptors[b].cache = rows[b].cache;
     }
     // Validate every cache before launching, so a fallback cannot double-rotate Q.
     for (int first = 0; first < count; first += kRopeCacheBatch) {
@@ -2812,7 +2818,7 @@ void FastllmCudaNaiveTrimDecodeCache(fastllm::Data &key, fastllm::Data &value,
 void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
         const fastllm::Data &weights, const fastllm::Data &packedKeys,
         const fastllm::Data &liveKeys, int capacity, bool fp8Query,
-        FastllmNaiveDecodeScratch &scratch, fastllm::Data &indices) {
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &indices, const void *const *cache) {
     using namespace fastllm;
     DecodeKeys keys{(const int *)liveKeys.cudaData, 0};
     const int stride = packedKeys.dims[2];
@@ -2827,7 +2833,7 @@ void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
         naive_dsa_mma::IndexerDecodeScores<<<(capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys,
             naive_dsa_mma::kThreads>>>((const BF16 *)scratch.indexQuery.cudaData,
             (const BF16 *)packedKeys.cudaData, (const float *)scratch.indexScale.cudaData,
-            (const BF16 *)weights.cudaData, scoreOutput, stride, keys, capacity - 1);
+            (const BF16 *)weights.cudaData, scoreOutput, stride, keys, capacity - 1, cache);
     } else
 #endif
     {
@@ -2836,7 +2842,7 @@ void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
             (float *)scratch.indexQuery.cudaData, 128, 0, fp8Query);
         IndexScoresDecode<<<(capacity + 7) / 8, 256>>>((const float *)scratch.indexQuery.cudaData,
             (const BF16 *)packedKeys.cudaData, (const BF16 *)weights.cudaData,
-            scoreOutput, stride, keys, capacity - 1);
+            scoreOutput, stride, keys, capacity - 1, cache);
     }
     Output(scratch.topk, INT32, {(int)(sizeof(naive_topk::Workspace) / sizeof(int))});
     Output(indices, INT32, {1, naive_topk::kTopK});
@@ -2901,7 +2907,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
                 (const int *)liveKeys.cudaData + row.sequence, (BF16 *)scratch.indexQuery.cudaData,
                 (float *)scratch.indexScale.cudaData, (unsigned *)scratch.indexScores.cudaData,
                 (naive_topk::Workspace *)scratch.topk.cudaData, (int *)row.indices->cudaData,
-                row.sequence, row.key->dims[2]};
+                row.sequence, row.key->dims[2], row.cache};
             capacity = std::max(capacity, row.capacity);
         }
         batch::Quantize<<<dim3(heads, count), dim>>>((const BF16 *)query.cudaData, descriptors);
@@ -2977,6 +2983,25 @@ bool HopperBulkAttention(const fastllm::Data &query, const float *bias,
 }
 #endif
 } // namespace
+
+bool FastllmCudaNaiveDSAMapsSupported() {
+#if CUDART_VERSION >= 12010
+    return FastllmCudaRuntimeArch() == 90;
+#else
+    return false;
+#endif
+}
+bool FastllmCudaNaiveEncodeDSAMaps(void *host, const void *key, const void *value,
+                                 int capacity, int keyStride) {
+#if CUDART_VERSION >= 12010
+    CUtensorMap maps[2];
+    if (!naive_attention_bulk::EncodeMaps(maps, key, value, capacity, keyStride)) return false;
+    std::memcpy(host, maps, sizeof(maps));
+    return true;
+#else
+    return false;
+#endif
+}
 
 void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
         const fastllm::Data &sink, const std::vector<FastllmNaiveDSARow> &rows,
@@ -3131,7 +3156,7 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
         bool aligned = true;
         for (int i = 0; i < (int)rows.size(); ++i) {
             auto &r = descriptors[i];
-            r.key = rows[i].key; r.value = rows[i].value;
+            r.key = rows[i].key; r.value = rows[i].value; r.cache = rows[i].cache;
             r.liveKeys = (const int *)liveKeys.cudaData + i;
             r.capacity = kSwaWindow; r.keyStride = kvHeads * kSwaQkDim;
             aligned = aligned && r.key && r.value && (uintptr_t)r.key % 16 == 0 && (uintptr_t)r.value % 16 == 0;

@@ -65,6 +65,7 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, int reserveCapaci
 
 void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width) {
     if (cache.expansionDims.size() == 3 && cache.expansionDims[1] >= capacity) return;
+    tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
 #ifdef USE_CUDA
     auto pool = cache.dataDevice == DataDevice::CUDA && cache.dataDeviceIds.size() == 1
         ? tpKVPool.find(cache.dataDeviceIds[0]) : tpKVPool.end();
@@ -127,6 +128,7 @@ NaiveN05FlashModel::NaiveN05FlashModel() {
 NaiveN05FlashModel::~NaiveN05FlashModel() {
     ShutdownRuntime();
     tpWorkers.Stop();
+    tpServingState.reset();
     tpDecodeState.reset();
     tpVerifyState.reset();
     tpBatchState.reset();
@@ -572,11 +574,13 @@ Data NaiveN05FlashModel::RunTarget(
             }
         };
         bool batchRopePrepared = false;
+        const void *const *layerCache = buf.cacheTable ? buf.cacheTable + (size_t)layer * buf.tableRows * 2 : nullptr;
+        const unsigned char *layerMaps = buf.cacheMaps ? buf.cacheMaps + (size_t)layer * buf.tableRows * FastllmNaiveDSAMapBytes : nullptr;
         if (batch) {
             while ((int)buf.sequences.size() < batch->Size())
                 buf.sequences.emplace_back(new TargetWorkspace());
         }
-        if (batch && batch->Size() > 1 && batch->Decode() && decodeWorkspace &&
+        if (batch && (batch->Size() > 1 || buf.cacheTable) && batch->Decode() && decodeWorkspace &&
             !graphVerify && (!capture || (!capture->verifying && capture->batchHistory.empty()))) {
             std::vector<FastllmNaiveRopeCacheRow> caches;
             caches.reserve(batch->Size());
@@ -592,7 +596,8 @@ Data NaiveN05FlashModel::RunTarget(
                 }
                 caches.push_back({batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
                     batch->Value(sequence, layer).multiDeviceDatas.at(gpu),
-                    slidingLayers[layer] ? nullptr : &indexKeys[sequence]});
+                    slidingLayers[layer] ? nullptr : &indexKeys[sequence],
+                    layerCache ? layerCache + sequence * 2 : nullptr});
             }
             batchRopePrepared = FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions,
                 caches, buf.liveKeys, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
@@ -619,7 +624,8 @@ Data NaiveN05FlashModel::RunTarget(
                 auto &part = *buf.sequences[sequence];
                 if (part.capacity > indexTopK)
                     rows.push_back({batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
-                        &part.decode, &part.indices, sequence, part.capacity});
+                        &part.decode, &part.indices, sequence, part.capacity,
+                        layerCache ? layerCache + sequence * 2 : nullptr});
             }
             batchIndexerPrepared = FastllmCudaNaiveBatchDecodeIndexer(batchIndexQ,
                 batchIndexWeights, buf.liveKeys, rows, indexFp8);
@@ -700,7 +706,8 @@ Data NaiveN05FlashModel::RunTarget(
                         if (graphVerify) FastllmCudaNaiveGraphVerifyIndexer(indexQ, indexWeights, pastKey,
                             buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
                         else FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights, pastKey,
-                            buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
+                            buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices,
+                            layerCache ? layerCache + sequence * 2 : nullptr);
                     } else {
                         if (capture && capture->verifying && length <= 8)
                             FastllmCudaNaiveVerifyIndexer(indexQ, indexWeights, pastKey, indexHeads,
@@ -718,6 +725,8 @@ Data NaiveN05FlashModel::RunTarget(
             }
             if (batchedDSA) {
                 FastllmNaiveDSARow row;
+                row.tensorMaps = layerMaps ? layerMaps + (size_t)sequence * FastllmNaiveDSAMapBytes : nullptr;
+                row.cache = layerCache ? layerCache + sequence * 2 : nullptr;
                 row.key = pastKey.cudaData;
                 row.value = pastValue.cudaData;
                 row.indices = selected->dims.empty() ? nullptr : (const int *)selected->cudaData;
@@ -728,7 +737,7 @@ Data NaiveN05FlashModel::RunTarget(
                 row.selectedCount = row.indices ? selected->dims.back() : 0;
                 dsaRows.push_back(row);
             } else if (batchedSWA) {
-                swaRows.push_back({pastKey.cudaData, pastValue.cudaData});
+                swaRows.push_back({pastKey.cudaData, pastValue.cudaData, layerCache ? layerCache + sequence * 2 : nullptr});
             } else if (decodeWorkspace) {
                 if (graphVerify) FastllmCudaNaiveGraphVerifyAttention(q, pastKey, pastValue, *selected, sink,
                     buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
@@ -1050,6 +1059,7 @@ void NaiveN05FlashModel::WarmUp() {
     }
     cache.clear();
     InitTensorParallelKVPool();
+    PrepareTensorParallelServing();
 }
 
 void NaiveN05FlashModel::InitTensorParallelKVPool() {

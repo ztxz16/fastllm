@@ -92,10 +92,11 @@ bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     int rotaryDim, float theta, float valueScale, int window,
     const fastllm::Data *packedQkv = nullptr, bool ring = false);
 // One decode token per independent cache. Descriptors are captured as kernel
-// arguments, and liveKeys/positions are read on replay; no GPU metadata buffer.
+// arguments; optional device indirection updates KV bindings without recapture.
 struct FastllmNaiveRopeCacheRow {
     fastllm::Data *key, *value;
     const fastllm::Data *indexKey;
+    const void *const *cache = nullptr;
 };
 bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     const fastllm::Data &v, const fastllm::Data &positions,
@@ -155,7 +156,7 @@ struct FastllmNaiveDecodeScratch {
 };
 // One query per independent sequence, up to 2048 selected keys. KV stays in
 // place, and descriptors are kernel arguments. Graph replay reads device lengths
-// without copying metadata. Preserve BF16 score/probability rounding. Large
+// and optional KV/TMA tables. Preserve BF16 score/probability rounding. Large
 // batches use Tensor Cores with FP32 accumulation; unsupported shapes retain
 // the existing CUDA kernels.
 void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
@@ -164,7 +165,7 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
     FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
 // Independent 128-token SWA rings (QK=192, V=128). Cache descriptors are
 // kernel arguments; liveKeys contains one absolute length per sequence.
-struct FastllmNaiveSWARow { const void *key, *value; };
+struct FastllmNaiveSWARow { const void *key, *value; const void *const *cache = nullptr; };
 void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
     const fastllm::Data &sink, const std::vector<FastllmNaiveSWARow> &rows,
     const fastllm::Data &liveKeys, int heads, int kvHeads,
@@ -183,12 +184,14 @@ void FastllmCudaNaiveTrimDecodeCache(fastllm::Data &key, fastllm::Data &value,
 void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
     const fastllm::Data &weights, const fastllm::Data &packedKeys,
     const fastllm::Data &liveKeys, int capacity, bool fp8Query,
-    FastllmNaiveDecodeScratch &scratch, fastllm::Data &indices);
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &indices,
+    const void *const *cache = nullptr);
 struct FastllmNaiveIndexerRow {
     const fastllm::Data *key;
     FastllmNaiveDecodeScratch *scratch;
     fastllm::Data *indices;
     int sequence, capacity;
+    const void *const *cache = nullptr;
 };
 // Independent sequences share launches and reuse their existing scratch.
 // Returning false leaves the caller free to use the single-sequence path.

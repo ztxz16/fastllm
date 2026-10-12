@@ -183,6 +183,7 @@ bool NaiveN05FlashModel::TryRestoreHistoryCache(std::vector<int> &tokens, int &c
 }
 
 void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
+    tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
     std::shared_ptr<const HistoryMemory> pending;
     {
         std::lock_guard<std::mutex> guard(historyMutex);
@@ -270,6 +271,7 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
 }
 
 void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
+    tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
     const Data *key = context->pastKeyValues.empty() ? nullptr : &context->pastKeyValues.front().first;
     RecycleTensorParallelCache(context);
     std::lock_guard<std::mutex> guard(historyMutex);

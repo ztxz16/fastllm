@@ -33,7 +33,7 @@ __global__ void Scores(const BF16 *q, FastllmNaiveDSABatch batch, float *scores,
         dim = FixedDim;
     const int h = blockIdx.x, b = blockIdx.z, first = blockIdx.y * 64, t = threadIdx.x, lane = t & 31,
               warp = t >> 5;
-    auto r = batch.rows[b];
+    auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
     __shared__ __align__(16) BF16 keys[64][264];
     __shared__ int selected[64];
@@ -88,7 +88,7 @@ __global__ void DirectScores(const BF16 *q, FastllmNaiveDSABatch batch, float *s
                              int stride) {
     const int h = blockIdx.x, b = blockIdx.z, t = threadIdx.x, lane = t & 31, warp = t >> 5,
               first = blockIdx.y * RowsPerWarp * Warps;
-    const auto r = batch.rows[b];
+    const auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
     const BF16 *key = (const BF16 *)r.key;
     float qr[6];
@@ -190,7 +190,7 @@ __global__ void Values(const float *scores, FastllmNaiveDSABatch batch, BF16 *ou
                        int stride) {
     constexpr int Tile = 256, Columns = 8;
     const int h = blockIdx.x, b = blockIdx.z, column = blockIdx.y * Columns, t = threadIdx.x;
-    auto r = batch.rows[b];
+    auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
     const BF16 *value = static_cast<const BF16 *>(r.value);
     const float *p = scores + ((size_t)b * heads + h) * stride;
@@ -233,7 +233,7 @@ template <int MaxKeys, int Columns>
 __global__ void SoftmaxTransposedValues(const float *scores, const float *sink, FastllmNaiveDSABatch batch,
                                         BF16 *out, int heads, int kvHeads, int stride) {
     const int h = blockIdx.x, b = blockIdx.z, t = threadIdx.x, column = blockIdx.y * Columns;
-    const auto r = batch.rows[b];
+    const auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
     const int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
     extern __shared__ __align__(16) unsigned char buffer[];
     auto &st = *(TransposedStorage<MaxKeys, Columns> *)buffer;
@@ -299,7 +299,7 @@ template <int MaxKeys, int Columns>
 __global__ void SoftmaxSparseValues(const float *scores, const float *sink, FastllmNaiveDSABatch batch,
                                     BF16 *out, int heads, int kvHeads, int stride) {
     const int h = blockIdx.x, b = blockIdx.z, t = threadIdx.x, column = blockIdx.y * Columns;
-    const auto r = batch.rows[b];
+    const auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
     const int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
     extern __shared__ __align__(16) unsigned char buffer[];
     auto &st = *(SparseStorage<MaxKeys, Columns> *)buffer;
@@ -362,7 +362,7 @@ template <int MaxKeys, int Groups, int Columns, bool Sparse>
 __global__ void GroupedValues(const float *scores, const float *sink, FastllmNaiveDSABatch batch, BF16 *out,
                               int heads, int kvHeads, int stride) {
     const int t = threadIdx.x, b = blockIdx.z, firstHead = blockIdx.x * Groups, column = blockIdx.y * Columns;
-    const auto r = batch.rows[b];
+    const auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = firstHead / (heads / kvHeads);
     extern __shared__ __align__(16) unsigned char memory[];
     auto &s = *(GroupStorage<MaxKeys, Groups, Columns> *)memory;

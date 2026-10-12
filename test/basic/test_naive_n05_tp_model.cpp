@@ -104,7 +104,7 @@ class Fixture : public NaiveN05FlashModel {
   public:
     int ranks;
     bool useRealScheduler = false;
-    explicit Fixture(int ranks, bool packed = false, bool graph = false, bool swaRing = false) : ranks(ranks) {
+    explicit Fixture(int ranks, bool packed = false, bool graph = false, bool swaRing = false, bool serving = false) : ranks(ranks) {
         setenv("FASTLLM_TP", ranks > 1 ? std::to_string(ranks).c_str() : "false", 1);
         deviceMap = {{"cuda:0", 1}};
         moeDeviceMap = deviceMap;
@@ -136,6 +136,12 @@ class Fixture : public NaiveN05FlashModel {
             weight.dicts["swa_head_dim"] = "192";
             weight.dicts["swa_v_head_dim"] = "128";
             weight.dicts["sliding_window"] = "128";
+        }
+        if (serving) {
+            weight.dicts["num_attention_heads"] = "64";
+            weight.dicts["head_dim"] = "192";
+            weight.dicts["v_head_dim"] = "128";
+            weight.dicts["moe_layer_freq"] = "[0,0]";
         }
         InitParams();
         SetSaveHistoryChat(false);
@@ -187,8 +193,8 @@ class Fixture : public NaiveN05FlashModel {
         for (int i = 0; i < 2; ++i) {
             auto p = "model.layers." + std::to_string(i);
             auto ap = p + ".self_attn.";
-            const int heads = i && swaRing ? 64 : 16, kv = i ? 8 : 4;
-            const int dim = i && swaRing ? 192 : 32, valueDim = i && swaRing ? 128 : 16;
+            const int heads = (i && swaRing) || serving ? 64 : 16, kv = i ? 8 : 4;
+            const int dim = (i && swaRing) || serving ? 192 : 32, valueDim = (i && swaRing) || serving ? 128 : 16;
             add(p + ".input_layernorm.weight", {256}, FLOAT32, 0, true);
             add(p + ".post_attention_layernorm.weight", {256}, FLOAT32, 0, true);
             add(ap + "q_proj.weight", {heads * dim, 256}, BFLOAT16, .03f);
@@ -196,7 +202,7 @@ class Fixture : public NaiveN05FlashModel {
             add(ap + "v_proj.weight", {kv * valueDim, 256}, BFLOAT16, .03f);
             add(ap + "o_proj.weight", {256, heads * valueDim}, BFLOAT16, .03f);
             add(ap + "attention_sink_bias", {heads}, FLOAT32, .1f);
-            if (i == 0) {
+            if (i == 0 || serving) {
                 add(ap + "indexer.wq.weight", {2048, 256}, BFLOAT16, .03f);
                 add(ap + "indexer.wk.weight", {128, 256}, BFLOAT16, .03f);
                 add(ap + "indexer.weights_proj.weight", {16, 256}, BFLOAT16, .03f);
@@ -219,6 +225,139 @@ class Fixture : public NaiveN05FlashModel {
     bool UseModelSpecificScheduler() const override { return !useRealScheduler; }
     void RunModelSpecificScheduler() override {}
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+    void ServingGraphInvalidationChecks() {
+        maxBatch = 4; SetMaxTokens(16384); WarmUp();
+        const int captures = verifyGraphCaptures;
+        std::vector<std::pair<Data, Data>> cache;
+        for (int layer = 0; layer < block_cnt; ++layer) cache.emplace_back(Data(BFLOAT16), Data(BFLOAT16));
+        GenerationConfig config;
+        config.top_k = 1; config.repeat_penalty = 1;
+        config.input_token_length = 3; config.output_token_limit = 32;
+        int past = 0;
+        auto run = [&](int rows) {
+            std::vector<float> ids(rows), positions(rows);
+            for (int i = 0; i < rows; ++i) { ids[i] = (past + i) * 3 % 251; positions[i] = past + i; }
+            Forward(Data(FLOAT32, {1, rows}, ids), Data(), Data(FLOAT32, {1, rows}, positions), cache, config);
+            past += rows;
+        };
+        run(3);
+        const int before = verifyGraphLaunches;
+        run(1);
+        if (verifyGraphLaunches - before != ranks) throw std::runtime_error("initial serving graph did not replay");
+        const int launches = verifyGraphLaunches;
+        // An incompatible setting can first be observed on a prefill call.
+        // Restoring it must not revive a graph whose resources may have moved.
+        SetMoeAtype(FLOAT16); run(2);
+        SetMoeAtype(BFLOAT16); run(1);
+        if (verifyGraphCaptures != captures || verifyGraphLaunches != launches)
+            throw std::runtime_error("incompatible serving graph was revived");
+        std::cout << "SERVING INVALIDATION PASS" << std::endl;
+    }
+    void ServingGraphChecks() {
+        // Candidate and eager reference retain independent request caches.
+        maxBatch = 16;
+        SetMaxTokens(131072);
+        WarmUp();
+        if (!verifyGraphCaptures) throw std::runtime_error("serving warmup captured no graphs");
+        const int captures = verifyGraphCaptures;
+        int checks = 0, replayed = 0, eager = 0;
+        for (int prefix : {3, 254, 2046, 4094}) {
+            using Cache = std::vector<std::pair<Data, Data>>;
+            std::vector<Cache> actual(8), expected(8);
+            std::vector<int> past(8, prefix);
+            GenerationConfig config;
+            config.input_token_length = prefix;
+            config.output_token_limit = 64;
+            config.top_k = 1; config.repeat_penalty = 1; config.output_logits = true;
+            auto prefill = [&](Cache &cache, int row) {
+                for (int i = 0; i < block_cnt; ++i) cache.emplace_back(Data(BFLOAT16), Data(BFLOAT16));
+                std::vector<float> ids(prefix), positions(prefix);
+                for (int i = 0; i < prefix; ++i) { ids[i] = (i * 3 + row) % 251; positions[i] = i; }
+                Forward(Data(FLOAT32, {1, prefix}, ids), Data(), Data(FLOAT32, {1, prefix}, positions), cache, config);
+            };
+            for (int row = 0; row < 8; ++row) { prefill(actual[row], row); prefill(expected[row], row); }
+            int step = 0;
+            for (int count : {8, 4, 3, 2, 1, 4, 8, 7, 8}) {
+                std::vector<int> order(count);
+                for (int row = 0; row < count; ++row) order[row] = step % 2 ? 7 - row : row;
+                auto run = [&](std::vector<Cache> &all, bool graph) {
+                    SetCudaGraph(graph);
+                    std::vector<float> ids;
+                    std::vector<Data> positions(count);
+                    std::vector<Data *> pos;
+                    std::vector<std::pair<Data *, Data *>> caches;
+                    std::vector<std::vector<float>> logits(count);
+                    std::vector<std::vector<float> *> outputs;
+                    for (int row = 0; row < count; ++row) {
+                        int sequence = order[row];
+                        ids.push_back((past[sequence] * 3 + sequence) % 251);
+                        positions[row].CopyFrom(Data(FLOAT32, {1, 1}, {(float)past[sequence]}));
+                        pos.push_back(&positions[row]); outputs.push_back(&logits[row]);
+                        for (auto &layer : all[sequence]) caches.emplace_back(&layer.first, &layer.second);
+                    }
+                    ForwardBatch(count, Data(FLOAT32, {1, count}, ids), {}, pos, std::vector<int>(count, 1),
+                                 caches, std::vector<GenerationConfig>(count, config), LastTokensManager(), &outputs);
+                    return logits;
+                };
+                const int before = verifyGraphLaunches;
+                auto output = run(actual, true);
+                int launched = verifyGraphLaunches - before;
+                if (launched != 0 && launched != ranks) throw std::runtime_error("partial-rank serving replay");
+                if (launched) ++replayed; else ++eager;
+                auto reference = run(expected, false);
+                SetCudaGraph(true);
+                for (int row = 0; row < count; ++row) {
+                    RequireCloseLogits(output[row].data(), reference[row], "serving graph changed logits");
+                    int sequence = order[row]; ++past[sequence];
+                    for (int layer = 0; layer < block_cnt; ++layer)
+                    for (int part = 0; part < 2; ++part) {
+                        auto &a = part ? actual[sequence][layer].second : actual[sequence][layer].first;
+                        auto &b = part ? expected[sequence][layer].second : expected[sequence][layer].first;
+                        if (a.dims != b.dims) throw std::runtime_error("serving root metadata mismatch");
+                        for (int rank = 0; rank < ranks; ++rank)
+                            if (a.multiDeviceDatas.at(rank)->dims != b.multiDeviceDatas.at(rank)->dims)
+                                throw std::runtime_error("serving rank metadata mismatch");
+                    }
+                    ++checks;
+                }
+                if (verifyGraphCaptures != captures) throw std::runtime_error("serving recaptured a graph");
+                ++step;
+            }
+        }
+        // Exercise the owned scheduler's cached validation plan at a real
+        // allocation boundary: unlimited generation reserves only the prompt.
+        GenerationConfig growing;
+        growing.top_k = 1; growing.repeat_penalty = 1;
+        growing.input_token_length = 126; growing.output_token_limit = -1;
+        std::vector<int> prompt(126), expectedTokens;
+        std::vector<float> ids(126), positions(126);
+        for (int i = 0; i < 126; ++i) { prompt[i] = (i * 3) % 251; ids[i] = prompt[i]; positions[i] = i; }
+        std::vector<std::pair<Data, Data>> reference;
+        for (int layer = 0; layer < block_cnt; ++layer) reference.emplace_back(Data(BFLOAT16), Data(BFLOAT16));
+        SetCudaGraph(false);
+        int token = Forward(Data(FLOAT32, {1, 126}, ids), Data(), Data(FLOAT32, {1, 126}, positions), reference, growing);
+        expectedTokens.push_back(token);
+        for (int i = 0; i < 7; ++i) {
+            token = Forward(Data(FLOAT32, {1, 1}, {(float)token}), Data(),
+                            Data(FLOAT32, {1, 1}, {(float)(126 + i)}), reference, growing);
+            expectedTokens.push_back(token);
+        }
+        SetCudaGraph(true);
+        eos_token_id = -1; eos_token_ids.clear();
+        useRealScheduler = true;
+        const int handle = LaunchResponseTokens(prompt, growing);
+        for (int expected : expectedTokens)
+            if (FetchResponseTokens(handle) != expected) throw std::runtime_error("scheduler KV growth changed tokens");
+        AbortResponse(handle);
+        ShutdownRuntime();
+        if (verifyGraphCaptures != captures) throw std::runtime_error("scheduler KV growth recaptured a graph");
+        if ((!failVerifyInstantiate && replayed < 20) ||
+            (failVerifyInstantiate && replayed != 0) || eager == 0)
+            throw std::runtime_error("missing serving replay/fallback coverage");
+        std::cout << "SERVING GRAPH PASS logits=" << checks << " replayed=" << replayed
+                  << " eager=" << eager << " serving_captures=" << verifyGraphCaptures - captures
+                  << " relative_max=" << largestLogitRelative << std::endl;
+    }
     void RingGraphToggleChecks(bool initialGraph) {
         int checks = 0, graphLaunches = 0;
         const std::vector<bool> modes = {true, true, false, false, true, true, false, true};
@@ -1497,6 +1636,20 @@ int main(int argc, char **argv) {
             return 0;
         }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (argc > 2 && std::string(argv[2]) == "serving_invalidation") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            Fixture fixture(ranks, false, true, true, true);
+            fixture.ServingGraphInvalidationChecks();
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "serving_graph") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            failVerifyInstantiate = argc > 3 && std::string(argv[3]) == "failinstantiate";
+            failGraphDevice = ranks - 1;
+            Fixture fixture(ranks, false, true, true, true);
+            fixture.ServingGraphChecks();
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "swa_ring_toggle") {
             const bool graph = argc <= 3 || std::string(argv[3]) != "eager";
             SetCudaEmbedding(true); SetCudaGraph(graph);
