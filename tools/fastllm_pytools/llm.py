@@ -1189,6 +1189,17 @@ def encode_hf_prompt(tokenizer, prompt: str):
     add_special_tokens = not (avoid_duplicate_bos and bos_token and prompt.startswith(bos_token))
     return tokenizer.encode(prompt, add_special_tokens = add_special_tokens)
 
+def _same_template_input(left, right):
+    # Templates can iterate tool properties and arguments in insertion order.
+    # Ordinary dict equality would allow reusing IDs for a different prompt.
+    if isinstance(left, dict) and isinstance(right, dict):
+        return (list(left) == list(right) and
+                all(_same_template_input(left[key], right[key]) for key in left))
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return (len(left) == len(right) and
+                all(_same_template_input(a, b) for a, b in zip(left, right)))
+    return left == right
+
 def apply_hf_chat_template(tokenizer, conversation, add_generation_prompt = True,
                            tokenize = False, enable_thinking = None, tools = None,
                            thinking_alias = False, thinking_effort = None,
@@ -2235,7 +2246,8 @@ class model:
                          enable_thinking, tools, thinking_effort, tool_choice,
                          chat_template_kwargs],
                         ensure_ascii = False,
-                        sort_keys = True,
+                        # Templates can render tool properties/arguments in
+                        # insertion order; distinct orders must not share IDs.
                         separators = (",", ":"))
                 except (TypeError, ValueError):
                     cache_key = None
@@ -2268,7 +2280,7 @@ class model:
                         tokenize = True,
                         enable_thinking = enable_thinking,
                         tools = tools,
-                        thinking_alias = self._is_kimi_k3(),
+                        thinking_alias = True,
                         thinking_effort = thinking_effort,
                         tool_choice = tool_choice,
                         chat_template_kwargs = chat_template_kwargs)
@@ -2811,6 +2823,7 @@ class model:
                 type = "ChatGLM3"
             if (not(history)):
                 history = [];
+            can_reuse_token_count = False
             if (type == "ChatGLM3"):
                 input = tokenizer.build_chat_input(query, history=history)["input_ids"].reshape(-1).tolist()
             else:
@@ -2818,15 +2831,14 @@ class model:
                 direct_template_tokens = None
                 can_reuse_token_count = (
                     conversation is not None and len(conversation) != 0 and
-                    not self.save_history and
                     pending_text_input_token_cache is not None and
-                    pending_text_input_token_cache.get("conversation") == conversation and
+                    _same_template_input(pending_text_input_token_cache.get("conversation"), conversation) and
                     pending_text_input_token_cache.get("add_generation_prompt") == add_generation_prompt and
                     pending_text_input_token_cache.get("enable_thinking") == enable_thinking and
-                    pending_text_input_token_cache.get("tools") == tools and
+                    _same_template_input(pending_text_input_token_cache.get("tools"), tools) and
                     pending_text_input_token_cache.get("thinking_effort") == thinking_effort and
-                    pending_text_input_token_cache.get("tool_choice") == tool_choice and
-                    pending_text_input_token_cache.get("chat_template_kwargs") == chat_template_kwargs)
+                    _same_template_input(pending_text_input_token_cache.get("tool_choice"), tool_choice) and
+                    _same_template_input(pending_text_input_token_cache.get("chat_template_kwargs"), chat_template_kwargs))
                 if can_reuse_token_count:
                     input = pending_text_input_token_cache["input_ids"]
                 elif (conversation != None and len(conversation) != 0):
@@ -2881,7 +2893,13 @@ class model:
                                                         max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                         False, stop_token_len, stop_token_list)
             if (self.save_history):
-                self.current_tokenizer_cache[handle] = [[prompt], [input]]
+                if can_reuse_token_count:
+                    # Native KV history is independent of this Python text
+                    # cache. Reused IDs have no rendered prompt snapshot; an
+                    # empty snapshot would match unrelated future requests.
+                    self.current_tokenizer_cache.pop(handle, None)
+                else:
+                    self.current_tokenizer_cache[handle] = [[prompt], [input]]
             return handle
         else:
             prompt = ""
