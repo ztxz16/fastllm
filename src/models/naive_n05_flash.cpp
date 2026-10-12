@@ -604,6 +604,19 @@ Data NaiveN05FlashModel::RunTarget(
                 [&](const std::unique_ptr<TargetWorkspace> &part) { return part->capacity > indexTopK; });
         Data &batchIndexQ = buf.indexQ, &batchIndexWeights = buf.indexWeights;
         if (batchIndexPrepared) prepareIndexQuery(normed, positions, batchIndexQ, batchIndexWeights);
+        bool batchIndexerPrepared = false;
+        if (batchIndexPrepared) {
+            std::vector<FastllmNaiveIndexerRow> rows;
+            rows.reserve(batch->Size());
+            for (int sequence = 0; sequence < batch->Size(); ++sequence) {
+                auto &part = *buf.sequences[sequence];
+                if (part.capacity > indexTopK)
+                    rows.push_back({batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
+                        &part.decode, &part.indices, sequence, part.capacity});
+            }
+            batchIndexerPrepared = FastllmCudaNaiveBatchDecodeIndexer(batchIndexQ,
+                batchIndexWeights, buf.liveKeys, rows, indexFp8);
+        }
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &pastKey, Data &pastValue,
                           TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, HistoryChunk *historyChunk, int sequence = 0) {
@@ -666,26 +679,28 @@ Data NaiveN05FlashModel::RunTarget(
             Data noIndices;
             Data *selected = &noIndices;
             if (!slidingLayers[layer] && (decodeWorkspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
-                Data rowIndexQ, rowIndexWeights;
-                Data &indexQ = batchIndexPrepared ? rowIndexQ : buf.indexQ;
-                Data &indexWeights = batchIndexPrepared ? rowIndexWeights : buf.indexWeights;
-                if (batchIndexPrepared) {
-                    indexQ.Resize({1, 1, indexHeads * indexDim});
-                    indexQ.FakeFrom(batchIndexQ, (size_t)sequence * indexHeads * indexDim * batchIndexQ.unitSize);
-                    indexWeights.Resize({1, 1, indexHeads});
-                    indexWeights.FakeFrom(batchIndexWeights, (size_t)sequence * indexHeads * batchIndexWeights.unitSize);
-                } else prepareIndexQuery(normed, positions, indexQ, indexWeights);
-                if (decodeWorkspace) {
-                    if (graphVerify) FastllmCudaNaiveGraphVerifyIndexer(indexQ, indexWeights, pastKey,
-                        buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
-                    else FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights, pastKey,
-                        buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
-                } else {
-                    if (capture && capture->verifying && length <= 8)
-                        FastllmCudaNaiveVerifyIndexer(indexQ, indexWeights, pastKey, indexHeads,
-                            indexDim, localPast, indexTopK, indexFp8, indices);
-                    else FastllmCudaNaiveIndexer(indexQ, indexWeights, pastKey, indexHeads, indexDim,
-                                                localPast, indexTopK, indexFp8, indices);
+                if (!batchIndexerPrepared) {
+                    Data rowIndexQ, rowIndexWeights;
+                    Data &indexQ = batchIndexPrepared ? rowIndexQ : buf.indexQ;
+                    Data &indexWeights = batchIndexPrepared ? rowIndexWeights : buf.indexWeights;
+                    if (batchIndexPrepared) {
+                        indexQ.Resize({1, 1, indexHeads * indexDim});
+                        indexQ.FakeFrom(batchIndexQ, (size_t)sequence * indexHeads * indexDim * batchIndexQ.unitSize);
+                        indexWeights.Resize({1, 1, indexHeads});
+                        indexWeights.FakeFrom(batchIndexWeights, (size_t)sequence * indexHeads * batchIndexWeights.unitSize);
+                    } else prepareIndexQuery(normed, positions, indexQ, indexWeights);
+                    if (decodeWorkspace) {
+                        if (graphVerify) FastllmCudaNaiveGraphVerifyIndexer(indexQ, indexWeights, pastKey,
+                            buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
+                        else FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights, pastKey,
+                            buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
+                    } else {
+                        if (capture && capture->verifying && length <= 8)
+                            FastllmCudaNaiveVerifyIndexer(indexQ, indexWeights, pastKey, indexHeads,
+                                indexDim, localPast, indexTopK, indexFp8, indices);
+                        else FastllmCudaNaiveIndexer(indexQ, indexWeights, pastKey, indexHeads, indexDim,
+                                                    localPast, indexTopK, indexFp8, indices);
+                    }
                 }
                 selected = &indices;
             }

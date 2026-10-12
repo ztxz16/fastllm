@@ -195,13 +195,10 @@ __global__ void Select(const Score *scores, Count liveCount, int *partials, int 
         offset += total;
     }
 }
-__global__ void Sort(const Candidates *in, const State *state, int *out, int workspaceStride = 0) {
-    in = (const Candidates *)((const char *)in + (size_t)blockIdx.x * workspaceStride);
-    state = (const State *)((const char *)state + (size_t)blockIdx.x * workspaceStride);
-    out += (size_t)blockIdx.x * kTopK;
+__device__ __forceinline__ void SortRow(const Candidates *in, const State *state, int *out) {
     if (state->uniform) {
         for (int i = threadIdx.x; i < kTopK; i += blockDim.x)
-            out[i] = i;
+            out[i] = i < state->selected ? i : -1;
         return;
     }
     constexpr int T = kThreads, Items = kCapacity / T;
@@ -226,5 +223,11 @@ __global__ void Sort(const Candidates *in, const State *state, int *out, int wor
         int j = threadIdx.x * Items + i;
         if (j < kTopK) out[j] = positions[i];
     }
+}
+__global__ void Sort(const Candidates *in, const State *state, int *out, int workspaceStride = 0) {
+    in = (const Candidates *)((const char *)in + (size_t)blockIdx.x * workspaceStride);
+    state = (const State *)((const char *)state + (size_t)blockIdx.x * workspaceStride);
+    out += (size_t)blockIdx.x * kTopK;
+    SortRow(in, state, out);
 }
 } // namespace naive_topk

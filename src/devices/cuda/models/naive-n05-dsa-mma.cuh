@@ -145,8 +145,8 @@ __global__ __launch_bounds__(kThreads) void Values(const float *prob, const BF16
 
 // Store the original E4M3 quantization result exactly in BF16, with its FP32
 // block scale kept separately. Do not round dequantized FP32 values to BF16.
-__global__ void QuantizeIndexer(const BF16 *input, BF16 *values, float *scales,
-                                int stride, int offset, bool roundScale = false) {
+__device__ __forceinline__ void QuantizeIndexerRow(const BF16 *input, BF16 *values, float *scales,
+        int stride, int offset, bool roundScale) {
     __shared__ float maximum[128];
     const int d = threadIdx.x, row = blockIdx.x;
     float x = (float)input[(size_t)row * stride + offset + d];
@@ -161,6 +161,11 @@ __global__ void QuantizeIndexer(const BF16 *input, BF16 *values, float *scales,
     float value = (float)__nv_fp8_e4m3(fmaxf(-448.0f, fminf(448.0f, x / scale)));
     values[(size_t)row * 128 + d] = __float2bfloat16(value);
     if (d == 0) scales[row] = scale;
+}
+
+__global__ void QuantizeIndexer(const BF16 *input, BF16 *values, float *scales,
+        int stride, int offset, bool roundScale = false) {
+    QuantizeIndexerRow(input, values, scales, stride, offset, roundScale);
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -187,19 +192,10 @@ __device__ __forceinline__ void LoadIndexerKeys(
 // One query: a warp scores eight BF16 keys against all sixteen E4M3 Q heads.
 // Keep FP32 MMA accumulation and ascending weighted-head order. Applying the
 // unchanged Q scales after MMA can change FP32 rounding relative to SIMT.
-template <typename ScoreOutput, typename Length = int, bool Verify = false>
-__global__ void IndexerDecodeScores(const BF16 *q, const BF16 *packedKeys,
+template <typename ScoreOutput>
+__device__ __forceinline__ void IndexerDecodeScoresRow(const BF16 *q, const BF16 *packedKeys,
         const float *qscale, const BF16 *weights, ScoreOutput scores,
-        int stride, Length liveKeys, int past) {
-    if constexpr (Verify) {
-        const int row = blockIdx.y;
-        q += (size_t)row * kHeads * kIndexerDim;
-        qscale += row * kHeads;
-        weights += row * kHeads;
-        liveKeys.length += row;
-        scores.scoreBits += (size_t)row * (past + 1);
-    }
-    int keys = liveKeys;
+        int stride, int keys, int past) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     __shared__ __align__(16) BF16 qs[kHeads][kIndexerDim + 8], ks[kKeys][kIndexerDim + 8];
     __shared__ float scale[kHeads], weight[kHeads];
@@ -246,6 +242,21 @@ __global__ void IndexerDecodeScores(const BF16 *q, const BF16 *packedKeys,
         }
     }
 #endif
+}
+
+template <typename ScoreOutput, typename Length = int, bool Verify = false>
+__global__ void IndexerDecodeScores(const BF16 *q, const BF16 *packedKeys,
+        const float *qscale, const BF16 *weights, ScoreOutput scores,
+        int stride, Length liveKeys, int past) {
+    if constexpr (Verify) {
+        const int row = blockIdx.y;
+        q += (size_t)row * kHeads * kIndexerDim;
+        qscale += row * kHeads;
+        weights += row * kHeads;
+        liveKeys.length += row;
+        scores.scoreBits += (size_t)row * (past + 1);
+    }
+    IndexerDecodeScoresRow(q, packedKeys, qscale, weights, scores, stride, int(liveKeys), past);
 }
 
 // 64 queries share each 64-key tile across all sixteen indexer heads.

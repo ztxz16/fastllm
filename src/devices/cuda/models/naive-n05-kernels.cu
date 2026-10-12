@@ -27,6 +27,7 @@
 // MMA bodies and runtime dispatch already guard the SM80-only instructions.
 #define FASTLLM_NAIVE_DSA_MMA
 #include "naive-n05-dsa-mma.cuh"
+#include "naive-n05-indexer-batch.cuh"
 #endif
 
 namespace {
@@ -2855,6 +2856,64 @@ void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
     }
     naive_topk::Sort<<<1, naive_topk::kThreads>>>(candidates, state, (int *)indices.cudaData);
     CheckLaunch();
+}
+
+bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
+        const fastllm::Data &weights, const fastllm::Data &liveKeys,
+        const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query) {
+#ifdef FASTLLM_NAIVE_DSA_MMA
+    using namespace fastllm;
+    namespace batch = naive_indexer_batch;
+    constexpr int heads = naive_dsa_mma::kHeads, dim = naive_dsa_mma::kIndexerDim;
+    if (rows.size() < 4 || !fp8Query || query.dataType != BFLOAT16 ||
+        weights.dataType != BFLOAT16 || liveKeys.dataType != INT32 ||
+        query.dims.empty() || query.dims.back() != heads * dim ||
+        weights.dims.empty() || weights.dims.back() != heads ||
+        !FastllmCudaFlashInferDataTypeSupported(BFLOAT16)) return false;
+    int maxCapacity = 0;
+    for (const auto &row : rows) {
+        if (!row.key || !row.scratch || !row.indices || row.key->dataType != BFLOAT16 ||
+            row.key->dims.size() != 3 || row.key->dims[2] < dim ||
+            row.capacity <= 0 || row.capacity > naive_topk::kMaxKeys ||
+            row.sequence < 0 || row.sequence >= liveKeys.Count(0) ||
+            (size_t)(row.sequence + 1) * heads * dim > query.Count(0) ||
+            (size_t)(row.sequence + 1) * heads > weights.Count(0)) return false;
+        maxCapacity = std::max(maxCapacity, row.capacity);
+    }
+    // A CTA scans each row. Keep cooperative selection when there are too few
+    // independent rows to amortize a long scan; tiny batches also retain it.
+    if (rows.size() < (size_t)((maxCapacity + naive_topk::kCapacity - 1) / naive_topk::kCapacity)) return false;
+    for (int first = 0; first < (int)rows.size(); first += batch::BatchLimit) {
+        const int count = std::min(batch::BatchLimit, (int)rows.size() - first);
+        batch::Batch descriptors{};
+        int capacity = 0;
+        for (int i = 0; i < count; ++i) {
+            const auto &row = rows[first + i];
+            auto &scratch = *row.scratch;
+            Output(scratch.indexQuery, BFLOAT16, {heads, dim});
+            Output(scratch.indexScale, FLOAT32, {heads});
+            Output(scratch.indexScores, INT32, {row.capacity});
+            Output(scratch.topk, INT32, {(int)(sizeof(naive_topk::Workspace) / sizeof(int))});
+            Output(*row.indices, INT32, {1, naive_topk::kTopK});
+            descriptors.rows[i] = {(const BF16 *)row.key->cudaData,
+                (const int *)liveKeys.cudaData + row.sequence, (BF16 *)scratch.indexQuery.cudaData,
+                (float *)scratch.indexScale.cudaData, (unsigned *)scratch.indexScores.cudaData,
+                (naive_topk::Workspace *)scratch.topk.cudaData, (int *)row.indices->cudaData,
+                row.sequence, row.key->dims[2]};
+            capacity = std::max(capacity, row.capacity);
+        }
+        batch::Quantize<<<dim3(heads, count), dim>>>((const BF16 *)query.cudaData, descriptors);
+        batch::Scores<<<dim3((capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, count),
+            naive_dsa_mma::kThreads>>>(
+            (const BF16 *)weights.cudaData, descriptors);
+        batch::Select<<<count, naive_topk::kThreads>>>(descriptors);
+        batch::Sort<<<count, naive_topk::kThreads>>>(descriptors);
+    }
+    CheckLaunch();
+    return true;
+#else
+    return false;
+#endif
 }
 
 namespace {

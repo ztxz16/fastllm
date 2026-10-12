@@ -184,6 +184,17 @@ void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
     const fastllm::Data &weights, const fastllm::Data &packedKeys,
     const fastllm::Data &liveKeys, int capacity, bool fp8Query,
     FastllmNaiveDecodeScratch &scratch, fastllm::Data &indices);
+struct FastllmNaiveIndexerRow {
+    const fastllm::Data *key;
+    FastllmNaiveDecodeScratch *scratch;
+    fastllm::Data *indices;
+    int sequence, capacity;
+};
+// Independent sequences share launches and reuse their existing scratch.
+// Returning false leaves the caller free to use the single-sequence path.
+bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
+    const fastllm::Data &weights, const fastllm::Data &liveKeys,
+    const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query);
 void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
     const fastllm::Data &key, const fastllm::Data &value,
     const fastllm::Data &indices, const fastllm::Data &sink,
