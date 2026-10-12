@@ -23,13 +23,18 @@ with tempfile.TemporaryDirectory() as tmp:
         lib.FastllmCudaGraphDestroy(g);return ex
     def ptrs(ts):return [t.data_ptr() for t in ts]
     with torch.cuda.stream(torch.cuda.ExternalStream(lib.GdnTestStream())):
-        for batch,hk,hv in [(1,16,48),(2,16,48),(4,16,48),(8,16,48),(16,16,48),(31,16,48),(4,1,1),(4,2,4)]:
+        for batch,hk,hv in [(1,16,48),(2,16,48),(4,16,48),(8,16,48),(16,16,48),(31,16,48),(32,16,48),(64,16,48),(128,16,48),(4,1,1),(4,2,4)]:
             torch.manual_seed(719+batch+hk);capacity=batch+7
             c=torch.randn(batch,(2*hk+hv)*128,device='cuda',dtype=torch.bfloat16)
             ba=torch.randn(batch,2*hv,device='cuda',dtype=torch.bfloat16)
             w=torch.full((128,),1/math.sqrt(128),device='cuda');l=torch.randn(hv,device='cuda')*.3;d=torch.randn(hv,device='cuda')*.1
             s=torch.randn(capacity,hv,128,128,device='cuda',dtype=torch.bfloat16)*.01;reference=s.clone()
             ids=torch.arange(batch,device='cuda',dtype=torch.int32);y=torch.empty(batch,hv,128,device='cuda',dtype=torch.bfloat16);refy=torch.empty_like(y)
+            if batch==32:
+                # An externally supplied BF16 view may only have 2-byte alignment.
+                storage=torch.empty(batch*hv*128+1,device='cuda',dtype=torch.bfloat16)
+                y=storage[1:].view(batch,hv,128)
+                assert y.data_ptr()%4==2
             scratch=torch.empty(2*hk*128+2*hv,device='cuda',dtype=torch.bfloat16)
             def call(variant=0):return slots(batch,hk,hv,capacity,variant,*ptrs([c,ba,w,l,d,s,ids,y]))
             assert call();s.copy_(reference);torch.cuda.synchronize();ex=capture(call)
@@ -52,7 +57,7 @@ with tempfile.TemporaryDirectory() as tmp:
             assert torch.equal(s,saved) and torch.all(y==17)
             records.append(dict(op='gdn_slots',batch=batch,hk=hk,hv=hv,steps=32,bitwise_equal=True))
             print(json.dumps(records[-1]),flush=True)
-        for batch,channels,bias in [(1,10240,0),(2,10240,1),(4,640,1),(31,384,0)]:
+        for batch,channels,bias in [(1,10240,0),(2,10240,1),(4,640,1),(31,384,0),(64,10240,0),(128,10240,1)]:
             capacity=batch+7;torch.manual_seed(138+batch)
             s=torch.randn(capacity,channels,4,device='cuda',dtype=torch.bfloat16);ref=s.clone()
             ids=torch.arange(batch,device='cuda',dtype=torch.int32)

@@ -304,7 +304,7 @@ inline bool Matmul(const void *input, const void *weight, void *output, int M, i
     // This bounds tuning cost, not model/architecture-specific dispatch.
     if (N <= 0 || K <= 0) return false;
     if (storage == CUDA_R_16BF) {
-        if (M < 8 || M > 32) return false;
+        if (M < 1 || M > 32) return false;
     } else if (storage == CUDA_R_16F) {
         // Large decode heads amortize tuning and saturate Hopper bandwidth.
         // Other shapes retain their native GEMV and exact-row reduction tree.
