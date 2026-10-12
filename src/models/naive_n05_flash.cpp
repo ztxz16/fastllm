@@ -287,6 +287,7 @@ std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputId
         "Naive batch forward requires ordinary TP inference and complete request descriptors.");
     TargetBatch requests{pastKeyValues, configs, seqLens, block_cnt};
     std::vector<float> packedPositions;
+    packedPositions.reserve(inputIds.Count(0));
     auto selection = SelectLogits(configs[0]);
     for (int b = 0; b < batch; ++b) {
         AssertInFastLLM(seqLens[b] > 0 && positionIds[b] &&
@@ -299,19 +300,25 @@ std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputId
         const int past = key.dims.empty() ? 0 : key.dims[1];
         AssertInFastLLM((int64_t)past + seqLens[b] <= max_positions,
             "Naive batch request exceeds the context window.");
-        Data positions(*positionIds[b]);
-        ToDataType(positions, FLOAT32);
-        positions.ToDevice(DataDevice::CPU);
-        AssertInFastLLM(positions.Count(0) == seqLens[b], "Naive batch position count mismatch.");
-        const float *values = (const float *)positions.cpuData;
-        packedPositions.insert(packedPositions.end(), values, values + seqLens[b]);
+        const Data &source = *positionIds[b];
+        AssertInFastLLM(source.Count(0) == seqLens[b], "Naive batch position count mismatch.");
+        if (source.dataDevice == DataDevice::CPU && source.dataType == FLOAT32) {
+            const float *values = (const float *)source.cpuData;
+            packedPositions.insert(packedPositions.end(), values, values + seqLens[b]);
+        } else {
+            Data positions(source);
+            ToDataType(positions, FLOAT32);
+            positions.ToDevice(DataDevice::CPU);
+            const float *values = (const float *)positions.cpuData;
+            packedPositions.insert(packedPositions.end(), values, values + seqLens[b]);
+        }
         auto other = SelectLogits(configs[b]);
         if (selection.count != other.count || selection.greedy != other.greedy ||
             selection.invTemperature != other.invTemperature) selection.count = 0;
     }
     AssertInFastLLM(inputIds.dims == std::vector<int>({1, (int)packedPositions.size()}) &&
         inputIds.dataType == FLOAT32, "Naive batch input must pack the unpadded sequences in order.");
-    Data positions(FLOAT32, inputIds.dims, packedPositions);
+    Data positions(FLOAT32, inputIds.dims, DataDevice::CPU, packedPositions.data());
     // The batch descriptor references response-owned KV. No KV payload or
     // ownership is copied into the legacy single-sequence argument.
     std::vector<std::pair<Data, Data>> unused;

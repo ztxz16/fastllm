@@ -572,6 +572,9 @@ class Fixture : public NaiveN05FlashModel {
             }
         }
         int checks = 0;
+        // Default direct-call descriptors use FLOAT32; serving creates BF16
+        // roots. Cover both the general metadata path and the replay fast path.
+        for (DataType rootType : {FLOAT32, BFLOAT16})
         for (auto prompts : {std::pair<int,int>{3, 11}, {126, 250}, {254, 510}, {2045, 2049}, {4090, 13}}) {
             std::vector<std::vector<int>> schedule(12, {0, 1});
             schedule[4] = {1, 0}; schedule[5] = {1, 0};
@@ -595,7 +598,9 @@ class Fixture : public NaiveN05FlashModel {
             for (int b=0;b<2;++b) {
                 cfg[b].input_token_length=prompt[b]; cfg[b].output_token_limit=64;
                 cfg[b].output_logits=true; cfg[b].top_k=1;
-                reference[b].resize(2);candidate[b].resize(2);
+                reference[b].resize(2);
+                for (int layer = 0; layer < 2; ++layer)
+                    candidate[b].emplace_back(Data(rootType), Data(rootType));
                 SetCudaGraph(false);
                 forward(reference[b],b,0,prompt[b]);
                 forward(candidate[b],b,0,prompt[b]);

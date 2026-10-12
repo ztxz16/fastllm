@@ -185,7 +185,8 @@ namespace fastllm {
         bool HasVerificationGraph() const;
         bool PrepareTensorParallelDecode(const Data &inputIds,
                                         std::vector<std::pair<Data, Data>> &kv, bool verifying,
-                                        const LogitsSelection &selection, const TargetBatch *batch = nullptr,
+                                        const LogitsSelection &selection, std::vector<int *> &cacheLengths,
+                                        const TargetBatch *batch = nullptr,
                                         bool collectHidden = false);
         Data ForwardTensorParallelDecode(int rank, const Data &inputIds, const Data &positions,
                                         std::vector<std::pair<Data, Data>> &kv,

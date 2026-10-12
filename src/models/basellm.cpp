@@ -2839,12 +2839,20 @@ namespace fastllm {
                     auto lastRecordTime = std::chrono::system_clock::now();
                     long long genTokens = 0;
                     const bool printProfile = GetFastllmEnv().printProfile;
+                    // Naive uses the base one-token position convention. Keep
+                    // scalar views alive across steps; prefill and other models
+                    // still go through their virtual input builder.
+                    const bool fastDecodeInput = model->model_struct == "naive_n05_flash";
+                    std::vector<float> decodePositions(fastDecodeInput ? maxBatch : 0);
+                    std::vector<Data> decodePositionIds;
+                    if (fastDecodeInput) decodePositionIds.reserve(maxBatch);
                     while (true) {
                         if (model->isFree) {
                             break;
                         }
                         std::vector <Data*> attentionMasks;
                         std::vector <Data*> positionIds;
+                        std::vector <Data*> ownedPositionIds;
                         std::vector <std::pair <Data*, Data*> > pastKeyValues;
                         std::vector <float> ids;
                         std::vector <int> seqLens;
@@ -2852,7 +2860,16 @@ namespace fastllm {
                         std::vector <int> handles;
                         std::vector <GenerationConfig> generationConfigs;
                         LastTokensManager tokensManager;
+                        tokensManager.units.reserve(maxBatch);
                         std::vector <std::vector <float>* > logits;
+                        attentionMasks.reserve(maxBatch);
+                        positionIds.reserve(maxBatch);
+                        pastKeyValues.reserve((size_t)maxBatch * model->block_cnt);
+                        ids.reserve(maxBatch);
+                        seqLens.reserve(maxBatch);
+                        handles.reserve(maxBatch);
+                        generationConfigs.reserve(maxBatch);
+                        logits.reserve(maxBatch);
 
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
                         auto &forwardLocker = model->forwardLocker;
@@ -2934,6 +2951,18 @@ namespace fastllm {
                                     // TODO: multicuda支持多prompt一起推理
                                     continue;
                                 }
+                                // Filter phases before counting active caches, so
+                                // steady decode does not repeat a prefill scan.
+                                if (it.second->isEnding) {
+                                    continue;
+                                }
+                                if (isPrompt && it.second->preTokens != 0) {
+                                    continue;
+                                }
+                                if (!isPrompt && it.second->preTokens == 0) {
+                                    continue;
+                                }
+
                                 if (isPrompt) {
                                     int alive = 0;
                                     for (auto &it: model->responseContextDict.dicts) {
@@ -2947,16 +2976,6 @@ namespace fastllm {
                                     if (alive >= maxBatch) {
                                         continue;
                                     }
-                                }
-
-                                if (it.second->isEnding) {
-                                    continue;
-                                }
-                                if (isPrompt && it.second->preTokens != 0) {
-                                    continue;
-                                }
-                                if (!isPrompt && it.second->preTokens == 0) {
-                                    continue;
                                 }
 
                                 if (it.second->cacheLen + it.second->currentTokens.size() > maxTotalLens ||
@@ -3035,7 +3054,14 @@ namespace fastllm {
                                 model->PrepareToolCallConstraint(it.second, generationConfigs.back());
                                 logits.push_back(CreatePendingResultLogits(it.second->generationConfig));
 
-                                tokensManager.units.push_back(it.second->tokens);
+                                // Keep one slot per request, but plain greedy decoding
+                                // does not consume repetition history. Avoid copying
+                                // its multiset/queue (including vector-growth copies).
+                                const auto &sampling = generationConfigs.back();
+                                if (sampling.IsSimpleGreedy() && !sampling.output_logits)
+                                    tokensManager.units.emplace_back(sampling.last_n);
+                                else
+                                    tokensManager.units.push_back(it.second->tokens);
                                 handles.push_back(it.first);
 
                                 if (it.second->preTokens == 0) {
@@ -3045,34 +3071,49 @@ namespace fastllm {
                                 } else {
                                     it.second->intParams["index"]++;
                                 }
-                                Data inputIds, attentionMask, curPositionIds;
-                                std::vector<std::vector<float> > tokens;
-                                tokens.resize(1);
-                                for (int i: it.second->currentTokens) {
-                                    tokens[0].push_back(i);
-                                }
-                                model->FillLLMInputs(tokens, it.second->intParams, inputIds, attentionMask, curPositionIds);
-                                ToDataType(attentionMask, model->dataType);
-
-                                seqLens.push_back(inputIds.Count(0));
-                                if (isPrompt) {
-                                    prefillTokens += seqLens.back();
-                                }
-                                for (int i = 0; i < inputIds.Count(0); i++) {
-                                    ids.push_back(((float *) inputIds.cpuData)[i]);
-                                }
-                                if (attentionMask.dims.size() == 0) {
+                                if (fastDecodeInput && !isPrompt && it.second->multimodalInput.empty() &&
+                                    it.second->currentTokens.size() == 1) {
+                                    const size_t row = seqLens.size();
+                                    decodePositions[row] = (float)it.second->intParams["promptLen"] +
+                                        it.second->intParams["index"] - 1;
+                                    if (decodePositionIds.size() <= row)
+                                        decodePositionIds.emplace_back(FLOAT32, std::vector<int>{1, 1},
+                                            DataDevice::CPU, &decodePositions[row]);
+                                    ids.push_back((float)it.second->currentTokens[0]);
+                                    seqLens.push_back(1);
                                     attentionMasks.push_back(nullptr);
+                                    positionIds.push_back(&decodePositionIds[row]);
                                 } else {
-                                    attentionMasks.push_back(new Data());
-                                    attentionMask.ToDevice(DataDevice::CPU);
-                                    attentionMasks.back()->CopyFrom(attentionMask);
-                                }
-                                if (curPositionIds.dims.size() == 0) {
-                                    positionIds.push_back(nullptr);
-                                } else {
-                                    positionIds.push_back(new Data());
-                                    positionIds.back()->CopyFrom(curPositionIds);
+                                    Data inputIds, attentionMask, curPositionIds;
+                                    std::vector<std::vector<float> > tokens;
+                                    tokens.resize(1);
+                                    for (int i: it.second->currentTokens) {
+                                        tokens[0].push_back(i);
+                                    }
+                                    model->FillLLMInputs(tokens, it.second->intParams, inputIds, attentionMask, curPositionIds);
+                                    ToDataType(attentionMask, model->dataType);
+
+                                    seqLens.push_back(inputIds.Count(0));
+                                    if (isPrompt) {
+                                        prefillTokens += seqLens.back();
+                                    }
+                                    for (int i = 0; i < inputIds.Count(0); i++) {
+                                        ids.push_back(((float *) inputIds.cpuData)[i]);
+                                    }
+                                    if (attentionMask.dims.size() == 0) {
+                                        attentionMasks.push_back(nullptr);
+                                    } else {
+                                        attentionMasks.push_back(new Data());
+                                        attentionMask.ToDevice(DataDevice::CPU);
+                                        attentionMasks.back()->CopyFrom(attentionMask);
+                                    }
+                                    if (curPositionIds.dims.size() == 0) {
+                                        positionIds.push_back(nullptr);
+                                    } else {
+                                        positionIds.push_back(new Data());
+                                        ownedPositionIds.push_back(positionIds.back());
+                                        positionIds.back()->CopyFrom(curPositionIds);
+                                    }
                                 }
                                 it.second->preTokens += seqLens.back();
                                 for (int i = 0; i < model->block_cnt; i++) {
@@ -3314,9 +3355,7 @@ namespace fastllm {
                         for (int i = 0; i < attentionMasks.size(); i++) {
                             delete attentionMasks[i];
                         }
-                        for (int i = 0; i < positionIds.size(); i++) {
-                            delete positionIds[i];
-                        }
+                        for (Data *position : ownedPositionIds) delete position;
 
                         if (seqLens.size() == 0) {
                             model->dictCV.wait(dictLocker);

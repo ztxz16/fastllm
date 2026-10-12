@@ -1071,6 +1071,11 @@ if (UNIT_TEST)
     fastllm_add_checked_test(legacy_paged_scheduler legacy_paged_scheduler_test "ALL_PASS" 60)
     set_tests_properties(legacy_paged_scheduler PROPERTIES RUN_SERIAL TRUE)
 
+    add_executable(legacy_scheduler_history_test test/basic/test_legacy_scheduler_history.cpp)
+    target_link_libraries(legacy_scheduler_history_test PRIVATE fastllm)
+    fastllm_add_checked_test(legacy_scheduler_history legacy_scheduler_history_test "ALL_PASS" 60)
+    set_tests_properties(legacy_scheduler_history PROPERTIES RUN_SERIAL TRUE)
+
     add_executable(speculative_sampling_test test/basic/test_speculative_sampling.cpp)
     target_link_libraries(speculative_sampling_test PRIVATE fastllm)
     add_test(NAME speculative_sampling COMMAND speculative_sampling_test)
