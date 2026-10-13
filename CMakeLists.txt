@@ -467,6 +467,16 @@ if (USE_CUDA)
         message(STATUS "Hopper SM90 DeepGEMM FP8 linear: ON")
     endif()
 
+    # Native WGMMA QKV/RoPE fusion has no CUTLASS or compiler-service dependency.
+    if (NOT CUDA_NO_TENSOR_CORE AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
+        (FASTLLM_DEEPGEMM_FP8_SM90_ENABLED OR
+         ("native" IN_LIST FASTLLM_CUDA_ARCHITECTURES AND
+          CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES "(^|;)90(-real|-virtual)?(;|$)")))
+        list(APPEND FASTLLM_CUDA_SM90_SOURCES src/devices/cuda/models/naive-n05-qkv.cu)
+        set_property(SOURCE src/devices/cuda/models/naive-n05-kernels.cu
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_QKV_SM90)
+    endif()
+
     # EP8 uses an isolated, pinned DeepGEMM source subset. Compile the kernel
     # directly into FastLLM; no Python package or external adapter is needed.
     if (UNIX AND NOT APPLE AND NOT USE_ROCM AND NOT CUDA_NO_TENSOR_CORE AND
@@ -1472,6 +1482,12 @@ if (UNIT_TEST)
         target_include_directories(naive_n05_rope_cache_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME naive_n05_rope_cache COMMAND naive_n05_rope_cache_test)
         set_tests_properties(naive_n05_rope_cache PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        if ("src/devices/cuda/models/naive-n05-qkv.cu" IN_LIST FASTLLM_CUDA_SM90_SOURCES)
+            add_executable(naive_n05_qkv_test test/basic/test_cuda_naive_qkv.cu)
+            target_link_libraries(naive_n05_qkv_test PRIVATE fastllm)
+            add_test(NAME naive_n05_qkv COMMAND naive_n05_qkv_test)
+            set_tests_properties(naive_n05_qkv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        endif()
         add_executable(naive_n05_logits_test test/basic/test_naive_n05_logits.cpp)
         target_link_libraries(naive_n05_logits_test PRIVATE fastllm)
         target_include_directories(naive_n05_logits_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

@@ -5,6 +5,9 @@
 #include "devices/cuda/naive-n05-kv.cuh"
 #include "naive-n05-dsa-decode.cuh"
 #include "naive-n05-attention-hopper.cuh"
+#ifdef FASTLLM_ENABLE_NAIVE_QKV_SM90
+#include "naive-n05-qkv.cuh"
+#endif
 #include <cuda_bf16.h>
 #include <nccl.h>
 #include <cuda_fp8.h>
@@ -2223,19 +2226,20 @@ bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     return true;
 }
 
-bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
+static bool PrepareBatchRopeCache(fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, const fastllm::Data &positions,
         const std::vector<FastllmNaiveRopeCacheRow> &rows, const fastllm::Data &liveKeys,
         int heads, int kvHeads, int dim, int valueDim, int rotaryDim, float theta,
-        float valueScale, int window, const fastllm::Data *packedQkv, bool ring) {
+        float valueScale, int window, const fastllm::Data *packedQkv, bool ring,
+        std::vector<RopeCacheRow> &descriptors, int &indexDim) {
     using namespace fastllm;
     const int count = rows.size();
     if (!count || q.dims.size() != 3 || q.dims[1] != count || k.dims.size() != 3 ||
         k.dims[1] != count || v.dims.size() != 3 || v.dims[1] != count ||
         positions.Count(0) < (uint64_t)count || liveKeys.Count(0) < (uint64_t)count ||
         (packedQkv && (packedQkv->dims.size() != 3 || packedQkv->dims[1] != count))) return false;
-    std::vector<RopeCacheRow> descriptors(count);
-    int indexDim = 0;
+    descriptors.resize(count);
+    indexDim = 0;
     for (int b = 0; b < count; ++b) {
         if (!rows[b].key || !rows[b].value) return false;
         auto view = [b](Data &dst, const Data &src) {
@@ -2258,6 +2262,20 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
         indexDim = width;
         descriptors[b].cache = rows[b].cache;
     }
+    return true;
+}
+
+bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &positions,
+        const std::vector<FastllmNaiveRopeCacheRow> &rows, const fastllm::Data &liveKeys,
+        int heads, int kvHeads, int dim, int valueDim, int rotaryDim, float theta,
+        float valueScale, int window, const fastllm::Data *packedQkv, bool ring) {
+    const int count = rows.size();
+    std::vector<RopeCacheRow> descriptors;
+    int indexDim = 0;
+    if (!PrepareBatchRopeCache(q, k, v, positions, rows, liveKeys, heads, kvHeads,
+            dim, valueDim, rotaryDim, theta, valueScale, window, packedQkv, ring,
+            descriptors, indexDim)) return false;
     // Validate every cache before launching, so a fallback cannot double-rotate Q.
     for (int first = 0; first < count; first += kRopeCacheBatch) {
         const int batchSize = std::min(kRopeCacheBatch, count - first);
@@ -2270,6 +2288,68 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
     }
     CheckLaunch();
     return true;
+}
+
+bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
+        const fastllm::Data &weight, const fastllm::Data &bias,
+        fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+        const fastllm::Data &positions, const std::vector<FastllmNaiveRopeCacheRow> &rows,
+        const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
+        int rotaryDim, float theta, float valueScale, int window, bool ring,
+        fastllm::Data &scratch) {
+#ifdef FASTLLM_ENABLE_NAIVE_QKV_SM90
+    using namespace fastllm;
+    const int count = rows.size();
+    if (count < 1 || count > 256 || heads != 8 || kvHeads != 1 || dim != 192 ||
+        valueDim != 128 || rotaryDim != 64 || !bias.dims.empty() ||
+        (window && (!ring || window != 128)) || FastllmCudaRuntimeArch() != 90) return false;
+    auto matrix = [&](const Data &x, const std::vector<int> &shape) {
+        if (x.dataType != BFLOAT16 || x.dataDevice != DataDevice::CUDA ||
+            x.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
+            !x.cudaData || (reinterpret_cast<uintptr_t>(x.cudaData) & 15) ||
+            x.dims != shape || x.strides.size() != shape.size()) return false;
+        size_t stride = 1;
+        for (int i = (int)shape.size() - 1; i >= 0; --i) {
+            if (x.strides[i] != stride) return false;
+            stride *= shape[i];
+        }
+        return true;
+    };
+    if (!matrix(input, {1, count, 4096}) || !matrix(weight, {1856, 4096})) return false;
+    std::vector<RopeCacheRow> descriptors;
+    int indexDim = 0;
+    if (!PrepareBatchRopeCache(q, k, v, positions, rows, liveKeys, heads, kvHeads,
+            dim, valueDim, rotaryDim, theta, valueScale, window, nullptr, ring,
+            descriptors, indexDim) || (indexDim && indexDim != 128)) return false;
+    const auto &first = descriptors.front();
+    if (!first.cache) return false;
+    for (int b = 0; b < count; ++b) {
+        const auto &r = descriptors[b];
+        if (r.cache != first.cache + b * 4 || r.keyRows != first.keyRows ||
+            r.valueRows != first.valueRows || r.pageLen != first.pageLen ||
+            (indexDim && r.indexKey != first.indexKey + b * 128)) return false;
+    }
+    if (!naive_qkv::Prepare()) return false;
+    if (count > 1) {
+        // Reuse the O-projection buffer after Indexer consumes its temporary.
+        // Reserve the monotonic envelope: capturing a smaller batch later must
+        // never relocate a shared graph allocation at split-K boundaries.
+        int units = count <= 16 ? count * 8 : std::max(256, count * 2);
+        scratch.dataType = BFLOAT16;
+        scratch.Resize({1, units, 1856 * 2}); // FP32 partials in BF16-sized storage.
+        scratch.ToDevice(input.dataDevice, input.dataDeviceIds, false);
+        scratch.Allocate(false);
+    }
+    naive_qkv::Params params{(BF16 *)q.cudaData, first.indexKey,
+        (const float *)positions.cudaData, (const int *)liveKeys.cudaData, first.cache,
+        theta, __float2bfloat16_rn(valueScale), first.pageLen, first.keyRows, first.valueRows, ring};
+    naive_qkv::Launch((const BF16 *)input.cudaData, (const BF16 *)weight.cudaData,
+        params, count, count > 1 ? (float *)scratch.cudaData : nullptr);
+    CheckLaunch();
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool FastllmCudaNaiveIndexerKeyNorm(fastllm::Data &input,

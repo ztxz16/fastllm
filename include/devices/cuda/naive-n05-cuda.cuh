@@ -105,6 +105,15 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
     const std::vector<FastllmNaiveRopeCacheRow> &rows, const fastllm::Data &liveKeys,
     int heads, int kvHeads, int dim, int valueDim, int rotaryDim, float theta,
     float valueScale, int window, const fastllm::Data *packedQkv = nullptr, bool ring = false);
+// Hopper TP8 BF16 projection + RoPE + cache append. Unsupported layouts return
+// false without touching outputs, allowing Linear + BatchRopeAppendCache fallback.
+bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
+    const fastllm::Data &weight, const fastllm::Data &bias,
+    fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+    const fastllm::Data &positions, const std::vector<FastllmNaiveRopeCacheRow> &rows,
+    const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
+    int rotaryDim, float theta, float valueScale, int window, bool ring,
+    fastllm::Data &scratch);
 // Convert the retained suffix between chronological and 128-slot ring layout.
 // Uses shared memory only, preserves allocations and host dimensions.
 void FastllmCudaNaiveSwaCacheLayout(fastllm::Data &key, fastllm::Data &value,

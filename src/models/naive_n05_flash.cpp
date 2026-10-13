@@ -594,16 +594,20 @@ Data NaiveN05FlashModel::RunTarget(
             norm(hidden, localWeight(prefix + ".input_layernorm.weight"), normed);
         const auto merged = weight.weight.find(ap + "mergeqkv.weight");
         const bool mergedQkv = merged != weight.weight.end() && !merged->second.dims.empty();
+        const bool batchRope = batch && (batch->Size() > 1 || buf.cacheTable) &&
+            batch->Decode() && decodeWorkspace && !graphVerify &&
+            (!capture || (!capture->verifying && capture->batchHistory.empty()));
         if (mergedQkv) {
-            Linear(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
+            if (!batchRope)
+                Linear(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
             // Q/K and V have different head widths. Read packed projection rows
             // directly in the RoPE/cache kernel instead of launching three Splits.
             for (auto item : {std::make_pair(&q, cfg.heads * cfg.headDim),
                               std::make_pair(&k, cfg.kvHeads * cfg.headDim),
                               std::make_pair(&v, cfg.kvHeads * cfg.valueDim)}) {
-                item.first->dataType = qkv.dataType;
+                item.first->dataType = normed.dataType;
                 item.first->Resize({1, length, item.second});
-                item.first->ToDevice(qkv.dataDevice, qkv.dataDeviceIds, false);
+                item.first->ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
                 item.first->Allocate(false);
             }
         } else {
@@ -657,8 +661,7 @@ Data NaiveN05FlashModel::RunTarget(
             while ((int)buf.sequences.size() < batch->Size())
                 buf.sequences.emplace_back(new TargetWorkspace());
         }
-        if (batch && (batch->Size() > 1 || buf.cacheTable) && batch->Decode() && decodeWorkspace &&
-            !graphVerify && (!capture || (!capture->verifying && capture->batchHistory.empty()))) {
+        if (batchRope) {
             std::vector<FastllmNaiveRopeCacheRow> caches;
             caches.reserve(batch->Size());
             // Project/normalize the complete batch, then borrow individual K rows.
@@ -690,10 +693,22 @@ Data NaiveN05FlashModel::RunTarget(
                     slidingLayers[layer] ? nullptr : &indexKeys[sequence],
                     layerCache ? layerCache + sequence * 4 : nullptr});
             }
-            batchRopePrepared = FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions,
-                caches, buf.liveKeys, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
-                rotaryDim, cfg.theta, valueScale, slidingLayers[layer] ? window : 0,
-                mergedQkv ? &qkv : nullptr, slidingLayers[layer] && tpSwaRingCache);
+#ifndef USE_ROCM
+            if (mergedQkv)
+                batchRopePrepared = FastllmCudaNaiveBatchQkvRopeAppendCache(normed,
+                    localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"),
+                    q, k, v, positions, caches, buf.liveKeys, cfg.heads, cfg.kvHeads,
+                    cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale,
+                    slidingLayers[layer] ? window : 0, slidingLayers[layer] && tpSwaRingCache, projected);
+#endif
+            if (!batchRopePrepared) {
+                if (mergedQkv)
+                    Linear(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
+                batchRopePrepared = FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions,
+                    caches, buf.liveKeys, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                    rotaryDim, cfg.theta, valueScale, slidingLayers[layer] ? window : 0,
+                    mergedQkv ? &qkv : nullptr, slidingLayers[layer] && tpSwaRingCache);
+            }
         }
         auto prepareIndexQuery = [&](Data &normed, Data &positions, Data &indexQ, Data &indexWeights) {
             const std::string ip = ap + "indexer.";
@@ -881,7 +896,7 @@ Data NaiveN05FlashModel::RunTarget(
                 view(rowQ, q, cfg.heads * cfg.headDim);
                 view(rowK, k, cfg.kvHeads * cfg.headDim);
                 view(rowV, v, cfg.kvHeads * cfg.valueDim);
-                if (mergedQkv) view(rowQkv, qkv, qkv.dims.back());
+                if (mergedQkv && !batchRopePrepared) view(rowQkv, qkv, qkv.dims.back());
                 view(rowAttention, attn, cfg.heads * cfg.valueDim);
                 rowPositions.Resize({1, count});
                 rowPositions.FakeFrom(positions, (size_t)offset * sizeof(float));
