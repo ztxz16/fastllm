@@ -1085,6 +1085,12 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
     } else {
         if (state.mode == TPDecodeState::Warm) r.communicationPointers.clear();
         FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+#ifndef USE_ROCM
+        // These variants already share activation/KV metadata buffers and are
+        // replayed serially by the same rank worker. Keep one Lt workspace for
+        // the whole family instead of exhausting one lease per captured shape.
+        FastllmCudaLinearGraphScope linearScope(storage.linearGraphWorkspace);
+#endif
         RunTarget(buf.inputIds, buf.positions, kv, config,
                   state.verifying || state.collectHidden ? &r.features : nullptr, rank, embedding, &buf, batch);
         if (FastllmCudaMergeMOEUsedGraphUnsafeFallback()) r.ok = false;

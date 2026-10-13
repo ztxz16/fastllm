@@ -85,6 +85,18 @@ std::vector <long long> FastllmCudaGetFreeSizes();
 long long FastllmCudaGetFreeSize();
 std::vector <long long> FastllmCudaGetTotalSizes();
 
+// One owner per serial graph family and GPU. The caller must serialize replay
+// of graphs sharing this workspace; unrelated graph families remain isolated.
+class FastllmCudaLinearGraphScope {
+public:
+    explicit FastllmCudaLinearGraphScope(std::shared_ptr<void> &workspace);
+    ~FastllmCudaLinearGraphScope();
+    FastllmCudaLinearGraphScope(const FastllmCudaLinearGraphScope &) = delete;
+    FastllmCudaLinearGraphScope &operator=(const FastllmCudaLinearGraphScope &) = delete;
+private:
+    std::shared_ptr<void> previous;
+};
+
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 #define FETCH_FLOAT2(pointer) (reinterpret_cast<float2*>(&(pointer))[0])
 

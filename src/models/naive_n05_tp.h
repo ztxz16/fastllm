@@ -25,6 +25,7 @@ struct NaiveN05FlashModel::TPDecodeState {
         // All pre-captured shapes share these allocations. Inputs and the KV
         // table keep their maximum-batch strides even for smaller graphs.
         Data inputStorage, cacheTable, cacheMaps, indexScores;
+        std::shared_ptr<void> linearGraphWorkspace;
         std::vector<unsigned char> hostInput;
         std::vector<void *> hostCache;
         std::vector<unsigned char> hostMaps;

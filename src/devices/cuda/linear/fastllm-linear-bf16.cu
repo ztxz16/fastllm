@@ -10,6 +10,18 @@
 #include <cuda_bf16.h>
 #endif
 
+FastllmCudaLinearGraphScope::FastllmCudaLinearGraphScope(std::shared_ptr<void> &workspace) {
+    if (!workspace) workspace = fastllm_bf16_lt::CreateSerialGraphWorkspace();
+    auto &current = fastllm_bf16_lt::SerialGraphWorkspace();
+    previous = std::move(current);
+    current = std::static_pointer_cast<fastllm_bf16_lt::Workspace>(workspace);
+}
+
+FastllmCudaLinearGraphScope::~FastllmCudaLinearGraphScope() {
+    fastllm_bf16_lt::SerialGraphWorkspace() =
+        std::static_pointer_cast<fastllm_bf16_lt::Workspace>(std::move(previous));
+}
+
 typedef union __align__(16) _union_bf16_4 {
     uint2 in;
     __nv_bfloat16 out[4];
@@ -996,7 +1008,10 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
         // BF16 results may differ in rounding from the GEMV reduction tree.
         // Narrow projections are faster with GEMV. Preserve its fused bias
         // rounding and the unwarmed/unsupported fallbacks as well.
-        const bool useLt = n > 0 && m >= 1024 && k >= 1024 && bias.dims.empty() &&
+        // A single 4096-wide row with at most 2048 outputs is faster with the
+        // native GEMV; Lt's split-K launch/reduction overhead dominates here.
+        const bool useLt = n > 0 && m >= 1024 && k >= 1024 &&
+            !(n == 1 && m == 4096 && k <= 2048) && bias.dims.empty() &&
             FastllmCudaRuntimeArch() == 90;
         if (!useLt || !fastllm_bf16_lt::Matmul(cudaInput, weightPtr, cudaOutput, n, m, k)) {
             LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, cudaBiasData, n, m, k);

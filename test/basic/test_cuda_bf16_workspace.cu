@@ -306,6 +306,71 @@ int main() {
         if (error)
             std::rethrow_exception(error);
         waitBusy(0);
+        // Startup may warm every shape, then capture more graphs than the pool
+        // has slots without any intervening eager GEMM. Serial graph families
+        // share one lease each; different families still replay concurrently.
+        struct Variant {
+            cudaGraph_t graph;
+            cudaGraphExec_t exec;
+            unsigned long long id;
+        };
+        std::vector<Variant> families[2];
+        std::thread serialOwner([&]() {
+            try {
+                cu(cudaSetDevice(0));
+                for (int family = 0; family < 2; ++family) {
+                    p[family].warm();
+                    auto workspace = lt::CreateSerialGraphWorkspace();
+                    need(bool(workspace), "serial workspace unavailable");
+                    lt::SerialGraphWorkspace() = workspace;
+                    for (int shape = 0; shape < 24; ++shape) {
+                        p[family].capture();
+                        families[family].push_back(
+                            {p[family].graph, p[family].exec, p[family].captureId});
+                        p[family].graph = nullptr;
+                        p[family].exec = nullptr;
+                    }
+                    lt::SerialGraphWorkspace().reset();
+                }
+            } catch (...) {
+                lt::SerialGraphWorkspace().reset();
+                error = std::current_exception();
+            }
+        });
+        serialOwner.join();
+        if (error) std::rethrow_exception(error);
+        waitBusy(2); // Graphs keep both leases after the worker and owners exit.
+        std::set<void *> familyScratch[2];
+        for (int family = 0; family < 2; ++family) {
+            for (const auto &v : families[family]) {
+                need(observed.at(v.id).size() == 1, "serial capture changed scratch");
+                familyScratch[family].insert(*observed.at(v.id).begin());
+            }
+            need(familyScratch[family].size() == 1, "serial family duplicated workspace");
+        }
+        need(familyScratch[0] != familyScratch[1], "concurrent families share workspace");
+        for (int iteration = 0; iteration < 8; ++iteration)
+            for (int shape = 0; shape < 24; ++shape)
+                for (int family = 0; family < 2; ++family)
+                    cu(cudaGraphLaunch(families[family][shape].exec, streams[family]));
+        for (auto s : streams) cu(cudaStreamSynchronize(s));
+        p[0].check();
+        p[1].check();
+        clone = nullptr;
+        copied = nullptr;
+        cu(cudaGraphClone(&clone, families[0].back().graph));
+        cu(cudaGraphInstantiate(&copied, clone, nullptr, nullptr, 0));
+        for (auto &family : families) for (auto &v : family) {
+            cu(cudaGraphExecDestroy(v.exec));
+            cu(cudaGraphDestroy(v.graph));
+        }
+        waitBusy(1);
+        cu(cudaGraphLaunch(copied, streams[0]));
+        cu(cudaGraphExecDestroy(copied));
+        cu(cudaGraphDestroy(clone));
+        cu(cudaStreamSynchronize(streams[0]));
+        p[0].check();
+        waitBusy(0);
         // All leases, including graph-held leases, count towards one bounded pool;
         // exhaustion is temporary and immediately recovers after a return.
         std::vector<lt::Workspace *> leases;
@@ -324,7 +389,8 @@ int main() {
         for (auto s : streams)
             cu(cudaStreamDestroy(s));
         puts("PASS independent captures, cross-thread replay/eager, graph lifetime, 24 worker "
-             "recreations, capture/tuning failures, bounded reusable leases");
+             "recreations, capture/tuning failures, 48 serial variants in concurrent "
+             "families, bounded reusable leases");
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "FAIL %s\n", e.what());

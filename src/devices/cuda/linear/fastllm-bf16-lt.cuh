@@ -110,6 +110,17 @@ inline void CUDART_CB ReturnGraphWorkspace(void *ptr) {
     ReturnWorkspace(static_cast<Workspace *>(ptr));
 }
 
+// Opt-in sharing for graphs whose owner already serializes their replay.
+// Unrelated graphs retain independent leases, including across worker teardown.
+inline std::shared_ptr<Workspace> &SerialGraphWorkspace() {
+    static thread_local std::shared_ptr<Workspace> workspace;
+    return workspace;
+}
+
+inline void CUDART_CB ReleaseSharedGraphWorkspace(void *ptr) {
+    delete static_cast<std::shared_ptr<Workspace> *>(ptr);
+}
+
 inline Workspace *AcquireWorkspace(int device) {
     Workspace *workspace = nullptr;
     auto &pool = Pool();
@@ -199,10 +210,28 @@ inline State *GetState(int device, bool capture) {
 #if CUDART_VERSION >= 11030
         // Allocate before capture, never within it. One reserve is enough for
         // the next capture; another eager call can prepare the following one.
-        if (!state.spare) state.spare = AcquireWorkspace(device);
+        if (!SerialGraphWorkspace() && !state.spare) state.spare = AcquireWorkspace(device);
 #endif
     }
     return &state;
+}
+
+inline std::shared_ptr<Workspace> CreateSerialGraphWorkspace() {
+#if CUDART_VERSION >= 11030
+    cudaStreamCaptureStatus capture;
+    CheckCuda(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
+    if (capture != cudaStreamCaptureStatusNone) return {};
+    int device = 0;
+    CheckCuda(cudaGetDevice(&device));
+    State *state = GetState(device, false);
+    if (!state) return {};
+    Workspace *workspace = state->spare ? state->spare : AcquireWorkspace(device);
+    if (!workspace) return {};
+    state->spare = nullptr;
+    return std::shared_ptr<Workspace>(workspace, ReturnWorkspace);
+#else
+    return {}; // Graph resource ownership is unavailable on older runtimes.
+#endif
 }
 
 inline void *CaptureWorkspace(State &state) {
@@ -219,14 +248,22 @@ inline void *CaptureWorkspace(State &state) {
     if (status != cudaStreamCaptureStatusActive || !graph)
         throw std::runtime_error("BF16 cuBLASLt capture is not active");
     if (id != state.captureId) {
-        if (!state.spare) return nullptr;
-        Workspace *workspace = state.spare;
-        state.spare = nullptr;
+        const auto &shared = SerialGraphWorkspace();
+        Workspace *workspace = shared ? shared.get() : state.spare;
+        if (!workspace || workspace->device != state.device) return nullptr;
+        void *reference = workspace;
+        cudaHostFn_t release = ReturnGraphWorkspace;
+        if (shared) {
+            // Every graph (and its clones/executables) retains the shared lease.
+            // The model or capture worker may disappear before replay completes.
+            reference = new std::shared_ptr<Workspace>(shared);
+            release = ReleaseSharedGraphWorkspace;
+        } else state.spare = nullptr;
         cudaUserObject_t owner = nullptr;
-        cudaError_t result = cudaUserObjectCreate(&owner, workspace,
-            ReturnGraphWorkspace, 1, cudaUserObjectNoDestructorSync);
+        cudaError_t result = cudaUserObjectCreate(&owner, reference,
+            release, 1, cudaUserObjectNoDestructorSync);
         if (result != cudaSuccess) {
-            ReturnWorkspace(workspace);
+            release(reference);
             CheckCuda(result);
         }
         result = cudaGraphRetainUserObject(graph, owner, 1, cudaGraphUserObjectMove);
