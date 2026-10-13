@@ -949,20 +949,23 @@ Data NaiveN05FlashModel::RunTarget(
             AddTo(hidden, projected);
             norm(hidden, postAttentionNorm, normed);
         }
+        Data *mlpNormWeight = nullptr, *mlpNormOutput = nullptr;
+        if (decodeWorkspace) {
+            const bool lastLayer = layer + 1 == block_cnt;
+            const std::string name = lastLayer ? "model.norm.weight" :
+                "model.layers." + std::to_string(layer + 1) + ".input_layernorm.weight";
+            mlpNormWeight = &localWeight(name);
+            mlpNormOutput = lastLayer ? &buf.last : &normed;
+        }
         auto addMlpResidual = [&](Data &branch, bool needsReduce) {
             if (!decodeWorkspace) {
                 if (needsReduce) reduce(branch);
                 AddTo(hidden, branch);
                 return;
             }
-            const bool lastLayer = layer + 1 == block_cnt;
-            const std::string name = lastLayer ? "model.norm.weight" :
-                "model.layers." + std::to_string(layer + 1) + ".input_layernorm.weight";
-            Data &output = lastLayer ? buf.last : normed;
-            Data &normWeight = localWeight(name);
-            if (!needsReduce || !reduce(branch, &hidden, &normWeight, &output))
-                FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, normWeight,
-                    rms_norm_eps, output);
+            if (!needsReduce || !reduce(branch, &hidden, mlpNormWeight, mlpNormOutput))
+                FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, *mlpNormWeight,
+                    rms_norm_eps, *mlpNormOutput);
         };
         if (!moeLayers[layer]) {
             // Dense and routed-expert scratch have independent lifetimes.
@@ -976,8 +979,8 @@ Data NaiveN05FlashModel::RunTarget(
             Linear(w1, localWeight(prefix + ".mlp.down_proj.weight"), Data(), w2);
             addMlpResidual(w2, true);
         } else {
-            // Decode ranks route only their contiguous token shard. Borrow the
-            // normalized activation; MegaMoE gathers into its existing output.
+            // Decode ranks route only their contiguous token shard, borrowing
+            // the normalized activation until MegaMoE finishes reading it.
             Data routedInput;
             if (shardMoe) {
                 routedInput.Resize({length / 8, embed_dim});
@@ -1013,9 +1016,11 @@ Data NaiveN05FlashModel::RunTarget(
             }
             normed.Reshape({length, embed_dim});
             if (!tensorParallel) ApplyMoeDeviceMapForLayer(layer);
+            bool moeNormReady = false;
             if (tensorParallel && tpEp8MegaState) {
-                FastllmCudaRunMimoEp8Mega(*tpEp8MegaState, tpRank, layer, normed,
-                                        expertIndex, expertScore, moeOutput, decodeWorkspace);
+                moeNormReady = FastllmCudaRunMimoEp8Mega(*tpEp8MegaState, tpRank, layer, normed,
+                    expertIndex, expertScore, moeOutput, decodeWorkspace,
+                    shardMoe ? &hidden : nullptr, mlpNormWeight, mlpNormOutput, rms_norm_eps);
             } else if (executor.firstDevice.find("numa") == 0 &&
                 (moeWeights[layer][2]->dataType == DataType::FP8_E4M3 ||
                  moeWeights[layer][2]->dataType == DataType::FP8_E4M3_BLOCK_128)) {
@@ -1088,7 +1093,8 @@ Data NaiveN05FlashModel::RunTarget(
             }
             if (!tensorParallel) ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
             moeOutput.Reshape(hidden.dims);
-            addMlpResidual(moeOutput, !(tensorParallel && tpEp8MegaState));
+            if (!moeNormReady)
+                addMlpResidual(moeOutput, !(tensorParallel && tpEp8MegaState));
         }
         if (capture && capture->collectHidden &&
             std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end())

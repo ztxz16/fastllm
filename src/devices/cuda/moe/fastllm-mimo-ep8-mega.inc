@@ -113,9 +113,10 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     FastllmCudaSetDevice(previous);
     return state;
 }
-void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int layer,
+bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int layer,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
-        fastllm::Data &output, bool graphDecode) {
+        fastllm::Data &output, bool graphDecode, fastllm::Data *residual,
+        const fastllm::Data *normWeight, fastllm::Data *normOutput, float eps) {
     using namespace fastllm;
     AssertInFastLLM(input.dataType == BFLOAT16 && input.dims.size() == 2 &&
         input.dims[1] == 4096, "Invalid MiMo EP8 input shape.");
@@ -143,7 +144,7 @@ void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     };
     if (total <= capacity && !localRouting) {
         run(0, total);
-        return;
+        return false;
     }
 
     // Uneven decode batches can replay bounded replicated chunks without
@@ -151,7 +152,7 @@ void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     if (graphDecode && total % ranks != 0) {
         for (int first = 0; first < total; first += capacity)
             run(first, std::min(capacity, total - first));
-        return;
+        return false;
     }
     // Dispatch each token from one rank, using the existing 64-row arena.
     // All ranks execute the same number of rounds, including empty shards.
@@ -162,16 +163,28 @@ void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
         run(begin + std::min(start, shard), std::max(0, std::min(capacity, shard - start)));
     }
     if (graphDecode) {
+        if (localRouting && residual && normWeight && normOutput) {
+            AssertInFastLLM(residual->dataType == BFLOAT16 && residual->Count(0) == total * 4096 &&
+                normWeight->dataType == FLOAT32 && normWeight->Count(0) == 4096,
+                "Invalid MiMo EP8 residual/RMSNorm shape.");
+            normOutput->dataType = BFLOAT16;
+            normOutput->Resize(residual->dims);
+            normOutput->ToDevice(output.dataDevice, output.dataDeviceIds, false);
+            normOutput->Allocate(false);
+            if (FastllmCudaCustomAllGatherAddRMSNorm(output.cudaData, residual->cudaData,
+                    (const float *)normWeight->cudaData, normOutput->cudaData,
+                    total * 4096, 4096, eps, BFLOAT16, state.devices[rank])) return true;
+        }
         if (localRouting && FastllmCudaCustomAllGatherRows(output.cudaData,
                 total * 4096, 4096, BFLOAT16, state.devices[rank]))
-            return;
+            return false;
         // Each rank has written its slice in-place. NCCL records the exchange
         // on the same stream, retaining the existing 64-row MoE workspace.
         AssertInFastLLM(FastllmNcclAllGather(
             (const uint16_t *)output.cudaData + (size_t)begin * 4096,
             output.cudaData, shard * 4096, BFLOAT16, state.devices[rank]),
             "MiMo EP8 decode AllGather failed.");
-        return;
+        return false;
     }
     // Publish completed shards, then gather directly into the existing output.
     // All sources stay alive until every peer finishes reading them. This
@@ -190,14 +203,16 @@ void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     }
     FastllmCudaSyncCurrentThreadStream();
     state.WaitForOutputs();
+    return false;
 }
 #else
 struct FastllmCudaMimoEp8Mega {};
 bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &) { return false; }
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(const std::vector<int> &,
     const std::vector<std::vector<std::vector<fastllm::Data *>>> &) { return {}; }
-void FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &, int, int, const fastllm::Data &,
-    const fastllm::Data &, const fastllm::Data &, fastllm::Data &, bool) {
+bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &, int, int, const fastllm::Data &,
+    const fastllm::Data &, const fastllm::Data &, fastllm::Data &, bool, fastllm::Data *,
+    const fastllm::Data *, fastllm::Data *, float) {
     throw std::runtime_error("MiMo EP8 MegaMoE requires a Linux CUDA build containing the SM90 backend.");
 }
 #endif

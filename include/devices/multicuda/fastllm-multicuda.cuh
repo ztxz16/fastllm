@@ -59,6 +59,13 @@ bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
 // other slices in-place, reusing the existing peer-access signals and policy.
 bool FastllmCudaCustomAllGatherRows(void* data, int count,
                                   int rowElements, int dataType, int deviceId);
+// Hopper BF16, width 4096: consume equal row shards directly, add to residual,
+// and apply Kimi-style RMSNorm without materializing the gathered tensor.
+// data stays unchanged; data/residual/output must be disjoint. False leaves
+// tensors untouched so the ordinary gather and norm remain the fallback.
+bool FastllmCudaCustomAllGatherAddRMSNorm(void *data, void *residual,
+    const float *weight, void *output, int count, int channels,
+    float eps, int dataType, int deviceId);
 // Reduces two independent rank-local tensors, rounds each reduction to the
 // destination type, then adds the rounded values into dest.  Keeping the two
 // reduction accumulators separate preserves the result of
