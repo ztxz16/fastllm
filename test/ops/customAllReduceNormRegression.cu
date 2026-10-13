@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -29,23 +30,27 @@ double Round(double value) { return __bfloat162float(__float2bfloat16_rn((float)
 
 __global__ void CheckOutput(const BF *input, const BF *source, const BF *hidden,
         const BF *expected, const BF *output, const BF *lower, const BF *upper,
-        int count, int *errors) {
+        const BF *referenceNorm, bool exactNorm, int count, int *errors) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += blockDim.x * gridDim.x) {
         float value = __bfloat162float(output[i]);
         if (((const unsigned short *)input)[i] != ((const unsigned short *)source)[i] ||
             ((const unsigned short *)hidden)[i] != ((const unsigned short *)expected)[i] ||
+            (exactNorm && ((const unsigned short *)output)[i] != ((const unsigned short *)referenceNorm)[i]) ||
             !(value >= (float)lower[i] && value <= (float)upper[i])) atomicAdd(errors, 1);
     }
 }
 
 struct Case {
     int count, rank;
+    bool gather;
     Data input{BFLOAT16}, hidden{BFLOAT16}, output{BFLOAT16}, weight{FLOAT32};
     Data source{BFLOAT16}, residual{BFLOAT16}, expected{BFLOAT16}, lower{BFLOAT16}, upper{BFLOAT16};
+    Data referenceNorm{BFLOAT16};
     cudaGraphExec_t graph = nullptr;
-    Case(int rows, int rank) : count(rows * 4096), rank(rank) {
+    Case(int rows, int rank, bool gather) : count(rows * 4096), rank(rank), gather(gather) {
         for (Data *d : {&input, &hidden, &output, &source, &residual, &expected, &lower, &upper})
             Init(*d, {1, rows, 4096}, rank);
+        if (gather) Init(referenceNorm, {1, rows, 4096}, rank);
         Init(weight, {4096}, rank);
         unsigned seed = 31 + rank + rows * 19;
         auto random = [&]() { seed = seed * 1664525u + 1013904223u; return (int(seed >> 16) - 32768) / 30000.f; };
@@ -60,8 +65,13 @@ struct Case {
         Check(cudaMemcpy(residual.cudaData, h.data(), count * 2, cudaMemcpyHostToDevice));
         Check(cudaMemcpy(weight.cudaData, w.data(), 4096 * 4, cudaMemcpyHostToDevice));
         Reset();
-        Require(FastllmCudaCustomAllReduceRows(input.cudaData, input.cudaData, count, 4096, BFLOAT16, rank), "reference AR rejected");
+        Require(gather ? FastllmCudaCustomAllGatherRows(input.cudaData, count, 4096, BFLOAT16, rank)
+            : FastllmCudaCustomAllReduceRows(input.cudaData, input.cudaData, count, 4096, BFLOAT16, rank),
+            "reference collective rejected");
         FastllmCudaNaiveAddDecodeRMSNorm(hidden, input, weight, 1e-5f, output);
+        if (gather)
+            Check(cudaMemcpyAsync(referenceNorm.cudaData, output.cudaData, count * 2,
+                                  cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         Check(cudaMemcpy(h.data(), hidden.cudaData, count * 2, cudaMemcpyDeviceToHost));
         Check(cudaMemcpy(expected.cudaData, h.data(), count * 2, cudaMemcpyHostToDevice));
         // FP64 reference, with a conservative bound covering the FP32 sum,
@@ -90,13 +100,17 @@ struct Case {
         Check(cudaMemcpyAsync(hidden.cudaData, residual.cudaData, count * 2, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
     }
     bool Fused(void *dest) {
+        if (gather)
+            return FastllmCudaCustomAllGatherAddRMSNorm(input.cudaData, hidden.cudaData,
+                (const float *)weight.cudaData, dest, count, 4096, 1e-5f, BFLOAT16, rank);
         return FastllmCudaCustomAllReduceAddRMSNorm(input.cudaData, hidden.cudaData,
             (const float *)weight.cudaData, dest, count, 4096, 1e-5f, BFLOAT16, rank);
     }
     void Validate(int *errors) {
         CheckOutput<<<32, 256, 0, cudaStreamPerThread>>>((const BF *)input.cudaData,
             (const BF *)source.cudaData, (const BF *)hidden.cudaData, (const BF *)expected.cudaData,
-            (const BF *)output.cudaData, (const BF *)lower.cudaData, (const BF *)upper.cudaData, count, errors);
+            (const BF *)output.cudaData, (const BF *)lower.cudaData, (const BF *)upper.cudaData,
+            (const BF *)referenceNorm.cudaData, gather, count, errors);
         Check(cudaGetLastError());
     }
     void Run(int *errors) {
@@ -111,6 +125,7 @@ struct Case {
 
 int main(int argc, char **argv) {
     int ranks = argc > 1 ? std::atoi(argv[1]) : 8, available = 0;
+    const bool gather = argc > 2 && std::string(argv[2]) == "gather";
     if (ranks != 2 && ranks != 4 && ranks != 6 && ranks != 8) return 2;
     if (cudaGetDeviceCount(&available) != cudaSuccess || available < ranks) return 77;
     std::vector<int> devices;
@@ -124,19 +139,32 @@ int main(int argc, char **argv) {
     }
     setenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE", "1", 1);
     Require(FastllmInitNccl(devices) && FastllmCudaCustomAllReduceInit(devices), "initialization failed");
+    std::vector<int> shapes = {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 32, 33, 36, 37, 64, 65, 127, 128, 129, 255, 256, 512, 1024};
+    if (gather) {
+        shapes.clear();
+        for (int n = ranks; n <= 256; n += ranks) shapes.push_back(n);
+        shapes.push_back(512 / ranks * ranks);
+        shapes.push_back(1024 / ranks * ranks);
+    }
     std::vector<std::thread> workers;
     std::vector<int> errors(ranks);
     for (int rank = 0; rank < ranks; ++rank) workers.emplace_back([&, rank]() {
         FastllmCudaSetDevice(rank);
         int *deviceErrors; Check(cudaMalloc(&deviceErrors, sizeof(int))); Check(cudaMemset(deviceErrors, 0, sizeof(int)));
         std::vector<std::unique_ptr<Case>> cases;
-        for (int rows : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 32, 33, 36, 37, 64, 65, 127, 128, 129, 255, 256, 512, 1024}) {
-            cases.emplace_back(new Case(rows, rank)); auto &c = *cases.back();
+        for (int rows : shapes) {
+            cases.emplace_back(new Case(rows, rank, gather)); auto &c = *cases.back();
             c.Reset(); Require(c.Fused(c.output.cudaData), "warmup rejected"); c.Validate(deviceErrors);
             Require(!c.Fused(rank == 0 ? (char *)c.output.cudaData + 2 : c.output.cudaData), "asymmetric alignment accepted");
             c.Validate(deviceErrors);
             Require(!c.Fused(rank == 0 ? c.hidden.cudaData : c.output.cudaData), "asymmetric alias accepted");
             c.Validate(deviceErrors);
+            if (gather) {
+                Require(!FastllmCudaCustomAllGatherAddRMSNorm(c.input.cudaData, c.hidden.cudaData,
+                    (const float *)c.weight.cudaData, c.output.cudaData, c.count - 4096, 4096,
+                    1e-5f, BFLOAT16, rank), "unequal row shards accepted");
+                c.Validate(deviceErrors);
+            }
             c.Run(deviceErrors); Check(cudaStreamSynchronize(cudaStreamPerThread));
             cudaGraph_t graph;
             Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
@@ -156,6 +184,8 @@ int main(int argc, char **argv) {
     for (auto &worker : workers) worker.join();
     FastllmCudaCustomAllReduceReset();
     for (int n : errors) if (n) { std::fprintf(stderr, "FAIL: %d incorrect elements\n", n); return 1; }
-    std::printf("PASS: TP%d, 24 shapes, 768 skewed graph replays, exact residual, FP64 norm bounds, collective fallback\n", ranks);
+    std::printf("PASS: TP%d, %s, %zu shapes, %zu skewed graph replays, exact residual, %s, collective fallback\n",
+        ranks, gather ? "AllGather" : "AllReduce", shapes.size(), shapes.size() * 32,
+        gather ? "bitwise norm and FP64 bounds" : "FP64 norm bounds");
     return 0;
 }

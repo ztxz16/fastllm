@@ -2137,6 +2137,10 @@ if (UNIT_TEST)
                              COMMAND customAllReduceNormRegression ${norm_ranks})
                     set_tests_properties(custom_all_reduce_norm_${norm_ranks} PROPERTIES
                         LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+                    add_test(NAME custom_all_gather_norm_${norm_ranks}
+                             COMMAND customAllReduceNormRegression ${norm_ranks} gather)
+                    set_tests_properties(custom_all_gather_norm_${norm_ranks} PROPERTIES
+                        LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
                 endforeach()
             endif()
             add_executable(customAllGatherRegression test/ops/customAllGatherRegression.cu)
