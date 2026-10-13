@@ -306,6 +306,16 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         if (!slidingLayers[layer]) {
             for (const char *name : {"wq.weight", "wk.weight", "weights_proj.weight", "k_norm.weight", "k_norm.bias"})
                 replicate(ap + "indexer." + name);
+#ifndef USE_ROCM
+            const int previousDevice = FastllmCudaGetDevice();
+            for (int device : tpDevices) {
+                FastllmCudaSetDevice(device);
+                FastllmCudaPackIndexerWeights(*weight[ap + "indexer.wq.weight"].multiDeviceDatas.at(device),
+                    *weight[ap + "indexer.wk.weight"].multiDeviceDatas.at(device),
+                    *weight[ap + "indexer.weights_proj.weight"].multiDeviceDatas.at(device));
+            }
+            FastllmCudaSetDevice(previousDevice);
+#endif
         }
         if (moeLayers[layer]) {
             replicate(prefix + ".mlp.gate.weight");

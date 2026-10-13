@@ -5,6 +5,7 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 #include "fastllm-bf16-lt.cuh"
+#include <stdexcept>
 
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
@@ -710,15 +711,33 @@ static void LaunchFastllmGemmBf16Bf16SmallBatch(__nv_bfloat16 *input, __nv_bfloa
     }
 }
 
+namespace {
+// Naive Indexer layout: 16 query heads, one key head, and one score per head.
+constexpr int kIndexerInput = 4096, kIndexerHeads = 16, kIndexerDim = 128;
+constexpr int kIndexerQ = kIndexerHeads * kIndexerDim;
+constexpr int kIndexerQK = kIndexerQ + kIndexerDim;
+constexpr int kIndexerQKW = kIndexerQK + kIndexerHeads;
+
+__device__ __forceinline__ void StoreIndexerProjection(__nv_bfloat16 *query,
+        __nv_bfloat16 *key, __nv_bfloat16 *scores, int row, int column, __nv_bfloat16 value) {
+    if (column < kIndexerQ) query[row * kIndexerQ + column] = value;
+    else if (column < kIndexerQK) key[row * kIndexerDim + column - kIndexerQ] = value;
+    // Preserve the BF16 projection round before multiplying by 1/sqrt(16).
+    else scores[row * kIndexerHeads + column - kIndexerQK] =
+        __float2bfloat16_rn(__bfloat162float(value) * 0.25f);
+}
+}
+
 // Map the original 256 logical lanes onto one warp per output. Each lane
 // keeps eight independent partials and reproduces the original 128/64/32
 // compensated tree in registers before the warp tree. This packs four
 // outputs per CTA without changing products, sum order or weight storage.
 // Two input rows share weight loads and keep independent reduction state.
-template <int K, int ROWS = 1>
+template <int K, int ROWS = 1, bool INDEXER = false>
 __global__ void FastllmGemvBf16Bf16WarpRows(const __nv_bfloat16 *input,
         const __nv_bfloat16 *weight, __nv_bfloat16 *output,
-        const __nv_bfloat16 *bias, int outputs) {
+        const __nv_bfloat16 *bias, int outputs,
+        __nv_bfloat16 *indexKey = nullptr, __nv_bfloat16 *indexScores = nullptr) {
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * 4 + threadIdx.x / 32;
     if (row >= outputs) return;
@@ -764,9 +783,127 @@ __global__ void FastllmGemvBf16Bf16WarpRows(const __nv_bfloat16 *input,
                 value = sum;
             }
         }
-        if (lane == 0) output[batch * outputs + row] = __float2bfloat16_rn(
-            bias ? value + __bfloat162float(bias[row]) : value);
+        if (lane == 0) {
+            const auto rounded = __float2bfloat16_rn(bias ? value + __bfloat162float(bias[row]) : value);
+            if constexpr (INDEXER)
+                StoreIndexerProjection(output, indexKey, indexScores, batch, row, rounded);
+            else output[batch * outputs + row] = rounded;
+        }
     }
+}
+
+namespace {
+bool IndexerWeightLayout(const fastllm::Data &wq, const fastllm::Data &wk,
+        const fastllm::Data &weights) {
+    const fastllm::Data *parts[] = {&wq, &wk, &weights};
+    const int widths[] = {kIndexerQ, kIndexerDim, kIndexerHeads};
+    for (int i = 0; i < 3; ++i) {
+        const auto &part = *parts[i];
+        if (part.dataType != fastllm::BFLOAT16 || part.dataDevice != fastllm::DataDevice::CUDA ||
+            !part.cudaData || part.dims.size() != 2 || part.dims[0] != widths[i] || part.dims[1] != kIndexerInput ||
+            part.strides.size() != 2 || part.strides[0] != kIndexerInput || part.strides[1] != 1 ||
+            part.dataDeviceIds != wq.dataDeviceIds) return false;
+    }
+    return FastllmCudaRuntimeArch() == 90;
+}
+
+bool IndexerWeightsPacked(const fastllm::Data &wq, const fastllm::Data &wk,
+        const fastllm::Data &weights) {
+    const auto *base = (const uint8_t *)wq.cudaData;
+    return wq.expansionBytes >= (size_t)kIndexerQKW * kIndexerInput * 2 &&
+        wk.cudaData == base + (size_t)kIndexerQ * kIndexerInput * 2 &&
+        weights.cudaData == base + (size_t)kIndexerQK * kIndexerInput * 2;
+}
+
+__global__ void IndexerProjectionUnpack(const __nv_bfloat16 *packed,
+        __nv_bfloat16 *query, __nv_bfloat16 *key, __nv_bfloat16 *scores, int rows) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * kIndexerQKW) return;
+    const int row = i / kIndexerQKW, column = i % kIndexerQKW;
+    StoreIndexerProjection(query, key, scores, row, column, packed[i]);
+}
+}
+
+bool FastllmCudaPackIndexerWeights(fastllm::Data &wq, fastllm::Data &wk, fastllm::Data &weights) {
+    if (!IndexerWeightLayout(wq, wk, weights)) return false;
+    if (IndexerWeightsPacked(wq, wk, weights)) return true;
+    if (FastllmCudaGraphIsCapturingFast()) return false;
+    for (auto *part : {&wq, &wk, &weights})
+        if (part->isFake || part->cudaDataBorrowed) return false;
+    fastllm::Data packed(fastllm::BFLOAT16, {kIndexerQKW, kIndexerInput});
+    packed.ToDevice(fastllm::DataDevice::CUDA, wq.dataDeviceIds, false);
+    packed.Allocate();
+    size_t offset = 0;
+    for (auto *part : {&wq, &wk, &weights}) {
+        FastllmCudaCopyFromDeviceToDevice((uint8_t *)packed.cudaData + offset, part->cudaData, part->GetBytes());
+        offset += part->GetBytes();
+    }
+    // Replace the three allocations, retaining original shapes for K-only
+    // short contexts and large-batch/unsupported projection fallbacks.
+    offset = 0;
+    for (auto *part : {&wq, &wk, &weights}) {
+        part->FreeSpace();
+        part->cudaData = (uint8_t *)packed.cudaData + offset;
+        part->cudaDataBorrowed = part != &wq;
+        part->directMemory = false;
+        part->expansionSize = part == &wq ? packed.expansionSize : part->Count(0);
+        part->expansionBytes = part == &wq ? packed.expansionBytes : part->GetBytes();
+        offset += part->GetBytes();
+    }
+    packed.cudaData = nullptr;
+    return true;
+}
+
+bool FastllmCudaIndexerProjection(const fastllm::Data &input,
+        const fastllm::Data &wq, const fastllm::Data &wk, const fastllm::Data &weights,
+        fastllm::Data &query, fastllm::Data &key, fastllm::Data &scores, fastllm::Data &scratch) {
+    if (input.dataType != fastllm::BFLOAT16 || input.dataDevice != fastllm::DataDevice::CUDA ||
+        !input.cudaData || input.dims.empty() || input.dims.back() != kIndexerInput ||
+        input.strides.size() != input.dims.size() ||
+        (reinterpret_cast<uintptr_t>(input.cudaData) & 15) ||
+        (reinterpret_cast<uintptr_t>(wq.cudaData) & 15) ||
+        input.dataDeviceIds != wq.dataDeviceIds ||
+        !IndexerWeightLayout(wq, wk, weights) || !IndexerWeightsPacked(wq, wk, weights)) return false;
+    size_t elements = 1;
+    for (int i = (int)input.dims.size() - 1; i >= 0; --i) {
+        if (input.strides[i] != elements || input.dims[i] <= 0) return false;
+        elements *= input.dims[i];
+    }
+    const size_t rows = elements / kIndexerInput;
+    // Limit fusion to measured decode batches; larger GEMMs keep the fallback.
+    if (rows == 0 || rows > 256) return false;
+    auto prepare = [&](fastllm::Data &output, int width) {
+        auto dims = input.dims;
+        dims.back() = width;
+        output.dataType = fastllm::BFLOAT16;
+        output.Resize(dims);
+        output.ToDevice(input.dataDevice, input.dataDeviceIds, false);
+        output.Allocate();
+    };
+    prepare(query, kIndexerQ); prepare(key, kIndexerDim); prepare(scores, kIndexerHeads);
+    const auto *x = (const __nv_bfloat16 *)input.cudaData;
+    const auto *w = (const __nv_bfloat16 *)wq.cudaData;
+    auto *q = (__nv_bfloat16 *)query.cudaData;
+    auto *k = (__nv_bfloat16 *)key.cudaData;
+    auto *s = (__nv_bfloat16 *)scores.cudaData;
+    if (rows == 1) {
+        FastllmGemvBf16Bf16WarpRows<kIndexerInput, 1, true><<<(kIndexerQKW + 3) / 4, 128>>>(x, w, q, nullptr, kIndexerQKW, k, s);
+    } else if (rows == 2) {
+        FastllmGemvBf16Bf16WarpRows<kIndexerInput, 2, true><<<(kIndexerQKW + 3) / 4, 128>>>(x, w, q, nullptr, kIndexerQKW, k, s);
+    } else {
+        prepare(scratch, kIndexerQKW);
+        auto handle = getFastllmCublasHandle();
+        if (!fastllm_bf16_lt::Matmul(input.cudaData, wq.cudaData, scratch.cudaData, rows, kIndexerInput, kIndexerQKW)) {
+            const float alpha = 1.0f, beta = 0.0f;
+            const auto status = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, kIndexerQKW, rows, kIndexerInput,
+                &alpha, w, CUDA_R_16BF, kIndexerInput, x, CUDA_R_16BF, kIndexerInput, &beta,
+                scratch.cudaData, CUDA_R_16BF, kIndexerQKW, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            if (status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("Indexer BF16 projection failed.");
+        }
+        IndexerProjectionUnpack<<<(rows * kIndexerQKW + 255) / 256, 256>>>(
+            (const __nv_bfloat16 *)scratch.cudaData, q, k, s, rows);
+    }
+    return true;
 }
 
 void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {

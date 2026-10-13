@@ -2130,6 +2130,17 @@ bool FastllmCudaHalfMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data
                                        bool scoresOnCuda, int topk, int hidden, int inter);
 
 bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+// Hopper BF16 Indexer, K=4096 and Q/K/score widths 2048/128/16. Wq owns the
+// packed allocation; Wk/weights borrow its trailing rows. Shapes and separate
+// Linear remain valid. Pack once before graph warmup; keep weights immutable
+// and Wq alive while the slices are used. Unsupported layouts return false.
+bool FastllmCudaPackIndexerWeights(fastllm::Data &wq, fastllm::Data &wk, fastllm::Data &weights);
+// Project all three outputs, preserving BF16 rounding before weights scaling.
+// Scratch may alias a later operator's output, but not input or these outputs.
+// Supports 1..256 rows; unsupported inputs return false without writing outputs.
+bool FastllmCudaIndexerProjection(const fastllm::Data &input,
+    const fastllm::Data &wq, const fastllm::Data &wk, const fastllm::Data &weights,
+    fastllm::Data &query, fastllm::Data &key, fastllm::Data &scores, fastllm::Data &scratch);
 bool FastllmCudaBFloat16MatMulInt4Group32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFloat32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);

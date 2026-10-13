@@ -628,11 +628,11 @@ Data NaiveN05FlashModel::RunTarget(
             batch && batch->Decode() && tpSwaRingCache;
         std::vector<FastllmNaiveSWARow> swaRows;
         if (batchedSWA) swaRows.reserve(batch->Size());
-        auto prepareIndexKey = [&](Data &normed, TargetWorkspace &buf) {
+        auto prepareIndexKey = [&](Data &normed, TargetWorkspace &buf, bool alreadyProjected = false) {
             if (slidingLayers[layer]) return;
             Data &indexKey = buf.indexKey;
             const std::string ip = ap + "indexer.";
-            Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
+            if (!alreadyProjected) Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
             if (decodeWorkspace && FastllmCudaNaiveIndexerKeyNorm(indexKey,
                     localWeight(ip + "k_norm.weight"), localWeight(ip + "k_norm.bias"))) return;
             // LayerNorm accumulates in FP32; the generic CUDA operation does
@@ -649,6 +649,8 @@ Data NaiveN05FlashModel::RunTarget(
             }
         };
         bool batchRopePrepared = false;
+        bool indexProjectionPrepared = false;
+        bool batchNeedsIndex = false;
         const void *const *layerCache = buf.cacheTable ? buf.cacheTable + (size_t)layer * buf.tableRows * 4 : nullptr;
         const unsigned char *layerMaps = buf.cacheMaps ? buf.cacheMaps + (size_t)layer * buf.tableRows * FastllmNaiveDSAMapBytes : nullptr;
         if (batch) {
@@ -661,7 +663,21 @@ Data NaiveN05FlashModel::RunTarget(
             caches.reserve(batch->Size());
             // Project/normalize the complete batch, then borrow individual K rows.
             // Cache descriptors retain the addresses, not these temporary views.
-            prepareIndexKey(normed, buf);
+            batchNeedsIndex = !slidingLayers[layer] &&
+                std::any_of(buf.sequences.begin(), buf.sequences.begin() + batch->Size(),
+                    [&](const std::unique_ptr<TargetWorkspace> &part) { return part->capacity > indexTopK; });
+#ifndef USE_ROCM
+            if (batchNeedsIndex) {
+                const std::string ip = ap + "indexer.";
+                // O projection is not live yet. Reuse its full-width buffer for
+                // the packed GEMM; graph shapes already share this allocation.
+                indexProjectionPrepared = FastllmCudaIndexerProjection(normed,
+                    localWeight(ip + "wq.weight"), localWeight(ip + "wk.weight"),
+                    localWeight(ip + "weights_proj.weight"), buf.indexQ, buf.indexKey,
+                    buf.indexWeights, projected);
+            }
+#endif
+            prepareIndexKey(normed, buf, indexProjectionPrepared);
             std::vector<Data> indexKeys(batch->Size());
             for (int sequence = 0; sequence < batch->Size(); ++sequence) {
                 if (!slidingLayers[layer]) {
@@ -686,11 +702,13 @@ Data NaiveN05FlashModel::RunTarget(
             Linear(normed, localWeight(ip + "weights_proj.weight"), Data(), indexWeights);
             Mul(indexWeights, 1.0f / std::sqrt((float)indexHeads), indexWeights);
         };
-        const bool batchIndexPrepared = batchRopePrepared && !slidingLayers[layer] &&
-            std::any_of(buf.sequences.begin(), buf.sequences.begin() + batch->Size(),
-                [&](const std::unique_ptr<TargetWorkspace> &part) { return part->capacity > indexTopK; });
+        const bool batchIndexPrepared = batchRopePrepared && batchNeedsIndex;
         Data &batchIndexQ = buf.indexQ, &batchIndexWeights = buf.indexWeights;
-        if (batchIndexPrepared) prepareIndexQuery(normed, positions, batchIndexQ, batchIndexWeights);
+        if (batchIndexPrepared) {
+            if (indexProjectionPrepared)
+                FastllmCudaNaiveRope(batchIndexQ, positions, indexHeads, indexDim, rotaryDim, cfg.theta);
+            else prepareIndexQuery(normed, positions, batchIndexQ, batchIndexWeights);
+        }
         bool batchIndexerPrepared = false;
         if (batchIndexPrepared) {
             std::vector<FastllmNaiveIndexerRow> rows;
