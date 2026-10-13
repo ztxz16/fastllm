@@ -2619,6 +2619,9 @@ namespace fastllm {
 
     Qwen4ExpModel::Qwen4ExpModel() : Qwen3NextModel() {
         this->canDoBatchForward = false;
+        // The legacy scheduler rotates request-local KV, recurrent and MTP
+        // state through the single-request Forward path.
+        this->canDoConcurrentForward = true;
         this->model_type = "qwen4_exp";
         this->model_struct = "qwen4_exp";
         this->defaultChunkedPrefillSize = 4096;
