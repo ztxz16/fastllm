@@ -187,12 +187,21 @@ void NaiveN05FlashModel::RestoreTensorParallelHistoryRank(Data &cache, int layer
     const int required = (std::max(length, capacity) + 127) / 128 * 128;
     // Expansion reallocates even when its requested capacity is unchanged.
     // Preserve adopted allocations and graph addresses when they already fit.
-    if (local->expansionDims.size() != 3 || local->expansionDims[1] < required) {
+    if (!local->isPagedKVCache && (local->expansionDims.size() != 3 || local->expansionDims[1] < required)) {
         if (!local->dims.empty()) local->Resize({1, 0, width + index});
         ReserveCache(*local, required, width + index);
     }
+    if (local->isPagedKVCache) {
+        for (int first = 0; first < length; first += local->pageLen) {
+            int rows = std::min(local->pageLen, length - first);
+            size_t offset = (size_t)local->pageIndex[first / local->pageLen] * local->pageLen * (width + index) * 2;
+            FastllmCudaCopyFromHostToDevice((uint8_t *)local->pagedKVCacheData->cudaData + offset,
+                host.cpuData + (size_t)first * (width + index) * 2, (size_t)rows * (width + index) * 2);
+        }
+    } else FastllmCudaCopyFromHostToDevice(local->cudaData, host.cpuData, host.GetBytes());
     local->Resize(host.dims);
-    FastllmCudaCopyFromHostToDevice(local->cudaData, host.cpuData, host.GetBytes());
+    if (local->isPagedKVCache)
+        local->lastPageLen = length ? (length - 1) % local->pageLen + 1 : 0;
 #endif
 }
 
@@ -294,6 +303,7 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
             draftContexts[&context->pastKeyValues] = std::move(draft);
         }
         for (int layer = 0; layer < block_cnt; ++layer) {
+            if (restoringPagedPrefix && !slidingLayers[layer]) continue;
             int first = slidingLayers[layer] ? std::max(0, state.length - window + 1) : 0;
             int length = state.length - first;
             for (int part = 0; part < 2; ++part) {
@@ -392,6 +402,61 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
     while (history.size() > historyRecordLimit) {
         history.erase(history.begin());
     }
+}
+
+PagedCacheManager *NaiveN05FlashModel::GetPagedKVCacheManager(int layer, bool key) const {
+    if (tpPagedCaches.empty() || layer < 0 || layer >= block_cnt || slidingLayers[layer]) return nullptr;
+    return tpPagedCaches.front()[layer * 2 + !key].get();
+}
+
+std::vector<std::pair<int, PagedCacheManager *>> NaiveN05FlashModel::GetPagedKVCacheManagers(int layer, bool key) const {
+    std::vector<std::pair<int, PagedCacheManager *>> result;
+    if (layer < 0 || layer >= block_cnt || slidingLayers[layer]) return result;
+    for (int rank = 0; rank < (int)tpPagedCaches.size(); ++rank)
+        result.emplace_back(tpDevices[rank], tpPagedCaches[rank][layer * 2 + !key].get());
+    return result;
+}
+
+bool NaiveN05FlashModel::TryRecordPagedPrefixCacheExtra(ResponseContext *context) {
+    // TryRecordPagedCache records the host companion state first. Every KV
+    // append/restore already publishes its length and complete-page metadata.
+    return saveHistoryChat && !tpPagedCaches.empty() && context != nullptr;
+}
+
+int NaiveN05FlashModel::QueryPagedPrefixCacheExtra(ResponseContext *context, int length) const {
+    if (!saveHistoryChat || !context || tpPagedCaches.empty()) return 0;
+    std::lock_guard<std::mutex> guard(historyMutex);
+    int best = 0;
+    for (const auto &entry : history) {
+        int limit = std::min<int>(length, std::min(entry->tokens.size(), context->currentTokens.size()));
+        int common = 0;
+        while (common < limit && entry->tokens[common] == context->currentTokens[common]) ++common;
+        best = std::max(best, common);
+    }
+    return best;
+}
+
+bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, int length) const {
+    auto *self = const_cast<NaiveN05FlashModel *>(this);
+    {
+        std::lock_guard<std::mutex> guard(historyMutex);
+        self->pendingHistory.reset();
+        for (const auto &entry : history)
+            if ((int)entry->tokens.size() >= length && (int)context->currentTokens.size() >= length &&
+                std::equal(entry->tokens.begin(), entry->tokens.begin() + length, context->currentTokens.begin())) {
+                self->pendingHistory = entry;
+                break;
+            }
+        if (!self->pendingHistory) return false;
+    }
+    struct Restore {
+        NaiveN05FlashModel *model; ResponseContext *context; int oldLength;
+        ~Restore() { model->restoringPagedPrefix = false; context->cacheLen = oldLength; }
+    } restore{self, context, context->cacheLen};
+    self->restoringPagedPrefix = true;
+    context->cacheLen = length;
+    self->OnResponseContextCreated(context);
+    return true;
 }
 
 void NaiveN05FlashModel::AddPromptCache(const std::vector<int> &tokens) {

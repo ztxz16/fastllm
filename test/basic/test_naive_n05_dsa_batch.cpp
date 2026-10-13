@@ -13,6 +13,9 @@
 #include <cuda_runtime_api.h>
 #include <stdexcept>
 #include <vector>
+#include <memory>
+#include <numeric>
+#include <random>
 using namespace fastllm;
 static int checks = 0;
 static void Require(bool ok, const char *why) {
@@ -72,8 +75,35 @@ static float Float(uint16_t bits) {
     std::memcpy(&x, &word, sizeof(x));
     return x;
 }
+// Independent K/V permutations ensure logical positions cannot accidentally
+// be used as physical offsets. Payloads are populated without the write kernel.
+struct PagedTensor {
+    PagedCacheManager pool;
+    Data table{INT32}, cache{BFLOAT16};
+    explicit PagedTensor(const Data &dense, int seed, int pageLen = 128) {
+        const int length = dense.dims[1], width = dense.dims[2];
+        const int pages = (length + pageLen - 1) / pageLen;
+        pool.dataType = BFLOAT16; pool.pageLen = pageLen;
+        pool.Resize({pages, pageLen, 1, width});
+        pool.ToDevice(DataDevice::CUDA, {0}, false); pool.Allocate(); pool.SetMaxPages(pages);
+        std::vector<int> ids(pages); std::iota(ids.begin(), ids.end(), 0);
+        std::shuffle(ids.begin(), ids.end(), std::mt19937(seed));
+        table.Resize({pages}); table.Allocate();
+        std::memcpy(table.cpuData, ids.data(), pages * sizeof(int));
+        table.ToDevice(DataDevice::CUDA, {0}, true);
+        for (int row = 0; row < length; row += pageLen)
+            Cuda(cudaMemcpy((uint8_t *)pool.cudaData + (size_t)ids[row / pageLen] * pageLen * width * 2,
+                (const uint8_t *)dense.cudaData + (size_t)row * width * 2,
+                (size_t)std::min(pageLen, length - row) * width * 2, cudaMemcpyDeviceToDevice));
+        cache.FakeFrom(table, 0); cache.dataType = BFLOAT16; cache.Resize(dense.dims);
+        cache.isPagedKVCache = true; cache.pagedKVCacheData = &pool;
+        cache.pageLen = pageLen; cache.pageIndex = ids;
+        cache.lastPageLen = (length - 1) % pageLen + 1;
+        cache.expansionDims = {1, pages * pageLen, width};
+    }
+};
 static void Test(int batch, int heads, int kvHeads, int dim, int vd, int capacity, bool sparse, bool withSink,
-                 bool unalignedKeys = false, bool mixed = false) {
+                 bool unalignedKeys = false, bool mixed = false, bool paged = false) {
     const int stride = kvHeads * dim + 128 + (unalignedKeys ? 1 : 0);
     Data q(BFLOAT16), sink(FLOAT32), live(INT32), output;
     Upload(q, {1, batch, heads * dim}, 31);
@@ -88,6 +118,7 @@ static void Test(int batch, int heads, int kvHeads, int dim, int vd, int capacit
     std::vector<std::vector<uint16_t>> hostKeys(batch), hostValues(batch);
     std::vector<std::vector<int>> hostIndices(batch);
     std::vector<FastllmNaiveDSARow> rows(batch);
+    std::vector<std::unique_ptr<PagedTensor>> pagedKeys, pagedValues;
     for (int b = 0; b < batch; ++b) {
         Upload(keys[b], {1, capacity, stride}, 7 + b);
         Upload(values[b], {1, capacity, kvHeads * vd}, 17 + b);
@@ -96,6 +127,14 @@ static void Test(int batch, int heads, int kvHeads, int dim, int vd, int capacit
         auto &r = rows[b];
         r.key = keys[b].cudaData;
         r.value = values[b].cudaData;
+        if (paged) {
+            pagedKeys.emplace_back(new PagedTensor(keys[b], b + 11));
+            pagedValues.emplace_back(new PagedTensor(values[b], b + 79));
+            r.key = pagedKeys.back()->pool.cudaData; r.value = pagedValues.back()->pool.cudaData;
+            r.keyPages = (const int *)pagedKeys.back()->table.cudaData;
+            r.valuePages = (const int *)pagedValues.back()->table.cudaData;
+            r.pageLen = 128; r.poolTokens = pagedKeys.back()->pool.maxPages * 128;
+        }
         r.capacity = capacity;
         r.keyStride = stride;
         r.liveKeys = (const int *)live.cudaData + b;
@@ -129,10 +168,23 @@ static void Test(int batch, int heads, int kvHeads, int dim, int vd, int capacit
         Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
         graph.Run();
         auto actual = Read<uint16_t>(output);
+        if (paged) {
+            auto denseRows = rows;
+            for (int b = 0; b < batch; ++b) {
+                denseRows[b].key = keys[b].cudaData; denseRows[b].value = values[b].cudaData;
+                denseRows[b].keyPages = denseRows[b].valuePages = nullptr;
+                denseRows[b].pageLen = denseRows[b].poolTokens = 0;
+            }
+            Data reference; FastllmNaiveDecodeScratch referenceScratch;
+            FastllmCudaNaiveBatchDSADecode(q, sink, denseRows, heads, kvHeads, dim, vd, referenceScratch, reference);
+            Require(actual == Read<uint16_t>(reference), "paging changed batch DSA arithmetic");
+        }
         int different = 0;
         double oldMaxError = 0;
         FastllmNaiveDecodeScratch oldScratch;
-        for (int b = 0; b < batch; ++b) {
+        // Bulk attention has its own rounding path. Paged bulk is compared
+        // bit-for-bit with the same dense batch kernel above and FP64 below.
+        for (int b = 0; b < batch && (!paged || batch < 128); ++b) {
             Data rowQuery(BFLOAT16), rowLive(INT32), oldOutput;
             rowQuery.Resize({1, 1, heads * dim});
             rowQuery.FakeFrom(q, (size_t)b * heads * dim * sizeof(uint16_t));
@@ -150,7 +202,7 @@ static void Test(int batch, int heads, int kvHeads, int dim, int vd, int capacit
                         "DSA differs from original rounding by more than one BF16 ULP");
             }
         }
-        if (capacity > 256)
+        if (capacity > 256 && (!paged || batch < 128))
             Require(different == 0, "Batch DSA differs from original decode");
         std::printf("Original decode comparison different=%d max=%.9g\n", different, oldMaxError);
         double squared = 0, referenceSquared = 0, maxError = 0;
@@ -281,6 +333,72 @@ static void TestRebinding(int batch, int capacity, bool sparse, bool generic = f
     std::printf("KV REBIND PASS batch=%d capacity=%d sparse=%d generic=%d\n", batch, capacity, sparse, generic);
 }
 
+static void TestPagedPrefill(int length, int queries = 3, int heads = 8, int pageLen = 128) {
+    const int width = 320, dim = 192, vd = 128;
+    Data k(BFLOAT16), v(BFLOAT16), q(BFLOAT16), iq(BFLOAT16), iw(BFLOAT16), sink;
+    Upload(k, {1, length, width}, 191); Upload(v, {1, length, vd}, 707);
+    Upload(q, {1, queries, heads * dim}, 777); Upload(iq, {1, queries, 16 * 128}, 90);
+    Upload(iw, {1, queries, 16}, 119);
+    PagedTensor pk(k, 173, pageLen), pv(v, 301, pageLen);
+    Data denseIndex, pagedIndex, expected, actual;
+    FastllmCudaNaiveIndexer(iq, iw, k, 16, 128, length - queries, 2048, true, denseIndex);
+    FastllmCudaNaiveIndexer(iq, iw, pk.cache, 16, 128, length - queries, 2048, true, pagedIndex);
+    Require(Read<int>(denseIndex) == Read<int>(pagedIndex), "paged Indexer changed TopK positions");
+    FastllmCudaNaiveAttention(q, k, v, denseIndex, sink, heads, 1, dim, vd, length - queries, 0, expected);
+    FastllmCudaNaiveAttention(q, pk.cache, pv.cache, pagedIndex, sink, heads, 1, dim, vd, length - queries, 0, actual);
+    Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "paged prefill changed attention");
+    // A write spanning two page boundaries leaves all other rows untouched.
+    Data input(BFLOAT16); Upload(input, {1, 131, width}, 952);
+    FastllmCudaNaivePagedWrite(pk.cache, input, 127);
+    auto old = Read<uint16_t>(k), add = Read<uint16_t>(input);
+    auto physical = Read<uint16_t>(pk.pool);
+    for (int r = 0; r < length; ++r) for (int c = 0; c < width; ++c) {
+        uint16_t ref = r >= 127 && r < 258 ? add[(r - 127) * width + c] : old[r * width + c];
+        Require(physical[((size_t)pk.cache.pageIndex[r / pageLen] * pageLen + r % pageLen) * width + c] == ref,
+            "paged append wrote wrong row or modified shared neighbors");
+    }
+    ++checks;
+    std::printf("PAGED PREFILL/INDEXER/WRITE PASS length=%d\n", length);
+}
+
+static void TestPagedBatchIndexer(int pageLen, bool generic) {
+    const int batch = 4, capacity = 4097, width = generic ? 321 : 320;
+    Data q(BFLOAT16), weights(BFLOAT16), live(INT32);
+    Upload(q, {1, batch, 16 * 128}, 901);
+    Upload(weights, {1, batch, 16}, 909);
+    live.Resize({batch}); live.Allocate();
+    std::vector<int> lengths(batch, capacity);
+    std::memcpy(live.cpuData, lengths.data(), batch * sizeof(int));
+    live.ToDevice(DataDevice::CUDA, {0}, true);
+    std::vector<Data> keys(batch, Data(BFLOAT16)), expected(batch), actual(batch);
+    std::vector<std::unique_ptr<PagedTensor>> pages;
+    std::vector<FastllmNaiveDecodeScratch> denseScratch(batch), pagedScratch(batch);
+    std::vector<FastllmNaiveIndexerRow> dense, paged;
+    for (int row = 0; row < batch; ++row) {
+        Upload(keys[row], {1, capacity, width}, 101 + row);
+        pages.emplace_back(new PagedTensor(keys[row], row + 37, pageLen));
+        dense.push_back({&keys[row], &denseScratch[row], &expected[row], row, capacity});
+        paged.push_back({&pages.back()->cache, &pagedScratch[row], &actual[row], row, capacity});
+    }
+    Graph graph;
+    graph.Capture([&] {
+        Require(FastllmCudaNaiveBatchDecodeIndexer(q, weights, live, paged, true), "paged batch indexer unavailable");
+    });
+    for (int base : {4097, 2049, 129}) {
+        for (int row = 0; row < batch; ++row) lengths[row] = base - row * 17;
+        Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+        graph.Run();
+        Require(FastllmCudaNaiveBatchDecodeIndexer(q, weights, live, dense, true), "dense batch indexer unavailable");
+        for (int row = 0; row < batch; ++row) {
+            Require(Read<int>(expected[row]) == Read<int>(actual[row]), "paged batch indexer TopK mismatch");
+            auto a = Read<unsigned>(denseScratch[row].indexScores), b = Read<unsigned>(pagedScratch[row].indexScores);
+            Require(std::equal(a.begin(), a.begin() + lengths[row], b.begin()), "paged batch indexer score mismatch");
+        }
+        ++checks;
+    }
+    std::printf("PAGED BATCH INDEXER PASS page_len=%d generic=%d\n", pageLen, generic);
+}
+
 int main() {
     try {
         int devices = 0;
@@ -308,6 +426,21 @@ int main() {
         }
         TestRebinding(4, 707, false, true);
         TestRebinding(33, 4097, true, true);
+        for (int capacity : {127, 128, 129, 2047, 2048, 4097}) {
+            Test(4, 8, 1, 192, 128, capacity, capacity > 2048, true, false, false, true);
+            Test(2, 8, 2, 128, 256, capacity, capacity > 2048, false, false, false, true);
+        }
+        for (int batch : {2, 8, 16, 31})
+            Test(batch, 8, 1, 192, 128, 4097, true, true, false, false, true);
+        for (int capacity : {257, 707, 2048, 4097})
+            Test(128, 8, 1, 192, 128, capacity, capacity > 2048, true, false, false, true);
+        for (int length : {511, 2048, 2049, 4097}) TestPagedPrefill(length);
+        for (int heads : {8, 16}) TestPagedPrefill(4097, 256, heads);
+        TestPagedPrefill(511, 3, 8, 96);
+        for (int pageLen : {96, 128}) {
+            TestPagedBatchIndexer(pageLen, false);
+            TestPagedBatchIndexer(pageLen, true);
+        }
         std::printf("BATCH DSA PASS %d checks\n", checks);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "FAIL %s\n", e.what());

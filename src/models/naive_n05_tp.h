@@ -63,7 +63,7 @@ struct NaiveN05FlashModel::TPServingState {
     uint64_t generation = 0, cacheEpoch = UINT64_MAX;
     std::vector<const Data *> requests;
     std::vector<int> expectedLengths, capacityLimits;
-    std::vector<int *> cacheLengths;
+    std::vector<int *> cacheLengths, pageLengths;
     std::map<std::pair<int, int>, std::shared_ptr<TPDecodeState>> graphs;
 };
 }

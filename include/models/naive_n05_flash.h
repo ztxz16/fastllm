@@ -48,6 +48,12 @@ namespace fastllm {
         // The history archive also retains keys discarded by sliding attention.
         bool UseGenericHistoryCache() const override { return false; }
         bool TryRestoreHistoryCache(std::vector<int> &tokens, int &cacheLen) override;
+        bool DeferHistoryCacheRestore() const override { return !tpPagedCaches.empty(); }
+        PagedCacheManager *GetPagedKVCacheManager(int layer, bool key) const override;
+        std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagers(int layer, bool key) const override;
+        bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
+        int QueryPagedPrefixCacheExtra(ResponseContext *context, int length) const override;
+        bool RestorePagedPrefixCacheExtra(ResponseContext *context, int length) const override;
         void TryRecordResponseContext(ResponseContext *context) override;
         void OnResponseContextCreated(ResponseContext *context) override;
         void OnResponseContextRemoved(ResponseContext *context) override;
@@ -147,6 +153,7 @@ namespace fastllm {
         int CacheReserveCapacity(const GenerationConfig &config) const;
         void AppendCache(Data &cache, Data &input, int reserveCapacity = 0);
         void ReserveCache(Data &cache, int capacity, int width);
+        void PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
         static void TrimCache(Data &cache, int length);
         int SampleTarget(Data &logits, std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
@@ -220,6 +227,8 @@ namespace fastllm {
                                    LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
         std::vector<int> tpDevices;
         std::map<int, std::shared_ptr<CudaWorkspace>> tpKVPool;
+        std::vector<std::vector<std::unique_ptr<PagedCacheManager>>> tpPagedCaches;
+        bool restoringPagedPrefix = false;
         bool tpPrepared = false;
         // Fixed at TP preparation so toggling CUDA Graph cannot change live KV
         // layout. Prefill/eager and verify temporarily use chronological rows.
@@ -250,7 +259,7 @@ namespace fastllm {
         std::shared_ptr<HistoryBudget> historyBudget = std::make_shared<HistoryBudget>();
         void InitHistoryBudget();
         size_t historyBytesPerToken = 0;
-        std::mutex historyMutex;
+        mutable std::mutex historyMutex;
         // Oldest first; completed records and their chunks are immutable.
         std::vector<std::shared_ptr<const HistoryMemory>> history;
         // LaunchResponseTokens holds dictLocker across lookup and creation.

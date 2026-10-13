@@ -129,8 +129,12 @@ __global__ __launch_bounds__(256) void Decode(const BF *q, Batch batch, const fl
     }
     const int ar = (l & 7) + ((l >> 3) & 1) * 8, ac = (l >> 4) * 8;
     for (int first = 0; first < n; first += 128) {
-        if (t < 128)
-            s.selected[t] = index(r, first + t, len, Ring);
+        if (t < 128) {
+            int k = index(r, first + t, len, Ring);
+            if constexpr (!Ring)
+                if (k >= 0) k = FastllmNaivePhysicalRow(r, k);
+            s.selected[t] = k;
+        }
         __syncthreads();
         for (int i = t; i < 128 * 24; i += 256) {
             int k = s.selected[i / 24], d = i % 24 * 8;
@@ -161,8 +165,12 @@ __global__ __launch_bounds__(256) void Decode(const BF *q, Batch batch, const fl
     __syncthreads();
     float acc[4] = {};
     for (int first = 0; first < n; first += 128) {
-        if (t < 128)
-            s.selected[t] = index(r, first + t, len, Ring);
+        if (t < 128) {
+            int k = index(r, first + t, len, Ring);
+            if constexpr (!Ring)
+                if (k >= 0) k = FastllmNaivePhysicalRow(r, k, true);
+            s.selected[t] = k;
+        }
         __syncthreads();
         for (int i = t; i < 128 * 16; i += 256) {
             int k = s.selected[i / 16], d = i % 16 * 8;

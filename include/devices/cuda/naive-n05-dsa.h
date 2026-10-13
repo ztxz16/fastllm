@@ -8,6 +8,8 @@ struct FastllmNaiveDSARow {
     int length = 0, capacity = 0, keyStride = 0, selectedCount = 0;
     const void *const *cache = nullptr;
     const void *tensorMaps = nullptr;
+    const int *keyPages = nullptr, *valuePages = nullptr;
+    int pageLen = 0, poolTokens = 0;
 };
 
 // Two Hopper tensor maps, stored in a 128-byte-aligned device allocation.
@@ -24,6 +26,18 @@ struct FastllmNaiveDSABatch {
 #ifdef __CUDACC__
 __device__ __forceinline__ FastllmNaiveDSARow FastllmNaiveResolveDSARow(FastllmNaiveDSARow row) {
     if (row.cache) { row.key = row.cache[0]; row.value = row.cache[1]; }
+    if (row.cache && row.pageLen) {
+        row.keyPages = (const int *)row.cache[2];
+        row.valuePages = (const int *)row.cache[3];
+    }
     return row;
+}
+__device__ __forceinline__ int FastllmNaivePhysicalRow(const FastllmNaiveDSARow &row, int token, bool value = false) {
+    const int *pages = value ? row.valuePages : row.keyPages;
+    if (!pages) return token;
+    const int length = row.pageLen;
+    const int page = (length & (length - 1)) == 0
+        ? token >> (__ffs(length) - 1) : token / length;
+    return token + (pages[page] - page) * length;
 }
 #endif

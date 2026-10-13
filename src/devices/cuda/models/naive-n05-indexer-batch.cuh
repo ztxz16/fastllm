@@ -5,7 +5,7 @@
 namespace naive_indexer_batch {
 using BF16 = __nv_bfloat16;
 struct Row {
-    const BF16 *key;
+    FastllmNaiveKV key;
     const int *live;
     BF16 *query;
     float *scale;
@@ -41,7 +41,9 @@ __global__ void Scores(const BF16 *weights, Batch batch) {
     const Row &row = batch.rows[blockIdx.y];
     int n = *row.live;
     if (blockIdx.x * naive_dsa_mma::kKeys >= n) return;
-    naive_dsa_mma::IndexerDecodeScoresRow(row.query, row.cache ? (const BF16 *)row.cache[0] : row.key, row.scale,
+    auto key = row.key;
+    key.Bind(row.cache);
+    naive_dsa_mma::IndexerDecodeScoresRow(row.query, key, row.scale,
         weights + (size_t)row.sequence * naive_dsa_mma::kHeads,
         ScoreOutput{row.scores}, row.stride, n, n - 1);
 }
@@ -68,7 +70,7 @@ __global__ void HopperScores(const BF16 *weights, Batch batch) {
     using namespace naive_dsa_mma;
     constexpr int Threads = 128;
     Row r = batch.rows[blockIdx.y];
-    if (r.cache) r.key = (const BF16 *)r.cache[0];
+    r.key.Bind(r.cache);
     const int n = *r.live, first = blockIdx.x * kKeys;
     if (first >= n) return;
     __shared__ __align__(16) BF16 qs[kHeads][kIndexerDim + 8], ks[kKeys][kIndexerDim + 8];
@@ -78,10 +80,15 @@ __global__ void HopperScores(const BF16 *weights, Batch batch) {
         int h = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
         LoadScoreVector<true>(&qs[h][d], r.query + h * kIndexerDim + d, true);
     }
+    // Tiles aligned to a divisor of the page length need only one page base.
+    // Keep per-row translation for arbitrary page lengths (e.g. 96 tokens).
+    const bool onePage = !r.key.pages || r.key.pageLen % kKeys == 0;
+    const BF16 *tile = onePage ? r.key.Row(first, r.stride) : nullptr;
     for (int i = t; i < kKeys * (kIndexerDim / 8); i += Threads) {
         int key = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
-        const BF16 *p = r.key + (size_t)(first + key) * r.stride + r.stride - kIndexerDim + d;
-        LoadScoreVector<false>(&ks[key][d], p, first + key < n);
+        const BF16 *base = onePage ? tile + (size_t)key * r.stride
+                                  : r.key.Row(min(first + key, n - 1), r.stride);
+        LoadScoreVector<false>(&ks[key][d], base + r.stride - kIndexerDim + d, first + key < n);
     }
     if (t < kHeads) {
         scales[t] = r.scale[t];

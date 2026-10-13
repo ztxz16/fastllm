@@ -222,6 +222,18 @@ class Fixture : public NaiveN05FlashModel {
             }
         }
     }
+    mutable int pagedRestores = 0;
+    int hostRestores = 0;
+    bool RestorePagedPrefixCacheExtra(ResponseContext *ctx, int length) const override {
+        bool restored = NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ctx, length);
+        pagedRestores += restored;
+        return restored;
+    }
+    bool TryRestoreHistoryCache(std::vector<int> &tokens, int &length) override {
+        bool restored = NaiveN05FlashModel::TryRestoreHistoryCache(tokens, length);
+        hostRestores += restored;
+        return restored;
+    }
     bool UseModelSpecificScheduler() const override { return !useRealScheduler; }
     void RunModelSpecificScheduler() override {}
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
@@ -258,12 +270,24 @@ class Fixture : public NaiveN05FlashModel {
             std::vector<std::vector<float>> uninterrupted, restored;
             auto sampled = infer(tokens, 2, uninterrupted);
             tokens.push_back(sampled[0]);
-            const int before = verifyGraphLaunches;
+            const int before = verifyGraphLaunches, gpuBefore = pagedRestores, cpuBefore = hostRestores;
             infer(tokens, 1, restored);
+            if (pagedRestores != gpuBefore + 1 || hostRestores != cpuBefore)
+                throw std::runtime_error("resident prefix used the CPU archive");
             if (verifyGraphLaunches - before != ranks || verifyGraphCaptures != captures)
                 throw std::runtime_error("restored prefix did not replay its prepared graph");
             if (restored[0] != uninterrupted[1])
                 throw std::runtime_error("restored serving graph changed logits");
+            // Evict one rank's key trie. The common restore must reject a
+            // partial TP hit and safely recover all ranks from the host archive.
+            auto *pool = GetPagedKVCacheManager(0, true);
+            std::vector<int> pressure;
+            for (int i = 0; i < pool->maxPages; ++i) pressure.push_back(pool->GetUnusedPageIndex(true));
+            pool->ReleasePageIndices(pressure);
+            std::vector<std::vector<float>> fallback;
+            infer(tokens, 1, fallback);
+            if (hostRestores != cpuBefore + 1 || fallback[0] != uninterrupted[1] || verifyGraphCaptures != captures)
+                throw std::runtime_error("paged eviction fallback changed logits or recaptured");
         }
         std::cout << "TP HISTORY SERVING PASS ranks=" << ranks << std::endl;
     }
@@ -298,6 +322,7 @@ class Fixture : public NaiveN05FlashModel {
     void ServingGraphChecks() {
         // Candidate and eager reference retain independent request caches.
         maxBatch = 16;
+        SetChunkedPrefillSize(4096);
         SetMaxTokens(131072);
         WarmUp();
         if (!verifyGraphCaptures) throw std::runtime_error("serving warmup captured no graphs");
@@ -921,6 +946,34 @@ class Fixture : public NaiveN05FlashModel {
         WarmUp();
         FastllmCudaSetDevice(0);
         int before = directAllocations;
+        {
+            auto *pool = GetPagedKVCacheManager(0, true);
+            Data owner(BFLOAT16), fork(BFLOAT16);
+            PreparePagedCache(owner, *pool, 127);
+            const int width = pool->dims[3];
+            owner.Resize({1, 127, width}); owner.lastPageLen = 127;
+            std::vector<uint16_t> pattern(127 * width, 0x3f80), copied(pattern.size());
+            auto address = [&](const Data &cache) {
+                return (uint8_t *)pool->cudaData + (size_t)cache.pageIndex[0] * pool->pageLen * width * 2;
+            };
+            FastllmCudaCopyFromHostToDevice(address(owner), pattern.data(), pattern.size() * 2);
+            fork.dataDevice = DataDevice::CUDA; fork.dataDeviceIds = {0};
+            fork.Resize(owner.dims); fork.pageLen = owner.pageLen;
+            fork.isPagedKVCache = true; fork.pagedKVCacheData = pool;
+            fork.pageIndex = owner.pageIndex; fork.lastPageLen = 127;
+            pool->Pick(fork.pageIndex);
+            PreparePagedCache(fork, *pool, 128);
+            if (fork.pageIndex[0] == owner.pageIndex[0]) throw std::runtime_error("partial shared page was overwritten");
+            FastllmCudaCopyFromDeviceToHost(copied.data(), address(fork), copied.size() * 2);
+            if (copied != pattern) throw std::runtime_error("partial page copy lost prior KV");
+            FastllmCudaCopyFromDeviceToHost(copied.data(), address(owner), copied.size() * 2);
+            if (copied != pattern) throw std::runtime_error("fork mutated its shared ancestor");
+            void *table = owner.cudaData;
+            owner.dims[1] = 128; owner.lastPageLen = 128;
+            PreparePagedCache(owner, *pool, 129);
+            if (owner.cudaData != table || owner.pageIndex.size() != 2 || directAllocations != before)
+                throw std::runtime_error("paged growth reallocated device storage");
+        }
         Data cache(BFLOAT16);
         cache.dataDevice = DataDevice::CUDA;
         cache.dataDeviceIds = {0};

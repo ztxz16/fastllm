@@ -73,6 +73,8 @@ void FastllmCudaNaiveDraftSwiGLU(const fastllm::Data &gateUp, fastllm::Data &out
 
 void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
                          int heads, int dim, int rotaryDim, float theta);
+// Append already transformed BF16 rows into an allocated logical page view.
+void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start);
 // Q/K RoPE and V scaling, preserving eager BF16 rounding. With packedQkv,
 // read [Q, K, V] within each row and write contiguous Q/K/V outputs; otherwise
 // operate in place. Q/K and V may have different head dimensions.

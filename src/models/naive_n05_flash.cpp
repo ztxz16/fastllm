@@ -59,7 +59,13 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, int reserveCapaci
         const int capacity = (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128);
         ReserveCache(cache, capacity, input.dims[2]);
     }
-    CatDirect(cache, input, 1);
+    if (cache.isPagedKVCache) {
+#ifdef USE_CUDA
+        FastllmCudaNaivePagedWrite(cache, input, oldLength);
+#endif
+        cache.Resize({1, length, input.dims[2]});
+        cache.lastPageLen = (length - 1) % cache.pageLen + 1;
+    } else CatDirect(cache, input, 1);
     cache.isKVCache = true;
 }
 
@@ -95,6 +101,67 @@ void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width) {
     }
 #endif
     cache.Expansion({1, capacity, width});
+}
+
+void NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manager, int end) {
+#ifdef USE_CUDA
+    const int width = manager.dims[3], capacity = std::min(max_positions,
+        std::min(tokensLimit > 0 ? tokensLimit : INT_MAX, manager.maxPages * manager.pageLen));
+    AssertInFastLLM(end >= 0 && end <= capacity && !cache.isFake,
+                    "Naive paged KV capacity exceeded.");
+    if (!cache.isPagedKVCache) {
+        AssertInFastLLM(!cache.cudaData && (cache.dims.empty() || cache.dims[1] == 0),
+                        "Naive paged attachment requires empty device storage.");
+        cache.dataType = BFLOAT16;
+        cache.UpdateUnitSize();
+        cache.dataDevice = DataDevice::CUDA;
+        cache.dataDeviceIds = manager.dataDeviceIds;
+        cache.isKVCache = cache.isPagedKVCache = true;
+        cache.pagedKVCacheData = &manager;
+        cache.pageLen = manager.pageLen;
+        cache.Resize({1, 0, width});
+    }
+    AssertInFastLLM(cache.pagedKVCacheData == &manager, "Naive paged KV pool changed.");
+    bool changed = !cache.cudaData;
+    if (!cache.cudaData) {
+        cache.cudaData = AllocateCudaWorkspace(tpKVPool.at(manager.dataDeviceIds[0]),
+            (size_t)((capacity + manager.pageLen - 1) / manager.pageLen) * sizeof(int));
+        if (!cache.cudaData) throw CudaWorkspaceExhausted("Naive KV page metadata pool exhausted.");
+        cache.directMemory = true;
+        cache.cudaDataBorrowed = false;
+    }
+    cache.expansionDims = {1, capacity, width};
+    cache.strides = {(uint64_t)capacity * width, (uint64_t)width, 1};
+    const int previous = cache.dims[1];
+    const int pages = (end + cache.pageLen - 1) / cache.pageLen;
+    bool copyTail = false;
+    {
+        std::lock_guard<std::mutex> guard(manager.pageIndexLocker);
+        if (previous && previous % cache.pageLen && end > previous)
+            copyTail = manager.pageRefCount[cache.pageIndex[(previous - 1) / cache.pageLen]] > 1;
+        if (manager.FreePageCount() < std::max(0, pages - (int)cache.pageIndex.size()) + copyTail)
+            throw CudaWorkspaceExhausted("Naive physical KV pages exhausted.");
+    }
+    if (copyTail) {
+        int last = (previous - 1) / cache.pageLen;
+        int old = cache.pageIndex[last], page = manager.GetUnusedPageIndex(true);
+        size_t bytes = (size_t)cache.pageLen * width * sizeof(uint16_t);
+        FastllmCudaCopyFromDeviceToDevice((uint8_t *)manager.cudaData + page * bytes,
+            (uint8_t *)manager.cudaData + old * bytes, bytes);
+        cache.pageIndex[last] = page;
+        manager.ReleasePageIndex(old);
+        changed = true;
+    }
+    while ((int)cache.pageIndex.size() < pages) {
+        cache.pageIndex.push_back(manager.GetUnusedPageIndex(true));
+        changed = true;
+    }
+    if (changed) {
+        FastllmCudaCopyFromHostToDevice(cache.cudaData, cache.pageIndex.data(), cache.pageIndex.size() * sizeof(int));
+        tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
+    }
+    cache.lastPageLen = previous ? (previous - 1) % cache.pageLen + 1 : 0;
+#endif
 }
 
 void NaiveN05FlashModel::TrimCache(Data &cache, int length) {
@@ -133,6 +200,12 @@ NaiveN05FlashModel::~NaiveN05FlashModel() {
     tpVerifyState.reset();
     tpBatchState.reset();
     tpEp8MegaState.reset();
+    for (auto &rank : tpPagedCaches) for (auto &pool : rank) {
+        if (pool && pool->trieRoot) {
+            pool->EvictTrieSubtree(pool->trieRoot);
+            pool->trieRoot = nullptr;
+        }
+    }
 }
 
 void NaiveN05FlashModel::InitParams() {
@@ -574,7 +647,7 @@ Data NaiveN05FlashModel::RunTarget(
             }
         };
         bool batchRopePrepared = false;
-        const void *const *layerCache = buf.cacheTable ? buf.cacheTable + (size_t)layer * buf.tableRows * 2 : nullptr;
+        const void *const *layerCache = buf.cacheTable ? buf.cacheTable + (size_t)layer * buf.tableRows * 4 : nullptr;
         const unsigned char *layerMaps = buf.cacheMaps ? buf.cacheMaps + (size_t)layer * buf.tableRows * FastllmNaiveDSAMapBytes : nullptr;
         if (batch) {
             while ((int)buf.sequences.size() < batch->Size())
@@ -597,7 +670,7 @@ Data NaiveN05FlashModel::RunTarget(
                 caches.push_back({batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
                     batch->Value(sequence, layer).multiDeviceDatas.at(gpu),
                     slidingLayers[layer] ? nullptr : &indexKeys[sequence],
-                    layerCache ? layerCache + sequence * 2 : nullptr});
+                    layerCache ? layerCache + sequence * 4 : nullptr});
             }
             batchRopePrepared = FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions,
                 caches, buf.liveKeys, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
@@ -625,7 +698,7 @@ Data NaiveN05FlashModel::RunTarget(
                 if (part.capacity > indexTopK)
                     rows.push_back({batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
                         &part.decode, &part.indices, sequence, part.capacity,
-                        layerCache ? layerCache + sequence * 2 : nullptr});
+                        layerCache ? layerCache + sequence * 4 : nullptr});
             }
             batchIndexerPrepared = FastllmCudaNaiveBatchDecodeIndexer(batchIndexQ,
                 batchIndexWeights, buf.liveKeys, rows, indexFp8);
@@ -658,6 +731,10 @@ Data NaiveN05FlashModel::RunTarget(
             if (fusedCache && !decodeWorkspace) {
                 pastKey.Resize({1, localPast + length, pastKey.dims[2]});
                 pastValue.Resize({1, localPast + length, pastValue.dims[2]});
+                if (pastKey.isPagedKVCache) {
+                    pastKey.lastPageLen = (localPast + length - 1) % pastKey.pageLen + 1;
+                    pastValue.lastPageLen = pastKey.lastPageLen;
+                }
             }
             if (!fusedCache) {
                 FastllmCudaNaiveRopeQKScaleV(q, k, v, positions, cfg.heads, cfg.kvHeads,
@@ -707,7 +784,7 @@ Data NaiveN05FlashModel::RunTarget(
                             buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
                         else FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights, pastKey,
                             buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices,
-                            layerCache ? layerCache + sequence * 2 : nullptr);
+                            layerCache ? layerCache + sequence * 4 : nullptr);
                     } else {
                         if (capture && capture->verifying && length <= 8)
                             FastllmCudaNaiveVerifyIndexer(indexQ, indexWeights, pastKey, indexHeads,
@@ -726,9 +803,15 @@ Data NaiveN05FlashModel::RunTarget(
             if (batchedDSA) {
                 FastllmNaiveDSARow row;
                 row.tensorMaps = layerMaps ? layerMaps + (size_t)sequence * FastllmNaiveDSAMapBytes : nullptr;
-                row.cache = layerCache ? layerCache + sequence * 2 : nullptr;
-                row.key = pastKey.cudaData;
-                row.value = pastValue.cudaData;
+                row.cache = layerCache ? layerCache + sequence * 4 : nullptr;
+                row.key = pastKey.isPagedKVCache ? pastKey.pagedKVCacheData->cudaData : pastKey.cudaData;
+                row.value = pastValue.isPagedKVCache ? pastValue.pagedKVCacheData->cudaData : pastValue.cudaData;
+                if (pastKey.isPagedKVCache) {
+                    row.keyPages = (const int *)pastKey.cudaData;
+                    row.valuePages = (const int *)pastValue.cudaData;
+                    row.pageLen = pastKey.pageLen;
+                    row.poolTokens = pastKey.pagedKVCacheData->maxPages * pastKey.pageLen;
+                }
                 row.indices = selected->dims.empty() ? nullptr : (const int *)selected->cudaData;
                 row.liveKeys = decodeWorkspace ? (const int *)buf.liveKeys.cudaData : nullptr;
                 row.length = localPast + length;
@@ -737,7 +820,7 @@ Data NaiveN05FlashModel::RunTarget(
                 row.selectedCount = row.indices ? selected->dims.back() : 0;
                 dsaRows.push_back(row);
             } else if (batchedSWA) {
-                swaRows.push_back({pastKey.cudaData, pastValue.cudaData, layerCache ? layerCache + sequence * 2 : nullptr});
+                swaRows.push_back({pastKey.cudaData, pastValue.cudaData, layerCache ? layerCache + sequence * 4 : nullptr});
             } else if (decodeWorkspace) {
                 if (graphVerify) FastllmCudaNaiveGraphVerifyAttention(q, pastKey, pastValue, *selected, sink,
                     buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
@@ -1096,7 +1179,7 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
                          (budget - fixedBytes) / fullBytesPerToken - (int64_t)batch * 127);
     if (tokensLimit > 0) tokens = std::min<int64_t>(tokens, tokensLimit);
     tokens = std::min<int64_t>(tokens, INT_MAX - 127);
-    // Each request rounds its contiguous full-attention cache to 128 rows.
+    // Preserve the existing budget, including a partial page per request.
     const int64_t bytes = fixedBytes + (tokens + (int64_t)batch * 127) * fullBytesPerToken;
     AssertInFastLLM(tokens >= 128 && bytes > 0 && bytes <= budget,
         "Naive startup KV pool exceeds the memory budget; reduce --tokens/--max_batch or prefill chunk size.");
@@ -1104,6 +1187,41 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     for (int device : tpDevices)
         pools.emplace(device, std::make_shared<CudaWorkspace>(device, bytes));
     tpKVPool.swap(pools);
+    const int pageLen = GetPageLen();
+    const int fullLayers = std::count(slidingLayers.begin(), slidingLayers.end(), 0);
+    const int64_t metadataBytes = (int64_t)fullLayers * 2 * batch *
+        ((std::min<int64_t>(max_positions, tokens) + pageLen - 1) / pageLen * sizeof(int) + 512) +
+        (int64_t)block_cnt * std::min(batch, 256) * 4 * sizeof(void *) + 512;
+    const int pages = (int)((bytes - fixedBytes - metadataBytes) / fullBytesPerToken / pageLen);
+    AssertInFastLLM(pages > 0, "Naive KV budget cannot fit paged metadata.");
+    tokens = std::min<int64_t>(tokens, (int64_t)pages * pageLen);
+    tpPagedCaches.resize(ranks);
+    for (int rank = 0; rank < ranks; ++rank) {
+        FastllmCudaSetDevice(tpDevices[rank]);
+        auto &managers = tpPagedCaches[rank];
+        managers.resize(block_cnt * 2);
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            if (slidingLayers[layer]) continue;
+            for (int part = 0; part < 2; ++part) {
+                int width = std::max(1, full.kvHeads / ranks) * (part ? full.valueDim : full.headDim) + (!part ? indexDim : 0);
+                auto manager = std::make_unique<PagedCacheManager>();
+                manager->type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE;
+                manager->dataType = BFLOAT16;
+                manager->UpdateUnitSize();
+                manager->dataDevice = DataDevice::CUDA;
+                manager->dataDeviceIds = {tpDevices[rank]};
+                manager->pageLen = pageLen;
+                manager->Resize({pages, pageLen, 1, width});
+                manager->cudaData = AllocateCudaWorkspace(tpKVPool.at(tpDevices[rank]), manager->GetBytes());
+                if (!manager->cudaData) throw CudaWorkspaceExhausted("Naive physical KV page pool exhausted.");
+                manager->directMemory = true;
+                manager->SetMaxPages(pages);
+                FastllmCudaMemset0(manager->cudaData, (size_t)pageLen * width * 2);
+                managers[layer * 2 + part] = std::move(manager);
+            }
+        }
+        ForceDeviceSync();
+    }
     tokensLimit = (int)tokens;
     printf("[Naive KV pool] preallocated %.2f MiB/GPU, %lld total tokens, batch %d, SWA capacity %lld rows/request. No serving-time KV cudaMalloc.\n",
         bytes / 1048576.0, (long long)tokens, batch, (long long)swaCapacity);

@@ -664,6 +664,9 @@ namespace fastllm {
         void NewMainLoop();
         void GPUMainLoop();
         void RunNewMainLoop(bool useGPUForward);
+
+        // Paged models may try resident pages before restoring a host archive.
+        virtual bool DeferHistoryCacheRestore() const { return false; }
     };
 }
 

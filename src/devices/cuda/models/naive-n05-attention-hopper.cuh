@@ -65,8 +65,8 @@ inline bool EncodeMaps(CUtensorMap *maps, const void *key, const void *value, in
 inline bool PrepareTmaBatch(TmaBatch &batch, const FastllmNaiveDSARow *rows, int count) {
     for (int i = 0; i < count; ++i) {
         const auto &r = batch.rows[i] = rows[i];
-        if (r.indices || r.capacity <= 0 || (r.cache && !r.tensorMaps)) return false;
-        if (!r.tensorMaps && !EncodeMaps(batch.maps + i * 2, r.key, r.value, r.capacity, r.keyStride)) return false;
+        if ((r.pageLen && r.pageLen % 128) || r.indices || r.capacity <= 0 || (r.cache && !r.tensorMaps)) return false;
+        if (!r.tensorMaps && !EncodeMaps(batch.maps + i * 2, r.key, r.value, r.poolTokens ? r.poolTokens : r.capacity, r.keyStride)) return false;
     }
     return true;
 }
@@ -80,7 +80,7 @@ __global__ __launch_bounds__(256) void HopperDecode(const BF *q,
     auto &s = *(TmaStorage<Max> *)tbuf;
     const int row = blockIdx.x, group = blockIdx.y, head = group * 8, t = threadIdx.x, l = t % 32,
               w = t / 32;
-    auto r = batch.rows[row];
+    auto r = FastllmNaiveResolveDSARow(batch.rows[row]);
     const int n = Length(r);
     const auto *maps = r.tensorMaps ? (const CUtensorMap *)r.tensorMaps : batch.maps + row * 2;
     if (t == 0 && r.tensorMaps) {
@@ -102,7 +102,7 @@ __global__ __launch_bounds__(256) void HopperDecode(const BF *q,
     const int ar = (l & 7) + ((l >> 3) & 1) * 8, ac = (l >> 4) * 8;
     for (int first = 0; first < n; first += 128) {
         if (t == 0)
-            tma_load(s.tile.keys, maps, &s.barrier, first, 128 * 192 * 2);
+            tma_load(s.tile.keys, maps, &s.barrier, FastllmNaivePhysicalRow(r, first), 128 * 192 * 2);
         tma_wait(&s.barrier, phase);
         phase ^= 1;
         __syncthreads();
@@ -129,7 +129,7 @@ __global__ __launch_bounds__(256) void HopperDecode(const BF *q,
     float acc[4] = {};
     for (int first = 0; first < n; first += 128) {
         if (t == 0)
-            tma_load(s.tile.values, maps + 1, &s.barrier, first, 128 * 128 * 2);
+            tma_load(s.tile.values, maps + 1, &s.barrier, FastllmNaivePhysicalRow(r, first, true), 128 * 128 * 2);
         tma_wait(&s.barrier, phase);
         phase ^= 1;
         if (first + 128 > n)

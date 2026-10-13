@@ -1,4 +1,7 @@
 #include "models/basellm.h"
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -165,6 +168,30 @@ std::vector<int> Drain(SchedulerModel &model, const std::vector<int> &handles, i
     return counts;
 }
 
+void CompletePagesOnly() {
+    SchedulerModel model(CacheView::Paged, 256);
+    ResponseContext ctx;
+    ctx.Init(1, FLOAT32, FLOAT32);
+    ctx.allTokens.assign(128, 7); // Includes a sampled token whose KV is absent.
+    for (int part = 0; part < 2; ++part) {
+        auto *pool = model.GetPagedKVCacheManager(0, part == 0);
+        auto &cache = part ? ctx.pastKeyValues[0].second : ctx.pastKeyValues[0].first;
+        cache.isPagedKVCache = true; cache.pagedKVCacheData = pool;
+        cache.pageLen = 128; cache.lastPageLen = 127;
+        cache.pageIndex.push_back(pool->GetUnusedPageIndex(true));
+    }
+    ctx.TryRecordPagedCache(&model);
+    std::vector<int> pages;
+    auto *pool = model.GetPagedKVCacheManager(0, true);
+    pool->Query(ctx.allTokens, pages);
+    Check(pages.empty(), "recorder published an unwritten tail token");
+    ctx.pastKeyValues[0].first.lastPageLen = ctx.pastKeyValues[0].second.lastPageLen = 128;
+    ctx.allTokens.push_back(8);
+    ctx.TryRecordPagedCache(&model);
+    pool->Query(ctx.allTokens, pages);
+    Check(pages.size() == 1, "recorder lost a complete page");
+}
+
 void Single(CacheView view, int capacity, int pageSize, int prompt, int output, int expected) {
     SchedulerModel model(view, capacity, pageSize);
     const int actual = Drain(model, {Launch(model, prompt, output)})[0];
@@ -195,8 +222,14 @@ void Concurrent(CacheView view, bool pressure) {
 
 int main() {
     try {
+#ifdef USE_CUDA
+        // CUDA builds query all devices when starting the legacy scheduler.
+        // Initialize their contexts before the progress deadline starts.
+        FastllmCudaGetFreeSizes();
+#endif
         SetDeviceMap({{"cpu", 1}});
         SetMaxTokens(0);
+        CompletePagesOnly();
         for (auto view : {CacheView::Contiguous, CacheView::Paged, CacheView::TensorParallel}) {
             Single(view, 500, 128, 256, 244, 244);
         }

@@ -2,6 +2,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "utils.h"
 #include "naive-n05-topk.cuh"
+#include "devices/cuda/naive-n05-kv.cuh"
 #include "naive-n05-dsa-decode.cuh"
 #include "naive-n05-attention-hopper.cuh"
 #include <cuda_bf16.h>
@@ -644,6 +645,8 @@ struct RopeCacheRow {
     const int *length;
     int keyRows, valueRows, cachePast;
     const void *const *cache = nullptr;
+    const int *keyPages = nullptr, *valuePages = nullptr;
+    int pageLen = 0;
 };
 constexpr int kRopeCacheBatch = 32;
 struct RopeCacheBatch { RopeCacheRow rows[kRopeCacheBatch]; };
@@ -674,7 +677,9 @@ __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
         const BF16 *src = index ? indexKey + (size_t)token * indexDim
             : (Packed ? qkv + base + head * dim
                       : k + ((size_t)token * kvHeads + head - heads) * dim);
-        BF16 *dst = key + (size_t)row * (kvHeads * dim + indexDim)
+        const int *pages = r.pageLen && r.cache ? (const int *)r.cache[2] : r.keyPages;
+        int physical = pages ? pages[row / r.pageLen] * r.pageLen + row % r.pageLen : row;
+        BF16 *dst = key + (size_t)physical * (kvHeads * dim + indexDim)
             + (index ? kvHeads * dim : (head - heads) * dim);
         RopeHeadTo(src, dst, positions[token], rotaryDim, theta);
         for (int d = rotaryDim + threadIdx.x; d < width; d += blockDim.x)
@@ -683,7 +688,9 @@ __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
         const int h = head - heads - kvHeads;
         const BF16 *src = Packed ? qkv + base + (heads + kvHeads) * dim + h * valueDim
                                 : v + ((size_t)token * kvHeads + h) * valueDim;
-        BF16 *dst = value + ((size_t)row * kvHeads + h) * valueDim;
+        const int *pages = r.pageLen && r.cache ? (const int *)r.cache[3] : r.valuePages;
+        int physical = pages ? pages[row / r.pageLen] * r.pageLen + row % r.pageLen : row;
+        BF16 *dst = value + ((size_t)physical * kvHeads + h) * valueDim;
         for (int d = threadIdx.x; d < valueDim; d += blockDim.x)
             dst[d] = __float2bfloat16_rn((float)src[d] * (float)valueScale);
     }
@@ -736,11 +743,11 @@ __global__ void IndexerKeyNorm(BF16 *input, const float *weight, const float *bi
         input[i] = __float2bfloat16_rn(((float)input[i] - mean) / deviation * weight[i] + bias[i]);
 }
 
-__global__ void RoundIndexer(const BF16 *input, float *output, int stride,
+__global__ void RoundIndexer(FastllmNaiveKV input, float *output, int stride,
                              int offset, bool fp8) {
     __shared__ float maximum[128];
     int d = threadIdx.x, row = blockIdx.x;
-    float x = (float)input[(size_t)row * stride + offset + d];
+    float x = (float)input.Row(row, stride)[offset + d];
     if (!fp8) {
         output[(size_t)row * 128 + d] = x;
         return;
@@ -777,10 +784,10 @@ __global__ void IndexScores(const float *q, const float *k, const BF16 *weights,
 // Decode consumes each packed BF16 K row once. Keep its FP32 values in
 // registers across the 16 heads, avoiding a full temporary K.
 template <typename ScoreOutput, typename Length = int, bool Verify = false>
-__global__ void IndexScoresDecode(const float *q, const BF16 *packedKeys,
+__global__ void IndexScoresDecode(const float *q, FastllmNaiveKV packedKeys,
         const BF16 *weights, ScoreOutput scores, int stride, Length liveKeys, int queryStart,
         const void *const *cache = nullptr) {
-    if (cache) packedKeys = (const BF16 *)cache[0];
+    packedKeys.Bind(cache);
     if constexpr (Verify) {
         const int row = blockIdx.y;
         q += (size_t)row * 16 * 128;
@@ -794,7 +801,7 @@ __global__ void IndexScoresDecode(const float *q, const BF16 *packedKeys,
     float k[4];
     #pragma unroll
     for (int i = 0; i < 4; ++i)
-        k[i] = (float)packedKeys[(size_t)key * stride + stride - 128 + lane + i * 32];
+        k[i] = (float)packedKeys.Row(key, stride)[stride - 128 + lane + i * 32];
     float score = 0;
     for (int h = 0; h < 16; ++h) {
         float dot = 0;
@@ -931,7 +938,7 @@ __device__ int KeyIndex(const int *indices, int query, int slot, int count,
 }
 
 template <typename Length = int, typename Count = int>
-__global__ void AttentionScores(const BF16 *q, const BF16 *k, const int *indices,
+__global__ void AttentionScores(const BF16 *q, FastllmNaiveKV k, const int *indices,
                                 float *scores, int heads, int kvHeads, int dim,
                                 int keyStride, Length liveKeys, Count liveCount, int past, int window, bool causal) {
     int count = liveCount;
@@ -949,7 +956,7 @@ __global__ void AttentionScores(const BF16 *q, const BF16 *k, const int *indices
         if (valid) {
             for (int d = lane; d < dim; d += 32)
                 dot += (float)q[((size_t)query * heads + h) * dim + d] *
-                       (float)k[(size_t)key * keyStride + kvHead * dim + d];
+                       (float)k.Row(key, keyStride)[kvHead * dim + d];
         }
         dot = WarpSum(dot);
         if (lane == 0)
@@ -970,7 +977,7 @@ constexpr int kDecodeValueTile = 64;
 
 // Preserve each head's arithmetic order while sharing gathered K loads.
 template<int HeadTile, int MaxDim, int KeyTile = 32, typename Length = int, bool Verify = false>
-__global__ void AttentionScoresDecodeGrouped(const BF16 *q, const BF16 *k,
+__global__ void AttentionScoresDecodeGrouped(const BF16 *q, FastllmNaiveKV k,
         const int *indices, float *scores, int heads, int kvHeads, int dim,
         int keyStride, Length liveKeys, int count, int past, bool causal) {
     if constexpr (Verify) {
@@ -1002,7 +1009,7 @@ __global__ void AttentionScoresDecodeGrouped(const BF16 *q, const BF16 *k,
         #pragma unroll
         for (int j = 0; j < MaxDim / 32; ++j) {
             if (valid && lane + j * 32 < dim) {
-                float value = (float)k[(size_t)key * keyStride + kvHead * dim + lane + j * 32];
+                float value = (float)k.Row(key, keyStride)[kvHead * dim + lane + j * 32];
                 #pragma unroll
                 for (int h = 0; h < HeadTile; ++h)
                     dot[h] += query[h][j] * value;
@@ -1021,7 +1028,7 @@ __global__ void AttentionScoresDecodeGrouped(const BF16 *q, const BF16 *k,
 // Stage eight selected K rows once for sixteen Q heads. The aligned load
 // path keeps each head's original lane sum, warp tree and BF16 rounding.
 template <typename Length = int>
-__global__ void AttentionScoresDecodeShared(const BF16 *q, const BF16 *k,
+__global__ void AttentionScoresDecodeShared(const BF16 *q, FastllmNaiveKV k,
         const int *indices, float *scores, int heads, int kvHeads, int dim,
         int keyStride, Length liveKeys, int count, int past, bool causal) {
     int keys = liveKeys;
@@ -1041,7 +1048,7 @@ __global__ void AttentionScoresDecodeShared(const BF16 *q, const BF16 *k,
     for (int i = t; i < KeyTile * (MaxDim / 8); i += threads) {
         int row = i / (MaxDim / 8), d = i % (MaxDim / 8) * 8, key = selected[row];
         *reinterpret_cast<uint4 *>(&values[row][d]) = key >= 0
-            ? *reinterpret_cast<const uint4 *>(k + (size_t)key * keyStride + kvHead * dim + d)
+            ? *reinterpret_cast<const uint4 *>(k.Row(key, keyStride) + kvHead * dim + d)
             : make_uint4(0, 0, 0, 0);
     }
     int head = firstHead + warp * HeadsPerWarp;
@@ -1085,7 +1092,7 @@ __global__ void AttentionScoresDecodeShared(const BF16 *q, const BF16 *k,
 // The bounded query register tile leaves larger head dimensions on the
 // general kernel; this path is only used for multiple-query prefill.
 template <int MaxDim, typename Length = int, typename Past = int>
-__global__ void AttentionScoresPrefill(const BF16 *q, const BF16 *k, const int *indices,
+__global__ void AttentionScoresPrefill(const BF16 *q, FastllmNaiveKV k, const int *indices,
                                       float *scores, int heads, int kvHeads, int dim,
                                       int keyStride, Length liveKeys, Length liveCount, Past livePast,
                                       int window, bool causal) {
@@ -1113,7 +1120,7 @@ __global__ void AttentionScoresPrefill(const BF16 *q, const BF16 *k, const int *
         for (int j = 0; j < MaxDim / 32; ++j) if (lane + j * 32 < dim) {
             #pragma unroll
             for (int i = 0; i < keysPerWarp; ++i) if (valid[i])
-                dot[i] += queryValues[j] * (float)k[(size_t)key[i] * keyStride + kvHead * dim + lane + j * 32];
+                dot[i] += queryValues[j] * (float)k.Row(key[i], keyStride)[kvHead * dim + lane + j * 32];
         }
         #pragma unroll
         for (int i = 0; i < keysPerWarp; ++i) {
@@ -1128,7 +1135,7 @@ __global__ void AttentionScoresPrefill(const BF16 *q, const BF16 *k, const int *
 // Reuse each K load across two Q heads in the same KV group. One key per
 // warp keeps the register tile small; each dot retains the original lane
 // accumulation, warp reduction and BF16 rounding order.
-__global__ void AttentionScoresPrefillGrouped(const BF16 *q, const BF16 *k, const int *indices,
+__global__ void AttentionScoresPrefillGrouped(const BF16 *q, FastllmNaiveKV k, const int *indices,
                                              float *scores, int heads, int kvHeads, int dim,
                                              int keyStride, int keys, int count, int past,
                                              int window, bool causal) {
@@ -1150,7 +1157,7 @@ __global__ void AttentionScoresPrefillGrouped(const BF16 *q, const BF16 *k, cons
         float dot[headTile] = {};
         #pragma unroll
         for (int j = 0; j < maxDim / 32; ++j) if (lane + j * 32 < dim && valid) {
-            float keyValue = (float)k[(size_t)key * keyStride + kvHead * dim + lane + j * 32];
+            float keyValue = (float)k.Row(key, keyStride)[kvHead * dim + lane + j * 32];
             #pragma unroll
             for (int h = 0; h < headTile; ++h)
                 dot[h] += queryValues[h][j] * keyValue;
@@ -1168,8 +1175,8 @@ __global__ void AttentionScoresPrefillGrouped(const BF16 *q, const BF16 *k, cons
 // Four output columns per lane amortize index/probability reads and permit
 // aligned 64-bit V loads. Each column keeps its original slot-ordered FP32
 // accumulation. Four independent heads per CTA avoid one-warp block limits.
-template <typename Length = int, typename Past = int>
-__global__ void AttentionValuesPrefill(const float *prob, const BF16 *v, const int *indices,
+template <typename Length = int, typename Past = int, bool Paged = false>
+__global__ void AttentionValuesPrefill(const float *prob, FastllmNaiveKV v, const int *indices,
                                       BF16 *out, int heads, int kvHeads, int dim,
                                       Length liveKeys, Length liveCount, Past livePast, int window, bool causal) {
     int keys = liveKeys, count = liveCount, past = livePast;
@@ -1181,10 +1188,31 @@ __global__ void AttentionValuesPrefill(const float *prob, const BF16 *v, const i
     const float *p = prob + ((size_t)query * heads + h) * count;
     for (int d = lane * columns; d < dim; d += 32 * columns) {
         float sum[columns] = {};
+        int mappedKey = -1;
         for (int slot = 0; slot < count; ++slot) {
-            int key = KeyIndex(indices, query, slot, count, past, window);
-            if (key >= 0 && key < keys && (!causal || key <= past + query)) {
-                uint2 bits = *reinterpret_cast<const uint2*>(v + ((size_t)key * kvHeads + kvHead) * dim + d);
+            int key;
+            bool valid;
+            if constexpr (Paged) {
+                // Resolve 32 page lookups together, then broadcast them in
+                // original slot order. Avoid a dependent page-table load
+                // before each serial V load without adding global scratch.
+                if ((slot & 31) == 0) {
+                    int logical = slot + lane < count
+                        ? KeyIndex(indices, query, slot + lane, count, past, window) : -1;
+                    mappedKey = logical >= 0 && logical < keys && (!causal || logical <= past + query)
+                        ? v.PhysicalRow(logical) : -1;
+                }
+                key = __shfl_sync(0xffffffff, mappedKey, slot & 31);
+                valid = key >= 0;
+            } else {
+                key = KeyIndex(indices, query, slot, count, past, window);
+                valid = key >= 0 && key < keys && (!causal || key <= past + query);
+            }
+            if (valid) {
+                const BF16 *row;
+                if constexpr (Paged) row = v.base + (size_t)key * kvHeads * dim + v.offset;
+                else row = v.Row(key, kvHeads * dim);
+                uint2 bits = *reinterpret_cast<const uint2*>(row + kvHead * dim + d);
                 unsigned words[2] = {bits.x, bits.y};
                 float weight = p[slot];
                 #pragma unroll
@@ -1287,7 +1315,7 @@ __global__ void AttentionSoftmaxDecode(float *scores, const float *sink) {
 // Keep eager's BF16 score/probability rounding, sink and reduction order while
 // removing the score tensor round-trip and two launches per layer.
 template <typename Length = int, typename Past = int>
-__global__ void AttentionShort(const BF16 *q, const BF16 *k, const BF16 *v,
+__global__ void AttentionShort(const BF16 *q, FastllmNaiveKV k, FastllmNaiveKV v,
                                const int *indices, const float *sink, BF16 *out,
                                int heads, int kvHeads, int dim, int valueDim,
                                int keyStride, Length liveKeys, int count, Past livePast, int window, bool causal) {
@@ -1302,7 +1330,7 @@ __global__ void AttentionShort(const BF16 *q, const BF16 *k, const BF16 *v,
         bool valid = key >= 0 && key < keys && (!causal || key <= past + query);
         if (valid) for (int d = lane; d < dim; d += 32)
             dot += (float)q[((size_t)query * heads + h) * dim + d] *
-                   (float)k[(size_t)key * keyStride + kvHead * dim + d];
+                   (float)k.Row(key, keyStride)[kvHead * dim + d];
         dot = WarpSum(dot);
         if (lane == 0) scores[slot] = valid ? RoundBF16(RoundBF16(dot) * rsqrtf((float)dim)) : -INFINITY;
     }
@@ -1333,7 +1361,7 @@ __global__ void AttentionShort(const BF16 *q, const BF16 *k, const BF16 *v,
         for (int slot = 0; slot < count; ++slot) {
             int key = KeyIndex(indices, query, slot, count, past, window);
             if (key >= 0 && key < keys && (!causal || key <= past + query))
-                value += scores[slot] * (float)v[((size_t)key * kvHeads + kvHead) * valueDim + d];
+                value += scores[slot] * (float)v.Row(key, kvHeads * valueDim)[kvHead * valueDim + d];
         }
         out[((size_t)query * heads + h) * valueDim + d] = __float2bfloat16(value);
     }
@@ -1355,7 +1383,7 @@ struct BatchSwaKeys {
 // reference kernel's dependent global load for every output/slot pair.
 // The softmax tree, BF16 rounding and slot-ordered FP32 FMAs are unchanged.
 template <int MaxKeys, typename Length = int, bool Verify = false, int Threads = kSwaThreads, int OutputTile = kSwaOutputTile, bool Ring = false>
-__global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v,
+__global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNaiveKV v,
         const float *sink, BF16 *out, int heads, int kvHeads, int keyStride, const Length liveKeys) {
     if constexpr (std::is_same<Length, BatchSwaKeys>::value) {
         const int row = blockIdx.y;
@@ -1393,7 +1421,7 @@ __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v
     for (int i = t; i < keys * OutputTile; i += Threads) {
         int row = i / OutputTile, col = i % OutputTile;
         const int physical = Ring ? ((firstKey + row) & (kSwaWindow - 1)) : row;
-        values[row][col] = v[((size_t)physical * kvHeads + kvHead) * kSwaValueDim + firstDim + col];
+        values[row][col] = v.Row(physical, kvHeads * kSwaValueDim)[kvHead * kSwaValueDim + firstDim + col];
     }
     float query[kSwaQkDim / 32];
     #pragma unroll
@@ -1403,7 +1431,7 @@ __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v
         float dot = 0;
         #pragma unroll
         for (int i = 0; i < kSwaQkDim / 32; ++i)
-            dot += query[i] * (float)k[(size_t)physical * keyStride + kvHead * kSwaQkDim + lane + i * 32];
+            dot += query[i] * (float)k.Row(physical, keyStride)[kvHead * kSwaQkDim + lane + i * 32];
         dot = WarpSum(dot);
         if (lane == 0) scores[slot] = RoundBF16(RoundBF16(dot) * rsqrtf((float)kSwaQkDim));
     }
@@ -1463,7 +1491,7 @@ __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v
 // Dispatch by workload shape, independent of TP rank count. All variants retain
 // the same QK/softmax/PV arithmetic; only the work assigned to each CTA changes.
 template <bool Verify>
-void LaunchShortAttention(const BF16 *q, const BF16 *k, const BF16 *v,
+void LaunchShortAttention(const BF16 *q, FastllmNaiveKV k, FastllmNaiveKV v,
         const float *bias, BF16 *out, int rows, int heads, int kvHeads,
         int keyStride, DecodeKeys keys, bool sliding, bool ring = false) {
     int threads = kSwaThreads, tile = kSwaOutputTile;
@@ -1498,7 +1526,7 @@ void LaunchShortAttention(const BF16 *q, const BF16 *k, const BF16 *v,
         q, k, v, bias, out, heads, kvHeads, keyStride, keys);
 }
 
-__global__ void AttentionValues(const float *prob, const BF16 *v, const int *indices,
+__global__ void AttentionValues(const float *prob, FastllmNaiveKV v, const int *indices,
                                 BF16 *out, int heads, int kvHeads, int dim,
                                 int keys, int count, int past, int window, bool causal) {
     int query = blockIdx.y, h = blockIdx.x;
@@ -1509,7 +1537,7 @@ __global__ void AttentionValues(const float *prob, const BF16 *v, const int *ind
         for (int slot = 0; slot < count; slot++) {
             int key = KeyIndex(indices, query, slot, count, past, window);
             if (key >= 0 && key < keys && (!causal || key <= past + query))
-                sum += p[slot] * (float)v[((size_t)key * kvHeads + kvHead) * dim + d];
+                sum += p[slot] * (float)v.Row(key, kvHeads * dim)[kvHead * dim + d];
         }
         out[((size_t)query * heads + h) * dim + d] = __float2bfloat16(sum);
     }
@@ -1520,7 +1548,7 @@ __global__ void AttentionValues(const float *prob, const BF16 *v, const int *ind
 // Inputs/probability rounding and BF16 output are unchanged; the FP32 sum order
 // differs from the serial fallback. Prefill and other shapes keep their paths.
 template <typename Length = int>
-__global__ void AttentionValuesDecodePartial(const float *prob, const BF16 *v,
+__global__ void AttentionValuesDecodePartial(const float *prob, FastllmNaiveKV v,
         const int *indices, float *partial, int heads, int kvHeads,
         Length liveKeys, int past, bool causal) {
     int keys = liveKeys;
@@ -1537,7 +1565,7 @@ __global__ void AttentionValuesDecodePartial(const float *prob, const BF16 *v,
             int slot = base + i, key = indices ? indices[slot] : slot;
             valid[i] = key >= 0 && key < keys && (!causal || key <= past);
             probabilities[i] = prob[h * count + slot];
-            values[i] = valid[i] ? (float)v[((size_t)key * kvHeads + kvHead) * dim + d] : 0;
+            values[i] = valid[i] ? (float)v.Row(key, kvHeads * dim)[kvHead * dim + d] : 0;
         }
         #pragma unroll
         for (int i = 0; i < 8; ++i)
@@ -1547,7 +1575,7 @@ __global__ void AttentionValuesDecodePartial(const float *prob, const BF16 *v,
 }
 
 template<int HeadTile, typename Length = int, bool Verify = false>
-__global__ void AttentionValuesDecodeGrouped(const float *prob, const BF16 *v,
+__global__ void AttentionValuesDecodeGrouped(const float *prob, FastllmNaiveKV v,
         const int *indices, float *partial, int heads, int kvHeads,
         Length liveKeys, int past, bool causal) {
     constexpr int count = kDecodePVKeys, dim = kDecodePVValueDim;
@@ -1571,7 +1599,7 @@ __global__ void AttentionValuesDecodeGrouped(const float *prob, const BF16 *v,
         for (int i = 0; i < 8; ++i) {
             int key = indices ? indices[base + i] : base + i;
             valid[i] = key >= 0 && key < keys && (!causal || key <= past);
-            values[i] = valid[i] ? (float)v[((size_t)key * kvHeads + kvHead) * dim + d] : 0;
+            values[i] = valid[i] ? (float)v.Row(key, kvHeads * dim)[kvHead * dim + d] : 0;
         }
         #pragma unroll
         for (int h = 0; h < HeadTile; ++h) {
@@ -1592,7 +1620,7 @@ __global__ void AttentionValuesDecodeGrouped(const float *prob, const BF16 *v,
 // Sixteen Q heads share a 64-key by 64-column V tile. Each warp computes
 // two heads; the existing 64-key partial sums and final reduction stay ordered.
 template <typename Length = int>
-__global__ void AttentionValuesDecodeShared(const float *prob, const BF16 *v,
+__global__ void AttentionValuesDecodeShared(const float *prob, FastllmNaiveKV v,
         const int *indices, float *partial, int heads, int kvHeads,
         Length liveKeys, int past, bool causal) {
     int keys = liveKeys;
@@ -1616,7 +1644,7 @@ __global__ void AttentionValuesDecodeShared(const float *prob, const BF16 *v,
     for (int i = t; i < slots * (ValueTile / 8); i += threads) {
         int row = i / (ValueTile / 8), d = i % (ValueTile / 8) * 8, key = selected[row];
         *reinterpret_cast<uint4 *>(&values[row][d]) = key >= 0
-            ? *reinterpret_cast<const uint4 *>(v + ((size_t)key * kvHeads + kvHead) * dim + firstColumn + d)
+            ? *reinterpret_cast<const uint4 *>(v.Row(key, kvHeads * dim) + kvHead * dim + firstColumn + d)
             : make_uint4(0, 0, 0, 0);
     }
     __syncthreads();
@@ -1674,7 +1702,7 @@ __global__ void AttentionValuesDecodeReduce(const float *partial, BF16 *out, int
 // load for each of 2048 slots. Output dimensions form separate CTAs; each
 // output keeps exactly the original slot order and FP32 FMA accumulation.
 template <typename Length = int, typename Count = int>
-__global__ void AttentionValuesTiled(const float *prob, const BF16 *v,
+__global__ void AttentionValuesTiled(const float *prob, FastllmNaiveKV v,
         const int *indices, BF16 *out, int heads, int kvHeads, int dim,
         Length liveKeys, Count liveCount, int past, int window, bool causal) {
     int count = liveCount;
@@ -1699,7 +1727,7 @@ __global__ void AttentionValuesTiled(const float *prob, const BF16 *v,
             int row = i / 32, col = blockIdx.z * 32 + i % 32;
             int key = selected[row];
             values[row][i % 32] = key >= 0 && col < dim
-                ? v[((size_t)key * kvHeads + kvHead) * dim + col] : __float2bfloat16(0);
+                ? v.Row(key, kvHeads * dim)[kvHead * dim + col] : __float2bfloat16(0);
         }
         __syncthreads();
         if (t < 32 && d < dim) {
@@ -1716,7 +1744,7 @@ __global__ void AttentionValuesTiled(const float *prob, const BF16 *v,
 // CTAs. Keep the original ascending-key FP32 accumulation and final BF16
 // rounding; all staging is shared memory, with no global partial buffer.
 template <int Columns>
-__global__ void AttentionValuesDecodeDense(const float *prob, const BF16 *value,
+__global__ void AttentionValuesDecodeDense(const float *prob, FastllmNaiveKV value,
         BF16 *output, const int *liveKeys, int capacity, int heads, int kvHeads) {
     constexpr int Dim = 128, Keys = 64;
     const int head = blockIdx.x, firstColumn = blockIdx.y * Columns;
@@ -1731,7 +1759,7 @@ __global__ void AttentionValuesDecodeDense(const float *prob, const BF16 *value,
         if (t < rows) probabilities[t] = p[first + t];
         for (int i = t; i < rows * Columns; i += blockDim.x) {
             const int row = i / Columns, column = i % Columns;
-            values[row][column] = value[((size_t)(first + row) * kvHeads + kvHead) * Dim + firstColumn + column];
+            values[row][column] = value.Row(first + row, kvHeads * Dim)[kvHead * Dim + firstColumn + column];
         }
         __syncthreads();
         if (t < Columns) {
@@ -2166,6 +2194,14 @@ static bool PrepareRopeCache(fastllm::Data &q, const fastllm::Data &k,
         packedQkv ? (const BF16 *)packedQkv->cudaData : nullptr,
         (const float *)positions.cudaData, dynamicLength ? (const int *)liveKeys.cudaData : nullptr,
         keyRows, valueRows, cachePast};
+    if (key.isPagedKVCache) {
+        if (!value.isPagedKVCache || key.pageLen != value.pageLen || window) return false;
+        row.key = (BF16 *)key.pagedKVCacheData->cudaData;
+        row.value = (BF16 *)value.pagedKVCacheData->cudaData;
+        row.keyPages = (const int *)key.cudaData;
+        row.valuePages = (const int *)value.cudaData;
+        row.pageLen = key.pageLen;
+    }
     return true;
 }
 
@@ -2316,13 +2352,13 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
             (float *)qScale.cudaData, dim, 0);
         if (queries == 1) {
             naive_dsa_mma::IndexerDecodeScores<<<(keys + kKeys - 1) / kKeys, kThreads>>>(
-                (const BF16 *)q.cudaData, (const BF16 *)packedKeys.cudaData,
+                (const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
                 (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
                 topKOutput, stride, keys, queryStart);
         } else {
             naive_dsa_mma::IndexerScores<<<dim3((keys + kKeys - 1) / kKeys,
                 (queries + kKeys - 1) / kKeys), kThreads>>>(
-                (const BF16 *)q.cudaData, (const BF16 *)packedKeys.cudaData,
+                (const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
                 (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
                 (float *)scores.cudaData, queries, keys, queryStart, stride);
         }
@@ -2334,11 +2370,11 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
             (float *)q.cudaData, dim, 0, fp8Query);
         if (decodeTopK) {
             IndexScoresDecode<<<(keys + 7) / 8, 256>>>((const float *)q.cudaData,
-                (const BF16 *)packedKeys.cudaData, (const BF16 *)weights.cudaData,
+                FastllmNaiveKV(packedKeys), (const BF16 *)weights.cudaData,
                 topKOutput, stride, keys, queryStart);
         } else {
             Output(k, DataType::FLOAT32, {keys, dim});
-            RoundIndexer<<<keys, 128>>>((const BF16 *)packedKeys.cudaData,
+            RoundIndexer<<<keys, 128>>>(FastllmNaiveKV(packedKeys),
                 (float *)k.cudaData, stride, stride - dim, false);
             if (queries > 1 && heads == 16) {
                 // A larger tile amortizes operand loads once there are enough tiles
@@ -2491,7 +2527,7 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         dim == kSwaQkDim && valueDim == kSwaValueDim && key.dims[2] == kvHeads * dim) {
         AttentionShortDecode<kSwaWindow><<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
             (const BF16 *)query.cudaData,
-            (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
+            FastllmNaiveKV(key), FastllmNaiveKV(value),
             sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
             (BF16 *)output.cudaData, heads, kvHeads, key.dims[2], keys);
         CheckLaunch();
@@ -2502,7 +2538,7 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         dim == kSwaQkDim && valueDim == kSwaValueDim) {
         AttentionShortDecode<256><<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
             (const BF16 *)query.cudaData,
-            (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
+            FastllmNaiveKV(key), FastllmNaiveKV(value),
             sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
             (BF16 *)output.cudaData, heads, kvHeads, key.dims[2], keys);
         CheckLaunch();
@@ -2510,7 +2546,7 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     }
     if (count <= 256) {
         AttentionShort<<<dim3(heads, queries), 256>>>((const BF16 *)query.cudaData,
-            (const BF16 *)key.cudaData, (const BF16 *)value.cudaData, selected,
+            FastllmNaiveKV(key), FastllmNaiveKV(value), selected,
             sink.dims.empty() ? nullptr : (const float *)sink.cudaData, (BF16 *)output.cudaData,
             heads, kvHeads, dim, valueDim, key.dims[2], keys, count, pastLength, window, causal);
         CheckLaunch();
@@ -2535,7 +2571,7 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     if (useMma) {
         naive_dsa_mma::Scores<<<dim3(queries, heads / naive_dsa_mma::kHeads,
             (count + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys), naive_dsa_mma::kThreads>>>(
-            (const BF16 *)query.cudaData, (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,
+            (const BF16 *)query.cudaData, FastllmNaiveKV(key), selected, (float *)scores.cudaData,
             heads, kvHeads, key.dims[2], keys, count, pastLength, causal);
     } else
 #endif
@@ -2543,28 +2579,28 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     if (sharedDecode && dim == kDecodeQkDim && key.dims[2] % 8 == 0 &&
         (size_t)key.cudaData % 16 == 0) {
         AttentionScoresDecodeShared<<<dim3(heads / kDecodeSharedHeads, count / kDecodeQkKeyTile), kDecodeSharedThreads>>>(
-            (const BF16 *)query.cudaData, (const BF16 *)key.cudaData, selected,
+            (const BF16 *)query.cudaData, FastllmNaiveKV(key), selected,
             (float *)scores.cudaData, heads, kvHeads, dim, key.dims[2],
             keys, count, pastLength, causal);
     } else if (groupedDecode && dim <= kDecodeQkDim) {
         AttentionScoresDecodeGrouped<4, kDecodeQkDim><<<dim3(heads / 4, count / 32), 128>>>(
-            (const BF16 *)query.cudaData, (const BF16 *)key.cudaData, selected,
+            (const BF16 *)query.cudaData, FastllmNaiveKV(key), selected,
             (float *)scores.cudaData, heads, kvHeads, dim, key.dims[2],
             keys, count, pastLength, causal);
     } else
     // Small query blocks need the original per-head CTA count for occupancy.
     if (queries >= 32 && dim <= 192 && heads / kvHeads >= 2) {
         AttentionScoresPrefillGrouped<<<dim3(kvHeads, queries, (heads / kvHeads + 1) / 2), 128>>>(
-            (const BF16 *)query.cudaData, (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,
+            (const BF16 *)query.cudaData, FastllmNaiveKV(key), selected, (float *)scores.cudaData,
             heads, kvHeads, dim, key.dims[2], keys, count, pastLength, window, causal);
     } else if (queries > 1 && dim <= 256) {
         auto kernel = dim <= 192 ? AttentionScoresPrefill<192> : AttentionScoresPrefill<256>;
         kernel<<<dim3(heads, queries), 128>>>((const BF16 *)query.cudaData,
-            (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,
+            FastllmNaiveKV(key), selected, (float *)scores.cudaData,
             heads, kvHeads, dim, key.dims[2], keys, count, pastLength, window, causal);
     } else {
         AttentionScores<<<dim3(heads, queries, queries == 1 ? (count + 63) / 64 : 1), 256>>>((const BF16 *)query.cudaData,
-            (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,
+            FastllmNaiveKV(key), selected, (float *)scores.cudaData,
             heads, kvHeads, dim, key.dims[2], keys, count, pastLength, window, causal);
     }
     if (sharedDecode) {
@@ -2577,7 +2613,7 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
 #ifdef FASTLLM_NAIVE_DSA_MMA
     if (useMma) {
         naive_dsa_mma::Values<<<dim3(queries, heads / naive_dsa_mma::kHeads), naive_dsa_mma::kThreads>>>(
-            (const float *)scores.cudaData, (const BF16 *)value.cudaData, selected, (BF16 *)output.cudaData,
+            (const float *)scores.cudaData, FastllmNaiveKV(value), selected, (BF16 *)output.cudaData,
             heads, kvHeads, keys, count, pastLength, causal);
     } else
 #endif
@@ -2587,30 +2623,35 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         if (sharedDecode && (size_t)value.cudaData % 16 == 0) {
             AttentionValuesDecodeShared<<<dim3(heads / kDecodeSharedHeads, kDecodePVParts,
                 kDecodePVValueDim / kDecodeValueTile), kDecodeSharedThreads>>>(
-                (const float *)scores.cudaData, (const BF16 *)value.cudaData,
+                (const float *)scores.cudaData, FastllmNaiveKV(value),
                 selected, (float *)partial.cudaData, heads, kvHeads, keys, pastLength, causal);
         } else if (groupedDecode) {
             AttentionValuesDecodeGrouped<4><<<dim3(heads / 4, kDecodePVParts), kDecodePVValueDim>>>(
-                (const float *)scores.cudaData, (const BF16 *)value.cudaData,
+                (const float *)scores.cudaData, FastllmNaiveKV(value),
                 selected, (float *)partial.cudaData, heads, kvHeads, keys, pastLength, causal);
         } else {
             AttentionValuesDecodePartial<<<dim3(heads, kDecodePVParts), kDecodePVValueDim>>>(
-                (const float *)scores.cudaData, (const BF16 *)value.cudaData,
+                (const float *)scores.cudaData, FastllmNaiveKV(value),
                 selected, (float *)partial.cudaData, heads, kvHeads, keys, pastLength, causal);
         }
         AttentionValuesDecodeReduce<<<(heads * kDecodePVValueDim + 255) / 256, 256>>>(
             (const float *)partial.cudaData, (BF16 *)output.cudaData, heads);
     } else if (queries == 1) {
         AttentionValuesTiled<<<dim3(heads, queries, (valueDim + 31) / 32), 256>>>((const float *)scores.cudaData,
-            (const BF16 *)value.cudaData, selected, (BF16 *)output.cudaData,
+            FastllmNaiveKV(value), selected, (BF16 *)output.cudaData,
             heads, kvHeads, valueDim, keys, count, pastLength, window, causal);
     } else if (valueDim % 4 == 0 && (size_t)value.cudaData % alignof(uint2) == 0) {
-        AttentionValuesPrefill<<<dim3((heads + 3) / 4, queries), 128>>>((const float *)scores.cudaData,
-            (const BF16 *)value.cudaData, selected, (BF16 *)output.cudaData,
+        // The cooperative page lookup requires all 32 lanes to own columns.
+        if (value.isPagedKVCache && valueDim % 128 == 0)
+            AttentionValuesPrefill<int, int, true><<<dim3((heads + 3) / 4, queries), 128>>>((const float *)scores.cudaData,
+                FastllmNaiveKV(value), selected, (BF16 *)output.cudaData,
+                heads, kvHeads, valueDim, keys, count, pastLength, window, causal);
+        else AttentionValuesPrefill<<<dim3((heads + 3) / 4, queries), 128>>>((const float *)scores.cudaData,
+            FastllmNaiveKV(value), selected, (BF16 *)output.cudaData,
             heads, kvHeads, valueDim, keys, count, pastLength, window, causal);
     } else {
         AttentionValues<<<dim3(heads, queries), 256>>>((const float *)scores.cudaData,
-            (const BF16 *)value.cudaData, selected, (BF16 *)output.cudaData,
+            FastllmNaiveKV(value), selected, (BF16 *)output.cudaData,
             heads, kvHeads, valueDim, keys, count, pastLength, window, causal);
     }
     CheckLaunch();
@@ -2683,13 +2724,15 @@ __global__ void DraftInput(const float *id, const BF16 *embedding, const BF16 *m
 
 __global__ void AppendDecodeKV(BF16 *key, BF16 *value, const BF16 *newKey,
         const BF16 *newValue, const int *length, int keyColumns, int valueColumns,
-        int window, bool ring) {
+        int window, bool ring, const int *keyPages, const int *valuePages, int pageLen) {
     int column = blockIdx.x * blockDim.x + threadIdx.x;
     int row = *length - 1;
     if (window) row = ring ? (row & (kSwaWindow - 1)) : min(row, window - 1);
-    if (column < keyColumns) key[(size_t)row * keyColumns + column] = newKey[column];
+    int kr = keyPages ? keyPages[row / pageLen] * pageLen + row % pageLen : row;
+    int vr = valuePages ? valuePages[row / pageLen] * pageLen + row % pageLen : row;
+    if (column < keyColumns) key[(size_t)kr * keyColumns + column] = newKey[column];
     else if ((column -= keyColumns) < valueColumns)
-        value[(size_t)row * valueColumns + column] = newValue[column];
+        value[(size_t)vr * valueColumns + column] = newValue[column];
 }
 
 __global__ void AppendVerifyKV(BF16 *key, BF16 *value, const BF16 *newKey,
@@ -2773,14 +2816,37 @@ void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
     CheckLaunch();
 }
 
+namespace {
+__global__ void PagedWrite(BF16 *pool, const int *pages, const BF16 *input, int start, int count, int width, int pageLen) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)count * width) return;
+    int row = start + i / width;
+    size_t physical = (size_t)pages[row / pageLen] * pageLen + row % pageLen;
+    pool[physical * width + i % width] = input[i];
+}
+}
+void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start) {
+    fastllm::AssertInFastLLM(cache.isPagedKVCache && cache.pagedKVCacheData &&
+        cache.dataType == fastllm::BFLOAT16 && input.dataType == fastllm::BFLOAT16 &&
+        cache.dims[2] == input.dims[2] && start >= 0 &&
+        start + input.dims[1] <= (int)cache.pageIndex.size() * cache.pageLen,
+        "Invalid Naive paged append.");
+    PagedWrite<<<(input.Count(0) + 255) / 256, 256>>>((BF16 *)cache.pagedKVCacheData->cudaData,
+        (const int *)cache.cudaData, (const BF16 *)input.cudaData,
+        start, input.dims[1], input.dims[2], cache.pageLen);
+    CheckLaunch();
+}
+
 void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &newKey, const fastllm::Data &newValue,
         const fastllm::Data &liveKeys, int window, bool ring) {
     fastllm::AssertInFastLLM(!ring || window == kSwaWindow, "Invalid SWA ring window.");
     int kc = key.dims[2], vc = value.dims[2];
-    AppendDecodeKV<<<(kc + vc + 255) / 256, 256>>>((BF16 *)key.cudaData,
-        (BF16 *)value.cudaData, (const BF16 *)newKey.cudaData,
-        (const BF16 *)newValue.cudaData, (const int *)liveKeys.cudaData, kc, vc, window, ring);
+    AppendDecodeKV<<<(kc + vc + 255) / 256, 256>>>((BF16 *)(key.isPagedKVCache ? key.pagedKVCacheData->cudaData : key.cudaData),
+        (BF16 *)(value.isPagedKVCache ? value.pagedKVCacheData->cudaData : value.cudaData), (const BF16 *)newKey.cudaData,
+        (const BF16 *)newValue.cudaData, (const int *)liveKeys.cudaData, kc, vc, window, ring,
+        key.isPagedKVCache ? (const int *)key.cudaData : nullptr,
+        value.isPagedKVCache ? (const int *)value.cudaData : nullptr, key.pageLen);
     CheckLaunch();
 }
 
@@ -2832,7 +2898,7 @@ void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
             (BF16 *)scratch.indexQuery.cudaData, (float *)scratch.indexScale.cudaData, 128, 0);
         naive_dsa_mma::IndexerDecodeScores<<<(capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys,
             naive_dsa_mma::kThreads>>>((const BF16 *)scratch.indexQuery.cudaData,
-            (const BF16 *)packedKeys.cudaData, (const float *)scratch.indexScale.cudaData,
+            FastllmNaiveKV(packedKeys), (const float *)scratch.indexScale.cudaData,
             (const BF16 *)weights.cudaData, scoreOutput, stride, keys, capacity - 1, cache);
     } else
 #endif
@@ -2841,7 +2907,7 @@ void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
         RoundIndexer<<<16, 128>>>((const BF16 *)query.cudaData,
             (float *)scratch.indexQuery.cudaData, 128, 0, fp8Query);
         IndexScoresDecode<<<(capacity + 7) / 8, 256>>>((const float *)scratch.indexQuery.cudaData,
-            (const BF16 *)packedKeys.cudaData, (const BF16 *)weights.cudaData,
+            FastllmNaiveKV(packedKeys), (const BF16 *)weights.cudaData,
             scoreOutput, stride, keys, capacity - 1, cache);
     }
     Output(scratch.topk, INT32, {(int)(sizeof(naive_topk::Workspace) / sizeof(int))});
@@ -2903,7 +2969,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             Output(scratch.indexScores, INT32, {row.capacity});
             Output(scratch.topk, INT32, {(int)(sizeof(naive_topk::Workspace) / sizeof(int))});
             Output(*row.indices, INT32, {1, naive_topk::kTopK});
-            descriptors.rows[i] = {(const BF16 *)row.key->cudaData,
+            descriptors.rows[i] = {FastllmNaiveKV(*row.key),
                 (const int *)liveKeys.cudaData + row.sequence, (BF16 *)scratch.indexQuery.cudaData,
                 (float *)scratch.indexScale.cudaData, (unsigned *)scratch.indexScores.cudaData,
                 (naive_topk::Workspace *)scratch.topk.cudaData, (int *)row.indices->cudaData,
@@ -3083,11 +3149,20 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
         auto *out = (BF16 *)output.cudaData + (size_t)first * heads * valueDim;
         auto *scores = (float *)scratch.attentionScores.cudaData;
         if (hopper) {
-            dsa::DirectScores<4, 4><<<dim3(heads, (count + 15) / 16, batch), 128>>>(
-                q, descriptors, scores, heads, kvHeads, count);
+            const bool sharedHeads = heads == 8 && kvHeads == 1;
+            // Larger sparse batches have enough CTAs to amortize a descriptor
+            // and page lookup over more keys without changing each dot product.
+            if (sharedHeads && sparse && batch >= 8)
+                dsa::DirectScores<16, 4><<<dim3(heads, (count + 63) / 64, batch), 128>>>(
+                    q, descriptors, scores, heads, kvHeads, count);
+            else if (sharedHeads && sparse && batch >= 2)
+                dsa::DirectScores<8, 4><<<dim3(heads, (count + 31) / 32, batch), 128>>>(
+                    q, descriptors, scores, heads, kvHeads, count);
+            else
+                dsa::DirectScores<4, 4><<<dim3(heads, (count + 15) / 16, batch), 128>>>(
+                    q, descriptors, scores, heads, kvHeads, count);
             // Share V across heads, with wider output tiles for larger dense
             // batches. Each head retains the original softmax/PV arithmetic.
-            const bool sharedHeads = heads == 8 && kvHeads == 1;
             if (sharedHeads && dense && batch >= 3 && count <= 1024)
                 dsa::GroupedValues<1024, 4, 16, false><<<dim3(heads / 4, 8, batch), 1024,
                     sizeof(dsa::GroupStorage<1024, 4, 16>)>>>(scores, bias, descriptors, out,
@@ -3096,7 +3171,7 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
                 dsa::GroupedValues<2048, 4, 16, false><<<dim3(heads / 4, 8, batch), 1024,
                     sizeof(dsa::GroupStorage<2048, 4, 16>)>>>(scores, bias, descriptors, out,
                     heads, kvHeads, count);
-            else if (sharedHeads && sparse && batch == 1)
+            else if (sharedHeads && sparse && (batch == 1 || batch >= 8))
                 dsa::GroupedValues<2048, 2, 8, true><<<dim3(heads / 2, 16, batch), 512,
                     sizeof(dsa::GroupStorage<2048, 2, 8>)>>>(scores, bias, descriptors, out,
                     heads, kvHeads, count);
@@ -3195,8 +3270,8 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
                    "Unsupported SWA ring attention shape.");
     DecodeKeys keys{(const int *)liveKeys.cudaData, window};
     auto *q = (const BF16 *)query.cudaData;
-    auto *k = (const BF16 *)key.cudaData;
-    auto *v = (const BF16 *)value.cudaData;
+    FastllmNaiveKV k(key);
+    FastllmNaiveKV v(value);
     auto *selected = indices.dims.empty() ? nullptr : (const int *)indices.cudaData;
     auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
     Output(output, BFLOAT16, {1, 1, heads * valueDim});
@@ -3234,7 +3309,7 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
             bool split = heads >= 4 && valueDim == kDecodePVValueDim;
             bool grouped = heads % kvHeads == 0 && (heads / kvHeads) % 4 == 0;
             bool shared = grouped && (heads / kvHeads) % kDecodeSharedHeads == 0;
-            if (shared && dim == kDecodeQkDim && key.dims[2] % 8 == 0 && (size_t)k % 16 == 0) {
+            if (shared && dim == kDecodeQkDim && key.dims[2] % 8 == 0 && (size_t)k.base % 16 == 0) {
                 AttentionScoresDecodeShared<<<dim3(heads / kDecodeSharedHeads, count / kDecodeQkKeyTile), kDecodeSharedThreads>>>(
                     q, k, selected, scores, heads, kvHeads, dim, key.dims[2], keys, count, capacity - 1, true);
             } else if (grouped && dim <= kDecodeQkDim) {
@@ -3249,7 +3324,7 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
             if (split) {
                 Output(scratch.attentionPartial, FLOAT32, {heads, kDecodePVParts, valueDim});
                 auto *partial = (float *)scratch.attentionPartial.cudaData;
-                if (shared && (size_t)v % 16 == 0) {
+                if (shared && (size_t)v.base % 16 == 0) {
                     AttentionValuesDecodeShared<<<dim3(heads / kDecodeSharedHeads, kDecodePVParts, 2), kDecodeSharedThreads>>>(
                         scores, v, selected, partial, heads, kvHeads, keys, capacity - 1, true);
                 } else if (grouped) {

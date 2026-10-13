@@ -1,4 +1,5 @@
 #pragma once
+#include "devices/cuda/naive-n05-kv.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -41,7 +42,7 @@ __device__ __forceinline__ int SelectedKey(const int *indices, int query, int sl
 }
 #endif
 
-__global__ __launch_bounds__(kThreads) void Scores(const BF16 *q, const BF16 *k,
+__global__ __launch_bounds__(kThreads) void Scores(const BF16 *q, FastllmNaiveKV k,
         const int *indices, float *scores, int heads, int kvHeads, int keyStride,
         int keys, int count, int past, bool causal) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -61,7 +62,7 @@ __global__ __launch_bounds__(kThreads) void Scores(const BF16 *q, const BF16 *k,
         if (lane == 0) valid[slot] = key >= 0;
         if (lane < kQkDim / 8) {
             uint4 values = key >= 0 ? *reinterpret_cast<const uint4*>(
-                k + (size_t)key * keyStride + kvHead * kQkDim + lane * 8) : make_uint4(0,0,0,0);
+                k.Row(key, keyStride) + kvHead * kQkDim + lane * 8) : make_uint4(0,0,0,0);
             *reinterpret_cast<uint4*>(&ks[slot][lane * 8]) = values;
         }
     }
@@ -89,7 +90,7 @@ __global__ __launch_bounds__(kThreads) void Scores(const BF16 *q, const BF16 *k,
 #endif
 }
 
-__global__ __launch_bounds__(kThreads) void Values(const float *prob, const BF16 *v,
+__global__ __launch_bounds__(kThreads) void Values(const float *prob, FastllmNaiveKV v,
         const int *indices, BF16 *out, int heads, int kvHeads,
         int keys, int count, int past, bool causal) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -115,7 +116,7 @@ __global__ __launch_bounds__(kThreads) void Values(const float *prob, const BF16
             int slot = i / (kValueDim / 8), col = i % (kValueDim / 8) * 8;
             int key = selected[slot];
             uint4 values = key >= 0 ? *reinterpret_cast<const uint4*>(
-                v + ((size_t)key * kvHeads + kvHead) * kValueDim + col) : make_uint4(0,0,0,0);
+                v.Row(key, kvHeads * kValueDim) + kvHead * kValueDim + col) : make_uint4(0,0,0,0);
             *reinterpret_cast<uint4*>(&vs[slot][col]) = values;
         }
         __syncthreads();
@@ -172,11 +173,11 @@ __global__ void QuantizeIndexer(const BF16 *input, BF16 *values, float *scales,
 // Both scoring kernels read the trailing Indexer K block from the packed cache.
 // Aligned rows use vector loads; partial tiles are zero-filled.
 __device__ __forceinline__ void LoadIndexerKeys(
-        BF16 (&tile)[kKeys][kIndexerDim + 8], const BF16 *packedKeys,
+        BF16 (&tile)[kKeys][kIndexerDim + 8], FastllmNaiveKV packedKeys,
         int stride, int first, int keys) {
     for (int i = threadIdx.x; i < kKeys * (kIndexerDim / 8); i += kThreads) {
         int row = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
-        const BF16 *src = packedKeys + (size_t)(first + row) * stride + stride - kIndexerDim + d;
+        const BF16 *src = packedKeys.Row(min(first + row, keys - 1), stride) + stride - kIndexerDim + d;
         if (stride % 8 == 0) {
             *reinterpret_cast<uint4*>(&tile[row][d]) = first + row < keys
                 ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
@@ -193,7 +194,7 @@ __device__ __forceinline__ void LoadIndexerKeys(
 // Keep FP32 MMA accumulation and ascending weighted-head order. Applying the
 // unchanged Q scales after MMA can change FP32 rounding relative to SIMT.
 template <typename ScoreOutput>
-__device__ __forceinline__ void IndexerDecodeScoresRow(const BF16 *q, const BF16 *packedKeys,
+__device__ __forceinline__ void IndexerDecodeScoresRow(const BF16 *q, FastllmNaiveKV packedKeys,
         const float *qscale, const BF16 *weights, ScoreOutput scores,
         int stride, int keys, int past) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -245,10 +246,10 @@ __device__ __forceinline__ void IndexerDecodeScoresRow(const BF16 *q, const BF16
 }
 
 template <typename ScoreOutput, typename Length = int, bool Verify = false>
-__global__ void IndexerDecodeScores(const BF16 *q, const BF16 *packedKeys,
+__global__ void IndexerDecodeScores(const BF16 *q, FastllmNaiveKV packedKeys,
         const float *qscale, const BF16 *weights, ScoreOutput scores,
         int stride, Length liveKeys, int past, const void *const *cache = nullptr) {
-    if (cache) packedKeys = (const BF16 *)cache[0];
+    packedKeys.Bind(cache);
     if constexpr (Verify) {
         const int row = blockIdx.y;
         q += (size_t)row * kHeads * kIndexerDim;
@@ -263,7 +264,7 @@ __global__ void IndexerDecodeScores(const BF16 *q, const BF16 *packedKeys,
 // 64 queries share each 64-key tile across all sixteen indexer heads.
 // Q uses E4M3 plus an FP32 scale; K uses the original BF16 values.
 // ReLU and weighted head accumulation remain in ascending head order.
-__global__ __launch_bounds__(256) void IndexerScores(const BF16 *q, const BF16 *k,
+__global__ __launch_bounds__(256) void IndexerScores(const BF16 *q, FastllmNaiveKV k,
         const float *qscale, const BF16 *weights,
         float *scores, int queries, int keys, int past, int keyStride) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800

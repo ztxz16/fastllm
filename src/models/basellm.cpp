@@ -514,7 +514,8 @@ namespace fastllm {
 
     void ResponseContext::TryRecord(basellm *model) {
         if (model->kvMemConfig.enabled) return;
-        model->TryRecordResponseContext(this);
+        if (model->DeferHistoryCacheRestore()) this->TryRecordPagedCache(model);
+        else model->TryRecordResponseContext(this);
     }
 
     void basellm::TryRecordResponseContext(ResponseContext *context) {
@@ -604,6 +605,7 @@ namespace fastllm {
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
         if (model->kvMemConfig.enabled) return;
+        if (model->DeferHistoryCacheRestore()) model->TryRecordResponseContext(this);
         if (!this->multimodalInput.empty()) {
             return;
         }
@@ -693,7 +695,9 @@ namespace fastllm {
             }
             if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty() &&
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
-                cache.pagedKVCacheData->Record(this->allTokens, cache.pageIndex);
+                auto pages = cache.pageIndex;
+                if (cache.lastPageLen < cache.pageLen) pages.pop_back();
+                cache.pagedKVCacheData->Record(this->allTokens, pages);
             }
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -1307,6 +1311,321 @@ namespace fastllm {
         exit(0);
     }
 
+    // Both schedulers restore the same page references and model-specific
+    // companion state. Called while scheduling is locked, between forwards.
+    static PagedCacheManager *RestoreResidentPrefix(basellm *model, ResponseContext *ctx) {
+        if (model->kvMemConfig.enabled || !ctx->multimodalInput.empty() || ctx->cacheLen != 0 ||
+            ctx->intParams.count("paged_prefix_restore_disabled")) return nullptr;
+        PagedCacheManager *probeManager = nullptr;
+        bool queryUnboundedLayersOnly = false;
+        for (int li = 0; li < model->block_cnt && probeManager == nullptr; li++) {
+            if (model->GetKVCacheRetainedTokens(li) >= 0) {
+                continue;
+            }
+            auto refs = model->GetPagedKVCacheManagers(li, true);
+            for (auto &ref : refs) {
+                if (ref.second != nullptr) {
+                    probeManager = ref.second;
+                    queryUnboundedLayersOnly = true;
+                    break;
+                }
+            }
+        }
+        if (probeManager == nullptr) {
+            auto probeRefs = model->GetPagedKVCacheManagers(
+                model->kvCacheId, true);
+            for (auto &ref : probeRefs) {
+                if (ref.second != nullptr) {
+                    probeManager = ref.second;
+                    break;
+                }
+            }
+        }
+        if (probeManager != nullptr) {
+            std::map<PagedCacheManager*, std::vector<int> > queriedPages;
+            auto queryManager = [&](PagedCacheManager *manager) -> std::vector<int>& {
+                auto it = queriedPages.find(manager);
+                if (it == queriedPages.end()) {
+                    std::vector<int> pages;
+                    manager->Query(ctx->currentTokens, pages);
+                    it = queriedPages.insert(std::make_pair(manager, std::move(pages))).first;
+                }
+                return it->second;
+            };
+
+            int minCachedPages = (int)queryManager(probeManager).size();
+            if (minCachedPages > 0) {
+                for (int li = 0; li < model->block_cnt; li++) {
+                    if (queryUnboundedLayersOnly &&
+                        model->GetKVCacheRetainedTokens(li) >= 0) {
+                        continue;
+                    }
+                    for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
+                        bool isKey = keyFlag == 0;
+                        auto refs = model->GetPagedKVCacheManagers(li, isKey);
+                        for (auto &ref : refs) {
+                            PagedCacheManager *manager = ref.second;
+                            if (manager == nullptr || manager->pageLen != probeManager->pageLen) {
+                                continue;
+                            }
+                            minCachedPages = std::min(minCachedPages,
+                                    (int)queryManager(manager).size());
+                        }
+                    }
+                }
+            }
+
+            if (minCachedPages > 0) {
+                int cachedLen = minCachedPages * probeManager->pageLen;
+                if (cachedLen >= (int)ctx->currentTokens.size()) {
+                    minCachedPages--;
+                }
+            }
+            if (minCachedPages > 0) {
+                int cachedLen = minCachedPages * probeManager->pageLen;
+                int extraCachedLen = model->QueryPagedPrefixCacheExtra(ctx, cachedLen);
+                extraCachedLen = std::max(0, std::min(extraCachedLen, cachedLen));
+                minCachedPages = extraCachedLen / probeManager->pageLen;
+            }
+            if (minCachedPages > 0) {
+                int cachedLen = minCachedPages * probeManager->pageLen;
+                auto managerDevice = [](PagedCacheManager *manager) {
+                    if (manager == nullptr) {
+                        return -1;
+                    }
+                    Data *managerData = (Data*)manager;
+                    if (managerData->dataDeviceIds.empty()) {
+                        return -1;
+                    }
+                    return managerData->dataDeviceIds[0];
+                };
+                auto restoreOne = [&](Data &cache,
+                                      PagedCacheManager *manager,
+                                      const std::vector<int> &pages) {
+                    if (manager == nullptr || (int)pages.size() < minCachedPages) {
+                        return;
+                    }
+                    Data *managerData = (Data*)manager;
+                    if (managerData->dims.size() < 4) {
+                        return;
+                    }
+                    // Model-specific extra state may have
+                    // restored a bounded fallback tail before
+                    // this generic full-prefix restore. Drop
+                    // that cache-owned reference before
+                    // replacing its page chain; the snapshot
+                    // keeps its own independent references.
+                    if (cache.isPagedKVCache &&
+                        cache.pagedKVCacheData != nullptr &&
+                        !cache.pageIndex.empty()) {
+                        cache.pagedKVCacheData->ReleasePageIndices(
+                            cache.pageIndex);
+                        cache.pageIndex.clear();
+                        cache.lastPageLen = 0;
+                    }
+                    cache.isKVCache = true;
+                    cache.isPagedKVCache = true;
+                    cache.pagedKVCacheData = manager;
+                    cache.pageLen = manager->pageLen;
+                    cache.pageIndex.assign(pages.begin(), pages.begin() + minCachedPages);
+                    manager->Pick(cache.pageIndex);
+                    cache.lastPageLen = manager->pageLen;
+                    cache.dataType = managerData->dataType;
+                    cache.UpdateUnitSize();
+                    cache.dataDevice = managerData->dataDevice;
+                    cache.dataDeviceIds = managerData->dataDeviceIds;
+                    int numHeads = managerData->dims[2];
+                    int headDim = managerData->dims[3];
+                    cache.Resize({numHeads, minCachedPages * manager->pageLen, headDim});
+                };
+
+                struct PagedCacheRestorePlan {
+                    Data *cache = nullptr;
+                    bool multiDevice = false;
+                    std::vector<std::pair<int, PagedCacheManager*> > refs;
+                };
+                std::vector<PagedCacheRestorePlan> restorePlans;
+                auto buildRestorePlan = [&](Data &cache,
+                                            const std::vector<std::pair<int, PagedCacheManager*> > &refs,
+                                            bool required) -> bool {
+                    std::vector<std::pair<int, PagedCacheManager*> > validRefs;
+                    for (auto ref : refs) {
+                        if (ref.second == nullptr || ref.second->pageLen != probeManager->pageLen) {
+                            continue;
+                        }
+                        Data *managerData = (Data*)ref.second;
+                        if (managerData->dims.size() < 4) {
+                            continue;
+                        }
+                        if ((int)queryManager(ref.second).size() < minCachedPages) {
+                            continue;
+                        }
+                        validRefs.push_back(ref);
+                    }
+                    if (validRefs.empty()) {
+                        return !required;
+                    }
+
+                    bool restoreAsMultiDevice =
+                        cache.multiDeviceData ||
+                        !cache.multiDeviceDatas.empty() ||
+                        refs.size() > 1;
+                    if (!restoreAsMultiDevice) {
+                        restorePlans.push_back(
+                            {&cache, false, std::move(validRefs)});
+                        return true;
+                    }
+
+                    // TP cache restore is collective. Restoring only the
+                    // ranks whose trie entries survived would leave the root
+                    // metadata describing a subset while stale local caches
+                    // and page references remain on the other ranks. Keep the
+                    // model-specific fallback state unless every expected
+                    // device can be restored together.
+                    if (validRefs.size() != refs.size()) {
+                        return !required;
+                    }
+                    std::set<int> restoreDevices;
+                    for (auto &ref : validRefs) {
+                        int device = ref.first >= 0
+                            ? ref.first : managerDevice(ref.second);
+                        if (device < 0 || !restoreDevices.insert(device).second) {
+                            return !required;
+                        }
+                        ref.first = device;
+                    }
+                    std::set<int> currentDevices;
+                    for (auto &it : cache.multiDeviceDatas) {
+                        if (it.second != nullptr) {
+                            currentDevices.insert(it.first);
+                        }
+                    }
+                    if (currentDevices.empty()) {
+                        for (int device : cache.dataDeviceIds) {
+                            if (device >= 0) {
+                                currentDevices.insert(device);
+                            }
+                        }
+                    }
+                    if (!currentDevices.empty() &&
+                        currentDevices != restoreDevices) {
+                        return !required;
+                    }
+
+                    restorePlans.push_back(
+                        {&cache, true, std::move(validRefs)});
+                    return true;
+                };
+
+                bool restorePlanReady = true;
+                for (int li = 0; li < model->block_cnt; li++) {
+                    auto &kvFirst = ctx->pastKeyValues[li].first;
+                    auto &kvSecond = ctx->pastKeyValues[li].second;
+                    bool unbounded = queryUnboundedLayersOnly &&
+                        model->GetKVCacheRetainedTokens(li) < 0;
+                    restorePlanReady =
+                        buildRestorePlan(
+                            kvFirst,
+                            model->GetPagedKVCacheManagers(li, true),
+                            unbounded && !kvFirst.isLinearAttention) &&
+                        restorePlanReady;
+                    restorePlanReady =
+                        buildRestorePlan(
+                            kvSecond,
+                            model->GetPagedKVCacheManagers(li, false),
+                            unbounded && !kvSecond.isLinearAttention) &&
+                        restorePlanReady;
+                }
+
+                auto applyRestorePlan = [&](PagedCacheRestorePlan &plan) -> bool {
+                    if (plan.cache == nullptr || plan.refs.empty()) {
+                        return false;
+                    }
+                    Data &cache = *plan.cache;
+                    if (!plan.multiDevice) {
+                        restoreOne(cache, plan.refs[0].second,
+                                   queryManager(plan.refs[0].second));
+                        return true;
+                    }
+
+                    cache.multiDeviceData = true;
+                    cache.dataDevice = DataDevice::CUDA;
+                    cache.dataDeviceIds.clear();
+                    cache.isKVCache = true;
+                    cache.isPagedKVCache = true;
+                    Data *firstLocal = nullptr;
+                    for (auto &ref : plan.refs) {
+                        int device = ref.first;
+                        cache.dataDeviceIds.push_back(device);
+                        Data *managerData = (Data*)ref.second;
+                        Data *&local = cache.multiDeviceDatas[device];
+                        if (local == nullptr) {
+                            local = new Data(managerData->dataType);
+                            local->SetKVCache();
+                            local->cacheUid = cache.cacheUid;
+                        }
+                        restoreOne(*local, ref.second, queryManager(ref.second));
+                        if (firstLocal == nullptr) {
+                            firstLocal = local;
+                        }
+                    }
+                    if (firstLocal == nullptr) {
+                        return false;
+                    }
+                    cache.dataType = firstLocal->dataType;
+                    cache.UpdateUnitSize();
+                    cache.cudaData = nullptr;
+                    cache.pageLen = firstLocal->pageLen;
+                    cache.pageIndex = firstLocal->pageIndex;
+                    cache.lastPageLen = firstLocal->lastPageLen;
+                    cache.pagedKVCacheData = firstLocal->pagedKVCacheData;
+                    cache.dims = firstLocal->dims;
+                    return true;
+                };
+
+                bool restoredPrefix = false;
+                if (restorePlanReady &&
+                    model->RestorePagedPrefixCacheExtra(ctx, cachedLen)) {
+                    restoredPrefix = true;
+                    for (auto &plan : restorePlans) {
+                        if (!applyRestorePlan(plan)) {
+                            restoredPrefix = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (restoredPrefix) {
+                    ctx->currentTokens.erase(
+                        ctx->currentTokens.begin(),
+                        ctx->currentTokens.begin() + cachedLen);
+                    ctx->cacheLen = cachedLen;
+                } else {
+                    // A prefix hit is useful only when its
+                    // complete model state can be restored.
+                    // Drop any model-specific partial state
+                    // and let this request prefill normally.
+                    for (auto &kv : ctx->pastKeyValues) {
+                        ReleasePagedCachePages(kv.first, true);
+                        ReleasePagedCachePages(kv.second, true);
+                    }
+                    ctx->cacheLen = 0;
+                    ctx->intParams["paged_prefix_restore_disabled"] = 1;
+                }
+            }
+        }
+        return probeManager;
+    }
+
+    static void RestoreDeferredHistory(basellm *model, ResponseContext *ctx) {
+        if (ctx->cacheLen == 0 && ctx->multimodalInput.empty() && model->DeferHistoryCacheRestore() &&
+            !ctx->intParams.count("deferred_history_checked")) {
+            ctx->intParams["deferred_history_checked"] = 1;
+            if (model->TryRestoreHistoryCache(ctx->currentTokens, ctx->cacheLen))
+                model->OnResponseContextCreated(ctx);
+        }
+    }
+
     void basellm::NewMainLoop() {
         RunNewMainLoop(false);
     }
@@ -1678,9 +1997,6 @@ namespace fastllm {
                    activePrefillTokenLimit);
         }
         while (true) {
-            if (model->isFree) {
-                break;
-            }
             std::vector <Data*> attentionMasks;
             std::vector <Data*> positionIds;
             std::vector <Data*> ownedAttentionMasks;
@@ -1715,6 +2031,9 @@ namespace fastllm {
             decodePositionIds.reserve(reserveBatch);
 
             std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+            // Pair the shutdown check with the condition variable's lock so
+            // its notification cannot be lost before an idle wait.
+            if (model->isFree) break;
             auto &forwardLocker = model->forwardLocker;
 
             // 单次遍历：处理abort、释放isEnding的KV cache、统计alive、构建orders、检测hasPrefill
@@ -1918,312 +2237,9 @@ namespace fastllm {
                     }
 
                     if (isPrompt) {
-                        if (!model->kvMemConfig.enabled && !isMultimodal && ctx->cacheLen == 0 &&
-                            ctx->intParams.find("paged_prefix_restore_disabled") ==
-                                ctx->intParams.end()) {
-                            PagedCacheManager *probeManager = nullptr;
-                            bool queryUnboundedLayersOnly = false;
-                            for (int li = 0; li < model->block_cnt && probeManager == nullptr; li++) {
-                                if (model->GetKVCacheRetainedTokens(li) >= 0) {
-                                    continue;
-                                }
-                                auto refs = model->GetPagedKVCacheManagers(li, true);
-                                for (auto &ref : refs) {
-                                    if (ref.second != nullptr) {
-                                        probeManager = ref.second;
-                                        queryUnboundedLayersOnly = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (probeManager == nullptr) {
-                                auto probeRefs = model->GetPagedKVCacheManagers(
-                                    model->kvCacheId, true);
-                                for (auto &ref : probeRefs) {
-                                    if (ref.second != nullptr) {
-                                        probeManager = ref.second;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (probeManager != nullptr) {
-                                std::map<PagedCacheManager*, std::vector<int> > queriedPages;
-                                auto queryManager = [&](PagedCacheManager *manager) -> std::vector<int>& {
-                                    auto it = queriedPages.find(manager);
-                                    if (it == queriedPages.end()) {
-                                        std::vector<int> pages;
-                                        manager->Query(ctx->currentTokens, pages);
-                                        it = queriedPages.insert(std::make_pair(manager, std::move(pages))).first;
-                                    }
-                                    return it->second;
-                                };
-
-                                int minCachedPages = (int)queryManager(probeManager).size();
-                                if (minCachedPages > 0) {
-                                    for (int li = 0; li < model->block_cnt; li++) {
-                                        if (queryUnboundedLayersOnly &&
-                                            model->GetKVCacheRetainedTokens(li) >= 0) {
-                                            continue;
-                                        }
-                                        for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
-                                            bool isKey = keyFlag == 0;
-                                            auto refs = model->GetPagedKVCacheManagers(li, isKey);
-                                            for (auto &ref : refs) {
-                                                PagedCacheManager *manager = ref.second;
-                                                if (manager == nullptr || manager->pageLen != probeManager->pageLen) {
-                                                    continue;
-                                                }
-                                                minCachedPages = std::min(minCachedPages,
-                                                        (int)queryManager(manager).size());
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if (minCachedPages > 0) {
-                                    int cachedLen = minCachedPages * probeManager->pageLen;
-                                    if (cachedLen >= (int)ctx->currentTokens.size()) {
-                                        minCachedPages--;
-                                        cachedLen = minCachedPages * probeManager->pageLen;
-                                    }
-                                }
-                                if (minCachedPages > 0) {
-                                    int cachedLen = minCachedPages * probeManager->pageLen;
-                                    int extraCachedLen = model->QueryPagedPrefixCacheExtra(ctx, cachedLen);
-                                    extraCachedLen = std::max(0, std::min(extraCachedLen, cachedLen));
-                                    minCachedPages = extraCachedLen / probeManager->pageLen;
-                                }
-                                if (minCachedPages > 0) {
-                                    int cachedLen = minCachedPages * probeManager->pageLen;
-                                    auto managerDevice = [](PagedCacheManager *manager) {
-                                        if (manager == nullptr) {
-                                            return -1;
-                                        }
-                                        Data *managerData = (Data*)manager;
-                                        if (managerData->dataDeviceIds.empty()) {
-                                            return -1;
-                                        }
-                                        return managerData->dataDeviceIds[0];
-                                    };
-                                    auto restoreOne = [&](Data &cache,
-                                                          PagedCacheManager *manager,
-                                                          const std::vector<int> &pages) {
-                                        if (manager == nullptr || (int)pages.size() < minCachedPages) {
-                                            return;
-                                        }
-                                        Data *managerData = (Data*)manager;
-                                        if (managerData->dims.size() < 4) {
-                                            return;
-                                        }
-                                        // Model-specific extra state may have
-                                        // restored a bounded fallback tail before
-                                        // this generic full-prefix restore. Drop
-                                        // that cache-owned reference before
-                                        // replacing its page chain; the snapshot
-                                        // keeps its own independent references.
-                                        if (cache.isPagedKVCache &&
-                                            cache.pagedKVCacheData != nullptr &&
-                                            !cache.pageIndex.empty()) {
-                                            cache.pagedKVCacheData->ReleasePageIndices(
-                                                cache.pageIndex);
-                                            cache.pageIndex.clear();
-                                            cache.lastPageLen = 0;
-                                        }
-                                        cache.isKVCache = true;
-                                        cache.isPagedKVCache = true;
-                                        cache.pagedKVCacheData = manager;
-                                        cache.pageLen = manager->pageLen;
-                                        cache.pageIndex.assign(pages.begin(), pages.begin() + minCachedPages);
-                                        manager->Pick(cache.pageIndex);
-                                        cache.lastPageLen = manager->pageLen;
-                                        cache.dataType = managerData->dataType;
-                                        cache.UpdateUnitSize();
-                                        cache.dataDevice = managerData->dataDevice;
-                                        cache.dataDeviceIds = managerData->dataDeviceIds;
-                                        int numHeads = managerData->dims[2];
-                                        int headDim = managerData->dims[3];
-                                        cache.Resize({numHeads, minCachedPages * manager->pageLen, headDim});
-                                    };
-
-                                    struct PagedCacheRestorePlan {
-                                        Data *cache = nullptr;
-                                        bool multiDevice = false;
-                                        std::vector<std::pair<int, PagedCacheManager*> > refs;
-                                    };
-                                    std::vector<PagedCacheRestorePlan> restorePlans;
-                                    auto buildRestorePlan = [&](Data &cache,
-                                                                const std::vector<std::pair<int, PagedCacheManager*> > &refs,
-                                                                bool required) -> bool {
-                                        std::vector<std::pair<int, PagedCacheManager*> > validRefs;
-                                        for (auto ref : refs) {
-                                            if (ref.second == nullptr || ref.second->pageLen != probeManager->pageLen) {
-                                                continue;
-                                            }
-                                            Data *managerData = (Data*)ref.second;
-                                            if (managerData->dims.size() < 4) {
-                                                continue;
-                                            }
-                                            if ((int)queryManager(ref.second).size() < minCachedPages) {
-                                                continue;
-                                            }
-                                            validRefs.push_back(ref);
-                                        }
-                                        if (validRefs.empty()) {
-                                            return !required;
-                                        }
-
-                                        bool restoreAsMultiDevice =
-                                            cache.multiDeviceData ||
-                                            !cache.multiDeviceDatas.empty() ||
-                                            refs.size() > 1;
-                                        if (!restoreAsMultiDevice) {
-                                            restorePlans.push_back(
-                                                {&cache, false, std::move(validRefs)});
-                                            return true;
-                                        }
-
-                                        // TP cache restore is collective. Restoring only the
-                                        // ranks whose trie entries survived would leave the root
-                                        // metadata describing a subset while stale local caches
-                                        // and page references remain on the other ranks. Keep the
-                                        // model-specific fallback state unless every expected
-                                        // device can be restored together.
-                                        if (validRefs.size() != refs.size()) {
-                                            return !required;
-                                        }
-                                        std::set<int> restoreDevices;
-                                        for (auto &ref : validRefs) {
-                                            int device = ref.first >= 0
-                                                ? ref.first : managerDevice(ref.second);
-                                            if (device < 0 || !restoreDevices.insert(device).second) {
-                                                return !required;
-                                            }
-                                            ref.first = device;
-                                        }
-                                        std::set<int> currentDevices;
-                                        for (auto &it : cache.multiDeviceDatas) {
-                                            if (it.second != nullptr) {
-                                                currentDevices.insert(it.first);
-                                            }
-                                        }
-                                        if (currentDevices.empty()) {
-                                            for (int device : cache.dataDeviceIds) {
-                                                if (device >= 0) {
-                                                    currentDevices.insert(device);
-                                                }
-                                            }
-                                        }
-                                        if (!currentDevices.empty() &&
-                                            currentDevices != restoreDevices) {
-                                            return !required;
-                                        }
-
-                                        restorePlans.push_back(
-                                            {&cache, true, std::move(validRefs)});
-                                        return true;
-                                    };
-
-                                    bool restorePlanReady = true;
-                                    for (int li = 0; li < model->block_cnt; li++) {
-                                        auto &kvFirst = ctx->pastKeyValues[li].first;
-                                        auto &kvSecond = ctx->pastKeyValues[li].second;
-                                        bool unbounded = queryUnboundedLayersOnly &&
-                                            model->GetKVCacheRetainedTokens(li) < 0;
-                                        restorePlanReady =
-                                            buildRestorePlan(
-                                                kvFirst,
-                                                model->GetPagedKVCacheManagers(li, true),
-                                                unbounded && !kvFirst.isLinearAttention) &&
-                                            restorePlanReady;
-                                        restorePlanReady =
-                                            buildRestorePlan(
-                                                kvSecond,
-                                                model->GetPagedKVCacheManagers(li, false),
-                                                unbounded && !kvSecond.isLinearAttention) &&
-                                            restorePlanReady;
-                                    }
-
-                                    auto applyRestorePlan = [&](PagedCacheRestorePlan &plan) -> bool {
-                                        if (plan.cache == nullptr || plan.refs.empty()) {
-                                            return false;
-                                        }
-                                        Data &cache = *plan.cache;
-                                        if (!plan.multiDevice) {
-                                            restoreOne(cache, plan.refs[0].second,
-                                                       queryManager(plan.refs[0].second));
-                                            return true;
-                                        }
-
-                                        cache.multiDeviceData = true;
-                                        cache.dataDevice = DataDevice::CUDA;
-                                        cache.dataDeviceIds.clear();
-                                        cache.isKVCache = true;
-                                        cache.isPagedKVCache = true;
-                                        Data *firstLocal = nullptr;
-                                        for (auto &ref : plan.refs) {
-                                            int device = ref.first;
-                                            cache.dataDeviceIds.push_back(device);
-                                            Data *managerData = (Data*)ref.second;
-                                            Data *&local = cache.multiDeviceDatas[device];
-                                            if (local == nullptr) {
-                                                local = new Data(managerData->dataType);
-                                                local->SetKVCache();
-                                                local->cacheUid = cache.cacheUid;
-                                            }
-                                            restoreOne(*local, ref.second, queryManager(ref.second));
-                                            if (firstLocal == nullptr) {
-                                                firstLocal = local;
-                                            }
-                                        }
-                                        if (firstLocal == nullptr) {
-                                            return false;
-                                        }
-                                        cache.dataType = firstLocal->dataType;
-                                        cache.UpdateUnitSize();
-                                        cache.cudaData = nullptr;
-                                        cache.pageLen = firstLocal->pageLen;
-                                        cache.pageIndex = firstLocal->pageIndex;
-                                        cache.lastPageLen = firstLocal->lastPageLen;
-                                        cache.pagedKVCacheData = firstLocal->pagedKVCacheData;
-                                        cache.dims = firstLocal->dims;
-                                        return true;
-                                    };
-
-                                    bool restoredPrefix = false;
-                                    if (restorePlanReady &&
-                                        model->RestorePagedPrefixCacheExtra(ctx, cachedLen)) {
-                                        restoredPrefix = true;
-                                        for (auto &plan : restorePlans) {
-                                            if (!applyRestorePlan(plan)) {
-                                                restoredPrefix = false;
-                                                break;
-                                            }
-                                        }
-                                    }
-
-                                    if (restoredPrefix) {
-                                        ctx->currentTokens.erase(
-                                            ctx->currentTokens.begin(),
-                                            ctx->currentTokens.begin() + cachedLen);
-                                        ctx->cacheLen = cachedLen;
-                                    } else {
-                                        // A prefix hit is useful only when its
-                                        // complete model state can be restored.
-                                        // Drop any model-specific partial state
-                                        // and let this request prefill normally.
-                                        for (auto &kv : ctx->pastKeyValues) {
-                                            ReleasePagedCachePages(kv.first, true);
-                                            ReleasePagedCachePages(kv.second, true);
-                                        }
-                                        ctx->cacheLen = 0;
-                                        ctx->intParams["paged_prefix_restore_disabled"] = 1;
-                                    }
-                                    {
-                                        std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
-                                        curBusyPages = probeManager->maxPages - probeManager->FreePageCount() + pendingNewPages;
-                                    }
-                                }
-                            }
+                        if (auto *manager = RestoreResidentPrefix(model, ctx)) {
+                            std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                            curBusyPages = manager->maxPages - manager->FreePageCount() + pendingNewPages;
                         }
 
                         // currentActivate already includes every pending
@@ -2233,6 +2249,8 @@ namespace fastllm {
                         if (currentActivate >= maxBatch) {
                             continue;
                         }
+
+                        RestoreDeferredHistory(model, ctx);
 
                         int thisLen = (int)ctx->currentTokens.size();
                         int thisPages = (thisLen + pageLen - 1) / pageLen;
@@ -2847,9 +2865,6 @@ namespace fastllm {
                     std::vector<Data> decodePositionIds;
                     if (fastDecodeInput) decodePositionIds.reserve(maxBatch);
                     while (true) {
-                        if (model->isFree) {
-                            break;
-                        }
                         std::vector <Data*> attentionMasks;
                         std::vector <Data*> positionIds;
                         std::vector <Data*> ownedPositionIds;
@@ -2872,6 +2887,7 @@ namespace fastllm {
                         logits.reserve(maxBatch);
 
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+                        if (model->isFree) break;
                         auto &forwardLocker = model->forwardLocker;
 
                         // 首先把已经abort的请求删除掉
@@ -2901,7 +2917,10 @@ namespace fastllm {
                             ? std::min(((long long)limit + pageLen - 1) / pageLen,
                                        (long long)pagedManager->maxPages) * pageLen
                             : 0;
-                        auto allocatedTokens = [](const Data &cache) -> long long {
+                        auto allocatedTokens = [](const Data &root) -> long long {
+                            const Data &cache = root.multiDeviceData && !root.multiDeviceDatas.empty() &&
+                                root.multiDeviceDatas.begin()->second->isPagedKVCache
+                                ? *root.multiDeviceDatas.begin()->second : root;
                             if (cache.isPagedKVCache) {
                                 return (long long)cache.pageIndex.size() * cache.pageLen;
                             }
@@ -2910,7 +2929,7 @@ namespace fastllm {
                         long long lenSum = 0;
                         int currentActivate = 0;
                         for (auto &it: model->responseContextDict.dicts) {
-                            if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
+                            if (allocatedTokens(it.second->pastKeyValues[model->kvCacheId].first) > 0) {
                                 const Data &cache = it.second->pastKeyValues[model->kvCacheId].first;
                                 lenSum += allocatedTokens(cache);
                                 currentActivate++;
@@ -3003,6 +3022,13 @@ namespace fastllm {
                                     continue;
                                 }
 
+                                if (isPrompt && model->DeferHistoryCacheRestore()) {
+                                    const auto &cache = it.second->pastKeyValues[model->kvCacheId].first;
+                                    const long long before = allocatedTokens(cache);
+                                    RestoreResidentPrefix(model, it.second);
+                                    RestoreDeferredHistory(model, it.second);
+                                    lenSum += allocatedTokens(cache) - before;
+                                }
                                 if (!isPrompt) {
                                     if (preallocatedPagedCache) {
                                         if (!reservePagedAppend(it.second->pastKeyValues[model->kvCacheId].first,
@@ -3384,7 +3410,7 @@ namespace fastllm {
         // placeholder tokens. Keep request-local KV reuse, but do not restore
         // cross-request token-only caches for multimodal prompts.
         bool allowHistoryCache = context->multimodalInput.empty();
-        bool restoredNativeHistory = allowHistoryCache &&
+        bool restoredNativeHistory = allowHistoryCache && !this->DeferHistoryCacheRestore() &&
             this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
 
         auto cache = !allowHistoryCache || restoredNativeHistory || !this->UseGenericHistoryCache() ?
