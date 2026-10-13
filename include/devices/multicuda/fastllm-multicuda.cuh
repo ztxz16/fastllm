@@ -47,6 +47,14 @@ bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
 // False means the caller must reduce rows separately with its ordinary path.
 bool FastllmCudaCustomAllReduceRows(void* data, void* dest, int count,
                                     int rowElements, int dataType, int deviceId);
+// Hopper BF16 decode: allreduce(data), BF16 residual addition and Kimi-style
+// RMSNorm (BF16 normalization followed by FP32 affine and BF16 output).
+// Reads data without materializing its full reduction, updates residual, and
+// writes output. The three tensors must not overlap. Unsupported inputs or a
+// disabled custom collective return false before launching any work.
+bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
+    const float *weight, void *output, int count, int channels,
+    float eps, int dataType, int deviceId);
 // Each rank owns its equal contiguous slice of the full tensor. Gather the
 // other slices in-place, reusing the existing peer-access signals and policy.
 bool FastllmCudaCustomAllGatherRows(void* data, int count,

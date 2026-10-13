@@ -465,7 +465,8 @@ Data NaiveN05FlashModel::RunTarget(
     auto &moeWeights = tensorParallel ? tpMoeWeights.at(tpRank) : this->moeWeights;
     auto &moeBiases = tensorParallel ? tpMoeBiases.at(tpRank) : this->moeBiases;
     size_t communication = 0;
-    auto reduce = [&](Data &data) {
+    auto reduce = [&](Data &data, Data *residual = nullptr,
+                      const Data *normWeight = nullptr, Data *normOutput = nullptr) {
         if (decodeWorkspace) {
             auto &state = *tpDecodeState;
             auto &rank = *state.ranks.at(tpRank);
@@ -476,7 +477,18 @@ Data NaiveN05FlashModel::RunTarget(
                 rank.ok = false;
             ++communication;
         }
-        if (!tensorParallel) return;
+        if (!tensorParallel) return false;
+#ifndef USE_ROCM
+        if (residual && decodeWorkspace && !verifying) {
+            normOutput->dataType = BFLOAT16;
+            normOutput->Resize(residual->dims);
+            normOutput->ToDevice(data.dataDevice, data.dataDeviceIds, false);
+            normOutput->Allocate(false);
+            if (FastllmCudaCustomAllReduceAddRMSNorm(data.cudaData, residual->cudaData,
+                    (const float *)normWeight->cudaData, normOutput->cudaData,
+                    data.Count(0), embed_dim, rms_norm_eps, data.dataType, gpu)) return true;
+        }
+#endif
         if (((batch && batch->Decode()) || (capture && capture->verifying)) && inputIds.dims[1] > 1) {
             if (!FastllmCudaCustomAllReduceRows(data.cudaData, data.cudaData,
                     data.Count(0), embed_dim, data.dataType, gpu)) {
@@ -488,6 +500,7 @@ Data NaiveN05FlashModel::RunTarget(
                 }
             }
         } else FastllmNcclAllReduce(data.cudaData, data.cudaData, data.Count(0), data.dataType, gpu);
+        return false;
     };
     int length = inputIds.dims[1];
     const bool shardMoe = tensorParallel && tpEp8MegaState && decodeWorkspace &&
@@ -925,21 +938,31 @@ Data NaiveN05FlashModel::RunTarget(
             FastllmCudaNaiveBatchSWADecode(q, localWeight(ap + "attention_sink_bias"), swaRows,
                 buf.liveKeys, cfg.heads, cfg.kvHeads, attn);
         Linear(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
-        reduce(projected);
+        Data &postAttentionNorm = localWeight(prefix + ".post_attention_layernorm.weight");
+        const bool attentionNormReady = reduce(projected, decodeWorkspace ? &hidden : nullptr,
+            &postAttentionNorm, &normed);
         if (decodeWorkspace) {
-            FastllmCudaNaiveAddDecodeRMSNorm(hidden, projected,
-                localWeight(prefix + ".post_attention_layernorm.weight"), rms_norm_eps, normed);
+            if (!attentionNormReady)
+                FastllmCudaNaiveAddDecodeRMSNorm(hidden, projected,
+                    postAttentionNorm, rms_norm_eps, normed);
         } else {
             AddTo(hidden, projected);
-            norm(hidden, localWeight(prefix + ".post_attention_layernorm.weight"), normed);
+            norm(hidden, postAttentionNorm, normed);
         }
-        auto addMlpResidual = [&](Data &branch) {
-            if (!decodeWorkspace) { AddTo(hidden, branch); return; }
+        auto addMlpResidual = [&](Data &branch, bool needsReduce) {
+            if (!decodeWorkspace) {
+                if (needsReduce) reduce(branch);
+                AddTo(hidden, branch);
+                return;
+            }
             const bool lastLayer = layer + 1 == block_cnt;
             const std::string name = lastLayer ? "model.norm.weight" :
                 "model.layers." + std::to_string(layer + 1) + ".input_layernorm.weight";
-            FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, localWeight(name),
-                rms_norm_eps, lastLayer ? buf.last : normed);
+            Data &output = lastLayer ? buf.last : normed;
+            Data &normWeight = localWeight(name);
+            if (!needsReduce || !reduce(branch, &hidden, &normWeight, &output))
+                FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, normWeight,
+                    rms_norm_eps, output);
         };
         if (!moeLayers[layer]) {
             // Dense and routed-expert scratch have independent lifetimes.
@@ -951,8 +974,7 @@ Data NaiveN05FlashModel::RunTarget(
             Silu(w1, w1);
             MulTo(w1, w3);
             Linear(w1, localWeight(prefix + ".mlp.down_proj.weight"), Data(), w2);
-            reduce(w2);
-            addMlpResidual(w2);
+            addMlpResidual(w2, true);
         } else {
             // Decode ranks route only their contiguous token shard. Borrow the
             // normalized activation; MegaMoE gathers into its existing output.
@@ -1066,8 +1088,7 @@ Data NaiveN05FlashModel::RunTarget(
             }
             if (!tensorParallel) ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
             moeOutput.Reshape(hidden.dims);
-            if (!(tensorParallel && tpEp8MegaState)) reduce(moeOutput);
-            addMlpResidual(moeOutput);
+            addMlpResidual(moeOutput, !(tensorParallel && tpEp8MegaState));
         }
         if (capture && capture->collectHidden &&
             std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end())

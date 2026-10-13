@@ -2129,6 +2129,16 @@ if (UNIT_TEST)
         target_include_directories(customAllReduceRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
         if (UNIX)
+            if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
+                add_executable(customAllReduceNormRegression test/ops/customAllReduceNormRegression.cu)
+                target_link_libraries(customAllReduceNormRegression PRIVATE fastllm)
+                foreach(norm_ranks IN ITEMS 2 4 6 8)
+                    add_test(NAME custom_all_reduce_norm_${norm_ranks}
+                             COMMAND customAllReduceNormRegression ${norm_ranks})
+                    set_tests_properties(custom_all_reduce_norm_${norm_ranks} PROPERTIES
+                        LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+                endforeach()
+            endif()
             add_executable(customAllGatherRegression test/ops/customAllGatherRegression.cu)
             target_link_libraries(customAllGatherRegression PRIVATE fastllm)
             foreach(gather_ranks IN ITEMS 2 4 6 8)
