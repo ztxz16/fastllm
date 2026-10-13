@@ -10,6 +10,11 @@ class AnthropicTextContentBlock(BaseModel):
     text: str
 
 
+class AnthropicThinkingContentBlock(BaseModel):
+    type: Literal["thinking"] = "thinking"
+    thinking: str
+
+
 class AnthropicToolUseContentBlock(BaseModel):
     type: Literal["tool_use"] = "tool_use"
     id: str
@@ -64,7 +69,8 @@ class AnthropicMessageResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"msg_{shortuuid.random()}")
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
-    content: List[Union[AnthropicTextContentBlock, AnthropicToolUseContentBlock]]
+    content: List[Union[AnthropicTextContentBlock, AnthropicThinkingContentBlock,
+                        AnthropicToolUseContentBlock]]
     model: str
     stop_reason: Optional[str] = None
     stop_sequence: Optional[str] = None
@@ -74,6 +80,11 @@ class AnthropicMessageResponse(BaseModel):
 class AnthropicTextDelta(BaseModel):
     type: Literal["text_delta"] = "text_delta"
     text: str
+
+
+class AnthropicThinkingDelta(BaseModel):
+    type: Literal["thinking_delta"] = "thinking_delta"
+    thinking: str
 
 
 class AnthropicInputJsonDelta(BaseModel):
@@ -89,13 +100,14 @@ class MessageStartEvent(BaseModel):
 class ContentBlockStartEvent(BaseModel):
     type: Literal["content_block_start"] = "content_block_start"
     index: int
-    content_block: Union[AnthropicTextContentBlock, AnthropicToolUseContentBlock]
+    content_block: Union[AnthropicTextContentBlock, AnthropicThinkingContentBlock,
+                         AnthropicToolUseContentBlock]
 
 
 class ContentBlockDeltaEvent(BaseModel):
     type: Literal["content_block_delta"] = "content_block_delta"
     index: int
-    delta: Union[AnthropicTextDelta, AnthropicInputJsonDelta]
+    delta: Union[AnthropicTextDelta, AnthropicThinkingDelta, AnthropicInputJsonDelta]
 
 
 class ContentBlockStopEvent(BaseModel):
