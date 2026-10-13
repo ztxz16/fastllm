@@ -2156,7 +2156,8 @@ namespace fastllm {
 #ifdef USE_CUDA
         const bool hasSparse = std::any_of(requestIndices.begin(), requestIndices.end(),
             [](const Data &indices) { return !indices.dims.empty(); });
-        if (batch > 1 && (!hasSparse || dsaBackend == DsaBackend::Auto)) {
+        if (batch > 1 && FastllmCudaFlashInferDataTypeSupported(absorbedQuery.dataType) &&
+            (!hasSparse || dsaBackend == DsaBackend::Auto)) {
             std::vector<const Data*> peCaches, latentCaches, indices;
             std::vector<int> lengths;
             for (int request = 0; request < batch; ++request) {
@@ -2204,6 +2205,10 @@ namespace fastllm {
                 glm5_next_detail::SparseLatentAttention(*attentionQuery, latentKvCache,
                     dsaIndices, 1.0f / std::sqrt((float)qkHeadDim), *attentionResult,
                     dsaBackend == DsaBackend::Auto, rows == 1 ? &keyPeCache : nullptr);
+            } else if (UsesDsa() &&
+                       !FastllmCudaFlashInferDataTypeSupported(attentionQuery->dataType)) {
+                glm5_next_detail::DenseLatentAttentionFallback(*attentionQuery, latentKvCache,
+                    1.0f / std::sqrt((float)qkHeadDim), *attentionResult);
             } else
 #endif
             {
@@ -2359,6 +2364,12 @@ namespace fastllm {
             !gateUp.dims.empty() && gateUp.dims.back() % 2 == 0,
             "GLM-5.3 merged gate/up output has an invalid shape.");
         const int intermediate = gateUp.dims.back() / 2;
+#ifdef USE_CUDA
+        if (FastllmCudaGlm5NextClampedSilu(gateUp, swigluLimit, gate)) {
+            Linear(gate, downWeight, Data(), output);
+            return;
+        }
+#endif
         Split(gateUp, -1, 0, intermediate, gate);
         Split(gateUp, -1, intermediate, 2 * intermediate, up);
         Glm5NextClamp(gate, false, 0.0f, true, swigluLimit);
@@ -2406,9 +2417,9 @@ namespace fastllm {
         // Resident TP ranks compute their own intermediate-channel slice.
         // The caller's FFN AllReduce combines routed and shared partials.
         if (threadTpRank >= 0 && !shardedRouted) {
-            const bool localNumasDecode = sequence == 1 && routedOnNumas;
-            if (!localNumasDecode || threadTpRank != 0) runShared();
-            if (localNumasDecode) {
+            const bool localNumasBatch = sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH && routedOnNumas;
+            if (!localNumasBatch || threadTpRank != 0) runShared();
+            if (localNumasBatch) {
                 // Publish peer shared-expert completion without draining its
                 // GPU on the host. The owner borrows a separate per-thread
                 // stream; the following AllReduce waits for the owner on CPU.
@@ -2699,6 +2710,18 @@ namespace fastllm {
                 CanUseNumasMoeExactSmallBatch(rows)) {
                 continue;
             }
+#ifndef USE_ROCM
+            if (moeDevice.rfind("numa", 0) == 0 && moeAtype == DataType::BFLOAT16 &&
+                layer < (int)expertWeights.size()) {
+                const auto &experts = expertWeights[layer];
+                // The prepared GGUF hybrid path preserves decode arithmetic
+                // on AVX2, including the multi-row TP expert-cache adapter.
+                if (CanUseNumasMoeExactGgufBatch(rows, experts.data(), (int)experts.size()) &&
+                    FastllmCudaCanRunMoeHybrid(const_cast<Data **>(experts.data()), (int)experts.size())) {
+                    continue;
+                }
+            }
+#endif
 #endif
             return false;
         }
@@ -2711,10 +2734,17 @@ namespace fastllm {
             TargetRuntimeCheckpoint &checkpoint) {
         if (threadTpState) {
             auto &tp = *threadTpState;
+#ifdef USE_CUDA
+            // ApplyDeviceMap changes executor routing, not the active CUDA device.
+            Glm5NextCudaDeviceScope restoreDevice;
+#endif
             std::lock_guard<std::mutex> lock(tp.forwardMutex);
             auto &caches = tp.requests.at(&pastKeyValues);
             checkpoint.ranks.resize(tp.ranks.size());
             for (size_t r = 0; r < tp.ranks.size(); ++r) {
+#ifdef USE_CUDA
+                FastllmCudaSetDevice(tp.devices[r]);
+#endif
                 ApplyDeviceMap(tp.ranks[r]->deviceMap, 0, block_cnt);
                 tp.ranks[r]->CaptureTargetRuntimeCheckpoint(r == 0 ? pastKeyValues : caches[r], checkpoint.ranks[r]);
 #ifdef USE_CUDA
@@ -2770,11 +2800,18 @@ namespace fastllm {
             int verificationInputs) {
         if (threadTpState) {
             auto &tp = *threadTpState;
+#ifdef USE_CUDA
+            // ApplyDeviceMap changes executor routing, not the active CUDA device.
+            Glm5NextCudaDeviceScope restoreDevice;
+#endif
             std::lock_guard<std::mutex> lock(tp.forwardMutex);
             auto &caches = tp.requests.at(&pastKeyValues);
             auto &replays = tp.replays.at(&pastKeyValues);
             AssertInFastLLM(checkpoint.ranks.size() == tp.ranks.size(), "GLM TP MTP checkpoint is incomplete.");
             for (size_t r = 0; r < tp.ranks.size(); ++r) {
+#ifdef USE_CUDA
+                FastllmCudaSetDevice(tp.devices[r]);
+#endif
                 ApplyDeviceMap(tp.ranks[r]->deviceMap, 0, block_cnt);
                 tp.ranks[r]->CommitTargetVerificationPrefix(r == 0 ? pastKeyValues : caches[r],
                     checkpoint.ranks[r], replays[r], committedInputs, verificationInputs);
@@ -3252,6 +3289,11 @@ namespace fastllm {
         const bool useBatchedVerifier =
             CanUseExactBatchedMtpVerification(
                 (int)candidateTokens.size());
+        if (verbose && state.verifySteps == 0) {
+            std::cout << "[GLM-5.3 MTP verifier] mode="
+                      << (useBatchedVerifier ? "batched" : "sequential")
+                      << " rows=" << candidateTokens.size() << "\n";
+        }
 
 #ifdef USE_CUDA
         // Verification is logically a sequence of decode rows. Force every
@@ -3804,39 +3846,50 @@ namespace fastllm {
             const std::string prefix = languagePrefix + "layers." +
                 std::to_string(layer) + ".";
 
-            Data normalizedAttention, attentionPost, attentionComb;
-            Glm5NextHcPreNorm(
-                *current, weight[prefix + "hc_attn_fn"],
-                weight[prefix + "hc_attn_scale"],
-                weight[prefix + "hc_attn_base"],
-                weight[prefix + "input_layernorm.weight"], hcMult,
-                hcSinkhornIters, hcEps, rms_norm_eps,
-                normalizedAttention, attentionPost, attentionComb);
-            Data attentionOutput;
-            if (kdaLayers[layer]) {
-                RunKdaAttention(layer, normalizedAttention, sequence, requestCaches,
-                    attentionOutput, kdaReplay == nullptr ? nullptr : &(*kdaReplay)[layer]);
-            } else if (batch > 1 && useCompressedMla) {
-                RunCompressedMlaAttention(layer, normalizedAttention, sequence,
-                                          requestCaches, attentionOutput);
-            } else if (batch > 1) {
-                // The optional expanded-cache backend retains its existing
-                // request-local attention implementation.
-                for (int row = 0; row < batch; ++row) {
-                    Data input, output;
-                    ViewGlm5NextRows(normalizedAttention, row, 1, input);
-                    RunSparseAttention(layer, input, 1, *requestCaches[row], output);
-                    AppendGlm5NextRows(attentionOutput, output, batch);
+            auto runAttention = [&](Data &input, Data &output) {
+                Data normalizedAttention, attentionPost, attentionComb;
+                Glm5NextHcPreNorm(
+                    input, weight[prefix + "hc_attn_fn"],
+                    weight[prefix + "hc_attn_scale"],
+                    weight[prefix + "hc_attn_base"],
+                    weight[prefix + "input_layernorm.weight"], hcMult,
+                    hcSinkhornIters, hcEps, rms_norm_eps,
+                    normalizedAttention, attentionPost, attentionComb);
+                Data attentionOutput;
+                if (kdaLayers[layer]) {
+                    RunKdaAttention(layer, normalizedAttention, sequence, requestCaches,
+                        attentionOutput, kdaReplay == nullptr ? nullptr : &(*kdaReplay)[layer]);
+                } else if (batch > 1 && useCompressedMla) {
+                    RunCompressedMlaAttention(layer, normalizedAttention, sequence,
+                                              requestCaches, attentionOutput);
+                } else if (batch > 1) {
+                    // The optional expanded-cache backend retains its existing
+                    // request-local attention implementation.
+                    for (int row = 0; row < batch; ++row) {
+                        Data rowInput, rowOutput;
+                        ViewGlm5NextRows(normalizedAttention, row, 1, rowInput);
+                        RunSparseAttention(layer, rowInput, 1, *requestCaches[row], rowOutput);
+                        AppendGlm5NextRows(attentionOutput, rowOutput, batch);
+                    }
+                } else {
+                    RunSparseAttention(layer, normalizedAttention, sequence,
+                        *requestCaches[0], attentionOutput,
+                        indexer == nullptr ? nullptr : &(*indexer)[layer]);
                 }
-            } else {
-                RunSparseAttention(layer, normalizedAttention, sequence,
-                    *requestCaches[0], attentionOutput,
-                    indexer == nullptr ? nullptr : &(*indexer)[layer]);
+                ThreadTpAllReduce(attentionOutput);
+                DeepSeekV4HcPost(attentionOutput, input, attentionPost, attentionComb, output);
+            };
+#ifdef USE_CUDA
+            if (threadTpRank >= 0 && sequence == 1 && batch == 1 && kdaLayers[layer] &&
+                kdaReplay == nullptr && threadTpOwner->activeGraphs) {
+                Data graphOutput;
+                threadTpOwner->RunKdaGraph(threadTpRank, layer, *current, graphOutput, runAttention);
+                next->CopyFrom(graphOutput);
+            } else
+#endif
+            {
+                runAttention(*current, *next);
             }
-            ThreadTpAllReduce(attentionOutput);
-            DeepSeekV4HcPost(
-                attentionOutput, *current,
-                attentionPost, attentionComb, *next);
             std::swap(current, next);
 
             Data normalizedFfn, ffnPost, ffnComb;

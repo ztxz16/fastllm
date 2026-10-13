@@ -59,7 +59,7 @@ inline bool TryMhaPrefill(Data &query, const Data &latentCache,
         keyWeight.dataDeviceIds != query.dataDeviceIds ||
         valueWeight.dataDeviceIds != query.dataDeviceIds ||
         keyWeight.cudaData == nullptr || valueWeight.cudaData == nullptr ||
-        FastllmCudaGraphIsCapturingFast() || !FastllmCudaFlashInferSupported()) {
+        FastllmCudaGraphIsCapturingFast() || !FastllmCudaFlashInferDataTypeSupported(query.dataType)) {
         return false;
     }
     const int heads = query.dims[0], rows = query.dims[1];

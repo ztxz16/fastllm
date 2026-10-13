@@ -19,6 +19,7 @@
 #include <vector>
 
 namespace fastllm {
+    class CudaChunkedPrefillPipeline;
     class Qwen4ExpModel : public Qwen3NextModel {
     public:
         Qwen4ExpModel();
@@ -73,6 +74,12 @@ namespace fastllm {
                 const GenerationConfig &generationConfig = GenerationConfig(),
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector<std::vector<float> *> *logits = nullptr) override;
+
+        bool TryForwardChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask, const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken) override;
 
         void WarmUp() override;
         PagedCacheManager *GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
@@ -167,6 +174,26 @@ namespace fastllm {
             bool mtpDisabled = false;
         };
 
+        struct PrefillStageContext {
+            int firstLayer = 0, endLayer = 0;
+            bool sampleOutput = false;
+            Data *hidden = nullptr;
+            std::mutex *hostExpertMutex = nullptr;
+            RequestState *state = nullptr;
+        };
+#ifdef USE_CUDA
+        std::unique_ptr<CudaChunkedPrefillPipeline> prefillPipeline;
+#ifndef USE_ROCM
+        struct PipelineMoeState;
+        std::unique_ptr<PipelineMoeState> pipelineMoe;
+        bool TryRunPipelineMoe(int layer, const Data &input, const Data &index,
+                const Data &score, Data &output, std::vector<Data *> &moeWeights,
+                const std::function<void()> &sharedExpert, Data **deferredPeer, bool preparedReadback);
+        bool TryPipelineMoeReadback(const Data &input, const Data &index, const Data &score);
+#endif
+#endif
+        std::map<int, Data> prefillLinearInvScales;
+
         struct ServingCache {
             using Pools = std::pair<std::shared_ptr<PagedCacheManager>,
                                     std::shared_ptr<PagedCacheManager>>;
@@ -219,10 +246,14 @@ namespace fastllm {
             TargetRuntimeCheckpoint *runtimeCheckpoint = nullptr;
             std::vector<Data> linearReplayOutputs;
             std::vector<Data> linearReplayCoreOutputs;
-            Data linearReplayPointerWorkspace;
-            std::vector<uint8_t> linearReplayPointerCache;
+            struct LinearReplayWorkspace {
+                Data pointers;
+                std::vector<uint8_t> cache;
+            };
+            std::map<int, LinearReplayWorkspace> linearReplayWorkspaces;
             std::map<int, Data> qsaRawKeys;
             Data pleInput;
+            Data pleNormalized;
             Data greedyTokenIds;
             Data greedyTokenValues;
         };
@@ -422,7 +453,10 @@ namespace fastllm {
         void RunPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output,
                     const std::vector<int> *hostInputTokens = nullptr,
-                    const DiskEmbeddingRowReader::Ticket *prefetched = nullptr);
+                    const DiskEmbeddingRowReader::Ticket *prefetched = nullptr,
+                    Data *normalizedCapture = nullptr);
+        bool TryCommitPLEPrefix(RequestState &state, const Data &normalized,
+                                const std::vector<int> &tokens, int count);
         void RunThreadTpPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output,
                     const std::vector<int> *hostInputTokens,
@@ -464,14 +498,29 @@ namespace fastllm {
                                 Data *alphaCapture = nullptr,
                                 Data *betaCapture = nullptr,
                                 Data *recurrentStateOutput = nullptr);
+        struct MoEGpuInputs {
+            Data index, score, sharedOutput;
+            Data *outputTarget = nullptr;
+            Data *peerOutput = nullptr;
+            bool sharedDeferred = false;
+            bool readbackPrepared = false;
+        };
+        void SelectMoEExperts(Data &routerLogits, Data &index, Data &score);
+        void RunSharedExpert(const std::string &mlp, Data &input,
+                             Data &gateUp, Data &hidden, Data &gate, Data &output);
+        void PrepareMoERouting(int layer, const Data &input, MoEGpuInputs &prepared);
         void RunMoE(int layer, const Data &input, Data &output,
-                    bool reduceOutput = true);
+                   bool reduceOutput = true, PrefillStageContext *prefill = nullptr,
+                   MoEGpuInputs *prepared = nullptr,
+                   const std::function<void()> &sharedGraph = {});
         void RunMoEWithPrefix(int deviceLayer,
                               const std::string &mlpPrefix,
                               std::vector<Data *> &moeWeights,
                               std::vector<Data *> &moeBiass,
                               const Data &input, Data &output,
-                              bool reduceOutput = true);
+                              bool reduceOutput = true, PrefillStageContext *prefill = nullptr,
+                              MoEGpuInputs *prepared = nullptr,
+                              const std::function<void()> &sharedGraph = {});
 
         bool HasMtpWeights() const;
         bool MtpSupportsGenerationConfig(
@@ -535,7 +584,8 @@ namespace fastllm {
             bool decodeEquivalentGdn,
             const std::vector<int> *hostInputTokens = nullptr,
             bool materializeCausalMaskOnGraphFallback = false,
-            const Data *precomputedEmbedding = nullptr);
+            const Data *precomputedEmbedding = nullptr,
+            PrefillStageContext *prefill = nullptr);
 
         bool TryRunThreadTpPrefixCudaGraph(
             Data &hiddenStates,
@@ -553,7 +603,8 @@ namespace fastllm {
             RequestState &requestState,
             Data &logits,
             Data *targetMultiHidden,
-            TargetVerificationCapture *verificationCapture);
+            TargetVerificationCapture *verificationCapture,
+            int graphEndLayer = -1, Data *stageOutput = nullptr);
 
         std::shared_ptr<PrefixSnapshot> FindPrefixSnapshotLocked(
             const std::vector<int> &tokens, int maxCachedLen,

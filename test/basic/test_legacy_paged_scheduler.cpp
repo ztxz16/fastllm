@@ -1,4 +1,5 @@
 #include "models/basellm.h"
+#include "models/qwen4_exp.h"
 
 #include <algorithm>
 #include <chrono>
@@ -32,7 +33,8 @@ class SchedulerModel : public basellm {
 public:
     int peakActiveCaches = 0;
 
-    SchedulerModel(CacheView view, int capacity, int pageSize = 128, int batch = 1)
+    SchedulerModel(CacheView view, int capacity, int pageSize = 128, int batch = 1,
+                   const basellm *capabilities = nullptr)
         : view(view) {
         block_cnt = 1;
         kvCacheId = 0;
@@ -41,8 +43,8 @@ public:
         max_positions = 4096; // The configured budget must also bound generation.
         dataType = kvCacheDataType = FLOAT32;
         eos_token_id = -100;
-        canDoBatchForward = false;
-        canDoConcurrentForward = true;
+        canDoBatchForward = capabilities ? capabilities->canDoBatchForward : false;
+        canDoConcurrentForward = capabilities ? capabilities->canDoConcurrentForward : true;
         use_new_engine = false;
         for (auto &pool : pools) {
             pool.type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE;
@@ -174,8 +176,8 @@ void Single(CacheView view, int capacity, int pageSize, int prompt, int output, 
           " tokens, got " + std::to_string(actual));
 }
 
-void Concurrent(CacheView view, bool pressure) {
-    SchedulerModel model(view, 1024, 128, 2);
+void Concurrent(CacheView view, bool pressure, const basellm *capabilities = nullptr) {
+    SchedulerModel model(view, 1024, 128, 2, capabilities);
     model.Pause();
     int first = Launch(model, 256, pressure ? 1500 : 320);
     int second = Launch(model, 256, pressure ? 1500 : 192);
@@ -214,6 +216,11 @@ int main() {
             Concurrent(view, false);
             Concurrent(view, true);
         }
+        // Model capability must permit simultaneous admission, not just a
+        // queue that serves complete requests one at a time.
+        Qwen4ExpModel qwen;
+        Concurrent(CacheView::Paged, false, &qwen);
+        Concurrent(CacheView::TensorParallel, false, &qwen);
         std::cout << "ALL_PASS\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

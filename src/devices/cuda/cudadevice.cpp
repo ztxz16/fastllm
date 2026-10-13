@@ -5595,6 +5595,11 @@ namespace fastllm {
             }
             return;
         }
+        if (FastllmCudaQwen4SparseDecode(query, key, value, indices, output,
+                                       intParams.find("group")->second,
+                                       floatParams.find("scale")->second)) {
+            return;
+        }
         Data compactKey(key.dataType,
                         {key.dims[0], width, key.dims[2]});
         Data compactValue(value.dataType,

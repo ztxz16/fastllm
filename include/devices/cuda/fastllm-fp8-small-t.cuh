@@ -39,7 +39,7 @@ inline bool UseWideMma16(int device) {
     return found->second;
 }
 
-// Callers validate dense row-scaled FP8, 1..8 rows, K divisible by 256,
+// Callers validate dense row-scaled FP8, small batches, K divisible by 256,
 // and non-overlapping input/output buffers before dispatch. No global workspace
 // or reordered weight copy is allocated by these kernels.
 // Reuse each decoded weight across a compile-time token tile. Accumulate
@@ -185,18 +185,40 @@ __global__ __launch_bounds__(Warps * 32, 2) void Kernel(const T *x, const uint8_
                                                         const BiasT *bias, T *y, int K, int N) {
     SimtBody<T, Tokens, Warps, Rows, Values, Add, BiasT>(x, w, scales, bias, y, K, N);
 }
-// A 16-output-row tile uses K-split warps and m16n8k16 tensor operations.
+// E4M3 -> FP16 is exact, including subnormals and signed zero. Decode two
+// lanes together without the software float conversion used by pre-SM89 FP8.
+__device__ __forceinline__ uint32_t DecodeHalf2(uint16_t codes) {
+    uint32_t bytes = __byte_perm(uint32_t(codes), 0u, 0x4140);
+    uint32_t bits = ((bytes << 8) & 0x80008000u) | ((bytes << 7) & 0x3f803f80u);
+    half2 scaled = __hmul2(*reinterpret_cast<half2 *>(&bits), __float2half2_rn(256.0f));
+    bits = *reinterpret_cast<uint32_t *>(&scaled);
+    if ((codes & 0x7fu) == 0x7fu) bits = (bits & 0xffff0000u) | 0x7fffu;
+    if ((codes & 0x7f00u) == 0x7f00u) bits = (bits & 0x0000ffffu) | 0x7fff0000u;
+    return bits;
+}
+
+// A 16-output-row tile uses K-split warps and tensor operations.
 // FP8 conversion is exact in FP16/BF16; no activation quantization or packed
-// weight cache is required. SM80+ uses MMA; older compiled targets use SIMT.
-template <class T, int Tokens, int Warps, bool Add = false, class BiasT = T>
+// weight cache is required. SM75 uses paired FP16 m16n8k8 instructions;
+// SM80+ also supports BF16 MMA. Older targets retain SIMT.
+template <class T, int Tokens, int Warps, bool Add = false, class BiasT = T, bool Tiled = false>
 __global__ __launch_bounds__(Warps * 32, 2) void MmaKernel(const T *__restrict__ x,
                                                            const uint8_t *__restrict__ w,
                                                            const float *__restrict__ scales,
                                                            const BiasT *__restrict__ bias, T *__restrict__ y,
-                                                           int K, int N) {
-#if __CUDA_ARCH__ >= 800
+                                                           int K, int N, int totalRows = Tokens) {
+#if __CUDA_ARCH__ >= 800 || (__CUDA_ARCH__ == 750 && !defined(CUDA_NO_TENSOR_CORE))
+#if __CUDA_ARCH__ == 750
+    if constexpr (!__is_same(T, half)) {
+        SimtBody<T, Tokens, Warps, 16 / Warps, 8, Add, BiasT>(x, w, scales, bias, y, K, N);
+        return;
+    }
+#endif
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, group = lane / 4, part = lane % 4;
     const int row = blockIdx.x * 16 + group;
+    const int tokenBase = Tiled ? int(blockIdx.y) * Tokens : 0;
+    x += size_t(tokenBase) * K;
+    y += size_t(tokenBase) * N;
     float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
     for (int base = warp * 64; base < K; base += Warps * 64) {
         uint4 a = {};
@@ -221,6 +243,9 @@ __global__ __launch_bounds__(Warps * 32, 2) void MmaKernel(const T *__restrict__
             uint32_t av[4];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
+#if __CUDA_ARCH__ == 750
+                av[j] = DecodeHalf2(uint16_t(words[j] >> ((part % 2) * 16)));
+#else
                 __nv_fp8x2_e4m3 q;
                 q.__x = uint16_t(words[j] >> ((part % 2) * 16));
                 __half2 h = static_cast<__half2>(q);
@@ -231,14 +256,25 @@ __global__ __launch_bounds__(Warps * 32, 2) void MmaKernel(const T *__restrict__
                     __nv_bfloat162 z = __floats2bfloat162_rn(f.x, f.y);
                     av[j] = *reinterpret_cast<uint32_t *>(&z);
                 }
+#endif
             }
             uint32_t v0 = 0, v1 = 0;
-            if (group < Tokens) {
+            if (group < Tokens && (!Tiled || tokenBase + group < totalRows)) {
                 v0 = __ldg(
                     reinterpret_cast<const uint32_t *>(x + size_t(group) * K + base + step * 16 + part * 2));
                 v1 = __ldg(reinterpret_cast<const uint32_t *>(x + size_t(group) * K + base + step * 16 +
                                                               part * 2 + 8));
             }
+#if __CUDA_ARCH__ == 750
+            asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+                         "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                         : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                         : "r"(av[0]), "r"(av[1]), "r"(v0));
+            asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+                         "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                         : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                         : "r"(av[2]), "r"(av[3]), "r"(v1));
+#else
             if constexpr (__is_same(T, half))
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -249,6 +285,7 @@ __global__ __launch_bounds__(Warps * 32, 2) void MmaKernel(const T *__restrict__
                              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                              : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
                              : "r"(av[0]), "r"(av[1]), "r"(av[2]), "r"(av[3]), "r"(v0), "r"(v1));
+#endif
         }
     }
     __shared__ float partial[Warps][128];
@@ -264,7 +301,7 @@ __global__ __launch_bounds__(Warps * 32, 2) void MmaKernel(const T *__restrict__
         for (int widx = 0; widx < Warps; ++widx)
             v += partial[widx][r * 8 + t];
         int n = blockIdx.x * 16 + r;
-        if (n < N) {
+        if (n < N && (!Tiled || tokenBase + t < totalRows)) {
             T p = T(v * scales[n] + (bias ? float(bias[n]) : 0.f));
             if constexpr (Add)
                 y[size_t(t) * N + n] = T(float(y[size_t(t) * N + n]) + float(p));
@@ -273,8 +310,30 @@ __global__ __launch_bounds__(Warps * 32, 2) void MmaKernel(const T *__restrict__
         }
     }
 #else
-    // Older targets retain a SIMT implementation with the same 16-row CTA.
     SimtBody<T, Tokens, Warps, 16 / Warps, 8, Add, BiasT>(x, w, scales, bias, y, K, N);
+#endif
+}
+
+inline bool UseSm75Mma(int device) {
+#ifdef CUDA_NO_TENSOR_CORE
+    return false;
+#else
+    static thread_local std::map<int, bool> supported;
+    auto found = supported.find(device);
+    if (found == supported.end()) {
+        int major = 0, minor = 0;
+        bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+                  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
+                  major == 7 && minor == 5;
+        if (ok) {
+            cudaFuncAttributes attributes{};
+            auto status = cudaFuncGetAttributes(&attributes, MmaKernel<half, 1, 8>);
+            ok = status == cudaSuccess && attributes.ptxVersion >= 75 && attributes.binaryVersion >= 75;
+            if (status != cudaSuccess) cudaGetLastError();
+        }
+        found = supported.emplace(device, ok).first;
+    }
+    return found->second;
 #endif
 }
 template <class T, int Tokens, bool Add = false, class BiasT = T, bool CheckOnly = false>
@@ -290,6 +349,13 @@ inline bool Launch(const T *x, const uint8_t *w, const float *scales, const Bias
             return true;                                                                \
         }                                                                               \
     } while (false)
+    if constexpr (__is_same(T, half)) {
+        if (UseSm75Mma(device)) {
+            if (K >= 4096)
+                FASTLLM_FP8_SMALL_LAUNCH((N + 15) / 16, 512, MmaKernel<T, Tokens, 16, Add, BiasT>);
+            FASTLLM_FP8_SMALL_LAUNCH((N + 15) / 16, 256, MmaKernel<T, Tokens, 8, Add, BiasT>);
+        }
+    }
     if constexpr (Tokens >= 5) {
         if (N < 16384 || Tokens == 8) {
             if ((N > 8192 && N < 16384) || (N <= 8192 && Tokens == 8) ||
@@ -327,7 +393,23 @@ inline bool Launch(const T *x, const uint8_t *w, const float *scales, const Bias
 }
 template <class T, bool Add = false, class BiasT = T, bool CheckOnly = false>
 inline bool Dispatch(const T *x, const uint8_t *w, const float *scales, const BiasT *bias, T *y, int K, int N,
-                     int tokens, cudaStream_t stream, int device = 0) {
+                     int tokens, cudaStream_t stream, int device = -1) {
+    if (device < 0 && cudaGetDevice(&device) != cudaSuccess) return false;
+    // Keep larger batches on the existing GEMM path. Tile the remaining
+    // small batches uniformly; the last token tile is guarded in the kernel.
+    if constexpr (__is_same(T, half)) {
+        if (tokens > 8 && tokens <= 32 && UseSm75Mma(device)) {
+            constexpr int Warps = 16;
+            if constexpr (CheckOnly)
+                return KernelAvailable<MmaKernel<T, 8, Warps, Add, BiasT, true>, Warps * 32>(device);
+            else {
+                MmaKernel<T, 8, Warps, Add, BiasT, true>
+                    <<<dim3((N + 15) / 16, (tokens + 7) / 8), Warps * 32, 0, stream>>>(
+                        x, w, scales, bias, y, K, N, tokens);
+                return true;
+            }
+        }
+    }
 #define FASTLLM_FP8_SMALL_CASE(M)                                                                            \
     case M:                                                                                                  \
         return Launch<T, M, Add, BiasT, CheckOnly>(x, w, scales, bias, y, K, N, stream, device);

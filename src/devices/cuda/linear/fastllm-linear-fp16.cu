@@ -908,6 +908,69 @@ __global__ void FastllmGemvFp32Fp16Kernel2MultiRow(
     }
 }
 
+// Preserve the compensated 256-thread reduction in eight virtual groups per warp.
+// Four independent output rows share each CTA.
+template<bool EXTRA_GATE = false, bool GATED = false>
+__global__ __launch_bounds__(128)
+void FastllmGemvFp32Fp16M2560WarpRowsKernel(const float *A, const half *B, float *C, const float *bias,
+              int k, const half *gateWeight = nullptr,
+              float *gateOutput = nullptr, const float *outputGate = nullptr) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (row >= k + (EXTRA_GATE ? 1 : 0)) return;
+    const half *weight = EXTRA_GATE && row == k ? gateWeight : B + size_t(row) * 2560;
+    float values[8] = {}, difference[8] = {};
+#pragma unroll
+    for (int v = 0; v < 8; ++v) {
+#pragma unroll
+        for (int base = 0; base < 2560; base += 1024) {
+            const int i = base + (lane + 32 * v) * 4;
+            if (i < 2560) {
+                union_half4 w;
+                w.in = *reinterpret_cast<const uint2 *>(weight + i);
+                const float4 a = *reinterpret_cast<const float4 *>(A + i);
+                float sum = 0.0f;
+                sum += a.x * __low2float(w.out2[0]);
+                sum += a.y * __high2float(w.out2[0]);
+                sum += a.z * __low2float(w.out2[1]);
+                sum += a.w * __high2float(w.out2[1]);
+                values[v] += sum;
+            }
+        }
+    }
+#pragma unroll
+    for (int stride = 4; stride > 0; stride >>= 1) {
+#pragma unroll
+        for (int v = 0; v < stride; ++v) {
+            const float other = values[v + stride] - difference[v];
+            const float sum = values[v] + other;
+            difference[v] = (sum - values[v]) - other;
+            values[v] = sum;
+        }
+    }
+#pragma unroll
+    for (int stride = 16; stride > 0; stride >>= 1) {
+        const float rhs = __shfl_down_sync(0xffffffffu, values[0], stride);
+        if (lane < stride) {
+            const float other = rhs - difference[0];
+            const float sum = values[0] + other;
+            difference[0] = (sum - values[0]) - other;
+            values[0] = sum;
+        }
+    }
+    if (lane == 0) {
+        if (EXTRA_GATE && row == k) {
+            const float projected = __fadd_rn(values[0], 0.0f);
+            gateOutput[0] = 1.0 / (1.0 + expf(-projected));
+        } else if (GATED) {
+            const float projected = __fadd_rn(values[0], bias ? __ldg(bias + row) : 0.0f);
+            C[row] = projected * outputGate[0];
+        } else {
+            C[row] = bias ? values[0] + __ldg(bias + row) : values[0];
+        }
+    }
+}
+
 // The two Qwen4 hyper-connection projections consume the same activation and
 // are immediately followed by independent elementwise transforms.  Combining
 // their output-row grids removes three launches without changing the GEMV
@@ -1293,6 +1356,9 @@ static void LaunchFastllmGemmFp32Fp16SmallRows(
     } else if (m == 640) {
         FastllmGemvFp32Fp16M640MultiRowWarpRowsKernel<PART, 8, GATED>
             <<<(k + 7) / 8, 256>>>(input, weight, output, bias, k, gate);
+    } else if (PART == 1 && m == 2560 && k >= 1024 && k <= 2560) {
+        FastllmGemvFp32Fp16M2560WarpRowsKernel<false, GATED>
+            <<<(k + 3) / 4, 128>>>(input, weight, output, bias, k, nullptr, nullptr, gate);
     } else if (m == 2560 && k <= 2560) {
         FastllmGemvFp32Fp16Kernel2MultiRow<256, PART, 2560, false, GATED>
             <<<k, 256>>>(input, weight, output, bias, m, k, nullptr, nullptr, gate);
@@ -1388,7 +1454,13 @@ bool FastllmCudaQwen4SharedExpert(
         outputs[i]->Allocate(false);
     }
 #define LAUNCH_PROJECT(N) case N: \
-        if (inputWidth == 2560) { \
+        if (N == 1 && inputWidth == 2560 && 2 * intermediate >= 1024) { \
+            FastllmGemvFp32Fp16M2560WarpRowsKernel<true> \
+                <<<(2 * intermediate + 4) / 4, 128>>>((float *)input.cudaData, \
+                    (half *)gateUpWeight.cudaData, (float *)gateUp.cudaData, \
+                    nullptr, 2 * intermediate, \
+                    (half *)gateWeight.cudaData, (float *)gate.cudaData); \
+        } else if (inputWidth == 2560) { \
             FastllmGemvFp32Fp16Kernel2MultiRow<256, N, 2560, true> \
                 <<<2 * intermediate + 1, 256>>>((float *)input.cudaData, \
                     (half *)gateUpWeight.cudaData, (float *)gateUp.cudaData, \

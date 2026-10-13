@@ -14,6 +14,9 @@
 #include <algorithm>
 #include <cctype>
 #include <mutex>
+#include <atomic>
+#include <exception>
+#include <unordered_map>
 #if defined(__linux__) && defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -59,6 +62,7 @@
 #include "gpt_oss.h"
 
 #include "gguf.h"
+#include "ggufdirectmerge.h"
 
 #ifdef USE_TFACC
 #include "fastllm-tfacc.h"
@@ -72,6 +76,9 @@
 namespace fastllm {
 #if defined(USE_NUMAS)
     void RegisterNumas(fastllm::Data *data, std::string weightType);
+    void RegisterNumasMoeWeightBatch(
+        const std::vector<std::pair<Data*, std::string>> &weights,
+        const std::function<void(size_t)> &onProgress);
 #endif
     extern BF16ToFP16Manager bf16tofp16;
 
@@ -634,7 +641,35 @@ namespace fastllm {
         return std::atoi(weightName.substr(begin, end - begin).c_str());
     }
 
-    static std::string GetMoeWeightSelectedDevice(const basellm *model, const std::string &weightName) {
+    // Build after model callbacks define the rules, then share read-only across
+    // loader threads. Preserve rule order and all matches for shared inputs.
+    class WeightMergeIndex {
+    public:
+        explicit WeightMergeIndex(const std::vector<WeightMergeRule> &rules) {
+            size_t inputCount = 0;
+            for (const auto &rule : rules) {
+                inputCount += rule.allInputs.size();
+            }
+            rulesByInput.reserve(inputCount);
+            for (size_t i = 0; i < rules.size(); ++i) {
+                for (const auto &input : rules[i].allInputs) {
+                    rulesByInput[input].push_back(i);
+                }
+            }
+        }
+
+        const std::vector<size_t> &Find(const std::string &weightName) const {
+            static const std::vector<size_t> empty;
+            auto it = rulesByInput.find(weightName);
+            return it == rulesByInput.end() ? empty : it->second;
+        }
+
+    private:
+        std::unordered_map<std::string, std::vector<size_t>> rulesByInput;
+    };
+
+    static std::string GetMoeWeightSelectedDevice(const basellm *model, const std::string &weightName,
+                                                 const WeightMergeIndex &mergeIndex) {
         if (model == nullptr) {
             return "";
         }
@@ -645,7 +680,8 @@ namespace fastllm {
         if (model->moeLinears.find(weightName) == model->moeLinears.end()) {
             return "";
         }
-        for (auto &mergeRule : model->weightMergeRules) {
+        for (size_t ruleId : mergeIndex.Find(weightName)) {
+            const auto &mergeRule = model->weightMergeRules[ruleId];
             for (auto &rule : mergeRule.rules) {
                 if (std::find(rule.inputs.begin(), rule.inputs.end(), weightName) == rule.inputs.end()) {
                     continue;
@@ -669,11 +705,7 @@ namespace fastllm {
 
     void basellm::WarmupNumaMoeWeights() {
 #if defined(USE_NUMAS)
-        struct PendingNumaWeight {
-            Data *data;
-            std::string weightType;
-        };
-        std::vector<PendingNumaWeight> pending;
+        std::vector<std::pair<Data*, std::string>> pending;
         uint64_t totalBytes = 0;
         int moeSpecialCount = 0;
         int numaSelectedCount = 0;
@@ -747,20 +779,14 @@ namespace fastllm {
                pending.size(), totalBytes / 1024.0 / 1024.0 / 1024.0);
         fflush(stdout);
         int lastProgress = -1;
-        for (int i = 0; i < (int)pending.size(); i++) {
-            RegisterNumas(pending[i].data, pending[i].weightType);
-#if defined(__linux__) && defined(__GLIBC__)
-            if ((i + 1) % 256 == 0) {
-                malloc_trim(0);
-            }
-#endif
-            int progress = (i + 1) * 100 / (int)pending.size();
+        RegisterNumasMoeWeightBatch(pending, [&](size_t completed) {
+            int progress = (int)(completed * 100 / pending.size());
             if (progress != lastProgress) {
                 printf("\r[Fastllm] AutoWarmup NUMA MoE: %d%%", progress);
                 fflush(stdout);
                 lastProgress = progress;
             }
-        }
+        });
 #if defined(__linux__) && defined(__GLIBC__)
         malloc_trim(0);
 #endif
@@ -2215,10 +2241,11 @@ namespace fastllm {
         return true;
     }
 
-    static bool IsDiskMoeWeight(basellm *model, const std::string &weightName) {
+    static bool IsDiskMoeWeight(basellm *model, const std::string &weightName,
+                                const WeightMergeIndex &mergeIndex) {
         return model != nullptr &&
                model->moeLinears.find(weightName) != model->moeLinears.end() &&
-               DeviceNameMatchesType(GetMoeWeightSelectedDevice(model, weightName), "disk");
+               DeviceNameMatchesType(GetMoeWeightSelectedDevice(model, weightName, mergeIndex), "disk");
     }
 
     static bool IsPureDiskDeviceMap(const std::map<std::string, int> &deviceMap) {
@@ -2248,7 +2275,8 @@ namespace fastllm {
 
     static WeightType GetDiskLazyWeightType(basellm *model,
                                             const std::string &weightName,
-                                            uint64_t sourceBytes) {
+                                            uint64_t sourceBytes,
+                                            const WeightMergeIndex &mergeIndex) {
         if (model == nullptr) {
             return WeightType::NONE;
         }
@@ -2256,7 +2284,7 @@ namespace fastllm {
             model->ngramWeights.find(weightName) != model->ngramWeights.end()) {
             return WeightType::EMBEDDING;
         }
-        if (IsDiskMoeWeight(model, weightName)) {
+        if (IsDiskMoeWeight(model, weightName, mergeIndex)) {
             return WeightType::LINEAR;
         }
         if (!IsPureDiskDeviceMap(model->deviceMap)) {
@@ -4299,6 +4327,7 @@ namespace fastllm {
                             "No DFlash tensors were mapped for the GGUF target.");
         }
         model->OnWeightsCreated(allWeightNames);
+        const WeightMergeIndex mergeIndex(model->weightMergeRules);
         ReportModelLoadProgress("weights_prepare", 1, 1);
         std::stable_sort(tensors.begin(), tensors.end(),
                          [&](const std::string &a, const std::string &b) {
@@ -4319,6 +4348,36 @@ namespace fastllm {
         // A serial group is one model-defined unit (for example, a decoder
         // layer). Read its tensors in parallel, then let the model upload and
         // release that group before any tensors from the next group are read.
+        // Publication and callbacks keep their existing ordering under locker.
+        auto finishMergedWeight = [&](const WeightMergeRuleSingle &rule, Data &mergeData) {
+            if (mergeData.dims.size() == 2) {
+#ifdef USE_TFACC
+                try {
+                    if (model->ShouldRegisterSpecialWeightForDeviceType(rule.output, "tfacc")) {
+                        mergeData.weightSum.resize(1);
+                        RegisterFastllmData(&mergeData, rule.type);
+                    }
+                } catch (...) {
+                }
+#endif
+#if defined(USE_NUMAS)
+                try {
+                    if (model->ShouldRegisterSpecialWeightForDeviceType(rule.output, "numa")) {
+                        mergeData.weightSum.resize(1);
+                        RegisterNumas(&mergeData, rule.type);
+                    }
+                } catch (...) {
+                }
+#endif
+                model->MoveSpecialWeightToCudaIfNeeded(rule.output, mergeData);
+            }
+            allFinishNames.insert(rule.output);
+            model->OnWeightLoaded(rule.output, allFinishNames);
+            for (const auto &input : rule.inputs) model->weight.weight.erase(input);
+        };
+        std::unordered_map<std::string, size_t> mergeOutputUses;
+        for (const auto &group : model->weightMergeRules)
+            for (const auto &rule : group.rules) ++mergeOutputUses[rule.output];
         auto loadGGUFWeights = [&](const std::vector<std::string> &loadTensors) {
             if (loadTensors.empty()) {
                 return;
@@ -4328,17 +4387,95 @@ namespace fastllm {
             std::vector<Data *> loadWeights;
             loadWeights.reserve(loadTensors.size());
             for (const auto &name : loadTensors) loadWeights.push_back(&model->weight.weight.at(name));
-            const int workers = std::min(threadNum, (int)loadTensors.size());
+            struct LoadJob {
+                size_t index;
+                const WeightMergeRuleSingle *merge = nullptr;
+                std::vector<const ReadGGUFTask*> inputs;
+                std::vector<int> dims;
+                uint64_t bytes = 0;
+            };
+            std::unordered_map<std::string, size_t> positions;
+            for (size_t i = 0; i < loadTensors.size(); ++i) positions.emplace(loadTensors[i], i);
+            std::vector<bool> claimed(loadTensors.size(), false);
+            std::vector<LoadJob> jobs;
+            for (size_t i = 0; i < loadTensors.size(); ++i) {
+                if (claimed[i]) continue;
+                LoadJob job;
+                job.index = i;
+                const auto &matches = mergeIndex.Find(loadTensors[i]);
+                if (matches.size() == 1) {
+                    const auto &group = model->weightMergeRules[matches.front()];
+                    // Coupled rules/shared inputs and cross-group dependencies
+                    // must retain the general loader's completion semantics.
+                    if (group.rules.size() == 1) {
+                        const auto &rule = group.rules.front();
+                        bool eligible = rule.inputs.size() >= 2 &&
+                            group.allInputs.size() == rule.inputs.size() &&
+                            mergeOutputUses.at(rule.output) == 1 &&
+                            mergeIndex.Find(rule.output).empty() &&
+                            model->weight.weight.find(rule.output) == model->weight.weight.end();
+                        for (const auto &name : rule.inputs) {
+                            auto pos = positions.find(name);
+                            auto task = readGGUFTaskDict.find(name);
+                            if (!eligible || pos == positions.end() || claimed[pos->second] ||
+                                task == readGGUFTaskDict.end() || mergeIndex.Find(name).size() != 1 ||
+                                mergeOutputUses.find(name) != mergeOutputUses.end()) {
+                                eligible = false;
+                                break;
+                            }
+                            const Data &weight = *loadWeights[pos->second];
+                            if (weight.cpuData != nullptr || weight.cudaData != nullptr ||
+                                !weight.numasData.empty() || weight.expansionSize != 0 ||
+                                weight.ggmlTensor != nullptr || weight.dataDevice != DataDevice::CPU ||
+                                weight.isFake || weight.isDiskWeight || weight.multiDeviceData ||
+                                weight.group != -1 || weight.groupCnt != -1 ||
+                                weight.blockK != -1 || weight.blockM != -1 ||
+                                weight.perChannelAxis != -1 || !weight.perChannelsConfigs.empty() ||
+                                !weight.zeros.empty() || !weight.scales.empty() || !weight.mins.empty() ||
+                                !weight.halfScales.empty() ||
+                                GetDiskLazyWeightType(model, name, ggml_nbytes(&task->second->tensor),
+                                                      mergeIndex) != WeightType::NONE) {
+                                eligible = false;
+                                break;
+                            }
+                            job.inputs.push_back(task->second);
+                        }
+                        if (eligible && GetGGUFDirectMergeLayout(job.inputs, job.dims, job.bytes)) {
+                            job.merge = &rule;
+                            for (const auto &name : rule.inputs) claimed[positions.at(name)] = true;
+                        }
+                    }
+                }
+                if (job.merge == nullptr) job.inputs.clear();
+                claimed[i] = true;
+                jobs.push_back(std::move(job));
+            }
+            const int workers = std::min(threadNum, (int)jobs.size());
+            std::atomic<size_t> nextJob{0};
+            std::atomic<bool> cancelled{false};
+            std::exception_ptr loadError;
             std::vector<std::thread> threads;
             for (int worker = 0; worker < workers; worker++) {
-                threads.emplace_back([&](int st, int end) {
-                    for (int i = st; i < end; i++) {
+                threads.emplace_back([&]() {
+                    auto loadJob = [&](const LoadJob &job) {
+                        const size_t i = job.index;
                         const auto &weightName = loadTensors[i];
                         uint64_t tensorBytes = 0;
-                        if (readGGUFTaskDict.find(weightName) != readGGUFTaskDict.end()) {
+                        std::unique_ptr<uint8_t[]> mergedBuffer;
+                        if (job.merge != nullptr) {
+                            // Fill each final slice exactly once. Only publication
+                            // touches the shared map; allocation and I/O are parallel.
+                            mergedBuffer.reset(new uint8_t[job.bytes]);
+                            for (const auto *input : job.inputs) {
+                                const uint64_t bytes = ggml_nbytes(&input->tensor);
+                                ReadGGUFTensorBytes(input->fileName, input->offset,
+                                                   mergedBuffer.get() + tensorBytes, bytes);
+                                tensorBytes += bytes;
+                            }
+                        } else if (readGGUFTaskDict.find(weightName) != readGGUFTaskDict.end()) {
                             auto *task = readGGUFTaskDict[weightName];
                             tensorBytes = ggml_nbytes(&task->tensor);
-                            const WeightType diskType = GetDiskLazyWeightType(model, weightName, tensorBytes);
+                            const WeightType diskType = GetDiskLazyWeightType(model, weightName, tensorBytes, mergeIndex);
                             if (diskType != WeightType::NONE &&
                                 task->replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
                                 SetDiskGGUFWeightMeta(*task->weight, task->tensor, task->fileName, task->offset);
@@ -4386,23 +4523,39 @@ namespace fastllm {
                                 nullptr, nullptr, -1, -1, -1);
                             tensor->ClearBuffer();
                         }
-                        {
-                            // Merging inserts/erases unordered_map nodes. Keep
-                            // lookups, callbacks and registration in this same
-                            // critical section; unlocking around merge corrupts
-                            // the map when multiple expert pairs finish together.
+                        // Map publication, callbacks and erasure remain serialized;
+                        // only private buffer allocation and reads run outside the lock.
+                        if (job.merge != nullptr) {
+                            std::lock_guard<std::mutex> weightGuard(locker);
+                            const auto type = job.inputs.front()->tensor.type;
+                            Data &merged = model->weight[job.merge->output];
+                            merged.dataType = type == GGML_TYPE_F32 ? DataType::FLOAT32 :
+                                type == GGML_TYPE_F16 ? DataType::FLOAT16 : DataType::DATA_GGUF_FORMAT;
+                            if (merged.dataType == DataType::DATA_GGUF_FORMAT) merged.ggmlType = type;
+                            merged.Resize(job.dims);
+                            merged.name = job.merge->output;
+                            merged.isModelWeight = true;
+                            merged.isGGUFData = true;
+                            merged.expansionSize = merged.Count(0);
+                            merged.expansionBytes = job.bytes;
+                            merged.cpuData = mergedBuffer.release();
+                            for (const auto *input : job.inputs) {
+                                allFinishNames.insert(input->name);
+                                merged.forceGGUFFp32Dequant |= input->weight->forceGGUFFp32Dequant;
+                            }
+                            if (merged.dims.size() == 2) merged.CalcWeightSum();
+                            finishMergedWeight(*job.merge, merged);
+                        } else {
                             std::lock_guard<std::mutex> weightGuard(locker);
                             allFinishNames.insert(weightName);
                             // 检查是否需要合并权重
                             bool needMerge = false;
-                            for (auto &rule : model->weightMergeRules) {
-                                if (rule.allInputs.find(weightName) == rule.allInputs.end()) {
-                                    continue;
-                                }
+                            for (size_t ruleId : mergeIndex.Find(weightName)) {
+                                auto &rule = model->weightMergeRules[ruleId];
                                 needMerge = true;
                                 bool canMerge = true;
                                 for (auto &name : rule.allInputs) {
-                                    if (allWeightNames.find(name) != allWeightNames.end() && 
+                                    if (allWeightNames.find(name) != allWeightNames.end() &&
                                         allFinishNames.find(name) == allFinishNames.end()) {
                                         canMerge = false;
                                     }
@@ -4413,17 +4566,17 @@ namespace fastllm {
                                 for (auto &it : rule.rules) {
                                     for (auto input : it.inputs) {
                                         if (model->weight[input].dims.size() == 2) {
-                                            if (model->weight[input].groupCnt != -1 && 
+                                            if (model->weight[input].groupCnt != -1 &&
                                                 model->weight[input].dims[1] % model->weight[input].groupCnt != 0) {
                                                 canMerge = false;
                                                 break;
                                             }
-                                            if (model->weight[input].blockK != -1 && 
+                                            if (model->weight[input].blockK != -1 &&
                                                 model->weight[input].dims[0] % model->weight[input].blockK != 0) {
                                                 canMerge = false;
                                                 break;
                                             }
-                                            if (model->weight[input].blockM != -1 && 
+                                            if (model->weight[input].blockM != -1 &&
                                                 model->weight[input].dims[1] % model->weight[input].blockM != 0) {
                                                 canMerge = false;
                                                 break;
@@ -4445,7 +4598,6 @@ namespace fastllm {
                                     if (allWeightNames.find(it.inputs[0]) == allWeightNames.end()) {
                                         continue;
                                     }
-                                    std::string mergedWeightName = it.output;
                                     int dim0Len = 0;
                                     for (auto input : it.inputs) {
                                         dim0Len += model->weight[input].dims[0];
@@ -4529,32 +4681,10 @@ namespace fastllm {
                                             }
                                             mergeData.CalcWeightSum();
                                         }
-#ifdef USE_TFACC
-                                        try {
-                                            if (model->ShouldRegisterSpecialWeightForDeviceType(mergeName, "tfacc")) {
-                                                mergeData.weightSum.resize(1);
-                                                RegisterFastllmData(&mergeData, it.type);
-                                            }
-                                        } catch (...) {
-                                        }
-#endif
-#if defined(USE_NUMAS)
-                                        try {
-                                            if (model->ShouldRegisterSpecialWeightForDeviceType(mergeName, "numa")) {
-                                                mergeData.weightSum.resize(1);
-                                                RegisterNumas(&mergeData, it.type);
-                                            }
-                                        } catch (...) {
-                                        }
-#endif
-                                        model->MoveSpecialWeightToCudaIfNeeded(mergeName, mergeData);
+
                                     }
 
-                                    allFinishNames.insert(mergedWeightName);
-                                    model->OnWeightLoaded(mergedWeightName, allFinishNames);
-                                    for (auto input : it.inputs) {
-                                        model->weight.weight.erase(input);
-                                    }
+                                    finishMergedWeight(it, model->weight[it.output]);
                                 }
                             }
 #ifdef USE_TFACC
@@ -4591,26 +4721,41 @@ namespace fastllm {
 
                         if (tensors.size() != 0) {
                             locker.lock();
-                            int current = ++cnt;
+                            const int previous = cnt;
+                            cnt += job.merge == nullptr ? 1 : (int)job.inputs.size();
+                            int current = cnt;
                             completedLoadBytes += tensorBytes;
                             uint64_t currentBytes = completedLoadBytes;
-                            printf("Loading %d \r", current * 100 / (int)tensors.size());
-                            fflush(stdout);
+                            const bool reportProgress = current == (int)tensors.size() ||
+                                current * 100 / (int)tensors.size() != previous * 100 / (int)tensors.size();
+                            if (reportProgress) {
+                                printf("Loading %d \r", current * 100 / (int)tensors.size());
+                                fflush(stdout);
+                            }
                             locker.unlock();
-                            if (current == (int)tensors.size() ||
-                                current * 100 / (int)tensors.size() !=
-                                    (current - 1) * 100 / (int)tensors.size()) {
+                            if (reportProgress) {
                                 ReportModelLoadProgress("weights_load", current, tensors.size(),
                                                         currentBytes, totalLoadBytes);
                             }
                         }
+                    };
+                    try {
+                        while (!cancelled.load(std::memory_order_relaxed)) {
+                            const size_t jobId = nextJob.fetch_add(1, std::memory_order_relaxed);
+                            if (jobId >= jobs.size()) break;
+                            loadJob(jobs[jobId]);
+                        }
+                    } catch (...) {
+                        std::lock_guard<std::mutex> guard(locker);
+                        if (!loadError) loadError = std::current_exception();
+                        cancelled.store(true, std::memory_order_relaxed);
                     }
-                }, loadTensors.size() * worker / workers,
-                   loadTensors.size() * (worker + 1) / workers);
+                });
             }
             for (auto &thread : threads) {
                 thread.join();
             }
+            if (loadError) std::rethrow_exception(loadError);
         };
 
         std::vector<std::string> serialTensors, parallelTensors;
@@ -4971,6 +5116,9 @@ namespace fastllm {
         // 如果有需要，为moe设置特定的量化参数。AWQ 的专家权重使用
         // .qweight 保存，即使名称模式未把它识别成普通 LINEAR，也必须走
         // 全局线性量化类型；否则会按普通 I32 参数加载。
+#if defined(__aarch64__)
+        const WeightMergeIndex earlyMergeIndex(model->weightMergeRules);
+#endif
         bool awqArmCpuMoeInt8Fallback = false;
         if (model->moeLinears.size() > 0 && (useMoeDataType || isAwqModel)) {
             for (auto &it : tensorMap) {
@@ -4980,7 +5128,7 @@ namespace fastllm {
                             weight.second = moeDataType;
                         } else if (dtypeConfigString.empty()) {
 #if defined(__aarch64__)
-                            std::string selectedDevice = GetMoeWeightSelectedDevice(model, weight.first);
+                            std::string selectedDevice = GetMoeWeightSelectedDevice(model, weight.first, earlyMergeIndex);
                             if (isAwqModel && model->model_struct == "qwen3_5" &&
                                 (DeviceNameMatchesType(selectedDevice, "cpu") ||
                                  DeviceNameMatchesType(selectedDevice, "numa"))) {
@@ -5142,6 +5290,7 @@ namespace fastllm {
             ReportModelLoadProgress("weights_prepare", 1, 1);
         }
         model->OnWeightsCreated(allWeightNames);
+        const WeightMergeIndex mergeIndex(model->weightMergeRules);
         std::stable_sort(tensors.begin(), tensors.end(),
                          [&](const std::string &a, const std::string &b) {
                              return model->GetWeightLoadPriority(a, tensorMap[a]) <
@@ -5357,7 +5506,7 @@ namespace fastllm {
                             }
 
                             WeightType diskLazyWeightType = GetDiskLazyWeightType(
-                                model, weightName, tensor.bytes);
+                                model, weightName, tensor.bytes, mergeIndex);
                             bool diskLazyWeight = diskLazyWeightType != WeightType::NONE;
                             if (diskLazyWeight) {
                                 if (packedInt4Info.isAffine) {
@@ -5572,10 +5721,8 @@ namespace fastllm {
                             }
                             // 检查是否需要合并权重
                             bool needMerge = false;
-                            for (auto &rule : model->weightMergeRules) {
-                                if (rule.allInputs.find(weightName) == rule.allInputs.end()) {
-                                    continue;
-                                }
+                            for (size_t ruleId : mergeIndex.Find(weightName)) {
+                                auto &rule = model->weightMergeRules[ruleId];
                                 needMerge = true;
                                 bool canMerge = true;
                                 for (auto &name : rule.allInputs) {

@@ -8,6 +8,7 @@
 #include "device.h"
 #include "devices/cpu/cpudevice.h"
 #include <functional>
+#include <mutex>
 
 namespace fastllm {
     int GetNumasMoeShardCount();
@@ -20,6 +21,18 @@ namespace fastllm {
         ~NumasMoeCudaAssistScope();
         NumasMoeCudaAssistScope(const NumasMoeCudaAssistScope &) = delete;
         NumasMoeCudaAssistScope &operator=(const NumasMoeCudaAssistScope &) = delete;
+    };
+    // A pipeline stage owns private staging while sharing the CPU worker pool.
+    // The caller holds cpuLock during preparation/CPU work; GPU completion can
+    // continue after the NUMA prefill backend releases that lock.
+    class NumasMoePipelineScope {
+        int previousWorkspace;
+        std::unique_lock<std::mutex> *previousLock;
+    public:
+        NumasMoePipelineScope(int workspace, std::unique_lock<std::mutex> *cpuLock);
+        ~NumasMoePipelineScope();
+        NumasMoePipelineScope(const NumasMoePipelineScope &) = delete;
+        NumasMoePipelineScope &operator=(const NumasMoePipelineScope &) = delete;
     };
     // Plan local CPU sets for CUDA submission, excluding expert-worker cores
     // and respecting the caller's affinity. Empty sets preserve OS placement.
@@ -73,6 +86,13 @@ namespace fastllm {
     bool IsNumasLinearWeightRegistered(const Data *weight);
     // CUDA can borrow expert shards only when NUMA registration pins them.
     bool NumasMoeWeightsArePinned();
+    // Bounded arenas for GGUF expert weights, including gate/up row interleave
+    // and one CUDA host registration per arena. Other formats use RegisterNumas.
+    void RegisterNumasMoeWeightBatch(
+        const std::vector<std::pair<Data*, std::string>> &weights,
+        const std::function<void(size_t)> &onProgress = {});
+    // Retire only arenas owned by the batch path; borrowed NUMA views are ignored.
+    void ReleaseNumasMoeWeightArena(Data *weight);
 
     // Single-token SwiGLU subsets using already registered NUMA shards. Each
     // selected route writes its unweighted FP32 result at route * hidden.
@@ -173,6 +193,10 @@ namespace fastllm {
     // Whether the active CPU kernels can preserve one-token decode arithmetic
     // for a grouped MoE batch of this size.
     bool CanUseNumasMoeExactSmallBatch(int rows);
+
+    // GGUF verification also preserves the single-row dot and scored BF16/Q8
+    // boundaries on AVX2. Native formats retain the AVX512-BF16 requirement.
+    bool CanUseNumasMoeExactGgufBatch(int rows, Data *const *weights, int weightsBatch);
 
     // Begin copying a contiguous CUDA MoE decode/verification batch to the
     // reusable pinned NUMA staging buffers.  The eventual MergeMOE call

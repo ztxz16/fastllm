@@ -192,6 +192,14 @@ void Scoring() {
     std::printf("PASS weighted ReLU scoring max_error=%.8g\n",err);Check(err<2e-5,"score reference");
 }
 struct BorrowedCache:Data{~BorrowedCache(){isPagedKVCache=false;}};
+bool MlaSupported(DataType type) {
+    int device = 0, sharedMemory = 0;
+    Check(cudaGetDevice(&device) == cudaSuccess, "MLA device");
+    Check(cudaDeviceGetAttribute(&sharedMemory, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+                                device) == cudaSuccess, "MLA shared memory");
+    // FlashInfer's MLA dispatcher requires at least 92672 bytes per SM.
+    return FastllmCudaFlashInferDataTypeSupported(type) && sharedMemory >= 92672;
+}
 void Attention(int past,int rows,bool fragmented) {
     const int heads=64,rank=512,pageLen=32,tokens=past+rows,pages=(tokens+31)/32;
     std::vector<float> kv((fragmented?pages*2:pages)*pageLen*rank),q(heads*rows*rank);
@@ -227,25 +235,84 @@ void Attention(int past,int rows,bool fragmented) {
         Upload(pagedQuery,{heads,rows,rank},q);
         SparseLatentAttention(pagedQuery,cache,physical,1.f/16,pagedOutput,false,&peCache);
         Check(Download(pagedOutput)==got,"paged BF16 fallback differs");
-        Upload(pagedQuery,{heads,rows,rank},q);
-        Data qPe,direct;
-        Upload(qPe,{1,1,heads,64},std::vector<float>(heads*64));
-        Upload(direct,{heads,1,rank},std::vector<float>(heads*rank));
-        Check(FastllmCudaMLAPaged(pagedQuery,qPe,peCache,cache,direct,
-            1.f/16,2048+tokens%4,&physical),"FlashInfer physical-page dispatch");
-        SparseLatentAttention(pagedQuery,cache,physical,1.f/16,pagedOutput,true,&peCache);
-        auto flash=Download(pagedOutput); double diff=0,sq=0;
-        Check(flash==Download(direct),"physical-page wrapper did not use MLA");
-        for(size_t i=0;i<got.size();++i){diff=std::max(diff,double(std::abs(flash[i]-got[i])));sq+=(flash[i]-got[i])*(flash[i]-got[i]);}
-        Check(diff<.004 && std::sqrt(sq/got.size())<.001,"paged MLA differs");
-        std::printf("PASS physical-page MLA max_diff=%.8g rmse=%.8g\n",diff,std::sqrt(sq/got.size()));
+        if (MlaSupported(BFLOAT16)) {
+            Upload(pagedQuery,{heads,rows,rank},q);
+            Data qPe,direct;
+            Upload(qPe,{1,1,heads,64},std::vector<float>(heads*64));
+            Upload(direct,{heads,1,rank},std::vector<float>(heads*rank));
+            Check(FastllmCudaMLAPaged(pagedQuery,qPe,peCache,cache,direct,
+                1.f/16,2048+tokens%4,&physical),"FlashInfer physical-page dispatch");
+            SparseLatentAttention(pagedQuery,cache,physical,1.f/16,pagedOutput,true,&peCache);
+            auto flash=Download(pagedOutput); double diff=0,sq=0;
+            Check(flash==Download(direct),"physical-page wrapper did not use MLA");
+            for(size_t i=0;i<got.size();++i){diff=std::max(diff,double(std::abs(flash[i]-got[i])));sq+=(flash[i]-got[i])*(flash[i]-got[i]);}
+            Check(diff<.004 && std::sqrt(sq/got.size())<.001,"paged MLA differs");
+            std::printf("PASS physical-page MLA max_diff=%.8g rmse=%.8g\n",diff,std::sqrt(sq/got.size()));
+        }
     }
     std::printf("PASS sparse latent attention past=%d rows=%d fragmented=%d max_error=%.8g\n",past,rows,fragmented,error);
     Check(error<.003,"attention independent reference");
 }
+bool Sm75VerificationAttention() {
+    cudaDeviceProp prop{};
+    int device = 0;
+    Check(cudaGetDevice(&device) == cudaSuccess, "attention device");
+    Check(cudaGetDeviceProperties(&prop, device) == cudaSuccess, "attention properties");
+    if (prop.major != 7 || prop.minor != 5) return false;
+    int checks = 0;
+    for (int heads : {32, 64}) for (int rows : {1, 2, 3, 4, 8, 9})
+        for (int width : {32, 517, 2051, 4096}) {
+            const int cap = width + rows + 23;
+            std::vector<float> q(rows * heads * 512), kv(cap * 512), sink(heads);
+            std::vector<int> ids(rows * width);
+            for (int i = 0; i < (int)q.size(); ++i) q[i] = Pattern(i / 512, i % 512) / 8;
+            for (int i = 0; i < (int)kv.size(); ++i) kv[i] = Pattern(i / 512 + 11, i % 512) / 8;
+            for (int h = 0; h < heads; ++h) sink[h] = Pattern(h, 7);
+            for (int r = 0; r < rows; ++r) for (int c = 0; c < width; ++c)
+                ids[r * width + c] = c % 19 == 0 ? -1 : (c * 17 + r * 13) % (cap - rows + r + 1);
+            // Include fully masked rows as well as per-row tails and duplicate candidates.
+            if (rows > 1 && width == 32) std::fill(ids.begin(), ids.begin() + width, -1);
+            Data query, cache, chunk, indices(INT32), sinks, reference, actual;
+            Upload(query, {1, rows, heads, 512}, q);
+            Upload(cache, {1, cap, 512}, kv);
+            Upload(chunk, {1, rows, 512}, std::vector<float>(rows * 512));
+            Upload(sinks, {heads}, sink, FLOAT32);
+            indices.Resize({1, rows, width});
+            indices.ToDevice(DataDevice::CUDA, std::vector<int>{device});
+            indices.Allocate();
+            FastllmCudaCopyFromHostToDevice(indices.cudaData, ids.data(), ids.size() * sizeof(int));
+            // Candidate indices already encode causality. Padding unused query
+            // rows selects the scalar fallback without a production debug flag.
+            const int referenceRows = rows + 8;
+            q.resize(referenceRows * heads * 512, 0);
+            ids.resize(referenceRows * width, -1);
+            Data referenceQuery, referenceChunk, referenceIndices(INT32);
+            Upload(referenceQuery, {1, referenceRows, heads, 512}, q);
+            Upload(referenceChunk, {1, referenceRows, 512}, std::vector<float>(referenceRows * 512));
+            referenceIndices.Resize({1, referenceRows, width});
+            referenceIndices.ToDevice(DataDevice::CUDA, std::vector<int>{device});
+            referenceIndices.Allocate();
+            FastllmCudaCopyFromHostToDevice(referenceIndices.cudaData, ids.data(), ids.size() * sizeof(int));
+            Check(FastllmCudaDeepSeekV41SparseAttention(referenceQuery, referenceChunk, nullptr, &cache,
+                &referenceIndices, sinks, 0, 0, 1.f / 16, reference), "scalar attention reference");
+            auto expected = Download(reference);
+            expected.resize(rows * heads * 512);
+            Check(FastllmCudaDeepSeekV41SparseAttention(query, chunk, nullptr, &cache,
+                &indices, sinks, 0, 0, 1.f / 16, actual), "verification attention launch");
+            Check(Download(actual) == expected, "SM75 verification attention changed BF16 output");
+            ++checks;
+        }
+    std::printf("PASS SM75 verification attention device=%d: %d exact BF16 checks\n", device, checks);
+    return true;
+}
 void MlaPlanCache(int device, int heads, int rank, DataType type) {
     FastllmCudaSetDevice(device);
     static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:" + std::to_string(device));
+    if (!MlaSupported(type)) {
+        std::printf("SKIP MLA plan cache device=%d dtype=%d: unsupported datatype or shared memory\n",
+                    device, int(type));
+        return;
+    }
     constexpr int pageLen = 16, pages = 8, tokens = pageLen * pages;
     std::vector<int> pageIds(pages), indices(tokens);
     std::vector<float> kv(2 * tokens * rank), pe(2 * tokens * 64), query(heads * rank), queryPe(heads * 64);
@@ -441,6 +508,15 @@ int main(int argc, char **argv) {
     FastllmCudaSetDevice(0);
     static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:0");
     try {
+        if (argc == 2 && std::string(argv[1]) == "--sm75-verify") {
+            bool checked = false;
+            for (int device = 0; device < devices; ++device) {
+                FastllmCudaSetDevice(device);
+                static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:" + std::to_string(device));
+                checked = Sm75VerificationAttention() || checked;
+            }
+            return checked ? 0 : 77;
+        }
         if (argc == 2 && std::string(argv[1]) == "--rollback") {
             for (int device = 0; device < devices; ++device) {
                 FastllmCudaSetDevice(device);

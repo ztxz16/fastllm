@@ -197,18 +197,46 @@ void ggml_cuda_op_mul_mat_vec_q(
 }
 */
 
-static void *FastllmGGUFGetDequantWorkspace(size_t *workspaceBytes,
-                                            const fastllm::Data &weight,
-                                            const char *context) {
-    void *workspace = FastllmCudaGetFlashInferFloatWorkspace(workspaceBytes);
-    if (workspace == nullptr || workspaceBytes == nullptr || *workspaceBytes == 0) {
-        fastllm::ErrorInFastLLM(
+// Reuse an existing arena or borrow the required bytes from the pool,
+// preserving the original 256 MiB chunk policy and workspace override.
+struct FastllmGGUFDequantWorkspace {
+    void *data = nullptr;
+    size_t bytes = 0;
+    bool owned = false;
+
+    FastllmGGUFDequantWorkspace(const fastllm::Data &weight,
+            const char *context, int m, int k,
+            size_t elementBytes, size_t extraElementBytes = 0) {
+        data = FastllmCudaTryGetFlashInferFloatWorkspace(&bytes);
+        if (data == nullptr && std::getenv("FT_FLOAT_WORKSPACE_SIZE") != nullptr) {
+            data = FastllmCudaGetFlashInferFloatWorkspace(&bytes);
+        }
+        if (data == nullptr) {
+            const int rows = FastllmGGUFCalcChunkRows(
+                size_t(256) * 1024 * 1024, m, k,
+                elementBytes, extraElementBytes,
+                FastllmGGUFDequantRowGroup(static_cast<ggml_type>(weight.ggmlType)),
+                weight, context);
+            bytes = FastllmGGUFAlignBytes(size_t(rows) * m * elementBytes) +
+                    size_t(rows) * m * extraElementBytes;
+            data = FastllmCudaMalloc(bytes);
+            owned = true;
+        }
+        if (data == nullptr || bytes == 0) {
+            fastllm::ErrorInFastLLM(
                 "Fastllm GGUF CUDA " + std::string(context) +
                 " failed to get dequant workspace, weight = " +
                 FastllmGGUFWeightDisplayName(weight) + ".\n");
+        }
     }
-    return workspace;
-}
+    ~FastllmGGUFDequantWorkspace() {
+        if (owned && !FastllmCudaFreeAfterCurrentThreadStream(data)) {
+            FastllmCudaFree(data);
+        }
+    }
+    FastllmGGUFDequantWorkspace(const FastllmGGUFDequantWorkspace &) = delete;
+    FastllmGGUFDequantWorkspace &operator=(const FastllmGGUFDequantWorkspace &) = delete;
+};
 
 bool FastllmCudaGGUFPrefillSupported(fastllm::DataType inputType, int weightType) {
     const auto type = static_cast<ggml_type>(weightType);
@@ -271,12 +299,11 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
         dequantFp32 != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
-        size_t wsBytes = 0;
-        float *cudaFp32Weight = (float *) FastllmGGUFGetDequantWorkspace(
-                &wsBytes, weight, "FP32 SGEMM");
+        FastllmGGUFDequantWorkspace scratch(weight, "FP32 SGEMM", m, k, sizeof(float));
+        float *cudaFp32Weight = static_cast<float *>(scratch.data);
         int rowGroup = FastllmGGUFDequantRowGroup(ggufType);
         int maxRowsPerChunk = FastllmGGUFCalcChunkRows(
-                wsBytes, m, k, sizeof(float), 0, rowGroup, weight, "FP32 SGEMM");
+                scratch.bytes, m, k, sizeof(float), 0, rowGroup, weight, "FP32 SGEMM");
         size_t srcRowBytes = ggml_row_size(ggufType, m);
 
         cublasStatus_t status;
@@ -306,12 +333,12 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                dequantFp16 != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
-        size_t wsBytes = 0;
-        uint8_t *workspace = (uint8_t *) FastllmGGUFGetDequantWorkspace(
-                &wsBytes, weight, "FP16-to-FP32 SGEMM");
+        FastllmGGUFDequantWorkspace scratch(
+                weight, "FP16-to-FP32 SGEMM", m, k, sizeof(half), sizeof(float));
+        uint8_t *workspace = static_cast<uint8_t *>(scratch.data);
         int rowGroup = FastllmGGUFDequantRowGroup(ggufType);
         int maxRowsPerChunk = FastllmGGUFCalcChunkRows(
-                wsBytes, m, k, sizeof(half), sizeof(float), rowGroup,
+                scratch.bytes, m, k, sizeof(half), sizeof(float), rowGroup,
                 weight, "FP16-to-FP32 SGEMM");
         size_t srcRowBytes = ggml_row_size(ggufType, m);
 
@@ -615,12 +642,10 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
         (forceDequant || n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) &&
         dequant != nullptr) {
         auto handle = getFastllmCublasHandle();
-        size_t workspaceBytes = 0;
-        void *workspace = FastllmGGUFGetDequantWorkspace(
-                &workspaceBytes, weight, "FP16 GEMM");
+        FastllmGGUFDequantWorkspace scratch(weight, "FP16 GEMM", m, k, sizeof(half));
         FastllmGGUFDequantGemm(
                 cudaInput, weight, cudaOutput, n, m, k,
-                workspace, workspaceBytes, dequant, handle, stream);
+                scratch.data, scratch.bytes, dequant, handle, stream);
     } else if (!usedDirectGemv && !usedMmq && !usedPlanar && !usedExtendedMmvq) {
         q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
         quantize_row_q8_1_cuda (
@@ -1220,12 +1245,10 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
         (forceDequant || n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) &&
         dequant != nullptr) {
         auto handle = getFastllmCublasHandle();
-        size_t workspaceBytes = 0;
-        void *workspace = FastllmGGUFGetDequantWorkspace(
-                &workspaceBytes, weight, "BF16 GEMM");
+        FastllmGGUFDequantWorkspace scratch(weight, "BF16 GEMM", m, k, sizeof(__nv_bfloat16));
         FastllmGGUFDequantGemm(
                 cudaInput, weight, cudaOutput, n, m, k,
-                workspace, workspaceBytes, dequant, handle, stream);
+                scratch.data, scratch.bytes, dequant, handle, stream);
     } else if (!usedDirectGemv && !usedMmq && !usedExtendedMmvq) {
         q8Input = (block_q8_1 *)FastllmCudaMalloc(n * m * sizeof(__nv_bfloat16));
         quantize_row_q8_1_cuda(

@@ -966,6 +966,11 @@ if (UNIT_TEST)
                 ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4")
         endif()
 
+        add_executable(gguf_direct_merge_test test/basic/test_gguf_direct_merge.cpp)
+        target_link_libraries(gguf_direct_merge_test PRIVATE fastllm)
+        fastllm_add_checked_test(gguf_direct_merge gguf_direct_merge_test
+            "PASS: generic GGUF direct merge" 60)
+
         add_executable(qwen4_gguf_test test/basic/test_qwen4_gguf.cpp)
         target_link_libraries(qwen4_gguf_test PRIVATE fastllm)
         fastllm_add_checked_test(qwen4_gguf qwen4_gguf_test "PASS: Qwen4 three-shard GGUF" 60)
@@ -1065,6 +1070,22 @@ if (UNIT_TEST)
     set_tests_properties(reduce_batch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
 
     if (USE_NUMAS)
+        add_executable(numas_moe_batch_register_test test/basic/test_numas_moe_batch_register.cpp)
+        target_link_libraries(numas_moe_batch_register_test PRIVATE fastllm)
+        fastllm_add_checked_test(numas_moe_batch_register numas_moe_batch_register_test "PASS: bounded NUMA arenas" 120)
+        fastllm_add_checked_test(numas_moe_batch_register_boundaries numas_moe_batch_register_test "PASS: bounded NUMA arenas" 120 --chunk-boundary)
+        fastllm_add_checked_test(numas_moe_batch_register_unpinned numas_moe_batch_register_test "PASS: bounded NUMA arenas" 120)
+        fastllm_add_checked_test(numas_moe_batch_register_dual_numa numas_moe_batch_register_test "PASS: bounded NUMA arenas" 120)
+        set_tests_properties(numas_moe_batch_register numas_moe_batch_register_boundaries PROPERTIES
+            ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_PINNED_WEIGHT=1" RUN_SERIAL TRUE)
+        set_tests_properties(numas_moe_batch_register_unpinned PROPERTIES
+            ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_PINNED_WEIGHT=0" RUN_SERIAL TRUE)
+        set_tests_properties(numas_moe_batch_register_dual_numa PROPERTIES
+            ENVIRONMENT "FT_NUMAS=2;FT_THREADS=4;FT_PINNED_WEIGHT=1" RUN_SERIAL TRUE)
+        if (USE_CUDA)
+            target_include_directories(numas_moe_batch_register_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            set_tests_properties(numas_moe_batch_register numas_moe_batch_register_boundaries numas_moe_batch_register_dual_numa PROPERTIES LABELS cuda)
+        endif()
         add_executable(numas_v41_q2_moe_test test/basic/test_numas_v41_q2_moe.cpp)
         target_link_libraries(numas_v41_q2_moe_test PRIVATE fastllm)
         add_test(NAME numas_v41_q2_moe COMMAND numas_v41_q2_moe_test)
@@ -1130,6 +1151,13 @@ if (UNIT_TEST)
             ENVIRONMENT "FT_NUMAS=2;FT_THREADS=6;FT_GPU_PREFILL=0"
             SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         if (USE_CUDA)
+            add_executable(numas_moe_pipeline_test test/basic/test_numas_moe_pipeline.cpp)
+            target_link_libraries(numas_moe_pipeline_test PRIVATE fastllm)
+            target_include_directories(numas_moe_pipeline_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(numas_moe_pipeline numas_moe_pipeline_test "PASS: NUMA pipeline private staging" 120)
+            set_tests_properties(numas_moe_pipeline PROPERTIES
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=1;FT_EXPERT_LIMIT=32"
+                LABELS "cuda;numa;multigpu" RUN_SERIAL TRUE)
             add_executable(numas_nvfp4_hybrid_cold_test test/basic/test_numas_nvfp4_hybrid_cold.cpp)
             target_link_libraries(numas_nvfp4_hybrid_cold_test PRIVATE fastllm)
             target_include_directories(numas_nvfp4_hybrid_cold_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -1343,6 +1371,15 @@ if (UNIT_TEST)
         target_include_directories(glm5_next_dsa_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME glm5_next_dsa COMMAND glm5_next_dsa_test)
         add_test(NAME glm5_next_dsa_mtp_rollback COMMAND glm5_next_dsa_test --rollback)
+        add_test(NAME glm5_next_dsa_sm75_verify COMMAND glm5_next_dsa_test --sm75-verify)
+        set_tests_properties(glm5_next_dsa_sm75_verify PROPERTIES LABELS "cuda;mtp"
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        add_executable(glm5_next_tp_stream_test test/basic/test_glm5_next_tp_stream.cpp)
+        target_link_libraries(glm5_next_tp_stream_test PRIVATE fastllm)
+        target_include_directories(glm5_next_tp_stream_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME glm5_next_tp_stream COMMAND glm5_next_tp_stream_test)
+        set_tests_properties(glm5_next_tp_stream PROPERTIES LABELS "cuda;tp;mtp"
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
         set_tests_properties(glm5_next_dsa_mtp_rollback PROPERTIES LABELS cuda SKIP_RETURN_CODE 77
             RUN_SERIAL TRUE TIMEOUT 180 PASS_REGULAR_EXPRESSION "PASS GLM DSA MTP rollback on all CUDA devices")
         set_tests_properties(glm5_next_dsa PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
@@ -1798,6 +1835,9 @@ if (UNIT_TEST)
             target_link_libraries(cuda_glm5_gguf_cache_test PRIVATE fastllm)
             target_include_directories(cuda_glm5_gguf_cache_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             fastllm_add_checked_test(cuda_glm5_gguf_cache cuda_glm5_gguf_cache_test "PASS: GLM GGUF cache" 120)
+            fastllm_add_checked_test(cuda_glm5_gguf_packed_iq cuda_glm5_gguf_cache_test "PASS: GLM GGUF packed IQ" 180 --packed-iq)
+            fastllm_add_checked_test(cuda_glm5_gguf_tp_batch cuda_glm5_gguf_cache_test "PASS: GLM TP batch" 180 --tp-batch)
+            fastllm_add_checked_test(cuda_glm5_gguf_iq4_down cuda_glm5_gguf_cache_test "PASS: IQ4_XS TP down" 60 --iq4-down)
             fastllm_add_checked_test(cuda_glm5_gguf_frequency cuda_glm5_gguf_cache_test "PASS: GLM GGUF cache" 120 --frequency)
             fastllm_add_checked_test(cuda_glm5_gguf_no_cache cuda_glm5_gguf_cache_test "PASS: GLM GGUF cache" 120 --no-cache)
             fastllm_add_checked_test(cuda_glm5_gguf_verify cuda_glm5_gguf_cache_test "PASS: GLM GGUF verify" 180 --verify)
@@ -1809,7 +1849,8 @@ if (UNIT_TEST)
             fastllm_add_checked_test(cuda_glm5_gguf_ep_cache cuda_glm5_gguf_cache_test "PASS: GLM GGUF EP cache" 180 --ep-cache)
             fastllm_add_checked_test(cuda_glm5_gguf_ep_prefill cuda_glm5_gguf_cache_test "PASS: GLM GGUF EP prefill" 180 --ep-prefill)
             fastllm_add_checked_test(cuda_glm5_gguf_ep_numa_prefill cuda_glm5_gguf_cache_test "PASS: GLM GGUF EP prefill" 180 --ep-numa-prefill)
-            set_tests_properties(cuda_glm5_gguf_cache cuda_glm5_gguf_frequency cuda_glm5_gguf_no_cache
+            set_tests_properties(cuda_glm5_gguf_cache cuda_glm5_gguf_packed_iq cuda_glm5_gguf_tp_batch
+                cuda_glm5_gguf_iq4_down cuda_glm5_gguf_frequency cuda_glm5_gguf_no_cache
                 cuda_glm5_gguf_verify cuda_glm5_gguf_verify_no_cache cuda_glm5_gguf_verify_full_cache
                 cuda_glm5_gguf_resident cuda_glm5_gguf_host_prefill cuda_glm5_gguf_host_prefill_no_cache
                 cuda_glm5_gguf_ep_cache cuda_glm5_gguf_ep_prefill
@@ -1900,7 +1941,7 @@ if (UNIT_TEST)
         add_executable(cuda_q6_mmvq_test test/basic/test_cuda_q6_mmvq.cu)
         target_link_libraries(cuda_q6_mmvq_test PRIVATE fastllm)
         set_target_properties(cuda_q6_mmvq_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
-        fastllm_add_checked_test(cuda_q6_mmvq cuda_q6_mmvq_test "PASS Q6 multi-row" 600)
+        fastllm_add_checked_test(cuda_q6_mmvq cuda_q6_mmvq_test "PASS Q6/Q5 multi-row" 600)
         set_tests_properties(cuda_q6_mmvq PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
         add_executable(cuda_qwen4_sparse_prefill_test test/basic/test_cuda_qwen4_sparse_prefill.cu)

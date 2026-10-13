@@ -42,6 +42,10 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
 void FastllmCudaCustomAllReduceReset();
 bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
                                 int dataType, int deviceId);
+// Optional bounded host spin for dedicated decode submission cores. The
+// pointer registration and collective fallback checks remain unchanged.
+bool FastllmCudaCustomAllReduceWithSpin(void* data, void* dest, int count,
+                                      int dataType, int deviceId, int hostSpinMicroseconds);
 // Reduce a block with the rank-ordered FP32 arithmetic selected for one row.
 // Uses the existing single-row enable policy and registers the complete block.
 // False means the caller must reduce rows separately with its ordinary path.

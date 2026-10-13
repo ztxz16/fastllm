@@ -7490,6 +7490,42 @@ __global__ void FastllmClampKernel(T *data, int len, bool hasMin, float minValue
     data[idx] = FastllmCudaFloatToValue<T>(x);
 }
 
+__global__ void FastllmGlm5NextClampedSiluKernel(const __nv_bfloat16 *input,
+        __nv_bfloat16 *output, int count, int intermediate, float limit) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int offset = (i / intermediate) * (2 * intermediate) + i % intermediate;
+    float gate = __bfloat162float(input[offset]);
+    float up = __bfloat162float(input[offset + intermediate]);
+    if (gate > limit) gate = limit;
+    if (up < -limit) up = -limit;
+    if (up > limit) up = limit;
+    // Preserve all three BF16 boundaries of Clamp -> Silu -> MulTo.
+    gate = __bfloat162float(__float2bfloat16_rn(gate));
+    up = __bfloat162float(__float2bfloat16_rn(up));
+    const float activated = __bfloat162float(__float2bfloat16_rn(gate / (1.0f + expf(-gate))));
+    output[i] = __float2bfloat16_rn(activated * up);
+}
+
+bool FastllmCudaGlm5NextClampedSilu(const fastllm::Data &input, float limit, fastllm::Data &output) {
+    using namespace fastllm;
+    if (input.dataDevice != DataDevice::CUDA || !input.cudaData || input.dims.empty() ||
+        input.dims.back() <= 0 || input.dims.back() % 2 || input.dataType != DataType::BFLOAT16 ||
+        !std::isfinite(limit) || limit < 0 || input.Count(0) > INT_MAX) return false;
+    auto dims = input.dims;
+    dims.back() /= 2;
+    output.dataType = input.dataType;
+    output.UpdateUnitSize();
+    output.Resize(dims);
+    output.ToDevice(DataDevice::CUDA, input.dataDeviceIds, false);
+    output.Allocate(false);
+    const int count = input.Count(0) / 2;
+    if (count) FastllmGlm5NextClampedSiluKernel<<<(count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        (const __nv_bfloat16*)input.cudaData, (__nv_bfloat16*)output.cudaData, count, dims.back(), limit);
+    AssertInFastLLM(cudaPeekAtLastError() == cudaSuccess, "GLM clamped SiLU launch failed.");
+    return true;
+}
+
 bool FastllmCudaClamp(fastllm::Data &input, bool hasMin, float minValue, bool hasMax, float maxValue) {
     if (!hasMin && !hasMax) {
         return true;
@@ -9399,17 +9435,20 @@ bool FastllmCudaKimiK3RecurrentKDA(
     }
 #ifndef USE_ROCM
     // Decode, multi-row verification and prefill share the exact register scan.
-    // Auxiliary/state replay and graph capture keep the allocation-free path.
+    // Auxiliary/state replay retains the allocation-free path. Captures use
+    // pinned pool scratch, preserving the same register scan as eager decode.
     if (dimension == KIMI_K3_KDA_DIMENSION && batch > 0 && heads > 0 &&
         sequence > 0 && !stateOnly && !outputAux &&
         normalizeQKInFp32 && roundBetaToBfloat16 &&
-        aLog.Count(0) == (uint64_t)heads && !FastllmCudaGraphIsCapturing()) {
+        aLog.Count(0) == (uint64_t)heads) {
         size_t rows = (size_t)batch * sequence * heads;
         if (rows <= (size_t)std::numeric_limits<int>::max() - 3) {
             size_t scratchBytes = rows * (3 * dimension + 1) * sizeof(float);
-            size_t borrowedBytes = 0;
-            bool own = false;
-            void *scratch = FastllmBorrowCudaTempBuffer(scratchBytes, &borrowedBytes, &own);
+            const bool capturing = FastllmCudaGraphIsCapturingFast();
+            size_t borrowedBytes = capturing ? scratchBytes : 0;
+            bool own = capturing;
+            void *scratch = capturing ? FastllmCudaMalloc(scratchBytes) :
+                FastllmBorrowCudaTempBuffer(scratchBytes, &borrowedBytes, &own);
             if (scratch != nullptr && borrowedBytes >= scratchBytes) {
                 KimiK3LaunchKdaPrefill(q.cudaData, k.cudaData, v.cudaData, rawGate.cudaData,
                     (const float*)rawBeta.cudaData, (const float*)aLog.cudaData,
@@ -11719,24 +11758,19 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
     useLegacyMerge = __shfl_sync(FULL_WARP_MASK, useLegacyMerge, 0);
 
     if (!useLegacyMerge) {
-        if (lane == 0) {
-            float selectedSum = 1.0f;
-            if (needNorm) {
-                selectedSum = 0.0f;
+        float selectedSum = 1.0f;
+        if (lane == 0 && needNorm) {
+            selectedSum = 0.0f;
 #pragma unroll
-                for (int rank = 0; rank < TOPK; ++rank) {
-                    selectedSum += selectedProbabilities[rank];
-                }
-                if (!isfinite(selectedSum) || fabsf(selectedSum) < 1.0e-20f) {
-                    selectedSum = 1.0f;
-                }
-            }
-#pragma unroll
-            for (int rank = 0; rank < TOPK; ++rank) {
-                index[rank] = selectedIds[rank];
-                score[rank] = selectedProbabilities[rank] /
-                              selectedSum * routeScale;
-            }
+            for (int rank = 0; rank < TOPK; ++rank)
+                selectedSum += selectedProbabilities[rank];
+            if (!isfinite(selectedSum) || fabsf(selectedSum) < 1.0e-20f)
+                selectedSum = 1.0f;
+        }
+        selectedSum = __shfl_sync(FULL_WARP_MASK, selectedSum, 0);
+        if (lane < TOPK) {
+            index[lane] = selectedIds[lane];
+            score[lane] = selectedProbabilities[lane] / selectedSum * routeScale;
         }
         return;
     }
@@ -20376,7 +20410,15 @@ int FastllmCudaGetHostNumaNode(int device) {
         domain, bus, slot, function);
     int node = -1;
     std::ifstream file(path);
-    if (file >> node) return node;
+    if ((file >> node) && node >= 0) return node;
+    // Firmware can omit PCI NUMA affinity even on a single-node machine.
+    // Only a single online node gives an unambiguous fallback.
+    std::ifstream nodes("/sys/devices/system/node/online");
+    std::string online;
+    if ((nodes >> online) && !online.empty() &&
+        online.find_first_not_of("0123456789") == std::string::npos) {
+        try { return std::stoi(online); } catch (const std::exception &) {}
+    }
 #endif
     return -1;
 }

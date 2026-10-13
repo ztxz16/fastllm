@@ -22,8 +22,111 @@
 #include <vector>
 
 namespace {
+    // FP32 sequence recurrence with independent column tiles and register state.
+    __global__ void Qwen4PrefillNormalizeKernel(const float *qkv, float *qk,
+            int keyHeads, int valueHeads, float eps, float inv) {
+        const int head = blockIdx.x % keyHeads, row = blockIdx.x / keyHeads;
+        const int lane = threadIdx.x;
+        const size_t channels = size_t(2 * keyHeads + valueHeads) * 128;
+        const float *qp = qkv + size_t(row) * channels + head * 128;
+        const float *kp = qp + keyHeads * 128;
+        float4 q = reinterpret_cast<const float4 *>(qp)[lane];
+        float4 k = reinterpret_cast<const float4 *>(kp)[lane];
+        float qs = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
+        float ks = k.x*k.x + k.y*k.y + k.z*k.z + k.w*k.w;
+        for (int shift = 16; shift; shift >>= 1) {
+            qs += __shfl_down_sync(0xffffffffu, qs, shift);
+            ks += __shfl_down_sync(0xffffffffu, ks, shift);
+        }
+        const float qn = rsqrtf(__shfl_sync(0xffffffffu, qs, 0) / 128 + eps);
+        const float kn = rsqrtf(__shfl_sync(0xffffffffu, ks, 0) / 128 + eps);
+        q.x = (q.x * qn * inv) * inv; q.y = (q.y * qn * inv) * inv;
+        q.z = (q.z * qn * inv) * inv; q.w = (q.w * qn * inv) * inv;
+        k.x = k.x * kn * inv; k.y = k.y * kn * inv;
+        k.z = k.z * kn * inv; k.w = k.w * kn * inv;
+        float *target = qk + size_t(blockIdx.x) * 256;
+        reinterpret_cast<float4 *>(target)[lane] = q;
+        reinterpret_cast<float4 *>(target + 128)[lane] = k;
+    }
+
+    template<typename T>
+    __global__ void Qwen4PrefillGatesKernel(const T *alpha, const T *beta,
+            const float *aLog, const float *dtBias, float2 *gates,
+            int heads, size_t count) {
+        for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+             i < count; i += size_t(gridDim.x) * blockDim.x) {
+            const int h = i % heads;
+            const float x = float(alpha[i]) + dtBias[h];
+            const float sp = x > 20.f ? x : log1p(expf(x));
+            gates[i] = make_float2(expf(-expf((double)aLog[h]) * sp),
+                                   1.0 / (1.0 + expf(-float(beta[i]))));
+        }
+    }
+
+    __global__ __launch_bounds__(128)
+    void Qwen4PrefillRecurrentKernel(const float *qkv, const float *qk,
+            const float2 *gates, const float *initial, float *state, float *output,
+            int keyHeads, int valueHeads, int sequence) {
+        const int head = blockIdx.x / 4 % valueHeads;
+        const int batch = blockIdx.x / (4 * valueHeads);
+        const int first = (blockIdx.x % 4) * 32;
+        const int tid = threadIdx.x, col = tid % 32, group = tid / 32;
+        const int keyHead = head / (valueHeads / keyHeads);
+        const size_t channels = size_t(2 * keyHeads + valueHeads) * 128;
+        const size_t stateBase = (size_t(batch) * valueHeads + head) * 128 * 128;
+        __shared__ float query[128], key[128], memoryPart[4][32], outputPart[4][32];
+        float values[32];
+        #pragma unroll
+        for (int i = 0; i < 32; ++i)
+            values[i] = initial[stateBase + (group * 32 + i) * 128 + first + col];
+        size_t row = size_t(batch) * sequence;
+        const float *norm = qk + (row * keyHeads + keyHead) * 256;
+        float nextQ = norm[tid], nextK = norm[128 + tid];
+        float nextV = qkv[row * channels + (2 * keyHeads + head) * 128 + first + col];
+        float2 nextGate = gates[row * valueHeads + head];
+        for (int t = 0; t < sequence; ++t, ++row) {
+            query[tid] = nextQ; key[tid] = nextK;
+            const float v = nextV, decay = nextGate.x, beta = nextGate.y;
+            __syncthreads();
+            if (t + 1 < sequence) {
+                norm = qk + ((row + 1) * keyHeads + keyHead) * 256;
+                nextQ = norm[tid]; nextK = norm[128 + tid];
+                nextV = qkv[(row + 1) * channels + (2 * keyHeads + head) * 128 + first + col];
+                nextGate = gates[(row + 1) * valueHeads + head];
+            }
+            float memory = 0;
+            #pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                values[i] *= decay;
+                memory += values[i] * key[group * 32 + i];
+            }
+            memoryPart[group][col] = memory;
+            __syncthreads();
+            const float sum = ((memoryPart[0][col] + memoryPart[1][col]) +
+                               memoryPart[2][col]) + memoryPart[3][col];
+            const float delta = (v - sum) * beta;
+            float result = 0;
+            #pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                values[i] += key[group * 32 + i] * delta;
+                result += values[i] * query[group * 32 + i];
+            }
+            outputPart[group][col] = result;
+            __syncthreads();
+            if (group == 0)
+                output[(row * valueHeads + head) * 128 + first + col] =
+                    ((outputPart[0][col] + outputPart[1][col]) + outputPart[2][col]) + outputPart[3][col];
+        }
+        #pragma unroll
+        for (int i = 0; i < 32; ++i)
+            state[stateBase + (group * 32 + i) * 128 + first + col] = values[i];
+    }
+
+    template<bool DeviceTop>
     __global__ void Qwen4TopProbabilityKernel(
-            const float *logits, float *output, int vocabulary, float maximum) {
+            const float *logits, float *output, int vocabulary, float maximum,
+            const float *top) {
+        if constexpr (DeviceTop) maximum = top[1];
         __shared__ float partial[32];
         float sum = 0.0f;
         float correction = 0.0f;
@@ -46,7 +149,9 @@ namespace {
                 sum += __shfl_down_sync(0xffffffff, sum, offset);
             if (threadIdx.x == 0) {
                 const float probability = 1.0f / sum;
-                *output = isfinite(maximum) && isfinite(probability) ? probability : 0.0f;
+                if constexpr (DeviceTop) output[0] = top[0];
+                output[DeviceTop ? 1 : 0] =
+                    isfinite(maximum) && isfinite(probability) ? probability : 0.0f;
             }
         }
     }
@@ -1180,6 +1285,24 @@ namespace {
             const float *input, const float *weight, const half *gate,
             half *output, float eps);
 
+    struct Qwen4LinearReplayPointers {
+        const void *convInput;
+        const float *convWeight;
+        const float *convCheckpoint;
+        float *convState;
+        float *convolved;
+        const void *alpha;
+        const void *beta;
+        const float *aLog;
+        const float *dtBias;
+        const float *recurrentCheckpoint;
+        float *recurrentState;
+        float *coreOutput;
+    };
+
+    static_assert(sizeof(Qwen4LinearReplayPointers) == 12 * sizeof(void*),
+                  "Qwen4 replay pointer table must not contain padding");
+
     template <typename T, bool OUT_OF_PLACE_STATE, bool FUSE_OUTPUT = false>
     __global__ __launch_bounds__(128) void Qwen4GatedDeltaRuleDecodeKernel(
             const float *qkv, const T *alpha, const T *beta,
@@ -1332,19 +1455,39 @@ namespace {
         }
     }
 
+    struct Qwen4LinearReplaySequenceBatch {
+        static constexpr int MAX_LAYERS = 32;
+        Qwen4LinearReplayPointers layers[MAX_LAYERS];
+    };
+    struct Qwen4NoLinearReplayBatch {};
+
     // Sequence state tiling. A warp owns 32 adjacent value
     // channels, so each lane retains the generic kernel's strictly increasing
     // K reduction order.  Four independent blocks per value head expose the
     // same 128 lanes to four times as many SMs while caching each state tile
     // across all speculative tokens.
-    template <typename T, bool OUT_OF_PLACE_STATE>
+    template <typename T, bool OUT_OF_PLACE_STATE, bool BATCHED_REPLAY = false>
     __global__ __launch_bounds__(32)
     void Qwen4GatedDeltaRuleSequenceValueTileKernel(
             const float *qkv, const T *alpha, const T *beta,
             const float *aLog, const float *dtBias, float *state,
             float *stateOutput, float *output,
             int keyHeads, int valueHeads,
-            int sequence, float recurrentEps, float inverseHead) {
+            int sequence, float recurrentEps, float inverseHead,
+            typename std::conditional<BATCHED_REPLAY,
+                Qwen4LinearReplaySequenceBatch, Qwen4NoLinearReplayBatch>::type
+                layers = {}) {
+        static_assert(!BATCHED_REPLAY || !OUT_OF_PLACE_STATE);
+        if constexpr (BATCHED_REPLAY) {
+            const auto &layer = layers.layers[blockIdx.y];
+            qkv = layer.convolved;
+            alpha = static_cast<const T *>(layer.alpha);
+            beta = static_cast<const T *>(layer.beta);
+            aLog = layer.aLog;
+            dtBias = layer.dtBias;
+            state = layer.recurrentState;
+            output = layer.coreOutput;
+        }
         constexpr int KEY_DIM = 128;
         constexpr int VALUE_DIM = 128;
         constexpr int VALUE_TILE = 32;
@@ -1560,24 +1703,6 @@ namespace {
         Qwen4GdnOutputGateExactDevice(input + offset, weight, gate + offset,
                                     output + offset, eps);
     }
-
-    struct Qwen4LinearReplayPointers {
-        const void *convInput;
-        const float *convWeight;
-        const float *convCheckpoint;
-        float *convState;
-        float *convolved;
-        const void *alpha;
-        const void *beta;
-        const float *aLog;
-        const float *dtBias;
-        const float *recurrentCheckpoint;
-        float *recurrentState;
-        float *coreOutput;
-    };
-
-    static_assert(sizeof(Qwen4LinearReplayPointers) == 12 * sizeof(void*),
-                  "Qwen4 replay pointer table must not contain padding");
 
     __global__ void Qwen4LinearReplayRestoreKernel(
             const Qwen4LinearReplayPointers *layers,
@@ -1939,6 +2064,47 @@ namespace {
                 scores[item] = score * inverseSqrt;
             }
         }
+    }
+
+    // Coalesced key loads for one decode query. Shared-memory transposition
+    // retains the original serial FP32 dot order and ordered head reduction,
+    // including exact score ties, while avoiding strided global loads.
+    template <typename T>
+    __global__ void Qwen4QSAScoreDecodeKernel(
+            const T *query, const float *compressedKeys, float *scores,
+            int blocks, float inverseSqrt, int queryStart, int compressRatio,
+            const int32_t *decodeMeta) {
+        constexpr int tileKeys = 32, heads = 4, dim = 128;
+        __shared__ float keys[dim][tileKeys + 1];
+        __shared__ float queries[dim][heads + 1];
+        const int position = queryStart == -2 && decodeMeta ? decodeMeta[0] : queryStart;
+        const int actual = position >= 0 ? (position + 1) / compressRatio :
+            (decodeMeta ? (decodeMeta[0] + 1) / compressRatio : blocks);
+        const int valid = min(blocks, actual);
+        const int firstKey = blockIdx.x * tileKeys;
+        if (firstKey >= valid) return;
+        #pragma unroll
+        for (int i = threadIdx.x; i < tileKeys * dim; i += tileKeys * heads) {
+            const int key = i / dim, column = i % dim;
+            keys[column][key] = firstKey + key < valid
+                ? compressedKeys[(uint64_t)(firstKey + key) * dim + column] : 0.0f;
+        }
+        #pragma unroll
+        for (int i = threadIdx.x; i < heads * dim; i += tileKeys * heads)
+            queries[i % dim][i / dim] = Qwen4CudaToFloat(query[i]);
+        __syncthreads();
+        const int head = threadIdx.x % heads;
+        const int key = threadIdx.x / heads;
+        float dot = 0.0f;
+#pragma unroll
+        for (int column = 0; column < dim; ++column)
+            dot += queries[column][head] * keys[column][key];
+        float score = 0.0f;
+#pragma unroll
+        for (int h = 0; h < heads; ++h)
+            score += fmaxf(__shfl_sync(0xffffffffu, dot, h, heads), 0.0f);
+        if (head == 0 && firstKey + key < valid)
+            scores[firstKey + key] = score * inverseSqrt;
     }
 
     // Reuse each compressed key across four prefill queries. Transposed,
@@ -2771,6 +2937,32 @@ namespace {
         }
     }
 
+    template <typename T>
+    void Qwen4LaunchLinearReplaySequence(
+            const std::vector<FastllmCudaQwen4LinearReplayItem> &items,
+            int keyHeads, int valueHeads, int sequence, float recurrentEps) {
+        Qwen4LinearReplaySequenceBatch layers{};
+        for (size_t i = 0; i < items.size(); ++i) {
+            auto &layer = layers.layers[i];
+            const auto &item = items[i];
+            layer.convolved = (float*)item.convolved->cudaData;
+            layer.alpha = item.alpha->cudaData;
+            layer.beta = item.beta->cudaData;
+            layer.aLog = (float*)item.aLog->cudaData;
+            layer.dtBias = (float*)item.dtBias->cudaData;
+            layer.recurrentState = (float*)item.recurrentState->cudaData;
+            layer.coreOutput = (float*)item.coreOutput->cudaData;
+        }
+        const float inverseHead = 1.0f / std::sqrt(128.0f);
+        // Only the pointer source and independent layer grid differ from
+        // separate sequence replays; retain the same kernel and lane mapping.
+        Qwen4GatedDeltaRuleSequenceValueTileKernel<T, false, true><<<
+            dim3(valueHeads * 4, items.size()), 32, 0, cudaStreamPerThread>>>(
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, keyHeads, valueHeads, sequence,
+            recurrentEps, inverseHead, layers);
+    }
+
     bool Qwen4CanRunGatedDeltaRule(
             const fastllm::Data &qkv, const fastllm::Data &alpha,
             const fastllm::Data &beta,
@@ -2816,8 +3008,18 @@ namespace {
 bool FastllmCudaQwen4TopProbability(const float *logits, float *output,
                                    int vocabulary, float maxLogit) {
     if (logits == nullptr || output == nullptr || vocabulary <= 0) return false;
-    Qwen4TopProbabilityKernel<<<1, 1024, 0, cudaStreamPerThread>>>(
-        logits, output, vocabulary, maxLogit);
+    Qwen4TopProbabilityKernel<false><<<1, 1024, 0, cudaStreamPerThread>>>(
+        logits, output, vocabulary, maxLogit, nullptr);
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4TopProbabilityFromTopK(const float *logits, float *output,
+                                           int vocabulary, const float *top) {
+    if (logits == nullptr || output == nullptr || top == nullptr || vocabulary <= 0)
+        return false;
+    Qwen4TopProbabilityKernel<true><<<1, 1024, 0, cudaStreamPerThread>>>(
+        logits, output, vocabulary, 0.0f, top);
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }
@@ -3410,6 +3612,16 @@ static bool FastllmCudaQwen4QSASelectLaunch(
     }
     auto launchScore = [&](const auto *typedQuery) {
         using T = std::remove_cv_t<std::remove_pointer_t<decltype(typedQuery)>>;
+        if (rows == 1 && heads == 4 && headDim == 128) {
+            Qwen4QSAScoreDecodeKernel<<<(scoreCapacity + 31) / 32, 128, 0, cudaStreamPerThread>>>(
+                typedQuery, (const float *)compressedKeys.cudaData, scores,
+                scoreCapacity, inverseSqrt, queryStart, compressRatio, decodeMeta);
+            const cudaError_t error = cudaGetLastError();
+            if (error == cudaSuccess) return true;
+            if (error != cudaErrorInvalidConfiguration && error != cudaErrorLaunchOutOfResources &&
+                error != cudaErrorNoKernelImageForDevice && error != cudaErrorInvalidDeviceFunction)
+                return false;
+        }
         if (tiledPrefill) {
             const dim3 grid((activeBlocks + 63) / 64, (rows + 3) / 4);
             Qwen4QSAScorePrefillKernel<<<grid, threads, 0, cudaStreamPerThread>>>(
@@ -4458,6 +4670,45 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
     // from state reuse and additional independent blocks, not an ISA or a
     // particular speculative width. Single-token decode keeps its mapping.
     const bool useValueTile = sequence > 1;
+    if (sequence >= 64) {
+        cudaStreamCaptureStatus capture;
+        const auto status = cudaStreamIsCapturing(cudaStreamPerThread, &capture);
+        if (status != cudaSuccess) return false;
+        const size_t rows = size_t(batch) * sequence;
+        const size_t normBytes = rows * keyHeads * 256 * sizeof(float);
+        const size_t gateCount = rows * valueHeads;
+        const size_t need = normBytes + gateCount * sizeof(float2);
+        if (capture == cudaStreamCaptureStatusNone && need <= (size_t(256) << 20)) {
+            size_t available = 0;
+            bool own = false;
+            void *scratch = FastllmBorrowCudaTempBuffer(need, &available, &own);
+            if (scratch && available >= need) {
+                auto *normalized = static_cast<float *>(scratch);
+                auto *gates = reinterpret_cast<float2 *>(static_cast<uint8_t *>(scratch) + normBytes);
+                Qwen4PrefillNormalizeKernel<<<rows * keyHeads, 32, 0, cudaStreamPerThread>>>(
+                    (const float *)qkv.cudaData, normalized, keyHeads, valueHeads, recurrentEps, inverseHead);
+                const int gateBlocks = int(std::min(size_t(1024), (gateCount + 255) / 256));
+                auto prepareGates = [&](auto *typedAlpha) {
+                    using T = std::remove_cv_t<std::remove_pointer_t<decltype(typedAlpha)>>;
+                    Qwen4PrefillGatesKernel<T><<<gateBlocks, 256, 0, cudaStreamPerThread>>>(
+                        typedAlpha, (const T *)beta.cudaData, (const float *)aLog.cudaData,
+                        (const float *)dtBias.cudaData, gates, valueHeads, gateCount);
+                };
+                if (alpha.dataType == fastllm::FLOAT32) prepareGates((const float *)alpha.cudaData);
+                else if (alpha.dataType == fastllm::FLOAT16) prepareGates((const half *)alpha.cudaData);
+                else prepareGates((const __nv_bfloat16 *)alpha.cudaData);
+                Qwen4PrefillRecurrentKernel<<<blocks * 4, 128, 0, cudaStreamPerThread>>>(
+                    (const float *)qkv.cudaData, normalized, gates, (const float *)state.cudaData,
+                    (float *)(stateOutput ? stateOutput->cudaData : state.cudaData),
+                    (float *)output.cudaData, keyHeads, valueHeads, sequence);
+                const auto launch = cudaGetLastError();
+                FastllmReleaseCudaTempBuffer(scratch, own);
+                DeviceSync();
+                return launch == cudaSuccess;
+            }
+            FastllmReleaseCudaTempBuffer(scratch, own);
+        }
+    }
     if (alpha.dataType == fastllm::DataType::FLOAT32) {
         if (stateOutput == nullptr) {
             Qwen4LaunchGatedDeltaRule<float, false>(
@@ -4603,7 +4854,7 @@ bool FastllmCudaQwen4ReplayLinearAttentionBatch(
         std::vector<uint8_t> &pointerCache,
         int sequence, int convKernel, bool silu,
         int keyHeads, int valueHeads, int keyDim, int valueDim,
-        float recurrentEps) {
+        float recurrentEps, bool batchRecurrent, bool synchronize) {
     if (items.empty() || sequence <= 0 || convKernel <= 0 ||
         keyHeads <= 0 || valueHeads <= 0 ||
         valueHeads % keyHeads != 0 ||
@@ -4828,6 +5079,39 @@ bool FastllmCudaQwen4ReplayLinearAttentionBatch(
             convKernel);
     }
 
+    if (!batchRecurrent) {
+        // Preserve the sequence kernel's reduction order on pipeline stages.
+        if (sequence > 1 && sequence <= 4 &&
+            items.size() <= Qwen4LinearReplaySequenceBatch::MAX_LAYERS) {
+            if (gateType == fastllm::DataType::FLOAT32) {
+                Qwen4LaunchLinearReplaySequence<float>(items,
+                    keyHeads, valueHeads, sequence, recurrentEps);
+            } else if (gateType == fastllm::DataType::FLOAT16) {
+                Qwen4LaunchLinearReplaySequence<half>(items,
+                    keyHeads, valueHeads, sequence, recurrentEps);
+            } else {
+                Qwen4LaunchLinearReplaySequence<__nv_bfloat16>(items,
+                    keyHeads, valueHeads, sequence, recurrentEps);
+            }
+        } else {
+            // Keep the established per-layer recurrence arithmetic for placement
+            // paths that previously replayed through GatedDeltaRuleSequence.
+            // Batched restore/convolution still remove their copies and slicing.
+            for (const auto &item : items) {
+                fastllm::Data alpha, beta;
+                alpha.FakeFrom(*item.alpha, 0);
+                beta.FakeFrom(*item.beta, 0);
+                alpha.Resize({1, sequence, valueHeads});
+                beta.Resize({1, sequence, valueHeads});
+                if (!FastllmCudaQwen4GatedDeltaRuleDecode(
+                        *item.convolved, alpha, beta, *item.aLog, *item.dtBias,
+                        *item.recurrentState, *item.coreOutput, keyHeads, valueHeads,
+                        keyDim, valueDim, recurrentEps, nullptr)) return false;
+            }
+        }
+        if (synchronize) ForceDeviceSync();
+        return cudaGetLastError() == cudaSuccess;
+    }
     const int recurrentBlocks = (int)items.size() * valueHeads;
     const float inverseHead = 1.0f / std::sqrt((float)keyDim);
     if (gateType == fastllm::DataType::FLOAT32) {
@@ -4849,7 +5133,7 @@ bool FastllmCudaQwen4ReplayLinearAttentionBatch(
     // The model executor may dispatch the following layer on another host
     // thread (and therefore another per-thread CUDA stream).  Complete this
     // rejected-prefix transition before publishing the restored caches.
-    ForceDeviceSync();
+    if (synchronize) ForceDeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -4921,6 +5205,82 @@ bool FastllmCudaQwen4SparsePrefill(const fastllm::Data &query, const fastllm::Da
     }
     AssertInFastLLM(cudaGetLastError() == cudaSuccess, "Qwen4 sparse prefill launch failed.");
     FastllmCudaSyncCurrentThreadStream();
+    return true;
+#endif
+}
+
+// Single-query QSA keeps the same FP16 score/probability boundaries as the
+// gather + attention path, including zero K/V for invalid selected positions.
+// decodeMeta makes cache length dynamic during CUDA graph replay.
+bool FastllmCudaQwen4SparseDecode(const fastllm::Data &query, const fastllm::Data &key,
+                                 const fastllm::Data &value, const fastllm::Data &indices,
+                                 fastllm::Data &output, int groups, float scale,
+                                 const int32_t *decodeMeta) {
+#if defined(USE_ROCM) || defined(CUDA_NO_TENSOR_CORE)
+    return false;
+#else
+    using namespace fastllm;
+    if (query.dataType != FLOAT16 || key.dataType != FLOAT16 || value.dataType != FLOAT16 ||
+        indices.dataType != INT32 || query.dims.size() != 3 || key.dims.size() != 3 ||
+        value.dims != key.dims || indices.dims.size() != 2 || groups <= 0 || groups > 32 ||
+        int64_t(query.dims[0]) != int64_t(key.dims[0]) * groups || query.dims[1] != 1 ||
+        indices.dims[0] != 1 || query.dims[2] != key.dims[2] || query.dims[2] <= 0 ||
+        query.dims[2] > 256 || query.dims[2] % 16 || key.dims[0] <= 0 || key.dims[1] <= 0 ||
+        indices.dims[1] < 128 || indices.dims[1] > 3072 ||
+        query.dataDevice != CUDA || key.dataDevice != CUDA || value.dataDevice != CUDA ||
+        indices.dataDevice != CUDA || !query.cudaData || !key.cudaData || !value.cudaData ||
+        !indices.cudaData || query.strides.size() != 3 || key.strides.size() != 3 ||
+        value.strides.size() != 3 || indices.strides.size() != 2 || query.strides[2] != 1 ||
+        query.strides[0] != uint64_t(query.dims[2]) || query.strides[1] != query.strides[0] ||
+        key.strides[2] != 1 || value.strides[2] != 1 || key.strides[1] != key.dims[2] ||
+        value.strides[1] != value.dims[2] || key.strides[0] % 8 || value.strides[0] % 8 ||
+        indices.strides[0] != indices.dims[1] || indices.strides[1] != 1 ||
+        (reinterpret_cast<uintptr_t>(query.cudaData) & 15))
+        return false;
+    const int device = FastllmCudaGetDevice();
+    int major = 0, minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess ||
+        major * 10 + minor < 75)
+        return false;
+    const int heads = query.dims[0], dim = query.dims[2], width = indices.dims[1];
+    const uint64_t headTiles = uint64_t(key.dims[0]) * ((uint64_t(groups) + 15) / 16);
+    if (headTiles > 65535 || uint64_t(heads) * dim > INT_MAX)
+        return false;
+    const auto address = Qwen4GetCacheAddress(key, value);
+    const auto *keyData = static_cast<const half *>(Qwen4CachePayload(key));
+    const auto *valueData = static_cast<const half *>(Qwen4CachePayload(value));
+    if (!keyData || !valueData || (reinterpret_cast<uintptr_t>(keyData) & 15) ||
+        (reinterpret_cast<uintptr_t>(valueData) & 15))
+        return false;
+    const int splits = (width + 127) / 128;
+    Data scores(FLOAT16, {heads, width}), partials(FLOAT32, {splits, heads, dim});
+    for (Data *tensor : {&scores, &partials}) {
+        tensor->dataDevice = CUDA;
+        tensor->dataDeviceIds = {device};
+        tensor->Allocate(false);
+    }
+    output.dataType = FLOAT16;
+    output.UpdateUnitSize();
+    output.Resize(query.dims);
+    output.ToDevice(CUDA, std::vector<int>{device}, false);
+    output.Allocate(false);
+    Qwen4SparseQK<true><<<dim3((width + 63) / 64, 1, headTiles), 128,
+                         (16 + 64) * (dim + 8) * sizeof(half) + 1024 * sizeof(float),
+                         cudaStreamPerThread>>>(
+        (const half *)query.cudaData, keyData, (const int32_t *)indices.cudaData,
+        (half *)scores.cudaData, 1, heads, groups, key.dims[1], dim, width, 0,
+        key.strides[0], __half2float(__float2half_rn(scale)), address, decodeMeta);
+    FastllmCudaSoftmax(scores, scores, -1);
+    Qwen4SparsePV<true><<<dim3((dim + 63) / 64, splits, headTiles), 128, 0,
+                         cudaStreamPerThread>>>(
+        (const half *)scores.cudaData, valueData, (const int32_t *)indices.cudaData,
+        (float *)partials.cudaData, 1, heads, groups, key.dims[1], dim, width, 0,
+        value.strides[0], address, decodeMeta);
+    Qwen4SparseDecodeReduce<<<(heads * dim + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        (const float *)partials.cudaData, (half *)output.cudaData, heads * dim, splits);
+    AssertInFastLLM(cudaGetLastError() == cudaSuccess, "Qwen4 sparse decode launch failed.");
+    DeviceSync();
     return true;
 #endif
 }

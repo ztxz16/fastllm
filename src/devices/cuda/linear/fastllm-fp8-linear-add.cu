@@ -74,7 +74,7 @@ bool FastllmCudaFP8LinearAddCanRun(const Data &input, const Data &weight, const 
         weight.dims[0] < 512 || weight.dims[0] > 65536 || weight.dims[1] < 512 || weight.dims[1] > 32768 ||
         weight.IsRepacked || weight.blockK != 1 ||
         weight.blockM < weight.dims[1] || weight.scales.size() != size_t(weight.dims[0]) ||
-        input.dims.back() != weight.dims[1] || input.Count(0) % weight.dims[1] != 0 || input.Count(0) / weight.dims[1] > 8 ||
+        input.dims.back() != weight.dims[1] || input.Count(0) % weight.dims[1] != 0 || input.Count(0) / weight.dims[1] > 32 ||
         output.dims.back() != weight.dims[0] || output.Count(0) != input.Count(0) / weight.dims[1] * weight.dims[0])
         return false;
     const int N = weight.dims[0];

@@ -312,6 +312,8 @@ void FastllmReleaseCudaTempBuffer(void *ptr, bool own);
 //   - 如果 workspace 还没有创建，会按默认大小（FT_FLOAT_WORKSPACE_SIZE 或 256MB）惰性分配。
 // 注意：返回的指针只是借用，不需要 free。
 void *FastllmCudaGetFlashInferFloatWorkspace(size_t *outSize);
+// Return an existing arena without allocating one.
+void *FastllmCudaTryGetFlashInferFloatWorkspace(size_t *outSize);
 
 // 借/还 dequant 用的临时 scratch buffer。
 // FastllmBorrowDequantScratch:
@@ -499,6 +501,7 @@ bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSigmoidMulTo(fastllm::Data &input,
                              const fastllm::Data &gate);
 bool FastllmCudaClamp(fastllm::Data &input, bool hasMin, float minValue, bool hasMax, float maxValue);
+bool FastllmCudaGlm5NextClampedSilu(const fastllm::Data &input, float limit, fastllm::Data &output);
 bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit, fastllm::Data &output);
 bool FastllmCudaDeepSeekV41SharedSwigluQuantized(const fastllm::Data &input, float limit, fastllm::Data &output);
 bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output);
@@ -697,6 +700,9 @@ bool FastllmCudaQwen4MergeTpGreedy(const float *candidates, int *output,
 // selection. Output is one device float, without materializing a softmax row.
 bool FastllmCudaQwen4TopProbability(const float *logits, float *output,
                                    int vocabulary, float maxLogit);
+// Preserve TopK's token id and compute confidence without a host round trip.
+bool FastllmCudaQwen4TopProbabilityFromTopK(const float *logits, float *output,
+                                           int vocabulary, const float *top);
 bool FastllmCudaQwen4QSASelect(const fastllm::Data &query,
                                const fastllm::Data &compressedKeys,
                                fastllm::Data &indices, int keyLength,
@@ -773,8 +779,13 @@ bool FastllmCudaQwen4GatherKV(const fastllm::Data &key,
                              const fastllm::Data &indices,
                              fastllm::Data &compactKey,
                              fastllm::Data &compactValue);
-// Indexed FP16 prefill without expanded KV tensors. Returns false for
-// unsupported layouts, devices, or graph capture so the caller can fall back.
+// Indexed FP16 single-query attention; decodeMeta supplies the graph replay position.
+bool FastllmCudaQwen4SparseDecode(const fastllm::Data &query, const fastllm::Data &key,
+                                 const fastllm::Data &value, const fastllm::Data &indices,
+                                 fastllm::Data &output, int groups, float scale,
+                                 const int32_t *decodeMeta = nullptr);
+
+// Indexed FP16 prefill; unsupported layouts and graph capture use the fallback.
 bool FastllmCudaQwen4SparsePrefill(
     const fastllm::Data &query, const fastllm::Data &key,
     const fastllm::Data &value, const fastllm::Data &indices,
@@ -854,7 +865,7 @@ bool FastllmCudaQwen4ReplayLinearAttentionBatch(
         std::vector<uint8_t> &pointerCache,
         int sequence, int convKernel, bool silu,
         int keyHeads, int valueHeads, int keyDim, int valueDim,
-        float recurrentEps);
+        float recurrentEps, bool batchRecurrent = true, bool synchronize = true);
 bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim, float ropeBase, int startPos,
                                        int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
                                        float eps);
@@ -1865,6 +1876,10 @@ struct FastllmCudaMoeGGUFCacheView {
     // Optional device table of separately allocated canonical records. Disk
     // caches can batch resident experts without copying them into one arena.
     const uint8_t *const *recordPointers = nullptr;
+    // Optional device-side count for compact perExpert calls. routeCount is
+    // the launch bound; only the first *activeRouteCount entries are read or
+    // written. Keep this count and the routing arrays alive through replay.
+    const int32_t *activeRouteCount = nullptr;
 };
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
 bool FastllmCudaMoeGGUFCacheNumaSupported(int gateType, int downType,
@@ -1877,6 +1892,13 @@ bool FastllmCudaMoeGlm5GGUFCacheCompute(
         const fastllm::Data &input, fastllm::Data &activation,
         const FastllmCudaMoeGGUFCacheView &view,
         const float *scores, int topk, float swigluLimit, float *perExpert);
+// Two-rank row TP: each record contains half the gate/up rows
+// and half the down output rows. Gate activations must be all-gathered before
+// the down stage; outputs retain full strides and original BF16 boundaries.
+bool FastllmCudaMoeGlm5GGUFTpStage(bool down, int rank,
+        const fastllm::Data &input, fastllm::Data &activation,
+        const FastllmCudaMoeGGUFCacheView &view, const float *scores,
+        int topk, float swigluLimit, float *perExpert);
 // GPU-only GLM GGUF experts; shares the scored cache arithmetic and keeps
 // routing on CUDA. Long prefills are tiled with bounded scratch storage.
 bool FastllmCudaMergeMOEGlm5GGUFResident(
@@ -1964,9 +1986,10 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
         const std::function<void()> &launchParallel = {});
 // Cooperative eager decode/verify: every TP rank calls once with the same
 // context and row count (up to FASTLLM_CUDA_MOE_CACHE_MAX_BATCH).
-// Rank 0 supplies authoritative routes and executes the single NUMA subset.
+// routingRank supplies routes and executes the single NUMA subset (default 0).
 // Each GPU computes its resident experts (expert ID modulo rank count); the
-// caller sums the returned rank-local contributions with its TP collective.
+// caller sums the returned rank-local contributions. Physical expert ownership
+// stays fixed when a PP layer changes routingRank.
 // Rejection is collective and precedes every launchParallel callback.
 struct FastllmCudaMoeExpertParallel;
 struct FastllmCudaMoeExpertParallelStats {
@@ -1979,10 +2002,15 @@ std::shared_ptr<FastllmCudaMoeExpertParallel> FastllmCudaCreateMoeExpertParallel
 // Read only between calls, after all ranks have finished expert dispatch.
 FastllmCudaMoeExpertParallelStats FastllmCudaGetMoeExpertParallelStats(
         const FastllmCudaMoeExpertParallel &state);
+// Capture the single-row routing readback after an established EP warmup.
+// Buffers remain owned by state; callers must retain it for the graph lifetime.
+bool FastllmCudaMoeExpertParallelReadback(FastllmCudaMoeExpertParallel &state, int rank,
+        const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score);
 bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int rank,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
-        const std::function<void()> &launchParallel = {});
+        const std::function<void()> &launchParallel = {}, int routingRank = 0,
+        bool preparedReadback = false);
 bool FastllmCudaCanRunMoeCacheSmallBatch(
         const fastllm::Data &input, const fastllm::Data &index,
         const fastllm::Data &score, fastllm::Data **weights,
