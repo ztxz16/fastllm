@@ -120,10 +120,14 @@ namespace fastllm {
         struct LogitsSelection {
             int count = 0;
             bool greedy = false;
+            bool cudaSampling = false;
             float invTemperature = 1.0f;
             Data candidates; // CPU [rows, count * 2], (global token ID, score).
+            std::vector<int> sampledTokens;
         };
         LogitsSelection SelectLogits(const GenerationConfig &config, bool speculative = false) const;
+        std::vector<int> SampleCudaLogits(Data &logits,
+                                        const std::vector<GenerationConfig> &configs);
         struct TargetCapture {
             LogitsSelection *selection = nullptr;
             bool verifying = false;
@@ -220,7 +224,8 @@ namespace fastllm {
         Data ForwardTensorParallelDecode(int rank, const Data &inputIds, const Data &positions,
                                         std::vector<std::pair<Data, Data>> &kv,
                                         const GenerationConfig &config, const Data *embedding, TargetCapture *capture,
-                                        float *candidateResult, const TargetBatch *batch = nullptr);
+                                        float *candidateResult, const TargetBatch *batch = nullptr,
+                                        bool keepCudaLogits = false);
         Data ForwardTensorParallel(const Data &inputIds, const Data &positions,
                                    std::vector<std::pair<Data, Data>> &kv,
                                    const GenerationConfig &config, TargetCapture *capture = nullptr,

@@ -388,6 +388,7 @@ std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputId
             packedPositions.insert(packedPositions.end(), values, values + seqLens[b]);
         }
         auto other = SelectLogits(configs[b]);
+        selection.cudaSampling = selection.cudaSampling && other.cudaSampling;
         if (selection.count != other.count || selection.greedy != other.greedy ||
             selection.invTemperature != other.invTemperature) selection.count = 0;
     }
@@ -399,6 +400,7 @@ std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputId
     std::vector<std::pair<Data, Data>> unused;
     Data logits = ForwardTensorParallel(inputIds, positions, unused, configs[0],
                                         nullptr, &selection, &requests);
+    if (!selection.sampledTokens.empty()) return selection.sampledTokens;
     std::vector<int> tokens(batch);
     if (!selection.candidates.dims.empty()) {
         for (int b = 0; b < batch; ++b)
@@ -1079,6 +1081,17 @@ NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
         std::abs(config.repeat_penalty - 1.0f) > 1e-8f ||
         !config.tool_call_allowed_token_ids.empty()) return selection;
     selection.greedy = config.IsSimpleGreedy();
+    // Full-vocabulary top-p matches the shared CUDA sampler's distribution.
+    // Finite top-k keeps its existing top-k-then-top-p semantics, as does
+    // speculative verification, which needs probabilities rather than a draw.
+    if (!speculative && !selection.greedy &&
+        config.top_k >= weight.weight.at("lm_head.weight").dims[0] &&
+        std::isfinite(config.temperature) && config.temperature > 0 &&
+        std::isfinite(1.0f / config.temperature) &&
+        std::isfinite(config.top_p) && config.top_p > 0 && config.top_p <= 1) {
+        selection.cudaSampling = true;
+        return selection;
+    }
     if (selection.greedy) selection.count = 1;
     else if (config.top_k > 1 && config.top_k <= kNaiveLogitsMaxTopK &&
              std::isfinite(config.temperature) && config.temperature > 0 &&
@@ -1091,10 +1104,36 @@ NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
     return selection;
 }
 
+std::vector<int> NaiveN05FlashModel::SampleCudaLogits(
+        Data &logits, const std::vector<GenerationConfig> &configs) {
+#ifdef USE_CUDA
+    AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.dataType == FLOAT32 &&
+        logits.Count(0) / logits.dims.back() == configs.size(), "Naive CUDA sampling: invalid logits.");
+    FastllmCudaSetDevice(logits.dataDeviceIds.at(0));
+    const int rows = configs.size(), vocab = logits.dims.back();
+    std::vector<float> temperatures(rows), topPs(rows);
+    std::vector<int> topKs(rows, vocab), tokens(rows);
+    for (int row = 0; row < rows; ++row) {
+        temperatures[row] = configs[row].temperature;
+        topPs[row] = configs[row].top_p;
+    }
+    AssertInFastLLM(FastllmCudaTopKTopPSampling((float *)logits.cudaData,
+        temperatures.data(), topKs.data(), topPs.data(), tokens.data(), rows, vocab),
+        "Naive CUDA top-p sampling failed.");
+    return tokens;
+#else
+    ErrorInFastLLM("Naive CUDA sampling requires CUDA.");
+    return {};
+#endif
+}
+
 int NaiveN05FlashModel::SampleTarget(
         Data &logits, std::vector<std::pair<Data, Data>> &pastKeyValues,
         const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
         std::vector<float> *retLogits, LogitsSelection *selection) {
+    if (selection && !selection->sampledTokens.empty()) return selection->sampledTokens[0];
+    if (selection && selection->cudaSampling)
+        return SampleCudaLogits(logits, {generationConfig})[0];
     if (selection && !selection->candidates.dims.empty()) {
         if (selection->greedy) return (int)((float *)selection->candidates.cpuData)[0];
         return LLMSamplingOnly(selection->candidates, 0, generationConfig);

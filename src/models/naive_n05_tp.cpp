@@ -997,7 +997,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
 Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &inputIds,
         const Data &positions, std::vector<std::pair<Data, Data>> &kv,
         const GenerationConfig &config, const Data *embedding, TargetCapture *capture,
-        float *candidateResult, const TargetBatch *batch) {
+        float *candidateResult, const TargetBatch *batch, bool keepCudaLogits) {
     auto &state = *tpDecodeState;
     auto &r = *state.ranks.at(rank);
     auto &storage = *r.storage;
@@ -1106,6 +1106,15 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
         FastllmCudaCopyFromDeviceToHost(candidateResult, storage.logitsCandidates.cudaData, (size_t)state.rows * state.selection.count * 2 * sizeof(float));
         return Data();
     }
+    if (keepCudaLogits) {
+        // Borrow the graph's stable output; never release or move its storage.
+        Data output;
+        output.FakeFrom(buf.logits, 0);
+        // Storage is shared across batch graphs; its host shape may describe
+        // the last captured batch rather than the graph being replayed.
+        output.Resize({1, state.rows, tpVocabRanges[rank].second - tpVocabRanges[rank].first});
+        return output;
+    }
     // ToDevice(CPU) would release the graph's persistent output allocation.
     Data output(FLOAT32, {1, state.rows, tpVocabRanges[rank].second - tpVocabRanges[rank].first});
     output.Allocate();
@@ -1129,7 +1138,8 @@ Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const 
     } restore{GetExecutor()};
     SetCurrentThreadExecutor(executor.get());
     if (tpDecodeState && tpDecodeState->active && !tpDecodeState->disabled)
-        return ForwardTensorParallelDecode(rank, inputIds, positions, kv, config, embedding, capture, candidateResult, batch);
+        return ForwardTensorParallelDecode(rank, inputIds, positions, kv, config, embedding, capture,
+            candidateResult, batch, selection && selection->cudaSampling);
     // Generic operators can move their inputs. Give every worker its own IDs.
     Data localIds(inputIds), localPositions(positions);
     TargetWorkspace *workspace = batch ? tpBatchWorkspaces.at(rank).get() : capture && capture->verifying
@@ -1143,7 +1153,8 @@ Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const 
         ForceDeviceSync();
         return Data();
     }
-    if (!isIntermediateChunkedPrefill) logits.ToDevice(DataDevice::CPU);
+    if (!isIntermediateChunkedPrefill && !(selection && selection->cudaSampling))
+        logits.ToDevice(DataDevice::CPU);
     ForceDeviceSync();
     return logits;
 #else
@@ -1175,6 +1186,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         });
     if (compact) selection->count = std::min(selection->count, vocab);
     const int count = compact ? selection->count : 0;
+    const bool cudaSampling = selection && selection->cudaSampling && !isIntermediateChunkedPrefill;
     LogitsSelection fullLogits;
     const int rows = batch ? batch->Size() : capture && capture->verifying ? inputIds.dims[1] : 1;
     const int sequences = batch ? batch->Size() : 1;
@@ -1332,8 +1344,18 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             else captures[rank].history = histories[0];
         }
     }
-    std::vector<Data> logits(compact ? 0 : tpDevices.size());
+    std::vector<Data> logits(compact || cudaSampling ? 0 : tpDevices.size());
     std::vector<float> candidates(compact ? tpDevices.size() * rows * count * 2 : 0);
+    // Reuse one root-device matrix, as in the other TP models. Sampling stays
+    // outside the graph so per-request parameters and RNG change on each replay.
+    static thread_local Data samplingStorage(FLOAT32);
+    Data &cudaLogits = samplingStorage;
+    if (cudaSampling) {
+        FastllmCudaSetDevice(tpDevices[0]);
+        cudaLogits.ToDevice(DataDevice::CUDA, {tpDevices[0]}, false);
+        cudaLogits.Resize({rows, vocab});
+        cudaLogits.Allocate(false);
+    }
 
     auto forwardRanks = [&]() {
         runRanks([&](int rank) {
@@ -1341,8 +1363,20 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                                           embedding.dims.empty() ? nullptr : &embedding,
                                           captures.empty() ? nullptr : &captures[rank],
                                           compact ? candidates.data() + (size_t)rank * rows * count * 2 : nullptr,
-                                          compact ? selection : nullptr, batch);
-            if (!compact) logits[rank].CopyFrom(local);
+                                          compact || cudaSampling ? selection : nullptr, batch);
+            if (cudaSampling && !local.dims.empty()) {
+                const auto range = tpVocabRanges[rank];
+                const size_t width = (range.second - range.first) * sizeof(float);
+                AssertInFastLLM(local.dataDevice == DataDevice::CUDA &&
+                    local.Count(0) == (uint64_t)rows * (range.second - range.first),
+                    "Naive CUDA sampling: invalid shard output.");
+                // Queue the peer write after this rank's graph on the same
+                // stream. All shards complete before root-device sampling.
+                AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
+                    (float *)cudaLogits.cudaData + range.first, (size_t)vocab * sizeof(float),
+                    local.cudaData, width, width, rows), "Naive CUDA sampling: logits copy failed.");
+                FastllmCudaSyncCurrentThreadStream();
+            } else if (!compact && !cudaSampling) logits[rank].CopyFrom(local);
         });
     };
     if (graphDecode && tpDecodeState->warmed && !tpDecodeState->captured &&
@@ -1581,6 +1615,11 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     });
     if (capture) capture->hidden = std::move(captures[0].hidden);
     if (isIntermediateChunkedPrefill) return Data();
+    if (cudaSampling) {
+        selection->sampledTokens = SampleCudaLogits(cudaLogits,
+            batch ? batch->configs : std::vector<GenerationConfig>{config});
+        return Data();
+    }
     if (compact) {
         auto &output = selection->candidates;
         output.dataType = FLOAT32;

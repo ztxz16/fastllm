@@ -164,6 +164,10 @@ class FastLLmCompletion:
           temperature = 1.0
           top_k = 1
           top_p = 1.0
+      elif top_k is not None and top_k <= 0:
+          # API top_k <= 0 disables truncation. Native backends expect a
+          # positive candidate count and otherwise take their greedy path.
+          top_k = self.model.get_vocab_size()
       return do_sample, top_p, top_k, temperature
 
   def _normalize_stop_strings(

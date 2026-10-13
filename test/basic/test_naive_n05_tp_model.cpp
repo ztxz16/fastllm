@@ -19,6 +19,22 @@ extern "C" void *FastllmCudaDirectMalloc(size_t bytes) {
     static auto fn = (void *(*)(size_t))dlsym(RTLD_NEXT, "FastllmCudaDirectMalloc");
     return fn(bytes);
 }
+static bool inspectGpuSampling = false;
+static std::vector<float> sampledGpuLogits;
+static int gpuSamplingCalls = 0;
+extern "C" bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
+        int *topKs, float *topPs, int *output, int batch, int vocab) {
+    ++gpuSamplingCalls;
+    if (inspectGpuSampling) {
+        sampledGpuLogits.resize((size_t)batch * vocab);
+        auto error = cudaMemcpy(sampledGpuLogits.data(), logits,
+            sampledGpuLogits.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    }
+    static auto fn = (bool (*)(float *, float *, int *, float *, int *, int, int))
+        dlsym(RTLD_NEXT, "FastllmCudaTopKTopPSampling");
+    return fn(logits, temperatures, topKs, topPs, output, batch, vocab);
+}
 static bool failVerifyBegin = false, failVerifyInstantiate = false, expectVerifyGraph = true;
 static int failGraphDevice = 3;
 extern "C" bool FastllmCudaGraphLaunch(void *exec) {
@@ -290,6 +306,122 @@ class Fixture : public NaiveN05FlashModel {
                 throw std::runtime_error("paged eviction fallback changed logits or recaptured");
         }
         std::cout << "TP HISTORY SERVING PASS ranks=" << ranks << std::endl;
+    }
+    void CudaSamplingChecks() {
+        // Compare empirical GPU probabilities with the existing CPU sampling
+        // oracle, with a different temperature/top-p for each group of rows.
+        const int vocab = 256, groups = 6, repeats = 4096;
+        std::vector<float> values(groups * repeats * vocab);
+        std::vector<GenerationConfig> configs(groups * repeats);
+        std::vector<std::vector<float>> expected(groups);
+        for (int group = 0; group < groups; ++group) {
+            auto &cfg = configs[group * repeats];
+            cfg.top_k = vocab; cfg.temperature = .6f + .3f * (group % 3);
+            cfg.top_p = group < 3 ? .73f : 1.0f;
+            std::vector<float> base(vocab);
+            for (int token = 0; token < vocab; ++token)
+                base[token] = -.25f * ((token * 73) % vocab);
+            expected[group] = SpeculativeDistribution(base.data(), vocab, cfg, LastTokensUnit());
+            for (int i = 0; i < repeats; ++i) {
+                int row = group * repeats + i;
+                configs[row] = cfg;
+                std::copy(base.begin(), base.end(), values.begin() + row * vocab);
+            }
+        }
+        Data probabilities(FLOAT32, {groups * repeats, vocab}, values);
+        probabilities.ToDevice(DataDevice::CUDA, {0}, true);
+        inspectGpuSampling = true;
+        auto sampled = SampleCudaLogits(probabilities, configs);
+        if (sampledGpuLogits != values) throw std::runtime_error("input logits changed");
+        inspectGpuSampling = false;
+        for (int group = 0; group < groups; ++group) {
+            std::vector<int> counts(vocab);
+            for (int row = group * repeats; row < (group + 1) * repeats; ++row) {
+                int token = sampled[row];
+                if (token < 0 || token >= vocab || expected[group][token] <= 0)
+                    throw std::runtime_error("GPU draw outside CPU nucleus support");
+                ++counts[token];
+            }
+            for (int token = 0; token < vocab; ++token)
+                if (std::abs((double)counts[token] / repeats - expected[group][token]) > .035)
+                    throw std::runtime_error("GPU sampling frequency differs from CPU distribution");
+        }
+        GenerationConfig cfg; cfg.top_k = vocab; cfg.top_p = .95f;
+        if (!SelectLogits(cfg).cudaSampling || SelectLogits(cfg, true).cudaSampling)
+            throw std::runtime_error("incorrect ordinary/speculative sampling selection");
+        for (int k : {1, 4, 50}) {
+            cfg.top_k = k;
+            if (SelectLogits(cfg).cudaSampling) throw std::runtime_error("finite top-k distribution changed");
+        }
+        cfg.top_k = vocab; cfg.output_token_limit = 32; cfg.input_token_length = 3;
+        maxBatch = 4; SetMaxTokens(16384);
+        WarmUp();
+        int captures = verifyGraphCaptures, checks = 0;
+        using Cache = std::vector<std::pair<Data, Data>>;
+        std::vector<Cache> actual(4), reference(4);
+        std::vector<int> past(4, 3);
+        inspectGpuSampling = true;
+        for (int row = 0; row < 4; ++row) {
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                actual[row].emplace_back(Data(BFLOAT16), Data(BFLOAT16));
+                reference[row].emplace_back(Data(BFLOAT16), Data(BFLOAT16));
+            }
+            Data ids(FLOAT32, {1, 3}, {float(row + 1), 2, 3});
+            Data positions(FLOAT32, {1, 3}, {0, 1, 2});
+            auto ref = cfg; ref.output_logits = true;
+            std::vector<float> logits;
+            Forward(ids, Data(), positions, reference[row], ref, LastTokensManager(), &logits);
+            int calls = gpuSamplingCalls;
+            Forward(ids, Data(), positions, actual[row], cfg);
+            if (gpuSamplingCalls != calls + 1 || sampledGpuLogits != logits)
+                throw std::runtime_error("prefill GPU sampling logits differ from full CPU output");
+            ++checks;
+        }
+        for (int rows : {1, 4, 2, 4, 1}) {
+            if (ranks == 1 && rows != 1) continue;
+            std::vector<Data> positions(rows);
+            std::vector<Data *> pos;
+            std::vector<float> ids;
+            std::vector<std::pair<Data *, Data *>> a, r;
+            std::vector<GenerationConfig> cs(rows, cfg), refs(rows, cfg);
+            std::vector<std::vector<float>> expectedRows(rows);
+            std::vector<std::vector<float> *> outputs;
+            for (int row = 0; row < rows; ++row) {
+                ids.push_back(float((past[row] * 3 + row) % 251));
+                positions[row].CopyFrom(Data(FLOAT32, {1, 1}, {float(past[row])}));
+                pos.push_back(&positions[row]); outputs.push_back(&expectedRows[row]);
+                cs[row].temperature = .5f + .3f * row; cs[row].top_p = .7f + .07f * row;
+                refs[row] = cs[row]; refs[row].output_logits = true;
+                for (int layer = 0; layer < block_cnt; ++layer) {
+                    a.emplace_back(&actual[row][layer].first, &actual[row][layer].second);
+                    r.emplace_back(&reference[row][layer].first, &reference[row][layer].second);
+                }
+            }
+            Data input(FLOAT32, {1, rows}, ids);
+            int calls = gpuSamplingCalls, launches = verifyGraphLaunches;
+            if (rows == 1) {
+                Forward(input, Data(), positions[0], reference[0], refs[0], LastTokensManager(), &expectedRows[0]);
+                Forward(input, Data(), positions[0], actual[0], cs[0]);
+            } else {
+                ForwardBatch(rows, input, {}, pos, std::vector<int>(rows, 1), r, refs, LastTokensManager(), &outputs);
+                ForwardBatch(rows, input, {}, pos, std::vector<int>(rows, 1), a, cs);
+            }
+            std::vector<float> expectedFlat;
+            for (auto &row : expectedRows) expectedFlat.insert(expectedFlat.end(), row.begin(), row.end());
+            if (gpuSamplingCalls != calls + 1 || sampledGpuLogits != expectedFlat)
+                throw std::runtime_error("decode GPU sampling logits differ from full CPU output");
+            if (ranks > 1 && verifyGraphLaunches - launches != ranks * 2) {
+                std::cerr << "rows=" << rows << " launches=" << verifyGraphLaunches - launches
+                          << " expected=" << ranks * 2 << std::endl;
+                throw std::runtime_error("CUDA sampling lost serving graph replay");
+            }
+            for (int row = 0; row < rows; ++row) ++past[row];
+            ++checks;
+        }
+        inspectGpuSampling = false;
+        if (verifyGraphCaptures != captures) throw std::runtime_error("sampling parameter change recaptured graph");
+        std::cout << "CUDA SAMPLING PASS ranks=" << ranks << " draws=" << sampled.size()
+                  << " model_checks=" << checks << " no_recapture=1" << std::endl;
     }
     void ServingGraphInvalidationChecks() {
         maxBatch = 4; SetMaxTokens(16384); WarmUp();
@@ -1707,6 +1839,12 @@ int main(int argc, char **argv) {
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (argc > 2 && std::string(argv[2]) == "cuda_sampling") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            Fixture fixture(ranks, false, true, true, true);
+            fixture.CudaSamplingChecks();
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "history_serving") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);

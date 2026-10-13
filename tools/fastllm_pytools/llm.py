@@ -1981,6 +1981,19 @@ class model:
     def eval(self):
         return self;
 
+    def get_vocab_size(self):
+        """Return the output vocabulary bound used by unrestricted sampling."""
+        config = getattr(self, "config", {})
+        text_config = config.get("text_config") or config
+        size = text_config.get("vocab_size")
+        if size is None and self.hf_tokenizer is not None:
+            size = max(self.hf_tokenizer.get_vocab().values(), default=-1) + 1
+        if size is None:
+            size = fastllm_lib.get_tokenizer_vocab_size(self.model)
+        if int(size) <= 0:
+            raise ValueError("Cannot determine vocabulary size for unrestricted sampling")
+        return int(size)
+
     def build_tokenizer_decode_token_cache(self):
         if self.tokenizer_decode_token_cache is not None:
             return
