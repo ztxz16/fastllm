@@ -45,7 +45,6 @@ void FlashInferWorkSpaceManager::EnsureIntCapacity(size_t required) {
 
 FlashInferWorkSpaceManager::FlashInferWorkSpaceManager()
     : float_workspace_size(ParseSizeFromEnv("FT_FLOAT_WORKSPACE_SIZE", 256 * 1024 * 1024)) {
-    d_float_workspace = FastllmCudaMalloc(float_workspace_size);
     d_int_workspace = FastllmCudaDirectMalloc(int_workspace_size);
     cudaError_t err = cudaMallocHost(&h_page_locked_int_workspace, int_workspace_size);
     if (err != cudaSuccess || h_page_locked_int_workspace == nullptr) {
@@ -60,27 +59,56 @@ FlashInferWorkSpaceManager::~FlashInferWorkSpaceManager() {
     cudaFreeHost(h_page_locked_int_workspace);
 }
 
-static std::map<int, std::unique_ptr<FlashInferWorkSpaceManager>> s_fastllmFlashInferWorkSpaceMap;
+// Registry operations must not allocate on CUDA: an allocation can wait for
+// a collective whose other device still needs to look up its workspace.
+struct FlashInferWorkSpaceEntry {
+    std::mutex mutex;
+    std::unique_ptr<FlashInferWorkSpaceManager> workspace;
+};
+static std::map<int, std::unique_ptr<FlashInferWorkSpaceEntry>> s_fastllmFlashInferWorkSpaceMap;
 static std::mutex s_fastllmFlashInferWorkSpaceMapLock;
 
-FlashInferWorkSpaceManager& getFastllmFlashInferWorkSpace() {
-    int id = -1;
-    cudaGetDevice(&id);
+static FlashInferWorkSpaceEntry *FindFlashInferWorkSpace(int id, bool create) {
     std::lock_guard<std::mutex> guard(s_fastllmFlashInferWorkSpaceMapLock);
     auto it = s_fastllmFlashInferWorkSpaceMap.find(id);
-    if (it != s_fastllmFlashInferWorkSpaceMap.end()) {
-        return *it->second;
-    }
-    auto manager = std::make_unique<FlashInferWorkSpaceManager>();
-    FlashInferWorkSpaceManager* ptr = manager.get();
-    s_fastllmFlashInferWorkSpaceMap[id] = std::move(manager);
-    return *ptr;
+    if (it != s_fastllmFlashInferWorkSpaceMap.end()) return it->second.get();
+    if (!create) return nullptr;
+    auto entry = std::make_unique<FlashInferWorkSpaceEntry>();
+    auto *result = entry.get();
+    s_fastllmFlashInferWorkSpaceMap.emplace(id, std::move(entry));
+    return result;
 }
 
-static FlashInferWorkSpaceManager *tryGetFastllmFlashInferWorkSpace(int id) {
-    std::lock_guard<std::mutex> guard(s_fastllmFlashInferWorkSpaceMapLock);
-    auto it = s_fastllmFlashInferWorkSpaceMap.find(id);
-    return it == s_fastllmFlashInferWorkSpaceMap.end() ? nullptr : it->second.get();
+FlashInferWorkSpaceManager& getFastllmFlashInferWorkSpace(bool allocateFloat) {
+    int id = -1;
+    checkCudaErrors("Error: CUDA error when find device!", cudaGetDevice(&id));
+    auto *entry = FindFlashInferWorkSpace(id, true);
+    std::lock_guard<std::mutex> guard(entry->mutex);
+    auto &workspace = entry->workspace;
+    if (workspace == nullptr) {
+        workspace = std::make_unique<FlashInferWorkSpaceManager>();
+    }
+    if (allocateFloat && workspace->d_float_workspace == nullptr) {
+        workspace->d_float_workspace = FastllmCudaMalloc(workspace->float_workspace_size);
+    }
+    return *workspace;
+}
+
+static void *TryGetFlashInferFloatWorkspace(int id, size_t *outSize) {
+    if (outSize != nullptr) *outSize = 0;
+    auto *entry = FindFlashInferWorkSpace(id, false);
+    if (entry == nullptr) return nullptr;
+    std::lock_guard<std::mutex> guard(entry->mutex);
+    auto *workspace = entry->workspace.get();
+    void *data = workspace ? workspace->d_float_workspace : nullptr;
+    if (outSize != nullptr && data != nullptr) *outSize = workspace->float_workspace_size;
+    return data;
+}
+
+void *FastllmCudaTryGetFlashInferFloatWorkspace(size_t *outSize) {
+    int id = -1;
+    checkCudaErrors("Error: CUDA error when find device!", cudaGetDevice(&id));
+    return TryGetFlashInferFloatWorkspace(id, outSize);
 }
 
 void *FastllmCudaGetFlashInferFloatWorkspace(size_t *outSize) {
@@ -135,13 +163,13 @@ void *FastllmBorrowCudaTempBuffer(size_t needBytes, size_t *outBytes, bool *outO
     cudaError_t state = cudaGetDevice(&id);
     checkCudaErrors("Error: CUDA error when find device!", state);
 
-    FlashInferWorkSpaceManager *workspace = tryGetFastllmFlashInferWorkSpace(id);
-    if (workspace != nullptr && workspace->d_float_workspace != nullptr &&
-        workspace->float_workspace_size >= needBytes) {
+    size_t workspaceBytes = 0;
+    void *workspace = TryGetFlashInferFloatWorkspace(id, &workspaceBytes);
+    if (workspace != nullptr && workspaceBytes >= needBytes) {
         if (outBytes != nullptr) {
-            *outBytes = workspace->float_workspace_size;
+            *outBytes = workspaceBytes;
         }
-        return workspace->d_float_workspace;
+        return workspace;
     }
 
     std::mutex *deviceLock = nullptr;

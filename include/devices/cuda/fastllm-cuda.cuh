@@ -312,6 +312,8 @@ void FastllmReleaseCudaTempBuffer(void *ptr, bool own);
 //   - 如果 workspace 还没有创建，会按默认大小（FT_FLOAT_WORKSPACE_SIZE 或 256MB）惰性分配。
 // 注意：返回的指针只是借用，不需要 free。
 void *FastllmCudaGetFlashInferFloatWorkspace(size_t *outSize);
+// Return an existing arena without allocating one.
+void *FastllmCudaTryGetFlashInferFloatWorkspace(size_t *outSize);
 
 // 借/还 dequant 用的临时 scratch buffer。
 // FastllmBorrowDequantScratch:
