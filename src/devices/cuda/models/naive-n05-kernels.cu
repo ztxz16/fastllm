@@ -669,6 +669,46 @@ __global__ void RopeQKScaleV(BF16 *q, BF16 *k, BF16 *v, const float *positions,
     }
 }
 
+// Share the position-dependent rotation across Q/K heads of a token.
+// Each warp owns whole pairs, including for in-place non-packed input.
+template <bool Packed>
+__global__ void RopeQKScaleVToken(BF16 *q, BF16 *k, BF16 *v, const float *positions,
+        int heads, int kvHeads, int dim, int valueDim,
+        int rotaryDim, float theta, BF16 valueScale, const BF16 *qkv) {
+    __shared__ float cosine[128], sine[128];
+    int token = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
+    if (t < rotaryDim / 2) {
+        float angle = positions[token] * powf(theta, -2.0f * t / rotaryDim);
+        cosine[t] = RoundBF16(cosf(angle));
+        sine[t] = RoundBF16(sinf(angle));
+    }
+    __syncthreads();
+    const size_t base = (size_t)token * ((heads + kvHeads) * dim + kvHeads * valueDim);
+    for (int head = warp; head < heads + 2 * kvHeads; head += 8) {
+        if (head < heads + kvHeads) {
+            BF16 *x = head < heads ? q + ((size_t)token * heads + head) * dim
+                : k + ((size_t)token * kvHeads + head - heads) * dim;
+            const BF16 *src = Packed ? qkv + base + head * dim : x;
+            for (int d = lane; d < rotaryDim / 2; d += 32) {
+                float a = (float)src[d], b = (float)src[d + rotaryDim / 2];
+                float c = cosine[d], s = sine[d];
+                x[d] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
+                x[d + rotaryDim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
+            }
+            if constexpr (Packed)
+                for (int d = rotaryDim / 2 + lane; d < dim / 2; d += 32)
+                    ((__nv_bfloat162 *)x)[d] = ((const __nv_bfloat162 *)src)[d];
+        } else {
+            BF16 *x = v + ((size_t)token * kvHeads + head - heads - kvHeads) * valueDim;
+            const BF16 *src = Packed ? qkv + base + (heads + kvHeads) * dim
+                + (head - heads - kvHeads) * valueDim : x;
+            for (int d = lane; d < valueDim / 2; d += 32)
+                ((__nv_bfloat162 *)x)[d] = __hmul2(((const __nv_bfloat162 *)src)[d],
+                    __halves2bfloat162(valueScale, valueScale));
+        }
+    }
+}
+
 struct RopeCacheRow {
     BF16 *q, *key, *value;
     const BF16 *k, *v, *indexKey, *qkv;
@@ -2179,8 +2219,14 @@ void FastllmCudaNaiveRopeQKScaleV(fastllm::Data &q, fastllm::Data &k,
             x.cudaData && x.strides.size() == 3 && x.strides[2] == 1 && x.strides[1] == x.dims[2],
             "Invalid Naive-N0.5 packed QKV input.");
     }
-    auto kernel = packedQkv ? RopeQKScaleV<true> : RopeQKScaleV<false>;
-    kernel<<<(uint64_t)q.dims[1] * (heads + 2 * kvHeads), 128>>>(
+    const uintptr_t addresses = (uintptr_t)q.cudaData | (uintptr_t)k.cudaData |
+        (uintptr_t)v.cudaData | (packedQkv ? (uintptr_t)packedQkv->cudaData : 0);
+    const bool tokenRope = q.dims[1] >= 1024 && rotaryDim <= 256 &&
+        dim % 2 == 0 && valueDim % 2 == 0 && addresses % alignof(__nv_bfloat162) == 0;
+    auto kernel = tokenRope ? (packedQkv ? RopeQKScaleVToken<true> : RopeQKScaleVToken<false>)
+        : (packedQkv ? RopeQKScaleV<true> : RopeQKScaleV<false>);
+    kernel<<<tokenRope ? (uint64_t)q.dims[1] : (uint64_t)q.dims[1] * (heads + 2 * kvHeads),
+        tokenRope ? 256 : 128>>>(
         (BF16 *)q.cudaData, (BF16 *)k.cudaData, (BF16 *)v.cudaData,
         (const float *)positions.cudaData, heads, kvHeads, dim, valueDim,
         rotaryDim, theta, __float2bfloat16_rn(valueScale), packedQkv ? (const BF16 *)packedQkv->cudaData : nullptr);
