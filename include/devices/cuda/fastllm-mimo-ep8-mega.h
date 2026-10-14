@@ -3,7 +3,7 @@
 #include <memory>
 
 // Opt-in MiMo complete-expert EP8 backend. All handles and symmetric buffers
-// are prepared before worker execution / CUDA Graph capture.
+// for decode are prepared before worker execution / CUDA Graph capture.
 struct FastllmCudaMimoEp8Mega;
 bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &devices);
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
@@ -20,4 +20,5 @@ void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
 bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int layer,
     const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
     fastllm::Data &output, bool graphDecode, fastllm::Data *residual = nullptr,
-    const fastllm::Data *normWeight = nullptr, fastllm::Data *normOutput = nullptr, float eps = 0);
+    const fastllm::Data *normWeight = nullptr, fastllm::Data *normOutput = nullptr, float eps = 0,
+    fastllm::Data *prefillScratch = nullptr);

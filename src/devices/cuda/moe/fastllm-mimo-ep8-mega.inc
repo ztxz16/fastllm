@@ -15,6 +15,7 @@ struct FastllmCudaMimoEp8Mega {
         std::vector<std::unique_ptr<fastllm::Data>> scales;
         std::vector<void *> layers;
         void *output = nullptr; // Borrowed only during the prefill exchange.
+        void *prefillScratch = nullptr;
         ~Rank() { for (void *layer : layers) if (layer) fastllm_ep8_mega_moe_destroy(layer); }
     };
     std::vector<int> devices;
@@ -146,7 +147,8 @@ void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
 bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int layer,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, bool graphDecode, fastllm::Data *residual,
-        const fastllm::Data *normWeight, fastllm::Data *normOutput, float eps) {
+        const fastllm::Data *normWeight, fastllm::Data *normOutput, float eps,
+        fastllm::Data *prefillScratch) {
     using namespace fastllm;
     AssertInFastLLM(input.dataType == BFLOAT16 && input.dims.size() == 2 &&
         input.dims[1] == 4096, "Invalid MiMo EP8 input shape.");
@@ -163,13 +165,46 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     output.Allocate(false);
     void *handle = state.ranks.at(rank)->layers.at(layer);
     AssertInFastLLM(handle != nullptr, "Missing MiMo EP8 layer handle.");
-    const int capacity = fastllm_ep8_mega_moe_max_rows();
+    int capacity = fastllm_ep8_mega_moe_max_rows();
+    std::vector<const void *> prefillPeers;
+    // Eligibility uses the common input shape so every rank participates even
+    // when one local buffer is unavailable. Router FP32 input is dead here;
+    // it is overwritten by the next layer's conversion, after AllGather's
+    // final rendezvous has released every remote reader/writer.
+    if (!graphDecode && (size_t)total * 4096 * sizeof(float) >=
+            fastllm_ep8_mega_moe_prefill_workspace_bytes()) {
+        auto &local = *state.ranks[rank];
+        local.prefillScratch = nullptr;
+        int prefillCapacity = 0;
+        if (prefillScratch && prefillScratch->dataType == FLOAT32 &&
+            prefillScratch->dataDevice == DataDevice::CUDA &&
+            prefillScratch->dataDeviceIds == std::vector<int>{state.devices[rank]} &&
+            !prefillScratch->dims.empty() && prefillScratch->dims.back() == 4096 &&
+            prefillScratch->Count(0) == (size_t)total * 4096 &&
+            prefillScratch->cudaData != input.cudaData) {
+            prefillCapacity = fastllm_ep8_mega_moe_prepare_prefill(
+                handle, prefillScratch->cudaData, prefillScratch->GetBytes());
+            AssertInFastLLM(prefillCapacity >= 0, fastllm_ep8_mega_moe_error());
+            if (prefillCapacity) local.prefillScratch = prefillScratch->cudaData;
+        }
+        state.WaitForOutputs();
+        bool ready = true;
+        for (const auto &peer : state.ranks) ready = ready && peer->prefillScratch;
+        if (ready) {
+            capacity = prefillCapacity;
+            for (const auto &peer : state.ranks) prefillPeers.push_back(peer->prefillScratch);
+        }
+    }
     auto run = [&](int start, int rows) {
         const int routeStart = localRouting ? start - begin : start;
-        if (!fastllm_ep8_mega_moe_run(handle, (const uint16_t *)input.cudaData + (size_t)start * 4096,
-            (uint16_t *)output.cudaData + (size_t)start * 4096,
-            (const int32_t *)index.cudaData + routeStart * 8,
-            (const float *)score.cudaData + routeStart * 8, rows))
+        const void *x = (const uint16_t *)input.cudaData + (size_t)start * 4096;
+        void *y = (uint16_t *)output.cudaData + (size_t)start * 4096;
+        const int32_t *idx = (const int32_t *)index.cudaData + routeStart * 8;
+        const float *scores = (const float *)score.cudaData + routeStart * 8;
+        const int ok = prefillPeers.empty() ?
+            fastllm_ep8_mega_moe_run(handle, x, y, idx, scores, rows) :
+            fastllm_ep8_mega_moe_run_prefill(handle, prefillPeers.data(), x, y, idx, scores, rows);
+        if (!ok)
             throw std::runtime_error(std::string("MiMo EP8 launch failed: ") + fastllm_ep8_mega_moe_error());
     };
     if (total <= capacity && !localRouting) {
@@ -184,7 +219,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
             run(first, std::min(capacity, total - first));
         return false;
     }
-    // Dispatch each token from one rank, using the existing 64-row arena.
+    // Dispatch each token from one rank, using the selected bounded arena.
     // All ranks execute the same number of rounds, including empty shards.
     const int shard = (int)((int64_t)total * (rank + 1) / ranks) - begin;
     const int rounds = (int)(((int64_t)total + ranks * capacity - 1) / (ranks * capacity));
@@ -229,7 +264,7 @@ void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &, int, fastllm::
 }
 bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &, int, int, const fastllm::Data &,
     const fastllm::Data &, const fastllm::Data &, fastllm::Data &, bool, fastllm::Data *,
-    const fastllm::Data *, fastllm::Data *, float) {
+    const fastllm::Data *, fastllm::Data *, float, fastllm::Data *) {
     throw std::runtime_error("MiMo EP8 MegaMoE requires a Linux CUDA build containing the SM90 backend.");
 }
 #endif

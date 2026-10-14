@@ -1046,7 +1046,8 @@ Data NaiveN05FlashModel::RunTarget(
             if (tensorParallel && tpEp8MegaState) {
                 moeNormReady = FastllmCudaRunMimoEp8Mega(*tpEp8MegaState, tpRank, layer, normed,
                     expertIndex, expertScore, moeOutput, decodeWorkspace,
-                    shardMoe ? &hidden : nullptr, mlpNormWeight, mlpNormOutput, rms_norm_eps);
+                    shardMoe ? &hidden : nullptr, mlpNormWeight, mlpNormOutput, rms_norm_eps,
+                    !decodeWorkspace && !hasRouterProbabilities ? &routerInput : nullptr);
             } else if (executor.firstDevice.find("numa") == 0 &&
                 (moeWeights[layer][2]->dataType == DataType::FP8_E4M3 ||
                  moeWeights[layer][2]->dataType == DataType::FP8_E4M3_BLOCK_128)) {
