@@ -1848,6 +1848,7 @@ int main(int argc, char **argv) {
         if (argc > 2 && std::string(argv[2]) == "history_serving") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);
+            if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
             fixture.HistoryServingChecks();
             return 0;
         }

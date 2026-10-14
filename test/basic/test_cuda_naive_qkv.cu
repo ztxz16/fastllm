@@ -31,9 +31,9 @@ void Fill(Data &x, unsigned seed) {
     }
     Check(cudaMemcpy(x.cudaData, values.data(), values.size() * 2, cudaMemcpyHostToDevice));
 }
-std::vector<uint16_t> Read(const Data &x) {
-    std::vector<uint16_t> result(x.Count(0));
-    Check(cudaMemcpy(result.data(), x.cudaData, result.size() * 2, cudaMemcpyDeviceToHost));
+std::vector<uint8_t> Read(const Data &x) {
+    std::vector<uint8_t> result(x.GetBytes());
+    Check(cudaMemcpy(result.data(), x.cudaData, result.size(), cudaMemcpyDeviceToHost));
     return result;
 }
 struct Case {
@@ -46,7 +46,7 @@ struct Case {
     std::vector<std::unique_ptr<Data>> keys, values, indices;
     std::vector<FastllmNaiveRopeCacheRow> rows;
     cudaGraphExec_t graph = nullptr;
-    Case(int batch, bool ring, int pageLen = 64)
+    Case(int batch, bool ring, int pageLen = 64, DataType cacheType = BFLOAT16)
         : batch(batch), capacity(ring ? 128 : pageLen * 4), pageLen(ring ? 0 : pageLen),
           width(ring ? 192 : 320), ring(ring) {
         Init(x, {1, batch, 4096}); Init(q, {1, batch, 1536});
@@ -54,15 +54,19 @@ struct Case {
         Init(packed, {1, batch, 1856}); Init(index, {1, batch, 128});
         Init(positions, {1, batch}); Init(lengths, {batch});
         Init(pages, {batch, 8}); Init(table, {batch, 8});
+        for (Data *cache : {&key, &value, &otherKey, &otherValue}) {
+            cache->dataType = cacheType;
+            cache->UpdateUnitSize();
+        }
         Init(key, {batch * capacity, width}); Init(value, {batch * capacity, 128});
         Init(otherKey, key.dims); Init(otherValue, value.dims);
         keyPool.Resize(key.dims); keyPool.FakeFrom(key, 0);
         valuePool.Resize(value.dims); valuePool.FakeFrom(value, 0);
         for (int b = 0; b < batch; ++b) {
-            keys.emplace_back(new Data(BFLOAT16, {1, capacity, width}, DataDevice::CUDA,
-                ring ? (char *)key.cudaData + (size_t)b * capacity * width * 2 : (void *)((int *)pages.cudaData + b * 8)));
-            values.emplace_back(new Data(BFLOAT16, {1, capacity, 128}, DataDevice::CUDA,
-                ring ? (char *)value.cudaData + (size_t)b * capacity * 128 * 2 : (void *)((int *)pages.cudaData + b * 8 + 4)));
+            keys.emplace_back(new Data(cacheType, {1, capacity, width}, DataDevice::CUDA,
+                ring ? (char *)key.cudaData + (size_t)b * capacity * width * key.unitSize : (void *)((int *)pages.cudaData + b * 8)));
+            values.emplace_back(new Data(cacheType, {1, capacity, 128}, DataDevice::CUDA,
+                ring ? (char *)value.cudaData + (size_t)b * capacity * 128 * value.unitSize : (void *)((int *)pages.cudaData + b * 8 + 4)));
             indices.emplace_back(new Data(BFLOAT16, {1, 1, 128}, DataDevice::CUDA,
                 (char *)index.cudaData + b * 128 * 2));
             if (!ring) {
@@ -90,8 +94,8 @@ struct Case {
                 ids[b * 8 + j] = ((b + iteration) % batch) * 4 + (3 - j);
                 ids[b * 8 + 4 + j] = ((batch - 1 - b + iteration) % batch) * 4 + j;
             }
-            bindings[b * 4] = (char *)dstKey.cudaData + (ring ? (size_t)b * capacity * width * 2 : 0);
-            bindings[b * 4 + 1] = (char *)dstValue.cudaData + (ring ? (size_t)b * capacity * 128 * 2 : 0);
+            bindings[b * 4] = (char *)dstKey.cudaData + (ring ? (size_t)b * capacity * width * key.unitSize : 0);
+            bindings[b * 4 + 1] = (char *)dstValue.cudaData + (ring ? (size_t)b * capacity * 128 * value.unitSize : 0);
             bindings[b * 4 + 2] = (int *)pages.cudaData + b * 8;
             bindings[b * 4 + 3] = (int *)pages.cudaData + b * 8 + 4;
         }
@@ -102,9 +106,9 @@ struct Case {
     }
     void Reset() {
         for (Data *data : {&q, &key, &value, &otherKey, &otherValue})
-            Check(cudaMemset(data->cudaData, 0x3d, data->Count(0) * 2));
+            Check(cudaMemset(data->cudaData, 0x3d, data->GetBytes()));
     }
-    std::vector<std::vector<uint16_t>> Output() {
+    std::vector<std::vector<uint8_t>> Output() {
         return {Read(q), Read(key), Read(value), Read(otherKey), Read(otherValue)};
     }
     bool Fused(Data &weight, Data &scratch, const Data &bias = Data()) {
@@ -130,8 +134,9 @@ int main() {
         std::vector<std::unique_ptr<Case>> cases;
         const int batches[] = {256, 129, 128, 65, 64, 33, 32, 17, 16, 8, 7, 6, 5, 4, 3, 2, 1};
         void *address = nullptr;
+        for (DataType type : {BFLOAT16, FP8_E4M3})
         for (int batch : batches) for (bool ring : {false, true}) {
-            cases.emplace_back(new Case(batch, ring));
+            cases.emplace_back(new Case(batch, ring, 64, type));
             auto &c = *cases.back();
             Require(c.Fused(weight, scratch), "supported fusion rejected");
             if (!address) address = scratch.cudaData;

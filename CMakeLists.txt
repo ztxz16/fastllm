@@ -1618,6 +1618,11 @@ if (UNIT_TEST)
                 set_tests_properties(naive_n05_history_serving_${NAIVE_SERVING_RANKS}
                     PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                     PASS_REGULAR_EXPRESSION "TP HISTORY SERVING PASS")
+                add_test(NAME naive_n05_history_serving_fp8_${NAIVE_SERVING_RANKS}
+                    COMMAND naive_n05_verify_graph_test ${NAIVE_SERVING_RANKS} history_serving fp8)
+                set_tests_properties(naive_n05_history_serving_fp8_${NAIVE_SERVING_RANKS}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "TP HISTORY SERVING PASS")
                 add_test(NAME naive_n05_serving_graph_${NAIVE_SERVING_RANKS}
                     COMMAND naive_n05_verify_graph_test ${NAIVE_SERVING_RANKS} serving_graph)
                 set_tests_properties(naive_n05_serving_graph_${NAIVE_SERVING_RANKS}
@@ -1723,6 +1728,20 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_dsa_batch COMMAND naive_n05_dsa_batch_test)
         set_tests_properties(naive_n05_dsa_batch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "BATCH DSA PASS")
+
+        add_executable(naive_n05_fp8_kv_test test/basic/test_naive_n05_fp8_kv.cpp)
+        target_link_libraries(naive_n05_fp8_kv_test PRIVATE fastllm)
+        target_include_directories(naive_n05_fp8_kv_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_fp8_kv COMMAND naive_n05_fp8_kv_test)
+        set_tests_properties(naive_n05_fp8_kv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "ALL FP8 CHECKS PASSED")
+
+        add_executable(naive_n05_fp8_conversion_test test/basic/test_naive_n05_fp8_conversion.cu)
+        target_link_libraries(naive_n05_fp8_conversion_test PRIVATE fastllm)
+        set_target_properties(naive_n05_fp8_conversion_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME naive_n05_fp8_conversion COMMAND naive_n05_fp8_conversion_test)
+        set_tests_properties(naive_n05_fp8_conversion PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+            PASS_REGULAR_EXPRESSION "FP8 CONVERSION PASS")
 
         add_executable(cuda_verify_multirow_test test/basic/test_cuda_verify_multirow.cu)
         target_link_libraries(cuda_verify_multirow_test PRIVATE fastllm)
