@@ -2729,7 +2729,8 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         auto status = naive_swa_flashinfer::Run((const BF16 *)query.cudaData,
             (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
             sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
-            (BF16 *)output.cudaData, queries, keys, heads, kvHeads, key.dims[2]);
+            (BF16 *)output.cudaData, queries, keys, heads, kvHeads, key.dims[2],
+            cudaStreamPerThread, FastllmCudaRuntimeArch() == 90);
         AssertInFastLLM(status == cudaSuccess,
             std::string("Naive SWA FlashInfer: ") + cudaGetErrorString(status));
         CheckLaunch();
