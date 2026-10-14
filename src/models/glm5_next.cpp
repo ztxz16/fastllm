@@ -3540,6 +3540,9 @@ namespace fastllm {
             const GenerationConfig &generationConfig,
             const LastTokensManager &lastTokens,
             std::vector<float> *logits, int &outputToken) {
+        if (executionMode == ExecutionMode::Hybrid)
+            return TryForwardHybridChunkedPrefill(inputIds, attentionMask, pastKeyValues,
+                generationConfig, lastTokens, logits, outputToken);
         if (threadTpState) return false;
         (void)positionIds; // This model derives causal positions from its caches.
 #ifdef USE_CUDA

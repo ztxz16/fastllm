@@ -14,6 +14,7 @@
 
 namespace fastllm {
     class HybridMoeDecodeStep;
+    struct HybridPrefillContext;
     class CudaChunkedPrefillPipeline;
 
     struct Glm5NextIndexerCheckpoint {
@@ -114,6 +115,12 @@ namespace fastllm {
         ExecutionMode executionMode = ExecutionMode::Cpu;
         void InitExecutionMode();
         void PrepareHybridMoeCache();
+        bool TryForwardHybridChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken);
         HybridMoeDecodeStep BeginHybridDraftMoe(const Data &input, int sequence);
         struct ThreadTpState;
         std::unique_ptr<ThreadTpState> threadTpState;
@@ -224,7 +231,8 @@ namespace fastllm {
                 const std::vector<std::vector<std::pair<Data, Data>>*>
                     &requestCaches,
                 std::vector<KdaReplayCapture> *kdaReplay = nullptr,
-                std::vector<Glm5NextIndexerCache> *indexer = nullptr);
+                std::vector<Glm5NextIndexerCache> *indexer = nullptr,
+                HybridPrefillContext *prefill = nullptr);
 
         void RunAttentionBlock(int layer, const std::string &prefix,
                 Data &input, Data &output,
@@ -339,7 +347,8 @@ namespace fastllm {
                 int deviceLayer, const std::string &mlpPrefix,
                 std::vector<Data*> &weights,
                 std::vector<Data*> &biases,
-                Data &input, int sequence, Data &output);
+                Data &input, int sequence, Data &output,
+                HybridPrefillContext *prefill = nullptr);
 
         void RunSharedMoe(int deviceLayer, const std::string &mlp,
                 Data &input, Data &output, bool &sharedReady);

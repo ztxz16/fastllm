@@ -4,6 +4,7 @@
 #include "blocks/baseblock.h"
 #include "utils.h"
 #include "utils/hybrid_moe.h"
+#include "utils/hybrid_parallel.h"
 #include "devices/disk/diskdevice.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
@@ -17,7 +18,7 @@ namespace fastllm {
             int deviceLayer, const std::string &mlp,
             std::vector<Data*> &weights,
             std::vector<Data*> &biases,
-            Data &input, int sequence, Data &output) {
+            Data &input, int sequence, Data &output, HybridPrefillContext *prefill) {
         const std::string routedDevice = SelectMoeDeviceForLayer(deviceLayer);
         if (ExecutionDeviceIsGpu(routedDevice)) {
             RunGpuMoeWithPrefix(deviceLayer, mlp, weights, biases, input, sequence, output);
@@ -25,6 +26,8 @@ namespace fastllm {
         }
         const std::vector<int> outputDims = input.dims;
         input.Reshape({sequence, embed_dim});
+        HybridMoePipelineGuard hostExperts(input, routedDevice,
+            prefill ? prefill->hostExperts : nullptr, prefill ? prefill->firstLayer : -1);
 
         bool sharedReady = false;
         auto runShared = [&] {
@@ -64,10 +67,11 @@ namespace fastllm {
         }
 #endif
         const std::vector<int> noDevices;
-        const auto &moeDevices = threadTpRank >= 0 ? threadTpOwner->devices : noDevices;
+        const auto &moeDevices = prefill ? prefill->devices :
+            (threadTpRank >= 0 ? threadTpOwner->devices : noDevices);
         DiskMoeCudaDeviceScope diskDevices(moeDevices);
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        NumasMoeCudaAssistScope numaDevices(threadTpRank >= 0 ? &moeDevices : nullptr);
+        NumasMoeCudaAssistScope numaDevices(moeDevices.empty() ? nullptr : &moeDevices);
         if (threadTpRank == 0 && routedOnNumas)
             FastllmCudaPrepareMoeExpertCache(weights.data(), weights.size(), moeDevices);
 #endif
@@ -77,7 +81,7 @@ namespace fastllm {
         Data routedOutput;
 #if defined(USE_CUDA) && defined(USE_NUMAS)
 #ifndef USE_ROCM
-        if (sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH && input.dataType == DataType::BFLOAT16 &&
+        if (!prefill && sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH && input.dataType == DataType::BFLOAT16 &&
             moeAtype == DataType::BFLOAT16 && routedOnNumas &&
             fastllm::RunHybridMoeOnDevices(input, expertIndex, expertScore, routedOutput,
                 weights.data(), (int)weights.size(), deviceLayer, moeDevices, runShared)) {
@@ -89,7 +93,7 @@ namespace fastllm {
         }
 #endif
         const bool prefetchNumasSmallBatch =
-            sequence >= 1 &&
+            !prefill && sequence >= 1 &&
             sequence <= kNumasMoePrefetchMaxRows &&
             GetCudaSharedExpert() && routedOnNumas &&
             std::getenv(
@@ -104,6 +108,7 @@ namespace fastllm {
 
         Data w1, w2, w3, tempInput, tempOutput;
         Data moeInputTemp, moeOutputTemp;
+        if (routedDevice == "cpu") hostExperts.LockCpu();
         ApplyMoeDeviceMapForLayer(deviceLayer);
         MergeMOEBlock(
             &input, &expertIndex, &expertScore,
@@ -137,7 +142,7 @@ namespace fastllm {
             Data &hiddenStates, int firstLayer, int endLayer,
             const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
             std::vector<KdaReplayCapture> *kdaReplay,
-            std::vector<Glm5NextIndexerCache> *indexer) {
+            std::vector<Glm5NextIndexerCache> *indexer, HybridPrefillContext *prefill) {
         const int sequence = hiddenStates.dims[1];
         const int batch = (int)requestCaches.size();
         AssertInFastLLM(batch == 1 || (batch == sequence &&
@@ -148,7 +153,7 @@ namespace fastllm {
         Data *next = &hiddenStatesTemp;
         HybridMoeDecodeGroup decodeCaches;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        const bool frequencyDecode = sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH;
+        const bool frequencyDecode = !prefill && sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH;
 #endif
         for (int layer = firstLayer; layer < endLayer; layer++) {
             ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
@@ -183,7 +188,7 @@ namespace fastllm {
                 }
 #endif
                 RunHybridMoeWithPrefix(layer, prefix + "mlp.", expertWeights[layer],
-                    expertBiases[layer], normalizedFfn, sequence, ffnOutput);
+                    expertBiases[layer], normalizedFfn, sequence, ffnOutput, prefill);
             }
             FinishFfnBlock(ffnOutput, *current, ffnPost, ffnComb, *next);
             std::swap(current, next);
@@ -215,6 +220,84 @@ namespace fastllm {
             }
             cache.Prepare([this] { WarmupNumaMoeWeights(); }, true);
         }
+#endif
+    }
+
+    bool Glm5NextModel::TryForwardHybridChunkedPrefill(
+            const Data &inputIds, const Data &attentionMask,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<float> *logits, int &outputToken) {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        const int chunkSize = GetChunkedPrefillSize();
+        if (threadTpState || threadTpRank >= 0 || !generationConfig.IsSimpleGreedy() ||
+            mtpEnabled || saveHistoryChat || !useCompressedMla || GetKVCacheInCPU() ||
+            GetHistoryCacheInCPU() || GetLowMemMode() || GetFastllmEnv().printProfile ||
+            FastllmCudaGraphIsCapturingFast() || inputIds.dataDevice != DataDevice::CPU ||
+            inputIds.dataType != DataType::FLOAT32 || !inputIds.cpuData ||
+            inputIds.dims.size() != 2 || inputIds.dims[0] != 1 ||
+            chunkSize <= 0 || inputIds.dims[1] <= chunkSize || !attentionMask.dims.empty()) return false;
+        std::vector<CudaPrefillStage> stages;
+        if (!BuildCudaPrefillStages(deviceMap, block_cnt, stages)) return false;
+        bool numa = false;
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            if (denseMlpLayers[layer]) continue;
+            const auto device = SelectMoeDeviceForLayer(layer);
+            const bool host = device == "cpu" || device == "numa" || device.rfind("numa:", 0) == 0;
+            numa |= device == "numa" || device.rfind("numa:", 0) == 0;
+            if (!host && device != SelectDeviceFromMap(deviceMap, layer + 1, block_cnt)) return false;
+        }
+        for (const auto &cache : pastKeyValues)
+            if (!cache.first.dims.empty() || !cache.second.dims.empty() ||
+                !cache.first.pageIndex.empty() || !cache.second.pageIndex.empty()) return false;
+        // Resolve shared weight transformations and request registry entries
+        // before workers acquire disjoint layer ranges. Never retry after Run.
+        const int previousDevice = FastllmCudaGetDevice();
+        struct RestoreDevice { int device; ~RestoreDevice() { FastllmCudaSetDevice(device); } } restore{previousDevice};
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            if (!kdaLayers[layer]) {
+                ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
+                PrepareMlaWeights(layer);
+            }
+        }
+        if ((int)pastKeyValues.size() < block_cnt) pastKeyValues.resize(block_cnt);
+        std::lock_guard<std::mutex> indexerGuard(indexerCachesMutex);
+        auto &indexer = indexerCaches[&pastKeyValues];
+        if (indexer.empty()) indexer.resize(block_cnt);
+        std::vector<int> devices;
+        for (const auto &stage : stages) devices.push_back(stage.device);
+        HybridPrefillScope hybrid(devices, numa);
+        if (!prefillPipeline) prefillPipeline.reset(new CudaChunkedPrefillPipeline());
+        const int sequence = inputIds.dims[1];
+        const int chunks = 1 + (sequence - 1) / chunkSize;
+        const float *tokens = reinterpret_cast<const float *>(inputIds.cpuData);
+        if (verbose) {
+            printf("[Prompt] Hybrid pipelined prefill: %zu CUDA stages, %d chunks (%d tokens/chunk).\n",
+                   stages.size(), chunks, chunkSize);
+            fflush(stdout);
+        }
+        prefillPipeline->Run(devices, chunks, DataType::BFLOAT16,
+            {1, chunkSize, hcMult, embed_dim}, [&](int rank, int chunk, Data &hidden) {
+                if (chunk == 0) hybrid.BindWorker(rank);
+                const auto &stage = stages[rank];
+                HybridPrefillContext context{stage.firstLayer, &hybrid.hostExperts, {stage.device}};
+                if (rank == 0) {
+                    const int start = chunk * chunkSize;
+                    const int length = std::min(chunkSize, sequence - start);
+                    Data input(DataType::FLOAT32, {1, length},
+                        std::vector<float>(tokens + start, tokens + start + length));
+                    std::lock_guard<std::mutex> lock(hybrid.hostExperts);
+                    ForwardEmbedding(input, hidden);
+                }
+                ForwardHybridLayers(hidden, stage.firstLayer, stage.endLayer,
+                    {&pastKeyValues}, nullptr, &indexer, &context);
+                if (rank + 1 == (int)stages.size() && chunk + 1 == chunks)
+                    outputToken = ForwardOutput(hidden, generationConfig, lastTokens, logits, true);
+            });
+        return true;
+#else
+        return false;
 #endif
     }
 } // namespace fastllm
