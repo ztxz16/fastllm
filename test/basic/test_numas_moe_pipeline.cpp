@@ -4,6 +4,7 @@
 #include "utils.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/numas/numasdevice.h"
+#include "utils/hybrid_parallel.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -60,9 +61,7 @@ struct Fixture {
         scores.ToDevice(CUDA, std::vector<int>{device});
         std::vector<int> devices{device};
         NumasMoeCudaAssistScope assist(&devices);
-        std::unique_lock<std::mutex> lock;
-        if (cpuMutex) lock = std::unique_lock<std::mutex>(*cpuMutex, std::defer_lock);
-        NumasMoePipelineScope pipeline(device, cpuMutex ? &lock : nullptr);
+        HybridMoePipelineGuard pipeline(input, "numa", cpuMutex, device);
         Data results[3], w1, w2, w3, curInput, curOutput;
         const int count = rows >= 65 ? 3 : 1;
         // Keep successive layer outputs on CUDA: staging reuse must wait for
@@ -72,9 +71,9 @@ struct Fixture {
                      w1, w2, w3, curInput, curOutput, 0.f, results[layer], layer);
         Data &output = results[count - 1];
         if (cpuMutex && rows >= 65)
-            Require(!lock.owns_lock(), "Pipelined GPU prefill retained the CPU lock");
+            Require(!pipeline.HoldsCpuPool(), "Pipelined GPU prefill retained the CPU lock");
         if (cpuMutex && rows == 1)
-            Require(lock.owns_lock(), "CPU-only fallback released its guard unexpectedly");
+            Require(pipeline.HoldsCpuPool(), "CPU-only fallback released its guard unexpectedly");
         output.ToDevice(CPU);
         std::vector<float> result(rows * hidden);
         std::memcpy(result.data(), output.cpuData, result.size() * sizeof(float));

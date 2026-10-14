@@ -41,13 +41,8 @@ namespace fastllm {
             SelectSpecialWeightDevice(mlp + "experts.0.gateup_proj.weight", deviceLayer);
         // GPU routing and the shared expert do not use the host worker pool.
         // Defer its guard until routed MoE; CPU and decode paths retain it.
-        std::unique_lock<std::mutex> hostExperts;
-        if (prefill && prefill->hostExpertMutex &&
-            (moeDevice == "cpu" || moeDevice == "numa" || moeDevice.rfind("numa:", 0) == 0)) {
-            hostExperts = std::unique_lock<std::mutex>(*prefill->hostExpertMutex, std::defer_lock);
-            if (flattened.dataDevice != DataDevice::CUDA || batch * sequence < 1024)
-                hostExperts.lock();
-        }
+        HybridMoePipelineGuard hostExperts(flattened, moeDevice,
+            prefill ? prefill->hostExpertMutex : nullptr, prefill ? prefill->firstLayer : -1);
         Data routerLogits, localIndex, localScore, localShared;
         if (prepared) {
             prepared->result.Reset();
@@ -80,8 +75,6 @@ namespace fastllm {
             prefill ? &prefillDevices : (hostPrefill ? &threadTpOwner->devices : nullptr));
         // Stage buffers remain distinct while CPU jobs share the same pool.
         // Unsupported/CPU-only paths simply keep the outer lock until return.
-        NumasMoePipelineScope pipelineScope(prefill ? prefill->firstLayer : -1,
-                                            prefill && numaMoe ? &hostExperts : nullptr);
         if (runRoutedExperts && batch * sequence <= kNumasMoePrefetchMaxRows &&
             flattened.dataDevice == DataDevice::CUDA && numaMoe &&
             !FastllmCudaMoeCacheRequested() && !FastllmCudaGraphIsCapturing()) {
@@ -243,8 +236,7 @@ namespace fastllm {
         selectExperts();
         // NUMA acquires this guard around CPU work after preparing its private
         // CUDA branch. The generic CPU backend retains the outer guard.
-        if (hostExperts.mutex() && !hostExperts.owns_lock() && moeDevice == "cpu")
-            hostExperts.lock();
+        if (moeDevice == "cpu") hostExperts.LockCpu();
         const std::string outputDevice =
             SelectDeviceFromMap(this->deviceMap, deviceLayer + 1, this->block_cnt);
         bool hybridMoe = false;

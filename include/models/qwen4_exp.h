@@ -21,6 +21,7 @@
 
 namespace fastllm {
     class CudaChunkedPrefillPipeline;
+    class HybridMoePeerRuntime;
     class Qwen4ExpModel : public Qwen3NextModel {
     public:
         Qwen4ExpModel();
@@ -194,7 +195,7 @@ namespace fastllm {
 #ifdef USE_CUDA
         std::unique_ptr<CudaChunkedPrefillPipeline> prefillPipeline;
 #ifndef USE_ROCM
-        struct HybridPeerState;
+        using HybridPeerState = HybridMoePeerRuntime;
         std::unique_ptr<HybridPeerState> hybridPeer;
         bool TryRunPipelineMoe(int layer, const Data &input, const Data &index,
                 const Data &score, Data &output, std::vector<Data *> &moeWeights,
@@ -612,7 +613,6 @@ namespace fastllm {
         int BeginForwardLayer(ForwardWorkspace &, int &layer);
         void EndForwardLayer(ForwardWorkspace &, int layer);
         std::vector<int> FinishForward(ForwardWorkspace &);
-        struct HybridPrefillScope;
         struct HybridExecutionScope;
         struct DraftGraphPolicy {
             bool device = false, tp = false, hybrid = false, placementCompatible = false;

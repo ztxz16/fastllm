@@ -85,7 +85,12 @@ namespace fastllm {
             }
         }
         FastllmCudaPeerAccessInit(devices);
-        HybridPrefillScope hybrid(*this, devices);
+        bool numa = false;
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            const auto device = SelectMoeDeviceForLayer(layer);
+            numa |= device == "numa" || device.rfind("numa:", 0) == 0;
+        }
+        HybridPrefillScope hybrid(devices, numa);
         if (!prefillPipeline)
             prefillPipeline.reset(new CudaChunkedPrefillPipeline());
         const DataType type =
