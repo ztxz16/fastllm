@@ -981,8 +981,15 @@ Data NaiveN05FlashModel::RunTarget(
                 buf.liveKeys, cfg.heads, cfg.kvHeads, attn);
         Linear(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
         Data &postAttentionNorm = localWeight(prefix + ".post_attention_layernorm.weight");
-        const bool attentionNormReady = reduce(projected, decodeWorkspace ? &hidden : nullptr,
-            &postAttentionNorm, &normed);
+        bool attentionNormReady = false;
+        if (shardPrefillNorm && length >= 1024 && length % 8 == 0) {
+            // Only this rank's token shard feeds the following EP Router/MoE.
+            // Avoid distributing reduced rows that are never consumed here.
+            FastllmCudaMimoEp8PrefillReduceScatter(*tpEp8MegaState, tpRank, projected);
+        } else {
+            attentionNormReady = reduce(projected, decodeWorkspace ? &hidden : nullptr,
+                &postAttentionNorm, &normed);
+        }
         if (shardPrefillNorm) {
             const int first = (int)((int64_t)length * tpRank / 8);
             const int rows = (int)((int64_t)length * (tpRank + 1) / 8) - first;

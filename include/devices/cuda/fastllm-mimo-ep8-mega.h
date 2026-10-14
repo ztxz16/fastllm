@@ -16,6 +16,10 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
 // EP8 peer publication barriers; all data stays on GPUs, with no extra arena.
 void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
                                       fastllm::Data &output);
+// Equal prefill shards only. The reduced slice remains at its original
+// row offset; other rows are not valid collective outputs.
+void FastllmCudaMimoEp8PrefillReduceScatter(FastllmCudaMimoEp8Mega &state, int rank,
+                                          fastllm::Data &output);
 // Routing may cover the full input or this rank's equal contiguous token shard.
 // Sharded results are gathered in-place, unless the optional residual/RMSNorm
 // fusion succeeds. True means residual and normOutput are ready; in that case

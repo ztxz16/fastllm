@@ -3587,6 +3587,31 @@ bool FastllmNcclAllGather(const void* data, void* dest, int count,
     return true;
 }
 
+bool FastllmNcclReduceScatter(const void* data, void* dest, int count,
+                             int dataType, int deviceId) {
+    ncclComm_t comm = FindNcclCommNoLog(deviceId);
+    ncclDataType_t type = ncclFloat;
+    if (data == nullptr || dest == nullptr || count <= 0 || comm == nullptr ||
+        !FastllmNcclResolveDataType(dataType, type, "ReduceScatter")) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    const cudaStream_t stream = cudaStreamPerThread;
+    const ncclResult_t result = ncclReduceScatter(data, dest, count, type, ncclSum, comm, stream);
+    if (result != ncclSuccess) {
+        printf("Error: ncclReduceScatter failed on device %d: %s\n",
+               deviceId, ncclGetErrorString(result));
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    if (FastllmNcclPostSyncEnabled(stream)) {
+        const cudaError_t state = cudaStreamSynchronize(stream);
+        checkCudaErrors("Error: CUDA error when synchronizing NCCL reduce-scatter!", state);
+        return state == cudaSuccess;
+    }
+    return true;
+}
+
 // Sums all ranks but materializes the result only on root.  This is preferable
 // to AllReduce for hybrid single-CUDA + EP execution, whose next operator
 // consumes only the layer-owning GPU's output.

@@ -123,6 +123,25 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     FastllmCudaSetDevice(previous);
     return state;
 }
+void FastllmCudaMimoEp8PrefillReduceScatter(FastllmCudaMimoEp8Mega &state, int rank,
+                                          fastllm::Data &output) {
+    using namespace fastllm;
+    const int ranks = (int)state.devices.size();
+    const uint64_t elements = output.Count(0);
+    AssertInFastLLM(rank >= 0 && rank < ranks && elements > 0 && elements % ranks == 0 &&
+        elements / ranks <= std::numeric_limits<int>::max() &&
+        output.cudaData && output.dataType == BFLOAT16 &&
+        output.dataDevice == DataDevice::CUDA &&
+        output.dataDeviceIds.size() == 1 && output.dataDeviceIds[0] == state.devices[rank],
+        "Invalid MiMo EP8 prefill ReduceScatter tensor.");
+    const int count = (int)(elements / ranks);
+    state.WaitForOutputs();
+    const bool ok = FastllmNcclReduceScatter(output.cudaData,
+        (uint16_t *)output.cudaData + (size_t)rank * count,
+        count, output.dataType, state.devices[rank]);
+    state.WaitForOutputs();
+    AssertInFastLLM(ok, "MiMo EP8 prefill ReduceScatter failed.");
+}
 void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
                                       fastllm::Data &output) {
     // Publish completed shards, then gather directly into the existing output.
@@ -302,6 +321,9 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
 }
 #else
 struct FastllmCudaMimoEp8Mega {};
+void FastllmCudaMimoEp8PrefillReduceScatter(FastllmCudaMimoEp8Mega &, int, fastllm::Data &) {
+    throw std::runtime_error("MiMo EP8 MegaMoE is unavailable.");
+}
 bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &) { return false; }
 size_t FastllmCudaMimoEp8PrefillWorkspaceBytes(int) { return 0; }
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(const std::vector<int> &,
