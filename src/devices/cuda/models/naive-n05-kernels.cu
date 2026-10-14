@@ -5,6 +5,8 @@
 #include "devices/cuda/naive-n05-kv.cuh"
 #include "naive-n05-dsa-decode.cuh"
 #include "naive-n05-attention-hopper.cuh"
+#include "naive-n05-prefill.cuh"
+#include "naive-n05-prefill-mma.cuh"
 #ifdef FASTLLM_ENABLE_NAIVE_QKV_SM90
 #include "naive-n05-qkv.cuh"
 #endif
@@ -36,6 +38,7 @@
 
 namespace {
 using BF16 = __nv_bfloat16;
+template <class Kernel> bool BulkKernelSupported(Kernel kernel, size_t shared, int minArch);
 constexpr int kSwaWindow = 128;
 // Decode graphs keep launch geometry fixed while the live KV length changes.
 // Ordinary launches retain the int specialization, with no device-side branch.
@@ -2649,8 +2652,38 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     const bool splitDecode = queries == 1 && window == 0 && count == kDecodePVKeys && heads >= 4;
     const bool groupedDecode = splitDecode && heads % kvHeads == 0 && (heads / kvHeads) % 4 == 0;
     const bool sharedDecode = groupedDecode && (heads / kvHeads) % kDecodeSharedHeads == 0;
+    const bool tiledPrefill = queries >= 32 && window == 0 && heads % kvHeads == 0 &&
+        heads / kvHeads == naive_prefill::Heads && dim == naive_prefill::QkDim &&
+        valueDim == naive_prefill::ValueDim && key.dims[2] % 8 == 0 &&
+        (size_t)key.cudaData % 16 == 0 && (size_t)value.cudaData % 16 == 0;
+    if (tiledPrefill && count <= 2048 && (size_t)query.cudaData % 16 == 0) {
+        namespace mma = naive_prefill_mma;
+        // Select by architecture and available shared memory, never timing.
+        auto kernel = mma::Generic<2048>;
+        size_t shared = sizeof(mma::Storage<2048>);
+        if (BulkKernelSupported(kernel, shared, 80)) {
+            kernel<<<dim3(queries, heads / naive_prefill::Heads), 256, shared>>>(
+                (const BF16 *)query.cudaData, FastllmNaiveKV(key), FastllmNaiveKV(value),
+                selected, sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+                (BF16 *)output.cudaData, heads, kvHeads, key.dims[2], keys, count, pastLength, causal);
+            CheckLaunch();
+            return;
+        }
+    }
     Data scores;
     Output(scores, DataType::FLOAT32, {queries, heads, count});
+    if (tiledPrefill) {
+        naive_prefill::Scores<<<dim3(queries, heads / naive_prefill::ScoreHeads, (count + 63) / 64), 128>>>(
+            (const BF16 *)query.cudaData, FastllmNaiveKV(key), selected, (float *)scores.cudaData,
+            heads, kvHeads, key.dims[2], keys, count, pastLength, causal);
+        AttentionSoftmax<<<queries * heads, 256>>>((float *)scores.cudaData,
+            sink.dims.empty() ? nullptr : (const float *)sink.cudaData, heads, count);
+        naive_prefill::Values<<<dim3(queries, heads / naive_prefill::Heads), 256>>>(
+            (const float *)scores.cudaData, FastllmNaiveKV(value), selected, (BF16 *)output.cudaData,
+            heads, kvHeads, keys, count, pastLength, causal);
+        CheckLaunch();
+        return;
+    }
 #ifdef FASTLLM_NAIVE_DSA_MMA
     // Sixteen Q heads share each gathered K/V tile. Preserve materialized
     // BF16-rounded logits/probabilities; MMA changes FP32 reduction order.

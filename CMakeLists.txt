@@ -1551,6 +1551,12 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_attention COMMAND naive_n05_attention_test)
         set_tests_properties(naive_n05_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
+        add_executable(naive_n05_prefill_test test/basic/test_naive_n05_prefill.cpp)
+        target_link_libraries(naive_n05_prefill_test PRIVATE fastllm)
+        target_include_directories(naive_n05_prefill_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_prefill COMMAND naive_n05_prefill_test)
+        set_tests_properties(naive_n05_prefill PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
         add_executable(naive_n05_tp_model_test test/basic/test_naive_n05_tp_model.cpp)
         target_link_libraries(naive_n05_tp_model_test PRIVATE fastllm)
         target_include_directories(naive_n05_tp_model_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
