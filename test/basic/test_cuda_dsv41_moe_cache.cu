@@ -37,6 +37,12 @@ __global__ void CheckFP4Decode(float *output) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     output[i] = fastllm::cuda::dsv41_cache::FP4(i % 16, i / 16);
 }
+__global__ void CheckFP4Pair(float *output) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const float2 pair = fastllm::cuda::dsv41_cache::FP4Pair(i % 256, i / 256);
+    output[2 * i] = pair.x;
+    output[2 * i + 1] = pair.y;
+}
 static void Quant(std::vector<float> &v, int blockSize = 32) {
     for (size_t start = 0; start < v.size(); start += blockSize) {
         float maximum = 1e-4f;
@@ -132,6 +138,31 @@ int main(int argc, char **argv) {
                 const float expected = Bf(std::copysign(magnitude[code & 7], code & 8 ? -1.0f : 1.0f) * scale);
                 Require(std::memcmp(&values[i], &expected, sizeof(float)) == 0, "FP4 decode / CPU oracle mismatch");
             }
+        }
+        {
+            constexpr int pairs = 256 * 256;
+            float *device;
+            Check(cudaMalloc(&device, 2 * pairs * sizeof(float)));
+            CheckFP4Pair<<<pairs / 256, 256>>>(device);
+            std::vector<float> values(2 * pairs);
+            Check(cudaMemcpy(values.data(), device, values.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            Check(cudaFree(device));
+            const float magnitude[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
+            for (int i = 0; i < pairs; ++i) {
+                const int packed = i % 256, exponent = i / 256;
+                for (int part = 0; part < 2; ++part) {
+                    const float actual = values[2 * i + part];
+                    if (exponent == 255) {
+                        Require(std::isnan(actual), "FP4 pair NaN scale");
+                        continue;
+                    }
+                    const int code = (packed >> (4 * part)) & 15;
+                    const float scale = exponent == 0 ? std::ldexp(1.0f, -127) : std::ldexp(1.0f, exponent - 127);
+                    const float expected = Bf(std::copysign(magnitude[code & 7], code & 8 ? -1.0f : 1.0f) * scale);
+                    Require(std::memcmp(&actual, &expected, sizeof(float)) == 0, "FP4 pair / CPU oracle mismatch");
+                }
+            }
+            std::printf("FP4_PAIR_PASS pairs=%d values=%d\n", pairs, 2 * pairs);
         }
         // Preserve the existing V4 block-128 helper while extending V4.1.
         for (int block : {32, 128})
