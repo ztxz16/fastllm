@@ -155,8 +155,9 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     const int ranks = (int)state.devices.size();
     const int total = input.dims[0];
     const int begin = (int)((int64_t)total * rank / ranks);
-    const bool localRouting = total >= ranks && total % ranks == 0 &&
-        index.dims == std::vector<int>({total / ranks, 8});
+    const int shard = (int)((int64_t)total * (rank + 1) / ranks) - begin;
+    const bool localRouting = total >= ranks && (!graphDecode || total % ranks == 0) &&
+        index.dims == std::vector<int>({shard, 8});
     AssertInFastLLM((localRouting || index.dims == std::vector<int>({total, 8})) &&
         score.dims == index.dims, "Invalid MiMo EP8 routing shape.");
     output.dataType = BFLOAT16;
@@ -221,7 +222,6 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     }
     // Dispatch each token from one rank, using the selected bounded arena.
     // All ranks execute the same number of rounds, including empty shards.
-    const int shard = (int)((int64_t)total * (rank + 1) / ranks) - begin;
     const int rounds = (int)(((int64_t)total + ranks * capacity - 1) / (ranks * capacity));
     for (int round = 0; round < rounds; ++round) {
         const int start = round * capacity;

@@ -506,6 +506,11 @@ Data NaiveN05FlashModel::RunTarget(
     int length = inputIds.dims[1];
     const bool shardMoe = tensorParallel && tpEp8MegaState && decodeWorkspace &&
         !verifying && length >= 8 && length % 8 == 0;
+    // Small prefill chunks use MegaMoE's replicated (up to 64 rows) path.
+    // Larger chunks dispatch contiguous token shards, including uneven tails.
+    const bool shardPrefillRouter = tensorParallel && tpEp8MegaState &&
+        !decodeWorkspace && !verifying && length > 64;
+    const bool shardRouter = shardMoe || shardPrefillRouter;
     const int reserveCapacity = CacheReserveCapacity(config);
     const int previousExactThreshold = FastllmCudaGetLinearExactBatchThreshold();
     struct RestoreExactThreshold {
@@ -1005,20 +1010,34 @@ Data NaiveN05FlashModel::RunTarget(
             Linear(w1, localWeight(prefix + ".mlp.down_proj.weight"), Data(), w2);
             addMlpResidual(w2, true);
         } else {
-            // Decode ranks route only their contiguous token shard, borrowing
+            // EP ranks route only their contiguous token shard, borrowing
             // the normalized activation until MegaMoE finishes reading it.
             Data routedInput;
-            if (shardMoe) {
-                routedInput.Resize({length / 8, embed_dim});
-                routedInput.FakeFrom(normed, (size_t)tpRank * (length / 8) * embed_dim * normed.unitSize);
+            if (shardRouter) {
+                const int first = (int)((int64_t)length * tpRank / 8);
+                const int end = (int)((int64_t)length * (tpRank + 1) / 8);
+                routedInput.Resize({end - first, embed_dim});
+                routedInput.FakeFrom(normed, (size_t)first * embed_dim * normed.unitSize);
             }
-            Data &routerSource = shardMoe ? routedInput : normed;
+            Data &routerSource = shardRouter ? routedInput : normed;
             Data &routerWeight = localWeight(prefix + ".mlp.gate.weight");
             bool hasRouterProbabilities =
                 FastllmCudaNaiveRouterSigmoid(routerSource, routerWeight, router);
             if (!hasRouterProbabilities) {
-                ToDataType(routerSource, routerInput, DataType::FLOAT32);
-                Linear(routerInput, routerWeight, Data(), router);
+                Data localRouterInput;
+                if (shardPrefillRouter) {
+                    // Keep the former full FP32 allocation for MegaMoE's
+                    // borrowed arena, but convert/project only the local rows.
+                    routerInput.dataType = FLOAT32;
+                    routerInput.UpdateUnitSize();
+                    routerInput.Resize({length, embed_dim});
+                    routerInput.ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
+                    routerInput.Allocate(false);
+                    localRouterInput.FakeFrom(routerInput, 0);
+                }
+                Data &fp32Input = shardPrefillRouter ? localRouterInput : routerInput;
+                ToDataType(routerSource, fp32Input, DataType::FLOAT32);
+                Linear(fp32Input, routerWeight, Data(), router);
             }
             Data &routerBias = localWeight(prefix + ".mlp.gate.e_score_correction_bias");
             auto &executor = *(Executor *)GetExecutor();
