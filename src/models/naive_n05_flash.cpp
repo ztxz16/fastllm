@@ -859,23 +859,34 @@ Data NaiveN05FlashModel::RunTarget(
                                  (int64_t)(length / ranks) * pastKey.dims[1] >= 1024 * 1024) {
                             // Indexer Q/K are replicated. Score disjoint query
                             // tiles and gather only the selected integer indices.
-                            // Keep 64-row tile boundaries so the score arithmetic
-                            // matches the unsharded prefill kernel.
-                            const int rows = length / ranks, first = tpRank * rows;
-                            Data localQ, localWeights, localIndices;
-                            localQ.Resize({1, rows, indexHeads * indexDim});
-                            localQ.FakeFrom(indexQ, (size_t)first * indexHeads * indexDim * indexQ.unitSize);
-                            localWeights.Resize({1, rows, indexHeads});
-                            localWeights.FakeFrom(indexWeights, (size_t)first * indexHeads * indexWeights.unitSize);
+                            // Pair an early and a late range to balance causal
+                            // work while preserving 64-row tiles and the MMA
+                            // dispatch threshold, so score arithmetic is unchanged.
+                            const int rows = length / ranks;
+                            const bool balanced = length % (ranks * 128) == 0 &&
+                                (ranks == 2 || ranks == 4 || ranks == 8) &&
+                                (int64_t)(rows / 2) * pastKey.dims[1] >= 1024 * 1024;
+                            const int parts = balanced ? 2 : 1, partRows = rows / parts;
                             indices.dataType = INT32;
                             indices.Resize({length, indexTopK});
                             indices.ToDevice(indexQ.dataDevice, indexQ.dataDeviceIds, false);
                             indices.Allocate(false);
-                            localIndices.Resize({rows, indexTopK});
-                            localIndices.FakeFrom(indices, (size_t)first * indexTopK * sizeof(int));
-                            FastllmCudaNaiveIndexer(localQ, localWeights, pastKey, indexHeads, indexDim,
-                                localPast + first, indexTopK, indexFp8, localIndices);
+                            for (int part = 0; part < parts; ++part) {
+                                const int first = part == 0 ? tpRank * partRows :
+                                    length - (tpRank + 1) * partRows;
+                                Data localQ, localWeights, localIndices;
+                                localQ.Resize({1, partRows, indexHeads * indexDim});
+                                localQ.FakeFrom(indexQ, (size_t)first * indexHeads * indexDim * indexQ.unitSize);
+                                localWeights.Resize({1, partRows, indexHeads});
+                                localWeights.FakeFrom(indexWeights, (size_t)first * indexHeads * indexWeights.unitSize);
+                                localIndices.Resize({partRows, indexTopK});
+                                localIndices.FakeFrom(indices,
+                                    (size_t)(tpRank * rows + part * partRows) * indexTopK * sizeof(int));
+                                FastllmCudaNaiveIndexer(localQ, localWeights, pastKey, indexHeads, indexDim,
+                                    localPast + first, indexTopK, indexFp8, localIndices);
+                            }
                             FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, indices);
+                            if (balanced) FastllmCudaNaiveRestoreIndexerRows(indices, ranks);
                         }
                         else FastllmCudaNaiveIndexer(indexQ, indexWeights, pastKey, indexHeads, indexDim,
                                                     localPast, indexTopK, indexFp8, indices);

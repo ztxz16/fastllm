@@ -597,6 +597,23 @@ __global__ void SelectTopKCompact(const float *scores, unsigned long long *selec
     }
 }
 
+// AllGather writes [front_0, back_0, front_1, back_1, ...]. Each
+// thread owns one column across all tiles, so the permutation is in-place.
+template<int Ranks>
+__global__ void RestoreBalancedRows(int *indices, int tileElements) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= tileElements) return;
+    int values[2 * Ranks];
+    #pragma unroll
+    for (int tile = 0; tile < 2 * Ranks; ++tile)
+        values[tile] = indices[(size_t)tile * tileElements + i];
+    #pragma unroll
+    for (int rank = 0; rank < Ranks; ++rank) {
+        indices[(size_t)rank * tileElements + i] = values[2 * rank];
+        indices[(size_t)(2 * Ranks - 1 - rank) * tileElements + i] = values[2 * rank + 1];
+    }
+}
+
 // Sort only the compact candidate row within one CTA. The 64-bit key
 // retains score ordering and lower-index tie breaking, including signed zero.
 __global__ void SortTopKCompact(const unsigned long long *input, const int *ends,
@@ -2483,6 +2500,23 @@ bool FastllmCudaNaiveQuantizeIndexer(const fastllm::Data &input,
 #else
     return false;
 #endif
+}
+
+void FastllmCudaNaiveRestoreIndexerRows(fastllm::Data &indices, int ranks) {
+    using namespace fastllm;
+    AssertInFastLLM(indices.dataType == INT32 && indices.dataDevice == DataDevice::CUDA &&
+        indices.cudaData && indices.dataDeviceIds.size() == 1 &&
+        indices.dims.size() == 2 && indices.dims[0] > 0 &&
+        indices.dims[1] > 0 && (ranks == 2 || ranks == 4 || ranks == 8) &&
+        indices.dims[0] % (2 * ranks) == 0 && indices.Count(0) / (2 * ranks) <= INT_MAX,
+        "Invalid balanced Indexer row layout.");
+    const int count = indices.Count(0) / (2 * ranks);
+    const int blocks = (count - 1) / 256 + 1;
+    FastllmCudaSetDevice(indices.dataDeviceIds[0]);
+    if (ranks == 2) RestoreBalancedRows<2><<<blocks, 256>>>((int *)indices.cudaData, count);
+    else if (ranks == 4) RestoreBalancedRows<4><<<blocks, 256>>>((int *)indices.cudaData, count);
+    else RestoreBalancedRows<8><<<blocks, 256>>>((int *)indices.cudaData, count);
+    CheckLaunch();
 }
 
 void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
