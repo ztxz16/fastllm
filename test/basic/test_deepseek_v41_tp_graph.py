@@ -100,7 +100,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True)
     parser.add_argument('--hc-mult', type=int, choices=(2, 4), default=4)
-    parser.add_argument('--expert-cache', action='store_true')
+    backend = parser.add_mutually_exclusive_group()
+    backend.add_argument('--expert-cache', action='store_true')
+    backend.add_argument('--gpu-experts', action='store_true')
+    backend.add_argument('--disk-experts', action='store_true')
+    parser.add_argument('--ngram-device', choices=('cpu', 'disk'), default='cpu')
     parser.add_argument('--fp8-dense', action='store_true',
                         help='exercise block-32 FP8 weights and persistent activation quantization buffers')
     parser.add_argument('--eager-only', action='store_true',
@@ -113,6 +117,12 @@ def main():
                    FASTLLM_DSV41_DISABLE_FAKE_QUANT='0' if args.fp8_dense else '1',
                    FASTLLM_DSV41_CUDA_GRAPH_DEBUG='1')
         command = [args.binary, str(directory)] + (['--expert-cache'] if args.expert_cache else [])
+        if args.gpu_experts:
+            command.append('--gpu-experts')
+        if args.disk_experts:
+            command.append('--disk-experts')
+        if args.ngram_device == 'disk':
+            command.append('--disk-engram')
         if args.fp8_dense:
             command.append('--fp8-dense')
         if args.eager_only:
@@ -126,8 +136,12 @@ def main():
             raise SystemExit(77)
         result.check_returncode()
         assert 'PASS: synchronous/asynchronous TP verification 1..8, features and rollback match across requests' in result.stdout
-        if args.eager_only:
+        if args.eager_only or args.disk_experts:
             assert 'decode CUDA graph captured:' not in result.stdout
+            if args.disk_experts:
+                assert 'CUDA Graph bypassed for disk expert weights' in result.stdout
+                if not args.eager_only:
+                    assert 'PASS: disk experts preserve eager results with CUDA Graph requested' in result.stdout
         else:
             assert 'PASS: DSpark graph shapes 1..8, main features and rollback match across requests' in result.stdout
             assert 'decode CUDA graph captured:' in result.stdout, 'graph was not exercised'
