@@ -2191,16 +2191,23 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     const uint32_t lane_idx = tid.x, warp_idx = get_warp_idx<KTraits>(tid.y, tid.z);
     const uint32_t num_qo_heads = num_kv_heads * group_size;
 
-    const uint32_t max_chunk_size = partition_kv ? ceil_div(kv_len, num_chunks) : kv_len;
-    const uint32_t chunk_start = partition_kv ? chunk_idx * max_chunk_size : 0;
-    const uint32_t chunk_end =
-        partition_kv ? min((chunk_idx + 1) * max_chunk_size, kv_len) : kv_len;
-    const uint32_t chunk_size = chunk_end - chunk_start;
-
     auto block = cg::this_thread_block();
     auto smem = reinterpret_cast<uint8_t*>(&smem_storage);
     AttentionVariant variant(params, /*batch_idx=*/0, smem);
     const uint32_t window_left = variant.window_left;
+
+    const uint32_t max_chunk_size = partition_kv ? ceil_div(kv_len, num_chunks) : kv_len;
+    // Every query in this CTA masks the keys before window_start. Skip whole
+    // KV tiles, retaining the original tile boundaries and accumulation order.
+    // Split-KV keeps its original partitions and merge bookkeeping.
+    const uint32_t window_start = AttentionVariant::uses_sliding_window
+        ? sub_if_greater_or_zero(kv_len + (bx * CTA_TILE_Q) / group_size, qo_len + window_left)
+        : 0;
+    const uint32_t chunk_start = partition_kv ? chunk_idx * max_chunk_size
+                                             : (window_start / CTA_TILE_KV) * CTA_TILE_KV;
+    const uint32_t chunk_end =
+        partition_kv ? min((chunk_idx + 1) * max_chunk_size, kv_len) : kv_len;
+    const uint32_t chunk_size = chunk_end - chunk_start;
 
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     constexpr uint32_t O_FRAG_D = KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT
