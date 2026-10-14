@@ -614,27 +614,32 @@ __global__ void RestoreBalancedRows(int *indices, int tileElements) {
     }
 }
 
-// Sort only the compact candidate row within one CTA. The 64-bit key
-// retains score ordering and lower-index tie breaking, including signed zero.
+// Keep all score bits but compress the inverse index to its actual width.
+// Skipping constant index bits reduces radix passes without changing score
+// order or lower-index tie breaking, including signed zero and NaNs.
 __global__ void SortTopKCompact(const unsigned long long *input, const int *ends,
-                               int *indices, int queries, int stride, int topK) {
+                               int *indices, int queries, int stride, int topK, int keyCount) {
     constexpr int Threads = 256, Items = 16;
     using Sort = cub::BlockRadixSort<unsigned long long, Threads, Items>;
     __shared__ typename Sort::TempStorage storage;
     const int row = blockIdx.x, count = ends[queries + row] - row * stride;
+    const int indexBits = 32 - __clz((unsigned)max(1, keyCount - 1));
+    const unsigned mask = 0xffffffffu >> (32 - indexBits);
     unsigned long long keys[Items];
     #pragma unroll
     for (int i = 0; i < Items; ++i) {
         int col = threadIdx.x + i * Threads;
-        keys[i] = col < count ? input[(size_t)row * stride + col] : 0;
+        unsigned long long key = col < count ? input[(size_t)row * stride + col] : 0;
+        unsigned index = 0xffffffffu - (unsigned)key;
+        keys[i] = col < count ? ((key >> 32) << indexBits) | (mask - index) : 0;
     }
-    Sort(storage).SortDescendingBlockedToStriped(keys);
+    Sort(storage).SortDescendingBlockedToStriped(keys, 0, 32 + indexBits);
     #pragma unroll
     for (int i = 0; i < Items; ++i) {
         int col = threadIdx.x + i * Threads;
         if (col < topK)
             indices[(size_t)row * topK + col] = col < count
-                ? (int)(0xffffffffu - (unsigned)keys[i]) : -1;
+                ? (int)(mask - ((unsigned)keys[i] & mask)) : -1;
     }
 }
 
@@ -2158,7 +2163,7 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
         }
         if (blockSort) {
             SortTopKCompact<<<queries, 256>>>(input, begin, (int *)indices.cudaData,
-                queries, sortStride, topK);
+                queries, sortStride, topK, keys);
             CheckLaunch();
             return;
         }
@@ -2563,7 +2568,9 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
                 (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
                 topKOutput, stride, keys, queryStart);
         } else {
-            naive_dsa_mma::IndexerScores<<<dim3((keys + kKeys - 1) / kKeys,
+            // TopK consumes only each row's causal prefix. Blocks beyond
+            // the final query's prefix cannot contribute any selected key.
+            naive_dsa_mma::IndexerScores<<<dim3((queryStart + queries + kKeys - 1) / kKeys,
                 (queries + kKeys - 1) / kKeys), kThreads>>>(
                 (const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
                 (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
