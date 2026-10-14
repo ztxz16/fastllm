@@ -2,6 +2,10 @@
 #include "fastllm.h"
 #include "devices/cuda/naive-n05-dsa.h"
 
+inline bool FastllmNaiveKVType(fastllm::DataType type) {
+    return type == fastllm::BFLOAT16 || type == fastllm::FP8_E4M3;
+}
+
 // Match the full-vocabulary CUDA Top1's 256-lane reduction order on ties.
 // Global IDs are essential: shards need not start at a multiple of 256.
 #ifdef __CUDACC__
@@ -41,7 +45,8 @@ void FastllmCudaNaiveLogitsSelect(const fastllm::Data &logits, int vocabOffset,
     int count, bool greedy, float invTemperature,
     fastllm::Data &partial, fastllm::Data &output);
 
-// Model-specific CUDA operations use BF16 activations. Keys/values are packed
+// Model-specific CUDA operations use BF16 activations and BF16 or unscaled
+// E4M3 KV storage. Keys/values are packed
 // as [1, tokens, heads * dim (+ indexDim for DSA keys)].
 // Per-layer raw projections [1, rows, 2 * heads * dim] and norm weights [dim].
 // Returns false on unsupported layouts without changing cache contents/metadata.
@@ -73,8 +78,16 @@ void FastllmCudaNaiveDraftSwiGLU(const fastllm::Data &gateUp, fastllm::Data &out
 
 void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
                          int heads, int dim, int rotaryDim, float theta);
-// Append already transformed BF16 rows into an allocated logical page view.
+// Append transformed BF16 rows into allocated BF16/FP8 dense or paged storage.
 void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start);
+// Read logical cache slices into an existing BF16 staging allocation. Used by
+// history recording; no full-cache dequantization is needed for attention.
+struct FastllmNaiveKVRead {
+    const fastllm::Data *source;
+    void *target;
+    int first, rows;
+};
+void FastllmCudaNaiveReadCache(const std::vector<FastllmNaiveKVRead> &slices);
 // Q/K RoPE and V scaling, preserving eager BF16 rounding. With packedQkv,
 // read [Q, K, V] within each row and write contiguous Q/K/V outputs; otherwise
 // operate in place. Q/K and V may have different head dimensions.
@@ -132,7 +145,8 @@ bool FastllmCudaNaiveQuantizeIndexer(const fastllm::Data &input,
 // affine arithmetic and final BF16 rounding without conversion buffers.
 bool FastllmCudaNaiveIndexerKeyNorm(fastllm::Data &input,
     const fastllm::Data &weight, const fastllm::Data &bias);
-// Only Q is optionally E4M3-rounded; Indexer K always retains its BF16 input.
+// Only Q uses the Indexer's activation quantizer. Indexer K is read from the
+// chosen KV storage type, without applying a second activation quantization.
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             const fastllm::Data &weights,
                             const fastllm::Data &packedKeys,
@@ -176,7 +190,11 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
     FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
 // Independent 128-token SWA rings (QK=192, V=128). Cache descriptors are
 // kernel arguments; liveKeys contains one absolute length per sequence.
-struct FastllmNaiveSWARow { const void *key, *value; const void *const *cache = nullptr; };
+struct FastllmNaiveSWARow {
+    const void *key, *value;
+    const void *const *cache = nullptr;
+    bool fp8 = false;
+};
 void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
     const fastllm::Data &sink, const std::vector<FastllmNaiveSWARow> &rows,
     const fastllm::Data &liveKeys, int heads, int kvHeads,

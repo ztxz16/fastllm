@@ -60,6 +60,12 @@ __device__ __forceinline__ void LoadScoreVector(void *destination, const void *s
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
             :: "r"(address), "l"(source), "r"(bytes) : "memory");
 }
+template<bool CacheL1>
+__device__ __forceinline__ void LoadScoreVector(void *destination, FastllmNaiveKVRow source, bool valid) {
+    if (source.fp8) *(uint4 *)destination = valid ? source.Load8() : make_uint4(0,0,0,0);
+    else LoadScoreVector<CacheL1>(destination, source.data, valid);
+}
+
 #endif
 
 // K occupies the MMA row dimension: each warp produces sixteen key scores.
@@ -83,10 +89,10 @@ __global__ void HopperScores(const BF16 *weights, Batch batch) {
     // Tiles aligned to a divisor of the page length need only one page base.
     // Keep per-row translation for arbitrary page lengths (e.g. 96 tokens).
     const bool onePage = !r.key.pages || r.key.pageLen % kKeys == 0;
-    const BF16 *tile = onePage ? r.key.Row(first, r.stride) : nullptr;
+    const auto tile = onePage ? r.key.Row(first, r.stride) : FastllmNaiveKVRow{};
     for (int i = t; i < kKeys * (kIndexerDim / 8); i += Threads) {
         int key = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
-        const BF16 *base = onePage ? tile + (size_t)key * r.stride
+        const auto base = onePage ? tile + (size_t)key * r.stride
                                   : r.key.Row(min(first + key, n - 1), r.stride);
         LoadScoreVector<false>(&ks[key][d], base + r.stride - kIndexerDim + d, first + key < n);
     }

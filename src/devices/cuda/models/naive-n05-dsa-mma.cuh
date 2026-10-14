@@ -61,8 +61,7 @@ __global__ __launch_bounds__(kThreads) void Scores(const BF16 *q, FastllmNaiveKV
         int key = SelectedKey(indices, query, first + slot, count, keys, past, causal);
         if (lane == 0) valid[slot] = key >= 0;
         if (lane < kQkDim / 8) {
-            uint4 values = key >= 0 ? *reinterpret_cast<const uint4*>(
-                k.Row(key, keyStride) + kvHead * kQkDim + lane * 8) : make_uint4(0,0,0,0);
+            uint4 values = key >= 0 ? (k.Row(key, keyStride) + kvHead * kQkDim + lane * 8).Load8() : make_uint4(0,0,0,0);
             *reinterpret_cast<uint4*>(&ks[slot][lane * 8]) = values;
         }
     }
@@ -115,8 +114,7 @@ __global__ __launch_bounds__(kThreads) void Values(const float *prob, FastllmNai
         for (int i = threadIdx.x; i < kKeys * (kValueDim / 8); i += kThreads) {
             int slot = i / (kValueDim / 8), col = i % (kValueDim / 8) * 8;
             int key = selected[slot];
-            uint4 values = key >= 0 ? *reinterpret_cast<const uint4*>(
-                v.Row(key, kvHeads * kValueDim) + kvHead * kValueDim + col) : make_uint4(0,0,0,0);
+            uint4 values = key >= 0 ? (v.Row(key, kvHeads * kValueDim) + kvHead * kValueDim + col).Load8() : make_uint4(0,0,0,0);
             *reinterpret_cast<uint4*>(&vs[slot][col]) = values;
         }
         __syncthreads();
@@ -177,10 +175,10 @@ __device__ __forceinline__ void LoadIndexerKeys(
         int stride, int first, int keys) {
     for (int i = threadIdx.x; i < kKeys * (kIndexerDim / 8); i += kThreads) {
         int row = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
-        const BF16 *src = packedKeys.Row(min(first + row, keys - 1), stride) + stride - kIndexerDim + d;
+        const auto src = packedKeys.Row(min(first + row, keys - 1), stride) + stride - kIndexerDim + d;
         if (stride % 8 == 0) {
             *reinterpret_cast<uint4*>(&tile[row][d]) = first + row < keys
-                ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
+                ? src.Load8() : make_uint4(0, 0, 0, 0);
         } else {
             #pragma unroll
             for (int j = 0; j < 8; ++j)

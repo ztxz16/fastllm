@@ -65,7 +65,7 @@ inline bool EncodeMaps(CUtensorMap *maps, const void *key, const void *value, in
 inline bool PrepareTmaBatch(TmaBatch &batch, const FastllmNaiveDSARow *rows, int count) {
     for (int i = 0; i < count; ++i) {
         const auto &r = batch.rows[i] = rows[i];
-        if ((r.pageLen && r.pageLen % 128) || r.indices || r.capacity <= 0 || (r.cache && !r.tensorMaps)) return false;
+        if (r.fp8 || (r.pageLen && r.pageLen % 128) || r.indices || r.capacity <= 0 || (r.cache && !r.tensorMaps)) return false;
         if (!r.tensorMaps && !EncodeMaps(batch.maps + i * 2, r.key, r.value, r.poolTokens ? r.poolTokens : r.capacity, r.keyStride)) return false;
     }
     return true;

@@ -60,7 +60,7 @@ struct NaiveN05FlashModel::TPDecodeState {
 struct NaiveN05FlashModel::TPServingState {
     bool preparing = false, capturing = false, sealed = false;
     int prepareCapacity = 0;
-    DataType moeType = BFLOAT16;
+    DataType moeType = BFLOAT16, kvType = BFLOAT16;
     uint64_t generation = 0, cacheEpoch = UINT64_MAX;
     std::vector<const Data *> requests;
     std::vector<int> expectedLengths, capacityLimits;

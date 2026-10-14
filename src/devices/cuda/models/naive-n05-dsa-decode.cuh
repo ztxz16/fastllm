@@ -27,6 +27,10 @@ template <bool Async> __device__ __forceinline__ void Copy(void *dst, const void
 #endif
     *reinterpret_cast<uint4 *>(dst) = valid ? *reinterpret_cast<const uint4 *>(src) : make_uint4(0, 0, 0, 0);
 }
+template <bool Async> __device__ __forceinline__ void Copy(void *dst, FastllmNaiveKVRow src, bool valid) {
+    if (src.fp8) *(uint4 *)dst = valid ? src.Load8() : make_uint4(0, 0, 0, 0);
+    else Copy<Async>(dst, src.data, valid);
+}
 template <int FixedDim = 0>
 __global__ void Scores(const BF16 *q, FastllmNaiveDSABatch batch, float *scores, int heads, int kvHeads,
                        int dim, int stride) {
@@ -43,7 +47,7 @@ __global__ void Scores(const BF16 *q, FastllmNaiveDSABatch batch, float *scores,
         selected[t] = index >= 0 && index < length ? index : -1;
     }
     __syncthreads();
-    FastllmNaiveKV key((const BF16 *)r.key, r.keyPages, r.pageLen);
+    FastllmNaiveKV key((const BF16 *)r.key, r.keyPages, r.pageLen, r.fp8);
     if (dim % 8 == 0 && r.keyStride % 8 == 0 && (size_t)key.base % 16 == 0) {
         for (int i = t; i < 64 * (dim / 8); i += 256) {
             int row = i / (dim / 8), d = i % (dim / 8) * 8, index = selected[row];
@@ -91,7 +95,7 @@ __global__ void DirectScores(const BF16 *q, FastllmNaiveDSABatch batch, float *s
               first = blockIdx.y * RowsPerWarp * Warps;
     const auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
-    FastllmNaiveKV key((const BF16 *)r.key, r.keyPages, r.pageLen);
+    FastllmNaiveKV key((const BF16 *)r.key, r.keyPages, r.pageLen, r.fp8);
     float qr[6];
 #pragma unroll
     for (int d = 0; d < 6; ++d)
@@ -101,7 +105,7 @@ __global__ void DirectScores(const BF16 *q, FastllmNaiveDSABatch batch, float *s
         int slot = first + warp + i * Warps, index = slot < count ? (r.indices ? r.indices[slot] : slot) : -1;
         bool valid = index >= 0 && index < length;
         // Resolve the logical row once; all six vector components share it.
-        const BF16 *base = valid ? key.Row(index, r.keyStride) + kh * 192 + lane : nullptr;
+        const auto base = valid ? key.Row(index, r.keyStride) + kh * 192 + lane : FastllmNaiveKVRow{};
         float kr[6];
 #pragma unroll
         for (int d = 0; d < 6; ++d)
@@ -195,7 +199,7 @@ __global__ void Values(const float *scores, FastllmNaiveDSABatch batch, BF16 *ou
     const int h = blockIdx.x, b = blockIdx.z, column = blockIdx.y * Columns, t = threadIdx.x;
     auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
-    FastllmNaiveKV value((const BF16 *)r.value, r.valuePages, r.pageLen);
+    FastllmNaiveKV value((const BF16 *)r.value, r.valuePages, r.pageLen, r.fp8);
     const float *p = scores + ((size_t)b * heads + h) * stride;
     __shared__ __align__(16) BF16 values[Tile][Columns];
     __shared__ float prob[Tile];
@@ -245,12 +249,12 @@ __global__ void SoftmaxTransposedValues(const float *scores, const float *sink, 
     auto &scratch = st.temp;
     auto &maximum = st.maximum;
     auto &denominator = st.denominator;
-    FastllmNaiveKV v((const BF16 *)r.value, r.valuePages, r.pageLen);
+    FastllmNaiveKV v((const BF16 *)r.value, r.valuePages, r.pageLen, r.fp8);
     const float *src = scores + ((size_t)b * heads + h) * stride;
     for (int i = t; i < count * (Columns / 8); i += 256) {
         int row = i / (Columns / 8), d = i % (Columns / 8) * 8, index = r.indices ? r.indices[row] : row;
         bool valid = index >= 0 && index < length;
-        uint4 packed = valid ? *(const uint4 *)(v.Row(valid ? index : 0, kvHeads * 128) + kh * 128 + column + d)
+        uint4 packed = valid ? (v.Row(valid ? index : 0, kvHeads * 128) + kh * 128 + column + d).Load8()
                              : make_uint4(0, 0, 0, 0);
         BF16 *bf = (BF16 *)&packed;
 #pragma unroll
@@ -311,7 +315,7 @@ __global__ void SoftmaxSparseValues(const float *scores, const float *sink, Fast
     auto &scratch = st.temp;
     auto &maximum = st.maximum;
     auto &denominator = st.denominator;
-    FastllmNaiveKV v((const BF16 *)r.value, r.valuePages, r.pageLen);
+    FastllmNaiveKV v((const BF16 *)r.value, r.valuePages, r.pageLen, r.fp8);
     const float *src = scores + ((size_t)b * heads + h) * stride;
     for (int i = t; i < count * (Columns / 8); i += 32 * Columns) {
         int row = i / (Columns / 8), d = i % (Columns / 8) * 8, index = r.indices ? r.indices[row] : row;
@@ -369,12 +373,12 @@ __global__ void GroupedValues(const float *scores, const float *sink, FastllmNai
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = firstHead / (heads / kvHeads);
     extern __shared__ __align__(16) unsigned char memory[];
     auto &s = *(GroupStorage<MaxKeys, Groups, Columns> *)memory;
-    FastllmNaiveKV v((const BF16 *)r.value, r.valuePages, r.pageLen);
+    FastllmNaiveKV v((const BF16 *)r.value, r.valuePages, r.pageLen, r.fp8);
     for (int i = t; i < count * (Columns / 8); i += Groups * 256) {
         int row = i / (Columns / 8), col = i % (Columns / 8) * 8, index = r.indices ? r.indices[row] : row;
         bool valid = index >= 0 && index < length;
         uint4 packed = valid
-                           ? *(const uint4 *)(v.Row(valid ? index : 0, kvHeads * 128) + kh * 128 + column + col)
+                           ? (v.Row(valid ? index : 0, kvHeads * 128) + kh * 128 + column + col).Load8()
                            : make_uint4(0, 0, 0, 0);
         BF16 *bf = (BF16 *)&packed;
 #pragma unroll

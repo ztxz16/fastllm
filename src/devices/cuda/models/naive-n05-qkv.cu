@@ -1,3 +1,4 @@
+#include "devices/cuda/naive-n05-kv.cuh"
 #include "naive-n05-qkv.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include <cuda_runtime.h>
@@ -47,10 +48,10 @@ __device__ void Store(Params p, int b, int logical, BF value, BF peer) {
     if (c < kQuery)
         p.q[b * kQuery + c] = value;
     else if (c < kQK) {
-        BF *key = (BF *)p.cache[b * 4];
+        FastllmNaiveKVWriteRow key{(void *)p.cache[b * 4], p.fp8};
         key[(size_t)PhysicalRow(p, b, row, false) * (p.indexKey ? 320 : 192) + c - kQuery] = value;
     } else {
-        BF *v = (BF *)p.cache[b * 4 + 1];
+        FastllmNaiveKVWriteRow v{(void *)p.cache[b * 4 + 1], p.fp8};
         v[(size_t)PhysicalRow(p, b, row, true) * 128 + c - kQK] =
             __float2bfloat16_rn((float)value * (float)p.valueScale);
     }
@@ -63,7 +64,7 @@ __device__ void StoreIndex(Params p, int b) {
     BF value = src[d];
     if (d < 64)
         value = Rotate(value, src[d ^ 32], d, p.positions[b], p.theta);
-    BF *key = (BF *)p.cache[b * 4];
+    FastllmNaiveKVWriteRow key{(void *)p.cache[b * 4], p.fp8};
     key[(size_t)PhysicalRow(p, b, row, false) * 320 + 192 + d] = value;
 }
 __global__ void QkvGemv(const __nv_bfloat16 *input, const __nv_bfloat16 *weight, Params p) {

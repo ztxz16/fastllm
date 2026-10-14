@@ -847,8 +847,8 @@ void NaiveN05FlashModel::AppendDraftContext(Data &hidden, int start, DraftContex
         key.Reshape({1, length, draftKvHeads * draftHeadDim});
         pos.ToDevice(key.dataDevice, key.dataDeviceIds);
         FastllmCudaNaiveRope(key, pos, draftKvHeads, draftHeadDim, draftHeadDim, draftTheta);
-        AppendCache(context.kv[i].first, key, draftWindow + draftBlock);
-        AppendCache(context.kv[i].second, value, draftWindow + draftBlock);
+        AppendCache(context.kv[i].first, key, BFLOAT16, draftWindow + draftBlock);
+        AppendCache(context.kv[i].second, value, BFLOAT16, draftWindow + draftBlock);
         // Retain bounded draft KV storage between proposal/commit rounds.
         // Copying the suffix discards capacity and reallocates ten buffers
         // on every round once the draft window is full.
@@ -963,8 +963,8 @@ Data NaiveN05FlashModel::RunDraft(int anchor, DraftContext &context) {
             pos.ToDevice(q.dataDevice, q.dataDeviceIds);
             FastllmCudaNaiveRope(q, pos, draftHeads, draftHeadDim, draftHeadDim, draftTheta);
             FastllmCudaNaiveRope(k, pos, draftKvHeads, draftHeadDim, draftHeadDim, draftTheta);
-            AppendCache(cache.first, k);
-            AppendCache(cache.second, v);
+            AppendCache(cache.first, k, BFLOAT16);
+            AppendCache(cache.second, v, BFLOAT16);
         }
         FastllmCudaNaiveAttention(q, cache.first, cache.second, Data(), Data(),
             draftHeads, draftKvHeads, draftHeadDim, draftHeadDim, past, draftWindow, attention, false);

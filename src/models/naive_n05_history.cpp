@@ -6,6 +6,7 @@
 #include <limits>
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/naive-n05-cuda.cuh"
 #endif
 
 namespace fastllm {
@@ -191,7 +192,13 @@ void NaiveN05FlashModel::RestoreTensorParallelHistoryRank(Data &cache, int layer
         if (!local->dims.empty()) local->Resize({1, 0, width + index});
         ReserveCache(*local, required, width + index);
     }
-    if (local->isPagedKVCache) {
+    if (local->dataType == FP8_E4M3) {
+        // The immutable host archive retains BF16 rows. Quantize on the GPU
+        // using exactly the same store boundary as a fresh prefill.
+        host.ToDevice(DataDevice::CUDA, {device}, true);
+        if (local->dims.empty()) local->Resize({1, 0, width + index});
+        FastllmCudaNaivePagedWrite(*local, host, 0);
+    } else if (local->isPagedKVCache) {
         for (int first = 0; first < length; first += local->pageLen) {
             int rows = std::min(local->pageLen, length - first);
             size_t offset = (size_t)local->pageIndex[first / local->pageLen] * local->pageLen * (width + index) * 2;

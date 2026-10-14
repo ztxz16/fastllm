@@ -139,7 +139,7 @@ __global__ __launch_bounds__(256) void Decode(const BF *q, Batch batch, const fl
         for (int i = t; i < 128 * 24; i += 256) {
             int k = s.selected[i / 24], d = i % 24 * 8;
             Copy<true>(&s.tile.keys[i / 24][d],
-                       (const BF *)r.key + (size_t)max(k, 0) * r.keyStride + kh * 192 + d, k >= 0);
+                       FastllmNaiveKVRow(r.key, r.fp8) + (size_t)max(k, 0) * r.keyStride + kh * 192 + d, k >= 0);
         }
         asm volatile("cp.async.commit_group; cp.async.wait_group 0;");
         __syncthreads();
@@ -175,7 +175,7 @@ __global__ __launch_bounds__(256) void Decode(const BF *q, Batch batch, const fl
         for (int i = t; i < 128 * 16; i += 256) {
             int k = s.selected[i / 16], d = i % 16 * 8;
             Copy<true>(&s.tile.values[i / 16][d],
-                       (const BF *)r.value + ((size_t)max(k, 0) * kvHeads + kh) * 128 + d, k >= 0);
+                       FastllmNaiveKVRow(r.value, r.fp8) + ((size_t)max(k, 0) * kvHeads + kh) * 128 + d, k >= 0);
         }
         asm volatile("cp.async.commit_group; cp.async.wait_group 0;");
         __syncthreads();

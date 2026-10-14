@@ -302,13 +302,13 @@ constexpr int kTrimMaxRows = 128;
 // A CTA owns a disjoint 64-byte column tile and stages all retained rows
 // before writing. The barrier makes overlapping suffix moves safe while rows
 // are copied in parallel; other CTAs never read or write these columns.
-template <bool ToRing>
-__global__ void SwaCacheLayout(BF16 *key, BF16 *value, int kc, int vc, int count, int first) {
-    constexpr int columns = kTrimTileBytes / sizeof(BF16);
-    __shared__ BF16 rows[kSwaWindow * columns];
+template <bool ToRing, typename T = BF16>
+__global__ void SwaCacheLayout(T *key, T *value, int kc, int vc, int count, int first) {
+    constexpr int columns = kTrimTileBytes / sizeof(T);
+    __shared__ T rows[kSwaWindow * columns];
     int keyBlocks = (kc + columns - 1) / columns;
     bool isKey = blockIdx.x < keyBlocks;
-    BF16 *data = isKey ? key : value;
+    T *data = isKey ? key : value;
     int stride = isKey ? kc : vc;
     int column = (isKey ? blockIdx.x : blockIdx.x - keyBlocks) * columns;
     for (int i = threadIdx.x; i < count * columns; i += blockDim.x) {
@@ -594,7 +594,8 @@ __global__ void SelectTopKCompact(const float *scores, unsigned long long *selec
     }
 }
 
-__device__ void RopeHeadTo(const BF16 *x, BF16 *out, float position,
+template <typename Output>
+__device__ void RopeHeadTo(const BF16 *x, Output out, float position,
                            int rotaryDim, float theta) {
     for (int d = threadIdx.x; d < rotaryDim / 2; d += blockDim.x) {
         float angle = position * powf(theta, -2.0f * d / rotaryDim);
@@ -650,6 +651,7 @@ struct RopeCacheRow {
     const void *const *cache = nullptr;
     const int *keyPages = nullptr, *valuePages = nullptr;
     int pageLen = 0;
+    bool fp8 = false;
 };
 constexpr int kRopeCacheBatch = 32;
 struct RopeCacheBatch { RopeCacheRow rows[kRopeCacheBatch]; };
@@ -658,8 +660,9 @@ template <bool Packed>
 __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
         int heads, int kvHeads, int dim, int valueDim, int indexDim, int rotaryDim,
         float theta, BF16 valueScale, int window, bool ring) {
-    BF16 *q = r.q, *key = r.cache ? (BF16 *)r.cache[0] : r.key,
-        *value = r.cache ? (BF16 *)r.cache[1] : r.value;
+    BF16 *q = r.q;
+    FastllmNaiveKVWriteRow key{r.cache ? (void *)r.cache[0] : r.key, r.fp8},
+        value{r.cache ? (void *)r.cache[1] : r.value, r.fp8};
     const BF16 *k = r.k, *v = r.v, *indexKey = r.indexKey, *qkv = r.qkv;
     const float *positions = r.positions;
     const int *length = r.length;
@@ -682,7 +685,7 @@ __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
                       : k + ((size_t)token * kvHeads + head - heads) * dim);
         const int *pages = r.pageLen && r.cache ? (const int *)r.cache[2] : r.keyPages;
         int physical = pages ? pages[row / r.pageLen] * r.pageLen + row % r.pageLen : row;
-        BF16 *dst = key + (size_t)physical * (kvHeads * dim + indexDim)
+        auto dst = key + (size_t)physical * (kvHeads * dim + indexDim)
             + (index ? kvHeads * dim : (head - heads) * dim);
         RopeHeadTo(src, dst, positions[token], rotaryDim, theta);
         for (int d = rotaryDim + threadIdx.x; d < width; d += blockDim.x)
@@ -693,7 +696,7 @@ __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
                                 : v + ((size_t)token * kvHeads + h) * valueDim;
         const int *pages = r.pageLen && r.cache ? (const int *)r.cache[3] : r.valuePages;
         int physical = pages ? pages[row / r.pageLen] * r.pageLen + row % r.pageLen : row;
-        BF16 *dst = value + ((size_t)physical * kvHeads + h) * valueDim;
+        auto dst = value + ((size_t)physical * kvHeads + h) * valueDim;
         for (int d = threadIdx.x; d < valueDim; d += blockDim.x)
             dst[d] = __float2bfloat16_rn((float)src[d] * (float)valueScale);
     }
@@ -1051,7 +1054,7 @@ __global__ void AttentionScoresDecodeShared(const BF16 *q, FastllmNaiveKV k,
     for (int i = t; i < KeyTile * (MaxDim / 8); i += threads) {
         int row = i / (MaxDim / 8), d = i % (MaxDim / 8) * 8, key = selected[row];
         *reinterpret_cast<uint4 *>(&values[row][d]) = key >= 0
-            ? *reinterpret_cast<const uint4 *>(k.Row(key, keyStride) + kvHead * dim + d)
+            ? (k.Row(key, keyStride) + kvHead * dim + d).Load8()
             : make_uint4(0, 0, 0, 0);
     }
     int head = firstHead + warp * HeadsPerWarp;
@@ -1212,10 +1215,10 @@ __global__ void AttentionValuesPrefill(const float *prob, FastllmNaiveKV v, cons
                 valid = key >= 0 && key < keys && (!causal || key <= past + query);
             }
             if (valid) {
-                const BF16 *row;
-                if constexpr (Paged) row = v.base + (size_t)key * kvHeads * dim + v.offset;
+                FastllmNaiveKVRow row;
+                if constexpr (Paged) row = FastllmNaiveKVRow(v.base, v.fp8) + (size_t)key * kvHeads * dim + v.offset;
                 else row = v.Row(key, kvHeads * dim);
-                uint2 bits = *reinterpret_cast<const uint2*>(row + kvHead * dim + d);
+                uint2 bits = (row + kvHead * dim + d).Load4();
                 unsigned words[2] = {bits.x, bits.y};
                 float weight = p[slot];
                 #pragma unroll
@@ -1393,8 +1396,8 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
         q += (size_t)row * heads * kSwaQkDim;
         out += (size_t)row * heads * kSwaValueDim;
         const auto &cache = liveKeys.rows[row];
-        k = (const BF16 *)(cache.cache ? cache.cache[0] : cache.key);
-        v = (const BF16 *)(cache.cache ? cache.cache[1] : cache.value);
+        k = FastllmNaiveKV(cache.cache ? cache.cache[0] : cache.key, nullptr, 0, cache.fp8);
+        v = FastllmNaiveKV(cache.cache ? cache.cache[1] : cache.value, nullptr, 0, cache.fp8);
     }
     if constexpr (Verify) {
         const int row = blockIdx.y;
@@ -1647,7 +1650,7 @@ __global__ void AttentionValuesDecodeShared(const float *prob, FastllmNaiveKV v,
     for (int i = t; i < slots * (ValueTile / 8); i += threads) {
         int row = i / (ValueTile / 8), d = i % (ValueTile / 8) * 8, key = selected[row];
         *reinterpret_cast<uint4 *>(&values[row][d]) = key >= 0
-            ? *reinterpret_cast<const uint4 *>(v.Row(key, kvHeads * dim) + kvHead * dim + firstColumn + d)
+            ? (v.Row(key, kvHeads * dim) + kvHead * dim + firstColumn + d).Load8()
             : make_uint4(0, 0, 0, 0);
     }
     __syncthreads();
@@ -2012,20 +2015,19 @@ void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int kee
     using namespace fastllm;
     AssertInFastLLM(keep >= 0 && key.dims.size() == 3 && value.dims.size() == 3 &&
         key.dims[0] == 1 && value.dims[0] == 1 && key.dims[1] == value.dims[1] &&
-        key.dataType == BFLOAT16 && value.dataType == BFLOAT16 &&
+        FastllmNaiveKVType(key.dataType) && value.dataType == key.dataType &&
         key.dataDevice == DataDevice::CUDA && value.dataDevice == DataDevice::CUDA &&
         key.dataDeviceIds == value.dataDeviceIds && key.dims[2] > 0 && value.dims[2] > 0,
         "Invalid Naive-N0.5 sliding cache layout.");
     if (key.dims[1] <= keep) return;
     int drop = key.dims[1] - keep;
-    if (key.dims[2] % 8 == 0 && value.dims[2] % 8 == 0) {
+    const int kb = key.dims[2] * key.unitSize, vb = value.dims[2] * value.unitSize;
+    if (kb % 16 == 0 && vb % 16 == 0) {
         LaunchTrimCachePair((uint4 *)key.cudaData, (uint4 *)value.cudaData,
-            key.dims[2] / 8, value.dims[2] / 8, drop, keep);
+            kb / 16, vb / 16, drop, keep);
     } else {
-        // The vector path requires 16-byte row alignment. Other BF16 layouts
-        // use the same overlap-safe column ownership at scalar granularity.
-        LaunchTrimCachePair((uint16_t *)key.cudaData, (uint16_t *)value.cudaData,
-            key.dims[2], value.dims[2], drop, keep);
+        LaunchTrimCachePair((uint8_t *)key.cudaData, (uint8_t *)value.cudaData,
+            kb, vb, drop, keep);
     }
     CheckLaunch();
     key.Resize({1, keep, key.dims[2]});
@@ -2153,8 +2155,8 @@ static bool PrepareRopeCache(fastllm::Data &q, const fastllm::Data &k,
         return x.dataType == type && x.dataDevice == DataDevice::CUDA &&
             x.dataDeviceIds == device && x.cudaData;
     };
-    auto matrix = [&](const Data &x, int64_t columns) {
-        return resident(x, BFLOAT16) && x.dims.size() == 3 && x.dims[0] == 1 &&
+    auto matrix = [&](const Data &x, int64_t columns, bool cache = false) {
+        return resident(x, cache ? x.dataType : BFLOAT16) && (!cache || FastllmNaiveKVType(x.dataType)) && x.dims.size() == 3 && x.dims[0] == 1 &&
             x.dims[1] >= 0 && x.dims[2] == columns && x.strides.size() == 3 &&
             x.strides[2] == 1 && x.strides[1] == columns;
     };
@@ -2179,7 +2181,7 @@ static bool PrepareRopeCache(fastllm::Data &q, const fastllm::Data &k,
     const int64_t kc = (int64_t)kvHeads * dim + indexDim, vc = (int64_t)kvHeads * valueDim;
     if (kc > INT_MAX || vc > INT_MAX ||
         (int64_t)rows * ((int64_t)heads + 2LL * kvHeads + (indexDim != 0)) > INT_MAX ||
-        !matrix(key, kc) || !matrix(value, vc)) return false;
+        !matrix(key, kc, true) || !matrix(value, vc, true) || key.dataType != value.dataType) return false;
     auto reservedRows = [](const Data &x) {
         if (x.expansionDims.empty()) return x.dims[1];
         return x.expansionDims.size() == 3 && x.expansionDims[0] == 1 &&
@@ -2197,6 +2199,7 @@ static bool PrepareRopeCache(fastllm::Data &q, const fastllm::Data &k,
         packedQkv ? (const BF16 *)packedQkv->cudaData : nullptr,
         (const float *)positions.cudaData, dynamicLength ? (const int *)liveKeys.cudaData : nullptr,
         keyRows, valueRows, cachePast};
+    row.fp8 = key.dataType == FP8_E4M3;
     if (key.isPagedKVCache) {
         if (!value.isPagedKVCache || key.pageLen != value.pageLen || window) return false;
         row.key = (BF16 *)key.pagedKVCacheData->cudaData;
@@ -2326,7 +2329,7 @@ bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
     for (int b = 0; b < count; ++b) {
         const auto &r = descriptors[b];
         if (r.cache != first.cache + b * 4 || r.keyRows != first.keyRows ||
-            r.valueRows != first.valueRows || r.pageLen != first.pageLen ||
+            r.valueRows != first.valueRows || r.pageLen != first.pageLen || r.fp8 != first.fp8 ||
             (indexDim && r.indexKey != first.indexKey + b * 128)) return false;
     }
     if (!naive_qkv::Prepare()) return false;
@@ -2342,7 +2345,7 @@ bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
     }
     naive_qkv::Params params{(BF16 *)q.cudaData, first.indexKey,
         (const float *)positions.cudaData, (const int *)liveKeys.cudaData, first.cache,
-        theta, __float2bfloat16_rn(valueScale), first.pageLen, first.keyRows, first.valueRows, ring};
+        theta, __float2bfloat16_rn(valueScale), first.pageLen, first.keyRows, first.valueRows, ring, first.fp8};
     naive_qkv::Launch((const BF16 *)input.cudaData, (const BF16 *)weight.cudaData,
         params, count, count > 1 ? (float *)scratch.cudaData : nullptr);
     CheckLaunch();
@@ -2402,7 +2405,7 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         query.dims[0] == 1 && query.dims[1] > 0 && query.dims[2] == (int64_t)heads * dim &&
         packedKeys.dims.size() == 3 && packedKeys.dims[0] == 1 && packedKeys.dims[2] >= dim &&
         queryStart >= 0 && (int64_t)queryStart + query.dims[1] <= packedKeys.dims[1] && topK > 0 &&
-        query.dataType == BFLOAT16 && packedKeys.dataType == BFLOAT16 && weights.dataType == BFLOAT16 &&
+        query.dataType == BFLOAT16 && FastllmNaiveKVType(packedKeys.dataType) && weights.dataType == BFLOAT16 &&
         query.dataDevice == DataDevice::CUDA && packedKeys.dataDevice == DataDevice::CUDA &&
         weights.dataDevice == DataDevice::CUDA && query.dataDeviceIds == packedKeys.dataDeviceIds &&
         query.dataDeviceIds == weights.dataDeviceIds && query.cudaData && packedKeys.cudaData &&
@@ -2531,8 +2534,7 @@ void FastllmCudaNaiveVerifyAttention(const fastllm::Data &query,
         (compactWindow || (!window && pastLength + rows <= 256))) {
         const int first = window ? std::min(pastLength + 1, window) : pastLength + 1;
         auto *q = (const BF16 *)query.cudaData;
-        auto *k = (const BF16 *)key.cudaData;
-        auto *v = (const BF16 *)value.cudaData;
+        FastllmNaiveKV k(key), v(value);
         auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
         auto *out = (BF16 *)output.cudaData;
         // An eager caller can retain more than window-1 old rows.
@@ -2554,12 +2556,12 @@ void FastllmCudaNaiveVerifyAttention(const fastllm::Data &query,
         const int begin = window ? std::max(0, end - window) : 0;
         const int length = end - begin;
         Data q(BFLOAT16, {1, 1, heads * dim});
-        Data k(BFLOAT16, {1, length, key.dims[2]});
-        Data v(BFLOAT16, {1, length, value.dims[2]});
+        Data k(key.dataType, {1, length, key.dims[2]});
+        Data v(value.dataType, {1, length, value.dims[2]});
         Data out(BFLOAT16, {1, 1, heads * valueDim}), selected;
         q.FakeFrom(query, (size_t)row * heads * dim * sizeof(BF16));
-        k.FakeFrom(key, (size_t)begin * key.dims[2] * sizeof(BF16));
-        v.FakeFrom(value, (size_t)begin * value.dims[2] * sizeof(BF16));
+        k.FakeFrom(key, (size_t)begin * key.dims[2] * key.unitSize);
+        v.FakeFrom(value, (size_t)begin * value.dims[2] * value.unitSize);
         out.FakeFrom(output, (size_t)row * heads * valueDim * sizeof(BF16));
         // Crossing the dense/sparse boundary inside a block must not change
         // the PV reduction tree of the earlier, still-dense positions.
@@ -2589,6 +2591,7 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     if (((queries >= 32 && (size_t)queries * heads >= 2048) ||
          (queries == 1 && keys == kSwaWindow && heads >= 64 && heads / kvHeads == 8)) &&
         window == kSwaWindow && causal && !selected && pastLength == keys - queries &&
+        key.dataType == BFLOAT16 && value.dataType == BFLOAT16 &&
         dim == kSwaQkDim && valueDim == kSwaValueDim && key.dims[2] % 8 == 0 &&
         (size_t)query.cudaData % 16 == 0 && (size_t)key.cudaData % 16 == 0 &&
         (size_t)value.cudaData % 16 == 0 && FastllmCudaFlashInferDataTypeSupported(DataType::BFLOAT16)) {
@@ -2802,7 +2805,7 @@ __global__ void DraftInput(const float *id, const BF16 *embedding, const BF16 *m
     if (column == 0) positions[row] = *length - 1 + row;
 }
 
-__global__ void AppendDecodeKV(BF16 *key, BF16 *value, const BF16 *newKey,
+__global__ void AppendDecodeKV(FastllmNaiveKVWriteRow key, FastllmNaiveKVWriteRow value, const BF16 *newKey,
         const BF16 *newValue, const int *length, int keyColumns, int valueColumns,
         int window, bool ring, const int *keyPages, const int *valuePages, int pageLen) {
     int column = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2815,7 +2818,7 @@ __global__ void AppendDecodeKV(BF16 *key, BF16 *value, const BF16 *newKey,
         value[(size_t)vr * valueColumns + column] = newValue[column];
 }
 
-__global__ void AppendVerifyKV(BF16 *key, BF16 *value, const BF16 *newKey,
+__global__ void AppendVerifyKV(FastllmNaiveKVWriteRow key, FastllmNaiveKVWriteRow value, const BF16 *newKey,
         const BF16 *newValue, const int *length, int kc, int vc, int window) {
     int column = blockIdx.x * blockDim.x + threadIdx.x;
     const int query = blockIdx.y;
@@ -2826,15 +2829,15 @@ __global__ void AppendVerifyKV(BF16 *key, BF16 *value, const BF16 *newKey,
         value[(size_t)row * vc + column] = newValue[(size_t)query * vc + column];
 }
 
-__global__ void CopyVerifyWindow(const BF16 *key, const BF16 *value,
+__global__ void CopyVerifyWindow(FastllmNaiveKV key, FastllmNaiveKV value,
         BF16 *outKey, BF16 *outValue, const int *length, int query,
         int kc, int vc, int window) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     const int end = min(*length - 1, window - 1) + query + 1;
     const int begin = max(0, end - window), rows = min(end, window);
-    if (index < rows * kc) outKey[index] = key[(size_t)begin * kc + index];
+    if (index < rows * kc) outKey[index] = key.Row(begin + index / kc, kc)[index % kc];
     else if ((index -= rows * kc) < rows * vc)
-        outValue[index] = value[(size_t)begin * vc + index];
+        outValue[index] = value.Row(begin + index / vc, vc)[index % vc];
 }
 
 int DecodeTopKBlocks() {
@@ -2897,22 +2900,54 @@ void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
 }
 
 namespace {
-__global__ void PagedWrite(BF16 *pool, const int *pages, const BF16 *input, int start, int count, int width, int pageLen) {
+struct KVReadBatch {
+    struct Row { FastllmNaiveKV source; BF16 *target; int first, count, width; } rows[32];
+};
+__global__ void ReadCache(KVReadBatch batch) {
+    const auto &r = batch.rows[blockIdx.y];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < r.count) r.target[i] = r.source.Row(r.first + i / r.width, r.width)[i % r.width];
+}
+__global__ void PagedWrite(FastllmNaiveKVWriteRow pool, const int *pages, const BF16 *input, int start, int count, int width, int pageLen) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t)count * width) return;
     int row = start + i / width;
-    size_t physical = (size_t)pages[row / pageLen] * pageLen + row % pageLen;
+    size_t physical = pages ? (size_t)pages[row / pageLen] * pageLen + row % pageLen : row;
     pool[physical * width + i % width] = input[i];
 }
 }
+void FastllmCudaNaiveReadCache(const std::vector<FastllmNaiveKVRead> &slices) {
+    for (size_t first = 0; first < slices.size(); first += 32) {
+        KVReadBatch batch{};
+        int count = std::min<size_t>(32, slices.size() - first), maximum = 0;
+        for (int i = 0; i < count; ++i) {
+            const auto &s = slices[first + i];
+            const auto &data = *s.source;
+            fastllm::AssertInFastLLM(FastllmNaiveKVType(data.dataType) &&
+                data.dataDevice == fastllm::DataDevice::CUDA && data.dims.size() == 3 &&
+                s.target && s.first >= 0 && s.rows > 0, "Invalid Naive KV read.");
+            int elements = s.rows * data.dims[2];
+            batch.rows[i] = {FastllmNaiveKV(data), (BF16 *)s.target, s.first, elements, data.dims[2]};
+            maximum = std::max(maximum, elements);
+        }
+        ReadCache<<<dim3((maximum + 255) / 256, count), 256>>>(batch);
+    }
+    CheckLaunch();
+}
 void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start) {
-    fastllm::AssertInFastLLM(cache.isPagedKVCache && cache.pagedKVCacheData &&
-        cache.dataType == fastllm::BFLOAT16 && input.dataType == fastllm::BFLOAT16 &&
+    using namespace fastllm;
+    AssertInFastLLM(FastllmNaiveKVType(cache.dataType) && input.dataType == BFLOAT16 &&
+        cache.dataDevice == DataDevice::CUDA && input.dataDevice == DataDevice::CUDA &&
+        cache.dims.size() == 3 && input.dims.size() == 3 &&
         cache.dims[2] == input.dims[2] && start >= 0 &&
-        start + input.dims[1] <= (int)cache.pageIndex.size() * cache.pageLen,
-        "Invalid Naive paged append.");
-    PagedWrite<<<(input.Count(0) + 255) / 256, 256>>>((BF16 *)cache.pagedKVCacheData->cudaData,
-        (const int *)cache.cudaData, (const BF16 *)input.cudaData,
+        start + input.dims[1] <= (cache.isPagedKVCache
+            ? (int)cache.pageIndex.size() * cache.pageLen
+            : (cache.expansionDims.empty() ? cache.dims[1] : cache.expansionDims[1])),
+        "Invalid Naive KV append.");
+    FastllmNaiveKVWriteRow destination{cache.isPagedKVCache ? cache.pagedKVCacheData->cudaData : cache.cudaData,
+                                     cache.dataType == FP8_E4M3};
+    PagedWrite<<<(input.Count(0) + 255) / 256, 256>>>(destination,
+        cache.isPagedKVCache ? (const int *)cache.cudaData : nullptr, (const BF16 *)input.cudaData,
         start, input.dims[1], input.dims[2], cache.pageLen);
     CheckLaunch();
 }
@@ -2922,8 +2957,8 @@ void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &liveKeys, int window, bool ring) {
     fastllm::AssertInFastLLM(!ring || window == kSwaWindow, "Invalid SWA ring window.");
     int kc = key.dims[2], vc = value.dims[2];
-    AppendDecodeKV<<<(kc + vc + 255) / 256, 256>>>((BF16 *)(key.isPagedKVCache ? key.pagedKVCacheData->cudaData : key.cudaData),
-        (BF16 *)(value.isPagedKVCache ? value.pagedKVCacheData->cudaData : value.cudaData), (const BF16 *)newKey.cudaData,
+    AppendDecodeKV<<<(kc + vc + 255) / 256, 256>>>({key.isPagedKVCache ? key.pagedKVCacheData->cudaData : key.cudaData, key.dataType == fastllm::FP8_E4M3},
+        {value.isPagedKVCache ? value.pagedKVCacheData->cudaData : value.cudaData, value.dataType == fastllm::FP8_E4M3}, (const BF16 *)newKey.cudaData,
         (const BF16 *)newValue.cudaData, (const int *)liveKeys.cudaData, kc, vc, window, ring,
         key.isPagedKVCache ? (const int *)key.cudaData : nullptr,
         value.isPagedKVCache ? (const int *)value.cudaData : nullptr, key.pageLen);
@@ -2936,28 +2971,38 @@ void FastllmCudaNaiveSwaCacheLayout(fastllm::Data &key, fastllm::Data &value,
     const int count = std::min(past, kSwaWindow - 1);
     const int first = (past - count) & (kSwaWindow - 1);
     if (!count || !first) return;
-    AssertInFastLLM(key.dataType == BFLOAT16 && value.dataType == BFLOAT16 &&
+    AssertInFastLLM(FastllmNaiveKVType(key.dataType) && value.dataType == key.dataType &&
         key.dataDevice == DataDevice::CUDA && value.dataDevice == DataDevice::CUDA &&
         key.dims.size() == 3 && value.dims.size() == 3 && key.dims[0] == 1 && value.dims[0] == 1 &&
         key.dims[1] == count && value.dims[1] == count &&
         key.expansionDims.size() == 3 && value.expansionDims.size() == 3 &&
         key.expansionDims[1] >= kSwaWindow && value.expansionDims[1] >= kSwaWindow,
         "Invalid SWA ring cache layout.");
-    constexpr int columns = kTrimTileBytes / sizeof(BF16);
-    int kc = key.dims[2], vc = value.dims[2];
-    int blocks = (kc + columns - 1) / columns + (vc + columns - 1) / columns;
-    auto kernel = toRing ? SwaCacheLayout<true> : SwaCacheLayout<false>;
-    kernel<<<blocks, 256>>>((BF16 *)key.cudaData, (BF16 *)value.cudaData, kc, vc, count, first);
+    auto launch = [&](auto *storage) {
+        using T = std::remove_pointer_t<decltype(storage)>;
+        constexpr int columns = kTrimTileBytes / sizeof(T);
+        int kc = key.dims[2], vc = value.dims[2];
+        int blocks = (kc + columns - 1) / columns + (vc + columns - 1) / columns;
+        auto kernel = toRing ? SwaCacheLayout<true, T> : SwaCacheLayout<false, T>;
+        kernel<<<blocks, 256>>>((T *)key.cudaData, (T *)value.cudaData, kc, vc, count, first);
+    };
+    if (key.dataType == FP8_E4M3) launch((uint8_t *)nullptr);
+    else launch((BF16 *)nullptr);
     CheckLaunch();
 }
 
 void FastllmCudaNaiveTrimDecodeCache(fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &liveKeys, int window) {
-    constexpr int columns = kTrimTileBytes / sizeof(BF16);
-    int kc = key.dims[2], vc = value.dims[2];
-    int blocks = (kc + columns - 1) / columns + (vc + columns - 1) / columns;
-    TrimCachePairTiled<BF16, true><<<blocks, 256>>>((BF16 *)key.cudaData,
-        (BF16 *)value.cudaData, kc, vc, 1, window - 1, (const int *)liveKeys.cudaData);
+    auto launch = [&](auto *storage) {
+        using T = std::remove_pointer_t<decltype(storage)>;
+        constexpr int columns = kTrimTileBytes / sizeof(T);
+        int kc = key.dims[2], vc = value.dims[2];
+        int blocks = (kc + columns - 1) / columns + (vc + columns - 1) / columns;
+        TrimCachePairTiled<T, true><<<blocks, 256>>>((T *)key.cudaData,
+            (T *)value.cudaData, kc, vc, 1, window - 1, (const int *)liveKeys.cudaData);
+    };
+    if (key.dataType == fastllm::FP8_E4M3) launch((uint8_t *)nullptr);
+    else launch((BF16 *)nullptr);
     CheckLaunch();
 }
 
@@ -3025,7 +3070,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     bool hopper = FastllmCudaRuntimeArch() == 90;
     int maxCapacity = 0;
     for (const auto &row : rows) {
-        if (!row.key || !row.scratch || !row.indices || row.key->dataType != BFLOAT16 ||
+        if (!row.key || !row.scratch || !row.indices || !FastllmNaiveKVType(row.key->dataType) ||
             row.key->dims.size() != 3 || row.key->dims[2] < dim ||
             row.capacity <= 0 || row.capacity > naive_topk::kMaxKeys ||
             row.sequence < 0 || row.sequence >= liveKeys.Count(0) ||
@@ -3311,7 +3356,7 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
         bool aligned = true;
         for (int i = 0; i < (int)rows.size(); ++i) {
             auto &r = descriptors[i];
-            r.key = rows[i].key; r.value = rows[i].value; r.cache = rows[i].cache;
+            r.key = rows[i].key; r.value = rows[i].value; r.cache = rows[i].cache; r.fp8 = rows[i].fp8;
             r.liveKeys = (const int *)liveKeys.cudaData + i;
             r.capacity = kSwaWindow; r.keyStride = kvHeads * kSwaQkDim;
             aligned = aligned && r.key && r.value && (uintptr_t)r.key % 16 == 0 && (uintptr_t)r.value % 16 == 0;
@@ -3428,8 +3473,8 @@ void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &newKey, const fastllm::Data &newValue,
         const fastllm::Data &liveKeys, int window) {
     const int kc = key.dims[2], vc = value.dims[2], rows = newKey.dims[1];
-    AppendVerifyKV<<<dim3((kc + vc + 255) / 256, rows), 256>>>((BF16 *)key.cudaData,
-        (BF16 *)value.cudaData, (const BF16 *)newKey.cudaData,
+    AppendVerifyKV<<<dim3((kc + vc + 255) / 256, rows), 256>>>({key.cudaData, key.dataType == fastllm::FP8_E4M3},
+        {value.cudaData, value.dataType == fastllm::FP8_E4M3}, (const BF16 *)newKey.cudaData,
         (const BF16 *)newValue.cudaData, (const int *)liveKeys.cudaData, kc, vc, window);
     CheckLaunch();
 }
@@ -3702,8 +3747,8 @@ void FastllmCudaNaiveDraftAttention(const fastllm::Data &query,
     Output(output, BFLOAT16, {1, rows, heads * dim});
     DraftLength keys{(const int *)liveKeys.cudaData, window, rows};
     DraftLength past{(const int *)liveKeys.cudaData, window, 0};
-    auto *q = (const BF16 *)query.cudaData, *k = (const BF16 *)key.cudaData;
-    auto *v = (const BF16 *)value.cudaData;
+    auto *q = (const BF16 *)query.cudaData;
+    FastllmNaiveKV k(key), v(value);
     auto *out = (BF16 *)output.cudaData;
     if (shortAttention) {
         AttentionShort<<<dim3(heads, rows), 256>>>(q, k, v, nullptr, nullptr, out,
@@ -3749,7 +3794,7 @@ void FastllmCudaNaiveGraphVerifyIndexer(const fastllm::Data &query,
             (BF16 *)scratch.indexQuery.cudaData, (float *)scratch.indexScale.cudaData, 128, 0);
         naive_dsa_mma::IndexerDecodeScores<IndexerTopKOutput, DecodeKeys, true>
             <<<dim3((capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, rows), naive_dsa_mma::kThreads>>>(
-                (const BF16 *)scratch.indexQuery.cudaData, (const BF16 *)packedKeys.cudaData,
+                (const BF16 *)scratch.indexQuery.cudaData, FastllmNaiveKV(packedKeys),
                 (const float *)scratch.indexScale.cudaData, (const BF16 *)weights.cudaData,
                 scoreOutput, stride, keys, capacity - 1);
     } else
@@ -3759,7 +3804,7 @@ void FastllmCudaNaiveGraphVerifyIndexer(const fastllm::Data &query,
         RoundIndexer<<<rows * 16, 128>>>((const BF16 *)query.cudaData,
             (float *)scratch.indexQuery.cudaData, 128, 0, fp8Query);
         IndexScoresDecode<IndexerTopKOutput, DecodeKeys, true><<<dim3((capacity + 7) / 8, rows), 256>>>(
-            (const float *)scratch.indexQuery.cudaData, (const BF16 *)packedKeys.cudaData,
+            (const float *)scratch.indexQuery.cudaData, FastllmNaiveKV(packedKeys),
             (const BF16 *)weights.cudaData, scoreOutput, stride, keys, capacity - 1);
     }
     auto *workspaces = (naive_topk::Workspace *)scratch.topk.cudaData;
@@ -3798,8 +3843,7 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
         (window == kSwaWindow || (!window && indices.dims.empty() && capacity > 0 && capacity <= 256))) {
         DecodeKeys keys{(const int *)liveKeys.cudaData, window ? window : capacity};
         auto *q = (const BF16 *)query.cudaData;
-        auto *k = (const BF16 *)key.cudaData;
-        auto *v = (const BF16 *)value.cudaData;
+        FastllmNaiveKV k(key), v(value);
         auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
         auto *out = (BF16 *)output.cudaData;
         LaunchShortAttention<true>(q, k, v, bias, out, rows, heads, kvHeads,
@@ -3823,12 +3867,12 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
         DecodeKeys keys{(const int *)liveKeys.cudaData, 0};
         AttentionScoresDecodeGrouped<4, kDecodeQkDim, 32, DecodeKeys, true>
             <<<dim3(heads / 4, count / 32, rows), 128>>>((const BF16 *)query.cudaData,
-                (const BF16 *)key.cudaData, selected, scores, heads, kvHeads, dim,
+                FastllmNaiveKV(key), selected, scores, heads, kvHeads, dim,
                 key.dims[2], keys, count, capacity - 1, true);
         AttentionSoftmax<<<rows * heads, 256>>>(scores, bias, heads, count);
         AttentionValuesDecodeGrouped<4, DecodeKeys, true>
             <<<dim3(heads / 4, kDecodePVParts, rows), kDecodePVValueDim>>>(scores,
-                (const BF16 *)value.cudaData, selected, partial, heads, kvHeads, keys, capacity - 1, true);
+                FastllmNaiveKV(value), selected, partial, heads, kvHeads, keys, capacity - 1, true);
         AttentionValuesDecodeReduce<<<dim3((heads * valueDim + 255) / 256, rows), 256>>>(
             partial, (BF16 *)output.cudaData, heads);
         CheckLaunch();
@@ -3851,7 +3895,7 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
         if (window) {
             int kc = key.dims[2], vc = value.dims[2];
             CopyVerifyWindow<<<(window * (kc + vc) + 255) / 256, 256>>>(
-                (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
+                FastllmNaiveKV(key), FastllmNaiveKV(value),
                 (BF16 *)scratch.windowKey.cudaData, (BF16 *)scratch.windowValue.cudaData,
                 (const int *)liveKeys.cudaData, row, kc, vc, window);
         }

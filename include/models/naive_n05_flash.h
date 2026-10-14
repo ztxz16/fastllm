@@ -155,7 +155,7 @@ namespace fastllm {
                        TargetCapture *capture, int tpRank = -1, const Data *embedding = nullptr,
                        TargetWorkspace *workspace = nullptr, const TargetBatch *batch = nullptr);
         int CacheReserveCapacity(const GenerationConfig &config) const;
-        void AppendCache(Data &cache, Data &input, int reserveCapacity = 0);
+        void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0);
         void ReserveCache(Data &cache, int capacity, int width);
         void PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
         static void TrimCache(Data &cache, int length);
