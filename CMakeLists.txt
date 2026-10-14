@@ -255,6 +255,15 @@ if (USE_CUDA)
         message(STATUS "CUDA20 is unavailable for this CMake/NVCC combination, falling back to CUDA17")
     endif()
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    # NVCC 13.0 ICEs in std::_Destroy for this unit's C++20 host containers.
+    # It requires only C++17; retain C++20 for the other CUDA/DeepGEMM units.
+    if (CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA" AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0 AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
+        set_source_files_properties(
+            src/devices/cuda/linear/fastllm-native-lowbit-prefill.cu
+            PROPERTIES COMPILE_OPTIONS "-std=c++17")
+    endif()
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
     # TurboMind s884 内核（third_party/turbomind）依赖这些 nvcc 特性。
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
