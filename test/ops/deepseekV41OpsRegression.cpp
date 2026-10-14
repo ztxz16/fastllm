@@ -579,6 +579,55 @@ static void CheckHcPreNormFused() {
 
 
 #ifdef USE_CUDA
+static void CheckWoABlock32Decode() {
+    // Real V4.1 projection geometry, plus each dispatch guard's fallback.
+    struct Case { int groups, tokens, block, cols; DataType inputType; };
+    const Case cases[] = {
+        {8, 1, 32, 4096, DataType::BFLOAT16},
+        {4, 1, 32, 4096, DataType::BFLOAT16},
+        {8, 2, 32, 4096, DataType::BFLOAT16},
+        {8, 1, 128, 4096, DataType::BFLOAT16},
+        {8, 1, 32, 2048, DataType::BFLOAT16},
+        {8, 1, 32, 4096, DataType::FLOAT32},
+    };
+    std::mt19937 rng(1741);
+    std::normal_distribution<float> normal(0, .25f);
+    const char *original = std::getenv("FASTLLM_DSV41_CUDA_WOA_BLOCK32");
+    const bool hadFlag = original != nullptr;
+    const std::string savedFlag = original ? original : "";
+    for (const auto &c : cases) {
+        constexpr int rank = 1024;
+        Data w(DataType::FP8_E4M3, {c.groups * rank, c.cols});
+        w.blockK = w.blockM = c.block;
+        w.scales.resize((c.groups * rank / c.block) * (c.cols / c.block));
+        for (size_t i = 0; i < w.scales.size(); ++i)
+            w.scales[i] = std::ldexp(1.0f, int(i % 7) - 9);
+        w.Allocate();
+        for (uint64_t i = 0; i < w.Count(0); ++i) {
+            const uint32_t value = rng();
+            w.cpuData[i] = uint8_t((value % 127) | (value & 128));
+        }
+        ToDev(w, true);
+        for (float amplitude : {0.0f, .001f, 1.0f, 16.0f}) {
+            std::vector<float> xv(size_t(c.tokens) * c.groups * c.cols);
+            for (float &v : xv) v = normal(rng) * amplitude;
+            Data x(DataType::FLOAT32, {1, c.tokens, c.groups * 8, c.cols / 8}, xv);
+            ToDataType(x, c.inputType);
+            ToDev(x, true);
+            Data ref, out;
+            setenv("FASTLLM_DSV41_CUDA_WOA_BLOCK32", "0", 1);
+            Require(FastllmCudaDeepSeekV4WoA(x, w, c.groups, rank, ref), "WoA FP8 baseline rejected");
+            setenv("FASTLLM_DSV41_CUDA_WOA_BLOCK32", "1", 1);
+            Require(FastllmCudaDeepSeekV4WoA(x, w, c.groups, rank, out), "WoA block32 dispatch rejected");
+            Require(ref.dims == out.dims && BitEqual(ReadFloats(ref), ReadFloats(out)),
+                    "WoA block32 specialization/fallback changed output bits");
+        }
+    }
+    if (hadFlag) setenv("FASTLLM_DSV41_CUDA_WOA_BLOCK32", savedFlag.c_str(), 1);
+    else unsetenv("FASTLLM_DSV41_CUDA_WOA_BLOCK32");
+    std::cout << "  [cuda] WoA block32 decode: 24 specialization/fallback cases bit-identical\n";
+}
+
 static void CheckWoASmallBatch() {
     std::mt19937 rng(1730);
     std::normal_distribution<float> normal(0, .25f);
@@ -759,6 +808,7 @@ int main() {
             CheckHcPreNormFused();
             CheckHcSmallBatch();
             CheckWoASmallBatch();
+            CheckWoABlock32Decode();
 #endif
         } else {
             std::cout << "(未编译 / 未检测到 CUDA，跳过 GPU 部分)\n";

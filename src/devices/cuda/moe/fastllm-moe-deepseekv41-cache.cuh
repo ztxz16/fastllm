@@ -26,16 +26,39 @@ __device__ inline float FP4(unsigned value, unsigned exponent) {
 __device__ inline float BFloat(float value) {
     return __bfloat162float(__float2bfloat16_rn(value));
 }
+// Keep the scale edge cases and signed zero exact without divergent branches.
+__device__ __forceinline__ unsigned SelectBits(unsigned a, unsigned b, bool condition) {
+    unsigned result;
+    asm("{ .reg .pred p; setp.ne.u32 p,%3,0; selp.u32 %0,%1,%2,p; }"
+        : "=r"(result) : "r"(a), "r"(b), "r"((unsigned)condition));
+    return result;
+}
+__device__ __forceinline__ float2 FP4Pair(unsigned packed, unsigned exponent) {
+    unsigned bits = SelectBits(exponent << 23, 0x00400000u, exponent != 0);
+    bits = SelectBits(bits, 0x7fc00000u, exponent != 255);
+    const float scale = __uint_as_float(bits);
+    // E2M1 magnitudes are exact FP16 values with zero low bytes. Two
+    // register byte permutations decode both values, without a memory LUT.
+    // FP16 here only represents unscaled {0,.5,1,1.5,2,3,4,6}; scale and
+    // products still use FP32 and the original BF16 rounding.
+    const unsigned lut = __byte_perm(0x3e3c3800u, 0x46444240u, packed & 0x77u);
+    unsigned halves = __byte_perm(lut, 0u, 0x1404u);
+    halves |= ((packed & 8u) << 12) | ((packed & 128u) << 24);
+    const float2 values = __half22float2(*reinterpret_cast<const __half2 *>(&halves));
+    return make_float2(BFloat(__fmul_rn(values.x,scale)), BFloat(__fmul_rn(values.y,scale)));
+}
 __device__ inline float Dot(const __nv_bfloat16 *input, const uint8_t *weight, int columns) {
     const int lane = threadIdx.x & 15;
     float sum = 0;
+    // Independent loads/decodes overlap; additions retain the original order.
+    #pragma unroll 8
     for (int block = 0; block < columns / 32; ++block) {
         const uint8_t *w = weight + block * 17;
-        const unsigned packed = w[lane], exponent = w[16];
-        // Match BF16 dot semantics: accumulate each adjacent product pair.
-        const float pair =
-            __fadd_rn(__fmul_rn(__bfloat162float(input[block * 32 + lane * 2]), FP4(packed & 15, exponent)),
-                      __fmul_rn(__bfloat162float(input[block * 32 + lane * 2 + 1]), FP4(packed >> 4, exponent)));
+        const float2 value = FP4Pair(w[lane], w[16]);
+        // Each adjacent BF16 input pair is aligned, including every block.
+        const unsigned x = reinterpret_cast<const unsigned *>(input)[block * 16 + lane];
+        const float x0 = __uint_as_float(x << 16), x1 = __uint_as_float(x & 0xffff0000u);
+        const float pair = __fadd_rn(__fmul_rn(x0, value.x), __fmul_rn(x1, value.y));
         sum = __fadd_rn(sum, pair);
     }
     for (int delta = 8; delta; delta >>= 1)

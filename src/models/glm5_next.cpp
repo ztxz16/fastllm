@@ -1,4 +1,5 @@
 #include "glm5_next.h"
+#include "utils/hybrid_moe.h"
 #include "glm5_next_mla_prefill.h"
 #include "glm5_next_dsa.h"
 #include "glm5_next_gguf.h"
@@ -776,6 +777,7 @@ namespace fastllm {
             }
         }
 
+        if (threadTpRank < 0) InitExecutionMode();
         InitThreadTp();
         std::cout
             << "[GLM-5.3] Hybrid text model: 34 KDA + 11 DSA layers, "
@@ -951,6 +953,29 @@ namespace fastllm {
         return result;
     }
 
+    void Glm5NextModel::InitExecutionMode() {
+        std::vector<std::string> placements;
+        const std::string fallback = ((Executor*)GetExecutor())->GetFirstDeviceType();
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            auto main = SelectDeviceFromMap(deviceMap, layer + 1, block_cnt);
+            if (main.empty()) main = fallback;
+            placements.push_back(main);
+            if (!denseMlpLayers[layer]) {
+                const auto moe = SelectMoeDeviceForLayer(layer);
+                placements.push_back(moe.empty() ? main : moe);
+            }
+        }
+        // A zero-layer fixture still has a meaningful embedding/output device.
+        if (placements.empty()) {
+            auto main = SelectDeviceFromMap(deviceMap, 1, 1);
+            placements.push_back(main.empty() ? fallback : main);
+        }
+        const char *requested = std::getenv("FASTLLM_EXECUTION_MODE");
+        executionMode = ResolveExecutionMode(requested, placements);
+        std::printf("[Fastllm] FASTLLM_EXECUTION_MODE=%s -> %s (GLM-5.3)\n",
+            requested ? requested : "auto", ExecutionModeName(executionMode));
+    }
+
     void Glm5NextModel::OnModelWeightsLoaded() {
         const auto &ggufArch = weight.dicts["gguf_architecture"];
         if (ggufArch == "glm5next" || ggufArch == "glm5-next") {
@@ -1099,34 +1124,7 @@ namespace fastllm {
             mtpWeightsReady = true;
         }
         PrepareDiskMoeCache(expertWeights);
-#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        {
-            std::vector<FastllmCudaMoeCacheLayer> layers;
-            const int cacheLayers = block_cnt + (mtpEnabled && mtpWeightsReady ? 1 : 0);
-            for (int layer = 0; layer < cacheLayers; ++layer) {
-                const std::string device = SelectMoeDeviceForLayer(std::min(layer, block_cnt - 1));
-                const auto &experts = layer == block_cnt ? mtpExpertWeights : expertWeights[layer];
-                if ((device == "numa" || device.rfind("numa:", 0) == 0) &&
-                    experts.size() >= 4 && experts[2] &&
-                    (experts[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
-                     experts[2]->dataType == DataType::DATA_GGUF_FORMAT)) {
-                    // A draft layer may use a different GGUF quantization from
-                    // the target. Leave unsupported layers on the ordinary NUMA
-                    // path without disabling the target's dynamic GPU offload.
-                    if (experts[2]->dataType == DataType::DATA_GGUF_FORMAT &&
-                        (!experts[3] || experts[2]->dims.size() != 2 || experts[3]->dims.size() != 2 ||
-                         !FastllmCudaMoeGlm5GGUFCacheSupported(experts[2]->ggmlType, experts[3]->ggmlType,
-                             experts[2]->dims[1], experts[3]->dims[1]))) continue;
-                    layers.push_back({experts.data(), (int)experts.size(),
-                                      false, swigluLimit, true});
-                }
-            }
-            if (!layers.empty()) {
-                FastllmCudaPrepareMoeCache(layers.data(), (int)layers.size(),
-                    [this] { WarmupNumaMoeWeights(); }, true);
-            }
-        }
-#endif
+        if (executionMode == ExecutionMode::Hybrid) PrepareHybridMoeCache();
     }
 
     int Glm5NextModel::GetHistoryCacheSequenceLength(
@@ -2156,7 +2154,8 @@ namespace fastllm {
 #ifdef USE_CUDA
         const bool hasSparse = std::any_of(requestIndices.begin(), requestIndices.end(),
             [](const Data &indices) { return !indices.dims.empty(); });
-        if (batch > 1 && (!hasSparse || dsaBackend == DsaBackend::Auto)) {
+        if (batch > 1 && FastllmCudaFlashInferDataTypeSupported(absorbedQuery.dataType) &&
+            (!hasSparse || dsaBackend == DsaBackend::Auto)) {
             std::vector<const Data*> peCaches, latentCaches, indices;
             std::vector<int> lengths;
             for (int request = 0; request < batch; ++request) {
@@ -2204,6 +2203,10 @@ namespace fastllm {
                 glm5_next_detail::SparseLatentAttention(*attentionQuery, latentKvCache,
                     dsaIndices, 1.0f / std::sqrt((float)qkHeadDim), *attentionResult,
                     dsaBackend == DsaBackend::Auto, rows == 1 ? &keyPeCache : nullptr);
+            } else if (UsesDsa() &&
+                       !FastllmCudaFlashInferDataTypeSupported(attentionQuery->dataType)) {
+                glm5_next_detail::DenseLatentAttentionFallback(*attentionQuery, latentKvCache,
+                    1.0f / std::sqrt((float)qkHeadDim), *attentionResult);
             } else
 #endif
             {
@@ -2359,6 +2362,12 @@ namespace fastllm {
             !gateUp.dims.empty() && gateUp.dims.back() % 2 == 0,
             "GLM-5.3 merged gate/up output has an invalid shape.");
         const int intermediate = gateUp.dims.back() / 2;
+#ifdef USE_CUDA
+        if (FastllmCudaGlm5NextClampedSilu(gateUp, swigluLimit, gate)) {
+            Linear(gate, downWeight, Data(), output);
+            return;
+        }
+#endif
         Split(gateUp, -1, 0, intermediate, gate);
         Split(gateUp, -1, intermediate, 2 * intermediate, up);
         Glm5NextClamp(gate, false, 0.0f, true, swigluLimit);
@@ -2368,177 +2377,45 @@ namespace fastllm {
         Linear(gate, downWeight, Data(), output);
     }
 
-    void Glm5NextModel::RunMoe(
-            int layerIndex, Data &input, int sequence, Data &output) {
-        RunMoeWithPrefix(
-            layerIndex,
-            languagePrefix + "layers." + std::to_string(layerIndex) +
-                ".mlp.",
-            expertWeights[layerIndex], expertBiases[layerIndex],
-            input, sequence, output);
-    }
-
     void Glm5NextModel::RunMoeWithPrefix(
             int deviceLayer, const std::string &mlp,
-            std::vector<Data*> &weights,
-            std::vector<Data*> &biases,
+            std::vector<Data*> &weights, std::vector<Data*> &biases,
             Data &input, int sequence, Data &output) {
-        const std::vector<int> outputDims = input.dims;
-        input.Reshape({sequence, embed_dim});
+        if (executionMode == ExecutionMode::Gpu)
+            RunGpuMoeWithPrefix(deviceLayer, mlp, weights, biases, input, sequence, output);
+        else
+            RunHybridMoeWithPrefix(deviceLayer, mlp, weights, biases, input, sequence, output);
+    }
 
-        bool sharedReady = false;
-        auto runShared = [&] {
-            if (sharedReady) return;
-            if (GetCudaSharedExpert() || threadTpRank >= 0) {
-                ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
-            } else {
-                ApplyMoeDeviceMapForLayer(deviceLayer);
-            }
-            RunClampedMlp(input,
-                weight[mlp + "shared_experts.gateup_proj.weight"],
-                weight[mlp + "shared_experts.down_proj.weight"], output);
-            sharedReady = true;
-        };
-#ifdef USE_CUDA
-        const std::string routedDevice = SelectMoeDeviceForLayer(deviceLayer);
-        const bool routedOnNumas = routedDevice == "numa" || routedDevice.rfind("numa:", 0) == 0;
-        const bool shardedRouted = threadTpRank >= 0 && threadTpOwner->shardedMoeLayers[deviceLayer];
-        // Resident TP ranks compute their own intermediate-channel slice.
-        // The caller's FFN AllReduce combines routed and shared partials.
-        if (threadTpRank >= 0 && !shardedRouted) {
-            const bool localNumasDecode = sequence == 1 && routedOnNumas;
-            if (!localNumasDecode || threadTpRank != 0) runShared();
-            if (localNumasDecode) {
-                // Publish peer shared-expert completion without draining its
-                // GPU on the host. The owner borrows a separate per-thread
-                // stream; the following AllReduce waits for the owner on CPU.
-                auto &tp = *threadTpOwner;
-                if (threadTpRank != 0)
-                    FastllmCudaEventRecordCurrentThread(tp.moeReady[threadTpRank]);
-                tp.Barrier();
-                if (threadTpRank == 0) {
-                    for (size_t r = 1; r < tp.devices.size(); ++r) {
-                        FastllmCudaSetDevice(tp.devices[r]);
-                        FastllmCudaCurrentThreadStreamWaitEvent(tp.moeReady[r]);
-                    }
-                    FastllmCudaSetDevice(tp.devices[0]);
-                }
-            } else {
-                FastllmCudaSyncCurrentThreadStream();
-                threadTpOwner->Barrier();
-            }
-            if (threadTpRank != 0) {
-                input.Reshape(outputDims);
-                output.Reshape(outputDims);
-                return;
-            }
+    void Glm5NextModel::RunSharedMoe(
+            int deviceLayer, const std::string &mlp, Data &input,
+            Data &output, bool &sharedReady) {
+        if (sharedReady) return;
+        if (GetCudaSharedExpert() || threadTpRank >= 0) {
+            ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
+        } else {
+            ApplyMoeDeviceMapForLayer(deviceLayer);
         }
-#endif
-        const std::vector<int> noDevices;
-        const auto &moeDevices = threadTpRank >= 0 ? threadTpOwner->devices : noDevices;
-        DiskMoeCudaDeviceScope diskDevices(moeDevices);
-#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        NumasMoeCudaAssistScope numaDevices(threadTpRank >= 0 ? &moeDevices : nullptr);
-        if (threadTpRank == 0 && routedOnNumas)
-            FastllmCudaPrepareMoeExpertCache(weights.data(), weights.size(), moeDevices);
-#endif
+        RunClampedMlp(input,
+            weight[mlp + "shared_experts.gateup_proj.weight"],
+            weight[mlp + "shared_experts.down_proj.weight"], output);
+        sharedReady = true;
+    }
+
+    void Glm5NextModel::RouteMoe(
+            int deviceLayer, const std::string &mlp, Data &input,
+            Data &routerInput, Data &routerScores, Data &expertIndex, Data &expertScore) {
         ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
-        Data routerInput, routerScores;
         ToDataType(input, routerInput, DataType::FLOAT32);
         Linear(routerInput, weight[mlp + "gate.weight"],
                Data(), routerScores);
         Sigmoid(routerScores, routerScores);
-        Data expertIndex, expertScore;
         SelectExpert(
             routerScores, expertIndex, expertScore,
             num_experts_per_tok, norm_topk_prob,
             routed_scaling_factor,
             &weight[mlp + "gate.e_score_correction_bias"]);
 
-        Data routedOutput;
-#if defined(USE_CUDA) && !defined(USE_ROCM)
-        if ((routedDevice == "cuda" || routedDevice.rfind("cuda:", 0) == 0) &&
-            weights.size() >= 4 && weights[2] && weights[2]->dataType == DataType::DATA_GGUF_FORMAT) {
-            runShared();
-            const int previous = FastllmCudaGetDevice();
-            struct RestoreDevice { int device; ~RestoreDevice() { FastllmCudaSetDevice(device); } } restore{previous};
-            const auto &owner = weights[2]->dataDeviceIds;
-            AssertInFastLLM(weights[2]->dataDevice == DataDevice::CUDA && owner.size() == 1,
-                "GLM GGUF resident experts must be loaded on one CUDA device.");
-            // Copy only activations when the MoE owner differs from the dense
-            // rank; the original TP input remains on its rank's device.
-            Data localInput, activation, workspace;
-            Data *routedInput = &input;
-            if (input.dataDevice != DataDevice::CUDA || input.dataDeviceIds != owner) {
-                localInput.CopyFrom(input);
-                localInput.ToDevice(DataDevice::CUDA, owner);
-                routedInput = &localInput;
-            }
-            expertIndex.ToDevice(DataDevice::CUDA, owner);
-            expertScore.ToDevice(DataDevice::CUDA, owner);
-            FastllmCudaSetDevice(owner[0]);
-            AssertInFastLLM(moeAtype == DataType::BFLOAT16 &&
-                FastllmCudaMergeMOEGlm5GGUFResident(*routedInput, activation, workspace,
-                    routedOutput, weights.data(), (int)weights.size(),
-                    static_cast<const int32_t *>(expertIndex.cudaData),
-                    static_cast<const float *>(expertScore.cudaData), num_experts_per_tok, swigluLimit),
-                "Unsupported GLM GGUF resident MoE dtype, quantization or shape.");
-            routedOutput.ToDevice(DataDevice::CUDA, output.dataDeviceIds);
-            FastllmCudaSetDevice(previous);
-            ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
-            AddTo(output, routedOutput);
-            input.Reshape(outputDims);
-            output.Reshape(outputDims);
-            return;
-        }
-#endif
-#if defined(USE_CUDA) && defined(USE_NUMAS)
-#ifndef USE_ROCM
-        if (sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH && input.dataType == DataType::BFLOAT16 &&
-            moeAtype == DataType::BFLOAT16 && routedOnNumas &&
-            FastllmCudaMergeMOEHybridOnDevices(input, expertIndex, expertScore, routedOutput,
-                weights.data(), (int)weights.size(), deviceLayer, moeDevices, runShared)) {
-            ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
-            AddTo(output, routedOutput);
-            input.Reshape(outputDims);
-            output.Reshape(outputDims);
-            return;
-        }
-#endif
-        const bool prefetchNumasSmallBatch =
-            sequence >= 1 &&
-            sequence <= kNumasMoePrefetchMaxRows &&
-            GetCudaSharedExpert() && routedOnNumas &&
-            std::getenv(
-                "FASTLLM_GLM5_DISABLE_NUMAS_MOE_OVERLAP") == nullptr;
-        if (prefetchNumasSmallBatch) {
-            PrefetchNumasMoeDecodeInput(
-                input, expertIndex, expertScore, deviceLayer);
-        }
-#endif
-
-        runShared();
-
-        Data w1, w2, w3, tempInput, tempOutput;
-        Data moeInputTemp, moeOutputTemp;
-#ifdef USE_CUDA
-        if (shardedRouted) ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
-        else
-#endif
-        ApplyMoeDeviceMapForLayer(deviceLayer);
-        MergeMOEBlock(
-            &input, &expertIndex, &expertScore,
-            &weights, &biases,
-            &w1, &w2, &w3, &tempInput, &tempOutput,
-            0.0f, &routedOutput, deviceLayer,
-            input.dataType, moeAtype,
-            &moeInputTemp, &moeOutputTemp,
-            MoeGateSwiglu, false, swigluLimit, true);
-
-        ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
-        AddTo(output, routedOutput);
-        input.Reshape(outputDims);
-        output.Reshape(outputDims);
     }
 
     int Glm5NextModel::Sample(
@@ -2699,6 +2576,18 @@ namespace fastllm {
                 CanUseNumasMoeExactSmallBatch(rows)) {
                 continue;
             }
+#ifndef USE_ROCM
+            if (moeDevice.rfind("numa", 0) == 0 && moeAtype == DataType::BFLOAT16 &&
+                layer < (int)expertWeights.size()) {
+                const auto &experts = expertWeights[layer];
+                // The prepared GGUF hybrid path preserves decode arithmetic
+                // on AVX2, including the multi-row TP expert-cache adapter.
+                if (CanUseNumasMoeExactGgufBatch(rows, experts.data(), (int)experts.size()) &&
+                    FastllmCudaCanRunMoeHybrid(const_cast<Data **>(experts.data()), (int)experts.size())) {
+                    continue;
+                }
+            }
+#endif
 #endif
             return false;
         }
@@ -2711,10 +2600,17 @@ namespace fastllm {
             TargetRuntimeCheckpoint &checkpoint) {
         if (threadTpState) {
             auto &tp = *threadTpState;
+#ifdef USE_CUDA
+            // ApplyDeviceMap changes executor routing, not the active CUDA device.
+            Glm5NextCudaDeviceScope restoreDevice;
+#endif
             std::lock_guard<std::mutex> lock(tp.forwardMutex);
             auto &caches = tp.requests.at(&pastKeyValues);
             checkpoint.ranks.resize(tp.ranks.size());
             for (size_t r = 0; r < tp.ranks.size(); ++r) {
+#ifdef USE_CUDA
+                FastllmCudaSetDevice(tp.devices[r]);
+#endif
                 ApplyDeviceMap(tp.ranks[r]->deviceMap, 0, block_cnt);
                 tp.ranks[r]->CaptureTargetRuntimeCheckpoint(r == 0 ? pastKeyValues : caches[r], checkpoint.ranks[r]);
 #ifdef USE_CUDA
@@ -2770,11 +2666,18 @@ namespace fastllm {
             int verificationInputs) {
         if (threadTpState) {
             auto &tp = *threadTpState;
+#ifdef USE_CUDA
+            // ApplyDeviceMap changes executor routing, not the active CUDA device.
+            Glm5NextCudaDeviceScope restoreDevice;
+#endif
             std::lock_guard<std::mutex> lock(tp.forwardMutex);
             auto &caches = tp.requests.at(&pastKeyValues);
             auto &replays = tp.replays.at(&pastKeyValues);
             AssertInFastLLM(checkpoint.ranks.size() == tp.ranks.size(), "GLM TP MTP checkpoint is incomplete.");
             for (size_t r = 0; r < tp.ranks.size(); ++r) {
+#ifdef USE_CUDA
+                FastllmCudaSetDevice(tp.devices[r]);
+#endif
                 ApplyDeviceMap(tp.ranks[r]->deviceMap, 0, block_cnt);
                 tp.ranks[r]->CommitTargetVerificationPrefix(r == 0 ? pastKeyValues : caches[r],
                     checkpoint.ranks[r], replays[r], committedInputs, verificationInputs);
@@ -2946,15 +2849,11 @@ namespace fastllm {
         // Draft layers run outside ForwardLayers. Give their experts the same
         // frequency policy and measured miss split, closing the step after
         // readers finish even if the forward throws.
-        struct DraftCache {
-            void *state = nullptr;
-            ~DraftCache() { FastllmCudaEndMoeDecode(state); }
-        };
-        DraftCache draftCache;
-        if (sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
+        HybridMoeDecodeStep draftCache;
+        if (executionMode == ExecutionMode::Hybrid && sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
             normalizedFfn.dataDevice == DataDevice::CUDA && !normalizedFfn.dataDeviceIds.empty()) {
             FastllmCudaSetDevice(normalizedFfn.dataDeviceIds[0]);
-            draftCache.state = FastllmCudaBeginMoeDecode(
+            draftCache.Begin(
                 mtpExpertWeights.data(), mtpExpertWeights.size(), num_experts_per_tok);
         }
 #endif
@@ -3252,6 +3151,11 @@ namespace fastllm {
         const bool useBatchedVerifier =
             CanUseExactBatchedMtpVerification(
                 (int)candidateTokens.size());
+        if (verbose && state.verifySteps == 0) {
+            std::cout << "[GLM-5.3 MTP verifier] mode="
+                      << (useBatchedVerifier ? "batched" : "sequential")
+                      << " rows=" << candidateTokens.size() << "\n";
+        }
 
 #ifdef USE_CUDA
         // Verification is logically a sequence of decode rows. Force every
@@ -3780,33 +3684,23 @@ namespace fastllm {
             const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
             std::vector<KdaReplayCapture> *kdaReplay,
             std::vector<Glm5NextIndexerCache> *indexer) {
-        const int sequence = hiddenStates.dims[1];
-        const int batch = (int)requestCaches.size();
-        AssertInFastLLM(batch == 1 || (batch == sequence &&
-            kdaReplay == nullptr && indexer == nullptr),
-            "GLM-5.3 batched layers require one decode token per request.");
-        Data hiddenStatesTemp;
-        Data *current = &hiddenStates;
-        Data *next = &hiddenStatesTemp;
-#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        // A layer-partitioned model owns one cache on each GPU. Advance each
-        // cache once per decode/verify batch and close it on every exit.
-        struct DecodeCaches {
-            std::map<int, void *> states;
-            ~DecodeCaches() {
-                for (const auto &state : states) FastllmCudaEndMoeDecode(state.second);
-            }
-        } decodeCaches;
-        const bool frequencyDecode = sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH;
-#endif
-        for (int layer = firstLayer; layer < endLayer; layer++) {
-            ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
-            const std::string prefix = languagePrefix + "layers." +
-                std::to_string(layer) + ".";
+        if (executionMode == ExecutionMode::Gpu)
+            ForwardGpuLayers(hiddenStates, firstLayer, endLayer, requestCaches, kdaReplay, indexer);
+        else
+            ForwardHybridLayers(hiddenStates, firstLayer, endLayer, requestCaches, kdaReplay, indexer);
+    }
 
+    void Glm5NextModel::RunAttentionBlock(
+            int layer, const std::string &prefix, Data &input, Data &output,
+            const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
+            std::vector<KdaReplayCapture> *kdaReplay,
+            std::vector<Glm5NextIndexerCache> *indexer) {
+        const int sequence = input.dims[1];
+        const int batch = requestCaches.size();
+        auto runAttention = [&](Data &input, Data &output) {
             Data normalizedAttention, attentionPost, attentionComb;
             Glm5NextHcPreNorm(
-                *current, weight[prefix + "hc_attn_fn"],
+                input, weight[prefix + "hc_attn_fn"],
                 weight[prefix + "hc_attn_scale"],
                 weight[prefix + "hc_attn_base"],
                 weight[prefix + "input_layernorm.weight"], hcMult,
@@ -3823,10 +3717,10 @@ namespace fastllm {
                 // The optional expanded-cache backend retains its existing
                 // request-local attention implementation.
                 for (int row = 0; row < batch; ++row) {
-                    Data input, output;
-                    ViewGlm5NextRows(normalizedAttention, row, 1, input);
-                    RunSparseAttention(layer, input, 1, *requestCaches[row], output);
-                    AppendGlm5NextRows(attentionOutput, output, batch);
+                    Data rowInput, rowOutput;
+                    ViewGlm5NextRows(normalizedAttention, row, 1, rowInput);
+                    RunSparseAttention(layer, rowInput, 1, *requestCaches[row], rowOutput);
+                    AppendGlm5NextRows(attentionOutput, rowOutput, batch);
                 }
             } else {
                 RunSparseAttention(layer, normalizedAttention, sequence,
@@ -3834,53 +3728,38 @@ namespace fastllm {
                     indexer == nullptr ? nullptr : &(*indexer)[layer]);
             }
             ThreadTpAllReduce(attentionOutput);
-            DeepSeekV4HcPost(
-                attentionOutput, *current,
-                attentionPost, attentionComb, *next);
-            std::swap(current, next);
-
-            Data normalizedFfn, ffnPost, ffnComb;
-            Glm5NextHcPreNorm(
-                *current, weight[prefix + "hc_ffn_fn"],
-                weight[prefix + "hc_ffn_scale"],
-                weight[prefix + "hc_ffn_base"],
-                weight[prefix + "post_attention_layernorm.weight"], hcMult,
-                hcSinkhornIters, hcEps, rms_norm_eps,
-                normalizedFfn, ffnPost, ffnComb);
-            Data ffnOutput;
-            if (denseMlpLayers[layer]) {
-                RunClampedMlp(
-                    normalizedFfn,
-                    weight[prefix + "mlp.gateup_proj.weight"],
-                    weight[prefix + "mlp.down_proj.weight"],
-                    ffnOutput);
-            } else {
-#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-                auto &experts = expertWeights[layer];
-                if (threadTpRank <= 0 && frequencyDecode && normalizedFfn.dataDevice == DataDevice::CUDA &&
-                    !normalizedFfn.dataDeviceIds.empty() && experts.size() >= 4 && experts[2] &&
-                    (experts[2]->dataType == DataType::DATA_GGUF_FORMAT ||
-                     experts[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED)) {
-                    const int device = normalizedFfn.dataDeviceIds[0];
-                    if (decodeCaches.states.count(device) == 0) {
-                        FastllmCudaSetDevice(device);
-                        if (void *state = FastllmCudaBeginMoeDecode(
-                                experts.data(), experts.size(), num_experts_per_tok,
-                                threadTpRank >= 0 ? &threadTpOwner->devices : nullptr)) {
-                            decodeCaches.states.emplace(device, state);
-                        }
-                    }
-                }
+            DeepSeekV4HcPost(attentionOutput, input, attentionPost, attentionComb, output);
+        };
+#ifdef USE_CUDA
+        if (threadTpRank >= 0 && sequence == 1 && batch == 1 && kdaLayers[layer] &&
+            kdaReplay == nullptr && threadTpOwner->activeGraphs) {
+            Data graphOutput;
+            threadTpOwner->RunKdaGraph(threadTpRank, layer, input, graphOutput, runAttention);
+            output.CopyFrom(graphOutput);
+        } else
 #endif
-                RunMoe(layer, normalizedFfn, sequence, ffnOutput);
-            }
-            ThreadTpAllReduce(ffnOutput);
-            DeepSeekV4HcPost(
-                ffnOutput, *current, ffnPost, ffnComb, *next);
-            std::swap(current, next);
+        {
+            runAttention(input, output);
         }
-        // Each layer swaps twice, so the final residual remains in the
-        // caller-owned buffer. No tensor ownership crosses a worker boundary.
+    }
+
+    void Glm5NextModel::PrepareFfnBlock(
+            const std::string &prefix, Data &input, Data &normalizedFfn,
+            Data &ffnPost, Data &ffnComb) {
+        Glm5NextHcPreNorm(
+            input, weight[prefix + "hc_ffn_fn"],
+            weight[prefix + "hc_ffn_scale"],
+            weight[prefix + "hc_ffn_base"],
+            weight[prefix + "post_attention_layernorm.weight"], hcMult,
+            hcSinkhornIters, hcEps, rms_norm_eps,
+            normalizedFfn, ffnPost, ffnComb);
+    }
+
+    void Glm5NextModel::FinishFfnBlock(
+            Data &ffnOutput, Data &input, Data &ffnPost, Data &ffnComb, Data &output) {
+        ThreadTpAllReduce(ffnOutput);
+        DeepSeekV4HcPost(
+            ffnOutput, input, ffnPost, ffnComb, output);
     }
 
     int Glm5NextModel::ForwardOutput(

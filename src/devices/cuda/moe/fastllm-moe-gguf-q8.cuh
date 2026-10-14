@@ -413,7 +413,8 @@ template<ggml_type Type> struct Format {
 template<ggml_type Type, int ThreadsPerRow = 32, bool Packed = false>
 __device__ __forceinline__ float RowDot(const void *weight, const block_q8_1 *x,
                                       int columns, const uint64_t *grid, int packedRow = 0) {
-    static_assert(ThreadsPerRow == 32 || (ThreadsPerRow == 8 && Type == GGML_TYPE_Q2_0));
+    static_assert(ThreadsPerRow == 32 || (ThreadsPerRow == 8 && Type == GGML_TYPE_Q2_0) ||
+        (ThreadsPerRow == 16 && (Type == GGML_TYPE_IQ4_NL || Type == GGML_TYPE_IQ4_XS)));
     using F = Format<Type>;
     float sum = 0;
     for (int k = threadIdx.x % ThreadsPerRow; k < columns/32; k += ThreadsPerRow) {
@@ -427,8 +428,13 @@ __device__ __forceinline__ float RowDot(const void *weight, const block_q8_1 *x,
             sum += DotIQ3XXS<Packed>(weight, xb, b, part, reinterpret_cast<const uint32_t *>(grid), packedRow);
         else if constexpr (Type == GGML_TYPE_IQ3_S)
             sum += DotIQ3S(weight, xb, b, part, reinterpret_cast<const uint32_t *>(grid));
-        else if constexpr (Type == GGML_TYPE_IQ4_NL || Type == GGML_TYPE_IQ4_XS)
-            sum += DotIQ4<Type>(weight, xb, b, part);
+        else if constexpr (Type == GGML_TYPE_IQ4_NL || Type == GGML_TYPE_IQ4_XS) {
+            if constexpr (ThreadsPerRow == 16)
+                // Up to 32 Q8 blocks: combine k and k+16 before the remaining
+                // shuffle stages, preserving the full-warp reduction tree.
+                sum = __fadd_rn(sum, DotIQ4<Type>(weight, xb, b, part));
+            else sum += DotIQ4<Type>(weight, xb, b, part);
+        }
         else if constexpr (ThreadsPerRow == 8) {
             // With at most sixteen Q8 blocks this combines k and k+8,
             // exactly the first nonzero stage of the full-warp reduction.

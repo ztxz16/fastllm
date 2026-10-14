@@ -1,9 +1,10 @@
 #ifndef FASTLLM_GLM5_NEXT_TP_H
 #define FASTLLM_GLM5_NEXT_TP_H
 
-#include "utils/persistent_worker_group.h"
+#include "glm5_next_tp_state.h"
 #ifdef USE_CUDA
 #include "devices/multicuda/fastllm-multicuda.cuh"
+#include "devices/cuda/cudaworkspace.h"
 #endif
 #include <condition_variable>
 #include <chrono>
@@ -13,61 +14,14 @@
 #endif
 
 namespace fastllm {
-    struct Glm5NextModel::ThreadTpState {
-        using Cache = std::vector<std::pair<Data, Data>>;
-        std::vector<int> devices;
-        std::vector<std::vector<int>> workerCpus;
-        std::vector<unsigned char> workerBoundToSpareCores;
-        std::vector<std::unique_ptr<Glm5NextModel>> ranks;
-        std::map<const Cache *, std::vector<Cache>> requests;
-        std::map<const Cache *, std::vector<std::vector<KdaReplayCapture>>> replays;
-        std::mutex forwardMutex, barrierMutex;
-        std::condition_variable barrierCv;
-        unsigned generation = 0;
-        int arrived = 0;
-        bool failed = false;
-        PersistentWorkerGroup workers;
-        std::vector<void *> moeReady;
-        std::vector<bool> shardedMoeLayers;
-        int loadingLayer = -1;
-
-        ~ThreadTpState() {
-            workers.Stop();
 #ifdef USE_CUDA
-            const int previous = FastllmCudaGetDevice();
-            for (size_t r = 0; r < moeReady.size(); ++r) if (moeReady[r]) {
-                FastllmCudaSetDevice(devices[r]);
-                FastllmCudaEventDestroy(moeReady[r]);
-            }
-            FastllmCudaSetDevice(previous);
+    namespace {
+        struct Glm5NextCudaDeviceScope {
+            int previous = FastllmCudaGetDevice();
+            ~Glm5NextCudaDeviceScope() { FastllmCudaSetDevice(previous); }
+        };
+    }
 #endif
-        }
-
-        void Abort() {
-            std::lock_guard<std::mutex> lock(barrierMutex);
-            failed = true;
-            barrierCv.notify_all();
-        }
-
-        void Barrier() {
-            std::unique_lock<std::mutex> lock(barrierMutex);
-            if (failed) throw std::runtime_error("GLM TP peer failed");
-            unsigned previous = generation;
-            if (++arrived == (int)devices.size()) {
-                arrived = 0;
-                ++generation;
-                barrierCv.notify_all();
-            } else if (!barrierCv.wait_for(lock, std::chrono::seconds(120), [&] {
-                    return failed || generation != previous;
-                })) {
-                failed = true;
-                barrierCv.notify_all();
-                throw std::runtime_error("GLM TP rank rendezvous timed out");
-            }
-            if (failed) throw std::runtime_error("GLM TP peer failed");
-        }
-    };
-
     void Glm5NextModel::InitThreadTp() {
 #ifdef USE_CUDA
         if (threadTpRank >= 0 || threadTpState) return;
@@ -149,10 +103,7 @@ namespace fastllm {
             (expertLayer >= 0 && !threadTpState->shardedMoeLayers[expertLayer])) return;
         auto &devices = threadTpState->devices;
         const int count = devices.size();
-        struct RestoreDevice {
-            int previous = FastllmCudaGetDevice();
-            ~RestoreDevice() { FastllmCudaSetDevice(previous); }
-        } restore;
+        Glm5NextCudaDeviceScope restore;
         auto equalScheme = [&](int width, int parts = 1) {
             AssertInFastLLM(width % count == 0, "GLM TP weight dimension is not divisible.");
             DivisionScheme scheme;
@@ -284,9 +235,18 @@ namespace fastllm {
         }
 #endif
         AssertInFastLLM(FastllmInitNccl(devices), "GLM TP NCCL initialization failed.");
+        tp.reductionBuffers.resize(count);
+        for (auto &buffers : tp.reductionBuffers) buffers.resize(8);
+#ifdef USE_NUMAS
+        for (int layer = 0; layer < block_cnt; ++layer) if (!denseMlpLayers[layer]) {
+            auto &experts = expertWeights[layer];
+            FastllmCudaPrepareMoeTensorParallel(experts.data(), experts.size(), devices);
+        }
+#endif
         for (int d : devices) {
             FastllmCudaSetDevice(d);
             tp.moeReady.push_back(d == devices[0] ? nullptr : FastllmCudaEventCreate());
+            tp.callerReady.push_back(FastllmCudaEventCreate());
             AssertInFastLLM(FastllmCudaGraphPrepareCaptureDevice(),
                 "GLM TP CUDA device initialization failed.");
         }
@@ -308,6 +268,7 @@ namespace fastllm {
             model->moeDeviceMap = moeDeviceMap;
             model->layeredMoeDeviceMap = layeredMoeDeviceMap;
             model->moeDeviceLayers = moeDeviceLayers;
+            model->InitExecutionMode();
             model->expertWeights = expertWeights;
             model->expertBiases = expertBiases;
             tp.ranks.push_back(std::move(model));
@@ -323,10 +284,12 @@ namespace fastllm {
                 (expertLayer >= 0 && !tp.shardedMoeLayers[expertLayer])) continue;
             if (name == languagePrefix + "embed_tokens.weight") {
                 source.ToDevice(DataDevice::CPU);
+                // Rank zero borrows this storage. The coordinator's MTP draft
+                // must not migrate its owner and invalidate the CPU view.
+                source.lockInCPU = true;
                 auto &local = tp.ranks[0]->weight[name];
                 local = source;
                 local.isFake = true;
-                local.lockInCPU = true;
                 continue;
             }
             StageThreadTpWeight(name);
@@ -417,6 +380,20 @@ namespace fastllm {
             (rows > 1 && rows < (uint64_t)FastllmCudaGetLinearExactBatchThreshold());
         const int hostSpinUs = decodeOrVerify &&
             threadTpOwner->workerBoundToSpareCores[threadTpRank] ? 1000 : 0;
+        // Reuse the existing correctness-tested, topology-tuned peer path.
+        // Unsupported messages retain NCCL and its submission rendezvous.
+        if (decodeOrVerify && rows <= 8) {
+            // Keep a stable pointer tuple for each verification width. Registering transient
+            // layer outputs drains both devices and pins allocator blocks.
+            auto &buffer = threadTpOwner->reductionBuffers[threadTpRank][rows - 1];
+            buffer.CopyFrom(data);
+            if (FastllmCudaCustomAllReduceWithSpin(buffer.cudaData, buffer.cudaData, buffer.Count(0), buffer.dataType,
+                    threadTpOwner->devices[threadTpRank], hostSpinUs)) {
+                AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                    data.cudaData, buffer.cudaData, data.GetBytes()), "GLM TP reduction copy failed.");
+                return;
+            }
+        }
         FastllmNcclAllReduceNoCustomWithSpin(data.cudaData, data.cudaData, data.Count(0), data.dataType,
             threadTpOwner->devices[threadTpRank], hostSpinUs);
 #endif
@@ -428,6 +405,9 @@ namespace fastllm {
         std::lock_guard<std::mutex> lock(tp.forwardMutex);
         auto it = tp.requests.find(key);
         if (it == tp.requests.end()) return;
+#ifdef USE_CUDA
+        tp.graphs.erase(key);
+#endif
         for (size_t r = 0; r < tp.ranks.size(); ++r)
             tp.ranks[r]->indexerCaches.erase(r == 0 ? key : &it->second[r]);
         tp.replays.erase(key);
@@ -458,12 +438,34 @@ namespace fastllm {
             caches.resize(tp.devices.size());
             for (size_t r = 1; r < caches.size(); ++r) caches[r].resize(block_cnt);
         }
+        tp.activeGraphs = nullptr;
+        if (GetFastllmEnv().cudaGraph && !mtpEnabled && inputIds.dims[1] == 1 && kdaReplay == nullptr) {
+            auto &graphs = tp.graphs[&pastKeyValues];
+            if (graphs.empty()) {
+                graphs.resize(block_cnt);
+                for (int layer = 0; layer < block_cnt; ++layer) if (kdaLayers[layer])
+                    graphs[layer] = std::make_unique<ThreadTpState::KdaGraphLayer>(tp.devices);
+            }
+            tp.activeGraphs = &graphs;
+        }
         auto &replays = tp.replays[&pastKeyValues];
         if (kdaReplay) {
             replays.resize(tp.devices.size());
-            for (auto &replay : replays) { replay.clear(); replay.resize(block_cnt); }
+            for (auto &replay : replays) replay.resize(block_cnt);
         }
         const int exactThreshold = FastllmCudaGetLinearExactBatchThreshold();
+        // MTP produces input slices and restores recurrent state on the caller's
+        // per-thread streams. A host worker rendezvous does not publish that
+        // CUDA work. Fence each producer stream before its TP rank consumes it.
+        const bool publishCaller = mtpEnabled || inputIds.dataDevice == DataDevice::CUDA;
+        if (publishCaller) {
+            const int previous = FastllmCudaGetDevice();
+            for (size_t r = 0; r < tp.devices.size(); ++r) {
+                FastllmCudaSetDevice(tp.devices[r]);
+                FastllmCudaEventRecordCurrentThread(tp.callerReady[r]);
+            }
+            FastllmCudaSetDevice(previous);
+        }
         std::vector<Data> hidden(tp.devices.size());
         std::vector<std::exception_ptr> errors(tp.devices.size());
         int result = 0;
@@ -478,6 +480,7 @@ namespace fastllm {
             }
 #endif
             FastllmCudaSetDevice(tp.devices[r]);
+            if (publishCaller) FastllmCudaCurrentThreadStreamWaitEvent(tp.callerReady[r]);
             struct RestoreExactThreshold {
                 int old = FastllmCudaGetLinearExactBatchThreshold();
                 ~RestoreExactThreshold() { FastllmCudaSetLinearExactBatchThreshold(old); }

@@ -1,0 +1,77 @@
+#ifndef FASTLLM_DEEPSEEKV41_EXECUTION_H
+#define FASTLLM_DEEPSEEKV41_EXECUTION_H
+#include "utils/hybrid_moe.h"
+
+#include "deepseekv41.h"
+#include <functional>
+
+namespace fastllm {
+    struct DeepSeekV41DecodeWorkspace {
+        Data hiddenStates, hiddenTemp, preMix, dsparkPreMix;
+        int preMixSeqlen = -1;      // preMix 只在长度变化时重建（内容是常量 one-hot）
+        Data attnPre, attnPost, attnComb, ffnPre, ffnPost, ffnComb;
+        Data x, attnInput, qr, qNorm, q, kv, attnOut, woAOut, attnProj;
+        Data attnInputFloat, rawKVAll, rawScoreAll, qIdxAll, idxWeights, idxWeightsAll;
+        Data ffnInput, ffnOut, gateInput, gateLogits, expertIndex, expertScore;
+        Data sharedGateup, sharedSwiglu, sharedExpertOut;
+        Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
+        Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
+        struct MoeCacheWorkspace { Data index, score, output; };
+        std::map<int, MoeCacheWorkspace> moeCache;
+        Data quantizedActivation;
+        Data attnInputQuantized, qNormQuantized;
+        // TP and CUDA graphs retain one buffer per weight.
+        std::map<std::string, Data> quantizedActivations;
+    };
+
+    // A decode policy must end before the head, and also on exception unwinding.
+    struct DeepSeekV41MoeContext {
+        DeepSeekV41DecodeWorkspace &workspace;
+        HybridMoeDecodeStep &step;
+        std::vector<Data *> &moeWeights;
+        const std::vector<int> &tpDevices;
+        int layer, seqlen;
+        bool tp, single, dsparkVerify, graphActive, dumpDebug, hasSharedExpertOut;
+        bool verifyAllTokens;
+        std::function<void()> runSharedSegment;
+        std::function<void()> releaseSharedScratch;
+    };
+
+    // Tensor-copy helpers shared with attention/KV code. They preserve graph
+    // addresses and know when TP roots contain metadata rather than payloads.
+    void V41Assign(Data &, const Data &, const std::vector<int> &);
+    void V41ReplicaToCpu(Data &, const Data &, const std::vector<int> &);
+#ifdef USE_CUDA
+    void V41ResetMultiDevice(Data &);
+    void V41SyncRootFromReplica(Data &, const std::vector<int> &);
+#endif
+    bool V41EnvFlag(const char *);
+    bool V41DeviceSpecUsesType(const std::string &, const std::string &);
+    bool V41DeviceMapUsesCuda(const std::map<std::string, int> &);
+    int V41DeviceMapCudaDeviceCount(const std::map<std::string, int> &);
+} // namespace fastllm
+
+namespace fastllm {
+struct DeepSeekV41Model::ForwardState {
+    std::unique_ptr<ForwardWorkspace> work;
+    ForwardState(DeepSeekV41Model &model, const std::vector<DeepSeekV41Segment> &inputSegments,
+                                                       const Data &inputIds,
+                                                       const Data *inputEmbeds,
+                                                       const std::vector<int> *imageMask,
+                                                       const std::vector<GenerationConfig> &generationConfigsIn,
+                                                       const LastTokensManager &lastTokens,
+                                                       std::vector<std::vector<float>*> *retLogits,
+                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues);
+    ~ForwardState();
+    int Layers() const;
+    void BeginLayer(int layer);
+    void EndLayer(int layer);
+    void GpuExperts(int layer);
+    void HybridExperts(int layer);
+    void BeginHybridStep();
+    void PrepareInputs();
+    std::vector<int> Finish();
+};
+}
+
+#endif // FASTLLM_DEEPSEEKV41_EXECUTION_H

@@ -1,4 +1,5 @@
 #include "fastllm.h"
+#include "devices/cuda/fastllm-fp8-small-t.cuh"
 #include "executor.h"
 #include "devices/cuda/fastllm-cuda-fp8-linear-add.h"
 #include <cuda_fp16.h>
@@ -180,13 +181,15 @@ template <class T> void Run(DataType type, int K, bool hasBias, int N = 5120, in
     cudaGraphExecDestroy(exec);
     cudaGraphDestroy(graph);
     // Unsupported batches must remain in the original complete LinearAdd path.
-    Data bx(type, {1, 9, K}), bo(type, {1, 9, N}), bm(type);
+    const int fallbackRows = type == DataType::FLOAT16 && K % 256 == 0 &&
+                                     fastllm::fp8small::UseSm75Mma(0) ? 33 : 9;
+    Data bx(type, {1, fallbackRows, K}), bo(type, {1, fallbackRows, N}), bm(type);
     Allocate(bx);
     Allocate(bo);
-    std::vector<T> bxx(9 * K, T(.01f)), boo(9 * N, T(.1f));
+    std::vector<T> bxx(fallbackRows * K, T(.01f)), boo(fallbackRows * N, T(.1f));
     Upload(bx, bxx);
     Upload(bo, boo);
-    Require(!FastllmCudaFP8LinearAddCanRun(bx, w, bias, bo), "batch nine admitted");
+    Require(!FastllmCudaFP8LinearAddCanRun(bx, w, bias, bo), "unsupported batch admitted");
     op.RunOnDevice("cuda", "LinearAdd",
                    {{"input", &bx}, {"weight", &w}, {"bias", &bias}, {"middle", &bm}, {"output", &bo}}, {},
                    {});
@@ -201,7 +204,7 @@ template <class T> void Run(DataType type, int K, bool hasBias, int N = 5120, in
                    {});
     Check(cudaDeviceSynchronize());
     auto disabled = Download<T>(bo);
-    Require(!std::memcmp(fallback.data(), disabled.data(), 9 * N * sizeof(T)), "batch fallback differs");
+    Require(!std::memcmp(fallback.data(), disabled.data(), fallbackRows * N * sizeof(T)), "batch fallback differs");
     // K=256 is valid for generic LinearAdd, but below this fusion's minimum reduction width.
     w.Resize({N, 256});
     w.blockM = 256;
@@ -321,6 +324,10 @@ int main(int argc, char **argv) {
         }
         SmallRows<half>(DataType::FLOAT16, 5, 513, 768);
         SmallRows<__nv_bfloat16>(DataType::BFLOAT16, 7, 513, 768);
+        if (fastllm::fp8small::UseSm75Mma(0)) {
+            for (int M = 9; M <= 32; ++M)
+                SmallRows<half>(DataType::FLOAT16, M, 513, 768);
+        }
         puts("ALL PASS");
     } catch (const std::exception &e) {
         fprintf(stderr, "FAIL: %s\n", e.what());

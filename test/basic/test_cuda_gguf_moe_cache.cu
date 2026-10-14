@@ -1,6 +1,7 @@
 #include "fastllm.h"
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/cuda/fastllm-moe-prefetch.h"
 #include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "gguf.h"
@@ -531,8 +532,8 @@ template<class T> static void RunRoutedBatch(ggml_type gateType, ggml_type downT
     int numaGateType = -1, numaDownType = -1;
     Data input(dtype, {rows, hidden}), gate(dtype, {routes, inter}), output(dtype, {rows, hidden});
     Data slots(INT32, {routes}), map(INT32, {routes}), scores(FLOAT32, {routes});
-    Data partial(FLOAT32, {routes, hidden});
-    for (auto *d : {&records, &workspace, &input, &gate, &output, &slots, &map, &scores, &partial}) Gpu(*d);
+    Data partial(FLOAT32, {routes, hidden}), activeCount(INT32, {1});
+    for (auto *d : {&records, &workspace, &input, &gate, &output, &slots, &map, &scores, &partial, &activeCount}) Gpu(*d);
     if (numa) Gpu(numaRecords);
     for (int e = 0; e < experts; ++e) {
         auto g = Weight(gateType, 2 * inter, hidden, 11 * e + 1, true);
@@ -600,6 +601,48 @@ template<class T> static void RunRoutedBatch(ggml_type gateType, ggml_type downT
         Require(actual == reference, "compact dispatch changed expert arithmetic or row mapping");
         Require(previous.empty() || actual != previous, "compact dispatch reused stale input");
         previous = actual;
+        // Reuse one graph as the live route count shrinks and grows, including
+        // zero. Poison inactive descriptors so a stale count cannot silently
+        // overwrite another expert or read a valid but unintended record.
+        view.routeSlots = static_cast<int32_t *>(slots.cudaData);
+        view.routeMap = static_cast<int32_t *>(map.cudaData);
+        view.routeCount = routes;
+        view.q8InputPrepared = false;
+        view.activeRouteCount = static_cast<int32_t *>(activeCount.cudaData);
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        const float untouched = 1234.25f;
+        for (int count : {0, 1, routes, topk, routes - 1, 0, routes}) {
+            auto liveSlots = compactSlots, liveRoutes = compactRoutes;
+            std::fill(liveSlots.begin() + count, liveSlots.end(), 0x7fffffff);
+            std::fill(liveRoutes.begin() + count, liveRoutes.end(), 0x7fffffff);
+            std::vector<float> expected(actual.size(), untouched);
+            for (int i = 0; i < count; ++i)
+                std::copy_n(reference.data() + compactRoutes[i] * hidden, hidden,
+                            expected.data() + compactRoutes[i] * hidden);
+            std::fill(actual.begin(), actual.end(), untouched);
+            Cuda(cudaMemcpy(slots.cudaData, liveSlots.data(), routes * sizeof(int32_t), cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(map.cudaData, liveRoutes.data(), routes * sizeof(int32_t), cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(activeCount.cudaData, &count, sizeof(count), cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(partial.cudaData, actual.data(), actual.size() * sizeof(float), cudaMemcpyHostToDevice));
+            if (!exec) {
+                auto compute = [&] {
+                    Require(FastllmCudaMoeGGUFCacheCompute(input, gate, output, view,
+                        static_cast<float *>(scores.cudaData), topk,
+                        static_cast<float *>(partial.cudaData)), "dynamic compact batch rejected");
+                };
+                compute();
+                Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+                compute();
+                Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+                Cuda(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+            }
+            Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+            Cuda(cudaMemcpy(actual.data(), partial.cudaData, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            Require(actual == expected, "dynamic graph changed active routes or touched inactive routes");
+        }
+        Cuda(cudaGraphExecDestroy(exec));
+        Cuda(cudaGraphDestroy(graph));
         Require(!FastllmCudaMoeGGUFCacheCompute(input, gate, output, view,
             static_cast<float *>(scores.cudaData), topk, nullptr), "compact dispatch accepted a dense reduction");
     }
@@ -952,23 +995,47 @@ template<class T> static void RunHost(ggml_type type, fastllm::DataType dtype,
     Require(!launch(),"host uploads admitted during graph capture");
     Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph)); Cuda(cudaGraphDestroy(graph));
     if (batch >= 1024) {
+        Require(!FastllmCudaPrefetchMoeGGUFHost(table.data(), experts), "cold prefetch admitted");
         // Grow a previously used transfer/compute arena. The previous DMA
         // must finish before its backing allocation can be released.
         input.Resize({33, hidden});
         Require(launch(), "host prefill growth warmup rejected");
         input.Resize({batch, hidden});
     }
-    for (int pass = 0; pass < 3; ++pass) {
+    for (int pass = 0; pass < (batch >= 1024 ? 4 : 3); ++pass) {
         selected = pass == 0 ? std::unordered_set<int>{1,3} :
             pass == 1 ? std::unordered_set<int>{2,4} : std::unordered_set<int>{1,2,3,4};
-        if (pass == 2) for (int e = 1; e <= experts; ++e) selected.insert(e);
+        if (pass >= 2) for (int e = 1; e <= experts; ++e) selected.insert(e);
         // Alias two immutable NUMA shards; restore ownership before assertions.
         std::vector<uint8_t *> originals;
         for (auto &w : owned) {
             originals.push_back(w->cpuData);
             if (pass) { w->numasData = {w->cpuData,w->cpuData+w->GetBytes()/2}; w->cpuData = nullptr; }
         }
+        std::vector<uint8_t *> pinned;
+        if (pass == 3) {
+            for (size_t i = 0; i < owned.size(); ++i) {
+                auto &w = *owned[i]; uint8_t *p = nullptr;
+                Cuda(cudaHostAlloc(&p, w.GetBytes(), cudaHostAllocPortable));
+                std::memcpy(p, originals[i], w.GetBytes());
+                w.numasData = {p, p + w.GetBytes() / 2};
+                pinned.push_back(p);
+            }
+            Require(FastllmCudaPrefetchMoeGGUFHost(table.data(), experts), "pinned prefetch rejected");
+            // Reuse while the previous DMA may still be pending.
+            Require(FastllmCudaPrefetchMoeGGUFHost(table.data(), experts), "prefetch reuse rejected");
+            // Exercise consumer ordering across streams, then the empty
+            // prefetch state after clearing the completed uploads below.
+            FastllmCudaWaitMoeGGUFHostPrefetch(cudaStreamPerThread);
+        } else if (batch >= 1024 && pass == 1) {
+            Require(!FastllmCudaPrefetchMoeGGUFHost(table.data(), experts), "pageable prefetch admitted");
+        }
         const bool ok = launch();
+        if (pass == 3) {
+            FastllmCudaClearMoeGGUFHostPrefetch();
+            FastllmCudaWaitMoeGGUFHostPrefetch(cudaStreamPerThread);
+        }
+        for (auto *p : pinned) Cuda(cudaFreeHost(p));
         for (size_t i = 0; i < owned.size(); ++i) {
             owned[i]->cpuData = originals[i]; owned[i]->numasData.clear();
         }
@@ -985,6 +1052,7 @@ template<class T> static void RunHost(ggml_type type, fastllm::DataType dtype,
                 "host packed weights were modified");
         }
     }
+    FastllmCudaClearMoeGGUFHostPrefetch();
     std::printf("PASS GGUF host type=%d dtype=%d rows=%d inter=%d cross=%d device=%d\n",type,dtype,batch,inter,cross,device);
 }
 
@@ -1110,7 +1178,7 @@ static void RunSharedGGUFRecords() {
 
 static void RunHybrid(ggml_type format, int rows, bool single = false, bool frequency = false,
                       fastllm::DataType inputType = fastllm::FLOAT32, bool noCache = false,
-                      bool large = false, bool verifyDynamic = false) {
+                      bool large = false, bool verifyDynamic = false, bool stableWidth = false) {
     using namespace fastllm;
     constexpr int experts = 24, topk = 7, steps = 18;
     int hidden = 256;
@@ -1125,7 +1193,8 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
     size_t stride = 0;
     for (int layer = 0; layer < 2; ++layer) {
         const int inter = large ? 768 + layer * 256 : (layer + 1) * 256;
-        const int width = large ? 2560 + layer * 512 : (layer + 1) * 256;
+        const int width = stableWidth ? (large ? 2560 : 256) :
+            (large ? 2560 + layer * 512 : (layer + 1) * 256);
         tables[layer].resize(2 * (experts + 1));
         if (noCache) oracleTables[layer].resize(tables[layer].size());
         for (int e = 0; e < experts; ++e) for (int part = 0; part < 2; ++part) {
@@ -1165,6 +1234,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
         Require(CanRunNumasMoeDecodeExperts(table.data(), table.size()), "GGUF CPU subset unavailable");
     std::shared_ptr<FastllmCudaMoeExpertParallel> context;
     if (!single) context = FastllmCudaCreateMoeExpertParallel(ranks);
+    const bool peerAccess = !single && FastllmCudaPeerAccessInit({0, 1});
     Data input[2]{{inputType, {rows, hidden}}, {inputType, {rows, hidden}}}, output[2], referenceInput;
     for (int rank = 0; rank < ranks; ++rank) {
         Cuda(cudaSetDevice(rank)); input[rank].ToDevice(CUDA, std::vector<int>{rank}); input[rank].Allocate(false);
@@ -1339,10 +1409,24 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
             Cuda(cudaMemcpy(ids.cudaData,route.data(),route.size()*4,cudaMemcpyHostToDevice));
         }
         Cuda(cudaMemcpy(scores.cudaData, score.data(), score.size()*4, cudaMemcpyHostToDevice));
+        // PP attention ownership alternates without changing physical expert
+        // ownership. Verify both routing roots against the same CPU/GPU oracle.
+        const int routingRank = single ? 0 : step % ranks;
+        Data movedIds, movedScores;
+        if (routingRank != 0) {
+            movedIds.CopyFrom(ids); movedScores.CopyFrom(scores);
+            movedIds.ToDevice(CUDA, std::vector<int>{routingRank});
+            movedScores.ToDevice(CUDA, std::vector<int>{routingRank});
+        }
+        const Data &routedIds = routingRank == 0 ? ids : movedIds;
+        const Data &routedScores = routingRank == 0 ? scores : movedScores;
         std::exception_ptr errors[2]; bool accepted[2]{};
         auto run = [&](int rank) {
             try {
                 Cuda(cudaSetDevice(rank)); Data empty;
+                // Alternate local and peer inputs, exercising both PP routing
+                // owners and FP32/FP16/BF16 conversion against the same oracle.
+                const Data &rankInput = peerAccess && step % 4 >= 2 ? input[routingRank] : input[rank];
                 Data sharedScratch(FLOAT32, {1, hidden}); Gpu(sharedScratch);
                 int callbacks = 0;
                 auto parallel = [&] {
@@ -1355,13 +1439,13 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                         table.data(), table.size(), layer, parallel) && callbacks == 0,
                         "rejected hybrid launched its shared branch");
                 }
-                if (!single && step == 0 && inputType != FLOAT32) {
+                if (!single && step < ranks && inputType != FLOAT32) {
                     Data invalidIds;
-                    invalidIds.FakeFrom(ids, 0);
+                    invalidIds.FakeFrom(routedIds, 0);
                     invalidIds.Resize({rows, 0});
-                    Require(!FastllmCudaMergeMOEExpertParallel(*context, rank, input[rank],
-                        rank == 0 ? invalidIds : empty, rank == 0 ? scores : empty,
-                        output[rank], table.data(), table.size(), layer, [] {}),
+                    Require(!FastllmCudaMergeMOEExpertParallel(*context, rank, rankInput,
+                        rank == routingRank ? invalidIds : empty, rank == routingRank ? routedScores : empty,
+                        output[rank], table.data(), table.size(), layer, [] {}, routingRank),
                         "EP accepted invalid routes");
                 }
                 cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
@@ -1405,9 +1489,35 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                     }
                 } else if (single) accepted[rank] = FastllmCudaMergeMOEHybrid(input[rank], ids, scores, output[rank],
                     table.data(), table.size(), layer, parallel);
-                else accepted[rank] = FastllmCudaMergeMOEExpertParallel(*context, rank, input[rank],
-                    rank == 0 ? ids : empty, rank == 0 ? scores : empty, output[rank],
-                    table.data(), table.size(), layer, [] {});
+                else {
+                    cudaGraph_t readGraph = nullptr;
+                    cudaGraphExec_t readExec = nullptr;
+                    bool preparedReadback = false;
+                    if (!noCache && step >= ranks &&
+                            rank == routingRank && GetFastllmEnv().cudaGraph) {
+                        Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+                        preparedReadback = FastllmCudaMoeExpertParallelReadback(*context, rank,
+                            rankInput, routedIds, routedScores);
+                        Cuda(cudaStreamEndCapture(cudaStreamPerThread, &readGraph));
+                        // Changing hidden width needs the ordinary Prepare() path;
+                        // stable widths must capture and use the mapped readback.
+                        Require(preparedReadback == stableWidth, "graph readback shape guard failed");
+                        if (preparedReadback) {
+                            Cuda(cudaGraphInstantiate(&readExec, readGraph, nullptr, nullptr, 0));
+                            Cuda(cudaGraphLaunch(readExec, cudaStreamPerThread));
+                            Cuda(cudaGraphLaunch(readExec, cudaStreamPerThread));
+                        } else {
+                            Cuda(cudaGraphDestroy(readGraph)); readGraph = nullptr;
+                        }
+                    }
+                    accepted[rank] = FastllmCudaMergeMOEExpertParallel(*context, rank, rankInput,
+                        rank == routingRank ? routedIds : empty, rank == routingRank ? routedScores : empty,
+                        output[rank], table.data(), table.size(), layer, [] {}, routingRank, preparedReadback);
+                    if (readExec) {
+                        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                        Cuda(cudaGraphExecDestroy(readExec)); Cuda(cudaGraphDestroy(readGraph));
+                    }
+                }
                 if (exec) {
                     Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
                     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1420,6 +1530,9 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                 if (accepted[rank]) Cuda(cudaMemcpy(actual[rank].data(), output[rank].cudaData,
                     actual[rank].size()*4, cudaMemcpyDeviceToHost));
                 if (single) Require(callbacks == (frequency ? 3 : 1), "hybrid shared callback count changed");
+            } catch (const std::exception &error) {
+                std::fprintf(stderr, "EP fixture rank %d step %d: %s\n", rank, step, error.what());
+                errors[rank] = std::current_exception();
             } catch (...) { errors[rank] = std::current_exception(); }
         };
         if (single) run(0);
@@ -1427,6 +1540,15 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
         for (int rank = 0; rank < ranks; ++rank) {
             if (errors[rank]) std::rethrow_exception(errors[rank]);
             Require(accepted[rank], "GGUF EP hybrid path rejected");
+        }
+        if (peerAccess) {
+            Cuda(cudaSetDevice(routingRank));
+            Require(FastllmCudaAddTo(output[routingRank], output[1-routingRank], 1.0f),
+                    "peer result addition rejected");
+            std::vector<float> sum(rows * hidden);
+            Cuda(cudaMemcpy(sum.data(), output[routingRank].cudaData, sum.size()*4, cudaMemcpyDeviceToHost));
+            for (size_t c = 0; c < sum.size(); ++c)
+                Require(sum[c] == actual[0][c] + actual[1][c], "peer result addition changed values");
         }
         for (size_t c = 0; c < lower.size(); ++c) {
             const float v = actual[0][c] + (single ? 0 : actual[1][c]);
@@ -1587,6 +1709,12 @@ int main(int argc, char **argv) {
             for (int rows : {1, 2, 3, 4, 5, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH}) {
                 RunHybrid(GGML_TYPE_IQ3_S, rows, false, false, fastllm::FLOAT32, false, false, true);
                 RunHybrid(GGML_TYPE_IQ3_S, rows, false, false, fastllm::FLOAT16, true, true, true);
+            }
+            if (fastllm::GetFastllmEnv().cudaGraph) {
+                for (int rows : {1, 3, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH})
+                    for (auto type : {fastllm::FLOAT32, fastllm::FLOAT16, fastllm::BFLOAT16})
+                        RunHybrid(GGML_TYPE_IQ3_S, rows, false, false, type, false, false, true, true);
+                std::puts("PASS: captured EP readback both routing roots and FP32/FP16/BF16");
             }
             std::puts("PASS: parallel dynamic resident/staged/NUMA experts and numerical references"); return 0;
         }

@@ -29,6 +29,21 @@ template <class T> T *Upload(const std::vector<T> &v) {
     Check(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
     return p;
 }
+// Exhaust all paired E4M3 codes, including subnormals, signed zero and NaNs.
+__global__ void CheckDecodeHalf2(int *errors) {
+    uint16_t codes = blockIdx.x * blockDim.x + threadIdx.x;
+    __nv_fp8x2_e4m3 q;
+    q.__x = codes;
+    __half2 h = static_cast<__half2>(q);
+    uint32_t expected = *reinterpret_cast<uint32_t *>(&h);
+    uint32_t actual = fastllm::fp8small::DecodeHalf2(codes);
+    for (int shift = 0; shift < 32; shift += 16) {
+        uint16_t a = actual >> shift, e = expected >> shift;
+        // NaN payloads/signs may differ; every other code must be bit-exact.
+        if (a != e && !((a & 0x7fff) > 0x7c00 && (e & 0x7fff) > 0x7c00))
+            atomicAdd(errors, 1);
+    }
+}
 template <class T> void Launch(T *x, uint8_t *w, T *y, T *b, float *s, int M, int K, int N, int bm, int bk) {
     if constexpr (__is_same(T, half))
         LaunchFastllmGemmFp16FP8E4M3(x, w, y, b, s, M, K, N, bm, bk);
@@ -142,12 +157,18 @@ int main() {
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || !n)
             return 77;
+        auto errors = Upload(std::vector<int>(1, 0));
+        CheckDecodeHalf2<<<256, 256>>>(errors);
+        int errorCount = 0;
+        Check(cudaMemcpy(&errorCount, errors, sizeof(int), cudaMemcpyDeviceToHost));
+        Check(cudaFree(errors));
+        Req(errorCount == 0, "FP8 pair decode differs from CUDA conversion");
         int device = 0;
         Check(cudaGetDevice(&device));
         Req(!fastllm::fp8small::KernelAvailable<
                 fastllm::fp8small::MmaKernel<half, 8, 16>, 1025>(device),
             "unsupported block size admitted");
-        Req(!fastllm::fp8small::CanRun<half>(device, 512, 513, 9),
+        Req(!fastllm::fp8small::CanRun<half>(device, 512, 513, 33),
             "unsupported row count admitted");
         Check(cudaGetLastError());
 #define RUN(T)                                                                                               \
@@ -176,7 +197,11 @@ int main() {
             Run<__nv_bfloat16>(5120, 14336, M, M%2, false, true);
             Run<half>(768, 4099, M, true, false, true);
         }
-        Run<half>(5120,14336,9,false,false,false);
+        bool extended = fastllm::fp8small::UseSm75Mma(device);
+        for (int M = 9; M <= 32; ++M)
+            Run<half>(768, 513, M, M % 2, false, extended);
+        Run<half>(5120,14336,9,false,false,extended);
+        Run<half>(768,513,33,false,false,false);
         Run<half>(5120,3584,4,false,false,true);
         Run<__nv_bfloat16>(1536,513,8,true,false,true);
         puts("PASS row FP8");

@@ -7,6 +7,8 @@
 // resident GPU execution routes, prefetched experts.
 // Includes CPU-assigned routes; excludes prefetch lookups from residency and
 // route totals. Does not include prefill, Qwen4 expert parallel or pure-GPU mode.
+// GLM TP2 reports the shared route decisions on both participating devices;
+// each GPU executes a complementary shard, so do not sum these route counts.
 // Call between requests, after host inference has finished. Synchronizes the
 // device. Take snapshot differences; reading never resets scheduler or cache.
 extern "C" bool fastllm_moe_cuda_cache_route_stats(int device, uint64_t *values);

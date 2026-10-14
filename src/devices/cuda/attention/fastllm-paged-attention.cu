@@ -542,7 +542,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         return ok;
     }
     using namespace flashinfer;
-    FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
+    FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace(false);
 
     // 获取基本参数
     int q0 = q.dims[0];  // total num_qo_heads across all batches
@@ -745,6 +745,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
             void *d_int_plan = nullptr;
             void *d_dynamic_status = nullptr;
             size_t int_plan_bytes = 0;
+            size_t float_plan_bytes = 0;
             uint32_t max_batch_size_if_split = 0;
             unsigned long long last_dynamic_capture_id = 0;
             bool has_dynamic_capture_id = false;
@@ -786,6 +787,12 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
             return bytes;
         };
 
+        // Plan offsets depend on shape, not on a fixed float arena. The pool
+        // retains captured addresses until their CUDA Graph is released.
+        auto releaseScratch = [](void *ptr) {
+            if (!FastllmCudaFreeAfterCurrentThreadStream(ptr)) FastllmCudaFree(ptr);
+        };
+        std::unique_ptr<void, decltype(releaseScratch)> float_scratch(nullptr, releaseScratch);
         PrefillPlanInfo plan_info;
         void *plan_int_base = workspace.d_int_workspace;
         std::shared_ptr<PrefillPlanCacheEntry> plan_entry;
@@ -829,9 +836,13 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
                     total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim,
                     pageLen, useFlashInferCudaGraph, sizeof(QType), windowLeft, -1, false, 0, 0, stream));
             workspace.EnsureIntCapacity(intBytes);
+            if (floatBytes > 0) {
+                float_scratch.reset(FastllmCudaMalloc(floatBytes));
+                if (!float_scratch) throw std::bad_alloc();
+            }
             PrefillPlanInfo created_plan_info;
             cudaError_t plan_status = PrefillPlan<uint32_t>(
-                    workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
+                    float_scratch.get(), floatBytes, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
                     workspace.int_workspace_size, created_plan_info,
                     (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(),
                     total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim,
@@ -847,6 +858,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
                 entry = std::make_shared<PrefillPlanCacheEntry>();
             }
             entry->plan_info = created_plan_info;
+            entry->float_plan_bytes = floatBytes;
             size_t required_bytes = planIntBytes(created_plan_info);
             if (entry->d_int_plan == nullptr || entry->int_plan_bytes < required_bytes) {
                 if (entry->d_int_plan != nullptr) {
@@ -978,6 +990,10 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         }
         plan_entry = entry;
         plan_info = entry->plan_info;
+        if (entry->float_plan_bytes > 0 && float_scratch == nullptr) {
+            float_scratch.reset(FastllmCudaMalloc(entry->float_plan_bytes));
+            if (!float_scratch) throw std::bad_alloc();
+        }
         plan_int_base = entry->d_int_plan;
         if (dynamic_decode_plan) {
             std::lock_guard<std::mutex> guard(plan_cache_mutex);
@@ -1032,9 +1048,9 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
                     static_cast<uint8_t*>(plan_int_base) + plan_info.block_valid_mask_offset);
             }
             tmp_v = reinterpret_cast<QType*>(
-                static_cast<uint8_t*>(workspace.d_float_workspace) + plan_info.v_offset);
+                static_cast<uint8_t*>(float_scratch.get()) + plan_info.v_offset);
             tmp_s = reinterpret_cast<float*>(
-                static_cast<uint8_t*>(workspace.d_float_workspace) + plan_info.s_offset);
+                static_cast<uint8_t*>(float_scratch.get()) + plan_info.s_offset);
         }
 
         if (launch_dynamic_decode_plan) {

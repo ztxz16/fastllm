@@ -59,8 +59,8 @@ __global__ __launch_bounds__(128, 4) void Project(const void *__restrict__ weigh
                     int ls = 0, hs = 0;
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
-                        ls = __dp4a(0x01010101, a[t][j], ls);
-                        hs = __dp4a(0x01010101, a[t][j + 4], hs);
+                        ls = ggml_cuda_dp4a(0x01010101, a[t][j], ls);
+                        hs = ggml_cuda_dp4a(0x01010101, a[t][j + 4], hs);
                     }
                     loSum[t] = ls;
                     hiSum[t] = hs;
@@ -104,8 +104,8 @@ __global__ __launch_bounds__(128, 4) void Project(const void *__restrict__ weigh
                         int lo = 0, hi = 0;
 #pragma unroll
                         for (int j = 0; j < 4; ++j) {
-                            lo = __dp4a(v[j], a[t][j], lo);
-                            hi = __dp4a(v[j + 4], a[t][j + 4], hi);
+                            lo = ggml_cuda_dp4a(v[j], a[t][j], lo);
+                            hi = ggml_cuda_dp4a(v[j + 4], a[t][j + 4], hi);
                         }
                         if constexpr (Type == GGML_TYPE_Q2_K)
                             sum[r][t] += d * (dx[t] * (lo * (sc0 & 15) + hi * (sc1 & 15))) -
@@ -121,7 +121,7 @@ __global__ __launch_bounds__(128, 4) void Project(const void *__restrict__ weigh
                         int dot = 0;
 #pragma unroll
                         for (int j = 0; j < 8; ++j)
-                            dot = __dp4a(v[j], a[t][j], dot);
+                            dot = ggml_cuda_dp4a(v[j], a[t][j], dot);
                         if constexpr (Type == GGML_TYPE_Q4_K)
                             sum[r][t] += d * (dx[t] * (dot * scale)) -
                                          dmin * (dx[t] * ((loSum[t] + hiSum[t]) * minimum));

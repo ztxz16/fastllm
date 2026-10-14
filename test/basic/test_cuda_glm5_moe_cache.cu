@@ -1,6 +1,7 @@
 #include "fastllm.h"
 #include "executor.h"
 #include "utils.h"
+#include "utils/hybrid_moe.h"
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
@@ -175,11 +176,17 @@ static void CheckVerify(FastllmCudaMoeCacheLayer *layers, std::vector<Data *> *w
     bool sawCpu = false, sawResident = false, sawStaged = false, sawBoth = false;
     FastllmCudaReleaseMoeCache(weights[0].data(), layers[0].weightsBatch);
     Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}, noCache), "verify cache preparation failed");
-    for (int device = 0; device < (dual ? 2 : 1); ++device) {
-        Check(cudaSetDevice(device));
-        void *state = FastllmCudaBeginMoeDecode(weights[0].data(), weights[0].size(), topk);
-        Require(state != nullptr, "verify device preparation failed");
-        FastllmCudaEndMoeDecode(state);
+    {
+        HybridMoeDecodeGroup group;
+        for (int device = 0; device < (dual ? 2 : 1); ++device) {
+            Check(cudaSetDevice(device));
+            Require(!group.Contains(device), "new cache group already contains device");
+            Require(group.Begin(device, weights[0].data(), weights[0].size(), topk),
+                "verify device preparation failed");
+            Require(group.Contains(device) &&
+                group.Begin(device, weights[0].data(), weights[0].size(), topk),
+                "cache group failed to retain one step per device");
+        }
     }
     // Grow and shrink one live dispatcher, retaining cache contents and the
     // independent timing estimates for each row count.
@@ -253,12 +260,13 @@ static void CheckVerify(FastllmCudaMoeCacheLayer *layers, std::vector<Data *> *w
                     }
                 };
                 snapshot(before, cacheBefore, gpuBefore);
-                void *state = FastllmCudaBeginMoeDecode(weights[table].data(), weights[table].size(), topk);
-                Require(state != nullptr, "verify frequency step missing");
+                HybridMoeDecodeStep step;
+                step.Begin(weights[table].data(), weights[table].size(), topk);
+                Require(bool(step), "verify frequency step missing");
                 int callbacks = 0;
                 if (dual && pass == 0) {
                     Data rejected;
-                    Require(!FastllmCudaMergeMOEHybridOnDevices(input, index, scores, rejected,
+                    Require(!RunHybridMoeOnDevices(input, index, scores, rejected,
                         weights[table].data(), weights[table].size(), table, {1 - device},
                         [&] { ++callbacks; }), "unlisted origin device accepted");
                     Require(callbacks == 0 && rejected.cudaData == nullptr,
@@ -269,12 +277,12 @@ static void CheckVerify(FastllmCudaMoeCacheLayer *layers, std::vector<Data *> *w
                 const bool restricted = dual && pass % 3 == 2;
                 const auto allowed = restricted ? std::vector<int>{device} :
                     dual ? std::vector<int>{0, 1} : std::vector<int>{};
-                Require(FastllmCudaMergeMOEHybridOnDevices(input, index, scores, output, weights[table].data(),
+                Require(RunHybridMoeOnDevices(input, index, scores, output, weights[table].data(),
                     weights[table].size(), table, allowed, [&] {
                         ++callbacks;
                         if (dual) Check(cudaSetDevice(1 - device));
                     }), "GLM verifier hybrid rejected");
-                FastllmCudaEndMoeDecode(state);
+                step.Finish();
                 int current;
                 Check(cudaGetDevice(&current));
                 Require(current == device && callbacks == 1, "verify callback/device contract failed");

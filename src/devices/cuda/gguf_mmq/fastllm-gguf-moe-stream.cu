@@ -1,6 +1,7 @@
 #include "fastllm-gguf-mmq-common.cuh"
 #include "fastllm-gguf-moe-stream.cuh"
 #include "fastllm-gguf-moe-glm5.h"
+#include "devices/cuda/fastllm-moe-prefetch.h"
 #include "../moe/fastllm-moe-gguf-common.cuh"
 #include "../moe/fastllm-moe-gguf-restore.cuh"
 
@@ -76,11 +77,62 @@ struct DownUpload {
         CUDA_CHECK(cudaEventDestroy(ready));
     }
 };
-// The caller serializes model layers; keep a small reusable transfer ring per
-// device rather than creating streams/events for every expert or layer.
+// A bounded raw-weight lookahead. Only already registered host storage may be
+// queued here; unsupported/pageable sources retain the ordinary streamed path.
+struct Prefetch {
+    static constexpr size_t budget = size_t(256) * 1024 * 1024;
+    static constexpr int groups = 16, expertsPerGroup = 16;
+    struct Item {
+        uint8_t *data;
+        const uint8_t *host;
+        size_t bytes;
+        int type, group;
+    };
+    uint8_t *buffer = nullptr;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t ready[groups]{};
+    int pendingGroups = 0;
+    fastllm::Data **table = nullptr;
+    std::unordered_map<const fastllm::Data *, Item> items;
+    Prefetch() {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        for (auto &event : ready) CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    }
+    void Drain() {
+        if (pendingGroups) CUDA_CHECK(cudaEventSynchronize(ready[pendingGroups - 1]));
+        pendingGroups = 0;
+    }
+    ~Prefetch() {
+        Drain();
+        if (buffer) CUDA_CHECK(cudaFree(buffer));
+        for (auto event : ready) CUDA_CHECK(cudaEventDestroy(event));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+    }
+    static const uint8_t *Host(const fastllm::Data &w) {
+        return w.cpuData ? w.cpuData : w.numasData.empty() ? nullptr : w.numasData[0];
+    }
+    static bool Pinned(const void *source) {
+        if (!source) return false;
+        cudaPointerAttributes attr{};
+        const auto status = cudaPointerGetAttributes(&attr, source);
+        if (status != cudaSuccess) { cudaGetLastError(); return false; }
+        return attr.type == cudaMemoryTypeHost;
+    }
+    const Item *Find(fastllm::Data **weights, const fastllm::Data &w) const {
+        if (table != weights) return nullptr;
+        auto it = items.find(&w);
+        if (it == items.end() || it->second.bytes != w.GetBytes() ||
+            it->second.type != w.ggmlType || it->second.host != Host(w)) return nullptr;
+        return &it->second;
+    }
+};
+
+// The caller serializes model layers; reuse transfer resources per device.
 struct Pipeline {
     static constexpr int groups = 3, experts = 16;
     std::mutex mutex;
+    std::unique_ptr<Prefetch> prefetch;
+    std::unordered_map<fastllm::Data **, std::vector<int>> prefillOrder;
     cudaStream_t dma = nullptr, restore = nullptr;
     cudaEvent_t metadata = nullptr, copied[groups]{}, restored[groups]{}, released[groups]{};
     Pipeline() {
@@ -94,13 +146,14 @@ struct Pipeline {
         }
     }
 };
-static Pipeline &GetPipeline(int device) {
+static Pipeline *GetPipeline(int device, bool create = true) {
     static std::mutex mutex;
     static auto *pipelines = new std::map<int, std::unique_ptr<Pipeline>>;
     std::lock_guard<std::mutex> lock(mutex);
+    if (!create && !pipelines->count(device)) return nullptr;
     auto &pipeline = (*pipelines)[device];
     if (!pipeline) pipeline.reset(new Pipeline());
-    return *pipeline;
+    return pipeline.get();
 }
 
 static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
@@ -111,7 +164,7 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     using namespace fastllm_gguf_mmq;
     using fastllm_gguf_moe::AllocateTensor;
     const int device = FastllmCudaGetDevice(), rows = input.dims[0], hidden = input.dims[1];
-    auto &pipeline = GetPipeline(device);
+    auto &pipeline = *GetPipeline(device);
     std::lock_guard<std::mutex> lock(pipeline.mutex);
     FastllmCudaMoePrefillResidents resident;
     FastllmCudaGetMoePrefillResidents(weights, expertCount, resident, glm5);
@@ -135,6 +188,7 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
         std::vector<int> experts, counts, offsets{0}, tiles, routes;
         size_t pointersOffset, countsOffset, offsetsOffset, tilesOffset, routesOffset;
         int copiesBegin = 0, copiesCount = 0;
+        int lastPrefetchedGroup = -1;
     };
     std::vector<Batch> batches;
     int capacity = 0;
@@ -205,7 +259,7 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     auto *base = static_cast<uint8_t *>(workspace.cudaData);
     FastllmCudaMoePrefillPlan admission;
     FastllmCudaPlanMoePrefill(weights, expertCount, indices, scores, rows, topk, experts, admission);
-    struct Upload { const fastllm::Data *weight; uint8_t *target; };
+    struct Upload { const fastllm::Data *weight; uint8_t *target; const Prefetch::Item *prefetched = nullptr; };
     std::vector<std::vector<Upload>> uploads(batches.size());
     std::vector<WeightCopy> copies;
     std::vector<uint8_t> metadata(metaBytes, 0);
@@ -233,8 +287,16 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
                                  : admitted ? admitted : base + rawOffset + offset;
                     if (!restore) destination = target;
                 }
+                const auto *prefetched = !hit && !resident.nativeGlm && pipeline.prefetch
+                    ? pipeline.prefetch->Find(weights, w) : nullptr;
+                if (prefetched) {
+                    batch.lastPrefetchedGroup = std::max(batch.lastPrefetchedGroup, prefetched->group);
+                    // Restore reads the prefetched raw record directly; plain
+                    // formats copy into their canonical/admission destination.
+                    if (restore) target = prefetched->data;
+                }
                 pointers.push_back(destination);
-                if (!hit) uploads[g].push_back({&w, target});
+                if (!hit && !(prefetched && restore)) uploads[g].push_back({&w, target, prefetched});
                 if (restore) copies.push_back({target, destination, w.ggmlType, w.dims[0], w.dims[1],
                     int(cross && part == 0), int(ggml_blck_size((ggml_type)Ordinary(w.ggmlType))),
                     int(ggml_type_size((ggml_type)Ordinary(w.ggmlType)))});
@@ -268,9 +330,20 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
         const auto &batch = batches[g];
         const int slot = g % Pipeline::groups;
         if (g >= Pipeline::groups) CUDA_CHECK(cudaStreamWaitEvent(pipeline.dma, pipeline.released[slot], 0));
-        for (const auto &upload : uploads[g]) UploadWeight(*upload.weight, upload.target, pipeline.dma);
+        for (const auto &upload : uploads[g]) {
+            if (upload.prefetched) {
+                CUDA_CHECK(cudaStreamWaitEvent(pipeline.dma,
+                    pipeline.prefetch->ready[upload.prefetched->group], 0));
+                CUDA_CHECK(cudaMemcpyAsync(upload.target, upload.prefetched->data,
+                    upload.weight->GetBytes(), cudaMemcpyDeviceToDevice, pipeline.dma));
+            } else UploadWeight(*upload.weight, upload.target, pipeline.dma);
+        }
         CUDA_CHECK(cudaEventRecord(pipeline.copied[slot], pipeline.dma));
         CUDA_CHECK(cudaStreamWaitEvent(pipeline.restore, pipeline.copied[slot], 0));
+        // All prefetch groups share one stream; the last event covers earlier groups.
+        if (batch.lastPrefetchedGroup >= 0)
+            CUDA_CHECK(cudaStreamWaitEvent(pipeline.restore,
+                pipeline.prefetch->ready[batch.lastPrefetchedGroup], 0));
         if (batch.copiesCount) Restore<<<dim3(std::min(64, (maxBlocks + 7) / 8), batch.copiesCount),
             256, 0, pipeline.restore>>>(reinterpret_cast<const WeightCopy *>(base + metaOffset + descOffset) + batch.copiesBegin);
         CUDA_CHECK(cudaEventRecord(pipeline.restored[slot], pipeline.restore));
@@ -288,9 +361,93 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     run(StreamedMoePhase::Finish, {});
     FastllmCudaPublishMoePrefill(admission);
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (rows >= 1024 && !glm5 && pipeline.prefetch) pipeline.prefillOrder[weights] = order;
     return true;
 }
 } // namespace fastllm_gguf_stream
+
+bool FastllmCudaPrefetchMoeGGUFHost(fastllm::Data **weights, int expertCount) {
+    using namespace fastllm_gguf_stream;
+    if (!weights || expertCount <= 0) return false;
+    cudaStreamCaptureStatus capture;
+    CUDA_CHECK(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
+    if (capture != cudaStreamCaptureStatusNone) return false;
+    auto &pipeline = *GetPipeline(FastllmCudaGetDevice());
+    std::lock_guard<std::mutex> lock(pipeline.mutex);
+    if (!pipeline.prefetch) pipeline.prefetch.reset(new Prefetch());
+    auto previous = pipeline.prefillOrder.find(weights);
+    if (previous == pipeline.prefillOrder.end()) return false;
+    FastllmCudaMoePrefillResidents resident;
+    FastllmCudaGetMoePrefillResidents(weights, expertCount, resident, false);
+    if (resident.nativeGlm) return false;
+    std::vector<const fastllm::Data *> plan;
+    size_t bytes = 0;
+    for (int e : previous->second) {
+        if (e < 0 || e >= expertCount) continue;
+        if (2 * e + 1 < int(resident.weights.size()) && resident.weights[2 * e]) continue;
+        const auto *gate = weights[2 * (e + 1)], *down = weights[2 * (e + 1) + 1];
+        bool valid = gate && down;
+        if (valid) for (const auto *w : {gate, down}) {
+            valid = valid && w->dataType == fastllm::DATA_GGUF_FORMAT &&
+                Ordinary(w->ggmlType) >= 0 && !w->numasData.empty();
+            if (w->cpuData) valid = valid && Prefetch::Pinned(w->cpuData);
+            else for (const auto *p : w->numasData) valid = valid && Prefetch::Pinned(p);
+        }
+        if (!valid) continue;
+        const size_t extra = Align(gate->GetBytes()) + Align(down->GetBytes());
+        if (bytes + extra > Prefetch::budget ||
+            plan.size() / 2 >= Prefetch::groups * Prefetch::expertsPerGroup) break;
+        plan.push_back(gate); plan.push_back(down); bytes += extra;
+    }
+    if (plan.empty()) return false;
+    auto &ahead = *pipeline.prefetch;
+    ahead.Drain();
+    ahead.items.clear(); ahead.table = nullptr;
+    if (!ahead.buffer) {
+        size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        if (free < Prefetch::budget + size_t(1024) * 1024 * 1024) return false;
+        const auto status = cudaMalloc(reinterpret_cast<void **>(&ahead.buffer), Prefetch::budget);
+        if (status == cudaErrorMemoryAllocation) { cudaGetLastError(); return false; }
+        CUDA_CHECK(status);
+    }
+    size_t offset = 0;
+    for (size_t i = 0; i < plan.size(); ++i) {
+        const auto &w = *plan[i];
+        const int group = i / (2 * Prefetch::expertsPerGroup);
+        UploadWeight(w, ahead.buffer + offset, ahead.stream);
+        ahead.items.emplace(&w, Prefetch::Item{ahead.buffer + offset,
+            Prefetch::Host(w), w.GetBytes(), w.ggmlType, group});
+        offset += Align(w.GetBytes());
+        if ((i + 1) % (2 * Prefetch::expertsPerGroup) == 0 || i + 1 == plan.size()) {
+            CUDA_CHECK(cudaEventRecord(ahead.ready[group], ahead.stream));
+            ahead.pendingGroups = group + 1;
+        }
+    }
+    ahead.table = weights;
+    return true;
+}
+
+void FastllmCudaWaitMoeGGUFHostPrefetch(void *stream) {
+    using namespace fastllm_gguf_stream;
+    auto *pipeline = GetPipeline(FastllmCudaGetDevice(), false);
+    if (!pipeline) return;
+    std::lock_guard<std::mutex> lock(pipeline->mutex);
+    const auto &ahead = pipeline->prefetch;
+    if (ahead && ahead->pendingGroups)
+        CUDA_CHECK(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(stream),
+            ahead->ready[ahead->pendingGroups - 1], 0));
+}
+
+void FastllmCudaClearMoeGGUFHostPrefetch() {
+    using namespace fastllm_gguf_stream;
+    auto *existing = GetPipeline(FastllmCudaGetDevice(), false);
+    if (!existing) return;
+    auto &pipeline = *existing;
+    std::lock_guard<std::mutex> lock(pipeline.mutex);
+    pipeline.prefetch.reset();
+    pipeline.prefillOrder.clear();
+}
 
 bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
         fastllm::Data &gate, fastllm::Data &workspace, fastllm::Data &output,

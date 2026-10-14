@@ -627,6 +627,49 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
 }
 
+// Reuse one decoded Q5_K fragment across verifier rows without changing
+// the integer dot products or the floating-point accumulation order.
+struct FastllmQ5MmvqFragment {
+    int values[QR5_K][2], scales[QR5_K], mins[QR5_K];
+    float2 dm;
+    __device__ __forceinline__ FastllmQ5MmvqFragment(const block_q5_K &w, int iqs) {
+        const int offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
+        const int *lo = reinterpret_cast<const int *>(w.qs + 16 * offset + 4 * ((iqs / 2) % 4));
+        const int *hi = reinterpret_cast<const int *>(w.qh + 4 * ((iqs / 2) % 4));
+        const uint16_t *sc = reinterpret_cast<const uint16_t *>(w.scales);
+        const int j = offset / 2;
+        const uint16_t scale = j < 2 ? sc[j] & 0x3f3f :
+            (sc[j + 2] & 0x0f0f) | ((sc[j - 2] & 0xc0c0) >> 2);
+        const uint16_t min = j < 2 ? sc[j + 2] & 0x3f3f :
+            ((sc[j + 2] >> 4) & 0x0f0f) | ((sc[j] & 0xc0c0) >> 2);
+        dm = __half22float2(w.dm);
+#pragma unroll
+        for (int i = 0; i < QR5_K; ++i) {
+            scales[i] = (scale >> (8 * i)) & 255;
+            mins[i] = (min >> (8 * i)) & 255;
+#pragma unroll
+            for (int part = 0; part < 2; ++part)
+                values[i][part] = ((lo[4 * part] >> (4 * i)) & 0x0f0f0f0f) |
+                    (((hi[4 * part] >> (offset + i)) << 4) & 0x10101010);
+        }
+    }
+    __device__ __forceinline__ float Dot(const block_q8_1 *y, int iqs) const {
+        const int offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
+        float sum = 0, correction = 0;
+#pragma unroll
+        for (int i = 0; i < QR5_K; ++i) {
+            const block_q8_1 &block = y[offset + i];
+            const int *u = reinterpret_cast<const int *>(block.qs) + ((iqs / 2) % 4);
+            const int dot = ggml_cuda_dp4a(values[i][0], u[0], ggml_cuda_dp4a(values[i][1], u[4], 0));
+            const int total = ggml_cuda_dp4a(0x01010101, u[0], ggml_cuda_dp4a(0x01010101, u[4], 0));
+            const float d = __low2float(block.ds);
+            sum += d * (dot * scales[i]);
+            correction += d * (total * mins[i]);
+        }
+        return dm.x * sum - dm.y * correction;
+    }
+};
+
 #define VDR_Q6_K_Q8_1_MMVQ 1
 #define VDR_Q6_K_Q8_1_MMQ  8
 

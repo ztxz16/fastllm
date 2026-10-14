@@ -83,7 +83,8 @@ void Write(const std::string &path, const Json::object &metadata, const std::vec
 struct Fixture {
     std::string directory;
     std::vector<std::string> files;
-    Fixture(bool tpExperts = false, int expertCount = 2) {
+    Fixture(bool tpExperts = false, int expertCount = 2, bool patternedExperts = false,
+            ggml_type gateType = GGML_TYPE_IQ2_XS) {
         const int expertWidth = tpExperts ? 64 : 32;
         char name[] = "/tmp/fastllm-qwen4-gguf-XXXXXX";
         Check(mkdtemp(name) != nullptr, "fixture directory failed"); directory = name;
@@ -161,12 +162,13 @@ struct Fixture {
         for (int layer = 0; layer < (tpExperts ? 2 : 1); ++layer)
         for (const auto &kind : {"gate", "up", "down"}) {
             const bool down = kind == std::string("down");
-            const ggml_type type = down ? GGML_TYPE_IQ4_NL : GGML_TYPE_IQ2_XS;
+            const ggml_type type = down ? GGML_TYPE_IQ4_NL : gateType;
             const std::vector<int> dims = down ? std::vector<int>{expertCount, 256, expertWidth} : std::vector<int>{expertCount, expertWidth, 256};
             const size_t bytes = expertCount * dims[1] * ggml_row_size(type, dims[2]);
             Bytes payload(bytes, 0);
-            if (tpExperts) for (size_t i = 0; i < bytes; ++i)
-                payload[i] = (i / ggml_row_size(type, dims[2]) + 17 * i + layer) % 63;
+            const int projectionTag = patternedExperts ? (down ? 23 : kind == std::string("up") ? 11 : 0) : 0;
+            if (tpExperts || patternedExperts) for (size_t i = 0; i < bytes; ++i)
+                payload[i] = (i / ggml_row_size(type, dims[2]) + 17 * i + layer + projectionTag) % 63;
             tensors.push_back({"blk." + std::to_string(layer) + ".ffn_" + std::string(kind) + "_exps.weight", dims, type, payload});
         }
         tensors.push_back(FloatTensor("blk.1.ple_conv1d.weight", {512, 4}, GGML_TYPE_F32, std::vector<float>(512 * 4, .25f)));
@@ -522,7 +524,7 @@ static void TestConcurrentExpertMerges() {
     SetThreads(16);
     SetNgramDevice("cpu");
     constexpr int experts = 128;
-    Fixture fixture(false, experts);
+    Fixture fixture(false, experts, true);
     for (int repeat = 0; repeat < 8; ++repeat) {
         auto model = CreateLLMModelFromGGUFFile(fixture.files[0], "");
         for (int e = 0; e < experts; ++e) {
@@ -533,6 +535,19 @@ static void TestConcurrentExpertMerges() {
                 Check(it != model->weight.weight.end() && it->second.dims == item.second,
                       "parallel GGUF merge lost an expert projection");
                 Check(it->second.cpuData != nullptr, "parallel GGUF merge lost weight storage");
+                const bool down = std::string(item.first) == "down_proj.weight";
+                const ggml_type type = down ? GGML_TYPE_IQ4_NL : GGML_TYPE_IQ2_XS;
+                const size_t rowBytes = ggml_row_size(type, item.second[1]);
+                const size_t sourceBytes = (down ? 256 : 32) * rowBytes;
+                Check(it->second.dataType == DATA_GGUF_FORMAT && it->second.ggmlType == type,
+                      "parallel GGUF merge changed the expert quantization");
+                for (size_t offset = 0; offset < rowBytes * item.second[0]; ++offset) {
+                    const size_t sourceOffset = e * sourceBytes + offset % sourceBytes;
+                    const int projectionTag = down ? 23 : offset >= sourceBytes ? 11 : 0;
+                    const uint8_t expected = (sourceOffset / rowBytes + 17 * sourceOffset + projectionTag) % 63;
+                    Check(it->second.cpuData[offset] == expected,
+                          "parallel GGUF merge changed expert bytes or gate/up order");
+                }
             }
             Check(!model->weight.weight.count(prefix + "gate_proj.weight") &&
                   !model->weight.weight.count(prefix + "up_proj.weight"),
@@ -542,6 +557,55 @@ static void TestConcurrentExpertMerges() {
     SetThreads(2);
 }
 
+static void TestDirectMergeFormats() {
+    SetThreads(16);
+    SetNgramDevice("cpu");
+    for (auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
+                     GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS,
+                     GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
+        Fixture fixture(false, 32, true, type);
+        auto model = CreateLLMModelFromGGUFFile(fixture.files[0], "");
+        const size_t rowBytes = ggml_row_size(type, 256), sourceBytes = 32 * rowBytes;
+        for (int expert = 0; expert < 32; ++expert) {
+            const std::string name = "model.language_model.layers.0.mlp.experts." +
+                std::to_string(expert) + ".gateup_proj.weight";
+            Data &weight = model->weight[name];
+            const DataType expectedType = type == GGML_TYPE_F32 ? FLOAT32 :
+                type == GGML_TYPE_F16 ? FLOAT16 : DATA_GGUF_FORMAT;
+            Check(weight.dataType == expectedType && weight.dims == std::vector<int>({64, 256}),
+                  "direct merge changed storage metadata");
+            Check(weight.cpuData && weight.GetBytes() == sourceBytes * 2,
+                  "direct merge missing bytes");
+            for (size_t j = 0; j < sourceBytes * 2; ++j) {
+                const size_t source = expert * sourceBytes + j % sourceBytes;
+                const uint8_t expected = (source / rowBytes + 17 * source + (j >= sourceBytes ? 11 : 0)) % 63;
+                Check(weight.cpuData[j] == expected, "direct merge changed payload");
+            }
+        }
+    }
+    {
+        Fixture fixture(false, 8, true, GGML_TYPE_IQ3_S);
+        SetMoeDeviceMap({{"disk", 1}});
+        auto model = CreateLLMModelFromGGUFFile(fixture.files[0], "");
+        Data &weight = model->weight["model.language_model.layers.0.mlp.experts.0.gateup_proj.weight"];
+        Check(weight.isDiskWeight && weight.cpuData == nullptr && weight.dims == std::vector<int>({64, 256}),
+              "direct merge eagerly loaded a disk expert");
+        SetMoeDeviceMap({{"cpu", 1}});
+    }
+    {
+        Fixture fixture(false, 32, true, GGML_TYPE_IQ3_S);
+        std::ifstream input(fixture.files[1], std::ios::binary | std::ios::ate);
+        const auto size = input.tellg(); input.close();
+        Check(truncate(fixture.files[1].c_str(), (off_t)size - 4096) == 0, "truncate failed");
+        bool rejected = false;
+        try { auto model = CreateLLMModelFromGGUFFile(fixture.files[0], ""); }
+        catch (const std::runtime_error &) { rejected = true; }
+        Check(rejected, "parallel import accepted a truncated weight file");
+    }
+    SetThreads(2);
+    std::cout << "PASS: direct merge formats, disk fallback and parallel read failure\n";
+}
+
 int main(int argc, char **argv) {
     try {
         SetThreads(2); SetDeviceMap({{"cpu", 1}}); SetMoeDeviceMap({{"cpu", 1}});
@@ -549,6 +613,7 @@ int main(int argc, char **argv) {
         SetMoeCudaCacheBytes(0); setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
         if (argc == 2 && std::string(argv[1]) == "--tp-load") return TestStreamingTpImport();
         TestConcurrentExpertMerges();
+        TestDirectMergeFormats();
         Fixture fixture;
         TestFloatImport(fixture.directory);
         TestEmbeddingImport(fixture);
@@ -557,6 +622,8 @@ int main(int argc, char **argv) {
             SetNgramDevice(disk ? "disk" : "cpu");
             auto base = CreateLLMModelFromGGUFFile(fixture.files[0], "");
             auto *m = dynamic_cast<Qwen4ExpModel *>(base.get()); Check(m != nullptr, "architecture dispatch");
+            Check(m->GetExecutionMode() == ExecutionMode::Cpu,
+                  "CPU execution mode must ignore the PLE storage device");
             Qwen4GGUFTestAccess::CheckMetadata(*m);
             const std::string p = "model.language_model.layers.0.linear_attn.";
             for (const char *name : {"in_proj_qkv.weight", "in_proj_z.weight"}) {

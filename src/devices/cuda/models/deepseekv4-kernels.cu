@@ -1125,6 +1125,61 @@ __global__ void DeepSeekV4WoAFp8PairBlockReduceKernel(
     }
 }
 
+// Optional V4.1 BS=1 block32 specialization. Keep the original 256-lane
+// accumulation/reduction tree and FP16-rounded weight semantics unchanged.
+// Fixed dimensions remove integer division from the memory access loop.
+__global__ void DeepSeekV41WoAFp8Block32DecodeKernel(
+        const __nv_bfloat16 *__restrict__ input, const uint8_t *__restrict__ weight,
+        const float *__restrict__ scales, __nv_bfloat16 *__restrict__ output) {
+    constexpr int cols = 4096, rank = 1024, threads = 256, rows = 4;
+    __shared__ float partial[rows * threads];
+    const int rowStart = blockIdx.x * rows;
+    const int group = rowStart / rank;
+    const auto *src = input + group * cols;
+    const auto *weights = weight + (uint64_t)rowStart * cols;
+    // Four aligned output rows share one 32-row quantization block.
+    const auto *scaleRow = scales + (rowStart / 32) * (cols / 32);
+    float sums[rows] = {};
+    #pragma unroll 1
+    for (int col = threadIdx.x; col < cols; col += threads) {
+        const float value = __bfloat162float(src[col]);
+        const float scale = scaleRow[col / 32];
+        #pragma unroll
+        for (int row = 0; row < rows; row++) {
+            sums[row] += value * DeepSeekV4Fp8E4M3ScaledHalfToFloat(
+                weights[(uint64_t)row * cols + col], scale);
+        }
+    }
+    #pragma unroll
+    for (int row = 0; row < rows; row++) {
+        partial[row * threads + threadIdx.x] = sums[row];
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int stride = 128; stride >= 64; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            #pragma unroll
+            for (int row = 0; row < rows; row++) {
+                partial[row * threads + threadIdx.x] += partial[row * threads + threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x < 32) {
+        #pragma unroll
+        for (int row = 0; row < rows; row++) {
+            float sum = partial[row * threads + threadIdx.x] + partial[row * threads + threadIdx.x + 32];
+            #pragma unroll
+            for (int stride = 16; stride > 0; stride >>= 1) {
+                sum += __shfl_down_sync(0xffffffffu, sum, stride);
+            }
+            if (threadIdx.x == 0) {
+                output[rowStart + row] = __float2bfloat16_rn(sum);
+            }
+        }
+    }
+}
+
 template <typename InT, int RowsPerBlock>
 __global__ void DeepSeekV4WoAFp8RowsBlockReduceKernel(
         const InT *o, const uint8_t *w, const float *scales, __nv_bfloat16 *output,
@@ -5976,6 +6031,16 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
                 woA.blockK % rowsPerBlock == 0;
             bool launched = false;
             const uint8_t *weightData = (const uint8_t*)woA.cudaData;
+            const char *block32Decode = std::getenv("FASTLLM_DSV41_CUDA_WOA_BLOCK32");
+            if (block32Decode != nullptr && std::strcmp(block32Decode, "0") != 0 &&
+                o.dataType == fastllm::DataType::BFLOAT16 && totalTokens == 1 &&
+                groups == 8 && oRank == 1024 && groupDim == 4096 &&
+                woA.blockK == 32 && woA.blockM == 32) {
+                DeepSeekV41WoAFp8Block32DecodeKernel<<<2048, 256>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(oData),
+                    weightData, scaleData, outData);
+                return true;
+            }
             if (useTokenTile && tokensPerBlock == 2 &&
                 rowsPerBlock == 4) {
                 launched = DeepSeekV4LaunchWoAFp8TokenRowsBlockReduce<

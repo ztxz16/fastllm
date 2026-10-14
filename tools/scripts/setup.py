@@ -55,6 +55,7 @@ package_version = package_info["version"]
 setup (
     name = package_name,
     version = package_version,
+    python_requires = '>=3.10',
     author = "huangyuyang",
     author_email = "ztxz16@foxmail.com",
     description = "High-performance C++ inference engine for dense and MoE language models",

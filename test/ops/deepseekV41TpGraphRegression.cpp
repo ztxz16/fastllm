@@ -144,22 +144,32 @@ int main(int argc, char **argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) return 77;
     try {
-        bool expertCache = false, fp8Dense = false, eagerOnly = false;
+        bool expertCache = false, fp8Dense = false, eagerOnly = false, gpuExperts = false;
+        bool diskExperts = false, diskEngram = false;
         if (argc < 2)
-            throw std::runtime_error("usage: deepseekV41TpGraphRegression FIXTURE_DIR [--expert-cache] [--fp8-dense] [--eager-only]");
+            throw std::runtime_error("usage: deepseekV41TpGraphRegression FIXTURE_DIR "
+                "[--expert-cache | --gpu-experts | --disk-experts] [--disk-engram] [--fp8-dense] [--eager-only]");
         for (int i = 2; i < argc; ++i) {
             const std::string option = argv[i];
             if (option == "--expert-cache") expertCache = true;
+            else if (option == "--gpu-experts") gpuExperts = true;
+            else if (option == "--disk-experts") diskExperts = true;
+            else if (option == "--disk-engram") diskEngram = true;
             else if (option == "--fp8-dense") fp8Dense = true;
             else if (option == "--eager-only") eagerOnly = true;
             else throw std::runtime_error("unknown option: " + option);
         }
+        if (int(expertCache) + int(gpuExperts) + int(diskExperts) > 1)
+            throw std::runtime_error("expert backend options are mutually exclusive");
         setenv("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP", "1", 1);
         SetCudaGraph(false);
         SetThreads(2);
         SetCudaSharedExpert(true);
         SetDeviceMap({{"multicuda:0,1", 1}});
-        SetMoeDeviceMap({{expertCache ? "numa" : "cpu", 1}});
+        const std::string moeDevice = gpuExperts ? "multicuda:0,1" :
+            (expertCache ? "numa" : (diskExperts ? "disk" : "cpu"));
+        SetMoeDeviceMap({{moeDevice, 1}});
+        SetNgramDevice(diskEngram ? "disk" : "cpu");
         if (expertCache) {
             SetMoeCudaCacheBytes(16ULL << 20);
             // Keep the split deterministic while testing graph replay and KV.
@@ -168,6 +178,9 @@ int main(int argc, char **argv) {
         }
         auto base = CreateLLMModelFromHF(argv[1], fp8Dense ? DataType::DATA_AUTO_SOURCE : DataType::FLOAT16);
         auto &model = dynamic_cast<DeepSeekV41Model &>(*base);
+        if (model.GetExecutionMode() != (gpuExperts ? ExecutionMode::Gpu : ExecutionMode::Hybrid)) {
+            throw std::runtime_error("wrong execution backend selected");
+        }
         // Initialize weight shards and kernel plans before comparing dispatch.
         RunRequests(model, {7});
         const auto expected = RunRequests(model, {7, 17, 33, 7});
@@ -196,13 +209,18 @@ int main(int argc, char **argv) {
         if (eagerOnly) return 0;
         SetCudaGraph(true);
         Compare(verifyEight, RunDsparkRequests(model));
-        if ((model.*(&Access::v41CudaGraphSlots)).size() != 8)
-            throw std::runtime_error("missing DSpark graph shapes");
+        const size_t expectedGraphShapes = diskExperts ? 0 : 8;
+        if ((model.*(&Access::v41CudaGraphSlots)).size() != expectedGraphShapes)
+            throw std::runtime_error("unexpected DSpark graph shapes or disk graph fallback");
         SetCudaGraph(false);
         Compare(verifyEight, RunDsparkRequests(model));
         SetCudaGraph(true);
         Compare(verifyEight, RunDsparkRequests(model));
-        std::cout << "PASS: DSpark graph shapes 1..8, main features and rollback match across requests\n";
+        if (diskExperts) {
+            std::cout << "PASS: disk experts preserve eager results with CUDA Graph requested, including verification and rollback\n";
+        } else {
+            std::cout << "PASS: DSpark graph shapes 1..8, main features and rollback match across requests\n";
+        }
     } catch (const std::exception &e) {
         std::cerr << "FAIL: " << e.what() << '\n';
         return 1;

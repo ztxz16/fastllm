@@ -46,7 +46,6 @@ namespace fastllm {
                 currentErrors = &errors;
                 activeCount = (int)workerKeys.size();
                 finishedCount = 0;
-                skippedWorkerRank = -1;
                 taskId++;
             }
             cv.notify_all();
@@ -59,7 +58,6 @@ namespace fastllm {
                 currentErrors = nullptr;
                 activeCount = 0;
                 finishedCount = 0;
-                skippedWorkerRank = -1;
             }
         }
 
@@ -75,14 +73,13 @@ namespace fastllm {
             }
 
             std::lock_guard<std::mutex> submitGuard(submitMutex);
-            EnsureLocked(workerKeys);
+            EnsureLocked(workerKeys, 1);
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 currentTask = task;
                 currentErrors = &errors;
-                activeCount = (int)workerKeys.size();
+                activeCount = (int)workerKeys.size() - 1;
                 finishedCount = 0;
-                skippedWorkerRank = 0;
                 taskId++;
             }
             cv.notify_all();
@@ -106,15 +103,15 @@ namespace fastllm {
                 currentErrors = nullptr;
                 activeCount = 0;
                 finishedCount = 0;
-                skippedWorkerRank = -1;
             }
         }
 
     private:
-        void EnsureLocked(const std::vector<int> &workerKeys) {
+        void EnsureLocked(const std::vector<int> &workerKeys, int firstRank = 0) {
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                if (!stop && keys == workerKeys && workers.size() == workerKeys.size()) {
+                if (!stop && keys == workerKeys && firstWorkerRank == firstRank &&
+                    workers.size() == workerKeys.size() - firstRank) {
                     return;
                 }
             }
@@ -129,13 +126,13 @@ namespace fastllm {
                 taskId = 0;
                 activeCount = 0;
                 finishedCount = 0;
-                skippedWorkerRank = -1;
+                firstWorkerRank = firstRank;
             }
 
             std::vector<std::thread> nextWorkers;
-            nextWorkers.reserve(workerKeys.size());
+            nextWorkers.reserve(workerKeys.size() - firstRank);
             try {
-                for (int i = 0; i < (int)workerKeys.size(); i++) {
+                for (int i = firstRank; i < (int)workerKeys.size(); i++) {
                     nextWorkers.emplace_back([this, i]() { WorkerLoop(i); });
                 }
             } catch (...) {
@@ -175,7 +172,6 @@ namespace fastllm {
                     taskId = 0;
                     activeCount = 0;
                     finishedCount = 0;
-                    skippedWorkerRank = -1;
                     return;
                 }
                 stop = true;
@@ -196,7 +192,6 @@ namespace fastllm {
                 taskId = 0;
                 activeCount = 0;
                 finishedCount = 0;
-                skippedWorkerRank = -1;
             }
         }
 
@@ -205,7 +200,6 @@ namespace fastllm {
             while (true) {
                 std::function<void(int)> task;
                 std::vector<std::exception_ptr> *errors = nullptr;
-                bool skipTask = false;
                 {
                     std::unique_lock<std::mutex> lock(mutex);
                     cv.wait(lock, [&]() {
@@ -217,21 +211,18 @@ namespace fastllm {
                     lastTaskId = taskId;
                     task = currentTask;
                     errors = currentErrors;
-                    skipTask = rank == skippedWorkerRank;
                 }
 
                 std::exception_ptr error;
-                if (!skipTask) {
-                    try {
-                        task(rank);
-                    } catch (...) {
-                        error = std::current_exception();
-                    }
+                try {
+                    task(rank);
+                } catch (...) {
+                    error = std::current_exception();
                 }
 
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    if (!skipTask && errors != nullptr &&
+                    if (errors != nullptr &&
                         rank >= 0 && rank < (int)errors->size()) {
                         (*errors)[rank] = error;
                     }
@@ -254,7 +245,7 @@ namespace fastllm {
         uint64_t taskId = 0;
         int activeCount = 0;
         int finishedCount = 0;
-        int skippedWorkerRank = -1;
+        int firstWorkerRank = 0;
         bool stop = false;
     };
 }

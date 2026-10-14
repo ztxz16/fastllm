@@ -42,4 +42,4 @@ struct FlashInferWorkSpaceManager {
     ~FlashInferWorkSpaceManager();
 };
 
-FlashInferWorkSpaceManager &getFastllmFlashInferWorkSpace();
+FlashInferWorkSpaceManager &getFastllmFlashInferWorkSpace(bool allocateFloat = true);

@@ -250,6 +250,7 @@ inline void BuildDsaIndices(Data &input, Data &qNormalized,
 inline void SparseLatentAttention(Data &query, const Data &cache,
         Data &indices, float scale, Data &output, bool useFlashInfer = true,
         const Data *keyPeCache = nullptr) {
+    useFlashInfer = useFlashInfer && FastllmCudaFlashInferDataTypeSupported(query.dataType);
     const int heads = query.dims[0], sequence = query.dims[1];
     const int tokens = cache.dims[1], rank = query.dims[2];
     const auto *pool = cache.pagedKVCacheData;
@@ -311,6 +312,23 @@ inline void SparseLatentAttention(Data &query, const Data &cache,
     }
     output.Reshape({sequence, heads, rank});
     PermuteSelf(output, {1, 0, 2});
+}
+
+// Keep the already validated BF16 DSA fallback on pre-Ampere devices.
+inline void DenseLatentAttentionFallback(Data &query, const Data &cache,
+        float scale, Data &output) {
+    const int rows = query.dims[1], tokens = cache.dims[1];
+    AssertInFastLLM(rows > 0 && tokens >= rows,
+        "GLM dense latent attention cache length mismatch.");
+    Data indices(DataType::INT32);
+    indices.Resize({rows, tokens});
+    indices.Allocate(false);
+    auto *ids = reinterpret_cast<int32_t *>(indices.cpuData);
+    for (int row = 0; row < rows; ++row)
+        for (int key = 0; key < tokens; ++key)
+            ids[size_t(row) * tokens + key] = key <= tokens - rows + row ? key : -1;
+    indices.ToDevice(query.dataDevice, query.dataDeviceIds);
+    SparseLatentAttention(query, cache, indices, scale, output, false);
 }
 
 } } // namespace fastllm::glm5_next_detail

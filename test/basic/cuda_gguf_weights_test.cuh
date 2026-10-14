@@ -42,6 +42,10 @@ static std::vector<uint8_t> Weights(ggml_type type, int n, int k) {
         case GGML_TYPE_IQ2_XS:
             static_cast<block_iq2_xs *>(p)->d = d;
             break;
+        case GGML_TYPE_Q5_K: {
+            static_cast<block_q5_K *>(p)->dm = __halves2half2(d, d);
+            break;
+        }
         case GGML_TYPE_Q4_K: {
             auto *w = static_cast<block_q4_K *>(p);
             w->dm = __halves2half2(d, d);

@@ -21,13 +21,14 @@
 //      （ViT + 3x3 下采样 aligner，实现见 src/models/deepseekv41_vision.cpp），图像 token 的嵌入
 //      由 ForwardMultimodal 写入 input_ids 中 image_token_id 的位置。
 //
-// 当前实现目标：在通用 CUDA/CPU 路径上跑通文本 / 图文推理（单请求 prefill + decode），
-// 专家与 Engram 表放在 CPU 内存，注意力层放在 GPU。
+// 权重、注意力和 KV 实现共用；GPU 与混合专家执行分别维护，初始化时选择后端。
+// Engram 表可常驻 CPU 内存或按行从 disk 读取，独立于专家执行模式。
 //
 
 #ifndef FASTLLM_DEEPSEEKV41_H
 #define FASTLLM_DEEPSEEKV41_H
 
+#include "utils/execution_mode.h"
 #include "deepseekv4.h"
 
 #include <atomic>
@@ -173,6 +174,10 @@ namespace fastllm {
         std::vector<std::vector<int64_t> > offsets;      // [engramLayer][(maxNgram-1)*heads]
     };
 
+    struct DeepSeekV41MoeContext;
+    class HybridMoeDecodeStep;
+    struct DeepSeekV41GraphSegmentMeta;
+
     class DeepSeekV41Model : public DeepSeekV4Model {
     public:
         DeepSeekV41Model();
@@ -247,7 +252,15 @@ namespace fastllm {
         bool UseGenericHistoryCache() const override { return false; }
         bool UseModelSpecificScheduler() const override { return false; }
 
+        ExecutionMode GetExecutionMode() const { return executionMode; }
+
     protected:
+        ExecutionMode executionMode = ExecutionMode::Cpu;
+        bool v41MoeCudaGraphCompatible = true;
+        void InitExecutionMode();
+        void BeginHybridMoeStep(HybridMoeDecodeStep &, bool tp, bool single, int seqlen);
+        bool RunGpuMoe(DeepSeekV41MoeContext &);
+        bool RunHybridMoe(DeepSeekV41MoeContext &);
         bool moeExpertCacheAttempted = false;
         // Source FP8/FP4 linears still require block-32 FP8 activations after
         // their weights have been decoded into the requested storage dtype.
@@ -359,6 +372,38 @@ namespace fastllm {
         // RoPE、压缩、indexer、稀疏注意力按片段分别执行。
         // inputEmbeds 非空时直接作为嵌入（[1, tokens, dim]，供视觉输入使用）；
         // imageMask 非空时标记每个 token 是否为图像 token（Engram 历史置 -1，路由改用 gate.bias_vl）。
+        struct ForwardWorkspace;
+        struct ForwardState;
+        void PrepareForward(ForwardWorkspace &);
+        void PrepareForwardInputs(ForwardWorkspace &);
+        void BeginForwardLayer(ForwardWorkspace &, int layer);
+        void EndForwardLayer(ForwardWorkspace &, int layer);
+        void RunForwardSharedExpert(ForwardWorkspace &, int layer);
+        DeepSeekV41MoeContext MakeForwardMoeContext(ForwardWorkspace &, int layer);
+        std::vector<int> FinishForward(ForwardWorkspace &);
+        void GiveUpForwardGraph(ForwardWorkspace &, const char *stage);
+        void CollectForwardGraphPointers(ForwardWorkspace &, std::vector<const void*> &out);
+        void ReleaseForwardPrefill(ForwardWorkspace &, std::initializer_list<Data *> tensors);
+        void RunForwardGraphSegment(ForwardWorkspace &, const std::function<void()> &body, int index, bool capturable,
+            const std::function<void(DeepSeekV41GraphSegmentMeta&)> &record,
+            const std::function<void(const DeepSeekV41GraphSegmentMeta&)> &restore);
+        std::vector<int> ForwardGpu(const std::vector<DeepSeekV41Segment> &inputSegments,
+                                                       const Data &inputIds,
+                                                       const Data *inputEmbeds,
+                                                       const std::vector<int> *imageMask,
+                                                       const std::vector<GenerationConfig> &generationConfigsIn,
+                                                       const LastTokensManager &lastTokens,
+                                                       std::vector<std::vector<float>*> *retLogits,
+                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues);
+        std::vector<int> ForwardHybrid(const std::vector<DeepSeekV41Segment> &inputSegments,
+                                                       const Data &inputIds,
+                                                       const Data *inputEmbeds,
+                                                       const std::vector<int> *imageMask,
+                                                       const std::vector<GenerationConfig> &generationConfigsIn,
+                                                       const LastTokensManager &lastTokens,
+                                                       std::vector<std::vector<float>*> *retLogits,
+                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues);
+
         std::vector<int> ForwardSegments(
                 const std::vector<DeepSeekV41Segment> &inputSegments,
                 const Data &inputIds,

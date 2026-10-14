@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -1175,7 +1176,7 @@ struct CustomArState {
     bool captureFallbackLogged = false;
     std::map<std::vector<uintptr_t>, std::vector<CustomArRankData *> > registrations;
 
-    uint64_t generation = 0;
+    std::atomic<uint64_t> generation{0};
     int arrived = 0;
     int pendingCount = 0;
     int pendingType = -1;
@@ -1426,7 +1427,8 @@ bool BuildCustomArRegistration(CustomArState &state,
 bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
                                     void *input, int count, int dataType,
                                     bool localEligible,
-                                    CustomArRankData *&rankData) {
+                                    CustomArRankData *&rankData,
+                                    int hostSpinMicroseconds = 0) {
     // Registration is itself collective.  A local-pointer-only lookup is
     // unsafe because allocators can reuse an address on some ranks but not on
     // others; hit ranks would launch while miss ranks wait for registration.
@@ -1529,6 +1531,22 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
         state.generation++;
         state.condition.notify_all();
     } else {
+        // Dedicated decode submitters can meet without a scheduler wake-up.
+        // Keep the full tuple/eligibility rendezvous and its sleeping fallback;
+        // only the generation is read without holding the registration mutex.
+        if (hostSpinMicroseconds > 0 && !capturing) {
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::microseconds(hostSpinMicroseconds);
+            lock.unlock();
+            unsigned spins = 0;
+            while (state.generation.load(std::memory_order_acquire) == waitGeneration) {
+                if ((++spins & 63U) == 0) {
+                    if (std::chrono::steady_clock::now() >= deadline) break;
+                    std::this_thread::yield();
+                }
+            }
+            lock.lock();
+        }
         state.condition.wait(lock, [&state, waitGeneration]() {
             return state.generation != waitGeneration;
         });
@@ -1779,7 +1797,8 @@ bool LaunchCustomArPairAdd(CustomArState &state,
 
 bool RunCustomArCandidate(void *data, void *dest, int count,
                           int dataType, int deviceId,
-                          bool requireEnabledPath = false, int rowElements = 0) {
+                          bool requireEnabledPath = false, int rowElements = 0,
+                          int hostSpinMicroseconds = 0) {
     if (count <= 0 || rowElements < 0 || (rowElements && count % rowElements)) {
         return false;
     }
@@ -1814,7 +1833,7 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
 
     CustomArRankData *rankData = nullptr;
     if (!FindOrRegisterCustomArPointers(state, rank, data, count,
-                                        dataType, localEligible, rankData)) {
+                                        dataType, localEligible, rankData, hostSpinMicroseconds)) {
         return false;
     }
     const bool useTwoStage = CustomArUseTwoStage(state.devices.size(), bytes);
@@ -2884,6 +2903,12 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
 bool FastllmCudaCustomAllReduce(void *data, void *dest, int count,
                                 int dataType, int deviceId) {
     return RunCustomArCandidate(data, dest, count, dataType, deviceId, true);
+}
+
+bool FastllmCudaCustomAllReduceWithSpin(void *data, void *dest, int count,
+                                      int dataType, int deviceId, int hostSpinMicroseconds) {
+    return RunCustomArCandidate(data, dest, count, dataType, deviceId, true, 0,
+                                hostSpinMicroseconds);
 }
 
 bool FastllmCudaCustomAllReduceRows(void *data, void *dest, int count,

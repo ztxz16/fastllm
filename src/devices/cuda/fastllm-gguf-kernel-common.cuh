@@ -23,7 +23,15 @@ static __device__ __forceinline__ int get_int_b2(const void *p, const int &i) {
     const auto *v = static_cast<const uint16_t *>(p);
     return int(uint32_t(v[2 * i]) | (uint32_t(v[2 * i + 1]) << 16));
 }
-static __device__ __forceinline__ int ggml_cuda_dp4a(int a, int b, int c) { return __dp4a(a, b, c); }
+static __device__ __forceinline__ int ggml_cuda_dp4a(int a, int b, int c) {
+#if __CUDA_ARCH__ >= 610
+    return __dp4a(a, b, c);
+#else
+    const auto *x = reinterpret_cast<const int8_t *>(&a);
+    const auto *y = reinterpret_cast<const int8_t *>(&b);
+    return c + x[0]*y[0] + x[1]*y[1] + x[2]*y[2] + x[3]*y[3];
+#endif
+}
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
 #pragma unroll
     for (int d = 16; d; d >>= 1)
