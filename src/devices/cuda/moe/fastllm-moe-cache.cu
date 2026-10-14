@@ -2377,16 +2377,25 @@ bool ComputeFP8Cache(const fastllm::Data &input, fastllm::Data &gateOutput,
         cache.routeSlots, scores, topk, perExpert);
 }
 
+bool ComputeV41Cache(const fastllm::Data &input, fastllm::Data &activation,
+        fastllm::Data &output, const OffloadLayout &layout, const DeviceCache &cache,
+        const float *scores, int topk, float *perExpert);
+
 bool ComputeStagedNativeExpert(const fastllm::Data &input, fastllm::Data &gate,
         fastllm::Data &output, const OffloadLayout &layout, const DecodeOverlapWorkspace &work,
         int32_t *slot, const float *score, float *perExpert, const FastllmCudaMoeStageEvents &events) {
-    if (input.dataType != fastllm::FLOAT32) return false;
+    const bool v41 = layout.deepSeekV41 &&
+        layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 && input.dataType == fastllm::BFLOAT16;
+    if (!v41 && input.dataType != fastllm::FLOAT32) return false;
     DeviceCache temporary;
     temporary.slots = work.expertReady.size(); temporary.records = work.records;
     temporary.fp8Pointers = work.fp8Pointers; temporary.routeSlots = slot;
     fastllm::Data gateRow;
     gateRow.FakeFrom(gate, 0); gateRow.Resize({1, layout.inter});
     gateRow.dataDeviceIds = gate.dataDeviceIds;
+    // The caller supplies the same block32-quantized BF16 activation used by
+    // resident V4.1 experts. Temporary records must keep that arithmetic too.
+    if (v41) return ComputeV41Cache(input, gateRow, output, layout, temporary, score, 1, perExpert);
     if (layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3)
         return LaunchNVFP4Cache<float>(input, gateRow, output, layout, temporary, score, 1, perExpert, events);
     return FastllmCudaMoeFP8CacheComputeStaged(input, gateRow, output, FP8CacheView(layout, temporary),
@@ -3823,10 +3832,14 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
     // can overlap the previous token's admissions instead of waiting here.
     WaitCacheAdmission(*cache);
     // GLM GGUF verification also needs an active scope when all experts fit.
-    const bool frequencyScope = (!group->layout.deepSeekV41 && !group->layout.glm5) ||
+    const char *v41Frequency = std::getenv("FASTLLM_DSV41_MOE_FREQUENCY");
+    const bool v41FrequencyScope = group->layout.deepSeekV41 &&
+        group->layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 &&
+        v41Frequency && std::strcmp(v41Frequency, "0") != 0;
+    const bool frequencyScope = v41FrequencyScope || (!group->layout.deepSeekV41 && !group->layout.glm5) ||
         (group->layout.glm5 && (NativeSharedRecords(*group) ||
          group->layout.weightType == fastllm::DATA_GGUF_FORMAT));
-    if (frequencyScope && (cache->slots < int(group->totalRecords) ||
+    if (frequencyScope && (v41FrequencyScope || cache->slots < int(group->totalRecords) ||
         (group->layout.glm5 && group->layout.weightType == fastllm::DATA_GGUF_FORMAT))) {
         PrepareFrequencyPolicy(group, cache);
         cache->frequency->BeginStep();
@@ -4654,7 +4667,8 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
                     layout.weightType == fastllm::DATA_GGUF_FORMAT ?
                     ComputeGGUFExperts(input, gateOutput, output, layout, temporary,
                         routeScore, 1, routeOutput, events) :
-                    ComputeStagedNativeExpert(input, gateOutput, output, layout, *overlap,
+                    ComputeStagedNativeExpert(layout.deepSeekV41 ? work.quantizedInput : input,
+                        gateOutput, output, layout, *overlap,
                         overlap->slots + route, routeScore, routeOutput, events);
                 fastllm::AssertInFastLLM(computed, "Staged decode CUDA expert failed.\n");
                 temporary.q8InputPrepared = true;

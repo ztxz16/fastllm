@@ -32,6 +32,18 @@ namespace fastllm {
                     "CUDA shared experts and ordinary math; using the configured backend.\n");
             }
         }
+        // A complete decode step spans every layer. Admission runs afterward,
+        // outside graph capture, while the attention/shared segments retain
+        // their stable graph-owned tensors. Unsupported layouts retain NUMA.
+        if (!tp && single && seqlen == 1 &&
+            V41EnvFlag("FASTLLM_DSV41_MOE_FREQUENCY") && FastllmCudaMoeCacheRequested() &&
+            !V41ReferenceMathEnabled() && GetCudaSharedExpert() &&
+            std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
+            (this->deviceMap.empty() || V41DeviceMapUsesCuda(this->deviceMap)) &&
+            V41DeviceMapCudaDeviceCount(this->deviceMap) <= 1) {
+            step.Begin(
+                weights[0].data(), (int)weights[0].size(), num_experts_per_tok);
+        }
 #endif
     }
 
@@ -65,7 +77,28 @@ namespace fastllm {
               (tp || (single && seqlen == 1 && !FastllmCudaMoeCacheRequested()))));
 #endif
         bool tpCacheHandled = false;
+        bool singleCacheHandled = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        if (ctx.step && hasSharedExpertOut &&
+            moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
+            ffnInput.dataDevice == DataDevice::CUDA && ffnInput.cudaData &&
+            FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
+            const int device = FastllmCudaGetDevice();
+            auto &cache = ws->moeCache[device];
+            // The router may return CPU tensors. Stage only its small
+            // result, never migrate the input/output of a captured segment.
+            V41ReplicaToCpu(cache.index, expertIndex, tpDevices);
+            V41ReplicaToCpu(cache.score, expertScore, tpDevices);
+            cache.index.ToDevice(DataDevice::CUDA, {device}, true);
+            cache.score.ToDevice(DataDevice::CUDA, {device}, true);
+            Data input;
+            input.FakeFrom(ffnInput, 0);
+            input.Resize({1, dim});
+            input.dataDeviceIds = {device};
+            singleCacheHandled = fastllm::RunHybridMoe(
+                input, cache.index, cache.score, ffnOut,
+                moeWeights.data(), (int)moeWeights.size(), layer, runSharedSegment);
+        }
         if (tp && FastllmCudaMoeCacheRequested() && single &&
             (seqlen == 1 || (dsparkVerify && seqlen <= 8)) && !dumpDebug && hasSharedExpertOut &&
             !V41ReferenceMathEnabled() &&
@@ -113,7 +146,7 @@ namespace fastllm {
             FastllmCudaSetDevice(originalDevice);
         }
 #endif
-        if (!tpCacheHandled) {
+        if (!tpCacheHandled && !singleCacheHandled) {
             if (overlapShared) {
                 V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
                 V41ReplicaToCpu(cpuMoeIndex, expertIndex, tpDevices);
@@ -128,7 +161,7 @@ namespace fastllm {
         combineFfnPostDispatch = tp && single && hasSharedExpertOut && !dumpDebug &&
             (seqlen == 1 || dsparkVerify);
 #endif
-        if (!tpCacheHandled) {
+        if (!tpCacheHandled && !singleCacheHandled) {
             this->ApplyMoeDeviceMapForLayer(layer);
             // 路由专家在 multicuda 上按专家并行（每卡一部分专家 + all-reduce），
             // 在 cpu / numa 上仍然是单份计算，结果随后广播回两张卡。
@@ -213,6 +246,10 @@ namespace fastllm {
                 ffnOut.ToDevice(DataDevice::CUDA);
             }
 #endif
+        }
+        if (singleCacheHandled) {
+            ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
+            AddTo(ffnOut, sharedExpertOut);
         }
         return combineFfnPostDispatch;
     }

@@ -3,6 +3,8 @@
 #include "utils.h"
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
+#include "moe_cache_config.h"
 #include "devices/numas/numasdevice.h"
 #include "devices/numas/numas.h"
 #include "../../src/devices/cuda/moe/fastllm-moe-deepseekv41-cache.cuh"
@@ -460,6 +462,49 @@ int main(int argc, char **argv) {
                         values[c] = __bfloat162float(actual[c]);
                     Compare(values, expected, "V4.1 cache/oracle mismatch");
                 }
+            }
+            if (pass == 0) {
+                // Start cold: exercise calibrated temporary GPU execution,
+                // gradual frequency admission and then fully resident routes.
+                // Admission never changes the routed expert IDs or arithmetic.
+                FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+                MoeCacheConfig policy;
+                policy.updateInterval = 2;
+                policy.maxReplacements = 1;
+                policy.replacementMargin = 0;
+                SetMoeCacheConfig(policy);
+                Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "frequency cache preparation failed");
+                setenv("FASTLLM_DSV41_MOE_FREQUENCY", "1", 1);
+                setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "hybrid", 1);
+                unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
+                uint64_t before[8], after[8];
+                Require(fastllm_moe_cuda_cache_route_stats(0, before), "frequency initial statistics failed");
+                for (int repeat = 0; repeat < 24; ++repeat) {
+                    void *step = FastllmCudaBeginMoeDecode(weights[t].data(), weights[t].size(), topk);
+                    Require(step != nullptr, "frequency decode scope rejected");
+                    int callbacks = 0;
+                    Require(FastllmCudaMergeMOEHybrid(input, index, scores, output,
+                        weights[t].data(), weights[t].size(), t, [&] { ++callbacks; }),
+                        "frequency hybrid rejected");
+                    Require(callbacks == 1, "frequency shared callback count mismatch");
+                    FastllmCudaEndMoeDecode(step);
+                    Check(cudaMemcpy(actual.data(), output.cudaData, hidden * 2, cudaMemcpyDeviceToHost));
+                    std::vector<float> values(hidden);
+                    for (int c = 0; c < hidden; ++c) values[c] = __bfloat162float(actual[c]);
+                    Compare(values, expected, "frequency/staged FP4 oracle mismatch");
+                }
+                Require(fastllm_moe_cuda_cache_route_stats(0, after), "frequency final statistics failed");
+                Require(after[1] - before[1] == 24 * topk, "frequency route count mismatch");
+                Require(after[5] > before[5], "frequency CPU misses not exercised");
+                Require(after[6] > before[6], "frequency resident GPU hits not exercised");
+                Require(after[4] - before[4] > after[6] - before[6], "dynamic GPU miss streaming not exercised");
+                std::printf("FREQUENCY_PASS routes=%llu CPU=%llu resident=%llu streamed=%llu\n",
+                    (unsigned long long)(after[1] - before[1]),
+                    (unsigned long long)(after[5] - before[5]),
+                    (unsigned long long)(after[6] - before[6]),
+                    (unsigned long long)((after[4] - before[4]) - (after[6] - before[6])));
+                unsetenv("FASTLLM_DSV41_MOE_FREQUENCY");
+                SetMoeCacheConfig(MoeCacheConfig{});
             }
             // Full NUMA fallback must obey the same contract as the subset.
             for (int rows : (pass < 4 && pass % 4 != 1 ? std::vector<int>{1, 5, 33} : std::vector<int>{1})) {
