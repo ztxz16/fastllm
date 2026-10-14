@@ -60,23 +60,19 @@ __device__ __forceinline__ void LoadScoreVector(void *destination, const void *s
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
             :: "r"(address), "l"(source), "r"(bytes) : "memory");
 }
-template<bool CacheL1>
-__device__ __forceinline__ void LoadScoreVector(void *destination, FastllmNaiveKVRow source, bool valid) {
-    if (source.fp8) *(uint4 *)destination = valid ? source.Load8() : make_uint4(0,0,0,0);
-    else LoadScoreVector<CacheL1>(destination, source.data, valid);
-}
-
 #endif
 
 // K occupies the MMA row dimension: each warp produces sixteen key scores.
 // Cache the reused Q in L1, while streaming K directly to shared memory.
 // The caller guarantees 16-byte alignment and retains Scores as the fallback.
+template<bool FP8>
 __global__ void HopperScores(const BF16 *weights, Batch batch) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_dsa_mma;
     constexpr int Threads = 128;
     Row r = batch.rows[blockIdx.y];
     r.key.Bind(r.cache);
+    r.key.fp8 = FP8;
     const int n = *r.live, first = blockIdx.x * kKeys;
     if (first >= n) return;
     __shared__ __align__(16) BF16 qs[kHeads][kIndexerDim + 8], ks[kKeys][kIndexerDim + 8];
@@ -90,17 +86,35 @@ __global__ void HopperScores(const BF16 *weights, Batch batch) {
     // Keep per-row translation for arbitrary page lengths (e.g. 96 tokens).
     const bool onePage = !r.key.pages || r.key.pageLen % kKeys == 0;
     const auto tile = onePage ? r.key.Row(first, r.stride) : FastllmNaiveKVRow{};
-    for (int i = t; i < kKeys * (kIndexerDim / 8); i += Threads) {
-        int key = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
-        const auto base = onePage ? tile + (size_t)key * r.stride
-                                  : r.key.Row(min(first + key, n - 1), r.stride);
-        LoadScoreVector<false>(&ks[key][d], base + r.stride - kIndexerDim + d, first + key < n);
+    if constexpr (FP8) {
+        __shared__ __align__(16) unsigned char packed[kKeys][kIndexerDim];
+        for (int i = t; i < kKeys * (kIndexerDim / 16); i += Threads) {
+            int key = i / (kIndexerDim / 16), d = i % (kIndexerDim / 16) * 16;
+            const auto base = onePage ? tile + (size_t)key * r.stride
+                                      : r.key.Row(min(first + key, n - 1), r.stride);
+            LoadScoreVector<false>(&packed[key][d],
+                (const unsigned char *)base.data + r.stride - kIndexerDim + d, first + key < n);
+        }
+        asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+        for (int i = t; i < kKeys * (kIndexerDim / 8); i += Threads) {
+            int key = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
+            *(uint4 *)&ks[key][d] = FastllmNaiveKVRow(&packed[key][d], true).Load8();
+        }
+    } else {
+        for (int i = t; i < kKeys * (kIndexerDim / 8); i += Threads) {
+            int key = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
+            const auto base = onePage ? tile + (size_t)key * r.stride
+                                      : r.key.Row(min(first + key, n - 1), r.stride);
+            LoadScoreVector<false>(&ks[key][d], (base + r.stride - kIndexerDim + d).data, first + key < n);
+        }
     }
     if (t < kHeads) {
         scales[t] = r.scale[t];
         weightsF[t] = (float)weights[r.sequence * kHeads + t];
     }
-    asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;" ::: "memory");
+    if constexpr (!FP8)
+        asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;" ::: "memory");
     __syncthreads();
     float dot[2][4] = {};
 #pragma unroll

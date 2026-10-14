@@ -102,7 +102,9 @@ __device__ inline void Normalize(BF *prob, const float *sink, int head, int n, i
         }
     }
 }
-template <int Max> struct Storage {
+template<bool FP8> struct PackedStorage {};
+template<> struct PackedStorage<true> { __align__(16) unsigned char packed[128][192]; };
+template <int Max, bool FP8 = false> struct Storage : PackedStorage<FP8> {
     BF qs[8][200];
     union {
         BF keys[128][200];
@@ -111,16 +113,17 @@ template <int Max> struct Storage {
     BF prob[8][Max + 8];
     int selected[128];
 };
-template <int Max, bool Ring>
+template <int Max, bool Ring, bool FP8, bool AsyncFP8 = true>
 __global__ __launch_bounds__(256) void Decode(const BF *q, Batch batch, const float *sink, BF *out,
                                               int heads, int kvHeads) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_dsa_decode;
     extern __shared__ __align__(16) char buffer[];
-    auto &s = *(Storage<Max> *)buffer;
+    auto &s = *(Storage<Max, FP8 && AsyncFP8> *)buffer;
     const int row = blockIdx.x, group = blockIdx.y, head = group * 8, t = threadIdx.x, l = t % 32,
               w = t / 32, kh = head / (heads / kvHeads);
     auto r = FastllmNaiveResolveDSARow(batch.rows[row]);
+    r.fp8 = FP8;
     int len = Ring ? (r.liveKeys ? *r.liveKeys : r.length) : Length(r);
     int n = Ring ? min(len, 128) : (r.indices ? r.selectedCount : len);
     for (int i = t; i < 8 * 24; i += 256) {
@@ -136,12 +139,27 @@ __global__ __launch_bounds__(256) void Decode(const BF *q, Batch batch, const fl
             s.selected[t] = k;
         }
         __syncthreads();
-        for (int i = t; i < 128 * 24; i += 256) {
-            int k = s.selected[i / 24], d = i % 24 * 8;
-            Copy<true>(&s.tile.keys[i / 24][d],
-                       FastllmNaiveKVRow(r.key, r.fp8) + (size_t)max(k, 0) * r.keyStride + kh * 192 + d, k >= 0);
+        if constexpr (FP8 && AsyncFP8) {
+            // Stage packed bytes asynchronously; expand only this shared tile.
+            for (int i = t; i < 128 * 12; i += 256) {
+                int k = s.selected[i / 12], d = i % 12 * 16;
+                Copy<true>(&s.packed[i / 12][d],
+                    (const unsigned char *)r.key + (size_t)max(k, 0) * r.keyStride + kh * 192 + d, k >= 0);
+            }
+            asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
+            __syncthreads();
+            for (int i = t; i < 128 * 24; i += 256) {
+                int row = i / 24, d = i % 24 * 8;
+                *(uint4 *)&s.tile.keys[row][d] = FastllmNaiveKVRow(&s.packed[row][d], true).Load8();
+            }
+        } else {
+            for (int i = t; i < 128 * 24; i += 256) {
+                int k = s.selected[i / 24], d = i % 24 * 8;
+                Copy<true>(&s.tile.keys[i / 24][d],
+                           FastllmNaiveKVRow(r.key, r.fp8) + (size_t)max(k, 0) * r.keyStride + kh * 192 + d, k >= 0);
+            }
+            asm volatile("cp.async.commit_group; cp.async.wait_group 0;");
         }
-        asm volatile("cp.async.commit_group; cp.async.wait_group 0;");
         __syncthreads();
         float acc[4] = {};
 #pragma unroll
@@ -172,12 +190,27 @@ __global__ __launch_bounds__(256) void Decode(const BF *q, Batch batch, const fl
             s.selected[t] = k;
         }
         __syncthreads();
-        for (int i = t; i < 128 * 16; i += 256) {
-            int k = s.selected[i / 16], d = i % 16 * 8;
-            Copy<true>(&s.tile.values[i / 16][d],
-                       FastllmNaiveKVRow(r.value, r.fp8) + ((size_t)max(k, 0) * kvHeads + kh) * 128 + d, k >= 0);
+        if constexpr (FP8 && AsyncFP8) {
+            // Stage packed bytes asynchronously; expand only this shared tile.
+            for (int i = t; i < 128 * 8; i += 256) {
+                int k = s.selected[i / 8], d = i % 8 * 16;
+                Copy<true>(&s.packed[i / 8][d],
+                    (const unsigned char *)r.value + ((size_t)max(k, 0) * kvHeads + kh) * 128 + d, k >= 0);
+            }
+            asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
+            __syncthreads();
+            for (int i = t; i < 128 * 16; i += 256) {
+                int row = i / 16, d = i % 16 * 8;
+                *(uint4 *)&s.tile.values[row][d] = FastllmNaiveKVRow(&s.packed[row][d], true).Load8();
+            }
+        } else {
+            for (int i = t; i < 128 * 16; i += 256) {
+                int k = s.selected[i / 16], d = i % 16 * 8;
+                Copy<true>(&s.tile.values[i / 16][d],
+                           FastllmNaiveKVRow(r.value, r.fp8) + ((size_t)max(k, 0) * kvHeads + kh) * 128 + d, k >= 0);
+            }
+            asm volatile("cp.async.commit_group; cp.async.wait_group 0;");
         }
-        asm volatile("cp.async.commit_group; cp.async.wait_group 0;");
         __syncthreads();
 #pragma unroll
         for (int k = 0; k < 128; k += 16) {

@@ -302,7 +302,7 @@ constexpr int kTrimMaxRows = 128;
 // A CTA owns a disjoint 64-byte column tile and stages all retained rows
 // before writing. The barrier makes overlapping suffix moves safe while rows
 // are copied in parallel; other CTAs never read or write these columns.
-template <bool ToRing, typename T = BF16>
+template <bool ToRing, typename T>
 __global__ void SwaCacheLayout(T *key, T *value, int kc, int vc, int count, int first) {
     constexpr int columns = kTrimTileBytes / sizeof(T);
     __shared__ T rows[kSwaWindow * columns];
@@ -1421,13 +1421,22 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
         else firstKey = max(0, *liveKeys.length - kSwaWindow);
     }
     __shared__ float scores[MaxKeys], scratch[kSwaThreads], maximum, denominator;
-    __shared__ BF16 values[MaxKeys][OutputTile];
+    __shared__ __align__(16) BF16 values[MaxKeys][OutputTile];
     int h = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
     int kvHead = h / (heads / kvHeads), firstDim = blockIdx.z * OutputTile;
-    for (int i = t; i < keys * OutputTile; i += Threads) {
-        int row = i / OutputTile, col = i % OutputTile;
-        const int physical = Ring ? ((firstKey + row) & (kSwaWindow - 1)) : row;
-        values[row][col] = v.Row(physical, kvHeads * kSwaValueDim)[kvHead * kSwaValueDim + firstDim + col];
+    if (v.fp8) {
+        for (int i = t; i < keys * (OutputTile / 8); i += Threads) {
+            int row = i / (OutputTile / 8), col = i % (OutputTile / 8) * 8;
+            const int physical = Ring ? ((firstKey + row) & (kSwaWindow - 1)) : row;
+            *(uint4 *)&values[row][col] = (v.Row(physical, kvHeads * kSwaValueDim) +
+                kvHead * kSwaValueDim + firstDim + col).Load8();
+        }
+    } else {
+        for (int i = t; i < keys * OutputTile; i += Threads) {
+            int row = i / OutputTile, col = i % OutputTile;
+            const int physical = Ring ? ((firstKey + row) & (kSwaWindow - 1)) : row;
+            values[row][col] = v.Row(physical, kvHeads * kSwaValueDim)[kvHead * kSwaValueDim + firstDim + col];
+        }
     }
     float query[kSwaQkDim / 32];
     #pragma unroll
@@ -1437,7 +1446,7 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
         float dot = 0;
         #pragma unroll
         for (int i = 0; i < kSwaQkDim / 32; ++i)
-            dot += query[i] * (float)k.Row(physical, keyStride)[kvHead * kSwaQkDim + lane + i * 32];
+            dot += query[i] * k.Row(physical, keyStride).LoadFloat(kvHead * kSwaQkDim + lane + i * 32);
         dot = WarpSum(dot);
         if (lane == 0) scores[slot] = RoundBF16(RoundBF16(dot) * rsqrtf((float)kSwaQkDim));
     }
@@ -3068,6 +3077,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         weights.dims.empty() || weights.dims.back() != heads ||
         !FastllmCudaFlashInferDataTypeSupported(BFLOAT16)) return false;
     bool hopper = FastllmCudaRuntimeArch() == 90;
+    const auto cacheType = rows.front().key ? rows.front().key->dataType : BFLOAT16;
     int maxCapacity = 0;
     for (const auto &row : rows) {
         if (!row.key || !row.scratch || !row.indices || !FastllmNaiveKVType(row.key->dataType) ||
@@ -3076,7 +3086,10 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             row.sequence < 0 || row.sequence >= liveKeys.Count(0) ||
             (size_t)(row.sequence + 1) * heads * dim > query.Count(0) ||
             (size_t)(row.sequence + 1) * heads > weights.Count(0)) return false;
-        hopper = hopper && row.key->dims[2] % 8 == 0 && (uintptr_t)row.key->cudaData % 16 == 0;
+        // cp.async copies 16 bytes; FP8 therefore needs twice as many elements.
+        hopper = hopper && row.key->dataType == cacheType &&
+            row.key->dims[2] % (cacheType == FP8_E4M3 ? 16 : 8) == 0 &&
+            (uintptr_t)row.key->cudaData % 16 == 0;
         maxCapacity = std::max(maxCapacity, row.capacity);
     }
     // A CTA scans each row. Keep cooperative selection when there are too few
@@ -3103,7 +3116,10 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         }
         batch::Quantize<<<dim3(heads, count), dim>>>((const BF16 *)query.cudaData, descriptors);
         const dim3 grid((capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, count);
-        if (hopper) batch::HopperScores<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+        if (hopper) {
+            auto kernel = cacheType == FP8_E4M3 ? batch::HopperScores<true> : batch::HopperScores<false>;
+            kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+        }
         else batch::Scores<<<grid, naive_dsa_mma::kThreads>>>((const BF16 *)weights.cudaData, descriptors);
         batch::Select<<<count, naive_topk::kThreads>>>(descriptors);
         batch::Sort<<<count, naive_topk::kThreads>>>(descriptors);
@@ -3136,12 +3152,27 @@ template <int Max, bool Ring>
 bool BulkAttention(const fastllm::Data &query, const float *bias,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, fastllm::Data &output) {
     namespace bulk = naive_attention_bulk;
-    if (!BulkKernelSupported(bulk::Decode<Max, Ring>, sizeof(bulk::Storage<Max>), 80)) return false;
+    const bool fp8 = rows.front().fp8;
+    bool asyncFP8 = fp8;
+    for (const auto &row : rows) {
+        if (row.fp8 != fp8) return false;
+        asyncFP8 = asyncFP8 && row.keyStride % 16 == 0;
+    }
+    auto kernel = fp8 ? (asyncFP8 ? bulk::Decode<Max, Ring, true> : bulk::Decode<Max, Ring, true, false>)
+                      : bulk::Decode<Max, Ring, false>;
+    size_t shared = asyncFP8 ? sizeof(bulk::Storage<Max, true>) : sizeof(bulk::Storage<Max, false>);
+    if (!BulkKernelSupported(kernel, shared, 80)) {
+        // GPUs with a smaller shared-memory limit retain the vector-load path.
+        if (!asyncFP8) return false;
+        kernel = bulk::Decode<Max, Ring, true, false>;
+        shared = sizeof(bulk::Storage<Max, false>);
+        if (!BulkKernelSupported(kernel, shared, 80)) return false;
+    }
     for (int first = 0; first < (int)rows.size(); first += bulk::BatchLimit) {
         int n = std::min(bulk::BatchLimit, (int)rows.size() - first);
         bulk::Batch batch{};
         std::copy_n(rows.begin() + first, n, batch.rows);
-        bulk::Decode<Max, Ring><<<dim3(n, heads / 8), 256, sizeof(bulk::Storage<Max>)>>>(
+        kernel<<<dim3(n, heads / 8), 256, shared>>>(
             (const BF16 *)query.cudaData + (size_t)first * heads * 192, batch, bias,
             (BF16 *)output.cudaData + (size_t)first * heads * 128, heads, kvHeads);
     }

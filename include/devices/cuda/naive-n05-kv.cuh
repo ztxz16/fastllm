@@ -20,29 +20,30 @@ struct FastllmNaiveKVRow {
         return fp8 ? __float2bfloat16_rn((float)((const __nv_fp8_e4m3 *)data)[n])
                    : ((const __nv_bfloat16 *)data)[n];
     }
+    // Every finite E4M3 value is exactly representable in BF16. Scalar
+    // FP32 consumers can skip the redundant BF16 round-trip.
+    __device__ __forceinline__ float LoadFloat(size_t n) const {
+        return fp8 ? (float)((const __nv_fp8_e4m3 *)data)[n]
+                   : (float)((const __nv_bfloat16 *)data)[n];
+    }
+    // E4M3 is exactly representable in FP16 and BF16. Pair conversion uses
+    // the native FP8x2 instruction where available and preserves CUDA's NaNs.
+    __device__ __forceinline__ static unsigned ConvertPair(unsigned short bits) {
+        __half2 h = __nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3);
+        float2 f = __half22float2(h);
+        __nv_bfloat162 b = __floats2bfloat162_rn(f.x, f.y);
+        return *reinterpret_cast<unsigned *>(&b);
+    }
     __device__ __forceinline__ uint4 Load8() const {
         if (!fp8) return *(const uint4 *)data;
         uint2 packed = *(const uint2 *)data;
-        uint4 result;
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            __nv_fp8_e4m3 value;
-            value.__x = ((const unsigned char *)&packed)[i];
-            ((__nv_bfloat16 *)&result)[i] = __float2bfloat16_rn((float)value);
-        }
-        return result;
+        return make_uint4(ConvertPair(packed.x), ConvertPair(packed.x >> 16),
+                          ConvertPair(packed.y), ConvertPair(packed.y >> 16));
     }
     __device__ __forceinline__ uint2 Load4() const {
         if (!fp8) return *(const uint2 *)data;
         unsigned packed = *(const unsigned *)data;
-        uint2 result;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            __nv_fp8_e4m3 value;
-            value.__x = ((const unsigned char *)&packed)[i];
-            ((__nv_bfloat16 *)&result)[i] = __float2bfloat16_rn((float)value);
-        }
-        return result;
+        return make_uint2(ConvertPair(packed), ConvertPair(packed >> 16));
     }
 };
 
