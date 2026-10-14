@@ -252,13 +252,12 @@ extern "C" int fastllm_ep8_mega_moe_prepare_prefill(void *handle, void *workspac
             l.prefillCapacity = capacity;
         }
         // The caller lends dead router activations. Reset only control data;
-        // dispatch/combine overwrite all live token data. Finish both writes
-        // before the caller publishes this arena to any remote rank.
+        // dispatch/combine overwrite all live token data. The caller records
+        // an event after these writes and makes every peer stream wait for it.
         const size_t controls = layout::SM90Workspace(workspace, R, E, capacity, K).get_num_bytes();
         check(cudaMemsetAsync(workspace, 0, controls, cudaStreamPerThread));
         check(cudaMemcpyAsync(l.prefill.metadata, &l.prefillMetadata, sizeof(Metadata),
                              cudaMemcpyHostToDevice, cudaStreamPerThread));
-        check(cudaStreamSynchronize(cudaStreamPerThread));
         return capacity;
     } catch (const std::exception &e) { error = e.what(); return -1; }
 }

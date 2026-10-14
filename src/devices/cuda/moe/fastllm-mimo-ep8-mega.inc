@@ -6,6 +6,7 @@
 #include "devices/cuda/fastllm-mimo-ep8-mega-kernel.h"
 #if defined(FASTLLM_ENABLE_MIMO_EP8_MEGA) && !defined(_WIN32) && !defined(USE_ROCM)
 #include "devices/multicuda/fastllm-multicuda.cuh"
+#include "devices/cuda/naive-n05-cuda.cuh"
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -16,7 +17,11 @@ struct FastllmCudaMimoEp8Mega {
         std::vector<void *> layers;
         void *output = nullptr; // Borrowed only during the prefill exchange.
         void *prefillScratch = nullptr;
-        ~Rank() { for (void *layer : layers) if (layer) fastllm_ep8_mega_moe_destroy(layer); }
+        void *prefillReady = nullptr;
+        ~Rank() {
+            for (void *layer : layers) if (layer) fastllm_ep8_mega_moe_destroy(layer);
+            if (prefillReady) FastllmCudaEventDestroy(prefillReady);
+        }
     };
     std::vector<int> devices;
     std::vector<std::unique_ptr<Rank>> ranks;
@@ -74,6 +79,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     for (int r = 0; r < 8; ++r) {
         FastllmCudaSetDevice(devices[r]);
         auto rank = std::make_unique<FastllmCudaMimoEp8Mega::Rank>();
+        rank->prefillReady = FastllmCudaEventCreate();
         rank->workspace.Resize({(int)bytes});
         rank->workspace.ToDevice(DataDevice::CUDA, {devices[r]}, false);
         rank->workspace.Allocate(false);
@@ -132,6 +138,18 @@ void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
         "Invalid MiMo EP8 prefill AllGather tensor.");
     const int total = output.dims[0];
     const size_t rowBytes = (size_t)output.dims[1] * output.unitSize;
+    if (total % ranks == 0) {
+        // The collective consumes and produces on each worker's compute
+        // stream. Rendezvous only for submission, never for GPU completion.
+        const int rows = total / ranks;
+        state.WaitForOutputs();
+        AssertInFastLLM(FastllmNcclAllGather(
+            (const uint8_t *)output.cudaData + (size_t)rank * rows * rowBytes,
+            output.cudaData, rows * output.dims[1], output.dataType, state.devices[rank]),
+            "MiMo EP8 prefill AllGather failed.");
+        state.WaitForOutputs();
+        return;
+    }
     state.ranks[rank]->output = output.cudaData;
     FastllmCudaSyncCurrentThreadStream();
     state.WaitForOutputs();
@@ -170,7 +188,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     void *handle = state.ranks.at(rank)->layers.at(layer);
     AssertInFastLLM(handle != nullptr, "Missing MiMo EP8 layer handle.");
     int capacity = fastllm_ep8_mega_moe_max_rows();
-    std::vector<const void *> prefillPeers;
+    const void *prefillPeers[8]{};
     // Eligibility uses the common input shape so every rank participates even
     // when one local buffer is unavailable. Router FP32 input is dead here;
     // it is overwritten by the next layer's conversion, after AllGather's
@@ -190,13 +208,21 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
             AssertInFastLLM(prefillCapacity >= 0, fastllm_ep8_mega_moe_error());
             if (prefillCapacity) local.prefillScratch = prefillScratch->cudaData;
         }
+        FastllmCudaEventRecordCurrentThread(local.prefillReady);
         state.WaitForOutputs();
         bool ready = true;
         for (const auto &peer : state.ranks) ready = ready && peer->prefillScratch;
         if (ready) {
             capacity = prefillCapacity;
-            for (const auto &peer : state.ranks) prefillPeers.push_back(peer->prefillScratch);
+            for (int r = 0; r < ranks; ++r) {
+                const auto &peer = state.ranks[r];
+                FastllmCudaCurrentThreadStreamWaitEvent(peer->prefillReady);
+                prefillPeers[r] = peer->prefillScratch;
+            }
         }
+        // Every wait must capture this generation before a fast worker can
+        // re-record an event during the next layer's preparation.
+        state.WaitForOutputs();
     }
     auto run = [&](int start, int rows) {
         const int routeStart = localRouting ? start - begin : start;
@@ -204,9 +230,9 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
         void *y = (uint16_t *)output.cudaData + (size_t)start * 4096;
         const int32_t *idx = (const int32_t *)index.cudaData + routeStart * 8;
         const float *scores = (const float *)score.cudaData + routeStart * 8;
-        const int ok = prefillPeers.empty() ?
+        const int ok = !prefillPeers[0] ?
             fastllm_ep8_mega_moe_run(handle, x, y, idx, scores, rows) :
-            fastllm_ep8_mega_moe_run_prefill(handle, prefillPeers.data(), x, y, idx, scores, rows);
+            fastllm_ep8_mega_moe_run_prefill(handle, prefillPeers, x, y, idx, scores, rows);
         if (!ok)
             throw std::runtime_error(std::string("MiMo EP8 launch failed: ") + fastllm_ep8_mega_moe_error());
     };
@@ -252,6 +278,24 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
             output.cudaData, shard * 4096, BFLOAT16, state.devices[rank]),
             "MiMo EP8 decode AllGather failed.");
         return false;
+    }
+    if (localRouting && residual && normWeight && normOutput) {
+        // Keep residuals local between consecutive MoE layers. Gather the
+        // normalized input needed by the next TP projection, not raw MoE output.
+        normOutput->dataType = BFLOAT16;
+        normOutput->Resize(residual->dims);
+        normOutput->ToDevice(output.dataDevice, output.dataDeviceIds, false);
+        normOutput->Allocate(false);
+        const size_t offset = (size_t)begin * 4096 * sizeof(uint16_t);
+        Data localResidual(BFLOAT16, {shard, 4096}), localOutput, localNorm;
+        localResidual.FakeFrom(*residual, offset);
+        localOutput.FakeFrom(output, offset);
+        localNorm.FakeFrom(*normOutput, offset);
+        FastllmCudaNaiveAddDecodeRMSNorm(localResidual, localOutput, *normWeight, eps, localNorm);
+        Data gathered(BFLOAT16, {total, 4096});
+        gathered.FakeFrom(*normOutput, 0);
+        FastllmCudaMimoEp8PrefillAllGather(state, rank, gathered);
+        return true;
     }
     FastllmCudaMimoEp8PrefillAllGather(state, rank, output);
     return false;

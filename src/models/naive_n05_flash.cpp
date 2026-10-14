@@ -597,7 +597,18 @@ Data NaiveN05FlashModel::RunTarget(
             else AssertInFastLLM(false, "Naive TP RMSNorm launch failed.");
         }
     };
+    const bool fusePrefillNorm = !decodeWorkspace && !verifying && length > 1;
+    bool prefillNormReady = false, prefillResidualSharded = false;
     for (int layer = 0; layer < block_cnt; layer++) {
+        const bool shardPrefillNorm = fusePrefillNorm && shardPrefillRouter &&
+            moeLayers[layer] && layer + 1 < block_cnt && moeLayers[layer + 1] &&
+            (!capture || !capture->collectHidden);
+        if (prefillResidualSharded && !shardPrefillNorm) {
+            Data rows(BFLOAT16, {length, embed_dim});
+            rows.FakeFrom(hidden, 0);
+            FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, rows);
+            prefillResidualSharded = false;
+        }
         if (!tensorParallel) ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
         std::string prefix = "model.layers." + std::to_string(layer);
         std::string ap = prefix + ".self_attn.";
@@ -609,7 +620,7 @@ Data NaiveN05FlashModel::RunTarget(
         int rotaryDim = (int)(cfg.headDim * partialRotary);
         // This RMSNorm rounds the normalized activation before multiplying
         // the affine weight, matching the checkpoint's LlamaRMSNorm.
-        if (!decodeWorkspace || layer == 0)
+        if ((!decodeWorkspace && !prefillNormReady) || layer == 0)
             norm(hidden, localWeight(prefix + ".input_layernorm.weight"), normed);
         const auto merged = weight.weight.find(ap + "mergeqkv.weight");
         const bool mergedQkv = merged != weight.weight.end() && !merged->second.dims.empty();
@@ -972,7 +983,21 @@ Data NaiveN05FlashModel::RunTarget(
         Data &postAttentionNorm = localWeight(prefix + ".post_attention_layernorm.weight");
         const bool attentionNormReady = reduce(projected, decodeWorkspace ? &hidden : nullptr,
             &postAttentionNorm, &normed);
-        if (decodeWorkspace) {
+        if (shardPrefillNorm) {
+            const int first = (int)((int64_t)length * tpRank / 8);
+            const int rows = (int)((int64_t)length * (tpRank + 1) / 8) - first;
+            normed.dataType = BFLOAT16;
+            normed.Resize(hidden.dims);
+            normed.ToDevice(hidden.dataDevice, hidden.dataDeviceIds, false);
+            normed.Allocate(false);
+            Data localHidden(BFLOAT16, {rows, embed_dim}), localBranch, localNorm;
+            localHidden.FakeFrom(hidden, (size_t)first * embed_dim * sizeof(uint16_t));
+            localBranch.FakeFrom(projected, (size_t)first * embed_dim * sizeof(uint16_t));
+            localNorm.FakeFrom(normed, (size_t)first * embed_dim * sizeof(uint16_t));
+            FastllmCudaNaiveAddDecodeRMSNorm(localHidden, localBranch,
+                postAttentionNorm, rms_norm_eps, localNorm);
+            prefillResidualSharded = true;
+        } else if (decodeWorkspace || fusePrefillNorm) {
             if (!attentionNormReady)
                 FastllmCudaNaiveAddDecodeRMSNorm(hidden, projected,
                     postAttentionNorm, rms_norm_eps, normed);
@@ -981,7 +1006,7 @@ Data NaiveN05FlashModel::RunTarget(
             norm(hidden, postAttentionNorm, normed);
         }
         Data *mlpNormWeight = nullptr, *mlpNormOutput = nullptr;
-        if (decodeWorkspace) {
+        if (decodeWorkspace || (fusePrefillNorm && layer + 1 < block_cnt)) {
             const bool lastLayer = layer + 1 == block_cnt;
             const std::string name = lastLayer ? "model.norm.weight" :
                 "model.layers." + std::to_string(layer + 1) + ".input_layernorm.weight";
@@ -991,7 +1016,10 @@ Data NaiveN05FlashModel::RunTarget(
         auto addMlpResidual = [&](Data &branch, bool needsReduce) {
             if (!decodeWorkspace) {
                 if (needsReduce) reduce(branch);
-                AddTo(hidden, branch);
+                if (fusePrefillNorm && mlpNormWeight)
+                    FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, *mlpNormWeight,
+                        rms_norm_eps, *mlpNormOutput);
+                else AddTo(hidden, branch);
                 return;
             }
             if (!needsReduce || !reduce(branch, &hidden, mlpNormWeight, mlpNormOutput))
@@ -1070,7 +1098,8 @@ Data NaiveN05FlashModel::RunTarget(
             if (tensorParallel && tpEp8MegaState) {
                 moeNormReady = FastllmCudaRunMimoEp8Mega(*tpEp8MegaState, tpRank, layer, normed,
                     expertIndex, expertScore, moeOutput, decodeWorkspace,
-                    shardMoe ? &hidden : nullptr, mlpNormWeight, mlpNormOutput, rms_norm_eps,
+                    (shardMoe || shardPrefillNorm) ? &hidden : nullptr,
+                    mlpNormWeight, mlpNormOutput, rms_norm_eps,
                     !decodeWorkspace && !hasRouterProbabilities ? &routerInput : nullptr);
             } else if (executor.firstDevice.find("numa") == 0 &&
                 (moeWeights[layer][2]->dataType == DataType::FP8_E4M3 ||
@@ -1147,6 +1176,7 @@ Data NaiveN05FlashModel::RunTarget(
             if (!moeNormReady)
                 addMlpResidual(moeOutput, !(tensorParallel && tpEp8MegaState));
         }
+        prefillNormReady = fusePrefillNorm && mlpNormWeight;
         if (capture && capture->collectHidden &&
             std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end())
             Copy(hidden, capture->hidden[layer]);
