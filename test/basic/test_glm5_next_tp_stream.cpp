@@ -53,6 +53,21 @@ struct Glm5NextGGUFTestAccess {
         m.RemoveThreadTpRequest(&cache);
         return result;
     }
+    static void CheckCoordinatorEmbedding(Glm5NextModel &m) {
+        // The MTP draft uses the coordinator's embedding after rank zero has
+        // borrowed its CPU storage. Enabling CUDA embedding must not move the
+        // owner and invalidate that rank's view before the next target step.
+        auto &weight = m.weight["model.language_model.embed_tokens.weight"];
+        auto *storage = weight.cpuData;
+        SetCudaEmbedding(true);
+        Data ids(FLOAT32, {1,1}, {3}), hidden;
+        m.ForwardEmbedding(ids, hidden);
+        if (weight.dataDevice != DataDevice::CPU || weight.cpuData != storage)
+            throw std::runtime_error("coordinator embedding invalidated TP CPU storage");
+        if (Forward(m, ids) != 3)
+            throw std::runtime_error("TP embedding changed after coordinator lookup");
+        std::cout << "PASS: coordinator embedding retains TP CPU storage" << std::endl;
+    }
 };
 }
 static void CUDART_CB Delay(void *) { std::this_thread::sleep_for(std::chrono::milliseconds(80)); }
@@ -73,6 +88,7 @@ int main() {
     Data ids(FLOAT32, {1,1}, {0});
     ids.ToDevice(CUDA, std::vector<int>{0});
     if (Glm5NextGGUFTestAccess::Forward(model, ids) != 0) throw std::runtime_error("toy model warmup failed");
+    Glm5NextGGUFTestAccess::CheckCoordinatorEmbedding(model);
     float *pinned = nullptr;
     CheckCuda(cudaMallocHost(reinterpret_cast<void **>(&pinned), sizeof(float)));
     for (bool enabled : {false, true}) {

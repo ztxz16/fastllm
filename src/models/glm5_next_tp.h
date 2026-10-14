@@ -465,10 +465,12 @@ namespace fastllm {
                 (expertLayer >= 0 && !tp.shardedMoeLayers[expertLayer])) continue;
             if (name == languagePrefix + "embed_tokens.weight") {
                 source.ToDevice(DataDevice::CPU);
+                // Rank zero borrows this storage. The coordinator's MTP draft
+                // must not migrate its owner and invalidate the CPU view.
+                source.lockInCPU = true;
                 auto &local = tp.ranks[0]->weight[name];
                 local = source;
                 local.isFake = true;
-                local.lockInCPU = true;
                 continue;
             }
             StageThreadTpWeight(name);
