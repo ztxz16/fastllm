@@ -8,12 +8,15 @@
 namespace fastllm {
     // GPU-only MoE orchestration. No NUMA locks, cache admission, host prefetch
     // or dynamic split can enter this path, including CUDA graph capture.
-    void Qwen4ExpModel::RunGpuMoEWithPrefix(
-            int deviceLayer, const std::string &mlp,
-            std::vector<Data *> &moeWeights, std::vector<Data *> &moeBiass,
+    void Qwen4ExpModel::RunGpuMoE(
+            const MoEExecutionPlan &plan,
             const Data &input, Data &output, bool reduceOutput,
-            PrefillStageContext *, MoEGpuInputs *prepared,
+            PrefillStageContext *, MoEPrepared *prepared,
             const std::function<void()> &sharedGraph) {
+        const int deviceLayer = plan.deviceLayer;
+        const std::string &mlp = plan.mlpPrefix;
+        auto &moeWeights = *plan.weights;
+        auto &moeBiass = *plan.bias;
         Data flattened;
         flattened.FakeFrom(input, 0);
         flattened.Resize(input.dims);
@@ -21,10 +24,9 @@ namespace fastllm {
         Data routerLogits, localIndex, localScore, localShared;
         Data &index = prepared ? prepared->index : localIndex;
         Data &score = prepared ? prepared->score : localScore;
-        Data &sharedOutput = prepared ? prepared->sharedOutput : localShared;
+        Data &sharedOutput = prepared ? prepared->result.sharedOutput : localShared;
         if (prepared) {
-            prepared->sharedDeferred = false;
-            prepared->peerOutput = nullptr;
+            prepared->result.Reset();
         } else {
             Linear(flattened, weight[mlp + "gate.weight"], Data(), routerLogits);
             ToDataType(routerLogits, DataType::FLOAT32);
@@ -93,7 +95,7 @@ namespace fastllm {
             const std::vector<int> *hostInputTokens,
             bool materializeCausalMaskOnGraphFallback,
             const Data *precomputedEmbedding, PrefillStageContext *prefill) {
-        ForwardState frame(*this, batch, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig,
+        ForwardState frame(*this, ExecutionMode::Gpu, batch, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig,
             lastTokens, retLogits, targetMultiHidden, allVerificationTokens, verificationAccepted,
             verificationCapture, recordPrefixSnapshot, allowDecodeCudaGraph, decodeEquivalentGdn,
             hostInputTokens, materializeCausalMaskOnGraphFallback, precomputedEmbedding, prefill);
@@ -102,7 +104,7 @@ namespace fastllm {
             const int action = frame.BeginLayer(layer);
             if (action == ForwardState::Complete) break;
             if (action == ForwardState::Skip) continue;
-            frame.GpuExperts(layer);
+            frame.RunExperts(layer);
             frame.EndLayer(layer);
         }
         return frame.Finish();

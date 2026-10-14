@@ -102,11 +102,16 @@ namespace fastllm {
         friend struct Qwen4GGUFTestAccess;
         struct PrefixSnapshot;
         struct DecodeCudaGraphState;
+        struct DecodeGraphExecution;
+        struct DecodeGraphPolicy { bool hybridDense = false; bool eligible = false; };
+        DecodeGraphPolicy GpuDecodeGraphPolicy() const;
+        DecodeGraphPolicy HybridDecodeGraphPolicy(const Data &hiddenStates, bool mtpTargetGraph);
         struct PleStagingState;
         struct MtpDraftCudaGraphState;
         struct QsaHostMirrorTransfer;
         struct ServingCache;
         struct MtpRuntimeState;
+        struct HybridTpState;
         struct ThreadTpState;
         std::unique_ptr<ThreadTpState> threadTpState;
         ThreadTpState *threadTpOwner = nullptr;
@@ -189,8 +194,8 @@ namespace fastllm {
 #ifdef USE_CUDA
         std::unique_ptr<CudaChunkedPrefillPipeline> prefillPipeline;
 #ifndef USE_ROCM
-        struct PipelineMoeState;
-        std::unique_ptr<PipelineMoeState> pipelineMoe;
+        struct HybridPeerState;
+        std::unique_ptr<HybridPeerState> hybridPeer;
         bool TryRunPipelineMoe(int layer, const Data &input, const Data &index,
                 const Data &score, Data &output, std::vector<Data *> &moeWeights,
                 const std::function<void()> &sharedExpert, Data **deferredPeer, bool preparedReadback);
@@ -512,29 +517,48 @@ namespace fastllm {
                                 Data *alphaCapture = nullptr,
                                 Data *betaCapture = nullptr,
                                 Data *recurrentStateOutput = nullptr);
-        struct MoEGpuInputs {
-            Data index, score, sharedOutput;
-            Data *outputTarget = nullptr;
+        struct MoEExecutionPlan {
+            ExecutionMode backend = ExecutionMode::Cpu;
+            int deviceLayer = 0;
+            std::string mlpPrefix;
+            // Borrow the original tables: caches key on their data() addresses.
+            // Device shards and quantization remain in Data; graph capability
+            // is checked for the current shape, format and TP configuration.
+            std::vector<Data *> *weights = nullptr, *bias = nullptr;
+        };
+        std::vector<MoEExecutionPlan> targetMoePlans;
+        MoEExecutionPlan draftMoePlan;
+        void PrepareMoEExecutionPlans();
+
+        struct MoEResult {
+            Data sharedOutput;
+            // The backend has queued the peer completion wait on the consumer
+            // stream. Consume this borrowed result before the next expert call
+            // reuses the peer buffer; only the graph boundary performs the join.
             Data *peerOutput = nullptr;
             bool sharedDeferred = false;
+            void Reset() { peerOutput = nullptr; sharedDeferred = false; }
+            int JoinMask() const { return int(sharedDeferred) + 2 * int(peerOutput != nullptr); }
+        };
+        struct MoEPrepared {
+            Data index, score;
+            MoEResult result;
+            // Optional stable, graph-owned destination; never owned here.
+            Data *outputTarget = nullptr;
             bool readbackPrepared = false;
         };
         void SelectMoEExperts(Data &routerLogits, Data &index, Data &score);
         void RunSharedExpert(const std::string &mlp, Data &input,
                              Data &gateUp, Data &hidden, Data &gate, Data &output);
-        void PrepareMoERouting(int layer, const Data &input, MoEGpuInputs &prepared);
+        void PrepareMoERouting(int layer, const Data &input, MoEPrepared &prepared);
         void RunMoE(int layer, const Data &input, Data &output,
                    bool reduceOutput = true, PrefillStageContext *prefill = nullptr,
-                   MoEGpuInputs *prepared = nullptr,
+                   MoEPrepared *prepared = nullptr,
                    const std::function<void()> &sharedGraph = {});
-        void RunMoEWithPrefix(int deviceLayer,
-                              const std::string &mlpPrefix,
-                              std::vector<Data *> &moeWeights,
-                              std::vector<Data *> &moeBiass,
-                              const Data &input, Data &output,
-                              bool reduceOutput = true, PrefillStageContext *prefill = nullptr,
-                              MoEGpuInputs *prepared = nullptr,
-                              const std::function<void()> &sharedGraph = {});
+        void RunMoE(const MoEExecutionPlan &plan, const Data &input, Data &output,
+                    bool reduceOutput = true, PrefillStageContext *prefill = nullptr,
+                    MoEPrepared *prepared = nullptr,
+                    const std::function<void()> &sharedGraph = {});
 
         bool HasMtpWeights() const;
         bool MtpSupportsGenerationConfig(
@@ -588,7 +612,16 @@ namespace fastllm {
         int BeginForwardLayer(ForwardWorkspace &, int &layer);
         void EndForwardLayer(ForwardWorkspace &, int layer);
         std::vector<int> FinishForward(ForwardWorkspace &);
-        void BeginHybridForward(ForwardWorkspace &);
+        struct HybridPrefillScope;
+        struct HybridExecutionScope;
+        struct DraftGraphPolicy {
+            bool device = false, tp = false, hybrid = false, placementCompatible = false;
+        };
+        DraftGraphPolicy GpuDraftGraphPolicy(int sequence) const;
+        DraftGraphPolicy HybridDraftGraphPolicy(int sequence);
+        std::vector<std::vector<int>> HybridWorkerCpuSets(const std::vector<int> &devices) const;
+        void PrefetchHybridExperts(const Data &inputIds, bool pipelinedPrefill, int layer, int endLayer);
+        void PrepareHybridExperts(bool hasMtpWeights);
         std::vector<int> ForwardGpu(
             int batch,
             const Data &inputIds,
@@ -627,18 +660,12 @@ namespace fastllm {
             const std::vector<int> *hostInputTokens,
             bool materializeCausalMaskOnGraphFallback,
             const Data *precomputedEmbedding, PrefillStageContext *prefill);
-        void RunGpuMoEWithPrefix(
-            int deviceLayer, const std::string &mlp,
-            std::vector<Data *> &moeWeights,
-            std::vector<Data *> &moeBiass,
+        void RunGpuMoE(const MoEExecutionPlan &plan,
             const Data &input, Data &output, bool reduceOutput, PrefillStageContext *prefill,
-            MoEGpuInputs *prepared, const std::function<void()> &sharedGraph);
-        void RunHybridMoEWithPrefix(
-            int deviceLayer, const std::string &mlp,
-            std::vector<Data *> &moeWeights,
-            std::vector<Data *> &moeBiass,
+            MoEPrepared *prepared, const std::function<void()> &sharedGraph);
+        void RunHybridMoE(const MoEExecutionPlan &plan,
             const Data &input, Data &output, bool reduceOutput, PrefillStageContext *prefill,
-            MoEGpuInputs *prepared, const std::function<void()> &sharedGraph);
+            MoEPrepared *prepared, const std::function<void()> &sharedGraph);
 
         std::vector<int> ForwardTarget(
             int batch,
@@ -665,6 +692,7 @@ namespace fastllm {
             Data &hiddenStates,
             std::vector<std::pair<Data, Data>> &pastKeyValues);
         bool TryRunDecodeCudaGraphBackbone(
+            ExecutionMode graphMode,
             int graphStartLayer,
             bool startBeforeAttention,
             const Data &hiddenStates,
