@@ -597,6 +597,30 @@ __global__ void SelectTopKCompact(const float *scores, unsigned long long *selec
     }
 }
 
+// Sort only the compact candidate row within one CTA. The 64-bit key
+// retains score ordering and lower-index tie breaking, including signed zero.
+__global__ void SortTopKCompact(const unsigned long long *input, const int *ends,
+                               int *indices, int queries, int stride, int topK) {
+    constexpr int Threads = 256, Items = 16;
+    using Sort = cub::BlockRadixSort<unsigned long long, Threads, Items>;
+    __shared__ typename Sort::TempStorage storage;
+    const int row = blockIdx.x, count = ends[queries + row] - row * stride;
+    unsigned long long keys[Items];
+    #pragma unroll
+    for (int i = 0; i < Items; ++i) {
+        int col = threadIdx.x + i * Threads;
+        keys[i] = col < count ? input[(size_t)row * stride + col] : 0;
+    }
+    Sort(storage).SortDescendingBlockedToStriped(keys);
+    #pragma unroll
+    for (int i = 0; i < Items; ++i) {
+        int col = threadIdx.x + i * Threads;
+        if (col < topK)
+            indices[(size_t)row * topK + col] = col < count
+                ? (int)(0xffffffffu - (unsigned)keys[i]) : -1;
+    }
+}
+
 template <typename Output>
 __device__ void RopeHeadTo(const BF16 *x, Output out, float position,
                            int rotaryDim, float theta) {
@@ -2061,14 +2085,29 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
         // Full sorting remains cheaper for short rows or large requested K.
         bool compact = (int64_t)keys >= (int64_t)topK * 4;
         int sortStride = compact ? topK * 2 : keys;
-        Data encoded, sorted, offsets, workspace;
+        Data encoded, offsets;
         Output(encoded, INT32, {queries, sortStride, 2});
-        Output(sorted, INT32, {queries, sortStride, 2});
+        const bool blockSort = topK == 2048 && sortStride <= 4096;
         Output(offsets, INT32, {2, queries});
         Output(indices, INT32, {queries, topK});
         auto *input = (unsigned long long *)encoded.cudaData;
-        auto *output = (unsigned long long *)sorted.cudaData;
         auto *begin = (int *)offsets.cudaData;
+        if (compact) {
+            SelectTopKCompact<<<queries, 256>>>((const float *)scores.cudaData,
+                input, begin, queries, keys, queryStart, topK, sortStride);
+        } else {
+            EncodeTopK<<<dim3((keys + 255) / 256, queries), 256>>>(
+                (const float *)scores.cudaData, input, begin, queries, keys, queryStart);
+        }
+        if (blockSort) {
+            SortTopKCompact<<<queries, 256>>>(input, begin, (int *)indices.cudaData,
+                queries, sortStride, topK);
+            CheckLaunch();
+            return;
+        }
+        Data sorted, workspace;
+        Output(sorted, INT32, {queries, sortStride, 2});
+        auto *output = (unsigned long long *)sorted.cudaData;
         size_t bytes = 0;
         int items = compact ? queries * sortStride : (queries - 1) * keys + queryStart + queries;
         auto status = cub::DeviceSegmentedRadixSort::SortKeysDescending(
@@ -2077,13 +2116,6 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
         AssertInFastLLM(status == cudaSuccess && (bytes + 3) / 4 <= INT_MAX,
             "Naive-N0.5 batched TopK workspace query failed.");
         Output(workspace, INT32, {(int)((bytes + 3) / 4)});
-        if (compact) {
-            SelectTopKCompact<<<queries, 256>>>((const float *)scores.cudaData,
-                input, begin, queries, keys, queryStart, topK, sortStride);
-        } else {
-            EncodeTopK<<<dim3((keys + 255) / 256, queries), 256>>>(
-                (const float *)scores.cudaData, input, begin, queries, keys, queryStart);
-        }
         status = cub::DeviceSegmentedRadixSort::SortKeysDescending(
             workspace.cudaData, bytes, input, output, items, queries, begin, begin + queries,
             0, 64, cudaStreamPerThread);
