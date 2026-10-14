@@ -1964,6 +1964,12 @@ if (UNIT_TEST)
         fastllm_add_checked_test(cuda_qwen4_sparse_prefill cuda_qwen4_sparse_prefill_test "PASS Qwen4 indexed sparse prefill and HyperMix" 600)
         set_tests_properties(cuda_qwen4_sparse_prefill PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+        add_executable(cuda_qwen4_kvmem_test test/basic/test_cuda_qwen4_kvmem.cu)
+        target_link_libraries(cuda_qwen4_kvmem_test PRIVATE fastllm)
+        set_target_properties(cuda_qwen4_kvmem_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_qwen4_kvmem cuda_qwen4_kvmem_test "PASS exact QSA host/device storage" 600)
+        set_tests_properties(cuda_qwen4_kvmem PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
         add_executable(cuda_qwen4_confidence_test test/basic/test_cuda_qwen4_confidence.cu)
         target_link_libraries(cuda_qwen4_confidence_test PRIVATE fastllm)
         set_target_properties(cuda_qwen4_confidence_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

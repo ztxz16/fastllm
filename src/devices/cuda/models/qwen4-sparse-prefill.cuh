@@ -1,10 +1,12 @@
 // Indexed FP16 attention. A tile shares one KV head among up to 16 query
-// heads. KV remains in its original cache; only the scores are materialized.
-template <bool DECODE = false>
+// heads. Device KV is read in place; host-backed prefill reads a shared staging
+// buffer without changing the selected tokens or FP16 arithmetic boundaries.
+template <bool DECODE = false, bool STAGED = false>
 __global__ void Qwen4SparseQK(const half *query, const half *key, const int32_t *indices,
                               half *scores, int sequence, int queryHeads, int groups, int length,
                               int dim, int width, int rowStart, uint64_t keyStride, float scale,
-                              Qwen4CacheAddress address, const int32_t *decodeMeta = nullptr) {
+                              Qwen4CacheAddress address, const int32_t *decodeMeta = nullptr,
+                              const half *staged = nullptr) {
 #if __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     extern __shared__ __align__(32) unsigned char shared[];
@@ -32,7 +34,8 @@ __global__ void Qwen4SparseQK(const half *query, const half *key, const int32_t 
         *reinterpret_cast<uint4 *>(k + tileRow * pitch + col) =
             token >= 0 && token < length
                 ? *reinterpret_cast<const uint4 *>(
-                      key + address.Offset(false, kvHead, token, keyStride) + col)
+                      (STAGED ? staged + (uint64_t(token) * address.heads + kvHead) * dim
+                              : address.Read(false, key, kvHead, token, keyStride)) + col)
                 : make_uint4(0, 0, 0, 0);
     }
     __syncthreads();
@@ -60,11 +63,12 @@ __global__ void Qwen4SparseQK(const half *query, const half *key, const int32_t 
 #endif
 }
 
-template <bool DECODE = false, typename Output = half>
+template <bool DECODE = false, typename Output = half, bool STAGED = false>
 __global__ void Qwen4SparsePV(const half *probabilities, const half *value, const int32_t *indices,
                               Output *output, int sequence, int queryHeads, int groups, int length,
                               int dim, int width, int rowStart, uint64_t valueStride,
-                              Qwen4CacheAddress address, const int32_t *decodeMeta = nullptr) {
+                              Qwen4CacheAddress address, const int32_t *decodeMeta = nullptr,
+                              const half *staged = nullptr) {
 #if __CUDA_ARCH__ >= 700
     using namespace nvcuda;
     __shared__ __align__(32) half p[16 * 24], v[16 * 72];
@@ -100,7 +104,8 @@ __global__ void Qwen4SparsePV(const half *probabilities, const half *value, cons
             *reinterpret_cast<uint4 *>(v + (i / 8) * 72 + (i % 8) * 8) =
                 column < dim && token >= 0 && token < length
                     ? *reinterpret_cast<const uint4 *>(
-                          value + address.Offset(true, kvHead, token, valueStride) + column)
+                          (STAGED ? staged + (uint64_t(token) * address.heads + kvHead) * dim
+                                  : address.Read(true, value, kvHead, token, valueStride)) + column)
                     : make_uint4(0, 0, 0, 0);
         }
         __syncthreads();

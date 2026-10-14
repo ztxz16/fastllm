@@ -643,6 +643,12 @@ namespace fastllm {
                                 axis < (int)cache.dims.size(),
                                 "Qwen4-Exp cache append rank mismatch.\n");
             }
+            if (cache.kvMemConfig) {
+                AssertInFastLLM(axis == 1 && cache.dims.size() == 3 &&
+                    cache.dims[1] + append.dims[1] <= cache.expansionDims[1],
+                    "Qwen4 KVMem logical capacity exceeded.");
+                return;
+            }
             if (Qwen4IsPagedKV(cache)) {
                 Qwen4ReservePagedAppend(cache, cache.dims[1] + append.dims[1]);
                 return;
@@ -715,6 +721,8 @@ namespace fastllm {
             destination.dataDeviceIds = source.dataDeviceIds;
             destination.cudaData = source.cudaData;
             destination.cudaDataBorrowed = true;
+            destination.kvMemConfig = source.kvMemConfig;
+            destination.kvMemCache = source.kvMemCache;
             destination.cacheUid = cacheUid;
             destination.isKVCache = true;
             destination.isLinearAttention = linear;
@@ -732,7 +740,7 @@ namespace fastllm {
 
         void Qwen4DetachBorrowedCudaTensor(
                 Data &data, bool growFullAttentionCache = true) {
-            if (data.dataDevice != DataDevice::CUDA ||
+            if (data.kvMemCache || data.dataDevice != DataDevice::CUDA ||
                 !data.cudaDataBorrowed || data.cudaData == nullptr || data.isPagedKVCache) {
                 return;
             }
@@ -993,11 +1001,6 @@ namespace fastllm {
             return end == value ? fallback : (int)parsed;
         }
 
-        int Qwen4MtpDraftsPerStep() {
-            return std::max(0, std::min(
-                8, Qwen4EnvInt("FASTLLM_QWEN4_ENABLE_MTP", 0)));
-        }
-
         float Qwen4MtpMinProbability() {
             const char *value = std::getenv("FASTLLM_QWEN4_MTP_MIN_P");
             if (value == nullptr || value[0] == '\0') return 0;
@@ -1217,6 +1220,11 @@ namespace fastllm {
             cache.isKVCache = true;
             cache.isLinearAttention = linear;
         }
+    }
+
+    int Qwen4MtpDraftsPerStep() {
+        return std::max(0, std::min(
+            8, Qwen4EnvInt("FASTLLM_QWEN4_ENABLE_MTP", 0)));
     }
 
     struct Qwen4ExpModel::PleStagingState {
@@ -1906,6 +1914,7 @@ namespace fastllm {
             model->eos_token_ids = eos_token_ids;
             model->dataType = dataType;
             model->kvCacheDataType = kvCacheDataType;
+            model->kvMemConfig = kvMemConfig;
             model->num_k_heads = num_k_heads / count;
             model->num_v_heads = num_v_heads / count;
             model->num_attention_heads = num_attention_heads / count;
@@ -6330,6 +6339,8 @@ namespace fastllm {
             pastValue.dataType = value.dataType;
             pastValue.UpdateUnitSize();
         }
+        if (executionMode == ExecutionMode::Hybrid && kvMemConfig.enabled && previousLength == 0)
+            PrepareHybridKvMemCache(stateLayer, key, keyCacheDesc.dims[0], pastKey, pastValue);
         const int unitLength = !GetKVCacheInCPU() &&
             keyCacheDesc.dataDevice == DataDevice::CUDA ? 128 : 64;
         const bool geometricGrowth =
@@ -6410,7 +6421,7 @@ namespace fastllm {
             Qwen4ResizeKVCache(pastKey, previousLength + sequence);
             Qwen4ResizeKVCache(pastValue, previousLength + sequence);
         } else {
-            AssertInFastLLM(!Qwen4IsPagedKV(pastKey), "Qwen4 paged KV append failed.\n");
+            AssertInFastLLM(!Qwen4IsPagedKV(pastKey) && !pastKey.kvMemCache, "Qwen4 KV append failed.\n");
             CatDirect(pastKey, key, 1);
             CatDirect(pastValue, value, 1);
         }
@@ -6426,8 +6437,8 @@ namespace fastllm {
             Qwen4SparseAttention(query, pastKey, pastValue,
                                  qsaIndices, attentionGroup,
                                  attentionScale, context);
-        } else if (Qwen4IsPagedKV(pastKey)) {
-            if (qsaDeviceCompatibleMask && qsaMask.dims.empty() &&
+        } else if (Qwen4IsPagedKV(pastKey) || pastKey.kvMemCache) {
+            if (!pastKey.kvMemCache && qsaDeviceCompatibleMask && qsaMask.dims.empty() &&
                 pastKey.pageIndex == pastValue.pageIndex && query.dataType == FLOAT16) {
                 Data qs, ps, pages, last;
                 GeneratePagedBatchParams(query, {&pastKey}, 1, qs, ps, pages, last, {sequence});
@@ -7476,6 +7487,9 @@ namespace fastllm {
                 destination = Data();
                 return allowEmpty;
             }
+            // Generic tensor copies cannot interpret tiered storage. Prefix
+            // reuse is disabled for KVMem, like the generic KVMem backend.
+            if (source.kvMemCache) return false;
             if (Qwen4IsPagedKV(source)) {
                 Qwen4SharePagedCache(source, destination);
                 return true;
@@ -11194,7 +11208,7 @@ namespace fastllm {
     bool Qwen4ExpModel::ShouldRecordPrefixSnapshot(
             const std::vector<std::pair<Data, Data>> &pastKeyValues,
             const RequestState &state, int &cachedLen) const {
-        if (state.hasMultimodalInput || autoWarmupRunning.load() ||
+        if (kvMemConfig.enabled || state.hasMultimodalInput || autoWarmupRunning.load() ||
             !Qwen4PrefixCacheEnabled() ||
             (int)pastKeyValues.size() < this->block_cnt) {
             return false;
@@ -13871,11 +13885,13 @@ namespace fastllm {
         long long capacity = std::min(max_positions, std::numeric_limits<int>::max() - lookahead);
         if (GetMaxTokens() > 0) capacity = std::min<long long>(capacity, GetMaxTokens());
         if (tokensLimit > 0) capacity = std::min<long long>(capacity, tokensLimit);
-        if (kvCacheLimit > 0) {
+        const bool hybridKvMem = executionMode == ExecutionMode::Hybrid && kvMemConfig.enabled;
+        if (hybridKvMem) capacity = kvMemConfig.maxTokens;
+        if (kvCacheLimit > 0 && !hybridKvMem) {
             capacity = std::min(capacity,
                 std::max(0LL, kvCacheLimit - totalFixedBytes) / totalBytesPerToken);
         }
-        const bool autoCapacity = GetMaxTokens() <= 0;
+        const bool autoCapacity = GetMaxTokens() <= 0 && !hybridKvMem;
         // QSA selection holds one FP32 score per prefill row and compressed
         // key. Its peak workspace is shared by the layers on each device,
         // unlike their persistent compressed keys. MTP may prepend one
@@ -13914,6 +13930,19 @@ namespace fastllm {
             retain(state->second);
             if (state->second.mtpState) retain(state->second.mtpState->attentionState);
         }
+        size_t allocatedBytes = 0;
+        std::vector<std::shared_ptr<ServingCache>> reservations;
+        for (const auto &target : targets) {
+            auto reserved = std::make_shared<ServingCache>();
+            if (target.first->executionMode == ExecutionMode::Hybrid && kvMemConfig.enabled) {
+                auto state = target.first->requestStates.find(&target.second->front().first);
+                std::shared_ptr<KvMemCache> mtp;
+                if (state != target.first->requestStates.end() && state->second.mtpState)
+                    mtp = state->second.mtpState->key.kvMemCache;
+                allocatedBytes += target.first->RetainHybridKvMemStorage(*target.second, mtp, *reserved);
+            }
+            reservations.push_back(std::move(reserved));
+        }
         ClearWarmupCache(warmupCache);
         const auto freeBytes = FastllmCudaGetFreeSizes();
         const auto deviceBytes = FastllmCudaGetTotalSizes();
@@ -13946,17 +13975,18 @@ namespace fastllm {
         if (capacity <= 0) {
             throw std::runtime_error("Qwen4-Exp has insufficient memory for startup KV reservation.");
         }
-        size_t allocatedBytes = 0;
         const int reservedCapacity = (int)capacity + lookahead * linearSlots;
-        std::vector<std::shared_ptr<ServingCache>> reservations;
         for (size_t rank = 0; rank < targets.size(); ++rank) {
-            auto reserved = std::make_shared<ServingCache>();
+            auto &reserved = reservations[rank];
             reserved->qsaHostMirrors = std::move(hostMirrors[rank]);
             reserved->layers.resize(block_cnt);
             for (int layer = 0; layer < (int)shapes[rank].size(); ++layer) {
                 const bool linear = layer < block_cnt && IsLinearAttentionLayer(layer);
                 auto &source = shapes[rank][layer];
                 auto &destination = layer < block_cnt ? reserved->layers[layer] : reserved->mtp;
+                // Full KV belongs to each tiered request, not a full-context
+                // global GPU page pool. Fixed linear states keep their pool.
+                if (reserved->kvMemStorage.count(layer)) continue;
                 for (int component = 0; component < 2; ++component) {
                     const Shape &shape = component == 0 ? source.first : source.second;
                     auto &manager = component == 0 ? destination.first : destination.second;
@@ -13988,13 +14018,13 @@ namespace fastllm {
                     allocatedBytes += tensor.GetBytes();
                 }
             }
-            reservations.push_back(std::move(reserved));
         }
         for (size_t rank = 0; rank < targets.size(); ++rank) {
             targets[rank].first->servingCache = std::move(reservations[rank]);
         }
         tokensLimit = (int)capacity;
         maxBatch = linearSlots;
+        if (executionMode == ExecutionMode::Hybrid) FinishHybridKvMemWarmup();
         std::printf("[Fastllm] Qwen4-Exp startup KV capacity: %d tokens, %d fixed linear slots, page size %d, %.2f MiB CUDA storage.\n",
             tokensLimit, linearSlots, GetPageLen(), allocatedBytes / 1048576.0);
         std::fflush(stdout);

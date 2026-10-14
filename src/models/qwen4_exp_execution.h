@@ -1,6 +1,7 @@
 #pragma once
 #include "qwen4_exp.h"
 namespace fastllm {
+int Qwen4MtpDraftsPerStep();
 // Forward orchestration depends on this interface, not on graph/KV internals.
 struct Qwen4ExpModel::ForwardState {
     enum Action { Skip, Experts, Complete };

@@ -29,6 +29,9 @@ namespace fastllm {
         void InitParams() override;
         bool RetainCudaWorkspace() const override;
         ExecutionMode GetExecutionMode() const { return executionMode; }
+        void ConfigureKvMem(const KvMemConfig &config) override;
+        bool SupportsKvMem() const override { return executionMode == ExecutionMode::Hybrid; }
+        void ValidateKvMemModel(const KvMemConfig &config) const override;
 
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &tensorNames) override;
@@ -201,6 +204,9 @@ namespace fastllm {
                                     std::shared_ptr<PagedCacheManager>>;
             std::vector<Pools> layers;
             Pools mtp;
+            // KVMem admits one request. Retain its pinned backing and bounded
+            // device allocation after warmup; each new request resets the map.
+            std::map<int, std::shared_ptr<KvMemCache>> kvMemStorage;
             // One warmup allocation per layer, moved into the first request
             // that needs it. Mutable QSA history is never shared by requests.
             std::map<int, std::shared_ptr<QsaHostMirrorTransfer>> qsaHostMirrors;
@@ -208,6 +214,12 @@ namespace fastllm {
         std::shared_ptr<ServingCache> servingCache;
         void ClearWarmupCache(std::vector<std::pair<Data, Data>> &cache);
         void ReserveServingCache(std::vector<std::pair<Data, Data>> &warmupCache);
+        void PrepareHybridKvMemCache(int layer, const Data &key, int heads,
+                                    Data &pastKey, Data &pastValue);
+        size_t RetainHybridKvMemStorage(const std::vector<std::pair<Data, Data>> &cache,
+                                      const std::shared_ptr<KvMemCache> &mtp,
+                                      ServingCache &reserved) const;
+        void FinishHybridKvMemWarmup();
         void AcquireServingCache(std::vector<std::pair<Data, Data>> &cache,
                                  RequestState &state, int appendTokens = 1);
         std::shared_ptr<QsaHostMirrorTransfer> &GetQsaHostMirror(

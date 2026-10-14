@@ -5535,7 +5535,7 @@ namespace fastllm {
         const int width = indices.dims[1];
         const int sequence = query.dims[1];
         if (sequence > 1) {
-            if (!key.isPagedKVCache && !value.isPagedKVCache &&
+            if (!key.isPagedKVCache && !value.isPagedKVCache && !key.kvMemCache &&
                 FastllmCudaTryTritonQwen4SparseAttention(
                     query, key, value, indices,
                     intParams.find("group")->second,

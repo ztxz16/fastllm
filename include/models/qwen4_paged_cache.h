@@ -4,6 +4,7 @@
 #include "utils.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "models/qwen4_kvmem.h"
 #endif
 
 namespace fastllm {
@@ -168,6 +169,9 @@ namespace fastllm {
     }
 
     inline void Qwen4ResizeKVCache(Data &cache, int length) {
+#ifdef USE_CUDA
+        if (auto *tiered = Qwen4GetKvMem(cache)) tiered->SetLength(length);
+#endif
         if (Qwen4IsPagedKV(cache)) {
             const int pages = (length + cache.pageLen - 1) / cache.pageLen;
             AssertInFastLLM(pages <= (int)cache.pageIndex.size(),

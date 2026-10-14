@@ -1,4 +1,6 @@
 #include "fastllm.h"
+#include "models/qwen4_kvmem.h"
+#include <numeric>
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "utils/utils.h"
 #include <cuda_runtime_api.h>
@@ -93,6 +95,16 @@ static void Run(DataType type, int batch, int sequence, int dim, bool mrope) {
     Cache(vc, batch * kvHeads, previous + sequence + 31, previous, dim);
     Cache(rk, batch * kvHeads, previous + sequence + 17, previous, dim);
     Cache(rv, batch * kvHeads, previous + sequence + 31, previous, dim);
+    std::shared_ptr<Qwen4KvMem> tiered;
+    Data tk(type), tv(type), tq(type), tg(type);
+    if (dim % 8 == 0) {
+        KvMemConfig cfg;
+        cfg.enabled = true; cfg.maxTokens = previous + sequence + 32; cfg.residentTokens = 4;
+        tiered = std::make_shared<Qwen4KvMem>(cfg, type, batch * kvHeads, dim, 0);
+        tiered->Attach(tk, tv, tiered);
+        Require(FastllmCudaQwen4KVAppend(kc, vc, 0, tk, tv), "tiered prefix append");
+        tk.Resize(kc.dims); tv.Resize(vc.dims);
+    }
     auto fused = [&](int offset) {
         Require(FastllmCudaQwen4AttentionPrepare(qgate, key, value, qnorm, knorm,
             positions, q, gate, kc, vc, dim, rotary, sectionH, sectionW,
@@ -129,6 +141,24 @@ static void Run(DataType type, int batch, int sequence, int dim, bool mrope) {
         reference(offset);
         const auto oldK = Read(kc, true), oldV = Read(vc, true);
         fused(offset);
+        if (tiered) {
+            Require(FastllmCudaQwen4AttentionPrepare(qgate, key, value, qnorm, knorm,
+                positions, tq, tg, tk, tv, dim, rotary, sectionH, sectionW,
+                1e-6f, 1000000.f, offset), "tiered fused append");
+            Equal(q, tq, "tiered Q"); Equal(gate, tg, "tiered gate");
+            const int length = offset + sequence;
+            Data indices(INT32, {1, length}); indices.Allocate();
+            std::iota((int *)indices.cpuData, (int *)indices.cpuData + length, 0);
+            indices.ToDevice(DataDevice::CUDA, {0}, true);
+            Data ak(type, {batch * kvHeads, length, dim}), av(type, ak.dims),
+                 bk(type, ak.dims), bv(type, ak.dims);
+            for (auto *x : {&ak, &av, &bk, &bv}) { x->ToDevice(DataDevice::CUDA, {0}, false); x->Allocate(false); }
+            for (auto *x : {&kc, &vc, &tk, &tv}) x->Resize({batch * kvHeads, length, dim});
+            Require(FastllmCudaQwen4GatherKV(kc, vc, indices, ak, av), "reference gather");
+            Require(FastllmCudaQwen4GatherKV(tk, tv, indices, bk, bv), "tiered gather");
+            Equal(ak, bk, "tiered K"); Equal(av, bv, "tiered V");
+            kc.Resize({batch * kvHeads, previous, dim}); vc.Resize(kc.dims);
+        }
         Equal(q, rq, "Q"); Equal(gate, rg, "gate");
         // Compare the entire allocation to also check untouched prefix/tail.
         Equal(kc, rk, "K cache", true); Equal(vc, rv, "V cache", true);
