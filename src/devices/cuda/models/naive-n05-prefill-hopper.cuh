@@ -107,7 +107,8 @@ __global__ __launch_bounds__(256) void Hopper(const BF *q,
             ldt4(a, &s.tile.values[k + (l & 7) + (l >> 4) * 8][w * 16 + ((l >> 3) & 1) * 8]);
             mma(acc, a, breg);
         }
-        __syncthreads();
+        // The next tile's index-publication barrier also waits for all
+        // PV reads before its K copy overwrites the shared tile.
     }
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
