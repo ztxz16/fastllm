@@ -112,6 +112,191 @@ class LoadedMedia:
         self.videos.extend(other.videos)
         self.temp_paths.extend(other.temp_paths)
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "on", "true", "yes"}
+
+
+# The thinking-close marker is a single special token (248069) in the Qwen3.8
+# vocabulary.  A context saturated with it primes the model to write it back,
+# and live turns have ended mid-thought right before that position.  Rewriting
+# occurrences that arrive in message text to a marker-shaped placeholder keeps
+# the meaning while dropping the literal special token.  Only message payloads
+# are touched: the chat template's own think-open / think-close skeleton is
+# rendered later and must stay intact.
+_INPUT_THINK_CLOSE_MARKER = "</think" + ">"
+_INPUT_THINK_CLOSE_REPLACEMENT = "<ft:/think>"
+_INPUT_THINK_MARKER_POLICY_ENV = "FT_INPUT_THINK_MARKER_POLICY"
+
+
+def _input_think_marker_replacement() -> Optional[str]:
+    """Replacement for a literal thinking-close marker, or ``None`` disabled.
+
+    On by default: an unset switch still rewrites markers.  ``FT_INPUT_THINK_MARKER_POLICY``
+    controls it:
+
+    * unset / ``on`` / ``1`` / ``true`` / ``replace`` -> ``<ft:/think>``;
+    * ``off`` / ``0`` / ``false`` / ``no`` / ``disable`` -> disabled;
+    * anything else -> used verbatim as the replacement (experiments).
+    """
+    value = os.environ.get(_INPUT_THINK_MARKER_POLICY_ENV)
+    if value is None:
+        return _INPUT_THINK_CLOSE_REPLACEMENT
+    stripped = value.strip()
+    lowered = stripped.lower()
+    if lowered in ("off", "0", "false", "no", "disable", "disabled"):
+        return None
+    if lowered in ("", "on", "1", "true", "yes", "replace"):
+        return _INPUT_THINK_CLOSE_REPLACEMENT
+    return stripped
+
+
+def _new_code_state() -> Dict[str, Any]:
+    """Fresh fenced-code state for the generated text (see ``_advance_code_state``)."""
+    return {"fence": False, "line_start": True}
+
+
+def _advance_code_state(code_state: Dict[str, Any], text: str) -> None:
+    """Track fenced code blocks (a >=3 backtick run opening a line).
+
+    A fence is the one code construct that hides a protocol marker without any
+    backtick next to it, so it is tracked across deltas: the opening fence can
+    arrive long before the marker does.
+    """
+    in_fence = code_state.get("fence", False)
+    line_start = code_state.get("line_start", True)
+    index = 0
+    limit = len(text)
+    while index < limit:
+        char = text[index]
+        if char == "\n":
+            line_start = True
+            index += 1
+            continue
+        if char == "`":
+            end = index
+            while end < limit and text[end] == "`":
+                end += 1
+            if end - index >= 3 and line_start:
+                in_fence = not in_fence
+            index = end
+            line_start = False
+            continue
+        if not char.isspace():
+            line_start = False
+        index += 1
+    code_state["fence"] = in_fence
+    code_state["line_start"] = line_start
+    if text:
+        code_state["last_char"] = text[-1]
+
+
+def _marker_is_quoted(
+        text: str, position: int,
+        code_state: Optional[Dict[str, Any]] = None) -> bool:
+    """Whether the marker at ``position`` is a mention, not the end of thinking.
+
+    Two cheap signals, both usable while streaming:
+
+    * a backtick immediately before the marker - the model wrote it as inline
+      code (`` `</think>` ``), which is what it does when it reasons about the
+      protocol itself;
+    * the marker sits inside an open fenced code block.
+
+    ``code_state`` (streaming) carries what the text before the buffer already
+    was: a marker at the start of the buffer must consult ``last_char``, because
+    the delta holdback for a partial tag can leave the opening backtick just
+    outside the buffer.
+
+    Backtick *parity* counting is deliberately not used: generated text carries
+    doubled and unbalanced backticks often enough that parity desynchronises,
+    and a desynchronised scanner silently accepts the very markers it exists to
+    skip.
+    """
+    if position > 0:
+        if text[position - 1] == "`":
+            return True
+    elif code_state is not None and code_state.get("last_char") == "`":
+        return True
+    probe = dict(code_state) if code_state is not None else _new_code_state()
+    _advance_code_state(probe, text[:max(0, min(position, len(text)))])
+    return bool(probe.get("fence"))
+
+
+def _marker_ends_thinking(
+        text: str, position: int, marker: str = "</think>") -> Optional[bool]:
+    """Whether the marker at ``position`` ends the thinking block.
+
+    ``True`` = the thinking block ends here, ``False`` = the model was still
+    talking across the marker (a mention), ``None`` = undecided, nothing but
+    blanks follows it so
+    far (streaming: the next delta has not arrived yet).
+
+    A real close ends the thought, so the model starts a new line (or a
+    new block, e.g. the ``<tool_call>`` it emits right after closing) while a
+    mention keeps the sentence going (``...the output has no </think> at all
+    ...``).  Measured on Qwen3.8-27B: every real close was followed by a line
+    break or a block opener (7/7 ordinary turns, and the real boundary of all 3
+    leaked turns), while every marker that leaked the reasoning into ``content``
+    was followed by ordinary prose.  Text alone cannot separate the two in
+    general - a mid-sentence marker *could* be a real close - so such a marker
+    is left in the reasoning and the caller reports the turn (retryable)
+    instead of silently splitting there.
+    """
+    tail = text[position + len(marker):]
+    stripped = tail.lstrip(" \t")
+    if stripped[:1] in ("\n", "\r", "<"):
+        return True
+    if not stripped:
+        return None
+    return False
+
+
+def _scan_think_boundary(
+        text: str, marker: str = "</think>", *, line_delimited: bool = False,
+        code_state: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, int]:
+    """Locate the thinking boundary: ``(index, mid_sentence_mentions_skipped)``.
+
+    Markers the model *mentioned* as code (inline or fenced) are prose and are
+    skipped.  With ``line_delimited`` a marker the model kept talking across is
+    a mention too: cutting there orphans the rest of the reasoning in the
+    content channel - the "thinking leaked into the answer" shape seen live.
+    When the model only ever mentions the marker there is no boundary and the
+    caller reports the turn instead of guessing a split point.  ``code_state``
+    is the streaming state, needed for a marker at the start of ``text``.
+    """
+    skipped = 0
+    search_from = 0
+    while True:
+        found = text.find(marker, search_from)
+        if found < 0:
+            return -1, skipped
+        if not _marker_is_quoted(text, found, code_state):
+            if not line_delimited:
+                return found, skipped
+            ends_thinking = _marker_ends_thinking(text, found, marker)
+            if ends_thinking is not False:
+                return found, skipped
+            skipped += 1
+        search_from = found + len(marker)
+
+
+def _find_think_boundary(
+        text: str, marker: str = "</think>", *,
+        line_delimited: bool = False) -> int:
+    """Index of the marker that really ends the thinking block, or -1.
+
+    Markers the model *mentioned* (inline code or a fenced block, and with
+    ``line_delimited`` also ones it kept talking across) are prose about the
+    protocol, not the end of thinking, and are skipped.
+    """
+    return _scan_think_boundary(
+        text, marker, line_delimited=line_delimited)[0]
+
+
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
@@ -371,6 +556,23 @@ class FastLLmCompletion:
           return self.model.get_type() == "naive_n05_flash"
       except Exception:
           return False
+
+  def _thinking_boundary_line_delimited(self) -> bool:
+      """Whether a real end of thinking has to start a new line for this model.
+
+      True for the Qwen tagged-reasoning family (qwen3_5 / qwen4), whose
+      generation prompt ends inside the thinking block: the model finishes the
+      thought, so the answer follows on its own line.  A marker the model
+      merely mentions mid-sentence must therefore not end the block - doing
+      so leaks the rest of the reasoning into ``content`` with no error.  Other
+      tagged-reasoning families (dots3_note, naive_n05, glm5_next) keep the
+      previous "first textual marker" behaviour until their close shape has
+      been measured; ``FT_THINKING_BOUNDARY_LINE_DELIMITED=0`` restores it for
+      every model.
+      """
+      if not self._is_qwen_reasoning_model():
+          return False
+      return _env_flag("FT_THINKING_BOUNDARY_LINE_DELIMITED", True)
 
   def _is_qwen3_5_reasoning_response(self, enable_thinking: bool) -> bool:
       return (enable_thinking and self._is_qwen_reasoning_model()
@@ -862,14 +1064,19 @@ class FastLLmCompletion:
       if not emit_reasoning_content:
           return result, None
       result = self._strip_optional_think_start(result)
-      think_end = "</think>"
-      think_end_idx = result.find(think_end)
+      # A marker quoted inside a code span is prose, not the end of thinking: the
+      # model writes `</think>` in backticks whenever it reasons about the
+      # protocol itself, and cutting there orphans the rest of the reasoning
+      # in the content channel (or drops the tool call with it).  A marker the
+      # model kept talking across is a mention for the same reason.
+      think_end_idx = _find_think_boundary(
+          result, line_delimited=self._thinking_boundary_line_delimited())
       if think_end_idx < 0:
           # The Qwen3.5 generation prompt ends inside <think>. A truncated
           # generation without </think> therefore contains reasoning only.
           return "", result or None
       reasoning_content = result[:think_end_idx]
-      content = result[think_end_idx + len(think_end):]
+      content = result[think_end_idx + len("</think>"):]
       return content, reasoning_content or None
 
   def _split_glm5_next_reasoning(
@@ -916,18 +1123,61 @@ class FastLLmCompletion:
               state["buffer"] = state["buffer"][1:]
           state["strip_leading_newline"] = False
 
-      think_end_idx = state["buffer"].find(think_end)
+      # A marker the model *mentioned* (inline code / fenced block) is prose,
+      # not the end of thinking: keep looking for the real one.  For the models
+      # whose close is line-delimited, a marker the model kept talking across
+      # is a mention too.  A model that only ever mentions it produces no
+      # boundary at all, which the caller reports instead of guessing a split
+      # point inside the reasoning.
+      think_end_idx = -1
+      undecided_at = -1
+      search_from = 0
+      line_delimited = bool(state.get("line_delimited_boundary"))
+      code_state = state.setdefault("code_state", _new_code_state())
+      while True:
+          candidate = state["buffer"].find(think_end, search_from)
+          if candidate < 0:
+              break
+          if not _marker_is_quoted(state["buffer"], candidate, code_state):
+              if not line_delimited:
+                  think_end_idx = candidate
+                  break
+              ends_thinking = _marker_ends_thinking(
+                  state["buffer"], candidate, think_end)
+              if ends_thinking is None:
+                  # The character after the marker has not arrived yet: hold
+                  # the marker back instead of committing to a split.
+                  undecided_at = candidate
+                  break
+              if ends_thinking is False:
+                  # The model was still talking across the marker, so it is
+                  # quoting the protocol rather than ending the thinking block.
+                  state["boundary_mentions_skipped"] = (
+                      state.get("boundary_mentions_skipped", 0) + 1)
+                  search_from = candidate + len(think_end)
+                  continue
+              think_end_idx = candidate
+              break
+          search_from = candidate + len(think_end)
       if think_end_idx >= 0:
           reasoning_delta = state["buffer"][:think_end_idx]
           content_delta = state["buffer"][think_end_idx + len(think_end):]
+          _advance_code_state(code_state, reasoning_delta)
           state["buffer"] = ""
           state["active"] = False
+          state["boundary_seen"] = True
+          state["undecided_marker"] = False
           messages = []
           if reasoning_delta:
               messages.append(DeltaMessage(reasoning_content=reasoning_delta))
           return messages, content_delta
 
       overlap = self._partial_tag_overlap(state["buffer"], think_end)
+      if undecided_at >= 0:
+          # Hold the whole undecided marker (and any blanks after it), not just
+          # an incomplete tag prefix.
+          overlap = max(overlap, len(state["buffer"]) - undecided_at)
+      state["undecided_marker"] = undecided_at >= 0
       if overlap:
           reasoning_delta = state["buffer"][:-overlap]
           state["buffer"] = state["buffer"][-overlap:]
@@ -936,6 +1186,7 @@ class FastLLmCompletion:
           state["buffer"] = ""
 
       if reasoning_delta:
+          _advance_code_state(code_state, reasoning_delta)
           return [DeltaMessage(reasoning_content=reasoning_delta)], ""
       return [], ""
 
@@ -1769,6 +2020,36 @@ class FastLLmCompletion:
           tool_calls = parsed.valid_tool_calls,
           content = parsed.content,
       )
+
+  def _recover_reasoning_tool_calls(
+      self,
+      reasoning: str,
+      request: ChatCompletionRequest,
+      *,
+      finish_reason: Optional[str] = None,
+  ) -> Optional[Any]:
+      """Recover a tool call the model wrote *inside* the thinking block.
+
+      Only the text after the thinking boundary reaches the tool parser, so a
+      call emitted before it disappears without even a diagnostic (the parser
+      never sees the markup), the response reports finish_reason=stop and an
+      agent client ends its loop without acting.  A candidate counts only when
+      it is not a *mention* (a call the model merely quoted is prose, not an
+      act) and parses through the normal validation path.
+      """
+      if not request.tools or not reasoning:
+          return None
+      candidates = []
+      for opener in ("<tool_call>", "<function="):
+          position = reasoning.rfind(opener)
+          if position >= 0 and not _marker_is_quoted(reasoning, position):
+              candidates.append(position)
+      for position in sorted(set(candidates), reverse = True):
+          parsed = self._parse_non_stream_tool_calls(
+              reasoning[position:], request, finish_reason=finish_reason)
+          if not isinstance(parsed, ErrorResponse) and parsed.tools_called:
+              return parsed
+      return None
 
   def _normalize_system_messages(
       self, conversation: List[ConversationMessage],
@@ -3032,6 +3313,7 @@ class FastLLmCompletion:
       if (not(self.hide_input)):
          logging.debug("fastllm anthropic input message: %s", messages)
 
+      messages = self._neutralize_input_think_close(messages)
       model_images = media.images if media.images else None
       model_videos = media.videos if media.videos else None
       try:
@@ -3099,6 +3381,49 @@ class FastLLmCompletion:
               return self.create_error_response(str(e))
           except ValueError as e:
               return self.create_error_response(str(e))
+
+  def _neutralize_input_think_close(
+      self, messages: List[Dict[str, Any]]
+  ) -> List[Dict[str, Any]]:
+      """Rewrite literal thinking-close markers in message payloads.
+
+      The marker is a single special token in the Qwen3.8 vocabulary, so a
+      context saturated with it primes the model to emit it; live turns have
+      ended mid-thought right before that position.  Only ``content`` /
+      ``reasoning_content`` text is rewritten - the chat template's own
+      think-open / think-close markers are rendered later and are left untouched.
+      """
+      replacement = _input_think_marker_replacement()
+      if replacement is None or not messages:
+          return messages
+      changed = 0
+      for message in messages:
+          if not isinstance(message, dict):
+              continue
+          for key in ("content", "reasoning_content"):
+              value = message.get(key)
+              if isinstance(value, str):
+                  if _INPUT_THINK_CLOSE_MARKER in value:
+                      message[key] = value.replace(
+                          _INPUT_THINK_CLOSE_MARKER, replacement)
+                      changed += 1
+              elif isinstance(value, list):
+                  parts = []
+                  for part in value:
+                      if (isinstance(part, dict)
+                              and isinstance(part.get("text"), str)
+                              and _INPUT_THINK_CLOSE_MARKER in part["text"]):
+                          part = dict(part)
+                          part["text"] = part["text"].replace(
+                              _INPUT_THINK_CLOSE_MARKER, replacement)
+                          changed += 1
+                      parts.append(part)
+                  message[key] = parts
+      if changed:
+          logging.info(
+              "Neutralised thinking-close marker in %d input field(s)",
+              changed)
+      return messages
 
   async def create_chat_completion(
       self, request: ChatCompletionRequest, raw_request: Request
@@ -3245,6 +3570,7 @@ class FastLLmCompletion:
       except ValueError as error:
           self._cleanup_temp_paths(media.temp_paths)
           return self.create_error_response(str(error))
+      messages = self._neutralize_input_think_close(messages)
       effective_request = self._with_effective_tool_choice(
           request, tool_choice)
 
@@ -3397,6 +3723,11 @@ class FastLLmCompletion:
            return self.create_error_response("Client disconnected")
 
       history_raw = result
+      # Set when thinking was on but no marker actually ended the block (none
+      # at all, or only ones the model quoted inside a code span / talked
+      # across).
+      thinking_boundary_missing = False
+      boundary_mentions_skipped = 0
       if self._is_kimi_k3_model():
           if emit_reasoning_content:
               result, reasoning_content = self._split_kimi_k3_reasoning(
@@ -3409,8 +3740,27 @@ class FastLLmCompletion:
                   result = self._strip_kimi_k3_response_wrapper(result)
       elif (self._is_qwen_reasoning_model()
             or self._is_dots3_note_model() or self._is_naive_n05_model()):
+          line_delimited = self._thinking_boundary_line_delimited()
+          boundary_index, boundary_mentions_skipped = _scan_think_boundary(
+              self._strip_optional_think_start(history_raw),
+              line_delimited=line_delimited)
           result, reasoning_content = self._split_qwen3_5_reasoning(
               result, emit_reasoning_content)
+          thinking_boundary_missing = (emit_reasoning_content
+                                      and boundary_index < 0)
+          if emit_reasoning_content:
+              if boundary_mentions_skipped:
+                  logging.warning(
+                      "Thinking boundary: ignored %d marker mention(s) that did "
+                      "not start a line (reasoning=%d chars, content=%d chars)",
+                      boundary_mentions_skipped, len(reasoning_content or ""),
+                      len(result or ""))
+              if _env_flag("FT_THINKING_BOUNDARY_LOG", True):
+                  logging.info(
+                      "Thinking boundary: offset=%d reasoning=%d chars "
+                      "content=%d chars mentions_skipped=%d",
+                      boundary_index, len(reasoning_content or ""),
+                      len(result or ""), boundary_mentions_skipped)
       elif self._is_glm5_next_model():
           result, reasoning_content = self._split_glm5_next_reasoning(
               result, emit_reasoning_content)
@@ -3431,6 +3781,47 @@ class FastLLmCompletion:
           if request_id in self.conversation_handles:
               del self.conversation_handles[request_id]
           return tool_call_info
+
+      if (request.tools and emit_reasoning_content and reasoning_content
+              and not tool_call_info.tools_called
+              and not (tool_call_info.content or "").strip()):
+          # The tool parser only saw the text after the thinking boundary, so a
+          # call written inside the reasoning would be dropped silently.
+          recovered = self._recover_reasoning_tool_calls(
+              reasoning_content, request, finish_reason=finish_reason)
+          if recovered is not None:
+              logging.warning(
+                  "Recovered %d tool call(s) written inside the thinking block",
+                  len(recovered.tool_calls))
+              tool_call_info = recovered
+      if (not tool_call_info.tools_called
+              and emit_reasoning_content and reasoning_content
+              and finish_reason == "stop"
+              and not (tool_call_info.content or "").strip()
+              and _env_flag("FT_THINKING_BOUNDARY_ERROR", True)):
+          # An agent client reads "stop with no tool call" as a finished turn, so
+          # a blank answer ends its loop in silence - and may hide a tool call
+          # that never reached the parser.  Report instead.  Two shapes land
+          # here: the end marker never appeared, or it appeared and the model
+          # said nothing (a bare marker inside the reasoning looks exactly like
+          # a real end, so an early split cannot be ruled out).
+          reason = ("thinking never closed" if thinking_boundary_missing
+                    else "thinking closed without an answer")
+          if thinking_boundary_missing and boundary_mentions_skipped:
+              # Markers exist, they just never started a line: cutting at one of
+              # them is what leaks the reasoning into the answer, so the turn is
+              # reported rather than split mid-sentence.
+              reason = ("thinking end marker did not start a line - the block may "
+                        "have closed mid-sentence")
+          logging.warning(
+              "Empty thinking turn (%s): reasoning=%d chars, content empty",
+              reason, len(reasoning_content))
+          self._release_conversation_handle(request_id, handle)
+          return self.create_error_response(
+              f"The model produced no answer and no tool call ({reason}); "
+              "retry the request.",
+              err_type = "invalid_thinking_block",
+          )
 
       if tool_call_info.tools_called:
           remember = getattr(self.model, "remember_deepseek_v41_tool_output", None)
@@ -3596,6 +3987,11 @@ class FastLLmCompletion:
         current_token_ids = []
         previous_text = ""
         current_text = ""
+        # Reasoning text is kept separately: the tool parser never sees it, and
+        # a call written there has to be recovered explicitly.  ``content_text``
+        # mirrors the visible answer for the boundary audit log only.
+        reasoning_text = ""
+        content_text = ""
         remember = (getattr(self.model, "remember_deepseek_v41_tool_output", None)
                     if request.tools and self._is_deepseek_v41_model() else None)
         history_content = ""
@@ -3607,6 +4003,16 @@ class FastLLmCompletion:
             "active": emit_reasoning_content,
             "buffer": "",
             "started": False,
+            "boundary_seen": False,
+            # A real close starts a new line for the qwen-family models; see
+            # ``_thinking_boundary_line_delimited``.  ``undecided_marker`` marks
+            # a trailing marker whose following character is still missing and
+            # which is therefore held back, not committed to.
+            "line_delimited_boundary":
+                self._thinking_boundary_line_delimited(),
+            "boundary_mentions_skipped": 0,
+            "undecided_marker": False,
+            "code_state": _new_code_state(),
             "format": reasoning_format,
             "phase": "reasoning" if emit_reasoning_content else "content",
             "reasoning_started": False,
@@ -3627,6 +4033,7 @@ class FastLLmCompletion:
             reasoning_delta_messages, delta_text = self._consume_tagged_reasoning_delta(
                 delta_text, reasoning_state)
             for reasoning_delta_message in reasoning_delta_messages:
+                reasoning_text += reasoning_delta_message.reasoning_content or ""
                 if remember:
                     history_reasoning_parts.append(reasoning_delta_message.reasoning_content or "")
                 choice_data = ChatCompletionResponseStreamChoice(
@@ -3683,6 +4090,7 @@ class FastLLmCompletion:
                     logging.warning("Invalid stream tool call suppressed: %s",
                                     diagnostics)
                 if parse_result.content or parse_result.valid_tool_calls:
+                    content_text += parse_result.content or ""
                     delta_message = DeltaMessage(
                         content = parse_result.content,
                         tool_calls = parse_result.valid_tool_calls,
@@ -3691,6 +4099,7 @@ class FastLLmCompletion:
                     delta_message = None
                 # print("delta", delta_message)
             else:
+                content_text += delta_text
                 delta_message = DeltaMessage(content = delta_text)
 
             if (delta_message):
@@ -3773,20 +4182,50 @@ class FastLLmCompletion:
                 and reasoning_state.get("format") != "kimi_k3"
                 and reasoning_state.get("active")
                 and reasoning_state.get("buffer")):
-            choice_data = ChatCompletionResponseStreamChoice(
-                index = 0,
-                delta = DeltaMessage(reasoning_content = reasoning_state["buffer"]),
-                logprobs = None,
-                finish_reason = None)
-            chunk = ChatCompletionStreamResponseWithUsage(
-                id = request_id,
-                object = chunk_object_type,
-                created = created_time,
-                choices = [choice_data],
-                model = model_name)
-            data = chunk.model_dump_json(exclude_unset=True)
-            yield f"data: {data}\n\n"
+            buffered_reasoning = reasoning_state["buffer"]
+            if (reasoning_state.get("undecided_marker")
+                    and reasoning_state.get("line_delimited_boundary")
+                    and buffered_reasoning.startswith("</think>")):
+                # Generation ended right after a marker whose follower never
+                # arrived: that is an end marker with nothing after it, so
+                # consume the marker and let the blank-answer path report it.
+                buffered_reasoning = buffered_reasoning[
+                    len("</think>"):].lstrip(" \t")
+                reasoning_state["boundary_seen"] = True
             reasoning_state["buffer"] = ""
+            if buffered_reasoning:
+                choice_data = ChatCompletionResponseStreamChoice(
+                    index = 0,
+                    delta = DeltaMessage(reasoning_content = buffered_reasoning),
+                    logprobs = None,
+                    finish_reason = None)
+                chunk = ChatCompletionStreamResponseWithUsage(
+                    id = request_id,
+                    object = chunk_object_type,
+                    created = created_time,
+                    choices = [choice_data],
+                    model = model_name)
+                data = chunk.model_dump_json(exclude_unset=True)
+                yield f"data: {data}\n\n"
+                reasoning_text += buffered_reasoning
+
+        # Boundary audit trail.  A leaked turn used to leave no trace at all in
+        # the server log, so an early split could not be reconciled afterwards.
+        if emit_reasoning_content and reasoning_format != "kimi_k3":
+            mentions_skipped = reasoning_state.get(
+                "boundary_mentions_skipped", 0)
+            if mentions_skipped:
+                logging.warning(
+                    "Thinking boundary (stream): ignored %d marker mention(s) "
+                    "that did not start a line (reasoning=%d chars, "
+                    "content=%d chars)",
+                    mentions_skipped, len(reasoning_text), len(content_text))
+            if _env_flag("FT_THINKING_BOUNDARY_LOG", True):
+                logging.info(
+                    "Thinking boundary (stream): reasoning=%d chars content=%d "
+                    "chars mentions_skipped=%d boundary_seen=%s",
+                    len(reasoning_text), len(content_text), mentions_skipped,
+                    bool(reasoning_state.get("boundary_seen")))
 
         # 3. 结束标志
         usage = self._chat_usage(
@@ -3794,8 +4233,37 @@ class FastLLmCompletion:
         finish_reason = self._chat_finish_reason(
             usage.completion_tokens or 0, request.max_tokens or 32768,
             stopped_by_stop_string)
+        # Recover calls written inside the thinking block before the parser's
+        # final diagnostics: that markup never reached the parser, so nothing
+        # below can see it and the turn would end as a bare stop.
+        recovered_stream_calls: List[Any] = []
+        if (request.tools and tool_call_parser
+                and not tool_call_parser.has_valid_streamed_tool_calls
+                and not (current_text or "").strip()
+                and reasoning_text.strip()):
+            recovered = self._recover_reasoning_tool_calls(
+                reasoning_text, request, finish_reason=finish_reason)
+            if recovered is not None:
+                logging.warning(
+                    "Recovered %d tool call(s) written inside the thinking block",
+                    len(recovered.tool_calls))
+                # The stream protocol carries delta call objects, the recovery
+                # path goes through the non-stream parser (ToolCall).
+                recovered_stream_calls = [
+                    DeltaToolCall(
+                        index = index,
+                        id = call.id,
+                        type = "function",
+                        function = DeltaFunctionCall(
+                            name = call.function.name,
+                            arguments = call.function.arguments,
+                        ),
+                    )
+                    for index, call in enumerate(recovered.tool_calls)
+                ]
+                finish_reason = 'tool_calls'
         final_stream_error_data = None
-        if request.tools and tool_call_parser:
+        if request.tools and tool_call_parser and not recovered_stream_calls:
             final_diagnostics = tool_call_parser.finalize_stream(
                 finish_reason=finish_reason)
             if final_diagnostics:
@@ -3819,6 +4287,35 @@ class FastLLmCompletion:
             elif (tool_call_parser.has_valid_streamed_tool_calls
                   and not tool_call_parser.incomplete_tool_call):
                 finish_reason = 'tool_calls'
+        if (final_stream_error_data is None and not recovered_stream_calls
+                and emit_reasoning_content and reasoning_text.strip()
+                and finish_reason == "stop"
+                # ``current_text`` only mirrors the text the tool parser saw, so
+                # without tools it stays empty even when the answer arrived -
+                # the visible delta accumulator has to be consulted as well.
+                and not (content_text or "").strip()
+                and not (current_text or "").strip()
+                and _env_flag("FT_THINKING_BOUNDARY_ERROR", True)):
+            # An agent client reads "stop with no tool call" as a finished turn,
+            # so a blank answer ends its loop in silence.  Report instead: the
+            # end marker never appeared, or it appeared and the model said
+            # nothing (a bare marker inside the reasoning looks exactly like a
+            # real end, so an early split cannot be ruled out).
+            reason = ("thinking closed without an answer"
+                      if reasoning_state.get("boundary_seen")
+                      else "thinking never closed")
+            if (not reasoning_state.get("boundary_seen")
+                    and reasoning_state.get("boundary_mentions_skipped")):
+                reason = ("thinking end marker did not start a line - the block may "
+                          "have closed mid-sentence")
+            logging.warning(
+                "Empty thinking turn (%s): reasoning=%d chars, content empty",
+                reason, len(reasoning_text))
+            final_stream_error_data = self.create_streaming_error_response(
+                f"The model produced no answer and no tool call ({reason}); "
+                "retry the request.",
+                err_type = "invalid_thinking_block",
+            )
         if final_stream_error_data is not None:
             data = final_stream_error_data
         elif fast_text_stream:
@@ -3849,7 +4346,23 @@ class FastLLmCompletion:
                 usage = usage)
             data = chunk.model_dump_json(exclude_unset = True,
                                         exclude_none = True)
-        if (final_stream_error_data is None and request.tools
+        if recovered_stream_calls:
+            delta_message = DeltaMessage(tool_calls = recovered_stream_calls)
+            choice_data = ChatCompletionResponseStreamChoice(
+                index = 0,
+                delta = delta_message,
+                logprobs = None,
+                finish_reason = None)
+            chunk = ChatCompletionStreamResponseWithUsage(
+                id = request_id,
+                object = chunk_object_type,
+                created = created_time,
+                choices = [choice_data],
+                model = model_name)
+            recovered_data = chunk.model_dump_json(exclude_unset = True,
+                                                   exclude_none = True)
+            yield f"data: {recovered_data}\n\n"
+        elif (final_stream_error_data is None and request.tools
                 and tool_call_parser):
             flush_result = tool_call_parser.flush_stream_tool_calls()
             if remember and finish_reason == 'tool_calls':
