@@ -31,7 +31,28 @@ __global__ __launch_bounds__(256) void Hopper(const BF *q,
     float maximum = sink ? sink[head + w] : -INFINITY;
     float denominator = sink ? 1.f : 0.f;
     float acc[4] = {};
-    for (int first = 0; first < count; first += Tile) {
+    if (t < 8) s.denominator[t] = sink ? 1.f : 0.f;
+    int activeCount = min(count, causal ? min(keys, past + row + 1) : keys);
+    if (indices) {
+        // Ignore only a trailing span with no valid keys. Indices need not be
+        // sorted or unique; keep their original stride and accumulation order.
+        int last = 0;
+        for (int slot = t; slot < count; slot += Threads) {
+            int key = indices[(size_t)row * count + slot];
+            if (key >= 0 && key < keys && (!causal || key <= past + row))
+                last = slot + 1;
+        }
+        #pragma unroll
+        for (int step = 16; step; step >>= 1)
+            last = max(last, __shfl_down_sync(0xffffffff, last, step));
+        if (l == 0) s.selected[w] = last;
+        __syncthreads();
+        activeCount = 0;
+        #pragma unroll
+        for (int warp = 0; warp < 8; ++warp) activeCount = max(activeCount, s.selected[warp]);
+        __syncthreads();
+    }
+    for (int first = 0; first < activeCount; first += Tile) {
         Load<192,200,Tile,Threads>(s.tile.keys, s.selected, key, indices,
             row, first, count, keys, past, causal, stride, kh);
         asm volatile("cp.async.wait_group 0;" ::: "memory");
