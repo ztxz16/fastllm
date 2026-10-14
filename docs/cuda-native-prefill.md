@@ -63,7 +63,7 @@ CUDA_HOME=/path/to/cuda-13.1 CUDA_VISIBLE_DEVICES=0 \
 
 测试包含 FP8/NVFP4 量化参考、SwiGLU/residual、TMA/cuBLASLt 对照、decode/graph/不支持尺寸回退、GDN prefix/decay 和 compact scratch 别名。GPU 测试需串行在空闲设备运行。
 
-本轮使用 CUDA 13.1.80，在 SM120 RTX 5090 上完成运行验证。通用源文件另通过 SM75/80/86/89/90/100/120/121 编译检查；不代表已在这些硬件上实测。TMA 单独使用 compute_120f/sm_120f 编译。
+使用 CUDA 13.1.80，在 SM120 RTX 5090 上完成运行验证。通用源文件另通过 SM75/80/86/89/90/100/120/121 编译检查；不代表已在这些硬件上实测。TMA 单独使用 compute_120f/sm_120f 编译。
 
 整模型 2K/8K、每组33个 teacher-forced token 的 logits 抽样用于发现明显数值问题，不替代完整困惑度/下游质量评估。因此自动开启仅限上述 SM120 形状，其他 SM 仍保持 opt-in。
 
@@ -85,7 +85,7 @@ export FASTLLM_CUDA_FP8_MARLIN=0
 
 这条路径使 NVFP4 prefill 和 decode 共用一份权重。预热时在原权重 allocation 内转换为 E2M1 codes、cuBLASLt tiled E4M3 scales 和 global scale。prefill 直接读取，不再执行 Marlin→NVFP4 重排；decode 使用读取同一布局的 W4A16 GEMV，并融合 SwiGLU/residual。
 
-没有第二份常驻权重，也没有 5.6 GB 缓存开关。转换期间仅有当前层临时缓冲（最大约 100 MB），校验和安装后立即释放。低比特 prefill 仍使用前文的 416 MiB 固定共享工作区；大 M 回退最多请求 32 MiB 解量化 scratch。原权重 allocation 不缩小。
+不保存第二份常驻权重。转换期间仅有当前层临时缓冲（最大约 100 MB），校验和安装后立即释放。低比特 prefill 仍使用前文的 416 MiB 固定共享工作区；大 M 回退最多请求 32 MiB 解量化 scratch。原权重 allocation 不缩小。
 
 初始转换仅启用于 SM12x、可用 SM120+ 编译镜像、单设备完整权重，且限于 N=34816/K=5120 和 N=5120/K=17408 两种尺寸。需要 FP16 输入输出、NVFP4 block16、预热同步阶段；不能在 graph capture 中转换。E4M3 scales 必须通过还原检查，失败则不改写原权重。开关默认关闭。其他 SM、TP shard 尺寸或不满足条件的权重保留原有调度；当前新布局仅在 SM120 单卡实测。
 
@@ -97,12 +97,12 @@ export FASTLLM_CUDA_FP8_MARLIN=0
 
 `Data` 只增加布局标记，不增加权重缓存指针。复制保留布局信息；迁回 CPU、reshape/resize 和 expansion 前恢复原始格式；释放清除标记。不能直接对 tiled 权重调用 `FakeFrom` 创建原始字节切片，必须先恢复源权重，接口会显式拒绝错误用法。
 
-新增测试覆盖 pack/restore、M=1/2/3/8 GEMV、graph replay、两个实际 K 特化、M=9/17/63/127/129/255 的补齐和输出边界，以及新布局 prefill 与 cuBLASLt 对照。`native-layout-lifecycle.cpp` 另链接构建好的 `libfastllm_tools.so`，检查复制、CPU 迁移和 reshape。测试在空闲 GPU 上串行执行。
+回归覆盖 pack/restore、M=1/2/3/8 GEMV、graph replay、两个实际 K 特化、M=9/17/63/127/129/255 的补齐和输出边界，以及原生布局 prefill 与 cuBLASLt 对照。`native-layout-lifecycle.cpp` 另链接构建好的 `libfastllm_tools.so`，检查复制、CPU 迁移和 reshape。测试在空闲 GPU 上串行执行。
 
 
 ## SM120 手写融合 prefill
 
-开启原 NVFP4 native prefill 后，符合条件时默认使用自包含的手写 kernel。`FASTLLM_CUDA_NATIVE_NVFP4_FRESH=0` 或 `FASTLLM_CUDA_NATIVE_NVFP4_TMA=0` 可禁用此路径并回退 cuBLASLt；没有保留外部引擎的旧 TMA 算子。
+开启原 NVFP4 native prefill 后，符合条件时默认使用自包含的手写 kernel。`FASTLLM_CUDA_NATIVE_NVFP4_FRESH=0` 或 `FASTLLM_CUDA_NATIVE_NVFP4_TMA=0` 可禁用此路径并回退 cuBLASLt。
 
 支持 SM120、M=256..4096（包括非整倍数尾块）、gate/up N34816 K5120 的 SwiGLU 融合，以及 down N5120 K17408 的 residual 融合。保留无 bias、指针对齐、非 CUDA Graph capture 约束。普通 Linear mode0、其他尺寸、SM 或资源不满足时回退 cuBLASLt/原 Linear 路径；M<256 沿用旧通用路径。
 

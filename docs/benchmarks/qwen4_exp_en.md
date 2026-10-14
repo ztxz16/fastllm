@@ -4,7 +4,7 @@
 
 ## 2026-09-29: Flash-Next NVFP4 on two RTX 2080 Ti GPUs
 
-All six configurations use inference code from commit `d6ef5c784`. See the [deployment commands](../qwen4.md) and [machine-readable measurements](qwen38_flash_next_2080ti_20260929.json).
+All six configurations use inference code from commit `d6ef5c784`. See the [deployment commands](../qwen4.md).
 
 Hardware: two **22 GiB** RTX 2080 Ti GPUs (22528 MiB each), an AMD EPYC 7452 with 32 cores / 64 threads, one NUMA node and 125.7 GiB RAM; Ubuntu 24.04.4, driver 595.84. This is not the standard 11 GiB 2080 Ti configuration.
 
@@ -59,70 +59,25 @@ python test/benchmark/qwen38_hybrid.py /data/models/Qwen3.8-Flash-Next-NVFP4 \
 
 Replace the placement flags for other configurations; clear `FASTLLM_TP` for sequential placement. The script records raw tokens and arrival times in `results.json`, and native prefill throughput in `[Prompt]` log lines. The built-in `ftllm benchmark` Prefill value uses input tokens divided by TTFT and therefore has a slightly different timing boundary.
 
-## Historical FP8 / Blackwell smoke tests
 
-The following uses a different checkpoint format and machine and is retained separately from the NVFP4 measurements above.
+## GPU-resident GGUF experts
 
-### Test scope
+Hardware: two 22 GiB RTX 2080 Ti GPUs and an EPYC 7452, one NUMA node. TP2, FP16 activations, CUDA Graph enabled, MTP off, expert cache budget 0; native GGUF experts on GPU, embedding on CPU, PLE on disk, 28 threads, 1 GiB KV budget, GPU memory ratio 0.95. See the [launch configuration](../qwen3.8-flash-next/README_EN.md#gguf-resident-performance).
 
-- Model: Qwen4-Exp / Qwen3.8-Flash-Next FP8 text model.
-- Hardware: RTX PRO 6000 Blackwell 96 GB and a 72-core dual-NUMA host.
-- Workload: 2 input tokens and at most 1 output token.
-- Purpose: smoke-test the CPU, CUDA + CPU, and CUDA + NUMA paths.
-- Limitation: this is not a sustained prefill or decode benchmark.
+Native generation timings, batch 1, greedy, no HTTP or profiler; median of three measured runs after warmup. Decode: 512 input and 512 output tokens, `511 / (last arrival - first arrival)`. Prefill: 4096 input tokens and one output, `4096 / TTFT`.
 
-### Recommended commands
+| Weights | Date | Decode, chunk 32 | Decode, chunk 512 | Prefill, chunk 1024 |
+| --- | --- | ---: | ---: | ---: |
+| GSQ-RCO-IQ2_XS | 2026-10-01 | 70.87 | 69.77 | 1205.13 |
+| GSQ-RCO-Q2_0 (Q3_K Dense included) | 2026-10-02 | 71.59 | 70.67 | 1359.00 |
 
-#### CPU with CPU MoE
+Rates are token/s. These separate measurements are not a controlled comparison of quantization formats. Chunk size may change generated trajectories.
 
-~~~bash
-ftllm benchmark /data/models/qwen4-exp \
-  --device cpu --moe_device cpu \
-  --atype float32 --threads 64 \
-  --input_tokens 2 --output_tokens 1 \
-  --batch 1 --warmup 0 --temperature 0
-~~~
+| Weights | Logical weights GiB/GPU | GPU0/1 after load and warmup GiB | GPU0/1 sampled peak GiB |
+| --- | ---: | --- | --- |
+| IQ2_XS | 19.3554 | 20.2088 / 20.2049 | 21.0586 / 20.8379 |
+| Q2_0 | 18.6634 | 19.8436 / 19.8416 | 20.6855 / 20.4648 |
 
-#### CUDA with CPU MoE
+Two-second GPU sampling may miss brief peaks. IQ2_XS host HWM was 41.905 GiB with zero swap; CPU embedding used 2.368 GiB. Arithmetic, JSON and 4096-token prefill checks passed; these are not a full quality evaluation. Q8 activation dot products have quantization error and need not match floating-point activation computation bit for bit.
 
-~~~bash
-ftllm benchmark /data/models/qwen4-exp \
-  --device cuda --moe_device cpu \
-  --atype float16 --moe_atype float32 \
-  --threads 64 \
-  --input_tokens 2 --output_tokens 1 \
-  --batch 1 --warmup 0 --temperature 0
-~~~
-
-#### CUDA with NUMA MoE
-
-~~~bash
-ftllm benchmark /data/models/qwen4-exp \
-  --device cuda --moe_device numa \
-  --atype float16 --moe_atype float32 \
-  --threads 64 \
-  --input_tokens 2 --output_tokens 1 \
-  --batch 1 --warmup 0 --temperature 0
-~~~
-
-### Measured results
-
-| Execution path | TTFT | Short-input prefill |
-| --- | ---: | ---: |
-| CPU with CPU MoE | 274.44 ms | 7.29 token/s |
-| CUDA with CPU MoE | 78.03 ms | 25.63 token/s |
-| CUDA with NUMA MoE | 69.68 ms | 28.70 token/s |
-
-These values compare the relative fixed cost of three paths for the same smoke input. With at most one output token, they do not provide sustained decode throughput.
-
-### Deployment starting point
-
-~~~bash
-ftllm server /data/models/qwen4-exp \
-  --model_name qwen4-exp \
-  --device cuda --moe_device numa \
-  --chunked_prefill_size 8192 \
-  --gpu_mem_ratio 0.9
-~~~
-
-The PLE table stays on the CPU by default. Add `--ngram_device disk` when host memory is insufficient; disk-backed PLE was not measured in these FP8 smoke tests.
+Measured native-library SHA256: IQ2_XS `0e9aa1b66b2d502e150395a40bfca36f2b43c0ea937329f43f89d60861add82b`; Q2_0 `2c60b9f0661321f32447f8d3bd1de75998e6fd9029eda3a95a79aad210241f91`. Results apply to these builds on SM75.

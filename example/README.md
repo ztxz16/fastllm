@@ -2,7 +2,7 @@
 
 ## Benchmark
 
-测速示例程序，方便大家测试不同软硬件下的推理性能。作者测试的速度可以参考[这里](doc/benchmark.md)。
+测速示例程序，方便大家测试不同软硬件下的推理性能。作者测试的速度可以参考[这里](../docs/benchmark.md)。
 
 由于实际使用时很难满足batch的条件，也并非贪婪解码，该速度与真实使用时的速度有一定差异。
 
@@ -15,7 +15,6 @@ CPU：
 GPU：
 
    `./benchmark -p chatglm-6b-int4.flm -f prompts.txt --batch [Batch大小]`
-
 
 
 ## Web UI 

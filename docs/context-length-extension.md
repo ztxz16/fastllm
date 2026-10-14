@@ -1,6 +1,6 @@
 # FastLLM 多模型上下文扩展
 
-状态：已实现首批 HF 模型的静态 YaRN 扩展，包含公共配置解析、CPU/CUDA 旋转、分页缓存写入、启动容量检查和服务元数据。本文同时说明已验证范围及尚未接入的布局。验证基于 `9d948ec6` 之后的上下文扩展实现，日期为 2026-09-06。
+支持适用模型的静态 YaRN 扩展，包含公共配置解析、CPU/CUDA 旋转、分页缓存写入、启动容量检查和服务元数据。本文同时说明已验证范围及尚未接入的布局。下述真实模型验证基于 `9d948ec6` 之后的上下文扩展实现，日期为 2026-09-06。
 
 ## 使用方法
 
@@ -31,7 +31,7 @@ Qwen3 的配置声明可能是 40960，而官方 YaRN 原始长度为 32768，�
 {"rope_type":"yarn","factor":4,"original_max_position_embeddings":262144}
 ```
 
-Launcher 的高级参数增加了“RoPE 扩展”，可填写同一个字符串或 JSON；JSON 作为一个 argv 元素传递。工作室仍通过 `/v1/models` 获取实际上下文。
+Launcher 的高级参数“RoPE 扩展”可填写同一个字符串或 JSON；JSON 作为一个 argv 元素传递。工作室通过 `/v1/models` 获取实际上下文。
 
 Python 在创建模型时传入扩展参数，随后 warmup 校准容量：
 
@@ -54,7 +54,7 @@ print(model.context_config)
 
 ## 支持范围与行为
 
-| 模型/布局 | 本期接入 | 验证范围 |
+| 模型/布局 | 支持范围 | 验证范围 |
 | --- | --- | --- |
 | Qwen2/2.5 普通文本 | 公共配置、普通旋转和融合分页写入 | Qwen2-7B 真实模型；普通布局 CPU/CUDA 算子 |
 | Qwen3 dense | 普通、独立 CUDA、TP、分页及非分页入口；YaRN 不分配全长 sin/cos 表 | Qwen3-0.6B 默认回归、YaRN、41,000 token 输入 |
@@ -64,7 +64,7 @@ print(model.context_config)
 
 新 RoPE 扩展入口接入 **HF 模型目录和 GGUF 文件**，仍受上表的模型布局限制。GGUF 显式传入 `--rope_scaling` 时，在 `InitParams` 前应用公共配置；读取 GGUF 的窗口、theta、旋转维度、scaling 元数据和 Qwen3.5 交错 sections，原生加载路径保持不变。GGUF、FLM、自定义 GraphLLM 的 CLI 仅设置 `--max_context_length` 时保留旧的限长路径：可以缩小，超过模型窗口时仍取原上限。FLM 和自定义 GraphLLM 显式设置 `--rope_scaling` 仍会报不支持。Python 的新构造参数支持 HF 目录和 GGUF；其他格式继续使用旧长度 setter。上下文扩展不会额外增加某模型对 FP4、MTP 或其他后端的支持。结合主机 KV 备份的长上下文用法见 [KVMem](kvmem.md)。
 
-本期开放 default、linear 与静态 YaRN。linear 扩大声明窗口同样需要明确原始长度。已有 dynamic NTK 在没有 RoPE 覆盖且没有扩大声明窗口时保留原路径，不开放新的动态扩展。外部 DSpark 与 YaRN 同用仍拒绝启动。Qwen3.5 的 DFlash2 可保留独立的原生 default RoPE 与目标 YaRN 同用，但草稿必须显式声明所有层均为滑窗注意力，窗口不超过其原生长度，且不使用缩放、partial rotary 或 M-RoPE。HF/GGUF 两个加载入口执行同一项检查。该组合不承诺短上下文相同的草稿接受率；主模型与草稿分别使用自己的旋转配置。
+当前支持 default、linear 与静态 YaRN。linear 扩大声明窗口同样需要明确原始长度。已有 dynamic NTK 在没有 RoPE 覆盖且没有扩大声明窗口时保留原路径，不开放新的动态扩展。外部 DSpark 与 YaRN 同用仍拒绝启动。Qwen3.5 的 DFlash2 可保留独立的原生 default RoPE 与目标 YaRN 同用，但草稿必须显式声明所有层均为滑窗注意力，窗口不超过其原生长度，且不使用缩放、partial rotary 或 M-RoPE。HF/GGUF 两个加载入口执行同一项检查。该组合不承诺短上下文相同的草稿接受率；主模型与草稿分别使用自己的旋转配置。
 
 | HF 新入口的输入 | 行为 |
 | --- | --- |
@@ -77,7 +77,7 @@ print(model.context_config)
 | 校准后的 KV 容量小于显式目标 | warmup 失败，报告目标及校准容量 |
 | 未显式设置目标 | 保留按物理 KV 容量限制实际窗口的行为 |
 
-## 实现结构与后续模型接入
+## 实现结构与模型接入
 
 公共实现位于 [`include/contextconfig.h`](../include/contextconfig.h) 和 [`src/contextconfig.cpp`](../src/contextconfig.cpp)。
 
@@ -108,7 +108,7 @@ Qwen3.5 的 head_dim=256、partial rotary factor=0.25，实际仅旋转 64 维�
 
 Qwen3.5 专用融合 decode 接收同一份 YaRN 参数；普通 prefill、TP 与内置 MTP 的对应入口也连接该计划。专用融合 prefill 尚未增加 YaRN，启用扩展时使用现有拆分操作完成相同计算。这可能影响 prefill 性能。
 
-首版保留现有算子按实际位置计算频率的方式，没有另外建立设备端 `inv_freq` 缓存；因此也没有新增图资源生命周期或全局缓存管理。Qwen3 的 YaRN 路径跳过全长 sin/cos 表及依赖该表的融合 attention。后续可以在有性能数据的基础上增加短频率表，而不改变配置接口。
+算子按实际位置计算频率，不使用额外的设备端 `inv_freq` 缓存。Qwen3 的 YaRN 路径跳过全长 sin/cos 表及依赖该表的融合 attention。
 
 ## 服务长度和显存
 
@@ -124,7 +124,7 @@ Qwen3.8-27B-FP8 有 16 层全注意力、4 个 KV head、head_dim=256。按当�
 | FP8 | 32768 | 30.52 GiB | 15.26 GiB |
 | FP4，包含 block16 scale | 18432 | 17.17 GiB | 8.58 GiB |
 
-还需要权重、线性注意力状态、MTP、图及工作区。本机两张 24GB 显卡的既有 8K FP4/TP2 配置常驻合计约 37GiB，换成 1M KV 的估算超过 54GiB，不能承诺完整 1M。本次自动预算实测为 **462080 token**（TP2、FP4、pageLen=128、MTP/图关闭、GPU 内存比例 0.9）；请求 1M 时明确失败。容量会随启动参数和空闲显存变化。
+还需要权重、线性注意力状态、MTP、图及工作区。本机两张 24GB 显卡的既有 8K FP4/TP2 配置常驻合计约 37GiB，换成 1M KV 的估算超过 54GiB，不能承诺完整 1M。已测自动预算为 **462080 token**（TP2、FP4、pageLen=128、MTP/图关闭、GPU 内存比例 0.9）；请求 1M 时明确失败。容量会随启动参数和空闲显存变化。
 
 ## 验证与复现
 
@@ -139,7 +139,7 @@ numactl -C 0-31 -m 0 compute-sanitizer --tool memcheck --error-exitcode 99 \
   build-fastllm/contextExtensionRegression --cuda
 ```
 
-测试目标需要 `-DUNIT_TEST=ON`；CPU-only 构建也可以运行 `context_extension_cpu`。新增的 `test/api/context_extension_model_probe.py` 是显式运行的真实模型探针，不下载模型；记录首 token logits、生成 token、耗时和解析后的窗口。MTP 探针使用普通 token 输出，避免 `output_logits` 自动禁用 MTP；`--no-logits` 可用于对应的非 MTP 对照。例如复现实际超过原声明的 Qwen3.5 输入：
+测试目标需要 `-DUNIT_TEST=ON`；CPU-only 构建也可以运行 `context_extension_cpu`。`test/api/context_extension_model_probe.py` 是显式运行的真实模型探针，不下载模型；记录首 token logits、生成 token、耗时和解析后的窗口。MTP 探针使用普通 token 输出，避免 `output_logits` 自动禁用 MTP；`--no-logits` 可用于对应的非 MTP 对照。例如复现实际超过原声明的 Qwen3.5 输入：
 
 ```bash
 numactl -C 0-31 -m 0 python3 test/api/context_extension_model_probe.py \
@@ -148,41 +148,18 @@ numactl -C 0-31 -m 0 python3 test/api/context_extension_model_probe.py \
   --input-tokens 270000 --kv fp4 --rope yarn
 ```
 
-本次已完成的结果：
+## 验证范围
 
-| 测试 | 结果 |
-| --- | --- |
-| 配置解析 | 普通/嵌套、40960/32768 区分、已缩放配置、不重复缩放、别名冲突、非法参数及未知布局均通过 |
-| CPU/CUDA RoPE 和 M-RoPE | FP32/FP16/BF16，与独立标量公式对照；位置覆盖 32768、262144、999999、1000000 等边界 |
-| 融合分页写入 | Q/K 与分解操作对照；非旋转维度、V 和 gate 检查通过 |
-| FP4 回归 | 4 种 attention 配置通过，新增 YaRN 三轴高位置的融合量化写入和图重放检查 |
-| CUDA memcheck | 新增上下文算子测试 0 errors |
-| Qwen3-0.6B / Qwen3.5-2B 未开启扩展 | 两个固定提示的首 token logits 与修改前逐位一致，生成 token 完全一致 |
-| Qwen2-7B、Qwen3-0.6B、Qwen3.5-2B、Qwen3-30B-A3B-FP8 YaRN 短输入 | 真实模型推理完成，logits 有限 |
-| Qwen3-0.6B，41,000 token 输入 | 超过原 40,960；正确返回开头口令 K314159，首 token 约 1.66 秒 |
-| Qwen3.5-2B，270,000 token 输入、FP4 KV | 超过原 262,144；正确返回开头口令 K314159，首 token 约 109.47 秒 |
-| Qwen3.8-27B-FP8，TP2、FP4、factor=4 | 短输入推理完成，logits 有限，实际服务窗口与显式 8192 一致 |
-| Qwen3.8-27B-FP8，TP2、FP4、factor=4、MTP=1、CUDA Graph | 日志确认 MTP 启用、两卡 decode 图及 verify=2 图捕获；两个提示的生成 token 与无 MTP/无图对照完全一致 |
-| Qwen3.5-2B，图片输入、factor=4 | 完成 native 图片请求，图文展开后 86 token，logits 有限 |
-| Qwen3.8-27B-FP8，TP2、FP4、目标 1M、自动 KV 预算 | 校准容量 462080 token；启动按预期返回容量不足错误 |
-| 旧长度 setter 与新计划 | 8192 缩至 4096 后通过 4096 KV 容量 warmup，元数据同步；再次设为 8192 仍保持 4096，不改变 RoPE |
-| 启动失败后重试 | Qwen3-0.6B 在同一进程连续三次因 4096 目标超过 2048 KV 池而失败，均释放已加载模型；失败后 GPU 占用约 1265/1269/1269 MiB，随后改为 2048 可正常加载并生成 391 |
-| GGUF 旧限长入口 | Qwen2-7B Q4_K_M 设置 4096 后启动、推理正常；原窗口 32768、用户限长 4096、实际窗口 4096 的元数据保留 |
-| 默认路径补充复查 | Qwen3-0.6B / Qwen3.5-2B 的默认首 token logits、生成 token 再次与修改前一致；投机参数 13 项、默认快速路径 33 项通过 |
-| CPU-only 构建 | 独立编译通过，`context_extension_cpu` 通过 |
-| Python/Launcher | 上下文元数据、旧限长入口及启动失败释放 20 项、CLI 7 项、Launcher 35 项、启动进度 5 项、Launcher 工作室 16 项通过；加上投机参数与默认快速路径共 129 项 |
+回归覆盖配置解析和冲突检查、独立标量 RoPE/M-RoPE 参考、融合分页写入、FP4 KV、CUDA Graph、启动容量不足时的释放和重试，以及 CPU-only 构建。
+高位置算子输入覆盖 32768、262144、999999、1000000；这不等于完整 1M 请求验证。
 
-Qwen2.5-1.5B 在修改前加载已出现 Linear 权重形状错误；Qwen2-0.5B 的当前 CUDA 分页 attention 不支持 head_dim=64。这两个本机 checkpoint 不计为验证通过，使用 Qwen2-7B 完成该模型族的实际接线验证。
+真实模型检查覆盖 Qwen2-7B、Qwen3-0.6B、Qwen3.5-2B 和 Qwen3-30B-A3B-FP8 的短输入；Qwen3-0.6B 的 41000-token 输入、Qwen3.5-2B 的 270000-token FP4 输入均完成开头口令检索。
+Qwen3.8-27B-FP8 的 TP2、FP4、MTP1 和 Graph 在短请求中通过；该双卡配置申请 1M 上下文时校准容量为 462080，按预期拒绝启动。Qwen3.5-2B 的图片请求完成，logits 有限。
+这些是有限请求与回归检查，不是长上下文质量基准；更复杂检索、并发、长前缀复用和完整 1M 请求未据此验收。
 
-以上单次口令检索只验证请求执行和一个长距离检索样例，不是长上下文质量基准。高位置小张量测试不等于完整 1M 输入验收；当前也没有完成 vLLM/SGLang 全模型 logits 对照。更多长度、复杂检索、并发、长前缀复用和充分显存上的完整 1M 请求仍需单独测量。
+## 模型配置参考
 
-## 上游参考与取舍
+- [Qwen3 的原始长度和 YaRN 配方](https://huggingface.co/Qwen/Qwen3-8B#processing-long-texts)
+- [Qwen3.8-27B-FP8 的 1M 配置](https://huggingface.co/Qwen/Qwen3.8-27B-FP8#best-practices)
 
-vLLM 将 `--max-model-len` 与 HF RoPE overrides 分开；SGLang 对应 `--context-length` 与 JSON model overrides。两者的放宽声明长度选项只是绕过长度检查，不能代替 RoPE 或显存支持。本实现采用明确配置和容量验证，不新增绕过全部限制的环境变量。
-
-参考核实的版本为 vLLM `f4eccdadefc6501fafeb1a0bf7f171ff24f984b0`、SGLang `ccf9fe6590ee7437005d8353c3c67d2dc4d25fcb`：
-
-- [vLLM 长度校验](https://github.com/vllm-project/vllm/blob/f4eccdadefc6501fafeb1a0bf7f171ff24f984b0/vllm/config/model.py) 与 [扩展文档](https://docs.vllm.ai/en/stable/features/context_extension/)。
-- [SGLang 长度校验](https://github.com/sgl-project/sglang/blob/ccf9fe6590ee7437005d8353c3c67d2dc4d25fcb/python/sglang/srt/configs/model_config.py) 与 [M-RoPE](https://github.com/sgl-project/sglang/blob/ccf9fe6590ee7437005d8353c3c67d2dc4d25fcb/python/sglang/srt/layers/rotary_embedding/mrope.py)。
-- [Qwen3 的原始长度和 YaRN 配方](https://huggingface.co/Qwen/Qwen3-8B#processing-long-texts)、[Qwen3.8-27B-FP8 的 1M 配置](https://huggingface.co/Qwen/Qwen3.8-27B-FP8#best-practices)。
-- [Transformers 多组 RoPE 配置](https://huggingface.co/docs/transformers/main/en/internal/rope_utils#per-layer-type-rope-configuration) 提供后续多组适配参考；本期尚未实现该能力。
+声明长度、RoPE 配置和物理 KV 容量必须同时满足；放宽声明长度不能替代位置编码或显存支持。

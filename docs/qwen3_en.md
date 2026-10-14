@@ -89,7 +89,7 @@ ftllm server /data/models/qwen \
   --gpu_mem_ratio 0.9
 ~~~
 
-Extending the model-declared window requires a valid `--rope_scaling` configuration; insufficient calibrated KV capacity fails startup. For Qwen3, specify the original RoPE length explicitly (commonly 32768). See [context extension](context-length-extension-design.md) for examples and validation limits.
+Extending the model-declared window requires a valid `--rope_scaling` configuration; insufficient calibrated KV capacity fails startup. For Qwen3, specify the original RoPE length explicitly (commonly 32768). See [context extension](context-length-extension.md) for examples and validation limits.
 
 ## MTP
 

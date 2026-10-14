@@ -108,8 +108,8 @@ GEMM task boundaries must meet the corresponding block/row alignment rules.
 FP32 hybrid decode and small batches reuse the FP8/NVFP4 scheduling paths;
 unsupported CPU layouts or input types retain the existing fallback.
 
-The immutable mapped host snapshot is made before destructive NUMA repacking.
-It adds host RAM usage, approximately the number of experts times the largest
+Adapters that cannot borrow registered NUMA storage take an immutable mapped host snapshot before destructive repacking.
+This fallback adds host RAM usage, approximately the number of experts times the largest
 record stride, in addition to CPU expert storage. Pure GPU expert execution
 with on-demand refills remains available through the cache operator without
 NUMA registration. Decode and verification batches of up to nine rows use
@@ -221,8 +221,7 @@ frequency policy, with admissions after readers complete. BF16 draft expert
 weights keep their existing execution path; the GLM NVFP4 checkpoint used in
 testing has BF16 draft experts. This covers one GPU per layer, including
 layer-partitioned dual-GPU models; GLM thread-TP expert parallelism is unchanged.
-GLM's DSA backend currently rejects MTP, so MTP requires the existing dense
-attention backend (`FASTLLM_GLM5_NEXT_DSA_BACKEND=dense`).
+Compressed MLA supports learned DSA with MTP and rank-local rollback. Expanded attention uses the dense backend; see the [GLM guide](glm5.md).
 
 With frequency caching active, compact GLM verification can also use the other
 GPUs whose caches have already been initialized for the same model. This applies
@@ -375,8 +374,7 @@ computation runs on `cudaStreamPerThread`; asynchronous admission streams publis
 an event dependency before subsequent cache reads.
 
 Model integration is available in DeepSeek V4.1 (described below) and the
-Qwen4-Exp backbone used by Qwen3.8-Flash-Next. Qwen4-Exp snapshots host experts
-before deferred NUMA registration can repack or release their original storage.
+Qwen4-Exp backbone used by Qwen3.8-Flash-Next. Qwen4-Exp prepares cache sources before deferred NUMA registration, borrowing supported pinned layouts and taking a snapshot for other layouts.
 Prefill and unsupported layouts
 retain the configured MoE backend. CPU-only and ROCm builds do not enable this
 NVIDIA CUDA adapter. A model must prepare its expert tables and call the cache
@@ -436,10 +434,7 @@ expert, amplifying the difference in later layers.
 
 Qwen4-Exp MTP verifier batches of up to nine tokens can use the cache and become
 eligible for CUDA Graph when the remaining graph requirements are satisfied.
-Larger batches retain the configured MoE backend. MTP draft expert tables are
-not registered with this cache and retain their separately configured placement.
-TP with host experts keeps its existing MTP graph fallback; enabling the cache
-does not enable a whole-backbone MTP graph.
+Larger batches retain the configured MoE backend. Eligible target and host draft expert tables share the cache budget. GPU-resident draft experts use the GPU backend. Decode/verification graph eligibility still depends on shape, layout and TP capabilities; enabling the cache alone does not guarantee graph execution.
 
 For supported compact NVFP4 host tables assigned entirely to NUMA, preparation
 copies only original E4M3/global scales, invokes the model's NUMA registration
@@ -454,8 +449,7 @@ releases the temporary snapshot; unsupported layouts retain a full snapshot.
 Repeated preparation reuses the group, preserving graph source addresses.
 Borrowed weights must remain alive until the model releases the cache.
 
-For Qwen3.8-Flash-Next-NVFP4 this removes about 56.25 GiB of duplicate weights,
-retaining about 7.03 GiB of scales. No full snapshot is allocated during loading,
+For Qwen3.8-Flash-Next-NVFP4 the borrowed layout retains about 7.03 GiB of original scales outside the NUMA weight storage. No full snapshot is allocated during loading,
 though individual tensor conversions still need temporary storage. Planar
 weight ranges let refill use contiguous 16-byte loads without transferring
 inline FP32 scales; narrow or inline shards use 4-byte loads. Cache capacity,
@@ -671,7 +665,7 @@ contiguous slices of the row. Callers retain their NaN handling and any legacy
 tie-resolution rules. Input types can convert to FP32 before these helpers;
 changing the source precision does not silently change the accumulation type.
 
-The first integrated router optimization is the existing 512-expert/top-10
+The router includes a 512-expert/top-10
 shape specialization. Its dispatch checks shape and dtype, not model name.
 It keeps the original softmax arithmetic, normalization, and legacy tie path.
 Other router shapes retain their existing implementations. Reusing these
@@ -819,19 +813,6 @@ cold admission, eviction, CPU/GPU prefill, unregistered NVFP4 cold startup,
 asymmetric budgets and GPU 0/1/0 output
 movement. `--dual --verify-only` limits it to multirow verification.
 
-## Measured GPU-resident GGUF configuration
-
-The [Qwen3.8-Flash-Next benchmark](qwen3.8-flash-next/README_EN.md#gguf-resident-performance)
-records the 2026-10-01 cleanup build on two 22 GiB RTX 2080 Ti cards:
-70.87 token/s decode (512 input / 512 output, chunk 32) and 1205.13 token/s
-for 4096-token prefill (chunk 1024), each the median of three measured runs
-after warmup. MTP is off and CUDA Graph is on. Expert weights remain on GPU
-with zero expert-cache budget; embedding remains on CPU and PLE uses disk.
-Per-GPU logical weights are 19.36 GiB, used memory after loading is about
-20.21 GiB, and sampled peaks are 21.06 / 20.84 GiB.
-[Machine-readable results](benchmarks/qwen38_flash_next_iq2xs_2080ti_20261001.json)
-include configuration, timing definitions, per-run data and validation limits.
-
 ## GGUF NUMA GPU-assisted prefill
 
 NUMA prefill retains its CPU/GPU expert scheduler. For supported 33–4096-row
@@ -894,9 +875,7 @@ The ordinary Q2_0 Dense path also accepts 1–8-row Q8/DP4A MMVQ for
 FP32/FP16/BF16. It requires 64-column alignment and at most 32 KiB of staged
 Q8 activation per block; other shapes retain the existing fallback. This
 Dense change adds activation quantization and can change generated tokens.
-The [Q2_0 TP2 benchmark](qwen3.8-flash-next/README_EN.md#gguf-q2_0-expert-mmq-and-dense-decode-optimization-2026-10-01)
-records 1354.38 token/s for 4096-token prefill (+19.83%) and 70.74 token/s
-decode (+0.85%) on two 22 GiB RTX 2080 Ti cards, with MTP off and Graph on.
+Final deployment measurements are listed in the [Qwen4 benchmark](benchmarks/qwen4_exp_en.md#gpu-resident-gguf-experts).
 
 `cuda_gguf_moe_host` checks the CPU R4 repacker against an independent decoded
 weight oracle, cross/non-cross gate/up layouts, selected subset changes,
@@ -964,9 +943,7 @@ attention heads, recurrent state and KV pages. Attention output, dense-FFN
 and shared-expert down projections reduce their rank-local partial sums.
 Routing executes on the owner rank. Routed host
 experts are evaluated once, using a single process-wide RAM cache; TP does not
-load a full host expert copy per rank. MTP is currently unsupported in this
-path and must remain disabled; `--cuda_shared_expert true` is required.
-Prefix/history reuse is bypassed for TP. As with ordinary BF16 tensor
+load a full host expert copy per rank. `--cuda_shared_expert true` is required. MTP placement and unsupported draft formats follow the [GLM deployment guide](glm5.md); prefix/history reuse is bypassed for hybrid TP. As with ordinary BF16 tensor
 parallelism, partitioning changes floating-point accumulation and can change
 generated tokens; it does not promise bitwise agreement with serial execution.
 

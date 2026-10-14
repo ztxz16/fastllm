@@ -54,6 +54,6 @@ ftllm server /data/models/glm5 \
 
 GLM-5.3-Flash KDA, paged history caches, and NUMA decode pipelining are selected from the model architecture.
 
-## Benchmark status
+## Benchmark
 
-No publishable complete GLM-5 / GLM-5.3-Flash throughput table is stored in the repository. See the [GLM-5 benchmark page](benchmarks/glm5_en.md) for suggested device commands and the current data status.
+Scoped GLM-5.3-Flash prefill measurements and their limits are available on the [benchmark page](benchmarks/glm5_en.md).

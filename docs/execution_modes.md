@@ -1,6 +1,6 @@
 # GPU 与混合推理执行路径
 
-`FASTLLM_EXECUTION_MODE=auto|gpu|hybrid|cpu` 是统一选择器。本次接入
+`FASTLLM_EXECUTION_MODE=auto|gpu|hybrid|cpu` 是统一选择器，支持
 Qwen4（包括 `qwen4_exp` / Qwen3.8-Flash-Next）、DeepSeek V4.1 与
 GLM 5.3 Flash（`glm5_next`）。
 默认 `auto` 根据每层最终生效的主干和路由专家设备选择；显式模式与设备不符时报错。
@@ -27,7 +27,7 @@ Engram、PLE、embedding 的存储位置与主干执行模式独立。仅将这�
 主循环。GPU forward 调用 GPU 专家计算；Hybrid forward 自己管理混合 MoE 步骤、
 预取和专家执行。CPU 路径使用 Hybrid 文件中的主机后端分支，不启动 CUDA 缓存策略。
 
-公共模型文件保留权重加载、数学语义、Attention、KV、Graph 分段和采样。
+公共模型代码保留权重加载、数学语义、Attention、KV 和采样；Graph 策略与共享机制的文件边界见下文。
 Qwen / DeepSeek 的 `ForwardWorkspace` 持有一次前向的状态，`ForwardState` 提供块接口。
 GLM 保留栈上的逐层临时张量，通过 Attention、FFN 前后处理块共享数学实现。
 Attention/GDN/QSA、Hyper-Connection、共享专家与现有 CUDA 融合算子继续共用，
@@ -39,8 +39,7 @@ Attention/GDN/QSA、Hyper-Connection、共享专家与现有 CUDA 融合算子�
 Qwen / DeepSeek 混合策略的启动仍位于 embedding 之前；准备输入是显式的公共块，避免拆文件时
 改变缓存准入等待、设备选择与输入计算的先后顺序。
 
-MTP / DSpark 的请求管理与草稿模型仍使用原实现；目标模型验证进入所选 forward。
-本次不改动路由 top-k、量化格式、专家权重、KV 格式或底层 CUDA 算子。
+MTP / DSpark 的请求管理、接受/拒绝与回滚由公共逻辑维护；目标模型验证进入所选 forward。
 
 ## 复用混合 MoE
 
@@ -84,19 +83,25 @@ GLM 的缓存策略在各设备首个适用 MoE 层启动，维持原有时序�
 
 当前 GLM 专用 GPU 专家缓存注册支持原有 NVFP4 block-16 和符合条件的 GGUF 格式。
 FP8 源权重仍使用其既有主机/GPU 后端；选择 Hybrid 或设置缓存预算不会自动将 FP8
-转换为 NVFP4/GGUF，也不代表该缓存已启用。本次拆分不增加量化格式或算子支持。
+转换为 NVFP4/GGUF，也不代表该缓存已启用。
 
-## 后续模型
+## Qwen4 模块边界
 
-| 模型 | 当前状态与下一步 |
+| 职责 | 实现 |
 | --- | --- |
-| Qwen3 MoE | 已有 `ForwardGPU` / `ForwardV2`，重点是统一选择规则、分文件和复用混合 MoE，避免重写已有 GPU 路径 |
-| Qwen3.5 | 已有 GPU 资格判断和大量 Graph/MTP 路径；先整理主干、请求调度、草稿与混合专家边界，分阶段迁移 |
-| Qwen3 Next、GLM5 MoE DSA | 仍有较大的共同前向；可按模型块拆分，独立验证缓存和不同请求批量 |
-| DeepSeek V4 | 与 V4.1 的请求、KV 和投机实现不同，需单独迁移，不能直接替换 V4.1 的 forward |
-| Naive N0.5、Kimi K3 | 先审查已有 TP/草稿及实际主机专家支持，再决定是否增加 Hybrid forward；不为了目录一致复制 GPU 路径 |
-| Llama、Qwen2 等稠密模型 | 没有路由专家缓存的复用收益；按实际 CPU/GPU 调度差异再决定拆分优先级 |
+| GPU / Hybrid 普通前向与专家执行 | `qwen4_exp_gpu.cpp` / `qwen4_exp_hybrid.cpp` |
+| 每层及草稿的专家执行计划、路由与公共共享专家数学 | `qwen4_exp_moe.cpp` |
+| GPU 图编排 | `qwen4_exp_gpu_graph.cpp` |
+| Hybrid 图段与段外专家编排 | `qwen4_exp_hybrid_graph.cpp` |
+| 图存储、捕获/回放/销毁、共享数学与状态发布 | `qwen4_exp_graph.cpp` / `qwen4_exp_graph.h` |
+| 混合专家协作、绑核与执行生命周期 | `qwen4_exp_hybrid_parallel.cpp` / `qwen4_exp_hybrid.h` |
+| 分层 prefill 流水 | `qwen4_exp_pp.cpp` |
+| TP 线程、通信与共享请求状态 | `qwen4_exp_tp.cpp` / `qwen4_exp_tp.h` |
 
-验证时需要同时覆盖真实权重的固定输入 logits、稳态 prefill/decode 耗时，以及
-CPU fallback、Graph 捕获/回放、TP、前缀缓存和投机回滚。精度测试与测速分开，
-不能用几条文字回答替代 logits 回归，也不能把编译或权重加载计入解码速度。
+全模型模式负责配置检查和 forward 选择；`MoEExecutionPlan` 另按实际设备为目标各层和草稿选择专家后端。
+主模型专家在 NUMA、草稿专家在 GPU 时，两者分别调用对应后端。该计划记录后端、层号、前缀和原权重/偏置表；格式、形状和 Graph 能力仍由运行时检查，不是“权重在 GPU 即可进图”的承诺。
+
+`HybridExecutionScope` 与 `HybridPrefillScope` 管理混合策略、CPU 亲和性及步骤收尾；公共 workspace 管理共享张量。
+MTP 的接受、拒绝、前缀提交和 KV 回滚只有一份语义实现。共享专家、远端专家合并及 buffer 有效期通过专家接口和图边界协调。
+
+维护时必须保持图地址有效、张量释放顺序、TP 集合通信顺序和 MTP 回滚语义。模型回归需覆盖固定输入 logits、CPU fallback、Graph 捕获/重放、TP、前缀恢复和投机回滚；精度测试与稳态测速分开。

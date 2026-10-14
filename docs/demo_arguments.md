@@ -36,7 +36,7 @@
 --kv_cache_limit 168K # 设置为168K
 ```
 - **单会话上下文 (`--max_context_length`, `--max-context-length`)**: 输入与输出合计上限；扩大模型声明窗口需要有效的 RoPE 配置，warmup 后容量不足会启动失败。
-- **RoPE 扩展 (`--rope_scaling`, `--rope-scaling`)**: HF Qwen2/3/3.5 布局支持静态 YaRN；填 `yarn` 或 JSON。Qwen3 等模型须明确 `original_max_position_embeddings`。用法、支持范围和验证记录见[上下文扩展](context-length-extension-design.md)。
+- **RoPE 扩展 (`--rope_scaling`, `--rope-scaling`)**: HF Qwen2/3/3.5 布局支持静态 YaRN；填 `yarn` 或 JSON。Qwen3 等模型须明确 `original_max_position_embeddings`。用法、支持范围和验证记录见[上下文扩展](context-length-extension.md)。
 - **最大Batch数量 (`--max_batch`)**: 设置每次同时处理的请求数量。若不使用此参数，框架会自动处理
 - **线程数量 (`-t, --threads`)**: 设置CPU线程数量，device设置为`cpu`时对速度有较大影响，设置为`cuda`时影响较小，主要影响读取模型的速度
 - **自定义模型描述文件 (`--custom`)**: 指定描述自定义模型的Python文件。具体见 [自定义模型](custom.md)

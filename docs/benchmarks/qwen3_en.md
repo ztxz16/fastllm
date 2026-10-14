@@ -35,11 +35,12 @@ ftllm server /data/models/Qwen3.6-27B-FP8 \
 | 64 | 2930.4490 token/s |
 | 128 / 256 | Unavailable due to capacity or warmup OOM |
 
-The [full Qwen3.6 analysis](../qwen36_27b_fp8_tp2_benchmark_20260809.md) includes framework comparisons and operator profiling.
+The [Qwen3.6 benchmark](qwen36_27b_fp8.md) records the final configuration and results.
 
 ## Qwen3.8-27B-FP8 with DFlash2 TP2
 
 - Hardware: 2 × RTX 5090 with 32,607 MiB each, connected over PCIe without NVLink.
+- Measured 2026-08-19, FastLLM commit `161962de`.
 - Draft model: a separate Qwen3.8-27B-DFlash2 checkpoint.
 - Recommended DFlash block: 8, including the anchor token.
 
@@ -58,13 +59,11 @@ ftllm server /data/models/Qwen3.8-27B-FP8 \
 
 | Path | Output length | Median fixed-stream throughput |
 | --- | ---: | ---: |
-| Target only | 512 | 81.45 token/s |
 | MTP5 | 1024 | 273.65 token/s |
-| DFlash B6 | 1024 | 287.29 token/s |
 | DFlash B8 | 1024 | 381.00 token/s |
 | DFlash B8 | 4096 | 377.52 token/s |
 
-The final 128-question GSM8K run with DFlash B8 reached 207.06 token/s and 120/128 correct. This end-to-end result includes sampling and variable output lengths, so it is not directly comparable to the forced fixed-token stream. See the [full DFlash2 analysis](../dflash2_qwen38_27b_tp2_20260819.md).
+The final 128-question GSM8K run with DFlash B8 reached 207.06 token/s and 120/128 correct. This end-to-end result includes sampling and variable output lengths, so it is not directly comparable to the forced fixed-token stream. See the [DFlash2 benchmark](../benchmarks/qwen38_27b_dflash2.md).
 
 ## Qwen3.5
 

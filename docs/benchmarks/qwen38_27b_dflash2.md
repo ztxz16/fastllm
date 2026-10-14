@@ -1,10 +1,10 @@
 # Qwen3.8-27B-FP8 DFlash2 / MTP Benchmark
 
-[Benchmark 索引](../benchmark.md) · [完整 DFlash2 报告](../dflash2_qwen38_27b_tp2_20260819.md) · [部署指南](../qwen3.md)
+[Benchmark 索引](../benchmark.md) · [部署指南](../qwen3.md)
 
 ## 测试配置
 
-- 日期：2026-08-19。
+- 日期：2026-08-19，FastLLM commit `161962de`。
 - 目标模型：Qwen3.8-27B-FP8。
 - Draft：独立 Qwen3.8-27B-DFlash2 checkpoint。
 - 硬件：2 × RTX 5090，每卡 32607 MiB，PCIe，无 NVLink。
@@ -33,35 +33,28 @@ Draft checkpoint 的 `architectures` 必须包含 `DFlash2DraftModel`。省略 b
 
 | 路径 | 输出长度 | 运行次数 | 中位吞吐 |
 | --- | ---: | ---: | ---: |
-| Target only | 512 | 历史 sweep | 81.45 token/s |
 | MTP5 | 1024 | 2 | 273.65 token/s |
-| DFlash B6 | 1024 | 2 | 287.29 token/s |
 | DFlash B8 | 1024 | 3 | 381.00 token/s |
 | DFlash B8 | 4096 | 2 | 377.52 token/s |
 
-固定流结果表明当前 checkpoint 应优先使用原生 B8，而不是旧的 B6 配置。
+固定流结果表明该 checkpoint 的推荐配置为原生 B8。
 
 ## GSM8K 端到端
 
-128 题、非 greedy、单并发：
+128 题、单并发，temperature=1、top_p=0.95、top_k=20、最多输出 4096 token：
 
-| 版本 | 输出 token | 总耗时 | 吞吐 | 正确 |
+| 配置 | 输出 token | 总耗时 | 吞吐 | 正确 |
 | --- | ---: | ---: | ---: | ---: |
-| 初始 FastLLM B6 | 72584 | 587.664 s | 123.51 token/s | 120/128 |
-| 最终 FastLLM B8 | 70878 | 342.308 s | 207.06 token/s | 120/128 |
+| DFlash B8 | 70878 | 342.308 s | 207.06 token/s | 120/128 |
 
 这是包含采样、不同 EOS 和不同输出长度的服务端到端吞吐，不能与固定流的 381.00 token/s 混为同一指标。
 
-## 其他设备布局
+MTP5 配置保留相同目标模型、TP2、embedding 和容量参数，移除上述三个 `--speculative_*` 参数，改用 `--mtp 5`。DFlash 和 `--mtp` 不能同时启用。本页没有单卡或 CPU / NUMA 的实测速率。
 
-| 布局 | 建议命令 | 当前速度 |
-| --- | --- | --- |
-| 双卡 TP2 target only | 去掉 `--speculative_*` 参数 | 81.45 token/s，固定流 |
-| 双卡 TP2 MTP | 目标命令追加 `--mtp 5` | 273.65 token/s，固定流 |
-| 双卡 TP2 DFlash B8 | 使用上方推荐命令 | 381.00 token/s，固定流 |
-| 单张 CUDA | `ftllm server /data/models/Qwen3.8-27B-FP8 --device cuda` | 待实测 |
-| CPU / NUMA | `ftllm server /data/models/Qwen3.8-27B-FP8 --device numa -t 64` | 待实测 |
+## 接受率与采样语义
 
-DFlash 和 `--mtp` 不能同时启用。
+上述 GSM8K 测量中，七个候选位置的累计接受率分别为 86.68%、71.18%、58.33%、48.29%、39.90%、33.37%、27.69%；每轮平均提交 4.654 个 token。
+接受率取决于输入和采样参数，不能视为固定配置的常数。
 
-性能优化过程、SGLang 对比、接受率和准确性分析见[完整报告](../dflash2_qwen38_27b_tp2_20260819.md)。
+随机采样使用标准拒绝采样：候选分布为 q，目标分布为 p，以 `min(1, p/q)` 接受；首次拒绝后从归一化的 `max(p-q, 0)` 采样，全部接受时额外采样目标 token。
+这保证的是给定目标条件分布下的采样语义；不同批量前向仍可能有浮点舍入差异，不保证相同随机种子产生逐 token 相同的输出。
