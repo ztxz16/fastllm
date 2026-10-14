@@ -86,7 +86,14 @@ int main() {
 #endif
             Check(model.SelectSpecialWeightDevice(target, 3) == "numa", "target expert placement changed");
             model.deviceMap = {{"cuda:0", 1}, {"cuda:1", 1}};
-            Check(model.SelectSpecialWeightDevice(draft, 3) == "numa", "pipeline placement changed");
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            Check(model.SelectSpecialWeightDevice(draft, 3) == "cuda:1", "pipeline draft must use its final CUDA stage");
+            setenv("FASTLLM_QWEN4_MTP_GPU_EXPERTS", "0", 1);
+            Check(model.SelectSpecialWeightDevice(draft, 3) == "numa", "pipeline draft placement opt-out ignored");
+            unsetenv("FASTLLM_QWEN4_MTP_GPU_EXPERTS");
+#else
+            Check(model.SelectSpecialWeightDevice(draft, 3) == "numa", "CPU build changed pipeline placement");
+#endif
             model.deviceMap = {{"cuda:0,1", 1}};
             Check(model.SelectSpecialWeightDevice(draft, 3) == "numa", "multi-device placement changed");
             model.deviceMap = {{"cpu", 1}};
