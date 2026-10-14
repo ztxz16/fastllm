@@ -15,6 +15,28 @@
 using namespace fastllm;
 namespace fastllm {
 struct Glm5NextGGUFTestAccess {
+    static void CheckExecutionModes() {
+        Glm5NextModel model;
+        model.block_cnt = 4;
+        model.denseMlpLayers.assign(4, true);
+        model.deviceMap = {{"cuda:0", 1}};
+        model.moeDeviceMap = {{"cpu", 1}};
+        model.InitExecutionMode();
+        if (model.GetExecutionMode() != ExecutionMode::Gpu)
+            throw std::runtime_error("dense-only GLM partition must ignore unused expert placement");
+        model.denseMlpLayers.back() = false;
+        model.InitExecutionMode();
+        if (model.GetExecutionMode() != ExecutionMode::Hybrid)
+            throw std::runtime_error("GLM host experts did not select hybrid forward");
+        model.moeDeviceMap = {{"cuda:0", 1}};
+        model.InitExecutionMode();
+        if (model.GetExecutionMode() != ExecutionMode::Gpu)
+            throw std::runtime_error("GLM resident experts did not select GPU forward");
+        model.deviceMap = model.moeDeviceMap = {{"cpu", 1}};
+        model.InitExecutionMode();
+        if (model.GetExecutionMode() != ExecutionMode::Cpu)
+            throw std::runtime_error("GLM CPU placement did not select CPU fallback");
+    }
     static void InitTp(Glm5NextModel &model, bool resident = false, bool sharded = false) {
         model.block_cnt = 4;
         model.kdaHeads = model.num_attention_heads = 4;
@@ -30,6 +52,7 @@ struct Glm5NextGGUFTestAccess {
             model.moeDeviceLayers = 2;
         }
         model.weight.dicts["gguf_architecture"] = "glm5next";
+        model.InitExecutionMode();
         model.InitThreadTp();
     }
 };
@@ -415,6 +438,7 @@ void Run(const std::string &directory) {
 int main(int argc, char **argv) {
     char directory[]="/tmp/fastllm-glm53-gguf-XXXXXX";
     try {
+        Glm5NextGGUFTestAccess::CheckExecutionModes();
 #ifdef USE_CUDA
         if (argc == 2 && std::string(argv[1]) == "--prefill-formats") {
             for (auto type : {BFLOAT16, FLOAT16, FLOAT32}) {

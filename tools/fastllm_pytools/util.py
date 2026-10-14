@@ -1749,7 +1749,7 @@ def make_normal_llm_model(args, startup_progress = None):
             args.device = expanded
     if (args.moe_device and args.moe_device != ""):
         args.moe_device = expand_cudapp_device(args.moe_device)
-    if is_deepseek_v41_model or is_qwen38_flash_next_model:
+    if is_deepseek_v41_model or is_qwen38_flash_next_model or is_glm5_next_model:
         # Native model initialization resolves auto from effective per-layer
         # placements, after TP fallback. Keep auto intact for subsequent models.
         os.environ.setdefault("FASTLLM_EXECUTION_MODE", "auto")

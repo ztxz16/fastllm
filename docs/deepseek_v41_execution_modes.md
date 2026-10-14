@@ -1,6 +1,6 @@
 # DeepSeek V4.1 执行后端
 
-`FASTLLM_EXECUTION_MODE` 是统一的执行模式选择变量，现由 DeepSeek V4.1 与 Qwen4 接入。
+`FASTLLM_EXECUTION_MODE` 是统一的执行模式选择变量，现由 DeepSeek V4.1、Qwen4 与 GLM 5.3 Flash 接入。
 完整的共用组件、forward 拆分和后续迁移说明见 [执行路径设计](execution_modes.md)。
 其他模型保持原有行为。变量不改变设备配置，也不会自动搬迁权重。
 

@@ -215,7 +215,7 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/context
         src/models/deepseekv41.cpp src/models/deepseekv41_execution.cpp src/models/deepseekv41_gpu.cpp src/models/deepseekv41_hybrid.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
         src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/qwen4_exp_gpu.cpp src/models/qwen4_exp_hybrid.cpp src/utils/hybrid_moe.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
-        src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/gpt_oss.cpp
+        src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/glm5_next_gpu.cpp src/models/glm5_next_hybrid.cpp src/models/gpt_oss.cpp
         src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
         third_party/json11/json11.cpp
         third_party/gguf/gguf.cpp third_party/gguf/ggml-quant.cpp third_party/gguf/ggml-iqk.cpp third_party/gguf/ggml-dequantize.cpp

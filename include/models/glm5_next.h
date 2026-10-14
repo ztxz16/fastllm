@@ -2,6 +2,7 @@
 #define FASTLLM_GLM5_NEXT_H
 
 #include "basellm.h"
+#include "utils/execution_mode.h"
 
 #include <cstdint>
 #include <deque>
@@ -32,6 +33,7 @@ namespace fastllm {
     class Glm5NextModel : public basellm {
     public:
         Glm5NextModel();
+        ExecutionMode GetExecutionMode() const { return executionMode; }
         ~Glm5NextModel() override;
 
         void InitParams() override;
@@ -108,6 +110,9 @@ namespace fastllm {
 
     private:
         friend struct Glm5NextGGUFTestAccess;
+        ExecutionMode executionMode = ExecutionMode::Cpu;
+        void InitExecutionMode();
+        void PrepareHybridMoeCache();
         struct ThreadTpState;
         std::unique_ptr<ThreadTpState> threadTpState;
         ThreadTpState *threadTpOwner = nullptr;
@@ -205,6 +210,30 @@ namespace fastllm {
                 std::vector<KdaReplayCapture> *kdaReplay = nullptr,
                 std::vector<Glm5NextIndexerCache> *indexer = nullptr);
 
+        void ForwardGpuLayers(
+                Data &hiddenStates, int firstLayer, int endLayer,
+                const std::vector<std::vector<std::pair<Data, Data>>*>
+                    &requestCaches,
+                std::vector<KdaReplayCapture> *kdaReplay = nullptr,
+                std::vector<Glm5NextIndexerCache> *indexer = nullptr);
+
+        void ForwardHybridLayers(
+                Data &hiddenStates, int firstLayer, int endLayer,
+                const std::vector<std::vector<std::pair<Data, Data>>*>
+                    &requestCaches,
+                std::vector<KdaReplayCapture> *kdaReplay = nullptr,
+                std::vector<Glm5NextIndexerCache> *indexer = nullptr);
+
+        void RunAttentionBlock(int layer, const std::string &prefix,
+                Data &input, Data &output,
+                const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
+                std::vector<KdaReplayCapture> *kdaReplay,
+                std::vector<Glm5NextIndexerCache> *indexer);
+        void PrepareFfnBlock(const std::string &prefix, Data &input,
+                Data &normalizedFfn, Data &ffnPost, Data &ffnComb);
+        void FinishFfnBlock(Data &ffnOutput, Data &input,
+                Data &ffnPost, Data &ffnComb, Data &output);
+
         int ForwardOutput(
                 Data &hiddenStates,
                 const GenerationConfig &generationConfig,
@@ -292,14 +321,28 @@ namespace fastllm {
                 Data &input, Data &gateUpWeight, Data &downWeight,
                 Data &output);
 
-        void RunMoe(
-                int layerIndex, Data &input, int sequence, Data &output);
-
         void RunMoeWithPrefix(
                 int deviceLayer, const std::string &mlpPrefix,
                 std::vector<Data*> &weights,
                 std::vector<Data*> &biases,
                 Data &input, int sequence, Data &output);
+
+        void RunGpuMoeWithPrefix(
+                int deviceLayer, const std::string &mlpPrefix,
+                std::vector<Data*> &weights,
+                std::vector<Data*> &biases,
+                Data &input, int sequence, Data &output);
+
+        void RunHybridMoeWithPrefix(
+                int deviceLayer, const std::string &mlpPrefix,
+                std::vector<Data*> &weights,
+                std::vector<Data*> &biases,
+                Data &input, int sequence, Data &output);
+
+        void RunSharedMoe(int deviceLayer, const std::string &mlp,
+                Data &input, Data &output, bool &sharedReady);
+        void RouteMoe(int deviceLayer, const std::string &mlp, Data &input,
+                Data &routerInput, Data &routerScores, Data &expertIndex, Data &expertScore);
 
         int Sample(
                 Data &hiddenStates,
