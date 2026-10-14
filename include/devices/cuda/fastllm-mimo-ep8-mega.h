@@ -6,6 +6,9 @@
 // for decode are prepared before worker execution / CUDA Graph capture.
 struct FastllmCudaMimoEp8Mega;
 bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &devices);
+// Required backing for an eligible eager prefill chunk, or zero for the
+// existing small-chunk path / builds without the SM90 backend.
+size_t FastllmCudaMimoEp8PrefillWorkspaceBytes(int rows);
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     const std::vector<int> &devices,
     const std::vector<std::vector<std::vector<fastllm::Data *>>> &weights);

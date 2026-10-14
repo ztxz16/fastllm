@@ -1026,13 +1026,18 @@ Data NaiveN05FlashModel::RunTarget(
             if (!hasRouterProbabilities) {
                 Data localRouterInput;
                 if (shardPrefillRouter) {
-                    // Keep the former full FP32 allocation for MegaMoE's
-                    // borrowed arena, but convert/project only the local rows.
+                    // Share one backing allocation with the prefill arena;
+                    // only the logical local rows are converted/projected.
                     routerInput.dataType = FLOAT32;
                     routerInput.UpdateUnitSize();
-                    routerInput.Resize({length, embed_dim});
+                    const size_t rowBytes = (size_t)embed_dim * sizeof(float);
+                    const size_t arenaBytes = FastllmCudaMimoEp8PrefillWorkspaceBytes(length);
+                    const int reserveRows = std::max<size_t>(length,
+                        (arenaBytes + rowBytes - 1) / rowBytes);
+                    routerInput.Resize({reserveRows, embed_dim});
                     routerInput.ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
                     routerInput.Allocate(false);
+                    routerInput.Resize({length, embed_dim});
                     localRouterInput.FakeFrom(routerInput, 0);
                 }
                 Data &fp32Input = shardPrefillRouter ? localRouterInput : routerInput;

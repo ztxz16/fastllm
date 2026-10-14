@@ -52,6 +52,9 @@ bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &devices) {
     FastllmCudaSetDevice(previous);
     return ok;
 }
+size_t FastllmCudaMimoEp8PrefillWorkspaceBytes(int rows) {
+    return fastllm_ep8_mega_moe_prefill_workspace_bytes(rows);
+}
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
         const std::vector<int> &devices,
         const std::vector<std::vector<std::vector<fastllm::Data *>>> &weights) {
@@ -172,19 +175,18 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     // when one local buffer is unavailable. Router FP32 input is dead here;
     // it is overwritten by the next layer's conversion, after AllGather's
     // final rendezvous has released every remote reader/writer.
-    if (!graphDecode && (size_t)total * 4096 * sizeof(float) >=
-            fastllm_ep8_mega_moe_prefill_workspace_bytes()) {
+    if (!graphDecode && FastllmCudaMimoEp8PrefillWorkspaceBytes(total)) {
         auto &local = *state.ranks[rank];
         local.prefillScratch = nullptr;
         int prefillCapacity = 0;
-        if (prefillScratch && prefillScratch->dataType == FLOAT32 &&
+        if (prefillScratch && !prefillScratch->isFake && prefillScratch->dataType == FLOAT32 &&
             prefillScratch->dataDevice == DataDevice::CUDA &&
             prefillScratch->dataDeviceIds == std::vector<int>{state.devices[rank]} &&
             !prefillScratch->dims.empty() && prefillScratch->dims.back() == 4096 &&
             prefillScratch->Count(0) == (size_t)total * 4096 &&
             prefillScratch->cudaData != input.cudaData) {
             prefillCapacity = fastllm_ep8_mega_moe_prepare_prefill(
-                handle, prefillScratch->cudaData, prefillScratch->GetBytes());
+                handle, prefillScratch->cudaData, prefillScratch->expansionBytes, total);
             AssertInFastLLM(prefillCapacity >= 0, fastllm_ep8_mega_moe_error());
             if (prefillCapacity) local.prefillScratch = prefillScratch->cudaData;
         }
@@ -257,6 +259,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
 #else
 struct FastllmCudaMimoEp8Mega {};
 bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &) { return false; }
+size_t FastllmCudaMimoEp8PrefillWorkspaceBytes(int) { return 0; }
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(const std::vector<int> &,
     const std::vector<std::vector<std::vector<fastllm::Data *>>> &) { return {}; }
 void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &, int, fastllm::Data &) {

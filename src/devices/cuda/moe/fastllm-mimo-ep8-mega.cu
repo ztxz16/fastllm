@@ -17,7 +17,16 @@ namespace {
 using namespace fastllm_ep8_deep_gemm;
 constexpr int H = 4096, I = 2048, E = 256, R = 8, LOCAL_E = E / R, K = 8, CAP = 64;
 constexpr int BM = 64, BN = 128, BK = 128, STAGES = 8, SMS = 78;
-constexpr int PREFILL_CAP = 224, PREFILL_BN = 256, PREFILL_STAGES = 4;
+constexpr int PREFILL_CAP = 1024, PREFILL_BN = 256, PREFILL_STAGES = 4;
+int PrefillCapacity(int inputRows) {
+    if (inputRows <= R * CAP) return 0;
+    // Every rank must choose the same layout, including uneven shards. Use
+    // global rows, not local allocation sizes, which can differ across ranks.
+    const int rows = inputRows / R + (inputRows % R != 0);
+    int capacity = CAP * 2;
+    while (capacity < rows && capacity < PREFILL_CAP) capacity *= 2;
+    return capacity;
+}
 // All local experts share a compact token pool. Across ranks there are at most
 // R * CAP * K routes in total; each expert adds at most BM-1 alignment slots.
 // The sum of aligned expert spans is a multiple of BM, so rounding this bound
@@ -100,9 +109,9 @@ void activationDescriptors(Scratch &s, int capacity) {
     descriptor(s.a2, CU_TENSOR_MAP_DATA_TYPE_UINT8, s.l2, I, pool, I, BK, BM, true);
     descriptor(s.sa2, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, s.l2s, sfpool, I / 64, sfpool * 4, BM, 1, false);
 }
-template <bool Prefill = false>
+template <int capacity = CAP>
 auto kernel() {
-    constexpr int capacity = Prefill ? PREFILL_CAP : CAP;
+    constexpr bool Prefill = capacity > CAP;
     constexpr int pool = PoolTokens(capacity), sfpool = pool / BM * 128;
     return &sm90_fp8_mega_moe_impl<capacity, H, I, E, K, LOCAL_E, BM,
                                    Prefill ? PREFILL_BN : BN, BK, pool, sfpool,
@@ -120,6 +129,7 @@ struct Layer {
     Scratch scratch;
     Scratch prefill;
     void *prefillBase = nullptr;
+    int prefillCapacity = 0;
     Metadata prefillMetadata;
 };
 } // namespace
@@ -133,9 +143,10 @@ extern "C" size_t fastllm_ep8_mega_moe_workspace_bytes() {
     Scratch s{};
     return s.slice(nullptr);
 }
-extern "C" size_t fastllm_ep8_mega_moe_prefill_workspace_bytes() {
+extern "C" size_t fastllm_ep8_mega_moe_prefill_workspace_bytes(int inputRows) {
     Scratch s{};
-    return s.slice(nullptr, PREFILL_CAP);
+    const int capacity = PrefillCapacity(inputRows);
+    return capacity ? s.slice(nullptr, capacity) : 0;
 }
 extern "C" int fastllm_ep8_mega_moe_init_workspace(void *workspace, size_t bytes,
                                                    const int *devices, int rank) {
@@ -212,43 +223,50 @@ extern "C" void *fastllm_ep8_mega_moe_create(const void *const *gate, const void
         for (int e = 0; e < LOCAL_E; ++e)
             descriptor(layer->prefillMetadata.down[e], CU_TENSOR_MAP_DATA_TYPE_UINT8,
                        const_cast<void *>(down[e]), I, H, I, BK, PREFILL_BN, true);
-        check(cudaFuncSetAttribute(kernel<true>(), cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM));
+        check(cudaFuncSetAttribute(kernel<128>(), cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM));
+        check(cudaFuncSetAttribute(kernel<256>(), cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM));
+        check(cudaFuncSetAttribute(kernel<512>(), cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM));
+        check(cudaFuncSetAttribute(kernel<PREFILL_CAP>(), cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM));
         return layer.release();
     } catch (const std::exception &e) {
         error = e.what();
         return nullptr;
     }
 }
-extern "C" int fastllm_ep8_mega_moe_prepare_prefill(void *handle, void *workspace, size_t bytes) {
+extern "C" int fastllm_ep8_mega_moe_prepare_prefill(void *handle, void *workspace, size_t bytes,
+                                                   int inputRows) {
     try {
-        if (!workspace || reinterpret_cast<uintptr_t>(workspace) % 256 ||
-            bytes < fastllm_ep8_mega_moe_prefill_workspace_bytes()) return 0;
+        const int capacity = PrefillCapacity(inputRows);
+        Scratch required{};
+        if (!capacity || !workspace || reinterpret_cast<uintptr_t>(workspace) % 256 ||
+            bytes < required.slice(nullptr, capacity)) return 0;
         if (!handle) throw std::runtime_error("Missing EP8 prefill handle");
         auto &l = *static_cast<Layer *>(handle);
         int device;
         check(cudaGetDevice(&device));
         if (device != l.device) throw std::runtime_error("MegaMoE prefill device mismatch");
-        if (l.prefillBase != workspace) {
-            l.prefill.slice(workspace, PREFILL_CAP);
-            activationDescriptors(l.prefill, PREFILL_CAP);
+        if (l.prefillBase != workspace || l.prefillCapacity != capacity) {
+            l.prefill.slice(workspace, capacity);
+            activationDescriptors(l.prefill, capacity);
             l.prefillBase = workspace;
+            l.prefillCapacity = capacity;
         }
         // The caller lends dead router activations. Reset only control data;
         // dispatch/combine overwrite all live token data. Finish both writes
         // before the caller publishes this arena to any remote rank.
-        const size_t controls = layout::SM90Workspace(workspace, R, E, PREFILL_CAP, K).get_num_bytes();
+        const size_t controls = layout::SM90Workspace(workspace, R, E, capacity, K).get_num_bytes();
         check(cudaMemsetAsync(workspace, 0, controls, cudaStreamPerThread));
         check(cudaMemcpyAsync(l.prefill.metadata, &l.prefillMetadata, sizeof(Metadata),
                              cudaMemcpyHostToDevice, cudaStreamPerThread));
         check(cudaStreamSynchronize(cudaStreamPerThread));
-        return PREFILL_CAP;
+        return capacity;
     } catch (const std::exception &e) { error = e.what(); return -1; }
 }
-template <bool Prefill>
+template <int capacity>
 static int Run(void *handle, const void *x, void *y, const int32_t *idx,
                const float *scores, int rows, const void *const *peers = nullptr) {
     try {
-        constexpr int capacity = Prefill ? PREFILL_CAP : CAP;
+        constexpr bool Prefill = capacity > CAP;
         if (!handle || !x || !y || !idx || !scores || rows < 0 || rows > capacity)
             throw std::runtime_error("MegaMoE requires valid pointers and 0..capacity rows");
         auto &l = *static_cast<Layer *>(handle);
@@ -263,7 +281,8 @@ static int Run(void *handle, const void *x, void *y, const int32_t *idx,
         // in expert computation/barriers. Their combine writes no output rows.
         std::array<int64_t, R> addresses = l.peers;
         if constexpr (Prefill) {
-            if (!peers || !l.prefillBase || peers[l.rank] != l.prefillBase)
+            if (!peers || !l.prefillBase || l.prefillCapacity != capacity ||
+                peers[l.rank] != l.prefillBase)
                 throw std::runtime_error("Unprepared EP8 prefill arena");
             for (int r = 0; r < R; ++r) {
                 if (!peers[r]) throw std::runtime_error("Missing EP8 prefill peer");
@@ -276,7 +295,7 @@ static int Run(void *handle, const void *x, void *y, const int32_t *idx,
             static_cast<__nv_fp8_e4m3 *>(s.x), static_cast<float *>(s.xs), static_cast<int64_t *>(s.idx),
             static_cast<float *>(s.scores), rows, capacity, H, H / 128, K, 1.0f);
         auto sym = layout::SymBuffer<R>(addresses, l.rank);
-        kernel<Prefill>()<<<SMS, 384, Prefill ? PREFILL_SMEM : SMEM, cudaStreamPerThread>>>(y, nullptr, rows, sym, s.a1, s.sa1, s.metadata->gate,
+        kernel<capacity>()<<<SMS, 384, Prefill ? PREFILL_SMEM : SMEM, cudaStreamPerThread>>>(y, nullptr, rows, sym, s.a1, s.sa1, s.metadata->gate,
             s.metadata->gateScales, s.d1, s.a2, s.sa2, s.metadata->down, s.metadata->downScales);
         check(cudaGetLastError());
         return 1;
@@ -287,11 +306,20 @@ static int Run(void *handle, const void *x, void *y, const int32_t *idx,
 }
 extern "C" int fastllm_ep8_mega_moe_run(void *handle, const void *x, void *y, const int32_t *idx,
                                       const float *scores, int rows) {
-    return Run<false>(handle, x, y, idx, scores, rows);
+    return Run<CAP>(handle, x, y, idx, scores, rows);
 }
 extern "C" int fastllm_ep8_mega_moe_run_prefill(void *handle, const void *const *peers,
         const void *x, void *y, const int32_t *idx, const float *scores, int rows) {
-    return Run<true>(handle, x, y, idx, scores, rows, peers);
+    if (handle) {
+        switch (static_cast<Layer *>(handle)->prefillCapacity) {
+            case 128: return Run<128>(handle, x, y, idx, scores, rows, peers);
+            case 256: return Run<256>(handle, x, y, idx, scores, rows, peers);
+            case 512: return Run<512>(handle, x, y, idx, scores, rows, peers);
+            case PREFILL_CAP: return Run<PREFILL_CAP>(handle, x, y, idx, scores, rows, peers);
+        }
+    }
+    error = "Unprepared EP8 prefill arena";
+    return 0;
 }
 extern "C" void fastllm_ep8_mega_moe_destroy(void *handle) {
     delete static_cast<Layer *>(handle);
