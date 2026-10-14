@@ -9,6 +9,8 @@
 //
 
 #include "qwen4_exp.h"
+#include "qwen4_exp_execution.h"
+#include "utils/hybrid_moe.h"
 #include "qwen4_tp_sampling.h"
 #include "models/qwen4_paged_cache.h"
 
@@ -49,6 +51,7 @@
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -1922,6 +1925,7 @@ namespace fastllm {
             model->moeDeviceMap = localMoeMap(moeDeviceMap);
             model->layeredMoeDeviceMap = localMoeMap(layeredMoeDeviceMap);
             model->moeDeviceLayers = moeDeviceLayers;
+            model->InitExecutionMode();
             model->ngramDevice = ngramDevice;
             model->pleNgramDiskWeight = pleNgramDiskWeight;
             model->pleNgramDiskWeight.isFake = true;
@@ -2784,6 +2788,7 @@ namespace fastllm {
         this->indexerCompressRatio = Qwen4DictInt(weight.dicts, "indexer_compress_ratio", 4);
 
         InitThreadTp();
+        if (threadTpRank < 0) InitExecutionMode();
 
         auto parseIntegerArray = [&](const std::string &key,
                                      std::vector<int> &values) {
@@ -3565,6 +3570,22 @@ namespace fastllm {
             }
         }
         return true;
+    }
+
+    void Qwen4ExpModel::InitExecutionMode() {
+        std::vector<std::string> placements;
+        const std::string fallback = ((Executor*)GetExecutor())->GetFirstDeviceType();
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            auto main = SelectDeviceFromMap(deviceMap, layer + 1, block_cnt);
+            if (main.empty()) main = fallback;
+            auto moe = SelectMoeDeviceForLayer(layer);
+            placements.push_back(main);
+            placements.push_back(moe.empty() ? main : moe);
+        }
+        const char *requested = std::getenv("FASTLLM_EXECUTION_MODE");
+        executionMode = ResolveExecutionMode(requested, placements);
+        std::printf("[Fastllm] FASTLLM_EXECUTION_MODE=%s -> %s (Qwen4)\n",
+            requested ? requested : "auto", ExecutionModeName(executionMode));
     }
 
     void Qwen4ExpModel::PrepareWeights() {
@@ -6985,6 +7006,19 @@ namespace fastllm {
             std::vector<Data *> &moeBiass,
             const Data &input, Data &output, bool reduceOutput, PrefillStageContext *prefill,
             MoEGpuInputs *prepared, const std::function<void()> &sharedGraph) {
+        if (executionMode == ExecutionMode::Gpu) {
+            RunGpuMoEWithPrefix(deviceLayer, mlp, moeWeights, moeBiass, input, output, reduceOutput, prefill, prepared, sharedGraph);
+        } else {
+            RunHybridMoEWithPrefix(deviceLayer, mlp, moeWeights, moeBiass, input, output, reduceOutput, prefill, prepared, sharedGraph);
+        }
+    }
+
+    void Qwen4ExpModel::RunHybridMoEWithPrefix(
+            int deviceLayer, const std::string &mlp,
+            std::vector<Data *> &moeWeights,
+            std::vector<Data *> &moeBiass,
+            const Data &input, Data &output, bool reduceOutput, PrefillStageContext *prefill,
+            MoEGpuInputs *prepared, const std::function<void()> &sharedGraph) {
         const int batch = input.dims[0];
         const int sequence = input.dims[1];
         Data flattened;
@@ -7144,7 +7178,7 @@ namespace fastllm {
             // The hybrid backend starts NUMA workers and expert DMA before
             // this callback queues the independent shared expert. Keep its
             // intermediates alive until both branches have been combined.
-            if (FastllmCudaMergeMOEHybrid(flattened, expertIndex, expertScore,
+            if (fastllm::RunHybridMoe(flattened, expertIndex, expertScore,
                     output, moeWeights.data(), moeWeights.size(), deviceLayer,
                     [&] { runSharedExpert(sharedOutput); })) {
                 finishHybrid();
@@ -7200,7 +7234,7 @@ namespace fastllm {
         bool hybridMoe = false;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         if (outputDevice.find("cuda") == 0) {
-            hybridMoe = FastllmCudaMergeMOEHybrid(flattened, expertIndex, expertScore,
+            hybridMoe = fastllm::RunHybridMoe(flattened, expertIndex, expertScore,
                 output, moeWeights.data(), moeWeights.size(), deviceLayer);
         }
 #endif
@@ -7793,7 +7827,6 @@ namespace fastllm {
         state.processedTokens = checkpoint.processedTokens;
         copies.Copy();
     }
-
 
     void Qwen4ExpModel::CaptureTargetRuntimeCheckpoint(
             std::vector<std::pair<Data, Data>> &pastKeyValues,
@@ -12053,23 +12086,11 @@ namespace fastllm {
                 requestState->mtpState->proposals.clear();
                 requestState->mtpState->targetCheckpointPrepared = false;
             }
-#if defined(USE_CUDA) && !defined(USE_ROCM)
-            void *decodePolicy = nullptr;
-            if (Qwen4MtpDraftsPerStep() == 0 && inputIds.dims[1] == 1 &&
-                Qwen4CudaOnlyDeviceMap(this->deviceMap) &&
-                !this->weights.empty() && !this->weights[0].empty()) {
-                decodePolicy = FastllmCudaBeginMoeDecode(
-                    this->weights[0].data(), this->weights[0].size(), this->num_experts_per_tok);
-            }
-#endif
             auto result = ForwardTarget(
                 batch, inputIds, attentionMask, positionIds,
                 pastKeyValues, generationConfig, lastTokens, retLogits,
                 nullptr, nullptr, nullptr, nullptr,
                 true, true, false);
-#if defined(USE_CUDA) && !defined(USE_ROCM)
-            FastllmCudaEndMoeDecode(decodePolicy);
-#endif
             return result;
         }
 
@@ -12572,7 +12593,71 @@ namespace fastllm {
         return {verifiedOutputs.front()};
     }
 
-    std::vector<int> Qwen4ExpModel::ForwardTarget(
+    // Per-call tensor state shared by the math blocks. Execution order lives
+    // exclusively in qwen4_exp_gpu.cpp and qwen4_exp_hybrid.cpp.
+    struct Qwen4ExpModel::ForwardWorkspace {
+        Qwen4ExpModel &model;
+        int batch;
+        const Data &inputIds;
+        const Data &attentionMask;
+        const Data &positionIds;
+        std::vector<std::pair<Data, Data>> &pastKeyValues;
+        const GenerationConfig &generationConfig;
+        const LastTokensManager &lastTokens;
+        std::vector<std::vector<float> *> *retLogits;
+        Data *targetMultiHidden;
+        std::vector<int> *allVerificationTokens;
+        std::vector<unsigned char> *verificationAccepted;
+        TargetVerificationCapture *verificationCapture;
+        bool recordPrefixSnapshot;
+        bool allowDecodeCudaGraph;
+        bool decodeEquivalentGdn;
+        const std::vector<int> *hostInputTokens;
+        bool materializeCausalMaskOnGraphFallback;
+        const Data *precomputedEmbedding;
+        PrefillStageContext *prefill;
+        int firstLayer = 0;
+        int endLayer = 0;
+        RequestState *requestState = nullptr;
+        DiskEmbeddingRowReader::Ticket plePrefetch;
+        Data embedding;
+        Data hiddenBuffers[2];
+        Data *hiddenStates = nullptr;
+        Data *nextHiddenStates = nullptr;
+        Data carriedAttentionNorm;
+        Data carriedAttentionProjection;
+        Data finalHyperNorm;
+        bool hasCarriedAttentionNorm = false;
+        bool hasCarriedAttentionProjection = false;
+        bool hasFinalHyperNorm = false;
+        bool usedDecodeCudaGraph = false;
+        Data logits;
+        int qsaPreviousLength = 0;
+        std::unique_ptr<Data> fallbackCausalMask;
+        const Data *effectiveAttentionMask = nullptr;
+        bool qsaDeviceCompatibleMask = false;
+        int decodeReserveTokens = 0;
+        std::map<int, Data> cudaPositionIds;
+        struct LayerWorkspace {
+            // Preserve the original stack declaration/destruction order. The
+            // CUDA temporary allocator reuses these buffers across layers.
+            Data attentionNorm, attentionInput, attentionInjection, attentionOutput;
+            Data mlpNorm, mlpProjection;
+            Data mlpInput, mlpInjection, mlpOutput;
+            // Match default-initialized stack Data objects: optional::emplace
+            // must not zero the whole aggregate before each Data constructor.
+            LayerWorkspace() {}
+        };
+        std::optional<LayerWorkspace> layerData;
+        Qwen4MtpGdnModeGuard mtpGdnMode;
+        HybridMoeDecodeStep decodeStep;
+#ifdef USE_CUDA
+        int previousLinearExactBatchThreshold = FastllmCudaGetLinearExactBatchThreshold();
+#endif
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM) && defined(__linux__)
+        std::unique_ptr<PipelineMoeState::CallerAffinity> pipelineAffinity;
+#endif
+        ForwardWorkspace(Qwen4ExpModel &model,
             int batch,
             const Data &inputIds,
             const Data &attentionMask,
@@ -12590,41 +12675,109 @@ namespace fastllm {
             bool decodeEquivalentGdn,
             const std::vector<int> *hostInputTokens,
             bool materializeCausalMaskOnGraphFallback,
-            const Data *precomputedEmbedding, PrefillStageContext *prefill) {
-        Qwen4MtpGdnModeGuard mtpGdnMode(decodeEquivalentGdn);
+            const Data *precomputedEmbedding, PrefillStageContext *prefill)
+            : model(model), batch(batch), inputIds(inputIds), attentionMask(attentionMask), positionIds(positionIds), pastKeyValues(pastKeyValues), generationConfig(generationConfig), lastTokens(lastTokens), retLogits(retLogits), targetMultiHidden(targetMultiHidden), allVerificationTokens(allVerificationTokens), verificationAccepted(verificationAccepted), verificationCapture(verificationCapture), recordPrefixSnapshot(recordPrefixSnapshot), allowDecodeCudaGraph(allowDecodeCudaGraph), decodeEquivalentGdn(decodeEquivalentGdn), hostInputTokens(hostInputTokens), materializeCausalMaskOnGraphFallback(materializeCausalMaskOnGraphFallback), precomputedEmbedding(precomputedEmbedding), prefill(prefill), mtpGdnMode(decodeEquivalentGdn) {}
+        ~ForwardWorkspace() {
+#ifdef USE_CUDA
+            FastllmCudaSetLinearExactBatchThreshold(previousLinearExactBatchThreshold);
+#endif
+        }
+    };
+
+    Qwen4ExpModel::ForwardState::ForwardState(Qwen4ExpModel &model,
+            int batch,
+            const Data &inputIds,
+            const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float> *> *retLogits,
+            Data *targetMultiHidden,
+            std::vector<int> *allVerificationTokens,
+            std::vector<unsigned char> *verificationAccepted,
+            TargetVerificationCapture *verificationCapture,
+            bool recordPrefixSnapshot,
+            bool allowDecodeCudaGraph,
+            bool decodeEquivalentGdn,
+            const std::vector<int> *hostInputTokens,
+            bool materializeCausalMaskOnGraphFallback,
+            const Data *precomputedEmbedding, PrefillStageContext *prefill)
+        : work(new ForwardWorkspace(model, batch, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, retLogits, targetMultiHidden, allVerificationTokens, verificationAccepted, verificationCapture, recordPrefixSnapshot, allowDecodeCudaGraph, decodeEquivalentGdn, hostInputTokens, materializeCausalMaskOnGraphFallback, precomputedEmbedding, prefill)) {
+    }
+    void Qwen4ExpModel::ForwardState::Prepare() { work->model.PrepareForward(*work); }
+    Qwen4ExpModel::ForwardState::~ForwardState() = default;
+    int Qwen4ExpModel::ForwardState::FirstLayer() const { return work->firstLayer; }
+    int Qwen4ExpModel::ForwardState::EndLayer() const { return work->endLayer; }
+    int Qwen4ExpModel::ForwardState::BeginLayer(int &layer) { return work->model.BeginForwardLayer(*work, layer); }
+    void Qwen4ExpModel::ForwardState::EndLayer(int layer) { work->model.EndForwardLayer(*work, layer); }
+    std::vector<int> Qwen4ExpModel::ForwardState::Finish() { return work->model.FinishForward(*work); }
+    void Qwen4ExpModel::ForwardState::GpuExperts(int layer) {
+        auto &m=work->model;
+        m.RunGpuMoEWithPrefix(layer, m.languagePrefix + "layers." + std::to_string(layer) + ".mlp.",
+            m.weights[layer], m.biass[layer], work->layerData->mlpInput, work->layerData->mlpOutput, true, work->prefill, nullptr, {});
+    }
+    void Qwen4ExpModel::ForwardState::HybridExperts(int layer) {
+        auto &m=work->model;
+        m.RunHybridMoEWithPrefix(layer, m.languagePrefix + "layers." + std::to_string(layer) + ".mlp.",
+            m.weights[layer], m.biass[layer], work->layerData->mlpInput, work->layerData->mlpOutput, true, work->prefill, nullptr, {});
+    }
+    void Qwen4ExpModel::ForwardState::BeginHybridStep() { work->model.BeginHybridForward(*work); }
+    void Qwen4ExpModel::ForwardState::PrefetchExperts(int layer) {
+        // Resolve expert placement only for eligible pipelined prefill. Decode
+        // and ordinary prefill never schedule this host-weight prefetch.
+        if (!work->prefill || work->inputIds.dims[1] < 1024 ||
+            layer < 0 || layer >= work->endLayer) return;
+        auto &m=work->model;
+        HybridMoePrefetch(m.weights, layer, work->endLayer, true,
+            work->inputIds.dims[1], m.SelectMoeDeviceForLayer(layer));
+    }
+    void Qwen4ExpModel::PrepareForward(ForwardWorkspace &f) {
+        auto &batch = f.batch;
+        auto &inputIds = f.inputIds;
+        auto &attentionMask = f.attentionMask;
+        auto &positionIds = f.positionIds;
+        auto &pastKeyValues = f.pastKeyValues;
+        auto &generationConfig = f.generationConfig;
+        auto &verificationCapture = f.verificationCapture;
+        auto &allowDecodeCudaGraph = f.allowDecodeCudaGraph;
+        auto &hostInputTokens = f.hostInputTokens;
+        auto &materializeCausalMaskOnGraphFallback = f.materializeCausalMaskOnGraphFallback;
+        auto &precomputedEmbedding = f.precomputedEmbedding;
+        auto &prefill = f.prefill;
+        auto &firstLayer = f.firstLayer;
+        auto &endLayer = f.endLayer;
+        auto &requestState = f.requestState;
+        auto &plePrefetch = f.plePrefetch;
+        auto &embedding = f.embedding;
+        auto &hiddenBuffers = f.hiddenBuffers;
+        auto &hiddenStates = f.hiddenStates;
+        auto &nextHiddenStates = f.nextHiddenStates;
+        auto &qsaPreviousLength = f.qsaPreviousLength;
+        auto &effectiveAttentionMask = f.effectiveAttentionMask;
+        auto &qsaDeviceCompatibleMask = f.qsaDeviceCompatibleMask;
+        auto &decodeReserveTokens = f.decodeReserveTokens;
+#ifdef USE_CUDA
+        auto &previousLinearExactBatchThreshold = f.previousLinearExactBatchThreshold;
+#endif
         AssertInFastLLM(batch == 1 && inputIds.dims.size() == 2 &&
                         inputIds.dims[0] == 1,
                         "Qwen4-Exp currently runs one request per Forward call.");
         AssertInFastLLM((int)pastKeyValues.size() >= this->block_cnt,
                         "Qwen4-Exp received too few cache slots.");
         PrepareWeights();
-#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM) && defined(__linux__)
-        // Keep dense submissions and MoE coordination on the same spare cores
-        // for this decode step, then restore the caller for prefill/application work.
-        PipelineMoeState::CallerAffinity pipelineAffinity(
-            !prefill && !threadTpState && threadTpRank < 0 && inputIds.dims[1] == 1 &&
-            Qwen4MtpDraftsPerStep() == 0 ? pipelineMoe.get() : nullptr);
-#endif
 #ifdef USE_CUDA
         // A verifier batch is still decode: keep every small FP16 projection
         // on the row-independent native path.  Besides preserving the
         // one-token reduction tree, that specialization replaces the last
         // five CTA barriers with the equivalent warp-shuffle tree.
-        const int previousLinearExactBatchThreshold =
-            FastllmCudaGetLinearExactBatchThreshold();
+        previousLinearExactBatchThreshold = FastllmCudaGetLinearExactBatchThreshold();
         if (verificationCapture != nullptr && inputIds.dims[1] > 1 &&
             inputIds.dims[1] <= 8) {
             FastllmCudaSetLinearExactBatchThreshold(std::max(
                 previousLinearExactBatchThreshold,
                 inputIds.dims[1] + 1));
         }
-        struct LinearExactBatchThresholdRestore {
-            int previous;
-            ~LinearExactBatchThresholdRestore() {
-                FastllmCudaSetLinearExactBatchThreshold(previous);
-            }
-        } linearExactBatchThresholdRestore{
-            previousLinearExactBatchThreshold};
 #endif
         if (verificationCapture != nullptr) {
             verificationCapture->linearConvInputs.resize(this->block_cnt);
@@ -12657,9 +12810,9 @@ namespace fastllm {
             }
         }
 
-        const int firstLayer = prefill ? prefill->firstLayer : 0;
-        const int endLayer = prefill ? prefill->endLayer : block_cnt;
-        RequestState *requestState = prefill ? prefill->state : nullptr;
+        firstLayer = prefill ? prefill->firstLayer : 0;
+        endLayer = prefill ? prefill->endLayer : block_cnt;
+        requestState = prefill ? prefill->state : nullptr;
         if (!requestState) {
             std::lock_guard<std::mutex> guard(this->stateMutex);
             requestState = &this->requestStates[&pastKeyValues[0].first];
@@ -12705,7 +12858,7 @@ namespace fastllm {
         // Row selection depends only on tokens, so issue before embedding and
         // layer 0. The ticket owns its buffers; no request history is advanced
         // until RunPLE consumes the result (including speculative forwards).
-        DiskEmbeddingRowReader::Ticket plePrefetch;
+
         if (firstLayer <= pleLayer && pleLayer < endLayer &&
             pleDiskReader && threadTpRank <= 0 && inputIds.dims[1] == 1 &&
             this->pleLayer > 0 &&
@@ -12727,9 +12880,8 @@ namespace fastllm {
         }
         if (!prefill) AcquireServingCache(pastKeyValues, *requestState, inputIds.dims[1]);
 
-        Data embedding, hiddenBuffers[2];
-        Data *hiddenStates = prefill ? prefill->hidden : &hiddenBuffers[0];
-        Data *nextHiddenStates = &hiddenBuffers[1];
+        hiddenStates = prefill ? prefill->hidden : &hiddenBuffers[0];
+        nextHiddenStates = &hiddenBuffers[1];
         // The previous request/chunk may have left the last layer's device
         // selected. Expand the embedding on the first layer's device.
         if (firstLayer == 0) {
@@ -12759,32 +12911,6 @@ namespace fastllm {
             DumpTensorIfRequested("embedding", *hiddenStates);
         }
 
-        Data carriedAttentionNorm, carriedAttentionProjection;
-        Data finalHyperNorm;
-        bool hasCarriedAttentionNorm = false;
-        bool hasCarriedAttentionProjection = false;
-        bool hasFinalHyperNorm = false;
-        bool usedDecodeCudaGraph = false;
-        auto prefillProjectionStorage = [&](
-                const Data &reference, const std::string &prefix,
-                Data &storage) -> Data* {
-#ifdef USE_CUDA
-            const Data &downWeight =
-                this->weight[prefix + "input_mix_weight_down.weight"];
-            const Data &injectionWeight =
-                this->weight[prefix + "block_inject_weight.weight"];
-            if (verificationCapture == nullptr && inputIds.dims[1] >= 8 &&
-                reference.dataDevice == DataDevice::CUDA &&
-                reference.dataType == DataType::FLOAT32 &&
-                downWeight.dataType == DataType::FLOAT16 &&
-                injectionWeight.dataType == DataType::FLOAT16) {
-                return &storage;
-            }
-#endif
-            return nullptr;
-        };
-        Data logits;
-        int qsaPreviousLength = 0;
         for (int layer = firstLayer; layer < endLayer; layer++) {
             if (!this->IsLinearAttentionLayer(layer)) {
                 const Data &pastKey = pastKeyValues[layer].first;
@@ -12793,19 +12919,9 @@ namespace fastllm {
                 break;
             }
         }
-        std::unique_ptr<Data> fallbackCausalMask;
-        const Data *effectiveAttentionMask = &attentionMask;
-        auto ensureFallbackCausalMask = [&]() {
-            if (!materializeCausalMaskOnGraphFallback ||
-                !effectiveAttentionMask->dims.empty()) {
-                return;
-            }
-            fallbackCausalMask = std::make_unique<Data>(
-                Qwen4BuildCausalMask(
-                    qsaPreviousLength, inputIds.dims[1]));
-            effectiveAttentionMask = fallbackCausalMask.get();
-        };
-        const bool qsaDeviceCompatibleMask =
+
+        effectiveAttentionMask = &attentionMask;
+        qsaDeviceCompatibleMask =
             materializeCausalMaskOnGraphFallback ||
             attentionMask.dims.empty() ||
             ((threadTpRank >= 0 || restoredPrefixSnapshot || verificationCapture != nullptr) &&
@@ -12851,7 +12967,7 @@ namespace fastllm {
                 }
             }
         }
-        int decodeReserveTokens = 0;
+
         const bool reserveTpDecode = threadTpRank >= 0 && allowDecodeCudaGraph &&
             GetFastllmEnv().cudaGraph &&
             Qwen4TpDecodeFitsCapacityClass(generationConfig, this->indexerBudget);
@@ -12877,7 +12993,73 @@ namespace fastllm {
                     Qwen4RoundUpCacheCapacity(generationConfig.input_token_length, 128));
             }
         }
-        std::map<int, Data> cudaPositionIds;
+
+    }
+    int Qwen4ExpModel::BeginForwardLayer(ForwardWorkspace &f, int &layer) {
+        f.layerData.emplace();
+        auto &mlpInput = f.layerData->mlpInput;
+        auto &mlpInjection = f.layerData->mlpInjection;
+        auto &attentionNorm = f.layerData->attentionNorm;
+        auto &attentionInput = f.layerData->attentionInput;
+        auto &attentionInjection = f.layerData->attentionInjection;
+        auto &attentionOutput = f.layerData->attentionOutput;
+        auto &mlpNorm = f.layerData->mlpNorm;
+        auto &mlpProjection = f.layerData->mlpProjection;
+        auto &inputIds = f.inputIds;
+        auto &positionIds = f.positionIds;
+        auto &pastKeyValues = f.pastKeyValues;
+        auto &generationConfig = f.generationConfig;
+        auto &targetMultiHidden = f.targetMultiHidden;
+        auto &verificationCapture = f.verificationCapture;
+        auto &allowDecodeCudaGraph = f.allowDecodeCudaGraph;
+        auto &decodeEquivalentGdn = f.decodeEquivalentGdn;
+        auto &hostInputTokens = f.hostInputTokens;
+        auto &materializeCausalMaskOnGraphFallback = f.materializeCausalMaskOnGraphFallback;
+        auto &prefill = f.prefill;
+        auto &requestState = f.requestState;
+        auto &plePrefetch = f.plePrefetch;
+        auto &hiddenStates = f.hiddenStates;
+        auto &nextHiddenStates = f.nextHiddenStates;
+        auto &carriedAttentionNorm = f.carriedAttentionNorm;
+        auto &carriedAttentionProjection = f.carriedAttentionProjection;
+        auto &hasCarriedAttentionNorm = f.hasCarriedAttentionNorm;
+        auto &hasCarriedAttentionProjection = f.hasCarriedAttentionProjection;
+        auto &usedDecodeCudaGraph = f.usedDecodeCudaGraph;
+        auto &logits = f.logits;
+        auto &qsaPreviousLength = f.qsaPreviousLength;
+        auto &fallbackCausalMask = f.fallbackCausalMask;
+        auto &effectiveAttentionMask = f.effectiveAttentionMask;
+        auto &qsaDeviceCompatibleMask = f.qsaDeviceCompatibleMask;
+        auto &decodeReserveTokens = f.decodeReserveTokens;
+        auto &cudaPositionIds = f.cudaPositionIds;
+        auto prefillProjectionStorage = [&](
+                const Data &reference, const std::string &prefix,
+                Data &storage) -> Data* {
+#ifdef USE_CUDA
+            const Data &downWeight =
+                this->weight[prefix + "input_mix_weight_down.weight"];
+            const Data &injectionWeight =
+                this->weight[prefix + "block_inject_weight.weight"];
+            if (verificationCapture == nullptr && inputIds.dims[1] >= 8 &&
+                reference.dataDevice == DataDevice::CUDA &&
+                reference.dataType == DataType::FLOAT32 &&
+                downWeight.dataType == DataType::FLOAT16 &&
+                injectionWeight.dataType == DataType::FLOAT16) {
+                return &storage;
+            }
+#endif
+            return nullptr;
+        };
+        auto ensureFallbackCausalMask = [&]() {
+            if (!materializeCausalMaskOnGraphFallback ||
+                !effectiveAttentionMask->dims.empty()) {
+                return;
+            }
+            fallbackCausalMask = std::make_unique<Data>(
+                Qwen4BuildCausalMask(
+                    qsaPreviousLength, inputIds.dims[1]));
+            effectiveAttentionMask = fallbackCausalMask.get();
+        };
         auto positionsFor = [&](const Data &reference) -> const Data& {
 #ifdef USE_CUDA
             if (reference.dataDevice == DataDevice::CUDA) {
@@ -12903,23 +13085,12 @@ namespace fastllm {
 #endif
             return positionIds;
         };
-        auto prefetchExperts = [&](int layer) {
-#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-            if (!prefill || inputIds.dims[1] < 1024 || layer >= endLayer) return;
-            const auto moe = SelectMoeDeviceForLayer(layer);
-            if (moe != "numa" && moe.rfind("numa:", 0) != 0) return;
-            auto &table = this->weights[layer];
-            FastllmCudaPrefetchMoeGGUFHost(table.data(), int(table.size()) / 2 - 1);
-#endif
-        };
-        for (int layer = firstLayer; layer < endLayer; layer++) {
             ApplyDeviceMap(this->deviceMap, layer + 1, this->block_cnt);
-            if (layer == firstLayer) prefetchExperts(layer);
 
             if (layer == 0 && allowDecodeCudaGraph &&
                 verificationCapture == nullptr &&
                 TryRunThreadTpPrefixCudaGraph(*hiddenStates, pastKeyValues)) {
-                continue;
+                return ForwardState::Skip;
             }
 
             if (layer == this->pleLayer) {
@@ -12963,7 +13134,7 @@ namespace fastllm {
                             pastKeyValues, *requestState, logits,
                             targetMultiHidden, verificationCapture)) {
                         usedDecodeCudaGraph = true;
-                        break;
+                        return ForwardState::Complete;
                     }
                     ensureFallbackCausalMask();
                 }
@@ -13000,7 +13171,7 @@ namespace fastllm {
                             verificationCapture, stageEnd, nextHiddenStates)) {
                         if (stageEnd == this->block_cnt) {
                             usedDecodeCudaGraph = true;
-                            break;
+                            return ForwardState::Complete;
                         }
                         std::swap(hiddenStates, nextHiddenStates);
                         carriedAttentionNorm.FreeSpace();
@@ -13008,7 +13179,7 @@ namespace fastllm {
                         hasCarriedAttentionNorm = false;
                         hasCarriedAttentionProjection = false;
                         layer = stageEnd - 1;
-                        continue;
+                        return ForwardState::Skip;
                     }
                     ensureFallbackCausalMask();
                 }
@@ -13019,8 +13190,6 @@ namespace fastllm {
                                             std::to_string(layer) + ".";
             const std::string attentionHyperPrefix =
                 layerPrefix + "attn_hyper_connection.";
-            Data attentionNorm, attentionInput, attentionInjection;
-            Data attentionOutput;
             Data *normalizedAttention = &attentionNorm;
             if (hasCarriedAttentionNorm) {
                 normalizedAttention = &carriedAttentionNorm;
@@ -13110,11 +13279,10 @@ namespace fastllm {
                     pastKeyValues, *requestState, logits,
                     targetMultiHidden, verificationCapture)) {
                 usedDecodeCudaGraph = true;
-                break;
+                return ForwardState::Complete;
             }
             const std::string mlpHyperPrefix =
                 layerPrefix + "mlp_hyper_connection.";
-            Data mlpNorm, mlpProjection;
             Data *mlpProjectionStorage =
                 prefillProjectionStorage(
                     *hiddenStates, mlpHyperPrefix, mlpProjection);
@@ -13124,14 +13292,44 @@ namespace fastllm {
                 *nextHiddenStates, mlpNorm, mlpProjectionStorage);
             std::swap(hiddenStates, nextHiddenStates);
 
-            Data mlpInput, mlpInjection, mlpOutput;
             HyperMixNormalized(mlpNorm, mlpHyperPrefix,
                                mlpInput, &mlpInjection,
                                mlpProjectionStorage);
             mlpNorm.FreeSpace();
             mlpProjection.FreeSpace();
-            RunMoE(layer, mlpInput, mlpOutput, true, prefill);
-            prefetchExperts(layer + 1);
+        return ForwardState::Experts;
+    }
+    void Qwen4ExpModel::EndForwardLayer(ForwardWorkspace &f, int layer) {
+        auto &mlpInjection = f.layerData->mlpInjection;
+        auto &mlpOutput = f.layerData->mlpOutput;
+        auto &inputIds = f.inputIds;
+        auto &verificationCapture = f.verificationCapture;
+        auto &hiddenStates = f.hiddenStates;
+        auto &nextHiddenStates = f.nextHiddenStates;
+        auto &carriedAttentionNorm = f.carriedAttentionNorm;
+        auto &carriedAttentionProjection = f.carriedAttentionProjection;
+        auto &finalHyperNorm = f.finalHyperNorm;
+        auto &hasCarriedAttentionNorm = f.hasCarriedAttentionNorm;
+        auto &hasCarriedAttentionProjection = f.hasCarriedAttentionProjection;
+        auto &hasFinalHyperNorm = f.hasFinalHyperNorm;
+        auto prefillProjectionStorage = [&](
+                const Data &reference, const std::string &prefix,
+                Data &storage) -> Data* {
+#ifdef USE_CUDA
+            const Data &downWeight =
+                this->weight[prefix + "input_mix_weight_down.weight"];
+            const Data &injectionWeight =
+                this->weight[prefix + "block_inject_weight.weight"];
+            if (verificationCapture == nullptr && inputIds.dims[1] >= 8 &&
+                reference.dataDevice == DataDevice::CUDA &&
+                reference.dataType == DataType::FLOAT32 &&
+                downWeight.dataType == DataType::FLOAT16 &&
+                injectionWeight.dataType == DataType::FLOAT16) {
+                return &storage;
+            }
+#endif
+            return nullptr;
+        };
             if (layer + 1 == this->block_cnt) {
                 const std::string finalHyperPrefix =
                     languagePrefix + "hyper_connection_mixer.";
@@ -13176,8 +13374,28 @@ namespace fastllm {
             std::swap(hiddenStates, nextHiddenStates);
             DumpTensorIfRequested("layer_" + std::to_string(layer) +
                                   "_output", *hiddenStates);
-        }
-
+        f.layerData.reset();
+    }
+    std::vector<int> Qwen4ExpModel::FinishForward(ForwardWorkspace &f) {
+        auto &inputIds = f.inputIds;
+        auto &pastKeyValues = f.pastKeyValues;
+        auto &generationConfig = f.generationConfig;
+        auto &lastTokens = f.lastTokens;
+        auto &retLogits = f.retLogits;
+        auto &targetMultiHidden = f.targetMultiHidden;
+        auto &allVerificationTokens = f.allVerificationTokens;
+        auto &verificationAccepted = f.verificationAccepted;
+        auto &verificationCapture = f.verificationCapture;
+        auto &recordPrefixSnapshot = f.recordPrefixSnapshot;
+        auto &hostInputTokens = f.hostInputTokens;
+        auto &prefill = f.prefill;
+        auto &requestState = f.requestState;
+        auto &hiddenStates = f.hiddenStates;
+        auto &finalHyperNorm = f.finalHyperNorm;
+        auto &hasFinalHyperNorm = f.hasFinalHyperNorm;
+        auto &usedDecodeCudaGraph = f.usedDecodeCudaGraph;
+        auto &logits = f.logits;
+        auto &qsaPreviousLength = f.qsaPreviousLength;
         if (prefill) {
             if (hiddenStates != prefill->hidden) prefill->hidden->CopyFrom(*hiddenStates);
             if (!prefill->sampleOutput) return {};
@@ -13398,6 +13616,46 @@ namespace fastllm {
             token = LLMSampling(logits, 0, generationConfig, unit);
         }
         return {token};
+    }
+    void Qwen4ExpModel::BeginHybridForward(ForwardWorkspace &f) {
+        auto &inputIds = f.inputIds;
+        auto &prefill = f.prefill;
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM) && defined(__linux__)
+        // Keep dense submissions and MoE coordination on the same spare cores
+        // for this decode step, then restore the caller for prefill/application work.
+        f.pipelineAffinity.reset(new PipelineMoeState::CallerAffinity(
+            !prefill && !threadTpState && threadTpRank < 0 && inputIds.dims[1] == 1 &&
+            Qwen4MtpDraftsPerStep() == 0 ? pipelineMoe.get() : nullptr));
+#endif
+
+        if (executionMode == ExecutionMode::Hybrid && threadTpRank < 0 && Qwen4MtpDraftsPerStep() == 0 &&
+            inputIds.dims[1] == 1 && Qwen4CudaOnlyDeviceMap(deviceMap) &&
+            !weights.empty() && !weights[0].empty()) {
+            f.decodeStep.Begin(weights[0].data(), weights[0].size(), num_experts_per_tok);
+        }
+    }
+    std::vector<int> Qwen4ExpModel::ForwardTarget(
+            int batch,
+            const Data &inputIds,
+            const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float> *> *retLogits,
+            Data *targetMultiHidden,
+            std::vector<int> *allVerificationTokens,
+            std::vector<unsigned char> *verificationAccepted,
+            TargetVerificationCapture *verificationCapture,
+            bool recordPrefixSnapshot,
+            bool allowDecodeCudaGraph,
+            bool decodeEquivalentGdn,
+            const std::vector<int> *hostInputTokens,
+            bool materializeCausalMaskOnGraphFallback,
+            const Data *precomputedEmbedding, PrefillStageContext *prefill) {
+        PrepareWeights();
+        if (executionMode == ExecutionMode::Gpu) return ForwardGpu(batch, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, retLogits, targetMultiHidden, allVerificationTokens, verificationAccepted, verificationCapture, recordPrefixSnapshot, allowDecodeCudaGraph, decodeEquivalentGdn, hostInputTokens, materializeCausalMaskOnGraphFallback, precomputedEmbedding, prefill);
+        return ForwardHybrid(batch, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, retLogits, targetMultiHidden, allVerificationTokens, verificationAccepted, verificationCapture, recordPrefixSnapshot, allowDecodeCudaGraph, decodeEquivalentGdn, hostInputTokens, materializeCausalMaskOnGraphFallback, precomputedEmbedding, prefill);
     }
 
     void Qwen4ExpModel::OnResponseContextCreated(ResponseContext *context) {

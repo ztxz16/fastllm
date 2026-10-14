@@ -6,6 +6,7 @@
 #define FASTLLM_QWEN4_EXP_H
 
 #include "qwen3_next.h"
+#include "utils/execution_mode.h"
 #include "devices/disk/diskdevice.h"
 
 #include <atomic>
@@ -27,6 +28,7 @@ namespace fastllm {
 
         void InitParams() override;
         bool RetainCudaWorkspace() const override;
+        ExecutionMode GetExecutionMode() const { return executionMode; }
 
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &tensorNames) override;
@@ -566,6 +568,66 @@ namespace fastllm {
             RequestState &state,
             const TargetRuntimeCheckpoint &checkpoint,
             TargetVerificationCapture &capture);
+        struct ForwardState;
+        struct ForwardWorkspace;
+        ExecutionMode executionMode = ExecutionMode::Cpu;
+        void InitExecutionMode();
+        void PrepareForward(ForwardWorkspace &);
+        int BeginForwardLayer(ForwardWorkspace &, int &layer);
+        void EndForwardLayer(ForwardWorkspace &, int layer);
+        std::vector<int> FinishForward(ForwardWorkspace &);
+        void BeginHybridForward(ForwardWorkspace &);
+        std::vector<int> ForwardGpu(
+            int batch,
+            const Data &inputIds,
+            const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float> *> *retLogits,
+            Data *targetMultiHidden,
+            std::vector<int> *allVerificationTokens,
+            std::vector<unsigned char> *verificationAccepted,
+            TargetVerificationCapture *verificationCapture,
+            bool recordPrefixSnapshot,
+            bool allowDecodeCudaGraph,
+            bool decodeEquivalentGdn,
+            const std::vector<int> *hostInputTokens,
+            bool materializeCausalMaskOnGraphFallback,
+            const Data *precomputedEmbedding, PrefillStageContext *prefill);
+        std::vector<int> ForwardHybrid(
+            int batch,
+            const Data &inputIds,
+            const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float> *> *retLogits,
+            Data *targetMultiHidden,
+            std::vector<int> *allVerificationTokens,
+            std::vector<unsigned char> *verificationAccepted,
+            TargetVerificationCapture *verificationCapture,
+            bool recordPrefixSnapshot,
+            bool allowDecodeCudaGraph,
+            bool decodeEquivalentGdn,
+            const std::vector<int> *hostInputTokens,
+            bool materializeCausalMaskOnGraphFallback,
+            const Data *precomputedEmbedding, PrefillStageContext *prefill);
+        void RunGpuMoEWithPrefix(
+            int deviceLayer, const std::string &mlp,
+            std::vector<Data *> &moeWeights,
+            std::vector<Data *> &moeBiass,
+            const Data &input, Data &output, bool reduceOutput, PrefillStageContext *prefill,
+            MoEGpuInputs *prepared, const std::function<void()> &sharedGraph);
+        void RunHybridMoEWithPrefix(
+            int deviceLayer, const std::string &mlp,
+            std::vector<Data *> &moeWeights,
+            std::vector<Data *> &moeBiass,
+            const Data &input, Data &output, bool reduceOutput, PrefillStageContext *prefill,
+            MoEGpuInputs *prepared, const std::function<void()> &sharedGraph);
+
         std::vector<int> ForwardTarget(
             int batch,
             const Data &inputIds,

@@ -622,6 +622,8 @@ int main(int argc, char **argv) {
             SetNgramDevice(disk ? "disk" : "cpu");
             auto base = CreateLLMModelFromGGUFFile(fixture.files[0], "");
             auto *m = dynamic_cast<Qwen4ExpModel *>(base.get()); Check(m != nullptr, "architecture dispatch");
+            Check(m->GetExecutionMode() == ExecutionMode::Cpu,
+                  "CPU execution mode must ignore the PLE storage device");
             Qwen4GGUFTestAccess::CheckMetadata(*m);
             const std::string p = "model.language_model.layers.0.linear_attn.";
             for (const char *name : {"in_proj_qkv.weight", "in_proj_z.weight"}) {
