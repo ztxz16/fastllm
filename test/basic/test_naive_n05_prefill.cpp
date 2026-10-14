@@ -77,7 +77,8 @@ static void TestAttentionGroupedScores() {
             }
             FastllmCudaNaiveAttention(q,k,v,indices,headSink,1,1,s.dim,s.valueDim,past,0,reference,causal);
             auto expected=Read<uint16_t>(reference);
-            // MMA changes the FP32 sum order. Compare against the existing
+            // MMA changes the sum order; the Hopper path additionally rounds
+            // unnormalized online probabilities. Compare against the existing
             // isolated-head implementation with a bounded BF16 error contract.
             double error=0,norm=0,maxError=0,maxReference=0;
             for (int r=0;r<s.queries;++r) for (int d=0;d<s.valueDim;++d) {

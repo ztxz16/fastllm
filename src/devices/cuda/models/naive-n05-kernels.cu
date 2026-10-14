@@ -6,7 +6,7 @@
 #include "naive-n05-dsa-decode.cuh"
 #include "naive-n05-attention-hopper.cuh"
 #include "naive-n05-prefill.cuh"
-#include "naive-n05-prefill-mma.cuh"
+#include "naive-n05-prefill-hopper.cuh"
 #ifdef FASTLLM_ENABLE_NAIVE_QKV_SM90
 #include "naive-n05-qkv.cuh"
 #endif
@@ -2661,6 +2661,11 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         // Select by architecture and available shared memory, never timing.
         auto kernel = mma::Generic<2048>;
         size_t shared = sizeof(mma::Storage<2048>);
+        if (FastllmCudaRuntimeArch() == 90 &&
+            BulkKernelSupported(mma::Hopper, sizeof(mma::HopperStorage), 90)) {
+            kernel = mma::Hopper;
+            shared = sizeof(mma::HopperStorage);
+        }
         if (BulkKernelSupported(kernel, shared, 80)) {
             kernel<<<dim3(queries, heads / naive_prefill::Heads), 256, shared>>>(
                 (const BF16 *)query.cudaData, FastllmNaiveKV(key), FastllmNaiveKV(value),
