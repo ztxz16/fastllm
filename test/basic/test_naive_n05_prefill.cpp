@@ -156,12 +156,37 @@ static void TestAttentionSwa() {
     }
 }
 
+// Query sharding must preserve every selected index, including causal padding
+// and stable tie ordering. Borrowed output slices model the in-place AllGather.
+static void TestIndexerPrefillShards() {
+    for (auto shape : {std::vector<int>{1024,4096,2}, {4096,8192,8}}) {
+        const int rows=shape[0], keys=shape[1], ranks=shape[2], local=rows/ranks;
+        constexpr int heads=16, dim=128, topK=2048, stride=192+128;
+        Data q(BFLOAT16),w(BFLOAT16),k(BFLOAT16),reference,actual(INT32);
+        Upload(q,{1,rows,heads*dim},53); Upload(w,{1,rows,heads},71);
+        Upload(k,{1,keys,stride},113);
+        FastllmCudaNaiveIndexer(q,w,k,heads,dim,keys-rows,topK,true,reference);
+        auto expected=Read<int>(reference);
+        actual.Resize({rows,topK}); actual.ToDevice(DataDevice::CUDA,{0},false); actual.Allocate(false);
+        for (int rank=0;rank<ranks;++rank) {
+            int first=rank*local;
+            Data qr,wr,ir;
+            qr.Resize({1,local,heads*dim}); qr.FakeFrom(q,(size_t)first*heads*dim*q.unitSize);
+            wr.Resize({1,local,heads}); wr.FakeFrom(w,(size_t)first*heads*w.unitSize);
+            ir.Resize({local,topK}); ir.FakeFrom(actual,(size_t)first*topK*sizeof(int));
+            FastllmCudaNaiveIndexer(qr,wr,k,heads,dim,keys-rows+first,topK,true,ir);
+        }
+        Require(Read<int>(actual)==expected,"sharded prefill Indexer differs from replicated queries");
+        ++checks;
+    }
+}
+
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     try {
         SetThreads(4);
-        TestAttentionGroupedScores(); TestAttentionSwa();
+        TestAttentionGroupedScores(); TestAttentionSwa(); TestIndexerPrefillShards();
         Require(cudaDeviceSynchronize()==cudaSuccess,"prefill CUDA synchronization failed");
         std::printf("Naive prefill regression passed: %d cases\n",checks);
     } catch (const std::exception &e) { std::fprintf(stderr,"%s\n",e.what()); return 1; }

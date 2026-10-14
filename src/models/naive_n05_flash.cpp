@@ -835,9 +835,32 @@ Data NaiveN05FlashModel::RunTarget(
                             buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices,
                             layerCache ? layerCache + sequence * 4 : nullptr);
                     } else {
+                        const int ranks = tensorParallel ? (int)tpDevices.size() : 1;
                         if (capture && capture->verifying && length <= 8)
                             FastllmCudaNaiveVerifyIndexer(indexQ, indexWeights, pastKey, indexHeads,
                                 indexDim, localPast, indexTopK, indexFp8, indices);
+                        else if (!verifying && tpEp8MegaState && ranks > 1 && length % (ranks * 64) == 0 &&
+                                 (int64_t)(length / ranks) * pastKey.dims[1] >= 1024 * 1024) {
+                            // Indexer Q/K are replicated. Score disjoint query
+                            // tiles and gather only the selected integer indices.
+                            // Keep 64-row tile boundaries so the score arithmetic
+                            // matches the unsharded prefill kernel.
+                            const int rows = length / ranks, first = tpRank * rows;
+                            Data localQ, localWeights, localIndices;
+                            localQ.Resize({1, rows, indexHeads * indexDim});
+                            localQ.FakeFrom(indexQ, (size_t)first * indexHeads * indexDim * indexQ.unitSize);
+                            localWeights.Resize({1, rows, indexHeads});
+                            localWeights.FakeFrom(indexWeights, (size_t)first * indexHeads * indexWeights.unitSize);
+                            indices.dataType = INT32;
+                            indices.Resize({length, indexTopK});
+                            indices.ToDevice(indexQ.dataDevice, indexQ.dataDeviceIds, false);
+                            indices.Allocate(false);
+                            localIndices.Resize({rows, indexTopK});
+                            localIndices.FakeFrom(indices, (size_t)first * indexTopK * sizeof(int));
+                            FastllmCudaNaiveIndexer(localQ, localWeights, pastKey, indexHeads, indexDim,
+                                localPast + first, indexTopK, indexFp8, localIndices);
+                            FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, indices);
+                        }
                         else FastllmCudaNaiveIndexer(indexQ, indexWeights, pastKey, indexHeads, indexDim,
                                                     localPast, indexTopK, indexFp8, indices);
                     }

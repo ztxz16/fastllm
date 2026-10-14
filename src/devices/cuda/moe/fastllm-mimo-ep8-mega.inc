@@ -113,6 +113,36 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     FastllmCudaSetDevice(previous);
     return state;
 }
+void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
+                                      fastllm::Data &output) {
+    // Publish completed shards, then gather directly into the existing output.
+    // All sources stay alive until every peer finishes reading them. This
+    // eager-only path needs neither zero padding nor another collective arena.
+    using namespace fastllm;
+    const int ranks = (int)state.devices.size();
+    AssertInFastLLM(rank >= 0 && rank < ranks && output.dims.size() == 2 &&
+        output.dims[0] > 0 && output.dims[1] > 0 && output.cudaData &&
+        output.dataDevice == DataDevice::CUDA &&
+        output.dataDeviceIds == std::vector<int>{state.devices[rank]} &&
+        (output.dataType == BFLOAT16 || output.dataType == INT32),
+        "Invalid MiMo EP8 prefill AllGather tensor.");
+    const int total = output.dims[0];
+    const size_t rowBytes = (size_t)output.dims[1] * output.unitSize;
+    state.ranks[rank]->output = output.cudaData;
+    FastllmCudaSyncCurrentThreadStream();
+    state.WaitForOutputs();
+    for (int step = 1; step < ranks; ++step) {
+        const int peer = (rank + step) % ranks;
+        const size_t first = (int64_t)total * peer / ranks;
+        const size_t rows = (int64_t)total * (peer + 1) / ranks - first;
+        AssertInFastLLM(FastllmCudaMemcpyPeerAsyncCurrentThread(state.devices[rank],
+            (uint8_t *)output.cudaData + first * rowBytes, state.devices[peer],
+            (const uint8_t *)state.ranks[peer]->output + first * rowBytes,
+            rows * rowBytes), "MiMo EP8 peer output copy failed.");
+    }
+    FastllmCudaSyncCurrentThreadStream();
+    state.WaitForOutputs();
+}
 bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int layer,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, bool graphDecode, fastllm::Data *residual,
@@ -186,23 +216,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
             "MiMo EP8 decode AllGather failed.");
         return false;
     }
-    // Publish completed shards, then gather directly into the existing output.
-    // All sources stay alive until every peer finishes reading them. This
-    // eager-only path needs neither zero padding nor another collective arena.
-    state.ranks[rank]->output = output.cudaData;
-    FastllmCudaSyncCurrentThreadStream();
-    state.WaitForOutputs();
-    for (int step = 1; step < ranks; ++step) {
-        const int peer = (rank + step) % ranks;
-        const size_t first = (int64_t)total * peer / ranks;
-        const size_t rows = (int64_t)total * (peer + 1) / ranks - first;
-        AssertInFastLLM(FastllmCudaMemcpyPeerAsyncCurrentThread(state.devices[rank],
-            (uint16_t *)output.cudaData + first * 4096, state.devices[peer],
-            (const uint16_t *)state.ranks[peer]->output + first * 4096,
-            rows * 4096 * sizeof(uint16_t)), "MiMo EP8 peer output copy failed.");
-    }
-    FastllmCudaSyncCurrentThreadStream();
-    state.WaitForOutputs();
+    FastllmCudaMimoEp8PrefillAllGather(state, rank, output);
     return false;
 }
 #else
@@ -210,6 +224,9 @@ struct FastllmCudaMimoEp8Mega {};
 bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &) { return false; }
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(const std::vector<int> &,
     const std::vector<std::vector<std::vector<fastllm::Data *>>> &) { return {}; }
+void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &, int, fastllm::Data &) {
+    throw std::runtime_error("MiMo EP8 prefill AllGather requires the SM90 backend.");
+}
 bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &, int, int, const fastllm::Data &,
     const fastllm::Data &, const fastllm::Data &, fastllm::Data &, bool, fastllm::Data *,
     const fastllm::Data *, fastllm::Data *, float) {

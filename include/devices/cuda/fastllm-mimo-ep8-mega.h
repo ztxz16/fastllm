@@ -9,6 +9,10 @@ bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &devices);
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     const std::vector<int> &devices,
     const std::vector<std::vector<std::vector<fastllm::Data *>>> &weights);
+// Eager-only, in-place gather of contiguous row shards. Reuses the existing
+// EP8 peer publication barriers; all data stays on GPUs, with no extra arena.
+void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
+                                      fastllm::Data &output);
 // Routing may cover the full input or this rank's equal contiguous token shard.
 // Sharded results are gathered in-place, unless the optional residual/RMSNorm
 // fusion succeeds. True means residual and normOutput are ready; in that case
