@@ -120,6 +120,19 @@ namespace fastllm {
         output.Reshape(outputDims);
     }
 
+    HybridMoeDecodeStep Glm5NextModel::BeginHybridDraftMoe(
+            const Data &input, int sequence) {
+        HybridMoeDecodeStep step;
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        if (sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
+            input.dataDevice == DataDevice::CUDA && !input.dataDeviceIds.empty()) {
+            FastllmCudaSetDevice(input.dataDeviceIds[0]);
+            step.Begin(mtpExpertWeights.data(), mtpExpertWeights.size(), num_experts_per_tok);
+        }
+#endif
+        return step;
+    }
+
     void Glm5NextModel::ForwardHybridLayers(
             Data &hiddenStates, int firstLayer, int endLayer,
             const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
@@ -181,7 +194,7 @@ namespace fastllm {
     void Glm5NextModel::PrepareHybridMoeCache() {
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
         {
-            std::vector<FastllmCudaMoeCacheLayer> layers;
+            HybridMoeCachePlan cache(HybridMoeMath::Glm5, swigluLimit);
             const int cacheLayers = block_cnt + (mtpEnabled && mtpWeightsReady ? 1 : 0);
             for (int layer = 0; layer < cacheLayers; ++layer) {
                 const std::string device = SelectMoeDeviceForLayer(std::min(layer, block_cnt - 1));
@@ -197,14 +210,10 @@ namespace fastllm {
                         (!experts[3] || experts[2]->dims.size() != 2 || experts[3]->dims.size() != 2 ||
                          !FastllmCudaMoeGlm5GGUFCacheSupported(experts[2]->ggmlType, experts[3]->ggmlType,
                              experts[2]->dims[1], experts[3]->dims[1]))) continue;
-                    layers.push_back({experts.data(), (int)experts.size(),
-                                      false, swigluLimit, true});
+                    cache.Add(experts, device);
                 }
             }
-            if (!layers.empty()) {
-                FastllmCudaPrepareMoeCache(layers.data(), (int)layers.size(),
-                    [this] { WarmupNumaMoeWeights(); }, true);
-            }
+            cache.Prepare([this] { WarmupNumaMoeWeights(); }, true);
         }
 #endif
     }

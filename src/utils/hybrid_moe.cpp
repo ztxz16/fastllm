@@ -6,6 +6,32 @@
 #endif
 
 namespace fastllm {
+void HybridMoeCachePlan::Add(const std::vector<Data *> &weights,
+                            const std::string &device) {
+    const bool numa = device == "numa" || device.rfind("numa:", 0) == 0;
+    if (device != "cpu" && !numa) return;
+    layers.push_back({weights.data(), static_cast<int>(weights.size())});
+    allNuma = allNuma && numa;
+}
+bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeights,
+                                 bool allowStreaming) const {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+    if (layers.empty()) return false;
+    std::vector<FastllmCudaMoeCacheLayer> cacheLayers;
+    cacheLayers.reserve(layers.size());
+    for (const auto &layer : layers) {
+        cacheLayers.push_back({layer.weights, layer.count,
+            math == HybridMoeMath::DeepSeekV41, swigluLimit, math == HybridMoeMath::Glm5});
+    }
+    // The backend retains format-dependent snapshot/registration order and
+    // publishes a cache only after validation. Failure leaves host fallback intact.
+    return FastllmCudaPrepareMoeCache(cacheLayers.data(), static_cast<int>(cacheLayers.size()),
+        allNuma ? registerNumaWeights : std::function<void()>{}, allowStreaming);
+#else
+    return false;
+#endif
+}
+
 HybridMoeDecodeStep::~HybridMoeDecodeStep() { Finish(); }
 void HybridMoeDecodeStep::Begin(Data **weights, int count, int topk,
                                const std::vector<int> *devices) {

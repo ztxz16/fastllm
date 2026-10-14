@@ -321,44 +321,21 @@ namespace fastllm {
 
     void Qwen4ExpModel::PrepareHybridExperts(bool hasMtpWeights) {
         if (MoeCudaCacheRequested()) {
-            bool cachePrepared = false;
-#if defined(USE_CUDA) && !defined(USE_ROCM)
-            if (hasMtpWeights && !weights.empty() && weights[0].size() > 2 &&
-                weights[0][2]->isGGUFData && mtpMoeWeights[2]->isGGUFData) {
-                // Original table addresses must be retained as cache keys.
-                // Only host-placed experts share the bounded cache. A
-                // GPU-resident draft table is kept outside this budget.
-                std::vector<FastllmCudaMoeCacheLayer> cacheLayers;
-                bool allNuma = true;
-                for (int layer = 0; layer <= block_cnt; ++layer) {
-                    const std::string device =
-                        layer == block_cnt
-                            ? SelectSpecialWeightDevice(
-                                  "mtp.layers.0.mlp.experts.0.gateup_proj.weight", block_cnt - 1)
-                            : SelectMoeDeviceForLayer(layer);
-                    if (device != "cpu" && device != "numa" && device.compare(0, 5, "numa:") != 0)
-                        continue;
-                    allNuma = allNuma && device != "cpu";
-                    const auto &table = layer == block_cnt ? mtpMoeWeights : weights[layer];
-                    cacheLayers.push_back({table.data(), static_cast<int>(table.size())});
-                }
-                std::function<void()> registerNumaWeights;
-#ifdef USE_NUMAS
-                if (allNuma) {
-                    // Cache preparation registers NUMA shards before binding
-                    // shared weights, retaining a canonical snapshot only as a fallback.
-                    registerNumaWeights = [this] { WarmupNumaMoeWeights(); };
-                }
-#endif
-                cachePrepared = !cacheLayers.empty() &&
-                                FastllmCudaPrepareMoeCache(cacheLayers.data(),
-                                                           static_cast<int>(cacheLayers.size()),
-                                                           registerNumaWeights);
-            } else
-#endif
-            {
-                cachePrepared = PrepareMoeCudaCache(this->weights);
+            HybridMoeCachePlan cache;
+            const bool includeDraft = hasMtpWeights && !weights.empty() && weights[0].size() > 2 &&
+                weights[0][2]->isGGUFData && mtpMoeWeights[2]->isGGUFData;
+            const int targetLayers = includeDraft ? block_cnt : static_cast<int>(weights.size());
+            for (int layer = 0; layer < targetLayers; ++layer)
+                cache.Add(weights[layer], SelectMoeDeviceForLayer(layer));
+            if (includeDraft) {
+                cache.Add(mtpMoeWeights, SelectSpecialWeightDevice(
+                    "mtp.layers.0.mlp.experts.0.gateup_proj.weight", block_cnt - 1));
             }
+            std::function<void()> registerNumaWeights;
+#ifdef USE_NUMAS
+            registerNumaWeights = [this] { WarmupNumaMoeWeights(); };
+#endif
+            const bool cachePrepared = cache.Prepare(registerNumaWeights);
             if (!cachePrepared) {
                 std::fprintf(stderr, "[Fastllm] Qwen4 CUDA expert cache unavailable; using the "
                                      "configured MoE device.\n");

@@ -1,12 +1,14 @@
 #ifndef FASTLLM_DEEPSEEKV41_EXECUTION_H
 #define FASTLLM_DEEPSEEKV41_EXECUTION_H
-#include "utils/hybrid_moe.h"
 
 #include "deepseekv41.h"
 #include <functional>
 
 namespace fastllm {
+    struct DeepSeekV41HybridWorkspace;
     struct DeepSeekV41DecodeWorkspace {
+        DeepSeekV41DecodeWorkspace();
+        ~DeepSeekV41DecodeWorkspace();
         Data hiddenStates, hiddenTemp, preMix, dsparkPreMix;
         int preMixSeqlen = -1;      // preMix 只在长度变化时重建（内容是常量 one-hot）
         Data attnPre, attnPost, attnComb, ffnPre, ffnPost, ffnComb;
@@ -16,18 +18,15 @@ namespace fastllm {
         Data sharedGateup, sharedSwiglu, sharedExpertOut;
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
         Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
-        struct MoeCacheWorkspace { Data index, score, output; };
-        std::map<int, MoeCacheWorkspace> moeCache;
+        std::unique_ptr<DeepSeekV41HybridWorkspace> hybrid;
         Data quantizedActivation;
         Data attnInputQuantized, qNormQuantized;
         // TP and CUDA graphs retain one buffer per weight.
         std::map<std::string, Data> quantizedActivations;
     };
 
-    // A decode policy must end before the head, and also on exception unwinding.
     struct DeepSeekV41MoeContext {
         DeepSeekV41DecodeWorkspace &workspace;
-        HybridMoeDecodeStep &step;
         std::vector<Data *> &moeWeights;
         const std::vector<int> &tpDevices;
         int layer, seqlen;

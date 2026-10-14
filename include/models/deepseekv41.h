@@ -260,7 +260,7 @@ namespace fastllm {
         void InitExecutionMode();
         void BeginHybridMoeStep(HybridMoeDecodeStep &, bool tp, bool single, int seqlen);
         bool RunGpuMoe(DeepSeekV41MoeContext &);
-        bool RunHybridMoe(DeepSeekV41MoeContext &);
+        bool RunHybridMoe(DeepSeekV41MoeContext &, HybridMoeDecodeStep *);
         bool moeExpertCacheAttempted = false;
         // Source FP8/FP4 linears still require block-32 FP8 activations after
         // their weights have been decoded into the requested storage dtype.

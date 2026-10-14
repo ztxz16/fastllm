@@ -2845,18 +2845,9 @@ namespace fastllm {
             hiddenStates,
             weight[prefix + "post_attention_layernorm.weight"],
             rms_norm_eps, normalizedFfn);
-#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        // Draft layers run outside ForwardLayers. Give their experts the same
-        // frequency policy and measured miss split, closing the step after
-        // readers finish even if the forward throws.
-        HybridMoeDecodeStep draftCache;
-        if (executionMode == ExecutionMode::Hybrid && sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
-            normalizedFfn.dataDevice == DataDevice::CUDA && !normalizedFfn.dataDeviceIds.empty()) {
-            FastllmCudaSetDevice(normalizedFfn.dataDeviceIds[0]);
-            draftCache.Begin(
-                mtpExpertWeights.data(), mtpExpertWeights.size(), num_experts_per_tok);
-        }
-#endif
+        // Keep the draft policy alive through its head and every early return.
+        auto draftCache = executionMode == ExecutionMode::Hybrid
+            ? BeginHybridDraftMoe(normalizedFfn, sequence) : HybridMoeDecodeStep{};
         RunMoeWithPrefix(
             block_cnt - 1, prefix + "mlp.",
             mtpExpertWeights, mtpExpertBiases,

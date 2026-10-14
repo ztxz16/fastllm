@@ -934,6 +934,15 @@ if (UNIT_TEST)
     target_include_directories(execution_mode_test PRIVATE include)
     fastllm_add_checked_test(execution_mode execution_mode_test "ALL_PASS" 60)
 
+    if (NOT USE_ROCM)
+        # Mock the CUDA boundary so hybrid lifetime contracts also run without a GPU.
+        add_executable(hybrid_moe_test test/basic/test_hybrid_moe.cpp src/utils/hybrid_moe.cpp)
+        target_include_directories(hybrid_moe_test PRIVATE include)
+        target_compile_definitions(hybrid_moe_test PRIVATE USE_CUDA)
+        set_target_properties(hybrid_moe_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(hybrid_moe hybrid_moe_test "ALL_PASS" 60)
+    endif()
+
     add_executable(moe_decode_policy_test test/basic/test_moe_decode_policy.cpp)
     target_include_directories(moe_decode_policy_test PRIVATE include)
     set_target_properties(moe_decode_policy_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)

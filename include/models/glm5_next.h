@@ -13,6 +13,7 @@
 #include <vector>
 
 namespace fastllm {
+    class HybridMoeDecodeStep;
     class CudaChunkedPrefillPipeline;
 
     struct Glm5NextIndexerCheckpoint {
@@ -113,6 +114,7 @@ namespace fastllm {
         ExecutionMode executionMode = ExecutionMode::Cpu;
         void InitExecutionMode();
         void PrepareHybridMoeCache();
+        HybridMoeDecodeStep BeginHybridDraftMoe(const Data &input, int sequence);
         struct ThreadTpState;
         std::unique_ptr<ThreadTpState> threadTpState;
         ThreadTpState *threadTpOwner = nullptr;

@@ -8,6 +8,29 @@
 #include <vector>
 
 namespace fastllm {
+// Numerical semantics belong to the expert layout, not to the storage tier.
+// Keep score placement, projection rounding and activation quantization distinct.
+enum class HybridMoeMath { Standard, Glm5, DeepSeekV41 };
+
+// A short-lived preparation plan borrows the original expert tables. GPU and
+// disk-resident layers stay outside the host cache. NUMA storage can only be
+// borrowed when every selected table is registered by the supplied callback.
+class HybridMoeCachePlan {
+public:
+    explicit HybridMoeCachePlan(HybridMoeMath math = HybridMoeMath::Standard,
+                               float swigluLimit = 0.0f)
+        : math(math), swigluLimit(swigluLimit) {}
+    void Add(const std::vector<Data *> &weights, const std::string &device);
+    bool Prepare(const std::function<void()> &registerNumaWeights = {},
+                 bool allowStreaming = false) const;
+private:
+    struct Layer { Data *const *weights; int count; };
+    std::vector<Layer> layers;
+    HybridMoeMath math;
+    float swigluLimit;
+    bool allNuma = true;
+};
+
 // One complete target token/verification step owns one policy scope. Cache
 // admission must finish outside captured GPU segments, including on exceptions.
 // Weight-table pointers remain cache keys; this class never copies the tables.
