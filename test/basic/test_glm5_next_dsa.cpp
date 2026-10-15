@@ -179,17 +179,23 @@ void Selection(int past,int rows) {
     }
     std::printf("PASS selection past=%d rows=%d width=%d\n",past,rows,width);
 }
-void Scoring() {
-    const int rows=9,m=520,heads=32;std::vector<float> q(rows*heads*128),k(m*128),w(rows*heads);
-    for(int r=0;r<rows*heads;++r){w[r]=Pattern(r,3)/32;for(int d=0;d<128;++d)q[r*128+d]=F(Bf(Pattern(r,d)/8));}
-    for(int j=0;j<m;++j)for(int d=0;d<128;++d)k[j*128+d]=F(Bf(Pattern(j+8,d)/8));
+void Scoring(bool hybrid = false, int rows = 9) {
+    const int m=520,heads=32;std::vector<float> q(rows*heads*128),k(m*128),w(rows*heads);
+    for(int r=0;r<rows*heads;++r){w[r]=Pattern(r,3)/32;for(int d=0;d<128;++d)q[r*128+d]=F(Bf(std::ldexp(Pattern(r,d)/8, hybrid ? (r*17+d*13)%7-3 : 0)));}
+    for(int j=0;j<m;++j)for(int d=0;d<128;++d)k[j*128+d]=F(Bf(std::ldexp(Pattern(j+8,d)/8, hybrid ? (j*19+d*11)%7-3 : 0)));
     Data qd,kd,wd,s;Upload(qd,{1,rows,heads,128},q);Upload(kd,{1,m,128},k);Upload(wd,{1,rows,heads},w,FLOAT32);
-    Check(FastllmCudaDeepSeekV41IndexerScore(qd,wd,kd,4,2050,s),"score launch");auto got=Download(s);double err=0;
+    Check(hybrid ? FastllmCudaGlm5NextHybridIndexerScore(qd,wd,kd,s) :
+        FastllmCudaDeepSeekV41IndexerScore(qd,wd,kd,4,2050,s),"score launch");auto got=Download(s);double err=0;
     for(int r=0;r<rows;++r)for(int j=0;j<std::min(m,(2050+r+1)/4);++j){
         double expected=0;for(int h=0;h<heads;++h){double dot=0;for(int d=0;d<128;++d)dot+=q[(r*heads+h)*128+d]*k[j*128+d];expected+=std::max(0.,dot)*w[r*heads+h];}
         err=std::max(err,std::abs(got[r*m+j]-expected));
     }
     std::printf("PASS weighted ReLU scoring max_error=%.8g\n",err);Check(err<2e-5,"score reference");
+    if (hybrid) {
+        Data reference;
+        Check(FastllmCudaDeepSeekV41IndexerScore(qd,wd,kd,4,2050,reference),"legacy score launch");
+        Check(got == Download(reference),"hybrid indexer must preserve every FP32 score bit");
+    }
 }
 struct BorrowedCache:Data{~BorrowedCache(){isPagedKVCache=false;}};
 bool MlaSupported(DataType type) {
@@ -200,7 +206,8 @@ bool MlaSupported(DataType type) {
     // FlashInfer's MLA dispatcher requires at least 92672 bytes per SM.
     return FastllmCudaFlashInferDataTypeSupported(type) && sharedMemory >= 92672;
 }
-void Attention(int past,int rows,bool fragmented) {
+void Attention(int past,int rows,bool fragmented,bool hybrid=false) {
+    const int device=FastllmCudaGetDevice();
     const int heads=64,rank=512,pageLen=32,tokens=past+rows,pages=(tokens+31)/32;
     std::vector<float> kv((fragmented?pages*2:pages)*pageLen*rank),q(heads*rows*rank);
     std::vector<int> pagesIds(pages);for(int p=0;p<pages;++p)pagesIds[p]=fragmented?(pages-1-p)*2:p;
@@ -211,8 +218,8 @@ void Attention(int past,int rows,bool fragmented) {
     Check(FastllmCudaDeepSeekV41IndexerTopK(scores,nullptr,512,4,past,1,groups),"attention groups");groups.Reshape({rows,groups.dims.back()});
     Check(FastllmCudaQwen4ExpandSelectedBlocks(groups,tokens,past,4,idx),"attention indices");auto ids=Integers(idx);const int width=idx.dims.back();
     PagedCacheManager pool;Upload(pool,{int(kv.size()/pageLen/rank),pageLen,1,rank},kv);
-    BorrowedCache cache;cache.dataDevice=DataDevice::CUDA;cache.dataDeviceIds={0};cache.dataType=BFLOAT16;cache.Resize({1,tokens,rank});cache.isPagedKVCache=true;cache.pageLen=pageLen;cache.lastPageLen=(tokens-1)%pageLen+1;cache.pageIndex=pagesIds;cache.pagedKVCacheData=&pool;
-    Data query,out;Upload(query,{heads,rows,rank},q);SparseLatentAttention(query,cache,idx,1.f/16,out);auto got=Download(out);double error=0;
+    BorrowedCache cache;cache.dataDevice=DataDevice::CUDA;cache.dataDeviceIds={device};cache.dataType=BFLOAT16;cache.Resize({1,tokens,rank});cache.isPagedKVCache=true;cache.pageLen=pageLen;cache.lastPageLen=(tokens-1)%pageLen+1;cache.pageIndex=pagesIds;cache.pagedKVCacheData=&pool;
+    Data query,out;Upload(query,{heads,rows,rank},q);SparseLatentAttention(query,cache,idx,1.f/16,out,true,nullptr,hybrid);auto got=Download(out);double error=0;
     for(float v:got)Check(std::isfinite(v),"attention nonfinite");
     for(int h:{0,17,63})for(int r=0;r<rows;++r){
         std::vector<double> p(width);double den=0;
@@ -221,7 +228,7 @@ void Attention(int past,int rows,bool fragmented) {
     }
     if (rows == 1) {
         Data table(INT32), physical, pagedQuery, pagedOutput;
-        table.Resize({pages}); table.ToDevice(DataDevice::CUDA,{0},false); table.Allocate(false);
+        table.Resize({pages}); table.ToDevice(DataDevice::CUDA,{device},false); table.Allocate(false);
         FastllmCudaCopyFromHostToDevice(table.cudaData,pagesIds.data(),pages*4);
         Check(FastllmCudaQwen4ExpandSelectedBlocks(groups,tokens,past,4,physical,&table,pageLen),"paged expand");
         auto mapped=Integers(physical);
@@ -229,11 +236,11 @@ void Attention(int past,int rows,bool fragmented) {
             Check(mapped[i]==(ids[i]<0?-1:pagesIds[ids[i]/pageLen]*pageLen+ids[i]%pageLen),"physical page mapping");
         PagedCacheManager pePool;
         Upload(pePool,{int(kv.size()/pageLen/rank),pageLen,1,64},std::vector<float>(kv.size()/rank*64));
-        BorrowedCache peCache;peCache.dataDevice=DataDevice::CUDA;peCache.dataDeviceIds={0};peCache.dataType=BFLOAT16;peCache.Resize({1,tokens,64});
+        BorrowedCache peCache;peCache.dataDevice=DataDevice::CUDA;peCache.dataDeviceIds={device};peCache.dataType=BFLOAT16;peCache.Resize({1,tokens,64});
         peCache.isPagedKVCache=true;peCache.pageLen=pageLen;peCache.lastPageLen=cache.lastPageLen;
         peCache.pageIndex=pagesIds;peCache.pagedKVCacheData=&pePool;
         Upload(pagedQuery,{heads,rows,rank},q);
-        SparseLatentAttention(pagedQuery,cache,physical,1.f/16,pagedOutput,false,&peCache);
+        SparseLatentAttention(pagedQuery,cache,physical,1.f/16,pagedOutput,false,&peCache,hybrid);
         Check(Download(pagedOutput)==got,"paged BF16 fallback differs");
         if (MlaSupported(BFLOAT16)) {
             Upload(pagedQuery,{heads,rows,rank},q);
@@ -464,6 +471,57 @@ void DecodeSmallGemv() {
     }
     std::puts("PASS short BF16 GEMV exact against original 256-thread multirow path");
 }
+
+bool HybridSm75Attention() {
+    int major = 0, minor = 0, device = 0;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+    if (major != 7 || minor != 5) return false;
+    for (int heads : {32, 64}) for (int rows : {1, 2, 4, 8, 16, 17, 32, 33, 64, 512}) {
+        const int count = rows == 2 ? 33 : 2051, cap = 2309;
+        std::vector<float> q(rows * heads * 512), kv(cap * 512);
+        for (size_t i = 0; i < q.size(); ++i) q[i] = F(Bf(std::ldexp(Pattern(i / 512, i % 512) / 4, int(i * 13 % 7) - 3)));
+        for (size_t i = 0; i < kv.size(); ++i) kv[i] = F(Bf(std::ldexp(Pattern(i / 512 + 41, i % 512) / 4, int(i * 19 % 7) - 3)));
+        std::vector<int> indices(rows * count);
+        for (int r = 0; r < rows; ++r) for (int c = 0; c < count; ++c)
+            indices[r * count + c] = c % 29 == 0 ? -1 : (c * 13 + r * 17) % cap;
+        Data query, latent, idx(INT32), output, reference, sink;
+        Upload(query, {1, rows, heads, 512}, q); Upload(latent, {1, cap, 512}, kv);
+        Upload(sink, {heads}, std::vector<float>(heads, -INFINITY), FLOAT32);
+        idx.Resize({1, rows, count}); idx.ToDevice(DataDevice::CUDA, {device}, false); idx.Allocate(false);
+        FastllmCudaCopyFromHostToDevice(idx.cudaData, indices.data(), indices.size() * sizeof(int));
+        Check(FastllmCudaGlm5NextHybridSparseAttention(query, latent, idx, 1.f / 16, output), "hybrid attention launch");
+        auto got = Download(output); double maximum = 0, referenceError = 0;
+        for (float x : got) Check(std::isfinite(x), "hybrid nonfinite");
+        for (int r : {0, rows - 1}) for (int h : {0, heads - 1}) {
+            std::vector<double> p(count); double den = 0;
+            for (int c = 0; c < count; ++c) if (indices[r * count + c] >= 0) {
+                double dot = 0;
+                for (int d = 0; d < 512; ++d) dot += q[(r * heads + h) * 512 + d] * double(kv[indices[r * count + c] * 512 + d]);
+                den += p[c] = std::exp(dot / 16);
+            }
+            for (int d = 0; d < 512; d += 17) {
+                double num = 0;
+                for (int c = 0; c < count; ++c) if (indices[r * count + c] >= 0)
+                    num += p[c] * kv[indices[r * count + c] * 512 + d];
+                const double expected = num / den;
+                const double error = std::abs(got[(r * heads + h) * 512 + d] - expected);
+                Check(error <= 1e-6 + std::abs(expected) / 250, "hybrid FP64 BF16 rounding bound");
+                referenceError = std::max(referenceError, error);
+            }
+        }
+        if (rows <= 64) {
+            Check(FastllmCudaDeepSeekV41SparseAttention(query, latent, nullptr, &latent, &idx, sink, 0, 0, 1.f / 16, reference), "reference attention launch");
+            auto before = Download(reference);
+            for (size_t i = 0; i < got.size(); ++i) maximum = std::max(maximum, std::abs(double(got[i]) - before[i]));
+            Check(before == got, "hybrid attention must preserve every BF16 output bit");
+        }
+        std::printf("PASS hybrid sparse device=%d heads=%d rows=%d old_max=%.8g fp64_max=%.8g\n", device, heads, rows, maximum, referenceError);
+    }
+    return true;
+}
+
 void Fixture(const std::string &dir) {
     auto load = [&](const std::string &name, Data &out, DataType type) {
         std::ifstream f(dir+"/"+name+".bin", std::ios::binary);
@@ -508,6 +566,21 @@ int main(int argc, char **argv) {
     FastllmCudaSetDevice(0);
     static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:0");
     try {
+        if (argc == 2 && std::string(argv[1]) == "--hybrid-sm75") {
+            bool checked = false;
+            for (int device = 0; device < devices; ++device) {
+                FastllmCudaSetDevice(device);
+                static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:" + std::to_string(device));
+                if (!HybridSm75Attention()) continue;
+                checked = true;
+                for (int rows : {9, 17, 33}) Scoring(true, rows);
+                Attention(2045, 9, true, true);
+                Attention(4098, 1, false, true);
+                Attention(32769, 1, true, true);
+                Check(cudaDeviceSynchronize() == cudaSuccess, "hybrid CUDA async error");
+            }
+            return checked ? 0 : 77;
+        }
         if (argc == 2 && std::string(argv[1]) == "--sm75-verify") {
             bool checked = false;
             for (int device = 0; device < devices; ++device) {

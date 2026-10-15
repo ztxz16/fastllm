@@ -1400,6 +1400,9 @@ if (UNIT_TEST)
         add_test(NAME glm5_next_dsa COMMAND glm5_next_dsa_test)
         add_test(NAME glm5_next_dsa_mtp_rollback COMMAND glm5_next_dsa_test --rollback)
         add_test(NAME glm5_next_dsa_sm75_verify COMMAND glm5_next_dsa_test --sm75-verify)
+        add_test(NAME glm5_next_dsa_hybrid_sm75 COMMAND glm5_next_dsa_test --hybrid-sm75)
+        set_tests_properties(glm5_next_dsa_hybrid_sm75 PROPERTIES LABELS "cuda;hybrid"
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         set_tests_properties(glm5_next_dsa_sm75_verify PROPERTIES LABELS "cuda;mtp"
             SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         add_executable(glm5_next_tp_stream_test test/basic/test_glm5_next_tp_stream.cpp)

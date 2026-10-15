@@ -1958,6 +1958,161 @@ namespace {
         out[h * 512 + first] = __float2bfloat16_rn(acc * inv);
     }
 
+    // One thread owns one candidate/head dot. Stage keys transposed so all
+    // 128 FMAs retain the scalar order while each warp reads contiguous keys.
+    __global__ void Glm5HybridIndexerDots(const __nv_bfloat16 *query,
+            const __nv_bfloat16 *keys, int candidates, float *dots) {
+        const int token = blockIdx.z, head = blockIdx.y * 8 + threadIdx.x / 32;
+        const int candidate = blockIdx.x * 32 + threadIdx.x % 32;
+        __shared__ float keyTile[128][33], queryTile[8][128];
+        for (int i = threadIdx.x; i < 32 * 128; i += 256) {
+            const int row = i / 128, d = i % 128, source = blockIdx.x * 32 + row;
+            keyTile[d][row] = source < candidates ? __bfloat162float(keys[size_t(source) * 128 + d]) : 0.f;
+        }
+        for (int i = threadIdx.x; i < 8 * 128; i += 256)
+            queryTile[i / 128][i % 128] = __bfloat162float(
+                query[(size_t(token) * 32 + blockIdx.y * 8) * 128 + i]);
+        __syncthreads();
+        if (candidate >= candidates) return;
+        float sum = 0.f;
+        #pragma unroll
+        for (int d = 0; d < 128; ++d)
+            sum += queryTile[threadIdx.x / 32][d] * keyTile[d][threadIdx.x % 32];
+        dots[(size_t(token) * 32 + head) * candidates + candidate] = sum;
+    }
+
+    __global__ void Glm5HybridIndexerReduce(const float *dots, const float *weights,
+            int candidates, int heads, float *output) {
+        const int candidate = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
+        if (candidate >= candidates) return;
+        float sum = 0;
+        for (int h = 0; h < heads; ++h)
+            sum += fmaxf(dots[(size_t(row) * heads + h) * candidates + candidate], 0.f) * weights[row * heads + h];
+        output[size_t(row) * candidates + candidate] = sum;
+    }
+
+    // Keep each query segment in registers across eight candidate groups.
+    // Coalesced shared loads preserve the original 64-FMA/eight-lane dot order.
+    __global__ void __launch_bounds__(256)
+    Glm5HybridAttentionScores(const __nv_bfloat16 *q, const __nv_bfloat16 *kv,
+            const int32_t *indices, int count, int cap, int heads, float *scores) {
+        const int token = blockIdx.z, group = threadIdx.x / 64;
+        const int local = threadIdx.x % 64, lane = local % 8;
+        const int h = blockIdx.y * 8 + local / 8;
+        q += size_t(token) * heads * 512;
+        indices += size_t(token) * count;
+        scores += size_t(token) * heads * count;
+        __shared__ float keys[4][520], queries[8][520];
+        for (int i = threadIdx.x; i < 8 * 512; i += 256) {
+            const int d = i % 512;
+            queries[i / 512][d + d / 64] = __bfloat162float(q[(blockIdx.y * 8 + i / 512) * 512 + d]);
+        }
+        __syncthreads();
+        float query[64];
+        #pragma unroll
+        for (int d = 0; d < 64; ++d) query[d] = queries[local / 8][lane * 65 + d];
+        for (int tile = 0; tile < 8; ++tile) {
+            const int c = blockIdx.x * 32 + tile * 4 + group;
+            const int id = c < count ? indices[c] : -1;
+            const bool valid = id >= 0 && id < cap;
+            if (valid) for (int d = local; d < 512; d += 64)
+                keys[group][d + d / 64] = __bfloat162float(kv[size_t(id) * 512 + d]);
+            __syncthreads();
+            if (valid) {
+                float dot = 0.f;
+                #pragma unroll
+                for (int d = 0; d < 64; ++d) dot += query[d] * keys[group][lane * 65 + d];
+                dot += __shfl_xor_sync(0xffffffff, dot, 1);
+                dot += __shfl_xor_sync(0xffffffff, dot, 2);
+                dot += __shfl_xor_sync(0xffffffff, dot, 4);
+                if (lane == 0) scores[h * count + c] = dot;
+            }
+            __syncthreads();
+        }
+    }
+
+    // Prefix maxima are associative. Evaluate the same expf(alpha/p) as the
+    // online softmax in parallel, but accumulate its denominator sequentially.
+    __global__ void Glm5HybridAttentionWeights(const float *scores, const int32_t *indices,
+            int count, int cap, int heads, float scale, float2 *weights, float *inverse) {
+        const int h = blockIdx.x, token = blockIdx.y, tid = threadIdx.x;
+        const int lane = tid % 32, warp = tid / 32;
+        scores += (size_t(token) * heads + h) * count;
+        weights += (size_t(token) * heads + h) * count;
+        indices += size_t(token) * count;
+        __shared__ float maximum, denominator, warpMax[8], warpBefore[8];
+        __shared__ float2 coefficients[256];
+        if (tid == 0) { maximum = -INFINITY; denominator = 1.f; }
+        __syncthreads();
+        for (int base = 0; base < count; base += 256) {
+            const int c = base + tid, id = c < count ? indices[c] : -1;
+            const bool valid = id >= 0 && id < cap;
+            const float score = valid ? scores[c] * scale : -INFINITY;
+            float prefix = score;
+            #pragma unroll
+            for (int offset = 1; offset < 32; offset *= 2) {
+                const float before = __shfl_up_sync(0xffffffff, prefix, offset);
+                if (lane >= offset) prefix = fmaxf(prefix, before);
+            }
+            if (lane == 31) warpMax[warp] = prefix;
+            __syncthreads();
+            if (tid < 8) {
+                float value = maximum;
+                for (int w = 0; w < tid; ++w) value = fmaxf(value, warpMax[w]);
+                warpBefore[tid] = value;
+            }
+            __syncthreads();
+            const float previousLane = __shfl_up_sync(0xffffffff, prefix, 1);
+            const float before = fmaxf(warpBefore[warp], lane ? previousLane : -INFINITY);
+            const float next = fmaxf(before, score);
+            const float2 pair = valid ? make_float2(__expf(before - next), __expf(score - next)) : make_float2(1.f, 0.f);
+            coefficients[tid] = pair;
+            if (c < count) weights[c] = pair;
+            __syncthreads();
+            if (tid == 0) {
+                float sum = denominator;
+                for (int j = 0; j < min(256, count - base); ++j)
+                    sum = sum * coefficients[j].x + coefficients[j].y;
+                denominator = sum;
+                maximum = fmaxf(warpBefore[7], warpMax[7]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) inverse[size_t(token) * heads + h] = 1.f / denominator;
+    }
+
+    template<int Heads, int Tile>
+    __global__ void Glm5HybridAttentionValues(const __nv_bfloat16 *kv,
+            const int32_t *indices, const float2 *weights, const float *inverse,
+            int count, int cap, int heads, __nv_bfloat16 *output) {
+        const int token = blockIdx.z, h = blockIdx.x * Heads, d = blockIdx.y * 128 + threadIdx.x;
+        indices += size_t(token) * count;
+        weights += (size_t(token) * heads + h) * count;
+        float acc[Heads] = {};
+        for (int base = 0; base < count; base += Tile) {
+            float2 pair[Heads][Tile]; float value[Tile]; bool valid[Tile];
+            #pragma unroll
+            for (int j = 0; j < Tile; ++j) {
+                const int c = base + j, id = c < count ? indices[c] : -1;
+                valid[j] = id >= 0 && id < cap;
+                if (valid[j]) {
+                    value[j] = __bfloat162float(kv[size_t(id) * 512 + d]);
+                    #pragma unroll
+                    for (int k = 0; k < Heads; ++k) pair[k][j] = weights[k * count + c];
+                }
+            }
+            #pragma unroll
+            for (int j = 0; j < Tile; ++j) if (valid[j]) {
+                #pragma unroll
+                for (int k = 0; k < Heads; ++k)
+                    acc[k] = acc[k] * pair[k][j].x + pair[k][j].y * value[j];
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < Heads; ++k)
+            output[(size_t(token) * heads + h + k) * 512 + d] =
+                __float2bfloat16_rn(acc[k] * inverse[size_t(token) * heads + h + k]);
+    }
 
     // ---------------- SparseAttention（BF16 mma 版本，SM80+） ----------------
     //
@@ -3094,6 +3249,107 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, co
         (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
         ratio, startPos, listCap, (int32_t*)output.cudaData);
     return V41CheckLaunch("IndexerTopK");
+}
+
+// Hybrid workspaces require dense tensors on the selected CUDA device.
+static bool Glm5HybridDense(const fastllm::Data &x) {
+    if (!V41OnCuda(x) || x.multiDeviceData || x.dims.size() != x.strides.size()) return false;
+    uint64_t stride = 1;
+    for (int i = int(x.dims.size()) - 1; i >= 0; --i) {
+        if (x.dims[i] <= 0 || (x.dims[i] > 1 && x.strides[i] != stride)) return false;
+        stride *= x.dims[i];
+    }
+    return true;
+}
+
+bool FastllmCudaGlm5NextHybridIndexerScore(const fastllm::Data &query,
+        const fastllm::Data &weights, const fastllm::Data &keys, fastllm::Data &output) {
+    if (!Glm5HybridDense(query) || !Glm5HybridDense(keys) || !Glm5HybridDense(weights) ||
+        &output == &query || &output == &keys || &output == &weights ||
+        query.dataDeviceIds != keys.dataDeviceIds || query.dataDeviceIds != weights.dataDeviceIds ||
+        query.dataType != DataType::BFLOAT16 || keys.dataType != DataType::BFLOAT16 ||
+        weights.dataType != DataType::FLOAT32 || query.dims.size() != 4 ||
+        query.dims[0] != 1 || query.dims[1] < 8 || query.dims[2] != 32 || query.dims[3] != 128 ||
+        keys.dims.size() != 3 || keys.dims[0] != 1 || keys.dims[1] < 1 || keys.dims[2] != 128 ||
+        weights.Count(0) != size_t(query.dims[1]) * 32 || !V41IsSm75()) return false;
+    const int rows = query.dims[1], candidates = keys.dims[1], heads = 32;
+    const int batch = std::min(rows, std::max(1, std::min(32, (1 << 22) / candidates / heads)));
+    const size_t scoreElements = size_t(batch) * heads * candidates;
+    void *allocation = nullptr;
+    if (FastllmCudaTryMalloc(&allocation, scoreElements * sizeof(float)) !=
+        FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
+    struct Scratch {
+        void *ptr;
+        ~Scratch() { if (!FastllmCudaFreeAfterCurrentThreadStream(ptr)) FastllmCudaFree(ptr); }
+    } scratch{allocation};
+    if (!V41PrepareOutput(output, DataType::FLOAT32, {1, rows, candidates})) return false;
+    auto *dots = static_cast<float *>(allocation);
+    for (int first = 0; first < rows; first += batch) {
+        const int current = std::min(batch, rows - first);
+        Glm5HybridIndexerDots<<<dim3((candidates + 31) / 32, heads / 8, current), 256>>>(
+            (const __nv_bfloat16 *)query.cudaData + size_t(first) * heads * 128,
+            (const __nv_bfloat16 *)keys.cudaData, candidates, dots);
+        if (!V41CheckLaunch("GlmHybridIndexerDots")) return false;
+        Glm5HybridIndexerReduce<<<dim3((candidates + 255) / 256, current), 256>>>(
+            dots, (const float *)weights.cudaData + size_t(first) * heads, candidates, heads,
+            (float *)output.cudaData + size_t(first) * candidates);
+        if (!V41CheckLaunch("GlmHybridIndexerReduce")) return false;
+    }
+    return true;
+}
+
+bool FastllmCudaGlm5NextHybridSparseAttention(const fastllm::Data &query,
+        const fastllm::Data &latent, const fastllm::Data &indices,
+        float scale, fastllm::Data &output) {
+    if (!Glm5HybridDense(query) || !Glm5HybridDense(latent) || !Glm5HybridDense(indices) ||
+        query.dataType != DataType::BFLOAT16 || latent.dataType != DataType::BFLOAT16 ||
+        indices.dataType != DataType::INT32 || query.dims.size() != 4 ||
+        query.dims[0] != 1 || query.dims[1] < 1 ||
+        (query.dims[2] != 32 && query.dims[2] != 64) || query.dims[3] != 512 ||
+        latent.dims.size() != 3 || latent.dims[0] != 1 || latent.dims[1] < 1 || latent.dims[2] != 512 ||
+        indices.dims.size() != 3 || indices.dims[0] != 1 || indices.dims[1] != query.dims[1] ||
+        indices.dims[2] < 32 || indices.dims[2] > 4096 || !std::isfinite(scale) || scale <= 0 ||
+        &output == &query || &output == &latent || &output == &indices ||
+        query.dataDeviceIds != latent.dataDeviceIds || query.dataDeviceIds != indices.dataDeviceIds ||
+        !V41IsSm75()) return false;
+    const int tokens = query.dims[1], heads = query.dims[2], count = indices.dims[2];
+    // Bound scratch independently of prompt length. Keep the reference dot,
+    // denominator and PV accumulation order, including every BF16 boundary.
+    const int batch = std::min(tokens, 16);
+    const size_t scoreElements = size_t(batch) * heads * count;
+    void *allocation = nullptr;
+    if (FastllmCudaTryMalloc(&allocation, (scoreElements * 3 + size_t(batch) * heads) * sizeof(float)) !=
+        FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
+    struct Scratch {
+        void *ptr;
+        ~Scratch() { if (!FastllmCudaFreeAfterCurrentThreadStream(ptr)) FastllmCudaFree(ptr); }
+    } scratch{allocation};
+    if (!V41PrepareOutput(output, DataType::BFLOAT16, query.dims)) return false;
+    auto *scores = static_cast<float *>(allocation);
+    auto *weights = reinterpret_cast<float2 *>(scores + scoreElements);
+    auto *inverse = scores + scoreElements * 3;
+    for (int first = 0; first < tokens; first += batch) {
+        const int rows = std::min(batch, tokens - first);
+        const auto *selected = (const int32_t *)indices.cudaData + size_t(first) * count;
+        Glm5HybridAttentionScores<<<dim3((count + 31) / 32, heads / 8, rows), 256>>>(
+            (const __nv_bfloat16 *)query.cudaData + size_t(first) * heads * 512,
+            (const __nv_bfloat16 *)latent.cudaData, selected, count, latent.dims[1], heads, scores);
+        if (!V41CheckLaunch("GlmHybridAttentionScores")) return false;
+        Glm5HybridAttentionWeights<<<dim3(heads, rows), 256>>>(scores, selected,
+            count, latent.dims[1], heads, scale, weights, inverse);
+        if (!V41CheckLaunch("GlmHybridAttentionWeights")) return false;
+        if (rows >= 8) {
+            Glm5HybridAttentionValues<4, 8><<<dim3(heads / 4, 4, rows), 128>>>(
+                (const __nv_bfloat16 *)latent.cudaData, selected, weights, inverse,
+                count, latent.dims[1], heads, (__nv_bfloat16 *)output.cudaData + size_t(first) * heads * 512);
+        } else {
+            Glm5HybridAttentionValues<1, 4><<<dim3(heads, 4, rows), 128>>>(
+                (const __nv_bfloat16 *)latent.cudaData, selected, weights, inverse,
+                count, latent.dims[1], heads, (__nv_bfloat16 *)output.cudaData + size_t(first) * heads * 512);
+        }
+        if (!V41CheckLaunch("GlmHybridAttentionValues")) return false;
+    }
+    return true;
 }
 
 extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, const fastllm::Data &chunkKV,

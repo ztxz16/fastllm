@@ -2117,7 +2117,7 @@ namespace fastllm {
                 glm5_next_detail::BuildDsaIndices(rowInput, rowNormalized, weight,
                     prefix + "indexer.", latentKvCache.dims[1] - rows, indexTopK,
                     *requestIndexer, dsaIndices, rows == 1 ? &latentKvCache : nullptr,
-                    batch > 1 ? &rowProjections : nullptr);
+                    batch > 1 ? &rowProjections : nullptr, executionMode == ExecutionMode::Hybrid);
             }
             if (batch == 1 && dsaIndices.dims.empty() && sequence >= 64 &&
                 FastllmCudaGetLinearExactBatchThreshold() < sequence) {
@@ -2202,11 +2202,13 @@ namespace fastllm {
             if (!dsaIndices.dims.empty()) {
                 glm5_next_detail::SparseLatentAttention(*attentionQuery, latentKvCache,
                     dsaIndices, 1.0f / std::sqrt((float)qkHeadDim), *attentionResult,
-                    dsaBackend == DsaBackend::Auto, rows == 1 ? &keyPeCache : nullptr);
+                    dsaBackend == DsaBackend::Auto, rows == 1 ? &keyPeCache : nullptr,
+                    executionMode == ExecutionMode::Hybrid);
             } else if (UsesDsa() &&
                        !FastllmCudaFlashInferDataTypeSupported(attentionQuery->dataType)) {
                 glm5_next_detail::DenseLatentAttentionFallback(*attentionQuery, latentKvCache,
-                    1.0f / std::sqrt((float)qkHeadDim), *attentionResult);
+                    1.0f / std::sqrt((float)qkHeadDim), *attentionResult,
+                    executionMode == ExecutionMode::Hybrid);
             } else
 #endif
             {

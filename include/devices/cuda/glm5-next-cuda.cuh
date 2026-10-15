@@ -17,3 +17,13 @@ bool FastllmCudaGlm5NextHcPreNorm(
     fastllm::Data &base, fastllm::Data &norm, int hcMult, int iters,
     float eps, float normEps, fastllm::Data &output,
     fastllm::Data &post, fastllm::Data &comb);
+
+// FP32 sparse attention for SM75 hybrid prefill/decode/verification.
+// BF16 authoritative KV and queries; no additional KV quantization.
+bool FastllmCudaGlm5NextHybridSparseAttention(const fastllm::Data &query,
+    const fastllm::Data &latent, const fastllm::Data &indices,
+    float scale, fastllm::Data &output);
+
+// Batched FP32 weighted-ReLU index scoring on SM75 hybrid prefill.
+bool FastllmCudaGlm5NextHybridIndexerScore(const fastllm::Data &query,
+    const fastllm::Data &weights, const fastllm::Data &keys, fastllm::Data &output);
