@@ -478,14 +478,17 @@ if (USE_CUDA)
         message(STATUS "Hopper SM90 DeepGEMM FP8 linear: ON")
     endif()
 
-    # Native WGMMA QKV/RoPE fusion has no CUTLASS or compiler-service dependency.
+    # Native WGMMA kernels have no CUTLASS or compiler-service dependency.
     if (NOT CUDA_NO_TENSOR_CORE AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
         (FASTLLM_DEEPGEMM_FP8_SM90_ENABLED OR
          ("native" IN_LIST FASTLLM_CUDA_ARCHITECTURES AND
           CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES "(^|;)90(-real|-virtual)?(;|$)")))
-        list(APPEND FASTLLM_CUDA_SM90_SOURCES src/devices/cuda/models/naive-n05-qkv.cu)
+        list(APPEND FASTLLM_CUDA_SM90_SOURCES
+            src/devices/cuda/models/naive-n05-qkv.cu
+            src/devices/cuda/models/naive-n05-indexer.cu)
         set_property(SOURCE src/devices/cuda/models/naive-n05-kernels.cu
-            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_QKV_SM90)
+            APPEND PROPERTY COMPILE_DEFINITIONS
+                FASTLLM_ENABLE_NAIVE_QKV_SM90 FASTLLM_ENABLE_NAIVE_INDEXER_SM90)
     endif()
 
     # EP8 uses an isolated, pinned DeepGEMM source subset. Compile the kernel

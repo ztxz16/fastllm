@@ -10,6 +10,9 @@
 #ifdef FASTLLM_ENABLE_NAIVE_QKV_SM90
 #include "naive-n05-qkv.cuh"
 #endif
+#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
+#include "naive-n05-indexer.cuh"
+#endif
 #include <cuda_bf16.h>
 #include <nccl.h>
 #include <cuda_fp8.h>
@@ -2612,7 +2615,15 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
                 (const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
                 (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
                 topKOutput, stride, keys, queryStart);
-        } else {
+        }
+#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
+        else if (naive_indexer::Prepare()) {
+            naive_indexer::Launch((const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
+                (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
+                (float *)scores.cudaData, queries, keys, queryStart, stride);
+        }
+#endif
+        else {
             // TopK consumes only each row's causal prefix. Blocks beyond
             // the final query's prefix cannot contribute any selected key.
             const bool pipeline = FastllmCudaRuntimeArch() == 90;
