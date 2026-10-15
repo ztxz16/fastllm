@@ -461,6 +461,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
         src/devices/cuda/models/glm5-next-dsa.cpp
         src/devices/cuda/linear/fastllm-hybrid-bf16.cu
+        src/devices/cuda/models/glm5-hybrid-prefill.cu
         src/devices/cuda/models/dots3-note-kernels.cu
         src/devices/cuda/models/naive-n05-kernels.cu
         src/devices/cuda/models/naive-n05-experts.cu

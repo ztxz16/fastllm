@@ -7,6 +7,7 @@
 //
 
 #include "fastllm-cuda.cuh"
+#include "../fastllm-hybrid-prefill.cuh"
 #include "deepseekv41-reference.cuh"
 #include "fastllm.h"
 
@@ -2114,6 +2115,54 @@ namespace {
                 __float2bfloat16_rn(acc[k] * inverse[size_t(token) * heads + h + k]);
     }
 
+    // Stage a candidate tile once for 32 heads. The value recurrence retains
+    // the original candidate order and FP32 arithmetic, including skipped IDs.
+    __global__ void Glm5HybridPrefillValues(const __nv_bfloat16 *kv,
+            const int32_t *indices, const float2 *weights, const float *inverse,
+            int count, int cap, int heads, __nv_bfloat16 *output) {
+        constexpr int headTile = 32, candidateTile = 32, dimensions = 128;
+        const int row = blockIdx.z, head = blockIdx.x * headTile;
+        const int column = threadIdx.x % dimensions, group = threadIdx.x / dimensions;
+        indices += size_t(row) * count;
+        weights += (size_t(row) * heads + head) * count;
+        __shared__ float values[candidateTile][dimensions];
+        __shared__ float2 pairs[headTile][candidateTile];
+        __shared__ int ids[candidateTile];
+        float sums[headTile / 2] = {};
+        for (int first = 0; first < count; first += candidateTile) {
+            if (threadIdx.x < candidateTile) {
+                const int c = first + threadIdx.x, id = c < count ? indices[c] : -1;
+                ids[threadIdx.x] = id >= 0 && id < cap ? id : -1;
+            }
+            __syncthreads();
+            for (int i = threadIdx.x; i < candidateTile * dimensions; i += 256) {
+                const int c = i / dimensions, d = i % dimensions, id = ids[c];
+                values[c][d] = id >= 0 ? __bfloat162float(kv[size_t(id) * 512 + blockIdx.y * dimensions + d]) : 0.f;
+            }
+            for (int i = threadIdx.x; i < headTile * candidateTile; i += 256) {
+                const int c = i % candidateTile;
+                pairs[i / candidateTile][c] = ids[c] >= 0 ?
+                    weights[(i / candidateTile) * count + first + c] : make_float2(1.f, 0.f);
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int c = 0; c < candidateTile; ++c) if (ids[c] >= 0) {
+                const float value = values[c][column];
+                #pragma unroll
+                for (int a = 0; a < headTile / 2; ++a) {
+                    const float2 pair = pairs[group + 2 * a][c];
+                    sums[a] = sums[a] * pair.x + pair.y * value;
+                }
+            }
+            __syncthreads();
+        }
+        #pragma unroll
+        for (int a = 0; a < headTile / 2; ++a) {
+            const size_t h = size_t(row) * heads + head + group + 2 * a;
+            output[h * 512 + blockIdx.y * dimensions + column] = __float2bfloat16_rn(sums[a] * inverse[h]);
+        }
+    }
+
     // ---------------- SparseAttention（BF16 mma 版本，SM80+） ----------------
     //
     // Keep the checkpoint's 64-slot online softmax, BF16 probabilities and
@@ -3313,6 +3362,8 @@ bool FastllmCudaGlm5NextHybridSparseAttention(const fastllm::Data &query,
         query.dataDeviceIds != latent.dataDeviceIds || query.dataDeviceIds != indices.dataDeviceIds ||
         !V41IsSm75()) return false;
     const int tokens = query.dims[1], heads = query.dims[2], count = indices.dims[2];
+    if (tokens >= 128 && FastllmCudaGlm5HybridPrefillAttention(
+            query, latent, indices, scale, output)) return true;
     // Bound scratch independently of prompt length. Keep the reference dot,
     // denominator and PV accumulation order, including every BF16 boundary.
     const int batch = std::min(tokens, 16);
@@ -3338,7 +3389,11 @@ bool FastllmCudaGlm5NextHybridSparseAttention(const fastllm::Data &query,
         Glm5HybridAttentionWeights<<<dim3(heads, rows), 256>>>(scores, selected,
             count, latent.dims[1], heads, scale, weights, inverse);
         if (!V41CheckLaunch("GlmHybridAttentionWeights")) return false;
-        if (rows >= 8) {
+        if (tokens >= 64) {
+            Glm5HybridPrefillValues<<<dim3(heads / 32, 4, rows), 256>>>(
+                (const __nv_bfloat16 *)latent.cudaData, selected, weights, inverse,
+                count, latent.dims[1], heads, (__nv_bfloat16 *)output.cudaData + size_t(first) * heads * 512);
+        } else if (rows >= 8) {
             Glm5HybridAttentionValues<4, 8><<<dim3(heads / 4, 4, rows), 128>>>(
                 (const __nv_bfloat16 *)latent.cudaData, selected, weights, inverse,
                 count, latent.dims[1], heads, (__nv_bfloat16 *)output.cudaData + size_t(first) * heads * 512);
