@@ -617,15 +617,26 @@ __global__ void RestoreBalancedRows(int *indices, int tileElements) {
     }
 }
 
+// Hopper benefits from fewer radix passes; retain CUB's original setting
+// on other architectures where the larger digit's resource cost is unmeasured.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+constexpr int kCompactTopKRadixBits = 6;
+#else
+constexpr int kCompactTopKRadixBits = 4;
+#endif
+template<int Items>
+using CompactTopKSort = cub::BlockRadixSort<unsigned long long, 256, Items,
+    cub::NullType, kCompactTopKRadixBits>;
+
 // Keep all score bits but compress the inverse index to its actual width.
 // Skipping constant index bits reduces radix passes without changing score
 // order or lower-index tie breaking, including signed zero and NaNs.
 template<int Items>
 __device__ void SortTopKCompactRow(const unsigned long long *input, const int *ends,
         int *indices, int queries, int stride, int topK, int keyCount,
-        typename cub::BlockRadixSort<unsigned long long, 256, Items>::TempStorage &storage) {
+        typename CompactTopKSort<Items>::TempStorage &storage) {
     constexpr int Threads = 256;
-    using Sort = cub::BlockRadixSort<unsigned long long, Threads, Items>;
+    using Sort = CompactTopKSort<Items>;
     const int row = blockIdx.x, count = ends[queries + row] - row * stride;
     const int indexBits = 32 - __clz((unsigned)max(1, keyCount - 1));
     const unsigned mask = 0xffffffffu >> (32 - indexBits);
@@ -652,9 +663,9 @@ __device__ void SortTopKCompactRow(const unsigned long long *input, const int *e
 __global__ void SortTopKCompact(const unsigned long long *input, const int *ends,
         int *indices, int queries, int stride, int topK, int keyCount) {
     union Storage {
-        cub::BlockRadixSort<unsigned long long, 256, 8>::TempStorage small;
-        cub::BlockRadixSort<unsigned long long, 256, 12>::TempStorage medium;
-        cub::BlockRadixSort<unsigned long long, 256, 16>::TempStorage large;
+        CompactTopKSort<8>::TempStorage small;
+        CompactTopKSort<12>::TempStorage medium;
+        CompactTopKSort<16>::TempStorage large;
     };
     __shared__ Storage storage;
     const int count = ends[queries + blockIdx.x] - blockIdx.x * stride;
