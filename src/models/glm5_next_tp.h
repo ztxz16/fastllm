@@ -174,30 +174,30 @@ namespace fastllm {
 
     int Glm5NextModel::GetWeightLoadPriority(const std::string &name,
             const std::vector<std::pair<std::string, DataType>> &) const {
-        const int layer = StreamingThreadTpLayer(name);
+        const int layer = threadTpState ? StreamingThreadTpLayer(name) : StreamingHybridLayer(name);
         return layer < 0 ? 0 : layer - block_cnt - 1;
     }
 
     bool Glm5NextModel::ShouldLoadWeightSeriallyBeforeOthers(const std::string &name,
             const std::vector<std::pair<std::string, DataType>> &) const {
-        return StreamingThreadTpLayer(name) >= 0;
+        return (threadTpState ? StreamingThreadTpLayer(name) : StreamingHybridLayer(name)) >= 0;
     }
 
     void Glm5NextModel::OnWeightLoadGroupStarted(const std::set<std::string> &names) {
-        if (!threadTpState) return;
-        int &layer = threadTpState->loadingLayer;
+        int &layer = threadTpState ? threadTpState->loadingLayer : hybridLoadingLayer;
         layer = -1;
         for (const auto &name : names) {
-            const int current = StreamingThreadTpLayer(name);
+            const int current = threadTpState ? StreamingThreadTpLayer(name) : StreamingHybridLayer(name);
             if (current < 0) continue;
-            AssertInFastLLM(layer < 0 || layer == current, "GLM TP load group contains multiple layers.");
+            AssertInFastLLM(layer < 0 || layer == current, "GLM weight load group contains multiple layers.");
             layer = current;
         }
     }
 
     void Glm5NextModel::OnWeightLoadGroupFinished() {
 #ifdef USE_CUDA
-        if (!threadTpState || threadTpState->loadingLayer < 0) return;
+        if (!threadTpState) { StageHybridWeights(); return; }
+        if (threadTpState->loadingLayer < 0) return;
         const int layer = threadTpState->loadingLayer;
         threadTpState->loadingLayer = -1;
         // Join all loader workers before converting paired K/V tensors and

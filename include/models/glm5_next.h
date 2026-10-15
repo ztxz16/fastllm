@@ -115,6 +115,9 @@ namespace fastllm {
         ExecutionMode executionMode = ExecutionMode::Cpu;
         void InitExecutionMode();
         void PrepareHybridMoeCache();
+        int StreamingHybridLayer(const std::string &name) const;
+        void StageHybridWeights();
+        int hybridLoadingLayer = -1;
         bool TryForwardHybridChunkedPrefill(
                 const Data &inputIds, const Data &attentionMask,
                 std::vector<std::pair<Data, Data>> &pastKeyValues,

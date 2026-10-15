@@ -1,6 +1,10 @@
 // Independent host-expert forward: NUMA overlap, device groups and cache policy.
 #include "glm5_next.h"
 #include "glm5_next_tp_state.h"
+#include "glm5_next_gguf.h"
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include "blocks/baseblock.h"
 #include "utils.h"
 #include "utils/hybrid_moe.h"
@@ -194,6 +198,58 @@ namespace fastllm {
             std::swap(current, next);
         }
         // Two residual swaps per layer preserve caller-owned state.
+    }
+
+    int Glm5NextModel::StreamingHybridLayer(const std::string &name) const {
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        const auto arch = weight.dicts.find("gguf_architecture");
+        if (threadTpState || executionMode != ExecutionMode::Hybrid || GetLowMemMode() ||
+            arch == weight.dicts.end() ||
+            (arch->second != "glm5next" && arch->second != "glm5-next")) return -1;
+        const std::string prefix = languagePrefix + "layers.";
+        if (name.rfind(prefix, 0) != 0) return -1;
+        const char *start = name.c_str() + prefix.size();
+        char *end = nullptr;
+        const long layer = std::strtol(start, &end, 10);
+        if (end == start || *end != '.' || layer < 0 || layer >= block_cnt) return -1;
+        const std::string suffix(end + 1);
+        if (suffix.rfind("self_attn.", 0) != 0 &&
+            !(denseMlpLayers[layer] && suffix.rfind("mlp.", 0) == 0) &&
+            !(GetCudaSharedExpert() && suffix.rfind("mlp.shared_experts.", 0) == 0)) return -1;
+        const std::string device = SelectDeviceFromMap(deviceMap, layer + 1, block_cnt);
+        if (device != "cuda" && device.rfind("cuda:", 0) != 0) return -1;
+        std::map<int, int> ratios;
+        return ParseDeviceIds(device, "cuda", ratios).size() == 1 ? int(layer) : -1;
+#else
+        return -1;
+#endif
+    }
+
+    void Glm5NextModel::StageHybridWeights() {
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        if (hybridLoadingLayer < 0) return;
+        const int layer = hybridLoadingLayer;
+        hybridLoadingLayer = -1;
+        // Convert paired GGUF K/V tensors before uploading; the loader has
+        // joined the group's workers, and restoration consumes source names.
+        glm5_next_detail::RestoreGgufWeights(weight, layer + 1, num_attention_heads,
+            qkNopeHeadDim, valueHeadDim, kvLoraRank, layer);
+        std::map<int, int> ratios;
+        const auto devices = ParseDeviceIds(
+            SelectDeviceFromMap(deviceMap, layer + 1, block_cnt), "cuda", ratios);
+        const int previousDevice = FastllmCudaGetDevice();
+        for (auto &item : weight.weight) {
+            if (StreamingHybridLayer(item.first) != layer) continue;
+            Data &data = item.second;
+            if (data.dims.size() == 2 && data.GetBytes() >= (1ULL << 20) &&
+                data.isModelWeight && data.dataDevice == DataDevice::CPU && data.cpuData)
+                data.ToDevice(DataDevice::CUDA, devices);
+        }
+        FastllmCudaSetDevice(previousDevice);
+#if defined(__GLIBC__)
+        malloc_trim(0);
+#endif
+#endif
     }
 
     void Glm5NextModel::PrepareHybridMoeCache() {
