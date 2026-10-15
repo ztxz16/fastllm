@@ -2590,8 +2590,11 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         } else {
             // TopK consumes only each row's causal prefix. Blocks beyond
             // the final query's prefix cannot contribute any selected key.
-            naive_dsa_mma::IndexerScores<<<dim3((queryStart + queries + kKeys - 1) / kKeys,
-                (queries + kKeys - 1) / kKeys), kThreads>>>(
+            const bool pipeline = FastllmCudaRuntimeArch() == 90;
+            const int rows = pipeline ? 32 : 64;
+            auto kernel = pipeline ? naive_dsa_mma::IndexerScores<true> : naive_dsa_mma::IndexerScores<false>;
+            kernel<<<dim3((queryStart + queries + kKeys - 1) / kKeys,
+                (queries + rows - 1) / rows), rows * 4>>>(
                 (const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
                 (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
                 (float *)scores.cudaData, queries, keys, queryStart, stride);
