@@ -154,6 +154,12 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             bool fp8Query, fastllm::Data &indices);
 // Restore front/back-paired query shards after AllGather, in the same allocation.
 void FastllmCudaNaiveRestoreIndexerRows(fastllm::Data &indices, int ranks);
+// Consume front/back-paired Indexer rows directly. False leaves all inputs
+// untouched so callers can restore rows and use the ordinary attention path.
+bool FastllmCudaNaiveBalancedAttention(const fastllm::Data &query,
+    const fastllm::Data &key, const fastllm::Data &value,
+    const fastllm::Data &indices, const fastllm::Data &sink,
+    int heads, int kvHeads, int pastLength, int ranks, fastllm::Data &output);
 void FastllmCudaNaiveAttention(const fastllm::Data &query,
                               const fastllm::Data &key,
                               const fastllm::Data &value,

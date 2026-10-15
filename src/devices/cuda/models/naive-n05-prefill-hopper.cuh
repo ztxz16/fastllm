@@ -16,13 +16,18 @@ struct HopperStorage {
 __global__ __launch_bounds__(256) void Hopper(const BF *q,
         FastllmNaiveKV key, FastllmNaiveKV value, const int *indices,
         const float *sink, BF *out, int heads, int kvHeads, int stride,
-        int keys, int count, int past, bool causal) {
+        int keys, int count, int past, bool causal, int indexTile = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     using namespace naive_attention_bulk;
     constexpr int Tile = HopperStorage::Tile, Threads = 256;
     extern __shared__ __align__(16) char buffer[];
     auto &s = *(HopperStorage *)buffer;
     int row = blockIdx.x, head = blockIdx.y * 8, kh = head / (heads / kvHeads);
+    int indexRow = row;
+    if (indexTile) {
+        int rank = min(row, (int)gridDim.x - 1 - row) / indexTile;
+        indexRow = (2 * rank + (row >= gridDim.x / 2)) * indexTile + row % indexTile;
+    }
     int t = threadIdx.x, l = t % 32, w = t / 32;
     for (int i = t; i < 8 * 24; i += Threads)
         *(uint4 *)&s.qs[i / 24][i % 24 * 8] =
@@ -38,7 +43,7 @@ __global__ __launch_bounds__(256) void Hopper(const BF *q,
         // sorted or unique; keep their original stride and accumulation order.
         int last = 0;
         for (int slot = t; slot < count; slot += Threads) {
-            int key = indices[(size_t)row * count + slot];
+            int key = indices[(size_t)indexRow * count + slot];
             if (key >= 0 && key < keys && (!causal || key <= past + row))
                 last = slot + 1;
         }
@@ -54,7 +59,7 @@ __global__ __launch_bounds__(256) void Hopper(const BF *q,
     }
     for (int first = 0; first < activeCount; first += Tile) {
         Load<192,200,Tile,Threads>(s.tile.keys, s.selected, key, indices,
-            row, first, count, keys, past, causal, stride, kh);
+            row, first, count, keys, past, causal, stride, kh, indexRow);
         asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
         float dot[4] = {};
@@ -73,7 +78,7 @@ __global__ __launch_bounds__(256) void Hopper(const BF *q,
         }
         __syncthreads();
         Load<128,136,Tile,Threads>(s.tile.values, s.selected, value, indices,
-            row, first, count, keys, past, causal, kvHeads * 128, kh);
+            row, first, count, keys, past, causal, kvHeads * 128, kh, indexRow);
         float logits[Tile / 32], m = maximum;
         #pragma unroll
         for (int j = 0; j < Tile / 32; ++j) {

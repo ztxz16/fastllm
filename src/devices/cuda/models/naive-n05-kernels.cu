@@ -617,11 +617,12 @@ __global__ void RestoreBalancedRows(int *indices, int tileElements) {
 // Keep all score bits but compress the inverse index to its actual width.
 // Skipping constant index bits reduces radix passes without changing score
 // order or lower-index tie breaking, including signed zero and NaNs.
-__global__ void SortTopKCompact(const unsigned long long *input, const int *ends,
-                               int *indices, int queries, int stride, int topK, int keyCount) {
-    constexpr int Threads = 256, Items = 16;
+template<int Items>
+__device__ void SortTopKCompactRow(const unsigned long long *input, const int *ends,
+        int *indices, int queries, int stride, int topK, int keyCount,
+        typename cub::BlockRadixSort<unsigned long long, 256, Items>::TempStorage &storage) {
+    constexpr int Threads = 256;
     using Sort = cub::BlockRadixSort<unsigned long long, Threads, Items>;
-    __shared__ typename Sort::TempStorage storage;
     const int row = blockIdx.x, count = ends[queries + row] - row * stride;
     const int indexBits = 32 - __clz((unsigned)max(1, keyCount - 1));
     const unsigned mask = 0xffffffffu >> (32 - indexBits);
@@ -641,6 +642,25 @@ __global__ void SortTopKCompact(const unsigned long long *input, const int *ends
             indices[(size_t)row * topK + col] = col < count
                 ? (int)(mask - ((unsigned)keys[i] & mask)) : -1;
     }
+}
+
+// Candidate selection still has 4096 slots. Sort only the populated range;
+// shrinking selection itself would add radix passes on long or tied rows.
+__global__ void SortTopKCompact(const unsigned long long *input, const int *ends,
+        int *indices, int queries, int stride, int topK, int keyCount) {
+    union Storage {
+        cub::BlockRadixSort<unsigned long long, 256, 8>::TempStorage small;
+        cub::BlockRadixSort<unsigned long long, 256, 12>::TempStorage medium;
+        cub::BlockRadixSort<unsigned long long, 256, 16>::TempStorage large;
+    };
+    __shared__ Storage storage;
+    const int count = ends[queries + blockIdx.x] - blockIdx.x * stride;
+    if (count <= 2048)
+        SortTopKCompactRow<8>(input, ends, indices, queries, stride, topK, keyCount, storage.small);
+    else if (count <= 3072)
+        SortTopKCompactRow<12>(input, ends, indices, queries, stride, topK, keyCount, storage.medium);
+    else
+        SortTopKCompactRow<16>(input, ends, indices, queries, stride, topK, keyCount, storage.large);
 }
 
 template <typename Output>
@@ -2705,6 +2725,54 @@ void FastllmCudaNaiveVerifyAttention(const fastllm::Data &query,
     }
 }
 
+static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
+        const fastllm::Data &key, const fastllm::Data &value,
+        const fastllm::Data &indices, const fastllm::Data &sink,
+        int heads, int kvHeads, int pastLength, bool causal, int indexTile,
+        fastllm::Data &output) {
+    using namespace fastllm;
+    namespace mma = naive_prefill_mma;
+    const int queries = query.dims[1], keys = key.dims[1];
+    const int count = indices.dims.empty() ? keys : indices.dims[1];
+    if (count <= 0 || count > 2048 || (size_t)query.cudaData % 16 != 0) return false;
+    auto kernel = mma::Generic<2048>;
+    size_t shared = sizeof(mma::Storage<2048>);
+    if (FastllmCudaRuntimeArch() == 90 &&
+        BulkKernelSupported(mma::Hopper, sizeof(mma::HopperStorage), 90)) {
+        kernel = mma::Hopper;
+        shared = sizeof(mma::HopperStorage);
+    }
+    if (!BulkKernelSupported(kernel, shared, 80)) return false;
+    Output(output, BFLOAT16, {1, queries, heads * 128});
+    kernel<<<dim3(queries, heads / 8), 256, shared>>>(
+        (const BF16 *)query.cudaData, FastllmNaiveKV(key), FastllmNaiveKV(value),
+        indices.dims.empty() ? nullptr : (const int *)indices.cudaData,
+        sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+        (BF16 *)output.cudaData, heads, kvHeads, key.dims[2], keys, count,
+        pastLength, causal, indexTile);
+    CheckLaunch();
+    return true;
+}
+
+bool FastllmCudaNaiveBalancedAttention(const fastllm::Data &query,
+        const fastllm::Data &key, const fastllm::Data &value,
+        const fastllm::Data &indices, const fastllm::Data &sink,
+        int heads, int kvHeads, int pastLength, int ranks, fastllm::Data &output) {
+    using namespace fastllm;
+    if ((ranks != 2 && ranks != 4 && ranks != 8) || heads <= 0 || kvHeads <= 0 ||
+        heads != kvHeads * 8 || query.dims.size() != 3 || query.dims[0] != 1 ||
+        query.dims[1] < 32 || query.dims[1] % (2 * ranks) != 0 || query.dims[2] != heads * 192 ||
+        key.dims.size() != 3 || value.dims.size() != 3 || key.dims[0] != 1 || value.dims[0] != 1 ||
+        key.dims[1] <= 0 || value.dims[1] != key.dims[1] || key.dims[2] < kvHeads * 192 ||
+        key.dims[2] % 8 != 0 || value.dims[2] != kvHeads * 128 ||
+        indices.dims.size() != 2 || indices.dims[0] != query.dims[1] ||
+        indices.dataType != INT32 || query.dataType != BFLOAT16 ||
+        !FastllmNaiveKVType(key.dataType) || !FastllmNaiveKVType(value.dataType) ||
+        (size_t)key.cudaData % 16 != 0 || (size_t)value.cudaData % 16 != 0) return false;
+    return LaunchNaivePrefillAttention(query, key, value, indices, sink,
+        heads, kvHeads, pastLength, true, query.dims[1] / (2 * ranks), output);
+}
+
 void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &key,
                               const fastllm::Data &value, const fastllm::Data &indices,
                               const fastllm::Data &sink, int heads, int kvHeads,
@@ -2776,25 +2844,8 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         heads / kvHeads == naive_prefill::Heads && dim == naive_prefill::QkDim &&
         valueDim == naive_prefill::ValueDim && key.dims[2] % 8 == 0 &&
         (size_t)key.cudaData % 16 == 0 && (size_t)value.cudaData % 16 == 0;
-    if (tiledPrefill && count <= 2048 && (size_t)query.cudaData % 16 == 0) {
-        namespace mma = naive_prefill_mma;
-        // Select by architecture and available shared memory, never timing.
-        auto kernel = mma::Generic<2048>;
-        size_t shared = sizeof(mma::Storage<2048>);
-        if (FastllmCudaRuntimeArch() == 90 &&
-            BulkKernelSupported(mma::Hopper, sizeof(mma::HopperStorage), 90)) {
-            kernel = mma::Hopper;
-            shared = sizeof(mma::HopperStorage);
-        }
-        if (BulkKernelSupported(kernel, shared, 80)) {
-            kernel<<<dim3(queries, heads / naive_prefill::Heads), 256, shared>>>(
-                (const BF16 *)query.cudaData, FastllmNaiveKV(key), FastllmNaiveKV(value),
-                selected, sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
-                (BF16 *)output.cudaData, heads, kvHeads, key.dims[2], keys, count, pastLength, causal);
-            CheckLaunch();
-            return;
-        }
-    }
+    if (tiledPrefill && LaunchNaivePrefillAttention(query, key, value, indices, sink,
+            heads, kvHeads, pastLength, causal, 0, output)) return;
     Data scores;
     Output(scores, DataType::FLOAT32, {queries, heads, count});
     if (tiledPrefill) {

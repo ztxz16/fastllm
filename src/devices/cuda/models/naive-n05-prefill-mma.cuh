@@ -21,10 +21,11 @@ template<int Max> struct Storage {
 template<int Width, int Pitch, int Tile, int Threads>
 __device__ inline void Load(BF (*dst)[Pitch], int *selected, FastllmNaiveKV kv,
         const int *indices, int query, int first, int count, int keys,
-        int past, bool causal, int stride, int head) {
+        int past, bool causal, int stride, int head, int indexRow) {
     int t = threadIdx.x;
     if (t < Tile) {
-        int key = naive_prefill::Key(indices, query, first + t, count, keys, past, causal);
+        int key = first + t < count ? (indices ? indices[(size_t)indexRow * count + first + t] : first + t) : -1;
+        if (key >= keys || (causal && key > past + query)) key = -1;
         // Translate each selected row once, then share it across vector loads.
         selected[t] = key >= 0 ? kv.PhysicalRow(key) : -1;
     }
@@ -42,13 +43,18 @@ template<int Max>
 __global__ __launch_bounds__(256) void Generic(const BF *q,
         FastllmNaiveKV key, FastllmNaiveKV value, const int *indices,
         const float *sink, BF *out, int heads, int kvHeads, int stride,
-        int keys, int count, int past, bool causal) {
+        int keys, int count, int past, bool causal, int indexTile = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_attention_bulk;
     constexpr int Tile = Storage<Max>::Tile, Threads = 256;
     extern __shared__ __align__(16) char buffer[];
     auto &s = *(Storage<Max> *)buffer;
     int row = blockIdx.x, head = blockIdx.y * 8, kh = head / (heads / kvHeads);
+    int indexRow = row;
+    if (indexTile) {
+        int rank = min(row, (int)gridDim.x - 1 - row) / indexTile;
+        indexRow = (2 * rank + (row >= gridDim.x / 2)) * indexTile + row % indexTile;
+    }
     int t = threadIdx.x, l = t % 32, w = t / 32;
     for (int i = t; i < 8 * 24; i += Threads)
         *(uint4 *)&s.qs[i / 24][i % 24 * 8] =
@@ -56,7 +62,7 @@ __global__ __launch_bounds__(256) void Generic(const BF *q,
     const int ar = (l & 7) + ((l >> 3) & 1) * 8, ac = (l >> 4) * 8;
     for (int first = 0; first < count; first += Tile) {
         Load<192,200,Tile,Threads>(s.tile.keys, s.selected, key, indices,
-            row, first, count, keys, past, causal, stride, kh);
+            row, first, count, keys, past, causal, stride, kh, indexRow);
         asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
         float acc[4] = {};
@@ -81,7 +87,7 @@ __global__ __launch_bounds__(256) void Generic(const BF *q,
     float acc[4] = {};
     for (int first = 0; first < count; first += Tile) {
         Load<128,136,Tile,Threads>(s.tile.values, s.selected, value, indices,
-            row, first, count, keys, past, causal, kvHeads * 128, kh);
+            row, first, count, keys, past, causal, kvHeads * 128, kh, indexRow);
         asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
         #pragma unroll

@@ -833,6 +833,7 @@ Data NaiveN05FlashModel::RunTarget(
             }
             Data noIndices;
             Data *selected = &noIndices;
+            int balancedIndexRanks = 0;
             if (!slidingLayers[layer] && (decodeWorkspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
                 if (!batchIndexerPrepared) {
                     Data rowIndexQ, rowIndexWeights;
@@ -886,7 +887,7 @@ Data NaiveN05FlashModel::RunTarget(
                                     localPast + first, indexTopK, indexFp8, localIndices);
                             }
                             FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, indices);
-                            if (balanced) FastllmCudaNaiveRestoreIndexerRows(indices, ranks);
+                            if (balanced) balancedIndexRanks = ranks;
                         }
                         else FastllmCudaNaiveIndexer(indexQ, indexWeights, pastKey, indexHeads, indexDim,
                                                     localPast, indexTopK, indexFp8, indices);
@@ -936,9 +937,14 @@ Data NaiveN05FlashModel::RunTarget(
                     FastllmCudaNaiveVerifyAttention(q, pastKey, pastValue, *selected, sink,
                         cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                         localPast, slidingLayers[layer] ? window : 0, attn);
-                else FastllmCudaNaiveAttention(q, pastKey, pastValue, *selected, sink,
-                                               cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
-                                               localPast, slidingLayers[layer] ? window : 0, attn);
+                else if (!balancedIndexRanks || !FastllmCudaNaiveBalancedAttention(
+                        q, pastKey, pastValue, *selected, sink, cfg.heads, cfg.kvHeads,
+                        localPast, balancedIndexRanks, attn)) {
+                    if (balancedIndexRanks) FastllmCudaNaiveRestoreIndexerRows(*selected, balancedIndexRanks);
+                    FastllmCudaNaiveAttention(q, pastKey, pastValue, *selected, sink,
+                        cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                        localPast, slidingLayers[layer] ? window : 0, attn);
+                }
                 if (slidingLayers[layer] && !verifying)
                     FastllmCudaNaiveTrimCache(pastKey, pastValue, window - 1);
                 if (ringCache && !verifying)
