@@ -22,6 +22,21 @@
 
 namespace fastllm {
     namespace {
+        static void SplitPrefillInput(const Data &input, int start, int count, Data &output) {
+            // Keep host token/position metadata on the host while chunking.
+            // Dispatching Split to GPU0 makes TP workers clone and peer-copy
+            // each chunk, introducing cross-device synchronization before use.
+            if (input.dataDevice == DataDevice::CPU && input.dataType == FLOAT32 &&
+                input.dims.size() == 2 && input.dims[0] == 1 && input.cpuData &&
+                input.strides.size() == 2 && input.strides[1] == 1) {
+                Data view(FLOAT32, {1, count}, DataDevice::CPU,
+                          input.cpuData + (size_t)start * sizeof(float));
+                output.CopyFrom(view);
+            } else {
+                Split(input, 1, start, start + count, output);
+            }
+        }
+
         static bool NeedRepeatPenalty(const GenerationConfig &config) {
             float diff = config.repeat_penalty - 1.0f;
             return diff > 1e-6f || diff < -1e-6f;
@@ -2568,7 +2583,7 @@ namespace fastllm {
                         }
                         auto chunkStartTime = std::chrono::system_clock::now();
                         Data curInput, curPositionIds;
-                        Split(inputIds, 1, st, st + curLen, curInput);
+                        SplitPrefillInput(inputIds, st, curLen, curInput);
                         {
                             curPositionIds.dataType = positionIds[0]->dataType;
                             curPositionIds.Resize({1, curLen});
@@ -3224,8 +3239,8 @@ namespace fastllm {
                                         auto chunkStartTime = std::chrono::steady_clock::now();
                                         int curLen = std::min(st == 0 ? first : part, len - st);
                                         Data curInput, curPositionIds;
-                                        Split(inputIds, 1, st, st + curLen, curInput);
-                                        Split(*positionIds[0], 1, st, st + curLen, curPositionIds);
+                                        SplitPrefillInput(inputIds, st, curLen, curInput);
+                                        SplitPrefillInput(*positionIds[0], st, curLen, curPositionIds);
 
                                         ret = std::vector <int> {model->Forward(curInput, Data(), curPositionIds,
                                             *pastKeyValue1, generationConfigs[0], tokensManager, logits[0])};
