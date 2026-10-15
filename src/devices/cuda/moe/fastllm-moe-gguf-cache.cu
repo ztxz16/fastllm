@@ -625,12 +625,25 @@ template<ggml_type Type> constexpr size_t BlockBytes() {
     return sizeof(block_iq4_xs);
 }
 
+#include "fastllm-moe-glm5-k.cuh"
+
 // Read NUMA's interleaved/R4 rows without materializing canonical weights.
 // Preserve the canonical decoder's per-lane FMA and warp reduction order;
 // GLM's Q8_K/BF16 arithmetic is distinct from the ordinary Q8_1 projections.
-template<ggml_type Type, typename T>
+template<ggml_type Type, typename T, bool Vector = false>
 __device__ __forceinline__ float NumaDot(const uint8_t *record, int row,
         size_t pitch, int storageType, const T *input, int columns, int warp, int warps) {
+#if __CUDA_ARCH__ == 750
+    if constexpr (Vector && std::is_same_v<T, float> && (Type == GGML_TYPE_Q2_K || Type == GGML_TYPE_Q3_K || Type == GGML_TYPE_Q4_K)) {
+        // Cache allocations are aligned; retain the scalar path for external
+        // views into a workspace or weight buffer with a smaller alignment.
+        if ((reinterpret_cast<uintptr_t>(input) % 16 | reinterpret_cast<uintptr_t>(record) % 4) == 0) {
+            if (storageType >= 0 && storageType != Type)
+                return KDotVector<Type, true>(record, row, pitch, input, columns, warp, warps);
+            return KDotVector<Type, false>(record, row, pitch, input, columns, warp, warps);
+        }
+    }
+#endif
     if constexpr (Type == GGML_TYPE_Q2_K || Type == GGML_TYPE_Q3_K || Type == GGML_TYPE_Q4_K) {
         if (storageType >= 0 && storageType != Type) {
             const auto *blocks = record + size_t(row/4)*4*pitch;
@@ -766,9 +779,9 @@ __global__ void Gate(const float *input, __nv_bfloat16 *activation,
     const size_t pitch = size_t(view.hidden / QK_K) * BlockBytes<Type>();
     const int warp = threadIdx.x / 32;
     const int storage = NumaType<true>(view);
-    float gate = NumaDot<Type>(record, storage >= 0 ? 2 * row : row,
+    float gate = NumaDot<Type, float, std::is_same_v<View, FastllmCudaMoeGGUFCacheView>>(record, storage >= 0 ? 2 * row : row,
         pitch, storage, input, view.hidden, warp, 4);
-    float up = NumaDot<Type>(record, storage >= 0 ? 2 * row + 1 : row + view.inter / (Tp ? 2 : 1),
+    float up = NumaDot<Type, float, std::is_same_v<View, FastllmCudaMoeGGUFCacheView>>(record, storage >= 0 ? 2 * row + 1 : row + view.inter / (Tp ? 2 : 1),
         pitch, storage, input, view.hidden, warp, 4);
     __shared__ float gates[4], ups[4];
     if (threadIdx.x % 32 == 0) { gates[warp] = gate; ups[warp] = up; }
@@ -790,7 +803,7 @@ __global__ void Down(const T *activation, float *output, View view, int rank = 0
     if (row >= view.hidden) return;
     const auto *record = ExpertWeight<false>(view, route);
     const size_t pitch = size_t(view.inter / QK_K) * BlockBytes<Type>();
-    const float value = record ? NumaDot<Type>(record, row, pitch, NumaType<false>(view),
+    const float value = record ? NumaDot<Type, T, std::is_same_v<View, FastllmCudaMoeGGUFCacheView>>(record, row, pitch, NumaType<false>(view),
         activation + size_t(route) * view.inter, view.inter, 0, 1) : 0;
     if (threadIdx.x % 32 == 0)
         output[size_t(OriginalRoute(view, route)) * view.hidden + row + (Tp ? rank * (view.hidden / 2) : 0)] =
