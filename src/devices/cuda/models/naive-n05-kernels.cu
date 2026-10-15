@@ -686,6 +686,28 @@ __global__ void Rope(BF16 *data, const float *positions, int heads, int dim,
     RopeHead(data + (size_t)row * dim, positions[row / heads], rotaryDim, theta);
 }
 
+// Share RoPE frequencies across heads when prefill has enough independent tokens.
+__global__ void RopeToken(BF16 *data, const float *positions, int heads, int dim,
+                          int rotaryDim, float theta) {
+    __shared__ float cosine[128], sine[128];
+    const int token = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
+    if (t < rotaryDim / 2) {
+        float angle = positions[token] * powf(theta, -2.0f * t / rotaryDim);
+        cosine[t] = RoundBF16(cosf(angle));
+        sine[t] = RoundBF16(sinf(angle));
+    }
+    __syncthreads();
+    for (int head = warp; head < heads; head += 8) {
+        BF16 *x = data + ((size_t)token * heads + head) * dim;
+        for (int d = lane; d < rotaryDim / 2; d += 32) {
+            float a = (float)x[d], b = (float)x[d + rotaryDim / 2];
+            float c = cosine[d], s = sine[d];
+            x[d] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
+            x[d + rotaryDim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
+        }
+    }
+}
+
 // Each CTA owns one head. Packed projection input is unpacked while rotating
 // Q/K and scaling V, without intermediate Split kernels.
 template <bool Packed>
@@ -2226,9 +2248,12 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
 void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
                          int heads, int dim, int rotaryDim, float theta) {
     fastllm::AssertInFastLLM(input.dataType == fastllm::DataType::BFLOAT16 &&
-                            rotaryDim > 0 && rotaryDim % 2 == 0 && rotaryDim <= dim,
+                            heads > 0 && rotaryDim > 0 && rotaryDim % 2 == 0 && rotaryDim <= dim,
                             "Invalid Naive-N0.5 RoPE input.");
-    Rope<<<input.Count(0) / dim, 128>>>((BF16 *)input.cudaData,
+    const uint64_t rows = input.Count(0) / dim / heads;
+    const bool tokenRope = rows >= 512 && heads >= 8 && rotaryDim <= 256;
+    auto kernel = tokenRope ? RopeToken : Rope;
+    kernel<<<tokenRope ? rows : rows * heads, tokenRope ? 256 : 128>>>((BF16 *)input.cudaData,
         (const float *)positions.cudaData, heads, dim, rotaryDim, theta);
     CheckLaunch();
 }

@@ -667,7 +667,7 @@ Data NaiveN05FlashModel::RunTarget(
             Data &indexKey = buf.indexKey;
             const std::string ip = ap + "indexer.";
             if (!alreadyProjected) Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
-            if (decodeWorkspace && FastllmCudaNaiveIndexerKeyNorm(indexKey,
+            if (FastllmCudaNaiveIndexerKeyNorm(indexKey,
                     localWeight(ip + "k_norm.weight"), localWeight(ip + "k_norm.bias"))) return;
             // LayerNorm accumulates in FP32; the generic CUDA operation does
             // not accept BF16 storage, so round only its final result.
