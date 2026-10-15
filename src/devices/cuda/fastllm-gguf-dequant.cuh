@@ -1,6 +1,9 @@
 #pragma once
 
 #include "fastllm-cuda.cuh"
+#ifndef USE_ROCM
+#include "fastllm-hybrid-prefill.cuh"
+#endif
 #include "gguf.h"
 
 #include <cuda_bf16.h>
@@ -115,6 +118,12 @@ void FastllmGGUFDequantGemm(const T *input, const fastllm::Data &weight,
         const int rows = std::min(chunkRows, k - offset);
         dequant(static_cast<const char *>(weight.cudaData) + (size_t)offset * srcRowBytes,
                 dequantized, rows, m, stream);
+#ifndef USE_ROCM
+        if constexpr (!fp16) {
+            if (FastllmCudaHybridBf16Gemm(input, dequantized, output + offset,
+                    n, m, rows, k, handle)) continue;
+        }
+#endif
         // Each token retains the full k-column output stride across chunks.
         const cublasStatus_t status = cublasGemmEx(
                 handle, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, m,

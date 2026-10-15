@@ -1,5 +1,6 @@
 #include "devices/cuda/glm5-next-cuda.cuh"
 #include "fastllm-cuda.cuh"
+#include "../fastllm-hybrid-prefill.cuh"
 #include "fastllm.h"
 
 #include <algorithm>
@@ -3451,6 +3452,48 @@ __global__ void DeepSeekV4HcPreDotsBlockKernel(const XT *x, const WT *w, float *
     }
 }
 
+template<typename XT, typename WT>
+__global__ void Glm5HybridHcPreDotsKernel(const XT *x, const WT *w, float *dots,
+        int tokens, int flatDim, int mixHc, int dotsStride, int dotParts) {
+    const int lane = threadIdx.x % 32;
+    const int task = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (task >= tokens * dotsStride * dotParts) return;
+    const int idx = task / dotParts, part = task % dotParts;
+    const int m = idx % dotsStride, token = idx / dotsStride;
+    const int begin = int(uint64_t(flatDim) * part / dotParts);
+    const int end = int(uint64_t(flatDim) * (part + 1) / dotParts);
+    const XT *input = x + size_t(token) * flatDim;
+    float partial[8] = {};
+    if (m == mixHc) {
+        for (int first = begin; first < end; first += 256) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int k = first + lane + 32 * j;
+                if (k < end) {float value = Dsv4ToFloat(input[k]); partial[j] += value * value;}
+            }
+        }
+    } else {
+        const WT *weight = w + size_t(m) * flatDim;
+        for (int first = begin; first < end; first += 512) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int k = first + 2 * (lane + 32 * j);
+                if (k + 1 < end) partial[j] += Dsv4PairDot(input, weight, k);
+            }
+        }
+    }
+    // The eight registers represent lanes t, t+32, ... of the original
+    // 256-thread block. Retain its 128,64,32,16,... binary reduction tree.
+#pragma unroll
+    for (int j = 0; j < 4; ++j) partial[j] += partial[j + 4];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) partial[j] += partial[j + 2];
+    float sum = partial[0] + partial[1];
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffff, sum, offset);
+    if (lane == 0) dots[task] = sum;
+}
+
 template <typename XT>
 __global__ void DeepSeekV4HcPreSqSumKernel(const XT *x, float *dots,
                                            int tokens, int flatDim, int dotsStride) {
@@ -6181,6 +6224,7 @@ bool DeepSeekV4LaunchHcPostByOutput(const fastllm::Data &x, const fastllm::Data 
     int threads = 256;
     const XT *xData = (const XT *)x.cudaData;
     const RT *resData = (const RT *)residual.cudaData;
+    if (FastllmCudaHybridHcPost(x, residual, cudaPost, cudaComb, output, tokens, hcMult, dim)) return true;
 
     int hcPost4MinTokens = 16384;
     if (const char *env = std::getenv("FASTLLM_DSV4_HCPOST4_MIN_TOKENS")) {
@@ -7574,12 +7618,13 @@ static bool DeepSeekV4HcPreNormImpl(const fastllm::Data &x,
                                                 float eps, float normEps,
                                                 fastllm::Data &normOutput,
                                                 fastllm::Data &post,
-                                                fastllm::Data &comb, bool roundBeforeWeight) {
+                                                fastllm::Data &comb, bool roundBeforeWeight,
+                                                bool hybridPrefill = false) {
     // The fused finish processes each row independently. Cover small decode
     // batches, including shrinking batches, and eight-row target verification.
     const bool supportedRows =
         x.dims.size() == 4 && x.dims[0] == 1 &&
-        x.dims[1] >= 1 && x.dims[1] <= 8;
+        x.dims[1] >= 1 && (x.dims[1] <= 8 || (hybridPrefill && x.dims[1] >= 64));
     if (x.dataDevice != fastllm::DataDevice::CUDA ||
         hcFn.dataDevice != fastllm::DataDevice::CUDA ||
         hcScale.dataDevice != fastllm::DataDevice::CUDA ||
@@ -7626,6 +7671,12 @@ static bool DeepSeekV4HcPreNormImpl(const fastllm::Data &x,
     int dotThreads = 256;
     int dotBlocks = tokens * dotsStride * dotParts;
     auto launchDots = [&](const auto *fn) {
+        if (hybridPrefill) {
+            Glm5HybridHcPreDotsKernel<<<(dotBlocks + 7) / 8, 256>>>(
+                (const __nv_bfloat16 *)x.cudaData, fn, dots, tokens, flatDim,
+                mixHc, dotsStride, dotParts);
+            return;
+        }
         DeepSeekV4HcPreDotsBlockKernel<<<dotBlocks, dotThreads,
                                          dotThreads * sizeof(float)>>>(
             (const __nv_bfloat16 *)x.cudaData, fn, dots, tokens, flatDim,
@@ -7665,6 +7716,16 @@ bool FastllmCudaGlm5NextHcPreNorm(
         fastllm::Data &post, fastllm::Data &comb) {
     return DeepSeekV4HcPreNormImpl(x, fn, scale, base, norm, hcMult, iters,
         eps, normEps, output, post, comb, true);
+}
+
+bool FastllmCudaGlm5NextHybridHcPreNorm(
+        const fastllm::Data &x, fastllm::Data &fn, fastllm::Data &scale,
+        fastllm::Data &base, fastllm::Data &norm, int hcMult, int iters,
+        float eps, float normEps, fastllm::Data &output,
+        fastllm::Data &post, fastllm::Data &comb) {
+    if (x.dims.size() != 4 || x.dims[1] < 64 || FastllmCudaRuntimeArch() != 75) return false;
+    return DeepSeekV4HcPreNormImpl(x, fn, scale, base, norm, hcMult, iters,
+        eps, normEps, output, post, comb, true, true);
 }
 
 extern "C" bool FastllmCudaDeepSeekV4HcPostPreNorm(

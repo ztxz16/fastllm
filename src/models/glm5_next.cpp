@@ -263,18 +263,24 @@ namespace fastllm {
 
         void Glm5NextHcPreNorm(Data &input, Data &fn, Data &scale,
                 Data &base, Data &norm, int hcMult, int sinkhornIters,
-                float eps, float normEps, Data &output, Data &post, Data &comb) {
+                float eps, float normEps, Data &output, Data &post, Data &comb,
+                bool hybrid = false) {
 #ifdef USE_CUDA
             auto *executor = static_cast<Executor*>(GetExecutor());
+            const bool prefill = hybrid && input.dims.size() == 4 && input.dims[1] >= 64;
             if (input.dims.size() == 4 && input.dims[0] == 1 &&
-                input.dims[1] >= 1 && input.dims[1] <= 8 &&
+                input.dims[1] >= 1 && (input.dims[1] <= 8 || prefill) &&
                 input.dims[2] == 4 && input.dims[3] == 4096 &&
                 executor->GetFirstDeviceType() == "cuda") {
                 const auto devices = executor->GetDeviceIds("cuda");
                 for (Data *x : {&input, &fn, &scale, &base, &norm})
                     x->ToDevice(DataDevice::CUDA, devices);
                 FastllmCudaSetDevice(GetPointerDeviceId(input.cudaData));
-                if (FastllmCudaGlm5NextHcPreNorm(input, fn, scale, base, norm,
+                auto run = FastllmCudaGlm5NextHcPreNorm;
+#ifndef USE_ROCM
+                if (prefill) run = FastllmCudaGlm5NextHybridHcPreNorm;
+#endif
+                if (run(input, fn, scale, base, norm,
                         hcMult, sinkhornIters, eps, normEps, output, post, comb)) return;
             }
 #endif
@@ -3701,7 +3707,7 @@ namespace fastllm {
                 weight[prefix + "hc_attn_base"],
                 weight[prefix + "input_layernorm.weight"], hcMult,
                 hcSinkhornIters, hcEps, rms_norm_eps,
-                normalizedAttention, attentionPost, attentionComb);
+                normalizedAttention, attentionPost, attentionComb, executionMode == ExecutionMode::Hybrid);
             Data attentionOutput;
             if (kdaLayers[layer]) {
                 RunKdaAttention(layer, normalizedAttention, sequence, requestCaches,
@@ -3748,7 +3754,7 @@ namespace fastllm {
             weight[prefix + "hc_ffn_base"],
             weight[prefix + "post_attention_layernorm.weight"], hcMult,
             hcSinkhornIters, hcEps, rms_norm_eps,
-            normalizedFfn, ffnPost, ffnComb);
+            normalizedFfn, ffnPost, ffnComb, executionMode == ExecutionMode::Hybrid);
     }
 
     void Glm5NextModel::FinishFfnBlock(

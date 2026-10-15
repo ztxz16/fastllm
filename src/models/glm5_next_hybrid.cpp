@@ -12,6 +12,9 @@
 #include "devices/disk/diskdevice.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
+#ifndef USE_ROCM
+#include "devices/cuda/fastllm-cuda-hybrid-prefill.h"
+#endif
 #endif
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
@@ -149,6 +152,9 @@ namespace fastllm {
             std::vector<Glm5NextIndexerCache> *indexer, HybridPrefillContext *prefill) {
         const int sequence = hiddenStates.dims[1];
         const int batch = (int)requestCaches.size();
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        FastllmCudaHybridPrefillScope prefillMath(batch == 1 && sequence >= 1024);
+#endif
         AssertInFastLLM(batch == 1 || (batch == sequence &&
             kdaReplay == nullptr && indexer == nullptr),
             "GLM-5.3 batched layers require one decode token per request.");

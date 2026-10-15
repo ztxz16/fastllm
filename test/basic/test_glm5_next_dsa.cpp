@@ -1,4 +1,6 @@
 #include "../../src/models/glm5_next_dsa.h"
+#include "../../src/devices/cuda/fastllm-hybrid-prefill.cuh"
+#include "devices/cuda/fastllm-cuda-hybrid-prefill.h"
 #include "executor.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
@@ -472,6 +474,28 @@ void DecodeSmallGemv() {
     std::puts("PASS short BF16 GEMV exact against original 256-thread multirow path");
 }
 
+void HybridHcPrefill() {
+    constexpr int dim = 4096, flat = 4 * dim, mix = 24;
+    std::vector<float> fn(mix * flat), scale = {.8f, .6f, .7f}, base(mix), norm(dim);
+    for (int i = 0; i < mix * flat; ++i) fn[i] = Pattern(i / flat, i % flat) / 256;
+    for (int i = 0; i < mix; ++i) base[i] = Pattern(i, 3) / 16;
+    for (int i = 0; i < dim; ++i) norm[i] = 1 + Pattern(i, 4) / 16;
+    for (int rows : {64, 129, 512}) for (auto type : {FLOAT32, BFLOAT16}) {
+        std::vector<float> x(rows * flat);
+        for (int i = 0; i < rows * flat; ++i) x[i] = Pattern(i / 128, i % 128);
+        Data input, w, sc, ba, n, mixed, post, comb, reference, out, fastPost, fastComb;
+        Upload(input, {1, rows, 4, dim}, x); Upload(w, {mix, flat}, fn, type);
+        Upload(sc, {3}, scale, FLOAT32); Upload(ba, {mix}, base, FLOAT32); Upload(n, {dim}, norm, FLOAT32);
+        Check(FastllmCudaDeepSeekV4HcPre(input, w, sc, ba, 4, 20, 1e-6f, 1e-6f, mixed, post, comb), "HC prefill reference");
+        KimiK3RMSNorm(mixed, n, 1e-6f, reference);
+        Check(FastllmCudaGlm5NextHybridHcPreNorm(input, w, sc, ba, n, 4, 20, 1e-6f, 1e-6f, out, fastPost, fastComb), "HC hybrid prefill");
+        Check(Download(reference) == Download(out), "HC hybrid prefill output differs");
+        Check(Download(post) == Download(fastPost), "HC hybrid prefill post differs");
+        Check(Download(comb) == Download(fastComb), "HC hybrid prefill comb differs");
+    }
+    std::puts("PASS hybrid HC prefill: output, post and comb exact");
+}
+
 bool HybridSm75Attention() {
     int major = 0, minor = 0, device = 0;
     cudaGetDevice(&device);
@@ -520,6 +544,94 @@ bool HybridSm75Attention() {
         std::printf("PASS hybrid sparse device=%d heads=%d rows=%d old_max=%.8g fp64_max=%.8g\n", device, heads, rows, maximum, referenceError);
     }
     return true;
+}
+
+void HybridBf16Prefill() {
+    constexpr int rows = 1024, columns = 136, width = 128, stride = 136;
+    std::vector<float> x(rows * columns), w(width * columns);
+    for (int i = 0; i < int(x.size()); ++i) x[i] = F(Bf(Pattern(i / columns, i % columns)));
+    for (int i = 0; i < int(w.size()); ++i) w[i] = F(Bf(Pattern(i / columns + 23, i % columns)));
+    Data input, weight, output;
+    Upload(input, {rows, columns}, x);
+    Upload(weight, {width, columns}, w);
+    Upload(output, {rows, stride}, std::vector<float>(rows * stride, 19.f));
+    auto handle = getFastllmCublasHandle();
+    auto run = [&]() {
+        return FastllmCudaHybridBf16Gemm(static_cast<const __nv_bfloat16 *>(input.cudaData),
+            static_cast<const __nv_bfloat16 *>(weight.cudaData),
+            static_cast<__nv_bfloat16 *>(output.cudaData), rows, columns, width, stride, handle);
+    };
+    Check(!run(), "hybrid GEMM must not change the default GPU policy");
+    {
+        FastllmCudaHybridPrefillScope scope(true);
+        Check(!FastllmCudaHybridBf16Gemm(static_cast<const __nv_bfloat16 *>(input.cudaData) + 1,
+            static_cast<const __nv_bfloat16 *>(weight.cudaData),
+            static_cast<__nv_bfloat16 *>(output.cudaData), rows, columns, width, stride, handle),
+            "hybrid GEMM unaligned input fallback");
+        Check(!FastllmCudaHybridBf16Gemm(static_cast<const __nv_bfloat16 *>(input.cudaData),
+            static_cast<const __nv_bfloat16 *>(weight.cudaData) + 1,
+            static_cast<__nv_bfloat16 *>(output.cudaData), rows, columns, width, stride, handle),
+            "hybrid GEMM unaligned weight fallback");
+        Check(run(), "hybrid BF16 GEMM launch");
+        auto got = Download(output);
+        for (int row = 0; row < rows; ++row) {
+            for (int col = 0; col < width; ++col) {
+                double expected = 0;
+                for (int k = 0; k < columns; ++k)
+                    expected += double(x[row * columns + k]) * w[col * columns + k];
+                Check(std::abs(got[row * stride + col] - expected) <=
+                    1e-5 + std::abs(expected) / 250, "hybrid GEMM FP64 BF16 rounding bound");
+            }
+            for (int col = width; col < stride; ++col)
+                Check(got[row * stride + col] == 19.f, "hybrid GEMM output stride");
+        }
+        {
+            FastllmCudaHybridPrefillScope disabled(false);
+            Check(!run(), "nested hybrid scope disable");
+        }
+        Check(run(), "nested hybrid scope restore");
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) == cudaSuccess,
+            "hybrid GEMM capture begin");
+        Check(!run(), "hybrid GEMM must leave graph capture to the existing path");
+        cudaGraph_t graph;
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph) == cudaSuccess, "hybrid GEMM capture end");
+        cudaGraphDestroy(graph);
+        // One vector spans too wide an exponent range for lossless FP16.
+        x[0] = F(Bf(1e-30f));
+        Upload(input, {rows, columns}, x);
+        Check(!run(), "hybrid GEMM exponent-range fallback");
+    }
+    Check(!run(), "hybrid scope must restore the default policy");
+    std::puts("PASS hybrid BF16 prefill FP64 reference, stride, scope and fallbacks");
+}
+
+void HybridHcPostPrefill() {
+    constexpr int rows = 1024, dim = 256;
+    for (bool wide : {false, true}) {
+        std::vector<float> x(rows * dim), r(rows * 4 * dim), p(rows * 4), c(rows * 16);
+        auto fill = [&](std::vector<float> &v, int seed) {
+            for (size_t i = 0; i < v.size(); ++i) {
+                v[i] = Pattern(i / dim + seed, i % dim);
+                if (wide) v[i] = std::ldexp(v[i], int(i * 17 % 180) - 90);
+            }
+        };
+        fill(x, 11); fill(r, 23); fill(p, 31); fill(c, 47);
+        Data input, residual, post, comb, reference, output;
+        Upload(input, {1, rows, dim}, x); Upload(residual, {1, rows, 4, dim}, r);
+        Upload(post, {rows, 4}, p, FLOAT32); Upload(comb, {rows, 4, 4}, c, FLOAT32);
+        Check(FastllmCudaDeepSeekV4HcPostCudaMix(input, residual, post, comb,
+            1, rows, 4, dim, reference), "HC post reference");
+        {
+            FastllmCudaHybridPrefillScope scope(true);
+            Check(FastllmCudaDeepSeekV4HcPostCudaMix(input, residual, post, comb,
+                1, rows, 4, dim, output), "hybrid HC post");
+        }
+        std::vector<uint16_t> expected(rows * 4 * dim), actual(expected.size());
+        FastllmCudaCopyFromDeviceToHost(expected.data(), reference.cudaData, expected.size() * 2);
+        FastllmCudaCopyFromDeviceToHost(actual.data(), output.cudaData, actual.size() * 2);
+        Check(actual == expected, "hybrid HC post must preserve every BF16 output bit");
+    }
+    std::puts("PASS hybrid HC post, FP64-equivalent BF16 output including extreme exponents");
 }
 
 void Fixture(const std::string &dir) {
@@ -573,6 +685,9 @@ int main(int argc, char **argv) {
                 static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:" + std::to_string(device));
                 if (!HybridSm75Attention()) continue;
                 checked = true;
+                HybridHcPrefill();
+                HybridBf16Prefill();
+                HybridHcPostPrefill();
                 for (int rows : {9, 17, 33}) Scoring(true, rows);
                 Attention(2045, 9, true, true);
                 Attention(4098, 1, false, true);
