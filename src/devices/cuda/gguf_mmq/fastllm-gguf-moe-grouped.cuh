@@ -3,6 +3,8 @@
 // fastllm_gguf_mmq after mmq_io, the Q8 helpers and imported MMQ definitions.
 
 #include "fastllm-gguf-moe-v41-mmq.cuh"
+#include "fastllm-gguf-moe-hybrid-q4.cuh"
+#include "fastllm-gguf-moe-hybrid-q2.cuh"
 
 #include "fastllm-gguf-mmq-q2.cuh"
 
@@ -145,20 +147,38 @@ __global__ void Quantize(const T *input, block_q8_1_mmq *output,
     if (col%32 == 0) q.d4[(col%128)/32] = __half2float(__float2half_rn(scale));
 }
 
-template<ggml_type Type, int Tile = kTile>
+template<ggml_type Type, int Tile = kTile, bool SelectRows = false>
 __global__ void Matmul(const uint8_t *const *weights, int part,
                        const block_q8_1_mmq *input, float *output,
                        const int *counts, const int *offsets, const int *tileExperts,
                        int experts, int columns, int width, int capacity, int stride) {
     if (blockIdx.y*kTile >= offsets[experts]) return;
     const int e = tileExperts[blockIdx.y], begin = offsets[e];
+    // Hybrid streaming can contain tiny and busy experts in the same upload.
+    // Each expert is handled by exactly one tile width; routing stays padded
+    // to 16 rows; Q2_K uses its separate integer-scaled accumulation.
+    if constexpr (SelectRows) {
+        const int rows = counts[e];
+        if constexpr (Tile == 16) { if (rows > 16) return; }
+        if constexpr (Tile == 32) { if (rows <= 16 || rows > 32) return; }
+        if constexpr (Tile == 64) { if (rows <= 32) return; }
+    }
     const int packedTile = blockIdx.y-begin/kTile;
     // Keep the 16-row routing/workspace layout. Only the first CTA of each
     // wider tile computes; this avoids padding every expert to 64 rows.
     if (packedTile%(Tile/kTile)) return;
     const int localTile = packedTile/(Tile/kTile);
     const int padded = ((columns+255)/256)*256;
-    if constexpr (Type == GGML_TYPE_Q2_K || Type == GGML_TYPE_Q4_K) {
+    if constexpr (SelectRows && Type == GGML_TYPE_Q2_K) {
+        hybrid_q2_mmq::Compute<Tile>(weights[2*e+part], input+begin,
+            output+size_t(begin)*width, padded, width, stride, counts[e], capacity, localTile);
+    } else if constexpr (SelectRows && Type == GGML_TYPE_Q4_K) {
+        mul_mat_q_process_tile<Type, Tile, MMQ_NWARPS, true, false, hybrid_q4_mmq_type_traits, (Tile > kTile)>(
+            reinterpret_cast<const char *>(weights[2*e+part]),
+            reinterpret_cast<const char *>(input+begin), output+size_t(begin)*width,
+            nullptr, padded, width, stride, padded, counts[e], capacity, width,
+            blockIdx.x, localTile, 0, padded/256);
+    } else if constexpr (Type == GGML_TYPE_Q2_K || Type == GGML_TYPE_Q4_K) {
         mul_mat_q_process_tile<Type, Tile, MMQ_NWARPS, true, false, v41_mmq_type_traits, (Tile > kTile)>(
             reinterpret_cast<const char *>(weights[2*e+part]),
             reinterpret_cast<const char *>(input+begin), output+size_t(begin)*width,
@@ -249,30 +269,45 @@ __global__ void IQ1Gate(const block_q8_1 *input, T *gate,
     if (threadIdx.x%32 == 0) gate[size_t(route)*inter+row] = mmq_io<T>::from_float(value);
 }
 
-template<ggml_type Type, int Tile = kTile>
+template<ggml_type Type, int Tile = kTile, bool SelectRows = false>
 static void LaunchMatrix(const uint8_t *const *weights, int part, Workspace &w,
                           int experts, int columns, int width, cudaStream_t stream) {
     const int device = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[device].cc;
     constexpr ggml_type SharedType = Type == GGML_TYPE_Q2_0 ? GGML_TYPE_Q8_0 :
         Type == GGML_TYPE_Q4_K ? GGML_TYPE_Q2_K : Type;
-    const int shared = mmq_get_shmem<SharedType>(Tile, get_mmq_y_host(cc), cc);
+    constexpr bool packedQ2 = SelectRows && Type == GGML_TYPE_Q2_K;
+    const int shared = packedQ2 ? (Tile*MMQ_TILE_Y_K + hybrid_q2_mmq::kOutputTile*MMQ_MMA_TILE_X_K_Q2_K)*sizeof(int)
+        : mmq_get_shmem<SharedType>(Tile, get_mmq_y_host(cc), cc);
     static std::once_flag initialized[GGML_CUDA_MAX_DEVICES];
     std::call_once(initialized[device], [shared]() {
-        CUDA_CHECK(cudaFuncSetAttribute(Matmul<Type, Tile>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared));
+        CUDA_CHECK(cudaFuncSetAttribute(Matmul<Type, Tile, SelectRows>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared));
     });
-    Matmul<Type, Tile><<<dim3((width+get_mmq_y_host(cc)-1)/get_mmq_y_host(cc), w.activeRows/kTile),
-        dim3(32, MMQ_NWARPS), shared, stream>>>(weights, part, w.quantized, w.products,
+    const int outputTile = packedQ2 ? hybrid_q2_mmq::kOutputTile : get_mmq_y_host(cc);
+    Matmul<Type, Tile, SelectRows><<<dim3((width+outputTile-1)/outputTile, w.activeRows/kTile),
+        dim3(32, packedQ2 ? hybrid_q2_mmq::kWarps : MMQ_NWARPS), shared, stream>>>(weights, part, w.quantized, w.products,
             w.counts, w.offsets, w.tileExperts, experts, columns, width, w.capacity,
             int(ggml_row_size(Type, columns)));
 }
 static void Matrix(int type, const uint8_t *const *weights, int part, Workspace &w,
-                    int experts, int columns, int width, cudaStream_t stream) {
+                    int experts, int columns, int width, cudaStream_t stream, bool hybridStream = false) {
     // Short expert batches waste half of a 64-row tile on Turing. Use a
     // narrower tile based on the routed batch, independent of model dimensions.
     const bool compactTuring = w.inputRows >= 1024 &&
         int64_t(w.activeRows) <= int64_t(experts) * 48 &&
         ggml_cuda_info().devices[ggml_cuda_get_device()].cc == CC_TURING;
+    if (hybridStream && w.inputRows >= 1024 &&
+        ggml_cuda_info().devices[ggml_cuda_get_device()].cc == CC_TURING) {
+#define HYBRID_MATRIX(T) case GGML_TYPE_##T: \
+        LaunchMatrix<GGML_TYPE_##T, 16, true>(weights, part, w, experts, columns, width, stream); \
+        LaunchMatrix<GGML_TYPE_##T, 32, true>(weights, part, w, experts, columns, width, stream); \
+        LaunchMatrix<GGML_TYPE_##T, 64, true>(weights, part, w, experts, columns, width, stream); return;
+        switch (type) {
+            HYBRID_MATRIX(Q2_K) HYBRID_MATRIX(Q3_K) HYBRID_MATRIX(Q4_K)
+            default: break;
+        }
+#undef HYBRID_MATRIX
+    }
     switch (type) {
 #define GROUPED_CASE(T) case GGML_TYPE_##T: \
         if (compactTuring) LaunchMatrix<GGML_TYPE_##T, 32>(weights, part, w, experts, columns, width, stream); \
