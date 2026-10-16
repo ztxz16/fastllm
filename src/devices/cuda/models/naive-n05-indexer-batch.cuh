@@ -245,6 +245,110 @@ __global__ void Select(Batch batch) {
     }
     if (t == 0) state->selected = offset;
 }
+// Multi-CTA radix selection. Kernel boundaries provide the grid barriers, so
+// independent rows do not need one cooperative launch per request. All partial
+// histograms, counts and candidates reuse the existing TopK workspace.
+__global__ void SplitHistogram(Batch batch, int shift) {
+    using namespace naive_topk;
+    const Row &r=batch.rows[blockIdx.y];
+    auto *w=r.workspace; int n=*r.live, t=threadIdx.x;
+    if(shift!=24 && w->state.done) return;
+    __shared__ int histogram[kBuckets];
+    __shared__ unsigned maxima[kThreads/32];
+    histogram[t]=0; __syncthreads();
+    int chunk=((n+int(gridDim.x)*kThreads-1)/(int(gridDim.x)*kThreads))*kThreads;
+    int begin=blockIdx.x*chunk,end=min(n,begin+chunk);
+    unsigned mask=shift==24?0u:~0u<<(shift+8),prefix=shift==24?0u:w->state.prefix;
+    unsigned maximum=0,reference=n?r.scores[0]:0;bool different=false;
+    for(int base=begin;base<end;base+=kThreads) {
+        int i=base+t;unsigned bits=i<end?r.scores[i]:0;
+        if(shift==24) {maximum=max(maximum,bits);different|=i<end&&bits!=reference;}
+        int bucket=i<end&&(bits&mask)==prefix?int((bits>>shift)&255):256;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        unsigned peers=__match_any_sync(0xffffffff,bucket);
+        if(bucket<256&&(t&31)==__ffs(peers)-1)atomicAdd(histogram+bucket,__popc(peers));
+#else
+        if(bucket<256)atomicAdd(histogram+bucket,1);
+#endif
+    }
+    __syncthreads();w->partials[blockIdx.x*kBuckets+t]=histogram[t];
+    if(shift==24) {
+        int changed=__syncthreads_or(different);maximum=WarpMax(maximum);
+        if(!(t&31))maxima[t/32]=maximum;__syncthreads();
+        if(!t) {
+            unsigned m=0;for(int i=0;i<kThreads/32;++i)m=max(m,maxima[i]);
+            w->partials[gridDim.x*kBuckets+blockIdx.x]=m;
+            w->ties[blockIdx.x]=changed;
+        }
+    }
+}
+__global__ void SplitThreshold(Batch batch,int blocks,int shift) {
+    using namespace naive_topk;
+    const Row &r=batch.rows[blockIdx.x];auto *w=r.workspace;auto *s=&w->state;
+    int n=*r.live,t=threadIdx.x,topK=min(n,kTopK);
+    if(shift!=24&&s->done)return;
+    if(!n) {if(!t){s->uniform=1;s->selected=0;s->done=1;}return;}
+    using Scan=cub::BlockScan<int,kThreads>;
+    __shared__ typename Scan::TempStorage scan;
+    __shared__ unsigned maxima[kThreads/32];
+    if(shift==24) {
+        int changed=__syncthreads_or(t<blocks&&w->ties[t]);
+        unsigned m=t<blocks?(unsigned)w->partials[blocks*kBuckets+t]:0;m=WarpMax(m);
+        if(!(t&31))maxima[t/32]=m;__syncthreads();
+        if(!t) {
+            m=0;for(int i=0;i<kThreads/32;++i)m=max(m,maxima[i]);
+            s->maximum=m;s->uniform=!changed;s->selected=topK;s->done=!changed;
+        }
+        __syncthreads();if(!changed)return;
+    }
+    int rank=shift==24?topK:s->rank,bucket=255-t,total=0;
+    unsigned prefix=shift==24?0u:s->prefix;
+    for(int b=0;b<blocks;++b)total+=w->partials[b*kBuckets+bucket];
+    int before;Scan(scan).ExclusiveSum(total,before);__syncthreads();
+    if(before<rank&&before+total>=rank) {
+        s->prefix=prefix|(unsigned(bucket)<<shift);s->rank=rank-before;
+        s->candidates=topK-(rank-before)+total;
+    }
+    __syncthreads();
+    if(!t)s->done=s->candidates<=kCapacity||shift==0||s->prefix==s->maximum;
+    __syncthreads();
+    bucket=(s->prefix>>shift)&255;
+    int greater=t<blocks&&shift!=24?w->partials[blocks*kBuckets+t]:0;
+    int equal=0;
+    if(t<blocks) {
+        for(int b=bucket+1;b<kBuckets;++b)greater+=w->partials[t*kBuckets+b];
+        equal=w->partials[t*kBuckets+bucket];
+    }
+    if(!s->done) {if(t<blocks)w->partials[blocks*kBuckets+t]=greater;return;}
+    int tieOffset;Scan(scan).ExclusiveSum(equal,tieOffset);__syncthreads();
+    int count=greater+(s->candidates>kCapacity?min(equal,max(0,s->rank-tieOffset)):equal);
+    if(t<blocks){w->ties[t]=tieOffset;w->partials[blocks*kBuckets+t]=count;}
+    int unused,selected;Scan(scan).ExclusiveSum(count,unused,selected);
+    if(!t)s->selected=selected;
+}
+__global__ void SplitCompact(Batch batch) {
+    using namespace naive_topk;
+    const Row&r=batch.rows[blockIdx.y];auto*w=r.workspace;auto*s=&w->state;
+    if(s->uniform)return;
+    using Scan=cub::BlockScan<int,kThreads>;__shared__ typename Scan::TempStorage scan;
+    int n=*r.live,t=threadIdx.x;
+    int chunk=((n+int(gridDim.x)*kThreads-1)/(int(gridDim.x)*kThreads))*kThreads;
+    int begin=blockIdx.x*chunk,end=min(n,begin+chunk),offset=0;
+    for(int b=0;b<int(blockIdx.x);++b)offset+=w->partials[gridDim.x*kBuckets+b];
+    int tiesBefore=w->ties[blockIdx.x];unsigned prefix=s->prefix;
+    for(int base=begin;base<end;base+=kThreads) {
+        int i=base+t;unsigned bits=i<end?r.scores[i]:0;bool take=i<end&&bits>=prefix;
+        if(s->candidates>kCapacity) {
+            int equal=i<end&&bits==prefix,before,total;
+            Scan(scan).ExclusiveSum(equal,before,total);__syncthreads();
+            take=i<end&&(bits>prefix||(equal&&tiesBefore+before<s->rank));tiesBefore+=total;
+        }
+        int before,total;Scan(scan).ExclusiveSum(int(take),before,total);__syncthreads();
+        if(take){w->candidates.keys[offset+before]=bits-prefix;w->candidates.positions[offset+before]=i;}
+        offset+=total;
+    }
+}
+
 __global__ void Sort(Batch batch) {
     const Row &row = batch.rows[blockIdx.x];
     naive_topk::SortRow(&row.workspace->candidates, &row.workspace->state, row.indices);
