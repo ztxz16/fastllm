@@ -12528,17 +12528,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
 
         std::vector<int> previewNewPages;
-        previewNewPages.reserve(newPageCount);
-        if (newPageCount > 0) {
-            std::lock_guard<std::mutex> guard(manager.pageIndexLocker);
-            for (int i = 0; i < newPageCount && i < (int)manager.freePages.size(); i++) {
-                previewNewPages.push_back(manager.freePages[(int)manager.freePages.size() - 1 - i]);
-            }
-            int trieOffset = newPageCount - (int)previewNewPages.size();
-            for (int i = 0; i < trieOffset && i < (int)manager.triePages.size(); i++) {
-                previewNewPages.push_back(manager.triePages[(int)manager.triePages.size() - 1 - i]);
-            }
-        }
+        manager.PreviewUnusedPageIndices(newPageCount, previewNewPages);
         AssertInFastLLM((int)previewNewPages.size() >= newPageCount,
                         "CpuGenerateAppendPagedCacheBatchParamsOp: no enough pages for batch append.\n");
 

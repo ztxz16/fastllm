@@ -1099,6 +1099,10 @@ if (UNIT_TEST)
     add_executable(qwen35_paged_cache_test test/basic/test_qwen35_paged_cache.cpp)
     add_test(NAME qwen35_paged_cache COMMAND qwen35_paged_cache_test)
 
+    add_executable(paged_cache_lru_test test/basic/test_paged_cache_lru.cpp)
+    target_link_libraries(paged_cache_lru_test PRIVATE fastllm)
+    add_test(NAME paged_cache_lru COMMAND paged_cache_lru_test)
+
     add_executable(multimodal_history_cache_test test/basic/test_multimodal_history_cache.cpp)
     target_link_libraries(multimodal_history_cache_test PRIVATE fastllm)
     add_test(NAME multimodal_history_cache COMMAND multimodal_history_cache_test)

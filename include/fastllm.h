@@ -709,6 +709,9 @@ namespace fastllm {
     struct CacheTrieNode {
         int pageId = -1;
         long long timestamp = 0;
+        long long lastAccess = 0;
+        int unusedIndex = -1;
+        bool evictable = false;
         std::unordered_map<uint64_t, CacheTrieNode*> children;
         CacheTrieNode *parent = nullptr;
         uint64_t edgeHash = 0;
@@ -761,6 +764,18 @@ namespace fastllm {
             static uint64_t HashTokenPage(const int *tokens, int len);
             void Record(const std::vector<int> &tokens, const std::vector<int> &pages);
             void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds);
+
+            // Materialize free pages in the same order used by allocation.
+            // This may evict unreferenced cache entries, but never reserves pages.
+            void PreviewUnusedPageIndices(int count, std::vector<int> &pages);
+            bool IsCachedPage(int pageIndex, long long generation);
+
+        private:
+            std::set<std::pair<long long, int>> evictableLeaves;
+            void UpdateEvictableLeaf(CacheTrieNode *node);
+            void RemoveTriePage(int pageIndex);
+            void ReleasePageIndexLocked(int pageIndex);
+            void PrepareFreePages(int count);
     };
 
     struct PartitionLinkNode {
