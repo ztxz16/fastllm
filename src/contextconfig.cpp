@@ -74,8 +74,13 @@ namespace fastllm {
                                       const ContextOptions &options) {
         Require(options.maxLength == -1 || options.maxLength > 0, "max_context_length must be positive");
         ContextPlan plan;
-        const std::string p =
+        std::string p =
             Read(dict, spec.configPrefix + "max_position_embeddings").is_null() ? "" : spec.configPrefix;
+        // Unadapted HF text layouts still support shrink-only context limits.
+        // Their declared window may live in the flattened text_config object.
+        if (!spec.supported && Read(dict, p + "max_position_embeddings").is_null() &&
+            !Read(dict, "text_config.max_position_embeddings").is_null())
+            p = "text_config.";
         Object geometry;
         for (auto key : {"max_position_embeddings", "head_dim", "hidden_size", "num_attention_heads", "rope_theta",
                          "partial_rotary_factor"}) {

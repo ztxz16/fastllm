@@ -55,10 +55,18 @@ static bool RunGlm5Streamed(StreamedMoePhase phase, const __nv_bfloat16 *input,
         GatherV41<<<dim3((batch.rows + 7) / 8, hidden / 128), 256, 0, stream>>>(
             reinterpret_cast<const block_q8_K *>(s.input), s.quantized, batch.routes,
             batch.offsets + batch.experts, hidden, capacity, topk);
-        Matrix(gt, batch.weights, 0, w, batch.experts, hidden, 2 * inter, stream);
+        const bool packedQ2 = rows >= 1024 &&
+            ggml_cuda_info().devices[ggml_cuda_get_device()].cc == CC_TURING;
+        if (packedQ2 && gt == GGML_TYPE_Q2_K)
+            hybrid_q2_mmq::PackSums<<<dim3((batch.rows + 7) / 8, hidden / 128), 256, 0, stream>>>(
+                s.quantized, batch.rows, capacity);
+        Matrix(gt, batch.weights, 0, w, batch.experts, hidden, 2 * inter, stream, true);
         ActivateQuantizeGlm5Streamed<<<dim3(inter / 256, batch.rows), 256, 0, stream>>>(
             s.products, s.quantized, gate, batch.routes, scores, inter, capacity, limit);
-        Matrix(dt, batch.weights, 1, w, batch.experts, inter, hidden, stream);
+        if (packedQ2 && dt == GGML_TYPE_Q2_K)
+            hybrid_q2_mmq::PackSums<<<dim3((batch.rows + 7) / 8, inter / 128), 256, 0, stream>>>(
+                s.quantized, batch.rows, capacity);
+        Matrix(dt, batch.weights, 1, w, batch.experts, inter, hidden, stream, true);
         ScatterStreamed<__nv_bfloat16><<<(batch.rows * hidden + 255) / 256, 256, 0, stream>>>(
             s.products, s.routes, batch.routes, batch.rows, hidden);
     }

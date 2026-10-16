@@ -46,7 +46,7 @@ PYTHONPATH="$PWD/build-fastllm/tools" OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 \
 
 按本机调整 Python 包路径、模型路径和 NUMA/CPU 绑定。测试检查实际 TP 设备数和 KV 池容量、首次解码不恢复前缀、缓存请求各恢复一次，以及生成过程中缓存统计稳定。每个请求申请 64 个输出，但受上下文上限约束只输出剩余 17 个。失败判定不依赖机器速度。将 `--tokens` 改为 `4224` 可对照多留一页的配置；增加 `--sampling` 可检查拒绝采样路径。各配置应串行运行。贪心结果的 token ID 会打印为 `KV_CAPACITY_RESULT`，可核对紧池与多一页配置的输出一致性。
 
-编译兼容性检查使用仍支持 sm_60 的 nvcc（本次验证为 CUDA 12.4），不需要 GPU：
+编译兼容性检查使用支持 sm_60 的 nvcc，例如 CUDA 12.4，不需要 GPU：
 
 ```sh
 python3 test/cuda/check_paged_params_build.py --nvcc /usr/local/cuda-12.4/bin/nvcc

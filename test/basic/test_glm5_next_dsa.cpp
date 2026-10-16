@@ -1,4 +1,11 @@
 #include "../../src/models/glm5_next_dsa.h"
+#include "../../src/models/glm5_next_hybrid_graph.h"
+#include "../../src/devices/cuda/fastllm-hybrid-prefill.cuh"
+#include "devices/cuda/fastllm-cuda-hybrid-prefill.h"
+#include "devices/cuda/fastllm-cuda-hybrid-kda.h"
+#include "devices/cuda/fastllm-cuda-hybrid-dsa.h"
+#include "devices/cuda/fastllm-cuda-hybrid-output.h"
+#include "gguf.h"
 #include "executor.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
@@ -12,6 +19,12 @@
 #include <stdexcept>
 using namespace fastllm;
 using namespace fastllm::glm5_next_detail;
+namespace fastllm {
+struct Glm5NextGGUFTestAccess {
+    static void HybridGraphs(); static void HybridKda(); static void HybridMla();
+    static void HybridDsaPreparation(); static void HybridRouter();
+};
+}
 namespace {
 void Check(bool ok, const char *why) { if (!ok) throw std::runtime_error(why); }
 uint16_t Bf(float x) {
@@ -179,17 +192,23 @@ void Selection(int past,int rows) {
     }
     std::printf("PASS selection past=%d rows=%d width=%d\n",past,rows,width);
 }
-void Scoring() {
-    const int rows=9,m=520,heads=32;std::vector<float> q(rows*heads*128),k(m*128),w(rows*heads);
-    for(int r=0;r<rows*heads;++r){w[r]=Pattern(r,3)/32;for(int d=0;d<128;++d)q[r*128+d]=F(Bf(Pattern(r,d)/8));}
-    for(int j=0;j<m;++j)for(int d=0;d<128;++d)k[j*128+d]=F(Bf(Pattern(j+8,d)/8));
+void Scoring(bool hybrid = false, int rows = 9) {
+    const int m=520,heads=32;std::vector<float> q(rows*heads*128),k(m*128),w(rows*heads);
+    for(int r=0;r<rows*heads;++r){w[r]=Pattern(r,3)/32;for(int d=0;d<128;++d)q[r*128+d]=F(Bf(std::ldexp(Pattern(r,d)/8, hybrid ? (r*17+d*13)%7-3 : 0)));}
+    for(int j=0;j<m;++j)for(int d=0;d<128;++d)k[j*128+d]=F(Bf(std::ldexp(Pattern(j+8,d)/8, hybrid ? (j*19+d*11)%7-3 : 0)));
     Data qd,kd,wd,s;Upload(qd,{1,rows,heads,128},q);Upload(kd,{1,m,128},k);Upload(wd,{1,rows,heads},w,FLOAT32);
-    Check(FastllmCudaDeepSeekV41IndexerScore(qd,wd,kd,4,2050,s),"score launch");auto got=Download(s);double err=0;
+    Check(hybrid ? FastllmCudaGlm5NextHybridIndexerScore(qd,wd,kd,s) :
+        FastllmCudaDeepSeekV41IndexerScore(qd,wd,kd,4,2050,s),"score launch");auto got=Download(s);double err=0;
     for(int r=0;r<rows;++r)for(int j=0;j<std::min(m,(2050+r+1)/4);++j){
         double expected=0;for(int h=0;h<heads;++h){double dot=0;for(int d=0;d<128;++d)dot+=q[(r*heads+h)*128+d]*k[j*128+d];expected+=std::max(0.,dot)*w[r*heads+h];}
         err=std::max(err,std::abs(got[r*m+j]-expected));
     }
     std::printf("PASS weighted ReLU scoring max_error=%.8g\n",err);Check(err<2e-5,"score reference");
+    if (hybrid) {
+        Data reference;
+        Check(FastllmCudaDeepSeekV41IndexerScore(qd,wd,kd,4,2050,reference),"legacy score launch");
+        Check(got == Download(reference),"hybrid indexer must preserve every FP32 score bit");
+    }
 }
 struct BorrowedCache:Data{~BorrowedCache(){isPagedKVCache=false;}};
 bool MlaSupported(DataType type) {
@@ -200,7 +219,8 @@ bool MlaSupported(DataType type) {
     // FlashInfer's MLA dispatcher requires at least 92672 bytes per SM.
     return FastllmCudaFlashInferDataTypeSupported(type) && sharedMemory >= 92672;
 }
-void Attention(int past,int rows,bool fragmented) {
+void Attention(int past,int rows,bool fragmented,bool hybrid=false) {
+    const int device=FastllmCudaGetDevice();
     const int heads=64,rank=512,pageLen=32,tokens=past+rows,pages=(tokens+31)/32;
     std::vector<float> kv((fragmented?pages*2:pages)*pageLen*rank),q(heads*rows*rank);
     std::vector<int> pagesIds(pages);for(int p=0;p<pages;++p)pagesIds[p]=fragmented?(pages-1-p)*2:p;
@@ -211,8 +231,8 @@ void Attention(int past,int rows,bool fragmented) {
     Check(FastllmCudaDeepSeekV41IndexerTopK(scores,nullptr,512,4,past,1,groups),"attention groups");groups.Reshape({rows,groups.dims.back()});
     Check(FastllmCudaQwen4ExpandSelectedBlocks(groups,tokens,past,4,idx),"attention indices");auto ids=Integers(idx);const int width=idx.dims.back();
     PagedCacheManager pool;Upload(pool,{int(kv.size()/pageLen/rank),pageLen,1,rank},kv);
-    BorrowedCache cache;cache.dataDevice=DataDevice::CUDA;cache.dataDeviceIds={0};cache.dataType=BFLOAT16;cache.Resize({1,tokens,rank});cache.isPagedKVCache=true;cache.pageLen=pageLen;cache.lastPageLen=(tokens-1)%pageLen+1;cache.pageIndex=pagesIds;cache.pagedKVCacheData=&pool;
-    Data query,out;Upload(query,{heads,rows,rank},q);SparseLatentAttention(query,cache,idx,1.f/16,out);auto got=Download(out);double error=0;
+    BorrowedCache cache;cache.dataDevice=DataDevice::CUDA;cache.dataDeviceIds={device};cache.dataType=BFLOAT16;cache.Resize({1,tokens,rank});cache.isPagedKVCache=true;cache.pageLen=pageLen;cache.lastPageLen=(tokens-1)%pageLen+1;cache.pageIndex=pagesIds;cache.pagedKVCacheData=&pool;
+    Data query,out;Upload(query,{heads,rows,rank},q);SparseLatentAttention(query,cache,idx,1.f/16,out,true,nullptr,hybrid);auto got=Download(out);double error=0;
     for(float v:got)Check(std::isfinite(v),"attention nonfinite");
     for(int h:{0,17,63})for(int r=0;r<rows;++r){
         std::vector<double> p(width);double den=0;
@@ -221,7 +241,7 @@ void Attention(int past,int rows,bool fragmented) {
     }
     if (rows == 1) {
         Data table(INT32), physical, pagedQuery, pagedOutput;
-        table.Resize({pages}); table.ToDevice(DataDevice::CUDA,{0},false); table.Allocate(false);
+        table.Resize({pages}); table.ToDevice(DataDevice::CUDA,{device},false); table.Allocate(false);
         FastllmCudaCopyFromHostToDevice(table.cudaData,pagesIds.data(),pages*4);
         Check(FastllmCudaQwen4ExpandSelectedBlocks(groups,tokens,past,4,physical,&table,pageLen),"paged expand");
         auto mapped=Integers(physical);
@@ -229,11 +249,11 @@ void Attention(int past,int rows,bool fragmented) {
             Check(mapped[i]==(ids[i]<0?-1:pagesIds[ids[i]/pageLen]*pageLen+ids[i]%pageLen),"physical page mapping");
         PagedCacheManager pePool;
         Upload(pePool,{int(kv.size()/pageLen/rank),pageLen,1,64},std::vector<float>(kv.size()/rank*64));
-        BorrowedCache peCache;peCache.dataDevice=DataDevice::CUDA;peCache.dataDeviceIds={0};peCache.dataType=BFLOAT16;peCache.Resize({1,tokens,64});
+        BorrowedCache peCache;peCache.dataDevice=DataDevice::CUDA;peCache.dataDeviceIds={device};peCache.dataType=BFLOAT16;peCache.Resize({1,tokens,64});
         peCache.isPagedKVCache=true;peCache.pageLen=pageLen;peCache.lastPageLen=cache.lastPageLen;
         peCache.pageIndex=pagesIds;peCache.pagedKVCacheData=&pePool;
         Upload(pagedQuery,{heads,rows,rank},q);
-        SparseLatentAttention(pagedQuery,cache,physical,1.f/16,pagedOutput,false,&peCache);
+        SparseLatentAttention(pagedQuery,cache,physical,1.f/16,pagedOutput,false,&peCache,hybrid);
         Check(Download(pagedOutput)==got,"paged BF16 fallback differs");
         if (MlaSupported(BFLOAT16)) {
             Upload(pagedQuery,{heads,rows,rank},q);
@@ -464,6 +484,181 @@ void DecodeSmallGemv() {
     }
     std::puts("PASS short BF16 GEMV exact against original 256-thread multirow path");
 }
+
+void HybridHcPreNorm() {
+    constexpr int dim = 4096, flat = 4 * dim, mix = 24;
+    std::vector<float> fn(mix * flat), scale = {.8f, .6f, .7f}, base(mix), norm(dim);
+    for (int i = 0; i < mix * flat; ++i) fn[i] = Pattern(i / flat, i % flat) / 256;
+    for (int i = 0; i < mix; ++i) base[i] = Pattern(i, 3) / 16;
+    for (int i = 0; i < dim; ++i) norm[i] = 1 + Pattern(i, 4) / 16;
+    for (int rows : {1, 2, 4, 8, 64, 129, 512}) for (auto type : {FLOAT32, BFLOAT16}) {
+        for (int variant = 0; variant < (rows == 1 ? 4 : 1); ++variant) {
+            const int iterations[] = {20, 1, 2, 37};
+            std::vector<float> x(rows * flat);
+            for (int i = 0; i < rows * flat; ++i)
+                x[i] = variant == 3 ? 0.0f : std::ldexp(Pattern(i / 128, i % 128),
+                    variant == 1 ? -7 : variant == 2 ? 7 : 0);
+            Data input, w, sc, ba, n, mixed, post, comb, reference, out, fastPost, fastComb;
+            Upload(input, {1, rows, 4, dim}, x); Upload(w, {mix, flat}, fn, type);
+            Upload(sc, {3}, scale, FLOAT32); Upload(ba, {mix}, base, FLOAT32); Upload(n, {dim}, norm, FLOAT32);
+            Check(FastllmCudaDeepSeekV4HcPre(input, w, sc, ba, 4, iterations[variant], 1e-6f, 1e-6f, mixed, post, comb), "HC reference");
+            KimiK3RMSNorm(mixed, n, 1e-6f, reference);
+            Check(FastllmCudaGlm5NextHybridHcPreNorm(input, w, sc, ba, n, 4, iterations[variant], 1e-6f, 1e-6f, out, fastPost, fastComb), "HC hybrid pre-norm");
+            Check(Download(reference) == Download(out), "HC hybrid pre-norm output differs");
+            Check(Download(post) == Download(fastPost), "HC hybrid pre-norm post differs");
+            Check(Download(comb) == Download(fastComb), "HC hybrid pre-norm comb differs");
+        }
+    }
+    std::puts("PASS hybrid HC pre-norm: output, post and comb exact");
+}
+
+bool HybridSm75Attention() {
+    int major = 0, minor = 0, device = 0;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+    if (major != 7 || minor != 5) return false;
+    for (int heads : {32, 64}) for (int rows : {1, 2, 4, 8, 16, 17, 32, 33, 64, 512}) {
+        const int count = rows == 2 ? 33 : 2051, cap = 2309;
+        std::vector<float> q(rows * heads * 512), kv(cap * 512);
+        for (size_t i = 0; i < q.size(); ++i) q[i] = F(Bf(std::ldexp(Pattern(i / 512, i % 512) / 4, int(i * 13 % 7) - 3)));
+        for (size_t i = 0; i < kv.size(); ++i) kv[i] = F(Bf(std::ldexp(Pattern(i / 512 + 41, i % 512) / 4, int(i * 19 % 7) - 3)));
+        std::vector<int> indices(rows * count);
+        for (int r = 0; r < rows; ++r) for (int c = 0; c < count; ++c)
+            indices[r * count + c] = c % 29 == 0 ? -1 : (c * 13 + r * 17) % cap;
+        Data query, latent, idx(INT32), output, reference, sink;
+        Upload(query, {1, rows, heads, 512}, q); Upload(latent, {1, cap, 512}, kv);
+        Upload(sink, {heads}, std::vector<float>(heads, -INFINITY), FLOAT32);
+        idx.Resize({1, rows, count}); idx.ToDevice(DataDevice::CUDA, {device}, false); idx.Allocate(false);
+        FastllmCudaCopyFromHostToDevice(idx.cudaData, indices.data(), indices.size() * sizeof(int));
+        Check(FastllmCudaGlm5NextHybridSparseAttention(query, latent, idx, 1.f / 16, output), "hybrid attention launch");
+        auto got = Download(output); double maximum = 0, referenceError = 0;
+        if (rows == 1) {
+            auto padded = kv; padded.insert(padded.begin(), 0.f);
+            Data backing, unaligned, fallback;
+            Upload(backing, {1, int(padded.size())}, padded);
+            unaligned.FakeFrom(backing, sizeof(uint16_t)); unaligned.Resize(latent.dims);
+            Check(FastllmCudaGlm5NextHybridSparseAttention(query, unaligned, idx, 1.f / 16, fallback),
+                "hybrid unaligned KV fallback launch");
+            Check(Download(fallback) == got, "hybrid unaligned KV fallback bits");
+        }
+        for (float x : got) Check(std::isfinite(x), "hybrid nonfinite");
+        for (int r : {0, rows - 1}) for (int h : {0, heads - 1}) {
+            std::vector<double> p(count); double den = 0;
+            for (int c = 0; c < count; ++c) if (indices[r * count + c] >= 0) {
+                double dot = 0;
+                for (int d = 0; d < 512; ++d) dot += q[(r * heads + h) * 512 + d] * double(kv[indices[r * count + c] * 512 + d]);
+                den += p[c] = std::exp(dot / 16);
+            }
+            for (int d = 0; d < 512; d += 17) {
+                double num = 0;
+                for (int c = 0; c < count; ++c) if (indices[r * count + c] >= 0)
+                    num += p[c] * kv[indices[r * count + c] * 512 + d];
+                const double expected = num / den;
+                const double error = std::abs(got[(r * heads + h) * 512 + d] - expected);
+                Check(error <= 1e-6 + std::abs(expected) / 250, "hybrid FP64 BF16 rounding bound");
+                referenceError = std::max(referenceError, error);
+            }
+        }
+        if (rows <= 64) {
+            Check(FastllmCudaDeepSeekV41SparseAttention(query, latent, nullptr, &latent, &idx, sink, 0, 0, 1.f / 16, reference), "reference attention launch");
+            auto before = Download(reference);
+            for (size_t i = 0; i < got.size(); ++i) maximum = std::max(maximum, std::abs(double(got[i]) - before[i]));
+            Check(before == got, "hybrid attention must preserve every BF16 output bit");
+        }
+        std::printf("PASS hybrid sparse device=%d heads=%d rows=%d old_max=%.8g fp64_max=%.8g\n", device, heads, rows, maximum, referenceError);
+    }
+    return true;
+}
+
+void HybridBf16Prefill() {
+    constexpr int rows = 1024, columns = 136, width = 128, stride = 136;
+    std::vector<float> x(rows * columns), w(width * columns);
+    for (int i = 0; i < int(x.size()); ++i) x[i] = F(Bf(Pattern(i / columns, i % columns)));
+    for (int i = 0; i < int(w.size()); ++i) w[i] = F(Bf(Pattern(i / columns + 23, i % columns)));
+    Data input, weight, output;
+    Upload(input, {rows, columns}, x);
+    Upload(weight, {width, columns}, w);
+    Upload(output, {rows, stride}, std::vector<float>(rows * stride, 19.f));
+    auto handle = getFastllmCublasHandle();
+    auto run = [&]() {
+        return FastllmCudaHybridBf16Gemm(static_cast<const __nv_bfloat16 *>(input.cudaData),
+            static_cast<const __nv_bfloat16 *>(weight.cudaData),
+            static_cast<__nv_bfloat16 *>(output.cudaData), rows, columns, width, stride, handle);
+    };
+    Check(!run(), "hybrid GEMM must not change the default GPU policy");
+    {
+        FastllmCudaHybridPrefillScope scope(true);
+        Check(!FastllmCudaHybridBf16Gemm(static_cast<const __nv_bfloat16 *>(input.cudaData) + 1,
+            static_cast<const __nv_bfloat16 *>(weight.cudaData),
+            static_cast<__nv_bfloat16 *>(output.cudaData), rows, columns, width, stride, handle),
+            "hybrid GEMM unaligned input fallback");
+        Check(!FastllmCudaHybridBf16Gemm(static_cast<const __nv_bfloat16 *>(input.cudaData),
+            static_cast<const __nv_bfloat16 *>(weight.cudaData) + 1,
+            static_cast<__nv_bfloat16 *>(output.cudaData), rows, columns, width, stride, handle),
+            "hybrid GEMM unaligned weight fallback");
+        Check(run(), "hybrid BF16 GEMM launch");
+        auto got = Download(output);
+        for (int row = 0; row < rows; ++row) {
+            for (int col = 0; col < width; ++col) {
+                double expected = 0;
+                for (int k = 0; k < columns; ++k)
+                    expected += double(x[row * columns + k]) * w[col * columns + k];
+                Check(std::abs(got[row * stride + col] - expected) <=
+                    1e-5 + std::abs(expected) / 250, "hybrid GEMM FP64 BF16 rounding bound");
+            }
+            for (int col = width; col < stride; ++col)
+                Check(got[row * stride + col] == 19.f, "hybrid GEMM output stride");
+        }
+        {
+            FastllmCudaHybridPrefillScope disabled(false);
+            Check(!run(), "nested hybrid scope disable");
+        }
+        Check(run(), "nested hybrid scope restore");
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) == cudaSuccess,
+            "hybrid GEMM capture begin");
+        Check(!run(), "hybrid GEMM must leave graph capture to the existing path");
+        cudaGraph_t graph;
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph) == cudaSuccess, "hybrid GEMM capture end");
+        cudaGraphDestroy(graph);
+        // One vector spans too wide an exponent range for lossless FP16.
+        x[0] = F(Bf(1e-30f));
+        Upload(input, {rows, columns}, x);
+        Check(!run(), "hybrid GEMM exponent-range fallback");
+    }
+    Check(!run(), "hybrid scope must restore the default policy");
+    std::puts("PASS hybrid BF16 prefill FP64 reference, stride, scope and fallbacks");
+}
+
+void HybridHcPostPrefill() {
+    constexpr int rows = 1024, dim = 256;
+    for (bool wide : {false, true}) {
+        std::vector<float> x(rows * dim), r(rows * 4 * dim), p(rows * 4), c(rows * 16);
+        auto fill = [&](std::vector<float> &v, int seed) {
+            for (size_t i = 0; i < v.size(); ++i) {
+                v[i] = Pattern(i / dim + seed, i % dim);
+                if (wide) v[i] = std::ldexp(v[i], int(i * 17 % 180) - 90);
+            }
+        };
+        fill(x, 11); fill(r, 23); fill(p, 31); fill(c, 47);
+        Data input, residual, post, comb, reference, output;
+        Upload(input, {1, rows, dim}, x); Upload(residual, {1, rows, 4, dim}, r);
+        Upload(post, {rows, 4}, p, FLOAT32); Upload(comb, {rows, 4, 4}, c, FLOAT32);
+        Check(FastllmCudaDeepSeekV4HcPostCudaMix(input, residual, post, comb,
+            1, rows, 4, dim, reference), "HC post reference");
+        {
+            FastllmCudaHybridPrefillScope scope(true);
+            Check(FastllmCudaDeepSeekV4HcPostCudaMix(input, residual, post, comb,
+                1, rows, 4, dim, output), "hybrid HC post");
+        }
+        std::vector<uint16_t> expected(rows * 4 * dim), actual(expected.size());
+        FastllmCudaCopyFromDeviceToHost(expected.data(), reference.cudaData, expected.size() * 2);
+        FastllmCudaCopyFromDeviceToHost(actual.data(), output.cudaData, actual.size() * 2);
+        Check(actual == expected, "hybrid HC post must preserve every BF16 output bit");
+    }
+    std::puts("PASS hybrid HC post, FP64-equivalent BF16 output including extreme exponents");
+}
+
 void Fixture(const std::string &dir) {
     auto load = [&](const std::string &name, Data &out, DataType type) {
         std::ifstream f(dir+"/"+name+".bin", std::ios::binary);
@@ -502,12 +697,620 @@ void Fixture(const std::string &dir) {
     dump("pooled-keys",cache.keys);std::puts("PASS real checkpoint fixture execution");
 }
 }
+void fastllm::Glm5NextGGUFTestAccess::HybridRouter() {
+    const int device = FastllmCudaGetDevice();
+    auto bytes = [&](Data &x) {
+        std::vector<unsigned char> b(x.GetBytes());
+        Check(cudaMemcpy(b.data(), x.cudaData, b.size(), cudaMemcpyDeviceToHost) == cudaSuccess, "router download");
+        return b;
+    };
+    for (int experts : {64, 128, 256, 512}) {
+        // Each shape owns its immutable weight and the Linear reference's
+        // cached zero bias, just as model weights do during inference.
+        Glm5NextModel model;
+        model.executionMode = ExecutionMode::Hybrid;
+        model.weight.weight.try_emplace("gate.weight");
+        auto &weight = model.weight["gate.weight"];
+        std::vector<float> w((size_t)experts * 4096), x(4096), biasValues(experts);
+        for (size_t i = 0; i < w.size(); ++i) w[i] = Pattern(int(i / 4096) + 1, int(i % 4096)) * .02f;
+        for (int i = 0; i < experts; ++i) biasValues[i] = Pattern(i, 3) * .03f;
+        Upload(weight, {experts, 4096}, w, FLOAT32);
+        Data input, bias, converted, expected, actual;
+        Upload(bias, {experts}, biasValues, FLOAT32);
+        Glm5NextModel::HybridDecodeState::Segment segment(device, 1);
+        for (int step = 0; step < 6; ++step) {
+            for (int i = 0; i < 4096; ++i) x[i] = step == 0 ? 0 :
+                std::ldexp(Pattern(i / 128 + step, i % 128), step * 8 - 24);
+            Upload(input, {1, 1, 4096}, x);
+            segment.Run(input, [&](Data &in, std::vector<Data> &out) {
+                Check(model.TryHybridRouterScores("", in, out[0]), "hybrid router launch");
+            });
+            ToDataType(input, converted, FLOAT32); Linear(converted, weight, Data(), expected);
+            Sigmoid(expected, expected);
+            Check(bytes(segment.outputs[0]) == bytes(expected), "router probability bits");
+            for (bool norm : {false, true}) for (float scale : {.5f, 1.5f}) {
+                Data ids, scores, expectedIds, expectedScores;
+                SelectExpert(segment.outputs[0], ids, scores, 8, norm, scale, &bias);
+                SelectExpert(expected, expectedIds, expectedScores, 8, norm, scale, &bias);
+                Check(bytes(ids) == bytes(expectedIds), "router expert IDs");
+                Check(bytes(scores) == bytes(expectedScores), "router selected score bits");
+            }
+            if (step) Check(segment.exec != nullptr, "router graph replay");
+        }
+        Upload(actual, {1}, {17.f}, FLOAT32); const auto saved = bytes(actual);
+        for (auto mode : {ExecutionMode::Gpu, ExecutionMode::Cpu}) {
+            model.executionMode = mode;
+            Check(!model.TryHybridRouterScores("", input, actual), "router nonhybrid fallback");
+        }
+        model.executionMode = ExecutionMode::Hybrid;
+        model.mtpEnabled = true; Check(!model.TryHybridRouterScores("", input, actual), "router MTP fallback"); model.mtpEnabled = false;
+        model.threadTpRank = 0; Check(!model.TryHybridRouterScores("", input, actual), "router TP fallback"); model.threadTpRank = -1;
+        weight.lockInCPU = true; Check(!model.TryHybridRouterScores("", input, actual), "router host weight fallback"); weight.lockInCPU = false;
+        Upload(input, {1, 2, 4096}, std::vector<float>(8192));
+        Check(!model.TryHybridRouterScores("", input, actual), "router multiple-row fallback");
+        Upload(input, {1, 1, 4096}, x, FLOAT32);
+        Check(!model.TryHybridRouterScores("", input, actual), "router input-type fallback");
+        Check(bytes(actual) == saved, "router fallback changed output");
+    }
+    std::printf("PASS hybrid router GPU%d probabilities/IDs/scores exact, graph and GPU/CPU/TP/MTP/batch fallbacks\n", device);
+}
+
+void fastllm::Glm5NextGGUFTestAccess::HybridKda() {
+    const int device = FastllmCudaGetDevice();
+    auto bytes = [&](Data &x) {
+        std::vector<unsigned char> b(x.GetBytes());
+        Check(cudaMemcpy(b.data(),x.cudaData,b.size(),cudaMemcpyDeviceToHost)==cudaSuccess,"KDA download");
+        return b;
+    };
+    for (bool gguf : {false, true}) for (int columns : {264, 512, 2048, 4096, 8192, 12288})
+            for (int rows : {1, 31, 128}) {
+        Data input, fw, bw, gw, f, beta, g, expectedF, expectedBeta, expectedG;
+        auto fill = [&](Data &x, const std::vector<int> &dims, int seed, int exponent) {
+            size_t count = 1; for (int d : dims) count *= d;
+            std::vector<float> values(count);
+            for (size_t i = 0; i < count; ++i)
+                values[i] = std::ldexp(Pattern(int(i / 128) + seed, int(i % 128)), exponent);
+            Upload(x, dims, values);
+        };
+        fill(fw, {rows, columns}, 3, -3);
+        fill(bw, {rows / 2 + 1, columns}, 7, -3);
+        fill(gw, {rows + 5, columns}, 11, -3);
+        if (gguf) for (Data *w : {&fw, &bw, &gw}) {
+            w->dataType = DATA_GGUF_FORMAT; w->ggmlType = GGML_TYPE_BF16; w->Resize(w->dims);
+        }
+        auto run = [&](Data &x, Data &fo, Data &bo, Data &go) {
+            return FastllmCudaHybridKdaInputProjections(x, fw, bw, gw, fo, bo, go);
+        };
+        Glm5NextModel::HybridDecodeState::Segment segment(device, 3);
+        const bool graphCase = columns == 4096 && rows == 128;
+        for (int step = 0; step < 5; ++step) {
+            fill(input, {1, 1, columns}, step + 17, step == 1 ? -30 : step == 2 ? 30 : -2);
+            if (graphCase) segment.Run(input, [&](Data &x, std::vector<Data> &out) {
+                Check(run(x, out[0], out[1], out[2]), "KDA input graph launch");
+            });
+            else Check(run(input, f, beta, g), "KDA input projections launch");
+            Linear(input, fw, Data(), expectedF);
+            Linear(input, bw, Data(), expectedBeta);
+            Linear(input, gw, Data(), expectedG);
+            Check(bytes(graphCase ? segment.outputs[0] : f) == bytes(expectedF), "KDA F projection bits");
+            Check(bytes(graphCase ? segment.outputs[1] : beta) == bytes(expectedBeta), "KDA beta projection bits");
+            Check(bytes(graphCase ? segment.outputs[2] : g) == bytes(expectedG), "KDA G projection bits");
+            if (graphCase && step) Check(segment.exec != nullptr, "KDA input graph replay");
+        }
+        Data untouched; fill(untouched, {1, 1, 8}, 1, 0);
+        const auto saved = bytes(untouched);
+        void *original = fw.cudaData; fw.cudaData = (char*)original + 2;
+        Check(!run(input, untouched, beta, g), "KDA input unaligned fallback"); fw.cudaData = original;
+        Check(bytes(untouched) == saved, "KDA input fallback changed output");
+        Check(!run(input, f, f, g), "KDA input aliased outputs fallback");
+        const auto shape = input.dims; input.Resize({1, 2, columns / 2});
+        Check(!run(input, untouched, beta, g), "KDA input batch fallback"); input.Resize(shape);
+        const auto type = bw.dataType; bw.dataType = FLOAT32;
+        Check(!run(input, untouched, beta, g), "KDA input mixed-type fallback"); bw.dataType = type;
+        Check(bytes(untouched) == saved, "KDA input unsupported fallback changed output");
+    }
+    std::printf("PASS hybrid KDA input projections device=%d, native/GGUF, 36 shapes x 5 steps, graph and fallback\n", device);
+    for (bool gguf : {false, true}) for (int heads : {1, 5, 32, 64, 128, 256}) for (int rank : {8, 24, 128, 256}) for (int taps : {2, 4, 5}) {
+        constexpr int dim = 128;
+        const int channels = heads * dim;
+        Data q,k,v,f,g,beta,fw,gw,qw,kw,vw,a,dt,norm,cache,state,refCache,refState,output,reference;
+        auto fill = [&](Data &x,const std::vector<int> &dims,int seed,float scale,DataType type=BFLOAT16) {
+            size_t n=1;for(int d:dims)n*=d;std::vector<float> values(n);
+            for(size_t i=0;i<n;++i)values[i]=Pattern(int(i/128)+seed,int(i%128))*scale;
+            Upload(x,dims,values,type);
+        };
+        fill(q,{1,1,channels},1,.5f);fill(k,q.dims,2,.5f);fill(v,q.dims,3,.5f);
+        fill(f,{1,1,rank},4,.1f);fill(g,f.dims,5,.1f);fill(beta,{1,1,heads},6,.3f);
+        fill(fw,{channels,rank},7,.1f);fill(gw,fw.dims,8,.1f);
+        if (gguf) for (auto *w : {&fw,&gw}) {
+            w->dataType=DATA_GGUF_FORMAT;w->ggmlType=GGML_TYPE_BF16;w->Resize(w->dims);
+        }
+        fill(qw,{channels,1,taps},9,.1f,FLOAT32);fill(kw,qw.dims,10,.1f,FLOAT32);fill(vw,qw.dims,11,.1f,FLOAT32);
+        fill(a,{heads},12,.3f,FLOAT32);fill(dt,{heads,dim},13,.1f,FLOAT32);fill(norm,{dim},14,.2f,FLOAT32);
+        fill(cache,{3,taps-1,channels},15,.5f);fill(state,{1,heads,dim,dim},16,.01f,FLOAT32);
+        refCache.CopyFrom(cache);refState.CopyFrom(state);
+        auto run = [&](Data &input,Data &out) {
+            return FastllmCudaHybridKdaDecode(input,k,v,f,g,beta,fw,gw,qw,kw,vw,a,dt,norm,
+                cache,state,heads,dim,taps,-5.f,1e-6f,out);
+        };
+        auto eager = [&] {
+            Data rawGate,rawBeta,gate;
+            Linear(f,fw,Data(),rawGate);ToDataType(beta,rawBeta,FLOAT32);
+            Data convolved[3],views[3];Data *inputs[]{&q,&k,&v};Data *weights[]{&qw,&kw,&vw};
+            for(int i=0;i<3;++i) {
+                views[i].FakeFrom(refCache,(size_t)i*(taps-1)*channels*2);
+                views[i].Resize({1,taps-1,channels});
+                KimiK3CausalConv1D(*inputs[i],*weights[i],taps,views[i],convolved[i]);
+                convolved[i].Reshape({1,1,heads,dim});
+            }
+            rawGate.Reshape({1,1,heads,dim});Data attention;
+            KimiK3RecurrentKDAOutputOnly(convolved[0],convolved[1],convolved[2],rawGate,rawBeta,
+                a,dt,-5.f,refState,attention,true,true);
+            Linear(g,gw,Data(),gate);gate.Reshape({1,1,heads,dim});
+            KimiK3RMSNormSigmoidGate(attention,gate,norm,1e-6f,reference);
+        };
+        const bool graphCase = heads == 64 && rank == 128 && taps == 4;
+        Glm5NextModel::HybridDecodeState::Segment segment(device,1);
+        for (int step=0;step<5;++step) {
+            fill(q,q.dims,step+31,.5f);
+            if(graphCase)segment.Run(q,[&](Data &in,std::vector<Data> &out){Check(run(in,out[0]),"KDA graph launch");});
+            else Check(run(q,output),"KDA launch");
+            eager();
+            Check(bytes(graphCase?segment.outputs[0]:output)==bytes(reference),"KDA output bits");
+            Check(bytes(cache)==bytes(refCache),"KDA convolution cache bits");
+            Check(bytes(state)==bytes(refState),"KDA recurrent state bits");
+            if(graphCase && step)Check(segment.exec!=nullptr,"KDA graph capture/replay");
+            if(graphCase) {
+                std::vector<void*> scratch;
+                for(int j=0;j<32;++j)scratch.push_back(FastllmCudaMalloc(65536));
+                for(void *p:scratch)FastllmCudaFree(p);
+            }
+        }
+        const auto savedCache=bytes(cache),savedState=bytes(state);
+        void *saved=f.cudaData;f.cudaData=(char*)f.cudaData+2;
+        Check(!run(q,output),"KDA unaligned fallback");f.cudaData=saved;
+        Check(bytes(cache)==savedCache && bytes(state)==savedState,"KDA fallback mutated state");
+        if(graphCase) {
+            auto time = [&](const std::function<void()> &body) {
+                cudaEvent_t begin,end;cudaEventCreate(&begin);cudaEventCreate(&end);
+                cudaEventRecord(begin,cudaStreamPerThread);
+                for(int i=0;i<100;++i)body();
+                cudaEventRecord(end,cudaStreamPerThread);cudaEventSynchronize(end);
+                float ms=0;cudaEventElapsedTime(&ms,begin,end);cudaEventDestroy(begin);cudaEventDestroy(end);
+                return ms*10;
+            };
+            const float oldUs=time(eager),newUs=time([&]{Check(run(q,output),"KDA timing launch");});
+            std::printf("KDA timing device=%d gguf=%d eager_us=%.3f hybrid_us=%.3f\n",device,gguf,oldUs,newUs);
+        }
+    }
+    Check(cudaDeviceSynchronize()==cudaSuccess,"KDA asynchronous error");
+    std::printf("PASS hybrid KDA device=%d 144 native/GGUF shapes x 5 steps, output/cache/state bits, graph, fallback\n",device);
+}
+
+void fastllm::Glm5NextGGUFTestAccess::HybridMla() {
+    const int device = FastllmCudaGetDevice();
+    Check(FastllmCudaHybridDsaSupported(), "hybrid MLA SM75 support");
+    for (int start : {2048, 4093, 8190, 32766}) for (int heads : {32, 64}) {
+        constexpr int steps = 16;
+        int pages = (start + steps + 127) / 128 + 7;
+        while (pages % 5 == 0) ++pages;
+        PagedCacheManager pool;
+        BorrowedCache paged;
+        Data keyPe, input, unused, absorbed, replacement, output;
+        auto fill = [&](Data &x, const std::vector<int> &dims, int seed, DataType type=BFLOAT16) {
+            size_t count=1;for(int d:dims)count*=d;std::vector<float> values(count);
+            for(size_t i=0;i<count;++i)values[i]=Pattern(int(i/128)+seed,int(i%128))*.125f;
+            Upload(x,dims,values,type);
+        };
+        fill(pool,{pages,128,1,512},1);
+        paged.dataType=BFLOAT16;paged.Resize({1,start+1,512});paged.isPagedKVCache=true;
+        paged.pageLen=128;paged.pagedKVCacheData=&pool;
+        auto updatePages = [&](int tokens) {
+            paged.Resize({1,tokens,512});paged.lastPageLen=(tokens-1)%128+1;
+            paged.pageIndex.clear();
+            for(int p=0;p<(tokens+127)/128;++p)paged.pageIndex.push_back((p*5+3)%pages);
+        };
+        WeightMap weight;weight.weight.try_emplace("index_kpool_compress_ape");
+        auto &ape=weight["index_kpool_compress_ape"];fill(ape,{4,128},2,FLOAT32);
+        Glm5NextIndexerCache actual,reference;
+        actual.tokens=reference.tokens=start;
+        fill(actual.keys,{1,start/4,128},3);reference.keys.CopyFrom(actual.keys);
+        if(start%4) {
+            fill(actual.tailKeys,{1,start%4,128},4);fill(actual.tailGates,{1,start%4,128},5);
+            reference.tailKeys.CopyFrom(actual.tailKeys);reference.tailGates.CopyFrom(actual.tailGates);
+        }
+        DsaProjections projected;projected.queryQuantized=true;
+        fill(absorbed,{heads,1,512},6);fill(input,{1,1,128},7);
+        Glm5NextModel::HybridDecodeState::MlaSegment segment;
+        auto attend = [&](Data &indices, Data &out) {
+            Data q;q.FakeFrom(absorbed,0);q.Resize(absorbed.dims);
+            SparseLatentAttention(q,paged,indices,.125f,out,false,&keyPe,true);
+        };
+        auto run = [&] {
+            return segment.Run(actual,projected.keys,projected.gates,projected.query,
+                projected.headWeights,ape,paged,{&absorbed},attend,output);
+        };
+        int replays=0;
+        for(int step=0;step<steps;++step) {
+            const int past=start+step;updatePages(past+1);
+            fill(projected.keys,{1,1,128},step+10);fill(projected.gates,{1,1,128},step+20);
+            fill(projected.query,{1,1,32,128},step+30);fill(projected.headWeights,{1,1,32},step+40,FLOAT32);
+            if(step==9 && paged.pageIndex.size()>1)std::swap(paged.pageIndex[0],paged.pageIndex[1]);
+            if(step==11) {
+                fill(replacement,absorbed.dims,60);
+                absorbed.CopyFrom(replacement);
+                // Force an address replacement while keeping the shape.
+                std::swap(absorbed.cudaData,replacement.cudaData);
+            }
+            if(step==7) {
+                actual.captureReplay=true;
+                Check(!run() && actual.tokens==past,"hybrid MLA unsupported checkpoint fallback");
+                actual.captureReplay=false;
+                Data ignored;
+                BuildDsaIndices(input,unused,weight,"",past,2048,actual,ignored,&paged,&projected,true);
+                attend(ignored,output);
+            } else {
+                Check(run(),"hybrid MLA decode run");
+                replays+=segment.graph && segment.graph->exec;
+            }
+            Data indices,expected;
+            BuildDsaIndices(input,unused,weight,"",past,2048,reference,indices,&paged,&projected,true);
+            attend(indices,expected);
+            Check(Download(output)==Download(expected),"hybrid MLA graph attention bits");
+            Check(actual.tokens==reference.tokens && actual.keys.dims==reference.keys.dims &&
+                Download(actual.keys)==Download(reference.keys),"hybrid MLA pooled cache bits");
+            Check(actual.tailKeys.dims==reference.tailKeys.dims && actual.tailGates.dims==reference.tailGates.dims,
+                "hybrid MLA tail shapes");
+            if((past+1)%4) {
+                Check(Download(actual.tailKeys)==Download(reference.tailKeys) &&
+                    Download(actual.tailGates)==Download(reference.tailGates),"hybrid MLA tail bits");
+            }
+            if(step!=7) {
+                int position=0;FastllmCudaCopyFromDeviceToHost(&position,segment.position.cudaData,4);
+                Check(position==actual.tokens,"hybrid MLA device/host position");
+            }
+        }
+        Check(replays>=5,"hybrid MLA must replay across dynamic lengths");
+        // The descriptor does not own the pool used by this test.
+        paged.pagedKVCacheData=nullptr;
+    }
+    Check(cudaDeviceSynchronize()==cudaSuccess,"hybrid MLA asynchronous error");
+    std::printf("PASS hybrid MLA device=%d dynamic KPool/page/bucket boundaries, graph, fallback, attention/cache bits\n",device);
+}
+
+void fastllm::Glm5NextGGUFTestAccess::HybridGraphs() {
+    constexpr int n = 4096;
+    const int device = FastllmCudaGetDevice();
+    Data state;
+    Upload(state, {1, 1, n}, std::vector<float>(n));
+    std::vector<float> expected(n);
+    for (bool disabled : {false, true}) {
+        Glm5NextModel::HybridDecodeState::Segment segment(device, 2);
+        segment.disabled = disabled;
+        for (int step = 0; step < 7; ++step) {
+            // Recreate the source allocation; captured kernels must read the
+            // copied input, not retain the first caller's tensor address.
+            std::vector<float> values(n);
+            for (int i = 0; i < n; ++i) values[i] = F(Bf(Pattern(step + 1, i)));
+            Data input;
+            Upload(input, {1, 1, n}, values);
+            segment.Run(input, [&](Data &fixed, std::vector<Data> &out) {
+                Mul(fixed, 0.5f, out[0]);
+                AddTo(state, out[0]);
+                out[1].CopyFrom(state);
+            });
+            for (int i = 0; i < n; ++i) expected[i] = F(Bf(expected[i] + values[i] * 0.5f));
+            Check(Download(state) == expected && Download(segment.outputs[1]) == expected,
+                  "hybrid graph recurrent state/input lifetime");
+            if (step > 0) Check(disabled ? segment.exec == nullptr : segment.exec != nullptr,
+                                "hybrid graph capture/fallback selection");
+            std::vector<void *> scratch;
+            for (int i = 0; i < 32; ++i) scratch.push_back(FastllmCudaMalloc(65536));
+            for (void *p : scratch) FastllmCudaFree(p);
+        }
+    }
+    int major = 0, minor = 0;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+    if (major == 7 && minor == 5) for (auto type : {FLOAT32, BFLOAT16}) {
+        Data fn, scale, base, norm;
+        std::vector<float> weights(24 * 4 * n), norms(n), bases(24);
+        for (int i = 0; i < int(weights.size()); ++i) weights[i] = Pattern(i / n, i % n) / 256;
+        for (int i = 0; i < n; ++i) norms[i] = 1 + Pattern(i, 7) / 16;
+        for (int i = 0; i < 24; ++i) bases[i] = Pattern(i, 3) / 16;
+        Upload(fn, {24, 4 * n}, weights, type); Upload(norm, {n}, norms, FLOAT32);
+        Upload(scale, {3}, {.8f, .6f, .7f}, FLOAT32); Upload(base, {24}, bases, FLOAT32);
+        Glm5NextModel::HybridDecodeState::Segment segment(device, 3);
+        for (int step = 0; step < 5; ++step) {
+            Data input, reference, post, comb;
+            std::vector<float> values(4 * n);
+            for (int i = 0; i < 4 * n; ++i) values[i] = Pattern(step + i / n, i % n) * .25f;
+            Upload(input, {1, 1, 4, n}, values);
+            segment.Run(input, [&](Data &fixed, std::vector<Data> &out) {
+                Check(FastllmCudaGlm5NextHybridHcPreNorm(fixed, fn, scale, base, norm,
+                    4, 20, 1e-6f, 1e-6f, out[0], out[1], out[2]), "HC graph body");
+            });
+            Check(FastllmCudaGlm5NextHcPreNorm(input, fn, scale, base, norm,
+                4, 20, 1e-6f, 1e-6f, reference, post, comb), "HC eager reference");
+            Check(Download(reference) == Download(segment.outputs[0]) &&
+                  Download(post) == Download(segment.outputs[1]) &&
+                  Download(comb) == Download(segment.outputs[2]), "HC graph output/post/comb bits");
+            if (step) Check(segment.exec != nullptr, "HC graph replay not captured");
+        }
+    }
+    Check(cudaDeviceSynchronize() == cudaSuccess, "hybrid graph asynchronous error");
+    std::printf("PASS hybrid graph device=%d capture/replay, input replacement, pool reuse, eager fallback\n",device);
+}
+void HybridMoePost() {
+    auto bytes = [](Data &x) {
+        std::vector<unsigned char> result(x.GetBytes());
+        Check(cudaMemcpy(result.data(), x.cudaData, result.size(), cudaMemcpyDeviceToHost) == cudaSuccess,
+              "expert post download");
+        return result;
+    };
+    int cases = 0;
+    for (int rows : {1, 2, 4, 8, 16, 32}) for (int hc : {1, 4, 8})
+    for (int dim : {37, 4096}) for (int seed = 0; seed < 4; ++seed) {
+        std::vector<float> a(rows * dim), b(a.size()), residual(rows * hc * dim), post(rows * hc), comb(rows * hc * hc);
+        auto value = [&](int i, int offset) {
+            float v = Pattern(seed + offset, i);
+            if (seed == 1) return std::copysign(0.f, v);
+            if (seed == 2) return std::ldexp(v, (i * 7 + offset) % 200 - 100);
+            if (seed == 3 && i < 3) return i == 0 ? NAN : i == 1 ? INFINITY : -INFINITY;
+            return v;
+        };
+        for (int i = 0; i < int(a.size()); ++i) { a[i] = value(i, 1); b[i] = value(i, 2); }
+        for (int i = 0; i < int(residual.size()); ++i) residual[i] = value(i, 3);
+        for (int i = 0; i < int(post.size()); ++i) post[i] = Pattern(seed, i) / 4;
+        for (int i = 0; i < int(comb.size()); ++i) comb[i] = Pattern(seed + 5, i) / 8;
+        Data shared, routed, res, p, c, sum, reference, output;
+        Upload(shared, {rows, dim}, a); Upload(routed, {rows, dim}, b);
+        Upload(res, {1, rows, hc, dim}, residual); Upload(p, {1, rows, hc}, post, FLOAT32);
+        Upload(c, {1, rows, hc, hc}, comb, FLOAT32);
+        auto original = [&] {
+            sum.CopyFrom(shared); AddTo(sum, routed);
+            Check(FastllmCudaDeepSeekV4HcPostCudaMix(sum, res, p, c, 1, rows, hc, dim, reference),
+                  "original expert sum and HC post");
+        };
+        original();
+        Check(FastllmCudaHybridMoeHcPost(shared, routed, res, p, c, output), "fused expert post dispatch");
+        Check(bytes(output) == bytes(reference), "expert BF16 sum and FP64 residual bits");
+        if (seed == 0 && hc == 4 && dim == 4096) {
+            Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) == cudaSuccess,
+                  "expert post graph begin");
+            Check(FastllmCudaHybridMoeHcPost(shared, routed, res, p, c, output), "expert post capture");
+            cudaGraph_t graph; cudaGraphExec_t exec;
+            Check(cudaStreamEndCapture(cudaStreamPerThread, &graph) == cudaSuccess, "expert post graph end");
+            Check(cudaGraphInstantiateWithFlags(&exec, graph, 0) == cudaSuccess, "expert post instantiate");
+            for (int step = 0; step < 3; ++step) {
+                for (int i = 0; i < int(a.size()); ++i) a[i] = Pattern(step + 8, i);
+                Upload(shared, {rows, dim}, a); original();
+                Check(cudaGraphLaunch(exec, cudaStreamPerThread) == cudaSuccess, "expert post replay");
+                Check(bytes(output) == bytes(reference), "expert post replay bits");
+            }
+            cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
+        }
+        if (rows == 1 && hc == 4 && dim == 37 && seed == 0) {
+            const auto old = bytes(res);
+            Check(!FastllmCudaHybridMoeHcPost(shared, routed, res, p, c, res), "expert post alias fallback");
+            Check(bytes(res) == old, "expert post fallback must leave output intact");
+        }
+        ++cases;
+    }
+    {
+        Data x, res, p, c, output;
+        Upload(x, {33, 1}, std::vector<float>(33)); Upload(res, {1, 33, 1, 1}, std::vector<float>(33));
+        Upload(p, {33}, std::vector<float>(33), FLOAT32); Upload(c, {33}, std::vector<float>(33), FLOAT32);
+        Upload(output, {1}, {7}); const auto old = bytes(output);
+        Check(!FastllmCudaHybridMoeHcPost(x, x, res, p, c, output), "expert post row limit fallback");
+        Check(bytes(output) == old, "expert post row limit must leave output intact");
+    }
+    Check(cudaDeviceSynchronize() == cudaSuccess, "expert post asynchronous error");
+    std::printf("PASS hybrid expert post GPU%d: %d exact cases, rows1..32, graph, nonfinite and alias fallback\n",
+                FastllmCudaGetDevice(), cases);
+}
+
+void HybridOutput() {
+    auto bytes = [](Data &x) {
+        std::vector<unsigned char> v(x.GetBytes());
+        Check(cudaMemcpy(v.data(),x.cudaData,v.size(),cudaMemcpyDeviceToHost)==cudaSuccess,"output download");
+        return v;
+    };
+    int cases=0;
+    for(int hc:{1,2,3,4,8,16}) for(int seed=0;seed<12;++seed) {
+        std::vector<float> x(hc*4096),w(4096);
+        for(int i=0;i<int(x.size());++i) {
+            x[i]=Pattern(i/4096+seed,i%4096);
+            if(seed%3==0)x[i]=std::ldexp(x[i],(i*13+seed)%81-40);
+            if(seed==1)x[i]=0;
+        }
+        for(int i=0;i<4096;++i)w[i]=Pattern(seed+17,i)*.25f;
+        Data input,weight,reference,output,fp,mean,collapsed;
+        Upload(input,{1,1,hc,4096},x);Upload(weight,{4096},w,FLOAT32);
+        auto old = [&] {
+            ToDataType(input,fp,FLOAT32);
+            for(int i=0;i<hc;++i) {
+                Data row;Split(fp,2,i,i+1,row);row.Reshape({1,1,4096});
+                if(!i)Mul(row,1.f/hc,mean);else AddTo(mean,row,1.f/hc);
+            }
+            ToDataType(mean,collapsed,BFLOAT16);KimiK3RMSNorm(collapsed,weight,1e-6f,reference);
+        };
+        old();Check(FastllmCudaHybridHcMeanNorm(input,weight,1e-6f,output),"hybrid output norm dispatch");
+        Check(bytes(output)==bytes(reference),"hybrid output normalization bits");
+        if(hc==4 && seed==2) {
+            Check(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)==cudaSuccess,"output capture");
+            Check(FastllmCudaHybridHcMeanNorm(input,weight,1e-6f,output),"captured norm");
+            cudaGraph_t graph;cudaGraphExec_t exec;Check(cudaStreamEndCapture(cudaStreamPerThread,&graph)==cudaSuccess,"output capture end");
+            Check(cudaGraphInstantiateWithFlags(&exec,graph,0)==cudaSuccess,"output instantiate");
+            for(int i=0;i<3;++i){Check(cudaGraphLaunch(exec,cudaStreamPerThread)==cudaSuccess,"output replay");Check(bytes(output)==bytes(reference),"norm replay bits");}
+            cudaGraphExecDestroy(exec);cudaGraphDestroy(graph);
+            input.strides[2]++;Check(!FastllmCudaHybridHcMeanNorm(input,weight,1e-6f,output),"strided norm fallback");input.strides[2]--;
+            input.Reshape({1,2,2,4096});Check(!FastllmCudaHybridHcMeanNorm(input,weight,1e-6f,output),"batch norm fallback");
+        }
+        cases++;
+    }
+    int selections=0;
+    for(int n:{1,17,255,256,257,4095,4096,4097,154880,200001}) for(int mode=0;mode<8;++mode) {
+        std::vector<float> values(n);
+        for(int i=0;i<n;++i)values[i]=Pattern(mode,i);
+        if(mode==1)std::fill(values.begin(),values.end(),1.f);
+        if(mode>=2) {
+            std::fill(values.begin(),values.end(),-INFINITY);
+            if(mode==2)for(int i:{1,64,128,256,4096,4097})if(i<n)values[i]=7;
+            if(mode==3)for(int i:{1,64})if(i<n)values[i]=7;
+            if(mode==4)for(int i:{3,128,192,4097})if(i<n)values[i]=INFINITY;
+            if(mode==5)std::fill(values.begin(),values.end(),NAN);
+            if(mode==6){std::fill(values.begin(),values.end(),NAN);values.back()=1;}
+        }
+        Data input,fp,reference,output;Upload(input,{1,1,n},values);
+        ToDataType(input,fp,FLOAT32);TopK(fp,reference,1);
+        Check(FastllmCudaHybridTop1(input,output),"hybrid top1 dispatch");
+        Check(bytes(output)==bytes(reference),"hybrid top1 tie/nonfinite bits");selections++;
+        input.Reshape({1,n,1});if(n>1)Check(!FastllmCudaHybridTop1(input,output),"multirow top1 fallback");
+    }
+    int device=0;cudaGetDevice(&device);
+    std::printf("PASS hybrid output device=%d: %d HC mean/norm and %d Top1 cases, exact bits, ties, nonfinite, graph, fallback\n",device,cases,selections);
+}
+void fastllm::Glm5NextGGUFTestAccess::HybridDsaPreparation() {
+    auto bytes = [](Data &x) {
+        std::vector<unsigned char> result(x.GetBytes());
+        Check(cudaMemcpy(result.data(), x.cudaData, result.size(), cudaMemcpyDeviceToHost) == cudaSuccess,
+            "DSA projection download");
+        return result;
+    };
+    int quantCases = 0;
+    for (int rows : {1, 2, 7, 32}) {
+        Glm5NextModel::HybridDecodeState::Segment segment(FastllmCudaGetDevice(), 1);
+        for (int step = 0; step < 7; ++step) {
+            std::vector<float> values(rows * 128);
+            for (size_t i = 0; i < values.size(); ++i) {
+                const float x = Pattern(i / 128, i % 128);
+                values[i] = step == 0 ? 0.f : step == 1 ? x :
+                    step == 2 ? std::ldexp(x, -80) : step == 3 ? std::ldexp(x, 80) :
+                    step == 4 ? (int(i % 127) - 63) * .0625f + .0001f :
+                    step == 5 ? F(uint16_t(0x3f00 + i % 256)) + std::ldexp(1.f, -9) : x;
+            }
+            if (step == 6) {
+                values[0] = std::numeric_limits<float>::infinity();
+                values[1] = -values[0];
+                values[2] = std::numeric_limits<float>::quiet_NaN();
+            }
+            Data input, rounded, expected, scales, bfScales;
+            Upload(input, {rows, 128}, values, FLOAT32);
+            ToDataType(input, rounded, BFLOAT16);
+            Check(FastllmCudaNaiveQuantizeIndexer(rounded, expected, scales, true), "reference FP8 quantization");
+            ToDataType(scales, bfScales, BFLOAT16); MulTo(expected, bfScales);
+            segment.Run(input, [&](Data &fixed, std::vector<Data> &out) {
+                Check(FastllmCudaHybridDsaQuantizeRotated(fixed, out[0]), "fused FP8 round trip");
+            });
+            Check(bytes(expected) == bytes(segment.outputs[0]), "FP8 round-trip bits, including scale boundaries");
+            if (step) Check(segment.exec != nullptr, "FP8 round-trip graph replay");
+            ++quantCases;
+        }
+    }
+    Data unsupported, untouched;
+    Upload(unsupported, {1, 129}, std::vector<float>(129), FLOAT32);
+    Check(!FastllmCudaHybridDsaQuantizeRotated(unsupported, untouched) && untouched.cudaData == nullptr,
+        "unsupported quantization must leave output untouched");
+    int cases = 0;
+    for (const auto shape : {std::pair<int,int>{37,31}, {257,513}, {4096,1536}}) {
+        const int columns = shape.first, rank = shape.second;
+        WeightMap weights;
+        for (const auto item : {std::pair<const char*,int>{"wk.weight",128},
+                {"index_kpool_compress_gate",128}, {"weights_proj.weight",32}, {"wq_b.weight",4096}}) {
+            const int width = std::string(item.first) == "wq_b.weight" ? rank : columns;
+            std::vector<float> values(size_t(width) * item.second);
+            for (size_t i=0;i<values.size();++i) values[i]=Pattern(i/width,i%width)/137;
+            Upload(weights[item.first], {item.second,width}, values, FLOAT32);
+        }
+        std::vector<float> gamma(128),beta(128);
+        for(int i=0;i<128;++i){gamma[i]=1+Pattern(i,3)/16;beta[i]=Pattern(i,5)/16;}
+        Upload(weights["k_norm.weight"],{128},gamma,FLOAT32);
+        Upload(weights["k_norm.bias"],{128},beta,FLOAT32);
+        Data input,normalized;
+        Glm5NextModel::HybridDecodeState::Segment segment(FastllmCudaGetDevice(),4);
+        for(int step=0;step<5;++step) {
+            std::vector<float> x(columns),q(rank);
+            for(int i=0;i<columns;++i)x[i]=step==4?0.f:std::ldexp(Pattern(step,i),step==2?7:step==3?-7:0);
+            for(int i=0;i<rank;++i)q[i]=std::ldexp(Pattern(step+3,i),step==3?-7:0);
+            Upload(input,{1,1,columns},x);
+            if(!step)Upload(normalized,{1,1,rank},q);
+            else {
+                std::vector<uint16_t> bits(rank);for(int i=0;i<rank;++i)bits[i]=Bf(q[i]);
+                FastllmCudaCopyFromHostToDevice(normalized.cudaData,bits.data(),rank*2);
+            }
+            DsaProjections reference;
+            ProjectDsaKeys(input,weights,"",reference);ProjectDsaQueries(input,normalized,weights,"",reference);
+            auto body=[&](Data &fixed,std::vector<Data> &out) {
+                Check(FastllmCudaHybridDsaProjections(fixed,normalized,weights["wk.weight"],
+                    weights["index_kpool_compress_gate"],weights["wq_b.weight"],weights["weights_proj.weight"],
+                    weights["k_norm.weight"],weights["k_norm.bias"],out[0],out[1],out[2],out[3]),"DSA projections dispatch");
+            };
+            segment.Run(input,body);
+            Data *expected[]{&reference.keys,&reference.gates,&reference.query,&reference.headWeights};
+            for(int i=0;i<4;++i)Check(bytes(*expected[i])==bytes(segment.outputs[i]),"DSA projection/normalization/scale bits");
+            if(step)Check(segment.exec!=nullptr,"DSA projection graph not captured");
+            ++cases;
+        }
+        Data rejected, untouched;Upload(rejected,{1,2,columns},std::vector<float>(2*columns));
+        Check(!FastllmCudaHybridDsaProjections(rejected,normalized,weights["wk.weight"],
+            weights["index_kpool_compress_gate"],weights["wq_b.weight"],weights["weights_proj.weight"],
+            weights["k_norm.weight"],weights["k_norm.bias"],untouched,untouched,untouched,untouched),"DSA multirow fallback");
+        Check(untouched.cudaData==nullptr,"DSA rejection mutated output");
+    }
+    Check(cudaDeviceSynchronize()==cudaSuccess,"DSA projections async error");
+    std::printf("PASS hybrid DSA preparation GPU%d: %d projections and %d FP8 round trips exact, graph replay and fallback\n",
+        FastllmCudaGetDevice(),cases,quantCases);
+}
+
 int main(int argc, char **argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     FastllmCudaSetDevice(0);
     static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:0");
     try {
+        const struct HybridCase {
+            const char *option;
+            void (*run)();
+            bool sm75Only;
+        } hybridCases[] = {
+            {"--hybrid-moe-post", HybridMoePost, true},
+            {"--hybrid-dsa-prepare", Glm5NextGGUFTestAccess::HybridDsaPreparation, true},
+            {"--hybrid-output", HybridOutput, false},
+            {"--hybrid-mla", Glm5NextGGUFTestAccess::HybridMla, true},
+            {"--hybrid-router", Glm5NextGGUFTestAccess::HybridRouter, false},
+            {"--hybrid-kda", Glm5NextGGUFTestAccess::HybridKda, false},
+            {"--hybrid-graph", Glm5NextGGUFTestAccess::HybridGraphs, false},
+        };
+        for (const auto &test : hybridCases) if (argc == 2 && std::string(argv[1]) == test.option) {
+            bool checked = false;
+            for (int device = 0; device < devices; ++device) {
+                FastllmCudaSetDevice(device);
+                static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:" + std::to_string(device));
+                if (test.sm75Only && FastllmCudaRuntimeArch() != 75) continue;
+                test.run();
+                checked = true;
+            }
+            return checked ? 0 : 77;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--hybrid-sm75") {
+            bool checked = false;
+            for (int device = 0; device < devices; ++device) {
+                FastllmCudaSetDevice(device);
+                static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:" + std::to_string(device));
+                if (!HybridSm75Attention()) continue;
+                checked = true;
+                HybridHcPreNorm();
+                HybridBf16Prefill();
+                HybridHcPostPrefill();
+                for (int rows : {1, 2, 4, 8, 9, 17, 33}) Scoring(true, rows);
+                Attention(2045, 9, true, true);
+                Attention(4098, 1, false, true);
+                Attention(32769, 1, true, true);
+                Check(cudaDeviceSynchronize() == cudaSuccess, "hybrid CUDA async error");
+            }
+            return checked ? 0 : 77;
+        }
         if (argc == 2 && std::string(argv[1]) == "--sm75-verify") {
             bool checked = false;
             for (int device = 0; device < devices; ++device) {

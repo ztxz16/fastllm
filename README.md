@@ -210,7 +210,7 @@ ftllm server /data/models/Qwen3.8-27B-FP8 \
 
 `--tokens` 是所有会话共享的 KV 池容量，未设置时自动预算。显式目标超过 RoPE 覆盖范围或 warmup 校准容量会启动失败；`/v1/models` 返回实际窗口、模型原声明和用户目标。上述 1M 命令需要足够显存，本机双 24GB 的测试配置无法容纳，完整 1M 输入尚未实测。
 
-当前扩展接入 HF Qwen2、Qwen3、Qwen3.5 布局，以及基于 Qwen3.5 架构的 Qwen3.8；Launcher 高级参数中的「RoPE 扩展」使用相同配置。GGUF、FLM 和自定义 GraphLLM 仅设置长度时保留旧的只缩小行为，暂不支持新的 RoPE 扩展。更多参数、适配范围和验证结果见[上下文扩展说明](docs/context-length-extension-design.md)。
+当前扩展支持 Qwen2、Qwen3、Qwen3.5 布局，以及基于 Qwen3.5 架构的 Qwen3.8；Launcher 高级参数中的「RoPE 扩展」使用相同配置。HF 目录和 GGUF 文件均可显式设置 `--rope_scaling`，仍受模型布局限制。GGUF、FLM 和自定义 GraphLLM 在 CLI 中仅设置长度时保留只缩小的行为；FLM 和自定义 GraphLLM 暂不支持 RoPE 扩展。更多参数、适配范围和验证结果见[上下文扩展说明](docs/context-length-extension.md)。
 
 ### 投机解码
 
@@ -238,7 +238,7 @@ ftllm server /data/models/qwen3.8 \
 
 `--draft` 会根据 draft checkpoint 自动识别 MTP、DFlash2 或 DSpark。独立 MTP 当前用于 Qwen3.5 GGUF，路径可指向包含 `config.json` 和 `mtp.safetensors` 的目录，也可直接指向 `mtp.safetensors`；省略 `--draft_tokens` 时默认使用 5。DFlash2 的 `--draft_tokens` 表示实际 draft token 数，不包含 anchor token。
 
-DFlash2 的完整配置和验证结果见 [Qwen3.8 DFlash2 文档](docs/dflash2_qwen38_27b_tp2_20260819.md)。
+DFlash2 的完整配置和验证结果见 [Qwen3.8 DFlash2 文档](docs/benchmarks/qwen38_27b_dflash2.md)。
 
 ### Qwen4 PLE 磁盘模式
 
@@ -312,7 +312,7 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--ori` | 读取部分 GGUF 时指定原模型配置和 tokenizer 目录 |
 | `--mmproj` | Qwen3.5 架构族 GGUF 的配套视觉模块文件；配置要求与示例见 [GGUF 多模态](docs/qwen3.md#gguf-multimodal) |
 
-Qwen4 单卡 CUDA 推理默认将 MTP 草稿专家常驻 GPU，独立于 `--moe_cuda_cache` 的目标模型专家缓存预算，需要额外的草稿专家显存。显存紧张时，可在启动前设置 `FASTLLM_QWEN4_MTP_GPU_EXPERTS=0`，让草稿专家继续使用 MoE 设备配置；TP、多设备流水线和 CPU 推理沿用原有放置策略。
+Qwen4 CUDA 推理将 MTP 草稿专家常驻 GPU：单卡使用该卡，PP 使用最后一个 CUDA 阶段，TP 在各卡常驻对应分片。草稿专家独立于 `--moe_cuda_cache` 的目标模型专家缓存预算，需要额外显存；CPU 推理沿用 MoE 设备配置。
 
 Qwen3.5 系列的 MTP 和 DFlash 草稿支持以下设置。启用相应的草稿算法后，兼容路径默认使用 NVFP4；环境变量可在启动前覆盖默认值：
 

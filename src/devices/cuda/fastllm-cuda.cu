@@ -7,6 +7,7 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "fastllm-cuda-rope.cuh"
 #include "devices/cuda/cudaworkspace.h"
@@ -499,6 +500,19 @@ long long FastllmCudaGetFreeSize() {
     size_t totalBytes = 0;
     const cudaError_t error = cudaMemGetInfo(&freeBytes, &totalBytes);
     return error == cudaSuccess ? (long long)freeBytes : 0;
+}
+
+bool FastllmCudaGetMemoryInfo(int device, uint64_t &freeBytes, uint64_t &totalBytes) {
+    int previous = -1;
+    if (device < 0 || cudaGetDevice(&previous) != cudaSuccess) return false;
+    if (cudaSetDevice(device) != cudaSuccess) return false;
+    size_t free = 0, total = 0;
+    const auto error = cudaMemGetInfo(&free, &total);
+    const auto restored = cudaSetDevice(previous);
+    if (error != cudaSuccess || restored != cudaSuccess) return false;
+    freeBytes = free;
+    totalBytes = total;
+    return total > 0 && free <= total;
 }
 
 std::vector <long long> FastllmCudaGetTotalSizes() {
@@ -5362,8 +5376,18 @@ void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointer
     }
 }
 
+static thread_local std::vector<size_t> *fastllmCudaAllocationRecorder = nullptr;
+std::vector<size_t> *FastllmCudaSetAllocationRecorder(std::vector<size_t> *requests) {
+    auto *previous = fastllmCudaAllocationRecorder;
+    fastllmCudaAllocationRecorder = requests;
+    return previous;
+}
+
 static void *FastllmCudaMallocImpl(
         size_t size, FastllmCudaTryMallocResult *tryResult) {
+    if (fastllmCudaAllocationRecorder && size) {
+        fastllmCudaAllocationRecorder->push_back(size);
+    }
     if (tryResult != nullptr) {
         *tryResult = FASTLLM_CUDA_TRY_MALLOC_ERROR;
     }
@@ -5615,6 +5639,25 @@ FastllmCudaTryMallocResult FastllmCudaTryMalloc(
         return FASTLLM_CUDA_TRY_MALLOC_ERROR;
     }
     return result;
+}
+
+bool FastllmCudaReserveGraphWorkspace(const std::vector<size_t> &requests) {
+    if (FastllmCudaGraphIsCapturingFast()) return false;
+    FastllmCudaAllocationRecorder suspend(nullptr);
+    std::vector<void *> blocks;
+    blocks.reserve(requests.size());
+    bool ok = true;
+    for (size_t size : requests) {
+        if (!size) continue;
+        void *ptr = nullptr;
+        if (FastllmCudaTryMalloc(&ptr, size) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+            ok = false;
+            break;
+        }
+        blocks.push_back(ptr);
+    }
+    for (void *ptr : blocks) FastllmCudaFree(ptr);
+    return ok;
 }
 
 void * FastllmCudaMalloc(size_t size) {

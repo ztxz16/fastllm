@@ -13,6 +13,8 @@
 #include <vector>
 
 namespace fastllm {
+    class HybridMoeDecodeStep;
+    struct HybridPrefillContext;
     class CudaChunkedPrefillPipeline;
 
     struct Glm5NextIndexerCheckpoint {
@@ -113,6 +115,35 @@ namespace fastllm {
         ExecutionMode executionMode = ExecutionMode::Cpu;
         void InitExecutionMode();
         void PrepareHybridMoeCache();
+        int StreamingHybridLayer(const std::string &name) const;
+        void StageHybridWeights();
+        int hybridLoadingLayer = -1;
+        bool TryForwardHybridChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken);
+        HybridMoeDecodeStep BeginHybridDraftMoe(const Data &input, int sequence);
+        struct HybridDecodeState;
+        bool TryHybridRouterScores(const std::string &mlp, Data &input, Data &scores);
+        bool TryHybridOutputNorm(Data &input, Data &output);
+        bool TryHybridGreedy(Data &logits, const GenerationConfig &config, int &token);
+        std::shared_ptr<HybridDecodeState> hybridDecodeState;
+        bool TryHybridDecodePrepare(int layer, const std::string &prefix, Data &input,
+                Data &attention, Data &normalizedFfn, Data &post, Data &comb,
+                const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches);
+        void RemoveHybridDecodeRequest(const std::vector<std::pair<Data, Data>> *key);
+        bool TryHybridKdaInputProjections(int layer, Data &input, Data &f, Data &beta, Data &g);
+        bool TryHybridKdaDecode(int layer, Data &q, Data &k, Data &v,
+                Data &f, Data &g, Data &beta, std::pair<Data, Data> &cache, Data &output);
+        bool TryHybridMlaProjections(int layer, Data &input, const std::vector<Data *> &outputs,
+                const std::function<void(Data &, std::vector<Data> &)> &body);
+        bool TryHybridDsaProjections(int layer, Data &input, Data &normalized,
+            Data &key, Data &gate, Data &query, Data &head);
+        bool TryHybridMlaDecode(int layer, Data &query, Data &key, Data &gate,
+                Data &indexQuery, Data &headWeights, Data &keyWeight, Data &valueWeight, Data &output,
+                const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches);
         struct ThreadTpState;
         std::unique_ptr<ThreadTpState> threadTpState;
         ThreadTpState *threadTpOwner = nullptr;
@@ -222,7 +253,8 @@ namespace fastllm {
                 const std::vector<std::vector<std::pair<Data, Data>>*>
                     &requestCaches,
                 std::vector<KdaReplayCapture> *kdaReplay = nullptr,
-                std::vector<Glm5NextIndexerCache> *indexer = nullptr);
+                std::vector<Glm5NextIndexerCache> *indexer = nullptr,
+                HybridPrefillContext *prefill = nullptr);
 
         void RunAttentionBlock(int layer, const std::string &prefix,
                 Data &input, Data &output,
@@ -333,11 +365,17 @@ namespace fastllm {
                 std::vector<Data*> &biases,
                 Data &input, int sequence, Data &output);
 
+        struct HybridFfnFinish {
+            Data &residual, &post, &comb, &output;
+            bool completed = false;
+        };
         void RunHybridMoeWithPrefix(
                 int deviceLayer, const std::string &mlpPrefix,
                 std::vector<Data*> &weights,
                 std::vector<Data*> &biases,
-                Data &input, int sequence, Data &output);
+                Data &input, int sequence, Data &output,
+                HybridPrefillContext *prefill = nullptr,
+                HybridFfnFinish *finish = nullptr);
 
         void RunSharedMoe(int deviceLayer, const std::string &mlp,
                 Data &input, Data &output, bool &sharedReady);

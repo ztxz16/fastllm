@@ -1,6 +1,6 @@
 # Qwen3.6-27B-FP8 Benchmark
 
-[Benchmark 索引](../benchmark.md) · [完整性能分析](../qwen36_27b_fp8_tp2_benchmark_20260809.md) · [部署指南](../qwen3.md)
+[Benchmark 索引](../benchmark.md) · [部署指南](../qwen3.md)
 
 ## 测试配置
 
@@ -65,6 +65,4 @@ python3 test/benchmark/decode.py /data/models/Qwen3.6-27B-FP8 \
   --max-tokens 256
 ~~~
 
-当前脚本和历史报告的请求构造、采样与计时窗口可能不同。发布新数据时必须保留完整 JSON，并标明是否严格复现历史口径。
-
-三框架对比、Nsight 波形和逐算子归因见[完整性能分析](../qwen36_27b_fp8_tp2_benchmark_20260809.md)。
+复测时记录请求构造、采样参数、计时窗口及完整输出；只有口径一致的结果才可与本页数值比较。

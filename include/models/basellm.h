@@ -449,7 +449,7 @@ namespace fastllm {
         KvMemConfig kvMemConfig;
         bool kvMemLocked = false;
         void WarmupKvMem();
-        void ConfigureKvMem(const KvMemConfig &config);
+        virtual void ConfigureKvMem(const KvMemConfig &config);
         virtual bool SupportsKvMem() const { return false; }
         virtual bool KvMemLayerEligible(int layer) const { return GetKVCacheRetainedTokens(layer) < 0; }
         // Models provide the actual per-layer KV geometry; derived models may

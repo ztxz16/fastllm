@@ -9,7 +9,7 @@ Qwen3 系列按具体 checkpoint、精度和推理路径分别记录，不能把
 | 模型与路径 | 测试设备 | 代表结果 | 完整记录 |
 | --- | --- | --- | --- |
 | Qwen3.6-27B-FP8 TP2 | 2 × RTX 5090 32GB，PCIe，无 NVLink | Decode：B1 94.81、B16 1163.94、B64 2930.45 token/s | [启动命令与完整结果](qwen36_27b_fp8.md) |
-| Qwen3.8-27B-FP8 DFlash2 TP2 | 2 × RTX 5090 32GB，PCIe，无 NVLink | 固定流：target 81.45、MTP5 273.65、DFlash B8 381.00 token/s | [启动命令与完整结果](qwen38_27b_dflash2.md) |
+| Qwen3.8-27B-FP8 DFlash2 TP2 | 2 × RTX 5090 32GB，PCIe，无 NVLink | 固定流：MTP5 273.65、DFlash B8 381.00 token/s | [启动命令与完整结果](qwen38_27b_dflash2.md) |
 
 ## Qwen3.5
 

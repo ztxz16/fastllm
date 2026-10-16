@@ -102,6 +102,19 @@ extern "C" {
         fastllm::SetMoeCudaCacheBytes(bytes);
     }
 
+    DLL_EXPORT void set_moe_cuda_cache_device(int device, uint64_t bytes) {
+        fastllm::SetMoeCudaCacheDeviceBytes(device, bytes);
+    }
+
+    // CUDA ordinals obey CUDA_VISIBLE_DEVICES, unlike nvidia-smi indices.
+    DLL_EXPORT bool get_cuda_memory_info(int device, uint64_t *values) {
+#ifdef USE_CUDA
+        return values && FastllmCudaGetMemoryInfo(device, values[0], values[1]);
+#else
+        return false;
+#endif
+    }
+
     DLL_EXPORT bool set_moe_cache_policy(float halfLife, int updateInterval,
             int maxReplacements, uint64_t maxBytes, float minHeat, float margin,
             float factor, int minimumResidence, float prefillPrior, bool rankByBytes) {

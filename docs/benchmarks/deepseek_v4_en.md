@@ -6,10 +6,11 @@
 
 - Model: DeepSeek-V4 / DeepSeek-V4-Flash.
 - Parallelism: TP8.
-- CUDA architecture: SM120/SM121.
+- Tested CUDA architecture: SM120; the kernel path supports SM120/SM121.
 - Input/output: 128 / 256 tokens.
 - CUDA Graph and custom AllReduce were enabled.
 - The source report did not record the exact GPU SKU, memory, or interconnect, so the results must not be attributed to a specific GPU model.
+- The measurement date and source revision were not recorded; these results do not establish current HEAD performance.
 
 ## Recommended TP8 command
 
@@ -24,33 +25,16 @@ ftllm server /data/models/deepseek-v4 \
 
 `--triton` uses Triton when it is available in the active Python environment and otherwise falls back to the built-in CUDA path.
 
-## Full-model results
+## Results
 
-| Metric | Before optimization | SM120 fast path | Change |
-| --- | ---: | ---: | ---: |
-| TTFT | 415.27 ms | 405.47 ms | -2.36% |
-| TPOP | 13.51 ms/token | 10.01 ms/token | -25.91% |
-| Decode throughput | 74.03 token/s | 99.93 token/s | +34.99% |
-| Total throughput | 66.32 token/s | 86.57 token/s | +30.53% |
-| Total time | 3.8600 s | 2.9572 s | -23.39% |
-
-## Sparse-attention core
-
-| Path | Mean GPU time per layer |
+| Metric | Measured value |
 | --- | ---: |
-| Original serial FastLLM Triton | 81.859 µs |
-| vLLM FlashInfer SM120 main kernel plus merge | 13.660 µs |
-| FastLLM SM120 split plus merge | 5.796 µs |
+| TTFT | 405.47 ms |
+| TPOP | 10.01 ms/token |
+| Decode throughput | 99.93 token/s |
+| Total throughput | 86.57 token/s |
+| Total time | 2.9572 s |
 
-This is a short-context workload and must not be extrapolated to long contexts with top-k 512 or 1,024.
+SM120 split + merge sparse attention averaged 5.796 µs per layer in the CUDA Graph trace. These measurements cover short context only; they do not establish performance for long context, other hardware or hybrid expert placement.
 
-## Other layouts
-
-| Device layout | Suggested launch command | Speed |
-| --- | --- | --- |
-| TP8 on SM120/SM121 | Use the command above | 99.93 decode token/s |
-| Single GPU with NUMA MoE | `ftllm server /data/models/deepseek-v4 --device cuda --moe_device numa` | Not measured |
-| GPU with CPU MoE | `ftllm server /data/models/deepseek-v4 --device cuda --moe_device cpu` | Not measured |
-| GPU, NUMA, and disk experts | `ftllm server /data/models/deepseek-v4 --device cuda --moe_device "{'cuda':1,'numa':8,'disk':1}"` | Not measured |
-
-Different layouts have different bottlenecks; TP8 results cannot be used to estimate hybrid-MoE or disk-expert performance.
+Kernel contracts, numerical limits and fallback behavior are documented in the [sparse attention guide](../deepseek_v4_sparse_attention.md).

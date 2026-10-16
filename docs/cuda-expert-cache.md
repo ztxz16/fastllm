@@ -7,6 +7,11 @@ record size, and device resource limits.
 
 ## Enabling the cache
 
+Hybrid CLI startup also supports opt-in [automatic memory planning](hybrid-auto.md)
+with `--moe_cuda_cache auto` and `--moe_cpu_cache auto`. Numeric defaults and
+the native cache APIs retain their existing behavior.
+Use `--auto` to also select devices, TP/PP, resident experts, chunk size and threads.
+
 Use `--moe_cuda_cache 5g` (alias `--moe-cuda-cache`) with CUDA compute and
 host/NUMA experts, or call `ftllm.llm.set_moe_cuda_cache(5 << 30)` before model
 loading. Zero disables the cache by default. The budget covers expert records
@@ -41,9 +46,20 @@ or BF16 activations. The V4.1 adapter has a separate BF16 contract:
 | `NVFP4_BLOCK_16_E4M3` | Packed E2M1 weights, planar E4M3 block scales, global scales | Existing compact NVFP4 adapter |
 | `FP8_E4M3` | Original E4M3 bytes and FP32 block-scale arrays for gate/up and down | Hidden/intermediate widths and column scale blocks divisible by 4 |
 | `FP8_E4M3_BLOCK_128` | Original interleaved 128-byte weight blocks and FP32 scales | Hidden/intermediate widths divisible by 128 |
+| GLM 5.3 / DeepSeek V4.1 `FP8_E4M3_BLOCK_128` | Native NUMA gate/up row pairs; 128 E4M3 bytes followed by one FP32 scale | BF16 scored decode and small-batch verification; widths divisible by 128; GLM also reuses resident weights during multi-row prefill |
 | GLM 5.3 `NVFP4_BLOCK_16_E4M3_PACKED` | Native NUMA gate/up row pairs, packed E2M1 values, inline E4M3 block scales and per-row global scales | BF16 decode, 2–9-row verification and NUMA-assisted multi-row prefill; hidden/intermediate widths divisible by 128 |
 | DeepSeek V4.1 `NVFP4_BLOCK_32_E8M0` | 16 packed E2M1 bytes and one UE8M0 scale per 32 weights | BF16 decode and 2–8-row verification; NUMA weights and widths divisible by 32 |
 | DeepSeek V4.1 Q2_K gate/up + Q4_K down | Registered NUMA Q2_K_R4/Q4_K_R4 blocks, retaining cross-interleaved gate/up rows | BF16 decode and 2–8-row verification; widths divisible by 256 |
+
+The scored FP8 adapter shares cache admission, NUMA storage and temporary
+uploads with the general FP8 backend. It reads registered rows directly,
+without a second host weight snapshot or dequantized resident weight copy.
+Projection results round to BF16; clamp and route scores are applied before
+down-activation FP8 quantization (128 values for GLM, 32 for V4.1). V4.1
+retains its input quantization. Ordinary FP8 models such as Qwen retain the
+general adapter's arithmetic. FP8 checkpoint weights become packed block-128
+records during NUMA registration; no additional model-name or GPU-architecture
+switch is needed.
 
 The generic GGUF adapter accepts Q2_0, Q4_0/Q4_1, Q5_0/Q5_1,
 Q8_0/Q8_1, Q2_K–Q6_K, IQ1_S/IQ1_M, IQ2_XXS/IQ2_XS/IQ2_S,
@@ -108,8 +124,8 @@ GEMM task boundaries must meet the corresponding block/row alignment rules.
 FP32 hybrid decode and small batches reuse the FP8/NVFP4 scheduling paths;
 unsupported CPU layouts or input types retain the existing fallback.
 
-The immutable mapped host snapshot is made before destructive NUMA repacking.
-It adds host RAM usage, approximately the number of experts times the largest
+Adapters that cannot borrow registered NUMA storage take an immutable mapped host snapshot before destructive repacking.
+This fallback adds host RAM usage, approximately the number of experts times the largest
 record stride, in addition to CPU expert storage. Pure GPU expert execution
 with on-demand refills remains available through the cache operator without
 NUMA registration. Decode and verification batches of up to nine rows use
@@ -221,8 +237,7 @@ frequency policy, with admissions after readers complete. BF16 draft expert
 weights keep their existing execution path; the GLM NVFP4 checkpoint used in
 testing has BF16 draft experts. This covers one GPU per layer, including
 layer-partitioned dual-GPU models; GLM thread-TP expert parallelism is unchanged.
-GLM's DSA backend currently rejects MTP, so MTP requires the existing dense
-attention backend (`FASTLLM_GLM5_NEXT_DSA_BACKEND=dense`).
+Compressed MLA supports learned DSA with MTP and rank-local rollback. Expanded attention uses the dense backend; see the [GLM guide](glm5.md).
 
 With frequency caching active, compact GLM verification can also use the other
 GPUs whose caches have already been initialized for the same model. This applies
@@ -348,6 +363,13 @@ once. Target and draft host expert tables share the same GGUF LRU pool and
 expert-record budget; draft dense weights and verifier state use additional
 memory. The existing Qwen4 MTP generation constraints still apply.
 
+Qwen4 hybrid PP can pipeline chunked prefill with greedy MTP and CPU
+embedding (`--low_gpu_mem`). The final stage updates draft KV for each chunk,
+retains the target hidden row needed at the next chunk boundary, and joins
+target request state before the final proposal and prefix snapshot. This also
+supports exact QSA KV streaming. CUDA embedding, sampling, restored prefixes
+and other unsupported pipeline configurations retain serial prefill.
+
 After warmup, read or reset counters outside timed inference:
 
 ```python
@@ -375,8 +397,7 @@ computation runs on `cudaStreamPerThread`; asynchronous admission streams publis
 an event dependency before subsequent cache reads.
 
 Model integration is available in DeepSeek V4.1 (described below) and the
-Qwen4-Exp backbone used by Qwen3.8-Flash-Next. Qwen4-Exp snapshots host experts
-before deferred NUMA registration can repack or release their original storage.
+Qwen4-Exp backbone used by Qwen3.8-Flash-Next. Qwen4-Exp prepares cache sources before deferred NUMA registration, borrowing supported pinned layouts and taking a snapshot for other layouts.
 Prefill and unsupported layouts
 retain the configured MoE backend. CPU-only and ROCm builds do not enable this
 NVIDIA CUDA adapter. A model must prepare its expert tables and call the cache
@@ -436,10 +457,7 @@ expert, amplifying the difference in later layers.
 
 Qwen4-Exp MTP verifier batches of up to nine tokens can use the cache and become
 eligible for CUDA Graph when the remaining graph requirements are satisfied.
-Larger batches retain the configured MoE backend. MTP draft expert tables are
-not registered with this cache and retain their separately configured placement.
-TP with host experts keeps its existing MTP graph fallback; enabling the cache
-does not enable a whole-backbone MTP graph.
+Larger batches retain the configured MoE backend. Eligible target and host draft expert tables share the cache budget. GPU-resident draft experts use the GPU backend. Decode/verification graph eligibility still depends on shape, layout and TP capabilities; enabling the cache alone does not guarantee graph execution.
 
 For supported compact NVFP4 host tables assigned entirely to NUMA, preparation
 copies only original E4M3/global scales, invokes the model's NUMA registration
@@ -454,8 +472,7 @@ releases the temporary snapshot; unsupported layouts retain a full snapshot.
 Repeated preparation reuses the group, preserving graph source addresses.
 Borrowed weights must remain alive until the model releases the cache.
 
-For Qwen3.8-Flash-Next-NVFP4 this removes about 56.25 GiB of duplicate weights,
-retaining about 7.03 GiB of scales. No full snapshot is allocated during loading,
+For Qwen3.8-Flash-Next-NVFP4 the borrowed layout retains about 7.03 GiB of original scales outside the NUMA weight storage. No full snapshot is allocated during loading,
 though individual tensor conversions still need temporary storage. Planar
 weight ranges let refill use contiguous 16-byte loads without transferring
 inline FP32 scales; narrow or inline shards use 4-byte loads. Cache capacity,
@@ -671,7 +688,7 @@ contiguous slices of the row. Callers retain their NaN handling and any legacy
 tie-resolution rules. Input types can convert to FP32 before these helpers;
 changing the source precision does not silently change the accumulation type.
 
-The first integrated router optimization is the existing 512-expert/top-10
+The router includes a 512-expert/top-10
 shape specialization. Its dispatch checks shape and dtype, not model name.
 It keeps the original softmax arithmetic, normalization, and legacy tie path.
 Other router shapes retain their existing implementations. Reusing these
@@ -819,19 +836,6 @@ cold admission, eviction, CPU/GPU prefill, unregistered NVFP4 cold startup,
 asymmetric budgets and GPU 0/1/0 output
 movement. `--dual --verify-only` limits it to multirow verification.
 
-## Measured GPU-resident GGUF configuration
-
-The [Qwen3.8-Flash-Next benchmark](qwen3.8-flash-next/README_EN.md#gguf-resident-performance)
-records the 2026-10-01 cleanup build on two 22 GiB RTX 2080 Ti cards:
-70.87 token/s decode (512 input / 512 output, chunk 32) and 1205.13 token/s
-for 4096-token prefill (chunk 1024), each the median of three measured runs
-after warmup. MTP is off and CUDA Graph is on. Expert weights remain on GPU
-with zero expert-cache budget; embedding remains on CPU and PLE uses disk.
-Per-GPU logical weights are 19.36 GiB, used memory after loading is about
-20.21 GiB, and sampled peaks are 21.06 / 20.84 GiB.
-[Machine-readable results](benchmarks/qwen38_flash_next_iq2xs_2080ti_20261001.json)
-include configuration, timing definitions, per-run data and validation limits.
-
 ## GGUF NUMA GPU-assisted prefill
 
 NUMA prefill retains its CPU/GPU expert scheduler. For supported 33–4096-row
@@ -894,9 +898,7 @@ The ordinary Q2_0 Dense path also accepts 1–8-row Q8/DP4A MMVQ for
 FP32/FP16/BF16. It requires 64-column alignment and at most 32 KiB of staged
 Q8 activation per block; other shapes retain the existing fallback. This
 Dense change adds activation quantization and can change generated tokens.
-The [Q2_0 TP2 benchmark](qwen3.8-flash-next/README_EN.md#gguf-q2_0-expert-mmq-and-dense-decode-optimization-2026-10-01)
-records 1354.38 token/s for 4096-token prefill (+19.83%) and 70.74 token/s
-decode (+0.85%) on two 22 GiB RTX 2080 Ti cards, with MTP off and Graph on.
+Final deployment measurements are listed in the [Qwen4 benchmark](benchmarks/qwen4_exp_en.md#gpu-resident-gguf-experts).
 
 `cuda_gguf_moe_host` checks the CPU R4 repacker against an independent decoded
 weight oracle, cross/non-cross gate/up layouts, selected subset changes,
@@ -964,9 +966,7 @@ attention heads, recurrent state and KV pages. Attention output, dense-FFN
 and shared-expert down projections reduce their rank-local partial sums.
 Routing executes on the owner rank. Routed host
 experts are evaluated once, using a single process-wide RAM cache; TP does not
-load a full host expert copy per rank. MTP is currently unsupported in this
-path and must remain disabled; `--cuda_shared_expert true` is required.
-Prefix/history reuse is bypassed for TP. As with ordinary BF16 tensor
+load a full host expert copy per rank. `--cuda_shared_expert true` is required. MTP placement and unsupported draft formats follow the [GLM deployment guide](glm5.md); prefix/history reuse is bypassed for hybrid TP. As with ordinary BF16 tensor
 parallelism, partitioning changes floating-point accumulation and can change
 generated tokens; it does not promise bitwise agreement with serial execution.
 
@@ -1055,3 +1055,103 @@ Logical route counters count each expert invocation once.
 slots, occupied local slots, local payload bytes, locally computed cache-hit
 routes and cumulative whole-expert upload bytes. Hit routes can be summed across
 GPUs; the per-device totals need not match.
+
+### Qwen4 hybrid MTP graph capture
+
+By default, single-GPU Qwen3.8-Flash-Next hybrid MTP owns graph segments
+per request and verifier length. Workspace reservation is always enabled: the
+eager warmup records pooled allocation sizes, then capture reserves sufficient
+blocks outside capture before returning them to the graph pool. This avoids
+relying on warmup scratch that another graph has since pinned. Capacity failure
+falls back to eager execution. Reservation can increase temporary VRAM use; it
+does not change the configured expert-cache budget.
+
+The default limit remains one new segment per stage invocation. Short verifier
+lengths may not finish capturing during a 1024-token response. Set the generic
+capture budget to front-load more shapes during warmup:
+
+```bash
+export FASTLLM_CUDA_GRAPH_CAPTURE_BUDGET=8
+```
+
+The capture budget is clamped to 1–128. TP honors it for the first compatible
+graph-reuse request; ordinary short-context or internal warmup requests retain
+the one-segment limit. A reusable TP request defaults to eight if the variable
+is unset. TP records allocation demand per rank and reserves each device's
+workspace before all ranks enter capture. Larger values front-load capture work
+into warmup and are not necessarily faster. Expert routing, weights, MTP
+acceptance rules and the per-layer CPU/GPU synchronization are unchanged.
+
+Validation should include complete generation and repeated timings without a
+GPU profiler. CUDA Graph node tracing materially changes launch overhead and
+should be used to inspect submission patterns, not to report production TPS.
+
+### Reusing Qwen4 graphs between serving requests
+
+For a single CUDA device, CUDA layer PP, or CUDA TP with MTP, graph-slot
+reuse is enabled automatically for compatible requests. Use `--max_batch 1`,
+fixed startup KV reservation, greedy text generation, and disabled
+history/prefix caching. Set `FASTLLM_CUDA_GRAPH_CAPTURE_BUDGET` when the warmup
+should capture more verifier lengths up front.
+
+The first compatible request is the capture warmup. Run a representative full
+request before timing or accepting production traffic so ordinary decode and
+all required MTP verifier lengths have time to warm and capture. For the
+16K-input/1K-output benchmark, use that complete shape as the warmup. This does
+not capture every possible shape during model construction.
+
+One model-owned serving slot (one cache per rank for TP) keeps the target/draft graphs, KV page tables,
+linear-attention state allocations, QSA buffers and MTP checkpoint storage at
+stable addresses. Finishing a successful request retains that slot and releases its logical KV
+page references before the scheduler admits another request. Reusing it
+clears token history, logical KV/QSA lengths, recurrent state and pending draft
+outputs without moving captured storage. The existing pointer, dtype, shape
+and capacity checks still guard replay.
+
+After the first compatible request, target and draft capture are frozen for
+that slot. Captured variants replay; unseen or invalidated variants run eager
+without capturing during later requests. A too-short warmup can therefore
+leave variants eager until the slot is retired and warmed again.
+
+This implementation only reuses prompts at least as long as the QSA
+indexer budget. Multimodal input, non-greedy generation, prefix/history
+restore and short-context requests keep their existing paths. Target-only TP
+keeps its existing cache-reuse behavior. An incompatible
+request retires the idle slot before using the bounded KV pool. Cancellation,
+request errors or forward exceptions discard the slot. The next compatible
+request then starts a new warmup. At most one completed slot is retained;
+its graph/workspace memory stays allocated between requests and must fit
+alongside the configured expert cache and KV reservation.
+
+`qwen4_gguf_test --graph-slot-reset` validates history reset, freeze
+propagation and stable QSA/MTP checkpoint storage on the same or different CUDA
+devices. PP synchronizes every participating device before resetting shared
+request state; TP resets each rank’s target and draft state and returns its
+logical KV pages before the next admission.
+
+For PP with MTP, explicitly select CPU embedding before creating the model
+(`ftllm.llm.set_cuda_embedding(False)`). Otherwise Graph mode defaults to CUDA
+embedding, and the target’s first stage and the draft’s last stage can move
+the same full embedding weight between GPUs. This is separate from expert
+cache residency and from graph-slot reuse.
+
+### Qwen4 TP MTP draft placement and sampling
+
+TP MTP expert shards are kept resident on each rank’s GPU, outside the
+target’s bounded expert cache. Target experts retain their CPU/NUMA policy.
+The draft’s GPU weights and workspaces still count against the total device
+memory budget.
+
+For a canonical Q8_0 or Q6_K head, `FASTLLM_MTP_DRAFT_VOCAB` selects draft-only
+vocabulary rows before the target head is split. The selected rows are then
+partitioned across TP ranks with 256-row-aligned boundaries. Token mapping and
+TopK tie ordering use the original subset-row positions. A subset too small
+to give every rank an aligned shard retains the full-vocabulary TP path.
+The target head and greedy verification always keep the full vocabulary;
+sampled or device-chained proposals retain their existing full-head paths.
+
+The draft Graph includes local TopK and confidence reduction. Each rank reads
+back one compact tuple containing its row ID, local top probability and maximum
+logit. The host merges candidates and reconstructs the global subset softmax
+denominator without gathering full logits. Reuse and freeze rules above also
+apply to these draft graphs.

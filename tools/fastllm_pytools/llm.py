@@ -649,11 +649,35 @@ def set_cuda_graph(cuda_graph):
 def set_cuda_slab(mb: int):
     fastllm_lib.set_cuda_slab(ctypes.c_int(mb));
 
-def set_moe_cuda_cache(bytes_: int):
+def set_moe_cuda_cache(bytes_: int, device_bytes=None):
+    """Set cache budgets before loading; a scalar call clears device overrides."""
     bytes_ = int(bytes_)
     if bytes_ < 0 or bytes_ > (1 << 64) - 1:
         raise ValueError("MoE CUDA cache size must fit in uint64")
-    fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
+    budgets = {} if device_bytes is None else {int(d): int(b) for d, b in device_bytes.items()}
+    if any(d < 0 or d > (1 << 31) - 1 or b < 0 or b > bytes_ for d, b in budgets.items()):
+        raise ValueError("Per-device cache budgets must be nonnegative and within the scalar ceiling")
+    setter = getattr(fastllm_lib, "set_moe_cuda_cache_device", None)
+    if budgets and setter is None:
+        raise RuntimeError("Per-device cache planning requires a matching native library")
+    fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_))
+    if budgets:
+        setter.argtypes = [ctypes.c_int, ctypes.c_uint64]
+        setter.restype = None
+        for device, budget in budgets.items():
+            setter(device, budget)
+
+def get_cuda_memory_info(device: int):
+    """Return free/total CUDA bytes for a visible ordinal, or fail closed."""
+    query = getattr(fastllm_lib, "get_cuda_memory_info", None)
+    if query is None:
+        raise RuntimeError("Hybrid auto requires a matching native library")
+    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_bool
+    values = (ctypes.c_uint64 * 2)()
+    if not query(int(device), values):
+        raise RuntimeError("Cannot measure memory on CUDA device %d" % device)
+    return {"free": int(values[0]), "total": int(values[1])}
 
 def set_moe_cache_policy(*, half_life=128., update_interval=1, max_replacements=96,
                          max_bytes=0, min_heat=1., margin=1., factor=1.,
@@ -3319,13 +3343,22 @@ class model:
     def set_kvmem(self, *, enabled=True, max_tokens=32768, resident_tokens=8192,
                   sink_tokens=128, recent_tokens=2048, retrieval_tokens=4096,
                   prefill_tokens=512, host_mib=8192, retrieval_interval=64):
-        """Opt into sparse, host-backed KV before warmup (single-GPU Qwen3/3.5).
+        """Opt into host-backed KV before warmup (one active request).
 
-        This changes attention once the resident budget is exceeded. Prefix
-        caching and batching are disabled; Qwen3.5 also supports DFlash/MTP.
-        Token budgets except max_tokens must align to the configured KV page.
-        retrieval_interval controls speculative score reuse in committed tokens;
-        it need not be page aligned. Use 1 to refresh every verification round.
+        Qwen3/3.5 use sparse retrieval on one GPU, changing attention once the
+        resident budget is exceeded. Qwen3.5 also supports DFlash/MTP.
+        Qwen4/QSA in Hybrid execution mode keeps the original selection and stores
+        exact FP16 KV in pinned host memory, caching at most resident_tokens per layer
+        on its CUDA device. Prefill temporarily stages one full attention layer
+        on each device, reusing that workspace between layers. This also supports
+        PP/TP and CUDA Graph; sink/recent/retrieval policy parameters do not apply
+        to native QSA. Pure GPU and CPU execution modes do not enable Qwen4 KVMem.
+        Qwen4 resident_tokens must be divisible by 4. Prefix reuse and concurrent
+        requests are disabled in KVMem mode; the full max_tokens context remains
+        available. host_mib covers all target and possible draft KV layers.
+        For Qwen3/3.5, token budgets except max_tokens must align to the KV page.
+        retrieval_interval controls their speculative score reuse in committed
+        tokens; it need not be page aligned. Use 1 to refresh every verify round.
         """
         values = (max_tokens, resident_tokens, sink_tokens, recent_tokens,
                   retrieval_tokens, prefill_tokens)

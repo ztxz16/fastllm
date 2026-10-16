@@ -322,8 +322,8 @@ inline cudaError_t CopyRecords(const Record &layout, void *const *pointers,
         const int32_t *count = nullptr, const uint64_t *slotOffsets = nullptr,
         int fixedExpert = 0,
         const uint8_t *promoted = nullptr, int promotedExpert = -1,
-        const uint8_t *uploaded = nullptr, bool promotedNuma = false) {
-    Records<<<dim3(64, 1, 2), kRestoreThreads, 0, stream>>>(layout, pointers, destination,
+        const uint8_t *uploaded = nullptr, bool promotedNuma = false, int blocks = 64) {
+    Records<<<dim3(blocks, 1, 2), kRestoreThreads, 0, stream>>>(layout, pointers, destination,
         experts, slots, count, slotOffsets, fixedExpert, promoted, promotedExpert, uploaded, promotedNuma);
     return cudaGetLastError();
 }

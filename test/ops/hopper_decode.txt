@@ -1,4 +1,4 @@
-Hopper decode optimization
+Hopper decode projections
 
 Automatically enabled for eligible projections with 1 <= rows < 32 on SM90 (Hopper).
 No runtime environment switch is needed. Other GPU architectures use the
@@ -8,7 +8,7 @@ the FP16 route is excluded from ROCm and CUDA_NO_TENSOR_CORE builds.
 FP8 targets (N,K): (34816,5120), (5120,17408), (5120,6144),
 (16384,5120) for linear-attention QKVZ and (14336,5120) for full-attention Q+gate/K/V.
 Input/output: FP16 or BF16. Weights: E4M3, row-major, 128x128 block scaling.
-The new path quantizes activations in groups of 128 to FP8 E4M3, then uses
+The small-batch path quantizes activations in groups of 128 to FP8 E4M3, then uses
 swapped-operand WGMMA with TMA/persistent scheduling adapted from TensorRT-LLM.
 This changes numerical results relative to native W8A16. Output retains the input dtype.
 FP16 lm_head (1 <= M < 32,N=248320,K=5120), without bias or addTo, uses autotuned
@@ -73,10 +73,7 @@ Attention output   5120    6144    72               72
 Linear QKVZ        16384   5120    112              112
 Full Q+gate/K/V    14336   5120    96               128
 
-The rows32..64 gate/up, down, output and full QKV choices match those seen
-in TensorRT-LLM v1.3.0rc28's H20 BS32 trace. QKVZ was BF16 in that benchmark;
-its FP8 parameters were selected from the FastLLM sweep independently.
-The mainloop remains FastLLM's existing vendored DeepGEMM implementation.
+The mainloop uses FastLLM's vendored DeepGEMM implementation.
 
 For BN72/96/112, weight tiles can span two 128-column scaling groups.
 Shared memory includes both scale rows; output TMA disables swizzling

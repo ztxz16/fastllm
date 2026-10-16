@@ -140,7 +140,7 @@ static void CheckPrefill(FastllmCudaMoeCacheLayer *layers, std::vector<Data *> *
                 const bool ready = FastllmCudaGetMoePrefillResidents(weights, experts, view);
                 if (pass <= 1) Require(!ready, "assist worker allocated a prefill cache");
                 else {
-                    Require(ready && view.weightType == NVFP4_BLOCK_16_E4M3_PACKED, "prefill cache missing");
+                    Require(ready && view.weightType == weights[2]->dataType, "prefill cache missing");
                     int count = 0;
                     for (int e = 0; e < experts; ++e) if (view.weights[2 * e]) {
                         ++count;
@@ -369,8 +369,9 @@ int main(int argc, char **argv) {
             return false;
         };
         const bool dual = option("--dual"), noCache = option("--no-cache");
-        const bool prefill = option("--prefill"), verify = option("--verify");
+        const bool prefill = option("--prefill"), verify = option("--verify"), fp8 = option("--fp8");
         const bool frequency = option("--frequency") || noCache || prefill || verify;
+        std::printf("GLM cache weight format: %s\n", fp8 ? "FP8 block128" : "NVFP4 packed");
         int devices = 0;
         Check(cudaGetDeviceCount(&devices));
         Require(!dual || devices >= 2, "--dual requires two CUDA devices");
@@ -394,16 +395,31 @@ int main(int argc, char **argv) {
             for (int e = 0; e < experts; ++e)
                 for (int part = 0; part < 2; ++part) {
                     const int rows = part ? hidden : inter * 2, cols = part ? inter : hidden;
-                    auto w = std::make_unique<Data>(NVFP4_BLOCK_16_E4M3_PACKED);
+                    auto w = std::make_unique<Data>(fp8 ? FP8_E4M3_BLOCK_128 : NVFP4_BLOCK_16_E4M3_PACKED);
                     w->Resize({rows, cols});
                     w->blockK = 1;
-                    w->blockM = 16;
+                    w->blockM = fp8 ? 128 : 16;
                     const size_t pitch = GetDataBytes(w->dataType, 1, cols);
                     std::vector<uint8_t> packed(rows * pitch);
                     auto &matrix = dense[t][e * 2 + part];
                     matrix.resize(rows * cols);
                     const float fp4[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
                     for (int row = 0; row < rows; ++row) {
+                        if (fp8) {
+                            for (int c = 0; c < cols; c += 128) {
+                                uint8_t *block = packed.data() + row * pitch + c / 128 * 132;
+                                const float scale = std::ldexp(1.0f, (row + c / 128 + part + t) % 4 - 5);
+                                memcpy(block + 128, &scale, sizeof(scale));
+                                for (int j = 0; j < 128; ++j) {
+                                    // Include signed/subnormal/zero values and distinct block scales.
+                                    block[j] = uint8_t((rng() % 64) | ((rng() & 1) << 7));
+                                    __nv_fp8_e4m3 value;
+                                    value.__x = block[j];
+                                    matrix[row * cols + c + j] = float(value) * scale;
+                                }
+                            }
+                            continue;
+                        }
                         // Distinct globals for gate, up and down; exact binary
                         // scales make the independent dense oracle reproducible.
                         const float global = part ? .5f : row < inter ? .75f : 1.25f;
@@ -622,7 +638,8 @@ int main(int argc, char **argv) {
         ClearNumasMoeRuntimeCache();
         for (auto &w : owned) w->numasData.clear();
         for (void *p : shards) Check(cudaFreeHost(p));
-        std::puts("GLM compact NVFP4 cache: CPU/mixed/GPU, oracle, fallback, eviction and device transitions passed.");
+        std::printf("GLM %s cache: CPU/mixed/GPU, oracle, fallback, eviction and device transitions passed.\n",
+                    fp8 ? "FP8" : "compact NVFP4");
         return 0;
     } catch (const std::exception &e) {
         std::fprintf(stderr, "GLM cache test failed: %s\n", e.what());

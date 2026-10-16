@@ -214,7 +214,7 @@ ftllm server /data/models/Qwen3.8-27B-FP8 \
 
 `--tokens` sets the KV pool capacity shared by all sessions; omitting it enables automatic budgeting. Startup fails if an explicit target exceeds the configured RoPE range or the KV capacity calibrated during warmup. `/v1/models` reports the effective window, original model limit, and requested target. The 1M example requires sufficient GPU memory: the tested configuration with two 24GB GPUs cannot fit it, and a full 1M input has not been validated.
 
-Extension currently supports HF Qwen2, Qwen3, and Qwen3.5 layouts, including Qwen3.8 checkpoints based on Qwen3.5. Launcher's advanced "RoPE extension" field accepts the same configuration. GGUF, FLM, and custom GraphLLM loaders retain their existing shrink-only length behavior and do not support the new RoPE extension options. See the [context extension guide](docs/context-length-extension-design.md) for parameters, supported layouts, and validation results.
+Extension supports Qwen2, Qwen3, and Qwen3.5 layouts, including Qwen3.8 checkpoints based on Qwen3.5. Launcher's advanced "RoPE extension" field accepts the same configuration. HF directories and GGUF files accept explicit `--rope_scaling` options, subject to model layout support. Setting only a length in the CLI retains shrink-only behavior for GGUF, FLM, and custom GraphLLM; FLM and custom GraphLLM do not support RoPE extension. See the [context extension guide](docs/context-length-extension.md) for parameters, supported layouts, and validation results.
 
 ### Speculative decoding
 
@@ -242,7 +242,7 @@ ftllm server /data/models/qwen3.8 \
 
 `--draft` detects MTP, DFlash2, or DSpark from the draft checkpoint. Standalone MTP currently targets Qwen3.5 GGUF and may be either a directory containing `config.json` plus `mtp.safetensors`, or the `mtp.safetensors` file itself; it defaults to five draft tokens. For DFlash2, `--draft_tokens` counts actual draft tokens and excludes the anchor token.
 
-See the [Qwen3.8 DFlash2 report](docs/dflash2_qwen38_27b_tp2_20260819.md) for the complete configuration and validation results.
+See the [Qwen3.8 DFlash2 report](docs/benchmarks/qwen38_27b_dflash2.md) for the complete configuration and validation results.
 
 ### Disk-backed Qwen4 PLE
 
@@ -311,7 +311,7 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | `--ori` | Original model configuration and tokenizer directory for selected GGUF models |
 | `--mmproj` | Matching vision-module GGUF for Qwen3.5-family GGUF models; see [GGUF multimodal deployment](docs/qwen3_en.md#gguf-multimodal) for configuration requirements and an example |
 
-Qwen4 inference on a single CUDA GPU keeps MTP draft experts on the GPU by default, outside the target expert-cache budget set by `--moe_cuda_cache`. This requires additional VRAM for the draft experts. Set `FASTLLM_QWEN4_MTP_GPU_EXPERTS=0` before startup to retain the configured MoE placement when VRAM is limited. TP, pipelines across multiple devices, and CPU inference retain their existing placement policies.
+Qwen4 CUDA inference keeps MTP draft experts on the GPU: on the single device, on the final CUDA stage for PP, or as resident shards on each TP rank. Draft experts require additional VRAM outside the target expert-cache budget set by `--moe_cuda_cache`. CPU inference retains the configured MoE placement.
 
 Qwen3.5 MTP and DFlash drafts support the following settings. Compatible paths use NVFP4 by default once the corresponding draft algorithm is enabled. Environment variables can override these defaults before startup:
 

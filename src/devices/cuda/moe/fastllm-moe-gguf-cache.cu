@@ -625,12 +625,25 @@ template<ggml_type Type> constexpr size_t BlockBytes() {
     return sizeof(block_iq4_xs);
 }
 
+#include "fastllm-moe-glm5-k.cuh"
+
 // Read NUMA's interleaved/R4 rows without materializing canonical weights.
 // Preserve the canonical decoder's per-lane FMA and warp reduction order;
 // GLM's Q8_K/BF16 arithmetic is distinct from the ordinary Q8_1 projections.
-template<ggml_type Type, typename T>
+template<ggml_type Type, typename T, bool Vector = false>
 __device__ __forceinline__ float NumaDot(const uint8_t *record, int row,
         size_t pitch, int storageType, const T *input, int columns, int warp, int warps) {
+#if __CUDA_ARCH__ == 750
+    if constexpr (Vector && std::is_same_v<T, float> && (Type == GGML_TYPE_Q2_K || Type == GGML_TYPE_Q3_K || Type == GGML_TYPE_Q4_K)) {
+        // Cache allocations are aligned; retain the scalar path for external
+        // views into a workspace or weight buffer with a smaller alignment.
+        if ((reinterpret_cast<uintptr_t>(input) % 16 | reinterpret_cast<uintptr_t>(record) % 4) == 0) {
+            if (storageType >= 0 && storageType != Type)
+                return KDotVector<Type, true>(record, row, pitch, input, columns, warp, warps);
+            return KDotVector<Type, false>(record, row, pitch, input, columns, warp, warps);
+        }
+    }
+#endif
     if constexpr (Type == GGML_TYPE_Q2_K || Type == GGML_TYPE_Q3_K || Type == GGML_TYPE_Q4_K) {
         if (storageType >= 0 && storageType != Type) {
             const auto *blocks = record + size_t(row/4)*4*pitch;
@@ -751,7 +764,9 @@ __global__ void Quantize(const __nv_bfloat16 *input, float *output, int columns,
     }
 }
 
-template<ggml_type Type, class View, bool Tp = false>
+enum class Q2PairLayout { None, Canonical, R4 };
+
+template<ggml_type Type, class View, bool Tp = false, Q2PairLayout Q2Layout = Q2PairLayout::None>
 __global__ void Gate(const float *input, __nv_bfloat16 *activation,
                     View view, const float *scores, float limit, int topk, int rank = 0) {
     const int row = blockIdx.x, route = blockIdx.y;
@@ -766,10 +781,36 @@ __global__ void Gate(const float *input, __nv_bfloat16 *activation,
     const size_t pitch = size_t(view.hidden / QK_K) * BlockBytes<Type>();
     const int warp = threadIdx.x / 32;
     const int storage = NumaType<true>(view);
-    float gate = NumaDot<Type>(record, storage >= 0 ? 2 * row : row,
-        pitch, storage, input, view.hidden, warp, 4);
-    float up = NumaDot<Type>(record, storage >= 0 ? 2 * row + 1 : row + view.inter / (Tp ? 2 : 1),
-        pitch, storage, input, view.hidden, warp, 4);
+    float gate, up;
+    bool paired = false;
+#if __CUDA_ARCH__ == 750
+    if constexpr (std::is_same_v<View, FastllmCudaMoeGGUFCacheView> &&
+        (Q2Layout != Q2PairLayout::None || Type == GGML_TYPE_Q3_K || Type == GGML_TYPE_Q4_K)) {
+        if ((reinterpret_cast<uintptr_t>(input) % 16 | reinterpret_cast<uintptr_t>(record) % (Q2Layout == Q2PairLayout::R4 ? 8 : 4)) == 0) {
+            if constexpr (Q2Layout == Q2PairLayout::R4) {
+                gate = KDotQ2R4Pair(record, 2 * row, pitch, input, view.hidden, warp, 4, up);
+            } else {
+                const int g = storage >= 0 ? 2 * row : row;
+                const int u = storage >= 0 ? 2 * row + 1 : row + view.inter / (Tp ? 2 : 1);
+                if constexpr (Q2Layout == Q2PairLayout::Canonical) {
+                    gate = KDotQ2Pair(record, g, u, pitch, input, view.hidden, warp, 4, up);
+                } else {
+                    if (storage >= 0 && storage != Type)
+                        gate = KDotVector<Type, true, 2>(record, g, pitch, input, view.hidden, warp, 4, u, &up);
+                    else
+                        gate = KDotVector<Type, false, 2>(record, g, pitch, input, view.hidden, warp, 4, u, &up);
+                }
+            }
+            paired = true;
+        }
+    }
+#endif
+    if (!paired) {
+        gate = NumaDot<Type, float, std::is_same_v<View, FastllmCudaMoeGGUFCacheView>>(record, storage >= 0 ? 2 * row : row,
+            pitch, storage, input, view.hidden, warp, 4);
+        up = NumaDot<Type, float, std::is_same_v<View, FastllmCudaMoeGGUFCacheView>>(record, storage >= 0 ? 2 * row + 1 : row + view.inter / (Tp ? 2 : 1),
+            pitch, storage, input, view.hidden, warp, 4);
+    }
     __shared__ float gates[4], ups[4];
     if (threadIdx.x % 32 == 0) { gates[warp] = gate; ups[warp] = up; }
     __syncthreads();
@@ -790,11 +831,37 @@ __global__ void Down(const T *activation, float *output, View view, int rank = 0
     if (row >= view.hidden) return;
     const auto *record = ExpertWeight<false>(view, route);
     const size_t pitch = size_t(view.inter / QK_K) * BlockBytes<Type>();
-    const float value = record ? NumaDot<Type>(record, row, pitch, NumaType<false>(view),
+    const float value = record ? NumaDot<Type, T, std::is_same_v<View, FastllmCudaMoeGGUFCacheView>>(record, row, pitch, NumaType<false>(view),
         activation + size_t(route) * view.inter, view.inter, 0, 1) : 0;
     if (threadIdx.x % 32 == 0)
         output[size_t(OriginalRoute(view, route)) * view.hidden + row + (Tp ? rank * (view.hidden / 2) : 0)] =
             __bfloat162float(__float2bfloat16_rn(value));
+}
+// One warp computes two output rows with shared input loads.
+template<bool Native>
+__global__ void DownQ2Pair(const float *activation, float *output, FastllmCudaMoeGGUFCacheView view) {
+    const int row = blockIdx.x * 8 + 2 * (threadIdx.x / 32), route = blockIdx.y;
+    if (row >= view.hidden) return;
+    const auto *record = ExpertWeight<false>(view, route);
+    const auto *input = activation + size_t(route) * view.inter;
+    const size_t pitch = size_t(view.inter / QK_K) * sizeof(block_q2_K);
+    float first = 0, second = 0;
+    if (record) {
+        if ((reinterpret_cast<uintptr_t>(input) % 16 | reinterpret_cast<uintptr_t>(record) % (Native ? 8 : 4)) == 0) {
+            if constexpr (Native)
+                first = KDotQ2R4Pair(record, row, pitch, input, view.inter, 0, 1, second);
+            else
+                first = KDotQ2Pair(record, row, row + 1, pitch, input, view.inter, 0, 1, second);
+        } else {
+            first = NumaDot<GGML_TYPE_Q2_K, float, true>(record, row, pitch, view.numaDownType, input, view.inter, 0, 1);
+            second = NumaDot<GGML_TYPE_Q2_K, float, true>(record, row + 1, pitch, view.numaDownType, input, view.inter, 0, 1);
+        }
+    }
+    if (threadIdx.x % 32 == 0) {
+        const size_t offset = size_t(OriginalRoute(view, route)) * view.hidden + row;
+        output[offset] = __bfloat162float(__float2bfloat16_rn(first));
+        output[offset + 1] = __bfloat162float(__float2bfloat16_rn(second));
+    }
 }
 #include "fastllm-moe-glm5-iq.cuh"
 
@@ -815,6 +882,45 @@ template<bool GateStage> bool CanonicalIQ(const FastllmCudaMoeGGUFCacheView &vie
     // Down rows are canonical only for the ordinary type, never its R4 form.
     if constexpr (GateStage) return view.numaGateType < 0;
     return view.numaDownType < 0 || view.numaDownType == view.downType;
+}
+
+// Compile Q2 layouts separately so unused branches do not increase registers.
+template<ggml_type Type, class View>
+void LaunchGate(const float *input, __nv_bfloat16 *activation, const View &view,
+        const float *scores, float limit, int topk, int routes) {
+    if constexpr (Type == GGML_TYPE_Q2_K && std::is_same_v<View, FastllmCudaMoeGGUFCacheView>) {
+        if (Sm75IQSupported()) {
+            if (view.numaGateType == GGML_TYPE_Q2_K_R4) {
+                Gate<Type, View, false, Q2PairLayout::R4><<<dim3(view.inter, routes), 128, 0, cudaStreamPerThread>>>(
+                    input, activation, view, scores, limit, topk);
+                return;
+            }
+            if (view.numaGateType < 0 || view.numaGateType == Type) {
+                Gate<Type, View, false, Q2PairLayout::Canonical><<<dim3(view.inter, routes), 128, 0, cudaStreamPerThread>>>(
+                    input, activation, view, scores, limit, topk);
+                return;
+            }
+        }
+    }
+    Gate<Type><<<dim3(view.inter, routes), 128, 0, cudaStreamPerThread>>>(
+        input, activation, view, scores, limit, topk);
+}
+
+template<ggml_type Type, class View>
+void LaunchDown(const float *input, float *output, const View &view, int routes) {
+    if constexpr (Type == GGML_TYPE_Q2_K && std::is_same_v<View, FastllmCudaMoeGGUFCacheView>) {
+        if (Sm75IQSupported()) {
+            if (view.numaDownType == GGML_TYPE_Q2_K_R4) {
+                DownQ2Pair<true><<<dim3((view.hidden + 7) / 8, routes), 128, 0, cudaStreamPerThread>>>(input, output, view);
+                return;
+            }
+            if (view.numaDownType < 0 || view.numaDownType == Type) {
+                DownQ2Pair<false><<<dim3((view.hidden + 7) / 8, routes), 128, 0, cudaStreamPerThread>>>(input, output, view);
+                return;
+            }
+        }
+    }
+    Down<Type><<<dim3((view.hidden + 3) / 4, routes), 128, 0, cudaStreamPerThread>>>(input, output, view);
 }
 
 template<class View>
@@ -849,8 +955,8 @@ bool Compute(const fastllm::Data &input, fastllm::Data &activation,
             static_cast<__nv_bfloat16 *>(activation.cudaData), view, scores, swigluLimit, topk);
     } else switch (view.gateType) {
 #define GLM5_GATE(name) case GGML_TYPE_##name: \
-        glm5_gguf_cache::Gate<GGML_TYPE_##name><<<dim3(view.inter, routes), 128, 0, cudaStreamPerThread>>>( \
-            x, static_cast<__nv_bfloat16 *>(activation.cudaData), view, scores, swigluLimit, topk); break;
+        glm5_gguf_cache::LaunchGate<GGML_TYPE_##name>( \
+            x, static_cast<__nv_bfloat16 *>(activation.cudaData), view, scores, swigluLimit, topk, routes); break;
         GLM5_GATE_TYPES(GLM5_GATE)
 #undef GLM5_GATE
         default: return false;
@@ -869,8 +975,7 @@ bool Compute(const fastllm::Data &input, fastllm::Data &activation,
             DownIQ3XXSSm75<<<dim3(view.hidden / 4, routes), 128, 0, cudaStreamPerThread>>>(packed, perExpert, view);
         } else switch (view.downType) {
 #define GLM5_DOWN(name) case GGML_TYPE_##name: \
-            glm5_gguf_cache::Down<GGML_TYPE_##name><<<dim3((view.hidden + 3) / 4, routes), 128, 0, cudaStreamPerThread>>>( \
-                y, perExpert, view); break;
+            glm5_gguf_cache::LaunchDown<GGML_TYPE_##name>(y, perExpert, view, routes); break;
             GLM5_DOWN_Q8_TYPES(GLM5_DOWN)
 #undef GLM5_DOWN
             default: return false;

@@ -13,3 +13,5 @@ Benchmark 按模型分别整理。测试硬件、推荐启动命令、实测速�
 - [Dots3-Note](benchmarks/dots3_note.md)
 - [GLM-5 / GLM-5.3-Flash](benchmarks/glm5.md)
 - [Laguna](benchmarks/laguna.md)
+- [DeepSeek-V4.1-Flash](benchmarks/deepseek_v41.md)
+- [Naive-N0.5-Flash](benchmarks/naive_n05.md)

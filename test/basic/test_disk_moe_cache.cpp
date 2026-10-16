@@ -54,7 +54,7 @@ struct Fixture {
         fclose(file);
     }
     ~Fixture() { storage.clear(); unlink(path.c_str()); }
-    std::vector<uint16_t> Run(bool cached, int batch, int offset, int device = -1) {
+    std::vector<uint16_t> Run(bool cached, int batch, int offset, int device = -1, bool borrowedInput = false) {
         Data x(DataType::BFLOAT16, {batch, hidden}), y(DataType::BFLOAT16, {batch, hidden});
         Data ids(DataType::INT32PARAM, {batch, 3}), scores(DataType::FLOAT32, {batch, 3});
         Data a, b, c;
@@ -80,11 +80,30 @@ struct Fixture {
         auto &table = cached ? disk : memory;
         DataDict data = {{"input", &x}, {"output", &y}, {"index", &ids}, {"score", &scores},
             {"weights", (Data*)table.data()}, {"biass", (Data*)biases.data()}, {"w1", &a}, {"w2", &b}, {"w3", &c}};
+#ifdef USE_CUDA
+        Data source, view;
+        if (borrowedInput) {
+            source.CopyFrom(x);
+            source.ToDevice(DataDevice::CUDA, {0}, true);
+            view.FakeFrom(source, 0);
+            view.Resize(source.dims);
+            view.ToDevice(DataDevice::CPU);  // Executor's disk placement
+            Require(view.cpuData == nullptr, "fixture must exercise a borrowed CUDA view");
+            data["input"] = &view;
+        }
+#endif
         IntDict params = {{"weights___batch", (int)table.size()}, {"biass___batch", (int)biases.size()},
             {"deepSeekV4Mode", 1}, {"activationQuantBlock", 32}, {"quantizeSharedExpert", 1}};
         FloatDict floats = {{"sharedScale", 1.0f}, {"swigluLimit", 2.0f}};
         if (cached) { DiskMergeMOE op; op.Run("MergeMOE", data, floats, params); }
         else { CpuReference op; op.Run("MergeMOE", data, floats, params); }
+#ifdef USE_CUDA
+        if (borrowedInput) {
+            source.ToDevice(DataDevice::CPU);
+            Require(std::memcmp(source.cpuData, x.cpuData, x.GetBytes()) == 0,
+                "disk materialization modified or freed the borrowed input");
+        }
+#endif
         y.ToDevice(DataDevice::CPU);
         return std::vector<uint16_t>((uint16_t*)y.cpuData, (uint16_t*)y.cpuData + batch * hidden);
     }
@@ -125,6 +144,12 @@ int main(int argc, char **argv) {
             Fixture f(shared);
             SetMoeCudaCacheBytes(0);
             SetMoeCpuCacheBytes(f.expertBytes * 7);
+#ifdef USE_CUDA
+            if (FastllmCudaGetDeviceCount() > 0) {
+                for (int batch : {1, 7})
+                    Compare(f.Run(true, batch, 0, -1, true), f.Run(false, batch, 0), true);
+            }
+#endif
             for (int batch : {1, 7, 8, 40, 260, 520}) {
                 auto expected = f.Run(false, batch, 0);
                 Compare(f.Run(true, batch, 0), expected, true);

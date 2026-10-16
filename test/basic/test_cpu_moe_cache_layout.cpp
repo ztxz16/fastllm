@@ -36,6 +36,19 @@ int main() {
         Check(PlanCacheSlots({0}, 24, 8192, 16).offsets.empty());
         Check(PlanCacheSlots({17}, 24, 8192, 16).offsets.empty());
         Check(PlanCacheSlots({128}, -1, 8192, 16).offsets.empty());
+        using fastllm::cuda::PlanDeviceCacheSlots;
+        const std::vector<size_t> ppSizes{512, 256, 128, 128};
+        const std::vector<int> owners{0, 0, 1, -1};
+        const auto pp = PlanDeviceCacheSlots(ppSizes, owners, 1, 24, 8192, 16);
+        Check(pp.bytes == 48 * 128 && pp.offsets.size() == 48);
+        Check(pp.layers[0].count == 0 && pp.layers[1].count == 0);
+        Check(pp.layers[2].count == 48 && pp.layers[3].count == 48);
+        const auto small = PlanDeviceCacheSlots(ppSizes, owners, 0, 24, 16*512, 16);
+        Check(small.offsets.size() == 16 && small.layers[2].count == 0);
+        Check(small.layers[0].count == 16 && small.layers[3].count == 16);
+        Check(PlanDeviceCacheSlots({128}, {0}, 1, 24, 8192, 16).offsets.empty());
+        Check(PlanDeviceCacheSlots(ppSizes, {}, 0, 24, 8192, 16).bytes ==
+              PlanCacheSlots(ppSizes, 24, 8192, 16).bytes);
         std::puts("PASS: cache size classes, budgets, fallback and non-overlapping records"); return 0;
     } catch (const std::exception &e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
 }

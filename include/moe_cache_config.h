@@ -31,6 +31,10 @@ struct MoeCacheConfig {
     }
 };
 
+// Configure before loading; the scalar setter clears per-device overrides.
+void SetMoeCudaCacheDeviceBytes(int device, uint64_t bytes);
+uint64_t GetMoeCudaCacheDeviceBytes(int device);
+
 void SetMoeCacheConfig(const MoeCacheConfig &config);
 MoeCacheConfig GetMoeCacheConfig();
 

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <utility>
 #include <vector>
 
 namespace fastllm { namespace cuda {
@@ -60,6 +61,28 @@ inline CacheSlotPlan PlanCacheSlots(const std::vector<size_t> &strides,
         }
     }
     for (auto stride : strides) plan.layers.push_back(spans.at(stride));
+    return plan;
+}
+
+// Keep the original layer/table indices while excluding other PP stages from
+// the capacity calculation. Unrestricted layers (e.g. a shared draft) remain.
+inline CacheSlotPlan PlanDeviceCacheSlots(const std::vector<size_t> &strides,
+        const std::vector<int> &owners, int device, int experts,
+        uint64_t budget, int topk) {
+    if (owners.empty()) return PlanCacheSlots(strides, experts, budget, topk);
+    if (owners.size() != strides.size()) return {};
+    std::vector<size_t> local;
+    for (size_t i = 0; i < strides.size(); ++i)
+        if (owners[i] < 0 || owners[i] == device) local.push_back(strides[i]);
+    auto plan = PlanCacheSlots(local, experts, budget, topk);
+    auto spans = std::move(plan.layers);
+    // A distinct empty partition cannot borrow slots from the first layer.
+    plan.layers.assign(strides.size(), {int(plan.offsets.size()), 0});
+    if (!spans.empty()) {
+        size_t next = 0;
+        for (size_t i = 0; i < strides.size(); ++i)
+            if (owners[i] < 0 || owners[i] == device) plan.layers[i] = spans[next++];
+    }
     return plan;
 }
 } } // namespace fastllm::cuda

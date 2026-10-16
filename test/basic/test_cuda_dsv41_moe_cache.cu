@@ -9,6 +9,7 @@
 #include "devices/numas/numas.h"
 #include "../../src/devices/cuda/moe/fastllm-moe-deepseekv41-cache.cuh"
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -110,7 +111,12 @@ static void Compare(const std::vector<float> &actual, const std::vector<float> &
 int main(int argc, char **argv) {
     try {
         Require(prctl(PR_SET_DUMPABLE, 0) == 0, "disable test core dumps");
-        const bool dual = argc > 1 && std::string(argv[1]) == "--dual";
+        auto option = [&](const char *name) {
+            for (int i = 1; i < argc; ++i) if (std::strcmp(argv[i], name) == 0) return true;
+            return false;
+        };
+        const bool dual = option("--dual"), fp8 = option("--fp8");
+        std::printf("V4.1 cache weights: %s\n", fp8 ? "FP8 block128" : "NVFP4 block32");
         int devices = 0;
         Check(cudaGetDeviceCount(&devices));
         Require(!dual || devices >= 2, "--dual requires two CUDA devices");
@@ -211,16 +217,29 @@ int main(int argc, char **argv) {
             for (int e = 0; e < experts; ++e)
                 for (int part = 0; part < 2; ++part) {
                     const int rows = part ? hidden : inter * 2, cols = part ? inter : hidden;
-                    auto w = std::make_unique<Data>(DataType::NVFP4_BLOCK_32_E8M0);
+                    auto w = std::make_unique<Data>(fp8 ? FP8_E4M3_BLOCK_128 : NVFP4_BLOCK_32_E8M0);
                     w->Resize({rows, cols});
                     w->blockK = 1;
-                    w->blockM = 32;
+                    w->blockM = fp8 ? 128 : 32;
                     const size_t pitch = GetDataBytes(w->dataType, 1, cols);
                     std::vector<uint8_t> packed(rows * pitch);
                     auto &matrix = dense[t][e * 2 + part];
                     matrix.resize(rows * cols);
                     const float fp4[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
-                    for (int row = 0; row < rows; ++row)
+                    if (fp8) {
+                        for (int row = 0; row < rows; ++row)
+                            for (int c = 0; c < cols; c += 128) {
+                                uint8_t *block = packed.data() + row * pitch + c / 128 * 132;
+                                const float scale = std::ldexp(1.0f, (row + c / 128 + part + t) % 4 - 5);
+                                memcpy(block + 128, &scale, sizeof(scale));
+                                for (int j = 0; j < 128; ++j) {
+                                    block[j] = uint8_t((rng() % 64) | ((rng() & 1) << 7));
+                                    __nv_fp8_e4m3 value;
+                                    value.__x = block[j];
+                                    matrix[row * cols + c + j] = float(value) * scale;
+                                }
+                            }
+                    } else for (int row = 0; row < rows; ++row)
                         for (int c = 0; c < cols; c += 32) {
                             uint8_t *block = packed.data() + row * pitch + c / 32 * 17;
                             const int exponent = 121 + rng() % 4;
@@ -234,7 +253,7 @@ int main(int argc, char **argv) {
                                 }
                             }
                         }
-                    if (t == 0) {
+                    if (t == 0 && !fp8) {
                         // Source checkpoint layout: separate gate/up halves and
                         // planar UE8M0 scales, with no registered NUMA shards.
                         auto source = std::make_unique<Data>(NVFP4, std::vector<int>{rows, cols});
@@ -271,7 +290,7 @@ int main(int argc, char **argv) {
                 }
             layers[t] = {weights[t].data(), (int)weights[t].size(), true, 10.0f};
         }
-        const size_t record = ((size_t(3) * hidden * inter / 32 * 17 + 127) / 128) * 128;
+        const size_t record = ((weights[0][2]->GetBytes() + weights[0][3]->GetBytes() + 127) / 128) * 128;
         SetMoeCudaCacheBytes(0);
         Require(!FastllmCudaPrepareMoeCache(layers, tables, [] {}), "disabled cache accepted");
         SetMoeCudaCacheBytes(record);
@@ -525,7 +544,7 @@ int main(int argc, char **argv) {
                 memcpy(cpuIndex.cpuData, batchIds.data(), rows * topk * 4);
                 Data w1, w2, w3, cpuResult;
                 std::vector<Data *> biases(weights[t].size(), nullptr);
-                if (pass == 0 && rows == 33) {
+                if (!fp8 && pass == 0 && rows == 33) {
                     const auto cacheBytes = GetMoeCudaCacheBytes();
                     SetMoeCudaCacheBytes(0);
                     Data coldInput;

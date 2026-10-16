@@ -308,7 +308,8 @@ bool TryGlm5MultiGpuHybrid(OffloadGroup &group, DeviceCache &origin, int table,
             auto compute = [&](const uint8_t *records, int start, int count, bool resident) {
                 auto *slots = static_cast<int32_t *>(w.batchSlots.cudaData) + start;
                 auto *map = static_cast<int32_t *>(w.batchRoutes.cudaData) + start;
-                if (layout.weightType == NVFP4_BLOCK_16_E4M3_PACKED)
+                if (layout.weightType == NVFP4_BLOCK_16_E4M3_PACKED ||
+                    layout.weightType == FP8_E4M3_BLOCK_128)
                     return ComputeGlm5Experts(activation, w.gate, layout, records, slots,
                         static_cast<float *>(w.scores.cudaData), topk, w.GpuOutput(), map, count);
                 FastllmCudaMoeGGUFCacheView view{records, slots, layout.recordStride, layout.downOffset,

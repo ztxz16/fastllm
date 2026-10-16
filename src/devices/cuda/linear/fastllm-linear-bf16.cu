@@ -6,6 +6,7 @@
 #include "fastllm.h"
 #include "fastllm-bf16-lt.cuh"
 #include <stdexcept>
+#include "../fastllm-hybrid-prefill.cuh"
 
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
@@ -1165,7 +1166,9 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
         auto fastllmCublasHandle = getFastllmCublasHandle();
         // Small batches use a cached Lt algorithm; unsupported shapes retain
         // GemmEx. Both paths accumulate in FP32 and round to BF16 before bias.
-        if (!fastllm_bf16_lt::Matmul(cudaInput, weightPtr, cudaOutput, n, m, k)) {
+        if (!FastllmCudaHybridBf16Gemm(cudaInput, weightPtr, cudaOutput,
+                n, m, k, k, fastllmCublasHandle) &&
+            !fastllm_bf16_lt::Matmul(cudaInput, weightPtr, cudaOutput, n, m, k)) {
             float alpha = 1.0f, beta = 0.0f;
             cublasStatus_t status = cublasGemmEx(fastllmCublasHandle,
                 CUBLAS_OP_T, CUBLAS_OP_N, k, n, m,

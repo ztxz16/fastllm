@@ -22,7 +22,7 @@ MTP 反复思考问题的独立 API 复现、离线循环检测和真实输出�
 - `download.sh`: 检查本地 baseline 数据；本测试没有外部数据下载。
 - `run.sh`: 调用 `agent_tool_eval.py` 执行评测。
 - `baseline/default_cases.jsonl`: 默认测试数据，当前 24 条。
-- `results/`: 运行输出目录，JSONL/summary 默认被忽略，人工整理的 `.md` 报告可提交。
+- `results/`: 运行输出目录，JSONL/summary 默认被忽略，最终结论整理到 `docs/benchmarks/`，原始报告保存在仓库外。
 
 ## 1. Setup
 

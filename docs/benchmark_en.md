@@ -13,3 +13,5 @@ Benchmarks are organized by model. Open a model page for its tested hardware, re
 - [Dots3-Note](benchmarks/dots3_note_en.md)
 - [GLM-5 / GLM-5.3-Flash](benchmarks/glm5_en.md)
 - [Laguna](benchmarks/laguna_en.md)
+- [DeepSeek-V4.1-Flash (Chinese)](benchmarks/deepseek_v41.md)
+- [Naive-N0.5-Flash (Chinese)](benchmarks/naive_n05.md)

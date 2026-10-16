@@ -91,8 +91,11 @@ struct DirectLayoutFixture {
         Data ordinary(INT8,{int(canonical.size())},CPU,const_cast<uint8_t *>(canonical.data()));
         Data native(INT8,{int(packed.size())},CPU,packed.data());
         ordinary.ToDevice(CUDA); native.ToDevice(CUDA);
+        Data unaligned(INT8,{int(packed.size()+4)});
+        unaligned.ToDevice(CUDA);unaligned.Allocate(false);
+        Cuda(cudaMemcpy(static_cast<uint8_t *>(unaligned.cudaData)+4,native.cudaData,packed.size(),cudaMemcpyDeviceToDevice));
         constexpr int topk=3;
-        for (int rows : {1,2,3,4,7,9,17}) for (bool compact : {false,true}) {
+        for (int rows : {1,2,3,4,7,9,17,32}) for (bool compact : {false,true}) {
             const int routes=rows*topk;
             std::vector<uint16_t> x(rows*hidden);
             std::vector<int32_t> slots, map;
@@ -100,21 +103,26 @@ struct DirectLayoutFixture {
             for (int i=0;i<rows*hidden;++i) x[i]=Float32ToBFloat16RNEBits(float((i*17)%61-30)/23.f);
             for (int r=0;r<routes;++r) {
                 scores[r]=r%3==0 ? 0.f : r%3==1 ? -.125f : .3125f;
-                if (!compact || r%3!=1) {map.push_back(r);slots.push_back((r+r/topk)%2);}
+                if (!compact || r%3!=1) {map.push_back(r);slots.push_back(r%5==0 ? -1 : (r+r/topk)%2);}
             }
             std::reverse(map.begin(),map.end());
             Data input(BFLOAT16,{rows,hidden},CPU,x.data()), ds(FLOAT32,{routes},CPU,scores.data());
             Data di(INT32,{int(slots.size())},CPU,slots.data()), dm(INT32,{int(map.size())},CPU,map.data());
             input.ToDevice(CUDA);ds.ToDevice(CUDA);di.ToDevice(CUDA);dm.ToDevice(CUDA);
-            std::vector<float> output[2];
-            for (int variant=0;variant<2;++variant) {
-                Data scratch(FLOAT32,{rows*(hidden+topk*inter)}), result(FLOAT32,{routes,hidden}), activation;
+            std::vector<float> output[4];
+            std::vector<uint16_t> gates[4];
+            for (int variant=0;variant<4;++variant) {
+                Data scratch(FLOAT32,{rows*(hidden+topk*inter)+4}), result(FLOAT32,{routes,hidden}), activation;
                 scratch.ToDevice(CUDA);scratch.Allocate(false);result.ToDevice(CUDA);result.Allocate(false);
                 Cuda(cudaMemset(result.cudaData,0,result.GetBytes()));
+                // An external workspace may only have float alignment. This
+                // variant also compares the vector decoder with its fallback.
+                const size_t offset=variant==2 ? sizeof(float) : 0;
                 FastllmCudaMoeGGUFCacheView view{
-                    static_cast<const uint8_t *>(variant ? native.cudaData : ordinary.cudaData),
+                    variant==3 ? static_cast<const uint8_t *>(unaligned.cudaData)+4 :
+                        static_cast<const uint8_t *>(variant ? native.cudaData : ordinary.cudaData),
                     static_cast<const int32_t *>(di.cudaData),stride,gateBytes,gateType,downType,hidden,inter,
-                    scratch.cudaData,size_t(scratch.GetBytes())};
+                    static_cast<uint8_t *>(scratch.cudaData)+offset,size_t(scratch.GetBytes())-offset};
                 if (compact) {view.routeMap=static_cast<const int32_t *>(dm.cudaData);view.routeCount=map.size();}
                 if (variant) {view.numaGateType=gateStorage;view.numaDownType=downStorage;}
                 for (int reuse=0;reuse<2;++reuse) {
@@ -122,6 +130,20 @@ struct DirectLayoutFixture {
                     Require(FastllmCudaMoeGlm5GGUFCacheCompute(input,activation,view,
                         static_cast<const float *>(ds.cudaData),topk,.125f,static_cast<float *>(result.cudaData)),
                         "GLM direct layout computation rejected");
+                }
+                if (rows==1 && !compact && variant<2) {
+                    cudaGraph_t graph;
+                    cudaGraphExec_t executable;
+                    Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
+                    Require(FastllmCudaMoeGlm5GGUFCacheCompute(input,activation,view,
+                        static_cast<const float *>(ds.cudaData),topk,.125f,static_cast<float *>(result.cudaData)),
+                        "GLM cached layout capture rejected");
+                    Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph));
+                    Cuda(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0));
+                    Cuda(cudaGraphLaunch(executable,cudaStreamPerThread));
+                    Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                    Cuda(cudaGraphExecDestroy(executable));
+                    Cuda(cudaGraphDestroy(graph));
                 }
                 // Delay down weights on a separate stream. Gate/up must finish
                 // before that upload, and the staged result must be bit-exact
@@ -156,8 +178,14 @@ struct DirectLayoutFixture {
                 result.ToDevice(CPU);
                 output[variant].assign(reinterpret_cast<float *>(result.cpuData),
                     reinterpret_cast<float *>(result.cpuData)+routes*hidden);
+                activation.ToDevice(CPU);
+                gates[variant].assign(reinterpret_cast<uint16_t *>(activation.cpuData),
+                    reinterpret_cast<uint16_t *>(activation.cpuData)+slots.size()*inter);
             }
-            Require(output[0]==output[1],"GLM NUMA layout differs from canonical GPU arithmetic");
+            for (int variant=1;variant<4;++variant) {
+                Require(gates[0]==gates[variant],"GLM NUMA gate differs from canonical GPU arithmetic");
+                Require(output[0]==output[variant],"GLM NUMA layout differs from canonical GPU arithmetic");
+            }
         }
     }
 };
@@ -846,6 +874,7 @@ int main(int argc, char **argv) {
         const bool expertPrefill=numaPrefill || option=="--ep-prefill";
         const bool expertCache=expertPrefill || option=="--ep-cache";
         const bool resident=option=="--resident";
+        const bool ppCache=option=="--pp-cache" || option=="--pp-frequency";
         ExpertCacheTestMode cacheMode=ExpertCacheTestMode::Parallel;
         if(option=="--verify") cacheMode=ExpertCacheTestMode::Verify;
         else if(option=="--verify-no-cache") cacheMode=ExpertCacheTestMode::VerifyNoCache;
@@ -853,7 +882,7 @@ int main(int argc, char **argv) {
         const bool verify=cacheMode!=ExpertCacheTestMode::Parallel;
         const bool noCache=option=="--no-cache" || option=="--host-prefill-no-cache" ||
             cacheMode==ExpertCacheTestMode::VerifyNoCache;
-        const bool frequency=noCache || option=="--frequency";
+        const bool frequency=noCache || option=="--frequency" || option=="--pp-frequency";
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices || (expertCache && devices<2)) {
             std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: CUDA unavailable"); return 0;
@@ -907,6 +936,7 @@ int main(int argc, char **argv) {
             }
             stride=std::max(stride,weights[t][2]->GetBytes()+weights[t][3]->GetBytes());
             layers[t]={weights[t].data(),int(weights[t].size()),false,.125f,true};
+            if (ppCache) layers[t].cacheDevice = t == 4 ? std::min(1, devices-1) : 0;
             if (!resident) directFixtures.emplace_back(weights[t]);
         }
         stride=(stride+127)/128*128;
@@ -1122,6 +1152,7 @@ int main(int argc, char **argv) {
                 checkSubset("scored CPU callback recovery");
             }
             for(int device=0;device<std::min(2,devices);++device) {
+                if (ppCache && layers[t].cacheDevice != device) continue;
                 Cuda(cudaSetDevice(device));
                 Data input(BFLOAT16,{1,hidden},CPU,bx.data()),index(INT32,{1,topk},CPU,ids.data()),
                      score(FLOAT32,{1,topk},CPU,scores.data()),out;
@@ -1170,7 +1201,7 @@ int main(int argc, char **argv) {
                     worst=std::max(worst,Compare(actual,expected,"hybrid vs scalar oracle"));
                 }
             }
-            if (frequency && devices > 1) {
+            if (frequency && !ppCache && devices > 1) {
                 // Exercise arbitrary verifier widths as well as decode; rotate
                 // routes and alternate zero/nonzero inputs between rows to catch wrong maps.
                 for (int rows : {1, 2, 5}) {
@@ -1226,13 +1257,25 @@ int main(int argc, char **argv) {
         }
         for(int device=0;device<std::min(2,devices);++device) {
             uint64_t stats[5]={};Require(fastllm_moe_cuda_cache_stats(device,stats,false),"query counters");
+            if (ppCache) {
+                Require(stats[0] && stats[1] && stats[3] > 0, "PP cache not exercised");
+                if (device == 1) Require(stats[3] == uint64_t(experts), "PP Q2 capacity reserved foreign formats");
+                Cuda(cudaSetDevice(device));
+                for (int t=0;t<tables;++t) if (layers[t].cacheDevice != device) {
+                    FastllmCudaMoePrefillResidents view;
+                    Require(FastllmCudaGetMoePrefillResidents(weights[t].data(),experts,view,false), "PP resident view missing");
+                    Require(std::all_of(view.weights.begin(),view.weights.end(),[](const void *p){return !p;}),
+                            "PP cache admitted another stage's experts");
+                }
+                continue;
+            }
             Require(noCache ? stats[0]==0 && stats[1]>0 && stats[2]==0 && stats[3]==0 :
                 stats[0] && stats[1] && (frequency ? stats[3]>=uint64_t(tables*16) && stats[3]<tables*experts : stats[3]==uint64_t(tables*4)),
                     "cache cold/hot/eviction or compact slots missing");
         }
         if (frequency) Require(sawCpu && sawMixed && (noCache || sawGpu) && sawStaged,
                                "frequency did not exercise CPU, resident and staged GPU routes");
-        if (frequency && devices > 1) Require(sawCooperative[0] && sawCooperative[1], "cooperative path did not exercise both GPUs");
+        if (frequency && !ppCache && devices > 1) Require(sawCooperative[0] && sawCooperative[1], "cooperative path did not exercise both GPUs");
         FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size());
         ClearNumasMoeRuntimeCache();
         std::printf("PASS: GLM GGUF cache CPU/mixed/GPU, scalar oracle, duplicates, scores, clamp, eviction, counters; max relative L2 %.8f\n",worst);

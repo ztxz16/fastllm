@@ -6,6 +6,9 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/glm5-next-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
+#ifndef USE_ROCM
+#include "devices/cuda/fastllm-cuda-hybrid-dsa.h"
+#endif
 #include <cmath>
 #include <limits>
 
@@ -20,7 +23,7 @@ inline void ClearIndexerTensor(Data &data) {
 
 // All arithmetic below uses existing kernels. FP8 operands are stored exactly
 // in BF16 after power-of-two dequantization, for the existing V4.1 BF16 scorer.
-inline void RotateAndQuantizeIndexer(Data &input, Data &hadamard, Data &output) {
+inline void RotateAndQuantizeIndexer(Data &input, Data &hadamard, Data &output, bool hybrid = false) {
     if (hadamard.dims.empty()) {
         hadamard.dataType = DataType::FLOAT32;
         hadamard.Resize({128, 128});
@@ -38,6 +41,12 @@ inline void RotateAndQuantizeIndexer(Data &input, Data &hadamard, Data &output) 
     const auto dims = input.dims;
     fp32.Reshape({int(input.Count(0) / 128), 128});
     MatMulTransB(fp32, hadamard, rotated, 1.0f / std::sqrt(128.0f));
+#ifndef USE_ROCM
+    if (hybrid) {
+        rotated.Reshape(dims);
+        if (FastllmCudaHybridDsaQuantizeRotated(rotated, output)) return;
+    }
+#endif
     ToDataType(rotated, DataType::BFLOAT16);
     rotated.Reshape(dims);
     AssertInFastLLM(FastllmCudaNaiveQuantizeIndexer(
@@ -139,6 +148,9 @@ inline void CommitIndexerPrefix(Glm5NextIndexerCache &cache,
 
 struct DsaProjections {
     Data keys, gates, query, headWeights;
+    // A hybrid decode segment may also perform the fixed-shape rotation and
+    // quantization; the growing KPool and score/selection remain outside it.
+    bool queryQuantized = false;
 };
 
 // Stateless projections can share weight loads across independent requests.
@@ -181,7 +193,7 @@ inline void ProjectDsaQueries(Data &input, Data &qNormalized, WeightMap &weight,
 inline void BuildDsaIndices(Data &input, Data &qNormalized,
         WeightMap &weight, const std::string &prefix, int past, int topK,
         Glm5NextIndexerCache &cache, Data &indices,
-        const Data *pagedCache = nullptr, DsaProjections *projected = nullptr) {
+        const Data *pagedCache = nullptr, DsaProjections *projected = nullptr, bool hybrid = false) {
     AssertInFastLLM(input.dataDevice == DataDevice::CUDA &&
         input.dataType == DataType::BFLOAT16 && topK == 2048,
         "GLM DSA currently requires CUDA BF16 and Top-2048.");
@@ -210,9 +222,14 @@ inline void BuildDsaIndices(Data &input, Data &qNormalized,
     AssertInFastLLM(!projected->query.dims.empty() && !projected->headWeights.dims.empty(),
         "GLM DSA query projections are missing.");
     Data quantized, scores, groups;
-    RotateAndQuantizeIndexer(projected->query, cache.hadamard, quantized);
+    if (projected->queryQuantized) {
+        quantized.FakeFrom(projected->query, 0);
+        quantized.Resize(projected->query.dims);
+    } else RotateAndQuantizeIndexer(projected->query, cache.hadamard, quantized);
     auto &headWeights = projected->headWeights;
-    AssertInFastLLM(FastllmCudaDeepSeekV41IndexerScore(
+    const bool scored = hybrid && FastllmCudaGlm5NextHybridIndexerScore(
+        quantized, headWeights, cache.keys, scores);
+    AssertInFastLLM(scored || FastllmCudaDeepSeekV41IndexerScore(
         quantized, headWeights, cache.keys, 4, past, scores),
         "GLM DSA Indexer scoring failed.");
     const bool selected = sequence == 1 && FastllmCudaQwen4SelectBlocks(
@@ -249,7 +266,7 @@ inline void BuildDsaIndices(Data &input, Data &qNormalized,
 
 inline void SparseLatentAttention(Data &query, const Data &cache,
         Data &indices, float scale, Data &output, bool useFlashInfer = true,
-        const Data *keyPeCache = nullptr) {
+        const Data *keyPeCache = nullptr, bool hybrid = false) {
     useFlashInfer = useFlashInfer && FastllmCudaFlashInferDataTypeSupported(query.dataType);
     const int heads = query.dims[0], sequence = query.dims[1];
     const int tokens = cache.dims[1], rank = query.dims[2];
@@ -299,8 +316,10 @@ inline void SparseLatentAttention(Data &query, const Data &cache,
     PermuteSelf(query, {1, 0, 2});
     query.Reshape({1, sequence, heads, rank});
     indices.Reshape({1, sequence, indices.dims.back()});
-    if (keyPeCache != nullptr || !useFlashInfer ||
-        !FastllmCudaGlm5NextDsaPrefill(query, latent, indices, scale, output)) {
+    const bool hybridDone = hybrid && FastllmCudaGlm5NextHybridSparseAttention(
+        query, latent, indices, scale, output);
+    if (!hybridDone && (keyPeCache != nullptr || !useFlashInfer ||
+        !FastllmCudaGlm5NextDsaPrefill(query, latent, indices, scale, output))) {
         Data sink(DataType::FLOAT32);
         sink.Resize({heads});
         sink.ToDevice(query.dataDevice, query.dataDeviceIds, false);
@@ -316,7 +335,7 @@ inline void SparseLatentAttention(Data &query, const Data &cache,
 
 // Keep the already validated BF16 DSA fallback on pre-Ampere devices.
 inline void DenseLatentAttentionFallback(Data &query, const Data &cache,
-        float scale, Data &output) {
+        float scale, Data &output, bool hybrid = false) {
     const int rows = query.dims[1], tokens = cache.dims[1];
     AssertInFastLLM(rows > 0 && tokens >= rows,
         "GLM dense latent attention cache length mismatch.");
@@ -328,7 +347,7 @@ inline void DenseLatentAttentionFallback(Data &query, const Data &cache,
         for (int key = 0; key < tokens; ++key)
             ids[size_t(row) * tokens + key] = key <= tokens - rows + row ? key : -1;
     indices.ToDevice(query.dataDevice, query.dataDeviceIds);
-    SparseLatentAttention(query, cache, indices, scale, output, false);
+    SparseLatentAttention(query, cache, indices, scale, output, false, nullptr, hybrid);
 }
 
 } } // namespace fastllm::glm5_next_detail

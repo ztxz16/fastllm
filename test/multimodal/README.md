@@ -12,6 +12,7 @@
 python test/multimodal/fastllm_multimodal_check.py \
   --model-path /home/use/gemma-4-31B-it \
   --text-only-first
+```
 
 如果显存紧张，也可以切到 CPU：
 
@@ -20,7 +21,6 @@ python test/multimodal/fastllm_multimodal_check.py \
   --model-path /home/use/gemma-4-31B-it \
   --device cpu \
   --cpu-threads 32
-```
 ```
 
 自定义 messages：

@@ -11,6 +11,8 @@
 
 #include "deepseekv41.h"
 #include "deepseekv41_execution.h"
+#include "utils/hybrid_moe.h"
+#include <optional>
 
 #include "baseblock.h"
 #include "executor.h"
@@ -3114,7 +3116,7 @@ namespace fastllm {
         int indexTopK = 0;
         V41RopeParams windowRope{};
         V41RopeParams compressRope{};
-        HybridMoeDecodeStep moeStep;
+        std::optional<HybridMoeDecodeStep> moeStep;
         Data *curHidden = nullptr;
         Data *nextHidden = nullptr;
         bool dumpDebug = false;
@@ -3166,8 +3168,10 @@ namespace fastllm {
     void DeepSeekV41Model::ForwardState::BeginLayer(int layer) { work->model.BeginForwardLayer(*work, layer); }
     void DeepSeekV41Model::ForwardState::EndLayer(int layer) { work->model.EndForwardLayer(*work, layer); }
     void DeepSeekV41Model::ForwardState::BeginHybridStep() {
-        if (work->model.executionMode == ExecutionMode::Hybrid)
-            work->model.BeginHybridMoeStep(work->moeStep, work->tp, work->single, work->seqlen);
+        if (work->model.executionMode == ExecutionMode::Hybrid) {
+            work->moeStep.emplace();
+            work->model.BeginHybridMoeStep(*work->moeStep, work->tp, work->single, work->seqlen);
+        }
     }
     void DeepSeekV41Model::ForwardState::GpuExperts(int layer) {
         auto ctx=work->model.MakeForwardMoeContext(*work, layer);
@@ -3175,7 +3179,7 @@ namespace fastllm {
     }
     void DeepSeekV41Model::ForwardState::HybridExperts(int layer) {
         auto ctx=work->model.MakeForwardMoeContext(*work, layer);
-        work->combineFfnPostDispatch=work->model.RunHybridMoe(ctx);
+        work->combineFfnPostDispatch=work->model.RunHybridMoe(ctx, work->moeStep ? &*work->moeStep : nullptr);
     }
     std::vector<int> DeepSeekV41Model::ForwardState::Finish() { return work->model.FinishForward(*work); }
     void DeepSeekV41Model::PrepareForward(ForwardWorkspace &f) {
@@ -4442,7 +4446,7 @@ namespace fastllm {
             }
             return acc;
         };
-        moeStep.Finish();
+        if (moeStep) moeStep->Finish();
 #ifdef USE_CUDA
         // ---- 收尾：结束捕获 / 累计预热轮次 ----
         if (graphState) {
@@ -4651,14 +4655,13 @@ namespace fastllm {
         auto &tp = f.tp;
         auto &ws = f.ws;
         auto &graphActive = f.graphActive;
-        auto &moeStep = f.moeStep;
         auto &dumpDebug = f.dumpDebug;
         auto &moeWeights = f.moeWeights;
         auto &hasSharedExpertOut = f.hasSharedExpertOut;
         const auto &segments = boundedPrefill ? tailSegments : inputSegments;
 
         return DeepSeekV41MoeContext {
-            *ws, moeStep, moeWeights, tpDevices, layer, seqlen,
+            *ws, moeWeights, tpDevices, layer, seqlen,
             tp, single, dsparkVerify, graphActive, dumpDebug, hasSharedExpertOut,
             single && segments[0].spec != nullptr && segments[0].spec->wantAllTokens,
             [this, &f, layer] { RunForwardSharedExpert(f, layer); },

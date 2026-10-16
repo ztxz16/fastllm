@@ -1,6 +1,7 @@
 // CPU/NUMA experts: overlap, GPU cache, dynamic routing and host staging.
 // Pure GPU deployments never enter this backend.
 #include "deepseekv41_execution.h"
+#include "deepseekv41_hybrid.h"
 #include "baseblock.h"
 #include "utils.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
@@ -11,6 +12,9 @@
 #endif
 
 namespace fastllm {
+    DeepSeekV41DecodeWorkspace::DeepSeekV41DecodeWorkspace() = default;
+    DeepSeekV41DecodeWorkspace::~DeepSeekV41DecodeWorkspace() = default;
+
     void DeepSeekV41Model::BeginHybridMoeStep(
             HybridMoeDecodeStep &step, bool tp, bool single, int seqlen) {
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
@@ -19,16 +23,16 @@ namespace fastllm {
             moeExpertCacheAttempted = true;
             bool supported = !V41ReferenceMathEnabled() && GetCudaSharedExpert();
             std::vector<std::vector<Data *>> routedWeights = weights;
-            std::vector<FastllmCudaMoeCacheLayer> cacheLayers;
+            HybridMoeCachePlan cache(HybridMoeMath::DeepSeekV41, swiglu_limit);
             for (int layer = 0; layer < block_cnt; ++layer) {
                 supported &= V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "numa") &&
                     quantizedLinearNames.count("layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight");
                 routedWeights[layer][0] = routedWeights[layer][1] = nullptr;
-                cacheLayers.push_back({routedWeights[layer].data(), (int)routedWeights[layer].size(), true, swiglu_limit});
+                cache.Add(routedWeights[layer], SelectMoeDeviceForLayer(layer));
             }
-            if (!supported || !FastllmCudaPrepareMoeCache(cacheLayers.data(), block_cnt,
+            if (!supported || !cache.Prepare(
                     [this] { WarmupNumaMoeWeights(); })) {
-                fprintf(stderr, "[Fastllm] V4.1 expert cache requires NUMA NVFP4 block32 or Q2_K/Q4_K R4 experts, "
+                fprintf(stderr, "[Fastllm] V4.1 expert cache requires NUMA FP8 block128, NVFP4 block32 or Q2_K/Q4_K R4 experts, "
                     "CUDA shared experts and ordinary math; using the configured backend.\n");
             }
         }
@@ -47,7 +51,7 @@ namespace fastllm {
 #endif
     }
 
-    bool DeepSeekV41Model::RunHybridMoe(DeepSeekV41MoeContext &ctx) {
+    bool DeepSeekV41Model::RunHybridMoe(DeepSeekV41MoeContext &ctx, HybridMoeDecodeStep *step) {
         auto *ws = &ctx.workspace;
         auto &moeWeights = ctx.moeWeights;
         const auto &tpDevices = ctx.tpDevices;
@@ -79,12 +83,13 @@ namespace fastllm {
         bool tpCacheHandled = false;
         bool singleCacheHandled = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        if (ctx.step && hasSharedExpertOut &&
+        if (step && *step && hasSharedExpertOut &&
             moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
             ffnInput.dataDevice == DataDevice::CUDA && ffnInput.cudaData &&
             FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
             const int device = FastllmCudaGetDevice();
-            auto &cache = ws->moeCache[device];
+            if (!ws->hybrid) ws->hybrid.reset(new DeepSeekV41HybridWorkspace());
+            auto &cache = ws->hybrid->moeCache[device];
             // The router may return CPU tensors. Stage only its small
             // result, never migrate the input/output of a captured segment.
             V41ReplicaToCpu(cache.index, expertIndex, tpDevices);
@@ -114,7 +119,8 @@ namespace fastllm {
             FastllmCudaSetDevice(cacheDevice);
             if (local != ffnInput.multiDeviceDatas.end() && local->second && local->second->cudaData &&
                 FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
-                auto &cache = ws->moeCache[cacheDevice];
+                if (!ws->hybrid) ws->hybrid.reset(new DeepSeekV41HybridWorkspace());
+                auto &cache = ws->hybrid->moeCache[cacheDevice];
                 V41ReplicaToCpu(cache.index, expertIndex, tpDevices);
                 V41ReplicaToCpu(cache.score, expertScore, tpDevices);
                 cache.index.ToDevice(DataDevice::CUDA, {cacheDevice}, true);
