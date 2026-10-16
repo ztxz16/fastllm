@@ -647,6 +647,18 @@ def set_moe_cuda_cache(bytes_: int):
         raise ValueError("MoE CUDA cache size must fit in uint64")
     fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
 
+def get_cuda_memory_info(device: int):
+    """Return free/total CUDA bytes for a visible ordinal, or fail closed."""
+    query = getattr(fastllm_lib, "get_cuda_memory_info", None)
+    if query is None:
+        raise RuntimeError("Hybrid auto requires a matching native library")
+    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_bool
+    values = (ctypes.c_uint64 * 2)()
+    if not query(int(device), values):
+        raise RuntimeError("Cannot measure memory on CUDA device %d" % device)
+    return {"free": int(values[0]), "total": int(values[1])}
+
 def set_moe_cache_policy(*, half_life=128., update_interval=1, max_replacements=96,
                          max_bytes=0, min_heat=1., margin=1., factor=1.,
                          min_residence=0, prefill_prior=0., rank_by_bytes=False):

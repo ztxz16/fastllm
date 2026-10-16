@@ -83,6 +83,7 @@ typedef void* cublasHandle_t;
 
 std::vector <long long> FastllmCudaGetFreeSizes();
 long long FastllmCudaGetFreeSize();
+bool FastllmCudaGetMemoryInfo(int device, uint64_t &freeBytes, uint64_t &totalBytes);
 std::vector <long long> FastllmCudaGetTotalSizes();
 
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])

@@ -42,7 +42,8 @@ def save_defaults_to_json(parser, filename):
     print("Create config to -> \"" + filename + "\"")
 
 def args_parser():
-    parser = argparse.ArgumentParser(description = "fastllm")
+    from .util import _AutoArgumentParser
+    parser = _AutoArgumentParser(description = "fastllm")
     subparsers = parser.add_subparsers(dest='command', help='子命令')
 
     # 创建共享的解析器

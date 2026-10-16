@@ -7,6 +7,11 @@ record size, and device resource limits.
 
 ## Enabling the cache
 
+Hybrid CLI startup also supports opt-in [automatic memory planning](hybrid-auto.md)
+with `--moe_cuda_cache auto` and `--moe_cpu_cache auto`. Numeric defaults and
+the native cache APIs retain their existing behavior.
+Use `--auto` to also select devices, TP/PP, resident experts, chunk size and threads.
+
 Use `--moe_cuda_cache 5g` (alias `--moe-cuda-cache`) with CUDA compute and
 host/NUMA experts, or call `ftllm.llm.set_moe_cuda_cache(5 << 30)` before model
 loading. Zero disables the cache by default. The budget covers expert records

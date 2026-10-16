@@ -502,6 +502,19 @@ long long FastllmCudaGetFreeSize() {
     return error == cudaSuccess ? (long long)freeBytes : 0;
 }
 
+bool FastllmCudaGetMemoryInfo(int device, uint64_t &freeBytes, uint64_t &totalBytes) {
+    int previous = -1;
+    if (device < 0 || cudaGetDevice(&previous) != cudaSuccess) return false;
+    if (cudaSetDevice(device) != cudaSuccess) return false;
+    size_t free = 0, total = 0;
+    const auto error = cudaMemGetInfo(&free, &total);
+    const auto restored = cudaSetDevice(previous);
+    if (error != cudaSuccess || restored != cudaSuccess) return false;
+    freeBytes = free;
+    totalBytes = total;
+    return total > 0 && free <= total;
+}
+
 std::vector <long long> FastllmCudaGetTotalSizes() {
     int deviceCount;
     auto error = cudaGetDeviceCount(&deviceCount);
