@@ -25,6 +25,7 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
@@ -1251,6 +1252,7 @@ namespace fastllm {
             void *graph = nullptr;
             void *exec = nullptr;
             std::vector<void*> reservedPointers;
+            std::vector<size_t> allocationRequests;
         };
 
         std::mutex mutex;
@@ -1391,6 +1393,12 @@ namespace fastllm {
         }
     };
 
+    struct Qwen4ExpModel::DecodeServingSlot {
+        std::vector<std::pair<Data, Data>> cache;
+        std::vector<int> devices;
+        bool failed = false;
+    };
+
     struct Qwen4ExpModel::MtpDraftCudaGraphState {
         struct Segment {
             bool warmed = false;
@@ -1401,6 +1409,7 @@ namespace fastllm {
             void *graph = nullptr;
             void *exec = nullptr;
             std::vector<void*> reservedPointers;
+            std::vector<size_t> allocationRequests;
             std::vector<uint64_t> inputSignature;
             Data projectedHidden;
             Data attentionOutput;
@@ -1444,7 +1453,7 @@ namespace fastllm {
         }
 
         template <class Compute>
-        void RunPrefix(Segment &segment, Compute &&compute) {
+        void RunPrefix(Segment &segment, Compute &&compute, bool allowCapture) {
 #ifdef USE_CUDA
             if (segment.captured) {
                 if (FastllmCudaGraphLaunch(segment.exec)) return;
@@ -1453,7 +1462,13 @@ namespace fastllm {
                 FastllmCudaClearThreadError();
                 FastllmCudaClearGraphError();
             }
+            if (!allowCapture) {
+                compute();
+                return;
+            }
             if (segment.disabled || !segment.warmed) {
+                segment.allocationRequests.clear();
+                FastllmCudaAllocationRecorder record(&segment.allocationRequests);
                 compute();
                 segment.warmed = true;
                 return;
@@ -1461,6 +1476,11 @@ namespace fastllm {
             void *graph = nullptr, *exec = nullptr;
             bool pool = false;
             bool ok = FastllmCudaGraphPrepareCaptureDevice();
+            if (ok) {
+                ForceDeviceSync();
+                ok = !FastllmCudaGetThreadError() &&
+                    FastllmCudaReserveGraphWorkspace(segment.allocationRequests);
+            }
             if (ok) ok = pool = FastllmCudaGraphMemoryPoolBegin();
             if (ok) {
                 FastllmCudaClearThreadError();
@@ -1571,6 +1591,7 @@ namespace fastllm {
             bool failed = false;
             bool mtpDisabled = false;
             bool startupReserved = false;
+            bool reuseMtpGraphs = false;
         };
         std::map<const Data *, std::unique_ptr<RequestCache>> caches;
         // Keep at most one completed request. Graphs and all buffers
@@ -2385,7 +2406,15 @@ namespace fastllm {
             // Fresh TP requests can reuse storage without reusing contents.
             // Host experts cannot enter a whole CUDA graph, but their KV and
             // pinned QSA buffers have the same reusable lifetime.
-            const bool reusable = Qwen4MtpDraftsPerStep() == 0 &&
+            const bool reuseMtpGraphs = Qwen4MtpDraftsPerStep() > 0 &&
+                GetFastllmEnv().cudaGraph &&
+                !autoWarmupRunning.load() && maxBatch == 1 &&
+                !GetKVCacheInCPU() && !saveHistoryChat && !Qwen4PrefixCacheEnabled() &&
+                !hasMultimodalInput && generationConfig.IsSimpleGreedy() &&
+                generationConfig.input_token_length >= indexerBudget &&
+                std::all_of(tp.ranks.begin(), tp.ranks.end(),
+                    [](const auto &rank) { return rank->servingCache != nullptr; });
+            const bool reusable = (Qwen4MtpDraftsPerStep() == 0 || reuseMtpGraphs) &&
                 batch == 1 && (GetFastllmEnv().cudaGraph || tp.hostMoe) &&
                 Qwen4TpDecodeFitsCapacityClass(generationConfig, indexerBudget) &&
                 std::all_of(pastKeyValues.begin(), pastKeyValues.end(),
@@ -2414,6 +2443,7 @@ namespace fastllm {
             } else {
                 entry = std::make_unique<ThreadTpState::RequestCache>();
                 entry->ownsRankZero = reusable;
+                entry->reuseMtpGraphs = reusable && reuseMtpGraphs;
                 entry->ranks.resize(tp.devices.size());
                 for (size_t r = reusable ? 0 : 1; r < tp.devices.size(); ++r) {
                     entry->ranks[r].resize(block_cnt);
@@ -2483,29 +2513,33 @@ namespace fastllm {
                 // Preserve only reusable storage, after the previous worker's
                 // stream has completed, so captured addresses stay valid.
                 auto &state = model.requestStates[&cache.front().first];
-                RequestState fresh;
-                fresh.indexerTailKeyTensors.swap(state.indexerTailKeyTensors);
-                fresh.indexerTailPositionTensors.swap(state.indexerTailPositionTensors);
-                fresh.indexerBlockKeyTensors.swap(state.indexerBlockKeyTensors);
-                fresh.indexerHostMirrorTransfers.swap(state.indexerHostMirrorTransfers);
-                for (auto *tensors : {&fresh.indexerTailKeyTensors,
-                                      &fresh.indexerTailPositionTensors,
-                                      &fresh.indexerBlockKeyTensors}) {
-                    for (auto &item : *tensors) {
-                        if (item.second && !item.second->dims.empty()) {
-                            auto dims = item.second->dims;
-                            dims[0] = 0;
-                            item.second->Resize(dims);
+                if (entry->reuseMtpGraphs) {
+                    model.ResetDecodeServingState(state, true);
+                } else {
+                    RequestState fresh;
+                    fresh.indexerTailKeyTensors.swap(state.indexerTailKeyTensors);
+                    fresh.indexerTailPositionTensors.swap(state.indexerTailPositionTensors);
+                    fresh.indexerBlockKeyTensors.swap(state.indexerBlockKeyTensors);
+                    fresh.indexerHostMirrorTransfers.swap(state.indexerHostMirrorTransfers);
+                    for (auto *tensors : {&fresh.indexerTailKeyTensors,
+                                          &fresh.indexerTailPositionTensors,
+                                          &fresh.indexerBlockKeyTensors}) {
+                        for (auto &item : *tensors) {
+                            if (item.second && !item.second->dims.empty()) {
+                                auto dims = item.second->dims;
+                                dims[0] = 0;
+                                item.second->Resize(dims);
+                            }
                         }
                     }
-                }
-                for (auto &item : fresh.indexerHostMirrorTransfers) {
-                    if (item.second) {
-                        item.second->MarkDeviceSynchronized();
-                        item.second->Rollback(0);
+                    for (auto &item : fresh.indexerHostMirrorTransfers) {
+                        if (item.second) {
+                            item.second->MarkDeviceSynchronized();
+                            item.second->Rollback(0);
+                        }
                     }
+                    state = std::move(fresh);
                 }
-                state = std::move(fresh);
                 for (int layer = 0; layer < block_cnt; ++layer) {
                     for (Data *tensor : {&cache[layer].first, &cache[layer].second}) {
                         if (model.IsLinearAttentionLayer(layer)) {
@@ -2515,6 +2549,9 @@ namespace fastllm {
                         }
                     }
                 }
+            }
+            if (entry->reuseMtpGraphs) {
+                model.requestStates[&cache.front().first].reusableGraphRequest = true;
             }
             if (hasMultimodalInput) {
                 model.requestStates[&cache.front().first].hasMultimodalInput = true;
@@ -2623,7 +2660,7 @@ namespace fastllm {
         return true;
     }
 
-    void Qwen4ExpModel::RemoveThreadTpRequest(const Data *key) {
+    void Qwen4ExpModel::RemoveThreadTpRequest(const Data *key, bool completed) {
         if (!threadTpState) return;
         ThreadTpState &tp = *threadTpState;
         std::lock_guard<std::mutex> guard(tp.forwardMutex);
@@ -2633,15 +2670,37 @@ namespace fastllm {
         // Admission of another request takes priority over an idle graph.
         // Retaining a completed long-context slot during a peer's prefill
         // would otherwise pin its large KV and graph allocations unnecessarily.
-        bool reusable = tp.caches.size() == 1 &&
+        bool reusable = completed && tp.caches.size() == 1 &&
             cache->ownsRankZero && !cache->failed;
-        for (size_t r = 0; reusable && !tp.hostMoe && r < tp.ranks.size(); ++r) {
+        for (size_t r = 0; reusable && !cache->reuseMtpGraphs && !tp.hostMoe && r < tp.ranks.size(); ++r) {
             const auto &graphs = tp.ranks[r]->decodeCudaGraphStates;
             auto graph = graphs.find(&cache->ranks[r].front().first);
             reusable = graph != graphs.end() && graph->second &&
                 graph->second->wholeGraphMode &&
                 std::any_of(graph->second->segments.begin(), graph->second->segments.end(),
                     [](const auto &segment) { return segment.second.captured; });
+        }
+        if (cache->reuseMtpGraphs) {
+#ifdef USE_CUDA
+            Qwen4CudaDeviceGuard deviceGuard;
+            for (size_t r = 0; r < tp.ranks.size(); ++r) {
+                FastllmCudaSetDevice(tp.devices[r]);
+                ForceDeviceSync();
+                auto &model = *tp.ranks[r];
+                auto &local = cache->ranks[r];
+                const Data *localKey = &local.front().first;
+                if (reusable) {
+                    model.ResetDecodeServingState(model.requestStates[localKey], true);
+                    // Return logical KV pages before the scheduler admits the
+                    // next request, retaining all captured allocations.
+                    for (int layer = 0; layer < block_cnt; ++layer) {
+                        if (model.IsLinearAttentionLayer(layer)) continue;
+                        for (Data *tensor : {&local[layer].first, &local[layer].second})
+                            if (!tensor->dims.empty()) Qwen4ResizeKVCache(*tensor, 0);
+                    }
+                }
+            }
+#endif
         }
         if (reusable) {
             tp.ReleaseCache(nullptr, tp.idleCache);
@@ -2731,6 +2790,9 @@ namespace fastllm {
     Qwen4ExpModel::~Qwen4ExpModel() {
         ShutdownRuntime();
         threadTpState.reset();
+        for (auto &item : decodeServingSlots) ReleaseDecodeServingSlot(item.second);
+        decodeServingSlots.clear();
+        ReleaseDecodeServingSlot(idleDecodeServingSlot);
 #ifdef USE_CUDA
         prefillPipeline.reset();
 #ifndef USE_ROCM
@@ -5923,7 +5985,8 @@ namespace fastllm {
                          std::vector<int>({cachedBlocks,
                                            this->indexerHeadDim})),
                     "Qwen4-Exp QSA compressed cache append is inconsistent.");
-                const bool reusableEmptyBlocks = threadTpRank >= 0 &&
+                const bool reusableEmptyBlocks = (threadTpRank >= 0 ||
+                    state.reusableGraphRequest) &&
                     blockCache != nullptr && sameDevice(*blockCache) &&
                     blockCache->dataType == DataType::FLOAT32 &&
                     blockCache->dims == std::vector<int>({0, this->indexerHeadDim}) &&
@@ -8905,7 +8968,8 @@ namespace fastllm {
         };
         if (prefixSegment) {
             const bool wasCaptured = prefixSegment->captured;
-            state.draftGraphState->RunPrefix(*prefixSegment, runPrefix);
+            state.draftGraphState->RunPrefix(*prefixSegment, runPrefix,
+                !state.attentionState.decodeGraphsFrozen);
             if (!wasCaptured && prefixSegment->captured) {
                 // Capturing this prefix reserves its temporary pool buffers.
                 // Warm the tail again with those reservations in place before
@@ -9231,10 +9295,12 @@ namespace fastllm {
                     FastllmCudaClearThreadError();
                     FastllmCudaClearGraphError();
                 }
-                if (segment.disabled) {
+                if (segment.disabled || state.attentionState.decodeGraphsFrozen) {
                     postAttentionReady = runPostAttention();
                 } else if (!segment.warmed) {
                     FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+                    segment.allocationRequests.clear();
+                    FastllmCudaAllocationRecorder record(&segment.allocationRequests);
                     postAttentionReady = runPostAttention();
                     segment.warmed = true;
                     segment.disabled = !ThreadTpAllTrue(postAttentionReady &&
@@ -9247,6 +9313,12 @@ namespace fastllm {
                     bool recaptureWithoutParallelMarkers = false;
                     bool captureOk =
                         ThreadTpAllTrue(FastllmCudaGraphPrepareCaptureDevice());
+                    if (captureOk) {
+                        ForceDeviceSync();
+                        captureOk = ThreadTpAllTrue(!FastllmCudaGetThreadError());
+                        if (captureOk) captureOk = ThreadTpAllTrue(
+                            FastllmCudaReserveGraphWorkspace(segment.allocationRequests));
+                    }
                     if (captureOk) {
                         // The graph pool brackets all TP worker allocations;
                         // rank zero alone owns its begin/end and reservation.
@@ -9467,8 +9539,11 @@ namespace fastllm {
         }
 
         DecodeCudaGraphState *graphState;
+        bool captureFrozen = false;
         {
             std::lock_guard<std::mutex> guard(this->stateMutex);
+            const auto request = requestStates.find(&pastKeyValues[0].first);
+            captureFrozen = request != requestStates.end() && request->second.decodeGraphsFrozen;
             auto &backbone = this->decodeCudaGraphStates[&pastKeyValues[0].first];
             if (!backbone) backbone.reset(new DecodeCudaGraphState());
             if (!backbone->tpPrefix) backbone->tpPrefix.reset(new DecodeCudaGraphState());
@@ -9511,7 +9586,7 @@ namespace fastllm {
         auto &segment = graphState->segments[0];
         if (!segment.captured) {
             FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
-            if (!segment.warmed || segment.disabled) {
+            if (!segment.warmed || segment.disabled || captureFrozen) {
                 runBody();
                 segment.warmed = true;
                 segment.disabled = !ThreadTpAllTrue(
@@ -10754,7 +10829,17 @@ namespace fastllm {
             }
         };
 
-        bool captureAttempted = false;
+        int capturesAttempted = 0;
+        const char *captureBudgetEnv = std::getenv("FASTLLM_CUDA_GRAPH_CAPTURE_BUDGET");
+        // TP ranks already commit each capture together below. Limiting TP
+        // to one segment per forward leaves rare verifier lengths only
+        // partially captured when the first reusable request is frozen.
+        // Honor the same startup budget on every rank; serving requests
+        // still take the frozen/eager branch before attempting any capture.
+        const bool prepareReusableTp = threadTpRank >= 0 && requestState.reusableGraphRequest;
+        const int captureBudget = threadTpRank >= 0 && !prepareReusableTp ? 1 :
+            (captureBudgetEnv ? std::max(1, std::min(128, std::atoi(captureBudgetEnv)))
+                              : (prepareReusableTp ? 8 : 1));
         auto runCapturedSegment = [&](int segmentKey, const auto &runBody) {
             DecodeCudaGraphState::Segment &segment =
                 graphState->segments[segmentKey];
@@ -10784,8 +10869,17 @@ namespace fastllm {
                 return;
             }
 
+            // Serving requests only replay the shapes captured by the first
+            // request. An unseen or invalidated shape stays eager thereafter.
+            if (requestState.decodeGraphsFrozen) {
+                runBody();
+                return;
+            }
             FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
             if (!segment.warmed || segment.disabled) {
+                segment.allocationRequests.clear();
+                FastllmCudaAllocationRecorder record(
+                    (threadTpRank < 0 || prepareReusableTp) ? &segment.allocationRequests : nullptr);
                 runBody();
                 segment.warmed = true;
                 if (FastllmCudaMergeMOEUsedGraphUnsafeFallback()) {
@@ -10793,11 +10887,11 @@ namespace fastllm {
                 }
                 return;
             }
-            if (captureAttempted) {
+            if (capturesAttempted >= captureBudget) {
                 runBody();
                 return;
             }
-            captureAttempted = true;
+            ++capturesAttempted;
 
             void *capturedGraph = nullptr;
             void *capturedExec = nullptr;
@@ -10814,6 +10908,13 @@ namespace fastllm {
                 // entering capture; graph replay needs no such synchronization.
                 ForceDeviceSync();
                 captureOk = ThreadTpAllTrue(!FastllmCudaGetThreadError());
+            }
+            if (captureOk && (threadTpRank < 0 || prepareReusableTp)) {
+                // Earlier segments pin their temporary allocations. Reserve
+                // each rank's recorded demand before opening the shared pool,
+                // then rendezvous so no peer allocates during capture.
+                captureOk = ThreadTpAllTrue(
+                    FastllmCudaReserveGraphWorkspace(segment.allocationRequests));
             }
             if (captureOk) {
                 if (threadTpRank <= 0) {
@@ -12210,7 +12311,211 @@ namespace fastllm {
                             &batchLogits)[0];
     }
 
+    void Qwen4ExpModel::ResetDecodeServingState(RequestState &state, bool freezeGraphs) {
+#ifdef USE_CUDA
+        Qwen4CudaDeviceGuard deviceGuard;
+#endif
+        RequestState fresh;
+        fresh.reusableGraphRequest = true;
+        fresh.decodeGraphsFrozen = freezeGraphs;
+        fresh.servingCache = state.servingCache;
+        fresh.indexerTailKeyTensors.swap(state.indexerTailKeyTensors);
+        fresh.indexerTailPositionTensors.swap(state.indexerTailPositionTensors);
+        fresh.indexerBlockKeyTensors.swap(state.indexerBlockKeyTensors);
+        fresh.indexerHostMirrorTransfers.swap(state.indexerHostMirrorTransfers);
+        for (auto *tensors : {&fresh.indexerTailKeyTensors,
+                              &fresh.indexerTailPositionTensors,
+                              &fresh.indexerBlockKeyTensors}) {
+            for (auto &item : *tensors) {
+                if (item.second && !item.second->dims.empty()) {
+                    auto dims = item.second->dims;
+                    dims[0] = 0;
+                    item.second->Resize(dims);
+                }
+            }
+        }
+        for (auto &item : fresh.indexerHostMirrorTransfers) {
+#ifdef USE_CUDA
+            if (item.second) {
+                item.second->MarkDeviceSynchronized();
+                item.second->Rollback(0);
+            }
+#endif
+        }
+        fresh.mtpState = std::move(state.mtpState);
+        if (fresh.mtpState) {
+            auto &mtp = *fresh.mtpState;
+            ResetDecodeServingState(mtp.attentionState, freezeGraphs);
+            for (Data *tensor : {&mtp.key, &mtp.value}) {
+#ifdef USE_CUDA
+                if (!tensor->dataDeviceIds.empty()) FastllmCudaSetDevice(tensor->dataDeviceIds.front());
+#endif
+                if (!tensor->dims.empty()) Qwen4ResizeKVCache(*tensor, 0);
+            }
+            mtp.proposals.clear();
+            mtp.pendingOutputTokens.clear();
+            mtp.proposalCount = 0;
+            mtp.sampleProposal = false;
+            mtp.proposalTemperature = 1.0f;
+            mtp.deferredPosition = -1;
+            mtp.hasDeferredTargetHidden = false;
+            mtp.targetCheckpointPrepared = false;
+            // Keep checkpoint allocations and graph inputs at their captured
+            // addresses. The first new checkpoint overwrites their contents.
+        }
+        state = std::move(fresh);
+    }
+
+    void Qwen4ExpModel::ReleaseDecodeServingSlot(
+            std::unique_ptr<DecodeServingSlot> &slot) {
+        if (!slot) return;
+#ifdef USE_CUDA
+        Qwen4CudaDeviceGuard deviceGuard;
+        for (int device : slot->devices) {
+            FastllmCudaSetDevice(device);
+            ForceDeviceSync();
+        }
+#endif
+        if (!slot->cache.empty()) {
+            std::lock_guard<std::mutex> guard(stateMutex);
+            const Data *key = &slot->cache.front().first;
+            decodeCudaGraphStates.erase(key);
+            requestStates.erase(key);
+        }
+        slot.reset();
+    }
+
+    void Qwen4ExpModel::RemoveDecodeServingRequest(const Data *key, bool reusable) {
+        std::lock_guard<std::mutex> guard(decodeServingMutex);
+        auto found = decodeServingSlots.find(key);
+        if (found == decodeServingSlots.end()) return;
+        auto &slot = found->second;
+        if (!slot) {
+            decodeServingSlots.erase(found);
+            return;
+        }
+        if (reusable && !slot->failed && decodeServingSlots.size() == 1) {
+#ifdef USE_CUDA
+            Qwen4CudaDeviceGuard deviceGuard;
+            for (int device : slot->devices) {
+                FastllmCudaSetDevice(device);
+                ForceDeviceSync();
+            }
+#endif
+            // The scheduler checks free pages before calling ForwardBatch.
+            // Release logical KV occupancy now, while keeping page tables and
+            // graph-owned storage alive; an idle long request must not block
+            // admission of the next request into this same bounded pool.
+            {
+                std::lock_guard<std::mutex> stateGuard(stateMutex);
+                ResetDecodeServingState(requestStates[&slot->cache.front().first], true);
+            }
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                if (IsLinearAttentionLayer(layer)) continue;
+                for (Data *tensor : {&slot->cache[layer].first, &slot->cache[layer].second}) {
+#ifdef USE_CUDA
+                    if (!tensor->dataDeviceIds.empty()) FastllmCudaSetDevice(tensor->dataDeviceIds.front());
+#endif
+                    if (!tensor->dims.empty()) Qwen4ResizeKVCache(*tensor, 0);
+                }
+            }
+            ReleaseDecodeServingSlot(idleDecodeServingSlot);
+            idleDecodeServingSlot = std::move(slot);
+        } else ReleaseDecodeServingSlot(slot);
+        decodeServingSlots.erase(found);
+    }
+
     std::vector<int> Qwen4ExpModel::ForwardBatch(
+            int batch, const Data &inputIds, const Data &attentionMask,
+            const Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+            std::vector<std::vector<float> *> *retLogits) {
+        AssertInFastLLM(batch == 1 && inputIds.dims.size() == 2 &&
+                        inputIds.dims[0] == 1,
+                        "Qwen4-Exp currently runs one request per Forward call.");
+        AssertInFastLLM((int)pastKeyValues.size() >= this->block_cnt,
+                        "Qwen4-Exp received too few cache slots.");
+#ifdef USE_CUDA
+        bool reusable = false;
+        if (!pastKeyValues.empty() && threadTpRank < 0 && !threadTpState) {
+            std::lock_guard<std::mutex> guard(stateMutex);
+            const auto state = requestStates.find(&pastKeyValues.front().first);
+            reusable = state != requestStates.end() && state->second.reusableGraphRequest;
+        }
+        if (reusable) {
+            std::lock_guard<std::mutex> guard(decodeServingMutex);
+            const Data *requestKey = &pastKeyValues.front().first;
+            auto &slot = decodeServingSlots[requestKey];
+            try {
+                if (!slot) {
+                    const bool reused = idleDecodeServingSlot != nullptr;
+                    slot = std::move(idleDecodeServingSlot);
+                    if (!slot) {
+                        slot = std::make_unique<DecodeServingSlot>();
+                        slot->cache.reserve(block_cnt);
+                        for (int layer = 0; layer < block_cnt; ++layer) {
+                            slot->cache.emplace_back(Data(pastKeyValues[layer].first.dataType),
+                                                     Data(pastKeyValues[layer].second.dataType));
+                        }
+                        std::set<int> devices;
+                        for (const auto &layer : servingCache->layers)
+                            for (const auto &pool : {layer.first, layer.second})
+                                if (pool) devices.insert(pool->dataDeviceIds.front());
+                        if (servingCache->mtp.first)
+                            devices.insert(servingCache->mtp.first->dataDeviceIds.front());
+                        slot->devices.assign(devices.begin(), devices.end());
+                    }
+                    Qwen4CudaDeviceGuard deviceGuard;
+                    for (int device : slot->devices) {
+                        FastllmCudaSetDevice(device);
+                        if (reused) ForceDeviceSync();
+                    }
+                    {
+                        std::lock_guard<std::mutex> stateGuard(stateMutex);
+                        ResetDecodeServingState(requestStates[&slot->cache.front().first], reused);
+                    }
+                    for (int layer = 0; reused && layer < block_cnt; ++layer) {
+                        for (Data *tensor : {&slot->cache[layer].first, &slot->cache[layer].second}) {
+                            if (!tensor->dataDeviceIds.empty()) FastllmCudaSetDevice(tensor->dataDeviceIds.front());
+                            if (IsLinearAttentionLayer(layer)) tensor->Allocate(0.0f);
+                            else if (!tensor->dims.empty()) Qwen4ResizeKVCache(*tensor, 0);
+                        }
+                    }
+                }
+                auto result = ForwardBatchInternal(batch, inputIds, attentionMask, positionIds,
+                    slot->cache, generationConfig, lastTokens, retLogits);
+                for (int device : slot->devices) {
+                    FastllmCudaSetDevice(device);
+                    FastllmCudaSyncCurrentThreadStream();
+                }
+                // The scheduler sees metadata only; the slot owns all page
+                // references and stable addresses until release or reuse.
+                for (int layer = 0; layer < block_cnt; ++layer) {
+                    const bool linear = IsLinearAttentionLayer(layer);
+                    AssertInFastLLM(Qwen4BorrowCudaTensor(slot->cache[layer].first,
+                        pastKeyValues[layer].first, linear, false) &&
+                        Qwen4BorrowCudaTensor(slot->cache[layer].second,
+                        pastKeyValues[layer].second, linear, false),
+                        "Qwen4 reusable graph slot cannot publish cache metadata.");
+                }
+                return result;
+            } catch (...) {
+                if (slot) slot->failed = true;
+                throw;
+            }
+        }
+        // An incompatible request must be able to use the bounded KV pool.
+        // Its first forward retires the idle slot's fixed linear references.
+        if (!threadTpState && threadTpRank < 0) {
+            std::lock_guard<std::mutex> guard(decodeServingMutex);
+            ReleaseDecodeServingSlot(idleDecodeServingSlot);
+        }
+#endif
+        return ForwardBatchInternal(batch, inputIds, attentionMask, positionIds,
+            pastKeyValues, generationConfig, lastTokens, retLogits);
+    }
+
+    std::vector<int> Qwen4ExpModel::ForwardBatchInternal(
             int batch,
             const Data &inputIds,
             const Data &attentionMask,
@@ -13930,6 +14235,19 @@ namespace fastllm {
                 auto &state = this->requestStates[&context->pastKeyValues[0].first];
                 state = RequestState();
                 state.hasMultimodalInput = !context->multimodalInput.empty();
+#ifdef USE_CUDA
+                // One text-only serving slot owns fixed KV across all PP stages.
+                // TP owns equivalent slots in its rank workers. Prefix restores
+                // and short-context attention retain their established path.
+                state.reusableGraphRequest = GetFastllmEnv().cudaGraph && !autoWarmupRunning.load() &&
+                    !threadTpState && threadTpRank < 0 && maxBatch == 1 &&
+                    servingCache &&
+                    Qwen4CudaOnlyDeviceMap(deviceMap) && !GetKVCacheInCPU() &&
+                    !saveHistoryChat && !Qwen4PrefixCacheEnabled() &&
+                    !state.hasMultimodalInput && context->cacheLen == 0 &&
+                    context->generationConfig.IsSimpleGreedy() &&
+                    (int)context->allTokens.size() >= indexerBudget;
+#endif
             }
         }
     }
@@ -13938,9 +14256,13 @@ namespace fastllm {
         if (context == nullptr) {
             return;
         }
+        if (!context->pastKeyValues.empty())
+            RemoveDecodeServingRequest(&context->pastKeyValues.front().first,
+                !context->isAbort && context->error == ResponseContextErrorNone);
         std::lock_guard<std::mutex> guard(this->stateMutex);
         if (!context->pastKeyValues.empty()) {
-            RemoveThreadTpRequest(&context->pastKeyValues[0].first);
+            RemoveThreadTpRequest(&context->pastKeyValues[0].first,
+                !context->isAbort && context->error == ResponseContextErrorNone);
             this->decodeCudaGraphStates.erase(
                 &context->pastKeyValues[0].first);
             this->requestStates.erase(&context->pastKeyValues[0].first);

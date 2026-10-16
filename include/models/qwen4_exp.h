@@ -105,6 +105,19 @@ namespace fastllm {
         struct ServingCache;
         struct MtpRuntimeState;
         struct ThreadTpState;
+        struct DecodeServingSlot;
+        struct RequestState;
+        std::map<const Data *, std::unique_ptr<DecodeServingSlot>> decodeServingSlots;
+        std::unique_ptr<DecodeServingSlot> idleDecodeServingSlot;
+        std::mutex decodeServingMutex;
+        void ReleaseDecodeServingSlot(std::unique_ptr<DecodeServingSlot> &slot);
+        void RemoveDecodeServingRequest(const Data *key, bool reusable);
+        void ResetDecodeServingState(RequestState &state, bool freezeGraphs = false);
+        std::vector<int> ForwardBatchInternal(
+                int batch, const Data &inputIds, const Data &attentionMask,
+                const Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                std::vector<std::vector<float> *> *retLogits);
         std::unique_ptr<ThreadTpState> threadTpState;
         ThreadTpState *threadTpOwner = nullptr;
         int threadTpRank = -1;
@@ -114,7 +127,7 @@ namespace fastllm {
         void PrepareThreadTp();
         void ThreadTpAllReduce(Data &data);
         bool ThreadTpAllTrue(bool value);
-        void RemoveThreadTpRequest(const Data *key);
+        void RemoveThreadTpRequest(const Data *key, bool completed = false);
         std::vector<int> ForwardThreadTp(
                 int batch, const Data &inputIds, const Data &attentionMask,
                 const Data &positionIds,
@@ -125,6 +138,8 @@ namespace fastllm {
                 const Data *precomputedEmbedding = nullptr);
 
         struct RequestState {
+            bool reusableGraphRequest = false;
+            bool decodeGraphsFrozen = false;
             // Keep the model's preallocated pools alive while this request uses them.
             std::shared_ptr<ServingCache> servingCache;
             std::shared_ptr<PleStagingState> pleStaging;

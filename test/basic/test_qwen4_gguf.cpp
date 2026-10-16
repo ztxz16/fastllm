@@ -288,6 +288,84 @@ void TestEmbeddingImport(const Fixture &fixture) {
 }
 namespace fastllm {
 struct Qwen4GGUFTestAccess {
+    static void CheckGraphSlotReset(int targetDevice = 0, int draftDevice = 0) {
+#ifdef USE_CUDA
+        Qwen4ExpModel model;
+        Qwen4ExpModel::RequestState state;
+        state.previousToken1 = 17;
+        state.previousToken2 = 23;
+        state.convHistory = {1, 2, 3};
+        state.processedTokens = {4, 5, 6};
+        state.indexerRawKeys[1] = {9};
+        state.indexerPositions[1] = {10};
+        state.indexerBlockKeys[1] = {11};
+        state.geometricCacheGrowthReadyLayers.insert(1);
+        state.mtpDisabled = true;
+        state.hasMultimodalInput = true;
+        auto tensor = [&](const std::vector<int> &dims, int device = -1) {
+            size_t count = 1;
+            for (int dim : dims) count *= dim;
+            auto value = std::make_shared<Data>(FLOAT32, dims, std::vector<float>(count, 7));
+            value->ToDevice(CUDA, std::vector<int>{device < 0 ? targetDevice : device});
+            value->expansionDims = value->dims;
+            return value;
+        };
+        state.indexerTailKeyTensors[1] = tensor({4, 8});
+        state.indexerTailPositionTensors[1] = tensor({4});
+        state.indexerBlockKeyTensors[1] = tensor({16, 8});
+        void *tail = state.indexerTailKeyTensors[1]->cudaData;
+        void *positions = state.indexerTailPositionTensors[1]->cudaData;
+        void *blocks = state.indexerBlockKeyTensors[1]->cudaData;
+        state.mtpState = std::make_shared<Qwen4ExpModel::MtpRuntimeState>();
+        auto mtp = state.mtpState;
+        mtp->key.CopyFrom(*tensor({2, 6, 8}, draftDevice));
+        mtp->value.CopyFrom(*tensor({2, 6, 8}, draftDevice));
+        mtp->proposals = {12, 13};
+        mtp->pendingOutputTokens = {14, 15};
+        mtp->proposalCount = 2;
+        mtp->hasDeferredTargetHidden = true;
+        mtp->deferredPosition = 42;
+        mtp->targetCheckpointPrepared = true;
+        mtp->attentionState.processedTokens = {8, 9};
+        mtp->attentionState.previousToken1 = 11;
+        mtp->attentionState.indexerBlockKeyTensors[2] = tensor({16, 8}, draftDevice);
+        mtp->targetCheckpoint.linearSecond.resize(1);
+        mtp->targetCheckpoint.linearSecond[0].CopyFrom(*tensor({1, 4, 8}));
+        void *key = mtp->key.cudaData;
+        void *checkpoint = mtp->targetCheckpoint.linearSecond[0].cudaData;
+        for (int repetition = 0; repetition < 2; ++repetition) {
+            FastllmCudaSetDevice(targetDevice);
+            model.ResetDecodeServingState(state, true);
+            Check(FastllmCudaGetDevice() == targetDevice &&
+                  mtp->key.dataDeviceIds == std::vector<int>{draftDevice} &&
+                  state.indexerTailKeyTensors[1]->dataDeviceIds == std::vector<int>{targetDevice},
+                  "multi-GPU graph reset changed device ownership or caller device");
+            Check(state.reusableGraphRequest && state.decodeGraphsFrozen && state.previousToken1 == -1 &&
+                  state.previousToken2 == -1 && state.processedTokens.empty() &&
+                  state.convHistory.empty() && state.indexerRawKeys.empty() &&
+                  state.indexerPositions.empty() && state.indexerBlockKeys.empty() &&
+                  state.geometricCacheGrowthReadyLayers.empty() &&
+                  !state.mtpDisabled && !state.hasMultimodalInput,
+                  "graph slot retained request history");
+            Check(state.indexerTailKeyTensors[1]->cudaData == tail &&
+                  state.indexerTailPositionTensors[1]->cudaData == positions &&
+                  state.indexerBlockKeyTensors[1]->cudaData == blocks &&
+                  state.indexerTailKeyTensors[1]->dims[0] == 0 &&
+                  state.indexerBlockKeyTensors[1]->dims[0] == 0,
+                  "graph slot reset changed captured QSA storage");
+            Check(state.mtpState == mtp && mtp->key.cudaData == key && mtp->key.dims[1] == 0 &&
+                  mtp->value.dims[1] == 0 && mtp->proposals.empty() && mtp->pendingOutputTokens.empty() &&
+                  mtp->proposalCount == 0 && !mtp->hasDeferredTargetHidden &&
+                  mtp->deferredPosition == -1 && !mtp->targetCheckpointPrepared &&
+                  mtp->targetCheckpoint.linearSecond[0].cudaData == checkpoint &&
+                  mtp->attentionState.decodeGraphsFrozen && mtp->attentionState.processedTokens.empty() &&
+                  mtp->attentionState.previousToken1 == -1 &&
+                  mtp->attentionState.indexerBlockKeyTensors[2]->dims[0] == 0,
+                  "graph slot retained MTP history or moved checkpoint storage");
+        }
+        std::cout << "PASS: Qwen4 graph slot resets history and preserves captured storage\n";
+#endif
+    }
     static void CheckMetadata(Qwen4ExpModel &m) {
         Check(m.eosToken == 6 && m.eos_token_id == 8, "PLE reset token replaced generation EOS");
         Check(m.pleLayer == 1 && m.ngramShardCount == 1 && m.ngramHeadDim == 32, "PLE layout metadata");
@@ -677,6 +755,20 @@ int main(int argc, char **argv) {
         SetThreads(2); SetDeviceMap({{"cpu", 1}}); SetMoeDeviceMap({{"cpu", 1}});
         SetCudaEmbedding(false);
         SetMoeCudaCacheBytes(0); setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
+        if (argc == 2 && std::string(argv[1]) == "--graph-slot-reset") {
+#ifdef USE_CUDA
+            if (FastllmCudaGetDeviceCount() < 1) return 77;
+            FastllmCudaSetDevice(0);
+            Qwen4GGUFTestAccess::CheckGraphSlotReset();
+            if (FastllmCudaGetDeviceCount() >= 2) {
+                Qwen4GGUFTestAccess::CheckGraphSlotReset(0, 1);
+                Qwen4GGUFTestAccess::CheckGraphSlotReset(1, 0);
+            }
+            return 0;
+#else
+            return 77;
+#endif
+        }
         if (argc == 2 && std::string(argv[1]) == "--tp-load") return TestStreamingTpImport();
         if (argc == 2 && std::string(argv[1]) == "--draft-vocab") {
 #ifdef USE_CUDA
