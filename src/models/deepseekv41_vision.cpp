@@ -21,9 +21,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -102,6 +104,34 @@ namespace fastllm {
         // 这里与 gemma4 的视觉编码器一样传 attentionType = 2 表示不加任何掩码。
         const int kVisionAttentionType = 2;
 
+        bool VisionEnvFlag(const char *name) {
+            const char *v = std::getenv(name);
+            return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
+        }
+
+        int VisionEnvInt(const char *name, int fallback) {
+            const char *v = std::getenv(name);
+            if (v == nullptr || v[0] == '\0') {
+                return fallback;
+            }
+            return atoi(v);
+        }
+
+        // 图像缓存调试日志：带自增序号，仅 FASTLLM_DSV41_IMAGE_CACHE_DEBUG=1 时输出
+        void VisionCacheLog(const char *fmt, ...) {
+            if (!VisionEnvFlag("FASTLLM_DSV41_IMAGE_CACHE_DEBUG")) {
+                return;
+            }
+            static unsigned long seq = 0;
+            va_list args;
+            va_start(args, fmt);
+            fprintf(stdout, "[fastllm-dsv41-image-cache #%lu] ", ++seq);
+            vfprintf(stdout, fmt, args);
+            fprintf(stdout, "\n");
+            fflush(stdout);
+            va_end(args);
+        }
+
         void VisionAttention(const Data &q, const Data &k, const Data &v, float scale, Data &output) {
             const int n = q.dims[1];
             const int chunk = 1024;
@@ -126,6 +156,107 @@ namespace fastllm {
             }
             output.CopyFrom(acc);
         }
+    }
+
+    size_t DeepSeekV41ImageCacheKeyHash::operator()(const DeepSeekV41ImageCacheKey &k) const {
+        // FNV-1a：先混入尺寸，再逐字节混入像素，避免仅尺寸不同时发生碰撞
+        uint64_t h = 1469598103934665603ULL;
+        auto mix = [&](uint64_t v) {
+            h ^= v;
+            h *= 1099511628211ULL;
+        };
+        mix((uint64_t)(uint32_t)k.nVitH);
+        mix((uint64_t)(uint32_t)k.nVitW);
+        for (uint8_t b : k.pixels) {
+            mix((uint64_t)b);
+        }
+        return (size_t)h;
+    }
+
+    bool DeepSeekV41ImageCache::Enabled() {
+        // 未指定返回 fallback=0（关闭）；显式 > 0 才启用
+        const char *env = std::getenv("FASTLLM_DSV41_IMAGE_CACHE_MAX_RECORDS");
+        const int raw = (env != nullptr && env[0] != '\0') ? atoi(env) : 0;
+        this->maxEntries = (size_t)std::max(0, raw);
+        bool on = this->maxEntries > 0;
+        VisionCacheLog("Enabled() env=\"%s\" raw=%d maxEntries=%u -> %d",
+                       env != nullptr ? env : "(unset)", raw, (unsigned)this->maxEntries, (int)on);
+        return on;
+    }
+
+    bool DeepSeekV41ImageCache::Get(const void *pixels, size_t nbytes, int nVitH, int nVitW, Data &outEmbeds) {
+        fprintf(stderr, "[imgcache] Get ENTER nbytes=%zu nVitH=%d nVitW=%d entries=%u\n",
+                nbytes, nVitH, nVitW, (unsigned)this->entries.size());
+        fflush(stderr);
+        if (!this->Enabled()) {
+            fprintf(stderr, "[imgcache] Get disabled -> false\n"); fflush(stderr);
+            return false;
+        }
+        fprintf(stderr, "[imgcache] Get enabled ok, src=0x%p\n", pixels); fflush(stderr);
+        DeepSeekV41ImageCacheKey key;
+        const uint8_t *src = (const uint8_t*)pixels;
+        fprintf(stderr, "[imgcache] Get before assign nbytes=%zu\n", nbytes); fflush(stderr);
+        key.pixels.assign(src, src + nbytes);
+        fprintf(stderr, "[imgcache] Get after assign size=%zu\n", key.pixels.size()); fflush(stderr);
+        key.nVitH = nVitH;
+        key.nVitW = nVitW;
+        fprintf(stderr, "[imgcache] Get before lock, key{n=%d,%d}\n", nVitH, nVitW); fflush(stderr);
+        std::lock_guard<std::mutex> guard(this->locker);
+        fprintf(stderr, "[imgcache] Get locked, hash=%llu\n",
+                (unsigned long long)DeepSeekV41ImageCacheKeyHash()(key)); fflush(stderr);
+        auto it = this->entries.find(key);
+        fprintf(stderr, "[imgcache] Get find done, found=%d\n", (int)(it != this->entries.end())); fflush(stderr);
+        if (it == this->entries.end()) {
+            return false;
+        }
+        it->second.flushTime = ++this->flushTime;
+        // 深拷贝给调用方，避免与缓存内共享同一份可变的 Data
+        outEmbeds.CopyFrom(it->second.embeds);
+        fprintf(stderr, "[imgcache] Get HIT\n"); fflush(stderr);
+        return true;
+    }
+
+    void DeepSeekV41ImageCache::Put(const void *pixels, size_t nbytes, int nVitH, int nVitW, Data &&embeds) {
+        fprintf(stderr, "[imgcache] Put ENTER nbytes=%zu nVitH=%d nVitW=%d entries=%u\n",
+                nbytes, nVitH, nVitW, (unsigned)this->entries.size());
+        fflush(stderr);
+        if (!this->Enabled()) { return; }
+        DeepSeekV41ImageCacheKey key;
+        const uint8_t *src = (const uint8_t*)pixels;
+        fprintf(stderr, "[imgcache] Put before assign nbytes=%zu\n", nbytes); fflush(stderr);
+        key.pixels.assign(src, src + nbytes);
+        fprintf(stderr, "[imgcache] Put after assign size=%zu\n", key.pixels.size()); fflush(stderr);
+        key.nVitH = nVitH;
+        key.nVitW = nVitW;
+        std::lock_guard<std::mutex> guard(this->locker);
+        auto it = this->entries.find(key);
+        fprintf(stderr, "[imgcache] Put find done, found=%d entries=%u\n",
+                (int)(it != this->entries.end()), (unsigned)this->entries.size()); fflush(stderr);
+        if (it != this->entries.end()) {
+            it->second.embeds.CopyFrom(embeds);
+            it->second.flushTime = ++this->flushTime;
+            return;
+        }
+        // 超限：淘汰最久未用（flushTime 最小）的一条。用迭代器遍历并在遍历后 erase，避免边遍历边删。
+        while (this->entries.size() >= this->maxEntries && !this->entries.empty()) {
+            auto eraseIt = this->entries.end();
+            long long minFlushTime = (1LL << 60);
+            for (auto it = this->entries.begin(); it != this->entries.end(); ++it) {
+                if (it->second.flushTime < minFlushTime) {
+                    minFlushTime = it->second.flushTime;
+                    eraseIt = it;
+                }
+            }
+            if (eraseIt == this->entries.end()) {
+                break;
+            }
+            this->entries.erase(eraseIt);
+            fprintf(stderr, "[imgcache] Put evicted, entries=%u\n", (unsigned)this->entries.size()); fflush(stderr);
+        }
+        DeepSeekV41ImageCacheEntry &stored = this->entries[std::move(key)];
+        stored.embeds.CopyFrom(embeds);
+        stored.flushTime = ++this->flushTime;
+        fprintf(stderr, "[imgcache] Put inserted, entries=%u\n", (unsigned)this->entries.size()); fflush(stderr);
     }
 
     void DeepSeekV41Model::InitVisionParams() {
@@ -160,8 +291,8 @@ namespace fastllm {
                name == "image_start" || name == "image_end" || name == "image_newline";
     }
 
-    void DeepSeekV41Model::EncodeImage(const Data &patches, int nVitH, int nVitW, Data &output,
-                                       const std::string &dumpPrefix) {
+    bool DeepSeekV41Model::EncodeImage(const Data &patches, int nVitH, int nVitW, Data &output,
+                                       const std::string &dumpPrefix, bool cachePeekOnly) {
         AssertInFastLLM(VisionEnabled(), "DeepSeekV41: this checkpoint has no vision tower (vision_n_layers == 0).");
         const int n = nVitH * nVitW;
         const int dim = vision_dim;
@@ -180,6 +311,37 @@ namespace fastllm {
         } else {
             ToDataType(patches, patchInput, DataType::FLOAT32);
         }
+
+        // 第 1 层：图像 -> 视觉嵌入缓存。同一张图（相同像素 + 尺寸）直接复用上次编码结果，
+        // 跳过整个 ViT + aligner 前向。仅当像素已落到 CPU 且为 FLOAT32 时才可作缓存 key。
+        const bool cacheablePixel = (patchInput.cpuData != nullptr && patchInput.dataType == DataType::FLOAT32);
+        VisionCacheLog("EncodeImage() n=%d dims=[%d,%d] patches_dtype=%d cpuData=0x%p dataType=%d "
+                       "cacheablePixel=%d enabled=%d entries=%u cachePeek=%d",
+                       n, (int)patches.dims.size() >= 2 ? (int)patches.dims[0] : -1,
+                       (int)patches.dims.size() >= 2 ? (int)patches.dims[1] : -1,
+                       (int)patches.dataType, (void*)patchInput.cpuData, (int)patchInput.dataType,
+                       (int)cacheablePixel, (int)v41ImageCache.Enabled(), (unsigned)v41ImageCache.entries.size(),
+                       (int)cachePeekOnly);
+        if (cacheablePixel &&
+            v41ImageCache.Get(patchInput.cpuData, patchInput.GetBytes(), nVitH, nVitW, output)) {
+            if (!dumpPrefix.empty()) {
+                Data cpu;
+                VisionToCpuFloat(output, cpu);
+                VisionDump(cpu, dumpPrefix + "_embeds_cached");
+            }
+            VisionCacheLog("EncodeImage() CACHE-HIT, skip ViT, records=%u",
+                           (unsigned)v41ImageCache.entries.size());
+            return true;
+        }
+        // cachePeekOnly：仅允许“第 1 层命中”这一条路，绝不在此线程跑 GPU ViT（调度线程安全）。
+        if (cachePeekOnly) {
+            VisionCacheLog("EncodeImage() cache peek MISS, bail (no ViT on caller thread), records=%u",
+                           (unsigned)v41ImageCache.entries.size());
+            output = Data();
+            return false;
+        }
+        VisionCacheLog("EncodeImage() cache miss, running ViT, records=%u",
+                       (unsigned)v41ImageCache.entries.size());
         Data x;
         Linear(patchInput, weight["vision.patch_embed.proj.weight"], weight["vision.patch_embed.proj.bias"], x);
         x.Reshape({1, n, dim});
@@ -293,10 +455,23 @@ namespace fastllm {
         Linear(a1, weight["aligner.w2.weight"], weight["aligner.w2.bias"], a2);
         VisionToCpuFloat(a2, output);
         output.Reshape({blocks, embed_dim});
+
+        // 记录到图像缓存（key 用 FLOAT32 像素 + 尺寸）。关闭时不写入且不打日志。
+        if (cacheablePixel && v41ImageCache.Enabled()) {
+            Data copy;
+            copy.CopyFrom(output);
+            v41ImageCache.Put(patchInput.cpuData, patchInput.GetBytes(), nVitH, nVitW, std::move(copy));
+            VisionCacheLog("EncodeImage() finished ViT, attempting Put, records=%u",
+                           (unsigned)v41ImageCache.entries.size());
+        } else {
+            VisionCacheLog("EncodeImage() finished ViT, SKIP Put (cacheablePixel=%d enabled=%d)",
+                           (int)cacheablePixel, (int)v41ImageCache.Enabled());
+        }
+        return true;
     }
 
-    void DeepSeekV41Model::EncodeImageSpans(const std::map <std::string, std::vector <Data*> > &multimodalInput,
-                                            DeepSeekV41RequestState &state) {
+    bool DeepSeekV41Model::EncodeImageSpans(const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                                            DeepSeekV41RequestState &state, bool cachePeekOnly) {
         AssertInFastLLM(VisionEnabled(), "DeepSeekV41: this checkpoint has no vision tower (vision_n_layers == 0).");
         const int dim = embed_dim;
         const int r = vision_downsample_ratio;
@@ -306,7 +481,7 @@ namespace fastllm {
         auto gridIt = multimodalInput.find("image_grid");
         if (pixelIt == multimodalInput.end() || gridIt == multimodalInput.end() || gridIt->second.empty() ||
             gridIt->second[0] == nullptr) {
-            return;   // 没有图像数据（例如其它模型格式的 payload），按纯文本处理
+            return true;   // 没有图像数据（例如其它模型格式的 payload），按纯文本处理
         }
         std::vector<int> grid = VisionReadInts(*gridIt->second[0]);
         const int numImages = (int)grid.size() / 3;
@@ -328,7 +503,13 @@ namespace fastllm {
             AssertInFastLLM(start >= 0 && nVitH > 0 && nVitW > 0,
                             "DeepSeekV41 multimodal: invalid image_grid entry for image " + std::to_string(i) + ".");
             Data feats;
-            EncodeImage(*pixelIt->second[i], nVitH, nVitW, feats, dump ? "fl_image" + std::to_string(i) : "");
+            if (!EncodeImage(*pixelIt->second[i], nVitH, nVitW, feats,
+                             dump ? "fl_image" + std::to_string(i) : "", cachePeekOnly)) {
+                // cachePeekOnly 下任一图像未命中：整条不编码（调度线程不得跑 GPU ViT），返回 false。
+                state.imageSpans.clear();
+                state.imagesEncoded = false;
+                return false;
+            }
             if (dump) {
                 VisionDump(feats, "fl_image" + std::to_string(i) + "_embeds");
             }
@@ -353,6 +534,7 @@ namespace fastllm {
             AssertInFastLLM(pos == span, "DeepSeekV41 multimodal: internal span layout error.");
             state.imageSpans.push_back(std::move(spanData));
         }
+        return true;
     }
 
     bool DeepSeekV41Model::PrepareImageEmbeds(const Data &inputIds, int startPos, DeepSeekV41RequestState &state,

@@ -3320,10 +3320,17 @@ namespace fastllm {
         // A restored text prefix can bypass the multimodal prefill path, while
         // a restored media prefix may belong to different images with the same
         // placeholder tokens. Keep request-local KV reuse, but do not restore
-        // cross-request token-only caches for multimodal prompts.
+        // cross-request token-only caches for multimodal prompts, unless the
+        // model opts in to multimodal historical caching (it must then resolve
+        // image content identity before judging prefix equality).
         bool allowHistoryCache = context->multimodalInput.empty();
-        bool restoredNativeHistory = allowHistoryCache &&
-            this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
+        bool restoredNativeHistory = false;
+        if (allowHistoryCache) {
+            restoredNativeHistory = this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
+        } else if (this->AllowMultimodalHistoryCache()) {
+            restoredNativeHistory = this->TryRestoreHistoryCacheMultimodal(
+                context->currentTokens, context->cacheLen, context->multimodalInput);
+        }
 
         auto cache = !allowHistoryCache || restoredNativeHistory || !this->UseGenericHistoryCache() ?
                      std::make_pair((PastKVCacheMemory*)nullptr, 0) :
