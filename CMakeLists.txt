@@ -1430,6 +1430,12 @@ if (UNIT_TEST)
                                  LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
         endif()
 
+        add_executable(cuda_graph_workspace_test test/basic/test_cuda_graph_workspace.cpp)
+        target_link_libraries(cuda_graph_workspace_test PRIVATE fastllm)
+        target_include_directories(cuda_graph_workspace_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(cuda_graph_workspace cuda_graph_workspace_test "PASS: graph workspace" 180)
+        set_tests_properties(cuda_graph_workspace PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+
         add_executable(cuda_masked_attention_test test/basic/test_cuda_masked_attention.cpp)
         target_link_libraries(cuda_masked_attention_test PRIVATE fastllm)
         target_include_directories(cuda_masked_attention_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

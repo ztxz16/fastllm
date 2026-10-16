@@ -7,6 +7,7 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "fastllm-cuda-rope.cuh"
 #include "devices/cuda/cudaworkspace.h"
@@ -5362,8 +5363,18 @@ void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointer
     }
 }
 
+static thread_local std::vector<size_t> *fastllmCudaAllocationRecorder = nullptr;
+std::vector<size_t> *FastllmCudaSetAllocationRecorder(std::vector<size_t> *requests) {
+    auto *previous = fastllmCudaAllocationRecorder;
+    fastllmCudaAllocationRecorder = requests;
+    return previous;
+}
+
 static void *FastllmCudaMallocImpl(
         size_t size, FastllmCudaTryMallocResult *tryResult) {
+    if (fastllmCudaAllocationRecorder && size) {
+        fastllmCudaAllocationRecorder->push_back(size);
+    }
     if (tryResult != nullptr) {
         *tryResult = FASTLLM_CUDA_TRY_MALLOC_ERROR;
     }
@@ -5615,6 +5626,25 @@ FastllmCudaTryMallocResult FastllmCudaTryMalloc(
         return FASTLLM_CUDA_TRY_MALLOC_ERROR;
     }
     return result;
+}
+
+bool FastllmCudaReserveGraphWorkspace(const std::vector<size_t> &requests) {
+    if (FastllmCudaGraphIsCapturingFast()) return false;
+    FastllmCudaAllocationRecorder suspend(nullptr);
+    std::vector<void *> blocks;
+    blocks.reserve(requests.size());
+    bool ok = true;
+    for (size_t size : requests) {
+        if (!size) continue;
+        void *ptr = nullptr;
+        if (FastllmCudaTryMalloc(&ptr, size) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+            ok = false;
+            break;
+        }
+        blocks.push_back(ptr);
+    }
+    for (void *ptr : blocks) FastllmCudaFree(ptr);
+    return ok;
 }
 
 void * FastllmCudaMalloc(size_t size) {
