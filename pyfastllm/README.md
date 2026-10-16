@@ -227,16 +227,3 @@ python web_api.py -m 0 -p path_for_chatglm --max_batch_size 32
 | Moss | fastllm.MossModel |  |
 | Alpaca | fastllm.LlamaModel |  |
 | QWen | fastllm.QWenModel |  |
-
-
-## 开发计划(TODO)
-
-- [x]  修改response_batch的output_str函数，以返回值的形式返回答案
-- [x]  编解码部分优化，合并不同的返回类型
-- [x]  对接numpy等矩阵库
-- [ ]  Tensor的深复制和浅复制，以及基础运算符重载，在python端编写
-- [x]  fix low_api下pastKV复制的bug
-- [x]  模型运行参数对象类，封装模型运行时参数，包含模型路径、运行线程数、是否为低内存模型、惩罚因子、温度等
-- [x]  增加更多的op以及module，后续可增加更多
-- [ ]  增加其他后端
-- [ ]  更新文档接口说明
