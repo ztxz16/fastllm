@@ -434,6 +434,9 @@ if (USE_CUDA)
         src/devices/cuda/attention/fastllm-paged-attention-fp4-fp16.cu
         src/devices/cuda/attention/fastllm-paged-attention-fp4-bf16.cu
         src/devices/cuda/attention/fastllm-mla-paged.cu
+        src/devices/cuda/attention/fastllm-hybrid-kda.cu
+        src/devices/cuda/fastllm-hybrid-output.cu
+        src/devices/cuda/attention/fastllm-hybrid-dsa.cu
         src/devices/cuda/attention/paged/fastllm-paged-attention-native.cu
         src/devices/cuda/linear/fastllm-linear-fp32.cu
         src/devices/cuda/linear/fastllm-linear-fp16.cu
@@ -1409,8 +1412,17 @@ if (UNIT_TEST)
         add_test(NAME glm5_next_dsa_mtp_rollback COMMAND glm5_next_dsa_test --rollback)
         add_test(NAME glm5_next_dsa_sm75_verify COMMAND glm5_next_dsa_test --sm75-verify)
         add_test(NAME glm5_next_dsa_hybrid_sm75 COMMAND glm5_next_dsa_test --hybrid-sm75)
-        set_tests_properties(glm5_next_dsa_hybrid_sm75 PROPERTIES LABELS "cuda;hybrid"
-            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        add_test(NAME glm5_next_hybrid_router COMMAND glm5_next_dsa_test --hybrid-router)
+        add_test(NAME glm5_next_dsa_hybrid_kda COMMAND glm5_next_dsa_test --hybrid-kda)
+        add_test(NAME glm5_next_dsa_hybrid_mla COMMAND glm5_next_dsa_test --hybrid-mla)
+        add_test(NAME glm5_next_dsa_hybrid_prepare COMMAND glm5_next_dsa_test --hybrid-dsa-prepare)
+        add_test(NAME glm5_next_hybrid_output COMMAND glm5_next_dsa_test --hybrid-output)
+        add_test(NAME glm5_next_hybrid_graph COMMAND glm5_next_dsa_test --hybrid-graph)
+        add_test(NAME glm5_next_hybrid_moe_post COMMAND glm5_next_dsa_test --hybrid-moe-post)
+        set_tests_properties(glm5_next_dsa_hybrid_sm75 glm5_next_hybrid_router
+            glm5_next_dsa_hybrid_kda glm5_next_dsa_hybrid_mla glm5_next_dsa_hybrid_prepare
+            glm5_next_hybrid_output glm5_next_hybrid_graph glm5_next_hybrid_moe_post
+            PROPERTIES LABELS "cuda;hybrid" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         set_tests_properties(glm5_next_dsa_sm75_verify PROPERTIES LABELS "cuda;mtp"
             SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         add_executable(glm5_next_tp_stream_test test/basic/test_glm5_next_tp_stream.cpp)

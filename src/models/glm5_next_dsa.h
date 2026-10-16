@@ -6,6 +6,9 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/glm5-next-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
+#ifndef USE_ROCM
+#include "devices/cuda/fastllm-cuda-hybrid-dsa.h"
+#endif
 #include <cmath>
 #include <limits>
 
@@ -20,7 +23,7 @@ inline void ClearIndexerTensor(Data &data) {
 
 // All arithmetic below uses existing kernels. FP8 operands are stored exactly
 // in BF16 after power-of-two dequantization, for the existing V4.1 BF16 scorer.
-inline void RotateAndQuantizeIndexer(Data &input, Data &hadamard, Data &output) {
+inline void RotateAndQuantizeIndexer(Data &input, Data &hadamard, Data &output, bool hybrid = false) {
     if (hadamard.dims.empty()) {
         hadamard.dataType = DataType::FLOAT32;
         hadamard.Resize({128, 128});
@@ -38,6 +41,12 @@ inline void RotateAndQuantizeIndexer(Data &input, Data &hadamard, Data &output) 
     const auto dims = input.dims;
     fp32.Reshape({int(input.Count(0) / 128), 128});
     MatMulTransB(fp32, hadamard, rotated, 1.0f / std::sqrt(128.0f));
+#ifndef USE_ROCM
+    if (hybrid) {
+        rotated.Reshape(dims);
+        if (FastllmCudaHybridDsaQuantizeRotated(rotated, output)) return;
+    }
+#endif
     ToDataType(rotated, DataType::BFLOAT16);
     rotated.Reshape(dims);
     AssertInFastLLM(FastllmCudaNaiveQuantizeIndexer(
@@ -139,6 +148,9 @@ inline void CommitIndexerPrefix(Glm5NextIndexerCache &cache,
 
 struct DsaProjections {
     Data keys, gates, query, headWeights;
+    // A hybrid decode segment may also perform the fixed-shape rotation and
+    // quantization; the growing KPool and score/selection remain outside it.
+    bool queryQuantized = false;
 };
 
 // Stateless projections can share weight loads across independent requests.
@@ -210,7 +222,10 @@ inline void BuildDsaIndices(Data &input, Data &qNormalized,
     AssertInFastLLM(!projected->query.dims.empty() && !projected->headWeights.dims.empty(),
         "GLM DSA query projections are missing.");
     Data quantized, scores, groups;
-    RotateAndQuantizeIndexer(projected->query, cache.hadamard, quantized);
+    if (projected->queryQuantized) {
+        quantized.FakeFrom(projected->query, 0);
+        quantized.Resize(projected->query.dims);
+    } else RotateAndQuantizeIndexer(projected->query, cache.hadamard, quantized);
     auto &headWeights = projected->headWeights;
     const bool scored = hybrid && FastllmCudaGlm5NextHybridIndexerScore(
         quantized, headWeights, cache.keys, scores);

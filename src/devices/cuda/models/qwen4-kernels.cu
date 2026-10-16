@@ -1,4 +1,5 @@
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-hybrid-dsa.h"
 #include "fastllm-cuda-rope.cuh"
 #include "utils.h"
 #include "models/qwen4_kvmem.h"
@@ -3742,6 +3743,34 @@ bool FastllmCudaQwen4ExpandSelectedBlocks(const fastllm::Data &selected,
         rows, count, compressRatio, keyLength / compressRatio,
         keyLength, width, queryStart, nullptr,
         pageTable == nullptr ? nullptr : (const int32_t*)pageTable->cudaData, pageLen);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaHybridDsaSelect(const fastllm::Data &scores, const fastllm::Data &position,
+        const fastllm::Data &pageTable, int pageLen, fastllm::Data &indices) {
+    using namespace fastllm;
+    if (scores.dataDevice != DataDevice::CUDA || scores.dataType != FLOAT32 || !scores.cudaData ||
+        scores.dims.size() != 3 || scores.dims[0] != 1 || scores.dims[1] != 1 || scores.dims[2] < 512 ||
+        position.dataDevice != DataDevice::CUDA || position.dataType != INT32 || !position.cudaData ||
+        position.Count(0) != 1 || position.dataDeviceIds != scores.dataDeviceIds ||
+        pageTable.dataDevice != DataDevice::CUDA || pageTable.dataType != INT32 || !pageTable.cudaData ||
+        pageTable.dataDeviceIds != scores.dataDeviceIds || pageLen <= 0) return false;
+    Data selected(INT32);
+    selected.Resize({1, 512});
+    selected.ToDevice(DataDevice::CUDA, scores.dataDeviceIds, false);
+    selected.Allocate(false);
+    const auto *meta = (const int32_t *)position.cudaData;
+    if (!Qwen4SelectBlocksRaw((const float*)scores.cudaData, (int32_t*)selected.cudaData,
+            1, scores.dims[2], 512, -2, 4, meta)) return false;
+    indices.dataType = INT32;
+    indices.UpdateUnitSize();
+    indices.Resize({1, 2051});
+    indices.ToDevice(DataDevice::CUDA, scores.dataDeviceIds, false);
+    indices.Allocate(false);
+    Qwen4QSAExpandIndicesKernel<<<9, 256, 0, cudaStreamPerThread>>>(
+        (const int32_t *)selected.cudaData, (int32_t *)indices.cudaData,
+        1, 512, 4, scores.dims[2], 0, 2051, -2, meta,
+        (const int32_t *)pageTable.cudaData, pageLen);
     return cudaGetLastError() == cudaSuccess;
 }
 
