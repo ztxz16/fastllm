@@ -131,7 +131,23 @@ bool Qwen4ExpModel::TryRunPipelineMoe(int layer, const Data &input,
         } restore{previous, FastllmCudaGraphSetManagedCaptureOnly(true)};
         FastllmCudaSetDevice(target);
         if (worker != 0) {
-            // Dense graph variants retain this peer output across changing
+            // The owner records ready[owner] on its stream before each
+            // submission. A stream wait alone is too late if Resize/FreeSpace
+            // has to release a buffer before the queued wait executes. Fence
+            // the owner on the host only when this call can allocate or move
+            // peer storage; the normal fixed-capacity reuse path stays async.
+            const uint64_t required = uint64_t(FASTLLM_CUDA_MOE_CACHE_MAX_BATCH) * input.dims[1];
+            auto needsStorage = [&](const Data &data, DataType type) {
+                return data.cudaData == nullptr || data.dataDevice != CUDA ||
+                    data.dataDeviceIds.size() != 1 || data.dataDeviceIds[0] != target ||
+                    data.dataType != type || data.expansionSize < required;
+            };
+            const bool resizePeerOutput = needsStorage(state.peerOutput[peer], FLOAT32);
+            const bool resizePeerInput = !borrowInput && needsStorage(state.peerInput[peer], input.dataType);
+            if (resizePeerOutput || resizePeerInput)
+                FastllmCudaEventSynchronize(state.ready[owner]);
+            FastllmCudaCurrentThreadStreamWaitEvent(state.ready[owner]);
+            // Dense graph variants retain peer output across changing
             // verifier lengths. Its allocation must not grow on a later row.
             prepare(state.peerOutput[peer], target, FLOAT32);
             // Allocate on the thread that owns the peer stream, avoiding a
@@ -140,7 +156,6 @@ bool Qwen4ExpModel::TryRunPipelineMoe(int layer, const Data &input,
             static thread_local std::unique_ptr<Executor> executor(new Executor());
             executor->SetFirstDevice("cuda:" + std::to_string(target));
             SetCurrentThreadExecutor(executor.get());
-            FastllmCudaCurrentThreadStreamWaitEvent(state.ready[owner]);
             if (!borrowInput && !FastllmCudaMemcpyPeerAsyncCurrentThread(target,
                     state.peerInput[peer].cudaData, device, input.cudaData, input.GetBytes())) {
                 FastllmCudaEventSynchronize(state.ready[owner]);
