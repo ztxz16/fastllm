@@ -886,23 +886,6 @@ void NaiveN05FlashModel::CommitDraftContext(TargetCapture &capture, int tokens,
     }
     DraftLinear(combined, weight["dspark.fc.weight"], projected);
     KimiK3RMSNorm(projected, weight["dspark.hidden_norm.weight"], draftEps, hidden);
-    if (capture.history) {
-        auto &chunk = *capture.history;
-        chunk.length = std::min(chunk.length, tokens);
-        chunk.bytes = chunk.length * historyBytesPerToken;
-        for (auto &pair : chunk.layers) {
-            for (Data *tensor : {&pair.first, &pair.second}) {
-                if (tensor->dims[1] != chunk.length) {
-                    Data compact;
-                    CopyHistoryTensor(*tensor, compact, chunk.length);
-                    tensor->CopyFrom(compact);
-                    tensor->lockInCPU = true;
-                }
-            }
-        }
-        CopyHistoryTensor(hidden, chunk.draftHidden, chunk.length);
-        FinishHistoryChunk(kv, capture.history);
-    }
     AppendDraftContext(hidden, context.committed, context);
 }
 
@@ -1013,11 +996,6 @@ int NaiveN05FlashModel::ForwardDraft(
         context.pending.pop_front();
         return token;
     }
-    if (!context.restoredHidden.dims.empty()) {
-        int length = context.restoredHidden.dims[1];
-        AppendDraftContext(context.restoredHidden, context.committed - length, context);
-        context.restoredHidden = Data();
-    }
     int oldLength = kv[0].first.dims.empty() ? 0 : kv[0].first.dims[1];
     AssertInFastLLM(context.committed == oldLength, "Naive target/draft cache length mismatch.");
     // Tool constraints and content sampling change after each emitted prefix.
@@ -1030,11 +1008,11 @@ int NaiveN05FlashModel::ForwardDraft(
         limit = std::min(limit, config.output_token_limit - (oldLength - config.input_token_length) - 1);
     if (context.committed == 0 || context.kv.empty() || inputIds.dims[1] != 1 || config.output_logits || constrained || limit <= 0) {
         TargetCapture capture;
-        // With history disabled, only the final draft window is ever used.
+        // Only the final draft window is used; there is no CPU prefix archive.
         // Preserve absolute position accounting while skipping invisible
         // prompt chunks' feature copies, projection and draft KV construction.
         const int draftStart = std::max(0, config.input_token_length - draftWindow + 1);
-        capture.collectHidden = saveHistoryChat || oldLength + inputIds.dims[1] > draftStart;
+        capture.collectHidden = oldLength + inputIds.dims[1] > draftStart;
         auto selection = SelectLogits(config);
         capture.selection = &selection;
         Data logits = RunDraftTarget(inputIds, positions, kv, config, capture);

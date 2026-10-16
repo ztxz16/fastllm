@@ -1,123 +1,42 @@
 #include "models/naive_n05_flash.h"
-#include <algorithm>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
 
 using namespace fastllm;
-static void Require(bool ok, const char *message) {
-    if (!ok) throw std::runtime_error(message);
-}
 
-// Feed identifiable KV rows through the production archive and request hooks.
-// The scheduler is idle: tests cover cache ownership independently of weights.
+// Non-paged execution must safely recompute instead of archiving CPU KV.
 class HistoryFixture : public NaiveN05FlashModel {
 public:
     HistoryFixture() {
-        weight.dicts = {{"num_hidden_layers", "3"}, {"hidden_size", "16"},
+        weight.dicts = {{"num_hidden_layers", "2"}, {"hidden_size", "16"},
             {"num_attention_heads", "1"}, {"num_key_value_heads", "1"},
             {"head_dim", "128"}, {"v_head_dim", "8"},
             {"swa_num_attention_heads", "1"}, {"swa_num_key_value_heads", "1"},
             {"swa_head_dim", "128"}, {"swa_v_head_dim", "8"},
-            {"hybrid_layer_pattern", "[0,1,0]"}, {"moe_layer_freq", "[0,0,0]"},
+            {"hybrid_layer_pattern", "[0,1]"}, {"moe_layer_freq", "[0,0]"},
             {"scoring_func", "sigmoid"}, {"sliding_window", "128"}};
         InitParams();
         SetSaveHistoryChat(true);
     }
     bool UseModelSpecificScheduler() const override { return true; }
     void RunModelSpecificScheduler() override {}
-    static uint16_t Bits(int row, int layer, int part, int col) {
-        return (row * 17 + layer * 31 + part * 13 + col) & 0xffff;
-    }
-    ResponseContext *Create(const std::vector<int> &tokens, bool media = false) {
-        std::map<std::string, std::vector<Data *>> multimodal;
-        if (media) multimodal["image"] = {new Data(FLOAT32)};
-        int handle = LaunchResponseTokens(tokens, GenerationConfig(), multimodal);
-        return responseContextDict.GetHandle(handle);
-    }
-    ResponseContext *CreateDuringForward(const std::vector<int> &tokens) {
-        // Host-only restore must not wait for another request's GPU forward.
-        std::lock_guard<std::mutex> guard(forwardLocker);
-        return Create(tokens);
-    }
-    void Feed(ResponseContext *context, int past, int count) {
-        auto chunk = BeginHistoryChunk(context->pastKeyValues, past, count);
-        Require(chunk && chunk->length == count, "History recording was unavailable");
-        for (int layer = 0; layer < block_cnt; ++layer) {
-            for (int part = 0; part < 2; ++part) {
-                int width = part ? 8 : layer == 1 ? 128 : 256;
-                Data input(BFLOAT16, {1, count, width});
-                input.Allocate();
-                for (int row = 0; row < count; ++row) for (int col = 0; col < width; ++col)
-                    ((uint16_t *)input.cpuData)[row * width + col] = Bits(past + row, layer, part, col);
-                CopyHistoryTensor(input, part ? chunk->layers[layer].second : chunk->layers[layer].first, count);
-            }
+    void CheckFallback(const std::vector<int> &tokens) {
+        int handle = LaunchResponseTokens(tokens, GenerationConfig());
+        auto *context = responseContextDict.GetHandle(handle);
+        if (context->cacheLen || context->currentTokens != tokens)
+            throw std::runtime_error("unsupported prefix layout was reused");
+        for (auto &kv : context->pastKeyValues) {
+            kv.first.Resize({1, 128, 128}); kv.first.Allocate();
+            kv.second.Resize({1, 128, 8}); kv.second.Allocate();
         }
-        FinishHistoryChunk(context->pastKeyValues, chunk);
-    }
-    void CheckBound(ResponseContext *context) {
-        auto chunk = BeginHistoryChunk(context->pastKeyValues, 0, 100000000);
-        Require(chunk && chunk->length < 100000000 && chunk->bytes <= chunk->budget->limit,
-                "Archive capacity did not limit an oversized request");
-    }
-    void CheckFull(ResponseContext *context, int past) {
-        Require(!BeginHistoryChunk(context->pastKeyValues, past, 1),
-                "Full history archive exceeded its byte limit");
-    }
-    void Drop(ResponseContext *context) {
-        for (const auto &entry : responseContextDict.dicts) {
-            if (entry.second == context) {
-                RemoveResponseContext(entry.first);
-                return;
-            }
-        }
-        throw std::runtime_error("Unknown response context");
-    }
-    std::shared_ptr<HistoryBudget> ledger;
-    size_t rowBytes = 0;
-    void Budget(size_t rows) {
-        SetSaveHistoryChat(false);
-        SetSaveHistoryChat(true);
-        auto *probe = Create({7000, 20});
-        auto chunk = BeginHistoryChunk(probe->pastKeyValues, 0, 1);
-        Require(chunk != nullptr, "History budget probe was unavailable");
-        ledger = chunk->budget;
-        rowBytes = chunk->bytes;
-        Drop(probe);
-        chunk.reset();
-        Require(ledger->used == 0, "History references leaked after clearing");
-        ledger->limit = rows * rowBytes;
-    }
-    size_t UsedRows() const { return ledger->used / rowBytes; }
-    void CheckReservation() {
-        auto *ctx = Create({4000, 20, 30, 40});
-        auto chunk = BeginHistoryChunk(ctx->pastKeyValues, 0, 8);
-        Require(chunk && UsedRows() == 8, "In-flight capture was not charged");
-        chunk->length = 4;
-        chunk->bytes = 4 * rowBytes;
-        FinishHistoryChunk(ctx->pastKeyValues, chunk);
-        Require(UsedRows() == 4, "Truncated verification did not release unused reservation");
-        Drop(ctx);
-        Require(UsedRows() == 4, "Live capture lost its reservation on request removal");
-        chunk.reset();
-        Require(UsedRows() == 0, "Cancelled capture leaked its reservation");
-    }
-    void CheckRestored(ResponseContext *context, int expected) {
-        Require(context->cacheLen == expected, "Incorrect cached prefix length");
-        Require(context->preTokens == expected && context->intParams["index"] == -1 &&
-                context->intParams["promptLen"] == context->inputTokens,
-                "Restored request has incorrect scheduler positions");
-        for (int layer = 0; layer < block_cnt; ++layer) {
-            int start = layer == 1 ? std::max(0, expected - 127) : 0;
-            for (int part = 0; part < 2; ++part) {
-                const Data &cache = part ? context->pastKeyValues[layer].second : context->pastKeyValues[layer].first;
-                Require(cache.dims[1] == expected - start && cache.isKVCache,
-                        "Incorrect restored full/sliding cache shape");
-                for (int row = 0; row < cache.dims[1]; ++row) for (int col = 0; col < cache.dims[2]; ++col)
-                    Require(((uint16_t *)cache.cpuData)[row * cache.dims[2] + col] == Bits(start + row, layer, part, col),
-                            "KV/index key or sliding-window boundary changed during restore");
-            }
-        }
+        TryRecordResponseContext(context);
+        auto input = tokens;
+        int cached = -1;
+        if (TryRestoreHistoryCache(input, cached) || cached || input != tokens ||
+            TryRecordPagedPrefixCacheExtra(context) || QueryPagedPrefixCacheExtra(context, 128))
+            throw std::runtime_error("nonpaged execution created a CPU KV archive");
+        RemoveResponseContext(handle);
     }
 };
 
@@ -127,125 +46,14 @@ int main() {
         HistoryFixture model;
         std::vector<int> tokens(300);
         std::iota(tokens.begin(), tokens.end(), 10);
-        auto *seed = model.Create(tokens);
-        model.CheckBound(seed);
-        model.Feed(seed, 0, 150);
-        model.Feed(seed, 150, 150);
-        seed->allTokens.push_back(900); // sampled but not yet forwarded
-        model.TryRecordResponseContext(seed);
-
-        auto *repeat = model.CreateDuringForward(tokens);
-        model.CheckRestored(repeat, 299);
-        Require(repeat->currentTokens == std::vector<int>{tokens.back()}, "Exact repeat lost final input token");
-        ((uint16_t *)repeat->pastKeyValues[0].first.cpuData)[0] ^= 1;
-        for (int boundary : {1, 126, 127, 128, 149, 150, 151, 299}) {
-            auto branch = tokens;
-            branch[boundary] = 999;
-            model.CheckRestored(model.Create(branch), boundary);
-        }
-        model.CheckRestored(model.Create(std::vector<int>(tokens.begin(), tokens.begin() + 80)), 79);
-        auto extended = tokens;
-        extended.insert(extended.end(), {900, 901, 902});
-        auto *child = model.Create(extended);
-        model.CheckRestored(child, 300);
-        model.Feed(child, 300, 3);
-        model.TryRecordResponseContext(child);
-        model.CheckRestored(model.Create(extended), 302);
-        // Forking and extending a shared chunk must not mutate its parent.
-        auto fork = std::vector<int>(tokens.begin(), tokens.begin() + 170);
-        fork[149] = 999;
-        auto *forked = model.Create(fork);
-        model.CheckRestored(forked, 149);
-        model.Feed(forked, 149, 21);
-        model.TryRecordResponseContext(forked);
-        model.CheckRestored(model.Create(fork), 169);
-        model.CheckRestored(model.Create(tokens), 299);
-        auto *media = model.Create(tokens, true);
-        Require(media->cacheLen == 0 && media->currentTokens == tokens, "Multimodal request reused text KV");
-        model.TryRecordResponseContext(media);
-
-        // A completed speculative verify can be ahead of the last token
-        // emitted by the scheduler. Never publish its unconsumed suffix.
-        auto shortRequest = model.Create({101, 102, 103, 104, 105});
-        model.Feed(shortRequest, 0, 8);
-        model.TryRecordResponseContext(shortRequest);
-        auto shortHit = model.Create({101, 102, 103, 104, 105, 900});
-        model.CheckRestored(shortHit, 5);
+        for (int i = 0; i < 50; ++i) model.CheckFallback(tokens);
         model.SetSaveHistoryChat(false);
-        Require(model.Create(tokens)->cacheLen == 0, "Disabled history cache still hit");
+        model.CheckFallback(tokens);
         model.SetSaveHistoryChat(true);
-        Require(model.Create(tokens)->cacheLen == 0, "Disabling history did not clear old entries");
-
-        // Hits and recording a covered prefix both refresh the LRU order.
-        std::vector<ResponseContext *> recorded;
-        for (int i = 0; i < 5; ++i) {
-            auto *context = model.Create({1000 + i, 20});
-            model.Feed(context, 0, 2);
-            model.TryRecordResponseContext(context);
-            recorded.push_back(context);
-        }
-        model.CheckRestored(model.Create({1000, 20, 30}), 2);
-        auto *last = model.Create({1005, 20});
-        model.Feed(last, 0, 2);
-        model.TryRecordResponseContext(last);
-        Require(model.Create({1001, 20, 30})->cacheLen == 0, "Least recently used history entry was not evicted");
-        model.CheckRestored(model.Create({1000, 20, 30}), 2);
-        model.CheckRestored(model.Create({1005, 20, 30}), 2);
-        model.TryRecordResponseContext(recorded[2]);
-        last = model.Create({1006, 20});
-        model.Feed(last, 0, 2);
-        model.TryRecordResponseContext(last);
-        Require(model.Create({1003, 20, 30})->cacheLen == 0, "Recording a covered prefix did not refresh LRU");
-        model.CheckRestored(model.Create({1002, 20, 30}), 2);
-
-        // A large main record and a small title share one budget. Use a small
-        // budget so real allocations exercise eviction and ownership cheaply.
-        model.Budget(12);
-        std::vector<int> longTokens(10);
-        std::iota(longTokens.begin(), longTokens.end(), 2000);
-        auto *mainRequest = model.Create(longTokens);
-        model.Feed(mainRequest, 0, 10);
-        model.TryRecordResponseContext(mainRequest);
-        model.Drop(mainRequest);
-        auto *titleRequest = model.Create({3000, 20});
-        model.Feed(titleRequest, 0, 2);
-        model.TryRecordResponseContext(titleRequest);
-        model.Drop(titleRequest);
-        Require(model.UsedRows() == 12, "Archive accounting differs from unique stored chunks");
-        auto hit = longTokens;
-        hit.push_back(900);
-        auto *held = model.Create(hit);
-        model.CheckRestored(held, 10);
-        Require(model.UsedRows() == 12, "A shared prefix was counted twice");
-        model.Drop(held);
-        auto *titleHit = model.Create({3000, 20, 30});
-        model.CheckRestored(titleHit, 2);
-        model.Drop(titleHit);
-        auto *replacement = model.Create({5000, 20});
-        model.Feed(replacement, 0, 2);
-        model.TryRecordResponseContext(replacement);
-        model.Drop(replacement);
-        Require(model.UsedRows() == 4, "LRU eviction did not release the old long record");
-        Require(model.Create(hit)->cacheLen == 0, "Evicted long record still matched");
-        model.CheckRestored(model.Create({3000, 20, 30}), 2);
-
-        // Evicting a completed record cannot free chunks still held by an
-        // active request; publishing that request again remains safe.
-        model.Budget(10);
-        mainRequest = model.Create(longTokens);
-        model.Feed(mainRequest, 0, 10);
-        model.TryRecordResponseContext(mainRequest);
-        replacement = model.Create({6000, 20});
-        model.CheckFull(replacement, 0);
-        Require(model.UsedRows() == 10, "Eviction freed an active request's chunks");
-        model.TryRecordResponseContext(mainRequest);
-        model.CheckRestored(model.Create(hit), 10);
-        model.Budget(8);
-        model.CheckReservation();
-
-        std::cout << "Naive history prefix, fork, sliding, index, isolation and LRU: PASS\n";
-    } catch (const std::exception &e) {
-        std::cerr << e.what() << '\n';
+        model.CheckFallback(tokens);
+        std::cout << "CPU HISTORY DISABLED PASS" << std::endl;
+    } catch (const std::exception &error) {
+        std::cerr << error.what() << std::endl;
         return 1;
     }
 }

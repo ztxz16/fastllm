@@ -34,7 +34,6 @@ struct NaiveN05FlashModel::TPDecodeState {
         int maxRows = 0;
         TargetWorkspace buffers;
         Data logitsPartial, logitsCandidates;
-        Data historyDevice{BFLOAT16}, historyHost{BFLOAT16};
     };
     struct Rank {
         explicit Rank(std::shared_ptr<Storage> workspace = std::make_shared<Storage>())

@@ -92,28 +92,13 @@ void NaiveN05FlashModel::RestoreTensorParallelCache(ResponseContext *context) {
         for (Data *root : {&context->pastKeyValues[layer].first,
                            &context->pastKeyValues[layer].second})
             if (root->multiDeviceData || root->cudaData ||
-                (context->cacheLen == 0 ? (!root->dims.empty() || root->cpuData) :
-                 (root->dataDevice != DataDevice::CPU || !root->cpuData || root->dims.size() != 3)))
+                !root->dims.empty() || root->cpuData)
                 return;
         if (slidingLayers[layer]) continue;
         for (Data *root : {&idle[layer].first, &idle[layer].second})
             for (int device : tpDevices)
                 if (root->multiDeviceDatas.at(device)->expansionDims[1] != capacity)
                     return;
-    }
-    if (context->cacheLen > 0) {
-        // Keep the restored host rows, but transfer exclusive ownership of the
-        // idle GPU allocations. The forward workers overwrite them before use.
-        for (int layer = 0; layer < block_cnt; ++layer) {
-            for (int part = 0; part < 2; ++part) {
-                Data &root = part ? context->pastKeyValues[layer].second : context->pastKeyValues[layer].first;
-                Data &old = part ? idle[layer].second : idle[layer].first;
-                root.multiDeviceData = true;
-                root.dataDeviceIds = tpDevices;
-                root.multiDeviceDatas.swap(old.multiDeviceDatas);
-            }
-        }
-        return;
     }
     context->pastKeyValues.swap(idle);
     // The scheduler identifies a pending prompt by EMPTY root capacity.
@@ -1232,18 +1217,13 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         for (auto error : errors) if (error) std::rethrow_exception(error);
     };
     const bool reuseServingCache = CanReuseTensorParallelServingCache(batch);
-    struct RestoreCache { Data *cache; int layer; bool value; int capacity; };
-    std::vector<RestoreCache> restored;
     if (!reuseServingCache)
     for (int sequence = 0; sequence < sequences; ++sequence)
     for (int layer = 0; layer < block_cnt; ++layer) {
         for (Data *cache : {&key(sequence, layer), &value(sequence, layer)}) {
             if (cache->multiDeviceData && cache->dataDevice == DataDevice::CUDA) continue;
-            if (!cache->dims.empty()) {
-                const int reserve = CacheReserveCapacity(batch ? batch->configs[sequence] : config);
-                restored.push_back({cache, layer, cache == &value(sequence, layer),
-                    slidingLayers[layer] ? window - 1 + (batch ? batch->lengths[sequence] : inputIds.dims[1]) : reserve});
-            } else cache->dataDevice = DataDevice::CUDA;
+            AssertInFastLLM(cache->dims.empty(), "Naive TP does not restore CPU KV archives.");
+            cache->dataDevice = DataDevice::CUDA;
             cache->multiDeviceData = true;
             cache->dataDeviceIds = tpDevices;
             cache->isKVCache = true;
@@ -1271,7 +1251,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                 root.isPagedKVCache = false;
                 root.pagedKVCacheData = nullptr;
                 root.pageIndex.clear();
-                root.Resize({1, past, width});
+                if (root.dataDevice == DataDevice::CUDA) root.Resize({1, past, width});
                 root.expansionDims = {1, std::min(max_positions,
                     tpPagedCaches[0][layer * 2 + part]->maxPages * GetPageLen()), width};
             }
@@ -1290,37 +1270,11 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             }
         });
     }
-    if (!restored.empty()) {
-        runRanks([&](int rank) {
-            for (const auto &item : restored)
-                RestoreTensorParallelHistoryRank(*item.cache, item.layer, item.value, item.capacity, rank);
-            if (tpSwaRingCache) {
-                for (int sequence = 0; sequence < sequences; ++sequence)
-                for (int layer = 0; layer < block_cnt; ++layer) {
-                    if (!slidingLayers[layer] || key(sequence, layer).dataDevice != DataDevice::CPU) continue;
-                    FastllmCudaNaiveSwaCacheLayout(*key(sequence, layer).multiDeviceDatas.at(tpDevices[rank]),
-                        *value(sequence, layer).multiDeviceDatas.at(tpDevices[rank]), key(sequence, 0).dims[1], true);
-                }
-            }
-        });
-        for (const auto &item : restored) {
-            item.cache->FreeSpace();
-            item.cache->dataDevice = DataDevice::CUDA;
-            // The host archive only reserves its saved prefix. Publish the
-            // actual rank capacity before graph validation, just as the normal
-            // forward does below; otherwise an aligned prefix spuriously falls
-            // back to eager on its first appended token.
-            item.cache->expansionDims[1] =
-                item.cache->multiDeviceDatas.at(tpDevices[0])->expansionDims[1];
-        }
-    }
-    // CPU embedding uses the shared CPU worker pool, so compute it once on
-    // the caller instead of concurrently entering that pool from eight ranks.
+    // CPU embedding uses the shared worker pool; compute it once on the
+    // caller instead of concurrently entering that pool from every rank.
     Data embedding;
     if (!GetCudaEmbedding() || GetLowMemMode())
         Embedding(inputIds, weight["model.embed_tokens.weight"], embedding);
-    // One bounded graph state for full verification blocks, separate from
-    // ordinary decode. Smaller blocks and region boundaries remain eager.
     const bool verify = capture && capture->verifying;
     if (verify && tpSwaRingCache) {
         runRanks([&](int rank) {
@@ -1356,25 +1310,21 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         for (size_t rank = 0; rank < tpDevices.size(); ++rank)
             tpBatchWorkspaces.emplace_back(new TargetWorkspace());
     }
-    std::vector<std::shared_ptr<HistoryChunk>> histories(saveHistoryChat ? sequences : 0);
+    std::vector<PrefixSnapshots> prefixes(sequences);
     bool recording = false;
-    if (!histories.empty()) {
+    if (saveHistoryChat && !verify) {
         for (int sequence = 0; sequence < sequences; ++sequence) {
             const Data &first = key(sequence, 0);
-            histories[sequence] = BeginHistoryChunk(first, first.dims.empty() ? 0 : first.dims[1],
+            prefixes[sequence] = BeginPrefixSnapshots(first, first.dims.empty() ? 0 : first.dims[1],
                 batch ? batch->lengths[sequence] : inputIds.dims[1]);
-            recording = recording || histories[sequence] != nullptr;
+            recording = recording || !prefixes[sequence].empty();
         }
     }
-    if (capture) capture->history = recording ? histories[0] : nullptr;
     std::vector<TargetCapture> captures(capture || recording ? tpDevices.size() : 0);
     for (int rank = 0; rank < (int)captures.size(); ++rank) {
         captures[rank].verifying = verify;
         captures[rank].collectHidden = capture && capture->collectHidden && rank == 0;
-        if (recording) {
-            if (batch) captures[rank].batchHistory = histories;
-            else captures[rank].history = histories[0];
-        }
+        if (recording) captures[rank].prefixes = prefixes;
     }
     std::vector<Data> logits(compact || cudaSampling ? 0 : tpDevices.size());
     std::vector<float> candidates(compact ? tpDevices.size() * rows * count * 2 : 0);
@@ -1513,9 +1463,8 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     bool committedRootMetadata = false;
     if (graphDecode) {
         const size_t localSlots = (size_t)sequences * block_cnt * tpDevices.size() * 2;
-        // History recording still needs the old root lengths until its copies
-        // finish. Otherwise commit root and rank lengths in a single traversal.
-        committedRootMetadata = !recording &&
+        // Commit root and rank lengths in a single traversal.
+        committedRootMetadata =
             cacheLengths.size() == localSlots + (size_t)sequences * block_cnt * 2;
         tpDecodeState->warmed = true;
         if (!std::all_of(tpDecodeState->ranks.begin(), tpDecodeState->ranks.end(),
@@ -1573,77 +1522,25 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         }
     }
     if (graphDecode && recording) {
-        // Replay retains all new decode rows (or the uncommitted verify block).
-        // Download after replay, outside capture, preserving every fused kernel.
+        // Copy only at page boundaries, outside every captured graph. Payloads
+        // stay on device and retain exactly the stored BF16/FP8 bits.
         runRanks([&](int rank) {
             FastllmCudaSetDevice(tpDevices[rank]);
-            struct Slice { Data *target; int layer, part, rows, width; size_t offset, bytes;
-                           const Data *cache; int first; };
-            std::vector<Slice> slices;
-            size_t bytes = 0;
-            for (int sequence = 0; sequence < sequences; ++sequence) {
-                auto &chunk = histories[sequence];
-                if (!chunk) continue;
-                const int added = batch ? 1 : inputIds.dims[1];
-                for (int layer = 0; layer < block_cnt; ++layer) {
-                    const auto &cfg = slidingLayers[layer] ? sliding : full;
-                    const int ranks = tpDevices.size();
-                    if (ranks > cfg.kvHeads && rank % (ranks / cfg.kvHeads)) continue;
-                    for (int part = 0; part < 2; ++part) {
-                        Data &root = part ? value(sequence, layer) : key(sequence, layer);
-                        Data &local = *root.multiDeviceDatas.at(tpDevices[rank]);
-                        size_t size = (size_t)chunk->length * local.dims[2] * 2;
-                        const int first = tpSwaRingCache && slidingLayers[layer] && !verify
-                            ? key(sequence, 0).dims[1] & (window - 1) : local.dims[1] - added;
-                        slices.push_back({part ? &chunk->layers[layer].second : &chunk->layers[layer].first,
-                                          layer, part, chunk->length, local.dims[2], bytes, size, &local, first});
-                        bytes += size;
+            for (int sequence = 0; sequence < sequences; ++sequence)
+                for (const auto &snapshot : prefixes[sequence])
+                    for (int layer = 0; layer < block_cnt; ++layer) if (slidingLayers[layer]) {
+                        Data &k = *key(sequence, layer).multiDeviceDatas.at(tpDevices[rank]);
+                        Data &v = *value(sequence, layer).multiDeviceDatas.at(tpDevices[rank]);
+                        int rows = std::min(snapshot->length, window - 1);
+                        CopyPrefixWindow(*snapshot, rank, layer, k, v,
+                            tpSwaRingCache ? snapshot->length - rows : k.dims[1] - rows, tpSwaRingCache);
                     }
-                }
-            }
-            if (slices.empty()) return;
-            auto &storage = *tpDecodeState->ranks[rank]->storage;
-            storage.historyDevice.Resize({(int)(bytes / 2)});
-            storage.historyDevice.ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false);
-            storage.historyDevice.Allocate(false);
-            storage.historyHost.Resize({(int)(bytes / 2)}); storage.historyHost.Allocate(false);
-            if (kvCacheDataType == FP8_E4M3) {
-                std::vector<FastllmNaiveKVRead> reads;
-                reads.reserve(slices.size());
-                for (const auto &slice : slices)
-                    reads.push_back({slice.cache, (uint8_t *)storage.historyDevice.cudaData + slice.offset,
-                                     slice.first, slice.rows});
-                FastllmCudaNaiveReadCache(reads);
-            } else {
-                std::vector<void *> dsts;
-                std::vector<const void *> srcs;
-                std::vector<size_t> sizes;
-                for (const auto &slice : slices) {
-                    const Data &local = *slice.cache;
-                    const int physical = local.isPagedKVCache
-                        ? local.pageIndex.at(slice.first / local.pageLen) * local.pageLen + slice.first % local.pageLen
-                        : slice.first;
-                    const void *base = local.isPagedKVCache ? local.pagedKVCacheData->cudaData : local.cudaData;
-                    dsts.push_back((uint8_t *)storage.historyDevice.cudaData + slice.offset);
-                    srcs.push_back((const uint8_t *)base + (size_t)physical * slice.width * local.unitSize);
-                    sizes.push_back(slice.bytes);
-                }
-                AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
-                    dsts.data(), srcs.data(), sizes.data(), sizes.size()), "Naive TP history staging failed.");
-            }
-            // One host transfer per rank instead of one per layer and KV part.
-            FastllmCudaCopyFromDeviceToHost(storage.historyHost.cpuData, storage.historyDevice.cudaData, bytes);
-            for (const auto &slice : slices) {
-                Data view;
-                view.Resize({1, slice.rows, slice.width});
-                view.FakeFrom(storage.historyHost, slice.offset);
-                CopyTensorParallelHistory(view, *slice.target, slice.rows, slice.layer, rank, slice.part != 0);
-            }
+            ForceDeviceSync();
         });
     }
-    if (!capture && recording)
-        for (int sequence = 0; sequence < sequences; ++sequence)
-            FinishHistoryChunk(key(sequence, 0), histories[sequence]);
+    if (recording) for (int sequence = 0; sequence < sequences; ++sequence)
+        FinishPrefixSnapshots(key(sequence, 0), prefixes[sequence],
+            (batch ? batch->lengths[sequence] : inputIds.dims[1]) > 1);
     if (!committedRootMetadata) ForSequenceRanges(tpWorkers, tpDevices, sequences, graphDecode, [&](int begin, int end) {
         for (int sequence = begin; sequence < end; ++sequence)
         for (int layer = 0; layer < block_cnt; ++layer) {

@@ -45,7 +45,7 @@ namespace fastllm {
         bool NeedAttentionMask(int, int) override { return false; }
         // Bound idle TP prefill workspace with the shared pressure-aware pool.
         bool RetainCudaWorkspace() const override { return tpDevices.size() > 1; }
-        // The history archive also retains keys discarded by sliding attention.
+        // Prefix reuse requires both resident full-attention pages and a GPU SWA checkpoint.
         bool UseGenericHistoryCache() const override { return false; }
         bool TryRestoreHistoryCache(std::vector<int> &tokens, int &cacheLen) override;
         bool DeferHistoryCacheRestore() const override { return !tpPagedCaches.empty(); }
@@ -87,35 +87,40 @@ namespace fastllm {
             Data &Key(int sequence, int layer) const { return *kv[sequence * layers + layer].first; }
             Data &Value(int sequence, int layer) const { return *kv[sequence * layers + layer].second; }
         };
-        struct HistoryBudget {
-            std::atomic<size_t> used{0};
-            size_t limit = 0;
-            bool warned = false;
+        // Only window payloads live here; full DSA/indexer KV stays in the page pool.
+        struct PrefixPool {
+            std::mutex mutex;
+            std::vector<int> freeSlots;
+            std::vector<Data> storage;
+            std::vector<size_t> offsets;
+            size_t slotBytes = 0;
         };
-        struct HistoryChunk {
-            HistoryChunk() = default;
-            HistoryChunk(const HistoryChunk &) = delete;
-            HistoryChunk &operator=(const HistoryChunk &) = delete;
-            ~HistoryChunk() {
-                if (budget) budget->used.fetch_sub(reservedBytes, std::memory_order_relaxed);
+        struct PrefixSnapshot {
+            std::shared_ptr<PrefixPool> pool;
+            int slot = -1, length = 0;
+            std::vector<int> tokens;
+            // Observe the resident full-prefix endpoint without pinning KV.
+            // Generation checks prevent a recycled physical page from reviving
+            // a stale window checkpoint.
+            PagedCacheManager *fullPool = nullptr;
+            int fullPage = -1;
+            long long fullGeneration = 0;
+            bool HasResidentPrefix() const {
+                return fullPool && fullPool->IsCachedPage(fullPage, fullGeneration);
             }
-            int length = 0;
-            size_t bytes = 0;
-            size_t reservedBytes = 0;
-            std::shared_ptr<HistoryBudget> budget;
-            std::vector<std::pair<Data, Data>> layers;
-            Data draftHidden;
+            ~PrefixSnapshot() {
+                if (pool && slot >= 0) {
+                    std::lock_guard<std::mutex> lock(pool->mutex);
+                    pool->freeSlots.push_back(slot);
+                }
+            }
         };
-        std::shared_ptr<HistoryChunk> BeginHistoryChunk(
-            const std::vector<std::pair<Data, Data>> &kv, int past, int length);
-        std::shared_ptr<HistoryChunk> BeginHistoryChunk(const Data &key, int past, int length);
-        void FinishHistoryChunk(const Data &key, const std::shared_ptr<HistoryChunk> &chunk);
-        void CopyTensorParallelHistory(const Data &source, Data &target, int length,
-                                       int layer, int rank, bool value);
-        void RestoreTensorParallelHistoryRank(Data &cache, int layer, bool value, int capacity, int rank);
-        static void CopyHistoryTensor(const Data &source, Data &target, int length);
-        void FinishHistoryChunk(const std::vector<std::pair<Data, Data>> &kv,
-                                const std::shared_ptr<HistoryChunk> &chunk);
+        using PrefixSnapshots = std::vector<std::shared_ptr<PrefixSnapshot>>;
+        void RetirePrefixSnapshot(std::shared_ptr<PrefixSnapshot> &snapshot);
+        PrefixSnapshots BeginPrefixSnapshots(const Data &key, int past, int length);
+        void FinishPrefixSnapshots(const Data &key, const PrefixSnapshots &snapshots, bool prefill);
+        void CopyPrefixWindow(const PrefixSnapshot &snapshot, int rank, int layer,
+                              const Data &key, const Data &value, int first, bool ring);
 
         struct LogitsSelection {
             int count = 0;
@@ -133,8 +138,7 @@ namespace fastllm {
             bool verifying = false;
             bool collectHidden = true;
             std::map<int, Data> hidden;
-            std::shared_ptr<HistoryChunk> history;
-            std::vector<std::shared_ptr<HistoryChunk>> batchHistory;
+            std::vector<PrefixSnapshots> prefixes;
         };
         struct DraftTPState;
         std::shared_ptr<DraftTPState> draftTP;
@@ -143,7 +147,6 @@ namespace fastllm {
             int committed = 0;
             std::vector<std::pair<Data, Data>> kv;
             std::shared_ptr<DraftWorkspace> workspace;
-            Data restoredHidden;
             std::deque<std::pair<int, int>> pending;
             std::mt19937_64 random{std::random_device{}()};
             uint64_t rounds = 0, proposed = 0, accepted = 0;
@@ -233,7 +236,6 @@ namespace fastllm {
         std::vector<int> tpDevices;
         std::map<int, std::shared_ptr<CudaWorkspace>> tpKVPool;
         std::vector<std::vector<std::unique_ptr<PagedCacheManager>>> tpPagedCaches;
-        bool restoringPagedPrefix = false;
         bool tpPrepared = false;
         // Fixed at TP preparation so toggling CUDA Graph cannot change live KV
         // layout. Prefill/eager and verify temporarily use chronological rows.
@@ -247,31 +249,14 @@ namespace fastllm {
         PersistentWorkerGroup tpWorkers;
         std::vector<std::vector<std::vector<Data *>>> tpMoeWeights, tpMoeBiases;
         std::vector<std::pair<int, int>> tpVocabRanges;
-        struct HistorySpan {
-            std::shared_ptr<const HistoryChunk> chunk;
-            int length;
+        struct ActivePrefixes {
+            PrefixSnapshots prefill;
+            std::shared_ptr<PrefixSnapshot> decode;
         };
-        struct HistoryMemory {
-            std::vector<int> tokens;
-            std::vector<HistorySpan> spans;
-            int length = 0;
-        };
-        // Archives use host memory, never a second persistent GPU KV copy.
-        static constexpr size_t historyRecordLimit = 5;
-        // Shared chunks are charged once, including active and pending users.
-        // The host-only budget follows the serving token pool, capped by host
-        // memory; a long conversation can use space released by LRU entries.
-        std::shared_ptr<HistoryBudget> historyBudget = std::make_shared<HistoryBudget>();
-        void InitHistoryBudget();
-        size_t historyBytesPerToken = 0;
+        std::shared_ptr<PrefixPool> prefixPool;
         mutable std::mutex historyMutex;
-        // Oldest first; completed records and their chunks are immutable.
-        std::vector<std::shared_ptr<const HistoryMemory>> history;
-        // LaunchResponseTokens holds dictLocker across lookup and creation.
-        std::shared_ptr<const HistoryMemory> pendingHistory;
-        // The first key also identifies requests passed through ForwardBatch's
-        // pointer interface; no second request-to-cache lookup is needed.
-        std::map<const Data *, HistoryMemory> activeHistory;
+        PrefixSnapshots prefixHistory; // Oldest first, bounded by GPU pool slots.
+        std::map<const Data *, ActivePrefixes> activePrefixes;
 
         struct AttentionConfig {
             int heads, kvHeads, headDim, valueDim;

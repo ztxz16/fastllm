@@ -195,6 +195,9 @@ NaiveN05FlashModel::NaiveN05FlashModel() {
 
 NaiveN05FlashModel::~NaiveN05FlashModel() {
     ShutdownRuntime();
+    activePrefixes.clear();
+    prefixHistory.clear();
+    prefixPool.reset();
     tpWorkers.Stop();
     tpServingState.reset();
     tpDecodeState.reset();
@@ -256,12 +259,6 @@ void NaiveN05FlashModel::InitParams() {
     InitDraft();
     InitTensorParallel();
     canDoBatchForward = !draftEnabled && tpDevices.size() > 1;
-    historyBytesPerToken = draftEnabled ? embed_dim * sizeof(uint16_t) : 0;
-    for (int layer = 0; layer < block_cnt; ++layer) {
-        const auto &cfg = slidingLayers[layer] ? sliding : full;
-        historyBytesPerToken += sizeof(uint16_t) *
-            (cfg.kvHeads * (cfg.headDim + cfg.valueDim) + (slidingLayers[layer] ? 0 : indexDim));
-    }
     AssertInFastLLM(window > 0 && indexDim == 128 && indexTopK > 0 &&
                     full.heads % full.kvHeads == 0 && sliding.heads % sliding.kvHeads == 0 &&
                     (int)(full.headDim * partialRotary) <= indexDim &&
@@ -525,9 +522,6 @@ Data NaiveN05FlashModel::RunTarget(
         FastllmCudaSetLinearExactBatchThreshold(std::max(previousExactThreshold, length + 1));
     Data &firstKey = batch ? batch->Key(0, 0) : pastKeyValues[0].first;
     int pastLength = firstKey.dims.empty() ? 0 : firstKey.dims[1];
-    auto historyChunk = tensorParallel ? (capture ? capture->history : nullptr) :
-        BeginHistoryChunk(pastKeyValues, pastLength, length);
-    if (capture) capture->history = historyChunk;
     AssertInFastLLM(!slidingLayers[0] && (batch || pastLength + length <= max_positions),
                     "Naive-N0.5 requires a DSA first layer and input within the context window.");
     if (moeWeights.empty()) {
@@ -626,7 +620,7 @@ Data NaiveN05FlashModel::RunTarget(
         const bool mergedQkv = merged != weight.weight.end() && !merged->second.dims.empty();
         const bool batchRope = batch && (batch->Size() > 1 || buf.cacheTable) &&
             batch->Decode() && decodeWorkspace && !graphVerify &&
-            (!capture || (!capture->verifying && capture->batchHistory.empty()));
+            (!capture || !capture->verifying);
         if (mergedQkv) {
             if (!batchRope)
                 Linear(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
@@ -770,7 +764,7 @@ Data NaiveN05FlashModel::RunTarget(
         }
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &pastKey, Data &pastValue,
-                          TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, HistoryChunk *historyChunk, int sequence = 0) {
+                          TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, int sequence = 0) {
             Data &packed = buf.packed, &indexKey = buf.indexKey, &indices = buf.indices;
             int localPast = pastKey.dims.empty() ? 0 : pastKey.dims[1];
             const bool ringCache = tensorParallel && slidingLayers[layer] && tpSwaRingCache;
@@ -787,8 +781,7 @@ Data NaiveN05FlashModel::RunTarget(
                 : reserveCapacity;
             if (!batchRopePrepared) prepareIndexKey(normed, buf);
             Data noIndexKey, noLiveKeys;
-            bool fusedCache = batchRopePrepared || (!historyChunk &&
-                (decodeWorkspace || (!tensorParallel && length <= 8 && localPast > 0)) &&
+            bool fusedCache = batchRopePrepared || ((decodeWorkspace || (!tensorParallel && length <= 8 && localPast > 0)) &&
                 FastllmCudaNaiveRopeAppendCache(q, k, v, slidingLayers[layer] ? noIndexKey : indexKey,
                     positions, pastKey, pastValue, decodeWorkspace ? buf.liveKeys : noLiveKeys, cfg.heads, cfg.kvHeads,
                     cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale,
@@ -809,17 +802,6 @@ Data NaiveN05FlashModel::RunTarget(
                     Cat(k, indexKey, 2, packed);
                 } else {
                     packed.CopyFrom(k);
-                }
-                if (historyChunk) {
-                    if (tensorParallel) {
-                        CopyTensorParallelHistory(packed, historyChunk->layers[layer].first,
-                                                  historyChunk->length, layer, tpRank, false);
-                        CopyTensorParallelHistory(v, historyChunk->layers[layer].second,
-                                                  historyChunk->length, layer, tpRank, true);
-                    } else {
-                        CopyHistoryTensor(packed, historyChunk->layers[layer].first, historyChunk->length);
-                        CopyHistoryTensor(v, historyChunk->layers[layer].second, historyChunk->length);
-                    }
                 }
                 if (decodeWorkspace) {
                     if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, packed, v,
@@ -945,6 +927,13 @@ Data NaiveN05FlashModel::RunTarget(
                         cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                         localPast, slidingLayers[layer] ? window : 0, attn);
                 }
+                if (slidingLayers[layer] && capture && !capture->prefixes.empty()) {
+                    for (const auto &snapshot : capture->prefixes[sequence]) {
+                        int rows = std::min(snapshot->length, window - 1);
+                        CopyPrefixWindow(*snapshot, tpRank, layer, pastKey, pastValue,
+                            localPast + snapshot->length - globalPast - rows, false);
+                    }
+                }
                 if (slidingLayers[layer] && !verifying)
                     FastllmCudaNaiveTrimCache(pastKey, pastValue, window - 1);
                 if (ringCache && !verifying)
@@ -982,13 +971,13 @@ Data NaiveN05FlashModel::RunTarget(
                        *batch->Value(sequence, layer).multiDeviceDatas.at(gpu), part, count,
                        batch->Key(sequence, 0).dims.empty() ? 0 : batch->Key(sequence, 0).dims[1],
                        CacheReserveCapacity(batch->configs[sequence]), rowAttention,
-                       capture && !capture->batchHistory.empty() ? capture->batchHistory[sequence].get() : nullptr, sequence);
+                       sequence);
                 offset += count;
             }
         } else {
             auto &pastKey = tensorParallel ? *pastKeyValues[layer].first.multiDeviceDatas.at(gpu) : pastKeyValues[layer].first;
             auto &pastValue = tensorParallel ? *pastKeyValues[layer].second.multiDeviceDatas.at(gpu) : pastKeyValues[layer].second;
-            attend(normed, q, k, v, qkv, positions, pastKey, pastValue, buf, length, pastLength, reserveCapacity, attn, historyChunk.get());
+            attend(normed, q, k, v, qkv, positions, pastKey, pastValue, buf, length, pastLength, reserveCapacity, attn);
         }
         if (batchedDSA)
             FastllmCudaNaiveBatchDSADecode(q, localWeight(ap + "attention_sink_bias"), dsaRows,
@@ -1206,7 +1195,6 @@ Data NaiveN05FlashModel::RunTarget(
             std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end())
             Copy(hidden, capture->hidden[layer]);
     }
-    if (!tensorParallel && !capture) FinishHistoryChunk(pastKeyValues, historyChunk);
     if (isIntermediateChunkedPrefill) return Data();
     Data localLogits;
     Data &last = buf.last, &logits = decodeWorkspace ? buf.logits : localLogits;
@@ -1380,6 +1368,23 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         budget = std::min(budget, free * 3 / 4);
     }
     if (kvCacheLimit > 0) budget = std::min(budget, (int64_t)kvCacheLimit / ranks);
+    // Reserve bounded SWA checkpoints inside the same total KV budget. Full
+    // DSA/indexer pages are shared, never copied into this snapshot storage.
+    auto prefixes = std::make_shared<PrefixPool>();
+    prefixes->offsets.resize(block_cnt * 2);
+    for (int layer = 0; layer < block_cnt; ++layer) if (slidingLayers[layer]) {
+        for (int part = 0; part < 2; ++part) {
+            prefixes->offsets[layer * 2 + part] = prefixes->slotBytes;
+            const int width = std::max(1, sliding.kvHeads / ranks) *
+                (part ? sliding.valueDim : sliding.headDim);
+            prefixes->slotBytes += (size_t)window * width * kvBytes;
+        }
+    }
+    prefixes->slotBytes = (prefixes->slotBytes + 255) / 256 * 256;
+    const int prefixSlots = prefixes->slotBytes ? (int)std::min<int64_t>(
+        (int64_t)batch * 8, budget / 32 / prefixes->slotBytes) : 0;
+    const int64_t prefixBytes = (int64_t)prefixSlots * prefixes->slotBytes;
+    fixedBytes += prefixBytes;
     int64_t tokens = GetMaxTokens() > 0 ? GetMaxTokens() :
         std::min<int64_t>((int64_t)max_positions * batch,
                          (budget - fixedBytes) / fullBytesPerToken - (int64_t)batch * 127);
@@ -1393,6 +1398,24 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     for (int device : tpDevices)
         pools.emplace(device, std::make_shared<CudaWorkspace>(device, bytes));
     tpKVPool.swap(pools);
+    if (prefixSlots > 0) {
+        prefixes->storage.resize(ranks);
+        for (int rank = 0; rank < ranks; ++rank) {
+            Data &storage = prefixes->storage[rank];
+            storage.dataType = INT8;
+            storage.UpdateUnitSize();
+            storage.Resize({prefixSlots, (int)prefixes->slotBytes});
+            storage.dataDevice = DataDevice::CUDA;
+            storage.dataDeviceIds = {tpDevices[rank]};
+            storage.cudaData = AllocateCudaWorkspace(tpKVPool.at(tpDevices[rank]), prefixBytes);
+            if (!storage.cudaData) throw CudaWorkspaceExhausted("Naive GPU prefix pool exhausted.");
+            storage.directMemory = true;
+        }
+        for (int slot = 0; slot < prefixSlots; ++slot) prefixes->freeSlots.push_back(slot);
+        prefixPool = std::move(prefixes);
+        printf("[Naive GPU prefix cache] %d window slots, %.2f MiB/GPU within KV budget; no CPU KV archive.\n",
+               prefixSlots, prefixBytes / 1048576.0);
+    }
     const int pageLen = GetPageLen();
     const int fullLayers = std::count(slidingLayers.begin(), slidingLayers.end(), 0);
     const int64_t metadataBytes = (int64_t)fullLayers * 2 * batch *
