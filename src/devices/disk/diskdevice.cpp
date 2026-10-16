@@ -3099,6 +3099,33 @@ namespace fastllm {
 
     void DiskMergeMOE::Run(const std::string &opType, const DataDict &datas,
                            const FloatDict &floatParams, const IntDict &intParams) {
+#ifdef USE_CUDA
+        const Data &source = *datas.at("input");
+        if (!source.cpuData && source.cudaData && source.Count(0) > 0) {
+            // Borrowed CUDA views have no allocation capacity. Executor's
+            // ToDevice(CPU) changes their placement but cannot materialize a
+            // host buffer. Disk experts need real host rows for CPU misses.
+            Data host(source.dataType, source.dims);
+            host.Allocate(false);
+            const int previousDevice = FastllmCudaGetDevice();
+            struct RestoreInputDevice {
+                int device;
+                ~RestoreInputDevice() { FastllmCudaSetDevice(device); }
+            } restore{previousDevice};
+            const int sourceDevice = GetPointerDeviceId(source.cudaData);
+            if (sourceDevice >= 0) FastllmCudaSetDevice(sourceDevice);
+            FastllmCudaCopyFromDeviceToHost(host.cpuData, source.cudaData, source.GetBytes());
+            // Keep the GPU view for cache device selection; its owner outlives
+            // this call. Only the host mirror is owned by this temporary.
+            host.cudaData = source.cudaData;
+            host.cudaDataBorrowed = true;
+            host.dataDeviceIds = source.dataDeviceIds;
+            DataDict mirrored = datas;
+            mirrored["input"] = &host;
+            Run(opType, mirrored, floatParams, intParams);
+            return;
+        }
+#endif
         if (RunDiskCompact(datas, floatParams, intParams)) return;
         bool glmGGUF = false;
 #ifdef USE_CUDA
