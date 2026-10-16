@@ -91,6 +91,9 @@ struct DirectLayoutFixture {
         Data ordinary(INT8,{int(canonical.size())},CPU,const_cast<uint8_t *>(canonical.data()));
         Data native(INT8,{int(packed.size())},CPU,packed.data());
         ordinary.ToDevice(CUDA); native.ToDevice(CUDA);
+        Data unaligned(INT8,{int(packed.size()+4)});
+        unaligned.ToDevice(CUDA);unaligned.Allocate(false);
+        Cuda(cudaMemcpy(static_cast<uint8_t *>(unaligned.cudaData)+4,native.cudaData,packed.size(),cudaMemcpyDeviceToDevice));
         constexpr int topk=3;
         for (int rows : {1,2,3,4,7,9,17,32}) for (bool compact : {false,true}) {
             const int routes=rows*topk;
@@ -100,15 +103,15 @@ struct DirectLayoutFixture {
             for (int i=0;i<rows*hidden;++i) x[i]=Float32ToBFloat16RNEBits(float((i*17)%61-30)/23.f);
             for (int r=0;r<routes;++r) {
                 scores[r]=r%3==0 ? 0.f : r%3==1 ? -.125f : .3125f;
-                if (!compact || r%3!=1) {map.push_back(r);slots.push_back((r+r/topk)%2);}
+                if (!compact || r%3!=1) {map.push_back(r);slots.push_back(r%5==0 ? -1 : (r+r/topk)%2);}
             }
             std::reverse(map.begin(),map.end());
             Data input(BFLOAT16,{rows,hidden},CPU,x.data()), ds(FLOAT32,{routes},CPU,scores.data());
             Data di(INT32,{int(slots.size())},CPU,slots.data()), dm(INT32,{int(map.size())},CPU,map.data());
             input.ToDevice(CUDA);ds.ToDevice(CUDA);di.ToDevice(CUDA);dm.ToDevice(CUDA);
-            std::vector<float> output[3];
-            std::vector<uint16_t> gates[3];
-            for (int variant=0;variant<3;++variant) {
+            std::vector<float> output[4];
+            std::vector<uint16_t> gates[4];
+            for (int variant=0;variant<4;++variant) {
                 Data scratch(FLOAT32,{rows*(hidden+topk*inter)+4}), result(FLOAT32,{routes,hidden}), activation;
                 scratch.ToDevice(CUDA);scratch.Allocate(false);result.ToDevice(CUDA);result.Allocate(false);
                 Cuda(cudaMemset(result.cudaData,0,result.GetBytes()));
@@ -116,7 +119,8 @@ struct DirectLayoutFixture {
                 // variant also compares the vector decoder with its fallback.
                 const size_t offset=variant==2 ? sizeof(float) : 0;
                 FastllmCudaMoeGGUFCacheView view{
-                    static_cast<const uint8_t *>(variant ? native.cudaData : ordinary.cudaData),
+                    variant==3 ? static_cast<const uint8_t *>(unaligned.cudaData)+4 :
+                        static_cast<const uint8_t *>(variant ? native.cudaData : ordinary.cudaData),
                     static_cast<const int32_t *>(di.cudaData),stride,gateBytes,gateType,downType,hidden,inter,
                     static_cast<uint8_t *>(scratch.cudaData)+offset,size_t(scratch.GetBytes())-offset};
                 if (compact) {view.routeMap=static_cast<const int32_t *>(dm.cudaData);view.routeCount=map.size();}
@@ -126,6 +130,20 @@ struct DirectLayoutFixture {
                     Require(FastllmCudaMoeGlm5GGUFCacheCompute(input,activation,view,
                         static_cast<const float *>(ds.cudaData),topk,.125f,static_cast<float *>(result.cudaData)),
                         "GLM direct layout computation rejected");
+                }
+                if (rows==1 && !compact && variant<2) {
+                    cudaGraph_t graph;
+                    cudaGraphExec_t executable;
+                    Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
+                    Require(FastllmCudaMoeGlm5GGUFCacheCompute(input,activation,view,
+                        static_cast<const float *>(ds.cudaData),topk,.125f,static_cast<float *>(result.cudaData)),
+                        "GLM cached layout capture rejected");
+                    Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph));
+                    Cuda(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0));
+                    Cuda(cudaGraphLaunch(executable,cudaStreamPerThread));
+                    Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                    Cuda(cudaGraphExecDestroy(executable));
+                    Cuda(cudaGraphDestroy(graph));
                 }
                 // Delay down weights on a separate stream. Gate/up must finish
                 // before that upload, and the staged result must be bit-exact
@@ -164,7 +182,7 @@ struct DirectLayoutFixture {
                 gates[variant].assign(reinterpret_cast<uint16_t *>(activation.cpuData),
                     reinterpret_cast<uint16_t *>(activation.cpuData)+slots.size()*inter);
             }
-            for (int variant=1;variant<3;++variant) {
+            for (int variant=1;variant<4;++variant) {
                 Require(gates[0]==gates[variant],"GLM NUMA gate differs from canonical GPU arithmetic");
                 Require(output[0]==output[variant],"GLM NUMA layout differs from canonical GPU arithmetic");
             }
