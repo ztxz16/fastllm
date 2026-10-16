@@ -116,6 +116,23 @@ namespace fastllm {
     }
 #endif
 
+#ifdef USE_CUDA
+    static void Qwen4StreamTpReplica(Data &source, const std::vector<int> &devices) {
+        AssertInFastLLM(source.cpuData && !source.multiDeviceData &&
+                            source.multiDeviceDatas.empty() && source.dims.size() == 2,
+                        "Qwen4 TP streaming replica has an invalid source: " + source.name);
+        // Own each completed replica even if a later allocation fails.
+        source.multiDeviceData = true;
+        for (int device : devices) {
+            auto local = std::make_unique<Data>();
+            Qwen4CopyTpReplica(source, *local, device);
+            source.multiDeviceDatas.emplace(device, local.get());
+            local.release();
+        }
+        source.FreeSpace();
+    }
+#endif
+
     int Qwen4ExpModel::StreamingThreadTpExpertLayer(const std::string &name) const {
 #ifdef USE_CUDA
         if (!threadTpState || threadTpRank >= 0)
@@ -166,6 +183,10 @@ namespace fastllm {
     int Qwen4ExpModel::GetWeightLoadPriority(
         const std::string &tensorName,
         const std::vector<std::pair<std::string, DataType>> &) const {
+        // TP retains its existing expert/replica groups (priorities <= 0).
+        // This last serial group still completes before parallel host experts.
+        if (IsStreamingHybridBackboneWeight(tensorName))
+            return threadTpState ? 1 : -block_cnt - 2;
         const int layer = StreamingThreadTpExpertLayer(tensorName);
         if (layer >= 0)
             return layer - block_cnt;
@@ -178,13 +199,15 @@ namespace fastllm {
     bool Qwen4ExpModel::ShouldLoadWeightSeriallyBeforeOthers(
         const std::string &tensorName,
         const std::vector<std::pair<std::string, DataType>> &) const {
-        return StreamingThreadTpExpertLayer(tensorName) >= 0 ||
+        return IsStreamingHybridBackboneWeight(tensorName) ||
+               StreamingThreadTpExpertLayer(tensorName) >= 0 ||
                StreamingThreadTpReplicaLayer(tensorName) >= 0;
     }
 
     void Qwen4ExpModel::OnWeightLoadGroupStarted(const std::set<std::string> &names) {
-        if (!threadTpState)
-            return;
+        loadingHybridBackbone = !names.empty() &&
+            IsStreamingHybridBackboneWeight(*names.begin());
+        if (loadingHybridBackbone || !threadTpState) return;
         int &current = threadTpState->loadingExpertLayer;
         current = -1;
         threadTpState->loadingReplicas.clear();
@@ -202,9 +225,13 @@ namespace fastllm {
     }
 
     void Qwen4ExpModel::OnWeightLoadGroupFinished() {
+        if (loadingHybridBackbone) {
+            FinishHybridBackboneLoad();
+            return;
+        }
+        if (!threadTpState) return;
 #ifdef USE_CUDA
-        if (!threadTpState ||
-            (threadTpState->loadingExpertLayer < 0 && threadTpState->loadingReplicas.empty()))
+        if (threadTpState->loadingExpertLayer < 0 && threadTpState->loadingReplicas.empty())
             return;
         const int layer = std::exchange(threadTpState->loadingExpertLayer, -1);
         std::vector<std::string> replicas;
@@ -236,18 +263,7 @@ namespace fastllm {
         }
         for (const std::string &name : replicas) {
             Data &source = weight.weight.at(name);
-            AssertInFastLLM(source.cpuData && !source.multiDeviceData &&
-                                source.multiDeviceDatas.empty() && source.dims.size() == 2,
-                            "Qwen4 TP streaming replica has an invalid source: " + name);
-            // Own each completed replica even if a later allocation fails.
-            source.multiDeviceData = true;
-            for (int device : devices) {
-                auto local = std::make_unique<Data>();
-                Qwen4CopyTpReplica(source, *local, device);
-                source.multiDeviceDatas.emplace(device, local.get());
-                local.release();
-            }
-            source.FreeSpace();
+            Qwen4StreamTpReplica(source, devices);
         }
 #if defined(__GLIBC__)
         malloc_trim(0);
@@ -303,6 +319,139 @@ namespace fastllm {
     bool Qwen4ExpModel::ShouldDelaySpecialWeightCudaMove(const std::string &) const {
         // Splitting directly from host storage avoids loading all experts on rank 0.
         return threadTpState != nullptr;
+    }
+
+    int Qwen4ExpModel::SplitThreadTpWeight(const std::string &name, Data &source) {
+#ifdef USE_CUDA
+        auto &tp = *threadTpState;
+        auto &devices = tp.devices;
+        const int count = devices.size();
+        const bool expertWeight = name.find(".mlp.experts.") != std::string::npos;
+        const bool mtpExpert = expertWeight && name.rfind("mtp.", 0) == 0;
+        const int expertLayer = expertWeight ? (mtpExpert ? block_cnt - 1 :
+            std::atoi(name.c_str() + name.find("layers.") + 7)) : -1;
+        auto equalScheme = [&](int width, int parts = 1) {
+            AssertInFastLLM(width % count == 0, "Qwen4 TP weight dimension is not divisible.");
+            DivisionScheme result;
+            for (int r = 0; r < count; ++r) {
+                for (int part = 0; part < parts; ++part)
+                    result[devices[r]].push_back(
+                        {part * width + width * r / count, part * width + width * (r + 1) / count});
+            }
+            return result;
+        };
+        DivisionScheme scheme;
+        int axis = -1;
+        const bool linear = name.find(".linear_attn.") != std::string::npos;
+        const bool full = name.find(".self_attn.") != std::string::npos &&
+                          name.find(".indexer.") == std::string::npos;
+        if (name == "lm_head.weight" && source.dims.size() == 2 &&
+            (source.dataType == DataType::FLOAT16 ||
+             (source.dataType == DataType::DATA_GGUF_FORMAT && source.ggmlType >= 0 &&
+              !source.IsRepacked)) &&
+            source.dims[0] / 256 >= count && source.dims[0] <= (1 << 24)) {
+            // Row sharding preserves each logit's native GEMV arithmetic,
+            // including packed GGUF rows, without replicating the head.
+            axis = 0;
+            tp.vocabSize = source.dims[0];
+            tp.topCandidates.resize(count);
+            tp.topProbabilities.resize(count);
+            tp.shardLogits.resize(count);
+            // Select the draft rows while the canonical full target head
+            // is still available. Partition by subset row, preserving
+            // TopK lane order and balancing even a skewed token list.
+            if (Qwen4MtpDraftsPerStep() > 0) PrepareMtpDraftSubsetHead();
+            for (int r = 0; r < count; ++r) {
+                scheme[devices[r]] = {qwen4_tp::VocabRange(tp.vocabSize, count, r)};
+            }
+        } else if (linear) {
+            const int vd = num_v_heads * head_v_dim;
+            if (name.find("in_proj_qkv.weight") != std::string::npos ||
+                name.find("conv1d.weight") != std::string::npos) {
+                const int kd = num_k_heads * head_k_dim;
+                for (int r = 0; r < count; ++r) {
+                    scheme[devices[r]] = {{kd * r / count, kd * (r + 1) / count},
+                                         {kd + kd * r / count, kd + kd * (r + 1) / count},
+                                         {2 * kd + vd * r / count, 2 * kd + vd * (r + 1) / count}};
+                }
+                axis = 0;
+            } else if (name.find("out_proj.weight") != std::string::npos) {
+                // Packed GGUF columns retain tiled [value, key] heads.
+                // Each rank takes its key-head interval from every value group.
+                scheme = ggufWeightsRestored && source.dataType == DataType::DATA_GGUF_FORMAT &&
+                                 source.isGGUFData
+                             ? equalScheme(num_k_heads * head_v_dim, num_v_heads / num_k_heads)
+                             : equalScheme(vd);
+                axis = 1;
+            } else if (name.find("in_proj_z.weight") != std::string::npos) {
+                scheme = equalScheme(vd);
+                axis = 0;
+            } else if (name.find("in_proj_a.weight") != std::string::npos ||
+                       name.find("in_proj_b.weight") != std::string::npos ||
+                       name.find("A_log") != std::string::npos ||
+                       name.find("dt_bias") != std::string::npos) {
+                scheme = equalScheme(num_v_heads);
+                axis = 0;
+            }
+        } else if (full) {
+            if (name.find("q_proj.weight") != std::string::npos) {
+                scheme = equalScheme(num_attention_heads * head_dim * 2);
+                axis = 0;
+            } else if (name.find("o_proj.weight") != std::string::npos) {
+                scheme = equalScheme(num_attention_heads * head_dim);
+                axis = 1;
+            } else if (name.find("k_proj.weight") != std::string::npos ||
+                       name.find("v_proj.weight") != std::string::npos) {
+                for (int r = 0; r < count; ++r) {
+                    int first = r * num_attention_heads / count /
+                                (num_attention_heads / num_key_value_heads);
+                    int heads = std::max(1, num_key_value_heads / count);
+                    scheme[devices[r]] = {{first * head_dim, (first + heads) * head_dim}};
+                }
+                axis = 0;
+            }
+        } else if (name.find(".mlp.") != std::string::npos) {
+            if (name.find("gateup_proj.weight") != std::string::npos) {
+                axis = 0;
+            } else if (name.find("down_proj.weight") != std::string::npos) {
+                axis = 1;
+            }
+            if (axis >= 0 && expertWeight) {
+                const std::string downName =
+                    axis == 1 ? name
+                              : name.substr(0, name.size() -
+                                                   std::string("gateup_proj.weight").size()) +
+                                    "down_proj.weight";
+                scheme = Qwen4ExpertTpDivision(source, weight.weight.at(downName), devices,
+                                               axis, expertLayer);
+            } else if (axis >= 0) {
+                scheme = axis == 0 ? equalScheme(source.dims[0] / 2, 2)
+                                   : equalScheme(source.dims[1]);
+            }
+        }
+        if (axis >= 0) {
+            if (source.dims.size() != 2)
+                source.Reshape({source.dims[0], (int)source.Count(1)});
+            Data bias;
+            // Explicit head ranges must not be rotated by layer balancing.
+            bool compact = source.dataType == DataType::NVFP4_BLOCK_16_E4M3;
+            AssertInFastLLM(
+                SplitMultiCudaWeight(source, bias, devices, scheme, axis, true, compact),
+                "Qwen4 TP failed to split " + name);
+        }
+        return axis;
+#else
+        return -1;
+#endif
+    }
+
+    void Qwen4ExpModel::StreamHybridThreadTpWeight(const std::string &name, Data &source) {
+#ifdef USE_CUDA
+        // The MTP subset head needs the full host head after rank creation.
+        if (name == "lm_head.weight" && Qwen4MtpDraftsPerStep() > 0) return;
+        if (SplitThreadTpWeight(name, source) < 0)
+            Qwen4StreamTpReplica(source, threadTpState->devices);
+#endif
     }
 
     void Qwen4ExpModel::PrepareThreadTp() {
@@ -402,23 +551,6 @@ namespace fastllm {
             }
             tp.ranks.push_back(std::move(model));
         }
-        auto equalScheme = [&](int width, int parts = 1) {
-            AssertInFastLLM(width % count == 0, "Qwen4 TP weight dimension is not divisible.");
-            DivisionScheme result;
-            for (int r = 0; r < count; ++r) {
-                for (int part = 0; part < parts; ++part)
-                    result[devices[r]].push_back(
-                        {part * width + width * r / count, part * width + width * (r + 1) / count});
-            }
-            return result;
-        };
-        const int kd = num_k_heads * head_k_dim, vd = num_v_heads * head_v_dim;
-        DivisionScheme qkvScheme;
-        for (int r = 0; r < count; ++r) {
-            qkvScheme[devices[r]] = {{kd * r / count, kd * (r + 1) / count},
-                                     {kd + kd * r / count, kd + kd * (r + 1) / count},
-                                     {2 * kd + vd * r / count, 2 * kd + vd * (r + 1) / count}};
-        }
         std::map<int, int> compactLayerCounts;
         // WeightMap uses an unordered_map. Sorting is essential for the per-layer
         // consolidation below to bound the number of live source allocations.
@@ -460,100 +592,8 @@ namespace fastllm {
                 }
                 continue;
             }
-            DivisionScheme scheme;
-            int axis = -1;
-            const bool linear = name.find(".linear_attn.") != std::string::npos;
-            const bool full = name.find(".self_attn.") != std::string::npos &&
-                              name.find(".indexer.") == std::string::npos;
-            if (name == "lm_head.weight" && source.dims.size() == 2 &&
-                (source.dataType == DataType::FLOAT16 ||
-                 (source.dataType == DataType::DATA_GGUF_FORMAT && source.ggmlType >= 0 &&
-                  !source.IsRepacked)) &&
-                source.dims[0] / 256 >= count && source.dims[0] <= (1 << 24)) {
-                // Row sharding preserves each logit's native GEMV arithmetic,
-                // including packed GGUF rows, without replicating the head.
-                axis = 0;
-                tp.vocabSize = source.dims[0];
-                tp.topCandidates.resize(count);
-                tp.topProbabilities.resize(count);
-                tp.shardLogits.resize(count);
-                // Select the draft rows while the canonical full target head
-                // is still available. Partition by subset row, preserving
-                // TopK lane order and balancing even a skewed token list.
-                if (Qwen4MtpDraftsPerStep() > 0) PrepareMtpDraftSubsetHead();
-                for (int r = 0; r < count; ++r) {
-                    scheme[devices[r]] = {qwen4_tp::VocabRange(tp.vocabSize, count, r)};
-                }
-            } else if (linear) {
-                if (name.find("in_proj_qkv.weight") != std::string::npos ||
-                    name.find("conv1d.weight") != std::string::npos) {
-                    scheme = qkvScheme;
-                    axis = 0;
-                } else if (name.find("out_proj.weight") != std::string::npos) {
-                    // Packed GGUF columns retain tiled [value, key] heads.
-                    // Each rank takes its key-head interval from every value group.
-                    scheme = ggufWeightsRestored && source.dataType == DataType::DATA_GGUF_FORMAT &&
-                                     source.isGGUFData
-                                 ? equalScheme(num_k_heads * head_v_dim, num_v_heads / num_k_heads)
-                                 : equalScheme(vd);
-                    axis = 1;
-                } else if (name.find("in_proj_z.weight") != std::string::npos) {
-                    scheme = equalScheme(vd);
-                    axis = 0;
-                } else if (name.find("in_proj_a.weight") != std::string::npos ||
-                           name.find("in_proj_b.weight") != std::string::npos ||
-                           name.find("A_log") != std::string::npos ||
-                           name.find("dt_bias") != std::string::npos) {
-                    scheme = equalScheme(num_v_heads);
-                    axis = 0;
-                }
-            } else if (full) {
-                if (name.find("q_proj.weight") != std::string::npos) {
-                    scheme = equalScheme(num_attention_heads * head_dim * 2);
-                    axis = 0;
-                } else if (name.find("o_proj.weight") != std::string::npos) {
-                    scheme = equalScheme(num_attention_heads * head_dim);
-                    axis = 1;
-                } else if (name.find("k_proj.weight") != std::string::npos ||
-                           name.find("v_proj.weight") != std::string::npos) {
-                    for (int r = 0; r < count; ++r) {
-                        int first = r * num_attention_heads / count /
-                                    (num_attention_heads / num_key_value_heads);
-                        int heads = std::max(1, num_key_value_heads / count);
-                        scheme[devices[r]] = {{first * head_dim, (first + heads) * head_dim}};
-                    }
-                    axis = 0;
-                }
-            } else if (name.find(".mlp.") != std::string::npos) {
-                if (name.find("gateup_proj.weight") != std::string::npos) {
-                    axis = 0;
-                } else if (name.find("down_proj.weight") != std::string::npos) {
-                    axis = 1;
-                }
-                if (axis >= 0 && expertWeight) {
-                    const std::string downName =
-                        axis == 1 ? name
-                                  : name.substr(0, name.size() -
-                                                       std::string("gateup_proj.weight").size()) +
-                                        "down_proj.weight";
-                    scheme = Qwen4ExpertTpDivision(source, weight.weight.at(downName), devices,
-                                                   axis, expertLayer);
-                } else if (axis >= 0) {
-                    scheme = axis == 0 ? equalScheme(source.dims[0] / 2, 2)
-                                       : equalScheme(source.dims[1]);
-                }
-            }
             const std::vector<int> originalDims = source.dims;
-            if (axis >= 0) {
-                if (source.dims.size() != 2)
-                    source.Reshape({source.dims[0], (int)source.Count(1)});
-                Data bias;
-                // Explicit head ranges must not be rotated by layer balancing.
-                bool compact = source.dataType == DataType::NVFP4_BLOCK_16_E4M3;
-                AssertInFastLLM(
-                    SplitMultiCudaWeight(source, bias, devices, scheme, axis, true, compact),
-                    "Qwen4 TP failed to split " + name);
-            }
+            const int axis = SplitThreadTpWeight(name, source);
             if (source.multiDeviceData) {
                 // Both split weights and streamed replicas transfer their
                 // allocations to ranks without a CPU round trip.

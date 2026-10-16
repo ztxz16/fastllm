@@ -89,7 +89,7 @@ struct Fixture {
     std::string directory;
     std::vector<std::string> files;
     Fixture(bool tpExperts = false, int expertCount = 2, bool patternedExperts = false,
-            ggml_type gateType = GGML_TYPE_IQ2_XS) {
+            ggml_type gateType = GGML_TYPE_IQ2_XS, int vocab = 32) {
         const int expertWidth = tpExperts ? 64 : 32;
         char name[] = "/tmp/fastllm-qwen4-gguf-XXXXXX";
         Check(mkdtemp(name) != nullptr, "fixture directory failed"); directory = name;
@@ -97,10 +97,10 @@ struct Fixture {
         Json::object meta = {{"general.architecture", "qwen4exp"}, {"general.name", "Qwen4 GGUF regression"},
             {"tokenizer.ggml.eos_token_id", 8}, {"tokenizer.ggml.bos_token_id", 6}};
         Json::array tokens;
-        for (int i = 0; i < 32; ++i) tokens.emplace_back("token" + std::to_string(i));
+        for (int i = 0; i < vocab; ++i) tokens.emplace_back("token" + std::to_string(i));
         meta["tokenizer.ggml.tokens"] = tokens;
         meta["tokenizer.ggml.model"] = "gpt2";
-        const Json::object config = {{"block_count", 2}, {"embedding_length", 256}, {"vocab_size", 32},
+        const Json::object config = {{"block_count", 2}, {"embedding_length", 256}, {"vocab_size", vocab},
             {"attention.head_count", 2}, {"attention.head_count_kv", 1}, {"attention.key_length", 4},
             {"expert_count", expertCount}, {"expert_used_count", 1}, {"expert_feed_forward_length", expertWidth},
             {"ssm.group_count", 2}, {"ssm.time_step_rank", 6}, {"ssm.state_size", 4},
@@ -115,9 +115,9 @@ struct Fixture {
         for (const auto &item : config) meta["qwen4exp." + item.first] = item.second;
         Write(files[0], meta, {}); // Real distribution has a metadata-only first shard.
         std::vector<Tensor> tensors;
-        Tensor embedding{"token_embd.weight", {32, 256}, GGML_TYPE_IQ4_XS,
-                         Bytes(32 * ggml_row_size(GGML_TYPE_IQ4_XS, 256))};
-        for (int row = 0; row < 32; ++row) {
+        Tensor embedding{"token_embd.weight", {vocab, 256}, GGML_TYPE_IQ4_XS,
+                         Bytes(vocab * ggml_row_size(GGML_TYPE_IQ4_XS, 256))};
+        for (int row = 0; row < vocab; ++row) {
             auto &block = reinterpret_cast<block_iq4_xs *>(embedding.bytes.data())[row];
             block.d = float_to_half((row + 1) / 1024.0f);
             block.scales_h = row * 1973;
@@ -125,6 +125,11 @@ struct Fixture {
             for (int i = 0; i < 128; ++i) block.qs[i] = row * 17 + i * 29;
         }
         tensors.push_back(std::move(embedding));
+        if (vocab > 32) {
+            std::vector<float> head(vocab * 256);
+            for (size_t i = 0; i < head.size(); ++i) head[i] = float(int(i % 97) - 48) / 32;
+            tensors.push_back(FloatTensor("output.weight", {vocab, 256}, GGML_TYPE_Q8_0, head));
+        }
         auto rows = [&](const std::string &name, int prefix, int headDim, int columns, ggml_type type) {
             const int count = prefix + 6 * headDim;
             std::vector<float> values(count * columns);
@@ -609,7 +614,7 @@ static int TestStreamingTpImport() {
 #ifdef USE_CUDA
     if (FastllmCudaGetDeviceCount() < 2) return 77;
     unsetenv("FASTLLM_TP");
-    Fixture fixture(true);
+    Fixture fixture(true, 2, false, GGML_TYPE_IQ2_XS, 512);
     const std::string mtpPath = WriteMtpFixture(fixture, 64);
     setenv("FASTLLM_QWEN4_ENABLE_MTP", "3", 1);
     SetNgramDevice("disk");
@@ -617,10 +622,11 @@ static int TestStreamingTpImport() {
     SetDeviceMap({{"cuda:0", 1}}); SetMoeDeviceMap({{"cuda:0", 1}});
     SetLayeredMoeDeviceMap({{"cpu", 1}});
     setenv("FASTLLM_TP", "cuda:0,1", 1);
-    for (bool hostLastLayer : {true, false}) {
+    for (bool mtp : {false, true}) for (bool hostLastLayer : {true, false}) {
+        setenv("FASTLLM_QWEN4_ENABLE_MTP", mtp ? "3" : "0", 1);
         SetMoeDeviceLayers(hostLastLayer ? 1 : 0);
-        auto tp = CreateLLMModelFromGGUFFile(fixture.files[0], "", mtpPath);
-        for (int layer = 0; layer < 3; ++layer) for (int expert = 0; expert < 2; ++expert)
+        auto tp = CreateLLMModelFromGGUFFile(fixture.files[0], "", mtp ? mtpPath : "");
+        for (int layer = 0; layer < (mtp ? 3 : 2); ++layer) for (int expert = 0; expert < 2; ++expert)
         for (const std::string kind : {"gateup", "down"}) {
             const std::string name = (layer == 2 ? "mtp.layers.0.mlp.experts." :
                 "model.language_model.layers." + std::to_string(layer) + ".mlp.experts.") +
@@ -663,10 +669,10 @@ static int TestStreamingTpImport() {
                 Check(actual == expected, "streaming TP changed packed expert shard bytes");
             }
         }
-        const std::vector<std::string> replicaNames = {"model.language_model.hyper_connection_mixer.input_mix_weight_up.weight",
+        std::vector<std::string> replicaNames = {"model.language_model.hyper_connection_mixer.input_mix_weight_up.weight",
                 "model.language_model.layers.0.attn_hyper_connection.input_mix_weight_down.weight",
-                "model.language_model.layers.1.attn_hyper_connection.input_mix_weight_down.weight",
-                "mtp.fc_hidden.weight"};
+                "model.language_model.layers.1.attn_hyper_connection.input_mix_weight_down.weight"};
+        if (mtp) replicaNames.push_back("mtp.fc_hidden.weight");
         std::map<std::pair<std::string, int>, void *> replicaPointers;
         for (const std::string &name : replicaNames) {
             Data &source = tp->weight[name], &reference = cpu->weight[name];
@@ -684,6 +690,48 @@ static int TestStreamingTpImport() {
                       "streamed replica changed projection bytes");
             }
         }
+        std::map<std::pair<std::string, int>, void *> backbonePointers;
+        for (const std::string suffix : {"in_proj_qkv.weight", "in_proj_z.weight",
+                                         "in_proj_a.weight", "in_proj_b.weight",
+                                         "out_proj.weight", "head"}) {
+            const std::string name = suffix == "head" ? "lm_head.weight" :
+                "model.language_model.layers.0.linear_attn." + suffix;
+            Data &source = tp->weight[name], &reference = cpu->weight[name];
+            if (!hostLastLayer || (suffix == "head" && mtp)) {
+                Check(source.cpuData && !source.multiDeviceData,
+                      "hybrid streaming changed pure GPU load or retired the MTP head too early");
+                continue;
+            }
+            Check(!source.cpuData && source.multiDeviceData && source.multiDeviceDatas.size() == 2,
+                  "hybrid TP backbone retained its CPU source");
+            const size_t rowBytes = reference.GetBytes() / reference.dims[0];
+            for (int rank : {0, 1}) {
+                Data &shard = *source.multiDeviceDatas.at(rank);
+                backbonePointers[{name, rank}] = shard.cudaData;
+                Bytes actual(shard.GetBytes()), expected;
+                FastllmCudaSetDevice(rank);
+                FastllmCudaCopyFromDeviceToHost(actual.data(), shard.cudaData, actual.size());
+                if (suffix == "out_proj.weight") {
+                    for (int row = 0; row < reference.dims[0]; ++row) {
+                        const auto *begin = reference.cpuData + row * rowBytes + rank * rowBytes / 2;
+                        expected.insert(expected.end(), begin, begin + rowBytes / 2);
+                    }
+                } else {
+                    std::vector<std::pair<int, int>> ranges;
+                    if (suffix == "in_proj_qkv.weight")
+                        ranges = {{rank * 4, rank * 4 + 4}, {8 + rank * 4, 12 + rank * 4},
+                                  {16 + rank * 12, 28 + rank * 12}};
+                    else {
+                        const int rows = reference.dims[0] / 2;
+                        ranges = {{rank * rows, (rank + 1) * rows}};
+                    }
+                    for (auto range : ranges)
+                        expected.insert(expected.end(), reference.cpuData + range.first * rowBytes,
+                                        reference.cpuData + range.second * rowBytes);
+                }
+                Check(actual == expected, "hybrid TP changed restored GDN rows or vocabulary shard bytes");
+            }
+        }
         // The loader calls this hook again after ordinary weights: it must be a no-op.
         tp->OnWeightLoadGroupFinished();
         const std::string embeddingName = "model.language_model.embed_tokens.weight";
@@ -696,6 +744,11 @@ static int TestStreamingTpImport() {
             Check(replica.isFake && replica.cudaData == replicaPointers.at({name, device}),
                   "TP preparation copied or retained ownership of a streamed replica");
         }
+        for (const auto &entry : backbonePointers) {
+            const Data &shard = *tp->weight[entry.first.first].multiDeviceDatas.at(entry.first.second);
+            Check(shard.isFake && shard.cudaData == entry.second,
+                  "TP preparation did not transfer the early backbone allocation");
+        }
         Check(tp->weight[embeddingName].cpuData == embeddingStorage &&
               tp->weight[embeddingName].dataType == DATA_GGUF_FORMAT,
               "TP preparation released or expanded a borrowed host embedding");
@@ -706,6 +759,7 @@ static int TestStreamingTpImport() {
         }
         Check((tp->weight["model.language_model.layers.1.mlp.experts.0.down_proj.weight"].cpuData != nullptr) == hostLastLayer,
               "TP preparation changed CPU expert placement");
+        if (!mtp) continue;
         const Data &draft = tp->weight["mtp.layers.0.mlp.experts.0.down_proj.weight"];
         Check(draft.cpuData == nullptr && draft.multiDeviceDatas.size() == 2,
               "TP preparation did not retain resident MTP expert shards");
@@ -717,6 +771,78 @@ static int TestStreamingTpImport() {
     }
     unsetenv("FASTLLM_TP");
     std::cout << "PASS: Qwen4 streaming TP expert load, released CPU sources and exact packed shards\n";
+    return 0;
+#else
+    return 77;
+#endif
+}
+
+static int TestHybridBackboneImport() {
+#ifdef USE_CUDA
+    if (FastllmCudaGetDeviceCount() < 1) return 77;
+    unsetenv("FASTLLM_TP");
+    Fixture fixture(true);
+    const std::string mtpPath = WriteMtpFixture(fixture, 64);
+    const int lastDevice = FastllmCudaGetDeviceCount() >= 2 ? 1 : 0;
+    for (bool mtp : {false, true}) {
+        setenv("FASTLLM_QWEN4_ENABLE_MTP", mtp ? "3" : "0", 1);
+        SetDeviceMap({{"cpu", 1}}); SetMoeDeviceMap({{"cpu", 1}});
+        SetNgramDevice("disk");
+        auto reference = CreateLLMModelFromGGUFFile(fixture.files[0], "", mtp ? mtpPath : "");
+        for (int placement : {0, 1, 2}) {
+            SetDeviceMap(lastDevice ? std::map<std::string, int>{{"cuda:0", 1}, {"cuda:1", 1}}
+                                    : std::map<std::string, int>{{"cuda:0", 1}});
+            // All host experts, partially resident experts, then pure GPU.
+            SetMoeDeviceMap(placement == 0 ? std::map<std::string, int>{{"cpu", 1}} :
+                placement == 1 ? std::map<std::string, int>{{"cuda:0", 1}, {"cpu", 1}} :
+                                 std::map<std::string, int>{{"cuda:0", 1}});
+            auto model = CreateLLMModelFromGGUFFile(fixture.files[0], "", mtp ? mtpPath : "");
+            auto &qwen = dynamic_cast<Qwen4ExpModel &>(*model);
+            Check(qwen.GetExecutionMode() == (placement == 2 ? ExecutionMode::Gpu : ExecutionMode::Hybrid),
+                  "hybrid load test selected the wrong execution mode");
+            qwen.OnWeightLoadGroupFinished();
+            qwen.OnModelWeightsLoaded(); // Must not restore GDN rows a second time.
+            int uploaded = 0;
+            for (auto &entry : reference->weight.weight) {
+                const std::string &name = entry.first;
+                Data &expected = entry.second;
+                if (name.find(".mlp.experts.") != std::string::npos || !expected.cpuData) continue;
+                Data &actual = model->weight.weight.at(name);
+                Check(actual.dims == expected.dims && actual.dataType == expected.dataType &&
+                      actual.ggmlType == expected.ggmlType && actual.GetBytes() == expected.GetBytes(),
+                      "hybrid backbone load changed tensor metadata");
+                const bool projection = expected.dims.size() == 2 &&
+                    reference->weight.GetWeightType(name) == WeightType::LINEAR;
+                const bool target = name.compare(0, 4, "mtp.") != 0;
+                // The existing merged-weight callback already uploads MTP outputs
+                // when every target expert stays on the host.
+                const bool mergedMtp = placement == 0 &&
+                    (name == "mtp.layers.0.mlp.shared_expert.gateup_proj.weight" ||
+                     name == "mtp.layers.0.self_attn.qkv_proj.weight");
+                const bool stream = (placement != 2 && projection && target) || mergedMtp;
+                if (stream) {
+                    const int device = target && name.find(".layers.0.") != std::string::npos ? 0 : lastDevice;
+                    Check(!actual.cpuData && actual.cudaData && actual.dataDeviceIds == std::vector<int>{device},
+                          "hybrid backbone retained a host source or selected the wrong GPU");
+                    Bytes bytes(actual.GetBytes());
+                    const int saved = FastllmCudaGetDevice();
+                    FastllmCudaSetDevice(device);
+                    FastllmCudaCopyFromDeviceToHost(bytes.data(), actual.cudaData, bytes.size());
+                    FastllmCudaSetDevice(saved);
+                    Check(std::memcmp(bytes.data(), expected.cpuData, bytes.size()) == 0,
+                          "early upload changed GDN layout, merged QSA or projection bytes");
+                    ++uploaded;
+                } else {
+                    Check(actual.cpuData && std::memcmp(actual.cpuData, expected.cpuData, expected.GetBytes()) == 0,
+                          ("hybrid load changed a CPU consumer, MTP or pure GPU loading: " + name).c_str());
+                }
+            }
+            Check(placement == 2 ? uploaded == 0 : uploaded > 0, "missing hybrid backbone upload coverage");
+            const auto &ple = model->weight["model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight"];
+            Check(ple.isDiskWeight && !ple.cpuData, "hybrid load materialized the disk PLE table");
+        }
+    }
+    std::cout << "PASS: Qwen4 hybrid backbone load preserves placement and exact GGUF bytes\n";
     return 0;
 #else
     return 77;
@@ -833,6 +959,7 @@ int main(int argc, char **argv) {
 #endif
         }
         if (argc == 2 && std::string(argv[1]) == "--tp-load") return TestStreamingTpImport();
+        if (argc == 2 && std::string(argv[1]) == "--hybrid-load") return TestHybridBackboneImport();
         if (argc == 2 && std::string(argv[1]) == "--draft-vocab") {
 #ifdef USE_CUDA
             if (FastllmCudaGetDeviceCount() < 1) return 77;

@@ -16,10 +16,85 @@
 #endif
 #include "models/qwen4_kvmem.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 namespace fastllm {
+    bool Qwen4ExpModel::IsStreamingHybridBackboneWeight(const std::string &name) const {
+#ifdef USE_CUDA
+        const auto format = weight.dicts.find("gguf_architecture");
+        if (executionMode != ExecutionMode::Hybrid || threadTpRank >= 0 ||
+            format == weight.dicts.end() || format->second != "qwen4exp" ||
+            deviceMap.empty() || !Qwen4CudaOnlyDeviceMap(deviceMap))
+            return false;
+        // TP already streams these replicas; keep their original groups.
+        if (threadTpState && StreamingThreadTpReplicaLayer(name) >= 0) return false;
+        // Keep layout-dependent backbone tensors together until GGUF layout
+        // restoration has consumed them. Host experts and the large disk PLE
+        // table load afterwards; MTP retains its existing preparation path.
+        return name == "lm_head.weight" ||
+            (Qwen4StartsWith(name, languagePrefix) &&
+             name.find(".mlp.experts.") == std::string::npos && !ngramWeights.count(name));
+#else
+        return false;
+#endif
+    }
+
+    void Qwen4ExpModel::FinishHybridBackboneLoad() {
+#ifdef USE_CUDA
+        if (!loadingHybridBackbone) return;
+        loadingHybridBackbone = false;
+        // Readers and merge jobs have joined. Restore GDN rows before any
+        // projection leaves the host, using the same one-time preparation as
+        // OnModelWeightsLoaded. Norms and lookup tables keep their CPU owners.
+        RestoreGgufWeights();
+        std::vector<std::string> names;
+        for (const auto &item : weight.weight)
+            if (IsStreamingHybridBackboneWeight(item.first)) names.push_back(item.first);
+        if (threadTpState) std::sort(names.begin(), names.end());
+        for (const std::string &name : names) {
+            Data &data = weight.weight.at(name);
+            if (!data.isModelWeight ||
+                data.isFake || data.isDiskWeight || data.dataDevice != DataDevice::CPU ||
+                !data.cpuData || data.dims.size() != 2 ||
+                weight.GetWeightType(name) != WeightType::LINEAR)
+                continue;
+            if (threadTpState) {
+                Qwen4CudaDeviceGuard deviceGuard;
+                StreamHybridThreadTpWeight(name, data);
+                continue;
+            }
+            int layer = block_cnt - 1;
+            const std::string prefix = languagePrefix + "layers.";
+            if (Qwen4StartsWith(name, prefix)) {
+                char *end = nullptr;
+                const char *start = name.c_str() + prefix.size();
+                const long parsed = std::strtol(start, &end, 10);
+                if (end == start || *end != '.' || parsed < 0 || parsed >= block_cnt) continue;
+                layer = int(parsed);
+            }
+            const std::string device = SelectDeviceFromMap(deviceMap, layer + 1, block_cnt);
+            if (device != "cuda" && !Qwen4StartsWith(device, "cuda:")) continue;
+            std::map<int, int> ratios;
+            const auto devices = ParseDeviceIds(device, "cuda", ratios);
+            if (devices.size() > 1) continue; // Legacy sharding still needs its host source.
+            Qwen4CudaDeviceGuard deviceGuard;
+            if (FastllmCudaGetWeightSlabBytes() == 0) data.directMemory = true;
+            data.ToDevice(DataDevice::CUDA, devices);
+        }
+#if defined(__GLIBC__)
+        // Return the completed group's source pages before loading host
+        // experts, without adding allocator scans to the per-tensor path.
+        malloc_trim(0);
+#endif
+#endif
+    }
+
     void Qwen4ExpModel::RunHybridMoE(const MoEExecutionPlan &plan, const Data &input, Data &output,
                                      bool reduceOutput, PrefillStageContext *prefill,
                                      MoEPrepared *prepared,

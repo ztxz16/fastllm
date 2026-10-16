@@ -136,6 +136,11 @@ namespace fastllm {
         void InitThreadTp();
         int StreamingThreadTpExpertLayer(const std::string &weightName) const;
         int StreamingThreadTpReplicaLayer(const std::string &weightName) const;
+        bool IsStreamingHybridBackboneWeight(const std::string &weightName) const;
+        bool loadingHybridBackbone = false;
+        void FinishHybridBackboneLoad();
+        int SplitThreadTpWeight(const std::string &name, Data &source);
+        void StreamHybridThreadTpWeight(const std::string &name, Data &source);
         void PrepareThreadTp();
         void ThreadTpAllReduce(Data &data);
         bool ThreadTpAllTrue(bool value);

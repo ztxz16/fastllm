@@ -1021,6 +1021,10 @@ if (UNIT_TEST)
             fastllm_add_checked_test(qwen4_gguf_tp_load qwen4_gguf_test
                 "PASS: Qwen4 streaming TP expert load" 60 --tp-load)
             set_tests_properties(qwen4_gguf_tp_load PROPERTIES LABELS "cuda;gguf;tp" RUN_SERIAL TRUE)
+            fastllm_add_checked_test(qwen4_gguf_hybrid_load qwen4_gguf_test
+                "PASS: Qwen4 hybrid backbone load" 60 --hybrid-load)
+            set_tests_properties(qwen4_gguf_hybrid_load PROPERTIES LABELS "cuda;gguf;hybrid"
+                RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
         endif()
 
         if (USE_NUMAS)
