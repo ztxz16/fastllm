@@ -418,6 +418,12 @@ fastllm_lib.fetch_response_tokens_batch_llm_model.argtypes = [
 ]
 fastllm_lib.fetch_response_tokens_batch_llm_model.restype = ctypes.c_int
 
+fastllm_lib.fetch_response_tokens_batch_with_statistics_llm_model.argtypes = [
+    ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int)
+]
+fastllm_lib.fetch_response_tokens_batch_with_statistics_llm_model.restype = ctypes.c_int
+
 fastllm_lib.fetch_response_logits_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
 fastllm_lib.fetch_response_logits_llm_model.restype = ctypes.c_int
 
@@ -3048,27 +3054,29 @@ class model:
         is_prefill = True
         start_time = time.time()
 
-        def capture_response_statistics():
-            if response_statistics is None:
-                return
-            statistics = self.get_response_statistics(handle)
-            if statistics is not None:
-                response_statistics.update(statistics)
-
         # DSpark commits at most a small speculative block per scheduler turn,
         # but more than one block may be ready when the HTTP consumer is slow.
         # Drain a generous bounded batch through one C call and one scheduler
         # mutex acquisition.
         fetch_batch_capacity = 64
         fetch_batch_buffer = (ctypes.c_int * fetch_batch_capacity)()
+        fetch_statistics = (ctypes.c_int * 3)()
 
         def fetch_ready_tokens():
-            count = fastllm_lib.fetch_response_tokens_batch_llm_model(
+            count = fastllm_lib.fetch_response_tokens_batch_with_statistics_llm_model(
                 self.model, handle, fetch_batch_buffer,
-                fetch_batch_capacity)
+                fetch_batch_capacity, fetch_statistics)
             if count <= 0:
                 return count, []
             return count, [fetch_batch_buffer[i] for i in range(count)]
+
+        def capture_response_statistics():
+            # The terminal fetch releases the handle. Only use the snapshot
+            # returned by that same call; a lookup could read a new request.
+            if response_statistics is not None and fetch_statistics[0] >= 0:
+                response_statistics.update(zip(
+                    ("cached_input_tokens", "missed_input_tokens", "output_tokens"),
+                    fetch_statistics))
 
         if (self._can_apply_hf_chat_template() or
                 self._uses_hf_deepseek_v4_tokenizer()):

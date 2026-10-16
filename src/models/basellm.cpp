@@ -3473,6 +3473,13 @@ namespace fastllm {
         }
     }
 
+    static void CopyResponseStatistics(const ResponseContext &context, int *statistics) {
+        int inputTokens = std::max(0, context.inputTokens);
+        statistics[0] = std::min(inputTokens, std::max(0, context.cacheLen));
+        statistics[1] = inputTokens - statistics[0];
+        statistics[2] = std::max(0, context.curTokens);
+    }
+
     bool basellm::GetResponseStatistics(int handleId, int &cachedInputTokens,
                                         int &missedInputTokens, int &outputTokens) {
         std::unique_lock<std::mutex> dictLocker(this->dictLocker);
@@ -3484,10 +3491,11 @@ namespace fastllm {
             return false;
         }
 
-        int inputTokens = std::max(0, context->inputTokens);
-        cachedInputTokens = std::min(inputTokens, std::max(0, context->cacheLen));
-        missedInputTokens = inputTokens - cachedInputTokens;
-        outputTokens = std::max(0, context->curTokens);
+        int statistics[3];
+        CopyResponseStatistics(*context, statistics);
+        cachedInputTokens = statistics[0];
+        missedInputTokens = statistics[1];
+        outputTokens = statistics[2];
         return true;
     }
 
@@ -3534,6 +3542,14 @@ namespace fastllm {
 
     int basellm::FetchResponseTokensBatch(int handleId, int *output,
                                           int maxTokens) {
+        return FetchResponseTokensBatch(handleId, output, maxTokens, nullptr);
+    }
+
+    int basellm::FetchResponseTokensBatch(int handleId, int *output,
+                                          int maxTokens, int *statistics) {
+        if (statistics != nullptr) {
+            std::fill(statistics, statistics + 3, -1);
+        }
         if (output == nullptr || maxTokens <= 0) {
             return 0;
         }
@@ -3543,6 +3559,9 @@ namespace fastllm {
             return -1;
         }
         while (true) {
+            if (statistics != nullptr) {
+                CopyResponseStatistics(*context, statistics);
+            }
             if (!context->resultTokenQueue.empty()) {
                 int count = 0;
                 while (count < maxTokens &&

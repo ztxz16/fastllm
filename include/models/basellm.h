@@ -362,6 +362,11 @@ namespace fastllm {
         // accepted block without one Python/ASGI round trip per token.
         virtual int FetchResponseTokensBatch(int handleId, int *output,
                                              int maxTokens);
+        // Atomically return {cached input, missed input, output} counters with
+        // the tokens, including the terminal snapshot before releasing the
+        // handle. Counters are -1 if the context no longer exists.
+        int FetchResponseTokensBatch(int handleId, int *output,
+                                     int maxTokens, int *statistics);
 
         virtual int FetchResponseLogits(int handleId, std::vector <float> &logits); // 获取指定handle的输出Logits
 
