@@ -49,7 +49,8 @@ namespace fastllm {
     Qwen4ExpModel::DraftGraphPolicy Qwen4ExpModel::HybridDraftGraphPolicy(int sequence) {
         DraftGraphPolicy policy;
 #ifdef USE_CUDA
-        const bool hostExperts = threadTpOwner && threadTpOwner->hybrid.hostMoe;
+        const bool hostExperts = threadTpOwner && threadTpOwner->hybrid.hostMoe &&
+                                 !threadTpOwner->mtpGpuExperts;
         const bool hybridExperts =
             !mtpMoeWeights.empty() &&
             FastllmCudaUseMoeHybrid(mtpMoeWeights.data(), mtpMoeWeights.size());
@@ -59,7 +60,7 @@ namespace fastllm {
         policy.tp = threadTpRank >= 0 && sequence <= 4 && !mtpMoeWeights.empty() && !hybridExperts;
         policy.hybrid = sequence <= 4 && !mtpMoeWeights.empty() && (hostExperts || hybridExperts);
         policy.placementCompatible =
-            policy.device || (policy.hybrid ? Qwen4CudaOrNumaOnlyDeviceMap(moeDeviceMap) &&
+            policy.device || policy.tp || (policy.hybrid ? Qwen4CudaOrNumaOnlyDeviceMap(moeDeviceMap) &&
                                                   Qwen4CudaOrNumaOnlyDeviceMap(layeredMoeDeviceMap)
                                             : Qwen4CudaOnlyDeviceMap(moeDeviceMap) &&
                                                   Qwen4CudaOnlyDeviceMap(layeredMoeDeviceMap));

@@ -261,10 +261,10 @@ if (USE_CUDA)
         message(STATUS "CUDA20 is unavailable for this CMake/NVCC combination, falling back to CUDA17")
     endif()
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-    # NVCC 13.0 ICEs in std::_Destroy for this unit's C++20 host containers.
+    # NVCC 12.8/13.0 ICEs in std::_Destroy for this unit's C++20 host containers.
     # It requires only C++17; retain C++20 for the other CUDA/DeepGEMM units.
     if (CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA" AND
-        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0 AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
         CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
         set_source_files_properties(
             src/devices/cuda/linear/fastllm-native-lowbit-prefill.cu
@@ -1009,6 +1009,12 @@ if (UNIT_TEST)
         fastllm_add_checked_test(disk_embedding_reader disk_embedding_reader_test
             "PASS disk embedding reader" 60)
         if (USE_CUDA AND NOT USE_ROCM)
+            fastllm_add_checked_test(qwen4_draft_vocab qwen4_gguf_test
+                "PASS: draft vocabulary format=" 60 --draft-vocab)
+            set_tests_properties(qwen4_draft_vocab PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+            fastllm_add_checked_test(qwen4_graph_slot_reset qwen4_gguf_test
+                "PASS: Qwen4 graph slot resets history" 60 --graph-slot-reset)
+            set_tests_properties(qwen4_graph_slot_reset PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
             fastllm_add_checked_test(qwen4_gguf_tp_load qwen4_gguf_test
                 "PASS: Qwen4 streaming TP expert load" 60 --tp-load)
             set_tests_properties(qwen4_gguf_tp_load PROPERTIES LABELS "cuda;gguf;tp" RUN_SERIAL TRUE)
@@ -1448,6 +1454,12 @@ if (UNIT_TEST)
             set_tests_properties(cuda_paged_fragmented_attention cuda_paged_fragmented_attention_long PROPERTIES
                                  LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
         endif()
+
+        add_executable(cuda_graph_workspace_test test/basic/test_cuda_graph_workspace.cpp)
+        target_link_libraries(cuda_graph_workspace_test PRIVATE fastllm)
+        target_include_directories(cuda_graph_workspace_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(cuda_graph_workspace cuda_graph_workspace_test "PASS: graph workspace" 180)
+        set_tests_properties(cuda_graph_workspace PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
 
         add_executable(cuda_masked_attention_test test/basic/test_cuda_masked_attention.cpp)
         target_link_libraries(cuda_masked_attention_test PRIVATE fastllm)

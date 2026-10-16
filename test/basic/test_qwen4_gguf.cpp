@@ -47,6 +47,11 @@ struct Tensor { std::string name; std::vector<int> dims; ggml_type type; Bytes b
 Tensor FloatTensor(const std::string &name, const std::vector<int> &dims, ggml_type type,
                    const std::vector<float> &values) {
     Tensor t{name, dims, type, {}};
+    if (type == GGML_TYPE_Q6_K) {
+        t.bytes.resize(ggml_row_size(type, values.size()));
+        quantize_row_q6_K_ref(values.data(), reinterpret_cast<block_q6_K *>(t.bytes.data()), values.size());
+        return t;
+    }
     if (type == GGML_TYPE_Q8_0) {
         Check(values.size() % 32 == 0, "Q8 fixture block alignment");
         for (size_t b = 0; b < values.size(); b += 32) {
@@ -283,6 +288,145 @@ void TestEmbeddingImport(const Fixture &fixture) {
 }
 namespace fastllm {
 struct Qwen4GGUFTestAccess {
+    static void CheckGraphSlotReset(int targetDevice = 0, int draftDevice = 0) {
+#ifdef USE_CUDA
+        Qwen4ExpModel model;
+        Qwen4ExpModel::RequestState state;
+        state.previousToken1 = 17;
+        state.previousToken2 = 23;
+        state.convHistory = {1, 2, 3};
+        state.processedTokens = {4, 5, 6};
+        state.indexerRawKeys[1] = {9};
+        state.indexerPositions[1] = {10};
+        state.indexerBlockKeys[1] = {11};
+        state.geometricCacheGrowthReadyLayers.insert(1);
+        state.mtpDisabled = true;
+        state.hasMultimodalInput = true;
+        auto tensor = [&](const std::vector<int> &dims, int device = -1) {
+            size_t count = 1;
+            for (int dim : dims) count *= dim;
+            auto value = std::make_shared<Data>(FLOAT32, dims, std::vector<float>(count, 7));
+            value->ToDevice(CUDA, std::vector<int>{device < 0 ? targetDevice : device});
+            value->expansionDims = value->dims;
+            return value;
+        };
+        state.indexerTailKeyTensors[1] = tensor({4, 8});
+        state.indexerTailPositionTensors[1] = tensor({4});
+        state.indexerBlockKeyTensors[1] = tensor({16, 8});
+        void *tail = state.indexerTailKeyTensors[1]->cudaData;
+        void *positions = state.indexerTailPositionTensors[1]->cudaData;
+        void *blocks = state.indexerBlockKeyTensors[1]->cudaData;
+        state.mtpState = std::make_shared<Qwen4ExpModel::MtpRuntimeState>();
+        auto mtp = state.mtpState;
+        mtp->key.CopyFrom(*tensor({2, 6, 8}, draftDevice));
+        mtp->value.CopyFrom(*tensor({2, 6, 8}, draftDevice));
+        mtp->proposals = {12, 13};
+        mtp->pendingOutputTokens = {14, 15};
+        mtp->proposalCount = 2;
+        mtp->hasDeferredTargetHidden = true;
+        mtp->deferredPosition = 42;
+        mtp->targetCheckpointPrepared = true;
+        mtp->attentionState.processedTokens = {8, 9};
+        mtp->attentionState.previousToken1 = 11;
+        mtp->attentionState.indexerBlockKeyTensors[2] = tensor({16, 8}, draftDevice);
+        mtp->targetCheckpoint.linearSecond.resize(1);
+        mtp->targetCheckpoint.linearSecond[0].CopyFrom(*tensor({1, 4, 8}));
+        void *key = mtp->key.cudaData;
+        void *checkpoint = mtp->targetCheckpoint.linearSecond[0].cudaData;
+        for (int repetition = 0; repetition < 2; ++repetition) {
+            FastllmCudaSetDevice(targetDevice);
+            model.ResetDecodeServingState(state, true);
+            Check(FastllmCudaGetDevice() == targetDevice &&
+                  mtp->key.dataDeviceIds == std::vector<int>{draftDevice} &&
+                  state.indexerTailKeyTensors[1]->dataDeviceIds == std::vector<int>{targetDevice},
+                  "multi-GPU graph reset changed device ownership or caller device");
+            Check(state.reusableGraphRequest && state.decodeGraphsFrozen && state.previousToken1 == -1 &&
+                  state.previousToken2 == -1 && state.processedTokens.empty() &&
+                  state.convHistory.empty() && state.indexerRawKeys.empty() &&
+                  state.indexerPositions.empty() && state.indexerBlockKeys.empty() &&
+                  state.geometricCacheGrowthReadyLayers.empty() &&
+                  !state.mtpDisabled && !state.hasMultimodalInput,
+                  "graph slot retained request history");
+            Check(state.indexerTailKeyTensors[1]->cudaData == tail &&
+                  state.indexerTailPositionTensors[1]->cudaData == positions &&
+                  state.indexerBlockKeyTensors[1]->cudaData == blocks &&
+                  state.indexerTailKeyTensors[1]->dims[0] == 0 &&
+                  state.indexerBlockKeyTensors[1]->dims[0] == 0,
+                  "graph slot reset changed captured QSA storage");
+            Check(state.mtpState == mtp && mtp->key.cudaData == key && mtp->key.dims[1] == 0 &&
+                  mtp->value.dims[1] == 0 && mtp->proposals.empty() && mtp->pendingOutputTokens.empty() &&
+                  mtp->proposalCount == 0 && !mtp->hasDeferredTargetHidden &&
+                  mtp->deferredPosition == -1 && !mtp->targetCheckpointPrepared &&
+                  mtp->targetCheckpoint.linearSecond[0].cudaData == checkpoint &&
+                  mtp->attentionState.decodeGraphsFrozen && mtp->attentionState.processedTokens.empty() &&
+                  mtp->attentionState.previousToken1 == -1 &&
+                  mtp->attentionState.indexerBlockKeyTensors[2]->dims[0] == 0,
+                  "graph slot retained MTP history or moved checkpoint storage");
+        }
+        std::cout << "PASS: Qwen4 graph slot resets history and preserves captured storage\n";
+#endif
+    }
+    static void CheckGraphSlotOwnership(int secondDevice) {
+#ifdef USE_CUDA
+        Qwen4ExpModel model;
+        model.block_cnt = 2;
+        model.linearLayers = {true, true};
+        model.servingCache = std::make_shared<Qwen4ExpModel::ServingCache>();
+        model.servingCache->layers.resize(2);
+        for (int layer = 0; layer < 2; ++layer) {
+            const int device = layer == 0 ? 0 : secondDevice;
+            for (auto *pool : {&model.servingCache->layers[layer].first,
+                              &model.servingCache->layers[layer].second}) {
+                *pool = std::make_shared<PagedCacheManager>();
+                auto &tensor = **pool;
+                tensor.dataType = FLOAT32;
+                tensor.UpdateUnitSize();
+                tensor.dataDevice = CUDA;
+                tensor.dataDeviceIds = {device};
+                tensor.directMemory = true;
+                tensor.isLinearAttention = true;
+                tensor.type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE;
+                tensor.pageLen = 1;
+                FastllmCudaSetDevice(device);
+                tensor.Resize({1, 1, 2, 2});
+                tensor.Allocate();
+                tensor.SetMaxPages(1);
+            }
+        }
+        const Data *slotKey = nullptr;
+        for (int request = 0; request < 2; ++request) {
+            std::vector<std::pair<Data, Data>> cache(2);
+            const Data *rootKey = &cache.front().first;
+            model.requestStates[rootKey].reusableGraphRequest = true;
+            for (int phase = 0; phase < 2; ++phase) {
+                Check(model.WithDecodeServingCache(cache, [&](auto &owned) {
+                    const Data *key = &owned.front().first;
+                    if (!slotKey) slotKey = key;
+                    Check(key == slotKey && key != rootKey,
+                          "prefill, decode and repeated requests changed slot ownership");
+                    auto &state = model.requestStates[key];
+                    Check(state.processedTokens == (phase == 0 ? std::vector<int>{} :
+                                                                std::vector<int>{17}),
+                          "prefill history was lost or leaked into the next request");
+                    model.AcquireServingCache(owned, state, 1);
+                    state.processedTokens = {17};
+                    return true;
+                }), "serving callback failed");
+                for (const auto &pools : model.servingCache->layers)
+                    for (const auto &pool : {pools.first, pools.second})
+                        Check(pool->FreePageCount() == 0 && pool->pageRefCount[0] == 1,
+                              "scheduler view duplicated the fixed slot reference");
+            }
+            model.RemoveDecodeServingRequest(rootKey, true);
+            model.requestStates.erase(rootKey);
+        }
+        model.ReleaseDecodeServingSlot(model.idleDecodeServingSlot);
+        for (const auto &pools : model.servingCache->layers)
+            for (const auto &pool : {pools.first, pools.second})
+                Check(pool->FreePageCount() == 1, "retired slot leaked its fixed page");
+        std::cout << "PASS: Qwen4 prefill and decode share one reusable slot\n";
+#endif
+    }
     static void CheckMetadata(Qwen4ExpModel &m) {
         Check(m.eosToken == 6 && m.eos_token_id == 8, "PLE reset token replaced generation EOS");
         Check(m.pleLayer == 1 && m.ngramShardCount == 1 && m.ngramHeadDim == 32, "PLE layout metadata");
@@ -293,6 +437,59 @@ struct Qwen4GGUFTestAccess {
     static void Prepare(Qwen4ExpModel &m) { m.PrepareWeights(); }
     static void PrepareTp(Qwen4ExpModel &m) { m.PrepareThreadTp(); }
     static bool HasMtp(const Qwen4ExpModel &m) { return m.HasMtpWeights(); }
+    static void CheckDraftVocabulary(const std::string &directory, ggml_type type) {
+#ifdef USE_CUDA
+        Qwen4ExpModel model;
+        constexpr int vocab = 64, width = 256;
+        std::vector<float> values(vocab * width);
+        for (size_t i = 0; i < values.size(); ++i) values[i] = float(int(i * 37 % 97) - 48) / 8;
+        const auto tensor = FloatTensor("lm_head.weight", {vocab, width}, type, values);
+        model.weight.AddEmptyGGMLWeight("lm_head.weight", {vocab, width}, DATA_GGUF_FORMAT, type);
+        Data &head = model.weight["lm_head.weight"];
+        head.Allocate(); std::memcpy(head.cpuData, tensor.bytes.data(), tensor.bytes.size());
+        head.isModelWeight = true; head.weightType = WeightType::LINEAR;
+        head.ToDevice(CUDA, std::vector<int>{0});
+        const std::vector<int32_t> ids{51, 3, 0, 17, 63, 20, 9, 32, 4};
+        const std::string path = directory + "/draft-vocab.bin";
+        auto write = [&](const std::vector<int32_t> &tokens) {
+            std::ofstream file(path, std::ios::binary);
+            file.write(reinterpret_cast<const char *>(tokens.data()), tokens.size() * sizeof(int32_t));
+        };
+        write(ids); setenv("FASTLLM_MTP_DRAFT_VOCAB", path.c_str(), 1);
+        model.PrepareMtpDraftSubsetHead();
+        Check(model.mtpDraftSubsetIds == std::vector<int>(ids.begin(), ids.end()), "draft vocabulary map changed");
+        std::vector<uint8_t> copied(model.mtpDraftSubsetHead.GetBytes()), original(head.GetBytes());
+        FastllmCudaCopyFromDeviceToHost(copied.data(), model.mtpDraftSubsetHead.cudaData, copied.size());
+        FastllmCudaCopyFromDeviceToHost(original.data(), head.cudaData, original.size());
+        Check(original == tensor.bytes, "draft subset modified target head");
+        const size_t rowBytes = ggml_row_size(type, width);
+        for (size_t row = 0; row < ids.size(); ++row)
+            Check(std::memcmp(copied.data() + row * rowBytes,
+                original.data() + size_t(ids[row]) * rowBytes, rowBytes) == 0, "draft row selection corrupted Q8 bytes");
+        static_cast<Executor *>(GetExecutor())->SetFirstDevice("cuda");
+        std::vector<float> x(width);
+        for (int i = 0; i < width; ++i) x[i] = float(i % 23 - 11) / 31;
+        Data input(FLOAT32, {1, width}, x), full, subset;
+        Linear(input, head, Data(), full);
+        Linear(input, model.mtpDraftSubsetHead, Data(), subset);
+        full.ToDevice(CPU); subset.ToDevice(CPU);
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const float a = reinterpret_cast<float *>(full.cpuData)[ids[i]];
+            const float b = reinterpret_cast<float *>(subset.cpuData)[i];
+            Check(std::isfinite(b) && std::abs(a - b) <= 1e-5f * (1 + std::abs(a)),
+                "draft subset logits differ from corresponding target rows");
+        }
+        for (const auto &invalid : {std::vector<int32_t>{3,3}, std::vector<int32_t>{-1}, std::vector<int32_t>{64}}) {
+            write(invalid); model.mtpDraftSubsetAttempted = false;
+            bool rejected = false;
+            try { model.PrepareMtpDraftSubsetHead(); } catch (const std::runtime_error &) { rejected = true; }
+            Check(rejected, "draft vocabulary accepted invalid ids");
+        }
+        unsetenv("FASTLLM_MTP_DRAFT_VOCAB");
+        unlink(path.c_str());
+        std::cout << "PASS: draft vocabulary format=" << type << " preserves target bytes/logits and rejects invalid ids\n";
+#endif
+    }
     static void CheckPlePrefetch(Qwen4ExpModel &m) {
         static_cast<Executor *>(GetExecutor())->SetFirstDevice("cpu");
         const std::string prefix = "model.language_model.layers.1.ple.";
@@ -431,7 +628,9 @@ static int TestStreamingTpImport() {
             Data &reference = cpu->weight[name], &weight = tp->weight[name];
             Check(weight.dims == reference.dims && weight.ggmlType == reference.ggmlType,
                   "streaming TP changed parent weight metadata");
-            if (hostLastLayer && layer >= 1) {
+            // Target experts retain the configured CPU layer; draft experts
+            // are resident TP shards even when the last target layer is on CPU.
+            if (hostLastLayer && layer == 1) {
                 Check(!weight.multiDeviceData && weight.cpuData != nullptr,
                       "streaming TP uploaded a CPU expert layer");
                 Check(std::memcmp(weight.cpuData, reference.cpuData, reference.GetBytes()) == 0,
@@ -507,8 +706,14 @@ static int TestStreamingTpImport() {
         }
         Check((tp->weight["model.language_model.layers.1.mlp.experts.0.down_proj.weight"].cpuData != nullptr) == hostLastLayer,
               "TP preparation changed CPU expert placement");
-        Check((tp->weight["mtp.layers.0.mlp.experts.0.down_proj.weight"].cpuData != nullptr) == hostLastLayer,
-              "TP preparation changed MTP expert placement");
+        const Data &draft = tp->weight["mtp.layers.0.mlp.experts.0.down_proj.weight"];
+        Check(draft.cpuData == nullptr && draft.multiDeviceDatas.size() == 2,
+              "TP preparation did not retain resident MTP expert shards");
+        for (int rank = 0; rank < 2; ++rank) {
+            const Data &shard = *draft.multiDeviceDatas.at(rank);
+            Check(shard.dataDevice == CUDA && shard.cudaData != nullptr,
+                  "TP preparation released a resident MTP expert shard");
+        }
     }
     unsetenv("FASTLLM_TP");
     std::cout << "PASS: Qwen4 streaming TP expert load, released CPU sources and exact packed shards\n";
@@ -611,7 +816,34 @@ int main(int argc, char **argv) {
         SetThreads(2); SetDeviceMap({{"cpu", 1}}); SetMoeDeviceMap({{"cpu", 1}});
         SetCudaEmbedding(false);
         SetMoeCudaCacheBytes(0); setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
+        if (argc == 2 && std::string(argv[1]) == "--graph-slot-reset") {
+#ifdef USE_CUDA
+            if (FastllmCudaGetDeviceCount() < 1) return 77;
+            FastllmCudaSetDevice(0);
+            Qwen4GGUFTestAccess::CheckGraphSlotReset();
+            Qwen4GGUFTestAccess::CheckGraphSlotOwnership(0);
+            if (FastllmCudaGetDeviceCount() >= 2) {
+                Qwen4GGUFTestAccess::CheckGraphSlotOwnership(1);
+                Qwen4GGUFTestAccess::CheckGraphSlotReset(0, 1);
+                Qwen4GGUFTestAccess::CheckGraphSlotReset(1, 0);
+            }
+            return 0;
+#else
+            return 77;
+#endif
+        }
         if (argc == 2 && std::string(argv[1]) == "--tp-load") return TestStreamingTpImport();
+        if (argc == 2 && std::string(argv[1]) == "--draft-vocab") {
+#ifdef USE_CUDA
+            if (FastllmCudaGetDeviceCount() < 1) return 77;
+#else
+            return 77;
+#endif
+            Fixture fixture;
+            Qwen4GGUFTestAccess::CheckDraftVocabulary(fixture.directory, GGML_TYPE_Q8_0);
+            Qwen4GGUFTestAccess::CheckDraftVocabulary(fixture.directory, GGML_TYPE_Q6_K);
+            return 0;
+        }
         TestConcurrentExpertMerges();
         TestDirectMergeFormats();
         Fixture fixture;

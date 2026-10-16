@@ -60,89 +60,97 @@ namespace fastllm {
             }
         }
 
-        // Once workers start, never retry a partially appended request through
-        // serial Forward. All fallback checks must precede this boundary.
-        AcquireServingCache(pastKeyValues, *request, sequence);
-        std::vector<RequestState> states(stages.size(), *request);
-        std::vector<PrefillStageContext> contexts(stages.size());
-        std::mutex hostExpertMutex;
-        std::vector<int> devices;
-        int pleOwner = 0;
-        for (int rank = 0; rank < int(stages.size()); ++rank) {
-            const auto &stage = stages[rank];
-            devices.push_back(stage.device);
-            contexts[rank].firstLayer = stage.firstLayer;
-            contexts[rank].endLayer = stage.endLayer;
-            contexts[rank].state = &states[rank];
-            contexts[rank].hostExpertMutex = &hostExpertMutex;
-            if (stage.firstLayer <= pleLayer && pleLayer < stage.endLayer)
-                pleOwner = rank;
-            FastllmCudaSetDevice(stage.device);
-            auto &scale = prefillLinearInvScales[stage.device];
-            if (scale.dims.empty()) {
-                scale.CopyFrom(linearInvScaleData);
-                scale.ToDevice(CUDA, std::vector<int>{stage.device});
+        // Pipeline prefill and decode must own the same fixed cache slot.
+        // All fallback checks above precede slot acquisition and worker launch.
+        return WithDecodeServingCache(pastKeyValues, [&](auto &cache) {
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                request = &requestStates[&cache[0].first];
             }
-        }
-        FastllmCudaPeerAccessInit(devices);
-        bool numa = false;
-        for (int layer = 0; layer < block_cnt; ++layer) {
-            const auto device = SelectMoeDeviceForLayer(layer);
-            numa |= device == "numa" || device.rfind("numa:", 0) == 0;
-        }
-        HybridPrefillScope hybrid(devices, numa);
-        if (!prefillPipeline)
-            prefillPipeline.reset(new CudaChunkedPrefillPipeline());
-        const DataType type =
-            weight[languagePrefix + "embed_tokens.weight"].dataType == FLOAT16 ? FLOAT16 : FLOAT32;
-        const float *tokens = reinterpret_cast<const float *>(inputIds.cpuData);
-        const float *positions = reinterpret_cast<const float *>(positionIds.cpuData);
-        std::vector<std::vector<float> *> batchLogits{logits};
-        if (verbose) {
-            std::printf(
-                "[Prompt] Qwen4 pipelined prefill: %zu CUDA stages, %d chunks (%d tokens/chunk).\n",
-                stages.size(), chunks, chunkSize);
-            std::fflush(stdout);
-        }
-        prefillPipeline->Run(devices, chunks, type, {1, chunkSize, hcCount * embed_dim},
-                             [&](int rank, int chunk, Data &hidden) {
-                                 if (chunk == 0)
-                                     hybrid.BindWorker(rank);
-                                 const int start = chunk * chunkSize;
-                                 const int end = start + std::min(chunkSize, sequence - start);
-                                 Data ids(FLOAT32, {1, end - start},
-                                          std::vector<float>(tokens + start, tokens + end));
-                                 Data pos(FLOAT32, {1, end - start},
-                                          std::vector<float>(positions + start, positions + end));
-                                 auto &context = contexts[rank];
-                                 context.hidden = &hidden;
-                                 context.sampleOutput =
-                                     rank + 1 == int(stages.size()) && chunk + 1 == chunks;
-                                 const auto result = ForwardTarget(
-                                     1, ids, Data(), pos, pastKeyValues, generationConfig,
-                                     lastTokens, &batchLogits, nullptr, nullptr, nullptr, nullptr,
-                                     false, false, false, nullptr, false, nullptr, &context);
-                                 if (context.sampleOutput)
-                                     outputToken = result.front();
-                             });
+            // Once workers start, never retry a partially appended request through
+            // serial Forward. All fallback checks must precede this boundary.
+            AcquireServingCache(cache, *request, sequence);
+            std::vector<RequestState> states(stages.size(), *request);
+            std::vector<PrefillStageContext> contexts(stages.size());
+            std::mutex hostExpertMutex;
+            std::vector<int> devices;
+            int pleOwner = 0;
+            for (int rank = 0; rank < int(stages.size()); ++rank) {
+                const auto &stage = stages[rank];
+                devices.push_back(stage.device);
+                contexts[rank].firstLayer = stage.firstLayer;
+                contexts[rank].endLayer = stage.endLayer;
+                contexts[rank].state = &states[rank];
+                contexts[rank].hostExpertMutex = &hostExpertMutex;
+                if (stage.firstLayer <= pleLayer && pleLayer < stage.endLayer)
+                    pleOwner = rank;
+                FastllmCudaSetDevice(stage.device);
+                auto &scale = prefillLinearInvScales[stage.device];
+                if (scale.dims.empty()) {
+                    scale.CopyFrom(linearInvScaleData);
+                    scale.ToDevice(CUDA, std::vector<int>{stage.device});
+                }
+            }
+            FastllmCudaPeerAccessInit(devices);
+            bool numa = false;
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                const auto device = SelectMoeDeviceForLayer(layer);
+                numa |= device == "numa" || device.rfind("numa:", 0) == 0;
+            }
+            HybridPrefillScope hybrid(devices, numa);
+            if (!prefillPipeline)
+                prefillPipeline.reset(new CudaChunkedPrefillPipeline());
+            const DataType type =
+                weight[languagePrefix + "embed_tokens.weight"].dataType == FLOAT16 ? FLOAT16 : FLOAT32;
+            const float *tokens = reinterpret_cast<const float *>(inputIds.cpuData);
+            const float *positions = reinterpret_cast<const float *>(positionIds.cpuData);
+            std::vector<std::vector<float> *> batchLogits{logits};
+            if (verbose) {
+                std::printf(
+                    "[Prompt] Qwen4 pipelined prefill: %zu CUDA stages, %d chunks (%d tokens/chunk).\n",
+                    stages.size(), chunks, chunkSize);
+                std::fflush(stdout);
+            }
+            prefillPipeline->Run(devices, chunks, type, {1, chunkSize, hcCount * embed_dim},
+                                 [&](int rank, int chunk, Data &hidden) {
+                                     if (chunk == 0)
+                                         hybrid.BindWorker(rank);
+                                     const int start = chunk * chunkSize;
+                                     const int end = start + std::min(chunkSize, sequence - start);
+                                     Data ids(FLOAT32, {1, end - start},
+                                              std::vector<float>(tokens + start, tokens + end));
+                                     Data pos(FLOAT32, {1, end - start},
+                                              std::vector<float>(positions + start, positions + end));
+                                     auto &context = contexts[rank];
+                                     context.hidden = &hidden;
+                                     context.sampleOutput =
+                                         rank + 1 == int(stages.size()) && chunk + 1 == chunks;
+                                     const auto result = ForwardTarget(
+                                         1, ids, Data(), pos, cache, generationConfig,
+                                         lastTokens, &batchLogits, nullptr, nullptr, nullptr, nullptr,
+                                         false, false, false, nullptr, false, nullptr, &context);
+                                     if (context.sampleOutput)
+                                         outputToken = result.front();
+                                 });
 
-        // Only the PLE stage advances token/short-convolution history. Attention
-        // maps are owned by disjoint layer ranges and can be joined after draining.
-        *request = std::move(states[pleOwner]);
-        for (int rank = 0; rank < int(states.size()); ++rank) {
-            if (rank == pleOwner)
-                continue;
-            auto &other = states[rank];
-            request->indexerRawKeys.merge(other.indexerRawKeys);
-            request->indexerPositions.merge(other.indexerPositions);
-            request->indexerBlockKeys.merge(other.indexerBlockKeys);
-            request->indexerHostMirrorTransfers.merge(other.indexerHostMirrorTransfers);
-            request->indexerTailKeyTensors.merge(other.indexerTailKeyTensors);
-            request->indexerTailPositionTensors.merge(other.indexerTailPositionTensors);
-            request->indexerBlockKeyTensors.merge(other.indexerBlockKeyTensors);
-            request->geometricCacheGrowthReadyLayers.merge(other.geometricCacheGrowthReadyLayers);
-        }
-        return true;
+            // Only the PLE stage advances token/short-convolution history. Attention
+            // maps are owned by disjoint layer ranges and can be joined after draining.
+            *request = std::move(states[pleOwner]);
+            for (int rank = 0; rank < int(states.size()); ++rank) {
+                if (rank == pleOwner)
+                    continue;
+                auto &other = states[rank];
+                request->indexerRawKeys.merge(other.indexerRawKeys);
+                request->indexerPositions.merge(other.indexerPositions);
+                request->indexerBlockKeys.merge(other.indexerBlockKeys);
+                request->indexerHostMirrorTransfers.merge(other.indexerHostMirrorTransfers);
+                request->indexerTailKeyTensors.merge(other.indexerTailKeyTensors);
+                request->indexerTailPositionTensors.merge(other.indexerTailPositionTensors);
+                request->indexerBlockKeyTensors.merge(other.indexerBlockKeyTensors);
+                request->geometricCacheGrowthReadyLayers.merge(other.geometricCacheGrowthReadyLayers);
+            }
+            return true;
+        });
 #else
         return false;
 #endif

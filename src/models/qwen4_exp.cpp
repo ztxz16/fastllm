@@ -25,6 +25,7 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
@@ -54,6 +55,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -695,10 +697,6 @@ namespace fastllm {
             }
         };
 
-        bool Qwen4PrefixCacheEnabled() {
-            return Qwen4EnvFlagEnabled("FASTLLM_PREFIX_CACHE", true);
-        }
-
         bool Qwen4PrefixCacheDebugEnabled() {
             return Qwen4EnvFlagEnabled("FASTLLM_QWEN4_PREFIX_CACHE_DEBUG");
         }
@@ -1212,6 +1210,10 @@ namespace fastllm {
                value.compare(0, prefix.size(), prefix) == 0;
     }
 
+    bool Qwen4PrefixCacheEnabled() {
+        return Qwen4EnvFlagEnabled("FASTLLM_PREFIX_CACHE", true);
+    }
+
     int Qwen4MtpDraftsPerStep() {
         return std::max(0, std::min(
             8, Qwen4EnvInt("FASTLLM_QWEN4_ENABLE_MTP", 0)));
@@ -1238,6 +1240,12 @@ namespace fastllm {
         }
     };
 
+    struct Qwen4ExpModel::DecodeServingSlot {
+        std::vector<std::pair<Data, Data>> cache;
+        std::vector<int> devices;
+        bool failed = false;
+    };
+
     struct Qwen4ExpModel::MtpDraftCudaGraphState {
         struct Segment {
             bool warmed = false;
@@ -1248,6 +1256,7 @@ namespace fastllm {
             void *graph = nullptr;
             void *exec = nullptr;
             std::vector<void*> reservedPointers;
+            std::vector<size_t> allocationRequests;
             std::vector<uint64_t> inputSignature;
             Data projectedHidden;
             Data attentionOutput;
@@ -1291,7 +1300,7 @@ namespace fastllm {
         }
 
         template <class Compute>
-        void RunPrefix(Segment &segment, Compute &&compute) {
+        void RunPrefix(Segment &segment, Compute &&compute, bool allowCapture) {
 #ifdef USE_CUDA
             if (segment.captured) {
                 if (FastllmCudaGraphLaunch(segment.exec)) return;
@@ -1300,7 +1309,13 @@ namespace fastllm {
                 FastllmCudaClearThreadError();
                 FastllmCudaClearGraphError();
             }
+            if (!allowCapture) {
+                compute();
+                return;
+            }
             if (segment.disabled || !segment.warmed) {
+                segment.allocationRequests.clear();
+                FastllmCudaAllocationRecorder record(&segment.allocationRequests);
                 compute();
                 segment.warmed = true;
                 return;
@@ -1308,6 +1323,11 @@ namespace fastllm {
             void *graph = nullptr, *exec = nullptr;
             bool pool = false;
             bool ok = FastllmCudaGraphPrepareCaptureDevice();
+            if (ok) {
+                ForceDeviceSync();
+                ok = !FastllmCudaGetThreadError() &&
+                    FastllmCudaReserveGraphWorkspace(segment.allocationRequests);
+            }
             if (ok) ok = pool = FastllmCudaGraphMemoryPoolBegin();
             if (ok) {
                 FastllmCudaClearThreadError();
@@ -1374,13 +1394,19 @@ namespace fastllm {
     std::string Qwen4ExpModel::SelectSpecialWeightDevice(
             const std::string &weightName, int layerId) const {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (Qwen4StartsWith(weightName, kQwen4MtpExpertPrefix)) {
+            // Parent loading streams CUDA shards without NUMA registration;
+            // each rank executes its own shard outside the target expert cache.
+            if (threadTpState && threadTpState->mtpGpuExperts) return "cuda";
+            if (threadTpOwner && threadTpOwner->mtpGpuExperts)
+                return "cuda:" + std::to_string(threadTpOwner->devices[threadTpRank]);
+        }
         // The small draft stack runs repeatedly between target windows.
         // Keep its experts beside the draft stack, outside the target's
-        // bounded expert cache. A pipeline uses its final GPU; TP retains
-        // its existing distributed placement policy.
+        // bounded expert cache. A pipeline uses its final GPU; TP uses
+        // resident shards selected above.
         if (threadTpState == nullptr && threadTpRank < 0 &&
             Qwen4StartsWith(weightName, kQwen4MtpExpertPrefix) &&
-            Qwen4EnvFlagEnabled("FASTLLM_QWEN4_MTP_GPU_EXPERTS", true) &&
             Qwen4CudaOnlyDeviceMap(deviceMap)) {
             const std::string device = SelectDeviceFromMap(deviceMap, block_cnt, block_cnt);
             if (device == "cuda" || device.compare(0, 5, "cuda:") == 0) {
@@ -1580,6 +1606,9 @@ namespace fastllm {
     Qwen4ExpModel::~Qwen4ExpModel() {
         ShutdownRuntime();
         threadTpState.reset();
+        for (auto &item : decodeServingSlots) ReleaseDecodeServingSlot(item.second);
+        decodeServingSlots.clear();
+        ReleaseDecodeServingSlot(idleDecodeServingSlot);
 #ifdef USE_CUDA
         prefillPipeline.reset();
 #ifndef USE_ROCM
@@ -1609,7 +1638,8 @@ namespace fastllm {
                 if (layer.size() > 2 && layer[2] != nullptr)
                     FastllmCudaReleaseMergeMOEVllmMarlinCache(layer[2]);
             }
-            if (!threadTpOwner->hybrid.hostMoeLayers.back() && mtpMoeWeights.size() > 2 && mtpMoeWeights[2])
+            if ((!threadTpOwner->hybrid.hostMoeLayers.back() || threadTpOwner->mtpGpuExperts) &&
+                mtpMoeWeights.size() > 2 && mtpMoeWeights[2])
                 FastllmCudaReleaseMergeMOEVllmMarlinCache(mtpMoeWeights[2]);
         }
 #endif
@@ -2567,6 +2597,94 @@ namespace fastllm {
         PrepareMoEExecutionPlans();
         PrepareHybridExperts(hasMtpWeights);
         this->preparedWeights = true;
+    }
+
+    void Qwen4ExpModel::PrepareMtpDraftSubsetHead() {
+#ifdef USE_CUDA
+        if (mtpDraftSubsetAttempted) return;
+        const char *path = std::getenv("FASTLLM_MTP_DRAFT_VOCAB");
+        if (!path || !*path) return;
+        std::lock_guard<std::mutex> guard(prepareMutex);
+        if (mtpDraftSubsetAttempted) return;
+        auto require = [](bool ok, const char *message) {
+            if (!ok) throw std::runtime_error(message);
+        };
+        Data &head = weight["lm_head.weight"];
+        const bool prepareTp = threadTpState != nullptr && threadTpRank < 0;
+        require(head.dataType == DATA_GGUF_FORMAT &&
+            (head.ggmlType == GGML_TYPE_Q8_0 || head.ggmlType == GGML_TYPE_Q6_K) &&
+            !head.IsRepacked && head.dims.size() == 2 &&
+            ((prepareTp && head.cpuData) || (head.dataDevice == CUDA && head.cudaData)) &&
+            !head.multiDeviceData,
+            "MTP draft vocabulary requires a canonical Q8_0 or Q6_K head before TP sharding.");
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        const auto bytes = file ? file.tellg() : std::streampos(-1);
+        require(bytes > 0 && size_t(bytes) % sizeof(int32_t) == 0 &&
+            size_t(bytes) / sizeof(int32_t) <= size_t(head.dims[0]),
+            "Invalid MTP draft vocabulary file; expected little-endian int32 token ids.");
+        std::vector<int32_t> ids(size_t(bytes) / sizeof(int32_t));
+        file.seekg(0);
+        file.read(reinterpret_cast<char *>(ids.data()), size_t(bytes));
+        require(bool(file), "Failed to read MTP draft vocabulary.");
+        std::vector<bool> seen(head.dims[0], false);
+        for (int id : ids) {
+            require(id >= 0 && id < head.dims[0] && !seen[id],
+                "MTP draft vocabulary contains an invalid or duplicate token id.");
+            seen[id] = true;
+        }
+        const size_t rowBytes = ggml_row_size(static_cast<ggml_type>(head.ggmlType), head.dims[1]);
+        require(head.GetBytes() == rowBytes * head.dims[0], "MTP head row layout mismatch.");
+        // Preserve the target head and its quantization exactly. This one-time
+        // copy selects vocabulary rows; verification still uses the full head.
+        std::vector<uint8_t> source;
+        const uint8_t *canonical = head.cpuData;
+        if (!canonical) {
+            source.resize(head.GetBytes());
+            FastllmCudaCopyFromDeviceToHost(source.data(), head.cudaData, source.size());
+            canonical = source.data();
+        }
+        auto prepare = [&](Qwen4ExpModel &model, int first, int end,
+                           const std::vector<int> &devices) {
+            auto &subset = model.mtpDraftSubsetHead;
+            subset.dataType = DATA_GGUF_FORMAT;
+            subset.ggmlType = head.ggmlType;
+            subset.isGGUFData = true;
+            subset.Resize({end - first, head.dims[1]});
+            subset.Allocate(false);
+            for (int row = first; row < end; ++row)
+                std::memcpy(subset.cpuData + size_t(row - first) * rowBytes,
+                    canonical + size_t(ids[row]) * rowBytes, rowBytes);
+            subset.name = head.name + ".mtp_draft_subset";
+            subset.weightType = WeightType::LINEAR;
+            subset.isModelWeight = true;
+            subset.ToDevice(CUDA, devices);
+            model.mtpDraftSubsetIds.assign(ids.begin() + first, ids.begin() + end);
+            model.mtpDraftSubsetOffset = first;
+            model.mtpDraftSubsetAttempted = true;
+        };
+        if (prepareTp) {
+            auto &tp = *threadTpState;
+            // Keep nonempty, 256-row-aligned shards for the TopK reduction.
+            // A tiny subset safely retains the full-vocabulary TP path.
+            if (ids.size() / 256 < tp.ranks.size()) {
+                for (auto &rank : tp.ranks) rank->mtpDraftSubsetAttempted = true;
+                mtpDraftSubsetAttempted = true;
+                std::fprintf(stderr, "[Qwen4-Exp MTP] draft vocabulary too small for TP; retaining full head.\n");
+                return;
+            }
+            Qwen4CudaDeviceGuard deviceGuard;
+            for (int rank = 0; rank < (int)tp.ranks.size(); ++rank) {
+                auto range = qwen4_tp::VocabRange(ids.size(), tp.ranks.size(), rank);
+                prepare(*tp.ranks[rank], range.first, range.second, {tp.devices[rank]});
+            }
+        } else {
+            prepare(*this, 0, ids.size(), head.dataDeviceIds);
+        }
+        mtpDraftSubsetAttempted = true;
+        std::fprintf(stderr, "[Qwen4-Exp MTP] draft vocabulary %zu/%d, %.2f MiB total, %zu rank(s); full target head retained.\n",
+            ids.size(), head.dims[0], ids.size() * rowBytes / 1048576.0,
+            prepareTp ? threadTpState->ranks.size() : size_t(1));
+#endif
     }
 
     void Qwen4ExpModel::PrepareMtpDraftLmHeadWeight() {
@@ -4628,7 +4746,8 @@ namespace fastllm {
                          std::vector<int>({cachedBlocks,
                                            this->indexerHeadDim})),
                     "Qwen4-Exp QSA compressed cache append is inconsistent.");
-                const bool reusableEmptyBlocks = threadTpRank >= 0 &&
+                const bool reusableEmptyBlocks = (threadTpRank >= 0 ||
+                    state.reusableGraphRequest) &&
                     blockCache != nullptr && sameDevice(*blockCache) &&
                     blockCache->dataType == DataType::FLOAT32 &&
                     blockCache->dims == std::vector<int>({0, this->indexerHeadDim}) &&
@@ -7247,7 +7366,8 @@ namespace fastllm {
         };
         if (prefixSegment) {
             const bool wasCaptured = prefixSegment->captured;
-            state.draftGraphState->RunPrefix(*prefixSegment, runPrefix);
+            state.draftGraphState->RunPrefix(*prefixSegment, runPrefix,
+                !state.attentionState.decodeGraphsFrozen);
             if (!wasCaptured && prefixSegment->captured) {
                 // Capturing this prefix reserves its temporary pool buffers.
                 // Warm the tail again with those reservations in place before
@@ -7329,15 +7449,29 @@ namespace fastllm {
 
         bool graphHostSampling = false;
 #ifdef USE_CUDA
-        graphHostSampling = draftGraphSegment != nullptr && threadTpRank < 0 &&
+        graphHostSampling = draftGraphSegment != nullptr &&
+            (threadTpRank < 0 || threadTpOwner->vocabSize > 0) &&
             !deviceSampling && topProbability != nullptr &&
             Qwen4PrepareDecodeGraphWorkspace(draftGraphSegment->greedyOutput,
-                DataType::FLOAT32, {2}, state.draftGraphState->device);
+                DataType::FLOAT32, {threadTpRank >= 0 ? 3 : 2}, state.draftGraphState->device);
 #endif
         const std::string mlpHyperPrefix =
             layerPrefix + "mlp_hyper_connection.";
         const std::string finalPrefix = "mtp.hyper_connection_mixer.";
         const bool graphAfterMoe = hybridDraftGraph && draftGraphSegment != nullptr;
+        // Subset proposal probabilities are normalized over that subset. The
+        // greedy target verifier remains authoritative. Sampled speculation and
+        // device-chained proposals keep the original full-vocabulary path.
+        const bool subsetEligible = (threadTpRank < 0 || !mtpDraftSubsetIds.empty()) && sampleToken &&
+            !state.sampleProposal && !deviceSampling;
+        if (subsetEligible) PrepareMtpDraftSubsetHead();
+        const bool useDraftSubset = subsetEligible && !mtpDraftSubsetIds.empty();
+        auto mapDraftToken = [&](int token) {
+            if (!useDraftSubset) return token;
+            AssertInFastLLM(token >= 0 && token < int(mtpDraftSubsetIds.size()),
+                "MTP draft vocabulary result is out of range.");
+            return mtpDraftSubsetIds[token];
+        };
         Data localAfterAttention, mlpNorm, mlpInput, localMlpInjection, localMlpOutput;
         Data &afterAttention = graphAfterMoe
             ? draftGraphSegment->tailHidden : localAfterAttention;
@@ -7378,12 +7512,12 @@ namespace fastllm {
                 return false;
             }
 
-            PrepareMtpDraftLmHeadWeight();
-            Data &draftLmHead = this->mtpDraftLmHeadReady
+            if (!useDraftSubset) PrepareMtpDraftLmHeadWeight();
+            Data &draftLmHead = useDraftSubset ? mtpDraftSubsetHead : this->mtpDraftLmHeadReady
                 ? this->mtpDraftLmHeadWeight
                 : this->weight["lm_head.weight"];
             Data *headInput = &sampleHidden;
-            if (this->mtpDraftLmHeadReady &&
+            if (!useDraftSubset && this->mtpDraftLmHeadReady &&
                 sampleHidden.dataType == DataType::FLOAT32) {
                 // The packed FP8 CUDA GEMV is specialized for FP16/BF16
                 // activations.  Its generic FP32 fallback materializes the
@@ -7470,12 +7604,25 @@ namespace fastllm {
                 }
             }
             if (graphHostSampling) {
+                if (FastllmCudaGraphIsCapturingFast() &&
+                    (FastllmCudaGetThreadError() || FastllmCudaGetGraphError())) return false;
                 TopK(logits, top, 1);
+                if (FastllmCudaGraphIsCapturingFast() &&
+                    (FastllmCudaGetThreadError() || FastllmCudaGetGraphError())) return false;
                 AssertInFastLLM(FastllmCudaQwen4TopProbabilityFromTopK(
                     (const float *)logits.cudaData,
                     (float *)draftGraphSegment->greedyOutput.cudaData,
                     logits.dims.back(), (const float *)top.cudaData),
                     "Qwen4-Exp draft confidence sampling failed.");
+                if (threadTpRank >= 0) {
+                    // Return id, local probability and maximum in one compact
+                    // readback. The same TopK and confidence kernels are part
+                    // of the draft graph; no second eager reduction is needed.
+                    AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                        (float *)draftGraphSegment->greedyOutput.cudaData + 2,
+                        (const float *)top.cudaData + 1, sizeof(float)),
+                        "Qwen4 TP draft maximum copy failed.");
+                }
                 return true;
             }
 #endif
@@ -7499,6 +7646,7 @@ namespace fastllm {
                 (uint64_t)(deviceSampling ? sampledTokenOffset + 1 : 0),
                 (uint64_t)(nextMultiHidden != nullptr),
                 (uint64_t)graphHostSampling,
+                (uint64_t)(useDraftSubset ? (uintptr_t)mtpDraftSubsetHead.cudaData : 0),
                 (uint64_t)projectedHidden.dataType,
                 projectedHidden.Count(0),
                 attentionOutput.Count(0),
@@ -7542,10 +7690,12 @@ namespace fastllm {
                     FastllmCudaClearThreadError();
                     FastllmCudaClearGraphError();
                 }
-                if (segment.disabled) {
+                if (segment.disabled || state.attentionState.decodeGraphsFrozen) {
                     postAttentionReady = runPostAttention();
                 } else if (!segment.warmed) {
                     FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+                    segment.allocationRequests.clear();
+                    FastllmCudaAllocationRecorder record(&segment.allocationRequests);
                     postAttentionReady = runPostAttention();
                     segment.warmed = true;
                     segment.disabled = !ThreadTpAllTrue(postAttentionReady &&
@@ -7558,6 +7708,12 @@ namespace fastllm {
                     bool recaptureWithoutParallelMarkers = false;
                     bool captureOk =
                         ThreadTpAllTrue(FastllmCudaGraphPrepareCaptureDevice());
+                    if (captureOk) {
+                        ForceDeviceSync();
+                        captureOk = ThreadTpAllTrue(!FastllmCudaGetThreadError());
+                        if (captureOk) captureOk = ThreadTpAllTrue(
+                            FastllmCudaReserveGraphWorkspace(segment.allocationRequests));
+                    }
                     if (captureOk) {
                         // The graph pool brackets all TP worker allocations;
                         // rank zero alone owns its begin/end and reservation.
@@ -7704,26 +7860,42 @@ namespace fastllm {
             return -1;
         }
         if (state.sampleProposal) return sampledProposalToken;
+        auto mergeDraftTop = [&](int localToken, float maximum, float probability) {
+            const int offset = useDraftSubset ? mtpDraftSubsetOffset :
+                qwen4_tp::VocabRange(threadTpOwner->vocabSize,
+                    threadTpOwner->devices.size(), threadTpRank).first;
+            return threadTpOwner->MergeDraftTop(threadTpRank,
+                useDraftSubset ? mapDraftToken(localToken) : localToken + offset,
+                localToken + offset, maximum, probability, topProbability);
+        };
 #ifdef USE_CUDA
         if (graphHostSampling) {
-            float sampled[2];
+            float sampled[3];
             FastllmCudaCopyFromDeviceToHost(sampled,
-                draftGraphSegment->greedyOutput.cudaData, sizeof(sampled));
+                draftGraphSegment->greedyOutput.cudaData,
+                (threadTpRank >= 0 ? 3 : 2) * sizeof(float));
+            if (threadTpRank >= 0)
+                return mergeDraftTop((int)(sampled[0] + 1e-3f), sampled[2], sampled[1]);
             *topProbability = sampled[1];
-            return (int)(sampled[0] + 1e-3f);
+            return mapDraftToken((int)(sampled[0] + 1e-3f));
         }
 #endif
         int tpToken;
-        if (threadTpOwner != nullptr && threadTpOwner->TrySampleLogits(
+        if (!useDraftSubset && threadTpOwner != nullptr && threadTpOwner->TrySampleLogits(
                 threadTpRank, logits, GenerationConfig(), 0, tpToken,
                 nullptr, topProbability)) {
             return tpToken;
         }
         TopK(logits, top, 1);
         top.ToDevice(DataDevice::CPU);
+        if (threadTpRank >= 0 && useDraftSubset) {
+            const float *values = reinterpret_cast<const float *>(top.cpuData);
+            return mergeDraftTop((int)(values[0] + 1e-3f), values[1],
+                topProbability ? Qwen4TopProbability(logits, values[1]) : 0.0f);
+        }
         if (topProbability != nullptr)
             *topProbability = Qwen4TopProbability(logits, reinterpret_cast<float *>(top.cpuData)[1]);
-        return (int)(reinterpret_cast<float *>(top.cpuData)[0] + 1e-3f);
+        return mapDraftToken((int)(reinterpret_cast<float *>(top.cpuData)[0] + 1e-3f));
     }
 
     bool Qwen4ExpModel::TryRunThreadTpPrefixCudaGraph(
@@ -7762,8 +7934,11 @@ namespace fastllm {
         }
 
         DecodeCudaGraphState *graphState;
+        bool captureFrozen = false;
         {
             std::lock_guard<std::mutex> guard(this->stateMutex);
+            const auto request = requestStates.find(&pastKeyValues[0].first);
+            captureFrozen = request != requestStates.end() && request->second.decodeGraphsFrozen;
             auto &backbone = this->decodeCudaGraphStates[&pastKeyValues[0].first];
             if (!backbone) backbone.reset(new DecodeCudaGraphState());
             if (!backbone->tpPrefix) backbone->tpPrefix.reset(new DecodeCudaGraphState());
@@ -7806,7 +7981,7 @@ namespace fastllm {
         auto &segment = graphState->segments[0];
         if (!segment.captured) {
             FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
-            if (!segment.warmed || segment.disabled) {
+            if (!segment.warmed || segment.disabled || captureFrozen) {
                 runBody();
                 segment.warmed = true;
                 segment.disabled = !ThreadTpAllTrue(
@@ -8815,7 +8990,221 @@ namespace fastllm {
                             &batchLogits)[0];
     }
 
+    void Qwen4ExpModel::ResetDecodeServingState(RequestState &state, bool freezeGraphs) {
+#ifdef USE_CUDA
+        Qwen4CudaDeviceGuard deviceGuard;
+#endif
+        RequestState fresh;
+        fresh.reusableGraphRequest = true;
+        fresh.decodeGraphsFrozen = freezeGraphs;
+        fresh.servingCache = state.servingCache;
+        fresh.indexerTailKeyTensors.swap(state.indexerTailKeyTensors);
+        fresh.indexerTailPositionTensors.swap(state.indexerTailPositionTensors);
+        fresh.indexerBlockKeyTensors.swap(state.indexerBlockKeyTensors);
+        fresh.indexerHostMirrorTransfers.swap(state.indexerHostMirrorTransfers);
+        for (auto *tensors : {&fresh.indexerTailKeyTensors,
+                              &fresh.indexerTailPositionTensors,
+                              &fresh.indexerBlockKeyTensors}) {
+            for (auto &item : *tensors) {
+                if (item.second && !item.second->dims.empty()) {
+                    auto dims = item.second->dims;
+                    dims[0] = 0;
+                    item.second->Resize(dims);
+                }
+            }
+        }
+        for (auto &item : fresh.indexerHostMirrorTransfers) {
+#ifdef USE_CUDA
+            if (item.second) {
+                item.second->MarkDeviceSynchronized();
+                item.second->Rollback(0);
+            }
+#endif
+        }
+        fresh.mtpState = std::move(state.mtpState);
+        if (fresh.mtpState) {
+            auto &mtp = *fresh.mtpState;
+            ResetDecodeServingState(mtp.attentionState, freezeGraphs);
+            for (Data *tensor : {&mtp.key, &mtp.value}) {
+#ifdef USE_CUDA
+                if (!tensor->dataDeviceIds.empty()) FastllmCudaSetDevice(tensor->dataDeviceIds.front());
+#endif
+                if (!tensor->dims.empty()) Qwen4ResizeKVCache(*tensor, 0);
+            }
+            mtp.proposals.clear();
+            mtp.pendingOutputTokens.clear();
+            mtp.proposalCount = 0;
+            mtp.sampleProposal = false;
+            mtp.proposalTemperature = 1.0f;
+            mtp.deferredPosition = -1;
+            mtp.hasDeferredTargetHidden = false;
+            mtp.targetCheckpointPrepared = false;
+            // Keep checkpoint allocations and graph inputs at their captured
+            // addresses. The first new checkpoint overwrites their contents.
+        }
+        state = std::move(fresh);
+    }
+
+    void Qwen4ExpModel::ReleaseDecodeServingSlot(
+            std::unique_ptr<DecodeServingSlot> &slot) {
+        if (!slot) return;
+#ifdef USE_CUDA
+        Qwen4CudaDeviceGuard deviceGuard;
+        for (int device : slot->devices) {
+            FastllmCudaSetDevice(device);
+            ForceDeviceSync();
+        }
+#endif
+        if (!slot->cache.empty()) {
+            std::lock_guard<std::mutex> guard(stateMutex);
+            const Data *key = &slot->cache.front().first;
+            decodeCudaGraphStates.erase(key);
+            requestStates.erase(key);
+        }
+        slot.reset();
+    }
+
+    void Qwen4ExpModel::RemoveDecodeServingRequest(const Data *key, bool reusable) {
+        std::lock_guard<std::mutex> guard(decodeServingMutex);
+        auto found = decodeServingSlots.find(key);
+        if (found == decodeServingSlots.end()) return;
+        auto &slot = found->second;
+        if (!slot) {
+            decodeServingSlots.erase(found);
+            return;
+        }
+        if (reusable && !slot->failed && decodeServingSlots.size() == 1) {
+#ifdef USE_CUDA
+            Qwen4CudaDeviceGuard deviceGuard;
+            for (int device : slot->devices) {
+                FastllmCudaSetDevice(device);
+                ForceDeviceSync();
+            }
+#endif
+            // The scheduler checks free pages before calling ForwardBatch.
+            // Release logical KV occupancy now, while keeping page tables and
+            // graph-owned storage alive; an idle long request must not block
+            // admission of the next request into this same bounded pool.
+            {
+                std::lock_guard<std::mutex> stateGuard(stateMutex);
+                ResetDecodeServingState(requestStates[&slot->cache.front().first], true);
+            }
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                if (IsLinearAttentionLayer(layer)) continue;
+                for (Data *tensor : {&slot->cache[layer].first, &slot->cache[layer].second}) {
+#ifdef USE_CUDA
+                    if (!tensor->dataDeviceIds.empty()) FastllmCudaSetDevice(tensor->dataDeviceIds.front());
+#endif
+                    if (!tensor->dims.empty()) Qwen4ResizeKVCache(*tensor, 0);
+                }
+            }
+            ReleaseDecodeServingSlot(idleDecodeServingSlot);
+            idleDecodeServingSlot = std::move(slot);
+        } else ReleaseDecodeServingSlot(slot);
+        decodeServingSlots.erase(found);
+    }
+
     std::vector<int> Qwen4ExpModel::ForwardBatch(
+            int batch, const Data &inputIds, const Data &attentionMask,
+            const Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+            std::vector<std::vector<float> *> *retLogits) {
+        AssertInFastLLM(batch == 1 && inputIds.dims.size() == 2 &&
+                        inputIds.dims[0] == 1,
+                        "Qwen4-Exp currently runs one request per Forward call.");
+        AssertInFastLLM((int)pastKeyValues.size() >= this->block_cnt,
+                        "Qwen4-Exp received too few cache slots.");
+        std::vector<int> result;
+        WithDecodeServingCache(pastKeyValues, [&](auto &cache) {
+            result = ForwardBatchInternal(batch, inputIds, attentionMask, positionIds,
+                cache, generationConfig, lastTokens, retLogits);
+            return true;
+        });
+        return result;
+    }
+
+    bool Qwen4ExpModel::WithDecodeServingCache(
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const std::function<bool(std::vector<std::pair<Data, Data>> &)> &forward) {
+#ifdef USE_CUDA
+        bool reusable = false;
+        if (!pastKeyValues.empty() && threadTpRank < 0 && !threadTpState) {
+            std::lock_guard<std::mutex> guard(stateMutex);
+            const auto state = requestStates.find(&pastKeyValues.front().first);
+            reusable = state != requestStates.end() && state->second.reusableGraphRequest;
+        }
+        if (reusable) {
+            std::lock_guard<std::mutex> guard(decodeServingMutex);
+            const Data *requestKey = &pastKeyValues.front().first;
+            auto &slot = decodeServingSlots[requestKey];
+            try {
+                if (!slot) {
+                    const bool reused = idleDecodeServingSlot != nullptr;
+                    slot = std::move(idleDecodeServingSlot);
+                    if (!slot) {
+                        slot = std::make_unique<DecodeServingSlot>();
+                        slot->cache.reserve(block_cnt);
+                        for (int layer = 0; layer < block_cnt; ++layer) {
+                            slot->cache.emplace_back(Data(pastKeyValues[layer].first.dataType),
+                                                     Data(pastKeyValues[layer].second.dataType));
+                        }
+                        std::set<int> devices;
+                        for (const auto &layer : servingCache->layers)
+                            for (const auto &pool : {layer.first, layer.second})
+                                if (pool) devices.insert(pool->dataDeviceIds.front());
+                        if (servingCache->mtp.first)
+                            devices.insert(servingCache->mtp.first->dataDeviceIds.front());
+                        slot->devices.assign(devices.begin(), devices.end());
+                    }
+                    Qwen4CudaDeviceGuard deviceGuard;
+                    for (int device : slot->devices) {
+                        FastllmCudaSetDevice(device);
+                        if (reused) ForceDeviceSync();
+                    }
+                    {
+                        std::lock_guard<std::mutex> stateGuard(stateMutex);
+                        ResetDecodeServingState(requestStates[&slot->cache.front().first], reused);
+                    }
+                    for (int layer = 0; reused && layer < block_cnt; ++layer) {
+                        for (Data *tensor : {&slot->cache[layer].first, &slot->cache[layer].second}) {
+                            if (!tensor->dataDeviceIds.empty()) FastllmCudaSetDevice(tensor->dataDeviceIds.front());
+                            if (IsLinearAttentionLayer(layer)) tensor->Allocate(0.0f);
+                            else if (!tensor->dims.empty()) Qwen4ResizeKVCache(*tensor, 0);
+                        }
+                    }
+                }
+                if (!forward(slot->cache)) return false;
+                for (int device : slot->devices) {
+                    FastllmCudaSetDevice(device);
+                    FastllmCudaSyncCurrentThreadStream();
+                }
+                // The scheduler sees metadata only; the slot owns all page
+                // references and stable addresses until release or reuse.
+                for (int layer = 0; layer < block_cnt; ++layer) {
+                    const bool linear = IsLinearAttentionLayer(layer);
+                    AssertInFastLLM(Qwen4BorrowCudaTensor(slot->cache[layer].first,
+                        pastKeyValues[layer].first, linear, false) &&
+                        Qwen4BorrowCudaTensor(slot->cache[layer].second,
+                        pastKeyValues[layer].second, linear, false),
+                        "Qwen4 reusable graph slot cannot publish cache metadata.");
+                }
+                return true;
+            } catch (...) {
+                if (slot) slot->failed = true;
+                throw;
+            }
+        }
+        // An incompatible request must be able to use the bounded KV pool.
+        // Its first forward retires the idle slot's fixed linear references.
+        if (!threadTpState && threadTpRank < 0) {
+            std::lock_guard<std::mutex> guard(decodeServingMutex);
+            ReleaseDecodeServingSlot(idleDecodeServingSlot);
+        }
+#endif
+        return forward(pastKeyValues);
+    }
+
+    std::vector<int> Qwen4ExpModel::ForwardBatchInternal(
             int batch,
             const Data &inputIds,
             const Data &attentionMask,
@@ -10502,6 +10891,19 @@ namespace fastllm {
                 auto &state = this->requestStates[&context->pastKeyValues[0].first];
                 state = RequestState();
                 state.hasMultimodalInput = !context->multimodalInput.empty();
+#ifdef USE_CUDA
+                // One text-only serving slot owns fixed KV across all PP stages.
+                // TP owns equivalent slots in its rank workers. Prefix restores
+                // and short-context attention retain their established path.
+                state.reusableGraphRequest = GetFastllmEnv().cudaGraph && !autoWarmupRunning.load() &&
+                    !threadTpState && threadTpRank < 0 && maxBatch == 1 &&
+                    servingCache &&
+                    Qwen4CudaOnlyDeviceMap(deviceMap) && !GetKVCacheInCPU() &&
+                    !saveHistoryChat && !Qwen4PrefixCacheEnabled() &&
+                    !state.hasMultimodalInput && context->cacheLen == 0 &&
+                    context->generationConfig.IsSimpleGreedy() &&
+                    (int)context->allTokens.size() >= indexerBudget;
+#endif
             }
         }
     }
@@ -10510,9 +10912,13 @@ namespace fastllm {
         if (context == nullptr) {
             return;
         }
+        if (!context->pastKeyValues.empty())
+            RemoveDecodeServingRequest(&context->pastKeyValues.front().first,
+                !context->isAbort && context->error == ResponseContextErrorNone);
         std::lock_guard<std::mutex> guard(this->stateMutex);
         if (!context->pastKeyValues.empty()) {
-            RemoveThreadTpRequest(&context->pastKeyValues[0].first);
+            RemoveThreadTpRequest(&context->pastKeyValues[0].first,
+                !context->isAbort && context->error == ResponseContextErrorNone);
             this->decodeCudaGraphStates.erase(
                 &context->pastKeyValues[0].first);
             this->requestStates.erase(&context->pastKeyValues[0].first);

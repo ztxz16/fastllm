@@ -1,6 +1,7 @@
 #include "cuda_gguf_data_test.cuh"
 #include "models/qwen4_tp_sampling.h"
 #include <limits>
+#include <memory>
 #include <random>
 
 static double maxError = 0, maxOldError = 0;
@@ -50,6 +51,87 @@ static void CheckGraphReplay() {
     Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
 
 }
+static void CheckShardedDraftGraph(int devices) {
+    // Match a real, uneven draft subset. Its row order differs from token IDs;
+    // TP must preserve monolithic TopK tie order while mapping back to tokens.
+    constexpr int n = 106299, ranks = 2;
+    struct Shard {
+        int device, first, end;
+        Data logits, top, result;
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        Shard(int device, int first, int end)
+            : device(device), first(first), end(end), logits(FLOAT32, {1, end-first}),
+              top(FLOAT32, {1, 2}), result(FLOAT32, {3}) {}
+    };
+    std::vector<std::unique_ptr<Shard>> shards;
+    for (int rank = 0; rank < ranks; ++rank) {
+        auto range = qwen4_tp::VocabRange(n, ranks, rank);
+        auto s = std::make_unique<Shard>(rank % devices, range.first, range.second);
+        Cuda(cudaSetDevice(s->device)); FastllmCudaSetDevice(s->device);
+        for (Data *d : {&s->logits, &s->top, &s->result}) {
+            d->dataDevice=DataDevice::CUDA;
+            d->dataDeviceIds={s->device};
+            d->Allocate();
+        }
+        Upload(s->logits, std::vector<float>(s->end-s->first, 0));
+        auto run = [&] {
+            Check(FastllmCudaTopK(s->logits, s->top, 1), "draft local TopK rejected");
+            Check(FastllmCudaQwen4TopProbabilityFromTopK((float *)s->logits.cudaData,
+                (float *)s->result.cudaData, s->end-s->first, (float *)s->top.cudaData),
+                "draft compact confidence rejected");
+            Check(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                (float *)s->result.cudaData+2, (float *)s->top.cudaData+1, sizeof(float)),
+                "draft compact maximum rejected");
+        };
+        run(); Cuda(cudaDeviceSynchronize());
+        Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        run(); Cuda(cudaStreamEndCapture(cudaStreamPerThread, &s->graph));
+        Cuda(cudaGraphInstantiate(&s->exec, s->graph, nullptr, nullptr, 0));
+        shards.push_back(std::move(s));
+    }
+    std::mt19937 random(8105);
+    std::uniform_real_distribution<float> dist(-16, -1);
+    for (int turn = 0; turn < 8; ++turn) {
+        std::vector<float> values(n);
+        for (float &v : values) v = turn == 0 ? 0 : dist(random);
+        if (turn) {
+            values[turn % 2 ? n-1 : 128] = turn == 7 ? 12 : 2;
+            if (turn == 3) values[1] = values[shards[1]->first+128] = 2;
+        }
+        std::vector<std::pair<float,float>> probabilities;
+        int best = -1; float maximum = -std::numeric_limits<float>::infinity();
+        for (auto &s : shards) {
+            Cuda(cudaSetDevice(s->device)); FastllmCudaSetDevice(s->device);
+            Upload(s->logits, std::vector<float>(values.begin()+s->first, values.begin()+s->end));
+            Cuda(cudaGraphLaunch(s->exec, cudaStreamPerThread));
+            Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+            float compact[3];
+            Cuda(cudaMemcpy(compact, s->result.cudaData, sizeof(compact), cudaMemcpyDeviceToHost));
+            int row = int(compact[0]+1e-3f) + s->first;
+            Check(row >= s->first && row < s->end && compact[2] == values[row],
+                "draft tuple has a stale row or maximum");
+            probabilities.push_back({compact[2],compact[1]});
+            if (best < 0 || qwen4_tp::Top1Before(row,compact[2],best,maximum)) {
+                best=row; maximum=compact[2];
+            }
+        }
+        Cuda(cudaSetDevice(0)); FastllmCudaSetDevice(0);
+        Data full(FLOAT32,{1,n}), top(FLOAT32,{1,2}); Allocate(full); Allocate(top); Upload(full,values);
+        Check(FastllmCudaTopK(full,top,1),"reference subset TopK rejected");
+        float expected[2]; Cuda(cudaMemcpy(expected,top.cudaData,sizeof(expected),cudaMemcpyDeviceToHost));
+        Check(best == int(expected[0]+1e-3f),"sharded draft changes subset TopK tie order");
+        double denominator=0;
+        for(float v:values) denominator+=std::exp(double(v)-expected[1]);
+        Check(std::abs(qwen4_tp::MergeTopProbability(probabilities)-1/denominator)<2e-7,
+            "compact draft confidence differs from full subset softmax");
+    }
+    for(auto &s:shards) {
+        Cuda(cudaSetDevice(s->device)); FastllmCudaSetDevice(s->device);
+        Cuda(cudaGraphExecDestroy(s->exec)); Cuda(cudaGraphDestroy(s->graph));
+    }
+    std::cout << "PASS sharded draft compact Graph sampling and subset row ties\n";
+}
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) { std::cout << "SKIP no CUDA device\n"; return 77; }
@@ -78,6 +160,7 @@ int main() {
         Check(std::abs(qwen4_tp::MergeTopProbability({{ma, pa}, {mb, pb}}) - CheckRow(a)) < 2e-7, "TP merge mismatch");
         Check(!FastllmCudaQwen4TopProbability(nullptr, nullptr, 0, 0), "invalid arguments accepted");
         CheckGraphReplay();
+        CheckShardedDraftGraph(devices);
         std::cout << "PASS MTP confidence cases=" << cases << " max_fp64_error=" << maxError << " max_old_error=" << maxOldError << '\n';
     } catch (const std::exception &e) { std::cerr << e.what() << '\n'; return 1; }
 }

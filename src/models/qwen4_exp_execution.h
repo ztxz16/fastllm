@@ -6,6 +6,7 @@ namespace fastllm {
     extern thread_local bool qwen4MtpDecodeEquivalentTarget;
     extern thread_local bool qwen4ThreadTpExecution;
     int Qwen4MtpDraftsPerStep();
+    bool Qwen4PrefixCacheEnabled();
     bool Qwen4StartsWith(const std::string &value, const std::string &prefix);
     bool Qwen4EndsWith(const std::string &value, const std::string &suffix);
     bool Qwen4CudaOnlyDeviceMap(const std::map<std::string, int> &deviceMap);

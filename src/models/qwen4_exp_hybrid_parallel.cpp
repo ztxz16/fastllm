@@ -107,7 +107,7 @@ namespace fastllm {
             new HybridPeerState::CallerAffinity(bind ? model.hybridPeer.get() : nullptr));
 #endif
         if (!mtpIteration && model.executionMode == ExecutionMode::Hybrid &&
-            model.threadTpRank < 0 && Qwen4MtpDraftsPerStep() == 0 && inputIds.dims[1] == 1 &&
+            model.threadTpRank < 0 && inputIds.dims[1] == 1 &&
             Qwen4CudaOnlyDeviceMap(model.deviceMap) && !model.weights.empty() &&
             !model.weights[0].empty()) {
             decodeStep.Begin(model.weights[0].data(), model.weights[0].size(),

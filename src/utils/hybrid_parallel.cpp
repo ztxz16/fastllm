@@ -124,6 +124,18 @@ bool HybridMoePeerRuntime::Run(int layer, const Data &input, const Data &index,
             } restore{previous, FastllmCudaGraphSetManagedCaptureOnly(true)};
             FastllmCudaSetDevice(target);
             if (worker != 0) {
+                // A stream wait cannot protect storage freed by host-side
+                // reallocation. Fence only calls that may replace peer buffers.
+                const uint64_t required = uint64_t(FASTLLM_CUDA_MOE_CACHE_MAX_BATCH) * input.dims[1];
+                auto needsStorage = [&](const Data &data, DataType type) {
+                    return !data.cudaData || data.dataDevice != CUDA ||
+                        data.dataDeviceIds.size() != 1 || data.dataDeviceIds[0] != target ||
+                        data.dataType != type || data.expansionSize < required;
+                };
+                if (needsStorage(peerOutput[peer], FLOAT32) ||
+                    (!borrowInput && needsStorage(peerInput[peer], input.dataType)))
+                    FastllmCudaEventSynchronize(ready[owner]);
+                FastllmCudaCurrentThreadStreamWaitEvent(ready[owner]);
                 // Dense graph variants retain this peer output across changing
                 // verifier lengths. Its allocation must not grow on a later row.
                 prepare(peerOutput[peer], target, FLOAT32);
@@ -134,7 +146,6 @@ bool HybridMoePeerRuntime::Run(int layer, const Data &input, const Data &index,
                 static thread_local std::unique_ptr<Executor> executor(new Executor());
                 executor->SetFirstDevice("cuda:" + std::to_string(target));
                 SetCurrentThreadExecutor(executor.get());
-                FastllmCudaCurrentThreadStreamWaitEvent(ready[owner]);
                 if (!borrowInput && !FastllmCudaMemcpyPeerAsyncCurrentThread(
                                         target, peerInput[peer].cudaData, device,
                                         input.cudaData, input.GetBytes())) {

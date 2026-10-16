@@ -1032,3 +1032,103 @@ Logical route counters count each expert invocation once.
 slots, occupied local slots, local payload bytes, locally computed cache-hit
 routes and cumulative whole-expert upload bytes. Hit routes can be summed across
 GPUs; the per-device totals need not match.
+
+### Qwen4 hybrid MTP graph capture
+
+By default, single-GPU Qwen3.8-Flash-Next hybrid MTP owns graph segments
+per request and verifier length. Workspace reservation is always enabled: the
+eager warmup records pooled allocation sizes, then capture reserves sufficient
+blocks outside capture before returning them to the graph pool. This avoids
+relying on warmup scratch that another graph has since pinned. Capacity failure
+falls back to eager execution. Reservation can increase temporary VRAM use; it
+does not change the configured expert-cache budget.
+
+The default limit remains one new segment per stage invocation. Short verifier
+lengths may not finish capturing during a 1024-token response. Set the generic
+capture budget to front-load more shapes during warmup:
+
+```bash
+export FASTLLM_CUDA_GRAPH_CAPTURE_BUDGET=8
+```
+
+The capture budget is clamped to 1–128. TP honors it for the first compatible
+graph-reuse request; ordinary short-context or internal warmup requests retain
+the one-segment limit. A reusable TP request defaults to eight if the variable
+is unset. TP records allocation demand per rank and reserves each device's
+workspace before all ranks enter capture. Larger values front-load capture work
+into warmup and are not necessarily faster. Expert routing, weights, MTP
+acceptance rules and the per-layer CPU/GPU synchronization are unchanged.
+
+Validation should include complete generation and repeated timings without a
+GPU profiler. CUDA Graph node tracing materially changes launch overhead and
+should be used to inspect submission patterns, not to report production TPS.
+
+### Reusing Qwen4 graphs between serving requests
+
+For a single CUDA device, CUDA layer PP, or CUDA TP with MTP, graph-slot
+reuse is enabled automatically for compatible requests. Use `--max_batch 1`,
+fixed startup KV reservation, greedy text generation, and disabled
+history/prefix caching. Set `FASTLLM_CUDA_GRAPH_CAPTURE_BUDGET` when the warmup
+should capture more verifier lengths up front.
+
+The first compatible request is the capture warmup. Run a representative full
+request before timing or accepting production traffic so ordinary decode and
+all required MTP verifier lengths have time to warm and capture. For the
+16K-input/1K-output benchmark, use that complete shape as the warmup. This does
+not capture every possible shape during model construction.
+
+One model-owned serving slot (one cache per rank for TP) keeps the target/draft graphs, KV page tables,
+linear-attention state allocations, QSA buffers and MTP checkpoint storage at
+stable addresses. Finishing a successful request retains that slot and releases its logical KV
+page references before the scheduler admits another request. Reusing it
+clears token history, logical KV/QSA lengths, recurrent state and pending draft
+outputs without moving captured storage. The existing pointer, dtype, shape
+and capacity checks still guard replay.
+
+After the first compatible request, target and draft capture are frozen for
+that slot. Captured variants replay; unseen or invalidated variants run eager
+without capturing during later requests. A too-short warmup can therefore
+leave variants eager until the slot is retired and warmed again.
+
+This implementation only reuses prompts at least as long as the QSA
+indexer budget. Multimodal input, non-greedy generation, prefix/history
+restore and short-context requests keep their existing paths. Target-only TP
+keeps its existing cache-reuse behavior. An incompatible
+request retires the idle slot before using the bounded KV pool. Cancellation,
+request errors or forward exceptions discard the slot. The next compatible
+request then starts a new warmup. At most one completed slot is retained;
+its graph/workspace memory stays allocated between requests and must fit
+alongside the configured expert cache and KV reservation.
+
+`qwen4_gguf_test --graph-slot-reset` validates history reset, freeze
+propagation and stable QSA/MTP checkpoint storage on the same or different CUDA
+devices. PP synchronizes every participating device before resetting shared
+request state; TP resets each rank’s target and draft state and returns its
+logical KV pages before the next admission.
+
+For PP with MTP, explicitly select CPU embedding before creating the model
+(`ftllm.llm.set_cuda_embedding(False)`). Otherwise Graph mode defaults to CUDA
+embedding, and the target’s first stage and the draft’s last stage can move
+the same full embedding weight between GPUs. This is separate from expert
+cache residency and from graph-slot reuse.
+
+### Qwen4 TP MTP draft placement and sampling
+
+TP MTP expert shards are kept resident on each rank’s GPU, outside the
+target’s bounded expert cache. Target experts retain their CPU/NUMA policy.
+The draft’s GPU weights and workspaces still count against the total device
+memory budget.
+
+For a canonical Q8_0 or Q6_K head, `FASTLLM_MTP_DRAFT_VOCAB` selects draft-only
+vocabulary rows before the target head is split. The selected rows are then
+partitioned across TP ranks with 256-row-aligned boundaries. Token mapping and
+TopK tie ordering use the original subset-row positions. A subset too small
+to give every rank an aligned shard retains the full-vocabulary TP path.
+The target head and greedy verification always keep the full vocabulary;
+sampled or device-chained proposals retain their existing full-head paths.
+
+The draft Graph includes local TopK and confidence reduction. Each rank reads
+back one compact tuple containing its row ID, local top probability and maximum
+logit. The host merges candidates and reconstructs the global subset softmax
+denominator without gathering full logits. Reuse and freeze rules above also
+apply to these draft graphs.

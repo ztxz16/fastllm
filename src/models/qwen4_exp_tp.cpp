@@ -121,7 +121,8 @@ namespace fastllm {
         if (!threadTpState || threadTpRank >= 0)
             return -1;
         if (Qwen4StartsWith(name, kQwen4MtpExpertPrefix)) {
-            return threadTpState->hybrid.hostMoeLayers.back() ? -1 : block_cnt;
+            return threadTpState->hybrid.hostMoeLayers.back() && !threadTpState->mtpGpuExperts
+                ? -1 : block_cnt;
         }
         const std::string prefix = languagePrefix + "layers.";
         if (!Qwen4StartsWith(name, prefix))
@@ -293,6 +294,9 @@ namespace fastllm {
         threadTpState.reset(new ThreadTpState());
         threadTpState->devices = std::move(devices);
         threadTpState->hybrid.Init(*this, threadTpState->devices);
+#ifndef USE_ROCM
+        threadTpState->mtpGpuExperts = Qwen4MtpDraftsPerStep() > 0;
+#endif
 #endif
     }
 
@@ -311,6 +315,8 @@ namespace fastllm {
         PrepareWeights();
         tp.hybrid.workerCpus = HybridWorkerCpuSets(devices);
         tp.votes.resize(count);
+        tp.draftCandidates.resize(count);
+        tp.topProbabilities.resize(count);
         AssertInFastLLM(FastllmInitNccl(devices), "Qwen4 TP NCCL initialization failed.");
         for (int device : devices) {
             FastllmCudaSetDevice(device);
@@ -380,7 +386,7 @@ namespace fastllm {
                 model->mtpWeightsStatus.store(mtpWeightsStatus.load());
                 model->mtpMoeWeights.assign(2 + 2 * num_experts, nullptr);
                 model->mtpMoeBiass = model->mtpMoeWeights;
-                if (tp.hybrid.hostMoeLayers.back()) {
+                if (tp.hybrid.hostMoeLayers.back() && !tp.mtpGpuExperts) {
                     model->mtpMoeWeights = mtpMoeWeights;
                     model->mtpMoeBiass = mtpMoeBiass;
                 } else {
@@ -429,11 +435,10 @@ namespace fastllm {
                 continue;
             const bool expertWeight = name.find(".mlp.experts.") != std::string::npos;
             const bool mtpExpert = expertWeight && name.rfind("mtp.", 0) == 0;
-            const int expertLayer =
-                expertWeight ? (mtpExpert ? block_cnt - 1
-                                          : std::atoi(name.c_str() + name.find("layers.") + 7))
-                             : -1;
-            if (expertWeight && tp.hybrid.hostMoeLayers.at(expertLayer)) {
+            const int expertLayer = expertWeight ? (mtpExpert ? block_cnt - 1 :
+                std::atoi(name.c_str() + name.find("layers.") + 7)) : -1;
+            if (expertWeight && tp.hybrid.hostMoeLayers.at(expertLayer) &&
+                !(mtpExpert && tp.mtpGpuExperts)) {
                 // Keep the original host layout and NUMA weight registrations.
                 continue;
             }
@@ -472,6 +477,10 @@ namespace fastllm {
                 tp.topCandidates.resize(count);
                 tp.topProbabilities.resize(count);
                 tp.shardLogits.resize(count);
+                // Select the draft rows while the canonical full target head
+                // is still available. Partition by subset row, preserving
+                // TopK lane order and balancing even a skewed token list.
+                if (Qwen4MtpDraftsPerStep() > 0) PrepareMtpDraftSubsetHead();
                 for (int r = 0; r < count; ++r) {
                     scheme[devices[r]] = {qwen4_tp::VocabRange(tp.vocabSize, count, r)};
                 }
@@ -775,9 +784,16 @@ namespace fastllm {
             // Fresh TP requests can reuse storage without reusing contents.
             // Host experts cannot enter a whole CUDA graph, but their KV and
             // pinned QSA buffers have the same reusable lifetime.
-            const bool reusable =
-                Qwen4MtpDraftsPerStep() == 0 && batch == 1 &&
-                (GetFastllmEnv().cudaGraph || tp.hybrid.hostMoe) &&
+            const bool reuseMtpGraphs = Qwen4MtpDraftsPerStep() > 0 &&
+                GetFastllmEnv().cudaGraph &&
+                !autoWarmupRunning.load() && maxBatch == 1 &&
+                !GetKVCacheInCPU() && !saveHistoryChat && !Qwen4PrefixCacheEnabled() &&
+                !hasMultimodalInput && generationConfig.IsSimpleGreedy() &&
+                generationConfig.input_token_length >= indexerBudget &&
+                std::all_of(tp.ranks.begin(), tp.ranks.end(),
+                    [](const auto &rank) { return rank->servingCache != nullptr; });
+            const bool reusable = (Qwen4MtpDraftsPerStep() == 0 || reuseMtpGraphs) &&
+                batch == 1 && (GetFastllmEnv().cudaGraph || tp.hybrid.hostMoe) &&
                 Qwen4TpDecodeFitsCapacityClass(generationConfig, indexerBudget) &&
                 std::all_of(pastKeyValues.begin(), pastKeyValues.end(),
                             [](const std::pair<Data, Data> &kv) {
@@ -805,6 +821,7 @@ namespace fastllm {
             } else {
                 entry = std::make_unique<ThreadTpState::RequestCache>();
                 entry->ownsRankZero = reusable;
+                entry->reuseMtpGraphs = reusable && reuseMtpGraphs;
                 entry->ranks.resize(tp.devices.size());
                 for (size_t r = reusable ? 0 : 1; r < tp.devices.size(); ++r) {
                     entry->ranks[r].resize(block_cnt);
@@ -868,29 +885,33 @@ namespace fastllm {
                     // Preserve only reusable storage, after the previous worker's
                     // stream has completed, so captured addresses stay valid.
                     auto &state = model.requestStates[&cache.front().first];
-                    RequestState fresh;
-                    fresh.indexerTailKeyTensors.swap(state.indexerTailKeyTensors);
-                    fresh.indexerTailPositionTensors.swap(state.indexerTailPositionTensors);
-                    fresh.indexerBlockKeyTensors.swap(state.indexerBlockKeyTensors);
-                    fresh.indexerHostMirrorTransfers.swap(state.indexerHostMirrorTransfers);
-                    for (auto *tensors :
-                         {&fresh.indexerTailKeyTensors, &fresh.indexerTailPositionTensors,
-                          &fresh.indexerBlockKeyTensors}) {
-                        for (auto &item : *tensors) {
-                            if (item.second && !item.second->dims.empty()) {
-                                auto dims = item.second->dims;
-                                dims[0] = 0;
-                                item.second->Resize(dims);
+                    if (entry->reuseMtpGraphs) {
+                        model.ResetDecodeServingState(state, true);
+                    } else {
+                        RequestState fresh;
+                        fresh.indexerTailKeyTensors.swap(state.indexerTailKeyTensors);
+                        fresh.indexerTailPositionTensors.swap(state.indexerTailPositionTensors);
+                        fresh.indexerBlockKeyTensors.swap(state.indexerBlockKeyTensors);
+                        fresh.indexerHostMirrorTransfers.swap(state.indexerHostMirrorTransfers);
+                        for (auto *tensors : {&fresh.indexerTailKeyTensors,
+                                              &fresh.indexerTailPositionTensors,
+                                              &fresh.indexerBlockKeyTensors}) {
+                            for (auto &item : *tensors) {
+                                if (item.second && !item.second->dims.empty()) {
+                                    auto dims = item.second->dims;
+                                    dims[0] = 0;
+                                    item.second->Resize(dims);
+                                }
                             }
                         }
-                    }
-                    for (auto &item : fresh.indexerHostMirrorTransfers) {
-                        if (item.second) {
-                            item.second->MarkDeviceSynchronized();
-                            item.second->Rollback(0);
+                        for (auto &item : fresh.indexerHostMirrorTransfers) {
+                            if (item.second) {
+                                item.second->MarkDeviceSynchronized();
+                                item.second->Rollback(0);
+                            }
                         }
+                        state = std::move(fresh);
                     }
-                    state = std::move(fresh);
                     for (int layer = 0; layer < block_cnt; ++layer) {
                         for (Data *tensor : {&cache[layer].first, &cache[layer].second}) {
                             if (model.IsLinearAttentionLayer(layer)) {
@@ -900,6 +921,9 @@ namespace fastllm {
                             }
                         }
                     }
+                }
+                if (entry->reuseMtpGraphs) {
+                    model.requestStates[&cache.front().first].reusableGraphRequest = true;
                 }
                 if (hasMultimodalInput) {
                     model.requestStates[&cache.front().first].hasMultimodalInput = true;
@@ -951,7 +975,7 @@ namespace fastllm {
 #endif
     }
 
-    void Qwen4ExpModel::RemoveThreadTpRequest(const Data *key) {
+    void Qwen4ExpModel::RemoveThreadTpRequest(const Data *key, bool completed) {
         if (!threadTpState)
             return;
         ThreadTpState &tp = *threadTpState;
@@ -963,13 +987,36 @@ namespace fastllm {
         // Admission of another request takes priority over an idle graph.
         // Retaining a completed long-context slot during a peer's prefill
         // would otherwise pin its large KV and graph allocations unnecessarily.
-        bool reusable = tp.caches.size() == 1 && cache->ownsRankZero && !cache->failed;
-        for (size_t r = 0; reusable && !tp.hybrid.hostMoe && r < tp.ranks.size(); ++r) {
+        bool reusable = completed && tp.caches.size() == 1 &&
+            cache->ownsRankZero && !cache->failed;
+        for (size_t r = 0; reusable && !cache->reuseMtpGraphs && !tp.hybrid.hostMoe && r < tp.ranks.size(); ++r) {
             const auto &graphs = tp.ranks[r]->decodeCudaGraphStates;
             auto graph = graphs.find(&cache->ranks[r].front().first);
             reusable = graph != graphs.end() && graph->second && graph->second->wholeGraphMode &&
                        std::any_of(graph->second->segments.begin(), graph->second->segments.end(),
-                                   [](const auto &segment) { return segment.second.captured; });
+                    [](const auto &segment) { return segment.second.captured; });
+        }
+        if (cache->reuseMtpGraphs) {
+#ifdef USE_CUDA
+            Qwen4CudaDeviceGuard deviceGuard;
+            for (size_t r = 0; r < tp.ranks.size(); ++r) {
+                FastllmCudaSetDevice(tp.devices[r]);
+                ForceDeviceSync();
+                auto &model = *tp.ranks[r];
+                auto &local = cache->ranks[r];
+                const Data *localKey = &local.front().first;
+                if (reusable) {
+                    model.ResetDecodeServingState(model.requestStates[localKey], true);
+                    // Return logical KV pages before the scheduler admits the
+                    // next request, retaining all captured allocations.
+                    for (int layer = 0; layer < block_cnt; ++layer) {
+                        if (model.IsLinearAttentionLayer(layer)) continue;
+                        for (Data *tensor : {&local[layer].first, &local[layer].second})
+                            if (!tensor->dims.empty()) Qwen4ResizeKVCache(*tensor, 0);
+                    }
+                }
+            }
+#endif
         }
         if (reusable) {
             tp.ReleaseCache(nullptr, tp.idleCache);

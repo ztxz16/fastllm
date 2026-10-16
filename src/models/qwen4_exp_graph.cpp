@@ -11,6 +11,7 @@
 #include "utils.h"
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "fastllm-cuda-mtp.cuh"
 #endif
 namespace fastllm {
@@ -879,7 +880,17 @@ namespace fastllm {
             return true;
         };
 
-        bool captureAttempted = false;
+        int capturesAttempted = 0;
+        const char *captureBudgetEnv = std::getenv("FASTLLM_CUDA_GRAPH_CAPTURE_BUDGET");
+        // TP ranks already commit each capture together below. Limiting TP
+        // to one segment per forward leaves rare verifier lengths only
+        // partially captured when the first reusable request is frozen.
+        // Honor the same startup budget on every rank; serving requests
+        // still take the frozen/eager branch before attempting any capture.
+        const bool prepareReusableTp = threadTpRank >= 0 && requestState.reusableGraphRequest;
+        const int captureBudget = threadTpRank >= 0 && !prepareReusableTp ? 1 :
+            (captureBudgetEnv ? std::max(1, std::min(128, std::atoi(captureBudgetEnv)))
+                              : (prepareReusableTp ? 8 : 1));
         auto runCapturedSegment = [&](int segmentKey, const auto &runBody) {
             DecodeCudaGraphState::Segment &segment = graphState->segments[segmentKey];
             FastllmCudaSetDevice(device);
@@ -906,8 +917,17 @@ namespace fastllm {
                 return;
             }
 
+            // Serving requests only replay the shapes captured by the first
+            // request. An unseen or invalidated shape stays eager thereafter.
+            if (requestState.decodeGraphsFrozen) {
+                runBody();
+                return;
+            }
             FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
             if (!segment.warmed || segment.disabled) {
+                segment.allocationRequests.clear();
+                FastllmCudaAllocationRecorder record(
+                    (threadTpRank < 0 || prepareReusableTp) ? &segment.allocationRequests : nullptr);
                 runBody();
                 segment.warmed = true;
                 if (FastllmCudaMergeMOEUsedGraphUnsafeFallback()) {
@@ -915,11 +935,11 @@ namespace fastllm {
                 }
                 return;
             }
-            if (captureAttempted) {
+            if (capturesAttempted >= captureBudget) {
                 runBody();
                 return;
             }
-            captureAttempted = true;
+            ++capturesAttempted;
 
             void *capturedGraph = nullptr;
             void *capturedExec = nullptr;
@@ -936,6 +956,13 @@ namespace fastllm {
                 // entering capture; graph replay needs no such synchronization.
                 ForceDeviceSync();
                 captureOk = ThreadTpAllTrue(!FastllmCudaGetThreadError());
+            }
+            if (captureOk && (threadTpRank < 0 || prepareReusableTp)) {
+                // Earlier segments pin their temporary allocations. Reserve
+                // each rank's recorded demand before opening the shared pool,
+                // then rendezvous so no peer allocates during capture.
+                captureOk = ThreadTpAllTrue(
+                    FastllmCudaReserveGraphWorkspace(segment.allocationRequests));
             }
             if (captureOk) {
                 if (threadTpRank <= 0) {

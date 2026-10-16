@@ -10,7 +10,8 @@ namespace fastllm {
             int captureFailures = 0;
             void *graph = nullptr;
             void *exec = nullptr;
-            std::vector<void *> reservedPointers;
+            std::vector<void*> reservedPointers;
+            std::vector<size_t> allocationRequests;
         };
 
         std::mutex mutex;
