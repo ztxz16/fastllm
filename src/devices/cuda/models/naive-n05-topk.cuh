@@ -67,7 +67,8 @@ __global__ void Select(const Score *scores, Count liveCount, int *partials, int 
     }
     unsigned reference = OrderedScoreBits(scores[0]);
     unsigned prefix = 0, mask = 0;
-    int rank = kTopK, candidates = n, greaterCount = 0, blockCount = 0;
+    const int topK = min(n, kTopK);
+    int rank = topK, candidates = n, greaterCount = 0, blockCount = 0;
     for (int shift = 24; shift >= 0; shift -= 8) {
         hist[t] = 0;
         __syncthreads();
@@ -122,7 +123,7 @@ __global__ void Select(const Score *scores, Count liveCount, int *partials, int 
                     state->maximum = hi;
                     if (!changed) {
                         state->uniform = 1;
-                        state->selected = kTopK;
+                        state->selected = topK;
                     }
                 }
             }
@@ -134,7 +135,7 @@ __global__ void Select(const Score *scores, Count liveCount, int *partials, int 
             if (before < rank && before + total >= rank) {
                 state->prefix = prefix | (unsigned(bucket) << shift);
                 state->rank = rank - before;
-                state->candidates = kTopK - (rank - before) + total;
+                state->candidates = topK - (rank - before) + total;
             }
             __syncthreads();
             if (t == 0)

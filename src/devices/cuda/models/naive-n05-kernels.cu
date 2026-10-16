@@ -3357,6 +3357,24 @@ void FastllmCudaNaiveTrimDecodeCache(fastllm::Data &key, fastllm::Data &value,
     CheckLaunch();
 }
 
+namespace {
+void LaunchDecodeIndexerTopK(const unsigned *scores, DecodeKeys keys, naive_topk::Workspace *workspace) {
+    using namespace fastllm;
+    auto *histograms = workspace->partials;
+    auto *ties = workspace->ties;
+    auto *state = &workspace->state;
+    auto *candidates = &workspace->candidates;
+    void *args[] = {&scores, &keys, &histograms, &ties, &state, &candidates};
+    auto status = cudaLaunchCooperativeKernel((void *)naive_topk::Select<unsigned, DecodeKeys>,
+        DecodeTopKBlocks(), naive_topk::kThreads, args, 0, cudaStreamPerThread);
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        if (!FastllmCudaGraphIsCapturingFast())
+            AssertInFastLLM(false, "Naive decode graph TopK launch failed.");
+    }
+}
+}
+
 void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
         const fastllm::Data &weights, const fastllm::Data &packedKeys,
         const fastllm::Data &liveKeys, int capacity, bool fp8Query,
@@ -3390,19 +3408,9 @@ void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
     Output(indices, INT32, {1, naive_topk::kTopK});
     auto *workspace = (naive_topk::Workspace *)scratch.topk.cudaData;
     auto *scores = (const unsigned *)scratch.indexScores.cudaData;
-    auto *histograms = workspace->partials;
-    auto *ties = workspace->ties;
-    auto *state = &workspace->state;
-    auto *candidates = &workspace->candidates;
-    void *args[] = {&scores, &keys, &histograms, &ties, &state, &candidates};
-    auto status = cudaLaunchCooperativeKernel((void *)naive_topk::Select<unsigned, DecodeKeys>,
-        DecodeTopKBlocks(), naive_topk::kThreads, args, 0, cudaStreamPerThread);
-    if (status != cudaSuccess) {
-        FastllmCudaSetThreadError();
-        if (!FastllmCudaGraphIsCapturingFast())
-            AssertInFastLLM(false, "Naive decode graph TopK launch failed.");
-    }
-    naive_topk::Sort<<<1, naive_topk::kThreads>>>(candidates, state, (int *)indices.cudaData);
+    LaunchDecodeIndexerTopK(scores, keys, workspace);
+    naive_topk::Sort<<<1, naive_topk::kThreads>>>(&workspace->candidates, &workspace->state,
+        (int *)indices.cudaData);
     CheckLaunch();
 }
 
@@ -3435,9 +3443,10 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             (uintptr_t)row.key->cudaData % 16 == 0;
         maxCapacity = std::max(maxCapacity, row.capacity);
     }
-    // A CTA scans each row. Keep cooperative selection when there are too few
-    // independent rows to amortize a long scan; tiny batches also retain it.
-    if (rows.size() < (size_t)((maxCapacity + naive_topk::kCapacity - 1) / naive_topk::kCapacity)) return false;
+    // Scoring benefits from a shared launch even when a long row needs the
+    // cooperative TopK grid. Select the two algorithms independently.
+    const bool cooperativeTopK = rows.size() <
+        (size_t)((maxCapacity + naive_topk::kCapacity - 1) / naive_topk::kCapacity);
     for (int first = 0; first < (int)rows.size(); first += batch::BatchLimit) {
         const int count = std::min(batch::BatchLimit, (int)rows.size() - first);
         batch::Batch descriptors{};
@@ -3464,7 +3473,12 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
         }
         else batch::Scores<<<grid, naive_dsa_mma::kThreads>>>((const BF16 *)weights.cudaData, descriptors);
-        batch::Select<<<count, naive_topk::kThreads>>>(descriptors);
+        if (cooperativeTopK) {
+            for (int i = 0; i < count; ++i) {
+                const auto &row = descriptors.rows[i];
+                LaunchDecodeIndexerTopK(row.scores, DecodeKeys{row.live, 0}, row.workspace);
+            }
+        } else batch::Select<<<count, naive_topk::kThreads>>>(descriptors);
         batch::Sort<<<count, naive_topk::kThreads>>>(descriptors);
     }
     CheckLaunch();
