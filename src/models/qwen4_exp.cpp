@@ -7106,13 +7106,14 @@ namespace fastllm {
             RunSharedExpert(mlp, flattened, sharedGateUp, sharedHidden, sharedGate, sharedResult);
         };
 #if defined(USE_CUDA) && !defined(USE_ROCM)
-        // EP always produces one FP32 row here. Borrow the graph boundary
-        // for that result; unsupported backends retain the ordinary owning
-        // output and the boundary-copy fallback.
+        // Hybrid experts produce FP32 for every verifier row. Borrow the
+        // stable graph boundary for small batches as well as single decode;
+        // unsupported backends retain the owning-result/copy fallback.
         auto runExpertParallel = [&](const auto &run) {
             Data borrowed;
             Data *target = &output;
-            if (prepared && prepared->outputTarget && batch * sequence == 1 &&
+            if (prepared && prepared->outputTarget &&
+                batch * sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
                 (prepared->outputTarget->cudaData == nullptr ||
                  prepared->outputTarget->dataType == DataType::FLOAT32) &&
                 Qwen4PrepareCudaWorkspaceOnCurrentDevice(*prepared->outputTarget,
@@ -7171,17 +7172,21 @@ namespace fastllm {
         }
 #endif
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        if (runRoutedExperts && numaMoe && batch * sequence == 1 &&
+        if (runRoutedExperts && numaMoe &&
+            batch * sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
             SelectDeviceFromMap(this->deviceMap, deviceLayer + 1, this->block_cnt).find("cuda") == 0 &&
             FastllmCudaMoeCacheRequested()) {
             selectExperts();
-            // The hybrid backend starts NUMA workers and expert DMA before
-            // this callback queues the independent shared expert. Keep its
-            // intermediates alive until both branches have been combined.
-            if (fastllm::RunHybridMoe(flattened, expertIndex, expertScore,
-                    output, moeWeights.data(), moeWeights.size(), deviceLayer,
-                    [&] { runSharedExpert(sharedOutput); })) {
-                finishHybrid();
+            // Verification has the same independent shared/routed branches as
+            // single-token decode. Submit shared work after routing readback,
+            // beside NUMA experts, rather than making every layer's readback
+            // wait for the shared projection. Join at the next dense graph.
+            if (runExpertParallel([&](Data &target) {
+                    return fastllm::RunHybridMoe(flattened, expertIndex, expertScore,
+                        target, moeWeights.data(), moeWeights.size(), deviceLayer,
+                        [&] { runSharedExpert(sharedOutput); });
+                })) {
+                finishHybrid(true);
                 return;
             }
         }
@@ -13628,7 +13633,12 @@ namespace fastllm {
             Qwen4MtpDraftsPerStep() == 0 ? pipelineMoe.get() : nullptr));
 #endif
 
-        if (executionMode == ExecutionMode::Hybrid && threadTpRank < 0 && Qwen4MtpDraftsPerStep() == 0 &&
+        // Confidence-truncated MTP can execute an ordinary one-row target
+        // step. It needs the same frequency/admission scope as non-MTP decode;
+        // otherwise resident routes fall back to the legacy demand-fill policy
+        // and their observations never reach the verifier's frequency policy.
+        // Multi-row verification manages its scope inside expert parallel.
+        if (executionMode == ExecutionMode::Hybrid && threadTpRank < 0 &&
             inputIds.dims[1] == 1 && Qwen4CudaOnlyDeviceMap(deviceMap) &&
             !weights.empty() && !weights[0].empty()) {
             f.decodeStep.Begin(weights[0].data(), weights[0].size(), num_experts_per_tok);
