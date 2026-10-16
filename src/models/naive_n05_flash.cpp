@@ -776,8 +776,26 @@ Data NaiveN05FlashModel::RunTarget(
                         &part.decode, &part.indices, sequence, part.capacity,
                         layerCache ? layerCache + sequence * 4 : nullptr});
             }
+            const int ranks = tensorParallel ? (int)tpDevices.size() : 1;
+            const bool contextParallel = !verifying && decodeWorkspace && ranks > 1 &&
+                rows.size() >= 4 && buf.capacity >= std::max(65536, ranks * 4096) &&
+                FastllmCudaNaiveIndexerContextSupported(tpDevices) &&
+                buf.decode.indexScores.Count(0) >= (size_t)ranks * rows.size() * indexTopK * 2;
+            Data &exchange = buf.decode.indexScores;
             batchIndexerPrepared = FastllmCudaNaiveBatchDecodeIndexer(batchIndexQ,
-                batchIndexWeights, buf.liveKeys, rows, indexFp8);
+                batchIndexWeights, buf.liveKeys, rows, indexFp8,
+                contextParallel ? tpRank : 0, contextParallel ? ranks : 1,
+                contextParallel ? &exchange : nullptr);
+            if (batchIndexerPrepared && contextParallel) {
+                const int part = rows.size() * indexTopK * 2;
+                // AllGather is a bitwise copy. FLOAT32 selects the existing
+                // 32-bit custom transport; it does not interpret score bits.
+                if (!FastllmCudaCustomAllGatherRows(exchange.cudaData, ranks * part,
+                        indexTopK * 2, FLOAT32, gpu))
+                    AssertInFastLLM(FastllmNcclAllGather((int *)exchange.cudaData + tpRank * part,
+                        exchange.cudaData, part, INT32, gpu), "Indexer context all-gather failed.");
+                FastllmCudaNaiveMergeDecodeIndexer(buf.liveKeys, rows, exchange, ranks);
+            }
         }
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &pastKey, Data &pastValue,

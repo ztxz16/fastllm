@@ -195,13 +195,13 @@ __device__ __forceinline__ void LoadIndexerKeys(
 template <typename ScoreOutput>
 __device__ __forceinline__ void IndexerDecodeScoresRow(const BF16 *q, FastllmNaiveKV packedKeys,
         const float *qscale, const BF16 *weights, ScoreOutput scores,
-        int stride, int keys, int past) {
+        int stride, int keys, int past, int firstKey = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (keys <= 0) return;
     __shared__ __align__(16) BF16 qs[kHeads][kIndexerDim + 8], ks[kKeys][kIndexerDim + 8];
     __shared__ float scale[kHeads], weight[kHeads];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int first = blockIdx.x * kKeys;
+    const int first = firstKey + blockIdx.x * kKeys;
     for (int i = tid; i < kHeads * (kIndexerDim / 8); i += kThreads) {
         int row = i / 16, d = i % 16 * 8;
         *reinterpret_cast<uint4*>(&qs[row][d]) =

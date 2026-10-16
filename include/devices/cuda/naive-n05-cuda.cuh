@@ -236,7 +236,14 @@ struct FastllmNaiveIndexerRow {
 // Returning false leaves the caller free to use the single-sequence path.
 bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     const fastllm::Data &weights, const fastllm::Data &liveKeys,
-    const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query);
+    const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query,
+    int contextRank = 0, int contextRanks = 1, fastllm::Data *exchange = nullptr);
+// Collective dispatch must agree across the entire TP group, including mixed GPUs.
+bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices);
+// Merge rank-major (score bits, logical position) pairs after an all-gather.
+void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
+    const std::vector<FastllmNaiveIndexerRow> &rows, const fastllm::Data &exchange,
+    int contextRanks);
 void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
     const fastllm::Data &key, const fastllm::Data &value,
     const fastllm::Data &indices, const fastllm::Data &sink,

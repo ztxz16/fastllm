@@ -736,6 +736,12 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
         auto &storage = *state->ranks[rank]->storage;
         auto &buf = storage.buffers;
         buf.capacity = capacity;
+        if (capacity > 2048) {
+            // Decode Indexer CP reuses the score arena after packing local
+            // candidates; graph variants keep the same allocation/address.
+            buf.decode.indexScores.FakeFrom(storage.indexScores, 0);
+            buf.decode.indexScores.Resize({rows * capacity});
+        }
         for (int row = 0; row < rows; ++row) {
             auto &part = *buf.sequences[row];
             part.capacity = capacity;

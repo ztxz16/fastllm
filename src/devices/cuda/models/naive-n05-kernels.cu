@@ -3416,7 +3416,8 @@ void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
 
 bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         const fastllm::Data &weights, const fastllm::Data &liveKeys,
-        const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query) {
+        const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query,
+    int contextRank, int contextRanks, fastllm::Data *exchange) {
 #ifdef FASTLLM_NAIVE_DSA_MMA
     using namespace fastllm;
     namespace batch = naive_indexer_batch;
@@ -3426,6 +3427,12 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         query.dims.empty() || query.dims.back() != heads * dim ||
         weights.dims.empty() || weights.dims.back() != heads ||
         !FastllmCudaFlashInferDataTypeSupported(BFLOAT16)) return false;
+    const bool cp = contextRanks > 1;
+    if (contextRanks < 1 || contextRank < 0 || contextRank >= contextRanks ||
+        (cp && (!exchange || exchange->dataType != INT32 ||
+         exchange->Count(0) < (size_t)contextRanks * rows.size() * naive_topk::kTopK * 2))) return false;
+    std::vector<batch::Batch> packedBatches;
+    if (cp) packedBatches.reserve((rows.size() + batch::BatchLimit - 1) / batch::BatchLimit);
     bool hopper = FastllmCudaRuntimeArch() == 90;
     const auto cacheType = rows.front().key ? rows.front().key->dataType : BFLOAT16;
     for (const auto &row : rows) {
@@ -3459,8 +3466,11 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
                 (float *)scratch.indexScale.cudaData, (unsigned *)scratch.indexScores.cudaData,
                 (naive_topk::Workspace *)scratch.topk.cudaData, (int *)row.indices->cudaData,
                 row.sequence, row.key->dims[2], row.cache};
+            descriptors.rows[i].cpRank = contextRank;
+            descriptors.rows[i].cpRanks = contextRanks;
             capacity = std::max(capacity, row.capacity);
         }
+        if (cp) capacity = ((capacity + contextRanks * 64 - 1) / (contextRanks * 64)) * 64;
         batch::Quantize<<<dim3(heads, count), dim>>>((const BF16 *)query.cudaData, descriptors);
         const dim3 grid((capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, count);
         if (hopper) {
@@ -3471,17 +3481,71 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         if (capacity > 16384) {
             const int blocks = std::min(naive_topk::kMaxBlocks, (capacity + 4095) / 4096);
             for (int shift = 24; shift >= 0; shift -= 8) {
-                batch::SplitHistogram<<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors, shift);
-                batch::SplitThreshold<<<count, naive_topk::kThreads>>>(descriptors, blocks, shift);
+                batch::SplitHistogram<><<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors, shift);
+                batch::SplitThreshold<><<<count, naive_topk::kThreads>>>(descriptors, blocks, shift);
             }
-            batch::SplitCompact<<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors);
-        } else batch::Select<<<count, naive_topk::kThreads>>>(descriptors);
-        batch::Sort<<<count, naive_topk::kThreads>>>(descriptors);
+            batch::SplitCompact<><<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors);
+        } else batch::Select<><<<count, naive_topk::kThreads>>>(descriptors);
+        batch::Sort<><<<count, naive_topk::kThreads>>>(descriptors);
+        if (cp) {
+            batch::PackLocal<<<count, naive_topk::kThreads>>>(descriptors);
+            packedBatches.push_back(descriptors);
+        }
+    }
+    // Scores may alias the exchange arena. Finish packing every row before
+    // any copy can overwrite another row's score slice (CUDA 12.0 batches).
+    if (cp) for (int b = 0; b < (int)packedBatches.size(); ++b) {
+        int first = b * batch::BatchLimit;
+        int count = std::min(batch::BatchLimit, (int)rows.size() - first);
+        batch::CopyPacked<<<count, naive_topk::kThreads>>>(packedBatches[b],
+            (unsigned *)exchange->cudaData, rows.size(), first);
     }
     CheckLaunch();
     return true;
 #else
     return false;
+#endif
+}
+
+bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices) {
+#ifdef FASTLLM_NAIVE_DSA_MMA
+    static thread_local std::map<std::vector<int>, bool> supported;
+    auto it = supported.find(devices);
+    if (it != supported.end()) return it->second;
+    bool ok = devices.size() > 1;
+    for (int device : devices) {
+        int major = 0;
+        ok = ok && cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess
+            && major >= 8;
+    }
+    return supported[devices] = ok;
+#else
+    return false;
+#endif
+}
+
+void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
+        const std::vector<FastllmNaiveIndexerRow> &rows,
+        const fastllm::Data &exchange, int contextRanks) {
+#ifdef FASTLLM_NAIVE_DSA_MMA
+    namespace batch = naive_indexer_batch;
+    for (int first = 0; first < (int)rows.size(); first += batch::BatchLimit) {
+        int count = std::min(batch::BatchLimit, (int)rows.size() - first);
+        batch::Batch descriptors{};
+        for (int i = 0; i < count; ++i) {
+            const auto &source = rows[first + i];
+            auto &r = descriptors.rows[i];
+            r.live = (const int *)liveKeys.cudaData + source.sequence;
+            r.workspace = (naive_topk::Workspace *)source.scratch->topk.cudaData;
+            r.indices = (int *)source.indices->cudaData;
+            r.cpRanks = contextRanks;
+            r.merged = (const unsigned *)exchange.cudaData;
+            r.mergedRows = rows.size(); r.mergedRow = first + i;
+        }
+        batch::Select<true><<<count, naive_topk::kThreads>>>(descriptors);
+        batch::Sort<true><<<count, naive_topk::kThreads>>>(descriptors);
+    }
+    CheckLaunch();
 #endif
 }
 
