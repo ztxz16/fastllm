@@ -20,11 +20,12 @@ public:
     explicit HybridMoeCachePlan(HybridMoeMath math = HybridMoeMath::Standard,
                                float swigluLimit = 0.0f)
         : math(math), swigluLimit(swigluLimit) {}
-    void Add(const std::vector<Data *> &weights, const std::string &device);
+    void Add(const std::vector<Data *> &weights, const std::string &device,
+             int cacheDevice = -1);
     bool Prepare(const std::function<void()> &registerNumaWeights = {},
                  bool allowStreaming = false) const;
 private:
-    struct Layer { Data *const *weights; int count; };
+    struct Layer { Data *const *weights; int count; int cacheDevice; };
     std::vector<Layer> layers;
     HybridMoeMath math;
     float swigluLimit;
@@ -58,6 +59,10 @@ public:
     bool Contains(int device) const { return steps.count(device) != 0; }
     bool Begin(int device, Data **weights, int count, int topk,
                const std::vector<int> *devices = nullptr);
+    // Submit admissions after this device's last expert use in the forward.
+    // The caller must rule out later stages/peers reading its cache. Retain the
+    // completed entry so it cannot start a second policy step in this group.
+    void Finish(int device);
 private:
     std::map<int, HybridMoeDecodeStep> steps;
 };

@@ -1800,6 +1800,9 @@ struct FastllmCudaMoeCacheLayer {
     // GLM: BF16 projections, scores before block-128 FP8 down activation,
     // without V4.1's block-32 quantization of the incoming activation.
     bool glm5 = false;
+    // PP cache placement only; -1 permits every device. Expert-distributed
+    // execution supplies its own ownership and does not use this restriction.
+    int cacheDevice = -1;
 };
 // One anchor plus up to eight speculative tokens. Larger prefill batches
 // keep using the configured MoE backend.

@@ -1083,8 +1083,8 @@ static void CpuExpertReference(const float *input, float *output,
 static void RunSharedGGUFRecords() {
     using namespace fastllm_gguf_restore;
     constexpr int experts = 3;
-    enum class Mode { FixedExpert, Batch, Promotion, PackedPromotion, Empty, Uploaded };
-    for (auto type : {GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS,
+    enum class Mode { FixedExpert, Batch, Promotion, PackedPromotion, Empty, Uploaded, Background };
+    for (auto type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS,
                      GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
                      GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
                      GGML_TYPE_Q2_0, GGML_TYPE_Q8_0, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
@@ -1139,20 +1139,21 @@ static void RunSharedGGUFRecords() {
             Cuda(cudaMemcpy(uploaded, host + 2 * layout.stride, layout.stride, cudaMemcpyHostToDevice));
             // Cover host restoration, device-selected batches, D2D promotion,
             // empty requests, and restoration after a DMA upload.
-            for (auto mode : {Mode::FixedExpert, Mode::Batch, Mode::Promotion, Mode::PackedPromotion, Mode::Empty, Mode::Uploaded}) {
+            for (auto mode : {Mode::FixedExpert, Mode::Batch, Mode::Promotion, Mode::PackedPromotion, Mode::Empty, Mode::Uploaded, Mode::Background}) {
                 std::fill(expected.begin(), expected.end(), 0xa5);
                 metadata[6] = mode == Mode::Empty ? 0 : experts;
                 Cuda(cudaMemcpy(promoted, mode == Mode::PackedPromotion ? host : canonical.data(),
                     layout.stride, cudaMemcpyHostToDevice));
                 Cuda(cudaMemcpy(ids, metadata, sizeof(metadata), cudaMemcpyHostToDevice));
                 Cuda(cudaMemset(output, 0xa5, outputBytes));
-                if (mode == Mode::FixedExpert || mode == Mode::Uploaded) {
+                if (mode == Mode::FixedExpert || mode == Mode::Uploaded || mode == Mode::Background) {
                     std::memcpy(expected.data(), canonical.data() + 2 * layout.stride, layout.stride);
                     // Uploaded records must work without a host pointer table.
                     const bool fromUpload = mode == Mode::Uploaded;
                     Cuda(CopyRecords(layout, fromUpload ? nullptr : pointers, output, cudaStreamPerThread,
                         nullptr, nullptr, nullptr, nullptr, fromUpload ? 0 : 2,
-                        nullptr, -1, fromUpload ? uploaded : nullptr));
+                        nullptr, -1, fromUpload ? uploaded : nullptr, false,
+                        mode == Mode::Background ? 16 : 64));
                 } else {
                     for (int i = 0; i < metadata[6]; ++i)
                         std::memcpy(expected.data() + offsets[metadata[experts + i]],

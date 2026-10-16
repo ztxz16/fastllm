@@ -164,6 +164,14 @@ namespace fastllm {
         HybridMoeDecodeGroup decodeCaches;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
         const bool frequencyDecode = !prefill && sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH;
+        std::vector<CudaPrefillStage> decodeStages;
+        if (frequencyDecode && threadTpRank < 0 && !threadTpState && !mtpEnabled &&
+            !kdaReplay && !indexer && firstLayer == 0 && endLayer == block_cnt) {
+            // This placement check rejects device revisits. Each completed
+            // stage can upload its next-token cache while later stages run.
+            if (!BuildCudaPrefillStages(deviceMap, block_cnt, decodeStages)) decodeStages.clear();
+        }
+        size_t decodeStage = 0;
 #endif
         for (int layer = firstLayer; layer < endLayer; layer++) {
             ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
@@ -202,6 +210,13 @@ namespace fastllm {
             }
             FinishFfnBlock(ffnOutput, *current, ffnPost, ffnComb, *next);
             std::swap(current, next);
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+            if (decodeStage + 1 < decodeStages.size() &&
+                layer + 1 == decodeStages[decodeStage].endLayer) {
+                decodeCaches.Finish(decodeStages[decodeStage].device);
+                ++decodeStage;
+            }
+#endif
         }
         // Two residual swaps per layer preserve caller-owned state.
     }
@@ -262,6 +277,12 @@ namespace fastllm {
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
         {
             HybridMoeCachePlan cache(HybridMoeMath::Glm5, swigluLimit);
+            std::vector<int> cacheDevices(block_cnt, -1);
+            std::vector<CudaPrefillStage> stages;
+            if (!threadTpState && BuildCudaPrefillStages(deviceMap, block_cnt, stages))
+                for (const auto &stage : stages)
+                    std::fill(cacheDevices.begin() + stage.firstLayer,
+                              cacheDevices.begin() + stage.endLayer, stage.device);
             const int cacheLayers = block_cnt + (mtpEnabled && mtpWeightsReady ? 1 : 0);
             for (int layer = 0; layer < cacheLayers; ++layer) {
                 const std::string device = SelectMoeDeviceForLayer(std::min(layer, block_cnt - 1));
@@ -277,7 +298,7 @@ namespace fastllm {
                         (!experts[3] || experts[2]->dims.size() != 2 || experts[3]->dims.size() != 2 ||
                          !FastllmCudaMoeGlm5GGUFCacheSupported(experts[2]->ggmlType, experts[3]->ggmlType,
                              experts[2]->dims[1], experts[3]->dims[1]))) continue;
-                    cache.Add(experts, device);
+                    cache.Add(experts, device, layer < block_cnt ? cacheDevices[layer] : -1);
                 }
             }
             cache.Prepare([this] { WarmupNumaMoeWeights(); }, true);

@@ -96,5 +96,22 @@ int main() {
         Check(group.Begin(0, target.data(), target.size(), 2), "second device failed");
     }
     Check(ended == 5 && endOrder[3] == 6 && endOrder[4] == 5, "device policies ended in unstable order");
+    try {
+        HybridMoeDecodeGroup group;
+        Check(group.Begin(0, target.data(), target.size(), 2), "PP first stage failed");
+        group.Finish(2); // No eligible expert cache on this device.
+        Check(ended == 5, "absent stage finished a different device");
+        group.Finish(0);
+        group.Finish(0);
+        Check(ended == 6 && endOrder.back() == 7 && group.Contains(0),
+              "PP stage was not finished exactly once before the next stage");
+        Check(!group.Begin(0, target.data(), target.size(), 2) && begun == 7,
+              "completed stage started a second frequency step");
+        Check(group.Begin(1, draft.data(), draft.size(), 1), "PP next stage failed");
+        Check(ended == 6, "starting the next stage re-ended the previous stage");
+        throw 1; // Cancellation must still drain the remaining device scope.
+    } catch (int) {}
+    Check(begun == 8 && ended == 7 && endOrder.back() == 8,
+          "PP cancellation lost or double-ended a device policy");
     std::cout << "ALL_PASS: hybrid cache preparation and policy lifetimes\n";
 }

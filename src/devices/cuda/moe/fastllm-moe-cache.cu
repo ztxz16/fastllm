@@ -345,6 +345,7 @@ struct DeviceCache {
     cudaEvent_t frequencyReadersDone = nullptr;
     cudaStream_t admissionStream = nullptr;
     cudaEvent_t admissionDone = nullptr;
+    int admissionCopyBlocks = 64;
     bool frequencyActive = false;
     bool frequencyResidencyDirty = true;
     // EP plans from a CPU-owned snapshot while cache admissions run. Pending
@@ -385,6 +386,7 @@ struct OffloadGroup {
     // GGUF layers keep their actual record size in host storage and share
     // GPU slot partitions with other layers of the same size.
     std::vector<OffloadLayout> layerLayouts;
+    std::vector<int> cacheDevices;
     std::vector<size_t> layerHostOffsets;
     size_t totalRecords = 0;
     uint8_t *hostRecords = nullptr;
@@ -1219,6 +1221,8 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
         cache.prefillOwnerCount = group.expertDevices.size();
     }
     const uint64_t budgetBytes = DeviceCacheBudgetBytes(device);
+    const bool ppPlacement = group.expertDevices.empty() &&
+        std::any_of(group.cacheDevices.begin(), group.cacheDevices.end(), [](int d) { return d >= 0; });
     // A zero per-device budget can still execute streamed decode misses. No
     // resident payload or slots are allocated; all route lookups miss.
     const bool streamOnly = budgetBytes == 0 && group.cpuDecodeReady &&
@@ -1227,7 +1231,7 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
     if (budgetBytes == 0 && !streamOnly) return nullptr;
     size_t slots = RequestedSlots(
         group.layout.recordStride, group.totalRecords, budgetBytes);
-    if (!streamOnly && slots < kMaxTopK) {
+    if (!streamOnly && !ppPlacement && slots < kMaxTopK) {
         std::fprintf(stderr,
             "[Fastllm] CUDA expert cache needs at least %d slots; "
             "requested %zu.\n", kMaxTopK, slots);
@@ -1260,12 +1264,14 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
     fastllm::cuda::CacheSlotPlan slotPlan;
     if (streamOnly) {
         cache.layerSlots.resize(group.layerLayouts.size(), {0, 0});
-    } else if (!group.layerLayouts.empty()) {
+    } else if (!group.layerLayouts.empty() || ppPlacement) {
         std::vector<size_t> strides;
-        for (const auto &layout : group.layerLayouts) strides.push_back(layout.recordStride);
+        for (size_t layer = 0; layer < group.tableKeys.size(); ++layer)
+            strides.push_back(group.LayerLayout(layer).recordStride);
         const int ownedExperts = (group.layout.experts + cache.prefillOwnerCount - 1 -
             cache.prefillOwnerRank) / cache.prefillOwnerCount;
-        slotPlan = fastllm::cuda::PlanCacheSlots(strides, ownedExperts,
+        slotPlan = fastllm::cuda::PlanDeviceCacheSlots(strides,
+            group.expertDevices.empty() ? group.cacheDevices : std::vector<int>{}, device, ownedExperts,
             std::min(uint64_t(usableBytes), budgetBytes), kMaxTopK);
         slots = slotPlan.offsets.size();
         cache.recordBytes = slotPlan.bytes;
@@ -1383,6 +1389,9 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
         cudaFreeHost(cache.hostKeyToSlot);
         cache.hostKeyToSlot = cache.mappedKeyToSlot = nullptr;
     }
+    // SM75 reaches host-link bandwidth with fewer background restore CTAs.
+    // Leave room for the output head and the next token's foreground kernels.
+    if (properties.major == 7 && properties.minor == 5) cache.admissionCopyBlocks = 16;
     cache.ready = true;
 
     std::fprintf(stderr,
@@ -2015,6 +2024,8 @@ bool FastllmCudaPrepareMoeCache(
 
     std::unique_ptr<OffloadGroup> group(new OffloadGroup());
     group->layout = layout;
+    for (int layer = 0; layer < layerCount; ++layer)
+        group->cacheDevices.push_back(layers[layer].cacheDevice);
     group->allowStreaming = allowStreaming && registerNumaWeights &&
         (layout.weightType == fastllm::DATA_GGUF_FORMAT ||
          (layout.glm5 && layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3_PACKED));
@@ -2490,6 +2501,7 @@ bool EnsureCachedExperts(OffloadGroup *group, DeviceCache *cache, int tableId,
     const auto &layout = group->layout;
     const auto span = cache->layerSlots.empty() ? fastllm::cuda::CacheSlotSpan{0, cache->slots} :
         cache->layerSlots[tableId];
+    if (span.count == 0) return false;
     const fastllm::cuda::ExpertCacheView metadata{
         cache->keyToSlot, cache->slotKeys, cache->lastUsed, cache->step,
         cache->hitCount, cache->totalMissCount, cache->slots, cache->mappedKeyToSlot,
@@ -2725,6 +2737,10 @@ static void PrepareFrequencyPolicy(OffloadGroup *group, DeviceCache *cache) {
         cache->frequency = std::make_unique<fastllm::MoeFrequencyPolicy>(
             std::move(keys), std::move(slots), group->tableKeys.size(), config, std::move(recordBytes));
         cache->frequencyGroup = group;
+        for (int layer = 0; layer < int(cache->layerSlots.size()); ++layer)
+            if (cache->layerSlots[layer].count == 0)
+                for (int e = 0; e < group->layout.experts; ++e)
+                    cache->frequency->SetCandidateEligible(layer * group->layout.experts + e, false);
         if (!group->expertDevices.empty()) {
             for (int key = 0; key < int(group->totalRecords); ++key)
                 cache->frequency->SetCandidateEligible(key,
@@ -3924,7 +3940,8 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
             const auto &source = group.ggufSources[table];
             checkCudaErrors("MoE global admission", fastllm_gguf_restore::CopyRecords(source,
                 cache.numaPointers + size_t(table) * layout.experts * 2 * source.shards,
-                destination, stream, nullptr, nullptr, nullptr, nullptr, expert));
+                destination, stream, nullptr, nullptr, nullptr, nullptr, expert,
+                nullptr, -1, nullptr, false, cache.admissionCopyBlocks));
         }
         cache.uploadedExpertBytes += layout.gateBytes + layout.downBytes;
         cache.frequencyHostChanges[i] = a.key;

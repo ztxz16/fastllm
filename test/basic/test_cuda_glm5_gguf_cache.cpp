@@ -856,6 +856,7 @@ int main(int argc, char **argv) {
         const bool expertPrefill=numaPrefill || option=="--ep-prefill";
         const bool expertCache=expertPrefill || option=="--ep-cache";
         const bool resident=option=="--resident";
+        const bool ppCache=option=="--pp-cache" || option=="--pp-frequency";
         ExpertCacheTestMode cacheMode=ExpertCacheTestMode::Parallel;
         if(option=="--verify") cacheMode=ExpertCacheTestMode::Verify;
         else if(option=="--verify-no-cache") cacheMode=ExpertCacheTestMode::VerifyNoCache;
@@ -863,7 +864,7 @@ int main(int argc, char **argv) {
         const bool verify=cacheMode!=ExpertCacheTestMode::Parallel;
         const bool noCache=option=="--no-cache" || option=="--host-prefill-no-cache" ||
             cacheMode==ExpertCacheTestMode::VerifyNoCache;
-        const bool frequency=noCache || option=="--frequency";
+        const bool frequency=noCache || option=="--frequency" || option=="--pp-frequency";
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices || (expertCache && devices<2)) {
             std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: CUDA unavailable"); return 0;
@@ -917,6 +918,7 @@ int main(int argc, char **argv) {
             }
             stride=std::max(stride,weights[t][2]->GetBytes()+weights[t][3]->GetBytes());
             layers[t]={weights[t].data(),int(weights[t].size()),false,.125f,true};
+            if (ppCache) layers[t].cacheDevice = t == 4 ? std::min(1, devices-1) : 0;
             if (!resident) directFixtures.emplace_back(weights[t]);
         }
         stride=(stride+127)/128*128;
@@ -1132,6 +1134,7 @@ int main(int argc, char **argv) {
                 checkSubset("scored CPU callback recovery");
             }
             for(int device=0;device<std::min(2,devices);++device) {
+                if (ppCache && layers[t].cacheDevice != device) continue;
                 Cuda(cudaSetDevice(device));
                 Data input(BFLOAT16,{1,hidden},CPU,bx.data()),index(INT32,{1,topk},CPU,ids.data()),
                      score(FLOAT32,{1,topk},CPU,scores.data()),out;
@@ -1180,7 +1183,7 @@ int main(int argc, char **argv) {
                     worst=std::max(worst,Compare(actual,expected,"hybrid vs scalar oracle"));
                 }
             }
-            if (frequency && devices > 1) {
+            if (frequency && !ppCache && devices > 1) {
                 // Exercise arbitrary verifier widths as well as decode; rotate
                 // routes and alternate zero/nonzero inputs between rows to catch wrong maps.
                 for (int rows : {1, 2, 5}) {
@@ -1236,13 +1239,25 @@ int main(int argc, char **argv) {
         }
         for(int device=0;device<std::min(2,devices);++device) {
             uint64_t stats[5]={};Require(fastllm_moe_cuda_cache_stats(device,stats,false),"query counters");
+            if (ppCache) {
+                Require(stats[0] && stats[1] && stats[3] > 0, "PP cache not exercised");
+                if (device == 1) Require(stats[3] == uint64_t(experts), "PP Q2 capacity reserved foreign formats");
+                Cuda(cudaSetDevice(device));
+                for (int t=0;t<tables;++t) if (layers[t].cacheDevice != device) {
+                    FastllmCudaMoePrefillResidents view;
+                    Require(FastllmCudaGetMoePrefillResidents(weights[t].data(),experts,view,false), "PP resident view missing");
+                    Require(std::all_of(view.weights.begin(),view.weights.end(),[](const void *p){return !p;}),
+                            "PP cache admitted another stage's experts");
+                }
+                continue;
+            }
             Require(noCache ? stats[0]==0 && stats[1]>0 && stats[2]==0 && stats[3]==0 :
                 stats[0] && stats[1] && (frequency ? stats[3]>=uint64_t(tables*16) && stats[3]<tables*experts : stats[3]==uint64_t(tables*4)),
                     "cache cold/hot/eviction or compact slots missing");
         }
         if (frequency) Require(sawCpu && sawMixed && (noCache || sawGpu) && sawStaged,
                                "frequency did not exercise CPU, resident and staged GPU routes");
-        if (frequency && devices > 1) Require(sawCooperative[0] && sawCooperative[1], "cooperative path did not exercise both GPUs");
+        if (frequency && !ppCache && devices > 1) Require(sawCooperative[0] && sawCooperative[1], "cooperative path did not exercise both GPUs");
         FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size());
         ClearNumasMoeRuntimeCache();
         std::printf("PASS: GLM GGUF cache CPU/mixed/GPU, scalar oracle, duplicates, scores, clamp, eviction, counters; max relative L2 %.8f\n",worst);
