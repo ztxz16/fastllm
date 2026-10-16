@@ -197,6 +197,7 @@ __device__ __forceinline__ void IndexerDecodeScoresRow(const BF16 *q, FastllmNai
         const float *qscale, const BF16 *weights, ScoreOutput scores,
         int stride, int keys, int past) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    if (keys <= 0) return;
     __shared__ __align__(16) BF16 qs[kHeads][kIndexerDim + 8], ks[kKeys][kIndexerDim + 8];
     __shared__ float scale[kHeads], weight[kHeads];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;

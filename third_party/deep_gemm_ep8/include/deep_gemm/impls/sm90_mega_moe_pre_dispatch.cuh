@@ -24,7 +24,8 @@ __global__ void sm90_mega_moe_pre_dispatch_kernel(
     const uint32_t hidden,
     const uint32_t num_groups,
     const uint32_t top_k,
-    const float routed_scaling_factor) {
+    const float routed_scaling_factor,
+    const int* __restrict__ live_lengths = nullptr) {
     static_assert(kGroupSize == 128, "SM90 mega-moe pre-dispatch requires per-128 SF");
     constexpr uint32_t kVecElems = 8;  // 16-byte BF16 load per thread
     static_assert(kGroupSize % kVecElems == 0, "kGroupSize must be a multiple of 8");
@@ -39,6 +40,17 @@ __global__ void sm90_mega_moe_pre_dispatch_kernel(
 
     if (bid < num_tokens) {
         const uint32_t token_id = bid;
+        // Whole-block decision before reading activations. Keep the source
+        // shape/collectives unchanged but send no experts for inactive rows.
+        if (live_lengths && live_lengths[token_id] <= 0) {
+            if (tid < top_k) {
+                const uint32_t off = token_id * top_k + tid;
+                buf_topk_idx[off] = -1;
+                buf_topk_weights[off] = 0.f;
+            }
+            if constexpr (kUsePDL) cudaTriggerProgrammaticLaunchCompletion();
+            return;
+        }
         const auto* token_in = x + static_cast<uint64_t>(token_id) * hidden;
 
         uint4 in_bits = reinterpret_cast<const uint4*>(token_in)[tid];

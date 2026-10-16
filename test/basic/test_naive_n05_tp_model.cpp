@@ -354,14 +354,14 @@ class Fixture : public NaiveN05FlashModel {
             if (SelectLogits(cfg).cudaSampling) throw std::runtime_error("finite top-k distribution changed");
         }
         cfg.top_k = vocab; cfg.output_token_limit = 32; cfg.input_token_length = 3;
-        maxBatch = 4; SetMaxTokens(16384);
+        maxBatch = 128; SetMaxTokens(131072);
         WarmUp();
         int captures = verifyGraphCaptures, checks = 0;
         using Cache = std::vector<std::pair<Data, Data>>;
-        std::vector<Cache> actual(4), reference(4);
-        std::vector<int> past(4, 3);
+        std::vector<Cache> actual(48), reference(48);
+        std::vector<int> past(48, 3);
         inspectGpuSampling = true;
-        for (int row = 0; row < 4; ++row) {
+        for (int row = 0; row < 48; ++row) {
             for (int layer = 0; layer < block_cnt; ++layer) {
                 actual[row].emplace_back(Data(BFLOAT16), Data(BFLOAT16));
                 reference[row].emplace_back(Data(BFLOAT16), Data(BFLOAT16));
@@ -377,7 +377,7 @@ class Fixture : public NaiveN05FlashModel {
                 throw std::runtime_error("prefill GPU sampling logits differ from full CPU output");
             ++checks;
         }
-        for (int rows : {1, 4, 2, 4, 1}) {
+        for (int rows : {1, 4, 5, 7, 9, 16, 31, 39, 41, 44, 48, 40, 1}) {
             if (ranks == 1 && rows != 1) continue;
             std::vector<Data> positions(rows);
             std::vector<Data *> pos;
@@ -390,7 +390,7 @@ class Fixture : public NaiveN05FlashModel {
                 ids.push_back(float((past[row] * 3 + row) % 251));
                 positions[row].CopyFrom(Data(FLOAT32, {1, 1}, {float(past[row])}));
                 pos.push_back(&positions[row]); outputs.push_back(&expectedRows[row]);
-                cs[row].temperature = .5f + .3f * row; cs[row].top_p = .7f + .07f * row;
+                cs[row].temperature = .5f + .3f * (row % 4); cs[row].top_p = .7f + .07f * (row % 4);
                 refs[row] = cs[row]; refs[row].output_logits = true;
                 for (int layer = 0; layer < block_cnt; ++layer) {
                     a.emplace_back(&actual[row][layer].first, &actual[row][layer].second);
@@ -451,19 +451,20 @@ class Fixture : public NaiveN05FlashModel {
             throw std::runtime_error("incompatible serving graph was revived");
         std::cout << "SERVING INVALIDATION PASS" << std::endl;
     }
-    void ServingGraphChecks() {
+    void ServingGraphChecks(bool padding = false) {
         // Candidate and eager reference retain independent request caches.
-        maxBatch = 16;
+        maxBatch = padding ? 128 : 16;
         SetChunkedPrefillSize(4096);
-        SetMaxTokens(131072);
+        SetMaxTokens(padding ? 1048576 : 262144);
         WarmUp();
         if (!verifyGraphCaptures) throw std::runtime_error("serving warmup captured no graphs");
         const int captures = verifyGraphCaptures;
         int checks = 0, replayed = 0, eager = 0;
         for (int prefix : {3, 254, 2046, 4094}) {
             using Cache = std::vector<std::pair<Data, Data>>;
-            std::vector<Cache> actual(8), expected(8);
-            std::vector<int> past(8, prefix);
+            const int requests = padding ? 48 : 8;
+            std::vector<Cache> actual(requests), expected(requests);
+            std::vector<int> past(requests, prefix);
             GenerationConfig config;
             config.input_token_length = prefix;
             config.output_token_limit = 64;
@@ -474,11 +475,14 @@ class Fixture : public NaiveN05FlashModel {
                 for (int i = 0; i < prefix; ++i) { ids[i] = (i * 3 + row) % 251; positions[i] = i; }
                 Forward(Data(FLOAT32, {1, prefix}, ids), Data(), Data(FLOAT32, {1, prefix}, positions), cache, config);
             };
-            for (int row = 0; row < 8; ++row) { prefill(actual[row], row); prefill(expected[row], row); }
+            for (int row = 0; row < requests; ++row) { prefill(actual[row], row); prefill(expected[row], row); }
             int step = 0;
-            for (int count : {8, 4, 3, 2, 1, 4, 8, 7, 8}) {
+            const std::vector<int> counts = padding
+                ? std::vector<int>{5, 7, 9, 15, 17, 31, 33, 39, 41, 44, 47, 40, 48, 1, 43}
+                : std::vector<int>{8, 4, 3, 2, 1, 4, 8, 7, 8};
+            for (int count : counts) {
                 std::vector<int> order(count);
-                for (int row = 0; row < count; ++row) order[row] = step % 2 ? 7 - row : row;
+                for (int row = 0; row < count; ++row) order[row] = step % 2 ? requests - 1 - row : row;
                 auto run = [&](std::vector<Cache> &all, bool graph) {
                     SetCudaGraph(graph);
                     std::vector<float> ids;
@@ -502,6 +506,8 @@ class Fixture : public NaiveN05FlashModel {
                 auto output = run(actual, true);
                 int launched = verifyGraphLaunches - before;
                 if (launched != 0 && launched != ranks) throw std::runtime_error("partial-rank serving replay");
+                if (padding && !failVerifyInstantiate && (prefix == 3 || prefix == 4094) && launched != ranks)
+                    throw std::runtime_error("padded serving batch did not replay");
                 if (launched) ++replayed; else ++eager;
                 auto reference = run(expected, false);
                 SetCudaGraph(true);
@@ -1884,12 +1890,12 @@ int main(int argc, char **argv) {
             fixture.ServingGraphInvalidationChecks();
             return 0;
         }
-        if (argc > 2 && std::string(argv[2]) == "serving_graph") {
+        if (argc > 2 && (std::string(argv[2]) == "serving_graph" || std::string(argv[2]) == "serving_padding")) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             failVerifyInstantiate = argc > 3 && std::string(argv[3]) == "failinstantiate";
             failGraphDevice = ranks - 1;
             Fixture fixture(ranks, false, true, true, true);
-            fixture.ServingGraphChecks();
+            fixture.ServingGraphChecks(std::string(argv[2]) == "serving_padding");
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "swa_ring_toggle") {

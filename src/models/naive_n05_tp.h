@@ -1,5 +1,6 @@
 #pragma once
 #include "models/naive_n05_flash.h"
+#include "utils/decode_graph.h"
 #ifdef USE_CUDA
 #include "devices/cuda/naive-n05-cuda.cuh"
 
@@ -65,6 +66,7 @@ struct NaiveN05FlashModel::TPServingState {
     std::vector<const Data *> requests;
     std::vector<int> expectedLengths, capacityLimits;
     std::vector<int *> cacheLengths, pageLengths;
+    std::vector<int> batchBuckets;
     std::map<std::pair<int, int>, std::shared_ptr<TPDecodeState>> graphs;
 };
 }

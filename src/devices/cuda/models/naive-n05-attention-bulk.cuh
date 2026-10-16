@@ -123,6 +123,7 @@ __global__ __launch_bounds__(256) void Decode(const BF *q, Batch batch, const fl
     const int row = blockIdx.x, group = blockIdx.y, head = group * 8, t = threadIdx.x, l = t % 32,
               w = t / 32, kh = head / (heads / kvHeads);
     auto r = FastllmNaiveResolveDSARow(batch.rows[row]);
+    if (ZeroInactive(r, out + ((size_t)row * heads + head) * 128, 8 * 128)) return;
     r.fp8 = FP8;
     int len = Ring ? (r.liveKeys ? *r.liveKeys : r.length) : Length(r);
     int n = Ring ? min(len, 128) : (r.indices ? r.selectedCount : len);

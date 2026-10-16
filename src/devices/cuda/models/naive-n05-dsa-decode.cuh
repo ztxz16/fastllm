@@ -9,6 +9,13 @@ using BF16 = __nv_bfloat16;
 __device__ __forceinline__ int Length(const FastllmNaiveDSARow &r) {
     return max(0, min(r.capacity, r.liveKeys ? *r.liveKeys : r.length));
 }
+// A whole CTA owns this output slice. Test before page translation, index
+// reads or barriers: padded rows have no KV allocation or valid tensor map.
+__device__ __forceinline__ bool ZeroInactive(const FastllmNaiveDSARow &r, BF16 *out, int count) {
+    if (!r.liveKeys || *r.liveKeys > 0) return false;
+    for (int i = threadIdx.x; i < count; i += blockDim.x) out[i] = __float2bfloat16(0.f);
+    return true;
+}
 __device__ __forceinline__ float Round(float x) {
     return __bfloat162float(__float2bfloat16(x));
 }
@@ -39,6 +46,7 @@ __global__ void Scores(const BF16 *q, FastllmNaiveDSABatch batch, float *scores,
     const int h = blockIdx.x, b = blockIdx.z, first = blockIdx.y * 64, t = threadIdx.x, lane = t & 31,
               warp = t >> 5;
     auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
+    if (Length(r) == 0) return;
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
     __shared__ __align__(16) BF16 keys[64][264];
     __shared__ int selected[64];
@@ -94,6 +102,7 @@ __global__ void DirectScores(const BF16 *q, FastllmNaiveDSABatch batch, float *s
     const int h = blockIdx.x, b = blockIdx.z, t = threadIdx.x, lane = t & 31, warp = t >> 5,
               first = blockIdx.y * RowsPerWarp * Warps;
     const auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
+    if (Length(r) == 0) return;
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
     FastllmNaiveKV key((const BF16 *)r.key, r.keyPages, r.pageLen, r.fp8);
     float qr[6];
@@ -173,6 +182,7 @@ __device__ __forceinline__ void Normalize(const float *input, float *output, con
 __global__ void Softmax(float *scores, const float *sink, FastllmNaiveDSABatch batch, int heads, int stride) {
     const int row = blockIdx.x;
     auto r = batch.rows[row / heads];
+    if (Length(r) == 0) return;
     int count = r.indices ? r.selectedCount : Length(r);
     __shared__ float scratch[256], maximum, denominator;
     Normalize(scores + (size_t)row * stride, scores + (size_t)row * stride, sink, row % heads, count, scratch,
@@ -198,6 +208,7 @@ __global__ void Values(const float *scores, FastllmNaiveDSABatch batch, BF16 *ou
     constexpr int Tile = 256, Columns = 8;
     const int h = blockIdx.x, b = blockIdx.z, column = blockIdx.y * Columns, t = threadIdx.x;
     auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
+    if (ZeroInactive(r, out + ((size_t)b * heads + h) * ValueDim + column, Columns)) return;
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
     FastllmNaiveKV value((const BF16 *)r.value, r.valuePages, r.pageLen, r.fp8);
     const float *p = scores + ((size_t)b * heads + h) * stride;
@@ -241,6 +252,7 @@ __global__ void SoftmaxTransposedValues(const float *scores, const float *sink, 
                                         BF16 *out, int heads, int kvHeads, int stride) {
     const int h = blockIdx.x, b = blockIdx.z, t = threadIdx.x, column = blockIdx.y * Columns;
     const auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
+    if (ZeroInactive(r, out + ((size_t)b * heads + h) * 128 + column, Columns)) return;
     const int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
     extern __shared__ __align__(16) unsigned char buffer[];
     auto &st = *(TransposedStorage<MaxKeys, Columns> *)buffer;
@@ -307,6 +319,7 @@ __global__ void SoftmaxSparseValues(const float *scores, const float *sink, Fast
                                     BF16 *out, int heads, int kvHeads, int stride) {
     const int h = blockIdx.x, b = blockIdx.z, t = threadIdx.x, column = blockIdx.y * Columns;
     const auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
+    if (ZeroInactive(r, out + ((size_t)b * heads + h) * 128 + column, Columns)) return;
     const int length = Length(r), count = r.indices ? r.selectedCount : length, kh = h / (heads / kvHeads);
     extern __shared__ __align__(16) unsigned char buffer[];
     auto &st = *(SparseStorage<MaxKeys, Columns> *)buffer;
@@ -370,6 +383,11 @@ __global__ void GroupedValues(const float *scores, const float *sink, FastllmNai
                               int heads, int kvHeads, int stride) {
     const int t = threadIdx.x, b = blockIdx.z, firstHead = blockIdx.x * Groups, column = blockIdx.y * Columns;
     const auto r = FastllmNaiveResolveDSARow(batch.rows[b]);
+    if (r.liveKeys && *r.liveKeys <= 0) {
+        for (int i = t; i < Groups * Columns; i += blockDim.x)
+            out[((size_t)b * heads + firstHead + i / Columns) * 128 + column + i % Columns] = __float2bfloat16(0.f);
+        return;
+    }
     int length = Length(r), count = r.indices ? r.selectedCount : length, kh = firstHead / (heads / kvHeads);
     extern __shared__ __align__(16) unsigned char memory[];
     auto &s = *(GroupStorage<MaxKeys, Groups, Columns> *)memory;

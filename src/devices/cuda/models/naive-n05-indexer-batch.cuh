@@ -27,6 +27,7 @@ struct Batch { Row rows[BatchLimit]; };
 // Device lengths and optional KV bindings change without rebinding scratch.
 __global__ void Quantize(const BF16 *query, Batch batch) {
     const Row &row = batch.rows[blockIdx.y];
+    if (*row.live <= 0) return;
     naive_dsa_mma::QuantizeIndexerRow(query + (size_t)row.sequence *
         naive_dsa_mma::kHeads * naive_dsa_mma::kIndexerDim,
         row.query, row.scale, naive_dsa_mma::kIndexerDim, 0, false);

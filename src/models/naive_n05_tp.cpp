@@ -396,12 +396,8 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
     serving->generation = FastllmGetNcclGeneration();
     const int maxRows = std::min(maxBatch > 0 ? maxBatch : 256, 256);
     const int64_t tokenBudget = tokensLimit > 0 ? tokensLimit : (int64_t)maxRows * 16384;
-    std::vector<int> batches;
-    for (int n = 1; n <= maxRows; n *= 2) batches.push_back(n);
-    batches.push_back(maxRows);
-    if (maxRows >= 3) batches.push_back(3);
-    std::sort(batches.begin(), batches.end(), std::greater<int>());
-    batches.erase(std::unique(batches.begin(), batches.end()), batches.end());
+    serving->batchBuckets = DecodeGraphBatchBuckets(maxRows);
+    std::vector<int> batches(serving->batchBuckets.rbegin(), serving->batchBuckets.rend());
     int64_t scoreElements = 0;
     for (int rows : batches) {
         // A request cannot exceed the configured token pool. Round the last
@@ -632,7 +628,9 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
                 capacity = (int)std::min<int64_t>((int64_t)capacity * 2, max_positions);
         }
     }
-    auto found = serving.graphs.find({rows, capacity});
+    const auto shape = DecodeGraphBatch::Select(rows, serving.batchBuckets);
+    if (!shape) return false;
+    auto found = serving.graphs.find({shape.graphRows, capacity});
     if (found == serving.graphs.end() || found->second->disabled ||
         (!serving.preparing && (!serving.sealed || !found->second->captured))) return false;
     auto state = found->second;
@@ -697,6 +695,14 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
         // must be rebound even when returning to a previously used graph variant.
         for (int rank = 0; rank < ranks; ++rank) {
             auto &storage = *state->ranks[rank]->storage;
+            // Never retain bindings to requests that left the batch. Inactive
+            // device lengths prevent kernels from dereferencing these slots.
+            for (int layer = 0; layer < block_cnt; ++layer)
+            for (int row = rows; row < storage.maxRows; ++row)
+            for (int part = 0; part < 4; ++part) {
+                auto &pointer = storage.hostCache[((size_t)layer * storage.maxRows + row) * 4 + part];
+                if (pointer) { pointer = nullptr; storage.cacheDirty = true; }
+            }
             for (int layer = 0; layer < block_cnt; ++layer)
             for (int row = 0; row < rows; ++row)
             for (int part = 0; part < 2; ++part) {
@@ -1014,8 +1020,9 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
     auto &r = *state.ranks.at(rank);
     auto &storage = *r.storage;
     auto &buf = storage.buffers;
+    const int actualRows = batch ? batch->Size() : state.rows;
     if (state.mode != TPDecodeState::Capture) {
-        const size_t rowBytes = state.rows * sizeof(float);
+        const size_t rowBytes = actualRows * sizeof(float);
         const size_t strideBytes = (storage.maxRows ? storage.maxRows : state.rows) * sizeof(float);
         const bool hostInputs = inputIds.dataDevice == DataDevice::CPU &&
             positions.dataDevice == DataDevice::CPU && inputIds.dataType == FLOAT32 &&
@@ -1037,14 +1044,17 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
         }
         if (hostInputs && !storage.inputStorage.dims.empty()) {
             // Copy integer lengths as bytes, preserving their representation.
-            buf.inputIds.Resize(inputIds.dims);
-            buf.positions.Resize(positions.dims);
+            buf.inputIds.Resize({1, state.rows});
+            buf.positions.Resize({1, state.rows});
             buf.liveKeys.Resize({state.rows});
             storage.hostInput.resize(3 * strideBytes);
             unsigned char *input = storage.hostInput.data();
+            // Zero length is the device-side inactive-row contract. Clear all
+            // tails on every replay, including when reusing the same graph.
+            std::memset(input, 0, 3 * strideBytes);
             std::memcpy(input, inputIds.cpuData, rowBytes);
             std::memcpy(input + strideBytes, positions.cpuData, rowBytes);
-            for (int row = 0; row < state.rows; ++row) {
+            for (int row = 0; row < actualRows; ++row) {
                 int length = batch ? batch->Key(row, 0).dims[1] + 1 : kv[0].first.dims[1] + row + 1;
                 std::memcpy(input + 2 * strideBytes + row * sizeof(int), &length, sizeof(int));
             }
@@ -1063,13 +1073,17 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
                 if (src.dataDevice == DataDevice::CUDA)
                     FastllmCudaCopyFromDeviceToDevice(dst.cudaData, src.cudaData, src.GetBytes());
                 else FastllmCudaCopyFromHostToDevice(dst.cudaData, src.cpuData, src.GetBytes());
+                if (actualRows < state.rows)
+                    FastllmCudaMemset0((char *)dst.cudaData + src.GetBytes(),
+                        (state.rows - actualRows) * sizeof(float));
+                dst.Resize({1, state.rows});
             };
             copyInput(buf.inputIds, inputIds);
             Data localPositions(positions);
             ToDataType(localPositions, FLOAT32);
             copyInput(buf.positions, localPositions);
             std::vector<int> lengths(state.rows);
-            for (int row = 0; row < state.rows; ++row) lengths[row] = batch ? batch->Key(row, 0).dims[1] + 1 : kv[0].first.dims[1] + row + 1;
+            for (int row = 0; row < actualRows; ++row) lengths[row] = batch ? batch->Key(row, 0).dims[1] + 1 : kv[0].first.dims[1] + row + 1;
             if (buf.liveKeys.dims.empty()) {
                 buf.liveKeys.dataType = INT32;
                 buf.liveKeys.UpdateUnitSize();
@@ -1121,7 +1135,7 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
     if (capture && capture->collectHidden)
         for (auto &feature : r.features.hidden) Copy(feature.second, capture->hidden[feature.first]);
     if (state.selection.count && candidateResult) {
-        FastllmCudaCopyFromDeviceToHost(candidateResult, storage.logitsCandidates.cudaData, (size_t)state.rows * state.selection.count * 2 * sizeof(float));
+        FastllmCudaCopyFromDeviceToHost(candidateResult, storage.logitsCandidates.cudaData, (size_t)actualRows * state.selection.count * 2 * sizeof(float));
         return Data();
     }
     if (keepCudaLogits) {
@@ -1130,11 +1144,11 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
         output.FakeFrom(buf.logits, 0);
         // Storage is shared across batch graphs; its host shape may describe
         // the last captured batch rather than the graph being replayed.
-        output.Resize({1, state.rows, tpVocabRanges[rank].second - tpVocabRanges[rank].first});
+        output.Resize({1, actualRows, tpVocabRanges[rank].second - tpVocabRanges[rank].first});
         return output;
     }
     // ToDevice(CPU) would release the graph's persistent output allocation.
-    Data output(FLOAT32, {1, state.rows, tpVocabRanges[rank].second - tpVocabRanges[rank].first});
+    Data output(FLOAT32, {1, actualRows, tpVocabRanges[rank].second - tpVocabRanges[rank].first});
     output.Allocate();
     FastllmCudaCopyFromDeviceToHost(output.cpuData, buf.logits.cudaData, output.GetBytes());
     return output;
@@ -1457,6 +1471,10 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             graphDecode = false;
         } else state.captured = true;
     }
+    // Startup uses borrowed descriptor-only caches, not normal request-owned
+    // pages. A failed shape is simply unavailable; eager fallback starts with
+    // real requests after preparation, never with this private warmup backing.
+    if (!graphDecode && tpServingState && tpServingState->preparing) return Data();
     if (!graphDecode || verify) tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
     if (!graphDecode && !tpKVPool.empty()) {
         // Graph preparation already validates every rank's existing capacity.

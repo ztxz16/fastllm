@@ -40,8 +40,11 @@ __device__ int PhysicalRow(Params p, int b, int row, bool value) {
 }
 __device__ void Store(Params p, int b, int logical, BF value, BF peer) {
     int row = CacheRow(p, b);
-    if (row < 0)
+    if (row < 0) {
+        int c = Channel(logical);
+        if (c < kQuery) p.q[b * kQuery + c] = __float2bfloat16(0.f);
         return;
+    }
     int c = Channel(logical), d = c % 192;
     if (c < kQK && d < 64)
         value = Rotate(value, peer, d, p.positions[b], p.theta);

@@ -1124,7 +1124,8 @@ Data NaiveN05FlashModel::RunTarget(
                     expertIndex, expertScore, moeOutput, decodeWorkspace,
                     (shardMoe || shardPrefillNorm) ? &hidden : nullptr,
                     mlpNormWeight, mlpNormOutput, rms_norm_eps,
-                    !decodeWorkspace && !hasRouterProbabilities ? &routerInput : nullptr);
+                    !decodeWorkspace && !hasRouterProbabilities ? &routerInput : nullptr,
+                    decodeWorkspace && !verifying ? (const int *)buf.liveKeys.cudaData : nullptr);
             } else if (executor.firstDevice.find("numa") == 0 &&
                 (moeWeights[layer][2]->dataType == DataType::FP8_E4M3 ||
                  moeWeights[layer][2]->dataType == DataType::FP8_E4M3_BLOCK_128)) {

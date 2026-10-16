@@ -43,6 +43,15 @@ template <typename Score, typename Count = int>
 __global__ void Select(const Score *scores, Count liveCount, int *partials, int *ties, State *state,
                        Candidates *out) {
     int n = liveCount;
+    if (n <= 0) {
+        // The live count is common to this cooperative grid. All CTAs take
+        // the same branch before any grid barrier or score read.
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            state->selected = 0;
+            state->uniform = 1;
+        }
+        return;
+    }
     constexpr int T = kThreads;
     using Scan = cub::BlockScan<int, T>;
     __shared__ int hist[kBuckets];

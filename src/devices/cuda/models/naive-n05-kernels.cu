@@ -814,7 +814,13 @@ __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
     const int keyRows = r.keyRows, valueRows = r.valueRows, cachePast = r.cachePast;
     const int past = length ? (window ? min(*length - 1, window - 1) : *length - 1) : cachePast;
     const int row = ring ? ((*length - 1) & (kSwaWindow - 1)) : past + token;
-    if (past < 0 || row >= keyRows || row >= valueRows) return;
+    if (past < 0) {
+        if (head < heads)
+            for (int d = threadIdx.x; d < dim; d += blockDim.x)
+                q[((size_t)token * heads + head) * dim + d] = __float2bfloat16(0.f);
+        return;
+    }
+    if (row >= keyRows || row >= valueRows) return;
     const size_t base = (size_t)token * ((heads + kvHeads) * dim + kvHeads * valueDim);
     if (head < heads) {
         BF16 *dst = q + ((size_t)token * heads + head) * dim;
@@ -1536,6 +1542,17 @@ struct BatchSwaKeys {
 template <int MaxKeys, typename Length = int, bool Verify = false, int Threads = kSwaThreads, int OutputTile = kSwaOutputTile, bool Ring = false>
 __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNaiveKV v,
         const float *sink, BF16 *out, int heads, int kvHeads, int keyStride, const Length liveKeys) {
+    int keys = liveKeys;
+    if constexpr (Verify) keys = min(VerifyCount(liveKeys, blockIdx.y), MaxKeys);
+    // Handle inactive rows before binding KV or calculating the active-row
+    // offsets, so padding does not extend their register lifetimes.
+    if (keys <= 0) {
+        const int row = (Verify || std::is_same<Length, BatchSwaKeys>::value) ? blockIdx.y : 0;
+        if (threadIdx.x < OutputTile)
+            out[((size_t)row * heads + blockIdx.x) * kSwaValueDim +
+                blockIdx.z * OutputTile + threadIdx.x] = __float2bfloat16(0.f);
+        return;
+    }
     if constexpr (std::is_same<Length, BatchSwaKeys>::value) {
         const int row = blockIdx.y;
         q += (size_t)row * heads * kSwaQkDim;
@@ -1557,8 +1574,6 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
             v += (size_t)begin * kvHeads * kSwaValueDim;
         }
     }
-    int keys = liveKeys;
-    if constexpr (Verify) keys = min(VerifyCount(liveKeys, blockIdx.y), MaxKeys);
     int firstKey = 0;
     if constexpr (Ring) {
         if constexpr (std::is_same<Length, BatchSwaKeys>::value)

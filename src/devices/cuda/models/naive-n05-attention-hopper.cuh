@@ -81,6 +81,7 @@ __global__ __launch_bounds__(256) void HopperDecode(const BF *q,
     const int row = blockIdx.x, group = blockIdx.y, head = group * 8, t = threadIdx.x, l = t % 32,
               w = t / 32;
     auto r = FastllmNaiveResolveDSARow(batch.rows[row]);
+    if (ZeroInactive(r, out + ((size_t)row * heads + head) * 128, 8 * 128)) return;
     const int n = Length(r);
     const auto *maps = r.tensorMaps ? (const CUtensorMap *)r.tensorMaps : batch.maps + row * 2;
     if (t == 0 && r.tensorMaps) {

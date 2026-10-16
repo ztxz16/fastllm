@@ -816,6 +816,8 @@ if (UNIT_TEST)
     target_link_libraries(response_statistics_test PRIVATE fastllm)
     add_test(NAME response_statistics COMMAND response_statistics_test)
     set_tests_properties(response_statistics PROPERTIES TIMEOUT 30)
+    add_executable(decode_graph_batch_test test/basic/test_decode_graph_batch.cpp)
+    add_test(NAME decode_graph_batch COMMAND decode_graph_batch_test)
     add_executable(moe_expert_partition_test test/basic/test_moe_expert_partition.cpp)
     target_include_directories(moe_expert_partition_test PRIVATE src)
     add_test(NAME moe_expert_partition COMMAND moe_expert_partition_test)
@@ -1700,6 +1702,10 @@ if (UNIT_TEST)
             endforeach()
             add_test(NAME naive_n05_serving_invalidation
                 COMMAND naive_n05_verify_graph_test 2 serving_invalidation)
+            add_test(NAME naive_n05_serving_padding COMMAND naive_n05_verify_graph_test 8 serving_padding)
+            set_tests_properties(naive_n05_serving_padding PROPERTIES
+                LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600
+                PASS_REGULAR_EXPRESSION "SERVING GRAPH PASS")
             set_tests_properties(naive_n05_serving_invalidation
                 PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                 PASS_REGULAR_EXPRESSION "SERVING INVALIDATION PASS")

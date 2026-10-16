@@ -28,4 +28,4 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
     fastllm::Data &output, bool graphDecode, fastllm::Data *residual = nullptr,
     const fastllm::Data *normWeight = nullptr, fastllm::Data *normOutput = nullptr, float eps = 0,
-    fastllm::Data *prefillScratch = nullptr);
+    fastllm::Data *prefillScratch = nullptr, const int *liveKeys = nullptr);

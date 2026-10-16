@@ -263,7 +263,7 @@ extern "C" int fastllm_ep8_mega_moe_prepare_prefill(void *handle, void *workspac
 }
 template <int capacity>
 static int Run(void *handle, const void *x, void *y, const int32_t *idx,
-               const float *scores, int rows, const void *const *peers = nullptr) {
+               const float *scores, int rows, const void *const *peers = nullptr, const int *liveKeys = nullptr) {
     try {
         constexpr bool Prefill = capacity > CAP;
         if (!handle || !x || !y || !idx || !scores || rows < 0 || rows > capacity)
@@ -292,7 +292,7 @@ static int Run(void *handle, const void *x, void *y, const int32_t *idx,
         sm90_mega_moe_pre_dispatch_kernel<128, false><<<rows + padBlocks, H / 8, 0, cudaStreamPerThread>>>(
             static_cast<const __nv_bfloat16 *>(x), idx, scores,
             static_cast<__nv_fp8_e4m3 *>(s.x), static_cast<float *>(s.xs), static_cast<int64_t *>(s.idx),
-            static_cast<float *>(s.scores), rows, capacity, H, H / 128, K, 1.0f);
+            static_cast<float *>(s.scores), rows, capacity, H, H / 128, K, 1.0f, liveKeys);
         auto sym = layout::SymBuffer<R>(addresses, l.rank);
         kernel<capacity>()<<<SMS, 384, Prefill ? PREFILL_SMEM : SMEM, cudaStreamPerThread>>>(y, nullptr, rows, sym, s.a1, s.sa1, s.metadata->gate,
             s.metadata->gateScales, s.d1, s.a2, s.sa2, s.metadata->down, s.metadata->downScales);
@@ -306,6 +306,10 @@ static int Run(void *handle, const void *x, void *y, const int32_t *idx,
 extern "C" int fastllm_ep8_mega_moe_run(void *handle, const void *x, void *y, const int32_t *idx,
                                       const float *scores, int rows) {
     return Run<CAP>(handle, x, y, idx, scores, rows);
+}
+extern "C" int fastllm_ep8_mega_moe_run_masked(void *handle, const void *x, void *y, const int32_t *idx,
+        const float *scores, int rows, const int *liveKeys) {
+    return Run<CAP>(handle, x, y, idx, scores, rows, nullptr, liveKeys);
 }
 extern "C" int fastllm_ep8_mega_moe_run_prefill(void *handle, const void *const *peers,
         const void *x, void *y, const int32_t *idx, const float *scores, int rows) {

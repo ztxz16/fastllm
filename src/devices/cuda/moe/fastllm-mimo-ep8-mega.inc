@@ -188,7 +188,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, bool graphDecode, fastllm::Data *residual,
         const fastllm::Data *normWeight, fastllm::Data *normOutput, float eps,
-        fastllm::Data *prefillScratch) {
+        fastllm::Data *prefillScratch, const int *liveKeys) {
     using namespace fastllm;
     AssertInFastLLM(input.dataType == BFLOAT16 && input.dims.size() == 2 &&
         input.dims[1] == 4096, "Invalid MiMo EP8 input shape.");
@@ -250,7 +250,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
         const int32_t *idx = (const int32_t *)index.cudaData + routeStart * 8;
         const float *scores = (const float *)score.cudaData + routeStart * 8;
         const int ok = !prefillPeers[0] ?
-            fastllm_ep8_mega_moe_run(handle, x, y, idx, scores, rows) :
+            fastllm_ep8_mega_moe_run_masked(handle, x, y, idx, scores, rows, liveKeys ? liveKeys + start : nullptr) :
             fastllm_ep8_mega_moe_run_prefill(handle, prefillPeers, x, y, idx, scores, rows);
         if (!ok)
             throw std::runtime_error(std::string("MiMo EP8 launch failed: ") + fastllm_ep8_mega_moe_error());
@@ -333,7 +333,7 @@ void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &, int, fastllm::
 }
 bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &, int, int, const fastllm::Data &,
     const fastllm::Data &, const fastllm::Data &, fastllm::Data &, bool, fastllm::Data *,
-    const fastllm::Data *, fastllm::Data *, float, fastllm::Data *) {
+    const fastllm::Data *, fastllm::Data *, float, fastllm::Data *, const int *) {
     throw std::runtime_error("MiMo EP8 MegaMoE requires a Linux CUDA build containing the SM90 backend.");
 }
 #endif
