@@ -993,6 +993,9 @@ if (UNIT_TEST)
         fastllm_add_checked_test(disk_embedding_reader disk_embedding_reader_test
             "PASS disk embedding reader" 60)
         if (USE_CUDA AND NOT USE_ROCM)
+            fastllm_add_checked_test(qwen4_draft_vocab qwen4_gguf_test
+                "PASS: draft vocabulary format=" 60 --draft-vocab)
+            set_tests_properties(qwen4_draft_vocab PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
             fastllm_add_checked_test(qwen4_gguf_tp_load qwen4_gguf_test
                 "PASS: Qwen4 streaming TP expert load" 60 --tp-load)
             set_tests_properties(qwen4_gguf_tp_load PROPERTIES LABELS "cuda;gguf;tp" RUN_SERIAL TRUE)

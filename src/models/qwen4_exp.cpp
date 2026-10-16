@@ -54,6 +54,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -1530,6 +1531,7 @@ namespace fastllm {
         std::vector<int> devices;
         std::vector<std::vector<int>> workerCpus;
         bool hostMoe = false;
+        bool mtpGpuExperts = false;
         std::vector<bool> hostMoeLayers;
         int loadingExpertLayer = -1;
         std::vector<std::string> loadingReplicas;
@@ -1540,11 +1542,27 @@ namespace fastllm {
         int vocabSize = 0;
         std::vector<std::vector<std::pair<int, float>>> topCandidates;
         std::vector<std::pair<float, float>> topProbabilities;
+        struct DraftCandidate { int token, order; float score; };
+        std::vector<DraftCandidate> draftCandidates;
         std::vector<const Data *> shardLogits;
         Data gatheredLogits;
         bool TrySampleLogits(int rank, Data &logits,
                 const GenerationConfig &config, int cacheLength, int &token,
                 std::vector<int> *tokens = nullptr, float *topProbability = nullptr);
+        int MergeDraftTop(int rank, int token, int order, float score,
+                          float localProbability, float *probability) {
+            draftCandidates[rank] = {token, order, score};
+            topProbabilities[rank] = {score, localProbability};
+            Barrier();
+            auto best = draftCandidates.front();
+            for (const auto &candidate : draftCandidates) {
+                if (qwen4_tp::Top1Before(candidate.order, candidate.score,
+                                         best.order, best.score)) best = candidate;
+            }
+            if (probability) *probability = qwen4_tp::MergeTopProbability(topProbabilities);
+            Barrier(); // Peers must finish reading before the next proposal.
+            return best.token;
+        }
         std::vector<std::unique_ptr<Qwen4ExpModel>> ranks;
         using Cache = std::vector<std::pair<Data, Data>>;
         struct RequestCache {
@@ -1658,7 +1676,8 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (!threadTpState || threadTpRank >= 0) return -1;
         if (Qwen4StartsWith(name, kMtpExpertPrefix)) {
-            return threadTpState->hostMoeLayers.back() ? -1 : block_cnt;
+            return threadTpState->hostMoeLayers.back() && !threadTpState->mtpGpuExperts
+                ? -1 : block_cnt;
         }
         const std::string prefix = languagePrefix + "layers.";
         if (!Qwen4StartsWith(name, prefix)) return -1;
@@ -1827,6 +1846,7 @@ namespace fastllm {
                                           [](bool host) { return host; });
         threadTpState->hostMoeLayers = std::move(hostMoeLayers);
 #ifndef USE_ROCM
+        threadTpState->mtpGpuExperts = Qwen4MtpDraftsPerStep() > 0;
         if (threadTpState->hostMoe && MoeCudaCacheRequested()) {
             threadTpState->expertParallel = FastllmCudaCreateMoeExpertParallel(count);
         }
@@ -1842,13 +1862,19 @@ namespace fastllm {
     std::string Qwen4ExpModel::SelectSpecialWeightDevice(
             const std::string &weightName, int layerId) const {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (Qwen4StartsWith(weightName, kMtpExpertPrefix)) {
+            // Parent loading streams CUDA shards without NUMA registration;
+            // each rank executes its own shard outside the target expert cache.
+            if (threadTpState && threadTpState->mtpGpuExperts) return "cuda";
+            if (threadTpOwner && threadTpOwner->mtpGpuExperts)
+                return "cuda:" + std::to_string(threadTpOwner->devices[threadTpRank]);
+        }
         // The small draft stack runs repeatedly between target windows.
         // Keep its experts beside the draft stack, outside the target's
-        // bounded expert cache. A pipeline uses its final GPU; TP retains
-        // its existing distributed placement policy.
+        // bounded expert cache. A pipeline uses its final GPU; TP uses
+        // resident shards selected above.
         if (threadTpState == nullptr && threadTpRank < 0 &&
             Qwen4StartsWith(weightName, kMtpExpertPrefix) &&
-            Qwen4EnvFlagEnabled("FASTLLM_QWEN4_MTP_GPU_EXPERTS", true) &&
             Qwen4CudaOnlyDeviceMap(deviceMap)) {
             const std::string device = SelectDeviceFromMap(deviceMap, block_cnt, block_cnt);
             if (device == "cuda" || device.compare(0, 5, "cuda:") == 0) {
@@ -1888,6 +1914,8 @@ namespace fastllm {
         }
 #endif
         tp.votes.resize(count);
+        tp.draftCandidates.resize(count);
+        tp.topProbabilities.resize(count);
         AssertInFastLLM(FastllmInitNccl(devices), "Qwen4 TP NCCL initialization failed.");
         for (int device : devices) {
             FastllmCudaSetDevice(device);
@@ -1953,7 +1981,7 @@ namespace fastllm {
                 model->mtpWeightsStatus.store(mtpWeightsStatus.load());
                 model->mtpMoeWeights.assign(2 + 2 * num_experts, nullptr);
                 model->mtpMoeBiass = model->mtpMoeWeights;
-                if (tp.hostMoeLayers.back()) {
+                if (tp.hostMoeLayers.back() && !tp.mtpGpuExperts) {
                     model->mtpMoeWeights = mtpMoeWeights;
                     model->mtpMoeBiass = mtpMoeBiass;
                 } else {
@@ -1998,7 +2026,8 @@ namespace fastllm {
             const bool mtpExpert = expertWeight && name.rfind("mtp.", 0) == 0;
             const int expertLayer = expertWeight ? (mtpExpert ? block_cnt - 1 :
                 std::atoi(name.c_str() + name.find("layers.") + 7)) : -1;
-            if (expertWeight && tp.hostMoeLayers.at(expertLayer)) {
+            if (expertWeight && tp.hostMoeLayers.at(expertLayer) &&
+                !(mtpExpert && tp.mtpGpuExperts)) {
                 // Keep the original host layout and NUMA weight registrations.
                 continue;
             }
@@ -2035,6 +2064,10 @@ namespace fastllm {
                 tp.topCandidates.resize(count);
                 tp.topProbabilities.resize(count);
                 tp.shardLogits.resize(count);
+                // Select the draft rows while the canonical full target head
+                // is still available. Partition by subset row, preserving
+                // TopK lane order and balancing even a skewed token list.
+                if (Qwen4MtpDraftsPerStep() > 0) PrepareMtpDraftSubsetHead();
                 for (int r = 0; r < count; ++r) {
                     scheme[devices[r]] = {qwen4_tp::VocabRange(tp.vocabSize, count, r)};
                 }
@@ -2727,7 +2760,8 @@ namespace fastllm {
                 if (layer.size() > 2 && layer[2] != nullptr)
                     FastllmCudaReleaseMergeMOEVllmMarlinCache(layer[2]);
             }
-            if (!threadTpOwner->hostMoeLayers.back() && mtpMoeWeights.size() > 2 && mtpMoeWeights[2])
+            if ((!threadTpOwner->hostMoeLayers.back() || threadTpOwner->mtpGpuExperts) &&
+                mtpMoeWeights.size() > 2 && mtpMoeWeights[2])
                 FastllmCudaReleaseMergeMOEVllmMarlinCache(mtpMoeWeights[2]);
         }
 #endif
@@ -3740,6 +3774,94 @@ namespace fastllm {
         // otherwise nearly double host RSS. Warmup also trims those pages.
         WarmupNumaMoeWeights();
         this->preparedWeights = true;
+    }
+
+    void Qwen4ExpModel::PrepareMtpDraftSubsetHead() {
+#ifdef USE_CUDA
+        if (mtpDraftSubsetAttempted) return;
+        const char *path = std::getenv("FASTLLM_MTP_DRAFT_VOCAB");
+        if (!path || !*path) return;
+        std::lock_guard<std::mutex> guard(prepareMutex);
+        if (mtpDraftSubsetAttempted) return;
+        auto require = [](bool ok, const char *message) {
+            if (!ok) throw std::runtime_error(message);
+        };
+        Data &head = weight["lm_head.weight"];
+        const bool prepareTp = threadTpState != nullptr && threadTpRank < 0;
+        require(head.dataType == DATA_GGUF_FORMAT &&
+            (head.ggmlType == GGML_TYPE_Q8_0 || head.ggmlType == GGML_TYPE_Q6_K) &&
+            !head.IsRepacked && head.dims.size() == 2 &&
+            ((prepareTp && head.cpuData) || (head.dataDevice == CUDA && head.cudaData)) &&
+            !head.multiDeviceData,
+            "MTP draft vocabulary requires a canonical Q8_0 or Q6_K head before TP sharding.");
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        const auto bytes = file ? file.tellg() : std::streampos(-1);
+        require(bytes > 0 && size_t(bytes) % sizeof(int32_t) == 0 &&
+            size_t(bytes) / sizeof(int32_t) <= size_t(head.dims[0]),
+            "Invalid MTP draft vocabulary file; expected little-endian int32 token ids.");
+        std::vector<int32_t> ids(size_t(bytes) / sizeof(int32_t));
+        file.seekg(0);
+        file.read(reinterpret_cast<char *>(ids.data()), size_t(bytes));
+        require(bool(file), "Failed to read MTP draft vocabulary.");
+        std::vector<bool> seen(head.dims[0], false);
+        for (int id : ids) {
+            require(id >= 0 && id < head.dims[0] && !seen[id],
+                "MTP draft vocabulary contains an invalid or duplicate token id.");
+            seen[id] = true;
+        }
+        const size_t rowBytes = ggml_row_size(static_cast<ggml_type>(head.ggmlType), head.dims[1]);
+        require(head.GetBytes() == rowBytes * head.dims[0], "MTP head row layout mismatch.");
+        // Preserve the target head and its quantization exactly. This one-time
+        // copy selects vocabulary rows; verification still uses the full head.
+        std::vector<uint8_t> source;
+        const uint8_t *canonical = head.cpuData;
+        if (!canonical) {
+            source.resize(head.GetBytes());
+            FastllmCudaCopyFromDeviceToHost(source.data(), head.cudaData, source.size());
+            canonical = source.data();
+        }
+        auto prepare = [&](Qwen4ExpModel &model, int first, int end,
+                           const std::vector<int> &devices) {
+            auto &subset = model.mtpDraftSubsetHead;
+            subset.dataType = DATA_GGUF_FORMAT;
+            subset.ggmlType = head.ggmlType;
+            subset.isGGUFData = true;
+            subset.Resize({end - first, head.dims[1]});
+            subset.Allocate(false);
+            for (int row = first; row < end; ++row)
+                std::memcpy(subset.cpuData + size_t(row - first) * rowBytes,
+                    canonical + size_t(ids[row]) * rowBytes, rowBytes);
+            subset.name = head.name + ".mtp_draft_subset";
+            subset.weightType = WeightType::LINEAR;
+            subset.isModelWeight = true;
+            subset.ToDevice(CUDA, devices);
+            model.mtpDraftSubsetIds.assign(ids.begin() + first, ids.begin() + end);
+            model.mtpDraftSubsetOffset = first;
+            model.mtpDraftSubsetAttempted = true;
+        };
+        if (prepareTp) {
+            auto &tp = *threadTpState;
+            // Keep nonempty, 256-row-aligned shards for the TopK reduction.
+            // A tiny subset safely retains the full-vocabulary TP path.
+            if (ids.size() / 256 < tp.ranks.size()) {
+                for (auto &rank : tp.ranks) rank->mtpDraftSubsetAttempted = true;
+                mtpDraftSubsetAttempted = true;
+                std::fprintf(stderr, "[Qwen4-Exp MTP] draft vocabulary too small for TP; retaining full head.\n");
+                return;
+            }
+            Qwen4CudaDeviceGuard deviceGuard;
+            for (int rank = 0; rank < (int)tp.ranks.size(); ++rank) {
+                auto range = qwen4_tp::VocabRange(ids.size(), tp.ranks.size(), rank);
+                prepare(*tp.ranks[rank], range.first, range.second, {tp.devices[rank]});
+            }
+        } else {
+            prepare(*this, 0, ids.size(), head.dataDeviceIds);
+        }
+        mtpDraftSubsetAttempted = true;
+        std::fprintf(stderr, "[Qwen4-Exp MTP] draft vocabulary %zu/%d, %.2f MiB total, %zu rank(s); full target head retained.\n",
+            ids.size(), head.dims[0], ids.size() * rowBytes / 1048576.0,
+            prepareTp ? threadTpState->ranks.size() : size_t(1));
+#endif
     }
 
     void Qwen4ExpModel::PrepareMtpDraftLmHeadWeight() {
@@ -7026,7 +7148,10 @@ namespace fastllm {
         flattened.Resize(input.dims);
         flattened.Reshape({batch * sequence, input.dims.back()});
 
-        const bool hostMoe = threadTpRank >= 0 && threadTpOwner->hostMoeLayers[deviceLayer];
+        const bool residentTpDraft = threadTpRank >= 0 && threadTpOwner->mtpGpuExperts &&
+            Qwen4StartsWith(mlp, "mtp.");
+        const bool hostMoe = threadTpRank >= 0 && threadTpOwner->hostMoeLayers[deviceLayer] &&
+            !residentTpDraft;
         const bool runRoutedExperts = !hostMoe || threadTpRank == 0;
         const std::string moeDevice = SelectSpecialWeightDevice(
             mlp + "experts.0.gateup_proj.weight", deviceLayer);
@@ -8665,7 +8790,7 @@ namespace fastllm {
             !FastllmCudaUseMoeHybrid(this->mtpMoeWeights.data(), this->mtpMoeWeights.size());
         hybridDraftGraph = sequence <= 4 &&
             !this->mtpMoeWeights.empty() &&
-            ((threadTpOwner != nullptr && threadTpOwner->hostMoe) ||
+            ((threadTpOwner != nullptr && threadTpOwner->hostMoe && !threadTpOwner->mtpGpuExperts) ||
              FastllmCudaUseMoeHybrid(this->mtpMoeWeights.data(), this->mtpMoeWeights.size()));
         const bool draftGraphEligible = ThreadTpAllTrue(
             // Sampling scratch and RNG must remain outside a captured graph.
@@ -8677,7 +8802,7 @@ namespace fastllm {
             std::getenv("FASTLLM_PRINT_PROFILE") == nullptr &&
             std::getenv("FASTLLM_QWEN4_DUMP_DIR") == nullptr &&
             Qwen4CudaOnlyDeviceMap(this->deviceMap) &&
-            (deviceDraftGraph || (hybridDraftGraph
+            (deviceDraftGraph || tpDraftGraph || (hybridDraftGraph
                 ? Qwen4CudaOrNumaOnlyDeviceMap(this->moeDeviceMap) &&
                   Qwen4CudaOrNumaOnlyDeviceMap(this->layeredMoeDeviceMap)
                 : Qwen4CudaOnlyDeviceMap(this->moeDeviceMap) &&
@@ -8862,15 +8987,29 @@ namespace fastllm {
 
         bool graphHostSampling = false;
 #ifdef USE_CUDA
-        graphHostSampling = draftGraphSegment != nullptr && threadTpRank < 0 &&
+        graphHostSampling = draftGraphSegment != nullptr &&
+            (threadTpRank < 0 || threadTpOwner->vocabSize > 0) &&
             !deviceSampling && topProbability != nullptr &&
             Qwen4PrepareDecodeGraphWorkspace(draftGraphSegment->greedyOutput,
-                DataType::FLOAT32, {2}, state.draftGraphState->device);
+                DataType::FLOAT32, {threadTpRank >= 0 ? 3 : 2}, state.draftGraphState->device);
 #endif
         const std::string mlpHyperPrefix =
             layerPrefix + "mlp_hyper_connection.";
         const std::string finalPrefix = "mtp.hyper_connection_mixer.";
         const bool graphAfterMoe = hybridDraftGraph && draftGraphSegment != nullptr;
+        // Subset proposal probabilities are normalized over that subset. The
+        // greedy target verifier remains authoritative. Sampled speculation and
+        // device-chained proposals keep the original full-vocabulary path.
+        const bool subsetEligible = (threadTpRank < 0 || !mtpDraftSubsetIds.empty()) && sampleToken &&
+            !state.sampleProposal && !deviceSampling;
+        if (subsetEligible) PrepareMtpDraftSubsetHead();
+        const bool useDraftSubset = subsetEligible && !mtpDraftSubsetIds.empty();
+        auto mapDraftToken = [&](int token) {
+            if (!useDraftSubset) return token;
+            AssertInFastLLM(token >= 0 && token < int(mtpDraftSubsetIds.size()),
+                "MTP draft vocabulary result is out of range.");
+            return mtpDraftSubsetIds[token];
+        };
         Data localAfterAttention, mlpNorm, mlpInput, localMlpInjection, localMlpOutput;
         Data &afterAttention = graphAfterMoe
             ? draftGraphSegment->tailHidden : localAfterAttention;
@@ -8914,12 +9053,12 @@ namespace fastllm {
                 return false;
             }
 
-            PrepareMtpDraftLmHeadWeight();
-            Data &draftLmHead = this->mtpDraftLmHeadReady
+            if (!useDraftSubset) PrepareMtpDraftLmHeadWeight();
+            Data &draftLmHead = useDraftSubset ? mtpDraftSubsetHead : this->mtpDraftLmHeadReady
                 ? this->mtpDraftLmHeadWeight
                 : this->weight["lm_head.weight"];
             Data *headInput = &sampleHidden;
-            if (this->mtpDraftLmHeadReady &&
+            if (!useDraftSubset && this->mtpDraftLmHeadReady &&
                 sampleHidden.dataType == DataType::FLOAT32) {
                 // The packed FP8 CUDA GEMV is specialized for FP16/BF16
                 // activations.  Its generic FP32 fallback materializes the
@@ -9006,12 +9145,25 @@ namespace fastllm {
                 }
             }
             if (graphHostSampling) {
+                if (FastllmCudaGraphIsCapturingFast() &&
+                    (FastllmCudaGetThreadError() || FastllmCudaGetGraphError())) return false;
                 TopK(logits, top, 1);
+                if (FastllmCudaGraphIsCapturingFast() &&
+                    (FastllmCudaGetThreadError() || FastllmCudaGetGraphError())) return false;
                 AssertInFastLLM(FastllmCudaQwen4TopProbabilityFromTopK(
                     (const float *)logits.cudaData,
                     (float *)draftGraphSegment->greedyOutput.cudaData,
                     logits.dims.back(), (const float *)top.cudaData),
                     "Qwen4-Exp draft confidence sampling failed.");
+                if (threadTpRank >= 0) {
+                    // Return id, local probability and maximum in one compact
+                    // readback. The same TopK and confidence kernels are part
+                    // of the draft graph; no second eager reduction is needed.
+                    AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                        (float *)draftGraphSegment->greedyOutput.cudaData + 2,
+                        (const float *)top.cudaData + 1, sizeof(float)),
+                        "Qwen4 TP draft maximum copy failed.");
+                }
                 return true;
             }
 #endif
@@ -9035,6 +9187,7 @@ namespace fastllm {
                 (uint64_t)(deviceSampling ? sampledTokenOffset + 1 : 0),
                 (uint64_t)(nextMultiHidden != nullptr),
                 (uint64_t)graphHostSampling,
+                (uint64_t)(useDraftSubset ? (uintptr_t)mtpDraftSubsetHead.cudaData : 0),
                 (uint64_t)projectedHidden.dataType,
                 projectedHidden.Count(0),
                 attentionOutput.Count(0),
@@ -9240,26 +9393,42 @@ namespace fastllm {
             return -1;
         }
         if (state.sampleProposal) return sampledProposalToken;
+        auto mergeDraftTop = [&](int localToken, float maximum, float probability) {
+            const int offset = useDraftSubset ? mtpDraftSubsetOffset :
+                qwen4_tp::VocabRange(threadTpOwner->vocabSize,
+                    threadTpOwner->devices.size(), threadTpRank).first;
+            return threadTpOwner->MergeDraftTop(threadTpRank,
+                useDraftSubset ? mapDraftToken(localToken) : localToken + offset,
+                localToken + offset, maximum, probability, topProbability);
+        };
 #ifdef USE_CUDA
         if (graphHostSampling) {
-            float sampled[2];
+            float sampled[3];
             FastllmCudaCopyFromDeviceToHost(sampled,
-                draftGraphSegment->greedyOutput.cudaData, sizeof(sampled));
+                draftGraphSegment->greedyOutput.cudaData,
+                (threadTpRank >= 0 ? 3 : 2) * sizeof(float));
+            if (threadTpRank >= 0)
+                return mergeDraftTop((int)(sampled[0] + 1e-3f), sampled[2], sampled[1]);
             *topProbability = sampled[1];
-            return (int)(sampled[0] + 1e-3f);
+            return mapDraftToken((int)(sampled[0] + 1e-3f));
         }
 #endif
         int tpToken;
-        if (threadTpOwner != nullptr && threadTpOwner->TrySampleLogits(
+        if (!useDraftSubset && threadTpOwner != nullptr && threadTpOwner->TrySampleLogits(
                 threadTpRank, logits, GenerationConfig(), 0, tpToken,
                 nullptr, topProbability)) {
             return tpToken;
         }
         TopK(logits, top, 1);
         top.ToDevice(DataDevice::CPU);
+        if (threadTpRank >= 0 && useDraftSubset) {
+            const float *values = reinterpret_cast<const float *>(top.cpuData);
+            return mergeDraftTop((int)(values[0] + 1e-3f), values[1],
+                topProbability ? Qwen4TopProbability(logits, values[1]) : 0.0f);
+        }
         if (topProbability != nullptr)
             *topProbability = Qwen4TopProbability(logits, reinterpret_cast<float *>(top.cpuData)[1]);
-        return (int)(reinterpret_cast<float *>(top.cpuData)[0] + 1e-3f);
+        return mapDraftToken((int)(reinterpret_cast<float *>(top.cpuData)[0] + 1e-3f));
     }
 
     bool Qwen4ExpModel::TryRunThreadTpPrefixCudaGraph(

@@ -1055,3 +1055,23 @@ Logical route counters count each expert invocation once.
 slots, occupied local slots, local payload bytes, locally computed cache-hit
 routes and cumulative whole-expert upload bytes. Hit routes can be summed across
 GPUs; the per-device totals need not match.
+
+### Qwen4 TP MTP draft placement and sampling
+
+TP MTP expert shards are kept resident on each rank’s GPU, outside the
+target’s bounded expert cache. Target experts retain their CPU/NUMA policy.
+The draft’s GPU weights and workspaces still count against the total device
+memory budget.
+
+For a canonical Q8_0 or Q6_K head, `FASTLLM_MTP_DRAFT_VOCAB` selects draft-only
+vocabulary rows before the target head is split. The selected rows are then
+partitioned across TP ranks with 256-row-aligned boundaries. Token mapping and
+TopK tie ordering use the original subset-row positions. A subset too small
+to give every rank an aligned shard retains the full-vocabulary TP path.
+The target head and greedy verification always keep the full vocabulary;
+sampled or device-chained proposals retain their existing full-head paths.
+
+The draft Graph includes local TopK and confidence reduction. Each rank reads
+back one compact tuple containing its row ID, local top probability and maximum
+logit. The host merges candidates and reconstructs the global subset softmax
+denominator without gathering full logits.

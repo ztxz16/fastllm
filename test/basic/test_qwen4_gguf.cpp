@@ -47,6 +47,11 @@ struct Tensor { std::string name; std::vector<int> dims; ggml_type type; Bytes b
 Tensor FloatTensor(const std::string &name, const std::vector<int> &dims, ggml_type type,
                    const std::vector<float> &values) {
     Tensor t{name, dims, type, {}};
+    if (type == GGML_TYPE_Q6_K) {
+        t.bytes.resize(ggml_row_size(type, values.size()));
+        quantize_row_q6_K_ref(values.data(), reinterpret_cast<block_q6_K *>(t.bytes.data()), values.size());
+        return t;
+    }
     if (type == GGML_TYPE_Q8_0) {
         Check(values.size() % 32 == 0, "Q8 fixture block alignment");
         for (size_t b = 0; b < values.size(); b += 32) {
@@ -293,6 +298,59 @@ struct Qwen4GGUFTestAccess {
     static void Prepare(Qwen4ExpModel &m) { m.PrepareWeights(); }
     static void PrepareTp(Qwen4ExpModel &m) { m.PrepareThreadTp(); }
     static bool HasMtp(const Qwen4ExpModel &m) { return m.HasMtpWeights(); }
+    static void CheckDraftVocabulary(const std::string &directory, ggml_type type) {
+#ifdef USE_CUDA
+        Qwen4ExpModel model;
+        constexpr int vocab = 64, width = 256;
+        std::vector<float> values(vocab * width);
+        for (size_t i = 0; i < values.size(); ++i) values[i] = float(int(i * 37 % 97) - 48) / 8;
+        const auto tensor = FloatTensor("lm_head.weight", {vocab, width}, type, values);
+        model.weight.AddEmptyGGMLWeight("lm_head.weight", {vocab, width}, DATA_GGUF_FORMAT, type);
+        Data &head = model.weight["lm_head.weight"];
+        head.Allocate(); std::memcpy(head.cpuData, tensor.bytes.data(), tensor.bytes.size());
+        head.isModelWeight = true; head.weightType = WeightType::LINEAR;
+        head.ToDevice(CUDA, std::vector<int>{0});
+        const std::vector<int32_t> ids{51, 3, 0, 17, 63, 20, 9, 32, 4};
+        const std::string path = directory + "/draft-vocab.bin";
+        auto write = [&](const std::vector<int32_t> &tokens) {
+            std::ofstream file(path, std::ios::binary);
+            file.write(reinterpret_cast<const char *>(tokens.data()), tokens.size() * sizeof(int32_t));
+        };
+        write(ids); setenv("FASTLLM_MTP_DRAFT_VOCAB", path.c_str(), 1);
+        model.PrepareMtpDraftSubsetHead();
+        Check(model.mtpDraftSubsetIds == std::vector<int>(ids.begin(), ids.end()), "draft vocabulary map changed");
+        std::vector<uint8_t> copied(model.mtpDraftSubsetHead.GetBytes()), original(head.GetBytes());
+        FastllmCudaCopyFromDeviceToHost(copied.data(), model.mtpDraftSubsetHead.cudaData, copied.size());
+        FastllmCudaCopyFromDeviceToHost(original.data(), head.cudaData, original.size());
+        Check(original == tensor.bytes, "draft subset modified target head");
+        const size_t rowBytes = ggml_row_size(type, width);
+        for (size_t row = 0; row < ids.size(); ++row)
+            Check(std::memcmp(copied.data() + row * rowBytes,
+                original.data() + size_t(ids[row]) * rowBytes, rowBytes) == 0, "draft row selection corrupted Q8 bytes");
+        static_cast<Executor *>(GetExecutor())->SetFirstDevice("cuda");
+        std::vector<float> x(width);
+        for (int i = 0; i < width; ++i) x[i] = float(i % 23 - 11) / 31;
+        Data input(FLOAT32, {1, width}, x), full, subset;
+        Linear(input, head, Data(), full);
+        Linear(input, model.mtpDraftSubsetHead, Data(), subset);
+        full.ToDevice(CPU); subset.ToDevice(CPU);
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const float a = reinterpret_cast<float *>(full.cpuData)[ids[i]];
+            const float b = reinterpret_cast<float *>(subset.cpuData)[i];
+            Check(std::isfinite(b) && std::abs(a - b) <= 1e-5f * (1 + std::abs(a)),
+                "draft subset logits differ from corresponding target rows");
+        }
+        for (const auto &invalid : {std::vector<int32_t>{3,3}, std::vector<int32_t>{-1}, std::vector<int32_t>{64}}) {
+            write(invalid); model.mtpDraftSubsetAttempted = false;
+            bool rejected = false;
+            try { model.PrepareMtpDraftSubsetHead(); } catch (const std::runtime_error &) { rejected = true; }
+            Check(rejected, "draft vocabulary accepted invalid ids");
+        }
+        unsetenv("FASTLLM_MTP_DRAFT_VOCAB");
+        unlink(path.c_str());
+        std::cout << "PASS: draft vocabulary format=" << type << " preserves target bytes/logits and rejects invalid ids\n";
+#endif
+    }
     static void CheckPlePrefetch(Qwen4ExpModel &m) {
         static_cast<Executor *>(GetExecutor())->SetFirstDevice("cpu");
         const std::string prefix = "model.language_model.layers.1.ple.";
@@ -431,7 +489,9 @@ static int TestStreamingTpImport() {
             Data &reference = cpu->weight[name], &weight = tp->weight[name];
             Check(weight.dims == reference.dims && weight.ggmlType == reference.ggmlType,
                   "streaming TP changed parent weight metadata");
-            if (hostLastLayer && layer >= 1) {
+            // Target experts retain the configured CPU layer; draft experts
+            // are resident TP shards even when the last target layer is on CPU.
+            if (hostLastLayer && layer == 1) {
                 Check(!weight.multiDeviceData && weight.cpuData != nullptr,
                       "streaming TP uploaded a CPU expert layer");
                 Check(std::memcmp(weight.cpuData, reference.cpuData, reference.GetBytes()) == 0,
@@ -507,8 +567,14 @@ static int TestStreamingTpImport() {
         }
         Check((tp->weight["model.language_model.layers.1.mlp.experts.0.down_proj.weight"].cpuData != nullptr) == hostLastLayer,
               "TP preparation changed CPU expert placement");
-        Check((tp->weight["mtp.layers.0.mlp.experts.0.down_proj.weight"].cpuData != nullptr) == hostLastLayer,
-              "TP preparation changed MTP expert placement");
+        const Data &draft = tp->weight["mtp.layers.0.mlp.experts.0.down_proj.weight"];
+        Check(draft.cpuData == nullptr && draft.multiDeviceDatas.size() == 2,
+              "TP preparation did not retain resident MTP expert shards");
+        for (int rank = 0; rank < 2; ++rank) {
+            const Data &shard = *draft.multiDeviceDatas.at(rank);
+            Check(shard.dataDevice == CUDA && shard.cudaData != nullptr,
+                  "TP preparation released a resident MTP expert shard");
+        }
     }
     unsetenv("FASTLLM_TP");
     std::cout << "PASS: Qwen4 streaming TP expert load, released CPU sources and exact packed shards\n";
@@ -612,6 +678,17 @@ int main(int argc, char **argv) {
         SetCudaEmbedding(false);
         SetMoeCudaCacheBytes(0); setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
         if (argc == 2 && std::string(argv[1]) == "--tp-load") return TestStreamingTpImport();
+        if (argc == 2 && std::string(argv[1]) == "--draft-vocab") {
+#ifdef USE_CUDA
+            if (FastllmCudaGetDeviceCount() < 1) return 77;
+#else
+            return 77;
+#endif
+            Fixture fixture;
+            Qwen4GGUFTestAccess::CheckDraftVocabulary(fixture.directory, GGML_TYPE_Q8_0);
+            Qwen4GGUFTestAccess::CheckDraftVocabulary(fixture.directory, GGML_TYPE_Q6_K);
+            return 0;
+        }
         TestConcurrentExpertMerges();
         TestDirectMergeFormats();
         Fixture fixture;

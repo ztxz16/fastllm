@@ -402,11 +402,16 @@ namespace fastllm {
         // the generated token stream exact.  A packed FP8 copy cuts the three
         // bandwidth-bound draft head scans in half on supported CUDA models.
         Data mtpDraftLmHeadWeight;
+        Data mtpDraftSubsetHead;
+        std::vector<int> mtpDraftSubsetIds;
+        int mtpDraftSubsetOffset = 0;
+        bool mtpDraftSubsetAttempted = false;
         bool mtpDraftLmHeadReady = false;
         bool mtpDraftLmHeadAttempted = false;
 
         void PrepareWeights();
         void PrepareMtpDraftLmHeadWeight();
+        void PrepareMtpDraftSubsetHead();
         bool IsLinearAttentionLayer(int layer) const;
         void PrepareVision();
         void ApplyVisionRotary(Data &input, const Data &posX,
