@@ -767,6 +767,14 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT void set_model_indexer_dtype(int modelId, const char *dtype) {
+        std::string value = dtype;
+        fastllm::AssertInFastLLM(value == "auto" || value == "fp8" || value == "fp8_e4m3",
+                                "indexer_dtype should be auto, fp8 or fp8_e4m3.");
+        models.GetModel(modelId)->SetIndexerDataType(value == "auto"
+            ? fastllm::DATA_AUTO_NONE : fastllm::FP8_E4M3);
+    }
+
     DLL_EXPORT void set_model_kv_cache_dtype(int modelId, char *kv_cache_dtype) {
         auto model = models.GetModel(modelId);
         std::string dtypeStr = kv_cache_dtype;

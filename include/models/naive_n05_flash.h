@@ -22,6 +22,7 @@ namespace fastllm {
         NaiveN05FlashModel();
         ~NaiveN05FlashModel() override;
         void InitParams() override;
+        void SetIndexerDataType(DataType dataType) override;
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &names) override;
         int Forward(const Data &inputIds, const Data &attentionMask,
@@ -267,6 +268,10 @@ namespace fastllm {
         int window = 128, indexHeads = 16, indexDim = 128, indexTopK = 2048;
         float partialRotary = 0.334f, valueScale = 0.707f;
         bool indexFp8 = true;
+        bool fp8IndexerCache = false;
+        int IndexerCacheWidth(DataType type) const {
+            return fp8IndexerCache ? 144 / (type == FP8_E4M3 ? 1 : 2) : indexDim;
+        }
         std::vector<std::vector<Data *>> moeWeights, moeBiases;
     };
 }

@@ -796,7 +796,7 @@ struct RopeCacheRow {
     const void *const *cache = nullptr;
     const int *keyPages = nullptr, *valuePages = nullptr;
     int pageLen = 0;
-    bool fp8 = false;
+    bool fp8 = false, scaledIndexer = false;
 };
 constexpr int kRopeCacheBatch = 32;
 struct RopeCacheBatch { RopeCacheRow rows[kRopeCacheBatch]; };
@@ -836,11 +836,19 @@ __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
                       : k + ((size_t)token * kvHeads + head - heads) * dim);
         const int *pages = r.pageLen && r.cache ? (const int *)r.cache[2] : r.keyPages;
         int physical = pages ? pages[row / r.pageLen] * r.pageLen + row % r.pageLen : row;
-        auto dst = key + (size_t)physical * (kvHeads * dim + indexDim)
+        const int tail = r.scaledIndexer ? FastllmNaiveIndexerBytes / (r.fp8 ? 1 : 2) : indexDim;
+        auto dst = key + (size_t)physical * (kvHeads * dim + tail)
             + (index ? kvHeads * dim : (head - heads) * dim);
-        RopeHeadTo(src, dst, positions[token], rotaryDim, theta);
-        for (int d = rotaryDim + threadIdx.x; d < width; d += blockDim.x)
-            dst[d] = src[d];
+        if (index && r.scaledIndexer) {
+            __shared__ BF16 rotated[128];
+            RopeHeadTo(src, rotated, positions[token], rotaryDim, theta);
+            for (int d = rotaryDim + threadIdx.x; d < width; d += blockDim.x) rotated[d] = src[d];
+            __syncthreads();
+            FastllmNaiveStoreIndexer((float)rotated[threadIdx.x], dst.data);
+        } else {
+            RopeHeadTo(src, dst, positions[token], rotaryDim, theta);
+            for (int d = rotaryDim + threadIdx.x; d < width; d += blockDim.x) dst[d] = src[d];
+        }
     } else {
         const int h = head - heads - kvHeads;
         const BF16 *src = Packed ? qkv + base + (heads + kvHeads) * dim + h * valueDim
@@ -904,7 +912,9 @@ __global__ void RoundIndexer(FastllmNaiveKV input, float *output, int stride,
                              int offset, bool fp8) {
     __shared__ float maximum[128];
     int d = threadIdx.x, row = blockIdx.x;
-    float x = (float)input.Row(row, stride)[offset + d];
+    float x = input.scaledIndexer
+        ? input.IndexRow(row, stride).LoadFloat(d) * input.IndexScale(row, stride)
+        : (float)input.Row(row, stride)[offset + d];
     if (!fp8) {
         output[(size_t)row * 128 + d] = x;
         return;
@@ -958,7 +968,7 @@ __global__ void IndexScoresDecode(const float *q, FastllmNaiveKV packedKeys,
     float k[4];
     #pragma unroll
     for (int i = 0; i < 4; ++i)
-        k[i] = (float)packedKeys.Row(key, stride)[stride - 128 + lane + i * 32];
+        k[i] = packedKeys.IndexRow(key, stride).LoadFloat(lane + i * 32) * packedKeys.IndexScale(key, stride);
     float score = 0;
     for (int h = 0; h < 16; ++h) {
         float dot = 0;
@@ -2364,7 +2374,9 @@ static bool PrepareRopeCache(fastllm::Data &q, const fastllm::Data &k,
             !matrix(indexKey, indexKey.dims[2]) || indexKey.dims[1] != rows) return false;
         indexDim = indexKey.dims[2];
     }
-    const int64_t kc = (int64_t)kvHeads * dim + indexDim, vc = (int64_t)kvHeads * valueDim;
+    if (key.kvCacheFp8Indexer && indexDim != 128) return false;
+    const int64_t kc = (int64_t)kvHeads * dim + (key.kvCacheFp8Indexer
+        ? FastllmNaiveIndexerBytes / key.unitSize : indexDim), vc = (int64_t)kvHeads * valueDim;
     if (kc > INT_MAX || vc > INT_MAX ||
         (int64_t)rows * ((int64_t)heads + 2LL * kvHeads + (indexDim != 0)) > INT_MAX ||
         !matrix(key, kc, true) || !matrix(value, vc, true) || key.dataType != value.dataType) return false;
@@ -2386,6 +2398,7 @@ static bool PrepareRopeCache(fastllm::Data &q, const fastllm::Data &k,
         (const float *)positions.cudaData, dynamicLength ? (const int *)liveKeys.cudaData : nullptr,
         keyRows, valueRows, cachePast};
     row.fp8 = key.dataType == FP8_E4M3;
+    row.scaledIndexer = key.kvCacheFp8Indexer;
     if (key.isPagedKVCache) {
         if (!value.isPagedKVCache || key.pageLen != value.pageLen || window) return false;
         row.key = (BF16 *)key.pagedKVCacheData->cudaData;
@@ -2515,7 +2528,7 @@ bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
     for (int b = 0; b < count; ++b) {
         const auto &r = descriptors[b];
         if (r.cache != first.cache + b * 4 || r.keyRows != first.keyRows ||
-            r.valueRows != first.valueRows || r.pageLen != first.pageLen || r.fp8 != first.fp8 ||
+            r.valueRows != first.valueRows || r.pageLen != first.pageLen || r.fp8 != first.fp8 || r.scaledIndexer != first.scaledIndexer ||
             (indexDim && r.indexKey != first.indexKey + b * 128)) return false;
     }
     if (!naive_qkv::Prepare()) return false;
@@ -2531,7 +2544,7 @@ bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
     }
     naive_qkv::Params params{(BF16 *)q.cudaData, first.indexKey,
         (const float *)positions.cudaData, (const int *)liveKeys.cudaData, first.cache,
-        theta, __float2bfloat16_rn(valueScale), first.pageLen, first.keyRows, first.valueRows, ring, first.fp8};
+        theta, __float2bfloat16_rn(valueScale), first.pageLen, first.keyRows, first.valueRows, ring, first.fp8, first.scaledIndexer};
     naive_qkv::Launch((const BF16 *)input.cudaData, (const BF16 *)weight.cudaData,
         params, count, count > 1 ? (float *)scratch.cudaData : nullptr);
     CheckLaunch();
@@ -2625,7 +2638,7 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
 #ifdef FASTLLM_NAIVE_DSA_MMA
     using naive_dsa_mma::kKeys;
     using naive_dsa_mma::kThreads;
-    // Q keeps its E4M3 values and FP32 scales; K retains the input BF16 values.
+    // Q retains E4M3 values and FP32 scales; the cache descriptor selects K storage.
     // Decode tiles over keys; larger prefill chunks also share K across queries.
     if (fp8Query && heads == 16 && (queries == 1 ||
         (queries >= 32 && (int64_t)queries * keys >= 1024 * 1024)) &&
@@ -3184,12 +3197,40 @@ void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
 
 namespace {
 struct KVReadBatch {
-    struct Row { FastllmNaiveKV source; BF16 *target; int first, count, width; } rows[32];
+    struct Row { FastllmNaiveKV source; BF16 *target; int first, count, width, outWidth; } rows[32];
 };
 __global__ void ReadCache(KVReadBatch batch) {
     const auto &r = batch.rows[blockIdx.y];
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < r.count) r.target[i] = r.source.Row(r.first + i / r.width, r.width)[i % r.width];
+    if (i >= r.count) return;
+    const int row = r.first + i / r.outWidth, col = i % r.outWidth;
+    const int main = r.outWidth - (r.source.scaledIndexer ? FastllmNaiveIndexerBytes / 2 : 0);
+    if (col < main) r.target[i] = r.source.Row(row, r.width)[col];
+    else ((unsigned short *)r.target)[i] =
+        ((const unsigned short *)r.source.IndexRow(row, r.width).data)[col - main];
+}
+__global__ void PackIndexer(const BF16 *input, BF16 *output, int width) {
+    const int row = blockIdx.x, main = width - 128, outWidth = main + FastllmNaiveIndexerBytes / 2;
+    for (int d = threadIdx.x; d < main; d += blockDim.x) output[(size_t)row * outWidth + d] = input[(size_t)row * width + d];
+    FastllmNaiveStoreIndexer((float)input[(size_t)row * width + main + threadIdx.x], output + (size_t)row * outWidth + main);
+}
+__global__ void WriteIndexerCache(FastllmNaiveKV key, const BF16 *input, int width,
+        int start, const int *live = nullptr, FastllmNaiveKV value = {},
+        const BF16 *newValue = nullptr, int valueWidth = 0) {
+    const int token = blockIdx.x;
+    const int row = (live ? *live - 1 : start) + token;
+    const int main = width - FastllmNaiveIndexerBytes / (key.fp8 ? 1 : 2);
+    const int inputWidth = main + FastllmNaiveIndexerBytes / 2;
+    auto destination = key.Row(row, width);
+    FastllmNaiveKVWriteRow dst{(void *)destination.data, key.fp8};
+    for (int d = threadIdx.x; d < main; d += blockDim.x) dst[d] = input[(size_t)token * inputWidth + d];
+    for (int d = threadIdx.x; d < FastllmNaiveIndexerBytes / 4; d += blockDim.x)
+        ((unsigned *)((char *)destination.data + main * (key.fp8 ? 1 : 2)))[d] =
+            ((const unsigned *)(input + (size_t)token * inputWidth + main))[d];
+    if (newValue) {
+        FastllmNaiveKVWriteRow v{(void *)value.Row(row, valueWidth).data, value.fp8};
+        for (int d = threadIdx.x; d < valueWidth; d += blockDim.x) v[d] = newValue[(size_t)token * valueWidth + d];
+    }
 }
 __global__ void PagedWrite(FastllmNaiveKVWriteRow pool, const int *pages, const BF16 *input, int start, int count, int width, int pageLen) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -3209,12 +3250,24 @@ void FastllmCudaNaiveReadCache(const std::vector<FastllmNaiveKVRead> &slices) {
             fastllm::AssertInFastLLM(FastllmNaiveKVType(data.dataType) &&
                 data.dataDevice == fastllm::DataDevice::CUDA && data.dims.size() == 3 &&
                 s.target && s.first >= 0 && s.rows > 0, "Invalid Naive KV read.");
-            int elements = s.rows * data.dims[2];
-            batch.rows[i] = {FastllmNaiveKV(data), (BF16 *)s.target, s.first, elements, data.dims[2]};
+            int outWidth = data.dims[2];
+            if (data.kvCacheFp8Indexer) outWidth += FastllmNaiveIndexerBytes / 2 - FastllmNaiveIndexerBytes / data.unitSize;
+            int elements = s.rows * outWidth;
+            batch.rows[i] = {FastllmNaiveKV(data), (BF16 *)s.target, s.first, elements, data.dims[2], outWidth};
             maximum = std::max(maximum, elements);
         }
         ReadCache<<<dim3((maximum + 255) / 256, count), 256>>>(batch);
     }
+    CheckLaunch();
+}
+void FastllmCudaNaivePackIndexer(const fastllm::Data &input, fastllm::Data &output) {
+    fastllm::AssertInFastLLM(input.dataType == fastllm::BFLOAT16 && input.dims.size() == 3 &&
+        input.dims[0] == 1 && input.dims[1] > 0 && input.dims[2] >= 128 &&
+        input.dataDevice == fastllm::DataDevice::CUDA && input.cudaData &&
+        !input.kvCacheFp8Indexer, "Invalid Indexer packing input.");
+    Output(output, fastllm::BFLOAT16, {1, input.dims[1], input.dims[2] - 128 + FastllmNaiveIndexerBytes / 2});
+    output.kvCacheFp8Indexer = true;
+    PackIndexer<<<input.dims[1], 128>>>((const BF16 *)input.cudaData, (BF16 *)output.cudaData, input.dims[2]);
     CheckLaunch();
 }
 void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start) {
@@ -3222,11 +3275,19 @@ void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input
     AssertInFastLLM(FastllmNaiveKVType(cache.dataType) && input.dataType == BFLOAT16 &&
         cache.dataDevice == DataDevice::CUDA && input.dataDevice == DataDevice::CUDA &&
         cache.dims.size() == 3 && input.dims.size() == 3 &&
-        cache.dims[2] == input.dims[2] && start >= 0 &&
+        cache.kvCacheFp8Indexer == input.kvCacheFp8Indexer &&
+        cache.dims[2] == input.dims[2] + (cache.kvCacheFp8Indexer
+            ? FastllmNaiveIndexerBytes / cache.unitSize - FastllmNaiveIndexerBytes / 2 : 0) && start >= 0 &&
         start + input.dims[1] <= (cache.isPagedKVCache
             ? (int)cache.pageIndex.size() * cache.pageLen
             : (cache.expansionDims.empty() ? cache.dims[1] : cache.expansionDims[1])),
         "Invalid Naive KV append.");
+    if (cache.kvCacheFp8Indexer) {
+        WriteIndexerCache<<<input.dims[1], 128>>>(FastllmNaiveKV(cache), (const BF16 *)input.cudaData,
+            cache.dims[2], start);
+        CheckLaunch();
+        return;
+    }
     FastllmNaiveKVWriteRow destination{cache.isPagedKVCache ? cache.pagedKVCacheData->cudaData : cache.cudaData,
                                      cache.dataType == FP8_E4M3};
     PagedWrite<<<(input.Count(0) + 255) / 256, 256>>>(destination,
@@ -3239,6 +3300,13 @@ void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &newKey, const fastllm::Data &newValue,
         const fastllm::Data &liveKeys, int window, bool ring) {
     fastllm::AssertInFastLLM(!ring || window == kSwaWindow, "Invalid SWA ring window.");
+    if (key.kvCacheFp8Indexer) {
+        WriteIndexerCache<<<1, 128>>>(FastllmNaiveKV(key), (const BF16 *)newKey.cudaData,
+            key.dims[2], 0, (const int *)liveKeys.cudaData, FastllmNaiveKV(value),
+            (const BF16 *)newValue.cudaData, value.dims[2]);
+        CheckLaunch();
+        return;
+    }
     int kc = key.dims[2], vc = value.dims[2];
     AppendDecodeKV<<<(kc + vc + 255) / 256, 256>>>({key.isPagedKVCache ? key.pagedKVCacheData->cudaData : key.cudaData, key.dataType == fastllm::FP8_E4M3},
         {value.isPagedKVCache ? value.pagedKVCacheData->cudaData : value.cudaData, value.dataType == fastllm::FP8_E4M3}, (const BF16 *)newKey.cudaData,
@@ -3362,6 +3430,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             (size_t)(row.sequence + 1) * heads > weights.Count(0)) return false;
         // cp.async copies 16 bytes; FP8 therefore needs twice as many elements.
         hopper = hopper && row.key->dataType == cacheType &&
+            row.key->kvCacheFp8Indexer == rows.front().key->kvCacheFp8Indexer &&
             row.key->dims[2] % (cacheType == FP8_E4M3 ? 16 : 8) == 0 &&
             (uintptr_t)row.key->cudaData % 16 == 0;
         maxCapacity = std::max(maxCapacity, row.capacity);
@@ -3391,7 +3460,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         batch::Quantize<<<dim3(heads, count), dim>>>((const BF16 *)query.cudaData, descriptors);
         const dim3 grid((capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, count);
         if (hopper) {
-            auto kernel = cacheType == FP8_E4M3 ? batch::HopperScores<true> : batch::HopperScores<false>;
+            auto kernel = (cacheType == FP8_E4M3 || rows.front().key->kvCacheFp8Indexer) ? batch::HopperScores<true> : batch::HopperScores<false>;
             kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
         }
         else batch::Scores<<<grid, naive_dsa_mma::kThreads>>>((const BF16 *)weights.cudaData, descriptors);
@@ -3778,6 +3847,12 @@ void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &newKey, const fastllm::Data &newValue,
         const fastllm::Data &liveKeys, int window) {
     const int kc = key.dims[2], vc = value.dims[2], rows = newKey.dims[1];
+    if (key.kvCacheFp8Indexer) {
+        WriteIndexerCache<<<rows, 128>>>(FastllmNaiveKV(key), (const BF16 *)newKey.cudaData,
+            kc, 0, (const int *)liveKeys.cudaData, FastllmNaiveKV(value), (const BF16 *)newValue.cudaData, vc);
+        CheckLaunch();
+        return;
+    }
     AppendVerifyKV<<<dim3((kc + vc + 255) / 256, rows), 256>>>({key.cudaData, key.dataType == fastllm::FP8_E4M3},
         {value.cudaData, value.dataType == fastllm::FP8_E4M3}, (const BF16 *)newKey.cudaData,
         (const BF16 *)newValue.cudaData, (const int *)liveKeys.cudaData, kc, vc, window);

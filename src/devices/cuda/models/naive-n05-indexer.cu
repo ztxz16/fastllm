@@ -59,8 +59,8 @@ __global__ __launch_bounds__(256) void IndexerScores(const BF *q, FastllmNaiveKV
     }
     for (int i = tid; i < 64 * 16; i += Threads) {
         int row = i / 16, d = i % 16 * 8;
-        auto src = k.Row(min(firstK + row, keys - 1), stride) + stride - 128 + d;
-        if (stride % 8 == 0 && !k.fp8) {
+        auto src = k.IndexRow(min(firstK + row, keys - 1), stride) + d;
+        if (stride % 8 == 0 && !src.fp8) {
             unsigned dst = (unsigned)__cvta_generic_to_shared(sk + offset(row, d, 64));
             int valid = firstK + row < keys ? 16 : 0;
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src.data), "r"(valid)
@@ -109,7 +109,7 @@ __global__ __launch_bounds__(256) void IndexerScores(const BF *q, FastllmNaiveKV
             }
             if (firstQ + row < rows && firstK + col < keys)
                 scores[(size_t)(firstQ + row) * keys + firstK + col] =
-                    firstK + col <= past + firstQ + row ? total : -INFINITY;
+                    firstK + col <= past + firstQ + row ? total * k.IndexScale(firstK + col, stride) : -INFINITY;
         }
     }
 #endif

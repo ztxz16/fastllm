@@ -47,7 +47,8 @@ void FastllmCudaNaiveLogitsSelect(const fastllm::Data &logits, int vocabOffset,
 
 // Model-specific CUDA operations use BF16 activations and BF16 or unscaled
 // E4M3 KV storage. Keys/values are packed
-// as [1, tokens, heads * dim (+ indexDim for DSA keys)].
+// as [1, tokens, heads * dim (+ Indexer tail for DSA keys)].
+// kvCacheFp8Indexer marks a trailing 144-byte scaled E4M3 Indexer block.
 // Per-layer raw projections [1, rows, 2 * heads * dim] and norm weights [dim].
 // Returns false on unsupported layouts without changing cache contents/metadata.
 // No cross-layer weight copies are needed.
@@ -79,6 +80,7 @@ void FastllmCudaNaiveDraftSwiGLU(const fastllm::Data &gateUp, fastllm::Data &out
 void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
                          int heads, int dim, int rotaryDim, float theta);
 // Append transformed BF16 rows into allocated BF16/FP8 dense or paged storage.
+void FastllmCudaNaivePackIndexer(const fastllm::Data &input, fastllm::Data &output);
 void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start);
 // Read logical cache slices into an existing BF16 staging allocation. Used by
 // history recording; no full-cache dequantization is needed for attention.
@@ -145,8 +147,8 @@ bool FastllmCudaNaiveQuantizeIndexer(const fastllm::Data &input,
 // affine arithmetic and final BF16 rounding without conversion buffers.
 bool FastllmCudaNaiveIndexerKeyNorm(fastllm::Data &input,
     const fastllm::Data &weight, const fastllm::Data &bias);
-// Only Q uses the Indexer's activation quantizer. Indexer K is read from the
-// chosen KV storage type, without applying a second activation quantization.
+// Q uses blockwise E4M3 quantization when requested. K uses the main KV
+// storage type by default, or its independent scaled E4M3 tail when marked.
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             const fastllm::Data &weights,
                             const fastllm::Data &packedKeys,

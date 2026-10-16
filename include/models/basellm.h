@@ -515,6 +515,8 @@ namespace fastllm {
 
         virtual void SetKVCacheDataType(DataType dataType);
 
+        virtual void SetIndexerDataType(DataType dataType);
+
         virtual void SetMoeAtype(DataType type);
 
         virtual void UpdateRotaryPtr(Data **sinDataPtr, Data **cosDataPtr, const std::string &device);

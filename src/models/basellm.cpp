@@ -3861,6 +3861,10 @@ namespace fastllm {
         }
     }
 
+    void basellm::SetIndexerDataType(DataType dataType) {
+        AssertInFastLLM(dataType == DATA_AUTO_NONE, "--indexer_dtype is not supported by this model.");
+    }
+
     void basellm::SetKVCacheDataType(DataType dataType) {
         if (dataType == DataType::FP4_E2M1 && this->model_type != "qwen3_5" &&
             this->model_type != "deepseek_v41") {

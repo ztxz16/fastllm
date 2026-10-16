@@ -176,7 +176,7 @@ __device__ __forceinline__ void LoadIndexerKeys(
         int stride, int first, int keys) {
     for (int i = threadIdx.x; i < kKeys * (kIndexerDim / 8); i += Threads) {
         int row = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
-        const auto src = packedKeys.Row(min(first + row, keys - 1), stride) + stride - kIndexerDim + d;
+        const auto src = packedKeys.IndexRow(min(first + row, keys - 1), stride) + d;
         if (stride % 8 == 0) {
             *reinterpret_cast<uint4*>(&tile[row][d]) = first + row < keys
                 ? src.Load8() : make_uint4(0, 0, 0, 0);
@@ -239,7 +239,7 @@ __device__ __forceinline__ void IndexerDecodeScoresRow(const BF16 *q, FastllmNai
         #pragma unroll
         for (int i = 0; i < 2; ++i) {
             int key = first + warp * 8 + lane * 2 + i;
-            if (key < keys) scores.Store(key, key <= past ? score[i] : -INFINITY);
+            if (key < keys) scores.Store(key, key <= past ? score[i] * packedKeys.IndexScale(key, stride) : -INFINITY);
         }
     }
 #endif
@@ -261,7 +261,8 @@ __global__ void IndexerDecodeScores(const BF16 *q, FastllmNaiveKV packedKeys,
     IndexerDecodeScoresRow(q, packedKeys, qscale, weights, scores, stride, int(liveKeys), past);
 }
 
-// Q keeps E4M3-rounded values and FP32 scales; K remains BF16.
+// Q keeps E4M3-rounded values and FP32 scales. FP8 K values expand exactly
+// to BF16 for MMA; their per-key scale is applied to the final score.
 // Head accumulation order is unchanged.
 // Hopper overlaps the next head's Q load with MMA using two 32-row buffers.
 // The original 64-row schedule remains available for other CUDA architectures.
@@ -352,7 +353,7 @@ __global__ __launch_bounds__(Pipeline ? 128 : 256) void IndexerScores(const BF16
                 int row = firstQ + mTile * 16 + (lane >> 2) + (e / 2) * 8;
                 int col = firstK + nHalf * 32 + n * 16 + u * 8 + (lane & 3) * 2 + e % 2;
                 if (row < queries && col < keys)
-                    scores[(size_t)row * keys + col] = col <= past + row ? acc[n][u][e] : -INFINITY;
+                    scores[(size_t)row * keys + col] = col <= past + row ? acc[n][u][e] * k.IndexScale(col, keyStride) : -INFINITY;
             }
         }
     }

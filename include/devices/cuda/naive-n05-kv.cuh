@@ -63,6 +63,31 @@ struct FastllmNaiveKVWriteRow {
     }
 };
 
+// One scale per 128-dimensional Indexer key. Padding keeps both FP8 and
+// BF16 main-K rows 16-byte aligned for vector loads and TMA attention.
+constexpr int FastllmNaiveIndexerBytes = 144;
+// All 128 or 256 CTA threads participate; only the first 128 own values.
+__device__ __forceinline__ void FastllmNaiveStoreIndexer(float x, void *destination) {
+    __shared__ float maxima[8];
+    int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    float maximum = t < 128 ? fabsf(x) : 0.f;
+    for (int delta = 16; delta; delta >>= 1)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, delta));
+    if (!lane) maxima[warp] = maximum;
+    __syncthreads();
+    maximum = 0.f;
+    for (int i = 0; i < (blockDim.x + 31) / 32; ++i) maximum = fmaxf(maximum, maxima[i]);
+    float scale = fmaxf(maximum, 1e-4f) / 448.f;
+    if (t < 128) ((__nv_fp8_e4m3 *)destination)[t] =
+        __nv_fp8_e4m3(fmaxf(-448.f, fminf(448.f, x / scale)));
+    if (!t) {
+        *(float *)((char *)destination + 128) = scale;
+        // Deterministic padding makes raw archive copies reproducible.
+        *(unsigned *)((char *)destination + 132) = 0;
+        *(unsigned long long *)((char *)destination + 136) = 0;
+    }
+}
+
 // Logical rows backed either by a dense tensor or a shared paged pool.
 // Address translation leaves arithmetic, masks and TopK positions unchanged.
 struct FastllmNaiveKV {
@@ -70,7 +95,7 @@ struct FastllmNaiveKV {
     const int *pages = nullptr;
     int pageLen = 0, pageShift = -1;
     size_t offset = 0;
-    bool fp8 = false;
+    bool fp8 = false, scaledIndexer = false;
 
     __host__ __device__ FastllmNaiveKV(const void *data = nullptr) : base((const __nv_bfloat16 *)data) {}
     __host__ __device__ FastllmNaiveKV(const void *data, const int *table, int length, bool fp8 = false)
@@ -88,7 +113,9 @@ struct FastllmNaiveKV {
         : FastllmNaiveKV((const __nv_bfloat16 *)(data.isPagedKVCache
             ? data.pagedKVCacheData->cudaData : data.cudaData),
             data.isPagedKVCache ? (const int *)data.cudaData : nullptr,
-            data.isPagedKVCache ? data.pageLen : 0, data.dataType == fastllm::FP8_E4M3) {}
+            data.isPagedKVCache ? data.pageLen : 0, data.dataType == fastllm::FP8_E4M3) {
+        scaledIndexer = data.kvCacheFp8Indexer;
+    }
     // Callers retain logical rows instead of reconstructing them from element
     // offsets. One page lookup serves every dimension loaded from the row.
     __device__ __forceinline__ int PhysicalRow(int row) const {
@@ -101,6 +128,14 @@ struct FastllmNaiveKV {
     __device__ __forceinline__ FastllmNaiveKVRow Row(int row, int stride) const {
         row = PhysicalRow(row);
         return FastllmNaiveKVRow(base, fp8) + ((size_t)row * stride + offset);
+    }
+    __device__ __forceinline__ FastllmNaiveKVRow IndexRow(int row, int stride) const {
+        auto start = Row(row, stride);
+        if (!scaledIndexer) return start + stride - 128;
+        return {(const char *)start.data + stride * (fp8 ? 1 : 2) - FastllmNaiveIndexerBytes, true};
+    }
+    __device__ __forceinline__ float IndexScale(int row, int stride) const {
+        return scaledIndexer ? *(const float *)((const char *)IndexRow(row, stride).data + 128) : 1.f;
     }
     __host__ __device__ FastllmNaiveKV &operator+=(size_t index) { offset += index; return *this; }
     __device__ __forceinline__ void Bind(const void *const *table, int part = 0) {

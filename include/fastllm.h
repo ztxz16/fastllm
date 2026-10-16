@@ -499,6 +499,9 @@ namespace fastllm {
 
         long long cacheUid = 0; // 用来标注Cache id
         bool isKVCache = false; // 是否是KV Cache TODO: 做一些KVCache的管理
+        // Naive DSA: the key row ends in 128 E4M3 values + FP32 scale,
+        // padded to 144 bytes so the main attention row remains aligned.
+        bool kvCacheFp8Indexer = false;
         bool isLinearAttention = false; // 是否是线性attention的缓存（永远保持同样的形状）
         bool isLinearAttentionTransposed = false; // 线性attention recurrent state是否物理存成[V,K]
 

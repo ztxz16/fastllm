@@ -1150,6 +1150,7 @@ namespace fastllm {
         AssertInFastLLM(!ori.cudaNativeNvfp4Layout, "Native NVFP4 weight views require restoring the source layout first.");
         this->cudaNativeNvfp4Layout = false;
         this->dataType = ori.dataType;
+        this->kvCacheFp8Indexer = ori.kvCacheFp8Indexer;
         this->UpdateUnitSize();
         this->isFake = true;
         this->dataDevice = ori.dataDevice;
@@ -1199,6 +1200,7 @@ namespace fastllm {
 #endif
         this->name = ori.name;
         this->isKVCache = ori.isKVCache;
+        this->kvCacheFp8Indexer = ori.kvCacheFp8Indexer;
         this->isLinearAttention = ori.isLinearAttention;
         this->isLinearAttentionTransposed = ori.isLinearAttentionTransposed;
         this->cacheUid = ori.cacheUid;

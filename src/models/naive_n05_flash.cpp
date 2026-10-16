@@ -34,6 +34,20 @@ namespace {
     }
 }
 
+void NaiveN05FlashModel::SetIndexerDataType(DataType type) {
+    AssertInFastLLM(type == DATA_AUTO_NONE || type == FP8_E4M3,
+                    "Naive --indexer_dtype supports auto or fp8.");
+    AssertInFastLLM(!tpPrepared && !tpServingState && tpKVPool.empty() && activePrefixes.empty(),
+                    "Set Indexer dtype before warmup or inference.");
+#ifndef USE_CUDA
+    AssertInFastLLM(type == DATA_AUTO_NONE, "FP8 Indexer requires CUDA.");
+#endif
+    fp8IndexerCache = type == FP8_E4M3;
+    if (fp8IndexerCache) indexFp8 = true;
+    else indexFp8 = weight.dicts["indexer_activation_dtype"] != "bf16";
+
+}
+
 int NaiveN05FlashModel::CacheReserveCapacity(const GenerationConfig &config) const {
     // Like ChatGLM, reserve the request's prompt and bounded output in one
     // allocation. Chunked prefill must use the full prompt length supplied by
@@ -54,17 +68,19 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheTyp
     cache.dataType = cacheType;
     cache.UpdateUnitSize();
     cache.ToDevice(input.dataDevice, input.dataDeviceIds);
+    const int width = input.dims[2] + (cache.kvCacheFp8Indexer
+        ? IndexerCacheWidth(cacheType) - IndexerCacheWidth(BFLOAT16) : 0);
     const int64_t wanted = std::max(length, reserveCapacity);
     if (cache.expansionDims.empty() || cache.expansionDims[1] < wanted) {
         const int capacity = (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128);
-        ReserveCache(cache, capacity, input.dims[2]);
+        ReserveCache(cache, capacity, width);
     }
-    if (cache.dims.empty()) cache.Resize({1, 0, input.dims[2]});
-    if (cache.isPagedKVCache || cache.dataType == FP8_E4M3) {
+    if (cache.dims.empty()) cache.Resize({1, 0, width});
+    if (cache.isPagedKVCache || cache.dataType == FP8_E4M3 || cache.kvCacheFp8Indexer) {
 #ifdef USE_CUDA
         FastllmCudaNaivePagedWrite(cache, input, oldLength);
 #endif
-        cache.Resize({1, length, input.dims[2]});
+        cache.Resize({1, length, width});
         if (cache.isPagedKVCache) cache.lastPageLen = (length - 1) % cache.pageLen + 1;
     } else CatDirect(cache, input, 1);
     cache.isKVCache = true;
@@ -113,6 +129,7 @@ void NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
     if (!cache.isPagedKVCache) {
         AssertInFastLLM(!cache.cudaData && (cache.dims.empty() || cache.dims[1] == 0),
                         "Naive paged attachment requires empty device storage.");
+        cache.kvCacheFp8Indexer = manager.kvCacheFp8Indexer;
         cache.dataType = manager.dataType;
         cache.UpdateUnitSize();
         cache.dataDevice = DataDevice::CUDA;
@@ -766,6 +783,7 @@ Data NaiveN05FlashModel::RunTarget(
                           Data &positions, Data &pastKey, Data &pastValue,
                           TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, int sequence = 0) {
             Data &packed = buf.packed, &indexKey = buf.indexKey, &indices = buf.indices;
+            pastKey.kvCacheFp8Indexer = fp8IndexerCache && !slidingLayers[layer];
             int localPast = pastKey.dims.empty() ? 0 : pastKey.dims[1];
             const bool ringCache = tensorParallel && slidingLayers[layer] && tpSwaRingCache;
             // Graph replay reads/writes the ring directly. Eager prefill/fallback
@@ -803,13 +821,18 @@ Data NaiveN05FlashModel::RunTarget(
                 } else {
                     packed.CopyFrom(k);
                 }
+                Data *cacheInput = &packed;
+                if (pastKey.kvCacheFp8Indexer) {
+                    FastllmCudaNaivePackIndexer(packed, buf.packedIndexer);
+                    cacheInput = &buf.packedIndexer;
+                }
                 if (decodeWorkspace) {
-                    if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, packed, v,
+                    if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, *cacheInput, v,
                         buf.liveKeys, slidingLayers[layer] ? window : 0);
-                    else FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, packed, v,
+                    else FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, *cacheInput, v,
                         buf.liveKeys, slidingLayers[layer] ? window : 0, ringDecode);
                 } else {
-                    AppendCache(pastKey, packed, kvCacheDataType, layerCapacity);
+                    AppendCache(pastKey, *cacheInput, kvCacheDataType, layerCapacity);
                     AppendCache(pastValue, v, kvCacheDataType, layerCapacity);
                 }
             }
@@ -1355,7 +1378,7 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     for (int layer = 0; layer < block_cnt; ++layer) {
         const auto &cfg = slidingLayers[layer] ? sliding : full;
         const int64_t width = std::max(1, cfg.kvHeads / ranks) *
-            (cfg.headDim + cfg.valueDim) + (slidingLayers[layer] ? 0 : indexDim);
+            (cfg.headDim + cfg.valueDim) + (slidingLayers[layer] ? 0 : IndexerCacheWidth(kvCacheDataType));
         if (slidingLayers[layer]) fixedBytes += width * kvBytes * swaCapacity * batch;
         else fullBytesPerToken += width * kvBytes;
     }
@@ -1432,9 +1455,10 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         for (int layer = 0; layer < block_cnt; ++layer) {
             if (slidingLayers[layer]) continue;
             for (int part = 0; part < 2; ++part) {
-                int width = std::max(1, full.kvHeads / ranks) * (part ? full.valueDim : full.headDim) + (!part ? indexDim : 0);
+                int width = std::max(1, full.kvHeads / ranks) * (part ? full.valueDim : full.headDim) + (!part ? IndexerCacheWidth(kvCacheDataType) : 0);
                 auto manager = std::make_unique<PagedCacheManager>();
                 manager->type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE;
+                manager->kvCacheFp8Indexer = !part && fp8IndexerCache;
                 manager->dataType = kvCacheDataType;
                 manager->UpdateUnitSize();
                 manager->dataDevice = DataDevice::CUDA;

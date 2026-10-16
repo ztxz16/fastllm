@@ -52,7 +52,8 @@ __device__ void Store(Params p, int b, int logical, BF value, BF peer) {
         p.q[b * kQuery + c] = value;
     else if (c < kQK) {
         FastllmNaiveKVWriteRow key{(void *)p.cache[b * 4], p.fp8};
-        key[(size_t)PhysicalRow(p, b, row, false) * (p.indexKey ? 320 : 192) + c - kQuery] = value;
+        const int indexWidth = p.indexKey ? (p.scaledIndexer ? FastllmNaiveIndexerBytes / (p.fp8 ? 1 : 2) : 128) : 0;
+        key[(size_t)PhysicalRow(p, b, row, false) * (192 + indexWidth) + c - kQuery] = value;
     } else {
         FastllmNaiveKVWriteRow v{(void *)p.cache[b * 4 + 1], p.fp8};
         v[(size_t)PhysicalRow(p, b, row, true) * 128 + c - kQK] =
@@ -61,14 +62,17 @@ __device__ void Store(Params p, int b, int logical, BF value, BF peer) {
 }
 __device__ void StoreIndex(Params p, int b) {
     int d = threadIdx.x, row = CacheRow(p, b);
-    if (!p.indexKey || d >= 128 || row < 0)
+    if (!p.indexKey || row < 0)
         return;
     const BF *src = p.indexKey + b * 128;
-    BF value = src[d];
-    if (d < 64)
-        value = Rotate(value, src[d ^ 32], d, p.positions[b], p.theta);
+    BF value = d < 128 ? src[d] : __float2bfloat16(0.f);
+    if (d < 64) value = Rotate(value, src[d ^ 32], d, p.positions[b], p.theta);
     FastllmNaiveKVWriteRow key{(void *)p.cache[b * 4], p.fp8};
-    key[(size_t)PhysicalRow(p, b, row, false) * 320 + 192 + d] = value;
+    if (p.scaledIndexer) {
+        auto dst = key + (size_t)PhysicalRow(p, b, row, false) *
+            (192 + FastllmNaiveIndexerBytes / (p.fp8 ? 1 : 2)) + 192;
+        FastllmNaiveStoreIndexer((float)value, dst.data);
+    } else if (d < 128) key[(size_t)PhysicalRow(p, b, row, false) * 320 + 192 + d] = value;
 }
 __global__ void QkvGemv(const __nv_bfloat16 *input, const __nv_bfloat16 *weight, Params p) {
     if (blockIdx.x == kOutput / 4) {

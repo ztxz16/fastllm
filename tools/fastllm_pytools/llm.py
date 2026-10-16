@@ -506,6 +506,8 @@ fastllm_lib.get_kv_cache_token_limit_llm_model.restype = ctypes.c_int
 
 fastllm_lib.set_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 
+fastllm_lib.set_model_indexer_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
+fastllm_lib.set_model_indexer_dtype.restype = None
 fastllm_lib.set_model_kv_cache_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 
 fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
@@ -1337,7 +1339,10 @@ class model:
                   external_mtp_path: str = "",
                   mmproj_path: str = "",
                   max_context_length: int = -1,
-                  rope_scaling = None):
+                  rope_scaling = None,
+                  indexer_dtype: str = "auto"):
+        if indexer_dtype not in ("auto", "fp8", "fp8_e4m3"):
+            raise ValueError("indexer_dtype must be auto, fp8 or fp8_e4m3")
         if (isinstance(max_context_length, bool) or not isinstance(max_context_length, int) or
                 max_context_length != -1 and not 0 < max_context_length <= 2147483647):
             raise ValueError("max_context_length must be a positive 32-bit integer")
@@ -1607,6 +1612,8 @@ class model:
         print(f"[Fastllm] default generation config: {self.default_generation_config}")
         if (kv_cache_dtype != "" and kv_cache_dtype != "auto"):
             self.set_kv_cache_dtype(kv_cache_dtype)
+        if indexer_dtype != "auto":
+            fastllm_lib.set_model_indexer_dtype(self.model, indexer_dtype.encode())
         self._refresh_context_config()
 
     def _refresh_context_config(self):

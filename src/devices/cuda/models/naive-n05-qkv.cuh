@@ -15,7 +15,7 @@ struct Params {
     __nv_bfloat16 valueScale;
     int pageLen, keyRows, valueRows;
     bool ring;
-    bool fp8 = false;
+    bool fp8 = false, scaledIndexer = false;
 };
 
 // Initializes per-device launch attributes before capture; false leaves outputs untouched.
