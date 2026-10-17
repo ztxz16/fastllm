@@ -1460,6 +1460,9 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     if (!tpKVPool.empty() || !tpPrepared || tpDevices.size() <= 1 ||
         GetKVCacheInCPU() || !FastllmNaiveKVType(kvCacheDataType) || draftEnabled ||
         elementsInKVCachePerToken <= 0) return;
+    const double gpuMemRatio = GetGpuMemRatio();
+    AssertInFastLLM(std::isfinite(gpuMemRatio) && gpuMemRatio > 0 && gpuMemRatio <= 1,
+        "Naive GPU KV pool requires 0 < --gpu_mem_ratio <= 1.");
     const int ranks = tpDevices.size();
     const int batch = maxBatch > 0 ? maxBatch : 512;
     const int chunk = std::max(1, GetChunkedPrefillSize());
@@ -1481,13 +1484,22 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     // Scratch is allocated before measuring free memory, so the total budget
     // accounts for it without multiplying it by layers or concurrent requests.
     auto freeSizes = FastllmCudaGetFreeSizes();
+    auto totalSizes = FastllmCudaGetTotalSizes();
     int64_t budget = INT64_MAX;
     for (int device : tpDevices) {
-        // Leave room for prefill activations, graph workspaces and collectives.
-        int64_t free = freeSizes.at(device);
-        budget = std::min(budget, free * 3 / 4);
+        // Match paged AutoWarmup's ratio of total device memory. Measured free
+        // memory already excludes weights and warmed workspaces; the remainder
+        // outside the ratio is reserved for runtime growth, not KV storage.
+        const int64_t reserved = (int64_t)(totalSizes.at(device) * (1.0 - gpuMemRatio));
+        const int64_t available = freeSizes.at(device) - reserved;
+        budget = std::min(budget, available);
+        printf("[Naive KV budget] GPU %d: total %.2f MiB, free %.2f MiB, gpu_mem_ratio %.4f, runtime reserve %.2f MiB, available for KV %.2f MiB.\n",
+            device, totalSizes.at(device) / 1048576.0, freeSizes.at(device) / 1048576.0,
+            gpuMemRatio, reserved / 1048576.0, available / 1048576.0);
     }
     if (kvCacheLimit > 0) budget = std::min(budget, (int64_t)kvCacheLimit / ranks);
+    AssertInFastLLM(budget > 0,
+        "Naive GPU KV pool has no memory budget; increase --gpu_mem_ratio or free GPU memory.");
     // Reserve bounded SWA checkpoints inside the same total KV budget. Full
     // DSA/indexer pages are shared, never copied into this snapshot storage.
     auto prefixes = std::make_shared<PrefixPool>();
