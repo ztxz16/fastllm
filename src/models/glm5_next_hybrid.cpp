@@ -539,6 +539,7 @@ namespace fastllm {
                 if (threadTpRank <= 0 && frequencyDecode && normalizedFfn.dataDevice == DataDevice::CUDA &&
                     !normalizedFfn.dataDeviceIds.empty() && experts.size() >= 4 && experts[2] &&
                     (experts[2]->dataType == DataType::DATA_GGUF_FORMAT ||
+                     experts[2]->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                      experts[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED)) {
                     const int device = normalizedFfn.dataDeviceIds[0];
                     if (!decodeCaches.Contains(device)) {
@@ -633,6 +634,8 @@ namespace fastllm {
                 if ((device == "numa" || device.rfind("numa:", 0) == 0) &&
                     experts.size() >= 4 && experts[2] &&
                     (experts[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
+                     experts[2]->dataType == DataType::FP8_E4M3 ||
+                     experts[2]->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                      experts[2]->dataType == DataType::DATA_GGUF_FORMAT)) {
                     // A draft layer may use a different GGUF quantization from
                     // the target. Leave unsupported layers on the ordinary NUMA

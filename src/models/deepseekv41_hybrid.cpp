@@ -32,7 +32,7 @@ namespace fastllm {
             }
             if (!supported || !cache.Prepare(
                     [this] { WarmupNumaMoeWeights(); })) {
-                fprintf(stderr, "[Fastllm] V4.1 expert cache requires NUMA NVFP4 block32 or Q2_K/Q4_K R4 experts, "
+                fprintf(stderr, "[Fastllm] V4.1 expert cache requires NUMA FP8 block128, NVFP4 block32 or Q2_K/Q4_K R4 experts, "
                     "CUDA shared experts and ordinary math; using the configured backend.\n");
             }
         }

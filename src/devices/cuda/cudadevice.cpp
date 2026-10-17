@@ -8988,7 +8988,8 @@ namespace fastllm {
             deepSeekV4Mode && activationQuantBlock == 128 &&
             input.dataType == BFLOAT16 && output.dataType == BFLOAT16 &&
             weights[2] && (weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED ||
-                           weights[2]->dataType == DATA_GGUF_FORMAT) &&
+                           weights[2]->dataType == DATA_GGUF_FORMAT ||
+                           weights[2]->dataType == FP8_E4M3_BLOCK_128) &&
             FastllmCudaGetMoePrefillResidents(weights, m, resident, cacheAdmission) &&
             resident.nativeGlm) {
             // Layer-partitioned models admit only on the root GPU. With

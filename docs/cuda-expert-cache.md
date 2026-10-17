@@ -46,9 +46,20 @@ or BF16 activations. The V4.1 adapter has a separate BF16 contract:
 | `NVFP4_BLOCK_16_E4M3` | Packed E2M1 weights, planar E4M3 block scales, global scales | Existing compact NVFP4 adapter |
 | `FP8_E4M3` | Original E4M3 bytes and FP32 block-scale arrays for gate/up and down | Hidden/intermediate widths and column scale blocks divisible by 4 |
 | `FP8_E4M3_BLOCK_128` | Original interleaved 128-byte weight blocks and FP32 scales | Hidden/intermediate widths divisible by 128 |
+| GLM 5.3 / DeepSeek V4.1 `FP8_E4M3_BLOCK_128` | Native NUMA gate/up row pairs; 128 E4M3 bytes followed by one FP32 scale | BF16 scored decode and small-batch verification; widths divisible by 128; GLM also reuses resident weights during multi-row prefill |
 | GLM 5.3 `NVFP4_BLOCK_16_E4M3_PACKED` | Native NUMA gate/up row pairs, packed E2M1 values, inline E4M3 block scales and per-row global scales | BF16 decode, 2–9-row verification and NUMA-assisted multi-row prefill; hidden/intermediate widths divisible by 128 |
 | DeepSeek V4.1 `NVFP4_BLOCK_32_E8M0` | 16 packed E2M1 bytes and one UE8M0 scale per 32 weights | BF16 decode and 2–8-row verification; NUMA weights and widths divisible by 32 |
 | DeepSeek V4.1 Q2_K gate/up + Q4_K down | Registered NUMA Q2_K_R4/Q4_K_R4 blocks, retaining cross-interleaved gate/up rows | BF16 decode and 2–8-row verification; widths divisible by 256 |
+
+The scored FP8 adapter shares cache admission, NUMA storage and temporary
+uploads with the general FP8 backend. It reads registered rows directly,
+without a second host weight snapshot or dequantized resident weight copy.
+Projection results round to BF16; clamp and route scores are applied before
+down-activation FP8 quantization (128 values for GLM, 32 for V4.1). V4.1
+retains its input quantization. Ordinary FP8 models such as Qwen retain the
+general adapter's arithmetic. FP8 checkpoint weights become packed block-128
+records during NUMA registration; no additional model-name or GPU-architecture
+switch is needed.
 
 The generic GGUF adapter accepts Q2_0, Q4_0/Q4_1, Q5_0/Q5_1,
 Q8_0/Q8_1, Q2_K–Q6_K, IQ1_S/IQ1_M, IQ2_XXS/IQ2_XS/IQ2_S,

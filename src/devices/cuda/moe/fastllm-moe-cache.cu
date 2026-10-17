@@ -47,6 +47,7 @@
 #include <cuda_bf16.h>
 #include "fastllm-moe-deepseekv41-cache.cuh"
 #include "fastllm-moe-glm5-cache.cuh"
+#include "fastllm-moe-fp8-scored.cuh"
 
 namespace {
 
@@ -702,10 +703,13 @@ bool BindSharedFP8(const OffloadLayout &l, const fastllm::Data &w, int part,
                    fastllm::cuda::SharedWeightView &view) {
     const uint32_t columns = part == 0 ? l.hidden : l.inter;
     if (l.weightType == fastllm::DataType::FP8_E4M3_BLOCK_128) {
-        // Identical packed row payload: only undo gate/up row interleaving.
+        // Identical packed row payload; generic math restores gate/up halves.
         if (w.dataType != l.weightType) return false;
         view.rowBytes = fastllm::GetDataBytes(w.dataType, 1, columns);
         view.tileStride = view.rowStride = view.blockBytes = view.blockStride = view.rowBytes;
+        // Scored BF16 kernels read native gate/up pairs. Ordinary FP8 retains
+        // its canonical [gate, up] adapter and unchanged arithmetic.
+        if (l.glm5 || l.deepSeekV41) view.rowGroups = 1;
     } else {
         const int block = part == 0 ? l.gateBlockM : l.downBlockM;
         const auto expected = block == 128 ? fastllm::DataType::FP8_E4M3_BLOCK_128
@@ -926,7 +930,8 @@ bool ValidateWeightPair(fastllm::Data *gate, fastllm::Data *down,
         down->dataDevice != fastllm::DataDevice::CPU ||
         ((gate->cpuData == nullptr || down->cpuData == nullptr) &&
          ((gate->dataType != fastllm::DataType::NVFP4_BLOCK_32_E8M0 &&
-           gate->dataType != fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED) ||
+           gate->dataType != fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED &&
+           gate->dataType != fastllm::DataType::FP8_E4M3_BLOCK_128) ||
           gate->numasData.empty() || down->numasData.empty())) ||
         gate->dims.size() != 2 || down->dims.size() != 2 ||
         gate->dims[0] <= 0 || gate->dims[1] <= 0 ||
@@ -1117,7 +1122,7 @@ bool AllocateOne(void **pointer, size_t bytes) {
 
 bool PrepareFp8SlotPointers(DeviceCache &cache, const OffloadLayout &layout) {
     const int tables = Fp8PointerTableCount(layout.weightType);
-    if (tables == 0) return true;
+    if (tables == 0 || cache.slots == 0) return true;
     const size_t slots = cache.slots;
     std::vector<void *> pointers(slots * tables);
     for (size_t slot = 0; slot < slots; ++slot) {
@@ -1989,12 +1994,16 @@ bool FastllmCudaPrepareMoeCache(
                     down == nullptr ? -1 : static_cast<int>(down->dataType));
                 return false;
             }
+            const bool scoredFp8 = (layers[0].deepSeekV41 || layers[0].glm5) &&
+                observed.weightType == fastllm::DataType::FP8_E4M3_BLOCK_128;
             if (layers[0].deepSeekV41 !=
-                (observed.weightType == fastllm::DataType::NVFP4_BLOCK_32_E8M0 || v41GGUF)) return false;
+                (observed.weightType == fastllm::DataType::NVFP4_BLOCK_32_E8M0 || v41GGUF ||
+                 (layers[0].deepSeekV41 && scoredFp8))) return false;
             const bool glmGGUF = layers[0].glm5 &&
                 observed.weightType == fastllm::DataType::DATA_GGUF_FORMAT;
             if (layers[0].glm5 !=
-                (observed.weightType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED || glmGGUF)) return false;
+                (observed.weightType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED || glmGGUF ||
+                 (layers[0].glm5 && scoredFp8))) return false;
             if (glmGGUF && !FastllmCudaMoeGlm5GGUFCacheSupported(
                     observed.gateGgmlType, observed.downGgmlType, observed.hidden, observed.inter)) return false;
             if (expert == 0) {
@@ -2029,7 +2038,8 @@ bool FastllmCudaPrepareMoeCache(
         group->cacheDevices.push_back(layers[layer].cacheDevice);
     group->allowStreaming = allowStreaming && registerNumaWeights &&
         (layout.weightType == fastllm::DATA_GGUF_FORMAT ||
-         (layout.glm5 && layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3_PACKED));
+         (layout.glm5 && (layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3_PACKED ||
+                         layout.weightType == fastllm::FP8_E4M3_BLOCK_128)));
     if (layout.weightType == fastllm::DataType::DATA_GGUF_FORMAT) {
         group->layerLayouts = std::move(layerLayouts);
     }
@@ -2328,6 +2338,34 @@ void FastllmCudaReleaseMoeCache(
 }
 
 namespace {
+// Both scored models use the shared packed-FP8 cache, with their own
+// activation block and input preparation. No model-name dispatch in kernels.
+bool ComputeScoredFP8Experts(const fastllm::Data &input, fastllm::Data &activation,
+        const OffloadLayout &layout, const uint8_t *records, const int32_t *slots,
+        const float *scores, int topk, float *perExpert,
+        const int32_t *routeMap = nullptr, int routeCount = 0) {
+    if (layout.weightType != fastllm::FP8_E4M3_BLOCK_128 ||
+        !(layout.glm5 || layout.deepSeekV41) || input.dataType != fastllm::BFLOAT16 ||
+        !records || !scores || !perExpert || topk <= 0 ||
+        layout.hidden % 128 || layout.inter % 128) return false;
+    const int routes = routeCount ? routeCount : topk;
+    const int block = layout.glm5 ? 128 : 32;
+    using namespace fastllm::cuda::fp8_cache;
+    if (block == 128)
+        GateScored<128><<<dim3(layout.inter / 128, routes), 1024, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)input.cudaData, slots, records, scores,
+            (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
+            layout.recordStride, layout.swigluLimit, true, topk, routeMap);
+    else
+        GateScored<32><<<dim3(layout.inter / 32, routes), 256, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)input.cudaData, slots, records, scores,
+            (__nv_bfloat16 *)activation.cudaData, layout.hidden, layout.inter,
+            layout.recordStride, layout.swigluLimit, true, topk, routeMap);
+    DownScored<<<dim3(layout.hidden / 16, routes), 128, 0, cudaStreamPerThread>>>(
+        (const __nv_bfloat16 *)activation.cudaData, slots, records, perExpert,
+        layout.hidden, layout.inter, layout.recordStride, layout.downOffset, routeMap);
+    return cudaGetLastError() == cudaSuccess;
+}
 bool Glm5HybridShape(const OffloadLayout &l) {
     return l.glm5 && l.hidden % 128 == 0 && l.inter % 128 == 0;
 }
@@ -2337,6 +2375,9 @@ bool ComputeGlm5Experts(const fastllm::Data &input, fastllm::Data &gateOutput,
         const int32_t *routeMap = nullptr, int routeCount = 0) {
     if (!Glm5HybridShape(layout) || input.dataType != fastllm::DataType::BFLOAT16 || !perExpert)
         return false;
+    if (layout.weightType == fastllm::FP8_E4M3_BLOCK_128)
+        return ComputeScoredFP8Experts(input, gateOutput, layout, records, slots,
+            scores, topk, perExpert, routeMap, routeCount);
     const int routes = routeCount ? routeCount : topk;
     fastllm::cuda::glm5_cache::Gate<<<dim3(layout.inter / 128, routes), 1024, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16 *)input.cudaData, slots, records, scores,
@@ -2385,6 +2426,9 @@ FastllmCudaMoeFP8CacheView FP8CacheView(const OffloadLayout &layout, const Devic
 bool ComputeFP8Cache(const fastllm::Data &input, fastllm::Data &gateOutput,
         fastllm::Data &output, const OffloadLayout &layout, const DeviceCache &cache,
         const float *scores, int topk, float *perExpert) {
+    if (layout.glm5 || layout.deepSeekV41)
+        return ComputeScoredFP8Experts(input, gateOutput, layout, cache.records,
+            cache.routeSlots, scores, topk, perExpert);
     return FastllmCudaMoeFP8CacheCompute(input, gateOutput, output, FP8CacheView(layout, cache),
         cache.routeSlots, scores, topk, perExpert);
 }
@@ -2398,7 +2442,9 @@ bool ComputeStagedNativeExpert(const fastllm::Data &input, fastllm::Data &gate,
         int32_t *slot, const float *score, float *perExpert, const FastllmCudaMoeStageEvents &events) {
     const bool v41 = layout.deepSeekV41 &&
         layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 && input.dataType == fastllm::BFLOAT16;
-    if (!v41 && input.dataType != fastllm::FLOAT32) return false;
+    const bool scoredFp8 = (layout.glm5 || layout.deepSeekV41) &&
+        layout.weightType == fastllm::FP8_E4M3_BLOCK_128 && input.dataType == fastllm::BFLOAT16;
+    if (!v41 && !scoredFp8 && input.dataType != fastllm::FLOAT32) return false;
     DeviceCache temporary;
     temporary.slots = work.expertReady.size(); temporary.records = work.records;
     temporary.fp8Pointers = work.fp8Pointers; temporary.routeSlots = slot;
@@ -2408,6 +2454,8 @@ bool ComputeStagedNativeExpert(const fastllm::Data &input, fastllm::Data &gate,
     // The caller supplies the same block32-quantized BF16 activation used by
     // resident V4.1 experts. Temporary records must keep that arithmetic too.
     if (v41) return ComputeV41Cache(input, gateRow, output, layout, temporary, score, 1, perExpert);
+    if (scoredFp8) return ComputeScoredFP8Experts(input, gateRow, layout, work.records,
+        slot, score, 1, perExpert);
     if (layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3)
         return LaunchNVFP4Cache<float>(input, gateRow, output, layout, temporary, score, 1, perExpert, events);
     return FastllmCudaMoeFP8CacheComputeStaged(input, gateRow, output, FP8CacheView(layout, temporary),
@@ -4224,6 +4272,10 @@ bool TryV41VerifyHybrid(const fastllm::Data &input, const fastllm::Data &index, 
             fastllm::AssertInFastLLM(FastllmCudaMoeV41GGUFCacheCompute(w.quantizedInput, w.activation,
                 view, (const float *)score.cudaData, topk, layout.swigluLimit, dGpu),
                 "Verify Q2 CUDA experts failed.\n");
+        } else if (layout.weightType == fastllm::FP8_E4M3_BLOCK_128) {
+            fastllm::AssertInFastLLM(ComputeScoredFP8Experts(w.quantizedInput, w.activation,
+                layout, cache->records, dSlots, (const float *)score.cudaData, topk, dGpu, nullptr, routes),
+                "Verify FP8 CUDA experts failed.\n");
         } else {
             Gate<true><<<dim3(layout.inter / 32, routes), 512, 0, cudaStreamPerThread>>>(
                 (const __nv_bfloat16 *)w.quantizedInput.cudaData, dSlots, cache->records, (const float *)score.cudaData,
