@@ -394,8 +394,9 @@ def weight_costs(tensors, model, args):
                 raise ValueError("Hybrid auto CUDA cache requires GGUF, FP8 or packed FP4 expert weights")
             if (args.moe_device != "disk" and args.moe_cuda_cache == "auto" and
                     model.family in ("glm5", "deepseek_v41") and
-                    (tensor.kind not in ("U8", "I8") or target not in ("auto", "nvfp4"))):
-                raise ValueError("Hybrid auto: this model's NUMA CUDA cache requires GGUF or native packed FP4 experts")
+                    not ((tensor.kind in ("U8", "I8") and target in ("auto", "nvfp4")) or
+                         (tensor.kind in ("F8_E4M3", "F8_E4M3FN") and target in ("auto", "fp8_e4m3")))):
+                raise ValueError("Hybrid auto: this model's NUMA CUDA cache requires GGUF, native FP8 E4M3 or packed FP4 experts")
         if not tensor.kind.startswith("gguf:"):
             dtype = (args.moe_dtype or args.dtype) if is_expert or is_shared else args.dtype
             if dtype not in ("auto", "float16", "bfloat16", "float32", "fp8_e4m3", "nvfp4"):

@@ -226,6 +226,20 @@ class HybridAutoTest(unittest.TestCase):
         e, dense, common, host, largest, _ = auto.weight_costs(t, g, a)
         self.assertEqual((sum(e), sum(dense), common, host, largest), (64, 0, 0, 16384, 16384))
 
+    def test_native_fp8_experts_support_numa_cuda_cache(self):
+        from dataclasses import replace
+        g, _, _, _ = fixture()
+        for family in ("glm5", "deepseek_v41"):
+            for kind in ("F8_E4M3", "F8_E4M3FN"):
+                for dtype in ("auto", "fp8_e4m3"):
+                    with self.subTest(family=family, kind=kind, dtype=dtype):
+                        t = [auto.Tensor("layers.0.ffn.experts.0.up_proj.weight", (8, 8), 64, kind)]
+                        e, *_ = auto.weight_costs(t, replace(g, family=family), args(dtype=dtype))
+                        self.assertEqual(e[0], 64)
+            t = [auto.Tensor("layers.0.ffn.experts.0.up_proj.weight", (8, 8), 64, "F8_E5M2")]
+            with self.assertRaises(ValueError):
+                auto.weight_costs(t, replace(g, family=family), args())
+
     def test_hf_weight_conversion_counts_unpacked_values(self):
         g, _, _, _ = fixture()
         a = args(dtype="float16", moe_cuda_cache=0)
