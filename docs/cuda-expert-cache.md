@@ -352,6 +352,13 @@ once. Target and draft host expert tables share the same GGUF LRU pool and
 expert-record budget; draft dense weights and verifier state use additional
 memory. The existing Qwen4 MTP generation constraints still apply.
 
+Qwen4 hybrid PP can pipeline chunked prefill with greedy MTP and CPU
+embedding (`--low_gpu_mem`). The final stage updates draft KV for each chunk,
+retains the target hidden row needed at the next chunk boundary, and joins
+target request state before the final proposal and prefix snapshot. This also
+supports exact QSA KV streaming. CUDA embedding, sampling, restored prefixes
+and other unsupported pipeline configurations retain serial prefill.
+
 After warmup, read or reset counters outside timed inference:
 
 ```python

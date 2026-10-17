@@ -16,7 +16,7 @@ namespace fastllm {
                                                  std::vector<float> *logits, int &outputToken) {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         const int chunkSize = GetChunkedPrefillSize();
-        if (threadTpState || threadTpRank >= 0 || Qwen4MtpDraftsPerStep() != 0 ||
+        if (threadTpState || threadTpRank >= 0 ||
             !generationConfig.IsSimpleGreedy() || saveHistoryChat || GetKVCacheInCPU() ||
             GetHistoryCacheInCPU() || GetLowMemMode() || GetFastllmEnv().printProfile ||
             FastllmCudaGraphIsCapturingFast() || inputIds.dataDevice != DataDevice::CPU ||
@@ -35,12 +35,19 @@ namespace fastllm {
                 !kv.second.pageIndex.empty())
                 return false;
         PrepareWeights();
+        const bool mtp = Qwen4MtpDraftsPerStep() > 0;
+        // Keep shared CUDA embedding migration and unsupported MTP modes on
+        // their serial path. The hybrid auto policy selects CPU embedding.
+        if (mtp && (executionMode != ExecutionMode::Hybrid || GetCudaEmbedding() ||
+                    !MtpSupportsGenerationConfig(generationConfig)))
+            return false;
         RequestState *request;
         {
             std::lock_guard<std::mutex> lock(stateMutex);
             request = &requestStates[&pastKeyValues[0].first];
             if (request->hasMultimodalInput || request->borrowedPrefixSnapshot ||
-                !request->processedTokens.empty() || request->mtpState)
+                !request->processedTokens.empty() || request->mtpState ||
+                (mtp && request->mtpDisabled))
                 return false;
         }
 
@@ -55,7 +62,12 @@ namespace fastllm {
                 if (moe.empty() || moe == dense)
                     continue;
                 const bool host = moe == "cpu" || moe == "numa" || moe.rfind("numa:", 0) == 0;
-                if (!host)
+                // Hybrid MTP auto placement can balance resident experts
+                // across the PP devices independently of their dense layers.
+                // RunGpuMoE owns its cross-device input/output transfers.
+                const bool residentPeer = mtp && std::any_of(stages.begin(), stages.end(),
+                    [&](const auto &peer) { return moe == "cuda:" + std::to_string(peer.device); });
+                if (!host && !residentPeer)
                     return false;
             }
         }
@@ -69,6 +81,8 @@ namespace fastllm {
             }
             // Once workers start, never retry a partially appended request through
             // serial Forward. All fallback checks must precede this boundary.
+            if (mtp && !request->mtpState)
+                request->mtpState = std::make_shared<MtpRuntimeState>();
             AcquireServingCache(cache, *request, sequence);
             std::vector<RequestState> states(stages.size(), *request);
             std::vector<PrefillStageContext> contexts(stages.size());
@@ -105,6 +119,25 @@ namespace fastllm {
             const float *tokens = reinterpret_cast<const float *>(inputIds.cpuData);
             const float *positions = reinterpret_cast<const float *>(positionIds.cpuData);
             std::vector<std::vector<float> *> batchLogits{logits};
+            auto joinStates = [&]() {
+                // Only the PLE stage advances token/short-convolution history.
+                // Attention maps belong to disjoint layer ranges. The last
+                // stage needs the complete state before MTP's final snapshot.
+                RequestState joined = std::move(states[pleOwner]);
+                for (int rank = 0; rank < int(states.size()); ++rank) {
+                    if (rank == pleOwner) continue;
+                    auto &other = states[rank];
+                    joined.indexerRawKeys.merge(other.indexerRawKeys);
+                    joined.indexerPositions.merge(other.indexerPositions);
+                    joined.indexerBlockKeys.merge(other.indexerBlockKeys);
+                    joined.indexerHostMirrorTransfers.merge(other.indexerHostMirrorTransfers);
+                    joined.indexerTailKeyTensors.merge(other.indexerTailKeyTensors);
+                    joined.indexerTailPositionTensors.merge(other.indexerTailPositionTensors);
+                    joined.indexerBlockKeyTensors.merge(other.indexerBlockKeyTensors);
+                    joined.geometricCacheGrowthReadyLayers.merge(other.geometricCacheGrowthReadyLayers);
+                }
+                states.back() = std::move(joined);
+            };
             if (verbose) {
                 std::printf(
                     "[Prompt] Qwen4 pipelined prefill: %zu CUDA stages, %d chunks (%d tokens/chunk).\n",
@@ -125,30 +158,23 @@ namespace fastllm {
                                      context.hidden = &hidden;
                                      context.sampleOutput =
                                          rank + 1 == int(stages.size()) && chunk + 1 == chunks;
-                                     const auto result = ForwardTarget(
-                                         1, ids, Data(), pos, cache, generationConfig,
-                                         lastTokens, &batchLogits, nullptr, nullptr, nullptr, nullptr,
-                                         false, false, false, nullptr, false, nullptr, &context);
+                                     // Receiving the final chunk means every earlier
+                                     // stage has published its last state and activation.
+                                     // Join before the last MTP call so its snapshot and
+                                     // proposal generation reuse the ordinary semantics.
+                                     if (mtp && context.sampleOutput) joinStates();
+                                     const auto result = mtp && rank + 1 == int(stages.size())
+                                         ? ForwardBatchInternal(1, ids, Data(), pos, cache,
+                                             generationConfig, lastTokens, &batchLogits, &context)
+                                         : ForwardTarget(1, ids, Data(), pos, cache, generationConfig,
+                                             lastTokens, &batchLogits, nullptr, nullptr, nullptr, nullptr,
+                                             false, false, false, nullptr, false, nullptr, &context);
                                      if (context.sampleOutput)
                                          outputToken = result.front();
                                  });
 
-            // Only the PLE stage advances token/short-convolution history. Attention
-            // maps are owned by disjoint layer ranges and can be joined after draining.
-            *request = std::move(states[pleOwner]);
-            for (int rank = 0; rank < int(states.size()); ++rank) {
-                if (rank == pleOwner)
-                    continue;
-                auto &other = states[rank];
-                request->indexerRawKeys.merge(other.indexerRawKeys);
-                request->indexerPositions.merge(other.indexerPositions);
-                request->indexerBlockKeys.merge(other.indexerBlockKeys);
-                request->indexerHostMirrorTransfers.merge(other.indexerHostMirrorTransfers);
-                request->indexerTailKeyTensors.merge(other.indexerTailKeyTensors);
-                request->indexerTailPositionTensors.merge(other.indexerTailPositionTensors);
-                request->indexerBlockKeyTensors.merge(other.indexerBlockKeyTensors);
-                request->geometricCacheGrowthReadyLayers.merge(other.geometricCacheGrowthReadyLayers);
-            }
+            if (!mtp) joinStates();
+            *request = std::move(states.back());
             return true;
         });
 #else

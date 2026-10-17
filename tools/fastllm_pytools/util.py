@@ -1832,6 +1832,7 @@ def make_normal_llm_model(args, startup_progress = None):
     llm.set_moe_cpu_cache(
         _memory_size_bytes(getattr(args, "moe_cpu_cache", 0)))
     llm.set_ngram_device(args.ngram_device)
+    device_map = args.device
     if (args.device and args.device != ""):
         try:
             import ast
@@ -1843,13 +1844,13 @@ def make_normal_llm_model(args, startup_progress = None):
         except:
             llm.set_device_map(args.device)
     if (args.moe_device and args.device != ""):
+        front_moe_device = device_map if isinstance(device_map, (list, dict)) else args.device
+        if (_uses_thread_tp(tp_arg) and is_thread_tp_moe_model):
+            front_moe_device = _thread_tp_cuda_device_spec(tp_arg) or args.device
         try:
             import ast
             moe_device_map = ast.literal_eval(args.moe_device)
             if (args.moe_device_layers >= 0):
-                front_moe_device = args.device
-                if (_uses_thread_tp(tp_arg) and is_thread_tp_moe_model):
-                    front_moe_device = _thread_tp_cuda_device_spec(tp_arg) or args.device
                 llm.set_device_map(front_moe_device, True)
                 if (isinstance(moe_device_map, list) or isinstance(moe_device_map, dict)):
                     llm.set_layered_moe_device_map(moe_device_map)
@@ -1862,9 +1863,6 @@ def make_normal_llm_model(args, startup_progress = None):
                 llm.set_device_map(args.moe_device, True)
         except:
             if (args.moe_device_layers >= 0):
-                front_moe_device = args.device
-                if (_uses_thread_tp(tp_arg) and is_thread_tp_moe_model):
-                    front_moe_device = _thread_tp_cuda_device_spec(tp_arg) or args.device
                 llm.set_device_map(front_moe_device, True)
                 llm.set_layered_moe_device_map(args.moe_device)
                 llm.set_moe_device_layers(args.moe_device_layers)

@@ -104,6 +104,25 @@ class HybridAutoTest(unittest.TestCase):
                 auto.resolve(a, lambda _: self.fail("unexpected CUDA access"))
             self.assertEqual(vars(a), before)
 
+    def test_pp_resident_experts_receive_a_parsed_front_device_map(self):
+        with tempfile.TemporaryDirectory() as path:
+            Path(path, "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+            for backend in ("numa", "disk"):
+                with self.subTest(backend=backend):
+                    a = make_normal_parser("test").parse_args([
+                        path, "--device", "cudapp=0,1", "--tp", "off", "--threads", "1",
+                        "--moe_device", backend, "--moe_device_layers", "22"])
+                    runtime = MagicMock()
+                    runtime.model.return_value.get_max_input_len.return_value = 32768
+                    runtime.model.return_value.get_max_batch.return_value = 1
+                    with patch.dict(os.environ, {}, clear=True), \
+                            patch.dict(sys.modules, {"ftllm": types.SimpleNamespace(llm=runtime)}), \
+                            redirect_stdout(io.StringIO()):
+                        make_normal_llm_model(a)
+                    runtime.set_device_map.assert_any_call({"cuda:0": 1, "cuda:1": 1}, True)
+                    runtime.set_layered_moe_device_map.assert_called_once_with(backend)
+                    runtime.set_moe_device_layers.assert_any_call(22)
+
     def test_gguf_all_shards_and_missing_shard(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d)

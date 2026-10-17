@@ -117,6 +117,7 @@ namespace fastllm {
         struct ThreadTpState;
         struct DecodeServingSlot;
         struct RequestState;
+        struct PrefillStageContext;
         std::map<const Data *, std::unique_ptr<DecodeServingSlot>> decodeServingSlots;
         std::unique_ptr<DecodeServingSlot> idleDecodeServingSlot;
         std::mutex decodeServingMutex;
@@ -129,7 +130,8 @@ namespace fastllm {
                 int batch, const Data &inputIds, const Data &attentionMask,
                 const Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                 const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
-                std::vector<std::vector<float> *> *retLogits);
+                std::vector<std::vector<float> *> *retLogits,
+                PrefillStageContext *prefill = nullptr);
         std::unique_ptr<ThreadTpState> threadTpState;
         ThreadTpState *threadTpOwner = nullptr;
         int threadTpRank = -1;
@@ -606,7 +608,8 @@ namespace fastllm {
                         Data *sampledTokenIds = nullptr,
                         Data *sampledTokenValues = nullptr,
                         int sampledTokenOffset = 0,
-                        float *topProbability = nullptr);
+                        float *topProbability = nullptr,
+                        std::mutex *embeddingMutex = nullptr);
         void CaptureRequestRuntimeCheckpoint(
             RequestState &state,
             const std::map<int, int> &qsaLengths,

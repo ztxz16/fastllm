@@ -7194,7 +7194,8 @@ namespace fastllm {
             Data *sampledTokenIds,
             Data *sampledTokenValues,
             int sampledTokenOffset,
-            float *topProbability) {
+            float *topProbability,
+            std::mutex *embeddingMutex) {
         // Rejection replay can finish on an earlier pipeline device.
         ApplyDeviceMap(this->deviceMap, this->block_cnt, this->block_cnt);
         const int sequence = (int)inputTokens.size();
@@ -7297,10 +7298,15 @@ namespace fastllm {
 #endif
 
         Data inputEmbeds;
-        Embedding(
-            *tokenIds,
-            this->weight[languagePrefix + "embed_tokens.weight"],
-            inputEmbeds);
+        {
+            // The draft and the first PP stage share the CPU embedding pool.
+            std::unique_lock<std::mutex> lock;
+            if (embeddingMutex) lock = std::unique_lock<std::mutex>(*embeddingMutex);
+            Embedding(
+                *tokenIds,
+                this->weight[languagePrefix + "embed_tokens.weight"],
+                inputEmbeds);
+        }
 
         // The embedding lookup stays eager: its device cache is shared with
         // the target model. Stable copies let the pure projection/hyperconnection
@@ -9212,7 +9218,8 @@ namespace fastllm {
             std::vector<std::pair<Data, Data>> &pastKeyValues,
             const GenerationConfig &generationConfig,
             const LastTokensManager &lastTokens,
-            std::vector<std::vector<float> *> *retLogits) {
+            std::vector<std::vector<float> *> *retLogits,
+            PrefillStageContext *prefill) {
         AssertInFastLLM(batch == 1 && inputIds.dims.size() == 2 &&
                         inputIds.dims[0] == 1,
                         "Qwen4-Exp currently runs one request per Forward call.");
@@ -9224,8 +9231,8 @@ namespace fastllm {
         }
         PrepareWeights();
 
-        RequestState *requestState;
-        {
+        RequestState *requestState = prefill ? prefill->state : nullptr;
+        if (!requestState) {
             std::lock_guard<std::mutex> guard(this->stateMutex);
             requestState = &this->requestStates[&pastKeyValues[0].first];
         }
@@ -9244,7 +9251,7 @@ namespace fastllm {
         // Keep the whole MTP iteration on the same spare cores as ordinary
         // PP decode, including draft generation and recurrent-state replay.
         std::optional<HybridExecutionScope> hybridScope;
-        if (executionMode == ExecutionMode::Hybrid) hybridScope.emplace(*this, inputIds, false, true);
+        if (executionMode == ExecutionMode::Hybrid && !prefill) hybridScope.emplace(*this, inputIds, false, true);
 #endif
 
         if (requestState->mtpDisabled ||
@@ -9499,7 +9506,7 @@ namespace fastllm {
                 batch, inputIds, attentionMask, positionIds,
                 pastKeyValues, generationConfig, lastTokens, retLogits,
                 &targetHidden, nullptr, nullptr, nullptr,
-                false, true, false);
+                false, prefill == nullptr, false, nullptr, false, nullptr, prefill);
 
             const std::vector<int> ids = dataToInts(inputIds);
             const std::vector<int> currentPositions =
@@ -9511,8 +9518,9 @@ namespace fastllm {
                 ? pastKeyValues[this->kvCacheId].first.dims[1]
                 : (int)requestState->processedTokens.size();
             const bool finalPromptChunk =
-                generationConfig.input_token_length <= 0 ||
-                processedLength >= generationConfig.input_token_length;
+                prefill ? prefill->sampleOutput :
+                (generationConfig.input_token_length <= 0 ||
+                 processedLength >= generationConfig.input_token_length);
             std::vector<int> mtpTokens;
             std::vector<int> mtpPositions;
             Data pairedHidden;
@@ -9562,13 +9570,14 @@ namespace fastllm {
                 if (hasPairedHidden) {
                     RunMtpDraft(
                         mtp, pairedHidden, mtpTokens, mtpPositions,
-                        nullptr, false);
+                        nullptr, false, nullptr, nullptr, nullptr, 0, nullptr,
+                        prefill ? prefill->hostExpertMutex : nullptr);
                 }
                 // Prefix snapshot materialization can synchronize and
                 // rematerialize target recurrent state.  Keep it after the
                 // independent draft state has consumed this prompt chunk so
                 // snapshot bookkeeping cannot perturb prompt alignment.
-                MaybeRecordPrefixSnapshot(pastKeyValues, *requestState);
+                if (!prefill) MaybeRecordPrefixSnapshot(pastKeyValues, *requestState);
                 return result;
             }
 
@@ -10554,6 +10563,9 @@ namespace fastllm {
         auto &qsaPreviousLength = f.qsaPreviousLength;
         if (prefill) {
             if (hiddenStates != prefill->hidden) prefill->hidden->CopyFrom(*hiddenStates);
+            // Intermediate chunks still feed the draft's shifted prompt KV.
+            if (targetMultiHidden && !prefill->sampleOutput)
+                targetMultiHidden->CopyFrom(*hiddenStates);
             if (!prefill->sampleOutput) return {};
         }
 

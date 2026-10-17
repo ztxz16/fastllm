@@ -53,11 +53,19 @@ namespace fastllm {
         if (!prepared) SelectMoEExperts(routerLogits, index, score);
         const auto moeDevice = SelectSpecialWeightDevice(mlp + "experts.0.gateup_proj.weight", deviceLayer);
         const auto outputDevice = SelectDeviceFromMap(deviceMap, deviceLayer + 1, block_cnt);
+        const bool direct = moeDevice == outputDevice;
+        Data transferredInput;
+        Data &expertInput = executionMode == ExecutionMode::Hybrid && !direct ? transferredInput : flattened;
+        if (&expertInput != &flattened) {
+            // A borrowed view has no allocation capacity, so ToDevice cannot
+            // move it between PP stages. Own the input before the executor
+            // transfers it to a resident expert on another GPU.
+            expertInput.CopyFrom(flattened);
+        }
         if (!moeDevice.empty()) ApplyDeviceMap({{moeDevice, 1}}, 1, 1);
         Data routed, w1, w2, w3, temporaryInput, temporaryOutput;
-        const bool direct = moeDevice == outputDevice;
         Data &routedOutput = direct ? output : routed;
-        MergeMOE(flattened, index, score, moeWeights, moeBiass, w1, w2, w3,
+        MergeMOE(expertInput, index, score, moeWeights, moeBiass, w1, w2, w3,
                  temporaryInput, temporaryOutput, 1.0f, routedOutput, deviceLayer);
 #ifdef USE_CUDA
         FastllmCudaGraphMarkParallelJoin(deviceLayer);
