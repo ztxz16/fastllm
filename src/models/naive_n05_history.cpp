@@ -246,7 +246,7 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
     }
     if (!snapshot) return false;
     const int rows = std::min(length, window - 1), ranks = tpDevices.size();
-    const int capacity = (window - 1 + self->GetChunkedPrefillSize() + 127) / 128 * 128;
+    const int capacity = (window + 127) / 128 * 128;
     const int previous = FastllmCudaGetDevice();
     for (int rank = 0; rank < ranks; ++rank) {
         FastllmCudaSetDevice(tpDevices[rank]);

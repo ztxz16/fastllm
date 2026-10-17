@@ -32,6 +32,36 @@ namespace {
         for (auto &value : values.array_items()) result.push_back(value.int_value());
         return result;
     }
+#ifdef USE_CUDA
+    // Copy stored KV bits between a request's window and chronological scratch.
+    // At most one side wraps; copies are ordered with attention on the rank stream.
+    void CopySwaWindow(const Data &key, const Data &value, Data &targetKey, Data &targetValue,
+                       int sourceFirst, int targetFirst, int rows) {
+        if (rows == 0) return;
+        void *dsts[4]; const void *srcs[4]; size_t sizes[4];
+        int copies = 0;
+        for (int part = 0; part < 2; ++part) {
+            const Data &source = part ? value : key;
+            Data &target = part ? targetValue : targetKey;
+            const size_t rowBytes = (size_t)source.expansionDims[2] * source.unitSize;
+            AssertInFastLLM(source.dataType == target.dataType &&
+                source.expansionDims[2] == target.expansionDims[2], "Invalid SWA workspace layout.");
+            for (int offset = 0; offset < rows;) {
+                int from = (sourceFirst + offset) % source.expansionDims[1];
+                int to = (targetFirst + offset) % target.expansionDims[1];
+                int count = std::min({rows - offset, source.expansionDims[1] - from,
+                                     target.expansionDims[1] - to});
+                AssertInFastLLM(copies < 4, "Invalid SWA window copy.");
+                dsts[copies] = (uint8_t *)target.cudaData + to * rowBytes;
+                srcs[copies] = (uint8_t *)source.cudaData + from * rowBytes;
+                sizes[copies++] = count * rowBytes;
+                offset += count;
+            }
+        }
+        AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+            dsts, srcs, sizes, copies), "SWA workspace copy failed.");
+    }
+#endif
 }
 
 void NaiveN05FlashModel::SetIndexerDataType(DataType type) {
@@ -801,16 +831,26 @@ Data NaiveN05FlashModel::RunTarget(
             }
         }
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
-                          Data &positions, Data &pastKey, Data &pastValue,
+                          Data &positions, Data &cacheKey, Data &cacheValue,
                           TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, int sequence = 0) {
             Data &packed = buf.packed, &indexKey = buf.indexKey, &indices = buf.indices;
+            const bool sharedSwa = tensorParallel && slidingLayers[layer] &&
+                !decodeWorkspace && !verifying && !tpSwaPrefillWorkspaces.empty();
+            Data &pastKey = sharedSwa ? tpSwaPrefillWorkspaces[tpRank].first : cacheKey;
+            Data &pastValue = sharedSwa ? tpSwaPrefillWorkspaces[tpRank].second : cacheValue;
             pastKey.kvCacheFp8Indexer = fp8IndexerCache && !slidingLayers[layer];
-            int localPast = pastKey.dims.empty() ? 0 : pastKey.dims[1];
+            int localPast = cacheKey.dims.empty() ? 0 : cacheKey.dims[1];
             const bool ringCache = tensorParallel && slidingLayers[layer] && tpSwaRingCache;
+            if (sharedSwa) {
+                pastKey.Resize({1, localPast, cfg.kvHeads * cfg.headDim});
+                pastValue.Resize({1, localPast, cfg.kvHeads * cfg.valueDim});
+                CopySwaWindow(cacheKey, cacheValue, pastKey, pastValue,
+                    ringCache ? (globalPast - localPast) % window : 0, 0, localPast);
+            }
             // Graph replay reads/writes the ring directly. Eager prefill/fallback
             // uses the existing contiguous kernels and restores the ring once.
             // Verify was linearized outside capture by ForwardTensorParallel.
-            if (ringCache && !decodeWorkspace && !verifying)
+            if (ringCache && !decodeWorkspace && !verifying && !sharedSwa)
                 FastllmCudaNaiveSwaCacheLayout(pastKey, pastValue, globalPast, false);
             const bool ringDecode = ringCache && decodeWorkspace && !graphVerify;
             // Sliding layers retain only window-1 rows between chunks. Keep their
@@ -978,9 +1018,16 @@ Data NaiveN05FlashModel::RunTarget(
                             localPast + snapshot->length - globalPast - rows, false);
                     }
                 }
-                if (slidingLayers[layer] && !verifying)
+                if (sharedSwa) {
+                    const int rows = std::min(localPast + length, window - 1);
+                    CopySwaWindow(pastKey, pastValue, cacheKey, cacheValue,
+                        localPast + length - rows,
+                        ringCache ? (globalPast + length - rows) % window : 0, rows);
+                    cacheKey.Resize({1, rows, cfg.kvHeads * cfg.headDim});
+                    cacheValue.Resize({1, rows, cfg.kvHeads * cfg.valueDim});
+                } else if (slidingLayers[layer] && !verifying)
                     FastllmCudaNaiveTrimCache(pastKey, pastValue, window - 1);
-                if (ringCache && !verifying)
+                if (ringCache && !verifying && !sharedSwa)
                     FastllmCudaNaiveSwaCacheLayout(pastKey, pastValue, globalPast + length, true);
             }
         };
@@ -1382,6 +1429,29 @@ void NaiveN05FlashModel::WarmUp() {
     PrepareTensorParallelServing();
 }
 
+void NaiveN05FlashModel::PrepareSwaPrefillWorkspace(int rank, int length) {
+#ifdef USE_CUDA
+    FastllmCudaSetDevice(tpDevices[rank]);
+    auto &workspace = tpSwaPrefillWorkspaces[rank];
+    const int capacity = (int)(((int64_t)window - 1 + length + 127) / 128 * 128);
+    for (int part = 0; part < 2; ++part) {
+        Data &data = part ? workspace.second : workspace.first;
+        if (data.cudaData && !data.expansionDims.empty() && data.expansionDims[1] >= capacity) continue;
+        // Normal serving is preallocated for the configured chunk. Direct
+        // Forward callers may supply larger inputs; only scratch grows then.
+        data.FreeSpace();
+        data.dims.clear();
+        data.dataType = kvCacheDataType;
+        data.UpdateUnitSize();
+        data.dataDevice = DataDevice::CUDA;
+        data.dataDeviceIds = {tpDevices[rank]};
+        const int width = std::max(1, sliding.kvHeads / (int)tpDevices.size()) *
+            (part ? sliding.valueDim : sliding.headDim);
+        data.Expansion({1, capacity, width});
+    }
+#endif
+}
+
 void NaiveN05FlashModel::InitTensorParallelKVPool() {
 #ifdef USE_CUDA
     // Keep CPU/layer-serial and speculative execution on their existing cache
@@ -1393,7 +1463,11 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     const int ranks = tpDevices.size();
     const int batch = maxBatch > 0 ? maxBatch : 512;
     const int chunk = std::max(1, GetChunkedPrefillSize());
-    const int64_t swaCapacity = ((int64_t)window - 1 + chunk + 127) / 128 * 128;
+    const int64_t swaCapacity = ((int64_t)window + 127) / 128 * 128;
+    if (std::count(slidingLayers.begin(), slidingLayers.end(), 1)) {
+        tpSwaPrefillWorkspaces.resize(ranks);
+        for (int rank = 0; rank < ranks; ++rank) PrepareSwaPrefillWorkspace(rank, chunk);
+    }
     const int kvBytes = kvCacheDataType == FP8_E4M3 ? 1 : 2;
     int64_t fullBytesPerToken = 0, fixedBytes = 0;
     for (int layer = 0; layer < block_cnt; ++layer) {
@@ -1404,6 +1478,8 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         else fullBytesPerToken += width * kvBytes;
     }
     AssertInFastLLM(fullBytesPerToken > 0, "Naive KV pool requires full-attention layers.");
+    // Scratch is allocated before measuring free memory, so the total budget
+    // accounts for it without multiplying it by layers or concurrent requests.
     auto freeSizes = FastllmCudaGetFreeSizes();
     int64_t budget = INT64_MAX;
     for (int device : tpDevices) {

@@ -210,6 +210,7 @@ namespace fastllm {
         bool InitTensorParallel();
         void PrepareTensorParallel();
         void InitTensorParallelKVPool();
+        void PrepareSwaPrefillWorkspace(int rank, int length);
         struct TPDecodeState;
         std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState, tpBatchState;
         struct TPServingState;
@@ -237,6 +238,9 @@ namespace fastllm {
                                    LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
         std::vector<int> tpDevices;
         std::map<int, std::shared_ptr<CudaWorkspace>> tpKVPool;
+        // One chronological prefill workspace per GPU, reused across layers
+        // and requests. Request-owned SWA storage only holds the sliding window.
+        std::vector<std::pair<Data, Data>> tpSwaPrefillWorkspaces;
         std::vector<std::vector<std::unique_ptr<PagedCacheManager>>> tpPagedCaches;
         bool tpPrepared = false;
         // Fixed at TP preparation so toggling CUDA Graph cannot change live KV

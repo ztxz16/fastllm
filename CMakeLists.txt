@@ -1741,6 +1741,13 @@ if (UNIT_TEST)
                     PASS_REGULAR_EXPRESSION "BATCH PASS")
             endforeach()
             foreach(NAIVE_SERVING_RANKS 2 8)
+                foreach(NAIVE_WORKSPACE_DTYPE bf16 fp8)
+                    add_test(NAME naive_n05_swa_workspace_${NAIVE_SERVING_RANKS}_${NAIVE_WORKSPACE_DTYPE}
+                        COMMAND naive_n05_verify_graph_test ${NAIVE_SERVING_RANKS} swa_workspace ${NAIVE_WORKSPACE_DTYPE})
+                    set_tests_properties(naive_n05_swa_workspace_${NAIVE_SERVING_RANKS}_${NAIVE_WORKSPACE_DTYPE}
+                        PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                        PASS_REGULAR_EXPRESSION "SWA WORKSPACE PASS")
+                endforeach()
                 add_test(NAME naive_n05_history_serving_${NAIVE_SERVING_RANKS}
                     COMMAND naive_n05_verify_graph_test ${NAIVE_SERVING_RANKS} history_serving)
                 set_tests_properties(naive_n05_history_serving_${NAIVE_SERVING_RANKS}

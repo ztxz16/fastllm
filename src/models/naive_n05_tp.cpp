@@ -1450,8 +1450,9 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                 const auto &cfg = slidingLayers[layer] ? sliding : full;
                 for (Data *cache : {&key(sequence, layer), &value(sequence, layer)}) {
                     const int64_t past = cache->dims.empty() ? 0 : cache->dims[1];
-                    const int64_t wanted = std::max<int64_t>(past + length,
-                        slidingLayers[layer] ? std::min<int64_t>(reserve, (int64_t)window - 1 + length) : reserve);
+                    const int64_t wanted = slidingLayers[layer] && !tpSwaPrefillWorkspaces.empty()
+                        ? window : std::max<int64_t>(past + length,
+                            slidingLayers[layer] ? std::min<int64_t>(reserve, (int64_t)window - 1 + length) : reserve);
                     if (cache->expansionDims.size() == 3 && cache->expansionDims[1] >= wanted) continue;
                     const bool isValue = cache == &value(sequence, layer);
                     const int width = std::max(1, cfg.kvHeads / (int)tpDevices.size()) *
@@ -1462,8 +1463,18 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                 }
             }
         }
-        if (!reservations.empty()) runRanks([&](int rank) {
+        const int prefillLength = batch
+            ? *std::max_element(batch->lengths.begin(), batch->lengths.end()) : inputIds.dims[1];
+        const bool growScratch = std::any_of(tpSwaPrefillWorkspaces.begin(), tpSwaPrefillWorkspaces.end(),
+            [&](const auto &workspace) {
+                for (const Data *data : {&workspace.first, &workspace.second})
+                    if (!data->cudaData || data->expansionDims.empty() ||
+                        data->expansionDims[1] < (int64_t)window - 1 + prefillLength) return true;
+                return false;
+            });
+        if (!reservations.empty() || growScratch) runRanks([&](int rank) {
             FastllmCudaSetDevice(tpDevices[rank]);
+            if (growScratch) PrepareSwaPrefillWorkspace(rank, prefillLength);
             for (const auto &item : reservations)
                 ReserveCache(*item.cache->multiDeviceDatas.at(tpDevices[rank]), item.capacity, item.width);
         });

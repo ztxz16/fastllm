@@ -928,6 +928,58 @@ class Fixture : public NaiveN05FlashModel {
     }
 
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+    void SwaPrefillWorkspaceChecks() {
+        // Compare against the original contiguous-cache path before WarmUp
+        // installs the paged pool. Exercise short windows, wraps, multi-chunk
+        // continuations and direct calls larger than the configured chunk.
+        const std::vector<int> lengths = {3, 125, 1, 127, 4096, 17, 1};
+        std::vector<std::vector<float>> expected;
+        for (int pass = 0; pass < 2; ++pass) {
+            if (pass) {
+                SetCudaGraph(true);
+                maxBatch = 4; SetMaxTokens(32768); SetChunkedPrefillSize(1024);
+                WarmUp();
+            }
+            std::vector<std::pair<Data, Data>> kv(2);
+            std::vector<void *> pointers;
+            int past = 0;
+            for (int step = 0; step < (int)lengths.size(); ++step) {
+                int length = lengths[step];
+                SetCudaGraph(step != 2); // Eager decode followed by ring prefill.
+                std::vector<float> ids(length), positions(length), logits;
+                for (int i = 0; i < length; ++i) {
+                    ids[i] = (past + i) * 3 % 251; positions[i] = past + i;
+                }
+                Data input(FLOAT32, {1, length}, ids), pos(FLOAT32, {1, length}, positions);
+                GenerationConfig config;
+                config.top_k = 1; config.output_logits = true;
+                config.input_token_length = 6000; config.output_token_limit = 16;
+                Forward(input, Data(), pos, kv, config, LastTokensManager(), &logits);
+                if (!pass) expected.push_back(logits);
+                else {
+                    RequireCloseLogits(logits.data(), expected[step], "shared SWA prefill logits");
+                    std::vector<void *> current;
+                    for (Data *root : {&kv[1].first, &kv[1].second}) {
+                        if (root->expansionDims[1] != 128)
+                            throw std::runtime_error("SWA reservation depends on prefill length");
+                        for (int device = 0; device < ranks; ++device) {
+                            const Data &cache = *root->multiDeviceDatas.at(device);
+                            if (cache.expansionDims[1] != 128 || !IsCudaWorkspacePointer(cache.cudaData))
+                                throw std::runtime_error("SWA request cache escaped fixed pool window");
+                            current.push_back(cache.cudaData);
+                        }
+                    }
+                    if (step && current != pointers)
+                        throw std::runtime_error("SWA prefill changed decode cache addresses");
+                    pointers = std::move(current);
+                }
+                past += length;
+            }
+        }
+        std::cout << "SWA WORKSPACE PASS ranks=" << ranks
+                  << " relative=" << largestLogitRelative << std::endl;
+    }
+
     void CachePoolChecks() {
         maxBatch = 4;
         SetMaxTokens(8192);
@@ -1759,6 +1811,13 @@ int main(int argc, char **argv) {
         if (argc > 2 && std::string(argv[2]) == "kv_pool") {
             Fixture fixture(ranks);
             fixture.CachePoolChecks();
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "swa_workspace") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            Fixture fixture(ranks, false, true, true, true);
+            if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.SwaPrefillWorkspaceChecks();
             return 0;
         }
         const std::string draftMode = argc > 2 ? argv[2] : "";
