@@ -37,7 +37,7 @@ public:
             // Generic CPU work and decode keep the guard throughout the call.
             if (input.dataDevice != DataDevice::CUDA || input.dims[0] < 1024) lock.lock();
         }
-#ifdef USE_NUMAS
+#if defined(USE_CUDA) && defined(USE_NUMAS)
         pipeline.emplace(workspace, mutex && numa ? &lock : nullptr);
 #endif
     }
@@ -45,7 +45,7 @@ public:
     bool HoldsCpuPool() const { return lock.owns_lock(); }
 private:
     std::unique_lock<std::mutex> lock;
-#ifdef USE_NUMAS
+#if defined(USE_CUDA) && defined(USE_NUMAS)
     std::optional<NumasMoePipelineScope> pipeline;
 #endif
 };
