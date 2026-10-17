@@ -146,7 +146,8 @@ def latency_score(candidate, model, costs, args, mode, mapping, hardware, peers)
         compute *= len(ids)
         link *= len(ids)
     cpu_bandwidth = max(1, args.threads) * 1.0e9
-    covered = min(host, candidate["moe_cuda_cache"] * len(ids))
+    cache = candidate.get("moe_cuda_cache_per_device", dict.fromkeys(ids, candidate["moe_cuda_cache"]))
+    covered = min(host, sum(cache.values()))
     hit = (covered / host) ** .6 if host else 1.
     active = min(1., max(model.topk, args.moe_experts) / model.experts)
     misses = host * active * (1 - hit)
@@ -177,9 +178,28 @@ def latency_score(candidate, model, costs, args, mode, mapping, hardware, peers)
     return prefill + 512 * decode * max(1, args.max_batch)
 
 
+def kv_residencies(args, model):
+    """Supported exact streaming pools, without changing context capacity."""
+    from .util import _fastllm_env_flag_enabled
+    if (not model.streamed_kv or model.family != "qwen4" or args.kvmem is not None or
+            args.atype != "float16" or args.kv_cache_dtype != "float16" or
+            args.max_batch != 1 or args.tokens != args.max_context_length or
+            _fastllm_env_flag_enabled("FASTLLM_SKIP_WARMUP")):
+        return [0]
+    # KVMem cannot preserve prefix/history reuse. Honor explicit requests for
+    # either feature, including the existing prefix-cache environment override.
+    prefix = args.prefix_cache or os.environ.get("FASTLLM_PREFIX_CACHE", "")
+    if any(str(v).lower() not in ("", "false", "0", "off") for v in (prefix, args.cache_history)):
+        return [0]
+    return [0] + [n for n in (32768, 16384, 8192) if n < args.max_context_length]
+
+
 def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     """Resolve one --auto invocation transactionally, before model allocation."""
     from .env import env
+    from .util import _fastllm_env_flag_enabled
+    graph_enabled = ("FASTLLM_CUDA_GRAPH" not in os.environ or
+                     _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH"))
     explicit = set(getattr(args, "_auto_explicit", ()))
     base = copy.copy(args)
     for name in memory.AUTO_OPTIONS:
@@ -191,10 +211,10 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         raise ValueError("--auto requires positive CPU threads")
     if base.max_batch <= 0:
         base.max_batch = 1
-    # Avoid silently reserving a model's entire 256K/1M window for interactive use.
+    # Target 128K without extending the checkpoint's native window.
     metadata, tensors, model = memory.model_inputs(base)
     if base.max_context_length <= 0:
-        base.max_context_length = min(model.context, base.tokens if base.tokens > 0 else 32768)
+        base.max_context_length = min(model.context, base.tokens if base.tokens > 0 else 131072)
     if base.tokens <= 0:
         base.tokens = base.max_context_length * base.max_batch
     if "atype" not in explicit and model.family != "deepseek_v41":
@@ -224,56 +244,109 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     for backend in backends:
         # Disk is a capacity fallback. Do not trade host-resident experts for IO
         # merely because an approximate cache-locality score looks favourable.
-        for table in tables:
-            trial = copy.copy(base)
-            trial.moe_device, trial.ngram_device = backend, table
-            if backend == "cpu" and model.family != "qwen4" and trial.moe_cuda_cache == "auto":
-                trial.moe_cuda_cache = 0
-            memory.validate_options(trial)
-            cached_costs = None
-            for device, tp, mode, mapping in topologies(trial, explicit, info, gpu):
-                if any(d not in gpu for d in mapping):
-                    raise ValueError("--auto: selected CUDA ordinal is not visible")
-                trial.device, trial.tp = device, tp
-                try:
-                    prepared, costs, notes = memory.prepare(trial, metadata, tensors, model, mode, mapping,
-                                                            costs=cached_costs)
-                    cached_costs = costs
-                    def rank(p):
-                        score = latency_score(p, model, costs, prepared, mode, mapping, info, peers)
-                        return (-score, -p["host_estimated_bytes"], -p["resident_layers"])
-                    result = memory.plan(prepared, model, costs, mode, mapping, gpu, ram,
-                                         rank=rank, allow_full_gpu=True)
-                except ValueError as error:
-                    rejection = str(error)
-                    continue
-                result.update(device=device, tp=tp, moe_device=backend, ngram_device=table,
-                              threads=base.threads, atype=base.atype, kv_cache_dtype=base.kv_cache_dtype,
-                              max_context_length=base.max_context_length, tokens=base.tokens)
-                score = -rank(result)[0]
-                if notes:
-                    result["notes"] = notes
-                choices.append((score, copy.copy(trial), result))
+        kv_options = kv_residencies(base, model)
+        for kv_resident in kv_options:
+            for table in tables:
+                trial = copy.copy(base)
+                trial.moe_device, trial.ngram_device = backend, table
+                if backend == "cpu" and model.family != "qwen4" and trial.moe_cuda_cache == "auto":
+                    trial.moe_cuda_cache = 0
+                memory.validate_options(trial)
+                cached_costs = None
+                implicit_embedding_bytes = None
+                for device, tp, mode, mapping in topologies(trial, explicit, info, gpu):
+                    if any(d not in gpu for d in mapping):
+                        raise ValueError("--auto: selected CUDA ordinal is not visible")
+                    trial.device, trial.tp = device, tp
+                    try:
+                        prepared, costs, notes = memory.prepare(trial, metadata, tensors, model, mode, mapping,
+                                                                costs=cached_costs)
+                        cached_costs = costs
+                        if implicit_embedding_bytes is None:
+                            implicit_embedding_bytes = 0
+                            if (model.family == "qwen4" and graph_enabled and
+                                    not prepared.cuda_embedding and not prepared.low_gpu_mem):
+                                embedding_args = copy.copy(prepared)
+                                embedding_args.cuda_embedding = True
+                                implicit_embedding_bytes = memory.weight_costs(tensors, model, embedding_args)[2] - costs[2]
+                        cpu_embedding = (model.family == "qwen4" and prepared.mtp > 0 and
+                                         mode == "pp" and len(mapping) > 1 and
+                                         not {"cuda_embedding", "low_gpu_mem"} & explicit)
+                        prefer_cache = (model.family == "qwen4" and backend != "disk" and
+                                        prepared.moe_device_layers == "auto" and prepared.moe_cuda_cache == "auto")
+                        def rank(p):
+                            score = latency_score(p, model, costs, prepared, mode, mapping, info, peers)
+                            # Keep full GPU execution when it fits. Otherwise
+                            # prefer flexible caching; partial residency remains
+                            # available when host memory cannot hold all experts.
+                            placement = (2 if p["resident_layers"] == model.layers else
+                                         int(p["resident_layers"] == 0 and p["moe_cuda_cache"] > 0)) if prefer_cache else 0
+                            return (placement, -score, -p["host_estimated_bytes"], -p["resident_layers"])
+                        result = memory.plan(prepared, model, costs, mode, mapping, gpu, ram,
+                                             rank=rank, allow_full_gpu=True, kv_resident=kv_resident,
+                                             per_device_cache=model.family == "qwen4",
+                                             implicit_embedding_bytes=implicit_embedding_bytes,
+                                             hybrid_cpu_embedding=cpu_embedding)
+                    except ValueError as error:
+                        rejection = str(error)
+                        continue
+                    result.update(device=device, tp=tp, moe_device=backend, ngram_device=table,
+                                  threads=base.threads, atype=base.atype, kv_cache_dtype=base.kv_cache_dtype,
+                                  max_context_length=base.max_context_length, tokens=base.tokens)
+                    score = latency_score(result, model, costs, prepared, mode, mapping, info, peers)
+                    if kv_resident:
+                        notes.append("Exact QSA KV streaming leaves GPU memory for experts; prefix/history reuse disabled")
+                    if notes:
+                        result["notes"] = notes
+                    choices.append((score, copy.copy(trial), result))
+            # At long context, compare full KV with a 32K streaming pool even
+            # when both fit. The same latency score weighs expert capacity and
+            # chunk size; smaller pools remain capacity fallbacks only.
+            if choices and (kv_resident or base.max_context_length < 65536 or 32768 not in kv_options):
+                break
         if choices:
             break
     if not choices:
         raise ValueError("--auto could not find a safe configuration: " + rejection)
-    fastest = min(item[0] for item in choices)
+    # Prefer pipeline placement for Qwen without overriding explicit TP.
+    # Retain TP as a capacity fallback; explicit TP produces no PP candidates.
+    eligible = choices
+    if model.family == "qwen4":
+        eligible = [item for item in choices if item[2]["mode"] == "pp"] or choices
+    if (model.family == "qwen4" and base.moe_device_layers == "auto" and
+            base.moe_cuda_cache == "auto" and eligible[0][2]["moe_device"] != "disk"):
+        # Apply the same placement preference across topology/KV candidates.
+        full = [item for item in eligible if item[2]["resident_layers"] == model.layers]
+        cached = [item for item in eligible if item[2]["resident_layers"] == 0 and item[2]["moe_cuda_cache"] > 0]
+        eligible = full or cached or eligible
+    fastest = min(item[0] for item in eligible)
     # Small predicted wins are within the error of this uncalibrated model.
     # Prefer fewer devices/collectives when estimates are within ten percent.
-    close = [item for item in choices if item[0] <= fastest * 1.10]
+    # On the same topology, avoid streaming transfers and host bookkeeping
+    # unless the predicted benefit exceeds that uncertainty margin.
+    close = [item for item in eligible if item[0] <= fastest * 1.10]
     _, chosen, result = min(close, key=lambda item: (
-        len(item[2]["gpu_budget_bytes"]), item[2]["mode"] == "tp", item[0]))
+        len(item[2]["gpu_budget_bytes"]), item[2]["mode"] == "tp", "kvmem" in item[2], item[0]))
     for name in memory.AUTO_OPTIONS:
         if getattr(chosen, name) == "auto":
             setattr(chosen, name, result[name])
+    if "kvmem" in result:
+        chosen.kvmem = json.dumps(result["kvmem"], sort_keys=True)
+    if (model.family == "qwen4" and chosen.mtp > 0 and result["mode"] == "pp" and
+            len(result["gpu_budget_bytes"]) > 1 and result["resident_layers"] < model.layers and
+            not {"cuda_embedding", "low_gpu_mem"} & explicit):
+        # Target and draft run on opposite PP stages. Graph's implicit CUDA
+        # embedding would move the entire shared weight between those stages.
+        chosen.low_gpu_mem, chosen.cuda_embedding = True, False
+        result["low_gpu_mem"] = True
+        result.setdefault("notes", []).append("PP MTP uses CPU embedding to avoid moving its shared weight between GPUs")
     changed = (*memory.AUTO_OPTIONS, "device", "tp", "moe_device", "ngram_device", "threads",
-               "atype", "kv_cache_dtype", "max_context_length", "tokens", "max_batch")
+               "atype", "kv_cache_dtype", "max_context_length", "tokens", "max_batch", "kvmem",
+               "low_gpu_mem", "cuda_embedding")
     result["automatic"] = {"policy": "interactive-4k-input-512-output", "topology_candidates": len(choices),
                            "ranking": "estimated latency; not measured throughput", "mtp": args.mtp}
-    from .util import _fastllm_env_flag_enabled
-    result["automatic"]["cuda_graph"] = ("FASTLLM_CUDA_GRAPH" not in os.environ or
-                                             _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH"))
+    result["automatic"]["kv_streaming"] = "kvmem" in result
+    result["automatic"]["cuda_graph"] = graph_enabled
     for name in changed:
         setattr(args, name, getattr(chosen, name))
     print("[auto] " + json.dumps(result, sort_keys=True), flush=True)

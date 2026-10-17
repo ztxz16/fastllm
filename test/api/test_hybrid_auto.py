@@ -94,6 +94,59 @@ class HybridAutoTest(unittest.TestCase):
             model.set_chunked_prefill_size.assert_called_once_with(1024)
             self.assertEqual(model.hybrid_auto_plan, {"moe_cuda_cache": GiB})
 
+    def test_independent_cache_respects_stage_ownership_and_tiny_budget(self):
+        g, c, gpu, ram = fixture()
+        g.experts = 256
+        a = args(moe_device_layers=-1)
+        p = auto.plan(a, g, c, 'pp', {0: 1, 1: 1}, gpu, ram, per_device_cache=True)
+        self.assertEqual(p['moe_cuda_cache_per_device'], {0: 2 * GiB, 1: 2 * GiB})
+        # No allocation may consume the budget already reserved for workspace.
+        overhead = p['gpu_estimated_bytes'][1] - p['moe_cuda_cache_per_device'][1]
+        gpu[1]['free'] = overhead + (gpu[1]['total'] - p['gpu_budget_bytes'][1]) + MiB
+        p = auto.plan(a, g, c, 'pp', {0: 1, 1: 1}, gpu, ram, per_device_cache=True)
+        self.assertEqual(p['moe_cuda_cache_per_device'][1], 0)
+        self.assertGreater(p['moe_cuda_cache_per_device'][0], 0)
+        self.assertLessEqual(p['gpu_estimated_bytes'][1], p['gpu_budget_bytes'][1])
+        gpu[1]['free'] = gpu[1]['total']
+        for mode, backend in [('tp', 'numa'), ('pp', 'disk')]:
+            q = auto.plan(args(moe_device=backend), g, c, mode, {0: 1, 1: 1}, gpu, ram,
+                          per_device_cache=True)
+            self.assertNotIn('moe_cuda_cache_per_device', q)
+
+    def test_implicit_embedding_reserves_first_pp_stage_and_full_gpu_mtp(self):
+        g, c, gpu, ram = fixture()
+        g.experts = 256
+        c = ([4 * GiB] * 4, *c[1:])
+        a = args(moe_device_layers=-1)
+        base = auto.plan(a, g, c, 'pp', {0: 1, 1: 1}, gpu, ram, per_device_cache=True)
+        p = auto.plan(a, g, c, 'pp', {0: 1, 1: 1}, gpu, ram, per_device_cache=True,
+                      implicit_embedding_bytes=GiB)
+        self.assertEqual(base['moe_cuda_cache_per_device'][0] - p['moe_cuda_cache_per_device'][0], GiB)
+        self.assertEqual(base['moe_cuda_cache_per_device'][1], p['moe_cuda_cache_per_device'][1])
+        q = auto.plan(a, g, c, 'pp', {0: 1, 1: 1}, gpu, ram, per_device_cache=True,
+                      implicit_embedding_bytes=GiB, hybrid_cpu_embedding=True)
+        self.assertEqual(q['moe_cuda_cache_per_device'], base['moe_cuda_cache_per_device'])
+        # A full-GPU candidate cannot use the hybrid CPU-embedding exemption.
+        a.moe_device_layers, a.mtp = 0, 3
+        gpu = {d: dict(total=32 * GiB, free=32 * GiB) for d in (0, 1)}
+        p = auto.plan(a, g, c, 'pp', {0: 1, 1: 1}, gpu, ram, allow_full_gpu=True,
+                      implicit_embedding_bytes=GiB, hybrid_cpu_embedding=True)
+        q = auto.plan(a, g, c, 'pp', {0: 1, 1: 1}, gpu, ram, allow_full_gpu=True)
+        for d in gpu:
+            self.assertEqual(p['gpu_estimated_bytes'][d] - q['gpu_estimated_bytes'][d], GiB)
+
+    def test_qwen_gguf_embedding_budgets_expanded_fp32_table(self):
+        g, _, _, _ = fixture()
+        g.family = 'qwen4'
+        tensors = [auto.Tensor('blk.0.ffn_up_exps.weight', (8, 64, 128), MiB, 'gguf:11'),
+                   auto.Tensor('token_embd.weight', (1024, 128), 1024 * 128, 'gguf:23')]
+        a = args(cuda_embedding=True)
+        costs = auto.weight_costs(tensors, g, a)
+        self.assertEqual(costs[2:4], (1024 * 128 * 4, 1024 * 128 * 4))
+        a.low_gpu_mem = True
+        costs = auto.weight_costs(tensors, g, a)
+        self.assertEqual(costs[2:4], (0, 1024 * 128 * 4))
+
     def test_cpu_and_gpu_paths_reject_auto_before_hardware_query(self):
         for main, moe, mode in [("cpu", "numa", "auto"), ("cuda:0", "cuda:0", "auto"),
                                 ("cuda:0", "numa", "gpu")]:
@@ -323,6 +376,44 @@ class HybridAutoTest(unittest.TestCase):
         self.assertEqual(g.kv, [528 + 132, 0, 264 + 66, 0])
         self.assertEqual(g.state, [128 * 512 * 2] * 4)
         self.assertEqual(auto.geometry(md, "fp4", 0).kv, [288 + 68, 0, 144 + 34, 0])
+        self.assertEqual(g.streamed_kv, [])
+
+    def test_exact_qsa_streaming_geometry_excludes_the_full_context_index(self):
+        md = {"model_type": "qwen4_exp", "num_hidden_layers": 4,
+              "max_position_embeddings": 262144, "hidden_size": 2560,
+              "num_experts": 512, "num_experts_per_tok": 8, "moe_intermediate_size": 1024,
+              "num_key_value_heads": 2, "head_dim": 256}
+        for mtp in (0, 3):
+            g = auto.geometry(md, "float16", mtp)
+            self.assertEqual(g.streamed_kv, [0, 0, 0, 2048] + ([2048] if mtp else []))
+            self.assertEqual(g.kv, [0, 0, 0, 2176] + ([2176] if mtp else []))
+        for dtype in ("bfloat16", "float32", "fp8_e4m3"):
+            self.assertEqual(auto.geometry(md, dtype, 0).streamed_kv, [])
+        for changes in ({"head_dim": 64}, {"indexer_budget": 0}, {"indexer_compress_ratio": 8},
+                        {"compress_ratios": [0, 0, 0, 8]}):
+            self.assertEqual(auto.geometry({**md, **changes}, "float16", 0).streamed_kv, [])
+
+    def test_streaming_retains_index_and_counts_draft_host_budget_and_staging(self):
+        g, costs, gpu, ram = fixture()
+        g.family, g.context = "qwen4", 131072
+        g.kv, g.streamed_kv = [2176] * 4, [2048] * 4
+        a = args(atype="float16", kv_cache_dtype="float16", tokens=131072,
+                 max_context_length=131072, moe_device_layers=-1, moe_cuda_cache=0)
+        full = auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+        streamed = auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram, kv_resident=32768)
+        self.assertGreater(streamed["kvmem"]["host_mib"], 1280)  # 4 target + possible draft + page
+        self.assertEqual(streamed["workspace_bytes_per_device"] - full["workspace_bytes_per_device"],
+                         131076 * 2048)
+        for d in gpu:
+            # Two layers/card save 384 MiB; full-layer staging costs 256 MiB
+            # and page metadata/index alignment slightly reduce the net saving.
+            saved = full["gpu_estimated_bytes"][d] - streamed["gpu_estimated_bytes"][d]
+            self.assertGreater(saved, 120 * MiB)
+            self.assertLess(saved, 128 * MiB)
+        a.moe_device_layers = 0
+        with self.assertRaises(ValueError):
+            auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram,
+                      kv_resident=32768, allow_full_gpu=True)
 
     def test_pp_layer_assignment_matches_native_boundary(self):
         # Model calls SelectDeviceFromMap(layer + 1, block_cnt), using <=.

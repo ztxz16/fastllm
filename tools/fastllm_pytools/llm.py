@@ -641,11 +641,23 @@ def set_cuda_graph(cuda_graph):
 def set_cuda_slab(mb: int):
     fastllm_lib.set_cuda_slab(ctypes.c_int(mb));
 
-def set_moe_cuda_cache(bytes_: int):
+def set_moe_cuda_cache(bytes_: int, device_bytes=None):
+    """Set cache budgets before loading; a scalar call clears device overrides."""
     bytes_ = int(bytes_)
     if bytes_ < 0 or bytes_ > (1 << 64) - 1:
         raise ValueError("MoE CUDA cache size must fit in uint64")
-    fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
+    budgets = {} if device_bytes is None else {int(d): int(b) for d, b in device_bytes.items()}
+    if any(d < 0 or d > (1 << 31) - 1 or b < 0 or b > bytes_ for d, b in budgets.items()):
+        raise ValueError("Per-device cache budgets must be nonnegative and within the scalar ceiling")
+    setter = getattr(fastllm_lib, "set_moe_cuda_cache_device", None)
+    if budgets and setter is None:
+        raise RuntimeError("Per-device cache planning requires a matching native library")
+    fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_))
+    if budgets:
+        setter.argtypes = [ctypes.c_int, ctypes.c_uint64]
+        setter.restype = None
+        for device, budget in budgets.items():
+            setter(device, budget)
 
 def get_cuda_memory_info(device: int):
     """Return free/total CUDA bytes for a visible ordinal, or fail closed."""

@@ -15,6 +15,7 @@
 #include "fastllm-cuda-record-copy.cuh"
 #include "fastllm-cuda-shared-weight.cuh"
 #include "fastllm.h"
+#include "moe_cache_config.h"
 #include "utils.h"
 #include "gguf.h"
 #include "fastllm-moe-gguf-restore.cuh"
@@ -1011,7 +1012,7 @@ bool ValidateWeightPair(fastllm::Data *gate, fastllm::Data *down,
 uint64_t DeviceCacheBudgetBytes(int device) {
     const std::string name = "FASTLLM_MOE_CUDA_CACHE_BYTES_" + std::to_string(device);
     const char *value = std::getenv(name.c_str());
-    if (!value || !*value) return fastllm::GetMoeCudaCacheBytes();
+    if (!value || !*value) return fastllm::GetMoeCudaCacheDeviceBytes(device);
     uint64_t bytes = 0;
     for (const char *p = value; *p; ++p) {
         if (*p < '0' || *p > '9' || bytes > (UINT64_MAX - uint64_t(*p - '0')) / 10) {

@@ -102,6 +102,10 @@ extern "C" {
         fastllm::SetMoeCudaCacheBytes(bytes);
     }
 
+    DLL_EXPORT void set_moe_cuda_cache_device(int device, uint64_t bytes) {
+        fastllm::SetMoeCudaCacheDeviceBytes(device, bytes);
+    }
+
     // CUDA ordinals obey CUDA_VISIBLE_DEVICES, unlike nvidia-smi indices.
     DLL_EXPORT bool get_cuda_memory_info(int device, uint64_t *values) {
 #ifdef USE_CUDA

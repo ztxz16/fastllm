@@ -7,7 +7,7 @@ workspace allowance; they are capacity plans, not throughput autotuning.
 
 import ast
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
 import os
@@ -197,6 +197,7 @@ class Geometry:
     score_divisor: int
     activation_width: int
     default_chunk: int
+    streamed_kv: list = field(default_factory=list)  # exact host-backed KV bytes/token/layer, excluding index
 
 
 def geometry(metadata, kv_dtype, mtp):
@@ -237,6 +238,7 @@ def geometry(metadata, kv_dtype, mtp):
     if unit is None and not (family == "deepseek_v41" and kv_dtype == "fp4"):
         raise ValueError("Hybrid auto: unsupported KV precision")
     kv, state = [0] * layers, [0] * layers
+    streamed_kv = []
     if family == "qwen4":
         heads = int(get("num_key_value_heads", "attention.head_count_kv"))
         dim = int(get("head_dim", "attention.key_length"))
@@ -263,6 +265,13 @@ def geometry(metadata, kv_dtype, mtp):
             kv.append(heads * dim * 2 * unit + math.ceil(idxdim * 4 / min(r for r in ratios if r > 0)))
             state.append(0)
         score_divisor = min(r for r in ratios if r > 0)
+        # Only Qwen4 Hybrid has exact QSA streaming. Other KVMem adapters
+        # change attention selection and must never be enabled by this policy.
+        if (kv_dtype == "float16" and dim in (128, 256) and
+                all(r in (0, 4) for r in ratios) and
+                int(config.get("indexer_compress_ratio", 4)) == 4 and
+                int(get("indexer_budget", "attention.indexer.top_k", 2048)) > 0):
+            streamed_kv = [heads * dim * 4 if n else 0 for n in kv]
         width = hidden * int(get("hc_count", "hyper_connection.count", 4)) * 8 + linear_width * 12
         chunk = 4096
     elif family == "glm5":
@@ -302,7 +311,8 @@ def geometry(metadata, kv_dtype, mtp):
         score_divisor = min((r for r in ratios if r > 0), default=1)
         width = hidden * int(config.get("hc_mult", 4)) * 8 + int(config["num_attention_heads"]) * dim * 6
         chunk = 4096
-    return Geometry(family, layers, context, hidden, experts, topk, inter, kv, state, score_divisor, width, chunk)
+    return Geometry(family, layers, context, hidden, experts, topk, inter, kv, state,
+                    score_divisor, width, chunk, streamed_kv)
 
 
 def devices(args):
@@ -413,8 +423,11 @@ def weight_costs(tensors, model, args):
             if args.ngram_device != "disk":
                 host += size
         elif is_embedding:
+            # The Qwen GGUF adapter expands token embeddings to FP32.
+            if model.family == "qwen4" and tensor.kind.startswith("gguf:"):
+                size = math.prod(tensor.shape) * 4
             host += size
-            if args.cuda_embedding:
+            if args.cuda_embedding and not args.low_gpu_mem:
                 common += size
         elif is_shared and str(args.cuda_shared_expert).lower() in ("", "false", "0", "off"):
             host += size
@@ -433,7 +446,9 @@ def weight_costs(tensors, model, args):
     return expert, dense, common, host, largest, snapshot
 
 
-def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_gpu=False):
+def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_gpu=False,
+         kv_resident=0, per_device_cache=False, implicit_embedding_bytes=0,
+         hybrid_cpu_embedding=False):
     """Deterministic capacity solver. Explicit fields are never overwritten."""
     experts, dense, common, host, largest, snapshot = costs
     context = int(args.max_context_length) if args.max_context_length > 0 else model.context
@@ -444,6 +459,21 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     batch = max(1, int(args.max_batch))
     page = args.page_size if args.page_size > 0 else 128
     tokens = math.ceil(tokens / page) * page
+    streaming = bool(kv_resident)
+    kv_host_bytes = 0
+    if streaming:
+        if (model.family != "qwen4" or not model.streamed_kv or args.atype != "float16" or
+                args.kv_cache_dtype != "float16" or batch != 1 or args.tokens != context or
+                not 0 < kv_resident < context or kv_resident % 4):
+            raise ValueError("Hybrid auto: unsupported exact KV streaming configuration")
+        # Match Qwen4's validation: include a possible draft layer even with
+        # MTP off, plus provisional tokens and page alignment. The compressed
+        # QSA index remains on the GPU for the entire logical context.
+        logical = (context + args.mtp + 4) // 4 * 4
+        layer_bytes = max(model.streamed_kv)
+        target_bytes = sum(model.streamed_kv[:model.layers])
+        kv_host_bytes = math.ceil(logical * (target_bytes + layer_bytes) / MiB) * MiB
+        page_metadata = ((3 * (logical // 4) + 2 * (kv_resident // 4) + 3) & ~1) * 4 + 16
     ratio = float(args.gpu_mem_ratio)
     if not 0 < ratio <= 1:
         raise ValueError("Hybrid auto: gpu_mem_ratio must be in (0, 1]")
@@ -474,9 +504,20 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
         workspace = (rows * math.ceil(context / model.score_divisor) * 4 +
                      rows * (model.activation_width + topk * (model.hidden + 3 * model.intermediate)) * 4 +
                      model.hidden * model.intermediate * 3 * 2)
+        if streaming:
+            # Prefill stages one complete KV layer per device; the buffer is
+            # reused across layers. Do not count it as bounded by resident KV.
+            workspace += logical * layer_bytes
         for resident in residents:
             used = {d: common + workspace + guard for d in mapping}
+            if implicit_embedding_bytes and not (hybrid_cpu_embedding and resident < model.layers):
+                # Qwen PP embeds on its first stage; TP and a full-GPU MTP
+                # pipeline may also need the shared table on other devices.
+                targets = list(mapping) if mode == "tp" or args.mtp else [next(iter(mapping))]
+                for d in targets:
+                    used[d] += implicit_embedding_bytes
             host_experts = 0
+            host_by_device = dict.fromkeys(mapping, 0)
             for layer in range(len(experts)):
                 targets = list(mapping) if mode == "tp" else [layer_device(layer, model.layers, mapping)]
                 # Dense TP replication is an upper bound, including unsharded
@@ -486,24 +527,37 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     resident_bytes = experts[layer]  # Qwen draft experts stay on CUDA
                 host_experts += experts[layer] - resident_bytes
                 for d in targets:
-                    used[d] += dense[layer] + tokens * model.kv[layer] + batch * (args.mtp + 1) * model.state[layer]
+                    host_by_device[d] += experts[layer] - resident_bytes
+                    kv_bytes = tokens * model.kv[layer]
+                    if streaming and model.streamed_kv[layer]:
+                        raw = model.streamed_kv[layer]
+                        kv_bytes = logical * (model.kv[layer] - raw) + kv_resident * raw + page_metadata
+                    used[d] += dense[layer] + kv_bytes + batch * (args.mtp + 1) * model.state[layer]
                 if resident_bytes:
                     expert_targets = list(mapping) if mode == "tp" else [
                         layer_device(layer, resident, mapping) if layer < model.layers else next(reversed(mapping))]
                     for d in expert_targets:
                         used[d] += math.ceil(resident_bytes / len(expert_targets))
-            if host_experts == 0 and not allow_full_gpu:
+            if host_experts == 0 and (not allow_full_gpu or streaming):
                 continue
-            remaining = min(gpu_limit[d] - used[d] for d in mapping)
-            cuda_cache = max(0, min(remaining, host_experts)) if cache_auto else args.moe_cuda_cache
-            cuda_cache = cuda_cache // MiB * MiB if cache_auto else cuda_cache
-            if cache_auto and args.moe_device != "disk":
-                # The existing host cache requires at least 16 whole records.
-                record = math.ceil(max(experts[resident:model.layers], default=0) / model.experts)
-                if cuda_cache < 16 * (record + 256):
-                    cuda_cache = 0
-            if remaining < cuda_cache or remaining < 0:
+            remaining = {d: gpu_limit[d] - used[d] for d in mapping}
+            independent = per_device_cache and cache_auto and mode == "pp" and args.moe_device != "disk"
+            cache = {}
+            for d in mapping:
+                ceiling = remaining[d] if independent else min(remaining.values())
+                available_experts = host_by_device[d] if independent else host_experts
+                budget = max(0, min(ceiling, available_experts)) // MiB * MiB if cache_auto else args.moe_cuda_cache
+                if cache_auto and args.moe_device != "disk":
+                    # The existing host cache requires at least 16 whole records.
+                    record = math.ceil(max(experts[resident:model.layers], default=0) / model.experts)
+                    if budget < 16 * (record + 256):
+                        budget = 0
+                cache[d] = budget
+            if any(remaining[d] < cache[d] for d in mapping):
                 continue
+            # The scalar ceiling also enables registration; allocation uses the
+            # individual budgets. Explicit caches and TP retain uniform budgets.
+            cuda_cache = max(cache.values())
             # One streamed load group, host input/output staging and tokenizer.
             host_required = host + max(largest, max(experts, default=0)) + GiB + workspace
             if args.moe_device != "disk":
@@ -511,7 +565,12 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                 pinned = os.environ.get("FT_PINNED_WEIGHT", "1").lower() not in ("0", "false", "off")
                 if snapshot or not pinned or (cuda_cache > 0 and args.moe_device == "cpu"):
                     host_required += host_experts
-            host_required += tokens * sum(model.kv)  # request mirrors / saved prefix
+            if streaming:
+                # Full pinned KV replaces the normal request mirror. Retain
+                # the index allowance; prefix reuse is disabled by KVMem.
+                host_required += kv_host_bytes + logical * (sum(model.kv) - sum(model.streamed_kv))
+            else:
+                host_required += tokens * sum(model.kv)  # request mirrors / saved prefix
             cpu_cache = 0 if args.moe_device != "disk" else (
                 max(0, min(host_experts, host_limit - host_required)) if cpu_auto else args.moe_cpu_cache)
             cpu_cache = cpu_cache // MiB * MiB if cpu_auto else cpu_cache
@@ -521,16 +580,21 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     "total_tokens": tokens, "max_batch": batch, "chunked_prefill_size": chunk,
                     "resident_layers": resident, "resident_expert_layers": sum(x > 0 for x in experts[:resident]), "moe_device_layers": model.layers - resident if resident else -1,
                     "moe_cuda_cache": cuda_cache, "moe_cpu_cache": cpu_cache,
-                    "gpu_estimated_bytes": {d: used[d] + cuda_cache for d in mapping},
+                    "gpu_estimated_bytes": {d: used[d] + cache[d] for d in mapping},
                     "gpu_budget_bytes": gpu_limit, "host_estimated_bytes": host_required + cpu_cache,
                     "host_budget_bytes": host_limit, "workspace_bytes_per_device": workspace}
+            if independent and host_experts:
+                candidate["moe_cuda_cache_per_device"] = cache
+            if streaming:
+                candidate["kvmem"] = {"max_tokens": context, "resident_tokens": kv_resident,
+                                      "host_mib": kv_host_bytes // MiB, "prefill_tokens": chunk}
             if rank is not None:
                 score = rank(candidate)
             else:
                 # Prefer useful expert storage, rather than layer count:
                 # uneven layers can lower the common per-card cache ceiling.
                 resident_bytes = sum(experts) - host_experts
-                coverage = resident_bytes + min(host_experts, cuda_cache * len(mapping))
+                coverage = resident_bytes + min(host_experts, sum(cache.values()))
                 score = (coverage // (64 * MiB), resident_bytes, -resident)
             if selected_score is None or score > selected_score:
                 selected, selected_score = candidate, score

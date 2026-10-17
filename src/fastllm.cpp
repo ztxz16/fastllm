@@ -304,6 +304,8 @@ namespace fastllm {
     static bool cudaSharedExpert = false;
     static int cudaSlabMB = 0;
     static std::atomic<uint64_t> moeCudaCacheBytes{0};
+    static std::mutex moeCudaCacheDeviceMutex;
+    static std::map<int, uint64_t> moeCudaCacheDeviceBytes;
     static std::atomic<uint64_t> moeCpuCacheBytes{0};
     static bool enableAMX = false;
     static int maxTokens = -1;
@@ -450,12 +452,27 @@ namespace fastllm {
     }
 
     void SetMoeCudaCacheBytes(uint64_t bytes) {
-        moeCudaCacheBytes = bytes;
+        {
+            std::lock_guard<std::mutex> lock(moeCudaCacheDeviceMutex);
+            moeCudaCacheDeviceBytes.clear();
+            moeCudaCacheBytes = bytes;
+        }
         TrimDiskMoeCache();
     }
 
     uint64_t GetMoeCudaCacheBytes() {
         return moeCudaCacheBytes;
+    }
+
+    void SetMoeCudaCacheDeviceBytes(int device, uint64_t bytes) {
+        std::lock_guard<std::mutex> lock(moeCudaCacheDeviceMutex);
+        moeCudaCacheDeviceBytes[device] = bytes;
+    }
+
+    uint64_t GetMoeCudaCacheDeviceBytes(int device) {
+        std::lock_guard<std::mutex> lock(moeCudaCacheDeviceMutex);
+        auto it = moeCudaCacheDeviceBytes.find(device);
+        return it == moeCudaCacheDeviceBytes.end() ? moeCudaCacheBytes.load() : it->second;
     }
 
     namespace {

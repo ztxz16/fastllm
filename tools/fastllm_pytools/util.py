@@ -897,7 +897,7 @@ class _AutoArgumentParser(argparse.ArgumentParser):
 def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = _AutoArgumentParser(description = des, add_help = add_help)
     parser.add_argument('--auto', action='store_true',
-                        help='自动选择Qwen4/GLM-5.3/DeepSeek-V4.1的CUDA混推设备、TP/PP、驻留、缓存、chunk与线程；显式参数优先')
+                        help='自动选择Qwen4/GLM-5.3/DeepSeek-V4.1的CUDA混推配置，默认目标128K上下文；Qwen4按预算选择精确KV streaming；显式参数优先')
     parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹或配置文件')
     parser.add_argument('-p', '--path', type = str, required = False, default = '', help = '模型路径，fastllm模型文件或HF模型文件夹')
     parser.add_argument('-t', '--threads', type = int, default = -1,  help = '线程数量')
@@ -911,7 +911,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3或fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kvmem', type=str, default=None,
-                        help='启用主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"retrieval_interval":64}。默认关闭，单请求；Qwen3/3.5 单卡稀疏检索，Qwen4/QSA 混合推理按 resident_tokens 限制每层显存 KV，保留原生注意力选择')
+                        help='启用主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"retrieval_interval":64}。默认关闭（--auto 可按预算启用 Qwen4 精确换页），单请求；Qwen3/3.5 单卡稀疏检索，Qwen4/QSA 混合推理按 resident_tokens 限制每层显存 KV，保留原生注意力选择')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = _integer_or_auto, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如8192；auto按混推内存预算选择')
@@ -1816,8 +1816,11 @@ def make_normal_llm_model(args, startup_progress = None):
                          _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH"))
         llm.set_cuda_graph(graph_enabled)
     llm.set_moe_device_layers(-1)
-    llm.set_moe_cuda_cache(
-        _memory_size_bytes(getattr(args, "moe_cuda_cache", 0)))
+    cache_bytes = _memory_size_bytes(getattr(args, "moe_cuda_cache", 0))
+    if hybrid_auto_plan and "moe_cuda_cache_per_device" in hybrid_auto_plan:
+        llm.set_moe_cuda_cache(cache_bytes, hybrid_auto_plan["moe_cuda_cache_per_device"])
+    else:
+        llm.set_moe_cuda_cache(cache_bytes)
     llm.set_moe_cache_policy(
         half_life=getattr(args, "moe_cache_half_life", 128.),
         update_interval=getattr(args, "moe_cache_update_interval", 1),
