@@ -5178,7 +5178,7 @@ ops += (long long)lines * inputDim * interDim * 2;
 
                     std::vector <MultiThreadMemcpyMultiLinesTask> memcpyTasks;
                     for (int i = 0; i < (int)task.size(); i++) {
-                        memcpyTasks.push_back(MultiThreadMemcpyMultiLinesTask(tempInput.cpuData + i * inputDim * input.unitSize, input.cpuData + task[i].first * inputDim * input.unitSize, inputDim * input.unitSize));
+                        memcpyTasks.push_back(MultiThreadMemcpyMultiLinesTask(tempInput.cpuData + (size_t)i * inputDim * input.unitSize, input.cpuData + (size_t)task[i].first * inputDim * input.unitSize, inputDim * input.unitSize));
                     }
                     RunMultiThreadMemcpyMultiLines(memcpyTasks, GetAlivePool());
                     reshapeMoeLinear(tempInput, *weights[e * 2], w3);
@@ -5594,7 +5594,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             uint8_t *cur = newCache.cpuData + (newBsStart + o) * newCache.strides[0] * unitSize;
             cur += offset * newCache.strides[1] * unitSize;
             uint8_t *old = oldCache.cpuData + (oldBsStart + o) * oldCache.strides[0] * unitSize;
-            memcpy(cur, old, oldCache.dims[1] * oldCache.dims[2] * unitSize);
+            memcpy(cur, old, (size_t)oldCache.dims[1] * oldCache.dims[2] * unitSize);
         }
     }
 
@@ -7004,10 +7004,10 @@ ops += (long long)lines * inputDim * interDim * 2;
             uint8_t *temp = new uint8_t[64];
             for (int i = 0; i < n; i++) {
                 for (int j = 0; j + 63 < m; j += 64) {
-                    memcpy(temp, output + i * m + j, 64);
+                    memcpy(temp, output + (size_t)i * m + j, 64);
                     for (int k = 0; k < 32; k++) {
-                        output[i * m + j + k] = temp[k * 2 + 1];
-                        output[i * m + j + k + 32] = temp[k * 2];
+                        output[(size_t)i * m + j + k] = temp[k * 2 + 1];
+                        output[(size_t)i * m + j + k + 32] = temp[k * 2];
                     }
                 }
             }
@@ -7374,19 +7374,20 @@ ops += (long long)lines * inputDim * interDim * 2;
 
     struct MultiThreadSliceOp : MultiThreadBaseOp {
         uint8_t *input, *output;
-        int outer, inputStride, outputStride, copyLen;
+        int outer;
+        size_t inputStride, outputStride, copyLen;
 
-        MultiThreadSliceOp (uint8_t *output, uint8_t *input, int outer, int outputStride, int inputStride, int copyLen) : 
+        MultiThreadSliceOp (uint8_t *output, uint8_t *input, int outer, size_t outputStride, size_t inputStride, size_t copyLen) :
             output(output), input(input), outer(outer), inputStride(inputStride), outputStride(outputStride), copyLen(copyLen) {}
 
         void Run() {
             for (int o = 0; o < outer; o++) {
-                memcpy(output + o * outputStride, input + o * inputStride, copyLen);
+                memcpy(output + (size_t)o * outputStride, input + (size_t)o * inputStride, copyLen);
             }
         }
     };
 
-    static void RunMultiThreadSlice(uint8_t *output, uint8_t *input, int outer, int inputStride, int outputStride, int copyLen, AliveThreadPool *pool) {
+    static void RunMultiThreadSlice(uint8_t *output, uint8_t *input, int outer, size_t inputStride, size_t outputStride, size_t copyLen, AliveThreadPool *pool) {
         if (outer == 1) {
             (MultiThreadSliceOp(output, input, outer, outputStride, inputStride, copyLen)).Run();
             return;
@@ -7397,7 +7398,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         std::vector<fastllm::MultiThreadSliceOp*> ops;
         for (int i = 0; i < threadNum; i++) {
             int end = (i == threadNum - 1 ? outer : cur + per + (cur + per * (threadNum - i) < outer));
-            ops.push_back(new MultiThreadSliceOp(output + cur * outputStride, input + cur * inputStride, end - cur, outputStride, inputStride, copyLen));
+            ops.push_back(new MultiThreadSliceOp(output + (size_t)cur * outputStride, input + (size_t)cur * inputStride, end - cur, outputStride, inputStride, copyLen));
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
@@ -7432,8 +7433,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         int inner = input.strides[axis];
         int unitSize = input.unitSize;
         
-        RunMultiThreadSlice(output.cpuData, input.cpuData + start * inner * unitSize, outer, 
-            inputStride * unitSize, outputStride * unitSize, (end - start) * inner * unitSize, GetAlivePool());
+        RunMultiThreadSlice(output.cpuData, input.cpuData + (size_t)start * inner * unitSize, outer,
+            (size_t)inputStride * unitSize, (size_t)outputStride * unitSize,
+            (size_t)(end - start) * inner * unitSize, GetAlivePool());
     }
 
     void CpuRepeatOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -7473,9 +7475,9 @@ ops += (long long)lines * inputDim * interDim * 2;
 
         for (int o = 0; o < outer; o++) {
             for (int t = 0; t < repeatTimes; t++) {
-                memcpy(output.cpuData + o * outputStride * unitSize + t * channels * inner * unitSize,
-                    input.cpuData + (o * inputStride) * unitSize,
-                    channels * inner * unitSize);
+                memcpy(output.cpuData + (size_t)o * outputStride * unitSize + (size_t)t * channels * inner * unitSize,
+                    input.cpuData + (size_t)o * inputStride * unitSize,
+                    (size_t)channels * inner * unitSize);
             }
         }
     }
@@ -7679,12 +7681,12 @@ ops += (long long)lines * inputDim * interDim * 2;
         int unitSize = input0.unitSize;
 
         for (int o = 0; o < outer; o++) {
-            memcpy(output.cpuData + o * outputStride * unitSize,
-                   input0.cpuData + (o * input0Stride) * unitSize,
-                   input0.dims[axis] * inner * unitSize);
-            memcpy(output.cpuData + o * outputStride * unitSize + input0.dims[axis] * inner * unitSize,
-                   input1.cpuData + (o * input1Stride) * unitSize,
-                   input1.dims[axis] * inner * unitSize);
+            memcpy(output.cpuData + (size_t)o * outputStride * unitSize,
+                   input0.cpuData + (size_t)o * input0Stride * unitSize,
+                   (size_t)input0.dims[axis] * inner * unitSize);
+            memcpy(output.cpuData + (size_t)o * outputStride * unitSize + (size_t)input0.dims[axis] * inner * unitSize,
+                   input1.cpuData + (size_t)o * input1Stride * unitSize,
+                   (size_t)input1.dims[axis] * inner * unitSize);
         }
     }
 
@@ -7736,9 +7738,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         int unitSize = input.unitSize;
 
         for (int o = 0; o < outer; o++) {
-            memcpy(output.cpuData + o * outputStride * unitSize,
-                   input.cpuData + o * inputStride * unitSize,
-                   input.dims[axis] * inner * unitSize);
+            memcpy(output.cpuData + (size_t)o * outputStride * unitSize,
+                   input.cpuData + (size_t)o * inputStride * unitSize,
+                   (size_t)input.dims[axis] * inner * unitSize);
         }
     }
 
@@ -7762,9 +7764,9 @@ ops += (long long)lines * inputDim * interDim * 2;
             int inner = input0.strides[axis];
             int unitSize = input0.unitSize;
             for (int o = 0; o < outer; o++) {
-                memcpy(input0.cpuData + o * input0Stride * unitSize,
-                       input1.cpuData + o * input1Stride * unitSize,
-                       input1.dims[axis] * inner * unitSize);
+                memcpy(input0.cpuData + (size_t)o * input0Stride * unitSize,
+                       input1.cpuData + (size_t)o * input1Stride * unitSize,
+                       (size_t)input1.dims[axis] * inner * unitSize);
             }
 
             return;
@@ -7782,9 +7784,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         int unitSize = input0.unitSize;
 
         for (int o = 0; o < outer; o++) {
-            memcpy(input0.cpuData + o * input0Stride * unitSize + oldDims[axis] * inner * unitSize,
-                   input1.cpuData + (o * input1Stride) * unitSize,
-                   input1.dims[axis] * inner * unitSize);
+            memcpy(input0.cpuData + (size_t)o * input0Stride * unitSize + (size_t)oldDims[axis] * inner * unitSize,
+                   input1.cpuData + (size_t)o * input1Stride * unitSize,
+                   (size_t)input1.dims[axis] * inner * unitSize);
         }
     }
 
@@ -10198,7 +10200,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             int unitSize = input.unitSize;
             for (int i = 0; i < n; i++) {
                 for (int j = 0; j < m; j++) {
-                    memcpy(tmpData + (j * n + i) * k * unitSize, curData + (i * m + j) * k * unitSize, k * unitSize);
+                    memcpy(tmpData + ((size_t)j * n + i) * k * unitSize, curData + ((size_t)i * m + j) * k * unitSize, k * unitSize);
                 }
             }
         } else if (axis == std::vector <int> {2, 0, 1, 3}) {
@@ -10208,7 +10210,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             int unitSize = input.unitSize;
             for (int i = 0; i < n; i++) {
                 for (int j = 0; j < m; j++) {
-                    memcpy(tmpData + (j * n + i) * k * unitSize, curData + (i * m + j) * k * unitSize, k * unitSize);
+                    memcpy(tmpData + ((size_t)j * n + i) * k * unitSize, curData + ((size_t)i * m + j) * k * unitSize, k * unitSize);
                 }
             }
         } else if (axis == std::vector<int> {0, 2, 1, 3}) {
@@ -10220,11 +10222,11 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int o = 0; o < b; o++) {
                 for (int i = 0; i < n; i++) {
                     for (int j = 0; j < m; j++) {
-                        memcpy(tmpData + (j * n + i) * k * unitSize, curData + (i * m + j) * k * unitSize, k * unitSize);
+                        memcpy(tmpData + ((size_t)j * n + i) * k * unitSize, curData + ((size_t)i * m + j) * k * unitSize, k * unitSize);
                     }
                 }
-                tmpData += output.Count(1) * unitSize;
-                curData += input.Count(1) * unitSize;
+                tmpData += (size_t)output.Count(1) * unitSize;
+                curData += (size_t)input.Count(1) * unitSize;
             }
         } else {
             std::vector<int> oldSteps;
@@ -10267,6 +10269,22 @@ ops += (long long)lines * inputDim * interDim * 2;
 
     static std::vector <uint8_t> vold;
 
+    // The thread-pool transpose helper uses int byte offsets. Keep its fast path
+    // for small tensors and use wide offsets for embedding-sized buffers.
+    static void RunCpuTransposeByLineWide(uint8_t *output, uint8_t *input,
+                                          int n, int m, int lineBytes, AliveThreadPool *pool) {
+        if ((size_t)n * m * lineBytes <= 2147483647ULL) {
+            RunMultiThreadTransposeByLine(output, input, n, m, lineBytes, pool);
+            return;
+        }
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < m; j++) {
+                memcpy(output + ((size_t)j * n + i) * lineBytes,
+                       input + ((size_t)i * m + j) * lineBytes, lineBytes);
+            }
+        }
+    }
+
     void DoCpuPermuteSelf(Data &input, const std::vector <int> &axis) {
         bool same = false;
         same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && (input.dims[0] == 1 || input.dims[1] == 1));
@@ -10304,8 +10322,8 @@ ops += (long long)lines * inputDim * interDim * 2;
             float *temp = new float[n * m];
             float *finput = (float*)input.cpuData;
             for (int i = 0; i < outer; i++) {
-                memcpy(temp, finput + i * n * m, n * m * sizeof(float));
-                Transpose(finput + i * n * m, temp, n, m, n, m);
+                memcpy(temp, finput + (size_t)i * n * m, (size_t)n * m * sizeof(float));
+                Transpose(finput + (size_t)i * n * m, temp, n, m, n, m);
             }
             delete[] temp;
             input.Resize(new_dims);
@@ -10322,9 +10340,9 @@ ops += (long long)lines * inputDim * interDim * 2;
             int k = input.dims[3];
             int unitSize = input.unitSize;
             for (int o = 0; o < b; o++) {
-                RunMultiThreadTransposeByLine(newData, oldData, n, m, k * unitSize, GetAlivePool());
-                oldData += input.Count(1) * unitSize;
-                newData += input.Count(1) * unitSize;
+                RunCpuTransposeByLineWide(newData, oldData, n, m, k * unitSize, GetAlivePool());
+                oldData += (size_t)input.Count(1) * unitSize;
+                newData += (size_t)input.Count(1) * unitSize;
             }
             input.Resize(new_dims);
         } else if (axis == std::vector <int> {1, 0, 2}) {
@@ -10338,13 +10356,13 @@ ops += (long long)lines * inputDim * interDim * 2;
             int m = input.dims[1];
             int k = input.dims[2];
             int unitSize = input.unitSize;
-            RunMultiThreadTransposeByLine(newData, oldData, n, m, k * unitSize, GetAlivePool());
+            RunCpuTransposeByLineWide(newData, oldData, n, m, k * unitSize, GetAlivePool());
             input.Resize(new_dims);
         } else {
             auto tmp = new Data();
             fastllm::Permute(input, axis, *tmp);
 
-            memcpy(input.cpuData, tmp->cpuData, input.unitSize * input.Count(0));
+            memcpy(input.cpuData, tmp->cpuData, (size_t)input.unitSize * input.Count(0));
             input.Resize(tmp->dims);
             delete tmp;
         }
@@ -11074,12 +11092,12 @@ ops += (long long)lines * inputDim * interDim * 2;
         int unitSize = qkv.unitSize;
         for (int b = 0; b < bs; b++) {
             for (int s = 0; s < seqlen; s++) {
-                int offset = (b * seqlen + s) * total_dim;
+                size_t offset = ((size_t)b * seqlen + s) * total_dim;
                 memcpy((uint8_t*)qkv.cpuData + offset * unitSize,
-                       (uint8_t*)q.cpuData + (b * seqlen + s) * qdim * unitSize,
+                       (uint8_t*)q.cpuData + ((size_t)b * seqlen + s) * qdim * unitSize,
                        qdim * unitSize);
                 memcpy((uint8_t*)qkv.cpuData + (offset + qdim) * unitSize,
-                       (uint8_t*)k.cpuData + (b * seqlen + s) * per * unitSize,
+                       (uint8_t*)k.cpuData + ((size_t)b * seqlen + s) * per * unitSize,
                        per * unitSize);
             }
         }
@@ -11148,9 +11166,9 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int s = 0; s < seqlen; s++) {
                 for (int h = 0; h < q_heads; h++) {
                     uint8_t *dst = (uint8_t*)qOutput.cpuData +
-                        ((b * q_heads + h) * seqlen + s) * head_dim * unitSize;
+                        (((size_t)b * q_heads + h) * seqlen + s) * head_dim * unitSize;
                     uint8_t *src = (uint8_t*)q.cpuData +
-                        ((b * seqlen + s) * q_heads + h) * head_dim * unitSize;
+                        (((size_t)b * seqlen + s) * q_heads + h) * head_dim * unitSize;
                     memcpy(dst, src, head_dim * unitSize);
                 }
             }
@@ -11171,14 +11189,14 @@ ops += (long long)lines * inputDim * interDim * 2;
                 uint8_t *dst = pagedKData +
                     ((size_t)pageIdx * pageLen * k_heads * head_dim + pageOffset * k_heads * head_dim + h * head_dim) * unitSize;
                 uint8_t *src = (uint8_t*)k.cpuData +
-                    (b * k_heads * head_dim + h * head_dim) * unitSize;
+                    ((size_t)b * k_heads * head_dim + h * head_dim) * unitSize;
                 memcpy(dst, src, head_dim * unitSize);
             }
             for (int h = 0; h < v_heads; h++) {
                 uint8_t *dst = pagedVData +
                     ((size_t)pageIdx * pageLen * v_heads * head_dim + pageOffset * v_heads * head_dim + h * head_dim) * unitSize;
                 uint8_t *src = (uint8_t*)v.cpuData +
-                    (b * v_heads * head_dim + h * head_dim) * unitSize;
+                    ((size_t)b * v_heads * head_dim + h * head_dim) * unitSize;
                 memcpy(dst, src, head_dim * unitSize);
             }
         }
@@ -11756,11 +11774,11 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int t = 0; t < copyLen; t++) {
                 for (int h = 0; h < numHeads; h++) {
                     uint8_t *dst = pagedData + 
-                        (currentPageIdx * cache.pageLen * numHeads * headDim +
+                        ((size_t)currentPageIdx * cache.pageLen * numHeads * headDim +
                          (cache.lastPageLen + t) * numHeads * headDim +
                          h * headDim) * unitSize;
                     uint8_t *src = inputData + 
-                        (h * seqLen * headDim + (inputOffset + t) * headDim) * unitSize;
+                        ((size_t)h * seqLen * headDim + (inputOffset + t) * headDim) * unitSize;
                     memcpy(dst, src, headDim * unitSize);
                 }
             }
@@ -11786,11 +11804,11 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (int t = 0; t < copyLen; t++) {
                 for (int h = 0; h < numHeads; h++) {
                     uint8_t *dst = pagedData + 
-                        (newPageIdx * cache.pageLen * numHeads * headDim +
+                        ((size_t)newPageIdx * cache.pageLen * numHeads * headDim +
                          t * numHeads * headDim +
                          h * headDim) * unitSize;
                     uint8_t *src = inputData + 
-                        (h * seqLen * headDim + (inputOffset + t) * headDim) * unitSize;
+                        ((size_t)h * seqLen * headDim + (inputOffset + t) * headDim) * unitSize;
                     memcpy(dst, src, headDim * unitSize);
                 }
             }
@@ -11855,7 +11873,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         float dotProduct = 0.0f;
                         int kHeadIdx = o / group;
                         uint8_t *kDataPtr = kPagedData +
-                            (currentPageIdx * pageLen * kNumHeads * kHeadDim +
+                            ((size_t)currentPageIdx * pageLen * kNumHeads * kHeadDim +
                              t * kNumHeads * kHeadDim +
                              kHeadIdx * kHeadDim) * kUnitSize;
                         float *kToken = (float*)kDataPtr;
@@ -11915,7 +11933,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         int j = kvTokenIdx;
                         int vHeadIdx = o / group;
                         uint8_t *vDataPtr = vPagedData +
-                            (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
+                            ((size_t)currentPageIdx * vPageLen * vNumHeads * vHeadDim +
                              t * vNumHeads * vHeadDim +
                              vHeadIdx * vHeadDim) * vUnitSize;
                         float *vToken = (float*)vDataPtr;
@@ -11996,7 +12014,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         float dotProduct = 0.0f;
                         int kHeadIdx = o / group;
                         uint8_t *kDataPtr = kPagedData +
-                            (currentPageIdx * pageLen * kNumHeads * kHeadDim +
+                            ((size_t)currentPageIdx * pageLen * kNumHeads * kHeadDim +
                              t * kNumHeads * kHeadDim +
                              kHeadIdx * kHeadDim) * kUnitSize;
 
@@ -12063,7 +12081,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         int j = kvTokenIdx;
                         int vHeadIdx = o / group;
                         uint8_t *vDataPtr = vPagedData +
-                            (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
+                            ((size_t)currentPageIdx * vPageLen * vNumHeads * vHeadDim +
                              t * vNumHeads * vHeadDim +
                              vHeadIdx * vHeadDim) * vUnitSize;
 
@@ -12153,7 +12171,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         float dotProduct = 0.0f;
                         int kHeadIdx = o / group;
                         uint8_t *kDataPtr = kPagedData +
-                            (currentPageIdx * pageLen * kNumHeads * kHeadDim +
+                            ((size_t)currentPageIdx * pageLen * kNumHeads * kHeadDim +
                              t * kNumHeads * kHeadDim +
                              kHeadIdx * kHeadDim) * kUnitSize;
 
@@ -12220,7 +12238,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         int j = kvTokenIdx;
                         int vHeadIdx = o / group;
                         uint8_t *vDataPtr = vPagedData +
-                            (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
+                            ((size_t)currentPageIdx * vPageLen * vNumHeads * vHeadDim +
                              t * vNumHeads * vHeadDim +
                              vHeadIdx * vHeadDim) * vUnitSize;
 
@@ -12480,8 +12498,8 @@ ops += (long long)lines * inputDim * interDim * 2;
             int pageOffset = posData[b];
             for (int h = 0; h < numHeads; h++) {
                 uint8_t *dst = pagedData +
-                    (pageIdx * pageLen * numHeads * headDim + pageOffset * numHeads * headDim + h * headDim) * unitSize;
-                uint8_t *src = inputData + (b * numHeads * headDim + h * headDim) * unitSize;
+                    ((size_t)pageIdx * pageLen * numHeads * headDim + pageOffset * numHeads * headDim + h * headDim) * unitSize;
+                uint8_t *src = inputData + ((size_t)b * numHeads * headDim + h * headDim) * unitSize;
                 memcpy(dst, src, headDim * unitSize);
             }
         }
