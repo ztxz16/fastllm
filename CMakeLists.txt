@@ -1878,6 +1878,7 @@ if (UNIT_TEST)
             set_target_properties(cuda_dsv41_moe_cache_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
             add_test(NAME cuda_dsv41_moe_cache COMMAND cuda_dsv41_moe_cache_test)
             set_tests_properties(cuda_dsv41_moe_cache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+            fastllm_add_checked_test(cuda_dsv41_fp8_moe_cache cuda_dsv41_moe_cache_test "ALL_PASS V4.1:" 180 --fp8)
             add_executable(cuda_glm5_moe_cache_test test/basic/test_cuda_glm5_moe_cache.cu)
             target_link_libraries(cuda_glm5_moe_cache_test PRIVATE fastllm)
             set_target_properties(cuda_glm5_moe_cache_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
@@ -1888,8 +1889,15 @@ if (UNIT_TEST)
             fastllm_add_checked_test(cuda_glm5_moe_prefill cuda_glm5_moe_cache_test "GLM compact NVFP4 cache:" 120 --prefill)
             fastllm_add_checked_test(cuda_glm5_moe_verify cuda_glm5_moe_cache_test "GLM verify:" 120 --verify)
             fastllm_add_checked_test(cuda_glm5_moe_verify_no_cache cuda_glm5_moe_cache_test "GLM verify:" 120 --verify --no-cache)
+            fastllm_add_checked_test(cuda_glm5_fp8_moe_cache cuda_glm5_moe_cache_test "GLM FP8 cache:" 120 --fp8)
+            fastllm_add_checked_test(cuda_glm5_fp8_moe_frequency cuda_glm5_moe_cache_test "GLM FP8 cache:" 120 --fp8 --frequency)
+            fastllm_add_checked_test(cuda_glm5_fp8_moe_prefill cuda_glm5_moe_cache_test "GLM prefill:" 120 --fp8 --prefill)
+            fastllm_add_checked_test(cuda_glm5_fp8_moe_verify cuda_glm5_moe_cache_test "GLM verify:" 120 --fp8 --verify)
+            fastllm_add_checked_test(cuda_glm5_fp8_moe_verify_no_cache cuda_glm5_moe_cache_test "GLM verify:" 120 --fp8 --verify --no-cache)
             set_tests_properties(cuda_glm5_moe_frequency cuda_glm5_moe_no_cache cuda_glm5_moe_prefill
-                cuda_glm5_moe_verify cuda_glm5_moe_verify_no_cache PROPERTIES
+                cuda_glm5_moe_verify cuda_glm5_moe_verify_no_cache
+                cuda_glm5_fp8_moe_cache cuda_glm5_fp8_moe_frequency cuda_glm5_fp8_moe_prefill
+                cuda_glm5_fp8_moe_verify cuda_glm5_fp8_moe_verify_no_cache cuda_dsv41_fp8_moe_cache PROPERTIES
                 LABELS "cuda;moe;numa" RUN_SERIAL TRUE ENVIRONMENT "FT_NUMAS=1;FT_THREADS=8")
 
             add_executable(cuda_glm5_gguf_cache_test test/basic/test_cuda_glm5_gguf_cache.cpp)
