@@ -7,6 +7,7 @@
 #include "contextconfig.h"
 #include "baseblock.h"
 #include "template.h"
+#include "utils/prefill_batch.h"
 
 #include <atomic>
 #include <thread>
@@ -33,6 +34,7 @@ namespace fastllm {
     class basellm;
 
     struct ResponseContext {
+        PrefillBatchPolicy::Clock::time_point queuedAt = PrefillBatchPolicy::Clock::now();
         bool isEnding = false; // 代表这个请求已经处理完成了，不需要再forward了，但生成的token可能还没有被fetch
         bool isAbort = false; // 代表这个请求被中断了，也就是说不会再有人来fetch它了，那么推理完之后就可以删除这个请求了
         
@@ -511,6 +513,12 @@ namespace fastllm {
         // larger aggregate batching limit.
         virtual int GetBatchedPrefillTokenLimit();
 
+        // Opt-in per model; configure before the first request. A zero token
+        // target preserves the existing scheduler, and zero wait batches only
+        // requests already queued. Unsupported models keep their old policy.
+        virtual bool SupportsPrefillBatching() const { return false; }
+        bool SetPrefillBatching(int targetTokens, int maxWaitMs);
+
         virtual void SetDataType(DataType dataType);
 
         virtual void SetKVCacheDataType(DataType dataType);
@@ -660,6 +668,7 @@ namespace fastllm {
 
         // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
         int chunkedPrefillSize = -1;
+        PrefillBatchPolicy prefillBatchPolicy;
 
         // 由调度器在 long-prefill 的非末切片前向期间设置。支持该优化的
         // 模型可据此只更新 KV/线性状态，省去不会被消费的 lm_head 和采样。

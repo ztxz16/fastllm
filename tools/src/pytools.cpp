@@ -1282,6 +1282,10 @@ extern "C" {
         model->SetChunkedPrefillSize(size);
     }
 
+    DLL_EXPORT bool set_prefill_batching_llm_model(int modelId, int tokens, int maxWaitMs) {
+        return models.GetModel(modelId)->SetPrefillBatching(tokens, maxWaitMs);
+    }
+
     DLL_EXPORT void set_verbose_llm_model(int modelId, bool verbose) {
         auto model = models.GetModel(modelId);
         model->verbose = verbose;

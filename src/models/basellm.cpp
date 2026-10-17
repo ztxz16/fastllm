@@ -2879,6 +2879,10 @@ namespace fastllm {
                     std::vector<float> decodePositions(fastDecodeInput ? maxBatch : 0);
                     std::vector<Data> decodePositionIds;
                     if (fastDecodeInput) decodePositionIds.reserve(maxBatch);
+                    const bool batchPrefill = maxBatch > 1 && model->SupportsPrefillBatching() &&
+                                              model->prefillBatchPolicy.targetTokens > 0;
+                    const int prefillChunk = model->GetChunkedPrefillSize();
+                    const int prefillBatchLimit = model->GetBatchedPrefillTokenLimit();
                     while (true) {
                         std::vector <Data*> attentionMasks;
                         std::vector <Data*> positionIds;
@@ -2962,10 +2966,70 @@ namespace fastllm {
                         for (auto &it : model->responseContextDict.dicts) {
                             orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
                         }
-                        sort(orders.begin(), orders.end());
+                        if (batchPrefill) {
+                            // Preserve admission order while gathering. Restoring a
+                            // prefix shortens currentTokens; sorting by that length
+                            // would otherwise keep pinning new requests' KV pages.
+                            std::sort(orders.begin(), orders.end(), [&](const auto &a, const auto &b) {
+                                auto *left = model->responseContextDict.dicts.at(a.second);
+                                auto *right = model->responseContextDict.dicts.at(b.second);
+                                const bool lp = left->curTokens == 0, rp = right->curTokens == 0;
+                                if (lp != rp) return lp;
+                                if (lp && left->queuedAt != right->queuedAt) return left->queuedAt < right->queuedAt;
+                                return a < b;
+                            });
+                        } else sort(orders.begin(), orders.end());
+
+                        std::set<int> plannedPrefills;
+                        bool deferPrefill = false;
+                        int activeDecode = 0;
+                        if (batchPrefill) {
+                            auto oldest = PrefillBatchPolicy::Clock::time_point::max();
+                            for (auto &entry : model->responseContextDict.dicts) {
+                                if (entry.second->isEnding) continue;
+                                // A resident-prefix restore can set preTokens before
+                                // the first forward. It is still a pending prefill.
+                                if (entry.second->curTokens > 0) ++activeDecode;
+                                else oldest = std::min(oldest, entry.second->queuedAt);
+                            }
+                            currentActivate = activeDecode;
+                            const int slots = std::max(0, maxBatch - activeDecode);
+                            long long pendingTokens = 0;
+                            bool singlePrefill = false;
+                            for (auto &order : orders) {
+                                if ((int)plannedPrefills.size() >= slots) break;
+                                auto *ctx = model->responseContextDict.dicts.at(order.second);
+                                if (ctx->isEnding || ctx->curTokens != 0) continue;
+                                if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
+                                    ctx->cacheLen + ctx->currentTokens.size() > (size_t)model->max_positions) continue;
+                                // Count only cache misses. Restore each candidate once in
+                                // this pass; the selection below reuses the same KV owners.
+                                if (model->DeferHistoryCacheRestore()) {
+                                    const auto &cache = ctx->pastKeyValues[model->kvCacheId].first;
+                                    const long long before = allocatedTokens(cache);
+                                    RestoreResidentPrefix(model, ctx);
+                                    RestoreDeferredHistory(model, ctx);
+                                    lenSum += allocatedTokens(cache) - before;
+                                }
+                                const int count = ctx->currentTokens.size();
+                                const bool single = count > prefillChunk || !ctx->multimodalInput.empty();
+                                if (!plannedPrefills.empty() && (single || pendingTokens + count > prefillBatchLimit)) break;
+                                plannedPrefills.insert(order.second);
+                                pendingTokens += count;
+                                singlePrefill = single;
+                                if (single || pendingTokens >= prefillBatchLimit) break;
+                            }
+                            deferPrefill = !singlePrefill && model->prefillBatchPolicy.ShouldWait(
+                                pendingTokens, plannedPrefills.size(), slots, oldest, PrefillBatchPolicy::Clock::now());
+                            if (deferPrefill && activeDecode == 0) {
+                                model->dictCV.wait_until(dictLocker, model->prefillBatchPolicy.Deadline(oldest));
+                                continue;
+                            }
+                        }
 
                         for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
                             int cnt = 0;
+                            if (isPrompt && deferPrefill) continue; // Keep decoding while collecting prompts.
                             if (isPrompt == 0 && seqLens.size() > 0) {
                                 continue;
                             }
@@ -2981,7 +3045,7 @@ namespace fastllm {
                             for (auto &ii : orders) {
                                 auto &it = *model->responseContextDict.dicts.find(ii.second);
                                 // if (model->model_struct == "deepseek_v2" && isPrompt && seqLens.size() > 0) {
-                                if (isPrompt && seqLens.size() > 0) {
+                                if (isPrompt && seqLens.size() > 0 && !batchPrefill) {
                                     // TODO: multicuda支持多prompt一起推理
                                     continue;
                                 }
@@ -2990,16 +3054,25 @@ namespace fastllm {
                                 if (it.second->isEnding) {
                                     continue;
                                 }
-                                if (isPrompt && it.second->preTokens != 0) {
+                                const bool pendingPrefill = batchPrefill ? it.second->curTokens == 0 : it.second->preTokens == 0;
+                                if (isPrompt && !pendingPrefill) {
                                     continue;
                                 }
-                                if (!isPrompt && it.second->preTokens == 0) {
+                                if (!isPrompt && pendingPrefill) {
                                     continue;
                                 }
 
                                 if (isPrompt) {
+                                    if (batchPrefill && !plannedPrefills.count(it.first)) {
+                                        // Invalid requests still take the normal error path below.
+                                        if (it.second->cacheLen + it.second->currentTokens.size() <= (size_t)maxTotalLens &&
+                                            it.second->cacheLen + it.second->currentTokens.size() <= (size_t)model->max_positions)
+                                            continue;
+                                    }
                                     int alive = 0;
-                                    for (auto &it: model->responseContextDict.dicts) {
+                                    if (batchPrefill) {
+                                        alive = activeDecode + seqLens.size();
+                                    } else for (auto &it: model->responseContextDict.dicts) {
                                         if (it.second->isEnding) {
                                             continue;
                                         }
@@ -3037,7 +3110,7 @@ namespace fastllm {
                                     continue;
                                 }
 
-                                if (isPrompt && model->DeferHistoryCacheRestore()) {
+                                if (isPrompt && !batchPrefill && model->DeferHistoryCacheRestore()) {
                                     const auto &cache = it.second->pastKeyValues[model->kvCacheId].first;
                                     const long long before = allocatedTokens(cache);
                                     RestoreResidentPrefix(model, it.second);
@@ -3076,7 +3149,7 @@ namespace fastllm {
                                         }
                                     }
                                 } else {
-                                    if (it.second->currentTokens.size() * 2 < currentMaxLen) {
+                                    if (!batchPrefill && it.second->currentTokens.size() * 2 < currentMaxLen) {
                                         continue;
                                     }
                                     currentMaxLen = std::max(currentMaxLen, (int)it.second->currentTokens.size());
@@ -3164,7 +3237,7 @@ namespace fastllm {
                                 if (isPrompt) {
                                     cnt += it.second->currentTokens.size();
 
-                                    if (cnt > 1024) {
+                                    if (batchPrefill ? cnt >= prefillBatchLimit || seqLens[0] > prefillChunk : cnt > 1024) {
                                         break;
                                     }
                                     // break;
@@ -3271,8 +3344,8 @@ namespace fastllm {
                             if (model->verbose && prefillTokens > 0) {
                                 double spend = std::chrono::duration<double>(
                                     std::chrono::steady_clock::now() - prefillStartTime).count();
-                                printf("[Prompt] %d Tokens. Time: %.3f s. Speed: %.2f tokens / s.\n",
-                                       prefillTokens, spend, spend > 0 ? prefillTokens / spend : 0);
+                                printf("[Prompt] %d Tokens. Time: %.3f s. Speed: %.2f tokens / s. Batch: %d.\n",
+                                       prefillTokens, spend, spend > 0 ? prefillTokens / spend : 0, (int)seqLens.size());
                                 fflush(stdout);
                             }
                             if (printProfile) {
@@ -3508,6 +3581,7 @@ namespace fastllm {
         } else {
             context->isAbort = true;
         }
+        dictCV.notify_all();
     }
 
     int basellm::FetchResponseTokens(int handleId) {
@@ -3807,7 +3881,18 @@ namespace fastllm {
     }
 
     int basellm::GetBatchedPrefillTokenLimit() {
+        if (SupportsPrefillBatching() && prefillBatchPolicy.targetTokens > 0)
+            return std::max(GetChunkedPrefillSize(), prefillBatchPolicy.targetTokens);
         return this->GetChunkedPrefillSize();
+    }
+
+    bool basellm::SetPrefillBatching(int targetTokens, int maxWaitMs) {
+        std::lock_guard<std::mutex> lock(mainLoopLocker);
+        if (mainLoop != nullptr || targetTokens < 0 || maxWaitMs < 0 ||
+            (maxWaitMs > 0 && targetTokens == 0) ||
+            (targetTokens > 0 && !SupportsPrefillBatching())) return false;
+        prefillBatchPolicy = {targetTokens, maxWaitMs};
+        return true;
     }
 
     void basellm::SetDataType(DataType dataType) {

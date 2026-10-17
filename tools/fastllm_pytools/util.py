@@ -948,6 +948,10 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = _integer_or_auto, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如8192；auto按混推内存预算选择')
+    parser.add_argument('--prefill_batch_tokens', type=int, default=0,
+                        help='prefill 攒批的未缓存 token 目标，0关闭；当前仅支持 Naive 普通 TP GPU 推理；批量总预算至少为 chunked_prefill_size')
+    parser.add_argument('--prefill_max_wait_ms', type=int, default=0,
+                        help='prefill 攒批最长等待毫秒数，0不等待；需设置 prefill_batch_tokens；等待期间继续 decode')
     parser.add_argument('--fast_prefill', '--fast-prefill', action = 'store_true',
                         help = '启用DeepSeek-V4.1近似 prefill：后段层只计算末尾滑窗，可能改变 logits；默认关闭')
     parser.add_argument('--device', type = str, help = '使用的设备')
@@ -1122,6 +1126,11 @@ def make_normal_llm_model(args, startup_progress = None):
                                if name not in ("device", "moe_device") or getattr(args, name, None)]
 
     user_set_device = bool(args.device and args.device != "")
+    prefill_batch_tokens = getattr(args, 'prefill_batch_tokens', 0)
+    prefill_max_wait_ms = getattr(args, 'prefill_max_wait_ms', 0)
+    if not all(isinstance(value, int) and 0 <= value <= 2147483647
+               for value in (prefill_batch_tokens, prefill_max_wait_ms)) or (prefill_max_wait_ms > 0 and prefill_batch_tokens == 0):
+        raise ValueError("--prefill_batch_tokens and --prefill_max_wait_ms require non-negative int32 values; waiting requires a positive token target")
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
     # Resolve this after loading a saved JSON configuration. An explicit zero
     # must remain an opt-out, including when another model previously used slabs.
@@ -2021,6 +2030,8 @@ def make_normal_llm_model(args, startup_progress = None):
             if args.chunked_prefill_size > 0:
                 kvmem_options.setdefault("prefill_tokens", args.chunked_prefill_size)
             model.set_kvmem(**kvmem_options)
+        if prefill_batch_tokens > 0:
+            model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms)
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
         model.warmup()

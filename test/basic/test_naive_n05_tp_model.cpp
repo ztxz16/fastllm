@@ -874,12 +874,12 @@ class Fixture : public NaiveN05FlashModel {
                  <<" checks="<<checks<<" relative="<<largestLogitRelative<<std::endl;
     }
 
-    void PackedPrefillChecks() {
+    void PackedPrefillChecks(bool longPrefill = false) {
         GenerationConfig config;
         config.output_logits = true;
         config.output_token_limit = 16;
         config.top_k = 1;
-        std::vector<int> lengths = {3, 7, 1};
+        std::vector<int> lengths = longPrefill ? std::vector<int>{4096, 3983, 4211} : std::vector<int>{3, 7, 1};
         std::vector<std::vector<std::pair<Data, Data>>> reference(3), candidate(3);
         std::vector<Data> positions(3);
         std::vector<Data *> positionPtrs;
@@ -891,7 +891,7 @@ class Fixture : public NaiveN05FlashModel {
         for (int b = 0; b < 3; ++b) {
             reference[b].resize(2); candidate[b].resize(2);
             std::vector<float> tokens(lengths[b]), pos(lengths[b]);
-            for (int j = 0; j < lengths[b]; ++j) { tokens[j] = 5 * j + b; pos[j] = j; }
+            for (int j = 0; j < lengths[b]; ++j) { tokens[j] = (5 * j + b) % weight["model.embed_tokens.weight"].dims[0]; pos[j] = j; }
             Data input(FLOAT32, {1, lengths[b]}, tokens), position(FLOAT32, {1, lengths[b]}, pos);
             Forward(input, Data(), position, reference[b], config, LastTokensManager(), &expected[b]);
             positions[b].CopyFrom(position); positionPtrs.push_back(&positions[b]);
@@ -1787,6 +1787,12 @@ int main(int argc, char **argv) {
             SetCudaEmbedding(true);
             Fixture fixture(ranks, true, true);
             fixture.PackedPrefillChecks();
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "batch_prefill_long") {
+            SetCudaEmbedding(true);
+            Fixture fixture(ranks, false, true, true, true);
+            fixture.PackedPrefillChecks(true);
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "batch") {

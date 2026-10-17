@@ -44,6 +44,7 @@ namespace fastllm {
                               TargetCapture *capture = nullptr, float *candidateResult = nullptr,
                               const LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
         bool NeedAttentionMask(int, int) override { return false; }
+        bool SupportsPrefillBatching() const override;
         // Bound idle TP prefill workspace with the shared pressure-aware pool.
         bool RetainCudaWorkspace() const override { return tpDevices.size() > 1; }
         // Prefix reuse requires both resident full-attention pages and a GPU SWA checkpoint.

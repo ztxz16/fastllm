@@ -1143,6 +1143,11 @@ if (UNIT_TEST)
     fastllm_add_checked_test(legacy_paged_scheduler legacy_paged_scheduler_test "ALL_PASS" 60)
     set_tests_properties(legacy_paged_scheduler PROPERTIES RUN_SERIAL TRUE)
 
+    add_executable(prefill_batch_scheduler_test test/basic/test_prefill_batch_scheduler.cpp)
+    target_link_libraries(prefill_batch_scheduler_test PRIVATE fastllm)
+    fastllm_add_checked_test(prefill_batch_scheduler prefill_batch_scheduler_test "ALL_PASS" 30)
+    set_tests_properties(prefill_batch_scheduler PROPERTIES RUN_SERIAL TRUE)
+
     add_executable(legacy_scheduler_history_test test/basic/test_legacy_scheduler_history.cpp)
     target_link_libraries(legacy_scheduler_history_test PRIVATE fastllm)
     fastllm_add_checked_test(legacy_scheduler_history legacy_scheduler_history_test "ALL_PASS" 60)
@@ -1720,6 +1725,11 @@ if (UNIT_TEST)
                 add_test(NAME naive_n05_batch_prefill_${NAIVE_BATCH_RANKS}
                     COMMAND naive_n05_verify_graph_test ${NAIVE_BATCH_RANKS} batch_prefill)
                 set_tests_properties(naive_n05_batch_prefill_${NAIVE_BATCH_RANKS}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "PACKED PREFILL PASS")
+                add_test(NAME naive_n05_batch_prefill_long_${NAIVE_BATCH_RANKS}
+                    COMMAND naive_n05_verify_graph_test ${NAIVE_BATCH_RANKS} batch_prefill_long)
+                set_tests_properties(naive_n05_batch_prefill_long_${NAIVE_BATCH_RANKS}
                     PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                     PASS_REGULAR_EXPRESSION "PACKED PREFILL PASS")
             endforeach()

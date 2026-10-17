@@ -505,6 +505,8 @@ fastllm_lib.get_kv_cache_token_limit_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.get_kv_cache_token_limit_llm_model.restype = ctypes.c_int
 
 fastllm_lib.set_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+fastllm_lib.set_prefill_batching_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+fastllm_lib.set_prefill_batching_llm_model.restype = ctypes.c_bool
 
 fastllm_lib.set_model_indexer_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.set_model_indexer_dtype.restype = None
@@ -3417,6 +3419,14 @@ class model:
     def set_chunked_prefill_size(self, size: int):
         """设置分块 prefill 的切片大小（首块与后续块使用相同 token 数）。"""
         fastllm_lib.set_chunked_prefill_size_llm_model(self.model, size)
+
+    def set_prefill_batching(self, tokens: int, max_wait_ms: int = 0):
+        """启动前设置 prefill 攒批目标和最长等待；目前仅支持 Naive 普通 TP GPU 推理。"""
+        if not all(isinstance(value, int) and 0 <= value <= 2147483647
+                   for value in (tokens, max_wait_ms)) or (max_wait_ms > 0 and tokens == 0):
+            raise ValueError("prefill batching requires non-negative int32 values and a positive token target when waiting")
+        if not fastllm_lib.set_prefill_batching_llm_model(self.model, tokens, max_wait_ms):
+            raise ValueError("prefill batching must be configured before serving and currently requires ordinary Naive TP GPU inference")
     
     def set_verbose(self, verbose: int):
         fastllm_lib.set_verbose_llm_model(self.model, verbose)

@@ -36,7 +36,28 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
                 make_normal_llm_model(args)
                 self.native_env = dict(os.environ)
             fake.llm.set_cuda_slab.assert_called_once_with(args.cuda_slab)
+            self.loaded_model = fake.llm.model.return_value
             return args
+
+    def test_prefill_batching_cli_and_saved_settings(self):
+        for options, saved in [(['--tp', '8', '--prefill_batch_tokens', '16384',
+                                  '--prefill_max_wait_ms', '20', '--chunked_prefill_size', '8192'], None),
+                               ([], {'tp': '8', 'prefill_batch_tokens': 16384,
+                                     'prefill_max_wait_ms': 20, 'chunked_prefill_size': 8192})]:
+            with self.subTest(saved=saved):
+                self.configure(options, saved=saved)
+                self.loaded_model.set_prefill_batching.assert_called_once_with(16384, 20)
+                self.loaded_model.set_chunked_prefill_size.assert_called_once_with(8192)
+
+    def test_prefill_batching_defaults_and_invalid_values(self):
+        self.configure(['--tp', '8'])
+        self.loaded_model.set_prefill_batching.assert_not_called()
+        for options in [['--prefill_batch_tokens', '-1'], ['--prefill_max_wait_ms', '10'],
+                        ['--prefill_batch_tokens', '8192', '--prefill_max_wait_ms', '-1']]:
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, 'prefill'):
+                self.configure(options)
+        with self.assertRaisesRegex(ValueError, 'prefill'):
+            self.configure([], saved={'prefill_batch_tokens': 2147483648})
 
     def test_tp_defaults_and_explicit_slab(self):
         for ranks in (2, 4, 8):

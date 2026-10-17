@@ -193,9 +193,7 @@ void NaiveN05FlashModel::TrimCache(Data &cache, int length) {
 NaiveN05FlashModel::NaiveN05FlashModel() {
     model_type = model_struct = "naive_n05_flash";
     canDoBatchForward = false;
-    // Feed enough rows to each of the 256 experts to reuse its weights.
-    // 2048 also matches the sparse attention top-k boundary.
-    defaultChunkedPrefillSize = 2048;
+    defaultChunkedPrefillSize = 8192;
     dataType = kvCacheDataType = moeAtype = DataType::BFLOAT16;
     pre_prompt = user_role = bot_role = history_sep = "";
     weight.embeddingNames.insert("model.embed_tokens.weight");
@@ -349,6 +347,11 @@ NaiveN05FlashModel::GetTensorMap(const std::vector<std::string> &names) {
 
 int NaiveN05FlashModel::GetKVCacheRetainedTokens(int layer) const {
     return slidingLayers.at(layer) ? window - 1 : -1;
+}
+
+bool NaiveN05FlashModel::SupportsPrefillBatching() const {
+    return !draftEnabled && tpDevices.size() > 1 && CanUseGPUForward() &&
+           !GetKVCacheInCPU() && !kvMemConfig.enabled;
 }
 
 int NaiveN05FlashModel::Forward(
