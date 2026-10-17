@@ -358,7 +358,8 @@ def layer_device(layer, layers, mapping):
 
 def is_lookup_table(name):
     return ("ple_embd" in name or name == "per_layer_token_embd.weight" or "ple_embedding.weight" in name or
-            "ngram_embedding" in name or "engram" in name and "embedding" in name)
+            "ngram_embedding" in name or ".engram.embed." in name or
+            "engram" in name and "embedding" in name)
 
 
 def weight_costs(tensors, model, args):
@@ -418,7 +419,7 @@ def weight_costs(tensors, model, args):
             else:
                 raise ValueError("Hybrid auto: unsupported HF storage " + tensor.kind)
         is_table = is_lookup_table(name)
-        is_embedding = name == "token_embd.weight" or name.endswith("embed_tokens.weight")
+        is_embedding = name in ("token_embd.weight", "embed.weight") or name.endswith("embed_tokens.weight")
         if is_table:
             if args.ngram_device != "disk":
                 host += size

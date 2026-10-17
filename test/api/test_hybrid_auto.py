@@ -214,6 +214,18 @@ class HybridAutoTest(unittest.TestCase):
         a.ngram_device = "cpu"
         self.assertEqual(auto.weight_costs(tensors, g, a)[3], 64 * GiB + MiB)
 
+    def test_deepseek_native_lookup_tables_stay_off_gpu(self):
+        g, _, _, _ = fixture()
+        a = args(ngram_device="disk")
+        t = [auto.Tensor("layers.1.engram.embed.weight", (1024, 256), 262144, "F8_E4M3"),
+             auto.Tensor("layers.1.engram.embed.scale", (1024, 8), 8192, "F8_E8M0"),
+             auto.Tensor("embed.weight", (1024, 8), 16384, "BF16"),
+             auto.Tensor("layers.0.ffn.experts.0.w1.weight", (8, 8), 64, "F8_E4M3")]
+        self.assertTrue(all(auto.is_lookup_table(x.name) for x in t[:2]))
+        self.assertFalse(auto.is_lookup_table("layers.1.engram.wkv.weight"))
+        e, dense, common, host, largest, _ = auto.weight_costs(t, g, a)
+        self.assertEqual((sum(e), sum(dense), common, host, largest), (64, 0, 0, 16384, 16384))
+
     def test_hf_weight_conversion_counts_unpacked_values(self):
         g, _, _, _ = fixture()
         a = args(dtype="float16", moe_cuda_cache=0)
