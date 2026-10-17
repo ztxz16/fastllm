@@ -521,33 +521,37 @@ class Fixture : public NaiveN05FlashModel {
             throw std::runtime_error("incompatible serving graph was revived");
         std::cout << "SERVING INVALIDATION PASS" << std::endl;
     }
-    void ServingGraphChecks(bool padding = false) {
+    void ServingGraphChecks(bool padding = false, bool ragged = false) {
         // Candidate and eager reference retain independent request caches.
-        maxBatch = padding ? 128 : 16;
+        maxBatch = ragged ? 32 : padding ? 128 : 16;
         SetChunkedPrefillSize(4096);
-        SetMaxTokens(padding ? 1048576 : 262144);
+        SetMaxTokens(ragged ? 65536 : padding ? 1048576 : 262144);
         WarmUp();
         if (!verifyGraphCaptures) throw std::runtime_error("serving warmup captured no graphs");
         const int captures = verifyGraphCaptures;
         int checks = 0, replayed = 0, eager = 0;
-        for (int prefix : {3, 254, 2046, 4094}) {
+        for (int prefix : (ragged ? std::vector<int>{3070} : std::vector<int>{3, 254, 2046, 4094})) {
             using Cache = std::vector<std::pair<Data, Data>>;
-            const int requests = padding ? 48 : 8;
+            const int requests = ragged ? 9 : padding ? 48 : 8;
             std::vector<Cache> actual(requests), expected(requests);
             std::vector<int> past(requests, prefix);
+            // Nine requests pad to 16. The longest exceeds pool / 16 = 4096,
+            // while both independent reference/candidate KV sets fit the pool.
+            if (ragged) past[0] += 3072;
             GenerationConfig config;
             config.input_token_length = prefix;
             config.output_token_limit = 64;
             config.top_k = 1; config.repeat_penalty = 1; config.output_logits = true;
             auto prefill = [&](Cache &cache, int row) {
                 for (int i = 0; i < block_cnt; ++i) cache.emplace_back(Data(BFLOAT16), Data(BFLOAT16));
-                std::vector<float> ids(prefix), positions(prefix);
-                for (int i = 0; i < prefix; ++i) { ids[i] = (i * 3 + row) % 251; positions[i] = i; }
-                Forward(Data(FLOAT32, {1, prefix}, ids), Data(), Data(FLOAT32, {1, prefix}, positions), cache, config);
+                const int length = past[row];
+                std::vector<float> ids(length), positions(length);
+                for (int i = 0; i < length; ++i) { ids[i] = (i * 3 + row) % 251; positions[i] = i; }
+                Forward(Data(FLOAT32, {1, length}, ids), Data(), Data(FLOAT32, {1, length}, positions), cache, config);
             };
             for (int row = 0; row < requests; ++row) { prefill(actual[row], row); prefill(expected[row], row); }
             int step = 0;
-            const std::vector<int> counts = padding
+            const std::vector<int> counts = ragged ? std::vector<int>{9, 8, 1, 9, 7, 9, 3, 9} : padding
                 ? std::vector<int>{5, 7, 9, 15, 17, 31, 33, 39, 41, 44, 47, 40, 48, 1, 43}
                 : std::vector<int>{8, 4, 3, 2, 1, 4, 8, 7, 8};
             for (int count : counts) {
@@ -578,6 +582,8 @@ class Fixture : public NaiveN05FlashModel {
                 if (launched != 0 && launched != ranks) throw std::runtime_error("partial-rank serving replay");
                 if (padding && !failVerifyInstantiate && (prefix == 3 || prefix == 4094) && launched != ranks)
                     throw std::runtime_error("padded serving batch did not replay");
+                if (ragged && !failVerifyInstantiate && launched != ranks)
+                    throw std::runtime_error("ragged serving batch did not replay");
                 if (launched) ++replayed; else ++eager;
                 auto reference = run(expected, false);
                 SetCudaGraph(true);
@@ -626,8 +632,8 @@ class Fixture : public NaiveN05FlashModel {
         AbortResponse(handle);
         ShutdownRuntime();
         if (verifyGraphCaptures != captures) throw std::runtime_error("scheduler KV growth recaptured a graph");
-        if ((!failVerifyInstantiate && replayed < 20) ||
-            (failVerifyInstantiate && replayed != 0) || eager == 0)
+        if ((!failVerifyInstantiate && replayed < (ragged ? 8 : 20)) ||
+            (failVerifyInstantiate && replayed != 0) || (!ragged && eager == 0))
             throw std::runtime_error("missing serving replay/fallback coverage");
         std::cout << "SERVING GRAPH PASS logits=" << checks << " replayed=" << replayed
                   << " eager=" << eager << " serving_captures=" << verifyGraphCaptures - captures
@@ -1793,12 +1799,14 @@ int main(int argc, char **argv) {
             fixture.ServingGraphInvalidationChecks();
             return 0;
         }
-        if (argc > 2 && (std::string(argv[2]) == "serving_graph" || std::string(argv[2]) == "serving_padding")) {
+        if (argc > 2 && (std::string(argv[2]) == "serving_graph" || std::string(argv[2]) == "serving_padding" ||
+                        std::string(argv[2]) == "serving_ragged")) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             failVerifyInstantiate = argc > 3 && std::string(argv[3]) == "failinstantiate";
             failGraphDevice = ranks - 1;
             Fixture fixture(ranks, false, true, true, true);
-            fixture.ServingGraphChecks(std::string(argv[2]) == "serving_padding");
+            fixture.ServingGraphChecks(std::string(argv[2]) == "serving_padding",
+                                       std::string(argv[2]) == "serving_ragged");
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "swa_ring_toggle") {

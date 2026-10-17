@@ -1763,6 +1763,11 @@ if (UNIT_TEST)
                 set_tests_properties(naive_n05_serving_graph_${NAIVE_SERVING_RANKS}
                     PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                     PASS_REGULAR_EXPRESSION "SERVING GRAPH PASS")
+                add_test(NAME naive_n05_serving_ragged_${NAIVE_SERVING_RANKS}
+                    COMMAND naive_n05_verify_graph_test ${NAIVE_SERVING_RANKS} serving_ragged)
+                set_tests_properties(naive_n05_serving_ragged_${NAIVE_SERVING_RANKS}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "SERVING GRAPH PASS")
             endforeach()
             add_test(NAME naive_n05_serving_invalidation
                 COMMAND naive_n05_verify_graph_test 2 serving_invalidation)

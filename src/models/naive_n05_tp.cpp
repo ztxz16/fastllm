@@ -384,10 +384,12 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
     serving->batchBuckets = DecodeGraphBatchBuckets(maxRows);
     std::vector<int> batches(serving->batchBuckets.rbegin(), serving->batchBuckets.rend());
     int64_t scoreElements = 0;
+    // The pool bounds the sum of live lengths, not each request's length by
+    // the average. A ragged batch (including padded rows) may contain a long
+    // request at any batch size, so every bucket needs the same length range.
+    const int limit = (int)std::min<int64_t>(max_positions, tokenBudget);
     for (int rows : batches) {
-        // A request cannot exceed the configured token pool. Round the last
-        // bucket up: device live lengths, not bucket padding, bound KV reads.
-        const int limit = (int)std::min<int64_t>(max_positions, tokenBudget / rows);
+        // Round the last bucket up; device live lengths bound KV reads.
         std::vector<int> capacities{256, 2047};
         for (int64_t capacity = 4096; capacity / 2 < limit; capacity *= 2) {
             capacities.push_back((int)std::min<int64_t>(capacity, max_positions));
@@ -405,8 +407,8 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
             if (capacity > 2048) scoreElements = std::max(scoreElements, (int64_t)rows * capacity);
         }
     }
-    // Scratch is bounded by the token budget, not max_context * max_batch.
-    // All graph variants alias it; KV and weights are never duplicated.
+    // All graph variants alias one scratch sized for the largest shape;
+    // capturing more length buckets does not duplicate KV or weights.
     for (int rank = 0; rank < (int)tpDevices.size(); ++rank) {
         FastllmCudaSetDevice(tpDevices[rank]);
         if (!FastllmCudaNaiveDecodeGraphSupported()) return;
