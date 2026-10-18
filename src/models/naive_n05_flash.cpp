@@ -1605,9 +1605,10 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         "Naive startup KV pool exceeds the memory budget; reduce --tokens/--max_batch or prefill chunk size.");
     const int pageLen = GetPageLen();
     const int fullLayers = std::count(slidingLayers.begin(), slidingLayers.end(), 0);
+    const int graphRows = DecodeGraphBatchBuckets(std::min(batch, 256)).back();
     const int64_t metadataBytes = (int64_t)fullLayers * 2 * batch *
         ((std::min<int64_t>(max_positions, tokens) + pageLen - 1) / pageLen * sizeof(int) + 512) +
-        (int64_t)block_cnt * std::min(batch, 256) * 4 * sizeof(void *) + 512;
+        (int64_t)block_cnt * graphRows * 4 * sizeof(void *) + 512;
     const int pages = (int)((bytes - fixedBytes - metadataBytes) / fullBytesPerToken / pageLen);
     AssertInFastLLM(pages > 0, "Naive KV budget cannot fit paged metadata.");
     tokens = std::min<int64_t>(tokens, (int64_t)pages * pageLen);
