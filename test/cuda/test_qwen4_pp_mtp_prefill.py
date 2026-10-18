@@ -9,6 +9,9 @@ The history flag selects the existing serial fallback; prefix caching stays
 off for those references. A deterministic code continuation compares the same
 MTP mode across serial/PP execution, including ragged chunks and slot reuse.
 KV streaming is tested separately because it cannot enable history caching.
+Run both with all target experts on NUMA and with partial GPU residency. If a
+resident expert belongs to another PP stage, prefill must use the serial
+fallback; the same token, prefix-restore and request-reuse checks still apply.
 """
 import argparse
 import ctypes

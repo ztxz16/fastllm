@@ -62,12 +62,11 @@ namespace fastllm {
                 if (moe.empty() || moe == dense)
                     continue;
                 const bool host = moe == "cpu" || moe == "numa" || moe.rfind("numa:", 0) == 0;
-                // Hybrid MTP auto placement can balance resident experts
-                // across the PP devices independently of their dense layers.
-                // RunGpuMoE owns its cross-device input/output transfers.
-                const bool residentPeer = mtp && std::any_of(stages.begin(), stages.end(),
-                    [&](const auto &peer) { return moe == "cuda:" + std::to_string(peer.device); });
-                if (!host && !residentPeer)
+                // Each pipeline GPU has one compute owner. Resident experts
+                // on another stage would share its allocator, cuBLAS workspace
+                // and copies with a concurrent worker. Keep that layout on the
+                // serial chunked path, before acquiring a slot or appending KV.
+                if (!host)
                     return false;
             }
         }
