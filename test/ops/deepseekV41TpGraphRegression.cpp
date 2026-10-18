@@ -1,4 +1,4 @@
-// Run with test/basic/test_deepseek_v41_tp_graph.py (two CUDA devices).
+// Run with test/basic/test_deepseek_v41_tp_graph.py (--tp-size 2/4/8).
 #include "model.h"
 #include "models/deepseekv41.h"
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -6,9 +6,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <fstream>
 #include <stdexcept>
 
 using namespace fastllm;
+static std::vector<int> tpDevices;
 struct Access : DeepSeekV41Model {
     using DeepSeekV41Model::ForwardSegments;
     using DeepSeekV41Model::DsparkCommitPrefix;
@@ -47,7 +49,7 @@ static void AppendTensor(std::vector<float> &result, const Data &input) {
 // suffixes. Compare actual target features and committed KV, not only argmax.
 static std::vector<float> RunDsparkRequests(DeepSeekV41Model &model, int candidates = 8) {
     model.*(&Access::v41DsparkEnabled) = true;
-    model.*(&Access::v41DsparkTpDevices) = {0, 1};
+    model.*(&Access::v41DsparkTpDevices) = tpDevices;
     // Real requests enter DsparkAdvance after prefill before verifying drafts.
     // Reproduce its device setup without loading synthetic draft weights.
     (model.*(&Access::ApplyDsparkDevice))();
@@ -123,7 +125,8 @@ static std::vector<float> RunRequests(DeepSeekV41Model &model, const std::vector
             std::vector<float> logits;
             std::vector<std::vector<float> *> outputs{&logits};
             (model.*(&Access::ForwardSegments))({seg}, ids, nullptr, nullptr, {config}, last, &outputs, past);
-            if (logits.size() != 256) throw std::runtime_error("fixture vocabulary mismatch");
+            if (logits.size() != model.weight["head.weight"].dims[0])
+                throw std::runtime_error("fixture vocabulary mismatch");
             result.insert(result.end(), logits.begin(), logits.end());
         }
     }
@@ -142,13 +145,16 @@ static void Compare(const std::vector<float> &expected, const std::vector<float>
 
 int main(int argc, char **argv) {
     int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) return 77;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 1) return 77;
     try {
         bool expertCache = false, fp8Dense = false, eagerOnly = false, gpuExperts = false;
         bool diskExperts = false, diskEngram = false;
+        int tpSize = 2;
+        std::string logitsOnly;
         if (argc < 2)
             throw std::runtime_error("usage: deepseekV41TpGraphRegression FIXTURE_DIR "
-                "[--expert-cache | --gpu-experts | --disk-experts] [--disk-engram] [--fp8-dense] [--eager-only]");
+                "[--expert-cache | --gpu-experts | --disk-experts] [--disk-engram] [--fp8-dense] [--eager-only] "
+                "[--tp-size N] [--logits-only FILE]");
         for (int i = 2; i < argc; ++i) {
             const std::string option = argv[i];
             if (option == "--expert-cache") expertCache = true;
@@ -157,16 +163,27 @@ int main(int argc, char **argv) {
             else if (option == "--disk-engram") diskEngram = true;
             else if (option == "--fp8-dense") fp8Dense = true;
             else if (option == "--eager-only") eagerOnly = true;
+            else if (option == "--tp-size" && i + 1 < argc) tpSize = std::stoi(argv[++i]);
+            else if (option == "--logits-only" && i + 1 < argc) logitsOnly = argv[++i];
             else throw std::runtime_error("unknown option: " + option);
         }
         if (int(expertCache) + int(gpuExperts) + int(diskExperts) > 1)
             throw std::runtime_error("expert backend options are mutually exclusive");
+        if ((tpSize != 1 && tpSize != 2 && tpSize != 4 && tpSize != 8) ||
+            (tpSize == 1 && logitsOnly.empty()))
+            throw std::runtime_error("TP size must be 2, 4 or 8 (1 requires --logits-only)");
+        if (devices < tpSize) return 77;
+        std::string mainDevice = tpSize == 1 ? "cuda:0" : "multicuda:";
+        for (int i = 0; i < tpSize; ++i) {
+            tpDevices.push_back(i);
+            if (tpSize > 1) mainDevice += (i ? "," : "") + std::to_string(i);
+        }
         setenv("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP", "1", 1);
         SetCudaGraph(false);
         SetThreads(2);
         SetCudaSharedExpert(true);
-        SetDeviceMap({{"multicuda:0,1", 1}});
-        const std::string moeDevice = gpuExperts ? "multicuda:0,1" :
+        SetDeviceMap({{mainDevice, 1}});
+        const std::string moeDevice = gpuExperts ? mainDevice :
             (expertCache ? "numa" : (diskExperts ? "disk" : "cpu"));
         SetMoeDeviceMap({{moeDevice, 1}});
         SetNgramDevice(diskEngram ? "disk" : "cpu");
@@ -178,12 +195,21 @@ int main(int argc, char **argv) {
         }
         auto base = CreateLLMModelFromHF(argv[1], fp8Dense ? DataType::DATA_AUTO_SOURCE : DataType::FLOAT16);
         auto &model = dynamic_cast<DeepSeekV41Model &>(*base);
+        if (model.deviceMap != std::map<std::string, int>{{mainDevice, 1}})
+            throw std::runtime_error("requested TP layout silently fell back");
         if (model.GetExecutionMode() != (gpuExperts ? ExecutionMode::Gpu : ExecutionMode::Hybrid)) {
             throw std::runtime_error("wrong execution backend selected");
         }
         // Initialize weight shards and kernel plans before comparing dispatch.
         RunRequests(model, {7});
         const auto expected = RunRequests(model, {7, 17, 33, 7});
+        if (!logitsOnly.empty()) {
+            std::ofstream file(logitsOnly, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(expected.data()), expected.size() * sizeof(float));
+            if (!file) throw std::runtime_error("failed to write logits");
+            std::cout << "PASS: TP" << tpSize << " wrote " << expected.size() << " logits\n";
+            return 0;
+        }
         unsetenv("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP");
         Compare(expected, RunRequests(model, {7, 17, 33, 7}));
         if (!eagerOnly) {

@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -462,9 +463,97 @@ namespace fastllm {
             ToDataType(output, DataType::BFLOAT16);
         }
 
+#ifdef USE_CUDA
+        bool V41PrefillHcMixTp(const Data &input, Data &hcFn, Data &hcScale, Data &hcBase,
+                              int hcMult, int sinkhornIters, float eps, float normEps,
+                              Data &pre, Data &post, Data &comb) {
+            // A metadata-only replicated root often names just its first GPU.
+            // The replica map, not root.dataDeviceIds, defines the participating ranks.
+            std::vector<int> devices;
+            if (input.multiDeviceData && input.IsTensorParallelReplicated()) {
+                for (const auto &entry : input.multiDeviceDatas) devices.push_back(entry.first);
+            }
+            if (devices.size() < 2 || !input.multiDeviceData || !input.IsTensorParallelReplicated() ||
+                input.dims.size() != 4 || input.dims[0] != 1 || hcMult != 4 ||
+                input.dims[2] != hcMult || input.dims[1] < (int)devices.size() * 256 ||
+                (input.dataType != DataType::BFLOAT16 && input.dataType != DataType::FLOAT16 &&
+                 input.dataType != DataType::FLOAT32) || FastllmCudaGraphIsCapturingFast() ||
+                V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH")) return false;
+            for (const Data *data : {&input, (const Data *)&hcFn, (const Data *)&hcScale, (const Data *)&hcBase}) {
+                if (!data->multiDeviceData || !data->IsTensorParallelReplicated()) return false;
+                for (int device : devices) {
+                    auto it = data->multiDeviceDatas.find(device);
+                    if (it == data->multiDeviceDatas.end() || !it->second || !it->second->cudaData ||
+                        it->second->dims != data->dims) return false;
+                }
+            }
+            // Collective counts are signed ints; use wide arithmetic before
+            // selecting the optional partitioned path.
+            const int tokens = input.dims[1];
+            const int64_t rows = ((int64_t)tokens + devices.size() - 1) / devices.size();
+            if (rows * devices.size() > INT_MAX || rows * hcMult * hcMult > INT_MAX) return false;
+            if (!FastllmInitNccl(devices)) return false;
+            const int perRank = (int)rows, padded = perRank * devices.size();
+            V41AllocLike(pre, DataType::FLOAT32, {1, padded, hcMult}, input, devices);
+            V41AllocLike(post, DataType::FLOAT32, {1, padded, hcMult}, input, devices);
+            V41AllocLike(comb, DataType::FLOAT32, {1, padded, hcMult, hcMult}, input, devices);
+            auto viewRows = [](Data &view, const Data &parent, int first, int count) {
+                view.FakeFrom(parent, (size_t)first * parent.strides[1] * parent.unitSize);
+                auto dims = parent.dims; dims[1] = count;
+                view.expansionDims.clear(); view.Resize(dims);
+                view.expansionDims = dims; view.expansionSize = view.Count(0);
+                view.expansionBytes = view.GetBytes();
+            };
+            bool dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                const int begin = rank * perRank, count = std::min(perRank, tokens - begin);
+                Data x, p, s, c;
+                viewRows(x, *input.multiDeviceDatas.at(device), begin, count);
+                viewRows(p, *pre.multiDeviceDatas.at(device), begin, count);
+                viewRows(s, *post.multiDeviceDatas.at(device), begin, count);
+                viewRows(c, *comb.multiDeviceDatas.at(device), begin, count);
+                if (count < perRank) {
+                    for (Data *output : {&pre, &post, &comb}) {
+                        Data &local = *output->multiDeviceDatas.at(device);
+                        FastllmCudaMemset0((float *)local.cudaData + (size_t)(begin + count) * local.strides[1],
+                            (size_t)(perRank - count) * local.strides[1] * sizeof(float));
+                    }
+                }
+                bool ok = FastllmCudaDeepSeekV41HcMix(x, *hcFn.multiDeviceDatas.at(device),
+                    *hcScale.multiDeviceDatas.at(device), *hcBase.multiDeviceDatas.at(device),
+                    hcMult, sinkhornIters, eps, normEps, p, s, c);
+                AssertInFastLLM(ok, "DeepSeekV41 prefill HC query partition failed.");
+            });
+            AssertInFastLLM(dispatched, "DeepSeekV41 prefill HC dispatch failed.");
+            dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                bool ok = true;
+                for (Data *output : {&pre, &post, &comb}) {
+                    Data &local = *output->multiDeviceDatas.at(device);
+                    const int count = perRank * local.strides[1];
+                    const bool gathered = FastllmNcclAllGather((float *)local.cudaData + (size_t)rank * count,
+                        local.cudaData, count, (int)DataType::FLOAT32, device);
+                    ok = gathered && ok;
+                }
+                AssertInFastLLM(ok, "DeepSeekV41 prefill HC all-gather failed.");
+            });
+            AssertInFastLLM(dispatched, "DeepSeekV41 prefill HC gather dispatch failed.");
+            for (Data *output : {&pre, &post, &comb}) {
+                for (int device : devices) {
+                    auto dims = output->multiDeviceDatas.at(device)->dims; dims[1] = tokens;
+                    output->multiDeviceDatas.at(device)->Resize(dims);
+                }
+                V41SyncRootFromReplica(*output, devices);
+            }
+            return true;
+        }
+#endif
+
         void V41HcMix(const Data &input, Data &hcFn, Data &hcScale, Data &hcBase,
                       int hcMult, int sinkhornIters, float eps, float normEps,
                       Data &pre, Data &post, Data &comb) {
+#ifdef USE_CUDA
+            if (V41PrefillHcMixTp(input, hcFn, hcScale, hcBase, hcMult,
+                                 sinkhornIters, eps, normEps, pre, post, comb)) return;
+#endif
             V41Executor().Run("DeepSeekV41HcMix", {
                 {"input", (Data*)&input}, {"hcFn", &hcFn}, {"hcScale", &hcScale}, {"hcBase", &hcBase},
                 {"pre", &pre}, {"post", &post}, {"comb", &comb}
@@ -597,6 +686,117 @@ namespace fastllm {
                               {{"topK", topK}, {"compressRatio", ratio}, {"startPos", startPos},
                                {"blockSize", blockSize}});
         }
+
+#ifdef USE_CUDA
+        // Split independent prefill query rows across the TP group. Each rank
+        // keeps the original score/top-k kernels and causal positions; only the
+        // compact selected indices and candidate masks are exchanged.
+        bool V41PrefillIndexerTp(const Data &q, const Data &weights, const Data &keys,
+                                 Data &candidates, Data &topk, bool writeCandidates,
+                                 bool useCandidates, int ratio, int startPos, int topK,
+                                 int blockSize, int candidateTopK,
+                                 const std::vector<int> &devices) {
+            if (devices.size() < 2 || q.dims.size() != 4 || q.dims[0] != 1 ||
+                q.dims[1] < 1024 || q.dataType != DataType::BFLOAT16 ||
+                weights.dataType != DataType::FLOAT32 || weights.dims.size() != 3 ||
+                weights.dims[0] != 1 || weights.dims[1] != q.dims[1] ||
+                weights.dims[2] != q.dims[2] || keys.dataType != DataType::BFLOAT16 ||
+                keys.dims.size() != 3 || keys.dims[0] != 1 || keys.dims[1] <= 0 ||
+                keys.dims[2] != q.dims[3] || topK <= 0 || ratio <= 0 ||
+                (writeCandidates && useCandidates) || FastllmCudaGraphIsCapturingFast()) return false;
+            const int tokens = q.dims[1], width = std::min(topK, keys.dims[1]);
+            const int ranks = (int)devices.size(), perRank = (tokens + ranks - 1) / ranks;
+            const int paddedTokens = perRank * ranks;
+            const int maskWidth = blockSize > 0 ? (keys.dims[1] + blockSize - 1) / blockSize : 0;
+            if ((writeCandidates || useCandidates) && (maskWidth <= 0 || candidateTopK <= 0)) return false;
+            if ((int64_t)perRank * std::max(width, maskWidth) > std::numeric_limits<int>::max()) return false;
+            if (useCandidates && (candidates.dataType != DataType::INT8 ||
+                candidates.dims != std::vector<int>({1, tokens, maskWidth}))) return false;
+            std::vector<const Data *> inputs = {&q, &weights, &keys};
+            if (useCandidates) inputs.push_back(&candidates);
+            for (const Data *data : inputs) {
+                if (!data->multiDeviceData || !data->IsTensorParallelReplicated()) return false;
+                for (int device : devices) {
+                    auto it = data->multiDeviceDatas.find(device);
+                    if (it == data->multiDeviceDatas.end() || !it->second ||
+                        !it->second->cudaData || it->second->dims != data->dims ||
+                        it->second->dataType != data->dataType) return false;
+                }
+            }
+            if (!FastllmInitNccl(devices)) return false;
+            V41AllocLike(topk, DataType::INT32, {1, paddedTokens, width}, q, devices);
+            if (writeCandidates)
+                V41AllocLike(candidates, DataType::INT8, {1, paddedTokens, maskWidth}, q, devices);
+            auto rowsView = [](Data &view, const Data &source, int first, int count) {
+                view.FakeFrom(source, (size_t)first * source.strides[1] * source.unitSize);
+                auto dims = source.dims; dims[1] = count;
+                view.expansionDims.clear(); view.Resize(dims);
+                view.expansionDims = dims; view.expansionSize = view.Count(0);
+                view.expansionBytes = view.GetBytes();
+            };
+            std::vector<Data> scores(devices.size());
+            const int chunkTokens = V41IndexScoreChunk(perRank, keys.dims[1]);
+            bool dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                const int begin = rank * perRank, end = std::min(tokens, begin + perRank);
+                Data &output = *topk.multiDeviceDatas.at(device);
+                Data *mask = (writeCandidates || useCandidates) ? candidates.multiDeviceDatas.at(device) : nullptr;
+                // The last rank may have padding; initialise only the bytes
+                // exchanged by the collective, never another rank's range.
+                FastllmCudaMemset0((int32_t *)output.cudaData + (size_t)begin * width,
+                                  (size_t)perRank * width * sizeof(int32_t));
+                if (writeCandidates)
+                    FastllmCudaMemset0((uint8_t *)mask->cudaData + (size_t)begin * maskWidth,
+                                      (size_t)perRank * maskWidth);
+                for (int first = begin; first < end; first += chunkTokens) {
+                    const int count = std::min(chunkTokens, end - first);
+                    Data query, weight, selected, candidate;
+                    rowsView(query, *q.multiDeviceDatas.at(device), first, count);
+                    rowsView(weight, *weights.multiDeviceDatas.at(device), first, count);
+                    rowsView(selected, output, first, count);
+                    if (mask) rowsView(candidate, *mask, first, count);
+                    bool ok = FastllmCudaDeepSeekV41IndexerScore(query, weight,
+                        *keys.multiDeviceDatas.at(device), ratio, startPos + first, scores[rank]);
+                    if (writeCandidates)
+                        ok = ok && FastllmCudaDeepSeekV41CandidateBlocks(scores[rank], blockSize,
+                            candidateTopK, ratio, startPos + first, candidate);
+                    ok = ok && FastllmCudaDeepSeekV41IndexerTopK(scores[rank],
+                        useCandidates ? &candidate : nullptr, topK, ratio, startPos + first,
+                        std::max(1, blockSize), selected);
+                    AssertInFastLLM(ok, "DeepSeekV41 prefill indexer query partition failed.");
+                }
+            });
+            AssertInFastLLM(dispatched, "DeepSeekV41 prefill indexer dispatch failed.");
+            // Separate submission from allocation/destruction on every rank.
+            // No worker can enter a new allocation while peers submit NCCL.
+            dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                void *out = topk.multiDeviceDatas.at(device)->cudaData;
+                bool ok = FastllmNcclAllGather((int32_t *)out + (size_t)rank * perRank * width,
+                    out, perRank * width, (int)DataType::INT32, device);
+                if (writeCandidates) {
+                    void *mask = candidates.multiDeviceDatas.at(device)->cudaData;
+                    ok = ok && FastllmNcclAllGather((uint8_t *)mask + (size_t)rank * perRank * maskWidth,
+                        mask, perRank * maskWidth, (int)DataType::INT8, device);
+                }
+                AssertInFastLLM(ok, "DeepSeekV41 prefill indexer all-gather failed.");
+            });
+            AssertInFastLLM(dispatched, "DeepSeekV41 prefill indexer gather dispatch failed.");
+            dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int) {
+                if (scores[rank].cudaData &&
+                    FastllmCudaFreeAfterCurrentThreadStream(scores[rank].cudaData))
+                    scores[rank].cudaData = nullptr;
+                else if (scores[rank].cudaData)
+                    FastllmCudaSyncCurrentThreadStream();
+            });
+            AssertInFastLLM(dispatched, "DeepSeekV41 prefill indexer cleanup dispatch failed.");
+            for (int device : devices) {
+                topk.multiDeviceDatas.at(device)->Resize({1, tokens, width});
+                if (writeCandidates) candidates.multiDeviceDatas.at(device)->Resize({1, tokens, maskWidth});
+            }
+            V41SyncRootFromReplica(topk, devices);
+            if (writeCandidates) V41SyncRootFromReplica(candidates, devices);
+            return true;
+        }
+#endif
 
         void V41SparseAttention(const Data &q, const Data &chunkKV, const Data *ringKV,
                                 const Data *compressedKV, const Data *cmpIdx, Data &attnSink,
@@ -1126,15 +1326,14 @@ namespace fastllm {
             this->cantQuantLinears.insert(pre + ".ffn.gate.weight");
         }
 
-        // 注意力的 head 切分有硬约束（CUDA 稀疏注意力 kernel 每 block 32 个 head，
-        // wo_a 要求区间对齐到 o_group）。不满足时撤销 DeepSeekV4Model::InitParams
+        // 稀疏注意力支持不足一个 tile 的 head 分片；wo_a 仍要求区间对齐到 o_group。
+        // 不满足时撤销 DeepSeekV4Model::InitParams
         // 注册的注意力 TP 权重，让它们整块加载，前向里注意力也退回复制布局。
         if (V41DeviceMapUsesMultiCuda(this->deviceMap)) {
             const int ranks = V41MultiCudaRankCount(this->deviceMap);
             const bool aligned =
                 ranks > 1 && o_groups > 0 &&
                 num_attention_heads % ranks == 0 &&
-                (num_attention_heads / ranks) % 32 == 0 &&
                 num_attention_heads % o_groups == 0 &&
                 (num_attention_heads / ranks) % (num_attention_heads / o_groups) == 0;
             if (!aligned) {
@@ -1170,8 +1369,8 @@ namespace fastllm {
                     }
                     break;
                 }
-                printf("[Fastllm] DeepSeek-V4.1 tensor parallel needs num_attention_heads / tp to be a "
-                       "multiple of 32 and aligned to o_groups (got %d heads, %d ranks, o_groups=%d); "
+                printf("[Fastllm] DeepSeek-V4.1 tensor parallel needs equal head shards "
+                       "aligned to o_groups (got %d heads, %d ranks, o_groups=%d); "
                        "falling back to %s.\n",
                        num_attention_heads, ranks, o_groups, fallbackDevice.c_str());
                 fflush(stdout);
@@ -3375,13 +3574,12 @@ namespace fastllm {
         ApplyDeviceMap(this->deviceMap, 1, block_cnt);
         tpDevices = V41TpDevices(this->deviceMap);
         tp = !tpDevices.empty();
-        // 注意力切分仍要求每卡 head 数为 32 的倍数并对齐 o_group。
+        // 与 InitParams 使用相同的 head/o_group 对齐条件；kernel 内部处理尾部 head。
         const int tpRanks = (int)tpDevices.size();
         const bool tpHeadsAligned =
             tpRanks > 0 && o_groups > 0 &&
             num_attention_heads % tpRanks == 0 &&
             num_attention_heads % o_groups == 0 &&
-            (num_attention_heads / tpRanks) % 32 == 0 &&
             (num_attention_heads / tpRanks) % (num_attention_heads / o_groups) == 0;
         // InitParams 已经在 head 数切不开时把 device map 改回单卡（那时 tp 为假），
         // 这里的 tpHeadsAligned 只是同一条约束的兜底。
@@ -3485,12 +3683,14 @@ namespace fastllm {
                 tpVerifyWorkspaceActive = true;
             }
         }
-        // Eager verification retains per-weight quantization buffers just as
-        // graph execution does. Event-ordered dispatch can then avoid a device
-        // synchronization after every operator. Drain the ranks before releasing
-        // the workspace lock; long prefill still uses synchronous dispatch.
+        // The GPU execution path keeps producer/consumer ordering through
+        // bidirectional stream events, including eager prefill. Every dispatch
+        // publishes its completion event to the caller before temporary tensors
+        // can be reused; the scope drains all ranks before workspace destruction.
+        // Hybrid CPU expert paths retain their existing synchronization policy.
         tpDecodeDispatch.reset(new ScopedTpDispatch(
-            tp && single && (seqlen == 1 || graphActive || tpVerifyWorkspaceActive), tpDevices));
+            tp && (executionMode == ExecutionMode::Gpu || (single && seqlen == 1) ||
+                   graphActive || tpVerifyWorkspaceActive), tpDevices));
         graphPoolOpen = false;
         if (graphCapture) {
             const int oriDevice = FastllmCudaGetDevice();
@@ -4122,7 +4322,16 @@ namespace fastllm {
                             // 按 token 维分块调用打分 / 候选块 / top-k，把峰值显存钉在一个固定预算内。
                             const int scoreM = srcCache.indexK.dims.size() == 3 ? srcCache.indexK.dims[1] : 0;
                             int chunkTokens = V41IndexScoreChunk(segLen, scoreM);
-                            if (chunkTokens >= segLen) {
+                            bool partitionedIndexer = false;
+#ifdef USE_CUDA
+                            partitionedIndexer = !dumpDebug && V41PrefillIndexerTp(
+                                *qIdx, *idxWeightsScaled, srcCache.indexK, segCandidate[s], segTopK[s],
+                                isCandidateLayer, useCandidates, ratio, startPos, indexTopK,
+                                candidate_block_size, candidate_topk_blocks, tpDevices);
+#endif
+                            if (partitionedIndexer) {
+                                if (isCandidateLayer) segHasCandidates[s] = 1;
+                            } else if (chunkTokens >= segLen) {
                                 Data score;
                                 V41IndexerScore(*qIdx, *idxWeightsScaled, srcCache.indexK, ratio, startPos, score);
                                 if (dumpDebug) {

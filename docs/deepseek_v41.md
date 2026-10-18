@@ -48,7 +48,7 @@
 - 真实 checkpoint 的权重格式（FP8 32x32、FP4 路由专家、FP8 + UE8M0 的 Engram 表）；
 - 图像输入（OpenAI 接口的 `image_url`）：ViT + aligner、图像 token 的 `gate.bias_vl` 路由与 Engram 掩码，详见下文；
 - DSpark 投机解码（`mtp.*` 草稿层），详见下文"DSpark 投机解码"。
-- 双卡张量并行（`--tp 2`），详见下文"张量并行"。
+- 张量并行（`--tp 2`、`--tp 4`、`--tp 8`），详见下文"张量并行"。
 
 尚未实现：
 
@@ -232,10 +232,20 @@ FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/DeepSeek-V4.1-Flash \
 
 ### 约束
 
-TP 当前要求 `num_attention_heads / tp` 是 32 的倍数，以兼容 CUDA 稀疏注意力的回退路径，
-并且要对齐到 `o_group`。真实模型 64 头、`o_groups=8`，TP=2 满足（每卡 32 头 = 4 个 o_group）；
-TP=4 不满足。不满足时模型会打印一行说明并**整体退回单卡**（撤销注意力与 head 的 TP 权重注册，
+TP 要求 query heads 均匀分片，且每个分片包含完整的 `o_group`。
+真实模型 64 头、`o_groups=8`，TP=2/4/8 分别对应每卡 32/16/8 个 head；
+稀疏 Attention 的 MMA 和标量回退路径均支持尾部不足一个 tile 的 head，
+不会读取或写入填充 head 对应的全局内存。不满足分组对齐条件时模型会打印说明并**整体退回单卡**（撤销注意力与 head 的 TP 权重注册，
 把 device map 改回 `cuda:<第一张卡>`），而不是做"只切 FFN"的半张量并行。
+
+八卡 GPU 专家配置示例（Engram 表仍常驻 CPU 内存）：
+
+```bash
+FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/DeepSeek-V4.1-Flash \
+  --tp 8 --dtype auto --ngram_device cpu --chunked_prefill_size 512
+```
+
+默认 MoE 设备跟随主设备，使用八卡张量并行。此命令不启用近似 `--fast_prefill`。
 
 视觉编码器（ViT + aligner）与 DSpark 草稿层仍在单卡上算。`--tp 2 --dspark 5` 可以组合使用：
 目标模型按上述方式张量并行，草稿层在第一张卡运行，共享的 `head.weight` 沿用两卡词表分片，

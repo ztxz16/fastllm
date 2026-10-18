@@ -139,6 +139,76 @@ static void AttentionChecks() {
     std::cout << "PASS attention: " << checks << " comparisons; both devices, BF16/FP8/FP4, decode/prefill, ring wrap and invalid indices bitwise equal\n";
 }
 
+// Compare independent head shards against the existing full-head execution.
+// This catches cross-token reads/writes as well as partial MMA score tiles.
+static Data SliceAxis(Data &input, int axis, int begin, int count) {
+    auto bytes = Bytes(input);
+    auto dims = input.dims;
+    size_t outer = 1;
+    for (int i = 0; i < axis; ++i) outer *= dims[i];
+    const size_t inner = bytes.size() / (outer * dims[axis]);
+    const int original = dims[axis];
+    dims[axis] = count;
+    Data out(input.dataType, dims); out.Allocate();
+    for (size_t i = 0; i < outer; ++i)
+        memcpy(out.cpuData + i * count * inner,
+               bytes.data() + (i * original + begin) * inner, count * inner);
+    out.ToDevice(DataDevice::CUDA, std::vector<int>{FastllmCudaGetDevice()});
+    return out;
+}
+static void AttentionHeadShardChecks() {
+    int checks = 0;
+    struct Shape { int batch, tokens, start, window, width; };
+    const Shape shapes[] = {{1,1,0,128,0}, {1,1,1025,128,512},
+                            {1,5,127,128,65}, {2,3,0,128,65}};
+    SelectDevice(0);
+    for (auto type : {DataType::BFLOAT16, DataType::FLOAT32})
+        for (bool legacy : {false, true}) {
+            if (type == DataType::FLOAT32 && legacy) continue;
+            setenv("FASTLLM_DSV41_LEGACY_ATTN", legacy ? "1" : "0", 1);
+            for (auto shape : shapes) for (bool packed : {false, true}) {
+                const int cap = 1024;
+                auto q = Random(type, {shape.batch,shape.tokens,64,512}, 731);
+                auto chunk = Random(DataType::BFLOAT16, {shape.batch,shape.tokens,512}, 137);
+                auto ring = Random(DataType::BFLOAT16, {shape.batch,shape.window,512}, 887);
+                auto cmp = Random(DataType::BFLOAT16, {shape.batch,cap,512}, 191);
+                auto sink = Random(DataType::FLOAT32, {64}, 993);
+                Data idx(DataType::INT32, {shape.batch,shape.tokens,shape.width}); idx.Allocate();
+                for (int i = 0; i < shape.batch * shape.tokens * shape.width; ++i)
+                    ((int32_t*)idx.cpuData)[i] = i % 17 == 0 ? -1 : (i % 19 == 0 ? cap : i * 37 % cap);
+                idx.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+                Data ring8, cmp4;
+                Check(FastllmCudaDeepSeekV41QuantizeKV(ring, ring8, 1, 32), "head-shard ring pack");
+                Check(FastllmCudaDeepSeekV41QuantizeKV(cmp, cmp4, 3, 16), "head-shard compressed pack");
+                auto run = [&](Data &query, Data &sinks, Data &output) {
+                    Check(FastllmCudaDeepSeekV41SparseAttention(query, chunk,
+                        packed ? &ring8 : &ring, packed ? &cmp4 : &cmp,
+                        shape.width ? &idx : nullptr, sinks, shape.window, shape.start,
+                        .0441941738f, output), "head-shard attention rejected");
+                };
+                Data full; run(q, sink, full);
+                for (int heads : {1,8,16,24,40}) for (int begin : {0,64-heads}) {
+                    auto shardQ = SliceAxis(q, 2, begin, heads);
+                    auto shardSink = SliceAxis(sink, 0, begin, heads);
+                    auto expected = SliceAxis(full, 2, begin, heads);
+                    Data output; run(shardQ, shardSink, output);
+                    Check(Bytes(output) == Bytes(expected), "attention head-shard mismatch heads=" +
+                        std::to_string(heads) + " begin=" + std::to_string(begin) +
+                        " tokens=" + std::to_string(shape.tokens) + " legacy=" + std::to_string(legacy));
+                    if (heads == 8 && begin == 0 && shape.tokens == 1 && !legacy &&
+                        type == DataType::BFLOAT16) {
+                        ReplayGraph([&]() { run(shardQ, shardSink, output); });
+                        Check(Bytes(output) == Bytes(expected), "eight-head graph replay mismatch");
+                    }
+                    ++checks;
+                }
+            }
+        }
+    unsetenv("FASTLLM_DSV41_LEGACY_ATTN");
+    std::cout << "PASS attention head shards: " << checks
+              << " bitwise full-head comparisons; partial tiles, prefill/decode, BF16/FP8/FP4 KV, scalar/MMA, graph replay\n";
+}
+
 static void IndexerChecks() {
     int checks = 0;
     struct Shape { int batch, tokens, heads, candidates; };
@@ -381,7 +451,7 @@ static void SharedSwigluQuantizationChecks() {
                     auto input = Random(type, {rows, 2 * mid}, rows + mid, 20.f);
                     Data swiglu, expected(DataType::BFLOAT16, {rows, mid}), actual;
                     Check(FastllmCudaDeepSeekV41SharedSwiglu(input, limit, swiglu), "shared SwiGLU reference");
-                    expected.ToDevice(DataDevice::CUDA, {dev}); expected.Allocate();
+                    expected.ToDevice(DataDevice::CUDA, std::vector<int>{dev}); expected.Allocate();
                     Check(FastllmCudaDeepSeekV41QuantizeActivation(swiglu, expected), "shared quantization reference");
                     const auto bytes = Bytes(expected);
                     auto run = [&]() {
@@ -412,7 +482,8 @@ int main(int argc, char **argv) {
         Check(argc <= 2, "usage: deepseekV41DecodeOptimizationRegression [section]");
         Check(section == "all" || section == "attention" ||
               section == "indexer" || section == "fallback" || section == "rmsnorm" ||
-              section == "capacity" || section == "shared", "unknown section");
+              section == "capacity" || section == "shared" || section == "heads", "unknown section");
+        if (section == "all" || section == "heads") AttentionHeadShardChecks();
         if (section == "all" || section == "attention") AttentionChecks();
         if (section == "all" || section == "attention") AttentionGraphLifetimeChecks();
         if (section == "all" || section == "indexer") IndexerChecks();

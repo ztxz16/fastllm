@@ -4855,8 +4855,7 @@ namespace fastllm {
         for (int device : devices) {
             auto it = q.multiDeviceDatas.find(device);
             if (it == q.multiDeviceDatas.end() || it->second == nullptr ||
-                it->second->dims.size() != 4 || it->second->dims[2] <= 0 ||
-                it->second->dims[2] % 32 != 0) {
+                it->second->dims.size() != 4 || it->second->dims[2] <= 0) {
                 return false;
             }
         }
@@ -4940,7 +4939,7 @@ namespace fastllm {
                 return;
             }
             AssertInFastLLM(MultiCudaV41LocalHeadsValid(q, devices),
-                            "DeepSeekV41SparseAttention MultiCuda needs a per-rank head count that is a multiple of 32.\n");
+                            "DeepSeekV41SparseAttention MultiCuda needs a valid nonempty head shard on every rank.\n");
             if (!attnSink.multiDeviceData) {
                 AssertInFastLLM(SplitMultiCudaWeight1D(attnSink, devices, q.tpRanges),
                                 "DeepSeekV41SparseAttention MultiCuda failed to split attn_sink.\n");

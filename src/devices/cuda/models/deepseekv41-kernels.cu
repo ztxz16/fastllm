@@ -514,11 +514,11 @@ namespace {
 
     constexpr int kHcTokens = 4;
 
-    template <typename T, int HC>
+    template <typename T, int HC, bool DOTS_ONLY = false>
     __global__ void __launch_bounds__(kHcThreads)
     V41HcMixKernelMulti(const T *x, const float *fn, const float *scale, const float *base,
                         int tokens, int dim, int sinkhornIters, float eps, float normEps,
-                        float *pre, float *post, float *comb) {
+                        float *pre, float *post, float *comb, float *dotOutput = nullptr) {
         constexpr int MIXHC = (2 + HC) * HC;
         const int flatDim = HC * dim;
         const int t0 = blockIdx.x * kHcTokens;
@@ -577,6 +577,17 @@ namespace {
             }
         }
         __syncthreads();
+        if constexpr (DOTS_ONLY) {
+            // Keep the original accumulation/reduction order, but finish the
+            // Sinkhorn matrices in parallel warps rather than four CTA lanes.
+            for (int idx = threadIdx.x; idx < kHcTokens * (MIXHC + 1); idx += kHcThreads) {
+                const int tb = idx / (MIXHC + 1), m = idx % (MIXHC + 1);
+                if (t0 + tb < tokens)
+                    dotOutput[(uint64_t)(t0 + tb) * (MIXHC + 1) + m] =
+                        m == MIXHC ? sumsq[tb] : mixes[tb][m];
+            }
+            return;
+        }
         if (threadIdx.x < kHcTokens && t0 + (int)threadIdx.x < tokens) {
             const int tb = threadIdx.x;
             const int t = t0 + tb;
@@ -662,6 +673,38 @@ namespace {
             float total = 0.0f;
             for (int w = 0; w < kHcThreads / 32; ++w) total += partial[w];
             mix[m] = total;
+        }
+    }
+
+    // Reuse each FP32 coefficient across four tokens while parallelizing
+    // the 25 independent dot products. Per-output FMA and reduction order
+    // remain the same as the portable HcMix implementation.
+    template <typename T>
+    __global__ void V41HcBatchDots(const T *x, const float *fn, int flatDim,
+                                    int tokens, float *mix) {
+        constexpr int tile = 4;
+        const int m = blockIdx.x, first = blockIdx.y * tile;
+        float acc[tile] = {};
+        for (int k = threadIdx.x; k < flatDim; k += kHcThreads) {
+            const float weight = m == 24 ? 0.0f : fn[(uint64_t)m * flatDim + k];
+#pragma unroll
+            for (int t = 0; t < tile; ++t) {
+                const float value = first + t < tokens ? V41Load(x, (uint64_t)(first + t) * flatDim + k) : 0.0f;
+                acc[t] += value * (m == 24 ? value : weight);
+            }
+        }
+        __shared__ float partial[tile][kHcThreads / 32];
+#pragma unroll
+        for (int t = 0; t < tile; ++t) {
+            const float sum = V41WarpSum(acc[t]);
+            if ((threadIdx.x & 31) == 0) partial[t][threadIdx.x / 32] = sum;
+        }
+        __syncthreads();
+        if (threadIdx.x < tile && first + threadIdx.x < tokens) {
+            float total = 0.0f;
+#pragma unroll
+            for (int w = 0; w < kHcThreads / 32; ++w) total += partial[threadIdx.x][w];
+            mix[(uint64_t)(first + threadIdx.x) * 25 + m] = total;
         }
     }
 
@@ -1843,7 +1886,7 @@ namespace {
         const QT *qrow = q + ((uint64_t)t * heads + h) * dim + lane * segment;
         float qv[64];
         for (int d = 0; d < segment; d++) {
-            qv[d] = V41Load<QT>(qrow, d);
+            qv[d] = h < heads ? V41Load<QT>(qrow, d) : 0.0f;
         }
         constexpr int valueSegment = segment / ValueSplits;
         const int valueOffset = ValueSplits == 1 ? 0 : blockIdx.z * valueSegment;
@@ -1851,7 +1894,7 @@ namespace {
         for (int d = 0; d < valueSegment; d++) {
             acc[d] = 0.0f;
         }
-        float mx = sink[h];
+        float mx = h < heads ? sink[h] : 0.0f;
         float l = 1.0f;
 
         const int winStart = max(0, pos - windowSize + 1);
@@ -1916,8 +1959,10 @@ namespace {
         }
         float inv = 1.0f / l;
         __nv_bfloat16 *orow = out + ((uint64_t)t * heads + h) * dim + lane * segment + valueOffset;
-        for (int d = 0; d < valueSegment; d++) {
-            orow[d] = __float2bfloat16_rn(acc[d] * inv);
+        if (h < heads) {
+            for (int d = 0; d < valueSegment; d++) {
+                orow[d] = __float2bfloat16_rn(acc[d] * inv);
+            }
         }
     }
 
@@ -2265,20 +2310,40 @@ namespace {
     };
 
 
+    struct V41AttentionDescriptor {
+        const __nv_bfloat16 *q, *chunkKV, *ringKV, *compressedKV;
+        const uint8_t *ringKV8, *compressedKV8;
+        const int32_t *indices;
+        __nv_bfloat16 *output;
+        float *scores;
+        int cap, topWidth, startPos, ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack;
+    };
+
     // Independent candidate tiles materialize QK once. The consumer keeps
     // the original 64-slot online softmax and BF16 probability sequence.
+    template<bool BATCHED = false>
     __global__ void __launch_bounds__(kMmaThreads)
     V41SparseAttentionScoresKernel(const __nv_bfloat16 *q, const __nv_bfloat16 *chunkKV, const __nv_bfloat16 *ringKV,
                                 const __nv_bfloat16 *compressedKV, const uint8_t *ringKV8, const uint8_t *compressedKV8,
                                 const int32_t *cmpIdx, int seqlen, int heads,
                                 int windowSize, int cap, int topWidth, int startPos,
                                 float *scores,
-                                int ringMode, int ringRowBytes, int cmpMode, int cmpRowBytes, int vecUnpack) {
+                                int ringMode, int ringRowBytes, int cmpMode, int cmpRowBytes, int vecUnpack,
+                                const V41AttentionDescriptor *descriptors = nullptr) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
+        if constexpr (BATCHED) {
+            const auto &d = descriptors[blockIdx.x];
+            q=d.q; chunkKV=d.chunkKV; ringKV=d.ringKV; compressedKV=d.compressedKV;
+            ringKV8=d.ringKV8; compressedKV8=d.compressedKV8; cmpIdx=d.indices;
+            cap=d.cap; topWidth=d.topWidth; startPos=d.startPos; scores=d.scores;
+            ringMode=d.ringMode; ringRowBytes=d.ringRowBytes; cmpMode=d.cmpMode;
+            cmpRowBytes=d.cmpRowBytes; vecUnpack=d.vecUnpack;
+            if (blockIdx.z >= (windowSize + topWidth + kMmaNC - 1) / kMmaNC) return;
+        }
         extern __shared__ char v41MmaSharedRaw[];
         V41MmaShared &sh = *reinterpret_cast<V41MmaShared*>(v41MmaSharedRaw);
 
-        const int t = blockIdx.x;                       // b * seqlen + i
+        const int t = BATCHED ? 0 : blockIdx.x;                       // b * seqlen + i
         const int b = t / seqlen, i = t % seqlen;
         const int pos = startPos + i;
         const int h0 = blockIdx.y * kMmaHeads;
@@ -2287,8 +2352,9 @@ namespace {
 
         for (int v = threadIdx.x; v < kMmaHeads * (kMmaDim / 8); v += kMmaThreads) {
             int hh = v / (kMmaDim / 8), dv = v % (kMmaDim / 8);
-            *((float4*)&sh.qs[hh][dv * 8]) =
-                *((const float4*)(q + ((uint64_t)t * heads + h0 + hh) * kMmaDim) + dv);
+            *((float4*)&sh.qs[hh][dv * 8]) = h0 + hh < heads
+                ? *((const float4*)(q + ((uint64_t)t * heads + h0 + hh) * kMmaDim) + dv)
+                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
 
         const int winSlots = startPos == 0 ? min(seqlen, windowSize) : windowSize;
@@ -2384,12 +2450,14 @@ namespace {
 
         for (int v = threadIdx.x; v < kMmaHeads * kMmaNC; v += kMmaThreads) {
             const int row = v / kMmaNC, col = v % kMmaNC;
-            scores[(((uint64_t)t * heads + h0 + row) * tilesTotal + tile) * kMmaNC + col] = sh.sc[row][col];
+            if (h0 + row < heads) {
+                scores[(((uint64_t)t * heads + h0 + row) * tilesTotal + tile) * kMmaNC + col] = sh.sc[row][col];
+            }
         }
 #endif
     }
 
-    template <int VALUE_SPLITS, bool MATERIALIZED = false>
+    template <int VALUE_SPLITS, bool MATERIALIZED = false, bool BATCHED = false>
     __global__ void __launch_bounds__(kMmaThreads)
     V41SparseAttentionMmaKernel(const __nv_bfloat16 *q, const __nv_bfloat16 *chunkKV, const __nv_bfloat16 *ringKV,
                                 const __nv_bfloat16 *compressedKV, const uint8_t *ringKV8, const uint8_t *compressedKV8,
@@ -2397,13 +2465,21 @@ namespace {
                                 int windowSize, int cap, int topWidth, int startPos, float scale,
                                 __nv_bfloat16 *out,
                                 int ringMode, int ringRowBytes, int cmpMode, int cmpRowBytes, int vecUnpack,
-                                const float *scores = nullptr) {
+                                const float *scores = nullptr, const V41AttentionDescriptor *descriptors = nullptr) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
+        if constexpr (BATCHED) {
+            const auto &d = descriptors[blockIdx.x];
+            q=d.q; chunkKV=d.chunkKV; ringKV=d.ringKV; compressedKV=d.compressedKV;
+            ringKV8=d.ringKV8; compressedKV8=d.compressedKV8; cmpIdx=d.indices; out=d.output;
+            cap=d.cap; topWidth=d.topWidth; startPos=d.startPos; scores=d.scores;
+            ringMode=d.ringMode; ringRowBytes=d.ringRowBytes; cmpMode=d.cmpMode;
+            cmpRowBytes=d.cmpRowBytes; vecUnpack=d.vecUnpack;
+        }
         extern __shared__ char v41MmaSharedRaw[];
         using Shared = typename std::conditional<MATERIALIZED, V41MmaPvShared<VALUE_SPLITS>, V41MmaShared>::type;
         Shared &sh = *reinterpret_cast<Shared*>(v41MmaSharedRaw);
 
-        const int t = blockIdx.x;                       // b * seqlen + i
+        const int t = BATCHED ? 0 : blockIdx.x;                       // b * seqlen + i
         const int b = t / seqlen, i = t % seqlen;
         const int pos = startPos + i;
         const int h0 = blockIdx.y * kMmaHeads;
@@ -2413,8 +2489,9 @@ namespace {
         if constexpr (!MATERIALIZED) {
             for (int v = threadIdx.x; v < kMmaHeads * (kMmaDim / 8); v += kMmaThreads) {
                 int hh = v / (kMmaDim / 8), dv = v % (kMmaDim / 8);
-                *((float4*)&sh.qs[hh][dv * 8]) =
-                    *((const float4*)(q + ((uint64_t)t * heads + h0 + hh) * kMmaDim) + dv);
+                *((float4*)&sh.qs[hh][dv * 8]) = h0 + hh < heads
+                    ? *((const float4*)(q + ((uint64_t)t * heads + h0 + hh) * kMmaDim) + dv)
+                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
         }
         for (int r = threadIdx.x; r < kMmaHeads; r += kMmaThreads) {
@@ -2458,6 +2535,62 @@ namespace {
         for (int tile = 0; tile < tilesTotal; tile++) {
             const int tileStart = tile * kMmaNC;
             __syncthreads();
+            if constexpr (MATERIALIZED) {
+                // Distribute short value slices across threads, instead of
+                // reserving a mostly idle warp for each candidate. This only
+                // changes loads; probability rounding and PV order stay intact.
+            for (int item = threadIdx.x; item < kMmaNC * (loadDim / 16); item += kMmaThreads) {
+                const int slot = item / (loadDim / 16), vector = item % (loadDim / 16);
+                const int c = tileStart + slot;
+                const __nv_bfloat16 *src = nullptr;
+                const uint8_t *src8 = nullptr;
+                int src8Mode = 1;
+                bool ok = c < totalCand;
+                if (ok) {
+                    if (c < winSlots) {
+                        int p = winStart + c;
+                        if (p < 0 || p > pos) {
+                            ok = false;
+                        } else if (p >= startPos) {
+                            src = chunkKV + ((uint64_t)b * seqlen + (p - startPos)) * kMmaDim;
+                        } else if (ringKV8 != nullptr) {
+                            src8 = ringKV8 + ((uint64_t)b * windowSize + (p % windowSize)) * ringRowBytes;
+                            src8Mode = ringMode;
+                        } else {
+                            src = ringKV + ((uint64_t)b * windowSize + (p % windowSize)) * kMmaDim;
+                        }
+                    } else {
+                        int idx = idxRow[c - winSlots];
+                        if (idx < 0 || idx >= cap) {
+                            ok = false;
+                        } else if (compressedKV8 != nullptr) {
+                            src8 = compressedKV8 + ((uint64_t)b * cap + idx) * cmpRowBytes;
+                            src8Mode = cmpMode;
+                        } else {
+                            src = compressedKV + ((uint64_t)b * cap + idx) * kMmaDim;
+                        }
+                    }
+                }
+                __nv_bfloat16 *dst = &sh.kvs[slot][vector * 16];
+                if (!ok) {
+                    ((float4*)dst)[0] = make_float4(0.f,0.f,0.f,0.f);
+                    ((float4*)dst)[1] = make_float4(0.f,0.f,0.f,0.f);
+                } else if (src8 != nullptr) {
+                    if (vecUnpack) {
+                        V41LoadKvRow16Bf16(src8, kMmaDim, loadBase + vector * 16, src8Mode, dst);
+                    } else {
+                        #pragma unroll
+                        for (int j = 0; j < 16; ++j)
+                            dst[j] = __float2bfloat16_rn(V41LoadKvRow(
+                                src8, kMmaDim, loadBase + vector * 16 + j, src8Mode));
+                    }
+                } else {
+                    ((float4*)dst)[0] = ((const float4*)(src+loadBase+vector*16))[0];
+                    ((float4*)dst)[1] = ((const float4*)(src+loadBase+vector*16))[1];
+                }
+                if (vector == 0) sh.valid[slot] = ok ? 1 : 0;
+            }
+            } else {
             for (int slot = warp; slot < kMmaNC; slot += kMmaWarps) {
                 const int c = tileStart + slot;
                 const __nv_bfloat16 *src = nullptr;
@@ -2513,12 +2646,15 @@ namespace {
                     sh.valid[slot] = ok ? 1 : 0;
                 }
             }
+            }
             __syncthreads();
 
             if constexpr (MATERIALIZED) {
                 for (int v = threadIdx.x; v < kMmaHeads * kMmaNC; v += kMmaThreads) {
                     const int row = v / kMmaNC, col = v % kMmaNC;
-                    sh.sc[row][col] = scores[(((uint64_t)t * heads + h0 + row) * tilesTotal + tile) * kMmaNC + col];
+                    sh.sc[row][col] = h0 + row < heads
+                        ? scores[(((uint64_t)t * heads + h0 + row) * tilesTotal + tile) * kMmaNC + col]
+                        : 0.0f;
                 }
                 __syncthreads();
             } else {
@@ -2615,19 +2751,22 @@ namespace {
         const int outRow0 = pvM * 16 + (lane >> 2);
         const int outRow1 = outRow0 + 8;
         const int outCol = valueBase + pvSlice * kMmaDimSlice + (lane & 3) * 2;
-        const float denom0 = sh.lsum[outRow0] + expf(sink[h0 + outRow0] - sh.mx[outRow0]);
-        const float inv0 = 1.0f / denom0;
-        const float denom1 = sh.lsum[outRow1] + expf(sink[h0 + outRow1] - sh.mx[outRow1]);
-        const float inv1 = 1.0f / denom1;
+        const bool valid0 = h0 + outRow0 < heads, valid1 = h0 + outRow1 < heads;
+        const float inv0 = valid0 ? 1.0f / (sh.lsum[outRow0] + expf(sink[h0 + outRow0] - sh.mx[outRow0])) : 0.0f;
+        const float inv1 = valid1 ? 1.0f / (sh.lsum[outRow1] + expf(sink[h0 + outRow1] - sh.mx[outRow1])) : 0.0f;
         __nv_bfloat16 *o0 = out + ((uint64_t)t * heads + h0 + outRow0) * kMmaDim;
         __nv_bfloat16 *o1 = out + ((uint64_t)t * heads + h0 + outRow1) * kMmaDim;
 #pragma unroll
         for (int n = 0; n < kMmaPvTiles; n++) {
             int d = outCol + n * 8;
-            o0[d] = __float2bfloat16_rn(acc[n][0] * inv0);
-            o0[d + 1] = __float2bfloat16_rn(acc[n][1] * inv0);
-            o1[d] = __float2bfloat16_rn(acc[n][2] * inv1);
-            o1[d + 1] = __float2bfloat16_rn(acc[n][3] * inv1);
+            if (valid0) {
+                o0[d] = __float2bfloat16_rn(acc[n][0] * inv0);
+                o0[d + 1] = __float2bfloat16_rn(acc[n][1] * inv0);
+            }
+            if (valid1) {
+                o1[d] = __float2bfloat16_rn(acc[n][2] * inv1);
+                o1[d + 1] = __float2bfloat16_rn(acc[n][3] * inv1);
+            }
         }
 #endif
     }
@@ -2923,17 +3062,43 @@ extern "C" bool FastllmCudaDeepSeekV41HcMix(const fastllm::Data &x, fastllm::Dat
     hcFn.ToDevice(DataDevice::CUDA);
     hcScale.ToDevice(DataDevice::CUDA);
     hcBase.ToDevice(DataDevice::CUDA);
-    if (tokens >= 1 && tokens <= 8 && hcMult == 4 && !V41EnvOn("FASTLLM_DSV41_LEGACY_HCMIX") &&
+    if (tokens >= 1 && hcMult == 4 && !V41EnvOn("FASTLLM_DSV41_LEGACY_HCMIX") &&
         !V41EnvOn("FASTLLM_DSV41_LEGACY_HCMIX_DECODE")) {
         Data scratch;
         if (!V41PrepareOutput(scratch, DataType::FLOAT32, {tokens, 25})) return false;
         float *mix = (float *)scratch.cudaData;
+        if (tokens > 192) {
+            const int blocks = (tokens + kHcTokens - 1) / kHcTokens;
+            if (x.dataType == DataType::BFLOAT16)
+                V41HcMixKernelMulti<__nv_bfloat16, 4, true><<<blocks, kHcThreads>>>(
+                    (const __nv_bfloat16 *)x.cudaData, (const float *)hcFn.cudaData,
+                    nullptr, nullptr, tokens, dim, sinkhornIters, eps, normEps,
+                    nullptr, nullptr, nullptr, mix);
+            else if (x.dataType == DataType::FLOAT16)
+                V41HcMixKernelMulti<half, 4, true><<<blocks, kHcThreads>>>(
+                    (const half *)x.cudaData, (const float *)hcFn.cudaData,
+                    nullptr, nullptr, tokens, dim, sinkhornIters, eps, normEps,
+                    nullptr, nullptr, nullptr, mix);
+            else
+                V41HcMixKernelMulti<float, 4, true><<<blocks, kHcThreads>>>(
+                    (const float *)x.cudaData, (const float *)hcFn.cudaData,
+                    nullptr, nullptr, tokens, dim, sinkhornIters, eps, normEps,
+                    nullptr, nullptr, nullptr, mix);
+        } else if (tokens >= 16) {
+            if (x.dataType == DataType::BFLOAT16)
+                V41HcBatchDots<<<dim3(25, (tokens + 3) / 4), kHcThreads>>>((const __nv_bfloat16 *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, tokens, mix);
+            else if (x.dataType == DataType::FLOAT16)
+                V41HcBatchDots<<<dim3(25, (tokens + 3) / 4), kHcThreads>>>((const half *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, tokens, mix);
+            else
+                V41HcBatchDots<<<dim3(25, (tokens + 3) / 4), kHcThreads>>>((const float *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, tokens, mix);
+        } else {
         if (x.dataType == DataType::BFLOAT16)
             V41HcDecodeDots<<<dim3(25, tokens), kHcThreads>>>((const __nv_bfloat16 *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
         else if (x.dataType == DataType::FLOAT16)
             V41HcDecodeDots<<<dim3(25, tokens), kHcThreads>>>((const half *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
         else
             V41HcDecodeDots<<<dim3(25, tokens), kHcThreads>>>((const float *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
+        }
         V41HcDecodeFinish<<<tokens, 32>>>(mix, (const float *)hcScale.cudaData, (const float *)hcBase.cudaData,
             hcMult * dim, sinkhornIters, eps, normEps, (float *)pre.cudaData, (float *)post.cudaData, (float *)comb.cudaData);
         return V41CheckLaunch("HcMixDecode");
@@ -3496,7 +3661,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                                                       fastllm::Data &output) {
     if (V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") && FastllmCudaV41ReferenceAttention(q,chunkKV,ringKV,compressedKV,cmpIdx,attnSink,windowSize,startPos,softmaxScale,output)) return true;
     if (!V41OnCuda(q) || !V41OnCuda(chunkKV) || q.dims.size() != 4 || chunkKV.dims.size() != 3 ||
-        q.dims[3] != 512 || q.dims[2] % kAttnHeadsPerBlock != 0 || chunkKV.dataType != DataType::BFLOAT16 ||
+        q.dims[3] != 512 || q.dims[2] <= 0 || chunkKV.dataType != DataType::BFLOAT16 ||
         (q.dataType != DataType::BFLOAT16 && q.dataType != DataType::FLOAT32)) {
         return false;
     }
@@ -3566,10 +3731,12 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
 
     // BF16 mma 快速路径（SM80+，head_dim 512，q 为 BF16）。
     // FASTLLM_DSV41_LEGACY_ATTN=1 可退回下面的 FP32 标量 kernel 做对比 / 排查。
-    if (q.dataType == DataType::BFLOAT16 && dim == kMmaDim && heads % kMmaHeads == 0 &&
+    // Tail heads are zero-padded inside the tile; only real heads read/write
+    // global Q, scores, sinks and output. In particular TP8 has eight heads.
+    if (q.dataType == DataType::BFLOAT16 && dim == kMmaDim &&
         !V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN")) {
         const int tokens = bsz * seqlen;
-        const int headBlocks = heads / kMmaHeads;
+        const int headBlocks = (heads + kMmaHeads - 1) / kMmaHeads;
         bool launched = false;
         auto launch = [&](auto splitTag) {
             constexpr int splits = decltype(splitTag)::value;
@@ -3577,7 +3744,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
             const int candidateTiles = ((startPos == 0 ? std::min(seqlen, windowSize) : windowSize) + topWidth + 63) / 64;
             const uint64_t scratchBytes = (uint64_t)tokens * heads * candidateTiles * 64 * sizeof(float);
             if (tokens == 1 && candidateTiles >= 4 && scratchBytes <= 4 * 1024 * 1024 &&
-                V41MmaKernelReady<V41SparseAttentionScoresKernel, kMmaThreads, sizeof(V41MmaShared)>() &&
+                V41MmaKernelReady<V41SparseAttentionScoresKernel<>, kMmaThreads, sizeof(V41MmaShared)>() &&
                 V41MmaKernelReady<V41SparseAttentionMmaKernel<splits, true>, kMmaThreads, sizeof(PvShared)>()) {
                 void *allocation = nullptr;
                 const auto allocated = FastllmCudaTryMalloc(&allocation, scratchBytes);
@@ -3593,7 +3760,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                         }
                     } scratch{scores};
                     launched = true;
-                    V41SparseAttentionScoresKernel<<<dim3(tokens, headBlocks, candidateTiles), kMmaThreads, sizeof(V41MmaShared)>>>(
+                    V41SparseAttentionScoresKernel<><<<dim3(tokens, headBlocks, candidateTiles), kMmaThreads, sizeof(V41MmaShared)>>>(
                         (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
                         hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
                         hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
@@ -3648,7 +3815,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
         if (FastllmCudaGetThreadError()) return false;
         auto launchScalar = [&](auto headTag, auto padTag, auto valueTag) {
             constexpr int headGroup = decltype(headTag)::value;
-            dim3 grid(bsz * seqlen, heads / headGroup, decltype(valueTag)::value);
+            dim3 grid(bsz * seqlen, (heads + headGroup - 1) / headGroup, decltype(valueTag)::value);
             V41SparseAttentionKernel<__nv_bfloat16, headGroup, decltype(padTag)::value, decltype(valueTag)::value><<<grid, headGroup * kAttnLanes>>>(
                 (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
                 hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
@@ -3665,7 +3832,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
         if (smallDecode) launchScalar(std::integral_constant<int, 8>{}, std::true_type{}, std::integral_constant<int, 8>{});
         else launchScalar(std::integral_constant<int, kAttnHeadsPerBlock>{}, std::false_type{}, std::integral_constant<int, 1>{});
     } else {
-        dim3 grid(bsz * seqlen, heads / kAttnHeadsPerBlock);
+        dim3 grid(bsz * seqlen, (heads + kAttnHeadsPerBlock - 1) / kAttnHeadsPerBlock);
         V41SparseAttentionKernel<float><<<grid, kAttnThreads>>>(
             (const float*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
             hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
