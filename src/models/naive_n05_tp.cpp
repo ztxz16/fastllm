@@ -290,11 +290,17 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
                             "Naive TP: cannot split attention sinks.");
         }
         if (!slidingLayers[layer]) {
-            for (const char *name : {"wq.weight", "wk.weight", "weights_proj.weight", "k_norm.weight", "k_norm.bias"})
-                replicate(ap + "indexer." + name);
+            for (const char *name : {"wq.weight", "wk.weight", "weights_proj.weight", "k_norm.weight", "k_norm.bias"}) {
+                if (indexerLayerSharding)
+                    AssertInFastLLM(PlaceMultiCudaWeightOnDevice(weight[ap + "indexer." + name],
+                        tpDevices, tpDevices[IndexerOwnerRank(layer)]), "Indexer weight placement failed.");
+                else replicate(ap + "indexer." + name);
+            }
 #ifndef USE_ROCM
             const int previousDevice = FastllmCudaGetDevice();
-            for (int device : tpDevices) {
+            for (int rank = 0; rank < ranks; ++rank) {
+                if (!HasLocalIndexer(layer, rank)) continue;
+                const int device = tpDevices[rank];
                 FastllmCudaSetDevice(device);
                 FastllmCudaPackIndexerWeights(*weight[ap + "indexer.wq.weight"].multiDeviceDatas.at(device),
                     *weight[ap + "indexer.wk.weight"].multiDeviceDatas.at(device),
@@ -488,7 +494,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
             root.dataDeviceIds = tpDevices;
             for (int rank = 0; rank < ranks; ++rank) {
                 const int localWidth = std::max(1, cfg.kvHeads / ranks) * (part ? cfg.valueDim : cfg.headDim) +
-                                       (!part && !slidingLayers[layer] ? IndexerCacheWidth(kvCacheDataType) : 0);
+                                       (!part ? LocalIndexerCacheWidth(layer, rank) : 0);
                 auto *local = new Data(kvCacheDataType);
                 local->FakeFrom(backing[rank], ((size_t)row * 2 + part) * 256 * maxWidth * backing[rank].unitSize);
                 local->Resize({1, 2, localWidth});
@@ -501,7 +507,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
                     local->pageLen = tpPagedCaches[rank][layer * 2 + part]->pageLen;
                     local->pagedKVCacheData = tpPagedCaches[rank][layer * 2 + part].get();
                 }
-                local->kvCacheFp8Indexer = root.kvCacheFp8Indexer;
+                local->kvCacheFp8Indexer = root.kvCacheFp8Indexer && HasLocalIndexer(layer, rank);
                 root.multiDeviceDatas[tpDevices[rank]] = local;
             }
         }
@@ -653,7 +659,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
                                 if (it == root.multiDeviceDatas.end() || !it->second) return false;
                                 Data &local = *it->second;
                                 const int localWidth = std::max(1, cfg.kvHeads / ranks) *
-                                    (part ? cfg.valueDim : cfg.headDim) + (!part && !slidingLayers[layer] ? IndexerCacheWidth(kvCacheDataType) : 0);
+                                    (part ? cfg.valueDim : cfg.headDim) + (!part ? LocalIndexerCacheWidth(layer, rank) : 0);
                                 if (!local.cudaData || local.dataDevice != DataDevice::CUDA ||
                                     (uintptr_t)local.cudaData % 16 != 0 || local.strides.size() != 3 ||
                                     local.strides[1] != localWidth || local.strides[2] != 1 ||
@@ -714,7 +720,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
                 if (slidingLayers[layer]) continue;
                 for (int row = 0; row < rows; ++row) {
                     const size_t slot = ((size_t)row * block_cnt + layer) * ranks * 2 + rank * 2;
-                    const int stride = std::max(1, full.kvHeads / ranks) * full.headDim + IndexerCacheWidth(kvCacheDataType);
+                    const int stride = std::max(1, full.kvHeads / ranks) * full.headDim + LocalIndexerCacheWidth(layer, rank);
                     if (!FastllmCudaNaiveEncodeDSAMaps(storage.hostMaps.data() +
                             ((size_t)layer * storage.maxRows + row) * FastllmNaiveDSAMapBytes,
                             pointers[slot], pointers[slot + 1],
@@ -1270,17 +1276,22 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     for (int layer = 0; layer < block_cnt; ++layer) {
         for (Data *cache : {&key(sequence, layer), &value(sequence, layer)}) {
             cache->kvCacheFp8Indexer = cache == &key(sequence, layer) && !slidingLayers[layer] && fp8IndexerCache;
-            for (auto &entry : cache->multiDeviceDatas) entry.second->kvCacheFp8Indexer = cache->kvCacheFp8Indexer;
+            const int owner = indexerLayerSharding && !slidingLayers[layer]
+                ? tpDevices[IndexerOwnerRank(layer)] : -1;
+            for (auto &entry : cache->multiDeviceDatas)
+                entry.second->kvCacheFp8Indexer = cache->kvCacheFp8Indexer &&
+                    (!indexerLayerSharding || entry.first == owner);
             if (cache->multiDeviceData && cache->dataDevice == DataDevice::CUDA) continue;
             AssertInFastLLM(cache->dims.empty(), "Naive TP does not restore CPU KV archives.");
             cache->dataDevice = DataDevice::CUDA;
             cache->multiDeviceData = true;
             cache->dataDeviceIds = tpDevices;
             cache->isKVCache = true;
-            for (int device : tpDevices) {
+            for (int rank = 0; rank < (int)tpDevices.size(); ++rank) {
+                const int device = tpDevices[rank];
                 if (cache->multiDeviceDatas.count(device)) continue;
                 Data *local = new Data(kvCacheDataType);
-                local->kvCacheFp8Indexer = cache->kvCacheFp8Indexer;
+                local->kvCacheFp8Indexer = cache->kvCacheFp8Indexer && HasLocalIndexer(layer, rank);
                 local->dataDevice = DataDevice::CUDA;
                 local->dataDeviceIds = {device};
                 local->isKVCache = true;
@@ -1481,7 +1492,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         // Graph preparation already validates every rank's existing capacity.
         // Eager paths must finish all KV allocations before any collective, so
         // one exhausted rank cannot leave the others waiting in all-reduce.
-        struct Reservation { Data *cache; int capacity, width; };
+        struct Reservation { Data *cache; int capacity, width, indexerLayer; };
         std::vector<Reservation> reservations;
         for (int sequence = 0; sequence < sequences; ++sequence) {
             const int length = batch ? batch->lengths[sequence] : inputIds.dims[1];
@@ -1496,10 +1507,10 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                     if (cache->expansionDims.size() == 3 && cache->expansionDims[1] >= wanted) continue;
                     const bool isValue = cache == &value(sequence, layer);
                     const int width = std::max(1, cfg.kvHeads / (int)tpDevices.size()) *
-                        (isValue ? cfg.valueDim : cfg.headDim) +
-                        (!isValue && !slidingLayers[layer] ? IndexerCacheWidth(kvCacheDataType) : 0);
+                        (isValue ? cfg.valueDim : cfg.headDim);
                     reservations.push_back({cache,
-                        (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128), width});
+                        (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128), width,
+                        isValue ? -1 : layer});
                 }
             }
         }
@@ -1516,7 +1527,8 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             FastllmCudaSetDevice(tpDevices[rank]);
             if (growScratch) PrepareSwaPrefillWorkspace(rank, prefillLength);
             for (const auto &item : reservations)
-                ReserveCache(*item.cache->multiDeviceDatas.at(tpDevices[rank]), item.capacity, item.width);
+                ReserveCache(*item.cache->multiDeviceDatas.at(tpDevices[rank]), item.capacity,
+                    item.width + (item.indexerLayer < 0 ? 0 : LocalIndexerCacheWidth(item.indexerLayer, rank)));
         });
     }
     if (graphDecode)

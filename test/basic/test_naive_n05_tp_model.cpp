@@ -133,7 +133,8 @@ class Fixture : public NaiveN05FlashModel {
         }
         return NaiveN05FlashModel::Forward(inputIds, attentionMask, positionIds, kv, config, lastTokens, logits);
     }
-    explicit Fixture(int ranks, bool packed = false, bool graph = false, bool swaRing = false, bool serving = false) : ranks(ranks) {
+    explicit Fixture(int ranks, bool packed = false, bool graph = false, bool swaRing = false,
+                     bool serving = false, bool secondDsa = false) : ranks(ranks) {
         setenv("FASTLLM_TP", ranks > 1 ? std::to_string(ranks).c_str() : "false", 1);
         deviceMap = {{"cuda:0", 1}};
         moeDeviceMap = deviceMap;
@@ -171,6 +172,10 @@ class Fixture : public NaiveN05FlashModel {
             weight.dicts["head_dim"] = "192";
             weight.dicts["v_head_dim"] = "128";
             weight.dicts["moe_layer_freq"] = "[0,0]";
+        }
+        if (secondDsa) {
+            weight.dicts["hybrid_layer_pattern"] = "[0,0]";
+            weight.dicts["indexer_activation_dtype"] = "fp8";
         }
         InitParams();
         SetSaveHistoryChat(false);
@@ -222,7 +227,7 @@ class Fixture : public NaiveN05FlashModel {
         for (int i = 0; i < 2; ++i) {
             auto p = "model.layers." + std::to_string(i);
             auto ap = p + ".self_attn.";
-            const int heads = (i && swaRing) || serving ? 64 : 16, kv = i ? 8 : 4;
+            const int heads = (i && swaRing) || serving ? 64 : 16, kv = i && !secondDsa ? 8 : 4;
             const int dim = (i && swaRing) || serving ? 192 : 32, valueDim = (i && swaRing) || serving ? 128 : 16;
             add(p + ".input_layernorm.weight", {256}, FLOAT32, 0, true);
             add(p + ".post_attention_layernorm.weight", {256}, FLOAT32, 0, true);
@@ -752,6 +757,87 @@ class Fixture : public NaiveN05FlashModel {
             throw std::runtime_error("paged growth coverage or graph capture changed");
         std::cout << "SERVING PAGE GROWTH PASS exact_logits=" << reference.size()
                   << " growth_steps=" << growthSteps << " serving_captures=0" << std::endl;
+    }
+    std::vector<float> IndexerStorageRun(bool sharded, bool graph) {
+        SetIndexerTPStorage(sharded);
+        maxBatch = 4; SetMaxTokens(65536); SetChunkedPrefillSize(4096); WarmUp();
+        struct AsyncCollectives {
+            bool previous = FastllmCudaGetNcclForceSync();
+            AsyncCollectives() { FastllmCudaSetNcclForceSync(false); }
+            ~AsyncCollectives() { FastllmCudaSetNcclForceSync(previous); }
+        } asyncCollectives;
+        const int captures = verifyGraphCaptures, launches = verifyGraphLaunches;
+        std::vector<float> result;
+        GenerationConfig config;
+        config.top_k = 1; config.repeat_penalty = 1; config.output_logits = true;
+        config.output_token_limit = 160;
+        std::vector<std::vector<std::pair<Data, Data>>> cache(4);
+        std::vector<int> past(4);
+        for (int row = 0; row < 4; ++row) {
+            for (int layer = 0; layer < block_cnt; ++layer)
+                cache[row].emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
+            // Chunk boundaries, the 2048 Indexer transition, and nonaligned
+            // page ends all appear before the mixed-length decode batch.
+            for (int length : {127, 129, 1791 + row * 19}) {
+                std::vector<float> ids(length), positions(length), logits;
+                for (int i = 0; i < length; ++i) {
+                    positions[i] = past[row] + i;
+                    ids[i] = ((past[row] + i) * 3 + row) % 251;
+                }
+                Forward(Data(FLOAT32, {1, length}, ids), Data(), Data(FLOAT32, {1, length}, positions),
+                        cache[row], config, LastTokensManager(), &logits);
+                result.insert(result.end(), logits.begin(), logits.end());
+                past[row] += length;
+            }
+        }
+        for (int step = 0; step < 136; ++step) {
+            const int count = step % 4 + 1;
+            std::vector<float> ids(count);
+            std::vector<Data> positions(count);
+            std::vector<Data *> pos;
+            std::vector<std::pair<Data *, Data *>> kv;
+            std::vector<std::vector<float>> logits(count);
+            std::vector<std::vector<float> *> output;
+            std::vector<GenerationConfig> configs(count, config);
+            std::vector<int> lengths(count, 1), requests;
+            for (int row = 0; row < count; ++row) {
+                const int request = (step + row) % 4;
+                requests.push_back(request);
+                ids[row] = (past[request] * 3 + request) % 251;
+                positions[row].CopyFrom(Data(FLOAT32, {1, 1}, {(float)past[request]}));
+                pos.push_back(&positions[row]); output.push_back(&logits[row]);
+                for (auto &layer : cache[request]) kv.emplace_back(&layer.first, &layer.second);
+            }
+            ForwardBatch(count, Data(FLOAT32, {1, count}, ids), {}, pos, lengths, kv,
+                         configs, LastTokensManager(), &output);
+            for (int row = 0; row < count; ++row) {
+                result.insert(result.end(), logits[row].begin(), logits[row].end());
+                ++past[requests[row]];
+            }
+        }
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            const auto &key = cache[0][layer].first;
+            const int owner = layer % ranks;
+            const int ownerWidth = key.multiDeviceDatas.at(owner)->dims[2];
+            const int tail = kvCacheDataType == FP8_E4M3 ? 144 : 72;
+            const int indexWidth = key.multiDeviceDatas.at(owner)->kvCacheFp8Indexer ? tail : 128;
+            for (int rank = 0; rank < ranks; ++rank) {
+                const auto &local = *key.multiDeviceDatas.at(rank);
+                const int expected = ownerWidth - (sharded && rank != owner ? indexWidth : 0);
+                if (local.dims[2] != expected || !local.isPagedKVCache ||
+                    local.pagedKVCacheData->dims.back() != expected)
+                    throw std::runtime_error("Indexer shard cache width is incorrect");
+            }
+            const auto &weights = weight["model.layers." + std::to_string(layer) +
+                ".self_attn.indexer.wq.weight"].multiDeviceDatas;
+            if (weights.size() != (sharded ? 1 : ranks) || !weights.count(owner))
+                throw std::runtime_error("Indexer weight copies were not reduced");
+        }
+        if (verifyGraphCaptures != captures || (graph && verifyGraphLaunches == launches))
+            throw std::runtime_error("Indexer storage graph replay/capture mismatch");
+        std::cout << "INDEXER STORAGE RUN shard=" << sharded << " graph=" << graph
+                  << " logits=" << result.size() << " launches=" << verifyGraphLaunches - launches << std::endl;
+        return result;
     }
     void RingGraphToggleChecks(bool initialGraph) {
         int checks = 0, graphLaunches = 0;
@@ -1927,10 +2013,33 @@ int main(int argc, char **argv) {
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (argc > 2 && std::string(argv[2]) == "indexer_storage") {
+            SetCudaEmbedding(true);
+            const bool graph = argc <= 5 || std::string(argv[5]) != "eager";
+            SetCudaGraph(graph);
+            std::vector<float> reference;
+            for (bool shard : {false, true}) {
+                Fixture fixture(ranks, false, true, true, true, true);
+                if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+                if (argc > 4 && std::string(argv[4]) == "fp8") fixture.SetIndexerDataType(FP8_E4M3);
+                auto result = fixture.IndexerStorageRun(shard, graph);
+                if (!shard) reference = std::move(result);
+                else {
+                    if (reference.size() != result.size()) throw std::runtime_error("Indexer storage logits missing");
+                    RequireCloseLogits(result.data(), reference, "Indexer layer storage changed logits");
+                    size_t exact = 0;
+                    for (size_t i = 0; i < result.size(); ++i) exact += result[i] == reference[i];
+                    std::cout << "INDEXER STORAGE PASS ranks=" << ranks << " exact=" << exact
+                              << "/" << result.size() << " relative=" << largestLogitRelative << std::endl;
+                }
+            }
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "serving_page_growth") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            if (argc > 4 && std::string(argv[4]) == "layer_shard") fixture.SetIndexerTPStorage(true);
             fixture.ServingPageGrowthChecks();
             return 0;
         }
@@ -1945,6 +2054,7 @@ int main(int argc, char **argv) {
             Fixture fixture(ranks, false, true, true, true);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
             if (argc > 4 && std::string(argv[4]) == "fp8") fixture.SetIndexerDataType(FP8_E4M3);
+            if (argc > 5 && std::string(argv[5]) == "layer_shard") fixture.SetIndexerTPStorage(true);
             fixture.HistoryServingChecks();
             return 0;
         }

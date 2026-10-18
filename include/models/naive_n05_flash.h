@@ -23,6 +23,7 @@ namespace fastllm {
         ~NaiveN05FlashModel() override;
         void InitParams() override;
         void SetIndexerDataType(DataType dataType) override;
+        void SetIndexerTPStorage(bool shardByLayer);
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &names) override;
         int Forward(const Data &inputIds, const Data &attentionMask,
@@ -278,8 +279,19 @@ namespace fastllm {
         float partialRotary = 0.334f, valueScale = 0.707f;
         bool indexFp8 = true;
         bool fp8IndexerCache = false;
+        bool indexerLayerSharding = false;
+        int IndexerOwnerRank(int layer) const {
+            return std::count(slidingLayers.begin(), slidingLayers.begin() + layer, 0) % tpDevices.size();
+        }
+        bool HasLocalIndexer(int layer, int rank) const {
+            return !slidingLayers[layer] &&
+                (!indexerLayerSharding || rank < 0 || rank == IndexerOwnerRank(layer));
+        }
         int IndexerCacheWidth(DataType type) const {
             return fp8IndexerCache ? 144 / (type == FP8_E4M3 ? 1 : 2) : indexDim;
+        }
+        int LocalIndexerCacheWidth(int layer, int rank) const {
+            return HasLocalIndexer(layer, rank) ? IndexerCacheWidth(kvCacheDataType) : 0;
         }
         std::vector<std::vector<Data *>> moeWeights, moeBiases;
     };

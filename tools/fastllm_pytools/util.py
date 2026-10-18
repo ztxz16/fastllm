@@ -962,6 +962,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--indexer_dtype', choices=['auto', 'fp8', 'fp8_e4m3'], default='auto',
                         help='Naive DSA Indexer 类型；fp8 独立量化 Indexer Q/K 并压缩 K 缓存，auto 保持模型默认路径')
+    parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard'], default='replicated',
+                        help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；默认各卡复制')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3（含 Naive N0.5 CUDA）或fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kvmem', type=str, default=None,
@@ -1878,6 +1880,14 @@ def make_normal_llm_model(args, startup_progress = None):
     os.environ["FASTLLM_CUDAPP_SERIAL"] = "1" if raw_main_device.lower().startswith("cudapp=") else "0"
 
     tp_arg = getattr(args, "tp", "")
+    indexer_storage = getattr(args, "indexer_tp_storage", "replicated")
+    if indexer_storage not in ("replicated", "layer_shard"):
+        raise ValueError("indexer_tp_storage must be replicated or layer_shard")
+    if indexer_storage == "layer_shard":
+        if not is_naive_n05_model:
+            raise ValueError("Indexer layer_shard storage currently supports Naive DSA models only")
+        if _thread_tp_cuda_device_count(tp_arg or os.environ.get("FASTLLM_TP", "")) < 2:
+            raise ValueError("Indexer layer_shard storage requires --tp with at least two CUDA devices")
     if (tp_arg != ""):
         os.environ["FASTLLM_TP"] = tp_arg
         if (_uses_thread_tp(tp_arg)):
@@ -2051,7 +2061,8 @@ def make_normal_llm_model(args, startup_progress = None):
                             mmproj_path = args.mmproj,
                             max_context_length = -1 if legacy_context_limit else max_context_length,
                             rope_scaling = rope_scaling,
-                            indexer_dtype = getattr(args, "indexer_dtype", "auto"))
+                            indexer_dtype = getattr(args, "indexer_dtype", "auto"),
+                            indexer_tp_storage = indexer_storage)
         if hybrid_auto_plan is not None:
             model.hybrid_auto_plan = hybrid_auto_plan
         llm.report_model_load_progress("weights_finalize", 0, 1)

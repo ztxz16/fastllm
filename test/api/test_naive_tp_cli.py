@@ -37,7 +37,24 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
                 self.native_env = dict(os.environ)
             fake.llm.set_cuda_slab.assert_called_once_with(args.cuda_slab)
             self.loaded_model = fake.llm.model.return_value
+            self.model_options = fake.llm.model.call_args.kwargs
             return args
+
+    def test_indexer_tp_storage(self):
+        self.configure(['--tp', '8'])
+        self.assertEqual(self.model_options['indexer_tp_storage'], 'replicated')
+        for options, saved in [(['--tp', '8', '--indexer_tp_storage', 'layer_shard'], None),
+                               ([], {'tp': '4', 'indexer_tp_storage': 'layer_shard'})]:
+            with self.subTest(saved=saved):
+                self.configure(options, saved=saved)
+                self.assertEqual(self.model_options['indexer_tp_storage'], 'layer_shard')
+        for options, model, saved in [([], 'naive_n05_flash', None),
+                                      (['--tp', '1'], 'naive_n05_flash', None),
+                                      (['--tp', '8'], 'llama', None),
+                                      (['--tp', '8'], 'naive_n05_flash', {'indexer_tp_storage': 'invalid'})]:
+            with self.subTest(options=options, model=model), self.assertRaisesRegex(ValueError, '[Ii]ndexer'):
+                self.configure(options + ([] if saved else ['--indexer_tp_storage', 'layer_shard']),
+                               model_type=model, saved=saved)
 
     def test_prefill_batching_cli_and_saved_settings(self):
         for options, saved in [(['--tp', '8', '--prefill_batch_tokens', '16384',
