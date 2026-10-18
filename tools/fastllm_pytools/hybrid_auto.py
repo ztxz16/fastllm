@@ -362,12 +362,73 @@ def is_lookup_table(name):
             "engram" in name and "embedding" in name)
 
 
+def _is_routed_expert(name):
+    return "_exps." in name or bool(re.search(r"\.experts\.(?:\d+\.|(?:gate|up|down|gate_up)_proj)", name))
+
+
+def _packed_fp4_sizes(tensors, args):
+    """Packed payload plus runtime scales/padding, without reading weight data.
+
+    Follow the loader's scale-name priority and recognize only validated native
+    layouts. Unknown layouts and explicit precision conversions keep the existing
+    conservative conversion budget in weight_costs.
+    """
+    by_name = {t.name: t for t in tensors}
+    sizes = {}
+    for weight in tensors:
+        if weight.kind not in ("U8", "I8") or not weight.name.endswith(".weight") or len(weight.shape) < 2:
+            continue
+        expert = _is_routed_expert(weight.name)
+        shared = "_shexp." in weight.name or ".shared_experts." in weight.name
+        dtype = (args.moe_dtype or args.dtype) if expert or shared else args.dtype
+        if dtype not in ("auto", "nvfp4"):
+            continue
+        prefix = weight.name[:-len(".weight")]
+        candidates = (weight.name + "_scale_inv", weight.name + "_scale",
+                      prefix + ".scale_inv", prefix + ".scale")
+        scale = next((by_name[n] for n in candidates if n in by_name), None)
+        if scale is None or scale.kind not in ("F8_E8M0", "U8", "F8_E4M3") or len(scale.shape) < 2:
+            continue
+        if (min(*weight.shape, *scale.shape) <= 0 or
+                weight.bytes != math.prod(weight.shape) or scale.bytes != math.prod(scale.shape)):
+            continue
+        rows, columns = math.prod(weight.shape[:-1]), weight.shape[-1] * 2
+        scale_rows, scale_columns = math.prod(scale.shape[:-1]), scale.shape[-1]
+        if rows % scale_rows or columns % scale_columns:
+            continue
+        block_rows, block_columns = rows // scale_rows, columns // scale_columns
+        if block_rows & (block_rows - 1) or block_columns & (block_columns - 1) or block_columns < 16:
+            continue
+        # Raw U8 scales are E8M0 only for the loader's exact MXFP4 shape.
+        if scale.kind == "U8" and not (len(weight.shape) == len(scale.shape) == 2 and
+                                       block_rows == 1 and block_columns == 32):
+            continue
+        blocks16 = (columns + 15) // 16
+        if scale.kind == "F8_E4M3":
+            if block_columns != 16:
+                continue
+            # E4M3 can use compact byte scales + an aligned row-global FP32
+            # multiplier, or 4-byte block scales on CPU/older CUDA devices.
+            # The same costs feed both host and GPU placement: cover both.
+            compact_row = (4 + blocks16 * 9 + 3) // 4 * 4
+            row_bytes = max(compact_row, blocks16 * 12)
+        else:
+            # Native block32 uses 17 bytes/32 values. Keep the 9-byte block16
+            # fallback bound as CPU capabilities/overrides are not queried here.
+            # It also covers scale replication when source rows share a scale.
+            row_bytes = blocks16 * 9
+        sizes[weight.name] = max(weight.bytes + scale.bytes, rows * row_bytes)
+        sizes[scale.name] = 0  # Already included, even if the header lists it first.
+    return sizes
+
+
 def weight_costs(tensors, model, args):
     """Expert bytes by layer, replicated dense upper bounds and host tables."""
     expert = [0] * len(model.kv)
     dense = [0] * len(model.kv)
     common, host, largest = 0, 0, 0
     snapshot = False
+    packed_sizes = _packed_fp4_sizes(tensors, args)
     for tensor in tensors:
         name = tensor.name
         match = re.search(r"(?:^blk\.|(?:^|\.)layers\.)(\d+)\.", name)
@@ -379,7 +440,7 @@ def weight_costs(tensors, model, args):
             layer = model.layers
         if layer is not None and layer >= len(dense):
             raise ValueError("Hybrid auto: tensor layer outside model")
-        is_expert = "_exps." in name or bool(re.search(r"\.experts\.(?:\d+\.|(?:gate|up|down|gate_up)_proj)", name))
+        is_expert = _is_routed_expert(name)
         is_shared = "_shexp." in name or ".shared_experts." in name
         size = tensor.bytes
         if is_expert and tensor.kind in ("gguf:13", "gguf:14"):
@@ -403,11 +464,13 @@ def weight_costs(tensors, model, args):
                 raise ValueError("Hybrid auto: unsupported HF target weight precision " + dtype)
             # Norms/scales retain source precision. Compressed FP8/NVFP4
             # sources and their scale tensors are budgeted from their headers.
-            if tensor.kind in ("F16", "BF16", "F32"):
+            if name in packed_sizes:
+                size = packed_sizes[name]
+            elif tensor.kind in ("F16", "BF16", "F32"):
                 size = max(size, math.prod(tensor.shape) * (4 if dtype == "float32" else 2))
             elif tensor.kind in ("U8", "I8"):
-                # Packed FP4 stores two values per byte. Include expansion to
-                # the requested precision, or the compact runtime block layout.
+                # Unknown packed layouts retain the conservative bound. Explicit
+                # conversions count two unpacked values per stored byte.
                 size *= 8 if dtype == "float32" else 4 if dtype in ("float16", "bfloat16") else 2
             elif tensor.kind in ("F8_E4M3", "F8_E4M3FN", "F8_E5M2", "F8_E8M0"):
                 if dtype in ("float16", "bfloat16", "float32") or (dtype == "auto" and not is_expert):

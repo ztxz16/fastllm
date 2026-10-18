@@ -82,6 +82,8 @@ ftllm server /path/to/model.gguf \
   --moe_cuda_cache auto --moe_cpu_cache auto
 ```
 
+HF packed FP4 在 `auto`/`nvfp4` 下按配对的权重与 scale 元数据核算，包含运行时 scale、行对齐和布局转换开销，已合入的 scale 不重复计费。E4M3 取带行全局 scale/对齐的紧凑布局与 FP32 block scale 回退中较大的预算；E8M0 保留 block16 兼容布局的容量上界，以覆盖 CPU 能力或开关导致的回退，不再统一将 packed payload 翻倍。未识别的布局和显式精度转换仍采用保守上界。
+
 规划器读取 GGUF 全部分片的张量目录，或 HF safetensors 的索引和头部，不读取权重正文。GPU 预算采用 CUDA 的逻辑设备编号，因此遵循 `CUDA_VISIBLE_DEVICES`；主存预算同时检查 Linux `MemAvailable`、当前及各级可见父 cgroup 的内存限制与占用，不将 swap 计为可用内存。
 
 上下文、KV 精度、MTP、阈值和用户指定的并发数不参与自动降级。`--tokens` 是整体 KV token 容量；未指定时，按 `--max_context_length` 或模型原生窗口预留。自动规划下未指定 `--max_batch` 时取 1，并打印结果。大窗口放不下会在加载前报错，需要用户明确调整参数。

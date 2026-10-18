@@ -259,6 +259,114 @@ class HybridAutoTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             auto.weight_costs(t, g, args())
 
+    def test_native_packed_fp4_scales_are_counted_once(self):
+        from dataclasses import replace
+        g, _, _, _ = fixture()
+        prefix = "layers.0.ffn.experts.0.w1"
+        for family in ("deepseek_v41", "qwen4", "glm5"):
+            for kind in ("I8", "U8"):
+                for suffix in (".weight_scale_inv", ".weight_scale", ".scale_inv", ".scale"):
+                    for dtype in ("auto", "nvfp4"):
+                        with self.subTest(family=family, kind=kind, suffix=suffix, dtype=dtype):
+                            # Eight rows of 64 values: 256 packed bytes, 16
+                            # block32 scale bytes. The block16 fallback is 288.
+                            w = auto.Tensor(prefix + ".weight", (8, 32), 256, kind)
+                            scale = auto.Tensor(prefix + suffix, (8, 2), 16, "F8_E8M0")
+                            for tensors in ([w, scale], [scale, w]):
+                                costs = auto.weight_costs(tensors, replace(g, family=family), args(dtype=dtype))
+                                self.assertEqual((costs[0][0], costs[4]), (288, 288))
+
+    def test_packed_fp4_scale_replication_and_raw_mxfp4(self):
+        g, _, _, _ = fixture()
+        prefix = "model.layers.0.mlp.experts.0.down_proj"
+        w = auto.Tensor(prefix + ".weight", (8, 32), 256, "U8")
+        # Row-broadcast scales and larger source groups must still reserve
+        # one scale per runtime block and output row.
+        for shape, size, kind in [((2, 2), 4, "F8_E8M0"), ((8, 1), 8, "F8_E8M0"),
+                                  ((8, 4), 32, "F8_E8M0"), ((8, 2), 16, "U8")]:
+            with self.subTest(shape=shape, kind=kind):
+                scale = auto.Tensor(prefix + ".weight_scale", shape, size, kind)
+                self.assertEqual(auto.weight_costs([scale, w], g, args())[0][0], 288)
+
+    def test_e4m3_packed_fp4_covers_compact_alignment_and_float_scales(self):
+        from dataclasses import replace
+        g, _, _, _ = fixture()
+        prefix = "model.layers.0.mlp.experts.0.gate_proj"
+        # Compact 16-value rows need 16 bytes including global scale/alignment;
+        # 32-value rows need 24. For 64 values the float-scale fallback needs 48.
+        for columns, expected in [(16, 48), (32, 72), (64, 144)]:
+            w = auto.Tensor(prefix + ".weight", (3, columns // 2), 3 * columns // 2, "U8")
+            scale = auto.Tensor(prefix + ".weight_scale", (3, columns // 16), 3 * columns // 16, "F8_E4M3")
+            global_scale = auto.Tensor(prefix + ".weight_scale_2", (), 4, "F32")
+            for family in ("qwen4", "glm5", "deepseek_v41"):
+                for backend in ("numa", "cpu", "disk"):
+                    with self.subTest(columns=columns, family=family, backend=backend):
+                        costs = auto.weight_costs([scale, global_scale, w], replace(g, family=family),
+                                                 args(moe_device=backend, moe_cuda_cache=0))
+                        self.assertEqual(costs[0][0], expected + 4)
+                        self.assertEqual(costs[4], expected)
+
+    def test_packed_fp4_unrecognized_metadata_keeps_conservative_bound(self):
+        g, _, _, _ = fixture()
+        prefix = "layers.0.ffn.experts.0.w1"
+        w = auto.Tensor(prefix + ".weight", (8, 32), 256, "I8")
+        scales = [None, auto.Tensor(prefix + ".scale", (8, 2), 64, "F32"),
+                  auto.Tensor(prefix + ".scale", (8, 2), 15, "F8_E8M0"),
+                  auto.Tensor(prefix + ".scale", (3, 2), 6, "F8_E8M0"),
+                  auto.Tensor(prefix + ".scale", (8, 4), 32, "U8"),
+                  auto.Tensor(prefix + ".scale", (8, 2), 16, "F8_E4M3")]
+        for scale in scales:
+            with self.subTest(scale=scale):
+                ts = [w] + ([scale] if scale else [])
+                self.assertGreaterEqual(auto.weight_costs(ts, g, args())[0][0], 512)
+        # Match loader priority: an invalid first scale cannot be replaced by
+        # a convenient lower-priority tensor to shrink the budget.
+        ts = [w, auto.Tensor(prefix + ".weight_scale_inv", (8, 2), 64, "F32"),
+              auto.Tensor(prefix + ".scale", (8, 2), 16, "F8_E8M0")]
+        self.assertGreaterEqual(auto.weight_costs(ts, g, args())[0][0], 512)
+
+    def test_packed_fp4_explicit_conversion_and_expert_override(self):
+        g, _, _, _ = fixture()
+        prefix = "layers.0.ffn.experts.0.w1"
+        ts = [auto.Tensor(prefix + ".weight", (8, 32), 256, "I8"),
+              auto.Tensor(prefix + ".scale", (8, 2), 16, "F8_E8M0")]
+        for dtype, minimum in [("float16", 1024), ("bfloat16", 1024), ("float32", 2048)]:
+            with self.subTest(dtype=dtype):
+                costs = auto.weight_costs(ts, g, args(dtype=dtype, moe_cuda_cache=0))
+                self.assertGreaterEqual(costs[0][0], minimum)
+                costs = auto.weight_costs(ts, g, args(dtype=dtype, moe_dtype="nvfp4"))
+                self.assertEqual(costs[0][0], 288)
+        costs = auto.weight_costs(ts, g, args(dtype="nvfp4", moe_dtype="float32", moe_cuda_cache=0))
+        self.assertGreaterEqual(costs[0][0], 2048)
+
+    def test_packed_fp4_real_geometry_fits_384gib_numa_plan(self):
+        g = auto.Geometry("deepseek_v41", 40, 131072, 5120, 384, 6, 2304,
+                          [4224] + [0] * 39, [131072] * 40, 1, 360448, 4096)
+        tensors = []
+        for layer in range(40):
+            for projection, shape, scale_shape in [
+                    ("gate_up_proj", (384, 4608, 2560), (384, 4608, 160)),
+                    ("down_proj", (384, 5120, 1152), (384, 5120, 72))]:
+                prefix = "model.layers.%d.mlp.experts.%s" % (layer, projection)
+                import math
+                tensors.extend([auto.Tensor(prefix + ".weight", shape, math.prod(shape), "I8"),
+                                auto.Tensor(prefix + ".scale", scale_shape, math.prod(scale_shape), "F8_E8M0")])
+        a = args(tokens=131072, max_context_length=131072, chunked_prefill_size=4096,
+                 moe_device_layers=-1, moe_cuda_cache=20 * GiB)
+        costs = auto.weight_costs(tensors, g, a)
+        # 270 GiB of payload+scales on the block32 backend; keep about 285 GiB
+        # for the larger block16 fallback instead of the old 522 GiB estimate.
+        self.assertEqual(sum(costs[0]), 305764761600)
+        gpu = {0: {"total": 72 * GiB, "free": 71 * GiB}}
+        with patch.dict(os.environ, {}, clear=True):
+            p = auto.plan(a, g, costs, "pp", {0: 1}, gpu,
+                          {"total": 384 * GiB, "available": 352 * GiB})
+            self.assertEqual(p["moe_device_layers"], -1)
+            self.assertLess(p["host_estimated_bytes"], p["host_budget_bytes"])
+            with self.assertRaises(ValueError):
+                auto.plan(a, g, costs, "pp", {0: 1}, gpu,
+                          {"total": 256 * GiB, "available": 256 * GiB})
+
     def test_snapshot_fallback_counts_a_second_host_copy(self):
         g, c, gpu, ram = fixture()
         p = auto.plan(args(), g, c, "pp", {0: 1}, gpu, ram)
