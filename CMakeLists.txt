@@ -2006,6 +2006,13 @@ if (UNIT_TEST)
             set_tests_properties(naive_n05_kv_pool PROPERTIES
                 LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
                 PASS_REGULAR_EXPRESSION "KV POOL PASS")
+            foreach(NAIVE_KV_TYPE bf16 fp8)
+                add_test(NAME naive_n05_kv_pool_churn_${NAIVE_KV_TYPE}
+                    COMMAND naive_n05_verify_graph_test 2 kv_pool_churn ${NAIVE_KV_TYPE})
+                set_tests_properties(naive_n05_kv_pool_churn_${NAIVE_KV_TYPE} PROPERTIES
+                    LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                    PASS_REGULAR_EXPRESSION "KV CHURN PASS")
+            endforeach()
             foreach(NAIVE_RING_INITIAL_MODE eager graph)
                 add_test(NAME naive_n05_swa_ring_toggle_${NAIVE_RING_INITIAL_MODE}
                     COMMAND naive_n05_verify_graph_test 8 swa_ring_toggle ${NAIVE_RING_INITIAL_MODE})

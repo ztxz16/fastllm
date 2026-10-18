@@ -210,6 +210,7 @@ namespace fastllm {
         bool InitTensorParallel();
         void PrepareTensorParallel();
         void InitTensorParallelKVPool();
+        std::shared_ptr<CudaWorkspace> RequestKVPool(int device, size_t bytes) const;
         void PrepareSwaPrefillWorkspace(int rank, int length);
         struct TPDecodeState;
         std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState, tpBatchState;
@@ -238,6 +239,9 @@ namespace fastllm {
                                    LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
         std::vector<int> tpDevices;
         std::map<int, std::shared_ptr<CudaWorkspace>> tpKVPool;
+        // Separate equal-sized request allocations so prefix restore and cold
+        // prefill cannot fragment each other's page tables and SWA windows.
+        std::map<std::pair<int, size_t>, std::shared_ptr<CudaWorkspace>> tpRequestKVPool;
         // One chronological prefill workspace per GPU, reused across layers
         // and requests. Request-owned SWA storage only holds the sliding window.
         std::vector<std::pair<Data, Data>> tpSwaPrefillWorkspaces;

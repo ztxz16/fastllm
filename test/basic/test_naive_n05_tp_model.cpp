@@ -8,6 +8,7 @@
 #include <cuda_runtime_api.h>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
 #include <atomic>
@@ -120,6 +121,18 @@ class Fixture : public NaiveN05FlashModel {
   public:
     int ranks;
     bool useRealScheduler = false;
+    bool failDecodeAllocation = false;
+    int Forward(const Data &inputIds, const Data &attentionMask, const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &kv,
+                const GenerationConfig &config = GenerationConfig(),
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector<float> *logits = nullptr) override {
+        if (failDecodeAllocation && inputIds.dims == std::vector<int>({1, 1})) {
+            failDecodeAllocation = false;
+            throw CudaWorkspaceExhausted("injected decode allocation failure");
+        }
+        return NaiveN05FlashModel::Forward(inputIds, attentionMask, positionIds, kv, config, lastTokens, logits);
+    }
     explicit Fixture(int ranks, bool packed = false, bool graph = false, bool swaRing = false, bool serving = false) : ranks(ranks) {
         setenv("FASTLLM_TP", ranks > 1 ? std::to_string(ranks).c_str() : "false", 1);
         deviceMap = {{"cuda:0", 1}};
@@ -239,9 +252,14 @@ class Fixture : public NaiveN05FlashModel {
         }
     }
     mutable int pagedRestores = 0, lastPrefixLength = 0;
+    mutable bool failPrefixRestore = false;
     int hostRestores = 0;
     bool RestorePagedPrefixCacheExtra(ResponseContext *ctx, int length) const override {
         bool restored = NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ctx, length);
+        if (restored && failPrefixRestore) {
+            failPrefixRestore = false;
+            throw CudaWorkspaceExhausted("injected prefix allocation failure");
+        }
         pagedRestores += restored;
         if (restored) lastPrefixLength = length;
         return restored;
@@ -370,6 +388,18 @@ class Fixture : public NaiveN05FlashModel {
         if (pagedRestores != beforeResume + 1 || lastPrefixLength != 256 || hostRestores != 0)
             throw std::runtime_error("decode checkpoint was not reusable");
         RequireCloseLogits(resumed[0].data(), decoded[17], "decode checkpoint logits");
+        // A failure after restoring SWA must affect only this request, and its
+        // partial allocation must be released before a later cache hit.
+        failPrefixRestore = true;
+        GenerationConfig failedConfig;
+        failedConfig.top_k = 1; failedConfig.output_token_limit = 1;
+        int failedHandle = LaunchResponseTokens(tokens, failedConfig);
+        if (FetchResponseTokens(failedHandle) != -2 || failPrefixRestore)
+            throw std::runtime_error("prefix allocation error was not isolated");
+        std::vector<std::vector<float>> recovered;
+        infer(tokens, 1, recovered);
+        if (recovered != resumed)
+            throw std::runtime_error("prefix allocation failure changed the next request");
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         if (verifyGraphCaptures != captures) throw std::runtime_error("prefix serving recaptured a graph");
 #endif
@@ -934,6 +964,58 @@ class Fixture : public NaiveN05FlashModel {
     }
 
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+    void CachePoolChurnChecks() {
+        maxBatch = 160; max_positions = 200000;
+        SetMaxTokens(524288); SetChunkedPrefillSize(128); WarmUp();
+        FastllmCudaSetDevice(0);
+        const int before = directAllocations;
+        const int freePages = GetPagedKVCacheManager(0, true)->FreePageCount();
+        std::vector<std::vector<Data>> requests(maxBatch);
+        std::vector<int> order(maxBatch), tags(maxBatch);
+        std::iota(order.begin(), order.end(), 0);
+        std::mt19937 random(20261017);
+        auto allocate = [&](int slot, bool hit, int pass) {
+            if (requests[slot].empty()) requests[slot].resize(4);
+            const bool swa = hit ? pass == 0 : pass == 1;
+            for (int part = 0; part < 2; ++part) {
+                Data &cache = requests[slot][(swa ? 2 : 0) + part];
+                cache.dataType = kvCacheDataType; cache.UpdateUnitSize();
+                cache.dataDevice = DataDevice::CUDA; cache.dataDeviceIds = {0};
+                if (swa) {
+                    ReserveCache(cache, 128, std::max(1, 8 / ranks) * (part ? 128 : 192));
+                    uint64_t value = tags[slot];
+                    FastllmCudaCopyFromHostToDevice(cache.cudaData, &value, sizeof(value));
+                } else {
+                    PreparePagedCache(cache, *GetPagedKVCacheManager(0, !part), 1);
+                }
+            }
+        };
+        for (int slot : order) for (int pass = 0; pass < 2; ++pass) allocate(slot, false, pass);
+        for (int turn = 0; turn < 2000; ++turn) {
+            std::shuffle(order.begin(), order.end(), random);
+            int count = 1 + random() % 16;
+            bool hit = random() % 5 != 0;
+            for (int i = 0; i < count; ++i) {
+                requests[order[i]].clear(); tags[order[i]] = turn + 1;
+            }
+            // Batch restores reserve every SWA window before page tables;
+            // cold prefills reserve page tables first. Mix both orders.
+            for (int pass = 0; pass < 2; ++pass)
+                for (int i = 0; i < count; ++i) allocate(order[i], hit, pass);
+            if (turn % 100 == 0) for (int slot = 0; slot < maxBatch; ++slot) {
+                for (int part = 2; part < 4; ++part) {
+                    uint64_t value;
+                    FastllmCudaCopyFromDeviceToHost(&value, requests[slot][part].cudaData, sizeof(value));
+                    if (value != (uint64_t)tags[slot]) throw std::runtime_error("request KV slots overlap");
+                }
+            }
+        }
+        requests.clear();
+        if (directAllocations != before || GetPagedKVCacheManager(0, true)->FreePageCount() != freePages)
+            throw std::runtime_error("request churn allocated device memory or leaked KV pages");
+        std::cout << "KV CHURN PASS ranks=" << ranks << " batch=160 turns=2000" << std::endl;
+    }
+
     void SwaPrefillWorkspaceChecks() {
         // Compare against the original contiguous-cache path before WarmUp
         // installs the paged pool. Exercise short windows, wraps, multi-chunk
@@ -1055,7 +1137,7 @@ class Fixture : public NaiveN05FlashModel {
                 auto block = std::make_unique<Data>(BFLOAT16);
                 block->dataDevice = DataDevice::CUDA;
                 block->dataDeviceIds = {0};
-                ReserveCache(*block, 128, 16);
+                ReserveCache(*block, 128, std::max(1, 8 / ranks) * 32);
                 pressure.push_back(std::move(block));
             }
         } catch (const CudaWorkspaceExhausted &) {}
@@ -1072,6 +1154,14 @@ class Fixture : public NaiveN05FlashModel {
         while ((token = FetchResponseTokens(handle)) >= 0) ++count;
         if (token != -1 || count != 4)
             throw std::runtime_error("scheduler failed after KV exhaustion");
+        failDecodeAllocation = true;
+        failed = LaunchResponseTokens({1, 2, 3}, config);
+        if (FetchResponseTokens(failed) < 0 || FetchResponseTokens(failed) != -2 || failDecodeAllocation)
+            throw std::runtime_error("decode allocation error was not isolated");
+        handle = LaunchResponseTokens({1, 2, 3}, config); count = 0;
+        while ((token = FetchResponseTokens(handle)) >= 0) ++count;
+        if (token != -1 || count != 4)
+            throw std::runtime_error("decode error freed reusable position metadata");
         std::cout << "KV POOL PASS ranks=" << ranks << std::endl;
     }
 #endif
@@ -1819,6 +1909,13 @@ int main(int argc, char **argv) {
         if (argc > 2 && std::string(argv[2]) == "kv_pool") {
             Fixture fixture(ranks);
             fixture.CachePoolChecks();
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "kv_pool_churn") {
+            SetCudaGraph(false);
+            Fixture fixture(ranks, false, true, true, true);
+            if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.CachePoolChurnChecks();
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "swa_workspace") {

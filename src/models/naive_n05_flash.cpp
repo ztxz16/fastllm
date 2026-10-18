@@ -131,7 +131,7 @@ void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width) {
         storage.dataDevice = DataDevice::CUDA;
         storage.dataDeviceIds = cache.dataDeviceIds;
         storage.directMemory = true;
-        storage.cudaData = AllocateCudaWorkspace(pool->second, storage.GetBytes());
+        storage.cudaData = AllocateCudaWorkspace(RequestKVPool(pool->first, storage.GetBytes()), storage.GetBytes());
         if (!storage.cudaData)
             throw CudaWorkspaceExhausted("Naive KV pool exhausted; reduce concurrent context/output lengths or increase --tokens before startup.");
         if (cache.cudaData && !cache.dims.empty() && cache.dims[1] > 0)
@@ -172,8 +172,8 @@ void NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
     AssertInFastLLM(cache.pagedKVCacheData == &manager, "Naive paged KV pool changed.");
     bool changed = !cache.cudaData;
     if (!cache.cudaData) {
-        cache.cudaData = AllocateCudaWorkspace(tpKVPool.at(manager.dataDeviceIds[0]),
-            (size_t)((capacity + manager.pageLen - 1) / manager.pageLen) * sizeof(int));
+        const size_t bytes = (size_t)((capacity + manager.pageLen - 1) / manager.pageLen) * sizeof(int);
+        cache.cudaData = AllocateCudaWorkspace(RequestKVPool(manager.dataDeviceIds[0], bytes), bytes);
         if (!cache.cudaData) throw CudaWorkspaceExhausted("Naive KV page metadata pool exhausted.");
         cache.directMemory = true;
         cache.cudaDataBorrowed = false;
@@ -1452,6 +1452,11 @@ void NaiveN05FlashModel::PrepareSwaPrefillWorkspace(int rank, int length) {
 #endif
 }
 
+std::shared_ptr<CudaWorkspace> NaiveN05FlashModel::RequestKVPool(int device, size_t bytes) const {
+    auto it = tpRequestKVPool.find({device, (bytes + 255) / 256 * 256});
+    return it != tpRequestKVPool.end() ? it->second : tpKVPool.at(device);
+}
+
 void NaiveN05FlashModel::InitTensorParallelKVPool() {
 #ifdef USE_CUDA
     // Keep CPU/layer-serial and speculative execution on their existing cache
@@ -1477,7 +1482,12 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         const auto &cfg = slidingLayers[layer] ? sliding : full;
         const int64_t width = std::max(1, cfg.kvHeads / ranks) *
             (cfg.headDim + cfg.valueDim) + (slidingLayers[layer] ? 0 : IndexerCacheWidth(kvCacheDataType));
-        if (slidingLayers[layer]) fixedBytes += width * kvBytes * swaCapacity * batch;
+        if (slidingLayers[layer]) {
+            for (int dim : {cfg.headDim, cfg.valueDim}) {
+                const int64_t size = std::max(1, cfg.kvHeads / ranks) * dim * kvBytes * swaCapacity;
+                fixedBytes += (size + 255) / 256 * 256 * batch;
+            }
+        }
         else fullBytesPerToken += width * kvBytes;
     }
     AssertInFastLLM(fullBytesPerToken > 0, "Naive KV pool requires full-attention layers.");
@@ -1526,10 +1536,39 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     const int64_t bytes = fixedBytes + (tokens + (int64_t)batch * 127) * fullBytesPerToken;
     AssertInFastLLM(tokens >= 128 && bytes > 0 && bytes <= budget,
         "Naive startup KV pool exceeds the memory budget; reduce --tokens/--max_batch or prefill chunk size.");
+    const int pageLen = GetPageLen();
+    const int fullLayers = std::count(slidingLayers.begin(), slidingLayers.end(), 0);
+    const int64_t metadataBytes = (int64_t)fullLayers * 2 * batch *
+        ((std::min<int64_t>(max_positions, tokens) + pageLen - 1) / pageLen * sizeof(int) + 512) +
+        (int64_t)block_cnt * std::min(batch, 256) * 4 * sizeof(void *) + 512;
+    const int pages = (int)((bytes - fixedBytes - metadataBytes) / fullBytesPerToken / pageLen);
+    AssertInFastLLM(pages > 0, "Naive KV budget cannot fit paged metadata.");
+    tokens = std::min<int64_t>(tokens, (int64_t)pages * pageLen);
+    // Charge size classes to the existing budget, not additional device memory.
+    // Each arena only serves one aligned block size, so arbitrary request
+    // completion/restore order cannot leave unusable holes between live blocks.
+    std::map<size_t, int64_t> requestBlocks;
+    auto reserveBlocks = [&](size_t size, int64_t count) {
+        requestBlocks[(size + 255) / 256 * 256] += count;
+    };
+    reserveBlocks((std::min<int64_t>(max_positions, tokens) + pageLen - 1) / pageLen * sizeof(int),
+                  (int64_t)fullLayers * 2 * batch);
+    for (int layer = 0; layer < block_cnt; ++layer) if (slidingLayers[layer]) {
+        for (int dim : {sliding.headDim, sliding.valueDim})
+            reserveBlocks(swaCapacity * std::max(1, sliding.kvHeads / ranks) * dim * kvBytes, batch);
+    }
+    int64_t requestBytes = 0;
+    for (const auto &entry : requestBlocks) requestBytes += entry.first * entry.second;
     std::map<int, std::shared_ptr<CudaWorkspace>> pools;
-    for (int device : tpDevices)
-        pools.emplace(device, std::make_shared<CudaWorkspace>(device, bytes));
+    std::map<std::pair<int, size_t>, std::shared_ptr<CudaWorkspace>> requestPools;
+    for (int device : tpDevices) {
+        pools.emplace(device, std::make_shared<CudaWorkspace>(device, bytes - requestBytes));
+        for (const auto &entry : requestBlocks)
+            requestPools.emplace(std::make_pair(device, entry.first),
+                std::make_shared<CudaWorkspace>(device, entry.first * entry.second));
+    }
     tpKVPool.swap(pools);
+    tpRequestKVPool.swap(requestPools);
     if (prefixSlots > 0) {
         prefixes->storage.resize(ranks);
         for (int rank = 0; rank < ranks; ++rank) {
@@ -1548,14 +1587,6 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         printf("[Naive GPU prefix cache] %d window slots, %.2f MiB/GPU within KV budget; no CPU KV archive.\n",
                prefixSlots, prefixBytes / 1048576.0);
     }
-    const int pageLen = GetPageLen();
-    const int fullLayers = std::count(slidingLayers.begin(), slidingLayers.end(), 0);
-    const int64_t metadataBytes = (int64_t)fullLayers * 2 * batch *
-        ((std::min<int64_t>(max_positions, tokens) + pageLen - 1) / pageLen * sizeof(int) + 512) +
-        (int64_t)block_cnt * std::min(batch, 256) * 4 * sizeof(void *) + 512;
-    const int pages = (int)((bytes - fixedBytes - metadataBytes) / fullBytesPerToken / pageLen);
-    AssertInFastLLM(pages > 0, "Naive KV budget cannot fit paged metadata.");
-    tokens = std::min<int64_t>(tokens, (int64_t)pages * pageLen);
     tpPagedCaches.resize(ranks);
     for (int rank = 0; rank < ranks; ++rank) {
         FastllmCudaSetDevice(tpDevices[rank]);
