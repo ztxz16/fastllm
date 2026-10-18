@@ -57,6 +57,12 @@ CUDA/NUMA 混推在有专家显存缓存时，默认让 prefill 和 decode 复�
 排查或对照测试可设置 `FASTLLM_MOE_PREFILL_CACHE=0`，同时旁路 prefill 的驻留调度、缓存读取和写入，不关闭 decode 缓存；正常运行无需设置。在两次请求之间读取 `ftllm.llm.get_moe_cuda_cache_prefill_stats(device=0)` 并相减，可得到共享原生路径的调用数、GPU 专家/路由数、命中专家/路由数、避免上传的字节数、实际上传字节数和新写入专家数。统计读取会同步 GPU，不能放入吞吐计时区间；不包含独立 grouped GGUF 后端，GPU 内部布局还原也不计入上传字节。
 
 
+## DeepSeek 混推的分块预填充与校验
+
+启用 `--fast_prefill` 后，DeepSeek-V4.1 对满足 bounded replay 条件的单请求分块预填充，只在最后一块执行后段 SWA 层与输出头；前面的块更新长期 KV。末块不超过 SWA 窗口、增量续写、图像输入或 DSpark 等情况沿用原路径。该优化沿用 `fast_prefill` 的近似注意力语义，普通启动不会额外启用它。
+
+`FASTLLM_DSV41_HYBRID_PP=1` 显式启用混推跨块流水线，默认关闭。它要求 CUDA PP 层放置、NUMA 专家、`fast_prefill`、单请求 greedy，以及各级独立拥有其使用的共享 KV/index 来源；例如已验证的双卡 `--device cudapp=14:26 --tp off`。专家显存缓存、DSpark、历史复用或不兼容的层切分等情况会沿用普通路径。该入口不用于纯 GPU 或 TP 执行。
+
 ## DeepSeek FP8 WoA 的通用 prefill GEMM
 
 DeepSeek-V4/V4.1 的 CUDA WoA 投影在 token 数不小于 16 时，默认尝试分组 GEMM，并按设备能力使用 Tensor Core；混合推理和全 GPU 推理共用入口，不依赖 `--auto`、专家缓存或 `fast_prefill`。支持可变 token 数、batch、分组数和输出 rank，以及 FP8 block32、block128 和矩形量化块；非对齐的 K/N、token 尾块和不足 128 个元素的输入量化尾块均有边界处理，不要求固定 SM 数。原有 SM120 的 7/8-token 特化仍保留；其他小批量走原有归约路径，奇数 rank/量化行块走逐行归约。

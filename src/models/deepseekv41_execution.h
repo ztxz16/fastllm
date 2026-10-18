@@ -43,6 +43,8 @@ namespace fastllm {
         bool verifyAllTokens;
         std::function<void()> runSharedSegment;
         std::function<void()> releaseSharedScratch;
+        std::mutex *pipelineHostExperts = nullptr;
+        int pipelineFirstLayer = -1;
     };
 
     // Tensor-copy helpers shared with attention/KV code. They preserve graph
@@ -60,6 +62,15 @@ namespace fastllm {
 } // namespace fastllm
 
 namespace fastllm {
+// Private to hybrid PP: layers have disjoint owners, while token history and
+// logical positions are per stage. Payload stores BF16 hidden plus FP32 HC pre.
+struct DeepSeekV41Model::HybridPrefillStage {
+    int firstLayer = 0, endLayer = 0;
+    DeepSeekV41RequestState *request = nullptr;
+    Data *payload = nullptr;
+    std::mutex *hostExperts = nullptr;
+    bool sampleOutput = false;
+};
 struct DeepSeekV41Model::ForwardState {
     std::unique_ptr<ForwardWorkspace> work;
     ForwardState(DeepSeekV41Model &model, const std::vector<DeepSeekV41Segment> &inputSegments,
@@ -69,7 +80,8 @@ struct DeepSeekV41Model::ForwardState {
                                                        const std::vector<GenerationConfig> &generationConfigsIn,
                                                        const LastTokensManager &lastTokens,
                                                        std::vector<std::vector<float>*> *retLogits,
-                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues);
+                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues,
+                                                       HybridPrefillStage *prefill = nullptr);
     ~ForwardState();
     int Layers() const;
     void BeginLayer(int layer);

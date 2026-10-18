@@ -3373,6 +3373,54 @@ namespace fastllm {
         }
     }
 
+    bool DeepSeekV41Model::TryForwardChunkedPrefill(
+            const Data &inputIds, const Data &attentionMask, const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+            std::vector<float> *logits, int &outputToken) {
+        if (executionMode == ExecutionMode::Hybrid &&
+            TryForwardHybridChunkedPrefill(inputIds, attentionMask, positionIds,
+                pastKeyValues, generationConfig, lastTokens, logits, outputToken)) {
+            auto state = GetStateByFirstKey(&pastKeyValues[0].first);
+            V41UpdateStubKV(pastKeyValues[0].first, pastKeyValues[0].second, state->totalLen);
+            return true;
+        }
+        const int chunk = GetChunkedPrefillSize();
+        if (decoderSwaTailLayer <= 0 || decoderSwaTailLayer >= block_cnt ||
+            v41DsparkEnabled || chunk <= window_size || inputIds.dims.size() != 2 ||
+            inputIds.dims[0] != 1 || inputIds.dims[1] <= chunk ||
+            positionIds.dims.size() != 2 || positionIds.dims != inputIds.dims ||
+            V41FirstPosition(&positionIds) != 0) return false;
+        const int length = inputIds.dims[1];
+        const int lastChunk = (length - 1) % chunk + 1;
+        // A short final chunk would consume the preceding decoder window.
+        // Only bounded replay reconstructs that window without old tail KV.
+        if (lastChunk <= window_size ||
+            V41HasImageToken(V41ReadTokenIds(inputIds), image_token_id)) return false;
+        for (int layer : engram_layer_ids) if (layer >= decoderSwaTailLayer) return false;
+        std::vector<std::vector<float>*> finalLogits{logits};
+        for (int start = 0; start < length; start += chunk) {
+            const auto begin = std::chrono::steady_clock::now();
+            const int count = std::min(chunk, length - start);
+            const bool cacheOnly = start + count < length;
+            Data ids, positions;
+            Split(inputIds, 1, start, start + count, ids);
+            Split(positionIds, 1, start, start + count, positions);
+            auto result = ForwardSingle(ids, positions, pastKeyValues, generationConfig,
+                lastTokens, cacheOnly ? nullptr : &finalLogits, nullptr, nullptr, cacheOnly);
+            if (!cacheOnly) outputToken = result[0];
+            if (verbose) {
+                const double seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - begin).count();
+                printf("[Prompt] Long Prefill ... (%d/%d, %d%%). Speed: %.2f tokens / s.\n",
+                    start + count, length, (start + count) * 100 / length,
+                    seconds > 0 ? count / seconds : 0);
+                fflush(stdout);
+            }
+        }
+        return true;
+    }
+
     int DeepSeekV41Model::Forward(const Data &inputIds, const Data &attentionMask, const Data &positionIds,
                                   std::vector<std::pair<Data, Data> > &pastKeyValues,
                                   const GenerationConfig &generationConfig,
@@ -3403,7 +3451,7 @@ namespace fastllm {
                                                      const LastTokensManager &lastTokens,
                                                      std::vector<std::vector<float>*> *retLogits,
                                                      const Data *inputEmbeds,
-                                                     const std::vector<int> *imageMask) {
+                                                     const std::vector<int> *imageMask, bool prefillCacheOnly) {
         const int seqlen = inputIds.dims[1];
         const int startPos = V41FirstPosition(&positionIds);
         AssertInFastLLM(inputEmbeds == nullptr ||
@@ -3447,6 +3495,7 @@ namespace fastllm {
         segments[0].startPos = startPos;
         segments[0].seqlen = seqlen;
         segments[0].offset = 0;
+        segments[0].prefillCacheOnly = prefillCacheOnly;
         std::vector<GenerationConfig> generationConfigs(1, generationConfig);
         std::vector<std::pair<Data*, Data*> > samplingPastKeyValues;
         for (auto &kvPair : pastKeyValues) {
@@ -4111,6 +4160,7 @@ namespace fastllm {
 
     struct DeepSeekV41Model::ForwardWorkspace {
         DeepSeekV41Model &model;
+        HybridPrefillStage *prefill = nullptr;
         const std::vector<DeepSeekV41Segment> &inputSegments;
         const Data &inputIds;
         const Data *inputEmbeds;
@@ -4192,8 +4242,11 @@ namespace fastllm {
                                                        const std::vector<GenerationConfig> &generationConfigsIn,
                                                        const LastTokensManager &lastTokens,
                                                        std::vector<std::vector<float>*> *retLogits,
-                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues)
-        : work(new ForwardWorkspace(model, inputSegments, inputIds, inputEmbeds, imageMask, generationConfigsIn, lastTokens, retLogits, samplingPastKeyValues)) { model.PrepareForward(*work); }
+                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues, HybridPrefillStage *prefill)
+        : work(new ForwardWorkspace(model, inputSegments, inputIds, inputEmbeds, imageMask, generationConfigsIn, lastTokens, retLogits, samplingPastKeyValues)) {
+        work->prefill = prefill;
+        model.PrepareForward(*work);
+    }
     DeepSeekV41Model::ForwardState::~ForwardState() = default;
     void DeepSeekV41Model::ForwardState::PrepareInputs() { work->model.PrepareForwardInputs(*work); }
     bool DeepSeekV41Model::ForwardState::FullGraph() {
@@ -4203,7 +4256,11 @@ namespace fastllm {
         return false;
 #endif
     }
-    int DeepSeekV41Model::ForwardState::Layers() const { return work->model.block_cnt; }
+    int DeepSeekV41Model::ForwardState::Layers() const {
+        const int end = work->inputSegments[0].prefillCacheOnly ?
+            work->model.decoderSwaTailLayer : work->model.block_cnt;
+        return work->prefill ? std::min(end, work->prefill->endLayer) : end;
+    }
     void DeepSeekV41Model::ForwardState::BeginLayer(int layer) { work->model.BeginForwardLayer(*work, layer); }
     void DeepSeekV41Model::ForwardState::EndLayer(int layer) {
         if (work->endedLayerInGraph != layer) work->model.EndForwardLayer(*work, layer);
@@ -4323,6 +4380,10 @@ namespace fastllm {
             }
         }
         boundedPrefill &= hasLongSegment;
+        for (const auto &seg : inputSegments) if (seg.prefillCacheOnly) {
+            AssertInFastLLM(numSegments == 1 && boundedPrefill && !v41DsparkEnabled && !seg.spec,
+                "DeepSeekV41: cache-only chunks require single-sequence bounded prefill.");
+        }
         // 只裁剪本次前向的视图，调用方仍按完整片段提交请求 / DSpark 的逻辑位置。
 
         if (boundedPrefill) {
@@ -4361,7 +4422,7 @@ namespace fastllm {
         // 按 query head 切分，wo_b 按列切并 all-reduce，共享专家保持复制。
         // FastllmGetMulticudaDeviceAndRatio 读的是 ApplyDeviceMap 设置的全局设备表，
         // 首次前向前必须先应用一次主 device map，否则拿到的是空列表。
-        ApplyDeviceMap(this->deviceMap, 1, block_cnt);
+        ApplyDeviceMap(this->deviceMap, f.prefill ? f.prefill->firstLayer + 1 : 1, block_cnt);
         tpDevices = V41TpDevices(this->deviceMap);
         tp = !tpDevices.empty();
         // 与 InitParams 使用相同的 head/o_group 对齐条件；kernel 内部处理尾部 head。
@@ -4549,6 +4610,15 @@ namespace fastllm {
                                       (int)rope_scaling_original_max_position_embeddings, rope_factor,
                                       rope_scaling_beta_fast, rope_scaling_beta_slow};
 
+        PrepareForwardWeights();
+    }
+    void DeepSeekV41Model::PrepareHybridPrefill() {
+        PrepareForwardWeights();
+        // Resolve legacy lazy helpers only before concurrent hybrid stages.
+        V41IndexScoreChunk(2, 1);
+        V41Profiler();
+    }
+    void DeepSeekV41Model::PrepareForwardWeights() {
         // MoE 权重表（首次构建）
         if (weights.empty()) {
             weights.resize(block_cnt);
@@ -4609,7 +4679,12 @@ namespace fastllm {
         // 图模式下这些张量来自常驻工作区，地址必须在两次 decode 之间保持不变。
         Data &hiddenStates = ws->hiddenStates;
         Data &hiddenTemp = ws->hiddenTemp;
-        {
+        if (f.prefill && f.prefill->firstLayer > 0) {
+            Data view;
+            view.FakeFrom(*f.prefill->payload, 0);
+            view.Resize({1, seqlen, hc_mult, dim});
+            hiddenStates.CopyFrom(view);
+        } else {
             // embedOut 只活在前导段里，不是图的边界张量，必须保持为局部量：
             // 常驻之后 ToDataType 的原地降精度会往上一轮留下的、更小的设备缓冲里拷贝。
             Data embedOut;
@@ -4647,7 +4722,14 @@ namespace fastllm {
         Data &preMix = ws->preMix;
         // 内容是常量 one-hot，长度没变就不重建：CopyFrom 会先把它搬回 CPU 再搬上卡，
         // 每次换一个设备地址，图就废了。
-        if (ws->preMixSeqlen != seqlen) {
+        if (f.prefill && f.prefill->firstLayer > 0) {
+            Data view;
+            view.FakeFrom(*f.prefill->payload, uint64_t(seqlen) * hc_mult * dim * 2);
+            view.dataType = FLOAT32;
+            view.UpdateUnitSize();
+            view.Resize({1, seqlen, hc_mult});
+            preMix.CopyFrom(view);
+        } else if (ws->preMixSeqlen != seqlen) {
             std::vector<float> values((uint64_t)seqlen * hc_mult, 0.0f);
             for (int i = 0; i < seqlen; i++) {
                 values[(uint64_t)i * hc_mult] = 1.0f;
@@ -4913,6 +4995,9 @@ namespace fastllm {
             // ---- Engram ----
             for (size_t l = 0; l < engram_layer_ids.size(); l++) {
                 if (engram_layer_ids[l] == layer) {
+                    // Engram gather and NUMA MoE share the global CPU worker pool.
+                    std::unique_lock<std::mutex> hostLock;
+                    if (f.prefill) hostLock = std::unique_lock<std::mutex>(*f.prefill->hostExperts);
                     RunEngram(layer, (int)l, segments, *curHidden);
                 }
             }
@@ -5113,7 +5198,7 @@ namespace fastllm {
 #endif
             auto finishAttention = [&](int s, Data &kvRows, Data &attentionOutput) {
                 const auto &seg = segments[s];
-                auto &cache = seg.state->layers[layer];
+                auto &cache = (f.prefill ? f.prefill->request->layers : seg.state->layers)[layer];
                 const int startPos = seg.startPos, segLen = seg.seqlen;
                 Data *kvSeg = &kvRows, *attnOutSeg = &attentionOutput;
                 Data kvSeg8;
@@ -5139,7 +5224,7 @@ namespace fastllm {
             // ---- attention（按片段准备，decode 合并提交）----
             for (int s = 0; s < numSegments; s++) {
                 const DeepSeekV41Segment &seg = segments[s];
-                DeepSeekV41LayerCache &cache = seg.state->layers[layer];
+                DeepSeekV41LayerCache &cache = (f.prefill ? f.prefill->request->layers : seg.state->layers)[layer];
                 const int startPos = seg.startPos;
                 const int segLen = seg.seqlen;
 
@@ -5152,7 +5237,7 @@ namespace fastllm {
                 Data *cmpIdx = nullptr;
                 if (ratio > 0) {
                     const int src = kvSourceOf[layer];
-                    DeepSeekV41LayerCache &srcCache = seg.state->layers[src];
+                    DeepSeekV41LayerCache &srcCache = (f.prefill ? f.prefill->request->layers : seg.state->layers)[src];
                     if (isKvSource[layer] && !batchedCompression) {
                         std::string cpre = pre + ".attn.compressor";
                         Data rawKVSeg, rawScoreSeg, allKV, allScore;
@@ -5391,7 +5476,7 @@ namespace fastllm {
                         return !seg.spec || !seg.spec->deferWindow;
                     })) {
                     for (int s = 0; s < numSegments; ++s) {
-                        finishTransforms.push_back({&segKV[s], &segments[s].state->layers[layer].windowKV,
+                        finishTransforms.push_back({&segKV[s], &(f.prefill ? f.prefill->request->layers : segments[s].state->layers)[layer].windowKV,
                                                     segments[s].startPos, 0, false});
                         finishTransforms.push_back({&segAttnOut[s], nullptr, segments[s].startPos, 1, true});
                     }
@@ -5432,7 +5517,7 @@ namespace fastllm {
                         })) {
                         std::vector<V41DecodeTransform> transforms;
                         for (int s = 0; s < numSegments; ++s) {
-                            transforms.push_back({&segKV[s], &segments[s].state->layers[layer].windowKV,
+                            transforms.push_back({&segKV[s], &(f.prefill ? f.prefill->request->layers : segments[s].state->layers)[layer].windowKV,
                                                   segments[s].startPos, 0, false});
                             transforms.push_back({&segAttnOut[s], nullptr, segments[s].startPos, 1, true});
                         }
@@ -5442,7 +5527,7 @@ namespace fastllm {
                         finishAttention(s, segKV[s], segAttnOut[s]);
                 }
                 for (int s = 0; s < numSegments; ++s) {
-                    segments[s].state->layers[layer].totalLen = segments[s].startPos + 1;
+                    (f.prefill ? f.prefill->request->layers : segments[s].state->layers)[layer].totalLen = segments[s].startPos + 1;
                 }
             }
 #endif
@@ -5780,6 +5865,27 @@ namespace fastllm {
         };
         if (moeStep) moeStep->Finish();
 #ifdef USE_CUDA
+        if (f.prefill && !f.prefill->sampleOutput) {
+            auto &payload = *f.prefill->payload;
+            AssertInFastLLM(curHidden->dataType == BFLOAT16 && preMixPtr->dataType == FLOAT32,
+                "DeepSeek hybrid PP payload dtype mismatch.");
+            curHidden->ToDevice(CUDA);
+            preMixPtr->ToDevice(CUDA);
+            payload.Resize({1, seqlen, hc_mult * (embed_dim + 2)});
+            FastllmCudaCopyFromDeviceToDevice(payload.cudaData, curHidden->cudaData, curHidden->GetBytes());
+            FastllmCudaCopyFromDeviceToDevice((uint8_t*)payload.cudaData + curHidden->GetBytes(),
+                preMixPtr->cudaData, preMixPtr->GetBytes());
+            for (const auto &seg : inputSegments) seg.state->totalLen += seg.seqlen;
+            return std::vector<int>{-1};
+        }
+#endif
+        if (inputSegments[0].prefillCacheOnly) {
+            // The last chunk rebuilds all late SWA windows in bounded replay.
+            // No intermediate logits are consumed by the scheduler.
+            for (const auto &seg : inputSegments) seg.state->totalLen += seg.seqlen;
+            return std::vector<int>{-1};
+        }
+#ifdef USE_CUDA
         // ---- 收尾：结束捕获 / 累计预热轮次 ----
         if (graphState) {
             if (graphCapture) {
@@ -6024,7 +6130,9 @@ namespace fastllm {
             [this, &f, layer] { RunForwardSharedExpert(f, layer); },
             [this, &f] { auto *ws=f.ws;
                 ReleaseForwardPrefill(f, {&ws->x, &ws->gateInput, &ws->gateLogits,
-                    &ws->sharedGateup, &ws->sharedSwiglu, &ws->quantizedActivation}); }
+                    &ws->sharedGateup, &ws->sharedSwiglu, &ws->quantizedActivation}); },
+            f.prefill ? f.prefill->hostExperts : nullptr,
+            f.prefill ? f.prefill->firstLayer : -1
         };
     }
     void DeepSeekV41Model::GiveUpForwardGraph(ForwardWorkspace &f, const char *stage) {

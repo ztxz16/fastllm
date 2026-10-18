@@ -4,6 +4,7 @@
 #include "deepseekv41_hybrid.h"
 #include "baseblock.h"
 #include "utils.h"
+#include "utils/hybrid_parallel.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -75,6 +76,17 @@ namespace fastllm {
         Data &w1 = ws->w1, &w2 = ws->w2, &w3 = ws->w3;
         Data &tempInput = ws->tempInput, &tempOutput = ws->tempOutput;
         Data &moeInputTemp = ws->moeInputTemp, &moeOutputTemp = ws->moeOutputTemp;
+        std::unique_ptr<HybridMoePipelineGuard> pipelineGuard;
+        if (ctx.pipelineHostExperts) {
+            pipelineGuard.reset(new HybridMoePipelineGuard(ffnInput,
+                SelectMoeDeviceForLayer(layer), ctx.pipelineHostExperts, ctx.pipelineFirstLayer));
+        }
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        const std::vector<int> stageDevice{FastllmCudaGetDevice()};
+        std::optional<NumasMoeCudaAssistScope> stageAssist;
+        if (ctx.pipelineHostExperts)
+            stageAssist.emplace(&stageDevice);
+#endif
         // Copy CPU expert inputs before launching the shared expert. A
         // device-to-host copy after that launch would wait for all shared
         // GPU work, serializing the two otherwise independent branches.
@@ -289,3 +301,127 @@ namespace fastllm {
         return frame.Finish();
     }
 }
+
+namespace fastllm {
+bool DeepSeekV41Model::TryForwardHybridChunkedPrefill(
+        const Data &inputIds, const Data &attentionMask, const Data &positionIds,
+        std::vector<std::pair<Data, Data>> &pastKeyValues,
+        const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+        std::vector<float> *logits, int &outputToken) {
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+    // Experimental opt-in. The ordinary GPU and TP forwards never enter here.
+    const int chunkSize = GetChunkedPrefillSize();
+    if (executionMode != ExecutionMode::Hybrid || !V41EnvFlag("FASTLLM_DSV41_HYBRID_PP") ||
+        !generationConfig.IsSimpleGreedy() || saveHistoryChat || GetKVCacheInCPU() ||
+        GetHistoryCacheInCPU() || GetLowMemMode() || GetFastllmEnv().printProfile ||
+        FastllmCudaGraphIsCapturingFast() || FastllmCudaMoeCacheRequested() ||
+        !GetCudaSharedExpert() || v41DsparkEnabled || V41ReferenceMathEnabled() ||
+        V41EnvFlag("FASTLLM_DSV41_ENGRAM_PREFETCH") ||
+        std::getenv("FASTLLM_DSV41_DUMP_DIR") ||
+        decoderSwaTailLayer <= 0 || decoderSwaTailLayer >= block_cnt ||
+        chunkSize <= window_size || pastKeyValues.empty() ||
+        inputIds.dataDevice != CPU || inputIds.dataType != FLOAT32 || !inputIds.cpuData ||
+        inputIds.dims.size() != 2 || inputIds.dims[0] != 1 || inputIds.dims[1] <= chunkSize ||
+        !attentionMask.dims.empty() || positionIds.dataDevice != CPU ||
+        positionIds.dataType != FLOAT32 || !positionIds.cpuData || positionIds.dims != inputIds.dims)
+        return false;
+    const int sequence = inputIds.dims[1];
+    if ((sequence - 1) % chunkSize + 1 <= window_size) return false;
+    const float *tokens = reinterpret_cast<const float*>(inputIds.cpuData);
+    const float *positions = reinterpret_cast<const float*>(positionIds.cpuData);
+    for (int i = 0; i < sequence; ++i)
+        if (positions[i] != i || int(tokens[i]) == image_token_id) return false;
+    for (int layer : engram_layer_ids) if (layer >= decoderSwaTailLayer) return false;
+    for (const auto &kv : pastKeyValues)
+        if (!kv.first.dims.empty() || !kv.second.dims.empty() ||
+            !kv.first.pageIndex.empty() || !kv.second.pageIndex.empty()) return false;
+    std::vector<CudaPrefillStage> stages;
+    if (!BuildCudaPrefillStages(deviceMap, block_cnt, stages)) return false;
+    // A stage must own every shared KV/index/candidate source it consumes.
+    // In particular, arbitrary 10/11-layer splits cannot safely overlap.
+    for (const auto &stage : stages) {
+        if (stage.firstLayer >= decoderSwaTailLayer) return false;
+        for (int layer = stage.firstLayer; layer < stage.endLayer; ++layer) {
+            const auto moe = SelectMoeDeviceForLayer(layer);
+            if (moe != "numa" && moe.rfind("numa:", 0) != 0) return false;
+            if (compress_ratios[layer] > 0 &&
+                (kvSourceOf[layer] < stage.firstLayer || indexSourceOf[layer] < stage.firstLayer ||
+                 (candidate_source_layer_id >= 0 && layer > candidate_source_layer_id &&
+                  candidate_source_layer_id < stage.firstLayer))) return false;
+        }
+    }
+    auto existing = GetStateByFirstKey(&pastKeyValues[0].first);
+    if (existing && (existing->pendingMultimodal || existing->totalLen ||
+                    existing->restoredLen || existing->dspark)) return false;
+    const int callerDevice = FastllmCudaGetDevice();
+    struct RestoreDevice { int device; ~RestoreDevice() { FastllmCudaSetDevice(device); } } restore{callerDevice};
+    PrepareHybridPrefill();
+    auto request = GetOrCreateState(pastKeyValues, true);
+    std::vector<std::shared_ptr<DeepSeekV41RequestState>> states(stages.size());
+    std::vector<HybridPrefillStage> contexts(stages.size());
+    std::vector<int> devices;
+    std::mutex hostExperts;
+    for (int rank = 0; rank < int(stages.size()); ++rank) {
+        states[rank] = std::make_shared<DeepSeekV41RequestState>();
+        contexts[rank].firstLayer = stages[rank].firstLayer;
+        contexts[rank].endLayer = stages[rank].endLayer;
+        contexts[rank].request = request.get();
+        contexts[rank].hostExperts = &hostExperts;
+        devices.push_back(stages[rank].device);
+    }
+    FastllmCudaPeerAccessInit(devices);
+    HybridPrefillScope hybrid(devices, true);
+    CudaChunkedPrefillPipeline pipeline;
+    const int chunks = 1 + (sequence - 1) / chunkSize;
+    if (verbose) {
+        printf("[Prompt] DeepSeek hybrid pipelined prefill: %zu stages, %d chunks, %d tokens/chunk.\n",
+            stages.size(), chunks, chunkSize);
+        for (const auto &stage : stages)
+            printf("[DSV41 PP] device=%d layers=[%d,%d)\n", stage.device, stage.firstLayer, stage.endLayer);
+        fflush(stdout);
+    }
+    std::vector<std::pair<Data*, Data*>> sampling;
+    for (auto &kv : pastKeyValues) sampling.emplace_back(&kv.first, &kv.second);
+    pipeline.Run(devices, chunks, BFLOAT16, {1, chunkSize, hc_mult * (embed_dim + 2)},
+        [&](int rank, int chunk, Data &payload) {
+            if (chunk == 0) hybrid.BindWorker(rank);
+            const int start = chunk * chunkSize, count = std::min(chunkSize, sequence - start);
+            Data ids(FLOAT32, {1, count}, std::vector<float>(tokens + start, tokens + start + count));
+            std::vector<DeepSeekV41Segment> segments(1);
+            segments[0].state = states[rank];
+            segments[0].startPos = start;
+            segments[0].seqlen = count;
+            segments[0].prefillCacheOnly = chunk + 1 < chunks;
+            auto &context = contexts[rank];
+            context.payload = &payload;
+            context.sampleOutput = rank + 1 == int(stages.size()) && chunk + 1 == chunks;
+            std::vector<GenerationConfig> configs{generationConfig};
+            std::vector<std::vector<float>*> results{logits};
+            ForwardState frame(*this, segments, ids, nullptr, nullptr, configs, lastTokens,
+                context.sampleOutput ? &results : nullptr, sampling, &context);
+            // Only the first stage embeds. CPU embedding uses the same pool as MoE.
+            {
+                std::lock_guard<std::mutex> lock(hostExperts);
+                frame.PrepareInputs();
+            }
+            for (int layer = context.firstLayer; layer < frame.Layers(); ++layer) {
+                frame.BeginLayer(layer);
+                frame.HybridExperts(layer);
+                frame.EndLayer(layer);
+            }
+            const auto output = frame.Finish();
+            if (context.sampleOutput) outputToken = output.front();
+        });
+    // Run has joined all CUDA streams. Layer storage already belongs to request;
+    // commit the identical token history and logical position exactly once.
+    for (const auto &state : states)
+        AssertInFastLLM(state->totalLen == sequence && state->engramHistory == states.front()->engramHistory,
+            "DeepSeek hybrid PP stage history mismatch.");
+    request->totalLen = sequence;
+    request->engramHistory = std::move(states.front()->engramHistory);
+    return true;
+#else
+    return false;
+#endif
+}
+} // namespace fastllm
