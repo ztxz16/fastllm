@@ -12,6 +12,7 @@
 #include "devices/cuda/cudadevice.h"
 
 #include "fastllm-cuda.cuh"
+#include "devices/multicuda/fastllm-multicuda.cuh"
 
 extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data&, const fastllm::Data&,
     const fastllm::Data&, const fastllm::Data&, fastllm::Data&);
