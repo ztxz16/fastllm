@@ -141,6 +141,45 @@ static void TestPrefillAdmission() {
     Require(partition.SelectPrefill(0,0,{1,1}).key<0,"prefill crossed a record-size partition");
 }
 
+static void TestPrefillPreservesDecode() {
+    using fastllm::MoeFrequencyPolicy;
+    fastllm::MoeCacheConfig config;
+    config.halfLife = 32; config.updateInterval = 3; config.prefillPrior = .5f;
+    MoeFrequencyPolicy policy({0,0,0,0,1}, {0,0,1}, 2, config);
+    Require(!policy.HasDecodeHistory(), "fresh policy has decode history");
+    int owners[] = {0,-1,4}; policy.SetResidents(owners);
+    const int hot = 0;
+    for (int step = 0; step < 8; ++step) {
+        policy.BeginStep(); policy.Observe(0, &hot, 1); policy.EndStep();
+    }
+    Require(policy.HasDecodeHistory(), "decode history was not retained");
+    auto control = policy;
+    const std::vector<int> counts{0,0,8192,8192};
+    policy.ObservePrefill(0, counts, 8192, true);
+    for (int key = 0; key < 5; ++key)
+        Require(policy.Score(key) == control.Score(key), "warm prefill changed decode heat");
+    auto fill = policy.SelectPrefill(2, 0, counts, true);
+    Require(fill.key == 2 && fill.slot == 1, "warm prefill did not fill a vacant slot");
+    policy.Admit(0, fill); control.Admit(0, fill);
+    Require(policy.SelectPrefill(3, 0, counts, true).key < 0,
+            "warm prefill evicted a decode resident");
+    Require(policy.SelectPrefill(4, 0, counts, true).key < 0,
+            "warm prefill crossed partitions or replaced an existing key");
+    // Preserve the observation interval too: after a prompt, the same decode
+    // trace must make the same admissions as a control with no prompt.
+    const int changed = 3;
+    for (int step = 0; step < 32; ++step) {
+        policy.BeginStep(); control.BeginStep();
+        policy.Observe(0, &changed, 1); control.Observe(0, &changed, 1);
+        const auto actual = policy.EndStep(), expected = control.EndStep();
+        Require(actual.size() == expected.size(), "prefill changed decode update cadence");
+        for (size_t i = 0; i < actual.size(); ++i)
+            Require(actual[i].key == expected[i].key && actual[i].slot == expected[i].slot,
+                    "prefill changed subsequent decode admission");
+    }
+    Require(policy.Slot(changed) >= 0, "protected prefill froze decode adaptation");
+}
+
 static void TestFrequencyHotSetChange() {
     using fastllm::MoeFrequencyPolicy;
     for(int layers : {1,3,8,24,48,100}) {
@@ -472,6 +511,7 @@ static void TestSharedOverlap() {
 int main() {
     TestFrequencyAdmission();
     TestPrefillAdmission();
+    TestPrefillPreservesDecode();
     TestFrequencyHotSetChange();
     TestFrequencyIndexUpdates();
     TestFrequencyAvailability();

@@ -2588,6 +2588,37 @@ static void FastllmCudaFP8E4M3EnsureBFloat16BiasOnDevice(fastllm::Data &weight, 
     }
 }
 
+// A channel slice preserves the original full-K dot product and rounding.
+// The caller gathers disjoint output slices; it never sums partial products.
+extern "C" bool FastllmCudaBFloat16FP8ReplicatedRowSlice(
+        const fastllm::Data &input, fastllm::Data &weight,
+        fastllm::Data &output, int rowStart, int rowCount) {
+    if (input.dataType != fastllm::DataType::BFLOAT16 ||
+        output.dataType != fastllm::DataType::BFLOAT16 ||
+        weight.dataType != fastllm::DataType::FP8_E4M3 || weight.IsRepacked ||
+        weight.dims.size() != 2 || input.dims.empty() ||
+        input.Count(0) != (uint64_t)weight.dims[1] ||
+        output.Count(0) != (uint64_t)weight.dims[0] ||
+        rowStart < 0 || rowStart >= weight.dims[0] ||
+        rowCount <= 0 || rowCount > weight.dims[0] - rowStart ||
+        weight.blockK <= 0 || rowStart % weight.blockK ||
+        weight.blockM <= 0 || weight.dims[1] % weight.blockM ||
+        !input.cudaData || !weight.cudaData || output.dataDevice != fastllm::DataDevice::CUDA ||
+        FastllmCudaFp8E4M3HasSm70Layout(weight)) return false;
+    const int m = weight.dims[1], k = weight.dims[0];
+    fastllm::Data emptyBias;
+    FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, emptyBias, k);
+    output.Allocate();
+    LaunchFastllmGemmBF16FP8E4M3(
+        static_cast<__nv_bfloat16 *>(input.cudaData),
+        static_cast<uint8_t *>(weight.cudaData) + (size_t)rowStart * m,
+        static_cast<__nv_bfloat16 *>(output.cudaData) + rowStart,
+        nullptr, static_cast<float *>(weight.extraCudaData[0]) +
+            (size_t)(rowStart / weight.blockK) * ((m - 1) / weight.blockM + 1),
+        1, m, rowCount, weight.blockM, weight.blockK);
+    return true;
+}
+
 bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, bias, k);
     FastllmCudaFP8E4M3EnsureBFloat16BiasOnDevice(weight, bias, k);

@@ -765,3 +765,28 @@ bonus token 和缓存回滚；`deepseekV41OpsRegression` 检查小批量算子�
 使用 NVFP4 专家检查 TP verify 缓存、1–6 行 Graph 重放、主模型特征与 KV 回滚。
 编程模板在 top-p 截断后可能只剩一个候选，因此高接受率本身不能证明使用了贪心验证；
 评估时应记录采样参数、拒绝轮数和代码功能结果，分别检查采样校正与前向浮点误差。
+
+### Decode 投影与准备操作
+
+以下优化自动按输入条件选择，无需新增环境变量；不符合条件时继续使用原路径：
+
+- **mHC finish 与 Norm 合并下发**：BF16、HC=4、少于 16 个 token、偶数隐藏维度 4096–8192。
+  当前子层的 Sinkhorn 与使用上一子层 pre 系数的 Norm 在独立 CTA 中并行。
+  保持原 FP32 归约树、折叠后的 BF16 舍入及 Sinkhorn 顺序。
+- **Full Decode 的旋转准备**：独立的 Q/KV 描述符、输出旋转和窗口写入分别共用一次 kernel 下发。
+  位置、量化和窗口更新规则保持不变。
+- **Engram WKV 单 token 计算分片**：BF16 输入和原始 FP8 权重、对齐的输出通道、可用 NCCL TP 组。
+  每个 rank 只计算自己的输出通道，随后 AllGather BF16 结果。每个点积仍计算完整 K，
+  没有跨卡部分和归约。权重继续保留复制布局；这项优化减少计算和读取，不减少权重显存。
+  Prefill、多 token、其它 dtype、非对齐尺寸及不支持的权重布局使用原投影路径。
+- **Router 准备融合**：不超过 8 个 token、BF16 输入、FP32 权重、至多 1024 个专家时，
+  直接在寄存器中转换输入，并融合温度缩放与 sqrt(softplus)。保留原 FP32 点积归约顺序，
+  专家 Top-K、偏置、归一化和路由规则不变。
+- **O_A 单 token 归约**：各输出行使用独立 warp，保留原 256 线程二叉树求和顺序，
+  减少 block 同步。其余 token 数和不适用的分组布局继续走已有实现。
+
+这些路径使用通用 CUDA 实现，不依赖 Hopper 专用指令。CUDA 回归
+`deepseekV41DecodeProjections` 检查 mHC、Router 和 O_A 的精确结果及拒绝路径；
+`deepseekV41EngramProjection` 检查多卡输出顺序、较大 batch 回退及非法分片边界；
+`deepseekV41FullDecode` / `deepseekV41FullDecodeStress` 覆盖旋转、KV 生命周期和图重放。
+MoE 专家计算与通信调度未在这些优化中调整。

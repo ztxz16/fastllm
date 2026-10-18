@@ -9,6 +9,7 @@
 #include "devices/numas/numas.h"
 #include "../../src/devices/cuda/moe/fastllm-moe-glm5-cache.cuh"
 #include <cuda_bf16.h>
+#include "cuda_moe_prefill_test.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -167,6 +168,12 @@ static void CheckPrefill(FastllmCudaMoeCacheLayer *layers, std::vector<Data *> *
             }
         }
     }
+    Check(cudaSetDevice(0));
+    // Start the shared transport checks cold; the preceding high-row-count
+    // cases deliberately leave a full cache with a different frequency history.
+    FastllmCudaReleaseMoeCache(weightTables[0].data(), layers[0].weightsBatch);
+    Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "shared prefill prepare failed");
+    fastllm_prefill_test::Run(layers, weightTables, tables, true, 128);
     std::puts("GLM prefill: arbitrary rows, cold/warm bitwise output, native bytes and assist admission passed.");
 }
 static void CheckVerify(FastllmCudaMoeCacheLayer *layers, std::vector<Data *> *weights,

@@ -23,6 +23,7 @@
 #include "devices/moe_decode_scheduler.h"
 #include "devices/moe_frequency_policy.h"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/cuda/fastllm-cuda-moe-prefill.h"
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
 #endif
@@ -48,6 +49,7 @@
 #include "fastllm-moe-deepseekv41-cache.cuh"
 #include "fastllm-moe-glm5-cache.cuh"
 #include "fastllm-moe-fp8-scored.cuh"
+#include "fastllm-moe-prefill-restore.cuh"
 
 namespace {
 
@@ -357,6 +359,7 @@ struct DeviceCache {
     int prefillOwnerRank = 0, prefillOwnerCount = 1;
     uint64_t uploadedExpertBytes = 0;
     fastllm::Data prefillChanges;
+    uint64_t prefillStats[8]{};
     int32_t *keyToSlot = nullptr;
     int32_t *hostKeyToSlot = nullptr, *mappedKeyToSlot = nullptr;
     int32_t *slotKeys = nullptr;
@@ -2196,9 +2199,20 @@ bool FastllmCudaCanRunMoeHybrid(fastllm::Data **weights, int weightsBatch) {
     return FindHybridGroup(weights, weightsBatch) != nullptr;
 }
 
+static bool SharedMoePrefillSupported(const OffloadGroup &group) {
+    if (NativeSharedRecords(group) || NativeGlmGGUFRecords(group)) return true;
+    if (!group.sharedLayout.shards) return false;
+    return group.layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 ||
+           group.layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3 ||
+           group.layout.weightType == fastllm::FP8_E4M3 ||
+           group.layout.weightType == fastllm::FP8_E4M3_BLOCK_128;
+}
+
 bool FastllmCudaGetMoePrefillResidents(fastllm::Data **weights, int experts,
                                   FastllmCudaMoePrefillResidents &view, bool create) {
     view = {};
+    const char *enabled = std::getenv("FASTLLM_MOE_PREFILL_CACHE");
+    if (enabled && std::strcmp(enabled, "0") == 0) return false;
     if (!weights || experts <= 0 || !weights[2]) return false;
     OffloadGroup *group = nullptr;
     int table = -1;
@@ -2210,9 +2224,8 @@ bool FastllmCudaGetMoePrefillResidents(fastllm::Data **weights, int experts,
         table = it->second.layer;
     }
     const auto &layout = group->LayerLayout(table);
-    const bool supported = (layout.weightType == fastllm::DATA_GGUF_FORMAT &&
-        !layout.deepSeekV41) || (layout.glm5 && NativeSharedRecords(*group)) ||
-        NativeGlmGGUFRecords(*group);
+    const bool supported = SharedMoePrefillSupported(*group) ||
+        (layout.weightType == fastllm::DATA_GGUF_FORMAT && !layout.deepSeekV41);
     if (!supported || experts > layout.experts) return false;
     if (create && !GetDeviceCache(*group)) return false;
     const int device = FastllmCudaGetDevice();
@@ -2230,7 +2243,9 @@ bool FastllmCudaGetMoePrefillResidents(fastllm::Data **weights, int experts,
     view.gateType = layout.gateGgmlType; view.downType = layout.downGgmlType;
     view.hidden = layout.hidden; view.inter = layout.inter;
     view.ownerRank = cache.prefillOwnerRank; view.ownerCount = cache.prefillOwnerCount;
-    view.nativeGlm = NativeGlmGGUFRecords(*group) || (layout.glm5 && NativeSharedRecords(*group));
+    view.nativeWeights = NativeSharedRecords(*group) || NativeGlmGGUFRecords(*group);
+    view.sharedWeights = SharedMoePrefillSupported(*group);
+    view.nativeGlm = layout.glm5 && view.nativeWeights;
     const auto span = cache.layerSlots.empty() ?
         fastllm::cuda::CacheSlotSpan{0, cache.slots} : cache.layerSlots[table];
     for (int e = 0; e < experts; ++e) {
@@ -2816,6 +2831,8 @@ void FastllmCudaPlanMoePrefill(fastllm::Data **weights, int experts,
         const int32_t *indices, const float *scores, int rows, int topk,
         const std::unordered_set<int> &selected, FastllmCudaMoePrefillPlan &plan) {
     plan = {};
+    const char *enabled = std::getenv("FASTLLM_MOE_PREFILL_CACHE");
+    if (enabled && std::strcmp(enabled, "0") == 0) return;
     if (!weights || experts <= 0 || !weights[2] || !indices || !scores || rows <= 0 || topk <= 0) return;
     OffloadGroup *group = nullptr;
     int table = -1;
@@ -2826,10 +2843,8 @@ void FastllmCudaPlanMoePrefill(fastllm::Data **weights, int experts,
         group = it->second.group; table = it->second.layer;
     }
     const auto &layout = group->LayerLayout(table);
-    const bool supported = (layout.weightType == fastllm::DATA_GGUF_FORMAT && !layout.deepSeekV41) ||
-        (group->sharedLayout.shards && !layout.deepSeekV41 && !layout.glm5) ||
-        (layout.glm5 && NativeSharedRecords(*group)) ||
-        NativeGlmGGUFRecords(*group);
+    const bool supported = SharedMoePrefillSupported(*group) ||
+        (layout.weightType == fastllm::DATA_GGUF_FORMAT && !layout.deepSeekV41);
     if (!supported || experts > layout.experts) return;
     std::lock_guard<std::mutex> lock(group->mutex);
     const auto it = group->deviceCaches.find(FastllmCudaGetDevice());
@@ -2850,7 +2865,9 @@ void FastllmCudaPlanMoePrefill(fastllm::Data **weights, int experts,
         lastRow[e] = row; ++counts[e];
     }
     auto &policy = *cache->frequency;
-    policy.ObservePrefill(base, counts, rows);
+    const bool preserveDecode = layout.weightType != fastllm::DATA_GGUF_FORMAT &&
+        policy.HasDecodeHistory();
+    policy.ObservePrefill(base, counts, rows, preserveDecode);
     std::vector<int> candidates;
     for (int e : selected) {
         --e;
@@ -2862,14 +2879,15 @@ void FastllmCudaPlanMoePrefill(fastllm::Data **weights, int experts,
             candidates.push_back(e);
     }
     std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
-        const float left = policy.Score(base + a), right = policy.Score(base + b);
+        const float left = preserveDecode ? counts[a] : policy.Score(base + a);
+        const float right = preserveDecode ? counts[b] : policy.Score(base + b);
         return left != right ? left > right : a < b;
     });
     plan.weights.assign(2 * experts, nullptr);
     plan.cache = cache;
     plan.table = table;
     for (int e : candidates) {
-        const auto admission = policy.SelectPrefill(base + e, base, active);
+        const auto admission = policy.SelectPrefill(base + e, base, active, preserveDecode);
         if (admission.key < 0) continue;
         policy.Admit(table, admission);
         auto *record = cache->records + (cache->hostSlotOffsets.empty() ?
@@ -2924,6 +2942,175 @@ void FastllmCudaPublishMoePrefill(const FastllmCudaMoePrefillPlan &plan) {
     }
     if (cache.admissionDone) checkCudaErrors("MoE prefill admission fence",
         cudaEventRecord(cache.admissionDone, cudaStreamPerThread));
+}
+
+struct FastllmCudaMoePrefillCache::State {
+    fastllm::Data **source = nullptr;
+    std::vector<fastllm::Data *> weights;
+    std::vector<std::unique_ptr<fastllm::Data>> aliases;
+    FastllmCudaMoePrefillResidents resident;
+    FastllmCudaMoePrefillPlan admission;
+    OffloadGroup *group = nullptr;
+    DeviceCache *cache = nullptr;
+    int table = -1;
+    bool finished = false;
+    ~State() {
+        // Data owns its payload but not the legacy linear auxiliary vectors.
+        // These aliases are scope-local; retain neither bias allocations nor
+        // other kernel scratch after their last compute fence.
+        std::unordered_set<void *> auxiliary;
+        for (const auto &alias : aliases) if (alias) {
+            for (void *pointer : alias->extraCudaData) if (pointer) auxiliary.insert(pointer);
+            for (void *pointer : alias->extraCudaHalfData) if (pointer) auxiliary.insert(pointer);
+        }
+        for (void *pointer : auxiliary) FastllmCudaForceFree(pointer);
+    }
+};
+
+FastllmCudaMoePrefillCache::FastllmCudaMoePrefillCache() : state(new State) {}
+FastllmCudaMoePrefillCache::~FastllmCudaMoePrefillCache() = default;
+
+bool FastllmCudaMoePrefillCache::Begin(fastllm::Data **weights, int experts,
+        const int32_t *indices, const float *scores, int rows, int topk,
+        const std::unordered_set<int> &selected, bool admit) {
+    auto &s = *state;
+    if (!FastllmCudaGetMoePrefillResidents(weights, experts, s.resident, admit) ||
+        !s.resident.sharedWeights) return false;
+    {
+        std::lock_guard<std::mutex> lock(RegistryMutex());
+        const auto found = TableRegistry().find(weights[2]);
+        if (found == TableRegistry().end()) return false;
+        s.group = found->second.group; s.table = found->second.layer;
+    }
+    s.cache = GetDeviceCache(*s.group, false);
+    if (!s.cache) return false;
+    s.source = weights;
+    // A worker may read resident records, but only the owning deployment may
+    // allocate/admit. Whole-expert EP uses each worker's explicit owner rank.
+    if (admit || s.resident.ownerCount > 1)
+        FastllmCudaPlanMoePrefill(weights, experts, indices, scores, rows, topk, selected, s.admission);
+    s.weights.assign(weights, weights + 2 * (experts + 1));
+    s.aliases.resize(s.weights.size());
+    std::vector<int> counts(experts, 0);
+    for (int i = 0; i < rows * topk; ++i)
+        if (indices[i] >= 0 && indices[i] < experts) ++counts[indices[i]];
+    ++s.cache->prefillStats[0];
+    for (int selectedExpert : selected) {
+        const int e = selectedExpert - 1;
+        if (e < 0 || e >= experts || !counts[e]) continue;
+        ++s.cache->prefillStats[1]; s.cache->prefillStats[2] += counts[e];
+        const bool hit = s.resident.weights[2 * e] && s.resident.weights[2 * e + 1];
+        if (hit) {
+            ++s.cache->prefillStats[3]; s.cache->prefillStats[4] += counts[e];
+            s.cache->prefillStats[5] += weights[2 * selectedExpert]->GetBytes() +
+                                      weights[2 * selectedExpert + 1]->GetBytes();
+        }
+        for (int part = 0; part < 2; ++part) {
+            const int at = 2 * e + part, slot = at + 2;
+            const void *pointer = s.resident.weights[at];
+            if (!pointer && s.resident.nativeWeights && at < int(s.admission.weights.size()))
+                pointer = s.admission.weights[at];
+            if (!pointer) continue;
+            const auto &source = *weights[slot];
+            auto alias = std::make_unique<fastllm::Data>(source.dataType);
+            alias->Resize(source.dims);
+            alias->ggmlType = source.ggmlType; alias->ggmlTensor = source.ggmlTensor;
+            alias->isGGUFData = source.isGGUFData; alias->IsRepacked = source.IsRepacked;
+            alias->disableGGUFRepack = source.disableGGUFRepack;
+            alias->forceGGUFFp32Dequant = source.forceGGUFFp32Dequant;
+            alias->blockK = source.blockK; alias->blockM = source.blockM;
+            alias->dataDevice = fastllm::CUDA; alias->dataDeviceIds = {s.cache->device};
+            if (s.resident.nativeWeights) {
+                // Own auxiliary kernel buffers, while borrowing only payload.
+                alias->cudaData = const_cast<void *>(pointer); alias->cudaDataBorrowed = true;
+                alias->expansionSize = source.Count(0); alias->expansionBytes = source.GetBytes();
+            }
+            s.weights[slot] = alias.get(); s.aliases[slot] = std::move(alias);
+        }
+    }
+    return true;
+}
+
+fastllm::Data **FastllmCudaMoePrefillCache::Weights() {
+    return state->source ? state->weights.data() : nullptr;
+}
+
+void FastllmCudaMoePrefillCache::Upload(int slot, void *streamPointer) {
+    auto &s = *state;
+    auto *weight = s.weights[slot];
+    auto stream = streamPointer ? static_cast<cudaStream_t>(streamPointer) : cudaStreamPerThread;
+    const int at = slot - 2;
+    if (weight == s.source[slot]) {
+        if (weight->cpuData || !weight->numasData.empty()) {
+            if (slot >= 2) s.cache->prefillStats[6] += weight->GetBytes();
+            weight->ToCudaTemporary({}, true, streamPointer);
+        }
+        return;
+    }
+    if (s.resident.nativeWeights) {
+        if (at < int(s.admission.weights.size()) && s.admission.weights[at]) {
+            const auto &source = *s.source[slot];
+            const size_t bytes = source.GetBytes() / source.numasData.size();
+            for (size_t node = 0; node < source.numasData.size(); ++node)
+                checkCudaErrors("MoE prefill native upload", cudaMemcpyAsync(
+                    static_cast<uint8_t *>(weight->cudaData) + node * bytes,
+                    source.numasData[node], bytes, cudaMemcpyHostToDevice, stream));
+            s.cache->prefillStats[6] += source.GetBytes();
+        }
+        return;
+    }
+    // Canonical caches are converted on-device into exactly the layout that
+    // the existing multi-row kernels consume. Materialized weights are bounded
+    // by the copy/compute pipeline, independent of resident-cache capacity.
+    weight->Allocate(false);
+    const auto &layout = s.group->LayerLayout(s.table);
+    const int part = at % 2, rows = weight->dims[0], columns = weight->dims[1];
+    const size_t pitch = fastllm::GetDataBytes(weight->dataType, 1, columns);
+    const auto *source = static_cast<const uint8_t *>(s.resident.weights[at]);
+    auto *output = static_cast<uint8_t *>(weight->cudaData);
+    const int blocks = int(std::min<size_t>(256, (size_t(rows) * pitch + 255) / 256));
+    if (layout.weightType == fastllm::FP8_E4M3_BLOCK_128 ||
+        layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0) {
+        fastllm_prefill::RestorePackedRows<<<blocks, 256, 0, stream>>>(source, output, rows, pitch, part == 0);
+    } else if (layout.weightType == fastllm::FP8_E4M3) {
+        const auto *record = static_cast<const uint8_t *>(s.resident.weights[at - part]);
+        const auto *scales = reinterpret_cast<const float *>(record + layout.scalesOffset +
+            (part ? layout.gateScaleBytes : 0));
+        fastllm_prefill::RestoreFp8<<<blocks, 256, 0, stream>>>(source, scales, output,
+            rows, columns, part ? layout.downBlockK : layout.gateBlockK,
+            part ? layout.downBlockM : layout.gateBlockM, pitch, part == 0);
+    } else {
+        const auto *record = static_cast<const uint8_t *>(s.resident.weights[at - part]);
+        const auto *globals = reinterpret_cast<const float *>(record + layout.scalesOffset) + (part ? 2 : 0);
+        fastllm_prefill::RestoreNvfp4<<<blocks, 256, 0, stream>>>(source,
+            source + fastllm::GetNVFP4WeightBytes(rows, columns), globals, output, rows, columns,
+            pitch, part == 0, weight->dataType == fastllm::NVFP4_BLOCK_16_E4M3_PACKED,
+            weight->dataType == fastllm::NVFP4_BLOCK_16_PLANAR);
+    }
+    checkCudaErrors("MoE prefill resident layout", cudaGetLastError());
+}
+
+void FastllmCudaMoePrefillCache::Release(int slot) {
+    auto &s = *state;
+    auto *weight = s.weights[slot];
+    if (weight == s.source[slot]) {
+        if (weight->cpuData || !weight->numasData.empty()) weight->FreeCudaTemporary({}, false);
+    } else if (!s.resident.nativeWeights) weight->FreeSpace();
+}
+
+void FastllmCudaMoePrefillCache::Store(int expert) {
+    if (!state->resident.nativeWeights)
+        FastllmCudaStoreMoePrefillExpert(state->admission, expert,
+            *state->weights[2 * (expert + 1)], *state->weights[2 * (expert + 1) + 1]);
+}
+
+void FastllmCudaMoePrefillCache::Finish() {
+    auto &s = *state;
+    if (!s.source || s.finished) return;
+    FastllmCudaPublishMoePrefill(s.admission);
+    if (!s.admission.keys.empty()) FastllmCudaSyncCurrentThreadStream();
+    s.cache->prefillStats[7] += s.admission.keys.size();
+    s.finished = true;
 }
 
 // The tiny decode activation and route arrays share one host readback fence.
@@ -3898,9 +4085,12 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
     WaitCacheAdmission(*cache);
     // GLM GGUF verification also needs an active scope when all experts fit.
     const char *v41Frequency = std::getenv("FASTLLM_DSV41_MOE_FREQUENCY");
+    // Both native V4.1 layouts support cached and temporary GPU experts.
+    // Auto-configured caches must not require a separate environment opt-in.
     const bool v41FrequencyScope = group->layout.deepSeekV41 &&
-        group->layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 &&
-        v41Frequency && std::strcmp(v41Frequency, "0") != 0;
+        (group->layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 ||
+         group->layout.weightType == fastllm::FP8_E4M3_BLOCK_128) &&
+        (!v41Frequency || (v41Frequency[0] && std::strcmp(v41Frequency, "0") != 0));
     const bool frequencyScope = v41FrequencyScope || (!group->layout.deepSeekV41 && !group->layout.glm5) ||
         (group->layout.glm5 && (NativeSharedRecords(*group) ||
          group->layout.weightType == fastllm::DATA_GGUF_FORMAT));
@@ -4920,6 +5110,17 @@ extern "C" bool fastllm_moe_cuda_cache_route_stats(int device, uint64_t *values)
         auto it = group->deviceCaches.find(device);
         if (it == group->deviceCaches.end() || !it->second || !it->second->ready) continue;
         for (int i = 0; i < 8; ++i) values[i] += it->second->cooperativeStats[i];
+        if (it->second->verify) {
+            const auto &verify = *it->second->verify;
+            values[0] += verify.calls;
+            values[1] += verify.routes;
+            values[2] += verify.hits;
+            values[3] += verify.routes - verify.hits;
+            values[4] += verify.gpuRoutes;
+            values[5] += verify.routes - verify.gpuRoutes;
+            values[6] += verify.gpuRoutes;
+            values[7] += verify.admissions;
+        }
         if (it->second->batchHybrid) {
             const auto &batch = *it->second->batchHybrid;
             const auto &rank = *batch.ranks[0];
@@ -4996,6 +5197,23 @@ extern "C" bool fastllm_moe_cuda_cache_ep_stats(int device, uint64_t *values) {
         values[3] += cache.recordBytes;
         values[4] += cache.cooperativeStats[6];
         values[5] += cache.uploadedExpertBytes;
+    }
+    ok &= cudaSetDevice(previous) == cudaSuccess;
+    return ok;
+}
+
+extern "C" bool fastllm_moe_cuda_cache_prefill_stats(int device, uint64_t *values) {
+    if (!values || device < 0) return false;
+    std::fill_n(values, 8, uint64_t(0));
+    int previous = 0;
+    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(device) != cudaSuccess) return false;
+    bool ok = cudaDeviceSynchronize() == cudaSuccess;
+    std::lock_guard<std::mutex> guard(RegistryMutex());
+    for (const auto &group : Groups()) {
+        std::lock_guard<std::mutex> lock(group->mutex);
+        const auto it = group->deviceCaches.find(device);
+        if (it == group->deviceCaches.end() || !it->second) continue;
+        for (int i = 0; i < 8; ++i) values[i] += it->second->prefillStats[i];
     }
     ok &= cudaSetDevice(previous) == cudaSuccess;
     return ok;

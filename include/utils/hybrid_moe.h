@@ -12,6 +12,11 @@ namespace fastllm {
 // Keep score placement, projection rounding and activation quantization distinct.
 enum class HybridMoeMath { Standard, Glm5, DeepSeekV41 };
 
+// Full prefill timings are meaningful for these host-expert layouts. Keep
+// this capability independent of model names and cache capacity.
+bool HybridMoeMeasuredNativePrefill(const Data *gate, const Data *down,
+                                   HybridMoeMath math);
+
 // A short-lived preparation plan borrows the original expert tables. GPU and
 // disk-resident layers stay outside the host cache. NUMA storage can only be
 // borrowed when every selected table is registered by the supplied callback.

@@ -9,6 +9,7 @@
 #include "devices/numas/numas.h"
 #include "../../src/devices/cuda/moe/fastllm-moe-deepseekv41-cache.cuh"
 #include <cuda_bf16.h>
+#include "cuda_moe_prefill_test.h"
 #include <cuda_fp8.h>
 #include <algorithm>
 #include <cmath>
@@ -320,6 +321,13 @@ int main(int argc, char **argv) {
         Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "V4.1 cache preparation failed");
         Require(FastllmCudaCanRunMoeHybrid(weights[0].data(), weights[0].size()), "V4.1 hybrid unavailable");
         Require(!FastllmCudaCanRunMoeCache(weights[0].data(), weights[0].size()), "generic math accepted V4.1");
+        if (option("--prefill")) {
+            fastllm_prefill_test::Run(layers, weights, tables, true, 32);
+            FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+            for (void *pointer : shards) Check(cudaFreeHost(pointer));
+            return 0;
+        }
+
         Data input(BFLOAT16, {1, hidden}), index(INT32, {1, topk}), scores(FLOAT32, {1, topk}), output;
         Gpu(input);
         Gpu(index);
@@ -493,12 +501,18 @@ int main(int argc, char **argv) {
                 policy.replacementMargin = 0;
                 SetMoeCacheConfig(policy);
                 Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "frequency cache preparation failed");
-                setenv("FASTLLM_DSV41_MOE_FREQUENCY", "1", 1);
+                // Auto mode must activate admission without a private opt-in.
+                unsetenv("FASTLLM_DSV41_MOE_FREQUENCY");
                 setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "hybrid", 1);
                 unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
-                uint64_t before[8], after[8];
+                uint64_t before[8], after[8], cacheBefore[5], cacheAfter[5];
+                Require(fastllm_moe_cuda_cache_stats(0, cacheBefore, false), "frequency initial cache statistics failed");
+                uint64_t expectedResident = 0;
                 Require(fastllm_moe_cuda_cache_route_stats(0, before), "frequency initial statistics failed");
                 for (int repeat = 0; repeat < 24; ++repeat) {
+                    // One expert is admitted after every two complete steps.
+                    // Temporary GPU execution must not bypass this policy.
+                    expectedResident += std::min(repeat / policy.updateInterval, topk);
                     void *step = FastllmCudaBeginMoeDecode(weights[t].data(), weights[t].size(), topk);
                     Require(step != nullptr, "frequency decode scope rejected");
                     int callbacks = 0;
@@ -510,10 +524,15 @@ int main(int argc, char **argv) {
                     Check(cudaMemcpy(actual.data(), output.cudaData, hidden * 2, cudaMemcpyDeviceToHost));
                     std::vector<float> values(hidden);
                     for (int c = 0; c < hidden; ++c) values[c] = __bfloat162float(actual[c]);
-                    Compare(values, expected, "frequency/staged FP4 oracle mismatch");
+                    Compare(values, expected, "frequency/staged V4.1 oracle mismatch");
                 }
                 Require(fastllm_moe_cuda_cache_route_stats(0, after), "frequency final statistics failed");
                 Require(after[1] - before[1] == 24 * topk, "frequency route count mismatch");
+                Require(after[2] - before[2] == expectedResident, "default frequency admission interval/budget ignored");
+                Require(fastllm_moe_cuda_cache_stats(0, cacheAfter, false), "frequency final cache statistics failed");
+                Require(cacheAfter[0] - cacheBefore[0] == expectedResident, "frequency resident lookup count mismatch");
+                Require(cacheAfter[0] + cacheAfter[1] - cacheBefore[0] - cacheBefore[1] == 24 * topk,
+                    "frequency lookups must include CPU and temporary GPU routes");
                 Require(after[5] > before[5], "frequency CPU misses not exercised");
                 Require(after[6] > before[6], "frequency resident GPU hits not exercised");
                 Require(after[4] - before[4] > after[6] - before[6], "dynamic GPU miss streaming not exercised");

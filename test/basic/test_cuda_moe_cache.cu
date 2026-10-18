@@ -2,6 +2,7 @@
 #include "devices/moe_decode_scheduler.h"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #include "fastllm-cuda.cuh"
+#include "cuda_moe_prefill_test.h"
 #include "fastllm-cuda-shared-weight.cuh"
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
@@ -548,7 +549,7 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
                             int hidden = 128, int inter = 64, bool planar = false,
                             bool hybrid = false,
                             fastllm::DataType weightType = fastllm::DataType::NVFP4_BLOCK_16_E4M3,
-                            bool perchannel = false, bool compactScales = false) {
+                            bool perchannel = false, bool compactScales = false, bool prefill = false) {
     constexpr int experts = 24, topk = 7, tables = 2;
     std::mt19937 rng(171);
     std::vector<std::unique_ptr<fastllm::Data>> owned[3];
@@ -678,6 +679,14 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
             throw std::runtime_error("active cache invoked NUMA registration");
         }),
                 "active cache was not reused");
+    }
+    if (prefill) {
+        fastllm_prefill_test::Run(layers[1], weights[1], tables, false, 32, dtype);
+        for (int backend = 0; backend < 2; ++backend)
+            FastllmCudaReleaseMoeCache(weights[backend][0].data(), 2 * (experts + 1));
+        for (void *ptr : shards) Check(cudaFreeHost(ptr));
+        fastllm::SetMoeCudaCacheBytes(0);
+        return;
     }
     fastllm::Data input(dtype, {batch, hidden}), ids(fastllm::DataType::INT32, {batch, topk});
     fastllm::Data scores(fastllm::DataType::FLOAT32, {batch, topk});
@@ -1088,6 +1097,28 @@ static void CheckDecodePolicy() {
 
 int main(int argc, char **argv) {
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--prefill-model-shape") == 0) {
+            CompareNumaCache<__nv_bfloat16>(fastllm::BFLOAT16, 2, 1, 2560, 640,
+                false, false, fastllm::NVFP4_BLOCK_16_E4M3, false, true, true);
+            CompareNumaCache<float>(fastllm::FLOAT32, 2, 1, 2560, 640,
+                false, false, fastllm::NVFP4_BLOCK_16_E4M3, false, true, true);
+            std::puts("ALL_PASS shared prefill model shape");
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--prefill") == 0) {
+            for (int nodes : {1, 2}) {
+                for (int layout = 0; layout < 3; ++layout)
+                    CompareNumaCache<__nv_bfloat16>(fastllm::BFLOAT16, nodes, 1, 256, 128,
+                        layout == 1, false, fastllm::NVFP4_BLOCK_16_E4M3, false, layout == 2, true);
+                for (auto type : {fastllm::FP8_E4M3, fastllm::FP8_E4M3_BLOCK_128})
+                    CompareNumaCache<__nv_bfloat16>(fastllm::BFLOAT16, nodes, 1, 256, 128,
+                        false, false, type, false, false, true);
+                CompareNumaCache<__nv_bfloat16>(fastllm::BFLOAT16, nodes, 1, 256, 128,
+                    false, false, fastllm::FP8_E4M3, true, false, true);
+            }
+            std::puts("ALL_PASS shared prefill NVFP4/FP8 layouts");
+            return 0;
+        }
         if (argc == 2 && std::strcmp(argv[1], "--compact") == 0) {
             for (int columns : {33, 640, 2560}) for (int batch : {1, 4, 8, 32, 65}) {
                 ComparePlanarLinear<float>(fastllm::DataType::FLOAT32, columns, batch, true);

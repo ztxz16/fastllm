@@ -11,6 +11,7 @@
 #include "devices/cpu/alivethreadpool.h"
 #include "persistent_worker_group.h"
 #include "utils/hostbufferreclaim.h"
+#include "utils/hybrid_moe.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -470,7 +471,8 @@ namespace fastllm {
                 const std::vector<int> &gpuDevices,
                 int minSamples,
                 double *outCpuMs, double *outGpuMs,
-                const std::vector<std::vector<uint8_t>> &residents) {
+                const std::vector<std::vector<uint8_t>> &residents,
+                bool residentCpuEligible = false) {
             std::vector<double> unitCost;
             double cpuUnit = 0.0;
             {
@@ -514,7 +516,7 @@ namespace fastllm {
                 for (int e : order) {
                     bool resident = false;
                     for (const auto &device : residents) resident |= device[e] != 0;
-                    if (!resident && (int)expertTasks[e].size() < t) {
+                    if ((!resident || residentCpuEligible) && (int)expertTasks[e].size() < t) {
                         cpuRoutes += (double)expertTasks[e].size();
                     } else {
                         int worker = -1;
@@ -9963,8 +9965,10 @@ namespace fastllm {
                     expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
                 }
             }
-            // Resident experts need no PCIe transfer. Keep them on the GPU
-            // that owns their existing record, independently of the miss split.
+            // Prefer a resident's owning GPU when assigning GPU work. Native
+            // per-expert prefill still pays launch/layout costs: low-row-count
+            // residents may run faster on CPU and must remain in the measured
+            // threshold search. Grouped GGUF retains its resident batching.
             std::vector<bool> residentExperts(m+1, false);
 #ifdef USE_CUDA
             std::vector<std::vector<uint8_t>> residentByDevice(
@@ -9982,7 +9986,7 @@ namespace fastllm {
                          weights[2]->dataType == FP8_E4M3_BLOCK_128);
                     if (!FastllmCudaGetMoePrefillResidents(weights, m, view,
                             nativeGlm && (i == 0 || weights[2]->dataType == DATA_GGUF_FORMAT))) continue;
-                    if (!view.nativeGlm) {
+                    if (!view.sharedWeights) {
                         size_t groupedBytes = 0;
                         if (view.weightType == DATA_GGUF_FORMAT) {
 #ifndef USE_ROCM
@@ -10009,17 +10013,12 @@ namespace fastllm {
             // Feed back whole parallel calls, keyed by the actual weight formats
             // and CPU geometry. Mixed GGUF layers must not share a synthetic
             // single-expert curve simply because their matrix sizes match.
-            const bool measuredNativePrefill = weights[2] && weights[3] &&
-                !deepSeekV4Mode && (IsNumasGroupedNVFP4Weight(weights[2]) ||
-                weights[2]->dataType == FP8_E4M3 ||
-                weights[2]->dataType == FP8_E4M3_BLOCK_128 ||
-                weights[2]->dataType == FP8_E4M3_PERCHANNEL);
+            const auto hybridMath = !deepSeekV4Mode ? HybridMoeMath::Standard :
+                activationQuantBlock == 32 ? HybridMoeMath::DeepSeekV41 : HybridMoeMath::Glm5;
+            const bool measuredNativePrefill = HybridMoeMeasuredNativePrefill(weights[2], weights[3], hybridMath);
             const bool measuredPrefill = measuredNativePrefill || (weights[2] && weights[3] &&
-                (((!deepSeekV4Mode || activationQuantBlock == 128) &&
-                  weights[2]->dataType == DATA_GGUF_FORMAT) ||
-                 (deepSeekV4Mode && activationQuantBlock == 128 &&
-                  weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED &&
-                  weights[3]->dataType == NVFP4_BLOCK_16_E4M3_PACKED)));
+                (!deepSeekV4Mode || activationQuantBlock == 128) &&
+                weights[2]->dataType == DATA_GGUF_FORMAT);
             const bool autoExpertLimit = assistConfig.autoExpertLimit || measuredPrefill;
             const bool balanceGpu = assistConfig.balance || measuredPrefill;
             NumasMoeDeviceSpeedTracker *speedTracker = nullptr;
@@ -10050,7 +10049,7 @@ namespace fastllm {
                     double predictCpuMs = 0.0, predictGpuMs = 0.0;
                     measuredLimit = speedTracker->PredictExpertLimit(
                             expertTasks, weights, weightsBatch, gpuDevices,
-                            2, &predictCpuMs, &predictGpuMs, residentByDevice);
+                            2, &predictCpuMs, &predictGpuMs, residentByDevice, measuredNativePrefill);
                     if (measuredLimit <= 0 && !measuredNativePrefill) {
                         // Sample the two smallest nonresident experts on CPU;
                         // the remaining experts provide simultaneous GPU data.
@@ -10098,7 +10097,7 @@ namespace fastllm {
                     continue;
                 }
                 if (expertTasks[e].empty()) continue;
-                if (!residentExperts[e] && (int)expertTasks[e].size() < expertLimit) {
+                if ((!residentExperts[e] || measuredNativePrefill) && (int)expertTasks[e].size() < expertLimit) {
                     cpuExperts.insert(e);
                 } else {
                     gpuExperts.insert(e);

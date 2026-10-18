@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Expand the CPU fixture to CUDA TP dimensions and compare eager/graph execution.
 
-Requires numpy, torch, safetensors and 2/4/8 CUDA GPUs. The fixed input tokens
+Requires numpy, torch, safetensors and 1/2/4/8 CUDA GPUs. The fixed input tokens
 exercise Engram, shared KV, both indexer stages and changing request lengths.
 """
 import argparse
@@ -107,7 +107,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True)
     parser.add_argument('--hc-mult', type=int, choices=(2, 4), default=4)
-    parser.add_argument('--tp-size', type=int, choices=(2, 4, 8), default=2)
+    parser.add_argument('--tp-size', type=int, choices=(1, 2, 4, 8), default=2)
     backend = parser.add_mutually_exclusive_group()
     backend.add_argument('--expert-cache', action='store_true')
     backend.add_argument('--gpu-experts', action='store_true')
@@ -143,7 +143,7 @@ def main():
         if result.returncode == 77:
             raise SystemExit(77)
         result.check_returncode()
-        assert 'PASS: synchronous/asynchronous TP verification 1..8, features and rollback match across requests' in result.stdout
+        assert 'PASS: eager verification 1..8, features and rollback match across requests' in result.stdout
         if args.eager_only or args.disk_experts:
             assert 'decode CUDA graph captured:' not in result.stdout
             if args.disk_experts:

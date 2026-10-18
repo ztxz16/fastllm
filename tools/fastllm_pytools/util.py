@@ -928,7 +928,7 @@ class _AutoArgumentParser(argparse.ArgumentParser):
 def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = _AutoArgumentParser(description = des, add_help = add_help)
     parser.add_argument('--auto', action='store_true',
-                        help='自动选择Qwen4/GLM-5.3/DeepSeek-V4.1的CUDA混推配置，默认目标128K上下文；Qwen4按预算选择精确KV streaming；显式参数优先')
+                        help='自动选择CUDA混推配置：DeepSeek-V4.1默认1M上下文、DSpark 7和fast_prefill，其他模型默认128K；显式参数优先')
     parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹或配置文件')
     parser.add_argument('-p', '--path', type = str, required = False, default = '', help = '模型路径，fastllm模型文件或HF模型文件夹')
     parser.add_argument('-t', '--threads', type = int, default = -1,  help = '线程数量')
@@ -952,8 +952,11 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help='prefill 攒批的未缓存 token 目标，0关闭；当前仅支持 Naive 普通 TP GPU 推理；批量总预算至少为 chunked_prefill_size')
     parser.add_argument('--prefill_max_wait_ms', type=int, default=0,
                         help='prefill 攒批最长等待毫秒数，0不等待；需设置 prefill_batch_tokens；等待期间继续 decode')
-    parser.add_argument('--fast_prefill', '--fast-prefill', action = 'store_true',
-                        help = '启用DeepSeek-V4.1近似 prefill：后段层只计算末尾滑窗，可能改变 logits；默认关闭')
+    fast_prefill = parser.add_mutually_exclusive_group()
+    fast_prefill.add_argument('--fast_prefill', '--fast-prefill', action='store_true',
+                             help='启用DeepSeek-V4.1近似 prefill：后段层只计算末尾滑窗，可能改变 logits；该模型的--auto默认开启')
+    fast_prefill.add_argument('--no_fast_prefill', '--no-fast-prefill', dest='fast_prefill',
+                             action='store_false', help='关闭近似 prefill，包括覆盖--auto默认值')
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
                         type = _vision_device, default = None,
@@ -1099,6 +1102,16 @@ def expand_cudapp_device(device_str):
         n = int(spec)
         weights = [1] * n
     return str({f'cuda:{i}': w for i, w in enumerate(weights)})
+
+
+def _configure_embedded_dspark(args):
+    threshold = float(args.speculative_dspark_confidence_threshold)
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("--speculative_dspark_confidence_threshold must be in [0, 1]")
+    os.environ["FASTLLM_DSPARK_TOKENS"] = str(args.dspark)
+    os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"] = str(threshold)
+    args.speculative_algorithm = "dspark"
+
 
 def make_normal_llm_model(args, startup_progress = None):
     if startup_progress is not None:
@@ -1357,15 +1370,7 @@ def make_normal_llm_model(args, startup_progress = None):
         args.speculative_algorithm = "dspark"
     else:
         if dspark_tokens > 0:
-            os.environ["FASTLLM_DSPARK_TOKENS"] = str(dspark_tokens)
-            confidence_threshold = float(getattr(
-                args, "speculative_dspark_confidence_threshold", 0.5))
-            if not 0.0 <= confidence_threshold <= 1.0:
-                raise ValueError(
-                    "--speculative_dspark_confidence_threshold must be in [0, 1]")
-            os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"] = str(
-                confidence_threshold)
-            args.speculative_algorithm = "dspark"
+            _configure_embedded_dspark(args)
 
     usenuma = False
     try:
@@ -1476,6 +1481,13 @@ def make_normal_llm_model(args, startup_progress = None):
             dspark_config = config
             if is_deepseek_v41_model and isinstance(config.get("text_config"), dict):
                 dspark_config = config["text_config"]
+            if is_deepseek_v41_model and getattr(args, "auto", False):
+                from .auto_config import apply_model_defaults
+                apply_model_defaults(args, config)
+                if args.dspark != dspark_tokens:
+                    dspark_tokens = args.dspark
+                    speculative_algorithm = args.speculative_algorithm
+                    _configure_embedded_dspark(args)
             if speculative_algorithm == "dspark":
                 if speculative_draft_path:
                     if (architecture != "KimiK3ForConditionalGeneration" and

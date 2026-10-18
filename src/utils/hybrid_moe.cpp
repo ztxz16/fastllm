@@ -6,6 +6,24 @@
 #endif
 
 namespace fastllm {
+bool HybridMoeMeasuredNativePrefill(const Data *gate, const Data *down, HybridMoeMath math) {
+    if (!gate || !down || gate->dataType != down->dataType) return false;
+    switch (gate->dataType) {
+    case FP8_E4M3_BLOCK_128:
+        return true;
+    case FP8_E4M3: case FP8_E4M3_PERCHANNEL:
+        return math == HybridMoeMath::Standard;
+    case NVFP4_BLOCK_16: case NVFP4_BLOCK_16_E4M3:
+        return math == HybridMoeMath::Standard;
+    case NVFP4_BLOCK_16_E4M3_PACKED:
+        return math == HybridMoeMath::Standard || math == HybridMoeMath::Glm5;
+    case NVFP4_BLOCK_32_E8M0:
+        return math == HybridMoeMath::DeepSeekV41;
+    default:
+        return false;
+    }
+}
+
 void HybridMoeCachePlan::Add(const std::vector<Data *> &weights,
                             const std::string &device, int cacheDevice) {
     const bool numa = device == "numa" || device.rfind("numa:", 0) == 0;

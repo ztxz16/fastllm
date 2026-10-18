@@ -161,6 +161,8 @@ namespace fastllm {
         int offset = 0;
         // 非空时本片段处于 DSpark 校验 / 采集模式（见 DeepSeekV41SpecScratch）
         DeepSeekV41SpecScratch *spec = nullptr;
+        // Internal chunked-prefill step: update KV sources, defer the decoder tail/head.
+        bool prefillCacheOnly = false;
     };
 
     // Engram 哈希元数据（由 tokenizer 归一化派生，Python 侧生成 JSON，此处加载）
@@ -238,6 +240,12 @@ namespace fastllm {
                 const std::vector <GenerationConfig> &generationConfigs,
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr) override;
+
+        bool TryForwardChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask, const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken) override;
 
         void WarmUp() override;
 
@@ -373,6 +381,13 @@ namespace fastllm {
         // RoPE、压缩、indexer、稀疏注意力按片段分别执行。
         // inputEmbeds 非空时直接作为嵌入（[1, tokens, dim]，供视觉输入使用）；
         // imageMask 非空时标记每个 token 是否为图像 token（Engram 历史置 -1，路由改用 gate.bias_vl）。
+        struct HybridPrefillStage;
+        void PrepareForwardWeights();
+        void PrepareHybridPrefill();
+        bool TryForwardHybridChunkedPrefill(const Data &inputIds, const Data &attentionMask,
+            const Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+            std::vector<float> *logits, int &outputToken);
         struct ForwardWorkspace;
         struct ForwardState;
         void PrepareForward(ForwardWorkspace &);
@@ -444,7 +459,7 @@ namespace fastllm {
                 const LastTokensManager &lastTokens,
                 std::vector <std::vector <float>*> *logits,
                 const Data *inputEmbeds,
-                const std::vector<int> *imageMask);
+                const std::vector<int> *imageMask, bool prefillCacheOnly = false);
 
         // -------- DSpark 投机解码（src/models/deepseekv41_dspark.cpp）--------
         bool v41DsparkEnabled = false;
