@@ -669,6 +669,90 @@ class Fixture : public NaiveN05FlashModel {
                   << " eager=" << eager << " serving_captures=" << verifyGraphCaptures - captures
                   << " relative_max=" << largestLogitRelative << std::endl;
     }
+    void ServingPageGrowthChecks() {
+        maxBatch = 8; SetMaxTokens(131072); SetChunkedPrefillSize(4096); WarmUp();
+        const int captures = verifyGraphCaptures;
+        std::vector<float> reference;
+        std::exception_ptr error;
+        std::atomic<bool> ready{false};
+        int growthSteps = 0;
+        // Exercise the owned-thread fast path, with identical teacher-forced
+        // tokens and graph shapes. Invalidating every reference step retains
+        // the full validation/allocation path as an exact numerical oracle.
+        mainLoop = new std::thread([&]() {
+            while (!ready.load()) std::this_thread::yield();
+            try {
+                for (bool forceValidation : {true, false}) {
+                    std::vector<std::vector<std::pair<Data, Data>>> cache(8);
+                    ResponseContext invalidation;
+                    invalidation.Init(block_cnt, dataType, kvCacheDataType);
+                    GenerationConfig config;
+                    config.top_k = 1; config.repeat_penalty = 1; config.output_logits = true;
+                    config.output_token_limit = 256;
+                    std::vector<int> past(8);
+                    for (int row = 0; row < 8; ++row) {
+                        past[row] = 3072 + row * 17;
+                        std::vector<float> ids(past[row]), positions(past[row]);
+                        for (int i = 0; i < past[row]; ++i) { ids[i] = (i * 3 + row) % 251; positions[i] = i; }
+                        for (int i = 0; i < block_cnt; ++i)
+                            cache[row].emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
+                        Forward(Data(FLOAT32, {1, past[row]}, ids), Data(),
+                            Data(FLOAT32, {1, past[row]}, positions), cache[row], config);
+                    }
+                    size_t offset = 0;
+                    for (int step = 0; step < 256; ++step) {
+                        std::vector<float> ids(8);
+                        std::vector<Data> positions(8);
+                        std::vector<Data *> pos;
+                        std::vector<std::pair<Data *, Data *>> kv;
+                        std::vector<std::vector<float>> logits(8);
+                        std::vector<std::vector<float> *> output;
+                        std::vector<GenerationConfig> configs(8, config);
+                        std::vector<int> lengths(8, 1);
+                        for (int row = 0; row < 8; ++row) {
+                            ids[row] = (past[row] * 3 + row) % 251;
+                            positions[row].CopyFrom(Data(FLOAT32, {1, 1}, {(float)past[row]}));
+                            pos.push_back(&positions[row]); output.push_back(&logits[row]);
+                            for (auto &layer : cache[row]) kv.emplace_back(&layer.first, &layer.second);
+                        }
+                        if (forceValidation) OnResponseContextCreated(&invalidation);
+                        else {
+                            bool growing = false;
+                            for (int row = 0; row < 8; ++row) {
+                                const auto &local = *cache[row][0].first.multiDeviceDatas.begin()->second;
+                                growing |= past[row] >= (int)local.pageIndex.size() * local.pageLen;
+                            }
+                            growthSteps += growing;
+                        }
+                        ForwardBatch(8, Data(FLOAT32, {1, 8}, ids), {}, pos, lengths, kv,
+                                     configs, LastTokensManager(), &output);
+                        for (int row = 0; row < 8; ++row) {
+                            if (forceValidation) reference.insert(reference.end(), logits[row].begin(), logits[row].end());
+                            else for (float value : logits[row])
+                                if (value != reference.at(offset++))
+                                    throw std::runtime_error("paged growth changed logits");
+                            ++past[row];
+                            for (int layer = 0; layer < block_cnt; ++layer)
+                            for (Data *root : {&cache[row][layer].first, &cache[row][layer].second})
+                            for (auto &entry : root->multiDeviceDatas) {
+                                const auto &local = *entry.second;
+                                if (local.isPagedKVCache &&
+                                    (local.dims[1] != past[row] || local.lastPageLen != (past[row] - 1) % local.pageLen + 1))
+                                    throw std::runtime_error("paged growth metadata mismatch");
+                            }
+                        }
+                    }
+                }
+            } catch (...) { error = std::current_exception(); }
+        });
+        ready.store(true);
+        mainLoop->join(); delete mainLoop; mainLoop = nullptr;
+        if (error) std::rethrow_exception(error);
+        if (growthSteps < 8 || verifyGraphCaptures != captures)
+            throw std::runtime_error("paged growth coverage or graph capture changed");
+        std::cout << "SERVING PAGE GROWTH PASS exact_logits=" << reference.size()
+                  << " growth_steps=" << growthSteps << " serving_captures=0" << std::endl;
+    }
     void RingGraphToggleChecks(bool initialGraph) {
         int checks = 0, graphLaunches = 0;
         const std::vector<bool> modes = {true, true, false, false, true, true, false, true};
@@ -1843,6 +1927,13 @@ int main(int argc, char **argv) {
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (argc > 2 && std::string(argv[2]) == "serving_page_growth") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            Fixture fixture(ranks, false, true, true, true);
+            if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.ServingPageGrowthChecks();
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "cuda_sampling") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);

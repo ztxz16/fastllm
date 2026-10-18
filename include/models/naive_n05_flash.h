@@ -162,7 +162,7 @@ namespace fastllm {
         int CacheReserveCapacity(const GenerationConfig &config) const;
         void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0);
         void ReserveCache(Data &cache, int capacity, int width);
-        void PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
+        bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
         static void TrimCache(Data &cache, int length);
         int SampleTarget(Data &logits, std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
@@ -217,7 +217,7 @@ namespace fastllm {
         struct TPServingState;
         std::shared_ptr<TPServingState> tpServingState;
         std::atomic<uint64_t> tpCacheEpoch{0};
-        bool CanReuseTensorParallelServingCache(const TargetBatch *batch) const;
+        bool CanReuseTensorParallelServingCache(const TargetBatch *batch, bool checkCapacity = true) const;
         void PrepareTensorParallelServing();
         bool PrepareTensorParallelServingDecode(const Data &inputIds,
             const LogitsSelection &selection, std::vector<int *> &cacheLengths,
