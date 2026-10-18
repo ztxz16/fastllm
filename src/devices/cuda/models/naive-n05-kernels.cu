@@ -2883,6 +2883,25 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         return;
     }
 #endif
+    // Share each FP8 window across eight GQA heads. Keep the native BF16
+    // score/probability rounding instead of changing the softmax algorithm.
+    if (queries >= 32 && window == kSwaWindow && causal && !selected &&
+        heads > 0 && kvHeads > 0 && heads == kvHeads * 8 &&
+        dim == kSwaQkDim && valueDim == kSwaValueDim &&
+        query.dataType == BFLOAT16 && key.dataType == FP8_E4M3 && value.dataType == FP8_E4M3 &&
+        key.dims[2] % 8 == 0 && (size_t)query.cudaData % 16 == 0 &&
+        (size_t)key.cudaData % 16 == 0 && (size_t)value.cudaData % 16 == 0) {
+        auto kernel = naive_prefill_mma::Generic<128, 128>;
+        const size_t shared = sizeof(naive_prefill_mma::Storage<128>);
+        if (BulkKernelSupported(kernel, shared, 80)) {
+            kernel<<<dim3(queries, heads / 8), 256, shared>>>(
+                (const BF16 *)query.cudaData, FastllmNaiveKV(key), FastllmNaiveKV(value), nullptr,
+                sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+                (BF16 *)output.cudaData, heads, kvHeads, key.dims[2], keys, count, pastLength, true, 0);
+            CheckLaunch();
+            return;
+        }
+    }
     if (queries == 1 && window == kSwaWindow && causal && !selected &&
         keys > 0 && keys <= kSwaWindow && pastLength == keys - 1 &&
         dim == kSwaQkDim && valueDim == kSwaValueDim && key.dims[2] == kvHeads * dim) {
