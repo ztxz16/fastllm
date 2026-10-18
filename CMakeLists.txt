@@ -1842,6 +1842,19 @@ if (UNIT_TEST)
                     PASS_REGULAR_EXPRESSION "BATCH PASS")
             endforeach()
             foreach(NAIVE_SERVING_RANKS 2 8)
+                foreach(NAIVE_INDEXER_KV bf16 fp8)
+                    add_test(NAME naive_n05_indexer_storage_${NAIVE_SERVING_RANKS}_${NAIVE_INDEXER_KV}
+                        COMMAND naive_n05_verify_graph_test ${NAIVE_SERVING_RANKS} indexer_storage ${NAIVE_INDEXER_KV} fp8)
+                    set_tests_properties(naive_n05_indexer_storage_${NAIVE_SERVING_RANKS}_${NAIVE_INDEXER_KV}
+                        PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                        ENVIRONMENT "FASTLLM_CUDA_CUSTOM_ALLREDUCE=1"
+                        PASS_REGULAR_EXPRESSION "INDEXER STORAGE PASS")
+                endforeach()
+                add_test(NAME naive_n05_indexer_storage_history_${NAIVE_SERVING_RANKS}
+                    COMMAND naive_n05_verify_graph_test ${NAIVE_SERVING_RANKS} history_serving fp8 fp8 layer_shard)
+                set_tests_properties(naive_n05_indexer_storage_history_${NAIVE_SERVING_RANKS}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "TP GPU PREFIX PASS")
                 foreach(NAIVE_WORKSPACE_DTYPE bf16 fp8)
                     add_test(NAME naive_n05_swa_workspace_${NAIVE_SERVING_RANKS}_${NAIVE_WORKSPACE_DTYPE}
                         COMMAND naive_n05_verify_graph_test ${NAIVE_SERVING_RANKS} swa_workspace ${NAIVE_WORKSPACE_DTYPE})

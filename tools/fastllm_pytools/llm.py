@@ -510,6 +510,9 @@ fastllm_lib.set_prefill_batching_llm_model.restype = ctypes.c_bool
 
 fastllm_lib.set_model_indexer_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.set_model_indexer_dtype.restype = None
+if hasattr(fastllm_lib, "set_model_indexer_tp_storage"):
+    fastllm_lib.set_model_indexer_tp_storage.argtypes = [ctypes.c_int, ctypes.c_char_p]
+    fastllm_lib.set_model_indexer_tp_storage.restype = None
 fastllm_lib.set_model_kv_cache_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 
 fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
@@ -1385,9 +1388,14 @@ class model:
                   mmproj_path: str = "",
                   max_context_length: int = -1,
                   rope_scaling = None,
-                  indexer_dtype: str = "auto"):
+                  indexer_dtype: str = "auto",
+                  indexer_tp_storage: str = "replicated"):
         if indexer_dtype not in ("auto", "fp8", "fp8_e4m3"):
             raise ValueError("indexer_dtype must be auto, fp8 or fp8_e4m3")
+        if indexer_tp_storage not in ("replicated", "layer_shard"):
+            raise ValueError("indexer_tp_storage must be replicated or layer_shard")
+        if indexer_tp_storage != "replicated" and not hasattr(fastllm_lib, "set_model_indexer_tp_storage"):
+            raise RuntimeError("The loaded FastLLM library does not support Indexer TP storage; rebuild FastLLM.")
         if (isinstance(max_context_length, bool) or not isinstance(max_context_length, int) or
                 max_context_length != -1 and not 0 < max_context_length <= 2147483647):
             raise ValueError("max_context_length must be a positive 32-bit integer")
@@ -1659,6 +1667,8 @@ class model:
             self.set_kv_cache_dtype(kv_cache_dtype)
         if indexer_dtype != "auto":
             fastllm_lib.set_model_indexer_dtype(self.model, indexer_dtype.encode())
+        if indexer_tp_storage != "replicated":
+            fastllm_lib.set_model_indexer_tp_storage(self.model, indexer_tp_storage.encode())
         self._refresh_context_config()
 
     def _refresh_context_config(self):

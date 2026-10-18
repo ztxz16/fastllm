@@ -47,6 +47,21 @@ KV 历史缓存。页表和滑窗按分配大小使用独立的池，避免请�
 CUDA Graph、采样和临时算子工作区有各自的分配策略，不属于这项 KV 保证。
 CPU、按层串行、其他 KV 类型、草稿模型及跳过预热的直接调用保留原路径。
 
+### Indexer 按层分卡存储
+
+多卡 CUDA TP 可加 `--indexer_tp_storage layer_shard`，将 DSA 层按顺序轮流
+分配给各 TP rank。每层的 Indexer 权重和历史 K 只保存在所属 GPU，由该 GPU
+计算 Indexer，并将整数 TopK 广播给所有 rank；主 attention 的 TP 布局保持原样。
+默认值 `replicated` 保留每卡复制。此参数目前仅支持 Naive/MiMo DSA 模型，
+需要至少两张 TP 卡，并在加载后预热前设置；可与 `--indexer_dtype fp8` 独立组合。
+
+分卡不改变 Indexer 的精度配置。分页缓存和自动容量计算使用各卡实际宽度，
+总 token 容量以负担最重的卡为准。9 个 DSA 层在 TP8 下，一张卡持有 2 层，
+其余各持有 1 层。自动预算会将省下的空间用于更多上下文；固定 `--tokens`
+时则直接降低显存占用。代价是增加 TopK 广播，并停用原先依赖 K 副本的
+Indexer context parallel，长上下文 prefill/decode 可能变慢，需按负载选择。
+批量 decode 每层只广播一次整批 TopK，支持现有的预捕获 Graph 回放。
+
 ### EP8 与内置 MegaMoE
 
 MiMo FP8 在 8 张 H20 上可直接使用 `--tp 8 --ep 8`：Attention 保持 TP8，
