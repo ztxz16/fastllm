@@ -1328,7 +1328,7 @@ namespace fastllm {
 
     // Both schedulers restore the same page references and model-specific
     // companion state. Called while scheduling is locked, between forwards.
-    static PagedCacheManager *RestoreResidentPrefix(basellm *model, ResponseContext *ctx) {
+    static PagedCacheManager *RestoreResidentPrefixImpl(basellm *model, ResponseContext *ctx) {
         if (model->kvMemConfig.enabled || !ctx->multimodalInput.empty() || ctx->cacheLen != 0 ||
             ctx->intParams.count("paged_prefix_restore_disabled")) return nullptr;
         PagedCacheManager *probeManager = nullptr;
@@ -1630,6 +1630,25 @@ namespace fastllm {
             }
         }
         return probeManager;
+    }
+
+    static PagedCacheManager *RestoreResidentPrefix(basellm *model, ResponseContext *ctx) {
+#ifdef USE_CUDA
+        try {
+#endif
+            return RestoreResidentPrefixImpl(model, ctx);
+#ifdef USE_CUDA
+        } catch (const CudaWorkspaceExhausted &error) {
+            // Prefix restoration runs before Forward's allocation guard. Keep
+            // partial state owned by this failed request until normal removal;
+            // no other request or rank may consume it in a forward.
+            fprintf(stderr, "[Fastllm] Prefix restore failed: %s\n", error.what());
+            ctx->isEnding = true;
+            ctx->error = ResponseContextErrorPromptTooLong;
+            model->dictCV.notify_all();
+            return nullptr;
+        }
+#endif
     }
 
     static void RestoreDeferredHistory(basellm *model, ResponseContext *ctx) {
@@ -2256,6 +2275,7 @@ namespace fastllm {
                             std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
                             curBusyPages = manager->maxPages - manager->FreePageCount() + pendingNewPages;
                         }
+                        if (ctx->isEnding) continue;
 
                         // currentActivate already includes every pending
                         // prefill selected earlier in this pass.  Adding
@@ -3008,6 +3028,7 @@ namespace fastllm {
                                     const auto &cache = ctx->pastKeyValues[model->kvCacheId].first;
                                     const long long before = allocatedTokens(cache);
                                     RestoreResidentPrefix(model, ctx);
+                                    if (ctx->isEnding) continue;
                                     RestoreDeferredHistory(model, ctx);
                                     lenSum += allocatedTokens(cache) - before;
                                 }
@@ -3114,6 +3135,7 @@ namespace fastllm {
                                     const auto &cache = it.second->pastKeyValues[model->kvCacheId].first;
                                     const long long before = allocatedTokens(cache);
                                     RestoreResidentPrefix(model, it.second);
+                                    if (it.second->isEnding) continue;
                                     RestoreDeferredHistory(model, it.second);
                                     lenSum += allocatedTokens(cache) - before;
                                 }
@@ -3369,7 +3391,7 @@ namespace fastllm {
                                 model->dictCV.notify_all();
                                 ReleasePendingResultLogits(logits);
                                 for (auto *mask : attentionMasks) delete mask;
-                                for (auto *position : positionIds) delete position;
+                                for (auto *position : ownedPositionIds) delete position;
                                 continue;
                             }
 #endif
