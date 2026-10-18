@@ -267,7 +267,7 @@ namespace fastllm {
         std::set<std::string> quantizedLinearNames;
         void LinearWithActivationQuant(Data &input, const std::string &weightName,
                                        Data &output, bool replicated = false, Data *scratch = nullptr,
-                                       bool inputQuantized = false);
+                                       bool inputQuantized = false, Data *reductionScratch = nullptr);
 
         // -------- 跨层共享 --------
         std::vector<int> kv_source_layer_ids;

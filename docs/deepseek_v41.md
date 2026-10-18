@@ -245,7 +245,7 @@ TP 主模型特征传回草稿 GPU 时显式指定设备；回归覆盖两种首
 
 ### 混合推理的 decode 调度
 
-TP 的共享专家 gate/up 按中间维度切分，down 执行 all-reduce；路由专家仍使用配置的 CPU / NUMA 后端。
+TP 的共享专家在各卡复制计算，保留完整点积后的 BF16 舍入边界；混合执行的路由专家仍使用配置的 CPU / NUMA 后端。
 输入先暂存，再发射 GPU 共享专家，使两条分支重叠。单 token TP 默认使用常驻 worker 与流事件，
 保持 Graph 和段外算子使用的 GPU 地址稳定，并在采样前等待所有 logits 分片的生产完成。
 
@@ -706,7 +706,6 @@ eager / Graph 切换和共享专家重叠，以及 DSpark 的 1～6 token 图重
 | `FASTLLM_DSV41_DISABLE_CUDA_ROUTE` | 路由退回 CPU 参考实现 |
 | `FASTLLM_DSV41_DUMP_DIR` | 把每层中间张量写到该目录（对齐调试） |
 | `FASTLLM_DSV41_DISABLE_TP_ATTENTION` | 张量并行时不切分注意力 head（排查用，注意力改为每卡各算一份） |
-| `FASTLLM_DSV41_DISABLE_TP_SHARED_EXPERT` | 张量并行时不切分共享专家（排查用） |
 | `FASTLLM_CUDA_GRAPH` 等 | decode 与 DSpark 校验的 CUDA Graph，见对应章节 |
 | `FASTLLM_TRACE_OPS` | 逐算子打印"算子名 / 落在哪个设备 / 权重名"（排查 TP 落点用） |
 | `FASTLLM_DSV41_DISABLE_PREFIX_CACHE` 等 | 前缀缓存相关，见"多请求与前缀缓存" |

@@ -54,7 +54,14 @@ using MarlinMoeKernelFn = void (*)(
     int, bool, int, int, int, int, int *, bool, bool, bool);
 
 static MarlinMoeKernelFn GetMarlinMoeKernel(int threadK, int threadN,
-                                            int &threads) {
+                                            int &threads, int tileRows = 8) {
+    if (tileRows == 32 && threadK == 64 && threadN == 128) {
+        threads = 128;
+        return marlin_kernel::Marlin<
+            marlin_types::kBFloat16.id(), marlin_types::kFE2M1f.id(),
+            marlin_types::kBFloat16.id(), marlin_types::kFE8M0fnu.id(),
+            128, 2, 8, 4, false, 4, 2, false>;
+    }
     if (threadK == 128 && threadN == 128) {
         threads = 256;
         return marlin_kernel::Marlin<
@@ -185,9 +192,9 @@ static int GetAwqMarlinMoeSharedMemorySize(bool gate, bool smallBatch) {
     return gate ? 101376 : 49664;
 }
 
-static int GetMarlinMoeSharedMemorySize(int threadK, int threadN) {
+static int GetMarlinMoeSharedMemorySize(int threadK, int threadN, int tileRows = 8) {
     constexpr int stages = 4;
-    constexpr int threadM = 16;
+    const int threadM = std::max(16, tileRows);
     constexpr int groupSize = 32;
     constexpr int packFactor = 8;
 
@@ -238,6 +245,22 @@ static bool PrepareMarlinMoeKernels(int device) {
         }
     }
     return true;
+}
+
+// Optional prefill tile. The ordinary eight-row kernels remain usable on
+// devices that cannot launch it.
+static bool PrepareMarlinMoePrefillKernel(int device) {
+    static thread_local std::map<int, bool> ready;
+    auto it = ready.find(device);
+    if (it != ready.end()) return it->second;
+    int threads = 0, available = 0;
+    auto kernel = GetMarlinMoeKernel(64, 128, threads, 32);
+    const int needed = GetMarlinMoeSharedMemorySize(64, 128, 32);
+    bool ok = kernel && MarlinMoeDeviceSupported(device) &&
+        cudaDeviceGetAttribute(&available, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) == cudaSuccess &&
+        needed <= available && cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, needed) == cudaSuccess;
+    ready[device] = ok;
+    return ok;
 }
 
 static bool PrepareAwqMarlinMoeKernels(int device) {
@@ -312,9 +335,9 @@ static bool LaunchMarlinMoe(
         int topk, bool multiplyTopkWeights, int numGroups, int rows,
         int outputColumns, int inputColumns, int *workspace,
         cudaStream_t stream, int threadK, int threadN, int sms,
-        int blocksPerSm) {
+        int blocksPerSm, int tileRows = 8) {
     int threads = 0;
-    MarlinMoeKernelFn kernel = GetMarlinMoeKernel(threadK, threadN, threads);
+    MarlinMoeKernelFn kernel = GetMarlinMoeKernel(threadK, threadN, threads, tileRows);
     if (kernel == nullptr || activation == nullptr || weight == nullptr ||
         output == nullptr || temporaryOutput == nullptr || scales == nullptr ||
         sortedTokenIds == nullptr || expertIds == nullptr ||
@@ -327,7 +350,7 @@ static bool LaunchMarlinMoe(
     }
 
     kernel<<<sms * blocksPerSm, threads,
-             GetMarlinMoeSharedMemorySize(threadK, threadN), stream>>>(
+             GetMarlinMoeSharedMemorySize(threadK, threadN, tileRows), stream>>>(
         reinterpret_cast<const int4 *>(activation),
         reinterpret_cast<const int4 *>(weight),
         reinterpret_cast<int4 *>(output),
@@ -736,12 +759,15 @@ __global__ void ClearAwqMoeRouteCountsKernel(
 
 __global__ void CountAwqMoeRoutesKernel(
         const int32_t *__restrict__ indices,
-        int32_t *__restrict__ expertCounts, int routes, int experts) {
+        int32_t *__restrict__ expertCounts, int routes, int experts,
+        int ownerRank, int ownerCount) {
     int route = blockIdx.x * blockDim.x + threadIdx.x;
     if (route >= routes) {
         return;
     }
     int expert = indices[route];
+    if (expert < 0 || expert % ownerCount != ownerRank) return;
+    expert /= ownerCount;
     if ((unsigned int)expert < (unsigned int)experts) {
         atomicAdd(expertCounts + expert, 1);
     }
@@ -796,7 +822,8 @@ __global__ void BuildAwqMoeRouteOffsetsKernel(
 __global__ void ScatterAwqMoeRoutesStableKernel(
         const int32_t *__restrict__ indices,
         const int32_t *__restrict__ expertStarts,
-        int32_t *__restrict__ sortedTokenIds, int routes, int experts) {
+        int32_t *__restrict__ sortedTokenIds, int routes, int experts,
+        int ownerRank, int ownerCount) {
     int expert = blockIdx.x;
     if (expert >= experts) {
         return;
@@ -810,7 +837,7 @@ __global__ void ScatterAwqMoeRoutesStableKernel(
     int outputOffset = expertStarts[expert];
     for (int tile = 0; tile < routes; tile += blockDim.x) {
         int route = tile + threadIdx.x;
-        bool selected = route < routes && indices[route] == expert;
+        bool selected = route < routes && indices[route] == expert * ownerCount + ownerRank;
         unsigned int mask = __ballot_sync(0xffffffffu, selected);
         if (lane == 0) {
             warpOffsets[warp] = __popc(mask);
@@ -844,26 +871,27 @@ static void LaunchAwqMoeRouteMetadata(
         int32_t *sortedTokenIds, int32_t *gateExpertIds,
         int32_t *downExpertIds, int32_t *numTokensPadded,
         int routes, int experts, int gateBlock, int downBlock,
-        cudaStream_t stream) {
+        cudaStream_t stream, int ownerRank = 0, int ownerCount = 1) {
     constexpr int threads = 256;
     ClearAwqMoeRouteCountsKernel<<<
         (experts + threads - 1) / threads, threads, 0, stream>>>(
         expertCounts, experts);
     CountAwqMoeRoutesKernel<<<
         (routes + threads - 1) / threads, threads, 0, stream>>>(
-        indices, expertCounts, routes, experts);
+        indices, expertCounts, routes, experts, ownerRank, ownerCount);
     BuildAwqMoeRouteOffsetsKernel<<<1, threads, 0, stream>>>(
         expertCounts, expertStarts, sortedTokenIds, gateExpertIds,
         downExpertIds, numTokensPadded, routes, experts,
         gateBlock, downBlock);
     ScatterAwqMoeRoutesStableKernel<<<experts, threads, 0, stream>>>(
-        indices, expertStarts, sortedTokenIds, routes, experts);
+        indices, expertStarts, sortedTokenIds, routes, experts, ownerRank, ownerCount);
 }
 
 template <typename T>
 __global__ void SwigluRowsKernel(const T *__restrict__ gateUp,
                                  T *__restrict__ output,
-                                 int rows, int intermediate, float limit = 0.0f) {
+                                 int rows, int intermediate, float limit = 0.0f,
+                                 const float *routeScores = nullptr) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     int count = rows * intermediate;
     if (id >= count) {
@@ -878,13 +906,15 @@ __global__ void SwigluRowsKernel(const T *__restrict__ gateUp,
         gate = fminf(gate, limit);
         up = fmaxf(-limit, fminf(up, limit));
     }
-    output[id] = FromFloat<T>((gate / (1.0f + expf(-gate))) * up);
+    float value = (gate / (1.0f + expf(-gate))) * up;
+    if (routeScores != nullptr) value *= routeScores[row];
+    output[id] = FromFloat<T>(value);
 }
 
-template <typename T>
+template <typename T, typename OutT = T>
 __global__ void ReduceEpRowsKernel(const T *__restrict__ expertRows,
                                    const int32_t *__restrict__ globalIndices,
-                                   T *__restrict__ output, int logicalRows,
+                                   OutT *__restrict__ output, int logicalRows,
                                    int topk,
                                    int ownerRank, int ownerCount, int hidden) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -905,7 +935,7 @@ __global__ void ReduceEpRowsKernel(const T *__restrict__ expertRows,
             }
         }
     }
-    output[(size_t)row * hidden + col] = FromFloat<T>(value);
+    output[(size_t)row * hidden + col] = FromFloat<OutT>(value);
 }
 
 template <typename T, bool ApplyScores = false>
@@ -1510,10 +1540,13 @@ __global__ void AwqMarlinMoeDecodeDownH2048N256Top8Kernel(
 
 struct MarlinLayerCache {
     static constexpr int kSmallBatchRows = 8;
+    static constexpr int kV41BatchRows = 256;
+    int batchRows = kSmallBatchRows;
 
     bool ready = false;
     std::atomic<bool> retired {false};
     int device = -1;
+    int computeMajor = 0;
     int experts = 0;
     int hidden = 0;
     int intermediate = 0;
@@ -1527,11 +1560,18 @@ struct MarlinLayerCache {
 
     int32_t *sortedTokenIds = nullptr;
     int32_t *expertIds = nullptr;
+    int32_t *expertCounts = nullptr;
+    int32_t *expertStarts = nullptr;
     int32_t *numTokensPadded = nullptr;
     int *workspace = nullptr;
     float *temporaryOutput = nullptr;
     void *gateOutput = nullptr;
     void *downOutput = nullptr;
+
+    fastllm::Data quantizedInput;
+    // Decode graphs must not borrow the resizable prefill quantization buffer.
+    // Power-of-two buckets keep addresses stable without caching every length.
+    std::map<int, fastllm::Data> decodeQuantizedInputs;
 
     std::mutex buildMutex;
 
@@ -1578,6 +1618,8 @@ static void ReleaseCacheStorage(MarlinLayerCache &cache) {
     ReleaseDirect(cache.downScale);
     ReleaseDirect(cache.sortedTokenIds);
     ReleaseDirect(cache.expertIds);
+    ReleaseDirect(cache.expertCounts);
+    ReleaseDirect(cache.expertStarts);
     ReleaseDirect(cache.numTokensPadded);
     ReleaseDirect(cache.workspace);
     ReleaseDirect(cache.temporaryOutput);
@@ -1589,6 +1631,8 @@ static void ReleaseCacheStorage(MarlinLayerCache &cache) {
     cache.downScale = nullptr;
     cache.sortedTokenIds = nullptr;
     cache.expertIds = nullptr;
+    cache.expertCounts = nullptr;
+    cache.expertStarts = nullptr;
     cache.numTokensPadded = nullptr;
     cache.workspace = nullptr;
     cache.temporaryOutput = nullptr;
@@ -1665,12 +1709,13 @@ static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
     size_t gateScaleBytes = (size_t)intermediate * 2 * (hidden / 32);
     size_t downScaleBytes = (size_t)hidden * (intermediate / 32);
     constexpr size_t scalarBytes = sizeof(uint16_t);
-    const int routeCapacity = topk * MarlinLayerCache::kSmallBatchRows;
+    const int routeCapacity = topk * cache.batchRows;
     // In the worst case every route belongs to a different expert and needs
     // its own eight-row Marlin block.
     const int paddedRouteCapacity = routeCapacity * 8;
 
     cache.device = device;
+    cudaDeviceGetAttribute(&cache.computeMajor, cudaDevAttrComputeCapabilityMajor, device);
     cache.experts = experts;
     cache.hidden = hidden;
     cache.intermediate = intermediate;
@@ -1684,6 +1729,8 @@ static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
         (size_t)paddedRouteCapacity * sizeof(int32_t));
     cache.expertIds = (int32_t *)AllocateDirect(
         (size_t)routeCapacity * sizeof(int32_t));
+    cache.expertCounts = (int32_t *)AllocateDirect((size_t)experts * sizeof(int32_t));
+    cache.expertStarts = (int32_t *)AllocateDirect((size_t)experts * sizeof(int32_t));
     cache.numTokensPadded = (int32_t *)AllocateDirect(sizeof(int32_t));
     cache.workspace = (int *)AllocateDirect((size_t)sms * 4 * sizeof(int));
     size_t temporaryFloats = (size_t)sms * 4 * 8 * 256 * 2;
@@ -1695,6 +1742,7 @@ static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
     if (cache.gateWeight == nullptr || cache.downWeight == nullptr ||
         cache.gateScale == nullptr || cache.downScale == nullptr ||
         cache.sortedTokenIds == nullptr || cache.expertIds == nullptr ||
+        cache.expertCounts == nullptr || cache.expertStarts == nullptr ||
         cache.numTokensPadded == nullptr || cache.workspace == nullptr ||
         cache.temporaryOutput == nullptr || cache.gateOutput == nullptr ||
         cache.downOutput == nullptr) {
@@ -1795,7 +1843,7 @@ static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
 }
 
 static std::shared_ptr<MarlinLayerCache> GetOrBuildLayerCache(
-        fastllm::Data **weights, int weightsBatch, int topk) {
+        fastllm::Data **weights, int weightsBatch, int topk, int batchRows) {
     if (weights == nullptr || weightsBatch < 4 || weights[2] == nullptr) {
         return {};
     }
@@ -1830,6 +1878,7 @@ static std::shared_ptr<MarlinLayerCache> GetOrBuildLayerCache(
         if (cache->retired.load(std::memory_order_acquire)) {
             failed = true;
         } else if (!cache->ready) {
+            cache->batchRows = batchRows;
             failed = !BuildLayerCache(weights, weightsBatch, topk, *cache);
             if (failed) {
                 // Prevent another waiter from retrying this same cache between
@@ -3681,7 +3730,8 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                              fastllm::Data &output, fastllm::Data **weights,
                              int weightsBatch, const int32_t *globalIndices,
                              const float *scores, int topk, int ownerRank,
-                             int ownerCount) {
+                             int ownerCount, bool deepSeekV41 = false,
+                             float swigluLimit = 0.0f) {
     if (globalIndices == nullptr || scores == nullptr || topk <= 0 ||
         topk > 16 || ownerCount <= 0 ||
         input.dims.empty() || input.dataDevice != fastllm::DataDevice::CUDA) {
@@ -3694,7 +3744,8 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
     }
 
     std::shared_ptr<MarlinLayerCache> cache =
-        GetOrBuildLayerCache(weights, weightsBatch, topk);
+        GetOrBuildLayerCache(weights, weightsBatch, topk,
+            deepSeekV41 ? MarlinLayerCache::kV41BatchRows : MarlinLayerCache::kSmallBatchRows);
     if (cache == nullptr || !cache->ready || input.dims.back() != cache->hidden) {
         return false;
     }
@@ -3706,22 +3757,111 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
     if (rows <= 0 || (size_t)rows * cache->hidden != input.Count(0)) {
         return false;
     }
+    const fastllm::Data *gemmInput = &input;
+    if (deepSeekV41) {
+        // The checkpoint requires W4A8, including the BF16 rounding before
+        // quantizing the routed activation fed to the down projection.
+        int bucket = 1;
+        while (bucket < rows && bucket < MarlinLayerCache::kV41BatchRows) bucket *= 2;
+        const bool decodeBuffer = rows <= MarlinLayerCache::kV41BatchRows;
+        fastllm::Data &quantized = decodeBuffer ? cache->decodeQuantizedInputs[bucket] : cache->quantizedInput;
+        quantized.dataType = input.dataType;
+        quantized.Resize(decodeBuffer ? std::vector<int>{bucket, cache->hidden} : input.dims);
+        quantized.ToDevice(fastllm::DataDevice::CUDA, input.dataDeviceIds, false);
+        quantized.Allocate(false);
+        quantized.Resize(input.dims);
+        if (!FastllmCudaDeepSeekV41QuantizeActivation(input, quantized)) return false;
+        gemmInput = &quantized;
+    }
 
-    const bool groupedRows =
-        rows > 1 && rows <= MarlinLayerCache::kSmallBatchRows;
-    const int scratchRoutes = groupedRows ? rows * topk : topk;
-    // The grouped DSpark path keeps all route activations resident at once;
-    // larger/general inputs retain the established serial-row fallback.
+    const bool groupedRows = rows > 1 &&
+        (deepSeekV41 || rows <= MarlinLayerCache::kSmallBatchRows);
+    int chunkRows = std::min(rows, cache->batchRows);
+    int tileRows = 8;
+    auto *sortedTokenIds = cache->sortedTokenIds;
+    auto *expertIds = cache->expertIds;
+    void *gateOutput = cache->gateOutput, *downOutput = cache->downOutput;
+    float *temporaryOutput = cache->temporaryOutput;
+    struct PrefillScratch {
+        void *storage = nullptr;
+        size_t capacity = 0;
+        int device = -1;
+        ~PrefillScratch() {
+            if (storage) {
+                int previous = FastllmCudaGetDevice();
+                FastllmCudaSetDevice(device);
+                FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaFree(storage);
+                FastllmCudaSetDevice(previous);
+            }
+        }
+    };
+    // Every invocation on this worker uses the same per-thread CUDA stream.
+    // Reuse bounded scratch in stream order across layers. This avoids repeated
+    // allocation/event bookkeeping and the synchronous release fallback when
+    // the general allocator supplies storage that cannot be deferred.
+    static thread_local std::map<int, std::unique_ptr<PrefillScratch>> prefillScratchByDevice;
+    if (deepSeekV41 && rows >= 512 && !FastllmCudaGraphIsCapturingFast() &&
+        PrepareMarlinMoePrefillKernel(cache->device)) {
+        const int candidateRows = std::min(rows, 2048);
+        const int routes = candidateRows * topk;
+        const size_t paddedRoutes = (size_t)routes + cache->experts * 31;
+        auto align = [](size_t size) { return (size + 255) & ~size_t(255); };
+        const size_t sortedBytes = align(paddedRoutes * sizeof(int32_t));
+        const size_t expertBytes = align(((paddedRoutes + 31) / 32) * sizeof(int32_t));
+        const size_t gateBytes = align((size_t)routes * cache->intermediate * 2 * sizeof(T));
+        const size_t downBytes = align((size_t)routes * cache->hidden * sizeof(T));
+        const size_t temporaryBytes = align((size_t)cache->sms * 4 * 32 * 256 * 2 * sizeof(float));
+        const size_t bytes = sortedBytes + expertBytes + gateBytes + downBytes + temporaryBytes;
+        if (bytes <= (size_t)512 * 1024 * 1024) {
+            auto &scratch = prefillScratchByDevice[cache->device];
+            if (!scratch) {
+                scratch = std::make_unique<PrefillScratch>();
+                scratch->device = cache->device;
+            }
+            if (scratch->capacity < bytes) {
+                size_t freeMemory = 0, totalMemory = 0;
+                void *replacement = nullptr;
+                // Capacity failure is optional: keep the ordinary small-chunk
+                // implementation when the device cannot reserve this buffer.
+                if (cudaMemGetInfo(&freeMemory, &totalMemory) == cudaSuccess &&
+                    freeMemory >= bytes + ((size_t)1 << 30) &&
+                    FastllmCudaTryDirectMalloc(&replacement, bytes) == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+                    if (scratch->storage) {
+                        FastllmCudaSyncCurrentThreadStream();
+                        FastllmCudaFree(scratch->storage);
+                    }
+                    scratch->storage = replacement;
+                    scratch->capacity = bytes;
+                }
+            }
+            if (scratch->capacity >= bytes) {
+                auto *storage = (uint8_t *)scratch->storage;
+                sortedTokenIds = (int32_t *)storage; storage += sortedBytes;
+                expertIds = (int32_t *)storage; storage += expertBytes;
+                gateOutput = storage; storage += gateBytes;
+                downOutput = storage; storage += downBytes;
+                temporaryOutput = (float *)storage;
+                chunkRows = candidateRows;
+                tileRows = 32;
+            }
+        }
+    }
+    const int scratchRoutes = groupedRows ? chunkRows * topk : topk;
+    // Bound temporary storage while processing an entire decode batch or
+    // prefill chunk with a small number of grouped launches. Each route keeps
+    // its original tensor-core tile row and BF16 rounding boundaries.
     w1.Resize({scratchRoutes, cache->intermediate});
     w1.Allocate(false);
     output.dataDevice = input.dataDevice;
     output.dataDeviceIds = input.dataDeviceIds;
-    output.dataType = input.dataType;
+    output.dataType = deepSeekV41 ? fastllm::DataType::FLOAT32 : input.dataType;
+    output.UpdateUnitSize();
     output.Resize(input.dims);
     output.Allocate(false);
 
     T *activation = (T *)w1.cudaData;
-    T *finalOutput = (T *)output.cudaData;
+    void *finalOutput = output.cudaData;
     if (activation == nullptr || finalOutput == nullptr) {
         return false;
     }
@@ -3746,70 +3886,102 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
     // eager execution.
     constexpr int gateThreadK = 128;
     constexpr int gateThreadN = 128;
-    constexpr int gateBlocksPerSm = 1;
+    // Two resident CTAs reduce the long gate/up tail on Hopper decode. The
+    // ordinary configuration remains the fallback for other architectures.
+    const int gateBlocksPerSm = deepSeekV41 && cache->computeMajor == 9 &&
+        rows >= 16 ? 2 : 1;
     constexpr int downThreadK = 64;
     constexpr int downThreadN = 128;
     constexpr int downBlocksPerSm = 3;
 
+    auto reduceRows = [&](const int32_t *indices, void *destination, int count) {
+        int blocks = (count * cache->hidden + threads - 1) / threads;
+        if (deepSeekV41) {
+            ReduceEpRowsKernel<T, float><<<blocks, threads, 0, cudaStreamPerThread>>>(
+                (const T *)downOutput, indices, (float *)destination,
+                count, topk, ownerRank, ownerCount, cache->hidden);
+        } else {
+            ReduceEpRowsKernel<T><<<blocks, threads, 0, cudaStreamPerThread>>>(
+                (const T *)downOutput, indices, (T *)destination,
+                count, topk, ownerRank, ownerCount, cache->hidden);
+        }
+    };
+
     if (groupedRows) {
-        const int routes = rows * topk;
-        BuildEpMetadataRowsKernel<<<1, 64, 0, cudaStreamPerThread>>>(
-            globalIndices, cache->sortedTokenIds, cache->expertIds,
-            nullptr,
-            cache->numTokensPadded, rows, topk, ownerRank, ownerCount,
-            cache->experts);
-        if (!checkStage("grouped EP metadata")) {
-            return false;
-        }
+        for (int first = 0; first < rows; first += chunkRows) {
+            const int count = std::min(chunkRows, rows - first);
+            const int routes = count * topk;
+            const int32_t *chunkIndices = globalIndices + (size_t)first * topk;
+            const float *chunkScores = scores + (size_t)first * topk;
+            const T *chunkInput = (const T *)gemmInput->cudaData + (size_t)first * cache->hidden;
+            void *chunkOutput = (uint8_t *)finalOutput + (size_t)first * cache->hidden *
+                (deepSeekV41 ? sizeof(float) : sizeof(T));
+            w1.Resize({routes, cache->intermediate});
+            if (deepSeekV41 && (count >= 16 || tileRows == 32)) {
+                // Group local routes using the selected tile, including tail chunks.
+                // Keep flattened route ids and their reduction order unchanged.
+                LaunchAwqMoeRouteMetadata(chunkIndices, cache->expertCounts, cache->expertStarts,
+                    sortedTokenIds, expertIds, expertIds,
+                    cache->numTokensPadded, routes, cache->experts, tileRows, tileRows,
+                    cudaStreamPerThread, ownerRank, ownerCount);
+            } else {
+                BuildEpMetadataRowsKernel<<<1, 64, 0, cudaStreamPerThread>>>(
+                    chunkIndices, sortedTokenIds, expertIds, nullptr,
+                    cache->numTokensPadded, count, topk, ownerRank, ownerCount, cache->experts);
+            }
+            if (!checkStage("grouped EP metadata")) {
+                return false;
+            }
 
-        if (!LaunchMarlinMoe(
-                input.cudaData, cache->gateWeight, cache->gateOutput,
-                cache->temporaryOutput, cache->gateScale,
-                cache->sortedTokenIds, cache->expertIds,
-                cache->numTokensPadded, scores, topk, false, gateGroups,
-                rows, cache->intermediate * 2, cache->hidden,
-                cache->workspace, cudaStreamPerThread, gateThreadK,
-                gateThreadN, cache->sms, gateBlocksPerSm) ||
-            !checkStage("grouped gate/up GEMM")) {
-            return false;
-        }
+            if (!LaunchMarlinMoe(
+                    chunkInput, cache->gateWeight, gateOutput,
+                    temporaryOutput, cache->gateScale,
+                    sortedTokenIds, expertIds,
+                    cache->numTokensPadded, chunkScores, topk, false, gateGroups,
+                    count, cache->intermediate * 2, cache->hidden,
+                    cache->workspace, cudaStreamPerThread, tileRows == 32 ? 64 : gateThreadK,
+                    gateThreadN, cache->sms, tileRows == 32 ? 2 : gateBlocksPerSm, tileRows) ||
+                !checkStage("grouped gate/up GEMM")) {
+                return false;
+            }
 
-        int actCount = routes * cache->intermediate;
-        SwigluRowsKernel<<<(actCount + threads - 1) / threads, threads, 0,
-                           cudaStreamPerThread>>>(
-            (const T *)cache->gateOutput, activation, routes,
-            cache->intermediate);
-        if (!checkStage("grouped SwiGLU")) {
-            return false;
-        }
+            int actCount = routes * cache->intermediate;
+            SwigluRowsKernel<<<(actCount + threads - 1) / threads, threads, 0,
+                               cudaStreamPerThread>>>(
+                (const T *)gateOutput, activation, routes,
+                cache->intermediate, deepSeekV41 ? swigluLimit : 0.0f,
+                deepSeekV41 ? chunkScores : nullptr);
+            if (deepSeekV41 && !FastllmCudaDeepSeekV41QuantizeActivation(w1, w1)) return false;
+            if (!checkStage("grouped SwiGLU")) {
+                return false;
+            }
 
-        if (!LaunchMarlinMoe(
-                activation, cache->downWeight, cache->downOutput,
-                cache->temporaryOutput, cache->downScale,
-                cache->sortedTokenIds, cache->expertIds,
-                cache->numTokensPadded, scores, 1, true, downGroups,
-                routes, cache->hidden, cache->intermediate,
-                cache->workspace, cudaStreamPerThread, downThreadK,
-                downThreadN, cache->sms, downBlocksPerSm) ||
-            !checkStage("grouped down GEMM")) {
-            return false;
-        }
+            if (!LaunchMarlinMoe(
+                    activation, cache->downWeight, downOutput,
+                    temporaryOutput, cache->downScale,
+                    sortedTokenIds, expertIds,
+                    cache->numTokensPadded, chunkScores, 1, !deepSeekV41, downGroups,
+                    routes, cache->hidden, cache->intermediate,
+                    cache->workspace, cudaStreamPerThread, downThreadK,
+                    downThreadN, cache->sms, tileRows == 32 ? 2 : downBlocksPerSm, tileRows) ||
+                !checkStage("grouped down GEMM")) {
+                return false;
+            }
 
-        int outputCount = rows * cache->hidden;
-        ReduceEpRowsKernel<<<(outputCount + threads - 1) / threads, threads,
-                             0, cudaStreamPerThread>>>(
-            (const T *)cache->downOutput, globalIndices, finalOutput, rows,
-            topk, ownerRank, ownerCount, cache->hidden);
-        return checkStage("grouped EP row reduction");
+            reduceRows(chunkIndices, chunkOutput, count);
+            if (!checkStage("grouped EP row reduction")) return false;
+        }
+        return true;
     }
 
     int actCount = topk * cache->intermediate;
     for (int row = 0; row < rows; ++row) {
-        const T *rowInput = (const T *)input.cudaData +
+        const T *rowInput = (const T *)gemmInput->cudaData +
                             (size_t)row * cache->hidden;
         const int32_t *rowIndices = globalIndices + (size_t)row * topk;
         const float *rowScores = scores + (size_t)row * topk;
-        T *rowOutput = finalOutput + (size_t)row * cache->hidden;
+        void *rowOutput = (uint8_t *)finalOutput + (size_t)row * cache->hidden *
+            (deepSeekV41 ? sizeof(float) : sizeof(T));
 
         BuildEpMetadataKernel<<<1, 1, 0, cudaStreamPerThread>>>(
             rowIndices, cache->sortedTokenIds, cache->expertIds,
@@ -3841,7 +4013,9 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
         SwigluRowsKernel<<<(actCount + threads - 1) / threads, threads, 0,
                            cudaStreamPerThread>>>(
             (const T *)cache->gateOutput, activation, topk,
-            cache->intermediate);
+            cache->intermediate, deepSeekV41 ? swigluLimit : 0.0f,
+            deepSeekV41 ? rowScores : nullptr);
+        if (deepSeekV41 && !FastllmCudaDeepSeekV41QuantizeActivation(w1, w1)) return false;
         if (!checkStage("SwiGLU")) {
             return false;
         }
@@ -3850,7 +4024,7 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
             activation, cache->downWeight, cache->downOutput,
             cache->temporaryOutput, cache->downScale,
             cache->sortedTokenIds, cache->expertIds, cache->numTokensPadded,
-            rowScores, 1, true, downGroups, topk, cache->hidden,
+            rowScores, 1, !deepSeekV41, downGroups, topk, cache->hidden,
             cache->intermediate, cache->workspace, cudaStreamPerThread,
             downThreadK, downThreadN, cache->sms, downBlocksPerSm)) {
             std::fprintf(stderr,
@@ -3864,10 +4038,7 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
             return false;
         }
 
-        ReduceEpRowsKernel<<<(cache->hidden + threads - 1) / threads, threads,
-                             0, cudaStreamPerThread>>>(
-            (const T *)cache->downOutput, rowIndices, rowOutput, 1, topk,
-            ownerRank, ownerCount, cache->hidden);
+        reduceRows(rowIndices, rowOutput, 1);
         if (!checkStage("EP row reduction")) {
             return false;
         }
@@ -4026,8 +4197,22 @@ bool FastllmCudaHalfMergeMOEVllmMarlinBatch1ExpertParallel(
 bool FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
         const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
         fastllm::Data **weights, int weightsBatch, const int32_t *globalIndices,
-        const float *scores, int topk, int ownerRank, int ownerCount) {
+        const float *scores, int topk, int ownerRank, int ownerCount,
+        bool deepSeekV41, float swigluLimit) {
     return fastllm_marlin_moe::RunMarlinMoe<__nv_bfloat16>(
         input, w1, output, weights, weightsBatch, globalIndices, scores, topk,
-        ownerRank, ownerCount);
+        ownerRank, ownerCount, deepSeekV41, swigluLimit);
+}
+
+bool FastllmCudaV41MarlinGraphReady(const fastllm::Data *layerKey, int rows) {
+    using namespace fastllm_marlin_moe;
+    std::lock_guard<std::mutex> lock(LayerCacheRegistryMutex());
+    auto it = LayerCacheRegistry().find(layerKey);
+    if (it == LayerCacheRegistry().end() || !it->second->ready ||
+        it->second->retired.load(std::memory_order_acquire)) return false;
+    int bucket = 1;
+    while (bucket < rows && bucket < MarlinLayerCache::kV41BatchRows) bucket *= 2;
+    if (rows > bucket) return false;
+    auto input = it->second->decodeQuantizedInputs.find(bucket);
+    return input != it->second->decodeQuantizedInputs.end() && input->second.cudaData != nullptr;
 }

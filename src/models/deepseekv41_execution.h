@@ -23,6 +23,7 @@ namespace fastllm {
         Data attnInputQuantized, qNormQuantized;
         // TP and CUDA graphs retain one buffer per weight.
         std::map<std::string, Data> quantizedActivations;
+        std::map<std::string, Data> reductionBuffers;
     };
 
     struct DeepSeekV41MoeContext {

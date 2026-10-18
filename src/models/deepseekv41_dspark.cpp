@@ -790,13 +790,19 @@ namespace fastllm {
     }
 
     void DeepSeekV41Model::DsparkProjectHead(Data &input, Data &output) {
+        Data floatInput;
+        Data *headInput = &input;
+        if (weight["head.weight"].dataType == DataType::FLOAT32) {
+            ToDataType(input, floatInput, DataType::FLOAT32);
+            headInput = &floatInput;
+        }
         if (v41DsparkTpDevices.empty()) {
-            LinearWithActivationQuant(input, "head.weight", output);
+            LinearWithActivationQuant(*headInput, "head.weight", output);
             return;
         }
         ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
         Data quantized;
-        Data *source = &input;
+        Data *source = headInput;
         if (quantizedLinearNames.count("head.weight")) {
             DsExecutor().Run("DeepSeekV41QuantizeActivation",
                 {{"input", &input}, {"output", &quantized}}, {}, {});

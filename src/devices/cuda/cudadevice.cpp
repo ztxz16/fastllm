@@ -10328,8 +10328,96 @@ namespace fastllm {
         return ok;
     }
 
+    // Architecture-independent V4.1 fallback. Only route metadata is staged
+    // on the host; the original weights and all arithmetic stay on CUDA.
+    // This eager path deliberately does not claim CUDA Graph compatibility.
+    static void DoCudaMergeMOEV41Fallback(Data &input, Data &output,
+            Data &index, Data &score, Data **weights, int weightsBatch,
+            float sharedScale, float swigluLimit) {
+        AssertInFastLLM(input.dataType == DataType::BFLOAT16 &&
+            input.dims.size() == 2 && index.dataType == DataType::INT32 &&
+            score.dataType == DataType::FLOAT32 && weightsBatch > 0,
+            "V4.1 CUDA MoE fallback requires BF16 input and typed routes.");
+        cudaMergeMOEUsedGraphUnsafeFallback = true;
+        int device = FastllmCudaGetDevice();
+        int rows = input.dims[0], hidden = input.dims[1], topk = index.dims.back();
+        std::vector<int32_t> ids(rows * topk);
+        std::vector<float> scores(rows * topk);
+        if (index.dataDevice == DataDevice::CUDA)
+            FastllmCudaCopyFromDeviceToHost(ids.data(), index.cudaData, ids.size() * sizeof(int32_t));
+        else std::memcpy(ids.data(), index.cpuData, ids.size() * sizeof(int32_t));
+        if (score.dataDevice == DataDevice::CUDA)
+            FastllmCudaCopyFromDeviceToHost(scores.data(), score.cudaData, scores.size() * sizeof(float));
+        else std::memcpy(scores.data(), score.cpuData, scores.size() * sizeof(float));
+        output.dataType = DataType::FLOAT32;
+        output.UpdateUnitSize();
+        output.Resize(input.dims);
+        output.ToDevice(DataDevice::CUDA, {device}, false);
+        output.Allocate(false);
+        FastllmCudaMemset0(output.cudaData, output.GetBytes());
+        Data gathered, middle, activation, expertOut, floatOut;
+        for (Data *tensor : {&gathered, &middle, &activation, &expertOut, &floatOut}) {
+            tensor->dataDevice = DataDevice::CUDA;
+            tensor->dataDeviceIds = {device};
+        }
+        for (int slot = 0; slot + 1 < weightsBatch; slot += 2) {
+            if (weights[slot] == nullptr || weights[slot + 1] == nullptr) continue;
+            AssertInFastLLM(weights[slot]->cudaData && weights[slot + 1]->cudaData,
+                "V4.1 MoE cannot fall back after discarding source weights. A packed kernel failed.");
+            std::vector<int32_t> selected;
+            std::vector<float> selectedScores;
+            for (int row = 0; row < rows; ++row) {
+                if (slot == 0) {
+                    if (sharedScale != 0.0f) {
+                        selected.push_back(row);
+                        selectedScores.push_back(sharedScale);
+                    }
+                } else for (int j = 0; j < topk; ++j) {
+                    if (ids[row * topk + j] == slot / 2 - 1) {
+                        selected.push_back(row);
+                        selectedScores.push_back(scores[row * topk + j]);
+                    }
+                }
+            }
+            int count = (int)selected.size();
+            if (count == 0) continue;
+            Data rowIds(DataType::INT32, {count});
+            rowIds.Allocate();
+            std::memcpy(rowIds.cpuData, selected.data(), count * sizeof(int32_t));
+            rowIds.ToDevice(DataDevice::CUDA, {device}, true);
+            Data routeScales(DataType::FLOAT32, {count}, selectedScores);
+            routeScales.ToDevice(DataDevice::CUDA, {device}, true);
+            Data unitScales(DataType::FLOAT32, {count}, std::vector<float>(count, 1.0f));
+            unitScales.ToDevice(DataDevice::CUDA, {device}, true);
+            gathered.dataType = DataType::BFLOAT16;
+            gathered.Resize({count, hidden});
+            gathered.ToDevice(DataDevice::CUDA, {device}, false);
+            gathered.Allocate(false);
+            FastllmCudaPickInput((uint8_t *)input.cudaData, (uint8_t *)gathered.cudaData,
+                count, hidden * sizeof(uint16_t), (int *)rowIds.cudaData);
+            AssertInFastLLM(FastllmCudaDeepSeekV41QuantizeActivation(gathered, gathered),
+                "V4.1 CUDA MoE input quantization failed.");
+            DoCudaLinearReshape(gathered, *weights[slot], middle);
+            DoCudaLinear(gathered, *weights[slot], *GetEmptyData(), middle);
+            AssertInFastLLM(FastllmCudaDeepSeekV41SharedSwigluQuantized(
+                middle, swigluLimit, activation, (const float *)routeScales.cudaData),
+                "V4.1 CUDA MoE gated activation failed.");
+            DoCudaLinearReshape(activation, *weights[slot + 1], expertOut);
+            DoCudaLinear(activation, *weights[slot + 1], *GetEmptyData(), expertOut);
+            floatOut.dataType = DataType::FLOAT32;
+            floatOut.Resize(expertOut.dims);
+            floatOut.ToDevice(DataDevice::CUDA, {device}, false);
+            floatOut.Allocate(false);
+            FastllmBF16ToFloat(expertOut.cudaData, floatOut.cudaData, expertOut.Count(0));
+            FastllmCudaPickOutputFloat((float *)floatOut.cudaData, (float *)output.cudaData,
+                count, hidden, (int *)rowIds.cudaData, (float *)unitScales.cudaData);
+            // The per-expert route buffers are released before the next group.
+            FastllmCudaSyncDevice(device);
+        }
+    }
+
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
-                        Data **weights, Data **biass, float sharedScale, MoeGateType gateType, int weightsBatch, float swigluLimit) {
+                        Data **weights, Data **biass, float sharedScale, MoeGateType gateType, int weightsBatch, float swigluLimit, bool deepSeekV41) {
         int curDeviceId = FastllmCudaGetDevice();
         auto clearIfOnOtherDevice = [curDeviceId](Data &data) {
             if (data.cudaData == nullptr) {
@@ -10347,6 +10435,12 @@ namespace fastllm {
         clearIfOnOtherDevice(w2);
         clearIfOnOtherDevice(w3);
         clearIfOnOtherDevice(output);
+        if (deepSeekV41) {
+            AssertInFastLLM(gateType == MoeGateSwiglu, "V4.1 MoE requires SwiGLU.");
+            DoCudaMergeMOEV41Fallback(input, output, index, score, weights,
+                weightsBatch, sharedScale, swigluLimit);
+            return;
+        }
         {
             int batch = input.dims[0];
 
@@ -10641,8 +10735,11 @@ namespace fastllm {
         const float swigluLimit = floatParams.count("swigluLimit") ? floatParams.at("swigluLimit") : 0.0f;
         AssertInFastLLM(std::isfinite(swigluLimit) && swigluLimit >= 0.0f,
                        "CUDA MoE swigluLimit must be finite and non-negative.");
+        const bool deepSeekV41 = intParams.count("deepSeekV4Mode") &&
+            intParams.at("deepSeekV4Mode") && intParams.count("activationQuantBlock") &&
+            intParams.at("activationQuantBlock") == 32;
         DoCudaMergeMOE (
-            input, output, index, score, w1, w2, w3, weights, biass, sharedScale, gateType, weightsBatch, swigluLimit
+            input, output, index, score, w1, w2, w3, weights, biass, sharedScale, gateType, weightsBatch, swigluLimit, deepSeekV41
         );
     }
 

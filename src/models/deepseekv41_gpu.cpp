@@ -28,11 +28,19 @@ namespace fastllm {
         Data &moeInputTemp = ws->moeInputTemp, &moeOutputTemp = ws->moeOutputTemp;
         runSharedSegment();
         ctx.releaseSharedScratch();
+        const bool fp32ExpertSum =
+            quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") != 0;
         bool combineFfnPostDispatch = false;
 #ifdef USE_CUDA
-        combineFfnPostDispatch = tp && single && hasSharedExpertOut && !dumpDebug &&
+        combineFfnPostDispatch = (!fp32ExpertSum ||
+            (ffnInput.dataType == DataType::BFLOAT16 && sharedExpertOut.dataType == DataType::BFLOAT16)) &&
+            tp && single && hasSharedExpertOut && !dumpDebug &&
             (seqlen == 1 || dsparkVerify);
 #endif
+        // Keep the FP32 routed sum for the fused HC post path. The CUDA
+        // kernel still rounds the shared+routed result to BF16 before HC.
+        Data &routedOutput = fp32ExpertSum && !combineFfnPostDispatch ?
+            ws->reductionBuffers["moe_routed_sum"] : ffnOut;
         ApplyMoeDeviceMapForLayer(layer);
         const bool routedExpertParallel = V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "multicuda");
         Data *input = &ffnInput, *index = &expertIndex, *score = &expertScore;
@@ -44,7 +52,10 @@ namespace fastllm {
         }
         // CUDA MoE bins routes on the host. Never let it migrate graph-owned
         // tensors; TP expert parallelism instead needs an independent replica.
-        if ((tp && !routedExpertParallel) || graphActive) {
+        // The V4.1 native EP path and its generic fallback only read typed
+        // routing tensors. They can consume the graph-owned replicas directly.
+        if ((tp && !routedExpertParallel) ||
+            (graphActive && !(fp32ExpertSum && routedExpertParallel))) {
             if (routedExpertParallel) {
                 V41Assign(cpuMoeIndex, expertIndex, tpDevices);
                 V41Assign(cpuMoeScore, expertScore, tpDevices);
@@ -56,7 +67,7 @@ namespace fastllm {
             score = &cpuMoeScore;
         }
         MergeMOEBlock(input, index, score, &moeWeights, &biass[layer],
-                      &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &ffnOut, layer,
+                      &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &routedOutput, layer,
                       ffnInput.dataType, ffnInput.dataType, &moeInputTemp, &moeOutputTemp,
                       MoeGateSwiglu, routedExpertParallel, swiglu_limit, true, nullptr,
                       quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") ? 32 : 128,
@@ -64,16 +75,28 @@ namespace fastllm {
         ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
 #ifdef USE_CUDA
         // Preserve generic-operator fallback semantics for unsupported dtypes.
-        if (tp && !combineFfnPostDispatch && ffnOut.dataDevice == DataDevice::CPU && ffnOut.cpuData) {
-            V41ResetMultiDevice(ffnOut);
-            PrepareMultiCudaReplicatedData(ffnOut, tpDevices, true);
+        if (tp && !combineFfnPostDispatch && routedOutput.dataDevice == DataDevice::CPU && routedOutput.cpuData) {
+            V41ResetMultiDevice(routedOutput);
+            PrepareMultiCudaReplicatedData(routedOutput, tpDevices, true);
         }
 #endif
         if (hasSharedExpertOut && !combineFfnPostDispatch) {
-            if (!(tp && ffnOut.multiDeviceData && sharedExpertOut.multiDeviceData)) {
-                ffnOut.ToDevice(sharedExpertOut.dataDevice);
+            if (!(tp && routedOutput.multiDeviceData && sharedExpertOut.multiDeviceData)) {
+                routedOutput.ToDevice(sharedExpertOut.dataDevice);
             }
-            AddTo(ffnOut, sharedExpertOut);
+            if (routedOutput.dataType == DataType::FLOAT32 &&
+                sharedExpertOut.dataType != DataType::FLOAT32) {
+                Data &sharedFloat = ws->reductionBuffers["moe_shared_sum"];
+                ToDataType(sharedExpertOut, sharedFloat, DataType::FLOAT32);
+                AddTo(routedOutput, sharedFloat);
+            } else {
+                AddTo(routedOutput, sharedExpertOut);
+            }
+        }
+        if (!combineFfnPostDispatch && routedOutput.dataType != ffnInput.dataType) {
+            ToDataType(routedOutput, ffnOut, ffnInput.dataType);
+        } else if (&routedOutput != &ffnOut) {
+            V41Assign(ffnOut, routedOutput, tpDevices);
         }
 #ifdef USE_CUDA
         if (graphActive && !tp && ffnOut.dataDevice == DataDevice::CPU) ffnOut.ToDevice(DataDevice::CUDA);

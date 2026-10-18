@@ -483,6 +483,13 @@ namespace fastllm {
             (data.cpuData == nullptr && data.cudaData == nullptr && data.numasData.empty())) {
             return false;
         }
+        // V4.1's shared expert is replicated in the original implementation.
+        // Splitting its down projection rounds partial sums to BF16 before
+        // the collective, which is not equivalent to one complete GEMM.
+        if (model->model_type == "deepseek_v41" &&
+            weightName.find(".ffn.shared_experts.") != std::string::npos) {
+            return false;
+        }
         auto typeIt = model->specialWeights.find(weightName);
         if (typeIt == model->specialWeights.end()) {
             return false;
@@ -5486,7 +5493,7 @@ namespace fastllm {
                                 oriDataType = DataType::FLOAT16;
                             }
                             if (tensor.dtype == "F8_E4M3" &&
-                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8
+                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::BFLOAT16 || dataType == DataType::INT8
                                 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO
                                 || dataType == DataType::INT2_GROUP
                                 || dataType == DataType::DATA_GGUF_FORMAT)) {
@@ -6255,7 +6262,7 @@ namespace fastllm {
                                 oriDataType = DataType::FLOAT16;
                             }
                             if (tensor.dtype == "F8_E4M3" && 
-                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO || dataType == DataType::DATA_GGUF_FORMAT)) {
+                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::BFLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO || dataType == DataType::DATA_GGUF_FORMAT)) {
                                 oriDataType = DataType::FLOAT32;
                                 scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensor.tensorName);
                             }

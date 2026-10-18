@@ -173,7 +173,11 @@ namespace fastllm {
     // fused collective can consume one partial from every device.
     bool MultiCudaLinearColumnLocal(Data &input, Data &weight, Data &bias,
                                     Data &output);
-
+    // Sum rank-local tensors in their current dtype and retain every replica.
+    bool MultiCudaReduceReplicated(Data &data);
+    // Optional BF16 transport with FP32 accumulation and a single final
+    // rounding. False leaves inputs untouched for the ordinary FP32 fallback.
+    bool MultiCudaTryReduceReplicatedFp32Accumulated(Data &data);
     // 将常驻 MultiCUDA worker 的 per-thread stream 接入/并回调用线程正在捕获的
     // 每卡 CUDA Graph。events 必须与 devices 一一对应并归属相同设备。
     bool MultiCudaGraphWorkersWaitEvents(const std::vector<int> &devices,
@@ -206,6 +210,7 @@ namespace fastllm {
     bool MultiCudaRepeatToReplicated(Data &input, int axis, int repeatTimes,
                                      Data &output);
     bool MultiCudaDeepSeekV41SharedSwiglu(Data &input, float limit, Data &output);
+    bool MultiCudaDeepSeekV41SharedSwigluQuantized(Data &input, float limit, Data &output);
     // Copy a dense activation replica directly to owned CPU storage. Returns
     // false without changing either tensor when the layout requires CopyFrom.
     bool MultiCudaCopyReplicaToCpu(Data &dst, const Data &src,

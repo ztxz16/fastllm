@@ -520,8 +520,14 @@ bool FastllmCudaSigmoidMulTo(fastllm::Data &input,
                              const fastllm::Data &gate);
 bool FastllmCudaClamp(fastllm::Data &input, bool hasMin, float minValue, bool hasMax, float maxValue);
 bool FastllmCudaGlm5NextClampedSilu(const fastllm::Data &input, float limit, fastllm::Data &output);
+
+// FP32 routed-expert sum and BF16 shared expert, with an explicit BF16
+// rounding boundary before the HC residual transform.
+bool FastllmCudaDeepSeekV41MoeHcPost(const fastllm::Data &input,
+    const fastllm::Data &shared, const fastllm::Data &residual,
+    const fastllm::Data &post, const fastllm::Data &comb, fastllm::Data &output);
 bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit, fastllm::Data &output);
-bool FastllmCudaDeepSeekV41SharedSwigluQuantized(const fastllm::Data &input, float limit, fastllm::Data &output);
+bool FastllmCudaDeepSeekV41SharedSwigluQuantized(const fastllm::Data &input, float limit, fastllm::Data &output, const float *routeScales = nullptr);
 bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData, float outputScale = 1.0f);
 bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fastllm::Data &softplusInput, fastllm::Data &softplusOutput, const fastllm::Data &aLogData, const fastllm::Data &dtBiasData);
@@ -2235,9 +2241,12 @@ bool FastllmCudaHalfMergeMOEVllmMarlinBatch1ExpertParallel(
 bool FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
         const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
         fastllm::Data **weights, int weightsBatch, const int32_t *globalIndices,
-        const float *scores, int topk, int ownerRank, int ownerCount);
+        const float *scores, int topk, int ownerRank, int ownerCount,
+        bool deepSeekV41 = false, float swigluLimit = 0.0f);
 bool FastllmCudaPrepareNVFP4E4M3Moe(fastllm::Data **weights, int weightsBatch);
 void FastllmCudaReleaseMergeMOEVllmMarlinCache(const fastllm::Data *layerKey);
+// Read-only readiness check: no repacking or allocation during graph capture.
+bool FastllmCudaV41MarlinGraphReady(const fastllm::Data *layerKey, int rows);
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
 bool FastllmCudaBFloat16MergeMOEDeepGemmSm120ExpertParallel(
         const fastllm::Data &input, fastllm::Data &output,

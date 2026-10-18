@@ -758,6 +758,16 @@ namespace fastllm {
             }
             Data cpu;
 #ifdef USE_CUDA
+            if (data.multiDeviceData && !data.IsTensorParallelReplicated()) {
+                // Sharded roots have no payload. Record each owned shard
+                // instead of issuing an invalid copy from the empty root.
+                for (const auto &part : data.multiDeviceDatas) {
+                    if (part.second != nullptr) {
+                        V41DumpTensor(*part.second, name + "_rank" + std::to_string(part.first));
+                    }
+                }
+                return;
+            }
             // 复制布局下 root 只有形状信息，CopyFrom 会导出一份垃圾——多卡排查时
             // 浮点张量会假发散（相关系数接近 0），非常容易误导。从副本取数。
             if (data.multiDeviceData && data.IsTensorParallelReplicated()) {
@@ -1396,8 +1406,22 @@ namespace fastllm {
                 }
                 continue;
             }
-            if (V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") && name=="head.weight") {
-                result[name].push_back({name,DataType::BFLOAT16});
+            if (name == "head.weight" && !quantizedLinearNames.count(name)) {
+                // The original ParallelHead promotes the BF16 checkpoint
+                // weight to FP32 and returns FP32 logits without BF16 rounding.
+                result[name].push_back({name, DataType::FLOAT32});
+                continue;
+            }
+            if (V41EndsWith(name, ".attn.wkv.weight") && quantizedLinearNames.count(name)) {
+                // V4's unquantized-KV exception must not dequantize the V4.1
+                // checkpoint to FP16: small weights lose exponent range.
+                result[name].push_back({name, DataType::FP8_E4M3});
+                continue;
+            }
+            if (V41EndsWith(name, ".attn.wo_a.weight")) {
+                // The original converter dequantizes this grouped projection
+                // to BF16, while retaining its explicit activation quantizer.
+                result[name].push_back({name, DataType::BFLOAT16});
                 continue;
             }
             // 磁盘表复用通用惰性加载；常驻表保留紧凑 UE8M0 scale，避免展开整张 scale 表。
@@ -1448,7 +1472,7 @@ namespace fastllm {
 
     void DeepSeekV41Model::LinearWithActivationQuant(Data &input, const std::string &weightName,
                                                     Data &output, bool replicated, Data *scratch,
-                                                    bool inputQuantized) {
+                                                    bool inputQuantized, Data *reductionScratch) {
         Data local;
         Data *source = &input;
         if (quantizedLinearNames.count(weightName)) {
@@ -1471,6 +1495,26 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") && !replicated &&
             FastllmCudaV41ReferenceLinear(*source,weight[weightName],output,1,source->dataType==DataType::BFLOAT16)) return;
+#endif
+        // Match RowParallelLinear: each local GEMM rounds to the activation
+        // dtype, the collective sums in FP32, and only its result rounds back.
+#ifdef USE_CUDA
+        if (source->IsTensorParallelSharded() &&
+            weight[weightName].tpLinearType == TP_LINEAR_COLUMN &&
+            (source->dataType == DataType::BFLOAT16 || source->dataType == DataType::FLOAT16)) {
+            Data localReduction;
+            Data &sum = reductionScratch != nullptr ? *reductionScratch : localReduction;
+            if (MultiCudaLinearColumnLocal(*source, weight[weightName], *GetEmptyData(), output)) {
+                // The custom collective accumulates half/BF16 operands in
+                // FP32 and rounds only once. Avoid the two staging casts and
+                // halve communication bytes when that exact path is available.
+                if (MultiCudaTryReduceReplicatedFp32Accumulated(output)) return;
+                ToDataType(output, sum, DataType::FLOAT32);
+                AssertInFastLLM(MultiCudaReduceReplicated(sum), "V4.1 FP32 TP reduction failed.\n");
+                ToDataType(sum, output, source->dataType);
+                return;
+            }
+        }
 #endif
         Linear(*source, weight[weightName], Data(), output, replicated);
     }
@@ -3106,7 +3150,6 @@ namespace fastllm {
         std::vector<int> tpDevices;
         bool tp = false;
         bool tpAttention = false;
-        bool tpSharedExpert = false;
         DeepSeekV41DecodeWorkspace localWorkspace;
         DeepSeekV41DecodeWorkspace *ws = &localWorkspace;
         bool graphActive = false;
@@ -3206,7 +3249,6 @@ namespace fastllm {
         auto &tpDevices = f.tpDevices;
         auto &tp = f.tp;
         auto &tpAttention = f.tpAttention;
-        auto &tpSharedExpert = f.tpSharedExpert;
         auto &ws = f.ws;
         auto &graphActive = f.graphActive;
         auto &dim = f.dim;
@@ -3275,30 +3317,25 @@ namespace fastllm {
 
         // ---- 张量并行 ----
         // deviceMap 为 multicuda 且不止一张卡时启用：q / attn_sink / 注意力输出 / wo_a
-        // 按 query head 切分，wo_b 与共享专家 down 按列切并 all-reduce，其余全部复制。
+        // 按 query head 切分，wo_b 按列切并 all-reduce，共享专家保持复制。
         // FastllmGetMulticudaDeviceAndRatio 读的是 ApplyDeviceMap 设置的全局设备表，
         // 首次前向前必须先应用一次主 device map，否则拿到的是空列表。
         ApplyDeviceMap(this->deviceMap, 1, block_cnt);
         tpDevices = V41TpDevices(this->deviceMap);
         tp = !tpDevices.empty();
-        // 注意力能否按 head 切分：CUDA 稀疏注意力 kernel 每个 block 处理 32 个 head，
-        // 要求每张卡分到的 head 数是 32 的倍数；wo_a 又要求 head 区间对齐到 o_group。
-        // 不满足时（例如 32 头的迷你模型、或 64 头开 TP=4）注意力退回"每卡各算一份"，
-        // 稠密 FFN / head 仍然切分。
+        // 注意力切分仍要求每卡 head 数为 32 的倍数并对齐 o_group。
         const int tpRanks = (int)tpDevices.size();
         const bool tpHeadsAligned =
             tpRanks > 0 && o_groups > 0 &&
             num_attention_heads % tpRanks == 0 &&
-            (num_attention_heads / tpRanks) % 32 == 0 &&
             num_attention_heads % o_groups == 0 &&
+            (num_attention_heads / tpRanks) % 32 == 0 &&
             (num_attention_heads / tpRanks) % (num_attention_heads / o_groups) == 0;
         // InitParams 已经在 head 数切不开时把 device map 改回单卡（那时 tp 为假），
         // 这里的 tpHeadsAligned 只是同一条约束的兜底。
-        // 排查用开关：关掉注意力 head 切分 / 共享专家切分后，全部算子退化为"两卡各算一份"，
-        // 可以把数值问题定位到切分路径还是复制路径。
+        // 排查时可关闭注意力 head 切分，改为每卡复制计算。
         tpAttention = tp && tpHeadsAligned &&
                                  !V41EnvFlag("FASTLLM_DSV41_DISABLE_TP_ATTENTION");
-        tpSharedExpert = tp && !V41EnvFlag("FASTLLM_DSV41_DISABLE_TP_SHARED_EXPERT");
         if (std::getenv("FASTLLM_TRACE_OPS") != nullptr) {
             static bool printed = false;
             if (!printed) {
@@ -3342,7 +3379,6 @@ namespace fastllm {
                 // 设备布局 / dtype 变化时丢弃旧图（图里烤死了每张卡上的权重地址）
                 std::string signature = std::to_string(block_cnt) + "|" + std::to_string((int)tp) +
                                         "|" + std::to_string((int)tpAttention) +
-                                        "|" + std::to_string((int)tpSharedExpert) +
                                         "|" + std::to_string((int)this->kvCacheDataType) +
                                         "|" + std::to_string(num_experts) +
                                         "|" + std::to_string((int)GetCudaSharedExpert()) + "|";
@@ -3628,14 +3664,13 @@ namespace fastllm {
         }
 #endif
 
-        // CUDA 路由能不能进图：FastllmCudaDeepSeekV4RouteScoreTransform 的 kernel 只支持
-        // <= 256 个专家（真实模型是 384），超了就整段走 CPU 参考路由，里面有同步 D2H。
-        // FASTLLM_DSV41_CUDA_GRAPH_FORCE_ROUTE_CAPTURE=1：排查用，强行把不可捕获的路由
-        // 也当成可捕获，用来验证"捕获中撞上非法的同步 D2H 也只是丢图回退、不会崩"。
+        // Both native CUDA score transformation and TopK iterate over the
+        // expert dimension; 384 experts do not require a host round-trip.
         cudaRouteCapturable =
             V41EnvFlag("FASTLLM_DSV41_CUDA_GRAPH_FORCE_ROUTE_CAPTURE") ||
-            (!hasImageTokens && num_experts <= 256 &&
+            (!hasImageTokens && num_experts > 0 && num_experts_per_tok <= 50 &&
              !V41EnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE"));
+
 
         // 分段调度：捕获 / 回放 / 逐算子。record 保存回放时被跳过的 host 侧形状变更，
         // restore 在回放时把它们补回来。任何一步失败都就地退回逐算子并永久关掉图。
@@ -3733,7 +3768,8 @@ namespace fastllm {
             // soon as its linear completes, instead of retaining all layers.
             LinearWithActivationQuant(input, name, output, replicated,
                 scratch != nullptr ? scratch : (ws == &localWorkspace && (!tp || seqlen > 1) ?
-                    (tp ? nullptr : &ws->quantizedActivation) : &ws->quantizedActivations[name]), inputQuantized);
+                    (tp ? nullptr : &ws->quantizedActivation) : &ws->quantizedActivations[name]), inputQuantized,
+                ws == &localWorkspace && seqlen > 1 ? nullptr : &ws->reductionBuffers[name]);
         };
             ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
             std::string pre = "layers." + std::to_string(layer);
@@ -3869,7 +3905,9 @@ namespace fastllm {
 
             quantizedLinear(attnQuant ? *attnQuant : attnInput, pre + ".attn.wkv.weight", kv,
                             tp, nullptr, attnQuant != nullptr);
+            if (dumpDebug) V41DumpTensor(kv, "fl_layer" + std::to_string(layer) + "_kv_proj" + dumpSuffix);
             V41RMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
+            if (dumpDebug) V41DumpTensor(kv, "fl_layer" + std::to_string(layer) + "_kv_norm" + dumpSuffix);
             kv.Reshape({1, seqlen, headDim});
 
             // kv source 层：compressor 的投影按整批算，分组 / 追加按片段做
@@ -4331,9 +4369,7 @@ namespace fastllm {
             }
 
             };   // runRoute
-            // 专家数超过 CUDA 路由 kernel 的 256 上限时（真实模型是 384），路由整段只能
-            // 走 CPU 参考实现：里面的 logits.ToDevice(CPU) 是同步 D2H，捕获期间非法。
-            // 这种情况下把这一段标成占位段逐算子执行，而不是让捕获在半路炸掉。
+            // Image-dependent routing keeps its existing eager fallback.
             RunForwardGraphSegment(f, runRoute, kV41GraphSegmentsPerLayer * layer + 2, cudaRouteCapturable,
                 [&](DeepSeekV41GraphSegmentMeta &meta) {
                     meta.expertIndexDims = expertIndex.dims;
@@ -4401,7 +4437,19 @@ namespace fastllm {
                         ffnOut.Reshape(ffnDims);
                         PrepareMultiCudaReplicatedData(ffnOut, tpDevices, true);
                     }
-                    AddTo(ffnOut, sharedExpertOut);
+                    if (ffnOut.dataType == DataType::FLOAT32 &&
+                        sharedExpertOut.dataType == DataType::BFLOAT16) {
+                        Data &sharedFloat = ws->reductionBuffers["moe_shared_sum"];
+                        Data &rounded = ws->reductionBuffers["moe_rounded_sum"];
+                        ToDataType(sharedExpertOut, sharedFloat, DataType::FLOAT32);
+                        AddTo(ffnOut, sharedFloat);
+                        ToDataType(ffnOut, rounded, DataType::BFLOAT16);
+                        rounded.Reshape(ffnDims);
+                        V41HcPost(rounded, *curHidden, ffnPost, ffnComb, *nextHidden);
+                        ffnPostDone = true;
+                    } else {
+                        AddTo(ffnOut, sharedExpertOut);
+                    }
                 }
             }
 #endif
@@ -4546,8 +4594,14 @@ namespace fastllm {
         }
         Data referenceHeadNorm, referenceHeadLogits;
         Data *precomputedHeadLogits = nullptr;
+        if (!precomputedHeadLogits && weight["head.weight"].dataType == DataType::FLOAT32) {
+            V41RMSNormBF16(headInput, weight["norm.weight"], rms_norm_eps, referenceHeadNorm);
+            ToDataType(referenceHeadNorm, DataType::FLOAT32);
+            Linear(referenceHeadNorm, weight["head.weight"], *GetEmptyData(), referenceHeadLogits);
+            precomputedHeadLogits = &referenceHeadLogits;
+        }
 #ifdef USE_CUDA
-        if (!tp && V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH")) {
+        if (precomputedHeadLogits == nullptr && !tp && V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH")) {
             headInput.ToDevice(DataDevice::CUDA);
             V41RMSNormBF16(headInput, weight["norm.weight"], rms_norm_eps, referenceHeadNorm);
             if (FastllmCudaV41ReferenceLinear(referenceHeadNorm, weight["head.weight"],
@@ -4587,16 +4641,11 @@ namespace fastllm {
         return ret;
     }
     void DeepSeekV41Model::RunForwardSharedExpert(ForwardWorkspace &f, int layer) {
-        auto &inputSegments = f.inputSegments;
-        auto &boundedPrefill = f.boundedPrefill;
-        auto &tailSegments = f.tailSegments;
         auto &seqlen = f.seqlen;
         auto &tp = f.tp;
-        auto &tpSharedExpert = f.tpSharedExpert;
         auto &localWorkspace = f.localWorkspace;
         auto &ws = f.ws;
         auto &hasSharedExpertOut = f.hasSharedExpertOut;
-        const auto &segments = boundedPrefill ? tailSegments : inputSegments;
         auto &ffnInput = ws->ffnInput;
         auto &sharedExpertOut = ws->sharedExpertOut;
         auto quantizedLinear = [&](Data &input, const std::string &name, Data &output, bool replicated = false,
@@ -4606,37 +4655,38 @@ namespace fastllm {
             // soon as its linear completes, instead of retaining all layers.
             LinearWithActivationQuant(input, name, output, replicated,
                 scratch != nullptr ? scratch : (ws == &localWorkspace && (!tp || seqlen > 1) ?
-                    (tp ? nullptr : &ws->quantizedActivation) : &ws->quantizedActivations[name]), inputQuantized);
+                    (tp ? nullptr : &ws->quantizedActivation) : &ws->quantizedActivations[name]), inputQuantized,
+                ws == &localWorkspace && seqlen > 1 ? nullptr : &ws->reductionBuffers[name]);
         };
 
         const std::string pre = "layers." + std::to_string(layer);
-        auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
-        auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
         auto body = [&] {
 
             if (hasSharedExpertOut) {
-                if (tpSharedExpert) {
-                    sharedGateupIt->second.tpLinearType = TP_LINEAR_ROW;
-                    sharedGateupIt->second.tpPackType = TP_PACK_GATEUP;
-                    sharedDownIt->second.tpLinearType = TP_LINEAR_COLUMN;
-                }
+                // Keep a complete shared expert on each rank, preserving
+                // the original BF16 rounding boundary without a collective.
                 Data &ww1 = ws->sharedSwiglu, &ww3 = ws->sharedGateup;
                 bool sharedQuantized = false;
                 quantizedLinear(ffnInput, pre + ".ffn.shared_experts.gateup.weight", ww3,
-                                tp && !tpSharedExpert);
+                                tp);
 #ifdef USE_CUDA
-                sharedQuantized = !tp && !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
+                if (!V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
                     quantizedLinearNames.count(pre + ".ffn.shared_experts.w2.weight") &&
-                    !ww3.dims.empty() && ww3.dims.back() % 64 == 0;
-                AssertInFastLLM(sharedQuantized ? FastllmCudaDeepSeekV41SharedSwigluQuantized(ww3, swiglu_limit, ww1) :
-                    (tp ? MultiCudaDeepSeekV41SharedSwiglu(ww3, swiglu_limit, ww1) :
-                          FastllmCudaDeepSeekV41SharedSwiglu(ww3, swiglu_limit, ww1)),
-                                "DeepSeekV41: CUDA shared expert activation rejected input.");
+                    !ww3.dims.empty() && ww3.dims.back() % 64 == 0) {
+                    sharedQuantized = tp ?
+                        MultiCudaDeepSeekV41SharedSwigluQuantized(ww3, swiglu_limit, ww1) :
+                        FastllmCudaDeepSeekV41SharedSwigluQuantized(ww3, swiglu_limit, ww1);
+                }
+                if (!sharedQuantized) {
+                    AssertInFastLLM(tp ? MultiCudaDeepSeekV41SharedSwiglu(ww3, swiglu_limit, ww1) :
+                        FastllmCudaDeepSeekV41SharedSwiglu(ww3, swiglu_limit, ww1),
+                        "DeepSeekV41: CUDA shared expert activation rejected input.");
+                }
 #else
                 Swiglu(ww3, ww1);
 #endif
                 quantizedLinear(ww1, pre + ".ffn.shared_experts.w2.weight", sharedExpertOut,
-                                tp && !tpSharedExpert, nullptr, sharedQuantized);
+                                tp, nullptr, sharedQuantized);
                 ToDataType(sharedExpertOut, DataType::BFLOAT16);
             }
 
@@ -4748,12 +4798,14 @@ namespace fastllm {
         auto &sharedExpertOut = ws->sharedExpertOut;
 #ifdef USE_CUDA
             out.clear();
-            const Data *tensors[] = {
+            std::vector<const Data *> tensors = {
                 &hiddenStates, &hiddenTemp, &preMix,
                 &attnPre, &attnPost, &attnComb, &ffnPre, &ffnPost, &ffnComb,
                 &x, &attnInput, &qr, &qNorm, &q, &kv, &attnOut, &woAOut, &attnProj,
                 &rawKVAll, &rawScoreAll, &qIdxAll, &idxWeightsAll,
-                &ffnInput, &expertIndex, &expertScore, &ws->sharedExpertOut};
+                &ffnInput, &expertIndex, &expertScore, &ws->sharedExpertOut,
+                &ws->ffnOut, &ws->w1, &ws->w2, &ws->w3};
+            for (const auto &entry : ws->reductionBuffers) tensors.push_back(&entry.second);
             for (const Data *data : tensors) {
                 out.push_back(data->cudaData);
                 // 非空却不在卡上，说明它被某个 host 侧算子搬走过，显存已经还给内存池，

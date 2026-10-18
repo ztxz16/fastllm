@@ -4463,10 +4463,12 @@ namespace fastllm {
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
         CudaDeepSeekV4HcPostOp cudaPostOp;
         BaseOperator *postOp = (BaseOperator *)&cudaPostOp;
-        DataDict roots = {{"input", &input}, {"residual", &residual},
+        const bool mixed = input.dataType == DataType::FLOAT32 &&
+            shared.dataType == DataType::BFLOAT16 && residual.dataType == DataType::BFLOAT16;
+        DataDict roots = {{"input", mixed ? &shared : &input}, {"residual", &residual},
                           {"post", &post}, {"comb", &comb}, {"output", &output}};
         if (devices.size() <= 1 || currentMultiCudaDedicatedWorker != nullptr ||
-            shared.dataType != input.dataType || shared.Count(0) != input.Count(0) ||
+            (!mixed && shared.dataType != input.dataType) || shared.Count(0) != input.Count(0) ||
             !postOp->CanRun("DeepSeekV41HcPost", roots, {}, {})) return false;
         for (Data *data : {&input, &shared, &residual, &post, &comb}) {
             if (data->multiDeviceData && !data->IsTensorParallelReplicated()) return false;
@@ -4502,6 +4504,13 @@ namespace fastllm {
                 localInput.Allocate(false);
                 FastllmCudaCopyFromHostToDevice(localInput.cudaData, cpuInput, inputBytes);
             }
+            if (mixed) {
+                AssertInFastLLM(FastllmCudaDeepSeekV41MoeHcPost(localInput, localShared,
+                    *residual.multiDeviceDatas.at(device), *post.multiDeviceDatas.at(device),
+                    *comb.multiDeviceDatas.at(device), *output.multiDeviceDatas.at(device)),
+                    "DeepSeekV41 mixed MoE HC post rejected validated tensors.");
+                return;
+            }
             // Keep the two kernels: AddTo must round to the activation dtype
             // before HcPost multiplies it by post and adds the residual mix.
             FastllmCudaAddTo(localInput, localShared, 1.0f);
@@ -4516,12 +4525,13 @@ namespace fastllm {
         return dispatched;
     }
 
-    bool MultiCudaDeepSeekV41SharedSwiglu(Data &input, float limit, Data &output) {
+    static bool RunMultiCudaV41SharedSwiglu(Data &input, float limit, Data &output, bool quantized) {
         std::vector<int> devices;
         std::map<int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
         if (!input.multiDeviceData || devices.size() <= 1) {
-            return FastllmCudaDeepSeekV41SharedSwiglu(input, limit, output);
+            return quantized ? FastllmCudaDeepSeekV41SharedSwigluQuantized(input, limit, output) :
+                FastllmCudaDeepSeekV41SharedSwiglu(input, limit, output);
         }
         if (input.dims.empty() || input.dims.back() % 2 != 0) return false;
         std::vector<int> dims = input.dims;
@@ -4558,12 +4568,28 @@ namespace fastllm {
         } else {
             return false;
         }
+        if (quantized) for (int device : devices) {
+            const Data &local = *input.multiDeviceDatas.at(device);
+            // Each local gate/up pair must preserve complete block-32 groups.
+            if (local.dims.empty() || local.dims.back() % 64 != 0) return false;
+        }
         std::vector<int> ok(devices.size(), 0);
         const bool dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
-            ok[rank] = FastllmCudaDeepSeekV41SharedSwiglu(
-                *input.multiDeviceDatas.at(device), limit, *output.multiDeviceDatas.at(device));
+            Data &localInput = *input.multiDeviceDatas.at(device);
+            Data &localOutput = *output.multiDeviceDatas.at(device);
+            ok[rank] = quantized ?
+                FastllmCudaDeepSeekV41SharedSwigluQuantized(localInput, limit, localOutput) :
+                FastllmCudaDeepSeekV41SharedSwiglu(localInput, limit, localOutput);
         });
         return dispatched && std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; });
+    }
+
+    bool MultiCudaDeepSeekV41SharedSwiglu(Data &input, float limit, Data &output) {
+        return RunMultiCudaV41SharedSwiglu(input, limit, output, false);
+    }
+
+    bool MultiCudaDeepSeekV41SharedSwigluQuantized(Data &input, float limit, Data &output) {
+        return RunMultiCudaV41SharedSwiglu(input, limit, output, true);
     }
 
     struct MultiCudaDelegatedCudaOp : MultiThreadBaseOp {
@@ -5491,6 +5517,74 @@ namespace fastllm {
             input, weight, bias, output, false, true);
     }
 
+    bool MultiCudaTryReduceReplicatedFp32Accumulated(Data &data) {
+        if (!data.IsTensorParallelReplicated() || data.multiDeviceDatas.size() < 2 ||
+            data.dataType != DataType::BFLOAT16 ||
+            data.Count(0) > (uint64_t)std::numeric_limits<int>::max()) return false;
+        if (const char *disabled = getenv("FASTLLM_DISABLE_NCCL")) {
+            if (!strcmp(disabled, "1") || !strcasecmp(disabled, "true")) return false;
+        }
+        // FP16 ToDataType uses round-toward-zero, while the custom
+        // collective rounds to nearest. Keep that dtype on its original path.
+        const int count = (int)data.Count(0);
+        std::vector<int> devices;
+        for (const auto &entry : data.multiDeviceDatas) {
+            const Data *local = entry.second;
+            if (!local || !local->cudaData || local->dataDevice != DataDevice::CUDA ||
+                local->dataType != data.dataType || local->Count(0) != data.Count(0) ||
+                reinterpret_cast<uintptr_t>(local->cudaData) % 16 != 0) return false;
+            // Require both policies: the reference FP32 path must also use
+            // the rank-ordered custom sum, preserving its reduction order.
+            if (!FastllmCudaCustomAllReduceCanRun(count, data.dataType, entry.first) ||
+                !FastllmCudaCustomAllReduceCanRun(count, DataType::FLOAT32, entry.first)) return false;
+            devices.push_back(entry.first);
+        }
+        std::vector<char> reduced(devices.size(), 0);
+        const bool dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                void *ptr = data.multiDeviceDatas.at(device)->cudaData;
+                reduced[rank] = FastllmCudaCustomAllReduce(ptr, ptr, count, data.dataType, device);
+            });
+        AssertInFastLLM(dispatched && !FastllmCudaGetThreadError(),
+                        "Custom FP32-accumulated reduction dispatch failed.\n");
+        const bool complete = std::all_of(reduced.begin(), reduced.end(), [](char ok) { return ok != 0; });
+        const bool untouched = std::none_of(reduced.begin(), reduced.end(), [](char ok) { return ok != 0; });
+        AssertInFastLLM(complete || untouched, "Partial custom FP32-accumulated reduction.\n");
+        if (!complete) return false;
+        SyncReplicatedRootMetaFromDevice0(data, devices);
+        return true;
+    }
+
+    bool MultiCudaReduceReplicated(Data &data) {
+        if (!data.IsTensorParallelReplicated() || data.multiDeviceDatas.empty()) return false;
+        std::vector<int> devices;
+        for (const auto &entry : data.multiDeviceDatas) {
+            const Data *local = entry.second;
+            if (local == nullptr || local->cudaData == nullptr ||
+                local->dataDevice != DataDevice::CUDA || local->dataType != data.dataType ||
+                local->Count(0) != data.Count(0)) return false;
+            devices.push_back(entry.first);
+        }
+        bool useNccl = FastllmInitNccl(devices);
+        if (const char *disabled = getenv("FASTLLM_DISABLE_NCCL")) {
+            if (!strcmp(disabled, "1") || !strcasecmp(disabled, "true")) useNccl = false;
+        }
+        if (useNccl) {
+            if (!MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                    Data &local = *data.multiDeviceDatas.at(device);
+                    FastllmNcclAllReduce(local.cudaData, local.cudaData, local.Count(0),
+                                        local.dataType, device);
+                })) return false;
+        } else {
+            // Peer-copy fallback cannot reuse a partial until its producer
+            // finishes. It intentionally stays synchronous without NCCL.
+            for (int device : devices) FastllmCudaSyncDevice(device);
+            ReduceReplicatedOutputOnRoot(data, devices);
+            for (int device : devices) FastllmCudaSyncDevice(device);
+        }
+        SyncReplicatedRootMetaFromDevice0(data, devices);
+        return true;
+    }
+
     bool MultiCudaLinearOp::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
         if (intParams.find("exType") != intParams.end()) {
             return false;
@@ -6268,6 +6362,7 @@ auto st = std::chrono::system_clock::now();
         int wBatch;
         float sharedScale;
         float swigluLimit;
+        bool deepSeekV41 = false;
         Data *output;
         Data *pairedReduceInput;
         int rootDeviceId;
@@ -6433,7 +6528,7 @@ auto st = std::chrono::system_clock::now();
                     (const float*)((uint8_t*)gpuRoutePacket.cudaData + routeOffset + routeBytes);
                 bool ok = false;
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
-                if (MultiCudaDsv4DeepGemmMoeEnabled() &&
+                if (!deepSeekV41 && MultiCudaDsv4DeepGemmMoeEnabled() &&
                     input->dataType == DataType::BFLOAT16) {
                     ok = FastllmCudaBFloat16MergeMOEDeepGemmSm120ExpertParallel(
                         packetInput, *output,
@@ -6452,9 +6547,10 @@ auto st = std::chrono::system_clock::now();
                         FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
                             packetInput, *w1, *output, localExpertTable->localWeights.data(),
                             (int)localExpertTable->localWeights.size(), gpuRouteIndex,
-                            gpuRouteScore, topk, expertOwnerRank, expertOwnerCount);
+                            gpuRouteScore, topk, expertOwnerRank, expertOwnerCount,
+                            deepSeekV41, swigluLimit);
                 }
-                if (!ok) {
+                if (!ok && !deepSeekV41) {
                     ok = input->dataType == DataType::FLOAT16 ?
                         FastllmCudaHalfMergeMOENVFP4Batch1ExpertParallel(
                             packetInput, *w1, *output, localExpertTable->localWeights.data(),
@@ -6485,7 +6581,7 @@ auto st = std::chrono::system_clock::now();
                 (input->dataType == DataType::FLOAT16 ||
                  input->dataType == DataType::BFLOAT16);
             if (expertParallel && input->dims.size() > 0 && input->dims[0] == 1 &&
-                !ran && !useVllmMarlin &&
+                !ran && !useVllmMarlin && !deepSeekV41 &&
                 !(directGpuRouteAvailable && batchOneDecode) &&
                 ((preparedHostIndex != nullptr && preparedHostScore != nullptr) ||
                  (deviceIndex->dims.size() >= 2 && deviceScore->dims.size() >= 2 &&
@@ -6574,7 +6670,7 @@ auto st = std::chrono::system_clock::now();
                     FastllmCudaCopyFromHostToDevice(filteredScore.cudaData, localScore.data(), localScore.size() * sizeof(float));
                     DoCudaMergeMOE(*input, *output, filteredIndex, filteredScore, *w1, *w2, *w3,
                                    localTable.localWeights.data(), nullptr, sharedScale, gateType,
-                                   (int)localTable.localWeights.size());
+                                   (int)localTable.localWeights.size(), swigluLimit, deepSeekV41);
                     ran = true;
                 }
             }
@@ -6588,7 +6684,7 @@ auto st = std::chrono::system_clock::now();
                 int topk = deviceIndex->dims[1];
                 bool deepGemmOk = false;
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
-                if (MultiCudaDsv4DeepGemmMoeEnabled() &&
+                if (!deepSeekV41 && MultiCudaDsv4DeepGemmMoeEnabled() &&
                     input->dataType == DataType::BFLOAT16) {
                     deepGemmOk =
                         FastllmCudaBFloat16MergeMOEDeepGemmSm120ExpertParallel(
@@ -6617,8 +6713,8 @@ auto st = std::chrono::system_clock::now();
                             (int)localExpertTable->localWeights.size(),
                             (const int32_t *)deviceIndex->cudaData,
                             (const float *)deviceScore->cudaData, topk,
-                            expertOwnerRank, expertOwnerCount);
-                } else {
+                            expertOwnerRank, expertOwnerCount, deepSeekV41, swigluLimit);
+                } else if (!deepSeekV41) {
                     ran = input->dataType == DataType::FLOAT16 ?
                         FastllmCudaHalfMergeMOENVFP4Batch1ExpertParallel(
                             *input, *w1, *output,
@@ -6650,7 +6746,7 @@ auto st = std::chrono::system_clock::now();
                 }
                 broadcastInput();
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
-                if (MultiCudaDsv4DeepGemmMoeEnabled() &&
+                if (!deepSeekV41 && MultiCudaDsv4DeepGemmMoeEnabled() &&
                     !expertParallel && directGpuRouteAvailable &&
                     input->dataType == DataType::BFLOAT16) {
                     const int topk = deviceIndex->dims[1];
@@ -6666,7 +6762,7 @@ auto st = std::chrono::system_clock::now();
                 if (!ran) {
                     DoCudaMergeMOE(*input, *output, *deviceIndex, *deviceScore,
                                    *w1, *w2, *w3,
-                                   curWeights.data(), nullptr, sharedScale, gateType, wBatch);
+                                   curWeights.data(), nullptr, sharedScale, gateType, wBatch, swigluLimit, deepSeekV41);
                 }
             }
             if (output->GetBytes() != partOutputBytes) {
@@ -6895,6 +6991,9 @@ auto st = std::chrono::system_clock::now();
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;
         float swigluLimit = floatParams.find("swigluLimit") != floatParams.end() ?
                             floatParams.find("swigluLimit")->second : 0.0f;
+        const bool deepSeekV41 = intParams.count("deepSeekV4Mode") &&
+            intParams.at("deepSeekV4Mode") && intParams.count("activationQuantBlock") &&
+            intParams.at("activationQuantBlock") == 32;
         MoeGateType gateType = intParams.find("gateType") != intParams.end() ?
             (MoeGateType) intParams.find("gateType")->second : MoeGateSwiglu;
         
@@ -6976,6 +7075,13 @@ auto st = std::chrono::system_clock::now();
             }
         }
 
+        // Routed expert outputs are BF16, but their local/EP sum stays FP32
+        // until the model adds the shared expert and rounds once.
+        if (deepSeekV41) {
+            output.dataType = DataType::FLOAT32;
+            output.UpdateUnitSize();
+        }
+
         CopyToMultiDevices(w1, devices, false);
         CopyToMultiDevices(w2, devices, false);
         CopyToMultiDevices(w3, devices, false);
@@ -6998,7 +7104,7 @@ auto st = std::chrono::system_clock::now();
                 break;
             }
         }
-        bool useHybridEpCollectives = useExpertParallel &&
+        bool useHybridEpCollectives = !deepSeekV41 && useExpertParallel &&
                                       !input.multiDeviceData && input.cudaData != nullptr &&
                                       input.dims.size() > 0 && input.dims[0] == 1 &&
                                       index.dims.size() >= 2 && score.dims.size() >= 2 &&
@@ -7135,6 +7241,7 @@ auto st = std::chrono::system_clock::now();
                 auto *op = &localOps.back();
                 op->gateType = gateType;
                 op->swigluLimit = swigluLimit;
+                op->deepSeekV41 = deepSeekV41;
                 ops.push_back(op);
             }
             if (persistentWorkspace != nullptr) {
@@ -7283,6 +7390,7 @@ auto st = std::chrono::system_clock::now();
                 );
                 op->gateType = gateType;
                 op->swigluLimit = swigluLimit;
+                op->deepSeekV41 = deepSeekV41;
                 op->expertOwnerRank = i;
                 op->expertOwnerCount = (int)devices.size();
                 op->pairedReduceInput = pairedReduceInput == nullptr ? nullptr :
@@ -7332,6 +7440,7 @@ auto st = std::chrono::system_clock::now();
                 );
                 op->gateType = gateType;
                 op->swigluLimit = swigluLimit;
+                op->deepSeekV41 = deepSeekV41;
                 op->expertOwnerRank = i;
                 op->expertOwnerCount = (int)devices.size();
                 ops.push_back(op);

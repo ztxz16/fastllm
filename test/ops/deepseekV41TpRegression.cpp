@@ -26,7 +26,7 @@ static std::vector<uint8_t> Bytes(Data &value) {
     cpu.ToDevice(DataDevice::CPU);
     return {cpu.cpuData, cpu.cpuData + cpu.GetBytes()};
 }
-static int SharedSwigluChecks() {
+static int SharedSwigluChecks(bool quantized = false) {
     int checks = 0;
     for (auto type : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32}) {
         for (bool sharded : {false, true}) {
@@ -40,7 +40,12 @@ static int SharedSwigluChecks() {
                 Data expected;
                 if (!FastllmCudaDeepSeekV41SharedSwiglu(source, .5f, expected))
                     throw std::runtime_error("single CUDA Swiglu failed");
-                auto expectedBytes = Bytes(expected);
+                Data quantizedExpected;
+                if (quantized) {
+                    ((Executor *)GetExecutor())->Run("DeepSeekV41QuantizeActivation",
+                        {{"input", &expected}, {"output", &quantizedExpected}}, {}, {});
+                }
+                auto expectedBytes = Bytes(quantized ? quantizedExpected : expected);
                 ApplyDeviceMap({{"multicuda:0,1", 1}}, 0, 1);
                 FastllmMultiCudaSetDevice({0, 1});
                 if (sharded) {
@@ -67,7 +72,8 @@ static int SharedSwigluChecks() {
                 } else {
                     PrepareMultiCudaReplicatedData(input, {0, 1}, true);
                 }
-                if (!MultiCudaDeepSeekV41SharedSwiglu(input, .5f, output))
+                if (!(quantized ? MultiCudaDeepSeekV41SharedSwigluQuantized(input, .5f, output) :
+                      MultiCudaDeepSeekV41SharedSwiglu(input, .5f, output)))
                     throw std::runtime_error("TP shared Swiglu failed");
                 if (output.dataType != DataType::BFLOAT16 || output.dims != expected.dims)
                     throw std::runtime_error("TP shared Swiglu metadata mismatch");
@@ -250,7 +256,7 @@ int main() {
     if (cudaGetDeviceCount(&count) != cudaSuccess || count < 2) return 77;
     try {
         Executor &exec = *((Executor *)GetExecutor());
-        int checks = SharedSwigluChecks() + AddHcPostChecks() + HandoffChecks() + DelayedLogitsGatherChecks();
+        int checks = SharedSwigluChecks() + SharedSwigluChecks(true) + AddHcPostChecks() + HandoffChecks() + DelayedLogitsGatherChecks();
         for (auto type : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32}) {
             Data tpOutput;
             for (int tokens : {1, 5, 33, 1}) {

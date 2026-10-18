@@ -11675,7 +11675,7 @@ __global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
     }
 }
 
-// Fixed-shape selection for 512/top-10 and single-row 256/top-8 decode.
+// Fixed-shape selection with a legacy-compatible tie fallback.
 // APPLY_SOFTMAX joins the established 256-thread FP32 softmax with
 // selection while reproducing its max/sum/division order exactly. One warp
 // then performs TopK; exact ties rebuild the original 64-thread lists and
@@ -11699,7 +11699,8 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
 
     static_assert((EXPERTS == 256 && TOPK == 8) ||
                   (EXPERTS == 512 && TOPK == 10) ||
-                  (!APPLY_SOFTMAX && EXPERTS == 288 && TOPK == 8));
+                  (!APPLY_SOFTMAX && ((EXPERTS == 288 && TOPK == 8) ||
+                                      (EXPERTS == 384 && TOPK == 6))));
     int token = blockIdx.x;
     const float *tokenLogits = logits + (size_t)token * EXPERTS;
     index += (size_t)token * TOPK;
@@ -11745,7 +11746,7 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
     int firstExpert = lane * VALUES_PER_LANE;
     float choiceKeys[VALUES_PER_LANE];
     float firstProbabilities[8], secondProbabilities[8];
-    if constexpr (EXPERTS != 288) {
+    if constexpr (EXPERTS != 288 && EXPERTS != 384) {
         FastllmRouterLoad8(probabilityLogits + firstExpert, firstProbabilities);
         if constexpr (VALUES_PER_LANE > 8)
             FastllmRouterLoad8(probabilityLogits + firstExpert + 8, secondProbabilities);
@@ -11754,7 +11755,7 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
     for (int part = 0; part < VALUES_PER_LANE; ++part) {
         int expert = firstExpert + part;
         float probability;
-        if constexpr (EXPERTS == 288) probability = probabilityLogits[expert];
+        if constexpr (EXPERTS == 288 || EXPERTS == 384) probability = probabilityLogits[expert];
         else probability = part < 8 ? firstProbabilities[part] : secondProbabilities[part - 8];
         float key = probability + (hasBias ? bias[expert] : 0.0f);
         choiceKeys[part] = isfinite(key) ? key : NEG_INF;
@@ -13113,7 +13114,7 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         return false;
     }
 
-    // Keep decode specializations narrow and preserve the generic kernel's
+    // Keep shape specializations narrow and preserve the generic kernel's
     // original MAXK=50 instantiation exactly: changing
     // its shared-memory row stride changes legacy merge behavior for prefill.
 #ifdef USE_ROCM
@@ -13121,7 +13122,11 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         cudaLogits, cudaBias, cudaIndex, cudaScore, n, numExperts,
         topk, hasBias, needNorm, routeScale);
 #else
-    if (n <= 8 && numExperts == 256 && topk == 8) {
+    if (numExperts == 384 && topk == 6) {
+        FastllmSelectExpertFixedTopKKernel<false, 384, 6><<<n, 32>>>(
+            cudaLogits, cudaBias, cudaIndex, cudaScore,
+            hasBias, needNorm, routeScale);
+    } else if (n <= 8 && numExperts == 256 && topk == 8) {
         FastllmSelectExpertFixedTopKKernel<false, 256, 8><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);

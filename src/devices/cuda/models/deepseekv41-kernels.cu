@@ -367,7 +367,7 @@ namespace {
 
     template <typename T, bool QUANTIZE = false>
     __global__ void V41SharedSwigluKernel(const T *input, __nv_bfloat16 *output,
-                                         uint64_t count, int mid, float limit) {
+                                         uint64_t count, int mid, float limit, const float *routeScales) {
         const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
         if (i >= count) return;
         const uint64_t offset = (i / mid) * (2 * mid) + i % mid;
@@ -378,7 +378,9 @@ namespace {
             up = fmaxf(-limit, fminf(up, limit));
         }
         // Keep the BF16 boundary before finding each group-32 FP8 scale.
-        __nv_bfloat16 result = __float2bfloat16_rn((gate / (1.0f + expf(-gate))) * up);
+        float gated = (gate / (1.0f + expf(-gate))) * up;
+        if (routeScales != nullptr) gated *= routeScales[i / mid];
+        __nv_bfloat16 result = __float2bfloat16_rn(gated);
         if constexpr (QUANTIZE) {
             const float value = __bfloat162float(result);
             float maximum = fabsf(value);
@@ -731,24 +733,55 @@ namespace {
         }
     }
 
-    template <typename T>
+    template <typename T, int HC>
     __global__ void V41HcPostKernel(const T *input, const T *residual, const float *post,
-                                    const float *comb, T *output, uint64_t count, int hcMult, int dim) {
+                                    const float *comb, T *output, uint64_t count, int dim) {
         const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= count / hcMult) return;
+        if (idx >= count / HC) return;
         const int d = idx % dim;
         const uint64_t t = idx / dim;
         float r[4];
-        for (int src = 0; src < hcMult; src++) r[src] = V41Load<T>(residual, (t * hcMult + src) * dim + d);
+#pragma unroll
+        for (int src = 0; src < HC; src++) r[src] = V41Load<T>(residual, (t * HC + src) * dim + d);
         const float x = V41Load<T>(input, idx);
-        for (int target = 0; target < hcMult; target++) {
+#pragma unroll
+        for (int target = 0; target < HC; target++) {
             float sum = 0.0f;
-            for (int src = 0; src < hcMult; src++) {
-                float term = __fmul_rn(comb[(t * hcMult + src) * hcMult + target], r[src]);
+    #pragma unroll
+        for (int src = 0; src < HC; src++) {
+                float term = __fmul_rn(comb[(t * HC + src) * HC + target], r[src]);
                 sum = __fadd_rn(sum, term);
             }
-            float scaled = __fmul_rn(post[t * hcMult + target], x);
-            V41Store<T>(output, (t * hcMult + target) * dim + d, __fadd_rn(scaled, sum));
+            float scaled = __fmul_rn(post[t * HC + target], x);
+            V41Store<T>(output, (t * HC + target) * dim + d, __fadd_rn(scaled, sum));
+        }
+    }
+
+    template <int HC>
+    __global__ void V41MoeHcPostKernel(const float *input, const __nv_bfloat16 *shared, const __nv_bfloat16 *residual, const float *post,
+                                    const float *comb, __nv_bfloat16 *output, uint64_t count, int dim) {
+        const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count / HC) return;
+        const int d = idx % dim;
+        const uint64_t t = idx / dim;
+        float r[4];
+#pragma unroll
+        for (int src = 0; src < HC; src++) r[src] = V41Load<__nv_bfloat16>(residual, (t * HC + src) * dim + d);
+        // Match FP32 routed sum + BF16 shared output, then the explicit
+        // BF16 rounding before the HC residual transform. Do not fuse this
+        // rounding boundary into the following FP32 multiply-adds.
+        const float sum = __fadd_rn(input[idx], __bfloat162float(shared[idx]));
+        const float x = __bfloat162float(__float2bfloat16_rn(sum));
+#pragma unroll
+        for (int target = 0; target < HC; target++) {
+            float sum = 0.0f;
+    #pragma unroll
+        for (int src = 0; src < HC; src++) {
+                float term = __fmul_rn(comb[(t * HC + src) * HC + target], r[src]);
+                sum = __fadd_rn(sum, term);
+            }
+            float scaled = __fmul_rn(post[t * HC + target], x);
+            V41Store<__nv_bfloat16>(output, (t * HC + target) * dim + d, __fadd_rn(scaled, sum));
         }
     }
 
@@ -2841,7 +2874,7 @@ namespace {
 // ==================== 导出接口 ====================
 
 template <bool QUANTIZE>
-static bool V41RunSharedSwiglu(const fastllm::Data &input, float limit, fastllm::Data &output) {
+static bool V41RunSharedSwiglu(const fastllm::Data &input, float limit, fastllm::Data &output, const float *routeScales = nullptr) {
     if (!V41OnCuda(input) || input.multiDeviceData || input.dims.empty() ||
         input.dims.back() <= 0 || input.dims.back() % 2 || !V41IsFloatType(input.dataType)) return false;
     auto dims = input.dims;
@@ -2854,11 +2887,11 @@ static bool V41RunSharedSwiglu(const fastllm::Data &input, float limit, fastllm:
     const int blocks = (count + 255) / 256;
     auto out = (__nv_bfloat16 *)output.cudaData;
     if (input.dataType == DataType::BFLOAT16)
-        V41SharedSwigluKernel<__nv_bfloat16, QUANTIZE><<<blocks, 256>>>((const __nv_bfloat16 *)input.cudaData, out, count, mid, limit);
+        V41SharedSwigluKernel<__nv_bfloat16, QUANTIZE><<<blocks, 256>>>((const __nv_bfloat16 *)input.cudaData, out, count, mid, limit, routeScales);
     else if (input.dataType == DataType::FLOAT16)
-        V41SharedSwigluKernel<half, QUANTIZE><<<blocks, 256>>>((const half *)input.cudaData, out, count, mid, limit);
+        V41SharedSwigluKernel<half, QUANTIZE><<<blocks, 256>>>((const half *)input.cudaData, out, count, mid, limit, routeScales);
     else
-        V41SharedSwigluKernel<float, QUANTIZE><<<blocks, 256>>>((const float *)input.cudaData, out, count, mid, limit);
+        V41SharedSwigluKernel<float, QUANTIZE><<<blocks, 256>>>((const float *)input.cudaData, out, count, mid, limit, routeScales);
     return V41CheckLaunch("SharedSwiglu");
 }
 
@@ -2866,8 +2899,8 @@ bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit,
     return V41RunSharedSwiglu<false>(input, limit, output);
 }
 
-bool FastllmCudaDeepSeekV41SharedSwigluQuantized(const fastllm::Data &input, float limit, fastllm::Data &output) {
-    return V41RunSharedSwiglu<true>(input, limit, output);
+bool FastllmCudaDeepSeekV41SharedSwigluQuantized(const fastllm::Data &input, float limit, fastllm::Data &output, const float *routeScales) {
+    return V41RunSharedSwiglu<true>(input, limit, output, routeScales);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41HcMix(const fastllm::Data &x, fastllm::Data &hcFn, fastllm::Data &hcScale,
@@ -3751,11 +3784,46 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data &input, const f
         comb.Count(0) != post.Count(0) * hc) return false;
     if (!V41PrepareOutput(output, input.dataType, residual.dims)) return false;
     const int blocks = (count / hc + 255) / 256;
-#define V41_HCPOST(T) V41HcPostKernel<<<blocks, 256>>>((const T*)input.cudaData, (const T*)residual.cudaData, \
-    (const float*)post.cudaData, (const float*)comb.cudaData, (T*)output.cudaData, count, hc, dim)
+#define V41_HCPOST_ONE(T, H) V41HcPostKernel<T, H><<<blocks, 256>>>((const T*)input.cudaData, (const T*)residual.cudaData, \
+    (const float*)post.cudaData, (const float*)comb.cudaData, (T*)output.cudaData, count, dim)
+#define V41_HCPOST(T) switch (hc) { \
+    case 1: V41_HCPOST_ONE(T, 1); break; \
+    case 2: V41_HCPOST_ONE(T, 2); break; \
+    case 3: V41_HCPOST_ONE(T, 3); break; \
+    case 4: V41_HCPOST_ONE(T, 4); break; \
+    }
     if (input.dataType == DataType::BFLOAT16) { V41_HCPOST(__nv_bfloat16); }
     else if (input.dataType == DataType::FLOAT16) { V41_HCPOST(half); }
     else { V41_HCPOST(float); }
+#undef V41_HCPOST_ONE
 #undef V41_HCPOST
     return V41CheckLaunch("HcPost");
+}
+
+extern "C" bool FastllmCudaDeepSeekV41MoeHcPost(const fastllm::Data &input, const fastllm::Data &shared, const fastllm::Data &residual,
+    const fastllm::Data &post, const fastllm::Data &comb, fastllm::Data &output) {
+    if (!V41OnCuda(input) || !V41OnCuda(residual) || !V41OnCuda(post) || !V41OnCuda(comb) ||
+        input.dataType != DataType::FLOAT32 || residual.dataType != DataType::BFLOAT16 ||
+        shared.dataType != DataType::BFLOAT16 || !V41OnCuda(shared) ||
+        shared.Count(0) != input.Count(0) || residual.dims.size() != 4 ||
+        post.dataType != DataType::FLOAT32 || comb.dataType != DataType::FLOAT32 ||
+        &output == &input || &output == &shared) return false;
+    const int hc = residual.dims[2], dim = residual.dims[3];
+    const uint64_t count = residual.Count(0);
+    if (hc <= 0 || hc > 4 || dim <= 0 || input.Count(0) * hc != count || post.Count(0) * dim != count ||
+        comb.Count(0) != post.Count(0) * hc) return false;
+    if (!V41PrepareOutput(output, residual.dataType, residual.dims)) return false;
+    const int blocks = (count / hc + 255) / 256;
+#define V41_MOE_HCPOST(H) V41MoeHcPostKernel<H><<<blocks, 256>>>( \
+    (const float*)input.cudaData, (const __nv_bfloat16*)shared.cudaData, \
+    (const __nv_bfloat16*)residual.cudaData, (const float*)post.cudaData, \
+    (const float*)comb.cudaData, (__nv_bfloat16*)output.cudaData, count, dim)
+    switch (hc) {
+        case 1: V41_MOE_HCPOST(1); break;
+        case 2: V41_MOE_HCPOST(2); break;
+        case 3: V41_MOE_HCPOST(3); break;
+        case 4: V41_MOE_HCPOST(4); break;
+    }
+#undef V41_MOE_HCPOST
+    return V41CheckLaunch("MoeHcPost");
 }

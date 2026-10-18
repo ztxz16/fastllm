@@ -8775,8 +8775,9 @@ extern "C" bool FastllmCudaDeepSeekV4RouteScoreTransform(fastllm::Data &logits, 
         return false;
     }
     int experts = logits.dims.back();
+    if (experts <= 0) return false;
     int rows = (int)(logits.Count(0) / experts);
-    if (experts > 256) {
+    if (rows <= 0) {
         return false;
     }
     DeepSeekV4RouteScoreTransformKernel<<<rows, 256>>>((float *)logits.cudaData, rows, experts, scoreFuncMode);
