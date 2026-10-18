@@ -7393,7 +7393,15 @@ namespace fastllm {
         Data emptyAttentionMask;
         std::unique_ptr<Data> denseAttentionMask;
         const Data *mtpAttentionMask = &emptyAttentionMask;
-        if (sequence > 1) {
+        // Above the QSA budget, selection already enforces causality and
+        // supplies its own mask or sparse indices. Avoid building a redundant
+        // chunk-by-history CPU mask on the hybrid CUDA path. Short attention
+        // still needs the explicit mask because its maskType is non-causal.
+        const bool implicitQsaMask = executionMode == ExecutionMode::Hybrid &&
+            attentionInput.dataDevice == DataDevice::CUDA &&
+            mtpPositionIds.dataDevice == DataDevice::CUDA &&
+            previousMtpLength + sequence > this->indexerBudget;
+        if (sequence > 1 && !implicitQsaMask) {
             const int mtpKeyLength = previousMtpLength + sequence;
             std::vector<float> mtpMaskValues(
                 (size_t)sequence * mtpKeyLength, 0.0f);

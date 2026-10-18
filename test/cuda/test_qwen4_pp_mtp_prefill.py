@@ -85,7 +85,8 @@ def main():
     try:
         model.set_chunked_prefill_size(512)
         for length, mtp, threshold in [(512, 1, .5), (513, 1, .5), (1025, 1, .5), (1024, 3, .5),
-                                        (1025, 3, 0), (1031, 3, .5), (1025, 0, 0)]:
+                                        (1025, 3, 0), (1031, 3, .5), (1025, 0, 0),
+                                        (4097, 3, 0), (4103, 3, .5)]:
             os.environ['FASTLLM_QWEN4_ENABLE_MTP'] = str(mtp)
             os.environ['FASTLLM_QWEN4_MTP_MIN_P'] = str(threshold)
             name = f'n{length}-mtp{mtp}-p{threshold}'
@@ -97,7 +98,7 @@ def main():
 
         os.environ['FASTLLM_QWEN4_ENABLE_MTP'] = '3'
         os.environ['FASTLLM_QWEN4_MTP_MIN_P'] = '.5'
-        prefix = padding[:1024-len(terminal)] + terminal
+        prefix = padding[:4096-len(terminal)] + terminal
         extended = prefix + model.encode('    (17, 17),\n')
         reference = request('prefix-reference', len(extended), True, ids=extended)
         os.environ['FASTLLM_PREFIX_CACHE'] = '1'

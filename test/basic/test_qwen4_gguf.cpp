@@ -293,6 +293,70 @@ void TestEmbeddingImport(const Fixture &fixture) {
 }
 namespace fastllm {
 struct Qwen4GGUFTestAccess {
+    static void CheckQsaCausalMask() {
+#ifdef USE_CUDA
+        SetDeviceMap({{"cuda:0", 1}});
+        for (DataType type : {FLOAT32, FLOAT16}) {
+            Qwen4ExpModel model;
+            model.dataType = type;
+            model.indexerHeads = 2;
+            model.indexerKvHeads = 1;
+            model.indexerHeadDim = 128;
+            model.indexerCompressRatio = 4;
+            model.indexerBudget = 2048;
+            model.rotary_dim = 64;
+            const std::string prefix = "mtp.layers.0.self_attn.";
+            std::vector<float> weights(384 * 16);
+            for (size_t i = 0; i < weights.size(); ++i)
+                weights[i] = float(int((i * 37 + 11) % 101) - 50) / 128;
+            model.weight.weight[prefix + "indexer.index_qk_proj.weight"].CopyFrom(
+                Data(type, {384, 16}, weights));
+            for (const char *name : {"q_layernorm.weight", "k_layernorm.weight"})
+                model.weight.weight[prefix + "indexer." + name].CopyFrom(
+                    Data(FLOAT32, {128}, std::vector<float>(128, 1)));
+            model.qsaKeyNormValues[0] = std::vector<float>(128, 1);
+            Qwen4ExpModel::RequestState explicitState, implicitState;
+            int previous = 0;
+            // Cross the dense-attention budget and the sparse-prefill boundary,
+            // including incomplete compression groups and decode-sized batches.
+            for (int rows : {2047, 1, 1, 3, 2044, 1, 3, 5, 2048}) {
+                const int length = previous + rows;
+                std::vector<float> values(rows * 16), positions(rows);
+                for (size_t i = 0; i < values.size(); ++i)
+                    values[i] = float(int((i * 13 + previous) % 79) - 39) / 64;
+                for (int i = 0; i < rows; ++i) positions[i] = previous + i;
+                Data input(type, {1, rows, 16}, values);
+                Data pos(FLOAT32, {1, rows}, positions);
+                input.ToDevice(CUDA, std::vector<int>{0});
+                pos.ToDevice(CUDA, std::vector<int>{0});
+                std::vector<float> maskValues(size_t(rows) * length, 0);
+                for (int row = 0; row < rows; ++row)
+                    std::fill(maskValues.begin() + size_t(row) * length + previous + row + 1,
+                              maskValues.begin() + size_t(row + 1) * length, 1);
+                Data mask(FLOAT32, {1, rows, length}, maskValues), empty;
+                Data explicitMask, explicitIndices, implicitMask, implicitIndices;
+                model.BuildQSAMask(0, prefix, input, mask, pos, previous, true,
+                                   explicitState, explicitMask, explicitIndices);
+                model.BuildQSAMask(0, prefix, input,
+                                   length > model.indexerBudget ? empty : mask,
+                                   pos, previous, true, implicitState, implicitMask, implicitIndices);
+                auto equal = [](Data &a, Data &b) {
+                    Check(a.dims == b.dims && a.dataType == b.dataType,
+                          "implicit QSA mask changed tensor metadata");
+                    if (a.dims.empty()) return;
+                    a.ToDevice(CPU); b.ToDevice(CPU);
+                    Check(a.GetBytes() == b.GetBytes() &&
+                          std::memcmp(a.cpuData, b.cpuData, a.GetBytes()) == 0,
+                          "implicit QSA mask changed selected attention entries");
+                };
+                equal(explicitMask, implicitMask);
+                equal(explicitIndices, implicitIndices);
+                previous = length;
+            }
+        }
+        std::cout << "PASS: Qwen4 explicit and implicit causal QSA masks match\n";
+#endif
+    }
     static void CheckGraphSlotReset(int targetDevice = 0, int draftDevice = 0) {
 #ifdef USE_CUDA
         Qwen4ExpModel model;
@@ -942,6 +1006,16 @@ int main(int argc, char **argv) {
         SetThreads(2); SetDeviceMap({{"cpu", 1}}); SetMoeDeviceMap({{"cpu", 1}});
         SetCudaEmbedding(false);
         SetMoeCudaCacheBytes(0); setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
+        if (argc == 2 && std::string(argv[1]) == "--qsa-causal-mask") {
+#ifdef USE_CUDA
+            if (FastllmCudaGetDeviceCount() < 1) return 77;
+            FastllmCudaSetDevice(0);
+            Qwen4GGUFTestAccess::CheckQsaCausalMask();
+            return 0;
+#else
+            return 77;
+#endif
+        }
         if (argc == 2 && std::string(argv[1]) == "--graph-slot-reset") {
 #ifdef USE_CUDA
             if (FastllmCudaGetDeviceCount() < 1) return 77;
