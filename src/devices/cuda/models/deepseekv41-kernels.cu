@@ -3230,6 +3230,59 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
         if (index < elements) V41Store<T>(output, index, V41QuantValueDev(value, scale, 1));
     }
 
+    // Match FastllmRMSNormKernelInner1<512>: pairwise loading, FMA order,
+    // shuffle-down tree, and BF16 output rounding. Q quantization consumes that
+    // rounded value, never the unrounded FP32 expression.
+    __global__ void V41QKVNormQuantKernel(const __nv_bfloat16 *q, const __nv_bfloat16 *kv,
+            const float *qw, const float *kw, __nv_bfloat16 *qn, __nv_bfloat16 *qq,
+            __nv_bfloat16 *kn, int qdim, int kdim, float eps) {
+        const bool query = (blockIdx.x & 1) == 0;
+        const int token = blockIdx.x / 2, dim = query ? qdim : kdim;
+        const auto *input = reinterpret_cast<const __nv_bfloat162 *>(query ? q : kv) + (size_t)token * (dim / 2);
+        auto *output = reinterpret_cast<__nv_bfloat162 *>(query ? qn : kn) + (size_t)token * (dim / 2);
+        const float *weight = query ? qw : kw;
+        const int tid = threadIdx.x, lane = tid % 32;
+        __shared__ float warpSums[16];
+        __shared__ float scale;
+        float sum = 0.0f;
+        for (int i = tid; i < dim / 2; i += 512) {
+            const __nv_bfloat162 v = input[i];
+            const float lo = __bfloat162float(v.x), hi = __bfloat162float(v.y);
+            sum += lo * lo + hi * hi;
+        }
+        for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane == 0) warpSums[tid / 32] = sum;
+        __syncthreads();
+        if (tid < 32) {
+            float v = lane < 16 ? warpSums[lane] : 0.0f;
+            for (int offset = 16; offset; offset >>= 1) v += __shfl_down_sync(0xffffffff, v, offset);
+            if (lane == 0) scale = rsqrtf(v / dim + eps);
+        }
+        __syncthreads();
+        const float s = scale;
+        // Uniform iteration count keeps every lane participating in shuffles.
+        for (int base = 0; base < dim / 2; base += 512) {
+            const int i = base + tid;
+            __nv_bfloat162 v = {};
+            if (i < dim / 2) {
+                v = input[i];
+                v.x = __float2bfloat16_rn(__bfloat162float(v.x) * s * __ldg(weight + 2 * i));
+                v.y = __float2bfloat16_rn(__bfloat162float(v.y) * s * __ldg(weight + 2 * i + 1));
+                output[i] = v;
+            }
+            if (query) {
+                float maximum = fmaxf(fabsf(__bfloat162float(v.x)), fabsf(__bfloat162float(v.y)));
+                // Sixteen lanes hold one contiguous 32-element quantization block.
+                for (int offset = 8; offset; offset >>= 1)
+                    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset, 16));
+                const float qs = V41QuantScaleDev(maximum, 1);
+                v.x = __float2bfloat16_rn(V41QuantValueDev(__bfloat162float(v.x), qs, 1));
+                v.y = __float2bfloat16_rn(V41QuantValueDev(__bfloat162float(v.y), qs, 1));
+                if (i < dim / 2) reinterpret_cast<__nv_bfloat162 *>(qq)[(size_t)token * (dim / 2) + i] = v;
+            }
+        }
+    }
+
     // ---------------- QuantizeKV ----------------
 
     constexpr int kKvQuantThreads = 128;
@@ -3387,6 +3440,54 @@ bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit,
 
 bool FastllmCudaDeepSeekV41SharedSwigluQuantized(const fastllm::Data &input, float limit, fastllm::Data &output, const float *routeScales) {
     return V41RunSharedSwiglu<true>(input, limit, output, routeScales);
+}
+
+extern "C" bool FastllmCudaV41QKVNormQuant(const Data &q, const Data &kv,
+        const Data &qWeight, const Data &kvWeight, float eps, Data &qNorm, Data &qQuant, Data &kvNorm) {
+    const int device = FastllmCudaGetDevice();
+    auto local = [device](const Data &d) {
+        return V41OnCuda(d) && !d.multiDeviceData && d.dataDeviceIds.size() == 1 &&
+               d.dataDeviceIds[0] == device;
+    };
+    if (!local(q) || !local(kv) || !local(qWeight) || !local(kvWeight) ||
+        q.dataType != DataType::BFLOAT16 || kv.dataType != DataType::BFLOAT16 ||
+        qWeight.dataType != DataType::FLOAT32 || kvWeight.dataType != DataType::FLOAT32 ||
+        q.dims.empty() || kv.dims.size() != q.dims.size()) return false;
+    const int qdim = q.dims.back(), kdim = kv.dims.back();
+    if (qdim < 512 || qdim >= 4096 || qdim % 32 || kdim < 512 || kdim >= 4096 || kdim % 32 ||
+        qWeight.Count(0) != (uint64_t)qdim || kvWeight.Count(0) != (uint64_t)kdim ||
+        reinterpret_cast<uintptr_t>(q.cudaData) % 4 || reinterpret_cast<uintptr_t>(kv.cudaData) % 4) return false;
+    auto kdims = q.dims;
+    kdims.back() = kdim;
+    const auto tokens = q.Count(0) / qdim;
+    if (tokens < 1 || tokens > 8 || kdims != kv.dims || !std::isfinite(eps) || eps < 0) return false;
+    if (&qNorm == &qQuant || &qNorm == &kvNorm || &qQuant == &kvNorm || &q == &qNorm ||
+        &q == &qQuant || &q == &kvNorm || &kv == &qNorm || &kv == &qQuant) return false;
+    auto overlaps = [](const void *a, size_t na, const void *b, size_t nb) {
+        const auto x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
+        return a && b && (x <= y ? y - x < na : x - y < nb);
+    };
+    const size_t qbytes = q.GetBytes(), kbytes = kv.GetBytes();
+    for (Data *out : {&qNorm, &qQuant, &kvNorm}) {
+        if (!out->cudaData) continue;
+        if (reinterpret_cast<uintptr_t>(out->cudaData) % 4) return false;
+        const size_t bytes = out == &kvNorm ? kbytes : qbytes;
+        for (const Data *source : {&q, &kv, &qWeight, &kvWeight}) {
+            if (out == &kvNorm && source == &kv && out->cudaData == kv.cudaData) continue;
+            if (overlaps(out->cudaData, bytes, source->cudaData, source->GetBytes())) return false;
+        }
+    }
+    if (overlaps(qNorm.cudaData, qbytes, qQuant.cudaData, qbytes) ||
+        overlaps(qNorm.cudaData, qbytes, kvNorm.cudaData, kbytes) ||
+        overlaps(qQuant.cudaData, qbytes, kvNorm.cudaData, kbytes)) return false;
+    if (!V41PrepareOutput(qNorm, DataType::BFLOAT16, q.dims) ||
+        !V41PrepareOutput(qQuant, DataType::BFLOAT16, q.dims) ||
+        !V41PrepareOutput(kvNorm, DataType::BFLOAT16, kv.dims)) return false;
+    V41QKVNormQuantKernel<<<tokens * 2, 512>>>((const __nv_bfloat16 *)q.cudaData,
+        (const __nv_bfloat16 *)kv.cudaData, (const float *)qWeight.cudaData, (const float *)kvWeight.cudaData,
+        (__nv_bfloat16 *)qNorm.cudaData, (__nv_bfloat16 *)qQuant.cudaData, (__nv_bfloat16 *)kvNorm.cudaData,
+        qdim, kdim, eps);
+    return V41CheckLaunch("QKVNormQuant");
 }
 
 extern "C" bool FastllmCudaV41RouterScores(const Data &input, Data &weight,

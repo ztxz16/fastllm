@@ -45,3 +45,16 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const fastllm::Data &x, const
 // Full-K output-channel slice; no partial dot products or reduction across GPUs.
 extern "C" bool FastllmCudaBFloat16FP8ReplicatedRowSlice(const fastllm::Data &input,
     fastllm::Data &weight, fastllm::Data &output, int rowStart, int rowCount);
+
+// Independent B1 block-scaled FP8 projections, retaining each full-K reduction.
+// Inputs, weights and preallocated outputs must reside on the current device.
+extern "C" bool FastllmCudaBFloat16FP8LinearPair(const fastllm::Data &input,
+    fastllm::Data &firstWeight, fastllm::Data &secondWeight,
+    fastllm::Data &firstOutput, fastllm::Data &secondOutput);
+
+// BF16 Q/KV RMSNorm with the original 512-thread reduction. Q is rounded to
+// BF16 before block-32 FP8 round-trip; both rounded and quantized Q are retained.
+// KV output may alias KV input. Other aliases and unsupported shapes reject.
+extern "C" bool FastllmCudaV41QKVNormQuant(const fastllm::Data &q, const fastllm::Data &kv,
+    const fastllm::Data &qWeight, const fastllm::Data &kvWeight, float eps,
+    fastllm::Data &qNorm, fastllm::Data &qQuant, fastllm::Data &kvNorm);

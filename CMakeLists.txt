@@ -1374,6 +1374,13 @@ if (UNIT_TEST)
             fastllm_add_checked_test(deepseekV41DecodeProjections deepseekV41DecodeProjectionRegression
                 "PASS V4.1 decode projections" 300)
             set_tests_properties(deepseekV41DecodeProjections PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+            add_executable(deepseekV41QKVPreparationRegression test/ops/deepseekV41QKVPreparationRegression.cpp)
+            target_link_libraries(deepseekV41QKVPreparationRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41QKVPreparationRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(deepseekV41QKVPreparation deepseekV41QKVPreparationRegression
+                "PASS V4.1 QKV preparation" 300)
+            set_tests_properties(deepseekV41QKVPreparation PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_executable(deepseekV41EngramProjectionRegression test/ops/deepseekV41EngramProjectionRegression.cpp)
             target_link_libraries(deepseekV41EngramProjectionRegression PRIVATE fastllm)
             target_include_directories(deepseekV41EngramProjectionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

@@ -830,6 +830,69 @@ namespace fastllm {
         }
 
 #ifdef USE_CUDA
+        // B1 only: larger batches retain their existing GEMM dispatch. All
+        // graph-owned scratch buffers belong to the forward workspace.
+        bool V41QkvPrepare(const Data &input, Data &qw, Data &kw, Data &qnw, Data &knw, float eps,
+                           Data &inputQuant, Data &qr, Data &qNorm, Data &qQuant, Data &kv) {
+            if (input.dataType != DataType::BFLOAT16 || input.dims.empty() || input.dims.back() <= 0 ||
+                input.Count(0) != (uint64_t)input.dims.back() || input.dims.back() % 32 ||
+                !std::isfinite(eps) || eps < 0) return false;
+            for (const Data *w : {&qw, &kw}) {
+                if (w->dataType != DataType::FP8_E4M3 || w->IsRepacked || w->dims.size() != 2 ||
+                    w->dims[1] != input.dims.back() || w->dims[0] < 512 || w->dims[0] >= 4096 ||
+                    w->dims[0] % 32 || w->blockM < 4 || (w->blockM & (w->blockM - 1)) ||
+                    w->blockK <= 1 || (w->blockK & (w->blockK - 1))) return false;
+            }
+            if (qnw.dataType != DataType::FLOAT32 || knw.dataType != DataType::FLOAT32 ||
+                qnw.Count(0) != (uint64_t)qw.dims[0] || knw.Count(0) != (uint64_t)kw.dims[0]) return false;
+            std::vector<int> devices;
+            if (input.multiDeviceData) {
+                if (!input.IsTensorParallelReplicated()) return false;
+                for (const auto &replica : input.multiDeviceDatas) devices.push_back(replica.first);
+                if (devices.empty()) return false;
+                for (Data *w : {&qw, &kw, &qnw, &knw}) {
+                    if (!w->multiDeviceData) PrepareMultiCudaReplicatedData(*w, devices, true);
+                    if (!w->IsTensorParallelReplicated()) return false;
+                    for (int device : devices) {
+                        const auto it = w->multiDeviceDatas.find(device);
+                        if (it == w->multiDeviceDatas.end() || !it->second || !it->second->cudaData ||
+                            !input.multiDeviceDatas.at(device) || !input.multiDeviceDatas.at(device)->cudaData)
+                            return false;
+                    }
+                }
+            } else {
+                if (input.dataDevice != DataDevice::CUDA || !input.cudaData ||
+                    input.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()}) return false;
+                for (Data *w : {&qw, &kw, &qnw, &knw}) {
+                    if (w->multiDeviceData) return false;
+                    if (w->dataDevice == DataDevice::CUDA && w->cudaData && w->dataDeviceIds != input.dataDeviceIds)
+                        return false;
+                    w->ToDevice(DataDevice::CUDA, input.dataDeviceIds, true);
+                }
+            }
+            auto qdims = input.dims, kdims = input.dims;
+            qdims.back() = qw.dims[0];
+            kdims.back() = kw.dims[0];
+            V41AllocLike(inputQuant, DataType::BFLOAT16, input.dims, input, devices);
+            for (Data *out : {&qr, &qNorm, &qQuant}) V41AllocLike(*out, DataType::BFLOAT16, qdims, input, devices);
+            V41AllocLike(kv, DataType::BFLOAT16, kdims, input, devices);
+            auto run = [&](const Data &x, Data &wq, Data &wk, Data &nq, Data &nk,
+                           Data &xq, Data &qraw, Data &qout, Data &qq, Data &kout) {
+                return FastllmCudaDeepSeekV41QuantizeActivation(x, xq) &&
+                    FastllmCudaBFloat16FP8LinearPair(xq, wq, wk, qraw, kout) &&
+                    FastllmCudaV41QKVNormQuant(qraw, kout, nq, nk, eps, qout, qq, kout);
+            };
+            if (devices.empty()) return run(input, qw, kw, qnw, knw, inputQuant, qr, qNorm, qQuant, kv);
+            std::vector<int> ok(devices.size(), 0);
+            const bool submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                ok[rank] = run(*input.multiDeviceDatas.at(device), *qw.multiDeviceDatas.at(device),
+                    *kw.multiDeviceDatas.at(device), *qnw.multiDeviceDatas.at(device), *knw.multiDeviceDatas.at(device),
+                    *inputQuant.multiDeviceDatas.at(device), *qr.multiDeviceDatas.at(device),
+                    *qNorm.multiDeviceDatas.at(device), *qQuant.multiDeviceDatas.at(device), *kv.multiDeviceDatas.at(device));
+            });
+            return submitted && std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; });
+        }
+
         bool V41RouterScores(const Data &input, Data &weight, float temperature, Data &output) {
             if (input.dataType != DataType::BFLOAT16 || input.dims.empty() ||
                 input.dims.back() <= 0 || input.Count(0) / input.dims.back() > 8 ||
@@ -5112,14 +5175,28 @@ namespace fastllm {
 
             // wq_a / wkv 是复制的（KV 是 MLA 式的单份 latent，与 head 无关）；
             // wq_b 按行切 -> q 的 head 维分片，Reshape 会把 tpAxis 从最后一维换算到 head 维。
-            quantizedLinear(attnInput, pre + ".attn.wq_a.weight", qr, tp, attnQuant);
-            V41RMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
+            bool qkvPrepared = false;
+#ifdef USE_CUDA
+            if (attnQuant && quantizedLinearNames.count(pre + ".attn.wq_b.weight") && !dumpDebug) {
+                qkvPrepared = V41QkvPrepare(attnInput, weight[pre + ".attn.wq_a.weight"],
+                    weight[pre + ".attn.wkv.weight"], weight[pre + ".attn.q_norm.weight"],
+                    weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, *attnQuant,
+                    qr, qNorm, ws->qNormQuantized, kv);
+            }
+#endif
+            if (!qkvPrepared) {
+                quantizedLinear(attnInput, pre + ".attn.wq_a.weight", qr, tp, attnQuant);
+                V41RMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
+            }
             if (tpAttention) {
                 weight[pre + ".attn.wq_b.weight"].tpLinearType = TP_LINEAR_ROW;
             }
             // 不切分注意力时 wq_b 也必须显式走复制布局：否则 MultiCudaLinearOp 会按
             // "大权重通用切分 + gather"处理，而那条路径读的是复制张量已失效的 root。
-            quantizedLinear(qNorm, pre + ".attn.wq_b.weight", q, tp && !tpAttention, qQuant);
+            // Keep qQuant's original eligibility for the Indexer: an unquantized
+            // Indexer projection must still consume the unquantized qNorm.
+            quantizedLinear(qkvPrepared ? ws->qNormQuantized : qNorm, pre + ".attn.wq_b.weight", q,
+                            tp && !tpAttention, qkvPrepared ? nullptr : qQuant, qkvPrepared);
             if (dumpDebug) {
                 const std::string tag = "fl_layer" + std::to_string(layer);
                 V41DumpTensor(qr, tag + "_qr" + dumpSuffix);
@@ -5131,10 +5208,12 @@ namespace fastllm {
             }
             q.Reshape({1, seqlen, num_attention_heads, headDim});
 
-            quantizedLinear(attnQuant ? *attnQuant : attnInput, pre + ".attn.wkv.weight", kv,
-                            tp, nullptr, attnQuant != nullptr);
-            if (dumpDebug) V41DumpTensor(kv, "fl_layer" + std::to_string(layer) + "_kv_proj" + dumpSuffix);
-            V41RMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
+            if (!qkvPrepared) {
+                quantizedLinear(attnQuant ? *attnQuant : attnInput, pre + ".attn.wkv.weight", kv,
+                                tp, nullptr, attnQuant != nullptr);
+                if (dumpDebug) V41DumpTensor(kv, "fl_layer" + std::to_string(layer) + "_kv_proj" + dumpSuffix);
+                V41RMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
+            }
             if (dumpDebug) V41DumpTensor(kv, "fl_layer" + std::to_string(layer) + "_kv_norm" + dumpSuffix);
             kv.Reshape({1, seqlen, headDim});
 
