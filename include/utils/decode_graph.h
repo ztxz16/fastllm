@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <climits>
+#include <cstdint>
 #include <vector>
 
 namespace fastllm {
@@ -22,14 +24,17 @@ struct DecodeGraphBatch {
     }
 };
 
-// Ascending, unique buckets; the endpoint is always included. Alignment is a
-// backend choice (e.g. the EP group size), not a requirement of the scheduler.
+// Align the final compute bucket too: an unaligned endpoint can disable a
+// backend's sharded execution. Admission limits remain the scheduler's job.
 inline std::vector<int> DecodeGraphBatchBuckets(int maxRows, int alignment = 8, int exactRows = 4) {
     if (maxRows <= 0 || alignment <= 0) return {};
+    const int64_t last = maxRows <= exactRows ? maxRows :
+        ((int64_t)maxRows + alignment - 1) / alignment * alignment;
+    if (last > INT_MAX) return {};
     std::vector<int> result;
     for (int n = 1; n <= std::min(maxRows, exactRows); ++n) result.push_back(n);
-    for (int n = alignment; n <= maxRows; n += alignment) result.push_back(n);
-    result.push_back(maxRows);
+    for (int64_t n = alignment; n <= last; n += alignment) result.push_back((int)n);
+    result.push_back((int)last);
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;

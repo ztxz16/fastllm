@@ -385,9 +385,10 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
     serving->moeType = moeAtype;
     serving->kvType = kvCacheDataType;
     serving->generation = FastllmGetNcclGeneration();
-    const int maxRows = std::min(maxBatch > 0 ? maxBatch : 256, 256);
-    const int64_t tokenBudget = tokensLimit > 0 ? tokensLimit : (int64_t)maxRows * 16384;
-    serving->batchBuckets = DecodeGraphBatchBuckets(maxRows);
+    const int maxRequests = std::min(maxBatch > 0 ? maxBatch : 256, 256);
+    const int64_t tokenBudget = tokensLimit > 0 ? tokensLimit : (int64_t)maxRequests * 16384;
+    serving->batchBuckets = DecodeGraphBatchBuckets(maxRequests);
+    const int maxRows = serving->batchBuckets.back();
     std::vector<int> batches(serving->batchBuckets.rbegin(), serving->batchBuckets.rend());
     int64_t scoreElements = 0;
     // The pool bounds the sum of live lengths, not each request's length by
@@ -604,6 +605,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
     const int rows = batch->Size(), ranks = tpDevices.size();
     int capacity = serving.prepareCapacity;
     if (!serving.preparing) {
+        if (maxBatch > 0 && rows > maxBatch) return false;
         int region = -1, longest = 0;
         for (int row = 0; row < rows; ++row) {
             const Data &key = batch->Key(row, 0);
