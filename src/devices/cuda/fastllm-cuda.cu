@@ -6631,8 +6631,10 @@ template <int THREAD_PER_BLOCK>
 __global__ void FastllmRepeatKernel (void *inputOri, void *outputOri, int outer, int repeatTimes, int inputStride, int outputStride0, int outputStride1, int copyLen) {
     int id = blockIdx.x;
     int i = id / repeatTimes, j = id % repeatTimes;
-    uint8_t *output = (uint8_t*)outputOri + i * outputStride0 + j * outputStride1;
-    uint8_t *input = (uint8_t*)inputOri + i * inputStride;
+    // The repeated tensor may exceed 2 GiB even though each row fits in int.
+    // Promote before multiplication to avoid signed byte-offset overflow.
+    uint8_t *output = (uint8_t*)outputOri + (size_t)i * outputStride0 + (size_t)j * outputStride1;
+    uint8_t *input = (uint8_t*)inputOri + (size_t)i * inputStride;
     for (int x = threadIdx.x; x < copyLen; x += THREAD_PER_BLOCK) {
         output[x] = input[x];
     }
