@@ -13,6 +13,23 @@ from pathlib import Path
 from . import hybrid_auto as memory
 
 
+def apply_model_defaults(args, metadata):
+    """Apply model-specific auto defaults before speculative setup/budgeting."""
+    config = metadata.get("text_config", metadata)
+    if (not getattr(args, "auto", False) or
+            config.get("model_type", metadata.get("model_type")) not in
+            ("deepseek_v41", "deepseek_v41_text")):
+        return
+    explicit = set(getattr(args, "_auto_explicit", ()))
+    speculation = {"mtp", "dspark", "speculative_algorithm", "speculative_draft_model_path",
+                   "draft_tokens", "speculative_num_draft_tokens", "speculative_dspark_block_size"}
+    if not explicit & speculation and not (args.mtp or args.dspark or args.speculative_algorithm or
+                                           args.speculative_draft_model_path):
+        args.dspark, args.speculative_algorithm = 7, "dspark"
+    if "fast_prefill" not in explicit:
+        args.fast_prefill = True
+
+
 def cuda_hardware():
     """Read visible CUDA ordinals, bandwidth bounds and peer access capability."""
     try:
@@ -132,7 +149,8 @@ def latency_score(candidate, model, costs, args, mode, mapping, hardware, peers)
     prior, not a measured cache hit rate. Keep this policy separate from safety.
     """
     experts, dense, common, _, _, _ = costs
-    resident = sum(experts[:candidate["resident_layers"]])
+    resident = sum(size for layer, size in enumerate(experts)
+                   if memory.expert_layer(layer, model) < candidate["resident_layers"])
     if args.mtp and model.family == "qwen4":
         resident += sum(experts[model.layers:])
     host = sum(experts) - resident
@@ -211,10 +229,12 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         raise ValueError("--auto requires positive CPU threads")
     if base.max_batch <= 0:
         base.max_batch = 1
-    # Target 128K without extending the checkpoint's native window.
     metadata, tensors, model = memory.model_inputs(base)
+    apply_model_defaults(base, metadata)
+    # DeepSeek V4.1 targets its 1M window; other models retain the 128K policy.
     if base.max_context_length <= 0:
-        base.max_context_length = min(model.context, base.tokens if base.tokens > 0 else 131072)
+        target = 1048576 if model.family == "deepseek_v41" else 131072
+        base.max_context_length = min(model.context, base.tokens if base.tokens > 0 else target)
     if base.tokens <= 0:
         base.tokens = base.max_context_length * base.max_batch
     if "atype" not in explicit and model.family != "deepseek_v41":
@@ -223,7 +243,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         base.kv_cache_dtype = "float16"
     # Re-evaluate geometry with the selected defaults (explicit precisions win).
     kv_dtype = base.atype if base.kv_cache_dtype == "auto" and base.atype != "auto" else base.kv_cache_dtype
-    model = memory.geometry(metadata, kv_dtype, base.mtp)
+    model = memory.geometry(metadata, kv_dtype, base.mtp, base.dspark)
     if hardware is None:
         hardware = cuda_hardware()
     info, peers = hardware
@@ -342,11 +362,15 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         result.setdefault("notes", []).append("PP MTP uses CPU embedding to avoid moving its shared weight between GPUs")
     changed = (*memory.AUTO_OPTIONS, "device", "tp", "moe_device", "ngram_device", "threads",
                "atype", "kv_cache_dtype", "max_context_length", "tokens", "max_batch", "kvmem",
-               "low_gpu_mem", "cuda_embedding")
+               "low_gpu_mem", "cuda_embedding", "dspark", "speculative_algorithm", "fast_prefill")
     result["automatic"] = {"policy": "interactive-4k-input-512-output", "topology_candidates": len(choices),
                            "ranking": "estimated latency; not measured throughput", "mtp": args.mtp}
     result["automatic"]["kv_streaming"] = "kvmem" in result
     result["automatic"]["cuda_graph"] = graph_enabled
+    result["automatic"]["dspark"] = chosen.dspark
+    result["automatic"]["fast_prefill"] = chosen.fast_prefill
+    if chosen.dspark:
+        result["automatic"]["dspark_confidence_threshold"] = chosen.speculative_dspark_confidence_threshold
     for name in changed:
         setattr(args, name, getattr(chosen, name))
     print("[auto] " + json.dumps(result, sort_keys=True), flush=True)

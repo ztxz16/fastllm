@@ -10,7 +10,9 @@ ftllm server /path/to/model.gguf --auto
 
 ## 单参数自动选择
 
-默认采用不超过模型原生窗口的 **128K 上下文、单请求**，按代表性的 4K 输入、512 输出估计交互延迟。读取可见 CUDA 设备的可用显存、SM 数、内存带宽参数、PCIe 条件和 peer access 能力，比较单卡、PP、双卡等比例 TP，并联合选择专家驻留、显存缓存、主存缓存和 chunk。权重可全驻留且预算允许时，也可选择全部专家放 GPU。CPU 线程依据进程可用的物理核数选择，并预留启动和 IO 线程。
+DeepSeek-V4.1 默认采用不超过模型原生窗口的 **1M（1,048,576 token）上下文、单请求**，开启 **DSpark 7**（置信度阈值默认 0.5）和 **fast_prefill**。其他模型保持 **128K 上下文、单请求**。按代表性的 4K 输入、512 输出估计交互延迟。读取可见 CUDA 设备的可用显存、SM 数、内存带宽参数、PCIe 条件和 peer access 能力，比较单卡、PP、双卡等比例 TP，并联合选择专家驻留、显存缓存、主存缓存和 chunk。权重可全驻留且预算允许时，也可选择全部专家放 GPU。CPU 线程依据进程可用的物理核数选择，并预留启动和 IO 线程。
+
+DeepSeek-V4.1 的 `fast_prefill` 沿用已有近似注意力语义，可能改变 logits。可用 `--no_fast_prefill` 关闭；`--dspark 0` 或 `--speculative_algorithm off` 关闭推测解码。显式上下文、草稿数、阈值和 JSON 配置中的 `fast_prefill: false` 均优先；`--threads 64` 可固定线程数。预算不足时先调整自动 chunk、缓存和专家放置，仍放不下则报错，不自动缩短 1M 上下文。
 
 主存优先使用 NUMA（构建支持时），否则使用 CPU；超大 PLE/Engram 表优先按需读取，减少启动搬运和主存占用，主存仍放不下时再考虑磁盘专家缓存。CUDA Graph 默认开启，原有 `FASTLLM_CUDA_GRAPH` 显式设置仍优先。原有运行时检查继续决定 Graph 能否实际捕获。
 
@@ -24,7 +26,7 @@ Qwen4 的纯自动选型优先采用可行的单卡或 PP 方案，减少混推�
 
 Qwen4 自动混推在主存充足时优先将目标专家全部放在主存，把可用显存用于动态专家缓存；主存不足时仍可选择部分整层驻留，避免过早使用磁盘专家。能全驻留 GPU 的模型仍保留全 GPU 方案。PP 的自动缓存按每张卡的权重、KV、MTP 和工作区分别核算，不再由最紧张的卡统一限制；`moe_cuda_cache_per_device` 给出各卡字节预算，`moe_cuda_cache` 为其中的最大值。显式缓存和显式驻留仍优先；TP 缓存仍使用统一的每卡预算，其他模型保持原有选择规则。
 
-显存预算保留 `gpu_mem_ratio` 对应的预留量（默认总显存的 10%），并另外计入每卡 512 MiB 的 Graph、库句柄和分配器保护空间；不会将实测剩余显存全部分配给专家缓存。Qwen 的预算还包括 Graph 默认启用的 CUDA embedding，GGUF 词嵌入按实际展开后的 FP32 大小计算；多卡 PP MTP 自动采用 CPU embedding 时免去对应显存开销。这是容量估计，实际余量仍取决于请求形状和运行时分配。
+显存预算保留 `gpu_mem_ratio` 对应的预留量（默认总显存的 10%），并另外计入每卡 512 MiB 的 Graph、库句柄和分配器保护空间；不会将实测剩余显存全部分配给专家缓存。Qwen 的预算还包括 Graph 默认启用的 CUDA embedding，GGUF 词嵌入按实际展开后的 FP32 大小计算；多卡 PP MTP 自动采用 CPU embedding 时免去对应显存开销。这是容量估计，不是运行时显存硬上限；CUDA 分配器可能保留可复用的空闲缓冲，因此驱动看到的显存峰值可能高于规划估算。实际余量仍取决于请求形状和运行时分配。
 
 显式参数优先，包括关闭缓存的 `0`、全部主存专家的 `--moe_device_layers -1`、`--tp off`、线程数、精度、MTP 和阈值。未指定 MTP 时仍关闭。若指定并发而未指定总 token 容量，会按上下文乘以并发预留。不会为了通过预算缩小用户指定的上下文或并发。JSON 配置中的设置也作为显式值处理；`--auto` 下同时给出的命令行设置优先于 JSON。
 
@@ -58,11 +60,11 @@ CUDA/NUMA 混推在有专家显存缓存时，默认让 prefill 和 decode 复�
 
 ## DeepSeek 混推的分块预填充与校验
 
-启用 `--fast_prefill` 后，DeepSeek-V4.1 对满足 bounded replay 条件的单请求分块预填充，只在最后一块执行后段 SWA 层与输出头；前面的块更新长期 KV。末块不超过 SWA 窗口、增量续写、图像输入或 DSpark 等情况沿用原路径。该优化沿用 `fast_prefill` 的近似注意力语义，普通启动不会额外启用它。
+启用 `--fast_prefill` 后，DeepSeek-V4.1 对满足 bounded replay 条件的单请求分块预填充，只在最后一块执行后段 SWA 层与输出头；前面的块更新长期 KV。末块不超过 SWA 窗口、增量续写、图像输入或 DSpark 等情况沿用原路径。该优化沿用 `fast_prefill` 的近似注意力语义；该模型的 `--auto` 默认开启，手动启动仍需显式开启。
 
 `FASTLLM_DSV41_HYBRID_PP=1` 显式启用混推跨块流水线，默认关闭。它要求 CUDA PP 层放置、NUMA 专家、`fast_prefill`、单请求 greedy，以及各级独立拥有其使用的共享 KV/index 来源；例如已验证的双卡 `--device cudapp=14:26 --tp off`。专家显存缓存、DSpark、历史复用或不兼容的层切分等情况会沿用普通路径。该入口不用于纯 GPU 或 TP 执行。
 
-DeepSeek-V4.1 原生 FP8/NVFP4 专家缓存随 `--moe_cuda_cache` 启用，不需要额外的频率策略开关。单卡 DSpark 的 2～8 token 校验在 Graph 开启时也使用现有缓存和动态分流，保持图段的缓冲地址；无可用 GPU 专家时保留 NUMA 回退。`get_moe_cuda_cache_route_stats` 同时统计普通解码与校验的路由，需在请求结束后读取。当前 `--auto` 仍不对 DSpark 做容量规划，使用显式参数启动；Graph 的默认开关与原有配置方式保持不变。
+DeepSeek-V4.1 原生 FP8/NVFP4 专家缓存随 `--moe_cuda_cache` 启用，不需要额外的频率策略开关。单卡 DSpark 的 2～8 token 校验在 Graph 开启时也使用现有缓存和动态分流，保持图段的缓冲地址；无可用 GPU 专家时保留 NUMA 回退。`get_moe_cuda_cache_route_stats` 同时统计普通解码与校验的路由，需在请求结束后读取。DeepSeek-V4.1 的 `--auto` 支持并默认开启内置 DSpark：所有启用草稿层的权重、BF16 滑窗状态、目标层 hidden 特征和验证临时空间均计入预算。草稿稠密部分按最后一张 PP 卡核算（TP 使用保守复制上界），草稿专家沿用最后 N 个主干层的专家放置；不会为纯滑窗草稿分配整段 1M KV。外置 DSpark 仍需手动配置。
 
 ## DeepSeek FP8 WoA 的通用 prefill GEMM
 
@@ -137,4 +139,4 @@ HF packed FP4 在 `auto`/`nvfp4` 下按配对的权重与 scale 元数据核算�
 
 这是一套内存容量规划规则，不是吞吐最优配置搜索。它复用现有缓存、动态 CPU/GPU 分流、Graph 和 TP/PP 执行路径，不改变算子、路由数学或采样策略。改变缓存或驻留配置可能选用现有的不同计算后端，其数值特性与手动使用相同参数一致。
 
-当前支持 Linux、等比例 TP、单卡及加权 CUDA PP 设备映射。CUDA 自动缓存按模型支持现有的 GGUF、FP8、packed FP4 专家格式；GLM/DeepSeek 的主存专家 CUDA 缓存要求 NUMA 和 GGUF/native FP8 E4M3/native packed FP4，普通 CPU 专家仍使用显式缓存参数。HF 精度转换按保守上界核算。除统一 `--auto` 的 Qwen4 精确 KV streaming 外，显式 KVMem、自定义 KV 字节上限、异比例 TP、视觉、自定义模型/权重转换、LoRA、RoPE 扩展及非 MTP 推测算法暂不参与自动规划，仍可使用原有显式参数。自动规划也不能与每卡缓存环境变量覆盖同时使用。逐项自动预算要求混合设备配置；统一 `--auto` 可以在预算允许时选择专家全驻留 GPU，但不选择纯 CPU 执行。
+当前支持 Linux、等比例 TP、单卡及加权 CUDA PP 设备映射。CUDA 自动缓存按模型支持现有的 GGUF、FP8、packed FP4 专家格式；GLM/DeepSeek 的主存专家 CUDA 缓存要求 NUMA 和 GGUF/native FP8 E4M3/native packed FP4，普通 CPU 专家仍使用显式缓存参数。HF 精度转换按保守上界核算。除统一 `--auto` 的 Qwen4 精确 KV streaming 外，显式 KVMem、自定义 KV 字节上限、异比例 TP、视觉、自定义模型/权重转换、LoRA、RoPE 扩展及 MTP/内置 DeepSeek-V4.1 DSpark 以外的推测算法暂不参与自动规划，仍可使用原有显式参数。自动规划也不能与每卡缓存环境变量覆盖同时使用。逐项自动预算要求混合设备配置；统一 `--auto` 可以在预算允许时选择专家全驻留 GPU，但不选择纯 CPU 执行。

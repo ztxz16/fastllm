@@ -198,9 +198,10 @@ class Geometry:
     activation_width: int
     default_chunk: int
     streamed_kv: list = field(default_factory=list)  # exact host-backed KV bytes/token/layer, excluding index
+    dspark_block_size: int = 0  # draft forward retains the trained block when verifying fewer tokens
 
 
-def geometry(metadata, kv_dtype, mtp):
+def geometry(metadata, kv_dtype, mtp, dspark=0):
     """Model adapters expose costs, while placement and budgeting stay shared."""
     arch = metadata.get("general.architecture", "")
     config = metadata.get("text_config", metadata)
@@ -219,6 +220,8 @@ def geometry(metadata, kv_dtype, mtp):
                 config[primary] = config[alias]
     else:
         raise ValueError("Hybrid auto supports Qwen4, GLM-5.3 and DeepSeek-V4.1")
+    if dspark and family != "deepseek_v41":
+        raise ValueError("Hybrid auto supports embedded DSpark only for DeepSeek-V4.1")
     def get(hf, gg, default=None):
         value = metadata.get(arch + "." + gg, default) if arch else config.get(hf, default)
         if value is None:
@@ -239,6 +242,7 @@ def geometry(metadata, kv_dtype, mtp):
         raise ValueError("Hybrid auto: unsupported KV precision")
     kv, state = [0] * layers, [0] * layers
     streamed_kv = []
+    dspark_block = 0
     if family == "qwen4":
         heads = int(get("num_key_value_heads", "attention.head_count_kv"))
         dim = int(get("head_dim", "attention.key_length"))
@@ -294,7 +298,7 @@ def geometry(metadata, kv_dtype, mtp):
         score_divisor, width, chunk = 4, hidden * 4 * 8 + 64 * 128 * 12, 1024
     else:
         if mtp:
-            raise ValueError("Hybrid auto: DeepSeek-V4.1 speculative planning is not supported")
+            raise ValueError("Hybrid auto: DeepSeek-V4.1 uses DSpark, not MTP")
         dim, idxdim = int(get("head_dim", "")), int(get("index_head_dim", ""))
         ratios = config["compress_ratios"]
         def row(dim, index=False):
@@ -311,8 +315,36 @@ def geometry(metadata, kv_dtype, mtp):
         score_divisor = min((r for r in ratios if r > 0), default=1)
         width = hidden * int(config.get("hc_mult", 4)) * 8 + int(config["num_attention_heads"]) * dim * 6
         chunk = 4096
+        if dspark:
+            drafts = int(config.get("num_nextn_predict_layers", config.get("n_mtp_layers", 0)))
+            trained = int(config.get("dspark_block_size", 0))
+            targets = config.get("dspark_target_layer_ids", [])
+            if (not 0 < drafts <= layers or trained <= 0 or dspark < 1 or
+                    int(config.get("dspark_noise_token_id", -1)) < 0 or
+                    int(config.get("dspark_markov_rank", 0)) <= 0 or
+                    int(config.get("dspark_n_routed_experts", 0)) <= 0 or
+                    int(config.get("dspark_num_experts_per_tok", 0)) <= 0 or
+                    not targets or any(not 0 <= i < layers for i in targets) or
+                    any(r != 0 for r in ratios[layers:layers + drafts])):
+                raise ValueError("Hybrid auto: invalid embedded DeepSeek-V4.1 DSpark configuration")
+            dspark_block = max(trained, dspark)
+            # Draft layers have only BF16 sliding-window state, not full-context
+            # KV. Dense draft work runs on the final PP device (replicated bound
+            # for TP); experts follow the final N target-layer placements.
+            kv.extend([0] * drafts)
+            state.extend([int(config["sliding_window"]) * dim * 2] * drafts)
+            # Preserve target hidden features and reserve proposal/verify logits.
+            width += hidden * (len(targets) + 1) * 2
+            state[-1] += (2 * dspark_block + 1) * int(get("vocab_size", "")) * 4
     return Geometry(family, layers, context, hidden, experts, topk, inter, kv, state,
-                    score_divisor, width, chunk, streamed_kv)
+                    score_divisor, width, chunk, streamed_kv, dspark_block)
+
+
+def expert_layer(layer, model):
+    """Match DSpark's ApplyMoeDeviceMapForLayer(main_layers - drafts + stage)."""
+    if model.family == "deepseek_v41" and layer >= model.layers:
+        return layer - (len(model.kv) - model.layers)
+    return layer
 
 
 def devices(args):
@@ -434,10 +466,18 @@ def weight_costs(tensors, model, args):
         match = re.search(r"(?:^blk\.|(?:^|\.)layers\.)(\d+)\.", name)
         layer = int(match[1]) if match else None
         is_draft = name.startswith(("mtp.", "nextn.")) or (layer is not None and layer >= model.layers)
-        if is_draft and not args.mtp:
-            continue
         if is_draft:
-            layer = model.layers
+            if model.family == "deepseek_v41":
+                stage = re.match(r"^mtp\.(\d+)\.", name)
+                if not model.dspark_block_size or not stage:
+                    continue
+                layer = model.layers + int(stage[1])
+                if layer >= len(model.kv):
+                    continue  # DsparkTensorNeeded ignores stages outside the checkpoint configuration.
+            elif args.mtp:
+                layer = model.layers
+            else:
+                continue
         if layer is not None and layer >= len(dense):
             raise ValueError("Hybrid auto: tensor layer outside model")
         is_expert = _is_routed_expert(name)
@@ -562,8 +602,9 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     cpu_auto = args.moe_cpu_cache == "auto"
     topk = max(model.topk, args.moe_experts)
     selected, selected_score = None, None
+    speculative = max(args.mtp, getattr(args, "dspark", 0))
     for chunk in chunks:
-        rows = batch * max(chunk + (1 if args.mtp else 0), args.mtp + 1)
+        rows = batch * max(chunk + (1 if args.mtp else 0), speculative + 1, model.dspark_block_size)
         # QSA/DSA score matrix, recurrent scan activations, routed expert
         # intermediates and one dense dequantization working set.
         workspace = (rows * math.ceil(context / model.score_divisor) * 4 +
@@ -587,20 +628,21 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                 targets = list(mapping) if mode == "tp" else [layer_device(layer, model.layers, mapping)]
                 # Dense TP replication is an upper bound, including unsharded
                 # norms and attention state; expert matrices are column/row split.
-                resident_bytes = experts[layer] if layer < resident else 0
+                owner = expert_layer(layer, model)
+                resident_bytes = experts[layer] if owner < resident else 0
                 if layer >= model.layers and args.mtp and model.family == "qwen4":
                     resident_bytes = experts[layer]  # Qwen draft experts stay on CUDA
                 host_experts += experts[layer] - resident_bytes
                 for d in targets:
                     host_by_device[d] += experts[layer] - resident_bytes
-                    kv_bytes = tokens * model.kv[layer]
+                    kv_bytes = (tokens + (speculative if model.dspark_block_size else 0)) * model.kv[layer]
                     if streaming and model.streamed_kv[layer]:
                         raw = model.streamed_kv[layer]
                         kv_bytes = logical * (model.kv[layer] - raw) + kv_resident * raw + page_metadata
-                    used[d] += dense[layer] + kv_bytes + batch * (args.mtp + 1) * model.state[layer]
+                    used[d] += dense[layer] + kv_bytes + batch * (speculative + 1) * model.state[layer]
                 if resident_bytes:
                     expert_targets = list(mapping) if mode == "tp" else [
-                        layer_device(layer, resident, mapping) if layer < model.layers else next(reversed(mapping))]
+                        layer_device(owner, resident, mapping) if owner < model.layers else next(reversed(mapping))]
                     for d in expert_targets:
                         used[d] += math.ceil(resident_bytes / len(expert_targets))
             if host_experts == 0 and (not allow_full_gpu or streaming):
@@ -676,7 +718,9 @@ def validate_options(args):
         raise ValueError("Hybrid auto requires CUDA + --moe_device cpu/numa/disk in auto/hybrid execution mode")
     if (args.kvmem or args.kv_cache_limit not in ("", "auto") or args.dtype_config or
             args.custom or args.lora or args.multimodal or args.rope_scaling or
-            getattr(args, "speculative_algorithm", "") not in ("", "off", "mtp")):
+            getattr(args, "speculative_algorithm", "") not in ("", "off", "mtp", "dspark") or
+            (getattr(args, "speculative_algorithm", "") == "dspark" and
+             (getattr(args, "speculative_draft_model_path", "") or args.dspark <= 0))):
         raise ValueError("Hybrid auto does not yet budget KVMem, custom KV limits, weight overrides, adapters, vision or external speculative algorithms; use explicit parameters")
     if any(k.startswith("FASTLLM_MOE_CUDA_CACHE_BYTES_") for k in os.environ):
         raise ValueError("Hybrid auto cannot combine with per-device cache environment overrides; use explicit cache parameters")
@@ -685,7 +729,7 @@ def validate_options(args):
 def model_inputs(args):
     metadata, tensors = inventory(args.path)
     kv_dtype = args.atype if args.kv_cache_dtype == "auto" and args.atype != "auto" else args.kv_cache_dtype
-    model = geometry(metadata, kv_dtype, args.mtp)
+    model = geometry(metadata, kv_dtype, args.mtp, args.dspark)
     draft = getattr(args, "speculative_draft_model_path", "")
     if draft:
         _, draft_tensors = inventory(draft)

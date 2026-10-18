@@ -496,7 +496,7 @@ class HybridAutoTest(unittest.TestCase):
                 patch.object(auto, "host_memory", return_value=ram), \
                 patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
             auto.resolve(a, gpu.__getitem__)
-        geometry.assert_called_once_with({}, "float32", 0)
+        geometry.assert_called_once_with({}, "float32", 0, 0)
         self.assertEqual((a.atype, a.kv_cache_dtype), ("float32", "auto"))
 
     def test_deepseek_shared_compressed_cache_accounting(self):
@@ -511,6 +511,89 @@ class HybridAutoTest(unittest.TestCase):
         self.assertEqual(g.state, [128 * 512 * 2] * 4)
         self.assertEqual(auto.geometry(md, "fp4", 0).kv, [288 + 68, 0, 144 + 34, 0])
         self.assertEqual(g.streamed_kv, [])
+
+    def dspark_metadata(self):
+        return {"model_type": "deepseek_v41", "num_hidden_layers": 4,
+                "max_position_embeddings": 1048576, "hidden_size": 4096,
+                "n_routed_experts": 256, "num_experts_per_tok": 8, "moe_intermediate_size": 2048,
+                "head_dim": 512, "index_head_dim": 128, "num_attention_heads": 64,
+                "compress_ratios": [1, 1, 2, 2, 0, 0], "kv_source_layer_ids": [0, 2],
+                "index_source_layer_ids": [0, 2], "sliding_window": 128,
+                "num_nextn_predict_layers": 2, "dspark_block_size": 5,
+                "dspark_target_layer_ids": [2, 3], "dspark_noise_token_id": 100,
+                "dspark_markov_rank": 32, "dspark_n_routed_experts": 128,
+                "dspark_num_experts_per_tok": 3, "vocab_size": 1024}
+
+    def test_dspark_has_bounded_draft_kv_and_budgets_every_draft_stage(self):
+        md = self.dspark_metadata()
+        off = auto.geometry(md, "float16", 0)
+        on = auto.geometry(md, "float16", 0, 7)
+        short = auto.geometry(md, "float16", 0, 2)
+        self.assertEqual(on.kv, off.kv + [0, 0])
+        self.assertEqual((on.dspark_block_size, short.dspark_block_size), (7, 5))
+        self.assertGreater(sum(on.state), sum(off.state) + 2 * 128 * 512 * 2)
+        self.assertGreater(on.activation_width, off.activation_width)
+        tensors = [auto.Tensor("layers.0.ffn.experts.0.w1.weight", (8, 8), 64, "F8_E4M3")]
+        for stage in range(3):
+            prefix = "mtp.%d.ffn.experts.0.w1" % stage
+            tensors += [auto.Tensor(prefix + ".weight", (8, 32), 256, "I8"),
+                        auto.Tensor(prefix + ".scale", (8, 2), 16, "F8_E8M0"),
+                        auto.Tensor("mtp.%d.attn.wq_a.weight" % stage, (8, 8), 128, "BF16")]
+        a = args(dspark=7, speculative_algorithm="dspark")
+        experts, dense, *_ = auto.weight_costs(tensors, on, a)
+        self.assertEqual(experts, [64, 0, 0, 0, 288, 288])
+        self.assertEqual(dense, [0, 0, 0, 0, 128, 128])
+        self.assertEqual(auto.weight_costs(tensors, off, args())[0], [64, 0, 0, 0])
+        auto.validate_options(a)
+        with self.assertRaises(ValueError):
+            auto.validate_options(args(dspark=7, speculative_algorithm="dspark",
+                                       speculative_draft_model_path="external"))
+        with self.assertRaises(ValueError):
+            auto.geometry({**md, "model_type": "qwen4_exp"}, "float16", 0, 7)
+        for changes in ({"num_nextn_predict_layers": 0}, {"dspark_target_layer_ids": [4]},
+                        {"compress_ratios": [1, 1, 2, 2, 1, 0]}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                auto.geometry({**md, **changes}, "float16", 0, 7)
+
+    def test_dspark_draft_experts_follow_tail_layer_residency_and_dense_final_stage(self):
+        g = auto.geometry(self.dspark_metadata(), "float16", 0, 7)
+        costs = ([GiB] * 6, [MiB] * 4 + [2 * MiB, 3 * MiB], 0, 0, GiB, False)
+        gpu = {d: dict(total=32 * GiB, free=32 * GiB) for d in (0, 1)}
+        ram = dict(total=128 * GiB, available=128 * GiB)
+        # Main prefix 0..2 and draft stage 0 (owner=2) are GPU resident;
+        # main layer 3 and draft stage 1 (owner=3) remain on the host.
+        a = args(dspark=7, speculative_algorithm="dspark", moe_cuda_cache=0, moe_device_layers=1)
+        partial = auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+        host = auto.plan(args(dspark=7, moe_cuda_cache=0, moe_device_layers=-1),
+                         g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+        self.assertEqual(host['host_estimated_bytes'] - partial['host_estimated_bytes'], 4 * GiB)
+        self.assertEqual(partial['gpu_estimated_bytes'][0] - host['gpu_estimated_bytes'][0], GiB)
+        self.assertEqual(partial['gpu_estimated_bytes'][1] - host['gpu_estimated_bytes'][1], 3 * GiB)
+        without_draft_dense = (costs[0], [MiB] * 4 + [0, 0], *costs[2:])
+        q = auto.plan(a, g, without_draft_dense, "pp", {0: 1, 1: 1}, gpu, ram)
+        self.assertEqual(partial['gpu_estimated_bytes'][0], q['gpu_estimated_bytes'][0])
+        self.assertEqual(partial['gpu_estimated_bytes'][1] - q['gpu_estimated_bytes'][1], 5 * MiB)
+        full = auto.plan(args(dspark=7, moe_cuda_cache=0, moe_device_layers=0),
+                         g, costs, "pp", {0: 1, 1: 1}, gpu, ram, allow_full_gpu=True)
+        self.assertEqual(host['host_estimated_bytes'] - full['host_estimated_bytes'], 6 * GiB)
+
+    def test_dspark_1m_budget_leaves_less_cache_without_shortening_context(self):
+        md = self.dspark_metadata()
+        gpu = {0: dict(total=64 * GiB, free=64 * GiB)}
+        ram = dict(total=512 * GiB, available=512 * GiB)
+        plans = []
+        for drafts in (0, 7):
+            g = auto.geometry(md, "float16", 0, drafts)
+            costs = ([16 * GiB] * 4 + ([GiB] * 2 if drafts else []),
+                     [MiB] * len(g.kv), 0, 0, GiB, False)
+            a = args(dspark=drafts, tokens=1048576, max_context_length=1048576,
+                     chunked_prefill_size=4096, moe_device_layers=-1)
+            plans.append(auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram))
+        off, on = plans
+        self.assertEqual((on['context_tokens'], on['total_tokens']), (1048576, 1048576))
+        self.assertLess(on['moe_cuda_cache'], off['moe_cuda_cache'])
+        self.assertGreaterEqual(on['host_estimated_bytes'] - off['host_estimated_bytes'], 2 * GiB)
+        self.assertLessEqual(on['gpu_estimated_bytes'][0], on['gpu_budget_bytes'][0])
 
     def test_exact_qsa_streaming_geometry_excludes_the_full_context_index(self):
         md = {"model_type": "qwen4_exp", "num_hidden_layers": 4,

@@ -153,6 +153,76 @@ class AutoConfigTest(unittest.TestCase):
                 self.assertIsNone(a.kvmem)
                 self.assertFalse(p['automatic']['kv_streaming'])
 
+    def test_deepseek_1m_target_respects_native_window_and_explicit_capacity(self):
+        self.g.family, self.g.context = 'deepseek_v41', 2097152
+        self.gpu = {0: dict(total=64 * GiB, free=64 * GiB)}
+        self.hardware = ({0: self.hardware[0][0]}, {(0, 0): True})
+        self.ram = dict(total=128 * GiB, available=128 * GiB)
+        for options, expected in [((), 1048576), (('--tokens', '65536'), 65536),
+                                  (('--max_context_length', '131072'), 131072)]:
+            with self.subTest(options=options):
+                a = self.args(*options)
+                self.resolve(a)
+                self.assertEqual((a.max_context_length, a.tokens), (expected, expected))
+        self.g.context = 262144
+        a = self.args()
+        self.resolve(a)
+        self.assertEqual(a.max_context_length, 262144)
+
+    def test_deepseek_auto_defaults_allow_explicit_opt_out_and_leave_other_models_alone(self):
+        md = {'model_type': 'deepseek_v41', 'text_config': {'model_type': 'deepseek_v41_text'}}
+        for options, drafts, fast in [((), 7, True), (('--dspark', '0'), 0, True),
+                                     (('--speculative_algorithm', 'off'), 0, True),
+                                     (('--mtp', '0'), 0, True),
+                                     (('--dspark', '5', '--no-fast-prefill'), 5, False)]:
+            a = self.args(*options)
+            auto.apply_model_defaults(a, md)
+            self.assertEqual((a.dspark, a.fast_prefill), (drafts, fast))
+        for family in ('qwen4_exp', 'glm5_next'):
+            a = self.args()
+            auto.apply_model_defaults(a, {'model_type': family})
+            self.assertEqual((a.dspark, a.fast_prefill), (0, False))
+        a = make_normal_parser('test').parse_args(['model'])
+        auto.apply_model_defaults(a, md)
+        self.assertEqual((a.dspark, a.fast_prefill), (0, False))
+
+    def test_deepseek_auto_defaults_reach_planner_and_runtime_with_cli_json_precedence(self):
+        cases = [({}, [], 7, True, .5),
+                 ({}, ['--dspark', '5', '--speculative_dspark_confidence_threshold', '.2'], 5, True, .2),
+                 ({}, ['--speculative_algorithm', 'off', '--no_fast_prefill'], 0, False, .5),
+                 ({'dspark': 0, 'fast_prefill': False}, [], 0, False, .5),
+                 ({'dspark': 0, 'fast_prefill': False}, ['--dspark', '7', '--fast_prefill'], 7, True, .5)]
+        for saved, cli, drafts, fast, threshold in cases:
+            with self.subTest(saved=saved, cli=cli), tempfile.TemporaryDirectory() as d:
+                Path(d, 'config.json').write_text(json.dumps({'model_type': 'deepseek_v41',
+                    'text_config': {'model_type': 'deepseek_v41_text', 'dspark_block_size': 5,
+                                    'dspark_target_layer_ids': [2, 3], 'dspark_noise_token_id': 100}}))
+                cfg = Path(d, 'serve.json')
+                cfg.write_text(json.dumps({'path': d, 'auto': True, **saved}))
+                a = make_normal_parser('test').parse_args([str(cfg), *cli])
+                runtime = MagicMock()
+                model = runtime.model.return_value
+                model.get_max_input_len.return_value = 1048576
+                model.get_max_batch.return_value = 1
+                def resolve(a, query):
+                    self.assertEqual((a.dspark, a.fast_prefill), (drafts, fast))
+                    self.assertEqual(os.environ.get('FASTLLM_DSPARK_TOKENS'), str(drafts) if drafts else None)
+                    if drafts:
+                        self.assertEqual(float(os.environ['FASTLLM_DSPARK_CONFIDENCE_THRESHOLD']), threshold)
+                    a.device, a.tp, a.moe_device = 'cuda:0', 'off', 'numa'
+                    a.threads, a.tokens, a.max_context_length, a.max_batch = 64, 1048576, 1048576, 1
+                    a.chunked_prefill_size, a.moe_cuda_cache = 4096, GiB
+                    return {'automatic': {'cuda_graph': True}}
+                def load(*unused, **kwargs):
+                    self.assertEqual(os.environ['FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY'], '1' if fast else '0')
+                    runtime.set_cuda_graph.assert_called_once_with(True)
+                    return model
+                runtime.model.side_effect = load
+                with patch.object(auto, 'resolve', side_effect=resolve), \
+                        patch.dict(sys.modules, {'ftllm': types.SimpleNamespace(llm=runtime)}), \
+                        patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+                    self.assertIs(make_normal_llm_model(a), model)
+
     def streaming_fixture(self):
         self.g.context = 262144
         self.g.kv = [8320] * 4
