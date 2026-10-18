@@ -36,3 +36,7 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const fastllm::Data &x, const
     fastllm::Data &fn, fastllm::Data &scale, fastllm::Data &base, fastllm::Data &normWeight,
     int sinkhornIters, float mixEps, float normEps, fastllm::Data &pre, fastllm::Data &post,
     fastllm::Data &comb, fastllm::Data &output);
+
+// Full-K output-channel slice; no partial dot products or reduction across GPUs.
+extern "C" bool FastllmCudaBFloat16FP8ReplicatedRowSlice(const fastllm::Data &input,
+    fastllm::Data &weight, fastllm::Data &output, int rowStart, int rowCount);

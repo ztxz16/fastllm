@@ -828,6 +828,52 @@ namespace fastllm {
             V41HcApplyPreNorm(input, previousPre, normWeight, normEps, tmp, output);
         }
 
+#ifdef USE_CUDA
+        // Decode partitions independent output channels. Keeping the weight
+        // replicas also preserves the existing prefill and unsupported-layout
+        // paths. Each owner computes full K, then gathers rounded BF16 outputs.
+        bool V41EngramTpLinear(Data &input, Data &weight, Data &output) {
+            if (!input.multiDeviceData || !input.IsTensorParallelReplicated() ||
+                input.dataType != DataType::BFLOAT16 || weight.dataType != DataType::FP8_E4M3 ||
+                weight.dims.size() != 2 || input.dims.empty() ||
+                input.Count(0) != (uint64_t)weight.dims[1] || weight.IsRepacked ||
+                weight.blockK <= 0 || weight.blockM <= 0 ||
+                weight.dims[1] % weight.blockM != 0) return false;
+            std::vector<int> devices;
+            for (const auto &local : input.multiDeviceDatas) devices.push_back(local.first);
+            if (devices.size() < 2 || weight.dims[0] % (devices.size() * weight.blockK) != 0 ||
+                V41EnvFlag("FASTLLM_DISABLE_NCCL") || !FastllmInitNccl(devices)) return false;
+            if (!weight.multiDeviceData) PrepareMultiCudaReplicatedData(weight, devices, true);
+            if (!weight.IsTensorParallelReplicated()) return false;
+            for (int device : devices) {
+                auto w = weight.multiDeviceDatas.find(device);
+                if (w == weight.multiDeviceDatas.end() || !w->second || !w->second->cudaData ||
+                    !input.multiDeviceDatas.at(device) || !input.multiDeviceDatas.at(device)->cudaData)
+                    return false;
+            }
+            auto dims = input.dims;
+            dims.back() = weight.dims[0];
+            V41AllocLike(output, DataType::BFLOAT16, dims, input, devices);
+            const int width = weight.dims[0] / devices.size();
+            std::vector<int> ready(devices.size(), 0);
+            bool dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                ready[rank] = FastllmCudaBFloat16FP8ReplicatedRowSlice(
+                    *input.multiDeviceDatas.at(device), *weight.multiDeviceDatas.at(device),
+                    *output.multiDeviceDatas.at(device), rank * width, width);
+            });
+            if (!dispatched || !std::all_of(ready.begin(), ready.end(), [](int v) { return v != 0; }))
+                return false;
+            dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                auto *dest = (uint16_t *)output.multiDeviceDatas.at(device)->cudaData;
+                const bool ok = FastllmNcclAllGather(dest + (size_t)rank * width, dest,
+                    width, DataType::BFLOAT16, device);
+                AssertInFastLLM(ok, "DeepSeekV41 Engram projection all-gather failed");
+            });
+            AssertInFastLLM(dispatched, "DeepSeekV41 Engram projection dispatch failed");
+            return true;
+        }
+#endif
+
         void V41EngramApply(Data &hidden, const Data &kv, Data &qWeight, Data &kWeight,
                             const Data *mask, float eps) {
             DataDict datas = {
@@ -2278,6 +2324,9 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") && !replicated &&
             FastllmCudaV41ReferenceLinear(*source,weight[weightName],output,1,source->dataType==DataType::BFLOAT16)) return;
+        if (replicated && V41EndsWith(weightName, ".engram.wkv.weight") &&
+            !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
+            V41EngramTpLinear(*source, weight[weightName], output)) return;
 #endif
         // Match RowParallelLinear: each local GEMM rounds to the activation
         // dtype, the collective sums in FP32, and only its result rounds back.
