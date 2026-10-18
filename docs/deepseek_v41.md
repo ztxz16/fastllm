@@ -793,6 +793,9 @@ bonus token 和缓存回滚；`deepseekV41OpsRegression` 检查小批量算子�
 - **mHC finish 与 Norm 合并下发**：BF16、HC=4、少于 16 个 token、偶数隐藏维度 4096–8192。
   当前子层的 Sinkhorn 与使用上一子层 pre 系数的 Norm 在独立 CTA 中并行。
   保持原 FP32 归约树、折叠后的 BF16 舍入及 Sinkhorn 顺序。
+- **Hopper mHC 点积预取**：SM90、BF16、HC=4、单 token、隐藏维度 4096–8192 时，
+  每条原有累加链分组预取 16 轮输入与 FP32 权重，按原顺序累加；尾部保留标量循环，
+  不改变 BF16 舍入、FMA 顺序和 warp/block 归约树。其它架构、dtype、尺寸和 batch 使用原点积实现。
 - **Full Decode 的旋转准备**：独立的 Q/KV 描述符、输出旋转和窗口写入分别共用一次 kernel 下发。
   位置、量化和窗口更新规则保持不变。
 - **Q/KV 投影与准备融合**：单 token、BF16 输入和原始块缩放 FP8 权重时，两个独立投影共用一次下发，

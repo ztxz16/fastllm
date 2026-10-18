@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -81,6 +82,43 @@ static int CheckMixNorm() {
     }
     return cases;
 }
+// A repeated >=16-token batch uses the independent HcBatchDots implementation.
+// Compare all outputs bitwise, including dimensions with partial prefetch tiles
+// and dtypes/sizes that retain the portable decode loop.
+static int CheckHcDecodeDots() {
+    int cases = 0;
+    for (auto type : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32})
+    for (int dim : {63, 4095, 4096, 4098, 5120, 6144, 8192, 8193})
+    for (int batch : {1, 2, 8, 15}) {
+        Data input, repeated, fn, scale, base, pre[2], post[2], comb[2];
+        Fill(input, {1, batch, 4, dim}, type, batch + dim, dim == 63 ? 0.0f : 0.8f);
+        Fill(fn, {24, 4 * dim}, DataType::FLOAT32, 3, 0.07f);
+        Fill(scale, {3}, DataType::FLOAT32, 4, 1.0f);
+        Fill(base, {24}, DataType::FLOAT32, 5, 0.3f);
+        const auto bytes = Bits(input);
+        const int copies = (16 + batch - 1) / batch;
+        repeated.dataType = type;
+        repeated.UpdateUnitSize();
+        repeated.Resize({1, batch * copies, 4, dim});
+        repeated.Allocate();
+        for (int i = 0; i < copies; ++i)
+            std::memcpy(repeated.cpuData + i * bytes.size(), bytes.data(), bytes.size());
+        repeated.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        const float normEps = dim == 63 ? 1e-6f : 0.0f;
+        Require(FastllmCudaDeepSeekV41HcMix(repeated, fn, scale, base, 4, 20, 1e-6f, normEps,
+                    pre[0], post[0], comb[0]), "batched HC dot reference rejected");
+        Require(FastllmCudaDeepSeekV41HcMix(input, fn, scale, base, 4, 20, 1e-6f, normEps,
+                    pre[1], post[1], comb[1]), "HC decode dots rejected");
+        for (auto outputs : {pre, post, comb}) {
+            auto expected = Bits(outputs[0]);
+            const auto actual = Bits(outputs[1]);
+            expected.resize(actual.size());
+            Require(actual == expected, "HC decode/batch dots changed FP32 accumulation order");
+        }
+        ++cases;
+    }
+    return cases;
+}
 static int CheckRouter() {
     int cases = 0;
     for (int dim : {64, 513, 5120}) for (int experts : {64, 384, 1024})
@@ -136,7 +174,7 @@ int main() {
     try {
         ApplyDeviceMap({{"cuda:0", 1}}, 0, 1);
         FastllmCudaSetDevice(0);
-        const int cases = CheckMixNorm() + CheckRouter() + CheckWoA();
+        const int cases = CheckMixNorm() + CheckHcDecodeDots() + CheckRouter() + CheckWoA();
         std::printf("PASS V4.1 decode projections: %d exact cases\n", cases);
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());
