@@ -158,14 +158,15 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                 "FASTLLM_DFLASH_MODEL_PATH": "/stale/dflash",
                 "FASTLLM_DFLASH_BLOCK_SIZE": "8",
             }
-            with patch.dict(os.environ, stale_speculative_env, clear=True):
-                args = self.configure_without_target(["--draft", draft_path])
-                self.assertEqual(args.speculative_algorithm, "mtp")
-                self.assertEqual(args.mtp, 5)
-                self.assertEqual(args.speculative_draft_model_path,
-                                 os.path.abspath(draft_path))
-                for env_name in stale_speculative_env:
-                    self.assertNotIn(env_name, os.environ)
+            for options in ([], ["--auto"]):
+                with self.subTest(options=options), patch.dict(os.environ, stale_speculative_env, clear=True):
+                    args = self.configure_without_target(["--draft", draft_path, *options])
+                    self.assertEqual(args.speculative_algorithm, "mtp")
+                    self.assertEqual(args.mtp, 5)
+                    self.assertEqual(args.speculative_draft_model_path,
+                                     os.path.abspath(draft_path))
+                    for env_name in stale_speculative_env:
+                        self.assertNotIn(env_name, os.environ)
 
     def test_mtp_file_is_auto_detected_and_uses_draft_tokens(self):
         with tempfile.TemporaryDirectory() as draft_path:
@@ -203,11 +204,18 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                     file.write(string("general.architecture") + struct.pack("<I", 8) + string(architecture))
                     file.write(string(name) + struct.pack("<IQQIQ", 2, 256, 256, 1, 0))
             write("qwen4exp-mtp", "mtp.fc_hidden.weight")
-            with patch.dict(os.environ, {}, clear=True):
-                args = self.configure_without_target(["--draft", path, "--mtp", "3"])
-                self.assertEqual(args.speculative_algorithm, "mtp")
-                self.assertEqual(args.mtp, 3)
-                self.assertEqual(args.speculative_draft_model_path, path)
+            for options, expected in [
+                ([], 5),
+                (["--mtp", "3"], 3),
+                (["--auto"], 3),
+                (["--auto", "--mtp", "5"], 5),
+                (["--auto", "--draft_tokens", "7"], 7),
+            ]:
+                with self.subTest(options=options), patch.dict(os.environ, {}, clear=True):
+                    args = self.configure_without_target(["--draft", path, *options])
+                    self.assertEqual(args.speculative_algorithm, "mtp")
+                    self.assertEqual(args.mtp, expected)
+                    self.assertEqual(args.speculative_draft_model_path, path)
             for architecture, name, message in [
                 ("qwen4exp", "mtp.fc_hidden.weight", "qwen4exp-mtp architecture"),
                 ("qwen4exp-mtp", "output.weight", "only mtp"),

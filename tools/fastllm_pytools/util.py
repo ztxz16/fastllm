@@ -1310,7 +1310,9 @@ def make_normal_llm_model(args, startup_progress = None):
                     "--mtp and --draft_tokens specify different MTP draft counts")
             mtp = draft_tokens
         elif mtp <= 0 and speculative_draft_path:
-            mtp = 5
+            # Qwen4 auto uses four verifier rows (anchor + three drafts),
+            # matching the existing target CUDA Graph width.
+            mtp = 3 if draft_is_mtp_gguf and getattr(args, "auto", False) else 5
         if mtp <= 0:
             raise ValueError("MTP requires --mtp N or an external --draft checkpoint")
         args.mtp = mtp

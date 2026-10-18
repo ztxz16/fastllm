@@ -189,9 +189,26 @@ def kv_residencies(args, model):
     # KVMem cannot preserve prefix/history reuse. Honor explicit requests for
     # either feature, including the existing prefix-cache environment override.
     prefix = args.prefix_cache or os.environ.get("FASTLLM_PREFIX_CACHE", "")
-    if any(str(v).lower() not in ("", "false", "0", "off") for v in (prefix, args.cache_history)):
+    history = args.cache_history if "cache_history" in getattr(args, "_auto_explicit", ()) else ""
+    if any(str(v).lower() not in ("", "false", "0", "off") for v in (prefix, history)):
         return [0]
     return [0] + [n for n in (32768, 16384, 8192) if n < args.max_context_length]
+
+
+def full_kv_has_expert_room(candidate, model, costs, mode, mapping, mtp):
+    """Full KV is roomy only if each GPU can also hold all its experts."""
+    if "kvmem" in candidate:
+        return False
+    host = dict.fromkeys(mapping, 0)
+    for layer, size in enumerate(costs[0]):
+        if layer < candidate["resident_layers"] or (mtp and layer >= model.layers):
+            continue
+        devices = list(mapping) if mode == "tp" else [memory.layer_device(layer, model.layers, mapping)]
+        for device in devices:
+            host[device] += math.ceil(size / len(devices))
+    cache = candidate.get("moe_cuda_cache_per_device", dict.fromkeys(mapping, candidate["moe_cuda_cache"]))
+    return all(candidate["gpu_estimated_bytes"][d] + max(0, host[d] - cache[d]) <=
+               candidate["gpu_budget_bytes"][d] for d in mapping)
 
 
 def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
@@ -246,6 +263,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         # merely because an approximate cache-locality score looks favourable.
         kv_options = kv_residencies(base, model)
         for kv_resident in kv_options:
+            previous_choices = len(choices)
             for table in tables:
                 trial = copy.copy(base)
                 trial.moe_device, trial.ngram_device = backend, table
@@ -298,11 +316,12 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                         notes.append("Exact QSA KV streaming leaves GPU memory for experts; prefix/history reuse disabled")
                     if notes:
                         result["notes"] = notes
-                    choices.append((score, copy.copy(trial), result))
-            # At long context, compare full KV with a 32K streaming pool even
-            # when both fit. The same latency score weighs expert capacity and
-            # chunk size; smaller pools remain capacity fallbacks only.
-            if choices and (kv_resident or base.max_context_length < 65536 or 32768 not in kv_options):
+                    roomy = model.family == "qwen4" and full_kv_has_expert_room(
+                        result, model, costs, mode, mapping, prepared.mtp)
+                    choices.append((score, copy.copy(trial), result, roomy))
+            # At long context prefer a 32K streaming pool unless full KV also
+            # leaves room for every expert. Smaller pools are capacity fallbacks.
+            if len(choices) > previous_choices and (kv_resident or base.max_context_length < 65536 or 32768 not in kv_options):
                 break
         if choices:
             break
@@ -319,19 +338,25 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         full = [item for item in eligible if item[2]["resident_layers"] == model.layers]
         cached = [item for item in eligible if item[2]["resident_layers"] == 0 and item[2]["moe_cuda_cache"] > 0]
         eligible = full or cached or eligible
+    if any("kvmem" in item[2] for item in eligible):
+        eligible = [item for item in eligible if "kvmem" in item[2] or item[3]]
     fastest = min(item[0] for item in eligible)
     # Small predicted wins are within the error of this uncalibrated model.
     # Prefer fewer devices/collectives when estimates are within ten percent.
-    # On the same topology, avoid streaming transfers and host bookkeeping
-    # unless the predicted benefit exceeds that uncertainty margin.
+    # Where every expert fits as well, keep full KV on an otherwise tied topology.
     close = [item for item in eligible if item[0] <= fastest * 1.10]
-    _, chosen, result = min(close, key=lambda item: (
+    _, chosen, result, _ = min(close, key=lambda item: (
         len(item[2]["gpu_budget_bytes"]), item[2]["mode"] == "tp", "kvmem" in item[2], item[0]))
     for name in memory.AUTO_OPTIONS:
         if getattr(chosen, name) == "auto":
             setattr(chosen, name, result[name])
     if "kvmem" in result:
         chosen.kvmem = json.dumps(result["kvmem"], sort_keys=True)
+        # Model detection supplies a history-cache default before planning. It
+        # must not re-enable reuse after the planner chose exact KV streaming.
+        for name in ("cache_history", "prefix_cache"):
+            if name not in explicit:
+                setattr(chosen, name, "false")
     if (model.family == "qwen4" and chosen.mtp > 0 and result["mode"] == "pp" and
             len(result["gpu_budget_bytes"]) > 1 and result["resident_layers"] < model.layers and
             not {"cuda_embedding", "low_gpu_mem"} & explicit):
@@ -342,7 +367,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         result.setdefault("notes", []).append("PP MTP uses CPU embedding to avoid moving its shared weight between GPUs")
     changed = (*memory.AUTO_OPTIONS, "device", "tp", "moe_device", "ngram_device", "threads",
                "atype", "kv_cache_dtype", "max_context_length", "tokens", "max_batch", "kvmem",
-               "low_gpu_mem", "cuda_embedding")
+               "low_gpu_mem", "cuda_embedding", "cache_history", "prefix_cache")
     result["automatic"] = {"policy": "interactive-4k-input-512-output", "topology_candidates": len(choices),
                            "ranking": "estimated latency; not measured throughput", "mtp": args.mtp}
     result["automatic"]["kv_streaming"] = "kvmem" in result

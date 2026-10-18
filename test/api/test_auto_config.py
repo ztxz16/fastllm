@@ -202,15 +202,37 @@ class AutoConfigTest(unittest.TestCase):
         self.assertEqual(streamed['chunked_prefill_size'], full['chunked_prefill_size'])
         self.assertEqual({call.kwargs['kv_resident'] for call in plans.call_args_list}, {0, 32768})
 
-    def test_full_kv_wins_when_streaming_gain_is_within_estimation_error(self):
+    def test_streaming_precedes_latency_estimates_when_experts_do_not_fit(self):
         self.streaming_fixture()
         self.g.experts = 256
         options = ('--device', 'cudapp=2', '--moe_device_layers', '-1', '--chunked_prefill_size', '512')
-        for full_score, streamed in [(10.5, False), (12., True)]:
+        for full_score in (9., 10.5, 12.):
             with self.subTest(full_score=full_score), patch.object(auto, 'latency_score',
                     side_effect=lambda p, *unused: 10. if 'kvmem' in p else full_score):
                 result = self.resolve(self.args(*options))
-            self.assertEqual('kvmem' in result, streamed)
+            self.assertIn('kvmem', result)
+
+    def test_full_kv_room_is_checked_per_device(self):
+        self.streaming_fixture()
+        self.g.experts = 256
+        self.gpu = {0: dict(total=5 * GiB, free=5 * GiB),
+                    1: dict(total=20 * GiB, free=20 * GiB)}
+        p = self.resolve(self.args('--device', 'cudapp=2', '--moe_device_layers', '-1',
+                                   '--chunked_prefill_size', '512'))
+        self.assertIn('kvmem', p)
+
+    def test_smaller_streaming_pool_is_tried_even_when_full_kv_fits(self):
+        self.streaming_fixture()
+        self.g.experts = 256
+        original = memory.plan
+        def plan(*args, **kwargs):
+            if kwargs.get('kv_resident') == 32768:
+                raise ValueError('32K pool does not fit')
+            return original(*args, **kwargs)
+        with patch.object(memory, 'plan', side_effect=plan):
+            p = self.resolve(self.args('--device', 'cudapp=2', '--moe_device_layers', '-1',
+                                       '--chunked_prefill_size', '512'))
+        self.assertEqual(p['kvmem']['resident_tokens'], 16384)
 
     def test_full_kv_remains_available_when_streaming_does_not_help_or_fit(self):
         self.streaming_fixture()
@@ -221,6 +243,9 @@ class AutoConfigTest(unittest.TestCase):
         self.assertNotIn('kvmem', full)
         options = ('--device', 'cudapp=2', '--moe_device_layers', '-1', '--moe_cuda_cache', '0')
         self.assertNotIn('kvmem', self.resolve(self.args(*options)))
+        cached = self.resolve(self.args('--device', 'cudapp=2', '--moe_device_layers', '-1'))
+        self.assertEqual(cached['resident_layers'], 0)
+        self.assertNotIn('kvmem', cached)
         original = memory.plan
         def plan(*args, **kwargs):
             if kwargs.get('kv_resident'):
@@ -300,12 +325,50 @@ class AutoConfigTest(unittest.TestCase):
             with self.subTest(changes=changes):
                 trial = copy.copy(a)
                 vars(trial).update(changes)
+                trial._auto_explicit = [*a._auto_explicit, *changes]
                 self.assertEqual(auto.kv_residencies(trial, self.g), [0])
         for env in ({'FASTLLM_PREFIX_CACHE': '1'}, {'FASTLLM_SKIP_WARMUP': '1'}):
             with patch.dict(os.environ, env, clear=True):
                 self.assertEqual(auto.kv_residencies(a, self.g), [0])
         self.g.family = 'glm5'
         self.assertEqual(auto.kv_residencies(a, self.g), [0])
+
+    def test_streaming_disables_default_history_and_preserves_explicit_history(self):
+        self.streaming_fixture()
+        self.gpu = {d: dict(total=8 * GiB, free=8 * GiB) for d in (0, 1)}
+        self.costs = ([4 * GiB] * 4, [1 << 20] * 4, 1 << 20, 0, GiB, False)
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit), tempfile.TemporaryDirectory() as d:
+                Path(d, 'config.json').write_text(json.dumps({'model_type': 'qwen4_exp'}))
+                options = ['--cache_history', 'true'] if explicit else []
+                a = make_normal_parser('test').parse_args([d, '--auto', *options])
+                runtime = MagicMock()
+                runtime.get_cuda_memory_info.side_effect = self.gpu.__getitem__
+                model = runtime.model.return_value
+                model.get_max_input_len.return_value = 131072
+                model.get_max_batch.return_value = 1
+                def warmup():
+                    if explicit:
+                        model.set_kvmem.assert_not_called()
+                        model.set_save_history.assert_called_once_with(True)
+                    else:
+                        model.set_kvmem.assert_called_once_with(**json.loads(a.kvmem))
+                        model.set_save_history.assert_not_called()
+                        runtime.set_cpu_historycache.assert_not_called()
+                        self.assertEqual(os.environ['FASTLLM_PREFIX_CACHE'], 'false')
+                model.warmup.side_effect = warmup
+                with patch.object(memory, 'model_inputs', return_value=({}, [], self.g)), \
+                        patch.object(memory, 'geometry', return_value=self.g), \
+                        patch.object(memory, 'weight_costs', return_value=self.costs), \
+                        patch.object(memory, 'host_memory', return_value=self.ram), \
+                        patch.object(auto, 'cuda_hardware', return_value=self.hardware), \
+                        patch.dict(sys.modules, {'ftllm': types.SimpleNamespace(llm=runtime)}), \
+                        patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+                    self.assertIs(make_normal_llm_model(a), model)
+                self.assertEqual(model.hybrid_auto_plan['automatic']['kv_streaming'], not explicit)
+                self.assertEqual(a.cache_history, 'true' if explicit else 'false')
+                self.assertEqual(a.prefix_cache, '' if explicit else 'false')
+                model.warmup.assert_called_once()
 
     def test_tp_off_and_heterogeneous_gpus_exclude_auto_tp(self):
         a = self.args('--tp', 'off')
