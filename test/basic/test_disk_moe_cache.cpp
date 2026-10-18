@@ -180,6 +180,16 @@ int main(int argc, char **argv) {
                 Require(GetDiskMoeCacheStats().cpuHits - adapted.cpuHits == 3, "cache did not adapt to new hot set");
             }
             for (int device = 0; device < devices; ++device) {
+                SetMoeCudaCacheBytes(0);
+                SetMoeCpuCacheBytes(f.expertBytes * (Fixture::experts + 1));
+                f.Run(true, 520, 0);
+                auto ramBefore = GetDiskMoeCacheStats();
+                Compare(f.Run(true, 520, 0, device), f.Run(false, 520, 0), false);
+                auto ramAfter = GetDiskMoeCacheStats();
+                Require(ramAfter.cpuHits > ramBefore.cpuHits && ramAfter.diskBytes == ramBefore.diskBytes,
+                    "warm RAM prefill read disk");
+                Require(ramAfter.cudaBytes == 0, "temporary prefill upload became permanent");
+                SetMoeCpuCacheBytes(f.expertBytes * 4);
                 SetMoeCudaCacheBytes(f.expertBytes * 4);
                 for (int repeat = 0; repeat < 3; ++repeat) Compare(f.Run(true, 1, 0, device), f.Run(false, 1, 0), false);
                 auto before = GetDiskMoeCacheStats();

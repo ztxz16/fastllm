@@ -2163,8 +2163,7 @@ namespace fastllm {
     static std::unique_ptr<Data> DiskCudaWeight(const Data &source, bool cross) {
         auto type = DiskCudaWeightType(source);
         if (type == DataType::DATA_AUTO_NONE) return nullptr;
-        auto result = std::make_unique<Data>(
-            type == DataType::NVFP4_BLOCK_32_E8M0 ? type : source.dataType);
+        auto result = std::make_unique<Data>(type);
         result->ggmlType = source.ggmlType;
         result->isGGUFData = source.isGGUFData;
         result->disableGGUFRepack = source.dataType == DataType::DATA_GGUF_FORMAT;
@@ -2174,22 +2173,66 @@ namespace fastllm {
         result->blockM = source.blockM;
         result->scales = source.scales;
         result->Allocate(false);
-        if (type == DataType::NVFP4_BLOCK_32_E8M0) {
-            size_t blocks = source.Count(0) / 32;
-            const uint8_t *scales = source.cpuData + blocks * 16;
-            for (size_t block = 0; block < blocks; ++block) {
-                uint8_t *dst = result->cpuData + block * 17;
-                memcpy(dst, source.cpuData + block * 16, 16);
-                dst[16] = scales[block];
+        if (type == DataType::NVFP4_BLOCK_32_E8M0 || source.dataType == DataType::FP8_E4M3) {
+            // Pack blocks and interleave gate/up rows in one bounded pass.
+            // The RAM cache keeps its original CPU layout; only the temporary
+            // CUDA record changes layout, with no full-matrix reorder copy.
+            const int rows = source.dims[0], columns = source.dims[1];
+            AssertInFastLLM(!cross || rows % 2 == 0, "Disk MoE gate/up rows must be even.\n");
+            const size_t pitch = GetDataBytes(type, 1, columns);
+            const int scaleColumns = (columns + source.blockM - 1) / source.blockM;
+            if (type == DataType::FP8_E4M3_BLOCK_128) {
+                AssertInFastLLM(source.scales.size() >=
+                    size_t((rows + source.blockK - 1) / source.blockK) * scaleColumns,
+                    "Disk MoE FP8 scale metadata is invalid.\n");
             }
+            const auto pack = [&](int first, int last) {
+                for (int row = first; row < last; ++row) {
+                    const int original = cross ? row / 2 + (row % 2) * (rows / 2) : row;
+                    uint8_t *dst = result->cpuData + size_t(row) * pitch;
+                    if (type == DataType::NVFP4_BLOCK_32_E8M0) {
+                        const int blocks = columns / 32;
+                        const size_t base = size_t(original) * blocks;
+                        const uint8_t *scales = source.cpuData + source.Count(0) / 2;
+                        for (int block = 0; block < blocks; ++block) {
+                            memcpy(dst + size_t(block) * 17, source.cpuData + (base + block) * 16, 16);
+                            dst[size_t(block) * 17 + 16] = scales[base + block];
+                        }
+                    } else {
+                        if (columns % 128) memset(dst, 0, pitch);
+                        for (int block = 0; block < scaleColumns; ++block) {
+                            const int count = std::min(128, columns - block * 128);
+                            memcpy(dst, source.cpuData + size_t(original) * columns + block * 128, count);
+                            dst += count;
+                            const float scale = source.scales[size_t(original / source.blockK) * scaleColumns + block];
+                            memcpy(dst, &scale, sizeof(scale)); dst += sizeof(scale);
+                        }
+                    }
+                }
+            };
+            struct PackOp : MultiThreadBaseOp {
+                const decltype(pack) &run; int first, last;
+                PackOp(const decltype(pack) &run, int first, int last) : run(run), first(first), last(last) {}
+                void Run() override { run(first, last); }
+            };
+            auto *pool = GetAlivePool();
+            const int first = pool->curActivateThreadInterval.first;
+            const int threads = std::max(1, std::min({rows / 128,
+                pool->curActivateThreadInterval.second - first, 16}));
+            if (threads == 1 || result->GetBytes() < (1ULL << 20)) pack(0, rows);
+            else {
+                std::vector<std::unique_ptr<PackOp>> ops;
+                for (int i = 0; i < threads; ++i) {
+                    ops.emplace_back(new PackOp(pack, rows * i / threads, rows * (i + 1) / threads));
+                    pool->PushOp(first + i, ops.back().get());
+                }
+                for (int i = 0; i < threads; ++i) pool->Wait(first + i);
+            }
+            result->scales.clear(); result->scales.shrink_to_fit();
         } else {
             memcpy(result->cpuData, source.cpuData, source.GetBytes());
-            if (source.dataType == DataType::FP8_E4M3) {
-                PackFp8ToCudaBlock128(*result);
-                result->scales.clear(); result->scales.shrink_to_fit();
-            }
+            if (cross) CrossSwigluReorderWeightInPlace(*result);
         }
-        if (cross) CrossSwigluReorderWeightInPlace(*result);
         return result;
     }
 
@@ -2900,7 +2943,12 @@ namespace fastllm {
             const auto &tasks = routes[expert];
             if (tasks.empty()) continue;
             Data *gate = weights[expert * 2], *down = weights[expert * 2 + 1];
-            AssertInFastLLM(gate && down, "Disk MoE has a missing expert projection.\n");
+            if (!gate || !down) {
+                ErrorInFastLLM("Disk MoE has a missing expert projection: layer=" +
+                    std::to_string(intParams.count("layer") ? intParams.at("layer") : -1) +
+                    " expert=" + std::to_string(expert - 1) +
+                    " gate=" + (gate ? gate->name : "null") + " down=" + (down ? down->name : "null") + "\n");
+            }
             const bool disk = gate->isDiskWeight && down->isDiskWeight;
             DiskExpertEntry *entry = disk ? &cache.entries[gate] : nullptr;
             DiskCachedExpert *host = nullptr, *gpu = nullptr;
@@ -2926,16 +2974,23 @@ namespace fastllm {
             // repacks. Consumption and FP32 accumulation stay in expert order;
             // ordinary decode and large prefill retain one-expert lookahead.
             prefetch(order + 1);
-            // Cold prefill can stream one expert through CUDA. A RAM hit stays
-            // on the CPU as requested; a CUDA hit always takes priority.
+            // Keep cold-prefill streaming, and offload sufficiently reused RAM
+            // experts. Uploading a whole weight for a few routed rows costs
+            // more than the CPU work; use the expert batch, not the chunk size.
 #ifdef USE_CUDA
             const bool canonicalGGUF = glmGGUF(gate, down);
             if (canonicalGGUF && host) {
                 host->gate->disableGGUFRepack = true;
                 host->down->disableGGUFRepack = true;
             }
-            if (!gpu && loaded && device >= 0 && DiskMoeGpuPrefillEnabled() &&
-                tokens >= DiskMoeGpuPrefillMinTokens() &&
+            // RAM offload is validated for V4.1 compact NVFP4. Other formats
+            // retain their existing residency decisions and cold-stream path.
+            const bool offloadRam = v4 && quantBlock == 32 && gateType == MoeGateSwiglu &&
+                DiskCudaWeightType(*gate) == DataType::NVFP4_BLOCK_32_E8M0 &&
+                DiskCudaWeightType(*down) == DataType::NVFP4_BLOCK_32_E8M0 &&
+                tasks.size() >= size_t(std::max(128, DiskMoeGpuPrefillMinTokens()));
+            if (!gpu && host && device >= 0 && DiskMoeGpuPrefillEnabled() &&
+                tokens >= DiskMoeGpuPrefillMinTokens() && (loaded || offloadRam) &&
                 (gate->dataType != DataType::DATA_GGUF_FORMAT || canonicalGGUF) &&
                 !(v4 && quantBlock == 32 && DiskV41CpuExpert(*gate, *down))) {
                 transientGpu = DiskCudaExpert(*host, gateType, canonicalGGUF);
