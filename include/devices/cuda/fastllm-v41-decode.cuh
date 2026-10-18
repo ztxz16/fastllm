@@ -30,3 +30,9 @@ FastllmCudaV41DecodeIndexerBatch(const std::vector<FastllmCudaV41DecodeIndexTask
                                  int topK, int blockSize, int candidateTopK, int ropeDim,
                                  float ropeBase, int originalSeqLen, float ropeFactor, int betaFast,
                                  int betaSlow, bool quantizeQuery);
+
+// Finish the current mix while normalizing with the previous sublayer coefficients.
+extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const fastllm::Data &x, const fastllm::Data &previousPre,
+    fastllm::Data &fn, fastllm::Data &scale, fastllm::Data &base, fastllm::Data &normWeight,
+    int sinkhornIters, float mixEps, float normEps, fastllm::Data &pre, fastllm::Data &post,
+    fastllm::Data &comb, fastllm::Data &output);

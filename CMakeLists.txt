@@ -1328,6 +1328,12 @@ if (UNIT_TEST)
                 "PASS [0-9]+ changing-context graph replays; stress=1" 300 --stress)
             set_tests_properties(deepseekV41FullDecode deepseekV41FullDecodeStress PROPERTIES
                 LABELS cuda RUN_SERIAL TRUE)
+            add_executable(deepseekV41DecodeProjectionRegression test/ops/deepseekV41DecodeProjectionRegression.cpp)
+            target_link_libraries(deepseekV41DecodeProjectionRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41DecodeProjectionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(deepseekV41DecodeProjections deepseekV41DecodeProjectionRegression
+                "PASS V4.1 decode projections" 300)
+            set_tests_properties(deepseekV41DecodeProjections PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_executable(deepseekV41EngramRegression test/ops/deepseekV41EngramRegression.cpp)
             target_link_libraries(deepseekV41EngramRegression PRIVATE fastllm)
             target_include_directories(deepseekV41EngramRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

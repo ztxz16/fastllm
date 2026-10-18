@@ -774,6 +774,60 @@ namespace fastllm {
             V41RMSNormBF16(tmp, normWeight, eps, output);
         }
 
+        void V41HcMixPreNorm(const Data &input, const Data &previousPre, Data &fn, Data &scale,
+                            Data &base, Data &normWeight, int hcMult, int iters, float mixEps,
+                            float normEps, Data &pre, Data &post, Data &comb, Data &tmp, Data &output) {
+#ifdef USE_CUDA
+            const bool eligible = !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
+                !V41EnvFlag("FASTLLM_DSV41_LEGACY_HCMIX") &&
+                !V41EnvFlag("FASTLLM_DSV41_LEGACY_HCMIX_DECODE") &&
+                !V41EnvFlag("FASTLLM_DSV41_DISABLE_HCPRENORM") && hcMult == 4 &&
+                input.dataType == DataType::BFLOAT16 && input.dims.size() == 4 &&
+                input.dims[0] * input.dims[1] > 0 && input.dims[0] * input.dims[1] < 16 &&
+                input.dims[3] >= 4096 && input.dims[3] <= 8192 && !(input.dims[3] & 1);
+            if (eligible && input.multiDeviceData && input.IsTensorParallelReplicated() &&
+                previousPre.multiDeviceData && previousPre.IsTensorParallelReplicated()) {
+                std::vector<int> devices;
+                for (const auto &replica : input.multiDeviceDatas) devices.push_back(replica.first);
+                bool compatible = !devices.empty();
+                for (Data *w : {&fn, &scale, &base, &normWeight}) {
+                    if (!w->multiDeviceData) PrepareMultiCudaReplicatedData(*w, devices, true);
+                    compatible &= w->IsTensorParallelReplicated() && w->dataType == DataType::FLOAT32;
+                }
+                const Data *inputs[] = {&input, &previousPre, &fn, &scale, &base, &normWeight};
+                for (int device : devices) {
+                    for (const Data *v : inputs) {
+                        auto it = v->multiDeviceDatas.find(device);
+                        compatible &= it != v->multiDeviceDatas.end() && it->second && it->second->cudaData;
+                    }
+                }
+                if (compatible) {
+                    const int b = input.dims[0], n = input.dims[1];
+                    V41AllocLike(pre, DataType::FLOAT32, {b, n, 4}, input, devices);
+                    V41AllocLike(post, DataType::FLOAT32, {b, n, 4}, input, devices);
+                    V41AllocLike(comb, DataType::FLOAT32, {b, n, 4, 4}, input, devices);
+                    V41AllocLike(output, DataType::BFLOAT16, {b, n, input.dims[3]}, input, devices);
+                    std::vector<int> ok(devices.size(), 0);
+                    const bool submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                        ok[rank] = FastllmCudaDeepSeekV41HcMixPreNorm(*input.multiDeviceDatas.at(device),
+                            *previousPre.multiDeviceDatas.at(device), *fn.multiDeviceDatas.at(device),
+                            *scale.multiDeviceDatas.at(device), *base.multiDeviceDatas.at(device),
+                            *normWeight.multiDeviceDatas.at(device), iters, mixEps, normEps,
+                            *pre.multiDeviceDatas.at(device), *post.multiDeviceDatas.at(device),
+                            *comb.multiDeviceDatas.at(device), *output.multiDeviceDatas.at(device));
+                    });
+                    if (submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; })) return;
+                }
+            }
+            if (eligible && !input.multiDeviceData &&
+                V41FusedPreNormSameDevice(input, previousPre, normWeight) &&
+                FastllmCudaDeepSeekV41HcMixPreNorm(input, previousPre, fn, scale, base, normWeight,
+                    iters, mixEps, normEps, pre, post, comb, output)) return;
+#endif
+            V41HcMix(input, fn, scale, base, hcMult, iters, mixEps, normEps, pre, post, comb);
+            V41HcApplyPreNorm(input, previousPre, normWeight, normEps, tmp, output);
+        }
+
         void V41EngramApply(Data &hidden, const Data &kv, Data &qWeight, Data &kWeight,
                             const Data *mask, float eps) {
             DataDict datas = {
@@ -4824,11 +4878,10 @@ namespace fastllm {
             Data *qQuant = reuseQuantized && needIndexer &&
                 quantizedLinearNames.count(pre + ".attn.wq_b.weight") &&
                 quantizedLinearNames.count(pre + ".attn.indexer.wq_b.weight") ? &ws->qNormQuantized : nullptr;
-            V41HcMix(*curHidden, weight[pre + ".hc_attn_fn"], weight[pre + ".hc_attn_scale"],
-                     weight[pre + ".hc_attn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
-                     attnPre, attnPost, attnComb);
-            V41HcApplyPreNorm(*curHidden, *preMixPtr, weight[pre + ".attn_norm.weight"], rms_norm_eps,
-                              x, attnInput);
+            V41HcMixPreNorm(*curHidden, *preMixPtr, weight[pre + ".hc_attn_fn"],
+                weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
+                weight[pre + ".attn_norm.weight"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                attnPre, attnPost, attnComb, x, attnInput);
 
             // wq_a / wkv 是复制的（KV 是 MLA 式的单份 latent，与 head 无关）；
             // wq_b 按行切 -> q 的 head 维分片，Reshape 会把 tpAxis 从最后一维换算到 head 维。
@@ -5382,11 +5435,10 @@ namespace fastllm {
             }
 
             // ---- FFN (MoE)：整批 ----
-            V41HcMix(*curHidden, weight[pre + ".hc_ffn_fn"], weight[pre + ".hc_ffn_scale"],
-                     weight[pre + ".hc_ffn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
-                     ffnPre, ffnPost, ffnComb);
-            V41HcApplyPreNorm(*curHidden, attnPre, weight[pre + ".ffn_norm.weight"], rms_norm_eps,
-                              x, ffnInput);
+            V41HcMixPreNorm(*curHidden, attnPre, weight[pre + ".hc_ffn_fn"],
+                weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
+                weight[pre + ".ffn_norm.weight"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                ffnPre, ffnPost, ffnComb, x, ffnInput);
             ffnDims = ffnInput.dims;
             ffnInput.Reshape({seqlen, dim});
             };   // runAttentionPost
