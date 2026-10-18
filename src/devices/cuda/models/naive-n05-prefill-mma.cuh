@@ -18,13 +18,16 @@ template<int Max> struct Storage {
     BF prob[8][Max + 8];
     int selected[Tile];
 };
-template<int Width, int Pitch, int Tile, int Threads>
+template<int Width, int Pitch, int Tile, int Threads, int Window = 0>
 __device__ inline void Load(BF (*dst)[Pitch], int *selected, FastllmNaiveKV kv,
         const int *indices, int query, int first, int count, int keys,
         int past, bool causal, int stride, int head, int indexRow) {
     int t = threadIdx.x;
     if (t < Tile) {
         int key = first + t < count ? (indices ? indices[(size_t)indexRow * count + first + t] : first + t) : -1;
+        if constexpr (Window > 0) {
+            if (key >= 0) key += max(0, past + query + 1 - Window);
+        }
         if (key >= keys || (causal && key > past + query)) key = -1;
         // Translate each selected row once, then share it across vector loads.
         selected[t] = key >= 0 ? kv.PhysicalRow(key) : -1;
@@ -39,7 +42,7 @@ __device__ inline void Load(BF (*dst)[Pitch], int *selected, FastllmNaiveKV kv,
     asm volatile("cp.async.commit_group;" ::: "memory");
 #endif
 }
-template<int Max>
+template<int Max, int Window = 0>
 __global__ __launch_bounds__(256) void Generic(const BF *q,
         FastllmNaiveKV key, FastllmNaiveKV value, const int *indices,
         const float *sink, BF *out, int heads, int kvHeads, int stride,
@@ -61,7 +64,7 @@ __global__ __launch_bounds__(256) void Generic(const BF *q,
             *(const uint4 *)(q + ((size_t)row * heads + head + i / 24) * 192 + i % 24 * 8);
     const int ar = (l & 7) + ((l >> 3) & 1) * 8, ac = (l >> 4) * 8;
     for (int first = 0; first < count; first += Tile) {
-        Load<192,200,Tile,Threads>(s.tile.keys, s.selected, key, indices,
+        Load<192,200,Tile,Threads,Window>(s.tile.keys, s.selected, key, indices,
             row, first, count, keys, past, causal, stride, kh, indexRow);
         asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
@@ -86,7 +89,7 @@ __global__ __launch_bounds__(256) void Generic(const BF *q,
     __syncthreads();
     float acc[4] = {};
     for (int first = 0; first < count; first += Tile) {
-        Load<128,136,Tile,Threads>(s.tile.values, s.selected, value, indices,
+        Load<128,136,Tile,Threads,Window>(s.tile.values, s.selected, value, indices,
             row, first, count, keys, past, causal, kvHeads * 128, kh, indexRow);
         asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
