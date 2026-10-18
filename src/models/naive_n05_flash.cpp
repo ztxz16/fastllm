@@ -950,7 +950,11 @@ Data NaiveN05FlashModel::RunTarget(
             Data *selected = &noIndices;
             int balancedIndexRanks = 0;
             if (!slidingLayers[layer] && (decodeWorkspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
-                if (localIndexer && !batchIndexerPrepared) {
+                const int ranks = tensorParallel ? (int)tpDevices.size() : 1;
+                const bool parallelIndex = !decodeWorkspace && !verifying && tpEp8MegaState && ranks > 1 &&
+                    (!indexerLayerSharding || tpIndexerPeerAccess) && length % (ranks * 64) == 0 &&
+                    (int64_t)(length / (2 * ranks)) * pastKey.dims[1] >= 1024 * 1024;
+                if ((localIndexer || parallelIndex) && !batchIndexerPrepared) {
                     Data rowIndexQ, rowIndexWeights;
                     Data &indexQ = batchIndexPrepared ? rowIndexQ : buf.indexQ;
                     Data &indexWeights = batchIndexPrepared ? rowIndexWeights : buf.indexWeights;
@@ -959,7 +963,30 @@ Data NaiveN05FlashModel::RunTarget(
                         indexQ.FakeFrom(batchIndexQ, (size_t)sequence * indexHeads * indexDim * batchIndexQ.unitSize);
                         indexWeights.Resize({1, 1, indexHeads});
                         indexWeights.FakeFrom(batchIndexWeights, (size_t)sequence * indexHeads * batchIndexWeights.unitSize);
-                    } else prepareIndexQuery(normed, positions, indexQ, indexWeights);
+                    } else if (localIndexer) prepareIndexQuery(normed, positions, indexQ, indexWeights);
+                    const Data *scoreKey = &pastKey;
+                    if (parallelIndex && indexerLayerSharding) {
+                        // Keep the only Indexer KV copy on its owning GPU. Peers
+                        // read its pages and score disjoint query tiles; only Q,
+                        // head weights and final indices cross collectives.
+                        if (!localIndexer) {
+                            for (auto item : {std::make_pair(&indexQ, indexHeads * indexDim),
+                                              std::make_pair(&indexWeights, indexHeads)}) {
+                                auto &data = *item.first;
+                                data.dataType = BFLOAT16;
+                                data.Resize({1, length, item.second});
+                                data.ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
+                                data.Allocate(false);
+                            }
+                        }
+                        const int owner = tpDevices[IndexerOwnerRank(layer)];
+                        FastllmNcclBroadcast(indexQ.cudaData, indexQ.Count(0), BFLOAT16, owner, gpu);
+                        FastllmNcclBroadcast(indexWeights.cudaData, indexWeights.Count(0), BFLOAT16, owner, gpu);
+                        // Broadcast also orders the owner's preceding KV append
+                        // before peer reads. The cache stays live through gather.
+                        const Data &root = batch ? batch->Key(sequence, layer) : pastKeyValues[layer].first;
+                        scoreKey = root.multiDeviceDatas.at(owner);
+                    }
                     if (decodeWorkspace) {
                         if (graphVerify) FastllmCudaNaiveGraphVerifyIndexer(indexQ, indexWeights, pastKey,
                             buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
@@ -967,14 +994,11 @@ Data NaiveN05FlashModel::RunTarget(
                             buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices,
                             layerCache ? layerCache + sequence * 4 : nullptr);
                     } else {
-                        const int ranks = tensorParallel ? (int)tpDevices.size() : 1;
                         if (capture && capture->verifying && length <= 8)
                             FastllmCudaNaiveVerifyIndexer(indexQ, indexWeights, pastKey, indexHeads,
                                 indexDim, localPast, indexTopK, indexFp8, indices);
-                        else if (!indexerLayerSharding && !verifying && tpEp8MegaState && ranks > 1 && length % (ranks * 64) == 0 &&
-                                 (int64_t)(length / ranks) * pastKey.dims[1] >= 1024 * 1024) {
-                            // Indexer Q/K are replicated. Score disjoint query
-                            // tiles and gather only the selected integer indices.
+                        else if (parallelIndex) {
+                            // Score disjoint query tiles and gather only indices.
                             // Pair an early and a late range to balance causal
                             // work while preserving 64-row tiles and the MMA
                             // dispatch threshold, so score arithmetic is unchanged.
@@ -998,8 +1022,8 @@ Data NaiveN05FlashModel::RunTarget(
                                 localIndices.Resize({partRows, indexTopK});
                                 localIndices.FakeFrom(indices,
                                     (size_t)(tpRank * rows + part * partRows) * indexTopK * sizeof(int));
-                                FastllmCudaNaiveIndexer(localQ, localWeights, pastKey, indexHeads, indexDim,
-                                    localPast + first, indexTopK, indexFp8, localIndices);
+                                FastllmCudaNaiveIndexer(localQ, localWeights, *scoreKey, indexHeads, indexDim,
+                                    localPast + first, indexTopK, indexFp8, localIndices, indexerLayerSharding);
                             }
                             FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, indices);
                             if (balanced) balancedIndexRanks = ranks;
@@ -1008,7 +1032,7 @@ Data NaiveN05FlashModel::RunTarget(
                                                     localPast, indexTopK, indexFp8, indices);
                     }
                 }
-                if (indexerLayerSharding && !broadcastBatchIndex) {
+                if (indexerLayerSharding && !broadcastBatchIndex && !parallelIndex) {
                     if (!localIndexer) {
                         indices.dataType = INT32;
                         indices.Resize({length, indexTopK});

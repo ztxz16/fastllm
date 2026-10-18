@@ -2613,7 +2613,7 @@ void FastllmCudaNaiveRestoreIndexerRows(fastllm::Data &indices, int ranks) {
 
 void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
                             const fastllm::Data &packedKeys, int heads, int dim,
-                            int queryStart, int topK, bool fp8Query, fastllm::Data &indices) {
+                            int queryStart, int topK, bool fp8Query, fastllm::Data &indices, bool peerKeys) {
     using namespace fastllm;
     // Indexer quantization is defined on 128-element blocks. The score kernel
     // has a general head-count path, but a different block width is unsupported.
@@ -2623,7 +2623,7 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         queryStart >= 0 && (int64_t)queryStart + query.dims[1] <= packedKeys.dims[1] && topK > 0 &&
         query.dataType == BFLOAT16 && FastllmNaiveKVType(packedKeys.dataType) && weights.dataType == BFLOAT16 &&
         query.dataDevice == DataDevice::CUDA && packedKeys.dataDevice == DataDevice::CUDA &&
-        weights.dataDevice == DataDevice::CUDA && query.dataDeviceIds == packedKeys.dataDeviceIds &&
+        weights.dataDevice == DataDevice::CUDA && (peerKeys || query.dataDeviceIds == packedKeys.dataDeviceIds) &&
         query.dataDeviceIds == weights.dataDeviceIds && query.cudaData && packedKeys.cudaData &&
         weights.cudaData && weights.Count(0) == (uint64_t)query.dims[1] * heads,
         "Invalid Naive-N0.5 Indexer layout (requires 128-element BF16 blocks).");

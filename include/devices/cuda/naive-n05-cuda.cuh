@@ -149,11 +149,12 @@ bool FastllmCudaNaiveIndexerKeyNorm(fastllm::Data &input,
     const fastllm::Data &weight, const fastllm::Data &bias);
 // Q uses blockwise E4M3 quantization when requested. K uses the main KV
 // storage type by default, or its independent scaled E4M3 tail when marked.
+// peerKeys requires enabled peer access and a producer dependency on this stream.
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             const fastllm::Data &weights,
                             const fastllm::Data &packedKeys,
                             int heads, int dim, int queryStart, int topK,
-                            bool fp8Query, fastllm::Data &indices);
+                            bool fp8Query, fastllm::Data &indices, bool peerKeys = false);
 // Restore front/back-paired query shards after AllGather, in the same allocation.
 void FastllmCudaNaiveRestoreIndexerRows(fastllm::Data &indices, int ranks);
 // Consume front/back-paired Indexer rows directly. False leaves all inputs
