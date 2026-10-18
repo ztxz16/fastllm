@@ -247,8 +247,26 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
     if (!snapshot) return false;
     const int rows = std::min(length, window - 1), ranks = tpDevices.size();
     const int capacity = (window + 127) / 128 * 128;
-    const int previous = FastllmCudaGetDevice();
-    for (int rank = 0; rank < ranks; ++rank) {
+    // Set up shared descriptors on the scheduler thread before rank workers
+    // touch their disjoint local caches. Do not mutate the root maps in parallel.
+    for (int layer = 0; layer < block_cnt; ++layer) {
+        if (!slidingLayers[layer]) continue;
+        for (int part = 0; part < 2; ++part) {
+            Data &root = part ? context->pastKeyValues[layer].second : context->pastKeyValues[layer].first;
+            const int dim = part ? sliding.valueDim : sliding.headDim;
+            root.multiDeviceData = true;
+            root.dataDevice = DataDevice::CUDA;
+            root.dataDeviceIds = tpDevices;
+            root.Resize({1, rows, sliding.kvHeads * dim});
+            root.expansionDims = {1, capacity, sliding.kvHeads * dim};
+            for (int device : tpDevices) {
+                Data *&cache = root.multiDeviceDatas[device];
+                if (!cache) cache = new Data(kvCacheDataType);
+            }
+        }
+    }
+    std::vector<std::exception_ptr> errors(ranks);
+    self->tpWorkers.Run(tpDevices, [&](int rank) {
         FastllmCudaSetDevice(tpDevices[rank]);
         std::vector<void *> dsts;
         std::vector<const void *> srcs;
@@ -259,13 +277,7 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
                 Data &root = part ? context->pastKeyValues[layer].second : context->pastKeyValues[layer].first;
                 const int dim = part ? sliding.valueDim : sliding.headDim;
                 const int width = std::max(1, sliding.kvHeads / ranks) * dim;
-                root.multiDeviceData = true;
-                root.dataDevice = DataDevice::CUDA;
-                root.dataDeviceIds = tpDevices;
-                root.Resize({1, rows, sliding.kvHeads * dim});
-                root.expansionDims = {1, capacity, sliding.kvHeads * dim};
-                Data *&cache = root.multiDeviceDatas[tpDevices[rank]];
-                if (!cache) cache = new Data(kvCacheDataType);
+                Data *cache = root.multiDeviceDatas.at(tpDevices[rank]);
                 cache->isKVCache = true;
                 cache->dataDevice = DataDevice::CUDA;
                 cache->dataDeviceIds = {tpDevices[rank]};
@@ -286,9 +298,12 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
         }
         AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
             dsts.data(), srcs.data(), sizes.data(), (int)sizes.size()), "GPU prefix restore failed.");
-        ForceDeviceSync(); // The next forward runs on a different rank thread.
-    }
-    FastllmCudaSetDevice(previous);
+        // Copies run concurrently on the persistent rank streams. Complete
+        // them before releasing the snapshot or allowing request cancellation
+        // to recycle destination storage; no device-wide barrier is needed.
+        FastllmCudaSyncCurrentThreadStream();
+    }, errors);
+    for (auto error : errors) if (error) std::rethrow_exception(error);
     context->preTokens = length;
     context->intParams["add_special_tokens"] = 0;
     context->intParams["promptLen"] = context->inputTokens;
