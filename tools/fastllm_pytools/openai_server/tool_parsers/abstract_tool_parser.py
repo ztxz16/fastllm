@@ -3,14 +3,39 @@
 # Copy from vLLM project
 
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from functools import cached_property
+from threading import Lock
+from types import MappingProxyType
 from typing import Callable, Optional, Union, TypeVar, Literal
+from weakref import WeakKeyDictionary
 from typing_extensions import Never, ParamSpec, TypeIs, assert_never
 from ..protocal.openai_protocol import *
 
 import logging
 logger = logging.getLogger(__name__)
+
+_tokenizer_vocabs = WeakKeyDictionary()
+_tokenizer_vocabs_lock = Lock()
+
+
+def _shared_vocab(tokenizer) -> Mapping[str, int]:
+    # The base vocabulary is fixed after loading. HF tracks tokens added later
+    # separately; checking that small table lets new parsers refresh. Do not
+    # call len(tokenizer): some backends enumerate the full vocabulary for it.
+    added_tokens = getattr(tokenizer, "added_tokens_decoder", None)
+    added_count = len(added_tokens) if added_tokens is not None else None
+    with _tokenizer_vocabs_lock:
+        try:
+            cached = _tokenizer_vocabs.get(tokenizer)
+        except TypeError:
+            # Custom tokenizers may not support weak references or hashing.
+            return MappingProxyType(tokenizer.get_vocab())
+        if cached is None or cached[0] != added_count:
+            cached = (added_count, MappingProxyType(tokenizer.get_vocab()))
+            _tokenizer_vocabs[tokenizer] = cached
+        return cached[1]
+
 
 def random_tool_call_id() -> str:
     return "fastllm-tool-" + str(uuid.uuid4().hex)
@@ -71,10 +96,11 @@ class ToolParser:
         return [1]
 
     @cached_property
-    def vocab(self) -> dict[str, int]:
+    def vocab(self) -> Mapping[str, int]:
         # NOTE: Only PreTrainedTokenizerFast is guaranteed to have .vocab
         # whereas all tokenizers have .get_vocab()
-        return self.model_tokenizer.get_vocab()
+        # Share only immutable vocabulary data, never streaming parser state.
+        return _shared_vocab(self.model_tokenizer)
 
     def adjust_request(
             self, request: ChatCompletionRequest) -> ChatCompletionRequest:
