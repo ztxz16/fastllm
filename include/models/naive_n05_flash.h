@@ -280,6 +280,7 @@ namespace fastllm {
         bool indexFp8 = true;
         bool fp8IndexerCache = false;
         bool indexerLayerSharding = false;
+        bool tpIndexerPeerAccess = false;
         int IndexerOwnerRank(int layer) const {
             return std::count(slidingLayers.begin(), slidingLayers.begin() + layer, 0) % tpDevices.size();
         }
