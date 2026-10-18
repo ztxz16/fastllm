@@ -214,6 +214,13 @@ int main(int argc, char **argv) {
         Compare(expected, RunRequests(model, {7, 17, 33, 7}));
         if (!eagerOnly) {
             SetCudaGraph(true);
+            // Ordinary decode captures only at service startup. Exercise the
+            // same warmup here instead of relying on request-time capture.
+            model.maxBatch = 1;
+            model.WarmUp();
+            const size_t ordinaryShapes = diskExperts ? 0 : 1;
+            if ((model.*(&Access::v41CudaGraphSlots)).size() != ordinaryShapes)
+                throw std::runtime_error("unexpected startup decode graph shapes");
             Compare(expected, RunRequests(model, {7, 17, 33, 7}));
             SetCudaGraph(false);
             Compare(expected, RunRequests(model, {7, 17, 33, 7}));

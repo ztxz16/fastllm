@@ -117,6 +117,7 @@ namespace fastllm {
         ForwardState frame(*this, inputSegments, inputIds, inputEmbeds, imageMask, generationConfigsIn,
             lastTokens, retLogits, samplingPastKeyValues);
         frame.PrepareInputs();
+        if (frame.FullGraph()) return frame.Finish();
         for (int layer=0; layer<frame.Layers(); ++layer) {
             frame.BeginLayer(layer);
             frame.GpuExperts(layer);

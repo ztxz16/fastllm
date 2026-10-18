@@ -1319,6 +1319,15 @@ if (UNIT_TEST)
         add_test(NAME deepseekV41DecodeOptimization COMMAND deepseekV41DecodeOptimizationRegression)
         set_tests_properties(deepseekV41DecodeOptimization PROPERTIES LABELS cuda TIMEOUT 300 SKIP_RETURN_CODE 77)
         if (NOT USE_ROCM)
+            add_executable(deepseekV41FullDecodeRegression test/ops/deepseekV41FullDecodeRegression.cpp)
+            target_link_libraries(deepseekV41FullDecodeRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41FullDecodeRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(deepseekV41FullDecode deepseekV41FullDecodeRegression
+                "PASS [0-9]+ changing-context graph replays; stress=0" 300)
+            fastllm_add_checked_test(deepseekV41FullDecodeStress deepseekV41FullDecodeRegression
+                "PASS [0-9]+ changing-context graph replays; stress=1" 300 --stress)
+            set_tests_properties(deepseekV41FullDecode deepseekV41FullDecodeStress PROPERTIES
+                LABELS cuda RUN_SERIAL TRUE)
             add_executable(deepseekV41EngramRegression test/ops/deepseekV41EngramRegression.cpp)
             target_link_libraries(deepseekV41EngramRegression PRIVATE fastllm)
             target_include_directories(deepseekV41EngramRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

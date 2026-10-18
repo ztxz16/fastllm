@@ -78,6 +78,7 @@ struct DeepSeekV41Model::ForwardState {
     void HybridExperts(int layer);
     void BeginHybridStep();
     void PrepareInputs();
+    bool FullGraph();
     std::vector<int> Finish();
 };
 }

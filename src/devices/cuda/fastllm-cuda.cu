@@ -24744,3 +24744,33 @@ void FastllmCudaPickOutput(uint8_t *partOutput, uint8_t *output, int rows, int c
         exit(0);
     }
 }
+
+
+// Compose already captured segments without recapturing model execution.
+// Child graph nodes preserve each segment's internal stream dependencies.
+extern "C" bool FastllmCudaGraphCompose(const void *const *children, int count,
+                                         void **outGraph, void **outExec) {
+    if (!children || count <= 0 || !outGraph || !outExec) return false;
+    *outGraph = nullptr;
+    *outExec = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    cudaGraphNode_t previous = nullptr;
+    cudaError_t result = cudaGraphCreate(&graph, 0);
+    for (int i = 0; i < count && result == cudaSuccess; ++i) {
+        cudaGraphNode_t next = nullptr;
+        result = cudaGraphAddChildGraphNode(&next, graph,
+            previous ? &previous : nullptr, previous ? 1 : 0,
+            reinterpret_cast<cudaGraph_t>(const_cast<void *>(children[i])));
+        previous = next;
+    }
+    if (result == cudaSuccess) result = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    if (result != cudaSuccess) {
+        if (exec) cudaGraphExecDestroy(exec);
+        if (graph) cudaGraphDestroy(graph);
+        return false;
+    }
+    *outGraph = graph;
+    *outExec = exec;
+    return true;
+}

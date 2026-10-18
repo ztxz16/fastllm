@@ -339,6 +339,7 @@ namespace fastllm {
         // 捕获和回放共用互斥量，抢不到锁的前向退回逐算子。
         std::mutex v41CudaGraphMutex;
         std::map<int, std::shared_ptr<void>> v41CudaGraphSlots;
+        bool v41CudaGraphWarmingUp = false;
         // One bounded eager verifier workspace, protected by v41CudaGraphMutex.
         // No graph captures these buffers, so candidate counts can share them.
         std::shared_ptr<DeepSeekV41DecodeWorkspace> v41TpVerifyWorkspace;
@@ -376,6 +377,10 @@ namespace fastllm {
         struct ForwardState;
         void PrepareForward(ForwardWorkspace &);
         void PrepareForwardInputs(ForwardWorkspace &);
+#ifdef USE_CUDA
+        bool TryFullDecodeGraph(ForwardWorkspace &);
+        void BuildFullDecodeGraph(int batch, const std::vector<std::shared_ptr<DeepSeekV41RequestState>> &states);
+#endif
         void BeginForwardLayer(ForwardWorkspace &, int layer);
         void EndForwardLayer(ForwardWorkspace &, int layer);
         void RunForwardSharedExpert(ForwardWorkspace &, int layer);

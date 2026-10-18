@@ -166,6 +166,9 @@ bool FastllmCudaGraphBeginCapture();
 bool FastllmCudaGraphPrepareCaptureDevice();
 bool FastllmCudaGraphEndCapture(void **graph);
 bool FastllmCudaGraphInstantiate(void *graph, void **exec);
+// Compose captured children in order, preserving their stream dependencies.
+bool FastllmCudaGraphCompose(const void *const *children, int count,
+                             void **outGraph, void **outExec);
 bool FastllmCudaTensorParallelGreedyGatherGraphCreate(
         int rootDevice, int ranks,
         const void *const *ids, const void *const *scores,

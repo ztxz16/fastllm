@@ -186,7 +186,7 @@ CPU 缓存按热度和最后访问时间管理，4096 次访问后衰减；预�
 
 ## 张量并行
 
-支持 GPU 共享专家、单 token 异步调度与分段 CUDA Graph。吞吐收益取决于 GPU、卡间通信和
+支持 GPU 共享专家、单 token 异步调度，以及分段和单请求整图 CUDA Graph。吞吐收益取决于 GPU、卡间通信和
 CPU 专家占比，应在相同配置下分别测量 decode 与首 token 延迟。
 
 ```bash
@@ -296,13 +296,32 @@ verify 始终计算全部候选位置。单 token decode 和 CUDA Graph 的执�
 
 ## decode 与 DSpark 校验的 CUDA Graph
 
-`FASTLLM_CUDA_GRAPH=1` 启用单请求 decode 和 DSpark 目标验证的分段图。各 token 行数分别预热、捕获和重放。
-图段包含固定地址的投影、归一化、路由及适用的共享专家计算；Engram、动态 KV 更新、主机专家和投机提交/回滚保留在图外。
-不能捕获的段走 eager；图边界仍保持原有数学和同步顺序。
+`FASTLLM_CUDA_GRAPH=1` 在启动预热时捕获普通 decode 图。按照 `max_batch` 预热 1、2、4 等二次幂，以及配置的最大 batch；未预热的 batch 或失效图使用 eager，不在普通请求内重新捕获。DSpark 目标验证仍保留独立的分段图。
 
-适用范围为文本、CUDA 单卡或兼容的 TP、非起始位置的单请求 decode/verify。批量 decode、普通多 token prefill、按层分卡及带同步 profiling/dump 的路径使用 eager。
-工作区由模型持有，不能并发取得锁时走 eager。权重、设备布局、共享专家配置及边界地址变化时重新校验；捕获失败时所有 TP rank 一致回退。
-按层部署应保持 Graph 关闭，避免全局开关附带的 CUDA embedding 放置影响主模型与草稿的跨卡访问。
+GPU 执行模式下，单请求文本 decode 满足以下条件时，会进一步组成每卡一张整图：
+
+- `--ngram_device cuda`，全部 Engram 表均已成功放到 GPU；
+- 普通 BF16 KV，未开启 DSpark，兼容的 TP head 分片；
+- 当前支持的 512 维 Full Attention、128 维 Indexer、四路 HC 布局。
+
+整图包含各层投影、归一化、动态 KV 更新、Indexer、Attention、路由专家、共享专家、Engram GPU 计算及 LM head。每个 decode step 每张卡只调用一次 `cudaGraphLaunch`，上下文长度和 KV 地址通过固定元数据缓冲更新，不随上下文增长重新捕获。请求准备、embedding 输入准备、Engram 地址计算和采样仍在图外；不能把它理解为整个 HTTP 请求只有一个 GPU 操作。
+
+启动日志出现以下信息，才表示整图已就绪：
+
+```text
+DeepSeek-V4.1 full decode graph ready: batch=1, ranks=8, one graph per rank/step
+```
+
+例如八卡单并发服务：
+
+```bash
+FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/DeepSeek-V4.1-Flash \
+  --tp 8 --ngram_device cuda --dtype auto --atype float32 --max_batch 1
+```
+
+这里 `atype=float32` 是模型前端接受的设置；主干内部仍按原模型使用 BF16 激活及相应量化边界。`dtype=auto` 保留带缩放的 FP8/FP4 源权重。
+
+其他已预热的 batch、CPU Engram 或混合专家模式使用可捕获的分段图，其动态操作保留在图外。普通多 token prefill、按层分卡及带同步 profiling/dump 的路径使用 eager。工作区由模型持有，不能并发取得锁时走 eager；设备、精度或权重布局变化后重新校验，捕获失败时各 TP rank 一致回退。按层部署应保持 Graph 关闭，避免 CUDA embedding 放置影响跨卡访问。
 
 排查参数包括 `FASTLLM_DSV41_CUDA_GRAPH_WARMUP`（默认 2）和 `FASTLLM_DSV41_CUDA_GRAPH_DEBUG`。故障注入和回放掩码仅供回归测试使用，不应作为部署调优配置。
 
@@ -340,16 +359,15 @@ V4.1 的压缩 KV 是跨层共享的：`kv_source_layer_ids` 的层算出的 cac
 
 ### 与张量并行的取舍
 
-| | 张量并行 `--tp 2` | 按层切分 |
+| | 张量并行 | 按层切分 |
 | --- | --- | --- |
-| 每卡稠密显存 | 约一半（注意力 / 共享专家 / head 切开，其余复制） | 约一半（整层归属一张卡） |
-| 单请求 prefill | 明显变快（注意力与稠密 GEMM 并行） | 基本不变 |
-| 单请求 decode | 变慢（每个算子多一次两卡 worker 调度，实测约 34 us/算子） | 基本不变 |
-| 通信 | 每层 2 次 all-reduce（NVLink，量小） | 每个 stage 边界 1 次隐藏状态搬运 |
-| 约束 | `num_attention_heads / tp` 必须是 32 的倍数并对齐 o_groups | 切分点必须落在 kv source 边界 |
+| 权重分布 | 注意力与 head 分片，共享专家复制；路由专家使用配置的 EP/混合后端 | 整层归属一张卡 |
+| 计算方式 | 同一层由多卡同时计算，需要集合通信 | 单请求依次经过各卡上的层 |
+| Decode 调度 | 支持常驻 worker 和符合条件的整图 | stage 边界传递隐藏状态 |
+| 约束 | head 均分，每个分片包含完整的 o_group | 切分点必须落在 kv source 边界 |
 
-建议：长上下文 / prefill 为主用 `--tp 2`；要显存（给 KV cache 或专家缓存腾地方）、
-或者以 decode 吞吐为主，用按层切分。两者目前是二选一。
+两种部署方式不能直接以旧的逐算子调度耗时比较。实际速度取决于卡间互联、
+GPU/CPU 专家布局、Engram 放置和 CUDA Graph 是否生效，应在相同负载下测量。
 
 ## prefill 的多卡专家流（`FT_MOE_ASSIST_DEVICES`）
 
@@ -682,14 +700,24 @@ MMA 路径检查设备及实际加载内核的架构、线程数和共享内存�
 RMSNorm 其他类型、维度和批量保留原路径，不满足向量读取对齐时使用标量读取。
 CUDA 构建仍需包含目标显卡支持的代码镜像，并使用支持该架构的工具链。
 
+其他加速路径也保留回退：
+
+- BF16×FP8 block-32 Marlin 要求 SM80+、匹配的尺寸和可无损表示的 E8M0 scale；否则保留原始行优先权重，使用通用 GEMV/cuBLAS 路径。
+- FP8 GEMV 的单行循环展开仅针对 SM90，其余架构使用原循环。
+- MoE 的 V4.1 量化、路由权重和 FP32 求和边界独立于加速后端；不支持 Marlin 时使用普通 CUDA 路径。不能捕获的路径保持 eager。
+- GPU Engram 要求各 rank 可互访且显存充足，否则保留 CPU 查表；不改变原始表的数值格式。
+- 整图不支持的形状、KV 类型、执行模式或设备退回分段图/eager。启动后失效的普通 decode 图不在请求内重新捕获。
+
+压缩 Attention 保留原有 PV 累加顺序；未保留改变 FP32 结合顺序的候选分块优化。整图回归对普通和压力输入均要求与 eager 结果逐位一致。
+
 ```bash
 ./build/deepseekV41OpsRegression
-ctest --test-dir build -R 'deepseekV41(Precision|Tp|DecodeOptimization)' --output-on-failure
+ctest --test-dir build -R 'deepseekV41(Precision|Tp|DecodeOptimization|FullDecode)' --output-on-failure
 python test/basic/test_deepseek_v41_tp_graph.py --binary ./build/deepseekV41TpGraphRegression
 ```
 
 Graph fixture 需要 PyTorch、safetensors、numpy 和两张 CUDA GPU；覆盖不同长度的连续请求、
-eager / Graph 切换和共享专家重叠，以及 DSpark 的 1～6 token 图重放、目标层特征与部分接受后的 KV 回滚。
+启动预热后的 eager / Graph 切换和共享专家重叠，以及 DSpark 的 1～8 token 图重放、目标层特征与部分接受后的 KV 回滚。
 `--hc-mult 2` 可补测两路 HC，默认四路。
 算子回归检查通用路径与 decode 对齐、独立 CPU RMSNorm 参考、量化 KV、远端 logits 同步、
 缓冲复用、并发 Graph 及捕获期间临时空间不足时的回退。

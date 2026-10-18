@@ -585,10 +585,11 @@ namespace fastllm {
         Data *precomputedLogits,
         Data *precomputedGreedyIds,
         Data *precomputedGreedyScores,
-        const std::map<int, void*> *precomputedReadyEvents
+        const std::map<int, void*> *precomputedReadyEvents,
+        bool preservePrecomputedLogits
     ) {
         Data ownedLogits;
-        Data &logits = precomputedLogits == nullptr ? ownedLogits : *precomputedLogits;
+        Data &sourceLogits = precomputedLogits == nullptr ? ownedLogits : *precomputedLogits;
         std::vector<Data> curLogits;
         curLogits.resize(batch);
 
@@ -608,14 +609,14 @@ namespace fastllm {
             }
 
             RMSNorm(*hiddenStates, *normWeight, rms_norm_eps, *hiddenStates);
-            Linear(*hiddenStates, *lmHeadWeight, *GetEmptyData(), logits);
-            ToDataType(logits, DataType::FLOAT32);
+            Linear(*hiddenStates, *lmHeadWeight, *GetEmptyData(), sourceLogits);
+            ToDataType(sourceLogits, DataType::FLOAT32);
         } else {
-            AssertInFastLLM(logits.dataType == DataType::FLOAT32,
+            AssertInFastLLM(sourceLogits.dataType == DataType::FLOAT32,
                             "Precomputed sampling logits must use FLOAT32.\n");
         }
 #ifdef USE_CUDA
-        bool canUseShardedGreedy = logits.IsTensorParallelSharded() &&
+        bool canUseShardedGreedy = sourceLogits.IsTensorParallelSharded() &&
             !ShouldPrintLogits();
         for (int b = 0; b < batch && canUseShardedGreedy; ++b) {
             canUseShardedGreedy = generationConfigs[b].IsSimpleGreedy() &&
@@ -624,11 +625,29 @@ namespace fastllm {
         }
         if (canUseShardedGreedy &&
             SampleTensorParallelGreedyLogits(
-                logits, batch, lastRet,
+                sourceLogits, batch, lastRet,
                 precomputedGreedyIds, precomputedGreedyScores,
                 precomputedReadyEvents)) {
             return;
         }
+#endif
+        Data *mutableLogits = &sourceLogits;
+        if (preservePrecomputedLogits && precomputedLogits != nullptr) {
+#ifdef USE_CUDA
+            if (sourceLogits.multiDeviceData && sourceLogits.IsTensorParallelSharded()) {
+                std::vector<int> devices;
+                for (const auto &entry : sourceLogits.multiDeviceDatas) devices.push_back(entry.first);
+                AssertInFastLLM(MultiCudaCopyShardedActivation(ownedLogits,
+                    sourceLogits, devices, true), "Cannot copy preserved sampling logits.\n");
+            } else
+#endif
+            {
+                ownedLogits.CopyFrom(sourceLogits);
+            }
+            mutableLogits = &ownedLogits;
+        }
+        Data &logits = *mutableLogits;
+#ifdef USE_CUDA
         GatherTensorParallelLogitsToRoot(logits);
 #endif
 
