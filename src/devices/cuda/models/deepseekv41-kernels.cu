@@ -508,6 +508,40 @@ namespace {
         output[i] = result;
     }
 
+    // Ascending reduction tree matches FastllmGemvFp32Fp32Kernel2.
+    // BF16 converts exactly to FP32 in registers; no activation cast buffer.
+    __global__ void V41RouterScoresKernel(const __nv_bfloat16 *input, const float *weight,
+                                          float *scores, int dim, int experts, float invTemp) {
+        const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
+        const int expert = blockIdx.x, token = blockIdx.y;
+        float sum = 0.0f;
+#pragma unroll 4
+        for (int i = tid; i < dim; i += 256)
+            sum += __bfloat162float(input[(size_t)token * dim + i]) * weight[(size_t)expert * dim + i];
+#pragma unroll
+        for (int offset = 1; offset < 32; offset *= 2) {
+            const float other = __shfl_down_sync(0xffffffff, sum, offset);
+            if ((lane & (2 * offset - 1)) == 0) sum += other;
+        }
+        __shared__ float partial[8];
+        if (lane == 0) partial[warp] = sum;
+        __syncthreads();
+        if (warp == 0) {
+            sum = lane < 8 ? partial[lane] : 0.0f;
+#pragma unroll
+            for (int offset = 1; offset < 8; offset *= 2) {
+                const float other = __shfl_down_sync(0xffffffff, sum, offset);
+                if ((lane & (2 * offset - 1)) == 0) sum += other;
+            }
+            if (lane == 0) {
+                const float value = __fmul_rn(__fadd_rn(sum, 0.0f), invTemp);
+                const float softplus = value > 20.0f ? value :
+                    (value < -20.0f ? expf(value) : log1pf(expf(value)));
+                scores[(size_t)token * experts + expert] = sqrtf(softplus);
+            }
+        }
+    }
+
     // ---------------- HcMix ----------------
 
     constexpr int kHcThreads = 256;
@@ -3306,6 +3340,25 @@ bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit,
 
 bool FastllmCudaDeepSeekV41SharedSwigluQuantized(const fastllm::Data &input, float limit, fastllm::Data &output, const float *routeScales) {
     return V41RunSharedSwiglu<true>(input, limit, output, routeScales);
+}
+
+extern "C" bool FastllmCudaV41RouterScores(const Data &input, Data &weight,
+                                            float temperature, Data &scores) {
+    if (!V41OnCuda(input) || input.multiDeviceData || weight.multiDeviceData ||
+        input.dataType != DataType::BFLOAT16 || weight.dataType != DataType::FLOAT32 ||
+        input.dims.empty() || input.dims.back() <= 0 || weight.dims.size() != 2 ||
+        input.dims.back() != weight.dims[1] ||
+        input.Count(0) / input.dims.back() < 1 || input.Count(0) / input.dims.back() > 8 ||
+        weight.dims[0] < 1 || weight.dims[0] > 1024 || temperature <= 0) return false;
+    weight.ToDevice(DataDevice::CUDA, std::vector<int>{FastllmCudaGetDevice()}, true);
+    auto dims = input.dims;
+    dims.back() = weight.dims[0];
+    if (!V41PrepareOutput(scores, DataType::FLOAT32, dims)) return false;
+    const float invTemp = fabsf(temperature - 1.0f) > 1e-6f ? 1.0f / temperature : 1.0f;
+    V41RouterScoresKernel<<<dim3(weight.dims[0], input.Count(0) / input.dims.back()), 256>>>(
+        (const __nv_bfloat16 *)input.cudaData, (const float *)weight.cudaData,
+        (float *)scores.cudaData, weight.dims[1], weight.dims[0], invTemp);
+    return V41CheckLaunch("RouterScores");
 }
 
 // Small BF16 decode batches: dot products remain the portable FP32 path;

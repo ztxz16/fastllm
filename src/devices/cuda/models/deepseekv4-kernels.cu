@@ -807,6 +807,40 @@ __global__ void DeepSeekV4WoAPairBlockReduceKernel(const InT *o, const WT *w, __
     }
 }
 
+// Decode grid carries group IDs explicitly, avoiding per-CTA integer division.
+// Independent row warps preserve the original FP32 binary reduction tree.
+template <typename InT, typename WT>
+__global__ void DeepSeekV4WoAGroupedRowsKernel(const InT *input, const WT *weight,
+        __nv_bfloat16 *output, int groupDim, int oRank) {
+    constexpr int ROWS = 2;
+    const int group = blockIdx.y, first = blockIdx.x * ROWS;
+    const int tid = threadIdx.x, lane = tid & 31;
+    if (first >= oRank) return;
+    float acc[ROWS] = {};
+#pragma unroll 4
+    for (int d = tid; d < groupDim; d += 256) {
+        const float x = Dsv4ToFloat(input[(size_t)group * groupDim + d]);
+#pragma unroll
+        for (int row = 0; row < ROWS; ++row)
+            if (first + row < oRank)
+                acc[row] += x * Dsv4ToFloat(weight[((size_t)group * oRank + first + row) * groupDim + d]);
+    }
+    __shared__ float partial[ROWS][256];
+#pragma unroll
+    for (int row = 0; row < ROWS; ++row) partial[row][tid] = acc[row];
+    __syncthreads();
+    const int row = tid / 32;
+    if (row >= ROWS || first + row >= oRank) return;
+    const float *p = partial[row];
+    float sum = ((p[lane] + p[lane + 128]) + (p[lane + 64] + p[lane + 192])) +
+                ((p[lane + 32] + p[lane + 160]) + (p[lane + 96] + p[lane + 224]));
+    for (int offset = 16; offset; offset >>= 1) {
+        const float other = __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane < offset) sum += other;
+    }
+    if (lane == 0) output[(uint64_t)group * oRank + first + row] = __float2bfloat16_rn(sum);
+}
+
 // Share each pair of weight rows across a tile of input tokens. Flattening
 // batch/sequence dimensions also handles incomplete tiles. Each individual
 // dot keeps the 256-thread accumulation/reduction order of the pair kernel.
@@ -865,7 +899,10 @@ void DeepSeekV4LaunchWoATokenPair(const InT *o, const WT *w, __nv_bfloat16 *outp
         int bsz, int seqlen, int heads, int headDim, int groups, int oRank) {
     const int tokens = bsz * seqlen;
     const int tile = tokens <= 2 ? 2 : 4;
-    if (tokens == 1) {
+    if (tokens == 1 && groups <= 65535) {
+        DeepSeekV4WoAGroupedRowsKernel<InT, WT><<<dim3(oRank / 2, groups), 256>>>(
+            o, w, output, (heads / groups) * headDim, oRank);
+    } else if (tokens == 1) {
         DeepSeekV4WoAPairBlockReduceKernel<<<tokens * groups * (oRank / 2), 256, 512 * sizeof(float)>>>(
             o,w,output,bsz,seqlen,heads,headDim,groups,oRank);
     } else if (tile == 2) {

@@ -829,6 +829,42 @@ namespace fastllm {
         }
 
 #ifdef USE_CUDA
+        bool V41RouterScores(const Data &input, Data &weight, float temperature, Data &output) {
+            if (input.dataType != DataType::BFLOAT16 || input.dims.empty() ||
+                input.dims.back() <= 0 || input.Count(0) / input.dims.back() > 8 ||
+                weight.dataType != DataType::FLOAT32 || weight.dims.size() != 2 ||
+                weight.dims[1] != input.dims.back() || weight.dims[0] > 1024) return false;
+            if (!input.multiDeviceData) {
+                const int current = FastllmCudaGetDevice();
+                if (input.dataDevice != DataDevice::CUDA || input.dataDeviceIds.empty() ||
+                    input.dataDeviceIds[0] != current ||
+                    (weight.dataDevice == DataDevice::CUDA && !weight.dataDeviceIds.empty() &&
+                     weight.dataDeviceIds[0] != current)) return false;
+                return FastllmCudaV41RouterScores(input, weight, temperature, output);
+            }
+            if (!input.IsTensorParallelReplicated()) return false;
+            std::vector<int> devices;
+            for (const auto &replica : input.multiDeviceDatas) devices.push_back(replica.first);
+            if (devices.empty()) return false;
+            if (!weight.multiDeviceData) PrepareMultiCudaReplicatedData(weight, devices, true);
+            if (!weight.IsTensorParallelReplicated()) return false;
+            for (int device : devices) {
+                auto w = weight.multiDeviceDatas.find(device);
+                if (w == weight.multiDeviceDatas.end() || !w->second || !w->second->cudaData ||
+                    !input.multiDeviceDatas.at(device) || !input.multiDeviceDatas.at(device)->cudaData)
+                    return false;
+            }
+            auto dims = input.dims;
+            dims.back() = weight.dims[0];
+            V41AllocLike(output, DataType::FLOAT32, dims, input, devices);
+            std::vector<int> ok(devices.size(), 0);
+            const bool submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                ok[rank] = FastllmCudaV41RouterScores(*input.multiDeviceDatas.at(device),
+                    *weight.multiDeviceDatas.at(device), temperature, *output.multiDeviceDatas.at(device));
+            });
+            return submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; });
+        }
+
         // Decode partitions independent output channels. Keeping the weight
         // replicas also preserves the existing prefill and unsupported-layout
         // paths. Each owner computes full K, then gathers rounded BF16 outputs.
@@ -5513,11 +5549,19 @@ namespace fastllm {
                 std::string gpre = pre + ".ffn.gate";
                 Data &xFloat = ws->gateInput;
                 Data &logits = ws->gateLogits;
-                ToDataType(ffnInput, xFloat, DataType::FLOAT32);
-                quantizedLinear(xFloat, gpre + ".weight", logits, tp);
-                ToDataType(logits, DataType::FLOAT32);
-                if (std::fabs(gate_temp - 1.0f) > 1e-6f) {
-                    Mul(logits, 1.0f / gate_temp, logits);
+                bool scoresReady = false;
+#ifdef USE_CUDA
+                if (!hasImageTokens && !V41ReferenceMathEnabled() &&
+                    !V41EnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE"))
+                    scoresReady = V41RouterScores(ffnInput, weight[gpre + ".weight"], gate_temp, logits);
+#endif
+                if (!scoresReady) {
+                    ToDataType(ffnInput, xFloat, DataType::FLOAT32);
+                    quantizedLinear(xFloat, gpre + ".weight", logits, tp);
+                    ToDataType(logits, DataType::FLOAT32);
+                    if (std::fabs(gate_temp - 1.0f) > 1e-6f) {
+                        Mul(logits, 1.0f / gate_temp, logits);
+                    }
                 }
                 Data &gateBias = weight[gpre + ".bias"];
                 // 图像 token 使用 bias_vl 做专家选择（只影响 prefill，走 CPU 参考路径）
@@ -5534,7 +5578,7 @@ namespace fastllm {
                 if (!hasImageTokens && !V41ReferenceMathEnabled() &&
                     (logits.dataDevice == DataDevice::CUDA || (tp && logits.multiDeviceData)) &&
                     !V41EnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") &&
-                    V41RouteScoreTransformTp(logits, 2, tpDevices)) {
+                    (scoresReady || V41RouteScoreTransformTp(logits, 2, tpDevices))) {
                     gateBias.ToDevice(DataDevice::CUDA);
                     SelectExpert(logits, expertIndex, expertScore, num_experts_per_tok, true,
                                  routed_scaling_factor, &gateBias);

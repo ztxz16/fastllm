@@ -779,8 +779,14 @@ bonus token 和缓存回滚；`deepseekV41OpsRegression` 检查小批量算子�
   每个 rank 只计算自己的输出通道，随后 AllGather BF16 结果。每个点积仍计算完整 K，
   没有跨卡部分和归约。权重继续保留复制布局；这项优化减少计算和读取，不减少权重显存。
   Prefill、多 token、其它 dtype、非对齐尺寸及不支持的权重布局使用原投影路径。
+- **Router 准备融合**：不超过 8 个 token、BF16 输入、FP32 权重、至多 1024 个专家时，
+  直接在寄存器中转换输入，并融合温度缩放与 sqrt(softplus)。保留原 FP32 点积归约顺序，
+  专家 Top-K、偏置、归一化和路由规则不变。
+- **O_A 单 token 归约**：各输出行使用独立 warp，保留原 256 线程二叉树求和顺序，
+  减少 block 同步。其余 token 数和不适用的分组布局继续走已有实现。
+
 这些路径使用通用 CUDA 实现，不依赖 Hopper 专用指令。CUDA 回归
-`deepseekV41DecodeProjections` 检查 mHC 的精确结果及拒绝路径；
+`deepseekV41DecodeProjections` 检查 mHC、Router 和 O_A 的精确结果及拒绝路径；
 `deepseekV41EngramProjection` 检查多卡输出顺序、较大 batch 回退及非法分片边界；
 `deepseekV41FullDecode` / `deepseekV41FullDecodeStress` 覆盖旋转、KV 生命周期和图重放。
 MoE 专家计算与通信调度未在这些优化中调整。
