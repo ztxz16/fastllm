@@ -155,6 +155,34 @@ static KernelFn PickKernel(int sizeM, int threadK, int threadN, int groupBlocks,
 #undef RET_K
 #undef RET_K_STAGES
 
+// BF16 activations and E4M3 weights with exact E8M0 block-32 scales.
+// Keep the existing FP16/group-128 kernels and dispatch unchanged.
+static KernelFn PickBf16Mxfp8Kernel(int rows, int tile) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    // Do not instantiate BF16 MMA for Turing device images. The host-side
+    // architecture guard keeps these calls on the ordinary CUDA fallback.
+    return nullptr;
+#else
+#define MXFP8(TM, M8, TN, TK) \
+    return MARLIN_NAMESPACE_NAME::Marlin< \
+        vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), vllm::kBFloat16.id(), \
+        vllm::kFE8M0fnu.id(), 128, TM, TN, TK, M8, 4, 2, false>
+    if (tile == 1) {
+        if (rows <= 8) MXFP8(1, true, 4, 8);
+        if (rows <= 16) MXFP8(1, false, 4, 8);
+        if (rows <= 32) MXFP8(2, false, 4, 8);
+        if (rows <= 48) MXFP8(3, false, 4, 8);
+        MXFP8(4, false, 4, 8);
+    }
+    if (rows <= 8) MXFP8(1, true, 8, 4);
+    if (rows <= 16) MXFP8(1, false, 8, 4);
+    if (rows <= 32) MXFP8(2, false, 8, 4);
+    if (rows <= 48) MXFP8(3, false, 8, 4);
+    MXFP8(4, false, 8, 4);
+#undef MXFP8
+#endif
+}
+
 // Explicit FE2M1 + special FE4M3 scale, group16 (group_blocks=1).
 // Only SM75 selects stages=2; newer architectures select stages=4.
 // The SM75 64x256x64 prefill tile specializes the fixed dense reduction
@@ -643,6 +671,54 @@ extern "C" bool FastllmCudaMarlinHalfFP8Gemm(
 
         row += chunkM;
         remaining -= chunkM;
+    }
+    return true;
+}
+
+extern "C" bool FastllmCudaMarlinBFloat16MXFP8Gemm(
+        const void *a, const uint32_t *weight, const uint8_t *scales,
+        void *c, int rows, int columns, int inner, int *workspace) {
+    int arch = 0;
+    if (!DeviceOk(&arch) || arch < 80 || rows <= 0 || columns <= 0 ||
+        inner <= 0 || columns % 64 || inner % 64 ||
+        (columns % 128 && inner % 128) || !a || !weight || !scales ||
+        !c || !workspace) return false;
+    int device = 0, sms = 0, shared = 0;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (sms <= 0 || shared <= 0 || !EnsureCTmp(device, (size_t)sms * 64 * 256))
+        return false;
+    const int tile = columns % 128 != 0 ? 1 : 0;
+    // Configure every tail specialization before entering a capture. A later
+    // prefill may have a different tail, but the captured scratch never moves.
+    static thread_local std::set<int> prepared;
+    if (!prepared.count(device)) {
+        cudaStreamCaptureStatus capture;
+        if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+            capture != cudaStreamCaptureStatusNone) return false;
+        for (int kind : {0, 1}) for (int m : {8, 16, 32, 48, 64}) {
+            if (cudaFuncSetAttribute(PickBf16Mxfp8Kernel(m, kind),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, shared) != cudaSuccess)
+                return false;
+        }
+        prepared.emplace(device);
+    }
+    for (int row = 0; row < rows;) {
+        int count = rows - row;
+        if (count >= 64) count = std::min(count / 64, 128) * 64;
+        const int chunkTile = tile;
+        KernelFn kernel = PickBf16Mxfp8Kernel(count, chunkTile);
+        kernel<<<sms, 128, shared, cudaStreamPerThread>>>(
+            reinterpret_cast<const int4 *>(static_cast<const uint16_t *>(a) + (size_t)row * inner),
+            reinterpret_cast<const int4 *>(weight),
+            reinterpret_cast<int4 *>(static_cast<uint16_t *>(c) + (size_t)row * columns),
+            reinterpret_cast<int4 *>(GetCTmp(device).ptr), nullptr, nullptr,
+            reinterpret_cast<const int4 *>(scales), nullptr, nullptr, nullptr,
+            inner / 32, count, columns, inner, inner, workspace,
+            false, false, true, shared);
+        if (cudaPeekAtLastError() != cudaSuccess) return false;
+        row += count;
     }
     return true;
 }

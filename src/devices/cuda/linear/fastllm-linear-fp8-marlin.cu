@@ -8,6 +8,7 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "fastllm-cublas-prefill.cuh"
 #include "devices/cuda/fastllm-cuda-fp8.h"
 #include "fastllm-fp8-marlin-gemv.cuh"
@@ -22,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <map>
 #include <vector>
 
 void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(
@@ -32,6 +34,24 @@ namespace {
 constexpr int FP8_MARLIN_WORKSPACE_IDX = 3;
 constexpr int FP8_MARLIN_SCALES_HALF_IDX = 1;
 constexpr int FP8_GROUP_SIZE = 128;
+
+// Own only the auxiliary block-32 BF16 layouts introduced here. Legacy FP8
+// layouts use different slots and keep their existing lifetime management.
+struct BFloatFp8Auxiliary {
+    int device = -1;
+    void *packed = nullptr, *scales = nullptr, *locks = nullptr, *dequantized = nullptr;
+    size_t dequantizedBytes = 0;
+};
+struct BFloatFp8AuxiliaryRegistry {
+    std::mutex mutex;
+    std::map<const fastllm::Data *, BFloatFp8Auxiliary> weights;
+    std::map<int, size_t> dequantizedBytes;
+};
+BFloatFp8AuxiliaryRegistry &BFloatFp8Registry() {
+    static auto *registry = new BFloatFp8AuxiliaryRegistry;
+    return *registry;
+}
+
 constexpr int FP8_MARLIN_CONVERT_MAX_M = 8;
 
 static bool Fp8MarlinEnvFlagDefaultEnabled(const char *name, bool defaultValue) {
@@ -554,4 +574,155 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return ok;
+}
+
+
+// Auxiliary packed copy: preserve the row-major source for generic GEMV and
+// cuBLAS fallback, unlike the pre-existing destructive FP16/group-128 path.
+extern "C" bool FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(
+        const void *input, fastllm::Data &weight, void *output,
+        int rows, int inner, int columns) {
+    constexpr int packedIndex = 4, scalesIndex = 5, locksIndex = 6;
+    int arch = 0;
+    if (!Fp8MarlinDeviceSupported(arch) || arch < 80 || rows < 1 ||
+        weight.dataType != fastllm::DataType::FP8_E4M3 || weight.IsRepacked || weight.isFake ||
+        weight.blockM != 32 || weight.blockK != 32 ||
+        inner <= 0 || columns <= 0 || inner % 64 || columns % 64 ||
+        (columns % 128 && inner % 128) || !weight.cudaData ||
+        HasFp8MarlinOnDevice(weight)) return false;
+    if (weight.extraCudaData.size() <= locksIndex || !weight.extraCudaData[packedIndex]) {
+        cudaStreamCaptureStatus capture;
+        if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+            capture != cudaStreamCaptureStatusNone) return false;
+        const int groups = inner / 32;
+        if (weight.scales.size() != (size_t)(columns / 32) * groups) return false;
+        std::vector<uint8_t> exponents(weight.scales.size());
+        for (size_t i = 0; i < exponents.size(); ++i) {
+            int exponent = 0;
+            const float mantissa = std::frexp(weight.scales[i], &exponent);
+            // Only lossless E8M0 scales are eligible. Other scales retain the
+            // generic FP32-scale implementation and the original weight bytes.
+            if (mantissa != 0.5f || exponent < -118 || exponent > 120) return false;
+            exponents[i] = uint8_t(exponent - 1 + 127);
+        }
+        std::vector<uint8_t> scales((size_t)columns * groups);
+        constexpr int processPerm[4] = {0, 2, 1, 3};
+        for (size_t i = 0; i < scales.size(); ++i) {
+            int pos = int(i & 63);
+            int after = (pos & ~3) + processPerm[pos & 3];
+            size_t flat = (i & ~size_t(63)) + (after >> 3) + 8 * (after & 7);
+            size_t group = flat / columns, row = flat % columns;
+            scales[i] = exponents[(row / 32) * groups + group];
+        }
+        int device = 0, sms = 0;
+        cudaGetDevice(&device);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+        const size_t bytes = (size_t)inner * columns;
+        auto *packed = (uint32_t *)FastllmCudaDirectMalloc(bytes);
+        auto *deviceScales = (uint8_t *)FastllmCudaDirectMalloc(scales.size());
+        auto *locks = (int *)FastllmCudaDirectMalloc((size_t)std::max(1, sms * 4) * sizeof(int));
+        auto *temporary = (uint32_t *)FastllmCudaMalloc(bytes);
+        bool ok = packed && deviceScales && locks && temporary && !FastllmCudaGetThreadError();
+        if (ok) {
+            FastllmCudaCopyFromHostToDevice(deviceScales, scales.data(), scales.size());
+            FastllmCudaMemset0(locks, (size_t)std::max(1, sms * 4) * sizeof(int));
+            FastllmFp8PackToGptqKernel<<<(bytes / 4 + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                (const uint8_t *)weight.cudaData, temporary, columns, inner);
+            ok = cudaPeekAtLastError() == cudaSuccess &&
+                FastllmCudaGptqMarlinRepackBits(temporary, packed, inner, columns, 8);
+            ok = cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess && ok;
+        }
+        if (temporary) FastllmCudaForceFree(temporary);
+        if (!ok) {
+            if (packed) FastllmCudaDirectFree(packed);
+            if (deviceScales) FastllmCudaDirectFree(deviceScales);
+            if (locks) FastllmCudaDirectFree(locks);
+            FastllmCudaClearThreadError();
+            return false;
+        }
+        if (weight.extraCudaData.size() <= locksIndex)
+            weight.extraCudaData.resize(locksIndex + 1, nullptr);
+        weight.extraCudaData[packedIndex] = packed;
+        weight.extraCudaData[scalesIndex] = deviceScales;
+        weight.extraCudaData[locksIndex] = locks;
+        auto &registry = BFloatFp8Registry();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        registry.weights[&weight] = {device, packed, deviceScales, locks, nullptr, 0};
+    }
+    return FastllmCudaMarlinBFloat16MXFP8Gemm(input,
+        (const uint32_t *)weight.extraCudaData[packedIndex],
+        (const uint8_t *)weight.extraCudaData[scalesIndex], output,
+        rows, columns, inner, (int *)weight.extraCudaData[locksIndex]);
+}
+
+
+extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {
+    if (weight.isFake) return;
+    auto &registry = BFloatFp8Registry();
+    BFloatFp8Auxiliary owned;
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto it = registry.weights.find(&weight);
+        if (it == registry.weights.end()) return;
+        owned = it->second;
+        registry.dequantizedBytes[owned.device] -= owned.dequantizedBytes;
+        registry.weights.erase(it);
+    }
+    const int previous = FastllmCudaGetDevice();
+    FastllmCudaSetDevice(owned.device);
+    void *pointers[] = {owned.packed, owned.scales, owned.locks, owned.dequantized};
+    for (int i = 0; i < 4; ++i) {
+        if (pointers[i]) FastllmCudaDirectFree(pointers[i]);
+        if (weight.extraCudaData.size() > size_t(i + 4) && weight.extraCudaData[i + 4] == pointers[i])
+            weight.extraCudaData[i + 4] = nullptr;
+    }
+    FastllmCudaSetDevice(previous);
+}
+
+extern "C" void FastllmCudaCacheBFloat16FP8Weight(fastllm::Data &weight,
+                                                const void *dequantized, size_t bytes) {
+    // The large-M cuBLAS path can reuse an exact BF16 materialization. Bound
+    // the cache, retain KV headroom, and never allocate while capturing a graph.
+    constexpr size_t maxWeight = size_t(64) << 20, maxDevice = size_t(4) << 30;
+    if (!dequantized || !bytes || bytes > maxWeight || weight.isFake ||
+        weight.extraCudaData.size() < 7 || !weight.extraCudaData[4] ||
+        (weight.extraCudaData.size() > 7 && weight.extraCudaData[7]) ||
+        FastllmCudaGraphIsCapturingFast()) return;
+    auto &registry = BFloatFp8Registry();
+    const int device = FastllmCudaGetDevice();
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto it = registry.weights.find(&weight);
+        if (it == registry.weights.end() || it->second.device != device ||
+            it->second.dequantizedBytes || registry.dequantizedBytes[device] + bytes > maxDevice) return;
+        it->second.dequantizedBytes = bytes;
+        registry.dequantizedBytes[device] += bytes;
+    }
+    size_t available = 0, total = 0;
+    void *cached = nullptr;
+    bool ok = cudaMemGetInfo(&available, &total) == cudaSuccess &&
+        available >= bytes + (size_t(8) << 30) &&
+        FastllmCudaTryDirectMalloc(&cached, bytes) == FASTLLM_CUDA_TRY_MALLOC_SUCCESS;
+    if (ok) {
+        ok = cudaMemcpyAsync(cached, dequantized, bytes, cudaMemcpyDeviceToDevice,
+                             cudaStreamPerThread) == cudaSuccess;
+        // Publish only after the copy completes, also permitting later use on
+        // another stream. This executes once during eager warmup, never replay.
+        ok = cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess && ok;
+    }
+    if (!ok) {
+        if (cached) FastllmCudaDirectFree(cached);
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        registry.dequantizedBytes[device] -= bytes;
+        registry.weights.at(&weight).dequantizedBytes = 0;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto &owned = registry.weights.at(&weight);
+        owned.dequantized = cached;
+        owned.dequantizedBytes = bytes;
+        if (weight.extraCudaData.size() <= 7) weight.extraCudaData.resize(8, nullptr);
+        weight.extraCudaData[7] = cached;
+    }
 }

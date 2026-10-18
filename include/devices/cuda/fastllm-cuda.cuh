@@ -357,6 +357,11 @@ bool FastllmCudaMarlinHalfFP8Gemm(const void *a, const uint32_t *b_q_weight,
                                   const void *b_scales, void *c,
                                   int size_m, int size_n, int size_k,
                                   int group_size, int *workspace);
+// SM80+ BF16 / E4M3 / E8M0 block-32; preserves generic row-major weights.
+bool FastllmCudaMarlinBFloat16MXFP8Gemm(const void *a, const uint32_t *weight,
+    const uint8_t *scales, void *c, int rows, int columns, int inner, int *workspace);
+bool FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(const void *input,
+    fastllm::Data &weight, void *output, int rows, int inner, int columns);
 // SM75+ weight-only NVFP4 Marlin (W4A16, group size 16).  SM75 selects the
 // two-stage Turing specialization; SM80+ selects the four-stage kernel.
 // Small-batch residual epilogue: same Marlin FP32 reduction, no temporary output.

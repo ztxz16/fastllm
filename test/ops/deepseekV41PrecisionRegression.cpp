@@ -8,6 +8,8 @@
 #include "models/deepseekv41.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cpu/cpudevice.h"
+#include "devices/cuda/cudadevice.h"
 #endif
 #include <algorithm>
 #include <cmath>
@@ -90,7 +92,9 @@ static void Quant(std::vector<float> &values, int block) {
 static void Activation(bool cuda) {
     ApplyDeviceMap({{"cpu", 1}}, 0, 1);
     for (DataType dtype : {DataType::FLOAT32, DataType::FLOAT16, DataType::BFLOAT16}) {
-        for (int rows : {1, 5, 33}) {
+        const std::vector<int> rowsToCheck = dtype == DataType::BFLOAT16 ?
+            std::vector<int>{1, 5, 33, 2047, 2048, 2049} : std::vector<int>{1, 5, 33};
+        for (int rows : rowsToCheck) {
             std::vector<float> x(rows * 128);
             for (size_t i = 0; i < x.size(); i++)
                 x[i] = std::ldexp(((int)(i * 13 % 83) - 41) / 16.0f, (int)((i / 32) % 7) - 5);
@@ -315,6 +319,38 @@ static void MixedMoe(bool numa = false) {
                 }
             }
 }
+#ifdef USE_CUDA
+static void NativeFp8ScaleRange() {
+    ApplyDeviceMap({{"cuda", 1}}, 0, 1);
+    constexpr int dim = 256, channels = 32;
+    for (int rows : {1, 2, 3, 4, 5, 6, 7, 8, 11, 31, 32, 33}) {
+        for (int scaleExponent : {-16, -12, -8, 0, 12}) {
+            Data weight(DataType::FP8_E4M3, {channels, dim});
+            weight.blockK = 32;
+            weight.blockM = 32;
+            weight.scales.assign(dim / 32, std::ldexp(1.0f, scaleExponent));
+            weight.Allocate();
+            std::memset(weight.cpuData, 0x21, channels * dim); // E4M3FN 0.140625
+            std::vector<float> x(rows * dim);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = Bf((1.0f + (i % 13) / 8.0f) / 1024.0f);
+            Data input(DataType::FLOAT32, {rows, dim}, x), output;
+            ToDataType(input, DataType::BFLOAT16);
+            Linear(input, weight, *GetEmptyData(), output);
+            auto actual = Read(output);
+            for (int row = 0; row < rows; ++row) {
+                double sum = 0;
+                for (int c = 0; c < dim; ++c) sum += x[row * dim + c] * 0.140625 * std::ldexp(1.0, scaleExponent);
+                for (int c = 0; c < channels; ++c) {
+                    if (actual[row * channels + c] != Bf(sum))
+                        std::cerr << "FP8 scale range rows=" << rows << " exponent=" << scaleExponent
+                                  << " actual=" << actual[row * channels + c] << " expected=" << Bf(sum) << '\n';
+                    Check(actual[row * channels + c] == Bf(sum), "FP8 GEMM lost exponent range in intermediate values");
+                }
+            }
+        }
+    }
+}
+#endif
 static void NVFP4TokenReuseOrder() {
     if (V41ReferenceMathEnabled()) return;
     for (auto shape : std::vector<std::pair<int,int>>{{32,19},{96,37},{5120,129},{2304,267}})
@@ -729,6 +765,7 @@ int main(int argc, char **argv) {
             ParallelReferenceBoundary();
             SharedSwigluBoundary();
             HcDecodeOrder();
+            NativeFp8ScaleRange();
         }
 #endif
         ReferenceFp8BlockBoundary();

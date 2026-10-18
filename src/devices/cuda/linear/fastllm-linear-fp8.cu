@@ -6,6 +6,7 @@
 //
 
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "fastllm.h"
 #include "devices/cuda/fastllm-cuda-fp8.h"
 #include "devices/cuda/fastllm-awq-sm70.cuh"
@@ -2040,6 +2041,9 @@ bool FastllmCudaHalfMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data
 }
 
 // ==================== BFloat16 x FP8_E4M3 ====================
+// Restore the E4M3 exponent before multiplying the activation/block scale.
+// Deferring the 2^120 correction until the output loses low bits through
+// FP32 underflow (and through BF16 underflow in the cuBLAS weight staging).
 
 __global__ void FastllmCudaFP8E4M32BF16Kernel(uint8_t* a, float *scales, __nv_bfloat16 *b, int k, int m, int blockK, int blockM) {
     unsigned int tid = threadIdx.x;
@@ -2056,10 +2060,42 @@ __global__ void FastllmCudaFP8E4M32BF16Kernel(uint8_t* a, float *scales, __nv_bf
         uint16_t b2_bits = (((ori >> 16) & 0x80) << 8) | (((ori >> 16) & 0x7F) << 4);
         uint16_t b3_bits = (((ori >> 24) & 0x80) << 8) | (((ori >> 24) & 0x7F) << 4);
 
-        b[st * m + i + 0] = __float2bfloat16_rn(__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b0_bits)) * curScale);
-        b[st * m + i + 1] = __float2bfloat16_rn(__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b1_bits)) * curScale);
-        b[st * m + i + 2] = __float2bfloat16_rn(__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b2_bits)) * curScale);
-        b[st * m + i + 3] = __float2bfloat16_rn(__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b3_bits)) * curScale);
+        b[st * m + i + 0] = __float2bfloat16_rn((__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b0_bits)) * 0x1p120f) * curScale);
+        b[st * m + i + 1] = __float2bfloat16_rn((__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b1_bits)) * 0x1p120f) * curScale);
+        b[st * m + i + 2] = __float2bfloat16_rn((__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b2_bits)) * 0x1p120f) * curScale);
+        b[st * m + i + 3] = __float2bfloat16_rn((__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b3_bits)) * 0x1p120f) * curScale);
+    }
+}
+
+// Decode the same E4M3 grid without creating tiny intermediate BF16 values.
+// Normal values can be constructed directly; subnormals retain their exact
+// power-of-two grid. This helper does not require native FP8 instructions.
+__device__ __forceinline__ float FastllmFp8GridToFloat(uint32_t code) {
+    const uint32_t magnitude = code & 127u, sign = (code & 128u) << 24;
+    if (magnitude >= 8)
+        return __uint_as_float(sign | (0x3c000000u + (magnitude << 20)));
+    return __uint_as_float(__float_as_uint(float(magnitude) * 0x1p-9f) | sign);
+}
+
+// Block-32 weights use shifts for scale lookup and one vector store per four
+// outputs. Other scale layouts keep the established conversion below.
+__global__ void FastllmCudaFP8E4M32BF16Block32Kernel(
+        const uint8_t *__restrict__ input, const float *__restrict__ scales,
+        __nv_bfloat16 *__restrict__ output, int columns) {
+    const int row = blockIdx.x;
+    const float *rowScales = scales + (size_t)(row / 32) * (columns / 32);
+    for (int i = threadIdx.x * 4; i < columns; i += blockDim.x * 4) {
+        const uint32_t packed = *reinterpret_cast<const uint32_t *>(
+            input + (size_t)row * columns + i);
+        const float scale = rowScales[i / 32];
+        const __nv_bfloat16 v0 = __float2bfloat16_rn(FastllmFp8GridToFloat(packed & 255u) * scale);
+        const __nv_bfloat16 v1 = __float2bfloat16_rn(FastllmFp8GridToFloat((packed >> 8) & 255u) * scale);
+        const __nv_bfloat16 v2 = __float2bfloat16_rn(FastllmFp8GridToFloat((packed >> 16) & 255u) * scale);
+        const __nv_bfloat16 v3 = __float2bfloat16_rn(FastllmFp8GridToFloat(packed >> 24) * scale);
+        uint2 values;
+        values.x = __bfloat16_as_ushort(v0) | (uint32_t(__bfloat16_as_ushort(v1)) << 16);
+        values.y = __bfloat16_as_ushort(v2) | (uint32_t(__bfloat16_as_ushort(v3)) << 16);
+        *reinterpret_cast<uint2 *>(output + (size_t)row * columns + i) = values;
     }
 }
 
@@ -2086,7 +2122,6 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
     const int shiftK = POWER_OF_TWO_BLOCKS ? __ffs(blockK) - 1 : 0;
     int ms = POWER_OF_TWO_BLOCKS ? ((m - 1) >> shiftM) + 1
                                : (m - 1) / blockM + 1;
-    const float magicScaleConstant = exp2f(120.0f);
     scales += (POWER_OF_TWO_BLOCKS ? st >> shiftK : st / blockK) * ms;
 
     const uint8_t *baseB = (uint8_t*)B + st * m;
@@ -2096,7 +2131,7 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
         for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
             const unsigned int code = baseB[i];
             const uint16_t bits = ((code & 0x80u) << 8) | ((code & 0x7fu) << 4);
-            const float value = __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(&bits));
+            const float value = (__bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(&bits)) * 0x1p120f);
 #pragma unroll
             for (int x = 0; x < PART; ++x)
                 sdata[x][tid] += float(A[size_t(x) * m + i]) * value * scales[POWER_OF_TWO_BLOCKS ? i >> shiftM : i / blockM];
@@ -2110,10 +2145,10 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
             uint16_t b1_bits = (((bb >> 8) & 0x80) << 8) | (((bb >> 8) & 0x7F) << 4);
             uint16_t b2_bits = (((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 4);
             uint16_t b3_bits = (((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 4);
-            float bf0 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b0_bits));
-            float bf1 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b1_bits));
-            float bf2 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b2_bits));
-            float bf3 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b3_bits));
+            float bf0 = (__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b0_bits)) * 0x1p120f);
+            float bf1 = (__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b1_bits)) * 0x1p120f);
+            float bf2 = (__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b2_bits)) * 0x1p120f);
+            float bf3 = (__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b3_bits)) * 0x1p120f);
 
 #pragma unroll
             for (int x = 0; x < PART; x++) {
@@ -2165,10 +2200,10 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
         if (tid == 0) {
             if (bias == nullptr) {
 #pragma unroll
-                for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sums[x] * magicScaleConstant);
+                for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sums[x]);
             } else {
 #pragma unroll
-                for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sums[x] * magicScaleConstant + __bfloat162float(bias[st]));
+                for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sums[x] + __bfloat162float(bias[st]));
             }
         }
     } else {
@@ -2191,10 +2226,10 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
         if (tid == 0) {
             if (bias == nullptr) {
 #pragma unroll
-                for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sdata[x][0] * magicScaleConstant);
+                for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sdata[x][0]);
             } else {
 #pragma unroll
-                for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sdata[x][0] * magicScaleConstant + __bfloat162float(bias[st]));
+                for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sdata[x][0] + __bfloat162float(bias[st]));
             }
         }
     }
@@ -2243,14 +2278,14 @@ __global__ void FastllmGemvBF16FP8E4M3KernelWarpRows(
                 (((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 4);
             const uint16_t b3Bits =
                 (((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 4);
-            const float bf0 = __bfloat162float(
-                *reinterpret_cast<const __nv_bfloat16*>(&b0Bits));
-            const float bf1 = __bfloat162float(
-                *reinterpret_cast<const __nv_bfloat16*>(&b1Bits));
-            const float bf2 = __bfloat162float(
-                *reinterpret_cast<const __nv_bfloat16*>(&b2Bits));
-            const float bf3 = __bfloat162float(
-                *reinterpret_cast<const __nv_bfloat16*>(&b3Bits));
+            const float bf0 = (__bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(&b0Bits)) * 0x1p120f);
+            const float bf1 = (__bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(&b1Bits)) * 0x1p120f);
+            const float bf2 = (__bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(&b2Bits)) * 0x1p120f);
+            const float bf3 = (__bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(&b3Bits)) * 0x1p120f);
 #pragma unroll
             for (int x = 0; x < PART; x++) {
                 regA.in = *reinterpret_cast<const uint2*>(
@@ -2264,7 +2299,6 @@ __global__ void FastllmGemvBF16FP8E4M3KernelWarpRows(
         }
     }
 
-    const float magicScaleConstant = exp2f(120.0f);
 #pragma unroll
     for (int x = 0; x < PART; x++) {
         float sum = partial[0][x];
@@ -2284,7 +2318,7 @@ __global__ void FastllmGemvBF16FP8E4M3KernelWarpRows(
             }
         }
         if (laneId == 0) {
-            float result = sum * magicScaleConstant;
+            float result = sum;
             if (bias != nullptr) {
                 result += __bfloat162float(bias[st]);
             }
@@ -2317,6 +2351,12 @@ __global__ void FastllmGemvBF16FP8E4M3KernelRegisterRows(
 #pragma unroll
     for (int x = 0; x < PART; x++) partial[x] = 0.0f;
     union_bf16_4_fp8 regA;
+    // Hopper batch-one projections benefit from overlapping address/decode
+    // work across consecutive iterations. Preserve every lane's FMA order
+    // and the compensated reduction; other architectures keep the old loop.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+#pragma unroll (PART == 1 ? 4 : 1)
+#endif
     for (int i = tid * 4; i < m; i += 256) {
         const float curScale = rowScales[POWER_OF_TWO_BLOCKS ? i >> shiftM : i / blockM];
         const uint32_t bb = *(const uint32_t*)(baseB + i);
@@ -2328,14 +2368,14 @@ __global__ void FastllmGemvBF16FP8E4M3KernelRegisterRows(
             (((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 4);
         const uint16_t b3Bits =
             (((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 4);
-        const float bf0 = __bfloat162float(
-            *reinterpret_cast<const __nv_bfloat16*>(&b0Bits));
-        const float bf1 = __bfloat162float(
-            *reinterpret_cast<const __nv_bfloat16*>(&b1Bits));
-        const float bf2 = __bfloat162float(
-            *reinterpret_cast<const __nv_bfloat16*>(&b2Bits));
-        const float bf3 = __bfloat162float(
-            *reinterpret_cast<const __nv_bfloat16*>(&b3Bits));
+        const float bf0 = (__bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&b0Bits)) * 0x1p120f);
+        const float bf1 = (__bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&b1Bits)) * 0x1p120f);
+        const float bf2 = (__bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&b2Bits)) * 0x1p120f);
+        const float bf3 = (__bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&b3Bits)) * 0x1p120f);
 #pragma unroll
         for (int x = 0; x < PART; x++) {
             regA.in = *reinterpret_cast<const uint2*>(
@@ -2356,7 +2396,6 @@ __global__ void FastllmGemvBF16FP8E4M3KernelRegisterRows(
     }
     __syncthreads();
     if (tid >= 32) return;
-    const float magicScaleConstant = exp2f(120.0f);
 #pragma unroll
     for (int x = 0; x < PART; x++) {
         float sum = partial[x];
@@ -2374,7 +2413,7 @@ __global__ void FastllmGemvBF16FP8E4M3KernelRegisterRows(
             }
         }
         if (lane == 0 && outputRow < k) {
-            float result = sum * magicScaleConstant;
+            float result = sum;
             if (bias != nullptr) result += __bfloat162float(bias[st]);
             C[st + (size_t)k * x] = __float2bfloat16_rn(result);
         }
@@ -2558,6 +2597,14 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
     __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
 
+    // Measured crossover: retain GEMV for one row and cuBLAS for large M.
+    if (n > 1 && n <= 64 && bias.dims.empty() && FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(
+            cudaInput, weight, cudaOutput, n, m, k)) {
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
     // See the FP32 adapter above: this path is only needed if a caller reuses
     // an FP16-repacked weight with BF16 activations later in its lifetime.
     if (FastllmCudaFp8E4M3HasSm70Layout(weight)) {
@@ -2597,7 +2644,13 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
 
         size_t wsBytes = 0;
         bool ownScratch = false;
-        __nv_bfloat16 *cudaBF16Weight = (__nv_bfloat16 *) FastllmBorrowDequantScratch((size_t)k * m * sizeof(__nv_bfloat16), &wsBytes, &ownScratch);
+        auto *cachedWeight = weight.blockM == 32 && weight.blockK == 32 &&
+            !weight.IsRepacked && weight.extraCudaData.size() > 7 && weight.extraCudaData[4] ?
+            (__nv_bfloat16 *)weight.extraCudaData[7] : nullptr;
+        __nv_bfloat16 *cudaBF16Weight = cachedWeight;
+        if (cachedWeight) wsBytes = (size_t)k * m * sizeof(__nv_bfloat16);
+        else cudaBF16Weight = (__nv_bfloat16 *)FastllmBorrowDequantScratch(
+            (size_t)k * m * sizeof(__nv_bfloat16), &wsBytes, &ownScratch);
         size_t bytesPerRow = (size_t)m * sizeof(__nv_bfloat16);
         int blockK = weight.blockK;
         int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
@@ -2612,16 +2665,31 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
         }
         int ms = (m - 1) / weight.blockM + 1;
 
-        float h_alpha = exp2f(120.0f), h_beta = 0.0f;
+        float h_alpha = 1.0f, h_beta = 0.0f;
         cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
         cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 
         for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
             int kc = std::min(maxRowsPerChunk, k - kOff);
-            FastllmCudaFP8E4M32BF16Kernel <<< kc, 256 >>>(
-                (uint8_t*)weight.cudaData + (size_t)kOff * m,
-                cudaScales + (size_t)(kOff / blockK) * ms,
-                cudaBF16Weight, kc, m, weight.blockK, weight.blockM);
+            const auto *weightChunk = (const uint8_t *)weight.cudaData + (size_t)kOff * m;
+            auto *scaleChunk = cudaScales + (size_t)(kOff / blockK) * ms;
+            if (cachedWeight) {
+                // The copy was produced by the identical dequantization kernel.
+            } else if (weight.blockK == 32 && weight.blockM == 32 && m % 32 == 0 &&
+                reinterpret_cast<uintptr_t>(weightChunk) % alignof(uint32_t) == 0 &&
+                reinterpret_cast<uintptr_t>(cudaBF16Weight) % alignof(uint2) == 0) {
+                const int threads = m >= 4096 ? 256 : 128;
+                FastllmCudaFP8E4M32BF16Block32Kernel<<<kc, threads>>>(
+                    weightChunk, scaleChunk, cudaBF16Weight, m);
+            } else {
+                FastllmCudaFP8E4M32BF16Kernel<<<kc, 256>>>(
+                    (uint8_t *)weightChunk, scaleChunk, cudaBF16Weight,
+                    kc, m, weight.blockK, weight.blockM);
+            }
+
+            if (!cachedWeight && n > 64 && n <= 256 && kc == k)
+                FastllmCudaCacheBFloat16FP8Weight(weight, cudaBF16Weight,
+                    (size_t)k * m * sizeof(__nv_bfloat16));
 
             status = cublasGemmEx(fastllmCublasHandle,
                                     CUBLAS_OP_T, CUBLAS_OP_N,
@@ -2643,7 +2711,7 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
             FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBF16Bias, k);
         }
 
-        FastllmReleaseDequantScratch(cudaBF16Weight, ownScratch);
+        if (!cachedWeight) FastllmReleaseDequantScratch(cudaBF16Weight, ownScratch);
     } else {
         LaunchFastllmGemmBF16FP8E4M3(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBF16Bias, cudaScales, n, m, k, weight.blockM, weight.blockK);
     }

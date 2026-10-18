@@ -6,6 +6,9 @@
 
 #include "fastllm.h"
 #include "kvmem.h"
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+#include "devices/cuda/fastllm-fp8-auxiliary.h"
+#endif
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda-native-prefill.h"
 #endif
@@ -1186,6 +1189,11 @@ namespace fastllm {
 
     void Data::CopyFrom(const Data &ori) {
         if (this == &ori) return;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (!this->isFake && this->extraCudaData.size() >= 7)
+            FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
+#endif
+
         if (ori.kvMemConfig || kvMemConfig) {
             throw std::runtime_error("KVMem cache snapshots require an explicit backend implementation");
         }
@@ -2312,6 +2320,11 @@ namespace fastllm {
         if (isFake)
             return;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (!this->isFake && this->extraCudaData.size() >= 7)
+            FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
+#endif
+
+#if defined(USE_CUDA) && !defined(USE_ROCM)
         if (this->dataType == DataType::DATA_GGUF_FORMAT) {
             FastllmCudaReleaseMoeGGUFResident(this);
         }
@@ -2520,6 +2533,10 @@ namespace fastllm {
         if (isFake) {
             return;
         }
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (!this->isFake && this->extraCudaData.size() >= 7)
+            FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
+#endif
         if (!this->kvMemCache && this->isPagedKVCache && !this->pageIndex.empty()) {
             this->pagedKVCacheData->ReleasePageIndices(this->pageIndex);
         }
@@ -2890,6 +2907,11 @@ namespace fastllm {
         if (alreadyOnTarget) {
             return;
         }
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (!this->isFake && this->extraCudaData.size() >= 7)
+            FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
+#endif
+
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         if (this->dataType == DataType::DATA_GGUF_FORMAT) {
             FastllmCudaReleaseMoeGGUFResident(this);
