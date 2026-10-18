@@ -22,6 +22,7 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-v41-engram.h"
 #include "deepseekv41-reference.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
@@ -837,7 +838,15 @@ namespace fastllm {
             void *mmapScale = nullptr;
             size_t mmapScaleLen = 0;
 
+#ifdef USE_CUDA
+            void *gpuTable = nullptr;
+            std::vector<int> gpuDevices;
+#endif
+
             ~V41EngramTable() {
+#ifdef USE_CUDA
+                FastllmCudaV41FreeEngram(gpuTable);
+#endif
 #if !defined(_WIN32) && !defined(_WIN64)
                 if (mmapData != nullptr) {
                     munmap(mmapData, mmapDataLen);
@@ -1599,6 +1608,22 @@ namespace fastllm {
                 V41MadviseRandom(table->data, weightInfo.bytes);
                 V41MadviseRandom(table->scale, scaleInfo.bytes);
             }
+#ifdef USE_CUDA
+            if (this->ngramDevice == "cuda") {
+                // Weight loading precedes the first forward, so the executor's
+                // TP device list may not have been initialized yet.
+                ApplyDeviceMap(this->deviceMap, 1, block_cnt);
+                table->gpuDevices = V41TpDevices(this->deviceMap);
+                if (!table->gpuDevices.empty()) {
+                    table->gpuTable = FastllmCudaV41CreateEngram(table->gpuDevices,
+                        table->data, table->scale, table->rows, table->dim, table->scaleBlock);
+                }
+                printf("[Fastllm] DeepSeek-V4.1: layer %d Engram %s.\n", layer,
+                    table->gpuTable ? "sharded GPU table ready" :
+                    "using CPU fallback (GPU topology or capacity unavailable)");
+                fflush(stdout);
+            }
+#endif
             engramTables.push_back(std::static_pointer_cast<void>(table));
         }
         printf("[Fastllm] DeepSeek-V4.1: engram tables ready.\n");
@@ -1708,6 +1733,9 @@ namespace fastllm {
         // 把要用到的表行摸一遍（每 64 字节一次），把页表项与 cache line 提前拉进来。
         // 常驻表超过缓存预算或使用磁盘 Embedding 时，后台只计算行号。
         void V41TouchEngramRows(const V41EngramTable &table, const std::vector<int64_t> &rows) {
+#ifdef USE_CUDA
+            if (table.gpuTable) return;
+#endif
             const uint64_t budget = 32ULL << 20;
             if (table.diskWeight != nullptr || rows.size() * (uint64_t)table.dim > budget) {
                 return;
@@ -1787,6 +1815,25 @@ namespace fastllm {
         const int dim = table.dim;
         const int scaleCols = dim / table.scaleBlock;
         double prepStart = V41Profiler().level > 0 ? V41NowMs() : 0.0;
+#ifdef USE_CUDA
+        if (table.gpuTable && rows.size() <= 1024 * 1024) {
+            V41ResetMultiDevice(output);
+            output = Data(DataType::BFLOAT16, {1, tokens, cols * dim});
+            output.dataDevice = DataDevice::CUDA;
+            output.dataDeviceIds = table.gpuDevices;
+            PrepareMultiCudaReplicatedData(output, table.gpuDevices, false);
+            const bool dispatched = MultiCudaRunDeviceCallbacks(table.gpuDevices, [&](int, int device) {
+                Data &local = *output.multiDeviceDatas.at(device);
+                local.Allocate(false);
+                AssertInFastLLM(FastllmCudaV41GatherEngram(table.gpuTable, rows, local),
+                    "DeepSeekV41: GPU Engram gather failed.");
+            });
+            AssertInFastLLM(dispatched, "DeepSeekV41: GPU Engram dispatch failed.");
+            V41SyncRootFromReplica(output, table.gpuDevices);
+            if (prepMs) *prepMs = 0;
+            return;
+        }
+#endif
         output.ToDevice(DataDevice::CPU);
         output = Data(DataType::BFLOAT16, {1, tokens, cols * dim});
         output.Allocate(false);
@@ -1977,8 +2024,13 @@ namespace fastllm {
         const bool tp = !tpDevices.empty();
         Data kv;
 #ifdef USE_CUDA
-        if (tp) {
-            PrepareMultiCudaReplicatedData(gathered, tpDevices, true);
+        if (tp && !gathered.multiDeviceData) {
+            // Large CPU Engram rows need one PCIe upload, not one complete
+            // host copy/upload per rank. NCCL preserves the original BF16 bits.
+            if (gathered.GetBytes() < 1024 * 1024 ||
+                !MultiCudaBroadcastCpuActivation(gathered, tpDevices)) {
+                PrepareMultiCudaReplicatedData(gathered, tpDevices, true);
+            }
         }
 #endif
         LinearWithActivationQuant(gathered, pre + ".wkv.weight", kv, tp);

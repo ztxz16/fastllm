@@ -5975,8 +5975,8 @@ namespace fastllm {
         std::string normalized = device;
         std::transform(normalized.begin(), normalized.end(), normalized.begin(),
                        [](unsigned char c) { return (char)std::tolower(c); });
-        AssertInFastLLM(normalized == "cpu" || normalized == "disk",
-                        "ngram device should be cpu or disk.\n");
+        AssertInFastLLM(normalized == "cpu" || normalized == "disk" || normalized == "cuda",
+                        "ngram device should be cpu, disk or cuda.\n");
         defaultNgramDevice = normalized;
     }
 

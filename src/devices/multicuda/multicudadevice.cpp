@@ -4419,6 +4419,42 @@ namespace fastllm {
         return true;
     }
 
+    bool MultiCudaBroadcastCpuActivation(Data &input, const std::vector<int> &devices) {
+        if (currentMultiCudaDedicatedWorker != nullptr || devices.size() < 2 ||
+            input.dataDevice != DataDevice::CPU || !input.cpuData || input.multiDeviceData ||
+            !IsCompactV41Activation(input) || input.Count(0) == 0 ||
+            input.Count(0) > std::numeric_limits<int>::max()) return false;
+        std::set<int> seen;
+        for (int device : devices) {
+            std::string specialId;
+            int mallocType = 0;
+            DeviceGetInfos(device, specialId, mallocType);
+            if (!specialId.empty() || mallocType == 0 || !seen.insert(device).second) return false;
+        }
+        if (!FastllmInitNccl(devices)) return false;
+        const int previousDevice = FastllmCudaGetDevice();
+        const int root = devices.front();
+        // Keep the original host allocation alive through its synchronous
+        // pageable-memory upload. The normal worker handoff orders the root
+        // stream's copy before NCCL; all consumers retain that same ordering.
+        PrepareMultiCudaReplicatedData(input, devices, false);
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            input.multiDeviceDatas.at(device)->Allocate(false);
+        }
+        FastllmCudaSetDevice(root);
+        FastllmCudaCopyFromHostToDevice(input.multiDeviceDatas.at(root)->cudaData,
+                                       input.cpuData, input.GetBytes());
+        const bool launched = MultiCudaRunDeviceCallbacks(devices, [&](int, int device) {
+            Data &local = *input.multiDeviceDatas.at(device);
+            FastllmNcclBroadcastFrom(local.cudaData, local.cudaData,
+                (int)local.Count(0), local.dataType, root, device);
+        });
+        FastllmCudaSetDevice(previousDevice);
+        AssertInFastLLM(launched, "MultiCuda CPU activation broadcast failed.");
+        return true;
+    }
+
     bool MultiCudaCopyReplicaToCpu(Data &dst, const Data &src,
                                     const std::vector<int> &devices) {
         // Do not move or release the source: CUDA Graphs retain its address.

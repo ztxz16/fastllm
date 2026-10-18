@@ -470,6 +470,7 @@ if (USE_CUDA)
         src/devices/cuda/models/naive-n05-experts.cu
         src/devices/cuda/models/deepseekv4-kernels.cu
         src/devices/cuda/models/deepseekv41-kernels.cu
+        src/devices/cuda/models/deepseekv41-engram.cu
         src/devices/cuda/models/deepseekv41-reference.cu
         src/devices/cuda/models/deepseekv41-dspark-kernels.cu
         src/devices/cuda/models/qwen4-kernels.cu)
@@ -1318,6 +1319,12 @@ if (UNIT_TEST)
         add_test(NAME deepseekV41DecodeOptimization COMMAND deepseekV41DecodeOptimizationRegression)
         set_tests_properties(deepseekV41DecodeOptimization PROPERTIES LABELS cuda TIMEOUT 300 SKIP_RETURN_CODE 77)
         if (NOT USE_ROCM)
+            add_executable(deepseekV41EngramRegression test/ops/deepseekV41EngramRegression.cpp)
+            target_link_libraries(deepseekV41EngramRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41EngramRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(deepseekV41Engram deepseekV41EngramRegression
+                "PASS Engram sharded gather" 300)
+            set_tests_properties(deepseekV41Engram PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_executable(fp8BFloat16CacheRegression test/ops/fp8BFloat16CacheRegression.cpp)
             target_link_libraries(fp8BFloat16CacheRegression PRIVATE fastllm)
             target_include_directories(fp8BFloat16CacheRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

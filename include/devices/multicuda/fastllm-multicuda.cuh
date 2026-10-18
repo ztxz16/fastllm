@@ -150,7 +150,12 @@ bool FastllmMultiCudaMatMul(const fastllm::Data &input, fastllm::Data &weight, c
 }
 #endif
 
+struct FastllmCudaV41AttentionRequest;
+
 namespace fastllm {
+    // Upload a compact CPU activation once, then broadcast it to TP ranks.
+    // Unsupported layouts/devices return false before changing the input.
+    bool MultiCudaBroadcastCpuActivation(Data &input, const std::vector<int> &devices);
     // Retire EP caches keyed by a routed-expert Data object before the object's
     // address can be reused by a subsequently loaded model.
     void MultiCudaReleaseMoeWeightCaches(const Data *layerKey);
