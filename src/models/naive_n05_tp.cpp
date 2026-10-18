@@ -559,7 +559,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
 #endif
 }
 
-bool NaiveN05FlashModel::CanReuseTensorParallelServingCache(const TargetBatch *batch) const {
+bool NaiveN05FlashModel::CanReuseTensorParallelServingCache(const TargetBatch *batch, bool checkCapacity) const {
 #ifdef USE_CUDA
     // Only the owned scheduler promises that descriptors cannot be mutated
     // behind this plan. Direct Forward callers always validate every tensor.
@@ -571,7 +571,8 @@ bool NaiveN05FlashModel::CanReuseTensorParallelServingCache(const TargetBatch *b
     for (int row = 0; row < batch->Size(); ++row) {
         const Data &root = batch->Key(row, 0);
         if (&root != s.requests[row] || root.dims.size() != 3 ||
-            root.dims[1] != s.expectedLengths[row] || root.dims[1] >= s.capacityLimits[row]) return false;
+            root.dims[1] != s.expectedLengths[row] ||
+            (checkCapacity && root.dims[1] >= s.capacityLimits[row])) return false;
     }
     return true;
 #else
@@ -1226,6 +1227,43 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         tpWorkers.Run(tpDevices, task, errors);
         for (auto error : errors) if (error) std::rethrow_exception(error);
     };
+    if (!tpPagedCaches.empty() && CanReuseTensorParallelServingCache(batch, false)) {
+        auto &serving = *tpServingState;
+        std::vector<int> growing;
+        for (int row = 0; row < sequences; ++row) {
+            const int past = key(row, 0).dims[1];
+            // A full SWA ring is stable. Only the physical page lists need
+            // extending at this boundary; tensor/table addresses stay fixed.
+            if (past >= serving.capacityLimits[row] && past >= window) growing.push_back(row);
+        }
+        if (!growing.empty()) {
+            std::vector<uint64_t> changes(tpDevices.size(), 0);
+            std::vector<std::vector<int>> limits(tpDevices.size(), std::vector<int>(growing.size(), INT_MAX));
+            runRanks([&](int rank) {
+                FastllmCudaSetDevice(tpDevices[rank]);
+                for (size_t i = 0; i < growing.size(); ++i) {
+                    const int row = growing[i], next = key(row, 0).dims[1] + 1;
+                    for (int layer = 0; layer < block_cnt; ++layer) if (!slidingLayers[layer])
+                    for (int part = 0; part < 2; ++part) {
+                        Data &root = part ? value(row, layer) : key(row, layer);
+                        Data &local = *root.multiDeviceDatas.at(tpDevices[rank]);
+                        changes[rank] += PreparePagedCache(local,
+                            *tpPagedCaches[rank][layer * 2 + part], next);
+                        limits[rank][i] = std::min(limits[rank][i],
+                            (int)local.pageIndex.size() * local.pageLen);
+                    }
+                }
+            });
+            for (size_t i = 0; i < growing.size(); ++i) {
+                int limit = INT_MAX;
+                for (const auto &rankLimits : limits) limit = std::min(limit, rankLimits[i]);
+                serving.capacityLimits[growing[i]] = limit;
+            }
+            // Account only for our own page updates. Any concurrent request
+            // lifecycle invalidation must still fail the epoch check below.
+            for (auto count : changes) serving.cacheEpoch += count;
+        }
+    }
     const bool reuseServingCache = CanReuseTensorParallelServingCache(batch);
     if (!reuseServingCache)
     for (int sequence = 0; sequence < sequences; ++sequence)

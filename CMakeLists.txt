@@ -1777,6 +1777,11 @@ if (UNIT_TEST)
                 set_tests_properties(naive_n05_kv_pool_churn_${NAIVE_KV_TYPE} PROPERTIES
                     LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
                     PASS_REGULAR_EXPRESSION "KV CHURN PASS")
+                add_test(NAME naive_n05_serving_page_growth_${NAIVE_KV_TYPE}
+                    COMMAND naive_n05_verify_graph_test 2 serving_page_growth ${NAIVE_KV_TYPE})
+                set_tests_properties(naive_n05_serving_page_growth_${NAIVE_KV_TYPE} PROPERTIES
+                    LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                    PASS_REGULAR_EXPRESSION "SERVING PAGE GROWTH PASS")
             endforeach()
             foreach(NAIVE_RING_INITIAL_MODE eager graph)
                 add_test(NAME naive_n05_swa_ring_toggle_${NAIVE_RING_INITIAL_MODE}

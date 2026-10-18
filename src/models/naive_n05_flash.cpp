@@ -150,7 +150,7 @@ void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width) {
     cache.Expansion({1, capacity, width});
 }
 
-void NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manager, int end) {
+bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manager, int end) {
 #ifdef USE_CUDA
     const int width = manager.dims[3], capacity = std::min(max_positions,
         std::min(tokensLimit > 0 ? tokensLimit : INT_MAX, manager.maxPages * manager.pageLen));
@@ -209,6 +209,9 @@ void NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
         tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
     }
     cache.lastPageLen = previous ? (previous - 1) % cache.pageLen + 1 : 0;
+    return changed;
+#else
+    return false;
 #endif
 }
 
