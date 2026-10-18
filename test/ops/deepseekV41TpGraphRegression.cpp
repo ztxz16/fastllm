@@ -1,7 +1,8 @@
-// Run with test/basic/test_deepseek_v41_tp_graph.py (--tp-size 2/4/8).
+// Run with test/basic/test_deepseek_v41_tp_graph.py (--tp-size 1/2/4/8).
 #include "model.h"
 #include "models/deepseekv41.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdlib>
@@ -169,13 +170,12 @@ int main(int argc, char **argv) {
         }
         if (int(expertCache) + int(gpuExperts) + int(diskExperts) > 1)
             throw std::runtime_error("expert backend options are mutually exclusive");
-        if ((tpSize != 1 && tpSize != 2 && tpSize != 4 && tpSize != 8) ||
-            (tpSize == 1 && logitsOnly.empty()))
-            throw std::runtime_error("TP size must be 2, 4 or 8 (1 requires --logits-only)");
+        if (tpSize != 1 && tpSize != 2 && tpSize != 4 && tpSize != 8)
+            throw std::runtime_error("device count must be 1, 2, 4 or 8");
         if (devices < tpSize) return 77;
         std::string mainDevice = tpSize == 1 ? "cuda:0" : "multicuda:";
         for (int i = 0; i < tpSize; ++i) {
-            tpDevices.push_back(i);
+            if (tpSize > 1) tpDevices.push_back(i);
             if (tpSize > 1) mainDevice += (i ? "," : "") + std::to_string(i);
         }
         setenv("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP", "1", 1);
@@ -234,14 +234,29 @@ int main(int argc, char **argv) {
         unsetenv("FASTLLM_DSV41_DISABLE_TP_VERIFY_ASYNC");
         Compare(verifyEight, RunDsparkRequests(model, 8));
         auto *workspace = (model.*(&Access::v41TpVerifyWorkspace)).get();
-        if (!workspace) throw std::runtime_error("asynchronous verifier was not exercised");
+        if (tpSize > 1 && !workspace) throw std::runtime_error("asynchronous verifier was not exercised");
         Compare(verifyEight, RunDsparkRequests(model, 8));
         if ((model.*(&Access::v41TpVerifyWorkspace)).get() != workspace)
             throw std::runtime_error("verifier workspace was not reused");
-        std::cout << "PASS: synchronous/asynchronous TP verification 1..8, features and rollback match across requests\n";
+        std::cout << "PASS: eager verification 1..8, features and rollback match across requests\n";
         if (eagerOnly) return 0;
         SetCudaGraph(true);
+        uint64_t cacheBefore[8] = {}, cacheAfter[8] = {};
+        if (expertCache && tpSize == 1 && !fastllm_moe_cuda_cache_route_stats(0, cacheBefore))
+            throw std::runtime_error("cannot read cache counters before graph verification");
         Compare(verifyEight, RunDsparkRequests(model));
+        if (expertCache && tpSize == 1) {
+            if (!fastllm_moe_cuda_cache_route_stats(0, cacheAfter))
+                throw std::runtime_error("cannot read cache counters after graph verification");
+            // 196 steps, top-2: even counting every step as
+            // ordinary decode cannot account for verification's route count.
+            const uint64_t decodeUpperBound = 4 * (8 * 6 + 1) * model.block_cnt * 2;
+            if (cacheAfter[1] - cacheBefore[1] <= decodeUpperBound ||
+                cacheAfter[4] - cacheBefore[4] <= decodeUpperBound)
+                throw std::runtime_error("graph verification bypassed the expert cache");
+            std::cout << "PASS: graph verification cache routes=" << cacheAfter[1] - cacheBefore[1]
+                      << " GPU routes=" << cacheAfter[4] - cacheBefore[4] << '\n';
+        }
         const size_t expectedGraphShapes = diskExperts ? 0 : 8;
         if ((model.*(&Access::v41CudaGraphSlots)).size() != expectedGraphShapes)
             throw std::runtime_error("unexpected DSpark graph shapes or disk graph fallback");
@@ -249,6 +264,18 @@ int main(int argc, char **argv) {
         Compare(verifyEight, RunDsparkRequests(model));
         SetCudaGraph(true);
         Compare(verifyEight, RunDsparkRequests(model));
+        if (expertCache && tpSize == 1) {
+            // A cold/unprofitable cache falls back to NUMA. Switching back
+            // to resident GPU experts must preserve every captured buffer.
+            setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", "0", 1);
+            SetCudaGraph(false);
+            const auto cpuVerify = RunDsparkRequests(model);
+            SetCudaGraph(true);
+            Compare(cpuVerify, RunDsparkRequests(model));
+            setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", "2", 1);
+            Compare(verifyEight, RunDsparkRequests(model));
+            std::cout << "PASS: graph verification survives NUMA fallback and resident cache transitions\n";
+        }
         if (diskExperts) {
             std::cout << "PASS: disk experts preserve eager results with CUDA Graph requested, including verification and rollback\n";
         } else {

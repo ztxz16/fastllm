@@ -56,12 +56,13 @@ CUDA/NUMA 混推在有专家显存缓存时，默认让 prefill 和 decode 复�
 
 排查或对照测试可设置 `FASTLLM_MOE_PREFILL_CACHE=0`，同时旁路 prefill 的驻留调度、缓存读取和写入，不关闭 decode 缓存；正常运行无需设置。在两次请求之间读取 `ftllm.llm.get_moe_cuda_cache_prefill_stats(device=0)` 并相减，可得到共享原生路径的调用数、GPU 专家/路由数、命中专家/路由数、避免上传的字节数、实际上传字节数和新写入专家数。统计读取会同步 GPU，不能放入吞吐计时区间；不包含独立 grouped GGUF 后端，GPU 内部布局还原也不计入上传字节。
 
-
 ## DeepSeek 混推的分块预填充与校验
 
 启用 `--fast_prefill` 后，DeepSeek-V4.1 对满足 bounded replay 条件的单请求分块预填充，只在最后一块执行后段 SWA 层与输出头；前面的块更新长期 KV。末块不超过 SWA 窗口、增量续写、图像输入或 DSpark 等情况沿用原路径。该优化沿用 `fast_prefill` 的近似注意力语义，普通启动不会额外启用它。
 
 `FASTLLM_DSV41_HYBRID_PP=1` 显式启用混推跨块流水线，默认关闭。它要求 CUDA PP 层放置、NUMA 专家、`fast_prefill`、单请求 greedy，以及各级独立拥有其使用的共享 KV/index 来源；例如已验证的双卡 `--device cudapp=14:26 --tp off`。专家显存缓存、DSpark、历史复用或不兼容的层切分等情况会沿用普通路径。该入口不用于纯 GPU 或 TP 执行。
+
+DeepSeek-V4.1 原生 FP8/NVFP4 专家缓存随 `--moe_cuda_cache` 启用，不需要额外的频率策略开关。单卡 DSpark 的 2～8 token 校验在 Graph 开启时也使用现有缓存和动态分流，保持图段的缓冲地址；无可用 GPU 专家时保留 NUMA 回退。`get_moe_cuda_cache_route_stats` 同时统计普通解码与校验的路由，需在请求结束后读取。当前 `--auto` 仍不对 DSpark 做容量规划，使用显式参数启动；Graph 的默认开关与原有配置方式保持不变。
 
 ## DeepSeek FP8 WoA 的通用 prefill GEMM
 
@@ -83,7 +84,6 @@ SM120 上仍保留原有 WoA 输入 E4M3/UE8M0 量化。行宽能被 128 整除�
 - `FASTLLM_DSV4_DEBUG_CUDA_WOA_GEMM=1`：输出命中形状及 cuBLAS 拒绝状态。
 
 构建 `deepseekV4WoAGemmRegression` 后运行可检查 FP64 独立参考、小批量回退、奇数维度、矩形量化块、输入范围、输入量化和真实投影形状；附加 `--bench` 输出SIMT 回退与自动 GEMM 路径的含同步交替测速中位数。旧架构验证需使用对应的 `compute_75/80/89` 编译 WoA 并测试对应能力分支；在新 GPU 上 JIT 执行旧 PTX 只能验证兼容路径，不能代表旧 GPU 的实际吞吐，也不能替代完整模型在旧 GPU 上的部署验证。
-
 
 ## 逐项自动预算
 

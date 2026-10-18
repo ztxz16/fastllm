@@ -102,7 +102,14 @@ namespace fastllm {
         bool tpCacheHandled = false;
         bool singleCacheHandled = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        if (step && *step && hasSharedExpertOut &&
+        // Verification runs between graph segments too. Use the same stable
+        // staging as decode, rather than migrating tensors owned by a graph.
+        // Its multi-row scheduler is independent of the single-token step.
+        const bool singleVerifyCache = graphActive && !tp && single && dsparkVerify && ctx.verifyAllTokens &&
+            seqlen > 1 && seqlen <= 8 && FastllmCudaMoeCacheRequested() &&
+            !dumpDebug && !V41ReferenceMathEnabled() &&
+            V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "numa");
+        if (((step && *step) || singleVerifyCache) && hasSharedExpertOut &&
             moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
             ffnInput.dataDevice == DataDevice::CUDA && ffnInput.cudaData &&
             FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
@@ -117,7 +124,7 @@ namespace fastllm {
             cache.score.ToDevice(DataDevice::CUDA, {device}, true);
             Data input;
             input.FakeFrom(ffnInput, 0);
-            input.Resize({1, dim});
+            input.Resize({seqlen, dim});
             input.dataDeviceIds = {device};
             singleCacheHandled = fastllm::RunHybridMoe(
                 input, cache.index, cache.score, ffnOut,

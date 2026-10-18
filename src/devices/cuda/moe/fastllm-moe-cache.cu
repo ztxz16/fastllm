@@ -5110,6 +5110,17 @@ extern "C" bool fastllm_moe_cuda_cache_route_stats(int device, uint64_t *values)
         auto it = group->deviceCaches.find(device);
         if (it == group->deviceCaches.end() || !it->second || !it->second->ready) continue;
         for (int i = 0; i < 8; ++i) values[i] += it->second->cooperativeStats[i];
+        if (it->second->verify) {
+            const auto &verify = *it->second->verify;
+            values[0] += verify.calls;
+            values[1] += verify.routes;
+            values[2] += verify.hits;
+            values[3] += verify.routes - verify.hits;
+            values[4] += verify.gpuRoutes;
+            values[5] += verify.routes - verify.gpuRoutes;
+            values[6] += verify.gpuRoutes;
+            values[7] += verify.admissions;
+        }
         if (it->second->batchHybrid) {
             const auto &batch = *it->second->batchHybrid;
             const auto &rank = *batch.ranks[0];
