@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import copy
+import contextvars
 import inspect
 import io
 import json
@@ -12,6 +13,7 @@ import tempfile
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from typing import (Any, AsyncGenerator, AsyncIterator, Dict, Iterable, List,
                     Optional, Tuple, Union)
@@ -71,6 +73,12 @@ except ImportError:
     )
 
 ConversationContent = Union[str, List[Dict[str, Any]]]
+
+# Keep CPU input preparation separate from the default executor: streaming
+# token fetches can occupy that executor while waiting for native inference.
+# Threads start lazily and are joined by ThreadPoolExecutor at process exit.
+_input_preparation_executor = ThreadPoolExecutor(
+    max_workers=min(4, os.cpu_count() or 1), thread_name_prefix="fastllm-input")
 
 _KIMI_K3_THINK_OPEN = "<|open|>think<|sep|>"
 _KIMI_K3_THINK_CLOSE = "<|close|>think<|sep|>"
@@ -147,6 +155,34 @@ class FastLLmCompletion:
     
   def init_fast_llm_model(self):
     pass
+
+  async def _prepare_text_request(self, prepare):
+      # Counting, one-shot tokenization reuse and native constraint/launch
+      # must stay on the same worker because their pending state is TLS.
+      pending = _input_preparation_executor.submit(
+          contextvars.copy_context().run, prepare)
+      future = asyncio.wrap_future(pending)
+      try:
+          return await asyncio.shield(future)
+      except asyncio.CancelledError:
+          # Cancellation cannot stop a running Python worker. Release any
+          # handle it creates even if the HTTP task/event loop has gone away.
+          def abort_prepared(done):
+              if done.cancelled():
+                  return
+              try:
+                  _, handle = done.result()
+              except Exception:
+                  return
+              try:
+                  self.model.abort_handle(handle)
+              except Exception:
+                  logging.exception("Failed to abort canceled input preparation")
+
+          pending.add_done_callback(abort_prepared)
+          pending.cancel()
+          future.cancel()
+          raise
   
   def create_error_response(
           self,
@@ -3083,7 +3119,8 @@ class FastLLmCompletion:
 
       model_images = media.images if media.images else None
       model_videos = media.videos if media.videos else None
-      try:
+
+      def prepare_and_launch_text_request():
           input_token_len = self._compute_multimodal_input_token_len(
               messages,
               enable_thinking = enable_thinking,
@@ -3118,6 +3155,14 @@ class FastLLmCompletion:
                   launch_kwargs, parser_request)
           handle = self.model.launch_stream_response(
               messages, **launch_kwargs)
+          return input_token_len, handle
+
+      try:
+          if not model_images and not model_videos:
+              input_token_len, handle = await self._prepare_text_request(
+                  prepare_and_launch_text_request)
+          else:
+              input_token_len, handle = prepare_and_launch_text_request()
       except (ValueError, TemplateError) as error:
           # Deterministic input/template failures must reach the SDK as a 400.
           # An uncaught exception becomes a 500, which Claude Code retries.
@@ -3348,11 +3393,8 @@ class FastLLmCompletion:
           return input_len, launched_handle
 
       try:
-          can_prepare_concurrently = (
-              not model_images and not model_videos and not tools and
-              "tool_call_constraint" not in launch_kwargs)
-          if can_prepare_concurrently:
-              input_token_len, handle = await asyncio.to_thread(
+          if not model_images and not model_videos:
+              input_token_len, handle = await self._prepare_text_request(
                   prepare_and_launch_text_request)
           else:
               input_token_len, handle = prepare_and_launch_text_request()
