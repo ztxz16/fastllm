@@ -22,6 +22,7 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "fastllm-v41-decode.cuh"
 #include "devices/cuda/fastllm-v41-engram.h"
 #include "deepseekv41-reference.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
@@ -53,6 +54,89 @@
 
 namespace fastllm {
     namespace {
+#ifdef USE_CUDA
+        // A one-token slice of a dense [1, tokens, ...] activation is contiguous
+        // on every TP rank. Borrow it for this forward instead of copying it.
+        // The forward scope drains all ranks before releasing the parent.
+        bool V41DecodeSliceView(Data &dst, const Data &src, int offset,
+                                const std::vector<int> &devices) {
+            if (devices.empty() || !src.multiDeviceData || src.dims.size() < 3 || src.dims[0] != 1 ||
+                offset < 0 || offset >= src.dims[1] || src.tpAxis == 1 ||
+                (!src.IsTensorParallelReplicated() && !src.IsTensorParallelSharded())) return false;
+            auto sameSliceShape = [](const std::vector<int> &view, const std::vector<int> &full) {
+                if (view.size() != full.size() || view.size() < 3 || view[1] != 1) return false;
+                for (size_t axis = 0; axis < view.size(); ++axis)
+                    if (axis != 1 && view[axis] != full[axis]) return false;
+                return true;
+            };
+            bool cachedView = dst.multiDeviceData && dst.multiDeviceDatas.size() == devices.size() &&
+                dst.dataDevice == DataDevice::CUDA && dst.dataType == src.dataType &&
+                dst.dataDeviceIds == devices && dst.tpLayout == src.tpLayout && dst.tpAxis == src.tpAxis &&
+                dst.tpRanges == src.tpRanges && sameSliceShape(dst.dims, src.dims) &&
+                dst.tpGlobalDims == dst.dims;
+            for (int device : devices) {
+                auto found = src.multiDeviceDatas.find(device);
+                if (found == src.multiDeviceDatas.end() || !found->second) return false;
+                const Data &local = *found->second;
+                if (!local.cudaData || local.dataDevice != DataDevice::CUDA || local.isKVCache ||
+                    local.isGGUFData || local.dims.size() != src.dims.size() || local.dims[0] != 1 ||
+                    local.dims[1] != src.dims[1] || local.strides.size() != local.dims.size() ||
+                    (local.dataType != DataType::BFLOAT16 && local.dataType != DataType::FLOAT16 &&
+                     local.dataType != DataType::FLOAT32 && local.dataType != DataType::INT32)) return false;
+                uint64_t stride = 1;
+                for (int axis = (int)local.dims.size() - 1; axis >= 0; --axis) {
+                    if (local.strides[axis] != stride) return false;
+                    stride *= local.dims[axis];
+                }
+                if (cachedView) {
+                    auto previous = dst.multiDeviceDatas.find(device);
+                    const Data *view = previous == dst.multiDeviceDatas.end() ? nullptr : previous->second;
+                    cachedView = view && view->isFake && view->dataType == local.dataType &&
+                        view->dataDevice == local.dataDevice && view->dataDeviceIds == local.dataDeviceIds &&
+                        view->cudaData == (uint8_t*)local.cudaData + (size_t)offset * local.strides[1] * local.unitSize &&
+                        sameSliceShape(view->dims, local.dims) && view->expansionSize == local.strides[1];
+                }
+            }
+            // Graph boundaries retain their allocations between layers and
+            // tokens. A matching borrowed row needs no metadata reconstruction.
+            if (cachedView) return true;
+            bool reusable = dst.multiDeviceData && dst.multiDeviceDatas.size() == devices.size();
+            for (int device : devices) {
+                auto found = dst.multiDeviceDatas.find(device);
+                reusable &= found != dst.multiDeviceDatas.end() && found->second && found->second->isFake;
+            }
+            if (!reusable) {
+                V41ResetMultiDevice(dst);
+                dst.FreeSpace();
+            }
+            dst.dataType = src.dataType;
+            dst.UpdateUnitSize();
+            auto dims = src.dims; dims[1] = 1;
+            dst.Resize(dims);
+            dst.dataDevice = DataDevice::CUDA;
+            dst.dataDeviceIds = devices;
+            dst.multiDeviceData = true;
+            dst.tpLayout = src.tpLayout; dst.tpAxis = src.tpAxis;
+            dst.tpGlobalDims = dims; dst.tpRanges = src.tpRanges;
+            for (int device : devices) {
+                const Data &source = *src.multiDeviceDatas.at(device);
+                Data *&view = dst.multiDeviceDatas[device];
+                if (!view) view = new Data();
+                view->FakeFrom(source, (size_t)offset * source.strides[1] * source.unitSize);
+                auto localDims = source.dims; localDims[1] = 1;
+                view->expansionDims.clear();
+                view->Resize(localDims);
+                // TP validation checks the accessible capacity even for a
+                // borrowed view. Publish only this row, never the parent's
+                // remaining capacity (which would permit overwriting siblings).
+                view->expansionDims = localDims;
+                view->expansionSize = view->Count(0);
+                view->expansionBytes = view->GetBytes();
+            }
+            return true;
+        }
+#endif
+
         // ---------------- 配置读取 ----------------
 
         bool V41HasKey(const WeightMap &weight, const std::string &key) {
@@ -409,6 +493,33 @@ namespace fastllm {
 #ifdef USE_CUDA
             if (!tpDevices.empty() && reference.multiDeviceData &&
                 reference.IsTensorParallelReplicated()) {
+                // These outputs are fully overwritten on ordered TP streams.
+                // Reuse capacity when the logical Top-K/candidate width changes.
+                uint64_t required = 1;
+                for (int dim : dims) required *= dim;
+                bool reuse = dst.multiDeviceData && dst.IsTensorParallelReplicated() &&
+                    !dst.isFake && dst.dataType == type &&
+                    dst.dataDeviceIds == tpDevices && dst.multiDeviceDatas.size() == tpDevices.size();
+                if (reuse) {
+                    for (int device : tpDevices) {
+                        auto it = dst.multiDeviceDatas.find(device);
+                        if (it == dst.multiDeviceDatas.end() || !it->second ||
+                            !it->second->cudaData || it->second->isFake ||
+                            it->second->dataDevice != DataDevice::CUDA ||
+                            it->second->dataType != type || it->second->expansionSize < required) {
+                            reuse = false;
+                            break;
+                        }
+                    }
+                }
+                if (reuse) {
+                    for (int device : tpDevices) {
+                        Data &local = *dst.multiDeviceDatas.at(device);
+                        if (local.dims != dims) local.Resize(dims);
+                    }
+                    if (dst.dims != dims) V41SyncRootFromReplica(dst, tpDevices);
+                    return;
+                }
                 V41ResetMultiDevice(dst);
                 dst.FreeSpace();
                 dst.dataType = type;
@@ -418,9 +529,19 @@ namespace fastllm {
                 dst.dataDeviceIds = tpDevices;
                 PrepareMultiCudaReplicatedData(dst, tpDevices, false);
                 const int oriDevice = FastllmCudaGetDevice();
+                std::vector<int> capacityDims = dims;
+                if (dims.size() == 3 && dims[0] == 1 && dims[1] == 1 && dims[2] > 0 &&
+                    (type == DataType::INT32 || type == DataType::INT8)) {
+                    int capacity = 64;
+                    while (capacity < dims[2] && capacity <= (1 << 29)) capacity *= 2;
+                    capacityDims[2] = std::max(capacity, dims[2]);
+                }
                 for (int device : tpDevices) {
                     FastllmCudaSetDevice(device);
-                    dst.multiDeviceDatas.at(device)->Allocate();
+                    Data &local = *dst.multiDeviceDatas.at(device);
+                    local.Resize(capacityDims);
+                    local.Allocate(false);
+                    if (capacityDims != dims) local.Resize(dims);
                 }
                 FastllmCudaSetDevice(oriDevice);
                 V41SyncRootFromReplica(dst, tpDevices);
@@ -605,6 +726,41 @@ namespace fastllm {
                                Data &tmp, Data &output) {
 #ifdef USE_CUDA
             static const bool disableFused = V41EnvFlag("FASTLLM_DSV41_DISABLE_HCPRENORM");
+            if (!disableFused && input.multiDeviceData && input.IsTensorParallelReplicated() &&
+                pre.multiDeviceData && pre.IsTensorParallelReplicated() &&
+                input.dataType == DataType::BFLOAT16 && input.dims.size() == 4 &&
+                pre.dataType == DataType::FLOAT32 && normWeight.dataType == DataType::FLOAT32) {
+                // A replicated root may advertise only its primary device;
+                // the replica map is the complete TP group.
+                std::vector<int> devices;
+                for (const auto &replica : input.multiDeviceDatas) devices.push_back(replica.first);
+                bool compatible = !devices.empty();
+                for (int device : devices) {
+                    const auto xi = input.multiDeviceDatas.find(device), pi = pre.multiDeviceDatas.find(device);
+                    compatible &= xi != input.multiDeviceDatas.end() && xi->second && xi->second->cudaData &&
+                                  pi != pre.multiDeviceDatas.end() && pi->second && pi->second->cudaData;
+                }
+                if (compatible) {
+                    if (!normWeight.multiDeviceData)
+                        PrepareMultiCudaReplicatedData(normWeight, devices, true);
+                    compatible = normWeight.IsTensorParallelReplicated();
+                    for (int device : devices) {
+                        const auto wi = normWeight.multiDeviceDatas.find(device);
+                        compatible &= wi != normWeight.multiDeviceDatas.end() && wi->second && wi->second->cudaData;
+                    }
+                }
+                if (compatible) {
+                    V41AllocLike(output, DataType::BFLOAT16,
+                        {input.dims[0], input.dims[1], input.dims[3]}, input, devices);
+                    std::vector<int> ok(devices.size(), 0);
+                    const bool submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                        ok[rank] = FastllmCudaDeepSeekV41HcPreNorm(*input.multiDeviceDatas.at(device),
+                            *pre.multiDeviceDatas.at(device), *normWeight.multiDeviceDatas.at(device),
+                            eps, *output.multiDeviceDatas.at(device));
+                    });
+                    if (submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; })) return;
+                }
+            }
             if (!disableFused && input.dataDevice == DataDevice::CUDA && !input.multiDeviceData &&
                 V41FusedPreNormSameDevice(input, pre, normWeight) &&
                 FastllmCudaDeepSeekV41HcPreNorm(input, pre, normWeight, eps, output)) {
@@ -634,6 +790,167 @@ namespace fastllm {
             int betaFast;
             int betaSlow;
         };
+
+#ifdef USE_CUDA
+        // Amortize worker/event handoffs across independent decode requests.
+        // Each rank still runs the portable native kernels in the same stream.
+        using V41DecodeTransform = FastllmCudaV41DecodeTransform;
+
+        bool V41PrepareDecodeTransforms(const std::vector<V41DecodeTransform> &items,
+                                 const V41RopeParams &rope, int windowSize,
+                                 const std::vector<int> &devices,
+                                 std::function<void(int, int)> &task) {
+            if (devices.empty() || items.empty()) return false;
+            for (const auto &item : items) {
+                if (!item.input || !item.input->multiDeviceData) return false;
+                for (int device : devices) {
+                    auto it = item.input->multiDeviceDatas.find(device);
+                    if (it == item.input->multiDeviceDatas.end() || !it->second) return false;
+                    const Data &x = *it->second;
+                    if (!x.cudaData || x.dataDevice != DataDevice::CUDA ||
+                        (x.dims.size() != 3 && x.dims.size() != 4) || x.dims[1] != 1 ||
+                        x.dims.back() > 1024 || x.dims.back() % 32 ||
+                        rope.ropeDim <= 0 || rope.ropeDim > 128 || rope.ropeDim > x.dims.back() ||
+                        (rope.ropeDim & 1) ||
+                        (x.dataType != DataType::BFLOAT16 && x.dataType != DataType::FLOAT16 &&
+                         x.dataType != DataType::FLOAT32)) return false;
+                    if (item.window) {
+                        auto ring = item.window->multiDeviceDatas.find(device);
+                        if (x.dims.size() != 3 || ring == item.window->multiDeviceDatas.end() ||
+                            !ring->second || ring->second->dataType != x.dataType ||
+                            !ring->second->cudaData || ring->second->dims.size() != 3 ||
+                            ring->second->dims[0] != x.dims[0] ||
+                            ring->second->dims[1] != windowSize ||
+                            ring->second->dims[2] != x.dims[2])
+                            return false;
+                    }
+                }
+            }
+            static const bool disableFakeQuant = V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT");
+            task = [&items, rope, windowSize](int, int device) {
+                std::vector<FastllmCudaV41DecodeTransform> local;
+                local.reserve(items.size());
+                for (const auto &item : items) {
+                    local.push_back({item.input->multiDeviceDatas.at(device),
+                        item.window ? item.window->multiDeviceDatas.at(device) : nullptr,
+                        item.startPos, disableFakeQuant ? 0 : item.quantMode, item.inverse});
+                }
+                if (FastllmCudaV41DecodeTransformsBatch(local, rope.ropeDim, rope.base,
+                        rope.originalSeqLen, rope.factor, rope.betaFast, rope.betaSlow, windowSize)) return;
+
+                for (const auto &item : items) {
+                    Data &x = *item.input->multiDeviceDatas.at(device);
+                    bool ok;
+                    if (item.window) {
+                        ok = FastllmCudaDeepSeekV41WindowStore(x, *item.window->multiDeviceDatas.at(device),
+                                                             item.startPos, windowSize);
+                    } else {
+                        ok = FastllmCudaDeepSeekV41RotaryQuant(x, rope.ropeDim, rope.base, item.startPos, 1,
+                            item.inverse, rope.originalSeqLen, rope.factor, rope.betaFast, rope.betaSlow,
+                            disableFakeQuant ? 0 : item.quantMode, x.dims.back(), 32);
+                    }
+                    AssertInFastLLM(ok, "DeepSeekV41 batched decode transform failed.");
+                }
+            };
+            return true;
+        }
+
+        bool V41DecodeTransforms(const std::vector<V41DecodeTransform> &items,
+                                 const V41RopeParams &rope, int windowSize,
+                                 const std::vector<int> &devices, bool workerOrdered = false) {
+            std::function<void(int, int)> task;
+            if (!V41PrepareDecodeTransforms(items, rope, windowSize, devices, task)) return false;
+            if (workerOrdered && MultiCudaRunDeviceCallbacksEnqueueOnly(devices, task)) return true;
+            return MultiCudaRunDeviceCallbacks(devices, task);
+        }
+
+        using V41DecodeIndexTask = FastllmCudaV41DecodeIndexTask;
+
+        bool V41PrepareDecodeIndexer(const std::vector<V41DecodeIndexTask> &items,
+                                   const V41RopeParams &rope, int ratio, int topK,
+                                   int blockSize, int candidateTopK,
+                                   const std::vector<int> &devices,
+                                   std::function<void(int, int)> &task) {
+            if (items.empty() || devices.empty()) return false;
+            // Validate before mutating queries. Unsupported layouts retain the
+            // existing executor path, including its architecture fallbacks.
+            for (const auto &r : items) {
+                for (Data *data : {r.query, r.weights, r.keys}) {
+                    if (!data || !data->multiDeviceData || !data->IsTensorParallelReplicated()) return false;
+                    for (int device : devices) {
+                        auto it = data->multiDeviceDatas.find(device);
+                        if (it == data->multiDeviceDatas.end() || !it->second || !it->second->cudaData) return false;
+                    }
+                }
+                if (r.query->dataType != DataType::BFLOAT16 || r.weights->dataType != DataType::FLOAT32 ||
+                    r.keys->dataType != DataType::BFLOAT16 || r.query->dims.size() != 4 ||
+                    r.query->dims[0] != 1 || r.query->dims[1] != 1 || r.query->dims[3] != 128 ||
+                    r.keys->dims.size() != 3 || r.keys->dims[0] != 1 || r.keys->dims[2] != 128 ||
+                    rope.ropeDim <= 0 || rope.ropeDim > 128 || (rope.ropeDim & 1)) return false;
+                if (r.useCandidates) {
+                    for (int device : devices) {
+                        auto it = r.candidates->multiDeviceDatas.find(device);
+                        if (it == r.candidates->multiDeviceDatas.end() || !it->second || !it->second->cudaData)
+                            return false;
+                    }
+                }
+            }
+            for (const auto &r : items) {
+                V41AllocLike(*r.topk, DataType::INT32, {1, 1, std::min(topK, r.keys->dims[1])},
+                             *r.query, devices);
+                if (r.writeCandidates) {
+                    V41AllocLike(*r.candidates, DataType::INT8,
+                        {1, 1, (r.keys->dims[1] + blockSize - 1) / blockSize}, *r.query, devices);
+                }
+            }
+            static const bool disableFakeQuant = V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT");
+            task = [&items, rope, ratio, topK, blockSize, candidateTopK](int, int device) {
+                std::vector<FastllmCudaV41DecodeIndexTask> local;
+                local.reserve(items.size());
+                for (const auto &r : items) local.push_back({r.query->multiDeviceDatas.at(device),
+                    r.weights->multiDeviceDatas.at(device), r.keys->multiDeviceDatas.at(device),
+                    (r.writeCandidates || r.useCandidates) ? r.candidates->multiDeviceDatas.at(device) : nullptr,
+                    r.topk->multiDeviceDatas.at(device), r.startPos, r.writeCandidates, r.useCandidates});
+                if (FastllmCudaV41DecodeIndexerBatch(local, ratio, topK, blockSize, candidateTopK,
+                        rope.ropeDim, rope.base, rope.originalSeqLen, rope.factor, rope.betaFast, rope.betaSlow,
+                        !disableFakeQuant)) return;
+                for (const auto &r : items) {
+                    Data &q = *r.query->multiDeviceDatas.at(device);
+                    Data &w = *r.weights->multiDeviceDatas.at(device);
+                    Data &k = *r.keys->multiDeviceDatas.at(device);
+                    Data &out = *r.topk->multiDeviceDatas.at(device);
+                    Data score;
+                    bool ok = FastllmCudaDeepSeekV41RotaryQuant(q, rope.ropeDim, rope.base, r.startPos, 1, false,
+                        rope.originalSeqLen, rope.factor, rope.betaFast, rope.betaSlow,
+                        disableFakeQuant ? 0 : 2, 128, 32);
+                    ok = ok && FastllmCudaDeepSeekV41IndexerScore(q, w, k, ratio, r.startPos, score);
+                    Data *candidate = nullptr;
+                    if (r.writeCandidates || r.useCandidates) candidate = r.candidates->multiDeviceDatas.at(device);
+                    if (r.writeCandidates)
+                        ok = ok && FastllmCudaDeepSeekV41CandidateBlocks(score, blockSize, candidateTopK,
+                                                                       ratio, r.startPos, *candidate);
+                    // The source layer publishes candidates for subsequent
+                    // layers, but does not apply its own new mask to top-k.
+                    ok = ok && FastllmCudaDeepSeekV41IndexerTopK(score, r.useCandidates ? candidate : nullptr,
+                        topK, ratio, r.startPos, std::max(1, blockSize), out);
+                    AssertInFastLLM(ok, "DeepSeekV41 batched indexer failed.");
+                    if (score.cudaData && FastllmCudaFreeAfterCurrentThreadStream(score.cudaData))
+                        score.cudaData = nullptr;
+                }
+            };
+            return true;
+        }
+
+        bool V41DecodeIndexerBatch(const std::vector<V41DecodeIndexTask> &items,
+                                   const V41RopeParams &rope, int ratio, int topK,
+                                   int blockSize, int candidateTopK,
+                                   const std::vector<int> &devices) {
+            std::function<void(int, int)> task;
+            return V41PrepareDecodeIndexer(items, rope, ratio, topK, blockSize,
+                                          candidateTopK, devices, task) &&
+                   MultiCudaRunDeviceCallbacks(devices, task);
+        }
+#endif
 
         void V41RotaryQuant(Data &x, const V41RopeParams &rope, int startPos, int posStep,
                             bool inverse, int quantMode, int quantBlock, int quantDim = -1) {
@@ -916,6 +1233,207 @@ namespace fastllm {
 #endif
             CatDirect(cache, rows, 1);
         }
+
+#ifdef USE_CUDA
+        // Reserve without appending: copies are submitted together on the
+        // persistent rank streams after all request metadata has been checked.
+        void V41ReserveDecodeRows(Data &data, DataType type, int width, int required,
+                                  const std::vector<int> &devices) {
+            if (data.dims.empty()) {
+                data.dataType = type;
+                data.UpdateUnitSize();
+                data.Resize({1, 0, width});
+            }
+            if (!data.multiDeviceData) {
+                if (data.Count(0) == 0) {
+                    data.dataDevice = DataDevice::CUDA;
+                    data.dataDeviceIds = devices;
+                }
+                PrepareMultiCudaReplicatedData(data, devices, data.Count(0) > 0);
+            }
+            const int original = FastllmCudaGetDevice();
+            for (int device : devices) {
+                Data &local = *data.multiDeviceDatas.at(device);
+                if (V41CacheRowCapacity(local) < required) {
+                    FastllmCudaSetDevice(device);
+                    int capacity = std::max(required, V41CacheRowCapacity(local) * 3 / 2);
+                    if (required > 2) capacity = (capacity + 255) / 256 * 256;
+                    local.Expansion({1, capacity, width});
+                }
+            }
+            FastllmCudaSetDevice(original);
+            V41SyncRootFromReplica(data, devices);
+        }
+
+        bool V41CompressDecodeBatch(const std::vector<DeepSeekV41Segment> &segments,
+                int layer, int ratio, Data &rawKV, Data &rawScore, Data &norm,
+                float eps, const V41RopeParams &rope, bool indexSource,
+                const std::function<void(Data &, Data &)> &projectIndex,
+                const std::vector<int> &devices, DeepSeekV41DecodeWorkspace &scratch) {
+            auto replicated = [&](const Data &data) {
+                if (!data.multiDeviceData || !data.IsTensorParallelReplicated()) return false;
+                for (int d : devices) {
+                    auto it = data.multiDeviceDatas.find(d);
+                    if (it == data.multiDeviceDatas.end() || !it->second ||
+                        (data.Count(0) && !it->second->cudaData)) return false;
+                }
+                return true;
+            };
+            if (devices.empty() || ratio < 1 || ratio > 2 ||
+                rawKV.dataType != DataType::FLOAT32 || rawKV.dims.size() != 3 ||
+                rawKV.dims[2] != 512 || !replicated(rawKV) ||
+                (ratio > 1 && (rawScore.dataType != DataType::FLOAT32 ||
+                              rawScore.dims != rawKV.dims || !replicated(rawScore)))) return false;
+            std::vector<int> ready, rowOf(segments.size(), -1);
+            for (int i = 0; i < (int)segments.size(); ++i) {
+                const auto &seg = segments[i];
+                auto &cache = seg.state->layers[layer];
+                if (seg.seqlen != 1 || seg.startPos <= 0 || seg.spec ||
+                    cache.rawTail != seg.startPos % ratio ||
+                    cache.compressedBlocks != seg.startPos / ratio) return false;
+                for (Data *data : {&cache.compressedKV, &cache.indexK,
+                                   &cache.rawTailKV, &cache.rawTailScore}) {
+                    // Count(0) is 1 for an unshaped Data. Prefill Split also
+                    // legitimately returns a root-only tail. Neither means
+                    // that the request cannot use the batched decode path.
+                    if (data->dims.empty()) continue;
+                    if (data->dims.size() != 3) return false;
+                    if (data->dims[1] == 0 || replicated(*data)) continue;
+                    const bool payload = data->dataDevice == DataDevice::CUDA ?
+                        data->cudaData != nullptr : data->cpuData != nullptr;
+                    if (data->IsTensorParallelSharded() || !payload) return false;
+                    PrepareMultiCudaReplicatedData(*data, devices, true);
+                    if (!replicated(*data)) return false;
+                }
+                if (cache.rawTail + 1 == ratio) {
+                    rowOf[i] = (int)ready.size();
+                    ready.push_back(i);
+                }
+            }
+            const int rows = (int)ready.size();
+            for (int i = 0; i < (int)segments.size(); ++i) {
+                auto &c = segments[i].state->layers[layer];
+                if (rowOf[i] < 0) {
+                    V41ReserveDecodeRows(c.rawTailKV, DataType::FLOAT32, 512, ratio, devices);
+                    V41ReserveDecodeRows(c.rawTailScore, DataType::FLOAT32, 512, ratio, devices);
+                } else {
+                    V41ReserveDecodeRows(c.compressedKV, DataType::BFLOAT16, 512, c.compressedBlocks + 1, devices);
+                    if (indexSource) V41ReserveDecodeRows(c.indexK, DataType::BFLOAT16, 128, c.compressedBlocks + 1, devices);
+                }
+            }
+            // Scratch remains alive until this forward's TP streams drain;
+            // graph workspaces retain it across tokens. Every rank reuses it
+            // only after its preceding cache append on the same worker stream.
+            auto &joined = scratch.compressJoined;
+            auto &scores = scratch.compressScores;
+            auto &latents = scratch.compressLatents;
+            auto &keys = scratch.compressKeys;
+            if (rows) {
+                V41AllocLike(joined, DataType::FLOAT32, {rows, ratio, 512}, rawKV, devices);
+                if (ratio > 1) V41AllocLike(scores, DataType::FLOAT32, {rows, ratio, 512}, rawKV, devices);
+                V41AllocLike(latents, DataType::BFLOAT16, {rows, 1, 512}, rawKV, devices);
+                PrepareMultiCudaReplicatedData(norm, devices, true);
+            }
+            MultiCudaRunDeviceCallbacks(devices, [&](int, int device) {
+                std::vector<void *> destinations;
+                std::vector<const void *> sources;
+                std::vector<size_t> sizes;
+                auto copy = [&](void *dst, const void *src, size_t bytes) {
+                    destinations.push_back(dst); sources.push_back(src); sizes.push_back(bytes);
+                };
+                for (int i = 0; i < (int)segments.size(); ++i) {
+                    auto &c = segments[i].state->layers[layer];
+                    const size_t offset = (size_t)segments[i].offset * 512 * sizeof(float);
+                    for (int part = 0; part < (ratio > 1 ? 2 : 1); ++part) {
+                        Data &source = part ? rawScore : rawKV;
+                        Data &tail = part ? c.rawTailScore : c.rawTailKV;
+                        const void *token = (const uint8_t *)source.multiDeviceDatas.at(device)->cudaData + offset;
+                        if (rowOf[i] < 0) {
+                            copy((uint8_t *)tail.multiDeviceDatas.at(device)->cudaData +
+                                 (size_t)c.rawTail * 512 * sizeof(float), token, 512 * sizeof(float));
+                        } else {
+                            Data &target = part ? scores : joined;
+                            auto *dst = (uint8_t *)target.multiDeviceDatas.at(device)->cudaData +
+                                (size_t)rowOf[i] * ratio * 512 * sizeof(float);
+                            if (c.rawTail) copy(dst, tail.multiDeviceDatas.at(device)->cudaData,
+                                                (size_t)c.rawTail * 512 * sizeof(float));
+                            copy(dst + (size_t)c.rawTail * 512 * sizeof(float), token, 512 * sizeof(float));
+                        }
+                    }
+                }
+                AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                    destinations.data(), sources.data(), sizes.data(), sizes.size()),
+                    "DeepSeekV41 decode compressor gather failed.");
+                if (rows) {
+                    AssertInFastLLM(FastllmCudaDeepSeekV41Compress(*joined.multiDeviceDatas.at(device),
+                        ratio > 1 ? scores.multiDeviceDatas.at(device) : nullptr,
+                        *norm.multiDeviceDatas.at(device), ratio, eps, *latents.multiDeviceDatas.at(device)),
+                        "DeepSeekV41 batched compressor failed.");
+                }
+            });
+            if (rows) {
+                latents.Reshape({1, rows, 512});
+                if (indexSource) projectIndex(latents, keys);
+                auto &latentViews = scratch.compressLatentViews;
+                auto &keyViews = scratch.compressKeyViews;
+                latentViews.resize(rows);
+                keyViews.resize(rows);
+                for (int row = 0; row < rows; ++row) {
+                    AssertInFastLLM(V41DecodeSliceView(latentViews[row], latents, row, devices), "compressor latent view failed");
+                    if (indexSource) AssertInFastLLM(V41DecodeSliceView(keyViews[row], keys, row, devices), "compressor key view failed");
+                }
+                const bool disableQuant = V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT");
+                MultiCudaRunDeviceCallbacks(devices, [&](int, int device) {
+                    std::vector<FastllmCudaV41DecodeTransform> transforms;
+                    std::vector<void *> destinations;
+                    std::vector<const void *> sources;
+                    std::vector<size_t> sizes;
+                    for (int row = 0; row < rows; ++row) {
+                        auto &c = segments[ready[row]].state->layers[layer];
+                        auto store = [&](Data &view, Data &cache, int mode, int block) {
+                            Data &local = *view.multiDeviceDatas.at(device);
+                            transforms.push_back({&local, nullptr, c.compressedBlocks * ratio,
+                                disableQuant ? 0 : mode, false, block});
+                            const size_t bytes = (size_t)local.dims.back() * 2;
+                            destinations.push_back((uint8_t *)cache.multiDeviceDatas.at(device)->cudaData +
+                                                   (size_t)c.compressedBlocks * bytes);
+                            sources.push_back(local.cudaData); sizes.push_back(bytes);
+                        };
+                        if (indexSource) store(keyViews[row], c.indexK, 2, 32);
+                        store(latentViews[row], c.compressedKV, 3, 16);
+                    }
+                    if (!FastllmCudaV41DecodeTransformsBatch(transforms, rope.ropeDim, rope.base,
+                            rope.originalSeqLen, rope.factor, rope.betaFast, rope.betaSlow, 1)) {
+                        for (const auto &t : transforms)
+                            AssertInFastLLM(FastllmCudaDeepSeekV41RotaryQuant(*t.input, rope.ropeDim, rope.base,
+                                t.startPos, 1, false, rope.originalSeqLen, rope.factor, rope.betaFast, rope.betaSlow,
+                                t.quantMode, t.input->dims.back(), t.quantBlock), "DeepSeekV41 compressor RoPE failed.");
+                    }
+                    AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                        destinations.data(), sources.data(), sizes.data(), sizes.size()),
+                        "DeepSeekV41 batched compressed cache append failed.");
+                });
+            }
+            auto setRows = [&](Data &data, int n) {
+                if (data.dims.empty()) return;
+                auto dims = data.dims; dims[1] = n;
+                for (int d : devices) data.multiDeviceDatas.at(d)->Resize(dims);
+                V41SyncRootFromReplica(data, devices);
+            };
+            for (int i = 0; i < (int)segments.size(); ++i) {
+                auto &c = segments[i].state->layers[layer];
+                c.rawTail = (c.rawTail + 1) % ratio;
+                if (rowOf[i] >= 0) {
+                    ++c.compressedBlocks;
+                    setRows(c.compressedKV, c.compressedBlocks);
+                    if (indexSource) setRows(c.indexK, c.compressedBlocks);
+                }
+                setRows(c.rawTailKV, c.rawTail);
+                setRows(c.rawTailScore, c.rawTail);
+            }
+            return true;
+        }
+#endif
 
         // 把 [1, n, w] 的分块结果写进 [1, N, w] 的整段缓冲的第 offset 行
         void V41WriteRows(Data &dst, const Data &src, int offset,
@@ -3041,7 +3559,13 @@ namespace fastllm {
     DeepSeekV41Model::ScopedTpDispatch::~ScopedTpDispatch() {
         if (enabled) {
             const int originalDevice = FastllmCudaGetDevice();
-            for (int device : devices) FastllmCudaSyncDevice(device);
+            // Keep the device-wide lifetime barrier, but let each persistent
+            // worker drain its own device concurrently. Serial device switches
+            // on the caller can cost more than the final decode operations.
+            if (!MultiCudaRunDeviceCallbacksEnqueueOnly(devices,
+                    [](int, int device) { FastllmCudaSyncDevice(device); })) {
+                for (int device : devices) FastllmCudaSyncDevice(device);
+            }
             FastllmCudaSetDevice(originalDevice);
             MultiCudaSetPersistentAsyncDispatch(previous);
         }
@@ -3416,13 +3940,9 @@ namespace fastllm {
         bool dumpDebug = false;
         int startPos0 = 0;
         std::string dumpSuffix;
-        std::vector<Data> segTopK;
-        std::vector<Data> segCandidate;
         std::vector<char> segHasCandidates;
+        std::vector<int> segHasTopK;
         Data *preMixPtr = nullptr;
-        std::vector<Data> segQ;
-        std::vector<Data> segKV;
-        std::vector<Data> segAttnOut;
         Data catTmp[2];
         bool cudaRouteCapturable = false;
         std::vector<Data*> moeWeights;
@@ -3435,6 +3955,9 @@ namespace fastllm {
         bool graphReplay = false;
         bool graphCapture = false;
         bool graphPoolOpen = false;
+        bool workerOrderedGraphReplay = false;
+        bool decodeQkvViewsPrepared = false;
+        bool decodeOutputViewsPrepared = false;
         std::unique_ptr<ScopedTpDispatch> tpDecodeDispatch;
 #endif
         ForwardWorkspace(DeepSeekV41Model &model, const std::vector<DeepSeekV41Segment> &inputSegments,
@@ -3793,13 +4316,14 @@ namespace fastllm {
         auto &dumpDebug = f.dumpDebug;
         auto &startPos0 = f.startPos0;
         auto &dumpSuffix = f.dumpSuffix;
-        auto &segTopK = f.segTopK;
-        auto &segCandidate = f.segCandidate;
+        auto &segTopK = f.ws->segTopK;
+        auto &segCandidate = f.ws->segCandidate;
         auto &segHasCandidates = f.segHasCandidates;
+        auto &segHasTopK = f.segHasTopK;
         auto &preMixPtr = f.preMixPtr;
-        auto &segQ = f.segQ;
-        auto &segKV = f.segKV;
-        auto &segAttnOut = f.segAttnOut;
+        auto &segQ = f.ws->segQ;
+        auto &segKV = f.ws->segKV;
+        auto &segAttnOut = f.ws->segAttnOut;
         auto &cudaRouteCapturable = f.cudaRouteCapturable;
 #ifdef USE_CUDA
         auto &graphState = f.graphState;
@@ -3864,6 +4388,7 @@ namespace fastllm {
         // 本次前向内跨层共享的 indexer 结果（按片段）
         segTopK.resize(numSegments); segCandidate.resize(numSegments);
         segHasCandidates.assign(numSegments, 0);
+        segHasTopK.assign(numSegments, 0);
 
         // 上一子层产出的 pre 系数。原来用 preMix.CopyFrom(ffnPre) 传递，
         // 但复制布局下 CopyFrom 只会拷贝可能已失效的 root，这里改成指针传递
@@ -3874,6 +4399,7 @@ namespace fastllm {
         // TP + cpu/numa MoE 时，从卡上副本拷出来的路由专家输入（复用同一组缓冲，
         // 避免每层重新分配、也避免栈上 Data 的地址被下游缓存复用）
         segQ.resize(numSegments); segKV.resize(numSegments); segAttnOut.resize(numSegments);
+        f.ws->segIndexQ.resize(numSegments); f.ws->segIndexWeight.resize(numSegments);
 
 #ifdef USE_CUDA
         // 工作区里所有跨段传递的张量：图里烤死的就是它们的设备地址。
@@ -3957,13 +4483,14 @@ namespace fastllm {
         auto &nextHidden = f.nextHidden;
         auto &dumpDebug = f.dumpDebug;
         auto &dumpSuffix = f.dumpSuffix;
-        auto &segTopK = f.segTopK;
-        auto &segCandidate = f.segCandidate;
+        auto &segTopK = f.ws->segTopK;
+        auto &segCandidate = f.ws->segCandidate;
         auto &segHasCandidates = f.segHasCandidates;
+        auto &segHasTopK = f.segHasTopK;
         auto &preMixPtr = f.preMixPtr;
-        auto &segQ = f.segQ;
-        auto &segKV = f.segKV;
-        auto &segAttnOut = f.segAttnOut;
+        auto &segQ = f.ws->segQ;
+        auto &segKV = f.ws->segKV;
+        auto &segAttnOut = f.ws->segAttnOut;
         auto &catTmp = f.catTmp;
         auto &cudaRouteCapturable = f.cudaRouteCapturable;
         auto &moeWeights = f.moeWeights;
@@ -4000,6 +4527,10 @@ namespace fastllm {
             if (single) {
                 return &full;
             }
+#ifdef USE_CUDA
+            if (segments[i].seqlen == 1 && segments[i].startPos > 0 &&
+                V41DecodeSliceView(tmp, full, segments[i].offset, tpDevices)) return &tmp;
+#endif
             Split(full, 1, segments[i].offset, segments[i].offset + segments[i].seqlen, tmp);
             return &tmp;
         };
@@ -4120,8 +4651,9 @@ namespace fastllm {
             // 【CUDA Graph 的 pre 段】这里到 RoPE 之前全部与 token 位置无关，整段可捕获。
             bool needIndexer = ratio > 0 && isIndexSource[layer];
             auto runAttentionPre = [&]() {
-            const bool reuseQuantized = !tp && seqlen <= 8 &&
-                !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH");
+            // Both projections read the same fake-FP8 values. The workspace
+            // owns these buffers across asynchronous TP dispatch and graph replay.
+            const bool reuseQuantized = !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH");
             Data *attnQuant = reuseQuantized &&
                 quantizedLinearNames.count(pre + ".attn.wq_a.weight") &&
                 quantizedLinearNames.count(pre + ".attn.wkv.weight") ? &ws->attnInputQuantized : nullptr;
@@ -4209,24 +4741,117 @@ namespace fastllm {
                 });
 
             ReleaseForwardPrefill(f, {&x, &qr, &qNorm, &ws->attnInputFloat, &ws->idxWeights});
-            // ---- attention（按片段）----
+            // Batch independent decode requests without changing their QK /
+            // softmax / BF16-probability arithmetic or per-request KV positions.
+            bool batchAttention = false;
+            bool batchTransforms = false, mergedAttention = false;
+#ifdef USE_CUDA
+            batchAttention = tp && !dumpDebug &&
+                std::all_of(segments.begin(), segments.end(), [](const DeepSeekV41Segment &seg) {
+                    return seg.seqlen == 1 && seg.startPos > 0;
+                });
+            std::vector<FastllmCudaV41AttentionRequest> attentionRequests;
+            std::vector<V41DecodeIndexTask> indexTasks;
+            auto &segIndexQ = f.ws->segIndexQ;
+            auto &segIndexWeight = f.ws->segIndexWeight;
+            if (batchAttention) {
+                std::vector<V41DecodeTransform> transforms;
+                transforms.reserve(2 * numSegments);
+                // A fully captured ordinary decode has fixed boundary pointers
+                // and uniform Q/KV shapes across layers. Validate/build its row
+                // views once per forward; only their contents change per layer.
+                // Eager, capture, invalidated and speculative paths still check
+                // every row. These flags never survive a forward/request batch.
+                const bool reuseRows = f.graphReplay && f.workerOrderedGraphReplay &&
+                    f.decodeQkvViewsPrepared;
+                for (int s = 0; s < numSegments; ++s) {
+                    if (reuseRows) {
+                        // The same borrowed rows were checked in an earlier layer.
+                    } else if (single) {
+                        AssertInFastLLM(V41DecodeSliceView(segQ[s], q, segments[s].offset, tpDevices) &&
+                                        V41DecodeSliceView(segKV[s], kv, segments[s].offset, tpDevices),
+                                        "DeepSeekV41 decode row view failed.");
+                    } else {
+                        sliceOf(q, s, segQ[s]);
+                        sliceOf(kv, s, segKV[s]);
+                    }
+                    transforms.push_back({&segQ[s], nullptr, segments[s].startPos, 0, false});
+                    transforms.push_back({&segKV[s], nullptr, segments[s].startPos, 1, false});
+                }
+                f.decodeQkvViewsPrepared = true;
+                // These producers and consumers all use the dedicated rank
+                // stream during ordinary replay. Preserve the general handoff
+                // on source layers, where cache growth may use the caller stream.
+                batchTransforms = V41DecodeTransforms(transforms, rope, window_size, tpDevices,
+                    f.workerOrderedGraphReplay && !isKvSource[layer]);
+                // Independent rows can be written directly into the persistent
+                // graph boundary, avoiding an O(batch^2) chain of concatenations.
+                mergedAttention = MultiCudaCopyShardedActivation(attnOut, q, tpDevices, false);
+                if (mergedAttention && !(f.graphReplay && f.workerOrderedGraphReplay &&
+                                         f.decodeOutputViewsPrepared)) {
+                    for (int s = 0; s < numSegments; ++s) {
+                        AssertInFastLLM(V41DecodeSliceView(segAttnOut[s], attnOut, segments[s].offset, tpDevices),
+                                        "DeepSeekV41 attention output view failed.");
+                    }
+                    f.decodeOutputViewsPrepared = true;
+                }
+            }
+#endif
+            bool batchedCompression = false;
+#ifdef USE_CUDA
+            if (batchAttention && !quantKV && ratio > 0 && isKvSource[layer]) {
+                batchedCompression = V41CompressDecodeBatch(segments, layer, ratio, rawKVAll, rawScoreAll,
+                    weight[pre + ".attn.compressor.norm.weight"], rms_norm_eps, rope, isIndexSource[layer],
+                    [&](Data &latent, Data &keys) {
+                        const std::string ipre = pre + ".attn.indexer";
+                        quantizedLinear(latent, ipre + ".wk.weight", keys, tp);
+                        V41RMSNormBF16(keys, weight[ipre + ".k_norm.weight"], rms_norm_eps, keys);
+                    }, tpDevices, *ws);
+            }
+#endif
+            auto finishAttention = [&](int s, Data &kvRows, Data &attentionOutput) {
+                const auto &seg = segments[s];
+                auto &cache = seg.state->layers[layer];
+                const int startPos = seg.startPos, segLen = seg.seqlen;
+                Data *kvSeg = &kvRows, *attnOutSeg = &attentionOutput;
+                Data kvSeg8;
+                const Data *windowRows = kvSeg;
+                if (quantKV) {
+                    // 滑窗 KV 在两档下都用 FP8：它本来就在 FP8 网格上，改 FP4 会真的损失精度
+                    V41QuantizeKV(*kvSeg, kvSeg8, 1, 32);
+                    windowRows = &kvSeg8;
+                }
+                if (seg.spec != nullptr && seg.spec->deferWindow) {
+                    // DSpark 校验：环形缓冲的写入推迟到接受长度确定之后。片段内的位置
+                    // 一律从 chunkKV 读取，因此推迟写入不改变本次前向的任何结果，
+                    // 也就不需要为回滚保存被覆盖的旧行。
+                    V41Assign(seg.spec->windowKV[layer], *windowRows, tpDevices);
+                } else {
+                    V41WindowStore(*windowRows, cache.windowKV, startPos, window_size);
+                }
+                // V4.1 quantizes the inverse-RoPE attention output in blocks
+                // of 32 before the grouped wo_a projection on every SM.
+                V41RotaryQuant(*attnOutSeg, rope, startPos, 1, true, 1, 32);
+                cache.totalLen = startPos + segLen;
+            };
+            // ---- attention（按片段准备，decode 合并提交）----
             for (int s = 0; s < numSegments; s++) {
                 const DeepSeekV41Segment &seg = segments[s];
                 DeepSeekV41LayerCache &cache = seg.state->layers[layer];
                 const int startPos = seg.startPos;
                 const int segLen = seg.seqlen;
 
-                Data *qSeg = sliceOf(q, s, segQ[s]);
-                V41RotaryQuant(*qSeg, rope, startPos, 1, false, 0, 32);
-                Data *kvSeg = sliceOf(kv, s, segKV[s]);
-                V41RotaryQuant(*kvSeg, rope, startPos, 1, false, 1, 32);
+                Data *qSeg = batchAttention ? &segQ[s] : sliceOf(q, s, segQ[s]);
+                if (!batchTransforms) V41RotaryQuant(*qSeg, rope, startPos, 1, false, 0, 32);
+                Data *kvSeg = batchAttention ? &segKV[s] : sliceOf(kv, s, segKV[s]);
+                if (!batchTransforms) V41RotaryQuant(*kvSeg, rope, startPos, 1, false, 1, 32);
 
                 Data *compressedKV = nullptr;
                 Data *cmpIdx = nullptr;
                 if (ratio > 0) {
                     const int src = kvSourceOf[layer];
                     DeepSeekV41LayerCache &srcCache = seg.state->layers[src];
-                    if (isKvSource[layer]) {
+                    if (isKvSource[layer] && !batchedCompression) {
                         std::string cpre = pre + ".attn.compressor";
                         Data rawKVSeg, rawScoreSeg, allKV, allScore;
                         Data *rawKV = sliceOf(rawKVAll, s, rawKVSeg);
@@ -4310,6 +4935,20 @@ namespace fastllm {
                     if (srcCache.compressedBlocks > 0) {
                         compressedKV = &srcCache.compressedKV;
                         if (needIndexer) {
+#ifdef USE_CUDA
+                            if (batchAttention && !quantKV) {
+                                const bool writeCandidates = layer == candidate_source_layer_id &&
+                                    candidate_block_size > 0 && candidate_topk_blocks > 0;
+                                const bool useCandidates = segHasCandidates[s] && candidate_source_layer_id >= 0 &&
+                                    candidate_source_layer_id < layer;
+                                indexTasks.push_back({sliceOf(qIdxAll, s, segIndexQ[s]),
+                                    sliceOf(idxWeightsAll, s, segIndexWeight[s]), &srcCache.indexK,
+                                    &segCandidate[s], &segTopK[s], startPos, writeCandidates, useCandidates});
+                                if (writeCandidates) segHasCandidates[s] = 1;
+                                cmpIdx = &segTopK[s];
+                            } else
+#endif
+                            {
                             Data qIdxSeg, idxWeightsSeg;
                             Data *qIdx = sliceOf(qIdxAll, s, qIdxSeg);
                             V41RotaryQuant(*qIdx, rope, startPos, 1, false, 2, 32);
@@ -4396,8 +5035,10 @@ namespace fastllm {
                                 }
                                 V41Assign(segTopK[s], topkAll, tpDevices);
                             }
+                            }
                         }
-                        if (segTopK[s].dims.size() == 3) {
+                        if (needIndexer) segHasTopK[s] = 1;
+                        if (segHasTopK[s] && segTopK[s].dims.size() == 3) {
                             cmpIdx = &segTopK[s];
                         }
                     }
@@ -4408,8 +5049,16 @@ namespace fastllm {
                 // attention 的 startPos 只用于局部窗口寻址；RoPE、indexer 和压缩 KV
                 // 的因果筛选已经按绝对位置完成。以新窗口起点 0 执行局部 attention。
                 const int windowStart = seg.seqlen < inputSegments[s].seqlen ? 0 : startPos;
+#ifdef USE_CUDA
+                if (batchAttention) {
+                    attentionRequests.push_back({qSeg, kvSeg, windowStart > 0 ? &cache.windowKV : nullptr,
+                        compressedKV, cmpIdx, attnOutSeg, windowStart});
+                } else
+#endif
+                {
                 V41SparseAttention(*qSeg, *kvSeg, windowStart > 0 ? &cache.windowKV : nullptr, compressedKV, cmpIdx,
                                    weight[pre + ".attn.attn_sink"], window_size, windowStart, softmaxScale, *attnOutSeg);
+                }
                 if (dumpDebug) {
                     std::string tag = "fl_layer" + std::to_string(layer);
                     V41DumpTensor(*qSeg, tag + "_q" + dumpSuffix);
@@ -4425,28 +5074,93 @@ namespace fastllm {
                         V41DumpTensor(cache.windowKV, tag + "_ring" + dumpSuffix);
                     }
                 }
-                Data kvSeg8;
-                const Data *windowRows = kvSeg;
-                if (quantKV) {
-                    // 滑窗 KV 在两档下都用 FP8：它本来就在 FP8 网格上，改 FP4 会真的损失精度
-                    V41QuantizeKV(*kvSeg, kvSeg8, 1, 32);
-                    windowRows = &kvSeg8;
-                }
-                if (seg.spec != nullptr && seg.spec->deferWindow) {
-                    // DSpark 校验：环形缓冲的写入推迟到接受长度确定之后。片段内的位置
-                    // 一律从 chunkKV 读取，因此推迟写入不改变本次前向的任何结果，
-                    // 也就不需要为回滚保存被覆盖的旧行。
-                    V41Assign(seg.spec->windowKV[layer], *windowRows, tpDevices);
-                } else {
-                    V41WindowStore(*windowRows, cache.windowKV, startPos, window_size);
-                }
-                V41RotaryQuant(*attnOutSeg, rope, startPos, 1, true, 0, 32);
-                cache.totalLen = startPos + segLen;
+                if (!batchAttention) finishAttention(s, *kvSeg, *attnOutSeg);
             }
 
+#ifdef USE_CUDA
+            if (batchAttention) {
+                // Index selection, attention, and ring update have device-local
+                // dependencies. Submit them together instead of handing the
+                // same stream back to the caller between all three stages.
+                bool completedTogether = false;
+                std::vector<V41DecodeTransform> finishTransforms;
+                std::function<void(int, int)> beforeAttention, afterAttention;
+                if (!quantKV && std::all_of(segments.begin(), segments.end(), [](const DeepSeekV41Segment &seg) {
+                        return !seg.spec || !seg.spec->deferWindow;
+                    })) {
+                    for (int s = 0; s < numSegments; ++s) {
+                        finishTransforms.push_back({&segKV[s], &segments[s].state->layers[layer].windowKV,
+                                                    segments[s].startPos, 0, false});
+                        finishTransforms.push_back({&segAttnOut[s], nullptr, segments[s].startPos, 1, true});
+                    }
+                    if (V41PrepareDecodeTransforms(finishTransforms, rope, window_size, tpDevices, afterAttention) &&
+                        (indexTasks.empty() || V41PrepareDecodeIndexer(indexTasks, rope, ratio, indexTopK,
+                            std::max(1, candidate_block_size), candidate_topk_blocks, tpDevices, beforeAttention))) {
+                        completedTogether = MultiCudaDeepSeekV41SparseAttentionBatch(attentionRequests,
+                            weight[pre + ".attn.attn_sink"], window_size, softmaxScale, tpDevices,
+                            beforeAttention, afterAttention,
+                            f.workerOrderedGraphReplay && !isKvSource[layer]);
+                    }
+                }
+                if (!completedTogether) {
+                    if (!indexTasks.empty() && !V41DecodeIndexerBatch(indexTasks, rope, ratio, indexTopK,
+                        std::max(1, candidate_block_size), candidate_topk_blocks, tpDevices)) {
+                        for (const auto &r : indexTasks) {
+                            V41RotaryQuant(*r.query, rope, r.startPos, 1, false, 2, 32);
+                            Data score;
+                            V41IndexerScore(*r.query, *r.weights, *r.keys, ratio, r.startPos, score);
+                            if (r.writeCandidates)
+                                V41CandidateBlocks(score, candidate_block_size, candidate_topk_blocks,
+                                                   ratio, r.startPos, *r.candidates);
+                            V41IndexerTopK(score, r.useCandidates ? r.candidates : nullptr, indexTopK,
+                                ratio, r.startPos, std::max(1, candidate_block_size), *r.topk);
+                        }
+                    }
+                    if (!MultiCudaDeepSeekV41SparseAttentionBatch(attentionRequests,
+                        weight[pre + ".attn.attn_sink"], window_size, softmaxScale, tpDevices)) {
+                        for (const auto &r : attentionRequests) {
+                            V41SparseAttention(*r.q, *r.chunkKV, r.ringKV, r.compressedKV, r.indices,
+                                weight[pre + ".attn.attn_sink"], window_size, r.startPos, softmaxScale, *r.output);
+                        }
+                    }
+                    // Do not overwrite a ring row until attention has read it.
+                    bool finished = false;
+                    if (!quantKV && std::all_of(segments.begin(), segments.end(), [](const DeepSeekV41Segment &seg) {
+                            return !seg.spec || !seg.spec->deferWindow;
+                        })) {
+                        std::vector<V41DecodeTransform> transforms;
+                        for (int s = 0; s < numSegments; ++s) {
+                            transforms.push_back({&segKV[s], &segments[s].state->layers[layer].windowKV,
+                                                  segments[s].startPos, 0, false});
+                            transforms.push_back({&segAttnOut[s], nullptr, segments[s].startPos, 1, true});
+                        }
+                        finished = V41DecodeTransforms(transforms, rope, window_size, tpDevices);
+                    }
+                    if (!finished) for (int s = 0; s < numSegments; ++s)
+                        finishAttention(s, segKV[s], segAttnOut[s]);
+                }
+                for (int s = 0; s < numSegments; ++s) {
+                    segments[s].state->layers[layer].totalLen = segments[s].startPos + 1;
+                }
+            }
+#endif
             ReleaseForwardPrefill(f, {&q, &kv, &attnInput, &rawKVAll, &rawScoreAll, &qIdxAll, &idxWeightsAll});
             for (int s = 0; s < numSegments; s++) ReleaseForwardPrefill(f, {&segQ[s], &segKV[s]});
-            Data *attnOutAll = single ? &attnOut : catSegments(segAttnOut, catTmp);
+            Data *attnOutAll = (single || mergedAttention) ? &attnOut : catSegments(segAttnOut, catTmp);
+            if (f.graphActive && !single && !mergedAttention) {
+                // The concatenation temporaries belong to this forward only.
+                // A graph must read the persistent boundary buffer instead.
+#ifdef USE_CUDA
+                if (tp && attnOutAll->IsTensorParallelSharded()) {
+                    AssertInFastLLM(MultiCudaCopyShardedActivation(attnOut, *attnOutAll, tpDevices),
+                                    "V4.1 graph attention boundary copy failed.");
+                } else
+#endif
+                {
+                    V41Assign(attnOut, *attnOutAll, tpDevices);
+                }
+                attnOutAll = &attnOut;
+            }
             // 【CUDA Graph 的 post 段】wo_a 到共享专家之间同样与 token 位置无关。
             // MergeMOEBlock（可能在 CPU / NUMA 上）与其后的 hc 残差留在段外。
             moeWeights = weights[layer];

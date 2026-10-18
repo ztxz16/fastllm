@@ -183,6 +183,18 @@ namespace fastllm {
     // Optional BF16 transport with FP32 accumulation and a single final
     // rounding. False leaves inputs untouched for the ordinary FP32 fallback.
     bool MultiCudaTryReduceReplicatedFp32Accumulated(Data &data);
+    // Batch independent attention requests on each TP rank.
+    // workerOrdered requires producer/consumer work on the same dedicated rank
+    // streams, with buffers kept alive until the enclosing forward drains them.
+    bool MultiCudaDeepSeekV41SparseAttentionBatch(
+        const std::vector<FastllmCudaV41AttentionRequest> &requests,
+        Data &attnSink, int windowSize, float scale, const std::vector<int> &devices,
+        const std::function<void(int, int)> &before = {},
+        const std::function<void(int, int)> &after = {}, bool workerOrdered = false);
+    // Copy compact TP activation shards while retaining destination addresses.
+    bool MultiCudaCopyShardedActivation(Data &dst, const Data &src, const std::vector<int> &devices,
+                                       bool copyData = true);
+
     // 将常驻 MultiCUDA worker 的 per-thread stream 接入/并回调用线程正在捕获的
     // 每卡 CUDA Graph。events 必须与 devices 一一对应并归属相同设备。
     bool MultiCudaGraphWorkersWaitEvents(const std::vector<int> &devices,

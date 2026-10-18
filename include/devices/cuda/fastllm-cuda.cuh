@@ -20,6 +20,14 @@ struct FastllmCudaRaggedGdnMetadataView {
     int maxPaddedTokens = 0;
 };
 
+// One independently positioned decode request. Tensor storage remains owned
+// by the caller until its CUDA stream has consumed the batch.
+struct FastllmCudaV41AttentionRequest {
+    const fastllm::Data *q, *chunkKV, *ringKV, *compressedKV, *indices;
+    fastllm::Data *output;
+    int startPos;
+};
+
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -963,6 +971,9 @@ bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, const fastllm
 bool FastllmCudaDeepSeekV41MarkovChain(const fastllm::Data &logits, const fastllm::Data &embedWeight,
                                        const fastllm::Data &headWeight, int anchorToken, int block,
                                        std::vector<int> &outTokens, fastllm::Data &outEmbeds);
+bool FastllmCudaDeepSeekV41SparseAttentionBatch(
+    const std::vector<FastllmCudaV41AttentionRequest> &requests,
+    fastllm::Data &attnSink, int windowSize, float softmaxScale);
 bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, const fastllm::Data &chunkKV,
                                            const fastllm::Data *ringKV, const fastllm::Data *compressedKV,
                                            const fastllm::Data *cmpIdx, fastllm::Data &attnSink,

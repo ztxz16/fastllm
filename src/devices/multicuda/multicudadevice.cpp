@@ -4286,17 +4286,33 @@ namespace fastllm {
         int repeatTimes;
         int rootDevice;
         int device;
+        bool repeatFromOutput;
 
         MultiCudaRepeatBroadcastOp(Data *rootInput, Data *localInput,
                                    Data *localOutput, int axis,
-                                   int repeatTimes, int rootDevice, int device) :
+                                   int repeatTimes, int rootDevice, int device, bool repeatFromOutput = false) :
                 rootInput(rootInput), localInput(localInput),
                 localOutput(localOutput), axis(axis),
                 repeatTimes(repeatTimes), rootDevice(rootDevice),
-                device(device) {}
+                device(device), repeatFromOutput(repeatFromOutput) {}
 
         void Run() override {
             FastllmCudaSetDevice(device);
+            if (repeatFromOutput) {
+                // For one outer row, the first output copy is also the
+                // broadcast staging area. Subsequent copies only read this
+                // prefix and write disjoint ranges, avoiding temporary replicas.
+                void *send = device == rootDevice ? rootInput->cudaData : localOutput->cudaData;
+                FastllmNcclBroadcastFrom(send, localOutput->cudaData, rootInput->Count(0),
+                                        rootInput->dataType, rootDevice, device);
+                if (repeatTimes > 1) {
+                    const int bytes = (int)rootInput->GetBytes();
+                    FastllmCudaRepeat(localOutput->cudaData,
+                        (uint8_t *)localOutput->cudaData + bytes, 1, repeatTimes - 1,
+                        bytes, bytes * (repeatTimes - 1), bytes, bytes);
+                }
+                return;
+            }
             void *send = device == rootDevice ? rootInput->cudaData :
                                                 localInput->cudaData;
             FastllmNcclBroadcastFrom(send, localInput->cudaData,
@@ -4344,11 +4360,14 @@ namespace fastllm {
         output.dataDevice = DataDevice::CUDA;
         output.dataDeviceIds = devices;
 
-        // Warmup creates these replicas.  Capture and replay only refresh their
-        // payloads, preserving every pointer recorded in the graph.
-        EnsureReplicatedMultiCudaTensor(input, devices, true);
+        // An unbatched repeat can broadcast straight into the first output
+        // slice. Other layouts retain independent broadcast staging replicas.
+        const bool repeatFromOutput = &input != &output && input.unitSizeDiv == 1 &&
+            input.Count(0) == input.Count(axis) && input.GetBytes() > 0 &&
+            output.GetBytes() <= (uint64_t)std::numeric_limits<int>::max();
+        if (!repeatFromOutput) EnsureReplicatedMultiCudaTensor(input, devices, true);
         EnsureReplicatedMultiCudaTensor(output, devices, false);
-        SyncReplicatedLocalShapeFromRoot(input, devices);
+        if (!repeatFromOutput) SyncReplicatedLocalShapeFromRoot(input, devices);
         SyncReplicatedLocalShapeFromRoot(output, devices);
         if (!FastllmInitNccl(devices)) {
             return false;
@@ -4356,10 +4375,9 @@ namespace fastllm {
 
         int originalDevice = FastllmCudaGetDevice();
         for (int device : devices) {
-            Data *localInput = input.multiDeviceDatas.at(device);
             Data *localOutput = output.multiDeviceDatas.at(device);
             FastllmCudaSetDevice(device);
-            localInput->Allocate(false);
+            if (!repeatFromOutput) input.multiDeviceDatas.at(device)->Allocate(false);
             localOutput->Allocate(false);
         }
         FastllmCudaSetDevice(originalDevice);
@@ -4368,9 +4386,9 @@ namespace fastllm {
         ops.reserve(devices.size());
         for (int device : devices) {
             ops.push_back(new MultiCudaRepeatBroadcastOp(
-                &input, input.multiDeviceDatas.at(device),
+                &input, repeatFromOutput ? nullptr : input.multiDeviceDatas.at(device),
                 output.multiDeviceDatas.at(device), axis, repeatTimes,
-                rootDevice, device));
+                rootDevice, device, repeatFromOutput));
         }
         RunMultiCudaDeviceOpsAndDelete(devices, ops);
         SyncReplicatedRootMetaFromDevice0(output, devices);
@@ -4389,18 +4407,22 @@ namespace fastllm {
         for (int device : devices) {
             if (!reuse) break;
             auto it = output.multiDeviceDatas.find(device);
-            std::vector<int> localDims = dims;
-            localDims[axis] = 0;
-            for (const auto &range : scheme.at(device)) localDims[axis] += range.second - range.first;
+            int localAxis = 0;
+            for (const auto &range : scheme.at(device)) localAxis += range.second - range.first;
             reuse = it != output.multiDeviceDatas.end() && it->second != nullptr &&
-                    it->second->dataType == output.dataType && it->second->dims == localDims &&
+                    it->second->dataType == output.dataType && it->second->dims.size() == dims.size() &&
                     it->second->dataDevice == DataDevice::CUDA && it->second->cudaData != nullptr;
+            if (reuse) for (size_t dim = 0; dim < dims.size(); ++dim)
+                if (it->second->dims[dim] != ((int)dim == axis ? localAxis : dims[dim])) {
+                    reuse = false;
+                    break;
+                }
         }
         if (!reuse) {
             PrepareMultiCudaShardedData(output, devices, dims, axis, scheme);
         } else {
-            output.Resize(dims);
-            output.tpGlobalDims = dims;
+            if (output.dims != dims) output.Resize(dims);
+            if (output.tpGlobalDims != dims) output.tpGlobalDims = dims;
         }
     }
 
@@ -4453,6 +4475,101 @@ namespace fastllm {
         FastllmCudaSetDevice(previousDevice);
         AssertInFastLLM(launched, "MultiCuda CPU activation broadcast failed.");
         return true;
+    }
+
+    static bool MultiCudaV41LocalHeadsValid(const Data &q, const std::vector<int> &devices);
+
+    bool MultiCudaDeepSeekV41SparseAttentionBatch(
+            const std::vector<FastllmCudaV41AttentionRequest> &requests,
+            Data &attnSink, int windowSize, float scale, const std::vector<int> &devices,
+            const std::function<void(int, int)> &before,
+            const std::function<void(int, int)> &after, bool workerOrdered) {
+        if (requests.empty() || devices.size() < 2) return false;
+        for (const auto &r : requests) {
+            if (!r.q || !r.output || !r.q->multiDeviceData || !r.q->IsTensorParallelSharded() ||
+                r.q->tpAxis != 2 || !MultiCudaV41LocalHeadsValid(*r.q, devices)) return false;
+        }
+        const auto &scheme = requests.front().q->tpRanges;
+        for (const auto &r : requests) if (r.q->tpRanges != scheme) return false;
+        auto mutableDevices = devices;
+        if (!attnSink.multiDeviceData && !SplitMultiCudaWeight1D(attnSink, mutableDevices, scheme)) return false;
+        for (const auto &r : requests) {
+            r.output->dataType = DataType::BFLOAT16;
+            PrepareV41ShardedOutput(*r.output, devices, r.q->dims, 2, scheme);
+        }
+        std::vector<int> ok(devices.size(), 0);
+        auto task = [&](int rank, int device) {
+            auto local = [&](const Data *root) -> const Data* {
+                if (!root) return nullptr;
+                auto found = root->multiDeviceDatas.find(device);
+                return found == root->multiDeviceDatas.end() ? nullptr : found->second;
+            };
+            std::vector<FastllmCudaV41AttentionRequest> batch;
+            for (const auto &r : requests) {
+                batch.push_back({local(r.q), local(r.chunkKV), local(r.ringKV), local(r.compressedKV),
+                    local(r.indices), r.output->multiDeviceDatas.at(device), r.startPos});
+                if (!batch.back().q || !batch.back().chunkKV || (r.ringKV && !batch.back().ringKV) ||
+                    (r.compressedKV && !batch.back().compressedKV) || (r.indices && !batch.back().indices)) return;
+            }
+            Data &sink = *attnSink.multiDeviceDatas.at(device);
+            if (before) before(rank, device);
+            if (!FastllmCudaDeepSeekV41SparseAttentionBatch(batch, sink, windowSize, scale)) {
+                if (FastllmCudaGetThreadError()) return;
+                // Preserve existing scalar/MMA support on other SMs and dtypes.
+                for (const auto &r : batch) {
+                    if (!FastllmCudaDeepSeekV41SparseAttention(*r.q, *r.chunkKV, r.ringKV, r.compressedKV,
+                        r.indices, sink, windowSize, r.startPos, scale, *r.output)) return;
+                }
+            }
+            if (after) after(rank, device);
+            ok[rank] = 1;
+        };
+        bool dispatched = workerOrdered && MultiCudaRunDeviceCallbacksEnqueueOnly(devices, task);
+        if (!dispatched) dispatched = MultiCudaRunDeviceCallbacks(devices, task);
+        if (!dispatched) {
+            const int originalDevice = FastllmCudaGetDevice();
+            for (size_t rank = 0; rank < devices.size(); ++rank) {
+                FastllmCudaSetDevice(devices[rank]);
+                task(rank, devices[rank]);
+                FastllmCudaSyncDevice(devices[rank]);
+            }
+            FastllmCudaSetDevice(originalDevice);
+        }
+        AssertInFastLLM(std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; }),
+                        "DeepSeekV41 batch attention failed on a TP rank.");
+        return true;
+    }
+
+    bool MultiCudaCopyShardedActivation(Data &dst, const Data &src,
+                                        const std::vector<int> &devices, bool copyData) {
+        if (&dst == &src) return true;
+        if (devices.size() < 2 || !src.multiDeviceData || !src.IsTensorParallelSharded()) return false;
+        for (int device : devices) {
+            auto it = src.multiDeviceDatas.find(device);
+            if (it == src.multiDeviceDatas.end() || it->second == nullptr ||
+                it->second->cudaData == nullptr || !IsCompactV41Activation(*it->second)) return false;
+        }
+        dst.dataType = src.dataType;
+        dst.UpdateUnitSize();
+        PrepareV41ShardedOutput(dst, devices, src.dims, src.tpAxis, src.tpRanges);
+        std::vector<int> ok(devices.size(), 0);
+        auto copy = [&](int rank, int device) {
+            FastllmCudaSetDevice(device);
+            Data &output = *dst.multiDeviceDatas.at(device);
+            const Data &input = *src.multiDeviceDatas.at(device);
+            output.Allocate(false);
+            ok[rank] = !copyData || FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                output.cudaData, input.cudaData, input.GetBytes());
+        };
+        if (!MultiCudaRunDeviceCallbacks(devices, copy)) {
+            const int originalDevice = FastllmCudaGetDevice();
+            for (size_t rank = 0; rank < devices.size(); ++rank) {
+                copy(rank, devices[rank]);
+                FastllmCudaSyncDevice(devices[rank]);
+            }
+            FastllmCudaSetDevice(originalDevice);
+        }
+        return std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; });
     }
 
     bool MultiCudaCopyReplicaToCpu(Data &dst, const Data &src,

@@ -7,6 +7,14 @@
 namespace fastllm {
     struct DeepSeekV41HybridWorkspace;
     struct DeepSeekV41DecodeWorkspace {
+        // Reuse request-row views and overwritten indexer outputs across
+        // decode calls. Per-forward validity flags still start empty: retained
+        // storage must never imply that an earlier request's indices are valid.
+        std::vector<Data> segTopK, segCandidate, segQ, segKV, segAttnOut;
+        std::vector<Data> segIndexQ, segIndexWeight;
+        Data compressJoined, compressScores, compressLatents, compressKeys;
+        std::vector<Data> compressLatentViews, compressKeyViews;
+
         DeepSeekV41DecodeWorkspace();
         ~DeepSeekV41DecodeWorkspace();
         Data hiddenStates, hiddenTemp, preMix, dsparkPreMix;

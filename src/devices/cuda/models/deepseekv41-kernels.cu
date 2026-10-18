@@ -1,3 +1,4 @@
+#include "fastllm-v41-decode.cuh"
 //
 // DeepSeek-V4.1 专用 CUDA kernel。
 //
@@ -20,6 +21,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
+#include <map>
+#include <array>
+#include <memory>
+#include <cstring>
+#include <stdexcept>
 #include <type_traits>
 #include <vector>
 
@@ -36,11 +42,121 @@ namespace {
 
     // 在当前 CUDA 设备上准备输出张量（与 deepseekv4-kernels.cu 中的同名逻辑一致）
     bool V41PrepareOutput(Data &output, DataType dataType, const std::vector<int> &dims) {
+        // Persistent outputs and borrowed decode rows are already on this
+        // rank. Avoid rebuilding metadata and querying capture state per row.
+        if (output.cudaData && output.dataDevice == DataDevice::CUDA &&
+            output.dataDeviceIds.size() == 1 && output.dataDeviceIds[0] == FastllmCudaGetDevice() &&
+            output.dataType == dataType && output.dims == dims &&
+            output.Count(0) <= output.expansionSize) return true;
         output.dataType = dataType;
         output.Resize(dims);
         output.ToDevice(DataDevice::CUDA, {FastllmCudaGetDevice()}, false);
         output.Allocate(false);
         return output.cudaData != nullptr;
+    }
+
+    // Separate slots are required: the indexer invokes the transform path
+    // while its own descriptors and scores are still in flight. A worker uses
+    // one per-thread CUDA stream, so reuse within each slot is stream ordered.
+    struct V41DecodeDeviceScratch {
+        void *storage = nullptr;
+        size_t capacity = 0;
+        int device = -1;
+        ~V41DecodeDeviceScratch() {
+            if (!storage) return;
+            const int previous = FastllmCudaGetDevice();
+            FastllmCudaSetDevice(device);
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(storage);
+            FastllmCudaSetDevice(previous);
+        }
+    };
+
+    void *V41BorrowDecodeScratch(int slot, size_t bytes) {
+        constexpr size_t limit = 128ULL * 1024 * 1024;
+        if (!bytes || bytes > limit || FastllmCudaGraphIsCapturingFast()) return nullptr;
+        static thread_local std::map<std::pair<int, int>, std::unique_ptr<V41DecodeDeviceScratch>> buffers;
+        const int device = FastllmCudaGetDevice();
+        auto &buffer = buffers[{device, slot}];
+        if (!buffer) {
+            buffer = std::make_unique<V41DecodeDeviceScratch>();
+            buffer->device = device;
+        }
+        if (buffer->capacity >= bytes) return buffer->storage;
+        size_t capacity = 64 * 1024;
+        while (capacity < bytes) capacity *= 2;
+        size_t available = 0, total = 0;
+        void *replacement = nullptr;
+        if (cudaMemGetInfo(&available, &total) != cudaSuccess ||
+            available < capacity + 256ULL * 1024 * 1024 ||
+            FastllmCudaTryDirectMalloc(&replacement, capacity) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS)
+            return nullptr;
+        if (buffer->storage) {
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(buffer->storage);
+        }
+        buffer->storage = replacement;
+        buffer->capacity = capacity;
+        return replacement;
+    }
+
+    // Keep host descriptors alive until the asynchronous upload completes.
+    // A bounded ring prevents per-layer pinned allocations and never reuses a
+    // slot whose copy is still in flight. Payload lifetime remains with callers.
+    struct V41DescriptorUploads {
+        struct Slot { void *host = nullptr; size_t capacity = 0; cudaEvent_t copied = nullptr; bool pending = false; };
+        std::array<Slot, 16> slots{};
+        size_t next = 0;
+        int device;
+        explicit V41DescriptorUploads(int device) : device(device) {}
+        ~V41DescriptorUploads() {
+            int previous = 0;
+            cudaGetDevice(&previous); cudaSetDevice(device);
+            for (auto &slot : slots) {
+                if (slot.pending) cudaEventSynchronize(slot.copied);
+                if (slot.copied) cudaEventDestroy(slot.copied);
+                if (slot.host) cudaFreeHost(slot.host);
+            }
+            cudaSetDevice(previous);
+        }
+    };
+
+    bool V41UploadDescriptors(void *dst, const void *src, size_t bytes) {
+        if (bytes > 128 * 1024 || FastllmCudaGraphIsCapturingFast())
+            return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+        static thread_local std::map<int, std::unique_ptr<V41DescriptorUploads>> pools;
+        const int device = FastllmCudaGetDevice();
+        auto &pool = pools[device];
+        if (!pool) pool.reset(new V41DescriptorUploads(device));
+        auto &slot = pool->slots[pool->next++ % pool->slots.size()];
+        if (slot.pending) {
+            const auto ready = cudaEventQuery(slot.copied);
+            if (ready == cudaErrorNotReady) {
+                if (cudaEventSynchronize(slot.copied) != cudaSuccess) return false;
+            } else if (ready != cudaSuccess) return false;
+            slot.pending = false;
+        }
+        if (!slot.copied && cudaEventCreateWithFlags(&slot.copied, cudaEventDisableTiming) != cudaSuccess)
+            return false;
+        if (slot.capacity < bytes) {
+            void *replacement = nullptr;
+            const size_t capacity = (bytes + 4095) & ~size_t(4095);
+            if (cudaHostAlloc(&replacement, capacity, cudaHostAllocDefault) != cudaSuccess) {
+                cudaGetLastError();
+                return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+            }
+            if (slot.host) cudaFreeHost(slot.host);
+            slot.host = replacement; slot.capacity = capacity;
+        }
+        std::memcpy(slot.host, src, bytes);
+        if (cudaMemcpyAsync(dst, slot.host, bytes, cudaMemcpyHostToDevice, cudaStreamPerThread) != cudaSuccess)
+            return false;
+        if (cudaEventRecord(slot.copied, cudaStreamPerThread) != cudaSuccess) {
+            cudaStreamSynchronize(cudaStreamPerThread);
+            return false;
+        }
+        slot.pending = true;
+        return true;
     }
 
     // ---------------- 类型转换 ----------------
@@ -1094,6 +1210,55 @@ namespace {
         V41Store<T>(base, d, v);
     }
 
+    struct V41DecodeTransformDescriptor {
+        __nv_bfloat16 *input, *window;
+        int rows, dim, position, mode, inverse, quantBlock;
+    };
+
+    template<int STRIDE = 1>
+    __global__ void V41DecodeTransformsKernel(const V41DecodeTransformDescriptor *items,
+                                               V41RopeTable rope, int ropeDim, int windowSize) {
+        const auto item = items[blockIdx.y * STRIDE];
+        const int rowsPerBlock = 512 / item.dim;
+        const int row = blockIdx.x * rowsPerBlock + threadIdx.x / item.dim;
+        if (row >= item.rows) return;
+        const int d = threadIdx.x % item.dim;
+        auto *base = item.input + (size_t)row * item.dim;
+        if (item.window) {
+            item.window[(size_t)(item.position % windowSize) * 512 + d] = base[d];
+            return;
+        }
+        float v = __bfloat162float(base[d]);
+        const float other = __shfl_xor_sync(0xffffffff, v, 1);
+        const int off = item.dim - ropeDim;
+        if (d >= off) {
+            const int k = d - off;
+            const float angle = (float)item.position * rope.invFreq[k >> 1];
+            float c = cosf(angle), s = sinf(angle);
+            if (item.inverse) s = -s;
+            // The RoPE-only reference evaluates the odd component with
+            // sine fused into the first product. Keep that FMA ordering:
+            // swapping the fused product can cross a BF16 rounding boundary.
+            if (item.mode == 0 && (k & 1))
+                v = __fmaf_rn(other, s, __fmul_rn(v, c));
+            else
+                v = (k & 1) ? (other * s + v * c) : (v * c - other * s);
+        }
+        v = V41Bf16Round(v);
+        if (item.mode) {
+            float maximum = fabsf(v);
+            if (item.quantBlock == 16) {
+                maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 8));
+                maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 4));
+                maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 2));
+                maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 1));
+            } else maximum = V41WarpMax(maximum);
+            const float scale = V41QuantScaleDev(maximum, item.mode);
+            v = V41QuantValueDev(v, scale, item.mode);
+        }
+        base[d] = __float2bfloat16_rn(v);
+    }
+
     // ---------------- Compress ----------------
 
     template <typename T>
@@ -1381,21 +1546,40 @@ namespace {
 #endif
     }
 
+    struct V41DecodeIndexDescriptor {
+        const __nv_bfloat16 *query, *keys;
+        const float *weights;
+        float *scores, *blockScores;
+        uint8_t *candidates;
+        int32_t *output;
+        int heads, count, width, position, blocks;
+        bool writeCandidates, useCandidates;
+    };
+
     // Decode uses heads as the MMA rows instead of padding one token to the
     // prefill kernel's 64 rows. Keep the dot-product and ordered head-sum
     // operations unchanged; the prefill kernel remains the general fallback.
+    template <bool BATCHED = false, bool PERSISTENT = false>
     __global__ void __launch_bounds__(256)
     V41IndexerScoreDecodeMmaKernel(const __nv_bfloat16 *q, const float *weights,
                                    const __nv_bfloat16 *k, int heads, int m,
                                    int ratio, int startPos, float *out,
-                                   const uint8_t *k8, int kMode, int kRowBytes, int vecUnpack) {
+                                   const uint8_t *k8, int kMode, int kRowBytes, int vecUnpack,
+                                   const V41DecodeIndexDescriptor *items = nullptr) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
         __shared__ __nv_bfloat16 ks[64][136];
         __shared__ __nv_bfloat16 qs[16][136];
         __shared__ float scores[16][64];
-        const int b = blockIdx.y, j0 = blockIdx.x * 64;
+        int b = blockIdx.y;
+        if (BATCHED) {
+            const auto item = items[b];
+            q = item.query; k = item.keys; weights = item.weights; out = item.scores;
+            heads = item.heads; m = item.count; startPos = item.position; b = 0;
+        }
         const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
         const int visible = ratio > 0 ? min(m, (startPos + 1) / ratio) : m;
+        const int end = PERSISTENT ? visible : (int)(blockIdx.x + 1) * 64;
+        for (int j0 = blockIdx.x * 64; j0 < end; j0 += gridDim.x * 64) {
         if (j0 >= visible) {
             if (tid < 64 && j0 + tid < m) out[(uint64_t)b * m + j0 + tid] = -INFINITY;
             return;
@@ -1446,6 +1630,8 @@ namespace {
             }
         }
         if (tid < 64 && j0 + tid < m) out[(uint64_t)b * m + j0 + tid] = total;
+        if constexpr (PERSISTENT) __syncthreads();
+        }
 #endif
     }
 
@@ -1504,9 +1690,18 @@ namespace {
 
     // ---------------- CandidateBlocks ----------------
 
+    template <bool BATCHED = false>
     __global__ void V41BlockScoreKernel(const float *score, int seqlen, int m, int blockSize, int numBlocks,
-                                        int ratio, int startPos, float *blockScore) {
-        const int t = blockIdx.x;
+                                        int ratio, int startPos, float *blockScore,
+                                        const V41DecodeIndexDescriptor *items = nullptr) {
+        int t = blockIdx.x;
+        if (BATCHED) {
+            const auto item = items[t];
+            if (!item.writeCandidates) return;
+            score = item.scores; blockScore = item.blockScores;
+            m = item.count; numBlocks = item.blocks; startPos = item.position;
+            seqlen = 1; t = 0;
+        }
         const int i = t % seqlen;
         const int visible = min(m, (startPos + i + 1) / ratio);
         const float *row = score + (uint64_t)t * m;
@@ -1526,8 +1721,15 @@ namespace {
         }
     }
 
-    __global__ void V41CandidateSelectKernel(const float *blockScore, int numBlocks, int topkBlocks, uint8_t *mask) {
-        const int t = blockIdx.x;
+    template <bool BATCHED = false>
+    __global__ void V41CandidateSelectKernel(const float *blockScore, int numBlocks, int topkBlocks, uint8_t *mask,
+                                               const V41DecodeIndexDescriptor *items = nullptr) {
+        int t = blockIdx.x;
+        if (BATCHED) {
+            const auto item = items[t];
+            if (!item.writeCandidates) return;
+            blockScore = item.blockScores; numBlocks = item.blocks; mask = item.candidates; t = 0;
+        }
         const float *brow = blockScore + (uint64_t)t * numBlocks;
         uint8_t *mrow = mask + (uint64_t)t * numBlocks;
         __shared__ unsigned hist[16];
@@ -1663,9 +1865,11 @@ namespace {
     // 共享内存里的候选块下标由 candList（动态共享内存）承载，listCap == 0 表示不压缩。
     constexpr int kTopKSurvivorCap = 1024;
 
+    template <bool BATCHED = false>
     __global__ void V41TopKKernel(const float *score, const uint8_t *candidates, int seqlen, int m,
                                   int numBlocks, int blockSize, int blockShift, int width,
-                                  int ratio, int startPos, int listCap, int32_t *out) {
+                                  int ratio, int startPos, int listCap, int32_t *out,
+                                  const V41DecodeIndexDescriptor *items = nullptr) {
         typedef cub::BlockScan<int, kSelThreads> BlockScan;
         __shared__ typename BlockScan::TempStorage scanStorage;
         __shared__ unsigned hist[256];
@@ -1673,7 +1877,14 @@ namespace {
         __shared__ int meta[4];             // 0: digit, 1: remaining, 2: 候选块个数
         extern __shared__ int candList[];
 
-        const int t = blockIdx.x;
+        int t = blockIdx.x;
+        if (BATCHED) {
+            const auto item = items[t];
+            score = item.scores; candidates = item.useCandidates ? item.candidates : nullptr;
+            m = item.count; numBlocks = item.blocks; width = item.width;
+            startPos = item.position; out = item.output; seqlen = 1; t = 0;
+            listCap = candidates ? min(numBlocks, listCap) : 0;
+        }
         const int i = t % seqlen;
         const int visible = min(m, (startPos + i + 1) / ratio);
         const float *row = score + (uint64_t)t * m;
@@ -2876,6 +3087,41 @@ namespace {
         if (lane == 0) output[(uint64_t)token * n + row] = __float2bfloat16_rn(total);
     }
 
+    // Eight consecutive BF16 values per lane reduce the number of CTAs on
+    // large tensors. Four lanes still reduce exactly one block-32 maximum;
+    // conversion, scaling and storage rounding are unchanged.
+
+template<int V>
+__global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __nv_bfloat16 *output, uint64_t elements) {
+    constexpr int GROUP = 32 / V;
+    const uint64_t index = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) * V;
+    __align__(16) __nv_bfloat16 values[V];
+    if (index + V <= elements) {
+        if constexpr (V == 8) *reinterpret_cast<uint4*>(values) = *reinterpret_cast<const uint4*>(input + index);
+        if constexpr (V == 4) *reinterpret_cast<uint2*>(values) = *reinterpret_cast<const uint2*>(input + index);
+        if constexpr (V == 2) *reinterpret_cast<uint32_t*>(values) = *reinterpret_cast<const uint32_t*>(input + index);
+    } else {
+#pragma unroll
+        for (int j = 0; j < V; ++j) values[j] = index+j < elements ? input[index+j] : __float2bfloat16_rn(0.f);
+    }
+    float maximum = 0.f;
+#pragma unroll
+    for (int j = 0; j < V; ++j) maximum = fmaxf(maximum, fabsf(__bfloat162float(values[j])));
+#pragma unroll
+    for (int offset = GROUP/2; offset; offset >>= 1)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset, GROUP));
+    const float scale = V41QuantScaleDev(maximum, 1);
+#pragma unroll
+    for (int j = 0; j < V; ++j) values[j] = __float2bfloat16_rn(V41QuantValueDev(__bfloat162float(values[j]), scale, 1));
+    if (index + V <= elements) {
+        if constexpr (V == 8) *reinterpret_cast<uint4*>(output + index) = *reinterpret_cast<const uint4*>(values);
+        if constexpr (V == 4) *reinterpret_cast<uint2*>(output + index) = *reinterpret_cast<const uint2*>(values);
+        if constexpr (V == 2) *reinterpret_cast<uint32_t*>(output + index) = *reinterpret_cast<const uint32_t*>(values);
+    } else {
+#pragma unroll
+        for (int j = 0; j < V; ++j) if (index+j < elements) output[index+j] = values[j];
+    }
+}
     template<class T>
     __global__ void V41QuantizeActivationKernel(const T *input, T *output, uint64_t elements) {
         uint64_t index = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -3189,7 +3435,9 @@ extern "C" bool FastllmCudaDeepSeekV41HcPreNorm(const fastllm::Data &x, const fa
     if (pre.Count(0) != (uint64_t)tokens * hcMult) {
         return false;
     }
-    normWeight.ToDevice(DataDevice::CUDA);
+    // Called directly by TP workers as well as the single-device executor.
+    // The default executor device may differ from this worker's device.
+    normWeight.ToDevice(DataDevice::CUDA, std::vector<int>{FastllmCudaGetDevice()}, true);
     if (normWeight.dataType != DataType::FLOAT32 || normWeight.dims.size() != 1 ||
         normWeight.dims[0] != channels || normWeight.cudaData == nullptr) {
         return false;
@@ -3395,7 +3643,7 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const
     if (q.dataType == DataType::BFLOAT16 && (kQuant || k.dataType == DataType::BFLOAT16) && dim == kIdxDim &&
         !V41EnvOn("FASTLLM_DSV41_LEGACY_INDEXER")) {
         if (seqlen == 1 && heads > 0 &&
-            V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel, 256>()) {
+            V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<false>, 256>()) {
             V41IndexerScoreDecodeMmaKernel<<<dim3((m + 63) / 64, bsz), 256>>>(
                 (const __nv_bfloat16*)q.cudaData, (const float*)weights.cudaData,
                 kQuant ? nullptr : (const __nv_bfloat16*)k.cudaData, heads, m, ratio, startPos,
@@ -3466,8 +3714,13 @@ extern "C" bool FastllmCudaDeepSeekV41CandidateBlocks(const fastllm::Data &score
                                          ratio, startPos, blockScore);
     V41CandidateSelectKernel<<<tokens, kSelThreads>>>(blockScore, numBlocks, topkBlocks, (uint8_t*)output.cudaData);
     bool ok = V41CheckLaunch("CandidateBlocks");
-    cudaDeviceSynchronize();
-    FastllmCudaFree(blockScore);
+    // Both producers and the only consumer use this thread's CUDA stream.
+    // Delay pool reuse until that stream completes, without draining other
+    // streams or stalling the CPU for every request in a decode batch.
+    if (!FastllmCudaFreeAfterCurrentThreadStream(blockScore)) {
+        FastllmCudaSyncCurrentThreadStream();
+        FastllmCudaFree(blockScore);
+    }
     return ok;
 }
 
@@ -3554,7 +3807,7 @@ static bool Glm5HybridIndexerScore(const fastllm::Data &query,
         FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
     struct Scratch {
         void *ptr;
-        ~Scratch() { if (!FastllmCudaFreeAfterCurrentThreadStream(ptr)) FastllmCudaFree(ptr); }
+        ~Scratch() { if (!FastllmCudaFreeAfterCurrentThreadStream(ptr)) { cudaStreamSynchronize(cudaStreamPerThread); FastllmCudaFree(ptr); } }
     } scratch{allocation};
     if (!V41PrepareOutput(output, DataType::FLOAT32, {1, rows, candidates})) return false;
     auto *dots = static_cast<float *>(allocation);
@@ -3652,6 +3905,129 @@ bool FastllmCudaGlm5NextHybridSparseAttention(const fastllm::Data &query,
         if (!V41CheckLaunch("GlmHybridAttentionValues")) return false;
     }
     return true;
+}
+
+template<int splits, bool MATERIALIZED = true>
+static bool V41SparseAttentionBatchImpl(
+        const std::vector<FastllmCudaV41AttentionRequest> &requests,
+        fastllm::Data &attnSink, int windowSize, float softmaxScale) {
+    if (requests.empty() || requests.size() > 1024 || windowSize < 0 ||
+        V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") || V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN") ||
+        !V41OnCuda(attnSink) || attnSink.dataType != DataType::FLOAT32) return false;
+    using PvShared = typename std::conditional<MATERIALIZED,
+        V41MmaPvShared<splits>, V41MmaShared>::type;
+    if constexpr (MATERIALIZED) {
+        if (!V41MmaKernelReady<V41SparseAttentionScoresKernel<true>, kMmaThreads, sizeof(V41MmaShared)>()) return false;
+    }
+    if (!V41MmaKernelReady<V41SparseAttentionMmaKernel<splits, MATERIALIZED, true>, kMmaThreads, sizeof(PvShared)>()) return false;
+    int heads = 0, maxTiles = 0;
+    std::vector<V41AttentionDescriptor> descriptors;
+    descriptors.reserve(requests.size());
+    for (const auto &r : requests) {
+        if (!r.q || !r.chunkKV || !r.output || r.startPos <= 0 ||
+            !V41OnCuda(*r.q) || !V41OnCuda(*r.chunkKV) ||
+            r.q->dataType != DataType::BFLOAT16 || r.chunkKV->dataType != DataType::BFLOAT16 ||
+            r.q->dims.size() != 4 || r.q->dims[0] != 1 || r.q->dims[1] != 1 ||
+            r.q->dims[2] <= 0 || r.q->dims[3] != kMmaDim ||
+            r.chunkKV->dims.size() != 3 || r.chunkKV->dims[0] != 1 ||
+            r.chunkKV->dims[1] != 1 || r.chunkKV->dims[2] != kMmaDim) return false;
+        if (heads && heads != r.q->dims[2]) return false;
+        heads = r.q->dims[2];
+        if (attnSink.Count(0) < heads) return false;
+        V41AttentionDescriptor d{};
+        d.q = (const __nv_bfloat16*)r.q->cudaData;
+        d.chunkKV = (const __nv_bfloat16*)r.chunkKV->cudaData;
+        d.startPos = r.startPos;
+        d.ringMode = d.cmpMode = 1;
+        if (windowSize) {
+            if (!r.ringKV || !V41OnCuda(*r.ringKV) || r.ringKV->dims.size() != 3 ||
+                r.ringKV->dims[0] != 1 || r.ringKV->dims[1] != windowSize) return false;
+            if (r.ringKV->dataType == DataType::INT8) {
+                int block = 0;
+                d.ringRowBytes = r.ringKV->dims[2];
+                if (!V41ParseKvRowHost(kMmaDim, d.ringRowBytes, &d.ringMode, &block)) return false;
+                d.ringKV8 = (const uint8_t*)r.ringKV->cudaData;
+            } else if (r.ringKV->dataType == DataType::BFLOAT16 && r.ringKV->dims[2] == kMmaDim) {
+                d.ringKV = (const __nv_bfloat16*)r.ringKV->cudaData;
+            } else return false;
+        }
+        if (r.compressedKV && r.indices && !r.compressedKV->dims.empty() && r.compressedKV->Count(0)) {
+            if (!V41OnCuda(*r.compressedKV) || !V41OnCuda(*r.indices) ||
+                r.compressedKV->dims.size() != 3 || r.compressedKV->dims[0] != 1 ||
+                r.indices->dataType != DataType::INT32 || r.indices->dims.size() != 3 ||
+                r.indices->dims[0] != 1 || r.indices->dims[1] != 1) return false;
+            d.cap = r.compressedKV->dims[1];
+            d.topWidth = r.indices->dims[2];
+            d.indices = (const int32_t*)r.indices->cudaData;
+            if (r.compressedKV->dataType == DataType::INT8) {
+                int block = 0;
+                d.cmpRowBytes = r.compressedKV->dims[2];
+                if (!V41ParseKvRowHost(kMmaDim, d.cmpRowBytes, &d.cmpMode, &block)) return false;
+                d.compressedKV8 = (const uint8_t*)r.compressedKV->cudaData;
+            } else if (r.compressedKV->dataType == DataType::BFLOAT16 && r.compressedKV->dims[2] == kMmaDim) {
+                d.compressedKV = (const __nv_bfloat16*)r.compressedKV->cudaData;
+            } else return false;
+        }
+        d.vecUnpack = V41Fp4VecUnpack() && d.ringRowBytes % 16 == 0 && d.cmpRowBytes % 16 == 0;
+        maxTiles = std::max(maxTiles, (windowSize + d.topWidth + kMmaNC - 1) / kMmaNC);
+        descriptors.push_back(d);
+    }
+    const size_t descriptorBytes = (descriptors.size() * sizeof(V41AttentionDescriptor) + 255) / 256 * 256;
+    const size_t scoreStride = MATERIALIZED ? (size_t)heads * maxTiles * kMmaNC : 0;
+    const size_t bytes = descriptorBytes + descriptors.size() * scoreStride * sizeof(float);
+    if (!maxTiles || bytes > 128 * 1024 * 1024) return false;
+    void *allocation = V41BorrowDecodeScratch(0, bytes);
+    const bool borrowed = allocation != nullptr;
+    if (!allocation && FastllmCudaTryMalloc(&allocation, bytes) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
+    struct Scratch {
+        void *ptr;
+        bool owned;
+        ~Scratch() { if (owned && !FastllmCudaFreeAfterCurrentThreadStream(ptr)) FastllmCudaFree(ptr); }
+    } scratch{allocation, !borrowed};
+    auto *deviceDescriptors = (V41AttentionDescriptor*)allocation;
+    float *scores = (float*)((uint8_t*)allocation + descriptorBytes);
+    for (size_t i = 0; i < requests.size(); ++i) {
+        if (!V41PrepareOutput(*requests[i].output, DataType::BFLOAT16, requests[i].q->dims)) return false;
+        descriptors[i].output = (__nv_bfloat16*)requests[i].output->cudaData;
+        descriptors[i].scores = MATERIALIZED ? scores + i * scoreStride : nullptr;
+    }
+    if (!V41UploadDescriptors(deviceDescriptors, descriptors.data(),
+            descriptors.size() * sizeof(V41AttentionDescriptor))) return false;
+    const int headBlocks = (heads + kMmaHeads - 1) / kMmaHeads;
+    if constexpr (MATERIALIZED) {
+    V41SparseAttentionScoresKernel<true><<<dim3(requests.size(), headBlocks, maxTiles), kMmaThreads, sizeof(V41MmaShared), cudaStreamPerThread>>>(
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1, heads, windowSize,
+        0, 0, 0, nullptr, 0, 0, 0, 0, 0, deviceDescriptors);
+    if (!V41CheckLaunch("BatchedSparseAttentionScores")) return false;
+    }
+    V41SparseAttentionMmaKernel<splits, MATERIALIZED, true><<<dim3(requests.size(), headBlocks, splits), kMmaThreads, sizeof(PvShared), cudaStreamPerThread>>>(
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        (const float*)attnSink.cudaData, 1, heads, windowSize, 0, 0, 0, softmaxScale,
+        nullptr, 0, 0, 0, 0, 0, nullptr, deviceDescriptors);
+    return V41CheckLaunch("BatchedSparseAttentionValues");
+}
+
+extern "C" bool FastllmCudaDeepSeekV41SparseAttentionBatch(
+        const std::vector<FastllmCudaV41AttentionRequest> &requests,
+        fastllm::Data &attnSink, int windowSize, float softmaxScale) {
+    // Small batches split value dimensions to expose parallelism. Once
+    // enough requests are ready, fewer splits avoid repeating online
+    // softmax, score loads and barriers. Each output keeps the same
+    // 64-slot probability rounding and PV accumulation sequence.
+    const size_t batch = requests.size();
+    const size_t headBlocks = batch && requests[0].q && requests[0].q->dims.size() == 4
+        ? (requests[0].q->dims[2] + kMmaHeads - 1) / kMmaHeads : 1;
+    if (batch * headBlocks >= 128) {
+        // With enough independent requests, compute QK and PV together and
+        // read each selected KV tile once. Keep the materialized implementation
+        // when the device cannot accommodate the fused shared-memory layout.
+        if (V41SparseAttentionBatchImpl<1, false>(requests, attnSink, windowSize, softmaxScale)) return true;
+        if (FastllmCudaGetThreadError()) return false;
+        return V41SparseAttentionBatchImpl<1>(requests, attnSink, windowSize, softmaxScale);
+    }
+    if (batch * headBlocks >= 64)
+        return V41SparseAttentionBatchImpl<2>(requests, attnSink, windowSize, softmaxScale);
+    return V41SparseAttentionBatchImpl<8>(requests, attnSink, windowSize, softmaxScale);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, const fastllm::Data &chunkKV,
@@ -3873,7 +4249,12 @@ extern "C" bool FastllmCudaDeepSeekV41QuantizeActivation(const fastllm::Data &in
     uint64_t count = input.Count(0);
     if (!count) return true;
     unsigned int blocks = (unsigned int)((count + 255) / 256);
-    if (input.dataType == fastllm::DataType::BFLOAT16)
+    if (input.dataType == fastllm::DataType::BFLOAT16 && count >= 256 * 1024 &&
+        reinterpret_cast<uintptr_t>(input.cudaData) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(output.cudaData) % 16 == 0) {
+        V41QuantizeActivationVectorKernel<8><<<(count + 2047) / 2048, 256>>>(
+            (const __nv_bfloat16*)input.cudaData, (__nv_bfloat16*)output.cudaData, count);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16)
         V41QuantizeActivationKernel<<<blocks, 256>>>((const __nv_bfloat16*)input.cudaData, (__nv_bfloat16*)output.cudaData, count);
     else if (input.dataType == fastllm::DataType::FLOAT16)
         V41QuantizeActivationKernel<<<blocks, 256>>>((const half*)input.cudaData, (half*)output.cudaData, count);
@@ -3993,4 +4374,143 @@ extern "C" bool FastllmCudaDeepSeekV41MoeHcPost(const fastllm::Data &input, cons
     }
 #undef V41_MOE_HCPOST
     return V41CheckLaunch("MoeHcPost");
+}
+
+extern "C" bool FastllmCudaV41DecodeTransformsBatch(
+        const std::vector<FastllmCudaV41DecodeTransform> &items,
+        int ropeDim, float ropeBase, int originalSeqLen, float ropeFactor,
+        int betaFast, int betaSlow, int windowSize) {
+    if (items.empty() || items.size() > 65535 || ropeDim <= 0 || ropeDim > 128 ||
+        (ropeDim & 1) || windowSize <= 0 || V41LegacyRotary() ||
+        V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH")) return false;
+    std::vector<V41DecodeTransformDescriptor> descriptors;
+    int maxRows = 0;
+    for (const auto &item : items) {
+        if (!item.input || !V41OnCuda(*item.input) || item.input->dataType != DataType::BFLOAT16 ||
+            (item.input->dims.size() != 3 && item.input->dims.size() != 4) ||
+            item.input->dims[0] != 1 || item.input->dims[1] != 1 ||
+            (item.input->dims.back() != 512 && item.input->dims.back() != 128) ||
+            item.startPos < 0 || item.quantMode < 0 || item.quantMode > 3 ||
+            (item.quantBlock != 16 && item.quantBlock != 32)) return false;
+        const int dim = item.input->dims.back();
+        const int rows = item.input->Count(0) / dim;
+        if (!rows) return false;
+        if (item.window && (dim != 512 || rows != 1 || !V41OnCuda(*item.window) ||
+            item.window->dataType != DataType::BFLOAT16 ||
+            item.window->dims != std::vector<int>({1, windowSize, 512}))) return false;
+        descriptors.push_back({(__nv_bfloat16 *)item.input->cudaData,
+            item.window ? (__nv_bfloat16 *)item.window->cudaData : nullptr,
+            rows, dim, item.startPos, item.quantMode, item.inverse ? 1 : 0, item.quantBlock});
+        maxRows = std::max(maxRows, (rows + 512 / dim - 1) / (512 / dim));
+    }
+    const size_t bytes = descriptors.size() * sizeof(V41DecodeTransformDescriptor);
+    void *storage = V41BorrowDecodeScratch(1, bytes);
+    const bool borrowed = storage != nullptr;
+    if (!storage) storage = FastllmCudaMalloc(bytes);
+    auto *device = (V41DecodeTransformDescriptor *)storage;
+    if (!device) return false;
+    if (!V41UploadDescriptors(device, descriptors.data(), bytes)) {
+        if (!borrowed) FastllmCudaFree(device);
+        return false;
+    }
+    auto rope = V41BuildRope(ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
+    V41DecodeTransformsKernel<<<dim3(maxRows, items.size()), 512, 0, cudaStreamPerThread>>>(
+        device, rope, ropeDim, windowSize);
+    const bool ok = V41CheckLaunch("DecodeTransformsBatch");
+    if (!borrowed && !FastllmCudaFreeAfterCurrentThreadStream(device)) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+        FastllmCudaFree(device);
+    }
+    if (!ok) throw std::runtime_error("DeepSeekV41 decode batch kernel launch failed");
+    return true;
+}
+
+
+extern "C" bool FastllmCudaV41DecodeIndexerBatch(
+        const std::vector<FastllmCudaV41DecodeIndexTask> &items,
+        int ratio, int topK, int blockSize, int candidateTopK,
+        int ropeDim, float ropeBase, int originalSeqLen, float ropeFactor,
+        int betaFast, int betaSlow, bool quantizeQuery) {
+    if (items.empty() || items.size() > 65535 || ratio <= 0 || topK <= 0 || blockSize <= 0 || candidateTopK <= 0 ||
+        V41LegacyTopK() || V41LegacyRotary() || V41EnvOn("FASTLLM_DSV41_LEGACY_INDEXER") ||
+        V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") ||
+        !V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<true>, 256>()) return false;
+    std::vector<V41DecodeIndexDescriptor> descriptors;
+    std::vector<FastllmCudaV41DecodeTransform> transforms;
+    size_t scoreCount = 0, blockCount = 0;
+    int maxCount = 0, maxBlocks = 0;
+    bool candidatesWritten = false;
+    for (const auto &item : items) {
+        if (!item.query || !item.weights || !item.keys || !item.topk ||
+            !V41OnCuda(*item.query) || !V41OnCuda(*item.weights) || !V41OnCuda(*item.keys) ||
+            item.query->dataType != DataType::BFLOAT16 || item.keys->dataType != DataType::BFLOAT16 ||
+            item.weights->dataType != DataType::FLOAT32 || item.query->dims.size() != 4 ||
+            item.query->dims[0] != 1 || item.query->dims[1] != 1 || item.query->dims[3] != 128 ||
+            item.keys->dims.size() != 3 || item.keys->dims[0] != 1 || item.keys->dims[2] != 128 ||
+            item.keys->dims[1] <= 0 || item.startPos < 0 || ropeDim <= 0 || ropeDim > 128 || (ropeDim & 1)) return false;
+        const int m = item.keys->dims[1], heads = item.query->dims[2], blocks = (m + blockSize - 1) / blockSize;
+        if (heads <= 0 || item.weights->Count(0) != size_t(heads)) return false;
+        if ((item.useCandidates || item.writeCandidates) && (!item.candidates ||
+            !V41OnCuda(*item.candidates) || item.candidates->dataType != DataType::INT8 ||
+            item.candidates->dims != std::vector<int>({1, 1, blocks}))) return false;
+        if (!V41PrepareOutput(*item.topk, DataType::INT32, {1, 1, std::min(topK, m)})) return false;
+        descriptors.push_back({(const __nv_bfloat16 *)item.query->cudaData,
+            (const __nv_bfloat16 *)item.keys->cudaData, (const float *)item.weights->cudaData,
+            nullptr, nullptr, (item.useCandidates || item.writeCandidates) ? (uint8_t *)item.candidates->cudaData : nullptr,
+            (int32_t *)item.topk->cudaData, heads, m, std::min(topK, m), item.startPos, blocks,
+            item.writeCandidates, item.useCandidates});
+        transforms.push_back({item.query, nullptr, item.startPos, quantizeQuery ? 2 : 0, false});
+        scoreCount += m; blockCount += blocks;
+        maxCount = std::max(maxCount, m); maxBlocks = std::max(maxBlocks, blocks);
+        candidatesWritten |= item.writeCandidates;
+    }
+    const size_t descriptorBytes = descriptors.size() * sizeof(V41DecodeIndexDescriptor);
+    if ((scoreCount + blockCount) * sizeof(float) > 128ULL * 1024 * 1024) return false;
+    const size_t bytes = descriptorBytes + (scoreCount + blockCount) * sizeof(float);
+    auto *storage = (uint8_t *)V41BorrowDecodeScratch(2, bytes);
+    const bool borrowed = storage != nullptr;
+    if (!storage) storage = (uint8_t *)FastllmCudaMalloc(bytes);
+    if (!storage) return false;
+    auto *scores = (float *)(storage + descriptorBytes);
+    auto *blocks = scores + scoreCount;
+    for (auto &item : descriptors) {
+        item.scores = scores; scores += item.count;
+        item.blockScores = blocks; blocks += item.blocks;
+    }
+    if (!V41UploadDescriptors(storage, descriptors.data(), descriptorBytes)) {
+        if (!borrowed && !FastllmCudaFreeAfterCurrentThreadStream(storage)) {
+            cudaStreamSynchronize(cudaStreamPerThread);
+            FastllmCudaFree(storage);
+        }
+        return false;
+    }
+    if (!FastllmCudaV41DecodeTransformsBatch(transforms, ropeDim, ropeBase, originalSeqLen,
+                                           ropeFactor, betaFast, betaSlow, 1)) {
+        if (!borrowed && !FastllmCudaFreeAfterCurrentThreadStream(storage)) {
+            cudaStreamSynchronize(cudaStreamPerThread);
+            FastllmCudaFree(storage);
+        }
+        return false;
+    }
+    auto *device = (const V41DecodeIndexDescriptor *)storage;
+    V41IndexerScoreDecodeMmaKernel<true><<<dim3((maxCount + 63) / 64, items.size()), 256, 0, cudaStreamPerThread>>>(
+        nullptr, nullptr, nullptr, 0, 0, ratio, 0, nullptr, nullptr, 0, 0, 0, device);
+    if (candidatesWritten) {
+        V41BlockScoreKernel<true><<<items.size(), 256, 0, cudaStreamPerThread>>>(
+            nullptr, 1, 0, blockSize, 0, ratio, 0, nullptr, device);
+        V41CandidateSelectKernel<true><<<items.size(), kSelThreads, 0, cudaStreamPerThread>>>(
+            nullptr, 0, candidateTopK, nullptr, device);
+    }
+    int shift = -1;
+    for (int i = 0; i < 31; ++i) if ((1 << i) == blockSize) { shift = i; break; }
+    const int listCap = shift >= 0 ? std::min(maxBlocks, 4096) : 0;
+    V41TopKKernel<true><<<items.size(), kSelThreads, (size_t)listCap * sizeof(int), cudaStreamPerThread>>>(
+        nullptr, nullptr, 1, 0, 0, blockSize, shift, 0, ratio, 0, listCap, nullptr, device);
+    const bool ok = V41CheckLaunch("DecodeIndexerBatch");
+    if (!borrowed && !FastllmCudaFreeAfterCurrentThreadStream(storage)) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+        FastllmCudaFree(storage);
+    }
+    if (!ok) throw std::runtime_error("DeepSeekV41 decode batch kernel launch failed");
+    return true;
 }
