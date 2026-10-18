@@ -57,6 +57,28 @@ CUDA/NUMA 混推在有专家显存缓存时，默认让 prefill 和 decode 复�
 排查或对照测试可设置 `FASTLLM_MOE_PREFILL_CACHE=0`，同时旁路 prefill 的驻留调度、缓存读取和写入，不关闭 decode 缓存；正常运行无需设置。在两次请求之间读取 `ftllm.llm.get_moe_cuda_cache_prefill_stats(device=0)` 并相减，可得到共享原生路径的调用数、GPU 专家/路由数、命中专家/路由数、避免上传的字节数、实际上传字节数和新写入专家数。统计读取会同步 GPU，不能放入吞吐计时区间；不包含独立 grouped GGUF 后端，GPU 内部布局还原也不计入上传字节。
 
 
+## DeepSeek FP8 WoA 的通用 prefill GEMM
+
+DeepSeek-V4/V4.1 的 CUDA WoA 投影在 token 数不小于 16 时，默认尝试分组 GEMM，并按设备能力使用 Tensor Core；混合推理和全 GPU 推理共用入口，不依赖 `--auto`、专家缓存或 `fast_prefill`。支持可变 token 数、batch、分组数和输出 rank，以及 FP8 block32、block128 和矩形量化块；非对齐的 K/N、token 尾块和不足 128 个元素的输入量化尾块均有边界处理，不要求固定 SM 数。原有 SM120 的 7/8-token 特化仍保留；其他小批量走原有归约路径，奇数 rank/量化行块走逐行归约。
+
+WoA 根据实际设备能力和数值条件选择计算路径，所有路径都保留已有的 FP8 权重解码到 FP16 的舍入：
+
+- SM80 及以上，BF16 输入且所有权重 scale 均为 float32 正规数表示的 2 的整数幂或正零时，解码结果可以精确表示为 BF16。直接使用 BF16 Tensor Core、FP32 累加并输出 BF16，省去输入展开和独立输出转换。每次调用检查实际 scale，不使用可能失效的指针缓存。
+- SM80 及以上的其余 BF16/FP16 输入，将输入和解码权重精确展开到 FP32，使用 TF32 Tensor Core 和 FP32 累加，再舍入到 BF16。FP16 权重与 BF16/FP16 输入都能精确表示为 TF32，不额外损失乘法输入精度。
+- SM75 使用 pedantic FP32 cuBLAS GEMM；未量化的 FLOAT32 输入也使用该路径，避免 TF32 截断。更早设备或 cuBLAS 拒绝时继续使用通用归约实现。
+
+SM120 上仍保留原有 WoA 输入 E4M3/UE8M0 量化。行宽能被 128 整除时，每个 warp 处理一组 128 个元素，用 shuffle 完成最大值归约、一次计算并广播 scale，再进行四元素 FP8 转换；非对齐行继续走有边界检查的实现。GEMM 的累加顺序与原有 SIMT 归约不同，结果允许 BF16 精度内的数值差异，不承诺投影逐位一致。SM120 以下仍按原有行为不执行这一步输入量化。
+
+展开后的权重只在本次调用中使用，不建立跨请求的常驻权重缓存。真实 G=8、N=1024、K=4096 形状的 BF16 路径只需 64 MiB 权重工作区，直接读取输入、写入输出，默认每次 GEMM 处理最多 4096 行。TF32/FP32 路径另需 128 MiB 权重工作区，token 工作区按最多 1024 行、通常不超过 160 MiB 分块（单行超过该预算时仍保留一行）。它们由现有 CUDA 内存池管理和复用，不能等同于请求结束立即归还驱动的显存。输入量化和最终输出的现有存储另计。
+
+无需新增启动参数。A/B 排查可设置以下环境变量，恢复时取消变量：
+
+- `FASTLLM_DSV4_DISABLE_CUDA_WOA_GEMM=1`：关闭全部 WoA GEMM，回退到 SIMT；不关闭专家缓存或输入量化。
+- `FASTLLM_DSV4_DEBUG_CUDA_WOA_GEMM=1`：输出命中形状及 cuBLAS 拒绝状态。
+
+构建 `deepseekV4WoAGemmRegression` 后运行可检查 FP64 独立参考、小批量回退、奇数维度、矩形量化块、输入范围、输入量化和真实投影形状；附加 `--bench` 输出SIMT 回退与自动 GEMM 路径的含同步交替测速中位数。旧架构验证需使用对应的 `compute_75/80/89` 编译 WoA 并测试对应能力分支；在新 GPU 上 JIT 执行旧 PTX 只能验证兼容路径，不能代表旧 GPU 的实际吞吐，也不能替代完整模型在旧 GPU 上的部署验证。
+
+
 ## 逐项自动预算
 
 Qwen4、GLM-5.3 和 DeepSeek-V4.1 的混合推理命令支持以下可选值：
