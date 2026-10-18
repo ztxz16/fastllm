@@ -388,22 +388,33 @@ printf("\n");
 }
 */
 
-static std::map<int, cublasHandle_t> s_fastllmCublasHandleMap;
 // CUDA Graph capture cannot rely on cuBLAS lazily allocating its default
 // workspace. Keep one process-lifetime workspace next to each process-lifetime
 // handle when graphs are enabled. The size is configurable for memory-tight
 // deployments, while 32 MiB covers the default workspace used by recent
 // architectures (including Blackwell).
-static std::map<int, void*> s_fastllmCublasWorkspaceMap;
+struct FastllmCublasState {
+    std::mutex mutex;
+    cublasHandle_t handle = nullptr;
+    void *workspace = nullptr;
+};
+static std::map<int, std::unique_ptr<FastllmCublasState>> s_fastllmCublasHandleMap;
 static std::mutex s_fastllmCublasHandleMapMutex;
 cublasHandle_t getFastllmCublasHandle() {
     int id = -1;
     cudaGetDevice(&id);
-    // 线程级张量并行时，多个 worker 线程会并发访问该全局 map，
-    // 必须加锁，否则并发读写 std::map 会破坏其内部结构导致死循环/崩溃。
-    std::lock_guard<std::mutex> guard(s_fastllmCublasHandleMapMutex);
-    auto it = s_fastllmCublasHandleMap.find(id);
-    if (it != s_fastllmCublasHandleMap.end()) {
+    FastllmCublasState *state;
+    {
+        // Only protect the registry here. CUDA initialization/allocation may
+        // wait for this rank's pending NCCL work; holding a cross-device lock
+        // would prevent another rank from reaching the matching collective.
+        std::lock_guard<std::mutex> guard(s_fastllmCublasHandleMapMutex);
+        auto &entry = s_fastllmCublasHandleMap[id];
+        if (!entry) entry = std::make_unique<FastllmCublasState>();
+        state = entry.get();
+    }
+    std::lock_guard<std::mutex> guard(state->mutex);
+    if (state->handle != nullptr) {
         // Every FastLLM CUDA operator uses the per-thread default stream, and
         // the symbolic cudaStreamPerThread handle remains valid when the
         // cublas handle is subsequently used by a persistent worker thread.
@@ -411,7 +422,7 @@ cublasHandle_t getFastllmCublasHandle() {
         // cublasSetStream resets cuBLAS workspace state and is not safe inside
         // an already active CUDA Graph capture. Keep the handle's stream
         // stable after creation so warmed GEMMs can be captured and replayed.
-        return it->second;
+        return state->handle;
     }
     cublasHandle_t handler = nullptr;
     auto stat = cublasCreate(&handler);
@@ -439,7 +450,7 @@ cublasHandle_t getFastllmCublasHandle() {
                     stat = cublasSetWorkspace(
                         handler, workspace, graphWorkspaceBytes);
                     if (stat == CUBLAS_STATUS_SUCCESS) {
-                        s_fastllmCublasWorkspaceMap[id] = workspace;
+                        state->workspace = workspace;
                     } else {
                         FastllmCudaDirectFree(workspace);
                         std::fprintf(
@@ -453,7 +464,7 @@ cublasHandle_t getFastllmCublasHandle() {
                 }
             }
         }
-        s_fastllmCublasHandleMap[id] = handler;
+        state->handle = handler;
     }
 
     return handler;

@@ -1020,11 +1020,9 @@ Data NaiveN05FlashModel::RunTarget(
                     // including inactive padded rows in a captured graph.
                     FastllmNcclBroadcast(indices.cudaData, indices.Count(0), INT32,
                                         tpDevices[IndexerOwnerRank(layer)], gpu);
-                    // Eager prefill may lazily initialize cuBLAS on the next
-                    // request. Do not hold its process-wide initialization lock
-                    // while this broadcast still needs the owner's projection.
-                    // Captured decode already has all workspaces initialized.
-                    if (!decodeWorkspace) FastllmCudaSyncCurrentThreadStream();
+                    // The broadcast meets all ranks at host submission, and
+                    // attention consumes its indices on the same stream.
+                    // No per-request GPU completion barrier is needed here.
                 }
                 selected = &indices;
             }

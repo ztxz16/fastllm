@@ -3409,13 +3409,45 @@ void FastllmNcclBroadcastFrom(void* send, void* recv, int count, int dataType, i
         return;
     }
 
+    // Eager ranks must finish preparing and submitting the same collective
+    // before one enters a new cuBLAS kernel/module. Otherwise lazy CUDA driver
+    // initialization can block the rank whose broadcast is still missing.
+    // The loading/warmup path keeps its existing GPU sync; graph capture must
+    // not participate in a host rendezvous.
+    auto *rendezvous = FastllmCudaGetNcclForceSync() ? nullptr : g_ncclSubmitRendezvous.get();
+    int rank = -1;
+    if (rendezvous != nullptr) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        cudaError_t state = cudaStreamIsCapturing(stream, &capture);
+        if (state != cudaSuccess) {
+            rendezvous->Abort("Broadcast stream capture query failed");
+            cudaGetLastError();
+            FastllmCudaSetThreadError();
+            return;
+        }
+        if (capture != cudaStreamCaptureStatusNone) rendezvous = nullptr;
+        else {
+            auto it = g_ncclRanks.find(deviceId);
+            if (it != g_ncclRanks.end()) rank = it->second;
+        }
+    }
+    auto waitForRanks = [&](fastllm::NcclSubmitRendezvous::Phase phase) {
+        if (rendezvous == nullptr || rendezvous->Wait(rank, phase, count, dataType)) return true;
+        printf("Error: Broadcast submission on device %d: %s\n",
+               deviceId, rendezvous->Error().c_str());
+        FastllmCudaSetThreadError();
+        return false;
+    };
+    if (!waitForRanks(fastllm::NcclSubmitRendezvous::Before)) return;
     ncclResult_t res = ncclBroadcast(send, recv, count, ncclType, rootRank, comm, stream);
     
     if (res != ncclSuccess) {
+        if (rendezvous != nullptr) rendezvous->Abort("ncclBroadcast submission failed");
         printf("Error: ncclBroadcast failed on device %d: %s\n", deviceId, ncclGetErrorString(res));
         FastllmCudaSetThreadError();
         return;
     }
+    if (!waitForRanks(fastllm::NcclSubmitRendezvous::After)) return;
     // 发射后立即同步：保证返回时集合通信已完成，不残留在途通信。无 P2P 的多卡(经 PCIe/SHM)下，
     // 若集合通信在途时另一线程触发真实 cudaMalloc(持 CUDA 驱动锁并隐式同步)，会与 NCCL 主机 proxy
     // 争用驱动锁形成跨 rank 死锁。同步发射可彻底消除该竞态。
