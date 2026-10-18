@@ -39,8 +39,15 @@ namespace fastllm {
         // A complete decode step spans every layer. Admission runs afterward,
         // outside graph capture, while the attention/shared segments retain
         // their stable graph-owned tensors. Unsupported layouts retain NUMA.
-        if (!tp && single && seqlen == 1 &&
-            V41EnvFlag("FASTLLM_DSV41_MOE_FREQUENCY") && FastllmCudaMoeCacheRequested() &&
+        // Native cache requests (including --auto) enable this path by default. Keep
+        // the explicit legacy switch only as an opt-out for comparisons.
+        const char *frequency = std::getenv("FASTLLM_DSV41_MOE_FREQUENCY");
+        const bool nativeFrequency = weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0 ||
+                                     weights[0][2]->dataType == FP8_E4M3_BLOCK_128;
+        const bool frequencyEnabled = frequency ?
+            V41EnvFlag("FASTLLM_DSV41_MOE_FREQUENCY") : nativeFrequency;
+        if (!tp && single && seqlen == 1 && frequencyEnabled &&
+            FastllmCudaMoeCacheRequested() &&
             !V41ReferenceMathEnabled() && GetCudaSharedExpert() &&
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
             (this->deviceMap.empty() || V41DeviceMapUsesCuda(this->deviceMap)) &&

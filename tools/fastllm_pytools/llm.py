@@ -755,6 +755,25 @@ def get_moe_cuda_cache_route_stats(device: int = 0):
     result["gpu_fraction"] = result["gpu_routes"] / routes if routes else None
     return result
 
+def get_moe_cuda_cache_prefill_stats(device: int = 0):
+    """Read native host-prefill cache transport counts between requests.
+
+    Includes direct resident aliases and on-device restoration of shared NUMA
+    layouts. Grouped GGUF has a separate path and is not included. Reused bytes
+    count host uploads avoided; temporary on-device conversion is not a hit
+    penalty. Synchronizes the device; subtract snapshots without resetting.
+    """
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_prefill_stats", None)
+    if query is None:
+        raise RuntimeError("Prefill cache statistics require an updated CUDA build")
+    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_bool
+    values = (ctypes.c_uint64 * 8)()
+    if not query(int(device), values):
+        raise RuntimeError("Could not read prefill cache statistics")
+    return dict(zip(("calls", "gpu_experts", "gpu_routes", "resident_experts", "resident_routes",
+                     "reused_bytes", "uploaded_bytes", "admitted_experts"), values))
+
 def set_moe_cpu_cache(bytes_: int):
     bytes_ = int(bytes_)
     if bytes_ < 0 or bytes_ > (1 << 64) - 1:

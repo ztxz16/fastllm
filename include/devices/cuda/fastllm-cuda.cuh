@@ -1861,7 +1861,7 @@ bool FastllmCudaPrepareMoeCache(
 bool FastllmCudaCanRunMoeCache(
         fastllm::Data **weights, int weightsBatch);
 
-// Snapshot of canonical GGUF or native compact GLM records on this GPU.
+// Snapshot of canonical or native shared expert records on this GPU.
 // create permits lazy allocation of a prepared cache; no admission/eviction
 // is performed. The caller must finish
 // using these pointers before the next decode/cache mutation or cache release.
@@ -1870,7 +1870,9 @@ struct FastllmCudaMoePrefillResidents {
     int weightType = -1;
     int gateType = -1, downType = -1, hidden = 0, inter = 0;
     int ownerRank = 0, ownerCount = 1;
-    bool nativeGlm = false;
+    bool nativeGlm = false; // GGUF grouped backend math compatibility
+    bool nativeWeights = false; // Directly consumed by existing host-prefill kernels.
+    bool sharedWeights = false; // Native or losslessly restored NUMA layout.
 };
 bool FastllmCudaGetMoePrefillResidents(fastllm::Data **weights, int experts,
                                   FastllmCudaMoePrefillResidents &view, bool create = false);

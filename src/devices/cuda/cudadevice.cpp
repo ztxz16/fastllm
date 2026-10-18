@@ -12,6 +12,8 @@
 #include "devices/cuda/cudadevice.h"
 
 #include "fastllm-cuda.cuh"
+#include "devices/multicuda/fastllm-multicuda.cuh"
+#include "devices/cuda/fastllm-cuda-moe-prefill.h"
 
 extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data&, const fastllm::Data&,
     const fastllm::Data&, const fastllm::Data&, fastllm::Data&);
@@ -8977,59 +8979,13 @@ namespace fastllm {
             }
         }
 
-        // The existing multi-row GLM kernels consume the same compact NUMA
-        // layout as decode. Borrow resident/admission records without changing
-        // the source weights shared by CPU and CUDA assist workers.
-        Data **sourceWeights = weights;
-        std::vector<Data *> cachedWeights;
-        std::vector<std::unique_ptr<Data>> cacheAliases;
+        // Cache transport is shared across model families. Numerical semantics
+        // remain in the existing projection/activation/reduction code below.
 #ifndef USE_ROCM
-        FastllmCudaMoePrefillPlan admission;
-        FastllmCudaMoePrefillResidents resident;
-        if (setZero && isCrossSwiglu && gateType == MoeGateSwiglu &&
-            deepSeekV4Mode && activationQuantBlock == 128 &&
-            input.dataType == BFLOAT16 && output.dataType == BFLOAT16 &&
-            weights[2] && (weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED ||
-                           weights[2]->dataType == DATA_GGUF_FORMAT ||
-                           weights[2]->dataType == FP8_E4M3_BLOCK_128) &&
-            FastllmCudaGetMoePrefillResidents(weights, m, resident, cacheAdmission) &&
-            resident.nativeGlm) {
-            // Layer-partitioned models admit only on the root GPU. With
-            // expert ownership, every GPU admits its own experts instead.
-            if (cacheAdmission || resident.ownerCount > 1) FastllmCudaPlanMoePrefill(weights, m, indexData,
-                scoreData, batch, topk, experts, admission);
-            cachedWeights.assign(weights, weights + 2 * (m + 1));
-            for (int e : experts) {
-                if (e <= 0 || e > m || expertTasks[e].empty()) continue;
-                for (int part = 0; part < 2; ++part) {
-                    const int at = 2 * (e - 1) + part;
-                    const void *pointer = resident.weights[at];
-                    if (!pointer && at < int(admission.weights.size())) pointer = admission.weights[at];
-                    if (!pointer) continue;
-                    const Data &source = *weights[2 * e + part];
-                    auto alias = std::make_unique<Data>(source.dataType);
-                    alias->isFake = true;
-                    alias->dims = source.dims;
-                    alias->strides = source.strides;
-                    alias->ggmlType = source.ggmlType;
-                    alias->ggmlTensor = source.ggmlTensor;
-                    alias->isGGUFData = source.isGGUFData;
-                    alias->IsRepacked = source.IsRepacked;
-                    alias->disableGGUFRepack = source.disableGGUFRepack;
-                    alias->forceGGUFFp32Dequant = source.forceGGUFFp32Dequant;
-                    alias->expansionSize = source.Count(0);
-                    alias->UpdateUnitSize();
-                    alias->dataDevice = DataDevice::CUDA;
-                    alias->cudaData = const_cast<void *>(pointer);
-                    alias->cudaDataBorrowed = true;
-                    alias->dataDeviceIds = {curDeviceId};
-                    alias->blockK = source.blockK; alias->blockM = source.blockM;
-                    cachedWeights[2 * e + part] = alias.get();
-                    cacheAliases.push_back(std::move(alias));
-                }
-            }
-            weights = cachedWeights.data();
-        }
+        FastllmCudaMoePrefillCache prefillCache;
+        const bool cachedPrefill = setZero && isCrossSwiglu && gateType == MoeGateSwiglu &&
+            prefillCache.Begin(weights, m, indexData, scoreData, batch, topk, experts, cacheAdmission);
+        if (cachedPrefill) weights = prefillCache.Weights();
 #endif
 
         // Match the NUMA CPU path's FP32 projection outputs and expert
@@ -9214,39 +9170,22 @@ namespace fastllm {
         // Temporary uploads preserve host storage; disk-cache residents have
         // none and must keep their device allocation after this invocation.
         auto uploadWeight = [&](int slot, void *stream = nullptr) {
-            Data *weight = weights[slot];
 #ifndef USE_ROCM
-            if (weight != sourceWeights[slot]) {
-                if (slot - 2 < int(admission.weights.size()) && admission.weights[slot - 2]) {
-                    const auto &source = *sourceWeights[slot];
-                    const size_t bytes = source.GetBytes() / source.numasData.size();
-                    for (size_t node = 0; node < source.numasData.size(); ++node) {
-                        auto *target = static_cast<uint8_t *>(weight->cudaData) + node * bytes;
-                        if (stream) FastllmCudaCopyFromPinnedHostToDeviceAsync(
-                            target, source.numasData[node], bytes, stream);
-                        else AssertInFastLLM(FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
-                            target, source.numasData[node], bytes), "GLM prefill cache upload failed.");
-                    }
-                }
-                return;
-            }
+            if (cachedPrefill) { prefillCache.Upload(slot, stream); return; }
 #endif
+            Data *weight = weights[slot];
             if (weight->cpuData || !weight->numasData.empty()) weight->ToCudaTemporary({}, true, stream);
         };
-        auto releaseWeight = [](Data *weight) {
+        auto releaseWeight = [&](int slot) {
+#ifndef USE_ROCM
+            if (cachedPrefill) { prefillCache.Release(slot); return; }
+#endif
+            Data *weight = weights[slot];
             if (weight->cpuData || !weight->numasData.empty()) weight->FreeCudaTemporary({}, false);
         };
         void *copyStream = FastllmCudaStreamCreate(true);
         void *computeDoneEvent = FastllmCudaEventCreate();
         int curExpert = findNextValidExpert(-1);
-
-#ifndef USE_ROCM
-        // GGUF cache admission belongs to the packed host-prefill backend.
-        // Its generic fallback does not have the native NUMA byte layout.
-        if (setZero && isCrossSwiglu && !deepSeekV4Mode && gateType == MoeGateSwiglu &&
-            weights[2]->dataType != DATA_GGUF_FORMAT && !weights[2]->isGGUFData)
-            FastllmCudaPlanMoePrefill(weights, m, indexData, scoreData, batch, topk, experts, admission);
-#endif
 
         if (curExpert >= 0) {
             uploadWeight(curExpert * 2);
@@ -9360,8 +9299,7 @@ namespace fastllm {
             }
 
 #ifndef USE_ROCM
-            if (!resident.nativeGlm)
-                FastllmCudaStoreMoePrefillExpert(admission, i - 1, *weights[i * 2], *weights[i * 2 + 1]);
+            if (cachedPrefill) prefillCache.Store(i - 1);
 #endif
             FastllmCudaEventRecord(computeDoneEvent);
             FastllmCudaStreamWaitEvent(copyStream, computeDoneEvent);
@@ -9371,8 +9309,8 @@ namespace fastllm {
             }
 
             if (prevExpert >= 0) {
-                releaseWeight(weights[prevExpert * 2]);
-                releaseWeight(weights[prevExpert * 2 + 1]);
+                releaseWeight(prevExpert * 2);
+                releaseWeight(prevExpert * 2 + 1);
             }
 
             prevExpert = curExpert;
@@ -9381,14 +9319,11 @@ namespace fastllm {
 
         if (prevExpert >= 0) {
             FastllmCudaEventSynchronize(computeDoneEvent);
-            releaseWeight(weights[prevExpert * 2]);
-            releaseWeight(weights[prevExpert * 2 + 1]);
+            releaseWeight(prevExpert * 2);
+            releaseWeight(prevExpert * 2 + 1);
         }
 #ifndef USE_ROCM
-        FastllmCudaPublishMoePrefill(admission);
-        // DoCudaMergeMOEFromCPU also serves short-lived prefill workers. Their
-        // per-thread stream must publish residency before the worker exits.
-        if (!admission.keys.empty()) FastllmCudaSyncCurrentThreadStream();
+        if (cachedPrefill) prefillCache.Finish();
 #endif
         if (accurateFp8Moe || deepSeekV41Mode) {
             FastllmFloatToBF16(

@@ -16,3 +16,10 @@ extern "C" bool fastllm_moe_cuda_cache_route_stats(int device, uint64_t *values)
 // local payload bytes, cached routes computed locally, uploaded expert bytes.
 // Uses the same snapshot rules as route_stats.
 extern "C" bool fastllm_moe_cuda_cache_ep_stats(int device, uint64_t *values);
+
+// Native host-expert prefill transport counters, including layout restoration.
+// values[8]: layer calls, GPU experts, GPU routes, resident experts, resident
+// routes, bytes reused without host upload, uploaded bytes, admitted experts.
+// Grouped GGUF backends have separate execution paths and are not counted here.
+// Same idle/snapshot rules as route_stats; never resets cache or policy.
+extern "C" bool fastllm_moe_cuda_cache_prefill_stats(int device, uint64_t *values);

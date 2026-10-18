@@ -42,6 +42,21 @@ ftllm server /path/to/model.gguf --auto --device cudapp=2
 
 启动打印 `[auto]`，给出最终模式、设备、线程、chunk、驻留、缓存、上下文及内存预算；`model.hybrid_auto_plan` 保存同一结果。权重精度、路由数学和采样算法保持原有实现。
 
+## 混合推理共用的 prefill 专家缓存
+
+CUDA/NUMA 混推在有专家显存缓存时，默认让 prefill 和 decode 复用同一份缓存与热度策略。这个运行时能力也适用于手动配置，不依赖 `--auto`。Qwen 标准 MoE、DeepSeek-V4.1、GLM-5.3 共用权重传输层：原生布局一致时直接借用显存记录；布局不一致时在 GPU 上还原原有 NUMA 字节布局，包括 gate/up 行序和 FP8/NVFP4 scale。未命中的专家继续临时上传，符合热度策略的记录写入有容量上限的缓存。
+
+原生格式的缓存已有 decode 历史时，prefill 保留已有记录、decode 热度和更新周期，只按当前路由热度填充空槽。已满缓存的替换交给后续 decode 观察决定，避免长提示词覆盖 decode 工作集、导致 prefill 提升却生成变慢。冷缓存仍可按原有 prefill 热度策略装入专家；GGUF 保留原有阶段策略。
+
+支持现有共享 NUMA 缓存注册的标准 FP8（block128/per-channel）、NVFP4（float-scale/planar/compact）、DeepSeek-V4.1 FP8 block128/NVFP4 block32，以及 GLM-5.3 原生 FP8 block128/compact NVFP4。GGUF 保留原有 grouped prefill 路径。没有可用缓存或布局不受支持时，继续执行原有主存路径。
+
+调度器根据整层 CPU/GPU 并行执行的实测耗时调整分流；原生 DeepSeek-V4.1 和 GLM-5.3 也使用这一反馈路径。原生逐专家路径中，低路由量的已驻留专家仍可分配到 CPU，避免缓存命中引入过多小算子开销；分配到 GPU 的已驻留专家使用拥有其记录的设备。显式 `FT_EXPERT_LIMIT` 固定 CPU/GPU 分流阈值，但不固定多个 GPU 之间的专家分配；后者仍可依据实测耗时调整，BF16 分组归约不保证跨次逐位一致。辅助 GPU 可以读取已有缓存，写入仍遵循原有 owner/admission 规则。
+
+该优化保留现有投影、激活、量化和归并算子，不启用 `fast_prefill` 的近似注意力。缓存命中仍需要计算；需要布局还原时还会有 GPU 内存读写，因此 prefill 加速幅度取决于缓存覆盖率、PCIe 搬运与算子耗时。
+
+排查或对照测试可设置 `FASTLLM_MOE_PREFILL_CACHE=0`，同时旁路 prefill 的驻留调度、缓存读取和写入，不关闭 decode 缓存；正常运行无需设置。在两次请求之间读取 `ftllm.llm.get_moe_cuda_cache_prefill_stats(device=0)` 并相减，可得到共享原生路径的调用数、GPU 专家/路由数、命中专家/路由数、避免上传的字节数、实际上传字节数和新写入专家数。统计读取会同步 GPU，不能放入吞吐计时区间；不包含独立 grouped GGUF 后端，GPU 内部布局还原也不计入上传字节。
+
+
 ## 逐项自动预算
 
 Qwen4、GLM-5.3 和 DeepSeek-V4.1 的混合推理命令支持以下可选值：

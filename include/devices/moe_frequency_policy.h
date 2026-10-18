@@ -205,9 +205,18 @@ public:
 
     // Prefill preserves its existing scale and borrowed-pointer protection.
     // Only the first prefill layer converts preceding decode history.
-    void ObservePrefill(int base, const std::vector<int> &counts, int rows) {
+    bool HasDecodeHistory() const { return steps > 0; }
+
+    void ObservePrefill(int base, const std::vector<int> &counts, int rows,
+                        bool preserveDecode = false) {
         if (rows <= 0 || base < 0 || size_t(base) + counts.size() > keys.size())
             throw std::invalid_argument("invalid MoE prefill histogram");
+        if (preserveDecode && HasDecodeHistory()) {
+            // A long prompt must not decay/rewrite an established decode
+            // working set. Vacant payload slots can still be filled without
+            // fabricating decode heat or changing its observation interval.
+            return;
+        }
         if (!prefill) {
             ScaleScores(float(prefillHalfLife) / (config.halfLife > 0 ? config.halfLife : prefillHalfLife));
             prefill = true;
@@ -222,13 +231,15 @@ public:
         }
     }
 
-    Admission SelectPrefill(int key, int base, const std::vector<int> &active) const {
+    Admission SelectPrefill(int key, int base, const std::vector<int> &active,
+                            bool emptyOnly = false) const {
         if (key < 0 || key >= int(keys.size()) || !keys[key].eligible ||
-            keys[key].slot >= 0 || keys[key].score <= 0)
+            keys[key].slot >= 0 || (!emptyOnly && keys[key].score <= 0))
             return {};
         const int slot = FindPrefillVictim(residents[keyPartitions[key]], 0, -1, base, active);
         if (slot < 0) return {};
         const int old = slots[slot];
+        if (emptyOnly && old >= 0) return {};
         if (old >= 0 && keys[key].score <= keys[old].score * prefillReplacementFactor +
             prefillReplacementMargin) return {};
         return {key, slot};
