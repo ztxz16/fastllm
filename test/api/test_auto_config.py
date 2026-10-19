@@ -91,6 +91,38 @@ class AutoConfigTest(unittest.TestCase):
         self.assertEqual(p['resident_layers'], self.g.layers)
         self.assertEqual((p['moe_device_layers'], p['moe_cuda_cache']), (0, 0))
 
+    def test_dense_qwen3_uses_real_gqa_geometry_and_budgets_a_tied_output_head(self):
+        metadata = dict(model_type="qwen3", num_hidden_layers=28, hidden_size=1024,
+                        num_attention_heads=16, num_key_value_heads=8, head_dim=128,
+                        intermediate_size=3072, max_position_embeddings=40960)
+        g = memory.geometry(metadata, "float16", 0)
+        self.assertEqual(sum(g.kv), 28 * 8 * 128 * 2 * 2)
+        self.assertEqual(g.attention_score_heads, 16)
+        embedding = memory.Tensor("model.embed_tokens.weight", (151936, 1024), 151936 * 1024 * 2, "BF16")
+        tensors = [embedding, memory.Tensor("model.layers.0.mlp.up_proj.weight", (3072, 1024), GiB, "BF16")]
+        a = self.args()
+        with patch.object(memory, 'inventory', return_value=(metadata, tensors)), \
+                patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+            p = auto.resolve(a, self.gpu.__getitem__, hardware=self.hardware, ram=self.ram, use_numa=True)
+            self.assertEqual(os.environ['FASTLLM_CUDA_GRAPH'], '0')
+            self.assertFalse(p['automatic']['cuda_graph'])
+        self.assertEqual((a.max_context_length, a.moe_device_layers, a.moe_cuda_cache, a.moe_cpu_cache),
+                         (40960, 0, 0, 0))
+        costs = memory.weight_costs(tensors, g, a)
+        self.assertEqual(sum(costs[0]), 0)
+        self.assertGreaterEqual(costs[2], 2 * embedding.bytes)
+        self.assertLessEqual(p['host_estimated_bytes'], p['host_budget_bytes'])
+        for d in p['gpu_budget_bytes']:
+            self.assertLessEqual(p['gpu_estimated_bytes'][d], p['gpu_budget_bytes'][d])
+        for mtp, dspark in ((1, 0), (0, 7)):
+            with self.assertRaises(ValueError):
+                memory.geometry(metadata, "float16", mtp, dspark)
+        with patch.object(memory, 'inventory', return_value=(metadata, tensors)), \
+                patch.dict(os.environ, {'FASTLLM_CUDA_GRAPH': '1'}, clear=True), redirect_stdout(io.StringIO()):
+            p = auto.resolve(self.args(), self.gpu.__getitem__, hardware=self.hardware, ram=self.ram, use_numa=True)
+            self.assertEqual(os.environ['FASTLLM_CUDA_GRAPH'], '1')
+            self.assertTrue(p['automatic']['cuda_graph'])
+
     def test_hybrid_prefers_cache_and_keeps_per_device_headroom(self):
         self.g.experts = 256
         self.costs = ([4 * GiB] * 4, [1 << 20] * 4, 1 << 20, 0, GiB, False)

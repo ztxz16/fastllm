@@ -247,6 +247,12 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if base.max_batch <= 0:
         base.max_batch = 1
     metadata, tensors, model = memory.model_inputs(base)
+    # Dense Qwen3's graph warmup currently hits stream-capture-unsupported
+    # in the deferred CUDA pool. Keep its new auto adapter on eager CUDA;
+    # an explicit environment override still opts into graph execution.
+    disable_qwen3_graph = model.family == "qwen3" and "FASTLLM_CUDA_GRAPH" not in os.environ
+    if disable_qwen3_graph:
+        graph_enabled = False
     apply_model_defaults(base, metadata)
     # DeepSeek V4.1 targets its 1M window; other models retain the 128K policy.
     if base.max_context_length <= 0:
@@ -399,5 +405,8 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         result["automatic"]["dspark_confidence_threshold"] = chosen.speculative_dspark_confidence_threshold
     for name in changed:
         setattr(args, name, getattr(chosen, name))
+    if disable_qwen3_graph:
+        os.environ["FASTLLM_CUDA_GRAPH"] = "0"
+        result.setdefault("notes", []).append("Dense Qwen3 auto uses eager CUDA to avoid unsupported graph capture")
     print("[auto] " + json.dumps(result, sort_keys=True), flush=True)
     return result
