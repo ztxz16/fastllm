@@ -234,8 +234,9 @@ namespace fastllm {
         }
 
         auto *pool = GetAlivePool();
-        int workerCount = std::min(
-            (int)pool->threads.size(), (int)tasks.size());
+        const int first = pool->curActivateThreadInterval.first;
+        const int available = pool->curActivateThreadInterval.second - first;
+        int workerCount = std::min(available, (int)tasks.size());
         std::atomic<int> next(workerCount);
         std::vector<MultiThreadDeepSeekV4MoeTaskQueueOp> workers;
         workers.reserve(workerCount);
@@ -243,10 +244,10 @@ namespace fastllm {
             workers.emplace_back(&tasks, &next, i);
         }
         for (int i = 0; i < workerCount; i++) {
-            pool->PushOp(i, &workers[i]);
+            pool->PushOp(first + i, &workers[i]);
         }
         for (int i = 0; i < workerCount; i++) {
-            pool->Wait(i);
+            pool->Wait(first + i);
         }
         if (deleteTasks) {
             for (auto *task : tasks) {
@@ -4717,9 +4718,9 @@ namespace fastllm {
                     fLastOutput = tempOutput.data();
                 }
                 if (useDeepSeekV4MoeFast) {
+                    const int first = pool->curActivateThreadInterval.first;
                     int reduceThreads = std::min(
-                        {(int)pool->threads.size(),
-                         16, m});
+                        {pool->curActivateThreadInterval.second - first, 16, m});
                     std::vector<MultiThreadDeepSeekV4MoeReduceOp> reduceOps;
                     reduceOps.reserve(reduceThreads);
                     int per = m / reduceThreads;
@@ -4736,10 +4737,10 @@ namespace fastllm {
                         cur = end;
                     }
                     for (int i = 0; i < reduceThreads; i++) {
-                        pool->PushOp(i, &reduceOps[i]);
+                        pool->PushOp(first + i, &reduceOps[i]);
                     }
                     for (int i = 0; i < reduceThreads; i++) {
-                        pool->Wait(i);
+                        pool->Wait(first + i);
                     }
                 } else for (int j = 0; j < v.size(); j++) {
                     float value = deepSeekV4Mode ? 1.0f : v[j].second;

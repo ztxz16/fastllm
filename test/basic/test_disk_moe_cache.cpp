@@ -1,10 +1,12 @@
 #include "fastllm.h"
 #include "utils.h"
 #include "devices/disk/diskdevice.h"
+#include "devices/cpu/alivethreadpool.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
 #endif
 #include <cmath>
+#include <future>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -142,6 +144,34 @@ int main(int argc, char **argv) {
         SetThreads(8);
         for (bool shared : {false, true}) {
             Fixture f(shared);
+            if (!shared && CPUInstructInfo().hasAVX512BF16 &&
+                !std::getenv("FASTLLM_DSV4_DISABLE_CPU_MOE_FAST")) {
+                auto expected = f.Run(false, 1, 0);
+                auto *pool = GetAlivePool();
+                auto previous = pool->curActivateThreadInterval;
+                std::atomic<bool> release{false};
+                struct Hold : MultiThreadBaseOp {
+                    std::atomic<bool> &release;
+                    explicit Hold(std::atomic<bool> &flag) : release(flag) {}
+                    void Run() override {
+                        while (!release.load()) std::this_thread::yield();
+                    }
+                } hold(release);
+                // Occupied inactive workers make use of the historical pool
+                // capacity observable, including an active interval not at 0.
+                pool->curActivateThreadInterval = {3, 5};
+                for (int i = 0; i < int(pool->threads.size()); ++i)
+                    if (i < 3 || i >= 5) pool->PushOp(i, &hold);
+                auto job = std::async(std::launch::async, [&] { return f.Run(false, 1, 0); });
+                bool ready = job.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+                release.store(true);
+                for (int i = 0; i < int(pool->threads.size()); ++i)
+                    if (i < 3 || i >= 5) pool->Wait(i);
+                auto actual = job.get();
+                pool->curActivateThreadInterval = previous;
+                Require(ready, "CPU MoE used inactive workers");
+                Compare(actual, expected, true);
+            }
             SetMoeCudaCacheBytes(0);
             SetMoeCpuCacheBytes(f.expertBytes * 7);
 #ifdef USE_CUDA
