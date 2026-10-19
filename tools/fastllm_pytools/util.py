@@ -74,6 +74,7 @@ def _memory_size_bytes(value) -> int:
         "kib": 1 << 10, "ki": 1 << 10, "kb": 1 << 10, "k": 1 << 10,
         "mib": 1 << 20, "mi": 1 << 20, "mb": 1 << 20, "m": 1 << 20,
         "gib": 1 << 30, "gi": 1 << 30, "gb": 1 << 30, "g": 1 << 30,
+        "tib": 1 << 40, "ti": 1 << 40, "tb": 1 << 40, "t": 1 << 40,
     }
     factor = 1
     number = text
@@ -929,6 +930,12 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = _AutoArgumentParser(description = des, add_help = add_help)
     parser.add_argument('--auto', action='store_true',
                         help='自动选择CUDA混推配置：DeepSeek-V4.1默认1M上下文、DSpark 7和fast_prefill，其他模型默认128K；显式参数优先')
+    parser.add_argument('--auto_gpu_memory_limit', '--auto-gpu-memory-limit',
+                        dest='auto_gpu_memory_limit', type=_memory_size_or_auto, default=None,
+                        help='自动规划时每张可见GPU的显存上限，如20g；未指定则读取实际可用显存')
+    parser.add_argument('--auto_host_memory_limit', '--auto-host-memory-limit',
+                        dest='auto_host_memory_limit', type=_memory_size_or_auto, default=None,
+                        help='自动规划时主机内存上限，如128g；未指定则读取实际可用内存')
     parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹或配置文件')
     parser.add_argument('-p', '--path', type = str, required = False, default = '', help = '模型路径，fastllm模型文件或HF模型文件夹')
     parser.add_argument('-t', '--threads', type = int, default = -1,  help = '线程数量')

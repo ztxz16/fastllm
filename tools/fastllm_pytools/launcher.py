@@ -530,8 +530,8 @@ class LauncherRuntime:
         configs = load_saved_configs(self.config_path)
         config = new_deploy_config(configs)
         config.command = "server"
-        config.config_mode = "long_context"
-        config.low_gpu_mem = True
+        config.config_mode = "auto"
+        config.device = "auto"
         return asdict(config)
 
     def _close_webui_locked(self):

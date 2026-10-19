@@ -62,6 +62,38 @@ class AutoConfigTest(unittest.TestCase):
         for d in p['gpu_budget_bytes']:
             self.assertLessEqual(p['gpu_estimated_bytes'][d], p['gpu_budget_bytes'][d])
 
+    def test_optional_memory_limits_cap_auto_planning_budgets(self):
+        a = self.args('--auto-gpu-memory-limit', '6g', '--auto-host-memory-limit', '20g')
+        p = self.resolve(a)
+        self.assertEqual((a.auto_gpu_memory_limit, a.auto_host_memory_limit), (6 * GiB, 20 * GiB))
+        self.assertTrue(all(value <= 6 * GiB for value in p['gpu_budget_bytes'].values()))
+        self.assertLessEqual(p['host_budget_bytes'], 20 * GiB)
+        self.assertEqual(p['automatic']['gpu_memory_limit'], 6 * GiB)
+        self.assertEqual(p['automatic']['host_memory_limit'], 20 * GiB)
+
+    def test_optional_memory_limits_are_unset_by_default(self):
+        a = self.args()
+        self.assertIsNone(a.auto_gpu_memory_limit)
+        self.assertIsNone(a.auto_host_memory_limit)
+
+    def test_memory_limits_cannot_inflate_detected_capacity(self):
+        normal = self.resolve(self.args())
+        capped = self.resolve(self.args('--auto_gpu_memory_limit', '1t',
+                                        '--auto_host_memory_limit', '2t'))
+        for field in ('gpu_budget_bytes', 'host_budget_bytes'):
+            self.assertEqual(normal[field], capped[field])
+
+    def test_memory_limits_reject_zero_and_insufficient_budgets(self):
+        for flag in ('--auto_gpu_memory_limit', '--auto_host_memory_limit'):
+            for size in ('0', '1'):
+                with self.subTest(flag=flag, size=size), self.assertRaises(ValueError):
+                    self.resolve(self.args(flag, size))
+
+    def test_optional_memory_limits_accept_terabyte_suffixes(self):
+        a = self.args('--auto-gpu-memory-limit', '1t', '--auto-host-memory-limit', '2TiB')
+        self.assertEqual(a.auto_gpu_memory_limit, 1 << 40)
+        self.assertEqual(a.auto_host_memory_limit, 2 << 40)
+
     def test_thread_environment_matches_native_numa_precedence(self):
         for environment, expected in [
                 ({'FT_THREADS': '7', 'FASTLLM_NUMA_THREADS': '4'}, 7),

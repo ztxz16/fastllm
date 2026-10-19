@@ -401,6 +401,8 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     result["automatic"]["cuda_graph"] = graph_enabled
     result["automatic"]["dspark"] = chosen.dspark
     result["automatic"]["fast_prefill"] = chosen.fast_prefill
+    result["automatic"]["gpu_memory_limit"] = result.get("auto_gpu_memory_limit")
+    result["automatic"]["host_memory_limit"] = result.get("auto_host_memory_limit")
     if chosen.dspark:
         result["automatic"]["dspark_confidence_threshold"] = chosen.speculative_dspark_confidence_threshold
     for name in changed:

@@ -13,6 +13,8 @@ const AUTOMATIC_CONFIGURATION_DEFAULTS = Object.freeze({
   cudapp: "2",
   threads: "auto",
   gpu_mem_ratio: "0.9",
+  auto_gpu_memory_limit: "",
+  auto_host_memory_limit: "",
   low_gpu_mem: false,
   max_batch: "auto",
   max_context_length: "auto",
@@ -73,13 +75,18 @@ function isSimpleNewProfile() {
 }
 
 function renderProfilePresentation() {
-  const simple = isSimpleNewProfile();
   const mode = collectForm().config_mode;
+  const runtimeAuto = mode === "auto";
+  const simple = isSimpleNewProfile() || runtimeAuto;
   elements.launchForm.classList.toggle("simple-profile", simple);
-  elements.profileParameters.classList.toggle("hidden", simple);
+  elements.launchForm.classList.toggle("runtime-auto-profile", runtimeAuto);
+  elements.profileParameters.classList.toggle("hidden", simple && !runtimeAuto);
   elements.automaticConfigActions.classList.toggle("hidden", simple);
-  elements.configurationModeSettings.classList.toggle("hidden", state.currentIndex !== null);
-  elements.profileEditorDescription.textContent = state.currentIndex === null
+  elements.configurationModeSettings.classList.toggle("hidden", state.currentIndex !== null && !runtimeAuto);
+  elements.automaticResourceLimits.classList.toggle("hidden", mode !== "auto");
+  elements.profileEditorDescription.textContent = runtimeAuto
+    ? configurationModeDescription(mode)
+    : state.currentIndex === null
     ? t("Choose a model and configuration mode, then save or start your service.")
     : t("Edit all settings, or click Automatic configuration to choose a mode.");
   elements.configurationModeDescription.textContent = configurationModeDescription(mode);
@@ -87,6 +94,7 @@ function renderProfilePresentation() {
 
 function configurationModeDescription(mode) {
   const descriptions = {
+    auto: t("Choose a model and service settings. Devices, memory and inference settings are planned when the service starts."),
     long_context: t("One conversation at a time; context capacity follows the model and available memory."),
     high_concurrency: t("Automatic batching; context capacity follows the model and available memory."),
     custom: t("Set parameters yourself, or use automatic configuration as a starting point.")
@@ -100,7 +108,7 @@ function openAutomaticConfigurationDialog() {
     return;
   }
   const config = collectForm();
-  const mode = config.config_mode === "high_concurrency" ? "high_concurrency" : "long_context";
+  const mode = ["auto", "long_context", "high_concurrency"].includes(config.config_mode) ? config.config_mode : "auto";
   elements.automaticModeOptions.replaceChildren();
   for (const card of elements.configurationModeOptions.children) {
     if (card.querySelector("input").value === "custom") continue;
@@ -112,6 +120,7 @@ function openAutomaticConfigurationDialog() {
     elements.automaticModeOptions.append(clone);
   }
   elements.automaticEnableSpeculativeDecoding.checked = config.enable_speculative_decoding;
+  elements.automaticEnableSpeculativeDecoding.closest("label").classList.toggle("hidden", mode === "auto");
   elements.automaticModeDescription.textContent = configurationModeDescription(mode);
   state.automaticConfigDialogPreviousStatus = state.automaticConfigStatus;
   elements.automaticConfigDialog.showModal();
@@ -295,12 +304,13 @@ function cancelPendingAutomaticConfiguration() {
 
 function prepareAutomaticConfigurationForNewProfile() {
   cancelPendingAutomaticConfiguration();
-  state.automaticConfigPending = isSimpleNewProfile();
+  state.automaticConfigPending = isSimpleNewProfile() && collectForm().config_mode !== "auto";
   state.automaticConfigStatus = { phase: state.automaticConfigPending ? "waiting" : "idle" };
   renderAutomaticConfigurationStatus();
 }
 
 function scheduleAutomaticConfiguration(delay = 650) {
+  if (collectForm().config_mode === "auto") return;
   window.clearTimeout(state.automaticConfigTimer);
   state.automaticConfigRequestId += 1;
   const model = String(collectForm().model || "").trim();
@@ -324,6 +334,17 @@ function scheduleAutomaticConfiguration(delay = 650) {
 async function configureProfileAutomatically({ automatic = false, selection = null } = {}) {
   const current = collectForm();
   const requested = { ...current, ...selection };
+  if (requested.config_mode === "auto") {
+    cancelPendingAutomaticConfiguration();
+    state.editingConfig = requested;
+    state.automaticConfigStatus = { phase: "idle" };
+    fillForm(requested);
+    state.dirty = true;
+    renderSaveState();
+    renderAutomaticConfigurationStatus();
+    schedulePreview(0);
+    return true;
+  }
   const model = String(current.model || "").trim();
   if (!model) {
     state.automaticConfigStatus = { phase: "missing-model" };
@@ -675,7 +696,7 @@ function renderProfiles() {
     titleRow.append(title);
     const metadata = document.createElement("div");
     metadata.className = "profile-metadata";
-    for (const value of [profileDeviceLabel(profile), profile.dtype || "auto", t("Port {port}", { port: profile.port || "—" })]) {
+    for (const value of [profileDeviceLabel(profile), profile.config_mode === "auto" ? "auto" : profile.dtype || "auto", t("Port {port}", { port: profile.port || "—" })]) {
       const detail = document.createElement("span");
       detail.textContent = value;
       metadata.append(detail);
@@ -726,6 +747,7 @@ function profileActionButton(action, index, label, variant = "") {
 }
 
 function profileDeviceLabel(profile) {
+  if (profile.config_mode === "auto") return t("Automatic configuration");
   const devices = {
     auto: t("Auto device"),
     cuda: "CUDA",
@@ -854,6 +876,7 @@ function showProfileEditor() {
   elements.profileEditorModal.classList.remove("hidden");
   document.body.classList.add("modal-open");
   elements.launchForm.scrollTop = 0;
+  elements.automaticResourceLimits.open = false;
   elements.launchForm.querySelector("#editor-advanced").open = !isSimpleNewProfile();
 }
 
@@ -919,7 +942,7 @@ async function deleteProfile(index) {
 async function saveCurrentProfile(showSuccess = false) {
   await ensureProfileConfiguration();
   const config = collectForm();
-  if (isSimpleNewProfile()) {
+  if (isSimpleNewProfile() && config.config_mode !== "auto") {
     const base = basename(config.model) || config.name;
     const used = new Set(state.profiles.map((profile) => profile.name));
     config.name = base;
@@ -942,6 +965,7 @@ async function saveCurrentProfile(showSuccess = false) {
 }
 
 async function ensureProfileConfiguration() {
+  if (collectForm().config_mode === "auto") return;
   if (!isSimpleNewProfile()) return;
   if (state.automaticConfigStatus?.phase === "applied"
       && state.automaticConfigAppliedModel === String(collectForm().model || "").trim()) return;

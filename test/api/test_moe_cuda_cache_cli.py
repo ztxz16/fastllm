@@ -31,6 +31,8 @@ class MoeCudaCacheCliTest(unittest.TestCase):
             "3GiB": 3 << 30,
             "512m": 512 << 20,
             "1.5gb": 3 << 29,
+            "3t": 3 << 40,
+            "1TiB": 1 << 40,
             "4096": 4096,
             "0": 0,
         }
@@ -45,7 +47,7 @@ class MoeCudaCacheCliTest(unittest.TestCase):
                 self.assertEqual(args.moe_cuda_cache, 3 << 30)
 
     def test_invalid_sizes_are_rejected(self):
-        for value in ("-1g", "nan", "inf", "1e300g", "3t", "",
+        for value in ("-1g", "nan", "inf", "1e300g", "3p", "",
                       "1e-300g", "0.5", 1 << 64, str(1 << 64),
                       "18446744073709551615.1", "17179869184g"):
             with self.subTest(value=value):

@@ -76,7 +76,11 @@
                   <div class="setup-section-heading"><span aria-hidden="true">02</span><h3 id="configuration-mode-title">配置模式</h3></div>
                   <div id="configuration-mode-options" class="configuration-mode-options" role="radiogroup" aria-labelledby="configuration-mode-title">
                     <label class="configuration-mode-card">
-                      <input type="radio" name="configuration-mode" data-config-mode value="long_context" checked>
+                      <input type="radio" name="configuration-mode" data-config-mode value="auto" checked>
+                      <span><strong>自动配置（默认）</strong><small>只需选择模型并填写服务信息，启动时自动规划推理配置。</small></span>
+                    </label>
+                    <label class="configuration-mode-card">
+                      <input type="radio" name="configuration-mode" data-config-mode value="long_context">
                       <span><strong>长上下文模式</strong><small>优先单会话容量，适合长文档与多轮对话。</small></span>
                     </label>
                     <label class="configuration-mode-card">
@@ -93,6 +97,24 @@
                     <input type="checkbox" data-field="enable_speculative_decoding" id="enable-speculative-decoding" aria-describedby="speculative-auto-description">
                     <span><strong>自动配置时尝试启用内置 MTP</strong><small id="speculative-auto-description">这是自动配置偏好；是否实际开启，以生成的推测解码参数为准。</small></span>
                   </label>
+                  <details id="automatic-resource-limits" class="automatic-resource-limits">
+                    <summary class="automatic-resource-limits-heading">
+                      <strong>资源限制（可选）</strong>
+                      <small>留空时自动读取当前机器配置</small>
+                    </summary>
+                    <div class="form-grid two-columns">
+                      <label class="field">
+                        <span>显存上限（每卡）</span>
+                        <input data-field="auto_gpu_memory_limit" type="text" placeholder="例如 20g">
+                        <small>限制自动规划每张可见 GPU 的预算。</small>
+                      </label>
+                      <label class="field">
+                        <span>内存上限</span>
+                        <input data-field="auto_host_memory_limit" type="text" placeholder="例如 128g">
+                        <small>限制自动规划可使用的主机内存总量。</small>
+                      </label>
+                    </div>
+                  </details>
                   </div>
                   <div id="automatic-config-actions" class="automatic-config-actions">
                     <button id="auto-configure-profile" class="primary-button" type="button">自动配置</button>
@@ -115,7 +137,7 @@
                       <span>配置名称 <b>*</b></span>
                       <input data-field="name" type="text" placeholder="例如 Qwen3.5-27B">
                     </label>
-                    <label class="field">
+                    <label class="field" data-inference-setting>
                       <span>启动方式 <b>*</b></span>
                       <select data-field="command">
                         <option value="server">API Server</option>
@@ -134,7 +156,7 @@
                       <span>服务端口 <b>*</b></span>
                       <input data-field="port" type="number" min="1" max="65535" inputmode="numeric">
                     </label>
-                    <label class="field">
+                    <label class="field" data-inference-setting>
                       <span>KV Cache 类型</span>
                       <select data-field="kv_cache_dtype">
                         <option value="auto">auto</option>
@@ -155,7 +177,16 @@
                         <option value="true">开启</option>
                       </select>
                     </label>
-                    <div class="device-config-row span-2">
+                    <label id="server-api-key-field" class="field">
+                      <span>API Key</span>
+                      <input data-field="api_key" type="password" autocomplete="off" placeholder="留空表示不校验">
+                      <small>保存在当前用户的本地配置文件中。</small>
+                    </label>
+                    <label id="server-hide-input-field" class="switch-field">
+                      <input data-field="hide_input" type="checkbox">
+                      <span><strong>隐藏请求输入</strong><small>启动时添加 <code>--hide_input</code></small></span>
+                    </label>
+                    <div class="device-config-row span-2" data-inference-setting>
                       <label class="field">
                         <span>主设备</span>
                         <select data-field="device">
@@ -317,15 +348,6 @@
                       <label class="field">
                         <span>模型缓存目录</span>
                         <input data-field="cache_dir" data-path-input data-directories-only type="text" list="path-suggestions" placeholder="留空使用默认缓存">
-                      </label>
-                      <label id="server-api-key-field" class="field">
-                        <span>API Key</span>
-                        <input data-field="api_key" type="password" autocomplete="off" placeholder="留空表示不校验">
-                        <small>保存在当前用户的本地配置文件中。</small>
-                      </label>
-                      <label id="server-hide-input-field" class="switch-field">
-                        <input data-field="hide_input" type="checkbox">
-                        <span><strong>隐藏请求输入</strong><small>启动时添加 <code>--hide_input</code></small></span>
                       </label>
                       <label class="field span-2">
                         <span>环境变量</span>

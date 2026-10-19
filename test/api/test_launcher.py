@@ -36,7 +36,7 @@ from fastllm_pytools.launcher import (
     launcher_html,
     recommend_launch_config,
 )
-from fastllm_pytools.tui import DeployConfig, build_fastllm_argv, config_from_dict
+from fastllm_pytools.tui import DeployConfig, build_fastllm_argv, build_fastllm_env, config_from_dict
 
 
 def unused_tcp_port():
@@ -126,9 +126,9 @@ class LauncherConfigTest(unittest.TestCase):
         self.assertEqual(result["profiles"], [])
 
     def test_configuration_mode_is_saved_without_changing_legacy_profiles(self):
-        self.assertEqual(self.runtime.default_profile()["config_mode"], "long_context")
-        self.assertTrue(self.runtime.default_profile()["low_gpu_mem"])
-        for mode in ("long_context", "high_concurrency", "custom"):
+        self.assertEqual(self.runtime.default_profile()["config_mode"], "auto")
+        self.assertFalse(self.runtime.default_profile()["low_gpu_mem"])
+        for mode in ("auto", "long_context", "high_concurrency", "custom"):
             saved = self.runtime.save_profile(None, self.config(config_mode=mode))
             self.assertEqual(self.runtime.profiles()[saved["index"]]["config_mode"], mode)
             self.assertNotIn("--config_mode", self.runtime.preview(saved["profile"])["command"])
@@ -137,6 +137,60 @@ class LauncherConfigTest(unittest.TestCase):
         self.assertFalse(legacy.low_gpu_mem)
         self.assertEqual(legacy.max_batch, "3")
         self.assertEqual(legacy.max_context_length, "12345")
+
+    def test_runtime_auto_ignores_hidden_manual_overrides_and_preserves_service_settings(self):
+        saved = self.runtime.save_profile(None, self.config(
+            config_mode="auto", api_key="test-key", hide_input=True,
+            device="tp", tp="0,1", threads="invalid", max_context_length="0",
+            speculative_algorithm="dflash", speculative_draft_model_path="",
+            extra_args="--device cpu --max_context_length 1024",
+            env_vars="FT_THREADS=120 FASTLLM_CUDA_GRAPH=0", low_gpu_mem=True,
+        ))["profile"]
+        argv = build_fastllm_argv(config_from_dict(saved))
+        self.assertEqual(argv, [
+            "ftllm", "server", self.model_path, "--auto",
+            "--model_name", "qwen-local", "--host", "127.0.0.1",
+            "--port", "18080", "--api_key", "test-key", "--hide_input",
+        ])
+        self.assertEqual(build_fastllm_env(config_from_dict(saved)), {})
+        self.assertEqual(self.runtime.preview(saved)["errors"], [])
+        invalid = self.runtime.preview({**saved, "port": "0", "model": ""})
+        self.assertEqual({field for issue in invalid["fieldErrors"] for field in issue["fields"]},
+                         {"model", "port"})
+
+    def test_runtime_auto_passes_optional_memory_limits(self):
+        saved = self.runtime.save_profile(None, self.config(
+            config_mode="auto", auto_gpu_memory_limit="20g",
+            auto_host_memory_limit="128g",
+        ))["profile"]
+        argv = build_fastllm_argv(config_from_dict(saved))
+        self.assertIn("--auto_gpu_memory_limit", argv)
+        self.assertIn("20g", argv)
+        self.assertIn("--auto_host_memory_limit", argv)
+        self.assertIn("128g", argv)
+        self.assertEqual(self.runtime.preview(saved)["errors"], [])
+
+    def test_runtime_auto_rejects_invalid_memory_limits(self):
+        invalid = self.runtime.preview(self.config(
+            config_mode="auto", auto_gpu_memory_limit="0",
+            auto_host_memory_limit="not-a-size",
+        ))
+        self.assertEqual(
+            {field for issue in invalid["fieldErrors"] for field in issue["fields"]},
+            {"auto_gpu_memory_limit", "auto_host_memory_limit"},
+        )
+
+    def test_memory_limits_share_cli_byte_bounds_and_only_apply_in_auto_mode(self):
+        for value in ("0.1", "18446744073709551616", "nan", "-1g"):
+            with self.subTest(value=value):
+                self.assertTrue(self.runtime.preview(self.config(
+                    config_mode="auto", auto_host_memory_limit=value))["errors"])
+        for value in ("", "auto", "1Ti", "128g"):
+            with self.subTest(value=value):
+                self.assertEqual(self.runtime.preview(self.config(
+                    config_mode="auto", auto_host_memory_limit=value))["errors"], [])
+        self.assertEqual(self.runtime.preview(self.config(
+            config_mode="custom", auto_host_memory_limit="invalid"))["errors"], [])
 
     def test_configuration_modes_preserve_model_weight_context_and_chunk_defaults(self):
         model_path = os.path.join(self.temp.name, "mode-test")

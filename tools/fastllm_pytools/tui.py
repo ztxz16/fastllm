@@ -85,6 +85,8 @@ class DeployConfig:
     moe_dtype: str = "auto"
     moe_dtype_custom: str = ""
     gpu_mem_ratio: str = "0.9"
+    auto_gpu_memory_limit: str = ""
+    auto_host_memory_limit: str = ""
     chunked_prefill_size: str = "auto"
     kv_cache_dtype: str = "auto"
     moe_atype: str = "auto"
@@ -558,7 +560,7 @@ def parse_env_vars(value: str) -> dict:
 
 
 def build_fastllm_env(config: DeployConfig) -> dict:
-    return parse_env_vars(config.env_vars)
+    return parse_env_vars(_runtime_auto_config(config).env_vars)
 
 
 def _env_prefix(config: DeployConfig) -> List[str]:
@@ -786,6 +788,20 @@ def _parse_modelscope_custom_value(value: str):
     return value
 
 
+def _is_optional_memory_limit(value: str) -> bool:
+    """Validate an optional binary memory cap such as 20g or 128g."""
+    from argparse import ArgumentTypeError
+    from .util import _memory_size_bytes
+
+    value = str(value).strip().lower()
+    if value in ("", "auto"):
+        return True
+    try:
+        return _memory_size_bytes(value) > 0
+    except ArgumentTypeError:
+        return False
+
+
 def parse_modelscope_custom_args(value: str) -> dict:
     kwargs = {}
     if not value.strip():
@@ -958,6 +974,16 @@ def _normalize_speculative_config(config: DeployConfig) -> DeployConfig:
     return config
 
 
+def _runtime_auto_config(config: DeployConfig) -> DeployConfig:
+    """Keep only service settings; hidden manual overrides must not pin --auto."""
+    if config.config_mode != "auto" or config.command != "server":
+        return config
+    service_fields = ("name", "command", "model", "model_name", "host", "port",
+                      "api_key", "hide_input", "config_mode", "auto_gpu_memory_limit",
+                      "auto_host_memory_limit")
+    return DeployConfig(**{name: getattr(config, name) for name in service_fields})
+
+
 def config_from_dict(data: dict) -> DeployConfig:
     config = DeployConfig()
     valid_keys = {field.name for field in fields(DeployConfig)}
@@ -976,7 +1002,7 @@ def config_from_dict(data: dict) -> DeployConfig:
         elif isinstance(default, str):
             value = "" if value is None else str(value)
         setattr(config, key, value)
-    if config.config_mode not in ("long_context", "high_concurrency", "custom"):
+    if config.config_mode not in ("auto", "long_context", "high_concurrency", "custom"):
         config.config_mode = "custom"
     normalize_main_device_config(config)
     normalize_moe_hybrid_config(
@@ -1126,6 +1152,18 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     if model:
         argv.append(model)
 
+    if config.config_mode == "auto" and config.command == "server":
+        argv.append("--auto")
+        for option, value in (("--model_name", effective_model_name(config)),
+                              ("--host", config.host.strip()), ("--port", config.port.strip()),
+                              ("--api_key", config.api_key.strip())):
+            _add_option(argv, option, value)
+        _add_option(argv, "--auto_gpu_memory_limit", config.auto_gpu_memory_limit.strip())
+        _add_option(argv, "--auto_host_memory_limit", config.auto_host_memory_limit.strip())
+        if config.hide_input:
+            argv.append("--hide_input")
+        return argv
+
     if config.command == "webui":
         # WebUI connects to an API server; inference options belong to the
         # separately launched model service, including for saved profiles.
@@ -1211,7 +1249,7 @@ def build_fastllm_command(config: DeployConfig) -> str:
 
 
 def validate_config(config: DeployConfig, field_errors: Optional[List[dict]] = None) -> List[str]:
-    config = _normalize_speculative_config(config)
+    config = _normalize_speculative_config(_runtime_auto_config(config))
     errors = []
 
     def add_error(message, *field_names):
@@ -1309,6 +1347,12 @@ def validate_config(config: DeployConfig, field_errors: Optional[List[dict]] = N
 
     if not _is_ratio(config.gpu_mem_ratio):
         add_error("显存利用率必须是 0 到 1 之间的数字，例如 0.9。", "gpu_mem_ratio")
+
+    if config.config_mode == "auto" and config.command == "server":
+        for field_name, label in (("auto_gpu_memory_limit", "自动规划显存上限"),
+                                  ("auto_host_memory_limit", "自动规划内存上限")):
+            if not _is_optional_memory_limit(getattr(config, field_name)):
+                add_error(f"{label}必须是正数内存大小，例如 20g；留空表示自动读取。", field_name)
 
     if config.command == "server" and not config.host.strip():
         add_error("监听地址不能为空。", "host")

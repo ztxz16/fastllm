@@ -26,6 +26,20 @@ def requested(args):
     return any(getattr(args, name, None) == "auto" for name in AUTO_OPTIONS)
 
 
+def _memory_limit_bytes(value, label):
+    """Return an optional explicit planner cap in bytes."""
+    if value is None or str(value).strip().lower() in ("", "auto"):
+        return None
+    try:
+        from .util import _memory_size_bytes
+        result = _memory_size_bytes(value)
+    except Exception as error:
+        raise ValueError("Hybrid auto: %s is invalid" % label) from error
+    if result <= 0:
+        raise ValueError("Hybrid auto: %s must be positive" % label)
+    return result
+
+
 @dataclass(frozen=True)
 class Tensor:
     name: str
@@ -609,10 +623,20 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     if not 0 < ratio <= 1:
         raise ValueError("Hybrid auto: gpu_mem_ratio must be in (0, 1]")
     gpu_limit = {d: gpu[d]["free"] - math.ceil(gpu[d]["total"] * (1 - ratio)) for d in mapping}
+    gpu_memory_limit = _memory_limit_bytes(
+        getattr(args, "auto_gpu_memory_limit", None), "auto_gpu_memory_limit"
+    )
+    if gpu_memory_limit is not None:
+        gpu_limit = {d: min(limit, gpu_memory_limit) for d, limit in gpu_limit.items()}
     # The library queries free memory after creating the CUDA contexts. Keep
     # additional space for graphs, allocator granularity and library handles.
     guard = 512 * MiB
     host_limit = ram["available"] - max(GiB, ram["total"] // 10)
+    host_memory_limit = _memory_limit_bytes(
+        getattr(args, "auto_host_memory_limit", None), "auto_host_memory_limit"
+    )
+    if host_memory_limit is not None:
+        host_limit = min(host_limit, host_memory_limit)
     chunks = ([4096, 2048, 1024, 512, 256] if args.chunked_prefill_size == "auto" else
               [args.chunked_prefill_size if args.chunked_prefill_size > 0 else model.default_chunk])
     chunks = list(dict.fromkeys(min(c, context) for c in chunks))
@@ -716,7 +740,9 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     "moe_cuda_cache": cuda_cache, "moe_cpu_cache": cpu_cache,
                     "gpu_estimated_bytes": {d: used[d] + cache[d] for d in mapping},
                     "gpu_budget_bytes": gpu_limit, "host_estimated_bytes": host_required + cpu_cache,
-                    "host_budget_bytes": host_limit, "workspace_bytes_per_device": workspace}
+                    "host_budget_bytes": host_limit, "workspace_bytes_per_device": workspace,
+                    "auto_gpu_memory_limit": gpu_memory_limit,
+                    "auto_host_memory_limit": host_memory_limit}
             if independent and host_experts:
                 candidate["moe_cuda_cache_per_device"] = cache
             if streaming:

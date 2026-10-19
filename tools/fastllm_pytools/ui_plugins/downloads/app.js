@@ -332,7 +332,9 @@ function useDownloadedModel() {
   prepareAutomaticConfigurationForNewProfile();
   scheduleAutomaticConfiguration(0);
   modelInput.focus();
-  showToast(t("A new launch item was created and is being configured automatically."), "success");
+  showToast(t(state.editingConfig.config_mode === "auto"
+    ? "Choose a model and service settings. Devices, memory and inference settings are planned when the service starts."
+    : "A new launch item was created and is being configured automatically."), "success");
 }
 
 
