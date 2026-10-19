@@ -472,7 +472,7 @@ namespace fastllm {
                 int minSamples,
                 double *outCpuMs, double *outGpuMs,
                 const std::vector<std::vector<uint8_t>> &residents,
-                bool residentCpuEligible = false) {
+                bool nativePrefill) {
             std::vector<double> unitCost;
             double cpuUnit = 0.0;
             {
@@ -514,14 +514,16 @@ namespace fastllm {
                 double cpuRoutes = 0.0;
                 gpuLoads.assign(unitCost.size(), 0.0);
                 for (int e : order) {
-                    bool resident = false;
-                    for (const auto &device : residents) resident |= device[e] != 0;
-                    if ((!resident || residentCpuEligible) && (int)expertTasks[e].size() < t) {
+                    // Only grouped GGUF pins residents to their owning GPU.
+                    bool pinnedResident = false;
+                    if (!nativePrefill)
+                        for (const auto &device : residents) pinnedResident |= device[e] != 0;
+                    if (!pinnedResident && (int)expertTasks[e].size() < t) {
                         cpuRoutes += (double)expertTasks[e].size();
                     } else {
                         int worker = -1;
                         for (int i = 0; i < int(unitCost.size()); ++i) {
-                            if (resident && !residents[i][e]) continue;
+                            if (pinnedResident && !residents[i][e]) continue;
                             if (worker < 0 || gpuLoads[i] < gpuLoads[worker]) worker = i;
                         }
                         gpuLoads[worker] += unitCost[worker];
@@ -9965,10 +9967,9 @@ namespace fastllm {
                     expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
                 }
             }
-            // Prefer a resident's owning GPU when assigning GPU work. Native
-            // per-expert prefill still pays launch/layout costs: low-row-count
-            // residents may run faster on CPU and must remain in the measured
-            // threshold search. Grouped GGUF retains its resident batching.
+            // Native experts retain host backing: keep them eligible for CPU
+            // and assist GPUs even when cached on another GPU. Hard affinity
+            // would idle workers in serial PP. Grouped GGUF keeps its ownership.
             std::vector<bool> residentExperts(m+1, false);
 #ifdef USE_CUDA
             std::vector<std::vector<uint8_t>> residentByDevice(
@@ -10156,7 +10157,7 @@ namespace fastllm {
                 for (int expert : orderedGpuExperts) {
                     int worker = -1;
                     for (int i = 0; i < gpuWorkerCount; ++i) {
-                        if (residentExperts[expert] && !residentByDevice[i][expert]) continue;
+                        if (residentExperts[expert] && !measuredNativePrefill && !residentByDevice[i][expert]) continue;
                         if (!residentExperts[expert] && cacheOwnerCounts[i] > 1 &&
                             (expert - 1) % cacheOwnerCounts[i] != cacheOwnerRanks[i]) continue;
                         if (worker < 0 || predictedMs[i] < predictedMs[worker]) worker = i;

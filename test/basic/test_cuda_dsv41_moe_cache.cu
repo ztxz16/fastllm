@@ -109,6 +109,89 @@ static void Compare(const std::vector<float> &actual, const std::vector<float> &
         throw std::runtime_error(label);
     }
 }
+
+// A cache concentrated on one GPU must not disable the other prefill worker.
+// Keep all selected experts resident on GPU 0 and GPU 1 empty, then compare the
+// two-worker result with uncached projections and the same BF16 partial
+// reduction. FT_EXPERT_LIMIT=0 fixes the CPU/GPU split so this tests resident
+// placement independently of calibration.
+static void CheckResidentAssist(std::vector<Data *> &weights) {
+    const int hidden = weights[2]->dims[1], experts = weights.size() / 2 - 1, topk = 6;
+    const std::vector<int> devices{0, 1};
+    std::unordered_set<int> selected;
+    for (int e = 0; e < topk; ++e) selected.insert(e + 1);
+    std::vector<Data *> biases(weights.size(), nullptr);
+    for (int rows : {129, 513, 2048}) {
+        Check(cudaSetDevice(0));
+        Data input(BFLOAT16, {rows, hidden}), index(INT32, {rows, topk}), scores(FLOAT32, {rows, topk});
+        input.Allocate(); index.Allocate(); scores.Allocate();
+        for (int i = 0; i < rows * hidden; ++i)
+            reinterpret_cast<uint16_t *>(input.cpuData)[i] = Float32ToBFloat16RNEBits((i % 37 - 18) / 8.f);
+        for (int r = 0; r < rows; ++r) for (int k = 0; k < topk; ++k) {
+            reinterpret_cast<int *>(index.cpuData)[r * topk + k] = (r + k) % topk;
+            reinterpret_cast<float *>(scores.cpuData)[r * topk + k] = k == 0 ? 0.f : (k + 1) / 16.f;
+        }
+        input.ToDevice(DataDevice::CUDA, {0}, true);
+        Data warm(BFLOAT16, {rows, hidden}), w1, w2, w3;
+        // Equal route counts and a fresh row-count profile yield alternating
+        // experts on the two workers. Reproduce their projection outputs on
+        // one GPU with transport bypassed, including the BF16 partial-sum
+        // boundary used by the multi-GPU reduction.
+        std::vector<float> expected(rows * hidden, 0.f);
+        setenv("FASTLLM_MOE_PREFILL_CACHE", "0", 1);
+        for (int worker = 0; worker < 2; ++worker) {
+            std::unordered_set<int> subset;
+            for (int e = worker; e < topk; e += 2) subset.insert(e + 1);
+            Data partial(BFLOAT16, {rows, hidden});
+            DoCudaMergeMOEFromCPU(input, partial, index, scores, w1, w2, w3, weights.data(),
+                biases.data(), 0, true, subset, true, MoeGateSwiglu, true, 10, 32, false, false);
+            ToDataType(partial, FLOAT32);
+            partial.ToDevice(DataDevice::CPU);
+            for (int i = 0; i < rows * hidden; ++i)
+                expected[i] += reinterpret_cast<float *>(partial.cpuData)[i];
+        }
+        for (float &value : expected) value = Bf(value);
+        unsetenv("FASTLLM_MOE_PREFILL_CACHE");
+        DoCudaMergeMOEFromCPU(input, warm, index, scores, w1, w2, w3, weights.data(),
+            biases.data(), 0, true, selected, true, MoeGateSwiglu, true, 10, 32, false, true);
+        FastllmCudaMoePrefillResidents residents;
+        Require(FastllmCudaGetMoePrefillResidents(weights.data(), experts, residents, true),
+            "resident assist root cache unavailable");
+        for (int e = 0; e < topk; ++e)
+            Require(residents.weights[2 * e] && residents.weights[2 * e + 1], "root expert not resident");
+        Check(cudaSetDevice(1));
+        Require(FastllmCudaGetMoePrefillResidents(weights.data(), experts, residents, true),
+            "resident assist secondary cache unavailable");
+        for (int e = 0; e < topk; ++e)
+            Require(!residents.weights[2 * e] && !residents.weights[2 * e + 1],
+                "secondary cache unexpectedly populated");
+        uint64_t before[2][8], after[2][8];
+        for (int device : devices)
+            Require(fastllm_moe_cuda_cache_prefill_stats(device, before[device]), "assist stats unavailable");
+        Check(cudaSetDevice(0));
+        Data output;
+        {
+            NumasMoeCudaAssistScope assist(&devices);
+            RunNumasMoe(input, index, scores, output, weights, 0);
+        }
+        for (int device : devices) {
+            Require(fastllm_moe_cuda_cache_prefill_stats(device, after[device]), "assist stats unavailable");
+            Require(after[device][1] > before[device][1], "resident affinity left a prefill GPU idle");
+        }
+        Require(after[0][3] > before[0][3], "balanced prefill failed to reuse residents");
+        Require(after[1][6] > before[1][6] && after[1][7] == before[1][7],
+            "assist miss did not stream without cache admission");
+        ToDataType(output, FLOAT32);
+        output.ToDevice(DataDevice::CPU);
+        Require(std::memcmp(output.cpuData, expected.data(), expected.size() * sizeof(float)) == 0,
+            "resident assist changed uncached projection/reduction bits");
+        std::printf("RESIDENT_ASSIST_PASS rows=%d gpu0=%llu gpu1=%llu hits=%llu\n", rows,
+            (unsigned long long)(after[0][1] - before[0][1]),
+            (unsigned long long)(after[1][1] - before[1][1]),
+            (unsigned long long)(after[0][3] - before[0][3]));
+    }
+}
+
 int main(int argc, char **argv) {
     try {
         Require(prctl(PR_SET_DUMPABLE, 0) == 0, "disable test core dumps");
@@ -322,6 +405,7 @@ int main(int argc, char **argv) {
         Require(FastllmCudaCanRunMoeHybrid(weights[0].data(), weights[0].size()), "V4.1 hybrid unavailable");
         Require(!FastllmCudaCanRunMoeCache(weights[0].data(), weights[0].size()), "generic math accepted V4.1");
         if (option("--prefill")) {
+            if (dual) CheckResidentAssist(weights[0]);
             fastllm_prefill_test::Run(layers, weights, tables, true, 32);
             FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
             for (void *pointer : shards) Check(cudaFreeHost(pointer));
