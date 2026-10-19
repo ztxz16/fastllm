@@ -270,7 +270,11 @@
     "停止 Claude Code": "停止 Claude Code",
     "Claude Code 项目与会话": "Claude Code 项目与会话",
     "搜索 Claude Code 会话": "搜索 Claude Code 会话",
-    "Claude Code 消息": "Claude Code 消息"
+    "Claude Code 消息": "Claude Code 消息",
+    "模型簇": "模型簇",
+    "下载范围（可选）": "下载范围（可选）",
+    "多个匹配规则用逗号分隔；留空下载整个仓库。GSQ 量化建议选择页面中的版本卡片。": "多个匹配规则用逗号分隔；留空下载整个仓库。GSQ 量化建议选择页面中的版本卡片。",
+    "按模型簇选择官方权重、GSQ 量化或混合推理模型；选中卡片会自动填入下载范围。": "按模型簇选择官方权重、GSQ 量化或混合推理模型；选中卡片会自动填入下载范围。"
   },
   "messages": {
     "Pi Agent": "Pi 智能体",
@@ -683,7 +687,25 @@
     "{name} is working…": "{name} 正在处理…",
     "{name} request failed.": "{name} 请求失败。",
     "{name} needs your response": "{name} 等待你的回应",
-    "What would you like to work on?": "今天想完成什么？"
+    "What would you like to work on?": "今天想完成什么？",
+    "稠密主模型，覆盖原始、FP8、NVFP4 与 DFlash2 草稿权重。": "稠密主模型，覆盖原始、FP8、NVFP4 与 DFlash2 草稿权重。",
+    "选择一个量化子目录；下载器只拉选中的分片与共享 mmproj。": "选择一个量化子目录；下载器只拉选中的分片与共享 mmproj。",
+    "大 MoE 混合推理模型，建议使用自动规划器部署。": "大 MoE 混合推理模型，建议使用自动规划器部署。",
+    "快速验证": "快速验证",
+    "小模型和自定义入口，用于先验证环境、权限与下载链路。": "小模型和自定义入口，用于先验证环境、权限与下载链路。",
+    "原始质量": "原始质量",
+    "约 31 GB": "约 31 GB",
+    "显存友好": "显存友好",
+    "推测解码草稿": "推测解码草稿",
+    "约 66.4 GB · 速度优先": "约 66.4 GB · 速度优先",
+    "约 68.0 GB · 体积优先": "约 68.0 GB · 体积优先",
+    "约 75.8 GB · 平衡": "约 75.8 GB · 平衡",
+    "约 83.6 GB · 质量优先": "约 83.6 GB · 质量优先",
+    "代码场景": "代码场景",
+    "约 510 GB · 混合推理": "约 510 GB · 混合推理",
+    "Download file patterns contain invalid characters.": "下载匹配规则包含无效字符。",
+    "Download file patterns may contain at most 64 entries.": "下载匹配规则最多可填写 64 项。",
+    "Each download file pattern must be at most 512 characters and cannot start with '-'.": "每条下载匹配规则最多 512 个字符，且不能以减号开头。"
   },
   "patterns": [
     {

@@ -31,13 +31,14 @@ from .launcher_opencode import OpenCodeRuntime
 from .launcher_codex import CodexRuntime
 from .launcher_claude import ClaudeRuntime
 from .launcher_mtp import detect_mtp_support, _dspark_config
+from .model_catalog import MODELSCOPE_DOWNLOAD_GROUPS
+from .modelscope_download import _filter_file_sizes
 from .startup_progress import PROGRESS_PREFIX
 from .ui_hardware import detect_hardware
 from .ui_plugins import BUNDLED_PLUGINS, PluginRegistry, install_plugin_routes, mount_studio_assets
 from .tui import (
     DEFAULT_MODELSCOPE_MODEL_ID,
     DeployConfig,
-    MODELSCOPE_MODEL_GROUPS,
     build_fastllm_env,
     build_fastllm_argv,
     complete_path_prefix,
@@ -196,6 +197,7 @@ class DownloadConfig:
     revision: str = "master"
     max_workers: int = 4
     token: str = ""
+    include: str = ""
 
 
 def _modelscope_is_available() -> bool:
@@ -253,6 +255,7 @@ def _coerce_download_config(payload: Any) -> DownloadConfig:
     )
     revision = text_value("revision", "master").strip() or "master"
     token = text_value("token")
+    include = text_value("include").strip()
     try:
         raw_max_workers = payload.get("maxWorkers", 4)
         max_workers = 0 if isinstance(raw_max_workers, bool) else int(raw_max_workers)
@@ -264,6 +267,7 @@ def _coerce_download_config(payload: Any) -> DownloadConfig:
         revision=revision,
         max_workers=max_workers,
         token=token,
+        include=include,
     )
 
 
@@ -300,11 +304,22 @@ def _validate_download_config(config: DownloadConfig) -> List[str]:
         errors.append("Concurrent downloads must be an integer from 1 to 64.")
     if len(config.token) > 8192 or CONTROL_CHARACTER_PATTERN.search(config.token):
         errors.append("Access token contains invalid characters.")
+    include_patterns = _download_include_patterns(config.include)
+    if len(config.include) > 8192 or CONTROL_CHARACTER_PATTERN.search(config.include):
+        errors.append("Download file patterns contain invalid characters.")
+    elif len(include_patterns) > 64:
+        errors.append("Download file patterns may contain at most 64 entries.")
+    elif any(len(pattern) > 512 or pattern.startswith("-") for pattern in include_patterns):
+        errors.append("Each download file pattern must be at most 512 characters and cannot start with '-'.")
     return errors
 
 
+def _download_include_patterns(value: str) -> List[str]:
+    return [item.strip() for item in re.split(r"[,;\n]+", value or "") if item.strip()]
+
+
 def _download_arguments(config: DownloadConfig) -> List[str]:
-    return [
+    arguments = [
         "download",
         "--model",
         config.model_id,
@@ -315,6 +330,9 @@ def _download_arguments(config: DownloadConfig) -> List[str]:
         "--max-workers",
         str(config.max_workers),
     ]
+    for pattern in _download_include_patterns(config.include):
+        arguments.extend(("--include", pattern))
+    return arguments
 
 
 def _download_argv(config: DownloadConfig) -> List[str]:
@@ -323,9 +341,29 @@ def _download_argv(config: DownloadConfig) -> List[str]:
 
 
 def _download_display_command(config: DownloadConfig) -> str:
-    argv = ["modelscope", *_download_arguments(config)]
-    suffix = "  [Token injected through environment]" if config.token else ""
+    argv = _download_argv(config)
+    suffix = "  # [Token injected through environment]" if config.token else ""
     return " ".join(shlex.quote(part) for part in argv) + suffix
+
+
+def _downloaded_model_path(config: DownloadConfig) -> str:
+    """Choose an unambiguous GGUF entry point, keeping HF directories intact."""
+    root = Path(config.target_dir)
+    patterns = _download_include_patterns(config.include)
+    if not patterns and (root / "config.json").is_file():
+        return str(root)
+    candidates = []
+    for path in root.rglob("*.gguf"):
+        if not path.is_file() or path.name.lower().startswith("mmproj"):
+            continue
+        if not _filter_file_sizes({path.relative_to(root).as_posix(): 0}, patterns):
+            continue
+        shard = re.fullmatch(r".*-(\d{5})-of-\d{5}\.gguf", path.name)
+        if shard and shard[1] != "00001":
+            continue
+        candidates.append(path)
+    # Multiple variants require the user to select the intended checkpoint.
+    return str(candidates[0]) if len(candidates) == 1 else str(root)
 
 
 def _display_endpoint(config: DeployConfig) -> str:
@@ -565,16 +603,17 @@ class LauncherRuntime:
         }
 
     def download_catalog(self) -> List[Dict[str, Any]]:
-        groups = []
-        for key, label, choices in MODELSCOPE_MODEL_GROUPS:
-            models = [
-                {"id": model_id, "label": model_label}
-                for model_id, model_label in choices
-                if model_id != "custom"
-            ]
-            if models:
-                groups.append({"id": key, "label": label, "models": models})
-        return groups
+        return [
+            {
+                "id": group["id"],
+                "label": group["label"],
+                "description": group.get("description", ""),
+                "accent": group.get("accent", "slate"),
+                "models": [dict(model) for model in group.get("models", ())],
+            }
+            for group in MODELSCOPE_DOWNLOAD_GROUPS
+            if group.get("models")
+        ]
 
     def save_profile(self, index: Optional[int], payload: Any) -> Dict[str, Any]:
         config = _coerce_config(payload)
@@ -701,6 +740,7 @@ class LauncherRuntime:
                 "pid": None,
                 "modelId": config.model_id,
                 "destination": config.target_dir,
+                "modelPath": "",
                 "progress": 0.0,
                 "progressIndeterminate": True,
                 "downloadedBytes": 0,
@@ -741,7 +781,7 @@ class LauncherRuntime:
         )
         threading.Thread(
             target=self._watch_download,
-            args=(process, generation),
+            args=(process, generation, config),
             name="ftllm-launcher-download",
             daemon=True,
         ).start()
@@ -799,8 +839,14 @@ class LauncherRuntime:
                 "message": f"Downloading model... Overall progress {progress:.1f}%",
             })
 
-    def _watch_download(self, process, generation: int):
+    def _watch_download(self, process, generation: int, config: DownloadConfig):
         exit_code = process.wait()
+        model_path = config.target_dir
+        if exit_code == 0:
+            try:
+                model_path = _downloaded_model_path(config)
+            except OSError:
+                pass  # A disappearing destination must not strand the watcher.
         with self._lock:
             if generation != self._download_generation:
                 return
@@ -823,6 +869,7 @@ class LauncherRuntime:
                     else f"Model download failed (code={exit_code})"
                 ),
                 "exitCode": exit_code,
+                "modelPath": model_path if completed else "",
             })
             destination = self._download_state["destination"]
             message = self._download_state["message"]

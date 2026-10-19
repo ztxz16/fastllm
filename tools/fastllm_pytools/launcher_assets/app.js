@@ -180,7 +180,7 @@ function cacheElements() {
     "confirmation-modal", "confirmation-icon", "confirmation-kicker",
     "confirmation-title", "confirmation-message", "confirmation-cancel",
     "confirmation-confirm",
-    "toast-region", "download-activity", "download-form", "download-preset",
+    "toast-region", "download-activity", "download-catalog", "download-form", "download-preset",
     "download-badge", "download-command", "download-validation", "download-start",
     "download-cancel", "download-use-model", "download-use-last", "download-status-icon",
     "download-status-title", "download-status-message", "download-progress-value",

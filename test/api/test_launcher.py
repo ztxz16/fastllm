@@ -23,11 +23,13 @@ if TOOLS_DIR not in sys.path:
 
 from fastllm_pytools.launcher import (
     ASSET_DIRECTORY,
+    DownloadConfig,
     MODELSCOPE_PROGRESS_PREFIX,
     LauncherError,
     LauncherRuntime,
     _launcher_access_addresses,
     _parse_modelscope_download_progress,
+    _downloaded_model_path,
     browse_folders,
     create_launcher_app,
     fastllm_launcher,
@@ -540,6 +542,7 @@ class LauncherConfigTest(unittest.TestCase):
             "targetDir": os.path.join(self.temp.name, "downloads", "qwen"),
             "revision": "master",
             "maxWorkers": "4",
+            "include": "Q2_0/*,mmproj-*.gguf",
             "token": "private-modelscope-token",
         }
         with patch(
@@ -549,9 +552,33 @@ class LauncherConfigTest(unittest.TestCase):
             preview = self.runtime.preview_download(payload)
 
         self.assertEqual(preview["errors"], [])
-        self.assertIn("modelscope download", preview["command"])
+        self.assertIn("modelscope_download.py download", preview["command"])
         self.assertNotIn("private-modelscope-token", preview["command"])
         self.assertIn("Token injected through environment", preview["command"])
+        self.assertIn("--include 'Q2_0/*'", preview["command"])
+        self.assertIn("--include 'mmproj-*.gguf'", preview["command"])
+
+    def test_downloaded_gguf_selects_filtered_first_shard_and_excludes_mmproj(self):
+        for name in ("Q2_0/model-00001-of-00002.gguf", "Q2_0/model-00002-of-00002.gguf",
+                     "IQ3_S/model.gguf", "mmproj-bf16.gguf"):
+            path = os.path.join(self.model_path, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb"):
+                pass
+        config = DownloadConfig(target_dir=self.model_path, include="Q2_0/*,mmproj-*.gguf")
+        self.assertEqual(_downloaded_model_path(config),
+                         os.path.join(self.model_path, "Q2_0/model-00001-of-00002.gguf"))
+        self.runtime._download_state["destination"] = self.model_path
+        self.runtime._watch_download(SimpleNamespace(wait=lambda: 0),
+                                    self.runtime._download_generation, config)
+        self.assertEqual(self.runtime.download_state()["modelPath"],
+                         os.path.join(self.model_path, "Q2_0/model-00001-of-00002.gguf"))
+        # Do not silently pick one variant from a complete multi-variant repo.
+        config.include = ""
+        self.assertEqual(_downloaded_model_path(config), self.model_path)
+        with open(os.path.join(self.model_path, "config.json"), "w") as stream:
+            json.dump({}, stream)
+        self.assertEqual(_downloaded_model_path(config), self.model_path)
 
     def test_download_progress_parser_rejects_invalid_events(self):
         valid = MODELSCOPE_PROGRESS_PREFIX + json.dumps({

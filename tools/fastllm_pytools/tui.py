@@ -33,6 +33,7 @@ HOT_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
     (DEFAULT_MODELSCOPE_MODEL_ID, "Qwen3.8-27B-FP8"),
     ("QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4", "Qwen3.8-27B-QUASAR-NVFP4"),
     ("z-lab/Qwen3.8-27B-DFlash2", "Qwen3.8-27B-DFlash2"),
+    ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "DeepSeek-V4.1-Flash-1017"),
 )
 CUSTOM_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
     ("custom", "自定义模型ID"),

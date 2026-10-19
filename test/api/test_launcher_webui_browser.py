@@ -2522,6 +2522,28 @@ document.querySelector('#counter').onclick = event => {
         expect(self.page.locator('#decode-speed')).to_have_text('0')
         self.assertEqual(len(pending), 1)
 
+    def test_download_catalog_selects_variant_and_launches_gguf_entrypoint(self):
+        self.page.locator('[data-view-button="download"]').click()
+        card = self.page.locator('[data-preset="flash-gsq-q2-0"]')
+        card.click()
+        expect(card).to_have_attribute('aria-pressed', 'true')
+        expect(card.locator('small')).to_have_text('About 66.4 GB · Speed')
+        expect(self.page.locator('[data-download-field="include"]')).to_have_value('Q2_0/*,mmproj-*.gguf')
+        self.page.locator('#download-preset').select_option('flash-gsq-iq3-s')
+        expect(card).to_have_attribute('aria-pressed', 'false')
+        expect(self.page.locator('[data-preset="flash-gsq-iq3-s"]')).to_have_attribute('aria-pressed', 'true')
+        self.page.clock.fast_forward(700)
+        expect(self.page.locator('#download-command')).to_contain_text("--include 'IQ3_S/*'")
+        shard = os.path.join(self.temp.name, 'model-00001-of-00002.gguf')
+        with open(shard, 'wb'):
+            pass
+        self.runtime._download_state.update(phase='completed', destination=self.temp.name, modelPath=shard)
+        self.page.clock.fast_forward(2100)
+        self.page.locator('#download-use-model').click()
+        expect(self.page.locator('[data-field="model"]')).to_have_value(shard)
+        expect(self.page.locator('[data-config-mode][value="long_context"]')).to_be_checked()
+
+
     def test_presets_stay_simple_and_editing_reuses_the_saved_mode(self):
         model_path = os.path.join(self.temp.name, 'model')
         os.mkdir(model_path)

@@ -270,7 +270,11 @@
     "停止 Claude Code": "Stop Claude Code",
     "Claude Code 项目与会话": "Claude Code projects and conversations",
     "搜索 Claude Code 会话": "Search Claude Code conversations",
-    "Claude Code 消息": "Claude Code message"
+    "Claude Code 消息": "Claude Code message",
+    "模型簇": "Model clusters",
+    "下载范围（可选）": "Download scope (optional)",
+    "多个匹配规则用逗号分隔；留空下载整个仓库。GSQ 量化建议选择页面中的版本卡片。": "Separate multiple patterns with commas; leave empty to download the whole repository. GSQ presets select the needed quantization files.",
+    "按模型簇选择官方权重、GSQ 量化或混合推理模型；选中卡片会自动填入下载范围。": "Choose official weights, GSQ quantizations, or hybrid inference models by cluster; selecting a card fills the download scope."
   },
   "messages": {
     "Pi Agent": "Pi Agent",
@@ -495,7 +499,25 @@
     "{name} is working…": "{name} is working…",
     "{name} request failed.": "{name} request failed.",
     "{name} needs your response": "{name} needs your response",
-    "What would you like to work on?": "What would you like to work on?"
+    "What would you like to work on?": "What would you like to work on?",
+    "稠密主模型，覆盖原始、FP8、NVFP4 与 DFlash2 草稿权重。": "Dense models with original, FP8, NVFP4 and DFlash2 draft weights.",
+    "选择一个量化子目录；下载器只拉选中的分片与共享 mmproj。": "Choose a quantization directory; download only its shards and the shared mmproj.",
+    "大 MoE 混合推理模型，建议使用自动规划器部署。": "Large MoE model for hybrid inference; automatic configuration is recommended.",
+    "快速验证": "Quick check",
+    "小模型和自定义入口，用于先验证环境、权限与下载链路。": "Small models for checking the environment, permissions and downloads.",
+    "原始质量": "Original weights",
+    "约 31 GB": "About 31 GB",
+    "显存友好": "Lower GPU memory use",
+    "推测解码草稿": "Speculative decoding draft",
+    "约 66.4 GB · 速度优先": "About 66.4 GB · Speed",
+    "约 68.0 GB · 体积优先": "About 68.0 GB · Size",
+    "约 75.8 GB · 平衡": "About 75.8 GB · Balanced",
+    "约 83.6 GB · 质量优先": "About 83.6 GB · Quality",
+    "代码场景": "Coding tasks",
+    "约 510 GB · 混合推理": "About 510 GB · Hybrid inference",
+    "Download file patterns contain invalid characters.": "Download file patterns contain invalid characters.",
+    "Download file patterns may contain at most 64 entries.": "Download file patterns may contain at most 64 entries.",
+    "Each download file pattern must be at most 512 characters and cannot start with '-'.": "Each download file pattern must be at most 512 characters and cannot start with '-'."
   },
   "patterns": [
     {
