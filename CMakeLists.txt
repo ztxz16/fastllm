@@ -1094,6 +1094,16 @@ if (UNIT_TEST)
         target_link_libraries(disk_moe_cache_test PRIVATE fastllm)
         add_test(NAME disk_moe_cache COMMAND disk_moe_cache_test)
         set_tests_properties(disk_moe_cache PROPERTIES TIMEOUT 180)
+
+        add_executable(deepseek_v41_disk_shared_test test/basic/test_deepseek_v41_disk_shared.cpp)
+        target_link_libraries(deepseek_v41_disk_shared_test PRIVATE fastllm)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if (Python3_Interpreter_FOUND)
+            add_test(NAME deepseek_v41_disk_shared
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/basic/test_deepseek_v41_disk_shared.py
+                        $<TARGET_FILE:deepseek_v41_disk_shared_test>)
+            set_tests_properties(deepseek_v41_disk_shared PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        endif()
         if (USE_CUDA AND NOT USE_ROCM)
             if (USE_NUMAS)
                 add_executable(disk_glm5_gguf_cache_test test/basic/test_disk_glm5_gguf_cache.cpp)

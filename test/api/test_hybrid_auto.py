@@ -499,6 +499,19 @@ class HybridAutoTest(unittest.TestCase):
         geometry.assert_called_once_with({}, "float32", 0, 0)
         self.assertEqual((a.atype, a.kv_cache_dtype), ("float32", "auto"))
 
+    def test_disk_moe_keeps_cuda_shared_experts_in_dense_budget(self):
+        from dataclasses import replace
+        g, _, _, _ = fixture()
+        g = replace(g, family="deepseek_v41")
+        tensors = [auto.Tensor("layers.0.ffn.experts.0.w1.weight", (64, 32), 2048, "F8_E4M3"),
+                   auto.Tensor("layers.0.ffn.shared_experts.w1.weight", (64, 32), 2048, "F8_E4M3")]
+        a = args(moe_device="disk", cuda_shared_expert="true", dtype="auto")
+        experts, dense, _, host, *_ = auto.weight_costs(tensors, g, a)
+        self.assertEqual((experts[0], dense[0], host), (2048, 4096, 0))
+        a.cuda_shared_expert = "false"
+        experts, dense, _, host, *_ = auto.weight_costs(tensors, g, a)
+        self.assertEqual((experts[0], dense[0], host), (2048, 0, 4096))
+
     def test_deepseek_shared_compressed_cache_accounting(self):
         md = {"model_type": "deepseek_v41", "num_hidden_layers": 4,
               "max_position_embeddings": 65536, "hidden_size": 4096,

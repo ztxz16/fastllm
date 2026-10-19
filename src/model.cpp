@@ -714,7 +714,9 @@ namespace fastllm {
              !model->layeredMoeDeviceMap.empty())) {
             int layerId = GetMoeWeightLayerId(weightName);
             if (layerId >= 0) {
-                return model->SelectMoeDeviceForLayer(layerId);
+                // Unregistered inputs still follow the model's placement
+                // policy, including CUDA shared experts in disk MoE mode.
+                return model->SelectSpecialWeightDevice(weightName, layerId);
             }
         }
         return "";
