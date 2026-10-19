@@ -473,14 +473,14 @@ int main(int argc, char **argv) {
                 if (memcmp(directOutput.data(), output.cpuData, directOutput.size()) != 0)
                     throw std::runtime_error("Q2 disk cold/warm outputs differ");
                 SetMoeCpuCacheBytes(1); SetMoeCpuCacheBytes(4 * 1024 * 1024);
-                const char *oldOverride = std::getenv("FASTLLM_DISK_NO_CACHE");
+                const char *oldOverride = std::getenv("FASTLLM_DISK_DIRECT_IO");
                 const bool hadOverride = oldOverride != nullptr;
                 const std::string savedOverride = hadOverride ? oldOverride : "";
-                setenv("FASTLLM_DISK_NO_CACHE", "0", 1);
+                setenv("FASTLLM_DISK_DIRECT_IO", "0", 1);
                 MergeMOE(input, index, score, weights, biases, w1, w2, w3, currentInput, currentOutput,
                          0.7f, output, 0, MoeGateSwiglu, false, 10.f, true, nullptr, 32, quantizeShared);
-                if (hadOverride) setenv("FASTLLM_DISK_NO_CACHE", savedOverride.c_str(), 1);
-                else unsetenv("FASTLLM_DISK_NO_CACHE");
+                if (hadOverride) setenv("FASTLLM_DISK_DIRECT_IO", savedOverride.c_str(), 1);
+                else unsetenv("FASTLLM_DISK_DIRECT_IO");
                 if (memcmp(directOutput.data(), output.cpuData, directOutput.size()) != 0)
                     throw std::runtime_error("Q2 disk aligned/buffered read outputs differ");
             }

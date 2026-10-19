@@ -583,8 +583,9 @@ FT_NUMAS=1 numactl -C 0-31 -m 0 \
 `--moe_cpu_cache` sets the process-wide RAM budget; `--moe_cuda_cache` sets
 VRAM **per GPU**. Both default to zero. A GPU hit executes on that GPU, a RAM
 hit executes on CPU, and a miss loads the expert from disk. Cold prefill can
-stream missing experts through CUDA using the existing disk GPU-prefill
-setting. NUMA-cache modes and per-device environment overrides do not apply
+stream missing experts through CUDA; `FT_GPU_PREFILL=0` disables this path.
+`FASTLLM_DISK_MOE_GPU_PREFILL_MIN_TOKENS` sets its minimum batch size (default 32).
+NUMA-cache modes and per-device environment overrides do not apply
 to this backend.
 
 Gate/up and down weights are cached together. Replacement prefers the lowest
@@ -597,10 +598,21 @@ combined coverage; another GPU can load it again if needed.
 
 Budgets cover retained expert payload, excluding other model weights, KV/Engram
 tables, metadata and temporary buffers. Computation stages at most 256 rows
-per expert and prefetches one missing expert. Cache reads default to `O_DIRECT`
-where available; `FASTLLM_DISK_DIRECT_IO=0` selects buffered reads. Shrinking or
+per expert. V4.1 single-token decode uses two disk readers and queues at most
+eight missing experts within 128 MiB of weight payloads; one oversized expert
+may still run. Other paths retain their one- or two-expert read-ahead windows.
+The reusable CPU weight workspace holds at most four buffers of 16 MiB each.
+Cache reads default to `O_DIRECT` where available; `FASTLLM_DISK_DIRECT_IO=0` selects buffered reads. Shrinking or
 disabling a cache releases excess entries, and model unload releases its
 entries. On glibc, retired buffers are periodically returned to the OS.
+The old `FASTLLM_DISK_MOE_GPU_PREFILL` and `FASTLLM_DISK_NO_CACHE` aliases
+are removed; use `FT_GPU_PREFILL` and `FASTLLM_DISK_DIRECT_IO`, respectively.
+
+For V4.1 batches of up to eight tokens, resident NVFP4 GPU experts are submitted
+before the independent CPU batch and gathered once. Results retain each route's
+BF16 rounding boundary and are accumulated in expert-ID order. GPU cache
+replacement waits for the resident work to finish, and rejected promotions
+skip weight packing. Shared GPU experts can overlap disk MoE work on a single GPU.
 
 CUDA residency supports compact NVFP4 with block-32 UE8M0 scales, block-128
 FP8 (native or packed), FP32, FP16 and BF16. Other formats use CPU execution.

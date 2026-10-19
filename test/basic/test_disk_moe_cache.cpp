@@ -56,9 +56,10 @@ struct Fixture {
         fclose(file);
     }
     ~Fixture() { storage.clear(); unlink(path.c_str()); }
-    std::vector<uint16_t> Run(bool cached, int batch, int offset, int device = -1, bool borrowedInput = false) {
+    std::vector<uint16_t> Run(bool cached, int batch, int offset, int device = -1,
+                              bool borrowedInput = false, int topk = 3, bool quantShared = true) {
         Data x(DataType::BFLOAT16, {batch, hidden}), y(DataType::BFLOAT16, {batch, hidden});
-        Data ids(DataType::INT32PARAM, {batch, 3}), scores(DataType::FLOAT32, {batch, 3});
+        Data ids(DataType::INT32PARAM, {batch, topk}), scores(DataType::FLOAT32, {batch, topk});
         Data a, b, c;
         x.Allocate(false); ids.Allocate(false); scores.Allocate(false);
         for (int row = 0; row < batch; ++row) {
@@ -67,9 +68,9 @@ struct Fixture {
                 uint32_t bits; memcpy(&bits, &value, 4);
                 ((uint16_t*)x.cpuData)[row * hidden + col] = bits >> 16;
             }
-            for (int j = 0; j < 3; ++j) {
-                ((int32_t*)ids.cpuData)[row * 3 + j] = (offset + (2 - j) * 2 + row % 2) % experts;
-                ((float*)scores.cpuData)[row * 3 + j] = .17f + j * .21f;
+            for (int j = 0; j < topk; ++j) {
+                ((int32_t*)ids.cpuData)[row * topk + j] = (offset + (topk - 1 - j) * 2 + row % 2) % experts;
+                ((float*)scores.cpuData)[row * topk + j] = .17f + j * .21f;
             }
         }
 #ifdef USE_CUDA
@@ -95,7 +96,7 @@ struct Fixture {
         }
 #endif
         IntDict params = {{"weights___batch", (int)table.size()}, {"biass___batch", (int)biases.size()},
-            {"deepSeekV4Mode", 1}, {"activationQuantBlock", 32}, {"quantizeSharedExpert", 1}};
+            {"deepSeekV4Mode", 1}, {"activationQuantBlock", 32}, {"quantizeSharedExpert", quantShared ? 1 : 0}};
         FloatDict floats = {{"sharedScale", 1.0f}, {"swigluLimit", 2.0f}};
         if (cached) { DiskMergeMOE op; op.Run("MergeMOE", data, floats, params); }
         else { CpuReference op; op.Run("MergeMOE", data, floats, params); }
@@ -233,6 +234,39 @@ int main(int argc, char **argv) {
                 Compare(f.Run(true, 1, 0, device), f.Run(false, 1, 0), false);
                 after = GetDiskMoeCacheStats();
                 Require(after.cpuBytes == 0 && after.cudaHits > before.cudaHits, "GPU-only residency");
+                // Heat a disjoint routed set enough to replace CUDA records,
+                // then return to the original set. Exercise borrowed views
+                // after exact-size record reuse, with no RAM backup.
+                auto replacing = GetDiskMoeCacheStats();
+                for (int offset : {6, 0}) {
+                    const auto start = GetDiskMoeCacheStats();
+                    // The cache clock is shared across devices. Allow a full
+                    // aging epoch instead of depending on the previous case
+                    // ending within 96 calls of an epoch boundary.
+                    for (int repeat = 0; repeat < 1600; ++repeat) {
+                        f.Run(true, 1, offset, device);
+                        if (repeat >= 95 && GetDiskMoeCacheStats().cudaEvictions > start.cudaEvictions) break;
+                    }
+                    Compare(f.Run(true, 1, offset, device), f.Run(false, 1, offset), false);
+                }
+                auto replaced = GetDiskMoeCacheStats();
+                Require(replaced.cudaEvictions > replacing.cudaEvictions && replaced.uploads > replacing.uploads,
+                    "CUDA replacement path was not exercised");
+                Require(replaced.cpuBytes == 0 && replaced.cudaBytes <= GetMoeCudaCacheBytes() * (device + 1),
+                    "CUDA replacement exceeded cache budget");
+                // Duplicate routes, shared-input quantization and mixed GPU /
+                // disk residency must survive deferred promotion and a single
+                // gather. The tiny RAM tier also exercises read-ahead teardown.
+                SetMoeCpuCacheBytes(1);
+                for (bool quantShared : {false, true}) for (int batch : {1, 7, 8}) {
+                    auto start = GetDiskMoeCacheStats();
+                    Compare(f.Run(true, batch, 0, device, false, 8, quantShared),
+                            f.Run(false, batch, 0, -1, false, 8, quantShared), false);
+                    auto end = GetDiskMoeCacheStats();
+                    Require(end.cudaHits > start.cudaHits && end.misses > start.misses,
+                        "duplicate-route fixture did not mix GPU hits and disk reads");
+                    Require(end.cpuBytes == 0, "read-ahead retained an over-budget RAM entry");
+                }
             }
             SetMoeCudaCacheBytes(1);
             for (int device = 0; device < devices; ++device)

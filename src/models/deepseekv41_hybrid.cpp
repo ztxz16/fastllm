@@ -96,6 +96,7 @@ namespace fastllm {
         overlapShared = hasSharedExpertOut &&
             !V41EnvFlag("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP") &&
             (V41DeviceSpecUsesType(overlapMoeDevice, "cpu") ||
+             (!tp && single && seqlen <= 8 && V41DeviceSpecUsesType(overlapMoeDevice, "disk")) ||
              (V41DeviceSpecUsesType(overlapMoeDevice, "numa") &&
               (tp || (single && seqlen == 1 && !FastllmCudaMoeCacheRequested()))));
 #endif

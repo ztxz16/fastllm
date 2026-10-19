@@ -1114,8 +1114,9 @@ if (UNIT_TEST)
             endif()
             add_test(NAME disk_moe_cache_cuda COMMAND disk_moe_cache_test 1)
             add_test(NAME disk_moe_cache_cuda_prefill COMMAND disk_moe_cache_test 1 prefill)
-            set_tests_properties(disk_moe_cache_cuda disk_moe_cache_cuda_prefill
-                                 PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+            add_test(NAME disk_moe_cache_cuda_dual COMMAND disk_moe_cache_test 2)
+            set_tests_properties(disk_moe_cache_cuda disk_moe_cache_cuda_prefill disk_moe_cache_cuda_dual
+                                 PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77 TIMEOUT 180)
         endif()
     endif()
     find_package(Threads REQUIRED)

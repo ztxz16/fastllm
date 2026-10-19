@@ -41,6 +41,7 @@
 #endif
 
 #ifdef USE_CUDA
+#include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #endif
 
@@ -127,10 +128,7 @@ namespace fastllm {
     }
 
     static bool DiskMoeGpuPrefillEnabled() {
-        static bool enabled = []() {
-            bool ret = ParseEnvFlag(std::getenv("FT_GPU_PREFILL"), true);
-            return ParseEnvFlag(std::getenv("FASTLLM_DISK_MOE_GPU_PREFILL"), ret);
-        }();
+        static const bool enabled = ParseEnvFlag(std::getenv("FT_GPU_PREFILL"), true);
         return enabled;
     }
 
@@ -150,10 +148,9 @@ namespace fastllm {
         return false;
 #else
         // A bounded expert cache should not create another unbounded copy in
-        // the OS page cache. Existing explicit I/O overrides still take precedence.
-        bool ret = ParseEnvFlag(std::getenv("FASTLLM_DISK_DIRECT_IO"),
-                                diskExpertRead && (GetMoeCpuCacheBytes() || GetMoeCudaCacheBytes()));
-        return ParseEnvFlag(std::getenv("FASTLLM_DISK_NO_CACHE"), ret);
+        // the OS page cache. An explicit I/O override still takes precedence.
+        return ParseEnvFlag(std::getenv("FASTLLM_DISK_DIRECT_IO"),
+                           diskExpertRead && (GetMoeCpuCacheBytes() || GetMoeCudaCacheBytes()));
 #endif
     }
 
@@ -480,12 +477,11 @@ namespace fastllm {
             return nullptr;
         }
         bool Retain(std::unique_ptr<uint8_t[]> &data, size_t allocated) {
-            // Workspace, not another expert cache: at most two GGUF
+            // Workspace, not another expert cache: at most two compact
             // gate/down pairs, with exact allocation-size reuse.
-            constexpr size_t maxBuffer = 16ULL << 20, maxBytes = 32ULL << 20;
+            constexpr size_t maxBuffer = 16ULL << 20;
             if (!data || allocated > maxBuffer) return false;
             std::lock_guard<std::mutex> lock(mutex);
-            if (allocated > maxBytes - bytes) return false;
             for (auto &buffer : buffers) if (!buffer.data) {
                 buffer.data = std::move(data);
                 buffer.bytes = allocated;
@@ -615,7 +611,17 @@ namespace fastllm {
             return loaded;
         }
 
-        loaded->Allocate(false);
+        std::unique_ptr<Data> guard(loaded);
+        const bool pooled = storage && weight->dataType == DataType::NVFP4 &&
+            weight->dims.size() == 2 && weight->blockK > 0 && weight->blockM > 0 &&
+            weight->scales.empty() && loaded->GetBytes() <= (16ULL << 20);
+        if (pooled) {
+            loaded->expansionSize = loaded->Count(0);
+            loaded->expansionBytes = loaded->GetBytes();
+            auto allocation = GetDiskWeightBufferPool().Acquire(loaded->expansionBytes);
+            if (!allocation) allocation.reset(new uint8_t[loaded->expansionBytes]);
+            loaded->cpuData = allocation.release();
+        } else loaded->Allocate(false);
 
         uint64_t dstOffset = 0;
         std::vector<uint8_t> buffer;
@@ -685,7 +691,11 @@ namespace fastllm {
             }
             dstOffset += dstBytes;
         }
-        return loaded;
+        if (pooled) {
+            storage->allocatedBytes = loaded->expansionBytes;
+            storage->allocation.reset(loaded->cpuData);
+        }
+        return guard.release();
     }
 
     static size_t DiskLinearChunkBytes() {
@@ -1770,7 +1780,7 @@ namespace fastllm {
         std::unique_ptr<Data> gate, down;
         DiskWeightStorage gateStorage, downStorage;
         int device = -1;
-        void *ggufRecord = nullptr;
+        void *cudaRecord = nullptr;
         uint64_t Bytes() const {
             uint64_t bytes = gateStorage.paddingBytes + downStorage.paddingBytes;
             for (const Data *w : {gate.get(), down.get()}) {
@@ -1802,7 +1812,7 @@ namespace fastllm {
         }
         ~DiskCachedExpert() {
             // Data owns ordinary new[] buffers; these two views are owned by
-            // the aligned allocations instead.
+            // the cache allocations instead.
             RecycleCpuStorage();
 #ifdef USE_CUDA
             if (device >= 0) {
@@ -1811,7 +1821,7 @@ namespace fastllm {
                 ReleaseDiskTempWeightCudaExtras(gate.get());
                 ReleaseDiskTempWeightCudaExtras(down.get());
                 gate.reset(); down.reset();
-                if (ggufRecord) FastllmCudaDirectFree(ggufRecord);
+                if (cudaRecord) FastllmCudaDirectFree(cudaRecord);
                 FastllmCudaSetDevice(previous);
             }
 #endif
@@ -2023,7 +2033,7 @@ namespace fastllm {
             else slot.reset();
         }
         bool MakeRoom(DiskExpertEntry *candidate, int device, uint64_t bytes, uint64_t budget,
-                      std::unique_ptr<DiskCachedExpert> *recycled = nullptr) {
+                      std::unique_ptr<DiskCachedExpert> *recycled = nullptr, bool apply = true) {
             if (bytes > budget) return false;
             uint64_t used = device < 0 ? cpuBytes : cudaBytes[device];
             if (used <= budget - bytes) return true;
@@ -2040,14 +2050,14 @@ namespace fastllm {
             // admission order while avoiding sorting the whole resident cache.
             auto evict = [&](DiskExpertEntry &victim) {
                 auto &slot = Slot(victim, device);
-                // Hand one exact-size GGUF record straight to its replacement.
+                // Hand one exact-size CUDA record straight to its replacement.
                 // No idle allocator pool survives an admission or budget trim.
                 bool reuse = recycled && !*recycled && device >= 0 &&
-                    slot->ggufRecord && slot->Bytes() == bytes;
+                    slot->cudaRecord && slot->Bytes() == bytes;
                 Evict(victim, device, reuse ? recycled : nullptr);
             };
             if (Slot(*weakest, device)->Bytes() >= used - (budget - bytes)) {
-                evict(*weakest);
+                if (apply) evict(*weakest);
                 return true;
             }
             std::vector<DiskExpertEntry*> victims;
@@ -2062,7 +2072,7 @@ namespace fastllm {
                 used -= Slot(*victim, device)->Bytes();
             }
             if (used > budget - bytes) return false;
-            for (size_t i = 0; i < count; ++i) evict(*victims[i]);
+            if (apply) for (size_t i = 0; i < count; ++i) evict(*victims[i]);
             return true;
         }
         void Trim() {
@@ -2253,23 +2263,28 @@ namespace fastllm {
         } restore;
         FastllmCudaSetDevice(device);
         expert.device = device;
-        const bool gguf = expert.gate->dataType == DataType::DATA_GGUF_FORMAT &&
-                          expert.down->dataType == DataType::DATA_GGUF_FORMAT;
+        // Preserve separately aligned allocations for other layouts. Native
+        // block-32 experts may share a record when down retains CUDA alignment.
+        const bool combined = (expert.gate->dataType == DataType::DATA_GGUF_FORMAT &&
+                               expert.down->dataType == DataType::DATA_GGUF_FORMAT) ||
+            (expert.gate->dataType == DataType::NVFP4_BLOCK_32_E8M0 &&
+             expert.down->dataType == DataType::NVFP4_BLOCK_32_E8M0 &&
+             expert.gate->GetBytes() % 256 == 0);
         const size_t recordBytes = expert.gate->GetBytes() + expert.down->GetBytes();
-        if (gguf && recycled && recycled->device == device && recycled->ggufRecord &&
+        if (combined && recycled && recycled->device == device && recycled->cudaRecord &&
             recycled->gate->GetBytes() + recycled->down->GetBytes() == recordBytes) {
-            expert.ggufRecord = recycled->ggufRecord;
-            recycled->ggufRecord = nullptr;
+            expert.cudaRecord = recycled->cudaRecord;
+            recycled->cudaRecord = nullptr;
         }
         recycled.reset();
-        if (gguf && !expert.ggufRecord) expert.ggufRecord = FastllmCudaDirectMalloc(recordBytes);
+        if (combined && !expert.cudaRecord) expert.cudaRecord = FastllmCudaDirectMalloc(recordBytes);
         size_t offset = 0;
         for (Data *weight : {expert.gate.get(), expert.down.get()}) {
             // Use dedicated storage so trims return VRAM to the driver; an
             // exact-size replacement can inherit its victim's record above.
             weight->directMemory = true;
-            weight->cudaDataBorrowed = gguf;
-            weight->cudaData = gguf ? static_cast<uint8_t *>(expert.ggufRecord) + offset :
+            weight->cudaDataBorrowed = combined;
+            weight->cudaData = combined ? static_cast<uint8_t *>(expert.cudaRecord) + offset :
                 FastllmCudaDirectMalloc(weight->GetBytes());
             FastllmCudaCopyFromHostToDevice(weight->cudaData, weight->cpuData, weight->GetBytes());
             weight->dataDevice = DataDevice::CUDA;
@@ -2306,7 +2321,7 @@ namespace fastllm {
         workspace.ToDevice(DataDevice::CUDA, {expert.device}, false); workspace.Allocate(false);
         values.ToDevice(DataDevice::CUDA, {expert.device}, false); values.Allocate(false);
         scores.ToDevice(DataDevice::CUDA, {expert.device}, true);
-        FastllmCudaMoeGGUFCacheView view{static_cast<const uint8_t *>(expert.ggufRecord),
+        FastllmCudaMoeGGUFCacheView view{static_cast<const uint8_t *>(expert.cudaRecord),
             static_cast<const int32_t *>(slots.cudaData),
             expert.gate->GetBytes() + expert.down->GetBytes(), expert.gate->GetBytes(),
             expert.gate->ggmlType, expert.down->ggmlType, hidden, inter,
@@ -2320,6 +2335,68 @@ namespace fastllm {
         memcpy(output.cpuData, values.cpuData, values.GetBytes());
 #endif
     }
+
+    // V4.1 decode keeps one BF16 output per route, including the shared
+    // expert. Submit the existing projection kernels without the host MoE
+    // adapter's per-expert synchronization. All views and weights remain live
+    // until Gather (also on exceptions); reduction still happens on the CPU.
+    struct DiskV41ResidentBatch {
+        struct Expert { DiskCachedExpert *weight; int first, rows; bool shared; };
+        Data input{BFLOAT16}, scores{FLOAT32}, middle{BFLOAT16}, activation{BFLOAT16}, values{BFLOAT16};
+        std::vector<Expert> experts;
+        std::vector<int> slots;
+        std::vector<float> perRoute;
+        int device, hidden;
+        bool queued = false;
+
+        DiskV41ResidentBatch(int device, int hidden, size_t routes)
+            : device(device), hidden(hidden), perRoute(routes * hidden) {}
+        ~DiskV41ResidentBatch() {
+            if (queued) {
+                FastllmCudaSetDevice(device);
+                FastllmCudaSyncCurrentThreadStream();
+            }
+        }
+        void Launch(float limit, bool quantShared) {
+            FastllmCudaSetDevice(device);
+            input.ToDevice(CUDA, {device}, true);
+            scores.ToDevice(CUDA, {device}, true);
+            values.Resize(input.dims); values.ToDevice(CUDA, {device}, false); values.Allocate(false);
+            int maxRows = 0, maxMiddle = 0;
+            for (const auto &e : experts) {
+                maxRows = std::max(maxRows, e.rows);
+                maxMiddle = std::max(maxMiddle, e.weight->gate->dims[0]);
+            }
+            middle.Resize({maxRows, maxMiddle}); middle.ToDevice(CUDA, {device}, false); middle.Allocate(false);
+            activation.Resize({maxRows, maxMiddle / 2}); activation.ToDevice(CUDA, {device}, false); activation.Allocate(false);
+            queued = true;
+            for (const auto &e : experts) {
+                Data x(BFLOAT16, {e.rows, hidden}, CUDA, (uint8_t *)input.cudaData + size_t(e.first) * hidden * 2);
+                Data y(BFLOAT16, {e.rows, hidden}, CUDA, (uint8_t *)values.cudaData + size_t(e.first) * hidden * 2);
+                x.cudaDataBorrowed = y.cudaDataBorrowed = true;
+                x.dataDeviceIds = y.dataDeviceIds = {device};
+                if (!e.shared || quantShared)
+                    AssertInFastLLM(FastllmCudaDeepSeekV41QuantizeActivation(x, x),
+                        "Disk V4.1 resident input quantization failed.\n");
+                DoCudaLinearReshape(x, *e.weight->gate, middle);
+                DoCudaLinear(x, *e.weight->gate, *GetEmptyData(), middle);
+                AssertInFastLLM(FastllmCudaDeepSeekV4PrepareMoeDownInput(middle, activation,
+                    (float *)scores.cudaData + e.first, limit, true, 32),
+                    "Disk V4.1 resident down input failed.\n");
+                DoCudaLinearReshape(activation, *e.weight->down, y);
+                DoCudaLinear(activation, *e.weight->down, *GetEmptyData(), y);
+            }
+        }
+        void Gather() {
+            FastllmCudaSetDevice(device);
+            values.ToDevice(CPU);
+            queued = false;
+            for (size_t row = 0; row < slots.size(); ++row)
+                for (int col = 0; col < hidden; ++col)
+                    perRoute[size_t(slots[row]) * hidden + col] =
+                        ReadDiskFloatValue(values.cpuData, BFLOAT16, row * hidden + col);
+        }
+    };
 
     // Queue the resident experts for a bounded batch, then leave the stream
     // running while the caller computes CPU experts and prefetches SSD misses.
@@ -2346,7 +2423,7 @@ namespace fastllm {
             pointers.dataType = INT32;
             pointers.Resize({int(experts.size() * sizeof(void *) / sizeof(int32_t))}); pointers.Allocate(false);
             for (size_t i = 0; i < experts.size(); ++i) {
-                const void *record = experts[i] ? experts[i]->ggufRecord : nullptr;
+                const void *record = experts[i] ? experts[i]->cudaRecord : nullptr;
                 memcpy(pointers.cpuData + i * sizeof(record), &record, sizeof(record));
             }
             hostSlots.resize(size_t(rows) * topk);
@@ -2819,7 +2896,20 @@ namespace fastllm {
                 glmGGUF(weights[2 * e], weights[2 * e + 1]);
         }
 #endif
-        const int prefetchDepth = nativeGlm || (v4 && quantBlock == 32 && tokens > 1 && tokens <= 8) ? 2 : 1;
+        const int prefetchDepth = nativeGlm || (v4 && quantBlock == 32 && tokens <= 8) ? 2 : 1;
+        // Workers may start the next queued read while the coordinator computes
+        // or maintains the cache. Bound completed + in-flight payloads as well
+        // as task count; large prefill keeps its existing streaming window.
+        const int prefetchWindow = v4 && quantBlock == 32 && tokens == 1 ? 8 : prefetchDepth;
+        auto readBytes = [&](int id) {
+            uint64_t bytes = 0;
+            for (const Data *w : {weights[id * 2], weights[id * 2 + 1]}) {
+                uint64_t stored = 0;
+                for (const auto &part : w->diskWeightParts) stored += part.bytes;
+                bytes += std::max<uint64_t>(stored, w->GetBytes());
+            }
+            return bytes;
+        };
         std::map<int, std::future<std::unique_ptr<DiskCachedExpert>>> pendingReads;
         // Unlike std::async, a packaged-task future does not wait on teardown.
         // Finish the read before the cache lock or model weight pointers expire.
@@ -2889,21 +2979,104 @@ namespace fastllm {
 #endif
         }
         auto prefetch = [&](int firstOrder) {
-            for (int next = firstOrder; next <= count + 1 && (int)pendingReads.size() < prefetchDepth; ++next) {
+            uint64_t queuedBytes = 0;
+            for (const auto &pending : pendingReads) queuedBytes += readBytes(pending.first);
+            for (int next = firstOrder; next <= count + 1 && (int)pendingReads.size() < prefetchWindow; ++next) {
                 int id = next % (count + 1);
                 Data *nextGate = weights[id * 2], *nextDown = weights[id * 2 + 1];
                 if (routes[id].empty() || !nextGate || !nextDown ||
                     !nextGate->isDiskWeight || !nextDown->isDiskWeight || pendingReads.count(id)) continue;
                 auto it = cache.entries.find(nextGate);
                 if (it != cache.entries.end() && (it->second.cpu || cudaHit(it->second))) continue;
+                const uint64_t bytes = readBytes(id);
+                // Always permit one expert even if it exceeds the window.
+                if (!pendingReads.empty() && queuedBytes + bytes > (128ULL << 20)) break;
                 // Allocate the future slot before starting work, so teardown
                 // can wait for every queued read even if allocation throws.
                 auto inserted = pendingReads.emplace(id, std::future<std::unique_ptr<DiskCachedExpert>>{});
                 inserted.first->second = cache.prefetch.Read(nextGate, nextDown,
                     repackCpu(nextGate, nextDown), prefetchDepth);
+                queuedBytes += bytes;
             }
         };
-        if (prefetchDepth > 1) prefetch(1);
+        prefetch(1);
+#ifdef USE_CUDA
+        std::unique_ptr<DiskV41ResidentBatch> v41Resident;
+        std::vector<bool> v41Queued(count + 1, false);
+        if (device >= 0 && tokens <= 8 && topk <= 16 && v4 && quantBlock == 32 &&
+            gateType == MoeGateSwiglu && input.dataType == BFLOAT16) {
+            auto batch = std::make_unique<DiskV41ResidentBatch>(device, hidden, size_t(tokens) * (topk + 1));
+            std::vector<float> scales;
+            std::vector<int> rows;
+            for (int order = 1; order <= count + 1; ++order) {
+                const int e = order % (count + 1);
+                if (routes[e].empty() || !weights[2 * e]) continue;
+                auto found = cache.entries.find(weights[2 * e]);
+                if (found == cache.entries.end()) continue;
+                auto *hit = cudaHit(found->second);
+                if (!hit || hit->device != device ||
+                    hit->gate->dataType != NVFP4_BLOCK_32_E8M0 || hit->down->dataType != NVFP4_BLOCK_32_E8M0) continue;
+                batch->experts.push_back({hit, int(rows.size()), int(routes[e].size()), e == 0});
+                v41Queued[e] = true;
+                for (const auto &task : routes[e]) {
+                    rows.push_back(task.token); scales.push_back(task.score);
+                    batch->slots.push_back(task.slot < 0 ? tokens * topk + task.token : task.slot);
+                }
+            }
+            if (!rows.empty()) {
+                batch->input.Resize({int(rows.size()), hidden}); batch->input.Allocate(false);
+                batch->scores.Resize({int(rows.size())}); batch->scores.Allocate(false);
+                for (size_t row = 0; row < rows.size(); ++row)
+                    memcpy(batch->input.cpuData + row * hidden * 2, input.cpuData + size_t(rows[row]) * hidden * 2, hidden * 2);
+                memcpy(batch->scores.cpuData, scales.data(), scales.size() * sizeof(float));
+                // Own the batch before launching, including exception cleanup.
+                v41Resident = std::move(batch);
+                v41Resident->Launch(limit, quantShared);
+            }
+        }
+#endif
+        // Complete independent RAM-resident routes while disk misses load.
+        // Each synthetic row contains exactly one route, retaining its BF16
+        // boundary; the normal loop still accumulates in expert-ID order.
+        std::vector<int> cpuSlots(count + 1, -1);
+        Data cpuBatchOutput(DataType::BFLOAT16);
+        if (tokens == 1 && v4 && quantBlock == 32 && gateType == MoeGateSwiglu &&
+            input.dataType == DataType::BFLOAT16) {
+            std::vector<int> selected;
+            std::vector<Data*> table{nullptr, nullptr};
+            for (int id = 1; id <= count; ++id) {
+                if (routes[id].size() != 1 || !weights[id * 2]) continue;
+                auto found = cache.entries.find(weights[id * 2]);
+                if (found == cache.entries.end() || cudaHit(found->second) || !found->second.cpu) continue;
+                auto *host = found->second.cpu.get();
+                if (host->gate->dataType != DataType::NVFP4 ||
+                    host->down->dataType != DataType::NVFP4 ||
+                    host->gate->blockM != 32 || host->down->blockM != 32) continue;
+                selected.push_back(id);
+                table.push_back(host->gate.get()); table.push_back(host->down.get());
+            }
+            if (selected.size() > 1) {
+                const int batch = selected.size();
+                Data x(input.dataType, {batch, hidden}), ids(DataType::INT32PARAM, {batch, 1});
+                Data scales(DataType::FLOAT32, {batch, 1}), a, b, c;
+                x.Allocate(false); ids.Allocate(false); scales.Allocate(false);
+                cpuBatchOutput.Resize({batch, hidden});
+                for (int row = 0; row < batch; ++row) {
+                    memcpy(x.cpuData + size_t(row) * input.GetBytes(), input.cpuData, input.GetBytes());
+                    ((int32_t*)ids.cpuData)[row] = row;
+                    ((float*)scales.cpuData)[row] = routes[selected[row]][0].score;
+                    cpuSlots[selected[row]] = row;
+                }
+                std::vector<Data*> biases(table.size(), nullptr);
+                DataDict batchData = {{"input", &x}, {"output", &cpuBatchOutput}, {"index", &ids},
+                    {"score", &scales}, {"weights", (Data*)table.data()}, {"biass", (Data*)biases.data()},
+                    {"w1", &a}, {"w2", &b}, {"w3", &c}};
+                IntDict batchParams = params;
+                batchParams["weights___batch"] = batchParams["biass___batch"] = table.size();
+                CpuMergeMOE::Run("MergeMOE", batchData, floatParams, batchParams);
+            }
+        }
+
 #ifdef USE_CUDA
         std::unique_ptr<DiskGlmGGUFResidentBatch> resident;
         std::vector<std::unique_ptr<DiskGlmGGUFResidentBatch>> assistResidents;
@@ -2936,6 +3109,15 @@ namespace fastllm {
             FastllmCudaSetDevice(device);
         }
 #endif
+        float *routeResults = nullptr;
+#ifdef USE_CUDA
+        if (v41Resident) routeResults = v41Resident->perRoute.data();
+        else if (resident) routeResults = resident->perRoute.data();
+#endif
+        auto routeOutput = [&](const Route &task) {
+            const size_t slot = task.slot < 0 ? tokens * topk + task.token : task.slot;
+            return routeResults ? routeResults + slot * hidden : sum.data() + size_t(task.token) * hidden;
+        };
         // V4 reduces routed experts by ID, with the shared expert last. Keep
         // the FP32 sum across tiers; never add separately rounded tier totals.
         for (int order = 1; order <= count + 1; ++order) {
@@ -2970,9 +3152,7 @@ namespace fastllm {
                         for (const auto &part : weight->diskWeightParts) cache.stats.diskBytes += part.bytes;
                 }
             }
-            // Small V4 verification batches overlap two independent reads and
-            // repacks. Consumption and FP32 accumulation stay in expert order;
-            // ordinary decode and large prefill retain one-expert lookahead.
+            // Refill before computation/cache work; consumption stays ordered.
             prefetch(order + 1);
             // Keep cold-prefill streaming, and offload sufficiently reused RAM
             // experts. Uploading a whole weight for a few routed rows costs
@@ -3005,9 +3185,16 @@ namespace fastllm {
             // Bound activation staging as well as weight staging for large chunks.
             bool queuedResident = false;
 #ifdef USE_CUDA
-            queuedResident = gpu && gpu != transientGpu.get() && residentDevices.count(gpu->device);
+            queuedResident = v41Queued[expert] ||
+                (gpu && gpu != transientGpu.get() && residentDevices.count(gpu->device));
 #endif
-            for (size_t first = 0; !queuedResident && first < tasks.size(); first += 256) {
+            if (cpuSlots[expert] >= 0) {
+                const size_t row = cpuSlots[expert];
+                float *dst = routeOutput(tasks[0]);
+                for (int col = 0; col < hidden; ++col)
+                    dst[col] += ReadDiskFloatValue(cpuBatchOutput.cpuData, cpuBatchOutput.dataType, row * hidden + col);
+            }
+            for (size_t first = 0; !queuedResident && cpuSlots[expert] < 0 && first < tasks.size(); first += 256) {
                 int batch = std::min<size_t>(256, tasks.size() - first);
                 Data x(input.dataType, {batch, hidden}), y(v4 ? input.dataType : DataType::FLOAT32, {batch, hidden});
                 Data ids(DataType::INT32PARAM, {batch, 1}), scales(DataType::FLOAT32, {batch, 1});
@@ -3071,24 +3258,31 @@ namespace fastllm {
                     }
                 }
                 for (int row = 0; row < batch; ++row) {
-                    float *dst = sum.data() + (size_t)tasks[first + row].token * hidden;
-#ifdef USE_CUDA
-                    if (resident) dst = resident->perRoute.data() + size_t(tasks[first + row].slot) * hidden;
-#endif
+                    float *dst = routeOutput(tasks[first + row]);
                     for (int col = 0; col < hidden; ++col)
                         dst[col] += ReadDiskFloatValue(y.cpuData, y.dataType, (size_t)row * hidden + col);
                 }
             }
+            bool retainCpu = true;
 #ifdef USE_CUDA
             // Limit transfer churn to the hottest eligible expert per invocation.
             // A promoted expert no longer needs to occupy the RAM tier too.
             if (expert == cudaCandidate) {
                 uint64_t bytes = transientGpu ? transientGpu->Bytes() : DiskCudaExpertBytes(*host);
-                if (resident && bytes && bytes <= GetMoeCudaCacheBytes()) {
+                if ((resident || v41Resident) && bytes && bytes <= GetMoeCudaCacheBytes()) {
                     // Retain only the one candidate's upload buffer. Borrowed
                     // resident weights cannot be evicted while kernels run.
-                    deferredPromotion = transientGpu ? std::move(transientGpu) : DiskCudaExpert(*host, gateType, canonicalGGUF);
-                    deferredEntry = entry;
+                    // Probe admission first: packing rejected candidates costs
+                    // much more than the metadata decision itself.
+                    const int target = transientGpu ? transientGpu->device : promotionDevice(bytes);
+                    if (cache.MakeRoom(entry, target, bytes, GetMoeCudaCacheBytes(), nullptr, false)) {
+                        deferredPromotion = transientGpu ? std::move(transientGpu) : DiskCudaExpert(*host, gateType, canonicalGGUF);
+                        deferredEntry = entry;
+                        // The packed promotion owns its staging. Admitting a
+                        // temporary RAM copy would evict another CPU expert,
+                        // only to discard this copy immediately after Gather.
+                        retainCpu = false;
+                    }
                 } else if (bytes) {
                     int target = transientGpu ? transientGpu->device : promotionDevice(bytes);
                     std::unique_ptr<DiskCachedExpert> recycled;
@@ -3103,7 +3297,7 @@ namespace fastllm {
                 }
             }
 #endif
-            if (entry && loaded && !cudaHit(*entry) &&
+            if (retainCpu && entry && loaded && !cudaHit(*entry) &&
                 cache.MakeRoom(entry, -1, loaded->Bytes(), GetMoeCpuCacheBytes())) {
                 cache.AdmitCpu(*entry, std::move(loaded));
             }
@@ -3113,6 +3307,7 @@ namespace fastllm {
             }
         }
 #ifdef USE_CUDA
+        if (v41Resident) v41Resident->Gather();
         if (resident) {
             resident->Gather();
             for (auto &batch : assistResidents) {
@@ -3121,25 +3316,27 @@ namespace fastllm {
                     memcpy(resident->perRoute.data() + r * hidden,
                         batch->perRoute.data() + r * hidden, hidden * sizeof(float));
             }
-            // Preserve the original expert-ID accumulation order, including
-            // duplicate routes and each expert's BF16 rounding boundary.
-            for (int expert = 1; expert <= count; ++expert) for (const auto &task : routes[expert]) {
-                const float *src = resident->perRoute.data() + size_t(task.slot) * hidden;
+        }
+        if (routeResults) {
+            // Preserve expert-ID order, duplicate routes and each expert's
+            // BF16 rounding boundary; the shared expert is accumulated last.
+            for (int order = 1; order <= count + 1; ++order) for (const auto &task : routes[order % (count + 1)]) {
+                const float *src = routeOutput(task);
                 float *dst = sum.data() + size_t(task.token) * hidden;
                 for (int col = 0; col < hidden; ++col) dst[col] += src[col];
             }
-            if (deferredPromotion) {
-                const int target = deferredPromotion->device < 0
-                    ? promotionDevice(deferredPromotion->Bytes()) : deferredPromotion->device;
-                std::unique_ptr<DiskCachedExpert> recycled;
-                if (cache.MakeRoom(deferredEntry, target, deferredPromotion->Bytes(), GetMoeCudaCacheBytes(),
-                                   deferredPromotion->device < 0 ? &recycled : nullptr)) {
-                    if (deferredPromotion->device < 0)
-                        UploadDiskExpert(*deferredPromotion, target, std::move(recycled));
-                    cache.Admit(*deferredEntry, std::move(deferredPromotion), target);
-                    cache.Evict(*deferredEntry, -1);
-                    ++cache.stats.uploads;
-                }
+        }
+        if (deferredPromotion) {
+            const int target = deferredPromotion->device < 0
+                ? promotionDevice(deferredPromotion->Bytes()) : deferredPromotion->device;
+            std::unique_ptr<DiskCachedExpert> recycled;
+            if (cache.MakeRoom(deferredEntry, target, deferredPromotion->Bytes(), GetMoeCudaCacheBytes(),
+                               deferredPromotion->device < 0 ? &recycled : nullptr)) {
+                if (deferredPromotion->device < 0)
+                    UploadDiskExpert(*deferredPromotion, target, std::move(recycled));
+                cache.Admit(*deferredEntry, std::move(deferredPromotion), target);
+                cache.Evict(*deferredEntry, -1);
+                ++cache.stats.uploads;
             }
         }
 #endif
