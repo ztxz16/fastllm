@@ -6,7 +6,16 @@
 ftllm server /path/to/model.gguf --auto
 ```
 
-支持 Linux NVIDIA CUDA 上 Qwen4、GLM-5.3、DeepSeek-V4.1 的现有混推模型。未启用 `--auto` 时，原有数值和默认行为保持不变。
+支持 Linux NVIDIA CUDA 上的 dense Qwen3，以及 Qwen4、GLM-5.3、DeepSeek-V4.1 混推模型。未启用 `--auto` 时，原有数值和默认行为保持不变。
+
+Qwen3.8 27B 使用 Qwen3.5 架构，目前不属于上述 dense Qwen3 支持范围；请使用[手动 CUDA/TP 配置](qwen3.md)，或 Launcher 原有的长上下文/高并发推荐。
+
+直接运行 `ftllm` 打开的 Launcher 中，新增启动项默认选择“自动配置”，只需选择本地模型并填写模型名、监听地址、端口等服务信息。启动命令使用 `--auto`，每次启动重新读取硬件余量；表单中原有的手动推理参数和环境变量不会带入这个模式。原有长上下文、高并发和自定义模式仍保留，已保存的配置不会自动切换。
+
+自动配置设置中可以填写可选的“显存上限（每卡）”和“内存上限”。它们分别对应
+`--auto_gpu_memory_limit` 与 `--auto_host_memory_limit`，接受 `20g`、`128g` 等二进制容量；留空时继续读取启动时的实际可用显存和主机内存。显存上限作用于每张可见 GPU，主机内存上限作用于整个自动规划预算。这是规划上限，不会限制操作系统或其它进程的实际内存分配；规划结果不足以容纳模型时会在加载前报错。
+
+Dense Qwen3 按实际 GQA 头数、KV、dense 权重及 tied output head 副本预算，不分配专家缓存；上下文取 128K 与模型原生窗口的较小值。目前 Qwen3 的 CUDA Graph 预热会触发 deferred pool 的 stream-capture-unsupported，因此此模型的 `--auto` 默认使用普通 CUDA 执行。显式 `FASTLLM_CUDA_GRAPH` 仍优先；其他模型的 Graph 默认策略不变。
 
 ## 单参数自动选择
 
@@ -101,6 +110,8 @@ Qwen4、GLM-5.3 和 DeepSeek-V4.1 的混合推理命令支持以下可选值：
 | `--moe_cpu_cache auto` | `moe_device=disk` 时按有效主存余量计算专家缓存上限；CPU/NUMA 常驻专家不另分配此缓存 |
 | `--moe_device_layers auto` | 加载前规划 GPU 驻留前缀，将后面的专家层留在指定的主机设备 |
 | `--chunked_prefill_size auto` | 在 4096、2048、1024、512、256 中依次选择满足内存预算的切片，且不超过上下文长度 |
+| `--auto_gpu_memory_limit 20g` | 将自动规划的每张 GPU 显存预算限制为不超过 20 GiB |
+| `--auto_host_memory_limit 128g` | 将自动规划的主机内存预算限制为不超过 128 GiB |
 
 只有写成 `auto` 的参数才参与自动选择。原有数值及默认值保持不变。
 `moe_device_layers` 的数值仍表示**末尾使用 `moe_device` 的层数**，不是 GPU 驻留层数；`-1` 表示全部专家层使用该设备。

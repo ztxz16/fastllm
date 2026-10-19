@@ -3,7 +3,11 @@
 [返回 README](../README.md) · [DeepSeek-V4 部署指南](deepseek.md) · [混合推理](mixforward.md)
 
 本文记录 FastLLM 对 DeepSeek-V4.1 系列（`model_type = deepseek_v41`，目前为 DeepSeek-V4.1-Flash）的支持范围、
-架构差异、启动方式与验证方法。实现位于：
+架构差异、启动方式与验证方法。
+
+面向自动化 agent 的 `--auto` 启动、参数覆盖和验收流程见 [模型部署速查](model-deployment-agent.md)。
+
+实现与回归入口：
 
 - `include/models/deepseekv41.h` / `src/models/deepseekv41.cpp`：模型（继承 `DeepSeekV4Model`，复用其 MoE / HC-post / WoA / 采样等基础设施）
 - `src/models/deepseekv41_vision.cpp`：视觉编码器（ViT + aligner）与图文前向 `ForwardMultimodal`
@@ -96,9 +100,22 @@ Engram 配置如下；默认值见表。权重格式与数学边界应分别核�
 | `FASTLLM_DSV41_ENGRAM_MADVISE=random / hugepage / both` | 仅作用于常驻表：`random` 设置 `MADV_RANDOM`；`hugepage` 使用匿名 mmap + `MADV_HUGEPAGE` 分配，减少页表与 TLB 开销，并省掉 `std::vector` 的清零。 |
 | `FASTLLM_DSV41_ENGRAM_WKV_FP8`（默认开，=0 关） | `layers.{1,14}.engram.wkv.weight` 在真实权重里本来就是 F8_E4M3 + UE8M0 块 scale（`[25600, 6144]`，block 32x32），默认会被解量化成启动 dtype（float16），每层 157 MB 变 314 MB。打开后按原样保留 FP8，**不做任何重量化**——权重数值就是 checkpoint 里的那份，比解成 float16 还少一次舍入；省下每层 157 MB 显存与同样多的每步带宽。只有伴随的 `.scale` 张量存在时才切换，权重是 BF16 的迷你模型不受影响。 |
 
-## 启动
+## 自动配置（推荐）
 
-以 2 x 24 GB GPU + 大内存主机为例（专家与 Engram 表放在 CPU 内存）：
+自动化部署建议先把本页和 [Agent 部署速查](model-deployment-agent.md) 交给 agent。对 V4.1 Flash，自动规划器会根据资源尝试 `fast_prefill`、DSpark、Engram 放置和长上下文预算；主机内存不足时会把 Engram/专家回退到磁盘，并在日志中给出实际配置。
+
+```bash
+ftllm server /path/to/DeepSeek-V4.1-Flash-1017 \
+  --auto --model_name deepseek-v4.1-flash-1017 \
+  --host 0.0.0.0 --port 8080
+```
+
+如果需要模拟较小机器，使用 `--auto_gpu_memory_limit 20g` 和
+`--auto_host_memory_limit 128g`；它们限制自动规划预算，省略时自动读取实际硬件。
+
+## 手动配置参考
+
+下面以单张 CUDA GPU + 大内存主机为例（专家与 Engram 表放在 CPU 内存；显存需求取决于上下文和 chunk）：
 
 ```bash
 ftllm server /path/to/DeepSeek-V4.1-Flash \

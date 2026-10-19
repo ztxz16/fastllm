@@ -1,10 +1,23 @@
 # GLM-5 / GLM-5.3-Flash 部署指南
 
-[English](glm5_en.md) · [返回 README](../README.md) · [Benchmark](benchmarks/glm5.md)
+[English](glm5_en.md) · [返回 README](../README.md) · [Agent 部署速查](model-deployment-agent.md) · [Benchmark](benchmarks/glm5.md)
 
 当前路径覆盖 GLM-5 DSA、GLM-5.3-Flash KDA 与分页缓存，以及部分 GLM-5.2 量化 KV-B checkpoint 的纯 CPU 推理。
 
-## API Server 快速启动
+自动化部署建议先把本页和 [Agent 部署速查](model-deployment-agent.md) 交给 agent，并优先使用 `--auto`。下面的手动命令用于固定设备、缓存和量化路径。
+
+## 自动配置（推荐）
+
+~~~bash
+ftllm server /data/models/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf \
+  --auto --model_name glm-5.3-flash \
+  --host 0.0.0.0 --port 8080
+~~~
+
+GGUF 只需指定第一个分片，其他分片保留在同一目录。需要限制规划预算时，增加
+`--auto_gpu_memory_limit 20g` 或 `--auto_host_memory_limit 128g`。
+
+## 手动配置参考
 
 ~~~bash
 ftllm server /data/models/glm5 \

@@ -1,6 +1,6 @@
 # FastLLM
 
-[English](README_EN.md) · [快速开始](#快速开始) · [模型部署指南](#模型部署指南) · [Flash-Next 用户手册](docs/qwen3.8-flash-next/README.md) · [Benchmark](docs/benchmark.md) · [常用参数](#常用参数) · [版本日志](docs/version.md)
+[English](README_EN.md) · [快速开始](#快速开始) · [模型部署指南](#模型部署指南) · [Agent 部署速查](docs/model-deployment-agent.md) · [开发与验证记录](docs/development-validation.md) · [Flash-Next 用户手册](docs/qwen3.8-flash-next/README.md) · [Benchmark](docs/benchmark.md) · [常用参数](#常用参数) · [版本日志](docs/version.md)
 
 FastLLM 是一个面向本地运行和服务部署的高性能大模型推理引擎。核心运行时使用 C++ 实现，不依赖 PyTorch，支持稠密模型与 MoE 模型，并提供 CUDA、ROCm、CPU、NUMA、磁盘混合推理以及多卡张量并行能力。
 
@@ -149,13 +149,17 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ## 模型部署指南
 
+如果由自动化 agent 部署，建议先把[模型簇与参数速查](docs/model-deployment-agent.md)交给 agent。支持自动规划的混合模型优先使用 `--auto`，再根据日志做必要的参数覆盖；Qwen3.8 27B 等尚未接入的架构使用对应的手动配置。开发记录、测试入口和 Benchmark 记录规则见[开发与验证记录](docs/development-validation.md)。
+
 不同模型在注意力结构、MoE 布局、投机解码和量化格式上差异很大。选择目标模型后，请先阅读对应部署指南，再使用后面的通用配置作为补充。
 
 | 模型 | 部署指南 | 推荐配置入口 | Benchmark |
 | --- | --- | --- | --- |
+| Agent 快速部署 | [模型簇与参数速查](docs/model-deployment-agent.md) | `--auto`、按日志回退 | — |
 | Qwen4-Exp / Qwen3.8-Flash-Next | [用户手册](docs/qwen3.8-flash-next/README.md) | 双卡串行 / TP2、专家缓存、固定 GPU 专家层、MTP | [本机实测性能](docs/qwen3.8-flash-next/README.md#performance) |
 | Qwen3.5 / Qwen3.6 / Qwen3.8 | [Qwen 当前模型指南](docs/qwen3.md) | 单卡、TP、混合 MoE、MTP、DFlash2 | [Qwen3 Benchmark](docs/benchmarks/qwen3.md) |
 | DeepSeek-V4 / V4-Flash | [DeepSeek-V4 指南](docs/deepseek.md) | CUDA + NUMA、磁盘专家、TP、内置 DSpark | [DeepSeek-V4 Benchmark](docs/benchmarks/deepseek_v4.md) |
+| DeepSeek-V4.1-Flash 1017 | [DeepSeek-V4.1 指南](docs/deepseek_v41.md) | `--auto`、Engram、DSpark、资源限额 | [DeepSeek-V4.1 Benchmark](docs/benchmarks/deepseek_v41.md) |
 | Kimi-K3 | [Kimi-K3 指南](docs/kimi_k3.md) | KDA/MLA、混合专家、磁盘专家、外部 DSpark | [Kimi-K3 Benchmark](docs/benchmarks/kimi_k3.md) |
 | Dots3-Note | [Dots3-Note 指南](docs/dots3_note.md) | DSA、长上下文、CUDA + CPU/NUMA | [Dots3-Note Benchmark](docs/benchmarks/dots3_note.md) |
 | GLM-5 / GLM-5.3-Flash | [GLM-5 指南](docs/glm5.md) | DSA/KDA、分页缓存、NUMA、量化 KV-B CPU | [GLM-5 Benchmark](docs/benchmarks/glm5.md) |
@@ -281,6 +285,8 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | 参数 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `--gpu_mem_ratio` | `0.9` | 可用于模型与缓存的 GPU 显存比例 |
+| `--auto_gpu_memory_limit` | 未设置 | `--auto` 时限制每张可见 GPU 的规划显存，例如 `20g`；未设置则读取实际可用显存 |
+| `--auto_host_memory_limit` | 未设置 | `--auto` 时限制自动规划使用的主机内存总量，例如 `128g`；未设置则读取实际可用内存 |
 | `--moe_cuda_cache` / `--moe-cuda-cache` | `0` | GPU 专家权重缓存预算，例如 `3g`（3 GiB）；`0` 关闭。配合 CUDA 主计算与 CPU/NUMA/disk 专家使用，KV Cache、普通权重及工作区另算；见[专家缓存说明](docs/cuda-expert-cache.md) |
 | `--moe_cpu_cache` / `--moe-cpu-cache` | `0` | `--moe_device disk` 的专家内存缓存总预算，例如 `32g`；可与显存专家缓存同时使用，见[磁盘多级缓存](docs/cuda-expert-cache.md#disk-backed-multilevel-cache) |
 | `--kv_cache_limit` | `auto` | KV Cache 最大使用量 |

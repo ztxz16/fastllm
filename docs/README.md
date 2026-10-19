@@ -3,6 +3,8 @@
 - [快速开始](../README.md)
 - [模型部署指南](../README.md#模型部署指南)
 - [Benchmark](benchmark.md)：按模型保存最终结果及测量范围
+- [开发与验证记录](development-validation.md)：文档分工、测试入口和 Benchmark 记录要求
+- [Agent 部署速查](model-deployment-agent.md)：建议交给自动化 agent 先阅读
 - [执行模式与模块边界](execution_modes.md)
 - [混合推理](mixforward.md)与 [CUDA 专家缓存](cuda-expert-cache.md)
 - [Benchmark 工具](../test/benchmark/README.md)

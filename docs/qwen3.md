@@ -1,12 +1,26 @@
 # Qwen3.5 / Qwen3.6 / Qwen3.8 部署指南
 
+面向自动化 agent 的模型簇选择、`--auto` 启动和参数表见 [模型部署速查](model-deployment-agent.md)。建议把该页交给 agent 先读，再按本页的手动参数做固定实验。
+
 [English](qwen3_en.md) · [返回 README](../README.md) · [Qwen4-Exp](qwen4.md) · [Benchmark](benchmarks/qwen3.md)
 
 本文面向当前 Qwen3.5、Qwen3.6 和 Qwen3.8 模型，包含 GGUF 多模态部署说明。Qwen4-Exp / Qwen3.8-Flash-Next 使用独立架构，请阅读 [Qwen4-Exp 部署说明](qwen4.md)。
 
 不同 checkpoint 可能是稠密、MoE、FP8、NVFP4 或其他量化格式。首次启动建议保留 `--dtype auto`，再根据显存和实测结果调整。
 
-## API Server 快速启动
+## 选择部署模式
+
+Qwen3.8 27B 属于 Qwen3.5 架构，当前 `--auto` 的 dense Qwen3 适配不覆盖此架构。请使用下方 CUDA/TP 手动配置，或在 Launcher 中选择原有的长上下文/高并发推荐。Flash-Next 混合推理建议使用 `--auto`，见[独立指南](qwen3.8-flash-next/README.md)。
+
+~~~bash
+ftllm server /data/models/Qwen3.8-27B-FP8 \
+  --device cuda --model_name qwen3.8-27b \
+  --host 0.0.0.0 --port 8080
+~~~
+
+单卡放不下时，按后文配置双卡 TP 或选择更低比特的权重。`--auto_gpu_memory_limit` 和 `--auto_host_memory_limit` 只对自动规划生效，不用于限制此处手动模式的实际占用。
+
+## 手动配置参考
 
 ~~~bash
 ftllm server /data/models/qwen \

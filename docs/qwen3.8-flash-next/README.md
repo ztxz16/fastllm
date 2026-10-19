@@ -2,7 +2,7 @@
 
 [English](README_EN.md) · [项目首页](../../README.md)
 
-本手册介绍 Qwen4-Exp / Qwen3.8-Flash-Next 的文本服务部署，包括单卡混合推理、双卡串行与并行、专家缓存、固定 GPU 专家层、MTP 和 API 调用。以下双卡示例使用 NVFP4 模型。
+本手册介绍 Qwen4-Exp / Qwen3.8-Flash-Next 的文本服务部署，包括单卡混合推理、双卡串行与并行、专家缓存、固定 GPU 专家层、MTP 和 API 调用。自动化部署建议先把本页和 [模型部署速查](../model-deployment-agent.md) 交给 agent，并优先使用 `--auto`；下面的手动命令用于固定实验和故障定位。以下双卡示例使用 NVFP4 模型。
 
 ## 准备模型
 
@@ -10,7 +10,28 @@
 
 混合推理需要足够的主机内存；使用磁盘 PLE 时，将模型存放在 SSD 上。
 
-## 快速启动
+## 自动配置（推荐）
+
+本地 HF/NVFP4 目录直接交给自动规划器即可：
+
+```bash
+ftllm server /data/models/Qwen3.8-Flash-Next-NVFP4 \
+  --auto --model_name qwen3.8-flash-next \
+  --host 0.0.0.0 --port 8080
+```
+
+GSQ GGUF 传入第一个分片，加载器会读取同目录的其余分片；下载目录和分片名称以本地文件为准：
+
+```bash
+ftllm server /data/models/Qwen3.8-Flash-Next-GSQ-RCO/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
+  --auto --model_name qwen3.8-flash-next \
+  --host 0.0.0.0 --port 8080
+```
+
+显存或主机内存需要人为限额时，附加 `--auto_gpu_memory_limit 20g` 或
+`--auto_host_memory_limit 128g`；省略时自动读取机器配置。启动日志会给出最终的设备、专家缓存和 chunk 设置。
+
+## 手动配置参考
 
 下面以一张 GPU 运行主干、CPU 的 NUMA 后端运行专家为例：
 
