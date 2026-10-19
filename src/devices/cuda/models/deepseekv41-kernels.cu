@@ -1035,13 +1035,14 @@ namespace {
     //     跨 warp 的 warp_sums 归约、rsqrtf(val / channels + eps) 与写出的 lo * s * w
     //     都与 RMSNorm kernel 一致。
     // 所以 THREAD_PER_BLOCK 必须与 LaunchFastllmRMSNormBFloat16 对同一个 channels 的选择相同。
-    template <int THREAD_PER_BLOCK, int MAX_ITER, bool FINISH_MIX = false>
+    template <int THREAD_PER_BLOCK, int MAX_ITER, bool FINISH_MIX = false, bool QUANTIZE_OUTPUT = false>
     __global__ void __launch_bounds__(THREAD_PER_BLOCK)
     V41HcPreNormKernel(const __nv_bfloat16 *x, const float *pre, const float *weight,
                        __nv_bfloat16 *out, int hcMult, int channels, float eps,
                        const float *mix = nullptr, const float *mixScale = nullptr,
                        const float *mixBase = nullptr, int sinkhornIters = 0,
-                       float mixEps = 0, float *post = nullptr, float *comb = nullptr, float *nextPre = nullptr) {
+                       float mixEps = 0, float *post = nullptr, float *comb = nullptr, float *nextPre = nullptr,
+                       __nv_bfloat16 *quantized = nullptr) {
         // The model consumes the PREVIOUS sublayer's pre coefficients.
         // Finish and normalization are independent, so separate CTAs overlap
         // them in one launch. Keep both original reduction orders.
@@ -1118,6 +1119,22 @@ namespace {
                 ov.x = __float2bfloat16_rn(cache[k].x * s * w0);
                 ov.y = __float2bfloat16_rn(cache[k].y * s * w1);
                 outb[i] = ov;
+                if constexpr (QUANTIZE_OUTPUT) {
+                    // One BF16 pair is one lane here; width-16 covers the
+                    // same contiguous block-32 group as the standalone
+                    // activation quantizer.
+                    float maximum = fmaxf(fabsf(__bfloat162float(ov.x)), fabsf(__bfloat162float(ov.y)));
+                    // d is a multiple of 32; a tail may contain only one
+                    // complete 16-lane group of the warp.
+                    const unsigned active = __activemask();
+                    for (int offset = 8; offset; offset >>= 1)
+                        maximum = fmaxf(maximum, __shfl_xor_sync(active, maximum, offset, 16));
+                    const float qs = V41QuantScaleDev(maximum, 1);
+                    __nv_bfloat162 qv;
+                    qv.x = __float2bfloat16_rn(V41QuantValueDev(__bfloat162float(ov.x), qs, 1));
+                    qv.y = __float2bfloat16_rn(V41QuantValueDev(__bfloat162float(ov.y), qs, 1));
+                    reinterpret_cast<__nv_bfloat162 *>(quantized)[(uint64_t)o * bf2 + i] = qv;
+                }
             }
         }
     }
@@ -3537,7 +3554,7 @@ extern "C" bool FastllmCudaV41RouterScores(const Data &input, Data &weight,
 // finish and normalization use independent CTAs in one launch, preserving arithmetic.
 extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &previousPre, Data &fn,
         Data &scale, Data &base, Data &normWeight, int sinkhornIters, float mixEps,
-        float normEps, Data &pre, Data &post, Data &comb, Data &output) {
+        float normEps, Data &pre, Data &post, Data &comb, Data &output, Data *quantizedOutput) {
     if (!V41OnCuda(x) || !V41OnCuda(previousPre) || previousPre.dataType != DataType::FLOAT32 ||
         x.multiDeviceData || previousPre.multiDeviceData || x.dataType != DataType::BFLOAT16 ||
         x.dims.size() != 4 || x.dims[2] != 4 || x.dims[0] * x.dims[1] < 1 ||
@@ -3546,6 +3563,7 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &pr
         scale.dataType != DataType::FLOAT32 || base.dataType != DataType::FLOAT32 ||
         normWeight.dataType != DataType::FLOAT32 || normWeight.Count(0) != x.dims[3]) return false;
     const int b = x.dims[0], n = x.dims[1], d = x.dims[3], tokens = b * n;
+    if (quantizedOutput != nullptr && (d % 32 != 0 || quantizedOutput == &x || quantizedOutput == &output)) return false;
     if (previousPre.Count(0) != (uint64_t)tokens * 4 || fn.Count(0) != (uint64_t)24 * 4 * d ||
         scale.Count(0) != 3 || base.Count(0) != 24) return false;
     for (Data *w : {&fn, &scale, &base, &normWeight})
@@ -3556,20 +3574,23 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &pr
         !V41PrepareOutput(post, DataType::FLOAT32, {b, n, 4}) ||
         !V41PrepareOutput(comb, DataType::FLOAT32, {b, n, 4, 4}) ||
         !V41PrepareOutput(output, DataType::BFLOAT16, {b, n, d})) return false;
+    if (quantizedOutput != nullptr &&
+        !V41PrepareOutput(*quantizedOutput, DataType::BFLOAT16, {b, n, d})) return false;
     if (tokens == 1 && V41IsSm<9, 0>())
         V41HcDecodeDots<__nv_bfloat16, true><<<dim3(25, tokens), kHcThreads>>>(
             (const __nv_bfloat16 *)x.cudaData, (const float *)fn.cudaData, 4 * d, (float *)scratch.cudaData);
     else
         V41HcDecodeDots<<<dim3(25, tokens), kHcThreads>>>((const __nv_bfloat16 *)x.cudaData,
             (const float *)fn.cudaData, 4 * d, (float *)scratch.cudaData);
-#define V41_MIX_NORM(I) V41HcPreNormKernel<1024, I, true><<<tokens * 2, 1024>>>( \
+#define V41_MIX_NORM(I, Q) V41HcPreNormKernel<1024, I, true, Q><<<tokens * 2, 1024>>>( \
         (const __nv_bfloat16 *)x.cudaData, (const float *)previousPre.cudaData, \
         (const float *)normWeight.cudaData, (__nv_bfloat16 *)output.cudaData, 4, d, normEps, \
         (const float *)scratch.cudaData, (const float *)scale.cudaData, (const float *)base.cudaData, \
-        sinkhornIters, mixEps, (float *)post.cudaData, (float *)comb.cudaData, (float *)pre.cudaData)
-    if (d <= 4096) { V41_MIX_NORM(2); }
-    else if (d <= 6144) { V41_MIX_NORM(3); }
-    else { V41_MIX_NORM(4); }
+        sinkhornIters, mixEps, (float *)post.cudaData, (float *)comb.cudaData, (float *)pre.cudaData, \
+        Q ? (__nv_bfloat16 *)quantizedOutput->cudaData : nullptr)
+    if (d <= 4096) { if (quantizedOutput) V41_MIX_NORM(2, true); else V41_MIX_NORM(2, false); }
+    else if (d <= 6144) { if (quantizedOutput) V41_MIX_NORM(3, true); else V41_MIX_NORM(3, false); }
+    else { if (quantizedOutput) V41_MIX_NORM(4, true); else V41_MIX_NORM(4, false); }
 #undef V41_MIX_NORM
     return V41CheckLaunch("HcMixPreNorm");
 }

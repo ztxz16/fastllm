@@ -775,9 +775,10 @@ namespace fastllm {
             V41RMSNormBF16(tmp, normWeight, eps, output);
         }
 
-        void V41HcMixPreNorm(const Data &input, const Data &previousPre, Data &fn, Data &scale,
-                            Data &base, Data &normWeight, int hcMult, int iters, float mixEps,
-                            float normEps, Data &pre, Data &post, Data &comb, Data &tmp, Data &output) {
+        bool V41HcMixPreNorm(const Data &input, const Data &previousPre, Data &fn, Data &scale,
+                             Data &base, Data &normWeight, int hcMult, int iters, float mixEps,
+                             float normEps, Data &pre, Data &post, Data &comb, Data &tmp, Data &output,
+                             Data *quantizedOutput = nullptr) {
 #ifdef USE_CUDA
             const bool eligible = !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
                 !V41EnvFlag("FASTLLM_DSV41_LEGACY_HCMIX") &&
@@ -808,6 +809,8 @@ namespace fastllm {
                     V41AllocLike(post, DataType::FLOAT32, {b, n, 4}, input, devices);
                     V41AllocLike(comb, DataType::FLOAT32, {b, n, 4, 4}, input, devices);
                     V41AllocLike(output, DataType::BFLOAT16, {b, n, input.dims[3]}, input, devices);
+                    if (quantizedOutput != nullptr)
+                        V41AllocLike(*quantizedOutput, DataType::BFLOAT16, {b, n, input.dims[3]}, input, devices);
                     std::vector<int> ok(devices.size(), 0);
                     const bool submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
                         ok[rank] = FastllmCudaDeepSeekV41HcMixPreNorm(*input.multiDeviceDatas.at(device),
@@ -815,25 +818,30 @@ namespace fastllm {
                             *scale.multiDeviceDatas.at(device), *base.multiDeviceDatas.at(device),
                             *normWeight.multiDeviceDatas.at(device), iters, mixEps, normEps,
                             *pre.multiDeviceDatas.at(device), *post.multiDeviceDatas.at(device),
-                            *comb.multiDeviceDatas.at(device), *output.multiDeviceDatas.at(device));
+                            *comb.multiDeviceDatas.at(device), *output.multiDeviceDatas.at(device),
+                            quantizedOutput != nullptr ? quantizedOutput->multiDeviceDatas.at(device) : nullptr);
                     });
-                    if (submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; })) return;
+                    if (submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; }))
+                        return quantizedOutput != nullptr;
                 }
             }
             if (eligible && !input.multiDeviceData &&
                 V41FusedPreNormSameDevice(input, previousPre, normWeight) &&
                 FastllmCudaDeepSeekV41HcMixPreNorm(input, previousPre, fn, scale, base, normWeight,
-                    iters, mixEps, normEps, pre, post, comb, output)) return;
+                    iters, mixEps, normEps, pre, post, comb, output, quantizedOutput))
+                return quantizedOutput != nullptr;
 #endif
             V41HcMix(input, fn, scale, base, hcMult, iters, mixEps, normEps, pre, post, comb);
             V41HcApplyPreNorm(input, previousPre, normWeight, normEps, tmp, output);
+            return false;
         }
 
 #ifdef USE_CUDA
         // B1 only: larger batches retain their existing GEMM dispatch. All
         // graph-owned scratch buffers belong to the forward workspace.
         bool V41QkvPrepare(const Data &input, Data &qw, Data &kw, Data &qnw, Data &knw, float eps,
-                           Data &inputQuant, Data &qr, Data &qNorm, Data &qQuant, Data &kv) {
+                           Data &inputQuant, Data &qr, Data &qNorm, Data &qQuant, Data &kv,
+                           bool inputQuantized = false) {
             if (input.dataType != DataType::BFLOAT16 || input.dims.empty() || input.dims.back() <= 0 ||
                 input.Count(0) != (uint64_t)input.dims.back() || input.dims.back() % 32 ||
                 !std::isfinite(eps) || eps < 0) return false;
@@ -878,7 +886,7 @@ namespace fastllm {
             V41AllocLike(kv, DataType::BFLOAT16, kdims, input, devices);
             auto run = [&](const Data &x, Data &wq, Data &wk, Data &nq, Data &nk,
                            Data &xq, Data &qraw, Data &qout, Data &qq, Data &kout) {
-                return FastllmCudaDeepSeekV41QuantizeActivation(x, xq) &&
+                return (inputQuantized || FastllmCudaDeepSeekV41QuantizeActivation(x, xq)) &&
                     FastllmCudaBFloat16FP8LinearPair(xq, wq, wk, qraw, kout) &&
                     FastllmCudaV41QKVNormQuant(qraw, kout, nq, nk, eps, qout, qq, kout);
             };
@@ -5168,10 +5176,10 @@ namespace fastllm {
             Data *qQuant = reuseQuantized && needIndexer &&
                 quantizedLinearNames.count(pre + ".attn.wq_b.weight") &&
                 quantizedLinearNames.count(pre + ".attn.indexer.wq_b.weight") ? &ws->qNormQuantized : nullptr;
-            V41HcMixPreNorm(*curHidden, *preMixPtr, weight[pre + ".hc_attn_fn"],
+            const bool attentionInputQuantized = V41HcMixPreNorm(*curHidden, *preMixPtr, weight[pre + ".hc_attn_fn"],
                 weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
                 weight[pre + ".attn_norm.weight"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
-                attnPre, attnPost, attnComb, x, attnInput);
+                attnPre, attnPost, attnComb, x, attnInput, attnQuant);
 
             // wq_a / wkv 是复制的（KV 是 MLA 式的单份 latent，与 head 无关）；
             // wq_b 按行切 -> q 的 head 维分片，Reshape 会把 tpAxis 从最后一维换算到 head 维。
@@ -5181,11 +5189,14 @@ namespace fastllm {
                 qkvPrepared = V41QkvPrepare(attnInput, weight[pre + ".attn.wq_a.weight"],
                     weight[pre + ".attn.wkv.weight"], weight[pre + ".attn.q_norm.weight"],
                     weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, *attnQuant,
-                    qr, qNorm, ws->qNormQuantized, kv);
+                    qr, qNorm, ws->qNormQuantized, kv, attentionInputQuantized);
             }
 #endif
             if (!qkvPrepared) {
-                quantizedLinear(attnInput, pre + ".attn.wq_a.weight", qr, tp, attnQuant);
+                // Reuse the fused quantizer even when the B1 QKV path is unavailable.
+                quantizedLinear(attentionInputQuantized ? *attnQuant : attnInput,
+                                pre + ".attn.wq_a.weight", qr, tp,
+                                attentionInputQuantized ? nullptr : attnQuant, attentionInputQuantized);
                 V41RMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
             }
             if (tpAttention) {

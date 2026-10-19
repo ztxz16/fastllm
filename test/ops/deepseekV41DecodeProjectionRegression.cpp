@@ -42,10 +42,11 @@ static std::vector<float> Floats(const Data &data) {
 }
 static int CheckMixNorm() {
     int cases = 0;
-    for (int dim : {4096, 5120, 6144, 8192}) {
+    for (int dim : {4096, 4128, 5120, 6144, 8192}) {
         for (int batch : {1, 2, 4, 8, 15}) {
             for (float amplitude : {0.3f, 2.0f}) {
                 Data input, previousPre, fn, scale, base, weight, pre[2], post[2], comb[2], out[2];
+                Data quantReference;
                 Fill(input, {1, batch, 4, dim}, DataType::BFLOAT16, 1, amplitude);
                 Fill(previousPre, {1, batch, 4}, DataType::FLOAT32, 2, 1.0f);
                 Fill(fn, {24, 4 * dim}, DataType::FLOAT32, 3, 0.01f);
@@ -61,6 +62,15 @@ static int CheckMixNorm() {
                 Require(Bits(pre[0]) == Bits(pre[1]) && Bits(post[0]) == Bits(post[1]) &&
                         Bits(comb[0]) == Bits(comb[1]) && Bits(out[0]) == Bits(out[1]),
                         "mix/norm changed bits or consumed the wrong pre coefficients");
+                Fill(quantReference, {1, batch, dim}, DataType::BFLOAT16, 7, 0.0f);
+                Require(FastllmCudaDeepSeekV41QuantizeActivation(out[0], quantReference),
+                        "reference activation quantization rejected");
+                Data quantFusedOut;
+                Require(FastllmCudaDeepSeekV41HcMixPreNorm(input, previousPre, fn, scale, base, weight,
+                    20, 1e-6f, 1e-6f, pre[1], post[1], comb[1], out[1], &quantFusedOut),
+                    "fused mix/norm quantization rejected");
+                Require(Bits(quantReference) == Bits(quantFusedOut),
+                        "fused mHC quantization differs from the standalone block-32 quantizer");
                 ++cases;
             }
         }
