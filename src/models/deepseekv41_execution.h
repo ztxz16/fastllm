@@ -24,6 +24,7 @@ namespace fastllm {
         Data attnInputFloat, rawKVAll, rawScoreAll, qIdxAll, idxWeights, idxWeightsAll;
         Data ffnInput, ffnOut, gateInput, gateLogits, expertIndex, expertScore;
         Data sharedGateup, sharedSwiglu, sharedExpertOut;
+        bool sharedExpertSharded = false;  // Valid only until the joint MoE collective.
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
         Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
         std::unique_ptr<DeepSeekV41HybridWorkspace> hybrid;
@@ -45,6 +46,7 @@ namespace fastllm {
         std::function<void()> releaseSharedScratch;
         std::mutex *pipelineHostExperts = nullptr;
         int pipelineFirstLayer = -1;
+        bool parallelShared = false;  // Set only after native graph buffers pass validation.
     };
 
     // Tensor-copy helpers shared with attention/KV code. They preserve graph

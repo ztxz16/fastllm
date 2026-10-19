@@ -940,7 +940,7 @@ namespace fastllm {
         // Decode partitions independent output channels. Keeping the weight
         // replicas also preserves the existing prefill and unsupported-layout
         // paths. Each owner computes full K, then gathers rounded BF16 outputs.
-        bool V41EngramTpLinear(Data &input, Data &weight, Data &output) {
+        bool V41ReplicatedRowLinear(Data &input, Data &weight, Data &output, bool gather = true) {
             if (!input.multiDeviceData || !input.IsTensorParallelReplicated() ||
                 input.dataType != DataType::BFLOAT16 || weight.dataType != DataType::FP8_E4M3 ||
                 weight.dims.size() != 2 || input.dims.empty() ||
@@ -971,13 +971,22 @@ namespace fastllm {
             });
             if (!dispatched || !std::all_of(ready.begin(), ready.end(), [](int v) { return v != 0; }))
                 return false;
+            if (!gather) return true;
             dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
                 auto *dest = (uint16_t *)output.multiDeviceDatas.at(device)->cudaData;
-                const bool ok = FastllmNcclAllGather(dest + (size_t)rank * width, dest,
-                    width, DataType::BFLOAT16, device);
-                AssertInFastLLM(ok, "DeepSeekV41 Engram projection all-gather failed");
+                const int count = width * (int)devices.size();
+                bool ok = FastllmCudaCustomAllGatherRows(
+                    dest, count, count, DataType::BFLOAT16, device);
+                // Keep rounded projection values unchanged. Unsupported peer
+                // topologies, policies and registrations retain NCCL; do not
+                // retry a failed CUDA launch with a second collective.
+                if (!ok && !FastllmCudaGetThreadError()) {
+                    ok = FastllmNcclAllGather(dest + (size_t)rank * width, dest,
+                        width, DataType::BFLOAT16, device);
+                }
+                AssertInFastLLM(ok, "DeepSeekV41 replicated projection all-gather failed");
             });
-            AssertInFastLLM(dispatched, "DeepSeekV41 Engram projection dispatch failed");
+            AssertInFastLLM(dispatched, "DeepSeekV41 replicated projection dispatch failed");
             return true;
         }
 #endif
@@ -2436,7 +2445,7 @@ namespace fastllm {
             FastllmCudaV41ReferenceLinear(*source,weight[weightName],output,1,source->dataType==DataType::BFLOAT16)) return;
         if (replicated && V41EndsWith(weightName, ".engram.wkv.weight") &&
             !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
-            V41EngramTpLinear(*source, weight[weightName], output)) return;
+            V41ReplicatedRowLinear(*source, weight[weightName], output)) return;
 #endif
         // Match RowParallelLinear: each local GEMM rounds to the activation
         // dtype, the collective sums in FP32, and only its result rounds back.
@@ -4250,6 +4259,11 @@ namespace fastllm {
             if (captureOk) {
                 for (int index = 0; index < deviceCount; index++) {
                     FastllmCudaSetDevice(state.deviceStates[index].device);
+                    const int regions = FastllmCudaGraphOptimizeParallelRegions(segment.graphs[index]);
+                    if (regions < 0) {
+                        captureOk = false;
+                        break;
+                    }
                     if (!FastllmCudaGraphInstantiate(segment.graphs[index], &segment.execs[index]) ||
                         segment.execs[index] == nullptr) {
                         captureOk = false;
@@ -4427,9 +4441,21 @@ namespace fastllm {
             if (!captured) ready = false;
         }
         if (ready) {
+            std::string mainDevice = SelectDeviceFromMap(work->model.deviceMap, layer + 1,
+                                                       work->model.block_cnt);
+            if (mainDevice.empty()) mainDevice = V41Executor().GetFirstDeviceType();
+            ctx.parallelShared = work->single && work->seqlen == 1 &&
+                ctx.hasSharedExpertOut && !work->dumpDebug && !work->dsparkVerify &&
+                !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
+                V41DeviceSpecUsesType(mainDevice, "multicuda") &&
+                mainDevice == work->model.SelectMoeDeviceForLayer(layer);
             work->captureGpuMoeTogether = true;
             work->combineFfnPostDispatch = false;
             work->model.RunForwardGraphSegment(*work, [&] {
+                    struct RestoreWorkerCapture {
+                        bool previous;
+                        ~RestoreWorkerCapture() { MultiCudaSetWorkerOrderedCapture(previous); }
+                    } restore{MultiCudaSetWorkerOrderedCapture(work->graphCapture && ctx.parallelShared)};
                     work->combineFfnPostDispatch = work->model.RunGpuMoe(ctx);
                     work->model.EndForwardLayer(*work, layer);
                 }, kV41GraphSegmentsPerLayer * layer + 3, true,
@@ -6208,6 +6234,7 @@ namespace fastllm {
         auto &hasSharedExpertOut = f.hasSharedExpertOut;
         auto &ffnInput = ws->ffnInput;
         auto &sharedExpertOut = ws->sharedExpertOut;
+        ws->sharedExpertSharded = false;
         auto quantizedLinear = [&](Data &input, const std::string &name, Data &output, bool replicated = false,
                                    Data *scratch = nullptr, bool inputQuantized = false) {
             // Graphs and asynchronous TP decode need stable per-weight buffers.
@@ -6223,8 +6250,8 @@ namespace fastllm {
         auto body = [&] {
 
             if (hasSharedExpertOut) {
-                // Keep a complete shared expert on each rank, preserving
-                // the original BF16 rounding boundary without a collective.
+                // Preserve full-K arithmetic and the original BF16 rounding.
+                // Eligible decode graphs partition only the down-projection rows.
                 Data &ww1 = ws->sharedSwiglu, &ww3 = ws->sharedGateup;
                 bool sharedQuantized = false;
                 quantizedLinear(ffnInput, pre + ".ffn.shared_experts.gateup.weight", ww3,
@@ -6245,8 +6272,34 @@ namespace fastllm {
 #else
                 Swiglu(ww3, ww1);
 #endif
-                quantizedLinear(ww1, pre + ".ffn.shared_experts.w2.weight", sharedExpertOut,
-                                tp, nullptr, sharedQuantized);
+#ifdef USE_CUDA
+                if (sharedQuantized && f.captureGpuMoeTogether && f.tp && f.single &&
+                    seqlen == 1 && !f.dumpDebug && !f.dsparkVerify &&
+                    quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight")) {
+                    std::string main = SelectDeviceFromMap(deviceMap, layer + 1, block_cnt);
+                    if (main.empty()) main = V41Executor().GetFirstDeviceType();
+                    const std::string moe = SelectMoeDeviceForLayer(layer);
+                    std::vector<int> devices;
+                    std::map<int, int> ratios;
+                    FastllmGetMulticudaDeviceAndRatio(devices, ratios, false);
+                    std::vector<int> replicas;
+                    for (const auto &entry : ww1.multiDeviceDatas) replicas.push_back(entry.first);
+                    const int width = weight[pre + ".ffn.shared_experts.w2.weight"].dims[0];
+                    bool ready = main == moe && V41DeviceSpecUsesType(main, "multicuda") &&
+                        devices == f.tpDevices && devices == replicas &&
+                        !devices.empty() && width % (devices.size() * 8) == 0 &&
+                        width <= 4 * 512 * 36;
+                    for (int device : devices) {
+                        ready &= FastllmCudaCustomAllReduceCanRun(width, DataType::FLOAT32, device) &&
+                                 FastllmCudaCustomAllReduceCanRun(width, DataType::BFLOAT16, device);
+                    }
+                    if (ready) ws->sharedExpertSharded = V41ReplicatedRowLinear(ww1,
+                        weight[pre + ".ffn.shared_experts.w2.weight"], sharedExpertOut, false);
+                }
+#endif
+                if (!ws->sharedExpertSharded)
+                    quantizedLinear(ww1, pre + ".ffn.shared_experts.w2.weight", sharedExpertOut,
+                                    tp, nullptr, sharedQuantized);
                 ToDataType(sharedExpertOut, DataType::BFLOAT16);
             }
 

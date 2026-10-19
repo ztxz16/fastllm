@@ -319,6 +319,39 @@ void FastllmCustomAllGatherInplaceKernel(CustomArRankData *rankData,
     CustomArBarrierFinal<Ranks>(allSignals, selfSignal, rank);
 }
 
+// A joint small-message collective: retain rank-ordered FP32 arithmetic and
+// gather each owner's already-rounded BF16 rows without doing arithmetic.
+// A packet belongs to the same CTA on every rank. Both results stay in
+// registers until all peers have finished reading that packet.
+template <int Ranks>
+__global__ __launch_bounds__(kCustomArThreads, 1)
+void FastllmCustomAllReduceAndGatherKernel(CustomArRankData *routedData,
+        CustomArRankData *sharedData, CustomArRankSignals allSignals,
+        CustomArSignal *selfSignal, float4 *routedOutput, uint2 *sharedOutput,
+        int rank, int packedCount) {
+    CustomArRankData routed = *routedData, shared = *sharedData;
+    CustomArBarrierStart<Ranks>(allSignals, selfSignal, rank);
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    float4 sum{};
+    uint2 value{};
+    if (index < packedCount) {
+        sum = reinterpret_cast<const float4 *>(routed.ptrs[0])[index];
+#pragma unroll
+        for (int peer = 1; peer < Ranks; ++peer) {
+            float4 x = reinterpret_cast<const float4 *>(routed.ptrs[peer])[index];
+            sum.x += x.x; sum.y += x.y; sum.z += x.z; sum.w += x.w;
+        }
+        const int owner = index / (packedCount / Ranks);
+        value = reinterpret_cast<const uint2 *>(shared.ptrs[owner])[index];
+    }
+    CustomArBarrierFinal<Ranks>(allSignals, selfSignal, rank);
+    __syncthreads();
+    if (index < packedCount) {
+        routedOutput[index] = sum;
+        sharedOutput[index] = value;
+    }
+}
+
 template <typename T, int Ranks>
 __global__ __launch_bounds__(kCustomArThreads, 1)
 void FastllmCustomAllReduceKernel(CustomArRankData *rankData,
@@ -3004,6 +3037,62 @@ bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
 #else
     return false;
 #endif
+}
+
+bool FastllmCudaCustomAllReduceAndGather(void *routed, void *dest,
+        void *shared, int count, int deviceId) {
+    if (count <= 0 || count % 8 ||
+        count / 4 > kCustomArThreads * kCustomArMaxBlocks ||
+        (size_t)count * sizeof(float) > CustomArMaxBytes()) return false;
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    if (!lease.Acquire(state, (size_t)count * sizeof(float), fastllm::FLOAT32,
+                       deviceId, true, rank)) return false;
+    const int ranks = (int)state.devices.size();
+    if (count % (ranks * 8)) return false;
+    auto disjoint = [](const void *a, size_t na, const void *b, size_t nb) {
+        uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+        return x <= y ? y - x >= na : x - y >= nb;
+    };
+    const size_t routedBytes = (size_t)count * 4, sharedBytes = (size_t)count * 2;
+    // Rank-local eligibility must participate in the pointer rendezvous: no
+    // rank can return early while other ranks wait for its pointer or barrier.
+    const bool eligible = routed && dest && shared &&
+        (((uintptr_t)routed | (uintptr_t)dest | (uintptr_t)shared) & 15u) == 0 &&
+        (routed == dest || disjoint(routed, routedBytes, dest, routedBytes)) &&
+        disjoint(routed, routedBytes, shared, sharedBytes) &&
+        disjoint(dest, routedBytes, shared, sharedBytes);
+    CustomArRankData *routedData = nullptr, *sharedData = nullptr;
+    if (!FindOrRegisterCustomArPointers(state, rank, routed, count,
+            fastllm::FLOAT32, eligible, routedData) ||
+        !FindOrRegisterCustomArPointers(state, rank, shared, count,
+            fastllm::BFLOAT16, eligible, sharedData)) return false;
+    const int blocks = (count / 4 + kCustomArThreads - 1) / kCustomArThreads;
+#define CUSTOM_AR_GATHER_CASE(RANKS)                                        \
+    case RANKS:                                                            \
+        FastllmCustomAllReduceAndGatherKernel<RANKS>                        \
+            <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(          \
+                routedData, sharedData, state.allSignals,                  \
+                state.allSignals.signals[rank], (float4 *)dest,            \
+                (uint2 *)shared, rank, count / 4);                         \
+        break
+    switch (ranks) {
+        CUSTOM_AR_GATHER_CASE(2);
+        CUSTOM_AR_GATHER_CASE(4);
+        CUSTOM_AR_GATHER_CASE(6);
+        CUSTOM_AR_GATHER_CASE(8);
+        default: return false;
+    }
+#undef CUSTOM_AR_GATHER_CASE
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        std::fprintf(stderr, "[Fastllm] joint reduce/gather failed on GPU %d: %s.\n",
+                     deviceId, cudaGetErrorString(status));
+        return false;
+    }
+    return true;
 }
 
 bool FastllmCudaCustomAllGatherRows(void *data, int count, int rowElements,

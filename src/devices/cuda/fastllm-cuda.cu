@@ -1137,7 +1137,9 @@ int FastllmCudaGraphOptimizeQwen35Moe(void *graph) {
             !FastllmCudaGraphGetAdjacentNodes(m.join, true, joinRoots)) {
             return -1;
         }
-        if (forkDependencies.empty() || sharedRoots.empty() || sharedTails.empty() ||
+        // A fork may be the graph root. Destroying its marker then makes
+        // both independent branches roots; no incoming edge is required.
+        if (sharedRoots.empty() || sharedTails.empty() ||
             routedRoots.empty() || routedTails.empty() || joinRoots.empty()) {
             fastllmCudaGraphLastError = "Qwen3.5 MoE graph marker adjacency is empty for layer " +
                                         std::to_string(it.first);
@@ -1204,7 +1206,7 @@ namespace {
     }
 }
 
-static bool FastllmCudaGraphQwen35MoeParallelSelfTest() {
+static bool FastllmCudaGraphQwen35MoeParallelSelfTest(bool rootFork = false) {
     int *shared = nullptr;
     int *routed = nullptr;
     int *output = nullptr;
@@ -1227,9 +1229,11 @@ static bool FastllmCudaGraphQwen35MoeParallelSelfTest() {
         cleanup();
         return false;
     }
-    cudaMemsetAsync(shared, 0, sizeof(int), cudaStreamPerThread);
-    cudaMemsetAsync(routed, 0, sizeof(int), cudaStreamPerThread);
-    cudaMemsetAsync(output, 0, sizeof(int), cudaStreamPerThread);
+    if (!rootFork) {
+        cudaMemsetAsync(shared, 0, sizeof(int), cudaStreamPerThread);
+        cudaMemsetAsync(routed, 0, sizeof(int), cudaStreamPerThread);
+        cudaMemsetAsync(output, 0, sizeof(int), cudaStreamPerThread);
+    }
     FastllmCudaGraphMarkQwen35MoeFork(0);
     FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(shared, 11);
     FastllmCudaGraphMarkQwen35MoeSharedDone(0);
@@ -1252,8 +1256,11 @@ static bool FastllmCudaGraphQwen35MoeParallelSelfTest() {
         return false;
     }
     int result = 0;
+    size_t rootCount = 0;
     bool ok = cudaMemcpy(&result, output, sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess &&
               result == 42;
+    if (rootFork)
+        ok &= cudaGraphGetRootNodes(graph, nullptr, &rootCount) == cudaSuccess && rootCount == 2;
     cleanup();
     return ok;
 }
@@ -1372,6 +1379,7 @@ static bool FastllmCudaGraphQwen35MoeAllocationFallbackSelfTest() {
 
 bool FastllmCudaGraphQwen35MoeSelfTest() {
     return FastllmCudaGraphQwen35MoeParallelSelfTest() &&
+           FastllmCudaGraphQwen35MoeParallelSelfTest(true) &&
            FastllmCudaGraphQwen35MoeAllocationFallbackSelfTest();
 }
 

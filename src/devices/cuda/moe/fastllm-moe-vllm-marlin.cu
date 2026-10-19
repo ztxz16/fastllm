@@ -3897,7 +3897,7 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
     // Two resident CTAs reduce the long gate/up tail on Hopper decode. The
     // ordinary configuration remains the fallback for other architectures.
     const int gateBlocksPerSm = deepSeekV41 && cache->computeMajor == 9 &&
-        rows >= 16 ? 2 : 1;
+        (rows == 1 || rows >= 16) ? 2 : 1;
     constexpr int downThreadK = 64;
     constexpr int downThreadN = 128;
     constexpr int downBlocksPerSm = 3;
