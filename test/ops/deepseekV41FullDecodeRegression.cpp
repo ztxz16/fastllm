@@ -22,6 +22,7 @@ static void Cuda(cudaError_t e) {
 }
 static float amplitude = .3f;
 static bool stress = false;
+static bool pooled = false;
 static void Fill(Data &d, const std::vector<int> &dims, int seed,
                  DataType type = DataType::BFLOAT16) {
     size_t n = 1;
@@ -69,9 +70,9 @@ int main(int argc, char **argv) {
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess ||
         major < 8)
         return 77;
-    if (argc > 1 && std::string(argv[1]) == "--stress") {
-        stress = true;
-        amplitude = 1.f;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--stress") { stress = true; amplitude = 1.f; }
+        if (std::string(argv[i]) == "--pooled") pooled = true;
     }
     try {
         ApplyDeviceMap({{"cpu", 1}}, 0, 1);
@@ -134,7 +135,13 @@ int main(int argc, char **argv) {
                                        nullptr,
                                        1};
                     }
+                    Data requestStorage;
                     FastllmV41FullDecodeBuffers b;
+                    if (pooled) {
+                        Fill(requestStorage, {int(3 * batch * sizeof(FastllmV41FullDecodeRequest))},
+                             0, DataType::INT8);
+                        b.requests = static_cast<FastllmV41FullDecodeRequest *>(requestStorage.cudaData) + batch;
+                    }
                     b.q = q.cudaData;
                     b.kv = kv.cudaData;
                     b.output = out.cudaData;
@@ -149,13 +156,32 @@ int main(int argc, char **argv) {
                           "unsupported ratio accepted");
                     void *plan = FastllmCudaV41CreateFullDecode(c, b);
                     Check(plan, "plan create");
-                    Check(!FastllmCudaV41UploadFullDecode(plan, requests.data(), batch + 1),
+                    auto upload = [&](const FastllmV41FullDecodeRequest *rows, size_t count) {
+                        if (!pooled) return FastllmCudaV41UploadFullDecode(plan, rows, count);
+                        if (count != size_t(batch)) {
+                            void *plans[] = {plan};
+                            return FastllmCudaV41UploadFullDecodeBatch(requestStorage.cudaData, plans, 1, rows, count);
+                        }
+                        std::vector<FastllmV41FullDecodeRequest> all(count * 3);
+                        std::copy(rows, rows + count, all.begin() + count);
+                        void *plans[] = {nullptr, plan, nullptr};
+                        return FastllmCudaV41UploadFullDecodeBatch(requestStorage.cudaData,
+                                                                  plans, 3, all.data(), count);
+                    };
+                    if (pooled) {
+                        void *wrong[] = {plan, nullptr, nullptr};
+                        std::vector<FastllmV41FullDecodeRequest> all(batch * 3);
+                        std::copy(requests.begin(), requests.end(), all.begin());
+                        Check(!FastllmCudaV41UploadFullDecodeBatch(requestStorage.cudaData,
+                                  wrong, 3, all.data(), batch), "wrong layer slice accepted");
+                    }
+                    Check(!upload(requests.data(), batch + 1),
                           "wrong request count accepted");
                     auto invalid = requests;
                     invalid[0].position = -1;
-                    Check(!FastllmCudaV41UploadFullDecode(plan, invalid.data(), batch),
+                    Check(!upload(invalid.data(), batch),
                           "negative position accepted");
-                    Check(FastllmCudaV41UploadFullDecode(plan, requests.data(), batch),
+                    Check(upload(requests.data(), batch),
                           "initial upload");
                     Cuda(cudaMemsetAsync(cand.cudaData, 1, cand.GetBytes(), cudaStreamPerThread));
                     Check(FastllmCudaV41PrepareFullDecode(plan) &&
@@ -236,7 +262,7 @@ int main(int argc, char **argv) {
                                                                   c.originalSeqLen, c.ropeFactor,
                                                                   c.betaFast, c.betaSlow, c.window),
                               "reference finish");
-                        Check(FastllmCudaV41UploadFullDecode(plan, requests.data(), batch),
+                        Check(upload(requests.data(), batch),
                               "runtime upload");
                         Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
                         Cuda(cudaDeviceSynchronize());

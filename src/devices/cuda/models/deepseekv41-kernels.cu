@@ -4875,7 +4875,8 @@ struct V41FullDecodePlan {
         if (pending) cudaEventSynchronize(copied);
         if (copied) cudaEventDestroy(copied);
         if (host) cudaFreeHost(host);
-        for (void *p : {static_cast<void *>(requests), static_cast<void *>(transforms),
+        if (requests && !buffers.requests) cudaFree(requests);
+        for (void *p : {static_cast<void *>(transforms),
                        static_cast<void *>(index), static_cast<void *>(attention),
                        static_cast<void *>(indexScores), static_cast<void *>(blockScores),
                        static_cast<void *>(attentionScores)}) if (p) cudaFree(p);
@@ -5014,22 +5015,26 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         using T = typename std::remove_pointer<typename std::remove_reference<decltype(*ptr)>::type>::type;
         return cudaMalloc(reinterpret_cast<void **>(ptr), count * sizeof(T)) == cudaSuccess;
     };
-    bool ok = alloc(&p->requests, c.batch) && alloc(&p->transforms, (size_t)c.batch * 7) &&
+    p->requests = static_cast<FastllmV41FullDecodeRequest *>(b.requests);
+    bool ok = (p->requests || alloc(&p->requests, c.batch)) &&
+        alloc(&p->transforms, (size_t)c.batch * 7) &&
         alloc(&p->attention, c.batch) && alloc(&p->attentionScores, (size_t)c.batch * c.heads * p->tiles * kMmaNC);
     if (c.indexSource) ok = ok && alloc(&p->index, c.batch) &&
         alloc(&p->indexScores, (size_t)c.batch * c.maxKeys) && alloc(&p->blockScores, (size_t)c.batch * blocks);
-    ok = ok && cudaHostAlloc(reinterpret_cast<void **>(&p->host), (size_t)c.batch * sizeof(*p->host), cudaHostAllocDefault) == cudaSuccess &&
-         cudaEventCreateWithFlags(&p->copied, cudaEventDisableTiming) == cudaSuccess;
+    if (!b.requests)
+        ok = ok && cudaHostAlloc(reinterpret_cast<void **>(&p->host), (size_t)c.batch * sizeof(*p->host), cudaHostAllocDefault) == cudaSuccess &&
+             cudaEventCreateWithFlags(&p->copied, cudaEventDisableTiming) == cudaSuccess;
     if (!ok) { cudaGetLastError(); return nullptr; }
     return p.release();
 }
 
 void FastllmCudaV41DestroyFullDecode(void *plan) { delete static_cast<V41FullDecodePlan *>(plan); }
 
-bool FastllmCudaV41UploadFullDecode(void *handle, const FastllmV41FullDecodeRequest *requests, size_t count) {
-    auto *p = static_cast<V41FullDecodePlan *>(handle);
-    if (!p || !requests || count != (size_t)p->config.batch || FastllmCudaGetDevice() != p->device ||
-        FastllmCudaGraphIsCapturingFast()) return false;
+namespace {
+bool V41ValidateFullDecodeRequests(const V41FullDecodePlan *p,
+        const FastllmV41FullDecodeRequest *requests, size_t count) {
+    if (!p || !requests || count != (size_t)p->config.batch ||
+        FastllmCudaGetDevice() != p->device) return false;
     const auto &c = p->config;
     for (size_t i = 0; i < count; ++i) {
         const auto &r = requests[i];
@@ -5038,6 +5043,31 @@ bool FastllmCudaV41UploadFullDecode(void *handle, const FastllmV41FullDecodeRequ
             (c.indexSource && !r.indexK) ||
             (c.kvSource && c.ratio > 1 && (!r.rawTailKV || !r.rawTailScore))) return false;
     }
+    return true;
+}
+} // namespace
+
+bool FastllmCudaV41UploadFullDecodeBatch(void *storage, void *const *plans, size_t layers,
+        const FastllmV41FullDecodeRequest *requests, size_t batch) {
+    if (!storage || !plans || !requests || !layers || !batch ||
+        layers > SIZE_MAX / batch / sizeof(*requests) || FastllmCudaGraphIsCapturingFast())
+        return false;
+    auto *deviceRequests = static_cast<FastllmV41FullDecodeRequest *>(storage);
+    for (size_t l = 0; l < layers; ++l) {
+        auto *p = static_cast<V41FullDecodePlan *>(plans[l]);
+        if (!p) continue;
+        if (!p->buffers.requests || p->requests != deviceRequests + l * batch ||
+            !V41ValidateFullDecodeRequests(p, requests + l * batch, batch)) return false;
+    }
+    // The bounded pinned staging pool retains each source until its copy event
+    // completes. The upload and graph replay use the same worker stream.
+    return V41UploadDescriptors(storage, requests, layers * batch * sizeof(*requests));
+}
+
+bool FastllmCudaV41UploadFullDecode(void *handle, const FastllmV41FullDecodeRequest *requests, size_t count) {
+    auto *p = static_cast<V41FullDecodePlan *>(handle);
+    if (FastllmCudaGraphIsCapturingFast() || !V41ValidateFullDecodeRequests(p, requests, count) ||
+        p->buffers.requests) return false;
     if (p->pending && cudaEventSynchronize(p->copied) != cudaSuccess) return false;
     std::memcpy(p->host, requests, count * sizeof(*requests));
     if (cudaMemcpyAsync(p->requests, p->host, count * sizeof(*requests), cudaMemcpyHostToDevice,
