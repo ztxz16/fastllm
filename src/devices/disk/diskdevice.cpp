@@ -2076,6 +2076,10 @@ namespace fastllm {
         }
     };
 
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+    class DiskMxfp4Upload;
+#endif
+
     struct DiskExpertCache {
         // An invocation holds this lock until all copies and computations finish.
         // Thus eviction/model unload cannot invalidate an in-flight weight.
@@ -2086,6 +2090,9 @@ namespace fastllm {
         std::map<int, uint64_t> cudaBytes;
         DiskMoeCacheStats stats;
         DiskExpertPrefetch prefetch;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        std::map<int, std::shared_ptr<DiskMxfp4Upload>> uploads;
+#endif
         std::vector<DiskExpertEntry*> cpuHeap;
         uint64_t cpuHeapEpoch = 0;
         std::map<int, std::vector<DiskExpertEntry *>> cudaHeaps;
@@ -2251,6 +2258,9 @@ namespace fastllm {
             return true;
         }
         void Trim() {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            if (!GetMoeCudaCacheBytes()) uploads.clear();
+#endif
             MakeRoom(nullptr, -1, 0, GetMoeCpuCacheBytes());
             if (!GetMoeCpuCacheBytes()) retiredCpuBytes += GetDiskWeightBufferPool().Clear();
             for (const auto &item : cudaBytes)
@@ -2379,7 +2389,12 @@ namespace fastllm {
         cache.Evict(it->second, -1);
         for (auto &item : it->second.cuda) cache.Evict(it->second, item.first);
         cache.entries.erase(it);
-        if (cache.entries.empty()) cache.retiredCpuBytes += GetDiskWeightBufferPool().Clear();
+        if (cache.entries.empty()) {
+            cache.retiredCpuBytes += GetDiskWeightBufferPool().Clear();
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            cache.uploads.clear();
+#endif
+        }
         cache.ReclaimCpu(cache.entries.empty());
     }
 
@@ -2552,31 +2567,48 @@ namespace fastllm {
     }
 
 #ifndef USE_ROCM
-    // Bounded staging, private to one disk MoE invocation. The RAM cache
-    // retains its canonical layout and no model-sized pinned copy is created.
+    // Bounded staging. Decode reuses one uploader per cache device under the
+    // cache mutex; prefill owns its uploader for the invocation. The RAM cache
+    // retains its canonical layout without a model-sized pinned copy.
     class DiskMxfp4Upload {
+        struct DeviceGuard {
+            int previous = FastllmCudaGetDevice();
+            explicit DeviceGuard(int device) { FastllmCudaSetDevice(device); }
+            ~DeviceGuard() { FastllmCudaSetDevice(previous); }
+        };
         int device;
         void *host = nullptr, *stream = nullptr, *ready = nullptr;
         size_t capacity = 0;
         bool unavailable = false;
         Data raw{BFLOAT16};
+        size_t gateBytes = 0, bytes = 0;
+        std::vector<int> gateDims, downDims;
     public:
         explicit DiskMxfp4Upload(int device) : device(device) {}
         ~DiskMxfp4Upload() {
             if (!stream) return;
-            FastllmCudaSetDevice(device);
+            DeviceGuard guard(device);
             FastllmCudaStreamSynchronize(stream);
             FastllmCudaSyncCurrentThreadStream();
+            raw.FreeSpace();
             FastllmCudaHostFree(host);
             FastllmCudaEventDestroy(ready);
             FastllmCudaStreamDestroy(stream);
         }
-        std::unique_ptr<DiskCachedExpert> Upload(const DiskCachedExpert &source,
-                std::unique_ptr<DiskCachedExpert> &recycled) {
-            const size_t gateBytes = source.gate->GetBytes();
-            const size_t bytes = gateBytes + source.down->GetBytes();
-            if (unavailable || bytes > (64ULL << 20) || gateBytes % 256) return nullptr;
-            FastllmCudaSetDevice(device);
+        size_t Bytes() const { return bytes; }
+        int Device() const { return device; }
+        void Wait() {
+            DeviceGuard guard(device);
+            FastllmCudaStreamSynchronize(stream);
+            AssertInFastLLM(!FastllmCudaGetThreadError(), "Disk expert upload failed.\n");
+        }
+        bool Prepare(const DiskCachedExpert &source) {
+            gateBytes = source.gate->GetBytes();
+            bytes = gateBytes + source.down->GetBytes();
+            if (unavailable || bytes > (64ULL << 20) || gateBytes % 256) return false;
+            gateDims = source.gate->dims;
+            downDims = source.down->dims;
+            DeviceGuard guard(device);
             if (!stream) {
                 stream = FastllmCudaStreamCreate(true);
                 ready = FastllmCudaEventCreate();
@@ -2588,31 +2620,10 @@ namespace fastllm {
                 if (!host) {
                     unavailable = true;
                     FastllmCudaClearThreadError();
-                    return nullptr;
+                    return false;
                 }
                 raw.Resize({int((bytes + 1) / 2)});
                 raw.ToDevice(CUDA, {device}, false); raw.Allocate(false);
-            }
-            auto gpu = std::make_unique<DiskCachedExpert>();
-            gpu->device = device;
-            if (recycled && recycled->device == device && recycled->cudaRecord &&
-                recycled->gate->GetBytes() + recycled->down->GetBytes() == bytes) {
-                gpu->cudaRecord = recycled->cudaRecord;
-                recycled->cudaRecord = nullptr;
-            }
-            recycled.reset();
-            if (!gpu->cudaRecord) gpu->cudaRecord = FastllmCudaDirectMalloc(bytes);
-            size_t offset = 0;
-            for (const Data *w : {source.gate.get(), source.down.get()}) {
-                auto view = std::make_unique<Data>(NVFP4_BLOCK_32_E8M0, w->dims, CUDA,
-                    static_cast<uint8_t *>(gpu->cudaRecord) + offset);
-                view->cudaDataBorrowed = true;
-                view->directMemory = true;
-                view->dataDeviceIds = {device};
-                view->blockK = w->blockK; view->blockM = w->blockM;
-                if (offset == 0) gpu->gate = std::move(view);
-                else gpu->down = std::move(view);
-                offset += w->GetBytes();
             }
             const auto copy = [&](size_t first, size_t last) {
                 if (first < gateBytes) {
@@ -2645,13 +2656,42 @@ namespace fastllm {
                 for (int i = 0; i < threads; ++i) pool->Wait(first + i);
             }
             FastllmCudaCopyFromPinnedHostToDeviceAsync(raw.cudaData, host, bytes, stream);
+            return true;
+        }
+        std::unique_ptr<DiskCachedExpert> Finish(std::unique_ptr<DiskCachedExpert> &recycled) {
+            DeviceGuard guard(device);
+            auto gpu = std::make_unique<DiskCachedExpert>();
+            gpu->device = device;
+            if (recycled && recycled->device == device && recycled->cudaRecord &&
+                recycled->gate->GetBytes() + recycled->down->GetBytes() == bytes) {
+                gpu->cudaRecord = recycled->cudaRecord;
+                recycled->cudaRecord = nullptr;
+            }
+            recycled.reset();
+            if (!gpu->cudaRecord) gpu->cudaRecord = FastllmCudaDirectMalloc(bytes);
+            size_t offset = 0;
+            for (const auto *dims : {&gateDims, &downDims}) {
+                auto view = std::make_unique<Data>(NVFP4_BLOCK_32_E8M0, *dims, CUDA,
+                    static_cast<uint8_t *>(gpu->cudaRecord) + offset);
+                view->cudaDataBorrowed = true;
+                view->directMemory = true;
+                view->dataDeviceIds = {device};
+                view->blockK = 1; view->blockM = 32;
+                if (offset == 0) gpu->gate = std::move(view);
+                else gpu->down = std::move(view);
+                offset += dims == &gateDims ? gateBytes : bytes - gateBytes;
+            }
             FastllmCudaPackDiskMxfp4(raw.cudaData, gpu->gate->cudaData,
-                source.gate->dims[0], source.gate->dims[1], true, stream);
+                gateDims[0], gateDims[1], true, stream);
             FastllmCudaPackDiskMxfp4(static_cast<uint8_t *>(raw.cudaData) + gateBytes,
-                gpu->down->cudaData, source.down->dims[0], source.down->dims[1], false, stream);
+                gpu->down->cudaData, downDims[0], downDims[1], false, stream);
             FastllmCudaEventRecord(ready, stream);
             FastllmCudaCurrentThreadStreamWaitEvent(ready);
             return gpu;
+        }
+        std::unique_ptr<DiskCachedExpert> Upload(const DiskCachedExpert &source,
+                std::unique_ptr<DiskCachedExpert> &recycled) {
+            return Prepare(source) ? Finish(recycled) : nullptr;
         }
     };
 
@@ -3496,6 +3536,9 @@ namespace fastllm {
         std::set<int> residentDevices;
         std::unique_ptr<DiskCachedExpert> deferredPromotion;
         DiskExpertEntry *deferredEntry = nullptr;
+#ifndef USE_ROCM
+        DiskMxfp4Upload *deferredUpload = nullptr; // Owned by cache under its mutex.
+#endif
         // Bound per-route result staging independently of prompt length. Large
         // chunks retain the streaming path; decode/verify batch all GPU hits.
         if (nativeGlm && device >= 0 && uint64_t(tokens) * topk * hidden * sizeof(float) <= (64ULL << 20)) {
@@ -3793,6 +3836,19 @@ namespace fastllm {
                     // much more than the metadata decision itself.
                     const int target = transientGpu ? transientGpu->device : promotionDevice(bytes);
                     if (cache.MakeRoom(entry, target, bytes, GetMoeCudaCacheBytes(), nullptr, false)) {
+#ifndef USE_ROCM
+                        if (!transientGpu && gateType == MoeGateSwiglu &&
+                            DiskCudaWeightType(*host->gate) == NVFP4_BLOCK_32_E8M0 &&
+                            DiskCudaWeightType(*host->down) == NVFP4_BLOCK_32_E8M0) {
+                            auto &upload = cache.uploads[target];
+                            if (!upload) upload = std::make_shared<DiskMxfp4Upload>(target);
+                            // Copy canonical bytes now, while resident GPU work
+                            // and subsequent CPU experts can still run. Reuse a
+                            // victim record only after all its users finish.
+                            if (upload->Prepare(*host)) deferredUpload = upload.get();
+                        }
+                        if (!deferredUpload)
+#endif
                         deferredPromotion = transientGpu ? std::move(transientGpu) : DiskCudaExpert(*host, gateType, canonicalGGUF);
                         deferredEntry = entry;
                         // The packed promotion owns its staging. Admitting a
@@ -3855,12 +3911,27 @@ namespace fastllm {
                 for (int col = 0; col < hidden; ++col) dst[col] += src[col];
             }
         }
-        if (deferredPromotion) {
-            const int target = deferredPromotion->device < 0
-                ? promotionDevice(deferredPromotion->Bytes()) : deferredPromotion->device;
+        uint64_t promotionBytes = deferredPromotion ? deferredPromotion->Bytes() : 0;
+        int promotionTarget = deferredPromotion ? deferredPromotion->device : -1;
+#ifndef USE_ROCM
+        if (deferredUpload) {
+            promotionBytes = deferredUpload->Bytes();
+            promotionTarget = deferredUpload->Device();
+        }
+#endif
+        if (promotionBytes) {
+            const int target = promotionTarget < 0 ? promotionDevice(promotionBytes) : promotionTarget;
             std::unique_ptr<DiskCachedExpert> recycled;
-            if (cache.MakeRoom(deferredEntry, target, deferredPromotion->Bytes(), GetMoeCudaCacheBytes(),
-                               deferredPromotion->device < 0 ? &recycled : nullptr)) {
+            if (cache.MakeRoom(deferredEntry, target, promotionBytes, GetMoeCudaCacheBytes(),
+                               deferredPromotion && deferredPromotion->device >= 0 ? nullptr : &recycled)) {
+#ifndef USE_ROCM
+                if (deferredUpload) {
+                    deferredPromotion = deferredUpload->Finish(recycled);
+                    // Another request may use a different CUDA stream after
+                    // the cache lock is released. Publish only ready weights.
+                    deferredUpload->Wait();
+                }
+#endif
                 if (deferredPromotion->device < 0)
                     UploadDiskExpert(*deferredPromotion, target, std::move(recycled));
                 cache.Admit(*deferredEntry, std::move(deferredPromotion), target);

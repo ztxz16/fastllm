@@ -304,6 +304,11 @@ int main(int argc, char **argv) {
                 auto after = GetDiskMoeCacheStats();
                 Require(after.cudaHits > before.cudaHits, "no CUDA cache hits");
                 Require(after.cudaBytes <= GetMoeCudaCacheBytes() * (device + 1), "CUDA budget");
+                auto nextRequest = std::async(std::launch::async, [&] {
+                    return f.Run(true, 1, 0, device);
+                });
+                auto nextOutput = nextRequest.get();
+                Compare(nextOutput, f.Run(false, 1, 0), false);
                 // GPU-only entries must remain valid after evicting their RAM copy.
                 SetMoeCpuCacheBytes(0);
                 before = GetDiskMoeCacheStats();
@@ -348,7 +353,14 @@ int main(int argc, char **argv) {
             for (int device = 0; device < devices; ++device)
                 Compare(f.Run(true, 520, 0, device), f.Run(false, 520, 0), false);
             Require(GetDiskMoeCacheStats().cudaBytes == 0, "undersized CUDA budget retained payload");
+#ifdef USE_CUDA
+            const int previousDevice = devices > 0 ? FastllmCudaGetDevice() : -1;
+#endif
             SetMoeCudaCacheBytes(0); SetMoeCpuCacheBytes(0);
+#ifdef USE_CUDA
+            Require(previousDevice < 0 || FastllmCudaGetDevice() == previousDevice,
+                    "cache trim changed the caller CUDA device");
+#endif
             auto stats = GetDiskMoeCacheStats();
             Require(stats.cpuBytes == 0 && stats.cudaBytes == 0, "disable did not release cache");
             Compare(f.Run(true, 1, 0), f.Run(false, 1, 0), true);
