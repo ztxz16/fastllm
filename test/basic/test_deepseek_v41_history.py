@@ -52,11 +52,87 @@ class HistoryTest(unittest.TestCase):
         cache = ToolHistory(max_entries=1)
         a=self.message('a'); b=self.message('b')
         cache.remember('first',a); cache.remember('second',b)
-        self.assertIsNone(cache.restore(a)); self.assertEqual(cache.restore(b),'second')
+        self.assertEqual(cache.restore(a),'first'); self.assertEqual(cache.restore(b),'second')
+        self.assertEqual(len(cache.entries), 1)
         cache=ToolHistory(max_bytes=5); cache.remember('large',a)
         self.assertEqual(cache.bytes,0)
+        self.assertEqual(cache.restore(a), 'large')
         a['tool_calls'] += b['tool_calls']; cache=ToolHistory(); cache.remember('parallel',a)
         a['tool_calls'].reverse(); self.assertIsNone(cache.restore(a))
+
+    def test_long_tool_history_keeps_exact_prefix_after_eviction(self):
+        # Reproduce the 132-call boundary, including noncanonical parameter
+        # order/spacing and parallel calls. Compare the entire rendered prefix.
+        from ftllm.openai_server.tool_parsers.deepseekv41_tool_parser import DeepSeekV41ToolParser
+        from types import SimpleNamespace
+        parser = DeepSeekV41ToolParser(SimpleNamespace(get_vocab=lambda: {}))
+        cache = ToolHistory()
+        messages = [dict(role='user', content='inspect')]
+        expected = encode_messages(messages, thinking_mode='chat')
+        for i in range(140):
+            invoke = ('<｜DSML｜ invoke name="exec_command">\n'
+                      '<｜DSML｜ parameter name="workdir" string="true">/tmp</｜DSML｜ parameter>\n'
+                      '<｜DSML｜ parameter name="cmd" string="true">echo %d</｜DSML｜ parameter>\n'
+                      '</｜DSML｜ invoke>\n') % i
+            raw = '\n\n\n<｜DSML｜ calls>\n' + invoke * (2 if i == 3 else 1) + '</｜DSML｜ calls>'
+            result = parser.extract_tool_calls(raw, SimpleNamespace(tools=[]))
+            msg = dict(role='assistant', content=result.content,
+                       tool_calls=[c.model_dump() for c in result.tool_calls])
+            cache.remember(raw, msg)
+            # API clients round-trip parsed JSON, losing parameter order and
+            # whitespace outside the DSML block.
+            if not (msg.get('content') or '').strip():
+                msg['content'] = None
+            for call in msg['tool_calls']:
+                call['function']['arguments'] = json.dumps(
+                    json.loads(call['function']['arguments']), sort_keys=True)
+            expected += raw + eos_token
+            messages.append(msg)
+            # Include real tool replies in the prefix before appending the next
+            # tool call. The encoder closes each tool response deterministically.
+            for call in msg['tool_calls']:
+                messages.append(dict(role='tool', tool_call_id=call['id'], content=str(i)))
+            rendered = encode_messages(messages, thinking_mode='chat', tool_history=cache)
+            self.assertTrue(rendered.startswith(expected), f"prefix changed after call {i + 1}")
+            expected = rendered
+        self.assertEqual(len(cache.entries), 128)
+        self.assertIsNotNone(cache._spill)
+        self.assertEqual(encode_messages(messages, thinking_mode='chat', tool_history=cache), expected)
+        self.assertFalse(encode_messages(messages, thinking_mode='chat') == expected)
+
+    def test_spilled_validation_replacement_and_cleanup(self):
+        from pathlib import Path
+        cache = ToolHistory(max_entries=0)
+        msg = self.message()
+        cache.remember('first', dict(msg, reasoning_content='thought'), thinking=True)
+        path = Path(cache._spill_dir.name)
+        self.assertEqual(cache.restore(msg, thinking=True), 'first')
+        self.assertIsNone(cache.restore(msg))
+        self.assertIsNone(cache.restore(dict(msg, reasoning_content='changed'), thinking=True))
+        changed = copy.deepcopy(msg)
+        changed['tool_calls'][0]['function']['arguments'] = '{"cmd":"other"}'
+        self.assertIsNone(cache.restore(changed, thinking=True))
+        cache.remember('replacement', changed)
+        self.assertIsNone(cache.restore(msg, thinking=True))
+        self.assertEqual(cache.restore(changed), 'replacement')
+        self.assertEqual(cache.bytes, 0)
+        cache.close()
+        self.assertFalse(path.exists())
+
+    def test_concurrent_spill_roundtrip(self):
+        from concurrent.futures import ThreadPoolExecutor
+        cache = ToolHistory(max_entries=2)
+        def roundtrip(i):
+            msg = self.message('parallel-%d' % i)
+            raw = 'original-%d' % i
+            cache.remember(raw, msg)
+            self.assertEqual(cache.restore(msg), raw)
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(roundtrip, range(160)))
+        self.assertLessEqual(len(cache.entries), 2)
+        for i in range(160):
+            self.assertEqual(cache.restore(self.message('parallel-%d' % i)), 'original-%d' % i)
+        cache.close()
 
     def test_thinking_history_without_client_reasoning(self):
         msg = self.message()

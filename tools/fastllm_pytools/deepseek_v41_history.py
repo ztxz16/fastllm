@@ -1,5 +1,13 @@
-"""Bounded, model-local preservation of generated DSML for tool continuations."""
+"""Preserve generated DSML for the model lifetime, with bounded RAM usage.
+
+Old tool replies can remain in an active conversation long after their KV cache
+was snapshotted. Evicting their original text changes the rendered prefix. Keep
+a small RAM LRU and spill older entries to a private, model-local SQLite store;
+only unloading the model releases that history, along with its KV caches.
+"""
 import json
+import sqlite3
+import tempfile
 from collections import OrderedDict
 from threading import RLock
 
@@ -11,6 +19,51 @@ class ToolHistory:
         self.max_bytes = max_bytes
         self.bytes = 0
         self.lock = RLock()
+        self._spill_dir = None
+        self._spill = None
+
+    @staticmethod
+    def _serialized(value):
+        return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+
+    def _spill_entry(self, key, saved):
+        if self._spill is None:
+            self._spill_dir = tempfile.TemporaryDirectory(prefix='fastllm-tool-history-')
+            self._spill = sqlite3.connect(self._spill_dir.name + '/history.sqlite',
+                                          check_same_thread=False)
+            # This store only lives as long as the in-process model/KV cache.
+            # It need not survive a crash or fsync every generated tool reply.
+            self._spill.execute('PRAGMA journal_mode=MEMORY')
+            self._spill.execute('PRAGMA synchronous=OFF')
+            self._spill.execute('CREATE TABLE history (key TEXT PRIMARY KEY, saved TEXT NOT NULL)')
+        self._spill.execute('INSERT OR REPLACE INTO history VALUES (?, ?)',
+                            (self._serialized(key), self._serialized(saved)))
+        self._spill.commit()
+
+    def _trim(self):
+        while self.entries and (len(self.entries) > self.max_entries or self.bytes > self.max_bytes):
+            key, saved = next(iter(self.entries.items()))
+            # Persist successfully before dropping the only exact copy.
+            self._spill_entry(key, saved)
+            self.entries.pop(key)
+            self.bytes -= saved[2]
+
+    def close(self):
+        with self.lock:
+            if self._spill is not None:
+                self._spill.close()
+                self._spill = None
+            if self._spill_dir is not None:
+                self._spill_dir.cleanup()
+                self._spill_dir = None
+            self.entries.clear()
+            self.bytes = 0
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @staticmethod
     def signature(message):
@@ -48,16 +101,18 @@ class ToolHistory:
         reasoning = message.get('reasoning_content') or ''
         size = (len(raw.encode('utf-8')) + len(repr(signature).encode('utf-8'))
                 + len(reasoning.encode('utf-8')))
-        if size > self.max_bytes or self.max_entries <= 0:
-            return
         with self.lock:
             old = self.entries.pop(key, None)
             if old:
                 self.bytes -= old[2]
             self.entries[key] = (value, raw, size, thinking, reasoning)
             self.bytes += size
-            while len(self.entries) > self.max_entries or self.bytes > self.max_bytes:
-                self.bytes -= self.entries.popitem(last=False)[1][2]
+            # A reused call ID must not expose an older spilled version after
+            # the new in-memory value is evicted.
+            if self._spill is not None:
+                self._spill.execute('DELETE FROM history WHERE key = ?', (self._serialized(key),))
+                self._spill.commit()
+            self._trim()
 
     def restore(self, message, thinking=False):
         signature = self.signature(message)
@@ -66,12 +121,18 @@ class ToolHistory:
         key, value = signature
         with self.lock:
             saved = self.entries.get(key)
-            if saved is None or saved[0] != value or saved[3] != thinking:
+            if saved is None and self._spill is not None:
+                row = self._spill.execute('SELECT saved FROM history WHERE key = ?',
+                                          (self._serialized(key),)).fetchone()
+                if row is not None:
+                    saved = json.loads(row[0])
+            if saved is None or self._serialized(saved[0]) != self._serialized(value) or saved[3] != thinking:
                 return None
             # Responses clients may omit reasoning entirely. Restore only the
             # server's own output, and reject explicitly changed reasoning.
             reasoning = message.get('reasoning_content')
             if reasoning and (not thinking or reasoning != saved[4]):
                 return None
-            self.entries.move_to_end(key)
+            if key in self.entries:
+                self.entries.move_to_end(key)
             return saved[1]
