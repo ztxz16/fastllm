@@ -151,6 +151,20 @@ def _discover_nvidia_lib_dirs() -> List[str]:
     # De-duplicate while preserving order
     return list(dict.fromkeys(dirs))
 
+def _find_pip_nccl() -> Optional[str]:
+    """libnccl.so.2 shipped by a pip nvidia-nccl-* wheel, if installed."""
+    try:
+        spec = importlib.util.find_spec("nvidia.nccl")
+    except Exception:
+        return None
+    if spec is None or spec.submodule_search_locations is None:
+        return None
+    for root in spec.submodule_search_locations:
+        candidate = os.path.join(root, "lib", "libnccl.so.2")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
 def _preload_cuda_runtime_dependencies() -> Dict[str, Any]:
     # Try system runtime first. If a machine only has pip nvidia-* packages,
     # the fallback search below will preload those shared libraries.
@@ -167,6 +181,21 @@ def _preload_cuda_runtime_dependencies() -> Dict[str, Any]:
         "libnccl.so.2",
     ]
     unresolved = set(base_names)
+    # NCCL: prefer the pip wheel (nvidia-nccl-*) when present. That is the copy
+    # torch links against; all libnccl.so.2 share one SONAME, so whichever is
+    # loaded first with RTLD_GLOBAL wins for the whole process. Preloading an
+    # older system NCCL first makes a later `import torch` fail with
+    # "undefined symbol: ncclCommWindowDeregister" (transformers imports torch
+    # to load tokenizers), and the HF tokenizer silently falls back.
+    pip_nccl = _find_pip_nccl()
+    if pip_nccl is not None:
+        try:
+            _load_library(pip_nccl)
+            diagnostics["loaded"].append(pip_nccl)
+            unresolved.discard("libnccl.so.2")
+        except Exception as e:
+            diagnostics["failed"].append(f"{pip_nccl}: {e}")
+            pip_nccl = None
     for libname in [
         "libcuda.so.1",
         "libcudart.so.12", "libcudart.so",
@@ -174,6 +203,8 @@ def _preload_cuda_runtime_dependencies() -> Dict[str, Any]:
         "libcublas.so.12", "libcublas.so",
         "libnccl.so.2", "libnccl.so",
     ]:
+        if pip_nccl is not None and libname.startswith("libnccl.so"):
+            continue
         try:
             _load_library(libname)
             diagnostics["loaded"].append(libname)
@@ -1355,10 +1386,14 @@ def try_load_hf_tokenizer(path):
                 os.environ.pop("USE_TORCH", None)
             else:
                 os.environ["USE_TORCH"] = original_use_torch
-    except:
+    except Exception as error:
         ret = _load_fast_tokenizer_from_tokenizer_json(path) if _is_step3p5_model_dir(path) else None
         if ret is None:
             print("Load AutoTokenizer failed. (you can try install transformers)")
+            print(f"  reason: {type(error).__name__}: {error}")
+            print("  WARNING: falling back to the FastLLM native tokenizer. For checkpoints that ship "
+                  "tokenizer.json (e.g. DeepSeek-V4/V4.1) it can split text differently from the "
+                  "official tokenizer, which silently degrades output quality.")
             print("Try load fastllm tokenizer.")
         else:
             return ret
