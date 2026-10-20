@@ -98,8 +98,8 @@ static int CheckMixNorm() {
 static int CheckHcDecodeDots() {
     int cases = 0;
     for (auto type : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32})
-    for (int dim : {63, 4095, 4096, 4098, 5120, 6144, 8192, 8193})
-    for (int batch : {1, 2, 8, 15}) {
+    for (int dim : {63, 4095, 4096, 4098, 5120, 6144, 8190, 8192, 8193})
+    for (int batch : {1, 2, 3, 4, 8, 9, 15}) {
         Data input, repeated, fn, scale, base, pre[2], post[2], comb[2];
         Fill(input, {1, batch, 4, dim}, type, batch + dim, dim == 63 ? 0.0f : 0.8f);
         Fill(fn, {24, 4 * dim}, DataType::FLOAT32, 3, 0.07f);

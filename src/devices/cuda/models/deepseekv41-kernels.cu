@@ -815,8 +815,8 @@ namespace {
     // Small decode/verify batches need parallelism across dot products as
     // well as tokens: the four-token kernel otherwise uses only one SM.
     // Retain each output's 256-thread strided accumulation and reduction order.
-    template <typename T, bool PREFETCH = false>
-    __global__ void V41HcDecodeDots(const T *x, const float *fn, int flatDim, float *mix) {
+    template <typename T, int TILE = 0>
+    __device__ __forceinline__ void V41HcDecodeDotsBody(const T *x, const float *fn, int flatDim, float *mix) {
         const int m = blockIdx.x;
         x += (uint64_t)blockIdx.y * flatDim;
         mix += (uint64_t)blockIdx.y * 25;
@@ -826,22 +826,18 @@ namespace {
         // Every launch uses exactly 256 threads. Expose that index range to
         // NVCC without changing any lane's FMA or reduction order.
         k &= kHcThreads - 1;
-        if constexpr (PREFETCH && std::is_same<T, __nv_bfloat16>::value) {
-            // Hide dependent-load latency without splitting the FP32 sum.
-            // Each lane still visits exactly the same elements in order;
-            // partial tiles use the original loop (no zero-padding FMAs).
-            if (flatDim >= 16384 && flatDim <= 32768) {
-                constexpr int TILE = 16;
-                for (; k + (TILE - 1) * kHcThreads < flatDim; k += TILE * kHcThreads) {
-                    float values[TILE], weights[TILE];
+        if constexpr (TILE > 0) {
+            // The SM90 BF16 launcher checks shape eligibility. Preserve each
+            // lane's FMA order; partial tiles use the original loop below.
+            for (; k + (TILE - 1) * kHcThreads < flatDim; k += TILE * kHcThreads) {
+                float values[TILE], weights[TILE];
 #pragma unroll
-                    for (int i = 0; i < TILE; ++i) {
-                        values[i] = V41Load(x, k + i * kHcThreads);
-                        weights[i] = m == 24 ? values[i] : fn[(uint64_t)m * flatDim + k + i * kHcThreads];
-                    }
-#pragma unroll
-                    for (int i = 0; i < TILE; ++i) acc += values[i] * weights[i];
+                for (int i = 0; i < TILE; ++i) {
+                    values[i] = V41Load(x, k + i * kHcThreads);
+                    weights[i] = m == 24 ? values[i] : fn[(uint64_t)m * flatDim + k + i * kHcThreads];
                 }
+#pragma unroll
+                for (int i = 0; i < TILE; ++i) acc += values[i] * weights[i];
             }
         }
 #endif
@@ -858,6 +854,19 @@ namespace {
             for (int w = 0; w < kHcThreads / 32; ++w) total += partial[w];
             mix[m] = total;
         }
+    }
+
+    template <typename T>
+    __global__ void V41HcDecodeDots(const T *x, const float *fn, int flatDim, float *mix) {
+        V41HcDecodeDotsBody(x, fn, flatDim, mix);
+    }
+
+    // Small SM90 grids benefit from registers for independent loads. Larger
+    // batches use a smaller tile to leave room for more resident CTAs.
+    template <int TILE>
+    __global__ __launch_bounds__(kHcThreads, 1)
+    void V41HcDecodeDotsSm90(const __nv_bfloat16 *x, const float *fn, int flatDim, float *mix) {
+        V41HcDecodeDotsBody<__nv_bfloat16, TILE>(x, fn, flatDim, mix);
     }
 
     // Reuse each FP32 coefficient across four tokens while parallelizing
@@ -3191,6 +3200,19 @@ namespace {
 
     bool V41IsSm75() { return V41IsSm<7, 5>(); }
 
+    void V41LaunchHcDecodeDots(const __nv_bfloat16 *x, const float *fn,
+                              int tokens, int flatDim, float *mix) {
+        const dim3 grid(25, tokens);
+        if (tokens <= 8 && flatDim >= 16384 && flatDim <= 32768 && V41IsSm<9, 0>()) {
+            if (tokens <= 3)
+                V41HcDecodeDotsSm90<64><<<grid, kHcThreads>>>(x, fn, flatDim, mix);
+            else
+                V41HcDecodeDotsSm90<16><<<grid, kHcThreads>>>(x, fn, flatDim, mix);
+        } else {
+            V41HcDecodeDots<<<grid, kHcThreads>>>(x, fn, flatDim, mix);
+        }
+    }
+
     bool V41EnvOn(const char *name) {
         const char *v = getenv(name);
         return v != nullptr && v[0] != '\0' && v[0] != '0';
@@ -3578,7 +3600,7 @@ extern "C" bool FastllmCudaV41RouterScores(const Data &input, Data &weight,
     return V41CheckLaunch("RouterScores");
 }
 
-// Small BF16 decode batches: dot products remain the portable FP32 path;
+// Small BF16 decode batches retain the original FP32 dot accumulation;
 // finish and normalization use independent CTAs in one launch, preserving arithmetic.
 extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &previousPre, Data &fn,
         Data &scale, Data &base, Data &normWeight, int sinkhornIters, float mixEps,
@@ -3604,12 +3626,8 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &pr
         !V41PrepareOutput(output, DataType::BFLOAT16, {b, n, d})) return false;
     if (quantizedOutput != nullptr &&
         !V41PrepareOutput(*quantizedOutput, DataType::BFLOAT16, {b, n, d})) return false;
-    if (tokens == 1 && V41IsSm<9, 0>())
-        V41HcDecodeDots<__nv_bfloat16, true><<<dim3(25, tokens), kHcThreads>>>(
-            (const __nv_bfloat16 *)x.cudaData, (const float *)fn.cudaData, 4 * d, (float *)scratch.cudaData);
-    else
-        V41HcDecodeDots<<<dim3(25, tokens), kHcThreads>>>((const __nv_bfloat16 *)x.cudaData,
-            (const float *)fn.cudaData, 4 * d, (float *)scratch.cudaData);
+    V41LaunchHcDecodeDots((const __nv_bfloat16 *)x.cudaData, (const float *)fn.cudaData,
+                         tokens, 4 * d, (float *)scratch.cudaData);
 #define V41_MIX_NORM(I, Q) V41HcPreNormKernel<1024, I, true, Q><<<tokens * 2, 1024>>>( \
         (const __nv_bfloat16 *)x.cudaData, (const float *)previousPre.cudaData, \
         (const float *)normWeight.cudaData, (__nv_bfloat16 *)output.cudaData, 4, d, normEps, \
@@ -3673,11 +3691,9 @@ extern "C" bool FastllmCudaDeepSeekV41HcMix(const fastllm::Data &x, fastllm::Dat
             else
                 V41HcBatchDots<<<dim3(25, (tokens + 3) / 4), kHcThreads>>>((const float *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, tokens, mix);
         } else {
-            if (x.dataType == DataType::BFLOAT16 && tokens == 1 && dim >= 4096 && dim <= 8192 && V41IsSm<9, 0>())
-                V41HcDecodeDots<__nv_bfloat16, true><<<dim3(25, tokens), kHcThreads>>>(
-                    (const __nv_bfloat16 *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
-            else if (x.dataType == DataType::BFLOAT16)
-                V41HcDecodeDots<<<dim3(25, tokens), kHcThreads>>>((const __nv_bfloat16 *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
+            if (x.dataType == DataType::BFLOAT16)
+                V41LaunchHcDecodeDots((const __nv_bfloat16 *)x.cudaData,
+                                     (const float *)hcFn.cudaData, tokens, hcMult * dim, mix);
             else if (x.dataType == DataType::FLOAT16)
                 V41HcDecodeDots<<<dim3(25, tokens), kHcThreads>>>((const half *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
             else
