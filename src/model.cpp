@@ -895,9 +895,14 @@ namespace fastllm {
             deviceIds = {deviceIds[0]};
         }
         if (data.dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
-            data.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
+            data.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
+            (selectedCuda && this->model_type == "deepseek_v41" &&
+             data.dataType == DataType::NVFP4 &&
+             weightName.find(".experts.") != std::string::npos)) {
             // Marlin replaces this source allocation with its consolidated
             // layout during warmup, so it must be independently releasable.
+            // This also applies to each local stage of V4.1 CUDA PP; keeping
+            // compact MXFP4 in a weight slab would retain both layouts.
             data.directMemory = true;
         }
         data.ToDevice(DataDevice::CUDA, deviceIds);

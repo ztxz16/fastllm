@@ -10269,6 +10269,44 @@ namespace fastllm {
         return ok;
     }
 
+#ifndef USE_ROCM
+    static bool TryCudaMergeMOEV41Mxfp4Marlin(
+            const Data &input, Data &output, const Data &index, const Data &score,
+            Data &activation, Data **weights, int weightsBatch,
+            float sharedScale, float swigluLimit) {
+        if (input.dataType != DataType::BFLOAT16 ||
+            input.dataDevice != DataDevice::CUDA || input.dims.size() != 2 ||
+            input.dims[0] <= 0 ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
+            index.dims.size() != 2 || index.dims[0] != input.dims[0] ||
+            score.dims != index.dims || index.dims[1] <= 0 || index.dims[1] > 16 ||
+            index.cudaData == nullptr || score.cudaData == nullptr ||
+            weights == nullptr || weightsBatch < 4 || (weightsBatch & 1) ||
+            weights[2] == nullptr || weights[2]->dataType != DataType::NVFP4 ||
+            !weights[2]->isModelWeight || !weights[2]->directMemory ||
+            (weights[0] != nullptr && sharedScale != 0.0f)) {
+            return false;
+        }
+        // A PP stage owns every expert in this layer. The existing EP kernel
+        // supports exactly this topology with one owner, without collectives.
+        // deepSeekV41=true preserves W4A8 rounding, clamping, pre-down routing
+        // weights and the FP32 expert sum.
+        const bool ok = FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
+            input, activation, output, weights, weightsBatch,
+            (const int32_t *)index.cudaData, (const float *)score.cudaData,
+            index.dims[1], 0, 1, true, swigluLimit);
+        if (!ok && weights[2]->cudaData == nullptr) {
+            // Repacking transfers ownership to the Marlin cache. Never run
+            // a source-layout fallback after that transfer.
+            FastllmCudaSetThreadError();
+            throw std::runtime_error(
+                "V4.1 MXFP4 Marlin failed after releasing compact expert weights.");
+        }
+        return ok;
+    }
+#endif
+
     // Architecture-independent V4.1 fallback. Only route metadata is staged
     // on the host; the original weights and all arithmetic stay on CUDA.
     // This eager path deliberately does not claim CUDA Graph compatibility.
@@ -10379,6 +10417,8 @@ namespace fastllm {
         if (deepSeekV41) {
             AssertInFastLLM(gateType == MoeGateSwiglu, "V4.1 MoE requires SwiGLU.");
 #ifndef USE_ROCM
+            if (TryCudaMergeMOEV41Mxfp4Marlin(input, output, index, score, w1,
+                    weights, weightsBatch, sharedScale, swigluLimit)) return;
             // Unsupported formats/batches retain the reference fallback.
             if (FastllmCudaMergeMOEV41GGUFResident(input, w1, w2, w3, output,
                     weights, weightsBatch, index, score, sharedScale, swigluLimit)) return;
