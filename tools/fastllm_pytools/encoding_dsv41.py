@@ -1,6 +1,7 @@
 """
 DeepSeek-V4.1 Encoding (vendored from the official ``encoding/encoding.py`` of
-deepseek-ai/DeepSeek-V4.1-Flash, unmodified apart from this note).
+deepseek-ai/DeepSeek-V4.1-Flash-1017; ftllm only adds the ``tool_history``
+pass-through used by server-side tool-call history reuse).
 
 DeepSeek-V4.1 仍未提供 Jinja chat_template，官方以 encoding.py 作为唯一的
 prompt 编码方式。本文件由 ftllm 在检测到 deepseek_v41 架构时自动调用。
@@ -90,33 +91,75 @@ def to_json(value: Any) -> str:
 
 
 def tools_from_openai_format(tools):
-    """Extract function definitions from OpenAI-format tool list."""
-    return [tool["function"] for tool in tools]
+    """Extract function definitions with namespace-qualified names."""
+    functions = []
+    for tool in tools:
+        function = dict(tool["function"])
+        if tool.get("namespace") is not None:
+            function["namespace"] = tool["namespace"]
+        function["name"] = _tool_name_for_encoding(function)
+        namespace = function.pop("namespace", None)
+        if isinstance(namespace, dict) and namespace.get("description"):
+            function["description"] = (
+                namespace["description"] + "\n" + (function.get("description") or "")
+            )
+        functions.append(function)
+    return functions
+
+
+def _split_tool_name(name: str, namespace: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """Split a qualified name and validate any explicit namespace."""
+    prefix, separator, bare_name = name.partition("::")
+    if separator:
+        assert namespace in (None, prefix), (
+            f"Conflicting tool namespaces: {namespace} != {prefix}"
+        )
+        namespace, name = prefix, bare_name
+    assert "::" not in name, f"Tool name must not contain '::': {name}"
+    assert namespace is None or "::" not in namespace, (
+        f"Tool namespace must not contain '::': {namespace}"
+    )
+    return namespace, name
+
+
+def _tool_name_for_encoding(tool: Dict[str, Any]) -> str:
+    namespace = tool.get("namespace")
+    if isinstance(namespace, dict):
+        namespace = namespace["name"]
+    namespace, name = _split_tool_name(tool["name"], namespace)
+    return name if namespace is None else f"{namespace}::{name}"
 
 
 def tool_calls_from_openai_format(tool_calls):
     """Convert OpenAI-format tool calls to internal format."""
-    return [
-        {
-            "name": tool_call["function"]["name"],
-            "arguments": tool_call["function"]["arguments"],
-        }
-        for tool_call in tool_calls
-    ]
+    calls = []
+    for tool_call in tool_calls:
+        function = tool_call["function"]
+        namespace, name = _split_tool_name(
+            function["name"], tool_call.get("namespace") or function.get("namespace")
+        )
+        call = {"name": name, "arguments": function["arguments"]}
+        if namespace is not None:
+            call["namespace"] = namespace
+        calls.append(call)
+    return calls
 
 
 def tool_calls_to_openai_format(tool_calls):
     """Convert internal tool calls to OpenAI format."""
-    return [
-        {
+    calls = []
+    for tool_call in tool_calls:
+        call = {
             "type": "function",
             "function": {
                 "name": tool_call["name"],
                 "arguments": tool_call["arguments"],
             }
         }
-        for tool_call in tool_calls
-    ]
+        if tool_call.get("namespace") is not None:
+            call["namespace"] = tool_call["namespace"]
+        calls.append(call)
+    return calls
 
 
 def decode_dsml_to_arguments(tool_name: str, tool_args: Dict[str, Tuple[str, str]]) -> Dict[str, str]:
@@ -128,7 +171,7 @@ def decode_dsml_to_arguments(tool_name: str, tool_args: Dict[str, Tuple[str, str
         tool_args: Dict mapping param_name -> (value, is_string_flag).
 
     Returns:
-        Dict with "name" and "arguments" (JSON string) keys.
+        Dict with "name", "arguments" (JSON string), and optional "namespace".
     """
     def _decode_value(key: str, value: str, string: str):
         if string == "true":
@@ -136,7 +179,11 @@ def decode_dsml_to_arguments(tool_name: str, tool_args: Dict[str, Tuple[str, str
         return f"{to_json(key)}: {value}"
 
     tool_args_json = "{" + ", ".join([_decode_value(k, v, string=is_str) for k, (v, is_str) in tool_args.items()]) + "}"
-    return dict(name=tool_name, arguments=tool_args_json)
+    namespace, name = _split_tool_name(tool_name)
+    tool_call = dict(name=name, arguments=tool_args_json)
+    if namespace is not None:
+        tool_call["namespace"] = namespace
+    return tool_call
 
 
 # ============================================================
@@ -158,10 +205,13 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         if role == "tool":
             # Convert tool message to a user message with tool_result block
+            content = msg.get("content", "")
+            if msg.get("content_blocks") and not isinstance(msg.get("content"), str):
+                content = msg["content_blocks"]
             tool_block = {
                 "type": "tool_result",
                 "tool_use_id": msg.get("tool_call_id", ""),
-                "content": msg.get("content", ""),
+                "content": content,
             }
             # Merge into previous message if it's already a user (merged tool)
             if merged and merged[-1].get("role") == "user" and "content_blocks" in merged[-1]:
@@ -174,7 +224,8 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif role == "user":
             content_blocks = msg.get("content_blocks")
             if content_blocks is None:
-                content_blocks = [{"type": "text", "text": msg.get("content", "")}]
+                content = msg.get("content", "")
+                content_blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
             if merged and merged[-1].get("role") == "user" and "content_blocks" in merged[-1] and merged[-1].get("task") is None:
                 merged[-1]["content_blocks"].extend(content_blocks)
             else:
@@ -523,11 +574,18 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
 
     V4.1 supports mid-conversation system messages, which count as user
     messages for the purposes of the assistant generation header.
+    User messages containing only tool results do not start a new turn.
     """
     last_user_index = -1
     for idx in range(len(messages) - 1, -1, -1):
         role = messages[idx].get("role")
         if role == "user" or (role == "system" and idx > 0):
+            content_blocks = messages[idx].get("content_blocks")
+            if content_blocks and not any(
+                block.get("type") in ("text", "image", "image_url")
+                for block in content_blocks
+            ):
+                continue
             last_user_index = idx
             break
     return last_user_index
@@ -623,7 +681,7 @@ def render_message(
                 tool_call_template.format(
                     dsml_token=dsml_token,
                     tool_call_tag_name=tool_call_tag_name,
-                    name=tc.get("name"),
+                    name=_tool_name_for_encoding(tc),
                     arguments=encode_arguments_to_dsml(tc)
                 )
                 for tc in tool_calls
@@ -738,13 +796,6 @@ def _encode_messages_text(
     """Encode preprocessed (text-only) messages into the V4.1 prompt format."""
     context = context if context else []
 
-    # Preprocess: merge tool messages and sort tool results
-    messages = merge_tool_messages(messages)
-    messages = sort_tool_results_by_call_order(context + messages)[len(context):]
-    if context:
-        context = merge_tool_messages(context)
-        context = sort_tool_results_by_call_order(context)
-
     full_messages = context + messages
 
     prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
@@ -790,7 +841,14 @@ def encode_messages(
     Text-only calls return the prompt string. When return_multi_modal_data is
     true, the result is ``(prompt, media_data)``.
     """
-    context = context or []
+    # Validate before merging can discard message-level textual fields.
+    for msg in (context or []) + messages:
+        _validate_no_image_sp_tokens(msg)
+
+    # Collect images only after tool results are in their final prompt order.
+    context = merge_tool_messages(context or [])
+    messages = merge_tool_messages(messages)
+    messages = sort_tool_results_by_call_order(context + messages)[len(context):]
     processed_context, _ = process_image_messages(context) if context else ([], [])
     processed_messages, images = process_image_messages(messages)
     prompt = _encode_messages_text(
