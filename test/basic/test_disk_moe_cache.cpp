@@ -19,13 +19,14 @@ void Require(bool ok, const char *message) {
     if (!ok) throw std::runtime_error(message);
 }
 struct CpuReference : CpuMergeMOE { using CpuMergeMOE::Run; };
+template<int Hidden = 256, int Middle = 128, int Experts = 12>
 struct Fixture {
-    static constexpr int hidden = 256, middle = 128, experts = 12;
+    static constexpr int hidden = Hidden, middle = Middle, experts = Experts;
     std::vector<std::unique_ptr<Data>> storage;
     std::vector<Data*> memory, disk, biases;
     std::string path;
     uint64_t expertBytes = 0;
-    Fixture(bool shared) : memory((experts + 1) * 2), disk(memory.size()), biases(memory.size()) {
+    Fixture(bool shared, bool split = false) : memory((experts + 1) * 2), disk(memory.size()), biases(memory.size()) {
         char name[] = "/tmp/fastllm-disk-moe-XXXXXX";
         int fd = mkstemp(name);
         Require(fd >= 0, "fixture file");
@@ -46,8 +47,27 @@ struct Fixture {
                 DiskWeightPart source;
                 source.fileName = path; source.fileOffset = ftell(file);
                 source.bytes = w->GetBytes(); source.sourceDataType = DataType::NVFP4; source.dims = w->dims;
-                lazy->diskWeightParts.push_back(source);
-                Require(fwrite(w->cpuData, 1, w->GetBytes(), file) == w->GetBytes(), "fixture write");
+                if (split) {
+                    // Non-sector-aligned, separately stored payload and scales;
+                    // the final scale part ends at EOF without sector padding.
+                    for (int piece = 0; piece < 4; ++piece) {
+                        for (int i = 0; i < 37 + piece * 19; ++i) fputc(0, file);
+                        const bool scale = piece >= 2;
+                        const size_t bytes = (scale ? w->GetBytes() - payload : payload) / 2;
+                        const size_t offset = (scale ? payload : 0) + (piece % 2) * bytes;
+                        source.fileOffset = ftell(file);
+                        source.bytes = bytes;
+                        source.dims = {w->dims[0] / 2, w->dims[1]};
+                        source.isScalePart = scale;
+                        source.scaleOffset = (piece % 2) * bytes;
+                        source.sourceDataType = scale ? INT8 : NVFP4;
+                        lazy->diskWeightParts.push_back(source);
+                        Require(fwrite(w->cpuData + offset, 1, bytes, file) == bytes, "split fixture write");
+                    }
+                } else {
+                    lazy->diskWeightParts.push_back(source);
+                    Require(fwrite(w->cpuData, 1, w->GetBytes(), file) == w->GetBytes(), "fixture write");
+                }
                 if (e == 1) expertBytes += w->GetBytes();
                 memory[e * 2 + part] = w.get(); disk[e * 2 + part] = lazy.get();
                 storage.push_back(std::move(w)); storage.push_back(std::move(lazy));
@@ -143,6 +163,19 @@ int main(int argc, char **argv) {
 #endif
         setenv("FT_GPU_PREFILL", argc > 2 ? "1" : "0", 1);
         SetThreads(8);
+        {
+            Fixture<2048, 1024, 3> split(false, true);
+            SetMoeCudaCacheBytes(0);
+            SetMoeCpuCacheBytes(split.expertBytes * 3 + (128ULL << 10));
+            auto before = GetDiskMoeCacheStats();
+            auto added = PreloadDiskMoeCache({split.disk});
+            Require(added > 0 && added <= GetMoeCpuCacheBytes(), "split preload budget");
+            Compare(split.Run(true, 1, 0), split.Run(false, 1, 0), true);
+            Require(GetDiskMoeCacheStats().diskBytes - before.diskBytes == split.expertBytes * 3,
+                    "split preload or route read accounting");
+            SetMoeCpuCacheBytes(1);
+            Compare(split.Run(true, 1, 1), split.Run(false, 1, 1), true);
+        }
         for (bool shared : {false, true}) {
             Fixture f(shared);
             if (!shared) {
@@ -240,7 +273,7 @@ int main(int argc, char **argv) {
                     SetMoeCudaCacheBytes(1);
                     SetMoeCpuCacheBytes(0);
                     auto cold = f.Run(true, batch, 0, device);
-                    SetMoeCpuCacheBytes(f.expertBytes * (Fixture::experts + 1));
+                    SetMoeCpuCacheBytes(f.expertBytes * (f.experts + 1));
                     f.Run(true, batch, 0, device);
                     auto ramBefore = GetDiskMoeCacheStats();
                     auto cached = f.Run(true, batch, 0, device);
@@ -258,7 +291,7 @@ int main(int argc, char **argv) {
                     SetMoeCudaCacheBytes(1);
                     SetMoeCpuCacheBytes(0);
                     auto cold = f.Run(true, 520, 1, device, false, 15, quantShared);
-                    SetMoeCpuCacheBytes(f.expertBytes * (Fixture::experts + 1));
+                    SetMoeCpuCacheBytes(f.expertBytes * (f.experts + 1));
                     f.Run(true, 520, 1, device, false, 15, quantShared);
                     Compare(f.Run(true, 520, 1, device, false, 15, quantShared), cold, true);
                     Compare(cold, f.Run(false, 520, 1, -1, false, 15, quantShared), false);

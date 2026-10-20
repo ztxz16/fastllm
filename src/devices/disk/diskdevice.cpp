@@ -144,6 +144,12 @@ namespace fastllm {
 
     static thread_local bool diskExpertRead = false;
 
+    struct DiskExpertReadScope {
+        bool previous = diskExpertRead;
+        DiskExpertReadScope() { diskExpertRead = true; }
+        ~DiskExpertReadScope() { diskExpertRead = previous; }
+    };
+
     static bool DiskDirectIoEnabled() {
 #ifndef O_DIRECT
         return false;
@@ -635,6 +641,53 @@ namespace fastllm {
         if (preservePrefix && prefix) memcpy(dst - prefix, saved.data(), prefix);
     }
 
+    struct DiskNativeReadPlan {
+        struct Range { const DiskWeightPart *part; uint64_t offset; };
+        std::vector<Range> ranges;
+        size_t prefix = 0, bytes = 0;
+
+        explicit DiskNativeReadPlan(const Data &weight) {
+            if (weight.dataType != NVFP4 || !weight.scales.empty() ||
+                weight.dims.size() != 2 || weight.blockK <= 0 || weight.blockM <= 0 ||
+                weight.GetBytes() < (1ULL << 20) || !DiskDirectIoEnabled()) return;
+            const uint64_t payload = GetNVFP4WeightBytes(weight.dims[0], weight.dims[1]);
+            uint64_t offset = 0;
+            for (const auto &part : weight.diskWeightParts) {
+                if (part.fileOffset < 0 || !part.bytes) { ranges.clear(); return; }
+                if (part.bytes > weight.GetBytes() ||
+                    (part.isScalePart ? part.scaleOffset > weight.GetBytes() - payload :
+                                       offset > weight.GetBytes() - part.bytes)) {
+                    ranges.clear(); return;
+                }
+                ranges.push_back({&part, part.isScalePart ? payload + part.scaleOffset : offset});
+                if (!part.isScalePart) offset += part.bytes;
+            }
+            if (offset != payload && !(ranges.size() == 1 && offset == weight.GetBytes())) {
+                ranges.clear(); return;
+            }
+            std::sort(ranges.begin(), ranges.end(), [](const auto &a, const auto &b) {
+                return a.offset < b.offset;
+            });
+            uint64_t end = 0;
+            for (const auto &range : ranges) {
+                // Only a byte-for-byte, complete canonical record can bypass
+                // the generic dtype conversion and split-part reader.
+                if (range.offset != end || range.part->bytes > weight.GetBytes() - end ||
+                    (!range.part->isScalePart && range.part->sourceDataType != NVFP4)) {
+                    ranges.clear(); return;
+                }
+                end += range.part->bytes;
+            }
+            if (end != weight.GetBytes()) { ranges.clear(); return; }
+            constexpr size_t alignment = 4096;
+            prefix = uint64_t(ranges.front().part->fileOffset) % alignment;
+            if (end > std::numeric_limits<size_t>::max() - 4 * alignment) {
+                ranges.clear(); return;
+            }
+            bytes = (end + prefix + alignment - 1) / alignment * alignment + 2 * alignment - 1;
+        }
+    };
+
     static Data *LoadDiskWeight(const Data *weight, DiskWeightStorage *storage = nullptr) {
         AssertInFastLLM(weight != nullptr && weight->isDiskWeight,
                         "LoadDiskWeight expects a lazy disk weight.\n");
@@ -714,6 +767,26 @@ namespace fastllm {
         }
 
         std::unique_ptr<Data> guard(loaded);
+        const DiskNativeReadPlan direct(*weight);
+        if (storage && direct.bytes) {
+            auto allocation = GetDiskWeightBufferPool().Acquire(direct.bytes);
+            if (!allocation) allocation.reset(new uint8_t[direct.bytes]);
+            loaded->expansionSize = loaded->Count(0);
+            loaded->expansionBytes = loaded->GetBytes();
+            const auto aligned = ((uintptr_t)allocation.get() + 4095) / 4096 * 4096;
+            loaded->cpuData = (uint8_t *)aligned + direct.prefix;
+            try {
+                for (const auto &range : direct.ranges)
+                    ReadDiskPartToAlignedStorage(*range.part, loaded->cpuData + range.offset, range.offset != 0);
+            } catch (...) {
+                loaded->cpuData = nullptr;
+                throw;
+            }
+            storage->paddingBytes = direct.bytes - loaded->GetBytes();
+            storage->allocatedBytes = direct.bytes;
+            storage->allocation = std::move(allocation);
+            return guard.release();
+        }
         const bool pooled = storage && weight->dataType == DataType::NVFP4 &&
             weight->dims.size() == 2 && weight->blockK > 0 && weight->blockM > 0 &&
             weight->scales.empty() && loaded->GetBytes() <= (16ULL << 20);
@@ -1948,11 +2021,7 @@ namespace fastllm {
 
     static std::unique_ptr<DiskCachedExpert> ReadDiskExpert(const Data *gate, const Data *down, bool repackCpu) {
         AssertInFastLLM(gate != nullptr && down != nullptr, "Disk expert weights are missing.\n");
-        struct ReadScope {
-            bool previous = diskExpertRead;
-            ReadScope() { diskExpertRead = true; }
-            ~ReadScope() { diskExpertRead = previous; }
-        } scope;
+        DiskExpertReadScope scope;
         DiskExpertReadBatch reads(*gate, *down);
         std::unique_ptr<DiskCachedExpert> expert(new DiskCachedExpert);
         expert->gate.reset(LoadDiskWeight(gate, &expert->gateStorage));
@@ -2233,7 +2302,14 @@ namespace fastllm {
                 if (found != cache.entries.end() && (found->second.cpu ||
                     std::any_of(found->second.cuda.begin(), found->second.cuda.end(),
                         [](const auto &item) { return bool(item.second); }))) continue;
-                const uint64_t bytes = gate->GetBytes() + down->GetBytes();
+                uint64_t bytes = 0;
+                for (const Data *w : {gate, down}) {
+                    // Preload must reserve alignment padding before queuing a
+                    // read, using the same direct-I/O policy as ReadDiskExpert.
+                    DiskExpertReadScope scope;
+                    const DiskNativeReadPlan direct(*w);
+                    bytes += direct.bytes ? direct.bytes : w->GetBytes();
+                }
                 if (!bytes || bytes > remaining) continue;
                 remaining -= bytes;
                 selected.emplace_back(gate, down);
