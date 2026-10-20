@@ -473,6 +473,36 @@ static void NativeMxfp4Moe() {
         }
         Check(actual == expected,
               "V4.1 native MXFP4 changed activation quantization, clipping or pre-down router weighting");
+        // Reuse the producer's quantized tensor, including non-unit/zero route
+        // scores. Incompatible optional metadata must fall back to input.
+        Data quantized;
+        quantized.CopyFrom(input);
+        Check(FastllmCudaDeepSeekV41QuantizeActivation(input, quantized),
+              "native MoE input quantization failed");
+        auto checkReuse = [&]() {
+            Check(FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
+                input, scratch, output, weights.data(), weights.size(),
+                (const int32_t *)index.cudaData, (const float *)score.cudaData,
+                1, 0, 1, true, 10.0f, &quantized), "native MoE optional quantization rejected input");
+            Check(Read(output) == expected, "native MoE quantization reuse/fallback changed output");
+        };
+        checkReuse();
+        // An invalid optional tensor contains zeros, so accidentally consuming
+        // it cannot pass merely because it happened to hold the right values.
+        FastllmCudaMemset0(quantized.cudaData, quantized.GetBytes());
+        quantized.Reshape({1, rows, dim});
+        checkReuse();
+        quantized.Reshape(input.dims);
+        quantized.dataType = DataType::FLOAT32;
+        checkReuse();
+        quantized.dataType = input.dataType;
+        quantized.dataDeviceIds = {1};
+        checkReuse();
+        quantized.dataDeviceIds = input.dataDeviceIds;
+        void *payload = quantized.cudaData;
+        quantized.cudaData = nullptr;
+        checkReuse();
+        quantized.cudaData = payload;
     }
 }
 static void NativeMxfp4Accumulation() {

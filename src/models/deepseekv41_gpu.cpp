@@ -93,12 +93,15 @@ namespace fastllm {
                 "Sharded shared output requires the joint FP32 routed reduction.\n");
             // Native BF16 graph inputs need neither dtype conversion nor a CPU
             // fallback. MultiCUDA keeps the replicated output metadata current.
-            ((Executor *)GetExecutor())->Run("MergeMOE", {
+            DataDict moeDatas = {
                 {"input", input}, {"index", index}, {"score", score},
                 {"weights", (Data *)moeWeights.data()}, {"biass", (Data *)biass[layer].data()},
                 {"w1", &w1}, {"w2", &w2}, {"w3", &w3},
                 {"curInput", &tempInput}, {"curOutput", &tempOutput}, {"output", &routedOutput}
-            }, {{"sharedScale", 1.0f}, {"swigluLimit", swiglu_limit}}, {
+            };
+            if (ws->ffnInputQuantizedReady) moeDatas["prequantizedInput"] = &ws->ffnInputQuantized;
+            ((Executor *)GetExecutor())->Run("MergeMOE", moeDatas,
+                {{"sharedScale", 1.0f}, {"swigluLimit", swiglu_limit}}, {
                 {"weights___batch", (int)moeWeights.size()}, {"biass___batch", (int)biass[layer].size()},
                 {"layer", layer}, {"gateType", (int)MoeGateSwiglu}, {"expertParallel", 1},
                 {"deepSeekV4Mode", 1}, {"activationQuantBlock", 32},

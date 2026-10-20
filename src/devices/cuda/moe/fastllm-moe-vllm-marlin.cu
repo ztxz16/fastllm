@@ -3731,7 +3731,8 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                              int weightsBatch, const int32_t *globalIndices,
                              const float *scores, int topk, int ownerRank,
                              int ownerCount, bool deepSeekV41 = false,
-                             float swigluLimit = 0.0f) {
+                             float swigluLimit = 0.0f,
+                             const fastllm::Data *prequantizedInput = nullptr) {
     if (globalIndices == nullptr || scores == nullptr || topk <= 0 ||
         topk > 16 || ownerCount <= 0 ||
         input.dims.empty() || input.dataDevice != fastllm::DataDevice::CUDA) {
@@ -3758,7 +3759,14 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
         return false;
     }
     const fastllm::Data *gemmInput = &input;
-    if (deepSeekV41) {
+    // Reuse is optional; incompatible metadata must retain ordinary quantization.
+    // The producer keeps the original BF16 tensor for Router and fallback paths.
+    if (deepSeekV41 && prequantizedInput != nullptr && prequantizedInput->cudaData &&
+        prequantizedInput->dataType == input.dataType && prequantizedInput->dims == input.dims &&
+        prequantizedInput->dataDevice == input.dataDevice &&
+        prequantizedInput->dataDeviceIds == input.dataDeviceIds) {
+        gemmInput = prequantizedInput;
+    } else if (deepSeekV41) {
         // The checkpoint requires W4A8, including the BF16 rounding before
         // quantizing the routed activation fed to the down projection.
         int bucket = 1;
@@ -4203,10 +4211,10 @@ bool FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
         const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
         fastllm::Data **weights, int weightsBatch, const int32_t *globalIndices,
         const float *scores, int topk, int ownerRank, int ownerCount,
-        bool deepSeekV41, float swigluLimit) {
+        bool deepSeekV41, float swigluLimit, const fastllm::Data *prequantizedInput) {
     return fastllm_marlin_moe::RunMarlinMoe<__nv_bfloat16>(
         input, w1, output, weights, weightsBatch, globalIndices, scores, topk,
-        ownerRank, ownerCount, deepSeekV41, swigluLimit);
+        ownerRank, ownerCount, deepSeekV41, swigluLimit, prequantizedInput);
 }
 
 bool FastllmCudaV41MarlinGraphReady(const fastllm::Data *layerKey, int rows) {

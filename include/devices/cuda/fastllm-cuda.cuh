@@ -2275,7 +2275,8 @@ bool FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
         const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
         fastllm::Data **weights, int weightsBatch, const int32_t *globalIndices,
         const float *scores, int topk, int ownerRank, int ownerCount,
-        bool deepSeekV41 = false, float swigluLimit = 0.0f);
+        bool deepSeekV41 = false, float swigluLimit = 0.0f,
+        const fastllm::Data *prequantizedInput = nullptr);
 bool FastllmCudaPrepareNVFP4E4M3Moe(fastllm::Data **weights, int weightsBatch);
 void FastllmCudaReleaseMergeMOEVllmMarlinCache(const fastllm::Data *layerKey);
 // Read-only readiness check: no repacking or allocation during graph capture.

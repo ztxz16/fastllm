@@ -29,7 +29,8 @@ namespace fastllm {
         Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
         std::unique_ptr<DeepSeekV41HybridWorkspace> hybrid;
         Data quantizedActivation;
-        Data attnInputQuantized, qNormQuantized;
+        Data attnInputQuantized, qNormQuantized, ffnInputQuantized;
+        bool ffnInputQuantizedReady = false;
         // TP and CUDA graphs retain one buffer per weight.
         std::map<std::string, Data> quantizedActivations;
         std::map<std::string, Data> reductionBuffers;

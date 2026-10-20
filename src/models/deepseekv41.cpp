@@ -3878,6 +3878,7 @@ namespace fastllm {
         std::vector<int> qDims, kvDims, qIdxDims;
         std::vector<int> ffnDims, ffnInputDims, expertIndexDims, expertScoreDims;
         bool swapHidden = false;
+        bool ffnInputQuantizedReady = false;
     };
 
 #ifdef USE_CUDA
@@ -5782,10 +5783,16 @@ namespace fastllm {
             }
 
             // ---- FFN (MoE)：整批 ----
-            V41HcMixPreNorm(*curHidden, attnPre, weight[pre + ".hc_ffn_fn"],
+            const bool quantizeFfn = executionMode == ExecutionMode::Gpu && tp && single &&
+                seqlen == 1 && !f.dsparkVerify &&
+                quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") &&
+                quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight");
+            ws->ffnInputQuantizedReady = V41HcMixPreNorm(*curHidden, attnPre, weight[pre + ".hc_ffn_fn"],
                 weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
                 weight[pre + ".ffn_norm.weight"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
-                ffnPre, ffnPost, ffnComb, x, ffnInput);
+                ffnPre, ffnPost, ffnComb, x, ffnInput,
+                quantizeFfn ? &ws->ffnInputQuantized : nullptr);
+            if (ws->ffnInputQuantizedReady) ws->ffnInputQuantized.Reshape({seqlen, dim});
             ffnDims = ffnInput.dims;
             ffnInput.Reshape({seqlen, dim});
             };   // runAttentionPost
@@ -5793,10 +5800,14 @@ namespace fastllm {
                 [&](DeepSeekV41GraphSegmentMeta &meta) {
                     meta.ffnDims = ffnDims;
                     meta.ffnInputDims = ffnInput.dims;
+                    meta.ffnInputQuantizedReady = ws->ffnInputQuantizedReady;
                     meta.swapHidden = true;
                 },
                 [&](const DeepSeekV41GraphSegmentMeta &meta) {
                     ffnDims = meta.ffnDims;
+                    ws->ffnInputQuantizedReady = meta.ffnInputQuantizedReady;
+                    if (ws->ffnInputQuantizedReady)
+                        ws->ffnInputQuantized.Reshape(meta.ffnInputDims);
                     if (ffnInput.dims != meta.ffnInputDims) {
                         ffnInput.Reshape(meta.ffnInputDims);
                     }
@@ -6254,8 +6265,9 @@ namespace fastllm {
                 // Eligible decode graphs partition only the down-projection rows.
                 Data &ww1 = ws->sharedSwiglu, &ww3 = ws->sharedGateup;
                 bool sharedQuantized = false;
-                quantizedLinear(ffnInput, pre + ".ffn.shared_experts.gateup.weight", ww3,
-                                tp);
+                quantizedLinear(ws->ffnInputQuantizedReady ? ws->ffnInputQuantized : ffnInput,
+                                pre + ".ffn.shared_experts.gateup.weight", ww3,
+                                tp, nullptr, ws->ffnInputQuantizedReady);
 #ifdef USE_CUDA
                 if (!V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
                     quantizedLinearNames.count(pre + ".ffn.shared_experts.w2.weight") &&
@@ -6422,7 +6434,7 @@ namespace fastllm {
                 &attnPre, &attnPost, &attnComb, &ffnPre, &ffnPost, &ffnComb,
                 &x, &attnInput, &qr, &qNorm, &q, &kv, &attnOut, &woAOut, &attnProj,
                 &rawKVAll, &rawScoreAll, &qIdxAll, &idxWeightsAll,
-                &ffnInput, &expertIndex, &expertScore, &ws->sharedExpertOut,
+                &ffnInput, &ws->ffnInputQuantized, &expertIndex, &expertScore, &ws->sharedExpertOut,
                 &ws->ffnOut, &ws->w1, &ws->w2, &ws->w3};
             for (const auto &entry : ws->reductionBuffers) tensors.push_back(&entry.second);
             for (const Data *data : tensors) {
