@@ -155,6 +155,62 @@ class AutoConfigTest(unittest.TestCase):
             self.assertEqual(os.environ['FASTLLM_CUDA_GRAPH'], '1')
             self.assertTrue(p['automatic']['cuda_graph'])
 
+    def test_qwen35_auto_uses_embedded_mtp_tp_and_native_context(self):
+        config = dict(model_type='qwen3_5_text', num_hidden_layers=64, hidden_size=5120,
+                      num_attention_heads=24, num_key_value_heads=4, head_dim=256,
+                      intermediate_size=17408, max_position_embeddings=262144,
+                      layer_types=['linear_attention'] * 3 + ['full_attention'] * 1)
+        config['layer_types'] *= 16
+        config.update(linear_num_key_heads=16, linear_num_value_heads=48,
+                      linear_key_head_dim=128, linear_value_head_dim=128,
+                      linear_conv_kernel_dim=4, mtp_num_hidden_layers=1)
+        metadata = {'model_type': 'qwen3_5', 'text_config': config}
+        geometry = memory.geometry(metadata, 'float16', 5)
+        self.assertEqual((len(geometry.kv), sum(bool(x) for x in geometry.kv[:64])), (65, 16))
+        self.assertEqual(geometry.kv[3], 4096)
+        self.assertGreater(geometry.state[0], 0)
+        costs = ([0] * 65, [300 << 20] * 65, 3 * GiB, 4 * GiB, GiB, False)
+        gpu = {d: {'total': 72 * GiB, 'free': 72 * GiB} for d in (0, 1)}
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, 'mtp.safetensors').write_bytes(b'draft')
+            a = self.args()
+            a.path = directory
+            a.dtype = 'fp8_e4m3'
+            with patch.object(memory, 'model_inputs', return_value=(metadata, [], geometry)), \
+                    patch.object(memory, 'weight_costs', return_value=costs), \
+                    patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+                result = auto.resolve(a, gpu.__getitem__, hardware=self.hardware,
+                                      ram={'total': 256 * GiB, 'available': 256 * GiB},
+                                      use_numa=True)
+                self.assertEqual(os.environ['FASTLLM_QWEN35_MTP_VERIFY_CUDA_GRAPH'], '0')
+            self.assertEqual((a.tp, a.max_batch, a.max_context_length, a.tokens, a.mtp),
+                             ('cuda:0,1', 4, 262144, 1048576, 5))
+            self.assertTrue(a.cuda_embedding)
+            self.assertEqual(result['mode'], 'tp')
+            self.assertFalse(result['automatic']['mtp_verify_cuda_graph'])
+
+            opt_out = self.args('--mtp', '0', '--max_batch', '2', '--max_context_length', '65536')
+            opt_out.path = directory
+            opt_out_costs = (costs[0][:-1], costs[1][:-1], *costs[2:])
+            with patch.object(memory, 'model_inputs', return_value=(metadata, [], geometry)), \
+                    patch.object(memory, 'weight_costs', return_value=opt_out_costs), \
+                    patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+                auto.resolve(opt_out, gpu.__getitem__, hardware=self.hardware,
+                             ram={'total': 256 * GiB, 'available': 256 * GiB}, use_numa=True)
+            self.assertEqual((opt_out.mtp, opt_out.max_batch, opt_out.max_context_length),
+                             (0, 2, 65536))
+
+            constrained = self.args()
+            constrained.path = directory
+            smaller = {d: {'total': 44 * GiB, 'free': 44 * GiB} for d in (0, 1)}
+            with patch.object(memory, 'model_inputs', return_value=(metadata, [], geometry)), \
+                    patch.object(memory, 'weight_costs', return_value=costs), \
+                    patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+                auto.resolve(constrained, smaller.__getitem__, hardware=self.hardware,
+                             ram={'total': 256 * GiB, 'available': 256 * GiB}, use_numa=True)
+            self.assertTrue(4096 <= constrained.max_context_length < 262144)
+            self.assertEqual(constrained.tokens, 4 * constrained.max_context_length)
+
     def test_hybrid_prefers_cache_and_keeps_per_device_headroom(self):
         self.g.experts = 256
         self.costs = ([4 * GiB] * 4, [1 << 20] * 4, 1 << 20, 0, GiB, False)

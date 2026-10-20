@@ -10,15 +10,15 @@
 
 ## 选择部署模式
 
-Qwen3.8 27B 属于 Qwen3.5 架构，当前 `--auto` 的 dense Qwen3 适配不覆盖此架构。请使用下方 CUDA/TP 手动配置，或在 Launcher 中选择原有的长上下文/高并发推荐。Flash-Next 混合推理建议使用 `--auto`，见[独立指南](qwen3.8-flash-next/README.md)。
+Qwen3.8 27B 属于 Qwen3.5 架构。Qwen3.8-27B-FP8 的稠密 HF checkpoint 已验证 `--auto`，默认使用纯 GPU TP、并发 4 和内置 MTP5，按预算选择最长的原生上下文。其他格式仍可使用下方 CUDA/TP 手动配置。Flash-Next 混合推理见[独立指南](qwen3.8-flash-next/README.md)。
 
 ~~~bash
 ftllm server /data/models/Qwen3.8-27B-FP8 \
-  --device cuda --model_name qwen3.8-27b \
+  --auto --model_name qwen3.8-27b \
   --host 0.0.0.0 --port 8080
 ~~~
 
-单卡放不下时，按后文配置双卡 TP 或选择更低比特的权重。`--auto_gpu_memory_limit` 和 `--auto_host_memory_limit` 只对自动规划生效，不用于限制此处手动模式的实际占用。
+`--auto` 优先尝试双卡 TP，显存不足时尝试四卡 TP 和较短上下文。显式指定 `--tp`、`--max_batch`、`--max_context_length`、`--tokens` 或 `--mtp 0` 可覆盖默认值。`--auto_gpu_memory_limit` 和 `--auto_host_memory_limit` 仅约束自动规划预算。
 
 ## 手动配置参考
 

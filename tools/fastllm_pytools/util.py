@@ -1459,6 +1459,11 @@ def make_normal_llm_model(args, startup_progress = None):
                 model_type in ("qwen3_5", "qwen3_5_moe") or
                 text_model_type in ("qwen3_5_text", "qwen3_5_moe_text")
             )
+            if is_qwen35_model and getattr(args, "auto", False):
+                from .auto_config import apply_model_defaults
+                apply_model_defaults(args, config)
+                mtp = args.mtp
+                speculative_algorithm = args.speculative_algorithm
             is_qwen38_flash_next_model = (
                 architecture in ("Qwen3_8FlashNextForConditionalGeneration",
                                  "Qwen4ExpForConditionalGeneration") or

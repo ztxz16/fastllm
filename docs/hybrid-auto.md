@@ -6,9 +6,9 @@
 ftllm server /path/to/model.gguf --auto
 ```
 
-支持 Linux NVIDIA CUDA 上的 dense Qwen3，以及 Qwen4、GLM-5.3、DeepSeek-V4.1 混推模型。未启用 `--auto` 时，原有数值和默认行为保持不变。
+支持 Linux NVIDIA CUDA 上的 dense Qwen3、Qwen3.5 架构的稠密 HF 模型，以及 Qwen4、GLM-5.3、DeepSeek-V4.1 混推模型。未启用 `--auto` 时，原有数值和默认行为保持不变。
 
-Qwen3.8 27B 使用 Qwen3.5 架构，目前不属于上述 dense Qwen3 支持范围；请使用[手动 CUDA/TP 配置](qwen3.md)，或 Launcher 原有的长上下文/高并发推荐。
+Qwen3.8-27B-FP8 已验证 `--auto`：优先选择纯 GPU TP，默认并发 4、模型原生上下文和内置 MTP5，显存不足时降低上下文。并发 MTP 验证默认采用 eager CUDA 路径，以避开批量验证 CUDA Graph 的非法内存访问；可用 `FASTLLM_QWEN35_MTP_VERIFY_CUDA_GRAPH=1` 显式覆盖。其他 Qwen3.5 架构 checkpoint 的量化格式和 MTP 权重仍需分别验证。
 
 直接运行 `ftllm` 打开的 Launcher 中，新增启动项默认选择“自动配置”，只需选择本地模型并填写模型名、监听地址、端口等服务信息。启动命令使用 `--auto`，每次启动重新读取硬件余量；表单中原有的手动推理参数和环境变量不会带入这个模式。原有长上下文、高并发和自定义模式仍保留，已保存的配置不会自动切换。
 
@@ -17,9 +17,11 @@ Qwen3.8 27B 使用 Qwen3.5 架构，目前不属于上述 dense Qwen3 支持范�
 
 Dense Qwen3 按实际 GQA 头数、KV、dense 权重及 tied output head 副本预算，不分配专家缓存；上下文取 128K 与模型原生窗口的较小值。目前 Qwen3 的 CUDA Graph 预热会触发 deferred pool 的 stream-capture-unsupported，因此此模型的 `--auto` 默认使用普通 CUDA 执行。显式 `FASTLLM_CUDA_GRAPH` 仍优先；其他模型的 Graph 默认策略不变。
 
+Qwen3.5 稠密 HF 模型按全注意力层的 GQA KV、线性注意力层的常驻状态、原生 FP8 权重和独立 MTP 层预算。先尝试原生上下文与纯 GPU TP2，必要时尝试 TP4 和较短上下文；显式 `--tp`、`--max_batch`、`--max_context_length`、`--tokens`、`--mtp 0` 或 `--speculative_algorithm off` 优先。内置 `mtp.safetensors` 且配置声明一个草稿层时默认启用 MTP5。默认 `--cuda_embedding`，不自动启用视觉输入。
+
 ## 单参数自动选择
 
-DeepSeek-V4.1 默认采用不超过模型原生窗口的 **1M（1,048,576 token）上下文、单请求**，开启 **DSpark 7**（置信度阈值默认 0.5）和 **fast_prefill**。其他模型保持 **128K 上下文、单请求**。按代表性的 4K 输入、512 输出估计交互延迟。读取可见 CUDA 设备的可用显存、SM 数、内存带宽参数、PCIe 条件和 peer access 能力，比较单卡、PP、双卡等比例 TP，并联合选择专家驻留、显存缓存、主存缓存和 chunk。权重可全驻留且预算允许时，也可选择全部专家放 GPU。CPU 线程依据进程可用的物理核数选择，并预留启动和 IO 线程。
+DeepSeek-V4.1 默认采用不超过模型原生窗口的 **1M（1,048,576 token）上下文、单请求**，开启 **DSpark 7**（置信度阈值默认 0.5）和 **fast_prefill**。Qwen3.5 稠密 HF 模型默认并发 4、尽量使用原生上下文；其他模型保持 **128K 上下文、单请求**。按代表性的 4K 输入、512 输出估计交互延迟。读取可见 CUDA 设备的可用显存、SM 数、内存带宽参数、PCIe 条件和 peer access 能力，比较单卡、PP、双卡等比例 TP，并联合选择专家驻留、显存缓存、主存缓存和 chunk。权重可全驻留且预算允许时，也可选择全部专家放 GPU。CPU 线程依据进程可用的物理核数选择，并预留启动和 IO 线程。
 
 DeepSeek-V4.1 的 `fast_prefill` 沿用已有近似注意力语义，可能改变 logits。可用 `--no_fast_prefill` 关闭；`--dspark 0` 或 `--speculative_algorithm off` 关闭推测解码。显式上下文、草稿数、阈值和 JSON 配置中的 `fast_prefill: false` 均优先；`--threads 64` 可固定线程数。预算不足时先调整自动 chunk、缓存和专家放置，仍放不下则报错，不自动缩短 1M 上下文。
 
@@ -29,7 +31,7 @@ Qwen4 混推在上下文容量达到 64K 时，优先使用每层 32K 显存池�
 
 自动 KV streaming 仅用于现有支持的 Qwen4 FP16 QSA、单请求混推路径，可使用单卡、PP 或 TP；不启用其他模型的近似 KVMem。它关闭 prefix/history 复用，但保留原生注意力选页；模型检测自动填入的历史缓存默认值不会阻止规划。用户通过命令行、JSON 或现有 prefix-cache 环境变量显式开启复用，或跳过 warmup、指定其他精度、多请求、指定不等于单请求上下文的总 token 容量时，不自动启用。显式 `--kvmem` 仍需配合原有手动参数。最终 `[auto]` 日志中的 `automatic.kv_streaming` 和 `kvmem` 给出实际选择。
 
-这些是快速估计规则，不是实测吞吐或完整调优：不会为了挑选配置反复加载模型。缓存局部性、PCIe 和算子效率的估计有误差；先应用上述 KV 容量策略，再比较预计延迟。估计延迟相差不超过 10% 时，优先选择较少设备和集合通信的方案；同一拓扑在显存能容纳全部专家时优先保留完整 KV。实际请求也可能更适合另一种模式。自动 TP 搜索目前限双卡、相近规格；多卡 PP 和显式等比例 TP 继续沿用现有预算校验。
+这些是快速估计规则，不是实测吞吐或完整调优：不会为了挑选配置反复加载模型。缓存局部性、PCIe 和算子效率的估计有误差；先应用上述 KV 容量策略，再比较预计延迟。估计延迟相差不超过 10% 时，优先选择较少设备和集合通信的方案；同一拓扑在显存能容纳全部专家时优先保留完整 KV。实际请求也可能更适合另一种模式。Qwen3.5 稠密 HF 模型自动搜索双卡和四卡等比例 TP；其他模型的自动 TP 搜索仍限双卡、相近规格。多卡 PP 和显式等比例 TP 继续沿用现有预算校验。
 
 Qwen4 的纯自动选型优先采用可行的单卡或 PP 方案，减少混推解码中的逐层 TP 归并；同一主存后端没有可行 PP 配置时，仍可退回 TP。避免磁盘专家的优先级高于 PP 偏好：先搜索主存专家后端的驻留、缓存和 chunk 组合，包括可行的 TP，全部放不下才考虑磁盘专家；PLE/Engram 按需读取独立于专家后端。显式 `--tp` 优先，其他模型继续按延迟估计选择。
 
@@ -37,7 +39,7 @@ Qwen4 自动混推在主存充足时优先将目标专家全部放在主存，�
 
 显存预算保留 `gpu_mem_ratio` 对应的预留量（默认总显存的 10%），并另外计入每卡 512 MiB 的 Graph、库句柄和分配器保护空间；不会将实测剩余显存全部分配给专家缓存。Qwen 的预算还包括 Graph 默认启用的 CUDA embedding，GGUF 词嵌入按实际展开后的 FP32 大小计算；多卡 PP MTP 自动采用 CPU embedding 时免去对应显存开销。这是容量估计，不是运行时显存硬上限；CUDA 分配器可能保留可复用的空闲缓冲，因此驱动看到的显存峰值可能高于规划估算。实际余量仍取决于请求形状和运行时分配。
 
-显式参数优先，包括关闭缓存的 `0`、全部主存专家的 `--moe_device_layers -1`、`--tp off`、线程数、精度和阈值。仅添加 `--auto` 不会启用 MTP，需指定 MTP 或提供草稿模型。若指定并发而未指定总 token 容量，会按上下文乘以并发预留。不会为了通过预算缩小用户指定的上下文或并发。JSON 配置中的设置也作为显式值处理；`--auto` 下同时给出的命令行设置优先于 JSON。
+显式参数优先，包括关闭缓存的 `0`、全部主存专家的 `--moe_device_layers -1`、`--tp off`、线程数、精度和阈值。除上述带内置草稿权重的 Qwen3.5 稠密 HF 模型外，仅添加 `--auto` 不会启用 MTP，需指定 MTP 或提供草稿模型。若指定并发而未指定总 token 容量，会按上下文乘以并发预留。不会为了通过预算缩小用户指定的上下文或并发。JSON 配置中的设置也作为显式值处理；`--auto` 下同时给出的命令行设置优先于 JSON。
 
 使用 `--auto --draft /path/to/mtp.gguf` 指定 Qwen4 外部 MTP GGUF 时，默认最多生成 3 个草稿 token，加上 anchor 为 4 行目标验证，匹配现有验证 CUDA Graph 的宽度。显式正数 `--mtp`、`--draft_tokens` 优先；阈值默认关闭，可用 `--mtp_min_p` 指定。保留草稿路径但关闭推测解码时，使用 `--speculative_algorithm off`。
 

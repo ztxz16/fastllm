@@ -149,7 +149,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ## 模型部署指南
 
-如果由自动化 agent 部署，建议先把[模型簇与参数速查](docs/model-deployment-agent.md)交给 agent。支持自动规划的混合模型优先使用 `--auto`，再根据日志做必要的参数覆盖；Qwen3.8 27B 等尚未接入的架构使用对应的手动配置。开发记录、测试入口和 Benchmark 记录规则见[开发与验证记录](docs/development-validation.md)。
+如果由自动化 agent 部署，建议先把[模型簇与参数速查](docs/model-deployment-agent.md)交给 agent。Qwen3.8-27B-FP8 和已支持的混合模型可以使用 `--auto`，再根据日志做必要的参数覆盖；尚未验证的量化格式使用对应的手动配置。开发记录、测试入口和 Benchmark 记录规则见[开发与验证记录](docs/development-validation.md)。
 
 不同模型在注意力结构、MoE 布局、投机解码和量化格式上差异很大。选择目标模型后，请先阅读对应部署指南，再使用后面的通用配置作为补充。
 

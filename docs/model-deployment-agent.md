@@ -6,11 +6,12 @@
 
 混合推理优先使用 `--auto`。它会在启动时读取可见 GPU、显存、主机内存和模型配置，联合选择主干设备、MoE 专家设备、专家缓存、上下文容量和分块 prefill。显式参数覆盖自动规划器，适合在第一次启动失败或需要固定实验条件时使用。
 
-当前 `--auto` 支持 Linux NVIDIA CUDA 上的 Qwen3 dense、Qwen4/Flash-Next、GLM-5.3 和 DeepSeek-V4.1。**Qwen3.8 27B 使用 Qwen3.5 架构，不等于 Qwen3 dense，目前应使用下方手动配置**；Launcher 选择“自定义”，或使用原有的长上下文/高并发推荐。
+当前 `--auto` 支持 Linux NVIDIA CUDA 上的 Qwen3 dense、Qwen3.5 架构的稠密 HF 模型、Qwen4/Flash-Next、GLM-5.3 和 DeepSeek-V4.1。Qwen3.8-27B-FP8 已验证自动 TP2、内置 MTP5、并发 4 和原生 262144 上下文；其他 Qwen3.5 checkpoint 需分别验证。
 
 | 模型簇 | 推荐入口 | 适合的下载项 |
 | --- | --- | --- |
-| Qwen3.8 27B | 手动 CUDA / TP；当前不支持 `--auto` | `Qwen/Qwen3.8-27B`、`Qwen/Qwen3.8-27B-FP8`、`QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` |
+| Qwen3.8 27B FP8 | `--auto`；纯 GPU TP、MTP、并发 4、尽量使用原生上下文 | `Qwen/Qwen3.8-27B-FP8` |
+| Qwen3.8 27B 其他格式 | 手动 CUDA / TP，按量化格式单独验证 | `Qwen/Qwen3.8-27B`、`QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` |
 | Qwen3.8-Flash-Next GSQ-RCO | `--auto`；GGUF 需要把首个分片作为模型路径 | `Q2_0`、`IQ2_XS`、`IQ3_XXS`、`IQ3_S`，下载时保留对应子目录和 `mmproj` |
 | DeepSeek V4.1 Flash | `--auto`；主机内存不足时按日志改用磁盘专家 | `deepseek-ai/DeepSeek-V4.1-Flash-1017` |
 | GLM-5.3-Flash | `--auto`；GGUF 需要把首个分片作为模型路径 | 本地完整 HF/NVFP4 目录或 `glm5next` GGUF 分片，见 [GLM 指南](glm5.md) |
@@ -19,7 +20,7 @@
 
 ## 推荐部署顺序
 
-1. 确认模型架构属于上面的支持范围，再用下方的 `--auto` 命令启动；Qwen3.8 27B 使用手动命令。
+1. 确认模型架构属于上面的支持范围，再用下方的 `--auto` 命令启动；尚未验证的 Qwen3.8 格式使用手动配置。
 2. 等待就绪日志，读取规划器实际选择的 `device`、`moe_device`、缓存、chunk 和上下文上限。
 3. 调用 `/v1/models` 和一次短请求；如果失败，把完整启动日志交给 agent，再只增加必要的显式覆盖。
 4. 需要比较性能时固定 GPU 可见性、线程、输入输出长度和 warmup，只改变一个配置项。
@@ -29,9 +30,9 @@
 ## 启动命令
 
 ```bash
-# Qwen3.8-27B FP8：当前使用手动 CUDA，需足够显存
+# Qwen3.8-27B FP8：自动纯 GPU TP，默认并发 4、内置 MTP5、最长可用原生上下文
 ftllm server /data/models/Qwen3.8-27B-FP8 \
-  --device cuda --model_name qwen3.8-27b \
+  --auto --model_name qwen3.8-27b \
   --host 0.0.0.0 --port 8080
 
 # Qwen3.8-Flash-Next GSQ-RCO；路径指向下载目录中的第一个 GGUF 分片

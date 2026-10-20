@@ -16,13 +16,25 @@ from . import hybrid_auto as memory
 def apply_model_defaults(args, metadata):
     """Apply model-specific auto defaults before speculative setup/budgeting."""
     config = metadata.get("text_config", metadata)
-    if (not getattr(args, "auto", False) or
-            config.get("model_type", metadata.get("model_type")) not in
-            ("deepseek_v41", "deepseek_v41_text")):
+    if not getattr(args, "auto", False):
         return
+    family = config.get("model_type", metadata.get("model_type"))
     explicit = set(getattr(args, "_auto_explicit", ()))
     speculation = {"mtp", "dspark", "speculative_algorithm", "speculative_draft_model_path",
                    "draft_tokens", "speculative_num_draft_tokens", "speculative_dspark_block_size"}
+    if family in ("qwen3_5", "qwen3_5_text"):
+        if "max_batch" not in explicit and args.max_batch <= 0:
+            args.max_batch = 4
+        if "cuda_embedding" not in explicit:
+            args.cuda_embedding = True
+        if (not explicit & speculation and not (args.mtp or args.dspark or args.speculative_algorithm or
+                                                args.speculative_draft_model_path) and
+                int(config.get("mtp_num_hidden_layers", 0)) == 1 and
+                (Path(args.path) / "mtp.safetensors").is_file()):
+            args.mtp, args.speculative_algorithm = 5, "mtp"
+        return
+    if family not in ("deepseek_v41", "deepseek_v41_text"):
+        return
     if not explicit & speculation and not (args.mtp or args.dspark or args.speculative_algorithm or
                                            args.speculative_draft_model_path):
         args.dspark, args.speculative_algorithm = 7, "dspark"
@@ -107,7 +119,7 @@ def cpu_threads():
     return max(1, len(cores) - min(4, len(cores) // 4))
 
 
-def topologies(args, explicit, hardware, gpu):
+def topologies(args, explicit, hardware, gpu, family=None):
     from .util import _uses_thread_tp, _normalize_thread_tp_arg
     fixed_tp = args.tp if "tp" in explicit else os.environ.get("FASTLLM_TP", "")
     fixed_device = "device" in explicit and bool(args.device)
@@ -136,7 +148,8 @@ def topologies(args, explicit, hardware, gpu):
         yield device, "off", "pp", mapping
         # First release automatically considers the validated two-rank layout.
         # Other explicit equal TP degrees still use the existing budget checks.
-        if ("tp" not in explicit and not fixed_tp and len(ids) == 2 and
+        if ("tp" not in explicit and not fixed_tp and
+                (len(ids) == 2 or family == "qwen35" and len(ids) == 4) and
                 len({hardware[d]["capability"] for d in ids}) == 1 and max(sm) <= min(sm) * 1.2):
             yield "cuda:" + ",".join(map(str, ids)), "cuda:" + ",".join(map(str, ids)), "tp", {d: 1 for d in ids}
 
@@ -229,6 +242,83 @@ def full_kv_has_expert_room(candidate, model, costs, mode, mapping, mtp):
                candidate["gpu_budget_bytes"][d] for d in mapping)
 
 
+def _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model, info, gpu, ram, numa):
+    """Prefer pure CUDA TP and the longest native context that fits batch 4."""
+    target = (base.max_context_length if "max_context_length" in explicit else
+              min(model.context, base.max_context_length))
+    topology = list(topologies(base, explicit, info, gpu, family="qwen35"))
+    if not ({"tp", "device"} & explicit):
+        parallel = [entry for entry in topology if entry[2] == "tp"]
+        if parallel:
+            topology = parallel
+    topology.sort(key=lambda entry: len(entry[3]))
+    rejection = "no supported CUDA topology"
+    def attempt(context):
+        nonlocal rejection
+        for device, tp, mode, mapping in topology:
+            trial = copy.copy(base)
+            trial.device, trial.tp = device, tp
+            trial.moe_device = base.moe_device or ("numa" if numa else "cpu")
+            trial.ngram_device = base.ngram_device
+            trial.max_context_length = context
+            if "tokens" not in explicit:
+                trial.tokens = context * trial.max_batch
+            try:
+                memory.validate_options(trial)
+                prepared, costs, notes = memory.prepare(trial, metadata, tensors, model, mode, mapping)
+                result = memory.plan(prepared, model, costs, mode, mapping, gpu, ram,
+                                     allow_full_gpu=True)
+            except ValueError as error:
+                rejection = str(error)
+                continue
+            result.update(device=device, tp=tp, moe_device=trial.moe_device,
+                          ngram_device=trial.ngram_device, threads=trial.threads,
+                          atype=trial.atype, kv_cache_dtype=trial.kv_cache_dtype,
+                          max_context_length=context, tokens=trial.tokens)
+            if notes:
+                result["notes"] = notes
+            return trial, result
+        return None
+
+    chosen = attempt(target)
+    if chosen is None and "max_context_length" not in explicit and "tokens" not in explicit:
+        # Capacity is monotone in context at a fixed batch/topology. Search
+        # page-aligned lengths so the fallback is the longest that fits.
+        low, high = 4096 // 128, (target - 1) // 128
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = attempt(middle * 128)
+            if candidate is None:
+                high = middle - 1
+            else:
+                chosen = candidate
+                low = middle + 1
+    if chosen is None:
+        raise ValueError("--auto could not find a safe Qwen3.5 CUDA TP configuration: " + rejection)
+    trial, result = chosen
+    for name in memory.AUTO_OPTIONS:
+        if getattr(trial, name) == "auto":
+            setattr(trial, name, result[name])
+    for name in (*memory.AUTO_OPTIONS, "device", "tp", "moe_device", "ngram_device",
+                 "threads", "atype", "kv_cache_dtype", "max_context_length", "tokens",
+                 "max_batch", "cuda_embedding", "mtp", "speculative_algorithm"):
+        setattr(args, name, getattr(trial, name))
+    # Batched Qwen3.5 MTP verification graph capture can access invalid CUDA
+    # memory at batch 4. Keep speculative decoding and the regular decode
+    # graph, while using the verified eager path for batched verification.
+    verify_graph_env = "FASTLLM_QWEN35_MTP_VERIFY_CUDA_GRAPH"
+    if trial.mtp > 0 and trial.max_batch > 1 and verify_graph_env not in os.environ:
+        os.environ[verify_graph_env] = "0"
+    result["automatic"] = {"policy": "qwen35-longest-context-pure-cuda-tp",
+                           "mtp": trial.mtp, "cuda_embedding": trial.cuda_embedding,
+                           "cuda_graph": os.environ.get("FASTLLM_CUDA_GRAPH", "1") != "0",
+                           "mtp_verify_cuda_graph": os.environ.get(verify_graph_env, "1") != "0",
+                           "gpu_memory_limit": result.get("auto_gpu_memory_limit"),
+                           "host_memory_limit": result.get("auto_host_memory_limit")}
+    print("[auto] " + json.dumps(result, sort_keys=True), flush=True)
+    return result
+
+
 def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     """Resolve one --auto invocation transactionally, before model allocation."""
     from .env import env
@@ -244,8 +334,6 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         base.threads = cpu_threads()
     if base.threads < 1:
         raise ValueError("--auto requires positive CPU threads")
-    if base.max_batch <= 0:
-        base.max_batch = 1
     metadata, tensors, model = memory.model_inputs(base)
     # Dense Qwen3's graph warmup currently hits stream-capture-unsupported
     # in the deferred CUDA pool. Keep its new auto adapter on eager CUDA;
@@ -254,9 +342,12 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if disable_qwen3_graph:
         graph_enabled = False
     apply_model_defaults(base, metadata)
-    # DeepSeek V4.1 targets its 1M window; other models retain the 128K policy.
+    if base.max_batch <= 0:
+        base.max_batch = 1
+    # Qwen3.5 targets the native window; DeepSeek V4.1 targets 1M.
     if base.max_context_length <= 0:
-        target = 1048576 if model.family == "deepseek_v41" else 131072
+        target = (model.context if model.family == "qwen35" else
+                  1048576 if model.family == "deepseek_v41" else 131072)
         base.max_context_length = min(model.context, base.tokens if base.tokens > 0 else target)
     if base.tokens <= 0:
         base.tokens = base.max_context_length * base.max_batch
@@ -273,6 +364,9 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     gpu = {d: query_gpu(d) for d in info}
     ram = ram if ram is not None else memory.host_memory()
     numa = env.use_numas if use_numa is None else use_numa
+    if model.family == "qwen35":
+        return _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model,
+                                     info, gpu, ram, numa)
     backends = [base.moe_device] if "moe_device" in explicit and base.moe_device else ["numa" if numa else "cpu", "disk"]
     tables = [base.ngram_device] if "ngram_device" in explicit else ["cpu", "disk"]
     table_bytes = sum(t.bytes for t in tensors if memory.is_lookup_table(t.name))

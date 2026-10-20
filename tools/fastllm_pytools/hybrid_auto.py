@@ -214,6 +214,7 @@ class Geometry:
     streamed_kv: list = field(default_factory=list)  # exact host-backed KV bytes/token/layer, excluding index
     dspark_block_size: int = 0  # draft forward retains the trained block when verifying fewer tokens
     attention_score_heads: int = 1  # dense GQA fallback may materialize one score matrix per query head
+    tp_kv_heads: int = 0  # Qwen3.5 GQA KV heads available for TP sharding
 
 
 def geometry(metadata, kv_dtype, mtp, dspark=0):
@@ -228,6 +229,8 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
     elif family == "qwen3":
         if mtp:
             raise ValueError("Auto: dense Qwen3 does not have embedded MTP")
+    elif family in ("qwen3_5", "qwen3_5_text", "qwen35"):
+        family = "qwen35"
     elif family in ("deepseek_v41", "deepseek_v41_text"):
         family = "deepseek_v41"
         config = dict(config)
@@ -237,7 +240,7 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
             if primary not in config and alias in config:
                 config[primary] = config[alias]
     else:
-        raise ValueError("Auto supports dense Qwen3, Qwen4, GLM-5.3 and DeepSeek-V4.1")
+        raise ValueError("Auto supports dense Qwen3, Qwen3.5, Qwen4, GLM-5.3 and DeepSeek-V4.1")
     if dspark and family != "deepseek_v41":
         raise ValueError("Hybrid auto supports embedded DSpark only for DeepSeek-V4.1")
     def get(hf, gg, default=None):
@@ -266,6 +269,38 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
                         [kv_heads * dim * 2 * unit] * layers, [0] * layers,
                         1, hidden * 8 + heads * dim * 6, 4096,
                         attention_score_heads=heads)
+    if family == "qwen35":
+        heads = int(get("num_attention_heads", "attention.head_count"))
+        kv_heads = int(get("num_key_value_heads", "attention.head_count_kv", heads))
+        dim = int(get("head_dim", "attention.key_length", hidden // heads))
+        inter = int(get("intermediate_size", "feed_forward_length"))
+        unit = {"auto": 2, "float16": 2, "bfloat16": 2, "float32": 4,
+                "fp8_e4m3": 1}.get(kv_dtype)
+        if min(layers, hidden, context, heads, kv_heads, dim, inter) <= 0 or heads % kv_heads or unit is None:
+            raise ValueError("Auto: invalid dense Qwen3.5 dimensions or KV precision")
+        kinds = config.get("layer_types")
+        if not isinstance(kinds, list) or len(kinds) != layers or any(
+                kind not in ("full_attention", "linear_attention") for kind in kinds):
+            raise ValueError("Auto: unsupported Qwen3.5 attention layout")
+        key_heads = int(get("linear_num_key_heads", "ssm.group_count", 16))
+        value_heads = int(get("linear_num_value_heads", "ssm.time_step_rank", 48))
+        key_dim = int(get("linear_key_head_dim", "ssm.state_size", 128))
+        value_dim = int(get("linear_value_head_dim", "ssm.value_dim", 128))
+        kernel = int(get("linear_conv_kernel_dim", "ssm.conv_kernel", 4))
+        if min(key_heads, value_heads, key_dim, value_dim, kernel) <= 0:
+            raise ValueError("Auto: invalid Qwen3.5 recurrent state")
+        kv = [kv_heads * dim * 2 * unit if kind == "full_attention" else 0 for kind in kinds]
+        state_bytes = (value_heads * key_dim * value_dim +
+                       (key_heads * key_dim + value_heads * value_dim) * kernel) * 4
+        state = [state_bytes if kind == "linear_attention" else 0 for kind in kinds]
+        if mtp:
+            if int(config.get("mtp_num_hidden_layers", 0)) != 1:
+                raise ValueError("Auto: Qwen3.5 MTP requires one embedded draft layer")
+            kv.append(kv_heads * dim * 2 * unit)
+            state.append(state_bytes)
+        return Geometry(family, layers, context, hidden, 1, 1, inter, kv, state,
+                        1, hidden * 8 + value_heads * value_dim * 12, 1024,
+                        tp_kv_heads=kv_heads)
     experts = int(get("n_routed_experts" if family != "qwen4" else "num_experts", "expert_count"))
     topk = int(get("num_experts_per_tok", "expert_used_count"))
     inter = int(get("moe_intermediate_size", "expert_feed_forward_length"))
@@ -488,6 +523,28 @@ def _packed_fp4_sizes(tensors, args):
     return sizes
 
 
+def _qwen35_weight_sizes(tensors, args):
+    """Keep native block FP8 payloads and count expanded scales once."""
+    by_name = {tensor.name: tensor for tensor in tensors}
+    sizes = {}
+    if args.dtype not in ("auto", "fp8_e4m3"):
+        return sizes
+    for tensor in tensors:
+        if tensor.kind not in ("F8_E4M3", "F8_E4M3FN") or not tensor.name.endswith(".weight"):
+            continue
+        prefix = tensor.name[:-7]
+        scale = next((by_name.get(name) for name in (
+            tensor.name + "_scale_inv", prefix + ".weight_scale_inv",
+            prefix + ".scale_inv") if name in by_name), None)
+        if (scale is None or scale.kind not in ("F32", "BF16") or
+                len(scale.shape) != len(tensor.shape) or
+                any(w % s for w, s in zip(tensor.shape, scale.shape))):
+            continue
+        sizes[tensor.name] = tensor.bytes + math.prod(scale.shape) * 4
+        sizes[scale.name] = 0
+    return sizes
+
+
 def weight_costs(tensors, model, args):
     """Expert bytes by layer, replicated dense upper bounds and host tables."""
     expert = [0] * len(model.kv)
@@ -495,6 +552,7 @@ def weight_costs(tensors, model, args):
     common, host, largest = 0, 0, 0
     snapshot = False
     packed_sizes = _packed_fp4_sizes(tensors, args)
+    native_sizes = _qwen35_weight_sizes(tensors, args) if model.family == "qwen35" else {}
     for tensor in tensors:
         name = tensor.name
         match = re.search(r"(?:^blk\.|(?:^|\.)layers\.)(\d+)\.", name)
@@ -538,7 +596,9 @@ def weight_costs(tensors, model, args):
                 raise ValueError("Hybrid auto: unsupported HF target weight precision " + dtype)
             # Norms/scales retain source precision. Compressed FP8/NVFP4
             # sources and their scale tensors are budgeted from their headers.
-            if name in packed_sizes:
+            if name in native_sizes:
+                size = native_sizes[name]
+            elif name in packed_sizes:
                 size = packed_sizes[name]
             elif tensor.kind in ("F16", "BF16", "F32"):
                 size = max(size, math.prod(tensor.shape) * (4 if dtype == "float32" else 2))
@@ -586,10 +646,17 @@ def weight_costs(tensors, model, args):
             dense[layer] += size
         if not is_table:
             largest = max(largest, size)
-    if not any(expert) and model.family != "qwen3":
+    if not any(expert) and model.family not in ("qwen3", "qwen35"):
         raise ValueError("Hybrid auto: no routed experts found")
     return expert, dense, common, host, largest, snapshot
 
+
+def _score_workspace(model, rows, context):
+    if model.family == "qwen35":
+        # Qwen3.5 uses tiled attention; it does not retain a full
+        # batch × heads × chunk × context score matrix.
+        return 512 * MiB
+    return rows * math.ceil(context / model.score_divisor) * 4 * model.attention_score_heads
 
 def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_gpu=False,
          kv_resident=0, per_device_cache=False, implicit_embedding_bytes=0,
@@ -642,7 +709,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     chunks = list(dict.fromkeys(min(c, context) for c in chunks))
     if args.moe_device_layers == "auto":
         # Only the unified policy may choose full GPU residency.
-        residents = ([model.layers] if model.family == "qwen3" else
+        residents = ([model.layers] if model.family in ("qwen3", "qwen35") else
                      range(model.layers if allow_full_gpu else model.layers - 1, -1, -1))
     else:
         host_layers = args.moe_device_layers
@@ -658,7 +725,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
         rows = batch * max(chunk + (1 if args.mtp else 0), speculative + 1, model.dspark_block_size)
         # QSA/DSA score matrix, recurrent scan activations, routed expert
         # intermediates and one dense dequantization working set.
-        workspace = (rows * math.ceil(context / model.score_divisor) * 4 * model.attention_score_heads +
+        workspace = (_score_workspace(model, rows, context) +
                      rows * (model.activation_width + topk * (model.hidden + 3 * model.intermediate)) * 4 +
                      model.hidden * model.intermediate * 3 * 2)
         if streaming:
@@ -690,7 +757,13 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     if streaming and model.streamed_kv[layer]:
                         raw = model.streamed_kv[layer]
                         kv_bytes = logical * (model.kv[layer] - raw) + kv_resident * raw + page_metadata
-                    used[d] += dense[layer] + kv_bytes + batch * (speculative + 1) * model.state[layer]
+                    dense_bytes = dense[layer]
+                    if model.family == "qwen35" and mode == "tp" and layer < model.layers:
+                        # Most Qwen3.5 projections are TP sharded; retain a
+                        # ten-percent replicated allowance for norms and buffers.
+                        dense_bytes = math.ceil(dense_bytes / len(mapping)) + math.ceil(dense_bytes / 10)
+                        kv_bytes = math.ceil(kv_bytes / min(len(mapping), model.tp_kv_heads))
+                    used[d] += dense_bytes + kv_bytes + batch * (speculative + 1) * model.state[layer]
                 if resident_bytes:
                     expert_targets = list(mapping) if mode == "tp" else [
                         layer_device(owner, resident, mapping) if owner < model.layers else next(reversed(mapping))]

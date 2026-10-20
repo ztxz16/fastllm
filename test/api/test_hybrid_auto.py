@@ -56,6 +56,22 @@ def write_gguf(path, metadata, tensors):
 
 
 class HybridAutoTest(unittest.TestCase):
+    def test_qwen35_fp8_payload_and_scale_are_budgeted_once(self):
+        metadata = dict(model_type='qwen3_5_text', num_hidden_layers=4,
+                        hidden_size=1024, num_attention_heads=8,
+                        num_key_value_heads=2, head_dim=128,
+                        intermediate_size=2048, max_position_embeddings=8192,
+                        layer_types=['linear_attention'] * 3 + ['full_attention'],
+                        linear_num_key_heads=4, linear_num_value_heads=8,
+                        linear_key_head_dim=64, linear_value_head_dim=64,
+                        linear_conv_kernel_dim=4, mtp_num_hidden_layers=1)
+        model = auto.geometry(metadata, 'float16', 0)
+        tensors = [auto.Tensor('model.layers.0.mlp.up_proj.weight', (128, 128), 16384, 'F8_E4M3'),
+                   auto.Tensor('model.layers.0.mlp.up_proj.weight_scale_inv', (1, 1), 4, 'F32')]
+        costs = auto.weight_costs(tensors, model, args(dtype='fp8_e4m3'))
+        self.assertEqual(costs[1][0], 16388)
+        self.assertEqual(model.kv, [0, 0, 0, 1024])
+
     def test_cli_opt_in_and_existing_defaults(self):
         defaults = make_normal_parser("test").parse_args([])
         self.assertFalse(auto.requested(defaults))
