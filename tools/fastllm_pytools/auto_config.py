@@ -402,7 +402,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                         cached_costs = costs
                         if implicit_embedding_bytes is None:
                             implicit_embedding_bytes = 0
-                            if (model.family == "qwen4" and graph_enabled and
+                            if (model.family in ("qwen4", "deepseek_v41") and graph_enabled and
                                     not prepared.cuda_embedding and not prepared.low_gpu_mem):
                                 embedding_args = copy.copy(prepared)
                                 embedding_args.cuda_embedding = True

@@ -537,7 +537,7 @@ class HybridAutoTest(unittest.TestCase):
               "index_source_layer_ids": [0, 2], "sliding_window": 128}
         g = auto.geometry(md, "fp8_e4m3", 0)
         self.assertEqual(g.kv, [528 + 132, 0, 264 + 66, 0])
-        self.assertEqual(g.state, [128 * 512 * 2] * 4)
+        self.assertEqual(g.state, [128 * 528] * 4)
         self.assertEqual(auto.geometry(md, "fp4", 0).kv, [288 + 68, 0, 144 + 34, 0])
         self.assertEqual(g.streamed_kv, [])
 
@@ -552,6 +552,152 @@ class HybridAutoTest(unittest.TestCase):
                 "dspark_target_layer_ids": [2, 3], "dspark_noise_token_id": 100,
                 "dspark_markov_rank": 32, "dspark_n_routed_experts": 128,
                 "dspark_num_experts_per_tok": 3, "vocab_size": 1024}
+
+    def test_v41_later_index_sources_share_persistent_keys(self):
+        md = self.dspark_metadata()
+        md["index_source_layer_ids"] = [0, 1, 2, 3]
+        g = auto.geometry(md, "float16", 0)
+        self.assertEqual(g.kv, [1280, 0, 640, 0])
+        self.assertEqual(g.kv_reallocation, [1024, 0, 512, 0])
+        self.assertEqual(sum(g.kv_padding), 2 * 256 * 1280)
+
+    def test_v41_native_kv_layout_and_1m_capacity_budget(self):
+        md = self.dspark_metadata()
+        md.update(num_hidden_layers=40, compress_ratios=[2] * 20 + [1] * 20,
+                  kv_source_layer_ids=[2, 8, 14, 20],
+                  index_source_layer_ids=[2, 8, 14, 20, 24, 28, 32, 36])
+        for dtype, per_token, window_row in [('float16', 3200, 1024),
+                                            ('float32', 3200, 1024),
+                                            ('fp8_e4m3', 1650, 528),
+                                            ('fp4', 890, 528),
+                                            ('fp4_e2m1', 890, 528)]:
+            with self.subTest(dtype=dtype):
+                g = auto.geometry(md, dtype, 0)
+                self.assertEqual(sum(g.kv), per_token)
+                self.assertEqual(sum(g.state), 40 * 128 * window_row)
+        g = auto.geometry(md, 'fp4', 0)
+        a = args(tokens=1048576, max_context_length=1048576, moe_device='disk',
+                 moe_device_layers=-1, moe_cuda_cache=0, moe_cpu_cache=0)
+        p = auto.plan(a, g, ([GiB] * 40, [MiB] * 40, 0, 0, GiB, False),
+                      'pp', {0: 1}, {0: dict(total=32 * GiB, free=32 * GiB)},
+                      dict(total=64 * GiB, available=64 * GiB))
+        self.assertEqual(p['kv_logical_bytes_per_device'][0], 890 * 1048576)
+        self.assertEqual(p['kv_capacity_bytes_per_device'][0], 890 * 1048576 * 3 // 2 + 4 * 256 * 356)
+        self.assertEqual(p['kv_reallocation_bytes_per_device'][0], 288 * 1048576)
+        self.assertLess(p['kv_capacity_bytes_per_device'][0] + p['kv_reallocation_bytes_per_device'][0], 1.6 * GiB)
+
+    def test_v41_score_budget_honors_native_chunk_overrides(self):
+        g = auto.geometry(self.dspark_metadata(), "float16", 0)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(auto._score_workspace(g, 4096, 1048576), 128 * MiB)
+            with patch.dict(os.environ, {"FASTLLM_DSV41_INDEX_CHUNK": "64"}):
+                self.assertEqual(auto._score_workspace(g, 4096, 1048576), 384 * MiB)
+            with patch.dict(os.environ, {"FASTLLM_DSV41_INDEX_SCORE_MB": "32"}):
+                self.assertEqual(auto._score_workspace(g, 4096, 1048576), 32 * MiB)
+            # Even a tiny byte budget must fit a full score row.
+            with patch.dict(os.environ, {"FASTLLM_DSV41_INDEX_SCORE_MB": "1"}):
+                self.assertEqual(auto._score_workspace(g, 4096, 1048576), 6 * MiB)
+
+    def test_v41_weight_budget_matches_native_precision_exceptions(self):
+        g = auto.geometry(self.dspark_metadata(), "float16", 0)
+        tensors = [auto.Tensor("layers.0.ffn.experts.0.w1.weight", (8, 8), 64, "F8_E4M3")]
+        for name in ("layers.0.attn.wq_b", "layers.0.attn.wo_a", "layers.0.engram.wkv"):
+            tensors += [auto.Tensor(name + ".weight", (64, 32), 2048, "F8_E4M3"),
+                        auto.Tensor(name + ".scale", (2, 1), 2, "F8_E8M0")]
+        tensors += [auto.Tensor("head.weight", (64, 32), 4096, "BF16"),
+                    auto.Tensor("layers.0.ffn.gate.weight", (8, 32), 512, "BF16")]
+        with patch.dict(os.environ, {}, clear=True):
+            sizes = auto._deepseek_v41_weight_sizes(tensors, args())
+            self.assertEqual(sizes["layers.0.attn.wq_b.weight"], 2056)
+            self.assertEqual(sizes["layers.0.attn.wq_b.scale"], 0)
+            self.assertNotIn("layers.0.attn.wo_a.weight", sizes)
+            self.assertEqual(sizes["head.weight"], 8192)
+            self.assertEqual(sizes["layers.0.ffn.gate.weight"], 1024)
+            self.assertEqual(sizes["layers.0.engram.wkv.weight"], 2056)
+            with patch.dict(os.environ, {"FASTLLM_DSV41_ENGRAM_WKV_FP8": "0"}):
+                self.assertNotIn("layers.0.engram.wkv.weight",
+                                 auto._deepseek_v41_weight_sizes(tensors, args()))
+            for dtype in ("float16", "bfloat16", "float32"):
+                self.assertNotIn("layers.0.attn.wq_b.weight",
+                                 auto._deepseek_v41_weight_sizes(tensors, args(dtype=dtype)))
+            # Missing scales must retain the existing conversion allowance.
+            no_scale = [t for t in tensors if not t.name.endswith(".scale")]
+            self.assertNotIn("layers.0.attn.wq_b.weight",
+                             auto._deepseek_v41_weight_sizes(no_scale, args()))
+            self.assertGreater(auto.weight_costs(no_scale, g, args())[1][0],
+                               auto.weight_costs(tensors, g, args())[1][0])
+
+    def test_v41_auto_shrinks_chunk_and_reserves_kv_expansion_at_1m(self):
+        g = auto.geometry(self.dspark_metadata(), "float16", 0)
+        costs = ([GiB] * 4, [MiB] * 4, 0, 0, GiB, False)
+        ram = dict(total=64 * GiB, available=64 * GiB)
+        a = args(tokens=1048576, max_context_length=1048576, moe_cuda_cache=0,
+                 moe_device_layers=-1, chunked_prefill_size=256)
+        with patch.dict(os.environ, {}, clear=True):
+            p = auto.plan(a, g, costs, "pp", {0: 1},
+                          {0: dict(total=32 * GiB, free=32 * GiB)}, ram)
+            reserve = (p["gpu_estimated_bytes"][0] - p["workspace_bytes_per_device"] -
+                       512 * MiB - sum(costs[1]) - sum(g.state))
+            self.assertGreaterEqual(reserve, 1.5 * a.tokens * sum(g.kv) +
+                                    a.tokens * max(g.kv_reallocation))
+            # Fit the smallest candidate, with no room for a larger one.
+            gpu = {0: dict(total=32 * GiB, free=p["gpu_estimated_bytes"][0] + 1)}
+            a.gpu_mem_ratio = 1
+            a.chunked_prefill_size = "auto"
+            fit = auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+            self.assertEqual((fit["context_tokens"], fit["chunked_prefill_size"]),
+                             (1048576, 256))
+            a.chunked_prefill_size = 512
+            with self.assertRaises(ValueError):
+                auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+
+    def test_v41_disk_workspace_reuse_has_guarded_scope_and_full_context_scores(self):
+        md = self.dspark_metadata()
+        md["quantization_config"] = {"quant_method": "fp8", "expert_dtype": "fp4",
+                                     "weight_block_size": [32, 32]}
+        g = auto.geometry(md, "float16", 0, 7)
+        a = args(moe_device="disk", fast_prefill=True)
+        with patch.dict(os.environ, {}, clear=True):
+            bounded = auto._workspace_bytes(a, g, 2048, 1048576, "pp", 0)
+            old = auto._workspace_bytes(a, g, 2048, 1048576, "tp", 0)
+            self.assertLess(bounded, old)
+            self.assertGreater(bounded, auto._workspace_bytes(a, g, 256, 1048576, "pp", 0))
+            for changes in (dict(moe_device="numa"), dict(dtype="float32"),
+                            dict(atype="float32"), dict(max_batch=2), dict(fast_prefill=False)):
+                other = copy.copy(a)
+                vars(other).update(changes)
+                self.assertEqual(auto._workspace_bytes(other, g, 2048, 1048576, "pp", 0), old)
+            self.assertEqual(auto._workspace_bytes(a, g, 2048, 1048576, "pp", 1), old)
+            with patch.dict(os.environ, {"FASTLLM_DSV41_DUMP_DIR": "/tmp/dump"}):
+                self.assertEqual(auto._workspace_bytes(a, g, 2048, 1048576, "pp", 0), old)
+            with patch.dict(os.environ, {"FASTLLM_DSV41_REFERENCE_MATH": "false"}):
+                # Native V41EnvFlag treats every non-empty value except "0" as enabled.
+                self.assertEqual(auto._workspace_bytes(a, g, 2048, 1048576, "pp", 0), old)
+            with patch.dict(os.environ, {"FASTLLM_DSV41_INDEX_SCORE_MB": "1024"}):
+                self.assertGreater(auto._workspace_bytes(a, g, 2048, 1048576, "pp", 0), bounded)
+
+    def test_v41_reused_workspace_preserves_chunk_boundary_and_kv_reserve(self):
+        md = self.dspark_metadata()
+        md["quantization_config"] = {"quant_method": "fp8", "expert_dtype": "fp4",
+                                     "weight_block_size": [32, 32]}
+        g = auto.geometry(md, "float16", 0)
+        a = args(moe_device="disk", fast_prefill=True, tokens=1048576,
+                 max_context_length=1048576, moe_device_layers=-1, moe_cpu_cache=0,
+                 moe_cuda_cache=0, chunked_prefill_size=2048, gpu_mem_ratio=1)
+        costs = ([GiB] * 4, [MiB] * 4, 0, 0, GiB, False)
+        ram = dict(total=64 * GiB, available=64 * GiB)
+        with patch.dict(os.environ, {}, clear=True):
+            p = auto.plan(a, g, costs, "pp", {0: 1}, {0: dict(total=32 * GiB, free=32 * GiB)}, ram)
+            gpu = {0: dict(total=32 * GiB, free=p["gpu_estimated_bytes"][0])}
+            a.chunked_prefill_size = "auto"
+            fit = auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+            self.assertEqual((fit["context_tokens"], fit["chunked_prefill_size"]), (1048576, 2048))
+            gpu[0]["free"] -= 1
+            smaller = auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+            self.assertEqual(smaller["chunked_prefill_size"], 1024)
+            a.chunked_prefill_size = 2048
+            with self.assertRaises(ValueError):
+                auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
 
     def test_dspark_has_bounded_draft_kv_and_budgets_every_draft_stage(self):
         md = self.dspark_metadata()

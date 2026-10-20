@@ -62,6 +62,30 @@ class AutoConfigTest(unittest.TestCase):
         for d in p['gpu_budget_bytes']:
             self.assertLessEqual(p['gpu_estimated_bytes'][d], p['gpu_budget_bytes'][d])
 
+
+    def test_deepseek_implicit_embedding_is_charged_before_chunk_selection(self):
+        self.g.family = 'deepseek_v41'
+        def costs(tensors, model, a):
+            c = list(self.costs)
+            if a.cuda_embedding and not a.low_gpu_mem:
+                c[2] += GiB
+            return tuple(c)
+        with patch.object(memory, 'model_inputs', return_value=({}, [], self.g)), \
+                patch.object(memory, 'geometry', return_value=self.g), \
+                patch.object(memory, 'weight_costs', side_effect=costs), \
+                patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+            plans = []
+            for flags in ((), ('--low_gpu_mem',)):
+                a = self.args('--device', 'cuda:0', '--moe_device', 'disk', '--moe_device_layers', '-1',
+                              '--chunked_prefill_size', '512', '--moe_cuda_cache', '0', *flags)
+                # Mark the default false explicitly to exercise normal mode.
+                if not flags:
+                    a._auto_explicit.append('low_gpu_mem')
+                plans.append(auto.resolve(a, self.gpu.__getitem__, hardware=self.hardware,
+                                          ram=self.ram, use_numa=True))
+            self.assertEqual(sum(plans[0]['gpu_estimated_bytes'].values()) -
+                             sum(plans[1]['gpu_estimated_bytes'].values()), GiB)
+
     def test_optional_memory_limits_cap_auto_planning_budgets(self):
         a = self.args('--auto-gpu-memory-limit', '6g', '--auto-host-memory-limit', '20g')
         p = self.resolve(a)
@@ -288,6 +312,8 @@ class AutoConfigTest(unittest.TestCase):
         a = self.args()
         self.resolve(a)
         self.assertEqual(a.max_context_length, 262144)
+
+
 
     def test_deepseek_auto_defaults_allow_explicit_opt_out_and_leave_other_models_alone(self):
         md = {'model_type': 'deepseek_v41', 'text_config': {'model_type': 'deepseek_v41_text'}}

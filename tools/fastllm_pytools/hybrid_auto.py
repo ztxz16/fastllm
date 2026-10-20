@@ -214,7 +214,10 @@ class Geometry:
     streamed_kv: list = field(default_factory=list)  # exact host-backed KV bytes/token/layer, excluding index
     dspark_block_size: int = 0  # draft forward retains the trained block when verifying fewer tokens
     attention_score_heads: int = 1  # dense GQA fallback may materialize one score matrix per query head
+    kv_reallocation: list = field(default_factory=list)  # largest growing tensor bytes/token/layer
+    kv_padding: list = field(default_factory=list)  # per-session capacity rounding bytes/layer
     tp_kv_heads: int = 0  # Qwen3.5 GQA KV heads available for TP sharding
+    disk_prefill: dict = field(default_factory=dict)  # native V4.1 BF16 workspace phases
 
 
 def geometry(metadata, kv_dtype, mtp, dspark=0):
@@ -233,6 +236,7 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
         family = "qwen35"
     elif family in ("deepseek_v41", "deepseek_v41_text"):
         family = "deepseek_v41"
+        kv_dtype = {"fp4_e2m1": "fp4", "bf16": "bfloat16"}.get(kv_dtype, kv_dtype)
         config = dict(config)
         for primary, alias in (("num_hidden_layers", "n_layers"), ("hidden_size", "dim"),
                                ("max_position_embeddings", "max_seq_len"), ("num_attention_heads", "n_heads"),
@@ -375,12 +379,18 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
                 return dim // 2 + dim // (32 if index else 16)
             if kv_dtype == "fp8_e4m3":
                 return dim + dim // 32
-            return dim * unit
+            # Native V4.1 always emits BF16 cache rows when not packed, even
+            # with an explicit float32 KV setting.
+            return dim * 2
         for i in config["kv_source_layer_ids"]:
             kv[i] += math.ceil(row(dim) / max(1, ratios[i]))
-        for i in config["index_source_layer_ids"]:
-            kv[i] += math.ceil(row(idxdim, True) / max(1, ratios[i]))
-        state = [int(config["sliding_window"]) * dim * max(2, unit or 2)] * layers
+        for i in config["kv_source_layer_ids"]:
+            # ForwardSegments appends indexK inside the isKvSource branch.
+            # Later index source layers reuse that source cache.
+            if i in config["index_source_layer_ids"]:
+                kv[i] += math.ceil(row(idxdim, True) / max(1, ratios[i]))
+        window_row = dim + dim // 32 if kv_dtype in ("fp4", "fp8_e4m3") else dim * 2
+        state = [int(config["sliding_window"]) * window_row] * layers
         score_divisor = min((r for r in ratios if r > 0), default=1)
         width = hidden * int(config.get("hc_mult", 4)) * 8 + int(config["num_attention_heads"]) * dim * 6
         chunk = 4096
@@ -405,8 +415,36 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
             # Preserve target hidden features and reserve proposal/verify logits.
             width += hidden * (len(targets) + 1) * 2
             state[-1] += (2 * dspark_block + 1) * int(get("vocab_size", "")) * 4
-    return Geometry(family, layers, context, hidden, experts, topk, inter, kv, state,
-                    score_divisor, width, chunk, streamed_kv, dspark_block)
+    result = Geometry(family, layers, context, hidden, experts, topk, inter, kv, state,
+                      score_divisor, width, chunk, streamed_kv, dspark_block)
+    if family == "deepseek_v41":
+        result.kv_reallocation = [0] * len(kv)
+        result.kv_padding = [0] * len(kv)
+        for i in config["kv_source_layer_ids"]:
+            result.kv_reallocation[i] = math.ceil(row(dim) / max(1, ratios[i]))
+            result.kv_padding[i] = 256 * (row(dim) + row(idxdim, True))
+        quant = metadata.get("quantization_config", {})
+        if (quant.get("quant_method") == "fp8" and quant.get("expert_dtype") == "fp4" and
+                quant.get("weight_block_size") == [32, 32]):
+            hc = int(config.get("hc_mult", 4))
+            heads = int(config["num_attention_heads"])
+            groups, rank = int(config.get("o_groups", 8)), int(config.get("o_lora_rank", hidden))
+            # Byte counts, not FP32 element counts. ReleaseForwardPrefill frees
+            # attention temporaries before WoA and MoE; hidden/features survive.
+            result.disk_prefill = {
+                "window": int(config["sliding_window"]),
+                "retained": hidden * hc * 4 + (hidden * (len(targets) + 1) * 2 if dspark else 0),
+                "attention": (heads * dim * 4 + hidden * 8 +
+                              int(config.get("q_lora_rank", hidden)) * 4 + dim * 8 +
+                              int(config.get("index_n_heads", heads)) * idxdim * 2 +
+                              max(int(config.get("index_topk", 512)),
+                                  int(config.get("candidate_topk_blocks", 2048))) * 8 +
+                              hc * (hc + 2) * 4),
+                "woa": heads * dim * 2 + groups * rank * 2 + hidden * 4,
+                "woa_weight": heads * dim * rank * 4,
+                "woa_scratch": (heads * dim + groups * rank) * 4,
+            }
+    return result
 
 
 def expert_layer(layer, model):
@@ -523,6 +561,50 @@ def _packed_fp4_sizes(tensors, args):
     return sizes
 
 
+def _deepseek_v41_weight_sizes(tensors, args):
+    """Mirror native V4.1 projection precision; unknown layouts keep the bound."""
+    by_name = {t.name: t for t in tensors}
+    sizes = {}
+    for tensor in tensors:
+        name = tensor.name
+        if tensor.kind.startswith("gguf:"):
+            continue
+        # GetTensorMap promotes these tensors even when --dtype is auto.
+        fp32 = (name == "head.weight" and "head.scale" not in by_name or
+                name.endswith((".ffn.gate.weight", ".confidence_head.proj.weight",
+                               ".attn.compressor.wkv.weight", ".attn.compressor.wgate.weight")))
+        if fp32 and tensor.kind in ("F16", "BF16", "F32", "F8_E4M3"):
+            sizes[name] = max(tensor.bytes, math.prod(tensor.shape) * 4)
+            continue
+        if tensor.kind != "F8_E4M3" or not name.endswith(".weight") or len(tensor.shape) != 2:
+            continue
+        dtype = (args.moe_dtype or args.dtype) if ".shared_experts." in name else args.dtype
+        if dtype != "auto":
+            continue
+        # Only ordinary native linears with a companion scale preserve FP8.
+        ordinary = bool(re.fullmatch(
+            r"(?:layers|mtp)\.\d+\.(?:attn\.(?:wq_a|wq_b|wkv|wo_b|indexer\.wq_b)|"
+            r"ffn\.shared_experts\.w[123]|main_proj)\.weight", name))
+        engram = (name.endswith(".engram.wkv.weight") and
+                  os.environ.get("FASTLLM_DSV41_ENGRAM_WKV_FP8", "1") != "0" and
+                  os.environ.get("FASTLLM_DSV41_REFERENCE_MATH", "0") in ("", "0"))
+        if not (ordinary or engram):
+            continue
+        prefix = name[:-len(".weight")]
+        if name.endswith(".attn.wkv.weight") and prefix + ".scale" not in by_name:
+            continue  # Otherwise the inherited cantQuantLinear mapping applies.
+        candidates = (name + "_scale_inv", name + "_scale", prefix + ".scale_inv", prefix + ".scale")
+        scale = next((by_name[n] for n in candidates if n in by_name), None)
+        if (scale is None or scale.kind not in ("F32", "BF16", "F8_E8M0", "U8") or
+                len(scale.shape) != 2 or min(*tensor.shape, *scale.shape) <= 0 or
+                any(w % s for w, s in zip(tensor.shape, scale.shape))):
+            continue
+        # Native scales may be expanded to FP32. Count them once with the payload.
+        sizes[name] = tensor.bytes + math.prod(scale.shape) * 4
+        sizes[scale.name] = 0
+    return sizes
+
+
 def _qwen35_weight_sizes(tensors, args):
     """Keep native block FP8 payloads and count expanded scales once."""
     by_name = {tensor.name: tensor for tensor in tensors}
@@ -552,7 +634,8 @@ def weight_costs(tensors, model, args):
     common, host, largest = 0, 0, 0
     snapshot = False
     packed_sizes = _packed_fp4_sizes(tensors, args)
-    native_sizes = _qwen35_weight_sizes(tensors, args) if model.family == "qwen35" else {}
+    native_sizes = (_deepseek_v41_weight_sizes(tensors, args) if model.family == "deepseek_v41" else
+                    _qwen35_weight_sizes(tensors, args) if model.family == "qwen35" else {})
     for tensor in tensors:
         name = tensor.name
         match = re.search(r"(?:^blk\.|(?:^|\.)layers\.)(\d+)\.", name)
@@ -656,7 +739,49 @@ def _score_workspace(model, rows, context):
         # Qwen3.5 uses tiled attention; it does not retain a full
         # batch × heads × chunk × context score matrix.
         return 512 * MiB
-    return rows * math.ceil(context / model.score_divisor) * 4 * model.attention_score_heads
+    columns = math.ceil(context / model.score_divisor)
+    if model.family != "deepseek_v41":
+        return rows * columns * 4 * model.attention_score_heads
+    # Match V41IndexScoreChunk, including overrides and the one-row lower bound.
+    def env_int(name, default):
+        match = re.match(r"\s*([+-]?\d+)", os.environ.get(name, ""))
+        return int(match[1]) if match else default
+    forced = env_int("FASTLLM_DSV41_INDEX_CHUNK", -1)
+    per_row = columns * 6  # FP32 scores plus candidate/mask allowance
+    if forced > 0:
+        return min(rows, forced) * per_row
+    budget = env_int("FASTLLM_DSV41_INDEX_SCORE_MB", 128)
+    budget = (budget if budget > 0 else 128) * MiB
+    return min(rows * per_row, max(budget, per_row))
+
+
+def _workspace_bytes(args, model, rows, context, mode, resident):
+    topk = max(model.topk, args.moe_experts)
+    scores = _score_workspace(model, rows, context)
+    dense = model.hidden * model.intermediate * 3 * 2
+    phase = model.disk_prefill
+    reusable = (phase and args.moe_device == "disk" and resident == 0 and mode == "pp" and
+                args.max_batch == 1 and rows > phase["window"] and args.fast_prefill and
+                args.dtype == "auto" and args.moe_dtype in ("", "auto") and
+                args.atype in ("auto", "bfloat16") and args.moe_atype in ("", "auto", "bfloat16") and
+                "FASTLLM_DSV41_DUMP_DIR" not in os.environ and
+                os.environ.get("FASTLLM_DSV41_REFERENCE_MATH", "0") in ("", "0"))
+    if not reusable:
+        return scores + rows * (model.activation_width + topk * (model.hidden + 3 * model.intermediate)) * 4 + dense
+    # Indexer scores retain their full-context budget. WoA's FP32 fallback
+    # expands one weight and at most 1024 rows (normally <=160 MiB).
+    attention = rows * phase["attention"] + scores
+    woa = (rows * phase["woa"] + phase["woa_weight"] +
+           min(rows, 1024) * phase["woa_scratch"])
+    # DiskMxfp4Prefill reuses a 256-row expert scratch, rather than allocating
+    # chunk * topk intermediates. Keep upload/repack/two in-flight records and
+    # a dense fallback working set separate from the persistent expert cache.
+    expert = (256 * (4 * model.hidden + 6 * model.intermediate) +
+              128 * MiB + dense)
+    moe = rows * (10 * model.hidden + 6 * model.intermediate + 8 * (topk + 1) +
+                  4 * model.experts) + expert
+    return rows * phase["retained"] + max(attention, woa, moe) + 32 * MiB
+
 
 def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_gpu=False,
          kv_resident=0, per_device_cache=False, implicit_embedding_bytes=0,
@@ -718,22 +843,19 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
         residents = [0 if host_layers < 0 else model.layers - host_layers]
     cache_auto = args.moe_cuda_cache == "auto"
     cpu_auto = args.moe_cpu_cache == "auto"
-    topk = max(model.topk, args.moe_experts)
     selected, selected_score = None, None
     speculative = max(args.mtp, getattr(args, "dspark", 0))
     for chunk in chunks:
         rows = batch * max(chunk + (1 if args.mtp else 0), speculative + 1, model.dspark_block_size)
-        # QSA/DSA score matrix, recurrent scan activations, routed expert
-        # intermediates and one dense dequantization working set.
-        workspace = (_score_workspace(model, rows, context) +
-                     rows * (model.activation_width + topk * (model.hidden + 3 * model.intermediate)) * 4 +
-                     model.hidden * model.intermediate * 3 * 2)
-        if streaming:
-            # Prefill stages one complete KV layer per device; the buffer is
-            # reused across layers. Do not count it as bounded by resident KV.
-            workspace += logical * layer_bytes
         for resident in residents:
+            workspace = _workspace_bytes(args, model, rows, context, mode, resident)
+            if streaming:
+                # Prefill stages one complete KV layer per device.
+                workspace += logical * layer_bytes
             used = {d: common + workspace + guard for d in mapping}
+            reallocation = dict.fromkeys(mapping, 0)
+            logical_kv = dict.fromkeys(mapping, 0)
+            capacity_kv = dict.fromkeys(mapping, 0)
             if implicit_embedding_bytes and not (hybrid_cpu_embedding and resident < model.layers):
                 # Qwen PP embeds on its first stage; TP and a full-GPU MTP
                 # pipeline may also need the shared table on other devices.
@@ -754,9 +876,19 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                 for d in targets:
                     host_by_device[d] += experts[layer] - resident_bytes
                     kv_bytes = (tokens + (speculative if model.dspark_block_size else 0)) * model.kv[layer]
+                    logical_kv[d] += kv_bytes
+                    if model.kv_reallocation:
+                        # V41AppendRows grows capacity by up to 1.5x plus row
+                        # rounding. Expansion allocates before freeing the old
+                        # tensor: allow one extra old buffer per device.
+                        logical_tokens = tokens + (speculative if model.dspark_block_size else 0)
+                        kv_bytes = (kv_bytes * 3 + 1) // 2 + batch * model.kv_padding[layer]
+                        reallocation[d] = max(reallocation[d],
+                                              logical_tokens * model.kv_reallocation[layer])
                     if streaming and model.streamed_kv[layer]:
                         raw = model.streamed_kv[layer]
                         kv_bytes = logical * (model.kv[layer] - raw) + kv_resident * raw + page_metadata
+                    capacity_kv[d] += kv_bytes
                     dense_bytes = dense[layer]
                     if model.family == "qwen35" and mode == "tp" and layer < model.layers:
                         # Most Qwen3.5 projections are TP sharded; retain a
@@ -769,6 +901,8 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                         layer_device(owner, resident, mapping) if owner < model.layers else next(reversed(mapping))]
                     for d in expert_targets:
                         used[d] += math.ceil(resident_bytes / len(expert_targets))
+            for d in mapping:
+                used[d] += reallocation[d]
             if host_experts == 0 and (not allow_full_gpu or streaming):
                 continue
             remaining = {d: gpu_limit[d] - used[d] for d in mapping}
@@ -818,6 +952,10 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     "auto_host_memory_limit": host_memory_limit}
             if independent and host_experts:
                 candidate["moe_cuda_cache_per_device"] = cache
+            if model.family == "deepseek_v41":
+                candidate["kv_logical_bytes_per_device"] = logical_kv
+                candidate["kv_capacity_bytes_per_device"] = capacity_kv
+                candidate["kv_reallocation_bytes_per_device"] = reallocation
             if streaming:
                 candidate["kvmem"] = {"max_tokens": context, "resident_tokens": kv_resident,
                                       "host_mib": kv_host_bytes // MiB, "prefill_tokens": chunk}
