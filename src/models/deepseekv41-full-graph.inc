@@ -146,9 +146,11 @@ void V41FullAdvance(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
 
 void DeepSeekV41Model::BuildFullDecodeGraph(
     int batch, const std::vector<std::shared_ptr<DeepSeekV41RequestState>> &states) {
-    // First enable ordinary BF16-KV GPU decode. Packed KV, speculative verify,
-    // other execution modes and unsupported shapes retain the existing path.
-    if (batch != 1 || executionMode != ExecutionMode::Gpu || v41DsparkEnabled ||
+    // Bound eagerly captured workspaces to small ordinary BF16-KV decode batches.
+    // Larger batches, packed KV, speculative verify and unsupported shapes retain
+    // the existing segmented/eager path.
+    if (batch < 1 || batch > 16 || executionMode != ExecutionMode::Gpu ||
+        v41DsparkEnabled ||
         (kvCacheDataType == DataType::FP8_E4M3 || kvCacheDataType == DataType::FP4_E2M1) ||
         !v41CudaGraphWarmingUp || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128 ||
         weight["head.weight"].dataType != DataType::FLOAT32)

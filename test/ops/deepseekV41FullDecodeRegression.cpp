@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
         ApplyDeviceMap({{"cpu", 1}}, 0, 1);
         FastllmCudaSetDevice(0);
         int checked = 0;
-        for (int batch : {1, 8, 128})
+        for (int batch : {1, 2, 4, 8, 16, 128})
             for (int ratio : {0, 1, 2})
                 for (int maskMode : {0, 1, 2}) {
                     if ((!ratio && maskMode) || (stress && batch != 1))

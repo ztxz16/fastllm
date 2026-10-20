@@ -6620,7 +6620,7 @@ namespace fastllm {
                         }
                         ForwardSegments(segments, ids, nullptr, nullptr, configs, last, nullptr, past);
                     }
-                    if (batch == 1) BuildFullDecodeGraph(batch, states);
+                    BuildFullDecodeGraph(batch, states);
                 }
             } catch (...) {
                 v41CudaGraphWarmingUp = false;
