@@ -2232,62 +2232,102 @@ namespace {
     }
 
 
+    template<bool Windowed>
+    __device__ __forceinline__ const __nv_bfloat16 *V41Sm75Candidate(
+            const __nv_bfloat16 *kv, const int32_t *indices, int c, int cap,
+            const __nv_bfloat16 *ring, const __nv_bfloat16 *chunk, int window, int start) {
+        if constexpr (Windowed) {
+            const int count = min(window, start + 1);
+            if (c < count) {
+                const int position = start - count + 1 + c;
+                return position == start ? chunk : ring + size_t(position % window) * 512;
+            }
+            c -= count;
+        }
+        const int idx = indices[c];
+        return idx >= 0 && idx < cap ? kv + size_t(idx) * 512 : nullptr;
+    }
+
     // SM75 compressed BF16 decode: materialize independent QK dots, then
     // retain the original candidate order and FP32 online-softmax recurrence.
     // Splitting only output dimensions requires no cross-CTA reduction.
+    template<bool Windowed = false>
     __global__ void __launch_bounds__(128)
     V41Sm75DecodeScores(const __nv_bfloat16 *q, const __nv_bfloat16 *kv,
-                       const int32_t *indices, int count, int cap, int heads, float *scores) {
+                       const int32_t *indices, int count, int cap, int heads, float *scores,
+                       const __nv_bfloat16 *ring = nullptr, const __nv_bfloat16 *chunk = nullptr,
+                       int window = 0, int start = 0) {
         const int token = blockIdx.z;
         q += (size_t)token * heads * 512;
-        indices += (size_t)token * count;
+        if constexpr (!Windowed) indices += (size_t)token * count;
         scores += (size_t)token * heads * count;
         __shared__ float keys[4][520];
+        __shared__ float queries[Windowed ? 4 : 1][520];
         const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
         const int c = blockIdx.x * 4 + warp;
         const int h = blockIdx.y * 4 + lane / 8;
-        const int idx = c < count ? indices[c] : -1;
-        const bool valid = idx >= 0 && idx < cap;
+        const auto *row = c < count ? V41Sm75Candidate<Windowed>(
+            kv, indices, c, cap, ring, chunk, window, start) : nullptr;
+        const bool valid = row != nullptr;
         if (valid) {
             for (int d = lane; d < 512; d += 32)
-                keys[warp][d + d / 64] = __bfloat162float(kv[(uint64_t)idx * 512 + d]);
+                keys[warp][d + d / 64] = __bfloat162float(row[d]);
         }
-        __syncwarp();
+        if constexpr (Windowed) {
+            // The dot lanes walk 64-value segments. Stage Q coalesced once
+            // per four heads instead of issuing strided global loads for
+            // every candidate and every scalar FMA.
+            for (int i = threadIdx.x; i < 4 * 512; i += 128) {
+                const int head = i / 512, d = i % 512;
+                queries[head][d + d / 64] = __bfloat162float(q[(blockIdx.y * 4 + head) * 512 + d]);
+            }
+            __syncthreads();
+        } else __syncwarp();
         if (!valid) return;
         const int segment = (lane % 8) * 64;
         float dot = 0.f;
         #pragma unroll
-        for (int d = 0; d < 64; ++d)
-            dot += __bfloat162float(q[h * 512 + segment + d]) * keys[warp][segment + segment / 64 + d];
+        for (int d = 0; d < 64; ++d) {
+            const float query = Windowed ? queries[lane / 8][segment + segment / 64 + d] :
+                __bfloat162float(q[h * 512 + segment + d]);
+            dot += query * keys[warp][segment + segment / 64 + d];
+        }
         dot += __shfl_xor_sync(0xffffffff, dot, 1);
         dot += __shfl_xor_sync(0xffffffff, dot, 2);
         dot += __shfl_xor_sync(0xffffffff, dot, 4);
         if (lane % 8 == 0) scores[h * count + c] = dot;
     }
 
+    template<bool Windowed = false>
     __global__ void __launch_bounds__(32)
     V41Sm75DecodeValues(const __nv_bfloat16 *kv, const int32_t *indices,
                        const float *scores, const float *sink, int count, int cap,
-                       int heads, float scale, __nv_bfloat16 *out) {
+                       int heads, float scale, __nv_bfloat16 *out,
+                       const __nv_bfloat16 *ring = nullptr, const __nv_bfloat16 *chunk = nullptr,
+                       int window = 0, int start = 0) {
         const int token = blockIdx.z;
-        indices += (size_t)token * count;
+        if constexpr (!Windowed) indices += (size_t)token * count;
         scores += (size_t)token * heads * count;
         out += (size_t)token * heads * 512;
-        constexpr int width = 32, Tile = 4;
-        const int h = blockIdx.x, first = blockIdx.y * width + threadIdx.x;
-        float acc = 0.f;
+        constexpr int width = 32, Tile = 4, Values = Windowed ? 4 : 1;
+        const int h = blockIdx.x, first = blockIdx.y * width * Values + threadIdx.x;
+        float acc[Values] = {};
         float mx = sink[h], l = 1.f;
         // Prefetch four candidates, then consume them in the original order.
         for (int base = 0; base < count; base += Tile) {
-            float sc[Tile], vv[Tile];
+            float sc[Tile], vv[Tile][Values];
             bool valid[Tile];
             #pragma unroll
             for (int j = 0; j < Tile; ++j) {
-                const int c = base + j, idx = c < count ? indices[c] : -1;
-                valid[j] = idx >= 0 && idx < cap;
+                const int c = base + j;
+                const auto *row = c < count ? V41Sm75Candidate<Windowed>(
+                    kv, indices, c, cap, ring, chunk, window, start) : nullptr;
+                valid[j] = row != nullptr;
                 if (valid[j]) {
                     sc[j] = scores[h * count + c];
-                    vv[j] = __bfloat162float(kv[(uint64_t)idx * 512 + first]);
+                    #pragma unroll
+                    for (int v = 0; v < Values; ++v)
+                        vv[j][v] = __bfloat162float(row[first + v * width]);
                 }
             }
             #pragma unroll
@@ -2295,12 +2335,15 @@ namespace {
                 const float s = sc[j] * scale;
                 const float next = fmaxf(mx, s), alpha = __expf(mx - next), p = __expf(s - next);
                 l = l * alpha + p;
-                acc = acc * alpha + p * vv[j];
+                #pragma unroll
+                for (int v = 0; v < Values; ++v) acc[v] = acc[v] * alpha + p * vv[j][v];
                 mx = next;
             }
         }
         const float inv = 1.f / l;
-        out[h * 512 + first] = __float2bfloat16_rn(acc * inv);
+        #pragma unroll
+        for (int v = 0; v < Values; ++v)
+            out[h * 512 + first + v * width] = __float2bfloat16_rn(acc[v] * inv);
     }
 
     // One thread owns one candidate/head dot. Stage keys transposed so all
@@ -4138,6 +4181,57 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttentionBatch(
     if (batch * headBlocks >= 64)
         return V41SparseAttentionBatchImpl<2>(requests, attnSink, windowSize, softmaxScale);
     return V41SparseAttentionBatchImpl<8>(requests, attnSink, windowSize, softmaxScale);
+}
+
+// Opt-in entry for hybrid eager decode. Other modes, architectures, graph
+// capture, batches and packed KV layouts retain their established path.
+extern "C" bool FastllmCudaDeepSeekV41HybridSparseAttention(const fastllm::Data &q,
+        const fastllm::Data &chunkKV, const fastllm::Data *ringKV,
+        const fastllm::Data *compressedKV, const fastllm::Data *cmpIdx,
+        fastllm::Data &attnSink, int windowSize, int startPos, float softmaxScale,
+        fastllm::Data &output) {
+    if (!V41OnCuda(q) || q.multiDeviceData || q.dims.size() != 4 ||
+        q.dims[0] != 1 || q.dims[1] != 1 || q.dims[3] != 512 ||
+        (q.dims[2] != 32 && q.dims[2] != 64) || q.dataType != DataType::BFLOAT16 ||
+        !V41OnCuda(chunkKV) || chunkKV.multiDeviceData || chunkKV.dataType != DataType::BFLOAT16 ||
+        chunkKV.dims != std::vector<int>({1, 1, 512}) || windowSize <= 0 || startPos < 0 ||
+        FastllmCudaGraphIsCapturingFast() || V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") ||
+        V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN") || !V41IsSm75()) return false;
+    if (startPos > 0 && (!ringKV || !V41OnCuda(*ringKV) || ringKV->multiDeviceData ||
+        ringKV->dataType != DataType::BFLOAT16 || ringKV->dims != std::vector<int>({1, windowSize, 512})))
+        return false;
+    const bool compressed = compressedKV && cmpIdx && compressedKV->Count(0) > 0;
+    if (compressed && (!V41OnCuda(*compressedKV) || compressedKV->multiDeviceData ||
+        compressedKV->dataType != DataType::BFLOAT16 || compressedKV->dims.size() != 3 ||
+        compressedKV->dims[0] != 1 || compressedKV->dims[2] != 512 ||
+        !V41OnCuda(*cmpIdx) || cmpIdx->multiDeviceData || cmpIdx->dataType != DataType::INT32 ||
+        cmpIdx->dims.size() != 3 || cmpIdx->dims[0] != 1 || cmpIdx->dims[1] != 1)) return false;
+    const int heads = q.dims[2], cap = compressed ? compressedKV->dims[1] : 0;
+    const int count = std::min(windowSize, startPos + 1) + (compressed ? cmpIdx->dims[2] : 0);
+    if (count < 32 || count > 4096 || attnSink.dataType != DataType::FLOAT32 ||
+        attnSink.Count(0) < heads || attnSink.multiDeviceData) return false;
+    void *allocation = nullptr;
+    if (FastllmCudaTryMalloc(&allocation, size_t(heads) * count * sizeof(float)) !=
+        FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
+    struct Scratch {
+        void *ptr;
+        ~Scratch() { if (!FastllmCudaFreeAfterCurrentThreadStream(ptr)) FastllmCudaFree(ptr); }
+    } scratch{allocation};
+    attnSink.ToDevice(DataDevice::CUDA);
+    if (!V41PrepareOutput(output, DataType::BFLOAT16, q.dims)) return false;
+    const auto *kv = compressed ? (const __nv_bfloat16 *)compressedKV->cudaData : nullptr;
+    const auto *indices = compressed ? (const int32_t *)cmpIdx->cudaData : nullptr;
+    const auto *ring = startPos > 0 ? (const __nv_bfloat16 *)ringKV->cudaData : nullptr;
+    const auto *chunk = (const __nv_bfloat16 *)chunkKV.cudaData;
+    auto *scores = static_cast<float *>(allocation);
+    V41Sm75DecodeScores<true><<<dim3((count + 3) / 4, heads / 4), 128>>>(
+        (const __nv_bfloat16 *)q.cudaData, kv, indices, count, cap, heads, scores,
+        ring, chunk, windowSize, startPos);
+    if (!V41CheckLaunch("HybridDecodeScores")) return false;
+    V41Sm75DecodeValues<true><<<dim3(heads, 4), 32>>>(kv, indices, scores,
+        (const float *)attnSink.cudaData, count, cap, heads, softmaxScale,
+        (__nv_bfloat16 *)output.cudaData, ring, chunk, windowSize, startPos);
+    return V41CheckLaunch("HybridDecodeValues");
 }
 
 extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, const fastllm::Data &chunkKV,

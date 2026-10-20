@@ -1257,7 +1257,7 @@ namespace fastllm {
 
         void V41SparseAttention(const Data &q, const Data &chunkKV, const Data *ringKV,
                                 const Data *compressedKV, const Data *cmpIdx, Data &attnSink,
-                                int windowSize, int startPos, float softmaxScale, Data &output) {
+                                int windowSize, int startPos, float softmaxScale, Data &output, bool hybrid) {
             DataDict datas = {
                 {"q", (Data*)&q}, {"chunkKV", (Data*)&chunkKV}, {"attnSink", &attnSink}, {"output", &output}
             };
@@ -1270,7 +1270,7 @@ namespace fastllm {
                 datas["cmpIdx"] = (Data*)cmpIdx;
             }
             V41Executor().Run("DeepSeekV41SparseAttention", datas, {{"softmaxScale", softmaxScale}},
-                              {{"windowSize", windowSize}, {"startPos", startPos}});
+                              {{"windowSize", windowSize}, {"startPos", startPos}, {"hybrid", hybrid}});
         }
 
         // float KV 行 -> 量化缓存行（INT8 Data）。(quantMode, quantBlock) 与写入前的伪量化一致：
@@ -5473,7 +5473,7 @@ namespace fastllm {
 #endif
                 {
                 V41SparseAttention(*qSeg, *kvSeg, windowStart > 0 ? &cache.windowKV : nullptr, compressedKV, cmpIdx,
-                                   weight[pre + ".attn.attn_sink"], window_size, windowStart, softmaxScale, *attnOutSeg);
+                                   weight[pre + ".attn.attn_sink"], window_size, windowStart, softmaxScale, *attnOutSeg, executionMode == ExecutionMode::Hybrid);
                 }
                 if (dumpDebug) {
                     std::string tag = "fl_layer" + std::to_string(layer);
@@ -5536,7 +5536,7 @@ namespace fastllm {
                         weight[pre + ".attn.attn_sink"], window_size, softmaxScale, tpDevices)) {
                         for (const auto &r : attentionRequests) {
                             V41SparseAttention(*r.q, *r.chunkKV, r.ringKV, r.compressedKV, r.indices,
-                                weight[pre + ".attn.attn_sink"], window_size, r.startPos, softmaxScale, *r.output);
+                                weight[pre + ".attn.attn_sink"], window_size, r.startPos, softmaxScale, *r.output, executionMode == ExecutionMode::Hybrid);
                         }
                     }
                     // Do not overwrite a ring row until attention has read it.

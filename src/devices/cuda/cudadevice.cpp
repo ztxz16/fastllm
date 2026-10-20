@@ -7024,13 +7024,18 @@ namespace fastllm {
 
     void CudaDeepSeekV41SparseAttentionOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        if (!FastllmCudaDeepSeekV41SparseAttention(*(datas.find("q")->second), *(datas.find("chunkKV")->second),
-                                                   CudaV41Optional(datas, "ringKV"), CudaV41Optional(datas, "compressedKV"),
-                                                   CudaV41Optional(datas, "cmpIdx"), *(datas.find("attnSink")->second),
-                                                   CudaV41Int(intParams, "windowSize", 128),
-                                                   CudaV41Int(intParams, "startPos", 0),
-                                                   CudaV41Float(floatParams, "softmaxScale", 1.0f),
-                                                   *(datas.find("output")->second))) {
+        auto run = [&](auto attention) {
+            return attention(*datas.at("q"), *datas.at("chunkKV"),
+                             CudaV41Optional(datas, "ringKV"), CudaV41Optional(datas, "compressedKV"),
+                             CudaV41Optional(datas, "cmpIdx"), *datas.at("attnSink"),
+                             CudaV41Int(intParams, "windowSize", 128), CudaV41Int(intParams, "startPos", 0),
+                             CudaV41Float(floatParams, "softmaxScale", 1.0f), *datas.at("output"));
+        };
+        if (CudaV41Int(intParams, "hybrid", 0) && !CudaV41Int(intParams, "multiCudaDispatch", 0)) {
+            if (run(FastllmCudaDeepSeekV41HybridSparseAttention)) return;
+            AssertInFastLLM(!FastllmCudaGetThreadError(), "Hybrid sparse attention failed.\n");
+        }
+        if (!run(FastllmCudaDeepSeekV41SparseAttention)) {
             ErrorInFastLLM("DeepSeekV41SparseAttention CUDA error: kernel rejected input.\n");
         }
     }
