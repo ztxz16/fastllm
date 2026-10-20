@@ -3320,6 +3320,7 @@ namespace fastllm {
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
         float swigluLimit = floatParams.find("swigluLimit") != floatParams.end() ?
                             floatParams.find("swigluLimit")->second : 0.0f;
+        const bool compactDecode = intParams.count("diskMoeDecode") && intParams.at("diskMoeDecode");
         bool deepSeekV4Mode = intParams.find("deepSeekV4Mode") != intParams.end() &&
                               intParams.find("deepSeekV4Mode")->second != 0;
         int activationQuantBlock = intParams.count("activationQuantBlock") ? intParams.at("activationQuantBlock") : 128;
@@ -4570,7 +4571,7 @@ namespace fastllm {
                             if (cpuInstructInfo.hasAVX512BF16) {
                                 LaunchLinearBFloat16NVFP4(expertBf16Input(idx), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
                             } else {
-                                LaunchLinearFloat32NVFP4(expertFloatInput(idx), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                                LaunchLinearFloat32NVFP4(expertFloatInput(idx), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread, compactDecode);
                             }
                         } else if (weight->dataType == DataType::BFLOAT16) {
                             LaunchLinearBFloat16BFloat16(expertBf16Input(idx), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
@@ -4690,7 +4691,7 @@ namespace fastllm {
                             if (cpuInstructInfo.hasAVX512BF16) {
                                 LaunchLinearBFloat16NVFP4((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
                             } else {
-                                LaunchLinearFloat32NVFP4(swigluResults[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
+                                LaunchLinearFloat32NVFP4(swigluResults[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread, compactDecode);
                             }
                         } else if (weightDown->dataType == DataType::BFLOAT16) {
                             LaunchLinearBFloat16BFloat16((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);

@@ -327,6 +327,7 @@ namespace fastllm {
         int blockK, blockM;
         float *scales;
         uint8_t *scaleBytes;
+        bool compactDecode = false;
 
         MultiThreadLinearFloat32NVFP4Op(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
                 int n, int m, int k, int st, int end,
@@ -411,7 +412,7 @@ namespace fastllm {
                                 std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum);
     void LaunchLinearFloat32NVFP4(float *inputData, Data &weight, float *outputData, float *biasData,
                                 int n, int m, int k,
-                                std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum);
+                                std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum, bool compactDecode = false);
     void LaunchLinearBFloat16BFloat16(uint16_t *inputData, Data &weight, float *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum);

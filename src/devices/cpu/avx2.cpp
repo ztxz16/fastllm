@@ -1450,6 +1450,44 @@ namespace fastllm {
 #endif
     }
 
+    // Disk MoE single-row block-32 projection. Keep the original four FMAs
+    // per block and scale accumulation order, but remove dynamic block bounds
+    // and keep only one column's partial sum live alongside the shared input.
+    bool LinearFloat32NVFP4E8M0Decode_AVX2_Kernel(const float *input, const uint8_t *weight,
+            const uint8_t *scales, float *output, int m, int k, int first, int last) {
+#ifdef __AVX2__
+        if (m <= 0 || m % 32 || first < 0 || last > k) return false;
+        const int blocks = m / 32, packed = m / 2;
+        int col = first;
+        for (; col + 4 <= last; col += 4) {
+            __m256 sum[4];
+            for (int c = 0; c < 4; ++c) sum[c] = _mm256_setzero_ps();
+            for (int b = 0; b < blocks; ++b) {
+                const __m256 x0 = _mm256_loadu_ps(input + b * 32);
+                const __m256 x1 = _mm256_loadu_ps(input + b * 32 + 8);
+                const __m256 x2 = _mm256_loadu_ps(input + b * 32 + 16);
+                const __m256 x3 = _mm256_loadu_ps(input + b * 32 + 24);
+                for (int c = 0; c < 4; ++c) {
+                    const uint8_t *w = weight + size_t(col + c) * packed + b * 16;
+                    __m256 v = _mm256_fmadd_ps(x0, NVFP4ToFloat32_AVX2(w), _mm256_setzero_ps());
+                    v = _mm256_fmadd_ps(x1, NVFP4ToFloat32_AVX2(w + 4), v);
+                    v = _mm256_fmadd_ps(x2, NVFP4ToFloat32_AVX2(w + 8), v);
+                    v = _mm256_fmadd_ps(x3, NVFP4ToFloat32_AVX2(w + 12), v);
+                    const float scale = NVFP4E8M0ScaleToFloatFast(scales[size_t(col + c) * blocks + b]);
+                    sum[c] = _mm256_fmadd_ps(v, _mm256_set1_ps(scale), sum[c]);
+                }
+            }
+            for (int c = 0; c < 4; ++c) output[col + c] = 0.f + Floatsum(sum[c]);
+        }
+        if (col < last)
+            LinearNVFP4_AVX2_Run<false>(input, const_cast<uint8_t *>(weight), nullptr, output,
+                1, m, k, col, last, 1, 32, nullptr, scales, blocks);
+        return true;
+#else
+        return false;
+#endif
+    }
+
     bool LinearBFloat16NVFP4E8M0_AVX2_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end, int blockK, int blockM, uint8_t *scaleBytes,
                         int ks, int ms) {

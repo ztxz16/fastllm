@@ -837,6 +837,8 @@ namespace fastllm {
     extern bool LinearFloat32NVFP4E8M0_AVX512F_Kernel(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end, int blockK, int blockM, uint8_t *scaleBytes,
         int ks, int ms);
+    extern bool LinearFloat32NVFP4E8M0Decode_AVX2_Kernel(const float *input, const uint8_t *weight,
+        const uint8_t *scales, float *output, int m, int k, int first, int last);
     extern bool LinearFloat32NVFP4E8M0_AVX2_Kernel(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end, int blockK, int blockM, uint8_t *scaleBytes,
         int ks, int ms);
@@ -1362,6 +1364,9 @@ namespace fastllm {
                     return;
                 }
             } else if (scaleBytes != nullptr) {
+                if (compactDecode && n == 1 && blockK == 1 && blockM == 32 && !biasData &&
+                    LinearFloat32NVFP4E8M0Decode_AVX2_Kernel(inputData, weightData, scaleBytes,
+                        outputData, m, k, st, end)) return;
                 if (LinearFloat32NVFP4E8M0_AVX2_Kernel(inputData, weightData, biasData, outputData,
                     n, m, k, st, end, blockK, blockM, scaleBytes, ks, ms)) {
                     return;
@@ -2258,7 +2263,7 @@ namespace fastllm {
 
     void LaunchLinearFloat32NVFP4(float *inputData, Data &weight, float *outputData, float *biasData,
         int n, int m, int k,
-        std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum, bool compactDecode) {
         float *scaleFloats = nullptr;
         uint8_t *scaleBytes = nullptr;
         PrepareNVFP4LinearScales(
@@ -2272,6 +2277,7 @@ namespace fastllm {
             }
             ops[startTid + i] = new MultiThreadLinearFloat32NVFP4Op(inputData, weight.cpuData, biasData, outputData,
                                     n, m, k, cur, end, scaleFloats, scaleBytes, weight.blockK, weight.blockM);
+            static_cast<MultiThreadLinearFloat32NVFP4Op *>(ops[startTid + i])->compactDecode = compactDecode;
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {

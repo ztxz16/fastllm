@@ -3323,6 +3323,7 @@ namespace fastllm {
         };
         IntDict params = intParams;
         params["weights___batch"] = params["biass___batch"] = 4;
+        params["diskMoeDecode"] = 1;
         struct Route { int token; float score; int slot; };
         std::vector<std::vector<Route>> routes(count + 1);
         for (int token = 0; token < tokens; ++token) {
