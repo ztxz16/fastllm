@@ -3250,11 +3250,15 @@ namespace fastllm {
                         }
                         if (seqLens.size() > 0) {
                             std::vector <std::pair <Data, Data> > *pastKeyValue1;
+                            ResponseContext *singleContext = nullptr;
                             bool isSingleText = false;
                             if (seqLens.size() == 1) {
-                                auto context = model->responseContextDict.dicts[handles[0]];
-                                pastKeyValue1 = &context->pastKeyValues;
-                                isSingleText = context->multimodalInput.empty();
+                                // Capture the selected request while holding dictLocker.
+                                // The first map entry may be a different queued or
+                                // completed request and can disappear during forward.
+                                singleContext = model->responseContextDict.dicts.at(handles[0]);
+                                pastKeyValue1 = &singleContext->pastKeyValues;
+                                isSingleText = singleContext->multimodalInput.empty();
                             }
                             dictLocker.unlock();
                             forwardLocker.lock();
@@ -3327,12 +3331,11 @@ namespace fastllm {
                                         }
                                     }
                                 } else {
-                                    auto context = model->responseContextDict.dicts.begin()->second;
-                                    if (context->multimodalInput.size() > 0) {
+                                    if (!singleContext->multimodalInput.empty()) {
                                         ret = model->ForwardMultimodal(inputIds,
                                                             attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
-                                                            *positionIds[0], *pastKeyValue1, context->multimodalInput,
-                                                           context->generationConfig, tokensManager, &logits);
+                                                            *positionIds[0], *pastKeyValue1, singleContext->multimodalInput,
+                                                            generationConfigs[0], tokensManager, &logits);
                                     } else {
                                         ret = std::vector <int> {model->Forward(inputIds,
                                                                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
