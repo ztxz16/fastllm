@@ -1309,14 +1309,9 @@ namespace {
         int rows, dim, position, mode, inverse, quantBlock;
     };
 
-    template<int STRIDE = 1, int ITEMS = 1>
-    __global__ void V41DecodeTransformsKernel(const V41DecodeTransformDescriptor *items,
-                                               V41RopeTable rope, int ropeDim, int windowSize) {
-        const auto item = items[(blockIdx.y / ITEMS) * STRIDE + blockIdx.y % ITEMS];
-        const int rowsPerBlock = 512 / item.dim;
-        const int row = blockIdx.x * rowsPerBlock + threadIdx.x / item.dim;
-        if (row >= item.rows) return;
-        const int d = threadIdx.x % item.dim;
+    __device__ __forceinline__ void V41DecodeTransformRow(
+            const V41DecodeTransformDescriptor &item, int row, int d,
+            V41RopeTable rope, int ropeDim, int windowSize) {
         auto *base = item.input + (size_t)row * item.dim;
         if (item.window) {
             item.window[(size_t)(item.position % windowSize) * 512 + d] = base[d];
@@ -1351,6 +1346,16 @@ namespace {
             v = V41QuantValueDev(v, scale, item.mode);
         }
         base[d] = __float2bfloat16_rn(v);
+    }
+
+    template<int STRIDE = 1, int ITEMS = 1>
+    __global__ void V41DecodeTransformsKernel(const V41DecodeTransformDescriptor *items,
+                                               V41RopeTable rope, int ropeDim, int windowSize) {
+        const auto item = items[(blockIdx.y / ITEMS) * STRIDE + blockIdx.y % ITEMS];
+        const int rowsPerBlock = 512 / item.dim;
+        const int row = blockIdx.x * rowsPerBlock + threadIdx.x / item.dim;
+        if (row >= item.rows) return;
+        V41DecodeTransformRow(item, row, threadIdx.x % item.dim, rope, ropeDim, windowSize);
     }
 
     // ---------------- Compress ----------------
@@ -4897,6 +4902,8 @@ extern "C" bool FastllmCudaV41DecodeIndexerBatch(
 }
 
 namespace {
+constexpr int kFullDecodeTransforms = 5;
+
 struct V41FullDecodePlan {
     FastllmV41FullDecodeConfig config;
     FastllmV41FullDecodeBuffers buffers;
@@ -4927,12 +4934,11 @@ struct V41FullDecodePlan {
 
 // Descriptor arrays are initialized on the GPU. Request addresses and lengths
 // may change on every replay without changing any graph node or launch shape.
-__global__ void V41FullDecodeSetup(FastllmV41FullDecodeConfig c, FastllmV41FullDecodeBuffers b,
+__device__ __forceinline__ void V41FullDecodeSetupRow(
+        int i, FastllmV41FullDecodeConfig c, FastllmV41FullDecodeBuffers b,
         const FastllmV41FullDecodeRequest *requests, V41DecodeTransformDescriptor *transforms,
         V41DecodeIndexDescriptor *index, V41AttentionDescriptor *attention,
         float *indexScores, float *blockScores, float *attentionScores, int tiles) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= c.batch) return;
     const auto r = requests[i];
     const int count = c.ratio ? (r.position + 1) / c.ratio : 0;
     const int blocks = c.ratio ? (count + c.blockSize - 1) / c.blockSize : 0;
@@ -4942,22 +4948,20 @@ __global__ void V41FullDecodeSetup(FastllmV41FullDecodeConfig c, FastllmV41FullD
     auto *out = static_cast<__nv_bfloat16 *>(b.output) + (size_t)i * c.heads * 512;
     auto *tk = c.ratio ? static_cast<int32_t *>(b.topk) + (size_t)i * c.topK : nullptr;
     auto *cand = c.ratio ? static_cast<uint8_t *>(b.candidates) + (size_t)i * maxBlocks : nullptr;
-    auto *t = transforms + i * 7;
-    t[0] = {q, nullptr, c.heads, 512, r.position, 0, 0, 32};
-    t[1] = {kv, nullptr, 1, 512, r.position, 1, 0, 32};
-    t[2] = {out, nullptr, c.heads, 512, r.position, 1, 1, 32};
-    t[3] = {kv, static_cast<__nv_bfloat16 *>(r.windowKV), 1, 512, r.position, 0, 0, 32};
+    auto *t = transforms + i * kFullDecodeTransforms;
+    t[0] = {out, nullptr, c.heads, 512, r.position, 1, 1, 32};
+    t[1] = {kv, static_cast<__nv_bfloat16 *>(r.windowKV), 1, 512, r.position, 0, 0, 32};
     if (c.kvSource) {
         const int blockPosition = (r.position / c.ratio) * c.ratio;
-        t[4] = {static_cast<__nv_bfloat16 *>(b.latents) + (size_t)i * 512,
+        t[2] = {static_cast<__nv_bfloat16 *>(b.latents) + (size_t)i * 512,
                 nullptr, 1, 512, blockPosition, 3, 0, 16};
         if (c.indexSource)
-            t[5] = {static_cast<__nv_bfloat16 *>(b.newIndexKeys) + (size_t)i * 128,
+            t[3] = {static_cast<__nv_bfloat16 *>(b.newIndexKeys) + (size_t)i * 128,
                     nullptr, 1, 128, blockPosition, 2, 0, 32};
     }
     if (c.indexSource) {
         auto *iq = static_cast<__nv_bfloat16 *>(b.indexQ) + (size_t)i * c.indexHeads * 128;
-        t[6] = {iq, nullptr, c.indexHeads, 128, r.position, 2, 0, 32};
+        t[4] = {iq, nullptr, c.indexHeads, 128, r.position, 2, 0, 32};
         index[i] = {iq, static_cast<const __nv_bfloat16 *>(r.indexK),
             static_cast<const float *>(b.indexWeights) + (size_t)i * c.indexHeads,
             indexScores + (size_t)i * c.maxKeys, blockScores + (size_t)i * maxBlocks,
@@ -4971,6 +4975,27 @@ __global__ void V41FullDecodeSetup(FastllmV41FullDecodeConfig c, FastllmV41FullD
     a.scores = attentionScores + (size_t)i * c.heads * tiles * kMmaNC;
     a.cap = count; a.topWidth = min(count, c.topK); a.startPos = r.position;
     attention[i] = a;
+}
+
+// Q/KV transforms read request and buffer arguments directly. They do not
+// depend on the descriptors initialized by the first CTA; later kernels see
+// both descriptor writes and transformed rows through ordinary stream order.
+__global__ void V41FullDecodePrepareKernel(
+        FastllmV41FullDecodeConfig c, FastllmV41FullDecodeBuffers b,
+        const FastllmV41FullDecodeRequest *requests, V41DecodeTransformDescriptor *transforms,
+        V41DecodeIndexDescriptor *index, V41AttentionDescriptor *attention,
+        float *indexScores, float *blockScores, float *attentionScores, int tiles,
+        V41RopeTable rope) {
+    const int token = blockIdx.y;
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        V41FullDecodeSetupRow(token, c, b, requests, transforms, index, attention,
+                             indexScores, blockScores, attentionScores, tiles);
+    const bool kv = blockIdx.x == c.heads;
+    auto *input = kv ? static_cast<__nv_bfloat16 *>(b.kv) + (size_t)token * 512 :
+        static_cast<__nv_bfloat16 *>(b.q) + ((size_t)token * c.heads + blockIdx.x) * 512;
+    const V41DecodeTransformDescriptor item{
+        input, nullptr, 1, 512, requests[token].position, kv ? 1 : 0, 0, 32};
+    V41DecodeTransformRow(item, 0, threadIdx.x, rope, c.ropeDim, c.window);
 }
 
 // Select a subset of the transform descriptors without uploading or reallocating.
@@ -5058,7 +5083,7 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
     };
     p->requests = static_cast<FastllmV41FullDecodeRequest *>(b.requests);
     bool ok = (p->requests || alloc(&p->requests, c.batch)) &&
-        alloc(&p->transforms, (size_t)c.batch * 7) &&
+        alloc(&p->transforms, (size_t)c.batch * kFullDecodeTransforms) &&
         alloc(&p->attention, c.batch) && alloc(&p->attentionScores, (size_t)c.batch * c.heads * p->tiles * kMmaNC);
     if (c.indexSource) ok = ok && alloc(&p->index, c.batch) &&
         alloc(&p->indexScores, (size_t)c.batch * c.maxKeys) && alloc(&p->blockScores, (size_t)c.batch * blocks);
@@ -5124,11 +5149,9 @@ bool FastllmCudaV41PrepareFullDecode(void *handle) {
     auto *p = static_cast<V41FullDecodePlan *>(handle);
     if (!p || FastllmCudaGetDevice() != p->device) return false;
     const auto &c = p->config; const auto &b = p->buffers;
-    V41FullDecodeSetup<<<(c.batch + 127) / 128, 128, 0, cudaStreamPerThread>>>(
+    V41FullDecodePrepareKernel<<<dim3(c.heads + 1, c.batch), 512, 0, cudaStreamPerThread>>>(
         c, b, p->requests, p->transforms, p->index, p->attention,
-        p->indexScores, p->blockScores, p->attentionScores, p->tiles);
-    // Independent descriptors share one launch; each row retains its original math.
-    V41DecodeTransformsKernel<7, 2><<<dim3(c.heads, c.batch * 2), 512, 0, cudaStreamPerThread>>>(p->transforms, p->rope, c.ropeDim, c.window);
+        p->indexScores, p->blockScores, p->attentionScores, p->tiles, p->rope);
     if (c.kvSource) {
         V41FullDecodeGather<<<c.batch, 512, 0, cudaStreamPerThread>>>(p->requests,
             static_cast<const float *>(b.rawKV), static_cast<const float *>(b.rawScore),
@@ -5146,14 +5169,14 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
     if (!p || FastllmCudaGetDevice() != p->device) return false;
     const auto &c = p->config; const auto &b = p->buffers;
     if (c.kvSource) {
-        V41DecodeTransformsKernel<7><<<dim3(1, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 4, p->rope, c.ropeDim, c.window);
+        V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3(1, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 2, p->rope, c.ropeDim, c.window);
         if (c.indexSource)
-            V41DecodeTransformsKernel<7><<<dim3(1, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 5, p->rope, c.ropeDim, c.window);
+            V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3(1, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 3, p->rope, c.ropeDim, c.window);
         V41FullDecodeAppend<<<c.batch, 512, 0, cudaStreamPerThread>>>(p->requests,
             static_cast<const __nv_bfloat16 *>(b.latents), static_cast<const __nv_bfloat16 *>(b.newIndexKeys), c.ratio, c.indexSource);
     }
     if (c.indexSource) {
-        V41DecodeTransformsKernel<7><<<dim3((c.indexHeads + 3) / 4, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 6, p->rope, c.ropeDim, c.window);
+        V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3((c.indexHeads + 3) / 4, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 4, p->rope, c.ropeDim, c.window);
         V41IndexerScoreDecodeMmaKernel<true, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
             nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
         if (c.writeCandidates) {
@@ -5168,6 +5191,6 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
     else if (p->fused) V41FullDecodeAttention<1, false>(*p);
     else V41FullDecodeAttention<1, true>(*p);
     // Independent descriptors share one launch; each row retains its original math.
-    V41DecodeTransformsKernel<7, 2><<<dim3(c.heads, c.batch * 2), 512, 0, cudaStreamPerThread>>>(p->transforms + 2, p->rope, c.ropeDim, c.window);
+    V41DecodeTransformsKernel<kFullDecodeTransforms, 2><<<dim3(c.heads, c.batch * 2), 512, 0, cudaStreamPerThread>>>(p->transforms, p->rope, c.ropeDim, c.window);
     return V41CheckLaunch("FullDecodeFinish");
 }
