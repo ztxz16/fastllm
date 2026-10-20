@@ -198,6 +198,12 @@ namespace fastllm {
 
         void OnModelWeightsLoaded() override;
 
+        // Reuse prefill scratch through decode. The existing pool bounds idle
+        // storage per device and reclaims it on allocation pressure.
+        bool RetainCudaWorkspace() const override {
+            return executionMode == ExecutionMode::Gpu;
+        }
+
         // V4.1 的 mtp.* 由本类自行解析（结构与 DeepSeek-V4 Flash 的内置 DSpark 不同）
         bool UsesEmbeddedV4Dspark() const override { return false; }
 
