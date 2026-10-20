@@ -2643,6 +2643,12 @@ bool FastllmCudaGlm5DiskExpert(const fastllm::Data &input, const fastllm::Data &
     const fastllm::Data &gate, const fastllm::Data &down, fastllm::Data &activation,
     fastllm::Data &output, float limit);
 
+// Stream native NVFP4 records and reduce token-ordered BF16 expert outputs.
+void FastllmCudaPackDiskMxfp4(const void *source, void *destination,
+    int rows, int columns, bool cross, void *stream);
+void FastllmCudaReduceDiskMxfp4(const void *values, float *sum,
+    const int *indices, int rows, int columns);
+
 // Only these two cache-owned projections may adopt the reversible layout.
 // The enclosing disk cache lock protects their storage throughout this scope.
 struct FastllmCudaDiskMxfp4Scope {

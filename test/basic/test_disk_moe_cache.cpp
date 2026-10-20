@@ -211,15 +211,35 @@ int main(int argc, char **argv) {
                 Require(GetDiskMoeCacheStats().cpuHits - adapted.cpuHits == 3, "cache did not adapt to new hot set");
             }
             for (int device = 0; device < devices; ++device) {
-                SetMoeCudaCacheBytes(0);
-                SetMoeCpuCacheBytes(f.expertBytes * (Fixture::experts + 1));
-                f.Run(true, 520, 0);
-                auto ramBefore = GetDiskMoeCacheStats();
-                Compare(f.Run(true, 520, 0, device), f.Run(false, 520, 0), false);
-                auto ramAfter = GetDiskMoeCacheStats();
-                Require(ramAfter.cpuHits > ramBefore.cpuHits && ramAfter.diskBytes == ramBefore.diskBytes,
-                    "warm RAM prefill read disk");
-                Require(ramAfter.cudaBytes == 0, "temporary prefill upload became permanent");
+                for (int batch : {128, 255, 520}) {
+                    // Select the GPU without retaining any GPU expert. With
+                    // 128 rows, routed experts receive only 64 rows each.
+                    SetMoeCudaCacheBytes(1);
+                    SetMoeCpuCacheBytes(0);
+                    auto cold = f.Run(true, batch, 0, device);
+                    SetMoeCpuCacheBytes(f.expertBytes * (Fixture::experts + 1));
+                    f.Run(true, batch, 0, device);
+                    auto ramBefore = GetDiskMoeCacheStats();
+                    auto cached = f.Run(true, batch, 0, device);
+                    Compare(cached, cold, true);
+                    Compare(cached, f.Run(false, batch, 0), false);
+                    auto ramAfter = GetDiskMoeCacheStats();
+                    Require(ramAfter.cpuHits > ramBefore.cpuHits && ramAfter.diskBytes == ramBefore.diskBytes,
+                        "warm RAM prefill read disk");
+                    Require(ramAfter.cudaBytes == 0, "temporary prefill upload became permanent");
+                }
+                // Repeated routes to one expert cross the 256-row boundary.
+                // Reduction must retain their order, including shared-expert
+                // input quantization being disabled.
+                for (bool quantShared : {false, true}) {
+                    SetMoeCudaCacheBytes(1);
+                    SetMoeCpuCacheBytes(0);
+                    auto cold = f.Run(true, 520, 1, device, false, 15, quantShared);
+                    SetMoeCpuCacheBytes(f.expertBytes * (Fixture::experts + 1));
+                    f.Run(true, 520, 1, device, false, 15, quantShared);
+                    Compare(f.Run(true, 520, 1, device, false, 15, quantShared), cold, true);
+                    Compare(cold, f.Run(false, 520, 1, -1, false, 15, quantShared), false);
+                }
                 SetMoeCpuCacheBytes(f.expertBytes * 4);
                 SetMoeCudaCacheBytes(f.expertBytes * 4);
                 for (int repeat = 0; repeat < 3; ++repeat) Compare(f.Run(true, 1, 0, device), f.Run(false, 1, 0), false);

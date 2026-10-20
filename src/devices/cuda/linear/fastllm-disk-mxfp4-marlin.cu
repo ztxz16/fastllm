@@ -12,6 +12,46 @@ namespace {
 using Kernel = void (*)(MARLIN_KERNEL_PARAMS);
 thread_local FastllmCudaDiskMxfp4Scope *diskScope = nullptr;
 
+// Canonical RAM records contain packed values followed by E8M0 scales.
+// Convert only the streamed GPU copy, including the gate/up row permutation.
+template<int width>
+__global__ void PackNative(const uint8_t *source, uint8_t *destination,
+                           int rows, int blocks, bool cross) {
+    int offset = (blockIdx.x * blockDim.x + threadIdx.x) * width;
+    int pitch = blocks * 17;
+    if (offset >= pitch) return;
+    for (int row = blockIdx.y; row < rows; row += gridDim.y) {
+        int original = cross ? row / 2 + (row % 2) * (rows / 2) : row;
+        int record = offset / 17, byte = offset % 17;
+        uint32_t value = 0;
+#pragma unroll
+        for (int j = 0; j < width; ++j) {
+            int b = byte + j, block = record;
+            if (b >= 17) { b -= 17; ++block; }
+            size_t src = size_t(original) * blocks + block;
+            uint8_t x = b < 16 ? source[src * 16 + b] :
+                source[size_t(rows) * blocks * 16 + src];
+            value |= uint32_t(x) << (j * 8);
+        }
+        if constexpr (width == 4)
+            reinterpret_cast<uint32_t *>(destination + size_t(row) * pitch)[offset / 4] = value;
+        else destination[size_t(row) * pitch + offset] = value;
+    }
+}
+
+// Routes of one expert are ordered by token. One thread owns each output
+// element and handles duplicate routes in order, without atomics or races.
+__global__ void ReduceRoutes(const __nv_bfloat16 *values, float *sum,
+                             const int *indices, int rows, int columns) {
+    int row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= columns || (row > 0 && indices[row - 1] == indices[row])) return;
+    size_t dst = size_t(indices[row]) * columns + col;
+    float value = sum[dst];
+    for (int r = row; r < rows && indices[r] == indices[row]; ++r)
+        value += __bfloat162float(values[size_t(r) * columns + col]);
+    sum[dst] = value;
+}
+
 void Check(cudaError_t status) {
     if (status != cudaSuccess)
         throw std::runtime_error(std::string("disk MXFP4 Marlin: ") + cudaGetErrorString(status));
@@ -166,6 +206,27 @@ bool Invalid(int *flag) {
     return invalid != 0;
 }
 } // namespace
+
+void FastllmCudaPackDiskMxfp4(const void *source, void *destination,
+        int rows, int columns, bool cross, void *stream) {
+    const int pitch = (columns / 32) * 17;
+    if (pitch % 4 == 0)
+        PackNative<4><<<dim3((pitch / 4 + 255) / 256, std::min(rows, 65535)), 256, 0,
+            static_cast<cudaStream_t>(stream)>>>(static_cast<const uint8_t *>(source),
+                static_cast<uint8_t *>(destination), rows, columns / 32, cross);
+    else
+        PackNative<1><<<dim3((pitch + 255) / 256, std::min(rows, 65535)), 256, 0,
+            static_cast<cudaStream_t>(stream)>>>(static_cast<const uint8_t *>(source),
+                static_cast<uint8_t *>(destination), rows, columns / 32, cross);
+    Check(cudaGetLastError());
+}
+
+void FastllmCudaReduceDiskMxfp4(const void *values, float *sum,
+        const int *indices, int rows, int columns) {
+    ReduceRoutes<<<dim3((columns + 255) / 256, rows), 256, 0, cudaStreamPerThread>>>(
+        static_cast<const __nv_bfloat16 *>(values), sum, indices, rows, columns);
+    Check(cudaGetLastError());
+}
 
 FastllmCudaDiskMxfp4Scope::FastllmCudaDiskMxfp4Scope(
         const fastllm::Data *gate, const fastllm::Data *down)
