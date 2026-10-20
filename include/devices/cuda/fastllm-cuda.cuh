@@ -546,6 +546,9 @@ bool FastllmCudaGlm5NextClampedSilu(const fastllm::Data &input, float limit, fas
 bool FastllmCudaDeepSeekV41MoeHcPost(const fastllm::Data &input,
     const fastllm::Data &shared, const fastllm::Data &residual,
     const fastllm::Data &post, const fastllm::Data &comb, fastllm::Data &output);
+// BF16 routed rows: preserve activation rounding before block-32 FP8 quantization.
+bool FastllmCudaDeepSeekV41BFloat16SwigluQuantized(const void *input, void *output,
+        int rows, int intermediate, float limit, const float *routeScales);
 bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit, fastllm::Data &output);
 bool FastllmCudaDeepSeekV41SharedSwigluQuantized(const fastllm::Data &input, float limit, fastllm::Data &output, const float *routeScales = nullptr);
 bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output);

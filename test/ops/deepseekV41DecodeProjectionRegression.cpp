@@ -178,13 +178,39 @@ static int CheckWoA() {
     }
     return cases;
 }
+static int CheckFusedSwigluQuantization() {
+    int cases = 0;
+    for (int rows : {1, 3, 6, 17, 96})
+    for (int width : {32, 96, 2304, 4096})
+    for (float amplitude : {0.0f, 0.3f, 12.0f})
+    for (float limit : {0.0f, 10.0f}) {
+        Data input, reference, fused;
+        Fill(input, {rows, 2 * width}, DataType::BFLOAT16, rows + width, amplitude);
+        Require(FastllmCudaSwigluClamped(input, limit, reference), "reference SwiGLU rejected");
+        Require(FastllmCudaDeepSeekV41QuantizeActivation(reference, reference),
+                "reference quantization rejected");
+        Fill(fused, {rows, width}, DataType::BFLOAT16, 4, 0.0f);
+        Require(FastllmCudaDeepSeekV41BFloat16SwigluQuantized(input.cudaData, fused.cudaData,
+                rows, width, limit, nullptr), "fused SwiGLU/quantization rejected");
+        Require(Bits(reference) == Bits(fused), "fused SwiGLU changed the BF16 rounding boundary");
+        ++cases;
+    }
+    Data output;
+    Fill(output, {1, 32}, DataType::BFLOAT16, 1, 1.0f);
+    const auto before = Bits(output);
+    Require(!FastllmCudaDeepSeekV41BFloat16SwigluQuantized(output.cudaData, output.cudaData,
+            1, 31, 10.0f, nullptr) && Bits(output) == before,
+            "unsupported quantization group mutated output");
+    return cases + 1;
+}
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     try {
         ApplyDeviceMap({{"cuda:0", 1}}, 0, 1);
         FastllmCudaSetDevice(0);
-        const int cases = CheckMixNorm() + CheckHcDecodeDots() + CheckRouter() + CheckWoA();
+        const int cases = CheckMixNorm() + CheckHcDecodeDots() + CheckRouter() + CheckWoA() +
+                          CheckFusedSwigluQuantization();
         std::printf("PASS V4.1 decode projections: %d exact cases\n", cases);
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());

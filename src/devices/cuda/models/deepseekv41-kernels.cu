@@ -3484,6 +3484,15 @@ static bool V41RunSharedSwiglu(const fastllm::Data &input, float limit, fastllm:
     return V41CheckLaunch("SharedSwiglu");
 }
 
+bool FastllmCudaDeepSeekV41BFloat16SwigluQuantized(const void *input, void *output,
+        int rows, int intermediate, float limit, const float *routeScales) {
+    if (!input || !output || rows <= 0 || intermediate <= 0 || intermediate % 32) return false;
+    const uint64_t count = (uint64_t)rows * intermediate;
+    V41SharedSwigluKernel<__nv_bfloat16, true><<<(count + 255) / 256, 256>>>(
+        (const __nv_bfloat16 *)input, (__nv_bfloat16 *)output, count, intermediate, limit, routeScales);
+    return V41CheckLaunch("BFloat16SwigluQuantized");
+}
+
 bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit, fastllm::Data &output) {
     return V41RunSharedSwiglu<false>(input, limit, output);
 }
