@@ -29,6 +29,9 @@ namespace fastllm {
     }
     struct MultiThreadBaseOp {
         virtual void Run() = 0;
+        // 任务一律经基类指针 delete。没有虚析构时派生类的析构不会执行，
+        // 其 std::string / map / vector 成员（如多卡派发的参数表）每次都会泄漏。
+        virtual ~MultiThreadBaseOp() = default;
     };
 
     struct AliveThreadTask {
@@ -151,8 +154,9 @@ namespace fastllm {
         }
 
         ~MultiThreadMultiOps() {
+            // 子任务由 new 单个分配（不是 new[]）。
             for (int i = 0; i < ops.size(); i++) {
-                delete[] ops[i];
+                delete ops[i];
             }
         }
     };

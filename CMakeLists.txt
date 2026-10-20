@@ -1021,6 +1021,10 @@ if (UNIT_TEST)
     target_link_libraries(device_operator_lifetime_test PRIVATE fastllm)
     add_test(NAME device_operator_lifetime COMMAND device_operator_lifetime_test)
 
+    add_executable(multithread_op_lifetime_test test/basic/test_multithread_op_lifetime.cpp)
+    target_link_libraries(multithread_op_lifetime_test PRIVATE fastllm)
+    add_test(NAME multithread_op_lifetime COMMAND multithread_op_lifetime_test)
+
     if (NOT WIN32)
         add_executable(glm5_next_gguf_test test/basic/test_glm5_next_gguf.cpp)
         target_link_libraries(glm5_next_gguf_test PRIVATE fastllm)
