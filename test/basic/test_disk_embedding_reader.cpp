@@ -74,9 +74,11 @@ int main() {
             setenv("FASTLLM_DISK_DIRECT_IO", direct ? "1" : "0", 1);
             for (auto types : {std::make_pair(DATA_GGUF_FORMAT, DATA_GGUF_FORMAT),
                                std::make_pair(FP8_E4M3, FP8_E4M3),
+                               std::make_pair(INT8, INT8),
                                std::make_pair(BFLOAT16, BFLOAT16),
                                std::make_pair(FLOAT16, FLOAT32)}) {
-                for (int columns : {32, 160, 256}) {
+                for (int columns : {8, 32, 160, 256}) {
+                    if (types.first == DATA_GGUF_FORMAT && columns % 32) continue;
                     Fixture f(types.first, types.second, columns);
                     for (size_t budget : {size_t(0), size_t(512), size_t(65536)}) {
                         DiskEmbeddingRowReader reader(f.weight, budget);

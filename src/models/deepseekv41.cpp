@@ -20,6 +20,7 @@
 #include "baseblock.h"
 #include "executor.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
+#include "devices/disk/diskdevice.h"
 #include "utils.h"
 #include "json11.hpp"
 
@@ -1686,6 +1687,8 @@ namespace fastllm {
             int scaleBlock = 32;
             Data *diskWeight = nullptr;
             Data diskScale;
+            std::unique_ptr<DiskEmbeddingRowReader> diskValueReader;
+            std::unique_ptr<DiskEmbeddingRowReader> diskScaleReader;
             const uint8_t *data = nullptr;      // FP8 E4M3, [rows, dim]
             const uint8_t *scale = nullptr;     // UE8M0, [rows, dim / scaleBlock]
             std::vector<uint8_t> dataStorage;
@@ -2421,6 +2424,11 @@ namespace fastllm {
                 table->diskScale.isDiskWeight = true;
                 table->diskScale.weightType = WeightType::EMBEDDING;
                 table->diskScale.diskWeightParts.push_back(std::move(scalePart));
+                if (executionMode == ExecutionMode::Hybrid) {
+                    // Read values and scales concurrently without a resident row cache.
+                    table->diskValueReader = std::make_unique<DiskEmbeddingRowReader>(embedding, 0);
+                    table->diskScaleReader = std::make_unique<DiskEmbeddingRowReader>(table->diskScale, 0);
+                }
                 printf("[Fastllm] DeepSeek-V4.1: engram table for layer %d ready (disk).\n", layer);
                 engramTables.push_back(std::static_pointer_cast<void>(table));
                 continue;
@@ -2702,7 +2710,26 @@ namespace fastllm {
         uint16_t *dst = (uint16_t*)output.cpuData;
         static const FP8E4M3ToFP32Manager fp8;
         Data diskValues, diskScales;
-        if (table.diskWeight != nullptr) {
+        DiskEmbeddingRowReader::Ticket valueRead, scaleRead;
+        const uint8_t *values = table.data, *scales = table.scale;
+        if (tokens > 1 && table.diskValueReader && table.diskScaleReader) {
+            std::vector<int32_t> lookupRows;
+            lookupRows.reserve(rows.size());
+            for (int64_t row : rows) {
+                AssertInFastLLM(row >= 0 && row < table.rows, "DeepSeekV41: engram hash out of range.");
+                lookupRows.push_back((int32_t)row);
+            }
+            valueRead = table.diskValueReader->ReadAsync(lookupRows);
+            scaleRead = table.diskScaleReader->ReadAsync(lookupRows);
+            const auto &rawValues = valueRead.values.get();
+            const auto &rawScales = scaleRead.values.get();
+            AssertInFastLLM(rawValues.size() == rows.size() * dim &&
+                            rawScales.size() == rows.size() * scaleCols,
+                            "DeepSeekV41: disk engram row size mismatch.");
+            // Tickets keep both buffers alive until the conversion workers join.
+            values = rawValues.data();
+            scales = rawScales.data();
+        } else if (table.diskWeight != nullptr) {
             Data lookupRows(DataType::INT32, {tokens, cols});
             lookupRows.Allocate(false);
             for (size_t i = 0; i < rows.size(); i++) {
@@ -2713,6 +2740,8 @@ namespace fastllm {
                 {{"input", &lookupRows}, {"weight", table.diskWeight}, {"output", &diskValues}}, {}, {});
             V41Executor().RunOnDevice("disk", "EmbeddingDirect",
                 {{"input", &lookupRows}, {"weight", &table.diskScale}, {"output", &diskScales}}, {}, {});
+            values = diskValues.cpuData;
+            scales = diskScales.cpuData;
         }
 
         const std::function<void(int, int)> worker = [&](int st, int end) {
@@ -2721,8 +2750,8 @@ namespace fastllm {
                     int64_t row = rows[(size_t)t * cols + c];
                     AssertInFastLLM(row >= 0 && row < table.rows, "DeepSeekV41: engram hash out of range.");
                     const uint64_t sourceRow = table.diskWeight != nullptr ? (uint64_t)t * cols + c : row;
-                    const uint8_t *src = (table.diskWeight != nullptr ? diskValues.cpuData : table.data) + sourceRow * dim;
-                    const uint8_t *sc = (table.diskWeight != nullptr ? diskScales.cpuData : table.scale) + sourceRow * scaleCols;
+                    const uint8_t *src = values + sourceRow * dim;
+                    const uint8_t *sc = scales + sourceRow * scaleCols;
                     uint16_t *out = dst + ((uint64_t)t * cols + c) * dim;
                     for (int d = 0; d < dim; d++) {
                         float v = fp8.dict[src[d]] * V41E8M0ToFloat(sc[d / table.scaleBlock]);
