@@ -248,7 +248,7 @@ namespace fastllm {
     class DiskDirectRange {
     public:
         DiskDirectRange(const DiskWeightPart &part, uint64_t offset, uint64_t bytes,
-                        bool allowScratch = true) {
+                        bool allowScratch = true, uint8_t *readBuffer = nullptr) {
             AssertInFastLLM(part.fileOffset >= 0 && offset <= part.bytes &&
                             bytes <= part.bytes - offset && bytes > 0,
                             "Disk direct read range is invalid: " + part.fileName + "\n");
@@ -268,8 +268,10 @@ namespace fastllm {
                                 std::numeric_limits<size_t>::max() - (alignment - 1),
                             "Disk direct read aligned range is too large.\n");
             bufferBytes = (requiredBytes + alignment - 1) / alignment * alignment;
-            buffer = allowScratch ? diskDirectScratch.Acquire(bufferBytes) : nullptr;
-            if (buffer != nullptr) {
+            buffer = readBuffer ? readBuffer : (allowScratch ? diskDirectScratch.Acquire(bufferBytes) : nullptr);
+            if (readBuffer) {
+                usesExternalBuffer = true;
+            } else if (buffer != nullptr) {
                 usesScratch = true;
             } else {
                 void *ptr = nullptr;
@@ -314,7 +316,7 @@ namespace fastllm {
             }
             if (usesScratch) {
                 diskDirectScratch.Release();
-            } else {
+            } else if (!usesExternalBuffer) {
                 free(buffer);
             }
             buffer = nullptr;
@@ -324,6 +326,104 @@ namespace fastllm {
         size_t bufferBytes = 0;
         size_t prefixBytes = 0;
         bool usesScratch = false;
+        bool usesExternalBuffer = false;
+    };
+
+    class DiskExpertReadBatch;
+    static thread_local DiskExpertReadBatch *diskExpertReadBatch = nullptr;
+
+    // Gate/up and down may have different destination layouts while their
+    // source payloads (or scales) are consecutive. Share only exact runs;
+    // never bridge gaps or read other experts just to enlarge a request.
+    class DiskExpertReadBatch {
+        struct Run {
+            DiskWeightPart part;
+            std::unique_ptr<DiskDirectRange> data;
+            size_t bufferOffset;
+        };
+        // A bounded, reusable mapping avoids both heap fragmentation among
+        // cached weights and faulting a new large temporary for every expert.
+        struct Scratch {
+            uint8_t *buffer = nullptr;
+            size_t capacity = 0;
+            bool inUse = false;
+            ~Scratch() { if (buffer) munmap(buffer, capacity); }
+            uint8_t *Acquire(size_t bytes) {
+                if (!bytes || inUse) return nullptr;
+                if (bytes > capacity) {
+                    if (buffer) munmap(buffer, capacity);
+                    buffer = nullptr;
+                    capacity = 0;
+                    void *ptr = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                    if (ptr == MAP_FAILED) return nullptr;
+                    buffer = (uint8_t*)ptr;
+                    capacity = bytes;
+                }
+                inUse = true;
+                return buffer;
+            }
+        };
+        static Scratch &GetScratch() { static thread_local Scratch scratch; return scratch; }
+        std::vector<Run> runs;
+        DiskExpertReadBatch *previous;
+        uint8_t *readBuffer = nullptr;
+    public:
+        DiskExpertReadBatch(const Data &gate, const Data &down)
+            : previous(diskExpertReadBatch) {
+            if (DiskDirectIoEnabled()) {
+                constexpr uint64_t limit = 32ULL << 20;
+                std::vector<DiskWeightPart> parts;
+                for (const Data *weight : {&gate, &down}) {
+                    for (const auto &part : weight->diskWeightParts) {
+                        if (part.fileOffset >= 0 && part.bytes && part.bytes <= limit &&
+                            part.bytes <= uint64_t(std::numeric_limits<off_t>::max()) -
+                                uint64_t(part.fileOffset)) parts.push_back(part);
+                    }
+                }
+                std::sort(parts.begin(), parts.end(), [](const auto &a, const auto &b) {
+                    return a.fileName != b.fileName ? a.fileName < b.fileName : a.fileOffset < b.fileOffset;
+                });
+                uint64_t stagedBytes = 0;
+                for (size_t first = 0; first < parts.size();) {
+                    DiskWeightPart run = parts[first];
+                    size_t next = first + 1;
+                    while (next < parts.size() && parts[next].fileName == run.fileName &&
+                           uint64_t(parts[next].fileOffset) == uint64_t(run.fileOffset) + run.bytes &&
+                           parts[next].bytes <= limit - run.bytes) {
+                        run.bytes += parts[next++].bytes;
+                    }
+                    const uint64_t alignedBytes = (uint64_t(run.fileOffset) % 4096 + run.bytes + 4095) / 4096 * 4096;
+                    if (next > first + 1 && alignedBytes <= limit - stagedBytes) {
+                        runs.push_back({std::move(run), nullptr, (size_t)stagedBytes});
+                        stagedBytes += alignedBytes;
+                    }
+                    first = next;
+                }
+                readBuffer = GetScratch().Acquire(stagedBytes);
+                if (!readBuffer) runs.clear();
+            }
+            diskExpertReadBatch = this;
+        }
+        ~DiskExpertReadBatch() {
+            diskExpertReadBatch = previous;
+            if (readBuffer) GetScratch().inUse = false;
+        }
+
+        bool Read(const DiskWeightPart &part, uint64_t offset, uint64_t bytes, uint8_t *dst) {
+            if (part.fileOffset < 0) return false;
+            for (auto &run : runs) {
+                if (part.fileName != run.part.fileName || part.fileOffset < run.part.fileOffset) continue;
+                const uint64_t relative = uint64_t(part.fileOffset) - uint64_t(run.part.fileOffset);
+                if (relative > run.part.bytes || offset > run.part.bytes - relative ||
+                    bytes > run.part.bytes - relative - offset) continue;
+                if (!run.data) run.data.reset(new DiskDirectRange(run.part, 0, run.part.bytes,
+                                                                 false, readBuffer + run.bufferOffset));
+                memcpy(dst, run.data->Get() + relative + offset, bytes);
+                return true;
+            }
+            return false;
+        }
     };
 
     static void ReadDiskPartRange(const DiskWeightPart &part, uint64_t offset,
@@ -333,6 +433,7 @@ namespace fastllm {
         if (bytes == 0) {
             return;
         }
+        if (diskExpertReadBatch && diskExpertReadBatch->Read(part, offset, bytes, dst)) return;
         if (DiskDirectIoEnabled()) {
             DiskDirectRange direct(part, offset, bytes);
             memcpy(dst, direct.Get(), bytes);
@@ -1845,11 +1946,13 @@ namespace fastllm {
     };
 
     static std::unique_ptr<DiskCachedExpert> ReadDiskExpert(const Data *gate, const Data *down, bool repackCpu) {
+        AssertInFastLLM(gate != nullptr && down != nullptr, "Disk expert weights are missing.\n");
         struct ReadScope {
             bool previous = diskExpertRead;
             ReadScope() { diskExpertRead = true; }
             ~ReadScope() { diskExpertRead = previous; }
         } scope;
+        DiskExpertReadBatch reads(*gate, *down);
         std::unique_ptr<DiskCachedExpert> expert(new DiskCachedExpert);
         expert->gate.reset(LoadDiskWeight(gate, &expert->gateStorage));
         expert->down.reset(LoadDiskWeight(down, &expert->downStorage));
@@ -2896,11 +2999,12 @@ namespace fastllm {
                 glmGGUF(weights[2 * e], weights[2 * e + 1]);
         }
 #endif
-        const int prefetchDepth = nativeGlm || (v4 && quantBlock == 32 && tokens <= 8) ? 2 : 1;
+        int prefetchDepth = nativeGlm || (v4 && quantBlock == 32 && tokens <= 8) ? 2 : 1;
         // Workers may start the next queued read while the coordinator computes
         // or maintains the cache. Bound completed + in-flight payloads as well
-        // as task count; large prefill keeps its existing streaming window.
-        const int prefetchWindow = v4 && quantBlock == 32 && tokens == 1 ? 8 : prefetchDepth;
+        // as task count. GPU prefill may widen this after selecting an offloaded
+        // expert; CPU-only execution keeps its existing streaming window.
+        int prefetchWindow = v4 && quantBlock == 32 && tokens == 1 ? 8 : prefetchDepth;
         auto readBytes = [&](int id) {
             uint64_t bytes = 0;
             for (const Data *w : {weights[id * 2], weights[id * 2 + 1]}) {
@@ -3177,6 +3281,13 @@ namespace fastllm {
                 if (transientGpu) {
                     UploadDiskExpert(*transientGpu, device);
                     gpu = transientGpu.get();
+                    // Overlap the next expert's disk read with host preparation.
+                    // Reuse the bounded queue; only widen GPU NVFP4 prefill.
+                    if (tokens >= 128 && input.dataType == BFLOAT16 &&
+                        gpu->gate->dataType == NVFP4_BLOCK_32_E8M0 &&
+                        gpu->down->dataType == NVFP4_BLOCK_32_E8M0) {
+                        prefetchDepth = prefetchWindow = 2;
+                    }
                 }
             }
 #endif
