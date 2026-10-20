@@ -457,6 +457,7 @@ if (USE_CUDA)
         src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/moe/fastllm-moe-cache.cu
         src/devices/cuda/moe/fastllm-moe-gguf-cache.cu
+        src/devices/cuda/moe/fastllm-moe-v41-gguf.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu
@@ -1324,6 +1325,16 @@ if (UNIT_TEST)
     if (USE_CUDA)
         target_include_directories(deepseekV41PrecisionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME deepseekV41PrecisionCuda COMMAND deepseekV41PrecisionRegression --cuda)
+        if (NOT USE_ROCM)
+            add_executable(deepseekV41GgufIndexedRegression test/ops/deepseekV41GgufIndexedRegression.cpp)
+            target_link_libraries(deepseekV41GgufIndexedRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41GgufIndexedRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME deepseekV41GgufIndexed COMMAND deepseekV41GgufIndexedRegression)
+            add_test(NAME deepseekV41GgufGrouped COMMAND deepseekV41GgufIndexedRegression --grouped-full)
+            add_test(NAME deepseekV41GgufGroupedSparse COMMAND deepseekV41GgufIndexedRegression --sparse)
+            set_tests_properties(deepseekV41GgufIndexed deepseekV41GgufGrouped deepseekV41GgufGroupedSparse
+                PROPERTIES LABELS cuda TIMEOUT 300 SKIP_RETURN_CODE 77)
+        endif()
         set_tests_properties(deepseekV41PrecisionCuda PROPERTIES LABELS cuda TIMEOUT 300)
         add_executable(deepseekV41TpRegression test/ops/deepseekV41TpRegression.cpp)
         target_link_libraries(deepseekV41TpRegression PRIVATE fastllm)

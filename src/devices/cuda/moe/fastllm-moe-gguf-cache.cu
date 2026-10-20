@@ -13,6 +13,7 @@
 #include "fastllm-moe-gguf-q8.cuh"
 #include "fastllm-moe-deepseekv41-cache.cuh"
 #include "fastllm-moe-v41-q8.cuh"
+#include "fastllm-cuda-v41-gguf.h"
 #include <algorithm>
 #include <atomic>
 #include <climits>
@@ -1218,6 +1219,60 @@ bool FastllmCudaMergeMOEGGUFResidentIndexed(
         case fastllm::BFLOAT16: return Compute<__nv_bfloat16>(input, gate, output, view, scores, topk);
         default: return false;
     }
+}
+
+bool FastllmCudaMergeMOEV41GGUFResident(
+        const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &activation,
+        fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
+        int weightsBatch, const fastllm::Data &indices, const fastllm::Data &scores,
+        float sharedScale, float swigluLimit) {
+    using fastllm_gguf_moe::AllocateTensor;
+    const int device = FastllmCudaGetDevice();
+    if (input.dataDevice != fastllm::CUDA || input.dataType != fastllm::BFLOAT16 ||
+        input.dataDeviceIds != std::vector<int>{device} || !input.cudaData ||
+        input.dims.size() != 2 || input.dims[0] <= 0 || input.dims[0] > 4096 ||
+        !weights || weightsBatch < 4 || weightsBatch%2 || !weights[2] || !weights[3] ||
+        (weights[0] && sharedScale != 0) || weights[2]->dims.size() != 2 ||
+        weights[2]->dataType != fastllm::DATA_GGUF_FORMAT ||
+        weights[3]->dataType != fastllm::DATA_GGUF_FORMAT ||
+        indices.dataDevice != fastllm::CUDA || indices.dataType != fastllm::INT32 ||
+        scores.dataDevice != fastllm::CUDA || scores.dataType != fastllm::FLOAT32 ||
+        indices.dataDeviceIds != input.dataDeviceIds || scores.dataDeviceIds != input.dataDeviceIds ||
+        indices.dims.size() != 2 || indices.dims[0] != input.dims[0] ||
+        indices.dims[1] <= 0 || indices.dims[1] > 32 || scores.dims != indices.dims ||
+        !indices.cudaData || !scores.cudaData || !std::isfinite(swigluLimit) || swigluLimit < 0)
+        return false;
+    const auto supported = [](int type) {
+        return type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_K ||
+               type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
+               type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M;
+    };
+    // Validate before constructing a persistent pointer table or launching work.
+    if (!supported(weights[2]->ggmlType) || !supported(weights[3]->ggmlType)) return false;
+    const int hidden = input.dims[1], inter = weights[2]->dims[0]/2;
+    if (hidden <= 0 || inter <= 0 || hidden > 24576 || inter > 24576 ||
+        hidden%256 || inter%256 || weights[2]->dims[1] != hidden) return false;
+    auto layer = GetResidentLayer(weights, weightsBatch, device);
+    if (!layer) return false;
+    const int rows = input.dims[0], topk = indices.dims[1], routes = rows*topk;
+    size_t bytes = (size_t(rows)*(hidden/32) + size_t(routes)*(inter/32))*sizeof(block_q8_1) +
+        size_t(routes)*hidden*sizeof(__nv_bfloat16);
+    const size_t groupedBytes = FastllmCudaV41GGUFGroupedWorkspaceBytes(layer->gateType, layer->downType,
+            rows, hidden, inter, layer->experts, topk);
+    // Preserve the original large-batch fallback for unsupported MMQ formats
+    // or hardware; do not multiply every token with a GEMV kernel.
+    if (rows > 32 && !groupedBytes) return false;
+    bytes = ((bytes+255)&~size_t(255)) + groupedBytes;
+    if (routes > 65535 || bytes > size_t(INT32_MAX)) return false;
+    AllocateTensor(gate, fastllm::BFLOAT16, {routes, 2*inter}, device);
+    AllocateTensor(activation, fastllm::BFLOAT16, {routes, inter}, device);
+    AllocateTensor(workspace, fastllm::INT8, {int(bytes)}, device);
+    AllocateTensor(output, fastllm::FLOAT32, {rows, hidden}, device);
+    fastllm::AssertInFastLLM(FastllmCudaRunV41GGUF(input, gate, activation, workspace,
+        output, layer->table, static_cast<const int32_t *>(indices.cudaData),
+        static_cast<const float *>(scores.cudaData), layer->gateType, layer->downType,
+        hidden, inter, layer->experts, topk, swigluLimit), "V4.1 resident GGUF CUDA launch failed.");
+    return true;
 }
 
 namespace v41_gguf_cache {

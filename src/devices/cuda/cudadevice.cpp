@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include "devices/cuda/fastllm-cuda-gguf-linear-add.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
@@ -10271,7 +10272,7 @@ namespace fastllm {
     // Architecture-independent V4.1 fallback. Only route metadata is staged
     // on the host; the original weights and all arithmetic stay on CUDA.
     // This eager path deliberately does not claim CUDA Graph compatibility.
-    static void DoCudaMergeMOEV41Fallback(Data &input, Data &output,
+    void DoCudaMergeMOEV41Fallback(Data &input, Data &output,
             Data &index, Data &score, Data **weights, int weightsBatch,
             float sharedScale, float swigluLimit) {
         AssertInFastLLM(input.dataType == DataType::BFLOAT16 &&
@@ -10377,6 +10378,11 @@ namespace fastllm {
         clearIfOnOtherDevice(output);
         if (deepSeekV41) {
             AssertInFastLLM(gateType == MoeGateSwiglu, "V4.1 MoE requires SwiGLU.");
+#ifndef USE_ROCM
+            // Unsupported formats/batches retain the reference fallback.
+            if (FastllmCudaMergeMOEV41GGUFResident(input, w1, w2, w3, output,
+                    weights, weightsBatch, index, score, sharedScale, swigluLimit)) return;
+#endif
             DoCudaMergeMOEV41Fallback(input, output, index, score, weights,
                 weightsBatch, sharedScale, swigluLimit);
             return;

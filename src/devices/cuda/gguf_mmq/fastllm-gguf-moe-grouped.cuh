@@ -147,7 +147,7 @@ __global__ void Quantize(const T *input, block_q8_1_mmq *output,
     if (col%32 == 0) q.d4[(col%128)/32] = __half2float(__float2half_rn(scale));
 }
 
-template<ggml_type Type, int Tile = kTile, bool SelectRows = false>
+template<ggml_type Type, int Tile = kTile, bool SelectRows = false, bool NativeV41 = false>
 __global__ void Matmul(const uint8_t *const *weights, int part,
                        const block_q8_1_mmq *input, float *output,
                        const int *counts, const int *offsets, const int *tileExperts,
@@ -174,6 +174,12 @@ __global__ void Matmul(const uint8_t *const *weights, int part,
             output+size_t(begin)*width, padded, width, stride, counts[e], capacity, localTile);
     } else if constexpr (SelectRows && Type == GGML_TYPE_Q4_K) {
         mul_mat_q_process_tile<Type, Tile, MMQ_NWARPS, true, false, hybrid_q4_mmq_type_traits, (Tile > kTile)>(
+            reinterpret_cast<const char *>(weights[2*e+part]),
+            reinterpret_cast<const char *>(input+begin), output+size_t(begin)*width,
+            nullptr, padded, width, stride, padded, counts[e], capacity, width,
+            blockIdx.x, localTile, 0, padded/256);
+    } else if constexpr (NativeV41 && (Type == GGML_TYPE_Q2_K || Type == GGML_TYPE_Q4_K || Type == GGML_TYPE_IQ1_S)) {
+        mul_mat_q_process_tile<Type, Tile, MMQ_NWARPS, true, false, native_v41_mmq_type_traits, (Tile > kTile)>(
             reinterpret_cast<const char *>(weights[2*e+part]),
             reinterpret_cast<const char *>(input+begin), output+size_t(begin)*width,
             nullptr, padded, width, stride, padded, counts[e], capacity, width,
@@ -269,22 +275,22 @@ __global__ void IQ1Gate(const block_q8_1 *input, T *gate,
     if (threadIdx.x%32 == 0) gate[size_t(route)*inter+row] = mmq_io<T>::from_float(value);
 }
 
-template<ggml_type Type, int Tile = kTile, bool SelectRows = false>
+template<ggml_type Type, int Tile = kTile, bool SelectRows = false, bool NativeV41 = false>
 static void LaunchMatrix(const uint8_t *const *weights, int part, Workspace &w,
                           int experts, int columns, int width, cudaStream_t stream) {
     const int device = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[device].cc;
     constexpr ggml_type SharedType = Type == GGML_TYPE_Q2_0 ? GGML_TYPE_Q8_0 :
-        Type == GGML_TYPE_Q4_K ? GGML_TYPE_Q2_K : Type;
+        (Type == GGML_TYPE_Q4_K || (NativeV41 && Type == GGML_TYPE_IQ1_S)) ? GGML_TYPE_Q2_K : Type;
     constexpr bool packedQ2 = SelectRows && Type == GGML_TYPE_Q2_K;
     const int shared = packedQ2 ? (Tile*MMQ_TILE_Y_K + hybrid_q2_mmq::kOutputTile*MMQ_MMA_TILE_X_K_Q2_K)*sizeof(int)
         : mmq_get_shmem<SharedType>(Tile, get_mmq_y_host(cc), cc);
     static std::once_flag initialized[GGML_CUDA_MAX_DEVICES];
     std::call_once(initialized[device], [shared]() {
-        CUDA_CHECK(cudaFuncSetAttribute(Matmul<Type, Tile, SelectRows>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared));
+        CUDA_CHECK(cudaFuncSetAttribute(Matmul<Type, Tile, SelectRows, NativeV41>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared));
     });
     const int outputTile = packedQ2 ? hybrid_q2_mmq::kOutputTile : get_mmq_y_host(cc);
-    Matmul<Type, Tile, SelectRows><<<dim3((width+outputTile-1)/outputTile, w.activeRows/kTile),
+    Matmul<Type, Tile, SelectRows, NativeV41><<<dim3((width+outputTile-1)/outputTile, w.activeRows/kTile),
         dim3(32, packedQ2 ? hybrid_q2_mmq::kWarps : MMQ_NWARPS), shared, stream>>>(weights, part, w.quantized, w.products,
             w.counts, w.offsets, w.tileExperts, experts, columns, width, w.capacity,
             int(ggml_row_size(Type, columns)));

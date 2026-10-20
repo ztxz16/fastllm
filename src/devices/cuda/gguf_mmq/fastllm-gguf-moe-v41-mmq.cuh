@@ -46,7 +46,52 @@ __device__ void Load(const char *x, int *tile, const int &block,
     NO_DEVICE_CODE;
 #endif
 }
-template <int mmq_x, int mmq_y, int nwarps>
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void LoadIQ1S(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int & kbx0, const int & i_max, const int & stride) {
+
+    int   * x_qs = (int   *)  x_tile;
+    float2 * x_ds = (float2 *) (x_qs + WARP_SIZE*2);
+
+
+    const int kqsx = threadIdx.x % QI1_S;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * WARP_SIZE/QI1_S) {
+        int i = i0 + threadIdx.y*(WARP_SIZE/QI1_S) + threadIdx.x/QI1_S;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_iq1_s * bxi = (const block_iq1_s *)(x + i*stride) + kbx0;
+
+        const uint32_t qs_packed = (uint32_t)get_int_b2(bxi->qs, kqsx);
+
+        const int qh = bxi->qh[kqsx];
+
+    #pragma unroll
+        for (int l = 0; l < QR1_S/2; ++l) {
+            const unsigned q = (qs_packed >> (8u*(unsigned)l)) & 0xffu;
+            const int grid = iq1s_grid_gpu[q | (((qh >> (3*l)) & 0x07) << 8)];
+
+            const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+            const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+
+            x_qs[i*MMQ_MMA_TILE_X_K_Q2_K + 8*kqsx + (2*l+0)] = grid0;
+            x_qs[i*MMQ_MMA_TILE_X_K_Q2_K + 8*kqsx + (2*l+1)] = grid1;
+
+        }
+
+        const float  d1q   = __half2float(bxi->d) * (((qh >> 11) & 0x0E) + 1);
+        const float  delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f*IQ1S_DELTA/0x8000);
+
+        x_ds[i*(MMQ_MMA_TILE_X_K_Q2_K/2) + 2*kqsx] = make_float2(d1q, delta);
+        x_ds[i*(MMQ_MMA_TILE_X_K_Q2_K/2) + 2*kqsx+1] = make_float2(d1q, delta);
+
+    }
+}
+
+template <int mmq_x, int mmq_y, int nwarps, bool Block32 = false, bool IQ1S = false>
 static __device__ __forceinline__ void DotV41(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int & k00) {
 #ifdef INT8_MMA_AVAILABLE
@@ -103,7 +148,7 @@ static __device__ __forceinline__ void DotV41(
 
 #pragma unroll
     for (int j0 = 0; j0 < mmq_x; j0 += ntx*mma_C::J) {
-        float dB[mma_C::ne/2];
+        float dB[mma_C::ne/2], sB[mma_C::ne/2];
 
 #pragma unroll
         for (int l = 0; l < mma_C::ne/2; ++l) {
@@ -114,13 +159,26 @@ static __device__ __forceinline__ void DotV41(
 
 #pragma unroll
         for (int k01 = 0; k01 < WARP_SIZE; k01 += QI8_1) {
+            // Native CUDA Q8_1 has an independent FP16-rounded scale per
+            // 32 values. NUMA Q8_K retains one FP32 scale for the whole block.
+            if constexpr (Block32) {
+#pragma unroll
+                for (int l = 0; l < mma_C::ne/2; ++l) {
+                    const int j = j0 + mma_C::get_j(l);
+                    if constexpr (IQ1S) {
+                        const float2 ds = __half22float2(reinterpret_cast<const half2 *>(y)[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                        dB[l] = ds.x;
+                        sB[l] = ds.y;
+                    } else dB[l] = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+                }
+            }
             mma_B B[2];
 
             B[0].load(y_qs + j0*MMQ_TILE_Y_K + (k01 + 0),        MMQ_TILE_Y_K);
             B[1].load(y_qs + j0*MMQ_TILE_Y_K + (k01 + mma_B::K), MMQ_TILE_Y_K);
 
             mma_C Cm[2];
-            {
+            if constexpr (!IQ1S) {
                 mma_A A1;
                 A1.x[0] = 0x01010101;
                 A1.x[1] = 0x01010101;
@@ -137,11 +195,18 @@ static __device__ __forceinline__ void DotV41(
 
 #pragma unroll
                 for (int l = 0; l < mma_C::ne; ++l) {
-                    float tmp = Cd[0].x[l]*dA[n][l/2][k01/4 + 0] + Cd[1].x[l]*dA[n][l/2][k01/4 + 1];
-                    {
+                    if constexpr (IQ1S) {
+                        // Match GEMV's d1q * (Q8 scale * integer dot +
+                        // rounded real-input sum * delta), without extra
+                        // FP16 rounding of the expanded weight scales.
+                        const float tmp = dA[n][l/2][k01/4] *
+                            (dB[l%2]*(Cd[0].x[l] + Cd[1].x[l]) + sB[l%2]*mA[n][l/2][k01/4]);
+                        sum[(j0/mma_C::J + n)*mma_C::ne + l] += tmp;
+                    } else {
+                        float tmp = Cd[0].x[l]*dA[n][l/2][k01/4 + 0] + Cd[1].x[l]*dA[n][l/2][k01/4 + 1];
                         tmp -= Cm[0].x[l]*mA[n][l/2][k01/4 + 0] + Cm[1].x[l]*mA[n][l/2][k01/4 + 1];
+                        sum[(j0/mma_C::J + n)*mma_C::ne + l] += tmp*dB[l%2];
                     }
-                    sum[(j0/mma_C::J + n)*mma_C::ne + l] += tmp*dB[l%2];
                 }
             }
         }
@@ -161,4 +226,19 @@ struct v41_mmq_type_traits {
     static constexpr vec_dot_mmq_t vec_dot_mma = v41_mmq::DotV41<X, Y, Warps>;
     // Host admission requires INT8 MMA; retain a well-formed device template.
     static constexpr vec_dot_mmq_t vec_dot_dp4a = v41_mmq::DotV41<X, Y, Warps>;
+};
+
+// Use the same integer bias sums as the native GEMV K-format reference,
+// avoiding the rounded real-input sums used by generic MMQ's DS4 format.
+template<int X, int Y, int Warps, bool Check, ggml_type Type>
+struct native_v41_mmq_type_traits : v41_mmq_type_traits<X,Y,Warps,Check,Type> {
+    static constexpr vec_dot_mmq_t vec_dot_mma = v41_mmq::DotV41<X,Y,Warps,true>;
+    static constexpr vec_dot_mmq_t vec_dot_dp4a = v41_mmq::DotV41<X,Y,Warps,true>;
+};
+
+template<int X, int Y, int Warps, bool Check>
+struct native_v41_mmq_type_traits<X,Y,Warps,Check,GGML_TYPE_IQ1_S> {
+    static constexpr load_tiles_mmq_t load_tiles = v41_mmq::LoadIQ1S<Y,Warps,Check>;
+    static constexpr vec_dot_mmq_t vec_dot_mma = v41_mmq::DotV41<X,Y,Warps,true,true>;
+    static constexpr vec_dot_mmq_t vec_dot_dp4a = v41_mmq::DotV41<X,Y,Warps,true,true>;
 };

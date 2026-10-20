@@ -30,6 +30,10 @@ namespace fastllm {
     void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis);
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
         Data **weights, Data **biass, float sharedScale, MoeGateType gateType = MoeGateSwiglu, int weightsBatch = -1, float swigluLimit = 0.0f, bool deepSeekV41 = false);
+    // Eager reference for unsupported V4.1 layouts and numerical regression.
+    // Requires the original expert allocations; unavailable after Marlin repack.
+    void DoCudaMergeMOEV41Fallback(Data &input, Data &output, Data &index, Data &score,
+        Data **weights, int weightsBatch, float sharedScale, float swigluLimit);
     void DoCudaFusedMOE(Data &input, Data &output, Data &index, Data &score,
         Data &gate, Data &up, Data &down, Data &w1,
         MoeGateType gateType = MoeGateSwiglu, float swigluLimit = 0.0f,

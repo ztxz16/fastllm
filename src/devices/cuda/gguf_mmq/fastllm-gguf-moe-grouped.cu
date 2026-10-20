@@ -1,4 +1,5 @@
 #include "fastllm-cuda-gguf-projections.h"
+#include "fastllm-cuda-v41-gguf.h"
 #include "fastllm-gguf-mmq-common.cuh"
 #include "fastllm-gguf-moe-stream.cuh"
 #include "fastllm-gguf-moe-glm5.h"
@@ -12,9 +13,11 @@
 
 namespace fastllm_gguf_mmq {
 #include "mmq.cuh"
+#include "fastllm-gguf-mmq-iq1.cuh"
 #include "../moe/fastllm-moe-gguf-q8.cuh"
 #include "fastllm-gguf-mmq-io.cuh"
 #include "fastllm-gguf-moe-grouped.cuh"
+#include "fastllm-gguf-moe-v41-native.cuh"
 } // namespace fastllm_gguf_mmq
 
 size_t fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(int gateType, int downType,
@@ -124,4 +127,55 @@ bool fastllm_gguf_mmq::RunStreamedMoe(StreamedMoePhase phase, const fastllm::Dat
 #undef STREAMED_RUN
         default: return false;
     }
+}
+
+size_t FastllmCudaV41GGUFGroupedWorkspaceBytes(int gateType, int downType,
+        int rows, int hidden, int inter, int experts, int topk) {
+    using namespace fastllm_gguf_mmq;
+    const auto supported = [](int type) {
+        return type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ||
+            type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K;
+    };
+    if (rows <= 32 || rows > 4096 || !supported(gateType) || !supported(downType) ||
+        hidden <= 0 || hidden > 24576 || hidden%256 ||
+        inter <= 0 || inter > 24576 || inter%256 ||
+        experts <= 0 || experts > 1024 || topk <= 0 || topk > 32 ||
+        rows*topk + experts*(grouped_moe::kTile-1) + grouped_moe::kTile-1 > 65535 ||
+        !int8_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) return 0;
+    return grouped_moe::Workspace(nullptr, rows, hidden, inter, experts, topk).bytes;
+}
+
+bool FastllmCudaV41GGUFGroupedProjection(bool gate, int type, const void *inputQ8,
+        void *outputBF16, const void *weightPointers, const int32_t *indices,
+        void *workspace, int rows, int hidden, int inter, int experts, int topk) {
+    using namespace fastllm_gguf_mmq;
+    grouped_moe::Workspace w(workspace, rows, hidden, inter, experts, topk);
+    const auto *weights = static_cast<const uint8_t *const *>(weightPointers);
+    if (gate) grouped_moe::PrepareRoutes(weights, indices, w, rows*topk, experts, cudaStreamPerThread);
+    const int columns = gate ? hidden : inter, width = gate ? 2*inter : hidden;
+    // IQ1_S consumes the original FP16 scale AND sum. K-format bias
+    // corrections use integer sums; all other formats consume D4 scales.
+    const bool ds4 = type == GGML_TYPE_IQ1_S;
+    const dim3 gather((w.activeRows+7)/8, columns/128);
+    if (ds4) grouped_moe::GatherNativeV41<true><<<gather, 256, 0, cudaStreamPerThread>>>(
+        static_cast<const block_q8_1 *>(inputQ8), w.quantized, w.groupRoutes,
+        w.offsets+experts, columns, w.capacity, gate ? topk : 1);
+    else grouped_moe::GatherNativeV41<false><<<gather, 256, 0, cudaStreamPerThread>>>(
+        static_cast<const block_q8_1 *>(inputQ8), w.quantized, w.groupRoutes,
+        w.offsets+experts, columns, w.capacity, gate ? topk : 1);
+    if (type == GGML_TYPE_IQ1_S) ensure_iq1s_grid(cudaStreamPerThread);
+    switch (type) {
+#define NATIVE_MATRIX(T) case GGML_TYPE_##T: \
+        if (rows >= 1024) grouped_moe::LaunchMatrix<GGML_TYPE_##T, 64, false, true>( \
+            weights, gate ? 0 : 1, w, experts, columns, width, cudaStreamPerThread); \
+        else grouped_moe::LaunchMatrix<GGML_TYPE_##T, 16, false, true>( \
+            weights, gate ? 0 : 1, w, experts, columns, width, cudaStreamPerThread); break;
+        NATIVE_MATRIX(IQ1_S) NATIVE_MATRIX(IQ1_M) NATIVE_MATRIX(Q2_0)
+        NATIVE_MATRIX(Q3_K) NATIVE_MATRIX(Q4_K)
+#undef NATIVE_MATRIX
+        default: return false;
+    }
+    grouped_moe::ScatterNativeV41<<<dim3((width+255)/256, rows*topk), 256, 0, cudaStreamPerThread>>>(
+        w.products, static_cast<__nv_bfloat16 *>(outputBF16), w.routeGroups, width);
+    return cudaGetLastError() == cudaSuccess;
 }
