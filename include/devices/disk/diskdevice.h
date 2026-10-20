@@ -41,6 +41,9 @@ namespace fastllm {
     DiskMoeCacheStats GetDiskMoeCacheStats();
     void TrimDiskMoeCache();
     void ReleaseDiskMoeCache(const Data *weight);
+    // Fill unused RAM budget in layer order with native NVFP4 block32 experts.
+    // Entries remain evictable; loading alone does not count as a route/hit.
+    uint64_t PreloadDiskMoeCache(const std::vector<std::vector<Data*>> &layers);
     // Register metadata only. Compact experts stay in their checkpoint files;
     // both bounded cache tiers use the public MoE frequency configuration.
     bool PrepareDiskMoeCache(const std::vector<std::vector<Data*>> &layers);

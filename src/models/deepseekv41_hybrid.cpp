@@ -6,6 +6,9 @@
 #include "utils.h"
 #include "utils/hybrid_parallel.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
+#include "devices/disk/diskdevice.h"
+#include <chrono>
+#include <exception>
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
@@ -15,6 +18,22 @@
 namespace fastllm {
     DeepSeekV41DecodeWorkspace::DeepSeekV41DecodeWorkspace() = default;
     DeepSeekV41DecodeWorkspace::~DeepSeekV41DecodeWorkspace() = default;
+
+    void DeepSeekV41Model::OnAutoWarmupFinished() {
+        if (executionMode != ExecutionMode::Hybrid || std::uncaught_exceptions() ||
+            !GetMoeCpuCacheBytes()) return;
+        // Wait until temporary warmup tensors have been released before
+        // filling RAM. Preloading during weight conversion raises its peak.
+        const auto started = std::chrono::steady_clock::now();
+        const uint64_t bytes = PreloadDiskMoeCache(weights);
+        if (bytes) {
+            const double seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+            printf("[Fastllm] Disk MoE RAM preload: %.2f GiB in %.3f s (budget %.2f GiB).\n",
+                bytes / double(1ULL << 30), seconds, GetMoeCpuCacheBytes() / double(1ULL << 30));
+            fflush(stdout);
+        }
+    }
 
     void DeepSeekV41Model::BeginHybridMoeStep(
             HybridMoeDecodeStep &step, bool tp, bool single, int seqlen) {

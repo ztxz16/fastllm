@@ -248,6 +248,7 @@ namespace fastllm {
                 std::vector<float> *logits, int &outputToken) override;
 
         void WarmUp() override;
+        void OnAutoWarmupFinished() override;
 
         // 每个 token 的长期 KV 缓存字节数（压缩 KV + indexer key），随 kvCacheDataType 变化
         long long KVCacheBytesPerToken() const;

@@ -145,6 +145,29 @@ int main(int argc, char **argv) {
         SetThreads(8);
         for (bool shared : {false, true}) {
             Fixture f(shared);
+            if (!shared) {
+                SetMoeCudaCacheBytes(0);
+                SetMoeCpuCacheBytes(f.expertBytes - 1);
+                auto before = GetDiskMoeCacheStats();
+                Require(PreloadDiskMoeCache({f.disk}) == 0, "undersized preload budget");
+                Require(GetDiskMoeCacheStats().diskBytes == before.diskBytes, "undersized preload read disk");
+                SetMoeCpuCacheBytes(f.expertBytes * 7);
+                Require(PreloadDiskMoeCache({f.disk, f.disk}) == f.expertBytes * 7, "preload budget or duplicate layer");
+                auto loaded = GetDiskMoeCacheStats();
+                Require(loaded.cpuBytes == f.expertBytes * 7 && loaded.cudaBytes == 0, "preload residency");
+                Require(loaded.diskBytes - before.diskBytes == f.expertBytes * 7, "preload read accounting");
+                Require(loaded.cpuHits == before.cpuHits && loaded.misses == before.misses, "preload fabricated usage");
+                Require(PreloadDiskMoeCache({f.disk}) == 0, "preload not idempotent");
+                Compare(f.Run(true, 1, 0), f.Run(false, 1, 0), true);
+                Require(GetDiskMoeCacheStats().diskBytes == loaded.diskBytes, "preloaded route read disk");
+                // First-time real routes may replace never-used preload entries.
+                Compare(f.Run(true, 1, 7), f.Run(false, 1, 7), true);
+                auto adapted = GetDiskMoeCacheStats();
+                Compare(f.Run(true, 1, 7), f.Run(false, 1, 7), true);
+                Require(GetDiskMoeCacheStats().diskBytes == adapted.diskBytes, "unused preload blocked admission");
+                SetMoeCpuCacheBytes(0);
+                Require(GetDiskMoeCacheStats().cpuBytes == 0, "preload survived cache disable");
+            }
             if (!shared && CPUInstructInfo().hasAVX512BF16 &&
                 !std::getenv("FASTLLM_DSV4_DISABLE_CPU_MOE_FAST")) {
                 auto expected = f.Run(false, 1, 0);

@@ -2141,13 +2141,15 @@ namespace fastllm {
             if (bytes > budget) return false;
             uint64_t used = device < 0 ? cpuBytes : cudaBytes[device];
             if (used <= budget - bytes) return true;
-            if (candidate && candidate->visits < 2) return false;
             const auto epoch = Epoch();
             auto colder = [&](auto *a, auto *b) {
                 unsigned ah = a->Heat(epoch), bh = b->Heat(epoch);
                 return ah != bh ? ah < bh : a->lastUse < b->lastUse;
             };
             DiskExpertEntry *weakest = Weakest(device, candidate);
+            // Unused preload entries must not block the first real request's
+            // working set. Ordinary scan-resistant admission stays unchanged.
+            if (candidate && candidate->visits < 2 && (!weakest || weakest->visits)) return false;
             if (!weakest || (candidate &&
                 candidate->Heat(epoch) <= weakest->Heat(epoch) + (device < 0 ? 0 : 16))) return false;
             // Equal-size routed experts need only one victim. Preserve the
@@ -2171,7 +2173,7 @@ namespace fastllm {
             while (used > budget - bytes && count < victims.size()) {
                 auto *victim = victims[count++];
                 // Strict admission resists cyclic scans with a small cache.
-                if (candidate && (candidate->visits < 2 ||
+                if (candidate && ((candidate->visits < 2 && victim->visits) ||
                     candidate->Heat(Epoch()) <= victim->Heat(Epoch()) + (device < 0 ? 0 : 16))) return false;
                 used -= Slot(*victim, device)->Bytes();
             }
@@ -2205,6 +2207,67 @@ namespace fastllm {
         // dependencies between the executor, CUDA runtime and model weights.
         static auto *cache = new DiskExpertCache;
         return *cache;
+    }
+
+    uint64_t PreloadDiskMoeCache(const std::vector<std::vector<Data*>> &layers) {
+        auto &cache = GetDiskExpertCache();
+        std::lock_guard<std::mutex> guard(cache.mutex);
+        cache.Trim();
+        const uint64_t budget = GetMoeCpuCacheBytes();
+        if (cache.cpuBytes >= budget) return 0;
+        uint64_t remaining = budget - cache.cpuBytes;
+        std::vector<std::pair<const Data*, const Data*>> selected;
+        std::unordered_set<const Data*> seen;
+        auto supported = [](const Data *w) {
+            return w && w->isDiskWeight && w->dataType == NVFP4 &&
+                w->dims.size() == 2 && w->blockK == 1 && w->blockM == 32 &&
+                w->scales.empty() && w->mins.empty() && w->zeros.empty() &&
+                w->halfScales.empty() && w->perChannelsConfigs.empty();
+        };
+        for (const auto &table : layers) {
+            // Shared experts have their own placement; preload routed pairs.
+            for (size_t i = 2; i + 1 < table.size(); i += 2) {
+                const Data *gate = table[i], *down = table[i + 1];
+                if (!supported(gate) || !supported(down) || !seen.insert(gate).second) continue;
+                auto found = cache.entries.find(gate);
+                if (found != cache.entries.end() && (found->second.cpu ||
+                    std::any_of(found->second.cuda.begin(), found->second.cuda.end(),
+                        [](const auto &item) { return bool(item.second); }))) continue;
+                const uint64_t bytes = gate->GetBytes() + down->GetBytes();
+                if (!bytes || bytes > remaining) continue;
+                remaining -= bytes;
+                selected.emplace_back(gate, down);
+            }
+        }
+        // Reserve every queued payload against the budget before allocation.
+        // Two existing I/O workers suffice; no second copy or persistent pool.
+        std::deque<std::future<std::unique_ptr<DiskCachedExpert>>> pending;
+        struct WaitPending {
+            decltype(pending) &reads;
+            ~WaitPending() { for (auto &read : reads) if (read.valid()) read.wait(); }
+        } waitPending{pending};
+        size_t next = 0;
+        auto enqueue = [&] {
+            if (next == selected.size()) return;
+            pending.emplace_back();
+            const auto &pair = selected[next++];
+            pending.back() = cache.prefetch.Read(pair.first, pair.second, false, 2);
+        };
+        enqueue();
+        enqueue();
+        uint64_t added = 0;
+        for (const auto &pair : selected) {
+            auto expert = pending.front().get();
+            pending.pop_front();
+            for (const Data *w : {pair.first, pair.second})
+                for (const auto &part : w->diskWeightParts) cache.stats.diskBytes += part.bytes;
+            const uint64_t bytes = expert->Bytes();
+            AssertInFastLLM(bytes <= budget - cache.cpuBytes, "Disk expert preload exceeded RAM budget.\n");
+            cache.AdmitCpu(cache.entries[pair.first], std::move(expert));
+            added += bytes;
+            enqueue();
+        }
+        return added;
     }
 
     DiskMoeCacheStats GetDiskMoeCacheStats() {
