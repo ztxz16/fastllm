@@ -823,6 +823,9 @@ namespace {
         float acc = 0.0f;
         int k = threadIdx.x;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+        // Every launch uses exactly 256 threads. Expose that index range to
+        // NVCC without changing any lane's FMA or reduction order.
+        k &= kHcThreads - 1;
         if constexpr (PREFETCH && std::is_same<T, __nv_bfloat16>::value) {
             // Hide dependent-load latency without splitting the FP32 sum.
             // Each lane still visits exactly the same elements in order;
