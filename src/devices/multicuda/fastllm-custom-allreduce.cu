@@ -29,6 +29,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include "fastllm-custom-allreduce-tagged.cuh"
 
 namespace {
 
@@ -1202,6 +1203,7 @@ struct CustomArState {
     CustomArRankSignals allSignals{};
     CustomArRankScratch allScratch{};
     CustomArPushWorkspaces allPushWorkspaces{};
+    std::unique_ptr<CustomArTaggedPeer> taggedPeer;
     void *inplaceScratch[kCustomArMaxRanks]{};
     int pushBlocks = 0;
     bool pushAvailable = false;
@@ -1242,11 +1244,15 @@ CustomArState &GetCustomArState() {
 struct CustomArAllocation {
     int device = -1;
     void *pointer = nullptr;
+    std::unique_ptr<CustomArTaggedPeer> taggedPeer;
 };
 
 std::vector<CustomArAllocation> DetachCustomArAllocationsLocked(
         CustomArState &state) {
     std::vector<CustomArAllocation> allocations;
+    if (state.taggedPeer) {
+        allocations.push_back({-1, nullptr, std::move(state.taggedPeer)});
+    }
     auto collect = [&](int rank, void *pointer) {
         if (pointer != nullptr && rank >= 0 &&
             rank < (int)state.devices.size()) {
@@ -1286,6 +1292,10 @@ void DrainAndReleaseCustomArAllocations(
         FastllmCudaSyncDevice(device);
     }
     for (const CustomArAllocation &allocation : allocations) {
+        if (allocation.taggedPeer) {
+            allocation.taggedPeer->ReleaseAfterDrain();
+            continue;
+        }
         if (allocation.device < 0 || allocation.pointer == nullptr) {
             continue;
         }
@@ -1868,6 +1878,15 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
     if (!FindOrRegisterCustomArPointers(state, rank, data, count,
                                         dataType, localEligible, rankData, hostSpinMicroseconds)) {
         return false;
+    }
+    if (dataType == fastllm::DataType::BFLOAT16 && state.taggedPeer &&
+        state.taggedPeer->CanUse(count)) {
+        const bool launched = state.taggedPeer->Launch(data, dest, count, rank);
+        if (cudaGetLastError() != cudaSuccess) {
+            FastllmCudaSetThreadError();
+            return false;
+        }
+        return launched;
     }
     const bool useTwoStage = CustomArUseTwoStage(state.devices.size(), bytes);
     // A small block of decode rows gives each rank only a few KiB of the
@@ -2843,6 +2862,9 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
             }
         }
     }
+    if (ok) {
+        state.taggedPeer = CustomArTaggedPeer::Create(devices);
+    }
     FastllmCudaSetDevice(originalDevice);
     if (!ok) {
         state.enabledPaths.store(0, std::memory_order_release);
@@ -3068,6 +3090,14 @@ bool FastllmCudaCustomAllReduceAndGather(void *routed, void *dest,
             fastllm::FLOAT32, eligible, routedData) ||
         !FindOrRegisterCustomArPointers(state, rank, shared, count,
             fastllm::BFLOAT16, eligible, sharedData)) return false;
+    if (state.taggedPeer && state.taggedPeer->CanUse(count)) {
+        const bool launched = state.taggedPeer->LaunchJoint(routed, dest, shared, count, rank);
+        if (cudaGetLastError() != cudaSuccess) {
+            FastllmCudaSetThreadError();
+            return false;
+        }
+        return launched;
+    }
     // Spread small messages across more CTAs without exceeding signal capacity.
     // Larger messages retain the original 512-thread blocks.
     const int threads =
