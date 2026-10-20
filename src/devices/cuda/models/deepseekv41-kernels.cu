@@ -192,8 +192,10 @@ namespace {
             return 1.0f;
         }
         unsigned bits = __float_as_uint(x);
-        int exponent = (int)((bits >> 23) & 0xFF) - 127 + ((bits & ((1u << 23) - 1)) != 0 ? 1 : 0);
-        return ldexpf(1.0f, exponent);
+        // Construct the same power of two directly, including the original
+        // subnormal-input and overflow behavior, without a general ldexpf.
+        return __uint_as_float((bits & 0x7f800000u) +
+                               ((bits & 0x007fffffu) ? 0x00800000u : 0u));
     }
 
     __device__ __forceinline__ float V41Fp8RoundTripDev(float v) {
@@ -247,7 +249,14 @@ namespace {
 
     __device__ __forceinline__ float V41QuantValueDev(float v, float scale, int quantMode) {
         float qmax = quantMode == 1 ? 448.0f : 6.0f;
-        float q = fminf(qmax, fmaxf(-qmax, v / scale));
+        const unsigned bits = __float_as_uint(scale);
+        // FP8 block scales are powers of two. Their normal reciprocals are
+        // exact, so multiplication preserves division's FP32 rounding. Keep
+        // division for FP4 and scales whose reciprocal is not normal.
+        const float scaled = quantMode == 1 && bits >= 0x00800000u &&
+                             bits < 0x7f000000u && !(bits & 0x007fffffu)
+            ? v * __uint_as_float(0x7f000000u - bits) : v / scale;
+        float q = fminf(qmax, fmaxf(-qmax, scaled));
         q = quantMode == 1 ? V41Fp8RoundTripDev(q) : V41Fp4RoundTripDev(q);
         return q * scale;
     }

@@ -122,6 +122,36 @@ static void Activation(bool cuda) {
     }
 }
 
+// Exercise power-of-two scaling with subnormal inputs, signed zero, FP8
+// halfway values and very large finite values. Quant enumerates the FP8 grid
+// independently of the CUDA implementation.
+static void ActivationScaleBoundaries(bool cuda) {
+    for (DataType dtype : {DataType::FLOAT32, DataType::FLOAT16, DataType::BFLOAT16}) {
+        ApplyDeviceMap({{"cpu", 1}}, 0, 1);
+        const std::vector<int> exponents = dtype == DataType::FLOAT16 ?
+            std::vector<int>{-24, -23, -22, -1, 0, 1, 7} :
+            std::vector<int>{-149, -126, -64, -23, -22, -1, 0, 1, 64, 119};
+        const float values[] = {0.0f, -0.0f, 1.0625f, -1.0625f, 1.1875f, -1.1875f, 384.0f, -384.0f};
+        std::vector<float> x(exponents.size() * 32);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::ldexp(values[i % 8], exponents[i / 32]);
+        const std::vector<int> shape{(int)exponents.size(), 32};
+        Data input(DataType::FLOAT32, shape, x), output;
+        ToDataType(input, dtype);
+        auto expected = Read(input);
+        Quant(expected, 32);
+        Data rounded(DataType::FLOAT32, shape, expected);
+        ToDataType(rounded, dtype);
+        expected = Read(rounded);
+        ApplyDeviceMap({{cuda ? "cuda" : "cpu", 1}}, 0, 1);
+        ((Executor *)GetExecutor())->Run("DeepSeekV41QuantizeActivation",
+            {{"input", &input}, {"output", &output}}, {}, {});
+        auto actual = Read(output);
+        Check(actual.size() == expected.size() &&
+              !std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)),
+              "FP8 activation scaling changed exponent boundaries or signed zero");
+    }
+}
+
 static void RotaryBoundary(bool cuda) {
     for (DataType dtype : {DataType::FLOAT32, DataType::FLOAT16, DataType::BFLOAT16}) {
         for (int start : {1, 129}) {
@@ -902,12 +932,14 @@ int main(int argc, char **argv) {
         SetThreads(30);
         ExportedActivationMetadata();
         Activation(false);
+        ActivationScaleBoundaries(false);
         RotaryBoundary(false);
         AttentionBoundary(false);
         HcFloat32Boundary(false);
 #ifdef USE_CUDA
         if (argc > 1 && std::string(argv[1]) == "--cuda") {
             Activation(true);
+            ActivationScaleBoundaries(true);
             RotaryBoundary(true);
             AttentionBoundary(true);
             BlockLinearBoundary();
