@@ -70,7 +70,8 @@ static void Replay(const std::function<void()> &fn) {
 }
 static int NormCases() {
     int cases = 0;
-    for (int qdim : {512, 544, 1280, 2016, 3072, 4064}) for (int kdim : {512, 1024})
+    for (int qdim : {512, 544, 1280, 2016, 2048, 2080, 3072, 4064})
+    for (int kdim : {512, 1024, 2048, 2080})
     for (int batch : {1, 2, 8}) for (float eps : {0.0f, 1e-6f, 1e-3f}) for (float amplitude : {0.0f, 0.8f, 256.0f}) {
         Data q, kv, qw, kw, qref, kref, quantRef, qnorm, quant, knorm;
         Fill(q, {1, batch, qdim}, DataType::BFLOAT16, 1, amplitude);
@@ -85,7 +86,11 @@ static int NormCases() {
         fused();
         Require(Bits(qref) == Bits(qnorm) && Bits(kref) == Bits(knorm) && Bits(quantRef) == Bits(quant),
                 "norm/quant changed BF16 rounding or block-32 scale");
-        if (qdim == 1280 && kdim == 512 && (eps == 0.0f || eps == 1e-6f)) {
+        // Exercise both sides of the register-cache boundary, including KV
+        // alone selecting the uncached path and in-place KV normalization.
+        const bool replayShape = (qdim == 1280 && (kdim == 512 || kdim == 2048 || kdim == 2080)) ||
+            ((qdim == 2048 || qdim == 2080) && kdim == 512);
+        if (replayShape && (eps == 0.0f || eps == 1e-6f)) {
             Replay(fused);
             Require(Bits(qref) == Bits(qnorm) && Bits(kref) == Bits(knorm) && Bits(quantRef) == Bits(quant),
                     "norm graph replay changed output");

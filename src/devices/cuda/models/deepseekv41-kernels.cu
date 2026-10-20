@@ -1066,7 +1066,6 @@ namespace {
         constexpr int WARP_SIZE = 32;
         constexpr int NUM_WARPS = THREAD_PER_BLOCK / WARP_SIZE;
         __shared__ float warp_sums[NUM_WARPS];
-        __shared__ float scale;
 
         const int o = FINISH_MIX ? blockIdx.x / 2 : blockIdx.x;
         const int bf2 = channels / 2;
@@ -1105,19 +1104,13 @@ namespace {
             warp_sums[warp_id] = sum2;
         }
         __syncthreads();
-        if (warp_id == 0) {
-            float val = (lane_id < NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+        // Each warp repeats the same small reduction, then broadcasts lane 0.
+        // This preserves the reduction tree without a second CTA barrier.
+        float val = (lane_id < NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
 #pragma unroll
-            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-                val += __shfl_down_sync(0xffffffff, val, offset);
-            }
-            if (lane_id == 0) {
-                scale = rsqrtf(val / channels + eps);
-            }
-        }
-        __syncthreads();
-
-        const float s = scale;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        const float s = rsqrtf(__shfl_sync(0xffffffff, val, 0) / channels + eps);
 #pragma unroll
         for (int k = 0; k < MAX_ITER; k++) {
             const int i = (int)tid + k * THREAD_PER_BLOCK;
@@ -3283,6 +3276,7 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
     // Match FastllmRMSNormKernelInner1<512>: pairwise loading, FMA order,
     // shuffle-down tree, and BF16 output rounding. Q quantization consumes that
     // rounded value, never the unrounded FP32 expression.
+    template <int CACHE_PAIRS = 0>
     __global__ void V41QKVNormQuantKernel(const __nv_bfloat16 *q, const __nv_bfloat16 *kv,
             const float *qw, const float *kw, __nv_bfloat16 *qn, __nv_bfloat16 *qq,
             __nv_bfloat16 *kn, int qdim, int kdim, float eps) {
@@ -3293,31 +3287,36 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
         const float *weight = query ? qw : kw;
         const int tid = threadIdx.x, lane = tid % 32;
         __shared__ float warpSums[16];
-        __shared__ float scale;
+        __nv_bfloat162 values[CACHE_PAIRS ? CACHE_PAIRS : 1];
+        float2 weights[CACHE_PAIRS ? CACHE_PAIRS : 1];
         float sum = 0.0f;
         for (int i = tid; i < dim / 2; i += 512) {
             const __nv_bfloat162 v = input[i];
+            if constexpr (CACHE_PAIRS) {
+                values[i / 512] = v;
+                weights[i / 512] = make_float2(__ldg(weight + 2 * i), __ldg(weight + 2 * i + 1));
+            }
             const float lo = __bfloat162float(v.x), hi = __bfloat162float(v.y);
             sum += lo * lo + hi * hi;
         }
         for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffff, sum, offset);
         if (lane == 0) warpSums[tid / 32] = sum;
         __syncthreads();
-        if (tid < 32) {
-            float v = lane < 16 ? warpSums[lane] : 0.0f;
-            for (int offset = 16; offset; offset >>= 1) v += __shfl_down_sync(0xffffffff, v, offset);
-            if (lane == 0) scale = rsqrtf(v / dim + eps);
-        }
-        __syncthreads();
-        const float s = scale;
+        float val = lane < 16 ? warpSums[lane] : 0.0f;
+        for (int offset = 16; offset; offset >>= 1) val += __shfl_down_sync(0xffffffff, val, offset);
+        const float s = rsqrtf(__shfl_sync(0xffffffff, val, 0) / dim + eps);
         // Uniform iteration count keeps every lane participating in shuffles.
         for (int base = 0; base < dim / 2; base += 512) {
             const int i = base + tid;
             __nv_bfloat162 v = {};
             if (i < dim / 2) {
-                v = input[i];
-                v.x = __float2bfloat16_rn(__bfloat162float(v.x) * s * __ldg(weight + 2 * i));
-                v.y = __float2bfloat16_rn(__bfloat162float(v.y) * s * __ldg(weight + 2 * i + 1));
+                // Small Q/KV rows fit in registers: overlap weight loads with
+                // the sum reduction and avoid reloading the BF16 input.
+                const float2 w = CACHE_PAIRS ? weights[base / 512] :
+                    make_float2(__ldg(weight + 2 * i), __ldg(weight + 2 * i + 1));
+                v = CACHE_PAIRS ? values[base / 512] : input[i];
+                v.x = __float2bfloat16_rn(__bfloat162float(v.x) * s * w.x);
+                v.y = __float2bfloat16_rn(__bfloat162float(v.y) * s * w.y);
                 output[i] = v;
             }
             if (query) {
@@ -3542,10 +3541,13 @@ extern "C" bool FastllmCudaV41QKVNormQuant(const Data &q, const Data &kv,
     if (!V41PrepareOutput(qNorm, DataType::BFLOAT16, q.dims) ||
         !V41PrepareOutput(qQuant, DataType::BFLOAT16, q.dims) ||
         !V41PrepareOutput(kvNorm, DataType::BFLOAT16, kv.dims)) return false;
-    V41QKVNormQuantKernel<<<tokens * 2, 512>>>((const __nv_bfloat16 *)q.cudaData,
-        (const __nv_bfloat16 *)kv.cudaData, (const float *)qWeight.cudaData, (const float *)kvWeight.cudaData,
-        (__nv_bfloat16 *)qNorm.cudaData, (__nv_bfloat16 *)qQuant.cudaData, (__nv_bfloat16 *)kvNorm.cudaData,
-        qdim, kdim, eps);
+#define V41_QKV_NORM(C) V41QKVNormQuantKernel<C><<<tokens * 2, 512>>>((const __nv_bfloat16 *)q.cudaData, \
+        (const __nv_bfloat16 *)kv.cudaData, (const float *)qWeight.cudaData, (const float *)kvWeight.cudaData, \
+        (__nv_bfloat16 *)qNorm.cudaData, (__nv_bfloat16 *)qQuant.cudaData, (__nv_bfloat16 *)kvNorm.cudaData, \
+        qdim, kdim, eps)
+    if (qdim <= 2048 && kdim <= 2048) V41_QKV_NORM(2);
+    else V41_QKV_NORM(0);
+#undef V41_QKV_NORM
     return V41CheckLaunch("QKVNormQuant");
 }
 
