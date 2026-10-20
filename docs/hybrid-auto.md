@@ -23,9 +23,11 @@ Qwen3.5 稠密 HF 模型按全注意力层的 GQA KV、线性注意力层的常�
 
 DeepSeek-V4.1 默认采用不超过模型原生窗口的 **1M（1,048,576 token）上下文、单请求**，开启 **DSpark 7**（置信度阈值默认 0.5）和 **fast_prefill**。Qwen3.5 稠密 HF 模型默认并发 4、尽量使用原生上下文；其他模型保持 **128K 上下文、单请求**。按代表性的 4K 输入、512 输出估计交互延迟。读取可见 CUDA 设备的可用显存、SM 数、内存带宽参数、PCIe 条件和 peer access 能力，比较单卡、PP、双卡等比例 TP，并联合选择专家驻留、显存缓存、主存缓存和 chunk。权重可全驻留且预算允许时，也可选择全部专家放 GPU。CPU 线程依据进程可用的物理核数选择，并预留启动和 IO 线程。
 
+DeepSeek-V4.1 的 `--auto` 默认使用 **`kv_cache_dtype=fp4`**：长期压缩 KV 和 indexer key 在原模型计算中已经经过 FP4 伪量化，按匹配的网格、分组和 scale 打包是无损存储；滑窗使用其原有 FP8 网格。Flash-1017 的长期 KV 为 **890 B/token**，1M 有效载荷约 **0.869 GiB**，加上当前分配器的扩容容量和新旧缓冲重叠，规划预留约 **1.59 GiB**。此前统一选择 16 位 KV 会将这两项分别放大到 3.125 / 5.69 GiB。显式 `--kv_cache_dtype`（包括 `float16`、`bfloat16`、`fp4_e2m1`、`auto`）优先；启用 `FASTLLM_DSV41_DISABLE_FAKE_QUANT` 或不满足打包维度时不自动启用 FP4。其他模型的存储默认不变。
+
 DeepSeek-V4.1 的 `fast_prefill` 沿用已有近似注意力语义，可能改变 logits。可用 `--no_fast_prefill` 关闭；`--dspark 0` 或 `--speculative_algorithm off` 关闭推测解码。显式上下文、草稿数、阈值和 JSON 配置中的 `fast_prefill: false` 均优先；`--threads 64` 可固定线程数。预算不足时先调整自动 chunk、缓存和专家放置，仍放不下则报错，不自动缩短 1M 上下文。
 
-DeepSeek-V4.1 的显存估算按 KV source 层统计共享的压缩 KV 和 index key，并计入原生缓存扩容的容量余量及新旧缓冲重叠。Indexer 打分按原生分块预算估算（默认 128 MiB，遵循 `FASTLLM_DSV41_INDEX_SCORE_MB` 和 `FASTLLM_DSV41_INDEX_CHUNK`），不直接预留完整的 `chunk × context` 分数矩阵。原模型的 FP8 投影按实际保留的精度及 scale 预算，输出头、路由和其他强制展开的投影仍按原生精度计入。自动 chunk 的候选为 4096、2048、1024、512、256；显式指定数值时不会自动降低。
+DeepSeek-V4.1 的显存估算按 KV source 层统计共享的压缩 KV 和 index key，并计入原生缓存扩容的容量余量及新旧缓冲重叠。Indexer 打分按原生分块预算估算（默认 128 MiB，遵循 `FASTLLM_DSV41_INDEX_SCORE_MB` 和 `FASTLLM_DSV41_INDEX_CHUNK`），不直接预留完整的 `chunk × context` 分数矩阵。原模型的 FP8 投影按实际保留的精度及 scale 预算，输出头、路由和其他强制展开的投影仍按原生精度计入。DeepSeek-V4.1 磁盘专家的自动 chunk 候选为 **8192、4096、2048、1024、512、256**；其他路径的候选上限保持 4096。候选不超过上下文长度；显式指定数值时不会自动降低。
 
 规划日志分别输出 `kv_logical_bytes_per_device`（有效载荷）、`kv_capacity_bytes_per_device`（含增长余量的容量）和 `kv_reallocation_bytes_per_device`（扩容时的旧缓冲重叠），避免将有效 KV 大小和规划峰值混为一谈。
 
@@ -119,7 +121,7 @@ Qwen4、GLM-5.3 和 DeepSeek-V4.1 的混合推理命令支持以下可选值：
 | `--moe_cuda_cache auto` | 扣除权重、KV、固定状态、工作区和预留空间，计算每卡专家缓存上限 |
 | `--moe_cpu_cache auto` | `moe_device=disk` 时按有效主存余量计算专家缓存上限；CPU/NUMA 常驻专家不另分配此缓存 |
 | `--moe_device_layers auto` | 加载前规划 GPU 驻留前缀，将后面的专家层留在指定的主机设备 |
-| `--chunked_prefill_size auto` | 在 4096、2048、1024、512、256 中依次选择满足内存预算的切片，且不超过上下文长度 |
+| `--chunked_prefill_size auto` | 在 4096、2048、1024、512、256 中选择满足内存预算的切片；DeepSeek-V4.1 磁盘专家额外考虑 8192，且不超过上下文长度 |
 | `--auto_gpu_memory_limit 20g` | 将自动规划的每张 GPU 显存预算限制为不超过 20 GiB |
 | `--auto_host_memory_limit 128g` | 将自动规划的主机内存预算限制为不超过 128 GiB |
 

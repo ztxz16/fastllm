@@ -829,8 +829,11 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     )
     if host_memory_limit is not None:
         host_limit = min(host_limit, host_memory_limit)
-    chunks = ([4096, 2048, 1024, 512, 256] if args.chunked_prefill_size == "auto" else
-              [args.chunked_prefill_size if args.chunked_prefill_size > 0 else model.default_chunk])
+    chunks = [4096, 2048, 1024, 512, 256]
+    if model.family == "deepseek_v41" and args.moe_device == "disk":
+        chunks.insert(0, 8192)
+    if args.chunked_prefill_size != "auto":
+        chunks = [args.chunked_prefill_size if args.chunked_prefill_size > 0 else model.default_chunk]
     chunks = list(dict.fromkeys(min(c, context) for c in chunks))
     if args.moe_device_layers == "auto":
         # Only the unified policy may choose full GPU residency.

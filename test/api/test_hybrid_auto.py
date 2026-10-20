@@ -699,6 +699,41 @@ class HybridAutoTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
 
+    def test_v41_disk_8192_candidate_respects_capacity_context_and_explicit_chunk(self):
+        md = self.dspark_metadata()
+        md["quantization_config"] = {"quant_method": "fp8", "expert_dtype": "fp4",
+                                     "weight_block_size": [32, 32]}
+        g = auto.geometry(md, "fp4", 0)
+        a = args(moe_device="disk", fast_prefill=True, tokens=1048576,
+                 max_context_length=1048576, moe_device_layers=-1, moe_cpu_cache=0,
+                 moe_cuda_cache=0, chunked_prefill_size=8192, gpu_mem_ratio=1)
+        costs = ([GiB] * 4, [MiB] * 4, 0, 0, GiB, False)
+        ram = dict(total=64 * GiB, available=64 * GiB)
+        roomy = {0: dict(total=32 * GiB, free=32 * GiB)}
+        with patch.dict(os.environ, {}, clear=True):
+            def plan(gpu):
+                return auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+            explicit = plan(roomy)
+            gpu = {0: dict(total=32 * GiB, free=explicit["gpu_estimated_bytes"][0])}
+            a.chunked_prefill_size = "auto"
+            fit = plan(gpu)
+            self.assertEqual((fit["context_tokens"], fit["chunked_prefill_size"]), (1048576, 8192))
+            gpu[0]["free"] -= 1
+            self.assertEqual(plan(gpu)["chunked_prefill_size"], 4096)
+            a.chunked_prefill_size = 8192
+            with self.assertRaises(ValueError):
+                plan(gpu)
+            a.chunked_prefill_size = 8196
+            self.assertEqual(plan(roomy)["chunked_prefill_size"], 8196)
+            a.chunked_prefill_size = "auto"
+            a.tokens = a.max_context_length = 6000
+            self.assertEqual(plan(roomy)["chunked_prefill_size"], 6000)
+            a.tokens = a.max_context_length = 1048576
+            a.moe_device = "numa"
+            self.assertEqual(plan(roomy)["chunked_prefill_size"], 4096)
+            a.moe_device, g.family = "disk", "fixture"
+            self.assertEqual(plan(roomy)["chunked_prefill_size"], 4096)
+
     def test_dspark_has_bounded_draft_kv_and_budgets_every_draft_stage(self):
         md = self.dspark_metadata()
         off = auto.geometry(md, "float16", 0)

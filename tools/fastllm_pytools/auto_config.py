@@ -42,6 +42,20 @@ def apply_model_defaults(args, metadata):
         args.fast_prefill = True
 
 
+def default_kv_dtype(model, metadata):
+    """Pack V4.1's already fake-quantized KV without another rounding step."""
+    if model.family != "deepseek_v41":
+        return "float16"
+    config = metadata.get("text_config", metadata)
+    # Match native V41EnvFlag: even the string "false" enables this debug flag.
+    fake_quant_disabled = os.environ.get("FASTLLM_DSV41_DISABLE_FAKE_QUANT", "0") not in ("", "0")
+    dim, index_dim = int(config.get("head_dim") or 0), int(config.get("index_head_dim") or 0)
+    if (not fake_quant_disabled and
+            dim > 0 and dim % 32 == 0 and index_dim > 0 and index_dim % 32 == 0):
+        # Compressed KV: E2M1 + E4M3/16; index keys: E2M1 + UE8M0/32.
+        # FP8 storage would use a different scale grid and is not lossless.
+        return "fp4"
+    return "float16"
 
 
 def cuda_hardware():
@@ -356,7 +370,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if "atype" not in explicit and model.family != "deepseek_v41":
         base.atype = "bfloat16" if model.family == "glm5" else "float16"
     if "kv_cache_dtype" not in explicit:
-        base.kv_cache_dtype = "float16"
+        base.kv_cache_dtype = default_kv_dtype(model, metadata)
     # Re-evaluate geometry with the selected defaults (explicit precisions win).
     kv_dtype = base.atype if base.kv_cache_dtype == "auto" and base.atype != "auto" else base.kv_cache_dtype
     model = memory.geometry(metadata, kv_dtype, base.mtp, base.dspark)
@@ -530,6 +544,8 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     result["automatic"]["dspark"] = chosen.dspark
     result["automatic"]["fast_prefill"] = chosen.fast_prefill
     result["automatic"]["low_gpu_mem"] = chosen.low_gpu_mem
+    if model.family == "deepseek_v41" and "kv_cache_dtype" not in explicit and chosen.kv_cache_dtype == "fp4":
+        result.setdefault("notes", []).append("Native fake-quantized KV uses lossless FP4 packing (FP8 sliding window)")
     result["automatic"]["gpu_memory_limit"] = result.get("auto_gpu_memory_limit")
     result["automatic"]["host_memory_limit"] = result.get("auto_host_memory_limit")
     if chosen.dspark:

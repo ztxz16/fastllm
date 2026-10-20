@@ -66,7 +66,7 @@ class AutoConfigTest(unittest.TestCase):
         self.g.family = 'deepseek_v41'
         a = self.args('--moe_device', 'disk', '--moe_device_layers', '-1')
         p = self.resolve(a)
-        self.assertEqual(a.chunked_prefill_size, 4096)
+        self.assertEqual(a.chunked_prefill_size, 8192)
         self.assertTrue(a.low_gpu_mem)
         self.assertFalse(a.cuda_embedding)
         self.assertTrue(p['automatic']['low_gpu_mem'])
@@ -331,7 +331,36 @@ class AutoConfigTest(unittest.TestCase):
         self.resolve(a)
         self.assertEqual(a.max_context_length, 262144)
 
+    def test_deepseek_auto_packs_native_kv_and_respects_explicit_storage(self):
+        self.g.family = 'deepseek_v41'
+        md = {'model_type': 'deepseek_v41', 'head_dim': 512, 'index_head_dim': 128}
+        for flag, expected in [(None, 'fp4'), ('float16', 'float16'),
+                               ('fp4_e2m1', 'fp4_e2m1'), ('auto', 'auto')]:
+            with self.subTest(flag=flag), \
+                    patch.object(memory, 'model_inputs', return_value=(md, [], self.g)), \
+                    patch.object(memory, 'geometry', return_value=self.g) as geometry, \
+                    patch.object(memory, 'weight_costs', return_value=self.costs), \
+                    patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+                a = self.args(*(['--kv_cache_dtype', flag] if flag else []))
+                p = auto.resolve(a, self.gpu.__getitem__, hardware=self.hardware,
+                                 ram=self.ram, use_numa=True)
+                self.assertEqual(a.kv_cache_dtype, expected)
+                self.assertEqual(p['kv_cache_dtype'], expected)
+                self.assertEqual(geometry.call_args.args[1], expected)
 
+    def test_lossless_kv_default_checks_native_debug_flag_and_geometry(self):
+        self.g.family = 'deepseek_v41'
+        md = {'text_config': {'head_dim': 512, 'index_head_dim': 128}}
+        for flag, expected in [('', 'fp4'), ('0', 'fp4'), ('1', 'float16'),
+                               ('false', 'float16'), ('off', 'float16')]:
+            with patch.dict(os.environ, {'FASTLLM_DSV41_DISABLE_FAKE_QUANT': flag}, clear=True):
+                self.assertEqual(auto.default_kv_dtype(self.g, md), expected)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(auto.default_kv_dtype(self.g, {'head_dim': 513, 'index_head_dim': 128}), 'float16')
+            self.assertEqual(auto.default_kv_dtype(self.g, {'head_dim': None, 'index_head_dim': 128}), 'float16')
+            self.g.family = 'qwen4'
+            self.assertEqual(auto.default_kv_dtype(self.g, md), 'float16')
+            self.assertEqual(auto.default_kv_dtype(self.g, {'text_config': None}), 'float16')
 
     def test_deepseek_auto_defaults_allow_explicit_opt_out_and_leave_other_models_alone(self):
         md = {'model_type': 'deepseek_v41', 'text_config': {'model_type': 'deepseek_v41_text'}}
