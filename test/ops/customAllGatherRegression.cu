@@ -89,7 +89,8 @@ static void RunJoint(int rank, int ranks, int &errors) {
         if (invalid == 4) count = 4 * 512 * 36 + 64;
         if (FastllmCudaCustomAllReduceAndGather(in, out, gather, count, rank)) std::abort();
     }
-    for (int part : {256, 640, 4096}) {
+    // TP8 crosses the 128-thread / 36-block dispatch boundary.
+    for (int part : {256, 640, 2304, 2312, 4096}) {
         const int count = ranks * part;
         for (bool inplace : {false, true}) {
             float *destination = inplace ? input : output;
@@ -206,7 +207,7 @@ int main(int argc, char **argv) {
     FastllmCudaCustomAllReduceReset();
     for (int error : errors) if (error) return 1;
     if (joint)
-        std::printf("Joint reduce/gather: %d GPUs, three sizes, in/out-of-place, changing values, skewed graphs PASS\n", ranks);
+        std::printf("Joint reduce/gather: %d GPUs, five sizes, in/out-of-place, changing values, skewed graphs PASS\n", ranks);
     else
         std::printf("Custom AllGather: %d GPUs, five shard sizes, eager +64 skewed graph replays PASS\n", ranks);
     return 0;

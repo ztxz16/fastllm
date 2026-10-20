@@ -3068,11 +3068,15 @@ bool FastllmCudaCustomAllReduceAndGather(void *routed, void *dest,
             fastllm::FLOAT32, eligible, routedData) ||
         !FindOrRegisterCustomArPointers(state, rank, shared, count,
             fastllm::BFLOAT16, eligible, sharedData)) return false;
-    const int blocks = (count / 4 + kCustomArThreads - 1) / kCustomArThreads;
+    // Spread small messages across more CTAs without exceeding signal capacity.
+    // Larger messages retain the original 512-thread blocks.
+    const int threads =
+        count / 4 <= 128 * kCustomArMaxBlocks ? 128 : kCustomArThreads;
+    const int blocks = (count / 4 + threads - 1) / threads;
 #define CUSTOM_AR_GATHER_CASE(RANKS)                                        \
     case RANKS:                                                            \
         FastllmCustomAllReduceAndGatherKernel<RANKS>                        \
-            <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(          \
+            <<<blocks, threads, 0, cudaStreamPerThread>>>(                   \
                 routedData, sharedData, state.allSignals,                  \
                 state.allSignals.signals[rank], (float4 *)dest,            \
                 (uint2 *)shared, rank, count / 4);                         \
