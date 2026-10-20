@@ -263,6 +263,44 @@ static void CheckQuantizeLossless(bool cuda) {
     }
 }
 
+static void CheckFp4ScaleBoundaries(bool cuda) {
+    // Sweep every positive finite BF16 block maximum, including the E4M3
+    // subnormal-scale transition missed by normally distributed test data.
+    // At amax=9*2^-9, fake quant chooses scale=2^-8 and rounds its maximum
+    // to 4*scale. Recomputing scale from that maximum used to halve it.
+    constexpr int dim = 512, block = 16, maxima = 0x7f7f;
+    const int rows = (maxima * block + dim - 1) / dim;
+    const float fractions[block] = {
+        1.f, -1.f, 0.f, -0.f, .03125f, -.0625f, .125f, -.25f,
+        .375f, -.5f, .625f, -.75f, .875f, -.875f, .5f, -.375f
+    };
+    std::vector<float> input(rows * dim, 0.f);
+    for (int bits = 1; bits <= maxima; ++bits) {
+        const float maximum = BFloat16BitsToFloat32(uint16_t(bits));
+        for (int lane = 0; lane < block; ++lane)
+            input[(bits - 1) * block + lane] = maximum * fractions[lane];
+    }
+    Data quantized = FakeQuantRows(input, rows, dim, 3, block, cuda);
+    const auto expected = ReadFloats(quantized);
+    Data packed = QuantizeKV(quantized, 3, block, cuda);
+    const auto bytes = ReadBytes(packed);
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const float actual = DecodeRowElem(bytes.data() + (i / dim) * RowBytes(dim, 3, block),
+                                          dim, 3, block, i % dim);
+        Require(memcmp(&actual, &expected[i], sizeof(float)) == 0,
+                std::string(cuda ? "CUDA" : "CPU") + " FP4 scale sweep loses value at block " +
+                std::to_string(i / block) + ", lane " + std::to_string(i % block));
+    }
+    if (cuda) {
+        Data cpu;
+        cpu.CopyFrom(quantized); cpu.ToDevice(DataDevice::CPU);
+        Require(bytes == ReadBytes(QuantizeKV(cpu, 3, block, false)),
+                "FP4 scale sweep: CPU/CUDA packing differs");
+    }
+    std::cout << "  [" << (cuda ? "cuda" : "cpu")
+              << "] FP4 packing preserves all 32639 finite BF16 block maxima\n";
+}
+
 // ---------------- 3. SparseAttention 的量化读路径 ----------------
 
 static Data RunAttention(const Data &q, const Data &chunkKV, Data *ring, Data *cmp, Data *idx,
@@ -776,6 +814,7 @@ int main() {
 
         std::cout << "== QuantizeKV 无损性（CPU）==\n";
         CheckQuantizeLossless(false);
+        CheckFp4ScaleBoundaries(false);
         std::cout << "== 读路径（CPU 参考实现）==\n";
         CheckAttentionRead(false);
         CheckIndexerRead(false);
@@ -783,6 +822,7 @@ int main() {
         if (gHasCuda) {
             std::cout << "== QuantizeKV 无损性（CUDA）==\n";
             CheckQuantizeLossless(true);
+            CheckFp4ScaleBoundaries(true);
             std::cout << "== 读路径（CUDA kernel）==\n";
             CheckAttentionRead(true);
             CheckIndexerRead(true);

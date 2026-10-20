@@ -221,8 +221,8 @@ namespace fastllm {
         return quantMode == 1 ? 448.0f : 6.0f;
     }
 
-    // 由块内 amax 推出该块的 scale。FP4 存储与伪量化共用这一份推导，
-    // 保证「先伪量化再按 FP4 存储」是幂等的（存储无损）。
+    // 原始伪量化的 scale 推导。缓存打包还需处理量化后 amax 变化的
+    // E4M3 次正规边界，见 V41QuantizeKvRow；不能改变这里的原模型计算。
     float DeepSeekV41BlockScale(float amax, int quantMode) {
         if (quantMode == 1) {
             amax = std::max(amax, 1e-4f);
@@ -359,8 +359,7 @@ namespace fastllm {
         return false;
     }
 
-    // 把一行 float 按 (quantMode, blockSize) 量化进缓存行。scale 的推导与 DeepSeekV41FakeQuantRow
-    // 共用 DeepSeekV41BlockScale，因此对已伪量化过的行是幂等的（存储无损）。
+    // 把一行 float 按 (quantMode, blockSize) 打包进缓存行，保留已有伪量化的网格。
     void V41QuantizeKvRow(const float *row, int dim, int quantMode, int blockSize, uint8_t *dst) {
         const bool fp8 = quantMode == 1;
         const float qmax = DeepSeekV41QuantMax(quantMode);
@@ -371,6 +370,11 @@ namespace fastllm {
                 amax = std::max(amax, std::fabs(row[i]));
             }
             float scale = DeepSeekV41BlockScale(amax, quantMode);
+            // E4M3 subnormal scale 2^-8 can produce a maximum of 4*scale,
+            // not 6*scale. Re-deriving scale from 2^-6 rounds down to 2^-9
+            // and clips that maximum. Recover the original grid only here;
+            // changing the fake quantizer would change the checkpoint math.
+            if (quantMode == 3 && amax == 0x1p-6f) scale = 0x1p-8f;
             if (quantMode == 3) {
                 scales[start / blockSize] = V41EncodeFp8E4M3(scale);
             } else {

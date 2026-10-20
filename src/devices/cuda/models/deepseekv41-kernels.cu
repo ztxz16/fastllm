@@ -3235,8 +3235,8 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
     constexpr int kKvQuantThreads = 128;
 
     // 每个 block 处理一行；blockSize 个线程为一组处理一个 scale 块，lane 对应块内元素。
-    // scale 的推导（V41QuantScaleDev）与伪量化 (DeepSeekV41FakeQuantRow) 共用，
-    // 因此对已伪量化过的行是幂等的，即 FP4 / FP8 存储无损。
+    // Reuse the fake-quantization grid, including the subnormal E4M3 case
+    // where the quantized maximum alone would otherwise halve the scale.
     template <typename T>
     __global__ void V41QuantizeKVKernel(const T *input, uint8_t *output, int rows, int dim,
                                         int quantMode, int blockSize, int rowBytes) {
@@ -3263,7 +3263,11 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
             for (int o = blockSize >> 1; o > 0; o >>= 1) {
                 amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
             }
-            const float scale = V41QuantScaleDev(amax, quantMode);
+            float scale = V41QuantScaleDev(amax, quantMode);
+            // A 2^-8 E4M3 scale may round its maximum to 4*scale = 2^-6.
+            // Recomputing from that maximum gives 2^-9 and clips it to 6*2^-9.
+            // Preserve the original grid in storage; leave RotaryQuant intact.
+            if (quantMode == 3 && amax == 0x1p-6f) scale = 0x1p-8f;
             const float q = fminf(qmax, fmaxf(-qmax, v / scale));
             if (quantMode == 1) {
                 __nv_fp8_e4m3 code(q);
