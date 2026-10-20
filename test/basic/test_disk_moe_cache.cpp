@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
         if (devices > 0 && devices > FastllmCudaGetDeviceCount()) return 77;
         for (int device = 0; device < devices; ++device) {
             FastllmCudaSetDevice(device);
-            if (FastllmCudaRuntimeArch() < 80) return 77;
+            if (FastllmCudaRuntimeArch() < 75) return 77;
         }
 #endif
         setenv("FT_GPU_PREFILL", argc > 2 ? "1" : "0", 1);

@@ -241,7 +241,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool is_zp_float,  // is zero point of float16 type?
           const bool dense_fp32,
           const bool add_residual,
-          const bool fuse_swiglu>
+          const bool fuse_swiglu,
+          const bool bf16_output>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -277,6 +278,12 @@ __global__ void Marlin(
       thread_k_blocks == 8 && group_blocks == 1 &&
       a_type_id == vllm::kFloat16.id() && b_type_id == vllm::kFE2M1f.id() &&
       c_type_id == vllm::kFloat16.id() && s_type_id == vllm::kFE4M3fn.id()));
+  // Turing MXFP4 uses losslessly converted FP16 operands but rounds the FP32
+  // result directly to BF16. No intermediate FP16 output/reduction is allowed.
+  static_assert(!bf16_output || (dense_fp32 && !add_residual && !fuse_swiglu &&
+      a_type_id == vllm::kFloat16.id() && c_type_id == vllm::kFloat16.id() &&
+      b_type_id == vllm::kFE2M1f.id() && s_type_id == vllm::kFE8M0fnu.id() &&
+      group_blocks == 2));
   const bool has_bias = dense_fp32 ? false : has_bias_arg;
   const bool use_atomic_add = dense_fp32 ? false : use_atomic_add_arg;
   const bool use_fp32_reduce = dense_fp32 ? true : use_fp32_reduce_arg;
@@ -308,7 +315,7 @@ __global__ void Marlin(
   // Disable use_fp16_accum for NVFP4 and cases when group_size == -1 &&
   // num_bits == 4
   constexpr bool use_fp16_accum =
-      a_type_id == vllm::kFloat16.id() &&
+      a_type_id == vllm::kFloat16.id() && !bf16_output &&
       (!(b_type_id == vllm::kFE2M1f.id() && s_type_id == vllm::kFE4M3fn.id()) &&
        !(group_blocks == -1 && num_bits == 4));
   #else
@@ -1684,8 +1691,15 @@ __global__ void Marlin(
         c0 *= global_scale_f32;
         c1 *= global_scale_f32;
       }
-      c_scalar_t2 res =
-          Cdtype::nums2num2(Cdtype::float2num(c0), Cdtype::float2num(c1));
+      c_scalar_t2 res;
+      if constexpr (bf16_output) {
+        // Only the storage type is half2; these bits receive no FP16 math.
+        res = __halves2half2(
+            __ushort_as_half(__bfloat16_as_ushort(__float2bfloat16_rn(c0))),
+            __ushort_as_half(__bfloat16_as_ushort(__float2bfloat16_rn(c1))));
+      } else {
+        res = Cdtype::nums2num2(Cdtype::float2num(c0), Cdtype::float2num(c1));
+      }
 
       // For per-column quantization we finally apply the scale here (only for
       // 4-bit)
@@ -1847,7 +1861,9 @@ __global__ void Marlin(
   // the dense prefill specialization, without changing the shared pipeline.
   // NVFP4 has no zero point, so matmul does not use its pipe argument.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
-  constexpr bool late_fetch = dense_fp32;
+  // Block-32 shares raw scale bytes between adjacent K fragments. Copy them
+  // before matmul expands the first fragment's bytes into FP16 scales.
+  constexpr bool late_fetch = dense_fp32 && !bf16_output;
 #else
   constexpr bool late_fetch = false;
 #endif
@@ -1965,8 +1981,8 @@ __global__ void Marlin(
 
       cp_async_wait<0>();
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
-      if constexpr (m_block_size_8 && b_type == vllm::kFE2M1f &&
-                    s_type == vllm::kFE4M3fn) {
+      if constexpr (bf16_output || (m_block_size_8 && b_type == vllm::kFE2M1f &&
+                    s_type == vllm::kFE4M3fn)) {
         // sh_red aliases the B pipeline. On SM75 cp_async_wait is a no-op:
         // every warp must finish its final shared B load before another
         // warp reuses that storage for the block's FP32 partial sums.

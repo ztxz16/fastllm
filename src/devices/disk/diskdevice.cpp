@@ -3120,6 +3120,12 @@ namespace fastllm {
                 auto *hit = cudaHit(found->second);
                 if (!hit || hit->device != device ||
                     hit->gate->dataType != NVFP4_BLOCK_32_E8M0 || hit->down->dataType != NVFP4_BLOCK_32_E8M0) continue;
+#ifndef USE_ROCM
+                // Resident decode reads native 17-byte blocks. Restore once
+                // when a prefill-prepared expert first enters this batch.
+                FastllmCudaSetDiskMxfp4MarlinLayout(*hit->gate, false);
+                FastllmCudaSetDiskMxfp4MarlinLayout(*hit->down, false);
+#endif
                 batch->experts.push_back({hit, int(rows.size()), int(routes[e].size()), e == 0});
                 v41Queued[e] = true;
                 for (const auto &task : routes[e]) {
@@ -3331,6 +3337,13 @@ namespace fastllm {
                     y.UpdateUnitSize();
                     FastllmCudaSetDevice(gpu->device);
                     x.ToDevice(DataDevice::CUDA, std::vector<int>{gpu->device}, true);
+#ifndef USE_ROCM
+                    FastllmCudaDiskMxfp4Scope marlinScope(activeGate, activeDown);
+                    if (input.dataType != DataType::BFLOAT16) {
+                        FastllmCudaSetDiskMxfp4MarlinLayout(*activeGate, false);
+                        FastllmCudaSetDiskMxfp4MarlinLayout(*activeDown, false);
+                    }
+#endif
                     if (canonicalGGUF) {
                         RunDiskGlmGGUFExpert(x, y, scales, *gpu, limit);
                     } else {

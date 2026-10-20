@@ -41,7 +41,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           // without atomics.
           const bool dense_fp32 = false,
           const bool add_residual = false,
-          const bool fuse_swiglu = false>
+          const bool fuse_swiglu = false,
+          const bool bf16_output = false>
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
 }

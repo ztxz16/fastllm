@@ -452,6 +452,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
         src/devices/cuda/linear/fastllm-linear-nvfp4-marlin.cu
         src/devices/cuda/linear/fastllm-marlin-fp8-dense.cu
+        src/devices/cuda/linear/fastllm-disk-mxfp4-marlin.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
         src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/moe/fastllm-moe-cache.cu
@@ -2194,6 +2195,13 @@ if (UNIT_TEST)
         set_target_properties(cuda_rmsnorm_decode_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
         add_test(NAME cuda_rmsnorm_decode COMMAND cuda_rmsnorm_decode_test)
         set_tests_properties(cuda_rmsnorm_decode PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(disk_mxfp4_marlin_test test/basic/test_disk_mxfp4_marlin.cu)
+        target_link_libraries(disk_mxfp4_marlin_test PRIVATE fastllm)
+        set_target_properties(disk_mxfp4_marlin_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME disk_mxfp4_marlin COMMAND disk_mxfp4_marlin_test)
+        set_tests_properties(disk_mxfp4_marlin PROPERTIES
+            LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
         add_executable(cuda_nvfp4_fused_test test/basic/test_cuda_nvfp4_fused.cu)
         # Baseline/candidate numerical comparison uses separate processes:

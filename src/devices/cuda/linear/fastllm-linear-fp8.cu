@@ -4579,6 +4579,18 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::
 }
 
 bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+#ifndef USE_ROCM
+    // Ordinary CUDA weights keep their existing dispatch. Cache-owned weights
+    // are repacked only after their actual (post-quantization) input is checked.
+    if (weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0 &&
+        (weight.IsRepacked || FastllmCudaDiskMxfp4Enabled(weight))) {
+        if (bias.dims.empty() && input.cudaData && output.cudaData) {
+            if (FastllmCudaTryDiskMxfp4Marlin(input.cudaData, weight, output.cudaData, n)) return true;
+        } else {
+            FastllmCudaSetDiskMxfp4MarlinLayout(weight, false);
+        }
+    }
+#endif
     FastllmCudaFP8E4M3Block128EnsureBFloat16BiasOnDevice(weight, bias, k);
 
     __nv_bfloat16 *cudaBiasData = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *) weight.extraCudaHalfData[0];

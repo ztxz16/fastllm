@@ -388,6 +388,15 @@ bool FastllmCudaMarlinHalfNVFP4Gemm(const void *a,
                                     int size_m, int size_n, int size_k,
                                     int *workspace, void *c_tmp);
 bool FastllmCudaMarlinNVFP4Supported(int size_n, int size_k);
+// Exclusive disk-expert cache use: reversible, equal-size block32/E8M0 repack.
+// IsRepacked marks this layout only for NVFP4_BLOCK_32_E8M0. No extra persistent
+// allocation is attached to the weight; its cache record remains the owner.
+bool FastllmCudaSetDiskMxfp4MarlinLayout(fastllm::Data &weight, bool enable);
+// Restores the native layout before returning false (including unsafe FP16
+// operand ranges). Repacking happens only after validating the BF16 input.
+bool FastllmCudaTryDiskMxfp4Marlin(const void *input, fastllm::Data &weight,
+    void *output, int rows);
+bool FastllmCudaDiskMxfp4Enabled(const fastllm::Data &weight);
 // Process-start opt-in for measured SM75 M=1..8 shapes. Also used by the
 // single-row dispatcher so its GEMV shortcut cannot bypass the tuned GEMM.
 bool FastllmCudaMarlinNVFP4DecodeTuneEnabled(int size_m, int size_n, int size_k,
@@ -2633,5 +2642,16 @@ extern "C" bool fastllm_moe_cuda_cache_stats(int device, uint64_t *values, bool 
 bool FastllmCudaGlm5DiskExpert(const fastllm::Data &input, const fastllm::Data &scores,
     const fastllm::Data &gate, const fastllm::Data &down, fastllm::Data &activation,
     fastllm::Data &output, float limit);
+
+// Only these two cache-owned projections may adopt the reversible layout.
+// The enclosing disk cache lock protects their storage throughout this scope.
+struct FastllmCudaDiskMxfp4Scope {
+    const fastllm::Data *gate, *down;
+    FastllmCudaDiskMxfp4Scope *previous;
+    FastllmCudaDiskMxfp4Scope(const fastllm::Data *gate, const fastllm::Data *down);
+    ~FastllmCudaDiskMxfp4Scope();
+    FastllmCudaDiskMxfp4Scope(const FastllmCudaDiskMxfp4Scope &) = delete;
+    FastllmCudaDiskMxfp4Scope &operator=(const FastllmCudaDiskMxfp4Scope &) = delete;
+};
 
 #endif // FASTLLM_CUDA_CUH

@@ -548,6 +548,18 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162, vllm::kFE4M3fn.id()>(
 }
 
 template <>
+__device__ inline void dequant_fp8_scales<half2, vllm::kFE8M0fnu.id()>(
+    int q, half2* frag_b) {
+  // The SM75 caller validates the scale range before retiring native weights.
+  auto convert = [](unsigned int e) {
+    return __float2half_rn(__uint_as_float(e << 23));
+  };
+  const unsigned int bits = static_cast<unsigned int>(q);
+  frag_b[1] = __halves2half2(convert((bits >> 8) & 255), convert(bits >> 24));
+  frag_b[0] = __halves2half2(convert(bits & 255), convert((bits >> 16) & 255));
+}
+
+template <>
 __device__ inline void dequant_fp8_scales<nv_bfloat162, vllm::kFE8M0fnu.id()>(
     int q, nv_bfloat162* frag_b) {
   // In this conversion, 2 ** -127 in FP8E8M0 would become 0 in BF16,
