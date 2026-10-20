@@ -1243,6 +1243,17 @@ namespace fastllm {
 
 #ifdef __AVX2__
     static inline __m256 NVFP4ToFloat32_AVX2(const uint8_t *packed) {
+        // E2M1 values are exact in BF16. Look up its two bytes, then widen
+        // to FP32 without changing the lane order or the block accumulation.
+        // Keep code 8 as +0, matching the native-layout decoder's semantics.
+        alignas(16) static const uint8_t loTable[16] = {
+            0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
+            0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0
+        };
+        alignas(16) static const uint8_t hiTable[16] = {
+            0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
+            0x00, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0
+        };
         uint32_t raw;
         memcpy(&raw, packed, sizeof(raw));
         __m128i bytes = _mm_cvtsi32_si128(static_cast<int>(raw));
@@ -1251,17 +1262,9 @@ namespace fastllm {
         __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), lowMask);
         __m128i interleaved = _mm_unpacklo_epi8(low, high);
 
-        __m256i fp4 = _mm256_cvtepu8_epi32(interleaved);
-        __m256i sign = _mm256_slli_epi32(_mm256_and_si256(fp4, _mm256_set1_epi32(0x8)), 28);
-        __m256i body = _mm256_and_si256(fp4, _mm256_set1_epi32(0x7));
-
-        __m256i exp = _mm256_slli_epi32(_mm256_add_epi32(_mm256_srli_epi32(body, 1), _mm256_set1_epi32(126)), 23);
-        __m256i mant = _mm256_slli_epi32(_mm256_and_si256(body, _mm256_set1_epi32(1)), 22);
-        mant = _mm256_andnot_si256(_mm256_cmpeq_epi32(body, _mm256_set1_epi32(1)), mant);
-
-        __m256i bits = _mm256_or_si256(sign, _mm256_or_si256(exp, mant));
-        bits = _mm256_andnot_si256(_mm256_cmpeq_epi32(body, _mm256_setzero_si256()), bits);
-        return _mm256_castsi256_ps(bits);
+        __m128i lo = _mm_shuffle_epi8(_mm_load_si128(reinterpret_cast<const __m128i*>(loTable)), interleaved);
+        __m128i hi = _mm_shuffle_epi8(_mm_load_si128(reinterpret_cast<const __m128i*>(hiTable)), interleaved);
+        return bf16_to_fp32_avx2(_mm_unpacklo_epi8(lo, hi));
     }
 
     static inline float NVFP4E8M0ScaleToFloatFast(uint8_t v) {
