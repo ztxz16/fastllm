@@ -1388,7 +1388,10 @@ if (UNIT_TEST)
             target_include_directories(deepseekV41EngramProjectionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             fastllm_add_checked_test(deepseekV41EngramProjection deepseekV41EngramProjectionRegression
                 "PASS Engram projection" 300)
-            set_tests_properties(deepseekV41EngramProjection PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+            fastllm_add_checked_test(deepseekV41SharedProjection deepseekV41EngramProjectionRegression
+                "PASS Shared projection" 300 --shared)
+            set_tests_properties(deepseekV41EngramProjection deepseekV41SharedProjection
+                PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_executable(deepseekV41EngramRegression test/ops/deepseekV41EngramRegression.cpp)
             target_link_libraries(deepseekV41EngramRegression PRIVATE fastllm)
             target_include_directories(deepseekV41EngramRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

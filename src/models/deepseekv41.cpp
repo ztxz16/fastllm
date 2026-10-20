@@ -2443,7 +2443,9 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") && !replicated &&
             FastllmCudaV41ReferenceLinear(*source,weight[weightName],output,1,source->dataType==DataType::BFLOAT16)) return;
-        if (replicated && V41EndsWith(weightName, ".engram.wkv.weight") &&
+        if (replicated &&
+            (V41EndsWith(weightName, ".engram.wkv.weight") ||
+             V41EndsWith(weightName, ".ffn.shared_experts.gateup.weight")) &&
             !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
             V41ReplicatedRowLinear(*source, weight[weightName], output)) return;
 #endif
