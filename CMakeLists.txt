@@ -1318,6 +1318,10 @@ if (UNIT_TEST)
     add_test(NAME deepseekV41PrecisionCpuFallback COMMAND deepseekV41PrecisionRegression)
     set_tests_properties(deepseekV41PrecisionCpuFallback PROPERTIES
         ENVIRONMENT "FASTLLM_DSV4_DISABLE_CPU_MOE_FAST=1")
+    add_executable(deepseekV41ImagePrefixRegression test/ops/deepseekV41ImagePrefixRegression.cpp)
+    target_link_libraries(deepseekV41ImagePrefixRegression PRIVATE fastllm)
+    fastllm_add_checked_test(deepseekV41ImagePrefix deepseekV41ImagePrefixRegression
+        "DeepSeek-V4.1 image prefix regression: PASS" 60)
     add_executable(legacyMultimodalRequestIsolation test/basic/test_legacy_multimodal_request_isolation.cpp)
     target_link_libraries(legacyMultimodalRequestIsolation PRIVATE fastllm)
     fastllm_add_checked_test(legacyMultimodalRequestIsolation legacyMultimodalRequestIsolation

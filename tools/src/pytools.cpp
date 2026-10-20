@@ -1013,6 +1013,11 @@ extern "C" {
         std::vector <float> imageInput;
         std::map <std::string, std::vector <fastllm::Data*> > *multimodalInput = new std::map <std::string, std::vector <fastllm::Data*> > ();
         std::string mode = multimodal_config["mode"].string_value();
+        if (mode == "deepseek_v41") {
+            // V4.1 receives already-expanded image token spans. Speculative
+            // decoding needs the complete prompt length to honor output limits.
+            config.input_token_length = input.size();
+        }
         const float *multimodalFloat = (const float*) multimodal_data;
 
         auto readShape = [](const json11::Json &node) {

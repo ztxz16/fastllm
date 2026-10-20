@@ -18,6 +18,10 @@
 #include "deepseekv41.h"
 
 #include "utils.h"
+#include "executor.h"
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -29,6 +33,42 @@
 
 namespace fastllm {
     namespace {
+        // Vision weights are not TP-sharded. Do not let generic operations
+        // (notably RMSNorm) produce multicuda tensors between CUDA-only linears.
+        // The model's forward lock serializes this temporary executor selection.
+        class VisionDeviceScope {
+            Executor *executor;
+            std::string previous;
+            std::string previousCuda = "cuda";
+            int previousDevice = -1;
+            bool changed = false;
+        public:
+            VisionDeviceScope() : executor(static_cast<Executor*>(GetExecutor())), previous(executor->firstDevice) {
+                if (executor->GetFirstDeviceType() == "multicuda") {
+                    auto cudaIds = executor->GetDeviceIds("cuda");
+                    for (size_t i = 0; i < cudaIds.size(); ++i)
+                        previousCuda += (i == 0 ? ":" : ",") + std::to_string(cudaIds[i]);
+#ifdef USE_CUDA
+                    previousDevice = FastllmCudaGetDevice();
+#endif
+                    auto ids = executor->GetDeviceIds("multicuda");
+                    AssertInFastLLM(!ids.empty(), "DeepSeekV41 vision: empty TP device list.");
+                    executor->SetFirstDevice("cuda:" + std::to_string(ids.front()));
+                    changed = true;
+                }
+            }
+            ~VisionDeviceScope() {
+                if (changed) {
+                    // Restore the CUDA fallback ids as well: TP workers use
+                    // Data::ToDevice(CUDA), which consults this executor entry.
+                    executor->SetFirstDevice(previousCuda);
+                    executor->SetFirstDevice(previous);
+#ifdef USE_CUDA
+                    FastllmCudaSetDevice(previousDevice);
+#endif
+                }
+            }
+        };
         // 真实 checkpoint 把视觉参数嵌在 config 的 vision_config 里（HF 命名，展平后为
         // "vision_config.num_hidden_layers" 之类）；测试用的迷你模型写的是扁平的 "vision_xxx"。
         // 两种都要认，优先 HF 命名。
@@ -162,6 +202,7 @@ namespace fastllm {
 
     void DeepSeekV41Model::EncodeImage(const Data &patches, int nVitH, int nVitW, Data &output,
                                        const std::string &dumpPrefix) {
+        VisionDeviceScope visionDevice;
         AssertInFastLLM(VisionEnabled(), "DeepSeekV41: this checkpoint has no vision tower (vision_n_layers == 0).");
         const int n = nVitH * nVitW;
         const int dim = vision_dim;
@@ -295,6 +336,33 @@ namespace fastllm {
         output.Reshape({blocks, embed_dim});
     }
 
+    bool DeepSeekV41Model::ReadImageCacheKeys(
+            const std::map<std::string, std::vector<Data*>> &input, DeepSeekV41ImageCacheKeys &keys) const {
+        keys.clear();
+        auto gridIt = input.find("image_grid"), hashIt = input.find("image_hashes"), pixelIt = input.find("pixel_values");
+        if (gridIt == input.end() || hashIt == input.end() || pixelIt == input.end() ||
+            gridIt->second.size() != 1 || hashIt->second.size() != 1 ||
+            !gridIt->second[0] || !hashIt->second[0]) return false;
+        const Data &gridData = *gridIt->second[0], &hashData = *hashIt->second[0];
+        const int count = (int)pixelIt->second.size();
+        if (count == 0 || gridData.dataType != DataType::INT32 || hashData.dataType != DataType::INT32 ||
+            gridData.dims != std::vector<int>({count, 3}) || hashData.dims != std::vector<int>({count, 8})) return false;
+        auto grid = VisionReadInts(gridData), hashes = VisionReadInts(hashData);
+        int previousEnd = 0;
+        for (int i = 0; i < count; ++i) {
+            int start = grid[i * 3], h = grid[i * 3 + 1], w = grid[i * 3 + 2];
+            if (start < previousEnd || h <= 0 || w <= 0 || !pixelIt->second[i]) return false;
+            int rows = (h + vision_downsample_ratio - 1) / vision_downsample_ratio;
+            int cols = (w + vision_downsample_ratio - 1) / vision_downsample_ratio;
+            int length = rows * (cols + 1) + 2;
+            std::vector<int> key = {start, h, w, length};
+            key.insert(key.end(), hashes.begin() + i * 8, hashes.begin() + (i + 1) * 8);
+            keys.push_back(std::move(key));
+            previousEnd = start + length;
+        }
+        return true;
+    }
+
     void DeepSeekV41Model::EncodeImageSpans(const std::map <std::string, std::vector <Data*> > &multimodalInput,
                                             DeepSeekV41RequestState &state) {
         AssertInFastLLM(VisionEnabled(), "DeepSeekV41: this checkpoint has no vision tower (vision_n_layers == 0).");
@@ -327,6 +395,9 @@ namespace fastllm {
             const int span = nLlmH * (nLlmW + 1) + 2;
             AssertInFastLLM(start >= 0 && nVitH > 0 && nVitW > 0,
                             "DeepSeekV41 multimodal: invalid image_grid entry for image " + std::to_string(i) + ".");
+            // Restored KV already contains this image. A partially restored
+            // span still needs its embeddings for the remaining image tokens.
+            if (start + span <= state.restoredLen) continue;
             Data feats;
             EncodeImage(*pixelIt->second[i], nVitH, nVitW, feats, dump ? "fl_image" + std::to_string(i) : "");
             if (dump) {
@@ -420,7 +491,7 @@ namespace fastllm {
         }
         const int seqlen = inputIds.dims[1];
         int chunk = GetChunkedPrefillSize();
-        if (startPos > 0 || chunk <= 0 || chunk >= seqlen) {
+        if (chunk <= 0 || chunk >= seqlen) {
             return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues,
                                 generationConfig, lastTokens, retLogits);
         }
@@ -432,7 +503,7 @@ namespace fastllm {
             Split(inputIds, 1, st, end, curIds);
             std::vector<float> posValues(end - st);
             for (int i = st; i < end; i++) {
-                posValues[i - st] = (float)i;
+                posValues[i - st] = (float)(startPos + i);
             }
             curPos.CopyFrom(Data(DataType::FLOAT32, {1, end - st}, posValues));
             ret = ForwardSingle(curIds, curPos, pastKeyValues, generationConfig, lastTokens,

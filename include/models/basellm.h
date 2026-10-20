@@ -467,6 +467,10 @@ namespace fastllm {
         // 模型可覆盖这三个 hook 来管理不兼容通用 pair<Data, Data> 的历史缓存。
         virtual bool TryRestoreHistoryCache(std::vector<int> &inputTokens, int &cacheLen) { return false; }
 
+        // Opt-in only: implementations must include media content in cache matching.
+        // Generic token-only history remains disabled for multimodal requests.
+        virtual bool TryRestoreMultimodalHistoryCache(ResponseContext *context) { return false; }
+
         virtual void TryRecordHistoryCache(const std::vector<int> &allTokens) {}
 
         virtual void TryRecordResponseContext(ResponseContext *context);

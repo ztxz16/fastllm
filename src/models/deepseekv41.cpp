@@ -3114,7 +3114,8 @@ namespace fastllm {
         std::lock_guard<std::mutex> guard(this->locker);
         int commonMax = V41EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", this->maxRecordNum);
         this->maxRecordNum = std::max(1, V41EnvInt("FASTLLM_DSV41_PREFIX_CACHE_MAX_RECORDS", commonMax));
-        auto old = this->memorys.find(memory->tokens);
+        auto key = std::make_pair(memory->tokens, memory->imageKeys);
+        auto old = this->memorys.find(key);
         if (old != this->memorys.end()) {
             memory->recordTimes = old->second->recordTimes + 1;
             memory->flushTime = ++this->flushTime;
@@ -3137,21 +3138,31 @@ namespace fastllm {
         }
         memory->recordTimes = 1;
         memory->flushTime = ++this->flushTime;
-        this->memorys[memory->tokens] = memory;
+        this->memorys[std::move(key)] = memory;
     }
 
     std::vector<std::pair<std::shared_ptr<DeepSeekV41HistoryMemory>, int> >
-    DeepSeekV41HistoryCacheManager::GetCandidates(const std::vector<int> &inputTokens) {
+    DeepSeekV41HistoryCacheManager::GetCandidates(const std::vector<int> &inputTokens,
+                                                 const DeepSeekV41ImageCacheKeys &imageKeys) {
         std::vector<std::pair<std::shared_ptr<DeepSeekV41HistoryMemory>, int> > candidates;
         std::lock_guard<std::mutex> guard(this->locker);
         // 至少留一个 token 给本次前向
         const int maxLen = (int)inputTokens.size() - 1;
         for (auto &it : this->memorys) {
-            const std::vector<int> &tokens = it.first;
+            const std::vector<int> &tokens = it.second->tokens;
             int limit = std::min(maxLen, (int)tokens.size());
             int len = 0;
             while (len < limit && tokens[len] == inputTokens[len]) {
                 len++;
+            }
+            // Token equality alone cannot distinguish images. Stop before the
+            // first changed/added/removed image, including a partially matched span.
+            const auto &storedImages = it.second->imageKeys;
+            for (size_t i = 0; i < std::max(storedImages.size(), imageKeys.size()); ++i) {
+                if (i < storedImages.size() && i < imageKeys.size() && storedImages[i] == imageKeys[i]) continue;
+                if (i < storedImages.size()) len = std::min(len, storedImages[i][0]);
+                if (i < imageKeys.size()) len = std::min(len, imageKeys[i][0]);
+                break;
             }
             if (len > 0) {
                 candidates.push_back({it.second, len});
@@ -3284,9 +3295,11 @@ namespace fastllm {
         if (!state || state->totalLen <= 0 || context->allTokens.empty()) {
             return;
         }
-        // 图文请求的状态不进前缀缓存（原因同 TryRestoreHistoryCache）
-        if (!context->multimodalInput.empty() || V41HasImageToken(context->allTokens, image_token_id)) {
-            return;
+        DeepSeekV41ImageCacheKeys imageKeys;
+        if (!context->multimodalInput.empty()) {
+            if (!ReadImageCacheKeys(context->multimodalInput, imageKeys)) return;
+        } else if (V41HasImageToken(context->allTokens, image_token_id)) {
+            return; // Missing media identity: never publish a token-only snapshot.
         }
         auto memory = SnapshotState(*state, context->allTokens);
         if (!memory) {
@@ -3297,6 +3310,9 @@ namespace fastllm {
             }
             return;
         }
+        for (const auto &key : imageKeys) {
+            if (key[0] < memory->totalLen) memory->imageKeys.push_back(key);
+        }
         v41HistoryCache.Record(memory);
         if (V41PrefixCacheDebug()) {
             printf("[fastllm-dsv41-prefix-cache] record tokens=%d records=%d\n",
@@ -3306,6 +3322,22 @@ namespace fastllm {
     }
 
     bool DeepSeekV41Model::TryRestoreHistoryCache(std::vector<int> &inputTokens, int &cacheLen) {
+        if (V41HasImageToken(inputTokens, image_token_id)) {
+            cacheLen = 0;
+            return false;
+        }
+        return TryRestoreHistoryCacheImpl(inputTokens, cacheLen, {});
+    }
+
+    bool DeepSeekV41Model::TryRestoreMultimodalHistoryCache(ResponseContext *context) {
+        if (context == nullptr) return false;
+        DeepSeekV41ImageCacheKeys imageKeys;
+        if (!ReadImageCacheKeys(context->multimodalInput, imageKeys)) return false;
+        return TryRestoreHistoryCacheImpl(context->currentTokens, context->cacheLen, imageKeys);
+    }
+
+    bool DeepSeekV41Model::TryRestoreHistoryCacheImpl(std::vector<int> &inputTokens, int &cacheLen,
+                                                    const DeepSeekV41ImageCacheKeys &imageKeys) {
         cacheLen = 0;
         if (!this->saveHistoryChat || V41PrefixCacheDisabled()) {
             return false;
@@ -3314,11 +3346,7 @@ namespace fastllm {
         if ((int)inputTokens.size() <= minTokens) {
             return false;
         }
-        // 图文请求不复用前缀：图像占位 token 的 id 与图像内容无关，同样的文字配不同的图会误命中
-        if (V41HasImageToken(inputTokens, image_token_id)) {
-            return false;
-        }
-        auto candidates = v41HistoryCache.GetCandidates(inputTokens);
+        auto candidates = v41HistoryCache.GetCandidates(inputTokens, imageKeys);
         std::shared_ptr<DeepSeekV41HistoryMemory> memory;
         int hitLen = 0, len = 0;
         for (auto &candidate : candidates) {
@@ -5163,8 +5191,12 @@ namespace fastllm {
             bool batchTransforms = false, mergedAttention = false;
 #ifdef USE_CUDA
             batchAttention = tp && !dumpDebug &&
-                std::all_of(segments.begin(), segments.end(), [](const DeepSeekV41Segment &seg) {
-                    return seg.seqlen == 1 && seg.startPos > 0;
+                std::all_of(segments.begin(), segments.end(), [layer](const DeepSeekV41Segment &seg) {
+                    // Restored snapshots start on CPU. The ordinary attention
+                    // path materializes the ring on every rank; the batched
+                    // decode path assumes those replicas already exist.
+                    return seg.seqlen == 1 && seg.startPos > 0 &&
+                           seg.state->layers[layer].windowKV.multiDeviceData;
                 });
             std::vector<FastllmCudaV41AttentionRequest> attentionRequests;
             std::vector<V41DecodeIndexTask> indexTasks;

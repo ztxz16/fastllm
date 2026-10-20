@@ -3501,8 +3501,9 @@ namespace fastllm {
         // placeholder tokens. Keep request-local KV reuse, but do not restore
         // cross-request token-only caches for multimodal prompts.
         bool allowHistoryCache = context->multimodalInput.empty();
-        bool restoredNativeHistory = allowHistoryCache && !this->DeferHistoryCacheRestore() &&
-            this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
+        bool restoredNativeHistory = !this->DeferHistoryCacheRestore() &&
+            (allowHistoryCache ? this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen) :
+                                 this->TryRestoreMultimodalHistoryCache(context));
 
         auto cache = !allowHistoryCache || restoredNativeHistory || !this->UseGenericHistoryCache() ?
                      std::make_pair((PastKVCacheMemory*)nullptr, 0) :

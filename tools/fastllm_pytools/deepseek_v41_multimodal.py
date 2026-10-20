@@ -14,6 +14,7 @@ ViT / aligner 前向在 C++ 侧完成（src/models/deepseekv41_vision.cpp）。
 """
 
 import copy
+import hashlib
 import json
 import math
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -250,7 +251,8 @@ def prepare_deepseek_v41_multimodal_inputs(
 def build_deepseek_v41_multimodal_payload(native_inputs: Dict[str, Any]) -> Tuple[Dict[str, Any], bytes]:
     """payload 布局（与 pytools.cpp 的 typed tensor 解析一致）：
        pixel_values: 每张图一个 float32 [n_vit_h * n_vit_w, 3 * p * p]
-       image_grid:   int32 [num_images, 3] = (span 起始位置, n_vit_h, n_vit_w)"""
+       image_grid:   int32 [num_images, 3] = (span 起始位置, n_vit_h, n_vit_w)
+       image_hashes: int32 [num_images, 8] = normalized patch SHA-256 words"""
     arrays: List[np.ndarray] = []
     descriptors: List[Dict[str, Any]] = []
     offset = 0
@@ -271,6 +273,11 @@ def build_deepseek_v41_multimodal_payload(native_inputs: Dict[str, Any]) -> Tupl
     for patches in native_inputs["image_patches"]:
         append("pixel_values", patches, np.float32)
     append("image_grid", native_inputs["image_grid"], np.int32)
+    # Hash the actual model input, not a URL or the repeated image placeholder.
+    # This stays inside the server adapter; clients cannot supply cache identities.
+    hashes = [np.frombuffer(hashlib.sha256(np.ascontiguousarray(p, dtype=np.float32).tobytes()).digest(),
+                           dtype=np.int32) for p in native_inputs["image_patches"]]
+    append("image_hashes", np.asarray(hashes, dtype=np.int32).reshape(-1, 8), np.int32)
     payload = b"".join(a.tobytes() for a in arrays)
     payload_config = {
         "mode": "deepseek_v41",

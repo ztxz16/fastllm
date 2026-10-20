@@ -42,6 +42,9 @@
 #include <vector>
 
 namespace fastllm {
+    // Per image: absolute start, ViT height/width, span length, SHA-256 (8 words)
+    // of the normalized FLOAT32 patches, computed by the native Python adapter.
+    using DeepSeekV41ImageCacheKeys = std::vector<std::vector<int>>;
     struct DeepSeekV41DecodeWorkspace;
     // 单层的推理缓存
     struct DeepSeekV41LayerCache {
@@ -132,6 +135,7 @@ namespace fastllm {
     // 前缀缓存的一条记录：某段 token 序列处理完后的完整请求状态（张量放在 CPU）
     struct DeepSeekV41HistoryMemory {
         std::vector<int> tokens;          // 已经进入模型的 token（长度 == totalLen）
+        DeepSeekV41ImageCacheKeys imageKeys;
         int totalLen = 0;
         std::vector<DeepSeekV41LayerCache> layers;
         std::vector<int> engramHistory;
@@ -144,13 +148,14 @@ namespace fastllm {
         int maxRecordNum = 8;
         long long flushTime = 0;
         // Data 没有深拷贝赋值，记录一律通过 shared_ptr 持有，避免隐式拷贝造成别名
-        std::map<std::vector<int>, std::shared_ptr<DeepSeekV41HistoryMemory> > memorys;
+        std::map<std::pair<std::vector<int>, DeepSeekV41ImageCacheKeys>,
+                 std::shared_ptr<DeepSeekV41HistoryMemory>> memorys;
 
         void Record(const std::shared_ptr<DeepSeekV41HistoryMemory> &memory);
         // 按公共前缀长度从长到短列出候选（相同长度时记录更短的在前，更容易满足截断约束）；
         // 可截断性由模型侧检查
         std::vector<std::pair<std::shared_ptr<DeepSeekV41HistoryMemory>, int> > GetCandidates(
-                const std::vector<int> &inputTokens);
+                const std::vector<int> &inputTokens, const DeepSeekV41ImageCacheKeys &imageKeys = {});
     };
 
     // 一次前向中的一个序列片段：属于哪个请求、从哪个位置开始、多少个 token、在拼接输入中的偏移
@@ -254,6 +259,11 @@ namespace fastllm {
         long long KVCacheBytesPerToken() const;
 
         bool TryRestoreHistoryCache(std::vector<int> &inputTokens, int &cacheLen) override;
+        bool TryRestoreMultimodalHistoryCache(ResponseContext *context) override;
+        bool ReadImageCacheKeys(const std::map<std::string, std::vector<Data*>> &input,
+                                DeepSeekV41ImageCacheKeys &keys) const;
+        bool TryRestoreHistoryCacheImpl(std::vector<int> &inputTokens, int &cacheLen,
+                                        const DeepSeekV41ImageCacheKeys &imageKeys);
         void TryRecordHistoryCache(const std::vector<int> &allTokens) override;
         void TryRecordResponseContext(ResponseContext *context) override;
         void OnResponseContextCreated(ResponseContext *context) override;
