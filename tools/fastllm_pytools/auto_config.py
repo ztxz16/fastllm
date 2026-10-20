@@ -42,6 +42,8 @@ def apply_model_defaults(args, metadata):
         args.fast_prefill = True
 
 
+
+
 def cuda_hardware():
     """Read visible CUDA ordinals, bandwidth bounds and peer access capability."""
     try:
@@ -419,12 +421,39 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                             # available when host memory cannot hold all experts.
                             placement = (2 if p["resident_layers"] == model.layers else
                                          int(p["resident_layers"] == 0 and p["moe_cuda_cache"] > 0)) if prefer_cache else 0
-                            return (placement, -score, -p["host_estimated_bytes"], -p["resident_layers"])
-                        result = memory.plan(prepared, model, costs, mode, mapping, gpu, ram,
-                                             rank=rank, allow_full_gpu=True, kv_resident=kv_resident,
-                                             per_device_cache=model.family == "qwen4",
-                                             implicit_embedding_bytes=implicit_embedding_bytes,
-                                             hybrid_cpu_embedding=cpu_embedding)
+                            # Disk prefill amortizes expert reads across the
+                            # chunk. Preserve context, then maximize its size.
+                            chunk = p["chunked_prefill_size"] if model.family == "deepseek_v41" and backend == "disk" else 0
+                            return (chunk, placement, -score, -p["host_estimated_bytes"], -p["resident_layers"])
+                        variants = [prepared]
+                        if (model.family == "deepseek_v41" and backend == "disk" and
+                                not prepared.low_gpu_mem and not {"cuda_embedding", "low_gpu_mem"} & explicit):
+                            low = copy.copy(prepared)
+                            low.low_gpu_mem, low.cuda_embedding = True, False
+                            variants.append(low)
+                        planned = []
+                        for variant in variants:
+                            try:
+                                p = memory.plan(variant, model, costs, mode, mapping, gpu, ram,
+                                                rank=rank, allow_full_gpu=True, kv_resident=kv_resident,
+                                                per_device_cache=model.family == "qwen4",
+                                                implicit_embedding_bytes=0 if variant.low_gpu_mem else implicit_embedding_bytes,
+                                                hybrid_cpu_embedding=cpu_embedding)
+                            except ValueError as error:
+                                rejection = str(error)
+                                continue
+                            # Under hybrid memory pressure, CPU embedding frees
+                            # space for chunk/cache; full GPU keeps normal mode.
+                            low_preference = int(variant.low_gpu_mem) * (
+                                1 if p["resident_layers"] < model.layers else -1)
+                            planned.append((p, variant, low_preference))
+                        if not planned:
+                            raise ValueError(rejection)
+                        result, prepared, _ = max(planned, key=lambda item: (
+                            rank(item[0])[0], item[2], rank(item[0])[1:]))
+                        if prepared.low_gpu_mem and model.family == "deepseek_v41":
+                            result["low_gpu_mem"] = True
+                            notes.append("Disk hybrid uses CPU embedding to leave GPU memory for prefill and expert cache")
                     except ValueError as error:
                         rejection = str(error)
                         continue
@@ -438,7 +467,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                         result["notes"] = notes
                     roomy = model.family == "qwen4" and full_kv_has_expert_room(
                         result, model, costs, mode, mapping, prepared.mtp)
-                    choices.append((score, copy.copy(trial), result, roomy))
+                    choices.append((score, copy.copy(prepared), result, roomy))
             # At long context prefer a 32K streaming pool unless full KV also
             # leaves room for every expert. Smaller pools are capacity fallbacks.
             if len(choices) > previous_choices and (kv_resident or base.max_context_length < 65536 or 32768 not in kv_options):
@@ -450,6 +479,9 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     # Prefer pipeline placement for Qwen without overriding explicit TP.
     # Retain TP as a capacity fallback; explicit TP produces no PP candidates.
     eligible = choices
+    if model.family == "deepseek_v41" and eligible[0][2]["moe_device"] == "disk":
+        largest_chunk = max(item[2]["chunked_prefill_size"] for item in eligible)
+        eligible = [item for item in eligible if item[2]["chunked_prefill_size"] == largest_chunk]
     if model.family == "qwen4":
         eligible = [item for item in choices if item[2]["mode"] == "pp"] or choices
     if (model.family == "qwen4" and base.moe_device_layers == "auto" and
@@ -491,10 +523,13 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                "dspark", "speculative_algorithm", "fast_prefill")
     result["automatic"] = {"policy": "interactive-4k-input-512-output", "topology_candidates": len(choices),
                            "ranking": "estimated latency; not measured throughput", "mtp": args.mtp}
+    if model.family == "deepseek_v41" and result["moe_device"] == "disk":
+        result["automatic"]["ranking"] = "largest feasible chunk at fixed context; CPU embedding under hybrid pressure; estimated latency"
     result["automatic"]["kv_streaming"] = "kvmem" in result
     result["automatic"]["cuda_graph"] = graph_enabled
     result["automatic"]["dspark"] = chosen.dspark
     result["automatic"]["fast_prefill"] = chosen.fast_prefill
+    result["automatic"]["low_gpu_mem"] = chosen.low_gpu_mem
     result["automatic"]["gpu_memory_limit"] = result.get("auto_gpu_memory_limit")
     result["automatic"]["host_memory_limit"] = result.get("auto_host_memory_limit")
     if chosen.dspark:

@@ -31,6 +31,8 @@ DeepSeek-V4.1 的显存估算按 KV source 层统计共享的压缩 KV 和 index
 
 DeepSeek-V4.1 原生 FP8/MXFP4 模型在单请求、非 TP、BF16、磁盘专家和 `fast_prefill` 路径下，按 attention、WoA、MoE 分阶段的临时缓冲峰值估算工作区。MoE 使用复用的 256 行专家缓冲，WoA 保留 FP32 fallback 的权重展开和分块空间；调试 dump、其他精度、GPU 驻留专家等路径继续采用通用保守估算。CUDA graph 隐式启用的 GPU embedding 也计入预算。
 
+磁盘混推的 `--auto` 在上下文预算不变的前提下优先选择最大的可行 chunk，并比较正常 embedding 与 `low_gpu_mem`。仍需混推时优先将 embedding 留在 CPU，为 chunk 和专家缓存腾出显存；全部专家可放 GPU 时保留正常模式。显式 `--cuda_embedding`、`--low_gpu_mem`（包括 JSON 中的 false）和 chunk 优先。此策略保留默认 `gpu_mem_ratio`、512 MiB guard、完整上下文 KV 及扩容重叠预算，不把短请求的实测显存当作 1M 上下文上限。
+
 主存优先使用 NUMA（构建支持时），否则使用 CPU；超大 PLE/Engram 表优先按需读取，减少启动搬运和主存占用，主存仍放不下时再考虑磁盘专家缓存。CUDA Graph 默认开启，原有 `FASTLLM_CUDA_GRAPH` 显式设置仍优先。原有运行时检查继续决定 Graph 能否实际捕获。
 
 Qwen4 混推在上下文容量达到 64K 时，优先使用每层 32K 显存池的精确 QSA KV streaming，将腾出的显存用于专家缓存或驻留。计入完整 KV、工作区和安全余量后，若各卡仍能容纳自己负责的全部专家（驻留或缓存），则完整显存 KV 也参与延迟比较。32K 池不可行时再尝试 16K、8K 池；较短上下文仅在完整 KV 放不下时考虑 streaming。所有方案保留逻辑上下文容量；完整 FP16 KV 放在 pinned 主存，索引仍覆盖全部上下文。预算包括主存 KV、GPU 页表和 prefill 临时使用的一整层 KV，保留原有显存安全余量。主存专家加 KV streaming 的优先级高于磁盘专家；主存不足或 streaming 不可行时仍可退回完整显存 KV。若仍放不下，加载前报错，不自动缩短上下文。

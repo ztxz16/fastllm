@@ -62,6 +62,24 @@ class AutoConfigTest(unittest.TestCase):
         for d in p['gpu_budget_bytes']:
             self.assertLessEqual(p['gpu_estimated_bytes'][d], p['gpu_budget_bytes'][d])
 
+    def test_deepseek_disk_prefers_large_chunk_and_cpu_embedding(self):
+        self.g.family = 'deepseek_v41'
+        a = self.args('--moe_device', 'disk', '--moe_device_layers', '-1')
+        p = self.resolve(a)
+        self.assertEqual(a.chunked_prefill_size, 4096)
+        self.assertTrue(a.low_gpu_mem)
+        self.assertFalse(a.cuda_embedding)
+        self.assertTrue(p['automatic']['low_gpu_mem'])
+        explicit = self.args('--moe_device', 'disk', '--moe_device_layers', '-1',
+                             '--cuda_embedding', '--chunked_prefill_size', '512')
+        self.resolve(explicit)
+        self.assertTrue(explicit.cuda_embedding)
+        self.assertFalse(explicit.low_gpu_mem)
+        self.assertEqual(explicit.chunked_prefill_size, 512)
+        # A full-GPU plan does not need the constrained-memory preference.
+        full = self.args('--moe_device', 'disk', '--moe_device_layers', '0')
+        self.resolve(full)
+        self.assertFalse(full.low_gpu_mem)
 
     def test_deepseek_implicit_embedding_is_charged_before_chunk_selection(self):
         self.g.family = 'deepseek_v41'
