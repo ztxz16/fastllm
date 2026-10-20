@@ -51,10 +51,11 @@ static void Compare(const std::vector<float> &a, const std::vector<float> &b, in
 }
 
 struct Fixture {
-    static constexpr int experts=8, topk=6;
+    const int experts, topk;
     std::vector<std::unique_ptr<Data>> owned;
     std::vector<Data *> weights, reference;
-    Fixture(int hidden, int inter, int device, bool useSlab=false) :
+    Fixture(int hidden, int inter, int device, bool useSlab=false,
+            int experts=8, int topk=6) : experts(experts), topk(topk),
         weights(2*(experts+1),nullptr), reference(weights) {
         DeepSeekV41Model loader;
         loader.block_cnt=1;
@@ -89,24 +90,25 @@ struct Fixture {
     }
 };
 
-static void Case(int hidden, int inter, int device, const std::vector<int> &sizes, bool useSlab=false) {
+static void Case(int hidden, int inter, int device, const std::vector<int> &sizes, bool useSlab=false,
+                 int experts=8, int topk=6, bool roundOutput=false) {
     FastllmCudaSetDevice(device);
-    Fixture f(hidden,inter,device,useSlab);
+    Fixture f(hidden,inter,device,useSlab,experts,topk);
     Data output, ref, a, b, c;
     std::mt19937 rng(89);
     std::normal_distribution<float> normal(0,1);
     for (int rows:sizes) {
-        std::vector<float> x(size_t(rows)*hidden), scales(rows*Fixture::topk);
+        std::vector<float> x(size_t(rows)*hidden), scales(rows*f.topk);
         for (size_t i=0; i<x.size(); ++i) x[i]=normal(rng)*std::ldexp(1.f,int(i/32%5)-2);
         Data input(FLOAT32,{rows,hidden},x);
         ToDataType(input,BFLOAT16);
-        Data ids(INT32,{rows,Fixture::topk}); ids.Allocate();
-        for (int r=0;r<rows;++r) for (int j=0;j<Fixture::topk;++j) {
+        Data ids(INT32,{rows,f.topk}); ids.Allocate();
+        for (int r=0;r<rows;++r) for (int j=0;j<f.topk;++j) {
             // Expert ordering differs from rank order; rows share experts.
-            ((int32_t *)ids.cpuData)[r*Fixture::topk+j]=(7-j+r)%Fixture::experts;
-            scales[r*Fixture::topk+j]=j==0 ? 0.f : j==1 ? -.17f : .31f*j;
+            ((int32_t *)ids.cpuData)[r*f.topk+j]=(f.experts-1-j+r)%f.experts;
+            scales[r*f.topk+j]=j==0 ? 0.f : j==1 ? -.17f : .31f*j;
         }
-        Data scores(FLOAT32,{rows,Fixture::topk},scales);
+        Data scores(FLOAT32,{rows,f.topk},scales);
         for (auto *d:{&input,&ids,&scores}) d->ToDevice(CUDA,{device},true);
         DoCudaMergeMOEV41Fallback(input,ref,ids,scores,f.reference.data(),
                                   f.reference.size(),0.f,10.f);
@@ -124,8 +126,8 @@ static void Case(int hidden, int inter, int device, const std::vector<int> &size
                           0.f,MoeGateSwiglu,f.weights.size(),10.f,true);
             Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph));
             Cuda(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
-            std::vector<int32_t> changed(Fixture::topk);
-            for(int j=0;j<Fixture::topk;++j) changed[j]=(j+3)%Fixture::experts;
+            std::vector<int32_t> changed(f.topk);
+            for(int j=0;j<f.topk;++j) changed[j]=(j+3)%f.experts;
             Cuda(cudaMemcpy(ids.cudaData,changed.data(),changed.size()*4,cudaMemcpyHostToDevice));
             Cuda(cudaGraphLaunch(exec,cudaStreamPerThread));
             const auto replay=Read(output);
@@ -134,6 +136,7 @@ static void Case(int hidden, int inter, int device, const std::vector<int> &size
             Check(replay==Read(output),"graph replay ignored changed GPU routes");
             Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
         }
+        if (roundOutput) ToDataType(output, BFLOAT16);
     }
 }
 
@@ -145,6 +148,11 @@ int main(int argc,char **argv) {
         Cuda(cudaGetDeviceProperties(&properties,0));
         if(properties.major<8) return 77; // In-tree Marlin requires SM80+.
         SetThreads(4);
+        if (argc > 1 && std::string(argv[1]) == "--draft") {
+            Case(5120,2304,0,{5,5,1,2,3,4,5,6,5,1},false,128,3,true);
+            std::printf("V4.1 MXFP4 draft regression PASS: %d checks\n",checks);
+            return 0;
+        }
         Case(256,256,0,{1,2,8,16,33,128,256,257,511,512,513,2049,1});
         Case(256,256,0,{1,8},true); // Unsupported allocator keeps the old path.
         if(devices>1) Case(256,256,1,{1,33,512,1}); // PP device changes/cache reuse.

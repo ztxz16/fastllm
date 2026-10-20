@@ -896,11 +896,6 @@ namespace fastllm {
             return false;
 #endif
         }
-        // 图文请求的 span 只在 prefill 出现，decode 与纯文本相同，但 gate.bias_vl
-        // 与 Engram 掩码的处理只覆盖 prefill，这里保守地关闭投机。
-        if (state.pendingMultimodal != nullptr || !state.imageSpans.empty()) {
-            return false;
-        }
         return true;
     }
 
@@ -1192,7 +1187,7 @@ namespace fastllm {
             std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues,
             bool allowSpeculate) {
         const int numSegments = (int)segments.size();
-        if (!v41DsparkEnabled || inputEmbeds != nullptr || imageMask != nullptr) {
+        if (!v41DsparkEnabled) {
             std::vector<int> plain = ForwardSegments(segments, inputIds, inputEmbeds, imageMask,
                                                      generationConfigs, lastTokens, retLogits,
                                                      samplingPastKeyValues);
@@ -1221,8 +1216,27 @@ namespace fastllm {
         int drafts = 0;
         const int startPos = numSegments == 1 ? segments[0].startPos : 0;
         const int seqlen = numSegments == 1 ? segments[0].seqlen : 0;
-        if (allowSpeculate && numSegments == 1 && active[0] && seqlen == 1 && startPos > 0) {
+        // Capture visual prefill hidden states for the draft window, but only
+        // verify proposals on ordinary text positions. Image masks and embeddings
+        // must retain their original row count through the target forward.
+        const bool textOnly = inputEmbeds == nullptr && imageMask == nullptr;
+        if (allowSpeculate && textOnly && numSegments == 1 && active[0] && seqlen == 1 && startPos > 0) {
             drafts = DsparkBuildVerifyInput(*segments[0].state, inputIds, startPos, verifyIds, draftTokens);
+            const GenerationConfig &config = generationConfigs[0];
+            if (config.output_token_limit > 0 && config.input_token_length > 0) {
+                // The anchor at startPos has already been emitted. Verification
+                // returns accepted drafts plus one correction/bonus token; never
+                // commit inputs beyond what the scheduler is allowed to emit.
+                // Otherwise max_tokens can leave KV ahead of allTokens and make
+                // the completed request ineligible for a prefix snapshot.
+                const int emitted = startPos - config.input_token_length + 1;
+                const int maxDrafts = std::max(0, config.output_token_limit - emitted - 1);
+                if (drafts > maxDrafts) {
+                    drafts = maxDrafts;
+                    draftTokens.resize(drafts);
+                    verifyIds.Resize({1, drafts + 1});
+                }
+            }
             if (drafts > 0) {
                 idsPtr = &verifyIds;
                 segments[0].seqlen = 1 + drafts;
@@ -1238,7 +1252,7 @@ namespace fastllm {
         }
 
         const double forwardStart = DsTick();
-        std::vector<int> ret = ForwardSegments(segments, *idsPtr, nullptr, nullptr, generationConfigs,
+        std::vector<int> ret = ForwardSegments(segments, *idsPtr, inputEmbeds, imageMask, generationConfigs,
                                                lastTokens, retLogits, samplingPastKeyValues);
         const double forwardMs = DsElapsed(forwardStart);
         // 单请求单 token 的普通前向：与校验前向对照，差值就是多校验 N 个候选的边际代价
@@ -1283,7 +1297,7 @@ namespace fastllm {
                 continue;
             }
             // prefill 分块的中间结果不是真正的下一个 token，这时只更新滑窗、不生成候选
-            const int anchor = segments[i].seqlen == 1 && (int)ret.size() > i ? ret[i] : -1;
+            const int anchor = textOnly && segments[i].seqlen == 1 && (int)ret.size() > i ? ret[i] : -1;
             DsparkDebugDumpState(*segments[i].state, "plain");
             DsparkAdvance(*segments[i].state, scratches[i], segments[i].startPos,
                           segments[i].startPos + segments[i].seqlen, anchor, generationConfigs[i]);
@@ -1693,8 +1707,16 @@ namespace fastllm {
                 ApplyDsparkDevice();
                 if (hasSharedExpertOut) {
                     ffnOut.ToDevice(sharedExpertOut.dataDevice);
+                    // Grouped GGUF experts accumulate into FP32; the shared expert
+                    // is BF16. Add in FP32 before the model's BF16 MoE boundary.
+                    if (sharedExpertOut.dataType != ffnOut.dataType) {
+                        ToDataType(sharedExpertOut, ffnOut.dataType);
+                    }
                     AddTo(ffnOut, sharedExpertOut);
                 }
+            }
+            if (ffnOut.dataType != DataType::BFLOAT16) {
+                ToDataType(ffnOut, DataType::BFLOAT16);
             }
             ffnOut.Reshape(ffnDims);
             DsHcPost(ffnOut, *curHidden, ffnPost, ffnComb, *nextHidden);

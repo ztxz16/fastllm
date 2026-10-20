@@ -3853,9 +3853,17 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
     // its original tensor-core tile row and BF16 rounding boundaries.
     w1.Resize({scratchRoutes, cache->intermediate});
     w1.Allocate(false);
+    const auto outputType = deepSeekV41 ? fastllm::DataType::FLOAT32 : input.dataType;
+    if (output.dataType != outputType) {
+        // Data::Allocate tracks element capacity, not allocated bytes. A caller
+        // can round this reusable buffer to BF16 between MoE stages; widening
+        // its dtype alone would retain that half-sized allocation and corrupt
+        // neighboring CUDA buffers on the next FP32 reduction.
+        output.FreeSpace();
+    }
     output.dataDevice = input.dataDevice;
     output.dataDeviceIds = input.dataDeviceIds;
-    output.dataType = deepSeekV41 ? fastllm::DataType::FLOAT32 : input.dataType;
+    output.dataType = outputType;
     output.UpdateUnitSize();
     output.Resize(input.dims);
     output.Allocate(false);
