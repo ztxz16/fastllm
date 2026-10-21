@@ -453,6 +453,8 @@ namespace fastllm {
         void WarmupKvMem();
         virtual void ConfigureKvMem(const KvMemConfig &config);
         virtual bool SupportsKvMem() const { return false; }
+        virtual bool SupportsKvMemBatch() const { return false; }
+        virtual bool SupportsKvMemPrefixCache() const { return false; }
         virtual bool KvMemLayerEligible(int layer) const { return GetKVCacheRetainedTokens(layer) < 0; }
         // Models provide the actual per-layer KV geometry; derived models may
         // shadow legacy head-count fields on basellm.
@@ -491,6 +493,10 @@ namespace fastllm {
         virtual void OnResponseContextCreated(ResponseContext *context) {}
 
         virtual void OnResponseContextRemoved(ResponseContext *context) {}
+
+        // Called under dictLocker after the final forward, before admitting
+        // another request. Output queues remain available to slow consumers.
+        virtual void OnResponseContextFinished(ResponseContext *context) {}
 
         virtual bool UseGenericHistoryCache() const { return true; }
 

@@ -218,7 +218,7 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/context
         src/models/qwen4_exp_graph.cpp src/models/qwen4_exp_gpu_graph.cpp src/models/qwen4_exp_hybrid_graph.cpp
         src/models/qwen4_exp_hybrid.cpp src/models/qwen4_exp_hybrid_parallel.cpp src/models/qwen4_exp_tp.cpp
         src/models/qwen4_exp_pp.cpp
-        src/utils/hybrid_moe.cpp src/utils/hybrid_parallel.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp
+        src/utils/hybrid_moe.cpp src/utils/hybrid_parallel.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp src/models/naive_n05_kvmem.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/glm5_next_gpu.cpp src/models/glm5_next_hybrid.cpp src/models/gpt_oss.cpp
         src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
@@ -398,6 +398,7 @@ if (USE_CUDA)
         src/devices/cuda/fastllm-cuda.cu
         src/devices/cuda/fastllm-cuda-mtp.cu
         src/devices/cuda/fastllm-kvmem.cu
+        src/devices/cuda/fastllm-kvmem-sparse.cu
         src/devices/cuda/fastllm-triton-cuda.cu
         src/devices/cuda/fastllm-ggml-cuda.cu
         src/devices/cuda/fastllm-gguf-mmvq-q.cu
@@ -504,7 +505,7 @@ if (USE_CUDA)
                 FASTLLM_ENABLE_NAIVE_QKV_SM90 FASTLLM_ENABLE_NAIVE_INDEXER_SM90)
     endif()
 
-    # EP8 uses an isolated, pinned DeepGEMM source subset. Compile the kernel
+    # EP4/EP8 uses an isolated, pinned DeepGEMM source subset. Compile the kernel
     # directly into FastLLM; no Python package or external adapter is needed.
     if (UNIX AND NOT APPLE AND NOT USE_ROCM AND NOT CUDA_NO_TENSOR_CORE AND
         CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
@@ -514,7 +515,7 @@ if (USE_CUDA)
         set(FASTLLM_MIMO_EP8_MEGA_ENABLED ON)
         set_property(SOURCE src/devices/cuda/cudadevice.cpp
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_MIMO_EP8_MEGA)
-        message(STATUS "MiMo H20 EP8 MegaMoE: built-in")
+        message(STATUS "MiMo H20 EP4/EP8 MegaMoE: built-in")
     endif()
 
     # FlashInfer's DeepSeek-V4 sparse MLA decode kernel uses SM120-only
@@ -853,6 +854,13 @@ if (UNIT_TEST)
     set_target_properties(qwen35_mtp_shortlist_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     fastllm_add_checked_test(qwen35_mtp_shortlist qwen35_mtp_shortlist_test "PASS" 60)
     if (USE_CUDA AND NOT USE_ROCM)
+        # Standalone infrastructure test: no model weights or full-library build.
+        add_executable(cuda_kvmem_sparse_test test/basic/test_cuda_kvmem_sparse.cu
+            src/devices/cuda/fastllm-kvmem-sparse.cu)
+        target_include_directories(cuda_kvmem_sparse_test PRIVATE include src/devices/cuda/models)
+        set_target_properties(cuda_kvmem_sparse_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_kvmem_sparse cuda_kvmem_sparse_test "PASS KVMem sparse" 300)
+        set_tests_properties(cuda_kvmem_sparse PROPERTIES LABELS cuda RUN_SERIAL TRUE)
         add_executable(cuda_kvmem_test test/basic/test_cuda_kvmem.cu)
         target_link_libraries(cuda_kvmem_test PRIVATE fastllm)
         set_target_properties(cuda_kvmem_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
@@ -1711,6 +1719,12 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_prefill COMMAND naive_n05_prefill_test)
         set_tests_properties(naive_n05_prefill PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
+        add_executable(naive_n05_prefix_cache_test test/basic/test_naive_n05_prefix_cache.cpp)
+        target_link_libraries(naive_n05_prefix_cache_test PRIVATE fastllm_tools)
+        add_test(NAME naive_n05_prefix_cache COMMAND naive_n05_prefix_cache_test)
+        set_tests_properties(naive_n05_prefix_cache PROPERTIES TIMEOUT 60
+            PASS_REGULAR_EXPRESSION "PREFIX CACHE PASS")
+
         add_executable(naive_n05_tp_model_test test/basic/test_naive_n05_tp_model.cpp)
         target_link_libraries(naive_n05_tp_model_test PRIVATE fastllm)
         target_include_directories(naive_n05_tp_model_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -1767,6 +1781,30 @@ if (UNIT_TEST)
                 fastllm_tools ${NAIVE_TP_GRAPH_CUDART} ${CMAKE_DL_LIBS})
             set_target_properties(naive_n05_verify_graph_test PROPERTIES ENABLE_EXPORTS ON LINKER_LANGUAGE CUDA)
             target_include_directories(naive_n05_verify_graph_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            foreach(NAIVE_SPARSE_KV_TYPE bf16 fp8)
+                add_test(NAME naive_n05_kvmem_${NAIVE_SPARSE_KV_TYPE}
+                    COMMAND naive_n05_verify_graph_test 4 kvmem ${NAIVE_SPARSE_KV_TYPE})
+                set_tests_properties(naive_n05_kvmem_${NAIVE_SPARSE_KV_TYPE}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "KVMEM MODEL PASS")
+                add_test(NAME naive_n05_kvmem_prefix_${NAIVE_SPARSE_KV_TYPE}
+                    COMMAND naive_n05_verify_graph_test 4 kvmem_prefix ${NAIVE_SPARSE_KV_TYPE} fp8 layer_shard)
+                set_tests_properties(naive_n05_kvmem_prefix_${NAIVE_SPARSE_KV_TYPE}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+                    PASS_REGULAR_EXPRESSION "TP GPU PREFIX PASS")
+            endforeach()
+            add_test(NAME naive_n05_serving_large COMMAND naive_n05_verify_graph_test 4 serving_large)
+            set_tests_properties(naive_n05_serving_large
+                PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+                PASS_REGULAR_EXPRESSION "SERVING GRAPH PASS")
+            add_test(NAME naive_n05_kvmem_pool COMMAND naive_n05_verify_graph_test 4 kvmem_pool fp8)
+            set_tests_properties(naive_n05_kvmem_pool
+                PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+                PASS_REGULAR_EXPRESSION "KVMEM POOL PASS")
+            add_test(NAME naive_n05_kvmem_fp8_scaled COMMAND naive_n05_verify_graph_test 4 kvmem fp8 fp8)
+            set_tests_properties(naive_n05_kvmem_fp8_scaled
+                PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                PASS_REGULAR_EXPRESSION "KVMEM MODEL PASS")
             add_test(NAME naive_n05_kv_pool COMMAND naive_n05_verify_graph_test 2 kv_pool)
             set_tests_properties(naive_n05_kv_pool PROPERTIES
                 LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180

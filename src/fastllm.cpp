@@ -1164,7 +1164,7 @@ namespace fastllm {
     }
 
     void Data::FakeFrom(const Data &ori, size_t offset) {
-        if (ori.kvMemConfig || kvMemConfig) {
+        if (ori.kvMemConfig || kvMemConfig || ori.kvStorageOwner || kvStorageOwner) {
             throw std::runtime_error("KVMem cache views require an explicit backend implementation");
         }
         AssertInFastLLM(!ori.cudaNativeNvfp4Layout, "Native NVFP4 weight views require restoring the source layout first.");
@@ -1194,7 +1194,7 @@ namespace fastllm {
             FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
 #endif
 
-        if (ori.kvMemConfig || kvMemConfig) {
+        if (ori.kvMemConfig || kvMemConfig || ori.kvStorageOwner || kvStorageOwner) {
             throw std::runtime_error("KVMem cache snapshots require an explicit backend implementation");
         }
 #ifdef USE_CUDA
