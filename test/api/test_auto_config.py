@@ -490,9 +490,22 @@ class AutoConfigTest(unittest.TestCase):
         self.g.streamed_kv = [8192] * 4
         self.gpu = {d: {'total': 3 * GiB, 'free': 3 * GiB} for d in (0, 1)}
 
-    def test_streaming_preserves_128k_and_budgets_host_and_prefill_staging(self):
+    def streaming_args(self, *options):
+        return self.args('--prefix_cache', 'false', '--cache_history', 'false', *options)
+
+    def test_default_reuse_is_not_disabled_to_fit_memory(self):
         self.streaming_fixture()
         a = self.args('--device', 'cuda:0', '--moe_device', 'numa')
+        before = vars(a).copy()
+        with self.assertRaises(ValueError):
+            self.resolve(a)
+        self.assertEqual(vars(a), before)
+        self.assertTrue(self.resolve(self.streaming_args(
+            '--device', 'cuda:0', '--moe_device', 'numa'))['automatic']['kv_streaming'])
+
+    def test_streaming_preserves_128k_and_budgets_host_and_prefill_staging(self):
+        self.streaming_fixture()
+        a = self.streaming_args('--device', 'cuda:0', '--moe_device', 'numa')
         p = self.resolve(a)
         config = json.loads(a.kvmem)
         self.assertEqual((a.max_context_length, a.tokens, a.max_batch), (131072, 131072, 1))
@@ -508,13 +521,13 @@ class AutoConfigTest(unittest.TestCase):
     def test_streaming_uses_smaller_resident_pool_only_when_needed(self):
         self.streaming_fixture()
         self.gpu[0] = dict(total=int(2.4 * GiB), free=int(2.4 * GiB))
-        a = self.args('--device', 'cuda:0', '--moe_device', 'numa')
+        a = self.streaming_args('--device', 'cuda:0', '--moe_device', 'numa')
         self.resolve(a)
         self.assertEqual(json.loads(a.kvmem)['resident_tokens'], 16384)
 
     def test_streaming_keeps_explicit_tp(self):
         self.streaming_fixture()
-        a = self.args('--tp', '2', '--moe_device', 'numa')
+        a = self.streaming_args('--tp', '2', '--moe_device', 'numa')
         p = self.resolve(a)
         self.assertEqual((p['mode'], set(p['gpu_budget_bytes'])), ('tp', {0, 1}))
         self.assertTrue(p['automatic']['kv_streaming'])
@@ -524,10 +537,10 @@ class AutoConfigTest(unittest.TestCase):
         self.g.experts = 256
         options = ('--device', 'cudapp=2', '--moe_device_layers', '-1', '--chunked_prefill_size', '512')
         with patch.object(auto, 'kv_residencies', return_value=[0]):
-            full = self.resolve(self.args(*options))
+            full = self.resolve(self.streaming_args(*options))
         original = memory.plan
         with patch.object(memory, 'plan', wraps=original) as plans:
-            streamed = self.resolve(self.args(*options))
+            streamed = self.resolve(self.streaming_args(*options))
         self.assertEqual(streamed['kvmem']['resident_tokens'], 32768)
         self.assertGreater(streamed['moe_cuda_cache'], full['moe_cuda_cache'])
         self.assertEqual(streamed['chunked_prefill_size'], full['chunked_prefill_size'])
@@ -540,7 +553,7 @@ class AutoConfigTest(unittest.TestCase):
         for full_score in (9., 10.5, 12.):
             with self.subTest(full_score=full_score), patch.object(auto, 'latency_score',
                     side_effect=lambda p, *unused: 10. if 'kvmem' in p else full_score):
-                result = self.resolve(self.args(*options))
+                result = self.resolve(self.streaming_args(*options))
             self.assertIn('kvmem', result)
 
     def test_full_kv_room_is_checked_per_device(self):
@@ -548,7 +561,7 @@ class AutoConfigTest(unittest.TestCase):
         self.g.experts = 256
         self.gpu = {0: dict(total=5 * GiB, free=5 * GiB),
                     1: dict(total=20 * GiB, free=20 * GiB)}
-        p = self.resolve(self.args('--device', 'cudapp=2', '--moe_device_layers', '-1',
+        p = self.resolve(self.streaming_args('--device', 'cudapp=2', '--moe_device_layers', '-1',
                                    '--chunked_prefill_size', '512'))
         self.assertIn('kvmem', p)
 
@@ -561,7 +574,7 @@ class AutoConfigTest(unittest.TestCase):
                 raise ValueError('32K pool does not fit')
             return original(*args, **kwargs)
         with patch.object(memory, 'plan', side_effect=plan):
-            p = self.resolve(self.args('--device', 'cudapp=2', '--moe_device_layers', '-1',
+            p = self.resolve(self.streaming_args('--device', 'cudapp=2', '--moe_device_layers', '-1',
                                        '--chunked_prefill_size', '512'))
         self.assertEqual(p['kvmem']['resident_tokens'], 16384)
 
@@ -569,12 +582,12 @@ class AutoConfigTest(unittest.TestCase):
         self.streaming_fixture()
         self.gpu = {d: dict(total=12 * GiB, free=12 * GiB) for d in (0, 1)}
         # Do not change a fully resident GPU configuration into hybrid streaming.
-        full = self.resolve(self.args('--device', 'cuda:0'))
+        full = self.resolve(self.streaming_args('--device', 'cuda:0'))
         self.assertEqual(full['resident_layers'], self.g.layers)
         self.assertNotIn('kvmem', full)
         options = ('--device', 'cudapp=2', '--moe_device_layers', '-1', '--moe_cuda_cache', '0')
-        self.assertNotIn('kvmem', self.resolve(self.args(*options)))
-        cached = self.resolve(self.args('--device', 'cudapp=2', '--moe_device_layers', '-1'))
+        self.assertNotIn('kvmem', self.resolve(self.streaming_args(*options)))
+        cached = self.resolve(self.streaming_args('--device', 'cudapp=2', '--moe_device_layers', '-1'))
         self.assertEqual(cached['resident_layers'], 0)
         self.assertNotIn('kvmem', cached)
         original = memory.plan
@@ -583,12 +596,12 @@ class AutoConfigTest(unittest.TestCase):
                 raise ValueError('No room for pinned KV')
             return original(*args, **kwargs)
         with patch.object(memory, 'plan', side_effect=plan):
-            self.assertNotIn('kvmem', self.resolve(self.args('--device', 'cudapp=2')))
+            self.assertNotIn('kvmem', self.resolve(self.streaming_args('--device', 'cudapp=2')))
 
     def test_short_context_does_not_stream_just_to_increase_cache(self):
         self.streaming_fixture()
         with patch.object(memory, 'plan', wraps=memory.plan) as plans:
-            p = self.resolve(self.args('--device', 'cudapp=2', '--max_context_length', '32768'))
+            p = self.resolve(self.streaming_args('--device', 'cudapp=2', '--max_context_length', '32768'))
         self.assertNotIn('kvmem', p)
         self.assertEqual({call.kwargs['kv_resident'] for call in plans.call_args_list}, {0})
 
@@ -625,7 +638,7 @@ class AutoConfigTest(unittest.TestCase):
     def test_streaming_does_not_hide_insufficient_ram_or_mutate_failed_request(self):
         self.streaming_fixture()
         self.ram = dict(total=8 * GiB, available=8 * GiB)
-        a = self.args('--device', 'cuda:0', '--moe_device', 'numa')
+        a = self.streaming_args('--device', 'cuda:0', '--moe_device', 'numa')
         before = vars(a).copy()
         with self.assertRaises(ValueError):
             self.resolve(a)
@@ -640,13 +653,13 @@ class AutoConfigTest(unittest.TestCase):
                 raise ValueError('Full KV leaves too little room for host expert residency')
             return original(args, *rest, **kwargs)
         with patch.object(memory, 'plan', side_effect=plan):
-            p = self.resolve(self.args())
+            p = self.resolve(self.streaming_args())
         self.assertEqual(p['moe_device'], 'numa')
         self.assertTrue(p['automatic']['kv_streaming'])
 
     def test_streaming_preserves_explicit_features_and_supported_model_boundary(self):
         self.streaming_fixture()
-        a = self.args()
+        a = self.streaming_args()
         a.atype = a.kv_cache_dtype = 'float16'
         a.tokens = a.max_context_length = 131072
         a.max_batch = 1
@@ -659,19 +672,28 @@ class AutoConfigTest(unittest.TestCase):
                 trial._auto_explicit = [*a._auto_explicit, *changes]
                 self.assertEqual(auto.kv_residencies(trial, self.g), [0])
         for env in ({'FASTLLM_PREFIX_CACHE': '1'}, {'FASTLLM_SKIP_WARMUP': '1'}):
+            trial = copy.copy(a)
+            if 'FASTLLM_PREFIX_CACHE' in env:
+                trial.prefix_cache = ''
             with patch.dict(os.environ, env, clear=True):
-                self.assertEqual(auto.kv_residencies(a, self.g), [0])
+                self.assertEqual(auto.kv_residencies(trial, self.g), [0])
         self.g.family = 'glm5'
         self.assertEqual(auto.kv_residencies(a, self.g), [0])
 
-    def test_streaming_disables_default_history_and_preserves_explicit_history(self):
+    def test_default_reuse_reaches_runtime_and_streaming_requires_opt_out(self):
         self.streaming_fixture()
         self.gpu = {d: dict(total=8 * GiB, free=8 * GiB) for d in (0, 1)}
         self.costs = ([4 * GiB] * 4, [1 << 20] * 4, 1 << 20, 0, GiB, False)
-        for explicit in (False, True):
-            with self.subTest(explicit=explicit), tempfile.TemporaryDirectory() as d:
+        cases = (
+            ((), True, '', False),
+            (('--cache_history', 'true'), True, '', False),
+            (('--prefix_cache', 'false'), True, 'false', False),
+            (('--cache_history', 'false'), False, '', False),
+            (('--prefix_cache', 'false', '--cache_history', 'false'), False, 'false', True),
+        )
+        for options, history, prefix, streaming in cases:
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as d:
                 Path(d, 'config.json').write_text(json.dumps({'model_type': 'qwen4_exp'}))
-                options = ['--cache_history', 'true'] if explicit else []
                 a = make_normal_parser('test').parse_args([d, '--auto', *options])
                 runtime = MagicMock()
                 runtime.get_cuda_memory_info.side_effect = self.gpu.__getitem__
@@ -679,14 +701,16 @@ class AutoConfigTest(unittest.TestCase):
                 model.get_max_input_len.return_value = 131072
                 model.get_max_batch.return_value = 1
                 def warmup():
-                    if explicit:
+                    if streaming:
+                        model.set_kvmem.assert_called_once_with(**json.loads(a.kvmem))
+                    else:
                         model.set_kvmem.assert_not_called()
+                    if history:
                         model.set_save_history.assert_called_once_with(True)
                     else:
-                        model.set_kvmem.assert_called_once_with(**json.loads(a.kvmem))
                         model.set_save_history.assert_not_called()
                         runtime.set_cpu_historycache.assert_not_called()
-                        self.assertEqual(os.environ['FASTLLM_PREFIX_CACHE'], 'false')
+                    self.assertEqual(os.environ.get('FASTLLM_PREFIX_CACHE', ''), prefix)
                 model.warmup.side_effect = warmup
                 with patch.object(memory, 'model_inputs', return_value=({}, [], self.g)), \
                         patch.object(memory, 'geometry', return_value=self.g), \
@@ -696,9 +720,9 @@ class AutoConfigTest(unittest.TestCase):
                         patch.dict(sys.modules, {'ftllm': types.SimpleNamespace(llm=runtime)}), \
                         patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
                     self.assertIs(make_normal_llm_model(a), model)
-                self.assertEqual(model.hybrid_auto_plan['automatic']['kv_streaming'], not explicit)
-                self.assertEqual(a.cache_history, 'true' if explicit else 'false')
-                self.assertEqual(a.prefix_cache, '' if explicit else 'false')
+                self.assertEqual(model.hybrid_auto_plan['automatic']['kv_streaming'], streaming)
+                self.assertEqual(a.cache_history, 'true' if history else 'false')
+                self.assertEqual(a.prefix_cache, prefix)
                 model.warmup.assert_called_once()
 
     def test_tp_off_and_heterogeneous_gpus_exclude_auto_tp(self):

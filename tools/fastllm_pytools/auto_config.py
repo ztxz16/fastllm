@@ -268,11 +268,11 @@ def kv_residencies(args, model):
             args.max_batch != 1 or args.tokens != args.max_context_length or
             _fastllm_env_flag_enabled("FASTLLM_SKIP_WARMUP")):
         return [0]
-    # KVMem cannot preserve prefix/history reuse. Honor explicit requests for
-    # either feature, including the existing prefix-cache environment override.
+    # KVMem cannot preserve prefix/history reuse. Keep reuse enabled by
+    # default; only consider streaming when both caches are explicitly off.
     prefix = args.prefix_cache or os.environ.get("FASTLLM_PREFIX_CACHE", "")
-    history = args.cache_history if "cache_history" in getattr(args, "_auto_explicit", ()) else ""
-    if any(str(v).lower() not in ("", "false", "0", "off") for v in (prefix, history)):
+    history = args.cache_history
+    if any(str(v).lower() not in ("false", "0", "off") for v in (prefix, history)):
         return [0]
     return [0] + [n for n in (32768, 16384, 8192) if n < args.max_context_length]
 
@@ -585,11 +585,6 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
             setattr(chosen, name, result[name])
     if "kvmem" in result:
         chosen.kvmem = json.dumps(result["kvmem"], sort_keys=True)
-        # Model detection supplies a history-cache default before planning. It
-        # must not re-enable reuse after the planner chose exact KV streaming.
-        for name in ("cache_history", "prefix_cache"):
-            if name not in explicit:
-                setattr(chosen, name, "false")
     if (model.family == "qwen4" and chosen.mtp > 0 and result["mode"] == "pp" and
             len(result["gpu_budget_bytes"]) > 1 and result["resident_layers"] < model.layers and
             not {"cuda_embedding", "low_gpu_mem"} & explicit):
