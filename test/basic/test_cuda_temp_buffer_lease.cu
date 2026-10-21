@@ -2,18 +2,24 @@
 #include "fastllm-cuda.cuh"
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 
 static void Check(cudaError_t e) {
     if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
 }
-__global__ void DelayedWrite(float *p, float value) {
-    const unsigned long long start = clock64();
-    while (clock64() - start < 40000000ULL) {}
-    p[0] = value;
+__global__ void Fill(unsigned *p, size_t n, unsigned tag) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) p[i] = tag;
 }
-__global__ void CopyFirst(const float *p, float *out) { out[0] = p[0]; }
+__global__ void Spin() {
+    const unsigned long long start = clock64();
+    while (clock64() - start < 2000000ULL) {}
+}
+__global__ void Verify(const unsigned *p, size_t n, unsigned tag, unsigned long long *bad) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        if (p[i] != tag) atomicAdd(bad, 1ULL);
+}
 
 int main() {
     try {
@@ -42,36 +48,36 @@ int main() {
         }
         FastllmReleaseCudaTempBuffer(c, ownC);
 
-        // Another thread's stream must not touch the buffer before the releaser's kernels finish.
-        void *shared = nullptr;
-        std::thread([&] {
+        // Two host threads (two per-thread streams) borrow concurrently, like the DFlash
+        // scheduler and a TP worker. Each tags the buffer and checks the tag survived.
+        unsigned long long corrupted = 0;
+        std::mutex corruptedMutex;
+        auto worker = [&](unsigned tag) {
             Check(cudaSetDevice(0));
-            bool own = false;
-            shared = FastllmBorrowCudaTempBuffer(bytes, nullptr, &own);
-            Check(cudaMemsetAsync(shared, 0, sizeof(float), cudaStreamPerThread));
-            DelayedWrite<<<1, 1, 0, cudaStreamPerThread>>>(static_cast<float *>(shared), 17.f);
-            FastllmReleaseCudaTempBuffer(shared, own);
-        }).join();
-        float *out = nullptr;
-        Check(cudaMalloc(&out, sizeof(float)));
-        float seen = -1.f;
-        std::thread([&] {
-            Check(cudaSetDevice(0));
-            bool own = true;
-            void *p = FastllmBorrowCudaTempBuffer(bytes, nullptr, &own);
-            if (p != shared || own) {
-                std::printf("FAIL cross-thread borrow: shared=%p p=%p own=%d\n", shared, p, own); ++failures;
+            const size_t n = bytes / sizeof(unsigned);
+            unsigned long long *bad = nullptr, host = 0;
+            Check(cudaMalloc(&bad, sizeof(*bad)));
+            for (int it = 0; it < 100; ++it) {
+                Check(cudaMemsetAsync(bad, 0, sizeof(*bad), cudaStreamPerThread));
+                bool own = false;
+                auto *p = static_cast<unsigned *>(FastllmBorrowCudaTempBuffer(bytes, nullptr, &own));
+                Fill<<<64, 256, 0, cudaStreamPerThread>>>(p, n, tag);
+                Spin<<<1, 1, 0, cudaStreamPerThread>>>();
+                Verify<<<64, 256, 0, cudaStreamPerThread>>>(p, n, tag, bad);
+                FastllmReleaseCudaTempBuffer(p, own);
+                Check(cudaMemcpyAsync(&host, bad, sizeof(host), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+                Check(cudaStreamSynchronize(cudaStreamPerThread));
+                std::lock_guard<std::mutex> guard(corruptedMutex);
+                corrupted += host;
             }
-            CopyFirst<<<1, 1, 0, cudaStreamPerThread>>>(static_cast<const float *>(p), out);
-            Check(cudaMemcpyAsync(&seen, out, sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
-            Check(cudaStreamSynchronize(cudaStreamPerThread));
-            FastllmReleaseCudaTempBuffer(p, own);
-        }).join();
-        if (seen != 17.f) {
-            std::printf("FAIL cross-stream ordering: read %g before the releaser's write\n", seen); ++failures;
+            Check(cudaFree(bad));
+        };
+        std::thread t0(worker, 0xA5A5A5A5u), t1(worker, 0x5A5A5A5Au);
+        t0.join();
+        t1.join();
+        if (corrupted != 0) {
+            std::printf("FAIL cross-stream sharing: %llu words overwritten by the other stream\n", corrupted); ++failures;
         }
-        Check(cudaDeviceSynchronize());
-        Check(cudaFree(out));
 
         if (failures) return 1;
         std::puts("PASS: temp buffer lease and cross-stream release");
