@@ -544,15 +544,15 @@ def _configure_expert_parallel(args, is_naive_n05_model):
         value = os.environ.get("FASTLLM_EP", "")
     if value == "" or value is None:
         return
-    if str(value) not in ("1", "8"):
-        raise ValueError("--ep supports 1 (MoE TP) or 8 (MiMo MegaMoE EP8)")
+    if str(value) not in ("1", "4", "8"):
+        raise ValueError("--ep supports 1 (MoE TP), 4 or 8 (MiMo MegaMoE EP)")
     ep = int(value)
-    if ep == 8:
+    if ep in (4, 8):
         if not is_naive_n05_model:
-            raise ValueError("--ep 8 currently supports MiMo DSA / Naive-N0.5 FP8 models")
-        if _thread_tp_cuda_device_count(getattr(args, "tp", "")) != 8:
-            raise ValueError("--ep 8 requires --tp 8 (exactly eight TP devices)")
-        print("[ep] --ep 8: 32 complete experts/GPU; built-in MegaMoE W8A8")
+            raise ValueError("--ep 4/8 currently supports MiMo DSA / Naive-N0.5 FP8 models")
+        if _thread_tp_cuda_device_count(getattr(args, "tp", "")) != ep:
+            raise ValueError(f"--ep {ep} requires exactly {ep} TP devices")
+        print(f"[ep] --ep {ep}: {256 // ep} complete experts/GPU; built-in MegaMoE W8A8")
     os.environ["FASTLLM_EP"] = str(ep)
     args.ep = ep
 
@@ -967,7 +967,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3（含 Naive N0.5 CUDA）或fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kvmem', type=str, default=None,
-                        help='启用主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"retrieval_interval":64}。默认关闭（--auto 可按预算启用 Qwen4 精确换页），单请求；Qwen3/3.5 单卡稀疏检索，Qwen4/QSA 混合推理按 resident_tokens 限制每层显存 KV，保留原生注意力选择')
+                        help='启用主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"retrieval_interval":64}。默认关闭（--auto 可按预算启用 Qwen4 精确换页），Qwen3/3.5 单请求稀疏检索；Qwen4/QSA 混合推理精确换页；MiMo/Naive CUDA TP 支持多请求精确 DSA KV 缓存，需先设置 --max_batch')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = _integer_or_auto, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如8192；auto按混推内存预算选择')
@@ -987,8 +987,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--multimodal', action = 'store_true',
                         help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
-    parser.add_argument('--ep', type = int, choices = (1, 8), default = None,
-                        help = '专家并行数；1为原MoE TP路径（默认），8为MiMo FP8/H20的EP8，默认使用内置MegaMoE W8A8；需配合--tp 8')
+    parser.add_argument('--ep', type = int, choices = (1, 4, 8), default = None,
+                        help = '专家并行数；1为原MoE TP路径（默认），4/8为MiMo FP8/H20的专家并行，使用内置MegaMoE W8A8；需配合相同大小的--tp')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = _integer_or_auto, default = -1, help = '后面多少层moe使用moe_device，-1表示全部；auto在混推加载前规划GPU驻留前缀')
     parser.add_argument('--moe_cuda_cache', '--moe-cuda-cache',

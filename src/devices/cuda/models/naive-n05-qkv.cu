@@ -42,7 +42,7 @@ __device__ void Store(Params p, int b, int logical, BF value, BF peer) {
     int row = CacheRow(p, b);
     if (row < 0) {
         int c = Channel(logical);
-        if (c < kQuery) p.q[b * kQuery + c] = __float2bfloat16(0.f);
+        if (p.lengths[b] <= 0 && c < kQuery) p.q[b * kQuery + c] = __float2bfloat16(0.f);
         return;
     }
     int c = Channel(logical), d = c % 192;

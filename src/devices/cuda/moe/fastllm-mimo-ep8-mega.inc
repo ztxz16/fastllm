@@ -1,5 +1,5 @@
-// MiMo EP8 keeps exactly one full copy of each expert across the eight ranks.
-// Attention remains TP8. Large inputs are partitioned into disjoint token
+// MiMo EP4/EP8 keeps one full copy of each expert across the participating ranks.
+// Attention uses the same TP group. Large inputs are partitioned into disjoint token
 // ranges before EP dispatch, then merged in-place into the existing output.
 // Small or uneven decode batches and verification retain replicated dispatch.
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
@@ -43,11 +43,11 @@ struct FastllmCudaMimoEp8Mega {
             exchangeFailed = true;
             outputReady.notify_all();
         }
-        if (exchangeFailed) throw std::runtime_error("MiMo EP8 output exchange timed out.");
+        if (exchangeFailed) throw std::runtime_error("MiMo EP output exchange timed out.");
     }
 };
 bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &devices) {
-    if (devices.size() != 8) return false;
+    if (devices.size() != 4 && devices.size() != 8) return false;
     int previous = FastllmCudaGetDevice();
     bool ok = true;
     for (int device : devices) {
@@ -57,45 +57,45 @@ bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &devices) {
     FastllmCudaSetDevice(previous);
     return ok;
 }
-size_t FastllmCudaMimoEp8PrefillWorkspaceBytes(int rows) {
-    return fastllm_ep8_mega_moe_prefill_workspace_bytes(rows);
+size_t FastllmCudaMimoEp8PrefillWorkspaceBytes(int rows, int ranks) {
+    return fastllm_ep8_mega_moe_prefill_workspace_bytes(rows, ranks);
 }
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
         const std::vector<int> &devices,
         const std::vector<std::vector<std::vector<fastllm::Data *>>> &weights) {
     using namespace fastllm;
-    AssertInFastLLM(FastllmCudaMimoEp8MegaSupported(devices) && weights.size() == 8,
-                   "MiMo EP8 MegaMoE requires eight H20 GPUs.");
-    const size_t bytes = fastllm_ep8_mega_moe_workspace_bytes();
+    AssertInFastLLM(FastllmCudaMimoEp8MegaSupported(devices) && weights.size() == devices.size(),
+                   "MiMo EP MegaMoE requires four or eight H20 GPUs.");
+    const size_t bytes = fastllm_ep8_mega_moe_workspace_bytes(devices.size());
     // Dedicated control storage must survive attention/cuBLAS calls. Sharing
     // the old transient scratch would race remote dispatch writes against a
     // later rank's memset. Bound it; retain no duplicate/repacked FP8 weights.
     AssertInFastLLM(bytes > 0 && bytes <= 48 * 1024 * 1024,
-                   "MiMo EP8 symmetric workspace exceeds its memory budget.");
+                   "MiMo EP symmetric workspace exceeds its memory budget.");
     auto state = std::make_shared<FastllmCudaMimoEp8Mega>();
     state->devices = devices;
     std::vector<const void *> peers;
     int previous = FastllmCudaGetDevice();
-    for (int r = 0; r < 8; ++r) {
+    for (int r = 0; r < (int)devices.size(); ++r) {
         FastllmCudaSetDevice(devices[r]);
         auto rank = std::make_unique<FastllmCudaMimoEp8Mega::Rank>();
         rank->prefillReady = FastllmCudaEventCreate();
         rank->workspace.Resize({(int)bytes});
         rank->workspace.ToDevice(DataDevice::CUDA, {devices[r]}, false);
         rank->workspace.Allocate(false);
-        AssertInFastLLM(fastllm_ep8_mega_moe_init_workspace(rank->workspace.cudaData, bytes, devices.data(), r), fastllm_ep8_mega_moe_error());
+        AssertInFastLLM(fastllm_ep8_mega_moe_init_workspace(rank->workspace.cudaData, bytes, devices.data(), r, devices.size()), fastllm_ep8_mega_moe_error());
         peers.push_back(rank->workspace.cudaData);
         state->ranks.push_back(std::move(rank));
     }
-    for (int r = 0; r < 8; ++r) {
+    for (int r = 0; r < (int)devices.size(); ++r) {
         FastllmCudaSetDevice(devices[r]);
         auto &rank = *state->ranks[r];
         rank.layers.resize(weights[r].size(), nullptr);
         for (size_t l = 0; l < weights[r].size(); ++l) {
             if (weights[r][l].empty()) continue;
-            AssertInFastLLM(weights[r][l].size() == 514, "Invalid MiMo EP8 expert table.");
+            AssertInFastLLM(weights[r][l].size() == 514, "Invalid MiMo EP expert table.");
             std::vector<const void *> gate, down, gs, ds;
-            for (int e = r * 32; e < (r + 1) * 32; ++e) {
+            for (int e = r * (256 / devices.size()); e < (r + 1) * (256 / devices.size()); ++e) {
                 for (int part = 0; part < 2; ++part) {
                     Data *w = weights[r][l][2 + e * 2 + part];
                     const std::vector<int> shape = part ? std::vector<int>{4096, 2048} : std::vector<int>{4096, 4096};
@@ -103,7 +103,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
                         w->blockM == 128 && w->blockK == 128 && w->cudaData &&
                         w->dataDeviceIds == std::vector<int>{devices[r]} &&
                         w->scales.size() == (size_t)shape[0] * shape[1] / (128 * 128),
-                        "MiMo EP8 requires complete native FP8 experts with 128x128 scales.");
+                        "MiMo EP requires complete native FP8 experts with 128x128 scales.");
                     // Native MergeMOE creates scales plus an unused zero-bias
                     // allocation for every TP shard. EP8 needs only the scales.
                     auto scale = std::make_unique<Data>(FLOAT32, std::vector<int>{(int)w->scales.size()}, w->scales);
@@ -114,11 +114,11 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
                 }
             }
             rank.layers[l] = fastllm_ep8_mega_moe_create(gate.data(), down.data(), gs.data(), ds.data(),
-                rank.workspace.cudaData, bytes, peers.data(), r, l);
+                rank.workspace.cudaData, bytes, peers.data(), r, l, devices.size());
             AssertInFastLLM(rank.layers[l] != nullptr, fastllm_ep8_mega_moe_error());
         }
-        printf("MIMO_EP8_MEGA gpu=%d experts=32 inter=2048 W8A8 workspace=%zu max_rows=%d Graph-ready backend=builtin\n",
-               devices[r], bytes, fastllm_ep8_mega_moe_max_rows());
+        printf("MIMO_EP_MEGA ranks=%d gpu=%d experts=%d inter=2048 W8A8 workspace=%zu max_rows=%d Graph-ready backend=builtin\n",
+               (int)devices.size(), devices[r], (int)(256 / devices.size()), bytes, fastllm_ep8_mega_moe_max_rows());
     }
     FastllmCudaSetDevice(previous);
     return state;
@@ -133,14 +133,14 @@ void FastllmCudaMimoEp8PrefillReduceScatter(FastllmCudaMimoEp8Mega &state, int r
         output.cudaData && output.dataType == BFLOAT16 &&
         output.dataDevice == DataDevice::CUDA &&
         output.dataDeviceIds.size() == 1 && output.dataDeviceIds[0] == state.devices[rank],
-        "Invalid MiMo EP8 prefill ReduceScatter tensor.");
+        "Invalid MiMo EP prefill ReduceScatter tensor.");
     const int count = (int)(elements / ranks);
     state.WaitForOutputs();
     const bool ok = FastllmNcclReduceScatter(output.cudaData,
         (uint16_t *)output.cudaData + (size_t)rank * count,
         count, output.dataType, state.devices[rank]);
     state.WaitForOutputs();
-    AssertInFastLLM(ok, "MiMo EP8 prefill ReduceScatter failed.");
+    AssertInFastLLM(ok, "MiMo EP prefill ReduceScatter failed.");
 }
 void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
                                       fastllm::Data &output) {
@@ -154,7 +154,7 @@ void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
         output.dataDevice == DataDevice::CUDA &&
         output.dataDeviceIds == std::vector<int>{state.devices[rank]} &&
         (output.dataType == BFLOAT16 || output.dataType == INT32),
-        "Invalid MiMo EP8 prefill AllGather tensor.");
+        "Invalid MiMo EP prefill AllGather tensor.");
     const int total = output.dims[0];
     const size_t rowBytes = (size_t)output.dims[1] * output.unitSize;
     if (total % ranks == 0) {
@@ -165,7 +165,7 @@ void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
         AssertInFastLLM(FastllmNcclAllGather(
             (const uint8_t *)output.cudaData + (size_t)rank * rows * rowBytes,
             output.cudaData, rows * output.dims[1], output.dataType, state.devices[rank]),
-            "MiMo EP8 prefill AllGather failed.");
+            "MiMo EP prefill AllGather failed.");
         state.WaitForOutputs();
         return;
     }
@@ -179,7 +179,7 @@ void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
         AssertInFastLLM(FastllmCudaMemcpyPeerAsyncCurrentThread(state.devices[rank],
             (uint8_t *)output.cudaData + first * rowBytes, state.devices[peer],
             (const uint8_t *)state.ranks[peer]->output + first * rowBytes,
-            rows * rowBytes), "MiMo EP8 peer output copy failed.");
+            rows * rowBytes), "MiMo EP peer output copy failed.");
     }
     FastllmCudaSyncCurrentThreadStream();
     state.WaitForOutputs();
@@ -191,7 +191,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
         fastllm::Data *prefillScratch, const int *liveKeys) {
     using namespace fastllm;
     AssertInFastLLM(input.dataType == BFLOAT16 && input.dims.size() == 2 &&
-        input.dims[1] == 4096, "Invalid MiMo EP8 input shape.");
+        input.dims[1] == 4096, "Invalid MiMo EP input shape.");
     const int ranks = (int)state.devices.size();
     const int total = input.dims[0];
     const int begin = (int)((int64_t)total * rank / ranks);
@@ -199,20 +199,20 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     const bool localRouting = total >= ranks && (!graphDecode || total % ranks == 0) &&
         index.dims == std::vector<int>({shard, 8});
     AssertInFastLLM((localRouting || index.dims == std::vector<int>({total, 8})) &&
-        score.dims == index.dims, "Invalid MiMo EP8 routing shape.");
+        score.dims == index.dims, "Invalid MiMo EP routing shape.");
     output.dataType = BFLOAT16;
     output.Resize(input.dims);
     output.ToDevice(DataDevice::CUDA, {state.devices.at(rank)}, false);
     output.Allocate(false);
     void *handle = state.ranks.at(rank)->layers.at(layer);
-    AssertInFastLLM(handle != nullptr, "Missing MiMo EP8 layer handle.");
+    AssertInFastLLM(handle != nullptr, "Missing MiMo EP layer handle.");
     int capacity = fastllm_ep8_mega_moe_max_rows();
     const void *prefillPeers[8]{};
     // Eligibility uses the common input shape so every rank participates even
     // when one local buffer is unavailable. Router FP32 input is dead here;
     // it is overwritten by the next layer's conversion, after AllGather's
     // final rendezvous has released every remote reader/writer.
-    if (!graphDecode && FastllmCudaMimoEp8PrefillWorkspaceBytes(total)) {
+    if (!graphDecode && FastllmCudaMimoEp8PrefillWorkspaceBytes(total, ranks)) {
         auto &local = *state.ranks[rank];
         local.prefillScratch = nullptr;
         int prefillCapacity = 0;
@@ -253,7 +253,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
             fastllm_ep8_mega_moe_run_masked(handle, x, y, idx, scores, rows, liveKeys ? liveKeys + start : nullptr) :
             fastllm_ep8_mega_moe_run_prefill(handle, prefillPeers, x, y, idx, scores, rows);
         if (!ok)
-            throw std::runtime_error(std::string("MiMo EP8 launch failed: ") + fastllm_ep8_mega_moe_error());
+            throw std::runtime_error(std::string("MiMo EP launch failed: ") + fastllm_ep8_mega_moe_error());
     };
     if (total <= capacity && !localRouting) {
         run(0, total);
@@ -278,7 +278,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
         if (localRouting && residual && normWeight && normOutput) {
             AssertInFastLLM(residual->dataType == BFLOAT16 && residual->Count(0) == total * 4096 &&
                 normWeight->dataType == FLOAT32 && normWeight->Count(0) == 4096,
-                "Invalid MiMo EP8 residual/RMSNorm shape.");
+                "Invalid MiMo EP residual/RMSNorm shape.");
             normOutput->dataType = BFLOAT16;
             normOutput->Resize(residual->dims);
             normOutput->ToDevice(output.dataDevice, output.dataDeviceIds, false);
@@ -295,7 +295,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
         AssertInFastLLM(FastllmNcclAllGather(
             (const uint16_t *)output.cudaData + (size_t)begin * 4096,
             output.cudaData, shard * 4096, BFLOAT16, state.devices[rank]),
-            "MiMo EP8 decode AllGather failed.");
+            "MiMo EP decode AllGather failed.");
         return false;
     }
     if (localRouting && residual && normWeight && normOutput) {
@@ -322,18 +322,18 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
 #else
 struct FastllmCudaMimoEp8Mega {};
 void FastllmCudaMimoEp8PrefillReduceScatter(FastllmCudaMimoEp8Mega &, int, fastllm::Data &) {
-    throw std::runtime_error("MiMo EP8 MegaMoE is unavailable.");
+    throw std::runtime_error("MiMo EP MegaMoE is unavailable.");
 }
 bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &) { return false; }
-size_t FastllmCudaMimoEp8PrefillWorkspaceBytes(int) { return 0; }
+size_t FastllmCudaMimoEp8PrefillWorkspaceBytes(int, int) { return 0; }
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(const std::vector<int> &,
     const std::vector<std::vector<std::vector<fastllm::Data *>>> &) { return {}; }
 void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &, int, fastllm::Data &) {
-    throw std::runtime_error("MiMo EP8 prefill AllGather requires the SM90 backend.");
+    throw std::runtime_error("MiMo EP prefill AllGather requires the SM90 backend.");
 }
 bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &, int, int, const fastllm::Data &,
     const fastllm::Data &, const fastllm::Data &, fastllm::Data &, bool, fastllm::Data *,
     const fastllm::Data *, fastllm::Data *, float, fastllm::Data *, const int *) {
-    throw std::runtime_error("MiMo EP8 MegaMoE requires a Linux CUDA build containing the SM90 backend.");
+    throw std::runtime_error("MiMo EP MegaMoE requires a Linux CUDA build containing the SM90 backend.");
 }
 #endif

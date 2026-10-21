@@ -518,6 +518,8 @@ if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
 
+fastllm_lib.supports_kvmem_prefix_cache_llm_model.argtypes = [ctypes.c_int]
+fastllm_lib.supports_kvmem_prefix_cache_llm_model.restype = ctypes.c_bool
 fastllm_lib.set_kvmem_llm_model.argtypes = (
     [ctypes.c_int, ctypes.c_bool] + [ctypes.c_int] * 6 + [ctypes.c_uint64, ctypes.c_int])
 fastllm_lib.set_kvmem_llm_model.restype = ctypes.c_char_p
@@ -3399,8 +3401,9 @@ class model:
         fastllm_lib.release_memory(self.model)
     
     def set_save_history(self, save: bool):
-        if getattr(self, "kvmem_enabled", False) and save:
-            raise ValueError("KVMem does not support history caching")
+        if (getattr(self, "kvmem_enabled", False) and save and
+                not fastllm_lib.supports_kvmem_prefix_cache_llm_model(self.model)):
+            raise ValueError("This model's KVMem backend does not support history caching")
         self.save_history = bool(save)
         fastllm_lib.set_save_history(self.model, save)
 
@@ -3432,7 +3435,7 @@ class model:
     def set_kvmem(self, *, enabled=True, max_tokens=32768, resident_tokens=8192,
                   sink_tokens=128, recent_tokens=2048, retrieval_tokens=4096,
                   prefill_tokens=512, host_mib=8192, retrieval_interval=64):
-        """Opt into host-backed KV before warmup (one active request).
+        """Opt into host-backed KV before warmup.
 
         Qwen3/3.5 use sparse retrieval on one GPU, changing attention once the
         resident budget is exceeded. Qwen3.5 also supports DFlash/MTP.
@@ -3443,8 +3446,14 @@ class model:
         PP/TP and CUDA Graph; sink/recent/retrieval policy parameters do not apply
         to native QSA. Pure GPU and CPU execution modes do not enable Qwen4 KVMem.
         Qwen4 resident_tokens must be divisible by 4. Prefix reuse and concurrent
-        requests are disabled in KVMem mode; the full max_tokens context remains
-        available. host_mib covers all target and possible draft KV layers.
+        requests are disabled in those adapters; the full max_tokens context
+        remains available. MiMo/Naive N0.5 supports CUDA TP with an explicit
+        max_batch set before KVMem, BF16/FP8 KV and CUDA Graph. Its Indexer stays
+        on GPU and preserves exact TopK; prefill stages one layer at a time.
+        MiMo KVMem supports shared paged prefixes and GPU SWA checkpoints; draft models remain disabled.
+        Its global physical pool can be set with set_max_tokens / --tokens before
+        configuring KVMem, independently of the per-request max_tokens limit.
+        host_mib covers all requests, ranks and KV layers (including graph padding).
         For Qwen3/3.5, token budgets except max_tokens must align to the KV page.
         retrieval_interval controls their speculative score reuse in committed
         tokens; it need not be page aligned. Use 1 to refresh every verify round.
@@ -3464,7 +3473,7 @@ class model:
         if error:
             raise ValueError(error.decode("utf-8", errors="replace"))
         self.kvmem_enabled = enabled
-        if enabled:
+        if enabled and not fastllm_lib.supports_kvmem_prefix_cache_llm_model(self.model):
             self.save_history = False
 
     def set_kv_cache_limit(self, limit: str):
@@ -3485,8 +3494,8 @@ class model:
         fastllm_lib.set_kv_cache_limit_llm_model(self.model, ctypes.c_int64(limit_bytes))
     
     def set_max_batch(self, batch: int):
-        if getattr(self, "kvmem_enabled", False) and batch != 1:
-            raise ValueError("KVMem currently requires max_batch=1")
+        if getattr(self, "kvmem_enabled", False) and batch != self.get_max_batch():
+            raise ValueError("Set max_batch before configuring KVMem")
         fastllm_lib.set_max_batch_llm_model(self.model, batch)
 
     def get_max_batch(self):

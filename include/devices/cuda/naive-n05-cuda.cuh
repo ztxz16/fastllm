@@ -81,7 +81,8 @@ void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
                          int heads, int dim, int rotaryDim, float theta);
 // Append transformed BF16 rows into allocated BF16/FP8 dense or paged storage.
 void FastllmCudaNaivePackIndexer(const fastllm::Data &input, fastllm::Data &output);
-void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start);
+void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start,
+    const fastllm::Data *liveKeys = nullptr);
 // Read logical cache slices into an existing BF16 staging allocation. Used by
 // history recording; no full-cache dequantization is needed for attention.
 struct FastllmNaiveKVRead {
@@ -114,6 +115,7 @@ struct FastllmNaiveRopeCacheRow {
     fastllm::Data *key, *value;
     const fastllm::Data *indexKey;
     const void *const *cache = nullptr;
+    const fastllm::Data *indexCache = nullptr; // Separate GPU Indexer: cache[2] contiguous, cache[4] paged.
 };
 bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     const fastllm::Data &v, const fastllm::Data &positions,
