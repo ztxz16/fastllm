@@ -219,8 +219,10 @@ class HybridAutoTest(unittest.TestCase):
                 auto.inventory(p)
 
     def test_fastllm_gguf_nested_and_symlink_shards_keep_quantized_sizes(self):
-        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as shared:
+        with tempfile.TemporaryDirectory() as d:
             p = Path(d)
+            shared = p / "shared"
+            shared.mkdir()
             (p / "config.json").write_text('{}')
             weight_map = {}
             expected = []
@@ -270,6 +272,32 @@ class HybridAutoTest(unittest.TestCase):
                     (p / "model.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + payload)
                     with self.assertRaisesRegex(ValueError, "fastllm"):
                         auto.inventory(p)
+
+    def test_safetensors_subdirectories_and_path_boundaries(self):
+        with tempfile.TemporaryDirectory() as d:
+            parent = Path(d)
+            model = parent / 'model'
+            (model / 'experts').mkdir(parents=True)
+            (model / 'config.json').write_text('{}')
+            header = json.dumps({'x': {'dtype': 'F16', 'shape': [8],
+                                      'data_offsets': [0, 16]}}).encode()
+            payload = struct.pack('<Q', len(header)) + header + bytes(16)
+            shard = model / 'experts' / 'rank0.safetensors'
+            shard.write_bytes(payload)
+            index = model / 'model.safetensors.index.json'
+            index.write_text(json.dumps({'weight_map': {'x': 'experts/rank0.safetensors'}}))
+            _, tensors = auto.inventory(model)
+            self.assertEqual(tensors, [auto.Tensor('x', (8,), 16, 'F16')])
+            outside = parent / 'outside.safetensors'
+            outside.write_bytes(payload)
+            (model / 'linked.safetensors').symlink_to(outside)
+            (model / 'linked_dir').symlink_to(parent, target_is_directory=True)
+            for name in ('../outside.safetensors', 'linked.safetensors',
+                         'linked_dir/outside.safetensors', str(shard.resolve())):
+                with self.subTest(name=name):
+                    index.write_text(json.dumps({'weight_map': {'x': name}}))
+                    with self.assertRaisesRegex(ValueError, 'invalid safetensors shard path'):
+                        auto.inventory(model)
 
     def test_ngram_and_inactive_draft_do_not_become_gpu_weights(self):
         g, _, _, _ = fixture()

@@ -19,7 +19,7 @@ Dense Qwen3 按实际 GQA 头数、KV、dense 权重及 tied output head 副本�
 
 Qwen3.5 稠密 HF 模型按全注意力层的 GQA KV、线性注意力层的常驻状态、原生 FP8 权重和独立 MTP 层预算。先尝试原生上下文与纯 GPU TP2，必要时尝试 TP4 和较短上下文；显式 `--tp`、`--max_batch`、`--max_context_length`、`--tokens`、`--mtp 0` 或 `--speculative_algorithm off` 优先。内置 `mtp.safetensors` 且配置声明一个草稿层时默认启用 MTP5。默认 `--cuda_embedding`，不自动启用视觉输入。
 
-HF safetensors 目录支持索引引用的多级分片和符号链接分片；`dtype=fastllm` 的版本 1 GGUF 量化张量读取序列化类型头，按保存的量化字节数规划，不按默认 FP16 展开。索引中的绝对路径、`..` 路径仍会拒绝。
+HF safetensors 目录支持索引引用的多级分片和模型目录内的符号链接分片；`dtype=fastllm` 的版本 1 GGUF 量化张量读取序列化类型头，按保存的量化字节数规划，不按默认 FP16 展开。索引中的绝对路径、`..` 路径和指向模型目录外的符号链接仍会拒绝。
 
 ## 单参数自动选择
 

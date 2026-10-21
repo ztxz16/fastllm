@@ -122,9 +122,10 @@ def inventory(path):
         tensors = []
         for name in files:
             file = path / name
-            # Check index names lexically: HF caches and split exports can use
-            # nested shards and symlinks to shared checkpoint storage.
-            if Path(name).is_absolute() or ".." in Path(name).parts or "\\" in name:
+            # Allow nested shards and in-directory symlinks while retaining
+            # the checkpoint boundary and rejecting invalid index names.
+            if (Path(name).is_absolute() or ".." in Path(name).parts or "\\" in name or
+                    path.resolve() not in file.resolve().parents):
                 raise ValueError("Hybrid auto: invalid safetensors shard path")
             with file.open("rb") as stream:
                 file_size = os.fstat(stream.fileno()).st_size
