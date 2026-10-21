@@ -511,6 +511,8 @@ namespace fastllm {
         // Optional request-owned sparse KV storage; pageIndex is a borrowed view.
         std::shared_ptr<const KvMemConfig> kvMemConfig;
         std::shared_ptr<KvMemCache> kvMemCache;
+        // Optional lifetime lease for model-owned, borrowed KV storage.
+        std::shared_ptr<void> kvStorageOwner;
         int pageLen = 128; // 每个page的长度（token数）
         PagedCacheManager *pagedKVCacheData = nullptr; // 存储kv cached的数据，shape为 [maxPages, pageLen, numHeads, headDim]
         std::vector <int> pageIndex; // 目前使用的Index编号

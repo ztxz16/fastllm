@@ -11,6 +11,7 @@ struct NaiveN05FlashModel::TargetWorkspace {
     Data w1, w2, w3, tempInput, tempOutput, moeOutput, moeInputTemp, moeOutputTemp;
     Data indexQ, indexKey, indexKeyFloat, indexWeights, indices, indexBroadcast, positions;
     Data last, logits, logitsBf16, inputIds, liveKeys;
+    Data sparsePointers, sparseLengths, sparseSelected;
     Data denseGate, denseUp, denseDown;
     FastllmNaiveDecodeScratch decode;
     const void *const *cacheTable = nullptr;

@@ -256,6 +256,130 @@ class Fixture : public NaiveN05FlashModel {
             }
         }
     }
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+    std::vector<float> SparseKvRun(bool enabled) {
+        maxBatch = 4; SetMaxTokens(16384); SetChunkedPrefillSize(1024);
+        if (enabled) {
+            SetMaxTokens(13312); // Less than 4 * 4096, enough for the actual mixed histories.
+            KvMemConfig config;
+            config.enabled = true; config.maxTokens = 4096; config.residentTokens = 2048;
+            config.prefillTokens = 1024; config.hostBytes = 1ULL << 30;
+            ConfigureKvMem(config);
+        } else max_positions = 4096;
+        WarmUp();
+        if (enabled && (tokensLimit != 13312 ||
+            GetPagedKVCacheManager(0, true)->maxPages * GetPageLen() != 13312))
+            throw std::runtime_error("KVMem ignored the independent physical pool budget");
+        const int captures = verifyGraphCaptures;
+        if (!captures) throw std::runtime_error("KVMem test requires startup CUDA Graph");
+        std::vector<float> result;
+        using Cache = std::vector<std::pair<Data, Data>>;
+        GenerationConfig config;
+        config.top_k = 1; config.repeat_penalty = 1; config.output_logits = true;
+        config.input_token_length = 3072; config.output_token_limit = 64;
+        // Recreate requests twice: every slot must be reset before reuse.
+        // Both short implicit selection and >resident exact TopK are covered.
+        for (int round = 0; round < 2; ++round) {
+            std::vector<Cache> requests(4);
+            std::vector<int> past(4, round ? 3072 : 12);
+            for (int row = 0; row < 4; ++row) {
+                for (int layer = 0; layer < block_cnt; ++layer)
+                    requests[row].emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
+                for (int start = 0; start < past[row]; start += 1024) {
+                    int length = std::min(1024, past[row] - start);
+                    std::vector<float> ids(length), positions(length), logits;
+                    for (int i = 0; i < length; ++i) { ids[i] = ((start + i) * 3 + row + round) % 251; positions[i] = start + i; }
+                    Forward(Data(FLOAT32, {1, length}, ids), Data(), Data(FLOAT32, {1, length}, positions),
+                        requests[row], config, LastTokensManager(), &logits);
+                    result.insert(result.end(), logits.begin(), logits.end());
+                }
+            }
+            for (int step = 0; step < 12; ++step) {
+                const int count = (step % 4) + 1;
+                std::vector<float> ids(count);
+                std::vector<Data> positions(count);
+                std::vector<Data *> pos;
+                std::vector<std::pair<Data *, Data *>> caches;
+                std::vector<std::vector<float>> logits(count);
+                std::vector<std::vector<float> *> outputs;
+                for (int row = 0; row < count; ++row) {
+                    const int owner = step % 2 ? 3 - row : row;
+                    ids[row] = (past[owner] * 3 + owner + round) % 251;
+                    positions[row].CopyFrom(Data(FLOAT32, {1, 1}, {(float)past[owner]}));
+                    pos.push_back(&positions[row]); outputs.push_back(&logits[row]);
+                    for (auto &layer : requests[owner]) caches.emplace_back(&layer.first, &layer.second);
+                    ++past[owner];
+                }
+                const bool graph = step % 3 != 0;
+                SetCudaGraph(graph);
+                const int launches = verifyGraphLaunches;
+                ForwardBatch(count, Data(FLOAT32, {1, count}, ids), {}, pos, std::vector<int>(count, 1), caches,
+                    std::vector<GenerationConfig>(count, config), LastTokensManager(), &outputs);
+                if (graph && verifyGraphLaunches - launches != ranks)
+                    throw std::runtime_error("KVMem test failed to replay all ranks");
+                if (verifyGraphCaptures != captures) throw std::runtime_error("KVMem serving recaptured graphs");
+                for (auto &row : logits) result.insert(result.end(), row.begin(), row.end());
+            }
+            SetCudaGraph(true);
+        }
+        // Mixed-length batched prefill shares staging, but never cache owners.
+        std::vector<Cache> merged(4);
+        std::vector<int> lengths{23, 31, 47, 61};
+        std::vector<float> ids;
+        std::vector<Data> positions(4);
+        std::vector<Data *> pos;
+        std::vector<std::pair<Data *, Data *>> caches;
+        std::vector<std::vector<float>> logits(4);
+        std::vector<std::vector<float> *> outputs;
+        for (int row = 0; row < 4; ++row) {
+            for (int layer = 0; layer < block_cnt; ++layer)
+                merged[row].emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
+            for (auto &layer : merged[row]) caches.emplace_back(&layer.first, &layer.second);
+            std::vector<float> coordinates(lengths[row]);
+            for (int i = 0; i < lengths[row]; ++i) { ids.push_back((i * 7 + row) % 251); coordinates[i] = i; }
+            positions[row].CopyFrom(Data(FLOAT32, {1, lengths[row]}, coordinates));
+            pos.push_back(&positions[row]); outputs.push_back(&logits[row]);
+        }
+        ForwardBatch(4, Data(FLOAT32, {1, (int)ids.size()}, ids), {}, pos, lengths, caches,
+            std::vector<GenerationConfig>(4, config), LastTokensManager(), &outputs);
+        for (auto &row : logits) result.insert(result.end(), row.begin(), row.end());
+        if (verifyGraphCaptures != captures) throw std::runtime_error("KVMem prefill recaptured graphs");
+        merged.clear();
+        if (enabled) {
+            eos_token_id = -1; eos_token_ids.clear(); useRealScheduler = true;
+            SetPrefillBatching(16, 20);
+            config.output_logits = false; config.output_token_limit = 16;
+            const int launches = verifyGraphLaunches;
+            std::vector<int> fullBatch;
+            for (int i = 0; i < maxBatch; ++i)
+                fullBatch.push_back(LaunchResponseTokens({1, 2, 3, 4}, config));
+            for (int handle : fullBatch) {
+                for (int i = 0; i < config.output_token_limit; ++i)
+                    if (FetchResponseTokens(handle) < 0)
+                        throw std::runtime_error("KVMem full batch ended early");
+                if (FetchResponseTokens(handle) != -1)
+                    throw std::runtime_error("KVMem full batch output count");
+            }
+            if (verifyGraphLaunches - launches != ranks * (config.output_token_limit - 1))
+                throw std::runtime_error("KVMem full slots serialized decode");
+            config.output_logits = false; config.output_token_limit = 1;
+            std::vector<int> handles;
+            for (int i = 0; i < 12; ++i) handles.push_back(LaunchResponseTokens({1, 2, 3, 4}, config));
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            while (!std::all_of(handles.begin(), handles.end(), [&](int h) { return CanFetchResponse(h); })) {
+                if (std::chrono::steady_clock::now() > deadline)
+                    throw std::runtime_error("KVMem slots held by completed output queues");
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            for (int handle : handles) {
+                if (FetchResponseTokens(handle) < 0 || FetchResponseTokens(handle) != -1)
+                    throw std::runtime_error("KVMem completed request lost queued output");
+            }
+            ShutdownRuntime();
+        }
+        return result;
+    }
+#endif
     mutable int pagedRestores = 0, lastPrefixLength = 0;
     mutable bool failPrefixRestore = false;
     int hostRestores = 0;
@@ -276,8 +400,106 @@ class Fixture : public NaiveN05FlashModel {
     }
     bool UseModelSpecificScheduler() const override { return !useRealScheduler; }
     void RunModelSpecificScheduler() override {}
-    void HistoryServingChecks(bool graph = true) {
-        maxBatch = 32; SetMaxTokens(262144); SetChunkedPrefillSize(128); WarmUp();
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+    void SparsePoolServingChecks() {
+        maxBatch = 8; SetMaxTokens(7937); SetChunkedPrefillSize(128);
+        KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 7937;
+        cfg.residentTokens = 2048; cfg.prefillTokens = 128; cfg.hostBytes = 1ULL << 30;
+        bool rejected = false;
+        try { ConfigureKvMem(cfg); } catch (const std::invalid_argument &) { rejected = true; }
+        if (!rejected) throw std::runtime_error("pool smaller than one rounded request was accepted");
+        SetMaxTokens(8193); // The physical pool rounds down to complete pages.
+        ConfigureKvMem(cfg); WarmUp();
+        if (tokensLimit != 8192 || GetPagedKVCacheManager(0, true)->maxPages != 64)
+            throw std::runtime_error("independent pool allocation mismatch");
+        useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();
+        SetPrefillBatching(8192, 20);
+        const int captures = verifyGraphCaptures;
+        auto run = [&](const std::vector<std::vector<int>> &prompts, int count,
+                       std::vector<std::vector<int>> *sampled = nullptr) {
+            std::vector<int> handles;
+            std::vector<std::vector<std::vector<float>>> output(prompts.size());
+            if (sampled) sampled->resize(prompts.size());
+            for (const auto &tokens : prompts) {
+                GenerationConfig gen; gen.top_k = 1; gen.output_logits = true;
+                gen.input_token_length = tokens.size(); gen.output_token_limit = count;
+                handles.push_back(LaunchResponseTokens(tokens, gen));
+            }
+            for (size_t row = 0; row < handles.size(); ++row) {
+                for (int step = 0; step < count; ++step) {
+                    output[row].emplace_back();
+                    const int token = FetchResponseLogits(handles[row], output[row].back());
+                    if (token < 0)
+                        throw std::runtime_error("shared pool truncated a response");
+                    if (sampled) (*sampled)[row].push_back(token);
+                }
+                std::vector<float> unused;
+                if (FetchResponseLogits(handles[row], unused) != -1)
+                    throw std::runtime_error("shared pool completion failed");
+            }
+            return output;
+        };
+        std::vector<int> prefix(6144);
+        for (int i = 0; i < (int)prefix.size(); ++i) prefix[i] = i * 3 % 251;
+        SetSaveHistoryChat(true);
+        run({prefix}, 1);
+        std::vector<std::vector<int>> forks(8, prefix);
+        for (int i = 0; i < 8; ++i) forks[i].push_back(240 + i);
+        const int hits = pagedRestores;
+        std::vector<std::vector<int>> sharedTokens;
+        const auto shared = run(forks, 132, &sharedTokens); // Nearly fills the physical pool.
+        if (pagedRestores - hits != 8)
+            throw std::runtime_error("physical pool double-counted shared prefixes");
+        // Larger suffixes require queuing even though all eight prefixes hit.
+        // Rejected candidates must release references and restore them later.
+        std::vector<std::vector<int>> queuedTokens;
+        const auto queued = run(forks, 384, &queuedTokens);
+        SetSaveHistoryChat(false);
+        for (int row = 0; row < 8; ++row) {
+            // Compare identical histories. Independent greedy runs can choose
+            // different near-tied tokens and diverge after many decode steps.
+            for (int step : {0, 1, 126, 127, 131}) {
+                auto input = forks[row];
+                input.insert(input.end(), sharedTokens[row].begin(), sharedTokens[row].begin() + step);
+                auto cold = run({input}, 1);
+                RequireCloseLogits(shared[row][step].data(), cold[0][0], "shared pool logits");
+            }
+            auto input = forks[row];
+            input.insert(input.end(), queuedTokens[row].begin(), queuedTokens[row].end() - 1);
+            auto cold = run({input}, 1);
+            RequireCloseLogits(queued[row].back().data(), cold[0][0], "queued prefix logits");
+        }
+        std::vector<std::vector<int>> independent(8, std::vector<int>(2048));
+        for (int row = 0; row < 8; ++row)
+            for (int i = 0; i < 2048; ++i) independent[row][i] = (i * 3 + row) % 251;
+        std::vector<std::vector<int>> pressureTokens;
+        const auto pressured = run(independent, 256, &pressureTokens);
+        for (int row = 0; row < 8; ++row) {
+            for (int step : {0, 127, 128, 255}) {
+                auto input = independent[row];
+                input.insert(input.end(), pressureTokens[row].begin(), pressureTokens[row].begin() + step);
+                auto cold = run({input}, 1);
+                RequireCloseLogits(pressured[row][step].data(), cold[0][0], "pool pressure logits");
+            }
+        }
+        run({std::vector<int>(7936, 7)}, 1); // Exactly reaches input + output limit.
+        GenerationConfig overlong; overlong.output_token_limit = 1;
+        if (FetchResponseTokens(LaunchResponseTokens(std::vector<int>(7937, 7), overlong)) != -2)
+            throw std::runtime_error("shared pool exceeded the per-request context limit");
+        if (verifyGraphCaptures != captures) throw std::runtime_error("shared pool recaptured graphs");
+        ShutdownRuntime();
+        std::cout << "KVMEM POOL PASS max_relative=" << largestLogitRelative
+                  << " max_abs=" << largestLogitAbsolute << std::endl;
+    }
+#endif
+    void HistoryServingChecks(bool graph = true, bool sparse = false) {
+        maxBatch = 32; SetMaxTokens(262144); SetChunkedPrefillSize(128);
+        if (sparse) {
+            KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 7937;
+            cfg.residentTokens = 2048; cfg.prefillTokens = 128; cfg.hostBytes = 1ULL << 30;
+            ConfigureKvMem(cfg);
+        }
+        WarmUp();
         useRealScheduler = true;
         eos_token_id = -1; eos_token_ids.clear();
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
@@ -382,6 +604,44 @@ class Fixture : public NaiveN05FlashModel {
             std::vector<std::vector<float>> unused;
             infer(prompts.back(), 1, unused);
         }
+        // More pending forks than hot slots: the shared immutable prefix must
+        // not consume a private slot until admission. Each fork then appends
+        // different tokens without changing its siblings' pages or Indexer.
+        SetSaveHistoryChat(false); SetSaveHistoryChat(true);
+        std::vector<int> shared(3072);
+        for (int i = 0; i < (int)shared.size(); ++i) shared[i] = i * 3 % 251;
+        std::vector<std::vector<float>> seed;
+        infer(shared, 1, seed);
+        const int forkCount = sparse ? maxBatch + 8 : 16, forkSteps = 4, beforeForks = pagedRestores;
+        std::vector<int> forks;
+        std::vector<std::vector<int>> forkPrompts(forkCount);
+        std::vector<std::vector<std::vector<float>>> forkLogits(forkCount);
+        for (int row = 0; row < forkCount; ++row) {
+            auto &prompt = forkPrompts[row]; prompt = shared;
+            prompt.push_back(252); prompt.push_back(row);
+            GenerationConfig cfg; cfg.top_k = 1; cfg.output_logits = true;
+            cfg.output_token_limit = forkSteps; cfg.input_token_length = prompt.size();
+            forks.push_back(LaunchResponseTokens(prompt, cfg));
+        }
+        for (int row = 0; row < forkCount; ++row) {
+            for (int step = 0; step < forkSteps; ++step) {
+                forkLogits[row].emplace_back();
+                if (FetchResponseLogits(forks[row], forkLogits[row].back()) < 0)
+                    throw std::runtime_error("shared prefix fork ended early");
+            }
+            std::vector<float> unused;
+            if (FetchResponseLogits(forks[row], unused) >= 0)
+                throw std::runtime_error("shared prefix fork did not end");
+        }
+        if (pagedRestores - beforeForks != forkCount)
+            throw std::runtime_error("shared prefix fork missed resident pages");
+        SetSaveHistoryChat(false);
+        for (int row = 0; row < forkCount; ++row) {
+            std::vector<std::vector<float>> cold;
+            infer(forkPrompts[row], forkSteps, cold);
+            for (int step = 0; step < forkSteps; ++step)
+                RequireCloseLogits(forkLogits[row][step].data(), cold[step], "shared prefix concurrent logits");
+        }
         // Capture a boundary during decode, then resume its output prefix.
         SetSaveHistoryChat(false); SetSaveHistoryChat(true);
         auto tokens = prompts.front(); tokens.resize(240);
@@ -405,6 +665,45 @@ class Fixture : public NaiveN05FlashModel {
         infer(tokens, 1, recovered);
         if (recovered != resumed)
             throw std::runtime_error("prefix allocation failure changed the next request");
+        // Ragged requests cross the same page on different decode steps, with
+        // several checkpoints submitted together on each rank. Every saved
+        // window must restore its own request after the batch has finished.
+        SetSaveHistoryChat(false); SetSaveHistoryChat(true);
+        const int batchSize = 16, outputs = 40;
+        std::vector<std::vector<int>> batchPrompts(batchSize), batchTokens(batchSize);
+        std::vector<std::vector<float>> batchLastLogits(batchSize);
+        std::vector<int> handles;
+        for (int row = 0; row < batchSize; ++row) {
+            auto &prompt = batchPrompts[row];
+            prompt.resize(232 + (row % 4) * 4);
+            for (int j = 0; j < (int)prompt.size(); ++j) prompt[j] = (row * 7 + j * 3) % 251;
+            GenerationConfig cfg;
+            cfg.top_k = 1; cfg.output_logits = true;
+            cfg.output_token_limit = outputs; cfg.input_token_length = prompt.size();
+            handles.push_back(LaunchResponseTokens(prompt, cfg));
+        }
+        for (int step = 0; step < outputs; ++step) for (int row = 0; row < batchSize; ++row) {
+            auto &logits = batchLastLogits[row];
+            logits.clear();
+            int token = FetchResponseLogits(handles[row], logits);
+            if (token < 0) throw std::runtime_error("batched prefix response ended early");
+            batchTokens[row].push_back(token);
+        }
+        for (int handle : handles) {
+            std::vector<float> unused;
+            if (FetchResponseLogits(handle, unused) >= 0)
+                throw std::runtime_error("batched prefix response did not end");
+        }
+        for (int row = 0; row < batchSize; ++row) {
+            auto prompt = batchPrompts[row];
+            prompt.insert(prompt.end(), batchTokens[row].begin(), batchTokens[row].end() - 1);
+            const int beforeHit = pagedRestores;
+            std::vector<std::vector<float>> hot;
+            infer(prompt, 1, hot);
+            if (pagedRestores != beforeHit + 1 || lastPrefixLength != 256 || hostRestores != 0)
+                throw std::runtime_error("batched decode checkpoint was not reusable");
+            RequireCloseLogits(hot[0].data(), batchLastLogits[row], "batched decode checkpoint logits");
+        }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         if (verifyGraphCaptures != captures) throw std::runtime_error("prefix serving recaptured a graph");
 #endif
@@ -556,19 +855,19 @@ class Fixture : public NaiveN05FlashModel {
             throw std::runtime_error("incompatible serving graph was revived");
         std::cout << "SERVING INVALIDATION PASS" << std::endl;
     }
-    void ServingGraphChecks(bool padding = false, bool ragged = false) {
+    void ServingGraphChecks(bool padding = false, bool ragged = false, bool large = false) {
         // An unaligned admission limit must still prepare the padded endpoint.
         // Run graph/reference sequentially so both obey that request limit.
-        maxBatch = ragged ? 32 : padding ? 47 : 16;
+        maxBatch = large ? 401 : ragged ? 32 : padding ? 47 : 16;
         SetChunkedPrefillSize(4096);
-        SetMaxTokens(ragged ? 65536 : padding ? 1048576 : 262144);
+        SetMaxTokens(large ? 4194304 : ragged ? 65536 : padding ? 1048576 : 262144);
         WarmUp();
         if (!verifyGraphCaptures) throw std::runtime_error("serving warmup captured no graphs");
         const int captures = verifyGraphCaptures;
         int checks = 0, replayed = 0, eager = 0;
         for (int prefix : (ragged ? std::vector<int>{3070} : std::vector<int>{3, 254, 2046, 4094})) {
             using Cache = std::vector<std::pair<Data, Data>>;
-            const int requests = ragged ? 9 : padding ? 47 : 8;
+            const int requests = large ? maxBatch : ragged ? 9 : padding ? 47 : 8;
             std::vector<std::vector<std::vector<float>>> capturedLogits;
             std::vector<std::vector<std::vector<int>>> capturedMetadata;
             for (bool graph : {true, false}) {
@@ -591,7 +890,7 @@ class Fixture : public NaiveN05FlashModel {
                 SetCudaGraph(graph);
                 for (int row = 0; row < requests; ++row) prefill(actual[row], row);
                 int step = 0;
-                const std::vector<int> counts = ragged ? std::vector<int>{9, 8, 1, 9, 7, 9, 3, 9} : padding
+                const std::vector<int> counts = large ? std::vector<int>{257, 263, 399, 400, 401, 256, 8} : ragged ? std::vector<int>{9, 8, 1, 9, 7, 9, 3, 9} : padding
                     ? std::vector<int>{5, 7, 9, 15, 17, 31, 33, 39, 41, 44, 47, 40, 46, 1, 43}
                     : std::vector<int>{8, 4, 3, 2, 1, 4, 8, 7, 8};
                 for (int count : counts) {
@@ -615,7 +914,7 @@ class Fixture : public NaiveN05FlashModel {
                                  caches, std::vector<GenerationConfig>(count, config), LastTokensManager(), &outputs);
                     int launched = verifyGraphLaunches - before;
                     if (launched != 0 && launched != ranks) throw std::runtime_error("partial-rank serving replay");
-                    if (graph && padding && !failVerifyInstantiate && (prefix == 3 || prefix == 4094) && launched != ranks)
+                    if (graph && (padding || large) && !failVerifyInstantiate && (prefix == 3 || prefix == 4094) && launched != ranks)
                         throw std::runtime_error("padded serving batch did not replay");
                     if (graph && ragged && !failVerifyInstantiate && launched != ranks)
                         throw std::runtime_error("ragged serving batch did not replay");
@@ -673,7 +972,7 @@ class Fixture : public NaiveN05FlashModel {
         AbortResponse(handle);
         ShutdownRuntime();
         if (verifyGraphCaptures != captures) throw std::runtime_error("scheduler KV growth recaptured a graph");
-        if ((!failVerifyInstantiate && replayed < (ragged ? 8 : 20)) ||
+        if ((!failVerifyInstantiate && replayed < (large ? 14 : ragged ? 8 : 20)) ||
             (failVerifyInstantiate && replayed != 0) || (!ragged && eager == 0))
             throw std::runtime_error("missing serving replay/fallback coverage");
         std::cout << "SERVING GRAPH PASS logits=" << checks << " replayed=" << replayed
@@ -2019,6 +2318,35 @@ int main(int argc, char **argv) {
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (argc > 2 && std::string(argv[2]) == "kvmem_pool") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            Fixture fixture(ranks, false, true, true, true);
+            fixture.SetIndexerTPStorage(true);
+            if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.SparsePoolServingChecks();
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "kvmem") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            std::vector<float> reference;
+            for (bool enabled : {false, true}) {
+                Fixture fixture(ranks, false, true, true, true);
+                fixture.SetIndexerTPStorage(true);
+                if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+                if (argc > 4 && std::string(argv[4]) == "fp8") fixture.SetIndexerDataType(FP8_E4M3);
+                auto result = fixture.SparseKvRun(enabled);
+                if (!enabled) reference = std::move(result);
+                else {
+                    if (reference.size() != result.size()) throw std::runtime_error("KVMem logits missing");
+                    RequireCloseLogits(result.data(), reference, "KVMem changed model logits");
+                    size_t exact = 0;
+                    for (size_t i = 0; i < result.size(); ++i) exact += result[i] == reference[i];
+                    std::cout << "KVMEM MODEL PASS ranks=" << ranks << " exact=" << exact << "/" << result.size()
+                        << " relative=" << largestLogitRelative << " max_abs=" << largestLogitAbsolute << std::endl;
+                }
+            }
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "indexer_storage") {
             SetCudaEmbedding(true);
             const bool graph = argc <= 5 || std::string(argv[5]) != "eager";
@@ -2055,13 +2383,13 @@ int main(int argc, char **argv) {
             fixture.CudaSamplingChecks();
             return 0;
         }
-        if (argc > 2 && std::string(argv[2]) == "history_serving") {
+        if (argc > 2 && (std::string(argv[2]) == "history_serving" || std::string(argv[2]) == "kvmem_prefix")) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
             if (argc > 4 && std::string(argv[4]) == "fp8") fixture.SetIndexerDataType(FP8_E4M3);
             if (argc > 5 && std::string(argv[5]) == "layer_shard") fixture.SetIndexerTPStorage(true);
-            fixture.HistoryServingChecks();
+            fixture.HistoryServingChecks(true, std::string(argv[2]) == "kvmem_prefix");
             return 0;
         }
 #endif
@@ -2097,13 +2425,13 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (argc > 2 && (std::string(argv[2]) == "serving_graph" || std::string(argv[2]) == "serving_padding" ||
-                        std::string(argv[2]) == "serving_ragged")) {
+                        std::string(argv[2]) == "serving_ragged" || std::string(argv[2]) == "serving_large")) {
             SetCudaEmbedding(true); SetCudaGraph(true);
             failVerifyInstantiate = argc > 3 && std::string(argv[3]) == "failinstantiate";
             failGraphDevice = ranks - 1;
             Fixture fixture(ranks, false, true, true, true);
             fixture.ServingGraphChecks(std::string(argv[2]) == "serving_padding",
-                                       std::string(argv[2]) == "serving_ragged");
+                                       std::string(argv[2]) == "serving_ragged", std::string(argv[2]) == "serving_large");
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "swa_ring_toggle") {

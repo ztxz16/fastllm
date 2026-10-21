@@ -35,6 +35,12 @@ class SchedulerModel : public basellm {
     int activeCaches = 0;
 public:
     int peakActiveCaches = 0;
+    void EnableSharedPool(int perRequest) {
+        kvMemConfig.enabled = true;
+        kvMemConfig.maxTokens = max_positions = perRequest;
+    }
+    bool SupportsKvMemBatch() const override { return true; }
+    bool SupportsKvMemPrefixCache() const override { return true; }
 
     SchedulerModel(CacheView view, int capacity, int pageSize = 128, int batch = 1,
                    const basellm *capabilities = nullptr)
@@ -220,6 +226,28 @@ void Concurrent(CacheView view, bool pressure, const basellm *capabilities = nul
     Check(Drain(model, {Launch(model, 256, 768)})[0] == 768, "pool reuse lost capacity");
     std::cout << "CONCURRENT_PASS view=" << (int)view << " pressure=" << pressure << '\n';
 }
+
+void SharedPoolPressure() {
+    SchedulerModel model(CacheView::Paged, 1024, 128, 4);
+    model.EnableSharedPool(768);
+    model.Pause();
+    std::vector<int> handles;
+    // Each request fits, but their future decode pages cannot all fit together.
+    for (int i = 0; i < 6; ++i) handles.push_back(Launch(model, 256, 256));
+    model.Resume();
+    Check(Drain(model, handles) == std::vector<int>(6, 256),
+          "shared pool pressure truncated output or stalled admission");
+    Check(model.peakActiveCaches == 2, "shared pool failed to reserve remaining outputs");
+    Check(Drain(model, {Launch(model, 700, 100)})[0] == 68,
+          "per-request context limit was not enforced");
+    Check(Drain(model, {Launch(model, 769, 1)}, -2)[0] == 0,
+          "shared pool admitted an overlong request");
+    Check(Drain(model, {Launch(model, 768, 1)}, -2)[0] == 0,
+          "shared pool did not leave room for the first output");
+    Check(Drain(model, {Launch(model, 256, -1)})[0] == 512,
+          "unbounded output did not reserve through the context limit");
+    std::cout << "SHARED_POOL_PASS\n";
+}
 }
 
 int main() {
@@ -232,6 +260,7 @@ int main() {
         SetDeviceMap({{"cpu", 1}});
         SetMaxTokens(0);
         CompletePagesOnly();
+        SharedPoolPressure();
         for (auto view : {CacheView::Contiguous, CacheView::Paged, CacheView::TensorParallel}) {
             Single(view, 500, 128, 256, 244, 244);
         }

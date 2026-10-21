@@ -15,6 +15,7 @@ namespace fastllm {
     class CudaWorkspace;
     class NaiveN05FlashModel : public basellm {
     protected:
+        static constexpr int MaxTPDecodeBatch = 512;
         struct TargetCapture;
         struct LogitsSelection;
         struct TargetBatch;
@@ -60,14 +61,19 @@ namespace fastllm {
         void TryRecordResponseContext(ResponseContext *context) override;
         void OnResponseContextCreated(ResponseContext *context) override;
         void OnResponseContextRemoved(ResponseContext *context) override;
+        void OnResponseContextFinished(ResponseContext *context) override;
         bool SetSaveHistoryChat(bool save) override;
         void AddPromptCache(const std::vector<int> &tokens) override;
         int GetKVCacheRetainedTokens(int layer) const override;
         void WarmUp() override;
+        void ConfigureKvMem(const KvMemConfig &config) override;
+        bool SupportsKvMem() const override { return true; }
+        bool SupportsKvMemBatch() const override { return true; }
+        bool SupportsKvMemPrefixCache() const override { return true; }
         int Ep8ExpertDevice(int expert, const std::vector<int> &loadDevices) const {
             AssertInFastLLM(tpEp8Mega && loadDevices == tpDevices && expert >= 0 && expert < 256,
-                           "MiMo EP8 expert loading must use the same ordered eight devices as TP.");
-            return tpDevices.at(expert / 32);
+                           "MiMo EP8 expert loading must use the same ordered devices as TP.");
+            return tpDevices.at(expert / (256 / tpDevices.size()));
         }
         std::string MakeInput(const std::string &history, int,
                               const std::string &input) override { return history + input; }
@@ -91,12 +97,22 @@ namespace fastllm {
             Data &Value(int sequence, int layer) const { return *kv[sequence * layers + layer].second; }
         };
         // Only window payloads live here; full DSA/indexer KV stays in the page pool.
+        static constexpr int MaxPrefillSnapshots = 3;
+        static constexpr int PrefixSnapshotsPerRequest = MaxPrefillSnapshots + 1;
         struct PrefixPool {
             std::mutex mutex;
             std::vector<int> freeSlots;
             std::vector<Data> storage;
             std::vector<size_t> offsets;
             size_t slotBytes = 0;
+            int SlotCount(int requests, int64_t budget) const {
+                if (!slotBytes) return 0;
+                // Reserve all active checkpoints before spending spare budget
+                // on completed history. The caller must check the total fits.
+                return (int)std::max<int64_t>((int64_t)requests * PrefixSnapshotsPerRequest,
+                    std::min<int64_t>((int64_t)requests * 8,
+                        std::max<int64_t>(0, budget) / 32 / slotBytes));
+            }
         };
         struct PrefixSnapshot {
             std::shared_ptr<PrefixPool> pool;
@@ -122,6 +138,15 @@ namespace fastllm {
         void RetirePrefixSnapshot(std::shared_ptr<PrefixSnapshot> &snapshot);
         PrefixSnapshots BeginPrefixSnapshots(const Data &key, int past, int length);
         void FinishPrefixSnapshots(const Data &key, const PrefixSnapshots &snapshots, bool prefill);
+        struct PrefixWindowCopies {
+            std::vector<void *> destinations;
+            std::vector<const void *> sources;
+            std::vector<size_t> bytes;
+            void Submit() const;
+        };
+        void AppendPrefixWindowCopies(PrefixWindowCopies &copies, const PrefixSnapshot &snapshot,
+                                      int rank, int layer, const Data &key, const Data &value,
+                                      int first, bool ring);
         void CopyPrefixWindow(const PrefixSnapshot &snapshot, int rank, int layer,
                               const Data &key, const Data &value, int first, bool ring);
 
@@ -202,12 +227,20 @@ namespace fastllm {
         std::shared_ptr<DraftContext> idleDraftContext;
 
     private:
+        friend struct NaiveN05PrefixCacheTestAccess;
         // Only request lifecycle callbacks (serialized by dictLocker) own this
         // single idle allocation set. No token contents are reused.
         std::vector<std::pair<Data, Data>> tpIdleCache;
         bool CanReuseTensorParallelCache(const ResponseContext *context) const;
         void RestoreTensorParallelCache(ResponseContext *context);
         void RecycleTensorParallelCache(ResponseContext *context);
+        struct SparseKvState;
+        std::shared_ptr<SparseKvState> sparseKv;
+        void InitSparseKv();
+        void AttachSparseKv(const std::vector<std::pair<Data *, Data *>> &roots);
+        Data SparseIndexer(int layer, int rank, const Data &key) const;
+        void StageSparseKv(int rank, int layer, const Data &key, const Data &value, Data &outKey, Data &outValue);
+        int PackedIndexerWidth() const { return sparseKv ? 0 : IndexerCacheWidth(kvCacheDataType); }
         bool InitTensorParallel();
         void PrepareTensorParallel();
         void InitTensorParallelKVPool();
@@ -292,7 +325,7 @@ namespace fastllm {
             return fp8IndexerCache ? 144 / (type == FP8_E4M3 ? 1 : 2) : indexDim;
         }
         int LocalIndexerCacheWidth(int layer, int rank) const {
-            return HasLocalIndexer(layer, rank) ? IndexerCacheWidth(kvCacheDataType) : 0;
+            return !sparseKv && HasLocalIndexer(layer, rank) ? IndexerCacheWidth(kvCacheDataType) : 0;
         }
         std::vector<std::vector<Data *>> moeWeights, moeBiases;
     };

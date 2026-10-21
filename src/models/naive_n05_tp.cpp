@@ -1,5 +1,6 @@
 #include "models/naive_n05_flash.h"
 #include "naive_n05_tp.h"
+#include "naive_n05_kvmem.h"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "executor.h"
 #include "utils.h"
@@ -67,7 +68,7 @@ bool NaiveN05FlashModel::CanReuseTensorParallelCache(const ResponseContext *cont
     // With a single live handle, removal happens after its last forward and
     // creation precedes its first forward. Never touch another request's KV or
     // the worker-owned decode state from these callbacks.
-    return !isFree && tpPagedCaches.empty() && tpDevices.size() > 1 &&
+    return !isFree && !kvMemConfig.enabled && tpPagedCaches.empty() && tpDevices.size() > 1 &&
         GetFastllmEnv().cudaGraph && !GetKVCacheInCPU() &&
         FastllmNaiveKVType(kvCacheDataType) && context->multimodalInput.empty() &&
         responseContextDict.dicts.size() == 1 &&
@@ -148,9 +149,10 @@ void NaiveN05FlashModel::RecycleTensorParallelCache(ResponseContext *context) {
 bool NaiveN05FlashModel::InitTensorParallel() {
     const char *epValue = std::getenv("FASTLLM_EP");
     const std::string ep = epValue ? epValue : "";
-    AssertInFastLLM(ep.empty() || ep == "1" || ep == "8",
-                   "MiMo --ep supports 1 (MoE TP) or 8 (MegaMoE EP8).");
-    const bool explicitEp8 = ep == "8";
+    AssertInFastLLM(ep.empty() || ep == "1" || ep == "4" || ep == "8",
+                   "MiMo --ep supports 1 (MoE TP), 4 or 8 (MegaMoE EP).");
+    const bool explicitEp = ep == "4" || ep == "8";
+    const int epRanks = explicitEp ? std::stoi(ep) : 1;
     tpEp8Mega = false;
 #ifdef USE_CUDA
     // Use the existing --tp setting; ordinary lists of layer devices retain
@@ -158,7 +160,7 @@ bool NaiveN05FlashModel::InitTensorParallel() {
     const char *value = std::getenv("FASTLLM_TP");
     std::string spec = value ? value : "";
     if (spec.empty() || spec == "false" || spec == "off" || spec == "none") {
-        AssertInFastLLM(!explicitEp8, "MiMo --ep 8 requires --tp 8.");
+        AssertInFastLLM(!explicitEp, "MiMo EP requires an equal TP group.");
         return false;
     }
     tpDevices.clear();
@@ -180,8 +182,8 @@ bool NaiveN05FlashModel::InitTensorParallel() {
         AssertInFastLLM(ratios.empty() || ratios[device] == ratios[tpDevices[0]],
                         "Naive TP requires equal device ratios.");
     }
-    AssertInFastLLM(!explicitEp8 || tpDevices.size() == 8,
-                   "MiMo --ep 8 requires exactly eight TP devices.");
+    AssertInFastLLM(!explicitEp || tpDevices.size() == (size_t)epRanks,
+                   "MiMo --ep must equal the TP device count.");
     if (tpDevices.size() <= 1) { tpDevices.clear(); return false; }
     const int ranks = tpDevices.size();
     for (auto cfg : {full, sliding}) {
@@ -190,15 +192,15 @@ bool NaiveN05FlashModel::InitTensorParallel() {
             "Naive TP requires complete Q heads and divisible or replicated KV groups.");
     }
     // Resolve once, before weight registration/loading.
-    tpEp8Mega = explicitEp8 && FastllmCudaMimoEp8MegaSupported(tpDevices);
-    AssertInFastLLM(!explicitEp8 || tpEp8Mega,
-        "MiMo --ep 8 requires eight H20 SM90/78-SM GPUs and a FastLLM build with built-in SM90 MegaMoE.");
+    tpEp8Mega = explicitEp && FastllmCudaMimoEp8MegaSupported(tpDevices);
+    AssertInFastLLM(!explicitEp || tpEp8Mega,
+        "MiMo --ep 4/8 requires four/eight H20 SM90/78-SM GPUs and a FastLLM build with built-in SM90 MegaMoE.");
     AssertInFastLLM(!tpEp8Mega || (embed_dim == 4096 && num_experts == 256 &&
                    num_experts_per_tok == 8 && block_cnt <= 48),
                    "MiMo EP8 requires hidden=4096, experts=256, topk=8 and at most 48 layers.");
     return true;
 #else
-    AssertInFastLLM(!explicitEp8, "MiMo --ep 8 requires a CUDA build with SM90 MegaMoE.");
+    AssertInFastLLM(!explicitEp, "MiMo EP requires a CUDA build with SM90 MegaMoE.");
     return false;
 #endif
 }
@@ -386,7 +388,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
     serving->moeType = moeAtype;
     serving->kvType = kvCacheDataType;
     serving->generation = FastllmGetNcclGeneration();
-    const int maxRequests = std::min(maxBatch > 0 ? maxBatch : 256, 256);
+    const int maxRequests = std::min(maxBatch > 0 ? maxBatch : 256, MaxTPDecodeBatch);
     const int64_t tokenBudget = tokensLimit > 0 ? tokensLimit : (int64_t)maxRequests * 16384;
     serving->batchBuckets = DecodeGraphBatchBuckets(maxRequests);
     const int maxRows = serving->batchBuckets.back();
@@ -422,7 +424,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
         if (!FastllmCudaNaiveDecodeGraphSupported()) return;
         auto storage = std::make_shared<TPDecodeState::Storage>();
         storage->maxRows = maxRows;
-        storage->hostCache.resize((size_t)block_cnt * maxRows * 4);
+        storage->hostCache.resize((size_t)block_cnt * maxRows * (sparseKv ? 8 : 4));
         auto allocate = [&](Data &data, DataType type, int elements) {
             data.dataType = type;
             data.Resize({elements});
@@ -443,7 +445,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
         allocate(storage->indexScores, INT32, (int)scoreElements);
         storage->buffers.cacheTable = (const void *const *)storage->cacheTable.cudaData;
         storage->buffers.tableRows = maxRows;
-        if (kvCacheDataType == BFLOAT16 && FastllmCudaNaiveDSAMapsSupported() && full.headDim == 192 && full.valueDim == 128 &&
+        if (!sparseKv && kvCacheDataType == BFLOAT16 && FastllmCudaNaiveDSAMapsSupported() && full.headDim == 192 && full.valueDim == 128 &&
             std::max(1, full.kvHeads / (int)tpDevices.size()) == 1) {
             storage->hostMaps.resize((size_t)block_cnt * maxRows * FastllmNaiveDSAMapBytes);
             allocate(storage->cacheMaps, INT32, storage->hostMaps.size() / sizeof(int));
@@ -463,7 +465,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
     int maxWidth = 0;
     for (const auto &cfg : {full, sliding})
         maxWidth = std::max(maxWidth, std::max(1, cfg.kvHeads / ranks) *
-                           std::max(cfg.headDim, cfg.valueDim) + IndexerCacheWidth(kvCacheDataType));
+                           std::max(cfg.headDim, cfg.valueDim) + PackedIndexerWidth());
     std::vector<Data> backing(ranks), pageTables(ranks);
     for (int rank = 0; rank < ranks; ++rank) {
         FastllmCudaSetDevice(tpDevices[rank]);
@@ -487,7 +489,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
         for (int part = 0; part < 2; ++part) {
             Data &root = part ? roots.back().second : roots.back().first;
             const int width = cfg.kvHeads * (part ? cfg.valueDim : cfg.headDim) +
-                              (!part && !slidingLayers[layer] ? IndexerCacheWidth(kvCacheDataType) : 0);
+                              (!part && !slidingLayers[layer] ? PackedIndexerWidth() : 0);
             root.kvCacheFp8Indexer = !part && !slidingLayers[layer] && fp8IndexerCache;
             root.Resize({1, 2, width});
             root.expansionDims = {1, max_positions, width};
@@ -652,7 +654,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
                         for (int part = 0; part < 2; ++part) {
                             Data &root = part ? batch->Value(row, layer) : batch->Key(row, layer);
                             const int width = cfg.kvHeads * (part ? cfg.valueDim : cfg.headDim) +
-                                (!part && !slidingLayers[layer] ? IndexerCacheWidth(kvCacheDataType) : 0);
+                                (!part && !slidingLayers[layer] ? PackedIndexerWidth() : 0);
                             if (!root.multiDeviceData || root.dataDevice != DataDevice::CUDA ||
                                 !CanResizeKVLength(root, required, width)) return false;
                             auto it = root.multiDeviceDatas.begin();
@@ -698,15 +700,17 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
             // device lengths prevent kernels from dereferencing these slots.
             for (int layer = 0; layer < block_cnt; ++layer)
             for (int row = rows; row < storage.maxRows; ++row)
-            for (int part = 0; part < 4; ++part) {
-                auto &pointer = storage.hostCache[((size_t)layer * storage.maxRows + row) * 4 + part];
+            for (int part = 0; part < (sparseKv && !slidingLayers[layer] ? 8 : 4); ++part) {
+                auto &pointer = storage.hostCache[(size_t)layer * storage.maxRows * (sparseKv ? 8 : 4) +
+                    row * (sparseKv && !slidingLayers[layer] ? 8 : 4) + part];
                 if (pointer) { pointer = nullptr; storage.cacheDirty = true; }
             }
             for (int layer = 0; layer < block_cnt; ++layer)
             for (int row = 0; row < rows; ++row)
             for (int part = 0; part < 2; ++part) {
                 const size_t src = ((size_t)row * block_cnt + layer) * ranks * 2 + rank * 2 + part;
-                const size_t dst = ((size_t)layer * storage.maxRows + row) * 4 + part;
+                const size_t dst = (size_t)layer * storage.maxRows * (sparseKv ? 8 : 4) +
+                    row * (sparseKv && !slidingLayers[layer] ? 8 : 4) + part;
                 if (storage.hostCache[dst] != pointers[src]) {
                     storage.hostCache[dst] = pointers[src];
                     storage.cacheDirty = true;
@@ -714,6 +718,15 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
                 if (storage.hostCache[dst + 2] != pageTables[src]) {
                     storage.hostCache[dst + 2] = pageTables[src];
                     storage.cacheDirty = true;
+                }
+                if (sparseKv && !part && !slidingLayers[layer] && HasLocalIndexer(layer, rank)) {
+                    void *index = sparseKv->ranks[rank]->indexers[layer]->cudaData;
+                    for (auto binding : {std::make_pair(dst + 4, index), std::make_pair(dst + 6, pageTables[src])}) {
+                        if (storage.hostCache[binding.first] != binding.second) {
+                            storage.hostCache[binding.first] = binding.second;
+                            storage.cacheDirty = true;
+                        }
+                    }
                 }
             }
             // Paged maps describe the immutable physical pool, independent
@@ -794,7 +807,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     if (tpServingState && !verifying)
         return PrepareTensorParallelServingDecode(inputIds, selection, cacheLengths, batch, collectHidden);
     const int rows = batch ? batch->Size() : verifying ? 8 : 1;
-    const int maxBatchRows = tpEp8MegaState ? 256 : 8;
+    const int maxBatchRows = tpEp8MegaState ? MaxTPDecodeBatch : 8;
     if (batch && (!batch->Decode() || rows > maxBatchRows)) return false;
     auto key = [&](int sequence, int layer) -> Data & { return batch ? batch->Key(sequence, layer) : kv[layer].first; };
     auto value = [&](int sequence, int layer) -> Data & { return batch ? batch->Value(sequence, layer) : kv[layer].second; };
@@ -858,7 +871,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
                         for (int part = 0; part < 2; ++part) {
                             Data &root = part ? value(sequence, layer) : key(sequence, layer);
                             const int width = part ? cfg.kvHeads * cfg.valueDim :
-                                cfg.kvHeads * cfg.headDim + (slidingLayers[layer] ? 0 : IndexerCacheWidth(kvCacheDataType));
+                                cfg.kvHeads * cfg.headDim + (slidingLayers[layer] ? 0 : PackedIndexerWidth());
                             if (!root.multiDeviceData || root.dataDevice != DataDevice::CUDA ||
                                 !CanResizeKVLength(root, required, width)) return false;
                             auto it = root.multiDeviceDatas.begin();
@@ -1236,7 +1249,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         tpWorkers.Run(tpDevices, task, errors);
         for (auto error : errors) if (error) std::rethrow_exception(error);
     };
-    if (!tpPagedCaches.empty() && CanReuseTensorParallelServingCache(batch, false)) {
+    if (!tpPagedCaches.empty() && !(tpServingState && tpServingState->preparing) && CanReuseTensorParallelServingCache(batch, false)) {
         auto &serving = *tpServingState;
         std::vector<int> growing;
         for (int row = 0; row < sequences; ++row) {
@@ -1278,7 +1291,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     for (int sequence = 0; sequence < sequences; ++sequence)
     for (int layer = 0; layer < block_cnt; ++layer) {
         for (Data *cache : {&key(sequence, layer), &value(sequence, layer)}) {
-            cache->kvCacheFp8Indexer = cache == &key(sequence, layer) && !slidingLayers[layer] && fp8IndexerCache;
+            cache->kvCacheFp8Indexer = !sparseKv && cache == &key(sequence, layer) && !slidingLayers[layer] && fp8IndexerCache;
             const int owner = indexerLayerSharding && !slidingLayers[layer]
                 ? tpDevices[IndexerOwnerRank(layer)] : -1;
             for (auto &entry : cache->multiDeviceDatas)
@@ -1302,6 +1315,14 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             }
         }
     }
+    if (sparseKv && !reuseServingCache) {
+        for (int sequence = 0; sequence < sequences; ++sequence) {
+            std::vector<std::pair<Data *, Data *>> roots;
+            for (int layer = 0; layer < block_cnt; ++layer)
+                roots.emplace_back(&key(sequence, layer), &value(sequence, layer));
+            AttachSparseKv(roots);
+        }
+    }
     if (!tpPagedCaches.empty() && !(tpServingState && tpServingState->preparing) && !reuseServingCache) {
         // Own only rank-local page references. The generic prefix restore's
         // root is a borrowed view of rank zero; publish the model's packed
@@ -1312,7 +1333,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             for (int part = 0; part < 2; ++part) {
                 Data &root = part ? value(sequence, layer) : key(sequence, layer);
                 const int past = root.dims.empty() ? 0 : root.dims[1];
-                const int width = full.kvHeads * (part ? full.valueDim : full.headDim) + (!part ? IndexerCacheWidth(kvCacheDataType) : 0);
+                const int width = full.kvHeads * (part ? full.valueDim : full.headDim) + (!part ? PackedIndexerWidth() : 0);
                 root.isPagedKVCache = false;
                 root.pagedKVCacheData = nullptr;
                 root.pageIndex.clear();
@@ -1334,6 +1355,10 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                 }
             }
         });
+    }
+    if (sparseKv && (!batch || !batch->Decode())) {
+        const int prefillLength = batch ? *std::max_element(batch->lengths.begin(), batch->lengths.end()) : inputIds.dims[1];
+        runRanks([&](int rank) { PrepareSwaPrefillWorkspace(rank, prefillLength); });
     }
     // CPU embedding uses the shared worker pool; compute it once on the
     // caller instead of concurrently entering that pool from every rank.
@@ -1603,16 +1628,21 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         // stay on device and retain exactly the stored BF16/FP8 bits.
         runRanks([&](int rank) {
             FastllmCudaSetDevice(tpDevices[rank]);
+            PrefixWindowCopies copies;
             for (int sequence = 0; sequence < sequences; ++sequence)
                 for (const auto &snapshot : prefixes[sequence])
                     for (int layer = 0; layer < block_cnt; ++layer) if (slidingLayers[layer]) {
                         Data &k = *key(sequence, layer).multiDeviceDatas.at(tpDevices[rank]);
                         Data &v = *value(sequence, layer).multiDeviceDatas.at(tpDevices[rank]);
                         int rows = std::min(snapshot->length, window - 1);
-                        CopyPrefixWindow(*snapshot, rank, layer, k, v,
+                        AppendPrefixWindowCopies(copies, *snapshot, rank, layer, k, v,
                             tpSwaRingCache ? snapshot->length - rows : k.dims[1] - rows, tpSwaRingCache);
                     }
-            ForceDeviceSync();
+            // Decode leaves every window resident until the next forward, so
+            // submit all layers/requests together. Complete this rank's stream
+            // before publishing snapshots or allowing their slots to be reused.
+            copies.Submit();
+            FastllmCudaSyncCurrentThreadStream();
         });
     }
     if (recording) for (int sequence = 0; sequence < sequences; ++sequence)
@@ -1631,7 +1661,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                     root.expansionDims[2] = width;
                 } else root.expansionDims = {1, local.expansionDims[1], width};
             };
-            syncMeta(key(sequence, layer), cfg.kvHeads * cfg.headDim + (slidingLayers[layer] ? 0 : IndexerCacheWidth(kvCacheDataType)));
+            syncMeta(key(sequence, layer), cfg.kvHeads * cfg.headDim + (slidingLayers[layer] ? 0 : PackedIndexerWidth()));
             syncMeta(value(sequence, layer), cfg.kvHeads * cfg.valueDim);
         }
     });
