@@ -1,6 +1,7 @@
 #pragma once
 #include "naive-n05-dsa-mma.cuh"
 #include "naive-n05-topk.cuh"
+#include <type_traits>
 
 namespace naive_indexer_batch {
 using BF16 = __nv_bfloat16;
@@ -52,6 +53,9 @@ constexpr int ArgumentBytes = 4096;
 constexpr int BatchLimit = (ArgumentBytes - 128) / sizeof(Row);
 struct Batch { Row rows[BatchLimit]; };
 
+// Long mixed-context batches used to launch one CTA for every key tile of the
+// longest row. Keep enough CTAs to fill Hopper, then let each CTA process a
+// strided sequence of tiles. Scores and TopK order remain unchanged.
 // Descriptors travel in the launch arguments and remain fixed in a graph.
 // Device lengths and optional KV bindings change without rebinding scratch.
 __global__ void Quantize(const BF16 *query, Batch batch) {
@@ -70,13 +74,19 @@ struct ScoreOutput {
 };
 __global__ void Scores(const BF16 *weights, Batch batch) {
     const Row &row = batch.rows[blockIdx.y];
-    int n = row.Count(), first = row.Begin();
-    if (blockIdx.x * naive_dsa_mma::kKeys >= n) return;
+    const int count = row.Count(), first = row.Begin(), end = first + count;
+    if (end <= first) return;
     auto key = row.key;
     key.Bind(row.cache);
-    naive_dsa_mma::IndexerDecodeScoresRow(row.query, key, row.scale,
-        weights + (size_t)row.sequence * naive_dsa_mma::kHeads,
-        ScoreOutput{row.scores, first}, row.stride, first + n, first + n - 1, first);
+    for (int offset = 0;; ++offset) {
+        const int tile = (offset * (int)gridDim.x + blockIdx.x) * naive_dsa_mma::kKeys;
+        if (first + tile >= end) break;
+        naive_dsa_mma::IndexerDecodeScoresRow(row.query, key, row.scale,
+            weights + (size_t)row.sequence * naive_dsa_mma::kHeads,
+            ScoreOutput{row.scores, first}, row.stride, end, end - 1, first, offset);
+        // The next tile reuses the helper's shared-memory staging area.
+        __syncthreads();
+    }
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -93,96 +103,137 @@ __device__ __forceinline__ void LoadScoreVector(void *destination, const void *s
 }
 #endif
 
+__device__ __forceinline__ void MmaFp8(float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+#if CUDART_VERSION >= 12040 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
+}
+
 // K occupies the MMA row dimension: each warp produces sixteen key scores.
 // Cache the reused Q in L1, while streaming K directly to shared memory.
 // The caller guarantees 16-byte alignment and retains Scores as the fallback.
-template<bool FP8>
+template<bool FP8, bool NativeFp8 = false>
 __global__ void HopperScores(const BF16 *weights, Batch batch) {
+    static_assert(!NativeFp8 || FP8, "Native FP8 MMA requires FP8 keys.");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    // Older-toolkit builds and older PTX images retain the BF16 MMA path,
+    // including when that PTX is JIT-compiled on a newer GPU.
+#if CUDART_VERSION >= 12040 && __CUDA_ARCH__ >= 890
+    constexpr bool UseNativeFp8 = NativeFp8;
+#else
+    constexpr bool UseNativeFp8 = false;
+#endif
     using namespace naive_dsa_mma;
     constexpr int Threads = 128;
     Row r = batch.rows[blockIdx.y];
     r.key.Bind(r.cache);
-    const int begin = r.Begin(), n = begin + r.Count(), first = begin + blockIdx.x * kKeys;
-    if (first >= n) return;
-    __shared__ __align__(16) BF16 qs[kHeads][kIndexerDim + 8], ks[kKeys][kIndexerDim + 8];
+    const int begin = r.Begin(), n = begin + r.Count();
+    const int tileStride = (int)gridDim.x * kKeys;
+    if (begin + blockIdx.x * kKeys >= n) return;
+    using Tile = std::conditional_t<UseNativeFp8, unsigned char, BF16>;
+    constexpr int Padding = UseNativeFp8 ? 16 : 8, Step = UseNativeFp8 ? 32 : 16;
+    __shared__ __align__(16) Tile qs[kHeads][kIndexerDim + Padding], ks[kKeys][kIndexerDim + Padding];
     __shared__ float scales[kHeads], weightsF[kHeads];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    for (int i = t; i < kHeads * (kIndexerDim / 8); i += Threads) {
+    if constexpr (UseNativeFp8) {
+        // Quantize already stores exact E4M3 values in BF16. Repacking those
+        // values adds no quantization; keep their original FP32 scales below.
+        for (int i = t; i < kHeads * kIndexerDim; i += Threads)
+            qs[i / kIndexerDim][i % kIndexerDim] =
+                __nv_cvt_float_to_fp8((float)r.query[i], __NV_SATFINITE, __NV_E4M3);
+    } else for (int i = t; i < kHeads * (kIndexerDim / 8); i += Threads) {
         int h = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
         LoadScoreVector<true>(&qs[h][d], r.query + h * kIndexerDim + d, true);
-    }
-    // Tiles aligned to a divisor of the page length need only one page base.
-    // Keep per-row translation for arbitrary page lengths (e.g. 96 tokens).
-    const bool onePage = !r.key.pages || r.key.pageLen % kKeys == 0;
-    const auto tile = onePage ? r.key.IndexRow(first, r.stride) : FastllmNaiveKVRow{};
-    const int byteStride = r.stride * (r.key.fp8 ? 1 : 2);
-    if constexpr (FP8) {
-        __shared__ __align__(16) unsigned char packed[kKeys][kIndexerDim];
-        for (int i = t; i < kKeys * (kIndexerDim / 16); i += Threads) {
-            int key = i / (kIndexerDim / 16), d = i % (kIndexerDim / 16) * 16;
-            const auto base = onePage ? FastllmNaiveKVRow((const char *)tile.data + (size_t)key * byteStride, FP8)
-                                      : r.key.IndexRow(min(first + key, n - 1), r.stride);
-            LoadScoreVector<false>(&packed[key][d],
-                (const unsigned char *)base.data + d, first + key < n);
-        }
-        asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
-        __syncthreads();
-        for (int i = t; i < kKeys * (kIndexerDim / 8); i += Threads) {
-            int key = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
-            *(uint4 *)&ks[key][d] = FastllmNaiveKVRow(&packed[key][d], true).Load8();
-        }
-    } else {
-        for (int i = t; i < kKeys * (kIndexerDim / 8); i += Threads) {
-            int key = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
-            const auto base = onePage ? FastllmNaiveKVRow((const char *)tile.data + (size_t)key * byteStride, FP8)
-                                      : r.key.IndexRow(min(first + key, n - 1), r.stride);
-            LoadScoreVector<false>(&ks[key][d], (base + d).data, first + key < n);
-        }
     }
     if (t < kHeads) {
         scales[t] = r.scale[t];
         weightsF[t] = (float)weights[r.sequence * kHeads + t];
     }
-    if constexpr (!FP8)
-        asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;" ::: "memory");
+    asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
-    float dot[2][4] = {};
-#pragma unroll
-    for (int d = 0; d < kIndexerDim; d += 16) {
-        uint32_t a[4];
-        Load4(a, &ks[warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8][d + (lane >> 4) * 8]);
-#pragma unroll
-        for (int group = 0; group < 2; ++group) {
-            uint32_t b[2];
-            Load2(b, &qs[group * 8 + (lane & 7)][d + ((lane >> 3) & 1) * 8]);
-            Mma(dot[group], a, b);
-        }
-    }
-    // Each lane scales only its own head values, before exchanging them.
-#pragma unroll
-    for (int group = 0; group < 2; ++group)
-#pragma unroll
-        for (int i = 0; i < 4; ++i)
-            dot[group][i] = fmaxf(dot[group][i] * scales[group * 8 + (lane & 3) * 2 + i % 2], 0.f);
-#pragma unroll
-    for (int half = 0; half < 2; ++half) {
-        float sum = 0.f;
-#pragma unroll
-        for (int group = 0; group < 2; ++group) {
-            const int h = group * 8 + (lane & 3) * 2;
-            float w0 = weightsF[h], w1 = weightsF[h + 1];
-            // Pass the accumulator through each pair of heads in ascending
-            // order. This halves the shuffles without reassociating the sum.
-#pragma unroll
-            for (int part = 0; part < 4; ++part) {
-                float value = fmaf(dot[group][half * 2], w0, sum);
-                value = fmaf(dot[group][half * 2 + 1], w1, value);
-                sum = __shfl_sync(0xffffffff, value, (lane & ~3) + part);
+    for (int first = begin + blockIdx.x * kKeys; first < n; first += tileStride) {
+        // Tiles aligned to a divisor of the page length need only one page base.
+        // Keep per-row translation for arbitrary page lengths (e.g. 96 tokens).
+        const bool onePage = !r.key.pages || r.key.pageLen % kKeys == 0;
+        const auto tile = onePage ? r.key.IndexRow(first, r.stride) : FastllmNaiveKVRow{};
+        const int byteStride = r.stride * (r.key.fp8 ? 1 : 2);
+        if constexpr (UseNativeFp8) {
+            for (int i = t; i < kKeys * (kIndexerDim / 16); i += Threads) {
+                int key = i / (kIndexerDim / 16), d = i % (kIndexerDim / 16) * 16;
+                const auto base = onePage ? FastllmNaiveKVRow((const char *)tile.data + (size_t)key * byteStride, true)
+                                          : r.key.IndexRow(min(first + key, n - 1), r.stride);
+                LoadScoreVector<false>(&ks[key][d], (const unsigned char *)base.data + d, first + key < n);
+            }
+        } else if constexpr (FP8) {
+            __shared__ __align__(16) unsigned char packed[kKeys][kIndexerDim];
+            for (int i = t; i < kKeys * (kIndexerDim / 16); i += Threads) {
+                int key = i / (kIndexerDim / 16), d = i % (kIndexerDim / 16) * 16;
+                const auto base = onePage ? FastllmNaiveKVRow((const char *)tile.data + (size_t)key * byteStride, FP8)
+                                          : r.key.IndexRow(min(first + key, n - 1), r.stride);
+                LoadScoreVector<false>(&packed[key][d],
+                    (const unsigned char *)base.data + d, first + key < n);
+            }
+            asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
+            __syncthreads();
+            for (int i = t; i < kKeys * (kIndexerDim / 8); i += Threads) {
+                int key = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
+                *(uint4 *)&ks[key][d] = FastllmNaiveKVRow(&packed[key][d], true).Load8();
+            }
+        } else {
+            for (int i = t; i < kKeys * (kIndexerDim / 8); i += Threads) {
+                int key = i / (kIndexerDim / 8), d = i % (kIndexerDim / 8) * 8;
+                const auto base = onePage ? FastllmNaiveKVRow((const char *)tile.data + (size_t)key * byteStride, FP8)
+                                          : r.key.IndexRow(min(first + key, n - 1), r.stride);
+                LoadScoreVector<false>(&ks[key][d], (base + d).data, first + key < n);
             }
         }
-        int key = first + warp * 16 + (lane >> 2) + half * 8;
-        if ((lane & 3) == 0 && key < n) r.scores[key - begin] = naive_topk::OrderedScoreBits(sum * r.key.IndexScale(key, r.stride));
+        if constexpr (!FP8 || UseNativeFp8)
+            asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+        float dot[2][4] = {};
+#pragma unroll
+        for (int d = 0; d < kIndexerDim; d += Step) {
+            uint32_t a[4];
+            Load4(a, &ks[warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8][d + (lane >> 4) * (Step / 2)]);
+#pragma unroll
+            for (int group = 0; group < 2; ++group) {
+                uint32_t b[2];
+                Load2(b, &qs[group * 8 + (lane & 7)][d + ((lane >> 3) & 1) * (Step / 2)]);
+                if constexpr (UseNativeFp8) MmaFp8(dot[group], a, b);
+                else Mma(dot[group], a, b);
+            }
+        }
+        // Each lane scales only its own head values, before exchanging them.
+#pragma unroll
+        for (int group = 0; group < 2; ++group)
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                dot[group][i] = fmaxf(dot[group][i] * scales[group * 8 + (lane & 3) * 2 + i % 2], 0.f);
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            float sum = 0.f;
+#pragma unroll
+            for (int group = 0; group < 2; ++group) {
+                const int h = group * 8 + (lane & 3) * 2;
+                float w0 = weightsF[h], w1 = weightsF[h + 1];
+                // Pass the accumulator through each pair of heads in ascending
+                // order. This halves the shuffles without reassociating the sum.
+#pragma unroll
+                for (int part = 0; part < 4; ++part) {
+                    float value = fmaf(dot[group][half * 2], w0, sum);
+                    value = fmaf(dot[group][half * 2 + 1], w1, value);
+                    sum = __shfl_sync(0xffffffff, value, (lane & ~3) + part);
+                }
+            }
+            int key = first + warp * 16 + (lane >> 2) + half * 8;
+            if ((lane & 3) == 0 && key < n) r.scores[key - begin] = naive_topk::OrderedScoreBits(sum * r.key.IndexScale(key, r.stride));
+        }
+        // Do not let the next tile overwrite shared K while another warp is
+        // still finishing the current MMA result.
+        __syncthreads();
     }
 #endif
 }

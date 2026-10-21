@@ -232,6 +232,37 @@ static void FP8Prefill(int length, bool paged) {
     fflush(stdout);
 }
 
+static void PrefillIndexerPaths(int queries, int length, bool paged, bool remote) {
+    FP8Tensor keys(length, 320, 101, paged);
+    Data q(BFLOAT16), weights(BFLOAT16);
+    Upload(q, {1, queries, 16 * 128}, 103);
+    Upload(weights, {1, queries, 16}, 107);
+    for (Data *key : {&keys.data(), &keys.dense}) {
+        Data local, shared;
+        FastllmCudaNaiveIndexer(q, weights, *key, 16, 128, length - queries, 2048, true, local);
+        FastllmCudaNaiveIndexer(q, weights, *key, 16, 128, length - queries, 2048, true, shared, true);
+        auto expected = Read<int>(local);
+        Require(expected == Read<int>(shared), "shared prefill Indexer TopK differs from local");
+        ++checks;
+        if (remote) {
+            Data peerQuery(BFLOAT16), peerWeights(BFLOAT16), peer;
+            Upload(peerQuery, q.dims, 103);
+            Upload(peerWeights, weights.dims, 107);
+            peerQuery.ToDevice(DataDevice::CUDA, {1}, true);
+            peerWeights.ToDevice(DataDevice::CUDA, {1}, true);
+            FastllmCudaSetDevice(1);
+            FastllmCudaNaiveIndexer(peerQuery, peerWeights, *key, 16, 128,
+                                   length - queries, 2048, true, peer, true);
+            Require(expected == Read<int>(peer), "peer prefill Indexer TopK differs from local");
+            ++checks;
+            FastllmCudaSetDevice(0);
+        }
+    }
+    printf("PREFILL INDEXER PATHS PASS queries=%d length=%d paged=%d remote=%d\n",
+           queries, length, paged, remote);
+    fflush(stdout);
+}
+
 static void FP8SWA(int batch) {
     Data q(BFLOAT16), sink(FLOAT32), live(INT32), a, b;
     Upload(q, {1, batch, 8 * 192}, 31);
@@ -257,8 +288,33 @@ static void FP8SWA(int batch) {
     printf("FP8 SWA PASS batch=%d\n", batch);
     fflush(stdout);
 }
-static void FP8BatchIndexer(int batch, bool paged, int width = 320) {
-    const int length = 4097;
+static double indexerRelativeError = 0, indexerMaxError = 0;
+static void CheckIndexerScores(const std::vector<unsigned> &actual,
+                               const std::vector<unsigned> &expected, int count) {
+    auto value = [](unsigned bits) {
+        bits = bits & 0x80000000u ? bits ^ 0x80000000u : ~bits;
+        float result;
+        std::memcpy(&result, &bits, sizeof(result));
+        return (double)result;
+    };
+    double error = 0, norm = 0, maximum = 0, scale = 0;
+    for (int i = 0; i < count; ++i) {
+        double a = value(actual[i]), b = value(expected[i]);
+        Require(std::isfinite(a) && std::isfinite(b), "non-finite Indexer score");
+        error += (a - b) * (a - b); norm += b * b;
+        maximum = std::max(maximum, std::abs(a - b));
+        scale = std::max(scale, std::abs(b));
+    }
+    // E4M3 values are unchanged, but FP8 k32 and BF16 k16 MMA can round
+    // FP32 accumulators differently. Bound both aggregate error and outliers;
+    // retain exact TopK comparisons separately below.
+    double relative = std::sqrt(error / std::max(norm, 1e-30));
+    indexerRelativeError = std::max(indexerRelativeError, relative);
+    indexerMaxError = std::max(indexerMaxError, maximum);
+    Require(relative <= 1e-7 && maximum <= 1e-6 + 2e-7 * scale, "FP8 indexer score error");
+}
+
+static void FP8BatchIndexer(int batch, bool paged, int width = 320, int length = 4097) {
     Data q(BFLOAT16), w(BFLOAT16), live(INT32);
     Upload(q, {1, batch, 16 * 128}, 191);
     Upload(w, {1, batch, 16}, 101);
@@ -285,10 +341,51 @@ static void FP8BatchIndexer(int batch, bool paged, int width = 320) {
     for (int i = 0; i < batch; ++i) {
         Require(Read<int>(a[i]) == Read<int>(b[i]), "FP8 batch indexer TopK mismatch");
         auto x = Read<unsigned>(sa[i].indexScores), y = Read<unsigned>(sb[i].indexScores);
-        Require(std::equal(x.begin(), x.begin() + length - i % 7, y.begin()), "FP8 indexer scores mismatch");
+        CheckIndexerScores(x, y, length - i % 7);
     }
     printf("FP8 BATCH INDEXER PASS batch=%d paged=%d stride=%d\n", batch, paged, width);
     fflush(stdout);
+    if (length <= 16384) return;
+    // Reuse one captured graph across ragged live lengths, including a padded
+    // row. Compare against the separate single-row scoring implementation.
+    std::vector<int> lengths(batch);
+    for (int i = 0; i < batch; ++i)
+        lengths[i] = i % 4 == 0 ? length : i % 4 == 1 ? 8191 : i % 4 == 2 ? 257 : 0;
+    Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+    graph.Run();
+    std::vector<std::vector<int>> expected(batch);
+    for (int i = 0; i < batch; ++i) {
+        expected[i] = Read<int>(a[i]);
+        if (!lengths[i]) continue;
+        Data qi, wi, reference;
+        qi.dataType = wi.dataType = BFLOAT16;
+        qi.Resize({1, 1, 2048}); qi.FakeFrom(q, (size_t)i * 2048 * sizeof(uint16_t));
+        wi.Resize({1, 1, 16}); wi.FakeFrom(w, (size_t)i * 16 * sizeof(uint16_t));
+        Data liveRow(INT32);
+        liveRow.Resize({1}); liveRow.FakeFrom(live, (size_t)i * sizeof(int));
+        FastllmNaiveDecodeScratch scratch;
+        FastllmCudaNaiveDecodeIndexer(qi, wi, k[i]->data(), liveRow,
+                                     length, true, scratch, reference);
+        Require(expected[i] == Read<int>(reference), "ragged Indexer changed scalar TopK");
+    }
+    // Serial execution of rank shards isolates partition/merge semantics from
+    // transport. Model tests cover the actual cross-device exchange.
+    for (int ranks : {2, 8}) {
+        Data exchange(INT32);
+        exchange.Resize({ranks * batch * 2048 * 2});
+        exchange.ToDevice(DataDevice::CUDA, {0}, false); exchange.Allocate();
+        Graph parallel;
+        parallel.Capture([&] {
+            for (int rank = 0; rank < ranks; ++rank)
+                Require(FastllmCudaNaiveBatchDecodeIndexer(q, w, live, fp, true,
+                    rank, ranks, &exchange), "context Indexer unavailable");
+            FastllmCudaNaiveMergeDecodeIndexer(live, fp, exchange, ranks);
+        });
+        parallel.Run();
+        for (int i = 0; i < batch; ++i)
+            Require(expected[i] == Read<int>(a[i]), "context Indexer changed TopK");
+    }
+    printf("RAGGED INDEXER PASS capacity=%d paged=%d stride=%d\n", length, paged, width);
 }
 
 static void FP8Rope(bool paged, int window) {
@@ -356,6 +453,27 @@ int main() {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
             return 77;
         FastllmCudaSetDevice(0);
+        int peerAccess = 0;
+        if (devices > 1) {
+            Cuda(cudaDeviceCanAccessPeer(&peerAccess, 1, 0));
+            if (peerAccess) {
+                FastllmCudaSetDevice(1);
+                cudaError_t error = cudaDeviceEnablePeerAccess(0, 0);
+                if (error == cudaErrorPeerAccessAlreadyEnabled)
+                    cudaGetLastError();
+                else
+                    Cuda(error);
+                FastllmCudaSetDevice(0);
+            }
+        }
+        for (bool paged : {false, true}) {
+            PrefillIndexerPaths(32, 32769, paged, peerAccess != 0);
+            PrefillIndexerPaths(65, 16385, paged, peerAccess != 0);
+            PrefillIndexerPaths(512, 32769, paged, peerAccess != 0);
+            // Exceeds the score workspace target, including a ragged final
+            // query tile. Local, shared and peer paths must keep identical TopK.
+            PrefillIndexerPaths(2049, 32769, paged, peerAccess != 0);
+        }
         for (bool paged : {false, true}) {
             for (int b : {1, 2, 4, 8, 32, 128, 256}) {
                 FP8DSA(b, 707, false, paged);
@@ -372,10 +490,14 @@ int main() {
         for (int b : {4, 32, 128, 256})
             for (bool paged : {false, true})
                 FP8BatchIndexer(b, paged);
+        for (int length : {16385, 131073, 200000})
+            for (int width : {320, 328})
+                FP8BatchIndexer(4, true, width, length);
         FP8Rope(false, 0);
         FP8Rope(true, 0);
         FP8Rope(false, 128);
-        printf("ALL FP8 CHECKS PASSED %d\n", checks);
+        printf("ALL FP8 CHECKS PASSED %d indexer_relative=%.9g indexer_max_abs=%.9g\n",
+               checks, indexerRelativeError, indexerMaxError);
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "FAIL: %s\n", e.what());

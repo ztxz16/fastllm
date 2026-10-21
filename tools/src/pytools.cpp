@@ -1233,6 +1233,10 @@ extern "C" {
         model->AddPromptCache(input);
     }
 
+    DLL_EXPORT bool supports_kvmem_prefix_cache_llm_model(int modelId) {
+        return models.GetModel(modelId)->SupportsKvMemPrefixCache();
+    }
+
     DLL_EXPORT const char *set_kvmem_llm_model(int modelId, bool enabled, int maxTokens,
             int residentTokens, int sinkTokens, int recentTokens, int retrievalTokens,
             int prefillTokens, unsigned long long hostBytes, int retrievalInterval) {
