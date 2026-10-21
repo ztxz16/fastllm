@@ -778,9 +778,10 @@ namespace fastllm {
         // their own current device when moving rank-local weights to CUDA.
 #ifdef USE_CUDA
         if (DsExecutor().GetFirstDeviceType() == "multicuda") {
-            // Finish both caller streams before crossing into the single-GPU
-            // draft path or gathering logits on the first rank.
-            for (int device : v41DsparkTpDevices) FastllmCudaSyncDevice(device);
+            // The draft path only consumes buffers owned by the first rank.
+            // Waiting for every TP rank here would serialize the draft with
+            // target work that is still draining on the other GPUs.
+            FastllmCudaSyncDevice(v41DsparkTpDevices.front());
         }
 #endif
         DsExecutor().SetFirstDevice("cuda");
@@ -1435,17 +1436,17 @@ namespace fastllm {
         // 1) main_x = main_norm(main_proj(cat(mean_hc(h_37), mean_hc(h_38), mean_hc(h_39))))
         Data combined, tmp;
         for (size_t k = 0; k < scratch.mainHidden.size(); k++) {
-            Data localHidden;
-            Data *hidden = &scratch.mainHidden[k];
+            const Data *hidden = &scratch.mainHidden[k];
 #ifdef USE_CUDA
             if (hidden->multiDeviceData) {
                 // Replicated tensors only carry shape metadata at the root.
-                // Read an actual rank buffer before entering the draft path.
-                AssertInFastLLM(MultiCudaCopyReplicaToCpu(localHidden, *hidden, v41DsparkTpDevices),
+                // The draft runs on the first rank, so consume that replica
+                // directly instead of staging it through host memory.
+                auto it = hidden->multiDeviceDatas.find(v41DsparkTpDevices.front());
+                AssertInFastLLM(it != hidden->multiDeviceDatas.end() && it->second != nullptr &&
+                                it->second->cudaData != nullptr,
                                 "DeepSeekV41 DSpark: cannot read the target TP hidden state.");
-                // A bare {0} selects the bool overload and disables the upload.
-                localHidden.ToDevice(DataDevice::CUDA, std::vector<int>{v41DsparkTpDevices.front()});
-                hidden = &localHidden;
+                hidden = it->second;
             }
 #endif
             Data part;
@@ -1715,7 +1716,7 @@ namespace fastllm {
                 MergeMOEBlock(&ffnInput, &expertIndex, &expertScore, &moeWeights, &v41DsparkMoeBiass[stage],
                               &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &ffnOut, layerId,
                               ffnInput.dataType, ffnInput.dataType, &moeInputTemp, &moeOutputTemp,
-                              MoeGateSwiglu, false, swiglu_limit, true, nullptr,
+                              MoeGateSwiglu, true, swiglu_limit, true, nullptr,
                               quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") ? 32 : 128,
                               quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight") != 0);
                 ApplyDsparkDevice();
