@@ -48,6 +48,15 @@ int main() {
         }
         FastllmReleaseCudaTempBuffer(c, ownC);
 
+        // Paged/MLA attention use the FlashInfer float workspace directly, so a borrow must not hand it out.
+        void *flashInferWorkspace = FastllmCudaGetFlashInferFloatWorkspace(nullptr);
+        bool ownD = true;
+        void *d = FastllmBorrowCudaTempBuffer(bytes, nullptr, &ownD);
+        if (d == nullptr || d == flashInferWorkspace) {
+            std::printf("FAIL borrow returned the FlashInfer workspace: d=%p workspace=%p\n", d, flashInferWorkspace); ++failures;
+        }
+        FastllmReleaseCudaTempBuffer(d, ownD);
+
         // Two host threads (two per-thread streams) borrow concurrently, like the DFlash
         // scheduler and a TP worker. Each tags the buffer and checks the tag survived.
         unsigned long long corrupted = 0;
