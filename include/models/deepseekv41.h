@@ -411,7 +411,7 @@ namespace fastllm {
         void PrepareForwardInputs(ForwardWorkspace &);
 #ifdef USE_CUDA
         bool TryFullDecodeGraph(ForwardWorkspace &);
-        void BuildFullDecodeGraph(int batch, const std::vector<std::shared_ptr<DeepSeekV41RequestState>> &states);
+        void BuildFullDecodeGraph(int batch, const std::vector<DeepSeekV41Segment> &segments);
 #endif
         void BeginForwardLayer(ForwardWorkspace &, int layer);
         void EndForwardLayer(ForwardWorkspace &, int layer);

@@ -2685,6 +2685,7 @@ namespace {
         __nv_bfloat16 *output;
         float *scores;
         int cap, topWidth, startPos, ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack;
+        int chunkOffset = 0; // query position relative to the shared verify chunk
     };
 
     // Independent candidate tiles materialize QK once. The consumer keeps
@@ -2714,6 +2715,7 @@ namespace {
         const int t = BATCHED ? 0 : blockIdx.x;                       // b * seqlen + i
         const int b = t / seqlen, i = t % seqlen;
         const int pos = startPos + i;
+        const int chunkStart = BATCHED ? startPos - descriptors[blockIdx.x].chunkOffset : startPos;
         const int h0 = blockIdx.y * kMmaHeads;
         const int warp = threadIdx.x >> 5;
         const int lane = threadIdx.x & 31;
@@ -2751,8 +2753,8 @@ namespace {
                     int p = winStart + c;
                     if (p < 0 || p > pos) {
                         ok = false;
-                    } else if (p >= startPos) {
-                        src = chunkKV + ((uint64_t)b * seqlen + (p - startPos)) * kMmaDim;
+                    } else if (p >= chunkStart) {
+                        src = chunkKV + ((uint64_t)b * seqlen + (p - chunkStart)) * kMmaDim;
                     } else if (ringKV8 != nullptr) {
                         src8 = ringKV8 + ((uint64_t)b * windowSize + (p % windowSize)) * ringRowBytes;
                         src8Mode = ringMode;
@@ -2850,6 +2852,7 @@ namespace {
         const int t = BATCHED ? 0 : blockIdx.x;                       // b * seqlen + i
         const int b = t / seqlen, i = t % seqlen;
         const int pos = startPos + i;
+        const int chunkStart = BATCHED ? startPos - descriptors[blockIdx.x].chunkOffset : startPos;
         const int h0 = blockIdx.y * kMmaHeads;
         const int warp = threadIdx.x >> 5;
         const int lane = threadIdx.x & 31;
@@ -2919,8 +2922,8 @@ namespace {
                         int p = winStart + c;
                         if (p < 0 || p > pos) {
                             ok = false;
-                        } else if (p >= startPos) {
-                            src = chunkKV + ((uint64_t)b * seqlen + (p - startPos)) * kMmaDim;
+                        } else if (p >= chunkStart) {
+                            src = chunkKV + ((uint64_t)b * seqlen + (p - chunkStart)) * kMmaDim;
                         } else if (ringKV8 != nullptr) {
                             src8 = ringKV8 + ((uint64_t)b * windowSize + (p % windowSize)) * ringRowBytes;
                             src8Mode = ringMode;
@@ -2970,8 +2973,8 @@ namespace {
                         int p = winStart + c;
                         if (p < 0 || p > pos) {
                             ok = false;
-                        } else if (p >= startPos) {
-                            src = chunkKV + ((uint64_t)b * seqlen + (p - startPos)) * kMmaDim;
+                        } else if (p >= chunkStart) {
+                            src = chunkKV + ((uint64_t)b * seqlen + (p - chunkStart)) * kMmaDim;
                         } else if (ringKV8 != nullptr) {
                             src8 = ringKV8 + ((uint64_t)b * windowSize + (p % windowSize)) * ringRowBytes;
                             src8Mode = ringMode;
@@ -5013,7 +5016,8 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
         V41DecodeIndexDescriptor *index, V41AttentionDescriptor *attention,
         float *indexScores, float *blockScores, float *attentionScores, int tiles) {
     const auto r = requests[i];
-    const int count = c.ratio ? (r.position + 1) / c.ratio : 0;
+    const int end = c.verifying ? requests[0].position + c.batch : r.position + 1;
+    const int count = c.ratio ? end / c.ratio : 0;
     const int blocks = c.ratio ? (count + c.blockSize - 1) / c.blockSize : 0;
     const int maxBlocks = (c.maxKeys + c.blockSize - 1) / c.blockSize;
     auto *q = static_cast<__nv_bfloat16 *>(b.q) + (size_t)i * c.heads * 512;
@@ -5042,7 +5046,10 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
             c.writeCandidates, c.useCandidates};
     }
     V41AttentionDescriptor a{};
-    a.q = q; a.chunkKV = kv; a.ringKV = static_cast<const __nv_bfloat16 *>(r.windowKV);
+    a.q = q;
+    a.chunkKV = c.verifying ? static_cast<const __nv_bfloat16 *>(b.kv) : kv;
+    a.chunkOffset = c.verifying ? i : 0;
+    a.ringKV = static_cast<const __nv_bfloat16 *>(r.windowKV);
     a.compressedKV = static_cast<const __nv_bfloat16 *>(r.compressedKV);
     a.indices = tk; a.output = out;
     a.scores = attentionScores + (size_t)i * c.heads * tiles * kMmaNC;
@@ -5103,6 +5110,41 @@ __global__ void V41FullDecodeAppend(const FastllmV41FullDecodeRequest *requests,
             keys[(size_t)blockIdx.x * 128 + d];
 }
 
+// Verification never overwrites the committed ring or compressor tail.
+// Save a contiguous [old tail, current chunk] stream for any accepted prefix.
+__global__ void V41FullVerifyGather(FastllmV41FullDecodeConfig c,
+        FastllmV41FullDecodeBuffers b, const FastllmV41FullDecodeRequest *requests) {
+    const int row = blockIdx.x, d = threadIdx.x;
+    const auto r = requests[row];
+    const int tail = requests[0].position % c.ratio;
+    const float value = static_cast<const float *>(b.rawKV)[(size_t)row * 512 + d];
+    static_cast<float *>(b.savedRawKV)[(size_t)(tail + row) * 512 + d] = value;
+    if (c.ratio == 1) {
+        static_cast<float *>(b.joined)[(size_t)row * 512 + d] = value;
+        return;
+    }
+    const float score = static_cast<const float *>(b.rawScore)[(size_t)row * 512 + d];
+    const bool ready = (r.position + 1) % c.ratio == 0;
+    const float previous = row ? static_cast<const float *>(b.rawKV)[(size_t)(row - 1) * 512 + d]
+                               : (tail ? static_cast<const float *>(r.rawTailKV)[d] : value);
+    const float previousScore = row ? static_cast<const float *>(b.rawScore)[(size_t)(row - 1) * 512 + d]
+                                    : (tail ? static_cast<const float *>(r.rawTailScore)[d] : score);
+    static_cast<float *>(b.joined)[(size_t)row * 1024 + d] = ready ? previous : value;
+    static_cast<float *>(b.joined)[(size_t)row * 1024 + 512 + d] = value;
+    static_cast<float *>(b.scores)[(size_t)row * 1024 + d] = ready ? previousScore : score;
+    static_cast<float *>(b.scores)[(size_t)row * 1024 + 512 + d] = score;
+    static_cast<float *>(b.savedRawScore)[(size_t)(tail + row) * 512 + d] = score;
+    if (row == 0 && tail) {
+        static_cast<float *>(b.savedRawKV)[d] = previous;
+        static_cast<float *>(b.savedRawScore)[d] = previousScore;
+    }
+}
+
+__global__ void V41FullVerifySaveKV(const __nv_bfloat16 *kv, __nv_bfloat16 *saved) {
+    const size_t i = (size_t)blockIdx.x * 512 + threadIdx.x;
+    saved[i] = kv[i];
+}
+
 template<int SPLITS, bool MATERIALIZED>
 void V41FullDecodeAttention(V41FullDecodePlan &p) {
     const auto &c = p.config;
@@ -5128,6 +5170,8 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         c.maxKeys <= 0 || c.topK <= 0 || c.topK > c.maxKeys || c.blockSize <= 0 ||
         c.ropeDim <= 0 || c.ropeDim > 128 || (c.ropeDim & 1) ||
         !b.q || !b.kv || !b.output || !b.sink ||
+        (c.verifying && (!b.savedKV || (c.kvSource &&
+            (!b.savedRawKV || (c.ratio == 2 && !b.savedRawScore))))) ||
         (c.ratio && (!b.topk || !b.candidates)) ||
         (c.kvSource && (!c.ratio || !b.rawKV || !b.joined || !b.latents || !b.compressNorm ||
           (c.ratio == 2 && (!b.rawScore || !b.scores)))) ||
@@ -5137,7 +5181,7 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
     p->config = c; p->buffers = b; p->device = FastllmCudaGetDevice();
     p->tiles = (c.window + (c.ratio ? c.topK : 0) + kMmaNC - 1) / kMmaNC;
     const int heads = (c.heads + kMmaHeads - 1) / kMmaHeads;
-    p->splits = c.batch * heads >= 128 ? 1 : c.batch >= 64 ? 2 : 8;
+    p->splits = c.verifying || c.batch * heads >= 128 ? 1 : c.batch >= 64 ? 2 : 8;
     if (!V41MmaKernelReady<V41SparseAttentionScoresKernel<true>, kMmaThreads, sizeof(V41MmaShared)>()) return nullptr;
     if (p->splits == 1) {
         p->fused = V41MmaKernelReady<V41SparseAttentionMmaKernel<1, false, true>, kMmaThreads, sizeof(V41MmaShared)>();
@@ -5177,6 +5221,10 @@ bool V41ValidateFullDecodeRequests(const V41FullDecodePlan *p,
     const auto &c = p->config;
     for (size_t i = 0; i < count; ++i) {
         const auto &r = requests[i];
+        if (c.verifying && (r.position != requests[0].position + (int)i ||
+            r.windowKV != requests[0].windowKV || r.compressedKV != requests[0].compressedKV ||
+            r.indexK != requests[0].indexK || r.rawTailKV != requests[0].rawTailKV ||
+            r.rawTailScore != requests[0].rawTailScore)) return false;
         if (r.position < 1 || !r.windowKV || (c.ratio &&
             (!r.compressedKV || (r.position + 1LL) / c.ratio > c.maxKeys)) ||
             (c.indexSource && !r.indexK) ||
@@ -5226,9 +5274,12 @@ bool FastllmCudaV41PrepareFullDecode(void *handle) {
         c, b, p->requests, p->transforms, p->index, p->attention,
         p->indexScores, p->blockScores, p->attentionScores, p->tiles, p->rope);
     if (c.kvSource) {
-        V41FullDecodeGather<<<c.batch, 512, 0, cudaStreamPerThread>>>(p->requests,
-            static_cast<const float *>(b.rawKV), static_cast<const float *>(b.rawScore),
-            static_cast<float *>(b.joined), static_cast<float *>(b.scores), c.ratio);
+        if (c.verifying)
+            V41FullVerifyGather<<<c.batch, 512, 0, cudaStreamPerThread>>>(c, b, p->requests);
+        else
+            V41FullDecodeGather<<<c.batch, 512, 0, cudaStreamPerThread>>>(p->requests,
+                static_cast<const float *>(b.rawKV), static_cast<const float *>(b.rawScore),
+                static_cast<float *>(b.joined), static_cast<float *>(b.scores), c.ratio);
         V41CompressKernel<float><<<c.batch, 512, 512 * sizeof(float), cudaStreamPerThread>>>(
             static_cast<const float *>(b.joined), static_cast<const float *>(b.scores),
             static_cast<const float *>(b.compressNorm), c.ratio, 512, c.ratio, c.normEps,
@@ -5264,6 +5315,12 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
     else if (p->fused) V41FullDecodeAttention<1, false>(*p);
     else V41FullDecodeAttention<1, true>(*p);
     // Independent descriptors share one launch; each row retains its original math.
-    V41DecodeTransformsKernel<kFullDecodeTransforms, 2><<<dim3(c.heads, c.batch * 2), 512, 0, cudaStreamPerThread>>>(p->transforms, p->rope, c.ropeDim, c.window);
+    if (c.verifying) {
+        V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3(c.heads, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms, p->rope, c.ropeDim, c.window);
+        V41FullVerifySaveKV<<<c.batch, 512, 0, cudaStreamPerThread>>>(
+            static_cast<const __nv_bfloat16 *>(b.kv), static_cast<__nv_bfloat16 *>(b.savedKV));
+    } else {
+        V41DecodeTransformsKernel<kFullDecodeTransforms, 2><<<dim3(c.heads, c.batch * 2), 512, 0, cudaStreamPerThread>>>(p->transforms, p->rope, c.ropeDim, c.window);
+    }
     return V41CheckLaunch("FullDecodeFinish");
 }

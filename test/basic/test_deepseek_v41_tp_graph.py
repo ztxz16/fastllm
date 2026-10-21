@@ -18,7 +18,7 @@ from test_deepseek_v41_cpu_fixture import unpack
 
 
 def prepare(directory, hc_mult=4, expert_cache=False, fp8_dense=False,
-            moe_intermediate_size=1024):
+            moe_intermediate_size=1024, expert_count=4):
     unpack(str(Path(__file__).with_name('deepseek_v41_fixture.npz')), str(directory))
     config = json.loads((directory / 'config.json').read_text())
     # Keep at least one 128-element weight-split unit per rank, including
@@ -28,7 +28,7 @@ def prepare(directory, hc_mult=4, expert_cache=False, fp8_dense=False,
                                  vocab_size=1024, hc_mult=hc_mult, o_groups=8,
                                  o_lora_rank=128)
     if expert_cache:
-        config['text_config']['n_routed_experts'] = 4
+        config['text_config']['n_routed_experts'] = expert_count
     (directory / 'config.json').write_text(json.dumps(config))
     weights = load_file(str(directory / 'model.safetensors'))
     for name, tensor in list(weights.items()):
@@ -76,7 +76,7 @@ def prepare(directory, hc_mult=4, expert_cache=False, fp8_dense=False,
         values = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.])
         for name, tensor in list(weights.items()):
             if '.ffn.gate.' in name:
-                weights[name] = tensor.repeat(2, *([1] * (tensor.ndim - 1)))
+                weights[name] = tensor.repeat(expert_count // 2, *([1] * (tensor.ndim - 1)))
             if '.ffn.experts.' not in name:
                 continue
             expert = int(name.split('.experts.')[1].split('.')[0])
@@ -88,7 +88,8 @@ def prepare(directory, hc_mult=4, expert_cache=False, fp8_dense=False,
             codes = codes.reshape(tensor.shape)
             packed = codes[:, ::2] | (codes[:, 1::2] << 4)
             scale = (exponent + 127).to(torch.uint8)
-            for target in (name, name.replace(f'.experts.{expert}.', f'.experts.{expert + 2}.')):
+            for replica in range(expert, expert_count, 2):
+                target = name.replace(f'.experts.{expert}.', f'.experts.{replica}.')
                 weights[target] = packed.clone()
                 weights[target.removesuffix('weight') + 'scale'] = scale.clone()
     if fp8_dense:
@@ -112,15 +113,23 @@ def main():
     backend.add_argument('--expert-cache', action='store_true')
     backend.add_argument('--gpu-experts', action='store_true')
     backend.add_argument('--disk-experts', action='store_true')
-    parser.add_argument('--ngram-device', choices=('cpu', 'disk'), default='cpu')
+    parser.add_argument('--ngram-device', choices=('cpu', 'disk', 'cuda'), default='cpu')
     parser.add_argument('--fp8-dense', action='store_true',
                         help='exercise block-32 FP8 weights and persistent activation quantization buffers')
     parser.add_argument('--eager-only', action='store_true',
                         help='compare synchronous/asynchronous TP verification without CUDA Graph')
+    parser.add_argument('--full-verify', action='store_true',
+                        help='require full target verification graphs with native FP4 experts and GPU Engram')
     args = parser.parse_args()
+    if args.full_verify:
+        if args.expert_cache or args.disk_experts or args.eager_only or args.hc_mult != 4 or args.tp_size == 1:
+            parser.error('--full-verify requires GPU experts, hc-mult=4 and TP >= 2')
+        args.gpu_experts = args.fp8_dense = True
+        args.ngram_device = 'cuda'
     with tempfile.TemporaryDirectory(prefix='v41-tp-graph-') as path:
         directory = Path(path)
-        prepare(directory, args.hc_mult, args.expert_cache, args.fp8_dense)
+        prepare(directory, args.hc_mult, args.expert_cache or args.full_verify, args.fp8_dense,
+                expert_count=2 * args.tp_size if args.full_verify else 4)
         env = dict(os.environ, FASTLLM_SKIP_WARMUP='1', FASTLLM_DSV41_REFERENCE_MATH='0',
                    FASTLLM_DSV41_DISABLE_FAKE_QUANT='0' if args.fp8_dense else '1',
                    FASTLLM_DSV41_CUDA_GRAPH_DEBUG='1')
@@ -131,6 +140,8 @@ def main():
             command.append('--disk-experts')
         if args.ngram_device == 'disk':
             command.append('--disk-engram')
+        if args.ngram_device == 'cuda':
+            command.append('--gpu-engram')
         if args.fp8_dense:
             command.append('--fp8-dense')
         if args.eager_only:
@@ -156,6 +167,9 @@ def main():
             for tokens in range(1, 9):
                 assert re.search(r'graph captured:.*tokens=%d\b' % tokens, result.stdout), 'missing graph shape %d' % tokens
                 assert 'graph replay: tokens=%d' % tokens in result.stdout, 'shape %d never replayed' % tokens
+        if args.full_verify:
+            for tokens in range(2, 9):
+                assert f'full verify graph ready: tokens={tokens},' in result.stdout
         assert 'giving up' not in result.stdout and 'graph disabled' not in result.stdout
         if args.expert_cache:
             assert re.search(r'V4.1 verify cache:.* [1-9]\d* GPU routes', result.stdout), 'verify never used GPU experts'

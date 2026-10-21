@@ -4,7 +4,7 @@ namespace {
 struct V41FullLayer {
     FastllmV41FullDecodeConfig config;
     int source = -1;
-    Data joined, scores, latents, keys;
+    Data joined, scores, latents, keys, savedKV, savedRawKV, savedRawScore;
     std::vector<void *> plans;
 };
 struct V41FullEngram {
@@ -17,9 +17,12 @@ struct V41FullEngram {
 struct V41FullGraph {
     std::vector<int> devices;
     int batch = 1, maxKeys = 131072;
+    bool verifying = false;
     std::vector<std::unique_ptr<V41FullLayer>> layers;
     std::map<int, std::unique_ptr<V41FullEngram>> engrams;
-    Data topk, candidates, head, norm, normFloat, logits, requests;
+    Data topk, candidates, head, norm, normFloat, logits, requests, gatheredLogits;
+    std::map<int, Data> mainHidden;
+    std::vector<void *> ready;
     std::shared_ptr<DeepSeekV41CudaGraphState> pieces;
     std::vector<void *> graphs, execs;
     ~V41FullGraph() {
@@ -32,6 +35,8 @@ struct V41FullGraph {
                 FastllmCudaGraphExecDestroy(execs[rank]);
             if (rank < graphs.size() && graphs[rank])
                 FastllmCudaGraphDestroy(graphs[rank]);
+            if (rank < ready.size() && ready[rank])
+                FastllmCudaEventDestroy(ready[rank]);
         }
         pieces.reset();
         for (auto &layer : layers)
@@ -44,16 +49,19 @@ struct V41FullGraph {
 // All allocations happen before graph launch. Moving a cache is safe because
 // graph kernels load its current pointer from request metadata on every replay.
 bool V41FullReserve(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segments) {
-    if ((int)segments.size() != g.batch)
+    if ((int)segments.size() != (g.verifying ? 1 : g.batch))
         return false;
     for (const auto &s : segments) {
-        if (!s.state || s.spec || s.seqlen != 1 || s.startPos < 1 ||
+        const bool validMode = g.verifying
+            ? s.spec && s.spec->deferWindow && s.spec->wantAllTokens && s.seqlen == g.batch
+            : !s.spec && s.seqlen == 1;
+        if (!s.state || !validMode || s.startPos < 1 ||
             (int)s.state->layers.size() != (int)g.layers.size())
             return false;
         for (size_t l = 0; l < g.layers.size(); ++l) {
             const auto &cfg = g.layers[l]->config;
             auto &cache = s.state->layers[l];
-            if (cfg.ratio && (s.startPos + 1LL) / cfg.ratio > g.maxKeys)
+            if (cfg.ratio && (s.startPos + (long long)s.seqlen) / cfg.ratio > g.maxKeys)
                 return false;
             if (cache.windowKV.dataType != DataType::BFLOAT16 || !cache.windowKV.multiDeviceData ||
                 !cache.windowKV.IsTensorParallelReplicated())
@@ -72,7 +80,7 @@ bool V41FullReserve(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
             if (!cfg.kvSource)
                 continue;
             auto &cache = s.state->layers[l];
-            const int rows = (s.startPos + 1) / cfg.ratio;
+            const int rows = (s.startPos + s.seqlen) / cfg.ratio;
             V41ReserveDecodeRows(cache.compressedKV, DataType::BFLOAT16, 512, rows, g.devices);
             if (cfg.indexSource)
                 V41ReserveDecodeRows(cache.indexK, DataType::BFLOAT16, 128, rows, g.devices);
@@ -97,10 +105,11 @@ bool V41FullUploadRank(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &s
         if (layer.plans.empty())
             continue;
         for (int i = 0; i < g.batch; ++i) {
-            auto &cache = segments[i].state->layers[l];
-            auto &source = segments[i].state->layers[layer.source < 0 ? l : layer.source];
-            requests[l * g.batch + i] = {ptr(cache.windowKV),  ptr(source.compressedKV), ptr(source.indexK),
-                           ptr(cache.rawTailKV), ptr(cache.rawTailScore),  segments[i].startPos};
+            const auto &segment = segments[g.verifying ? 0 : i];
+            auto &cache = segment.state->layers[l];
+            auto &source = segment.state->layers[layer.source < 0 ? l : layer.source];
+            requests[l * g.batch + i] = {ptr(cache.windowKV), ptr(source.compressedKV), ptr(source.indexK),
+                ptr(cache.rawTailKV), ptr(cache.rawTailScore), segment.startPos + (g.verifying ? i : 0)};
         }
         plans[l] = layer.plans[rank];
     }
@@ -129,30 +138,64 @@ void V41FullAdvance(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
     for (const auto &s : segments)
         for (size_t l = 0; l < g.layers.size(); ++l) {
             auto &cache = s.state->layers[l];
-            cache.totalLen = s.startPos + 1;
+            cache.totalLen = s.startPos + s.seqlen;
             const auto &cfg = g.layers[l]->config;
             if (!cfg.kvSource)
                 continue;
-            cache.compressedBlocks = (s.startPos + 1) / cfg.ratio;
-            cache.rawTail = (s.startPos + 1) % cfg.ratio;
+            cache.compressedBlocks = (s.startPos + s.seqlen) / cfg.ratio;
+            cache.rawTail = (s.startPos + s.seqlen) % cfg.ratio;
             resize(cache.compressedKV, cache.compressedBlocks);
             if (cfg.indexSource)
                 resize(cache.indexK, cache.compressedBlocks);
-            resize(cache.rawTailKV, cache.rawTail);
-            resize(cache.rawTailScore, cache.rawTail);
+            if (!g.verifying) {
+                resize(cache.rawTailKV, cache.rawTail);
+                resize(cache.rawTailScore, cache.rawTail);
+            }
         }
+}
+void V41FullBindVerify(V41FullGraph &g, const DeepSeekV41Segment &segment,
+                      const std::vector<int> &targetLayers) {
+    // Scratch views borrow graph buffers until commit/draft completes,
+    // before the next target forward can overwrite them.
+    auto borrow = [&](Data &view, const Data &source, int rows) {
+        AssertInFastLLM(V41DecodeSliceView(view, source, 0, g.devices, rows),
+                        "full verify buffer view failed");
+    };
+    auto &scratch = *segment.spec;
+    const int layers = g.layers.size();
+    scratch.windowKV.resize(layers);
+    scratch.rawKV.resize(layers);
+    scratch.rawScore.resize(layers);
+    scratch.prevRawTail.resize(layers);
+    scratch.prevBlocks.resize(layers);
+    for (int l = 0; l < layers; ++l) {
+        const auto &layer = *g.layers[l];
+        borrow(scratch.windowKV[l], layer.savedKV, g.batch);
+        if (!layer.config.kvSource) continue;
+        scratch.prevRawTail[l] = segment.startPos % layer.config.ratio;
+        scratch.prevBlocks[l] = segment.startPos / layer.config.ratio;
+        const int rows = scratch.prevRawTail[l] + segment.seqlen;
+        borrow(scratch.rawKV[l], layer.savedRawKV, rows);
+        if (layer.config.ratio > 1)
+            borrow(scratch.rawScore[l], layer.savedRawScore, rows);
+    }
+    if (scratch.captureMain) {
+        scratch.mainHidden.resize(targetLayers.size());
+        for (size_t i = 0; i < targetLayers.size(); ++i)
+            borrow(scratch.mainHidden[i], g.mainHidden.at(targetLayers[i]), g.batch);
+    }
 }
 } // namespace
 
 void DeepSeekV41Model::BuildFullDecodeGraph(
-    int batch, const std::vector<std::shared_ptr<DeepSeekV41RequestState>> &states) {
-    // Bound eagerly captured workspaces to small ordinary BF16-KV decode batches.
-    // Larger batches, packed KV, speculative verify and unsupported shapes retain
-    // the existing segmented/eager path.
-    if (batch < 1 || batch > 16 || executionMode != ExecutionMode::Gpu ||
-        v41DsparkEnabled ||
+    int batch, const std::vector<DeepSeekV41Segment> &segments) {
+    const bool verifying = segments.size() == 1 && segments[0].spec && segments[0].spec->deferWindow;
+    // Small BF16-KV target chunks share decode's fixed operands and dynamic
+    // request descriptors. Other shapes keep the segmented/eager path.
+    if (batch < 1 || batch > (verifying ? 8 : 16) || executionMode != ExecutionMode::Gpu ||
+        (!verifying && v41DsparkEnabled) ||
         (kvCacheDataType == DataType::FP8_E4M3 || kvCacheDataType == DataType::FP4_E2M1) ||
-        !v41CudaGraphWarmingUp || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128 ||
+        (!verifying && !v41CudaGraphWarmingUp) || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128 ||
         weight["head.weight"].dataType != DataType::FLOAT32)
         return;
     // Explicit reference/debug modes must retain their selected arithmetic.
@@ -160,7 +203,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         V41EnvFlag("FASTLLM_DSV41_LEGACY_ATTN") || V41EnvFlag("FASTLLM_DSV41_LEGACY_INDEXER") ||
         V41EnvFlag("FASTLLM_DSV41_LEGACY_TOPK") || V41EnvFlag("FASTLLM_DSV41_LEGACY_ROTARY"))
         return;
-    auto slot = v41CudaGraphSlots.find(batch);
+    auto slot = v41CudaGraphSlots.find(verifying ? -batch : batch);
     if (slot == v41CudaGraphSlots.end())
         return;
     auto state = V41GetCudaGraphState(slot->second);
@@ -170,24 +213,20 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     for (const auto &s : state->segments)
         if (s.passthrough || s.graphs.size() != state->devices.size())
             return;
+    for (int layer = 0; layer < block_cnt; ++layer)
+        if (!state->segments[layer * 4 + 3].containsGpuMoe) return;
     for (auto &table : engramTables)
         if (!std::static_pointer_cast<V41EngramTable>(table)->gpuTable)
             return;
     auto g = std::make_shared<V41FullGraph>();
     g->devices = state->devices;
     g->batch = batch;
+    g->verifying = verifying;
     g->pieces = std::make_shared<DeepSeekV41CudaGraphState>();
     g->pieces->PrepareDevices(g->devices, true);
     auto &ws = *state->workspace;
     ScopedTpDispatch dispatch(true, g->devices);
     const int original = FastllmCudaGetDevice();
-    std::vector<DeepSeekV41Segment> segments(batch);
-    for (int i = 0; i < batch; ++i) {
-        segments[i].state = states[i];
-        segments[i].offset = i;
-        segments[i].seqlen = 1;
-        segments[i].startPos = states[i]->totalLen - 1;
-    }
     auto alloc = [&](Data &data, DataType dtype, const std::vector<int> &dims) {
         V41AllocLike(data, dtype, dims, ws.hiddenStates, g->devices);
     };
@@ -200,6 +239,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         auto layer = std::make_unique<V41FullLayer>();
         auto &c = layer->config;
         c.batch = batch;
+        c.verifying = verifying;
         c.heads = num_attention_heads / g->devices.size();
         c.indexHeads = index_n_heads;
         c.ratio = compress_ratios[l];
@@ -223,6 +263,14 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         c.normEps = rms_norm_eps;
         c.softmaxScale = 1.f / std::sqrt(float(head_dim_full));
         layer->source = kvSourceOf[l];
+        if (verifying) {
+            alloc(layer->savedKV, DataType::BFLOAT16, {1, batch, 512});
+            if (c.kvSource) {
+                alloc(layer->savedRawKV, DataType::FLOAT32, {1, batch + c.ratio - 1, 512});
+                if (c.ratio == 2)
+                    alloc(layer->savedRawScore, DataType::FLOAT32, {1, batch + c.ratio - 1, 512});
+            }
+        }
         if (c.kvSource) {
             alloc(layer->joined, DataType::FLOAT32, {batch, c.ratio, 512});
             if (c.ratio == 2)
@@ -249,6 +297,11 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
               {1, batch, (int)e->hostRows.size() / batch * e->table->dim});
         g->engrams[engram_layer_ids[i]] = std::move(e);
     }
+    // Lazy verification capture runs after this call's embedding. The warm
+    // Engram children modify hiddenStates; restore its contents (not address)
+    // before replay, including the fallback path.
+    Data initialHidden;
+    if (verifying) V41Assign(initialHidden, ws.hiddenStates, g->devices);
     bool poolOpen = false;
     try {
         std::vector<std::vector<const void *>> children(g->devices.size());
@@ -292,6 +345,12 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                                    weight[prefix + ".engram.k_weight"], &e.mask, rms_norm_eps);
                 });
             }
+            if (verifying && std::find(v41DsparkTargetLayerIds.begin(),
+                    v41DsparkTargetLayerIds.end(), l) != v41DsparkTargetLayerIds.end()) {
+                capture([&] {
+                    V41HcApplyPre(ws.hiddenStates, ws.dsparkPreMix, g->mainHidden[l]);
+                });
+            }
             for (size_t rank = 0; rank < children.size(); ++rank)
                 children[rank].push_back(state->segments[l * 4].graphs[rank]);
             auto &layer = *g->layers[l];
@@ -322,6 +381,11 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 b.topk = ptr(g->topk);
                 b.candidates = ptr(g->candidates);
                 b.sink = ptr(weight[prefix + ".attn.attn_sink"]);
+                if (verifying) {
+                    b.savedKV = ptr(layer.savedKV);
+                    b.savedRawKV = ptr(layer.savedRawKV);
+                    b.savedRawScore = ptr(layer.savedRawScore);
+                }
                 if (layer.config.kvSource)
                     b.compressNorm = ptr(weight[prefix + ".attn.compressor.norm.weight"]);
                 layer.plans[rank] = FastllmCudaV41CreateFullDecode(layer.config, b);
@@ -360,23 +424,51 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             ToDataType(g->norm, g->normFloat, DataType::FLOAT32);
             weight["head.weight"].tpLinearType = TP_LINEAR_ROW;
             Linear(g->normFloat, weight["head.weight"], *GetEmptyData(), g->logits);
+            if (verifying) {
+                if (g->gatheredLogits.dims.empty()) {
+                    FastllmCudaSetDevice(g->devices.front());
+                    g->gatheredLogits.dataType = DataType::FLOAT32;
+                    g->gatheredLogits.dataDevice = DataDevice::CUDA;
+                    g->gatheredLogits.dataDeviceIds = {g->devices.front()};
+                    g->gatheredLogits.Resize(g->logits.dims);
+                    g->gatheredLogits.Allocate();
+                }
+                MultiCudaRunDeviceCallbacks(g->devices, [&](int, int device) {
+                    const auto &local = *g->logits.multiDeviceDatas.at(device);
+                    const int vocab = g->logits.dims.back(), width = local.dims.back();
+                    int offset = 0;
+                    for (const auto &range : g->logits.tpRanges.at(device)) {
+                        AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
+                            static_cast<float *>(g->gatheredLogits.cudaData) + range.first,
+                            vocab * sizeof(float), static_cast<const float *>(local.cudaData) + offset,
+                            width * sizeof(float), (range.second - range.first) * sizeof(float), batch),
+                            "full verify logits gather failed");
+                        offset += range.second - range.first;
+                    }
+                });
+            }
         });
         if (!FastllmCudaGraphMemoryPoolEnd(g->pieces->reservedPointers))
             throw std::runtime_error("full graph pool finish");
         poolOpen = false;
         g->graphs.resize(g->devices.size(), nullptr);
         g->execs.resize(g->devices.size(), nullptr);
+        if (verifying) g->ready.resize(g->devices.size(), nullptr);
         for (size_t rank = 0; rank < g->devices.size(); ++rank) {
             FastllmCudaSetDevice(g->devices[rank]);
+            if (verifying) {
+                g->ready[rank] = FastllmCudaEventCreate();
+                if (!g->ready[rank]) throw std::runtime_error("full verify completion event");
+            }
             if (!FastllmCudaGraphCompose(children[rank].data(), children[rank].size(),
                                          &g->graphs[rank], &g->execs[rank]))
                 throw std::runtime_error("full graph composition failed");
         }
         state->fullDecode = g;
         fprintf(stderr,
-                "[Fastllm] DeepSeek-V4.1 full decode graph ready: batch=%d, ranks=%zu, one graph "
+                "[Fastllm] DeepSeek-V4.1 full %s graph ready: %s=%d, ranks=%zu, one graph "
                 "per rank/step\n",
-                batch, g->devices.size());
+                verifying ? "verify" : "decode", verifying ? "tokens" : "batch", batch, g->devices.size());
     } catch (const std::exception &error) {
         if (poolOpen)
             FastllmCudaGraphMemoryPoolAbort();
@@ -386,13 +478,26 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 "[Fastllm] DeepSeek-V4.1 full graph unavailable: %s; retaining segmented graphs\n",
                 error.what());
     }
+    if (verifying) {
+        MultiCudaRunDeviceCallbacks(g->devices, [&](int, int device) {
+            FastllmCudaCopyFromDeviceToDevice(ws.hiddenStates.multiDeviceDatas.at(device)->cudaData,
+                initialHidden.multiDeviceDatas.at(device)->cudaData,
+                initialHidden.multiDeviceDatas.at(device)->GetBytes());
+        });
+        for (int device : g->devices) FastllmCudaSyncDevice(device);
+    }
     FastllmCudaSetDevice(original);
 }
 
 bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f) {
-    if (!f.graphReplay || !f.graphState || !f.graphState->fullDecode || f.dsparkVerify ||
-        v41CudaGraphWarmingUp || f.quantKV || f.hasImageTokens || f.inputEmbeds)
+    if (!f.graphReplay || !f.graphState || v41CudaGraphWarmingUp || f.quantKV ||
+        f.hasImageTokens || f.inputEmbeds)
         return false;
+    if (f.dsparkVerify && !f.graphState->fullVerifyAttempted) {
+        f.graphState->fullVerifyAttempted = true;
+        BuildFullDecodeGraph(f.seqlen, f.inputSegments);
+    }
+    if (!f.graphState->fullDecode) return false;
     auto g = std::static_pointer_cast<V41FullGraph>(f.graphState->fullDecode);
     if (!V41FullReserve(*g, f.inputSegments))
         return false;
@@ -414,15 +519,23 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f) {
         ready.fetch_add(1, std::memory_order_release);
         while (ready.load(std::memory_order_acquire) < (int)g->devices.size())
             std::this_thread::yield();
-        if (std::all_of(uploaded.begin(), uploaded.end(), [](int v) { return v == 1; }))
+        if (std::all_of(uploaded.begin(), uploaded.end(), [](int v) { return v == 1; })) {
             ok[rank] = FastllmCudaGraphLaunch(g->execs[rank]) ? 1 : -1;
+            if (g->verifying) FastllmCudaEventRecordCurrentThread(g->ready[rank]);
+        }
     });
     AssertInFastLLM(launched && std::all_of(ok.begin(), ok.end(), [](int v) { return v == 1; }),
                     "full decode graph replay failed");
+    if (g->verifying) {
+        // Root sampling reads peer-written vocabulary shards after every rank.
+        FastllmCudaSetDevice(g->devices.front());
+        for (void *event : g->ready) FastllmCudaCurrentThreadStreamWaitEvent(event);
+        V41FullBindVerify(*g, f.inputSegments[0], v41DsparkTargetLayerIds);
+    }
     V41FullAdvance(*g, f.inputSegments);
     f.curHidden = &f.ws->hiddenStates;
     f.preMixPtr = &f.ws->ffnPre;
     f.fullGraphHead = &g->head;
-    f.fullGraphLogits = &g->logits;
+    f.fullGraphLogits = g->verifying ? &g->gatheredLogits : &g->logits;
     return true;
 }

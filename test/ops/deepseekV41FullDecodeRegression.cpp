@@ -8,6 +8,7 @@
 #include "devices/cuda/fastllm-v41-decode.cuh"
 #include "devices/cuda/fastllm-v41-full-decode.h"
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -64,19 +65,24 @@ static void Equal(const Data &a, const Data &b, const char *name) {
     if (x != y)
         throw std::runtime_error(std::string("bits changed: ") + name);
 }
+#include "deepseekV41FullVerifyRegression.inc"
+
 int main(int argc, char **argv) {
     int devices = 0, major = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 1 ||
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess ||
         major < 8)
         return 77;
+    bool verify = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--stress") { stress = true; amplitude = 1.f; }
         if (std::string(argv[i]) == "--pooled") pooled = true;
+        if (std::string(argv[i]) == "--verify") verify = true;
     }
     try {
         ApplyDeviceMap({{"cpu", 1}}, 0, 1);
         FastllmCudaSetDevice(0);
+        if (verify) { RunVerifyRegression(); return 0; }
         int checked = 0;
         for (int batch : {1, 2, 4, 8, 16, 128})
             for (int ratio : {0, 1, 2})

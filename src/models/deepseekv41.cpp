@@ -59,16 +59,16 @@
 namespace fastllm {
     namespace {
 #ifdef USE_CUDA
-        // A one-token slice of a dense [1, tokens, ...] activation is contiguous
+        // A token slice of a dense [1, tokens, ...] activation is contiguous
         // on every TP rank. Borrow it for this forward instead of copying it.
         // The forward scope drains all ranks before releasing the parent.
         bool V41DecodeSliceView(Data &dst, const Data &src, int offset,
-                                const std::vector<int> &devices) {
+                                const std::vector<int> &devices, int rows = 1) {
             if (devices.empty() || !src.multiDeviceData || src.dims.size() < 3 || src.dims[0] != 1 ||
-                offset < 0 || offset >= src.dims[1] || src.tpAxis == 1 ||
+                offset < 0 || rows < 1 || rows > src.dims[1] - offset || src.tpAxis == 1 ||
                 (!src.IsTensorParallelReplicated() && !src.IsTensorParallelSharded())) return false;
-            auto sameSliceShape = [](const std::vector<int> &view, const std::vector<int> &full) {
-                if (view.size() != full.size() || view.size() < 3 || view[1] != 1) return false;
+            auto sameSliceShape = [rows](const std::vector<int> &view, const std::vector<int> &full) {
+                if (view.size() != full.size() || view.size() < 3 || view[1] != rows) return false;
                 for (size_t axis = 0; axis < view.size(); ++axis)
                     if (axis != 1 && view[axis] != full[axis]) return false;
                 return true;
@@ -98,7 +98,7 @@ namespace fastllm {
                     cachedView = view && view->isFake && view->dataType == local.dataType &&
                         view->dataDevice == local.dataDevice && view->dataDeviceIds == local.dataDeviceIds &&
                         view->cudaData == (uint8_t*)local.cudaData + (size_t)offset * local.strides[1] * local.unitSize &&
-                        sameSliceShape(view->dims, local.dims) && view->expansionSize == local.strides[1];
+                        sameSliceShape(view->dims, local.dims) && view->expansionSize == rows * local.strides[1];
                 }
             }
             // Graph boundaries retain their allocations between layers and
@@ -115,7 +115,7 @@ namespace fastllm {
             }
             dst.dataType = src.dataType;
             dst.UpdateUnitSize();
-            auto dims = src.dims; dims[1] = 1;
+            auto dims = src.dims; dims[1] = rows;
             dst.Resize(dims);
             dst.dataDevice = DataDevice::CUDA;
             dst.dataDeviceIds = devices;
@@ -127,11 +127,11 @@ namespace fastllm {
                 Data *&view = dst.multiDeviceDatas[device];
                 if (!view) view = new Data();
                 view->FakeFrom(source, (size_t)offset * source.strides[1] * source.unitSize);
-                auto localDims = source.dims; localDims[1] = 1;
+                auto localDims = source.dims; localDims[1] = rows;
                 view->expansionDims.clear();
                 view->Resize(localDims);
                 // TP validation checks the accessible capacity even for a
-                // borrowed view. Publish only this row, never the parent's
+                // borrowed view. Publish only this slice, never the parent's
                 // remaining capacity (which would permit overwriting siblings).
                 view->expansionDims = localDims;
                 view->expansionSize = view->Count(0);
@@ -1464,7 +1464,10 @@ namespace fastllm {
                 data.UpdateUnitSize();
                 data.Resize({1, 0, width});
             }
-            if (!data.multiDeviceData) {
+            // Split/CopyFrom may leave retired replica objects beside a newer
+            // root payload. Only a replicated layout makes those replicas live.
+            if (!data.multiDeviceData || !data.IsTensorParallelReplicated()) {
+                if (data.multiDeviceData) V41ResetMultiDevice(data);
                 if (data.Count(0) == 0) {
                     data.dataDevice = DataDevice::CUDA;
                     data.dataDeviceIds = devices;
@@ -3987,9 +3990,11 @@ namespace fastllm {
             DeepSeekV41CudaGraphState() : workspace(new DeepSeekV41DecodeWorkspace()) {}
 
             std::shared_ptr<void> fullDecode;
+            bool fullVerifyAttempted = false;
 
             void DestroyCapturedGraph() {
                 fullDecode.reset();
+                fullVerifyAttempted = false;
                 const int oriDevice = FastllmCudaGetDevice();
                 for (auto &segment : segments) {
                     for (size_t i = 0; i < segment.composedExecs.size(); ++i) {
@@ -6115,19 +6120,26 @@ namespace fastllm {
         // LLMSamplingBlock and the shared Qwen chain-rejection implementation.
         if (dsparkVerify) {
             Data allHidden, normed, allLogits, topk;
-            V41HcApplyPre(*curHidden, *preMixPtr, allHidden);
-            RMSNorm(allHidden, weight["norm.weight"], rms_norm_eps, normed);
-            // Reuse the sharded head and gather complete logits for DSpark.
-            DsparkProjectHead(normed, allLogits);
-            ToDataType(allLogits, DataType::FLOAT32);
+            Data *verifyLogits = &allLogits;
+#ifdef USE_CUDA
+            if (f.fullGraphLogits) {
+                verifyLogits = f.fullGraphLogits;
+            } else
+#endif
+            {
+                V41HcApplyPre(*curHidden, *preMixPtr, allHidden);
+                RMSNorm(allHidden, weight["norm.weight"], rms_norm_eps, normed);
+                DsparkProjectHead(normed, allLogits);
+                ToDataType(allLogits, DataType::FLOAT32);
+            }
             segments[0].spec->tokens.resize(seqlen);
             const GenerationConfig sampling = DsparkSamplingConfig(generationConfigsIn[0]);
             if (sampling.top_k > 1) {
-                DsparkSampleVerify(allLogits, *segments[0].state->dspark,
+                DsparkSampleVerify(*verifyLogits, *segments[0].state->dspark,
                                     *segments[0].spec, sampling);
             } else {
-                DsparkMaskToolLogits(allLogits, sampling, segments[0].spec->draftTokens);
-                TopK(allLogits, topk, 1);
+                DsparkMaskToolLogits(*verifyLogits, sampling, segments[0].spec->draftTokens);
+                TopK(*verifyLogits, topk, 1);
                 topk.ToDevice(DataDevice::CPU);
                 const int stride = topk.dims[topk.dims.size() - 1];
                 const float *topkData = (const float*)topk.cpuData;
@@ -6652,8 +6664,8 @@ namespace fastllm {
                     Data ids(DataType::FLOAT32, {1, batch}, std::vector<float>(batch, 1));
                     // Initial token, eager warmups, capture, and a replay.
                     const int rounds = V41DecodeCudaGraphWarmupRounds() + 3;
+                    std::vector<DeepSeekV41Segment> segments(batch);
                     for (int step = 0; step < rounds; ++step) {
-                        std::vector<DeepSeekV41Segment> segments(batch);
                         for (int i = 0; i < batch; ++i) {
                             segments[i].state = states[i];
                             segments[i].startPos = states[i]->totalLen;
@@ -6662,7 +6674,7 @@ namespace fastllm {
                         }
                         ForwardSegments(segments, ids, nullptr, nullptr, configs, last, nullptr, past);
                     }
-                    BuildFullDecodeGraph(batch, states);
+                    BuildFullDecodeGraph(batch, segments);
                 }
             } catch (...) {
                 v41CudaGraphWarmingUp = false;

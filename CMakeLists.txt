@@ -1379,8 +1379,10 @@ if (UNIT_TEST)
                 "PASS [0-9]+ changing-context graph replays; stress=1" 300 --stress)
             fastllm_add_checked_test(deepseekV41FullDecodePooled deepseekV41FullDecodeRegression
                 "PASS [0-9]+ changing-context graph replays; stress=0" 300 --pooled)
+            fastllm_add_checked_test(deepseekV41FullVerify deepseekV41FullDecodeRegression
+                "PASS [0-9]+ full verify graph replays" 300 --verify)
             set_tests_properties(deepseekV41FullDecode deepseekV41FullDecodeStress
-                deepseekV41FullDecodePooled PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+                deepseekV41FullDecodePooled deepseekV41FullVerify PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_executable(deepseekV41DecodeProjectionRegression test/ops/deepseekV41DecodeProjectionRegression.cpp)
             target_link_libraries(deepseekV41DecodeProjectionRegression PRIVATE fastllm)
             target_include_directories(deepseekV41DecodeProjectionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
