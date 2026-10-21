@@ -19,7 +19,7 @@ struct V41FullGraph {
     int batch = 1, maxKeys = 131072;
     std::vector<std::unique_ptr<V41FullLayer>> layers;
     std::map<int, std::unique_ptr<V41FullEngram>> engrams;
-    Data topk, candidates, head, norm, normFloat, logits;
+    Data topk, candidates, head, norm, normFloat, logits, requests;
     std::shared_ptr<DeepSeekV41CudaGraphState> pieces;
     std::vector<void *> graphs, execs;
     ~V41FullGraph() {
@@ -86,7 +86,8 @@ bool V41FullReserve(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
 
 bool V41FullUploadRank(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segments, int rank,
                        int device) {
-    std::vector<FastllmV41FullDecodeRequest> requests(g.batch);
+    std::vector<FastllmV41FullDecodeRequest> requests(g.layers.size() * g.batch);
+    std::vector<void *> plans(g.layers.size(), nullptr);
     auto ptr = [device](Data &d) -> void * {
         auto it = d.multiDeviceDatas.find(device);
         return it == d.multiDeviceDatas.end() || !it->second ? nullptr : it->second->cudaData;
@@ -98,12 +99,13 @@ bool V41FullUploadRank(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &s
         for (int i = 0; i < g.batch; ++i) {
             auto &cache = segments[i].state->layers[l];
             auto &source = segments[i].state->layers[layer.source < 0 ? l : layer.source];
-            requests[i] = {ptr(cache.windowKV),  ptr(source.compressedKV), ptr(source.indexK),
+            requests[l * g.batch + i] = {ptr(cache.windowKV),  ptr(source.compressedKV), ptr(source.indexK),
                            ptr(cache.rawTailKV), ptr(cache.rawTailScore),  segments[i].startPos};
         }
-        if (!FastllmCudaV41UploadFullDecode(layer.plans[rank], requests.data(), requests.size()))
-            return false;
+        plans[l] = layer.plans[rank];
     }
+    if (!FastllmCudaV41UploadFullDecodeBatch(ptr(g.requests), plans.data(), plans.size(),
+                                           requests.data(), g.batch)) return false;
     for (auto &entry : g.engrams) {
         auto &e = *entry.second;
         FastllmCudaCopyFromHostToDevice(ptr(e.rows), e.hostRows.data(),
@@ -144,9 +146,11 @@ void V41FullAdvance(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
 
 void DeepSeekV41Model::BuildFullDecodeGraph(
     int batch, const std::vector<std::shared_ptr<DeepSeekV41RequestState>> &states) {
-    // First enable ordinary BF16-KV GPU decode. Packed KV, speculative verify,
-    // other execution modes and unsupported shapes retain the existing path.
-    if (batch != 1 || executionMode != ExecutionMode::Gpu || v41DsparkEnabled ||
+    // Bound eagerly captured workspaces to small ordinary BF16-KV decode batches.
+    // Larger batches, packed KV, speculative verify and unsupported shapes retain
+    // the existing segmented/eager path.
+    if (batch < 1 || batch > 16 || executionMode != ExecutionMode::Gpu ||
+        v41DsparkEnabled ||
         (kvCacheDataType == DataType::FP8_E4M3 || kvCacheDataType == DataType::FP4_E2M1) ||
         !v41CudaGraphWarmingUp || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128 ||
         weight["head.weight"].dataType != DataType::FLOAT32)
@@ -187,6 +191,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     auto alloc = [&](Data &data, DataType dtype, const std::vector<int> &dims) {
         V41AllocLike(data, dtype, dims, ws.hiddenStates, g->devices);
     };
+    alloc(g->requests, DataType::INT8,
+          {1, int(block_cnt * batch * sizeof(FastllmV41FullDecodeRequest))});
     const int blockSize = std::max(1, candidate_block_size);
     alloc(g->topk, DataType::INT32, {1, batch, index_topk});
     alloc(g->candidates, DataType::INT8, {1, batch, (g->maxKeys + blockSize - 1) / blockSize});
@@ -301,6 +307,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                                                                          : it->second->cudaData;
                 };
                 FastllmV41FullDecodeBuffers b;
+                b.requests = static_cast<FastllmV41FullDecodeRequest *>(ptr(g->requests)) + l * batch;
                 b.q = ptr(ws.q);
                 b.kv = ptr(ws.kv);
                 b.output = ptr(ws.attnOut);

@@ -2,6 +2,7 @@
 // Small router outputs may still need host staging for existing CUDA operators.
 #include "deepseekv41_execution.h"
 #include "baseblock.h"
+#include "executor.h"
 #include "utils.h"
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -26,8 +27,29 @@ namespace fastllm {
         Data &w1 = ws->w1, &w2 = ws->w2, &w3 = ws->w3;
         Data &tempInput = ws->tempInput, &tempOutput = ws->tempOutput;
         Data &moeInputTemp = ws->moeInputTemp, &moeOutputTemp = ws->moeOutputTemp;
+#ifdef USE_CUDA
+        // Both branches only read ffnInput. Shared GEMV scratch/output and the
+        // routed Marlin buffers are distinct persistent allocations. Mark only
+        // single-token GPU captures; eager and unsupported paths stay serial.
+        auto markParallel = [&](int stage) {
+            if (!ctx.parallelShared) return;
+            AssertInFastLLM(MultiCudaRunDeviceCallbacks(
+                tpDevices, [&](int, int) {
+                    if (stage == 0) FastllmCudaGraphMarkParallelFork(layer);
+                    if (stage == 1) {
+                        FastllmCudaGraphMarkParallelFirstDone(layer);
+                        FastllmCudaGraphMarkParallelSecondBegin(layer);
+                    }
+                    if (stage == 2) FastllmCudaGraphMarkParallelJoin(layer);
+                }), "DeepSeekV41: MoE parallel marker dispatch failed.");
+        };
+        markParallel(0);
+#endif
         runSharedSegment();
         ctx.releaseSharedScratch();
+#ifdef USE_CUDA
+        markParallel(1);
+#endif
         const bool fp32ExpertSum =
             quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") != 0;
         bool combineFfnPostDispatch = false;
@@ -66,14 +88,56 @@ namespace fastllm {
             index = &cpuMoeIndex;
             score = &cpuMoeScore;
         }
-        MergeMOEBlock(input, index, score, &moeWeights, &biass[layer],
-                      &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &routedOutput, layer,
-                      ffnInput.dataType, ffnInput.dataType, &moeInputTemp, &moeOutputTemp,
-                      MoeGateSwiglu, routedExpertParallel, swiglu_limit, true, nullptr,
-                      quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") ? 32 : 128,
-                      quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight") != 0);
+        if (ws->sharedExpertSharded) {
+            AssertInFastLLM(combineFfnPostDispatch && fp32ExpertSum && routedExpertParallel,
+                "Sharded shared output requires the joint FP32 routed reduction.\n");
+            // Native BF16 graph inputs need neither dtype conversion nor a CPU
+            // fallback. MultiCUDA keeps the replicated output metadata current.
+            DataDict moeDatas = {
+                {"input", input}, {"index", index}, {"score", score},
+                {"weights", (Data *)moeWeights.data()}, {"biass", (Data *)biass[layer].data()},
+                {"w1", &w1}, {"w2", &w2}, {"w3", &w3},
+                {"curInput", &tempInput}, {"curOutput", &tempOutput}, {"output", &routedOutput}
+            };
+            if (ws->ffnInputQuantizedReady) moeDatas["prequantizedInput"] = &ws->ffnInputQuantized;
+            ((Executor *)GetExecutor())->Run("MergeMOE", moeDatas,
+                {{"sharedScale", 1.0f}, {"swigluLimit", swiglu_limit}}, {
+                {"weights___batch", (int)moeWeights.size()}, {"biass___batch", (int)biass[layer].size()},
+                {"layer", layer}, {"gateType", (int)MoeGateSwiglu}, {"expertParallel", 1},
+                {"deepSeekV4Mode", 1}, {"activationQuantBlock", 32},
+                {"quantizeSharedExpert", 0}, {"deferRankReduction", 1}
+            });
+        } else {
+            MergeMOEBlock(input, index, score, &moeWeights, &biass[layer],
+                          &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &routedOutput, layer,
+                          ffnInput.dataType, ffnInput.dataType, &moeInputTemp, &moeOutputTemp,
+                          MoeGateSwiglu, routedExpertParallel, swiglu_limit, true, nullptr,
+                          quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") ? 32 : 128,
+                          quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight") != 0);
+        }
         ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
 #ifdef USE_CUDA
+        markParallel(2);
+        if (ws->sharedExpertSharded) {
+            const int count = routedOutput.Count(0);
+            AssertInFastLLM(routedOutput.dataType == DataType::FLOAT32 &&
+                sharedExpertOut.dataType == DataType::BFLOAT16 &&
+                count == sharedExpertOut.Count(0) && count % tpDevices.size() == 0,
+                "Joint MoE collective received incompatible tensors.\n");
+            AssertInFastLLM(MultiCudaRunDeviceCallbacks(tpDevices, [&](int rank, int device) {
+                void *routed = routedOutput.multiDeviceDatas.at(device)->cudaData;
+                auto *shared = (uint16_t *)sharedExpertOut.multiDeviceDatas.at(device)->cudaData;
+                bool ok = FastllmCudaCustomAllReduceAndGather(
+                    routed, routed, shared, count, device);
+                if (!ok && !FastllmCudaGetThreadError()) {
+                    // Registration/topology rejection retains ordinary collectives.
+                    FastllmNcclAllReduce(routed, routed, count, DataType::FLOAT32, device);
+                    ok = FastllmNcclAllGather(shared + rank * (count / tpDevices.size()),
+                        shared, count / tpDevices.size(), DataType::BFLOAT16, device);
+                }
+                AssertInFastLLM(ok, "DeepSeekV41 joint MoE collective failed.\n");
+            }), "DeepSeekV41 joint MoE dispatch failed.\n");
+        }
         // Preserve generic-operator fallback semantics for unsupported dtypes.
         if (tp && !combineFfnPostDispatch && routedOutput.dataDevice == DataDevice::CPU && routedOutput.cpuData) {
             V41ResetMultiDevice(routedOutput);

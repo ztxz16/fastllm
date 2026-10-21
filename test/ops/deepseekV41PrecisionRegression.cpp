@@ -122,6 +122,36 @@ static void Activation(bool cuda) {
     }
 }
 
+// Exercise power-of-two scaling with subnormal inputs, signed zero, FP8
+// halfway values and very large finite values. Quant enumerates the FP8 grid
+// independently of the CUDA implementation.
+static void ActivationScaleBoundaries(bool cuda) {
+    for (DataType dtype : {DataType::FLOAT32, DataType::FLOAT16, DataType::BFLOAT16}) {
+        ApplyDeviceMap({{"cpu", 1}}, 0, 1);
+        const std::vector<int> exponents = dtype == DataType::FLOAT16 ?
+            std::vector<int>{-24, -23, -22, -1, 0, 1, 7} :
+            std::vector<int>{-149, -126, -64, -23, -22, -1, 0, 1, 64, 119};
+        const float values[] = {0.0f, -0.0f, 1.0625f, -1.0625f, 1.1875f, -1.1875f, 384.0f, -384.0f};
+        std::vector<float> x(exponents.size() * 32);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::ldexp(values[i % 8], exponents[i / 32]);
+        const std::vector<int> shape{(int)exponents.size(), 32};
+        Data input(DataType::FLOAT32, shape, x), output;
+        ToDataType(input, dtype);
+        auto expected = Read(input);
+        Quant(expected, 32);
+        Data rounded(DataType::FLOAT32, shape, expected);
+        ToDataType(rounded, dtype);
+        expected = Read(rounded);
+        ApplyDeviceMap({{cuda ? "cuda" : "cpu", 1}}, 0, 1);
+        ((Executor *)GetExecutor())->Run("DeepSeekV41QuantizeActivation",
+            {{"input", &input}, {"output", &output}}, {}, {});
+        auto actual = Read(output);
+        Check(actual.size() == expected.size() &&
+              !std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)),
+              "FP8 activation scaling changed exponent boundaries or signed zero");
+    }
+}
+
 static void RotaryBoundary(bool cuda) {
     for (DataType dtype : {DataType::FLOAT32, DataType::FLOAT16, DataType::BFLOAT16}) {
         for (int start : {1, 129}) {
@@ -443,6 +473,36 @@ static void NativeMxfp4Moe() {
         }
         Check(actual == expected,
               "V4.1 native MXFP4 changed activation quantization, clipping or pre-down router weighting");
+        // Reuse the producer's quantized tensor, including non-unit/zero route
+        // scores. Incompatible optional metadata must fall back to input.
+        Data quantized;
+        quantized.CopyFrom(input);
+        Check(FastllmCudaDeepSeekV41QuantizeActivation(input, quantized),
+              "native MoE input quantization failed");
+        auto checkReuse = [&]() {
+            Check(FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
+                input, scratch, output, weights.data(), weights.size(),
+                (const int32_t *)index.cudaData, (const float *)score.cudaData,
+                1, 0, 1, true, 10.0f, &quantized), "native MoE optional quantization rejected input");
+            Check(Read(output) == expected, "native MoE quantization reuse/fallback changed output");
+        };
+        checkReuse();
+        // An invalid optional tensor contains zeros, so accidentally consuming
+        // it cannot pass merely because it happened to hold the right values.
+        FastllmCudaMemset0(quantized.cudaData, quantized.GetBytes());
+        quantized.Reshape({1, rows, dim});
+        checkReuse();
+        quantized.Reshape(input.dims);
+        quantized.dataType = DataType::FLOAT32;
+        checkReuse();
+        quantized.dataType = input.dataType;
+        quantized.dataDeviceIds = {1};
+        checkReuse();
+        quantized.dataDeviceIds = input.dataDeviceIds;
+        void *payload = quantized.cudaData;
+        quantized.cudaData = nullptr;
+        checkReuse();
+        quantized.cudaData = payload;
     }
 }
 static void NativeMxfp4Accumulation() {
@@ -902,12 +962,14 @@ int main(int argc, char **argv) {
         SetThreads(30);
         ExportedActivationMetadata();
         Activation(false);
+        ActivationScaleBoundaries(false);
         RotaryBoundary(false);
         AttentionBoundary(false);
         HcFloat32Boundary(false);
 #ifdef USE_CUDA
         if (argc > 1 && std::string(argv[1]) == "--cuda") {
             Activation(true);
+            ActivationScaleBoundaries(true);
             RotaryBoundary(true);
             AttentionBoundary(true);
             BlockLinearBoundary();

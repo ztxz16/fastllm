@@ -2331,14 +2331,15 @@ __global__ void FastllmGemvBF16FP8E4M3KernelWarpRows(
 // The input traversal, FMA order and compensated 64-thread reduction match
 // Kernel1MultiRow. Callers guarantee four-element input/weight alignment.
 template <int ROWS, int PART, bool POWER_OF_TWO_BLOCKS>
-__global__ void FastllmGemvBF16FP8E4M3KernelRegisterRows(
+__device__ __forceinline__ void FastllmGemvBF16FP8E4M3RegisterRowsBody(
         const __nv_bfloat16 *__restrict__ A, const uint8_t *__restrict__ B,
         __nv_bfloat16 *__restrict__ C, const __nv_bfloat16 *__restrict__ bias,
-        const float *__restrict__ scales, int m, int k, int blockM, int blockK) {
+        const float *__restrict__ scales, int m, int k, int blockM, int blockK,
+        int outputBlock) {
     const int tid = threadIdx.x % 64;
     const int lane = tid % 32;
     const int row = threadIdx.x / 64;
-    const int outputRow = blockIdx.x * ROWS + row;
+    const int outputRow = outputBlock * ROWS + row;
     // Inactive tail rows still participate in the block-wide barrier.
     const int st = min(outputRow, k - 1);
     const int shiftM = POWER_OF_TWO_BLOCKS ? __ffs(blockM) - 1 : 0;
@@ -2418,6 +2419,27 @@ __global__ void FastllmGemvBF16FP8E4M3KernelRegisterRows(
             C[st + (size_t)k * x] = __float2bfloat16_rn(result);
         }
     }
+}
+
+template <int ROWS, int PART, bool POWER_OF_TWO_BLOCKS>
+__global__ void FastllmGemvBF16FP8E4M3KernelRegisterRows(
+        const __nv_bfloat16 *__restrict__ A, const uint8_t *__restrict__ B,
+        __nv_bfloat16 *__restrict__ C, const __nv_bfloat16 *__restrict__ bias,
+        const float *__restrict__ scales, int m, int k, int blockM, int blockK) {
+    FastllmGemvBF16FP8E4M3RegisterRowsBody<ROWS, PART, POWER_OF_TWO_BLOCKS>(
+        A, B, C, bias, scales, m, k, blockM, blockK, blockIdx.x);
+}
+
+// Different CTAs execute independent outputs; there is no cross-projection sum.
+__global__ void FastllmGemvBF16FP8PairKernel(const __nv_bfloat16 *input,
+        const uint8_t *w0, const uint8_t *w1, const float *s0, const float *s1,
+        __nv_bfloat16 *out0, __nv_bfloat16 *out1, int inner, int n0, int n1,
+        int bm0, int bk0, int bm1, int bk1) {
+    const int blocks0 = (n0 + 1) / 2;
+    const bool first = blockIdx.x < blocks0;
+    FastllmGemvBF16FP8E4M3RegisterRowsBody<2, 1, true>(input, first ? w0 : w1,
+        first ? out0 : out1, nullptr, first ? s0 : s1, inner, first ? n0 : n1,
+        first ? bm0 : bm1, first ? bk0 : bk1, first ? blockIdx.x : blockIdx.x - blocks0);
 }
 
 template <int PART>
@@ -2586,6 +2608,54 @@ static void FastllmCudaFP8E4M3EnsureBFloat16BiasOnDevice(fastllm::Data &weight, 
         checkCudaErrors("Error: CUDA error when moving bf16 bias to device!", state);
         weight.extraCudaHalfData.push_back((void *) cudaBiasData);
     }
+}
+
+extern "C" bool FastllmCudaBFloat16FP8LinearPair(const fastllm::Data &input,
+        fastllm::Data &w0, fastllm::Data &w1, fastllm::Data &out0, fastllm::Data &out1) {
+    using namespace fastllm;
+    const int device = FastllmCudaGetDevice();
+    auto local = [device](const Data &d) {
+        return !d.multiDeviceData && d.dataDevice == DataDevice::CUDA && d.cudaData &&
+               d.dataDeviceIds.size() == 1 && d.dataDeviceIds[0] == device;
+    };
+    auto overlaps = [](const void *a, size_t na, const void *b, size_t nb) {
+        const auto x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
+        return a && b && (x <= y ? y - x < na : x - y < nb);
+    };
+    if (!local(input) || input.dataType != DataType::BFLOAT16 || input.dims.empty() ||
+        input.dims.back() <= 0 || input.Count(0) != (uint64_t)input.dims.back() ||
+        input.dims.back() % 4 || reinterpret_cast<uintptr_t>(input.cudaData) % alignof(uint2)) return false;
+    const int inner = input.dims.back();
+    for (const Data *w : {&w0, &w1}) {
+        if (!local(*w) || w->dataType != DataType::FP8_E4M3 || w->IsRepacked ||
+            w->dims.size() != 2 || w->dims[0] <= 0 || w->dims[0] >= INT_MAX / 2 ||
+            w->dims[1] != inner || w->blockM < 4 || (w->blockM & (w->blockM - 1)) ||
+            w->blockK <= 1 || (w->blockK & (w->blockK - 1)) ||
+            reinterpret_cast<uintptr_t>(w->cudaData) % 4 || FastllmCudaFp8E4M3HasSm70Layout(*w)) return false;
+        const size_t scaleCount = size_t((w->dims[0] - 1) / w->blockK + 1) *
+                                  ((inner - 1) / w->blockM + 1);
+        if (w->scales.size() < scaleCount && w->extraCudaData.empty()) return false;
+        if (w->extraCudaData.empty() && FastllmCudaGraphIsCapturingFast()) return false;
+    }
+    for (const auto &item : {std::make_pair(&out0, &w0), std::make_pair(&out1, &w1)}) {
+        const Data &out = *item.first;
+        auto dims = input.dims;
+        dims.back() = item.second->dims[0];
+        if (!local(out) || out.dataType != DataType::BFLOAT16 || out.dims != dims) return false;
+        const Data *sources[] = {&input, &w0, &w1};
+        for (const Data *source : sources)
+            if (overlaps(out.cudaData, out.GetBytes(), source->cudaData, source->GetBytes())) return false;
+    }
+    if (overlaps(out0.cudaData, out0.GetBytes(), out1.cudaData, out1.GetBytes())) return false;
+    Data bias;
+    FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(w0, bias, w0.dims[0]);
+    FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(w1, bias, w1.dims[0]);
+    FastllmGemvBF16FP8PairKernel<<<(w0.dims[0] + 1) / 2 + (w1.dims[0] + 1) / 2, 128>>>(
+        (const __nv_bfloat16 *)input.cudaData, (const uint8_t *)w0.cudaData, (const uint8_t *)w1.cudaData,
+        (const float *)w0.extraCudaData[0], (const float *)w1.extraCudaData[0],
+        (__nv_bfloat16 *)out0.cudaData, (__nv_bfloat16 *)out1.cudaData,
+        inner, w0.dims[0], w1.dims[0], w0.blockM, w0.blockK, w1.blockM, w1.blockK);
+    return true;
 }
 
 // A channel slice preserves the original full-K dot product and rounding.

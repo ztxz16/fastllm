@@ -7,7 +7,7 @@ tokenizer.json 的模型目录。
 
 运行：
   PYTHONPATH=<fastllm>/build/tools \\
-  DSV41_ENCODING_DIR=/mnt/shared2/models/DeepSeek-V4.1-Flash/encoding \\
+  DSV41_ENCODING_DIR=/mnt/shared2/models/DeepSeek-V4.1-Flash-1017/encoding \\
   DSV41_TOKENIZER_DIR=/root/v41-tokenizer \\
       python test/basic/test_deepseek_v41_encoding_official.py
 """
@@ -26,7 +26,7 @@ except Exception:  # noqa: BLE001
 
 import ftllm.encoding_dsv41 as enc
 
-DEFAULT_ENCODING_DIR = "/mnt/shared2/models/DeepSeek-V4.1-Flash/encoding"
+DEFAULT_ENCODING_DIR = "/mnt/shared2/models/DeepSeek-V4.1-Flash-1017/encoding"
 DEFAULT_TOKENIZER_DIR = "/root/v41-tokenizer"
 
 ENCODING_DIR = os.environ.get("DSV41_ENCODING_DIR", DEFAULT_ENCODING_DIR)
@@ -209,6 +209,54 @@ def test_uses_hf_tokenizer_for_v41():
     forced.force_chat_template = True
     assert not forced._uses_hf_deepseek_v4_tokenizer()
     print("     _uses_hf_deepseek_v4_tokenizer 覆盖 deepseek_v41 / deepseek_v41_text")
+
+
+def test_tool_results_do_not_start_new_turn():
+    """1017 起：只含工具结果的 user 消息不算新一轮，当前轮跨工具调用保留思考。
+
+    旧版 find_last_user_index 把每条工具结果都当成新的用户轮次，未声明 tools 时
+    drop_thinking 会删掉 agent 当前轮里每一步的 reasoning_content。
+    """
+    import json as _json
+    call = lambda i, cmd: [{"id": f"c{i}", "type": "function",
+                            "function": {"name": "bash", "arguments": _json.dumps({"command": cmd})}}]
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1", "reasoning_content": "OLD-TURN"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "", "reasoning_content": "STEP-1", "tool_calls": call(1, "ls")},
+        {"role": "tool", "tool_call_id": "c1", "content": "x"},
+        {"role": "assistant", "content": "", "reasoning_content": "STEP-2", "tool_calls": call(2, "pwd")},
+        {"role": "tool", "tool_call_id": "c2", "content": "y"},
+    ]
+    prompt = enc.encode_messages(messages, thinking_mode="thinking", drop_thinking=True)
+    assert "OLD-TURN" not in prompt, "已结束轮次的思考应当丢弃"
+    assert "STEP-1" in prompt and "STEP-2" in prompt, "当前轮跨工具调用的思考被丢了"
+    assert prompt.endswith("<｜Assistant｜><think>")
+    print("     当前轮两步思考保留，上一轮思考丢弃")
+
+
+def test_namespaced_tool_roundtrip():
+    """1017 起：工具可带 namespace，渲染为 ns::name，解析回 name + namespace。"""
+    tools = [{"type": "function", "namespace": {"name": "search", "description": "Search tools."},
+              "function": {"name": "lookup", "description": "Look up a value",
+                           "parameters": {"type": "object",
+                                          "properties": {"query": {"type": "string"}}}}}]
+    messages = [{"role": "system", "content": "s", "tools": tools}, {"role": "user", "content": "q"}]
+    prompt = enc.encode_messages(messages, thinking_mode="chat")
+    assert "search::lookup" in prompt
+    # 助手消息带 namespace 的工具调用：渲染后再解析回来
+    history = [{"role": "user", "content": "q"},
+               {"role": "assistant", "content": "", "reasoning_content": "r",
+                "tool_calls": [{"type": "function", "namespace": "search",
+                                "function": {"name": "lookup", "arguments": '{"query": "v"}'}}]}]
+    rendered = enc.render_message(1, history, thinking_mode="thinking")
+    assert 'name="search::lookup"' in rendered, rendered
+    parsed = enc.parse_message_from_completion_text(rendered, thinking_mode="thinking")
+    call = parsed["tool_calls"][0]
+    assert call.get("namespace") == "search", call
+    assert call["function"]["name"] == "lookup", call
+    print("     search::lookup 渲染与解析往返一致")
 
 
 def main():

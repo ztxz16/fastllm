@@ -25,7 +25,7 @@ static std::vector<unsigned char> Bits(const Data &data) {
             "copy failed");
     return bytes;
 }
-int main() {
+int main(int argc, char **argv) {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count < 2) return 77;
     try {
@@ -44,11 +44,17 @@ int main() {
             for (int device : devices) FastllmCudaSyncDevice(device);
             FastllmCudaSetDevice(0);
         };
+        const bool shared = argc == 2 && std::string(argv[1]) == "--shared";
+        Require(argc == 1 || shared, "expected --shared or no arguments");
+        const std::vector<std::pair<int, int>> shapes = shared ?
+            std::vector<std::pair<int, int>>{{4608, 5120}, {512, 1024}, {384, 512}} :
+            std::vector<std::pair<int, int>>{{256, 256}, {25600, 6144}};
         int cases = 0;
-        for (auto shape : {std::make_pair(256, 256), std::make_pair(25600, 6144)}) {
+        for (auto shape : shapes) {
             const int columns = shape.first, inner = shape.second;
             ProjectionProbe model;
-            const std::string candidateName = "test.engram.wkv.weight";
+            const std::string candidateName = shared ?
+                "test.ffn.shared_experts.gateup.weight" : "test.engram.wkv.weight";
             const std::string referenceName = "reference.weight";
             Data &weight = model.weight.weight[candidateName];
             weight.dataType = DataType::FP8_E4M3;
@@ -69,7 +75,7 @@ int main() {
             referenceWeight.scales = weight.scales;
             model.quantizedLinearNames.insert(candidateName);
             model.quantizedLinearNames.insert(referenceName);
-            for (int batch : {1, 2, 8}) {
+            for (int batch : {1, 2, 4, 8}) {
                 FastllmCudaSetDevice(0);
                 std::vector<float> values(batch * inner);
                 for (size_t i = 0; i < values.size(); ++i)
@@ -87,7 +93,7 @@ int main() {
                 for (int device : devices) {
                     FastllmCudaSetDevice(device);
                     Require(Bits(*reference.multiDeviceDatas.at(device)) == Bits(*actual.multiDeviceDatas.at(device)),
-                            "Engram projection changed output bits or channel order");
+                            "replicated projection changed output bits or channel order");
                 }
                 if (batch == 1) {
                     FastllmCudaSetDevice(0);
@@ -105,7 +111,7 @@ int main() {
                 ++cases;
             }
         }
-        std::printf("PASS Engram projection: %d cases, TP%d\n", cases, ranks);
+        std::printf("PASS %s projection: %d cases, TP%d\n", shared ? "Shared" : "Engram", cases, ranks);
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

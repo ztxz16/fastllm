@@ -20,6 +20,8 @@ struct FastllmV41FullDecodeBuffers {
     void *joined = nullptr, *scores = nullptr, *latents = nullptr, *newIndexKeys = nullptr;
     void *indexQ = nullptr, *indexWeights = nullptr, *topk = nullptr, *candidates = nullptr;
     const void *compressNorm = nullptr, *sink = nullptr;
+    // Optional caller-owned request slice. It must outlive the plan and graphs.
+    void *requests = nullptr;
 };
 
 struct FastllmV41FullDecodeRequest {
@@ -36,5 +38,9 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &config,
 void FastllmCudaV41DestroyFullDecode(void *plan);
 bool FastllmCudaV41UploadFullDecode(void *plan, const FastllmV41FullDecodeRequest *requests,
                                     size_t count);
+// Plans use consecutive slices of storage. Null slots are allowed while the
+// caller builds the graph; initialized plans retain the ordinary validation.
+bool FastllmCudaV41UploadFullDecodeBatch(void *storage, void *const *plans, size_t layers,
+    const FastllmV41FullDecodeRequest *requests, size_t batch);
 bool FastllmCudaV41PrepareFullDecode(void *plan);
 bool FastllmCudaV41FinishFullDecode(void *plan);

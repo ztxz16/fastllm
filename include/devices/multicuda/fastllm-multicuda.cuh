@@ -63,6 +63,11 @@ bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
 // other slices in-place, reusing the existing peer-access signals and policy.
 bool FastllmCudaCustomAllGatherRows(void* data, int count,
                                   int rowElements, int dataType, int deviceId);
+// Rank-ordered FP32 all-reduce plus in-place BF16 equal-row all-gather.
+// dest may equal routed; shared must be disjoint from both FP32 tensors.
+// Returns false before launching work on unsupported shapes/topologies.
+bool FastllmCudaCustomAllReduceAndGather(void *routed, void *dest,
+    void *shared, int count, int deviceId);
 // Hopper BF16, width 4096: consume equal row shards directly, add to residual,
 // and apply Kimi-style RMSNorm without materializing the gathered tensor.
 // data stays unchanged; data/residual/output must be disjoint. False leaves
@@ -207,6 +212,10 @@ namespace fastllm {
     // 保证参与计算的 tensor 生命周期覆盖整个异步区间，并在回到调用线程的
     // CUDA stream 前显式等待对应 worker event。
     bool MultiCudaSetPersistentAsyncDispatch(bool enabled);
+    // Only for an active capture whose operations and persistent tensors are
+    // all on dedicated worker streams. The caller must join the streams at
+    // entry/exit. Returns the previous thread-local setting for scoped restore.
+    bool MultiCudaSetWorkerOrderedCapture(bool enabled);
     bool MultiCudaRunDeviceCallbacks(
         const std::vector<int> &devices,
         const std::function<void(int, int)> &callback);

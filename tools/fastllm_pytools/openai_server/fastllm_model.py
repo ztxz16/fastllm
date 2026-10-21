@@ -17,6 +17,7 @@ class FastLLmModel:
         is_qwen_reasoning = (
             self._is_qwen3_5(model) or self._is_qwen4_exp(model))
         is_naive_n05 = self._is_naive_n05(model)
+        is_deepseek_v41 = self._is_deepseek_v41(model)
         if is_naive_n05:
             # Naive exposes a thinking switch; "low" enables thinking without
             # imposing a smaller token budget. Keep local interactive use off
@@ -29,6 +30,9 @@ class FastLLmModel:
         elif is_qwen_reasoning:
             reasoning_efforts = ["none", "low", "medium", "xhigh"]
             default_reasoning_effort = "xhigh"
+        elif is_deepseek_v41:
+            reasoning_efforts = ["none", "low", "high", "max"]
+            default_reasoning_effort = "high"
         else:
             reasoning_efforts = []
             default_reasoning_effort = None
@@ -234,6 +238,18 @@ class FastLLmModel:
             "CogVLMForCausalLM", "Gemma4ForConditionalGeneration",
             "Step3p7ForConditionalGeneration", "Qwen3_8FlashNextForConditionalGeneration",
         }
+
+    @classmethod
+    def _is_deepseek_v41(cls, model):
+        config = getattr(model, "config", None)
+        if not isinstance(config, dict):
+            return False
+        architectures = config.get("architectures") or []
+        architecture = architectures[0] if isinstance(architectures, list) and architectures else ""
+        return (
+            architecture == "DeepseekV41ForCausalLM"
+            or config.get("model_type") in {"deepseek_v41", "deepseek_v41_text"}
+        )
 
     @staticmethod
     def _is_naive_n05(model):

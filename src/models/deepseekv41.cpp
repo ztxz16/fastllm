@@ -775,9 +775,10 @@ namespace fastllm {
             V41RMSNormBF16(tmp, normWeight, eps, output);
         }
 
-        void V41HcMixPreNorm(const Data &input, const Data &previousPre, Data &fn, Data &scale,
-                            Data &base, Data &normWeight, int hcMult, int iters, float mixEps,
-                            float normEps, Data &pre, Data &post, Data &comb, Data &tmp, Data &output) {
+        bool V41HcMixPreNorm(const Data &input, const Data &previousPre, Data &fn, Data &scale,
+                             Data &base, Data &normWeight, int hcMult, int iters, float mixEps,
+                             float normEps, Data &pre, Data &post, Data &comb, Data &tmp, Data &output,
+                             Data *quantizedOutput = nullptr) {
 #ifdef USE_CUDA
             const bool eligible = !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
                 !V41EnvFlag("FASTLLM_DSV41_LEGACY_HCMIX") &&
@@ -808,6 +809,8 @@ namespace fastllm {
                     V41AllocLike(post, DataType::FLOAT32, {b, n, 4}, input, devices);
                     V41AllocLike(comb, DataType::FLOAT32, {b, n, 4, 4}, input, devices);
                     V41AllocLike(output, DataType::BFLOAT16, {b, n, input.dims[3]}, input, devices);
+                    if (quantizedOutput != nullptr)
+                        V41AllocLike(*quantizedOutput, DataType::BFLOAT16, {b, n, input.dims[3]}, input, devices);
                     std::vector<int> ok(devices.size(), 0);
                     const bool submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
                         ok[rank] = FastllmCudaDeepSeekV41HcMixPreNorm(*input.multiDeviceDatas.at(device),
@@ -815,21 +818,89 @@ namespace fastllm {
                             *scale.multiDeviceDatas.at(device), *base.multiDeviceDatas.at(device),
                             *normWeight.multiDeviceDatas.at(device), iters, mixEps, normEps,
                             *pre.multiDeviceDatas.at(device), *post.multiDeviceDatas.at(device),
-                            *comb.multiDeviceDatas.at(device), *output.multiDeviceDatas.at(device));
+                            *comb.multiDeviceDatas.at(device), *output.multiDeviceDatas.at(device),
+                            quantizedOutput != nullptr ? quantizedOutput->multiDeviceDatas.at(device) : nullptr);
                     });
-                    if (submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; })) return;
+                    if (submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; }))
+                        return quantizedOutput != nullptr;
                 }
             }
             if (eligible && !input.multiDeviceData &&
                 V41FusedPreNormSameDevice(input, previousPre, normWeight) &&
                 FastllmCudaDeepSeekV41HcMixPreNorm(input, previousPre, fn, scale, base, normWeight,
-                    iters, mixEps, normEps, pre, post, comb, output)) return;
+                    iters, mixEps, normEps, pre, post, comb, output, quantizedOutput))
+                return quantizedOutput != nullptr;
 #endif
             V41HcMix(input, fn, scale, base, hcMult, iters, mixEps, normEps, pre, post, comb);
             V41HcApplyPreNorm(input, previousPre, normWeight, normEps, tmp, output);
+            return false;
         }
 
 #ifdef USE_CUDA
+        // B1 only: larger batches retain their existing GEMM dispatch. All
+        // graph-owned scratch buffers belong to the forward workspace.
+        bool V41QkvPrepare(const Data &input, Data &qw, Data &kw, Data &qnw, Data &knw, float eps,
+                           Data &inputQuant, Data &qr, Data &qNorm, Data &qQuant, Data &kv,
+                           bool inputQuantized = false) {
+            if (input.dataType != DataType::BFLOAT16 || input.dims.empty() || input.dims.back() <= 0 ||
+                input.Count(0) != (uint64_t)input.dims.back() || input.dims.back() % 32 ||
+                !std::isfinite(eps) || eps < 0) return false;
+            for (const Data *w : {&qw, &kw}) {
+                if (w->dataType != DataType::FP8_E4M3 || w->IsRepacked || w->dims.size() != 2 ||
+                    w->dims[1] != input.dims.back() || w->dims[0] < 512 || w->dims[0] >= 4096 ||
+                    w->dims[0] % 32 || w->blockM < 4 || (w->blockM & (w->blockM - 1)) ||
+                    w->blockK <= 1 || (w->blockK & (w->blockK - 1))) return false;
+            }
+            if (qnw.dataType != DataType::FLOAT32 || knw.dataType != DataType::FLOAT32 ||
+                qnw.Count(0) != (uint64_t)qw.dims[0] || knw.Count(0) != (uint64_t)kw.dims[0]) return false;
+            std::vector<int> devices;
+            if (input.multiDeviceData) {
+                if (!input.IsTensorParallelReplicated()) return false;
+                for (const auto &replica : input.multiDeviceDatas) devices.push_back(replica.first);
+                if (devices.empty()) return false;
+                for (Data *w : {&qw, &kw, &qnw, &knw}) {
+                    if (!w->multiDeviceData) PrepareMultiCudaReplicatedData(*w, devices, true);
+                    if (!w->IsTensorParallelReplicated()) return false;
+                    for (int device : devices) {
+                        const auto it = w->multiDeviceDatas.find(device);
+                        if (it == w->multiDeviceDatas.end() || !it->second || !it->second->cudaData ||
+                            !input.multiDeviceDatas.at(device) || !input.multiDeviceDatas.at(device)->cudaData)
+                            return false;
+                    }
+                }
+            } else {
+                if (input.dataDevice != DataDevice::CUDA || !input.cudaData ||
+                    input.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()}) return false;
+                for (Data *w : {&qw, &kw, &qnw, &knw}) {
+                    if (w->multiDeviceData) return false;
+                    if (w->dataDevice == DataDevice::CUDA && w->cudaData && w->dataDeviceIds != input.dataDeviceIds)
+                        return false;
+                    w->ToDevice(DataDevice::CUDA, input.dataDeviceIds, true);
+                }
+            }
+            auto qdims = input.dims, kdims = input.dims;
+            qdims.back() = qw.dims[0];
+            kdims.back() = kw.dims[0];
+            V41AllocLike(inputQuant, DataType::BFLOAT16, input.dims, input, devices);
+            for (Data *out : {&qr, &qNorm, &qQuant}) V41AllocLike(*out, DataType::BFLOAT16, qdims, input, devices);
+            V41AllocLike(kv, DataType::BFLOAT16, kdims, input, devices);
+            auto run = [&](const Data &x, Data &wq, Data &wk, Data &nq, Data &nk,
+                           Data &xq, Data &qraw, Data &qout, Data &qq, Data &kout) {
+                return (inputQuantized || FastllmCudaDeepSeekV41QuantizeActivation(x, xq)) &&
+                    FastllmCudaBFloat16FP8LinearPair(xq, wq, wk, qraw, kout) &&
+                    FastllmCudaV41QKVNormQuant(qraw, kout, nq, nk, eps, qout, qq, kout);
+            };
+            if (devices.empty()) return run(input, qw, kw, qnw, knw, inputQuant, qr, qNorm, qQuant, kv);
+            std::vector<int> ok(devices.size(), 0);
+            const bool submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                ok[rank] = run(*input.multiDeviceDatas.at(device), *qw.multiDeviceDatas.at(device),
+                    *kw.multiDeviceDatas.at(device), *qnw.multiDeviceDatas.at(device), *knw.multiDeviceDatas.at(device),
+                    *inputQuant.multiDeviceDatas.at(device), *qr.multiDeviceDatas.at(device),
+                    *qNorm.multiDeviceDatas.at(device), *qQuant.multiDeviceDatas.at(device), *kv.multiDeviceDatas.at(device));
+            });
+            return submitted && std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; });
+        }
+
         bool V41RouterScores(const Data &input, Data &weight, float temperature, Data &output) {
             if (input.dataType != DataType::BFLOAT16 || input.dims.empty() ||
                 input.dims.back() <= 0 || input.Count(0) / input.dims.back() > 8 ||
@@ -869,7 +940,7 @@ namespace fastllm {
         // Decode partitions independent output channels. Keeping the weight
         // replicas also preserves the existing prefill and unsupported-layout
         // paths. Each owner computes full K, then gathers rounded BF16 outputs.
-        bool V41EngramTpLinear(Data &input, Data &weight, Data &output) {
+        bool V41ReplicatedRowLinear(Data &input, Data &weight, Data &output, bool gather = true) {
             if (!input.multiDeviceData || !input.IsTensorParallelReplicated() ||
                 input.dataType != DataType::BFLOAT16 || weight.dataType != DataType::FP8_E4M3 ||
                 weight.dims.size() != 2 || input.dims.empty() ||
@@ -900,13 +971,22 @@ namespace fastllm {
             });
             if (!dispatched || !std::all_of(ready.begin(), ready.end(), [](int v) { return v != 0; }))
                 return false;
+            if (!gather) return true;
             dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
                 auto *dest = (uint16_t *)output.multiDeviceDatas.at(device)->cudaData;
-                const bool ok = FastllmNcclAllGather(dest + (size_t)rank * width, dest,
-                    width, DataType::BFLOAT16, device);
-                AssertInFastLLM(ok, "DeepSeekV41 Engram projection all-gather failed");
+                const int count = width * (int)devices.size();
+                bool ok = FastllmCudaCustomAllGatherRows(
+                    dest, count, count, DataType::BFLOAT16, device);
+                // Keep rounded projection values unchanged. Unsupported peer
+                // topologies, policies and registrations retain NCCL; do not
+                // retry a failed CUDA launch with a second collective.
+                if (!ok && !FastllmCudaGetThreadError()) {
+                    ok = FastllmNcclAllGather(dest + (size_t)rank * width, dest,
+                        width, DataType::BFLOAT16, device);
+                }
+                AssertInFastLLM(ok, "DeepSeekV41 replicated projection all-gather failed");
             });
-            AssertInFastLLM(dispatched, "DeepSeekV41 Engram projection dispatch failed");
+            AssertInFastLLM(dispatched, "DeepSeekV41 replicated projection dispatch failed");
             return true;
         }
 #endif
@@ -2363,9 +2443,11 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") && !replicated &&
             FastllmCudaV41ReferenceLinear(*source,weight[weightName],output,1,source->dataType==DataType::BFLOAT16)) return;
-        if (replicated && V41EndsWith(weightName, ".engram.wkv.weight") &&
+        if (replicated &&
+            (V41EndsWith(weightName, ".engram.wkv.weight") ||
+             V41EndsWith(weightName, ".ffn.shared_experts.gateup.weight")) &&
             !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
-            V41EngramTpLinear(*source, weight[weightName], output)) return;
+            V41ReplicatedRowLinear(*source, weight[weightName], output)) return;
 #endif
         // Match RowParallelLinear: each local GEMM rounds to the activation
         // dtype, the collective sums in FP32, and only its result rounds back.
@@ -3798,6 +3880,7 @@ namespace fastllm {
         std::vector<int> qDims, kvDims, qIdxDims;
         std::vector<int> ffnDims, ffnInputDims, expertIndexDims, expertScoreDims;
         bool swapHidden = false;
+        bool ffnInputQuantizedReady = false;
     };
 
 #ifdef USE_CUDA
@@ -4179,6 +4262,11 @@ namespace fastllm {
             if (captureOk) {
                 for (int index = 0; index < deviceCount; index++) {
                     FastllmCudaSetDevice(state.deviceStates[index].device);
+                    const int regions = FastllmCudaGraphOptimizeParallelRegions(segment.graphs[index]);
+                    if (regions < 0) {
+                        captureOk = false;
+                        break;
+                    }
                     if (!FastllmCudaGraphInstantiate(segment.graphs[index], &segment.execs[index]) ||
                         segment.execs[index] == nullptr) {
                         captureOk = false;
@@ -4356,9 +4444,21 @@ namespace fastllm {
             if (!captured) ready = false;
         }
         if (ready) {
+            std::string mainDevice = SelectDeviceFromMap(work->model.deviceMap, layer + 1,
+                                                       work->model.block_cnt);
+            if (mainDevice.empty()) mainDevice = V41Executor().GetFirstDeviceType();
+            ctx.parallelShared = work->single && work->seqlen == 1 &&
+                ctx.hasSharedExpertOut && !work->dumpDebug && !work->dsparkVerify &&
+                !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
+                V41DeviceSpecUsesType(mainDevice, "multicuda") &&
+                mainDevice == work->model.SelectMoeDeviceForLayer(layer);
             work->captureGpuMoeTogether = true;
             work->combineFfnPostDispatch = false;
             work->model.RunForwardGraphSegment(*work, [&] {
+                    struct RestoreWorkerCapture {
+                        bool previous;
+                        ~RestoreWorkerCapture() { MultiCudaSetWorkerOrderedCapture(previous); }
+                    } restore{MultiCudaSetWorkerOrderedCapture(work->graphCapture && ctx.parallelShared)};
                     work->combineFfnPostDispatch = work->model.RunGpuMoe(ctx);
                     work->model.EndForwardLayer(*work, layer);
                 }, kV41GraphSegmentsPerLayer * layer + 3, true,
@@ -5105,21 +5205,38 @@ namespace fastllm {
             Data *qQuant = reuseQuantized && needIndexer &&
                 quantizedLinearNames.count(pre + ".attn.wq_b.weight") &&
                 quantizedLinearNames.count(pre + ".attn.indexer.wq_b.weight") ? &ws->qNormQuantized : nullptr;
-            V41HcMixPreNorm(*curHidden, *preMixPtr, weight[pre + ".hc_attn_fn"],
+            const bool attentionInputQuantized = V41HcMixPreNorm(*curHidden, *preMixPtr, weight[pre + ".hc_attn_fn"],
                 weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
                 weight[pre + ".attn_norm.weight"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
-                attnPre, attnPost, attnComb, x, attnInput);
+                attnPre, attnPost, attnComb, x, attnInput, attnQuant);
 
             // wq_a / wkv 是复制的（KV 是 MLA 式的单份 latent，与 head 无关）；
             // wq_b 按行切 -> q 的 head 维分片，Reshape 会把 tpAxis 从最后一维换算到 head 维。
-            quantizedLinear(attnInput, pre + ".attn.wq_a.weight", qr, tp, attnQuant);
-            V41RMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
+            bool qkvPrepared = false;
+#ifdef USE_CUDA
+            if (attnQuant && quantizedLinearNames.count(pre + ".attn.wq_b.weight") && !dumpDebug) {
+                qkvPrepared = V41QkvPrepare(attnInput, weight[pre + ".attn.wq_a.weight"],
+                    weight[pre + ".attn.wkv.weight"], weight[pre + ".attn.q_norm.weight"],
+                    weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, *attnQuant,
+                    qr, qNorm, ws->qNormQuantized, kv, attentionInputQuantized);
+            }
+#endif
+            if (!qkvPrepared) {
+                // Reuse the fused quantizer even when the B1 QKV path is unavailable.
+                quantizedLinear(attentionInputQuantized ? *attnQuant : attnInput,
+                                pre + ".attn.wq_a.weight", qr, tp,
+                                attentionInputQuantized ? nullptr : attnQuant, attentionInputQuantized);
+                V41RMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
+            }
             if (tpAttention) {
                 weight[pre + ".attn.wq_b.weight"].tpLinearType = TP_LINEAR_ROW;
             }
             // 不切分注意力时 wq_b 也必须显式走复制布局：否则 MultiCudaLinearOp 会按
             // "大权重通用切分 + gather"处理，而那条路径读的是复制张量已失效的 root。
-            quantizedLinear(qNorm, pre + ".attn.wq_b.weight", q, tp && !tpAttention, qQuant);
+            // Keep qQuant's original eligibility for the Indexer: an unquantized
+            // Indexer projection must still consume the unquantized qNorm.
+            quantizedLinear(qkvPrepared ? ws->qNormQuantized : qNorm, pre + ".attn.wq_b.weight", q,
+                            tp && !tpAttention, qkvPrepared ? nullptr : qQuant, qkvPrepared);
             if (dumpDebug) {
                 const std::string tag = "fl_layer" + std::to_string(layer);
                 V41DumpTensor(qr, tag + "_qr" + dumpSuffix);
@@ -5131,10 +5248,12 @@ namespace fastllm {
             }
             q.Reshape({1, seqlen, num_attention_heads, headDim});
 
-            quantizedLinear(attnQuant ? *attnQuant : attnInput, pre + ".attn.wkv.weight", kv,
-                            tp, nullptr, attnQuant != nullptr);
-            if (dumpDebug) V41DumpTensor(kv, "fl_layer" + std::to_string(layer) + "_kv_proj" + dumpSuffix);
-            V41RMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
+            if (!qkvPrepared) {
+                quantizedLinear(attnQuant ? *attnQuant : attnInput, pre + ".attn.wkv.weight", kv,
+                                tp, nullptr, attnQuant != nullptr);
+                if (dumpDebug) V41DumpTensor(kv, "fl_layer" + std::to_string(layer) + "_kv_proj" + dumpSuffix);
+                V41RMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
+            }
             if (dumpDebug) V41DumpTensor(kv, "fl_layer" + std::to_string(layer) + "_kv_norm" + dumpSuffix);
             kv.Reshape({1, seqlen, headDim});
 
@@ -5666,10 +5785,16 @@ namespace fastllm {
             }
 
             // ---- FFN (MoE)：整批 ----
-            V41HcMixPreNorm(*curHidden, attnPre, weight[pre + ".hc_ffn_fn"],
+            const bool quantizeFfn = executionMode == ExecutionMode::Gpu && tp && single &&
+                seqlen == 1 && !f.dsparkVerify &&
+                quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") &&
+                quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight");
+            ws->ffnInputQuantizedReady = V41HcMixPreNorm(*curHidden, attnPre, weight[pre + ".hc_ffn_fn"],
                 weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
                 weight[pre + ".ffn_norm.weight"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
-                ffnPre, ffnPost, ffnComb, x, ffnInput);
+                ffnPre, ffnPost, ffnComb, x, ffnInput,
+                quantizeFfn ? &ws->ffnInputQuantized : nullptr);
+            if (ws->ffnInputQuantizedReady) ws->ffnInputQuantized.Reshape({seqlen, dim});
             ffnDims = ffnInput.dims;
             ffnInput.Reshape({seqlen, dim});
             };   // runAttentionPost
@@ -5677,10 +5802,14 @@ namespace fastllm {
                 [&](DeepSeekV41GraphSegmentMeta &meta) {
                     meta.ffnDims = ffnDims;
                     meta.ffnInputDims = ffnInput.dims;
+                    meta.ffnInputQuantizedReady = ws->ffnInputQuantizedReady;
                     meta.swapHidden = true;
                 },
                 [&](const DeepSeekV41GraphSegmentMeta &meta) {
                     ffnDims = meta.ffnDims;
+                    ws->ffnInputQuantizedReady = meta.ffnInputQuantizedReady;
+                    if (ws->ffnInputQuantizedReady)
+                        ws->ffnInputQuantized.Reshape(meta.ffnInputDims);
                     if (ffnInput.dims != meta.ffnInputDims) {
                         ffnInput.Reshape(meta.ffnInputDims);
                     }
@@ -6118,6 +6247,7 @@ namespace fastllm {
         auto &hasSharedExpertOut = f.hasSharedExpertOut;
         auto &ffnInput = ws->ffnInput;
         auto &sharedExpertOut = ws->sharedExpertOut;
+        ws->sharedExpertSharded = false;
         auto quantizedLinear = [&](Data &input, const std::string &name, Data &output, bool replicated = false,
                                    Data *scratch = nullptr, bool inputQuantized = false) {
             // Graphs and asynchronous TP decode need stable per-weight buffers.
@@ -6133,12 +6263,13 @@ namespace fastllm {
         auto body = [&] {
 
             if (hasSharedExpertOut) {
-                // Keep a complete shared expert on each rank, preserving
-                // the original BF16 rounding boundary without a collective.
+                // Preserve full-K arithmetic and the original BF16 rounding.
+                // Eligible decode graphs partition only the down-projection rows.
                 Data &ww1 = ws->sharedSwiglu, &ww3 = ws->sharedGateup;
                 bool sharedQuantized = false;
-                quantizedLinear(ffnInput, pre + ".ffn.shared_experts.gateup.weight", ww3,
-                                tp);
+                quantizedLinear(ws->ffnInputQuantizedReady ? ws->ffnInputQuantized : ffnInput,
+                                pre + ".ffn.shared_experts.gateup.weight", ww3,
+                                tp, nullptr, ws->ffnInputQuantizedReady);
 #ifdef USE_CUDA
                 if (!V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
                     quantizedLinearNames.count(pre + ".ffn.shared_experts.w2.weight") &&
@@ -6155,8 +6286,34 @@ namespace fastllm {
 #else
                 Swiglu(ww3, ww1);
 #endif
-                quantizedLinear(ww1, pre + ".ffn.shared_experts.w2.weight", sharedExpertOut,
-                                tp, nullptr, sharedQuantized);
+#ifdef USE_CUDA
+                if (sharedQuantized && f.captureGpuMoeTogether && f.tp && f.single &&
+                    seqlen == 1 && !f.dumpDebug && !f.dsparkVerify &&
+                    quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight")) {
+                    std::string main = SelectDeviceFromMap(deviceMap, layer + 1, block_cnt);
+                    if (main.empty()) main = V41Executor().GetFirstDeviceType();
+                    const std::string moe = SelectMoeDeviceForLayer(layer);
+                    std::vector<int> devices;
+                    std::map<int, int> ratios;
+                    FastllmGetMulticudaDeviceAndRatio(devices, ratios, false);
+                    std::vector<int> replicas;
+                    for (const auto &entry : ww1.multiDeviceDatas) replicas.push_back(entry.first);
+                    const int width = weight[pre + ".ffn.shared_experts.w2.weight"].dims[0];
+                    bool ready = main == moe && V41DeviceSpecUsesType(main, "multicuda") &&
+                        devices == f.tpDevices && devices == replicas &&
+                        !devices.empty() && width % (devices.size() * 8) == 0 &&
+                        width <= 4 * 512 * 36;
+                    for (int device : devices) {
+                        ready &= FastllmCudaCustomAllReduceCanRun(width, DataType::FLOAT32, device) &&
+                                 FastllmCudaCustomAllReduceCanRun(width, DataType::BFLOAT16, device);
+                    }
+                    if (ready) ws->sharedExpertSharded = V41ReplicatedRowLinear(ww1,
+                        weight[pre + ".ffn.shared_experts.w2.weight"], sharedExpertOut, false);
+                }
+#endif
+                if (!ws->sharedExpertSharded)
+                    quantizedLinear(ww1, pre + ".ffn.shared_experts.w2.weight", sharedExpertOut,
+                                    tp, nullptr, sharedQuantized);
                 ToDataType(sharedExpertOut, DataType::BFLOAT16);
             }
 
@@ -6279,7 +6436,7 @@ namespace fastllm {
                 &attnPre, &attnPost, &attnComb, &ffnPre, &ffnPost, &ffnComb,
                 &x, &attnInput, &qr, &qNorm, &q, &kv, &attnOut, &woAOut, &attnProj,
                 &rawKVAll, &rawScoreAll, &qIdxAll, &idxWeightsAll,
-                &ffnInput, &expertIndex, &expertScore, &ws->sharedExpertOut,
+                &ffnInput, &ws->ffnInputQuantized, &expertIndex, &expertScore, &ws->sharedExpertOut,
                 &ws->ffnOut, &ws->w1, &ws->w2, &ws->w3};
             for (const auto &entry : ws->reductionBuffers) tensors.push_back(&entry.second);
             for (const Data *data : tensors) {
@@ -6463,7 +6620,7 @@ namespace fastllm {
                         }
                         ForwardSegments(segments, ids, nullptr, nullptr, configs, last, nullptr, past);
                     }
-                    if (batch == 1) BuildFullDecodeGraph(batch, states);
+                    BuildFullDecodeGraph(batch, states);
                 }
             } catch (...) {
                 v41CudaGraphWarmingUp = false;

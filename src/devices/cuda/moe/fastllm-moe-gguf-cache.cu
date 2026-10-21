@@ -479,7 +479,24 @@ ResidentRegistry &ResidentLayers() {
 thread_local std::unordered_map<const fastllm::Data *, std::weak_ptr<ResidentLayer>> residentFront;
 
 std::shared_ptr<ResidentLayer> GetResidentLayer(fastllm::Data **weights, int count, int device) {
-    const auto *key = weights[2];
+    // Tensor-parallel EP passes a full global slot array whose remote expert
+    // entries are null.  Use the first complete local pair as the cache key
+    // and metadata source; the grouped route table still retains the global
+    // expert numbering and null slots are ignored by PrepareRoutes/Scatter.
+    int firstPair = -1;
+    for (int slot = 2; slot + 1 < count; slot += 2) {
+        if (weights[slot] != nullptr && weights[slot + 1] != nullptr) {
+            firstPair = slot;
+            break;
+        }
+    }
+    if (firstPair < 0) return {};
+    const auto *gate0 = weights[firstPair];
+    const auto *down0 = weights[firstPair + 1];
+    if (gate0->dataType != fastllm::DATA_GGUF_FORMAT ||
+        down0->dataType != fastllm::DATA_GGUF_FORMAT ||
+        gate0->dims.size() != 2 || down0->dims.size() != 2) return {};
+    const auto *key = gate0;
     auto front = residentFront.find(key);
     if (front != residentFront.end()) {
         auto layer = front->second.lock();
@@ -501,11 +518,13 @@ std::shared_ptr<ResidentLayer> GetResidentLayer(fastllm::Data **weights, int cou
         capture != cudaStreamCaptureStatusNone) return {};
     auto layer = std::make_shared<ResidentLayer>();
     layer->device = device;
+    // Keep the full global expert count: route indices remain global and
+    // grouped Scatter already skips null remote weights on each TP rank.
     layer->experts = count/2 - 1;
-    layer->hidden = weights[2]->dims[1];
-    layer->inter = weights[2]->dims[0]/2;
-    layer->gateType = weights[2]->ggmlType;
-    layer->downType = weights[3]->ggmlType;
+    layer->hidden = weights[firstPair]->dims[1];
+    layer->inter = weights[firstPair]->dims[0]/2;
+    layer->gateType = weights[firstPair]->ggmlType;
+    layer->downType = weights[firstPair + 1]->ggmlType;
     if (layer->inter <= 0 || !FastllmCudaMoeGGUFCacheSupported(layer->gateType, layer->hidden) ||
         !FastllmCudaMoeGGUFCacheSupported(layer->downType, layer->inter)) return {};
     std::vector<const uint8_t *> pointers(2*layer->experts, nullptr);
@@ -1231,10 +1250,8 @@ bool FastllmCudaMergeMOEV41GGUFResident(
     if (input.dataDevice != fastllm::CUDA || input.dataType != fastllm::BFLOAT16 ||
         input.dataDeviceIds != std::vector<int>{device} || !input.cudaData ||
         input.dims.size() != 2 || input.dims[0] <= 0 || input.dims[0] > 4096 ||
-        !weights || weightsBatch < 4 || weightsBatch%2 || !weights[2] || !weights[3] ||
-        (weights[0] && sharedScale != 0) || weights[2]->dims.size() != 2 ||
-        weights[2]->dataType != fastllm::DATA_GGUF_FORMAT ||
-        weights[3]->dataType != fastllm::DATA_GGUF_FORMAT ||
+        !weights || weightsBatch < 4 || weightsBatch%2 ||
+        (weights[0] && sharedScale != 0) ||
         indices.dataDevice != fastllm::CUDA || indices.dataType != fastllm::INT32 ||
         scores.dataDevice != fastllm::CUDA || scores.dataType != fastllm::FLOAT32 ||
         indices.dataDeviceIds != input.dataDeviceIds || scores.dataDeviceIds != input.dataDeviceIds ||
@@ -1248,12 +1265,11 @@ bool FastllmCudaMergeMOEV41GGUFResident(
                type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M;
     };
     // Validate before constructing a persistent pointer table or launching work.
-    if (!supported(weights[2]->ggmlType) || !supported(weights[3]->ggmlType)) return false;
-    const int hidden = input.dims[1], inter = weights[2]->dims[0]/2;
-    if (hidden <= 0 || inter <= 0 || hidden > 24576 || inter > 24576 ||
-        hidden%256 || inter%256 || weights[2]->dims[1] != hidden) return false;
     auto layer = GetResidentLayer(weights, weightsBatch, device);
-    if (!layer) return false;
+    if (!layer || !supported(layer->gateType) || !supported(layer->downType)) return false;
+    const int hidden = input.dims[1], inter = layer->inter;
+    if (hidden <= 0 || inter <= 0 || hidden > 24576 || inter > 24576 ||
+        hidden%256 || inter%256 || layer->hidden != hidden) return false;
     const int rows = input.dims[0], topk = indices.dims[1], routes = rows*topk;
     size_t bytes = (size_t(rows)*(hidden/32) + size_t(routes)*(inter/32))*sizeof(block_q8_1) +
         size_t(routes)*hidden*sizeof(__nv_bfloat16);

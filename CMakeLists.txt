@@ -1374,20 +1374,32 @@ if (UNIT_TEST)
                 "PASS [0-9]+ changing-context graph replays; stress=0" 300)
             fastllm_add_checked_test(deepseekV41FullDecodeStress deepseekV41FullDecodeRegression
                 "PASS [0-9]+ changing-context graph replays; stress=1" 300 --stress)
-            set_tests_properties(deepseekV41FullDecode deepseekV41FullDecodeStress PROPERTIES
-                LABELS cuda RUN_SERIAL TRUE)
+            fastllm_add_checked_test(deepseekV41FullDecodePooled deepseekV41FullDecodeRegression
+                "PASS [0-9]+ changing-context graph replays; stress=0" 300 --pooled)
+            set_tests_properties(deepseekV41FullDecode deepseekV41FullDecodeStress
+                deepseekV41FullDecodePooled PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_executable(deepseekV41DecodeProjectionRegression test/ops/deepseekV41DecodeProjectionRegression.cpp)
             target_link_libraries(deepseekV41DecodeProjectionRegression PRIVATE fastllm)
             target_include_directories(deepseekV41DecodeProjectionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             fastllm_add_checked_test(deepseekV41DecodeProjections deepseekV41DecodeProjectionRegression
                 "PASS V4.1 decode projections" 300)
             set_tests_properties(deepseekV41DecodeProjections PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+            add_executable(deepseekV41QKVPreparationRegression test/ops/deepseekV41QKVPreparationRegression.cpp)
+            target_link_libraries(deepseekV41QKVPreparationRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41QKVPreparationRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(deepseekV41QKVPreparation deepseekV41QKVPreparationRegression
+                "PASS V4.1 QKV preparation" 300)
+            set_tests_properties(deepseekV41QKVPreparation PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_executable(deepseekV41EngramProjectionRegression test/ops/deepseekV41EngramProjectionRegression.cpp)
             target_link_libraries(deepseekV41EngramProjectionRegression PRIVATE fastllm)
             target_include_directories(deepseekV41EngramProjectionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             fastllm_add_checked_test(deepseekV41EngramProjection deepseekV41EngramProjectionRegression
                 "PASS Engram projection" 300)
-            set_tests_properties(deepseekV41EngramProjection PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+            fastllm_add_checked_test(deepseekV41SharedProjection deepseekV41EngramProjectionRegression
+                "PASS Shared projection" 300 --shared)
+            set_tests_properties(deepseekV41EngramProjection deepseekV41SharedProjection
+                PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_executable(deepseekV41EngramRegression test/ops/deepseekV41EngramRegression.cpp)
             target_link_libraries(deepseekV41EngramRegression PRIVATE fastllm)
             target_include_directories(deepseekV41EngramRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -2499,6 +2511,10 @@ if (UNIT_TEST)
                 add_test(NAME custom_all_gather_${gather_ranks}
                          COMMAND customAllGatherRegression ${gather_ranks})
                 set_tests_properties(custom_all_gather_${gather_ranks} PROPERTIES
+                    LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+                add_test(NAME custom_all_reduce_gather_${gather_ranks}
+                         COMMAND customAllGatherRegression ${gather_ranks} joint)
+                set_tests_properties(custom_all_reduce_gather_${gather_ranks} PROPERTIES
                     LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
             endforeach()
 

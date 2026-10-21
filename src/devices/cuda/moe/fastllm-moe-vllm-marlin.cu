@@ -3731,7 +3731,8 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                              int weightsBatch, const int32_t *globalIndices,
                              const float *scores, int topk, int ownerRank,
                              int ownerCount, bool deepSeekV41 = false,
-                             float swigluLimit = 0.0f) {
+                             float swigluLimit = 0.0f,
+                             const fastllm::Data *prequantizedInput = nullptr) {
     if (globalIndices == nullptr || scores == nullptr || topk <= 0 ||
         topk > 16 || ownerCount <= 0 ||
         input.dims.empty() || input.dataDevice != fastllm::DataDevice::CUDA) {
@@ -3758,7 +3759,14 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
         return false;
     }
     const fastllm::Data *gemmInput = &input;
-    if (deepSeekV41) {
+    // Reuse is optional; incompatible metadata must retain ordinary quantization.
+    // The producer keeps the original BF16 tensor for Router and fallback paths.
+    if (deepSeekV41 && prequantizedInput != nullptr && prequantizedInput->cudaData &&
+        prequantizedInput->dataType == input.dataType && prequantizedInput->dims == input.dims &&
+        prequantizedInput->dataDevice == input.dataDevice &&
+        prequantizedInput->dataDeviceIds == input.dataDeviceIds) {
+        gemmInput = prequantizedInput;
+    } else if (deepSeekV41) {
         // The checkpoint requires W4A8, including the BF16 rounding before
         // quantizing the routed activation fed to the down projection.
         int bucket = 1;
@@ -3897,10 +3905,21 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
     // Two resident CTAs reduce the long gate/up tail on Hopper decode. The
     // ordinary configuration remains the fallback for other architectures.
     const int gateBlocksPerSm = deepSeekV41 && cache->computeMajor == 9 &&
-        rows >= 16 ? 2 : 1;
+        (rows == 1 || rows >= 16) ? 2 : 1;
     constexpr int downThreadK = 64;
     constexpr int downThreadN = 128;
     constexpr int downBlocksPerSm = 3;
+
+    auto applyActivation = [&](int routes, const float *routeScores) {
+        if (deepSeekV41 && cache->intermediate % 32 == 0)
+            return FastllmCudaDeepSeekV41BFloat16SwigluQuantized(gateOutput, activation,
+                routes, cache->intermediate, swigluLimit, routeScores);
+        const int count = routes * cache->intermediate;
+        SwigluRowsKernel<<<(count + threads - 1) / threads, threads, 0, cudaStreamPerThread>>>(
+            (const T *)gateOutput, activation, routes, cache->intermediate,
+            deepSeekV41 ? swigluLimit : 0.0f, deepSeekV41 ? routeScores : nullptr);
+        return !deepSeekV41 || FastllmCudaDeepSeekV41QuantizeActivation(w1, w1);
+    };
 
     auto reduceRows = [&](const int32_t *indices, void *destination, int count) {
         int blocks = (count * cache->hidden + threads - 1) / threads;
@@ -3953,14 +3972,7 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                 return false;
             }
 
-            int actCount = routes * cache->intermediate;
-            SwigluRowsKernel<<<(actCount + threads - 1) / threads, threads, 0,
-                               cudaStreamPerThread>>>(
-                (const T *)gateOutput, activation, routes,
-                cache->intermediate, deepSeekV41 ? swigluLimit : 0.0f,
-                deepSeekV41 ? chunkScores : nullptr);
-            if (deepSeekV41 && !FastllmCudaDeepSeekV41QuantizeActivation(w1, w1)) return false;
-            if (!checkStage("grouped SwiGLU")) {
+            if (!applyActivation(routes, chunkScores) || !checkStage("grouped SwiGLU")) {
                 return false;
             }
 
@@ -3982,7 +3994,6 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
         return true;
     }
 
-    int actCount = topk * cache->intermediate;
     for (int row = 0; row < rows; ++row) {
         const T *rowInput = (const T *)gemmInput->cudaData +
                             (size_t)row * cache->hidden;
@@ -4018,13 +4029,7 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
             return false;
         }
 
-        SwigluRowsKernel<<<(actCount + threads - 1) / threads, threads, 0,
-                           cudaStreamPerThread>>>(
-            (const T *)cache->gateOutput, activation, topk,
-            cache->intermediate, deepSeekV41 ? swigluLimit : 0.0f,
-            deepSeekV41 ? rowScores : nullptr);
-        if (deepSeekV41 && !FastllmCudaDeepSeekV41QuantizeActivation(w1, w1)) return false;
-        if (!checkStage("SwiGLU")) {
+        if (!applyActivation(topk, rowScores) || !checkStage("SwiGLU")) {
             return false;
         }
 
@@ -4206,10 +4211,10 @@ bool FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
         const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
         fastllm::Data **weights, int weightsBatch, const int32_t *globalIndices,
         const float *scores, int topk, int ownerRank, int ownerCount,
-        bool deepSeekV41, float swigluLimit) {
+        bool deepSeekV41, float swigluLimit, const fastllm::Data *prequantizedInput) {
     return fastllm_marlin_moe::RunMarlinMoe<__nv_bfloat16>(
         input, w1, output, weights, weightsBatch, globalIndices, scores, topk,
-        ownerRank, ownerCount, deepSeekV41, swigluLimit);
+        ownerRank, ownerCount, deepSeekV41, swigluLimit, prequantizedInput);
 }
 
 bool FastllmCudaV41MarlinGraphReady(const fastllm::Data *layerKey, int rows) {

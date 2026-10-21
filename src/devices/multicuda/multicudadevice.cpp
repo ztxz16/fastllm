@@ -40,6 +40,7 @@ namespace fastllm {
 
     static thread_local void *currentMultiCudaDedicatedWorker = nullptr;
     static thread_local bool multiCudaPersistentAsyncDispatch = false;
+    static thread_local bool multiCudaWorkerOrderedCapture = false;
 
     static bool MultiCudaEnvFlagEnabled(const char *name, bool defaultValue = false) {
         const char *v = std::getenv(name);
@@ -474,6 +475,15 @@ namespace fastllm {
 
         std::vector<MultiCudaDedicatedWorker*> workers;
         std::vector<uint64_t> targetIds;
+        if (multiCudaPersistentAsyncDispatch && multiCudaWorkerOrderedCapture &&
+            SubmitMultiCudaDeviceOps(opDevices, ops, workers, targetIds, false)) {
+            // The enclosing capture already joined these worker streams and
+            // will join them back at its exit. All GPU operations and persistent
+            // buffers in this scope are worker-owned; per-op caller handoffs
+            // would add redundant edges that serialize independent branches.
+            WaitMultiCudaDeviceOps(workers, targetIds);
+            return;
+        }
         if (multiCudaPersistentAsyncDispatch &&
             SubmitOrderedMultiCudaDeviceOps(opDevices, ops, workers, targetIds)) {
             // Each dispatch is a graph-safe bidirectional stream handoff:
@@ -535,6 +545,12 @@ namespace fastllm {
     bool MultiCudaSetPersistentAsyncDispatch(bool enabled) {
         bool previous = multiCudaPersistentAsyncDispatch;
         multiCudaPersistentAsyncDispatch = enabled;
+        return previous;
+    }
+
+    bool MultiCudaSetWorkerOrderedCapture(bool enabled) {
+        bool previous = multiCudaWorkerOrderedCapture;
+        multiCudaWorkerOrderedCapture = enabled;
         return previous;
     }
 
@@ -6515,6 +6531,8 @@ auto st = std::chrono::system_clock::now();
         float sharedScale;
         float swigluLimit;
         bool deepSeekV41 = false;
+        const Data *prequantizedInput = nullptr;
+        bool deferRankReduction = false;
         Data *output;
         Data *pairedReduceInput;
         int rootDeviceId;
@@ -6700,7 +6718,7 @@ auto st = std::chrono::system_clock::now();
                             packetInput, *w1, *output, localExpertTable->localWeights.data(),
                             (int)localExpertTable->localWeights.size(), gpuRouteIndex,
                             gpuRouteScore, topk, expertOwnerRank, expertOwnerCount,
-                            deepSeekV41, swigluLimit);
+                            deepSeekV41, swigluLimit, prequantizedInput);
                 }
                 if (!ok && !deepSeekV41) {
                     ok = input->dataType == DataType::FLOAT16 ?
@@ -6865,7 +6883,7 @@ auto st = std::chrono::system_clock::now();
                             (int)localExpertTable->localWeights.size(),
                             (const int32_t *)deviceIndex->cudaData,
                             (const float *)deviceScore->cudaData, topk,
-                            expertOwnerRank, expertOwnerCount, deepSeekV41, swigluLimit);
+                            expertOwnerRank, expertOwnerCount, deepSeekV41, swigluLimit, prequantizedInput);
                 } else if (!deepSeekV41) {
                     ran = input->dataType == DataType::FLOAT16 ?
                         FastllmCudaHalfMergeMOENVFP4Batch1ExpertParallel(
@@ -6923,6 +6941,8 @@ auto st = std::chrono::system_clock::now();
                                std::to_string(partOutputBytes) + ".\n");
             }
 
+            // The caller joins the shared branch before the joint collective.
+            if (deferRankReduction) return;
             if (doNcclReduce) {
                 if (pairedReduceInput != nullptr) {
                     AssertInFastLLM(
@@ -7161,6 +7181,12 @@ auto st = std::chrono::system_clock::now();
             devices.size() > 1 &&
             ((expertParallelIt != intParams.end() && expertParallelIt->second != 0) ||
              MultiCudaEnvFlagEnabled("FASTLLM_MULTICUDA_MOE_EXPERT_PARALLEL"));
+        const bool deferRankReduction = intParams.count("deferRankReduction") &&
+            intParams.at("deferRankReduction");
+        AssertInFastLLM(!deferRankReduction || (deepSeekV41 && n == 1 && useExpertParallel &&
+            input.multiDeviceData && input.IsTensorParallelReplicated() &&
+            input.dataType == DataType::BFLOAT16 && !hasSharedExpert && !pairedReduceInput),
+            "Deferred MoE reduction requires native BF16 single-token EP replicas.\n");
         if (useExpertParallel && hasSharedExpert && !weights[0]->multiDeviceData) {
             AssertInFastLLM(weights[1] != nullptr && weights[0]->dims.size() == 2 &&
                             weights[1]->dims.size() == 2 &&
@@ -7505,6 +7531,8 @@ auto st = std::chrono::system_clock::now();
         if (useNcclReduce) {
             useNcclReduce = FastllmInitNccl(devices);
         }
+        AssertInFastLLM(!deferRankReduction || (useNcclReduce && !temporaryInputReplication),
+            "Deferred MoE reduction requires persistent CUDA TP collectives.\n");
         AssertInFastLLM(
             pairedReduceInput == nullptr || useNcclReduce,
             "Paired MoE reduction requires CUDA TP collectives.\n");
@@ -7545,6 +7573,13 @@ auto st = std::chrono::system_clock::now();
                 op->deepSeekV41 = deepSeekV41;
                 op->expertOwnerRank = i;
                 op->expertOwnerCount = (int)devices.size();
+                op->deferRankReduction = deferRankReduction;
+                auto quantized = datas.find("prequantizedInput");
+                if (deepSeekV41 && quantized != datas.end() && quantized->second) {
+                    auto local = quantized->second->multiDeviceDatas.find(device);
+                    if (local != quantized->second->multiDeviceDatas.end())
+                        op->prequantizedInput = local->second;
+                }
                 op->pairedReduceInput = pairedReduceInput == nullptr ? nullptr :
                     pairedReduceInput->multiDeviceDatas[device];
                 ops.push_back(op);
