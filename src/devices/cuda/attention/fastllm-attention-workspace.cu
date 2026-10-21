@@ -189,26 +189,19 @@ void *FastllmBorrowCudaTempBuffer(size_t needBytes, size_t *outBytes, bool *outO
     {
         std::lock_guard<std::mutex> guard(*deviceLock);
         if (lease->leasedPtr == nullptr) {
-            size_t workspaceBytes = 0;
-            void *workspace = TryGetFlashInferFloatWorkspace(id, &workspaceBytes);
             FastllmCudaTempDeviceBuffer &holder = *holderPtr;
             size_t allocBytes = FastllmCudaTempAlignBytes(needBytes);
-            if (workspace != nullptr && workspaceBytes >= needBytes) {
-                ret = workspace;
-                retBytes = workspaceBytes;
-            } else {
-                if (holder.size < allocBytes) {
-                    if (holder.data != nullptr) {
-                        FastllmCudaDirectFree(holder.data);
-                        holder.data = nullptr;
-                        holder.size = 0;
-                    }
-                    holder.data = FastllmCudaDirectMalloc(allocBytes);
-                    holder.size = holder.data == nullptr ? 0 : allocBytes;
+            if (holder.size < allocBytes) {
+                if (holder.data != nullptr) {
+                    FastllmCudaDirectFree(holder.data);
+                    holder.data = nullptr;
+                    holder.size = 0;
                 }
-                ret = holder.data;
-                retBytes = holder.size;
+                holder.data = FastllmCudaDirectMalloc(allocBytes);
+                holder.size = holder.data == nullptr ? 0 : allocBytes;
             }
+            ret = holder.data;
+            retBytes = holder.size;
             if (ret == nullptr) {
                 if (outBytes != nullptr) {
                     *outBytes = 0;
