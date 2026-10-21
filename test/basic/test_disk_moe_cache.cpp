@@ -164,6 +164,18 @@ int main(int argc, char **argv) {
         setenv("FT_GPU_PREFILL", argc > 2 ? "1" : "0", 1);
         SetThreads(8);
         {
+            // A 160-wide intermediate crosses the 128-element activation
+            // task boundary; compare exact BF16 results with ordinary CPU MoE.
+            Fixture<96, 160, 3> f(false);
+            SetMoeCudaCacheBytes(0);
+            SetMoeCpuCacheBytes(f.expertBytes * 3 + (128ULL << 10));
+            for (int topk : {1, 3}) for (int batch : {2, 3, 5, 6, 7, 8, 11, 12, 13}) {
+                auto expected = f.Run(false, batch, 0, -1, false, topk);
+                Compare(f.Run(true, batch, 0, -1, false, topk), expected, true);
+                Compare(f.Run(true, batch, 0, -1, false, topk), expected, true);
+            }
+        }
+        {
             Fixture<2048, 1024, 3> split(false, true);
             SetMoeCudaCacheBytes(0);
             SetMoeCpuCacheBytes(split.expertBytes * 3 + (128ULL << 10));
@@ -237,7 +249,9 @@ int main(int argc, char **argv) {
                     Compare(f.Run(true, batch, 0, -1, true), f.Run(false, batch, 0), true);
             }
 #endif
-            for (int batch : {1, 7, 8, 40, 260, 520}) {
+            // Exercise every compact row count, the 8-token RAM batching
+            // boundary, and the >6-rows-per-expert fallback on cold reads.
+            for (int batch : {1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 40, 260, 520}) {
                 auto expected = f.Run(false, batch, 0);
                 Compare(f.Run(true, batch, 0), expected, true);
                 auto before = GetDiskMoeCacheStats();

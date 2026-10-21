@@ -839,6 +839,9 @@ namespace fastllm {
         int ks, int ms);
     extern bool LinearFloat32NVFP4E8M0Decode_AVX2_Kernel(const float *input, const uint8_t *weight,
         const uint8_t *scales, float *output, int m, int k, int first, int last);
+    extern bool LinearFloat32NVFP4E8M0DecodeRows_AVX2_Kernel(const float *input,
+        const uint8_t *weight, const uint8_t *scales, float *output,
+        int rows, int m, int k, int first, int last);
     extern bool LinearFloat32NVFP4E8M0_AVX2_Kernel(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end, int blockK, int blockM, uint8_t *scaleBytes,
         int ks, int ms);
@@ -1367,6 +1370,9 @@ namespace fastllm {
                 if (compactDecode && n == 1 && blockK == 1 && blockM == 32 && !biasData &&
                     LinearFloat32NVFP4E8M0Decode_AVX2_Kernel(inputData, weightData, scaleBytes,
                         outputData, m, k, st, end)) return;
+                if (compactDecode && n >= 2 && n <= 6 && blockK == 1 && blockM == 32 && !biasData &&
+                    LinearFloat32NVFP4E8M0DecodeRows_AVX2_Kernel(inputData, weightData, scaleBytes,
+                        outputData, n, m, k, st, end)) return;
                 if (LinearFloat32NVFP4E8M0_AVX2_Kernel(inputData, weightData, biasData, outputData,
                     n, m, k, st, end, blockK, blockM, scaleBytes, ks, ms)) {
                     return;

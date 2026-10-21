@@ -2250,7 +2250,7 @@ namespace fastllm {
                 auto *victim = victims[count++];
                 // Strict admission resists cyclic scans with a small cache.
                 if (candidate && ((candidate->visits < 2 && victim->visits) ||
-                    candidate->Heat(Epoch()) <= victim->Heat(Epoch()) + (device < 0 ? 0 : 16))) return false;
+                    candidate->Heat(epoch) <= victim->Heat(epoch) + (device < 0 ? 0 : 16))) return false;
                 used -= Slot(*victim, device)->Bytes();
             }
             if (used > budget - bytes) return false;
@@ -3378,8 +3378,8 @@ namespace fastllm {
         } restoreDevice{device};
         std::vector<int> cudaDevices{device};
         if (nativeGlm && !diskMoeCudaDevices.empty()) cudaDevices = diskMoeCudaDevices;
-        int cudaCandidate = -1;
 #endif
+        int cudaCandidate = -1;
         auto cudaHit = [&](const DiskExpertEntry &entry) -> DiskCachedExpert * {
 #ifdef USE_CUDA
             for (int d : cudaDevices) if (auto *hit = entry.Cuda(d)) return hit;
@@ -3490,16 +3490,18 @@ namespace fastllm {
         }
 #endif
         // Complete independent RAM-resident routes while disk misses load.
-        // Each synthetic row contains exactly one route, retaining its BF16
-        // boundary; the normal loop still accumulates in expert-ID order.
-        std::vector<int> cpuSlots(count + 1, -1);
+        // Each synthetic row keeps one route's score and BF16 boundary, while
+        // the row index selects its expert. This avoids one full CpuMergeMOE
+        // call per verify expert without changing the executed kernels.
+        std::vector<int> cpuBatchStarts(count + 1, -1);
         Data cpuBatchOutput(DataType::BFLOAT16);
-        if (tokens == 1 && v4 && quantBlock == 32 && gateType == MoeGateSwiglu &&
+        if (tokens <= 8 && v4 && quantBlock == 32 && gateType == MoeGateSwiglu &&
             input.dataType == DataType::BFLOAT16) {
             std::vector<int> selected;
             std::vector<Data*> table{nullptr, nullptr};
             for (int id = 1; id <= count; ++id) {
-                if (routes[id].size() != 1 || !weights[id * 2]) continue;
+                if (routes[id].empty() || routes[id].size() > 6 ||
+                    id == cudaCandidate || !weights[id * 2]) continue;
                 auto found = cache.entries.find(weights[id * 2]);
                 if (found == cache.entries.end() || cudaHit(found->second) || !found->second.cpu) continue;
                 auto *host = found->second.cpu.get();
@@ -3509,17 +3511,25 @@ namespace fastllm {
                 selected.push_back(id);
                 table.push_back(host->gate.get()); table.push_back(host->down.get());
             }
-            if (selected.size() > 1) {
-                const int batch = selected.size();
-                Data x(input.dataType, {batch, hidden}), ids(DataType::INT32PARAM, {batch, 1});
-                Data scales(DataType::FLOAT32, {batch, 1}), a, b, c;
+            if (!selected.empty()) {
+                int rows = 0;
+                for (int id : selected) rows += (int)routes[id].size();
+                Data x(input.dataType, {rows, hidden}), ids(DataType::INT32PARAM, {rows, 1});
+                Data scales(DataType::FLOAT32, {rows, 1}), a, b, c;
                 x.Allocate(false); ids.Allocate(false); scales.Allocate(false);
-                cpuBatchOutput.Resize({batch, hidden});
-                for (int row = 0; row < batch; ++row) {
-                    memcpy(x.cpuData + size_t(row) * input.GetBytes(), input.cpuData, input.GetBytes());
-                    ((int32_t*)ids.cpuData)[row] = row;
-                    ((float*)scales.cpuData)[row] = routes[selected[row]][0].score;
-                    cpuSlots[selected[row]] = row;
+                cpuBatchOutput.Resize({rows, hidden});
+                const size_t rowBytes = GetDataBytes(input.dataType, 1, hidden);
+                int row = 0;
+                for (int k = 0; k < (int)selected.size(); ++k) {
+                    const int id = selected[k];
+                    cpuBatchStarts[id] = row;
+                    for (const auto &task : routes[id]) {
+                        memcpy(x.cpuData + size_t(row) * rowBytes,
+                            input.cpuData + size_t(task.token) * rowBytes, rowBytes);
+                        ((int32_t*)ids.cpuData)[row] = k;
+                        ((float*)scales.cpuData)[row] = task.score;
+                        ++row;
+                    }
                 }
                 std::vector<Data*> biases(table.size(), nullptr);
                 DataDict batchData = {{"input", &x}, {"output", &cpuBatchOutput}, {"index", &ids},
@@ -3683,6 +3693,18 @@ namespace fastllm {
             }
             // Refill before computation/cache work; consumption stays ordered.
             prefetch(order + 1);
+            const bool cpuBatched = cpuBatchStarts[expert] >= 0;
+            if (cpuBatched) {
+                for (size_t route = 0; route < tasks.size(); ++route) {
+                    const size_t row = cpuBatchStarts[expert] + route;
+                    float *dst = routeOutput(tasks[route]);
+                    for (int col = 0; col < hidden; ++col)
+                        dst[col] += ReadDiskFloatValue(cpuBatchOutput.cpuData,
+                            cpuBatchOutput.dataType, (size_t)row * hidden + col);
+                }
+                // Keep the common cache admission/recycling below: an earlier
+                // expert may have evicted this precomputed RAM entry.
+            }
             // Keep cold and RAM-cached V4.1 experts on the same GPU prefill
             // path. A large chunk can route only a few rows to each expert;
             // testing expert reuse would move most cache hits back to CPU.
@@ -3697,7 +3719,7 @@ namespace fastllm {
             const bool offloadRam = nativeGpuPrefill &&
                 DiskCudaWeightType(*gate) == DataType::NVFP4_BLOCK_32_E8M0 &&
                 DiskCudaWeightType(*down) == DataType::NVFP4_BLOCK_32_E8M0;
-            if (!gpu && host && device >= 0 && DiskMoeGpuPrefillEnabled() &&
+            if (!cpuBatched && !gpu && host && device >= 0 && DiskMoeGpuPrefillEnabled() &&
                 tokens >= DiskMoeGpuPrefillMinTokens() && (loaded || offloadRam) &&
                 (gate->dataType != DataType::DATA_GGUF_FORMAT || canonicalGGUF) &&
                 !(v4 && quantBlock == 32 && DiskV41CpuExpert(*gate, *down))) {
@@ -3729,13 +3751,7 @@ namespace fastllm {
             queuedResident = v41Queued[expert] ||
                 (gpu && gpu != transientGpu.get() && residentDevices.count(gpu->device));
 #endif
-            if (cpuSlots[expert] >= 0) {
-                const size_t row = cpuSlots[expert];
-                float *dst = routeOutput(tasks[0]);
-                for (int col = 0; col < hidden; ++col)
-                    dst[col] += ReadDiskFloatValue(cpuBatchOutput.cpuData, cpuBatchOutput.dataType, row * hidden + col);
-            }
-            for (size_t first = 0; !queuedResident && cpuSlots[expert] < 0 && first < tasks.size(); first += 256) {
+            for (size_t first = 0; !cpuBatched && !queuedResident && first < tasks.size(); first += 256) {
                 int batch = std::min<size_t>(256, tasks.size() - first);
 #if defined(USE_CUDA) && !defined(USE_ROCM)
                 if (streamedPrefill) {

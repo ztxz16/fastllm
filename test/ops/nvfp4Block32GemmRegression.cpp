@@ -27,7 +27,13 @@
 #include <xmmintrin.h>
 #endif
 
-namespace fastllm { CPUInstructInfo *GetCPUInstructInfo(); }
+namespace fastllm {
+CPUInstructInfo *GetCPUInstructInfo();
+bool LinearFloat32NVFP4E8M0Decode_AVX2_Kernel(const float *, const uint8_t *,
+    const uint8_t *, float *, int, int, int, int);
+bool LinearFloat32NVFP4E8M0DecodeRows_AVX2_Kernel(const float *, const uint8_t *,
+    const uint8_t *, float *, int, int, int, int, int);
+}
 
 using namespace fastllm;
 
@@ -121,6 +127,46 @@ static void Reference(const uint16_t *A, long ldaElems, const uint8_t *B, size_t
             C[(size_t)i * ldcElems + j] = (float)total;
             Scale[(size_t)i * ldcElems + j] = (float)magnitude;
         }
+    }
+}
+
+// The compact disk-MoE kernel must preserve each row's existing accumulation
+// order and must not overwrite columns owned by another worker.
+static void CompactDecodeCorrectness() {
+    if (!GetCPUInstructInfo()->hasAVX2) return;
+    std::mt19937 rng(20261021);
+    for (const auto &shape : {std::pair<int, int>{32, 7}, {160, 33}, {2304, 96}, {5120, 128}}) {
+        const int m = shape.first, k = shape.second;
+        std::vector<uint8_t> weights(size_t(k) * m / 2), scales(size_t(k) * m / 32);
+        for (auto &w : weights) w = uint8_t(rng());
+        for (auto &s : scales) s = uint8_t(120 + rng() % 15);
+        for (int rows = 2; rows <= 6; ++rows) {
+            std::vector<float> input(size_t(rows) * m);
+            for (auto &x : input) x = float(int(rng() % 2001) - 1000) / 1000.0f;
+            for (const auto &range : {std::pair<int, int>{0, k}, {1, k - 1}, {k, k}}) {
+                std::vector<float> expected(size_t(rows) * k, -12345.0f), actual = expected;
+                for (int row = 0; row < rows; ++row) {
+                    Check(LinearFloat32NVFP4E8M0Decode_AVX2_Kernel(input.data() + size_t(row) * m,
+                        weights.data(), scales.data(), expected.data() + size_t(row) * k,
+                        m, k, range.first, range.second), "compact single-row reference");
+                }
+                Check(LinearFloat32NVFP4E8M0DecodeRows_AVX2_Kernel(input.data(), weights.data(),
+                    scales.data(), actual.data(), rows, m, k, range.first, range.second),
+                    "compact multi-row dispatch");
+                Check(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0,
+                    "compact rows=" + std::to_string(rows) + " m=" + std::to_string(m) +
+                    " columns=" + std::to_string(range.first) + ":" + std::to_string(range.second));
+            }
+        }
+    }
+    // Rejected calls must leave the destination untouched for the fallback.
+    float input[32] = {}, output = 123.0f;
+    uint8_t weights[16] = {}, scales[1] = {127};
+    for (const auto &args : {std::vector<int>{1, 32, 0, 1}, {7, 32, 0, 1},
+                            {2, 31, 0, 1}, {2, 32, -1, 1}, {2, 32, 1, 0}, {2, 32, 0, 2}}) {
+        Check(!LinearFloat32NVFP4E8M0DecodeRows_AVX2_Kernel(input, weights, scales, &output,
+            args[0], args[1], 1, args[2], args[3]) && output == 123.0f,
+            "compact unsupported shape/range fallback");
     }
 }
 
@@ -394,6 +440,7 @@ int main(int argc, char **argv) {
         info->hasAMX = false;
     }
     printf("hasAVX2=%d hasAVX512BF16=%d\n", (int)info->hasAVX2, (int)info->hasAVX512BF16);
+    CompactDecodeCorrectness();
     Correctness();
     ScaleCorrectness();
     StridedCorrectness();
