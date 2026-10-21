@@ -302,20 +302,36 @@ __device__ __forceinline__ void CustomArBarrierPublish(
 // Owned slices are never overwritten, so peers can copy them directly without
 // a staging buffer or arithmetic. Matching start/final barriers publish prior
 // writes and prevent the next operator from reusing a source before all reads.
-template <int Ranks>
+template <int Ranks, bool Flatten>
 __global__ __launch_bounds__(kCustomArThreads, 1)
 void FastllmCustomAllGatherInplaceKernel(CustomArRankData *rankData,
         CustomArRankSignals allSignals, CustomArSignal *selfSignal,
         uint4 *output, int rank, int part) {
     CustomArRankData pointers = *rankData;
     CustomArBarrierStart<Ranks>(allSignals, selfSignal, rank);
-    for (int offset = blockIdx.x * blockDim.x + threadIdx.x;
-         offset < part; offset += gridDim.x * blockDim.x) {
+    const int stride = gridDim.x * blockDim.x;
+    const int thread = blockIdx.x * blockDim.x + threadIdx.x;
+    if constexpr (Flatten) {
+        // Small messages have fewer than one CTA of payload per peer.
+        // Flattening (source, offset) pairs keeps every participating thread
+        // on one remote copy instead of serializing all peers through the few
+        // payload threads.
+        const int copies = part * (Ranks - 1);
+        for (int index = thread; index < copies; index += stride) {
+            int source = index / part;
+            const int offset = index - source * part;
+            if (source >= rank) ++source;
+            output[source * part + offset] =
+                reinterpret_cast<const uint4 *>(pointers.ptrs[source])[source * part + offset];
+        }
+    } else {
+        for (int offset = thread; offset < part; offset += stride) {
 #pragma unroll
-        for (int source = 0; source < Ranks; ++source)
-            if (source != rank)
-                output[source * part + offset] =
-                    reinterpret_cast<const uint4 *>(pointers.ptrs[source])[source * part + offset];
+            for (int source = 0; source < Ranks; ++source)
+                if (source != rank)
+                    output[source * part + offset] =
+                        reinterpret_cast<const uint4 *>(pointers.ptrs[source])[source * part + offset];
+        }
     }
     CustomArBarrierFinal<Ranks>(allSignals, selfSignal, rank);
 }
@@ -3150,10 +3166,16 @@ bool FastllmCudaCustomAllGatherRows(void *data, int count, int rowElements,
         (part + kCustomArThreads - 1) / kCustomArThreads));
 #define CUSTOM_AG_RANK_CASE(RANKS)                                           \
     case RANKS:                                                             \
-        FastllmCustomAllGatherInplaceKernel<RANKS>                            \
-            <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(           \
-                rankData, state.allSignals, state.allSignals.signals[rank],  \
-                reinterpret_cast<uint4 *>(data), rank, part);                \
+        if (RANKS > 2 && part <= kCustomArThreads / 2)                       \
+            FastllmCustomAllGatherInplaceKernel<RANKS, true>                  \
+                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
+                    rankData, state.allSignals, state.allSignals.signals[rank], \
+                    reinterpret_cast<uint4 *>(data), rank, part);            \
+        else                                                                 \
+            FastllmCustomAllGatherInplaceKernel<RANKS, false>                 \
+                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
+                    rankData, state.allSignals, state.allSignals.signals[rank], \
+                    reinterpret_cast<uint4 *>(data), rank, part);            \
         break
     switch (ranks) {
         CUSTOM_AG_RANK_CASE(2);

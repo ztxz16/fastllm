@@ -166,38 +166,41 @@ int main(int argc, char **argv) {
         Check(cudaMalloc(&deviceErrors, sizeof(int)));
         Check(cudaMemsetAsync(deviceErrors, 0, sizeof(int), cudaStreamPerThread));
         for (int i = 0; i < maxPart; ++i) host[i] = Value(rank, i);
-        for (int rows : {1, 2, 4, 8, 16}) {
-            const int part = rows * 4096, count = ranks * part;
-            auto run = [&] {
-                // Poison all foreign slices on every replay. A missing start
-                // or completion barrier must not silently reuse prior output.
-                Check(cudaMemsetAsync(data, 0xa5, (size_t)count * sizeof(*data), cudaStreamPerThread));
-                Check(cudaMemcpyAsync(data + rank * part, host, part * sizeof(*host),
-                                      cudaMemcpyHostToDevice, cudaStreamPerThread));
-                if (!FastllmCudaCustomAllGatherRows(data, count, 4096, fastllm::BFLOAT16, rank)) std::abort();
-                CheckGather<<<32, 256, 0, cudaStreamPerThread>>>(data, part, ranks, deviceErrors);
-                Check(cudaGetLastError());
-                // Interleave the established reduction to exercise the shared
-                // signal counters with differing collective grid sizes.
-                if (!FastllmCudaCustomAllReduceRows(data, data, count, 4096, fastllm::BFLOAT16, rank)) std::abort();
-            };
-            run();
-            Check(cudaStreamSynchronize(cudaStreamPerThread));
-            cudaGraph_t graph;
-            cudaGraphExec_t exec;
-            Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
-            run();
-            Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
-            Check(cudaGraphInstantiate(&exec, graph, 0));
-            for (int repeat = 0; repeat < 64; ++repeat) {
-                if ((repeat + rank) % 7 == 0)
-                    std::this_thread::sleep_for(std::chrono::microseconds(137 * (rank + 1)));
-                Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+        // BF16 shard widths bracket the 256 uint4 / 2048 element flatten
+        // threshold, including one-vector messages and larger batches.
+        for (int width : {8, 64, 2040, 2048, 2056, 4096})
+            for (int rows : {1, 2, 4, 8, 16}) {
+                const int part = rows * width, count = ranks * part;
+                auto run = [&] {
+                    // Poison all foreign slices on every replay. A missing start
+                    // or completion barrier must not silently reuse prior output.
+                    Check(cudaMemsetAsync(data, 0xa5, (size_t)count * sizeof(*data), cudaStreamPerThread));
+                    Check(cudaMemcpyAsync(data + rank * part, host, part * sizeof(*host),
+                                          cudaMemcpyHostToDevice, cudaStreamPerThread));
+                    if (!FastllmCudaCustomAllGatherRows(data, count, width, fastllm::BFLOAT16, rank)) std::abort();
+                    CheckGather<<<32, 256, 0, cudaStreamPerThread>>>(data, part, ranks, deviceErrors);
+                    Check(cudaGetLastError());
+                    // Interleave the established reduction to exercise the shared
+                    // signal counters with differing collective grid sizes.
+                    if (!FastllmCudaCustomAllReduceRows(data, data, count, width, fastllm::BFLOAT16, rank)) std::abort();
+                };
+                run();
+                Check(cudaStreamSynchronize(cudaStreamPerThread));
+                cudaGraph_t graph;
+                cudaGraphExec_t exec;
+                Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+                run();
+                Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+                Check(cudaGraphInstantiate(&exec, graph, 0));
+                for (int repeat = 0; repeat < 64; ++repeat) {
+                    if ((repeat + rank) % 7 == 0)
+                        std::this_thread::sleep_for(std::chrono::microseconds(137 * (rank + 1)));
+                    Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+                }
+                Check(cudaStreamSynchronize(cudaStreamPerThread));
+                Check(cudaGraphExecDestroy(exec));
+                Check(cudaGraphDestroy(graph));
             }
-            Check(cudaStreamSynchronize(cudaStreamPerThread));
-            Check(cudaGraphExecDestroy(exec));
-            Check(cudaGraphDestroy(graph));
-        }
         Check(cudaMemcpy(&errors[rank], deviceErrors, sizeof(int), cudaMemcpyDeviceToHost));
         Check(cudaFree(deviceErrors));
         Check(cudaFreeHost(host));
@@ -209,6 +212,6 @@ int main(int argc, char **argv) {
     if (joint)
         std::printf("Joint reduce/gather: %d GPUs, five sizes, in/out-of-place, changing values, skewed graphs PASS\n", ranks);
     else
-        std::printf("Custom AllGather: %d GPUs, five shard sizes, eager +64 skewed graph replays PASS\n", ranks);
+        std::printf("Custom AllGather: %d GPUs, six shard widths x five batches, eager +64 skewed graph replays PASS\n", ranks);
     return 0;
 }
