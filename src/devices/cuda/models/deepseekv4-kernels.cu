@@ -6130,7 +6130,15 @@ bool DeepSeekV4LaunchWoAGemm(const fastllm::Data &o, const fastllm::Data &woA,
                              fastllm::Data &output, int bsz, int seqlen,
                              int heads, int headDim, int groups, int oRank) {
     int tokens = bsz * seqlen;
-    if (tokens < 16) {
+    // BF16 verification batches also benefit from FP32-accumulating Tensor
+    // Cores. Keep the single-token and mixed-dtype reduction paths unchanged.
+    const bool bf16Verify = tokens >= 2 && tokens <= 8 &&
+        o.dataType == fastllm::DataType::BFLOAT16 &&
+        woA.dataType == fastllm::DataType::BFLOAT16 &&
+        FastllmCudaRuntimeArch() >= 80 && heads % groups == 0 &&
+        ((heads / groups) * headDim) % 8 == 0 && oRank % 8 == 0 &&
+        (uintptr_t)o.cudaData % 16 == 0 && (uintptr_t)woA.cudaData % 16 == 0;
+    if (tokens < 16 && !bf16Verify) {
         return false;
     }
     if (woA.dataType == fastllm::DataType::FP8_E4M3) {

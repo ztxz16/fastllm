@@ -153,15 +153,17 @@ static int CheckRouter() {
             "unsupported router batch must leave the output untouched");
     return cases + 1;
 }
-// Independent CPU oracle reproduces the historical per-lane FMA and the
-// 256-lane FP32 tree for both eager execution and captured replay.
+// Preserve exact historical reductions on fallback paths. Tensor Core cases
+// use an independent FP64 dot-product oracle and exact eager/graph parity.
 static int CheckWoA() {
     struct Shape { int batch, seq, groups, rank, dim; };
     const Shape shapes[] = {
         {1,1,3,6,17}, {1,2,1,6,255}, {1,3,3,6,257}, {1,4,1,6,512},
         {1,5,3,6,4095}, {1,6,1,1024,4096}, {1,7,3,6,4097},
         {1,8,1,1024,4096}, {1,9,3,6,513}, {1,15,1,6,1025},
-        {2,3,3,6,512}, {2,4,1,6,4096}
+        {2,3,3,6,512}, {2,4,1,6,4096},
+        {1,2,1,1024,4096}, {1,3,1,1024,4096}, {1,4,1,1024,4096},
+        {1,5,1,1024,4096}, {1,7,1,1024,4096}, {1,6,3,16,512}, {2,4,4,128,256}
     };
     int cases = 0;
     auto check = [&](Shape shape, DataType inputType, DataType weightType,
@@ -188,8 +190,33 @@ static int CheckWoA() {
         expected.ToDevice(DataDevice::CUDA, std::vector<int>{0});
         const auto expectedBits = Bits(expected);
         Require(FastllmCudaDeepSeekV4WoA(input, weight, groups, rank, output, false), "WoA rejected");
-        Require(output.dims == expected.dims && Bits(output) == expectedBits,
-                "WoA changed the original FP32 reduction");
+        Require(output.dims == expected.dims, "WoA output shape changed");
+        const bool tensorCore = tokens >= 2 && tokens <= 8 && dim % 8 == 0 && rank % 8 == 0 &&
+            inputType == DataType::BFLOAT16 && weightType == DataType::BFLOAT16 &&
+            FastllmCudaRuntimeArch() >= 80;
+        const auto eagerBits = Bits(output);
+        if (tensorCore) {
+            const auto actual = Floats(output);
+            double error = 0.0, norm = 0.0;
+            for (int token = 0; token < tokens; ++token)
+            for (int group = 0; group < groups; ++group) for (int row = 0; row < rank; ++row) {
+                double exact = 0.0, sumAbs = 0.0;
+                for (int d = 0; d < dim; ++d) {
+                    const double product = double(x[(token * groups + group) * dim + d]) *
+                                           w[(group * rank + row) * dim + d];
+                    exact += product; sumAbs += std::abs(product);
+                }
+                const double delta = actual[(token * groups + group) * rank + row] - exact;
+                Require(std::isfinite(delta) && std::abs(delta) <=
+                        0.004 * std::abs(exact) + 2e-6 * sumAbs + 1e-30,
+                        "WoA Tensor Core exceeds BF16 output / FP32 accumulation error bound");
+                error += delta * delta; norm += exact * exact;
+            }
+            Require(std::sqrt(error / std::max(norm, 1e-30)) < 0.002,
+                    "WoA Tensor Core FP64 oracle NRMSE exceeds 0.002");
+        } else {
+            Require(eagerBits == expectedBits, "WoA fallback changed the original FP32 reduction");
+        }
         cudaGraph_t graph;
         cudaGraphExec_t exec;
         Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
@@ -199,7 +226,7 @@ static int CheckWoA() {
         Check(cudaMemsetAsync(output.cudaData, 0xff, output.GetBytes(), cudaStreamPerThread));
         Check(cudaGraphLaunch(exec, cudaStreamPerThread));
         Check(cudaStreamSynchronize(cudaStreamPerThread));
-        Require(Bits(output) == expectedBits, "WoA graph changed bits or left a token tail unwritten");
+        Require(Bits(output) == eagerBits, "WoA graph changed bits or left a token tail unwritten");
         Check(cudaGraphExecDestroy(exec));
         Check(cudaGraphDestroy(graph));
         ++cases;
@@ -248,7 +275,7 @@ int main() {
         FastllmCudaSetDevice(0);
         const int cases = CheckMixNorm() + CheckHcDecodeDots() + CheckRouter() + CheckWoA() +
                           CheckFusedSwigluQuantization();
-        std::printf("PASS V4.1 decode projections: %d exact cases\n", cases);
+        std::printf("PASS V4.1 decode projections: %d cases (exact fallback and FP64 Tensor Core oracle)\n", cases);
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;
