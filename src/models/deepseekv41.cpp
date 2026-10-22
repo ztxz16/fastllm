@@ -26,7 +26,6 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
-#include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include "fastllm-v41-decode.cuh"
 #include "devices/cuda/fastllm-v41-engram.h"
 #include "deepseekv41-reference.cuh"
@@ -4351,7 +4350,10 @@ namespace fastllm {
                 for (int index = 0; index < deviceCount; index++) {
                     FastllmCudaSetDevice(state.deviceStates[index].device);
                     const int regions = FastllmCudaGraphOptimizeParallelRegions(segment.graphs[index]);
-                    if (regions < 0) {
+                    // Allocation nodes forbid marker removal. The optimizer
+                    // returns before mutation, so keep the captured serial
+                    // topology instead of discarding an otherwise valid graph.
+                    if (regions < 0 && regions != FASTLLM_CUDA_GRAPH_RECAPTURE_WITHOUT_PARALLEL_MARKERS) {
                         captureOk = false;
                         break;
                     }
@@ -4507,7 +4509,6 @@ namespace fastllm {
     void DeepSeekV41Model::ForwardState::GpuExperts(int layer) {
         auto ctx=work->model.MakeForwardMoeContext(*work, layer);
 #ifdef USE_CUDA
-        bool ggufMoe = false;
         bool ready = work->graphActive && work->tp && work->cudaRouteCapturable &&
             work->ws->ffnInput.dataType == DataType::BFLOAT16 &&
             work->model.quantizedLinearNames.count("layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight");
@@ -4522,11 +4523,8 @@ namespace fastllm {
                         break;
                     }
                 }
-                const bool gguf = key && key->dataType == DataType::DATA_GGUF_FORMAT;
-                ggufMoe |= gguf;
-                ready &= key && (gguf ? FastllmCudaV41GGUFGraphReady(
-                    key, work->seqlen, work->model.num_experts_per_tok) :
-                    FastllmCudaV41MarlinGraphReady(key, work->seqlen));
+                ready &= FastllmCudaV41MoeGraphReady(
+                    key, work->seqlen, work->model.num_experts_per_tok);
             }
         }
         if (work->graphReplay) {
@@ -4540,7 +4538,10 @@ namespace fastllm {
             std::string mainDevice = SelectDeviceFromMap(work->model.deviceMap, layer + 1,
                                                        work->model.block_cnt);
             if (mainDevice.empty()) mainDevice = V41Executor().GetFirstDeviceType();
-            ctx.parallelShared = !ggufMoe && work->single &&
+            // Resident backends share the same persistent branch workspace.
+            // The graph pass preserves serial edges for temporary/collective
+            // resource conflicts instead of excluding checkpoint formats.
+            ctx.parallelShared = work->single &&
                 ((work->seqlen == 1 && !work->dsparkVerify) ||
                  (work->dsparkVerify && work->seqlen >= 2 && work->seqlen <= 8)) &&
                 ctx.hasSharedExpertOut && !work->dumpDebug &&

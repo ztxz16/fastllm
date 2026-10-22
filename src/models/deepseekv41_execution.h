@@ -47,7 +47,7 @@ namespace fastllm {
         std::function<void()> releaseSharedScratch;
         std::mutex *pipelineHostExperts = nullptr;
         int pipelineFirstLayer = -1;
-        bool parallelShared = false;  // Set only after native graph buffers pass validation.
+        bool parallelShared = false;  // Set only after resident graph buffers pass validation.
     };
 
     // Tensor-copy helpers shared with attention/KV code. They preserve graph

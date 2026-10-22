@@ -1395,6 +1395,7 @@ public:
         target.activeCalls++;
         state = &target;
         rank = rankIt->second;
+        FastllmCudaGraphRecordCollective();
         return true;
     }
 

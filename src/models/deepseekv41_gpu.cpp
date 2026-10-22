@@ -29,7 +29,7 @@ namespace fastllm {
         Data &moeInputTemp = ws->moeInputTemp, &moeOutputTemp = ws->moeOutputTemp;
 #ifdef USE_CUDA
         // Both branches only read ffnInput. Shared GEMV scratch/output and the
-        // routed Marlin buffers are distinct persistent allocations. Mark only
+        // resident routed buffers are distinct persistent allocations. Mark only
         // GPU decode/verification captures; eager and unsupported paths stay serial.
         auto markParallel = [&](int stage) {
             if (!ctx.parallelShared) return;
