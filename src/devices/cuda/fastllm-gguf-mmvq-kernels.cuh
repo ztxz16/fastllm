@@ -183,6 +183,7 @@ static void mul_mat_vec_q_cuda_T(
 #if !defined(USE_ROCM)
 #include "fastllm-gguf-iq3-gemv.cuh"
 #include "fastllm-gguf-q3-k-gemv.cuh"
+#include "fastllm-gguf-q4-k-gemv.cuh"
 #include "fastllm-gguf-small-mmvq.cuh"
 #endif
 
@@ -235,6 +236,14 @@ void mul_mat_vec_q_cuda(
     const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, const int64_t ids_nb0,
     cudaStream_t stream) {
 #if !defined(USE_ROCM)
+    if constexpr (StoreMode == 0 && type == GGML_TYPE_Q4_K) {
+        if (ncols_y == 1 && ne2 == 1 && ids_data == nullptr && nrows_dst >= nrows_x &&
+            fastllm_gguf_q4_k::Supports(vx, vy, ncols_x, nrows_x)) {
+            fastllm_gguf_q4_k::Launch(vx, static_cast<const block_q8_1 *>(vy), dst,
+                                     ncols_x, nrows_x, stream);
+            return;
+        }
+    }
     if constexpr (StoreMode == 0 && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
         if ((ncols_y == 1 || (type == GGML_TYPE_Q6_K && ncols_y >= 2 && ncols_y <= 4)) &&
             ne2 == 1 && !ids_data && nrows_dst >= nrows_x &&
