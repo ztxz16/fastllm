@@ -743,6 +743,16 @@ def weight_costs(tensors, model, args):
             if layer is None:
                 raise ValueError("Hybrid auto: cannot place expert " + name)
             expert[layer] += size
+        elif model.family == "deepseek_v41" and name in ("head.weight", "head.scale", "norm.weight"):
+            # PP samples on its final stage. TP retains the conservative
+            # replicated bound, as it does for other decoder projections.
+            dense[model.layers - 1] += size
+        elif model.family == "deepseek_v41" and (
+                name.startswith(("vision.", "aligner.")) or
+                name in ("image_start", "image_end", "image_newline")):
+            # Text-only auto loads the idle vision tower on the host; it is
+            # never replicated onto every decoder pipeline stage.
+            host += size
         elif layer is None:
             common += size
         else:
@@ -782,13 +792,11 @@ def _workspace_bytes(args, model, rows, context, mode, resident):
     scores = _score_workspace(model, rows, context)
     dense = model.hidden * model.intermediate * 3 * 2
     phase = model.disk_prefill
-    # V4.1's NUMA prefill also keeps routed-expert intermediates in the
-    # reusable host-side staging path.  Charging the generic CUDA top-k
-    # intermediate tensor here multiplies rows by every expert route even
-    # though NUMA experts are never materialized on the GPU.  Keep the same
-    # phase bound used by disk prefill for the all-host NUMA/PP case; resident
-    # CUDA expert layers and TP retain the generic bound below.
-    reusable = (phase and args.moe_device in ("disk", "numa") and resident == 0 and mode == "pp" and
+    # PP releases attention temporaries between phases even when some expert
+    # layers are CUDA-resident. The resident GGUF route buffers survive those
+    # releases and are charged separately below.
+    resident_gguf = resident and all(layer in model.gguf_expert_bytes for layer in range(resident))
+    reusable = (phase and args.moe_device in ("disk", "numa") and (resident == 0 or resident_gguf) and mode == "pp" and
                 args.max_batch == 1 and rows > phase["window"] and args.fast_prefill and
                 args.dtype == "auto" and args.moe_dtype in ("", "auto") and
                 args.atype in ("auto", "bfloat16") and args.moe_atype in ("", "auto", "bfloat16") and
@@ -808,7 +816,23 @@ def _workspace_bytes(args, model, rows, context, mode, resident):
               128 * MiB + dense)
     moe = rows * (10 * model.hidden + 6 * model.intermediate + 8 * (topk + 1) +
                   4 * model.experts) + expert
-    return rows * phase["retained"] + max(attention, woa, moe) + 32 * MiB
+    resident_scratch = 0
+    if resident_gguf:
+        # FastllmCudaMergeMOEV41GGUFResident: BF16 gate/up/activation and
+        # per-route output, Q8_1 inputs, plus the grouped MMQ workspace.
+        # Larger batches use the per-expert fallback; bound its temporaries
+        # too, without retaining a full FP32 top-k tensor for every phase.
+        n = min(rows, 4096)
+        routes = n * topk
+        capacity = math.ceil((routes + model.experts * 15) / 16) * 16
+        grouped = capacity * (math.ceil(max(model.hidden, model.intermediate) / 256) * 288 +
+                              max(model.hidden, 2 * model.intermediate) * 4)
+        grouped += (3 * model.experts + 1 + capacity // 16 + capacity + routes) * 4 + 8 * 256
+        resident_scratch = (routes * (6 * model.intermediate + 2 * model.hidden) +
+                            (n * model.hidden + routes * model.intermediate) * 36 // 32 + grouped)
+        fallback = rows * (8 * model.hidden + 6 * model.intermediate) + dense
+        resident_scratch = max(resident_scratch, fallback)
+    return rows * phase["retained"] + max(attention, woa, moe) + resident_scratch + 32 * MiB
 
 
 def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_gpu=False,
@@ -939,12 +963,23 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                         kv_bytes = math.ceil(kv_bytes / min(len(mapping), model.tp_kv_heads))
                     used[d] += dense_bytes + kv_bytes + batch * (speculative + 1) * model.state[layer]
                 if resident_bytes:
+                    allocation_overhead = 0
+                    if (model.family == "deepseek_v41" and layer in model.gguf_expert_bytes and
+                            not getattr(args, "cuda_slab", None)):
+                        # Gate/up is merged with a separate down matrix. With
+                        # slabs disabled, allow a CUDA allocation page per
+                        # matrix instead of treating file bytes as device use.
+                        allocation_overhead = 2 * model.experts * 2 * MiB
                     expert_targets = list(mapping) if mode == "tp" else [
                         layer_device(owner, resident, mapping) if owner < model.layers else next(reversed(mapping))]
                     for d in expert_targets:
-                        used[d] += math.ceil(resident_bytes / len(expert_targets))
+                        used[d] += math.ceil(resident_bytes / len(expert_targets)) + allocation_overhead
             for d in mapping:
                 used[d] += reallocation[d]
+                # Upload rings are created on the main device executing the
+                # host-backed expert layer, not on GPU-only pipeline stages.
+                if not host_by_device[d]:
+                    used[d] -= transport
             if host_experts == 0 and (not allow_full_gpu or streaming):
                 continue
             remaining = {d: gpu_limit[d] - used[d] for d in mapping}
@@ -966,7 +1001,14 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             # individual budgets. Explicit caches and TP retain uniform budgets.
             cuda_cache = max(cache.values())
             # One streamed load group, host input/output staging and tokenizer.
-            host_required = host + max(largest, max(experts, default=0)) + GiB + workspace
+            staging = max(largest, max(experts, default=0))
+            # V4.1 PP projections move to CUDA during loading. Its conversion
+            # scratch is retired before allocating request workspace.
+            early_cuda = (model.family == "deepseek_v41" and mode == "pp" and
+                          "FASTLLM_DSV41_DUMP_DIR" not in os.environ and
+                          os.environ.get("FASTLLM_DSV41_REFERENCE_MATH", "0") in ("", "0"))
+            host_workspace = max(staging, workspace) if early_cuda else staging + workspace
+            host_required = host + host_workspace + GiB
             if args.moe_device != "disk":
                 host_required += host_experts
                 pinned = os.environ.get("FT_PINNED_WEIGHT", "1").lower() not in ("0", "false", "off")

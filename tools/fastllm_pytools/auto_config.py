@@ -170,6 +170,41 @@ def topologies(args, explicit, hardware, gpu, family=None):
             yield "cuda:" + ",".join(map(str, ids)), "cuda:" + ",".join(map(str, ids)), "tp", {d: 1 for d in ids}
 
 
+def capacity_pp_topologies(model, costs, layouts, gpu):
+    """Try contiguous expert partitions when compute-balanced PP cannot fit.
+
+    Quantized layers need not have equal sizes. Minimize the largest fraction
+    of a card occupied by resident experts; the capacity solver subsequently
+    checks dense weights, KV, workspaces and host memory without relaxing them.
+    """
+    prefix = [0]
+    for size in costs[0][:model.layers]:
+        prefix.append(prefix[-1] + size)
+    seen = {tuple(mapping.items()) for _, _, mode, mapping in layouts if mode == "pp"}
+    for _, _, mode, mapping in layouts:
+        ids = list(mapping)
+        if mode != "pp" or len(ids) < 2:
+            continue
+        states = {0: (0., ())}
+        for device in ids:
+            next_states = {}
+            for end in range(1, model.layers + 1):
+                options = ((max(score, (prefix[end] - prefix[start]) / max(1, gpu[device]["free"])),
+                            counts + (end - start,))
+                           for start, (score, counts) in states.items() if start < end)
+                best = min(options, default=None)
+                if best is not None:
+                    next_states[end] = best
+            states = next_states
+        for _, counts in states.values():
+            divisor = math.gcd(*counts)
+            weighted = {d: n // divisor for d, n in zip(ids, counts)}
+            key = tuple(weighted.items())
+            if key not in seen:
+                seen.add(key)
+                yield repr({"cuda:%d" % d: n for d, n in weighted.items()}), "off", "pp", weighted
+
+
 def latency_score(candidate, model, costs, args, mode, mapping, hardware, peers):
     """Relative latency for a 4K prompt + 512 outputs; no model reload/search.
 
@@ -358,6 +393,11 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if disable_qwen3_graph:
         graph_enabled = False
     apply_model_defaults(base, metadata)
+    if (model.family == "deepseek_v41" and "cuda_slab" not in explicit and
+            any(t.kind.startswith("gguf:") and memory._is_routed_expert(t.name) for t in tensors)):
+        # Thousands of standalone GGUF expert allocations waste CUDA pages.
+        # Reuse the existing persistent weight slabs; explicit zero still wins.
+        base.cuda_slab = 64
     if base.max_batch <= 0:
         base.max_batch = 1
     # Qwen3.5 targets the native window; DeepSeek V4.1 targets 1M.
@@ -383,7 +423,11 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if model.family == "qwen35":
         return _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model,
                                      info, gpu, ram, numa)
-    backends = [base.moe_device] if "moe_device" in explicit and base.moe_device else ["numa" if numa else "cpu", "disk"]
+    backends = ["numa" if numa else "cpu", "disk"]
+    if model.family == "deepseek_v41" and numa:
+        backends.insert(1, "cpu")
+    if "moe_device" in explicit and base.moe_device:
+        backends = [base.moe_device]
     tables = [base.ngram_device] if "ngram_device" in explicit else ["cpu", "disk"]
     table_bytes = sum(t.bytes for t in tensors if memory.is_lookup_table(t.name))
     if "ngram_device" not in explicit and table_bytes > max(4 * memory.GiB, ram["total"] // 10):
@@ -408,7 +452,16 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                 memory.validate_options(trial)
                 cached_costs = None
                 implicit_embedding_bytes = None
-                for device, tp, mode, mapping in topologies(trial, explicit, info, gpu):
+                layouts = list(topologies(trial, explicit, info, gpu))
+                def candidates():
+                    yield from layouts
+                    # Preserve the normal fast path. Before falling back to
+                    # disk, also try partitions balanced by resident bytes.
+                    if (model.family == "deepseek_v41" and not choices and
+                            backend != "disk" and cached_costs is not None and
+                            not {"device", "tp"} & explicit and not os.environ.get("FASTLLM_TP")):
+                        yield from capacity_pp_topologies(model, cached_costs, layouts, gpu)
+                for device, tp, mode, mapping in candidates():
                     if any(d not in gpu for d in mapping):
                         raise ValueError("--auto: selected CUDA ordinal is not visible")
                     trial.device, trial.tp = device, tp
@@ -442,7 +495,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                             chunk = p["chunked_prefill_size"] if model.family == "deepseek_v41" else 0
                             return (chunk, placement, -score, -p["host_estimated_bytes"], -p["resident_layers"])
                         variants = [prepared]
-                        if (model.family == "deepseek_v41" and backend == "disk" and
+                        if (model.family == "deepseek_v41" and
                                 not prepared.low_gpu_mem and not {"cuda_embedding", "low_gpu_mem"} & explicit):
                             low = copy.copy(prepared)
                             low.low_gpu_mem, low.cuda_embedding = True, False
@@ -469,7 +522,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                             rank(item[0])[0], item[2], rank(item[0])[1:]))
                         if prepared.low_gpu_mem and model.family == "deepseek_v41":
                             result["low_gpu_mem"] = True
-                            notes.append("Disk hybrid uses CPU embedding to leave GPU memory for prefill and expert cache")
+                            notes.append("Hybrid uses CPU embedding to leave GPU memory for prefill and experts")
                     except ValueError as error:
                         rejection = str(error)
                         continue
@@ -549,11 +602,14 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                "atype", "kv_cache_dtype", "max_context_length", "tokens", "max_batch", "kvmem",
                "low_gpu_mem", "cuda_embedding", "cache_history", "prefix_cache",
                "dspark", "speculative_algorithm", "fast_prefill")
+    if model.family == "deepseek_v41":
+        changed += ("cuda_slab",)
+        result["cuda_slab"] = chosen.cuda_slab
     result["automatic"] = {"policy": "interactive-4k-input-512-output", "topology_candidates": len(choices),
                            "ranking": "estimated latency; not measured throughput", "mtp": args.mtp}
     if model.family == "deepseek_v41":
         result["automatic"]["ranking"] = (
-            "largest feasible chunk at fixed context; PP preferred for "
+            "non-disk experts first; largest feasible chunk at fixed context; PP preferred for "
             "automatic host-backed hybrid; estimated latency"
         )
     result["automatic"]["kv_streaming"] = "kvmem" in result

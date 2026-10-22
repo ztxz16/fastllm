@@ -88,6 +88,20 @@ class AutoConfigTest(unittest.TestCase):
         self.assertEqual((p['mode'], a.chunked_prefill_size), ('pp', 8192))
         self.assertEqual(a.moe_device, 'numa')
 
+    def test_deepseek_gguf_auto_slabs_honor_explicit_opt_out(self):
+        self.g.family = 'deepseek_v41'
+        tensors = [memory.Tensor('layers.0.ffn.experts.0.w2.weight', (256, 256), 1 << 20, 'gguf:12')]
+        with patch.object(memory, 'model_inputs', return_value=({}, tensors, self.g)), \
+                patch.object(memory, 'geometry', return_value=self.g), \
+                patch.object(memory, 'weight_costs', return_value=self.costs), \
+                patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+            for flags, expected in [((), 64), (('--cuda_slab', '0'), 0), (('--cuda_slab', '32'), 32)]:
+                a = self.args(*flags)
+                p = auto.resolve(a, self.gpu.__getitem__, hardware=self.hardware,
+                                 ram=self.ram, use_numa=True)
+                self.assertEqual(a.cuda_slab, expected)
+                self.assertEqual(p['cuda_slab'], expected)
+
     def test_deepseek_implicit_embedding_is_charged_before_chunk_selection(self):
         self.g.family = 'deepseek_v41'
         def costs(tensors, model, a):
@@ -310,6 +324,53 @@ class AutoConfigTest(unittest.TestCase):
         a = self.args('--max_batch', '4', '--max_context_length', '8192', '--kv_cache_dtype', 'fp8_e4m3')
         self.resolve(a)
         self.assertEqual((a.max_batch, a.max_context_length, a.tokens, a.kv_cache_dtype), (4, 8192, 32768, 'fp8_e4m3'))
+
+    def test_unequal_expert_layers_use_weighted_pp_before_disk(self):
+        self.g.family = 'deepseek_v41'
+        self.g.layers = 6
+        self.g.kv = [1024] * 6
+        self.g.state = [1 << 20] * 6
+        self.costs = ([GiB] * 3 + [2 * GiB] * 3, [1 << 20] * 6, 0, 0, 2 * GiB, False)
+        self.gpu = {d: dict(total=4 * GiB, free=4 * GiB) for d in range(3)}
+        info = {d: self.hardware[0][0].copy() for d in self.gpu}
+        self.hardware = info, {(a, b): True for a in info for b in info}
+        self.ram = dict(total=7 * GiB, available=7 * GiB)
+        p = self.resolve(self.args('--max_context_length', '4096'))
+        self.assertEqual(p['moe_device'], 'numa')
+        self.assertEqual(p['mode'], 'pp')
+        self.assertEqual(p['resident_layers'], 5)
+        self.assertEqual(p['device'], "{'cuda:0': 2, 'cuda:1': 2, 'cuda:2': 1}")
+        self.assertEqual(p['moe_cpu_cache'], 0)
+        # An explicit layout must not silently become a different partition.
+        fixed = self.resolve(self.args('--max_context_length', '4096', '--device', 'cudapp=0,1,2'))
+        self.assertEqual(fixed['device'], 'cudapp=0,1,2')
+        self.assertEqual(fixed['moe_device'], 'disk')
+
+    def test_v41_capacity_fallback_does_not_change_other_families(self):
+        for family in ('qwen3', 'qwen4', 'glm5'):
+            with self.subTest(family=family):
+                self.g.family = family
+                backends = []
+                original = memory.prepare
+                def prepare(a, *rest, **kwargs):
+                    backends.append(a.moe_device)
+                    if a.moe_device == 'numa':
+                        raise ValueError('Force existing disk fallback')
+                    return original(a, *rest, **kwargs)
+                with patch.object(memory, 'prepare', side_effect=prepare), \
+                        patch.object(auto, 'capacity_pp_topologies') as weighted:
+                    p = self.resolve(self.args())
+                self.assertEqual(set(backends), {'numa', 'disk'})
+                self.assertEqual(p['moe_device'], 'disk')
+                self.assertNotIn('cuda_slab', p)
+                weighted.assert_not_called()
+
+    def test_capacity_pp_ratios_are_unique_after_normalization(self):
+        layouts = [('cudapp=0,1', 'off', 'pp', {0: 1, 1: 1})]
+        mappings = [mapping for _, _, _, mapping in
+                    auto.capacity_pp_topologies(self.g, self.costs, layouts, self.gpu)]
+        self.assertNotIn({0: 1, 1: 1}, mappings)
+        self.assertEqual(len(mappings), len({tuple(m.items()) for m in mappings}))
 
     def test_default_128k_and_explicit_total_capacity(self):
         self.g.context = 262144

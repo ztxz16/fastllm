@@ -309,6 +309,19 @@ class HybridAutoTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 auto.weight_costs(t, replace(g, family=family), args())
 
+    def test_deepseek_pp_head_and_idle_vision_are_not_replicated(self):
+        g = auto.geometry(self.dspark_metadata(), "float16", 0)
+        tensors = [auto.Tensor("layers.0.ffn.experts.0.w1.weight", (8, 8), 64, "gguf:1"),
+                   auto.Tensor("head.weight", (16, 8), 256, "BF16"),
+                   auto.Tensor("norm.weight", (8,), 32, "F32"),
+                   auto.Tensor("vision.blocks.0.attn.wqkv.weight", (8, 8), 128, "F16"),
+                   auto.Tensor("aligner.w1.weight", (8, 8), 128, "F16"),
+                   auto.Tensor("image_start", (8,), 32, "F32")]
+        _, dense, common, host, _, _ = auto.weight_costs(tensors, g, args())
+        self.assertEqual(common, 0)
+        self.assertEqual(dense, [0, 0, 0, 544])
+        self.assertEqual(host, 288)
+
     def test_hf_weight_conversion_counts_unpacked_values(self):
         g, _, _, _ = fixture()
         a = args(dtype="float16", moe_cuda_cache=0)
@@ -625,6 +638,64 @@ class HybridAutoTest(unittest.TestCase):
         resident = auto.plan(a, g, costs, "pp", {0: 1},
                              {0: dict(total=32*GiB, free=32*GiB)}, ram, allow_full_gpu=True)
         self.assertEqual(resident["expert_transport_bytes_per_device"], 0)
+
+    def test_v41_transport_only_charges_stages_with_host_experts(self):
+        g = auto.geometry(self.dspark_metadata(), "float16", 0)
+        a = args(tokens=4096, max_context_length=4096, moe_device_layers=2, moe_cuda_cache=0)
+        costs = ([GiB] * 4, [MiB] * 4, 0, 0, MiB, False)
+        gpu = {d: dict(total=16 * GiB, free=16 * GiB) for d in (0, 1)}
+        ram = dict(total=64 * GiB, available=64 * GiB)
+        native = auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+        g.gguf_expert_bytes = {2: 13 * MiB}
+        packed = auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+        self.assertEqual(packed["gpu_estimated_bytes"][0], native["gpu_estimated_bytes"][0])
+        self.assertEqual(packed["gpu_estimated_bytes"][1] - native["gpu_estimated_bytes"][1],
+                         96 * 13 * MiB + 272 * MiB)
+
+    def test_v41_resident_gguf_prefill_uses_phase_workspace(self):
+        metadata = self.dspark_metadata()
+        metadata['quantization_config'] = dict(quant_method='fp8', expert_dtype='fp4',
+                                                weight_block_size=[32, 32])
+        g = auto.geometry(metadata, 'fp4', 0)
+        a = args(fast_prefill=True, atype='bfloat16')
+        g.gguf_expert_bytes = {i: MiB for i in range(g.layers)}
+        with patch.dict(os.environ, {}, clear=True):
+            host = auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0)
+            resident = auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 2)
+            generic = auto._workspace_bytes(a, g, 4096, 1048576, 'tp', 2)
+            self.assertGreater(resident, host)  # resident route/MMQ buffers stay live
+            self.assertLess(resident, generic)
+            del g.gguf_expert_bytes[1]
+            self.assertEqual(auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 2), generic)
+
+    def test_v41_host_staging_is_reused_only_with_early_cuda_placement(self):
+        g = auto.geometry(self.dspark_metadata(), 'float16', 0)
+        a = args(tokens=4096, max_context_length=4096, moe_device_layers=2,
+                 moe_cuda_cache=0, fast_prefill=False)
+        costs = ([GiB] * 4, [MiB] * 4, 0, 0, MiB, False)
+        gpu = {0: dict(total=16 * GiB, free=16 * GiB)}
+        ram = dict(total=64 * GiB, available=64 * GiB)
+        with patch.dict(os.environ, {}, clear=True):
+            native = auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram)
+            for flag, value in [('FASTLLM_DSV41_REFERENCE_MATH', '1'),
+                                ('FASTLLM_DSV41_DUMP_DIR', '/tmp/v41-dump')]:
+                with patch.dict(os.environ, {flag: value}):
+                    debug = auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram)
+                self.assertEqual(debug['host_estimated_bytes'] - native['host_estimated_bytes'],
+                                 native['workspace_bytes_per_device'])
+
+    def test_v41_without_slabs_accounts_for_resident_allocation_pages(self):
+        g = auto.geometry(self.dspark_metadata(), 'float16', 0)
+        g.gguf_expert_bytes = {0: 4 * MiB, 1: 4 * MiB}
+        a = args(tokens=4096, max_context_length=4096, moe_device_layers=2,
+                 moe_cuda_cache=0, cuda_slab=64)
+        costs = ([GiB] * 4, [MiB] * 4, 0, 0, MiB, False)
+        gpu = {0: dict(total=4 * GiB, free=4 * GiB)}
+        ram = dict(total=64 * GiB, available=64 * GiB)
+        self.assertEqual(auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram)['resident_layers'], 2)
+        a.cuda_slab = 0
+        with self.assertRaises(ValueError):
+            auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram)
 
     def test_v41_later_index_sources_share_persistent_keys(self):
         md = self.dspark_metadata()
