@@ -1008,6 +1008,9 @@ bool FastllmCudaDeepSeekV41HybridSparseAttention(const fastllm::Data &q, const f
                                            int windowSize, int startPos, float softmaxScale,
                                            fastllm::Data &output);
 bool FastllmCudaDeepSeekV41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring, int startPos, int windowSize);
+// rowCount limits writes to a prefix without changing the source batch stride; -1 writes all rows.
+bool FastllmCudaDeepSeekV41WindowStorePrefix(const fastllm::Data &chunk, fastllm::Data &ring,
+                                            int startPos, int windowSize, int rowCount);
 bool FastllmCudaDeepSeekV41QuantizeActivation(const fastllm::Data &input, fastllm::Data &output);
 // Input has already undergone block-32 FP8 activation quantization.
 bool FastllmCudaDeepSeekV41LinearBlock32(const fastllm::Data &input, fastllm::Data &weight,

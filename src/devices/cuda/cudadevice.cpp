@@ -7067,9 +7067,10 @@ namespace fastllm {
 
     void CudaDeepSeekV41WindowStoreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        if (!FastllmCudaDeepSeekV41WindowStore(*(datas.find("chunk")->second), *(datas.find("ring")->second),
+        if (!FastllmCudaDeepSeekV41WindowStorePrefix(*(datas.find("chunk")->second), *(datas.find("ring")->second),
                                                CudaV41Int(intParams, "startPos", 0),
-                                               CudaV41Int(intParams, "windowSize", 128))) {
+                                               CudaV41Int(intParams, "windowSize", 128),
+                                               CudaV41Int(intParams, "rowCount", -1))) {
             ErrorInFastLLM("DeepSeekV41WindowStore CUDA error: kernel rejected input.\n");
         }
     }

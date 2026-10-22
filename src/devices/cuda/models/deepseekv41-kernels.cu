@@ -4799,12 +4799,15 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     return V41CheckLaunch("SparseAttention");
 }
 
-extern "C" bool FastllmCudaDeepSeekV41WindowStorePosition(const fastllm::Data &chunk, fastllm::Data &ring, int startPos,
-                                                  int windowSize, const int *devicePosition) {
-    if (!V41OnCuda(chunk) || chunk.dims.size() != 3) {
+static bool V41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring, int startPos,
+                           int windowSize, const int *devicePosition, int rowCount) {
+    if (!V41OnCuda(chunk) || chunk.dims.size() != 3 || windowSize <= 0) {
         return false;
     }
     int bsz = chunk.dims[0], seqlen = chunk.dims[1], dim = chunk.dims[2];
+    if (rowCount == -1) rowCount = seqlen;
+    if (rowCount < 0 || rowCount > seqlen) return false;
+    if (rowCount == 0) return true;
     if (ring.dims.size() != 3 || ring.dims[0] != bsz || ring.dims[1] != windowSize || ring.dims[2] != dim ||
         ring.dataType != chunk.dataType || !V41OnCuda(ring)) {
         if (!V41PrepareOutput(ring, chunk.dataType, {bsz, windowSize, dim})) {
@@ -4813,16 +4816,26 @@ extern "C" bool FastllmCudaDeepSeekV41WindowStorePosition(const fastllm::Data &c
         cudaMemset(ring.cudaData, 0, (size_t)ring.Count(0) * ring.unitSize / ring.unitSizeDiv);
     }
     int rowBytes = dim * chunk.unitSize;
-    int firstRow = std::max(0, seqlen - windowSize);
-    dim3 grid(seqlen - firstRow, bsz);
+    int firstRow = std::max(0, rowCount - windowSize);
+    dim3 grid(rowCount - firstRow, bsz);
     V41WindowStoreKernel<<<grid, 256>>>((const uint8_t*)chunk.cudaData, (uint8_t*)ring.cudaData, seqlen, rowBytes,
                                         startPos, windowSize, firstRow, devicePosition);
     return V41CheckLaunch("WindowStore");
 }
 
+extern "C" bool FastllmCudaDeepSeekV41WindowStorePosition(const fastllm::Data &chunk, fastllm::Data &ring,
+                                                        int startPos, int windowSize, const int *devicePosition) {
+    return V41WindowStore(chunk, ring, startPos, windowSize, devicePosition, -1);
+}
+
 extern "C" bool FastllmCudaDeepSeekV41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring,
-                                                  int startPos, int windowSize) {
-    return FastllmCudaDeepSeekV41WindowStorePosition(chunk, ring, startPos, windowSize, nullptr);
+                                                int startPos, int windowSize) {
+    return V41WindowStore(chunk, ring, startPos, windowSize, nullptr, -1);
+}
+
+extern "C" bool FastllmCudaDeepSeekV41WindowStorePrefix(const fastllm::Data &chunk, fastllm::Data &ring,
+                                                      int startPos, int windowSize, int rowCount) {
+    return V41WindowStore(chunk, ring, startPos, windowSize, nullptr, rowCount);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41QuantizeActivation(const fastllm::Data &input, fastllm::Data &output) {

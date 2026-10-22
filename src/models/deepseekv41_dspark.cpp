@@ -326,10 +326,10 @@ namespace fastllm {
                              {{"windowSize", windowSize}, {"startPos", startPos}});
         }
 
-        void DsWindowStore(const Data &chunkKV, Data &ring, int startPos, int windowSize) {
+        void DsWindowStore(const Data &chunkKV, Data &ring, int startPos, int windowSize, int rowCount = -1) {
             DsExecutor().Run("DeepSeekV41WindowStore", {
                 {"chunk", (Data*)&chunkKV}, {"ring", &ring}
-            }, {}, {{"startPos", startPos}, {"windowSize", windowSize}});
+            }, {}, {{"startPos", startPos}, {"windowSize", windowSize}, {"rowCount", rowCount}});
         }
 
         float DsSoftplus(float x) {
@@ -1514,10 +1514,6 @@ namespace fastllm {
                         "DeepSeekV41 DSpark: invalid accepted prefix length.");
         ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
         const int newLen = startPos + accept;
-        // Rejected suffixes require temporary prefix copies. Keep every copy
-        // alive until the whole commit completes, rather than synchronizing
-        // both ranks after each layer's WindowStore.
-        std::vector<Data> acceptedRows(accept < forwarded ? block_cnt : 0);
 #ifdef USE_CUDA
         ScopedTpDispatch commitDispatch(v41DsparkTpDevices.size() > 1, v41DsparkTpDevices);
 #endif
@@ -1525,13 +1521,9 @@ namespace fastllm {
             DeepSeekV41LayerCache &cache = state.layers[layer];
             // 1) 滑窗环形缓冲：只写入被接受的行
             if (layer < (int)scratch.windowKV.size() && scratch.windowKV[layer].dims.size() == 3) {
-                if (accept == forwarded) {
-                    DsWindowStore(scratch.windowKV[layer], cache.windowKV, startPos, window_size);
-                } else {
-                    Data &rows = acceptedRows[layer];
-                    Split(scratch.windowKV[layer], 1, 0, accept, rows);
-                    DsWindowStore(rows, cache.windowKV, startPos, window_size);
-                }
+                // Read the accepted prefix directly from each rank's scratch.
+                // Split would collapse replicas and broadcast them again.
+                DsWindowStore(scratch.windowKV[layer], cache.windowKV, startPos, window_size, accept);
             }
             cache.totalLen = newLen;
             // 2) 压缩 KV / indexer key：截断行数并重建 rawTail

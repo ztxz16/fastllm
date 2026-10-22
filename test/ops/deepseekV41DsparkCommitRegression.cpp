@@ -61,7 +61,7 @@ int main() {
         m.engram_layer_ids.clear();
         m.v41DsparkTpDevices = dev;
         int cases = 0;
-        for (int pos : {1, 2, 127, 128})
+        for (int pos : {1, 2, 127, 128, 8191, 8192})
             for (int forward = 2; forward <= 8; ++forward)
                 for (int accept = 1; accept <= forward; ++accept) {
                     DeepSeekV41RequestState state;
@@ -82,9 +82,12 @@ int main() {
                     Fill(cache.rawTailScore, FLOAT32, 2, dev, 0);
                     Fill(cache.compressedKV, BFLOAT16, (pos + forward) / 2, dev, 0);
                     Fill(cache.indexK, BFLOAT16, (pos + forward) / 2, dev, 0);
-                    std::vector<void *> addr;
-                    for (int d : dev)
+                    std::vector<void *> addr, ringAddr, inputAddr;
+                    for (int d : dev) {
                         addr.push_back(cache.rawTailKV.multiDeviceDatas.at(d)->cudaData);
+                        ringAddr.push_back(cache.windowKV.multiDeviceDatas.at(d)->cudaData);
+                        inputAddr.push_back(scratch.windowKV[0].multiDeviceDatas.at(d)->cudaData);
+                    }
                     m.DsparkCommitPrefix(state, scratch, pos, accept, forward);
                     Req(state.totalLen == pos + accept && cache.compressedBlocks == (pos + accept) / 2 &&
                             cache.rawTail == (pos + accept) % 2,
@@ -92,6 +95,15 @@ int main() {
                     for (int i = 0; i < accept; ++i)
                         std::copy_n(input.data() + i * 1024, 1024, ring.data() + ((pos + i) % 128) * 1024);
                     for (int d : dev) {
+                        Req(cache.windowKV.multiDeviceDatas.at(d)->cudaData == ringAddr[d] &&
+                            scratch.windowKV[0].multiDeviceDatas.at(d)->cudaData == inputAddr[d],
+                            "window commit moved storage");
+                        Req(Read(*scratch.windowKV[0].multiDeviceDatas.at(d), d) == input,
+                            "window commit modified scratch");
+                        for (Data *buffer : {&cache.compressedKV, &cache.indexK})
+                            Req(buffer->dims[1] == (pos + accept) / 2 &&
+                                buffer->multiDeviceDatas.at(d)->dims == buffer->dims,
+                                "compressed replica lengths mismatch");
                         Req(Read(*cache.windowKV.multiDeviceDatas.at(d), d) == ring,
                             "committed ring mismatch");
                         if (cache.rawTail) {
