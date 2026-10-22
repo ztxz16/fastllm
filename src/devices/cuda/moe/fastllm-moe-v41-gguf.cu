@@ -149,6 +149,17 @@ void Project(int type, const block_q8_1 *input, __nv_bfloat16 *output,
         Weights weights, const int32_t *indices,
         int experts, int topk, int routes, int columns, int rows) {
     const size_t shared = size_t(columns/32)*sizeof(block_q8_1);
+    if constexpr (Gate) {
+        // Amortize the staged IQ1_S codebook over four rows per warp.
+        if (type == GGML_TYPE_IQ1_S && rows >= 1024) {
+            constexpr int tile = 32;
+            V41GGUFProjection<GGML_TYPE_IQ1_S, Gate, Weights, tile>
+                <<<dim3((rows+tile-1)/tile, routes), 256, shared, cudaStreamPerThread>>>(
+                    input, output, weights, indices, experts, topk, columns, rows,
+                    ggml_row_size(GGML_TYPE_IQ1_S, columns));
+            return;
+        }
+    }
     if constexpr (!Gate) {
         // The V4.1 down projection reuses each Q8 activation across 16 rows.
         // Keep the four virtual-warp sums in their original order.
