@@ -10,6 +10,11 @@ bool FastllmCudaMergeMOEV41GGUFResident(
     int weightsBatch, const fastllm::Data &indices, const fastllm::Data &scores,
     float sharedScale, float swigluLimit);
 
+// Read-only admission for a previously warmed resident decode shape. The
+// model owns and validates graph workspace addresses; weight retirement
+// invalidates the resident pointer table and this readiness check together.
+bool FastllmCudaV41GGUFGraphReady(const fastllm::Data *layerKey, int rows, int topk);
+
 // Internal launcher; caller validates layouts and owns all scratch tensors.
 bool FastllmCudaRunV41GGUF(
     const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &activation,

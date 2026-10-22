@@ -240,6 +240,7 @@ static void CheckRegistration() {
 #endif
 static bool groupedTest = false;
 static bool sparseTest = false;
+static int graphReplays = 0;
 static int Case(int gt, int dt, int hidden, int inter, int device, bool missing) {
     FastllmCudaSetDevice(device);
     const int experts = sparseTest ? 384 : 8, topk = 6;
@@ -290,6 +291,8 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
         Data scores(FLOAT32, {rows, topk}, scales);
         for (auto *v : {&input, &indices, &scores}) v->ToDevice(CUDA, {device}, true);
         const float limit = pattern == 0 ? 0.f : .8f;
+        if (pattern == 0 && rows <= 32)
+            Check(!FastllmCudaV41GGUFGraphReady(weights[2], rows, topk), "unwarmed decode shape admitted");
         const bool accepted = FastllmCudaMergeMOEV41GGUFResident(input, gate, activation, workspace, output,
             weights.data(), weights.size(), indices, scores, 0.f, limit);
         if (groupedTest && (gt == GGML_TYPE_Q2_K || dt == GGML_TYPE_Q2_K)) {
@@ -298,6 +301,10 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
             continue;
         }
         Check(accepted, "resident dispatch rejected fixture");
+        if (pattern == 0 && rows <= 32) {
+            Check(FastllmCudaV41GGUFGraphReady(weights[2], rows, topk), "warm decode shape not admitted");
+            Check(!FastllmCudaV41GGUFGraphReady(weights[2], rows, topk - 1), "unwarmed top-k admitted");
+        }
         const auto actual = Read(output);
         if (cacheTest) CacheCompute(input,indices,scores,weights,actual,gt,dt,inter,limit,device);
         if (hybridTest) HybridAddition(input, indices, scores, weights, actual, limit, device);
@@ -332,7 +339,7 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
         fflush(stdout);
         if (!groupedTest) Check(different == 0, "indexed differs from per-token CUDA reference");
         else Check(std::sqrt(err2/std::max(norm2,1e-30)) < .002, "grouped differs materially from per-token CUDA reference");
-        if ((rows == 2 || rows == 64) && pattern == 1) {
+        if ((rows == 1 || rows == 2 || rows == 64) && pattern == 1) {
             cudaGraph_t graph; cudaGraphExec_t exec;
             Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
             Check(FastllmCudaMergeMOEV41GGUFResident(input, gate, activation, workspace, output,
@@ -341,16 +348,28 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
             Cuda(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
             Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
             Check(Read(output) == actual, "graph replay changed output");
-            // Replay must read changing routes, not baked-in host routing.
+            // Replays must consume changing routes, scores and activations.
+            // Include repeated/nonlocal routes and zero input to expose stale
+            // partials or pointers captured from a temporary host buffer.
             std::vector<int32_t> changed(rows*topk);
             Cuda(cudaMemcpy(changed.data(), indices.cudaData, changed.size()*4, cudaMemcpyDeviceToHost));
-            for (auto &e : changed) e = (e+3)%experts;
-            Cuda(cudaMemcpy(indices.cudaData, changed.data(), changed.size()*4, cudaMemcpyHostToDevice));
-            Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
-            const auto replayChanged = Read(output);
-            Check(FastllmCudaMergeMOEV41GGUFResident(input, gate, activation, workspace, output,
-                weights.data(), weights.size(), indices, scores, 0.f, limit), "changed-route dispatch");
-            Check(Read(output) == replayChanged, "graph replay did not consume changed GPU routes");
+            std::vector<uint16_t> originalInput(input.Count(0)), replayInput;
+            Cuda(cudaMemcpy(originalInput.data(), input.cudaData, originalInput.size()*2, cudaMemcpyDeviceToHost));
+            for (int replay = 0; replay < 4; ++replay) {
+                for (auto &e : changed) e = replay == 1 ? 3 : (e+3)%experts;
+                for (size_t i = 0; i < scales.size(); ++i) scales[i] = (int(i%7)-3)*(.125f+.03125f*replay);
+                replayInput = originalInput;
+                for (auto &v : replayInput) v = replay == 2 ? 0 : v ^ uint16_t(replay);
+                Cuda(cudaMemcpy(indices.cudaData, changed.data(), changed.size()*4, cudaMemcpyHostToDevice));
+                Cuda(cudaMemcpy(scores.cudaData, scales.data(), scales.size()*4, cudaMemcpyHostToDevice));
+                Cuda(cudaMemcpy(input.cudaData, replayInput.data(), replayInput.size()*2, cudaMemcpyHostToDevice));
+                Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+                const auto replayChanged = Read(output);
+                Check(FastllmCudaMergeMOEV41GGUFResident(input, gate, activation, workspace, output,
+                    weights.data(), weights.size(), indices, scores, 0.f, limit), "changed-route dispatch");
+                Check(Read(output) == replayChanged, "graph replay did not consume changed GPU inputs");
+                ++graphReplays;
+            }
             Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
         }
         checks++;
@@ -358,6 +377,12 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
 #ifdef USE_NUMAS
     if (cacheTest && !missing) CollectRegistrationFixture(weights,gt,dt,device);
 #endif
+    if (groupedTest)
+        Check(!FastllmCudaV41GGUFGraphReady(weights[2], 1, topk), "prefill alone admitted a decode graph");
+    Check(!FastllmCudaV41GGUFGraphReady(weights[2], 33, topk), "large batch admitted to decode graph");
+    // Retiring a non-key weight must invalidate the whole layer.
+    FastllmCudaReleaseMoeGGUFResident(weights[3]);
+    Check(!FastllmCudaV41GGUFGraphReady(weights[2], 1, topk), "retired resident layer admitted to graph");
     return checks;
 }
 
@@ -404,7 +429,7 @@ int main(int argc, char **argv) {
 #ifdef USE_NUMAS
         if (cacheTest) CheckRegistration();
 #endif
-        printf("PASS: V4.1 resident GGUF %s (%d checks)\n", cacheTest ? "canonical cache" : groupedTest ? "grouped prefill" : "indexed decode", checks);
+        printf("PASS: V4.1 resident GGUF %s (%d checks, %d changed-input graph replays)\n", cacheTest ? "canonical cache" : groupedTest ? "grouped prefill" : "indexed decode", checks, graphReplays);
         fflush(stdout);
         return 0;
     } catch(const std::exception &e) { fprintf(stderr,"FAIL: %s\n",e.what()); return 1; }

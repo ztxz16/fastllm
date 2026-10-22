@@ -457,6 +457,9 @@ struct ResidentLayer {
     void *table = nullptr;
     std::vector<const fastllm::Data *> sources;
     std::atomic<bool> retired{false};
+    // A pointer table built by prefill alone does not establish that the
+    // native V4.1 decode path and its scratch shape have been warmed.
+    std::atomic<uint32_t> v41DecodeTopks[32]{};
     ~ResidentLayer() {
         if (!table) return;
         int previous = -1;
@@ -1284,7 +1287,20 @@ bool FastllmCudaMergeMOEV41GGUFResident(
         output, layer->table, static_cast<const int32_t *>(indices.cudaData),
         static_cast<const float *>(scores.cudaData), layer->gateType, layer->downType,
         hidden, inter, layer->experts, topk, swigluLimit), "V4.1 resident GGUF CUDA launch failed.");
+    if (rows <= 32)
+        layer->v41DecodeTopks[rows - 1].fetch_or(uint32_t(1) << (topk - 1), std::memory_order_release);
     return true;
+}
+
+bool FastllmCudaV41GGUFGraphReady(const fastllm::Data *layerKey, int rows, int topk) {
+    if (!layerKey || rows < 1 || rows > 32 || topk < 1 || topk > 32) return false;
+    auto &registry = ResidentLayers();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    auto it = registry.layers.find(layerKey);
+    if (it == registry.layers.end()) return false;
+    const auto &layer = *it->second;
+    return layer.table && !layer.retired.load(std::memory_order_acquire) &&
+        (layer.v41DecodeTopks[rows - 1].load(std::memory_order_acquire) & (uint32_t(1) << (topk - 1)));
 }
 
 namespace v41_gguf_cache {
