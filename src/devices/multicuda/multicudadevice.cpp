@@ -6327,6 +6327,7 @@ auto st = std::chrono::system_clock::now();
         std::mutex mutex;
         bool initialized = false;
         DataType dataType = DataType::FLOAT32;
+        DataType outputType = DataType::FLOAT32;
         int topk = 0;
         int hidden = 0;
         int inter = 0;
@@ -6365,18 +6366,21 @@ auto st = std::chrono::system_clock::now();
             return data;
         }
 
-        bool Prepare(DataType nextDataType, const std::vector<int> &nextOutputDims,
+        bool Prepare(DataType nextDataType, DataType nextOutputType,
+                     const std::vector<int> &nextOutputDims,
                      int nextTopk, int nextHidden, int nextInter, size_t nextPacketBytes,
                      const std::vector<int> &nextDevices, int rootDevice) {
             std::lock_guard<std::mutex> lock(mutex);
             if (initialized) {
-                if (dataType != nextDataType || outputDims != nextOutputDims ||
+                if (dataType != nextDataType || outputType != nextOutputType ||
+                    outputDims != nextOutputDims ||
                     topk != nextTopk || hidden != nextHidden || inter != nextInter ||
                     packetBytes != nextPacketBytes || devices != nextDevices) {
                     return false;
                 }
             } else {
                 dataType = nextDataType;
+                outputType = nextOutputType;
                 outputDims = nextOutputDims;
                 topk = nextTopk;
                 hidden = nextHidden;
@@ -6384,8 +6388,8 @@ auto st = std::chrono::system_clock::now();
                 packetBytes = nextPacketBytes;
                 devices = nextDevices;
                 for (int device : devices) {
-                    w1[device] = AllocateCudaBuffer(dataType, {topk, inter}, device);
-                    output[device] = AllocateCudaBuffer(dataType, outputDims, device);
+                    w1[device] = AllocateCudaBuffer(dataType, {outputDims[0] * topk, inter}, device);
+                    output[device] = AllocateCudaBuffer(outputType, outputDims, device);
                     packet[device] = AllocateCudaBuffer(DataType::INT8, {(int)packetBytes}, device);
                 }
                 initialized = true;
@@ -6715,7 +6719,8 @@ auto st = std::chrono::system_clock::now();
                 (useVllmMarlin || batchOneDecode)) {
                 int topk = index->dims[1];
                 size_t hiddenBytes = input->GetBytes();
-                size_t routeBytes = (size_t)topk * sizeof(int32_t);
+                const int routeCount = input->dims[0] * topk;
+                size_t routeBytes = (size_t)routeCount * sizeof(int32_t);
                 size_t routeOffset = (hiddenBytes + alignof(int32_t) - 1) &
                                      ~(size_t)(alignof(int32_t) - 1);
                 size_t packetBytes = routeOffset + routeBytes * 2;
@@ -6736,7 +6741,7 @@ auto st = std::chrono::system_clock::now();
                     FastllmCudaPackMoeEpPacket(
                         gpuRoutePacket.cudaData, broadcastSource->cudaData, hiddenBytes,
                         (const int32_t*)broadcastIndexSource->cudaData,
-                        (const float*)broadcastScoreSource->cudaData, topk);
+                        (const float*)broadcastScoreSource->cudaData, routeCount);
                 }
 
                 // A single raw-byte collective carries the hidden state and
@@ -7338,9 +7343,22 @@ auto st = std::chrono::system_clock::now();
                 break;
             }
         }
-        bool useHybridEpCollectives = !deepSeekV41 && useExpertParallel &&
+        // Small hybrid batches can broadcast one persistent packet instead of
+        // rebuilding input/index/score replicas with three serial peer copies
+        // per rank. Keep the legacy single-row fallback for other weight types.
+        const bool packedHybridRoute = useExpertParallel && n >= 1 && n <= 8 &&
+            input.dims.size() == 2 && input.dims[0] == n &&
+            input.dataType == DataType::BFLOAT16 &&
+            index.dims.size() == 2 && score.dims == index.dims && topk > 0 && topk <= 16 &&
+            index.dataType == DataType::INT32 && score.dataType == DataType::FLOAT32 &&
+            index.dataDevice == DataDevice::CUDA && score.dataDevice == DataDevice::CUDA &&
+            index.cudaData != nullptr && score.cudaData != nullptr &&
+            GetPointerDeviceId(index.cudaData) == inputRootDevice &&
+            GetPointerDeviceId(score.cudaData) == inputRootDevice &&
+            MultiCudaEpHasCompactNvfp4LocalWeights(weights, wBatch, devices, 0);
+        bool useHybridEpCollectives = useExpertParallel &&
                                       !input.multiDeviceData && input.cudaData != nullptr &&
-                                      input.dims.size() > 0 && input.dims[0] == 1 &&
+                                      ((!deepSeekV41 && n == 1) || packedHybridRoute) &&
                                       index.dims.size() >= 2 && score.dims.size() >= 2 &&
                                       index.dataType == DataType::INT32 && score.dataType == DataType::FLOAT32 &&
                                       supportedCollectiveType && rootInCollective &&
@@ -7355,7 +7373,7 @@ auto st = std::chrono::system_clock::now();
             if (output.multiDeviceData) {
                 ResetMultiCudaTensor(output);
             }
-            output.dataType = input.dataType;
+            output.dataType = deepSeekV41 ? DataType::FLOAT32 : input.dataType;
             output.UpdateUnitSize();
             output.Resize(input.dims);
             output.dataDevice = DataDevice::CUDA;
@@ -7393,14 +7411,14 @@ auto st = std::chrono::system_clock::now();
                 int hidden = input.dims.back();
                 int inter = weights[3]->dims[1];
                 size_t hiddenBytes = input.GetBytes();
-                size_t routeBytes = (size_t)routeTopk * sizeof(int32_t);
+                size_t routeBytes = (size_t)n * routeTopk * sizeof(int32_t);
                 size_t routeOffset = (hiddenBytes + alignof(int32_t) - 1) &
                                      ~(size_t)(alignof(int32_t) - 1);
                 size_t packetBytes = routeOffset + routeBytes * 2;
                 MultiCudaMoeEpPersistentWorkspace &candidate =
                     GetMultiCudaMoeEpPersistentWorkspace(weights[2]);
                 if (packetBytes <= (size_t)std::numeric_limits<int>::max() &&
-                    candidate.Prepare(input.dataType, input.dims, routeTopk, hidden, inter,
+                    candidate.Prepare(input.dataType, output.dataType, input.dims, routeTopk, hidden, inter,
                                       packetBytes, devices, inputRootDevice)) {
                     persistentWorkspace = &candidate;
                 }
@@ -7464,7 +7482,9 @@ auto st = std::chrono::system_clock::now();
                     wBatch, sharedScale,
                     localOutput,
                     inputRootDevice, device, outputBytes,
-                    true, true, true, &input,
+                    // V4.1 keeps the established FP32 AllReduce order before
+                    // adding its shared expert and rounding once to BF16.
+                    true, true, !deepSeekV41 && n == 1, &input,
                     useGpuExpertRoute ? nullptr : &hostIndex,
                     useGpuExpertRoute ? nullptr : &hostScore,
                     useGpuExpertRoute, gpuRouteIndexSource, gpuRouteScoreSource,

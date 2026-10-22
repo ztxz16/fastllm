@@ -1415,6 +1415,13 @@ if (UNIT_TEST)
                 "PASS [0-9]+ borrowed CUDA conversions" 300)
             set_tests_properties(cudaBorrowedConversion PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+            add_executable(multiCudaHybridMoeRegression test/ops/multiCudaHybridMoeRegression.cpp)
+            target_link_libraries(multiCudaHybridMoeRegression PRIVATE fastllm)
+            target_include_directories(multiCudaHybridMoeRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(multiCudaHybridMoe multiCudaHybridMoeRegression
+                "PASS [0-9]+ hybrid EP batches" 300)
+            set_tests_properties(multiCudaHybridMoe PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
             add_executable(deepseekV41DsparkCommitRegression test/ops/deepseekV41DsparkCommitRegression.cpp)
             target_link_libraries(deepseekV41DsparkCommitRegression PRIVATE fastllm)
             target_include_directories(deepseekV41DsparkCommitRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
