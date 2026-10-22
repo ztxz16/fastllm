@@ -518,6 +518,60 @@ namespace {
         output[i] = result;
     }
 
+    // Pair adjacent BF16 values without changing the BF16 -> group-32 FP8
+    // rounding boundary. Each half warp owns one complete quantization group.
+    template <bool QUANTIZE>
+    __global__ void V41SharedSwigluBf16PairKernel(const __nv_bfloat162 *input,
+            __nv_bfloat162 *output, int pairs, int midPairs, float limit,
+            const float *routeScales) {
+        const int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= pairs) return;
+        const int row = i / midPairs;
+        const int offset = i + row * midPairs;
+        const float2 gates = __bfloat1622float2(input[offset]);
+        const float2 ups = __bfloat1622float2(input[offset + midPairs]);
+        float gate[2] = {gates.x, gates.y}, up[2] = {ups.x, ups.y};
+        __nv_bfloat16 result[2];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            if (limit > 0.0f) {
+                gate[j] = fminf(gate[j], limit);
+                up[j] = fmaxf(-limit, fminf(up[j], limit));
+            }
+            float value = (gate[j] / (1.0f + expf(-gate[j]))) * up[j];
+            if (routeScales != nullptr) value *= routeScales[row];
+            result[j] = __float2bfloat16_rn(value);
+        }
+        if constexpr (QUANTIZE) {
+            const float x = __bfloat162float(result[0]), y = __bfloat162float(result[1]);
+            float maximum = fmaxf(fabsf(x), fabsf(y));
+            const unsigned mask = __activemask();
+#pragma unroll
+            for (int offset = 8; offset; offset >>= 1)
+                maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, offset, 16));
+            const float scale = V41QuantScaleDev(maximum, 1);
+            result[0] = __float2bfloat16_rn(V41QuantValueDev(x, scale, 1));
+            result[1] = __float2bfloat16_rn(V41QuantValueDev(y, scale, 1));
+        }
+        output[i] = __halves2bfloat162(result[0], result[1]);
+    }
+
+    template <bool QUANTIZE>
+    void V41LaunchBf16Swiglu(const void *input, void *output, uint64_t count,
+                           int mid, float limit, const float *routeScales) {
+        // Tiny batches benefit more from the scalar kernel's extra active lanes.
+        if (count >= 32768 && mid % 2 == 0 && count <= INT_MAX / 2 &&
+            (uintptr_t)input % 4 == 0 && (uintptr_t)output % 4 == 0) {
+            const int pairs = count / 2;
+            V41SharedSwigluBf16PairKernel<QUANTIZE><<<(pairs + 127) / 128, 128>>>(
+                (const __nv_bfloat162*)input, (__nv_bfloat162*)output,
+                pairs, mid / 2, limit, routeScales);
+        } else {
+            V41SharedSwigluKernel<__nv_bfloat16, QUANTIZE><<<(count + 255) / 256, 256>>>(
+                (const __nv_bfloat16*)input, (__nv_bfloat16*)output, count, mid, limit, routeScales);
+        }
+    }
+
     // Ascending reduction tree matches FastllmGemvFp32Fp32Kernel2.
     // BF16 converts exactly to FP32 in registers; no activation cast buffer.
     __global__ void V41RouterScoresKernel(const __nv_bfloat16 *input, const float *weight,
@@ -3512,7 +3566,7 @@ static bool V41RunSharedSwiglu(const fastllm::Data &input, float limit, fastllm:
     const int blocks = (count + 255) / 256;
     auto out = (__nv_bfloat16 *)output.cudaData;
     if (input.dataType == DataType::BFLOAT16)
-        V41SharedSwigluKernel<__nv_bfloat16, QUANTIZE><<<blocks, 256>>>((const __nv_bfloat16 *)input.cudaData, out, count, mid, limit, routeScales);
+        V41LaunchBf16Swiglu<QUANTIZE>(input.cudaData, out, count, mid, limit, routeScales);
     else if (input.dataType == DataType::FLOAT16)
         V41SharedSwigluKernel<half, QUANTIZE><<<blocks, 256>>>((const half *)input.cudaData, out, count, mid, limit, routeScales);
     else
@@ -3524,8 +3578,7 @@ bool FastllmCudaDeepSeekV41BFloat16SwigluQuantized(const void *input, void *outp
         int rows, int intermediate, float limit, const float *routeScales) {
     if (!input || !output || rows <= 0 || intermediate <= 0 || intermediate % 32) return false;
     const uint64_t count = (uint64_t)rows * intermediate;
-    V41SharedSwigluKernel<__nv_bfloat16, true><<<(count + 255) / 256, 256>>>(
-        (const __nv_bfloat16 *)input, (__nv_bfloat16 *)output, count, intermediate, limit, routeScales);
+    V41LaunchBf16Swiglu<true>(input, output, count, intermediate, limit, routeScales);
     return V41CheckLaunch("BFloat16SwigluQuantized");
 }
 

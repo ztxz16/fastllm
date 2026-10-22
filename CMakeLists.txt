@@ -1413,6 +1413,13 @@ if (UNIT_TEST)
                 "PASS [0-9]+ TP8 DSpark commits" 300)
             set_tests_properties(deepseekV41DsparkCommit PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+            add_executable(deepseekV41SwigluRegression test/ops/deepseekV41SwigluRegression.cpp)
+            target_link_libraries(deepseekV41SwigluRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41SwigluRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(deepseekV41Swiglu deepseekV41SwigluRegression
+                "PASS [0-9]+ SwiGLU cases" 300)
+            set_tests_properties(deepseekV41Swiglu PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
             add_executable(deepseekV41EngramProjectionRegression test/ops/deepseekV41EngramProjectionRegression.cpp)
             target_link_libraries(deepseekV41EngramProjectionRegression PRIVATE fastllm)
             target_include_directories(deepseekV41EngramProjectionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
