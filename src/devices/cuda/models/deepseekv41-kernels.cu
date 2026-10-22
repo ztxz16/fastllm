@@ -5181,7 +5181,13 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
     p->config = c; p->buffers = b; p->device = FastllmCudaGetDevice();
     p->tiles = (c.window + (c.ratio ? c.topK : 0) + kMmaNC - 1) / kMmaNC;
     const int heads = (c.heads + kMmaHeads - 1) / kMmaHeads;
-    p->splits = c.verifying || c.batch * heads >= 128 ? 1 : c.batch >= 64 ? 2 : 8;
+    // Verification rows use the same independent QK tiles and value-dimension
+    // partitioning as decode. This keeps the 64-key online-softmax recurrence
+    // intact while exposing enough CTAs for small batches (including TP8).
+    // Large verification batches already have enough independent CTAs and
+    // retain the fused path; DSpark verification chunks contain 2--8 rows.
+    p->splits = (c.verifying && c.batch > 8) || c.batch * heads >= 128 ? 1 :
+                c.batch >= 64 ? 2 : 8;
     if (!V41MmaKernelReady<V41SparseAttentionScoresKernel<true>, kMmaThreads, sizeof(V41MmaShared)>()) return nullptr;
     if (p->splits == 1) {
         p->fused = V41MmaKernelReady<V41SparseAttentionMmaKernel<1, false, true>, kMmaThreads, sizeof(V41MmaShared)>();

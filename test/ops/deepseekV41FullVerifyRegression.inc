@@ -2,13 +2,15 @@
 // compressor stream and deferred ring writes, including changing cache pointers.
 static void RunVerifyRegression() {
     int checked = 0;
-    for (int tokens : {2, 3, 5, 6, 8})
+    for (int heads : {8, 17, 64})
+    for (int tokens : {2, 3, 4, 5, 6, 7, 8})
         for (int ratio : {0, 1, 2})
             for (int mask : {0, 1, 2}) {
                 if (!ratio && mask)
                     continue;
                 FastllmV41FullDecodeConfig c;
                 c.batch = tokens;
+                c.heads = heads;
                 c.verifying = true;
                 c.ratio = ratio;
                 c.kvSource = c.indexSource = ratio != 0;
@@ -20,12 +22,12 @@ static void RunVerifyRegression() {
                 const int maxBlocks = (c.maxKeys + c.blockSize - 1) / c.blockSize;
                 Data q, kv, out, iq, iw, sink, top, cand, raw, rawScore, joined, scores, latent,
                     newKeys, norm, saved, savedRaw, savedScore;
-                Fill(q, {1, tokens, 8, 512}, 1);
+                Fill(q, {1, tokens, heads, 512}, 1);
                 Fill(kv, {1, tokens, 512}, 2);
                 Fill(out, q.dims, 3);
                 Fill(iq, {1, tokens, 32, 128}, 4);
                 Fill(iw, {1, tokens, 32}, 5, FLOAT32);
-                Fill(sink, {8}, 6, FLOAT32);
+                Fill(sink, {heads}, 6, FLOAT32);
                 Fill(top, {1, tokens, 512}, 7, INT32);
                 Fill(cand, {1, tokens, maxBlocks}, 8, INT8);
                 Fill(raw, {1, tokens, 512}, 9, FLOAT32);
@@ -221,7 +223,7 @@ static void RunVerifyRegression() {
                 Cuda(cudaGraphExecDestroy(exec));
                 Cuda(cudaGraphDestroy(graph));
                 FastllmCudaV41DestroyFullDecode(plan);
-                std::cout << "verify tokens=" << tokens << " ratio=" << ratio << " mask=" << mask
+                std::cout << "verify heads=" << heads << " tokens=" << tokens << " ratio=" << ratio << " mask=" << mask
                           << " cumulative=" << checked << std::endl;
             }
     std::cout << "PASS " << checked
