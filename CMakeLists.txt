@@ -1338,6 +1338,12 @@ if (UNIT_TEST)
             add_executable(deepseekV41GgufIndexedRegression test/ops/deepseekV41GgufIndexedRegression.cpp)
             target_link_libraries(deepseekV41GgufIndexedRegression PRIVATE fastllm)
             target_include_directories(deepseekV41GgufIndexedRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(deepseekV41GgufHybrid deepseekV41GgufIndexedRegression
+                "PASS: V4.1 hybrid GGUF" 300 --hybrid)
+            set_tests_properties(deepseekV41GgufHybrid PROPERTIES LABELS cuda)
+            fastllm_add_checked_test(deepseekV41GgufCache deepseekV41GgufIndexedRegression
+                "PASS: V4.1 resident GGUF canonical cache" 300 --cache)
+            set_tests_properties(deepseekV41GgufCache PROPERTIES LABELS cuda)
             add_test(NAME deepseekV41GgufIndexed COMMAND deepseekV41GgufIndexedRegression)
             add_test(NAME deepseekV41GgufGrouped COMMAND deepseekV41GgufIndexedRegression --grouped-full)
             add_test(NAME deepseekV41GgufGroupedSparse COMMAND deepseekV41GgufIndexedRegression --sparse)

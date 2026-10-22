@@ -9,6 +9,7 @@
 //
 
 #include "fastllm-cuda.cuh"
+#include "fastllm-cuda-v41-gguf.h"
 #include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
 #include "fastllm-cuda-expert-cache.cuh"
 #include "fastllm-cuda-cache-layout.h"
@@ -879,6 +880,36 @@ bool ValidateV41GGUFPair(fastllm::Data *gate, fastllm::Data *down,
     observed.downGgmlType = down->ggmlType;
     observed.hidden = gate->dims[1]; observed.inter = down->dims[1];
     observed.gateBytes = gate->GetBytes(); observed.downBytes = down->GetBytes();
+    observed.downOffset = AlignUp(observed.gateBytes, 16);
+    observed.scalesOffset = AlignUp(observed.downOffset + observed.downBytes, 16);
+    observed.recordStride = AlignUp(observed.scalesOffset, 128);
+    return !expected || (expected->weightType == observed.weightType && expected->deepSeekV41 &&
+        expected->gateGgmlType == observed.gateGgmlType && expected->downGgmlType == observed.downGgmlType &&
+        expected->hidden == observed.hidden && expected->inter == observed.inter &&
+        expected->gateBytes == observed.gateBytes && expected->downBytes == observed.downBytes);
+}
+
+// NUMA may repack K-quants and interleave gate/up rows. Restore their original
+// quantized bytes on cache admission; no duplicate host weights or FP16 expansion.
+bool ValidateV41CanonicalGGUFPair(fastllm::Data *gate, fastllm::Data *down,
+                                  const OffloadLayout *expected, OffloadLayout &observed) {
+    if (!gate || !down || gate->dataType != fastllm::DATA_GGUF_FORMAT ||
+        down->dataType != fastllm::DATA_GGUF_FORMAT ||
+        gate->dataDevice != fastllm::CPU || down->dataDevice != fastllm::CPU ||
+        gate->numasData.empty() || down->numasData.empty() ||
+        gate->dims.size() != 2 || down->dims.size() != 2 ||
+        down->dims[0] <= 0 || down->dims[1] <= 0 || down->dims[1] > INT_MAX/2 ||
+        gate->dims[0] != 2*down->dims[1] || gate->dims[1] != down->dims[0] ||
+        gate->dims[1]%256 || down->dims[1]%256) return false;
+    observed.weightType = fastllm::DATA_GGUF_FORMAT;
+    observed.deepSeekV41 = true;
+    observed.gateGgmlType = fastllm_gguf_restore::Ordinary(gate->ggmlType);
+    observed.downGgmlType = fastllm_gguf_restore::Ordinary(down->ggmlType);
+    if (!FastllmCudaV41GGUFSupported(observed.gateGgmlType, observed.downGgmlType)) return false;
+    observed.hidden = gate->dims[1]; observed.inter = down->dims[1];
+    observed.gateBytes = size_t(gate->dims[0])*ggml_row_size(ggml_type(observed.gateGgmlType), observed.hidden);
+    observed.downBytes = size_t(down->dims[0])*ggml_row_size(ggml_type(observed.downGgmlType), observed.inter);
+    if (gate->GetBytes() != observed.gateBytes || down->GetBytes() != observed.downBytes) return false;
     observed.downOffset = AlignUp(observed.gateBytes, 16);
     observed.scalesOffset = AlignUp(observed.downOffset + observed.downBytes, 16);
     observed.recordStride = AlignUp(observed.scalesOffset, 128);
@@ -1961,6 +1992,19 @@ bool FastllmCudaPrepareMoeCache(
     if (registerBeforeSnapshot) {
         registerNumaWeights();
     }
+    // Preserve the native R4 fast path for its original uniform Q2_K/Q4_K
+    // group. Mixed V4.1 groups use canonical records with per-layer layouts.
+    bool canonicalV41GGUF = false;
+    if (layers[0].deepSeekV41) for (int layer = 0; layer < layerCount; ++layer) {
+        if (!layers[layer].weights || layers[layer].weightsBatch != (experts+1)*2) return false;
+        for (int position = 2; position < layers[layer].weightsBatch; position += 2) {
+            const auto *gate = layers[layer].weights[position], *down = layers[layer].weights[position+1];
+            if (gate && down && gate->dataType == fastllm::DATA_GGUF_FORMAT &&
+                (gate->ggmlType != GGML_TYPE_Q2_K_R4 || down->ggmlType != GGML_TYPE_Q4_K_R4))
+                canonicalV41GGUF = true;
+        }
+    }
+    const auto validateV41 = canonicalV41GGUF ? ValidateV41CanonicalGGUFPair : ValidateV41GGUFPair;
     OffloadLayout layout;
     layout.experts = experts;
     std::vector<OffloadLayout> layerLayouts;
@@ -1980,7 +2024,7 @@ bool FastllmCudaPrepareMoeCache(
             OffloadLayout observed;
             const bool v41GGUF = layers[0].deepSeekV41 && layers[layer].weights[position] &&
                 layers[layer].weights[position]->dataType == fastllm::DATA_GGUF_FORMAT;
-            if (!(v41GGUF ? ValidateV41GGUFPair : ValidateWeightPair)(
+            if (!(v41GGUF ? validateV41 : ValidateWeightPair)(
                     layers[layer].weights[position],
                     layers[layer].weights[position + 1],
                     expert == 0 ? nullptr : &layerLayout, observed)) {
@@ -2023,12 +2067,14 @@ bool FastllmCudaPrepareMoeCache(
                 observed.swigluLimit = layers[0].swigluLimit;
                 layout = observed;
                 first = false;
-            } else if (observed.weightType == fastllm::DataType::DATA_GGUF_FORMAT && !layers[0].deepSeekV41) {
-                if (layout.weightType != observed.weightType) return false;
+            } else if (observed.weightType == fastllm::DataType::DATA_GGUF_FORMAT &&
+                       (!layers[0].deepSeekV41 || canonicalV41GGUF)) {
+                if (layout.weightType != observed.weightType || (canonicalV41GGUF &&
+                    (layout.hidden != observed.hidden || layout.inter != observed.inter))) return false;
                 layout.recordStride = std::max(layout.recordStride, observed.recordStride);
             } else {
                 OffloadLayout checked;
-                if (!(v41GGUF ? ValidateV41GGUFPair : ValidateWeightPair)(layers[layer].weights[position],
+                if (!(v41GGUF ? validateV41 : ValidateWeightPair)(layers[layer].weights[position],
                                         layers[layer].weights[position + 1], &layout, checked)) return false;
             }
         }
@@ -2074,10 +2120,11 @@ bool FastllmCudaPrepareMoeCache(
     // Borrow supported NUMA layouts; snapshot only formats whose CPU packing
     // cannot yet be restored. GPU records always retain canonical GGUF bytes.
     const bool shareNuma = bool(registerNumaWeights) &&
-                          (layout.weightType != fastllm::DataType::DATA_GGUF_FORMAT || layout.deepSeekV41);
+                          (layout.weightType != fastllm::DataType::DATA_GGUF_FORMAT ||
+                           (layout.deepSeekV41 && !canonicalV41GGUF));
     const bool shareGGUF = bool(registerNumaWeights) &&
-        layout.weightType == fastllm::DATA_GGUF_FORMAT && !layout.deepSeekV41 &&
-        CanShareGGUFWeights(layers, layerCount);
+        layout.weightType == fastllm::DATA_GGUF_FORMAT &&
+        (canonicalV41GGUF || (!layout.deepSeekV41 && CanShareGGUFWeights(layers, layerCount)));
     if (shareNuma && (!storage || layout.recordStride > UINT32_MAX / kMaxTopK ||
                       !storage->plan(layout, group->sharedLayout))) return false;
     const size_t hostStride = shareNuma ? group->sharedLayout.auxiliaryBytes : layout.recordStride;
@@ -2137,7 +2184,7 @@ bool FastllmCudaPrepareMoeCache(
         }
     }
     if (shareGGUF) {
-        registerNumaWeights();
+        if (!registerBeforeSnapshot) registerNumaWeights();
         if (!BindGGUFWeights(*group, expertWeights)) return false;
         size_t sharedBytes = 0;
         for (const auto &l : group->layerLayouts) sharedBytes += size_t(experts) * l.recordStride;
@@ -2225,7 +2272,8 @@ bool FastllmCudaGetMoePrefillResidents(fastllm::Data **weights, int experts,
     }
     const auto &layout = group->LayerLayout(table);
     const bool supported = SharedMoePrefillSupported(*group) ||
-        (layout.weightType == fastllm::DATA_GGUF_FORMAT && !layout.deepSeekV41);
+        (layout.weightType == fastllm::DATA_GGUF_FORMAT &&
+         (!layout.deepSeekV41 || !group->ggufSources.empty()));
     if (!supported || experts > layout.experts) return false;
     if (create && !GetDeviceCache(*group)) return false;
     const int device = FastllmCudaGetDevice();
@@ -2498,7 +2546,9 @@ bool GGUFHybridShape(const OffloadLayout &layout) {
             layout.gateGgmlType, layout.downGgmlType, layout.hidden, layout.inter);
     if (layout.deepSeekV41) {
         fastllm::cuda::SharedExpertLayout plan;
-        return PlanSharedV41GGUF(layout, plan);
+        return PlanSharedV41GGUF(layout, plan) ||
+            (FastllmCudaV41GGUFSupported(layout.gateGgmlType, layout.downGgmlType) &&
+             FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(layout.hidden, layout.inter) != 0);
     }
     return FastllmCudaMoeGGUFCacheSupported(layout.gateGgmlType, layout.hidden) &&
            FastllmCudaMoeGGUFCacheSupported(layout.downGgmlType, layout.inter);
@@ -4084,13 +4134,11 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
     // can overlap the previous token's admissions instead of waiting here.
     WaitCacheAdmission(*cache);
     // GLM GGUF verification also needs an active scope when all experts fit.
-    const char *v41Frequency = std::getenv("FASTLLM_DSV41_MOE_FREQUENCY");
     // Both native V4.1 layouts support cached and temporary GPU experts.
     // Auto-configured caches must not require a separate environment opt-in.
     const bool v41FrequencyScope = group->layout.deepSeekV41 &&
         (group->layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 ||
-         group->layout.weightType == fastllm::FP8_E4M3_BLOCK_128) &&
-        (!v41Frequency || (v41Frequency[0] && std::strcmp(v41Frequency, "0") != 0));
+         group->layout.weightType == fastllm::FP8_E4M3_BLOCK_128);
     const bool frequencyScope = v41FrequencyScope || (!group->layout.deepSeekV41 && !group->layout.glm5) ||
         (group->layout.glm5 && (NativeSharedRecords(*group) ||
          group->layout.weightType == fastllm::DATA_GGUF_FORMAT));
@@ -4291,7 +4339,7 @@ bool TryV41VerifyHybrid(const fastllm::Data &input, const fastllm::Data &index, 
     auto *cache = GetDeviceCache(*group);
     if (!cache)
         return false;
-    const auto &layout = group->layout;
+    const auto &layout = group->LayerLayout(tableId);
     const int hidden = layout.hidden, rows = input.dims[0], topk = index.dims[1], routes = rows * topk;
     if (!cache->verify) {
         auto w = std::make_unique<VerifyWorkspace>();
@@ -4456,12 +4504,13 @@ bool TryV41VerifyHybrid(const fastllm::Data &input, const fastllm::Data &index, 
         checkCudaErrors("Verify GPU start", cudaEventRecord(w.start, cudaStreamPerThread));
         using namespace fastllm::cuda::dsv41_cache;
         if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
-            const FastllmCudaMoeGGUFCacheView view{cache->records, dSlots, layout.recordStride, layout.downOffset,
+            FastllmCudaMoeGGUFCacheView view{cache->records, dSlots, layout.recordStride, layout.downOffset,
                 layout.gateGgmlType, layout.downGgmlType, hidden, layout.inter,
                 cache->ggufWorkspace, cache->ggufWorkspaceBytes};
+            view.slotOffsets = cache->slotOffsets;
             fastllm::AssertInFastLLM(FastllmCudaMoeV41GGUFCacheCompute(w.quantizedInput, w.activation,
                 view, (const float *)score.cudaData, topk, layout.swigluLimit, dGpu),
-                "Verify Q2 CUDA experts failed.\n");
+                "Verify GGUF CUDA experts failed.\n");
         } else if (layout.weightType == fastllm::FP8_E4M3_BLOCK_128) {
             fastllm::AssertInFastLLM(ComputeScoredFP8Experts(w.quantizedInput, w.activation,
                 layout, cache->records, dSlots, (const float *)score.cudaData, topk, dGpu, nullptr, routes),

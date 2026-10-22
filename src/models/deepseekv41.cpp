@@ -5997,12 +5997,12 @@ namespace fastllm {
                         PrepareMultiCudaReplicatedData(ffnOut, tpDevices, true);
                     }
                     if (ffnOut.dataType == DataType::FLOAT32 &&
-                        sharedExpertOut.dataType == DataType::BFLOAT16) {
+                        sharedExpertOut.dataType != DataType::FLOAT32) {
                         Data &sharedFloat = ws->reductionBuffers["moe_shared_sum"];
                         Data &rounded = ws->reductionBuffers["moe_rounded_sum"];
                         ToDataType(sharedExpertOut, sharedFloat, DataType::FLOAT32);
                         AddTo(ffnOut, sharedFloat);
-                        ToDataType(ffnOut, rounded, DataType::BFLOAT16);
+                        ToDataType(ffnOut, rounded, ffnInput.dataType);
                         rounded.Reshape(ffnDims);
                         V41HcPost(rounded, *curHidden, ffnPost, ffnComb, *nextHidden);
                         ffnPostDone = true;

@@ -45,28 +45,26 @@ namespace fastllm {
             std::vector<std::vector<Data *>> routedWeights = weights;
             HybridMoeCachePlan cache(HybridMoeMath::DeepSeekV41, swiglu_limit);
             for (int layer = 0; layer < block_cnt; ++layer) {
-                supported &= V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "numa") &&
-                    quantizedLinearNames.count("layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight");
+                const auto device = SelectMoeDeviceForLayer(layer);
+                // GPU-resident layers are not members of the host cache.
+                if (!V41DeviceSpecUsesType(device, "numa")) continue;
+                supported &= quantizedLinearNames.count("layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight");
                 routedWeights[layer][0] = routedWeights[layer][1] = nullptr;
-                cache.Add(routedWeights[layer], SelectMoeDeviceForLayer(layer));
+                cache.Add(routedWeights[layer], device);
             }
             if (!supported || !cache.Prepare(
                     [this] { WarmupNumaMoeWeights(); })) {
-                fprintf(stderr, "[Fastllm] V4.1 expert cache requires NUMA FP8 block128, NVFP4 block32 or Q2_K/Q4_K R4 experts, "
+                fprintf(stderr, "[Fastllm] V4.1 expert cache requires NUMA FP8 block128, NVFP4 block32 or supported GGUF experts, "
                     "CUDA shared experts and ordinary math; using the configured backend.\n");
             }
         }
         // A complete decode step spans every layer. Admission runs afterward,
         // outside graph capture, while the attention/shared segments retain
         // their stable graph-owned tensors. Unsupported layouts retain NUMA.
-        // Native cache requests (including --auto) enable this path by default. Keep
-        // the explicit legacy switch only as an opt-out for comparisons.
-        const char *frequency = std::getenv("FASTLLM_DSV41_MOE_FREQUENCY");
+        // Native cache requests (including --auto) enable admission directly.
         const bool nativeFrequency = weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0 ||
                                      weights[0][2]->dataType == FP8_E4M3_BLOCK_128;
-        const bool frequencyEnabled = frequency ?
-            V41EnvFlag("FASTLLM_DSV41_MOE_FREQUENCY") : nativeFrequency;
-        if (!tp && single && seqlen == 1 && frequencyEnabled &&
+        if (!tp && single && seqlen == 1 && nativeFrequency &&
             FastllmCudaMoeCacheRequested() &&
             !V41ReferenceMathEnabled() && GetCudaSharedExpert() &&
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
@@ -125,11 +123,11 @@ namespace fastllm {
         // Verification runs between graph segments too. Use the same stable
         // staging as decode, rather than migrating tensors owned by a graph.
         // Its multi-row scheduler is independent of the single-token step.
-        const bool singleVerifyCache = graphActive && !tp && single && dsparkVerify && ctx.verifyAllTokens &&
-            seqlen > 1 && seqlen <= 8 && FastllmCudaMoeCacheRequested() &&
+        const bool singleStageCache = graphActive && !tp && single &&
+            (seqlen == 1 || (dsparkVerify && ctx.verifyAllTokens && seqlen > 1 && seqlen <= 8)) && FastllmCudaMoeCacheRequested() &&
             !dumpDebug && !V41ReferenceMathEnabled() &&
             V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "numa");
-        if (((step && *step) || singleVerifyCache) && hasSharedExpertOut &&
+        if (((step && *step) || singleStageCache) && hasSharedExpertOut &&
             moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
             ffnInput.dataDevice == DataDevice::CUDA && ffnInput.cudaData &&
             FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
@@ -208,6 +206,16 @@ namespace fastllm {
         }
         ctx.releaseSharedScratch();
 
+        // Add in the routed result's precision, then round once at the MoE
+        // boundary. Resident GGUF returns FP32 while shared experts may be 16-bit.
+        auto addSharedExpert = [&] {
+            Data *shared = &sharedExpertOut;
+            if (shared->dataType != ffnOut.dataType) {
+                shared = &ws->reductionBuffers["moe_shared_sum"];
+                ToDataType(sharedExpertOut, *shared, ffnOut.dataType);
+            }
+            AddTo(ffnOut, *shared);
+        };
         bool combineFfnPostDispatch = false;
 #ifdef USE_CUDA
         combineFfnPostDispatch = tp && single && hasSharedExpertOut && !dumpDebug &&
@@ -289,7 +297,10 @@ namespace fastllm {
                 if (!(tp && ffnOut.multiDeviceData && sharedExpertOut.multiDeviceData)) {
                     ffnOut.ToDevice(sharedExpertOut.dataDevice);
                 }
-                AddTo(ffnOut, sharedExpertOut);
+                addSharedExpert();
+            }
+            if (!combineFfnPostDispatch && ffnOut.dataType != ffnInput.dataType) {
+                ToDataType(ffnOut, ffnInput.dataType);
             }
 #ifdef USE_CUDA
             if (graphActive && !tp && ffnOut.dataDevice == DataDevice::CPU) {
@@ -301,7 +312,8 @@ namespace fastllm {
         }
         if (singleCacheHandled) {
             ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
-            AddTo(ffnOut, sharedExpertOut);
+            addSharedExpert();
+            if (ffnOut.dataType != ffnInput.dataType) ToDataType(ffnOut, ffnInput.dataType);
         }
         return combineFfnPostDispatch;
     }
