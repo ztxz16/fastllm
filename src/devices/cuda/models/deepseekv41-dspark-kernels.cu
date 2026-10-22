@@ -23,6 +23,7 @@
 //
 
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-dspark.h"
 #include "fastllm.h"
 
 #include <algorithm>
@@ -223,13 +224,14 @@ namespace {
 }
 
 // logits: [1, block, vocab] FLOAT32；embedWeight / headWeight: [vocab, rank] FP16 / BF16 / FP32。
-// outTokens 写回 block 个 token（主机内存），outEmbeds 为设备上的 [1, block, rank] FLOAT32。
+// tokenBuffer[0] 是设备上的 anchor，后续 block 个 token 和 outEmbeds 都保留在设备上。
+// values / indices 是可复用的归约临时缓冲区；调用方负责在 replay 前更新 anchor。
 // 任何前提不满足时返回 false，调用方退回通用算子实现。
-extern "C" bool FastllmCudaDeepSeekV41MarkovChain(const fastllm::Data &logits,
+extern "C" bool FastllmCudaDeepSeekV41MarkovChainDevice(const fastllm::Data &logits,
                                                   const fastllm::Data &embedWeight,
                                                   const fastllm::Data &headWeight,
-                                                  int anchorToken, int block,
-                                                  std::vector<int> &outTokens,
+                                                  int block, fastllm::Data &tokenBuffer,
+                                                  fastllm::Data &values, fastllm::Data &indices,
                                                   fastllm::Data &outEmbeds) {
     if (!DsOnCuda(logits) || !DsOnCuda(embedWeight) || !DsOnCuda(headWeight)) {
         return false;
@@ -251,24 +253,19 @@ extern "C" bool FastllmCudaDeepSeekV41MarkovChain(const fastllm::Data &logits,
     if (embedWeight.dims[0] < vocab || headWeight.dims[0] < vocab || headWeight.dims[1] != rank) {
         return false;
     }
-    if (anchorToken < 0 || anchorToken >= vocab) {
+    if (!DsOnCuda(tokenBuffer) || tokenBuffer.dataType != DataType::INT32 ||
+        tokenBuffer.Count(0) < (uint64_t)block + 1) {
         return false;
     }
     if (!DsPrepareOutput(outEmbeds, DataType::FLOAT32, {1, block, rank})) {
         return false;
     }
 
-    // token[0] = anchor，之后每一步在设备上写下一个；主机只在最后取回一次
-    int *tokens = (int*)FastllmCudaMalloc((size_t)(block + 1) * sizeof(int));
-    float *partialValue = (float*)FastllmCudaMalloc((size_t)kDsparkMarkovChunks * sizeof(float));
-    int *partialIndex = (int*)FastllmCudaMalloc((size_t)kDsparkMarkovChunks * sizeof(int));
-    if (tokens == nullptr || partialValue == nullptr || partialIndex == nullptr) {
-        if (tokens != nullptr) FastllmCudaFree(tokens);
-        if (partialValue != nullptr) FastllmCudaFree(partialValue);
-        if (partialIndex != nullptr) FastllmCudaFree(partialIndex);
-        return false;
-    }
-    FastllmCudaCopyFromHostToDevice(tokens, &anchorToken, sizeof(int));
+    if (!DsPrepareOutput(values, DataType::FLOAT32, {kDsparkMarkovChunks}) ||
+        !DsPrepareOutput(indices, DataType::INT32, {kDsparkMarkovChunks})) return false;
+    int *tokens = (int*)tokenBuffer.cudaData;
+    float *partialValue = (float*)values.cudaData;
+    int *partialIndex = (int*)indices.cudaData;
 
     const float *logitsData = (const float*)logits.cudaData;
     float *embedsData = (float*)outEmbeds.cudaData;
@@ -283,21 +280,25 @@ extern "C" bool FastllmCudaDeepSeekV41MarkovChain(const fastllm::Data &logits,
                              tokens, partialValue, partialIndex, embedsData);
     }
 
-    outTokens.resize(block);
-    FastllmCudaCopyFromDeviceToHost(outTokens.data(), tokens + 1, (size_t)block * sizeof(int));
-    FastllmCudaFree(tokens);
-    FastllmCudaFree(partialValue);
-    FastllmCudaFree(partialIndex);
-
     cudaError_t state = cudaGetLastError();
     if (state != cudaSuccess) {
         printf("[Fastllm] DeepSeek-V4.1 DSpark markov chain kernel error: %s\n", cudaGetErrorString(state));
         return false;
     }
-    for (int i = 0; i < block; i++) {
-        if (outTokens[i] < 0 || outTokens[i] >= vocab) {
-            return false;
-        }
-    }
+    return true;
+}
+
+extern "C" bool FastllmCudaDeepSeekV41MarkovChain(const fastllm::Data &logits,
+    const fastllm::Data &embedWeight, const fastllm::Data &headWeight, int anchorToken, int block,
+    std::vector<int> &outTokens, fastllm::Data &outEmbeds) {
+    if (block <= 0 || logits.dims.size() != 3 || anchorToken < 0 || anchorToken >= logits.dims[2]) return false;
+    Data tokens, values, indices;
+    if (!DsPrepareOutput(tokens, DataType::INT32, {block + 1})) return false;
+    FastllmCudaCopyFromHostToDevice(tokens.cudaData, &anchorToken, sizeof(int));
+    if (!FastllmCudaDeepSeekV41MarkovChainDevice(logits, embedWeight, headWeight, block,
+                                               tokens, values, indices, outEmbeds)) return false;
+    outTokens.resize(block);
+    FastllmCudaCopyFromDeviceToHost(outTokens.data(), (int*)tokens.cudaData + 1, block * sizeof(int));
+    for (int token : outTokens) if (token < 0 || token >= logits.dims[2]) return false;
     return true;
 }

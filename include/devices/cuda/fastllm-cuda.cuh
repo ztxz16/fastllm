@@ -973,6 +973,11 @@ bool FastllmCudaDeepSeekV41EngramApply(fastllm::Data &hidden, const fastllm::Dat
 bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
                                        int posStep, bool inverse, int originalSeqLen, float ropeFactor,
                                        int betaFast, int betaSlow, int quantMode, int quantDim, int quantBlock);
+// Graph replay reads the current absolute position from a device scalar.
+bool FastllmCudaDeepSeekV41RotaryQuantPosition(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
+                                       int posStep, bool inverse, int originalSeqLen, float ropeFactor,
+                                       int betaFast, int betaSlow, int quantMode, int quantDim, int quantBlock,
+                                       const int *devicePosition);
 bool FastllmCudaDeepSeekV41Compress(const fastllm::Data &kv, const fastllm::Data *score,
                                     fastllm::Data &normWeight, int ratio, float normEps, fastllm::Data &output);
 bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const fastllm::Data &weights,

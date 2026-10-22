@@ -83,7 +83,10 @@ namespace fastllm {
         Data windowKV;                // [1, windowSize, headDim] BF16 环形缓冲，row = pos % windowSize
     };
 
+    struct DeepSeekV41DsparkWorkspace;
     struct DeepSeekV41DsparkState {
+        std::shared_ptr<DeepSeekV41DsparkWorkspace> workspace;
+        std::map<int, std::shared_ptr<DeepSeekV41DsparkWorkspace>> contextWorkspaces;
         std::vector<DeepSeekV41DsparkLayerCache> layers;
         int committed = 0;            // 已写入草稿滑窗的位置数（== 目标模型的 totalLen）
         int filled = 0;               // 滑窗中连续有效的位置数（前缀缓存恢复后从 0 开始重新累积）

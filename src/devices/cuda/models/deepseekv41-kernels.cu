@@ -9,6 +9,7 @@
 //
 
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-dspark.h"
 #include "devices/cuda/fastllm-cuda-hybrid-dsa.h"
 #include "../fastllm-hybrid-prefill.cuh"
 #include "deepseekv41-reference.cuh"
@@ -1301,7 +1302,7 @@ namespace {
     template <typename T>
     __global__ void V41RotaryOnlyKernel(T *x, int rowsPerToken, int dim, V41RopeTable rope,
                                         int ropeDim, int startPos, int posStep, int inverse,
-                                        uint64_t totalPairs) {
+                                        uint64_t totalPairs, const int *devicePosition) {
         const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= totalPairs) {
             return;
@@ -1311,7 +1312,7 @@ namespace {
         const int d = (int)(idx - (uint64_t)r * pairs);
         const int token = r / rowsPerToken;
         T *base = x + (uint64_t)r * dim + (dim - ropeDim) + 2 * d;
-        const float pos = (float)(startPos + (long long)token * posStep);
+        const float pos = (float)((devicePosition ? *devicePosition : startPos) + (long long)token * posStep);
         const float ang = pos * rope.invFreq[d];
         float c = cosf(ang), s = sinf(ang);
         if (inverse) {
@@ -1330,7 +1331,7 @@ namespace {
     __global__ void V41RotaryQuantKernel(T *x, int rowsPerToken, int dim, V41RopeTable rope,
                                          int ropeDim, int startPos, int posStep, int inverse,
                                          int quantMode, int quantDim, int quantBlock,
-                                         int rowsPerBlock, int rows) {
+                                         int rowsPerBlock, int rows, const int *devicePosition) {
         const int sub = threadIdx.x / dim;
         const int d = (int)threadIdx.x - sub * dim;
         const int r = blockIdx.x * rowsPerBlock + sub;
@@ -1346,7 +1347,7 @@ namespace {
         const int off = dim - ropeDim;
         if (d >= off) {
             const int k = d - off;
-            const float pos = (float)(startPos + (long long)token * posStep);
+            const float pos = (float)((devicePosition ? *devicePosition : startPos) + (long long)token * posStep);
             const float ang = pos * rope.invFreq[k >> 1];
             float c = cosf(ang), s = sinf(ang);
             if (inverse) {
@@ -3489,13 +3490,13 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
     // ---------------- WindowStore ----------------
 
     __global__ void V41WindowStoreKernel(const uint8_t *chunk, uint8_t *ring, int seqlen, int rowBytes,
-                                         int startPos, int windowSize, int firstRow) {
+                                         int startPos, int windowSize, int firstRow, const int *devicePosition) {
         const int b = blockIdx.y;
         const int i = firstRow + blockIdx.x;
         if (i >= seqlen) {
             return;
         }
-        const int slot = (startPos + i) % windowSize;
+        const int slot = ((devicePosition ? *devicePosition : startPos) + i) % windowSize;
         const uint8_t *src = chunk + ((uint64_t)b * seqlen + i) * rowBytes;
         uint8_t *dst = ring + ((uint64_t)b * windowSize + slot) * rowBytes;
         for (int k = threadIdx.x; k < rowBytes; k += blockDim.x) {
@@ -3978,10 +3979,10 @@ extern "C" bool FastllmCudaDeepSeekV41EngramApply(fastllm::Data &hidden, const f
     return V41CheckLaunch("EngramApply");
 }
 
-extern "C" bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
+extern "C" bool FastllmCudaDeepSeekV41RotaryQuantPosition(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
                                                   int posStep, bool inverse, int originalSeqLen, float ropeFactor,
                                                   int betaFast, int betaSlow, int quantMode, int quantDim,
-                                                  int quantBlock) {
+                                                  int quantBlock, const int *devicePosition) {
     if (!V41OnCuda(x) || (x.dims.size() != 3 && x.dims.size() != 4) || !V41IsFloatType(x.dataType)) {
         return false;
     }
@@ -3998,6 +3999,7 @@ extern "C" bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim,
     if (rows <= 0) {
         return true;
     }
+    if (devicePosition && (V41LegacyRotary() || V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH"))) return false;
     if (V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") && FastllmCudaV41ReferenceRotary(x,ropeDim,ropeBase,startPos,posStep,inverse,originalSeqLen,ropeFactor,betaFast,betaSlow,quantMode,quantDim,quantBlock)) return true;
     V41RopeTable rope = V41BuildRope(ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
     if (V41LegacyRotary()) {
@@ -4021,13 +4023,13 @@ extern "C" bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim,
         const uint64_t blocks = (totalPairs + threads - 1) / threads;
         if (x.dataType == DataType::BFLOAT16) {
             V41RotaryOnlyKernel<__nv_bfloat16><<<(unsigned)blocks, threads>>>((__nv_bfloat16*)x.cudaData,
-                rowsPerToken, dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, totalPairs);
+                rowsPerToken, dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, totalPairs, devicePosition);
         } else if (x.dataType == DataType::FLOAT16) {
             V41RotaryOnlyKernel<half><<<(unsigned)blocks, threads>>>((half*)x.cudaData,
-                rowsPerToken, dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, totalPairs);
+                rowsPerToken, dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, totalPairs, devicePosition);
         } else {
             V41RotaryOnlyKernel<float><<<(unsigned)blocks, threads>>>((float*)x.cudaData,
-                rowsPerToken, dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, totalPairs);
+                rowsPerToken, dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, totalPairs, devicePosition);
         }
         return V41CheckLaunch("RotaryQuant");
     }
@@ -4037,15 +4039,23 @@ extern "C" bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim,
     const int blocks = (rows + rowsPerBlock - 1) / rowsPerBlock;
     if (x.dataType == DataType::BFLOAT16) {
         V41RotaryQuantKernel<__nv_bfloat16><<<blocks, threads>>>((__nv_bfloat16*)x.cudaData, rowsPerToken, dim, rope,
-            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock, rowsPerBlock, rows);
+            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock, rowsPerBlock, rows, devicePosition);
     } else if (x.dataType == DataType::FLOAT16) {
         V41RotaryQuantKernel<half><<<blocks, threads>>>((half*)x.cudaData, rowsPerToken, dim, rope,
-            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock, rowsPerBlock, rows);
+            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock, rowsPerBlock, rows, devicePosition);
     } else {
         V41RotaryQuantKernel<float><<<blocks, threads>>>((float*)x.cudaData, rowsPerToken, dim, rope,
-            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock, rowsPerBlock, rows);
+            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock, rowsPerBlock, rows, devicePosition);
     }
     return V41CheckLaunch("RotaryQuant");
+}
+
+extern "C" bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
+                                                  int posStep, bool inverse, int originalSeqLen, float ropeFactor,
+                                                  int betaFast, int betaSlow, int quantMode, int quantDim,
+                                                  int quantBlock) {
+    return FastllmCudaDeepSeekV41RotaryQuantPosition(x, ropeDim, ropeBase, startPos, posStep, inverse,
+        originalSeqLen, ropeFactor, betaFast, betaSlow, quantMode, quantDim, quantBlock, nullptr);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41Compress(const fastllm::Data &kv, const fastllm::Data *score,
@@ -4789,8 +4799,8 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     return V41CheckLaunch("SparseAttention");
 }
 
-extern "C" bool FastllmCudaDeepSeekV41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring, int startPos,
-                                                  int windowSize) {
+extern "C" bool FastllmCudaDeepSeekV41WindowStorePosition(const fastllm::Data &chunk, fastllm::Data &ring, int startPos,
+                                                  int windowSize, const int *devicePosition) {
     if (!V41OnCuda(chunk) || chunk.dims.size() != 3) {
         return false;
     }
@@ -4806,8 +4816,13 @@ extern "C" bool FastllmCudaDeepSeekV41WindowStore(const fastllm::Data &chunk, fa
     int firstRow = std::max(0, seqlen - windowSize);
     dim3 grid(seqlen - firstRow, bsz);
     V41WindowStoreKernel<<<grid, 256>>>((const uint8_t*)chunk.cudaData, (uint8_t*)ring.cudaData, seqlen, rowBytes,
-                                        startPos, windowSize, firstRow);
+                                        startPos, windowSize, firstRow, devicePosition);
     return V41CheckLaunch("WindowStore");
+}
+
+extern "C" bool FastllmCudaDeepSeekV41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring,
+                                                  int startPos, int windowSize) {
+    return FastllmCudaDeepSeekV41WindowStorePosition(chunk, ring, startPos, windowSize, nullptr);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41QuantizeActivation(const fastllm::Data &input, fastllm::Data &output) {

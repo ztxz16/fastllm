@@ -1429,6 +1429,13 @@ if (UNIT_TEST)
                 "PASS [0-9]+ persistent gathered projections" 300)
             set_tests_properties(multiCudaOutputGather PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+            add_executable(deepseekV41DraftPositionRegression test/ops/deepseekV41DraftPositionRegression.cpp)
+            target_link_libraries(deepseekV41DraftPositionRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41DraftPositionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(deepseekV41DraftPosition deepseekV41DraftPositionRegression
+                "PASS [0-9]+ dynamic draft positions" 300)
+            set_tests_properties(deepseekV41DraftPosition PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
             add_executable(multiCudaHybridMoeRegression test/ops/multiCudaHybridMoeRegression.cpp)
             target_link_libraries(multiCudaHybridMoeRegression PRIVATE fastllm)
             target_include_directories(multiCudaHybridMoeRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
