@@ -11,6 +11,7 @@
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
 #include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
+#include "utils/hybrid_moe.h"
 namespace fastllm { void RegisterNumas(Data *data, std::string weightType); }
 #endif
 #include <algorithm>
@@ -82,6 +83,8 @@ static void HybridAddition(Data &input, Data &indices, Data &scores,
 }
 
 static bool cacheTest = false;
+static bool streamTest = false;
+static bool cooperativeTest = false;
 static void CacheCompute(Data &input, Data &indices, Data &scores, std::vector<Data *> &weights,
                          const std::vector<float> &expected, int gt, int dt, int inter,
                          float limit, int device) {
@@ -182,6 +185,47 @@ static void CollectRegistrationFixture(std::vector<Data *> &weights, int gt, int
     }
     registeredFixtures.push_back(std::move(f));
 }
+class StreamModelProbe : public DeepSeekV41Model {
+public:
+    void PrepareStream() {
+        embed_dim = 512; block_cnt = registeredFixtures.size();
+        num_experts_per_tok = 6; swiglu_limit = .8f;
+        deviceMap = {{"cuda:0", 1}}; moeDeviceMap = {{"numa", 1}};
+        if (cooperativeTest) deviceMap = {{"cuda:0", 1}, {"cuda:1", 1}};
+        for (size_t layer=0; layer<registeredFixtures.size(); ++layer) {
+            weights.push_back(registeredFixtures[layer].host);
+            biass.emplace_back(weights.back().size(), nullptr);
+            quantizedLinearNames.insert("layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight");
+            for (size_t i=2; i<weights.back().size(); ++i)
+                RegisterNumas(weights.back()[i], i%2 ? "linear" : "linearSwiglu");
+        }
+        SetCudaSharedExpert(true);
+        HybridMoeDecodeStep step;
+        BeginHybridMoeStep(step, false, true, 1);
+    }
+    void Run(Data &input, Data &index, Data &score, Data &output,
+             int layer, int device, int &callbacks) {
+        if (!cooperativeTest) deviceMap = {{"cuda:" + std::to_string(device), 1}};
+        ApplyDeviceMap({{"cuda:" + std::to_string(device), 1}}, 0, 1);
+        ws.ffnInput.CopyFrom(input); ws.expertIndex.CopyFrom(index); ws.expertScore.CopyFrom(score);
+        if (layer % 2) {
+            ws.expertIndex.ToDevice(CPU); ws.expertScore.ToDevice(CPU);
+        }
+        ws.sharedExpertOut.CopyFrom(Data(FLOAT32, {1,embed_dim}, std::vector<float>(embed_dim,0.f)));
+        ToDataType(ws.sharedExpertOut, BFLOAT16);
+        ws.sharedExpertOut.ToDevice(CUDA, {device}, true);
+        const std::vector<int> devices{device};
+        DeepSeekV41MoeContext ctx{ws, weights[layer], devices, layer, 1,
+            false, true, false, false, false, true, false, [&] {
+                ++callbacks;
+                if (cooperativeTest) FastllmCudaSetDevice(1-device);
+            }, [] {}};
+        Check(!RunHybridMoe(ctx, nullptr), "unexpected TP streaming dispatch");
+        output.CopyFrom(ws.ffnOut);
+    }
+private:
+    DeepSeekV41DecodeWorkspace ws;
+};
 static void CheckRegistration() {
     FastllmCudaSetDevice(0); EnableAMX(false);
     std::vector<FastllmCudaMoeCacheLayer> layers;
@@ -192,17 +236,25 @@ static void CheckRegistration() {
     }
     maxStride=(maxStride+127)&~size_t(127);
     const size_t budget=registeredFixtures.size()*8*maxStride;
-    SetMoeCudaCacheBytes(budget);
-    Check(FastllmCudaPrepareMoeCache(layers.data(),layers.size(),[&]{
+    SetMoeCudaCacheBytes(streamTest ? 0 : budget);
+    StreamModelProbe model;
+    if (streamTest) model.PrepareStream();
+    else Check(FastllmCudaPrepareMoeCache(layers.data(),layers.size(),[&]{
         for(auto &f:registeredFixtures) for(size_t i=2;i<f.host.size();++i)
             RegisterNumas(f.host[i],i%2?"linear":"linearSwiglu");
     }),"mixed V4.1 NUMA GGUF cache registration failed");
-    setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS","6",1);
+    if (!streamTest) setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS","6",1);
     setenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH","0",1);
     const int hidden=512, inter=256, topk=6;
-    for(int pass=0;pass<5;++pass) for(size_t layer=0;layer<registeredFixtures.size();++layer) {
+    int devices = 0; Cuda(cudaGetDeviceCount(&devices));
+    bool simultaneousGpuRoutes = false;
+    for(int pass=0;pass<(streamTest ? 12 : 5);++pass) for(size_t layer=0;layer<registeredFixtures.size();++layer) {
         auto &f=registeredFixtures[layer];
-        const int rows=pass==4?5:1;
+        const int device = cooperativeTest ? int(layer * 2 / registeredFixtures.size()) :
+            streamTest ? pass % std::min(2, devices) : 0;
+        FastllmCudaSetDevice(device);
+        if (streamTest) for (auto *weight : f.gpu) if (weight) weight->ToDevice(CUDA, {device}, true);
+        const int rows=!streamTest && pass==4?5:1;
         std::vector<float> x(rows*hidden), scores(rows*topk);
         std::vector<int32_t> ids(rows*topk);
         for(size_t i=0;i<x.size();++i) x[i]=std::sin(float(i)*.031f);
@@ -211,18 +263,87 @@ static void CheckRegistration() {
             ids[r*topk+k]=k+(pass<2?0:12);
             scores[r*topk+k]=k==0?0.f:k==1?-.17f:.25f+.13f*k;
         }
+        // Keep the most reused expert first so the measured GPU route count
+        // identifies the independent reference subset, including its duplicate.
+        if (cooperativeTest) ids[0] = ids[1];
         Data input(FLOAT32,{rows,hidden},x), index(INT32,{rows,topk},CPU,ids.data());
         Data score(FLOAT32,{rows,topk},scores), output, reference, gate, activation, workspace;
         ToDataType(input,BFLOAT16);
-        for(auto *v:{&input,&index,&score}) v->ToDevice(CUDA,{0},true);
-        Check(FastllmCudaMergeMOEV41GGUFResident(input,gate,activation,workspace,reference,
+        for(auto *v:{&input,&index,&score}) v->ToDevice(CUDA,{device},true);
+        if (!streamTest) Check(FastllmCudaMergeMOEV41GGUFResident(input,gate,activation,workspace,reference,
             f.gpu.data(),f.gpu.size(),index,score,0,.8f),"registered cache reference failed");
-        Check(FastllmCudaMergeMOEHybrid(input,index,score,output,f.host.data(),f.host.size(),layer),
-            "registered cache dispatch failed");
+        uint64_t beforeRoutes[2][8] = {};
+        if (streamTest) for (int d=0;d<(cooperativeTest?2:1);++d)
+            fastllm_moe_cuda_cache_route_stats(cooperativeTest?d:device, beforeRoutes[d]);
+        int callbacks = 0;
+        if (streamTest) model.Run(input,index,score,output,layer,device,callbacks);
+        else Check(FastllmCudaMergeMOEHybrid(input,index,score,output,f.host.data(),f.host.size(),layer,
+            [&] { ++callbacks; }), "registered cache dispatch failed");
+        Check(callbacks == 1, "shared branch submitted more or less than once");
+        Check(GetPointerDeviceId(output.cudaData) == device, "streaming output remained on previous PP device");
+        if (streamTest) {
+            int gpu = 0, cpu = 0, activeDevices = 0;
+            for (int d=0;d<(cooperativeTest?2:1);++d) {
+                uint64_t afterRoutes[8] = {};
+                Check(fastllm_moe_cuda_cache_route_stats(cooperativeTest?d:device, afterRoutes),
+                      "missing dispatch counters");
+                const int routes = afterRoutes[4] - beforeRoutes[d][4];
+                gpu += routes; cpu += afterRoutes[5] - beforeRoutes[d][5];
+                activeDevices += routes > 0;
+            }
+            simultaneousGpuRoutes |= activeDevices > 1;
+            Check(gpu >= 0 && gpu <= topk && cpu == topk-gpu,
+                "dispatch route accounting mismatch");
+            // All routes miss a zero-budget cache: the scheduler sends the
+            // leading subset to CUDA. Compare with independent per-expert CUDA
+            // calls and the synchronous NUMA path, using the same assignment.
+            // CPU Q8_K and CUDA Q8_1 activations need not match one another.
+            std::vector<int32_t> gpuIds(topk, -1);
+            for (int k=0; k<gpu; ++k) gpuIds[k] = ids[k];
+            std::vector<uint16_t> inputBits(hidden);
+            std::vector<float> cpuInput(hidden);
+            Cuda(cudaMemcpy(inputBits.data(), input.cudaData, hidden*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+            for (int c=0; c<hidden; ++c) {
+                const uint32_t bits = uint32_t(inputBits[c]) << 16;
+                std::memcpy(&cpuInput[c], &bits, sizeof(bits));
+            }
+            std::vector<float> partial(topk*hidden, 0.f), sum(hidden, 0.f);
+            NumasMoeDecodeExperts(cpuInput.data(), partial.data(),
+                f.host.data(), ids.data(), gpuIds.data(), topk, layer, scores.data(), .8f, 32);
+            for (int k=0; k<gpu; ++k) {
+                Data ri, rs, expert;
+                ri.FakeFrom(index, k*sizeof(int32_t)); ri.Resize({1,1});
+                rs.FakeFrom(score, k*sizeof(float)); rs.Resize({1,1});
+                Check(FastllmCudaMergeMOEV41GGUFResident(input,gate,activation,workspace,expert,
+                    f.gpu.data(),f.gpu.size(),ri,rs,0,.8f), "stream reference expert failed");
+                const auto values = Read(expert);
+                std::copy(values.begin(), values.end(), partial.begin()+k*hidden);
+            }
+            for (int k=0; k<topk; ++k) for (int c=0; c<hidden; ++c) sum[c] += partial[k*hidden+c];
+            reference.CopyFrom(Data(FLOAT32, {1,hidden}, sum));
+            reference.ToDevice(CUDA, {device}, true);
+        }
         // The hybrid boundary rounds the routed sum to BF16.
         ToDataType(reference,BFLOAT16); ToDataType(reference,FLOAT32); ToDataType(output,FLOAT32);
         const auto expected=Read(reference), actual=Read(output);
-        Check(actual==expected,"NUMA restoration, mixed layer offsets or verifier cache changed values");
+        Check(actual == expected, streamTest ? "streamed split differs from its synchronous CPU/GPU reference" :
+            "NUMA restoration, mixed layer offsets or verifier cache changed values");
+    }
+    if (streamTest) {
+        if (cooperativeTest) Check(simultaneousGpuRoutes,
+            "cooperative decode never assigned work to both GPUs in one layer");
+        for (int device = 0; device < std::min(2, devices); ++device) {
+            uint64_t stats[5] = {}, routes[8] = {};
+            Check(fastllm_moe_cuda_cache_stats(device, stats, false), "streaming stats unavailable");
+            Check(stats[2] == 0 && stats[3] == 0, "zero-budget stream allocated resident slots");
+            Check(fastllm_moe_cuda_cache_route_stats(device, routes), "stream route stats unavailable");
+            Check(routes[4] > 0 && routes[5] > 0 && routes[6] == 0,
+                "streaming failed to execute both CPU and nonresident GPU experts");
+        }
+        puts(cooperativeTest ? "PASS: V4.1 cooperative GGUF decode, both GPUs, ordered CPU/GPU oracle, zero cache" :
+            "PASS: V4.1 zero-budget GGUF decode streaming and PP device handoff");
+        registeredFixtures.clear();
+        return;
     }
     uint64_t stats[5]={};
     Check(fastllm_moe_cuda_cache_stats(0,stats,false),"cache statistics failed");
@@ -376,7 +497,7 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
         checks++;
     }
 #ifdef USE_NUMAS
-    if (cacheTest && !missing) CollectRegistrationFixture(weights,gt,dt,device);
+    if ((cacheTest || streamTest) && !missing) CollectRegistrationFixture(weights,gt,dt,device);
 #endif
     if (groupedTest)
         Check(!FastllmCudaV41GGUFGraphReady(weights[2], 1, topk), "prefill alone admitted a decode graph");
@@ -402,6 +523,21 @@ int main(int argc, char **argv) {
             n += Case(GGML_TYPE_Q3_K,GGML_TYPE_Q3_K,5120,2304,0,true);
             printf("PASS: production decode grids and canonical cache (%d checks, %d changed-input graph replays)\n", n, graphReplays);
             return 0;
+        }
+        cooperativeTest = mode == "--cooperative";
+        if (cooperativeTest && devices < 2) return 77;
+        streamTest = mode == "--stream" || cooperativeTest;
+        if (streamTest) {
+#ifdef USE_NUMAS
+            for (auto pair : std::vector<std::pair<int,int>>{
+                    {GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M}, {GGML_TYPE_Q2_0, GGML_TYPE_Q3_K},
+                    {GGML_TYPE_Q4_K, GGML_TYPE_Q2_0}, {GGML_TYPE_Q2_K, GGML_TYPE_Q4_K}})
+                Case(pair.first, pair.second, 512, 256, 0, false);
+            CheckRegistration();
+            return 0;
+#else
+            return 77;
+#endif
         }
         if (hybridTest) {
             const int n = Case(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 512, 256, 0, false);
@@ -446,5 +582,11 @@ int main(int argc, char **argv) {
         printf("PASS: V4.1 resident GGUF %s (%d checks, %d changed-input graph replays)\n", cacheTest ? "canonical cache" : groupedTest ? "grouped prefill" : "indexed decode", checks, graphReplays);
         fflush(stdout);
         return 0;
-    } catch(const std::exception &e) { fprintf(stderr,"FAIL: %s\n",e.what()); return 1; }
+    } catch(const std::exception &e) {
+        fprintf(stderr,"FAIL: %s\n",e.what());
+#ifdef USE_NUMAS
+        registeredFixtures.clear();
+#endif
+        return 1;
+    }
 }

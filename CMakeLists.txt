@@ -1381,6 +1381,12 @@ if (UNIT_TEST)
             fastllm_add_checked_test(deepseekV41GgufCache deepseekV41GgufIndexedRegression
                 "PASS: V4.1 resident GGUF canonical cache" 300 --cache)
             set_tests_properties(deepseekV41GgufCache PROPERTIES LABELS cuda)
+            fastllm_add_checked_test(deepseekV41GgufStream deepseekV41GgufIndexedRegression
+                "PASS: V4.1 zero-budget GGUF decode streaming" 300 --stream)
+            set_tests_properties(deepseekV41GgufStream PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+            fastllm_add_checked_test(deepseekV41GgufCooperative deepseekV41GgufIndexedRegression
+                "PASS: V4.1 cooperative GGUF decode" 300 --cooperative)
+            set_tests_properties(deepseekV41GgufCooperative PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_test(NAME deepseekV41GgufIndexed COMMAND deepseekV41GgufIndexedRegression)
             add_test(NAME deepseekV41GgufGrouped COMMAND deepseekV41GgufIndexedRegression --grouped-full)
             add_test(NAME deepseekV41GgufGroupedSparse COMMAND deepseekV41GgufIndexedRegression --sparse)

@@ -86,8 +86,9 @@ bool RunHybridMoe(const Data &input, const Data &index, const Data &score,
                   Data &output, Data **weights, int count, int layer,
                   const std::function<void()> &launchParallel = {});
 
-// Tensor-parallel host experts can use multiple GPU cache/assist devices while
-// retaining their existing format-specific reduction and shared-expert overlap.
+// Host experts can borrow multiple GPUs independently of dense PP/TP placement.
+// The caller hands off their streams; format-specific expert math and ordered
+// reduction stay in the backend. Residency is independent of temporary work.
 bool RunHybridMoeOnDevices(const Data &input, const Data &index, const Data &score,
                           Data &output, Data **weights, int count, int layer,
                           const std::vector<int> &devices,

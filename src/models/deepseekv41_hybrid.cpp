@@ -38,9 +38,13 @@ namespace fastllm {
     void DeepSeekV41Model::BeginHybridMoeStep(
             HybridMoeDecodeStep &step, bool tp, bool single, int seqlen) {
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        if (FastllmCudaMoeCacheRequested() && !moeExpertCacheAttempted &&
+        const bool streamGGUF = !tp && weights[0][2]->dataType == DATA_GGUF_FORMAT;
+        if ((FastllmCudaMoeCacheRequested() || streamGGUF) && !moeExpertCacheAttempted &&
             !weights[0][2]->isDiskWeight) {
             moeExpertCacheAttempted = true;
+            std::vector<CudaPrefillStage> stages;
+            if (!tp && BuildCudaPrefillStages(deviceMap, block_cnt, stages))
+                for (const auto &stage : stages) hybridMoeDevices.push_back(stage.device);
             bool supported = !V41ReferenceMathEnabled() && GetCudaSharedExpert();
             std::vector<std::vector<Data *>> routedWeights = weights;
             std::vector<std::vector<Data *>> draftWeights;
@@ -74,7 +78,7 @@ namespace fastllm {
                 cache.Add(routedWeights[layer], device);
             }
             if (!supported || !cache.Prepare(
-                    [this] { WarmupNumaMoeWeights(); })) {
+                    [this] { WarmupNumaMoeWeights(); }, streamGGUF)) {
                 fprintf(stderr, "[Fastllm] V4.1 expert cache requires NUMA FP8 block128, NVFP4 block32 or supported GGUF experts, "
                     "CUDA shared experts and ordinary math; using the configured backend.\n");
             }
@@ -154,6 +158,18 @@ namespace fastllm {
         bool tpCacheHandled = false;
         bool singleCacheHandled = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        // A zero residency budget still permits bounded temporary GPU records.
+        // A layer-local scope activates measured splitting without admission.
+        // Serial decode can borrow the other PP devices; concurrent prefill
+        // stages retain exclusive ownership of their current device.
+        HybridMoeDecodeStep streamingStep;
+        if (!tp && !graphActive && single && seqlen == 1 && !FastllmCudaMoeCacheRequested() &&
+            !dumpDebug && !V41ReferenceMathEnabled() && hasSharedExpertOut &&
+            moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
+            V41DeviceSpecUsesType(overlapMoeDevice, "numa") &&
+            FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
+            streamingStep.Begin(moeWeights.data(), (int)moeWeights.size(), num_experts_per_tok);
+        }
         // Verification runs between graph segments too. Use the same stable
         // staging as decode, rather than migrating tensors owned by a graph.
         // Its multi-row scheduler is independent of the single-token step.
@@ -161,7 +177,7 @@ namespace fastllm {
             (seqlen >= 1 && seqlen < 32) && FastllmCudaMoeCacheRequested() &&
             !dumpDebug && !V41ReferenceMathEnabled() &&
             V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "numa");
-        if (((step && *step) || singleStageCache) && hasSharedExpertOut &&
+        if (((step && *step) || singleStageCache || streamingStep) && hasSharedExpertOut &&
             moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
             ffnInput.dataDevice == DataDevice::CUDA && ffnInput.cudaData &&
             FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
@@ -170,17 +186,30 @@ namespace fastllm {
             auto &cache = ws->hybrid->moeCache[device];
             // The router may return CPU tensors. Stage only its small
             // result, never migrate the input/output of a captured segment.
-            V41ReplicaToCpu(cache.index, expertIndex, tpDevices);
-            V41ReplicaToCpu(cache.score, expertScore, tpDevices);
-            cache.index.ToDevice(DataDevice::CUDA, {device}, true);
-            cache.score.ToDevice(DataDevice::CUDA, {device}, true);
+            auto stageRoute = [&](Data &buffer, Data &source) -> Data & {
+                // Eager PP routing already owns a valid CUDA tensor. Keep it
+                // on-device; the hybrid backend batches its pinned D2H copies.
+                if (streamingStep && source.dataDevice == DataDevice::CUDA &&
+                    source.cudaData && !source.multiDeviceData &&
+                    GetPointerDeviceId(source.cudaData) == device) return source;
+                V41ReplicaToCpu(buffer, source, tpDevices);
+                buffer.ToDevice(DataDevice::CUDA, {device}, true);
+                return buffer;
+            };
+            Data &routeIndex = stageRoute(cache.index, expertIndex);
+            Data &routeScore = stageRoute(cache.score, expertScore);
             Data input;
             input.FakeFrom(ffnInput, 0);
             input.Resize({seqlen, dim});
             input.dataDeviceIds = {device};
-            singleCacheHandled = fastllm::RunHybridMoe(
-                input, cache.index, cache.score, ffnOut,
-                moeWeights.data(), (int)moeWeights.size(), layer, runSharedSegment);
+            if (streamingStep && !ctx.pipelineHostExperts && hybridMoeDevices.size() > 1)
+                singleCacheHandled = fastllm::RunHybridMoeOnDevices(
+                    input, routeIndex, routeScore, ffnOut, moeWeights.data(),
+                    (int)moeWeights.size(), layer, hybridMoeDevices, runSharedSegment);
+            else
+                singleCacheHandled = fastllm::RunHybridMoe(
+                    input, routeIndex, routeScore, ffnOut,
+                    moeWeights.data(), (int)moeWeights.size(), layer, runSharedSegment);
         }
         if (tp && FastllmCudaMoeCacheRequested() && single &&
             (seqlen == 1 || (dsparkVerify && seqlen <= 8)) && !dumpDebug && hasSharedExpertOut &&

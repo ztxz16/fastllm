@@ -353,7 +353,7 @@ struct DeviceCache {
     std::unique_ptr<DecodePolicyState> decode;
 };
 
-struct Glm5MultiGpuHybrid;
+struct CooperativeMoe;
 struct Glm5TensorParallel;
 struct OffloadGroup {
     OffloadLayout layout;
@@ -377,7 +377,7 @@ struct OffloadGroup {
     // from these borrowed CPU layouts, without a second full host snapshot.
     std::vector<fastllm_gguf_restore::Record> ggufSources;
     std::unordered_map<int, std::unique_ptr<DeviceCache> > deviceCaches;
-    std::shared_ptr<Glm5MultiGpuHybrid> cooperativeHybrid;
+    std::shared_ptr<CooperativeMoe> cooperativeHybrid;
     bool tensorParallelRequested = false;
     std::shared_ptr<Glm5TensorParallel> tensorParallel;
     std::vector<int> expertDevices;
@@ -4153,7 +4153,9 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
     // Auto-configured caches must not require a separate environment opt-in.
     const bool v41FrequencyScope = group->layout.deepSeekV41 &&
         (group->layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 ||
-         group->layout.weightType == fastllm::FP8_E4M3_BLOCK_128);
+         group->layout.weightType == fastllm::FP8_E4M3_BLOCK_128 ||
+         (group->layout.weightType == fastllm::DATA_GGUF_FORMAT &&
+          group->allowStreaming && cache->slots == 0));
     const bool frequencyScope = v41FrequencyScope || (!group->layout.deepSeekV41 && !group->layout.glm5) ||
         (group->layout.glm5 && (NativeSharedRecords(*group) ||
          group->layout.weightType == fastllm::DATA_GGUF_FORMAT));
@@ -4315,7 +4317,7 @@ int V41CacheOption(const char *name, int fallback) {
 } // namespace
 
 #ifdef USE_NUMAS
-#include "fastllm-moe-glm5-hybrid.cuh"
+#include "fastllm-moe-cooperative.cuh"
 #endif
 
 static bool MergeMOEHybrid(const fastllm::Data &input,
@@ -4334,11 +4336,11 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
         int table = -1;
         auto *group = FindHybridGroup(weights, weightsBatch, &table);
         cudaStreamCaptureStatus capture;
-        if (group && group->layout.glm5 &&
+        if (group && SupportsCooperativeMoe(group->LayerLayout(table)) &&
             cudaStreamIsCapturing(cudaStreamPerThread, &capture) == cudaSuccess &&
             capture == cudaStreamCaptureStatusNone) {
             auto *origin = GetDeviceCache(*group);
-            if (origin && TryGlm5MultiGpuHybrid(*group, *origin, table, input, index, score,
+            if (origin && TryCooperativeMoe(*group, *origin, table, input, index, score,
                     output, weights, weightsBatch, layer, launchParallel, devices)) return true;
         }
     }
@@ -4349,7 +4351,7 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
         if (!group) return false;
         if (group->layout.glm5 && group->layout.weightType == fastllm::DATA_GGUF_FORMAT) {
             auto *cache = GetDeviceCache(*group);
-            return cache && TryGlm5MultiGpuHybrid(*group, *cache, table,
+            return cache && TryCooperativeMoe(*group, *cache, table,
                 input, index, score, output, weights, weightsBatch, layer, launchParallel, devices);
         }
         if (group->layout.deepSeekV41 ? input.dataType != fastllm::DataType::BFLOAT16 :
@@ -4357,7 +4359,7 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
              input.dataType != fastllm::DataType::FLOAT32)) return false;
         auto *cache = GetDeviceCache(*group);
         if (!cache) return false;
-        if (!devices && group->layout.glm5 && TryGlm5MultiGpuHybrid(*group, *cache, table,
+        if (!devices && group->layout.glm5 && TryCooperativeMoe(*group, *cache, table,
                 input, index, score, output, weights, weightsBatch, layer, launchParallel)) return true;
         // Keep resident experts on GPU and dynamically split quantized misses
         // between NUMA and streamed GPU execution, deduplicating weight DMA
