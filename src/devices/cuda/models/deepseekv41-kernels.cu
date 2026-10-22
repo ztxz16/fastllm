@@ -4656,11 +4656,11 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                             valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads,
                             softmaxScale, coefficients, inverseSums);
                         if (!V41CheckLaunch("Sm75QuantizedAttentionCoefficients")) return false;
-                        V41Sm75QuantizedAttentionValues<multi, true><<<dim3(heads, 16, seqlen), 32, 0, cudaStreamPerThread>>>(
+                        V41Sm75QuantizedAttentionValues<multi, true><<<dim3(heads, 8, seqlen), 64, 0, cudaStreamPerThread>>>(
                             rows, valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads, softmaxScale,
                             static_cast<__nv_bfloat16 *>(output.cudaData), coefficients, inverseSums);
                     } else {
-                        V41Sm75QuantizedAttentionValues<multi><<<dim3(heads, 16, seqlen), 32, 0, cudaStreamPerThread>>>(
+                        V41Sm75QuantizedAttentionValues<multi><<<dim3(heads, 8, seqlen), 64, 0, cudaStreamPerThread>>>(
                             rows, valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads, softmaxScale,
                             static_cast<__nv_bfloat16 *>(output.cudaData));
                     }

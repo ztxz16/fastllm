@@ -139,7 +139,7 @@ V41Sm75QuantizedAttentionCoefficients(const int32_t *valid, const float *scores,
 // Independent output dimensions can run in parallel without changing the
 // online-softmax or PV accumulation order, including skipped/duplicate indices.
 template<bool MultiToken, bool ReuseCoefficients = false>
-__global__ void __launch_bounds__(32)
+__global__ void __launch_bounds__(64)
 V41Sm75QuantizedAttentionValues(const float *rows, const int32_t *valid,
                                 const float *scores, const float *sink,
                                 int count, int heads, float scale, __nv_bfloat16 *output,
@@ -149,9 +149,11 @@ V41Sm75QuantizedAttentionValues(const float *rows, const int32_t *valid,
     valid += size_t(token) * count;
     scores += size_t(token) * heads * count;
     output += size_t(token) * heads * 512;
-    const int head = blockIdx.x, d = blockIdx.y * 32 + threadIdx.x;
+    const int head = blockIdx.x, d = blockIdx.y * 64 + threadIdx.x;
     if constexpr (ReuseCoefficients) coefficients += (size_t(token) * heads + head) * count;
-    constexpr int Tile = 4;
+    // Two warps per CTA and eight prefetched candidates preserve the ordered
+    // recurrence while improving memory-level parallelism on SM75.
+    constexpr int Tile = 8;
     float acc = 0.f, mx = sink[head], sum = 1.f;
     for (int base = 0; base < count; base += Tile) {
         float sc[Tile], values[Tile];
