@@ -4741,12 +4741,20 @@ namespace fastllm {
             data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmFloatToHalf(old, data.cudaData, len);
-            FastllmCudaFree(old);
+            if (!data.cudaDataBorrowed) FastllmCudaFree(old);
+            data.cudaDataBorrowed = false;
         } else if (data.dataType == DataType::BFLOAT16) {
             data.dataType = DataType::FLOAT16;
             data.UpdateUnitSize();
             int len = data.Count(0);
-            FastllmBF16ToHalf(data.cudaData, data.cudaData, len);
+            void *old = data.cudaData;
+            // A borrowed view must not change its owner's representation or
+            // release the underlying persistent allocation.
+            if (data.cudaDataBorrowed) {
+                data.cudaData = FastllmCudaMalloc(GetConvertedBufferBytes(data));
+                data.cudaDataBorrowed = false;
+            }
+            FastllmBF16ToHalf(old, data.cudaData, len);
         } else {
             ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
         }
@@ -4786,7 +4794,8 @@ namespace fastllm {
             data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmHalfToFloat(old, data.cudaData, len);
-            FastllmCudaFree(old);
+            if (!data.cudaDataBorrowed) FastllmCudaFree(old);
+            data.cudaDataBorrowed = false;
         } else if (data.dataType == DataType::BFLOAT16) {
             uint16_t *old = (uint16_t*)data.cudaData;
             data.dataType = DataType::FLOAT32;
@@ -4795,7 +4804,8 @@ namespace fastllm {
             data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmBF16ToFloat(old, data.cudaData, len);
-            FastllmCudaFree(old);
+            if (!data.cudaDataBorrowed) FastllmCudaFree(old);
+            data.cudaDataBorrowed = false;
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
         }
@@ -4880,12 +4890,20 @@ namespace fastllm {
             data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmFloatToBF16(old, data.cudaData, len);
-            FastllmCudaFree(old);
+            if (!data.cudaDataBorrowed) FastllmCudaFree(old);
+            data.cudaDataBorrowed = false;
         } else if (data.dataType == DataType::FLOAT16) {
             data.dataType = DataType::BFLOAT16;
             data.UpdateUnitSize();
             int len = data.Count(0);
-            FastllmHalfToBF16(data.cudaData, data.cudaData, len);
+            void *old = data.cudaData;
+            // A borrowed view must not change its owner's representation or
+            // release the underlying persistent allocation.
+            if (data.cudaDataBorrowed) {
+                data.cudaData = FastllmCudaMalloc(GetConvertedBufferBytes(data));
+                data.cudaDataBorrowed = false;
+            }
+            FastllmHalfToBF16(old, data.cudaData, len);
         } else {
             ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
         }
