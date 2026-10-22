@@ -5,6 +5,7 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-linear-output.h"
 #include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
 #include "devices/multicuda/multicudadevice.h"
 
@@ -3968,6 +3969,123 @@ namespace fastllm {
             }
         }
     };
+
+    struct MultiCudaOutputGatherWorkspace {
+        const Data *weight = nullptr;
+        std::vector<int> devices, inputDims;
+        std::vector<void*> weights;
+        DataType type = DataType::FLOAT32;
+        DivisionScheme ranges;
+        int rows = 0, vocab = 0, width = 0;
+        struct Rank { Data input, output, packet, gathered, compactWeight; };
+        std::vector<std::unique_ptr<Rank>> ranks;
+        Data result;
+        void *ready = nullptr;
+        ~MultiCudaOutputGatherWorkspace() {
+            if (ready) {
+                int previous = FastllmCudaGetDevice();
+                FastllmCudaSetDevice(devices.front()); FastllmCudaEventDestroy(ready);
+                FastllmCudaSetDevice(previous);
+            }
+        }
+    };
+
+    bool MultiCudaLinearOutputGatherPersistent(Data &input, Data &weight, Data &output,
+                                               std::shared_ptr<void> &workspace) {
+        if (input.multiDeviceData || input.dataDevice != DataDevice::CUDA || !input.cudaData ||
+            input.dims.empty() || weight.dims.size() != 2 || input.dims.back() != weight.dims[1] ||
+            (input.dataType != DataType::FLOAT32 && input.dataType != DataType::BFLOAT16) ||
+            weight.dataType != DataType::FLOAT32 ||
+            MultiCudaEnvFlagEnabled("FASTLLM_DISABLE_NCCL")) return false;
+        std::vector<int> devices; std::map<int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() < 2 || !MultiCudaDedicatedWorkersEnabled() || !FastllmInitNccl(devices)) return false;
+        const int root = devices.front();
+        if (GetPointerDeviceId(input.cudaData) != root) return false;
+        Data bias;
+        auto ranges = BuildMultiCudaRowSplitScheme(weight, devices, ratios);
+        if (!SplitMultiCudaWeight(weight, bias, devices, ranges, 0, true, true)) return false;
+        std::vector<void*> weights;
+        for (int device : devices) weights.push_back(weight.multiDeviceDatas.at(device)->cudaData);
+        auto state = std::static_pointer_cast<MultiCudaOutputGatherWorkspace>(workspace);
+        if (state && (state->weight != &weight || state->devices != devices || state->inputDims != input.dims ||
+            state->weights != weights || state->type != input.dataType || state->ranges != ranges)) return false;
+        if (!state) {
+            if (FastllmCudaGraphIsCapturingFast()) return false;
+            state = std::make_shared<MultiCudaOutputGatherWorkspace>();
+            state->weight = &weight; state->devices = devices; state->inputDims = input.dims;
+            state->weights = weights; state->type = input.dataType; state->ranges = ranges;
+            state->rows = input.Count(0) / input.dims.back(); state->vocab = weight.dims[0];
+            for (int device : devices) state->width = std::max(state->width, weight.multiDeviceDatas.at(device)->dims[0]);
+            auto allocate = [&](Data &data, const std::vector<int> &dims, int device, DataType type = DataType::FLOAT32) {
+                data.dataType = type; data.UpdateUnitSize(); data.Resize(dims);
+                data.dataDevice = DataDevice::CUDA; data.dataDeviceIds = {device};
+                FastllmCudaSetDevice(device); data.Allocate(false);
+            };
+            bool compact = input.dataType == DataType::BFLOAT16;
+            for (int device : devices) {
+                auto rank = std::make_unique<MultiCudaOutputGatherWorkspace::Rank>();
+                FastllmCudaSetDevice(device);
+                if (compact && !FastllmCudaTryCompactBFloat16Weight(*weight.multiDeviceDatas.at(device),
+                                                                   rank->compactWeight)) compact = false;
+                state->ranks.push_back(std::move(rank));
+            }
+            // Remember an unsupported checkpoint in the same workspace so the
+            // ordinary FP32 fallback does not retry a weight scan every token.
+            if (!compact) state->type = DataType::FLOAT32;
+            for (size_t index = 0; index < devices.size(); ++index) {
+                const int device = devices[index];
+                auto &rank = state->ranks[index];
+                if (!compact) rank->compactWeight.FreeSpace();
+                allocate(rank->input, input.dims, device, state->type);
+                allocate(rank->output, {state->rows, weight.multiDeviceDatas.at(device)->dims[0]}, device);
+                allocate(rank->packet, {state->rows, state->width}, device);
+                allocate(rank->gathered, {(int)devices.size(), state->rows, state->width}, device);
+                FastllmCudaMemset0(rank->packet.cudaData, rank->packet.GetBytes());
+            }
+            auto dims = input.dims; dims.back() = state->vocab;
+            allocate(state->result, dims, root); state->ready = FastllmCudaEventCreate();
+            workspace = state;
+        }
+        FastllmCudaSetDevice(root);
+        if (state->type != input.dataType) return false;
+        FastllmCudaEventRecordCurrentThread(state->ready);
+        bool queued = MultiCudaRunDeviceCallbacksEnqueueOnly(devices, [&](int index, int device) {
+            auto &rank = *state->ranks[index];
+            if (device == root) FastllmCudaCurrentThreadStreamWaitEvent(state->ready);
+            FastllmNcclBroadcastFrom(input.cudaData, rank.input.cudaData, input.Count(0), input.dataType, root, device);
+            Data &localWeight = *weight.multiDeviceDatas.at(device);
+            if (state->type == DataType::BFLOAT16) {
+                AssertInFastLLM(FastllmCudaBFloat16LinearFloat32(rank.input, rank.compactWeight, rank.output),
+                                "MultiCuda BF16 projection with FP32 output failed.");
+            } else DoCudaLinear(rank.input, localWeight, *GetEmptyData(), rank.output);
+            const size_t stride = (size_t)state->width * sizeof(float);
+            AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(rank.packet.cudaData, stride,
+                rank.output.cudaData, localWeight.dims[0] * sizeof(float), localWeight.dims[0] * sizeof(float),
+                state->rows), "MultiCuda persistent linear packing failed.");
+            AssertInFastLLM(FastllmNcclAllGather(rank.packet.cudaData, rank.gathered.cudaData,
+                state->rows * state->width, DataType::FLOAT32, device), "MultiCuda persistent linear gather failed.");
+            if (device == root) {
+                for (size_t other = 0; other < devices.size(); ++other) {
+                    int offset = 0;
+                    for (auto range : state->ranges.at(devices[other])) {
+                        const int length = range.second - range.first;
+                        const char *source = (const char*)rank.gathered.cudaData +
+                            other * state->rows * stride + offset * sizeof(float);
+                        char *destination = (char*)state->result.cudaData + range.first * sizeof(float);
+                        AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(destination,
+                            state->vocab * sizeof(float), source, stride, length * sizeof(float), state->rows),
+                            "MultiCuda persistent linear unpacking failed.");
+                        offset += length;
+                    }
+                }
+            }
+        });
+        AssertInFastLLM(queued && !FastllmCudaGetThreadError(), "MultiCuda persistent linear dispatch failed.");
+        FastllmCudaSetDevice(root); MultiCudaCurrentThreadWaitForWorker(root);
+        output.CopyFrom(state->result);
+        return true;
+    }
 
     static bool RunMultiCudaOutputGatherLinear(
             Data &input, Data &weight, Data &bias, Data &output) {

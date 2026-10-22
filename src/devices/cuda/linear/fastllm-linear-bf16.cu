@@ -4,6 +4,7 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "devices/cuda/fastllm-cuda-linear-output.h"
 #include "fastllm-bf16-lt.cuh"
 #include <stdexcept>
 #include "../fastllm-hybrid-prefill.cuh"
@@ -1235,5 +1236,52 @@ bool FastllmCudaBFloat16MatMulFloat32(const fastllm::Data &input, fastllm::Data 
     FastllmCudaFree(cudaInput);
     FastllmCudaFree(cudaOutput);
     DeviceSync();
+    return true;
+}
+
+namespace {
+__global__ void FastllmCompactBFloat16ExactKernel(const float *input, uint16_t *output,
+                                                uint64_t count, int *inexact) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t bits = __float_as_uint(input[i]);
+    output[i] = bits >> 16;
+    if ((bits & 0xffffu) || !isfinite(input[i])) atomicExch(inexact, 1);
+}
+}
+
+bool FastllmCudaTryCompactBFloat16Weight(const fastllm::Data &source, fastllm::Data &compact) {
+    if (source.dataDevice != fastllm::DataDevice::CUDA || !source.cudaData || source.dims.size() != 2 ||
+        source.dataType != fastllm::DataType::FLOAT32 || source.dims[0] <= 0 || source.dims[1] <= 0 || source.multiDeviceData ||
+        FastllmCudaGraphIsCapturingFast() || FastllmCudaRuntimeArch() < 80) return false;
+    compact.dataType = fastllm::DataType::BFLOAT16; compact.UpdateUnitSize(); compact.Resize(source.dims);
+    compact.ToDevice(fastllm::DataDevice::CUDA, source.dataDeviceIds, false); compact.Allocate(false);
+    int *flag = (int*)FastllmCudaMalloc(sizeof(int));
+    FastllmCudaMemset0(flag, sizeof(int));
+    FastllmCompactBFloat16ExactKernel<<<(source.Count(0) + 255) / 256, 256>>>(
+        (const float*)source.cudaData, (uint16_t*)compact.cudaData, source.Count(0), flag);
+    int inexact = 1;
+    FastllmCudaCopyFromDeviceToHost(&inexact, flag, sizeof(int)); FastllmCudaFree(flag);
+    return inexact == 0;
+}
+
+bool FastllmCudaBFloat16LinearFloat32(const fastllm::Data &input, const fastllm::Data &weight,
+                                     fastllm::Data &output) {
+    if (input.dataType != fastllm::DataType::BFLOAT16 || weight.dataType != fastllm::DataType::BFLOAT16 ||
+        input.dataDevice != fastllm::DataDevice::CUDA || weight.dataDevice != fastllm::DataDevice::CUDA ||
+        !input.cudaData || !weight.cudaData || input.multiDeviceData || weight.multiDeviceData ||
+        input.dataDeviceIds != weight.dataDeviceIds || input.dims.empty() || weight.dims.size() != 2 ||
+        input.dims.back() <= 0 ||
+        input.dims.back() != weight.dims[1] || FastllmCudaRuntimeArch() < 80) return false;
+    const int m = input.dims.back(), n = input.Count(0) / m, k = weight.dims[0];
+    if (m <= 0 || n <= 0 || k <= 0) return false;
+    auto dims = input.dims; dims.back() = k;
+    output.dataType = fastllm::DataType::FLOAT32; output.UpdateUnitSize(); output.Resize(dims);
+    output.ToDevice(fastllm::DataDevice::CUDA, input.dataDeviceIds, false); output.Allocate(false);
+    float alpha = 1.f, beta = 0.f;
+    const auto status = cublasGemmEx(getFastllmCublasHandle(), CUBLAS_OP_T, CUBLAS_OP_N, k, n, m,
+        &alpha, weight.cudaData, CUDA_R_16BF, m, input.cudaData, CUDA_R_16BF, m,
+        &beta, output.cudaData, CUDA_R_32F, k, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("BF16 linear with FP32 output failed");
     return true;
 }

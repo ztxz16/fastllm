@@ -1408,12 +1408,26 @@ if (UNIT_TEST)
                 "PASS [0-9]+ replicated row slices" 300)
             set_tests_properties(multiCudaReplicatedRows PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+            add_executable(bfloat16FloatOutputRegression test/ops/bfloat16FloatOutputRegression.cpp)
+            target_link_libraries(bfloat16FloatOutputRegression PRIVATE fastllm)
+            target_include_directories(bfloat16FloatOutputRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(bfloat16FloatOutput bfloat16FloatOutputRegression
+                "PASS [0-9]+ BF16 FP32-output oracle checks" 300)
+            set_tests_properties(bfloat16FloatOutput PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
             add_executable(cudaBorrowedConversionRegression test/ops/cudaBorrowedConversionRegression.cpp)
             target_link_libraries(cudaBorrowedConversionRegression PRIVATE fastllm)
             target_include_directories(cudaBorrowedConversionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             fastllm_add_checked_test(cudaBorrowedConversion cudaBorrowedConversionRegression
                 "PASS [0-9]+ borrowed CUDA conversions" 300)
             set_tests_properties(cudaBorrowedConversion PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+            add_executable(multiCudaOutputGatherRegression test/ops/multiCudaOutputGatherRegression.cpp)
+            target_link_libraries(multiCudaOutputGatherRegression PRIVATE fastllm)
+            target_include_directories(multiCudaOutputGatherRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(multiCudaOutputGather multiCudaOutputGatherRegression
+                "PASS [0-9]+ persistent gathered projections" 300)
+            set_tests_properties(multiCudaOutputGather PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
             add_executable(multiCudaHybridMoeRegression test/ops/multiCudaHybridMoeRegression.cpp)
             target_link_libraries(multiCudaHybridMoeRegression PRIVATE fastllm)

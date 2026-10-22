@@ -165,6 +165,11 @@ namespace fastllm {
     // address can be reused by a subsequently loaded model.
     void MultiCudaReleaseMoeWeightCaches(const Data *layerKey);
 
+    // Stable buffers and stream dependencies permit graph capture of a
+    // vocabulary-sharded projection with FP32 output and FP32/BF16 input,
+    // including uneven shard widths.
+    bool MultiCudaLinearOutputGatherPersistent(Data &input, Data &weight, Data &output,
+                                               std::shared_ptr<void> &workspace);
     bool MultiCudaLinearRow(Data &input, Data &weight, Data &bias, Data &output);
     bool MultiCudaLinearColumn(Data &input, Data &weight, Data &bias, Data &output);
     struct MultiCudaAsyncMLPHandle;

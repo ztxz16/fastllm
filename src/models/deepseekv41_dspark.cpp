@@ -814,7 +814,16 @@ namespace fastllm {
         Repeat(embedOut, 2, hc_mult, hiddenStates);
     }
 
-    void DeepSeekV41Model::DsparkProjectHead(Data &input, Data &output) {
+    void DeepSeekV41Model::DsparkProjectHead(Data &input, Data &output, bool persistent) {
+#ifdef USE_CUDA
+        if (persistent && input.dataType == DataType::BFLOAT16 && !v41DsparkTpDevices.empty() &&
+            !quantizedLinearNames.count("head.weight")) {
+            ApplyDsparkDevice();
+            FastllmMultiCudaSetDevice(v41DsparkTpDevices);
+            if (MultiCudaLinearOutputGatherPersistent(input, weight["head.weight"], output,
+                                                     v41DsparkHeadWorkspace)) return;
+        }
+#endif
         Data floatInput;
         Data *headInput = &input;
         if (weight["head.weight"].dataType == DataType::FLOAT32) {
@@ -837,6 +846,13 @@ namespace fastllm {
         // Drain their streams and allocate the gather destination on rank 0.
         ApplyDsparkDevice();
         ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
+#ifdef USE_CUDA
+        if (persistent && MultiCudaLinearOutputGatherPersistent(*source, weight["head.weight"], output,
+                                                  v41DsparkHeadWorkspace)) {
+            ApplyDsparkDevice();
+            return;
+        }
+#endif
         // Keep the vocabulary shards intact and gather complete logits on the
         // first GPU, as in Qwen's draft output-gather linear path.
         DsExecutor().Run("Linear",
@@ -1775,7 +1791,7 @@ namespace fastllm {
         if (v41DsparkTpDevices.empty()) {
             Linear(normed, weight["head.weight"], *GetEmptyData(), logits);
         } else {
-            DsparkProjectHead(normed, logits);
+            DsparkProjectHead(normed, logits, true);
         }
         ToDataType(logits, DataType::FLOAT32);
 

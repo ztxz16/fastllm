@@ -490,6 +490,7 @@ namespace fastllm {
         float v41DsparkConfidenceThreshold = 0.0f;
         std::vector<int> v41DsparkTargetLayerIds;
         std::vector<int> v41DsparkTpDevices;
+        std::shared_ptr<void> v41DsparkHeadWorkspace;
         std::vector<char> v41IsDsparkTarget;  // [block_cnt]
         std::vector<std::vector<Data*> > v41DsparkMoeWeights, v41DsparkMoeBiass;
         std::atomic<long long> v41DsparkRounds{0};
@@ -500,7 +501,7 @@ namespace fastllm {
         void InitDsparkParams();
         void ApplyDsparkDevice();
         void DsparkEmbedInput(const Data &inputIds, Data &hiddenStates);
-        void DsparkProjectHead(Data &input, Data &output);
+        void DsparkProjectHead(Data &input, Data &output, bool persistent = false);
         bool DsparkTensorNeeded(const std::string &name) const;
         // 支持贪心 / CUDA 采样及逐位置工具名、参数名约束
         bool DsparkSupportsRequest(const GenerationConfig &config,
