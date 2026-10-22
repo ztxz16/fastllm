@@ -1,4 +1,5 @@
 #include <climits>
+#include <stdexcept>
 #include "devices/cuda/fastllm-fp8-small-t.cuh"
 #include "devices/cuda/fastllm-fp8-sm70.cuh"
 //
@@ -2608,6 +2609,43 @@ static void FastllmCudaFP8E4M3EnsureBFloat16BiasOnDevice(fastllm::Data &weight, 
         checkCudaErrors("Error: CUDA error when moving bf16 bias to device!", state);
         weight.extraCudaHalfData.push_back((void *) cudaBiasData);
     }
+}
+
+extern "C" bool FastllmCudaConcatFp8Rows(const fastllm::Data &first,
+        const fastllm::Data &second, fastllm::Data &output) {
+    using namespace fastllm;
+    const int device = FastllmCudaGetDevice();
+    if (!output.dims.empty() || output.cudaData || output.cpuData || output.multiDeviceData ||
+        &output == &first || &output == &second || FastllmCudaGraphIsCapturingFast()) return false;
+    for (const Data *w : {&first, &second}) {
+        if (w->dataType != DataType::FP8_E4M3 || w->IsRepacked || w->isFake || w->isGGUFData ||
+            w->multiDeviceData || w->dataDevice != DataDevice::CUDA || !w->cudaData ||
+            w->dataDeviceIds != std::vector<int>{device} || w->dims.size() != 2 ||
+            w->dims[0] <= 0 || w->dims[1] <= 0 || w->blockM <= 0 || w->blockK <= 0 ||
+            FastllmCudaHasFp8MarlinLayout(*w) || FastllmCudaFp8E4M3HasSm70Layout(*w)) return false;
+        const size_t scales = size_t((w->dims[0] - 1) / w->blockK + 1) *
+                                     ((w->dims[1] - 1) / w->blockM + 1);
+        if (w->scales.size() != scales) return false;
+    }
+    if (first.dims[1] != second.dims[1] || first.blockM != second.blockM ||
+        first.blockK != second.blockK || first.dims[0] % first.blockK ||
+        first.dims[0] > INT_MAX - second.dims[0]) return false;
+    output.dataType = DataType::FP8_E4M3;
+    output.UpdateUnitSize();
+    output.Resize({first.dims[0] + second.dims[0], first.dims[1]});
+    output.blockM = first.blockM;
+    output.blockK = first.blockK;
+    output.scales = first.scales;
+    output.scales.insert(output.scales.end(), second.scales.begin(), second.scales.end());
+    output.dataDevice = DataDevice::CUDA;
+    output.dataDeviceIds = {device};
+    output.Allocate();
+    const bool copied = FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+        output.cudaData, first.cudaData, first.GetBytes()) &&
+        FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+            (uint8_t*)output.cudaData + first.GetBytes(), second.cudaData, second.GetBytes());
+    if (!copied) throw std::runtime_error("FP8 row concatenation failed.");
+    return true;
 }
 
 extern "C" bool FastllmCudaBFloat16FP8LinearPair(const fastllm::Data &input,

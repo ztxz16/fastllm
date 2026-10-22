@@ -837,14 +837,55 @@ namespace fastllm {
         }
 
 #ifdef USE_CUDA
-        // B1 only: larger batches retain their existing GEMM dispatch. All
-        // graph-owned scratch buffers belong to the forward workspace.
+        bool V41PrepareQkvWeight(Data &merged, Data &qw, Data &kw,
+                                  const std::vector<int> &devices) {
+            if (!merged.dims.empty()) {
+                if (merged.dataType != DataType::FP8_E4M3 || merged.blockM != qw.blockM ||
+                    merged.blockK != qw.blockK ||
+                    merged.dims != std::vector<int>{qw.dims[0] + kw.dims[0], qw.dims[1]}) return false;
+                if (devices.empty()) return !merged.multiDeviceData && merged.cudaData &&
+                    merged.dataDeviceIds == std::vector<int>{FastllmCudaGetDevice()};
+                if (!merged.IsTensorParallelReplicated() || merged.multiDeviceDatas.size() != devices.size())
+                    return false;
+                for (int device : devices) {
+                    auto local = merged.multiDeviceDatas.find(device);
+                    if (local == merged.multiDeviceDatas.end() || !local->second || !local->second->cudaData)
+                        return false;
+                }
+                return true;
+            }
+            if (devices.empty()) return FastllmCudaConcatFp8Rows(qw, kw, merged);
+            std::vector<std::unique_ptr<Data>> locals;
+            for (size_t i = 0; i < devices.size(); ++i) locals.emplace_back(new Data());
+            std::vector<int> ok(devices.size(), 0);
+            const bool submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                ok[rank] = FastllmCudaConcatFp8Rows(*qw.multiDeviceDatas.at(device),
+                    *kw.multiDeviceDatas.at(device), *locals[rank]);
+            });
+            if (!submitted || !std::all_of(ok.begin(), ok.end(), [](int x) { return x != 0; })) {
+                for (int device : devices) FastllmCudaSyncDevice(device);
+                return false;
+            }
+            merged.dataType = DataType::FP8_E4M3;
+            merged.UpdateUnitSize();
+            merged.Resize({qw.dims[0] + kw.dims[0], qw.dims[1]});
+            merged.blockM = qw.blockM; merged.blockK = qw.blockK;
+            merged.dataDevice = DataDevice::CUDA; merged.dataDeviceIds = devices;
+            merged.multiDeviceData = true; merged.tpLayout = TP_LAYOUT_REPLICATED;
+            merged.tpAxis = -1; merged.tpGlobalDims = merged.dims;
+            for (size_t i = 0; i < devices.size(); ++i) merged.multiDeviceDatas[devices[i]] = locals[i].release();
+            return true;
+        }
+
+        // Single-row GEMV and small-batch GEMM share the same BF16 normalization
+        // and FP8 activation boundaries. Graph slots share the packed weight cache.
         bool V41QkvPrepare(const Data &input, Data &qw, Data &kw, Data &qnw, Data &knw, float eps,
                            Data &inputQuant, Data &qr, Data &qNorm, Data &qQuant, Data &kv,
-                           bool inputQuantized = false) {
+                           bool inputQuantized = false, Data *joinedWeight = nullptr) {
             if (input.dataType != DataType::BFLOAT16 || input.dims.empty() || input.dims.back() <= 0 ||
-                input.Count(0) != (uint64_t)input.dims.back() || input.dims.back() % 32 ||
-                !std::isfinite(eps) || eps < 0) return false;
+                input.dims.back() % 32 || !std::isfinite(eps) || eps < 0) return false;
+            const uint64_t rows = input.Count(0) / input.dims.back();
+            if (rows < 1 || rows > 8 || (rows > 1 && !joinedWeight)) return false;
             for (const Data *w : {&qw, &kw}) {
                 if (w->dataType != DataType::FP8_E4M3 || w->IsRepacked || w->dims.size() != 2 ||
                     w->dims[1] != input.dims.back() || w->dims[0] < 512 || w->dims[0] >= 4096 ||
@@ -878,25 +919,38 @@ namespace fastllm {
                     w->ToDevice(DataDevice::CUDA, input.dataDeviceIds, true);
                 }
             }
+            if (rows > 1 && (qw.blockM != kw.blockM || qw.blockK != kw.blockK ||
+                qw.dims[0] % qw.blockK || !V41PrepareQkvWeight(*joinedWeight, qw, kw, devices))) return false;
             auto qdims = input.dims, kdims = input.dims;
             qdims.back() = qw.dims[0];
             kdims.back() = kw.dims[0];
             V41AllocLike(inputQuant, DataType::BFLOAT16, input.dims, input, devices);
-            for (Data *out : {&qr, &qNorm, &qQuant}) V41AllocLike(*out, DataType::BFLOAT16, qdims, input, devices);
+            auto projectedDims = qdims;
+            if (rows > 1) projectedDims.back() += kw.dims[0];
+            V41AllocLike(qr, DataType::BFLOAT16, projectedDims, input, devices);
+            for (Data *out : {&qNorm, &qQuant}) V41AllocLike(*out, DataType::BFLOAT16, qdims, input, devices);
             V41AllocLike(kv, DataType::BFLOAT16, kdims, input, devices);
             auto run = [&](const Data &x, Data &wq, Data &wk, Data &nq, Data &nk,
-                           Data &xq, Data &qraw, Data &qout, Data &qq, Data &kout) {
+                           Data &xq, Data &qraw, Data &qout, Data &qq, Data &kout, Data *joined) {
+                if (rows > 1) {
+                    Data bias;
+                    return (inputQuantized || FastllmCudaDeepSeekV41QuantizeActivation(x, xq)) &&
+                        FastllmCudaBFloat16MatMulFP8E4M3(xq, *joined, bias, qraw,
+                            rows, input.dims.back(), qw.dims[0] + kw.dims[0]) &&
+                        FastllmCudaV41QKVNormQuantPacked(qraw, nq, nk, eps, qout, qq, kout);
+                }
                 return (inputQuantized || FastllmCudaDeepSeekV41QuantizeActivation(x, xq)) &&
                     FastllmCudaBFloat16FP8LinearPair(xq, wq, wk, qraw, kout) &&
                     FastllmCudaV41QKVNormQuant(qraw, kout, nq, nk, eps, qout, qq, kout);
             };
-            if (devices.empty()) return run(input, qw, kw, qnw, knw, inputQuant, qr, qNorm, qQuant, kv);
+            if (devices.empty()) return run(input, qw, kw, qnw, knw, inputQuant, qr, qNorm, qQuant, kv, joinedWeight);
             std::vector<int> ok(devices.size(), 0);
             const bool submitted = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
                 ok[rank] = run(*input.multiDeviceDatas.at(device), *qw.multiDeviceDatas.at(device),
                     *kw.multiDeviceDatas.at(device), *qnw.multiDeviceDatas.at(device), *knw.multiDeviceDatas.at(device),
                     *inputQuant.multiDeviceDatas.at(device), *qr.multiDeviceDatas.at(device),
-                    *qNorm.multiDeviceDatas.at(device), *qQuant.multiDeviceDatas.at(device), *kv.multiDeviceDatas.at(device));
+                    *qNorm.multiDeviceDatas.at(device), *qQuant.multiDeviceDatas.at(device), *kv.multiDeviceDatas.at(device),
+                    rows > 1 ? joinedWeight->multiDeviceDatas.at(device) : nullptr);
             });
             return submitted && std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; });
         }
@@ -3986,6 +4040,9 @@ namespace fastllm {
             long long replayCount = 0;
             int composedThrough = -1;
             std::unique_ptr<DeepSeekV41DecodeWorkspace> workspace;
+            // Shared across batch-size slots with the same device layout. Keep
+            // derived weights out of the model weight map used by eager readers.
+            std::shared_ptr<std::map<int, Data>> packedQkvWeights;
 
             DeepSeekV41CudaGraphState() : workspace(new DeepSeekV41DecodeWorkspace()) {}
 
@@ -4661,6 +4718,17 @@ namespace fastllm {
                     graphState->ResetWorkspace();
                     graphState->signature = signature;
                     graphState->blockCnt = block_cnt;
+                    graphState->packedQkvWeights.reset();
+                    for (auto &slot : v41CudaGraphSlots) {
+                        if (!slot.second || slot.second.get() == graphState.get()) continue;
+                        auto other = V41GetCudaGraphState(slot.second);
+                        if (other->signature == signature && other->packedQkvWeights) {
+                            graphState->packedQkvWeights = other->packedQkvWeights;
+                            break;
+                        }
+                    }
+                    if (!graphState->packedQkvWeights)
+                        graphState->packedQkvWeights = std::make_shared<std::map<int, Data>>();
                 }
                 std::vector<int> graphDevices = tpDevices;
                 if (graphDevices.empty()) {
@@ -5225,11 +5293,13 @@ namespace fastllm {
                 qkvPrepared = V41QkvPrepare(attnInput, weight[pre + ".attn.wq_a.weight"],
                     weight[pre + ".attn.wkv.weight"], weight[pre + ".attn.q_norm.weight"],
                     weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, *attnQuant,
-                    qr, qNorm, ws->qNormQuantized, kv, attentionInputQuantized);
+                    qr, qNorm, ws->qNormQuantized, kv, attentionInputQuantized,
+                    f.graphActive && seqlen > 1 && seqlen <= 8 ?
+                        &(*f.graphState->packedQkvWeights)[layer] : nullptr);
             }
 #endif
             if (!qkvPrepared) {
-                // Reuse the fused quantizer even when the B1 QKV path is unavailable.
+                // Reuse the fused quantizer even when the combined QKV path is unavailable.
                 quantizedLinear(attentionInputQuantized ? *attnQuant : attnInput,
                                 pre + ".attn.wq_a.weight", qr, tp,
                                 attentionInputQuantized ? nullptr : attnQuant, attentionInputQuantized);
