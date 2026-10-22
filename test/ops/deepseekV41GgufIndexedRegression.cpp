@@ -126,6 +126,24 @@ static void CacheCompute(Data &input, Data &indices, Data &scores, std::vector<D
         Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
     }
     const auto values = Read(partial);
+    // Reorder and partition original routes, reusing the input Q8 prefix just
+    // as resident and asynchronously uploaded experts do in the verifier.
+    Cuda(cudaMemsetAsync(partial.cudaData, 0xff, partial.GetBytes(), cudaStreamPerThread));
+    for (int partition = 0; partition < 3; ++partition) {
+        std::vector<int32_t> selected, selectedSlots;
+        for (int r = rows*topk-1; r >= 0; --r) if (r%3 == partition) {
+            selected.push_back(r); selectedSlots.push_back(slots[r]);
+        }
+        if (selected.empty()) continue;
+        Data map(INT32,{int(selected.size())},CPU,selected.data());
+        Data chosen(INT32,{int(selectedSlots.size())},CPU,selectedSlots.data());
+        map.ToDevice(CUDA,{device},true); chosen.ToDevice(CUDA,{device},true);
+        view.routeMap = static_cast<const int32_t *>(map.cudaData);
+        view.routeSlots = static_cast<const int32_t *>(chosen.cudaData);
+        view.routeCount = selected.size(); view.q8InputPrepared = partition > 0;
+        run(); Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+    }
+    Check(Read(partial) == values, "sparse canonical route mapping changed expert partials");
     for (int row=0; row<rows; ++row) {
         std::vector<int> order(topk); for(int k=0;k<topk;++k) order[k]=k;
         std::stable_sort(order.begin(),order.end(),[&](int a,int b){return ids[row*topk+a]<ids[row*topk+b];});

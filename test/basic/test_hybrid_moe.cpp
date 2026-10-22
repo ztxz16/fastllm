@@ -12,6 +12,7 @@ void Check(bool ok, const char *message) {
 }
 std::vector<FastllmCudaMoeCacheLayer> prepared;
 bool registered = false, streaming = false, prepareResult = true, beginResult = true;
+double preparedFraction = 1.0;
 int begun = 0, ended = 0;
 std::vector<int> endOrder;
 }
@@ -25,6 +26,10 @@ bool FastllmCudaPrepareMoeCache(const FastllmCudaMoeCacheLayer *layers, int coun
     streaming = allowStreaming;
     if (registerWeights) registerWeights();
     return prepareResult;
+}
+bool FastllmCudaSetMoeCacheBudgetFraction(Data **, int, double fraction) {
+    preparedFraction = fraction;
+    return fraction > 0 && fraction <= 1;
 }
 void *FastllmCudaBeginMoeDecode(Data **, int, int, const std::vector<int> *) {
     ++begun;
@@ -67,6 +72,12 @@ int main() {
             prepared[0].glm5 == (math == HybridMoeMath::Glm5) &&
             prepared[0].deepSeekV41 == (math == HybridMoeMath::DeepSeekV41), "numerical profile changed");
     }
+    HybridMoeCachePlan mainPlan(HybridMoeMath::DeepSeekV41, 0, .75);
+    mainPlan.Add(target, "cpu");
+    Check(mainPlan.Prepare() && preparedFraction == .75, "main cache budget share lost");
+    HybridMoeCachePlan draftPlan(HybridMoeMath::DeepSeekV41, 0, .25);
+    draftPlan.Add(draft, "cpu");
+    Check(draftPlan.Prepare() && preparedFraction == .25, "draft cache budget share lost");
     prepareResult = false;
     Check(!mixed.Prepare(registerWeights), "cache rejection did not preserve fallback");
     Check(registrations == 2, "registration callback count changed");

@@ -33,6 +33,10 @@
 #include "baseblock.h"
 #include "executor.h"
 #include "utils.h"
+#include "utils/hybrid_moe.h"
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
+#endif
 #include "json11.hpp"
 
 #ifdef USE_CUDA
@@ -1720,7 +1724,19 @@ namespace fastllm {
                     hasSharedExpertOut = true;
                 }
                 this->ApplyMoeDeviceMapForLayer(layerId);
-                MergeMOEBlock(&ffnInput, &expertIndex, &expertScore, &moeWeights, &v41DsparkMoeBiass[stage],
+                bool hybrid = false;
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+                if (hasSharedExpertOut &&
+                    ffnInput.dataDevice == DataDevice::CUDA && ffnInput.dims.size() == 2 &&
+                    ffnInput.dims[0] < 32 &&
+                    FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
+                    expertIndex.ToDevice(DataDevice::CUDA, ffnInput.dataDeviceIds, true);
+                    expertScore.ToDevice(DataDevice::CUDA, ffnInput.dataDeviceIds, true);
+                    hybrid = fastllm::RunHybridMoe(ffnInput, expertIndex, expertScore, ffnOut,
+                        moeWeights.data(), (int)moeWeights.size(), layerId);
+                }
+#endif
+                if (!hybrid) MergeMOEBlock(&ffnInput, &expertIndex, &expertScore, &moeWeights, &v41DsparkMoeBiass[stage],
                               &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &ffnOut, layerId,
                               ffnInput.dataType, ffnInput.dataType, &moeInputTemp, &moeOutputTemp,
                               MoeGateSwiglu, true, swiglu_limit, true, nullptr,

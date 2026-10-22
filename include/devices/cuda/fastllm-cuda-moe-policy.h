@@ -30,3 +30,7 @@ bool FastllmCudaMergeMOEHybridOnDevices(const fastllm::Data &input,
     const fastllm::Data &index, const fastllm::Data &score, fastllm::Data &output,
     fastllm::Data **weights, int weightsBatch, int layer,
     const std::vector<int> &devices, const std::function<void()> &launchParallel);
+
+// Set before allocating device caches. Main and draft groups share the model's
+// configured per-device budget instead of each allocating the entire budget.
+bool FastllmCudaSetMoeCacheBudgetFraction(fastllm::Data **weights, int count, double fraction);

@@ -80,12 +80,17 @@ __device__ const uint8_t *V41Weight(const FastllmCudaMoeGGUFCacheView &view,
     return view.records + offset + (gate ? 0 : view.downOffset);
 }
 
+__device__ int V41Route(const uint8_t *const *, int route) { return route; }
+__device__ int V41Route(const FastllmCudaMoeGGUFCacheView &view, int route) {
+    return view.routeMap ? view.routeMap[route] : route;
+}
+
 template<ggml_type Type, bool Gate, class Weights>
 __global__ void V41GGUFProjection(const block_q8_1 *input, __nv_bfloat16 *output,
         Weights weights, const int32_t *indices,
         int experts, int topk, int columns, int rows, size_t rowBytes) {
     const int route = blockIdx.y;
-    const auto *x = input + size_t(Gate ? route/topk : route)*(columns/32);
+    const auto *x = input + size_t(Gate ? V41Route(weights, route)/topk : route)*(columns/32);
     extern __shared__ uint32_t activation[];
     // Stage the canonical codebook in the packed layout used by extended GEMV.
     // No host-side lazy initialization or synchronization is needed in capture.
@@ -187,12 +192,22 @@ bool FastllmCudaRunV41GGUF(
 namespace {
 size_t V41CacheWorkspaceBytes(int rows, int routes, int hidden, int inter) {
     return (size_t(rows)*(hidden/32) + size_t(routes)*(inter/32))*sizeof(block_q8_1) +
-        size_t(routes)*(2*size_t(inter)+hidden)*sizeof(__nv_bfloat16);
+        size_t(routes)*(2*size_t(inter)+hidden)*sizeof(__nv_bfloat16) + size_t(routes)*sizeof(float);
 }
 
-__global__ void V41CachePartials(const __nv_bfloat16 *partial, float *output, int count) {
+__global__ void V41CachePartials(const __nv_bfloat16 *partial, float *output,
+        int hidden, int count, const int32_t *routeMap) {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
-    if (i < count) output[i] = __bfloat162float(partial[i]);
+    if (i < count) {
+        const int route = i / hidden;
+        const size_t destination = size_t(routeMap ? routeMap[route] : route)*hidden + i%hidden;
+        output[destination] = __bfloat162float(partial[i]);
+    }
+}
+__global__ void V41CacheScores(const float *scores, float *selected,
+        const int32_t *routeMap, int routes) {
+    const int r = blockIdx.x*blockDim.x + threadIdx.x;
+    if (r < routes) selected[r] = scores[routeMap[r]];
 }
 }
 
@@ -219,9 +234,11 @@ bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
         view.hidden%256 || view.inter%256 || topk < 1 || topk > 16 ||
         !FastllmCudaV41GGUFSupported(view.gateType, view.downType) ||
         !view.records || !view.routeSlots || !view.workspace || !scores || !perExpert ||
-        view.routeMap || view.activeRouteCount || view.numaGateType >= 0 || view.numaDownType >= 0)
+        view.activeRouteCount || (view.routeMap && (view.routeCount < 1 || view.routeCount > input.dims[0]*topk)) ||
+        view.numaGateType >= 0 || view.numaDownType >= 0)
         return false;
-    const int rows = input.dims[0], routes = rows*topk, hidden = view.hidden, inter = view.inter;
+    const int rows = input.dims[0], routes = view.routeMap ? view.routeCount : rows*topk;
+    const int hidden = view.hidden, inter = view.inter;
     const size_t bytes = V41CacheWorkspaceBytes(rows, routes, hidden, inter);
     if (view.workspaceBytes < bytes) return false;
     auto *qInput = static_cast<block_q8_1 *>(view.workspace);
@@ -230,14 +247,21 @@ bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
     auto *partial = gateData + size_t(routes)*2*inter;
     fastllm::Data gate(fastllm::BFLOAT16, {routes, 2*inter}, fastllm::CUDA, gateData);
     gate.dataDeviceIds = input.dataDeviceIds;
-    V41GGUFQuantize<true><<<dim3((hidden+255)/256, rows), 256, 0, cudaStreamPerThread>>>(
-        static_cast<const __nv_bfloat16 *>(input.cudaData), qInput, hidden);
+    if (!view.q8InputPrepared)
+        V41GGUFQuantize<true><<<dim3((hidden+255)/256, rows), 256, 0, cudaStreamPerThread>>>(
+            static_cast<const __nv_bfloat16 *>(input.cudaData), qInput, hidden);
+    if (view.routeMap) {
+        auto *selectedScores = reinterpret_cast<float *>(partial + size_t(routes)*hidden);
+        V41CacheScores<<<(routes+255)/256, 256, 0, cudaStreamPerThread>>>(
+            scores, selectedScores, view.routeMap, routes);
+        scores = selectedScores;
+    }
     Project<true>(view.gateType, qInput, gateData, view, nullptr, 0, topk, routes, hidden, 2*inter);
     if (!FastllmCudaDeepSeekV41SharedSwigluQuantized(gate, swigluLimit, activation, scores)) return false;
     V41GGUFQuantize<false><<<dim3((inter+255)/256, routes), 256, 0, cudaStreamPerThread>>>(
         static_cast<const __nv_bfloat16 *>(activation.cudaData), qGate, inter);
     Project<false>(view.downType, qGate, partial, view, nullptr, 0, topk, routes, inter, hidden);
     V41CachePartials<<<(routes*hidden+255)/256, 256, 0, cudaStreamPerThread>>>(
-        partial, perExpert, routes*hidden);
+        partial, perExpert, hidden, routes*hidden, view.routeMap);
     return cudaGetLastError() == cudaSuccess;
 }

@@ -44,8 +44,10 @@ bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeight
     }
     // The backend retains format-dependent snapshot/registration order and
     // publishes a cache only after validation. Failure leaves host fallback intact.
-    return FastllmCudaPrepareMoeCache(cacheLayers.data(), static_cast<int>(cacheLayers.size()),
-        allNuma ? registerNumaWeights : std::function<void()>{}, allowStreaming);
+    if (!FastllmCudaPrepareMoeCache(cacheLayers.data(), static_cast<int>(cacheLayers.size()),
+            allNuma ? registerNumaWeights : std::function<void()>{}, allowStreaming)) return false;
+    return FastllmCudaSetMoeCacheBudgetFraction(const_cast<Data **>(layers.front().weights),
+        layers.front().count, budgetFraction);
 #else
     return false;
 #endif

@@ -23,8 +23,8 @@ bool HybridMoeMeasuredNativePrefill(const Data *gate, const Data *down,
 class HybridMoeCachePlan {
 public:
     explicit HybridMoeCachePlan(HybridMoeMath math = HybridMoeMath::Standard,
-                               float swigluLimit = 0.0f)
-        : math(math), swigluLimit(swigluLimit) {}
+                               float swigluLimit = 0.0f, double budgetFraction = 1.0)
+        : math(math), swigluLimit(swigluLimit), budgetFraction(budgetFraction) {}
     void Add(const std::vector<Data *> &weights, const std::string &device,
              int cacheDevice = -1);
     bool Prepare(const std::function<void()> &registerNumaWeights = {},
@@ -34,6 +34,7 @@ private:
     std::vector<Layer> layers;
     HybridMoeMath math;
     float swigluLimit;
+    double budgetFraction; // Model subgroups share one per-device cache budget.
     bool allNuma = true;
 };
 

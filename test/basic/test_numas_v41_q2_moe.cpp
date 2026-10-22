@@ -6,6 +6,7 @@
 #include "devices/disk/diskdevice.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
 #endif
 #include <algorithm>
 #include <cmath>
@@ -111,7 +112,9 @@ int main(int argc, char **argv) {
         if (disk) { SetMoeCpuCacheBytes(4 * 1024 * 1024); SetMoeCudaCacheBytes(0); }
         const int hidden = argc > 2 ? std::stoi(argv[2]) : 256;
         const int inter = (host || decodeOrVerify) && argc > 3 ? std::stoi(argv[3]) : 256;
-        const int experts = cache ? 24 : decodeOrVerify ? 6 : 3, topk = (cache || decodeOrVerify) ? 6 : 2;
+        const bool draft = cache && argc > 3 && std::string(argv[3]) == "draft";
+        const int experts = cache ? 24 : decodeOrVerify ? 6 : 3;
+        const int topk = draft ? 3 : (cache || decodeOrVerify) ? 6 : 2;
         // Q4_K_R4 consumes Q8_K32, while Q2_K_R4 consumes Q8_K.
         const bool q2Down = decodeOrVerify && argc > 4 && std::string(argv[4]) == "q2";
         std::vector<std::unique_ptr<Data>> owned;
@@ -191,6 +194,7 @@ int main(int argc, char **argv) {
             host ? std::vector<int>{33, 65, 128, 408, 1023, 1024, 1041, 4096} :
             decode ? std::vector<int>{1, 3} :
             verify ? std::vector<int>{1, 2, 3, 6, 8} :
+            cache ? std::vector<int>{2, 5, 1, 7, 9, 25, 31, 3, 6, 8} :
             std::vector<int>{1, 7, 32, 64, 260, 2, 3, 6, 8};
         for (bool quantizeShared : {false, true}) for (int rows : batches) {
             if ((cache || host || decodeOrVerify) && quantizeShared) continue;
@@ -414,16 +418,16 @@ int main(int argc, char **argv) {
                         throw std::runtime_error("V4.1 grouped changed packed host weights");
                 }
             }
-            if (cache && rows <= 8) {
+            if (cache && rows < 32) {
                 const std::vector<uint8_t> cpuReference(output.cpuData, output.cpuData + output.GetBytes());
                 Data gpuInput(input), gpuIndex(index), gpuScore(score), gpuOutput(BFLOAT16);
                 gpuInput.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
                 gpuIndex.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
                 gpuScore.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
                 setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", "6", 1);
-                // Prime every route used by this verifier through cold decode
-                // refills; the sixteen-slot budget forces eviction across cases.
-                for (int r = 0; r < rows; ++r) {
+                // Keep the first batch cold to require temporary miss uploads.
+                // Later cases prime routes; sixteen slots still force eviction.
+                for (int r = 0; r < (rows == 2 ? 0 : rows); ++r) {
                     Data x(BFLOAT16, {1, hidden}, DataDevice::CPU, inputBits.data() + r * hidden);
                     Data idsOne(INT32, {1, topk}, DataDevice::CPU, ids.data() + r * topk);
                     Data scoresOne(FLOAT32, {1, topk}, DataDevice::CPU, scores.data() + r * topk);
@@ -434,16 +438,16 @@ int main(int argc, char **argv) {
                             weights.data(), (int)weights.size(), 0))
                         throw std::runtime_error("Q2 cold CUDA decode rejected");
                 }
-                for (const char *split : {"0", "1", "6"}) {
-                    setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", split, 1);
+                for (int repeat = 0; repeat < 3; ++repeat) {
+                    const char *split = repeat == 0 ? "0" : repeat == 1 ? "1" : "6";
+                    if (rows == 1) setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", split, 1);
+                    else unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
                     if (!FastllmCudaMergeMOEHybrid(gpuInput, gpuIndex, gpuScore, gpuOutput,
                             weights.data(), (int)weights.size(), 0)) {
-                        if (rows == 1 || std::string(split) != "0")
-                            throw std::runtime_error("Q2 CUDA hybrid request rejected");
-                        continue; // CPU-only verifier intentionally uses its fallback.
+                        throw std::runtime_error("Q2 CUDA hybrid request rejected");
                     }
                     gpuOutput.ToDevice(DataDevice::CPU);
-                    if (std::string(split) == "0" && memcmp(gpuOutput.cpuData, cpuReference.data(), cpuReference.size()))
+                    if (rows == 1 && repeat == 0 && memcmp(gpuOutput.cpuData, cpuReference.data(), cpuReference.size()))
                         throw std::runtime_error("Q2 cache CPU subset differs from NUMA");
                     double error = 0, norm = 0;
                     for (int i = 0; i < rows * hidden; ++i) {
@@ -452,7 +456,7 @@ int main(int argc, char **argv) {
                         if (!std::isfinite(actual)) throw std::runtime_error("non-finite Q2 cached output");
                         error += (actual - expected) * (actual - expected); norm += expected * expected;
                     }
-                    printf("Q2 CUDA cache rows=%d split=%s relative_rms=%.6f\n", rows, split, std::sqrt(error / std::max(norm, 1e-20)));
+                    printf("Q2 CUDA cache rows=%d split=%s relative_rms=%.6f\n", rows, rows == 1 ? split : "adaptive", std::sqrt(error / std::max(norm, 1e-20)));
                     if (error > .000025 * std::max(norm, 1e-20))
                         throw std::runtime_error("Q2 CUDA hybrid differs from NUMA oracle");
                 }

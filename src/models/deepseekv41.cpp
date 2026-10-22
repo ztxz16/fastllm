@@ -2016,6 +2016,7 @@ namespace fastllm {
         ShutdownRuntime();
         DsparkReportStats();
         ReleaseMoeCudaCache(weights);
+        ReleaseMoeCudaCache(v41DsparkMoeWeights);
         {
             std::lock_guard<std::mutex> guard(v41StateMutex);
             v41States.clear();
@@ -6678,6 +6679,15 @@ namespace fastllm {
             if (prefillTokens > 1) sizes.push_back(prefillTokens);
             // Small matrix kernels can differ from the large prefill path.
             if (prefillTokens > 32) sizes.push_back(32);
+            // Exercise both verifier-sized batches and a non-multiple-of-eight
+            // tail before accepting requests. Their cost curves are separate
+            // from the large grouped prefill backend.
+            if (executionMode == ExecutionMode::Hybrid) {
+                for (int count = 2; count <= std::min(8, v41DsparkTokens + 1); ++count)
+                    if (prefillTokens > count) sizes.push_back(count);
+                if (!v41DsparkEnabled && prefillTokens > 5) sizes.push_back(5);
+                if (prefillTokens > 25) sizes.push_back(25);
+            }
             const int vocabSize = this->weight["embed.weight"].dims[0];
             for (int count : sizes) {
                 const auto begin = std::chrono::steady_clock::now();
@@ -6703,7 +6713,16 @@ namespace fastllm {
                 LastTokensManager last(1, 64);
                 // Private request state: never register synthetic tokens in the
                 // session/prefix cache, and release KV before graph warmup.
-                ForwardSegments(segments, ids, nullptr, nullptr, configs, last, nullptr, past);
+                if (executionMode == ExecutionMode::Hybrid && count == 25 && v41DsparkEnabled) {
+                    ForwardSegmentsWithDspark(segments, ids, nullptr, nullptr, configs, last, nullptr, past, false);
+                    auto draft = segments[0].state->dspark;
+                    if (draft && !draft->disabled) {
+                        std::vector<int> proposed;
+                        std::vector<float> confidence;
+                        for (int round = 0; round < 3; ++round)
+                            DsparkRunDraft(*draft, 1, proposed, confidence, configs[0]);
+                    }
+                } else ForwardSegments(segments, ids, nullptr, nullptr, configs, last, nullptr, past);
                 printf("[Warmup] DeepSeek-V4.1 prefill: %d tokens finished in %.3f s.\n", count,
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
                 fflush(stdout);

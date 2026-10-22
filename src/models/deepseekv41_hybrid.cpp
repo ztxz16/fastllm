@@ -43,7 +43,28 @@ namespace fastllm {
             moeExpertCacheAttempted = true;
             bool supported = !V41ReferenceMathEnabled() && GetCudaSharedExpert();
             std::vector<std::vector<Data *>> routedWeights = weights;
-            HybridMoeCachePlan cache(HybridMoeMath::DeepSeekV41, swiglu_limit);
+            std::vector<std::vector<Data *>> draftWeights;
+            if (v41DsparkEnabled) {
+                DsparkBuildMoeWeights();
+                draftWeights = v41DsparkMoeWeights;
+                for (int stage = 0; stage < int(draftWeights.size()); ++stage) {
+                    const int layer = std::max(0, block_cnt - v41DsparkLayers + stage);
+                    const std::string pre = "mtp." + std::to_string(stage) + ".ffn";
+                    if (!V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "numa") ||
+                        !quantizedLinearNames.count(pre + ".experts.0.w1.weight")) {
+                        draftWeights.clear(); break;
+                    }
+                }
+            }
+            auto payload = [](const std::vector<std::vector<Data *>> &tables) {
+                uint64_t bytes = 0;
+                for (const auto &table : tables) for (size_t i = 2; i < table.size(); ++i)
+                    if (table[i]) bytes += table[i]->GetBytes();
+                return bytes;
+            };
+            const uint64_t mainBytes = payload(routedWeights), draftBytes = payload(draftWeights);
+            const double draftFraction = draftBytes ? double(draftBytes) / (mainBytes + draftBytes) : 0;
+            HybridMoeCachePlan cache(HybridMoeMath::DeepSeekV41, swiglu_limit, 1.0 - draftFraction);
             for (int layer = 0; layer < block_cnt; ++layer) {
                 const auto device = SelectMoeDeviceForLayer(layer);
                 // GPU-resident layers are not members of the host cache.
@@ -56,6 +77,15 @@ namespace fastllm {
                     [this] { WarmupNumaMoeWeights(); })) {
                 fprintf(stderr, "[Fastllm] V4.1 expert cache requires NUMA FP8 block128, NVFP4 block32 or supported GGUF experts, "
                     "CUDA shared experts and ordinary math; using the configured backend.\n");
+            }
+            if (supported && !draftWeights.empty()) {
+                HybridMoeCachePlan draftCache(HybridMoeMath::DeepSeekV41, swiglu_limit, draftFraction);
+                for (auto &table : draftWeights) {
+                    table[0] = table[1] = nullptr;
+                    draftCache.Add(table, "numa");
+                }
+                if (!draftCache.Prepare([this] { WarmupNumaMoeWeights(); }))
+                    fprintf(stderr, "[Fastllm] DSpark expert cache unavailable; retaining NUMA fallback.\n");
             }
         }
         // A complete decode step spans every layer. Admission runs afterward,
@@ -124,7 +154,7 @@ namespace fastllm {
         // staging as decode, rather than migrating tensors owned by a graph.
         // Its multi-row scheduler is independent of the single-token step.
         const bool singleStageCache = graphActive && !tp && single &&
-            (seqlen == 1 || (dsparkVerify && ctx.verifyAllTokens && seqlen > 1 && seqlen <= 8)) && FastllmCudaMoeCacheRequested() &&
+            (seqlen >= 1 && seqlen < 32) && FastllmCudaMoeCacheRequested() &&
             !dumpDebug && !V41ReferenceMathEnabled() &&
             V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "numa");
         if (((step && *step) || singleStageCache) && hasSharedExpertOut &&
@@ -267,7 +297,7 @@ namespace fastllm {
                 moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
                 V41DeviceSpecUsesType(moeDeviceSpec, "numa") &&
                 moeInputPtr->dims.size() == 2 &&
-                (moeInputPtr->dims[0] == 1 || (moeInputPtr->dims[0] <= 8 && single && ctx.verifyAllTokens)) &&
+                moeInputPtr->dims[0] >= 1 && moeInputPtr->dims[0] < 32 && single &&
                 FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
                 // The 384-expert router can return CPU tensors. Upload its
                 // small result before entering the device-cache adapter.
