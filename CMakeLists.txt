@@ -1074,6 +1074,10 @@ if (UNIT_TEST)
         target_link_libraries(disk_embedding_reader_test PRIVATE fastllm)
         fastllm_add_checked_test(disk_embedding_reader disk_embedding_reader_test
             "PASS disk embedding reader" 60)
+        add_executable(deepseek_v41_disk_engram_test test/basic/test_deepseek_v41_disk_engram.cpp)
+        target_link_libraries(deepseek_v41_disk_engram_test PRIVATE fastllm)
+        fastllm_add_checked_test(deepseek_v41_disk_engram deepseek_v41_disk_engram_test
+            "PASS: V4.1 disk Engram decode and prefill" 60)
         if (USE_CUDA AND NOT USE_ROCM)
             fastllm_add_checked_test(qwen4_qsa_causal_mask qwen4_gguf_test
                 "PASS: Qwen4 explicit and implicit causal QSA masks match" 120 --qsa-causal-mask)

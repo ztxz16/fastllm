@@ -2959,7 +2959,9 @@ namespace fastllm {
         Data diskValues, diskScales;
         DiskEmbeddingRowReader::Ticket valueRead, scaleRead;
         const uint8_t *values = table.data, *scales = table.scale;
-        if (tokens > 1 && table.diskValueReader && table.diskScaleReader) {
+        // One token still hashes to many independent rows. Submit values and
+        // scales together so decode also uses the bounded I/O worker pools.
+        if (table.diskValueReader && table.diskScaleReader) {
             std::vector<int32_t> lookupRows;
             lookupRows.reserve(rows.size());
             for (int64_t row : rows) {
@@ -3007,55 +3009,26 @@ namespace fastllm {
                 }
             }
         };
-        // FASTLLM_DSV41_ENGRAM_POOL=1：改用 fastllm 常驻线程池。原来的实现每次调用都
-        // 现场 create/join 最多 32 个 std::thread，prefill 时这笔固定开销比查表本身还大。
-        // 结果逐位相同（只是换了执行 worker 的线程），默认开启；=0 可退回每次现场建线程。
-        static const bool usePool = V41EnvFlagOn("FASTLLM_DSV41_ENGRAM_POOL");
-        if (usePool) {
-            AliveThreadPool *pool = GetAlivePool();
-            int threadSt = pool->curActivateThreadInterval.first;
-            int threadLen = pool->curActivateThreadInterval.second - threadSt;
-            int threads = std::min(tokens, std::max(1, threadLen));
-            if (threads <= 1 || tokens < 8) {
-                worker(0, tokens);
-            } else {
-                std::vector<V41EngramGatherOp*> ops;
-                int per = (tokens + threads - 1) / threads;
-                for (int i = 0; i < threads; i++) {
-                    int st = i * per, end = std::min(tokens, st + per);
-                    if (st < end) {
-                        ops.push_back(new V41EngramGatherOp(&worker, st, end));
-                    }
-                }
-                for (size_t i = 0; i < ops.size(); i++) {
-                    pool->PushOp(threadSt + (int)i, ops[i]);
-                }
-                for (size_t i = 0; i < ops.size(); i++) {
-                    pool->Wait(threadSt + (int)i);
-                    delete ops[i];
-                }
-            }
-            return;
-        }
-        // std::thread::hardware_concurrency() 在 glibc 上会去读 /sys/devices/system/cpu/online，
-        // 原来每次查表都调一次，单次 decode 就要 0.2 ms——比查表本身贵一个数量级。只算一次。
-        static const int hardwareThreads = std::max(1, (int)std::thread::hardware_concurrency() / 2);
-        int threads = std::min(tokens, hardwareThreads);
-        threads = std::min(threads, 32);
+        // Reuse the persistent pool for prefill conversion; short decode rows
+        // stay on the caller. Build all tasks before publishing their pointers.
+        AliveThreadPool *pool = GetAlivePool();
+        const int threadSt = pool->curActivateThreadInterval.first;
+        const int threadLen = pool->curActivateThreadInterval.second - threadSt;
+        const int threads = std::min(tokens, std::max(1, threadLen));
         if (threads <= 1 || tokens < 8) {
             worker(0, tokens);
         } else {
-            std::vector<std::thread> pool;
-            int per = (tokens + threads - 1) / threads;
+            std::vector<V41EngramGatherOp> ops;
+            ops.reserve(threads);
+            const int per = (tokens + threads - 1) / threads;
             for (int i = 0; i < threads; i++) {
-                int st = i * per, end = std::min(tokens, st + per);
+                const int st = i * per, end = std::min(tokens, st + per);
                 if (st < end) {
-                    pool.emplace_back(worker, st, end);
+                    ops.emplace_back(&worker, st, end);
                 }
             }
-            for (auto &th : pool) {
-                th.join();
-            }
+            for (size_t i = 0; i < ops.size(); i++) pool->PushOp(threadSt + (int)i, &ops[i]);
+            for (size_t i = 0; i < ops.size(); i++) pool->Wait(threadSt + (int)i);
         }
     }
 
