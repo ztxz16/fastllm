@@ -881,11 +881,12 @@ namespace fastllm {
         // and FP8 activation boundaries. Graph slots share the packed weight cache.
         bool V41QkvPrepare(const Data &input, Data &qw, Data &kw, Data &qnw, Data &knw, float eps,
                            Data &inputQuant, Data &qr, Data &qNorm, Data &qQuant, Data &kv,
-                           bool inputQuantized = false, Data *joinedWeight = nullptr) {
+                           bool inputQuantized = false, Data *joinedWeight = nullptr, bool separateBatch = false) {
             if (input.dataType != DataType::BFLOAT16 || input.dims.empty() || input.dims.back() <= 0 ||
                 input.dims.back() % 32 || !std::isfinite(eps) || eps < 0) return false;
             const uint64_t rows = input.Count(0) / input.dims.back();
-            if (rows < 1 || rows > 8 || (rows > 1 && !joinedWeight)) return false;
+            if (rows < 1 || rows > 8 || (rows > 1 && !joinedWeight && !separateBatch)) return false;
+            const bool packed = rows > 1 && joinedWeight != nullptr;
             for (const Data *w : {&qw, &kw}) {
                 if (w->dataType != DataType::FP8_E4M3 || w->IsRepacked || w->dims.size() != 2 ||
                     w->dims[1] != input.dims.back() || w->dims[0] < 512 || w->dims[0] >= 4096 ||
@@ -919,20 +920,20 @@ namespace fastllm {
                     w->ToDevice(DataDevice::CUDA, input.dataDeviceIds, true);
                 }
             }
-            if (rows > 1 && (qw.blockM != kw.blockM || qw.blockK != kw.blockK ||
+            if (packed && (qw.blockM != kw.blockM || qw.blockK != kw.blockK ||
                 qw.dims[0] % qw.blockK || !V41PrepareQkvWeight(*joinedWeight, qw, kw, devices))) return false;
             auto qdims = input.dims, kdims = input.dims;
             qdims.back() = qw.dims[0];
             kdims.back() = kw.dims[0];
             V41AllocLike(inputQuant, DataType::BFLOAT16, input.dims, input, devices);
             auto projectedDims = qdims;
-            if (rows > 1) projectedDims.back() += kw.dims[0];
+            if (packed) projectedDims.back() += kw.dims[0];
             V41AllocLike(qr, DataType::BFLOAT16, projectedDims, input, devices);
             for (Data *out : {&qNorm, &qQuant}) V41AllocLike(*out, DataType::BFLOAT16, qdims, input, devices);
             V41AllocLike(kv, DataType::BFLOAT16, kdims, input, devices);
             auto run = [&](const Data &x, Data &wq, Data &wk, Data &nq, Data &nk,
                            Data &xq, Data &qraw, Data &qout, Data &qq, Data &kout, Data *joined) {
-                if (rows > 1) {
+                if (packed) {
                     Data bias;
                     return (inputQuantized || FastllmCudaDeepSeekV41QuantizeActivation(x, xq)) &&
                         FastllmCudaBFloat16MatMulFP8E4M3(xq, *joined, bias, qraw,
@@ -940,7 +941,11 @@ namespace fastllm {
                         FastllmCudaV41QKVNormQuantPacked(qraw, nq, nk, eps, qout, qq, kout);
                 }
                 return (inputQuantized || FastllmCudaDeepSeekV41QuantizeActivation(x, xq)) &&
-                    FastllmCudaBFloat16FP8LinearPair(xq, wq, wk, qraw, kout) &&
+                    (rows == 1 ? FastllmCudaBFloat16FP8LinearPair(xq, wq, wk, qraw, kout) :
+                        (FastllmCudaBFloat16MatMulFP8E4M3(xq, wq, Data(), qraw,
+                            rows, input.dims.back(), qw.dims[0]) &&
+                         FastllmCudaBFloat16MatMulFP8E4M3(xq, wk, Data(), kout,
+                            rows, input.dims.back(), kw.dims[0]))) &&
                     FastllmCudaV41QKVNormQuant(qraw, kout, nq, nk, eps, qout, qq, kout);
             };
             if (devices.empty()) return run(input, qw, kw, qnw, knw, inputQuant, qr, qNorm, qQuant, kv, joinedWeight);
@@ -950,7 +955,7 @@ namespace fastllm {
                     *kw.multiDeviceDatas.at(device), *qnw.multiDeviceDatas.at(device), *knw.multiDeviceDatas.at(device),
                     *inputQuant.multiDeviceDatas.at(device), *qr.multiDeviceDatas.at(device),
                     *qNorm.multiDeviceDatas.at(device), *qQuant.multiDeviceDatas.at(device), *kv.multiDeviceDatas.at(device),
-                    rows > 1 ? joinedWeight->multiDeviceDatas.at(device) : nullptr);
+                    packed ? joinedWeight->multiDeviceDatas.at(device) : nullptr);
             });
             return submitted && std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; });
         }
@@ -2528,6 +2533,25 @@ namespace fastllm {
         }
 #endif
         Linear(*source, weight[weightName], Data(), output, replicated);
+    }
+
+    bool DeepSeekV41Model::DsparkPrepareQkv(int stage, const Data &input, Data &inputQuant,
+                                           Data &raw, Data &qNorm, Data &qQuant, Data &kv) {
+#ifdef USE_CUDA
+        const std::string pre = "mtp." + std::to_string(stage) + ".attn.";
+        if (V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") || V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") ||
+            !quantizedLinearNames.count(pre + "wq_a.weight") ||
+            !quantizedLinearNames.count(pre + "wkv.weight") ||
+            !quantizedLinearNames.count(pre + "wq_b.weight")) return false;
+        // Keep the two original GEMM shapes: concatenation can move a BF16
+        // rounding boundary which subsequent FP8 quantization amplifies. Share
+        // input quantization and fuse normalization without changing those dots.
+        return V41QkvPrepare(input, weight[pre + "wq_a.weight"], weight[pre + "wkv.weight"],
+            weight[pre + "q_norm.weight"], weight[pre + "kv_norm.weight"], rms_norm_eps,
+            inputQuant, raw, qNorm, qQuant, kv, false, nullptr, true);
+#else
+        return false;
+#endif
     }
 
     void DeepSeekV41Model::OnModelWeightsLoaded() {

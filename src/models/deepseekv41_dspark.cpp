@@ -1604,7 +1604,7 @@ namespace fastllm {
         cmpIdx.CopyFrom(cmpIdxHost);
 
         Data attnPre, attnPost, attnComb, ffnPre, ffnPost, ffnComb;
-        Data x, attnInput, qr, qNorm, q, kv, table, attnOut, woAOut, attnProj;
+        Data x, attnInput, attnQuant, qr, qNorm, qQuant, q, kv, table, attnOut, woAOut, attnProj;
         Data ffnInput, ffnOut, expertIndex, expertScore;
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
         Data confidenceInput;
@@ -1621,14 +1621,20 @@ namespace fastllm {
             DsHcApplyPre(*curHidden, preMix, x);
             DsRMSNormBF16(x, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput);
 
-            LinearWithActivationQuant(attnInput, pre + ".attn.wq_a.weight", qr);
-            DsRMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
-            LinearWithActivationQuant(qNorm, pre + ".attn.wq_b.weight", q);
+            const bool qkvPrepared = DsparkPrepareQkv(stage, attnInput, attnQuant, qr, qNorm, qQuant, kv);
+            if (!qkvPrepared) {
+                LinearWithActivationQuant(attnInput, pre + ".attn.wq_a.weight", qr);
+                DsRMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
+            }
+            LinearWithActivationQuant(qkvPrepared ? qQuant : qNorm, pre + ".attn.wq_b.weight", q,
+                                      false, nullptr, qkvPrepared);
             q.Reshape({1, block, num_attention_heads, headDim});
             DsRotaryQuant(q, windowRope, startPos, 1, false, 0, 32);
 
-            LinearWithActivationQuant(attnInput, pre + ".attn.wkv.weight", kv);
-            DsRMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
+            if (!qkvPrepared) {
+                LinearWithActivationQuant(attnInput, pre + ".attn.wkv.weight", kv);
+                DsRMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
+            }
             kv.Reshape({1, block, headDim});
             DsRotaryQuant(kv, windowRope, startPos, 1, false, 1, 32);
 
