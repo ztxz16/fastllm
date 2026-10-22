@@ -153,29 +153,66 @@ static int CheckRouter() {
             "unsupported router batch must leave the output untouched");
     return cases + 1;
 }
+// Independent CPU oracle reproduces the historical per-lane FMA and the
+// 256-lane FP32 tree for both eager execution and captured replay.
 static int CheckWoA() {
+    struct Shape { int batch, seq, groups, rank, dim; };
+    const Shape shapes[] = {
+        {1,1,3,6,17}, {1,2,1,6,255}, {1,3,3,6,257}, {1,4,1,6,512},
+        {1,5,3,6,4095}, {1,6,1,1024,4096}, {1,7,3,6,4097},
+        {1,8,1,1024,4096}, {1,9,3,6,513}, {1,15,1,6,1025},
+        {2,3,3,6,512}, {2,4,1,6,4096}
+    };
     int cases = 0;
-    for (int dim : {17, 512, 4096}) for (int groups : {1, 3}) for (int rank : {6, 1024}) {
+    auto check = [&](Shape shape, DataType inputType, DataType weightType,
+                     float amplitude, int weightSeed) {
+        const int tokens = shape.batch * shape.seq, groups = shape.groups,
+                  rank = shape.rank, dim = shape.dim;
         Data input, weight, output, expected;
-        Fill(input, {1, 1, groups, dim}, DataType::BFLOAT16, 1, 0.3f);
-        Fill(weight, {groups, rank, dim}, DataType::BFLOAT16, 2, 0.01f);
+        Fill(input, {shape.batch, shape.seq, groups, dim}, inputType, tokens, amplitude);
+        Fill(weight, {groups, rank, dim}, weightType, weightSeed, 0.01f);
         const auto x = Floats(input), w = Floats(weight);
-        std::vector<float> values(groups * rank);
+        std::vector<float> values(tokens * groups * rank);
+        for (int token = 0; token < tokens; ++token)
         for (int group = 0; group < groups; ++group) for (int row = 0; row < rank; ++row) {
             float partial[256] = {};
             for (int lane = 0; lane < 256; ++lane) for (int d = lane; d < dim; d += 256)
-                partial[lane] = std::fma(x[group * dim + d], w[(group * rank + row) * dim + d], partial[lane]);
+                partial[lane] = std::fma(x[(token * groups + group) * dim + d],
+                                        w[(group * rank + row) * dim + d], partial[lane]);
             for (int stride = 128; stride; stride >>= 1)
                 for (int lane = 0; lane < stride; ++lane) partial[lane] += partial[lane + stride];
-            values[group * rank + row] = partial[0];
+            values[(token * groups + group) * rank + row] = partial[0];
         }
-        expected.CopyFrom(Data(DataType::FLOAT32, {1, 1, groups, rank}, values));
+        expected.CopyFrom(Data(DataType::FLOAT32, {shape.batch, shape.seq, groups * rank}, values));
         ToDataType(expected, DataType::BFLOAT16);
         expected.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        const auto expectedBits = Bits(expected);
         Require(FastllmCudaDeepSeekV4WoA(input, weight, groups, rank, output, false), "WoA rejected");
-        Require(Bits(output) == Bits(expected), "WoA changed the original FP32 reduction");
+        Require(output.dims == expected.dims && Bits(output) == expectedBits,
+                "WoA changed the original FP32 reduction");
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        Require(FastllmCudaDeepSeekV4WoA(input, weight, groups, rank, output, false), "WoA capture rejected");
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        Check(cudaGraphInstantiate(&exec, graph, 0));
+        Check(cudaMemsetAsync(output.cudaData, 0xff, output.GetBytes(), cudaStreamPerThread));
+        Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+        Check(cudaStreamSynchronize(cudaStreamPerThread));
+        Require(Bits(output) == expectedBits, "WoA graph changed bits or left a token tail unwritten");
+        Check(cudaGraphExecDestroy(exec));
+        Check(cudaGraphDestroy(graph));
         ++cases;
-    }
+    };
+    // Keep every original single-token case, including its input seeds.
+    for (int dim : {17, 512, 4096}) for (int groups : {1, 3}) for (int rank : {6, 1024})
+        check({1, 1, groups, rank, dim}, DataType::BFLOAT16, DataType::BFLOAT16, 0.3f, 2);
+    // Exercise token-tile tails, batch flattening, TP8 dimensions and mixed dtypes.
+    for (auto shape : shapes)
+    for (auto inputType : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32})
+    for (auto weightType : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32})
+    for (float amplitude : {0.f, 0.3f, 12.f})
+        check(shape, inputType, weightType, amplitude, shape.dim);
     return cases;
 }
 static int CheckFusedSwigluQuantization() {
