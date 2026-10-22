@@ -4556,6 +4556,62 @@ namespace fastllm {
         return true;
     }
 
+    bool MultiCudaCopyReplicatedRows(Data &dst, const Data &src, int start, int rows,
+                                      const std::vector<int> &devices) {
+        if (&dst == &src || devices.empty() || currentMultiCudaDedicatedWorker != nullptr ||
+            !src.multiDeviceData || !src.IsTensorParallelReplicated() ||
+            src.dims.size() != 3 || src.dims[0] != 1 || start < 0 || rows < 1 ||
+            rows > src.dims[1] - start || dst.isFake || dst.isKVCache || dst.isGGUFData)
+            return false;
+        std::set<int> seen;
+        for (int device : devices) {
+            auto input = src.multiDeviceDatas.find(device);
+            if (!seen.insert(device).second || input == src.multiDeviceDatas.end() ||
+                !input->second || input->second->dims != src.dims ||
+                input->second->dataType != src.dataType ||
+                input->second->dataDevice != DataDevice::CUDA || !input->second->cudaData ||
+                !IsCompactV41Activation(*input->second)) return false;
+            auto overlaps = [&](const Data &output) {
+                if (!output.cudaData) return false;
+                const uintptr_t a = (uintptr_t)input->second->cudaData;
+                const uintptr_t b = (uintptr_t)output.cudaData;
+                return a < b + output.expansionBytes && b < a + input->second->GetBytes();
+            };
+            if (overlaps(dst)) return false;
+            for (const auto &output : dst.multiDeviceDatas)
+                if (!output.second || output.second->isFake || overlaps(*output.second)) return false;
+        }
+        const int originalDevice = FastllmCudaGetDevice();
+        if (dst.multiDeviceData && (!dst.IsTensorParallelReplicated() || dst.dataType != src.dataType ||
+            dst.multiDeviceDatas.size() != devices.size() ||
+            std::any_of(devices.begin(), devices.end(), [&](int device) {
+                return dst.multiDeviceDatas.count(device) == 0;
+            })))
+            ResetMultiCudaTensor(dst);
+        Data shape(src.dataType, {1, rows, src.dims[2]});
+        EnsureReplicatedMultiCudaScratch(dst, shape, devices);
+        const size_t rowBytes = (size_t)src.dims[2] * src.unitSize;
+        std::vector<int> ok(devices.size(), 0);
+        auto copy = [&](int rank, int device) {
+            ok[rank] = FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                dst.multiDeviceDatas.at(device)->cudaData,
+                (const uint8_t*)src.multiDeviceDatas.at(device)->cudaData + start * rowBytes,
+                rows * rowBytes);
+        };
+        if (!MultiCudaRunDeviceCallbacks(devices, copy)) {
+            for (size_t rank = 0; rank < devices.size(); ++rank) {
+                FastllmCudaSetDevice(devices[rank]);
+                copy(rank, devices[rank]);
+                FastllmCudaSyncDevice(devices[rank]);
+            }
+        }
+        SyncReplicatedRootMetaFromDevice0(dst, devices);
+        FastllmCudaSetDevice(originalDevice);
+        AssertInFastLLM(std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; }),
+                        "MultiCuda replicated row copy failed.");
+        return true;
+    }
+
     bool MultiCudaCopyShardedActivation(Data &dst, const Data &src,
                                         const std::vector<int> &devices, bool copyData) {
         if (&dst == &src) return true;

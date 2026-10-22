@@ -1385,10 +1385,17 @@ namespace fastllm {
                 AssertInFastLLM(scratch.rawKV[layer].dims.size() == 3 &&
                                 scratch.rawKV[layer].dims[1] >= total,
                                 "DeepSeekV41 DSpark: the compressor rollback buffer is too short.");
-                Split(scratch.rawKV[layer], 1, total - rem, total, cache.rawTailKV);
-                if (ratio > 1) {
-                    Split(scratch.rawScore[layer], 1, total - rem, total, cache.rawTailScore);
-                }
+                auto copyTail = [&](Data &source, Data &tail) {
+#ifdef USE_CUDA
+                    // Keep rank-local cache storage: ordinary Split collapses
+                    // replicas to root and the next reserve broadcasts them back.
+                    if (MultiCudaCopyReplicatedRows(tail, source, total - rem, rem,
+                                                     v41DsparkTpDevices)) return;
+#endif
+                    Split(source, 1, total - rem, total, tail);
+                };
+                copyTail(scratch.rawKV[layer], cache.rawTailKV);
+                if (ratio > 1) copyTail(scratch.rawScore[layer], cache.rawTailScore);
             }
             AssertInFastLLM(cache.compressedBlocks == newLen / ratio,
                             "DeepSeekV41 DSpark: compressed cache rollback is inconsistent at layer " +

@@ -1399,6 +1399,20 @@ if (UNIT_TEST)
             fastllm_add_checked_test(deepseekV41QKVPreparation deepseekV41QKVPreparationRegression
                 "PASS V4.1 QKV preparation" 300)
             set_tests_properties(deepseekV41QKVPreparation PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+            add_executable(multiCudaReplicatedRowsRegression test/ops/multiCudaReplicatedRowsRegression.cpp)
+            target_link_libraries(multiCudaReplicatedRowsRegression PRIVATE fastllm)
+            target_include_directories(multiCudaReplicatedRowsRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(multiCudaReplicatedRows multiCudaReplicatedRowsRegression
+                "PASS [0-9]+ replicated row slices" 300)
+            set_tests_properties(multiCudaReplicatedRows PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+            add_executable(deepseekV41DsparkCommitRegression test/ops/deepseekV41DsparkCommitRegression.cpp)
+            target_link_libraries(deepseekV41DsparkCommitRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41DsparkCommitRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(deepseekV41DsparkCommit deepseekV41DsparkCommitRegression
+                "PASS [0-9]+ TP8 DSpark commits" 300)
+            set_tests_properties(deepseekV41DsparkCommit PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
             add_executable(deepseekV41EngramProjectionRegression test/ops/deepseekV41EngramProjectionRegression.cpp)
             target_link_libraries(deepseekV41EngramProjectionRegression PRIVATE fastllm)
             target_include_directories(deepseekV41EngramProjectionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

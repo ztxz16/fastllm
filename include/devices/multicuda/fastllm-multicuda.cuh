@@ -196,6 +196,11 @@ namespace fastllm {
         Data &attnSink, int windowSize, float scale, const std::vector<int> &devices,
         const std::function<void(int, int)> &before = {},
         const std::function<void(int, int)> &after = {}, bool workerOrdered = false);
+    // Copy contiguous rows of a dense [1, tokens, width] replicated tensor
+    // independently on each rank. Retains owned destination allocations and
+    // replica layout; unsupported layouts/aliases return false without writes.
+    bool MultiCudaCopyReplicatedRows(Data &dst, const Data &src, int start, int rows,
+                                      const std::vector<int> &devices);
     // Copy compact TP activation shards while retaining destination addresses.
     bool MultiCudaCopyShardedActivation(Data &dst, const Data &src, const std::vector<int> &devices,
                                        bool copyData = true);
