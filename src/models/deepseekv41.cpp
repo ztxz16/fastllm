@@ -4452,8 +4452,10 @@ namespace fastllm {
             std::string mainDevice = SelectDeviceFromMap(work->model.deviceMap, layer + 1,
                                                        work->model.block_cnt);
             if (mainDevice.empty()) mainDevice = V41Executor().GetFirstDeviceType();
-            ctx.parallelShared = work->single && work->seqlen == 1 &&
-                ctx.hasSharedExpertOut && !work->dumpDebug && !work->dsparkVerify &&
+            ctx.parallelShared = work->single &&
+                ((work->seqlen == 1 && !work->dsparkVerify) ||
+                 (work->dsparkVerify && work->seqlen >= 2 && work->seqlen <= 8)) &&
+                ctx.hasSharedExpertOut && !work->dumpDebug &&
                 !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
                 V41DeviceSpecUsesType(mainDevice, "multicuda") &&
                 mainDevice == work->model.SelectMoeDeviceForLayer(layer);
