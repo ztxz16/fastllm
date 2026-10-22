@@ -89,7 +89,8 @@ static void GraphChecks(bool capacityMiss, int tokens = 1) {
         if (capacityMiss) {
             // Exhaust fitting idle blocks; fallback must submit no partial fast path.
             const size_t count = std::min(cases[i].window, cases[i].start + cases[i].tokens) + cases[i].width;
-            const size_t bytes = size_t(cases[i].tokens) * count * (512+32+1) * sizeof(float);
+            // These cases all have >=512 candidates and include coefficient scratch.
+            const size_t bytes = size_t(cases[i].tokens) * (count * (512+3*32+1) + 32) * sizeof(float);
             for (;;) {
                 void *ptr = nullptr; const auto status = FastllmCudaTryMalloc(&ptr, bytes);
                 if (status == FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE) break;
@@ -106,7 +107,7 @@ static void GraphChecks(bool capacityMiss, int tokens = 1) {
         Cuda(cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking));
         if (!capacityMiss) {
             size_t count=0; Cuda(cudaGraphGetNodes(graphs[i], nullptr, &count));
-            Check(count >= 3, "parallel attention was not captured");
+            Check(count >= 4, "parallel attention/coefficient pass was not captured");
         }
     }
     for (void *a : reserved[0]) for (void *b : reserved[1])
@@ -126,6 +127,33 @@ static void GraphChecks(bool capacityMiss, int tokens = 1) {
         Cuda(cudaStreamDestroy(streams[i])); FastllmCudaGraphMemoryPoolRelease(reserved[i]);
         for (void *ptr : held[i]) FastllmCudaFree(ptr);
     }
+}
+static int CoefficientChecks() {
+    int checks = 0;
+    // Odd heads/candidate counts exercise float2 scratch alignment and partial
+    // warps. Cover both sides of the coefficient dispatch and its largest list.
+    for (int tokens : {1,3,4,5,7,8}) for (int width : {32,127,128,511,512,513,4096})
+        for (int pattern : {0,1,2}) {
+            Case c(7,0,0,width,0,3,1009+checks,BFLOAT16,tokens);
+            if (pattern == 0) {
+                std::vector<int32_t> invalid(size_t(tokens)*width,-1);
+                Cuda(cudaMemcpy(c.indices.cudaData,invalid.data(),invalid.size()*sizeof(int32_t),cudaMemcpyHostToDevice));
+            } else if (pattern == 1) {
+                // Large scores, negative/positive sinks, and tied zero scores
+                // must retain the scalar online-softmax result exactly.
+                Data q = Random(BFLOAT16,{1,tokens,7,512},233+checks,10000.f);
+                Data sink = Random(FLOAT32,{7},431+checks,10000.f);
+                Cuda(cudaMemcpy(c.q.cudaData,q.cudaData,q.GetBytes(),cudaMemcpyDeviceToDevice));
+                Cuda(cudaMemcpy(c.sink.cudaData,sink.cudaData,sink.GetBytes(),cudaMemcpyDeviceToDevice));
+            } else {
+                Cuda(cudaMemset(c.q.cudaData,0,c.q.GetBytes()));
+                Cuda(cudaMemset(c.sink.cudaData,0,c.sink.GetBytes()));
+            }
+            auto expected=c.Reference(); c.Run();
+            Equal(expected,c.output,"coefficient boundary case="+std::to_string(checks));
+            ++checks;
+        }
+    return checks;
 }
 static int VerifyChecks(bool smoke) {
     int checks = 0;
@@ -192,6 +220,7 @@ int main(int argc, char **argv) {
             }
             checks += VerifyChecks(mode=="smoke");
             if (mode!="smoke") {
+                checks += CoefficientChecks();
                 for (int heads : {128,129}) {
                     Case c(heads,128,8192,33,1,3); auto expected=c.Reference();
                     c.Run(); Equal(expected,c.output,"head limit"); ++checks;

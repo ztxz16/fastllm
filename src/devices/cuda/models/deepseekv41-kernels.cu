@@ -4614,7 +4614,12 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
         if (candidates >= 32 && candidates <= 4096 && heads <= 128) {
             const int count = int(candidates);
             const size_t rowsCount = size_t(seqlen) * count;
-            const size_t bytes = rowsCount * ((512 + heads) * sizeof(float) + sizeof(int32_t));
+            // A separate coefficient pass amortizes well for long candidate lists
+            // or verification batches; short decode keeps the single PV launch.
+            const bool reuseCoefficients = count >= 512 || (seqlen >= 4 && count >= 128);
+            const size_t scoreCount = rowsCount * heads;
+            const size_t bytes = rowsCount * ((512 + heads) * sizeof(float) + sizeof(int32_t)) +
+                (reuseCoefficients ? scoreCount * sizeof(float2) + size_t(seqlen) * heads * sizeof(float) : 0);
             void *allocation = nullptr;
             const auto status = FastllmCudaTryMalloc(&allocation, bytes);
             if (status == FASTLLM_CUDA_TRY_MALLOC_ERROR) return false;
@@ -4624,8 +4629,13 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                     ~Scratch() { if (!FastllmCudaFreeAfterCurrentThreadStream(ptr)) FastllmCudaFree(ptr); }
                 } scratch{allocation};
                 auto *rows = static_cast<float *>(allocation);
-                auto *scores = rows + rowsCount * 512;
-                auto *valid = reinterpret_cast<int32_t *>(scores + rowsCount * heads);
+                // Put float2 scratch immediately after the 512-wide rows so it
+                // stays aligned even for odd head/candidate counts.
+                auto *coefficients = reinterpret_cast<float2 *>(rows + rowsCount * 512);
+                auto *scores = reuseCoefficients ? reinterpret_cast<float *>(coefficients + scoreCount)
+                                                : rows + rowsCount * 512;
+                auto *inverseSums = scores + scoreCount;
+                auto *valid = reinterpret_cast<int32_t *>(inverseSums + (reuseCoefficients ? size_t(seqlen) * heads : 0));
                 V41Sm75QuantizedAttention params{
                     static_cast<const __nv_bfloat16 *>(chunkKV.cudaData),
                     hasRing && !ringFp8 ? static_cast<const __nv_bfloat16 *>(ringKV->cudaData) : nullptr,
@@ -4641,9 +4651,19 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                     V41Sm75QuantizedAttentionScores<multi><<<dim3((count + 3) / 4, (heads + 3) / 4, seqlen), 128, 0, cudaStreamPerThread>>>(
                         static_cast<const __nv_bfloat16 *>(q.cudaData), rows, valid, count, heads, scores);
                     if (!V41CheckLaunch("Sm75QuantizedAttentionScores")) return false;
-                    V41Sm75QuantizedAttentionValues<multi><<<dim3(heads, 16, seqlen), 32, 0, cudaStreamPerThread>>>(
-                        rows, valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads, softmaxScale,
-                        static_cast<__nv_bfloat16 *>(output.cudaData));
+                    if (reuseCoefficients) {
+                        V41Sm75QuantizedAttentionCoefficients<<<dim3(heads, seqlen), 32, 0, cudaStreamPerThread>>>(
+                            valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads,
+                            softmaxScale, coefficients, inverseSums);
+                        if (!V41CheckLaunch("Sm75QuantizedAttentionCoefficients")) return false;
+                        V41Sm75QuantizedAttentionValues<multi, true><<<dim3(heads, 16, seqlen), 32, 0, cudaStreamPerThread>>>(
+                            rows, valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads, softmaxScale,
+                            static_cast<__nv_bfloat16 *>(output.cudaData), coefficients, inverseSums);
+                    } else {
+                        V41Sm75QuantizedAttentionValues<multi><<<dim3(heads, 16, seqlen), 32, 0, cudaStreamPerThread>>>(
+                            rows, valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads, softmaxScale,
+                            static_cast<__nv_bfloat16 *>(output.cudaData));
+                    }
                     return V41CheckLaunch("Sm75QuantizedAttentionValues");
                 };
                 return seqlen == 1 ? launch(std::false_type{}) : launch(std::true_type{});
