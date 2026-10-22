@@ -806,6 +806,17 @@ namespace fastllm {
         }
     };
 
+    static bool DiskGGUFUsesMappedStorage(const Data &weight) {
+        if (weight.dataType != DATA_GGUF_FORMAT || weight.diskWeightParts.empty() ||
+            weight.diskWeightParts[0].fileOffset < 0) return false;
+        const int type = weight.ggmlType;
+        return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q4_K ||
+            type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S ||
+            type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS ||
+            type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ||
+            type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q3_K;
+    }
+
     static Data *LoadDiskWeight(const Data *weight, DiskWeightStorage *storage = nullptr) {
         AssertInFastLLM(weight != nullptr && weight->isDiskWeight,
                         "LoadDiskWeight expects a lazy disk weight.\n");
@@ -845,14 +856,7 @@ namespace fastllm {
             loaded->expansionSize = bytes;
             loaded->expansionBytes = bytes;
             DiskWeightAllocation allocation;
-            const bool alignedIq = weight->ggmlType == GGML_TYPE_Q2_K || weight->ggmlType == GGML_TYPE_Q4_K ||
-                weight->ggmlType == GGML_TYPE_IQ2_XXS || weight->ggmlType == GGML_TYPE_IQ2_S ||
-                weight->ggmlType == GGML_TYPE_IQ3_XXS || weight->ggmlType == GGML_TYPE_IQ4_XS ||
-                weight->ggmlType == GGML_TYPE_IQ1_S || weight->ggmlType == GGML_TYPE_IQ1_M ||
-                weight->ggmlType == GGML_TYPE_Q2_0 || weight->ggmlType == GGML_TYPE_Q3_K;
-            if (storage && !weight->diskWeightParts.empty() &&
-                alignedIq &&
-                weight->diskWeightParts[0].fileOffset >= 0) {
+            if (storage && DiskGGUFUsesMappedStorage(*weight)) {
                 constexpr uint64_t alignment = 4096;
                 const uint64_t sourcePrefix = (uint64_t)weight->diskWeightParts[0].fileOffset % alignment;
                 const uint64_t prefix = sourcePrefix / alignof(ggml_half) * alignof(ggml_half);
@@ -2535,14 +2539,27 @@ namespace fastllm {
         std::vector<std::pair<const Data*, const Data*>> selected;
         std::unordered_set<const Data*> seen;
         auto supported = [](const Data *w) {
-            return w && w->isDiskWeight && w->dataType == NVFP4 &&
-                w->dims.size() == 2 && w->blockK == 1 && w->blockM == 32 &&
-                w->scales.empty() && w->mins.empty() && w->zeros.empty() &&
-                w->halfScales.empty() && w->perChannelsConfigs.empty();
+            if (!w || !w->isDiskWeight || w->dims.size() != 2 ||
+                !w->scales.empty() || !w->mins.empty() || !w->zeros.empty() ||
+                !w->halfScales.empty() || !w->perChannelsConfigs.empty()) return false;
+            if (w->dataType == NVFP4) return w->blockK == 1 && w->blockM == 32;
+            if (w->dataType != DATA_GGUF_FORMAT || w->IsRepacked || w->diskWeightParts.empty()) return false;
+            // Only complete canonical GGUF records have a predictable RAM
+            // charge before reading. Reject partial/oversized metadata.
+            uint64_t bytes = 0, payload = w->GetBytes();
+            for (const auto &part : w->diskWeightParts) {
+                if (part.fileOffset < 0 || part.isScalePart || part.bytes > payload - bytes) return false;
+                bytes += part.bytes;
+            }
+            return bytes && bytes == payload;
         };
-        for (const auto &table : layers) {
-            // Shared experts have their own placement; preload routed pairs.
-            for (size_t i = 2; i + 1 < table.size(); i += 2) {
+        size_t columns = 0;
+        for (const auto &table : layers) columns = std::max(columns, table.size());
+        // Spread cold entries across layers instead of filling only a prefix
+        // of the model. Shared experts keep their own placement.
+        for (size_t i = 2; i + 1 < columns; i += 2) {
+            for (const auto &table : layers) {
+                if (i + 1 >= table.size()) continue;
                 const Data *gate = table[i], *down = table[i + 1];
                 if (!supported(gate) || !supported(down) || !seen.insert(gate).second) continue;
                 auto found = cache.entries.find(gate);
@@ -2550,14 +2567,18 @@ namespace fastllm {
                     std::any_of(found->second.cuda.begin(), found->second.cuda.end(),
                         [](const auto &item) { return bool(item.second); }))) continue;
                 uint64_t bytes = 0;
+                bool fits = true;
                 for (const Data *w : {gate, down}) {
                     // Preload must reserve alignment padding before queuing a
                     // read, using the same direct-I/O policy as ReadDiskExpert.
                     DiskExpertReadScope scope;
                     const DiskNativeReadPlan direct(*w);
-                    bytes += direct.bytes ? direct.bytes : w->GetBytes();
+                    const uint64_t allocated = DiskGGUFUsesMappedStorage(*w)
+                        ? DiskGGUFAllocationBytes(w->GetBytes()) : direct.bytes ? direct.bytes : w->GetBytes();
+                    if (allocated > remaining - bytes) { fits = false; break; }
+                    bytes += allocated;
                 }
-                if (!bytes || bytes > remaining) continue;
+                if (!fits || !bytes) continue;
                 remaining -= bytes;
                 selected.emplace_back(gate, down);
             }

@@ -140,6 +140,40 @@ static void Compare(const std::vector<float> &a, const std::vector<float> &b, do
     printf("relative L2 %.8g (limit %.8g)\n",rel,tolerance); fflush(stdout);
     Check(rel<=tolerance,"disk V4.1 GGUF numerics");
 }
+static uint64_t PreloadRecordBytes(const Fixture &f, bool mapped = true) {
+    const long nativePage = sysconf(_SC_PAGESIZE);
+    const uint64_t page = nativePage > 0 ? nativePage : 4096;
+    uint64_t bytes = 0;
+    for (int part=0; part<2; ++part) {
+        const uint64_t payload = f.disk[2+part]->GetBytes();
+        bytes += mapped ? (payload+8192+page-1)/page*page : payload;
+    }
+    return bytes;
+}
+static void TestPreload(Fixture &f, int device, bool mapped = true) {
+    SetMoeCudaCacheBytes(0); SetMoeCpuCacheBytes(0); TrimDiskMoeCache();
+    auto reference = f.Run(true,1,0,device,8);
+    auto before = GetDiskMoeCacheStats();
+    Check(PreloadDiskMoeCache({f.disk})==0,"disabled GGUF preload");
+    const uint64_t record = PreloadRecordBytes(f,mapped);
+    SetMoeCpuCacheBytes(record-1);
+    Check(PreloadDiskMoeCache({f.disk})==0,"undersized GGUF preload");
+    Check(GetDiskMoeCacheStats().diskBytes==before.diskBytes,"unbudgeted preload read disk");
+    SetMoeCpuCacheBytes(record*Fixture::experts-1);
+    Check(PreloadDiskMoeCache({f.disk,f.disk})==record*(Fixture::experts-1),"GGUF padding/duplicate preload budget");
+    auto partial = GetDiskMoeCacheStats();
+    Check(partial.cpuBytes==record*(Fixture::experts-1),"GGUF preload byte accounting");
+    Check(partial.diskBytes-before.diskBytes==f.bytes*(Fixture::experts-1),"GGUF preload read accounting");
+    Check(partial.cpuHits==before.cpuHits && partial.misses==before.misses,"GGUF preload fabricated routing");
+    Check(PreloadDiskMoeCache({f.disk})==0,"GGUF preload not idempotent");
+    SetMoeCpuCacheBytes(record*Fixture::experts);
+    Check(PreloadDiskMoeCache({f.disk})==record,"GGUF preload did not fill remaining capacity");
+    auto full = GetDiskMoeCacheStats();
+    Compare(f.Run(true,1,0,device,8),reference,0);
+    Check(GetDiskMoeCacheStats().diskBytes==full.diskBytes,"preloaded GGUF reread disk");
+    SetMoeCpuCacheBytes(0); TrimDiskMoeCache();
+    Check(!GetDiskMoeCacheStats().cpuBytes,"GGUF preload survived disable");
+}
 int main() { try {
     if (FastllmCudaGetDeviceCount()<1) return 77;
     SetThreads(4);
@@ -150,6 +184,7 @@ int main() { try {
         for (int device=0; device<std::min(2,FastllmCudaGetDeviceCount()); ++device) {
             printf("gate=%d down=%d device=%d\n",pair.first,pair.second,device); fflush(stdout);
             Fixture f(pair.first,pair.second,device);
+            TestPreload(f,device);
             const uint64_t ramBudget = f.bytes*8 + Fixture::experts*2*4*4096;
             SetMoeCpuCacheBytes(0); SetMoeCudaCacheBytes(0); TrimDiskMoeCache();
             auto cpuReference = f.Run(true,1,0,device,8);
@@ -159,6 +194,8 @@ int main() { try {
             auto warm=GetDiskMoeCacheStats();
             Check(warm.uploads>start.uploads && warm.cudaHits>start.cudaHits,"GPU cache unused");
             Check(warm.cudaBytes==f.bytes*8,"all experts not admitted");
+            Check(PreloadDiskMoeCache({f.disk})==0 && GetDiskMoeCacheStats().diskBytes==warm.diskBytes,
+                  "preload duplicated GPU-resident GGUF experts");
             // Exactly matches the native decode oracle after all routes hit.
             for (int rows : {1,5,8,9,33}) Compare(f.Run(true,rows,0,device),f.Run(false,rows,0,device),0);
             // Shrink VRAM with RAM headroom: every canonical record must
@@ -227,6 +264,28 @@ int main() { try {
                 f.Run(true,1,3,device,8);
             }
         }
+    }
+    {
+        Fixture a(GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M,0), b(GGML_TYPE_Q3_K,GGML_TYPE_Q4_K,0);
+        SetMoeCudaCacheBytes(0); SetMoeCpuCacheBytes(0); TrimDiskMoeCache();
+        const uint64_t budget = PreloadRecordBytes(a)+PreloadRecordBytes(b);
+        SetMoeCpuCacheBytes(budget);
+        auto before = GetDiskMoeCacheStats();
+        Check(PreloadDiskMoeCache({{a.disk[2],a.disk[3]}})==0,"preload included shared expert");
+        ++a.disk[2]->diskWeightParts[0].bytes;
+        Check(PreloadDiskMoeCache({{nullptr,nullptr,a.disk[2],a.disk[3]}})==0,"preload accepted oversized GGUF metadata");
+        --a.disk[2]->diskWeightParts[0].bytes;
+        Check(GetDiskMoeCacheStats().diskBytes==before.diskBytes,"invalid preload performed I/O");
+        Check(PreloadDiskMoeCache({a.disk,b.disk,a.disk})==budget,"preload did not distribute across layers");
+        auto loaded = GetDiskMoeCacheStats();
+        a.Run(true,1,0,0,1); b.Run(true,1,0,0,1);
+        Check(GetDiskMoeCacheStats().diskBytes==loaded.diskBytes,"preload starved later layer");
+        SetMoeCpuCacheBytes(0); TrimDiskMoeCache();
+    }
+    {
+        // GGUF formats without mapped cache buffers retain exact heap charges.
+        Fixture f(GGML_TYPE_Q5_K,GGML_TYPE_Q6_K,0);
+        TestPreload(f,0,false);
     }
     {
         // Real decode dimensions exercise the large, huge-page-aligned
