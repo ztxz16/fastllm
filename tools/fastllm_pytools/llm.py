@@ -1680,6 +1680,13 @@ class model:
             'temperature': 1.0
         }
 
+        # DeepSeek-V4.1 Flash recommends temperature=1 and top_p=1.
+        # Disable top-k truncation instead of inheriting the greedy top_k=1.
+        if (architecture == "DeepseekV41ForCausalLM" or
+                model_type in ("deepseek_v41", "deepseek_v41_text") or
+                text_model_type == "deepseek_v41_text"):
+            self.default_generation_config.update(top_p=1.0, top_k=0)
+
         # Modern GGUF files can embed the recommended sampler settings.  Use
         # them when there is no Hugging Face generation_config.json sidecar.
         self.default_generation_config.update({
