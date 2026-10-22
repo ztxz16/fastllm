@@ -6567,8 +6567,12 @@ namespace fastllm {
             std::lock_guard<std::mutex> lock(profileLocker);
             auto &profile = profiles[key];
             if (!profile.initialized || profile.maxN < adaptiveN) {
+                // Cover the available bounded range in one pass. Otherwise a
+                // slightly busier expert rebuilds every curve on a later request,
+                // even after a representative prefill has warmed this shape.
+                const int benchmarkN = std::min(input.dims[0], hardMaxBenchmarkN);
                 if (!BuildProfile(profile, input, output, w1, w2, w3, weights, biass,
-                                  weightsBatch, sharedScale, adaptiveN, m)) {
+                                  weightsBatch, sharedScale, benchmarkN, m)) {
                     return defaultExpertLimit;
                 }
             }

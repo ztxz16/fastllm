@@ -6581,9 +6581,51 @@ namespace fastllm {
             v41StatesByFirstKey.erase((const void*)&pastKeyValues[0].first);
         }
 #ifdef USE_CUDA
-        if (GetFastllmEnv().cudaGraph && v41MoeCudaGraphCompatible &&
-            V41DeviceMapUsesCuda(this->deviceMap) &&
-            std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr) {
+        const bool cudaWarmup = V41DeviceMapUsesCuda(this->deviceMap) &&
+            std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr;
+        if (cudaWarmup) {
+            // A single token does not exercise GGUF prefill kernels or the
+            // CPU/GPU expert cost curves. Pay their first-use cost before ready,
+            // with the same chunk/context bounds as ordinary requests.
+            int prefillTokens = std::min(8192, GetChunkedPrefillSize());
+            if (max_positions > 0) prefillTokens = std::min(prefillTokens, max_positions);
+            if (tokensLimit > 0) prefillTokens = std::min(prefillTokens, tokensLimit);
+            std::vector<int> sizes;
+            if (prefillTokens > 1) sizes.push_back(prefillTokens);
+            // Small matrix kernels can differ from the large prefill path.
+            if (prefillTokens > 32) sizes.push_back(32);
+            const int vocabSize = this->weight["embed.weight"].dims[0];
+            for (int count : sizes) {
+                const auto begin = std::chrono::steady_clock::now();
+                printf("[Warmup] DeepSeek-V4.1 prefill: %d tokens (kernels and MoE calibration).\n", count);
+                fflush(stdout);
+                std::vector<float> tokens(count);
+                uint32_t seed = 1;
+                for (float &token : tokens) {
+                    seed = seed * 1664525u + 1013904223u;
+                    token = seed % vocabSize;
+                }
+                Data ids(DataType::FLOAT32, {1, count}, tokens);
+                std::vector<DeepSeekV41Segment> segments(1);
+                segments[0].state = std::make_shared<DeepSeekV41RequestState>();
+                segments[0].state->layers.resize(block_cnt);
+                segments[0].seqlen = count;
+                std::vector<Data> dummy(2 * block_cnt);
+                std::vector<std::pair<Data*, Data*>> past;
+                for (size_t i = 0; i < dummy.size(); i += 2) past.emplace_back(&dummy[i], &dummy[i + 1]);
+                std::vector<GenerationConfig> configs(1);
+                configs[0].do_sample = false;
+                configs[0].top_k = 1;
+                LastTokensManager last(1, 64);
+                // Private request state: never register synthetic tokens in the
+                // session/prefix cache, and release KV before graph warmup.
+                ForwardSegments(segments, ids, nullptr, nullptr, configs, last, nullptr, past);
+                printf("[Warmup] DeepSeek-V4.1 prefill: %d tokens finished in %.3f s.\n", count,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+                fflush(stdout);
+            }
+        }
+        if (cudaWarmup && GetFastllmEnv().cudaGraph && v41MoeCudaGraphCompatible) {
             // Capture common decode sizes before accepting requests. Unknown
             // batch sizes and invalidated graphs fall back to eager execution.
             std::vector<int> batches;
