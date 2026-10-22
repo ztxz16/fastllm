@@ -2577,6 +2577,66 @@ namespace fastllm {
 #endif
     }
 
+    bool DeepSeekV41Model::MoveSpecialWeightToCudaIfNeeded(
+            const std::string &weightName, Data &data) const {
+        if (basellm::MoveSpecialWeightToCudaIfNeeded(weightName, data)) {
+            return true;
+        }
+#ifdef USE_CUDA
+        // The loader calls this after conversion and after a merge has finished.
+        // Release dense weights' host copies now instead of retaining them next
+        // to all NUMA experts until warmup. Only handle known single-GPU/PP
+        // consumers; TP, embeddings and auxiliary branches keep their existing
+        // preparation paths. In particular, never move w1/w3 merge inputs.
+        if (deviceMap.empty() || block_cnt <= 0 ||
+            V41ReferenceMathEnabled() || data.isDiskWeight || data.isFake ||
+            !data.isModelWeight || data.dataDevice != DataDevice::CPU ||
+            data.cpuData == nullptr || data.multiDeviceData || !data.numasData.empty()) {
+            return false;
+        }
+        int layer = block_cnt - 1;
+        if (weightName != "head.weight" && weightName != "norm.weight") {
+            if (!V41StartsWith(weightName, "layers.")) return false;
+            const size_t end = weightName.find('.', 7);
+            if (end == std::string::npos || end == 7) return false;
+            layer = 0;
+            for (size_t i = 7; i < end; ++i) {
+                const char c = weightName[i];
+                if (c < '0' || c > '9' || layer > (INT_MAX - (c - '0')) / 10) return false;
+                layer = layer * 10 + c - '0';
+            }
+            if (layer >= block_cnt) return false;
+            const std::string suffix = weightName.substr(end + 1);
+            static const std::set<std::string> denseWeights = {
+                "attn.attn_sink", "attn.compressor.norm.weight",
+                "attn.compressor.wgate.weight", "attn.compressor.wkv.weight",
+                "attn.indexer.k_norm.weight", "attn.indexer.weights_proj.weight",
+                "attn.indexer.wk.weight", "attn.indexer.wq_b.weight",
+                "attn.kv_norm.weight", "attn.q_norm.weight", "attn.wkv.weight",
+                "attn.wo_a.weight", "attn.wo_b.weight", "attn.wq_a.weight", "attn.wq_b.weight",
+                "attn_norm.weight", "engram.k_weight", "engram.q_weight", "engram.wkv.weight",
+                "ffn.gate.bias", "ffn.gate.weight", "ffn.shared_experts.gateup.weight",
+                "ffn.shared_experts.w2.weight", "ffn_norm.weight",
+                "hc_attn_base", "hc_attn_fn", "hc_attn_scale",
+                "hc_ffn_base", "hc_ffn_fn", "hc_ffn_scale"
+            };
+            if (!denseWeights.count(suffix) ||
+                (V41StartsWith(suffix, "ffn.shared_experts.") && !GetCudaSharedExpert())) {
+                return false;
+            }
+        }
+        const std::string device = SelectDeviceFromMap(deviceMap, layer + 1, block_cnt);
+        if (!V41StartsWith(device, "cuda:")) return false;
+        std::map<int, int> ratios;
+        const std::vector<int> devices = ParseDeviceIds(device, "cuda", ratios);
+        if (devices.size() != 1) return false;
+        data.ToDevice(DataDevice::CUDA, devices);
+        return true;
+#else
+        return false;
+#endif
+    }
+
     void DeepSeekV41Model::OnModelWeightsLoaded() {
         if (engram_layer_ids.empty()) {
             return;

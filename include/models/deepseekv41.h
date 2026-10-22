@@ -201,6 +201,8 @@ namespace fastllm {
 
         void OnModelWeightsLoaded() override;
 
+        bool MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const override;
+
         // Reuse prefill scratch through decode. The existing pool bounds idle
         // storage per device and reclaims it on allocation pressure.
         bool RetainCudaWorkspace() const override {

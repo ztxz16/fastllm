@@ -639,7 +639,7 @@ namespace fastllm {
                 std::vector<std::vector<Data *>> &layerWeights) const;
         bool ShouldRegisterSpecialWeightForDeviceType(const std::string &weightName, const std::string &deviceType) const;
         bool ShouldRegisterSpecialWeightForDeviceTypes(const std::string &weightName, const std::vector<std::string> &deviceTypes) const;
-        bool MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const;
+        virtual bool MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const;
 
         std::string adapterName;
 

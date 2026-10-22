@@ -1350,6 +1350,15 @@ if (UNIT_TEST)
         target_include_directories(deepseekV41PrecisionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME deepseekV41PrecisionCuda COMMAND deepseekV41PrecisionRegression --cuda)
         if (NOT USE_ROCM)
+            add_executable(deepseekV41LoadPlacement test/ops/deepseekV41LoadPlacement.cpp)
+            target_link_libraries(deepseekV41LoadPlacement PRIVATE fastllm)
+            target_include_directories(deepseekV41LoadPlacement PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(deepseekV41LoadPlacement deepseekV41LoadPlacement
+                "PASS: V4.1 load placement" 60)
+            fastllm_add_checked_test(deepseekV41LoadPlacementReference deepseekV41LoadPlacement
+                "PASS: V4.1 load placement reference" 60 --reference)
+            set_tests_properties(deepseekV41LoadPlacement deepseekV41LoadPlacementReference
+                PROPERTIES LABELS cuda)
             add_executable(deepseekV41Mxfp4PpRegression test/ops/deepseekV41Mxfp4PpRegression.cpp)
             target_link_libraries(deepseekV41Mxfp4PpRegression PRIVATE fastllm)
             target_include_directories(deepseekV41Mxfp4PpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
