@@ -37,7 +37,7 @@ def apply_model_defaults(args, metadata):
         return
     if not explicit & speculation and not (args.mtp or args.dspark or args.speculative_algorithm or
                                            args.speculative_draft_model_path):
-        args.dspark, args.speculative_algorithm = 7, "dspark"
+        args.dspark, args.speculative_algorithm = 5, "dspark"
     if "fast_prefill" not in explicit:
         args.fast_prefill = True
 
@@ -435,9 +435,11 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                             # available when host memory cannot hold all experts.
                             placement = (2 if p["resident_layers"] == model.layers else
                                          int(p["resident_layers"] == 0 and p["moe_cuda_cache"] > 0)) if prefer_cache else 0
-                            # Disk prefill amortizes expert reads across the
-                            # chunk. Preserve context, then maximize its size.
-                            chunk = p["chunked_prefill_size"] if model.family == "deepseek_v41" and backend == "disk" else 0
+                            # DeepSeek prefill amortizes indexed attention and
+                            # MoE dispatch across the chunk for all host-backed
+                            # expert backends. Preserve context, then maximize
+                            # the feasible chunk size.
+                            chunk = p["chunked_prefill_size"] if model.family == "deepseek_v41" else 0
                             return (chunk, placement, -score, -p["host_estimated_bytes"], -p["resident_layers"])
                         variants = [prepared]
                         if (model.family == "deepseek_v41" and backend == "disk" and
@@ -493,9 +495,16 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     # Prefer pipeline placement for Qwen without overriding explicit TP.
     # Retain TP as a capacity fallback; explicit TP produces no PP candidates.
     eligible = choices
-    if model.family == "deepseek_v41" and eligible[0][2]["moe_device"] == "disk":
+    if model.family == "deepseek_v41":
         largest_chunk = max(item[2]["chunked_prefill_size"] for item in eligible)
         eligible = [item for item in eligible if item[2]["chunked_prefill_size"] == largest_chunk]
+        # PP avoids the per-layer TP collectives for host-backed experts. Keep
+        # it for automatic topology selection when it supports the same chunk;
+        # explicit --tp/--device candidates remain untouched.
+        if not {"tp", "device"} & explicit:
+            pp = [item for item in eligible if item[2]["mode"] == "pp"]
+            if pp:
+                eligible = pp
     if model.family == "qwen4":
         eligible = [item for item in choices if item[2]["mode"] == "pp"] or choices
     if (model.family == "qwen4" and base.moe_device_layers == "auto" and
@@ -506,13 +515,18 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         eligible = full or cached or eligible
     if any("kvmem" in item[2] for item in eligible):
         eligible = [item for item in eligible if "kvmem" in item[2] or item[3]]
-    fastest = min(item[0] for item in eligible)
-    # Small predicted wins are within the error of this uncalibrated model.
-    # Prefer fewer devices/collectives when estimates are within ten percent.
-    # Where every expert fits as well, keep full KV on an otherwise tied topology.
-    close = [item for item in eligible if item[0] <= fastest * 1.10]
-    _, chosen, result, _ = min(close, key=lambda item: (
-        len(item[2]["gpu_budget_bytes"]), item[2]["mode"] == "tp", "kvmem" in item[2], item[0]))
+    if model.family == "deepseek_v41" and not {"tp", "device"} & explicit:
+        # Keep the fastest prediction at the largest feasible chunk; the
+        # generic ten-percent tie window can otherwise collapse PP to one GPU.
+        _, chosen, result, _ = min(eligible, key=lambda item: (
+            item[0], item[2]["mode"] == "tp", -len(item[2]["gpu_budget_bytes"])))
+    else:
+        # Predictions within ten percent are effectively tied: prefer fewer
+        # devices/collectives and full KV on otherwise comparable topologies.
+        fastest = min(item[0] for item in eligible)
+        close = [item for item in eligible if item[0] <= fastest * 1.10]
+        _, chosen, result, _ = min(close, key=lambda item: (
+            len(item[2]["gpu_budget_bytes"]), item[2]["mode"] == "tp", "kvmem" in item[2], item[0]))
     for name in memory.AUTO_OPTIONS:
         if getattr(chosen, name) == "auto":
             setattr(chosen, name, result[name])
@@ -537,8 +551,11 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                "dspark", "speculative_algorithm", "fast_prefill")
     result["automatic"] = {"policy": "interactive-4k-input-512-output", "topology_candidates": len(choices),
                            "ranking": "estimated latency; not measured throughput", "mtp": args.mtp}
-    if model.family == "deepseek_v41" and result["moe_device"] == "disk":
-        result["automatic"]["ranking"] = "largest feasible chunk at fixed context; CPU embedding under hybrid pressure; estimated latency"
+    if model.family == "deepseek_v41":
+        result["automatic"]["ranking"] = (
+            "largest feasible chunk at fixed context; PP preferred for "
+            "automatic host-backed hybrid; estimated latency"
+        )
     result["automatic"]["kv_streaming"] = "kvmem" in result
     result["automatic"]["cuda_graph"] = graph_enabled
     result["automatic"]["dspark"] = chosen.dspark

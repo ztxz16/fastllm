@@ -19,9 +19,11 @@ Dense Qwen3 按实际 GQA 头数、KV、dense 权重及 tied output head 副本�
 
 Qwen3.5 稠密 HF 模型按全注意力层的 GQA KV、线性注意力层的常驻状态、原生 FP8 权重和独立 MTP 层预算。先尝试原生上下文与纯 GPU TP2，必要时尝试 TP4 和较短上下文；显式 `--tp`、`--max_batch`、`--max_context_length`、`--tokens`、`--mtp 0` 或 `--speculative_algorithm off` 优先。内置 `mtp.safetensors` 且配置声明一个草稿层时默认启用 MTP5。默认 `--cuda_embedding`，不自动启用视觉输入。
 
+HF safetensors 目录支持索引引用的多级分片和符号链接分片；`dtype=fastllm` 的版本 1 GGUF 量化张量读取序列化类型头，按保存的量化字节数规划，不按默认 FP16 展开。索引中的绝对路径、`..` 路径仍会拒绝。
+
 ## 单参数自动选择
 
-DeepSeek-V4.1 默认采用不超过模型原生窗口的 **1M（1,048,576 token）上下文、单请求**，开启 **DSpark 7**（置信度阈值默认 0.5）和 **fast_prefill**。Qwen3.5 稠密 HF 模型默认并发 4、尽量使用原生上下文；其他模型保持 **128K 上下文、单请求**。按代表性的 4K 输入、512 输出估计交互延迟。读取可见 CUDA 设备的可用显存、SM 数、内存带宽参数、PCIe 条件和 peer access 能力，比较单卡、PP、双卡等比例 TP，并联合选择专家驻留、显存缓存、主存缓存和 chunk。权重可全驻留且预算允许时，也可选择全部专家放 GPU。CPU 线程依据进程可用的物理核数选择，并预留启动和 IO 线程。
+DeepSeek-V4.1 默认采用不超过模型原生窗口的 **1M（1,048,576 token）上下文、单请求**，开启 **DSpark 5**（置信度阈值默认 0.5）和 **fast_prefill**。Qwen3.5 稠密 HF 模型默认并发 4、尽量使用原生上下文；其他模型保持 **128K 上下文、单请求**。按代表性的 4K 输入、512 输出估计交互延迟。读取可见 CUDA 设备的可用显存、SM 数、内存带宽参数、PCIe 条件和 peer access 能力，比较单卡、PP、双卡等比例 TP，并联合选择专家驻留、显存缓存、主存缓存和 chunk。权重可全驻留且预算允许时，也可选择全部专家放 GPU。CPU 线程依据进程可用的物理核数选择，并预留启动和 IO 线程。
 
 DeepSeek-V4.1 的 `--auto` 默认使用 **`kv_cache_dtype=fp4`**：长期压缩 KV 和 indexer key 在原模型计算中已经经过 FP4 伪量化，按匹配的网格、分组和 scale 打包是无损存储；滑窗使用其原有 FP8 网格。Flash-1017 的长期 KV 为 **890 B/token**，1M 有效载荷约 **0.869 GiB**，加上当前分配器的扩容容量和新旧缓冲重叠，规划预留约 **1.59 GiB**。此前统一选择 16 位 KV 会将这两项分别放大到 3.125 / 5.69 GiB。显式 `--kv_cache_dtype`（包括 `float16`、`bfloat16`、`fp4_e2m1`、`auto`）优先；启用 `FASTLLM_DSV41_DISABLE_FAKE_QUANT` 或不满足打包维度时不自动启用 FP4。其他模型的存储默认不变。
 
@@ -31,9 +33,9 @@ DeepSeek-V4.1 的显存估算按 KV source 层统计共享的压缩 KV 和 index
 
 规划日志分别输出 `kv_logical_bytes_per_device`（有效载荷）、`kv_capacity_bytes_per_device`（含增长余量的容量）和 `kv_reallocation_bytes_per_device`（扩容时的旧缓冲重叠），避免将有效 KV 大小和规划峰值混为一谈。
 
-DeepSeek-V4.1 原生 FP8/MXFP4 模型在单请求、非 TP、BF16、磁盘专家和 `fast_prefill` 路径下，按 attention、WoA、MoE 分阶段的临时缓冲峰值估算工作区。MoE 使用复用的 256 行专家缓冲，WoA 保留 FP32 fallback 的权重展开和分块空间；调试 dump、其他精度、GPU 驻留专家等路径继续采用通用保守估算。CUDA graph 隐式启用的 GPU embedding 也计入预算。
+DeepSeek-V4.1 原生 FP8/MXFP4 模型在单请求、非 TP、BF16、NUMA/磁盘专家和 `fast_prefill` 路径下，按 attention、WoA、MoE 分阶段的临时缓冲峰值估算工作区。主机专家使用复用的 256 行工作缓冲，避免按 chunk 为每个路由重复计入 GPU 中间张量；WoA 保留 FP32 fallback 的权重展开和分块空间。调试 dump、其他精度、GPU 驻留专家等路径继续采用通用保守估算。CUDA graph 隐式启用的 GPU embedding 也计入预算。
 
-磁盘混推的 `--auto` 在上下文预算不变的前提下优先选择最大的可行 chunk，并比较正常 embedding 与 `low_gpu_mem`。仍需混推时优先将 embedding 留在 CPU，为 chunk 和专家缓存腾出显存；全部专家可放 GPU 时保留正常模式。显式 `--cuda_embedding`、`--low_gpu_mem`（包括 JSON 中的 false）和 chunk 优先。此策略保留默认 `gpu_mem_ratio`、512 MiB guard、完整上下文 KV 及扩容重叠预算，不把短请求的实测显存当作 1M 上下文上限。
+DeepSeek 混推的 `--auto` 在上下文预算不变的前提下优先选择最大的可行 chunk，候选顺序为 8192、4096、2048、1024、512、256；显式 chunk 优先。自动拓扑在同一主机后端支持该 chunk 时优先 PP，显式 `--tp` 或 `--device` 不受影响。磁盘专家仍比较正常 embedding 与 `low_gpu_mem`，为 chunk 和专家缓存腾出显存；全部专家可放 GPU 时保留正常模式。此策略保留默认 `gpu_mem_ratio`、512 MiB guard、完整上下文 KV 及扩容重叠预算，不把短请求的实测显存当作 1M 上下文上限。
 
 主存优先使用 NUMA（构建支持时），否则使用 CPU；超大 PLE/Engram 表优先按需读取，减少启动搬运和主存占用，主存仍放不下时再考虑磁盘专家缓存。CUDA Graph 默认开启，原有 `FASTLLM_CUDA_GRAPH` 显式设置仍优先。原有运行时检查继续决定 Graph 能否实际捕获。
 
@@ -89,6 +91,8 @@ CUDA/NUMA 混推在有专家显存缓存时，默认让 prefill 和 decode 复�
 
 `FASTLLM_DSV41_HYBRID_PP=1` 显式启用混推跨块流水线，默认关闭。它要求 CUDA PP 层放置、NUMA 专家、`fast_prefill`、单请求 greedy，以及各级独立拥有其使用的共享 KV/index 来源；例如已验证的双卡 `--device cudapp=14:26 --tp off`。专家显存缓存、DSpark、历史复用或不兼容的层切分等情况会沿用普通路径。该入口不用于纯 GPU 或 TP 执行。
 
+DeepSeek-V4.1 的 GGUF 专家缓存支持 `IQ1_S`、`IQ1_M`、`Q2_0`、`Q2_K`、`Q3_K`、`Q4_K` 的 gate/up、down 组合及不同层的混合格式，保留原量化字节。NUMA 的交错行和 R4 重排在入缓存时恢复为标准量化排列，无需 FP16 展开或额外主存权重副本；原 `Q2_K_R4`／`Q4_K_R4` 快速路径保留。部分专家层驻留 GPU 时，仅将其余 NUMA 层注册到缓存。开启 Graph 的单 token 解码和 DSpark 2～8 token 验证均可使用缓存。`--auto` 另外预留 GGUF 主存 prefill 的原始／还原上传环（3 × 16 × 2 个专家记录）和 256 MiB 预取空间及分配对齐余量，避免它们与 decode 缓存争用显存。
+
 DeepSeek-V4.1 原生 FP8/NVFP4 专家缓存随 `--moe_cuda_cache` 启用，不需要额外的频率策略开关。单卡 DSpark 的 2～8 token 校验在 Graph 开启时也使用现有缓存和动态分流，保持图段的缓冲地址；无可用 GPU 专家时保留 NUMA 回退。`get_moe_cuda_cache_route_stats` 同时统计普通解码与校验的路由，需在请求结束后读取。DeepSeek-V4.1 的 `--auto` 支持并默认开启内置 DSpark：所有启用草稿层的权重、BF16 滑窗状态、目标层 hidden 特征和验证临时空间均计入预算。草稿稠密部分按最后一张 PP 卡核算（TP 使用保守复制上界），草稿专家沿用最后 N 个主干层的专家放置；不会为纯滑窗草稿分配整段 1M KV。外置 DSpark 仍需手动配置。
 
 ## DeepSeek FP8 WoA 的通用 prefill GEMM
@@ -121,7 +125,7 @@ Qwen4、GLM-5.3 和 DeepSeek-V4.1 的混合推理命令支持以下可选值：
 | `--moe_cuda_cache auto` | 扣除权重、KV、固定状态、工作区和预留空间，计算每卡专家缓存上限 |
 | `--moe_cpu_cache auto` | `moe_device=disk` 时按有效主存余量计算专家缓存上限；CPU/NUMA 常驻专家不另分配此缓存 |
 | `--moe_device_layers auto` | 加载前规划 GPU 驻留前缀，将后面的专家层留在指定的主机设备 |
-| `--chunked_prefill_size auto` | 在 4096、2048、1024、512、256 中选择满足内存预算的切片；DeepSeek-V4.1 磁盘专家额外考虑 8192，且不超过上下文长度 |
+| `--chunked_prefill_size auto` | 在 4096、2048、1024、512、256 中选择满足内存预算的切片；DeepSeek-V4.1 所有主机专家后端额外优先考虑 8192，且不超过上下文长度 |
 | `--auto_gpu_memory_limit 20g` | 将自动规划的每张 GPU 显存预算限制为不超过 20 GiB |
 | `--auto_host_memory_limit 128g` | 将自动规划的主机内存预算限制为不超过 128 GiB |
 

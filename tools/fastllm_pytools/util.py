@@ -929,7 +929,7 @@ class _AutoArgumentParser(argparse.ArgumentParser):
 def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = _AutoArgumentParser(description = des, add_help = add_help)
     parser.add_argument('--auto', action='store_true',
-                        help='自动选择CUDA混推配置：DeepSeek-V4.1默认1M上下文、DSpark 7和fast_prefill，其他模型默认128K；显式参数优先')
+                        help='自动选择CUDA混推配置：DeepSeek-V4.1默认1M上下文、DSpark 5和fast_prefill，其他模型默认128K；显式参数优先')
     parser.add_argument('--auto_gpu_memory_limit', '--auto-gpu-memory-limit',
                         dest='auto_gpu_memory_limit', type=_memory_size_or_auto, default=None,
                         help='自动规划时每张可见GPU的显存上限，如20g；未指定则读取实际可用显存')
