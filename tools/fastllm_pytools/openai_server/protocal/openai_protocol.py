@@ -88,6 +88,8 @@ class ChatCompletionNamedToolChoiceParam(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model: str
+    logprobs: bool = False
+    top_logprobs: Optional[int] = None
     messages: Optional[Union[str, List[Dict[str, Any]]]] = []
     prompt: Optional[str] = ""
     temperature: Optional[float] = None
@@ -174,6 +176,8 @@ class ChatMessage(BaseModel):
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
+    logprobs: Optional[Dict[str, Any]] = Field(
+        default=None, exclude_if=lambda value: value is None)
     finish_reason: Optional[Literal["stop", "length", "tool_calls"]] = None
 
 

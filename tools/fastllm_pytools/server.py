@@ -320,7 +320,8 @@ def _fastllm_server(args, startup_progress):
     fastllm_completion = FastLLmCompletion(model_name = args.model_name, model = model,
                                            think = (args.think.lower() != "false"),
                                            enable_thinking = getattr(model, "enable_thinking", True),
-                                           hide_input = args.hide_input)
+                                           hide_input = args.hide_input,
+                                           max_logprobs = args.max_logprobs)
     fastllm_embed = FastLLmEmbed(model_name = args.model_name, model = model)
     fastllm_reranker = FastLLmReranker(model_name = args.model_name, model = model)
     fastllm_model = FastLLmModel(model_name = args.model_name, model = model)
