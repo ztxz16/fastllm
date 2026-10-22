@@ -490,7 +490,9 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
 }
 
 bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f) {
-    if (!f.graphReplay || !f.graphState || v41CudaGraphWarmingUp || f.quantKV ||
+    // Verification warmup uses the same composition/replay path as requests.
+    // Ordinary decode still builds its full graph explicitly after warmup.
+    if (!f.graphReplay || !f.graphState || (v41CudaGraphWarmingUp && !f.dsparkVerify) || f.quantKV ||
         f.hasImageTokens || f.inputEmbeds)
         return false;
     if (f.dsparkVerify && !f.graphState->fullVerifyAttempted) {

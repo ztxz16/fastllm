@@ -6798,6 +6798,53 @@ namespace fastllm {
                     }
                     BuildFullDecodeGraph(batch, segments);
                 }
+                if (v41DsparkEnabled) {
+                    // Confidence filtering and the output limit can shorten a
+                    // proposal. Warm every supported verification shape, using
+                    // private KV so no synthetic history enters a real request.
+                    for (int count = 2; count <= std::min(8, v41DsparkTokens + 1); ++count) {
+                        const auto begin = std::chrono::steady_clock::now();
+                        std::vector<DeepSeekV41Segment> segments(1);
+                        auto &seg = segments[0];
+                        seg.state = std::make_shared<DeepSeekV41RequestState>();
+                        seg.state->layers.resize(block_cnt);
+                        seg.seqlen = 1;
+                        std::vector<Data> dummy(2 * block_cnt);
+                        std::vector<std::pair<Data*, Data*>> past;
+                        for (size_t i = 0; i < dummy.size(); i += 2)
+                            past.emplace_back(&dummy[i], &dummy[i + 1]);
+                        std::vector<GenerationConfig> configs(1);
+                        configs[0].do_sample = false;
+                        configs[0].top_k = 1;
+                        LastTokensManager last(1, 64);
+                        Data first(DataType::FLOAT32, {1, 1}, {1});
+                        ForwardSegments(segments, first, nullptr, nullptr, configs, last, nullptr, past);
+                        Data ids(DataType::FLOAT32, {1, count}, std::vector<float>(count, 1));
+                        // Eager warmups, segmented capture, full composition and
+                        // one further replay. Commit between forwards just as a
+                        // real verifier does; both full and partial prefixes are
+                        // exercised without running a draft or counting accepts.
+                        for (int step = 0; step < V41DecodeCudaGraphWarmupRounds() + 3; ++step) {
+                            DeepSeekV41SpecScratch scratch;
+                            scratch.captureMain = scratch.deferWindow = scratch.wantAllTokens = true;
+                            scratch.windowKV.resize(block_cnt);
+                            scratch.rawKV.resize(block_cnt);
+                            scratch.rawScore.resize(block_cnt);
+                            scratch.prevRawTail.assign(block_cnt, 0);
+                            scratch.prevBlocks.assign(block_cnt, 0);
+                            seg.startPos = seg.state->totalLen;
+                            seg.seqlen = count;
+                            seg.spec = &scratch;
+                            ForwardSegments(segments, ids, nullptr, nullptr, configs, last, nullptr, past);
+                            DsparkCommitPrefix(*seg.state, scratch, seg.startPos,
+                                               step % 2 ? 1 : count, count);
+                            seg.spec = nullptr;
+                        }
+                        printf("[Warmup] DeepSeek-V4.1 verify: %d tokens finished in %.3f s.\n", count,
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+                        fflush(stdout);
+                    }
+                }
             } catch (...) {
                 v41CudaGraphWarmingUp = false;
                 throw;
