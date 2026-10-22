@@ -64,6 +64,10 @@ ftllm run Qwen/Qwen3-0.6B
 
 The API server is the primary deployment entry point:
 
+For multiple independent replicas on one Linux host, `ftllm deploy` adds background
+process supervision and streaming request routing while reusing native server arguments.
+Existing `ftllm serve/server` behavior is unchanged. See [deployment configuration](docs/deploy.md).
+
 ~~~bash
 # API server, listening on 0.0.0.0:8080 by default
 ftllm server Qwen/Qwen3-0.6B

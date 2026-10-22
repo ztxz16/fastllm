@@ -64,6 +64,9 @@ ftllm run Qwen/Qwen3-0.6B
 
 最常用的部署入口是 API Server：
 
+单机多副本可使用独立的 `ftllm deploy` 组件，复用原生服务参数，提供后台进程管理和
+流式请求路由；现有 `ftllm serve/server` 用法不变。配置与命令见 [多副本部署](docs/deploy.md)。
+
 ~~~bash
 # API Server，默认监听 0.0.0.0:8080
 ftllm server Qwen/Qwen3-0.6B
