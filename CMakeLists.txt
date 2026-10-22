@@ -1258,11 +1258,17 @@ if (UNIT_TEST)
         add_test(NAME numas_v41_q2_verify COMMAND numas_v41_q2_moe_test verify 512 2304)
         add_test(NAME numas_v41_q2_verify_q8k COMMAND numas_v41_q2_moe_test verify 256 768 q2)
         add_test(NAME numas_v41_q2_verify_dual_numa COMMAND numas_v41_q2_moe_test verify 512 2304)
+        add_test(NAME numas_v41_q2_0_decode COMMAND numas_v41_q2_moe_test decode 512 2304 q2_0)
+        add_test(NAME numas_v41_q2_0_decode_blocks COMMAND numas_v41_q2_moe_test decode 512 384 q2_0)
+        add_test(NAME numas_v41_q2_0_verify COMMAND numas_v41_q2_moe_test verify 512 384 q2_0)
+        add_test(NAME numas_v41_q2_0_decode_dual_numa COMMAND numas_v41_q2_moe_test decode 512 384 q2_0)
         set_tests_properties(numas_v41_q2_decode numas_v41_q2_decode_model_inter numas_v41_q2_decode_q8k
-            numas_v41_q2_verify numas_v41_q2_verify_q8k PROPERTIES
+            numas_v41_q2_verify numas_v41_q2_verify_q8k
+            numas_v41_q2_0_decode numas_v41_q2_0_decode_blocks numas_v41_q2_0_verify PROPERTIES
             ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=0"
             RUN_SERIAL TRUE TIMEOUT 120)
-        set_tests_properties(numas_v41_q2_decode_dual_numa numas_v41_q2_verify_dual_numa PROPERTIES
+        set_tests_properties(numas_v41_q2_decode_dual_numa numas_v41_q2_verify_dual_numa
+            numas_v41_q2_0_decode_dual_numa PROPERTIES
             ENVIRONMENT "FT_NUMAS=2;FT_THREADS=4;FT_GPU_PREFILL=0"
             RUN_SERIAL TRUE TIMEOUT 120)
         add_test(NAME disk_v41_q2_moe COMMAND numas_v41_q2_moe_test disk)

@@ -925,9 +925,12 @@ namespace fastllm {
                type == static_cast<DataType>(DataType::DATA_GGUF_FORMAT + GGML_TYPE_Q8_K32);
     }
 
-    static bool CanPrepareDeepSeekV4Q8K(DataType type, int columns, int activationQuantBlock) {
-        return IsQ8KActivationType(type) && columns % QK_K == 0 &&
-               (activationQuantBlock == 32 || activationQuantBlock == 128);
+    static int DeepSeekV4QuantizedPrepareBlock(DataType type, int columns, int activationQuantBlock) {
+        if (activationQuantBlock != 32 && activationQuantBlock != 128) return 0;
+        const int block = IsQ8KActivationType(type) ? QK_K :
+            type == static_cast<DataType>(DataType::DATA_GGUF_FORMAT + GGML_TYPE_Q8_0)
+                ? std::max(QK8_0, activationQuantBlock) : 0;
+        return block && columns % block == 0 ? block : 0;
     }
 
     struct MultiThreadDeepSeekV4NumasDownPrepareOp : MultiThreadBaseOp {
@@ -1024,6 +1027,12 @@ namespace fastllm {
                 Float32ToFloat16(
                     swigluData + st,
                     (uint16_t*)downInputData + st, end - st);
+            } else if (downInputType == static_cast<DataType>(
+                           DataType::DATA_GGUF_FORMAT + GGML_TYPE_Q8_0)) {
+                // Own complete FP8 and Q8_0 blocks. Convert directly on this
+                // worker, without recursively submitting to the same pool.
+                ConvertFromFloat32(downInputData + GetDataBytes(downInputType, 1, st),
+                    downInputType, swigluData + st, 1, end - st);
             } else {
                 ErrorInFastLLM(
                     "Unsupported DeepSeek-V4 NUMA MoE down activation type.\n");
@@ -4031,14 +4040,14 @@ namespace fastllm {
             }
             context.gate = true;
             runWorkers(work.rowWorkers, true);
-            const bool q8k = CanPrepareDeepSeekV4Q8K(downAct, inter, activationQuantBlock);
+            const int prepareBlock = DeepSeekV4QuantizedPrepareBlock(downAct, inter, activationQuantBlock);
             const bool floating = downAct == FLOAT32 || downAct == FLOAT16 || downAct == BFLOAT16;
-            if (q8k || (floating && inter % activationQuantBlock == 0)) {
+            if (prepareBlock || (floating && inter % activationQuantBlock == 0)) {
                 work.scoredPrepareWorkers.resize(config->threads);
                 for (int t = 0; t < config->threads; ++t) {
                     auto &worker = work.scoredPrepareWorkers[t];
                     worker.context = &context; worker.worker = t; worker.workers = config->threads;
-                    worker.block = q8k ? QK_K : activationQuantBlock;
+                    worker.block = prepareBlock ? prepareBlock : activationQuantBlock;
                     worker.activationQuantBlock = activationQuantBlock; worker.swigluLimit = swigluLimit;
                 }
                 runWorkers(work.scoredPrepareWorkers, false);
@@ -7210,10 +7219,10 @@ namespace fastllm {
             downInputDataType < DataType::DATA_GGUF_FORMAT &&
             NumasDeepSeekV4FastPathAvailable();
         // Cached Q2/Q4 experts use this grouped path even for one row.
-        // Their GEMM workers stay unchanged; prepare whole Q8_K blocks and
+        // Their GEMM workers stay unchanged; prepare whole Q8 blocks and
         // round/store the result with the existing parallel workers.
-        const bool useQ8KPrepare = enableDeepSeekV4LargeFast &&
-            CanPrepareDeepSeekV4Q8K(downInputDataType, interDim, activationQuantBlock);
+        const int quantizedPrepareBlock = enableDeepSeekV4LargeFast ?
+            DeepSeekV4QuantizedPrepareBlock(downInputDataType, interDim, activationQuantBlock) : 0;
         const bool useDeepSeekV4GroupedDecodeFast =
             useDeepSeekV4LargeFast && bs > 1 && bs <= 8 &&
             std::getenv(
@@ -7231,10 +7240,10 @@ namespace fastllm {
             // gained by grouping repeated experts.
             stride = 208;
         }
-        const bool useDeepSeekV4PostOps = useDeepSeekV4LargeFast || useQ8KPrepare;
+        const bool useDeepSeekV4PostOps = useDeepSeekV4LargeFast || quantizedPrepareBlock;
         const bool skipRedundantCrossSwiglu = useDeepSeekV4PostOps || fp8EagerMode;
         const bool useParallelDeepSeekV4Prepare =
-            useQ8KPrepare || (useDeepSeekV4LargeFast &&
+            quantizedPrepareBlock || (useDeepSeekV4LargeFast &&
                              interDim % (128 * numaConfig->numaCnt) == 0);
         const bool useParallelDeepSeekV4Store =
             useDeepSeekV4PostOps || (fp8EagerMode && bs >= 8);
@@ -7406,7 +7415,7 @@ namespace fastllm {
             offset = 0;
             const size_t downRowBytes =
                 GetDataBytes(downInputDataType, 1, interDim);
-            const int prepareColumns = useQ8KPrepare ? QK_K : interDim / numaConfig->numaCnt;
+            const int prepareColumns = quantizedPrepareBlock ? quantizedPrepareBlock : interDim / numaConfig->numaCnt;
             auto &prepareTaskStorage =
                 fastllmMoeDataManagerNumas.prepareTaskStorage;
             auto &prepareTasks =
@@ -8245,14 +8254,14 @@ namespace fastllm {
                 context.gateUp = work.gateUpOutput.data(); context.swiglu = work.swigluOutput.data();
                 context.downInput = work.downInput.data(); context.downType = downAct;
                 context.interDim = inter; context.downRowBytes = downBytes;
-                const bool q8k = CanPrepareDeepSeekV4Q8K(downAct, inter, 128);
+                const int prepareBlock = DeepSeekV4QuantizedPrepareBlock(downAct, inter, 128);
                 const bool floating = downAct == FLOAT32 || downAct == FLOAT16 || downAct == BFLOAT16;
-                if (q8k || (floating && inter % 128 == 0)) {
+                if (prepareBlock || (floating && inter % 128 == 0)) {
                     work.scoredPrepareWorkers.resize(config->threads);
                     for (int t = 0; t < config->threads; ++t) {
                         auto &worker = work.scoredPrepareWorkers[t];
                         worker.context = &context; worker.worker = t; worker.workers = config->threads;
-                        worker.block = q8k ? QK_K : 128; worker.activationQuantBlock = 128; worker.swigluLimit = swigluLimit;
+                        worker.block = prepareBlock ? prepareBlock : 128; worker.activationQuantBlock = 128; worker.swigluLimit = swigluLimit;
                     }
                     runWorkers(work.scoredPrepareWorkers, false);
                 } else {
@@ -9227,9 +9236,9 @@ namespace fastllm {
                         NumasDeepSeekV4FastPathAvailable();
                     // GGUF retains its existing GEMM workers. Only activation
                     // preparation and reduction share the floating-point path.
-                    const bool useQ8KPrepare = enableDeepSeekV4MoeFast &&
-                        CanPrepareDeepSeekV4Q8K(downInputDataType, interDim, activationQuantBlock);
-                    const bool useParallelPrepare = useDeepSeekV4MoeFast || useQ8KPrepare;
+                    const int quantizedPrepareBlock = enableDeepSeekV4MoeFast ?
+                        DeepSeekV4QuantizedPrepareBlock(downInputDataType, interDim, activationQuantBlock) : 0;
+                    const bool useParallelPrepare = useDeepSeekV4MoeFast || quantizedPrepareBlock;
                     bool reuseMoeTaskStorage =
                         useParallelPrepare &&
                         std::getenv(
@@ -9244,9 +9253,9 @@ namespace fastllm {
                     // the actual expert count and workers on each NUMA node.
                     int gateRowsPerTask = 208;
                     int downRowsPerTask = 128;
-                    // Q8_K tasks own complete 256-value blocks; floating-point
+                    // Quantized tasks own complete FP8 and Q8 blocks; floating-point
                     // tasks follow gate-output NUMA shards and FP8 blocks.
-                    int swigluRowsPerTask = useQ8KPrepare ? QK_K : std::max(
+                    int swigluRowsPerTask = quantizedPrepareBlock ? quantizedPrepareBlock : std::max(
                         128,
                         interDim / std::max(1, numaConfig->numaCnt));
 

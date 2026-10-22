@@ -55,6 +55,13 @@ static void Fp8(std::vector<float> &values) {
 }
 
 static void GgmlActivation(std::vector<float> &values, const Data &weight) {
+    if (ggml_type_vec_dot_type((ggml_type)weight.ggmlType) == GGML_TYPE_Q8_0) {
+        std::vector<block_q8_0> packed(values.size() / QK8_0);
+        iqk_quantize_row_q8_K(values.data(), packed.data(), values.size(),
+                             GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+        dequantize_row_q8_0(packed.data(), values.data(), values.size());
+        return;
+    }
     // Decode canonical Q8 blocks for a scalar matmul oracle. K32 changes
     // partial-sum metadata, while its scale and quant bytes keep this layout.
     std::vector<block_q8_K> packed(values.size() / QK_K);
@@ -118,18 +125,30 @@ int main(int argc, char **argv) {
         const int topk = draft ? 3 : (cache || decodeOrVerify) ? 6 : 2;
         // Q4_K_R4 consumes Q8_K32, while Q2_K_R4 consumes Q8_K.
         const bool q2Down = decodeOrVerify && argc > 4 && std::string(argv[4]) == "q2";
+        const bool q2ZeroDown = decodeOrVerify && argc > 4 && std::string(argv[4]) == "q2_0";
         std::vector<std::unique_ptr<Data>> owned;
         std::vector<Data*> weights(2 * (experts + 1), nullptr), biases(weights);
         std::vector<std::vector<float>> decoded(weights.size());
         std::vector<std::vector<uint8_t>> canonical(weights.size());
         for (int e = disk ? 0 : 1; e <= experts; ++e) for (int part = 0; part < 2; ++part) {
             int rows = part ? hidden : 2 * inter, cols = part ? inter : hidden;
-            auto type = part && !q2Down ? GGML_TYPE_Q4_K : GGML_TYPE_Q2_K;
+            auto type = part && q2ZeroDown ? GGML_TYPE_Q2_0 :
+                part && !q2Down ? GGML_TYPE_Q4_K : GGML_TYPE_Q2_K;
             auto weight = e == 0 ? std::make_unique<Data>(FLOAT16, std::vector<int>{rows, cols}) :
                 std::make_unique<Data>(DATA_GGUF_FORMAT, type, std::vector<int>{rows, cols});
             std::vector<float> original(rows * cols);
             for (int i = 0; i < rows * cols; ++i) original[i] = .03f * std::sin(i * .719f + e * .43f + part);
-            weight->CreateFromOriData(WeightType::LINEAR, FLOAT32, (uint8_t*)original.data(), nullptr, nullptr);
+            if (type == GGML_TYPE_Q2_0) {
+                weight->Allocate();
+                auto *blocks = reinterpret_cast<block_q2_0 *>(weight->cpuData);
+                for (size_t i = 0; i < weight->GetBytes() / sizeof(block_q2_0); ++i) {
+                    blocks[i].d = float_to_half(.015f * (1 + (i + e) % 5));
+                    for (size_t j = 0; j < sizeof(blocks[i].qs); ++j)
+                        blocks[i].qs[j] = uint8_t(i * 31 + j * 7 + e);
+                }
+            } else {
+                weight->CreateFromOriData(WeightType::LINEAR, FLOAT32, (uint8_t*)original.data(), nullptr, nullptr);
+            }
             if (host) canonical[e*2+part].assign(weight->cpuData, weight->cpuData+weight->GetBytes());
             auto &plain = decoded[e * 2 + part];
             plain.resize(original.size());
