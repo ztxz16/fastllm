@@ -332,6 +332,32 @@ static void CheckRegistration() {
     if (streamTest) {
         if (cooperativeTest) Check(simultaneousGpuRoutes,
             "cooperative decode never assigned work to both GPUs in one layer");
+        // DSpark verification also exercises the shared single-device scheduler.
+        // Repeated hot routes must execute without resident admission when
+        // the configured cache budget is zero.
+        unsetenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH");
+        for (size_t layer = 0; layer < registeredFixtures.size(); ++layer) {
+            FastllmCudaSetDevice(0);
+            const int rows = 5;
+            std::vector<int32_t> ids(rows * topk);
+            for (size_t i = 0; i < ids.size(); ++i) ids[i] = i % topk;
+            Data input(FLOAT32, {rows, hidden}, std::vector<float>(rows * hidden, .25f));
+            Data index(INT32, {rows, topk}, CPU, ids.data());
+            Data score(FLOAT32, {rows, topk}, std::vector<float>(rows * topk, 1.f / topk));
+            Data output;
+            ToDataType(input, BFLOAT16);
+            for (auto *value : {&input, &index, &score}) value->ToDevice(CUDA, {0}, true);
+            auto &weights = registeredFixtures[layer].host;
+            int callbacks = 0;
+            for (int repeat = 0; repeat < 3; ++repeat)
+                Check(FastllmCudaMergeMOEHybrid(input, index, score, output,
+                    weights.data(), weights.size(), layer, [&] { ++callbacks; }),
+                    "zero-budget verifier should execute through the shared scheduler");
+            Check(callbacks == 3, "verifier should submit shared work exactly once per call");
+            ToDataType(output, FLOAT32);
+            for (float value : Read(output))
+                Check(std::isfinite(value), "zero-budget verifier produced non-finite output");
+        }
         for (int device = 0; device < std::min(2, devices); ++device) {
             uint64_t stats[5] = {}, routes[8] = {};
             Check(fastllm_moe_cuda_cache_stats(device, stats, false), "streaming stats unavailable");
