@@ -586,7 +586,6 @@ int main(int argc, char **argv) {
                 SetMoeCacheConfig(policy);
                 Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "frequency cache preparation failed");
                 // Auto mode must activate admission without a private opt-in.
-                unsetenv("FASTLLM_DSV41_MOE_FREQUENCY");
                 setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "hybrid", 1);
                 unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
                 uint64_t before[8], after[8], cacheBefore[5], cacheAfter[5];
@@ -625,7 +624,6 @@ int main(int argc, char **argv) {
                     (unsigned long long)(after[5] - before[5]),
                     (unsigned long long)(after[6] - before[6]),
                     (unsigned long long)((after[4] - before[4]) - (after[6] - before[6])));
-                unsetenv("FASTLLM_DSV41_MOE_FREQUENCY");
                 SetMoeCacheConfig(MoeCacheConfig{});
             }
             // Full NUMA fallback must obey the same contract as the subset.

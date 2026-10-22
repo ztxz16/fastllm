@@ -565,7 +565,8 @@ size_t FastllmCudaMoeGGUFCacheWorkspaceBytes(int hidden, int inter) {
     if (hidden <= 0 || inter <= 0 || hidden > 24576 || inter > 24576 || hidden%32 || inter%32) return 0;
     const size_t v41 = Align16(size_t(8) * (hidden / 256) * sizeof(block_q8_K)) +
                        Align16(size_t(8 * 16) * (inter / 256) * sizeof(block_q8_K));
-    return std::max(Q8WorkspaceBytes(1, hidden, inter, 32), v41);
+    return std::max({Q8WorkspaceBytes(1, hidden, inter, 32), v41,
+        FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(hidden, inter)});
 }
 
 size_t FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(int hidden, int inter, int rows, int topk) {
@@ -1259,14 +1260,9 @@ bool FastllmCudaMergeMOEV41GGUFResident(
         indices.dims[1] <= 0 || indices.dims[1] > 32 || scores.dims != indices.dims ||
         !indices.cudaData || !scores.cudaData || !std::isfinite(swigluLimit) || swigluLimit < 0)
         return false;
-    const auto supported = [](int type) {
-        return type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_K ||
-               type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
-               type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M;
-    };
     // Validate before constructing a persistent pointer table or launching work.
     auto layer = GetResidentLayer(weights, weightsBatch, device);
-    if (!layer || !supported(layer->gateType) || !supported(layer->downType)) return false;
+    if (!layer || !FastllmCudaV41GGUFSupported(layer->gateType, layer->downType)) return false;
     const int hidden = input.dims[1], inter = layer->inter;
     if (hidden <= 0 || inter <= 0 || hidden > 24576 || inter > 24576 ||
         hidden%256 || inter%256 || layer->hidden != hidden) return false;
@@ -1388,6 +1384,9 @@ __global__ void Down(const block_q8_K *activation, float *output, FastllmCudaMoe
 bool FastllmCudaMoeV41GGUFCacheCompute(const fastllm::Data &input, fastllm::Data &activation,
         const FastllmCudaMoeGGUFCacheView &view, const float *scores, int topk,
         float swigluLimit, float *perExpert) {
+    if (FastllmCudaV41GGUFSupported(view.gateType, view.downType))
+        return FastllmCudaMoeV41CanonicalGGUFCacheCompute(input, activation, view,
+            scores, topk, swigluLimit, perExpert);
     if (input.dataType != fastllm::BFLOAT16 || input.dims.size() != 2 || !input.cudaData ||
         input.dims[0] < 1 || input.dims[0] > 8 || input.dims[1] != view.hidden ||
         view.hidden <= 0 || view.inter <= 0 || view.hidden % 256 || view.inter % 256 || topk < 1 || topk > 16 ||

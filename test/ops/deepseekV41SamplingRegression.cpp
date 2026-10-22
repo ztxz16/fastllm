@@ -4,6 +4,7 @@
 #include "models/deepseekv41.h"
 #include "executor.h"
 #include "baseblock.h"
+#include "gguf.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include <cuda_runtime.h>
@@ -25,6 +26,8 @@ static void Check(bool ok, const char *msg) {
 struct Probe : DeepSeekV41Model {
     using DeepSeekV41Model::DsparkCommitPrefix;
     using DeepSeekV41Model::DsparkAdvance;
+    using DeepSeekV41Model::ApplyDsparkDevice;
+    using DeepSeekV41Model::DsparkEmbedInput;
     using DeepSeekV41Model::DsparkProjectHead;
     using DeepSeekV41Model::DsparkAcceptedDraftCount;
     using DeepSeekV41Model::DsparkMaskToolLogits;
@@ -40,6 +43,16 @@ struct Probe : DeepSeekV41Model {
     void HeadSetup() {
         deviceMap = {{"multicuda:0,1", 1}};
         v41DsparkTpDevices = {0, 1};
+    }
+    void EmbeddingSetup(int mode) {
+        block_cnt = 2;
+        embed_dim = 256;
+        hc_mult = 4;
+        deviceMap = mode == 0 ? std::map<std::string, int>{{"cpu", 1}} :
+                    mode == 1 ? std::map<std::string, int>{{"cuda:0", 1}} :
+                    mode == 2 ? std::map<std::string, int>{{"cuda:0", 1}, {"cuda:1", 1}} :
+                                std::map<std::string, int>{{"multicuda:1,0", 1}};
+        v41DsparkTpDevices = mode == 3 ? std::vector<int>{1, 0} : std::vector<int>{};
     }
     void MainFeatureSetup(bool tp, int firstDevice) {
         if (tp) {
@@ -174,6 +187,75 @@ static std::vector<float> Read(Data &data) {
     ToDataType(cpu, DataType::FLOAT32);
     cpu.ToDevice(DataDevice::CPU);
     return {(float *)cpu.cpuData, (float *)cpu.cpuData + cpu.Count(0)};
+}
+
+// Alternate target and draft lookups as PP decoding does. The lookup must be
+// numerically identical while the shared table retains its original storage.
+static void DraftEmbedding(int devices) {
+    constexpr int vocab = 32, width = 256, hc = 4;
+    std::vector<float> values(vocab * width);
+    for (int i = 0; i < (int)values.size(); ++i) values[i] = ((i * 17) % 127 - 63) / 16.0f;
+    for (bool cudaEmbedding : {false, true}) for (int mode = 0; mode < (devices >= 2 ? 4 : 2); ++mode) {
+        SetCudaEmbedding(cudaEmbedding);
+        for (auto type : {BFLOAT16, FLOAT16, FLOAT32, DATA_GGUF_FORMAT}) {
+            Probe model;
+            model.EmbeddingSetup(mode);
+            auto &table = model.weight["embed.weight"];
+            if (type == DATA_GGUF_FORMAT) {
+                Data packed(DATA_GGUF_FORMAT, GGML_TYPE_Q4_K, {vocab, width});
+                packed.disableGGUFRepack = true;
+                packed.CreateFromOriData(WeightType::EMBEDDING, FLOAT32,
+                                         (uint8_t *)values.data(), nullptr, nullptr);
+                table.CopyFrom(packed);
+            } else {
+                table.CopyFrom(Data(type, {vocab, width}, values));
+            }
+            // The reference uses the old draft-device lookup with a separate
+            // table. It cannot migrate the target's shared embedding.
+            Data referenceTable;
+            referenceTable.CopyFrom(table);
+            const int owner = mode == 3 ? 1 : 0;
+            const int draft = mode >= 2 ? 1 : 0;
+            auto targetDevice = mode == 0 ? "cpu" : "cuda:" + std::to_string(owner);
+            void *storage = nullptr;
+            for (int rows : {1, 5, 6, 8, 5, 1}) {
+                std::vector<float> ids(rows, vocab - 1);
+                ids[0] = rows % vocab;
+                Data inputIds(FLOAT32, {1, rows}, ids), targetOut;
+                ((Executor *)GetExecutor())->SetFirstDevice(targetDevice);
+                Embedding(inputIds, table, targetOut);
+                void *current = table.dataDevice == CUDA ? table.cudaData : table.cpuData;
+                if (!storage) storage = current;
+                Check(current == storage, "target embedding storage migrated between rounds");
+
+                model.ApplyDsparkDevice();
+                Data expected;
+                Embedding(inputIds, referenceTable, expected);
+                ToDataType(expected, BFLOAT16);
+                auto expectedValues = Read(expected);
+                model.ApplyDsparkDevice();
+                Data hidden;
+                model.DsparkEmbedInput(inputIds, hidden);
+                Check(hidden.dims == std::vector<int>({1, rows, hc, width}), "draft embedding shape");
+                Check(hidden.dataType == BFLOAT16, "draft embedding dtype");
+                Check(mode == 0 ? hidden.dataDevice == CPU :
+                      hidden.dataDevice == CUDA && hidden.dataDeviceIds == std::vector<int>{draft},
+                      "draft embedding output is on the wrong device");
+                const bool cpuTable = mode == 0 || !cudaEmbedding || type == DATA_GGUF_FORMAT;
+                Check(cpuTable ? table.dataDevice == CPU && table.cpuData == storage :
+                      table.dataDevice == CUDA && table.dataDeviceIds == std::vector<int>{owner} &&
+                      table.cudaData == storage, "draft moved the shared embedding table");
+                auto actual = Read(hidden);
+                for (int row = 0; row < rows; ++row)
+                    for (int copy = 0; copy < hc; ++copy)
+                        for (int col = 0; col < width; ++col)
+                            Check(actual[(row * hc + copy) * width + col] == expectedValues[row * width + col],
+                                  "draft embedding values changed");
+            }
+        }
+    }
+    std::cout << "Draft embedding values and residency (CUDA embedding on/off, CPU/single/PP/TP, "
+                 "BF16/FP16/FP32/Q4_K) PASS\n";
 }
 // Feed identical, distinct per-layer features through the ordinary and TP
 // draft cache update. This detects missing uploads when crossing from TP to
@@ -584,5 +666,8 @@ int main() {
         Rollback(model, true);
         DraftHead();
     }
+    // This test configures CUDA embedding explicitly; keep it last so it does
+    // not override the automatic embedding policy used by the other tests.
+    DraftEmbedding(devices);
     std::cout << "DeepSeek V4.1 sampling regression PASS\n";
 }

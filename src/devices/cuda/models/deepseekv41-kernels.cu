@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <map>
+#include <limits>
 #include <array>
 #include <memory>
 #include <cstring>
@@ -2289,6 +2290,8 @@ namespace {
     }
 
 
+    #include "deepseekv41-sm75-quant-attention.cuh"
+
     template<bool Windowed>
     __device__ __forceinline__ const __nv_bfloat16 *V41Sm75Candidate(
             const __nv_bfloat16 *kv, const int32_t *indices, int c, int cap,
@@ -4479,6 +4482,57 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     }
     int cap = hasCmp ? compressedKV->dims[1] : 0;
     int topWidth = hasCmp ? cmpIdx->dims[2] : 0;
+    // Packed KV on SM75: unpack candidates once and reuse each QK dot across
+    // all output dimensions. Optional scratch follows the current stream / graph.
+    if (bsz == 1 && seqlen >= 1 && seqlen <= 8 && q.dataType == DataType::BFLOAT16 &&
+        (ringFp8 || cmpFp8) && windowSize >= 0 && startPos >= 0 &&
+        int64_t(startPos) + seqlen <= int64_t(std::numeric_limits<int>::max()) &&
+        chunkKV.dims[0] == 1 && chunkKV.dims[1] == seqlen && chunkKV.dims[2] == dim &&
+        (!hasRing || ringKV->dims[0] == 1) &&
+        (!hasCmp || (compressedKV->dims[0] == 1 && cmpIdx->dims[0] == 1 && cmpIdx->dims[1] == seqlen)) &&
+        attnSink.Count(0) >= heads && !V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN") && V41IsSm75()) {
+        const int windowCount = int(std::min<int64_t>(windowSize, int64_t(startPos) + seqlen));
+        const int64_t candidates = int64_t(windowCount) + topWidth;
+        if (candidates >= 32 && candidates <= 4096 && heads <= 128) {
+            const int count = int(candidates);
+            const size_t rowsCount = size_t(seqlen) * count;
+            const size_t bytes = rowsCount * ((512 + heads) * sizeof(float) + sizeof(int32_t));
+            void *allocation = nullptr;
+            const auto status = FastllmCudaTryMalloc(&allocation, bytes);
+            if (status == FASTLLM_CUDA_TRY_MALLOC_ERROR) return false;
+            if (status == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+                struct Scratch {
+                    void *ptr;
+                    ~Scratch() { if (!FastllmCudaFreeAfterCurrentThreadStream(ptr)) FastllmCudaFree(ptr); }
+                } scratch{allocation};
+                auto *rows = static_cast<float *>(allocation);
+                auto *scores = rows + rowsCount * 512;
+                auto *valid = reinterpret_cast<int32_t *>(scores + rowsCount * heads);
+                V41Sm75QuantizedAttention params{
+                    static_cast<const __nv_bfloat16 *>(chunkKV.cudaData),
+                    hasRing && !ringFp8 ? static_cast<const __nv_bfloat16 *>(ringKV->cudaData) : nullptr,
+                    hasCmp && !cmpFp8 ? static_cast<const __nv_bfloat16 *>(compressedKV->cudaData) : nullptr,
+                    ringFp8 ? static_cast<const uint8_t *>(ringKV->cudaData) : nullptr,
+                    cmpFp8 ? static_cast<const uint8_t *>(compressedKV->cudaData) : nullptr,
+                    hasCmp ? static_cast<const int32_t *>(cmpIdx->cudaData) : nullptr,
+                    windowSize, startPos, cap, windowCount, topWidth, ringMode, ringRowBytes, cmpMode, cmpRowBytes};
+                auto launch = [&](auto multiToken) {
+                    constexpr bool multi = decltype(multiToken)::value;
+                    V41Sm75QuantizedAttentionGather<multi><<<dim3(count, 1, seqlen), 128, 0, cudaStreamPerThread>>>(params, rows, valid);
+                    if (!V41CheckLaunch("Sm75QuantizedAttentionGather")) return false;
+                    V41Sm75QuantizedAttentionScores<multi><<<dim3((count + 3) / 4, (heads + 3) / 4, seqlen), 128, 0, cudaStreamPerThread>>>(
+                        static_cast<const __nv_bfloat16 *>(q.cudaData), rows, valid, count, heads, scores);
+                    if (!V41CheckLaunch("Sm75QuantizedAttentionScores")) return false;
+                    V41Sm75QuantizedAttentionValues<multi><<<dim3(heads, 16, seqlen), 32, 0, cudaStreamPerThread>>>(
+                        rows, valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads, softmaxScale,
+                        static_cast<__nv_bfloat16 *>(output.cudaData));
+                    return V41CheckLaunch("Sm75QuantizedAttentionValues");
+                };
+                return seqlen == 1 ? launch(std::false_type{}) : launch(std::true_type{});
+            }
+            // A graph-pool capacity miss has submitted no work; use the scalar path.
+        }
+    }
     // TP ranks have 32 MLA heads; the unsharded draft has 64. Parallel candidate dots
     // avoid repeating QK in every value slice; PV keeps the scalar recurrence.
     // Each verification row carries its own already-causal candidate list.

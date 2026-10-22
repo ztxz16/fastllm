@@ -81,6 +81,13 @@ class AutoConfigTest(unittest.TestCase):
         self.resolve(full)
         self.assertFalse(full.low_gpu_mem)
 
+    def test_deepseek_numa_prefers_largest_feasible_chunk_and_pp(self):
+        self.g.family = 'deepseek_v41'
+        a = self.args('--moe_device', 'numa', '--moe_device_layers', '-1')
+        p = self.resolve(a)
+        self.assertEqual((p['mode'], a.chunked_prefill_size), ('pp', 8192))
+        self.assertEqual(a.moe_device, 'numa')
+
     def test_deepseek_implicit_embedding_is_charged_before_chunk_selection(self):
         self.g.family = 'deepseek_v41'
         def costs(tensors, model, a):
@@ -364,10 +371,10 @@ class AutoConfigTest(unittest.TestCase):
 
     def test_deepseek_auto_defaults_allow_explicit_opt_out_and_leave_other_models_alone(self):
         md = {'model_type': 'deepseek_v41', 'text_config': {'model_type': 'deepseek_v41_text'}}
-        for options, drafts, fast in [((), 7, True), (('--dspark', '0'), 0, True),
+        for options, drafts, fast in [((), 5, True), (('--dspark', '0'), 0, True),
                                      (('--speculative_algorithm', 'off'), 0, True),
                                      (('--mtp', '0'), 0, True),
-                                     (('--dspark', '5', '--no-fast-prefill'), 5, False)]:
+                                     (('--dspark', '3', '--no-fast-prefill'), 3, False)]:
             a = self.args(*options)
             auto.apply_model_defaults(a, md)
             self.assertEqual((a.dspark, a.fast_prefill), (drafts, fast))
@@ -380,8 +387,8 @@ class AutoConfigTest(unittest.TestCase):
         self.assertEqual((a.dspark, a.fast_prefill), (0, False))
 
     def test_deepseek_auto_defaults_reach_planner_and_runtime_with_cli_json_precedence(self):
-        cases = [({}, [], 7, True, .5),
-                 ({}, ['--dspark', '5', '--speculative_dspark_confidence_threshold', '.2'], 5, True, .2),
+        cases = [({}, [], 5, True, .5),
+                 ({}, ['--dspark', '3', '--speculative_dspark_confidence_threshold', '.2'], 3, True, .2),
                  ({}, ['--speculative_algorithm', 'off', '--no_fast_prefill'], 0, False, .5),
                  ({'dspark': 0, 'fast_prefill': False}, [], 0, False, .5),
                  ({'dspark': 0, 'fast_prefill': False}, ['--dspark', '7', '--fast_prefill'], 7, True, .5)]

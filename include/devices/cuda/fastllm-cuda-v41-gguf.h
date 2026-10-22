@@ -24,3 +24,12 @@ bool FastllmCudaV41GGUFGroupedProjection(
     bool gate, int type, const void *inputQ8, void *outputBF16,
     const void *weightPointers, const int32_t *indices, void *workspace,
     int rows, int hidden, int inter, int experts, int topk);
+
+// Canonical packed records restored from NUMA shards, with per-layer slot offsets.
+struct FastllmCudaMoeGGUFCacheView;
+bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
+    const fastllm::Data &input, fastllm::Data &activation,
+    const FastllmCudaMoeGGUFCacheView &view, const float *scores,
+    int topk, float swigluLimit, float *perExpert);
+size_t FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(int hidden, int inter);
+bool FastllmCudaV41GGUFSupported(int gateType, int downType);

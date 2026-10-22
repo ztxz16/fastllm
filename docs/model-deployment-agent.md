@@ -139,7 +139,7 @@ Qwen3.8-Flash-Next 和 GLM 的 GGUF 分片必须保留同目录的其余分片�
 | `--no_fast_prefill` | 关闭快速 prefill，做精度或回归对照 |
 | `--speculative_dspark_confidence_threshold 0.5` | DSpark 草稿置信度门槛；提高时通常更早停止草稿生成，接受率和速度需实测 |
 
-DeepSeek V4.1 的自动模式默认规划不超过原生窗口的 1M 上下文、DSpark 7 和 `fast_prefill`；预算不足且调整专家放置、缓存和 chunk 后仍不可行时会报错，不自动缩短窗口。显式 `--dspark 0`、`--no_fast_prefill` 或上下文参数会覆盖默认值。GSQ GGUF 的量化布局由文件决定，不要再额外指定在线量化类型。
+DeepSeek V4.1 的自动模式默认规划不超过原生窗口的 1M 上下文、DSpark 5 和 `fast_prefill`；预算不足且调整专家放置、缓存和 chunk 后仍不可行时会报错，不自动缩短窗口。显式 `--dspark 0`、`--no_fast_prefill` 或上下文参数会覆盖默认值。GSQ GGUF 的量化布局由文件决定，不要再额外指定在线量化类型。
 
 ## 低资源回退
 

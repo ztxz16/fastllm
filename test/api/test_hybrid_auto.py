@@ -218,6 +218,59 @@ class HybridAutoTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 auto.inventory(p)
 
+    def test_fastllm_gguf_nested_and_symlink_shards_keep_quantized_sizes(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as shared:
+            p = Path(d)
+            (p / "config.json").write_text('{}')
+            weight_map = {}
+            expected = []
+            for i, kind in enumerate((19, 42, 29, 12, 11)):
+                key = "layers.%d.ffn.experts.%d.w1.weight" % (i % 4, i)
+                name = "experts/%d/model.safetensors" % i
+                payload = struct.pack("<iii", 1, 9999, kind) + bytes(256 + i)
+                header = json.dumps({key: {"dtype": "fastllm", "shape": [256, 256],
+                                         "data_offsets": [0, len(payload)]}}).encode()
+                file = p / name
+                file.parent.mkdir(parents=True)
+                target = Path(shared) / str(i) if i == 0 else file
+                target.write_bytes(struct.pack("<Q", len(header)) + header + payload)
+                if i == 0:
+                    file.symlink_to(target)
+                weight_map[key] = name
+                expected.append(auto.Tensor(key, (256, 256), len(payload), "gguf:%d" % kind))
+            (p / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+            _, tensors = auto.inventory(p)
+            self.assertEqual(tensors, expected)
+            g, _, _, _ = fixture()
+            self.assertEqual(sum(auto.weight_costs(tensors, g, args(dtype="float16"))[0]),
+                             sum(t.bytes for t in expected))
+
+    def test_safetensors_rejects_index_traversal_and_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)
+            (p / "config.json").write_text('{}')
+            for name in ("../outside.safetensors", "experts/../../outside.safetensors",
+                         str(p / "model.safetensors"), "experts\\outside.safetensors"):
+                with self.subTest(name=name):
+                    (p / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"x": name}}))
+                    with self.assertRaisesRegex(ValueError, "invalid safetensors shard path"):
+                        auto.inventory(p)
+
+    def test_fastllm_gguf_rejects_truncated_or_unsupported_prefix(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)
+            (p / "config.json").write_text('{}')
+            for payload in (bytes(8), struct.pack("<iii", 1, 9999, 19),
+                            struct.pack("<iii", 2, 9999, 19) + bytes(32),
+                            struct.pack("<iii", 1, 8, 19) + bytes(32),
+                            struct.pack("<iii", 1, 9999, -1) + bytes(32)):
+                with self.subTest(payload=payload[:12]):
+                    header = json.dumps({"x": {"dtype": "fastllm", "shape": [256, 256],
+                                              "data_offsets": [0, len(payload)]}}).encode()
+                    (p / "model.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + payload)
+                    with self.assertRaisesRegex(ValueError, "fastllm"):
+                        auto.inventory(p)
+
     def test_ngram_and_inactive_draft_do_not_become_gpu_weights(self):
         g, _, _, _ = fixture()
         a = args(ngram_device="disk")
@@ -553,6 +606,26 @@ class HybridAutoTest(unittest.TestCase):
                 "dspark_markov_rank": 32, "dspark_n_routed_experts": 128,
                 "dspark_num_experts_per_tok": 3, "vocab_size": 1024}
 
+    def test_v41_gguf_prefill_transport_does_not_consume_decode_cache_budget(self):
+        g = auto.geometry(self.dspark_metadata(), "float16", 0)
+        a = args(tokens=4096, max_context_length=4096, moe_device_layers=-1)
+        costs = ([4*GiB]*g.layers, [MiB]*g.layers, 0, 0, MiB, False)
+        gpu = {0: dict(total=16*GiB, free=16*GiB)}
+        ram = dict(total=64*GiB, available=64*GiB)
+        native = auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+        g.gguf_expert_bytes = {1: 13*MiB+1}
+        packed = auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+        extra = 96*(13*MiB+256)+272*MiB
+        self.assertEqual(packed["expert_transport_bytes_per_device"], extra)
+        self.assertEqual(packed["workspace_bytes_per_device"]-native["workspace_bytes_per_device"], extra)
+        self.assertGreaterEqual(native["moe_cuda_cache"]-packed["moe_cuda_cache"], extra-MiB)
+        self.assertEqual(packed["host_estimated_bytes"], native["host_estimated_bytes"])
+        # Resident-only layers need no host transfer ring.
+        a.moe_device_layers = 0
+        resident = auto.plan(a, g, costs, "pp", {0: 1},
+                             {0: dict(total=32*GiB, free=32*GiB)}, ram, allow_full_gpu=True)
+        self.assertEqual(resident["expert_transport_bytes_per_device"], 0)
+
     def test_v41_later_index_sources_share_persistent_keys(self):
         md = self.dspark_metadata()
         md["index_source_layer_ids"] = [0, 1, 2, 3]
@@ -661,9 +734,12 @@ class HybridAutoTest(unittest.TestCase):
             bounded = auto._workspace_bytes(a, g, 2048, 1048576, "pp", 0)
             old = auto._workspace_bytes(a, g, 2048, 1048576, "tp", 0)
             self.assertLess(bounded, old)
+            numa = copy.copy(a)
+            numa.moe_device = "numa"
+            self.assertEqual(auto._workspace_bytes(numa, g, 2048, 1048576, "pp", 0), bounded)
             self.assertGreater(bounded, auto._workspace_bytes(a, g, 256, 1048576, "pp", 0))
-            for changes in (dict(moe_device="numa"), dict(dtype="float32"),
-                            dict(atype="float32"), dict(max_batch=2), dict(fast_prefill=False)):
+            for changes in (dict(dtype="float32"), dict(atype="float32"),
+                            dict(max_batch=2), dict(fast_prefill=False)):
                 other = copy.copy(a)
                 vars(other).update(changes)
                 self.assertEqual(auto._workspace_bytes(other, g, 2048, 1048576, "pp", 0), old)
@@ -730,7 +806,7 @@ class HybridAutoTest(unittest.TestCase):
             self.assertEqual(plan(roomy)["chunked_prefill_size"], 6000)
             a.tokens = a.max_context_length = 1048576
             a.moe_device = "numa"
-            self.assertEqual(plan(roomy)["chunked_prefill_size"], 4096)
+            self.assertEqual(plan(roomy)["chunked_prefill_size"], 8192)
             a.moe_device, g.family = "disk", "fixture"
             self.assertEqual(plan(roomy)["chunked_prefill_size"], 4096)
 

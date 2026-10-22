@@ -1,7 +1,7 @@
 """Pre-load memory planning for hybrid MoE inference.
 
 This module resolves opt-in CLI values into the existing explicit configuration.
-It reads tensor headers, never weight payloads. Estimates include a conservative
+It reads tensor headers and serialized quantization prefixes, never weight arrays. Estimates include a conservative
 workspace allowance; they are capacity plans, not throughput autotuning.
 """
 
@@ -122,22 +122,38 @@ def inventory(path):
         tensors = []
         for name in files:
             file = path / name
-            if file.resolve().parent != path.resolve():
+            # Check index names lexically: HF caches and split exports can use
+            # nested shards and symlinks to shared checkpoint storage.
+            if Path(name).is_absolute() or ".." in Path(name).parts or "\\" in name:
                 raise ValueError("Hybrid auto: invalid safetensors shard path")
             with file.open("rb") as stream:
+                file_size = os.fstat(stream.fileno()).st_size
                 size = struct.unpack("<Q", gguf._read_exact(stream, 8))[0]
-                if not 0 < size <= min(128 * MiB, file.stat().st_size - 8):
+                if not 0 < size <= min(128 * MiB, file_size - 8):
                     raise ValueError("Hybrid auto: invalid safetensors header")
                 header = json.loads(gguf._read_exact(stream, size))
-            for key, item in header.items():
-                if key == "__metadata__":
-                    continue
-                start, end = item["data_offsets"]
-                if not 0 <= start < end <= file.stat().st_size - size - 8:
-                    raise ValueError("Hybrid auto: invalid safetensors tensor extent")
-                if weight_map is not None and weight_map.get(key) != name:
-                    raise ValueError("Hybrid auto: safetensors index/header mismatch")
-                tensors.append(Tensor(key, tuple(item["shape"]), end - start, item["dtype"]))
+                for key, item in header.items():
+                    if key == "__metadata__":
+                        continue
+                    start, end = item["data_offsets"]
+                    if not 0 <= start < end <= file_size - size - 8:
+                        raise ValueError("Hybrid auto: invalid safetensors tensor extent")
+                    if weight_map is not None and weight_map.get(key) != name:
+                        raise ValueError("Hybrid auto: safetensors index/header mismatch")
+                    kind = item["dtype"]
+                    if kind == "fastllm":
+                        # Data::ExportFastllmFormat prefixes serialized GGUF weights
+                        # with version, DataType and ggmlType (three little-endian ints).
+                        # Keep the serialized extent as a conservative byte budget.
+                        if end - start <= 12:
+                            raise ValueError("Hybrid auto: truncated fastllm tensor " + key)
+                        stream.seek(8 + size + start)
+                        version, dtype, ggml_type = struct.unpack("<iii", gguf._read_exact(stream, 12))
+                        if version != 1 or dtype != 9999 or ggml_type < 0:
+                            raise ValueError("Hybrid auto: unsupported fastllm serialization for " + key +
+                                             " (version=%d, dtype=%d, ggml=%d)" % (version, dtype, ggml_type))
+                        kind = "gguf:%d" % ggml_type
+                    tensors.append(Tensor(key, tuple(item["shape"]), end - start, kind))
         if weight_map is not None and set(weight_map) != {t.name for t in tensors}:
             raise ValueError("Hybrid auto: incomplete safetensors checkpoint")
     if len({t.name for t in tensors}) != len(tensors):
@@ -217,6 +233,7 @@ class Geometry:
     kv_reallocation: list = field(default_factory=list)  # largest growing tensor bytes/token/layer
     kv_padding: list = field(default_factory=list)  # per-session capacity rounding bytes/layer
     tp_kv_heads: int = 0  # Qwen3.5 GQA KV heads available for TP sharding
+    gguf_expert_bytes: dict = field(default_factory=dict)  # packed per-expert bytes by layer
     disk_prefill: dict = field(default_factory=dict)  # native V4.1 BF16 workspace phases
 
 
@@ -633,6 +650,7 @@ def weight_costs(tensors, model, args):
     dense = [0] * len(model.kv)
     common, host, largest = 0, 0, 0
     snapshot = False
+    gguf_layers = {}
     packed_sizes = _packed_fp4_sizes(tensors, args)
     native_sizes = (_deepseek_v41_weight_sizes(tensors, args) if model.family == "deepseek_v41" else
                     _qwen35_weight_sizes(tensors, args) if model.family == "qwen35" else {})
@@ -657,6 +675,8 @@ def weight_costs(tensors, model, args):
             raise ValueError("Hybrid auto: tensor layer outside model")
         is_expert = _is_routed_expert(name)
         is_shared = "_shexp." in name or ".shared_experts." in name
+        if is_expert and tensor.kind.startswith("gguf:") and layer is not None:
+            gguf_layers[layer] = gguf_layers.get(layer, 0) + tensor.bytes
         size = tensor.bytes
         if is_expert and tensor.kind in ("gguf:13", "gguf:14"):
             # NUMA Q5_K/Q6_K R4 cannot currently be restored by the cache;
@@ -731,6 +751,8 @@ def weight_costs(tensors, model, args):
             largest = max(largest, size)
     if not any(expert) and model.family not in ("qwen3", "qwen35"):
         raise ValueError("Hybrid auto: no routed experts found")
+    model.gguf_expert_bytes = {layer: math.ceil(size / model.experts)
+                               for layer, size in gguf_layers.items()}
     return expert, dense, common, host, largest, snapshot
 
 
@@ -760,7 +782,13 @@ def _workspace_bytes(args, model, rows, context, mode, resident):
     scores = _score_workspace(model, rows, context)
     dense = model.hidden * model.intermediate * 3 * 2
     phase = model.disk_prefill
-    reusable = (phase and args.moe_device == "disk" and resident == 0 and mode == "pp" and
+    # V4.1's NUMA prefill also keeps routed-expert intermediates in the
+    # reusable host-side staging path.  Charging the generic CUDA top-k
+    # intermediate tensor here multiplies rows by every expert route even
+    # though NUMA experts are never materialized on the GPU.  Keep the same
+    # phase bound used by disk prefill for the all-host NUMA/PP case; resident
+    # CUDA expert layers and TP retain the generic bound below.
+    reusable = (phase and args.moe_device in ("disk", "numa") and resident == 0 and mode == "pp" and
                 args.max_batch == 1 and rows > phase["window"] and args.fast_prefill and
                 args.dtype == "auto" and args.moe_dtype in ("", "auto") and
                 args.atype in ("auto", "bfloat16") and args.moe_atype in ("", "auto", "bfloat16") and
@@ -829,9 +857,12 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     )
     if host_memory_limit is not None:
         host_limit = min(host_limit, host_memory_limit)
-    chunks = [4096, 2048, 1024, 512, 256]
-    if model.family == "deepseek_v41" and args.moe_device == "disk":
-        chunks.insert(0, 8192)
+    # DeepSeek's prefill path can amortize the indexed attention and MoE
+    # dispatch over a larger block for every host-backed expert backend.  The
+    # capacity solver still rejects 8192 when the GPU workspace cannot hold it.
+    chunks = ([8192, 4096, 2048, 1024, 512, 256]
+              if model.family == "deepseek_v41" else
+              [4096, 2048, 1024, 512, 256])
     if args.chunked_prefill_size != "auto":
         chunks = [args.chunked_prefill_size if args.chunked_prefill_size > 0 else model.default_chunk]
     chunks = list(dict.fromkeys(min(c, context) for c in chunks))
@@ -855,7 +886,15 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             if streaming:
                 # Prefill stages one complete KV layer per device.
                 workspace += logical * layer_bytes
-            used = {d: common + workspace + guard for d in mapping}
+            # GGUF host prefill retains raw and canonical upload rings:
+            # 3 groups x 16 experts x 2 copies, plus 256 MiB lookahead.
+            # These packed-weight buffers coexist with activation scratch and
+            # the decode cache; generic top-k activation accounting omits them.
+            record = max((size for layer, size in model.gguf_expert_bytes.items()
+                          if expert_layer(layer, model) >= resident), default=0)
+            transport = (96 * (math.ceil(record / 256) * 256) + 272 * MiB
+                         if model.family == "deepseek_v41" and args.moe_device == "numa" and record else 0)
+            used = {d: common + workspace + transport + guard for d in mapping}
             reallocation = dict.fromkeys(mapping, 0)
             logical_kv = dict.fromkeys(mapping, 0)
             capacity_kv = dict.fromkeys(mapping, 0)
@@ -950,7 +989,8 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     "moe_cuda_cache": cuda_cache, "moe_cpu_cache": cpu_cache,
                     "gpu_estimated_bytes": {d: used[d] + cache[d] for d in mapping},
                     "gpu_budget_bytes": gpu_limit, "host_estimated_bytes": host_required + cpu_cache,
-                    "host_budget_bytes": host_limit, "workspace_bytes_per_device": workspace,
+                    "host_budget_bytes": host_limit, "workspace_bytes_per_device": workspace + transport,
+                    "expert_transport_bytes_per_device": transport,
                     "auto_gpu_memory_limit": gpu_memory_limit,
                     "auto_host_memory_limit": host_memory_limit}
             if independent and host_experts:
