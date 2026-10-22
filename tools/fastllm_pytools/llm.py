@@ -821,10 +821,12 @@ def set_moe_cpu_cache(bytes_: int):
     fastllm_lib.set_moe_cpu_cache(ctypes.c_uint64(bytes_))
 
 def get_disk_moe_cache_stats():
-    """Process-wide cumulative route counts and resident expert payload bytes."""
+    """Process-wide route counts, resident bytes and bounded cache workspace stats."""
     names = ("cpu_bytes", "cuda_bytes", "cpu_hits", "cuda_hits", "misses",
              "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions",
-             "cpu_cuda_overlap_bytes", "cuda_demotions", "cuda_demotion_bytes")
+             "cpu_cuda_overlap_bytes", "cuda_demotions", "cuda_demotion_bytes",
+             "cpu_workspace_bytes", "cpu_buffer_reuses", "cpu_buffer_allocations",
+             "cpu_reclaims", "async_maintenance")
     if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
         values = (ctypes.c_uint64 * len(names))()
         count = fastllm_lib.get_disk_moe_cache_stats_v2(values, len(names))

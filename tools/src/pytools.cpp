@@ -152,7 +152,9 @@ extern "C" {
         auto s = fastllm::GetDiskMoeCacheStats();
         const uint64_t result[] = {s.cpuBytes, s.cudaBytes, s.cpuHits, s.cudaHits, s.misses,
             s.diskBytes, s.uploads, s.cpuEvictions, s.cudaEvictions,
-            s.cpuCudaOverlapBytes, s.cudaDemotions, s.cudaDemotionBytes};
+            s.cpuCudaOverlapBytes, s.cudaDemotions, s.cudaDemotionBytes,
+            s.cpuWorkspaceBytes, s.cpuBufferReuses, s.cpuBufferAllocations,
+            s.cpuReclaims, s.asyncMaintenance};
         const int count = sizeof(result) / sizeof(result[0]);
         if (values && capacity > 0) std::copy_n(result, std::min(capacity, count), values);
         return count;

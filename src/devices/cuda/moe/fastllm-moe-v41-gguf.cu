@@ -77,6 +77,8 @@ __device__ const uint8_t *V41Weight(const FastllmCudaMoeGGUFCacheView &view,
         const int32_t *, int route, int, bool gate) {
     const int slot = view.routeSlots[route];
     if (slot < 0) return nullptr;
+    if (view.recordPointers)
+        return view.recordPointers[slot] + (gate ? 0 : view.downOffset);
     const size_t offset = view.slotOffsets ? view.slotOffsets[slot] : size_t(slot)*view.recordStride;
     return view.records + offset + (gate ? 0 : view.downOffset);
 }
@@ -249,7 +251,7 @@ bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
         input.dims[1] != view.hidden || view.hidden <= 0 || view.inter <= 0 ||
         view.hidden%256 || view.inter%256 || topk < 1 || topk > 16 ||
         !FastllmCudaV41GGUFSupported(view.gateType, view.downType) ||
-        !view.records || !view.routeSlots || !view.workspace || !scores || !perExpert ||
+        (!view.records && !view.recordPointers) || !view.routeSlots || !view.workspace || !scores || !perExpert ||
         view.activeRouteCount || (view.routeMap && (view.routeCount < 1 || view.routeCount > input.dims[0]*topk)) ||
         view.numaGateType >= 0 || view.numaDownType >= 0)
         return false;

@@ -1114,6 +1114,12 @@ if (UNIT_TEST)
                 set_tests_properties(disk_glm5_gguf_cache PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE
                     ENVIRONMENT "FT_NUMAS=1;FT_THREADS=8;FT_GPU_PREFILL=1;FASTLLM_DISK_DIRECT_IO=1")
             endif()
+            add_executable(disk_v41_gguf_cache_test test/basic/test_disk_v41_gguf_cache.cpp)
+            target_link_libraries(disk_v41_gguf_cache_test PRIVATE fastllm)
+            fastllm_add_checked_test(disk_v41_gguf_cache disk_v41_gguf_cache_test
+                "PASS: disk V4.1 GGUF cache" 180)
+            set_tests_properties(disk_v41_gguf_cache PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE
+                ENVIRONMENT "FT_GPU_PREFILL=1;FASTLLM_DISK_DIRECT_IO=1")
             add_test(NAME disk_moe_cache_cuda COMMAND disk_moe_cache_test 1)
             add_test(NAME disk_moe_cache_cuda_prefill COMMAND disk_moe_cache_test 1 prefill)
             add_test(NAME disk_moe_cache_cuda_dual COMMAND disk_moe_cache_test 2)
