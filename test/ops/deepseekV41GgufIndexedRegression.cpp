@@ -388,6 +388,12 @@ int main(int argc, char **argv) {
         for(int dt : {GGML_TYPE_Q2_0,GGML_TYPE_Q2_K,GGML_TYPE_Q3_K,GGML_TYPE_Q4_K,GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M})
             checks+=Case(gt,dt,512,256,0,false);
         checks+=Case(GGML_TYPE_Q3_K,GGML_TYPE_Q2_0,512,256,devices>1?1:0,true);
+        // TP ranks can lack either or both IQ1 projection weights.
+        for (auto pair : std::vector<std::pair<int,int>>{
+                {GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M},
+                {GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_S},
+                {GGML_TYPE_IQ1_M,GGML_TYPE_IQ1_M}})
+            checks+=Case(pair.first,pair.second,512,256,devices>1?1:0,true);
         if (mode == "--full" || mode == "--grouped-full") {
             for (auto pair : std::vector<std::pair<int,int>>{
                     {GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_S}, {GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M},

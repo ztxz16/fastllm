@@ -6,6 +6,7 @@
 #include "fastllm-cuda-v41-gguf.h"
 #include "fastllm-cuda.cuh"
 #include <cuda_fp8.h>
+#include "../fastllm-gguf-iq1-grid.cuh"
 
 namespace {
 // The same FP8 block-32 -> BF16 -> Q8_1 boundaries as the ordinary CUDA
@@ -85,37 +86,35 @@ __device__ int V41Route(const FastllmCudaMoeGGUFCacheView &view, int route) {
     return view.routeMap ? view.routeMap[route] : route;
 }
 
-template<ggml_type Type, bool Gate, class Weights>
+template<ggml_type Type, bool Gate, class Weights, int RowsPerBlock = 8>
 __global__ void V41GGUFProjection(const block_q8_1 *input, __nv_bfloat16 *output,
         Weights weights, const int32_t *indices,
         int experts, int topk, int columns, int rows, size_t rowBytes) {
     const int route = blockIdx.y;
+    const uint8_t *weight = V41Weight(weights, indices, route, experts, Gate);
+    const int firstRow = blockIdx.x*RowsPerBlock + threadIdx.x/32;
+    // The decision is uniform within the CTA. Missing TP experts must still
+    // clear every output row, but need neither the codebook nor activation.
+    if (!weight) {
+        for (int row = firstRow; row < rows && row < (blockIdx.x+1)*RowsPerBlock; row += 8)
+            if (threadIdx.x%32 == 0) output[size_t(route)*rows+row] = __float2bfloat16_rn(0.f);
+        return;
+    }
     const auto *x = input + size_t(Gate ? V41Route(weights, route)/topk : route)*(columns/32);
     extern __shared__ uint32_t activation[];
-    // Stage the canonical codebook in the packed layout used by extended GEMV.
-    // No host-side lazy initialization or synchronization is needed in capture.
     __shared__ uint32_t iqGrid[(Type == GGML_TYPE_IQ1_S || Type == GGML_TYPE_IQ1_M) ? 2048 : 1];
     if constexpr (Type == GGML_TYPE_IQ1_S || Type == GGML_TYPE_IQ1_M) {
-        for (int i = threadIdx.x; i < 2048; i += blockDim.x) {
-            const uint64_t values = iq1s_grid[i];
-            uint32_t packed = 0;
-#pragma unroll
-            for (int j = 0; j < 8; ++j)
-                packed |= uint32_t(int(int8_t(values >> (8*j))) + 1) << (8*(j%4) + 4*(j/4));
-            iqGrid[i] = packed;
-        }
+        for (int i = threadIdx.x; i < 2048; i += blockDim.x)
+            iqGrid[i] = fastllm_iq1_grid_packed[i];
     }
     for (int i = threadIdx.x; i < columns/32*int(sizeof(block_q8_1))/4; i += blockDim.x)
         activation[i] = reinterpret_cast<const uint32_t *>(x)[i];
     __syncthreads();
-    const int row = blockIdx.x*8 + threadIdx.x/32;
-    if (row >= rows) return;
-    const uint8_t *weight = V41Weight(weights, indices, route, experts, Gate);
-    float value = 0;
-    if (weight)
-        value = V41GGUFDot<Type>(weight+size_t(row)*rowBytes,
+    for (int row = firstRow; row < rows && row < (blockIdx.x+1)*RowsPerBlock; row += 8) {
+        const float value = V41GGUFDot<Type>(weight+size_t(row)*rowBytes,
             reinterpret_cast<const block_q8_1 *>(activation), columns, iqGrid);
-    if (threadIdx.x%32 == 0) output[size_t(route)*rows+row] = __float2bfloat16_rn(value);
+        if (threadIdx.x%32 == 0) output[size_t(route)*rows+row] = __float2bfloat16_rn(value);
+    }
 }
 
 __global__ void V41GGUFReduce(const __nv_bfloat16 *partial, float *output,
@@ -142,13 +141,13 @@ template<bool Gate, class Weights>
 void Project(int type, const block_q8_1 *input, __nv_bfloat16 *output,
         Weights weights, const int32_t *indices,
         int experts, int topk, int routes, int columns, int rows) {
-    const dim3 grid((rows+7)/8, routes);
     const size_t shared = size_t(columns/32)*sizeof(block_q8_1);
     switch (type) {
-#define PROJECT(Type) case GGML_TYPE_##Type: \
-        V41GGUFProjection<GGML_TYPE_##Type, Gate, Weights><<<grid, 256, shared, cudaStreamPerThread>>>( \
+#define PROJECT(Type) case GGML_TYPE_##Type: { \
+        constexpr int tile = (GGML_TYPE_##Type == GGML_TYPE_IQ1_S || GGML_TYPE_##Type == GGML_TYPE_IQ1_M) ? 16 : 8; \
+        V41GGUFProjection<GGML_TYPE_##Type, Gate, Weights, tile><<<dim3((rows+tile-1)/tile, routes), 256, shared, cudaStreamPerThread>>>( \
             input, output, weights, indices, experts, topk, columns, rows, \
-            ggml_row_size(GGML_TYPE_##Type, columns)); break;
+            ggml_row_size(GGML_TYPE_##Type, columns)); break; }
         PROJECT(Q2_0) PROJECT(Q2_K) PROJECT(Q3_K) PROJECT(Q4_K) PROJECT(IQ1_S) PROJECT(IQ1_M)
 #undef PROJECT
     }
