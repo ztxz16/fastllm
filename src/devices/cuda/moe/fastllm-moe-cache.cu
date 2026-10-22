@@ -3042,7 +3042,9 @@ bool FastllmCudaMoePrefillCache::Begin(fastllm::Data **weights, int experts,
             if (!pointer) continue;
             const auto &source = *weights[slot];
             auto alias = std::make_unique<fastllm::Data>(source.dataType);
-            alias->Resize(source.dims);
+            // This view has the source's exact shape. Borrow its GGUF metadata
+            // without Resize using an unset ggmlType or rewriting the source.
+            alias->dims = source.dims; alias->strides = source.strides;
             alias->ggmlType = source.ggmlType; alias->ggmlTensor = source.ggmlTensor;
             alias->isGGUFData = source.isGGUFData; alias->IsRepacked = source.IsRepacked;
             alias->disableGGUFRepack = source.disableGGUFRepack;

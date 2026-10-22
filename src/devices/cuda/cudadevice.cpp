@@ -9008,7 +9008,13 @@ namespace fastllm {
         // remain in the existing projection/activation/reduction code below.
 #ifndef USE_ROCM
         FastllmCudaMoePrefillCache prefillCache;
+        // Native GGUF records belong to the scored model path. Ordinary
+        // projections (including speed probes) may restore a different layout
+        // and must retain their temporary storage instead of aliasing the cache.
+        const bool cacheLayoutCompatible = !weights[2] ||
+            weights[2]->dataType != DATA_GGUF_FORMAT || deepSeekV4Mode;
         const bool cachedPrefill = setZero && isCrossSwiglu && gateType == MoeGateSwiglu &&
+            cacheLayoutCompatible &&
             prefillCache.Begin(weights, m, indexData, scoreData, batch, topk, experts, cacheAdmission);
         if (cachedPrefill) weights = prefillCache.Weights();
 #endif
