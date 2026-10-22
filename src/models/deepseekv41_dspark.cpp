@@ -789,6 +789,26 @@ namespace fastllm {
 #endif
     }
 
+    void DeepSeekV41Model::DsparkEmbedInput(const Data &inputIds, Data &hiddenStates) {
+        Data &embedding = weight["embed.weight"];
+        // Target prefill has placed CUDA embeddings on the first PP stage.
+        // Query there and transfer only selected rows before expanding HC.
+        // CPU/GGUF lookups and single-device/TP drafts need no device switch.
+        const bool ppCudaEmbedding = v41DsparkTpDevices.empty() && deviceMap.size() > 1 &&
+                                     embedding.dataDevice == DataDevice::CUDA;
+        if (ppCudaEmbedding) {
+            ApplyDeviceMap(this->deviceMap, 1, block_cnt);
+        }
+        Data embedOut;
+        Embedding(inputIds, embedding, embedOut);
+        ToDataType(embedOut, DataType::BFLOAT16);
+        if (ppCudaEmbedding) {
+            ApplyDsparkDevice();
+        }
+        embedOut.Reshape({1, static_cast<int>(inputIds.Count(0)), 1, embed_dim});
+        Repeat(embedOut, 2, hc_mult, hiddenStates);
+    }
+
     void DeepSeekV41Model::DsparkProjectHead(Data &input, Data &output) {
         Data floatInput;
         Data *headInput = &input;
@@ -1516,13 +1536,7 @@ namespace fastllm {
         idValues[0] = (float)anchorToken;
         Data draftIds(DataType::FLOAT32, {1, block}, idValues);
         Data hiddenStates, hiddenTemp;
-        {
-            Data embedOut;
-            Embedding(draftIds, weight["embed.weight"], embedOut);
-            ToDataType(embedOut, DataType::BFLOAT16);
-            embedOut.Reshape({1, block, 1, dim});
-            Repeat(embedOut, 2, hc_mult, hiddenStates);
-        }
+        DsparkEmbedInput(draftIds, hiddenStates);
         Data *curHidden = &hiddenStates;
         Data *nextHidden = &hiddenTemp;
 

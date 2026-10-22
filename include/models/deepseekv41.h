@@ -499,6 +499,7 @@ namespace fastllm {
 
         void InitDsparkParams();
         void ApplyDsparkDevice();
+        void DsparkEmbedInput(const Data &inputIds, Data &hiddenStates);
         void DsparkProjectHead(Data &input, Data &output);
         bool DsparkTensorNeeded(const std::string &name) const;
         // 支持贪心 / CUDA 采样及逐位置工具名、参数名约束
