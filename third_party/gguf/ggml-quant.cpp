@@ -7244,21 +7244,41 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 }
 
 #if defined(__AVX2__)
-// Expand two 3-bit index suffixes per lookup. A full 12-bit table would
-// occupy 32 KiB beside the 16 KiB codebook; this table needs only 256 bytes.
-static constexpr auto iq1s_index_high = [] {
-    std::array<uint32_t, 64> table{};
-    for (uint32_t i = 0; i < table.size(); ++i)
-        table[i] = ((i & 7) << 8) | (((i >> 3) & 7) << 24);
-    return table;
-}();
+// Expand all four index suffixes in parallel. Multiplication keeps the
+// relevant bits below bit 14 before the common right shift; high metadata
+// (scales/signs) is discarded by the mask, including at uint16 wraparound.
 static inline __m256i iq1s_values_avx2(const uint8_t *qs, uint16_t qh) {
     uint32_t low;
     memcpy(&low, qs, sizeof(low));
-    const uint64_t indices = (uint64_t)_mm_cvtsi128_si64(_mm_cvtepu8_epi16(_mm_cvtsi32_si128(low))) |
-        iq1s_index_high[qh & 63] | ((uint64_t)iq1s_index_high[(qh >> 6) & 63] << 32);
+    const __m128i high = _mm_srli_epi16(_mm_mullo_epi16(_mm_set1_epi16(qh),
+        _mm_setr_epi16(2048, 256, 32, 4, 0, 0, 0, 0)), 3);
+    const uint64_t indices = (uint64_t)_mm_cvtsi128_si64(_mm_or_si128(
+        _mm_cvtepu8_epi16(_mm_cvtsi32_si128(low)), _mm_and_si128(high, _mm_set1_epi16(0x700))));
     return _mm256_set_epi64x(iq1s_grid[uint16_t(indices >> 48)], iq1s_grid[uint16_t(indices >> 32)],
                             iq1s_grid[uint16_t(indices >> 16)], iq1s_grid[uint16_t(indices)]);
+}
+// IQ1_M packs two index suffixes and two delta signs in each metadata byte.
+// This 1 KiB table excludes the signs and avoids four scalar bit extractions.
+static constexpr auto iq1m_index_high = [] {
+    std::array<uint32_t, 256> table{};
+    for (uint32_t i = 0; i < table.size(); ++i)
+        table[i] = ((i & 7) << 8) | ((i & 0x70) << 20);
+    return table;
+}();
+static inline __m256i iq1m_values_avx2(const uint8_t *qs, const uint8_t *qh) {
+    uint32_t low;
+    memcpy(&low, qs, sizeof(low));
+    const uint64_t indices = (uint64_t)_mm_cvtsi128_si64(_mm_cvtepu8_epi16(_mm_cvtsi32_si128(low))) |
+        iq1m_index_high[qh[0]] | ((uint64_t)iq1m_index_high[qh[1]] << 32);
+    return _mm256_set_epi64x(iq1s_grid[uint16_t(indices >> 48)], iq1s_grid[uint16_t(indices >> 32)],
+                            iq1s_grid[uint16_t(indices >> 16)], iq1s_grid[uint16_t(indices)]);
+}
+static inline __m256i iq1m_delta_avx2(const uint8_t *qh) {
+    uint16_t bits;
+    memcpy(&bits, qh, sizeof(bits));
+    const __m256i signs = _mm256_sllv_epi32(_mm256_set1_epi32(bits),
+        _mm256_setr_epi32(28, 28, 24, 24, 20, 20, 16, 16));
+    return _mm256_or_si256(_mm256_srai_epi32(signs, 31), _mm256_set1_epi8(1));
 }
 #endif
 
@@ -7704,31 +7724,20 @@ void ggml_vec_dot_iq1_m_q8_K  (int n, float * restrict s, size_t bs, const void 
         __m256i sumi1 = _mm256_setzero_si256();
         __m256i sumi2 = _mm256_setzero_si256();
         for (int ib = 0; ib < QK_K/32; ib += 2) {
-            const __m256i q1b_1 = _mm256_set_epi64x(
-                    iq1s_grid[qs[3] | (((uint16_t)qh[1] << 4) & 0x700)], iq1s_grid[qs[2] | (((uint16_t)qh[1] << 8) & 0x700)],
-                    iq1s_grid[qs[1] | (((uint16_t)qh[0] << 4) & 0x700)], iq1s_grid[qs[0] | (((uint16_t)qh[0] << 8) & 0x700)]
-            );
-            const __m256i q1b_2 = _mm256_set_epi64x(
-                    iq1s_grid[qs[7] | (((uint16_t)qh[3] << 4) & 0x700)], iq1s_grid[qs[6] | (((uint16_t)qh[3] << 8) & 0x700)],
-                    iq1s_grid[qs[5] | (((uint16_t)qh[2] << 4) & 0x700)], iq1s_grid[qs[4] | (((uint16_t)qh[2] << 8) & 0x700)]
-            );
+            const __m256i q1b_1 = iq1m_values_avx2(qs, qh);
+            const __m256i q1b_2 = iq1m_values_avx2(qs + 4, qh + 2);
             const __m256i q8b_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
             const __m256i q8b_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
 
             const __m256i dot1 = mul_add_epi8(q1b_1, q8b_1);
             const __m256i dot2 = mul_add_epi8(q1b_2, q8b_2);
 
-            const __m256i delta1 = _mm256_set_epi64x(qh[1] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
-                                                     qh[1] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101,
-                                                     qh[0] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
-                                                     qh[0] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101);
-            const __m256i delta2 = _mm256_set_epi64x(qh[3] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
-                                                     qh[3] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101,
-                                                     qh[2] & 0x80 ? 0xffffffffffffffff : 0x0101010101010101,
-                                                     qh[2] & 0x08 ? 0xffffffffffffffff : 0x0101010101010101);
-
-            const __m256i dot3 = mul_add_epi8(delta1, q8b_1);
-            const __m256i dot4 = mul_add_epi8(delta2, q8b_2);
+            const __m256i delta1 = iq1m_delta_avx2(qh);
+            const __m256i delta2 = iq1m_delta_avx2(qh + 2);
+            // Delta is always +/-1. Its absolute value needs no sign
+            // operation; retain signed-byte wrapping and accumulation order.
+            const __m256i dot3 = _mm256_maddubs_epi16(_mm256_set1_epi8(1), _mm256_sign_epi8(q8b_1, delta1));
+            const __m256i dot4 = _mm256_maddubs_epi16(_mm256_set1_epi8(1), _mm256_sign_epi8(q8b_2, delta2));
 
             __m256i scale1 = MM256_SET_M128I(_mm_set1_epi16(sc[ib/2] >> 3), _mm_set1_epi16(sc[ib/2] >> 0));
             __m256i scale2 = MM256_SET_M128I(_mm_set1_epi16(sc[ib/2] >> 9), _mm_set1_epi16(sc[ib/2] >> 6));
