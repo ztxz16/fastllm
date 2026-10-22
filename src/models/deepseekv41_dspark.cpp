@@ -1732,6 +1732,7 @@ namespace fastllm {
                     FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
                     expertIndex.ToDevice(DataDevice::CUDA, ffnInput.dataDeviceIds, true);
                     expertScore.ToDevice(DataDevice::CUDA, ffnInput.dataDeviceIds, true);
+                    FastllmCudaMoeRouteScope routeScope(FastllmMoeRoutePhase::Draft);
                     hybrid = fastllm::RunHybridMoe(ffnInput, expertIndex, expertScore, ffnOut,
                         moeWeights.data(), (int)moeWeights.size(), layerId);
                 }

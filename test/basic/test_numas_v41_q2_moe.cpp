@@ -7,6 +7,7 @@
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
 #endif
 #include <algorithm>
 #include <cmath>
@@ -438,15 +439,29 @@ int main(int argc, char **argv) {
                             weights.data(), (int)weights.size(), 0))
                         throw std::runtime_error("Q2 cold CUDA decode rejected");
                 }
+                const auto phase = rows > 8 ? FastllmMoeRoutePhase::SmallPrefill :
+                    rows == 5 ? FastllmMoeRoutePhase::Draft :
+                    rows == 1 ? FastllmMoeRoutePhase::Decode : FastllmMoeRoutePhase::Verify;
                 for (int repeat = 0; repeat < 3; ++repeat) {
+                    FastllmCudaMoeRouteScope routeScope(phase);
                     const char *split = repeat == 0 ? "0" : repeat == 1 ? "1" : "6";
                     if (rows == 1) setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", split, 1);
                     else unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
+                    uint64_t before[8]{}, after[8]{};
+                    if (!fastllm_moe_cuda_cache_phase_stats(0, int(phase), before))
+                        throw std::runtime_error("phase statistics unavailable");
                     if (!FastllmCudaMergeMOEHybrid(gpuInput, gpuIndex, gpuScore, gpuOutput,
                             weights.data(), (int)weights.size(), 0)) {
                         throw std::runtime_error("Q2 CUDA hybrid request rejected");
                     }
                     gpuOutput.ToDevice(DataDevice::CPU);
+                    if (!fastllm_moe_cuda_cache_phase_stats(0, int(phase), after) ||
+                        after[1]-before[1] != uint64_t(rows*topk) ||
+                        after[4]-before[4]+after[5]-before[5] != uint64_t(rows*topk))
+                        throw std::runtime_error("phase counters lost or duplicated routes");
+                    if (rows == 2 && repeat == 0 &&
+                        (after[4]-before[4] == 0 || after[5]-before[5] == 0 || after[6]-before[6] != 0))
+                        throw std::runtime_error("cold verifier did not split uncached experts across CPU and GPU");
                     if (rows == 1 && repeat == 0 && memcmp(gpuOutput.cpuData, cpuReference.data(), cpuReference.size()))
                         throw std::runtime_error("Q2 cache CPU subset differs from NUMA");
                     double error = 0, norm = 0;
@@ -459,6 +474,20 @@ int main(int argc, char **argv) {
                     printf("Q2 CUDA cache rows=%d split=%s relative_rms=%.6f\n", rows, rows == 1 ? split : "adaptive", std::sqrt(error / std::max(norm, 1e-20)));
                     if (error > .000025 * std::max(norm, 1e-20))
                         throw std::runtime_error("Q2 CUDA hybrid differs from NUMA oracle");
+                }
+                if (rows == 8) {
+                    uint64_t before[4][8]{}, after[8]{};
+                    for (int p = 0; p < 4; ++p)
+                        if (!fastllm_moe_cuda_cache_phase_stats(0, p, before[p]))
+                            throw std::runtime_error("phase snapshot failed");
+                    if (!FastllmCudaMergeMOEHybrid(gpuInput, gpuIndex, gpuScore, gpuOutput,
+                            weights.data(), (int)weights.size(), 0))
+                        throw std::runtime_error("untagged hybrid request rejected");
+                    for (int p = 0; p < 4; ++p)
+                        if (!fastllm_moe_cuda_cache_phase_stats(0, p, after) ||
+                            memcmp(before[p], after, sizeof(after)))
+                            throw std::runtime_error("untagged request polluted phase counters");
+                    gpuOutput.ToDevice(DataDevice::CPU);
                 }
                 // The existing independent scalar oracle below checks cached
                 // output as well as the direct NUMA path.

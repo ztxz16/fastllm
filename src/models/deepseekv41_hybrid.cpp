@@ -114,6 +114,10 @@ namespace fastllm {
         const bool tp = ctx.tp, single = ctx.single, dsparkVerify = ctx.dsparkVerify;
         const bool graphActive = ctx.graphActive, dumpDebug = ctx.dumpDebug;
         const bool hasSharedExpertOut = ctx.hasSharedExpertOut;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        FastllmCudaMoeRouteScope routeScope(dsparkVerify ? FastllmMoeRoutePhase::Verify :
+            seqlen > 1 ? FastllmMoeRoutePhase::SmallPrefill : FastllmMoeRoutePhase::Decode);
+#endif
         const auto &runSharedSegment = ctx.runSharedSegment;
         const std::string pre = "layers." + std::to_string(layer);
         Data &ffnInput = ws->ffnInput, &ffnOut = ws->ffnOut;

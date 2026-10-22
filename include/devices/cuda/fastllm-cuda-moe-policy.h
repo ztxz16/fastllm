@@ -34,3 +34,17 @@ bool FastllmCudaMergeMOEHybridOnDevices(const fastllm::Data &input,
 // Set before allocating device caches. Main and draft groups share the model's
 // configured per-device budget instead of each allocating the entire budget.
 bool FastllmCudaSetMoeCacheBudgetFraction(fastllm::Data **weights, int count, double fraction);
+
+// Attribute small-batch routes without changing cache or scheduling decisions.
+// Scopes are thread-local and nest across model callbacks.
+enum class FastllmMoeRoutePhase { Unspecified = -1, Decode, Verify, Draft, SmallPrefill };
+FastllmMoeRoutePhase FastllmCudaSetMoeRoutePhase(FastllmMoeRoutePhase phase);
+class FastllmCudaMoeRouteScope {
+    FastllmMoeRoutePhase previous;
+public:
+    explicit FastllmCudaMoeRouteScope(FastllmMoeRoutePhase phase)
+        : previous(FastllmCudaSetMoeRoutePhase(phase)) {}
+    ~FastllmCudaMoeRouteScope() { FastllmCudaSetMoeRoutePhase(previous); }
+    FastllmCudaMoeRouteScope(const FastllmCudaMoeRouteScope &) = delete;
+    FastllmCudaMoeRouteScope &operator=(const FastllmCudaMoeRouteScope &) = delete;
+};

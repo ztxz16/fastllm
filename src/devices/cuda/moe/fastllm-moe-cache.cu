@@ -116,6 +116,8 @@ int Fp8PointerTableCount(fastllm::DataType type) {
         type == fastllm::DataType::FP8_E4M3_BLOCK_128 ? 2 : 0;
 }
 
+thread_local FastllmMoeRoutePhase routePhase = FastllmMoeRoutePhase::Unspecified;
+
 struct OffloadGroup;
 
 struct DecodeOverlapWorkspace {
@@ -347,6 +349,7 @@ struct DeviceCache {
     std::unique_ptr<HybridWorkspace> hybrid;
     std::shared_ptr<FastllmCudaMoeExpertParallel> batchHybrid;
     std::array<uint64_t, 8> cooperativeStats{};
+    std::array<std::array<uint64_t, 8>, 4> phaseStats{};
     std::unique_ptr<DecodePolicyState> decode;
 };
 
@@ -4027,6 +4030,12 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     work.pending = true;
     work.gpuRoutes += gpuCount;
     work.residentRoutes += hits;
+    if (count == 1 && routePhase != FastllmMoeRoutePhase::Unspecified) {
+        auto &stats = work.cache->phaseStats[int(routePhase)];
+        const uint64_t delta[8] = {1, uint64_t(routes), uint64_t(hits), uint64_t(routes-hits),
+            uint64_t(gpuCount), uint64_t(cpuCount), uint64_t(hits), uint64_t(work.admitted)};
+        for (int i = 0; i < 8; ++i) stats[i] += delta[i];
+    }
     if (overlap) {
         overlap->previousLayer = timingLayer;
         overlap->previousHits = hits;
@@ -4758,6 +4767,12 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
     work.gpuRoutes += gpu;
     work.residentRoutes += std::min(gpu, hits);
     work.allResidentRoutes += hits;
+    if (routePhase != FastllmMoeRoutePhase::Unspecified) {
+        auto &stats = cache->phaseStats[int(routePhase)];
+        const uint64_t delta[8] = {1, uint64_t(topk), uint64_t(hits), uint64_t(topk-hits),
+            uint64_t(gpu), uint64_t(topk-gpu), uint64_t(std::min(gpu, hits)), uint64_t(work.previousPrefetch)};
+        for (int i = 0; i < 8; ++i) stats[i] += delta[i];
+    }
     if (scoredBfloat && V41CacheOption(layout.glm5 ? "FASTLLM_GLM5_MOE_CACHE_TRACE" :
                                                  "FASTLLM_DSV41_MOE_CACHE_TRACE", 0) &&
         (work.scheduler.calls == 1 || work.scheduler.calls % 1024 == 0 ||
@@ -4892,6 +4907,29 @@ bool FastllmCudaMergeMOECache(
         }
     }
     return true;
+}
+
+FastllmMoeRoutePhase FastllmCudaSetMoeRoutePhase(FastllmMoeRoutePhase phase) {
+    const auto previous = routePhase;
+    routePhase = phase;
+    return previous;
+}
+
+extern "C" bool fastllm_moe_cuda_cache_phase_stats(int device, int phase, uint64_t *values) {
+    if (!values || device < 0 || phase < 0 || phase >= 4) return false;
+    std::fill_n(values, 8, uint64_t(0));
+    int previous = 0;
+    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(device) != cudaSuccess) return false;
+    bool ok = cudaDeviceSynchronize() == cudaSuccess;
+    std::lock_guard<std::mutex> guard(RegistryMutex());
+    for (const auto &group : Groups()) {
+        std::lock_guard<std::mutex> lock(group->mutex);
+        auto it = group->deviceCaches.find(device);
+        if (it == group->deviceCaches.end() || !it->second || !it->second->ready) continue;
+        for (int i = 0; i < 8; ++i) values[i] += it->second->phaseStats[phase][i];
+    }
+    ok &= cudaSetDevice(previous) == cudaSuccess;
+    return ok;
 }
 
 extern "C" bool fastllm_moe_cuda_cache_route_stats(int device, uint64_t *values) {

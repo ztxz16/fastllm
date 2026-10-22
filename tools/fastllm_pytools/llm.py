@@ -763,21 +763,30 @@ def get_moe_cuda_cache_stats(device: int = 0, reset: bool = False):
     result["hit_rate"] = result["hits"] / routes if routes else None
     return result
 
-def get_moe_cuda_cache_route_stats(device: int = 0):
-    """Read cumulative single-GPU hybrid decode/verifier counters between requests.
+def get_moe_cuda_cache_route_stats(device: int = 0, phase: str = None):
+    """Read cumulative hybrid expert-route counters between requests.
 
     Residency is measured across all routed experts before CPU/GPU dispatch,
-    excluding prefetch lookups. Prefill, multi-GPU EP and pure-GPU mode are
-    not counted. Host inference must be idle; this also synchronizes the GPU.
+    excluding prefetch lookups. Includes draft and small-prefill calls through
+    the hybrid backend; grouped prefill, multi-GPU EP and pure-GPU mode are
+    not counted. Optional phase: decode, verify, draft, small_prefill. Phase
+    attribution requires explicit model scopes; untagged calls and deferred
+    cache admissions are excluded. Host inference must be idle; this also
+    synchronizes the GPU.
     Subtract snapshots for per-request counts; cache and scheduler are retained.
     """
-    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_route_stats", None)
+    phases = {"decode": 0, "verify": 1, "draft": 2, "small_prefill": 3}
+    if phase is not None and phase not in phases:
+        raise ValueError("Unknown MoE route phase: " + str(phase))
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_phase_stats" if phase is not None else
+                    "fastllm_moe_cuda_cache_route_stats", None)
     if query is None:
         raise RuntimeError("Full-route expert-cache statistics require an updated CUDA build")
-    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.argtypes = [ctypes.c_int] + ([ctypes.c_int] if phase is not None else []) + [ctypes.POINTER(ctypes.c_uint64)]
     query.restype = ctypes.c_bool
     values = (ctypes.c_uint64 * 8)()
-    if not query(int(device), values):
+    args = [int(device)] + ([phases[phase]] if phase is not None else []) + [values]
+    if not query(*args):
         raise RuntimeError("Could not read full-route expert-cache statistics")
     result = dict(zip(("calls", "routes", "resident_routes", "nonresident_routes",
                        "gpu_routes", "cpu_routes", "resident_gpu_routes", "prefetched_experts"), values))
