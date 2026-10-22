@@ -2478,6 +2478,29 @@ namespace fastllm {
             }
             result[it.first] = it.second;
         }
+        if (V41DeviceMapUsesCuda(this->deviceMap) &&
+            !V41DeviceMapUsesMultiCuda(this->deviceMap) &&
+            !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
+            std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr) {
+            // Place PP projections as they finish loading. Keeping every
+            // attention/head source on the host until the first forward makes
+            // them coexist with NUMA expert registration, despite their final
+            // placement being CUDA. Shared gate/up inputs must remain on CPU
+            // until the existing merge rule has consumed both halves.
+            for (const auto &entry : result) {
+                for (const auto &target : entry.second) {
+                    const std::string &name = target.first;
+                    if (name.find(".experts.") != std::string::npos ||
+                        name.find(".shared_experts.") != std::string::npos ||
+                        IsVisionTensor(name) || weight.GetWeightType(name) != WeightType::LINEAR)
+                        continue;
+                    int layer = -1;
+                    if (name == "head.weight" || V41StartsWith(name, "mtp.")) layer = block_cnt - 1;
+                    else if (V41StartsWith(name, "layers.")) sscanf(name.c_str(), "layers.%d.", &layer);
+                    if (layer >= 0 && layer < block_cnt) AddSpecialWeight(name, "linear", layer);
+                }
+            }
+        }
         return result;
     }
 
