@@ -86,10 +86,15 @@ __device__ int V41Route(const FastllmCudaMoeGGUFCacheView &view, int route) {
     return view.routeMap ? view.routeMap[route] : route;
 }
 
-template<ggml_type Type, bool Gate, class Weights, int RowsPerBlock = 8>
+template<ggml_type Type, bool Gate, class Weights, int RowsPerBlock = 8, int StaticColumns = 0>
 __global__ void V41GGUFProjection(const block_q8_1 *input, __nv_bfloat16 *output,
         Weights weights, const int32_t *indices,
         int experts, int topk, int columns, int rows, size_t rowBytes) {
+    if constexpr (StaticColumns) {
+        static_assert(Type == GGML_TYPE_Q3_K, "fixed K is tuned for Q3_K");
+        columns = StaticColumns;
+        rowBytes = size_t(StaticColumns/256)*sizeof(block_q3_K);
+    }
     const int route = blockIdx.y;
     const uint8_t *weight = V41Weight(weights, indices, route, experts, Gate);
     const int firstRow = blockIdx.x*RowsPerBlock + threadIdx.x/32;
@@ -142,6 +147,18 @@ void Project(int type, const block_q8_1 *input, __nv_bfloat16 *output,
         Weights weights, const int32_t *indices,
         int experts, int topk, int routes, int columns, int rows) {
     const size_t shared = size_t(columns/32)*sizeof(block_q8_1);
+    if constexpr (!Gate) {
+        // The V4.1 down projection reuses each Q8 activation across 16 rows.
+        // Keep the four virtual-warp sums in their original order.
+        if (type == GGML_TYPE_Q3_K && columns == 2304 && rows >= 1024) {
+            constexpr int tile = 16;
+            V41GGUFProjection<GGML_TYPE_Q3_K, false, Weights, tile, 2304>
+                <<<dim3((rows+tile-1)/tile, routes), 256, shared, cudaStreamPerThread>>>(
+                    input, output, weights, indices, experts, topk, columns, rows,
+                    ggml_row_size(GGML_TYPE_Q3_K, columns));
+            return;
+        }
+    }
     switch (type) {
 #define PROJECT(Type) case GGML_TYPE_##Type: { \
         constexpr int tile = (GGML_TYPE_##Type == GGML_TYPE_IQ1_S || GGML_TYPE_##Type == GGML_TYPE_IQ1_M) ? 16 : 8; \

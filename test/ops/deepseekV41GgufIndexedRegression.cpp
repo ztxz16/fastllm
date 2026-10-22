@@ -240,6 +240,7 @@ static void CheckRegistration() {
 #endif
 static bool groupedTest = false;
 static bool sparseTest = false;
+static bool decodeGridTest = false;
 static int graphReplays = 0;
 static int Case(int gt, int dt, int hidden, int inter, int device, bool missing) {
     FastllmCudaSetDevice(device);
@@ -277,7 +278,7 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
     }
     Data gate, activation, workspace, output, ref;
     int checks = 0;
-    for (int rows : sparseTest ? std::vector<int>{512,1024} : groupedTest ? std::vector<int>{33,64,129} : cacheTest ? std::vector<int>{1,5,8} : std::vector<int>{1,2,8,32}) for (int pattern = 0; pattern < 3; ++pattern) {
+    for (int rows : decodeGridTest ? std::vector<int>{1} : sparseTest ? std::vector<int>{512,1024} : groupedTest ? std::vector<int>{33,64,129} : cacheTest ? std::vector<int>{1,5,8} : std::vector<int>{1,2,8,32}) for (int pattern = 0; pattern < 3; ++pattern) {
         std::vector<float> x(size_t(rows)*hidden), scales(rows*topk);
         for (size_t i = 0; i < x.size(); ++i)
             x[i] = pattern == 2 ? 0.f : std::ldexp(normal(rng)*30.f, int(i/32%5)-2);
@@ -393,6 +394,15 @@ int main(int argc, char **argv) {
         const std::string mode = argc>1 ? argv[1] : "";
         hybridTest = mode == "--hybrid";
         cacheTest = mode == "--cache";
+        if (mode == "--decode-grid") {
+            decodeGridTest = true;
+            int n = Case(GGML_TYPE_Q3_K,GGML_TYPE_Q3_K,5120,2304,0,true);
+            n += Case(GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M,5120,2304,0,true);
+            cacheTest = true;
+            n += Case(GGML_TYPE_Q3_K,GGML_TYPE_Q3_K,5120,2304,0,true);
+            printf("PASS: production decode grids and canonical cache (%d checks, %d changed-input graph replays)\n", n, graphReplays);
+            return 0;
+        }
         if (hybridTest) {
             const int n = Case(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 512, 256, 0, false);
             printf("PASS: V4.1 hybrid GGUF FP32/shared FP16/BF16 boundary (%d cases)\n", n);
@@ -425,6 +435,10 @@ int main(int argc, char **argv) {
                     {GGML_TYPE_IQ1_S,GGML_TYPE_Q2_0}, {GGML_TYPE_Q2_0,GGML_TYPE_IQ1_M},
                     {GGML_TYPE_Q2_0,GGML_TYPE_Q3_K}, {GGML_TYPE_Q2_0,GGML_TYPE_Q4_K}})
                 checks+=Case(pair.first,pair.second,5120,2304,0,false);
+            // Production-size Q3_K projections must preserve Q3_K arithmetic and
+            // clear nonlocal slots when captured routes change between replays.
+            checks+=Case(GGML_TYPE_Q3_K,GGML_TYPE_Q3_K,5120,2304,0,false);
+            checks+=Case(GGML_TYPE_Q3_K,GGML_TYPE_Q3_K,5120,2304,devices>1?1:0,true);
         }
 #ifdef USE_NUMAS
         if (cacheTest) CheckRegistration();
