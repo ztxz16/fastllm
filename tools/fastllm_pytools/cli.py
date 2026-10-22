@@ -117,6 +117,10 @@ def args_parser():
     subparsers.add_parser('serve', parents = [shared_parser], help = 'api模式')
     subparsers.add_parser('server', parents = [shared_parser], help = 'api模式')
 
+    from .deploy import add_deploy_args
+    deploy_parser = subparsers.add_parser('deploy', help='Manage independent model replicas')
+    add_deploy_args(deploy_parser)
+
     config_parser_ = subparsers.add_parser('config', help = '创建配置文件')
     config_parser_.add_argument('file', nargs='?', help = '配置文件的路径')
 
@@ -170,6 +174,13 @@ def main(argv=None):
     elif args.command in ('server', 'serve'):
         from .server import fastllm_server
         fastllm_server(args)
+    elif args.command == 'deploy':
+        from .deploy import main as deploy_main
+        try:
+            return deploy_main(args)
+        except (ValueError, RuntimeError, OSError) as error:
+            print(f"deploy: {error}", file=sys.stderr)
+            return 1
     elif args.command == 'export':
         from . import llm
         if (args.path == '' or args.path is None):
