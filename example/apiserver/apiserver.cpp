@@ -146,6 +146,9 @@ std::map <std::string, fastllm::DataType> dataTypeDict = {
     {"float32", fastllm::DataType::FLOAT32},
     {"half", fastllm::DataType::FLOAT16},
     {"float16", fastllm::DataType::FLOAT16},
+    {"bfloat16", fastllm::DataType::BFLOAT16},
+    {"bf16", fastllm::DataType::BFLOAT16},
+    {"fp8_e4m3", fastllm::DataType::FP8_E4M3},
     {"int8", fastllm::DataType::INT8},
     {"int4", fastllm::DataType::INT4_NOZERO},
     {"int4z", fastllm::DataType::INT4},
@@ -164,6 +167,8 @@ struct APIConfig {
     int batch = 256; // batch数限制
     fastllm::DataType dtype = fastllm::DataType::FLOAT16;
     fastllm::DataType atype = fastllm::DataType::FLOAT32;
+    fastllm::DataType kvCacheType = fastllm::DataType::DATA_AUTO_NONE;
+    fastllm::DataType moeType = fastllm::DataType::DATA_AUTO_NONE;
     int groupCnt = -1;
 
     std::map <std::string, int> devices;
@@ -236,6 +241,7 @@ struct HttpRequest {
                         return false;
                     }
                 }
+                return true;
             } else {
                 std::string key;
                 ToNext(buffer, ":", key);
@@ -320,7 +326,16 @@ struct WorkQueue {
 
     void Deal(WorkNode *node) {
         auto *req = &node->request;
-        if ((req->route == "/generate" || req->route == "/generate/") && req->method == "POST") {
+        if ((req->route == "/health" || req->route == "/health/") && req->method == "GET") {
+            std::string body = "{\"status\":\"ok\",\"model\":\"" + ::config.modelName + "\"}\n";
+            std::string message = "HTTP/1.1 200 OK\r\n";
+            message += "Content-Type: application/json\r\n";
+            message += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+            message += "Connection: close\r\n\r\n";
+            message += body;
+            write(node->client, message.c_str(), message.length());
+            close(node->client);
+        } else if ((req->route == "/generate" || req->route == "/generate/") && req->method == "POST") {
             std::string message = "";
             message += "HTTP/1.1 200 OK\r\n";
             message += "Content-Type:application/json\r\n";
@@ -619,7 +634,9 @@ void Usage() {
     std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
     std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
     std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
-    std::cout << "<--atype> <args>:             设置推理使用的数据类型(float32/float16)" << std::endl;
+    std::cout << "<--atype> <args>:             设置推理使用的数据类型(float32/float16/bfloat16)" << std::endl;
+    std::cout << "<--moe_atype> <args>:         设置MoE层使用的数据类型(float32/float16/bfloat16)" << std::endl;
+    std::cout << "<--kv_cache_dtype> <args>:    设置KV Cache类型(bfloat16/float16/fp8_e4m3)" << std::endl;
     std::cout << "<--batch> <args>:             最大batch数" << std::endl;
     std::cout << "<--tokens> <args>:            最大tokens容量" << std::endl;
     std::cout << "<--model_name> <args>:        模型名(openai api中使用)" << std::endl;
@@ -665,6 +682,20 @@ void ParseArgs(int argc, char **argv, APIConfig &config) {
             fastllm::AssertInFastLLM(dataTypeDict.find(atypeStr) != dataTypeDict.end(),
                                     "Unsupport act type: " + atypeStr);
             config.atype = dataTypeDict[atypeStr];
+        } else if (sargv[i] == "--moe_atype") {
+            std::string typeStr = sargv[++i];
+            if (typeStr != "auto") {
+                fastllm::AssertInFastLLM(dataTypeDict.find(typeStr) != dataTypeDict.end(),
+                                        "Unsupport moe act type: " + typeStr);
+                config.moeType = dataTypeDict[typeStr];
+            }
+        } else if (sargv[i] == "--kv_cache_dtype") {
+            std::string typeStr = sargv[++i];
+            if (typeStr != "auto") {
+                fastllm::AssertInFastLLM(dataTypeDict.find(typeStr) != dataTypeDict.end(),
+                                        "Unsupport kv cache type: " + typeStr);
+                config.kvCacheType = dataTypeDict[typeStr];
+            }
         } else if (sargv[i] == "--model_name") {
             config.modelName = sargv[++i];
         } else if (sargv[i] == "--device") {
@@ -697,7 +728,17 @@ int main(int argc, char** argv) {
     workQueue.model = isHFDir ? fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt)
         : fastllm::CreateLLMModelFromFile(config.path);
     workQueue.model->tokensLimit = config.tokens;
+    workQueue.model->maxBatch = config.batch;
     workQueue.model->SetDataType(config.atype);
+    if (config.moeType != fastllm::DataType::DATA_AUTO_NONE) {
+        workQueue.model->SetMoeAtype(config.moeType);
+    }
+    if (config.kvCacheType != fastllm::DataType::DATA_AUTO_NONE) {
+        workQueue.model->SetKVCacheDataType(config.kvCacheType);
+    }
+    if (fastllm::GetFastllmEnv().cudaGraph) {
+        workQueue.model->AutoWarmup();
+    }
     workQueue.maxActivateQueryNumber = std::max(1, std::min(256, config.batch));
     workQueue.Start();
 
@@ -734,12 +775,21 @@ int main(int argc, char** argv) {
         }
 
         int size = 0;
+        bool clientClosed = false;
         while (true) {
             int cur = read(client, buff + size, sizeof(buff) - size);
+            if (cur <= 0) {
+                close(client);
+                clientClosed = true;
+                break;
+            }
             size += cur;
             if (httpChecker.IsValid(buff, size)) {
                 break;
             }
+        }
+        if (clientClosed) {
+            continue;
         }
         buff[size] = 0;
 
