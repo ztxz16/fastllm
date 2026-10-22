@@ -1908,10 +1908,14 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
     // A small block of decode rows gives each rank only a few KiB of the
     // reduce-scatter shard. More, smaller CTAs overlap peer-read latency while
     // retaining every start/publish barrier and the rank-ordered FP32 sum.
-    // Ordinary collectives and larger blocks keep their established geometry.
+    // Row-wise collectives keep their existing compact geometry.
     const bool compactRows = rowElements > 0 && count > rowElements &&
         count / rowElements <= 8 && policyBytes <= kCustomArAutoSmallBytes;
-    const int threads = useTwoStage && compactRows ? 64 : kCustomArThreads;
+    // A two-stage shard of at most 32 KiB otherwise occupies only one or
+    // two 512-thread CTAs. Smaller CTAs overlap peer traffic on more SMs.
+    const bool smallShard = state.devices.size() == 8 && bytes <= 256 * 1024;
+    const int threads = !useTwoStage ? kCustomArThreads : compactRows ? 64 :
+        smallShard ? 128 : kCustomArThreads;
     const bool fusedCopyBack =
         data == dest && !useTwoStage &&
         bytes <= (size_t)kCustomArMaxBlocks * kCustomArThreads * 16 &&
