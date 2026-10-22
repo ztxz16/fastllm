@@ -1,5 +1,6 @@
 #include "gguf.h"
 #include <assert.h>
+#include <array>
 
 #ifdef __aarch64__
 
@@ -7242,6 +7243,25 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 #endif
 }
 
+#if defined(__AVX2__)
+// Expand two 3-bit index suffixes per lookup. A full 12-bit table would
+// occupy 32 KiB beside the 16 KiB codebook; this table needs only 256 bytes.
+static constexpr auto iq1s_index_high = [] {
+    std::array<uint32_t, 64> table{};
+    for (uint32_t i = 0; i < table.size(); ++i)
+        table[i] = ((i & 7) << 8) | (((i >> 3) & 7) << 24);
+    return table;
+}();
+static inline __m256i iq1s_values_avx2(const uint8_t *qs, uint16_t qh) {
+    uint32_t low;
+    memcpy(&low, qs, sizeof(low));
+    const uint64_t indices = (uint64_t)_mm_cvtsi128_si64(_mm_cvtepu8_epi16(_mm_cvtsi32_si128(low))) |
+        iq1s_index_high[qh & 63] | ((uint64_t)iq1s_index_high[(qh >> 6) & 63] << 32);
+    return _mm256_set_epi64x(iq1s_grid[uint16_t(indices >> 48)], iq1s_grid[uint16_t(indices >> 32)],
+                            iq1s_grid[uint16_t(indices >> 16)], iq1s_grid[uint16_t(indices)]);
+}
+#endif
+
 void ggml_vec_dot_iq1_s_q8_K  (int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -7311,12 +7331,21 @@ void ggml_vec_dot_iq1_s_q8_K  (int n, float * restrict s, size_t bs, const void 
         const uint16_t * qh = x[i].qh;
 
         __m256i sumi = _mm256_setzero_si256();
-        int sumi1 = 0;
+        // Apply each signed 4-bit scale to its two Q8 block sums with one
+        // packed 16-bit multiply-add. Products and the final sum fit int32;
+        // retain the floating-point accumulation order below.
+        const __m128i metadata = _mm_loadu_si128((const __m128i *)qh);
+        const __m128i scales = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(metadata, 11),
+            _mm_set1_epi16(14)), _mm_set1_epi16(1));
+        const __m128i signs = _mm_or_si128(_mm_srai_epi16(metadata, 15), _mm_set1_epi16(1));
+        const __m128i signedScales = _mm_sign_epi16(scales, signs);
+        const __m256i duplicated = _mm256_set_m128i(_mm_unpackhi_epi16(signedScales, signedScales),
+                                                   _mm_unpacklo_epi16(signedScales, signedScales));
+        const int sumi1 = hsum_i32_8(_mm256_madd_epi16(
+            _mm256_loadu_si256((const __m256i *)y[i].bsums), duplicated));
         for (int ib = 0; ib < QK_K/32; ib += 2) {
-            const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[qs[3] | ((qh[ib+0] >> 1) & 0x700)], iq1s_grid[qs[2] | ((qh[ib+0] << 2) & 0x700)],
-                                                    iq1s_grid[qs[1] | ((qh[ib+0] << 5) & 0x700)], iq1s_grid[qs[0] | ((qh[ib+0] << 8) & 0x700)]);
-            const __m256i q1b_2 = _mm256_set_epi64x(iq1s_grid[qs[7] | ((qh[ib+1] >> 1) & 0x700)], iq1s_grid[qs[6] | ((qh[ib+1] << 2) & 0x700)],
-                                                    iq1s_grid[qs[5] | ((qh[ib+1] << 5) & 0x700)], iq1s_grid[qs[4] | ((qh[ib+1] << 8) & 0x700)]);
+            const __m256i q1b_1 = iq1s_values_avx2(qs, qh[ib]);
+            const __m256i q1b_2 = iq1s_values_avx2(qs + 4, qh[ib + 1]);
             qs += 8;
             const __m256i q8b_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
             const __m256i q8b_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
@@ -7329,8 +7358,6 @@ void ggml_vec_dot_iq1_s_q8_K  (int n, float * restrict s, size_t bs, const void 
             const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16(ls2));
 
             sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p1, p2));
-            sumi1 += (y[i].bsums[2*ib+0] + y[i].bsums[2*ib+1]) * (qh[ib+0] & 0x8000 ? -1 : 1) * ls1
-                   + (y[i].bsums[2*ib+2] + y[i].bsums[2*ib+3]) * (qh[ib+1] & 0x8000 ? -1 : 1) * ls2;
         }
 
         const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
