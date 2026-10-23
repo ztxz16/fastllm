@@ -797,7 +797,7 @@ def _workspace_bytes(args, model, rows, context, mode, resident):
     # layers are CUDA-resident. The resident GGUF route buffers survive those
     # releases and are charged separately below.
     resident_gguf = resident and all(layer in model.gguf_expert_bytes for layer in range(resident))
-    reusable = (phase and args.moe_device in ("disk", "numa") and (resident == 0 or resident_gguf) and mode == "pp" and
+    reusable = (phase and (args.moe_device in ("disk", "numa") or getattr(args, "_host_moe_shared", False)) and (resident == 0 or resident_gguf) and mode == "pp" and
                 args.max_batch == 1 and rows > phase["window"] and args.fast_prefill and
                 args.dtype == "auto" and args.moe_dtype in ("", "auto") and
                 args.atype in ("auto", "bfloat16") and args.moe_atype in ("", "auto", "bfloat16") and
@@ -917,8 +917,10 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             # the decode cache; generic top-k activation accounting omits them.
             record = max((size for layer, size in model.gguf_expert_bytes.items()
                           if expert_layer(layer, model) >= resident), default=0)
+            shared_host = args.moe_device == "numa" or (
+                args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False))
             transport = (96 * (math.ceil(record / 256) * 256) + 272 * MiB
-                         if model.family == "deepseek_v41" and args.moe_device == "numa" and record else 0)
+                         if model.family == "deepseek_v41" and shared_host and record else 0)
             used = {d: common + workspace + transport + guard for d in mapping}
             reallocation = dict.fromkeys(mapping, 0)
             logical_kv = dict.fromkeys(mapping, 0)
@@ -1016,7 +1018,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             if args.moe_device != "disk":
                 host_required += host_experts
                 pinned = os.environ.get("FT_PINNED_WEIGHT", "1").lower() not in ("0", "false", "off")
-                if snapshot or not pinned or (cuda_cache > 0 and args.moe_device == "cpu"):
+                if snapshot or not pinned or (cuda_cache > 0 and args.moe_device == "cpu" and not getattr(args, "_host_moe_shared", False)):
                     host_required += host_experts
             if streaming:
                 # Full pinned KV replaces the normal request mirror. Retain
@@ -1098,7 +1100,8 @@ def prepare(args, metadata, tensors, model, mode, mapping, *, costs=None):
     for name in ("moe_cuda_cache", "moe_cpu_cache"):
         if getattr(planning_args, name) != "auto":
             setattr(planning_args, name, _memory_size_bytes(getattr(planning_args, name)))
-    if model.family in ("glm5", "deepseek_v41") and args.moe_device == "cpu" and args.moe_cuda_cache == "auto":
+    if (model.family in ("glm5", "deepseek_v41") and args.moe_device == "cpu" and
+            args.moe_cuda_cache == "auto" and not getattr(args, "_host_moe_shared", False)):
         raise ValueError("Hybrid auto: this model's CUDA expert cache requires --moe_device numa or disk")
     if model.family == "deepseek_v41" and mode == "tp" and len(mapping) > 1:
         config = metadata.get("text_config", metadata)

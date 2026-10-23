@@ -430,6 +430,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     gpu = {d: query_gpu(d) for d in info}
     ram = ram if ram is not None else memory.host_memory()
     numa = env.use_numas if use_numa is None else use_numa
+    base._host_moe_shared = numa
     if model.family == "qwen35":
         return _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model,
                                      info, gpu, ram, numa)
@@ -457,7 +458,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
             for table in tables:
                 trial = copy.copy(base)
                 trial.moe_device, trial.ngram_device = backend, table
-                if backend == "cpu" and model.family != "qwen4" and trial.moe_cuda_cache == "auto":
+                if backend == "cpu" and model.family != "qwen4" and not base._host_moe_shared and trial.moe_cuda_cache == "auto":
                     trial.moe_cuda_cache = 0
                 memory.validate_options(trial)
                 cached_costs = None

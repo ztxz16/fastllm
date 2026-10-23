@@ -29,13 +29,13 @@ class AutoConfigTest(unittest.TestCase):
         self.hardware = info, {(a, b): True for a in info for b in info}
         self.ram = {'total': 32 * GiB, 'available': 32 * GiB}
 
-    def resolve(self, a):
+    def resolve(self, a, *, use_numa=True):
         with patch.object(memory, 'model_inputs', return_value=({}, [], self.g)), \
                 patch.object(memory, 'geometry', return_value=self.g), \
                 patch.object(memory, 'weight_costs', return_value=self.costs), \
                 patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
             return auto.resolve(a, self.gpu.__getitem__, hardware=self.hardware,
-                                ram=self.ram, use_numa=True)
+                                ram=self.ram, use_numa=use_numa)
 
     def args(self, *options):
         return make_normal_parser('test').parse_args(['model.gguf', '--auto', *options])
@@ -417,6 +417,27 @@ class AutoConfigTest(unittest.TestCase):
         self.assertEqual(fixed['device'], 'cudapp=0,1,2')
         self.assertEqual(fixed['moe_device'], 'disk')
 
+    def test_v41_shared_cpu_and_numa_have_identical_capacity_plans(self):
+        self.g.family = 'deepseek_v41'
+        self.g.experts = 128
+        self.g.gguf_expert_bytes = {i: 2 * GiB // 128 for i in range(4)}
+        self.costs = ([2 * GiB] * 4, [1 << 20] * 4, 1 << 20, 1 << 20, 2 * GiB, False)
+        self.gpu = {d: dict(total=6 * GiB, free=6 * GiB) for d in (0, 1)}
+        self.ram = dict(total=int(12.5 * GiB), available=int(12.5 * GiB))
+        plans = [self.resolve(self.args('--max_context_length', '4096', '--moe_device', backend))
+                 for backend in ('cpu', 'numa')]
+        for p in plans:
+            self.assertGreater(p['moe_cuda_cache'], 0)
+            self.assertEqual(p['expert_transport_bytes_per_device'], 96 * (2 * GiB // 128) + 272 * (1 << 20))
+            self.assertLessEqual(p['host_estimated_bytes'], p['host_budget_bytes'])
+        for key in ('device', 'mode', 'resident_layers', 'chunked_prefill_size',
+                    'moe_cuda_cache', 'host_estimated_bytes', 'gpu_estimated_bytes'):
+            self.assertEqual(plans[0][key], plans[1][key], key)
+        legacy = self.resolve(self.args('--max_context_length', '4096'), use_numa=False)
+        self.assertEqual(legacy['moe_device'], 'cpu')
+        self.assertEqual(legacy['moe_cuda_cache'], 0)
+        self.assertEqual(legacy['expert_transport_bytes_per_device'], 0)
+
     def test_v41_capacity_fallback_does_not_change_other_families(self):
         for family in ('qwen3', 'qwen4', 'glm5'):
             with self.subTest(family=family):
@@ -435,6 +456,22 @@ class AutoConfigTest(unittest.TestCase):
                 self.assertEqual(p['moe_device'], 'disk')
                 self.assertNotIn('cuda_slab', p)
                 weighted.assert_not_called()
+
+    def test_shared_cpu_models_use_the_numa_cache_capacity_policy(self):
+        for family in ('qwen4', 'glm5'):
+            with self.subTest(family=family):
+                self.g.family, self.g.experts = family, 128
+                self.costs = ([8 * GiB] * 4, [1 << 20] * 4, 1 << 20, 1 << 20, 8 * GiB, False)
+                self.ram = dict(total=128 * GiB, available=128 * GiB)
+                plans = [self.resolve(self.args('--moe_device', backend))
+                         for backend in ('cpu', 'numa')]
+                self.assertGreater(plans[0]['moe_cuda_cache'], 0)
+                for key in ('mode', 'resident_layers', 'chunked_prefill_size',
+                            'moe_cuda_cache', 'host_estimated_bytes', 'gpu_estimated_bytes'):
+                    self.assertEqual(plans[0][key], plans[1][key], key)
+                legacy = self.resolve(self.args('--moe_device', 'cpu'), use_numa=False)
+                if family == 'glm5':
+                    self.assertEqual(legacy['moe_cuda_cache'], 0)
 
     def test_capacity_pp_ratios_are_unique_after_normalization(self):
         layouts = [('cudapp=0,1', 'off', 'pp', {0: 1, 1: 1})]
