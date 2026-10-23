@@ -4689,17 +4689,27 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                     constexpr bool multi = decltype(multiToken)::value;
                     V41Sm75QuantizedAttentionGather<multi><<<dim3(count, 1, seqlen), 128, 0, cudaStreamPerThread>>>(params, rows, valid);
                     if (!V41CheckLaunch("Sm75QuantizedAttentionGather")) return false;
-                    V41Sm75QuantizedAttentionScores<multi><<<dim3((count + 3) / 4, (heads + 3) / 4, seqlen), 128, 0, cudaStreamPerThread>>>(
-                        static_cast<const __nv_bfloat16 *>(q.cudaData), rows, valid, count, heads, scores);
+                    const bool reuseHeads = seqlen >= 4 && heads >= 32 && count >= 128;
+                    if (reuseHeads)
+                        V41Sm75QuantizedAttentionScores<multi, 2><<<dim3((count + 7) / 8, (heads + 3) / 4, seqlen), 128, 0, cudaStreamPerThread>>>(
+                            static_cast<const __nv_bfloat16 *>(q.cudaData), rows, valid, count, heads, scores);
+                    else
+                        V41Sm75QuantizedAttentionScores<multi><<<dim3((count + 3) / 4, (heads + 3) / 4, seqlen), 128, 0, cudaStreamPerThread>>>(
+                            static_cast<const __nv_bfloat16 *>(q.cudaData), rows, valid, count, heads, scores);
                     if (!V41CheckLaunch("Sm75QuantizedAttentionScores")) return false;
                     if (reuseCoefficients) {
                         V41Sm75QuantizedAttentionCoefficients<<<dim3(heads, seqlen), 32, 0, cudaStreamPerThread>>>(
                             valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads,
                             softmaxScale, coefficients, inverseSums);
                         if (!V41CheckLaunch("Sm75QuantizedAttentionCoefficients")) return false;
-                        V41Sm75QuantizedAttentionValues<multi, true><<<dim3(heads, 8, seqlen), 64, 0, cudaStreamPerThread>>>(
-                            rows, valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads, softmaxScale,
-                            static_cast<__nv_bfloat16 *>(output.cudaData), coefficients, inverseSums);
+                        if (reuseHeads)
+                            V41Sm75QuantizedAttentionValues<multi, true, 4><<<dim3((heads + 3) / 4, 8, seqlen), 64, 0, cudaStreamPerThread>>>(
+                                rows, valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads, softmaxScale,
+                                static_cast<__nv_bfloat16 *>(output.cudaData), coefficients, inverseSums);
+                        else
+                            V41Sm75QuantizedAttentionValues<multi, true><<<dim3(heads, 8, seqlen), 64, 0, cudaStreamPerThread>>>(
+                                rows, valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads, softmaxScale,
+                                static_cast<__nv_bfloat16 *>(output.cudaData), coefficients, inverseSums);
                     } else {
                         V41Sm75QuantizedAttentionValues<multi><<<dim3(heads, 8, seqlen), 64, 0, cudaStreamPerThread>>>(
                             rows, valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads, softmaxScale,

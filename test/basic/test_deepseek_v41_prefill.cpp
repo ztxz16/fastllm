@@ -110,7 +110,10 @@ static std::vector<float> Decode(const Data &x, int storage = 0) {
 }
 static void Attention(int device, bool quick) {
     struct Shape { int rows, heads, start, top; };
-    for (auto shape : {Shape{128, 32, 0, 0}, Shape{129, 64, 31, 33},
+    for (auto shape : {Shape{1, 64, 2048, 512}, Shape{2, 32, 126, 33},
+                       Shape{4, 33, 126, 33}, Shape{6, 64, 1, 512},
+                       Shape{6, 64, 2048, 512}, Shape{8, 32, 2048, 0},
+                       Shape{128, 32, 0, 0}, Shape{129, 64, 31, 33},
                        Shape{128, 64, 2048, 512}, Shape{2048, 64, 0, 512}}) {
         if (quick && shape.rows >= 1024) continue;
         constexpr int window = 128, cap = 1024;
