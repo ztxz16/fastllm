@@ -11,7 +11,8 @@ inline void FastllmCudaHybridCheck(cudaError_t status) {
 // False means the caller must recompute the complete output with its fallback.
 bool FastllmCudaHybridBf16Gemm(const __nv_bfloat16 *input,
         const __nv_bfloat16 *weight, __nv_bfloat16 *output,
-        int rows, int columns, int width, int outputStride, void *handle);
+        int rows, int columns, int width, int outputStride, void *handle,
+        int inputStride = 0);
 bool FastllmCudaSm75PrefillAttention(const fastllm::Data &query,
         const fastllm::Data &latent, const fastllm::Data &indices,
         float scale, fastllm::Data &output, const fastllm::Data *sink = nullptr);

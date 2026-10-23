@@ -6159,6 +6159,23 @@ bool DeepSeekV4LaunchWoAGemm(const fastllm::Data &o, const fastllm::Data &woA,
     float alpha = 1.0f, beta = 0.0f;
     auto handle = getFastllmCublasHandle();
 
+    if (o.dataType == fastllm::DataType::BFLOAT16 && woA.dataType == fastllm::DataType::BFLOAT16) {
+        bool complete = true;
+        for (int group = 0; group < groups; ++group) {
+            if (!FastllmCudaHybridBf16Gemm(
+                    static_cast<const __nv_bfloat16 *>(o.cudaData) + group * groupDim,
+                    static_cast<const __nv_bfloat16 *>(woA.cudaData) + size_t(group) * oRank * groupDim,
+                    static_cast<__nv_bfloat16 *>(output.cudaData) + group * oRank,
+                    tokens, groupDim, oRank, groups * oRank, handle, fullDim)) {
+                complete = false;
+                break;
+            }
+        }
+        if (complete) return true;
+        // A range/admission failure may follow successful groups. The normal
+        // batched GEMM below overwrites every group, including those outputs.
+    }
+
     if (o.dataType == fastllm::DataType::BFLOAT16 && woA.dataType == fastllm::DataType::FLOAT16) {
         half *halfO = (half *)FastllmCudaMalloc(o.Count(0) * sizeof(half));
         half *halfOut = (half *)FastllmCudaMalloc(output.Count(0) * sizeof(half));

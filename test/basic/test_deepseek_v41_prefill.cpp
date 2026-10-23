@@ -219,6 +219,108 @@ static void AttentionFallback(int device) {
     std::printf("ATTENTION FALLBACK PASS gpu=%d late-query range, graph and in-place output\n", device);
 }
 
+static void CompareBf16(const Data &reference, const Data &actual, const char *name) {
+    const auto a = Decode(reference), b = Decode(actual);
+    Check(a.size() == b.size(), "GEMM output shape");
+    double error = 0, norm = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        Check(std::isfinite(b[i]), "nonfinite GEMM output");
+        error += std::pow(double(a[i]) - b[i], 2); norm += double(a[i]) * a[i];
+    }
+    double relative = std::sqrt(error / std::max(norm, 1e-30));
+    std::printf("%s relative_rmse=%.8g\n", name, relative);
+    Check(relative < .001, "GEMM relative RMS difference");
+}
+
+static void Bf16Projection(int device, bool quick) {
+    // Grouped wo_a needs a strided activation view and output. Check both
+    // padding regions and FP64 sums independently of the cuBLAS reference.
+    constexpr int rows = 1024, columns = 136, inputStride = 152, width = 128, outputStride = 144;
+    Data x(BFLOAT16, {rows, inputStride}), w(BFLOAT16, {width, columns}), y(BFLOAT16, {rows, outputStride});
+    Fill(x, device, 91); Fill(w, device, 93); Fill(y, device, 95);
+    auto xv = Decode(x), wv = Decode(w);
+    auto sentinel = Read<uint16_t>(y);
+    auto handle = getFastllmCublasHandle();
+    auto run = [&]() {
+        return FastllmCudaHybridBf16Gemm(static_cast<const __nv_bfloat16 *>(x.cudaData),
+            static_cast<const __nv_bfloat16 *>(w.cudaData), static_cast<__nv_bfloat16 *>(y.cudaData),
+            rows, columns, width, outputStride, handle, inputStride);
+    };
+    Check(!run(), "BF16 GEMM default scope fallback");
+    {
+        FastllmCudaHybridPrefillScope scope(true);
+        Check(run(), "strided BF16 GEMM");
+        const auto got = Decode(y); const auto bits = Read<uint16_t>(y);
+        for (int row = 0; row < rows; ++row) {
+            for (int col = 0; col < width; ++col) {
+                double sum = 0, magnitude = 0;
+                for (int k = 0; k < columns; ++k) {
+                    const double product = double(xv[size_t(row) * inputStride + k]) * wv[size_t(col) * columns + k];
+                    sum += product; magnitude += std::abs(product);
+                }
+                // Include the FP32 dot-product bound: near cancellation, a
+                // relative BF16-only tolerance does not bound accumulation.
+                const double gamma = columns * std::numeric_limits<float>::epsilon();
+                const double bound = gamma / (1 - gamma) * magnitude + std::abs(sum) * .0041 + 1e-7;
+                if (std::abs(got[size_t(row) * outputStride + col] - sum) > bound) {
+                    std::fprintf(stderr, "GEMM FP64 mismatch row=%d col=%d actual=%.12g reference=%.12g\n", row, col, got[size_t(row) * outputStride + col], sum);
+                    throw std::runtime_error("strided BF16 GEMM FP64 rounding bound");
+                }
+            }
+            for (int col = width; col < outputStride; ++col)
+                Check(bits[size_t(row) * outputStride + col] == sentinel[size_t(row) * outputStride + col], "GEMM padding overwrite");
+        }
+        uint16_t tiny = Bf(1e-30f);
+        Check(cudaMemcpy(x.cudaData, &tiny, 2, cudaMemcpyHostToDevice) == cudaSuccess, "range test upload");
+        const auto before = Read<uint16_t>(y);
+        Check(!run(), "strided BF16 GEMM unsafe range fallback");
+        Check(Read<uint16_t>(y) == before, "rejected first chunk changed output");
+        std::vector<uint16_t> extreme(inputStride, Bf(std::ldexp(1.f, 40)));
+        extreme[0] = Bf(std::ldexp(1.f, -130));
+        Check(cudaMemcpy(x.cudaData, extreme.data(), extreme.size() * 2, cudaMemcpyHostToDevice) == cudaSuccess, "FP32 underflow test upload");
+        Check(!run(), "BF16 downscale must not silently underflow in FP32");
+        Check(Read<uint16_t>(y) == before, "underflow fallback changed output");
+    }
+
+    const int tokens = quick ? 1024 : 2048;
+    const int groupDim = quick ? 128 : 4096, rank = quick ? 128 : 1024, groups = 8;
+    Data input(BFLOAT16, {1, tokens, groups, groupDim}), weight(BFLOAT16, {groups * rank, groupDim});
+    Data old, next;
+    Fill(input, device, 97); Fill(weight, device, 101);
+    auto woa = [&](Data &output, bool enabled) {
+        FastllmCudaHybridPrefillScope scope(enabled);
+        Check(FastllmCudaDeepSeekV4WoA(input, weight, groups, rank, output, false), "wo_a projection");
+    };
+    woa(old, false); woa(next, true); CompareBf16(old, next, "WO_A");
+    // Fail admission after several groups have already written their output.
+    // The caller must overwrite those partial outputs with the full fallback.
+    uint16_t tiny = Bf(1e-30f);
+    Check(cudaMemcpy(static_cast<uint16_t *>(input.cudaData) + 6 * groupDim, &tiny, 2, cudaMemcpyHostToDevice) == cudaSuccess, "late group upload");
+    woa(old, false); woa(next, true);
+    Check(Read<uint16_t>(old) == Read<uint16_t>(next), "late group fallback did not overwrite all groups");
+    std::printf("WO_A PASS gpu=%d rows=%d group_dim=%d rank=%d\n", device, tokens, groupDim, rank);
+
+    // Exercise the public FP8 weight path, including BF16 expansion and bias.
+    constexpr int fp8Rows = 1024, fp8Columns = 1280, fp8Width = 4096;
+    Data fp8(FP8_E4M3, {fp8Width, fp8Columns}), activation(BFLOAT16, {fp8Rows, fp8Columns});
+    Data bias(FLOAT32, {fp8Width}), expected(BFLOAT16, {fp8Rows, fp8Width}), actual(BFLOAT16, {fp8Rows, fp8Width});
+    fp8.blockK = 32; fp8.blockM = 32;
+    fp8.scales.resize(size_t(fp8Width / 32) * (fp8Columns / 32));
+    for (size_t i = 0; i < fp8.scales.size(); ++i) fp8.scales[i] = std::ldexp(1.f, int(i % 5) - 8);
+    fp8.Allocate();
+    std::mt19937 random(103);
+    for (size_t i = 0; i < fp8.Count(0); ++i) fp8.cpuData[i] = uint8_t(random() % 96) | uint8_t((random() % 2) << 7);
+    fp8.ToDevice(CUDA, {device}, true);
+    Fill(activation, device, 107); Fill(bias, device, 109); Fill(expected, device, 113); Fill(actual, device, 127);
+    auto linear = [&](Data &output, bool enabled) {
+        FastllmCudaHybridPrefillScope scope(enabled);
+        Check(FastllmCudaBFloat16MatMulFP8E4M3(activation, fp8, bias, output, fp8Rows, fp8Columns, fp8Width), "FP8 prefill linear");
+    };
+    linear(expected, false); linear(actual, true); CompareBf16(expected, actual, "FP8_LINEAR");
+    std::printf("FP8_LINEAR PASS gpu=%d\n", device);
+    std::fflush(stdout);
+}
+
 int main(int argc, char **argv) {
     try {
         bool tested = false, quick = false;
@@ -233,6 +335,7 @@ int main(int argc, char **argv) {
             Indexer(device, quick);
             Attention(device, quick);
             AttentionFallback(device);
+            Bf16Projection(device, quick);
         }
         if (!tested) return 77;
         std::puts("DeepSeek V4.1 prefill PASS"); return 0;

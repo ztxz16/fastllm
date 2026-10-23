@@ -12,6 +12,7 @@
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/cuda/fastllm-cuda-hybrid-prefill.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -395,6 +396,10 @@ namespace fastllm {
                                                        const LastTokensManager &lastTokens,
                                                        std::vector<std::vector<float>*> *retLogits,
                                                        std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues) {
+#ifdef USE_CUDA
+        FastllmCudaHybridPrefillScope prefillMath(inputSegments.size() == 1 &&
+            inputSegments[0].seqlen >= 1024 && !V41ReferenceMathEnabled());
+#endif
         ForwardState frame(*this, inputSegments, inputIds, inputEmbeds, imageMask, generationConfigsIn,
             lastTokens, retLogits, samplingPastKeyValues);
         frame.BeginHybridStep();

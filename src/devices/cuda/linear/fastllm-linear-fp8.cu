@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include "fastllm-native-lowbit-prefill.cuh"
 #include "devices/cuda/fastllm-cuda-native-prefill.h"
+#include "../fastllm-hybrid-prefill.cuh"
 
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
@@ -2806,7 +2807,6 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
 
         float h_alpha = 1.0f, h_beta = 0.0f;
         cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
-        cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 
         for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
             int kc = std::min(maxRowsPerChunk, k - kOff);
@@ -2830,7 +2830,9 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
                 FastllmCudaCacheBFloat16FP8Weight(weight, cudaBF16Weight,
                     (size_t)k * m * sizeof(__nv_bfloat16));
 
-            status = cublasGemmEx(fastllmCublasHandle,
+            if (!FastllmCudaHybridBf16Gemm(cudaInput, cudaBF16Weight, cudaOutput + kOff,
+                    n, m, kc, k, fastllmCublasHandle)) {
+                const cublasStatus_t status = cublasGemmEx(fastllmCublasHandle,
                                     CUBLAS_OP_T, CUBLAS_OP_N,
                                     kc, n, m,
                                     &h_alpha, cudaBF16Weight, AType,
@@ -2838,11 +2840,10 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
                                     m, &h_beta,
                                     cudaOutput + kOff, CType,
                                     k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
-
-            if (status != CUBLAS_STATUS_SUCCESS) {
-                printf("Error: cublas error (BFloat16MatMulFP8E4M3).\n");
-                throw("cublas error");
-                exit(0);
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    printf("Error: cublas error (BFloat16MatMulFP8E4M3).\n");
+                    throw("cublas error");
+                }
             }
         }
 
