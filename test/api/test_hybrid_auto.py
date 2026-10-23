@@ -2,7 +2,7 @@
 import copy
 import io
 import types
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import json
 import os
 from pathlib import Path
@@ -1060,6 +1060,30 @@ class HybridAutoTest(unittest.TestCase):
         # Model calls SelectDeviceFromMap(layer + 1, block_cnt), using <=.
         self.assertEqual([auto.layer_device(i, 4, {0: 1, 1: 1}) for i in range(4)], [0, 0, 1, 1])
         self.assertEqual(auto.devices(args(device="cudapp=0,1")), ("pp", {0: 1, 1: 1}))
+
+
+
+class HostToleranceTest(unittest.TestCase):
+    def test_tolerance_default_and_clamp(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(auto.host_tolerance(), auto.DEFAULT_HOST_TOLERANCE)
+        for raw, expected in [("1.0", 1.0), ("1.05", 1.05), ("0.5", 1.0),
+                              ("2.0", 1.10), ("bad", auto.DEFAULT_HOST_TOLERANCE)]:
+            with patch.dict(os.environ, {"FASTLLM_AUTO_HOST_TOLERANCE": raw}, clear=True):
+                self.assertAlmostEqual(auto.host_tolerance(), expected)
+
+    def test_warning_only_when_over_budget(self):
+        buf = io.StringIO()
+        plan = {"host_budget_bytes": 100, "host_estimated_bytes": 103}
+        with redirect_stderr(buf):
+            returned = auto.warn_if_tolerance_used(plan)
+        self.assertIs(returned, plan)
+        self.assertIn("主机预算超", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            auto.warn_if_tolerance_used(
+                {"host_budget_bytes": 100, "host_estimated_bytes": 100})
+        self.assertEqual(buf.getvalue(), "")
 
 
 if __name__ == "__main__":

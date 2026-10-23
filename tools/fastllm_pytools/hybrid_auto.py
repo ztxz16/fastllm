@@ -14,12 +14,45 @@ import os
 from pathlib import Path
 import re
 import struct
+import sys
 
 from . import gguf_metadata as gguf
 
 GiB = 1 << 30
 MiB = 1 << 20
 AUTO_OPTIONS = ("moe_cuda_cache", "moe_cpu_cache", "chunked_prefill_size", "moe_device_layers")
+
+DEFAULT_HOST_TOLERANCE = 1.03
+MIN_HOST_TOLERANCE = 1.0
+MAX_HOST_TOLERANCE = 1.10
+
+
+def host_tolerance():
+    """主机预算弹性：默认 1.03（本机标定），环境变量可覆盖并夹在 [1.0, 1.10]。
+
+    未标定机器建议设为 1.0，让规划器严格按 host_limit 拒绝边界计划；调大只会
+    放宽、不会自动适配机器，属于显式冒险。
+    """
+    raw = os.environ.get("FASTLLM_AUTO_HOST_TOLERANCE")
+    value = DEFAULT_HOST_TOLERANCE
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = DEFAULT_HOST_TOLERANCE
+    return min(MAX_HOST_TOLERANCE, max(MIN_HOST_TOLERANCE, value))
+
+
+def warn_if_tolerance_used(plan):
+    """计划超过名义 host_budget 时提示：这是弹性接受的、未标定机器应关掉。"""
+    budget = plan.get("host_budget_bytes", 0)
+    estimated = plan.get("host_estimated_bytes", 0)
+    if budget and estimated > budget:
+        print("[auto-warn] 主机预算超 %.1f GiB（弹性 %.0f%%）；"
+              "未标定机器建议 FASTLLM_AUTO_HOST_TOLERANCE=1.0 或显式 --moe_device_layers"
+              % ((estimated - budget) / 2**30, (estimated / budget - 1.0) * 100.0),
+              file=sys.stderr, flush=True)
+    return plan
 
 
 def requested(args):
@@ -1059,7 +1092,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                 # 小机器上不会出现“总量-8GiB < 0”而全盘拒绝。
                 hard_headroom = 8 * GiB if ram["total"] >= 64 * GiB else max(
                     GiB, ram["total"] // 8)
-                host_effective_limit = min(int(host_limit * 1.03),
+                host_effective_limit = min(int(host_limit * host_tolerance()),
                                            int(ram["total"] - hard_headroom))
             if host_required + cpu_cache > host_effective_limit:
                 print("[auto-reject] moe=%s resident=%s host_required=%.1fGiB "
@@ -1098,9 +1131,9 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             if selected_score is None or score > selected_score:
                 selected, selected_score = candidate, score
         if selected is not None and rank is None:
-            return selected
+            return warn_if_tolerance_used(selected)
     if selected is not None:
-        return selected
+        return warn_if_tolerance_used(selected)
     raise ValueError("Hybrid auto: requested context, batch, explicit caches and weights do not fit the measured memory budget; "
                      "reduce an explicit cache/resident allocation, use disk experts, or choose smaller context/chunk explicitly")
 
