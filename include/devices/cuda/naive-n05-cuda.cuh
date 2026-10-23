@@ -152,6 +152,21 @@ bool FastllmCudaNaiveIndexerKeyNorm(fastllm::Data &input,
 // Q uses blockwise E4M3 quantization when requested. K uses the main KV
 // storage type by default, or its independent scaled E4M3 tail when marked.
 // peerKeys requires enabled peer access and a producer dependency on this stream.
+// Two balanced TP query ranges share quantization, scoring and exact TopK.
+// Output is [front, back] for one rank. Unsupported layouts return false untouched.
+bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::Data &weights,
+    const fastllm::Data &keys, int past, int rank, int ranks,
+    bool fp8Query, bool peerKeys, fastllm::Data &indices);
+// All items use the same rank/layout, but query and context lengths may differ.
+// At most eight requests and 512 MiB of scores; rejection leaves outputs untouched.
+struct FastllmNaivePrefillIndexerItem {
+    const fastllm::Data *query, *weights, *keys;
+    fastllm::Data *indices;
+    int past;
+};
+bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
+    int rank, int ranks, bool fp8Query, bool peerKeys);
+
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             const fastllm::Data &weights,
                             const fastllm::Data &packedKeys,

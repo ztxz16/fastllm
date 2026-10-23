@@ -932,6 +932,31 @@ Data NaiveN05FlashModel::RunTarget(
                                     tpDevices[IndexerOwnerRank(layer)], gpu);
             batchIndexerPrepared = true;
         }
+        // Prepare each request's independent KV and Indexer Q first, then score
+        // all requests together. Attention remains in its original request order.
+        const int prefillRanks = tensorParallel ? (int)tpDevices.size() : 1;
+        bool batchPrefillIndex = batch && batch->Size() > 1 && batch->Size() <= 8 &&
+            !decodeWorkspace && !verifying && sparseLayer && tpEp8MegaState &&
+            indexerLayerSharding && tpIndexerPeerAccess && indexFp8 && indexHeads == 16 &&
+            indexDim == 128 && indexTopK == 2048 &&
+            (prefillRanks == 2 || prefillRanks == 4 || prefillRanks == 8) &&
+            FastllmCudaRuntimeArch() == 90;
+        size_t prefillScoreBytes = 0;
+        if (batchPrefillIndex) for (int sequence = 0; sequence < batch->Size(); ++sequence) {
+            const auto &cache = *batch->Key(sequence, layer).multiDeviceDatas.at(gpu);
+            const int count = batch->lengths[sequence];
+            const int keys = (cache.dims.empty() ? 0 : cache.dims[1]) + count;
+            if (count <= 0 || count % (prefillRanks * 128) || keys < 8192 ||
+                (int64_t)(count / (2 * prefillRanks)) * keys < 1024 * 1024) {
+                batchPrefillIndex = false;
+                break;
+            }
+            prefillScoreBytes += (size_t)(count / prefillRanks) * keys * sizeof(float);
+            if (prefillScoreBytes > (size_t(512) << 20)) { batchPrefillIndex = false; break; }
+        }
+        int attendPhase = 0;
+        std::vector<FastllmNaivePrefillIndexerItem> prefillItems;
+        std::vector<std::unique_ptr<Data>> prefillViews;
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &cacheKey, Data &cacheValue,
                           TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, int sequence = 0) {
@@ -942,187 +967,211 @@ Data NaiveN05FlashModel::RunTarget(
             Data &pastValue = sharedSwa ? tpSwaPrefillWorkspaces[tpRank].second : cacheValue;
             pastKey.kvCacheFp8Indexer = !sparseLayer && fp8IndexerCache && localIndexer;
             int localPast = cacheKey.dims.empty() ? 0 : cacheKey.dims[1];
+            if (attendPhase == 2) localPast -= length;
             const bool ringCache = tensorParallel && slidingLayers[layer] && tpSwaRingCache;
-            if (sharedSwa) {
-                pastKey.Resize({1, localPast, cfg.kvHeads * cfg.headDim});
-                pastValue.Resize({1, localPast, cfg.kvHeads * cfg.valueDim});
-                CopySwaWindow(cacheKey, cacheValue, pastKey, pastValue,
-                    ringCache ? (globalPast - localPast) % window : 0, 0, localPast);
-            }
-            // Graph replay reads/writes the ring directly. Eager prefill/fallback
-            // uses the existing contiguous kernels and restores the ring once.
-            // Verify was linearized outside capture by ForwardTensorParallel.
-            if (ringCache && !decodeWorkspace && !verifying && !sharedSwa)
-                FastllmCudaNaiveSwaCacheLayout(pastKey, pastValue, globalPast, false);
             const bool ringDecode = ringCache && decodeWorkspace && !graphVerify;
-            // Sliding layers retain only window-1 rows between chunks. Keep their
-            // reservation bounded even when the full request is very long.
-            const int layerCapacity = slidingLayers[layer]
-                ? (int)std::min<int64_t>(reserveCapacity, (int64_t)window - 1 + length)
-                : reserveCapacity;
-            Data separateIndex = sparseLayer && localIndexer ? SparseIndexer(layer, tpRank, cacheKey) : Data();
-            Data &scoringKey = sparseLayer ? separateIndex : pastKey;
-            if (!batchRopePrepared) prepareIndexKey(normed, buf);
-            if (sparseLayer && localIndexer && !batchRopePrepared) {
-                FastllmCudaNaiveRope(indexKey, positions, 1, indexDim, rotaryDim, cfg.theta);
-                Data *input = &indexKey;
-                if (fp8IndexerCache) {
-                    FastllmCudaNaivePackIndexer(indexKey, buf.packedIndexer);
-                    input = &buf.packedIndexer;
-                }
-                if (decodeWorkspace)
-                    FastllmCudaNaivePagedWrite(separateIndex, *input, 0, &buf.liveKeys);
-                else AppendCache(separateIndex, *input, kvCacheDataType, 0);
-            }
-            Data noIndexKey, noLiveKeys;
-            bool fusedCache = batchRopePrepared || ((decodeWorkspace || (!tensorParallel && length <= 8 && localPast > 0)) &&
-                FastllmCudaNaiveRopeAppendCache(q, k, v, localIndexer && !sparseLayer ? indexKey : noIndexKey,
-                    positions, pastKey, pastValue, decodeWorkspace ? buf.liveKeys : noLiveKeys, cfg.heads, cfg.kvHeads,
-                    cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale,
-                    slidingLayers[layer] ? window : 0, mergedQkv ? &qkv : nullptr, ringDecode));
-            if (fusedCache && !decodeWorkspace) {
-                pastKey.Resize({1, localPast + length, pastKey.dims[2]});
-                pastValue.Resize({1, localPast + length, pastValue.dims[2]});
-                if (pastKey.isPagedKVCache) {
-                    pastKey.lastPageLen = (localPast + length - 1) % pastKey.pageLen + 1;
-                    pastValue.lastPageLen = pastKey.lastPageLen;
-                }
-            }
-            if (!fusedCache) {
-                FastllmCudaNaiveRopeQKScaleV(q, k, v, positions, cfg.heads, cfg.kvHeads,
-                    cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale, mergedQkv ? &qkv : nullptr);
-                if (localIndexer && !sparseLayer) {
-                    FastllmCudaNaiveRope(indexKey, positions, 1, indexDim, rotaryDim, cfg.theta);
-                    Cat(k, indexKey, 2, packed);
-                } else {
-                    packed.CopyFrom(k);
-                }
-                Data *cacheInput = &packed;
-                if (pastKey.kvCacheFp8Indexer) {
-                    FastllmCudaNaivePackIndexer(packed, buf.packedIndexer);
-                    cacheInput = &buf.packedIndexer;
-                }
-                if (decodeWorkspace) {
-                    if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, *cacheInput, v,
-                        buf.liveKeys, slidingLayers[layer] ? window : 0);
-                    else FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, *cacheInput, v,
-                        buf.liveKeys, slidingLayers[layer] ? window : 0, ringDecode);
-                } else {
-                    AppendCache(pastKey, *cacheInput, kvCacheDataType, layerCapacity);
-                    AppendCache(pastValue, v, kvCacheDataType, layerCapacity);
-                }
-            }
             Data noIndices;
-            Data *selected = &noIndices;
-            int balancedIndexRanks = 0;
-            if (!slidingLayers[layer] && (decodeWorkspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
-                const int ranks = tensorParallel ? (int)tpDevices.size() : 1;
-                const bool parallelIndex = !decodeWorkspace && !verifying && tpEp8MegaState && ranks > 1 &&
-                    (!indexerLayerSharding || tpIndexerPeerAccess) && length % (ranks * 64) == 0 &&
-                    (int64_t)(length / (2 * ranks)) * pastKey.dims[1] >= 1024 * 1024;
-                if ((localIndexer || parallelIndex) && !batchIndexerPrepared) {
-                    Data rowIndexQ, rowIndexWeights;
-                    Data &indexQ = batchIndexPrepared ? rowIndexQ : buf.indexQ;
-                    Data &indexWeights = batchIndexPrepared ? rowIndexWeights : buf.indexWeights;
-                    if (batchIndexPrepared) {
-                        indexQ.Resize({1, 1, indexHeads * indexDim});
-                        indexQ.FakeFrom(batchIndexQ, (size_t)sequence * indexHeads * indexDim * batchIndexQ.unitSize);
-                        indexWeights.Resize({1, 1, indexHeads});
-                        indexWeights.FakeFrom(batchIndexWeights, (size_t)sequence * indexHeads * batchIndexWeights.unitSize);
-                    } else if (localIndexer) prepareIndexQuery(normed, positions, indexQ, indexWeights);
-                    const Data *scoreKey = &scoringKey;
-                    Data peerIndex;
-                    if (parallelIndex && indexerLayerSharding) {
-                        // Keep the only Indexer KV copy on its owning GPU. Peers
-                        // read its pages and score disjoint query tiles; only Q,
-                        // head weights and final indices cross collectives.
-                        if (!localIndexer) {
-                            for (auto item : {std::make_pair(&indexQ, indexHeads * indexDim),
-                                              std::make_pair(&indexWeights, indexHeads)}) {
-                                auto &data = *item.first;
-                                data.dataType = BFLOAT16;
-                                data.Resize({1, length, item.second});
-                                data.ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
-                                data.Allocate(false);
-                            }
-                        }
-                        const int owner = tpDevices[IndexerOwnerRank(layer)];
-                        FastllmNcclBroadcast(indexQ.cudaData, indexQ.Count(0), BFLOAT16, owner, gpu);
-                        FastllmNcclBroadcast(indexWeights.cudaData, indexWeights.Count(0), BFLOAT16, owner, gpu);
-                        // Broadcast also orders the owner's preceding KV append
-                        // before peer reads. The cache stays live through gather.
-                        const Data &root = batch ? batch->Key(sequence, layer) : pastKeyValues[layer].first;
-                        scoreKey = root.multiDeviceDatas.at(owner);
-                        if (sparseLayer) {
-                            peerIndex = SparseIndexer(layer, IndexerOwnerRank(layer), *scoreKey);
-                            // The owner appended on its stream before broadcast;
-                            // use this query's length rather than stale root metadata.
-                            peerIndex.dims[1] = localPast + length;
-                            scoreKey = &peerIndex;
-                        }
+            Data *selected = attendPhase == 2 ? &indices : &noIndices;
+            int balancedIndexRanks = attendPhase == 2 ? prefillRanks : 0;
+            if (attendPhase != 2) {
+                if (sharedSwa) {
+                    pastKey.Resize({1, localPast, cfg.kvHeads * cfg.headDim});
+                    pastValue.Resize({1, localPast, cfg.kvHeads * cfg.valueDim});
+                    CopySwaWindow(cacheKey, cacheValue, pastKey, pastValue,
+                        ringCache ? (globalPast - localPast) % window : 0, 0, localPast);
+                }
+                // Graph replay reads/writes the ring directly. Eager prefill/fallback
+                // uses the existing contiguous kernels and restores the ring once.
+                // Verify was linearized outside capture by ForwardTensorParallel.
+                if (ringCache && !decodeWorkspace && !verifying && !sharedSwa)
+                    FastllmCudaNaiveSwaCacheLayout(pastKey, pastValue, globalPast, false);
+                // Sliding layers retain only window-1 rows between chunks. Keep their
+                // reservation bounded even when the full request is very long.
+                const int layerCapacity = slidingLayers[layer]
+                    ? (int)std::min<int64_t>(reserveCapacity, (int64_t)window - 1 + length)
+                    : reserveCapacity;
+                Data separateIndex = sparseLayer && localIndexer ? SparseIndexer(layer, tpRank, cacheKey) : Data();
+                Data &scoringKey = sparseLayer ? separateIndex : pastKey;
+                if (!batchRopePrepared) prepareIndexKey(normed, buf);
+                if (sparseLayer && localIndexer && !batchRopePrepared) {
+                    FastllmCudaNaiveRope(indexKey, positions, 1, indexDim, rotaryDim, cfg.theta);
+                    Data *input = &indexKey;
+                    if (fp8IndexerCache) {
+                        FastllmCudaNaivePackIndexer(indexKey, buf.packedIndexer);
+                        input = &buf.packedIndexer;
+                    }
+                    if (decodeWorkspace)
+                        FastllmCudaNaivePagedWrite(separateIndex, *input, 0, &buf.liveKeys);
+                    else AppendCache(separateIndex, *input, kvCacheDataType, 0);
+                }
+                Data noIndexKey, noLiveKeys;
+                bool fusedCache = batchRopePrepared || ((decodeWorkspace || (!tensorParallel && length <= 8 && localPast > 0)) &&
+                    FastllmCudaNaiveRopeAppendCache(q, k, v, localIndexer && !sparseLayer ? indexKey : noIndexKey,
+                        positions, pastKey, pastValue, decodeWorkspace ? buf.liveKeys : noLiveKeys, cfg.heads, cfg.kvHeads,
+                        cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale,
+                        slidingLayers[layer] ? window : 0, mergedQkv ? &qkv : nullptr, ringDecode));
+                if (fusedCache && !decodeWorkspace) {
+                    pastKey.Resize({1, localPast + length, pastKey.dims[2]});
+                    pastValue.Resize({1, localPast + length, pastValue.dims[2]});
+                    if (pastKey.isPagedKVCache) {
+                        pastKey.lastPageLen = (localPast + length - 1) % pastKey.pageLen + 1;
+                        pastValue.lastPageLen = pastKey.lastPageLen;
+                    }
+                }
+                if (!fusedCache) {
+                    FastllmCudaNaiveRopeQKScaleV(q, k, v, positions, cfg.heads, cfg.kvHeads,
+                        cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale, mergedQkv ? &qkv : nullptr);
+                    if (localIndexer && !sparseLayer) {
+                        FastllmCudaNaiveRope(indexKey, positions, 1, indexDim, rotaryDim, cfg.theta);
+                        Cat(k, indexKey, 2, packed);
+                    } else {
+                        packed.CopyFrom(k);
+                    }
+                    Data *cacheInput = &packed;
+                    if (pastKey.kvCacheFp8Indexer) {
+                        FastllmCudaNaivePackIndexer(packed, buf.packedIndexer);
+                        cacheInput = &buf.packedIndexer;
                     }
                     if (decodeWorkspace) {
-                        if (graphVerify) FastllmCudaNaiveGraphVerifyIndexer(indexQ, indexWeights, scoringKey,
-                            buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
-                        else FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights, scoringKey,
-                            buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices,
-                            indexTable(sequence));
+                        if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, *cacheInput, v,
+                            buf.liveKeys, slidingLayers[layer] ? window : 0);
+                        else FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, *cacheInput, v,
+                            buf.liveKeys, slidingLayers[layer] ? window : 0, ringDecode);
                     } else {
-                        if (capture && capture->verifying && length <= 8)
-                            FastllmCudaNaiveVerifyIndexer(indexQ, indexWeights, scoringKey, indexHeads,
-                                indexDim, localPast, indexTopK, indexFp8, indices);
-                        else if (parallelIndex) {
-                            // Score disjoint query tiles and gather only indices.
-                            // Pair an early and a late range to balance causal
-                            // work while preserving 64-row tiles and the MMA
-                            // dispatch threshold, so score arithmetic is unchanged.
-                            const int rows = length / ranks;
-                            const bool balanced = length % (ranks * 128) == 0 &&
-                                (ranks == 2 || ranks == 4 || ranks == 8) &&
-                                (int64_t)(rows / 2) * pastKey.dims[1] >= 1024 * 1024;
-                            const int parts = balanced ? 2 : 1, partRows = rows / parts;
+                        AppendCache(pastKey, *cacheInput, kvCacheDataType, layerCapacity);
+                        AppendCache(pastValue, v, kvCacheDataType, layerCapacity);
+                    }
+                }
+                if (!slidingLayers[layer] && (decodeWorkspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
+                    const int ranks = tensorParallel ? (int)tpDevices.size() : 1;
+                    const bool parallelIndex = !decodeWorkspace && !verifying && tpEp8MegaState && ranks > 1 &&
+                        (!indexerLayerSharding || tpIndexerPeerAccess) && length % (ranks * 64) == 0 &&
+                        (int64_t)(length / (2 * ranks)) * pastKey.dims[1] >= 1024 * 1024;
+                    if ((localIndexer || parallelIndex) && !batchIndexerPrepared) {
+                        Data rowIndexQ, rowIndexWeights;
+                        Data &indexQ = batchIndexPrepared ? rowIndexQ : buf.indexQ;
+                        Data &indexWeights = batchIndexPrepared ? rowIndexWeights : buf.indexWeights;
+                        if (batchIndexPrepared) {
+                            indexQ.Resize({1, 1, indexHeads * indexDim});
+                            indexQ.FakeFrom(batchIndexQ, (size_t)sequence * indexHeads * indexDim * batchIndexQ.unitSize);
+                            indexWeights.Resize({1, 1, indexHeads});
+                            indexWeights.FakeFrom(batchIndexWeights, (size_t)sequence * indexHeads * batchIndexWeights.unitSize);
+                        } else if (localIndexer) prepareIndexQuery(normed, positions, indexQ, indexWeights);
+                        const Data *scoreKey = &scoringKey;
+                        Data peerIndex;
+                        if (parallelIndex && indexerLayerSharding) {
+                            // Keep the only Indexer KV copy on its owning GPU. Peers
+                            // read its pages and score disjoint query tiles; only Q,
+                            // head weights and final indices cross collectives.
+                            if (!localIndexer) {
+                                for (auto item : {std::make_pair(&indexQ, indexHeads * indexDim),
+                                                  std::make_pair(&indexWeights, indexHeads)}) {
+                                    auto &data = *item.first;
+                                    data.dataType = BFLOAT16;
+                                    data.Resize({1, length, item.second});
+                                    data.ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
+                                    data.Allocate(false);
+                                }
+                            }
+                            const int owner = tpDevices[IndexerOwnerRank(layer)];
+                            FastllmNcclBroadcast(indexQ.cudaData, indexQ.Count(0), BFLOAT16, owner, gpu);
+                            FastllmNcclBroadcast(indexWeights.cudaData, indexWeights.Count(0), BFLOAT16, owner, gpu);
+                            // Broadcast also orders the owner's preceding KV append
+                            // before peer reads. The cache stays live through gather.
+                            const Data &root = batch ? batch->Key(sequence, layer) : pastKeyValues[layer].first;
+                            scoreKey = root.multiDeviceDatas.at(owner);
+                            if (sparseLayer) {
+                                peerIndex = SparseIndexer(layer, IndexerOwnerRank(layer), *scoreKey);
+                                // The owner appended on its stream before broadcast;
+                                // use this query's length rather than stale root metadata.
+                                peerIndex.dims[1] = localPast + length;
+                                scoreKey = &peerIndex;
+                            }
+                        }
+                        if (decodeWorkspace) {
+                            if (graphVerify) FastllmCudaNaiveGraphVerifyIndexer(indexQ, indexWeights, scoringKey,
+                                buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
+                            else FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights, scoringKey,
+                                buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices,
+                                indexTable(sequence));
+                        } else {
+                            if (capture && capture->verifying && length <= 8)
+                                FastllmCudaNaiveVerifyIndexer(indexQ, indexWeights, scoringKey, indexHeads,
+                                    indexDim, localPast, indexTopK, indexFp8, indices);
+                            else if (parallelIndex) {
+                                // Score disjoint query tiles and gather only indices.
+                                // Pair an early and a late range to balance causal
+                                // work while preserving 64-row tiles and the MMA
+                                // dispatch threshold, so score arithmetic is unchanged.
+                                const int rows = length / ranks;
+                                const bool balanced = length % (ranks * 128) == 0 &&
+                                    (ranks == 2 || ranks == 4 || ranks == 8) &&
+                                    (int64_t)(rows / 2) * pastKey.dims[1] >= 1024 * 1024;
+                                const int parts = balanced ? 2 : 1, partRows = rows / parts;
+                                indices.dataType = INT32;
+                                indices.Resize({length, indexTopK});
+                                indices.ToDevice(indexQ.dataDevice, indexQ.dataDeviceIds, false);
+                                indices.Allocate(false);
+                                if (attendPhase == 1) {
+                                    // SparseIndexer returns backend-approved non-owning views.
+                                    // Keep their metadata alive through the batched launch/gathers.
+                                    auto keyView = std::make_unique<Data>(scoreKey->dataType, scoreKey->dims);
+                                    keyView->FakeFrom(*scoreKey, 0);
+                                    keyView->isPagedKVCache = scoreKey->isPagedKVCache;
+                                    keyView->pageLen = scoreKey->pageLen;
+                                    keyView->pagedKVCacheData = scoreKey->pagedKVCacheData;
+                                    auto outputView = std::make_unique<Data>(INT32, std::vector<int>{rows, indexTopK});
+                                    outputView->FakeFrom(indices, (size_t)tpRank * rows * indexTopK * sizeof(int));
+                                    prefillItems.push_back({&indexQ, &indexWeights, keyView.get(), outputView.get(), localPast});
+                                    prefillViews.push_back(std::move(keyView));
+                                    prefillViews.push_back(std::move(outputView));
+                                    return;
+                                }
+                                Data rankIndices;
+                                rankIndices.Resize({rows, indexTopK});
+                                rankIndices.FakeFrom(indices, (size_t)tpRank * rows * indexTopK * sizeof(int));
+                                const bool mergedParts = balanced && indexTopK == 2048 &&
+                                    FastllmCudaNaiveBalancedIndexer(indexQ, indexWeights, *scoreKey,
+                                        localPast, tpRank, ranks, indexFp8, indexerLayerSharding, rankIndices);
+                                for (int part = 0; !mergedParts && part < parts; ++part) {
+                                    const int first = part == 0 ? tpRank * partRows :
+                                        length - (tpRank + 1) * partRows;
+                                    Data localQ, localWeights, localIndices;
+                                    localQ.Resize({1, partRows, indexHeads * indexDim});
+                                    localQ.FakeFrom(indexQ, (size_t)first * indexHeads * indexDim * indexQ.unitSize);
+                                    localWeights.Resize({1, partRows, indexHeads});
+                                    localWeights.FakeFrom(indexWeights, (size_t)first * indexHeads * indexWeights.unitSize);
+                                    localIndices.Resize({partRows, indexTopK});
+                                    localIndices.FakeFrom(indices,
+                                        (size_t)(tpRank * rows + part * partRows) * indexTopK * sizeof(int));
+                                    FastllmCudaNaiveIndexer(localQ, localWeights, *scoreKey, indexHeads, indexDim,
+                                        localPast + first, indexTopK, indexFp8, localIndices, indexerLayerSharding);
+                                }
+                                FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, indices);
+                                if (balanced) balancedIndexRanks = ranks;
+                            }
+                            else FastllmCudaNaiveIndexer(indexQ, indexWeights, scoringKey, indexHeads, indexDim,
+                                                        localPast, indexTopK, indexFp8, indices);
+                        }
+                    }
+                    if (indexerLayerSharding && !broadcastBatchIndex && !parallelIndex) {
+                        if (!localIndexer) {
                             indices.dataType = INT32;
                             indices.Resize({length, indexTopK});
-                            indices.ToDevice(indexQ.dataDevice, indexQ.dataDeviceIds, false);
+                            indices.ToDevice(q.dataDevice, q.dataDeviceIds, false);
                             indices.Allocate(false);
-                            for (int part = 0; part < parts; ++part) {
-                                const int first = part == 0 ? tpRank * partRows :
-                                    length - (tpRank + 1) * partRows;
-                                Data localQ, localWeights, localIndices;
-                                localQ.Resize({1, partRows, indexHeads * indexDim});
-                                localQ.FakeFrom(indexQ, (size_t)first * indexHeads * indexDim * indexQ.unitSize);
-                                localWeights.Resize({1, partRows, indexHeads});
-                                localWeights.FakeFrom(indexWeights, (size_t)first * indexHeads * indexWeights.unitSize);
-                                localIndices.Resize({partRows, indexTopK});
-                                localIndices.FakeFrom(indices,
-                                    (size_t)(tpRank * rows + part * partRows) * indexTopK * sizeof(int));
-                                FastllmCudaNaiveIndexer(localQ, localWeights, *scoreKey, indexHeads, indexDim,
-                                    localPast + first, indexTopK, indexFp8, localIndices, indexerLayerSharding);
-                            }
-                            FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, indices);
-                            if (balanced) balancedIndexRanks = ranks;
                         }
-                        else FastllmCudaNaiveIndexer(indexQ, indexWeights, scoringKey, indexHeads, indexDim,
-                                                    localPast, indexTopK, indexFp8, indices);
+                        // Integer broadcast preserves the owning rank's exact TopK.
+                        // Every rank calls this in the same layer/request order,
+                        // including inactive padded rows in a captured graph.
+                        FastllmNcclBroadcast(indices.cudaData, indices.Count(0), INT32,
+                                            tpDevices[IndexerOwnerRank(layer)], gpu);
+                        // The broadcast meets all ranks at host submission, and
+                        // attention consumes its indices on the same stream.
+                        // No per-request GPU completion barrier is needed here.
                     }
+                    selected = &indices;
                 }
-                if (indexerLayerSharding && !broadcastBatchIndex && !parallelIndex) {
-                    if (!localIndexer) {
-                        indices.dataType = INT32;
-                        indices.Resize({length, indexTopK});
-                        indices.ToDevice(q.dataDevice, q.dataDeviceIds, false);
-                        indices.Allocate(false);
-                    }
-                    // Integer broadcast preserves the owning rank's exact TopK.
-                    // Every rank calls this in the same layer/request order,
-                    // including inactive padded rows in a captured graph.
-                    FastllmNcclBroadcast(indices.cudaData, indices.Count(0), INT32,
-                                        tpDevices[IndexerOwnerRank(layer)], gpu);
-                    // The broadcast meets all ranks at host submission, and
-                    // attention consumes its indices on the same stream.
-                    // No per-request GPU completion barrier is needed here.
-                }
-                selected = &indices;
             }
             Data stagedKey, stagedValue;
             if (sparseLayer && !batchedDSA) StageSparseKv(tpRank, layer, pastKey, pastValue, stagedKey, stagedValue);
@@ -1203,34 +1252,59 @@ Data NaiveN05FlashModel::RunTarget(
             attn.Resize({1, length, cfg.heads * cfg.valueDim});
             attn.ToDevice(q.dataDevice, q.dataDeviceIds, false);
             attn.Allocate(false);
-            int offset = 0;
-            for (int sequence = 0; sequence < batch->Size(); ++sequence) {
-                const int count = batch->lengths[sequence];
-                auto view = [&](Data &dst, Data &src, int width) {
-                    dst.Resize({1, count, width});
-                    dst.FakeFrom(src, (size_t)offset * width * src.unitSize);
-                };
-                Data rowNorm, rowQ, rowK, rowV, rowQkv, rowPositions, rowAttention;
-                view(rowNorm, normed, embed_dim);
-                view(rowQ, q, cfg.heads * cfg.headDim);
-                view(rowK, k, cfg.kvHeads * cfg.headDim);
-                view(rowV, v, cfg.kvHeads * cfg.valueDim);
-                if (mergedQkv && !batchRopePrepared) view(rowQkv, qkv, qkv.dims.back());
-                view(rowAttention, attn, cfg.heads * cfg.valueDim);
-                rowPositions.Resize({1, count});
-                rowPositions.FakeFrom(positions, (size_t)offset * sizeof(float));
-                auto &part = *buf.sequences[sequence];
-                if (decodeWorkspace) {
-                    part.liveKeys.Resize({1});
-                    part.liveKeys.FakeFrom(buf.liveKeys, sequence * sizeof(int));
+            for (int phase = 0; phase < (batchPrefillIndex ? 2 : 1); ++phase) {
+                attendPhase = batchPrefillIndex ? phase + 1 : 0;
+                int offset = 0;
+                for (int sequence = 0; sequence < batch->Size(); ++sequence) {
+                    const int count = batch->lengths[sequence];
+                    auto view = [&](Data &dst, Data &src, int width) {
+                        dst.Resize({1, count, width});
+                        dst.FakeFrom(src, (size_t)offset * width * src.unitSize);
+                    };
+                    Data rowNorm, rowQ, rowK, rowV, rowQkv, rowPositions, rowAttention;
+                    view(rowNorm, normed, embed_dim);
+                    view(rowQ, q, cfg.heads * cfg.headDim);
+                    view(rowK, k, cfg.kvHeads * cfg.headDim);
+                    view(rowV, v, cfg.kvHeads * cfg.valueDim);
+                    if (mergedQkv && !batchRopePrepared) view(rowQkv, qkv, qkv.dims.back());
+                    view(rowAttention, attn, cfg.heads * cfg.valueDim);
+                    rowPositions.Resize({1, count});
+                    rowPositions.FakeFrom(positions, (size_t)offset * sizeof(float));
+                    auto &part = *buf.sequences[sequence];
+                    if (decodeWorkspace) {
+                        part.liveKeys.Resize({1});
+                        part.liveKeys.FakeFrom(buf.liveKeys, sequence * sizeof(int));
+                    }
+                    attend(rowNorm, rowQ, rowK, rowV, rowQkv, rowPositions,
+                           *batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
+                           *batch->Value(sequence, layer).multiDeviceDatas.at(gpu), part, count,
+                           batch->Key(sequence, 0).dims.empty() ? 0 : batch->Key(sequence, 0).dims[1],
+                           CacheReserveCapacity(batch->configs[sequence]), rowAttention,
+                           sequence);
+                    offset += count;
                 }
-                attend(rowNorm, rowQ, rowK, rowV, rowQkv, rowPositions,
-                       *batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
-                       *batch->Value(sequence, layer).multiDeviceDatas.at(gpu), part, count,
-                       batch->Key(sequence, 0).dims.empty() ? 0 : batch->Key(sequence, 0).dims[1],
-                       CacheReserveCapacity(batch->configs[sequence]), rowAttention,
-                       sequence);
-                offset += count;
+                if (batchPrefillIndex && phase == 0) {
+                    AssertInFastLLM((int)prefillItems.size() == batch->Size(), "Incomplete prefill Indexer batch.");
+                    if (!FastllmCudaNaiveBatchBalancedIndexer(prefillItems, tpRank, prefillRanks, indexFp8, true)) {
+                        for (const auto &item : prefillItems) {
+                            if (FastllmCudaNaiveBalancedIndexer(*item.query, *item.weights, *item.keys,
+                                    item.past, tpRank, prefillRanks, indexFp8, true, *item.indices)) continue;
+                            const int part = item.query->dims[1] / (2 * prefillRanks);
+                            for (int range = 0; range < 2; ++range) {
+                                const int first = range ? item.query->dims[1] - (tpRank + 1) * part : tpRank * part;
+                                Data localQ(BFLOAT16, {1, part, indexHeads * indexDim});
+                                Data localWeights(BFLOAT16, {1, part, indexHeads}), localIndices(INT32, {part, indexTopK});
+                                localQ.FakeFrom(*item.query, (size_t)first * indexHeads * indexDim * item.query->unitSize);
+                                localWeights.FakeFrom(*item.weights, (size_t)first * indexHeads * item.weights->unitSize);
+                                localIndices.FakeFrom(*item.indices, (size_t)range * part * indexTopK * sizeof(int));
+                                FastllmCudaNaiveIndexer(localQ, localWeights, *item.keys, indexHeads, indexDim,
+                                    item.past + first, indexTopK, indexFp8, localIndices, true);
+                            }
+                        }
+                    }
+                    for (int sequence = 0; sequence < batch->Size(); ++sequence)
+                        FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, buf.sequences[sequence]->indices);
+                }
             }
         } else {
             auto &pastKey = tensorParallel ? *pastKeyValues[layer].first.multiDeviceDatas.at(gpu) : pastKeyValues[layer].first;
