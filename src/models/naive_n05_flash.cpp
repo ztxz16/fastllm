@@ -5,8 +5,10 @@
 #include "executor.h"
 #include "json11.hpp"
 #include "utils.h"
+#include "utils/inference_trace.h"
 #include <cmath>
 #include <climits>
+#include <cstdlib>
 #include "devices/cuda/naive-n05-cuda.cuh"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -17,6 +19,12 @@
 
 namespace fastllm {
 namespace {
+    int TraceContextBefore(const Data *positions) {
+        return positions && positions->dataDevice == DataDevice::CPU &&
+            positions->dataType == FLOAT32 && positions->cpuData && positions->Count(0) > 0
+            ? (int)((const float *)positions->cpuData)[0] : -1;
+    }
+
     float ConfigNumber(const WeightMap &weight, const std::string &key, float fallback) {
         auto it = weight.dicts.find(key);
         return it == weight.dicts.end() || it->second == "null"
@@ -413,14 +421,21 @@ int NaiveN05FlashModel::Forward(
         std::vector<std::pair<Data, Data>> &pastKeyValues,
         const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
         std::vector<float> *retLogits) {
+    std::unique_ptr<inference_trace::Forward> trace;
+    if (auto *step = inference_trace::CurrentStep())
+        trace.reset(new inference_trace::Forward(*step, {(int)inputIds.Count(0)},
+                                                {TraceContextBefore(&positionIds)}));
     if (draftEnabled)
         return ForwardDraft(inputIds, positionIds, pastKeyValues, generationConfig, lastTokens, retLogits);
     auto selection = SelectLogits(generationConfig);
+    if (trace) trace->Mark("input_prepare_ms");
     Data logits = tpDevices.size() > 1
         ? ForwardTensorParallel(inputIds, positionIds, pastKeyValues, generationConfig, nullptr, &selection)
         : RunTarget(inputIds, positionIds, pastKeyValues, generationConfig, nullptr);
     if (isIntermediateChunkedPrefill) return 0;
-    return SampleTarget(logits, pastKeyValues, generationConfig, lastTokens, retLogits, &selection);
+    int token = SampleTarget(logits, pastKeyValues, generationConfig, lastTokens, retLogits, &selection);
+    if (trace) trace->Mark("sample_return_ms");
+    return token;
 }
 
 std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputIds,
@@ -428,6 +443,12 @@ std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputId
         const std::vector<int> &seqLens, std::vector<std::pair<Data *, Data *>> &pastKeyValues,
         const std::vector<GenerationConfig> &configs, const LastTokensManager &lastTokens,
         std::vector<std::vector<float> *> *retLogits) {
+    std::unique_ptr<inference_trace::Forward> trace;
+    if (auto *step = inference_trace::CurrentStep()) {
+        std::vector<int> contexts;
+        for (auto *position : positionIds) contexts.push_back(TraceContextBefore(position));
+        trace.reset(new inference_trace::Forward(*step, seqLens, std::move(contexts)));
+    }
     AssertInFastLLM(!draftEnabled && tpDevices.size() > 1 && batch > 0 &&
         (int)seqLens.size() == batch && (int)configs.size() == batch &&
         (int)positionIds.size() == batch && (int)pastKeyValues.size() == batch * block_cnt,
@@ -470,6 +491,7 @@ std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputId
     // The batch descriptor references response-owned KV. No KV payload or
     // ownership is copied into the legacy single-sequence argument.
     std::vector<std::pair<Data, Data>> unused;
+    if (trace) trace->Mark("input_prepare_ms");
     Data logits = ForwardTensorParallel(inputIds, positions, unused, configs[0],
                                         nullptr, &selection, &requests);
     if (!selection.sampledTokens.empty()) return selection.sampledTokens;

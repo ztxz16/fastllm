@@ -5,6 +5,7 @@
 #include "basellm.h"
 #include "utils.h"
 #include "utils/cuda_cache_budget.h"
+#include "utils/inference_trace.h"
 #include <sstream>
 #include <cstring>
 #include <cstdlib>
@@ -2893,6 +2894,7 @@ namespace fastllm {
                     auto lastRecordTime = std::chrono::system_clock::now();
                     long long genTokens = 0;
                     const bool printProfile = GetFastllmEnv().printProfile;
+                    const bool traceInference = inference_trace::Enabled();
                     // Naive uses the base one-token position convention. Keep
                     // scalar views alive across steps; prefill and other models
                     // still go through their virtual input builder.
@@ -2908,6 +2910,8 @@ namespace fastllm {
                     const int prefillChunk = model->GetChunkedPrefillSize();
                     const int prefillBatchLimit = model->GetBatchedPrefillTokenLimit();
                     while (true) {
+                        std::unique_ptr<inference_trace::Step> trace;
+                        if (traceInference) trace.reset(new inference_trace::Step());
                         std::vector <Data*> attentionMasks;
                         std::vector <Data*> positionIds;
                         std::vector <Data*> ownedPositionIds;
@@ -2929,7 +2933,9 @@ namespace fastllm {
                         generationConfigs.reserve(maxBatch);
                         logits.reserve(maxBatch);
 
+                        if (trace) trace->Mark("allocation_ms");
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+                        if (trace) trace->Mark("dict_lock_ms");
                         if (model->isFree) break;
                         auto &forwardLocker = model->forwardLocker;
 
@@ -2947,6 +2953,7 @@ namespace fastllm {
 
                         for (auto &entry : model->responseContextDict.dicts)
                             if (entry.second->isEnding) model->OnResponseContextFinished(entry.second);
+                        if (trace) trace->Mark("retire_requests_ms");
 
                         int limit = maxTotalLens;
                         int promptLimit = model->promptLimit;
@@ -3068,6 +3075,7 @@ namespace fastllm {
                             });
                         } else sort(orders.begin(), orders.end());
 
+                        if (trace) trace->Mark("schedule_scan_ms");
                         std::set<int> plannedPrefills;
                         bool deferPrefill = false;
                         if (batchPrefill) {
@@ -3120,6 +3128,7 @@ namespace fastllm {
                             }
                         }
 
+                        if (trace) trace->Mark("prefix_restore_plan_ms");
                         for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
                             int cnt = 0;
                             if (isPrompt && deferPrefill) continue; // Keep decoding while collecting prompts.
@@ -3351,7 +3360,21 @@ namespace fastllm {
                                 }
                             }
                         }
+                        if (trace) trace->Mark("batch_input_build_ms");
                         if (seqLens.size() > 0) {
+                            if (trace) {
+                                trace->submitted = true;
+                                trace->phase = prefillTokens > 0 ? "prefill" : "decode";
+                                trace->handles = handles;
+                                trace->lengths = seqLens;
+                                for (size_t row = 0; row < handles.size(); ++row) {
+                                    const Data *position = positionIds[row];
+                                    trace->contextBefore.push_back(position && position->dataDevice == DataDevice::CPU &&
+                                        position->dataType == FLOAT32 && position->cpuData && position->Count(0) > 0
+                                        ? (int)((const float *)position->cpuData)[0] : -1);
+                                    trace->cachedPrefix.push_back(model->responseContextDict.dicts.at(handles[row])->cacheLen);
+                                }
+                            }
                             std::vector <std::pair <Data, Data> > *pastKeyValue1;
                             ResponseContext *singleContext = nullptr;
                             bool isSingleText = false;
@@ -3363,8 +3386,10 @@ namespace fastllm {
                                 pastKeyValue1 = &singleContext->pastKeyValues;
                                 isSingleText = singleContext->multimodalInput.empty();
                             }
+                            if (trace) trace->Mark("batch_finalize_ms");
                             dictLocker.unlock();
                             forwardLocker.lock();
+                            if (trace) trace->Mark("forward_lock_ms");
 #ifdef USE_CUDA
                             if (model->RetainCudaWorkspace()) {
                                 FastllmCudaTrimBigBuffer();
@@ -3374,12 +3399,14 @@ namespace fastllm {
 #endif
                             Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                             std::vector<int> ret;
+                            if (trace) trace->Mark("workspace_input_ms");
                             std::chrono::system_clock::time_point profileStartTime;
                             if (printProfile) {
                                 profileStartTime = std::chrono::system_clock::now();
                                 ClearProfiler();
                             }
                             auto prefillStartTime = std::chrono::steady_clock::now();
+                            if (trace) trace->Mark("pre_forward_ms");
 #ifdef USE_CUDA
                             try {
 #endif
@@ -3447,6 +3474,7 @@ namespace fastllm {
                                     }
                                 }
                             }
+                            if (trace) trace->Mark("forward_dispatch_ms");
                             if (model->verbose && prefillTokens > 0) {
                                 double spend = std::chrono::duration<double>(
                                     std::chrono::steady_clock::now() - prefillStartTime).count();
@@ -3457,8 +3485,10 @@ namespace fastllm {
                             if (printProfile) {
                                 PrintLoopProfile("old", seqLens, (int)ret.size(), profileStartTime);
                             }
+                            if (trace) trace->Mark("legacy_forward_log_ms");
 #ifdef USE_CUDA
                             } catch (const CudaWorkspaceExhausted &error) {
+                                if (trace) trace->failed = true;
                                 forwardLocker.unlock();
                                 if (!dictLocker.owns_lock()) dictLocker.lock();
                                 fprintf(stderr, "[Fastllm] %s\n", error.what());
@@ -3478,6 +3508,7 @@ namespace fastllm {
 #endif
                             forwardLocker.unlock();
                             dictLocker.lock();
+                            if (trace) trace->Mark("result_lock_ms");
 
                             if (model->verbose) {
                                 auto nowTime = std::chrono::system_clock::now();
@@ -3507,6 +3538,7 @@ namespace fastllm {
                                 }
                             }
 
+                            if (trace) trace->Mark("legacy_decode_log_ms");
                             for (int i = 0; i < handles.size(); i++) {
                                 auto &it = *model->responseContextDict.dicts.find(handles[i]);
                                 int curRet = ret[i];
@@ -3538,6 +3570,7 @@ namespace fastllm {
                             }
                             model->dictCV.notify_all();
                             ReleasePendingResultLogits(logits);
+                            if (trace) trace->Mark("postprocess_ms");
                         } else {
                             // Finished requests keep their pages until the
                             // caller drains their output and removes them.
@@ -3576,6 +3609,7 @@ namespace fastllm {
                             delete attentionMasks[i];
                         }
                         for (Data *position : ownedPositionIds) delete position;
+                        if (trace) trace->Mark("cleanup_ms");
 
                         if (seqLens.size() == 0) {
                             model->dictCV.wait(dictLocker);

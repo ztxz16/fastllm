@@ -4,6 +4,7 @@
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "executor.h"
 #include "utils.h"
+#include "utils/inference_trace.h"
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
@@ -25,6 +26,19 @@ bool FastllmCudaMergeMOEUsedGraphUnsafeFallback();
 
 namespace {
 #ifdef USE_CUDA
+// One reusable event set per rank worker. Created only for an enabled trace,
+// and never recorded while a CUDA Graph is being captured.
+struct InferenceTimingEvents {
+    void *begin = FastllmCudaEventCreateTiming();
+    void *modelEnd = FastllmCudaEventCreateTiming();
+    void *end = FastllmCudaEventCreateTiming();
+    ~InferenceTimingEvents() {
+        FastllmCudaEventDestroy(begin);
+        FastllmCudaEventDestroy(modelEnd);
+        FastllmCudaEventDestroy(end);
+    }
+};
+
 // KV descriptors belong to individual requests. Partition by request, rather
 // than device, so workers write disjoint objects and contiguous result ranges.
 // Keep small batches on the caller; their scan is cheaper than a worker handoff.
@@ -1217,7 +1231,9 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config, TargetCapture *capture,
         LogitsSelection *selection, const TargetBatch *batch) {
 #ifdef USE_CUDA
+    auto *trace = inference_trace::CurrentForward();
     PrepareTensorParallel();
+    if (trace) trace->ranks.resize(tpDevices.size());
     std::vector<std::pair<Data *, Data *>> singleKV;
     std::vector<GenerationConfig> singleConfigs;
     std::vector<int> singleLengths;
@@ -1362,9 +1378,11 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     }
     // CPU embedding uses the shared worker pool; compute it once on the
     // caller instead of concurrently entering that pool from every rank.
+    if (trace) trace->Mark("tp_kv_prepare_ms");
     Data embedding;
     if (!GetCudaEmbedding() || GetLowMemMode())
         Embedding(inputIds, weight["model.embed_tokens.weight"], embedding);
+    if (trace) trace->Mark("embedding_ms");
     const bool verify = capture && capture->verifying;
     if (verify && tpSwaRingCache) {
         runRanks([&](int rank) {
@@ -1429,13 +1447,25 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         cudaLogits.Allocate(false);
     }
 
-    auto forwardRanks = [&]() {
+    if (trace) trace->Mark("graph_setup_ms");
+    auto forwardRanks = [&](bool measured = false) {
         runRanks([&](int rank) {
+            InferenceTimingEvents *events = nullptr;
+            inference_trace::Clock::time_point rankStart;
+            if (measured && trace) {
+                FastllmCudaSetDevice(tpDevices[rank]);
+                static thread_local std::unique_ptr<InferenceTimingEvents> timing;
+                if (!timing) timing.reset(new InferenceTimingEvents());
+                events = timing.get();
+                rankStart = inference_trace::Clock::now();
+                FastllmCudaEventRecordCurrentThread(events->begin);
+            }
             Data local = ForwardSingleGPU(rank, inputIds, positions, kv, config,
                                           embedding.dims.empty() ? nullptr : &embedding,
                                           captures.empty() ? nullptr : &captures[rank],
                                           compact ? candidates.data() + (size_t)rank * rows * count * 2 : nullptr,
                                           compact || cudaSampling ? selection : nullptr, batch);
+            if (events) FastllmCudaEventRecordCurrentThread(events->modelEnd);
             if (cudaSampling && !local.dims.empty()) {
                 const auto range = tpVocabRanges[rank];
                 const size_t width = (range.second - range.first) * sizeof(float);
@@ -1447,8 +1477,22 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                 AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
                     (float *)cudaLogits.cudaData + range.first, (size_t)vocab * sizeof(float),
                     local.cudaData, width, width, rows), "Naive CUDA sampling: logits copy failed.");
+                if (events) FastllmCudaEventRecordCurrentThread(events->end);
                 FastllmCudaSyncCurrentThreadStream();
-            } else if (!compact && !cudaSampling) logits[rank].CopyFrom(local);
+            } else {
+                if (!compact && !cudaSampling) logits[rank].CopyFrom(local);
+                if (events) FastllmCudaEventRecordCurrentThread(events->end);
+            }
+            if (events) {
+                auto waitStart = inference_trace::Clock::now();
+                FastllmCudaEventSynchronize(events->end);
+                auto &result = trace->ranks[rank];
+                result.device = tpDevices[rank];
+                result.observerWaitMs = inference_trace::Milliseconds(waitStart, inference_trace::Clock::now());
+                result.modelGpuMs = FastllmCudaEventElapsedTime(events->begin, events->modelEnd);
+                result.gatherGpuMs = FastllmCudaEventElapsedTime(events->modelEnd, events->end);
+                result.wallMs = inference_trace::Milliseconds(rankStart, inference_trace::Clock::now());
+            }
         });
     };
     if (graphDecode && tpDecodeState->warmed && !tpDecodeState->captured &&
@@ -1561,7 +1605,12 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     }
     if (graphDecode)
         tpDecodeState->mode = tpDecodeState->captured ? TPDecodeState::Replay : TPDecodeState::Warm;
-    forwardRanks();
+    if (trace) {
+        trace->mode = graphDecode ? (tpDecodeState->captured ? "cuda_graph" : "graph_warmup") : "eager";
+        trace->Mark("graph_capture_reserve_ms");
+    }
+    forwardRanks(true);
+    if (trace) trace->Mark("tp_execute_ms");
     bool committedRootMetadata = false;
     if (graphDecode) {
         const size_t localSlots = (size_t)sequences * block_cnt * tpDevices.size() * 2;
@@ -1666,10 +1715,12 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         }
     });
     if (capture) capture->hidden = std::move(captures[0].hidden);
+    if (trace) trace->Mark("kv_commit_prefix_ms");
     if (isIntermediateChunkedPrefill) return Data();
     if (cudaSampling) {
         selection->sampledTokens = SampleCudaLogits(cudaLogits,
             batch ? batch->configs : std::vector<GenerationConfig>{config});
+        if (trace) trace->Mark("sampling_ms");
         return Data();
     }
     if (compact) {
