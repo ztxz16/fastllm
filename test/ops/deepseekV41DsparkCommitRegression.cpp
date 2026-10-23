@@ -42,6 +42,101 @@ std::vector<unsigned char> Read(Data &x, int d) {
     Cu(cudaMemcpy(v.data(), x.cudaData, v.size(), cudaMemcpyDeviceToHost));
     return v;
 }
+
+void TestBatchedWindows(Access &m, const std::vector<int> &dev) {
+    m.block_cnt = 40;
+    m.isKvSource.assign(40, 0);
+    m.compress_ratios.assign(40, 0);
+    int cases = 0;
+    for (auto type : {BFLOAT16, FLOAT16, FLOAT32})
+        for (int pos : {127, 8192})
+            for (int accept = 1; accept <= 8; ++accept) {
+                DeepSeekV41RequestState state;
+                state.layers.resize(40);
+                DeepSeekV41SpecScratch scratch;
+                scratch.windowKV.resize(40);
+                std::vector<std::vector<std::vector<unsigned char>>> rings(40), inputs(40);
+                std::vector<std::vector<void*>> addresses(40);
+                for (int layer = 0; layer < 40; ++layer) {
+                    auto &ring = state.layers[layer].windowKV;
+                    auto &input = scratch.windowKV[layer];
+                    auto r = Fill(ring, type, 128, dev, layer);
+                    auto x = Fill(input, type, 8, dev, layer + 71);
+                    for (int d : dev) {
+                        Cu(cudaSetDevice(d));
+                        rings[layer].push_back(r);
+                        inputs[layer].push_back(x);
+                        for (auto &v : rings[layer].back()) v = (v + 19*d) % 251;
+                        for (auto &v : inputs[layer].back()) v = (v + 31*d) % 251;
+                        Cu(cudaMemcpy(ring.multiDeviceDatas.at(d)->cudaData, rings[layer].back().data(),
+                                      r.size(), cudaMemcpyHostToDevice));
+                        Cu(cudaMemcpy(input.multiDeviceDatas.at(d)->cudaData, inputs[layer].back().data(),
+                                      x.size(), cudaMemcpyHostToDevice));
+                        addresses[layer].push_back(ring.multiDeviceDatas.at(d)->cudaData);
+                    }
+                }
+                m.DsparkCommitPrefix(state, scratch, pos, accept, 8);
+                for (int layer = 0; layer < 40; ++layer) {
+                    auto &ring = state.layers[layer].windowKV;
+                    const size_t rowBytes = 512 * ring.unitSize;
+                    Req(state.layers[layer].totalLen == pos + accept, "batched layer length mismatch");
+                    for (int d : dev) {
+                        for (int row = 0; row < accept; ++row)
+                            std::copy_n(inputs[layer][d].data() + row*rowBytes, rowBytes,
+                                        rings[layer][d].data() + ((pos + row) % 128)*rowBytes);
+                        Req(Read(*ring.multiDeviceDatas.at(d), d) == rings[layer][d],
+                            "40-layer rank-local window mismatch");
+                        Req(Read(*scratch.windowKV[layer].multiDeviceDatas.at(d), d) == inputs[layer][d],
+                            "batched commit modified source");
+                        Req(ring.multiDeviceDatas.at(d)->cudaData == addresses[layer][d],
+                            "batched commit moved window storage");
+                    }
+                }
+                ++cases;
+            }
+    std::cout << "PASS " << cases << " TP8 40-layer commits with distinct rank/layer data and three dtypes" << std::endl;
+}
+
+void TestCopyRangeValidation(const std::vector<int> &dev) {
+    Data src, dst;
+    auto input = Fill(src, BFLOAT16, 8, dev, 7);
+    auto initial = Fill(dst, BFLOAT16, 128, dev, 99);
+    std::vector<MultiCudaReplicatedCopyRange> ranges;
+    // More segments than one batch kernel's parameter block, with unaligned bytes.
+    auto expected = initial;
+    for (int i = 0; i < 140; ++i) {
+        ranges.push_back({&dst, &src, size_t(11 + i*37), size_t(i*13), 17});
+        std::copy_n(input.data() + i*13, 17, expected.data() + 11 + i*37);
+    }
+    Req(MultiCudaCopyReplicatedRanges(ranges, dev), "valid batch rejected");
+    for (int d : dev) {
+        Req(Read(*dst.multiDeviceDatas.at(d), d) == expected, "unaligned batch bytes mismatch");
+        Req(Read(*src.multiDeviceDatas.at(d), d) == input, "batch modified source");
+    }
+    auto unchanged = [&] {
+        for (int d : dev) Req(Read(*dst.multiDeviceDatas.at(d), d) == expected, "rejected batch wrote data");
+    };
+    std::vector<MultiCudaReplicatedCopyRange> bad = {{&dst, &src, 0, 0, 16},
+                                                  {&dst, &src, 100, input.size(), 1}};
+    Req(!MultiCudaCopyReplicatedRanges(bad, dev), "out-of-bounds source accepted");
+    unchanged();
+    bad = {{&dst, &src, 0, 0, 16}, {&dst, &src, 8, 32, 16}};
+    Req(!MultiCudaCopyReplicatedRanges(bad, dev), "overlapping destinations accepted");
+    unchanged();
+    bad = {{&dst, &src, 0, 0, 16}, {&dst, &dst, 64, 8, 16}};
+    Req(!MultiCudaCopyReplicatedRanges(bad, dev), "cross-request source/destination alias accepted");
+    unchanged();
+    auto *last = src.multiDeviceDatas.at(dev.back());
+    last->Resize({1, 7, 512});
+    Req(!MultiCudaCopyReplicatedRanges(ranges, dev), "invalid last rank accepted");
+    last->Resize({1, 8, 512});
+    unchanged();
+    auto duplicate = dev;
+    duplicate.back() = duplicate.front();
+    Req(!MultiCudaCopyReplicatedRanges(ranges, duplicate), "duplicate device accepted");
+    unchanged();
+    std::cout << "PASS batched byte ranges, unaligned and multi-kernel copies, atomic validation and aliases" << std::endl;
+}
 int main() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count < 8)
@@ -127,6 +222,8 @@ int main() {
                   << " TP8 DSpark commits, lengths 2..8, every accepted prefix, ring wrap, FP32 tails and "
                      "stable allocations"
                   << std::endl;
+        TestBatchedWindows(m, dev);
+        TestCopyRangeValidation(dev);
     } catch (const std::exception &e) {
         std::cerr << e.what() << std::endl;
         return 1;

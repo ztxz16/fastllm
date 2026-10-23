@@ -1528,13 +1528,39 @@ namespace fastllm {
                         "DeepSeekV41 DSpark: invalid accepted prefix length.");
         ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
         const int newLen = startPos + accept;
+        bool batchedWindows = false;
 #ifdef USE_CUDA
         ScopedTpDispatch commitDispatch(v41DsparkTpDevices.size() > 1, v41DsparkTpDevices);
+        if (v41DsparkTpDevices.size() > 1 && startPos >= 0 && window_size > 0 && accept <= window_size) {
+            std::vector<MultiCudaReplicatedCopyRange> ranges;
+            bool valid = true;
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                if (layer >= (int)scratch.windowKV.size() || scratch.windowKV[layer].dims.size() != 3)
+                    continue;
+                const Data &input = scratch.windowKV[layer];
+                Data &ring = state.layers[layer].windowKV;
+                if (input.dims[0] != 1 || input.dims[1] < accept || input.dims[2] <= 0 ||
+                    ring.dims != std::vector<int>({1, window_size, input.dims[2]}) ||
+                    ring.dataType != input.dataType) {
+                    valid = false;
+                    break;
+                }
+                const size_t rowBytes = (size_t)input.dims[2] * input.unitSize;
+                const int offset = startPos % window_size;
+                const int first = std::min(accept, window_size - offset);
+                ranges.push_back({&ring, &input, offset * rowBytes, 0, first * rowBytes});
+                if (first < accept)
+                    ranges.push_back({&ring, &input, 0, first * rowBytes, (accept - first) * rowBytes});
+            }
+            if (valid)
+                batchedWindows = MultiCudaCopyReplicatedRanges(ranges, v41DsparkTpDevices);
+        }
 #endif
         for (int layer = 0; layer < block_cnt; layer++) {
             DeepSeekV41LayerCache &cache = state.layers[layer];
             // 1) 滑窗环形缓冲：只写入被接受的行
-            if (layer < (int)scratch.windowKV.size() && scratch.windowKV[layer].dims.size() == 3) {
+            if (!batchedWindows && layer < (int)scratch.windowKV.size() &&
+                scratch.windowKV[layer].dims.size() == 3) {
                 // Read the accepted prefix directly from each rank's scratch.
                 // Split would collapse replicas and broadcast them again.
                 DsWindowStore(scratch.windowKV[layer], cache.windowKV, startPos, window_size, accept);

@@ -4675,6 +4675,80 @@ namespace fastllm {
         return true;
     }
 
+    bool MultiCudaCopyReplicatedRanges(const std::vector<MultiCudaReplicatedCopyRange> &ranges,
+                                       const std::vector<int> &devices) {
+        if (ranges.empty() || devices.empty() || currentMultiCudaDedicatedWorker != nullptr ||
+            std::set<int>(devices.begin(), devices.end()).size() != devices.size())
+            return false;
+        struct Copies {
+            std::vector<void *> dst;
+            std::vector<const void *> src;
+            std::vector<size_t> bytes;
+        };
+        std::vector<Copies> copies(devices.size());
+        for (size_t rank = 0; rank < devices.size(); ++rank) {
+            auto &batch = copies[rank];
+            std::vector<std::pair<uintptr_t, uintptr_t>> reads, writes;
+            for (const auto &r : ranges) {
+                if (!r.src || !r.dst || !r.bytes || !r.src->IsTensorParallelReplicated() ||
+                    !r.dst->IsTensorParallelReplicated() || !r.src->multiDeviceData ||
+                    !r.dst->multiDeviceData || r.dst->isFake || !IsCompactV41Activation(*r.src) ||
+                    !IsCompactV41Activation(*r.dst))
+                    return false;
+                auto input = r.src->multiDeviceDatas.find(devices[rank]);
+                auto output = r.dst->multiDeviceDatas.find(devices[rank]);
+                if (input == r.src->multiDeviceDatas.end() || output == r.dst->multiDeviceDatas.end())
+                    return false;
+                const Data *src = input->second, *dst = output->second;
+                if (!src || !dst || dst->isFake || src->dataDevice != DataDevice::CUDA ||
+                    dst->dataDevice != DataDevice::CUDA || !src->cudaData || !dst->cudaData ||
+                    src->dims != r.src->dims || dst->dims != r.dst->dims ||
+                    src->dataType != r.src->dataType || dst->dataType != r.dst->dataType ||
+                    src->dataType != dst->dataType || !IsCompactV41Activation(*src) ||
+                    !IsCompactV41Activation(*dst) || r.srcOffset > src->GetBytes() ||
+                    r.bytes > src->GetBytes() - r.srcOffset || r.dstOffset > dst->GetBytes() ||
+                    r.bytes > dst->GetBytes() - r.dstOffset)
+                    return false;
+                auto a = (uintptr_t)src->cudaData + r.srcOffset;
+                auto b = (uintptr_t)dst->cudaData + r.dstOffset;
+                reads.emplace_back(a, a + r.bytes);
+                writes.emplace_back(b, b + r.bytes);
+                batch.src.push_back((const void *)a);
+                batch.dst.push_back((void *)b);
+                batch.bytes.push_back(r.bytes);
+            }
+            std::sort(reads.begin(), reads.end());
+            std::sort(writes.begin(), writes.end());
+            size_t read = 0;
+            for (size_t i = 0; i < writes.size(); ++i) {
+                if (i && writes[i - 1].second > writes[i].first)
+                    return false;
+                while (read < reads.size() && reads[read].second <= writes[i].first)
+                    ++read;
+                if (read < reads.size() && reads[read].first < writes[i].second)
+                    return false;
+            }
+        }
+        const int originalDevice = FastllmCudaGetDevice();
+        std::vector<int> ok(devices.size(), 0);
+        auto copy = [&](int rank, int device) {
+            const auto &batch = copies[rank];
+            ok[rank] = FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                batch.dst.data(), batch.src.data(), batch.bytes.data(), (int)batch.bytes.size());
+        };
+        if (!MultiCudaRunDeviceCallbacks(devices, copy)) {
+            for (size_t rank = 0; rank < devices.size(); ++rank) {
+                FastllmCudaSetDevice(devices[rank]);
+                copy(rank, devices[rank]);
+                FastllmCudaSyncDevice(devices[rank]);
+            }
+        }
+        FastllmCudaSetDevice(originalDevice);
+        AssertInFastLLM(std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; }),
+                        "MultiCuda replicated batch copy failed.");
+        return true;
+    }
+
     bool MultiCudaCopyReplicatedRows(Data &dst, const Data &src, int start, int rows,
                                       const std::vector<int> &devices) {
         if (&dst == &src || devices.empty() || currentMultiCudaDedicatedWorker != nullptr ||

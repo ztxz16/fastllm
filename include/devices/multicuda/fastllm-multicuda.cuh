@@ -201,6 +201,16 @@ namespace fastllm {
         Data &attnSink, int windowSize, float scale, const std::vector<int> &devices,
         const std::function<void(int, int)> &before = {},
         const std::function<void(int, int)> &after = {}, bool workerOrdered = false);
+    struct MultiCudaReplicatedCopyRange {
+        Data *dst;
+        const Data *src;
+        size_t dstOffset, srcOffset, bytes;
+    };
+    // Batch independent byte ranges of compact replicas without allocations.
+    // Validate the whole batch before writing; overlapping destinations or
+    // source/destination ranges return false, so the caller can fall back.
+    bool MultiCudaCopyReplicatedRanges(const std::vector<MultiCudaReplicatedCopyRange> &ranges,
+                                       const std::vector<int> &devices);
     // Copy contiguous rows of a dense [1, tokens, width] replicated tensor
     // independently on each rank. Retains owned destination allocations and
     // replica layout; unsupported layouts/aliases return false without writes.
