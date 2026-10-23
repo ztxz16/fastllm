@@ -2,6 +2,8 @@
 // Created by huangyuyang on 5/11/23.
 //
 
+#include <cstdio>
+
 #include "utils.h"
 
 #include "fastllm.h"
@@ -326,6 +328,41 @@ namespace fastllm {
         modelLoadProgressCallback = nullptr;
     }
 
+    // 加载期心跳：长阶段（权重读取 / NUMA 注册 / 预热）单独一个线程每 10 秒
+    // 打一行进度，重定向到日志时也能实时看到，避免"静默卡死"。
+    namespace {
+        std::mutex loadBeatLocker;
+        std::string loadBeatStage = "init";
+        std::string loadBeatShown;
+        uint64_t loadBeatDone = 0, loadBeatTotal = 0;
+        std::chrono::steady_clock::time_point loadBeatStart = std::chrono::steady_clock::now();
+        std::atomic<bool> loadBeatStarted{false};
+
+        void StartLoadHeartbeat() {
+            if (loadBeatStarted.exchange(true)) return;
+            std::thread([] {
+                for (int tick = 0; tick < 720; ++tick) {
+                    std::this_thread::sleep_for(std::chrono::seconds(10));
+                    std::string stage;
+                    uint64_t done = 0, total = 0;
+                    {
+                        std::lock_guard<std::mutex> guard(loadBeatLocker);
+                        stage = loadBeatStage;
+                        done = loadBeatDone;
+                        total = loadBeatTotal;
+                    }
+                    if (stage == "serving" || stage == "ready") break;
+                    const double elapsed = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - loadBeatStart).count();
+                    std::fprintf(stderr, "[load] %.0fs stage=%s %llu/%llu\n", elapsed,
+                                 stage.c_str(), (unsigned long long) done,
+                                 (unsigned long long) total);
+                    std::fflush(stderr);
+                }
+            }).detach();
+        }
+    }
+
     void ReportModelLoadProgress(const std::string &stage,
                                  uint64_t current,
                                  uint64_t total,
@@ -339,6 +376,20 @@ namespace fastllm {
         if (callback) {
             callback({stage, current, total, completedBytes, totalBytes});
         }
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> guard(loadBeatLocker);
+            changed = (stage != loadBeatShown);
+            loadBeatStage = stage;
+            loadBeatDone = current;
+            loadBeatTotal = total;
+            if (changed) loadBeatShown = stage;
+        }
+        if (changed) {
+            std::fprintf(stderr, "[load] stage=%s\n", stage.c_str());
+            std::fflush(stderr);
+        }
+        StartLoadHeartbeat();
     }
     static FastllmEnv fastllmEnv;
 

@@ -193,12 +193,13 @@ namespace fastllm {
         size_t total_size = size + alignment - 1;
         void* raw_ptr = numa_alloc_onnode(total_size, node);
         if (!raw_ptr) {
+            // 不要在这里 exit(0)：进程退出会析构「半注册」的权重状态（cpuData 已
+            // 释放、numasData 指向 arena），造成堆双重释放 → glibc
+            // "double free or corruption (out)" 直接 abort，把真正的失败原因
+            // 掩盖成一次崩溃。改为返回 nullptr，由调用方抛出可诊断的错误。
             std::cerr << "Failed to allocate " << size << " bytes on NUMA node " << node << std::endl;
-
-            std::cerr << "Try increate max_map_count: " << std::endl;
-            std::cerr << "Temporary: `sudo sysctl -w vm.max_map_count=262144`" << std::endl;
-            std::cerr << "Permanent: `sudo echo \"vm.max_map_count=262144\" | sudo tee -a /etc/sysctl.conf && sudo sysctl -p`" << std::endl;
-            exit(0);
+            std::cerr << "Host memory headroom exhausted (check MemAvailable / CommitLimit); "
+                      << "use a smaller expert batch or a non-NUMA moe_device." << std::endl;
 
             return nullptr;
         }
@@ -216,6 +217,26 @@ namespace fastllm {
         uintptr_t addr = reinterpret_cast<uintptr_t>(aligned_ptr);
         void* raw_ptr = reinterpret_cast<void*>(addr & ~(63));
         numa_free(raw_ptr, size);
+    }
+
+    bool BindExistingBufferToNuma(void* ptr, size_t size, int node) {
+#if defined(__linux__)
+        if (ptr == nullptr || size == 0) {
+            return false;
+        }
+        if (numa_max_node() == 0) {
+            // 单 NUMA 节点：主机内存本就属于该节点，无需迁移页。
+            return node == 0;
+        }
+        // 多 NUMA 节点：把已分配的页迁移到目标节点（不复制数据）。
+        // MPOL_MF_MOVE 需要 CAP_SYS_NICE 权限，失败时由调用方回退到拷贝路径。
+        // 直接构造 nodemask，避免依赖 libnuma 各版本 struct bitmask 的成员名差异。
+        unsigned long nodeMask = 1UL << (node % (8 * sizeof(unsigned long)));
+        return mbind(ptr, size, MPOL_BIND, &nodeMask, (unsigned long)(node + 1),
+                     MPOL_MF_MOVE) == 0;
+#else
+        return false;
+#endif
     }
 
     void* allocate_pinned_numa(size_t size, int node) {

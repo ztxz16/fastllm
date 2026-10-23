@@ -3263,6 +3263,33 @@ namespace fastllm {
             }
         };
         std::vector<Entry> entries;
+        // 零拷贝迁移（单 NUMA 节点）：把已就位（且已完成重排）的源缓冲直接当作
+        // numaData 使用，避免「源权重 + arena」双份提交与逐 arena 锁页把主机
+        // 内存打爆。任一权重不满足条件即整体回退，交回原拷贝路径。
+        auto adoptEntriesInPlace = [&]() -> bool {
+            std::vector<Data*> adopted;
+            for (const Entry &entry : entries) {
+                Data *weight = entry.weight;
+                if (weight == nullptr || weight->isDiskWeight || weight->cpuData == nullptr ||
+                    entry.shardBytes == 0 || weight->GetBytes() != entry.shardBytes) {
+                    break;
+                }
+                if (!BindExistingBufferToNuma(weight->cpuData, entry.shardBytes, 0)) {
+                    break;
+                }
+                weight->numasData.assign(1, (uint8_t*)weight->cpuData);
+                weight->cpuData = nullptr;   // 所有权转移给 numasData
+                adopted.push_back(weight);
+            }
+            if (adopted.size() != entries.size()) {
+                for (Data *weight : adopted) {
+                    weight->cpuData = (uint8_t*)weight->numasData[0];
+                    weight->numasData.clear();
+                }
+                return false;
+            }
+            return true;
+        };
         size_t arenaBytes = 0;
         std::set<Data*> seen;
         // Bound temporary duplication while replacing the source allocations.
@@ -3294,6 +3321,42 @@ namespace fastllm {
                 entry.shardBytes = (entry.weight->dims[0] / config->numaCnt) *
                     GetDataBytes(entry.weight->GetDataType(), 1, entry.weight->dims[1]);
                 arenaBytes += entry.shardBytes;
+            }
+            // ── 零拷贝迁移（单 NUMA 节点）──────────────────────────────────────
+            // 拷贝路径需要「源权重 + arena」双份提交，并且每个 arena 都会被锁页
+            // （pinned）。26,112 个专家权重（102.67 GiB）在 121 GiB 主机内存上会
+            // 打爆锁页/提交额度 → numa_alloc_onnode 失败 → 旧错误路径 exit(0)
+            // → 退出时双重释放 → glibc "double free or corruption (out)" 崩溃。
+            // 单节点时源缓冲本就属于目标节点：就地复用，不再分配 arena、不再
+            // memcpy、不再为 arena 锁页。分配/选择逻辑不变（仍选 moe_device=numa）。
+            if (config->numaCnt == 1 && adoptEntriesInPlace()) {
+                {
+                    auto &owners = GetNumasMoeWeightArenaOwners();
+                    std::lock_guard<std::mutex> guard(owners.mutex);
+                    owners.weights.reserve(owners.weights.size() + entries.size());
+                    for (const Entry &entry : entries) {
+                        Data *weight = entry.weight;
+                        // 采用的权重不挂真实 arena：arena 析构按 numa 的方式 free，
+                        // 与源缓冲的分配方式不匹配会造成非法释放；这里挂空 arena
+                        // 只做生命周期跟踪。
+                        owners.weights.emplace(weight,
+                            std::make_shared<NumasMoeWeightArena>(0, config->numaCnt));
+                        weight->numasNVFP4AllScalesFuseMagic = false;
+                        weight->expansionBytes = weight->GetBytes();
+                        // 锁页语义与原拷贝路径保持一致（原路径按 arena 锁页）；
+                        // 这里只锁「已经存在」的权重页，不再额外占内存。
+#ifdef USE_CUDA
+                        weight->isPinned = usePinned &&
+                            FastllmCudaHostRegister(weight->numasData[0], entry.shardBytes);
+#else
+                        weight->isPinned = false;
+#endif
+                    }
+                }
+                registered = true;
+                entries.clear();
+                arenaBytes = 0;
+                return;
             }
             auto arena = std::make_shared<NumasMoeWeightArena>(arenaBytes, config->numaCnt);
             for (int node = 0; node < config->numaCnt; ++node) {

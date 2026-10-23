@@ -205,6 +205,13 @@ def capacity_pp_topologies(model, costs, layouts, gpu):
                 yield repr({"cuda:%d" % d: n for d, n in weighted.items()}), "off", "pp", weighted
 
 
+def _auto_debug(message):
+    """Planner diagnostics: set FASTLLM_AUTO_DEBUG=1 to see rejected candidates."""
+    if os.environ.get("FASTLLM_AUTO_DEBUG"):
+        import sys
+        print("[auto-skip] " + message, file=sys.stderr, flush=True)
+
+
 def latency_score(candidate, model, costs, args, mode, mapping, hardware, peers):
     """Relative latency for a 4K prompt + 512 outputs; no model reload/search.
 
@@ -433,11 +440,21 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if model.family == "qwen35":
         return _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model,
                                      info, gpu, ram, numa)
-    backends = ["numa" if numa else "cpu", "disk"]
-    if model.family == "deepseek_v41" and numa:
+    # V4.1 的 CUDA 专家缓存只在 numa 后端成立：BindGGUFWeights 需要 NUMA 分片
+    # 与已注册的锁页主机内存。cpu 后端同样把专家放在 RAM，却会直接关掉缓存，
+    # 所以只要 NUMA 可用就优先 numa；CPU 仍作为后备候选保留。
+    host_backend = "numa" if numa else "cpu"
+    backends = [host_backend, "disk"]
+    # 只有 V4.1 需要把 cpu 作为 numa 的后备候选（缓存与 numa 绑定，
+    # cpu 会静默关缓存）；其它家族保持原来的 numa→disk 候选集不变。
+    if model.family == "deepseek_v41" and host_backend == "numa":
         backends.insert(1, "cpu")
     if "moe_device" in explicit and base.moe_device:
         backends = [base.moe_device]
+    elif os.environ.get("FASTLLM_AUTO_ONLY_NUMA") and host_backend == "numa":
+        # 排障/生产开关：把盘上流式专家彻底排除在候选之外。
+        # V4.1 的 CUDA 专家缓存与 numa 后端绑定，disk 计划会静默关掉缓存。
+        backends = ["numa"]
     tables = [base.ngram_device] if "ngram_device" in explicit else ["cpu", "disk"]
     table_bytes = sum(t.bytes for t in tensors if memory.is_lookup_table(t.name))
     if "ngram_device" not in explicit and table_bytes > max(4 * memory.GiB, ram["total"] // 10):
@@ -517,6 +534,10 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                                                 hybrid_cpu_embedding=cpu_embedding)
                             except ValueError as error:
                                 rejection = str(error)
+                                _auto_debug("variant resid=%s cache=%s mode=%s tp=%s low=%s :: %s" % (
+                                    getattr(prepared, "resident_layers", "?"),
+                                    getattr(prepared, "moe_cuda_cache", "?"), mode, tp,
+                                    getattr(variant, "low_gpu_mem", None), error))
                                 continue
                             # Under hybrid memory pressure, CPU embedding frees
                             # space for chunk/cache; full GPU keeps normal mode.
@@ -532,6 +553,8 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                             notes.append("Hybrid uses CPU embedding to leave GPU memory for prefill and experts")
                     except ValueError as error:
                         rejection = str(error)
+                        _auto_debug("backend=%s table=%s mode=%s tp=%s device=%s :: %s" % (
+                            backend, table, mode, tp, device, error))
                         continue
                     result.update(device=device, tp=tp, moe_device=backend, ngram_device=table,
                                   threads=base.threads, atype=base.atype, kv_cache_dtype=base.kv_cache_dtype,
@@ -556,6 +579,20 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     # Retain TP as a capacity fallback; explicit TP produces no PP candidates.
     eligible = choices
     if model.family == "deepseek_v41":
+        # Disk is a capacity fallback, not a placement choice: whenever a
+        # host-resident (numa) candidate survives the memory budget, drop the
+        # disk candidates. Otherwise an approximate latency tie lets the disk
+        # plan win, which silently disables the CUDA expert cache (it needs
+        # NUMA shards) and costs an order of magnitude in decode speed.
+        resident = [item for item in eligible if item[2]["moe_device"] != "disk"]
+        if resident:
+            eligible = resident
+        # V4.1 的 CUDA 专家缓存只在 numa 后端成立（BindGGUFWeights 需要 NUMA 分片）：
+        # cpu 后端同样把专家放 RAM，却会把 moe_cuda_cache 强制为 0，打分上反而更低，
+        # 于是 cpu 经常赢掉 numa。这里有 numa 候选就永不选 cpu。
+        numa_only = [item for item in eligible if item[2]["moe_device"] == "numa"]
+        if numa_only:
+            eligible = numa_only
         priority = max(_deepseek_priority(item[2], model) for item in eligible)
         eligible = [item for item in eligible if _deepseek_priority(item[2], model) == priority]
         # PP avoids the per-layer TP collectives for host-backed experts. Keep

@@ -876,7 +876,28 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     # The library queries free memory after creating the CUDA contexts. Keep
     # additional space for graphs, allocator granularity and library handles.
     guard = 512 * MiB
-    host_limit = ram["available"] - min(4 * GiB, max(GiB, ram["total"] // 10))
+    # 用固定预算而不是实时 MemAvailable：页缓存是可回收的，而 MemAvailable 会
+    # 被 dsh-web 等邻居进程的瞬时占用拉低，导致同一命令一会儿 numa、一会儿 disk。
+    #
+    # 预留（2026-10-23 实测）：6 GiB 只够规划余量，挡不住加载/预热峰值。
+    # 32 层专家 = 99.6 GiB 常驻 + ~7.4 GiB 运行期 = 107.05 GiB，
+    # 在 114G cgroup 上被接受后：加载期页缓存把 cgroup 顶到 110 GiB，
+    # 全局 MemAvailable 掉到 17 GiB 且页缓存被清零，紧接着预热再要 ~9 GiB
+    # -> 整机不可回收内存耗尽 -> 主机卡死/重启（两次）。
+    # 30 层（93.3 GiB）实测可以稳定加载+预热+decode（峰值 110 GiB 含页缓存，
+    # 稳态 105.6 GiB，avail 19.6 GiB）。
+    # 因此默认预留 12 GiB：warmup/加载峰值 ~9 GiB + 邻居进程(dsh-web) 2-6 GiB
+    # + 内核 slab/页表 ~3.5 GiB 折中；可用 FASTLLM_AUTO_HOST_RESERVE_GIB 覆盖。
+    # 小内存机器/单测夹具按总量缩放，避免固定 13 GiB 直接吃掉全部预算；
+    # 目标机 121 GiB 上仍是 13 GiB（121//8 = 15.1 > 13）。
+    host_reserve = min(13 * GiB, max(GiB, ram["total"] // 8))
+    _reserve_env = os.environ.get("FASTLLM_AUTO_HOST_RESERVE_GIB")
+    if _reserve_env:
+        try:
+            host_reserve = int(float(_reserve_env) * GiB)
+        except ValueError:
+            pass
+    host_limit = ram["total"] - host_reserve
     host_memory_limit = _memory_limit_bytes(
         getattr(args, "auto_host_memory_limit", None), "auto_host_memory_limit"
     )
@@ -1016,7 +1037,10 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             if args.moe_device != "disk":
                 host_required += host_experts
                 pinned = os.environ.get("FT_PINNED_WEIGHT", "1").lower() not in ("0", "false", "off")
-                if snapshot or not pinned or (cuda_cache > 0 and args.moe_device == "cpu"):
+                # numa 后端下专家权重由 NUMA 分片直接借给 CUDA 专家缓存，不需要
+                # 额外的主机快照；只有 disk 未来的快照路径才需要第二份。
+                if (snapshot and args.moe_device == "disk") or not pinned or (
+                        cuda_cache > 0 and args.moe_device == "cpu"):
                     host_required += host_experts
             if streaming:
                 # Full pinned KV replaces the normal request mirror. Retain
@@ -1027,7 +1051,22 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             cpu_cache = 0 if args.moe_device != "disk" else (
                 max(0, min(host_experts, host_limit - host_required)) if cpu_auto else args.moe_cpu_cache)
             cpu_cache = cpu_cache // MiB * MiB if cpu_auto else cpu_cache
-            if host_required + cpu_cache > host_limit:
+            # numa 候选只要略超估算预算就直接退化到 disk（慢 3-5 倍），实际
+            # 差一点点时应当保留：允许 3% 弹性，但硬顶 MemTotal-8GiB。
+            host_effective_limit = host_limit
+            if args.moe_device != "disk":
+                # 硬顶留出的余量同样按总量缩放：目标机 121 GiB 上是 8 GiB，
+                # 小机器上不会出现“总量-8GiB < 0”而全盘拒绝。
+                hard_headroom = 8 * GiB if ram["total"] >= 64 * GiB else max(
+                    GiB, ram["total"] // 8)
+                host_effective_limit = min(int(host_limit * 1.03),
+                                           int(ram["total"] - hard_headroom))
+            if host_required + cpu_cache > host_effective_limit:
+                print("[auto-reject] moe=%s resident=%s host_required=%.1fGiB "
+                      "host_experts=%.1fGiB cpu_cache=%.1fGiB limit=%.1fGiB" % (
+                          args.moe_device, resident, host_required / 2**30,
+                          host_experts / 2**30, cpu_cache / 2**30,
+                          host_effective_limit / 2**30), file=__import__("sys").stderr, flush=True)
                 continue
             candidate = {"family": model.family, "mode": mode, "context_tokens": context,
                     "total_tokens": tokens, "max_batch": batch, "chunked_prefill_size": chunk,

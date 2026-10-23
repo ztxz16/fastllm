@@ -1887,11 +1887,28 @@ def make_normal_llm_model(args, startup_progress = None):
                          _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH"))
         llm.set_cuda_graph(graph_enabled)
     llm.set_moe_device_layers(-1)
+    # --auto 的规划发生在 args 的副本上：把落到计划里的 MoE 设备/层数回写给
+    # args，否则 set_layered_moe_device_map(args.moe_device) 会拿到空串，
+    # SelectMoeDeviceForLayer 全部返回空设备 → host_layers=0 → CUDA 专家缓存
+    # 候选集为空而静默失效。
+    if hybrid_auto_plan and not args.moe_device:
+        planned_moe = hybrid_auto_plan.get("moe_device")
+        if planned_moe:
+            args.moe_device = planned_moe
+    if hybrid_auto_plan and getattr(args, "moe_device_layers", -1) is not None \
+            and args.moe_device_layers < 0:
+        planned_layers = hybrid_auto_plan.get("moe_device_layers")
+        if isinstance(planned_layers, int) and planned_layers >= 0:
+            args.moe_device_layers = planned_layers
     cache_bytes = _memory_size_bytes(getattr(args, "moe_cuda_cache", 0))
     if hybrid_auto_plan and "moe_cuda_cache_per_device" in hybrid_auto_plan:
         llm.set_moe_cuda_cache(cache_bytes, hybrid_auto_plan["moe_cuda_cache_per_device"])
     else:
-        llm.set_moe_cuda_cache(cache_bytes)
+        # --auto 已经按显存预算算出 moe_cuda_cache，但规划器不一定给出按设备拆分
+        # 的表；此时必须把规划值下发。命令行默认值是 0，直接下发会让整条 CUDA
+        # 专家缓存链路静默失效（规划里看到预算、运行期却完全不用）。
+        plan_cache = int(hybrid_auto_plan.get("moe_cuda_cache", 0) or 0) if hybrid_auto_plan else 0
+        llm.set_moe_cuda_cache(cache_bytes if cache_bytes > 0 else plan_cache)
     llm.set_moe_cache_policy(
         half_life=getattr(args, "moe_cache_half_life", 128.),
         update_interval=getattr(args, "moe_cache_update_interval", 1),
