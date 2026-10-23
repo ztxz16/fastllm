@@ -41,9 +41,10 @@ namespace fastllm {
             return false;
         }
 #ifdef USE_CUDA
-        if (opType == "MergeMOE" && device->deviceType == "cuda" &&
+        if (opType == "MergeMOE" &&
+            (device->deviceType == "cuda" || device->deviceType == "numa") &&
             (name == "w1" || name == "w2" || name == "w3")) {
-            // CUDA MoE overwrites these workspaces before reading them (or
+            // CUDA/NUMA MoE overwrites these workspaces before reading them (or
             // leaves them unused). Moving between layer devices must allocate
             // on the destination without transferring the previous layer's data.
             // Keep input semantics if a caller also binds this Data as an input.
