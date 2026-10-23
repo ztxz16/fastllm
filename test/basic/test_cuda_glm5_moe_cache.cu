@@ -1,4 +1,5 @@
 #include "fastllm.h"
+#include "utils/hybrid_moe.h"
 #include "executor.h"
 #include "utils.h"
 #include "utils/hybrid_moe.h"
@@ -27,6 +28,17 @@ void DoCudaMergeMOEFromCPU(Data &, Data &, Data &, Data &, Data &, Data &, Data 
     const std::unordered_set<int> &, bool, MoeGateType, bool, float, int, bool, bool);
 }
 using namespace fastllm;
+static bool PrepareCache(const FastllmCudaMoeCacheLayer *layers, int count, bool streaming = false) {
+    if (!HostMoeIsUnbound()) return FastllmCudaPrepareMoeCache(layers, count, [] {}, streaming);
+    std::vector<std::vector<Data *>> weights(count);
+    HybridMoeCachePlan plan(HybridMoeMath::Glm5, layers[0].swigluLimit);
+    for (int i = 0; i < count; ++i) {
+        weights[i].assign(layers[i].weights, layers[i].weights + layers[i].weightsBatch);
+        plan.Add(weights[i], "cpu");
+    }
+    return plan.Prepare({}, streaming);
+}
+
 static void Require(bool value, const char *message) {
     if (!value)
         throw std::runtime_error(message);
@@ -68,7 +80,7 @@ static void RunNumasMoe(Data &input, Data &index, Data &scores, Data &output, st
     Data w1, w2, w3, curInput, curOutput;
     std::vector<Data *> biases(weights.size(), nullptr);
     ((Executor *)GetExecutor())
-        ->RunOnDevice("numa", "MergeMOE",
+        ->RunOnDevice(HostMoeIsUnbound() ? "cpu" : "numa", "MergeMOE",
                       {{"input", &input},
                        {"index", &index},
                        {"score", &scores},
@@ -108,7 +120,7 @@ static void CheckPrefill(FastllmCudaMoeCacheLayer *layers, std::vector<Data *> *
         // only the weight source must preserve every output bit.
         std::vector<std::vector<uint16_t>> reference(dual ? 2 : 1);
         for (int pass = 0; pass < 4; ++pass) {
-            if (pass == 1) Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "prefill prepare failed");
+            if (pass == 1) Require(PrepareCache(layers, tables), "prefill prepare failed");
             for (int device = 0; device < (dual ? 2 : 1); ++device) {
                 Check(cudaSetDevice(device));
                 auto **weights = weightTables[device % tables].data();
@@ -172,7 +184,7 @@ static void CheckPrefill(FastllmCudaMoeCacheLayer *layers, std::vector<Data *> *
     // Start the shared transport checks cold; the preceding high-row-count
     // cases deliberately leave a full cache with a different frequency history.
     FastllmCudaReleaseMoeCache(weightTables[0].data(), layers[0].weightsBatch);
-    Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "shared prefill prepare failed");
+    Require(PrepareCache(layers, tables), "shared prefill prepare failed");
     fastllm_prefill_test::Run(layers, weightTables, tables, true, 128);
     std::puts("GLM prefill: arbitrary rows, cold/warm bitwise output, native bytes and assist admission passed.");
 }
@@ -182,7 +194,7 @@ static void CheckVerify(FastllmCudaMoeCacheLayer *layers, std::vector<Data *> *w
     const int experts = layers[0].weightsBatch / 2 - 1, topk = 4;
     bool sawCpu = false, sawResident = false, sawStaged = false, sawBoth = false;
     FastllmCudaReleaseMoeCache(weights[0].data(), layers[0].weightsBatch);
-    Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}, noCache), "verify cache preparation failed");
+    Require(PrepareCache(layers, tables, noCache), "verify cache preparation failed");
     {
         HybridMoeDecodeGroup group;
         for (int device = 0; device < (dual ? 2 : 1); ++device) {
@@ -376,6 +388,8 @@ int main(int argc, char **argv) {
             return false;
         };
         const bool dual = option("--dual"), noCache = option("--no-cache");
+        const bool unbound = option("--unbound");
+        HostMoePlacementScope placement(unbound);
         const bool prefill = option("--prefill"), verify = option("--verify"), fp8 = option("--fp8");
         const bool frequency = option("--frequency") || noCache || prefill || verify;
         std::printf("GLM cache weight format: %s\n", fp8 ? "FP8 block128" : "NVFP4 packed");
@@ -445,7 +459,10 @@ int main(int argc, char **argv) {
                             }
                         }
                     }
-                    for (int node = 0; node < nodes; ++node) {
+                    if (unbound) {
+                        w->Allocate(false);
+                        memcpy(w->cpuData, packed.data(), packed.size());
+                    } else for (int node = 0; node < nodes; ++node) {
                         void *ptr = nullptr;
                         Check(cudaHostAlloc(&ptr, rows / nodes * pitch, cudaHostAllocMapped | cudaHostAllocPortable));
                         for (int r = 0; r < rows / nodes; ++r) {
@@ -456,7 +473,7 @@ int main(int argc, char **argv) {
                         shards.push_back(ptr);
                         w->numasData.push_back((uint8_t *)ptr);
                     }
-                    w->isPinned = true;
+                    w->isPinned = !unbound;
                     w->isModelWeight = true;
                     weights[t][2 * (e + 1) + part] = w.get();
                     owned.push_back(std::move(w));
@@ -471,7 +488,7 @@ int main(int argc, char **argv) {
         SetMoeCudaCacheBytes(record * 16);
         Require(!FastllmCudaPrepareMoeCache(layers, tables), "unowned NUMA cache accepted");
         if (noCache) SetMoeCudaCacheBytes(0);
-        Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}, noCache), "GLM cache preparation failed");
+        Require(PrepareCache(layers, tables, noCache), "GLM cache preparation failed");
         Require(FastllmCudaCanRunMoeHybrid(weights[0].data(), weights[0].size()), "GLM hybrid unavailable");
         Require(!FastllmCudaCanRunMoeCache(weights[0].data(), weights[0].size()), "generic math accepted GLM");
         CheckUnsupportedCachePaths(weights[0], hidden, topk, dual);
@@ -496,7 +513,7 @@ int main(int argc, char **argv) {
             // Start the next calibration test with fresh timing estimates so
             // its cold-path coverage does not depend on the preceding splits.
             FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
-            Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}, noCache),
+            Require(PrepareCache(layers, tables, noCache),
                 "decode cache preparation after verify failed");
         }
         bool sawCpu = false, sawResident = false, sawStaged = false;
@@ -643,7 +660,7 @@ int main(int argc, char **argv) {
                                "frequency did not exercise CPU, streamed and resident experts");
         FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
         ClearNumasMoeRuntimeCache();
-        for (auto &w : owned) w->numasData.clear();
+        if (!unbound) for (auto &w : owned) w->numasData.clear();
         for (void *p : shards) Check(cudaFreeHost(p));
         std::printf("GLM %s cache: CPU/mixed/GPU, oracle, fallback, eviction and device transitions passed.\n",
                     fp8 ? "FP8" : "compact NVFP4");

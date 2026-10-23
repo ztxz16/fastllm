@@ -159,6 +159,9 @@ static void TestTiledGemm() {
 
 int main(int argc, char **argv) {
     try {
+        const bool unbound = argc > 1 && std::strcmp(argv[argc - 1], "--unbound") == 0;
+        if (unbound) --argc;
+        HostMoePlacementScope placement(unbound);
         const bool dual = argc == 2 && std::strcmp(argv[1], "--hybrid-dual") == 0;
         const bool hybrid = dual || (argc == 2 && std::strcmp(argv[1], "--hybrid") == 0);
         if (hybrid) {
@@ -180,7 +183,7 @@ int main(int argc, char **argv) {
         TestTiledGemm();
         constexpr int hidden = 256, inter = 128, experts = 3, topk = 2;
         auto &executor = *(Executor *)GetExecutor();
-        executor.SetFirstDevice("numa");
+        executor.SetFirstDevice(unbound ? "cpu" : "numa");
         std::vector<std::unique_ptr<Data>> owned;
         std::vector<Data *> weights(2 * (experts + 1), nullptr), biases(weights);
         for (int e = 1; e <= experts; e++) for (int part = 0; part < 2; part++) {

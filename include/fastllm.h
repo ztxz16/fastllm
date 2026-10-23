@@ -605,6 +605,8 @@ namespace fastllm {
         bool forceGGUFFp32Dequant = false;
 
         std::vector <uint8_t*> numasData; // numa数据
+        // Registered host-MoE shards may use one unbound CPU domain.
+        bool hostMoeUnbound = false;
         // True only when RegisterNumas has verified that every inline E8M0
         // scale in an NVFP4 block32 shard can absorb the kernel's 2^64
         // compensation without overflow.  Unknown and ineligible weights

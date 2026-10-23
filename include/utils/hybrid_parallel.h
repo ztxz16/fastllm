@@ -38,7 +38,7 @@ public:
             if (input.dataDevice != DataDevice::CUDA || input.dims[0] < 1024) lock.lock();
         }
 #if defined(USE_CUDA) && defined(USE_NUMAS)
-        pipeline.emplace(workspace, mutex && numa ? &lock : nullptr);
+        pipeline.emplace(workspace, mutex && (numa || HostMoeIsUnbound()) ? &lock : nullptr);
 #endif
     }
     void LockCpu() { if (lock.mutex() && !lock.owns_lock()) lock.lock(); }

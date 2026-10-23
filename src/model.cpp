@@ -4,6 +4,9 @@
 #include "model.h"
 #include "fastllm.h"
 #include "executor.h"
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#endif
 #include <sstream>
 #include <fstream>
 #include <regex>
@@ -76,9 +79,6 @@
 namespace fastllm {
 #if defined(USE_NUMAS)
     void RegisterNumas(fastllm::Data *data, std::string weightType);
-    void RegisterNumasMoeWeightBatch(
-        const std::vector<std::pair<Data*, std::string>> &weights,
-        const std::function<void(size_t)> &onProgress);
 #endif
     extern BF16ToFP16Manager bf16tofp16;
 
@@ -722,9 +722,9 @@ namespace fastllm {
         return "";
     }
 
-    void basellm::WarmupNumaMoeWeights() {
+    void basellm::WarmupNumaMoeWeights(bool includeCpu) {
 #if defined(USE_NUMAS)
-        std::vector<std::pair<Data*, std::string>> pending;
+        std::vector<std::pair<Data*, std::string>> pending, pendingCpu;
         uint64_t totalBytes = 0;
         int moeSpecialCount = 0;
         int numaSelectedCount = 0;
@@ -750,12 +750,10 @@ namespace fastllm {
             }
             moeSpecialCount++;
             auto layerIt = this->specialWeightLayerIds.find(weightName);
-            if (layerIt == this->specialWeightLayerIds.end() || layerIt->second < 0 ||
-                !DeviceNameMatchesType(
-                    this->SelectSpecialWeightDevice(weightName, layerIt->second),
-                    "numa")) {
-                continue;
-            }
+            if (layerIt == this->specialWeightLayerIds.end() || layerIt->second < 0) continue;
+            const auto selected = this->SelectSpecialWeightDevice(weightName, layerIt->second);
+            const bool unbound = includeCpu && selected == "cpu";
+            if (!unbound && !DeviceNameMatchesType(selected, "numa")) continue;
             numaSelectedCount++;
             auto weightIt = this->weight.weight.find(weightName);
             if (weightIt == this->weight.weight.end()) {
@@ -770,7 +768,7 @@ namespace fastllm {
             AssertInFastLLM(
                 !data.isDiskWeight && data.cpuData != nullptr && data.dims.size() == 2,
                 "AutoWarmup can't register NUMA MoE weight: " + weightName + "\n");
-            pending.push_back({&data, specialWeight.second});
+            (unbound ? pendingCpu : pending).push_back({&data, specialWeight.second});
             totalBytes += data.GetBytes();
         }
 
@@ -790,14 +788,19 @@ namespace fastllm {
             malloc_trim(0);
         }
 #endif
-        if (pending.empty()) {
-            return;
+        if (!pendingCpu.empty()) {
+            printf("[Fastllm] AutoWarmup host MoE: registering %zu CPU expert weights (unbound, shared compute/cache).\n",
+                   pendingCpu.size());
+            fflush(stdout);
+            RegisterHostMoeWeightBatch(pendingCpu, true);
         }
+        if (pending.empty()) return;
 
         printf("[Fastllm] AutoWarmup NUMA MoE: registering %zu expert weights (%.2f GiB).\n",
                pending.size(), totalBytes / 1024.0 / 1024.0 / 1024.0);
         fflush(stdout);
         int lastProgress = -1;
+        HostMoePlacementScope placement(false);
         RegisterNumasMoeWeightBatch(pending, [&](size_t completed) {
             int progress = (int)(completed * 100 / pending.size());
             if (progress != lastProgress) {
