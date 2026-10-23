@@ -9,6 +9,7 @@
 #include <cstdio>
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
+#include "devices/cuda/fastllm-cuda.cuh"
 #endif
 using namespace fastllm;
 namespace fastllm { void RegisterNumas(Data *weight, std::string type); }
@@ -72,11 +73,11 @@ static void TestChunkBoundaries() {
     const int nodes = GetNumasMoeShardCount();
     std::vector<std::unique_ptr<Data>> reference, batched;
     std::vector<std::pair<Data*, std::string>> pending;
-    // Three 102 MiB weights must span two 256 MiB arenas.
+    // Three 25.5 MiB weights must span two 64 MiB arenas.
     for (int seed = 0; seed < 3; ++seed) {
         auto make = [&]() {
             auto w = std::make_unique<Data>(DATA_GGUF_FORMAT, GGML_TYPE_Q8_0,
-                                            std::vector<int>{32768, 3072});
+                                            std::vector<int>{8192, 3072});
             w->Allocate(false);
             for (size_t i = 0; i < w->GetBytes(); ++i) w->cpuData[i] = (i * 17 + seed * 29) & 255;
             return w;
@@ -125,6 +126,10 @@ int main(int argc, char **argv) {
             (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)) {
             std::puts("FASTLLM_TEST_SKIP_NO_DEVICE");
             return 77;
+        }
+        if (devices > 0) {
+            Check(!FastllmCudaHostRegister(nullptr, 1), "invalid registration unexpectedly succeeded");
+            Check(cudaGetLastError() == cudaSuccess, "handled registration failure poisoned CUDA state");
         }
 #endif
         if (argc == 2 && std::string(argv[1]) == "--chunk-boundary") {

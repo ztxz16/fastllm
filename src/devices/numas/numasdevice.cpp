@@ -3265,9 +3265,12 @@ namespace fastllm {
         std::vector<Entry> entries;
         size_t arenaBytes = 0;
         std::set<Data*> seen;
-        // Bound temporary duplication while replacing the source allocations.
-        // A tensor larger than the budget gets an arena of its own.
-        constexpr size_t batchBytes = 256ULL * 1024 * 1024;
+        // Bound source duplication and pin-registration metadata. Older Linux
+        // kernels allocate a contiguous page-pointer array in get_user_pages;
+        // a 256 MiB registration needs 512 KiB of contiguous kernel memory and
+        // can fail on a fragmented, nearly full node. Keep ordinary batches
+        // at 64 MiB; a single larger tensor still gets its own arena.
+        constexpr size_t batchBytes = 64ULL * 1024 * 1024;
         auto flush = [&]() {
             if (entries.empty()) return;
             // Each task owns a distinct tensor. Keep the interleave -> repack
@@ -3304,7 +3307,7 @@ namespace fastllm {
             // Copy and retire sources in smaller waves. An entire arena still
             // gets one CUDA registration, but no longer needs to coexist with
             // all of its source pages. This leaves headroom for unreleased edge
-            // pages without raising the previous 256 MiB duplication budget.
+            // pages without exceeding the arena duplication budget.
             constexpr size_t copyWaveBytes = 32ULL * 1024 * 1024;
             for (size_t begin = 0; begin < entries.size();) {
                 size_t end = begin, waveBytes = 0;

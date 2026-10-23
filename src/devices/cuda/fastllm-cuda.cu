@@ -6467,6 +6467,9 @@ bool FastllmCudaHostRegister(void *ptr, size_t size) {
     if (err != cudaSuccess) {
         fprintf(stderr, "Warning: cudaHostRegister failed (%s), falling back to unpinned memory\n",
                 cudaGetErrorString(err));
+        // Registration has a supported unpinned fallback. Do not leave its
+        // handled error for an unrelated subsequent kernel's launch check.
+        cudaGetLastError();
         return false;
     }
     return true;
