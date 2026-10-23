@@ -2639,12 +2639,13 @@ namespace fastllm {
                 continue;
             }
 #ifdef USE_NUMAS
-            if (moeDevice.rfind("numa", 0) == 0 &&
+            HostMoePlacementScope placement(moeDevice == "cpu");
+            if (IsSharedHostMoeDevice(moeDevice) &&
                 CanUseNumasMoeExactSmallBatch(rows)) {
                 continue;
             }
 #ifndef USE_ROCM
-            if (moeDevice.rfind("numa", 0) == 0 && moeAtype == DataType::BFLOAT16 &&
+            if (IsSharedHostMoeDevice(moeDevice) && moeAtype == DataType::BFLOAT16 &&
                 layer < (int)expertWeights.size()) {
                 const auto &experts = expertWeights[layer];
                 // The prepared GGUF hybrid path preserves decode arithmetic

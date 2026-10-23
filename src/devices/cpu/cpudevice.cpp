@@ -6,6 +6,9 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
 #include "executor.h"
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#endif
 #include "devices/cpu/computeutils.h"
 #include "devices/cpu/kimi_k3_ops.h"
 
@@ -3482,6 +3485,15 @@ namespace fastllm {
 
     void CpuMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+#ifdef USE_NUMAS
+        if (CanRunHostMoe(datas, intParams)) {
+            RegisterUnboundHostMoe(reinterpret_cast<Data **>(datas.at("weights")),
+                                  intParams.at("weights___batch"));
+            NumasMergeMOE shared;
+            shared.Run(opType, datas, floatParams, intParams);
+            return;
+        }
+#endif
         fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuLinearOp());
  // auto ttt = std::chrono::system_clock::now();
  // std::vector <std::pair <std::string, float> > record;

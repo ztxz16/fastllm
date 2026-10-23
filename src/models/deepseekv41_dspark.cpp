@@ -32,6 +32,9 @@
 
 #include "baseblock.h"
 #include "executor.h"
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#endif
 #include "utils.h"
 #include "utils/hybrid_moe.h"
 #if defined(USE_CUDA) && !defined(USE_ROCM)
@@ -1993,6 +1996,9 @@ namespace fastllm {
 
                 {
                     std::vector<Data*> moeWeights = v41DsparkMoeWeights[stage];
+#ifdef USE_NUMAS
+                    HostMoePlacementScope placement(moeWeights.size() > 2 ? moeWeights[2] : nullptr);
+#endif
                     DeepSeekV41DsparkWorkspace::SharedExpertWorkspace localShared;
                     auto &shared = graphState ? graphState->sharedExperts[stage] : localShared;
                     bool hasSharedExpertOut = false;

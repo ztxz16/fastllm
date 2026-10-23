@@ -117,6 +117,9 @@ namespace fastllm {
         const bool runRoutedExperts = !hostMoe || threadTpRank == 0;
         const std::string moeDevice = SelectSpecialWeightDevice(
             mlp + "experts.0.gateup_proj.weight", deviceLayer);
+#ifdef USE_NUMAS
+        HostMoePlacementScope placement(moeDevice == "cpu");
+#endif
         // GPU routing and the shared expert do not use the host worker pool.
         // Defer its guard until routed MoE; CPU and decode paths retain it.
         HybridMoePipelineGuard hostExperts(flattened, moeDevice,
@@ -144,9 +147,9 @@ namespace fastllm {
             expertsSelected = true;
         };
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        const bool numaMoe = moeDevice == "numa" || moeDevice.rfind("numa:", 0) == 0;
+        const bool sharedHostMoe = IsSharedHostMoeDevice(moeDevice);
         const bool hostPrefill =
-            hostMoe && numaMoe && batch * sequence >= kNumasMoeGpuPrefillMinRows;
+            hostMoe && sharedHostMoe && batch * sequence >= kNumasMoeGpuPrefillMinRows;
         const std::vector<int> prefillDevices =
             prefill ? std::vector<int>{FastllmCudaGetDevice()} : std::vector<int>{};
         NumasMoeCudaAssistScope assistScope(
@@ -154,7 +157,7 @@ namespace fastllm {
         // Stage buffers remain distinct while CPU jobs share the same pool.
         // Unsupported/CPU-only paths simply keep the outer lock until return.
         if (runRoutedExperts && batch * sequence <= kNumasMoePrefetchMaxRows &&
-            flattened.dataDevice == DataDevice::CUDA && numaMoe &&
+            flattened.dataDevice == DataDevice::CUDA && sharedHostMoe &&
             !FastllmCudaMoeCacheRequested() && !FastllmCudaGraphIsCapturing()) {
             selectExperts();
             PrefetchNumasMoeDecodeInput(flattened, expertIndex, expertScore, deviceLayer);
@@ -222,7 +225,7 @@ namespace fastllm {
                 ThreadTpAllReduce(output);
         };
 #if defined(USE_NUMAS)
-        if (!prefill && threadTpRank < 0 && numaMoe &&
+        if (!prefill && threadTpRank < 0 && sharedHostMoe &&
             batch * sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
             FastllmCudaMoeCacheRequested()) {
             selectExperts();
@@ -254,7 +257,7 @@ namespace fastllm {
         }
 #endif
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        if (runRoutedExperts && numaMoe &&
+        if (runRoutedExperts && sharedHostMoe &&
             batch * sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
             SelectDeviceFromMap(this->deviceMap, deviceLayer + 1, this->block_cnt).find("cuda") == 0 &&
             FastllmCudaMoeCacheRequested()) {
@@ -316,9 +319,15 @@ namespace fastllm {
         }
 #endif
         selectExperts();
-        // NUMA acquires this guard around CPU work after preparing its private
+        // The shared host backend acquires the guard around CPU work after preparing its private
         // CUDA branch. The generic CPU backend retains the outer guard.
-        if (moeDevice == "cpu") hostExperts.LockCpu();
+        if (moeDevice == "cpu") {
+#ifdef USE_NUMAS
+            if (!CanRunHostMoe({{"weights", (Data *)moeWeights.data()}, {"biass", (Data *)moeBiass.data()}},
+                    {{"weights___batch", int(moeWeights.size())}, {"biass___batch", int(moeBiass.size())}}))
+#endif
+                hostExperts.LockCpu();
+        }
         const std::string outputDevice =
             SelectDeviceFromMap(this->deviceMap, deviceLayer + 1, this->block_cnt);
         bool hybridMoe = false;

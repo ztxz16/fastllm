@@ -12,14 +12,17 @@ namespace fastllm {
 // Keep score placement, projection rounding and activation quantization distinct.
 enum class HybridMoeMath { Standard, Glm5, DeepSeekV41 };
 
+// Both placements use the same kernels and cache policy in NUMA-enabled builds.
+bool IsSharedHostMoeDevice(const std::string &device);
+
 // Full prefill timings are meaningful for these host-expert layouts. Keep
 // this capability independent of model names and cache capacity.
 bool HybridMoeMeasuredNativePrefill(const Data *gate, const Data *down,
                                    HybridMoeMath math);
 
 // A short-lived preparation plan borrows the original expert tables. GPU and
-// disk-resident layers stay outside the host cache. NUMA storage can only be
-// borrowed when every selected table is registered by the supplied callback.
+// disk-resident layers stay outside the host cache. CPU tables register as one
+// unbound shard; NUMA tables use the supplied placement-aware registration.
 class HybridMoeCachePlan {
 public:
     explicit HybridMoeCachePlan(HybridMoeMath math = HybridMoeMath::Standard,
@@ -35,7 +38,7 @@ private:
     HybridMoeMath math;
     float swigluLimit;
     double budgetFraction; // Model subgroups share one per-device cache budget.
-    bool allNuma = true;
+    bool allNuma = true, allCpu = true;
 };
 
 // One complete target token/verification step owns one policy scope. Cache

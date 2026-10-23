@@ -1,4 +1,5 @@
 #include "fastllm.h"
+#include "utils/hybrid_moe.h"
 #include "devices/moe_decode_scheduler.h"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #include "fastllm-cuda.cuh"
@@ -549,7 +550,10 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
                             int hidden = 128, int inter = 64, bool planar = false,
                             bool hybrid = false,
                             fastllm::DataType weightType = fastllm::DataType::NVFP4_BLOCK_16_E4M3,
-                            bool perchannel = false, bool compactScales = false, bool prefill = false) {
+                            bool perchannel = false, bool compactScales = false, bool prefill = false, bool unbound = false) {
+#ifdef USE_NUMAS
+    fastllm::HostMoePlacementScope placement(unbound);
+#endif
     constexpr int experts = 24, topk = 7, tables = 2;
     std::mt19937 rng(171);
     std::vector<std::unique_ptr<fastllm::Data>> owned[3];
@@ -598,6 +602,15 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
     fastllm::SetMoeCudaCacheBytes(16 * ExpertRecordBytes(*weights[0][0][2], *weights[0][0][3]));
     for (int backend = 0; backend < 3; ++backend) {
         auto registerWeights = [&] {
+#ifdef USE_NUMAS
+            if (unbound) {
+                std::vector<std::pair<fastllm::Data *, std::string>> pending;
+                for (size_t i = 0; i < owned[backend].size(); ++i)
+                    pending.push_back({owned[backend][i].get(), i % 2 ? "linear" : "linearSwiglu"});
+                fastllm::RegisterHostMoeWeightBatch(pending, true);
+                return;
+            }
+#endif
             for (size_t i = 0; i < owned[backend].size(); ++i) {
                 auto &w = *owned[backend][i];
                 const int rows = w.dims[0], cols = w.dims[1];
@@ -659,8 +672,12 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
             for (int table = 0; table < tables; ++table)
                 Require(!FastllmCudaCanRunMoeCache(weights[1][table].data(), 2 * (experts + 1)),
                         "failed or interrupted preparation published a cache");
-            Require(FastllmCudaPrepareMoeCache(layers[1], tables, registerWeights),
-                    "valid NUMA registration rejected");
+            if (unbound) {
+                fastllm::HybridMoeCachePlan plan;
+                for (int table = 0; table < tables; ++table) plan.Add(weights[1][table], "cpu");
+                Require(plan.Prepare(), "valid CPU shared-cache registration rejected");
+            } else Require(FastllmCudaPrepareMoeCache(layers[1], tables, registerWeights),
+                           "valid NUMA registration rejected");
         } else {
             Require(!FastllmCudaPrepareMoeCache(layers[2], tables, [&] {
                 registerWeights();
@@ -1097,6 +1114,19 @@ static void CheckDecodePolicy() {
 
 int main(int argc, char **argv) {
     try {
+#ifdef USE_NUMAS
+        if (argc == 2 && std::strcmp(argv[1], "--unbound") == 0) {
+            fastllm::SetThreads(8);
+            for (auto type : {fastllm::NVFP4_BLOCK_16_E4M3, fastllm::FP8_E4M3, fastllm::FP8_E4M3_BLOCK_128}) {
+                CompareNumaCache<float>(fastllm::FLOAT32, 1, 1, 256, 128,
+                    false, true, type, false, false, false, true);
+                CompareNumaCache<__nv_bfloat16>(fastllm::BFLOAT16, 1, 1, 256, 128,
+                    false, false, type, false, false, true, true);
+            }
+            std::puts("ALL_PASS unbound standard host cache/decode/verify/prefill");
+            return 0;
+        }
+#endif
         if (argc == 2 && std::strcmp(argv[1], "--prefill-model-shape") == 0) {
             CompareNumaCache<__nv_bfloat16>(fastllm::BFLOAT16, 2, 1, 2560, 640,
                 false, false, fastllm::NVFP4_BLOCK_16_E4M3, false, true, true);

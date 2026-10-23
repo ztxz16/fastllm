@@ -1251,6 +1251,32 @@ if (UNIT_TEST)
         add_executable(numas_v41_q2_moe_test test/basic/test_numas_v41_q2_moe.cpp)
         target_link_libraries(numas_v41_q2_moe_test PRIVATE fastllm)
         add_test(NAME numas_v41_q2_moe COMMAND numas_v41_q2_moe_test)
+        add_test(NAME host_v41_q2_unbound COMMAND numas_v41_q2_moe_test --unbound)
+        add_test(NAME host_v41_q2_decode_unbound COMMAND numas_v41_q2_moe_test decode 512 384 q2_0 --unbound)
+        add_test(NAME host_v41_q2_verify_unbound COMMAND numas_v41_q2_moe_test verify 512 384 q2_0 --unbound)
+        add_test(NAME host_v41_iq1_s_verify_unbound COMMAND numas_v41_q2_moe_test verify 512 384 --iq1-s --unbound)
+        add_test(NAME host_v41_iq1_m_verify_unbound COMMAND numas_v41_q2_moe_test verify 512 384 --iq1-m --unbound)
+        set_tests_properties(host_v41_iq1_s_verify_unbound host_v41_iq1_m_verify_unbound PROPERTIES
+            ENVIRONMENT "FT_NUMAS=2;FT_THREADS=4;FT_GPU_PREFILL=0" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+        set_tests_properties(host_v41_q2_unbound host_v41_q2_decode_unbound host_v41_q2_verify_unbound PROPERTIES
+            ENVIRONMENT "FT_NUMAS=2;FT_THREADS=4;FT_GPU_PREFILL=0" RUN_SERIAL TRUE TIMEOUT 180)
+        add_test(NAME host_v41_q2_placement_parity COMMAND numas_v41_q2_moe_test --unbound --parity)
+        add_test(NAME host_v41_iq1_s_placement_parity COMMAND numas_v41_q2_moe_test --iq1-s --unbound --parity)
+        add_test(NAME host_v41_iq1_m_placement_parity COMMAND numas_v41_q2_moe_test --iq1-m --unbound --parity)
+        set_tests_properties(host_v41_q2_placement_parity host_v41_iq1_s_placement_parity
+            host_v41_iq1_m_placement_parity PROPERTIES
+            ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=0" RUN_SERIAL TRUE TIMEOUT 180)
+        if (USE_CUDA)
+            add_test(NAME host_v41_q2_cache_unbound COMMAND numas_v41_q2_moe_test cache 512 --unbound)
+            add_test(NAME host_v41_q2_draft_unbound COMMAND numas_v41_q2_moe_test cache 512 draft --unbound)
+            add_test(NAME host_v41_q2_prefill_unbound COMMAND numas_v41_q2_moe_test host 5120 2304 33 --unbound)
+            add_test(NAME host_v41_iq1_s_prefill_unbound COMMAND numas_v41_q2_moe_test host 768 256 33 --iq1-s --unbound)
+            add_test(NAME host_v41_iq1_m_prefill_unbound COMMAND numas_v41_q2_moe_test host 768 256 33 --iq1-m --unbound)
+            set_tests_properties(host_v41_iq1_s_prefill_unbound host_v41_iq1_m_prefill_unbound PROPERTIES
+                ENVIRONMENT "FT_NUMAS=2;FT_THREADS=4;FT_GPU_PREFILL=0" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+            set_tests_properties(host_v41_q2_cache_unbound host_v41_q2_draft_unbound host_v41_q2_prefill_unbound PROPERTIES
+                ENVIRONMENT "FT_NUMAS=2;FT_THREADS=4;FT_GPU_PREFILL=0" LABELS cuda RUN_SERIAL TRUE TIMEOUT 300)
+        endif()
         add_test(NAME numas_v41_q2_decode COMMAND numas_v41_q2_moe_test decode 256 256)
         add_test(NAME numas_v41_q2_decode_model_inter COMMAND numas_v41_q2_moe_test decode 512 2304)
         add_test(NAME numas_v41_q2_decode_q8k COMMAND numas_v41_q2_moe_test decode 256 768 q2)
@@ -1302,6 +1328,10 @@ if (UNIT_TEST)
         target_link_libraries(numas_fp8_eager_moe_test PRIVATE fastllm)
         add_test(NAME numas_fp8_eager_moe COMMAND numas_fp8_eager_moe_test)
         add_test(NAME numas_fp8_eager_moe_avx2 COMMAND numas_fp8_eager_moe_test --avx2)
+        add_test(NAME host_fp8_eager_moe_unbound COMMAND numas_fp8_eager_moe_test --unbound)
+        add_test(NAME host_fp8_eager_moe_avx2_unbound COMMAND numas_fp8_eager_moe_test --avx2 --unbound)
+        set_tests_properties(host_fp8_eager_moe_unbound host_fp8_eager_moe_avx2_unbound PROPERTIES
+            ENVIRONMENT "FT_NUMAS=2;FT_THREADS=4;FT_GPU_PREFILL=0" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         set_tests_properties(numas_fp8_eager_moe numas_fp8_eager_moe_avx2 PROPERTIES
             ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=0;FASTLLM_ACTIVATE_NUMA=ON"
             SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
@@ -1317,6 +1347,10 @@ if (UNIT_TEST)
         target_link_libraries(numas_nvfp4_moe_test PRIVATE fastllm)
         add_test(NAME numas_nvfp4_moe COMMAND numas_nvfp4_moe_test)
         add_test(NAME numas_nvfp4_moe_avx2 COMMAND numas_nvfp4_moe_test --avx2)
+        add_test(NAME host_nvfp4_moe_unbound COMMAND numas_nvfp4_moe_test --unbound)
+        add_test(NAME host_nvfp4_moe_avx2_unbound COMMAND numas_nvfp4_moe_test --avx2 --unbound)
+        set_tests_properties(host_nvfp4_moe_unbound host_nvfp4_moe_avx2_unbound PROPERTIES
+            ENVIRONMENT "FT_NUMAS=2;FT_THREADS=6;FT_GPU_PREFILL=0" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         set_tests_properties(numas_nvfp4_moe numas_nvfp4_moe_avx2 PROPERTIES
             ENVIRONMENT "FT_NUMAS=2;FT_THREADS=6;FT_GPU_PREFILL=0"
             SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
@@ -2306,6 +2340,22 @@ if (UNIT_TEST)
             add_executable(cuda_glm5_moe_cache_test test/basic/test_cuda_glm5_moe_cache.cu)
             target_link_libraries(cuda_glm5_moe_cache_test PRIVATE fastllm)
             set_target_properties(cuda_glm5_moe_cache_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            fastllm_add_checked_test(host_standard_moe_cache_unbound cuda_moe_cache_test "ALL_PASS unbound" 300 --unbound)
+            set_tests_properties(host_standard_moe_cache_unbound PROPERTIES
+                ENVIRONMENT "FT_NUMAS=2;FT_THREADS=8;FT_GPU_PREFILL=0" LABELS cuda RUN_SERIAL TRUE)
+            foreach(format nvfp4 fp8)
+                set(host_format_args)
+                if(format STREQUAL "fp8")
+                    list(APPEND host_format_args --fp8)
+                endif()
+                foreach(mode frequency prefill verify no-cache)
+                    set(host_case host_glm5_${format}_${mode}_unbound)
+                    fastllm_add_checked_test(${host_case} cuda_glm5_moe_cache_test "GLM.*cache:" 180
+                        --unbound --${mode} ${host_format_args})
+                    set_tests_properties(${host_case} PROPERTIES
+                        ENVIRONMENT "FT_NUMAS=2;FT_THREADS=8;FT_GPU_PREFILL=0" LABELS cuda RUN_SERIAL TRUE)
+                endforeach()
+            endforeach()
             add_test(NAME cuda_glm5_moe_cache COMMAND cuda_glm5_moe_cache_test)
             set_tests_properties(cuda_glm5_moe_cache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             fastllm_add_checked_test(cuda_glm5_moe_frequency cuda_glm5_moe_cache_test "GLM compact NVFP4 cache:" 120 --frequency)

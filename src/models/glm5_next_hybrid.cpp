@@ -361,6 +361,9 @@ namespace fastllm {
         }
         const std::vector<int> outputDims = input.dims;
         input.Reshape({sequence, embed_dim});
+#ifdef USE_NUMAS
+        HostMoePlacementScope placement(routedDevice == "cpu");
+#endif
         HybridMoePipelineGuard hostExperts(input, routedDevice,
             prefill ? prefill->hostExperts : nullptr, prefill ? prefill->firstLayer : -1);
 
@@ -369,13 +372,13 @@ namespace fastllm {
             RunSharedMoe(deviceLayer, mlp, input, output, sharedReady);
         };
 #ifdef USE_CUDA
-        const bool routedOnNumas = routedDevice == "numa" || routedDevice.rfind("numa:", 0) == 0;
+        const bool routedOnSharedHost = IsSharedHostMoeDevice(routedDevice);
         // Host experts run once on rank zero. Peer ranks still contribute
         // their shared-expert partials to the caller's FFN AllReduce.
         if (threadTpRank >= 0) {
-            const bool localNumasBatch = sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH && routedOnNumas;
-            if (!localNumasBatch || threadTpRank != 0) runShared();
-            if (localNumasBatch) {
+            const bool localHostBatch = sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH && routedOnSharedHost;
+            if (!localHostBatch || threadTpRank != 0) runShared();
+            if (localHostBatch) {
                 // Publish peer shared-expert completion without draining its
                 // GPU on the host. The owner borrows a separate per-thread
                 // stream; the following AllReduce waits for the owner on CPU.
@@ -407,7 +410,7 @@ namespace fastllm {
         DiskMoeCudaDeviceScope diskDevices(moeDevices);
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
         NumasMoeCudaAssistScope numaDevices(moeDevices.empty() ? nullptr : &moeDevices);
-        if (threadTpRank == 0 && routedOnNumas)
+        if (threadTpRank == 0 && routedOnSharedHost)
             FastllmCudaPrepareMoeExpertCache(weights.data(), weights.size(), moeDevices);
 #endif
         Data routerInput, routerScores, expertIndex, expertScore;
@@ -417,7 +420,7 @@ namespace fastllm {
 #if defined(USE_CUDA) && defined(USE_NUMAS)
 #ifndef USE_ROCM
         if (!prefill && sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH && input.dataType == DataType::BFLOAT16 &&
-            moeAtype == DataType::BFLOAT16 && routedOnNumas &&
+            moeAtype == DataType::BFLOAT16 && routedOnSharedHost &&
             fastllm::RunHybridMoeOnDevices(input, expertIndex, expertScore, routedOutput,
                 weights.data(), (int)weights.size(), deviceLayer, moeDevices, runShared)) {
             ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
@@ -435,7 +438,7 @@ namespace fastllm {
         const bool prefetchNumasSmallBatch =
             !prefill && sequence >= 1 &&
             sequence <= kNumasMoePrefetchMaxRows &&
-            GetCudaSharedExpert() && routedOnNumas &&
+            GetCudaSharedExpert() && routedOnSharedHost &&
             std::getenv(
                 "FASTLLM_GLM5_DISABLE_NUMAS_MOE_OVERLAP") == nullptr;
         if (prefetchNumasSmallBatch) {
@@ -448,7 +451,13 @@ namespace fastllm {
 
         Data w1, w2, w3, tempInput, tempOutput;
         Data moeInputTemp, moeOutputTemp;
-        if (routedDevice == "cpu") hostExperts.LockCpu();
+        if (routedDevice == "cpu") {
+#ifdef USE_NUMAS
+            if (!CanRunHostMoe({{"weights", (Data *)weights.data()}, {"biass", (Data *)biases.data()}},
+                    {{"weights___batch", int(weights.size())}, {"biass___batch", int(biases.size())}}))
+#endif
+                hostExperts.LockCpu();
+        }
         ApplyMoeDeviceMapForLayer(deviceLayer);
         MergeMOEBlock(
             &input, &expertIndex, &expertScore,
@@ -631,7 +640,7 @@ namespace fastllm {
             for (int layer = 0; layer < cacheLayers; ++layer) {
                 const std::string device = SelectMoeDeviceForLayer(std::min(layer, block_cnt - 1));
                 const auto &experts = layer == block_cnt ? mtpExpertWeights : expertWeights[layer];
-                if ((device == "numa" || device.rfind("numa:", 0) == 0) &&
+                if (IsSharedHostMoeDevice(device) &&
                     experts.size() >= 4 && experts[2] &&
                     (experts[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                      experts[2]->dataType == DataType::FP8_E4M3 ||

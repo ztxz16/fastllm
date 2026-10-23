@@ -186,13 +186,16 @@ static void CheckDuplicateDecode() {
 
 int main(int argc, char **argv) {
     try {
+        const bool unbound = argc > 1 && std::strcmp(argv[argc - 1], "--unbound") == 0;
+        if (unbound) --argc;
+        HostMoePlacementScope placement(unbound);
         if (argc == 2 && std::strcmp(argv[1], "--avx2") == 0) {
             auto *info = GetCPUInstructInfo();
             if (!info->hasAVX2) return 77;
             info->hasAVX512F = info->hasAVX512BF16 = info->hasAVX512VNNI = false;
             info->hasAMX = false;
         }
-        ((Executor *)GetExecutor())->SetFirstDevice("numa");
+        ((Executor *)GetExecutor())->SetFirstDevice(unbound ? "cpu" : "numa");
         // Vary shard tails, expert counts and fanout independently of model
         // dimensions. Include widths without a 64-column exact partition.
         const int shapes[][4] = {
