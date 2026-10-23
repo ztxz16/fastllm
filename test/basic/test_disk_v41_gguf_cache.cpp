@@ -4,6 +4,7 @@
 #include "devices/disk/diskdevice.h"
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -174,6 +175,73 @@ static void TestPreload(Fixture &f, int device, bool mapped = true) {
     SetMoeCpuCacheBytes(0); TrimDiskMoeCache();
     Check(!GetDiskMoeCacheStats().cpuBytes,"GGUF preload survived disable");
 }
+// Compare the cache adapter with canonical records against the same bytes in
+// NUMA's cross-interleaved layout. Include sparse routes and repeated experts.
+static void TestNativeLayout(Fixture &f, int device) {
+    FastllmCudaSetDevice(device);
+    const size_t downOffset = f.gpu[2]->GetBytes(), stride = f.bytes;
+    Data canonical(INT8, {int(stride*2)}), native(INT8, {int(stride*2)});
+    canonical.Allocate(false); native.Allocate(false);
+    for (int e=0; e<2; ++e) {
+        auto *dst = canonical.cpuData+size_t(e)*stride;
+        FastllmCudaCopyFromDeviceToHost(dst, f.gpu[2+2*e]->cudaData, downOffset);
+        FastllmCudaCopyFromDeviceToHost(dst+downOffset, f.gpu[3+2*e]->cudaData, stride-downOffset);
+        auto *packed = native.cpuData+size_t(e)*stride;
+        const size_t rowBytes = downOffset/(2*f.inter);
+        for (int row=0; row<2*f.inter; ++row)
+            memcpy(packed+size_t(2*(row%f.inter)+row/f.inter)*rowBytes, dst+size_t(row)*rowBytes, rowBytes);
+        memcpy(packed+downOffset, dst+downOffset, stride-downOffset);
+    }
+    canonical.ToDevice(CUDA,{device},true); native.ToDevice(CUDA,{device},true);
+    const size_t workspaceBytes = FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(f.hidden,f.inter);
+    Data scratch(INT8,{int(workspaceBytes)});
+    scratch.ToDevice(CUDA,{device},false); scratch.Allocate(false);
+    for (int rows : {1,6,8}) for (bool compact : {false,true}) {
+        constexpr int topk=6;
+        const int routes=compact ? rows*topk/2 : rows*topk;
+        Data input(BFLOAT16,{rows,f.hidden}), scores(FLOAT32,{rows,topk});
+        Data slots(INT32,{routes}), map(INT32,{routes}), output(FLOAT32,{rows*topk,f.hidden}), activation;
+        input.Allocate(false); scores.Allocate(false); slots.Allocate(false); map.Allocate(false); output.Allocate(false);
+        for (int i=0; i<rows*f.hidden; ++i)
+            ((uint16_t*)input.cpuData)[i]=Float32ToBFloat16RNEBits(std::sin(i*.17f)*3.f);
+        for (int i=0; i<rows*topk; ++i) ((float*)scores.cpuData)[i]=i%3==0 ? 0.f : i%3==1 ? -.17f : .35f;
+        for (int i=0; i<routes; ++i) {
+            ((int32_t*)slots.cpuData)[i]=i%5==0 ? -1 : i%2;
+            ((int32_t*)map.cpuData)[i]=2*i;
+        }
+        input.ToDevice(CUDA,{device},true); scores.ToDevice(CUDA,{device},true);
+        slots.ToDevice(CUDA,{device},true); map.ToDevice(CUDA,{device},true);
+        FastllmCudaMoeGGUFCacheView view{};
+        view.routeSlots=(int32_t*)slots.cudaData;
+        view.recordStride=stride; view.downOffset=downOffset;
+        view.gateType=f.gpu[2]->ggmlType; view.downType=f.gpu[3]->ggmlType;
+        view.hidden=f.hidden; view.inter=f.inter;
+        view.workspace=scratch.cudaData; view.workspaceBytes=workspaceBytes;
+        if (compact) { view.routeMap=(int32_t*)map.cudaData; view.routeCount=routes; }
+        std::vector<uint8_t> expected;
+        for (bool interleaved : {false,true}) {
+            std::fill_n((float*)output.cpuData, rows*topk*f.hidden, 17.f);
+            output.ToDevice(CUDA,{device},true);
+            view.records=(uint8_t*)(interleaved ? native.cudaData : canonical.cudaData);
+            view.numaGateType=interleaved ? view.gateType : -1;
+            view.numaDownType=interleaved ? view.downType : -1;
+            Check(FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,activation,view,
+                (float*)scores.cudaData,topk,.8f,(float*)output.cudaData),"native cache adapter rejected");
+            output.ToDevice(CPU);
+            if (!interleaved) expected.assign(output.cpuData,output.cpuData+output.GetBytes());
+            else Check(!memcmp(expected.data(),output.cpuData,expected.size()),"native/canonical cache mismatch");
+        }
+        output.ToDevice(CUDA,{device},true);
+        view.numaGateType=GGML_TYPE_Q2_K_R4;
+        Check(!FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,activation,view,
+            (float*)scores.cudaData,topk,.8f,(float*)output.cudaData),"R4 native layout accepted");
+        view.numaGateType=-1;
+        Check(!FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,activation,view,
+            (float*)scores.cudaData,topk,.8f,(float*)output.cudaData),"partial native layout accepted");
+    }
+    printf("PASS: V4.1 native/canonical cache device=%d gate=%d down=%d\n",device,f.gpu[2]->ggmlType,f.gpu[3]->ggmlType);
+}
+
 int main() { try {
     if (FastllmCudaGetDeviceCount()<1) return 77;
     SetThreads(4);
@@ -184,6 +252,7 @@ int main() { try {
         for (int device=0; device<std::min(2,FastllmCudaGetDeviceCount()); ++device) {
             printf("gate=%d down=%d device=%d\n",pair.first,pair.second,device); fflush(stdout);
             Fixture f(pair.first,pair.second,device);
+            TestNativeLayout(f,device);
             TestPreload(f,device);
             const uint64_t ramBudget = f.bytes*8 + Fixture::experts*2*4*4096;
             SetMoeCpuCacheBytes(0); SetMoeCudaCacheBytes(0); TrimDiskMoeCache();
@@ -291,6 +360,7 @@ int main() { try {
         // Real decode dimensions exercise the large, huge-page-aligned
         // mappings and their ordinary-page tails during D2H demotion.
         Fixture f(GGML_TYPE_IQ1_S,GGML_TYPE_Q2_0,0,5120,2304);
+        TestNativeLayout(f,0);
         SetMoeCpuCacheBytes(0); SetMoeCudaCacheBytes(0); TrimDiskMoeCache();
         auto reference=f.Run(true,1,0,0,8);
         SetMoeCpuCacheBytes(1ULL<<30); SetMoeCudaCacheBytes(f.bytes*8);

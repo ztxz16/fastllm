@@ -88,6 +88,13 @@ __device__ int V41Route(const FastllmCudaMoeGGUFCacheView &view, int route) {
     return view.routeMap ? view.routeMap[route] : route;
 }
 
+__device__ int V41WeightRow(const uint8_t *const *, int row, int, bool) { return row; }
+__device__ int V41WeightRow(const FastllmCudaMoeGGUFCacheView &view, int row, int rows, bool gate) {
+    // NUMA shards concatenate into [gate0, up0, gate1, up1, ...]. Preserve
+    // the canonical output order without copying either projection matrix.
+    return gate && view.numaGateType >= 0 ? 2*(row % (rows/2)) + row/(rows/2) : row;
+}
+
 template<ggml_type Type, bool Gate, class Weights, int RowsPerBlock = 8, int StaticColumns = 0>
 __global__ void V41GGUFProjection(const block_q8_1 *input, __nv_bfloat16 *output,
         Weights weights, const int32_t *indices,
@@ -118,7 +125,7 @@ __global__ void V41GGUFProjection(const block_q8_1 *input, __nv_bfloat16 *output
         activation[i] = reinterpret_cast<const uint32_t *>(x)[i];
     __syncthreads();
     for (int row = firstRow; row < rows && row < (blockIdx.x+1)*RowsPerBlock; row += 8) {
-        const float value = V41GGUFDot<Type>(weight+size_t(row)*rowBytes,
+        const float value = V41GGUFDot<Type>(weight+size_t(V41WeightRow(weights, row, rows, Gate))*rowBytes,
             reinterpret_cast<const block_q8_1 *>(activation), columns, iqGrid);
         if (threadIdx.x%32 == 0) output[size_t(route)*rows+row] = __float2bfloat16_rn(value);
     }
@@ -264,7 +271,8 @@ bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
         !FastllmCudaV41GGUFSupported(view.gateType, view.downType) ||
         (!view.records && !view.recordPointers) || !view.routeSlots || !view.workspace || !scores || !perExpert ||
         view.activeRouteCount || (view.routeMap && (view.routeCount < 1 || view.routeCount > input.dims[0]*topk)) ||
-        view.numaGateType >= 0 || view.numaDownType >= 0)
+        !((view.numaGateType < 0 && view.numaDownType < 0) ||
+          (view.numaGateType == view.gateType && view.numaDownType == view.downType)))
         return false;
     const int rows = input.dims[0], routes = view.routeMap ? view.routeCount : rows*topk;
     const int hidden = view.hidden, inter = view.inter;

@@ -441,9 +441,15 @@ void CopyNativeSharedExpert(const OffloadGroup &group, int table, int expert,
 void DecodeOverlapWorkspace::ConfigureLayout(const OffloadGroup &group, int table, int rows) {
     numaGateType = numaDownType = -1;
     const auto &layout = group.LayerLayout(table);
-    if (group.ggufSources.empty() || layout.deepSeekV41) return;
+    if (group.ggufSources.empty()) return;
     const auto &source = group.ggufSources[table];
-    const bool supported = layout.glm5
+    // V4.1 can read interleaved gate/up rows directly when the quantization
+    // blocks themselves are canonical. R4 packing still needs restoration.
+    const bool supported = layout.deepSeekV41
+        ? source.weights[0].type == layout.gateGgmlType &&
+          source.weights[1].type == layout.downGgmlType &&
+          FastllmCudaV41GGUFSupported(layout.gateGgmlType, layout.downGgmlType)
+        : layout.glm5
         ? FastllmCudaMoeGlm5GGUFCacheNumaSupported(source.weights[0].type,
             source.weights[1].type, layout.hidden, layout.inter)
         : FastllmCudaMoeGGUFCacheNumaSupported(source.weights[0].type,
