@@ -72,6 +72,49 @@
 
 ## 命令与进程归属
 
+### GPU 拓扑与 NUMA 绑定
+
+部署配置顶层 `"numa": "auto"` 为默认值。在多 NUMA 节点的 Linux 机器上，
+`start` 通过 `nvidia-smi` 查询物理 GPU 编号、UUID、PCI 地址和 NUMA 拓扑；
+拓扑命令不可用时读取 PCI sysfs 的 `numa_node`。每个副本的 GPU 应位于同一节点。
+随后在 Python、CUDA 初始化及 KVMem 分配前，以 `numactl --physcpubind=... --membind=N`
+启动该副本。CPU 范围取目标节点与启动环境允许 CPU 的交集，内存节点也必须在
+容器允许范围内。路由和 supervisor 不绑定到某个副本的节点。
+
+自动解析后的 `CUDA_VISIBLE_DEVICES` 使用完整 GPU/MIG UUID，防止 CUDA 枚举顺序与
+物理编号不一致。可以直接在 `gpus` 中填写 UUID 或唯一 UUID 前缀；MIG 标识通过
+`nvidia-smi -L` 查找父 GPU 的 NUMA 节点。该过程不导入模型、PyTorch 或初始化 CUDA。
+
+一个副本跨多个节点、拓扑未知、目标节点无可用 CPU、缺少 `numactl` 或绑定权限不足时，
+启动会明确失败，不退化为只绑 CPU 或 preferred 内存策略。可重新分组 GPU，或在
+`replicas[]` 中显式设置 `"numa_node": 0` 等节点编号覆盖自动判断；该编号属于机器的
+部署配置，组件不预设。显式覆盖会跳过该副本的 GPU 拓扑解析，保留原 GPU 标识。
+跨节点副本显式绑定单个节点时，其他节点的 GPU 仍会访问远端内存。
+
+若需要由外部程序管理绑定，可显式设置顶层 `"numa": "off"`；不能同时指定
+`replicas[].numa_node`。单 NUMA 节点或 CPU 副本默认不额外绑定，仍可显式指定节点。
+`auto` 会为副本设定新的内存策略，保留启动环境的 CPU/cpuset 限制；要完整继承外部
+内存策略应使用 `off`。
+
+普通 `render` 保持离线、跨平台行为。检查当前机器实际 GPU 映射和最终绑定命令：
+
+```sh
+ftllm deploy render --config deployment.json --resolve-topology
+```
+
+该命令只查询拓扑，不分配模型内存。`start` 还会对全部副本的绑定命令执行独立小进程
+探测，检查实际 CPU affinity 和 `MPOL_BIND` 内存策略，全部成功后才开始加载模型。
+`manifest.json`、`status` 的 `numa` 字段及 supervisor 日志记录目标节点、CPU、GPU
+映射和探测结果；模型就绪后再记录线程 CPU 范围及 `/proc/PID/numa_maps` 的分节点
+驻留内存。驻留统计包含共享文件页，不等同于 KV 缓存容量，也不要求所有页都在本节点。
+这些是启动时快照，不是持续采样；不向推理热路径添加日志。
+
+硬绑定只允许在目标节点分配新内存。部署时须为每个节点分别预留 KVMem、模型加载和
+运行时内存，不能把其他节点的空闲内存算作本副本容量。这个检查不替代模型自身的
+内存预算；绑定变更需要重新启动副本，不能迁移已经分配的锁页缓存。
+
+### 生命周期
+
 ```sh
 ftllm deploy render --config deployment.json
 ftllm deploy start  --config deployment.json
@@ -79,8 +122,9 @@ ftllm deploy status --config deployment.json
 ftllm deploy stop   --config deployment.json
 ```
 
-也可使用 `python -m ftllm.deploy ...`。`render` 只输出参数和命令，不创建运行目录或
-启动任何进程；认证参数在输出中隐藏。`start` 等所有副本及路由就绪后返回，后台
+也可使用 `python -m ftllm.deploy ...`。普通 `render` 只输出参数和命令，不创建运行目录或
+启动进程；`--resolve-topology` 会调用系统工具查询拓扑，不启动模型服务。
+认证参数在输出中隐藏。`start` 等所有副本及路由就绪后返回，后台
 supervisor 持续拥有这些进程，终端退出不影响已启动服务。
 
 默认按顺序加载副本以减少同时加载产生的内存峰值，`sequential_start=false` 可并行

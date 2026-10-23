@@ -221,6 +221,7 @@ class LifecycleTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.data = configuration(self.root, free_ports(3))
+        self.data['numa'] = 'off'  # Fake GPU IDs; topology/binding has separate tests.
         self.worker = self.root/'dummy.py'
         self.worker.write_text(DUMMY)
         self.data['worker'] = {'script': str(self.worker)}

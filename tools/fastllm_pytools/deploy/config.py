@@ -91,10 +91,13 @@ def resolve_config(data, source):
     source = Path(source).resolve()
     base = source.parent
     fields(data, ('schema_version', 'name', 'state_dir', 'serve_args', 'env', 'worker', 'replicas',
-                  'router', 'startup_timeout_seconds', 'stop_timeout_seconds', 'sequential_start', 'nofile'), 'deployment')
+                  'router', 'startup_timeout_seconds', 'stop_timeout_seconds', 'sequential_start', 'nofile', 'numa'), 'deployment')
     if data.get('schema_version') != 1 or not re.fullmatch(r'[A-Za-z0-9_-]+', data.get('name', '')):
         raise ValueError('Expected schema_version=1 and a simple deployment name')
     args = parse_serve_args(data['serve_args'])
+    numa = data.get('numa', 'auto')
+    if numa not in ('auto', 'off'):
+        raise ValueError('numa must be "auto" or "off"')
     worker = data.get('worker', {})
     fields(worker, ('python', 'script'), 'worker')
     python = worker.get('python', sys.executable)
@@ -140,7 +143,12 @@ def resolve_config(data, source):
         raise ValueError('At least one replica is required')
     roles, names, ports, devices = [], set(), {port}, set()
     for index, replica in enumerate(replicas):
-        fields(replica, ('name', 'gpus', 'port', 'env', 'max_inflight'), 'replica')
+        fields(replica, ('name', 'gpus', 'port', 'env', 'max_inflight', 'numa_node'), 'replica')
+        numa_node = replica.get('numa_node')
+        if numa_node is not None:
+            integer(numa_node, 'replica.numa_node', minimum=0)
+            if numa == 'off':
+                raise ValueError('replica.numa_node cannot be combined with numa="off"')
         name = replica.get('name', f'replica{index}')
         if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', name) or name in names or name == 'router':
             raise ValueError('Replica names must be distinct simple names other than router')
@@ -169,6 +177,7 @@ def resolve_config(data, source):
         else:
             env['PYTHONPATH'] = control_pythonpath()
         roles.append({'name': name, 'gpus': gpu_ids, 'port': port, 'max_inflight': limit,
+                      'numa_node': numa_node,
                       'url': f'http://127.0.0.1:{port}', 'env': env, 'cwd': str(base),
                       'command': [python, *entry, *data['serve_args'], '--host', '127.0.0.1',
                                   '--port', str(port), '--startup-progress', 'ndjson']})
@@ -181,7 +190,7 @@ def resolve_config(data, source):
     return {'schema_version': 1, 'name': data['name'], 'source_config': str(source),
             'state_dir': path_from(data.get('state_dir', '.ftllm-deploy/' + data['name']), base),
             'replicas': roles, 'router': router, 'api_key': args.api_key,
-            'serve_args': list(data['serve_args']), 'sequential_start': sequential, 'nofile': nofile,
+            'serve_args': list(data['serve_args']), 'sequential_start': sequential, 'nofile': nofile, 'numa': numa,
             'startup_timeout_seconds': seconds(data.get('startup_timeout_seconds', 900), 'startup_timeout_seconds'),
             'stop_timeout_seconds': seconds(data.get('stop_timeout_seconds', 30), 'stop_timeout_seconds')}
 

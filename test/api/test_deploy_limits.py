@@ -96,6 +96,7 @@ class LiveLimitTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.data = configuration(self.root, free_ports(3))
+        self.data['numa'] = 'off'  # This suite exercises proxy limits without GPUs.
         self.data['serve_args'][-1] = '380'
         self.data['router']['queue_limit_per_replica'] = 380
         self.data['startup_timeout_seconds'] = 15

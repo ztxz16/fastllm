@@ -18,6 +18,7 @@ import uuid
 
 from .process import process_identity, owned, group_members, signal_owned, stop_records, write_json, configure_nofile
 from .config import control_pythonpath
+from .numa import prepare_numa, verify_bindings, snapshot_worker
 
 
 def require_linux():
@@ -68,7 +69,8 @@ def status(config):
     return {'name': state['name'], 'phase': phase, 'run_dir': state['run_dir'],
             'supervisor_alive': supervisor_alive, 'replica_processes': alive,
             'error': error, 'started_at': manifest.get('started_at'),
-            'finished_at': manifest.get('finished_at'), 'resource_limits': manifest.get('resource_limits')}
+            'finished_at': manifest.get('finished_at'), 'resource_limits': manifest.get('resource_limits'),
+            'numa': manifest.get('numa')}
 
 
 def stop_state(state, timeout):
@@ -128,6 +130,8 @@ def start(config):
             raise RuntimeError('Deployment is already active; inspect status or stop it first')
         configure_nofile(config)  # Fail before loading any model; leave the caller's limits unchanged.
         check_ports(config)
+        config = prepare_numa(config)
+        verify_bindings(config)
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
         directory = root/'runs'/f'{stamp}_{uuid.uuid4().hex[:8]}'
         directory.mkdir(parents=True, mode=0o700)
@@ -143,7 +147,8 @@ def start(config):
             (sources/source.name).write_bytes(data)
             hashes[source.name] = hashlib.sha256(data).hexdigest()
         write_json(directory/'manifest.json', {'name': config['name'], 'phase': 'starting',
-            'started_at': time.time(), 'processes': {}, 'source_sha256': hashes})
+            'started_at': time.time(), 'processes': {}, 'source_sha256': hashes,
+            'numa': {r['name']: r['numa_binding'] for r in config['replicas']}})
         with (directory/'supervisor.log').open('w') as output:
             proc = subprocess.Popen([sys.executable, '-m', __package__ + '.supervisor', str(directory)],
                 stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
@@ -235,6 +240,7 @@ def supervise(directory):
         # All workers and the router inherit this from the detached supervisor.
         manifest['resource_limits'] = {'nofile': configure_nofile(config, apply=True)}
         print('Deployment resource limits: ' + json.dumps(manifest['resource_limits']), flush=True)
+        print('Deployment NUMA bindings: ' + json.dumps(manifest.get('numa', {})), flush=True)
         save()
         for replica in config['replicas']:
             launch(replica['name'], replica['command'], replica['env'], replica['cwd'])
@@ -244,6 +250,13 @@ def supervise(directory):
             deadline = time.monotonic() + config['startup_timeout_seconds']
             for replica in config['replicas']:
                 wait_ready(replica['url'] + '/v1/models', max(.01, deadline-time.monotonic()))
+        for replica in config['replicas']:
+            binding = replica.get('numa_binding', {})
+            if binding.get('enabled'):
+                snapshot = snapshot_worker(children[replica['name']].pid, binding)
+                manifest['numa'][replica['name']]['after_load'] = snapshot
+                print(f"NUMA after loading {replica['name']}: " + json.dumps(snapshot), flush=True)
+        save()
         launch('router', [sys.executable, '-m', __package__ + '.router', '--run-dir', str(directory)], {}, str(directory))
         host = config['router']['host']
         if host in ('0.0.0.0', ''):
