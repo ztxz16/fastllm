@@ -4783,8 +4783,8 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     if (FastllmCudaGetThreadError()) return false;
 
     if (q.dataType == DataType::BFLOAT16) {
-        // Prefill, batches and other architectures retain the old grouping.
-        const bool smallDecode = bsz == 1 && seqlen == 1 && V41IsSm75();
+        const bool sm75 = V41IsSm75();
+        const bool smallDecode = bsz == 1 && seqlen == 1 && sm75;
         if (FastllmCudaGetThreadError()) return false;
         auto launchScalar = [&](auto headTag, auto padTag, auto valueTag) {
             constexpr int headGroup = decltype(headTag)::value;
@@ -4803,6 +4803,11 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
         // 64 CTAs. Each slice retains the full QK dot and online-softmax order;
         // only independent output dimensions are partitioned (no reduction).
         if (smallDecode) launchScalar(std::integral_constant<int, 8>{}, std::true_type{}, std::integral_constant<int, 8>{});
+        // SM75 multi-token fallback keeps the same heads, QK reduction and online softmax.
+        // Padding separates the eight lanes' shared-memory banks without
+        // splitting values or repeating QK. Keep the legacy path for comparison.
+        else if (sm75 && seqlen > 1 && !V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN"))
+            launchScalar(std::integral_constant<int, kAttnHeadsPerBlock>{}, std::true_type{}, std::integral_constant<int, 1>{});
         else launchScalar(std::integral_constant<int, kAttnHeadsPerBlock>{}, std::false_type{}, std::integral_constant<int, 1>{});
     } else {
         dim3 grid(bsz * seqlen, (heads + kAttnHeadsPerBlock - 1) / kAttnHeadsPerBlock);
