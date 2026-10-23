@@ -1,6 +1,7 @@
 #include "gguf.h"
 #include <assert.h>
 #include <array>
+#include <type_traits>
 
 #ifdef __aarch64__
 
@@ -8273,4 +8274,102 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs,
     (void)bs; (void)bx; (void)by; (void)nrc;
     *s = iq_native::dot(n, static_cast<const block_iq4_xs *>(vx),
                        static_cast<const block_q8_K *>(vy));
+}
+
+#if defined(__AVX2__)
+// Two rows keep the live AVX2 state bounded while sharing IQ1 table lookups,
+// metadata and scales. Each row keeps exactly the single-dot reduction tree.
+template<bool IQ1M>
+static void iq1_q8_K_pair(int n, const void *weight, const void *const *inputs, float *outputs) {
+    using Weight = typename std::conditional<IQ1M, block_iq1_m, block_iq1_s>::type;
+    const auto *x = static_cast<const Weight *>(weight);
+    const block_q8_K *y[2] = {static_cast<const block_q8_K *>(inputs[0]),
+                               static_cast<const block_q8_K *>(inputs[1])};
+    __m256 accum[2] = {_mm256_setzero_ps(), _mm256_setzero_ps()};
+    __m256 delta[2] = {_mm256_setzero_ps(), _mm256_setzero_ps()};
+    float correction[2] = {};
+    for (int i = 0; i < n / QK_K; ++i) {
+        __m256i sumi[2] = {_mm256_setzero_si256(), _mm256_setzero_si256()};
+        __m256i sumd[2] = {_mm256_setzero_si256(), _mm256_setzero_si256()};
+        __m256i duplicated;
+        uint16_t sc[4];
+        float scale;
+        if constexpr (IQ1M) {
+            memcpy(sc, x[i].scales, sizeof(sc));
+            const uint16_t bits = (sc[0] >> 12) | ((sc[1] >> 8) & 0xf0) |
+                ((sc[2] >> 4) & 0xf00) | (sc[3] & 0xf000);
+            scale = GGML_FP16_TO_FP32(bits);
+        } else {
+            scale = GGML_FP16_TO_FP32(x[i].d);
+            const __m128i metadata = _mm_loadu_si128((const __m128i *)x[i].qh);
+            const __m128i scales = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(metadata, 11),
+                _mm_set1_epi16(14)), _mm_set1_epi16(1));
+            const __m128i signs = _mm_or_si128(_mm_srai_epi16(metadata, 15), _mm_set1_epi16(1));
+            const __m128i signedScales = _mm_sign_epi16(scales, signs);
+            duplicated = _mm256_set_m128i(_mm_unpackhi_epi16(signedScales, signedScales),
+                                          _mm_unpacklo_epi16(signedScales, signedScales));
+        }
+        for (int ib = 0; ib < QK_K / 32; ib += 2) {
+            __m256i q1, q2, s1, s2, d1, d2;
+            if constexpr (IQ1M) {
+                q1 = iq1m_values_avx2(x[i].qs + 4 * ib, x[i].qh + 2 * ib);
+                q2 = iq1m_values_avx2(x[i].qs + 4 * ib + 4, x[i].qh + 2 * ib + 2);
+                d1 = iq1m_delta_avx2(x[i].qh + 2 * ib);
+                d2 = iq1m_delta_avx2(x[i].qh + 2 * ib + 2);
+                s1 = _mm256_set_m128i(_mm_set1_epi16(sc[ib/2] >> 3), _mm_set1_epi16(sc[ib/2]));
+                s2 = _mm256_set_m128i(_mm_set1_epi16(sc[ib/2] >> 9), _mm_set1_epi16(sc[ib/2] >> 6));
+                s1 = _mm256_add_epi16(_mm256_slli_epi16(_mm256_and_si256(s1, _mm256_set1_epi16(7)), 1), _mm256_set1_epi16(1));
+                s2 = _mm256_add_epi16(_mm256_slli_epi16(_mm256_and_si256(s2, _mm256_set1_epi16(7)), 1), _mm256_set1_epi16(1));
+            } else {
+                q1 = iq1s_values_avx2(x[i].qs + 4 * ib, x[i].qh[ib]);
+                q2 = iq1s_values_avx2(x[i].qs + 4 * ib + 4, x[i].qh[ib + 1]);
+                s1 = _mm256_set1_epi16(2 * ((x[i].qh[ib] >> 12) & 7) + 1);
+                s2 = _mm256_set1_epi16(2 * ((x[i].qh[ib + 1] >> 12) & 7) + 1);
+            }
+            for (int r = 0; r < 2; ++r) {
+                const __m256i a1 = _mm256_loadu_si256((const __m256i *)(y[r][i].qs + 32 * ib));
+                const __m256i a2 = _mm256_loadu_si256((const __m256i *)(y[r][i].qs + 32 * ib + 32));
+                sumi[r] = _mm256_add_epi32(sumi[r], _mm256_add_epi32(
+                    _mm256_madd_epi16(mul_add_epi8(q1, a1), s1),
+                    _mm256_madd_epi16(mul_add_epi8(q2, a2), s2)));
+                if constexpr (IQ1M) {
+                    const __m256i t1 = _mm256_maddubs_epi16(_mm256_set1_epi8(1), _mm256_sign_epi8(a1, d1));
+                    const __m256i t2 = _mm256_maddubs_epi16(_mm256_set1_epi8(1), _mm256_sign_epi8(a2, d2));
+                    sumd[r] = _mm256_add_epi32(sumd[r], _mm256_add_epi32(
+                        _mm256_madd_epi16(t1, s1), _mm256_madd_epi16(t2, s2)));
+                }
+            }
+        }
+        for (int r = 0; r < 2; ++r) {
+            const float d = y[r][i].d * scale;
+            accum[r] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi[r]), accum[r]);
+            if constexpr (IQ1M) {
+                delta[r] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumd[r]), delta[r]);
+            } else {
+                const int sum = hsum_i32_8(_mm256_madd_epi16(
+                    _mm256_loadu_si256((const __m256i *)y[r][i].bsums), duplicated));
+                correction[r] += d * sum;
+            }
+        }
+    }
+    for (int r = 0; r < 2; ++r) {
+        if constexpr (IQ1M) outputs[r] = hsum_float_8(accum[r]) + IQ1M_DELTA * hsum_float_8(delta[r]);
+        else outputs[r] = hsum_float_8(accum[r]) + IQ1S_DELTA * correction[r];
+    }
+}
+#endif
+
+void ggml_vec_dot_iq1_q8_K_batch(ggml_type type, int n, const void *weight,
+        const void *const *inputs, float *outputs, int rows) {
+    assert(type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M);
+    assert(n % QK_K == 0 && rows > 0);
+    int row = 0;
+#if defined(__AVX2__)
+    for (; row + 1 < rows; row += 2) {
+        if (type == GGML_TYPE_IQ1_M) iq1_q8_K_pair<true>(n, weight, inputs + row, outputs + row);
+        else iq1_q8_K_pair<false>(n, weight, inputs + row, outputs + row);
+    }
+#endif
+    const auto dot = type == GGML_TYPE_IQ1_M ? ggml_vec_dot_iq1_m_q8_K : ggml_vec_dot_iq1_s_q8_K;
+    for (; row < rows; ++row) dot(n, outputs + row, 0, weight, 0, inputs[row], 0, 1);
 }

@@ -125,6 +125,27 @@ static void Test() {
         x.resize(nb*257); y.resize(nb); Fill(x,y,rng,extreme);
         for (int row=0; row<257; ++row) Verify(nb,x.data()+row*nb,y.data(),!extreme);
     }
+    // Independent activation pointers, odd tails, zero scales and -128 bytes.
+    for (int cols : {256, 768, 2304, 5120}) for (bool extreme : {false, true}) {
+        const int nb = cols / QK_K;
+        x.resize(nb * 31); y.resize(nb * 8); Fill(x, y, rng, extreme);
+        for (int rows = 1; rows <= 8; ++rows) for (int w = 0; w < 31; ++w) {
+            const void *inputs[8];
+            float actual[10], expected[8];
+            for (float &v : actual) v = -12345.f;
+            for (int r = 0; r < rows; ++r) {
+                inputs[r] = y.data() + ((r * 3) % 8) * nb;
+                auto volatile dot = &LegacyDot;
+                dot(nb, &expected[r], x.data() + w * nb,
+                    static_cast<const block_q8_K *>(inputs[r]));
+            }
+            ggml_vec_dot_iq1_q8_K_batch(GGML_TYPE_IQ1_S, cols,
+                x.data() + w * nb, inputs, actual + 1, rows);
+            if (actual[0] != -12345.f || actual[rows + 1] != -12345.f ||
+                memcmp(expected, actual + 1, rows * sizeof(float)))
+                throw std::runtime_error("IQ1 batched dot differs from frozen single-row oracle");
+        }
+    }
     puts("PASS: IQ1_S AVX2 legacy bits and dequantized reference");
 }
 

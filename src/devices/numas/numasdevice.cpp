@@ -2271,6 +2271,37 @@ namespace fastllm {
                 const int width = std::min(perNode - column, end - start);
                 Data &weight = *weights[2 * group.expert + phase];
                 if (scoredExact) {
+                    const auto type = static_cast<ggml_type>(weight.ggmlType);
+                    if (group.rows > 1 && (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M)) {
+                        const int inner = phase == 0 ? hidden : inter;
+                        const size_t weightBytes = ggml_row_size(type, inner);
+                        for (int first = 0; first < group.rows; first += 8) {
+                            const int batch = std::min(8, group.rows - first);
+                            const void *inputs[8];
+                            float *outputs[8];
+                            for (int r = 0; r < batch; ++r) {
+                                const int slot = group.rowOffset + first + r, route = (*routes)[slot];
+                                inputs[r] = phase == 0 ? input + (route / topk) * inputBytes :
+                                    downInput + slot * downBytes;
+                                outputs[r] = phase == 0 ? gateUp + (size_t)slot * columns + base :
+                                    output + (size_t)route * hidden + base;
+                            }
+                            for (int c = column; c < column + width; ++c) {
+                                float values[8];
+                                ggml_vec_dot_iq1_q8_K_batch(type, inner,
+                                    weight.numasData[node] + (size_t)c * weightBytes,
+                                    inputs, values, batch);
+                                // Match LinearQ8K's bias-free +0, including signed zero.
+                                for (int r = 0; r < batch; ++r) outputs[r][c] = values[r] + 0.0f;
+                            }
+                            if (phase == 1) for (int r = 0; r < batch; ++r) {
+                                MultiThreadDeepSeekV4NumasRoundOutputOp round(outputs[r], column, column + width);
+                                round.Run();
+                            }
+                        }
+                        start += width;
+                        continue;
+                    }
                     // Reuse one expert's cache-sized weight tile across all
                     // routed rows, but retain the one-row dot/reduction tree.
                     for (int tile = column; tile < column + width; tile += 64) {
@@ -8291,7 +8322,7 @@ namespace fastllm {
     static void NumasMoeGGUFVerifyBatchExact(const uint16_t *input, float *output, int rows,
         Data **weights, const int32_t *indices, const int32_t *gpuIndices,
         const float *scores, int topk, int layer, float swigluLimit,
-        const std::function<void()> &submitted, double *cpuElapsedUs) {
+        int activationQuantBlock, const std::function<void()> &submitted, double *cpuElapsedUs) {
         HostMoePlacementScope placement(weights[2]);
         double hostStart = cpuElapsedUs ? NumasProfileNowMs() * 1000 : 0, workUs = 0;
         auto &work = GetNumasMoeRuntimeWorkspace(layer % 2);
@@ -8321,8 +8352,12 @@ namespace fastllm {
         for (int row = 0; row < rows; ++row) {
             for (int c = 0; c < hidden; ++c)
                 work.inputFloat32[c] = BFloat16BitsToFloat32(input[(size_t)row * hidden + c]);
-            RunMultiThreadConvertFromFloat32(work.realInput.data() + row * inputBytes,
-                gateAct, work.inputFloat32.data(), 1, hidden, pool);
+            if (activationQuantBlock == 32)
+                QuantizeNumasV41Input(work.realInput.data() + row * inputBytes, gateAct, 1, hidden,
+                    reinterpret_cast<const uint8_t *>(work.inputFloat32.data()), FLOAT32);
+            else
+                RunMultiThreadConvertFromFloat32(work.realInput.data() + row * inputBytes,
+                    gateAct, work.inputFloat32.data(), 1, hidden, pool);
         }
         work.hybridDecodeQueues.resize(config->numaCnt);
         work.hybridDecodeWorkers.resize(config->threads);
@@ -8366,21 +8401,23 @@ namespace fastllm {
                 context.gateUp = work.gateUpOutput.data(); context.swiglu = work.swigluOutput.data();
                 context.downInput = work.downInput.data(); context.downType = downAct;
                 context.interDim = inter; context.downRowBytes = downBytes;
-                const int prepareBlock = DeepSeekV4QuantizedPrepareBlock(downAct, inter, 128);
+                const int prepareBlock = DeepSeekV4QuantizedPrepareBlock(downAct, inter, activationQuantBlock);
                 const bool floating = downAct == FLOAT32 || downAct == FLOAT16 || downAct == BFLOAT16;
-                if (prepareBlock || (floating && inter % 128 == 0)) {
+                if (prepareBlock || (floating && inter % activationQuantBlock == 0)) {
                     work.scoredPrepareWorkers.resize(config->threads);
                     for (int t = 0; t < config->threads; ++t) {
                         auto &worker = work.scoredPrepareWorkers[t];
                         worker.context = &context; worker.worker = t; worker.workers = config->threads;
-                        worker.block = prepareBlock ? prepareBlock : 128; worker.activationQuantBlock = 128; worker.swigluLimit = swigluLimit;
+                        worker.block = prepareBlock ? prepareBlock : activationQuantBlock;
+                        worker.activationQuantBlock = activationQuantBlock; worker.swigluLimit = swigluLimit;
                     }
                     runWorkers(work.scoredPrepareWorkers, false);
                 } else {
                     for (int i = 0; i < count; ++i)
                         PrepareDeepSeekV4DownInput(work.gateUpOutput.data() + (size_t)i * inter * 2,
                             work.swigluOutput.data() + (size_t)i * inter, work.downInput.data() + i * downBytes,
-                            downAct, *weights[2 * experts[i].first + 1], inter, true, experts[i].second, swigluLimit, 128, false);
+                            downAct, *weights[2 * experts[i].first + 1], inter, true, experts[i].second,
+                            swigluLimit, activationQuantBlock, false);
                 }
             }
         }
@@ -8446,11 +8483,11 @@ namespace fastllm {
             decodeCompatible) {
             auto runCpu = [&](const std::function<void()> &firstGateSubmitted) {
                 HostMoePlacementScope placement(weights[2]);
-                if (rows > 1 && rows <= kNumasMoePrefetchMaxRows && activationQuantBlock == 128 &&
+                if (rows > 1 && rows <= kNumasMoePrefetchMaxRows &&
                     GetCPUInstructInfo()->hasAVX2 && !GetCPUInstructInfo()->hasAVX512BF16) {
                     NumasMoeGGUFVerifyBatchExact(input, static_cast<float *>(output), rows,
                         weights, indices, gpuIndices, scores, topk, layer, swigluLimit,
-                        firstGateSubmitted, cpuElapsedUs);
+                        activationQuantBlock, firstGateSubmitted, cpuElapsedUs);
                     return;
                 }
                 auto &rowInput = GetNumasMoeRuntimeWorkspace(layer % 2).inputFloat32;
