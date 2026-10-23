@@ -876,7 +876,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     # The library queries free memory after creating the CUDA contexts. Keep
     # additional space for graphs, allocator granularity and library handles.
     guard = 512 * MiB
-    host_limit = ram["available"] - max(GiB, ram["total"] // 10)
+    host_limit = ram["available"] - min(4 * GiB, max(GiB, ram["total"] // 10))
     host_memory_limit = _memory_limit_bytes(
         getattr(args, "auto_host_memory_limit", None), "auto_host_memory_limit"
     )

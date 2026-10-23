@@ -477,6 +477,21 @@ class HybridAutoTest(unittest.TestCase):
                 auto.plan(a, g, costs, "pp", {0: 1}, gpu,
                           {"total": 256 * GiB, "available": 256 * GiB})
 
+    def test_host_reserve_keeps_floor_and_caps_large_machine_budget(self):
+        g, c, gpu, _ = fixture()
+        a = args(moe_device_layers=-1, moe_cuda_cache=0)
+        for total, available, reserve in [(8 * GiB, 8 * GiB, GiB),
+                                          (32 * GiB, 28 * GiB, 32 * GiB // 10),
+                                          (128 * GiB, 120 * GiB, 4 * GiB)]:
+            with self.subTest(total=total), patch.dict(os.environ, {}, clear=True):
+                ram = {"total": total, "available": available}
+                p = auto.plan(a, g, c, "pp", {0: 1}, gpu, ram)
+                self.assertEqual(p["host_budget_bytes"], available - reserve)
+                # The reserve remains unavailable even when total RAM is large.
+                ram["available"] = p["host_estimated_bytes"] + reserve - 1
+                with self.assertRaises(ValueError):
+                    auto.plan(a, g, c, "pp", {0: 1}, gpu, ram)
+
     def test_snapshot_fallback_counts_a_second_host_copy(self):
         g, c, gpu, ram = fixture()
         p = auto.plan(args(), g, c, "pp", {0: 1}, gpu, ram)
