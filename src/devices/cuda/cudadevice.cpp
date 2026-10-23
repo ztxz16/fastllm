@@ -4741,12 +4741,20 @@ namespace fastllm {
             data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmFloatToHalf(old, data.cudaData, len);
-            FastllmCudaFree(old);
+            if (!data.cudaDataBorrowed) FastllmCudaFree(old);
+            data.cudaDataBorrowed = false;
         } else if (data.dataType == DataType::BFLOAT16) {
             data.dataType = DataType::FLOAT16;
             data.UpdateUnitSize();
             int len = data.Count(0);
-            FastllmBF16ToHalf(data.cudaData, data.cudaData, len);
+            void *old = data.cudaData;
+            // A borrowed view must not change its owner's representation or
+            // release the underlying persistent allocation.
+            if (data.cudaDataBorrowed) {
+                data.cudaData = FastllmCudaMalloc(GetConvertedBufferBytes(data));
+                data.cudaDataBorrowed = false;
+            }
+            FastllmBF16ToHalf(old, data.cudaData, len);
         } else {
             ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
         }
@@ -4786,7 +4794,8 @@ namespace fastllm {
             data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmHalfToFloat(old, data.cudaData, len);
-            FastllmCudaFree(old);
+            if (!data.cudaDataBorrowed) FastllmCudaFree(old);
+            data.cudaDataBorrowed = false;
         } else if (data.dataType == DataType::BFLOAT16) {
             uint16_t *old = (uint16_t*)data.cudaData;
             data.dataType = DataType::FLOAT32;
@@ -4795,7 +4804,8 @@ namespace fastllm {
             data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmBF16ToFloat(old, data.cudaData, len);
-            FastllmCudaFree(old);
+            if (!data.cudaDataBorrowed) FastllmCudaFree(old);
+            data.cudaDataBorrowed = false;
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
         }
@@ -4880,12 +4890,20 @@ namespace fastllm {
             data.cudaData = FastllmCudaMalloc(newBytes);
             int len = data.Count(0);
             FastllmFloatToBF16(old, data.cudaData, len);
-            FastllmCudaFree(old);
+            if (!data.cudaDataBorrowed) FastllmCudaFree(old);
+            data.cudaDataBorrowed = false;
         } else if (data.dataType == DataType::FLOAT16) {
             data.dataType = DataType::BFLOAT16;
             data.UpdateUnitSize();
             int len = data.Count(0);
-            FastllmHalfToBF16(data.cudaData, data.cudaData, len);
+            void *old = data.cudaData;
+            // A borrowed view must not change its owner's representation or
+            // release the underlying persistent allocation.
+            if (data.cudaDataBorrowed) {
+                data.cudaData = FastllmCudaMalloc(GetConvertedBufferBytes(data));
+                data.cudaDataBorrowed = false;
+            }
+            FastllmHalfToBF16(old, data.cudaData, len);
         } else {
             ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
         }
@@ -7049,9 +7067,10 @@ namespace fastllm {
 
     void CudaDeepSeekV41WindowStoreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        if (!FastllmCudaDeepSeekV41WindowStore(*(datas.find("chunk")->second), *(datas.find("ring")->second),
+        if (!FastllmCudaDeepSeekV41WindowStorePrefix(*(datas.find("chunk")->second), *(datas.find("ring")->second),
                                                CudaV41Int(intParams, "startPos", 0),
-                                               CudaV41Int(intParams, "windowSize", 128))) {
+                                               CudaV41Int(intParams, "windowSize", 128),
+                                               CudaV41Int(intParams, "rowCount", -1))) {
             ErrorInFastLLM("DeepSeekV41WindowStore CUDA error: kernel rejected input.\n");
         }
     }
@@ -8989,7 +9008,13 @@ namespace fastllm {
         // remain in the existing projection/activation/reduction code below.
 #ifndef USE_ROCM
         FastllmCudaMoePrefillCache prefillCache;
+        // Native GGUF records belong to the scored model path. Ordinary
+        // projections (including speed probes) may restore a different layout
+        // and must retain their temporary storage instead of aliasing the cache.
+        const bool cacheLayoutCompatible = !weights[2] ||
+            weights[2]->dataType != DATA_GGUF_FORMAT || deepSeekV4Mode;
         const bool cachedPrefill = setZero && isCrossSwiglu && gateType == MoeGateSwiglu &&
+            cacheLayoutCompatible &&
             prefillCache.Begin(weights, m, indexData, scoreData, batch, topk, experts, cacheAdmission);
         if (cachedPrefill) weights = prefillCache.Weights();
 #endif

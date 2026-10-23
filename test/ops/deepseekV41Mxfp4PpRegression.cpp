@@ -119,15 +119,16 @@ static void Case(int hidden, int inter, int device, const std::vector<int> &size
               "incorrect optimized/fallback selection");
         Check((f.weights[2]->cudaData==nullptr)==!useSlab,"repack ownership mismatch");
         Compare(Read(output),Read(ref),rows);
-        if (rows==1 && !useSlab) {
+        if (rows<=8 && !useSlab) {
             cudaGraph_t graph; cudaGraphExec_t exec;
             Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
             DoCudaMergeMOE(input,output,ids,scores,a,b,c,f.weights.data(),nullptr,
                           0.f,MoeGateSwiglu,f.weights.size(),10.f,true);
             Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph));
             Cuda(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
-            std::vector<int32_t> changed(f.topk);
-            for(int j=0;j<f.topk;++j) changed[j]=(j+3)%f.experts;
+            std::vector<int32_t> changed(rows*f.topk);
+            for(int r=0;r<rows;++r) for(int j=0;j<f.topk;++j)
+                changed[r*f.topk+j]=(j+3+r)%f.experts;
             Cuda(cudaMemcpy(ids.cudaData,changed.data(),changed.size()*4,cudaMemcpyHostToDevice));
             Cuda(cudaGraphLaunch(exec,cudaStreamPerThread));
             const auto replay=Read(output);
@@ -140,6 +141,73 @@ static void Case(int hidden, int inter, int device, const std::vector<int> &size
     }
 }
 
+// EP compaction must retain original route ids, including empty ranks and
+// experts filling all eight tile rows. Check both initial execution and
+// replay after the GPU routing/input tensors change against the native W4A8
+// reference, not only against another Marlin launch.
+static void ExpertParallelCase() {
+    FastllmCudaSetDevice(0);
+    Fixture f(5120,2304,0,false,12,6);
+    Data scratch,output;
+    for (int owners : {1,2,8}) for (int rows : {1,2,3,4,5,6,7,8})
+    for (int pattern : {0,1,2,3}) {
+        const int owner=owners-1;
+        std::mt19937 rng(919+owners*131+rows*17+pattern);
+        std::vector<float> values(rows*5120),scores(rows*6);
+        std::vector<int32_t> indices(rows*6);
+        for (float &v:values) v=float(int(rng()%65521)-32760)/16384.f;
+        for (int i=0;i<rows*6;++i) {
+            int expert=pattern==3 ? i%6 : (i*13+i/6*17)%12;
+            int rank=pattern==0 ? int(rng()%owners) :
+                     pattern==2 ? (owner+1)%owners : owner;
+            indices[i]=expert*owners+rank;
+            scores[i]=i%7==0 ? 0.f : float(int(rng()%31)-3)/32;
+        }
+        Data input(FLOAT32,{rows,5120},values),score(FLOAT32,{rows,6},scores);
+        Data ids(INT32,{rows,6});ids.Allocate();
+        std::memcpy(ids.cpuData,indices.data(),indices.size()*sizeof(int32_t));
+        ToDataType(input,BFLOAT16);
+        for (Data *d:{&input,&score,&ids}) d->ToDevice(CUDA,{0},true);
+        auto run=[&] {
+            Check(FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
+                input,scratch,output,f.weights.data(),f.weights.size(),
+                (int32_t*)ids.cudaData,(float*)score.cudaData,6,owner,owners,true,10.f),
+                "EP compact Marlin launch failed");
+        };
+        run();Cuda(cudaDeviceSynchronize());
+        cudaGraph_t graph;cudaGraphExec_t exec;
+        Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
+        run();Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph));
+        Cuda(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+        for (int replay=0;replay<2;++replay) {
+            if (replay) {
+                std::rotate(indices.begin(),indices.begin()+6%indices.size(),indices.end());
+                for (float &v:values) v=-v;
+                Data changed(FLOAT32,{rows,5120},values);ToDataType(changed,BFLOAT16);
+                changed.ToDevice(CPU);
+                Cuda(cudaMemcpy(input.cudaData,changed.cpuData,changed.GetBytes(),cudaMemcpyHostToDevice));
+                Cuda(cudaMemcpy(ids.cudaData,indices.data(),indices.size()*sizeof(int32_t),cudaMemcpyHostToDevice));
+            }
+            Cuda(cudaGraphLaunch(exec,cudaStreamPerThread));
+            auto actual=Read(output);
+            run();Check(actual==Read(output),"EP graph/eager result mismatch");
+            std::vector<float> localScores=scores;
+            Data localIds(INT32,{rows,6});localIds.Allocate();
+            for (int i=0;i<rows*6;++i) {
+                ((int32_t*)localIds.cpuData)[i]=indices[i]/owners;
+                if (indices[i]%owners!=owner) localScores[i]=0.f;
+            }
+            Data ls(FLOAT32,{rows,6},localScores),reference;
+            localIds.ToDevice(CUDA,{0},true);ls.ToDevice(CUDA,{0},true);
+            DoCudaMergeMOEV41Fallback(input,reference,localIds,ls,f.reference.data(),
+                                     f.reference.size(),0.f,10.f);
+            std::printf("EP owners=%d rows=%d pattern=%d replay=%d ",owners,rows,pattern,replay);
+            Compare(actual,Read(reference),rows);
+        }
+        Cuda(cudaGraphExecDestroy(exec));Cuda(cudaGraphDestroy(graph));
+    }
+}
+
 int main(int argc,char **argv) {
     try {
         int devices=0;
@@ -148,6 +216,16 @@ int main(int argc,char **argv) {
         Cuda(cudaGetDeviceProperties(&properties,0));
         if(properties.major<8) return 77; // In-tree Marlin requires SM80+.
         SetThreads(4);
+        if (argc > 1 && std::string(argv[1]) == "--ep") {
+            ExpertParallelCase();
+            std::printf("V4.1 MXFP4 EP regression PASS: %d checks\n",checks);
+            return 0;
+        }
+        if (argc > 1 && std::string(argv[1]) == "--verify") {
+            Case(5120,2304,0,{1,2,3,4,5,6,7,8});
+            std::printf("V4.1 MXFP4 verification regression PASS: %d checks\n",checks);
+            return 0;
+        }
         if (argc > 1 && std::string(argv[1]) == "--draft") {
             Case(5120,2304,0,{5,5,1,2,3,4,5,6,5,1},false,128,3,true);
             std::printf("V4.1 MXFP4 draft regression PASS: %d checks\n",checks);

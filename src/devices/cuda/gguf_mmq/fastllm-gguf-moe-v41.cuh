@@ -49,7 +49,8 @@ __global__ void ActivateV41(const float *products, __nv_bfloat16 *gate,
     gate[i] = __float2bfloat16_rn(row < 0 ? 0.f : __fmul_rn(scores[i/inter], h));
 }
 
-__global__ void ReduceV41(const float *products, __nv_bfloat16 *output,
+template<class T>
+__global__ void ReduceV41(const T *products, __nv_bfloat16 *output,
                           const int *routeGroups, const int *indices,
                           int rows, int hidden, int topk) {
     const int i = blockIdx.x*blockDim.x+threadIdx.x;
@@ -69,7 +70,7 @@ __global__ void ReduceV41(const float *products, __nv_bfloat16 *output,
         const int route = base+order[k];
         const int group = routeGroups ? routeGroups[route] : route;
         if (group >= 0) sum = __fadd_rn(sum, __bfloat162float(__float2bfloat16_rn(
-            products[size_t(group)*hidden+i%hidden])));
+            mmq_io<T>::to_float(products[size_t(group)*hidden+i%hidden]))));
     }
     output[i] = __float2bfloat16_rn(sum);
 }

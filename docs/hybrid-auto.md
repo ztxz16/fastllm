@@ -19,7 +19,7 @@ Dense Qwen3 按实际 GQA 头数、KV、dense 权重及 tied output head 副本�
 
 Qwen3.5 稠密 HF 模型按全注意力层的 GQA KV、线性注意力层的常驻状态、原生 FP8 权重和独立 MTP 层预算。先尝试原生上下文与纯 GPU TP2，必要时尝试 TP4 和较短上下文；显式 `--tp`、`--max_batch`、`--max_context_length`、`--tokens`、`--mtp 0` 或 `--speculative_algorithm off` 优先。内置 `mtp.safetensors` 且配置声明一个草稿层时默认启用 MTP5。默认 `--cuda_embedding`，不自动启用视觉输入。
 
-HF safetensors 目录支持索引引用的多级分片和符号链接分片；`dtype=fastllm` 的版本 1 GGUF 量化张量读取序列化类型头，按保存的量化字节数规划，不按默认 FP16 展开。索引中的绝对路径、`..` 路径仍会拒绝。
+HF safetensors 目录支持索引引用的多级分片和模型目录内的符号链接分片；`dtype=fastllm` 的版本 1 GGUF 量化张量读取序列化类型头，按保存的量化字节数规划，不按默认 FP16 展开。索引中的绝对路径、`..` 路径和指向模型目录外的符号链接仍会拒绝。
 
 ## 单参数自动选择
 
@@ -29,19 +29,21 @@ DeepSeek-V4.1 的 `--auto` 默认使用 **`kv_cache_dtype=fp4`**：长期压缩 
 
 DeepSeek-V4.1 的 `fast_prefill` 沿用已有近似注意力语义，可能改变 logits。可用 `--no_fast_prefill` 关闭；`--dspark 0` 或 `--speculative_algorithm off` 关闭推测解码。显式上下文、草稿数、阈值和 JSON 配置中的 `fast_prefill: false` 均优先；`--threads 64` 可固定线程数。预算不足时先调整自动 chunk、缓存和专家放置，仍放不下则报错，不自动缩短 1M 上下文。
 
-DeepSeek-V4.1 的显存估算按 KV source 层统计共享的压缩 KV 和 index key，并计入原生缓存扩容的容量余量及新旧缓冲重叠。Indexer 打分按原生分块预算估算（默认 128 MiB，遵循 `FASTLLM_DSV41_INDEX_SCORE_MB` 和 `FASTLLM_DSV41_INDEX_CHUNK`），不直接预留完整的 `chunk × context` 分数矩阵。原模型的 FP8 投影按实际保留的精度及 scale 预算，输出头、路由和其他强制展开的投影仍按原生精度计入。DeepSeek-V4.1 磁盘专家的自动 chunk 候选为 **8192、4096、2048、1024、512、256**；其他路径的候选上限保持 4096。候选不超过上下文长度；显式指定数值时不会自动降低。
+DeepSeek-V4.1 的显存估算按 KV source 层统计共享的压缩 KV 和 index key，并计入原生缓存扩容的容量余量及新旧缓冲重叠。Indexer 打分按原生分块预算估算（默认 128 MiB，遵循 `FASTLLM_DSV41_INDEX_SCORE_MB` 和 `FASTLLM_DSV41_INDEX_CHUNK`），不直接预留完整的 `chunk × context` 分数矩阵。原模型的 FP8 投影按实际保留的精度及 scale 预算，输出头、路由和其他强制展开的投影仍按原生精度计入。DeepSeek-V4.1 的自动 chunk 候选为 **8192、4096、2048、1024、512、256**；其他模型的候选上限保持 4096。候选不超过上下文长度；显式指定数值时不会自动降低。
 
-规划日志分别输出 `kv_logical_bytes_per_device`（有效载荷）、`kv_capacity_bytes_per_device`（含增长余量的容量）和 `kv_reallocation_bytes_per_device`（扩容时的旧缓冲重叠），避免将有效 KV 大小和规划峰值混为一谈。
+规划日志分别输出 `kv_logical_bytes_per_device`（有效载荷）、`kv_capacity_bytes_per_device`（含增长余量的容量）和 `kv_reallocation_bytes_per_device`（扩容时的旧缓冲重叠），避免将有效 KV 大小和规划峰值混为一谈。GGUF NUMA 模型开启 DSpark 多卡分流时，辅助卡即使没有本地 NUMA 专家，也保留专家上传缓冲预算。
 
 DeepSeek-V4.1 原生 FP8/MXFP4 模型在单请求、非 TP、BF16、NUMA/磁盘专家和 `fast_prefill` 路径下，按 attention、WoA、MoE 分阶段的临时缓冲峰值估算工作区。主机专家使用复用的 256 行工作缓冲，避免按 chunk 为每个路由重复计入 GPU 中间张量；WoA 保留 FP32 fallback 的权重展开和分块空间。调试 dump、其他精度、GPU 驻留专家等路径继续采用通用保守估算。CUDA graph 隐式启用的 GPU embedding 也计入预算。
 
-DeepSeek 混推的 `--auto` 在上下文预算不变的前提下优先选择最大的可行 chunk，候选顺序为 8192、4096、2048、1024、512、256；显式 chunk 优先。自动拓扑在同一主机后端支持该 chunk 时优先 PP，显式 `--tp` 或 `--device` 不受影响。磁盘专家仍比较正常 embedding 与 `low_gpu_mem`，为 chunk 和专家缓存腾出显存；全部专家可放 GPU 时保留正常模式。此策略保留默认 `gpu_mem_ratio`、512 MiB guard、完整上下文 KV 及扩容重叠预算，不把短请求的实测显存当作 1M 上下文上限。
+DeepSeek 混推的 `--auto` 在上下文预算不变的前提下，先争取 chunk 达到 **512**，再优先将**每卡专家缓存补到 3 GiB**，随后选择最大的可行 chunk，并将剩余显存分给缓存。候选 chunk 为 8192、4096、2048、1024、512、256，不超过上下文长度；预算不足以满足目标时尽量接近，不因此拒绝可行方案，也不为凑缓存把已可行的 512 降到 256。全部专家驻留 GPU 时无需额外缓存。显式 chunk、缓存、驻留和内存限制优先。这一排序同时用于各拓扑内部和跨拓扑选择；同等 chunk／缓存优先级下自动拓扑优先 PP，显式 `--tp` 或 `--device` 不受影响。主机专家方案会比较正常 embedding 与 `low_gpu_mem`，为 chunk 和专家缓存腾出显存；全部专家可放 GPU 时保留正常模式。此策略保留默认 `gpu_mem_ratio`、512 MiB guard、完整上下文 KV 及扩容重叠预算，不把短请求的实测显存当作 1M 上下文上限。
 
 主存优先使用 NUMA（构建支持时），否则使用 CPU；超大 PLE/Engram 表优先按需读取，减少启动搬运和主存占用，主存仍放不下时再考虑磁盘专家缓存。CUDA Graph 默认开启，原有 `FASTLLM_CUDA_GRAPH` 显式设置仍优先。原有运行时检查继续决定 Graph 能否实际捕获。
 
-Qwen4 混推在上下文容量达到 64K 时，优先使用每层 32K 显存池的精确 QSA KV streaming，将腾出的显存用于专家缓存或驻留。计入完整 KV、工作区和安全余量后，若各卡仍能容纳自己负责的全部专家（驻留或缓存），则完整显存 KV 也参与延迟比较。32K 池不可行时再尝试 16K、8K 池；较短上下文仅在完整 KV 放不下时考虑 streaming。所有方案保留逻辑上下文容量；完整 FP16 KV 放在 pinned 主存，索引仍覆盖全部上下文。预算包括主存 KV、GPU 页表和 prefill 临时使用的一整层 KV，保留原有显存安全余量。主存专家加 KV streaming 的优先级高于磁盘专家；主存不足或 streaming 不可行时仍可退回完整显存 KV。若仍放不下，加载前报错，不自动缩短上下文。
+Qwen4 混推默认保留前缀缓存和历史对话复用，后续请求可复用已计算的相同文本前缀。自动规划不会为了扩大专家缓存而关闭复用；完整 KV 放不下时，调整专家驻留、缓存和设备配置，仍无可行方案则在加载前报错，不自动缩短上下文。
 
-自动 KV streaming 仅用于现有支持的 Qwen4 FP16 QSA、单请求混推路径，可使用单卡、PP 或 TP；不启用其他模型的近似 KVMem。它关闭 prefix/history 复用，但保留原生注意力选页；模型检测自动填入的历史缓存默认值不会阻止规划。用户通过命令行、JSON 或现有 prefix-cache 环境变量显式开启复用，或跳过 warmup、指定其他精度、多请求、指定不等于单请求上下文的总 token 容量时，不自动启用。显式 `--kvmem` 仍需配合原有手动参数。最终 `[auto]` 日志中的 `automatic.kv_streaming` 和 `kvmem` 给出实际选择。
+只有显式设置 `--prefix_cache false --cache_history false` 时，自动规划才考虑精确 QSA KV streaming；对应 JSON 配置和现有 `FASTLLM_PREFIX_CACHE` 环境变量也遵循这一规则。该模式不复用跨请求的前缀和历史，但保留原生注意力选页。适用范围为现有支持的 Qwen4 FP16 QSA、单请求混推路径，可使用单卡、PP 或 TP；不启用其他模型的近似 KVMem。跳过 warmup、指定其他精度、多请求或指定不等于单请求上下文的总 token 容量时，不自动启用。显式 `--kvmem` 仍需配合原有手动参数。
+
+允许 streaming 时，上下文容量达到 64K 后优先使用每层 32K 显存池，将腾出的显存用于专家缓存或驻留。若各卡仍能容纳自己负责的全部专家，完整显存 KV 也参与延迟比较。32K 池不可行时再尝试 16K、8K 池；较短上下文仅在完整 KV 放不下时考虑 streaming。所有方案保留逻辑上下文容量；完整 FP16 KV 放在 pinned 主存，索引仍覆盖全部上下文。预算包括主存 KV、GPU 页表和 prefill 临时使用的一整层 KV，保留原有显存安全余量。主存专家加 KV streaming 的优先级高于磁盘专家；主存不足或 streaming 不可行时仍可退回完整显存 KV。最终 `[auto]` 日志中的 `automatic.kv_streaming` 和 `kvmem` 给出实际选择。
 
 这些是快速估计规则，不是实测吞吐或完整调优：不会为了挑选配置反复加载模型。缓存局部性、PCIe 和算子效率的估计有误差；先应用上述 KV 容量策略，再比较预计延迟。估计延迟相差不超过 10% 时，优先选择较少设备和集合通信的方案；同一拓扑在显存能容纳全部专家时优先保留完整 KV。实际请求也可能更适合另一种模式。Qwen3.5 稠密 HF 模型自动搜索双卡和四卡等比例 TP；其他模型的自动 TP 搜索仍限双卡、相近规格。多卡 PP 和显式等比例 TP 继续沿用现有预算校验。
 
@@ -50,6 +52,8 @@ Qwen4 的纯自动选型优先采用可行的单卡或 PP 方案，减少混推�
 Qwen4 自动混推在主存充足时优先将目标专家全部放在主存，把可用显存用于动态专家缓存；主存不足时仍可选择部分整层驻留，避免过早使用磁盘专家。能全驻留 GPU 的模型仍保留全 GPU 方案。PP 的自动缓存按每张卡的权重、KV、MTP 和工作区分别核算，不再由最紧张的卡统一限制；`moe_cuda_cache_per_device` 给出各卡字节预算，`moe_cuda_cache` 为其中的最大值。显式缓存和显式驻留仍优先；TP 缓存仍使用统一的每卡预算，其他模型保持原有选择规则。
 
 显存预算保留 `gpu_mem_ratio` 对应的预留量（默认总显存的 10%），并另外计入每卡 512 MiB 的 Graph、库句柄和分配器保护空间；不会将实测剩余显存全部分配给专家缓存。Qwen 的预算还包括 Graph 默认启用的 CUDA embedding，GGUF 词嵌入按实际展开后的 FP32 大小计算；多卡 PP MTP 自动采用 CPU embedding 时免去对应显存开销。这是容量估计，不是运行时显存硬上限；CUDA 分配器可能保留可复用的空闲缓冲，因此驱动看到的显存峰值可能高于规划估算。实际余量仍取决于请求形状和运行时分配。
+
+主存预算从检测到的可用主存中扣除总主存的 10%，预留量最低 1 GiB、最高 4 GiB；显式 `--auto_host_memory_limit` 仍可进一步收紧预算。加载暂存、运行工作区和 KV 镜像另计入预计用量。这是规划预算，不是进程内存硬上限。
 
 显式参数优先，包括关闭缓存的 `0`、全部主存专家的 `--moe_device_layers -1`、`--tp off`、线程数、精度和阈值。除上述带内置草稿权重的 Qwen3.5 稠密 HF 模型外，仅添加 `--auto` 不会启用 MTP，需指定 MTP 或提供草稿模型。若指定并发而未指定总 token 容量，会按上下文乘以并发预留。不会为了通过预算缩小用户指定的上下文或并发。JSON 配置中的设置也作为显式值处理；`--auto` 下同时给出的命令行设置优先于 JSON。
 

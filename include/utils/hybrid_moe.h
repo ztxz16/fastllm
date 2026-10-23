@@ -12,19 +12,22 @@ namespace fastllm {
 // Keep score placement, projection rounding and activation quantization distinct.
 enum class HybridMoeMath { Standard, Glm5, DeepSeekV41 };
 
+// Both placements use the same kernels and cache policy in NUMA-enabled builds.
+bool IsSharedHostMoeDevice(const std::string &device);
+
 // Full prefill timings are meaningful for these host-expert layouts. Keep
 // this capability independent of model names and cache capacity.
 bool HybridMoeMeasuredNativePrefill(const Data *gate, const Data *down,
                                    HybridMoeMath math);
 
 // A short-lived preparation plan borrows the original expert tables. GPU and
-// disk-resident layers stay outside the host cache. NUMA storage can only be
-// borrowed when every selected table is registered by the supplied callback.
+// disk-resident layers stay outside the host cache. CPU tables register as one
+// unbound shard; NUMA tables use the supplied placement-aware registration.
 class HybridMoeCachePlan {
 public:
     explicit HybridMoeCachePlan(HybridMoeMath math = HybridMoeMath::Standard,
-                               float swigluLimit = 0.0f)
-        : math(math), swigluLimit(swigluLimit) {}
+                               float swigluLimit = 0.0f, double budgetFraction = 1.0)
+        : math(math), swigluLimit(swigluLimit), budgetFraction(budgetFraction) {}
     void Add(const std::vector<Data *> &weights, const std::string &device,
              int cacheDevice = -1);
     bool Prepare(const std::function<void()> &registerNumaWeights = {},
@@ -34,7 +37,8 @@ private:
     std::vector<Layer> layers;
     HybridMoeMath math;
     float swigluLimit;
-    bool allNuma = true;
+    double budgetFraction; // Model subgroups share one per-device cache budget.
+    bool allNuma = true, allCpu = true;
 };
 
 // One complete target token/verification step owns one policy scope. Cache
@@ -85,8 +89,9 @@ bool RunHybridMoe(const Data &input, const Data &index, const Data &score,
                   Data &output, Data **weights, int count, int layer,
                   const std::function<void()> &launchParallel = {});
 
-// Tensor-parallel host experts can use multiple GPU cache/assist devices while
-// retaining their existing format-specific reduction and shared-expert overlap.
+// Host experts can borrow multiple GPUs independently of dense PP/TP placement.
+// The caller hands off their streams; format-specific expert math and ordered
+// reduction stay in the backend. Residency is independent of temporary work.
 bool RunHybridMoeOnDevices(const Data &input, const Data &index, const Data &score,
                           Data &output, Data **weights, int count, int layer,
                           const std::vector<int> &devices,

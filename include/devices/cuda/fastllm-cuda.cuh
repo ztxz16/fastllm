@@ -200,8 +200,8 @@ void FastllmCudaGraphPointerTablesEnd();
 // captured. After capture, the optimizer rewires the sequential region into
 // shared/routed expert branches and removes every marker node. CUDA does not
 // allow node removal from graphs containing allocation/free nodes; in that
-// case the optimizer leaves the graph untouched and asks the caller to capture
-// again with markers disabled.
+// case the optimizer leaves the graph untouched. The caller may retain that
+// serial graph or capture again with markers disabled.
 static constexpr int FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS = -2;
 static constexpr int FASTLLM_CUDA_GRAPH_RECAPTURE_WITHOUT_PARALLEL_MARKERS =
     FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS;
@@ -221,6 +221,9 @@ bool FastllmCudaGraphQwen35MoeSelfTest();
 // the join depends on both region tails. Region ids only need to be unique in
 // one captured graph. Keep the Qwen3.5 entry points for source/ABI
 // compatibility.
+// Callers must keep persistent branch buffers disjoint. Within a graph pool,
+// temporary reuse and collectives in both branches retain serial dependencies.
+void FastllmCudaGraphRecordCollective();
 inline bool FastllmCudaGraphSetParallelMarkersEnabled(bool enabled) {
     return FastllmCudaGraphSetQwen35MoeMarkersEnabled(enabled);
 }
@@ -973,6 +976,11 @@ bool FastllmCudaDeepSeekV41EngramApply(fastllm::Data &hidden, const fastllm::Dat
 bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
                                        int posStep, bool inverse, int originalSeqLen, float ropeFactor,
                                        int betaFast, int betaSlow, int quantMode, int quantDim, int quantBlock);
+// Graph replay reads the current absolute position from a device scalar.
+bool FastllmCudaDeepSeekV41RotaryQuantPosition(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
+                                       int posStep, bool inverse, int originalSeqLen, float ropeFactor,
+                                       int betaFast, int betaSlow, int quantMode, int quantDim, int quantBlock,
+                                       const int *devicePosition);
 bool FastllmCudaDeepSeekV41Compress(const fastllm::Data &kv, const fastllm::Data *score,
                                     fastllm::Data &normWeight, int ratio, float normEps, fastllm::Data &output);
 bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const fastllm::Data &weights,
@@ -1000,6 +1008,9 @@ bool FastllmCudaDeepSeekV41HybridSparseAttention(const fastllm::Data &q, const f
                                            int windowSize, int startPos, float softmaxScale,
                                            fastllm::Data &output);
 bool FastllmCudaDeepSeekV41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring, int startPos, int windowSize);
+// rowCount limits writes to a prefix without changing the source batch stride; -1 writes all rows.
+bool FastllmCudaDeepSeekV41WindowStorePrefix(const fastllm::Data &chunk, fastllm::Data &ring,
+                                            int startPos, int windowSize, int rowCount);
 bool FastllmCudaDeepSeekV41QuantizeActivation(const fastllm::Data &input, fastllm::Data &output);
 // Input has already undergone block-32 FP8 activation quantization.
 bool FastllmCudaDeepSeekV41LinearBlock32(const fastllm::Data &input, fastllm::Data &weight,
@@ -2281,6 +2292,9 @@ bool FastllmCudaPrepareNVFP4E4M3Moe(fastllm::Data **weights, int weightsBatch);
 void FastllmCudaReleaseMergeMOEVllmMarlinCache(const fastllm::Data *layerKey);
 // Read-only readiness check: no repacking or allocation during graph capture.
 bool FastllmCudaV41MarlinGraphReady(const fastllm::Data *layerKey, int rows);
+// Resident backend admission, independent of checkpoint bit width. Unknown
+// backends and CPU routing fallbacks must not enter a GPU MoE graph.
+bool FastllmCudaV41MoeGraphReady(const fastllm::Data *layerKey, int rows, int topk);
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
 bool FastllmCudaBFloat16MergeMOEDeepGemmSm120ExpertParallel(
         const fastllm::Data &input, fastllm::Data &output,

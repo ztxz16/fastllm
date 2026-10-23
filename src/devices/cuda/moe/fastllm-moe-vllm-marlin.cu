@@ -632,14 +632,8 @@ __global__ void BuildEpMetadataKernel(const int32_t *__restrict__ globalIndices,
     numTokensPadded[0] = active * 8;
 }
 
-// Build one route list for a small multi-row verification batch. Marlin stores
-// gate/up outputs by flattened route id (row * topk + slot), so the same
-// metadata can be reused by the down projection with topk=1 and
-// rows=rows*topk. Keep one route in row zero of each padded block, matching the
-// established per-row path exactly; coalescing routes of one expert into other
-// tile rows changes low-order MMA accumulation on near-tied DSpark logits.
-// A single persistent Marlin launch can still consume every block, removing
-// the eight complete launch sequences per layer without changing tile layout.
+// Fallback metadata outside the compact small-batch path. Each route uses
+// row zero of an eight-row tile and retains its original flattened route id.
 __global__ void BuildEpMetadataRowsKernel(
         const int32_t *__restrict__ globalIndices,
         int32_t *__restrict__ sortedTokenIds,
@@ -708,13 +702,18 @@ __global__ void BuildEpMetadataRowsKernel(
 // Stable compact routing for at most 8 rows and top-k <= 16. Each expert
 // tile contains up to eight real routes. Original flattened route ids preserve
 // output scatter and the subsequent per-token weighted reduction order.
+// One 128-thread block handles EP filtering and compaction without atomics.
 __global__ void BuildGroupedMoeRowsKernel(
         const int32_t *indices, int32_t *sortedTokenIds,
         int32_t *gateExpertIds, int32_t *downExpertIds,
-        int32_t *numTokensPadded, int routes) {
+        int32_t *numTokensPadded, int routes, int localExperts,
+        int ownerRank = 0, int ownerCount = 1) {
     __shared__ int experts[128], blocks[128], warpCounts[4];
     const int route = threadIdx.x;
-    const int expert = route < routes ? indices[route] : -1;
+    int expert = route < routes ? indices[route] : -1;
+    const bool local = expert >= 0 && expert % ownerCount == ownerRank &&
+                       expert / ownerCount < localExperts;
+    expert = local ? expert / ownerCount : -1;
     experts[route] = expert;
     __syncthreads();
     int count = 0, leader = route;
@@ -724,7 +723,7 @@ __global__ void BuildGroupedMoeRowsKernel(
             ++count;
         }
     }
-    const bool first = route < routes && count % 8 == 0;
+    const bool first = local && count % 8 == 0;
     if (first) leader = route;
     int prefix = first;
     const int lane = route % 32, warp = route / 32;
@@ -739,14 +738,15 @@ __global__ void BuildGroupedMoeRowsKernel(
     if (first) {
         const int block = prefix - 1;
         blocks[route] = block;
-        gateExpertIds[block] = downExpertIds[block] = expert;
+        gateExpertIds[block] = expert;
+        if (downExpertIds) downExpertIds[block] = expert;
         reinterpret_cast<int4 *>(sortedTokenIds + block * 8)[0] =
             make_int4(routes, routes, routes, routes);
         reinterpret_cast<int4 *>(sortedTokenIds + block * 8)[1] =
             make_int4(routes, routes, routes, routes);
     }
     __syncthreads();
-    if (route < routes) sortedTokenIds[blocks[leader] * 8 + count % 8] = route;
+    if (local) sortedTokenIds[blocks[leader] * 8 + count % 8] = route;
 }
 
 __global__ void ClearAwqMoeRouteCountsKernel(
@@ -3633,7 +3633,7 @@ static bool RunNvfp4E4M3MarlinMoe(
     if (groupedRows) {
         BuildGroupedMoeRowsKernel<<<1, 128, 0, stream>>>(
             indices, routeStorage->sortedTokenIds, routeStorage->gateExpertIds,
-            routeStorage->downExpertIds, routeStorage->numTokensPadded, routes);
+            routeStorage->downExpertIds, routeStorage->numTokensPadded, routes, cache->experts);
     } else if (smallBatch && batch <= 9 && !groupedDecode) {
         // Give each route a dedicated padded Marlin row. Besides matching
         // the batch-1 reduction layout, this avoids the nondeterministic
@@ -3856,9 +3856,8 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
         }
     }
     const int scratchRoutes = groupedRows ? chunkRows * topk : topk;
-    // Bound temporary storage while processing an entire decode batch or
-    // prefill chunk with a small number of grouped launches. Each route keeps
-    // its original tensor-core tile row and BF16 rounding boundaries.
+    // Bound temporary storage while processing the batch in grouped chunks.
+    // Flattened route ids retain the activation and reduction buffer layout.
     w1.Resize({scratchRoutes, cache->intermediate});
     w1.Allocate(false);
     const auto outputType = deepSeekV41 ? fastllm::DataType::FLOAT32 : input.dataType;
@@ -3944,7 +3943,18 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
             void *chunkOutput = (uint8_t *)finalOutput + (size_t)first * cache->hidden *
                 (deepSeekV41 ? sizeof(float) : sizeof(T));
             w1.Resize({routes, cache->intermediate});
-            if (deepSeekV41 && (count >= 16 || tileRows == 32)) {
+            const bool compactRoutes = count > 1 && count <= 8 && tileRows == 8;
+            // Compact tiles use K=64 with the existing route-ordered reduction.
+            // On H20, four CTAs per SM improve these two model-sized projections;
+            // other architectures and shapes retain the general launch geometry.
+            const bool h20Compact = deepSeekV41 && compactRoutes &&
+                cache->computeMajor == 9 && cache->sms == 78 && cache->hidden == 5120 &&
+                cache->intermediate == 2304;
+            if (compactRoutes) {
+                BuildGroupedMoeRowsKernel<<<1, 128, 0, cudaStreamPerThread>>>(
+                    chunkIndices, sortedTokenIds, expertIds, nullptr,
+                    cache->numTokensPadded, routes, cache->experts, ownerRank, ownerCount);
+            } else if (deepSeekV41 && (count >= 16 || tileRows == 32)) {
                 // Group local routes using the selected tile, including tail chunks.
                 // Keep flattened route ids and their reduction order unchanged.
                 LaunchAwqMoeRouteMetadata(chunkIndices, cache->expertCounts, cache->expertStarts,
@@ -3966,8 +3976,8 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                     sortedTokenIds, expertIds,
                     cache->numTokensPadded, chunkScores, topk, false, gateGroups,
                     count, cache->intermediate * 2, cache->hidden,
-                    cache->workspace, cudaStreamPerThread, tileRows == 32 ? 64 : gateThreadK,
-                    gateThreadN, cache->sms, tileRows == 32 ? 2 : gateBlocksPerSm, tileRows) ||
+                    cache->workspace, cudaStreamPerThread, tileRows == 32 || compactRoutes ? 64 : gateThreadK,
+                    gateThreadN, cache->sms, h20Compact ? 4 : tileRows == 32 ? 2 : gateBlocksPerSm, tileRows) ||
                 !checkStage("grouped gate/up GEMM")) {
                 return false;
             }
@@ -3983,7 +3993,7 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                     cache->numTokensPadded, chunkScores, 1, !deepSeekV41, downGroups,
                     routes, cache->hidden, cache->intermediate,
                     cache->workspace, cudaStreamPerThread, downThreadK,
-                    downThreadN, cache->sms, tileRows == 32 ? 2 : downBlocksPerSm, tileRows) ||
+                    downThreadN, cache->sms, h20Compact ? 4 : tileRows == 32 ? 2 : downBlocksPerSm, tileRows) ||
                 !checkStage("grouped down GEMM")) {
                 return false;
             }

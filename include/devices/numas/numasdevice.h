@@ -11,6 +11,22 @@
 #include <mutex>
 
 namespace fastllm {
+    // Placement is independent of expert arithmetic/cache policy. Nested
+    // calls and CUDA CPU coordinators select it from the immutable weights.
+    class HostMoePlacementScope {
+        bool previous;
+    public:
+        explicit HostMoePlacementScope(bool unbound);
+        explicit HostMoePlacementScope(const Data *weight);
+        ~HostMoePlacementScope();
+        HostMoePlacementScope(const HostMoePlacementScope &) = delete;
+        HostMoePlacementScope &operator=(const HostMoePlacementScope &) = delete;
+    };
+    bool HostMoeIsUnbound();
+    bool CanRunHostMoe(const DataDict &datas, const IntDict &params);
+    void RegisterUnboundHostMoe(Data *const *weights, int count);
+    void RegisterHostMoeWeightBatch(const std::vector<std::pair<Data*, std::string>> &weights,
+        bool unbound, const std::function<void(size_t)> &onProgress = {});
     int GetNumasMoeShardCount();
     // Thread-TP models carry their own device set, independently of the
     // process-wide executor map. Borrow it for one synchronous MoE call.
@@ -58,6 +74,7 @@ namespace fastllm {
     };
 
     class NumasMergeMOE : CpuMergeMOE {
+    public:
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 

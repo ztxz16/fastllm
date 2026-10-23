@@ -3439,6 +3439,7 @@ void FastllmNcclBroadcastFrom(void* send, void* recv, int count, int dataType, i
         return false;
     };
     if (!waitForRanks(fastllm::NcclSubmitRendezvous::Before)) return;
+    FastllmCudaGraphRecordCollective();
     ncclResult_t res = ncclBroadcast(send, recv, count, ncclType, rootRank, comm, stream);
     
     if (res != ncclSuccess) {
@@ -3558,6 +3559,7 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
         return;
     }
     // 注意：ncclAllReduce 发射是异步的
+    FastllmCudaGraphRecordCollective();
     ncclResult_t res = ncclAllReduce(data, dest, count, ncclType, ncclSum, comm, stream);
     
     if (res != ncclSuccess) {
@@ -3604,6 +3606,7 @@ bool FastllmNcclAllGather(const void* data, void* dest, int count,
         return false;
     }
     const cudaStream_t stream = cudaStreamPerThread;
+    FastllmCudaGraphRecordCollective();
     const ncclResult_t result = ncclAllGather(data, dest, count, type, comm, stream);
     if (result != ncclSuccess) {
         printf("Error: ncclAllGather failed on device %d: %s\n",
@@ -3629,6 +3632,7 @@ bool FastllmNcclReduceScatter(const void* data, void* dest, int count,
         return false;
     }
     const cudaStream_t stream = cudaStreamPerThread;
+    FastllmCudaGraphRecordCollective();
     const ncclResult_t result = ncclReduceScatter(data, dest, count, type, ncclSum, comm, stream);
     if (result != ncclSuccess) {
         printf("Error: ncclReduceScatter failed on device %d: %s\n",
@@ -3686,6 +3690,7 @@ void FastllmNcclReduce(void* data, void* dest, int count, int dataType, int root
     }
 
     cudaStream_t stream = cudaStreamPerThread;
+    FastllmCudaGraphRecordCollective();
     ncclResult_t res = ncclReduce(data, dest, count, ncclType, ncclSum, rootRank, comm, stream);
     if (res != ncclSuccess) {
         printf("Error: ncclReduce failed on device %d: %s\n", deviceId, ncclGetErrorString(res));

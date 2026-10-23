@@ -806,11 +806,52 @@ static void CheckHcSmallBatch() {
 }
 #endif
 
+// Prefix commits must leave rejected rows and other batches untouched. The
+// byte oracle also covers packed KV rows; it does not call the store operator.
+static void CheckWindowStorePrefix(bool cuda) {
+    int cases = 0;
+    for (DataType type : {FLOAT32, FLOAT16, BFLOAT16, INT8})
+    for (int batch : {1, 3})
+    for (int rows : {1, 2, 3, 4, 5, 6, 7, 8, 131})
+    for (int accepted : {-1, 0, 1, rows / 2, rows})
+    for (int pos : {0, 127, 254}) {
+        const int width = type == INT8 ? 528 : 512;
+        Data chunk(type, {batch, rows, width}), ring(type, {batch, 128, width});
+        chunk.Allocate();
+        ring.Allocate();
+        for (size_t i = 0; i < chunk.GetBytes(); ++i) chunk.cpuData[i] = (i * 17 + i / 13) % 251;
+        memset(ring.cpuData, 0x5a, ring.GetBytes());
+        std::vector<uint8_t> source(chunk.cpuData, chunk.cpuData + chunk.GetBytes());
+        std::vector<uint8_t> expected(ring.cpuData, ring.cpuData + ring.GetBytes());
+        const int count = accepted < 0 ? rows : accepted;
+        const size_t rowBytes = width * chunk.unitSize;
+        for (int b = 0; b < batch; ++b)
+            for (int i = 0; i < count; ++i)
+                memcpy(expected.data() + (b * 128 + (pos + i) % 128) * rowBytes,
+                       source.data() + (b * rows + i) * rowBytes, rowBytes);
+        ToDev(chunk, cuda);
+        ToDev(ring, cuda);
+        IntDict params = {{"windowSize", 128}, {"startPos", pos}};
+        if (accepted >= 0) params["rowCount"] = accepted;
+        Exec().RunOnDevice(cuda ? "cuda" : "cpu", "DeepSeekV41WindowStore",
+                          {{"chunk", &chunk}, {"ring", &ring}}, {}, params);
+        ring.ToDevice(DataDevice::CPU);
+        chunk.ToDevice(DataDevice::CPU);
+        Require(memcmp(ring.cpuData, expected.data(), expected.size()) == 0, "prefix ring mismatch");
+        Require(chunk.dims == std::vector<int>({batch, rows, width}) &&
+                memcmp(chunk.cpuData, source.data(), source.size()) == 0, "prefix source modified");
+        ++cases;
+    }
+    std::cout << "  [" << (cuda ? "cuda" : "cpu") << "] WindowStore: " << cases
+              << " byte-exact prefix cases (batch stride, wrap, no-op, packed KV)\n";
+}
+
 int main() {
     try {
         gHasCuda = Exec().HasDevice("cuda");
         std::cout << "== 行布局与每 token 字节数 ==\n";
         CheckLayout();
+        CheckWindowStorePrefix(false);
 
         std::cout << "== QuantizeKV 无损性（CPU）==\n";
         CheckQuantizeLossless(false);
@@ -820,6 +861,7 @@ int main() {
         CheckIndexerRead(false);
 
         if (gHasCuda) {
+            CheckWindowStorePrefix(true);
             std::cout << "== QuantizeKV 无损性（CUDA）==\n";
             CheckQuantizeLossless(true);
             CheckFp4ScaleBoundaries(true);

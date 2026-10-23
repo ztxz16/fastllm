@@ -59,7 +59,7 @@ union alignas(16) HalfVector {
 // A power-of-two scale preserves BF16 operands exactly when they fit FP16.
 // Check every element, including subnormals, instead of assuming a safe range.
 __global__ void PackHybridBf16(const __nv_bfloat16 *input, half *output, int *exponents, int *unsafe,
-                               int columns) {
+                               int columns, int inputStride) {
     const int row = blockIdx.x, tid = threadIdx.x;
     __shared__ float maxima[128];
     __shared__ int exponent;
@@ -67,7 +67,7 @@ __global__ void PackHybridBf16(const __nv_bfloat16 *input, half *output, int *ex
     bool valid = true;
     for (int col = tid * 8; col < columns; col += 1024) {
         Bf16Vector value;
-        value.raw = *reinterpret_cast<const uint4 *>(input + size_t(row) * columns + col);
+        value.raw = *reinterpret_cast<const uint4 *>(input + size_t(row) * inputStride + col);
         for (int j = 0; j < 8; ++j) {
             const float x = __bfloat162float(value.values[j]);
             maximum = fmaxf(maximum, fabsf(x));
@@ -90,11 +90,15 @@ __global__ void PackHybridBf16(const __nv_bfloat16 *input, half *output, int *ex
     for (int col = tid * 8; col < columns; col += 1024) {
         Bf16Vector value;
         HalfVector packed;
-        value.raw = *reinterpret_cast<const uint4 *>(input + size_t(row) * columns + col);
+        value.raw = *reinterpret_cast<const uint4 *>(input + size_t(row) * inputStride + col);
         for (int j = 0; j < 8; ++j) {
-            const float x = __bfloat162float(value.values[j]) * scale;
+            const float original = __bfloat162float(value.values[j]);
+            const float x = original * scale;
             packed.values[j] = __float2half_rn(x);
-            valid = valid && isfinite(x) && __half2float(packed.values[j]) == x;
+            // Downscaling a wide-exponent BF16 row may already underflow in
+            // FP32. Comparing only FP16 against that zero would miss the loss.
+            valid = valid && isfinite(x) && __half2float(packed.values[j]) == x &&
+                (original == 0.f || x != 0.f);
         }
         *reinterpret_cast<uint4 *>(output + size_t(row) * columns + col) = packed.raw;
     }
@@ -119,10 +123,12 @@ bool FastllmCudaSetHybridPrefill(bool enabled) {
 }
 
 bool FastllmCudaHybridBf16Gemm(const __nv_bfloat16 *input, const __nv_bfloat16 *weight, __nv_bfloat16 *output,
-                               int rows, int columns, int width, int outputStride, void *rawHandle) {
+                               int rows, int columns, int width, int outputStride, void *rawHandle,
+                               int inputStride) {
     const auto handle = static_cast<cublasHandle_t>(rawHandle);
+    if (!inputStride) inputStride = columns;
     if (!hybridPrefill || rows < 1024 || columns < 128 || width < 128 || columns % 8 || width % 8 ||
-        outputStride < width || !input || !weight || !output ||
+        outputStride < width || inputStride < columns || inputStride % 8 || !input || !weight || !output ||
         (reinterpret_cast<uintptr_t>(input) % alignof(uint4)) ||
         (reinterpret_cast<uintptr_t>(weight) % alignof(uint4)) || FastllmCudaRuntimeArch() != 75)
         return false;
@@ -164,10 +170,10 @@ bool FastllmCudaHybridBf16Gemm(const __nv_bfloat16 *input, const __nv_bfloat16 *
     auto *xe = reinterpret_cast<int *>(y + size_t(rows) * chunk);
     auto *we = xe + rows, *unsafe = we + chunk;
     FastllmCudaHybridCheck(cudaMemsetAsync(unsafe, 0, sizeof(int), stream));
-    PackHybridBf16<<<rows, 128, 0, stream>>>(input, x, xe, unsafe, columns);
+    PackHybridBf16<<<rows, 128, 0, stream>>>(input, x, xe, unsafe, columns, inputStride);
     for (int first = 0; first < width; first += chunk) {
         const int count = std::min(chunk, width - first);
-        PackHybridBf16<<<count, 128, 0, stream>>>(weight + size_t(first) * columns, w, we, unsafe, columns);
+        PackHybridBf16<<<count, 128, 0, stream>>>(weight + size_t(first) * columns, w, we, unsafe, columns, columns);
         int invalid = 0;
         FastllmCudaHybridCheck(
             cudaMemcpyAsync(&invalid, unsafe, sizeof(int), cudaMemcpyDeviceToHost, stream));

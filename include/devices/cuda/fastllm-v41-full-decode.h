@@ -10,6 +10,9 @@ struct FastllmV41FullDecodeConfig {
     int blockSize = 64, candidateTopK = 32;
     int ropeDim = 64, originalSeqLen = 4096, betaFast = 32, betaSlow = 1;
     float ropeBase = 10000.f, ropeFactor = 1.f, normEps = 1e-6f, softmaxScale = 1.f;
+    // A verification plan treats batch rows as one causal chunk. Ring writes
+    // remain deferred until acceptance; the saved raw stream supports rollback.
+    bool verifying = false;
     bool kvSource = false, indexSource = false;
     bool writeCandidates = false, useCandidates = false;
 };
@@ -22,6 +25,7 @@ struct FastllmV41FullDecodeBuffers {
     const void *compressNorm = nullptr, *sink = nullptr;
     // Optional caller-owned request slice. It must outlive the plan and graphs.
     void *requests = nullptr;
+    void *savedKV = nullptr, *savedRawKV = nullptr, *savedRawScore = nullptr;
 };
 
 struct FastllmV41FullDecodeRequest {

@@ -165,6 +165,11 @@ namespace fastllm {
     // address can be reused by a subsequently loaded model.
     void MultiCudaReleaseMoeWeightCaches(const Data *layerKey);
 
+    // Stable buffers and stream dependencies permit graph capture of a
+    // vocabulary-sharded projection with FP32 output and FP32/BF16 input,
+    // including uneven shard widths.
+    bool MultiCudaLinearOutputGatherPersistent(Data &input, Data &weight, Data &output,
+                                               std::shared_ptr<void> &workspace);
     bool MultiCudaLinearRow(Data &input, Data &weight, Data &bias, Data &output);
     bool MultiCudaLinearColumn(Data &input, Data &weight, Data &bias, Data &output);
     struct MultiCudaAsyncMLPHandle;
@@ -196,6 +201,11 @@ namespace fastllm {
         Data &attnSink, int windowSize, float scale, const std::vector<int> &devices,
         const std::function<void(int, int)> &before = {},
         const std::function<void(int, int)> &after = {}, bool workerOrdered = false);
+    // Copy contiguous rows of a dense [1, tokens, width] replicated tensor
+    // independently on each rank. Retains owned destination allocations and
+    // replica layout; unsupported layouts/aliases return false without writes.
+    bool MultiCudaCopyReplicatedRows(Data &dst, const Data &src, int start, int rows,
+                                      const std::vector<int> &devices);
     // Copy compact TP activation shards while retaining destination addresses.
     bool MultiCudaCopyShardedActivation(Data &dst, const Data &src, const std::vector<int> &devices,
                                        bool copyData = true);

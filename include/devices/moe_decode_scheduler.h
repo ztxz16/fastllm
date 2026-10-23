@@ -212,7 +212,12 @@ public:
                 if (!p.timing || counts[r] >= p.capacity) continue;
                 const double next = std::max(gpu[r], (counts[r] + 1) * p.timing->copiedExpert.us) +
                     reuse[i] * p.timing->stagedExpert.us;
-                const double end = next + p.timing->dispatch.us + p.handoffUs;
+                // Decode submits all ranks while CPU workers run. Submission
+                // completion and GPU completion are concurrent bounds; only
+                // the measured delay before DMA starts precedes GPU work.
+                const double end = (decodeCpu && p.timing->decodeLaunch.initialized ?
+                    std::max(p.timing->dispatch.us, p.timing->decodeLaunch.us + next) :
+                    next + p.timing->dispatch.us) + p.handoffUs;
                 if (selected < 0 || end < finish) { selected = r; finish = end; compute = next; }
             }
             if (selected < 0) break;

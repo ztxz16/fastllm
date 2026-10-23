@@ -849,14 +849,16 @@ template <typename InT, typename WT, int Tokens>
 __global__ void DeepSeekV4WoATokenPairBlockReduceKernel(
         const InT *o, const WT *w, __nv_bfloat16 *output,
         int tokens, int fullDim, int groupDim, int groups, int oRank) {
-    extern __shared__ float partial[];
+    __shared__ float partial[Tokens * 2][256];
     const int pair = blockIdx.x % (oRank / 2);
     const int group = (blockIdx.x / (oRank / 2)) % groups;
     const int token = (blockIdx.x / (oRank / 2) / groups) * Tokens;
     const WT *w0 = w + ((uint64_t)group * oRank + pair * 2) * groupDim;
     const WT *w1 = w0 + groupDim;
     float sums[Tokens][2] = {};
-    for (int d = threadIdx.x; d < groupDim; d += blockDim.x) {
+    // Overlap independent weight loads while keeping each lane's FMA order.
+#pragma unroll 2
+    for (int d = threadIdx.x; d < groupDim; d += 256) {
         const float weight0 = Dsv4ToFloat(w0[d]);
         const float weight1 = Dsv4ToFloat(w1[d]);
 #pragma unroll
@@ -870,26 +872,30 @@ __global__ void DeepSeekV4WoATokenPairBlockReduceKernel(
     }
 #pragma unroll
     for (int t = 0; t < Tokens; ++t) {
-        partial[(t * 2) * blockDim.x + threadIdx.x] = sums[t][0];
-        partial[(t * 2 + 1) * blockDim.x + threadIdx.x] = sums[t][1];
+        partial[t * 2][threadIdx.x] = sums[t][0];
+        partial[t * 2 + 1][threadIdx.x] = sums[t][1];
     }
     __syncthreads();
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
+    // One warp owns each dot product after the shared-memory handoff.
+    // Reconstruct the first three levels of the original 256-lane tree,
+    // then finish its five remaining levels with shuffles. This preserves
+    // every FP32 addition while eliminating eight block-wide barriers.
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 #pragma unroll
-            for (int t = 0; t < Tokens * 2; ++t) {
-                partial[t * blockDim.x + threadIdx.x] += partial[t * blockDim.x + threadIdx.x + stride];
+    for (int item = warp; item < Tokens * 2; item += 8) {
+        const int t = item / 2;
+        if (token + t < tokens) {
+            const float *p = partial[item];
+            float sum = ((p[lane] + p[lane + 128]) + (p[lane + 64] + p[lane + 192])) +
+                        ((p[lane + 32] + p[lane + 160]) + (p[lane + 96] + p[lane + 224]));
+            for (int offset = 16; offset; offset >>= 1) {
+                const float other = __shfl_down_sync(0xffffffffu, sum, offset);
+                if (lane < offset) sum += other;
             }
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-#pragma unroll
-        for (int t = 0; t < Tokens; ++t) {
-            if (token + t < tokens) {
-                const uint64_t offset = ((uint64_t)(token + t) * groups + group) * oRank + pair * 2;
-                output[offset] = __float2bfloat16_rn(partial[(t * 2) * blockDim.x]);
-                output[offset + 1] = __float2bfloat16_rn(partial[(t * 2 + 1) * blockDim.x]);
+            if (lane == 0) {
+                const uint64_t offset = ((uint64_t)(token + t) * groups + group) * oRank +
+                                        pair * 2 + item % 2;
+                output[offset] = __float2bfloat16_rn(sum);
             }
         }
     }
@@ -908,11 +914,11 @@ void DeepSeekV4LaunchWoATokenPair(const InT *o, const WT *w, __nv_bfloat16 *outp
             o,w,output,bsz,seqlen,heads,headDim,groups,oRank);
     } else if (tile == 2) {
         DeepSeekV4WoATokenPairBlockReduceKernel<InT, WT, 2>
-            <<<((tokens + 1) / 2) * groups * (oRank / 2), 256, 1024 * sizeof(float)>>>(
+            <<<((tokens + 1) / 2) * groups * (oRank / 2), 256>>>(
                 o,w,output,tokens,heads*headDim,(heads/groups)*headDim,groups,oRank);
     } else {
         DeepSeekV4WoATokenPairBlockReduceKernel<InT, WT, 4>
-            <<<((tokens + 3) / 4) * groups * (oRank / 2), 256, 2048 * sizeof(float)>>>(
+            <<<((tokens + 3) / 4) * groups * (oRank / 2), 256>>>(
                 o,w,output,tokens,heads*headDim,(heads/groups)*headDim,groups,oRank);
     }
 }
@@ -6124,7 +6130,15 @@ bool DeepSeekV4LaunchWoAGemm(const fastllm::Data &o, const fastllm::Data &woA,
                              fastllm::Data &output, int bsz, int seqlen,
                              int heads, int headDim, int groups, int oRank) {
     int tokens = bsz * seqlen;
-    if (tokens < 16) {
+    // BF16 verification batches also benefit from FP32-accumulating Tensor
+    // Cores. Keep the single-token and mixed-dtype reduction paths unchanged.
+    const bool bf16Verify = tokens >= 2 && tokens <= 8 &&
+        o.dataType == fastllm::DataType::BFLOAT16 &&
+        woA.dataType == fastllm::DataType::BFLOAT16 &&
+        FastllmCudaRuntimeArch() >= 80 && heads % groups == 0 &&
+        ((heads / groups) * headDim) % 8 == 0 && oRank % 8 == 0 &&
+        (uintptr_t)o.cudaData % 16 == 0 && (uintptr_t)woA.cudaData % 16 == 0;
+    if (tokens < 16 && !bf16Verify) {
         return false;
     }
     if (woA.dataType == fastllm::DataType::FP8_E4M3) {
@@ -6144,6 +6158,23 @@ bool DeepSeekV4LaunchWoAGemm(const fastllm::Data &o, const fastllm::Data &woA,
     int fullDim = heads * headDim;
     float alpha = 1.0f, beta = 0.0f;
     auto handle = getFastllmCublasHandle();
+
+    if (o.dataType == fastllm::DataType::BFLOAT16 && woA.dataType == fastllm::DataType::BFLOAT16) {
+        bool complete = true;
+        for (int group = 0; group < groups; ++group) {
+            if (!FastllmCudaHybridBf16Gemm(
+                    static_cast<const __nv_bfloat16 *>(o.cudaData) + group * groupDim,
+                    static_cast<const __nv_bfloat16 *>(woA.cudaData) + size_t(group) * oRank * groupDim,
+                    static_cast<__nv_bfloat16 *>(output.cudaData) + group * oRank,
+                    tokens, groupDim, oRank, groups * oRank, handle, fullDim)) {
+                complete = false;
+                break;
+            }
+        }
+        if (complete) return true;
+        // A range/admission failure may follow successful groups. The normal
+        // batched GEMM below overwrites every group, including those outputs.
+    }
 
     if (o.dataType == fastllm::DataType::BFLOAT16 && woA.dataType == fastllm::DataType::FLOAT16) {
         half *halfO = (half *)FastllmCudaMalloc(o.Count(0) * sizeof(half));

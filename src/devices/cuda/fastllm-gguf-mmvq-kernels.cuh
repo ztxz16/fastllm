@@ -183,13 +183,14 @@ static void mul_mat_vec_q_cuda_T(
 #if !defined(USE_ROCM)
 #include "fastllm-gguf-iq3-gemv.cuh"
 #include "fastllm-gguf-q3-k-gemv.cuh"
+#include "fastllm-gguf-q4-k-gemv.cuh"
 #include "fastllm-gguf-small-mmvq.cuh"
 #endif
 
 // Pack independent decode outputs into one CTA while retaining the legacy
 // four-warp dot-product and reduction order in four virtual warp groups.
-// This reduces CTA scheduling overhead for broad Q5_K/Q6_K projections.
-template <ggml_type type, typename Output, int Inputs = 1>
+// This reduces CTA scheduling overhead for short Q4_K and broad Q5_K/Q6_K projections.
+template <ggml_type type, typename Output, int Inputs = 1, int StoreMode = 0>
 static __global__ void FastllmGgufMmvqWarpRows(
         const void * __restrict__ weights, const block_q8_1 * __restrict__ input,
         Output * __restrict__ output, int columns, int rows, int inputStride, int outputStride) {
@@ -224,7 +225,7 @@ static __global__ void FastllmGgufMmvqWarpRows(
 #pragma unroll
     for (int j = 0; j < Inputs; ++j) {
         const float sum = warp_reduce_sum(((partial[j][0] + partial[j][1]) + partial[j][2]) + partial[j][3]);
-        if (lane == 0) FastllmGgufStore<0>(output + j * outputStride + row, sum);
+        if (lane == 0) FastllmGgufStore<StoreMode>(output + j * outputStride + row, sum);
     }
 }
 
@@ -235,6 +236,14 @@ void mul_mat_vec_q_cuda(
     const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, const int64_t ids_nb0,
     cudaStream_t stream) {
 #if !defined(USE_ROCM)
+    if constexpr (StoreMode == 0 && type == GGML_TYPE_Q4_K) {
+        if (ncols_y == 1 && ne2 == 1 && ids_data == nullptr && nrows_dst >= nrows_x &&
+            fastllm_gguf_q4_k::Supports(vx, vy, ncols_x, nrows_x)) {
+            fastllm_gguf_q4_k::Launch(vx, static_cast<const block_q8_1 *>(vy), dst,
+                                     ncols_x, nrows_x, stream);
+            return;
+        }
+    }
     if constexpr (StoreMode == 0 && (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
         if ((ncols_y == 1 || (type == GGML_TYPE_Q6_K && ncols_y >= 2 && ncols_y <= 4)) &&
             ne2 == 1 && !ids_data && nrows_dst >= nrows_x &&
@@ -259,6 +268,17 @@ void mul_mat_vec_q_cuda(
                 }
                 return;
             }
+        }
+    }
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        // Short Q4_K projections (notably V4.1 wq_b) benefit from packing
+        // four rows into a CTA. Long K retains the parallel four-warp path.
+        if (ncols_y == 1 && ne2 == 1 && !ids_data && nrows_dst >= nrows_x &&
+            nrows_y >= ncols_x && nrows_x >= 1024 && (ncols_x == 1280 || ncols_x == 2304) &&
+            FastllmCudaRuntimeArch() == 75) {
+            FastllmGgufMmvqWarpRows<type, OType, 1, StoreMode><<<(nrows_x + 3) / 4, 128, 0, stream>>>(
+                vx, static_cast<const block_q8_1 *>(vy), dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+            return;
         }
     }
     if constexpr (type == GGML_TYPE_Q3_K) {

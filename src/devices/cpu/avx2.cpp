@@ -1488,6 +1488,81 @@ namespace fastllm {
 #endif
     }
 
+    // Block-32 disk projection for the token rows that share one expert.
+    // The verify batch routes several positions to the same expert; decoding
+    // the packed weight once and applying it to every row removes the repeated
+    // weight pass in the single-row kernel. Keep the per-column accumulation
+    // order identical to LinearFloat32NVFP4E8M0Decode_AVX2_Kernel.
+#ifdef __AVX2__
+    template <int ROWS>
+    static inline void NVFP4DecodeRowsCol_AVX2(const float *input, long lda,
+            const uint8_t *weight, const uint8_t *scales, float *output, long ldc,
+            int packed, int blocks, int col) {
+        __m256 sum[ROWS];
+        for (int r = 0; r < ROWS; ++r) sum[r] = _mm256_setzero_ps();
+        const uint8_t *wrow = weight + size_t(col) * packed;
+        const uint8_t *srow = scales + size_t(col) * blocks;
+        const __m256 zero = _mm256_setzero_ps();
+        for (int b = 0; b < blocks; ++b) {
+            const uint8_t *w = wrow + size_t(b) * 16;
+            const __m256 w0 = NVFP4ToFloat32_AVX2(w);
+            const __m256 w1 = NVFP4ToFloat32_AVX2(w + 4);
+            const __m256 w2 = NVFP4ToFloat32_AVX2(w + 8);
+            const __m256 w3 = NVFP4ToFloat32_AVX2(w + 12);
+            const __m256 scale = _mm256_set1_ps(NVFP4E8M0ScaleToFloatFast(srow[b]));
+            for (int r = 0; r < ROWS; ++r) {
+                const float *x = input + size_t(r) * lda + b * 32;
+                __m256 v = _mm256_fmadd_ps(_mm256_loadu_ps(x), w0, zero);
+                v = _mm256_fmadd_ps(_mm256_loadu_ps(x + 8), w1, v);
+                v = _mm256_fmadd_ps(_mm256_loadu_ps(x + 16), w2, v);
+                v = _mm256_fmadd_ps(_mm256_loadu_ps(x + 24), w3, v);
+                sum[r] = _mm256_fmadd_ps(v, scale, sum[r]);
+            }
+        }
+        for (int r = 0; r < ROWS; ++r) {
+            output[size_t(r) * ldc + col] = 0.f + Floatsum(sum[r]);
+        }
+    }
+
+#endif
+
+    bool LinearFloat32NVFP4E8M0DecodeRows_AVX2_Kernel(const float *input,
+            const uint8_t *weight, const uint8_t *scales, float *output,
+            int rows, int m, int k, int first, int last) {
+#ifdef __AVX2__
+        if (rows < 2 || rows > 6 || m <= 0 || m % 32 ||
+            first < 0 || first > last || last > k) return false;
+        const int blocks = m / 32, packed = m / 2;
+        for (int row = 0; row < rows; row += 4) {
+            const int batch = std::min(4, rows - row);
+            const float *src = input + size_t(row) * m;
+            float *dst = output + size_t(row) * k;
+            if (batch == 1) {
+                LinearFloat32NVFP4E8M0Decode_AVX2_Kernel(
+                    src, weight, scales, dst, m, k, first, last);
+                continue;
+            }
+            for (int col = first; col < last; ++col) {
+                if (batch == 4) {
+                    NVFP4DecodeRowsCol_AVX2<4>(src, m, weight, scales, dst, k,
+                                               packed, blocks, col);
+                } else if (batch == 3) {
+                    NVFP4DecodeRowsCol_AVX2<3>(src, m, weight, scales, dst, k,
+                                               packed, blocks, col);
+                } else {
+                    NVFP4DecodeRowsCol_AVX2<2>(src, m, weight, scales, dst, k,
+                                               packed, blocks, col);
+                }
+            }
+        }
+        return true;
+#else
+        (void)input; (void)weight; (void)scales; (void)output;
+        (void)rows; (void)m; (void)k; (void)first; (void)last;
+        return false;
+#endif
+    }
+
     bool LinearBFloat16NVFP4E8M0_AVX2_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end, int blockK, int blockM, uint8_t *scaleBytes,
                         int ks, int ms) {

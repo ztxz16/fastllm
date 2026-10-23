@@ -170,6 +170,41 @@ def topologies(args, explicit, hardware, gpu, family=None):
             yield "cuda:" + ",".join(map(str, ids)), "cuda:" + ",".join(map(str, ids)), "tp", {d: 1 for d in ids}
 
 
+def capacity_pp_topologies(model, costs, layouts, gpu):
+    """Try contiguous expert partitions when compute-balanced PP cannot fit.
+
+    Quantized layers need not have equal sizes. Minimize the largest fraction
+    of a card occupied by resident experts; the capacity solver subsequently
+    checks dense weights, KV, workspaces and host memory without relaxing them.
+    """
+    prefix = [0]
+    for size in costs[0][:model.layers]:
+        prefix.append(prefix[-1] + size)
+    seen = {tuple(mapping.items()) for _, _, mode, mapping in layouts if mode == "pp"}
+    for _, _, mode, mapping in layouts:
+        ids = list(mapping)
+        if mode != "pp" or len(ids) < 2:
+            continue
+        states = {0: (0., ())}
+        for device in ids:
+            next_states = {}
+            for end in range(1, model.layers + 1):
+                options = ((max(score, (prefix[end] - prefix[start]) / max(1, gpu[device]["free"])),
+                            counts + (end - start,))
+                           for start, (score, counts) in states.items() if start < end)
+                best = min(options, default=None)
+                if best is not None:
+                    next_states[end] = best
+            states = next_states
+        for _, counts in states.values():
+            divisor = math.gcd(*counts)
+            weighted = {d: n // divisor for d, n in zip(ids, counts)}
+            key = tuple(weighted.items())
+            if key not in seen:
+                seen.add(key)
+                yield repr({"cuda:%d" % d: n for d, n in weighted.items()}), "off", "pp", weighted
+
+
 def latency_score(candidate, model, costs, args, mode, mapping, hardware, peers):
     """Relative latency for a 4K prompt + 512 outputs; no model reload/search.
 
@@ -225,6 +260,16 @@ def latency_score(candidate, model, costs, args, mode, mapping, hardware, peers)
     return prefill + 512 * decode * max(1, args.max_batch)
 
 
+def _deepseek_priority(candidate, model):
+    """Soft targets shared by topology-local and final candidate selection."""
+    chunk = candidate["chunked_prefill_size"]
+    # Fully resident experts need no additional cache. Otherwise fill the
+    # per-GPU cache target before spending more memory on a larger chunk.
+    cache = (3 * memory.GiB if candidate["resident_layers"] == model.layers
+             else candidate["moe_cuda_cache"])
+    return min(chunk, 512), min(cache, 3 * memory.GiB), chunk
+
+
 def kv_residencies(args, model):
     """Supported exact streaming pools, without changing context capacity."""
     from .util import _fastllm_env_flag_enabled
@@ -233,11 +278,11 @@ def kv_residencies(args, model):
             args.max_batch != 1 or args.tokens != args.max_context_length or
             _fastllm_env_flag_enabled("FASTLLM_SKIP_WARMUP")):
         return [0]
-    # KVMem cannot preserve prefix/history reuse. Honor explicit requests for
-    # either feature, including the existing prefix-cache environment override.
+    # KVMem cannot preserve prefix/history reuse. Keep reuse enabled by
+    # default; only consider streaming when both caches are explicitly off.
     prefix = args.prefix_cache or os.environ.get("FASTLLM_PREFIX_CACHE", "")
-    history = args.cache_history if "cache_history" in getattr(args, "_auto_explicit", ()) else ""
-    if any(str(v).lower() not in ("", "false", "0", "off") for v in (prefix, history)):
+    history = args.cache_history
+    if any(str(v).lower() not in ("false", "0", "off") for v in (prefix, history)):
         return [0]
     return [0] + [n for n in (32768, 16384, 8192) if n < args.max_context_length]
 
@@ -358,6 +403,11 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if disable_qwen3_graph:
         graph_enabled = False
     apply_model_defaults(base, metadata)
+    if (model.family == "deepseek_v41" and "cuda_slab" not in explicit and
+            any(t.kind.startswith("gguf:") and memory._is_routed_expert(t.name) for t in tensors)):
+        # Thousands of standalone GGUF expert allocations waste CUDA pages.
+        # Reuse the existing persistent weight slabs; explicit zero still wins.
+        base.cuda_slab = 64
     if base.max_batch <= 0:
         base.max_batch = 1
     # Qwen3.5 targets the native window; DeepSeek V4.1 targets 1M.
@@ -380,10 +430,15 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     gpu = {d: query_gpu(d) for d in info}
     ram = ram if ram is not None else memory.host_memory()
     numa = env.use_numas if use_numa is None else use_numa
+    base._host_moe_shared = numa
     if model.family == "qwen35":
         return _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model,
                                      info, gpu, ram, numa)
-    backends = [base.moe_device] if "moe_device" in explicit and base.moe_device else ["numa" if numa else "cpu", "disk"]
+    backends = ["numa" if numa else "cpu", "disk"]
+    if model.family == "deepseek_v41" and numa:
+        backends.insert(1, "cpu")
+    if "moe_device" in explicit and base.moe_device:
+        backends = [base.moe_device]
     tables = [base.ngram_device] if "ngram_device" in explicit else ["cpu", "disk"]
     table_bytes = sum(t.bytes for t in tensors if memory.is_lookup_table(t.name))
     if "ngram_device" not in explicit and table_bytes > max(4 * memory.GiB, ram["total"] // 10):
@@ -403,12 +458,21 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
             for table in tables:
                 trial = copy.copy(base)
                 trial.moe_device, trial.ngram_device = backend, table
-                if backend == "cpu" and model.family != "qwen4" and trial.moe_cuda_cache == "auto":
+                if backend == "cpu" and model.family != "qwen4" and not base._host_moe_shared and trial.moe_cuda_cache == "auto":
                     trial.moe_cuda_cache = 0
                 memory.validate_options(trial)
                 cached_costs = None
                 implicit_embedding_bytes = None
-                for device, tp, mode, mapping in topologies(trial, explicit, info, gpu):
+                layouts = list(topologies(trial, explicit, info, gpu))
+                def candidates():
+                    yield from layouts
+                    # Preserve the normal fast path. Before falling back to
+                    # disk, also try partitions balanced by resident bytes.
+                    if (model.family == "deepseek_v41" and not choices and
+                            backend != "disk" and cached_costs is not None and
+                            not {"device", "tp"} & explicit and not os.environ.get("FASTLLM_TP")):
+                        yield from capacity_pp_topologies(model, cached_costs, layouts, gpu)
+                for device, tp, mode, mapping in candidates():
                     if any(d not in gpu for d in mapping):
                         raise ValueError("--auto: selected CUDA ordinal is not visible")
                     trial.device, trial.tp = device, tp
@@ -435,14 +499,11 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                             # available when host memory cannot hold all experts.
                             placement = (2 if p["resident_layers"] == model.layers else
                                          int(p["resident_layers"] == 0 and p["moe_cuda_cache"] > 0)) if prefer_cache else 0
-                            # DeepSeek prefill amortizes indexed attention and
-                            # MoE dispatch across the chunk for all host-backed
-                            # expert backends. Preserve context, then maximize
-                            # the feasible chunk size.
-                            chunk = p["chunked_prefill_size"] if model.family == "deepseek_v41" else 0
-                            return (chunk, placement, -score, -p["host_estimated_bytes"], -p["resident_layers"])
+                            priority = (_deepseek_priority(p, model) if model.family == "deepseek_v41"
+                                        else (0, 0, 0))
+                            return (priority, placement, -score, -p["host_estimated_bytes"], -p["resident_layers"])
                         variants = [prepared]
-                        if (model.family == "deepseek_v41" and backend == "disk" and
+                        if (model.family == "deepseek_v41" and
                                 not prepared.low_gpu_mem and not {"cuda_embedding", "low_gpu_mem"} & explicit):
                             low = copy.copy(prepared)
                             low.low_gpu_mem, low.cuda_embedding = True, False
@@ -469,7 +530,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                             rank(item[0])[0], item[2], rank(item[0])[1:]))
                         if prepared.low_gpu_mem and model.family == "deepseek_v41":
                             result["low_gpu_mem"] = True
-                            notes.append("Disk hybrid uses CPU embedding to leave GPU memory for prefill and expert cache")
+                            notes.append("Hybrid uses CPU embedding to leave GPU memory for prefill and experts")
                     except ValueError as error:
                         rejection = str(error)
                         continue
@@ -496,10 +557,10 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     # Retain TP as a capacity fallback; explicit TP produces no PP candidates.
     eligible = choices
     if model.family == "deepseek_v41":
-        largest_chunk = max(item[2]["chunked_prefill_size"] for item in eligible)
-        eligible = [item for item in eligible if item[2]["chunked_prefill_size"] == largest_chunk]
+        priority = max(_deepseek_priority(item[2], model) for item in eligible)
+        eligible = [item for item in eligible if _deepseek_priority(item[2], model) == priority]
         # PP avoids the per-layer TP collectives for host-backed experts. Keep
-        # it for automatic topology selection when it supports the same chunk;
+        # it when automatic candidates have the same chunk/cache priority;
         # explicit --tp/--device candidates remain untouched.
         if not {"tp", "device"} & explicit:
             pp = [item for item in eligible if item[2]["mode"] == "pp"]
@@ -516,7 +577,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if any("kvmem" in item[2] for item in eligible):
         eligible = [item for item in eligible if "kvmem" in item[2] or item[3]]
     if model.family == "deepseek_v41" and not {"tp", "device"} & explicit:
-        # Keep the fastest prediction at the largest feasible chunk; the
+        # Keep the fastest prediction after the chunk/cache preferences; the
         # generic ten-percent tie window can otherwise collapse PP to one GPU.
         _, chosen, result, _ = min(eligible, key=lambda item: (
             item[0], item[2]["mode"] == "tp", -len(item[2]["gpu_budget_bytes"])))
@@ -532,11 +593,6 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
             setattr(chosen, name, result[name])
     if "kvmem" in result:
         chosen.kvmem = json.dumps(result["kvmem"], sort_keys=True)
-        # Model detection supplies a history-cache default before planning. It
-        # must not re-enable reuse after the planner chose exact KV streaming.
-        for name in ("cache_history", "prefix_cache"):
-            if name not in explicit:
-                setattr(chosen, name, "false")
     if (model.family == "qwen4" and chosen.mtp > 0 and result["mode"] == "pp" and
             len(result["gpu_budget_bytes"]) > 1 and result["resident_layers"] < model.layers and
             not {"cuda_embedding", "low_gpu_mem"} & explicit):
@@ -549,11 +605,15 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                "atype", "kv_cache_dtype", "max_context_length", "tokens", "max_batch", "kvmem",
                "low_gpu_mem", "cuda_embedding", "cache_history", "prefix_cache",
                "dspark", "speculative_algorithm", "fast_prefill")
+    if model.family == "deepseek_v41":
+        changed += ("cuda_slab",)
+        result["cuda_slab"] = chosen.cuda_slab
     result["automatic"] = {"policy": "interactive-4k-input-512-output", "topology_candidates": len(choices),
                            "ranking": "estimated latency; not measured throughput", "mtp": args.mtp}
     if model.family == "deepseek_v41":
         result["automatic"]["ranking"] = (
-            "largest feasible chunk at fixed context; PP preferred for "
+            "non-disk experts first; fixed context; chunk up to 512, then per-GPU expert cache up to 3 GiB, "
+            "then largest feasible chunk; PP preferred for "
             "automatic host-backed hybrid; estimated latency"
         )
     result["automatic"]["kv_streaming"] = "kvmem" in result

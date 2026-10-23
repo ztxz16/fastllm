@@ -7,6 +7,7 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "fastllm-cuda-rope.cuh"
@@ -161,6 +162,27 @@ static std::set<void*> fastllmCudaGraphPoolTouchedDuringCapture;
 static std::set<std::pair<int, unsigned long long>>
     fastllmCudaGraphPoolCaptureIds;
 
+// Serial capture can reuse a temporary across branches. Such a region must
+// retain its serial edge when markers are removed; pinning the allocation
+// until graph destruction alone does not make concurrent reuse safe.
+struct FastllmCudaGraphParallelResources {
+    bool second = false, serial = false, collective = false;
+    std::set<void*> firstPointers;
+};
+static std::map<std::pair<int, unsigned long long>,
+    std::map<int, FastllmCudaGraphParallelResources>> fastllmCudaGraphParallelResources;
+
+static void FastllmCudaGraphRecordPoolResourceLocked(
+        void *ptr, const FastllmCudaGraphCaptureIdentity &identity) {
+    auto it = fastllmCudaGraphParallelResources.find({identity.device, identity.id});
+    if (it == fastllmCudaGraphParallelResources.end()) return;
+    for (auto &entry : it->second) {
+        auto &region = entry.second;
+        if (!region.second) region.firstPointers.insert(ptr);
+        else if (region.firstPointers.count(ptr)) region.serial = true;
+    }
+}
+
 static FastllmCudaGraphCaptureIdentity
 FastllmCudaGraphCurrentCaptureIdentity() {
     FastllmCudaGraphCaptureIdentity identity;
@@ -244,6 +266,7 @@ static bool FastllmCudaGraphPoolBeforeFreeLocked(
             FASTLLM_CUDA_GRAPH_POOL_CAPTURING &&
         FastllmCudaGraphCaptureIdentityRegisteredLocked(identity)) {
         fastllmCudaGraphPoolTouchedDuringCapture.insert(ptr);
+        FastllmCudaGraphRecordPoolResourceLocked(ptr, identity);
     }
     return true;
 }
@@ -259,7 +282,49 @@ static void FastllmCudaGraphPoolAfterAllocLocked(
             FASTLLM_CUDA_GRAPH_POOL_CAPTURING &&
         FastllmCudaGraphCaptureIdentityRegisteredLocked(identity)) {
         fastllmCudaGraphPoolTouchedDuringCapture.insert(ptr);
+        FastllmCudaGraphRecordPoolResourceLocked(ptr, identity);
     }
+}
+
+// All ranks keep collective ordering even when buffers happen to be disjoint:
+// custom collectives also share counters and NCCL has communicator ordering.
+void FastllmCudaGraphRecordCollective() {
+    const auto identity = FastllmCudaGraphCurrentCaptureIdentity();
+    if (!identity.valid) return;
+    std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+    auto it = fastllmCudaGraphParallelResources.find({identity.device, identity.id});
+    if (it == fastllmCudaGraphParallelResources.end()) return;
+    for (auto &entry : it->second) {
+        auto &region = entry.second;
+        if (!region.second) region.collective = true;
+        else if (region.collective) region.serial = true;
+    }
+}
+
+static bool FastllmCudaGraphParallelStage(int region, int stage) {
+    const auto identity = FastllmCudaGraphCurrentCaptureIdentity();
+    if (!identity.valid) return false;
+    std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+    auto &regions = fastllmCudaGraphParallelResources[{identity.device, identity.id}];
+    if (stage == 0) regions[region] = {};
+    else if (stage == 1) regions[region].second = true;
+    else {
+        const bool serial = regions[region].serial;
+        regions.erase(region);
+        if (regions.empty()) fastllmCudaGraphParallelResources.erase({identity.device, identity.id});
+        return serial;
+    }
+    return false;
+}
+
+bool FastllmCudaV41MoeGraphReady(const fastllm::Data *key, int rows, int topk) {
+#ifndef USE_ROCM
+    if (!key || rows <= 0 || topk <= 0) return false;
+    return FastllmCudaV41GGUFGraphReady(key, rows, topk) ||
+        (topk <= 16 && FastllmCudaV41MarlinGraphReady(key, rows));
+#else
+    return false;
+#endif
 }
 
 // 张量并行下 NCCL 集合通信异步发射在 cudaStreamPerThread 上且不立即同步。此时执行真实 cudaMalloc
@@ -682,9 +747,21 @@ void FastllmCudaSyncCurrentThreadStream() {
 }
 
 void *FastllmCudaStreamCreate(bool nonBlocking) {
-    cudaStream_t stream;
+    cudaStream_t stream = nullptr;
     unsigned int flags = nonBlocking ? cudaStreamNonBlocking : cudaStreamDefault;
     cudaError_t state = cudaStreamCreateWithFlags(&stream, flags);
+    // Hybrid PP can change its staging device after large prefill temporaries
+    // entered the idle pool. Stream metadata needs driver memory too; recover
+    // from the same pool pressure as tensor allocations, outside graph capture.
+    if (state == cudaErrorMemoryAllocation) {
+        cudaGetLastError();
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) == cudaSuccess &&
+                capture == cudaStreamCaptureStatusNone) {
+            FastllmCudaClearBigBufferCurrentDevice();
+            state = cudaStreamCreateWithFlags(&stream, flags);
+        }
+    }
     checkCudaErrors("Error: CUDA error when creating stream!", state);
     return (void*)stream;
 }
@@ -904,8 +981,9 @@ namespace {
         (void)layer;
     }
 
-    __global__ void FastllmCudaQwen35MoeJoinMarkerKernel(int layer) {
+    __global__ void FastllmCudaQwen35MoeJoinMarkerKernel(int layer, bool serial) {
         (void)layer;
+        (void)serial;
     }
 
     static bool FastllmCudaGraphIsCapturingCurrentThread() {
@@ -990,6 +1068,7 @@ namespace {
         cudaGraphNode_t sharedDone = nullptr;
         cudaGraphNode_t routedBegin = nullptr;
         cudaGraphNode_t join = nullptr;
+        bool serial = false;
     };
 }
 
@@ -1002,6 +1081,7 @@ bool FastllmCudaGraphSetQwen35MoeMarkersEnabled(bool enabled) {
 void FastllmCudaGraphMarkQwen35MoeFork(int layer) {
     if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
         FastllmCudaGraphIsCapturingCurrentThread()) {
+        FastllmCudaGraphParallelStage(layer, 0);
         FastllmCudaQwen35MoeForkMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
     }
 }
@@ -1016,6 +1096,7 @@ void FastllmCudaGraphMarkQwen35MoeSharedDone(int layer) {
 void FastllmCudaGraphMarkQwen35MoeRoutedBegin(int layer) {
     if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
         FastllmCudaGraphIsCapturingCurrentThread()) {
+        FastllmCudaGraphParallelStage(layer, 1);
         FastllmCudaQwen35MoeRoutedBeginMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
     }
 }
@@ -1023,7 +1104,8 @@ void FastllmCudaGraphMarkQwen35MoeRoutedBegin(int layer) {
 void FastllmCudaGraphMarkQwen35MoeJoin(int layer) {
     if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
         FastllmCudaGraphIsCapturingCurrentThread()) {
-        FastllmCudaQwen35MoeJoinMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
+        const bool serial = FastllmCudaGraphParallelStage(layer, 2);
+        FastllmCudaQwen35MoeJoinMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer, serial);
     }
 }
 
@@ -1047,8 +1129,7 @@ int FastllmCudaGraphOptimizeQwen35Moe(void *graph) {
 
     // CUDA forbids destroying nodes in a graph containing allocation/free
     // nodes. Detect that structural restriction before adding dependencies so
-    // the caller can safely discard this untouched graph and recapture without
-    // markers.
+    // the caller can retain this serial graph or recapture without markers.
     for (cudaGraphNode_t node : nodes) {
         cudaGraphNodeType type;
         state = cudaGraphNodeGetType(node, &type);
@@ -1114,6 +1195,9 @@ int FastllmCudaGraphOptimizeQwen35Moe(void *graph) {
             return -1;
         }
         layerMarkers.*slot = node;
+        if (slot == &FastllmCudaQwen35MoeMarkerNodes::join) {
+            layerMarkers.serial = *(bool*)params.kernelParams[1];
+        }
         markerCount++;
     }
 
@@ -1129,6 +1213,7 @@ int FastllmCudaGraphOptimizeQwen35Moe(void *graph) {
     std::set<std::pair<cudaGraphNode_t, cudaGraphNode_t> > desiredEdges;
     std::vector<cudaGraphNode_t> markerNodes;
     markerNodes.reserve(markerCount);
+    int parallelRegions = 0;
     for (auto &it : markers) {
         auto &m = it.second;
         if (m.fork == nullptr || m.sharedDone == nullptr ||
@@ -1160,10 +1245,15 @@ int FastllmCudaGraphOptimizeQwen35Moe(void *graph) {
             for (cudaGraphNode_t root : sharedRoots) {
                 desiredEdges.insert({dependency, root});
             }
+        }
+        // Resource conflicts keep the original first -> second edge. This
+        // still removes marker kernels and retains a usable serial graph.
+        for (cudaGraphNode_t dependency : m.serial ? sharedTails : forkDependencies) {
             for (cudaGraphNode_t root : routedRoots) {
                 desiredEdges.insert({dependency, root});
             }
         }
+        if (!m.serial) ++parallelRegions;
         for (cudaGraphNode_t tail : sharedTails) {
             for (cudaGraphNode_t root : joinRoots) {
                 desiredEdges.insert({tail, root});
@@ -1199,7 +1289,7 @@ int FastllmCudaGraphOptimizeQwen35Moe(void *graph) {
         }
     }
     fastllmCudaGraphLastError.clear();
-    return (int)markers.size();
+    return parallelRegions;
 }
 
 namespace {
@@ -1217,15 +1307,20 @@ namespace {
     }
 }
 
-static bool FastllmCudaGraphQwen35MoeParallelSelfTest(bool rootFork = false) {
+static bool FastllmCudaGraphQwen35MoeParallelSelfTest(
+        bool rootFork = false, bool temporaryReuse = false, bool collective = false) {
     int *shared = nullptr;
     int *routed = nullptr;
     int *output = nullptr;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
+    bool poolActive = false;
+    std::vector<void*> reserved;
     auto cleanup = [&]() {
         if (exec != nullptr) cudaGraphExecDestroy(exec);
         if (graph != nullptr) cudaGraphDestroy(graph);
+        if (poolActive) FastllmCudaGraphMemoryPoolAbort();
+        FastllmCudaGraphMemoryPoolRelease(reserved);
         if (shared != nullptr) cudaFree(shared);
         if (routed != nullptr) cudaFree(routed);
         if (output != nullptr) cudaFree(output);
@@ -1235,6 +1330,16 @@ static bool FastllmCudaGraphQwen35MoeParallelSelfTest(bool rootFork = false) {
         cudaMalloc(&output, sizeof(int)) != cudaSuccess) {
         cleanup();
         return false;
+    }
+    if (temporaryReuse) {
+        void *warm = FastllmCudaMalloc(4096);
+        if (!warm) { cleanup(); return false; }
+        FastllmCudaFree(warm);
+        cudaDeviceSynchronize();
+    }
+    if (temporaryReuse || collective) {
+        poolActive = FastllmCudaGraphMemoryPoolBegin();
+        if (!poolActive) { cleanup(); return false; }
     }
     if (!FastllmCudaGraphBeginCapture()) {
         cleanup();
@@ -1246,10 +1351,22 @@ static bool FastllmCudaGraphQwen35MoeParallelSelfTest(bool rootFork = false) {
         cudaMemsetAsync(output, 0, sizeof(int), cudaStreamPerThread);
     }
     FastllmCudaGraphMarkQwen35MoeFork(0);
-    FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(shared, 11);
+    int *firstTemp = temporaryReuse ? (int*)FastllmCudaMalloc(4096) : shared;
+    if (collective) FastllmCudaGraphRecordCollective();
+    FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(firstTemp, 11);
+    if (temporaryReuse) {
+        cudaMemcpyAsync(shared, firstTemp, sizeof(int), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        FastllmCudaFree(firstTemp);
+    }
     FastllmCudaGraphMarkQwen35MoeSharedDone(0);
     FastllmCudaGraphMarkQwen35MoeRoutedBegin(0);
-    FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(routed, 31);
+    int *secondTemp = temporaryReuse ? (int*)FastllmCudaMalloc(4096) : routed;
+    if (collective) FastllmCudaGraphRecordCollective();
+    FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(secondTemp, 31);
+    if (temporaryReuse) {
+        cudaMemcpyAsync(routed, secondTemp, sizeof(int), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        FastllmCudaFree(secondTemp);
+    }
     FastllmCudaGraphMarkQwen35MoeJoin(0);
     FastllmCudaQwen35MoeSelfTestJoinKernel<<<1, 1, 0, cudaStreamPerThread>>>(
         shared, routed, output);
@@ -1259,7 +1376,13 @@ static bool FastllmCudaGraphQwen35MoeParallelSelfTest(bool rootFork = false) {
         return false;
     }
     graph = (cudaGraph_t)capturedGraph;
-    if (FastllmCudaGraphOptimizeQwen35Moe(graph) != 1 ||
+    if (poolActive) {
+        if (!FastllmCudaGraphMemoryPoolEnd(reserved)) { cleanup(); return false; }
+        poolActive = false;
+    }
+    const bool serial = temporaryReuse || collective;
+    if ((temporaryReuse && (firstTemp == nullptr || firstTemp != secondTemp)) ||
+        FastllmCudaGraphOptimizeQwen35Moe(graph) != (serial ? 0 : 1) ||
         cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess ||
         cudaGraphLaunch(exec, cudaStreamPerThread) != cudaSuccess ||
         cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
@@ -1367,6 +1490,19 @@ static bool FastllmCudaGraphQwen35MoeAllocationFallbackSelfTest() {
         cleanup();
         return false;
     }
+    // The rejected graph is untouched: callers can also retain its serial
+    // markers without recapturing a body that changes host-side model state.
+    int serialResult = 0;
+    if (cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess ||
+        cudaGraphLaunch(exec, cudaStreamPerThread) != cudaSuccess ||
+        cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess ||
+        cudaMemcpy(&serialResult, output, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        serialResult != 42) {
+        cleanup();
+        return false;
+    }
+    cudaGraphExecDestroy(exec);
+    exec = nullptr;
     cudaGraphDestroy(graph);
     graph = nullptr;
 
@@ -1391,6 +1527,8 @@ static bool FastllmCudaGraphQwen35MoeAllocationFallbackSelfTest() {
 bool FastllmCudaGraphQwen35MoeSelfTest() {
     return FastllmCudaGraphQwen35MoeParallelSelfTest() &&
            FastllmCudaGraphQwen35MoeParallelSelfTest(true) &&
+           FastllmCudaGraphQwen35MoeParallelSelfTest(false, true) &&
+           FastllmCudaGraphQwen35MoeParallelSelfTest(false, false, true) &&
            FastllmCudaGraphQwen35MoeAllocationFallbackSelfTest();
 }
 
@@ -5268,6 +5406,7 @@ bool FastllmCudaGraphMemoryPoolBegin() {
     }
     fastllmCudaGraphPoolTouchedDuringCapture.clear();
     fastllmCudaGraphPoolCaptureIds.clear();
+    fastllmCudaGraphParallelResources.clear();
     fastllmCudaGraphPoolPhase.store(
         FASTLLM_CUDA_GRAPH_POOL_CAPTURING, std::memory_order_release);
     return true;
@@ -5328,6 +5467,7 @@ bool FastllmCudaGraphMemoryPoolEnd(std::vector<void*> &reservedPointers) {
         std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
         fastllmCudaGraphPoolTouchedDuringCapture.clear();
         fastllmCudaGraphPoolCaptureIds.clear();
+        fastllmCudaGraphParallelResources.clear();
         fastllmCudaGraphPoolPhase.store(
             FASTLLM_CUDA_GRAPH_POOL_IDLE, std::memory_order_release);
     }
@@ -5343,6 +5483,7 @@ void FastllmCudaGraphMemoryPoolAbort() {
     std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
     fastllmCudaGraphPoolTouchedDuringCapture.clear();
     fastllmCudaGraphPoolCaptureIds.clear();
+    fastllmCudaGraphParallelResources.clear();
     fastllmCudaGraphPoolPhase.store(
         FASTLLM_CUDA_GRAPH_POOL_IDLE, std::memory_order_release);
 }
@@ -6337,6 +6478,9 @@ bool FastllmCudaHostRegister(void *ptr, size_t size) {
     if (err != cudaSuccess) {
         fprintf(stderr, "Warning: cudaHostRegister failed (%s), falling back to unpinned memory\n",
                 cudaGetErrorString(err));
+        // Registration has a supported unpinned fallback. Do not leave its
+        // handled error for an unrelated subsequent kernel's launch check.
+        cudaGetLastError();
         return false;
     }
     return true;

@@ -32,11 +32,19 @@
 
 #include "baseblock.h"
 #include "executor.h"
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#endif
 #include "utils.h"
+#include "utils/hybrid_moe.h"
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
+#endif
 #include "json11.hpp"
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-dspark.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -48,12 +56,151 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <sstream>
 
 namespace fastllm {
+    // Per-request inputs and outputs have stable addresses. Temporary tensors
+    // created while capturing are owned by the graph allocator until teardown.
+    struct DeepSeekV41DsparkWorkspace {
+        int block = 0, width = 0;
+        bool disabled = false, parallelExperts = true;
+        std::vector<int> devices;
+        std::vector<void*> cachePointers;
+        Data input, preMix, indices, position, headHidden, normalized, logits;
+        Data markovTokens, markovValues, markovIndices, markovEmbeds;
+        // The graph optimizer may run shared and routed branches concurrently.
+        // Their scratch must remain disjoint throughout every replay.
+        struct SharedExpertWorkspace {
+            Data output, gateup, activated, floatOutput;
+        };
+        std::vector<SharedExpertWorkspace> sharedExperts;
+#ifdef USE_CUDA
+        std::vector<void*> graphs, execs, starts, ends, reserved;
+        void ClearGraphs() {
+            const int original = FastllmCudaGetDevice();
+            for (size_t i = 0; i < devices.size(); ++i) {
+                FastllmCudaSetDevice(devices[i]);
+                if (i < execs.size() && execs[i]) {
+                    FastllmCudaSyncDevice(devices[i]);
+                    FastllmCudaGraphExecDestroy(execs[i]);
+                }
+                if (i < graphs.size() && graphs[i]) FastllmCudaGraphDestroy(graphs[i]);
+                if (i < starts.size() && starts[i]) FastllmCudaEventDestroy(starts[i]);
+                if (i < ends.size() && ends[i]) FastllmCudaEventDestroy(ends[i]);
+            }
+            FastllmCudaGraphMemoryPoolRelease(reserved);
+            graphs.clear(); execs.clear(); starts.clear(); ends.clear(); reserved.clear();
+            FastllmCudaSetDevice(original);
+        }
+        ~DeepSeekV41DsparkWorkspace() { ClearGraphs(); }
+#endif
+    };
+
     namespace {
+#ifdef USE_CUDA
+        thread_local bool dsparkCapturing = false;
+
+        bool DsRunDraftGraph(DeepSeekV41DsparkWorkspace &state, const std::function<void()> &body) {
+            const int root = state.devices.front();
+            auto launch = [&]() {
+                for (size_t i = 0; i < state.devices.size(); ++i) {
+                    FastllmCudaSetDevice(state.devices[i]);
+                    AssertInFastLLM(FastllmCudaGraphLaunch(state.execs[i]),
+                                    "DeepSeekV41 DSpark graph launch failed.");
+                }
+                FastllmCudaSetDevice(root);
+            };
+            if (!state.execs.empty()) { launch(); return true; }
+            if (state.disabled) return false;
+            body(); // Resolve weights, collective buffers and all kernel workspaces.
+            if (state.disabled) return true; // Warmup already produced valid eager outputs.
+            const int count = state.devices.size();
+            state.graphs.assign(count, nullptr); state.execs.assign(count, nullptr);
+            state.starts.assign(count, nullptr); state.ends.assign(count, nullptr);
+            bool ok = true;
+            for (int i = 0; i < count; ++i) {
+                FastllmCudaSetDevice(state.devices[i]);
+                FastllmCudaSyncDevice(state.devices[i]);
+                ok = FastllmCudaGraphPrepareCaptureDevice() && ok;
+                state.starts[i] = FastllmCudaEventCreate();
+                state.ends[i] = FastllmCudaEventCreate();
+                ok = state.starts[i] && state.ends[i] && ok;
+            }
+            const bool pool = ok && FastllmCudaGraphMemoryPoolBegin();
+            ok = pool;
+            int begun = 0;
+            bool joined = false;
+            std::exception_ptr error;
+            if (pool) {
+                FastllmCudaClearThreadError();
+                for (int device : state.devices) {
+                    FastllmCudaSetDevice(device);
+                    if (!FastllmCudaGraphBeginCapture()) { ok = false; break; }
+                    ++begun;
+                }
+                if (ok && count > 1) {
+                    for (int i = 0; i < count; ++i) {
+                        FastllmCudaSetDevice(state.devices[i]);
+                        FastllmCudaEventRecordCurrentThread(state.starts[i]);
+                    }
+                    joined = MultiCudaGraphWorkersWaitEvents(state.devices, state.starts);
+                    ok = joined;
+                }
+                if (ok) {
+                    FastllmCudaSetDevice(root);
+                    dsparkCapturing = true;
+                    try { body(); } catch (...) { error = std::current_exception(); }
+                    dsparkCapturing = false;
+                    ok = !error && !state.disabled && !FastllmCudaGetThreadError() && !FastllmCudaGetGraphError();
+                }
+                if (joined) {
+                    ok = MultiCudaGraphWorkersRecordEvents(state.devices, state.ends) && ok;
+                    for (int i = 0; i < count; ++i) {
+                        FastllmCudaSetDevice(state.devices[i]);
+                        FastllmCudaCurrentThreadStreamWaitEvent(state.ends[i]);
+                    }
+                }
+                for (int i = 0; i < begun; ++i) {
+                    FastllmCudaSetDevice(state.devices[i]);
+                    ok = FastllmCudaGraphEndCapture(&state.graphs[i]) && ok;
+                }
+                ok = FastllmCudaGraphMemoryPoolEnd(state.reserved) && ok;
+                if (ok) for (int i = 0; i < count && ok; ++i) {
+                    FastllmCudaSetDevice(state.devices[i]);
+                    // Only the root core graph contains parallel expert regions.
+                    if (i == 0 && state.parallelExperts && !state.sharedExperts.empty()) {
+                        const int parallel = FastllmCudaGraphOptimizeParallelRegions(state.graphs[i]);
+                        if (parallel == FASTLLM_CUDA_GRAPH_RECAPTURE_WITHOUT_PARALLEL_MARKERS) {
+                            // Allocation nodes cannot be rewritten. Capture a
+                            // serial graph instead, retaining the graph speedup.
+                            state.ClearGraphs();
+                            state.parallelExperts = false;
+                            FastllmCudaSetDevice(root);
+                            return DsRunDraftGraph(state, body);
+                        }
+                        ok = parallel >= 0;
+                    }
+                    if (ok) ok = FastllmCudaGraphInstantiate(state.graphs[i], &state.execs[i]);
+                }
+            }
+            FastllmCudaSetDevice(root);
+            if (!ok) {
+                const std::string reason = FastllmCudaGraphLastError();
+                state.ClearGraphs(); state.disabled = true;
+                FastllmCudaClearLastError(); FastllmCudaClearThreadError(); FastllmCudaClearGraphError();
+                if (error) std::rethrow_exception(error);
+                fprintf(stderr, "[Fastllm] DeepSeekV41 DSpark graph capture failed (%s); using eager.\n", reason.c_str());
+                return false;
+            }
+            launch();
+            return true;
+        }
+#endif
+
         // ---- 与 deepseekv41.cpp 中同名的算子薄封装。那些封装位于匿名命名空间，
         // ---- 跨文件不可复用，这里按同样的参数重新封装一份（只是 Executor::Run 的转发）。
 
@@ -70,6 +217,15 @@ namespace fastllm {
             std::transform(v.begin(), v.end(), v.begin(), ::tolower);
             return v == "1" || v == "on" || v == "true" || v == "yes";
         }
+
+#ifdef USE_CUDA
+        bool DsDraftGraphEnabled() {
+            const auto &env = GetFastllmEnv();
+            return env.cudaGraph && !env.cudaSync && !env.printProfile &&
+                std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
+                !DsEnvFlag("FASTLLM_DSV41_REFERENCE_MATH") && !DsEnvFlag("FASTLLM_DSV41_LEGACY_ROTARY");
+        }
+#endif
 
         float DsEnvFloat(const char *name, float fallback) {
             const char *value = std::getenv(name);
@@ -127,11 +283,21 @@ namespace fastllm {
         };
 
         void DsRotaryQuant(Data &x, const DsRopeParams &rope, int startPos, int posStep,
-                           bool inverse, int quantMode, int quantBlock, int quantDim = -1) {
+                           bool inverse, int quantMode, int quantBlock, int quantDim = -1,
+                           const int *devicePosition = nullptr) {
             static const bool disableFakeQuant = DsEnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT");
             if (disableFakeQuant) {
                 quantMode = 0;
             }
+#ifdef USE_CUDA
+            if (devicePosition) {
+                AssertInFastLLM(FastllmCudaDeepSeekV41RotaryQuantPosition(x, rope.ropeDim, rope.base,
+                    startPos, posStep, inverse, rope.originalSeqLen, rope.factor, rope.betaFast, rope.betaSlow,
+                    quantMode, quantDim > 0 ? quantDim : x.dims.back(), quantBlock, devicePosition),
+                    "DeepSeekV41 DSpark dynamic rotary rejected input.");
+                return;
+            }
+#endif
             IntDict ints = {
                 {"ropeDim", rope.ropeDim}, {"startPos", startPos}, {"posStep", posStep},
                 {"inverse", inverse ? 1 : 0}, {"originalSeqLen", rope.originalSeqLen},
@@ -163,10 +329,10 @@ namespace fastllm {
                              {{"windowSize", windowSize}, {"startPos", startPos}});
         }
 
-        void DsWindowStore(const Data &chunkKV, Data &ring, int startPos, int windowSize) {
+        void DsWindowStore(const Data &chunkKV, Data &ring, int startPos, int windowSize, int rowCount = -1) {
             DsExecutor().Run("DeepSeekV41WindowStore", {
                 {"chunk", (Data*)&chunkKV}, {"ring", &ring}
-            }, {}, {{"startPos", startPos}, {"windowSize", windowSize}});
+            }, {}, {{"startPos", startPos}, {"windowSize", windowSize}, {"rowCount", rowCount}});
         }
 
         float DsSoftplus(float x) {
@@ -777,10 +943,11 @@ namespace fastllm {
         // Leave the CUDA executor's device list empty: TP worker kernels use
         // their own current device when moving rank-local weights to CUDA.
 #ifdef USE_CUDA
-        if (DsExecutor().GetFirstDeviceType() == "multicuda") {
-            // Finish both caller streams before crossing into the single-GPU
-            // draft path or gathering logits on the first rank.
-            for (int device : v41DsparkTpDevices) FastllmCudaSyncDevice(device);
+        if (DsExecutor().GetFirstDeviceType() == "multicuda" && !dsparkCapturing) {
+            // The draft path only consumes buffers owned by the first rank.
+            // Waiting for every TP rank here would serialize the draft with
+            // target work that is still draining on the other GPUs.
+            FastllmCudaSyncDevice(v41DsparkTpDevices.front());
         }
 #endif
         DsExecutor().SetFirstDevice("cuda");
@@ -809,7 +976,16 @@ namespace fastllm {
         Repeat(embedOut, 2, hc_mult, hiddenStates);
     }
 
-    void DeepSeekV41Model::DsparkProjectHead(Data &input, Data &output) {
+    void DeepSeekV41Model::DsparkProjectHead(Data &input, Data &output, bool persistent) {
+#ifdef USE_CUDA
+        if (persistent && input.dataType == DataType::BFLOAT16 && !v41DsparkTpDevices.empty() &&
+            !quantizedLinearNames.count("head.weight")) {
+            ApplyDsparkDevice();
+            FastllmMultiCudaSetDevice(v41DsparkTpDevices);
+            if (MultiCudaLinearOutputGatherPersistent(input, weight["head.weight"], output,
+                                                     v41DsparkHeadWorkspace)) return;
+        }
+#endif
         Data floatInput;
         Data *headInput = &input;
         if (weight["head.weight"].dataType == DataType::FLOAT32) {
@@ -832,6 +1008,13 @@ namespace fastllm {
         // Drain their streams and allocate the gather destination on rank 0.
         ApplyDsparkDevice();
         ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
+#ifdef USE_CUDA
+        if (persistent && MultiCudaLinearOutputGatherPersistent(*source, weight["head.weight"], output,
+                                                  v41DsparkHeadWorkspace)) {
+            ApplyDsparkDevice();
+            return;
+        }
+#endif
         // Keep the vocabulary shards intact and gather complete logits on the
         // first GPU, as in Qwen's draft output-gather linear path.
         DsExecutor().Run("Linear",
@@ -1334,10 +1517,6 @@ namespace fastllm {
                         "DeepSeekV41 DSpark: invalid accepted prefix length.");
         ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
         const int newLen = startPos + accept;
-        // Rejected suffixes require temporary prefix copies. Keep every copy
-        // alive until the whole commit completes, rather than synchronizing
-        // both ranks after each layer's WindowStore.
-        std::vector<Data> acceptedRows(accept < forwarded ? block_cnt : 0);
 #ifdef USE_CUDA
         ScopedTpDispatch commitDispatch(v41DsparkTpDevices.size() > 1, v41DsparkTpDevices);
 #endif
@@ -1345,13 +1524,9 @@ namespace fastllm {
             DeepSeekV41LayerCache &cache = state.layers[layer];
             // 1) 滑窗环形缓冲：只写入被接受的行
             if (layer < (int)scratch.windowKV.size() && scratch.windowKV[layer].dims.size() == 3) {
-                if (accept == forwarded) {
-                    DsWindowStore(scratch.windowKV[layer], cache.windowKV, startPos, window_size);
-                } else {
-                    Data &rows = acceptedRows[layer];
-                    Split(scratch.windowKV[layer], 1, 0, accept, rows);
-                    DsWindowStore(rows, cache.windowKV, startPos, window_size);
-                }
+                // Read the accepted prefix directly from each rank's scratch.
+                // Split would collapse replicas and broadcast them again.
+                DsWindowStore(scratch.windowKV[layer], cache.windowKV, startPos, window_size, accept);
             }
             cache.totalLen = newLen;
             // 2) 压缩 KV / indexer key：截断行数并重建 rawTail
@@ -1384,10 +1559,17 @@ namespace fastllm {
                 AssertInFastLLM(scratch.rawKV[layer].dims.size() == 3 &&
                                 scratch.rawKV[layer].dims[1] >= total,
                                 "DeepSeekV41 DSpark: the compressor rollback buffer is too short.");
-                Split(scratch.rawKV[layer], 1, total - rem, total, cache.rawTailKV);
-                if (ratio > 1) {
-                    Split(scratch.rawScore[layer], 1, total - rem, total, cache.rawTailScore);
-                }
+                auto copyTail = [&](Data &source, Data &tail) {
+#ifdef USE_CUDA
+                    // Keep rank-local cache storage: ordinary Split collapses
+                    // replicas to root and the next reserve broadcasts them back.
+                    if (MultiCudaCopyReplicatedRows(tail, source, total - rem, rem,
+                                                     v41DsparkTpDevices)) return;
+#endif
+                    Split(source, 1, total - rem, total, tail);
+                };
+                copyTail(scratch.rawKV[layer], cache.rawTailKV);
+                if (ratio > 1) copyTail(scratch.rawScore[layer], cache.rawTailScore);
             }
             AssertInFastLLM(cache.compressedBlocks == newLen / ratio,
                             "DeepSeekV41 DSpark: compressed cache rollback is inconsistent at layer " +
@@ -1435,17 +1617,17 @@ namespace fastllm {
         // 1) main_x = main_norm(main_proj(cat(mean_hc(h_37), mean_hc(h_38), mean_hc(h_39))))
         Data combined, tmp;
         for (size_t k = 0; k < scratch.mainHidden.size(); k++) {
-            Data localHidden;
-            Data *hidden = &scratch.mainHidden[k];
+            const Data *hidden = &scratch.mainHidden[k];
 #ifdef USE_CUDA
             if (hidden->multiDeviceData) {
                 // Replicated tensors only carry shape metadata at the root.
-                // Read an actual rank buffer before entering the draft path.
-                AssertInFastLLM(MultiCudaCopyReplicaToCpu(localHidden, *hidden, v41DsparkTpDevices),
+                // The draft runs on the first rank, so consume that replica
+                // directly instead of staging it through host memory.
+                auto it = hidden->multiDeviceDatas.find(v41DsparkTpDevices.front());
+                AssertInFastLLM(it != hidden->multiDeviceDatas.end() && it->second != nullptr &&
+                                it->second->cudaData != nullptr,
                                 "DeepSeekV41 DSpark: cannot read the target TP hidden state.");
-                // A bare {0} selects the bool overload and disables the upload.
-                localHidden.ToDevice(DataDevice::CUDA, std::vector<int>{v41DsparkTpDevices.front()});
-                hidden = &localHidden;
+                hidden = it->second;
             }
 #endif
             Data part;
@@ -1461,26 +1643,71 @@ namespace fastllm {
                 combined.CopyFrom(tmp);
             }
         }
-        const std::string stage0 = "mtp.0";
-        Data mainProj, mainX;
-        // Decoding FP8 weights to the startup dtype does not remove the
-        // checkpoint's block-32 activation quantization requirement.
-        LinearWithActivationQuant(combined, stage0 + ".main_proj.weight", mainProj);
-        DsRMSNormBF16(mainProj, weight[stage0 + ".main_norm.weight"], rms_norm_eps, mainX);
-        mainX.Reshape({1, rows, embed_dim});
-
-        // 2) 每个草稿层用自己的 wkv / kv_norm 把 main_x 写进滑窗环形缓冲
-        DsRopeParams windowRope = {qk_rope_head_dim, rope_base, 0, rope_factor,
-                                   rope_scaling_beta_fast, rope_scaling_beta_slow};
-        for (int stage = 0; stage < v41DsparkLayers; stage++) {
-            const std::string pre = "mtp." + std::to_string(stage);
-            Data kv;
-            LinearWithActivationQuant(mainX, pre + ".attn.wkv.weight", kv);
-            DsRMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
-            kv.Reshape({1, rows, head_dim_full});
-            DsRotaryQuant(kv, windowRope, startPos, 1, false, 1, 32);
-            DsWindowStore(kv, dspark.layers[stage].windowKV, startPos, window_size);
+        DeepSeekV41DsparkWorkspace *contextState = nullptr;
+#ifdef USE_CUDA
+        std::unique_lock<std::mutex> contextLock(v41CudaGraphMutex, std::defer_lock);
+        std::vector<void*> caches;
+        bool cacheReady = true;
+        for (auto &layer : dspark.layers) {
+            caches.push_back(layer.windowKV.cudaData);
+            cacheReady &= layer.windowKV.dataDevice == DataDevice::CUDA && layer.windowKV.cudaData;
         }
+        if (DsDraftGraphEnabled() && !v41DsparkTpDevices.empty() &&
+            rows <= 8 && cacheReady && combined.dataDevice == DataDevice::CUDA && contextLock.try_lock()) {
+            auto &slot = dspark.contextWorkspaces[rows];
+            const std::vector<int> devices{v41DsparkTpDevices.front()};
+            if (slot && (slot->devices != devices || slot->cachePointers != caches)) slot.reset();
+            if (!slot) {
+                slot = std::make_shared<DeepSeekV41DsparkWorkspace>();
+                slot->devices = devices; slot->cachePointers = caches;
+            }
+            if (!slot->disabled) {
+                contextState = slot.get(); contextState->input.CopyFrom(combined);
+                Data &position = contextState->position;
+                if (position.dims.empty()) {
+                    position.dataType = DataType::INT32; position.UpdateUnitSize(); position.Resize({1});
+                    position.ToDevice(DataDevice::CUDA, devices, false); position.Allocate();
+                }
+                FastllmCudaCopyFromHostToDevice(position.cudaData, &startPos, sizeof(int));
+            }
+        }
+#endif
+        auto contextBody = [&]() {
+            Data &contextInput = contextState ? contextState->input : combined;
+            const int *devicePosition = contextState ? (const int*)contextState->position.cudaData : nullptr;
+            const std::string stage0 = "mtp.0";
+            Data mainProj, mainX;
+            // Decoding FP8 weights to the startup dtype does not remove the
+            // checkpoint's block-32 activation quantization requirement.
+            LinearWithActivationQuant(contextInput, stage0 + ".main_proj.weight", mainProj);
+            DsRMSNormBF16(mainProj, weight[stage0 + ".main_norm.weight"], rms_norm_eps, mainX);
+            mainX.Reshape({1, rows, embed_dim});
+
+            // 2) 每个草稿层用自己的 wkv / kv_norm 把 main_x 写进滑窗环形缓冲
+            DsRopeParams windowRope = {qk_rope_head_dim, rope_base, 0, rope_factor,
+                                       rope_scaling_beta_fast, rope_scaling_beta_slow};
+            for (int stage = 0; stage < v41DsparkLayers; stage++) {
+                const std::string pre = "mtp." + std::to_string(stage);
+                Data kv;
+                LinearWithActivationQuant(mainX, pre + ".attn.wkv.weight", kv);
+                DsRMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
+                kv.Reshape({1, rows, head_dim_full});
+                DsRotaryQuant(kv, windowRope, startPos, 1, false, 1, 32, -1, devicePosition);
+#ifdef USE_CUDA
+                if (devicePosition) {
+                    AssertInFastLLM(FastllmCudaDeepSeekV41WindowStorePosition(kv, dspark.layers[stage].windowKV,
+                        startPos, window_size, devicePosition), "DeepSeekV41 DSpark dynamic window store failed.");
+                } else
+#endif
+                DsWindowStore(kv, dspark.layers[stage].windowKV, startPos, window_size);
+            }
+        };
+#ifdef USE_CUDA
+        if (!contextState || !DsRunDraftGraph(*contextState, contextBody)) contextBody();
+        if (contextLock.owns_lock()) contextLock.unlock();
+#else
+        contextBody();
+#endif
         dspark.committed = committed;
         dspark.filled = std::min(dspark.filled + rows, window_size);
         const double mainMs = DsElapsed(advanceStart);
@@ -1535,10 +1762,8 @@ namespace fastllm {
         std::vector<float> idValues((uint64_t)block, (float)v41DsparkNoiseTokenId);
         idValues[0] = (float)anchorToken;
         Data draftIds(DataType::FLOAT32, {1, block}, idValues);
-        Data hiddenStates, hiddenTemp;
-        DsparkEmbedInput(draftIds, hiddenStates);
-        Data *curHidden = &hiddenStates;
-        Data *nextHidden = &hiddenTemp;
+        Data embedded;
+        DsparkEmbedInput(draftIds, embedded);
 
         Data preMix;
         {
@@ -1575,186 +1800,310 @@ namespace fastllm {
         Data cmpIdx;
         cmpIdx.CopyFrom(cmpIdxHost);
 
-        Data attnPre, attnPost, attnComb, ffnPre, ffnPost, ffnComb;
-        Data x, attnInput, qr, qNorm, q, kv, table, attnOut, woAOut, attnProj;
-        Data ffnInput, ffnOut, expertIndex, expertScore;
-        Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
-        Data confidenceInput;
-
-        const double layersStart = DsTick();
-        for (int stage = 0; stage < v41DsparkLayers; stage++) {
-            const std::string pre = "mtp." + std::to_string(stage);
-            const int layerId = std::max(0, block_cnt - v41DsparkLayers + stage);
-            ApplyDsparkDevice();
-
-            DsHcMix(*curHidden, weight[pre + ".hc_attn_fn"], weight[pre + ".hc_attn_scale"],
-                    weight[pre + ".hc_attn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
-                    attnPre, attnPost, attnComb);
-            DsHcApplyPre(*curHidden, preMix, x);
-            DsRMSNormBF16(x, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput);
-
-            LinearWithActivationQuant(attnInput, pre + ".attn.wq_a.weight", qr);
-            DsRMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
-            LinearWithActivationQuant(qNorm, pre + ".attn.wq_b.weight", q);
-            q.Reshape({1, block, num_attention_heads, headDim});
-            DsRotaryQuant(q, windowRope, startPos, 1, false, 0, 32);
-
-            LinearWithActivationQuant(attnInput, pre + ".attn.wkv.weight", kv);
-            DsRMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
-            kv.Reshape({1, block, headDim});
-            DsRotaryQuant(kv, windowRope, startPos, 1, false, 1, 32);
-
-            Cat(dspark.layers[stage].windowKV, kv, 1, table);
-            AssertInFastLLM(table.dims.size() == 3 && table.dims[1] == tableRows,
-                            "DeepSeekV41 DSpark: draft attention gather table has a wrong size.");
-            DsSparseAttention(q, kv, nullptr, &table, &cmpIdx, weight[pre + ".attn.attn_sink"],
-                              1, 0, softmaxScale, attnOut);
-            DsRotaryQuant(attnOut, windowRope, startPos, 1, true, 0, 32);
-
-            DeepSeekV4WoA(attnOut, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
-            LinearWithActivationQuant(woAOut, pre + ".attn.wo_b.weight", attnProj);
-            DsHcPost(attnProj, *curHidden, attnPost, attnComb, *nextHidden);
-            std::swap(curHidden, nextHidden);
-
-            DsHcMix(*curHidden, weight[pre + ".hc_ffn_fn"], weight[pre + ".hc_ffn_scale"],
-                    weight[pre + ".hc_ffn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
-                    ffnPre, ffnPost, ffnComb);
-            DsHcApplyPre(*curHidden, attnPre, x);
-            DsRMSNormBF16(x, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput);
-            std::vector<int> ffnDims = ffnInput.dims;
-            ffnInput.Reshape({block, dim});
-
-            // 路由：sqrt(softplus(logits))，bias 只参与选择（草稿层 128 专家 top-3）
-            {
-                const std::string gpre = pre + ".ffn.gate";
-                Data xFloat, logits;
-                ToDataType(ffnInput, xFloat, DataType::FLOAT32);
-                Linear(xFloat, weight[gpre + ".weight"], Data(), logits);
-                ToDataType(logits, DataType::FLOAT32);
-                if (std::fabs(gate_temp - 1.0f) > 1e-6f) {
-                    Mul(logits, 1.0f / gate_temp, logits);
-                }
-                Data &gateBias = weight[gpre + ".bias"];
-                bool routed = false;
-#ifdef USE_CUDA
-                if (logits.dataDevice == DataDevice::CUDA &&
-                    !DsEnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") &&
-                    FastllmCudaDeepSeekV4RouteScoreTransform(logits, 2)) {
-                    gateBias.ToDevice(DataDevice::CUDA);
-                    SelectExpert(logits, expertIndex, expertScore, v41DsparkTopk, true,
-                                 routed_scaling_factor, &gateBias);
-                    routed = true;
-                }
-#endif
-                if (!routed) {
-                    logits.ToDevice(DataDevice::CPU);
-                    gateBias.ToDevice(DataDevice::CPU);
-                    const float *raw = (const float*)logits.cpuData;
-                    const float *bias = (const float*)gateBias.cpuData;
-                    std::vector<int> indices((uint64_t)block * v41DsparkTopk);
-                    std::vector<float> scores((uint64_t)block * v41DsparkTopk);
-                    std::vector<float> original(v41DsparkExperts), select(v41DsparkExperts);
-                    for (int t = 0; t < block; t++) {
-                        for (int e = 0; e < v41DsparkExperts; e++) {
-                            original[e] = std::sqrt(DsSoftplus(raw[(uint64_t)t * v41DsparkExperts + e]));
-                            select[e] = original[e] + bias[e];
-                        }
-                        float sum = 0.0f;
-                        for (int k = 0; k < v41DsparkTopk; k++) {
-                            int best = 0;
-                            for (int e = 1; e < v41DsparkExperts; e++) {
-                                if (select[e] > select[best]) {
-                                    best = e;
-                                }
-                            }
-                            indices[(uint64_t)t * v41DsparkTopk + k] = best;
-                            scores[(uint64_t)t * v41DsparkTopk + k] = original[best];
-                            sum += original[best];
-                            select[best] = -std::numeric_limits<float>::infinity();
-                        }
-                        for (int k = 0; k < v41DsparkTopk; k++) {
-                            float &v = scores[(uint64_t)t * v41DsparkTopk + k];
-                            if (norm_topk_prob && v41DsparkTopk > 1) {
-                                v /= (sum + 1e-20f);
-                            }
-                            v *= routed_scaling_factor;
-                        }
-                    }
-                    Data idxData(DataType::INT32, {block, v41DsparkTopk});
-                    idxData.Allocate();
-                    memcpy(idxData.cpuData, indices.data(), indices.size() * sizeof(int));
-                    expertIndex.CopyFrom(idxData);
-                    expertScore.CopyFrom(Data(DataType::FLOAT32, {block, v41DsparkTopk}, scores));
-                }
-            }
-
-            {
-                std::vector<Data*> moeWeights = v41DsparkMoeWeights[stage];
-                Data sharedExpertOut;
-                bool hasSharedExpertOut = false;
-                auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
-                auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
-                if (GetCudaSharedExpert() && !DsEnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
-                    sharedGateupIt != weight.weight.end() &&
-                    sharedDownIt != weight.weight.end() && !sharedGateupIt->second.isDiskWeight &&
-                    !sharedDownIt->second.isDiskWeight) {
-                    Data ww1, ww3;
-                    LinearWithActivationQuant(ffnInput, pre + ".ffn.shared_experts.gateup.weight", ww3);
-#ifdef USE_CUDA
-                    AssertInFastLLM(FastllmCudaDeepSeekV41SharedSwiglu(ww3, swiglu_limit, ww1),
-                                    "DeepSeekV41 DSpark: CUDA shared expert activation rejected input.");
-#else
-                    Swiglu(ww3, ww1);
-#endif
-                    LinearWithActivationQuant(ww1, pre + ".ffn.shared_experts.w2.weight", sharedExpertOut);
-                    ToDataType(sharedExpertOut, DataType::BFLOAT16);
-                    moeWeights[0] = moeWeights[1] = nullptr;
-                    hasSharedExpertOut = true;
-                }
-                this->ApplyMoeDeviceMapForLayer(layerId);
-                MergeMOEBlock(&ffnInput, &expertIndex, &expertScore, &moeWeights, &v41DsparkMoeBiass[stage],
-                              &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &ffnOut, layerId,
-                              ffnInput.dataType, ffnInput.dataType, &moeInputTemp, &moeOutputTemp,
-                              MoeGateSwiglu, false, swiglu_limit, true, nullptr,
-                              quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") ? 32 : 128,
-                              quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight") != 0);
-                ApplyDsparkDevice();
-                if (hasSharedExpertOut) {
-                    ffnOut.ToDevice(sharedExpertOut.dataDevice);
-                    // Grouped GGUF experts accumulate into FP32; the shared expert
-                    // is BF16. Add in FP32 before the model's BF16 MoE boundary.
-                    if (sharedExpertOut.dataType != ffnOut.dataType) {
-                        ToDataType(sharedExpertOut, ffnOut.dataType);
-                    }
-                    AddTo(ffnOut, sharedExpertOut);
-                }
-            }
-            if (ffnOut.dataType != DataType::BFLOAT16) {
-                ToDataType(ffnOut, DataType::BFLOAT16);
-            }
-            ffnOut.Reshape(ffnDims);
-            DsHcPost(ffnOut, *curHidden, ffnPost, ffnComb, *nextHidden);
-            std::swap(curHidden, nextHidden);
-            preMix.CopyFrom(ffnPre);
-        }
-
-        DsDraftTimingSlot().layers = DsElapsed(layersStart);
-
-        // ---- head：mtp.<last>.norm + 共享 lm_head ----
-        const double headStart = DsTick();
         const std::string last = "mtp." + std::to_string(v41DsparkLayers - 1);
-        Data headHidden;
-        DsHcApplyPre(*curHidden, preMix, headHidden);       // confidence head 的输入（未归一化）
-        Data normed, logits;
-        DsRMSNormBF16(headHidden, weight[last + ".norm.weight"], rms_norm_eps, normed);
-        if (v41DsparkTpDevices.empty()) {
-            Linear(normed, weight["head.weight"], *GetEmptyData(), logits);
-        } else {
-            DsparkProjectHead(normed, logits);
+        const bool randomDraft = config.top_k > 1;
+        Data &markovEmbedWeight = weight[last + ".markov_head.embed.weight"];
+        Data &markovHeadWeight = weight[last + ".markov_head.head.weight"];
+        Data eagerHeadHidden, eagerNormed, eagerMarkov;
+        DeepSeekV41DsparkWorkspace *graphState = nullptr;
+#ifdef USE_CUDA
+        // A full window has a fixed gather width. Short prefixes, CPU routing,
+        // reference math and unsupported expert layouts keep the eager path.
+        std::unique_lock<std::mutex> graphLock(v41CudaGraphMutex, std::defer_lock);
+        const bool graphMarkov = markovEmbedWeight.dims.size() == 2 && markovHeadWeight.dims.size() == 2 &&
+            markovEmbedWeight.dims[1] > 0 && markovEmbedWeight.dims[1] <= 512 &&
+            markovHeadWeight.dims[1] == markovEmbedWeight.dims[1] &&
+            markovEmbedWeight.dims[0] >= weight["head.weight"].dims[0] &&
+            markovHeadWeight.dims[0] >= weight["head.weight"].dims[0] &&
+            anchorToken >= 0 && anchorToken < markovEmbedWeight.dims[0] &&
+            markovEmbedWeight.dataType == markovHeadWeight.dataType &&
+            (markovEmbedWeight.dataType == DataType::BFLOAT16 ||
+             markovEmbedWeight.dataType == DataType::FLOAT16 || markovEmbedWeight.dataType == DataType::FLOAT32);
+        const bool graphEligible = graphMarkov && DsDraftGraphEnabled() && valid == window_size && block <= 8 &&
+            !randomDraft && !config.tool_call_name_constraint_enabled &&
+            !config.tool_call_parameter_name_constraint_enabled &&
+            !DsEnvFlag("FASTLLM_DSPARK_DISABLE_FUSED_MARKOV") &&
+            v41MoeCudaGraphCompatible &&
+            embedded.dataDevice == DataDevice::CUDA && v41DsparkTpDevices.size() > 1 &&
+            !DsEnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") && !DsEnvFlag("FASTLLM_DISABLE_NCCL");
+        std::vector<void*> cachePointers;
+        for (auto &layer : dspark.layers) cachePointers.push_back(layer.windowKV.cudaData);
+        if (graphEligible && graphLock.try_lock()) {
+            if (dspark.workspace && (dspark.workspace->devices != v41DsparkTpDevices ||
+                dspark.workspace->block != block || dspark.workspace->width != width ||
+                dspark.workspace->cachePointers != cachePointers)) dspark.workspace.reset();
+            if (!dspark.workspace) {
+                dspark.workspace = std::make_shared<DeepSeekV41DsparkWorkspace>();
+                auto &w = *dspark.workspace;
+                w.devices = v41DsparkTpDevices; w.block = block; w.width = width;
+                w.cachePointers = cachePointers;
+            }
+            if (!dspark.workspace->disabled) {
+                graphState = dspark.workspace.get();
+                graphState->sharedExperts.resize(v41DsparkLayers);
+                graphState->input.CopyFrom(embedded);
+                auto upload = [&](Data &dst, DataType type, const std::vector<int> &dims, const void *data) {
+                    if (dst.dims.empty()) {
+                        dst.dataType = type; dst.UpdateUnitSize(); dst.Resize(dims);
+                        dst.ToDevice(DataDevice::CUDA, {v41DsparkTpDevices.front()}, false); dst.Allocate();
+                    }
+                    FastllmCudaCopyFromHostToDevice(dst.cudaData, const_cast<void*>(data), dst.GetBytes());
+                };
+                upload(graphState->preMix, DataType::FLOAT32, preMix.dims, preMix.cpuData);
+                upload(graphState->indices, DataType::INT32, cmpIdxHost.dims, cmpIdxHost.cpuData);
+                upload(graphState->position, DataType::INT32, {1}, &startPos);
+                if (graphState->markovTokens.dims.empty()) {
+                    Data &d = graphState->markovTokens;
+                    d.dataType = DataType::INT32; d.UpdateUnitSize(); d.Resize({block + 1});
+                    d.ToDevice(DataDevice::CUDA, {v41DsparkTpDevices.front()}, false); d.Allocate();
+                }
+                FastllmCudaCopyFromHostToDevice(graphState->markovTokens.cudaData, &anchorToken, sizeof(int));
+                markovEmbedWeight.ToDevice(DataDevice::CUDA);
+                markovHeadWeight.ToDevice(DataDevice::CUDA);
+            }
         }
-        ToDataType(logits, DataType::FLOAT32);
+#endif
+        Data eagerLogits;
+        Data &logits = graphState ? graphState->logits : eagerLogits;
+        Data &headHidden = graphState ? graphState->headHidden : eagerHeadHidden;
+        Data &normed = graphState ? graphState->normalized : eagerNormed;
+        Data &markovAll = graphState ? graphState->markovEmbeds : eagerMarkov;
+        auto backbone = [&]() {
+            Data hiddenStates, hiddenTemp, layerPreMix;
+            hiddenStates.CopyFrom(graphState ? graphState->input : embedded);
+            layerPreMix.CopyFrom(graphState ? graphState->preMix : preMix);
+            Data *curHidden = &hiddenStates;
+            Data *nextHidden = &hiddenTemp;
+            const int *devicePosition = graphState ? (const int*)graphState->position.cudaData : nullptr;
+            Data &attentionIndices = graphState ? graphState->indices : cmpIdx;
+            Data attnPre, attnPost, attnComb, ffnPre, ffnPost, ffnComb;
+            Data x, attnInput, attnQuant, qr, qNorm, qQuant, q, kv, table, attnOut, woAOut, attnProj;
+            Data ffnInput, ffnOut, expertIndex, expertScore;
+            Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
 
-        DsDraftTimingSlot().head = DsElapsed(headStart);
+            const double layersStart = DsTick();
+            for (int stage = 0; stage < v41DsparkLayers; stage++) {
+                const std::string pre = "mtp." + std::to_string(stage);
+                const int layerId = std::max(0, block_cnt - v41DsparkLayers + stage);
+                ApplyDsparkDevice();
+
+                DsHcMix(*curHidden, weight[pre + ".hc_attn_fn"], weight[pre + ".hc_attn_scale"],
+                        weight[pre + ".hc_attn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                        attnPre, attnPost, attnComb);
+                DsHcApplyPre(*curHidden, layerPreMix, x);
+                DsRMSNormBF16(x, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput);
+
+                const bool qkvPrepared = DsparkPrepareQkv(stage, attnInput, attnQuant, qr, qNorm, qQuant, kv);
+                if (!qkvPrepared) {
+                    LinearWithActivationQuant(attnInput, pre + ".attn.wq_a.weight", qr);
+                    DsRMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
+                }
+                LinearWithActivationQuant(qkvPrepared ? qQuant : qNorm, pre + ".attn.wq_b.weight", q,
+                                          false, nullptr, qkvPrepared);
+                q.Reshape({1, block, num_attention_heads, headDim});
+                DsRotaryQuant(q, windowRope, startPos, 1, false, 0, 32, -1, devicePosition);
+
+                if (!qkvPrepared) {
+                    LinearWithActivationQuant(attnInput, pre + ".attn.wkv.weight", kv);
+                    DsRMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
+                }
+                kv.Reshape({1, block, headDim});
+                DsRotaryQuant(kv, windowRope, startPos, 1, false, 1, 32, -1, devicePosition);
+
+                Cat(dspark.layers[stage].windowKV, kv, 1, table);
+                AssertInFastLLM(table.dims.size() == 3 && table.dims[1] == tableRows,
+                                "DeepSeekV41 DSpark: draft attention gather table has a wrong size.");
+                DsSparseAttention(q, kv, nullptr, &table, &attentionIndices, weight[pre + ".attn.attn_sink"],
+                                  1, 0, softmaxScale, attnOut);
+                DsRotaryQuant(attnOut, windowRope, startPos, 1, true, 0, 32, -1, devicePosition);
+
+                DeepSeekV4WoA(attnOut, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
+                LinearWithActivationQuant(woAOut, pre + ".attn.wo_b.weight", attnProj);
+                DsHcPost(attnProj, *curHidden, attnPost, attnComb, *nextHidden);
+                std::swap(curHidden, nextHidden);
+
+                DsHcMix(*curHidden, weight[pre + ".hc_ffn_fn"], weight[pre + ".hc_ffn_scale"],
+                        weight[pre + ".hc_ffn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                        ffnPre, ffnPost, ffnComb);
+                DsHcApplyPre(*curHidden, attnPre, x);
+                DsRMSNormBF16(x, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput);
+                std::vector<int> ffnDims = ffnInput.dims;
+                ffnInput.Reshape({block, dim});
+
+                // 路由：sqrt(softplus(logits))，bias 只参与选择（草稿层 128 专家 top-3）
+                {
+                    const std::string gpre = pre + ".ffn.gate";
+                    Data xFloat, logits;
+                    ToDataType(ffnInput, xFloat, DataType::FLOAT32);
+                    Linear(xFloat, weight[gpre + ".weight"], Data(), logits);
+                    ToDataType(logits, DataType::FLOAT32);
+                    if (std::fabs(gate_temp - 1.0f) > 1e-6f) {
+                        Mul(logits, 1.0f / gate_temp, logits);
+                    }
+                    Data &gateBias = weight[gpre + ".bias"];
+                    bool routed = false;
+#ifdef USE_CUDA
+                    if (logits.dataDevice == DataDevice::CUDA &&
+                        !DsEnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") &&
+                        FastllmCudaDeepSeekV4RouteScoreTransform(logits, 2)) {
+                        gateBias.ToDevice(DataDevice::CUDA);
+                        SelectExpert(logits, expertIndex, expertScore, v41DsparkTopk, true,
+                                     routed_scaling_factor, &gateBias);
+                        routed = true;
+                    }
+#endif
+                    if (!routed) {
+                        logits.ToDevice(DataDevice::CPU);
+                        gateBias.ToDevice(DataDevice::CPU);
+                        const float *raw = (const float*)logits.cpuData;
+                        const float *bias = (const float*)gateBias.cpuData;
+                        std::vector<int> indices((uint64_t)block * v41DsparkTopk);
+                        std::vector<float> scores((uint64_t)block * v41DsparkTopk);
+                        std::vector<float> original(v41DsparkExperts), select(v41DsparkExperts);
+                        for (int t = 0; t < block; t++) {
+                            for (int e = 0; e < v41DsparkExperts; e++) {
+                                original[e] = std::sqrt(DsSoftplus(raw[(uint64_t)t * v41DsparkExperts + e]));
+                                select[e] = original[e] + bias[e];
+                            }
+                            float sum = 0.0f;
+                            for (int k = 0; k < v41DsparkTopk; k++) {
+                                int best = 0;
+                                for (int e = 1; e < v41DsparkExperts; e++) {
+                                    if (select[e] > select[best]) {
+                                        best = e;
+                                    }
+                                }
+                                indices[(uint64_t)t * v41DsparkTopk + k] = best;
+                                scores[(uint64_t)t * v41DsparkTopk + k] = original[best];
+                                sum += original[best];
+                                select[best] = -std::numeric_limits<float>::infinity();
+                            }
+                            for (int k = 0; k < v41DsparkTopk; k++) {
+                                float &v = scores[(uint64_t)t * v41DsparkTopk + k];
+                                if (norm_topk_prob && v41DsparkTopk > 1) {
+                                    v /= (sum + 1e-20f);
+                                }
+                                v *= routed_scaling_factor;
+                            }
+                        }
+                        Data idxData(DataType::INT32, {block, v41DsparkTopk});
+                        idxData.Allocate();
+                        memcpy(idxData.cpuData, indices.data(), indices.size() * sizeof(int));
+                        expertIndex.CopyFrom(idxData);
+                        expertScore.CopyFrom(Data(DataType::FLOAT32, {block, v41DsparkTopk}, scores));
+                    }
+                }
+
+                {
+                    std::vector<Data*> moeWeights = v41DsparkMoeWeights[stage];
+#ifdef USE_NUMAS
+                    HostMoePlacementScope placement(moeWeights.size() > 2 ? moeWeights[2] : nullptr);
+#endif
+                    DeepSeekV41DsparkWorkspace::SharedExpertWorkspace localShared;
+                    auto &shared = graphState ? graphState->sharedExperts[stage] : localShared;
+                    bool hasSharedExpertOut = false;
+                    auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
+                    auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
+                    if (GetCudaSharedExpert() && !DsEnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
+                        sharedGateupIt != weight.weight.end() &&
+                        sharedDownIt != weight.weight.end() && !sharedGateupIt->second.isDiskWeight &&
+                        !sharedDownIt->second.isDiskWeight) {
+#ifdef USE_CUDA
+                        if (dsparkCapturing && graphState->parallelExperts) FastllmCudaGraphMarkParallelFork(stage);
+#endif
+                        LinearWithActivationQuant(ffnInput, pre + ".ffn.shared_experts.gateup.weight", shared.gateup);
+#ifdef USE_CUDA
+                        AssertInFastLLM(FastllmCudaDeepSeekV41SharedSwiglu(shared.gateup, swiglu_limit, shared.activated),
+                                        "DeepSeekV41 DSpark: CUDA shared expert activation rejected input.");
+#else
+                        Swiglu(shared.gateup, shared.activated);
+#endif
+                        LinearWithActivationQuant(shared.activated, pre + ".ffn.shared_experts.w2.weight", shared.output);
+                        ToDataType(shared.output, DataType::BFLOAT16);
+                        moeWeights[0] = moeWeights[1] = nullptr;
+                        hasSharedExpertOut = true;
+#ifdef USE_CUDA
+                        if (dsparkCapturing && graphState->parallelExperts) {
+                            FastllmCudaGraphMarkParallelFirstDone(stage);
+                            FastllmCudaGraphMarkParallelSecondBegin(stage);
+                        }
+#endif
+                    }
+                    this->ApplyMoeDeviceMapForLayer(layerId);
+                    bool hybrid = false;
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+                    if (hasSharedExpertOut &&
+                        ffnInput.dataDevice == DataDevice::CUDA && ffnInput.dims.size() == 2 &&
+                        ffnInput.dims[0] < 32 &&
+                        FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
+                        expertIndex.ToDevice(DataDevice::CUDA, ffnInput.dataDeviceIds, true);
+                        expertScore.ToDevice(DataDevice::CUDA, ffnInput.dataDeviceIds, true);
+                        FastllmCudaMoeRouteScope routeScope(FastllmMoeRoutePhase::Draft);
+                        hybrid = fastllm::RunHybridMoe(ffnInput, expertIndex, expertScore, ffnOut,
+                            moeWeights.data(), (int)moeWeights.size(), layerId);
+                    }
+#endif
+                    if (!hybrid) MergeMOEBlock(&ffnInput, &expertIndex, &expertScore, &moeWeights, &v41DsparkMoeBiass[stage],
+                                  &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &ffnOut, layerId,
+                                  ffnInput.dataType, ffnInput.dataType, &moeInputTemp, &moeOutputTemp,
+                                  MoeGateSwiglu, true, swiglu_limit, true, nullptr,
+                                  quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") ? 32 : 128,
+                                  quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight") != 0);
+                    // Only the persistent packet path supplies graph-safe EP buffers.
+                    if (graphState && !ffnOut.cudaDataBorrowed) graphState->disabled = true;
+                    ApplyDsparkDevice();
+                    if (hasSharedExpertOut) {
+#ifdef USE_CUDA
+                        if (dsparkCapturing && graphState->parallelExperts) FastllmCudaGraphMarkParallelJoin(stage);
+#endif
+                        ffnOut.ToDevice(shared.output.dataDevice);
+                        // Grouped GGUF experts accumulate into FP32; the shared expert
+                        // is BF16. Add in FP32 before the model's BF16 MoE boundary.
+                        Data *sharedOutput = &shared.output;
+                        if (shared.output.dataType != ffnOut.dataType) {
+                            ToDataType(shared.output, shared.floatOutput, ffnOut.dataType);
+                            sharedOutput = &shared.floatOutput;
+                        }
+                        AddTo(ffnOut, *sharedOutput);
+                    }
+                }
+                if (ffnOut.dataType != DataType::BFLOAT16) {
+                    ToDataType(ffnOut, DataType::BFLOAT16);
+                }
+                ffnOut.Reshape(ffnDims);
+                DsHcPost(ffnOut, *curHidden, ffnPost, ffnComb, *nextHidden);
+                std::swap(curHidden, nextHidden);
+                layerPreMix.CopyFrom(ffnPre);
+            }
+
+            DsDraftTimingSlot().layers = DsElapsed(layersStart);
+
+            DsHcApplyPre(*curHidden, layerPreMix, headHidden);
+            DsRMSNormBF16(headHidden, weight[last + ".norm.weight"], rms_norm_eps, normed);
+            // ---- head：mtp.<last>.norm + 共享 lm_head ----
+            const double headStart = DsTick();
+            if (v41DsparkTpDevices.empty()) {
+                Linear(normed, weight["head.weight"], *GetEmptyData(), logits);
+            } else {
+                DsparkProjectHead(normed, logits, true);
+            }
+            ToDataType(logits, DataType::FLOAT32);
+
+            DsDraftTimingSlot().head = DsElapsed(headStart);
+            if (graphState && !v41DsparkHeadWorkspace) graphState->disabled = true;
+#ifdef USE_CUDA
+            if (graphState) {
+                AssertInFastLLM(FastllmCudaDeepSeekV41MarkovChainDevice(logits, markovEmbedWeight, markovHeadWeight,
+                    block, graphState->markovTokens, graphState->markovValues, graphState->markovIndices, markovAll),
+                    "DeepSeekV41 DSpark device Markov chain rejected input.");
+            }
+#endif
+        };
+#ifdef USE_CUDA
+        if (!graphState || !DsRunDraftGraph(*graphState, backbone)) backbone();
+#else
+        backbone();
+#endif
 
         // ---- markov head：逐位置加 bigram 偏置后生成候选 ----
         //
@@ -1764,7 +2113,6 @@ namespace fastllm {
         // 也才几毫秒。所以 CUDA 上走一个把整条链留在设备上的融合 kernel，
         // 主机只在最后取回一次；其它设备（或 dtype / 布局不满足前提时）退回下面的通用实现。
         const double markovStart = DsTick();
-        const bool randomDraft = config.top_k > 1;
         dspark.sampledProposal = randomDraft;
 #ifdef USE_CUDA
         if (randomDraft) {
@@ -1777,14 +2125,18 @@ namespace fastllm {
             dspark.proposalProbs.Allocate();
         }
 #endif
-        Data &markovEmbedWeight = weight[last + ".markov_head.embed.weight"];
-        Data &markovHeadWeight = weight[last + ".markov_head.head.weight"];
         const int markovRank = markovEmbedWeight.dims.size() == 2 ? markovEmbedWeight.dims[1]
                                                                   : v41DsparkMarkovRank;
-        Data markovAll;                 // [1, block, rank]，confidence head 的输入
         bool fusedMarkov = false;
 #ifdef USE_CUDA
-        if (!randomDraft && !config.tool_call_name_constraint_enabled &&
+        if (graphState) {
+            tokens.resize(block);
+            FastllmCudaCopyFromDeviceToHost(tokens.data(), (int*)graphState->markovTokens.cudaData + 1,
+                                            block * sizeof(int));
+            fusedMarkov = true;
+            DsDraftTimingSlot().markovFused = true;
+        }
+        if (!fusedMarkov && !randomDraft && !config.tool_call_name_constraint_enabled &&
             !config.tool_call_parameter_name_constraint_enabled && !DsEnvFlag("FASTLLM_DSPARK_DISABLE_FUSED_MARKOV") && logits.dataDevice == DataDevice::CUDA) {
             markovEmbedWeight.ToDevice(DataDevice::CUDA);
             markovHeadWeight.ToDevice(DataDevice::CUDA);

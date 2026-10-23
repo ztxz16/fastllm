@@ -2,6 +2,9 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #include "devices/cuda/fastllm-moe-prefetch.h"
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#endif
 #include <iostream>
 #include <stdexcept>
 
@@ -12,6 +15,7 @@ void Check(bool ok, const char *message) {
 }
 std::vector<FastllmCudaMoeCacheLayer> prepared;
 bool registered = false, streaming = false, prepareResult = true, beginResult = true;
+double preparedFraction = 1.0;
 int begun = 0, ended = 0;
 std::vector<int> endOrder;
 }
@@ -25,6 +29,10 @@ bool FastllmCudaPrepareMoeCache(const FastllmCudaMoeCacheLayer *layers, int coun
     streaming = allowStreaming;
     if (registerWeights) registerWeights();
     return prepareResult;
+}
+bool FastllmCudaSetMoeCacheBudgetFraction(Data **, int, double fraction) {
+    preparedFraction = fraction;
+    return fraction > 0 && fraction <= 1;
 }
 void *FastllmCudaBeginMoeDecode(Data **, int, int, const std::vector<int> *) {
     ++begun;
@@ -40,6 +48,23 @@ bool FastllmCudaMergeMOEHybrid(const Data &, const Data &, const Data &, Data &,
         Data **, int, int, const std::function<void()> &) { return false; }
 bool FastllmCudaMergeMOEHybridOnDevices(const Data &, const Data &, const Data &, Data &,
         Data **, int, int, const std::vector<int> &, const std::function<void()> &) { return false; }
+
+#ifdef USE_NUMAS
+// Placement is a backend boundary too: record it without creating a thread pool.
+namespace fastllm {
+static thread_local bool testUnbound = false;
+HostMoePlacementScope::HostMoePlacementScope(bool unbound)
+    : previous(testUnbound) { testUnbound = unbound; }
+HostMoePlacementScope::HostMoePlacementScope(const Data *weight)
+    : HostMoePlacementScope(weight && weight->hostMoeUnbound) {}
+HostMoePlacementScope::~HostMoePlacementScope() { testUnbound = previous; }
+bool HostMoeIsUnbound() { return testUnbound; }
+bool IsNumasLinearWeightSupported(const Data *) { return true; }
+bool IsNumasLinearWeightRegistered(const Data *) { return true; }
+void RegisterHostMoeWeightBatch(const std::vector<std::pair<Data *, std::string>> &,
+        bool, const std::function<void(size_t)> &) {}
+}
+#endif
 
 int main() {
     std::vector<Data *> target(6), draft(4), resident(4);
@@ -66,6 +91,29 @@ int main() {
         Check(prepared[0].swigluLimit == 7.0f &&
             prepared[0].glm5 == (math == HybridMoeMath::Glm5) &&
             prepared[0].deepSeekV41 == (math == HybridMoeMath::DeepSeekV41), "numerical profile changed");
+    }
+    HybridMoeCachePlan mainPlan(HybridMoeMath::DeepSeekV41, 0, .75);
+    mainPlan.Add(target, "cpu");
+    Check(mainPlan.Prepare() && preparedFraction == .75, "main cache budget share lost");
+    HybridMoeCachePlan draftPlan(HybridMoeMath::DeepSeekV41, 0, .25);
+    draftPlan.Add(draft, "cpu");
+    Check(draftPlan.Prepare() && preparedFraction == .25, "draft cache budget share lost");
+    for (auto math : {HybridMoeMath::Standard, HybridMoeMath::Glm5, HybridMoeMath::DeepSeekV41}) {
+        HybridMoeCachePlan cpuPlan(math);
+        cpuPlan.Add(target, "cpu");
+        bool called = false;
+        Check(cpuPlan.Prepare([&] {
+            called = true;
+#ifdef USE_NUMAS
+            Check(HostMoeIsUnbound(), "CPU registration used bound placement");
+#endif
+        }, true), "CPU cache preparation failed");
+#ifdef USE_NUMAS
+        Check(called, "CPU registration missing for a math profile");
+        Check(!HostMoeIsUnbound(), "CPU cache preparation leaked placement");
+#else
+        Check(!called, "CPU registration requires the shared NUMA backend");
+#endif
     }
     prepareResult = false;
     Check(!mixed.Prepare(registerWeights), "cache rejection did not preserve fallback");

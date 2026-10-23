@@ -67,8 +67,10 @@ __device__ inline float Dot(const __nv_bfloat16 *input, const uint8_t *weight, i
 }
 template <bool Batched = false>
 __global__ void Gate(const __nv_bfloat16 *input, const int32_t *slots, const uint8_t *records, const float *scores,
-                     __nv_bfloat16 *activation, int hidden, int inter, size_t stride, float limit, int topk = 1) {
-    const int route = blockIdx.y, slot = slots[route];
+                     __nv_bfloat16 *activation, int hidden, int inter, size_t stride, float limit, int topk = 1,
+                     const int32_t *routeMap = nullptr) {
+    const int selected = blockIdx.y, route = routeMap ? routeMap[selected] : selected;
+    const int slot = slots[selected];
     if constexpr (Batched)
         input += (size_t)(route / topk) * hidden;
     if (slot < 0)
@@ -102,8 +104,10 @@ __global__ void Gate(const __nv_bfloat16 *input, const int32_t *slots, const uin
     }
 }
 static __global__ void Down(const __nv_bfloat16 *activation, const int32_t *slots, const uint8_t *records,
-                            float *output, int hidden, int inter, size_t stride, size_t downOffset) {
-    const int route = blockIdx.y, slot = slots[route];
+                            float *output, int hidden, int inter, size_t stride, size_t downOffset,
+                            const int32_t *routeMap = nullptr) {
+    const int selected = blockIdx.y, route = routeMap ? routeMap[selected] : selected;
+    const int slot = slots[selected];
     if (slot < 0)
         return;
     const int column = blockIdx.x * 8 + threadIdx.x / 16;

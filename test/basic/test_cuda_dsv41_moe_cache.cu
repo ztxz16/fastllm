@@ -697,7 +697,7 @@ int main(int argc, char **argv) {
         // varied rows and duplicate routes against the independent dense
         // FP8/BF16 oracle, including partial and entirely resident GPU work.
         setenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH", "0", 1);
-        int verifyChecks = 0, admissionChecks = 0;
+        int verifyChecks = 0;
         Data verifyOutput;
         for (int pass = 0; pass < 21; ++pass) {
             const int t = pass % tables, rows = std::vector<int>{8, 2, 3, 4, 5, 6, 7}[pass % 7];
@@ -808,22 +808,15 @@ int main(int argc, char **argv) {
                     ++verifyChecks;
                 };
                 setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "hybrid", 1);
-                setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", "0", 1);
-                Require(!runVerify(),
-                        "verify all-CPU fallback rejected");
+                unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
+                Require(runVerify(), "cold verifier rejected");
+                checkResult();
                 if (pass == 0) {
-                    setenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH", "1", 1);
                     for (int repeat = 0; repeat < 3; ++repeat) {
-                        if (runVerify()) {
-                            checkResult();
-                            ++admissionChecks;
-                        }
+                        Require(runVerify(), "adaptive verifier rejected");
+                        checkResult();
                     }
-                    setenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH", "0", 1);
                 }
-                setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", "15", 1);
-                if (runVerify())
-                    checkResult();
                 // Seed all ten experts through the ordinary pure-cache path;
                 // every selected verify group must now be resident.
                 setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "gpu", 1);
@@ -839,8 +832,8 @@ int main(int argc, char **argv) {
                             "verify warmup rejected");
                 }
                 setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "hybrid", 1);
-                for (const char *split : {"1", "3", "15"}) {
-                    setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", split, 1);
+                unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
+                for (int calibration = 0; calibration < 3; ++calibration) {
                     for (int repeat = 0; repeat < 2; ++repeat) {
                         Check(cudaMemsetAsync(parallelOutput.cudaData, 0xff, parallelOutput.GetBytes(), cudaStreamPerThread));
                         Require(runVerify(repeat == 0),
@@ -856,7 +849,7 @@ int main(int argc, char **argv) {
                 Require(!runVerify(),
                         "verify wrong dtype accepted");
                 bx.dataType = BFLOAT16;
-                bx.dims[0] = bi.dims[0] = bs.dims[0] = 9;
+                bx.dims[0] = bi.dims[0] = bs.dims[0] = 32;
                 Require(!runVerify(),
                         "verify oversized batch accepted");
                 bx.dims[0] = bi.dims[0] = bs.dims[0] = rows;
@@ -870,9 +863,7 @@ int main(int argc, char **argv) {
                 Check(cudaGraphDestroy(parallelGraph));
             }
         }
-        Require(admissionChecks > 0, "verify admission overlap was not exercised");
-        std::printf("VERIFY_PASS %d multirow CPU/GPU oracle checks, %d CPU/admission overlaps\n", verifyChecks,
-                    admissionChecks);
+        std::printf("VERIFY_PASS %d multirow CPU/GPU oracle checks\n", verifyChecks);
         unsetenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");

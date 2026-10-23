@@ -27,7 +27,7 @@ struct Access : DeepSeekV41Model {
 static void AppendTensor(std::vector<float> &result, const Data &input) {
     if (input.dims.empty() || input.Count(0) == 0) return;
     Data cpu;
-    if (input.multiDeviceData) {
+    if (input.multiDeviceData && input.IsTensorParallelReplicated()) {
         const Data &local = *input.multiDeviceDatas.at(0);
         const int original = FastllmCudaGetDevice();
         FastllmCudaSetDevice(0);
@@ -98,8 +98,14 @@ static std::vector<float> RunDsparkRequests(DeepSeekV41Model &model, int candida
             }
             result.push_back(state->totalLen);
             for (const auto &cache : state->layers) {
-                for (const Data *data : {&cache.windowKV, &cache.compressedKV, &cache.indexK,
-                                         &cache.rawTailKV, &cache.rawTailScore}) AppendTensor(result, *data);
+                for (const Data *data : {&cache.windowKV, &cache.compressedKV, &cache.indexK})
+                    AppendTensor(result, *data);
+                // An empty logical tail can retain arbitrary allocated rows.
+                // Only live tail rows participate in the next compression.
+                if (cache.rawTail > 0) {
+                    AppendTensor(result, cache.rawTailKV);
+                    AppendTensor(result, cache.rawTailScore);
+                }
             }
         }
     }
@@ -149,12 +155,12 @@ int main(int argc, char **argv) {
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 1) return 77;
     try {
         bool expertCache = false, fp8Dense = false, eagerOnly = false, gpuExperts = false;
-        bool diskExperts = false, diskEngram = false;
+        bool diskExperts = false, diskEngram = false, gpuEngram = false;
         int tpSize = 2;
         std::string logitsOnly;
         if (argc < 2)
             throw std::runtime_error("usage: deepseekV41TpGraphRegression FIXTURE_DIR "
-                "[--expert-cache | --gpu-experts | --disk-experts] [--disk-engram] [--fp8-dense] [--eager-only] "
+                "[--expert-cache | --gpu-experts | --disk-experts] [--disk-engram | --gpu-engram] [--fp8-dense] [--eager-only] "
                 "[--tp-size N] [--logits-only FILE]");
         for (int i = 2; i < argc; ++i) {
             const std::string option = argv[i];
@@ -162,6 +168,7 @@ int main(int argc, char **argv) {
             else if (option == "--gpu-experts") gpuExperts = true;
             else if (option == "--disk-experts") diskExperts = true;
             else if (option == "--disk-engram") diskEngram = true;
+            else if (option == "--gpu-engram") gpuEngram = true;
             else if (option == "--fp8-dense") fp8Dense = true;
             else if (option == "--eager-only") eagerOnly = true;
             else if (option == "--tp-size" && i + 1 < argc) tpSize = std::stoi(argv[++i]);
@@ -186,7 +193,7 @@ int main(int argc, char **argv) {
         const std::string moeDevice = gpuExperts ? mainDevice :
             (expertCache ? "numa" : (diskExperts ? "disk" : "cpu"));
         SetMoeDeviceMap({{moeDevice, 1}});
-        SetNgramDevice(diskEngram ? "disk" : "cpu");
+        SetNgramDevice(gpuEngram ? "cuda" : diskEngram ? "disk" : "cpu");
         if (expertCache) {
             SetMoeCudaCacheBytes(16ULL << 20);
             // Keep the split deterministic while testing graph replay and KV.

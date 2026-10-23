@@ -48,6 +48,16 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const fastllm::Data &x, const
 extern "C" bool FastllmCudaBFloat16FP8ReplicatedRowSlice(const fastllm::Data &input,
     fastllm::Data &weight, fastllm::Data &output, int rowStart, int rowCount);
 
+// Concatenate native row-major FP8 matrices with matching block scales.
+// Destination is caller-owned and must be empty; setup runs before capture.
+extern "C" bool FastllmCudaConcatFp8Rows(const fastllm::Data &first,
+    const fastllm::Data &second, fastllm::Data &output);
+
+// Normalize packed [Q, KV] rows and quantize Q at the existing BF16 boundary.
+extern "C" bool FastllmCudaV41QKVNormQuantPacked(const fastllm::Data &qkv,
+    const fastllm::Data &qWeight, const fastllm::Data &kvWeight, float eps,
+    fastllm::Data &qNorm, fastllm::Data &qQuant, fastllm::Data &kvNorm);
+
 // Independent B1 block-scaled FP8 projections, retaining each full-K reduction.
 // Inputs, weights and preallocated outputs must reside on the current device.
 extern "C" bool FastllmCudaBFloat16FP8LinearPair(const fastllm::Data &input,

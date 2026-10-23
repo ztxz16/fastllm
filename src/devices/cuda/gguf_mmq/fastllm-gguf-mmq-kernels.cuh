@@ -123,6 +123,7 @@ void launch_mmq_type(
         ggml_backend_cuda_context &context, const mmq_args &args,
         OutputType *output, cudaStream_t stream) {
     if constexpr (type == GGML_TYPE_IQ1_S) ensure_iq1s_grid(stream);
+    const auto &device = ggml_cuda_info().devices[ggml_cuda_get_device()];
     // Match the token tile to small verifier and prefill batches. A fixed
     // 128-row tile also computes the rows masked out during write-back.
     if (args.ne11 <= 8) {
@@ -131,7 +132,10 @@ void launch_mmq_type(
     } else if (args.ne11 <= 32) {
         launch_mul_mat_q_to_output<type, 32, OutputType>(
             context, args, output, stream);
-    } else if (args.ne11 <= 64) {
+    } else if (args.ne11 <= 64 ||
+               mmq_get_shmem<type>(128, get_mmq_y_host(device.cc), device.cc) > device.smpbo) {
+        // Q2_K's 128-row tile exceeds SM75's shared-memory budget. Keep a
+        // legal tile while still processing the complete input chunk.
         launch_mul_mat_q_to_output<type, 64, OutputType>(
             context, args, output, stream);
     } else {

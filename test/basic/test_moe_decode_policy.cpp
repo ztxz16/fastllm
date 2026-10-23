@@ -497,6 +497,25 @@ static void TestSharedOverlap() {
     Require(std::count(owners.begin(), owners.end(), -1) == 8,
             "decode split ignored non-linear CPU cost");
 
+    // DMA runs during host submission. Charging the full submission time
+    // before each rank's work would discard a profitable two-link split.
+    Scheduler launchA, launchB, launchCpu;
+    for (auto *p : {&launchA, &launchB}) {
+        p->copiedExpert.Observe(100); p->stagedExpert.Observe(10);
+        p->dispatch.Observe(300); p->decodeLaunch.Observe(10);
+    }
+    for (int n=1;n<=6;++n) launchCpu.ObserveDecodeCpu(n,n*100);
+    plans = {{&launchA,0,6,0},{&launchB,0,6,0}};
+    owners = Scheduler::AssignSharedMisses(plans,launchCpu.cpuExpert,{1,1,1,1,1,1},1,&launchCpu);
+    Require(std::count(owners.begin(),owners.end(),-1)<=3 &&
+            std::find(owners.begin(),owners.end(),0)!=owners.end() &&
+            std::find(owners.begin(),owners.end(),1)!=owners.end(),
+            "decode double-counted submission overlapping DMA");
+    launchB.decodeLaunch = {}; launchB.decodeLaunch.Observe(2000);
+    owners = Scheduler::AssignSharedMisses(plans,launchCpu.cpuExpert,{1,1,1,1,1,1},1,&launchCpu);
+    Require(std::find(owners.begin(),owners.end(),1)==owners.end(),
+            "decode ignored delayed helper submission");
+
     Scheduler coldA, coldB;
     cpu = {};
     plans = {{&coldA, 0, 1, 0}, {&coldB, 0, 1, 0}};

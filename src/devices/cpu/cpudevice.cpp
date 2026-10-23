@@ -6,6 +6,9 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
 #include "executor.h"
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#endif
 #include "devices/cpu/computeutils.h"
 #include "devices/cpu/kimi_k3_ops.h"
 
@@ -3303,8 +3306,194 @@ namespace fastllm {
         }
     }
 
+    static bool V41NVFP4RowsSupported(Data *gateWeight, Data *downWeight, int rows, int dim) {
+        return rows >= 1 && rows <= 6 && gateWeight != nullptr && downWeight != nullptr &&
+            gateWeight->dataType == DataType::NVFP4 &&
+            downWeight->dataType == DataType::NVFP4 &&
+            gateWeight->blockK == 1 && downWeight->blockK == 1 &&
+            gateWeight->blockM == 32 && downWeight->blockM == 32 &&
+            gateWeight->dims.size() == 2 && downWeight->dims.size() == 2 &&
+            gateWeight->dims[1] == dim && downWeight->dims[0] == dim &&
+            dim > 0 && dim % 32 == 0 &&
+            gateWeight->dims[0] > 0 && gateWeight->dims[0] % 64 == 0 &&
+            downWeight->dims[1] == gateWeight->dims[0] / 2;
+    }
+
+    struct MultiThreadV41RowsInputOp : MultiThreadBaseOp {
+        const uint16_t *source;
+        float *destination;
+        int dim, quantBlock;
+        MultiThreadV41RowsInputOp(const uint16_t *source, float *destination,
+                                  int dim, int quantBlock)
+            : source(source), destination(destination), dim(dim), quantBlock(quantBlock) {}
+        void Run() override {
+            BFloat16ToFloat32(const_cast<uint16_t*>(source), destination, dim);
+            QuantizeDequantizeFP8E4M3Blocks(destination, dim, quantBlock);
+        }
+    };
+
+    struct MultiThreadV41RowsOutputOp : MultiThreadBaseOp {
+        const float *source;
+        uint16_t *destination;
+        int dim;
+        MultiThreadV41RowsOutputOp(const float *source, uint16_t *destination, int dim)
+            : source(source), destination(destination), dim(dim) {}
+        void Run() override {
+            for (int i = 0; i < dim; ++i) {
+                // Match the single-expert reduction, including signed zero.
+                destination[i] = Float32ToBFloat16RNEBits(
+                    0.0f + RoundFloat32ToBFloat16RNE(source[i]));
+            }
+        }
+    };
+
+    // The disk MoE verify batch sends several positions to one routed expert.
+    // Decode every expert's packed weights once for all of its rows, then
+    // dynamically schedule all experts and column chunks together. Compared
+    // with one full-thread launch per expert, this shares the projection
+    // barriers across experts without changing the arithmetic.
+    static void ScheduleV41RowsLinear(std::vector<MultiThreadBaseOp*> &tasks,
+            std::vector<MultiThreadLinearFloat32NVFP4Op> &storage,
+            Data &weight, float *input, float *output, int rows,
+            int inputColumns, int outputColumns, int chunk) {
+        float *scaleFloats = weight.scales.empty() ? nullptr : weight.scales.data();
+        uint8_t *scaleBytes = GetNVFP4ScaleData(weight);
+        const int begin = (int)storage.size();
+        for (int st = 0; st < outputColumns; st += chunk) {
+            storage.emplace_back(input, weight.cpuData, nullptr, output,
+                rows, inputColumns, outputColumns, st,
+                std::min(st + chunk, outputColumns), scaleFloats, scaleBytes,
+                weight.blockK, weight.blockM);
+            storage.back().compactDecode = true;
+        }
+        for (size_t i = begin; i < storage.size(); ++i) tasks.push_back(&storage[i]);
+    }
+
+    static bool TryV41MoeNVFP4Rows(Data &input, Data &output, Data **weights,
+            int expertCount, int topk, const int32_t *indices,
+            const float *scores, float swigluLimit, int activationQuantBlock) {
+        const int rows = input.dims[0], dim = input.dims[1];
+        if (rows < 2 || cpuInstructInfo.hasAVX512BF16 ||
+            std::getenv("FASTLLM_DSV4_DISABLE_CPU_MOE_FAST") ||
+            std::getenv("FASTLLM_DSV41_DISABLE_BATCHED_MOE") ||
+            topk != 1 || weights[0] != nullptr ||
+            weights[1] != nullptr || input.dataType != DataType::BFLOAT16 ||
+            output.dataType != DataType::BFLOAT16) return false;
+
+        // The disk cache groups routes by expert. Validate every contiguous
+        // group before writing output so an unsupported fallback cannot leave
+        // a partially computed row.
+        struct Group {
+            int first, rows, mid;
+            Data *gate, *down;
+            std::vector<float> x, gateOutput, activation, downOutput;
+        };
+        std::vector<Group> groups;
+        for (int first = 0; first < rows;) {
+            const int expert = indices[first];
+            if (expert < 0 || expert >= expertCount) return false;
+            int last = first + 1;
+            while (last < rows && indices[last] == expert) ++last;
+            if (!V41NVFP4RowsSupported(weights[(expert + 1) * 2],
+                    weights[(expert + 1) * 2 + 1], last - first, dim)) return false;
+            Data *gate = weights[(expert + 1) * 2];
+            groups.push_back({first, last - first,
+                              gate->dims[0] / 2, gate, weights[(expert + 1) * 2 + 1],
+                              {}, {}, {}, {}});
+            first = last;
+        }
+
+        output.Allocate(false);
+        std::vector<MultiThreadV41RowsInputOp> inputTasks;
+        std::vector<MultiThreadBaseOp*> tasks;
+        inputTasks.reserve(rows);
+        for (Group &group : groups) {
+            group.x.resize((size_t)group.rows * dim);
+            group.gateOutput.resize((size_t)group.rows * group.mid * 2);
+            group.activation.resize((size_t)group.rows * group.mid);
+            group.downOutput.resize((size_t)group.rows * dim);
+            for (int r = 0; r < group.rows; ++r) {
+                inputTasks.emplace_back((uint16_t*)input.cpuData +
+                    (size_t)(group.first + r) * dim,
+                    group.x.data() + (size_t)r * dim, dim, activationQuantBlock);
+            }
+        }
+        tasks.clear();
+        tasks.reserve(inputTasks.size());
+        for (auto &task : inputTasks) tasks.push_back(&task);
+        ScheduleDeepSeekV4MoeTasks(tasks, false);
+
+        std::vector<MultiThreadLinearFloat32NVFP4Op> gateStorage, downStorage;
+        size_t gateTaskCount = 0, downTaskCount = 0;
+        for (const Group &group : groups) {
+            gateTaskCount += (group.mid * 2 + 255) / 256;
+            downTaskCount += (dim + 255) / 256;
+        }
+        gateStorage.reserve(gateTaskCount);
+        downStorage.reserve(downTaskCount);
+        tasks.clear();
+        tasks.reserve(gateTaskCount);
+        for (Group &group : groups) {
+            ScheduleV41RowsLinear(tasks, gateStorage, *group.gate,
+                group.x.data(), group.gateOutput.data(), group.rows,
+                dim, group.mid * 2, 256);
+        }
+        ScheduleDeepSeekV4MoeTasks(tasks, false);
+
+        std::vector<MultiThreadDeepSeekV4MoeDownPrepareOp> activationTasks;
+        for (Group &group : groups) {
+            for (int r = 0; r < group.rows; ++r) {
+                for (int st = 0; st < group.mid; st += 128) {
+                    activationTasks.emplace_back(
+                        group.gateOutput.data() + (size_t)r * group.mid * 2,
+                        group.activation.data() + (size_t)r * group.mid, nullptr,
+                        group.mid, st, std::min(st + 128, group.mid), true,
+                        scores[group.first + r], swigluLimit,
+                        true, true, false, activationQuantBlock);
+                }
+            }
+        }
+        tasks.clear();
+        tasks.reserve(activationTasks.size());
+        for (auto &task : activationTasks) tasks.push_back(&task);
+        ScheduleDeepSeekV4MoeTasks(tasks, false);
+
+        tasks.clear();
+        tasks.reserve(downTaskCount);
+        for (Group &group : groups) {
+            ScheduleV41RowsLinear(tasks, downStorage, *group.down,
+                group.activation.data(), group.downOutput.data(), group.rows,
+                group.mid, dim, 256);
+        }
+        ScheduleDeepSeekV4MoeTasks(tasks, false);
+
+        std::vector<MultiThreadV41RowsOutputOp> outputTasks;
+        outputTasks.reserve(rows);
+        for (const Group &group : groups) {
+            for (int r = 0; r < group.rows; ++r) {
+                outputTasks.emplace_back(group.downOutput.data() + (size_t)r * dim,
+                    (uint16_t*)output.cpuData + (size_t)(group.first + r) * dim, dim);
+            }
+        }
+        tasks.clear();
+        tasks.reserve(outputTasks.size());
+        for (auto &task : outputTasks) tasks.push_back(&task);
+        ScheduleDeepSeekV4MoeTasks(tasks, false);
+
+        return true;
+    }
+
     void CpuMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+#ifdef USE_NUMAS
+        if (CanRunHostMoe(datas, intParams)) {
+            RegisterUnboundHostMoe(reinterpret_cast<Data **>(datas.at("weights")),
+                                  intParams.at("weights___batch"));
+            NumasMergeMOE shared;
+            shared.Run(opType, datas, floatParams, intParams);
+            return;
+        }
+#endif
         fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuLinearOp());
  // auto ttt = std::chrono::system_clock::now();
  // std::vector <std::pair <std::string, float> > record;
@@ -4145,6 +4334,10 @@ namespace fastllm {
             int outer = n;
             float *floatInput = input.dataType == DataType::FLOAT32 ? (float*)input.cpuData : nullptr;
             output.Allocate(0.0f);
+
+            if (compactDecode && deepSeekV4Mode && activationQuantBlock == 32 && !useGeglu &&
+                TryV41MoeNVFP4Rows(input, output, weights, routedExpertCount, topk,
+                    indexData, scoreData, swigluLimit, activationQuantBlock)) return;
 
             if (deepSeekV4Mode && activationQuantBlock == 32 && !useGeglu &&
                 TryV41MoePrefill(input,output,weights,routedExpertCount,topk,indexData,scoreData,

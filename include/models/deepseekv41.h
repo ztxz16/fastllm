@@ -83,7 +83,10 @@ namespace fastllm {
         Data windowKV;                // [1, windowSize, headDim] BF16 环形缓冲，row = pos % windowSize
     };
 
+    struct DeepSeekV41DsparkWorkspace;
     struct DeepSeekV41DsparkState {
+        std::shared_ptr<DeepSeekV41DsparkWorkspace> workspace;
+        std::map<int, std::shared_ptr<DeepSeekV41DsparkWorkspace>> contextWorkspaces;
         std::vector<DeepSeekV41DsparkLayerCache> layers;
         int committed = 0;            // 已写入草稿滑窗的位置数（== 目标模型的 totalLen）
         int filled = 0;               // 滑窗中连续有效的位置数（前缀缓存恢复后从 0 开始重新累积）
@@ -198,6 +201,8 @@ namespace fastllm {
 
         void OnModelWeightsLoaded() override;
 
+        bool MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const override;
+
         // Reuse prefill scratch through decode. The existing pool bounds idle
         // storage per device and reclaims it on allocation pressure.
         bool RetainCudaWorkspace() const override {
@@ -287,6 +292,7 @@ namespace fastllm {
         bool RunGpuMoe(DeepSeekV41MoeContext &);
         bool RunHybridMoe(DeepSeekV41MoeContext &, HybridMoeDecodeStep *);
         bool moeExpertCacheAttempted = false;
+        std::vector<int> hybridMoeDevices;
         // Source FP8/FP4 linears still require block-32 FP8 activations after
         // their weights have been decoded into the requested storage dtype.
         std::set<std::string> quantizedLinearNames;
@@ -411,7 +417,7 @@ namespace fastllm {
         void PrepareForwardInputs(ForwardWorkspace &);
 #ifdef USE_CUDA
         bool TryFullDecodeGraph(ForwardWorkspace &);
-        void BuildFullDecodeGraph(int batch, const std::vector<std::shared_ptr<DeepSeekV41RequestState>> &states);
+        void BuildFullDecodeGraph(int batch, const std::vector<DeepSeekV41Segment> &segments);
 #endif
         void BeginForwardLayer(ForwardWorkspace &, int layer);
         void EndForwardLayer(ForwardWorkspace &, int layer);
@@ -490,6 +496,7 @@ namespace fastllm {
         float v41DsparkConfidenceThreshold = 0.0f;
         std::vector<int> v41DsparkTargetLayerIds;
         std::vector<int> v41DsparkTpDevices;
+        std::shared_ptr<void> v41DsparkHeadWorkspace;
         std::vector<char> v41IsDsparkTarget;  // [block_cnt]
         std::vector<std::vector<Data*> > v41DsparkMoeWeights, v41DsparkMoeBiass;
         std::atomic<long long> v41DsparkRounds{0};
@@ -500,7 +507,9 @@ namespace fastllm {
         void InitDsparkParams();
         void ApplyDsparkDevice();
         void DsparkEmbedInput(const Data &inputIds, Data &hiddenStates);
-        void DsparkProjectHead(Data &input, Data &output);
+        void DsparkProjectHead(Data &input, Data &output, bool persistent = false);
+        bool DsparkPrepareQkv(int stage, const Data &input, Data &inputQuant,
+                              Data &raw, Data &qNorm, Data &qQuant, Data &kv);
         bool DsparkTensorNeeded(const std::string &name) const;
         // 支持贪心 / CUDA 采样及逐位置工具名、参数名约束
         bool DsparkSupportsRequest(const GenerationConfig &config,

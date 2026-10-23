@@ -648,7 +648,9 @@ template <typename T>
 bool RunSelectedPaths(const std::vector<int> &devices, int dataType,
                       const char *typeName, int &selectedPaths,
                       int &testedPaths) {
-    const size_t testBytes[] = {kSmallBytes, kLargeBytes};
+    // Exercise compact two-stage shards, their upper boundary, and the tail packet.
+    const size_t testBytes[] = {kSmallBytes, 48 * 1024, 120 * 1024, 160 * 1024,
+                                256 * 1024, 256 * 1024 + 16, kLargeBytes};
     for (size_t bytes : testBytes) {
         const int count = (int)(bytes / sizeof(T));
         if (!FastllmCudaCustomAllReduceCanRun(

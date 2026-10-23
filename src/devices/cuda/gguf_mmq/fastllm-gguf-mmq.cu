@@ -12,7 +12,7 @@ namespace fastllm_gguf_mmq {
 constexpr int kQuantizeBlockSize = 128;
 constexpr int kBlackwellMinMmqRows = 8;
 constexpr int kDefaultMinMmqRows = 9;
-constexpr int kMaxMmqRows = 1024;
+constexpr size_t kMmqBufferBytes = size_t(128) * 1024 * 1024;
 
 #include "fastllm-gguf-mmq-io.cuh"
 
@@ -426,22 +426,34 @@ static bool matmul(
     const int cc = ggml_cuda_info().devices[device].cc;
     const int min_rows = cc >= 1200 ?
         kBlackwellMinMmqRows : kDefaultMinMmqRows;
-    if (rows < min_rows || rows > kMaxMmqRows ||
-        !int8_mma_available(cc)) {
+    if (rows < min_rows || !int8_mma_available(cc)) {
         return false;
     }
 
+    // Bound activation and FP32 output scratch independently of the prefill
+    // length. Reuse it on the caller's stream, like the dense Marlin row loop,
+    // instead of sending long inputs to the dequantized GEMM fallback.
+    const size_t quantized_guard_count = get_mmq_x_max_host(cc);
+    const size_t quantized_row_bytes =
+        static_cast<size_t>(padded_cols) / (4 * QK8_1) * sizeof(block_q8_1_mmq);
+    // Each scratch buffer is capped separately. Small projections can process
+    // more rows per launch; wide projections still split into bounded chunks.
+    // The quantizer uses grid.y for rows, whose CUDA limit is 65535.
+    size_t max_rows = std::min({size_t(65535),
+        (kMmqBufferBytes - quantized_guard_count * sizeof(block_q8_1_mmq)) / quantized_row_bytes,
+        kMmqBufferBytes / (static_cast<size_t>(output_cols) * sizeof(float))});
+    if (max_rows == 0) return false;
+    if (max_rows >= 128) max_rows = max_rows / 128 * 128;
+    const int chunk_rows = static_cast<int>(std::min(static_cast<size_t>(rows), max_rows));
     // MMQ always loads a complete row tile. The final tile can therefore read
     // past the last real row in each K block and, for the final K block, past
     // the packed activation payload. ggml reserves one maximum-size tile as a
     // guard region for the same reason. Its values need not be initialized:
     // they belong only to output rows masked by the checked write-back path.
     const size_t quantized_payload_count =
-        static_cast<size_t>(rows) * padded_cols / (4 * QK8_1);
-    const size_t quantized_count = quantized_payload_count +
-        static_cast<size_t>(get_mmq_x_max_host(
-            ggml_cuda_info().devices[device].cc));
-    const size_t output_count = static_cast<size_t>(rows) * output_cols;
+        static_cast<size_t>(chunk_rows) * padded_cols / (4 * QK8_1);
+    const size_t quantized_count = quantized_payload_count + quantized_guard_count;
+    const size_t output_count = static_cast<size_t>(chunk_rows) * output_cols;
     block_q8_1_mmq *quantized = nullptr;
     float *float_output = nullptr;
     if (FastllmCudaTryMalloc(reinterpret_cast<void **>(&quantized),
@@ -456,8 +468,6 @@ static bool matmul(
         return false;
     }
 
-    launch_quantize(type, input, quantized, rows, cols, padded_cols, stream);
-
     mmq_args args{};
     args.x = static_cast<const char *>(weight);
     args.y = reinterpret_cast<const char *>(quantized);
@@ -466,12 +476,21 @@ static bool matmul(
     args.ne01 = output_cols;
     args.stride01 = ggml_row_size(type, cols);
     args.ne10 = padded_cols;
-    args.ne11 = rows;
-    args.stride11 = rows;
     args.ne0 = output_cols;
 
     ggml_backend_cuda_context context;
-    launch_mmq(type, context, args, output, stream);
+    for (int offset = 0; offset < rows;) {
+        const int count = std::min(chunk_rows, rows - offset);
+        launch_quantize(type, input + static_cast<size_t>(offset) * cols,
+                        quantized, count, cols, padded_cols, stream);
+        // Small final chunks are valid MMQ inputs too: min_rows is only the
+        // admission policy for the complete operation, not a kernel limit.
+        args.ne11 = count;
+        args.stride11 = count;
+        launch_mmq(type, context, args,
+                   output + static_cast<size_t>(offset) * output_cols, stream);
+        offset += count;
+    }
 
     FastllmCudaFree(float_output);
     FastllmCudaFree(quantized);

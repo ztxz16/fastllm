@@ -457,6 +457,9 @@ struct ResidentLayer {
     void *table = nullptr;
     std::vector<const fastllm::Data *> sources;
     std::atomic<bool> retired{false};
+    // A pointer table built by prefill alone does not establish that the
+    // native V4.1 decode path and its scratch shape have been warmed.
+    std::atomic<uint32_t> v41DecodeTopks[32]{};
     ~ResidentLayer() {
         if (!table) return;
         int previous = -1;
@@ -1284,7 +1287,20 @@ bool FastllmCudaMergeMOEV41GGUFResident(
         output, layer->table, static_cast<const int32_t *>(indices.cudaData),
         static_cast<const float *>(scores.cudaData), layer->gateType, layer->downType,
         hidden, inter, layer->experts, topk, swigluLimit), "V4.1 resident GGUF CUDA launch failed.");
+    if (rows <= 32)
+        layer->v41DecodeTopks[rows - 1].fetch_or(uint32_t(1) << (topk - 1), std::memory_order_release);
     return true;
+}
+
+bool FastllmCudaV41GGUFGraphReady(const fastllm::Data *layerKey, int rows, int topk) {
+    if (!layerKey || rows < 1 || rows > 32 || topk < 1 || topk > 32) return false;
+    auto &registry = ResidentLayers();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    auto it = registry.layers.find(layerKey);
+    if (it == registry.layers.end()) return false;
+    const auto &layer = *it->second;
+    return layer.table && !layer.retired.load(std::memory_order_acquire) &&
+        (layer.v41DecodeTopks[rows - 1].load(std::memory_order_acquire) & (uint32_t(1) << (topk - 1)));
 }
 
 namespace v41_gguf_cache {
@@ -1358,15 +1374,15 @@ __global__ void Gate(const block_q8_K *input, __nv_bfloat16 *activation,
         if (threadIdx.x % 32 == 0) activation[size_t(route) * view.inter + column] = __float2bfloat16_rn(0);
         return;
     }
-    const uint8_t *record = view.records + size_t(view.routeSlots[route]) * view.recordStride;
-    input += size_t(route / topk) * (view.hidden / 256);
+    const uint8_t *record = view.records + (view.slotOffsets ? view.slotOffsets[view.routeSlots[route]] : size_t(view.routeSlots[route]) * view.recordStride);
+    input += size_t((view.routeMap ? view.routeMap[route] : route) / topk) * (view.hidden / 256);
     using fastllm::cuda::dsv41_cache::BFloat;
     // NUMA preserves the cross-interleaved gate/up row pairs in R4 blocks.
     float gate = BFloat(Dot<true>(record, input, 2 * column, view.hidden));
     float up = BFloat(Dot<true>(record, input, 2 * column + 1, view.hidden));
     if (threadIdx.x % 32 == 0) {
         if (limit > 0) { gate = fminf(gate, limit); up = fmaxf(-limit, fminf(up, limit)); }
-        const float value = __fmul_rn(__fmul_rn(gate / (1.f + expf(-gate)), up), scores[route]);
+        const float value = __fmul_rn(__fmul_rn(gate / (1.f + expf(-gate)), up), scores[view.routeMap ? view.routeMap[route] : route]);
         activation[size_t(route) * view.inter + column] = __float2bfloat16_rn(value);
     }
 }
@@ -1374,10 +1390,10 @@ __global__ void Gate(const block_q8_K *input, __nv_bfloat16 *activation,
 __global__ void Down(const block_q8_K *activation, float *output, FastllmCudaMoeGGUFCacheView view) {
     const int column = blockIdx.x * 4 + threadIdx.x / 32, route = blockIdx.y;
     if (column >= view.hidden || view.routeSlots[route] < 0) return;
-    const uint8_t *weight = view.records + size_t(view.routeSlots[route]) * view.recordStride + view.downOffset;
+    const uint8_t *weight = view.records + (view.slotOffsets ? view.slotOffsets[view.routeSlots[route]] : size_t(view.routeSlots[route]) * view.recordStride) + view.downOffset;
     const float value = Dot<false>(weight, activation + size_t(route) * (view.inter / 256), column, view.inter);
     if (threadIdx.x % 32 == 0)
-        output[size_t(route) * view.hidden + column] = fastllm::cuda::dsv41_cache::BFloat(value);
+        output[size_t(view.routeMap ? view.routeMap[route] : route) * view.hidden + column] = fastllm::cuda::dsv41_cache::BFloat(value);
 }
 } // namespace v41_gguf_cache
 
@@ -1392,7 +1408,8 @@ bool FastllmCudaMoeV41GGUFCacheCompute(const fastllm::Data &input, fastllm::Data
         view.hidden <= 0 || view.inter <= 0 || view.hidden % 256 || view.inter % 256 || topk < 1 || topk > 16 ||
         view.gateType != GGML_TYPE_Q2_K_R4 || view.downType != GGML_TYPE_Q4_K_R4 ||
         !scores || !perExpert || !view.workspace || !view.routeSlots || !view.records) return false;
-    const int rows = input.dims[0], routes = rows * topk;
+    const int rows = input.dims[0], routes = view.routeMap ? view.routeCount : rows * topk;
+    if (routes < 1 || routes > rows * topk || view.activeRouteCount) return false;
     const size_t inputBytes = Align16(size_t(rows) * (view.hidden / 256) * sizeof(block_q8_K));
     const size_t gateBytes = Align16(size_t(routes) * (view.inter / 256) * sizeof(block_q8_K));
     if (view.workspaceBytes < inputBytes + gateBytes) return false;
@@ -1402,7 +1419,7 @@ bool FastllmCudaMoeV41GGUFCacheCompute(const fastllm::Data &input, fastllm::Data
     activation.Resize({routes, view.inter});
     activation.ToDevice(fastllm::DataDevice::CUDA, input.dataDeviceIds, false);
     activation.Allocate(false);
-    v41_gguf_cache::Quantize<<<dim3(view.hidden / 256, rows), 256, 0, cudaStreamPerThread>>>(
+    if (!view.q8InputPrepared) v41_gguf_cache::Quantize<<<dim3(view.hidden / 256, rows), 256, 0, cudaStreamPerThread>>>(
         static_cast<const __nv_bfloat16 *>(input.cudaData), qInput, view.hidden);
     v41_gguf_cache::Gate<<<dim3((view.inter + 3) / 4, routes), 128, 0, cudaStreamPerThread>>>(
         qInput, static_cast<__nv_bfloat16 *>(activation.cudaData), view, scores, topk, swigluLimit);

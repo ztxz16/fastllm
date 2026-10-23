@@ -219,8 +219,10 @@ class HybridAutoTest(unittest.TestCase):
                 auto.inventory(p)
 
     def test_fastllm_gguf_nested_and_symlink_shards_keep_quantized_sizes(self):
-        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as shared:
+        with tempfile.TemporaryDirectory() as d:
             p = Path(d)
+            shared = p / "shared"
+            shared.mkdir()
             (p / "config.json").write_text('{}')
             weight_map = {}
             expected = []
@@ -271,6 +273,32 @@ class HybridAutoTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "fastllm"):
                         auto.inventory(p)
 
+    def test_safetensors_subdirectories_and_path_boundaries(self):
+        with tempfile.TemporaryDirectory() as d:
+            parent = Path(d)
+            model = parent / 'model'
+            (model / 'experts').mkdir(parents=True)
+            (model / 'config.json').write_text('{}')
+            header = json.dumps({'x': {'dtype': 'F16', 'shape': [8],
+                                      'data_offsets': [0, 16]}}).encode()
+            payload = struct.pack('<Q', len(header)) + header + bytes(16)
+            shard = model / 'experts' / 'rank0.safetensors'
+            shard.write_bytes(payload)
+            index = model / 'model.safetensors.index.json'
+            index.write_text(json.dumps({'weight_map': {'x': 'experts/rank0.safetensors'}}))
+            _, tensors = auto.inventory(model)
+            self.assertEqual(tensors, [auto.Tensor('x', (8,), 16, 'F16')])
+            outside = parent / 'outside.safetensors'
+            outside.write_bytes(payload)
+            (model / 'linked.safetensors').symlink_to(outside)
+            (model / 'linked_dir').symlink_to(parent, target_is_directory=True)
+            for name in ('../outside.safetensors', 'linked.safetensors',
+                         'linked_dir/outside.safetensors', str(shard.resolve())):
+                with self.subTest(name=name):
+                    index.write_text(json.dumps({'weight_map': {'x': name}}))
+                    with self.assertRaisesRegex(ValueError, 'invalid safetensors shard path'):
+                        auto.inventory(model)
+
     def test_ngram_and_inactive_draft_do_not_become_gpu_weights(self):
         g, _, _, _ = fixture()
         a = args(ngram_device="disk")
@@ -308,6 +336,19 @@ class HybridAutoTest(unittest.TestCase):
             t = [auto.Tensor("layers.0.ffn.experts.0.up_proj.weight", (8, 8), 64, "F8_E5M2")]
             with self.assertRaises(ValueError):
                 auto.weight_costs(t, replace(g, family=family), args())
+
+    def test_deepseek_pp_head_and_idle_vision_are_not_replicated(self):
+        g = auto.geometry(self.dspark_metadata(), "float16", 0)
+        tensors = [auto.Tensor("layers.0.ffn.experts.0.w1.weight", (8, 8), 64, "gguf:1"),
+                   auto.Tensor("head.weight", (16, 8), 256, "BF16"),
+                   auto.Tensor("norm.weight", (8,), 32, "F32"),
+                   auto.Tensor("vision.blocks.0.attn.wqkv.weight", (8, 8), 128, "F16"),
+                   auto.Tensor("aligner.w1.weight", (8, 8), 128, "F16"),
+                   auto.Tensor("image_start", (8,), 32, "F32")]
+        _, dense, common, host, _, _ = auto.weight_costs(tensors, g, args())
+        self.assertEqual(common, 0)
+        self.assertEqual(dense, [0, 0, 0, 544])
+        self.assertEqual(host, 288)
 
     def test_hf_weight_conversion_counts_unpacked_values(self):
         g, _, _, _ = fixture()
@@ -435,6 +476,21 @@ class HybridAutoTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 auto.plan(a, g, costs, "pp", {0: 1}, gpu,
                           {"total": 256 * GiB, "available": 256 * GiB})
+
+    def test_host_reserve_keeps_floor_and_caps_large_machine_budget(self):
+        g, c, gpu, _ = fixture()
+        a = args(moe_device_layers=-1, moe_cuda_cache=0)
+        for total, available, reserve in [(8 * GiB, 8 * GiB, GiB),
+                                          (32 * GiB, 28 * GiB, 32 * GiB // 10),
+                                          (128 * GiB, 120 * GiB, 4 * GiB)]:
+            with self.subTest(total=total), patch.dict(os.environ, {}, clear=True):
+                ram = {"total": total, "available": available}
+                p = auto.plan(a, g, c, "pp", {0: 1}, gpu, ram)
+                self.assertEqual(p["host_budget_bytes"], available - reserve)
+                # The reserve remains unavailable even when total RAM is large.
+                ram["available"] = p["host_estimated_bytes"] + reserve - 1
+                with self.assertRaises(ValueError):
+                    auto.plan(a, g, c, "pp", {0: 1}, gpu, ram)
 
     def test_snapshot_fallback_counts_a_second_host_copy(self):
         g, c, gpu, ram = fixture()
@@ -625,6 +681,82 @@ class HybridAutoTest(unittest.TestCase):
         resident = auto.plan(a, g, costs, "pp", {0: 1},
                              {0: dict(total=32*GiB, free=32*GiB)}, ram, allow_full_gpu=True)
         self.assertEqual(resident["expert_transport_bytes_per_device"], 0)
+
+    def test_v41_transport_only_charges_stages_with_host_experts(self):
+        g = auto.geometry(self.dspark_metadata(), "float16", 0)
+        a = args(tokens=4096, max_context_length=4096, moe_device_layers=2, moe_cuda_cache=0)
+        costs = ([GiB] * 4, [MiB] * 4, 0, 0, MiB, False)
+        gpu = {d: dict(total=16 * GiB, free=16 * GiB) for d in (0, 1)}
+        ram = dict(total=64 * GiB, available=64 * GiB)
+        native = auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+        g.gguf_expert_bytes = {2: 13 * MiB}
+        packed = auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+        self.assertEqual(packed["gpu_estimated_bytes"][0], native["gpu_estimated_bytes"][0])
+        self.assertEqual(packed["gpu_estimated_bytes"][1] - native["gpu_estimated_bytes"][1],
+                         96 * 13 * MiB + 272 * MiB)
+
+    def test_v41_dspark_transport_covers_gpu_only_helper_stages(self):
+        g = auto.geometry(self.dspark_metadata(), "float16", 0)
+        a = args(tokens=4096, max_context_length=4096, moe_device_layers=2,
+                 moe_cuda_cache=0, dspark=5)
+        costs = ([GiB] * 4, [MiB] * 4, 0, 0, MiB, False)
+        gpu = {d: dict(total=16 * GiB, free=16 * GiB) for d in (0, 1)}
+        ram = dict(total=64 * GiB, available=64 * GiB)
+        native = auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+        g.gguf_expert_bytes = {2: 13 * MiB}
+        packed = auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+        for device in (0, 1):
+            self.assertEqual(packed["gpu_estimated_bytes"][device] - native["gpu_estimated_bytes"][device],
+                             96 * 13 * MiB + 272 * MiB)
+        # A helper's staging budget cannot be spent again on resident weights/cache.
+        gpu[0]["free"] = packed["gpu_estimated_bytes"][0] - 1
+        with self.assertRaises(ValueError):
+            auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+
+    def test_v41_resident_gguf_prefill_uses_phase_workspace(self):
+        metadata = self.dspark_metadata()
+        metadata['quantization_config'] = dict(quant_method='fp8', expert_dtype='fp4',
+                                                weight_block_size=[32, 32])
+        g = auto.geometry(metadata, 'fp4', 0)
+        a = args(fast_prefill=True, atype='bfloat16')
+        g.gguf_expert_bytes = {i: MiB for i in range(g.layers)}
+        with patch.dict(os.environ, {}, clear=True):
+            host = auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0)
+            resident = auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 2)
+            generic = auto._workspace_bytes(a, g, 4096, 1048576, 'tp', 2)
+            self.assertGreater(resident, host)  # resident route/MMQ buffers stay live
+            self.assertLess(resident, generic)
+            del g.gguf_expert_bytes[1]
+            self.assertEqual(auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 2), generic)
+
+    def test_v41_host_staging_is_reused_only_with_early_cuda_placement(self):
+        g = auto.geometry(self.dspark_metadata(), 'float16', 0)
+        a = args(tokens=4096, max_context_length=4096, moe_device_layers=2,
+                 moe_cuda_cache=0, fast_prefill=False)
+        costs = ([GiB] * 4, [MiB] * 4, 0, 0, MiB, False)
+        gpu = {0: dict(total=16 * GiB, free=16 * GiB)}
+        ram = dict(total=64 * GiB, available=64 * GiB)
+        with patch.dict(os.environ, {}, clear=True):
+            native = auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram)
+            for flag, value in [('FASTLLM_DSV41_REFERENCE_MATH', '1'),
+                                ('FASTLLM_DSV41_DUMP_DIR', '/tmp/v41-dump')]:
+                with patch.dict(os.environ, {flag: value}):
+                    debug = auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram)
+                self.assertEqual(debug['host_estimated_bytes'] - native['host_estimated_bytes'],
+                                 native['workspace_bytes_per_device'])
+
+    def test_v41_without_slabs_accounts_for_resident_allocation_pages(self):
+        g = auto.geometry(self.dspark_metadata(), 'float16', 0)
+        g.gguf_expert_bytes = {0: 4 * MiB, 1: 4 * MiB}
+        a = args(tokens=4096, max_context_length=4096, moe_device_layers=2,
+                 moe_cuda_cache=0, cuda_slab=64)
+        costs = ([GiB] * 4, [MiB] * 4, 0, 0, MiB, False)
+        gpu = {0: dict(total=4 * GiB, free=4 * GiB)}
+        ram = dict(total=64 * GiB, available=64 * GiB)
+        self.assertEqual(auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram)['resident_layers'], 2)
+        a.cuda_slab = 0
+        with self.assertRaises(ValueError):
+            auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram)
 
     def test_v41_later_index_sources_share_persistent_keys(self):
         md = self.dspark_metadata()

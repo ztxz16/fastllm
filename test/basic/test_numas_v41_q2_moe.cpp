@@ -1,11 +1,14 @@
 #include "fastllm.h"
 #include "executor.h"
 #include "devices/numas/numasdevice.h"
+#include "devices/numas/numas.h"
 #include "utils.h"
 #include "gguf.h"
 #include "devices/disk/diskdevice.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
 #endif
 #include <algorithm>
 #include <cmath>
@@ -20,6 +23,7 @@
 using namespace fastllm;
 namespace fastllm {
     void RegisterNumas(Data *data, std::string weightType);
+    NumaConfig *GetNumaConfig();
 }
 
 static float Bf16(float value) {
@@ -53,6 +57,13 @@ static void Fp8(std::vector<float> &values) {
 }
 
 static void GgmlActivation(std::vector<float> &values, const Data &weight) {
+    if (ggml_type_vec_dot_type((ggml_type)weight.ggmlType) == GGML_TYPE_Q8_0) {
+        std::vector<block_q8_0> packed(values.size() / QK8_0);
+        iqk_quantize_row_q8_K(values.data(), packed.data(), values.size(),
+                             GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+        dequantize_row_q8_0(packed.data(), values.data(), values.size());
+        return;
+    }
     // Decode canonical Q8 blocks for a scalar matmul oracle. K32 changes
     // partial-sum metadata, while its scale and quant bytes keep this layout.
     std::vector<block_q8_K> packed(values.size() / QK_K);
@@ -89,6 +100,14 @@ struct RestoreEnv {
 
 int main(int argc, char **argv) {
     try {
+        const bool parity = argc > 1 && std::string(argv[argc - 1]) == "--parity";
+        if (parity) --argc;
+        const bool unbound = argc > 1 && std::string(argv[argc - 1]) == "--unbound";
+        if (unbound) --argc;
+        HostMoePlacementScope placement(unbound);
+        const bool iq1s = argc > 1 && std::string(argv[argc - 1]) == "--iq1-s";
+        const bool iq1m = argc > 1 && std::string(argv[argc - 1]) == "--iq1-m";
+        if (iq1s || iq1m) --argc;
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool disk = mode == "disk", cache = mode == "cache", host = mode == "host";
         const bool decode = mode == "decode", verify = mode == "verify";
@@ -106,26 +125,66 @@ int main(int argc, char **argv) {
             fclose(file);
         }
         EnableAMX(false);
+        if (parity) SetThreads(8); // A later reduction must not reactivate old workers.
         SetThreads(4);
-        ((Executor*)GetExecutor())->SetFirstDevice(disk ? "disk" : "numa");
+        ((Executor*)GetExecutor())->SetFirstDevice(disk ? "disk" : unbound ? "cpu" : "numa");
         if (disk) { SetMoeCpuCacheBytes(4 * 1024 * 1024); SetMoeCudaCacheBytes(0); }
         const int hidden = argc > 2 ? std::stoi(argv[2]) : 256;
         const int inter = (host || decodeOrVerify) && argc > 3 ? std::stoi(argv[3]) : 256;
-        const int experts = cache ? 24 : decodeOrVerify ? 6 : 3, topk = (cache || decodeOrVerify) ? 6 : 2;
+        const bool draft = cache && argc > 3 && std::string(argv[3]) == "draft";
+        const int experts = cache ? 24 : decodeOrVerify ? 6 : (iq1s || iq1m) ? 7 : 3;
+        const int topk = draft ? 3 : (cache || decodeOrVerify) ? 6 : 2;
         // Q4_K_R4 consumes Q8_K32, while Q2_K_R4 consumes Q8_K.
         const bool q2Down = decodeOrVerify && argc > 4 && std::string(argv[4]) == "q2";
+        const bool q2ZeroDown = iq1s || iq1m || (decodeOrVerify && argc > 4 && std::string(argv[4]) == "q2_0");
         std::vector<std::unique_ptr<Data>> owned;
         std::vector<Data*> weights(2 * (experts + 1), nullptr), biases(weights);
+        std::vector<std::unique_ptr<Data>> boundOwned;
+        std::vector<Data*> boundWeights(weights);
+        if (parity && (!unbound || cache || disk))
+            throw std::runtime_error("placement comparison requires uncached unbound host weights");
         std::vector<std::vector<float>> decoded(weights.size());
         std::vector<std::vector<uint8_t>> canonical(weights.size());
         for (int e = disk ? 0 : 1; e <= experts; ++e) for (int part = 0; part < 2; ++part) {
             int rows = part ? hidden : 2 * inter, cols = part ? inter : hidden;
-            auto type = part && !q2Down ? GGML_TYPE_Q4_K : GGML_TYPE_Q2_K;
+            auto type = part && q2ZeroDown ? GGML_TYPE_Q2_0 :
+                part && !q2Down ? GGML_TYPE_Q4_K : GGML_TYPE_Q2_K;
+            if (!part && (iq1s || iq1m)) type = iq1s ? GGML_TYPE_IQ1_S : GGML_TYPE_IQ1_M;
             auto weight = e == 0 ? std::make_unique<Data>(FLOAT16, std::vector<int>{rows, cols}) :
                 std::make_unique<Data>(DATA_GGUF_FORMAT, type, std::vector<int>{rows, cols});
             std::vector<float> original(rows * cols);
             for (int i = 0; i < rows * cols; ++i) original[i] = .03f * std::sin(i * .719f + e * .43f + part);
-            weight->CreateFromOriData(WeightType::LINEAR, FLOAT32, (uint8_t*)original.data(), nullptr, nullptr);
+            if (type == GGML_TYPE_Q2_0) {
+                weight->Allocate();
+                auto *blocks = reinterpret_cast<block_q2_0 *>(weight->cpuData);
+                for (size_t i = 0; i < weight->GetBytes() / sizeof(block_q2_0); ++i) {
+                    blocks[i].d = float_to_half(.015f * (1 + (i + e) % 5));
+                    for (size_t j = 0; j < sizeof(blocks[i].qs); ++j)
+                        blocks[i].qs[j] = uint8_t(i * 31 + j * 7 + e);
+                }
+            } else if (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M) {
+                weight->Allocate();
+                uint32_t state = 937 + e;
+                for (size_t i = 0; i < weight->GetBytes(); ++i) {
+                    state = state * 1664525U + 1013904223U;
+                    weight->cpuData[i] = state >> 24;
+                }
+                const uint16_t scale = float_to_half(.00390625f * (1 + e % 3));
+                const size_t bytes = ggml_type_size(type);
+                for (size_t offset = 0; offset < weight->GetBytes(); offset += bytes) {
+                    uint8_t *block = weight->cpuData + offset;
+                    if (iq1s) memcpy(block, &scale, sizeof(scale));
+                    else {
+                        auto *q = reinterpret_cast<block_iq1_m *>(block);
+                        uint16_t scales[4]; memcpy(scales, q->scales, sizeof(scales));
+                        for (int i = 0; i < 4; ++i)
+                            scales[i] = (scales[i] & 0xfff) | ((scale >> (4 * i)) & 15) << 12;
+                        memcpy(q->scales, scales, sizeof(scales));
+                    }
+                }
+            } else {
+                weight->CreateFromOriData(WeightType::LINEAR, FLOAT32, (uint8_t*)original.data(), nullptr, nullptr);
+            }
             if (host) canonical[e*2+part].assign(weight->cpuData, weight->cpuData+weight->GetBytes());
             auto &plain = decoded[e * 2 + part];
             plain.resize(original.size());
@@ -163,23 +222,89 @@ int main(int argc, char **argv) {
                 weight->isDiskWeight = true;
                 weight->diskWeightParts.push_back(part);
             }
+            if (parity) {
+                boundOwned.emplace_back(new Data(*weight));
+                boundWeights[e * 2 + part] = boundOwned.back().get();
+            }
             weights[e * 2 + part] = weight.get();
             owned.push_back(std::move(weight));
         }
+        auto registerWeights = [&] {
+            std::vector<std::pair<Data *, std::string>> pending;
+            for (int e = 1; e <= experts; ++e) {
+                pending.push_back({weights[e * 2], "linearSwiglu"});
+                pending.push_back({weights[e * 2 + 1], "linear"});
+            }
+            RegisterHostMoeWeightBatch(pending, unbound);
+        };
+        bool boundRegistered = false;
+        auto registerBound = [&] {
+            if (boundRegistered) return;
+            HostMoePlacementScope bound(false);
+            if (GetNumasMoeShardCount() != 1)
+                throw std::runtime_error("placement comparison requires FT_NUMAS=1");
+            std::vector<std::pair<Data *, std::string>> pending;
+            for (int e = 1; e <= experts; ++e) {
+                pending.push_back({boundWeights[2 * e], "linearSwiglu"});
+                pending.push_back({boundWeights[2 * e + 1], "linear"});
+            }
+            RegisterHostMoeWeightBatch(pending, false);
+            boundRegistered = true;
+        };
+        if (unbound && !cache && !disk) {
+            DataDict data{{"weights", reinterpret_cast<Data *>(weights.data())}};
+            IntDict params{{"weights___batch", int(weights.size())}};
+            if (!CanRunHostMoe(data, params))
+                throw std::runtime_error("unregistered supported CPU experts rejected");
+            params["diskMoeDecode"] = 1;
+            if (CanRunHostMoe(data, params))
+                throw std::runtime_error("disk decode entered shared CPU registration");
+            params.erase("diskMoeDecode");
+            registerWeights();
+            if (!CanRunHostMoe(data, params))
+                throw std::runtime_error("registered CPU experts rejected by shared backend");
+            params["gateType"] = int(MoeGateSwiglu) + 1;
+            if (CanRunHostMoe(data, params))
+                throw std::runtime_error("unsupported gate entered shared CPU MoE");
+            params.erase("gateType");
+            data["weights"] = nullptr;
+            if (CanRunHostMoe(data, params))
+                throw std::runtime_error("null weight table entered shared CPU MoE");
+        }
+        if (unbound && GetNumasMoeShardCount() != 1)
+            throw std::runtime_error("unbound host MoE must use one logical shard");
         Data output(BFLOAT16), w1, w2, w3, currentInput, currentOutput;
 #ifdef USE_CUDA
         if (cache) {
             FastllmCudaSetDevice(0);
+            if (unbound) {
+                // Adjacent malloc blocks can share CUDA registration pages.
+                // Small, simultaneously live arenas make that failure repeatable.
+                std::vector<std::pair<void *, size_t>> allocations;
+                for (size_t i = 0; i < 32; ++i) {
+                    const size_t bytes = 257 + i;
+                    void *ptr = allocate_aligned_numa(bytes, 0);
+                    if (!ptr || uintptr_t(ptr) % size_t(sysconf(_SC_PAGESIZE)) ||
+                            !FastllmCudaHostRegister(ptr, bytes))
+                        throw std::runtime_error("unbound arenas must have independent pinnable pages");
+                    memset(ptr, int(i), bytes);
+                    allocations.push_back({ptr, bytes});
+                }
+                // Allocation ownership, not the caller's current placement,
+                // must select the matching deallocator.
+                HostMoePlacementScope bound(false);
+                for (const auto &allocation : allocations) {
+                    FastllmCudaHostUnregister(allocation.first);
+                    free_aligned_numa(allocation.first, allocation.second + 63);
+                }
+            }
             const size_t gateBytes = weights[2]->GetBytes();
             const size_t downOffset = (gateBytes + 15) & ~size_t(15);
             const size_t stride = (downOffset + weights[3]->GetBytes() + 127) & ~size_t(127);
             SetMoeCudaCacheBytes(16 * stride);
             FastllmCudaMoeCacheLayer layer{weights.data(), (int)weights.size(), true, 10.f};
             if (!FastllmCudaPrepareMoeCache(&layer, 1, [&] {
-                for (int e = 1; e <= experts; ++e) {
-                    RegisterNumas(weights[e * 2], "linearSwiglu");
-                    RegisterNumas(weights[e * 2 + 1], "linear");
-                }
+                registerWeights();
             })) throw std::runtime_error("Q2 CUDA cache preparation failed");
         }
 #else
@@ -191,6 +316,7 @@ int main(int argc, char **argv) {
             host ? std::vector<int>{33, 65, 128, 408, 1023, 1024, 1041, 4096} :
             decode ? std::vector<int>{1, 3} :
             verify ? std::vector<int>{1, 2, 3, 6, 8} :
+            cache ? std::vector<int>{2, 5, 1, 7, 9, 25, 31, 3, 6, 8} :
             std::vector<int>{1, 7, 32, 64, 260, 2, 3, 6, 8};
         for (bool quantizeShared : {false, true}) for (int rows : batches) {
             if ((cache || host || decodeOrVerify) && quantizeShared) continue;
@@ -229,11 +355,30 @@ int main(int argc, char **argv) {
             if (disk) { SetMoeCpuCacheBytes(1); SetMoeCpuCacheBytes(4 * 1024 * 1024); }
             Data index(INT32, {rows, topk}, DataDevice::CPU, ids.data());
             Data score(FLOAT32, {rows, topk}, DataDevice::CPU, scores.data());
+            if (parity && GetNumaConfig()->threads != 4)
+                throw std::runtime_error("unbound placement ignored the active thread limit");
             MergeMOE(input, index, score, weights, biases, w1, w2, w3, currentInput, currentOutput,
                      0.7f, output, 0, MoeGateSwiglu, false, 10.f, true, nullptr, 32, quantizeShared);
             // GPU-assisted prefill may return a CUDA tensor. The numerical
             // references below always read the host representation.
             output.ToDevice(DataDevice::CPU);
+            if (parity) {
+                // First use the ordinary unbound pool, then initialize NUMA.
+                // Later CPU batches must stay unbound after that transition.
+                registerBound();
+                HostMoePlacementScope bound(false);
+                auto *executor = (Executor*)GetExecutor();
+                executor->SetFirstDevice("numa");
+                Data actual(BFLOAT16), b1, b2, b3, bi, bo;
+                MergeMOE(input, index, score, boundWeights, biases, b1, b2, b3, bi, bo,
+                         .7f, actual, 0, MoeGateSwiglu, false, 10.f, true, nullptr, 32, quantizeShared);
+                executor->SetFirstDevice("cpu");
+                actual.ToDevice(DataDevice::CPU);
+                if (actual.GetBytes() != output.GetBytes() ||
+                        memcmp(actual.cpuData, output.cpuData, output.GetBytes()))
+                    throw std::runtime_error("CPU and single-node NUMA outputs differ");
+                printf("CPU/NUMA bitwise PASS rows=%d hidden=%d inter=%d\n", rows, hidden, inter);
+            }
             if (verify) {
                 // The cache verifier uses the grouped path even for one row.
                 // Compare its scalar fallback exactly, including untouched GPU
@@ -325,7 +470,8 @@ int main(int argc, char **argv) {
                     FastllmCudaSetDevice(device);
                     Data gpuInput(input), gate, workspace, gpuOutput;
                     gpuInput.ToDevice(DataDevice::CUDA, std::vector<int>{device}, true);
-                    std::unordered_set<int> selected{1,2,3};
+                    std::unordered_set<int> selected;
+                    for (int expert = 1; expert <= experts; ++expert) selected.insert(expert);
                     auto launch = [&](bool v4 = true, int block = 32) {
                         return FastllmCudaMergeMOEGGUFHost(gpuInput, gate, workspace, gpuOutput,
                             weights.data(), experts, ids.data(), scores.data(), topk, selected, true, v4, 10.f, block);
@@ -348,15 +494,29 @@ int main(int argc, char **argv) {
                     if (!launch()) throw std::runtime_error("V4.1 grouped rejected Q2_K/Q4_K prefill");
                     gpuOutput.ToDevice(DataDevice::CPU);
                     const std::vector<uint8_t> grouped(gpuOutput.cpuData, gpuOutput.cpuData+gpuOutput.GetBytes());
+                    std::vector<uint8_t> comparison = reference;
+                    if (iq1s || iq1m) {
+                        // IQ CPU Q8_K and native CUDA Q8_1 are different
+                        // established quantization contracts. Verify GPU math
+                        // is independent of host placement, then check CPU
+                        // math with the scalar oracle.
+                        for (auto *weight : weights) if (weight) weight->hostMoeUnbound = false;
+                        if (!launch()) throw std::runtime_error("bound upload pipeline rejected IQ1");
+                        for (auto *weight : weights) if (weight) weight->hostMoeUnbound = unbound;
+                        gpuOutput.ToDevice(DataDevice::CPU);
+                        comparison.assign(gpuOutput.cpuData, gpuOutput.cpuData + gpuOutput.GetBytes());
+                        if (comparison != grouped) throw std::runtime_error("host placement changed IQ1 GPU output bits");
+                    }
                     double error2 = 0, reference2 = 0;
                     for (size_t i = 0; i < reference.size()/2; ++i) {
-                        float a = BFloat16BitsToFloat32(((uint16_t*)gpuOutput.cpuData)[i]);
-                        float b = BFloat16BitsToFloat32(((const uint16_t*)reference.data())[i]);
+                        float a = BFloat16BitsToFloat32(((const uint16_t*)grouped.data())[i]);
+                        float b = BFloat16BitsToFloat32(((const uint16_t*)comparison.data())[i]);
                         if (!std::isfinite(a)) throw std::runtime_error("nonfinite grouped output");
                         error2 += (a-b)*(a-b); reference2 += b*b;
                     }
                     const double relative = std::sqrt(error2/std::max(reference2, 1e-20));
-                    printf("Q2/Q4 V4.1 grouped device=%d rows=%d CPU_relative_rms=%.6f\n", device, rows, relative);
+                    printf("V4.1 grouped device=%d rows=%d reference=%s relative_rms=%.6f\n",
+                           device, rows, (iq1s || iq1m) ? "ordinary CUDA" : "CPU", relative);
                     if (relative > .005) throw std::runtime_error("V4.1 grouped differs from NUMA reference");
                     if (rows == 65) {
                         for (bool ordinary : {false, true}) {
@@ -401,8 +561,9 @@ int main(int argc, char **argv) {
                         if (std::sqrt(diff/std::max(norm, 1e-20)) > .005)
                             throw std::runtime_error("V4.1 grouped expert subsets disagree");
                     }
-                    // Keep the last GPU result for the independent scalar oracle below.
-                    memcpy(output.cpuData, grouped.data(), reference.size());
+                    // IQ1 retains its CPU result for the Q8_K scalar oracle;
+                    // its CUDA Q8_1 contract was checked above without tolerance.
+                    if (!iq1s && !iq1m) memcpy(output.cpuData, grouped.data(), reference.size());
                     gpuInput.ToDevice(DataDevice::CPU);
                     if (memcmp(gpuInput.cpuData, inputBits.data(), inputBits.size()*2))
                         throw std::runtime_error("V4.1 grouped changed input");
@@ -414,16 +575,16 @@ int main(int argc, char **argv) {
                         throw std::runtime_error("V4.1 grouped changed packed host weights");
                 }
             }
-            if (cache && rows <= 8) {
+            if (cache && rows < 32) {
                 const std::vector<uint8_t> cpuReference(output.cpuData, output.cpuData + output.GetBytes());
                 Data gpuInput(input), gpuIndex(index), gpuScore(score), gpuOutput(BFLOAT16);
                 gpuInput.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
                 gpuIndex.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
                 gpuScore.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
                 setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", "6", 1);
-                // Prime every route used by this verifier through cold decode
-                // refills; the sixteen-slot budget forces eviction across cases.
-                for (int r = 0; r < rows; ++r) {
+                // Keep the first batch cold to require temporary miss uploads.
+                // Later cases prime routes; sixteen slots still force eviction.
+                for (int r = 0; r < (rows == 2 ? 0 : rows); ++r) {
                     Data x(BFLOAT16, {1, hidden}, DataDevice::CPU, inputBits.data() + r * hidden);
                     Data idsOne(INT32, {1, topk}, DataDevice::CPU, ids.data() + r * topk);
                     Data scoresOne(FLOAT32, {1, topk}, DataDevice::CPU, scores.data() + r * topk);
@@ -434,16 +595,30 @@ int main(int argc, char **argv) {
                             weights.data(), (int)weights.size(), 0))
                         throw std::runtime_error("Q2 cold CUDA decode rejected");
                 }
-                for (const char *split : {"0", "1", "6"}) {
-                    setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", split, 1);
+                const auto phase = rows > 8 ? FastllmMoeRoutePhase::SmallPrefill :
+                    rows == 5 ? FastllmMoeRoutePhase::Draft :
+                    rows == 1 ? FastllmMoeRoutePhase::Decode : FastllmMoeRoutePhase::Verify;
+                for (int repeat = 0; repeat < 3; ++repeat) {
+                    FastllmCudaMoeRouteScope routeScope(phase);
+                    const char *split = repeat == 0 ? "0" : repeat == 1 ? "1" : "6";
+                    if (rows == 1) setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", split, 1);
+                    else unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
+                    uint64_t before[8]{}, after[8]{};
+                    if (!fastllm_moe_cuda_cache_phase_stats(0, int(phase), before))
+                        throw std::runtime_error("phase statistics unavailable");
                     if (!FastllmCudaMergeMOEHybrid(gpuInput, gpuIndex, gpuScore, gpuOutput,
                             weights.data(), (int)weights.size(), 0)) {
-                        if (rows == 1 || std::string(split) != "0")
-                            throw std::runtime_error("Q2 CUDA hybrid request rejected");
-                        continue; // CPU-only verifier intentionally uses its fallback.
+                        throw std::runtime_error("Q2 CUDA hybrid request rejected");
                     }
                     gpuOutput.ToDevice(DataDevice::CPU);
-                    if (std::string(split) == "0" && memcmp(gpuOutput.cpuData, cpuReference.data(), cpuReference.size()))
+                    if (!fastllm_moe_cuda_cache_phase_stats(0, int(phase), after) ||
+                        after[1]-before[1] != uint64_t(rows*topk) ||
+                        after[4]-before[4]+after[5]-before[5] != uint64_t(rows*topk))
+                        throw std::runtime_error("phase counters lost or duplicated routes");
+                    if (rows == 2 && repeat == 0 &&
+                        (after[4]-before[4] == 0 || after[5]-before[5] == 0 || after[6]-before[6] != 0))
+                        throw std::runtime_error("cold verifier did not split uncached experts across CPU and GPU");
+                    if (rows == 1 && repeat == 0 && memcmp(gpuOutput.cpuData, cpuReference.data(), cpuReference.size()))
                         throw std::runtime_error("Q2 cache CPU subset differs from NUMA");
                     double error = 0, norm = 0;
                     for (int i = 0; i < rows * hidden; ++i) {
@@ -452,9 +627,23 @@ int main(int argc, char **argv) {
                         if (!std::isfinite(actual)) throw std::runtime_error("non-finite Q2 cached output");
                         error += (actual - expected) * (actual - expected); norm += expected * expected;
                     }
-                    printf("Q2 CUDA cache rows=%d split=%s relative_rms=%.6f\n", rows, split, std::sqrt(error / std::max(norm, 1e-20)));
+                    printf("Q2 CUDA cache rows=%d split=%s relative_rms=%.6f\n", rows, rows == 1 ? split : "adaptive", std::sqrt(error / std::max(norm, 1e-20)));
                     if (error > .000025 * std::max(norm, 1e-20))
                         throw std::runtime_error("Q2 CUDA hybrid differs from NUMA oracle");
+                }
+                if (rows == 8) {
+                    uint64_t before[4][8]{}, after[8]{};
+                    for (int p = 0; p < 4; ++p)
+                        if (!fastllm_moe_cuda_cache_phase_stats(0, p, before[p]))
+                            throw std::runtime_error("phase snapshot failed");
+                    if (!FastllmCudaMergeMOEHybrid(gpuInput, gpuIndex, gpuScore, gpuOutput,
+                            weights.data(), (int)weights.size(), 0))
+                        throw std::runtime_error("untagged hybrid request rejected");
+                    for (int p = 0; p < 4; ++p)
+                        if (!fastllm_moe_cuda_cache_phase_stats(0, p, after) ||
+                            memcmp(before[p], after, sizeof(after)))
+                            throw std::runtime_error("untagged request polluted phase counters");
+                    gpuOutput.ToDevice(DataDevice::CPU);
                 }
                 // The existing independent scalar oracle below checks cached
                 // output as well as the direct NUMA path.
@@ -521,7 +710,9 @@ int main(int argc, char **argv) {
                 }
             }
             double relative = std::sqrt(error2 / std::max(reference2, 1e-20));
-            printf("Q2/Q4 V4.1 %s rows=%d quant_shared=%d relative_rms=%.6f\n", disk ? "disk" : host ? "CUDA grouped" : "NUMA", rows, quantizeShared, relative);
+            printf("V4.1 %s rows=%d quant_shared=%d relative_rms=%.6f\n",
+                   disk ? "disk" : host && !iq1s && !iq1m ? "CUDA grouped" : "host",
+                   rows, quantizeShared, relative);
             if (relative > (host ? .005 : .01)) throw std::runtime_error("Q2/Q4 MoE differs from scalar activation/GEMM oracle");
         }
 #ifdef USE_CUDA

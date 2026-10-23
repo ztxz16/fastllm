@@ -7,7 +7,7 @@
 #include <map>
 
 namespace {
-// GLM hybrid sparse prefill. BF16 operands are packed losslessly, with FP32
+// SM75 sparse prefill. BF16 operands are packed losslessly, with FP32
 // dot products and a three-component FP16 probability expansion plus residual.
 __device__ __forceinline__ void GlmMma1688(float *d, uint32_t a0, uint32_t a1, uint32_t b) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
@@ -23,10 +23,10 @@ __device__ __forceinline__ uint32_t GlmHalfPair(const half *x) {
 __device__ __forceinline__ uint32_t GlmHalfPair(half a, half b) {
     return uint32_t(__half_as_ushort(a)) | (uint32_t(__half_as_ushort(b)) << 16);
 }
-__global__ void GlmPackVectors(const __nv_bfloat16 *x, half *out, int *exponents, int *bad, int vectors) {
+__global__ void GlmPackVectors(const __nv_bfloat16 *x, half *out, int *exponents, int *bad,
+                              const float *sink = nullptr, int heads = 0) {
     const int v = blockIdx.x, tid = threadIdx.x;
-    if (v >= vectors)
-        return;
+    if (v == 0 && sink && tid < heads && !isfinite(sink[tid])) atomicExch(bad, 1);
     __shared__ float maxima[128];
     __shared__ int exponent;
     float m = 0;
@@ -62,7 +62,8 @@ constexpr int kGlmPrefillSharedBytes =
     (32 * 520 + 16 * 520 + 3 * 32 * 24) * 2 + (2 * 32 * 16 + 32 * 24 + 32 * 3) * 4 + 16 * 2 * 4;
 __global__ void __launch_bounds__(256)
     GlmPrefillAttention(const half *q, const half *kv, const int *qexp, const int *kexp, const int *indices,
-                        int count, int cap, int heads, float scale, __nv_bfloat16 *out) {
+                        int count, int cap, int heads, float scale, __nv_bfloat16 *out,
+                        const float *sink) {
     extern __shared__ unsigned char bytes[];
     half *queries = reinterpret_cast<half *>(bytes);
     half *keys = queries + 32 * 520;
@@ -82,8 +83,8 @@ __global__ void __launch_bounds__(256)
             *reinterpret_cast<const uint4 *>(q + size_t(head + i / 64) * 512 + (i % 64) * 8);
     const int queryExponent = qexp[head + tid / 8];
     if (tid < 32) {
-        state[tid] = -INFINITY;
-        state[32 + tid] = 0.f;
+        state[tid] = sink ? sink[head + tid] : -INFINITY;
+        state[32 + tid] = sink ? 1.f : 0.f;
         state[64 + tid] = 0.f;
     }
     float acc[16][4] = {};
@@ -228,13 +229,24 @@ __global__ void __launch_bounds__(256)
 
 } // namespace
 
-// The hybrid attention entry point validates dimensions, strides, devices and
-// aliasing before this attempt. A false return recomputes all rows in fallback.
-bool FastllmCudaGlm5HybridPrefillAttention(const fastllm::Data &query, const fastllm::Data &latent,
-                                           const fastllm::Data &indices, float scale, fastllm::Data &output) {
+// Callers validate shapes, strides and devices. Input buffers must survive a
+// late packing failure so the caller can recompute every row in fallback.
+bool FastllmCudaSm75PrefillAttention(const fastllm::Data &query, const fastllm::Data &latent,
+                                    const fastllm::Data &indices, float scale, fastllm::Data &output,
+                                    const fastllm::Data *sink) {
     if (FastllmCudaRuntimeArch() != 75 || query.dims[1] < 128 || !std::isfinite(scale) || scale <= 0 ||
         scale > 1)
         return false;
+    if (output.cudaData) {
+        const uintptr_t out = reinterpret_cast<uintptr_t>(output.cudaData);
+        const size_t bytes = query.GetBytes();
+        for (const fastllm::Data *input : {&query, &latent, &indices, sink}) {
+            if (!input) continue;
+            const uintptr_t src = reinterpret_cast<uintptr_t>(input->cudaData);
+            if (src && (out <= src ? src - out < bytes : out - src < input->GetBytes()))
+                return false;
+        }
+    }
     const auto stream = cudaStreamPerThread;
     cudaStreamCaptureStatus capture;
     if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone)
@@ -279,7 +291,8 @@ bool FastllmCudaGlm5HybridPrefillAttention(const fastllm::Data &query, const fas
     auto *ke = qe + batch * heads, *unsafe = ke + capacity;
     FastllmCudaHybridCheck(cudaMemsetAsync(unsafe, 0, sizeof(int), stream));
     GlmPackVectors<<<capacity, 128, 0, stream>>>(static_cast<const __nv_bfloat16 *>(latent.cudaData), kv, ke,
-                                                 unsafe, capacity);
+                                                 unsafe,
+                                                 sink ? static_cast<const float *>(sink->cudaData) : nullptr, heads);
     output.dataType = fastllm::BFLOAT16;
     output.UpdateUnitSize();
     output.Resize(query.dims);
@@ -289,7 +302,7 @@ bool FastllmCudaGlm5HybridPrefillAttention(const fastllm::Data &query, const fas
         const int n = std::min(batch, rows - first);
         GlmPackVectors<<<n * heads, 128, 0, stream>>>(static_cast<const __nv_bfloat16 *>(query.cudaData) +
                                                           size_t(first) * heads * 512,
-                                                      q, qe, unsafe, n * heads);
+                                                      q, qe, unsafe);
         int invalid = 0;
         FastllmCudaHybridCheck(
             cudaMemcpyAsync(&invalid, unsafe, sizeof(int), cudaMemcpyDeviceToHost, stream));
@@ -299,7 +312,8 @@ bool FastllmCudaGlm5HybridPrefillAttention(const fastllm::Data &query, const fas
         GlmPrefillAttention<<<dim3(heads / 32, n), 256, kGlmPrefillSharedBytes, stream>>>(
             q, kv, qe, ke, static_cast<const int *>(indices.cudaData) + size_t(first) * count, count,
             capacity, heads, scale,
-            static_cast<__nv_bfloat16 *>(output.cudaData) + size_t(first) * heads * 512);
+            static_cast<__nv_bfloat16 *>(output.cudaData) + size_t(first) * heads * 512,
+            sink ? static_cast<const float *>(sink->cudaData) : nullptr);
         FastllmCudaHybridCheck(cudaGetLastError());
     }
     return true;

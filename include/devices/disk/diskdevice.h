@@ -36,6 +36,8 @@ namespace fastllm {
         uint64_t diskBytes = 0, uploads = 0, cpuEvictions = 0, cudaEvictions = 0;
         // Compact hierarchy: retained host/GPU overlap and selected GPU-to-RAM moves.
         uint64_t cpuCudaOverlapBytes = 0, cudaDemotions = 0, cudaDemotionBytes = 0;
+        uint64_t cpuWorkspaceBytes = 0, cpuBufferReuses = 0, cpuBufferAllocations = 0;
+        uint64_t cpuReclaims = 0, asyncMaintenance = 0;
     };
     // CUDA bytes are summed across devices; the configured CUDA budget is per GPU.
     DiskMoeCacheStats GetDiskMoeCacheStats();

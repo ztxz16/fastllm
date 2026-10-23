@@ -1,4 +1,7 @@
 #include "utils/hybrid_moe.h"
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#endif
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
@@ -6,6 +9,14 @@
 #endif
 
 namespace fastllm {
+bool IsSharedHostMoeDevice(const std::string &device) {
+    if (device == "numa" || device.rfind("numa:", 0) == 0) return true;
+#ifdef USE_NUMAS
+    return device == "cpu";
+#else
+    return false;
+#endif
+}
 bool HybridMoeMeasuredNativePrefill(const Data *gate, const Data *down, HybridMoeMath math) {
     if (!gate || !down || gate->dataType != down->dataType) return false;
     switch (gate->dataType) {
@@ -30,11 +41,37 @@ void HybridMoeCachePlan::Add(const std::vector<Data *> &weights,
     if (device != "cpu" && !numa) return;
     layers.push_back({weights.data(), static_cast<int>(weights.size()), cacheDevice});
     allNuma = allNuma && numa;
+    allCpu = allCpu && device == "cpu";
 }
 bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeights,
                                  bool allowStreaming) const {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
     if (layers.empty()) return false;
+#ifdef USE_NUMAS
+    HostMoePlacementScope placement(allCpu);
+#endif
+    std::function<void()> registerWeights = allNuma ? registerNumaWeights : std::function<void()>{};
+#ifdef USE_NUMAS
+    if (allCpu) {
+        // Registration belongs to the host backend, regardless of the model's
+        // math profile. Keep the cache backend's snapshot/packing order intact.
+        for (const auto &layer : layers)
+            for (int i = 0; i < layer.count; ++i) {
+                const auto *w = layer.weights[i];
+                if (w && (w->isDiskWeight || !IsNumasLinearWeightSupported(w) ||
+                    (!w->numasData.empty() && !w->hostMoeUnbound))) return false;
+            }
+        registerWeights = [&] {
+            if (registerNumaWeights) registerNumaWeights();
+            std::vector<std::pair<Data *, std::string>> pending;
+            for (const auto &layer : layers)
+                for (int i = 0; i < layer.count; ++i)
+                    if (layer.weights[i] && !IsNumasLinearWeightRegistered(layer.weights[i]))
+                        pending.push_back({layer.weights[i], i % 2 ? "linear" : "linearSwiglu"});
+            if (!pending.empty()) RegisterHostMoeWeightBatch(pending, true);
+        };
+    }
+#endif
     std::vector<FastllmCudaMoeCacheLayer> cacheLayers;
     cacheLayers.reserve(layers.size());
     for (const auto &layer : layers) {
@@ -44,8 +81,10 @@ bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeight
     }
     // The backend retains format-dependent snapshot/registration order and
     // publishes a cache only after validation. Failure leaves host fallback intact.
-    return FastllmCudaPrepareMoeCache(cacheLayers.data(), static_cast<int>(cacheLayers.size()),
-        allNuma ? registerNumaWeights : std::function<void()>{}, allowStreaming);
+    if (!FastllmCudaPrepareMoeCache(cacheLayers.data(), static_cast<int>(cacheLayers.size()),
+            registerWeights, allowStreaming)) return false;
+    return FastllmCudaSetMoeCacheBudgetFraction(const_cast<Data **>(layers.front().weights),
+        layers.front().count, budgetFraction);
 #else
     return false;
 #endif
@@ -91,9 +130,10 @@ void HybridMoePrefetch(std::vector<std::vector<Data *>> &weights,
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
     if (!pipelinedPrefill || rows < 1024 || layer < 0 || layer >= endLayer ||
         layer >= int(weights.size()) ||
-        (expertDevice != "numa" && expertDevice.rfind("numa:", 0) != 0)) return;
+        !IsSharedHostMoeDevice(expertDevice)) return;
     auto &table = weights[layer];
     if (table.size() <= 2) return;
+    HostMoePlacementScope placement(table[2]);
     FastllmCudaPrefetchMoeGGUFHost(table.data(), int(table.size()) / 2 - 1);
 #endif
 }
@@ -101,6 +141,9 @@ bool RunHybridMoe(const Data &input, const Data &index, const Data &score,
                   Data &output, Data **weights, int count, int layer,
                   const std::function<void()> &launchParallel) {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+#ifdef USE_NUMAS
+    HostMoePlacementScope placement(weights && count >= 4 ? weights[2] : nullptr);
+#endif
     return FastllmCudaMergeMOEHybrid(input, index, score, output, weights, count,
                                    layer, launchParallel);
 #else
@@ -112,6 +155,9 @@ bool RunHybridMoeOnDevices(const Data &input, const Data &index, const Data &sco
                           const std::vector<int> &devices,
                           const std::function<void()> &launchParallel) {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+#ifdef USE_NUMAS
+    HostMoePlacementScope placement(weights && count >= 4 ? weights[2] : nullptr);
+#endif
     return FastllmCudaMergeMOEHybridOnDevices(input, index, score, output,
         weights, count, layer, devices, launchParallel);
 #else

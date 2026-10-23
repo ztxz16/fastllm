@@ -1197,6 +1197,11 @@ namespace fastllm {
         int windowSize = V41Int(intParams, "windowSize", 128);
         AssertInFastLLM(chunk.dims.size() == 3, "DeepSeekV41WindowStore error: chunk should be [b, s, d].\n");
         int bsz = chunk.dims[0], seqlen = chunk.dims[1], dim = chunk.dims[2];
+        int rowCount = V41Int(intParams, "rowCount", -1);
+        if (rowCount == -1) rowCount = seqlen;
+        AssertInFastLLM(windowSize > 0 && rowCount >= 0 && rowCount <= seqlen,
+                        "DeepSeekV41WindowStore error: invalid prefix length or window.\n");
+        if (rowCount == 0) return;
         if (ring.dims.size() != 3 || ring.dims[0] != bsz || ring.dims[1] != windowSize || ring.dims[2] != dim ||
             ring.cpuData == nullptr) {
             ring.dataType = chunk.dataType;
@@ -1206,7 +1211,7 @@ namespace fastllm {
         AssertInFastLLM(ring.dataType == chunk.dataType, "DeepSeekV41WindowStore error: dtype mismatch.\n");
         int unit = chunk.unitSize;
         for (int b = 0; b < bsz; b++) {
-            for (int i = std::max(0, seqlen - windowSize); i < seqlen; i++) {
+            for (int i = std::max(0, rowCount - windowSize); i < rowCount; i++) {
                 int slot = (startPos + i) % windowSize;
                 memcpy(ring.cpuData + ((uint64_t)b * windowSize + slot) * dim * unit,
                        chunk.cpuData + ((uint64_t)b * seqlen + i) * dim * unit,

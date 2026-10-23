@@ -41,9 +41,14 @@ class UnrestrictedSamplingTest(unittest.IsolatedAsyncioTestCase):
         model = SamplingModel()
         model.default_generation_config = {**model.default_generation_config, 'top_k': 0}
         instance = completion(model)
-        await instance.create_anthropic_message(AnthropicMessageRequest(
-            model=instance.model_name, messages=[{'role':'user','content':'answer'}], max_tokens=128), RawRequest())
-        self.assertEqual(model.sampling_args['top_k'], 152576)
+        for req_type, method in (
+                (ChatCompletionRequest, instance.create_chat_completion),
+                (AnthropicMessageRequest, instance.create_anthropic_message)):
+            with self.subTest(api=req_type.__name__):
+                await method(req_type(model=instance.model_name,
+                    messages=[{'role':'user','content':'answer'}], max_tokens=128), RawRequest())
+                self.assertEqual(model.sampling_args['top_k'], 152576)
+                self.assertTrue(model.sampling_args['do_sample'])
 
 class NativeVocabularyTest(unittest.TestCase):
     @classmethod
