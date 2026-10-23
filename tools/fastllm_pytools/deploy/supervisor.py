@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from .process import process_identity, owned, group_members, signal_owned, stop_records, write_json
+from .process import process_identity, owned, group_members, signal_owned, stop_records, write_json, configure_nofile
 from .config import control_pythonpath
 
 
@@ -68,7 +68,7 @@ def status(config):
     return {'name': state['name'], 'phase': phase, 'run_dir': state['run_dir'],
             'supervisor_alive': supervisor_alive, 'replica_processes': alive,
             'error': error, 'started_at': manifest.get('started_at'),
-            'finished_at': manifest.get('finished_at')}
+            'finished_at': manifest.get('finished_at'), 'resource_limits': manifest.get('resource_limits')}
 
 
 def stop_state(state, timeout):
@@ -126,6 +126,7 @@ def start(config):
         previous = read(root/'state.json')
         if previous and (owned(previous['supervisor']) or any(group_members(r) for r in records_for(previous))):
             raise RuntimeError('Deployment is already active; inspect status or stop it first')
+        configure_nofile(config)  # Fail before loading any model; leave the caller's limits unchanged.
         check_ports(config)
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
         directory = root/'runs'/f'{stamp}_{uuid.uuid4().hex[:8]}'
@@ -231,6 +232,10 @@ def supervise(directory):
         raise TimeoutError(f'Readiness timeout: {url}: {last_error}')
 
     try:
+        # All workers and the router inherit this from the detached supervisor.
+        manifest['resource_limits'] = {'nofile': configure_nofile(config, apply=True)}
+        print('Deployment resource limits: ' + json.dumps(manifest['resource_limits']), flush=True)
+        save()
         for replica in config['replicas']:
             launch(replica['name'], replica['command'], replica['env'], replica['cwd'])
             if config['sequential_start']:

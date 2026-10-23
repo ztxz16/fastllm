@@ -91,7 +91,7 @@ def resolve_config(data, source):
     source = Path(source).resolve()
     base = source.parent
     fields(data, ('schema_version', 'name', 'state_dir', 'serve_args', 'env', 'worker', 'replicas',
-                  'router', 'startup_timeout_seconds', 'stop_timeout_seconds', 'sequential_start'), 'deployment')
+                  'router', 'startup_timeout_seconds', 'stop_timeout_seconds', 'sequential_start', 'nofile'), 'deployment')
     if data.get('schema_version') != 1 or not re.fullmatch(r'[A-Za-z0-9_-]+', data.get('name', '')):
         raise ValueError('Expected schema_version=1 and a simple deployment name')
     args = parse_serve_args(data['serve_args'])
@@ -175,10 +175,13 @@ def resolve_config(data, source):
     sequential = data.get('sequential_start', True)
     if type(sequential) is not bool:
         raise ValueError('sequential_start must be a boolean')
+    nofile = data.get('nofile')
+    if nofile is not None:
+        integer(nofile, 'nofile')
     return {'schema_version': 1, 'name': data['name'], 'source_config': str(source),
             'state_dir': path_from(data.get('state_dir', '.ftllm-deploy/' + data['name']), base),
             'replicas': roles, 'router': router, 'api_key': args.api_key,
-            'serve_args': list(data['serve_args']), 'sequential_start': sequential,
+            'serve_args': list(data['serve_args']), 'sequential_start': sequential, 'nofile': nofile,
             'startup_timeout_seconds': seconds(data.get('startup_timeout_seconds', 900), 'startup_timeout_seconds'),
             'stop_timeout_seconds': seconds(data.get('stop_timeout_seconds', 30), 'stop_timeout_seconds')}
 

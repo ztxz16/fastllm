@@ -7,6 +7,33 @@ import time
 from pathlib import Path
 
 
+def configure_nofile(config, apply=False):
+    """Budget proxy sockets before loading workers; change only the soft limit."""
+    import resource
+    active = sum(replica['max_inflight'] for replica in config['replicas'])
+    queued = len(config['replicas']) * config['router']['queue_limit_per_replica']
+    # An active proxy owns downstream + upstream sockets; queued requests own
+    # only downstream sockets. Reserve descriptors for health, logs and idle
+    # connections. This is a capacity estimate, not a global connection cap.
+    required = 2 * active + queued + 256
+    requested = config.get('nofile')
+    if requested is not None and requested < required:
+        raise ValueError(f'nofile={requested} is below the deployment capacity requirement {required}')
+    target = requested if requested is not None else required
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and target > hard:
+        raise RuntimeError(f'RLIMIT_NOFILE hard limit {hard} is below required {target}; '
+                           'raise the launcher/container open-file limit before starting deploy')
+    effective = soft if soft == resource.RLIM_INFINITY else max(soft, target)
+    if apply and effective != soft:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (effective, hard))
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f'Cannot raise RLIMIT_NOFILE soft limit from {soft} to {effective}: {error}') from error
+    return {'required': required, 'requested': requested, 'soft_before': soft,
+            'soft': effective, 'hard': hard}
+
+
 def write_json(path, value):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
