@@ -29,13 +29,13 @@ DeepSeek-V4.1 的 `--auto` 默认使用 **`kv_cache_dtype=fp4`**：长期压缩 
 
 DeepSeek-V4.1 的 `fast_prefill` 沿用已有近似注意力语义，可能改变 logits。可用 `--no_fast_prefill` 关闭；`--dspark 0` 或 `--speculative_algorithm off` 关闭推测解码。显式上下文、草稿数、阈值和 JSON 配置中的 `fast_prefill: false` 均优先；`--threads 64` 可固定线程数。预算不足时先调整自动 chunk、缓存和专家放置，仍放不下则报错，不自动缩短 1M 上下文。
 
-DeepSeek-V4.1 的显存估算按 KV source 层统计共享的压缩 KV 和 index key，并计入原生缓存扩容的容量余量及新旧缓冲重叠。Indexer 打分按原生分块预算估算（默认 128 MiB，遵循 `FASTLLM_DSV41_INDEX_SCORE_MB` 和 `FASTLLM_DSV41_INDEX_CHUNK`），不直接预留完整的 `chunk × context` 分数矩阵。原模型的 FP8 投影按实际保留的精度及 scale 预算，输出头、路由和其他强制展开的投影仍按原生精度计入。DeepSeek-V4.1 磁盘专家的自动 chunk 候选为 **8192、4096、2048、1024、512、256**；其他路径的候选上限保持 4096。候选不超过上下文长度；显式指定数值时不会自动降低。
+DeepSeek-V4.1 的显存估算按 KV source 层统计共享的压缩 KV 和 index key，并计入原生缓存扩容的容量余量及新旧缓冲重叠。Indexer 打分按原生分块预算估算（默认 128 MiB，遵循 `FASTLLM_DSV41_INDEX_SCORE_MB` 和 `FASTLLM_DSV41_INDEX_CHUNK`），不直接预留完整的 `chunk × context` 分数矩阵。原模型的 FP8 投影按实际保留的精度及 scale 预算，输出头、路由和其他强制展开的投影仍按原生精度计入。DeepSeek-V4.1 的自动 chunk 候选为 **8192、4096、2048、1024、512、256**；其他模型的候选上限保持 4096。候选不超过上下文长度；显式指定数值时不会自动降低。
 
 规划日志分别输出 `kv_logical_bytes_per_device`（有效载荷）、`kv_capacity_bytes_per_device`（含增长余量的容量）和 `kv_reallocation_bytes_per_device`（扩容时的旧缓冲重叠），避免将有效 KV 大小和规划峰值混为一谈。
 
 DeepSeek-V4.1 原生 FP8/MXFP4 模型在单请求、非 TP、BF16、NUMA/磁盘专家和 `fast_prefill` 路径下，按 attention、WoA、MoE 分阶段的临时缓冲峰值估算工作区。主机专家使用复用的 256 行工作缓冲，避免按 chunk 为每个路由重复计入 GPU 中间张量；WoA 保留 FP32 fallback 的权重展开和分块空间。调试 dump、其他精度、GPU 驻留专家等路径继续采用通用保守估算。CUDA graph 隐式启用的 GPU embedding 也计入预算。
 
-DeepSeek 混推的 `--auto` 在上下文预算不变的前提下优先选择最大的可行 chunk，候选顺序为 8192、4096、2048、1024、512、256；显式 chunk 优先。自动拓扑在同一主机后端支持该 chunk 时优先 PP，显式 `--tp` 或 `--device` 不受影响。磁盘专家仍比较正常 embedding 与 `low_gpu_mem`，为 chunk 和专家缓存腾出显存；全部专家可放 GPU 时保留正常模式。此策略保留默认 `gpu_mem_ratio`、512 MiB guard、完整上下文 KV 及扩容重叠预算，不把短请求的实测显存当作 1M 上下文上限。
+DeepSeek 混推的 `--auto` 在上下文预算不变的前提下，先争取 chunk 达到 **512**，再优先将**每卡专家缓存补到 3 GiB**，随后选择最大的可行 chunk，并将剩余显存分给缓存。候选 chunk 为 8192、4096、2048、1024、512、256，不超过上下文长度；预算不足以满足目标时尽量接近，不因此拒绝可行方案，也不为凑缓存把已可行的 512 降到 256。全部专家驻留 GPU 时无需额外缓存。显式 chunk、缓存、驻留和内存限制优先。这一排序同时用于各拓扑内部和跨拓扑选择；同等 chunk／缓存优先级下自动拓扑优先 PP，显式 `--tp` 或 `--device` 不受影响。主机专家方案会比较正常 embedding 与 `low_gpu_mem`，为 chunk 和专家缓存腾出显存；全部专家可放 GPU 时保留正常模式。此策略保留默认 `gpu_mem_ratio`、512 MiB guard、完整上下文 KV 及扩容重叠预算，不把短请求的实测显存当作 1M 上下文上限。
 
 主存优先使用 NUMA（构建支持时），否则使用 CPU；超大 PLE/Engram 表优先按需读取，减少启动搬运和主存占用，主存仍放不下时再考虑磁盘专家缓存。CUDA Graph 默认开启，原有 `FASTLLM_CUDA_GRAPH` 显式设置仍优先。原有运行时检查继续决定 Graph 能否实际捕获。
 

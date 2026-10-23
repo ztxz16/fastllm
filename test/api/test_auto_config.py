@@ -102,6 +102,77 @@ class AutoConfigTest(unittest.TestCase):
                 self.assertEqual(a.cuda_slab, expected)
                 self.assertEqual(p['cuda_slab'], expected)
 
+    def deepseek_cache_fixture(self):
+        self.g.family, self.g.experts = 'deepseek_v41', 256
+        self.g.activation_width = 512 * 1024
+        self.costs = ([4 * GiB] * 4, *self.costs[1:])
+        return ('--moe_device', 'numa', '--moe_device_layers', '-1')
+
+    def test_deepseek_cache_target_precedes_larger_chunk(self):
+        options = self.deepseek_cache_fixture()
+        p = self.resolve(self.args(*options))
+        large = self.resolve(self.args(*options, '--chunked_prefill_size', '2048'))
+        small = self.resolve(self.args(*options, '--chunked_prefill_size', '512'))
+        self.assertEqual((p['mode'], p['chunked_prefill_size']), ('pp', 1024))
+        self.assertGreaterEqual(p['moe_cuda_cache'], 3 * GiB)
+        self.assertLess(large['moe_cuda_cache'], 3 * GiB)
+        # Once 3 GiB fits, grow the chunk rather than maximizing cache alone.
+        self.assertGreater(small['moe_cuda_cache'], p['moe_cuda_cache'])
+
+    def test_deepseek_chunk_floor_precedes_cache_target_and_can_fall_back(self):
+        options = (*self.deepseek_cache_fixture(), '--device', 'cuda:0')
+        self.gpu[0]['free'] = 21 * GiB // 4
+        p = self.resolve(self.args(*options))
+        small = self.resolve(self.args(*options, '--chunked_prefill_size', '256'))
+        self.assertEqual(p['chunked_prefill_size'], 512)
+        self.assertLess(p['moe_cuda_cache'], 3 * GiB)
+        self.assertGreaterEqual(small['moe_cuda_cache'], 3 * GiB)
+        # Both targets are soft: retain a safe plan when even 512 cannot fit.
+        self.gpu[0]['free'] = 5 * GiB // 2
+        fallback = self.resolve(self.args(*options))
+        self.assertEqual(fallback['chunked_prefill_size'], 256)
+        self.assertLessEqual(fallback['gpu_estimated_bytes'][0], fallback['gpu_budget_bytes'][0])
+
+    def test_deepseek_cache_targets_keep_explicit_values_and_short_context(self):
+        options = (*self.deepseek_cache_fixture(), '--device', 'cuda:0')
+        cases = [(('--moe_cuda_cache', '0'), 2048, 0),
+                 (('--chunked_prefill_size', '2048'), 2048, None),
+                 (('--chunked_prefill_size', '256', '--moe_cuda_cache', '1g'), 256, GiB),
+                 (('--max_context_length', '128'), 128, None)]
+        for flags, chunk, cache in cases:
+            with self.subTest(flags=flags):
+                a = self.args(*options, *flags)
+                p = self.resolve(a)
+                self.assertEqual(a.chunked_prefill_size, chunk)
+                if cache is not None:
+                    self.assertEqual(a.moe_cuda_cache, cache)
+                if chunk == 128:
+                    self.assertEqual((a.max_context_length, a.tokens), (128, 128))
+                self.assertLessEqual(p['gpu_estimated_bytes'][0], p['gpu_budget_bytes'][0])
+                self.assertLessEqual(p['host_estimated_bytes'], p['host_budget_bytes'])
+
+    def test_deepseek_cache_priority_applies_across_topologies(self):
+        options = self.deepseek_cache_fixture()
+        original = memory.plan
+        def plan(args, model, costs, mode, *rest, **kwargs):
+            # Present feasible per-topology results whose priorities differ.
+            trial = copy.copy(args)
+            trial.chunked_prefill_size = 2048 if mode == 'pp' else 512
+            trial.moe_cuda_cache = GiB if mode == 'pp' else 3 * GiB
+            return original(trial, model, costs, mode, *rest, **kwargs)
+        with patch.object(memory, 'plan', side_effect=plan):
+            p = self.resolve(self.args(*options))
+            self.assertEqual((p['mode'], p['chunked_prefill_size'], p['moe_cuda_cache']),
+                             ('tp', 512, 3 * GiB))
+            explicit = self.resolve(self.args(*options, '--tp', 'off'))
+            self.assertEqual(explicit['mode'], 'pp')
+
+    def test_deepseek_full_gpu_does_not_need_cache_target(self):
+        self.g.family = 'deepseek_v41'
+        p = self.resolve(self.args('--device', 'cuda:0'))
+        self.assertEqual(p['resident_layers'], self.g.layers)
+        self.assertEqual(p['moe_cuda_cache'], 0)
+
     def test_deepseek_implicit_embedding_is_charged_before_chunk_selection(self):
         self.g.family = 'deepseek_v41'
         def costs(tensors, model, a):

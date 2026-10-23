@@ -260,6 +260,16 @@ def latency_score(candidate, model, costs, args, mode, mapping, hardware, peers)
     return prefill + 512 * decode * max(1, args.max_batch)
 
 
+def _deepseek_priority(candidate, model):
+    """Soft targets shared by topology-local and final candidate selection."""
+    chunk = candidate["chunked_prefill_size"]
+    # Fully resident experts need no additional cache. Otherwise fill the
+    # per-GPU cache target before spending more memory on a larger chunk.
+    cache = (3 * memory.GiB if candidate["resident_layers"] == model.layers
+             else candidate["moe_cuda_cache"])
+    return min(chunk, 512), min(cache, 3 * memory.GiB), chunk
+
+
 def kv_residencies(args, model):
     """Supported exact streaming pools, without changing context capacity."""
     from .util import _fastllm_env_flag_enabled
@@ -488,12 +498,9 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                             # available when host memory cannot hold all experts.
                             placement = (2 if p["resident_layers"] == model.layers else
                                          int(p["resident_layers"] == 0 and p["moe_cuda_cache"] > 0)) if prefer_cache else 0
-                            # DeepSeek prefill amortizes indexed attention and
-                            # MoE dispatch across the chunk for all host-backed
-                            # expert backends. Preserve context, then maximize
-                            # the feasible chunk size.
-                            chunk = p["chunked_prefill_size"] if model.family == "deepseek_v41" else 0
-                            return (chunk, placement, -score, -p["host_estimated_bytes"], -p["resident_layers"])
+                            priority = (_deepseek_priority(p, model) if model.family == "deepseek_v41"
+                                        else (0, 0, 0))
+                            return (priority, placement, -score, -p["host_estimated_bytes"], -p["resident_layers"])
                         variants = [prepared]
                         if (model.family == "deepseek_v41" and
                                 not prepared.low_gpu_mem and not {"cuda_embedding", "low_gpu_mem"} & explicit):
@@ -549,10 +556,10 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     # Retain TP as a capacity fallback; explicit TP produces no PP candidates.
     eligible = choices
     if model.family == "deepseek_v41":
-        largest_chunk = max(item[2]["chunked_prefill_size"] for item in eligible)
-        eligible = [item for item in eligible if item[2]["chunked_prefill_size"] == largest_chunk]
+        priority = max(_deepseek_priority(item[2], model) for item in eligible)
+        eligible = [item for item in eligible if _deepseek_priority(item[2], model) == priority]
         # PP avoids the per-layer TP collectives for host-backed experts. Keep
-        # it for automatic topology selection when it supports the same chunk;
+        # it when automatic candidates have the same chunk/cache priority;
         # explicit --tp/--device candidates remain untouched.
         if not {"tp", "device"} & explicit:
             pp = [item for item in eligible if item[2]["mode"] == "pp"]
@@ -569,7 +576,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if any("kvmem" in item[2] for item in eligible):
         eligible = [item for item in eligible if "kvmem" in item[2] or item[3]]
     if model.family == "deepseek_v41" and not {"tp", "device"} & explicit:
-        # Keep the fastest prediction at the largest feasible chunk; the
+        # Keep the fastest prediction after the chunk/cache preferences; the
         # generic ten-percent tie window can otherwise collapse PP to one GPU.
         _, chosen, result, _ = min(eligible, key=lambda item: (
             item[0], item[2]["mode"] == "tp", -len(item[2]["gpu_budget_bytes"])))
@@ -604,7 +611,8 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                            "ranking": "estimated latency; not measured throughput", "mtp": args.mtp}
     if model.family == "deepseek_v41":
         result["automatic"]["ranking"] = (
-            "non-disk experts first; largest feasible chunk at fixed context; PP preferred for "
+            "non-disk experts first; fixed context; chunk up to 512, then per-GPU expert cache up to 3 GiB, "
+            "then largest feasible chunk; PP preferred for "
             "automatic host-backed hybrid; estimated latency"
         )
     result["automatic"]["kv_streaming"] = "kvmem" in result
