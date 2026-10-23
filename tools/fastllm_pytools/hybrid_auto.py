@@ -975,11 +975,14 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                         layer_device(owner, resident, mapping) if owner < model.layers else next(reversed(mapping))]
                     for d in expert_targets:
                         used[d] += math.ceil(resident_bytes / len(expert_targets)) + allocation_overhead
+            cooperative_verify = mode == "pp" and len(mapping) > 1 and getattr(args, "dspark", 0) > 0
             for d in mapping:
                 used[d] += reallocation[d]
                 # Upload rings are created on the main device executing the
-                # host-backed expert layer, not on GPU-only pipeline stages.
-                if not host_by_device[d]:
+                # host-backed expert layer. DSpark's cooperative verify can
+                # also stage experts on GPU-only PP stages; retain the same
+                # conservative transport bound for those helper devices.
+                if not host_by_device[d] and not cooperative_verify:
                     used[d] -= transport
             if host_experts == 0 and (not allow_full_gpu or streaming):
                 continue

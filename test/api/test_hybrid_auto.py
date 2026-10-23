@@ -695,6 +695,24 @@ class HybridAutoTest(unittest.TestCase):
         self.assertEqual(packed["gpu_estimated_bytes"][1] - native["gpu_estimated_bytes"][1],
                          96 * 13 * MiB + 272 * MiB)
 
+    def test_v41_dspark_transport_covers_gpu_only_helper_stages(self):
+        g = auto.geometry(self.dspark_metadata(), "float16", 0)
+        a = args(tokens=4096, max_context_length=4096, moe_device_layers=2,
+                 moe_cuda_cache=0, dspark=5)
+        costs = ([GiB] * 4, [MiB] * 4, 0, 0, MiB, False)
+        gpu = {d: dict(total=16 * GiB, free=16 * GiB) for d in (0, 1)}
+        ram = dict(total=64 * GiB, available=64 * GiB)
+        native = auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+        g.gguf_expert_bytes = {2: 13 * MiB}
+        packed = auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+        for device in (0, 1):
+            self.assertEqual(packed["gpu_estimated_bytes"][device] - native["gpu_estimated_bytes"][device],
+                             96 * 13 * MiB + 272 * MiB)
+        # A helper's staging budget cannot be spent again on resident weights/cache.
+        gpu[0]["free"] = packed["gpu_estimated_bytes"][0] - 1
+        with self.assertRaises(ValueError):
+            auto.plan(a, g, costs, "pp", {0: 1, 1: 1}, gpu, ram)
+
     def test_v41_resident_gguf_prefill_uses_phase_workspace(self):
         metadata = self.dspark_metadata()
         metadata['quantization_config'] = dict(quant_method='fp8', expert_dtype='fp4',

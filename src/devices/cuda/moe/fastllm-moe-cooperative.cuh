@@ -6,32 +6,6 @@ bool SupportsCooperativeMoe(const OffloadLayout &layout) {
     return layout.glm5 || (layout.deepSeekV41 && layout.weightType == fastllm::DATA_GGUF_FORMAT);
 }
 
-// Scheduling/transfers operate on routes; adapters retain each format's math.
-bool ComputeCooperativeGGUF(const fastllm::Data &input, fastllm::Data &gate,
-        fastllm::Data &output, const OffloadLayout &layout,
-        FastllmCudaMoeGGUFCacheView view, const float *scores, int topk,
-        float *perExpert, const int *hostRoutes, int count) {
-    if (!layout.deepSeekV41)
-        return ComputeGGUFExperts(input, gate, output, layout, view, scores, topk, perExpert);
-    // V4.1's canonical adapter consumes contiguous rows; cooperative ownership
-    // is sparse. Reuse its one-route path, retaining block-32 FP8, Q8, BF16,
-    // score placement and ordered reduction boundaries.
-    const auto *slots = view.routeSlots;
-    view.routeMap = nullptr;
-    view.routeCount = 0;
-    view.q8InputPrepared = false;
-    for (int i = 0; i < count; ++i) {
-        const int route = hostRoutes[i];
-        fastllm::Data row;
-        row.FakeFrom(input, size_t(route / topk) * layout.hidden * sizeof(uint16_t));
-        row.Resize({1, layout.hidden});
-        view.routeSlots = slots + i;
-        if (!ComputeGGUFExperts(row, gate, output, layout, view, scores + route, 1,
-                perExpert + size_t(route) * layout.hidden)) return false;
-    }
-    return true;
-}
-
 struct CooperativeMoe {
     using Rank = FastllmCudaMoeExpertParallel::Rank;
     using Estimate = fastllm::MoeDecodeScheduler::Estimate;
@@ -105,7 +79,9 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
     using Scheduler = MoeDecodeOverlapScheduler;
     const auto &layout = group.LayerLayout(table);
     const int rows = input.dims[0], hidden = layout.hidden;
-    if (!SupportsCooperativeMoe(layout) || !origin.frequencyActive ||
+    const bool layerAdmission = layout.deepSeekV41 && layout.weightType == DATA_GGUF_FORMAT &&
+        rows > 1 && allowedDevices && allowedDevices->size() > 1;
+    if (!SupportsCooperativeMoe(layout) || (!origin.frequencyActive && !layerAdmission) ||
         !origin.hostKeyToSlot || input.dataType != BFLOAT16 ||
         !(NativeSharedRecords(group) || (layout.weightType == DATA_GGUF_FORMAT &&
           group.sharedLayout.shards == 0 && GGUFHybridShape(layout))) ||
@@ -174,6 +150,7 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
         if (!entry) entry = std::make_unique<CooperativeMoe::DeviceWork>();
         if (!entry->Prepare(cache->device, hidden)) { (void)cudaGetLastError(); return false; }
         auto &w = entry->rank;
+        w.admitted = false;
         w.cache = cache; w.group = &group; w.table = table; w.rows = rows; w.topk = topk;
         if (cache->admissionDone) checkCudaErrors("Cooperative MoE peer residency", cudaEventSynchronize(cache->admissionDone));
         const int capacity = std::min(routes, layout.experts);
@@ -245,6 +222,26 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
         }
     }
     const int cpuRoutes = std::count(r.Owners(), r.Owners() + routes, -1);
+    // Preserve V4.1 verify's bounded admission policy: one reused miss per
+    // layer, on its permanent PP owner. Enabling another execution device
+    // must not turn a small verify into a global cache-refill burst.
+    int candidate = -1;
+    if (layerAdmission && origin.slots > 0) {
+        if (r.heat.size() != group.totalRecords) r.heat.assign(group.totalRecords, 0);
+        unsigned bestHeat = 0;
+        for (int i = 0; i < routes; ++i) {
+            auto &heat = r.heat[base + r.Indices()[i]];
+            heat = std::min(heat + 1, 65535u);
+            if (r.Resident()[i] < 0 && heat >= 2 && heat > bestHeat) {
+                bestHeat = heat; candidate = i;
+            }
+        }
+        int interval = 31;
+        while (std::gcd(interval, int(group.tableKeys.size())) != 1) ++interval;
+        const double cpuBudget = cpuRoutes * state.cpu[timingLayer].cpuExpert.us;
+        if (r.refill.initialized && cpuBudget > 0 && r.refill.us > cpuBudget &&
+            r.calls % interval != 0) candidate = -1;
+    }
     auto allocate = [&](Data &data, DataType type, std::vector<int> dims, int device) {
         data.dataType = type; data.Resize(dims);
         data.ToDevice(CUDA, {device}, false); data.Allocate(false);
@@ -285,13 +282,14 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
     checkCudaErrors("Cooperative MoE output device", cudaSetDevice(origin.device));
     allocate(r.ids, INT32, {rows, topk}, origin.device);
     allocate(r.owners, INT32, {rows, topk}, origin.device);
+    if (candidate >= 0) allocate(r.lookup, INT32, {2 * FastllmCudaMoeExpertParallel::maxRoutes}, origin.device);
     if (work.size() > 1) allocate(root.received, FLOAT32, {routes, hidden}, origin.device);
     allocate(output, BFLOAT16, {rows, hidden}, origin.device);
     // Only the expert's permanent owner updates its frequency. Temporary
     // miss offload may still choose any device independently of cache placement.
     for (auto *device : work) {
         auto &cache = *device->rank.cache;
-        if (!cache.frequencyActive || !cache.frequency) continue;
+        if (layerAdmission || !cache.frequencyActive || !cache.frequency) continue;
         if (group.expertDevices.empty() && &cache != &origin) continue;
         std::array<int, kMaxTopK> owned;
         for (int row = 0; row < rows; ++row) {
@@ -372,9 +370,11 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
                     view.numaGateType = group.ggufSources[table].weights[0].type;
                     view.numaDownType = group.ggufSources[table].weights[1].type;
                 }
-                const bool ok = ComputeCooperativeGGUF(activation, w.gate, output, layout, view,
-                    static_cast<float *>(w.scores.cudaData), topk, w.GpuOutput(),
-                    w.BatchRoutes() + start, count);
+                // Preserve the full input layout and sparse route map: all
+                // rows sharing a staged expert use one upload and one batch,
+                // and resident/staged batches reuse the input quantization.
+                const bool ok = ComputeGGUFExperts(activation, w.gate, output, layout, view,
+                    static_cast<float *>(w.scores.cudaData), topk, w.GpuOutput());
                 inputPrepared = true;
                 return ok;
             };
@@ -455,12 +455,34 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
         static_cast<__nv_bfloat16 *>(output.cudaData), hidden, topk);
     checkCudaErrors("Cooperative MoE gathered reduction", cudaGetLastError());
     checkCudaErrors("Cooperative MoE gather done", cudaEventRecord(r.done, cudaStreamPerThread));
+    r.admitted = candidate >= 0 && !misses.empty();
+    if (r.admitted) {
+        if (!origin.admissionStream) checkCudaErrors("Cooperative MoE admission stream",
+            cudaStreamCreateWithFlags(&origin.admissionStream, cudaStreamNonBlocking));
+        const auto stream = origin.admissionStream;
+        checkCudaErrors("Cooperative MoE admission readers", cudaStreamWaitEvent(stream, r.done, 0));
+        checkCudaErrors("Cooperative MoE admission start", cudaEventRecord(r.copyStart, stream));
+        BuildHybridPrefetchRoutes<<<1, 32, 0, stream>>>(
+            static_cast<int32_t *>(r.ids.cudaData) + (candidate / topk) * topk,
+            origin.keyToSlot, origin.slotKeys, static_cast<int32_t *>(r.lookup.cudaData),
+            base, layout.experts, topk, candidate % topk);
+        const int staged = r.stagedSlots[candidate];
+        const uint8_t *record = staged >= 0
+            ? r.overlap->records + size_t(staged) * layout.recordStride : nullptr;
+        AssertInFastLLM(EnsureCachedExperts(&group, &origin, table,
+            static_cast<int32_t *>(r.lookup.cudaData), topk, stream, record,
+            r.Indices()[candidate]), "Cooperative MoE admission failed");
+        checkCudaErrors("Cooperative MoE admission done", cudaEventRecord(r.copyEnd, stream));
+        checkCudaErrors("Cooperative MoE admission fence", cudaEventRecord(origin.admissionDone, stream));
+    }
+    ++r.calls;
     state.previousRoot = &root;
     for (size_t d = 0; d < work.size(); ++d) {
         auto &stats = caches[d]->cooperativeStats;
         const int cpu = d == 0 ? cpuRoutes : 0, total = gpuRoutes[d] + cpu;
         stats[0] += d == 0; stats[1] += total; stats[2] += hits[d];
         stats[3] += total - hits[d]; stats[4] += gpuRoutes[d]; stats[5] += cpu; stats[6] += hits[d];
+        if (d == 0) stats[7] += r.admitted;
     }
     return true;
 }

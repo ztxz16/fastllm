@@ -31,7 +31,7 @@ DeepSeek-V4.1 的 `fast_prefill` 沿用已有近似注意力语义，可能改�
 
 DeepSeek-V4.1 的显存估算按 KV source 层统计共享的压缩 KV 和 index key，并计入原生缓存扩容的容量余量及新旧缓冲重叠。Indexer 打分按原生分块预算估算（默认 128 MiB，遵循 `FASTLLM_DSV41_INDEX_SCORE_MB` 和 `FASTLLM_DSV41_INDEX_CHUNK`），不直接预留完整的 `chunk × context` 分数矩阵。原模型的 FP8 投影按实际保留的精度及 scale 预算，输出头、路由和其他强制展开的投影仍按原生精度计入。DeepSeek-V4.1 的自动 chunk 候选为 **8192、4096、2048、1024、512、256**；其他模型的候选上限保持 4096。候选不超过上下文长度；显式指定数值时不会自动降低。
 
-规划日志分别输出 `kv_logical_bytes_per_device`（有效载荷）、`kv_capacity_bytes_per_device`（含增长余量的容量）和 `kv_reallocation_bytes_per_device`（扩容时的旧缓冲重叠），避免将有效 KV 大小和规划峰值混为一谈。
+规划日志分别输出 `kv_logical_bytes_per_device`（有效载荷）、`kv_capacity_bytes_per_device`（含增长余量的容量）和 `kv_reallocation_bytes_per_device`（扩容时的旧缓冲重叠），避免将有效 KV 大小和规划峰值混为一谈。GGUF NUMA 模型开启 DSpark 多卡分流时，辅助卡即使没有本地 NUMA 专家，也保留专家上传缓冲预算。
 
 DeepSeek-V4.1 原生 FP8/MXFP4 模型在单请求、非 TP、BF16、NUMA/磁盘专家和 `fast_prefill` 路径下，按 attention、WoA、MoE 分阶段的临时缓冲峰值估算工作区。主机专家使用复用的 256 行工作缓冲，避免按 chunk 为每个路由重复计入 GPU 中间张量；WoA 保留 FP32 fallback 的权重展开和分块空间。调试 dump、其他精度、GPU 驻留专家等路径继续采用通用保守估算。CUDA graph 隐式启用的 GPU embedding 也计入预算。
 

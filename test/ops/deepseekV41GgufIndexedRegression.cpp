@@ -204,19 +204,20 @@ public:
         BeginHybridMoeStep(step, false, true, 1);
     }
     void Run(Data &input, Data &index, Data &score, Data &output,
-             int layer, int device, int &callbacks) {
+             int layer, int device, int &callbacks, bool graph = false) {
+        const int rows = input.dims[0];
         if (!cooperativeTest) deviceMap = {{"cuda:" + std::to_string(device), 1}};
         ApplyDeviceMap({{"cuda:" + std::to_string(device), 1}}, 0, 1);
         ws.ffnInput.CopyFrom(input); ws.expertIndex.CopyFrom(index); ws.expertScore.CopyFrom(score);
         if (layer % 2) {
             ws.expertIndex.ToDevice(CPU); ws.expertScore.ToDevice(CPU);
         }
-        ws.sharedExpertOut.CopyFrom(Data(FLOAT32, {1,embed_dim}, std::vector<float>(embed_dim,0.f)));
+        ws.sharedExpertOut.CopyFrom(Data(FLOAT32, {rows,embed_dim}, std::vector<float>(rows*embed_dim,0.f)));
         ToDataType(ws.sharedExpertOut, BFLOAT16);
         ws.sharedExpertOut.ToDevice(CUDA, {device}, true);
         const std::vector<int> devices{device};
-        DeepSeekV41MoeContext ctx{ws, weights[layer], devices, layer, 1,
-            false, true, false, false, false, true, false, [&] {
+        DeepSeekV41MoeContext ctx{ws, weights[layer], devices, layer, rows,
+            false, true, rows > 1, graph, false, true, rows > 1, [&] {
                 ++callbacks;
                 if (cooperativeTest) FastllmCudaSetDevice(1-device);
             }, [] {}};
@@ -226,6 +227,87 @@ public:
 private:
     DeepSeekV41DecodeWorkspace ws;
 };
+
+static void CheckCooperativeCache() {
+    FastllmCudaSetDevice(0); EnableAMX(false);
+    size_t stride = 0;
+    for (const auto &f : registeredFixtures)
+        stride = std::max(stride, ((f.host[2]->GetBytes()+15)&~size_t(15))+f.host[3]->GetBytes());
+    const size_t budget = registeredFixtures.size()*4*((stride+127)&~size_t(127));
+    SetMoeCudaCacheBytes(budget);
+    StreamModelProbe model;
+    model.PrepareStream();
+    constexpr int hidden=512, topk=6;
+    constexpr int widths[] = {1,2,5,3,8,6};
+    bool dualVerify=false, resident=false, cpu=false;
+    for (int pass=0; pass<18; ++pass) for (size_t layer=0; layer<registeredFixtures.size(); ++layer) {
+        const int rows=widths[pass%6];
+        const int device=int(layer*2/registeredFixtures.size());
+        FastllmCudaSetDevice(device);
+        auto &f=registeredFixtures[layer];
+        for (auto *w:f.gpu) if (w) w->ToDevice(CUDA,{device},true);
+        std::vector<float> x(rows*hidden), scores(rows*topk,0.f);
+        std::vector<int32_t> ids(rows*topk), owners(rows*topk,-1);
+        for (size_t i=0;i<x.size();++i) x[i]=std::sin(float(i+pass)*.031f);
+        for (int row=0;row<rows;++row) {
+            for (int k=0;k<topk;++k) ids[row*topk+k]=(k+(pass/3)*6)%24;
+            ids[row*topk]=ids[row*topk+1]; // Duplicate within/across rows.
+            // One nonzero route per row gives an independent exact oracle:
+            // either the CPU or CUDA quantized expert may own that route.
+            scores[row*topk+(row+pass)%topk]=row%2 ? -.31f : .77f;
+        }
+        Data input(FLOAT32,{rows,hidden},x), index(INT32,{rows,topk},CPU,ids.data());
+        Data score(FLOAT32,{rows,topk},scores), output, reference, gate, activation, workspace;
+        ToDataTypeForceCPU(input,BFLOAT16);
+        std::vector<float> partial(rows*topk*hidden,0.f), cpuSum(rows*hidden,0.f);
+        NumasMoeVerifyExperts(reinterpret_cast<uint16_t *>(input.cpuData),partial.data(),rows,
+            f.host.data(),f.host.size(),ids.data(),owners.data(),scores.data(),topk,layer,.8f,true,32);
+        for (int row=0;row<rows;++row) for(int k=0;k<topk;++k) for(int c=0;c<hidden;++c)
+            cpuSum[row*hidden+c]+=partial[(row*topk+k)*hidden+c];
+        Data cpuReference(FLOAT32,{rows,hidden},cpuSum);
+        ToDataTypeForceCPU(cpuReference,BFLOAT16); ToDataTypeForceCPU(cpuReference,FLOAT32);
+        for(auto *v:{&input,&index,&score}) v->ToDevice(CUDA,{device},true);
+        Check(FastllmCudaMergeMOEV41GGUFResident(input,gate,activation,workspace,reference,
+            f.gpu.data(),f.gpu.size(),index,score,0,.8f),"cached cooperative CUDA oracle failed");
+        ToDataType(reference,BFLOAT16); ToDataType(reference,FLOAT32);
+        const auto gpuExpected=Read(reference);
+        uint64_t before[2][8]={};
+        for(int d=0;d<2;++d) fastllm_moe_cuda_cache_route_stats(d,before[d]);
+        int callbacks=0;
+        model.Run(input,index,score,output,layer,device,callbacks,pass%2==0);
+        Check(callbacks==1,"cached verify shared callback count changed");
+        Check(GetPointerDeviceId(output.cudaData)==device,"cached verify output on wrong PP device");
+        ToDataType(output,FLOAT32);
+        const auto actual=Read(output);
+        const auto *cpuExpected=reinterpret_cast<const float *>(cpuReference.cpuData);
+        for(int row=0;row<rows;++row) {
+            bool cpuMatch=true,gpuMatch=true;
+            for(int c=0;c<hidden;++c) {
+                const int i=row*hidden+c;
+                cpuMatch &= actual[i]==cpuExpected[i]; gpuMatch &= actual[i]==gpuExpected[i];
+            }
+            Check(cpuMatch || gpuMatch,"cached cooperative row differs from both independent CPU/CUDA oracles");
+        }
+        int active=0; uint64_t total=0, admissions=0;
+        for(int d=0;d<2;++d) {
+            uint64_t after[8]={}; fastllm_moe_cuda_cache_route_stats(d,after);
+            total+=after[4]-before[d][4]+after[5]-before[d][5];
+            active+=after[4]>before[d][4];
+            resident |= after[6]>before[d][6]; cpu |= after[5]>before[d][5];
+            admissions+=after[7]-before[d][7];
+        }
+        Check(total==uint64_t(rows*topk),"cached cooperative lost or duplicated routes");
+        if (rows>1) Check(admissions<=1,"cached verify exceeded one admission per layer");
+        dualVerify |= rows>1 && active==2;
+    }
+    Check(dualVerify && resident && cpu,"cached verify did not exercise both GPUs, cache hits and CPU fallback");
+    for(int d=0;d<2;++d) {
+        uint64_t stats[5]={}; Check(fastllm_moe_cuda_cache_stats(d,stats,false),"cached verify stats unavailable");
+        Check(stats[2]>0 && stats[2]<=budget && stats[3]<stats[4],"cached verify exceeded residency budget");
+    }
+    registeredFixtures.clear();
+    puts("PASS: V4.1 cached cooperative verify, dual GPU, sparse batches, exact CPU/CUDA oracle");
+}
 static void CheckRegistration() {
     FastllmCudaSetDevice(0); EnableAMX(false);
     std::vector<FastllmCudaMoeCacheLayer> layers;
@@ -550,7 +632,8 @@ int main(int argc, char **argv) {
             printf("PASS: production decode grids and canonical cache (%d checks, %d changed-input graph replays)\n", n, graphReplays);
             return 0;
         }
-        cooperativeTest = mode == "--cooperative";
+        const bool cooperativeCacheTest = mode == "--cooperative-cache";
+        cooperativeTest = mode == "--cooperative" || cooperativeCacheTest;
         if (cooperativeTest && devices < 2) return 77;
         streamTest = mode == "--stream" || cooperativeTest;
         if (streamTest) {
@@ -559,7 +642,8 @@ int main(int argc, char **argv) {
                     {GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M}, {GGML_TYPE_Q2_0, GGML_TYPE_Q3_K},
                     {GGML_TYPE_Q4_K, GGML_TYPE_Q2_0}, {GGML_TYPE_Q2_K, GGML_TYPE_Q4_K}})
                 Case(pair.first, pair.second, 512, 256, 0, false);
-            CheckRegistration();
+            if (cooperativeCacheTest) CheckCooperativeCache();
+            else CheckRegistration();
             return 0;
 #else
             return 77;
