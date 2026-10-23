@@ -1510,6 +1510,8 @@ namespace {
     }
 
 
+    #include "deepseekv41-prefill-indexer.cuh"
+
     // ---------------- mma / ldmatrix 内联汇编封装（SM80+） ----------------
 
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
@@ -4141,9 +4143,13 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const
     if (m == 0) {
         return true;
     }
+    const bool legacyIndexer = V41EnvOn("FASTLLM_DSV41_LEGACY_INDEXER");
+    if (!legacyIndexer &&
+        V41TryIndexerPrefill(q, weights, k, kMode, ratio, startPos, output)) return true;
+    if (FastllmCudaGetThreadError()) return false;
     // BF16 mma 快速路径（SM80+）；FASTLLM_DSV41_LEGACY_INDEXER=1 退回下面的标量 kernel
     if (q.dataType == DataType::BFLOAT16 && (kQuant || k.dataType == DataType::BFLOAT16) && dim == kIdxDim &&
-        !V41EnvOn("FASTLLM_DSV41_LEGACY_INDEXER")) {
+        !legacyIndexer) {
         if (seqlen == 1 && heads > 0 &&
             V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<false>, 256>()) {
             V41IndexerScoreDecodeMmaKernel<<<dim3((m + 63) / 64, bsz), 256>>>(
