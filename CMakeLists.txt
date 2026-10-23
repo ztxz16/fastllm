@@ -1663,6 +1663,13 @@ if (UNIT_TEST)
             fastllm_add_checked_test(fp8BFloat16Cache fp8BFloat16CacheRegression
                 "PASS BF16 FP8 auxiliary cache" 300)
             set_tests_properties(fp8BFloat16Cache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+            add_executable(mxfp8DenseRegression test/ops/mxfp8DenseRegression.cpp)
+            target_link_libraries(mxfp8DenseRegression PRIVATE fastllm)
+            target_include_directories(mxfp8DenseRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(mxfp8Dense mxfp8DenseRegression
+                "PASS [0-9]+ eager [+] graph shapes" 300)
+            set_tests_properties(mxfp8Dense PROPERTIES LABELS cuda RUN_SERIAL TRUE)
         endif()
     endif()
     add_executable(nvfp4Block32GemmRegression test/ops/nvfp4Block32GemmRegression.cpp)

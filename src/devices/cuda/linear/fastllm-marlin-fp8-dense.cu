@@ -183,6 +183,24 @@ static KernelFn PickBf16Mxfp8Kernel(int rows, int tile) {
 #endif
 }
 
+// Exact storage layout of the BF16/E4M3/E8M0 kernel above. B and the
+// reduction tile alias; scales and the four-stage A pipeline follow them.
+// Reserving the device's entire shared memory prevents other graph branches
+// from occupying the same SM even when most of that reservation is unused.
+static int Bf16Mxfp8SharedBytes(int rows, int tile) {
+    const int threadN = tile == 1 ? 64 : 128;
+    const int threadK = tile == 1 ? 128 : 64;
+    const int mBlocks = rows <= 8 ? 1 : std::min(4, (rows + 15) / 16);
+    const int tileM = rows <= 8 ? 8 : 16 * mBlocks;
+    const int bPipeline = 4 * threadN * threadK;
+    const int reduction = (2 * (threadN / 16) + 1) * 16 * mBlocks * 16;
+    const int bReductionBias = std::max(std::max(bPipeline, reduction),
+        std::min(bPipeline, reduction) + threadN * 2);
+    const int scales = 4 * (threadK / 32) * threadN;
+    const int aPipeline = 4 * tileM * threadK * 2;
+    return bReductionBias + scales + aPipeline;
+}
+
 // Explicit FE2M1 + special FE4M3 scale, group16 (group_blocks=1).
 // Only SM75 selects stages=2; newer architectures select stages=4.
 // The SM75 64x256x64 prefill tile specializes the fixed dense reduction
@@ -709,7 +727,9 @@ extern "C" bool FastllmCudaMarlinBFloat16MXFP8Gemm(
         if (count >= 64) count = std::min(count / 64, 128) * 64;
         const int chunkTile = tile;
         KernelFn kernel = PickBf16Mxfp8Kernel(count, chunkTile);
-        kernel<<<sms, 128, shared, cudaStreamPerThread>>>(
+        const int launchShared = Bf16Mxfp8SharedBytes(count, chunkTile);
+        if (launchShared > shared) return false;
+        kernel<<<sms, 128, launchShared, cudaStreamPerThread>>>(
             reinterpret_cast<const int4 *>(static_cast<const uint16_t *>(a) + (size_t)row * inner),
             reinterpret_cast<const int4 *>(weight),
             reinterpret_cast<int4 *>(static_cast<uint16_t *>(c) + (size_t)row * columns),
