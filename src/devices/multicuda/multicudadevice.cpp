@@ -4472,6 +4472,13 @@ namespace fastllm {
 
     bool MultiCudaRepeatToReplicated(Data &input, int axis, int repeatTimes,
                                      Data &output) {
+        // Both repeat paths rely on NCCL to refresh every replica. Reject
+        // unsupported types before changing either tensor so callers can fall back.
+        if (input.dataType != DataType::FLOAT32 && input.dataType != DataType::FLOAT16 &&
+            input.dataType != DataType::BFLOAT16 && input.dataType != DataType::INT8 &&
+            input.dataType != DataType::INT32) {
+            return false;
+        }
         std::vector<int> devices;
         std::map<int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
@@ -4498,11 +4505,22 @@ namespace fastllm {
         // An unbatched repeat can broadcast straight into the first output
         // slice. Other layouts retain independent broadcast staging replicas.
         const bool repeatFromOutput = &input != &output && input.unitSizeDiv == 1 &&
-            input.Count(0) == input.Count(axis) && input.GetBytes() > 0 &&
-            output.GetBytes() <= (uint64_t)std::numeric_limits<int>::max();
-        if (!repeatFromOutput) EnsureReplicatedMultiCudaTensor(input, devices, true);
+                                      input.Count(0) == input.Count(axis) && input.GetBytes() > 0 &&
+                                      output.GetBytes() <= (uint64_t)std::numeric_limits<int>::max();
+        // For compact inputs the worker broadcast initializes every staging
+        // replica. Preserve the original layout/copy path for padded tensors.
+        bool compactInput =
+            &input != &output && input.unitSizeDiv == 1 && input.strides.size() == input.dims.size();
+        uint64_t stride = 1;
+        for (int dim = (int)input.dims.size() - 1; compactInput && dim >= 0; --dim) {
+            compactInput &= input.strides[dim] == stride;
+            stride *= input.dims[dim];
+        }
+        if (!repeatFromOutput)
+            EnsureReplicatedMultiCudaTensor(input, devices, !compactInput);
         EnsureReplicatedMultiCudaTensor(output, devices, false);
-        if (!repeatFromOutput) SyncReplicatedLocalShapeFromRoot(input, devices);
+        if (!repeatFromOutput)
+            SyncReplicatedLocalShapeFromRoot(input, devices);
         SyncReplicatedLocalShapeFromRoot(output, devices);
         if (!FastllmInitNccl(devices)) {
             return false;

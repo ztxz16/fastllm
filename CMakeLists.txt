@@ -1593,6 +1593,13 @@ if (UNIT_TEST)
                 "PASS [0-9]+ replicated row slices" 300)
             set_tests_properties(multiCudaReplicatedRows PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+            add_executable(multiCudaRepeatRegression test/ops/multiCudaRepeatRegression.cpp)
+            target_link_libraries(multiCudaRepeatRegression PRIVATE fastllm)
+            target_include_directories(multiCudaRepeatRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(multiCudaRepeat multiCudaRepeatRegression
+                "PASS [0-9]+ INT16/FP8_E4M3 rejection and CUDA fallback checks" 300)
+            set_tests_properties(multiCudaRepeat PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
             add_executable(bfloat16FloatOutputRegression test/ops/bfloat16FloatOutputRegression.cpp)
             target_link_libraries(bfloat16FloatOutputRegression PRIVATE fastllm)
             target_include_directories(bfloat16FloatOutputRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

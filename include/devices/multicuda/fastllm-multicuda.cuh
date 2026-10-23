@@ -253,6 +253,7 @@ namespace fastllm {
     // execute Repeat independently on every device.  This keeps the output
     // replicas current without rebuilding their storage, so the whole handoff
     // can be captured by a multi-device CUDA Graph.
+    // Unsupported NCCL dtypes return false without changing either tensor.
     bool MultiCudaRepeatToReplicated(Data &input, int axis, int repeatTimes,
                                      Data &output);
     bool MultiCudaDeepSeekV41SharedSwiglu(Data &input, float limit, Data &output);
