@@ -57,6 +57,7 @@
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #ifndef USE_ROCM
 #include "../cuda/gguf_mmq/fastllm-gguf-moe-glm5.h"
+#include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include "devices/cuda/fastllm-moe-prefetch.h"
 #endif
 #endif
@@ -10006,6 +10007,9 @@ namespace fastllm {
 #ifndef USE_ROCM
                             if (nativeGlm) groupedBytes = fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(
                                 view.gateType, view.downType, bs, view.hidden, view.inter, m, topk);
+                            else if (deepSeekV4Mode && activationQuantBlock == 32)
+                                groupedBytes = FastllmCudaV41GGUFGroupedWorkspaceBytes(
+                                    view.gateType, view.downType, bs, view.hidden, view.inter, m, topk);
                             else
 #endif
                             groupedBytes = FastllmCudaMoeGGUFGroupedWorkspaceBytes(view.gateType,

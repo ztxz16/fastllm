@@ -469,11 +469,91 @@ static void CheckRegistration() {
 #endif
 static bool groupedTest = false;
 static bool sparseTest = false;
+static bool hostPrefillTest = false;
 static bool decodeGridTest = false;
 static int graphReplays = 0;
+
+static void HostPrefill(Data &input, Data &indices, Data &scores,
+        std::vector<Data *> &weights, int gt, int dt, float limit, int device) {
+    const int rows = input.dims[0], hidden = input.dims[1], topk = indices.dims[1];
+    const int experts = weights.size() / 2 - 1, inter = weights[3]->dims[1];
+    const bool cross = rows != 128;
+    std::vector<std::unique_ptr<Data>> owned;
+    std::vector<Data *> host(weights.size(), nullptr);
+    for (int e = 1; e <= experts; ++e) for (int part = 0; part < 2; ++part) {
+        const auto *source = weights[2 * e + part];
+        if (!source) continue;
+        auto w = std::make_unique<Data>(DATA_GGUF_FORMAT, part ? dt : gt, source->dims);
+        w->Allocate();
+        std::vector<uint8_t> packed(source->GetBytes());
+        Cuda(cudaMemcpy(packed.data(), source->cudaData, packed.size(), cudaMemcpyDeviceToHost));
+        const size_t rowBytes = packed.size() / source->dims[0];
+        for (int row = 0; row < source->dims[0]; ++row) {
+            const int destination = part || !cross ? row : 2 * (row % inter) + row / inter;
+            std::memcpy(w->cpuData + destination * rowBytes, packed.data() + row * rowBytes, rowBytes);
+        }
+        // Exercise the same K-quant R4 restore used by registered NUMA weights.
+        w->Repack();
+        host[2 * e + part] = w.get(); owned.push_back(std::move(w));
+    }
+    std::vector<int32_t> ids(rows * topk);
+    std::vector<float> scales(rows * topk);
+    Cuda(cudaMemcpy(ids.data(), indices.cudaData, ids.size() * 4, cudaMemcpyDeviceToHost));
+    Cuda(cudaMemcpy(scales.data(), scores.cudaData, scales.size() * 4, cudaMemcpyDeviceToHost));
+    Data gate, scratch, output, referenceGate, activation, referenceScratch, reference;
+    for (int pass = 0; pass < 3; ++pass) {
+        std::unordered_set<int> selected;
+        auto subset = weights;
+        for (int e = 1; e <= experts; ++e) {
+            if (host[2 * e] && (pass == 0 || e % 2 == pass % 2)) selected.insert(e);
+            else subset[2 * e] = subset[2 * e + 1] = nullptr;
+        }
+        if (pass == 0) {
+            Check(!FastllmCudaMergeMOEGGUFHost(input, gate, scratch, output, host.data(), experts,
+                ids.data(), scales.data(), topk, selected, cross, true, limit, 64),
+                "host grouped admitted unsupported activation quantization");
+            if (gt == GGML_TYPE_IQ1_S)
+                Check(!FastllmCudaMergeMOEGGUFHost(input, gate, scratch, output, host.data(), experts,
+                    ids.data(), scales.data(), topk, selected, cross, false, limit),
+                    "native IQ1_S escaped into ordinary GGUF dispatch");
+            Check(!gate.cudaData && !scratch.cudaData && !output.cudaData,
+                "rejected host grouped call allocated output or workspace");
+        }
+        // Each NUMA shard contains complete output rows. Keep ownership in
+        // cpuData outside the call, including when checking failure paths.
+        std::vector<uint8_t *> originals;
+        for (auto &w : owned) {
+            originals.push_back(w->cpuData);
+            if (pass) { w->numasData = {w->cpuData, w->cpuData + w->GetBytes() / 2}; w->cpuData = nullptr; }
+        }
+        const bool ok = FastllmCudaMergeMOEGGUFHost(input, gate, scratch, output, host.data(), experts,
+            ids.data(), scales.data(), topk, selected, cross, true, limit, 32);
+        for (size_t i = 0; i < owned.size(); ++i) {
+            owned[i]->cpuData = originals[i]; owned[i]->numasData.clear();
+        }
+        Check(ok, "V4.1 host grouped rejected fixture");
+        Check(FastllmCudaMergeMOEV41GGUFResident(input, referenceGate, activation, referenceScratch,
+            reference, subset.data(), subset.size(), indices, scores, 0.f, limit), "host grouped oracle rejected");
+        ToDataType(reference, BFLOAT16); ToDataType(reference, FLOAT32);
+        ToDataType(output, FLOAT32);
+        const auto actual = Read(output), expected = Read(reference);
+        double err = 0, norm = 0;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            Check(std::isfinite(actual[i]), "host grouped non-finite result");
+            err += std::pow(double(actual[i]) - expected[i], 2); norm += double(expected[i]) * expected[i];
+        }
+        const double relative = std::sqrt(err / std::max(norm, 1e-30));
+        printf("host gt=%d dt=%d rows=%d experts=%d pass=%d cross=%d device=%d relative=%.9g\n",
+            gt, dt, rows, experts, pass, cross, device, relative);
+        Check(relative < .002, "host grouped differs from native V4.1 grouped oracle");
+        for (auto &w : owned) Check(!w->cudaData, "host grouped retained a weight upload");
+        FastllmCudaReleaseMoeGGUFResident(subset[2 * *selected.begin()]);
+    }
+}
+
 static int Case(int gt, int dt, int hidden, int inter, int device, bool missing) {
     FastllmCudaSetDevice(device);
-    const int experts = sparseTest ? 384 : 8, topk = 6;
+    const int experts = sparseTest ? 384 : hostPrefillTest && hidden == 512 ? 64 : 8, topk = 6;
     std::mt19937 rng(317 + gt*17+dt);
     std::normal_distribution<float> normal(0, .04f);
     std::vector<std::unique_ptr<Data>> owned;
@@ -507,7 +587,7 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
     }
     Data gate, activation, workspace, output, ref;
     int checks = 0;
-    for (int rows : decodeGridTest ? std::vector<int>{1} : sparseTest ? std::vector<int>{512,1024} : groupedTest ? std::vector<int>{33,64,129} : cacheTest ? std::vector<int>{1,5,8} : std::vector<int>{1,2,8,32}) for (int pattern = 0; pattern < 3; ++pattern) {
+    for (int rows : hostPrefillTest ? std::vector<int>{33,128,2048} : decodeGridTest ? std::vector<int>{1} : sparseTest ? std::vector<int>{512,1024} : groupedTest ? std::vector<int>{33,64,129} : cacheTest ? std::vector<int>{1,5,8} : std::vector<int>{1,2,8,32}) for (int pattern = 0; pattern < 3; ++pattern) {
         std::vector<float> x(size_t(rows)*hidden), scales(rows*topk);
         for (size_t i = 0; i < x.size(); ++i)
             x[i] = pattern == 2 ? 0.f : std::ldexp(normal(rng)*30.f, int(i/32%5)-2);
@@ -521,6 +601,10 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
         Data scores(FLOAT32, {rows, topk}, scales);
         for (auto *v : {&input, &indices, &scores}) v->ToDevice(CUDA, {device}, true);
         const float limit = pattern == 0 ? 0.f : .8f;
+        if (hostPrefillTest) {
+            HostPrefill(input, indices, scores, weights, gt, dt, limit, device);
+            ++checks; continue;
+        }
         if (pattern == 0 && rows <= 32)
             Check(!FastllmCudaV41GGUFGraphReady(weights[2], rows, topk), "unwarmed decode shape admitted");
         const bool accepted = FastllmCudaMergeMOEV41GGUFResident(input, gate, activation, workspace, output,
@@ -621,6 +705,20 @@ int main(int argc, char **argv) {
         int devices=0; if(cudaGetDeviceCount(&devices)!=cudaSuccess || devices==0) return 77;
         SetThreads(4);
         const std::string mode = argc>1 ? argv[1] : "";
+        if (mode == "--host-prefill") {
+            hostPrefillTest = true;
+            int checks = 0;
+            for (auto pair : std::vector<std::pair<int, int>>{
+                    {GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_S}, {GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M},
+                    {GGML_TYPE_IQ1_S, GGML_TYPE_Q2_0}, {GGML_TYPE_Q2_0, GGML_TYPE_Q2_0},
+                    {GGML_TYPE_Q2_0, GGML_TYPE_IQ1_M}, {GGML_TYPE_Q2_0, GGML_TYPE_Q3_K},
+                    {GGML_TYPE_Q2_0, GGML_TYPE_Q4_K}, {GGML_TYPE_IQ1_M, GGML_TYPE_Q2_0},
+                    {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K}, {GGML_TYPE_Q4_K, GGML_TYPE_IQ1_M}})
+                checks += Case(pair.first, pair.second, 512, 256, 0, false);
+            checks += Case(GGML_TYPE_IQ1_S, GGML_TYPE_Q2_0, 5120, 2304, devices > 1 ? 1 : 0, true);
+            printf("PASS: V4.1 host grouped prefill (%d cases)\n", checks);
+            return 0;
+        }
         hybridTest = mode == "--hybrid";
         cacheTest = mode == "--cache";
         if (mode == "--decode-grid") {

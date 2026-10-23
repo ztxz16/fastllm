@@ -1,7 +1,6 @@
 #pragma once
 // Native CUDA V4.1 grouped projections. Keep quantization and SwiGLU in the
 // shared indexed launcher; this file only packs Q8_1, multiplies, and scatters.
-namespace grouped_moe {
 template<bool DS4>
 __global__ void GatherNativeV41(const block_q8_1 *input, block_q8_1_mmq *output,
         const int *groupRoutes, const int *activeRows, int columns, int capacity, int topk) {
@@ -30,4 +29,20 @@ __global__ void ScatterNativeV41(const float *products, __nv_bfloat16 *output,
     output[size_t(route)*width+c] = __float2bfloat16_rn(
         group < 0 ? 0.f : products[size_t(group)*width+c]);
 }
-} // namespace grouped_moe
+
+static bool NativeV41Matrix(int type, const uint8_t *const *weights, int part,
+        Workspace &w, int experts, int columns, int width, cudaStream_t stream) {
+    if (type == GGML_TYPE_IQ1_S) ensure_iq1s_grid(stream);
+    switch (type) {
+#define NATIVE_MATRIX(T) case GGML_TYPE_##T: \
+        if (w.inputRows >= 1024) LaunchMatrix<GGML_TYPE_##T, 64, false, true>( \
+            weights, part, w, experts, columns, width, stream); \
+        else LaunchMatrix<GGML_TYPE_##T, 16, false, true>( \
+            weights, part, w, experts, columns, width, stream); break;
+        NATIVE_MATRIX(IQ1_S) NATIVE_MATRIX(IQ1_M) NATIVE_MATRIX(Q2_0)
+        NATIVE_MATRIX(Q3_K) NATIVE_MATRIX(Q4_K)
+#undef NATIVE_MATRIX
+        default: return false;
+    }
+    return true;
+}

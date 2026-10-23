@@ -17,7 +17,6 @@ namespace fastllm_gguf_mmq {
 #include "../moe/fastllm-moe-gguf-q8.cuh"
 #include "fastllm-gguf-mmq-io.cuh"
 #include "fastllm-gguf-moe-grouped.cuh"
-#include "fastllm-gguf-moe-v41-native.cuh"
 } // namespace fastllm_gguf_mmq
 
 size_t fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(int gateType, int downType,
@@ -106,21 +105,21 @@ bool FastllmCudaMoeGGUFGrouped(const fastllm::Data &input, fastllm::Data &gate,
         deepSeekV41, swigluLimit, nullptr);
 }
 
-size_t fastllm_gguf_mmq::StreamedMoeWorkspaceBytes(int rows, int hidden, int inter, int topk, int capacity) {
-    return grouped_moe::StreamedWorkspace(nullptr, rows, hidden, inter, topk, capacity).bytes;
+size_t fastllm_gguf_mmq::StreamedMoeWorkspaceBytes(int rows, int hidden, int inter, int topk, int capacity, bool nativeV41) {
+    return grouped_moe::StreamedWorkspace(nullptr, rows, hidden, inter, topk, capacity, nativeV41).bytes;
 }
 
 bool fastllm_gguf_mmq::RunStreamedMoe(StreamedMoePhase phase, const fastllm::Data &input,
         fastllm::Data &gate, fastllm::Data &output, void *workspace, int capacity,
         int hidden, int inter, int topk, int gateType, int downType,
         const StreamedMoeBatch &batch, const float *scores, bool glm5,
-        float swigluLimit, const int32_t *indices) {
-    if (glm5 && (input.dataType != fastllm::BFLOAT16 || !indices)) return false;
+        float swigluLimit, const int32_t *indices, bool nativeV41) {
+    if ((glm5 || nativeV41) && (input.dataType != fastllm::BFLOAT16 || !indices)) return false;
     switch (input.dataType) {
 #define STREAMED_RUN(DType, T) case fastllm::DType: return grouped_moe::RunStreamed( \
         phase, static_cast<const T *>(input.cudaData), static_cast<T *>(gate.cudaData), \
         static_cast<T *>(output.cudaData), workspace, capacity, input.dims[0], hidden, inter, topk, \
-        gateType, downType, batch, scores, glm5, swigluLimit, indices);
+        gateType, downType, batch, scores, glm5, swigluLimit, indices, nativeV41);
         STREAMED_RUN(FLOAT32, float)
         STREAMED_RUN(FLOAT16, half)
         STREAMED_RUN(BFLOAT16, __nv_bfloat16)
@@ -163,18 +162,8 @@ bool FastllmCudaV41GGUFGroupedProjection(bool gate, int type, const void *inputQ
     else grouped_moe::GatherNativeV41<false><<<gather, 256, 0, cudaStreamPerThread>>>(
         static_cast<const block_q8_1 *>(inputQ8), w.quantized, w.groupRoutes,
         w.offsets+experts, columns, w.capacity, gate ? topk : 1);
-    if (type == GGML_TYPE_IQ1_S) ensure_iq1s_grid(cudaStreamPerThread);
-    switch (type) {
-#define NATIVE_MATRIX(T) case GGML_TYPE_##T: \
-        if (rows >= 1024) grouped_moe::LaunchMatrix<GGML_TYPE_##T, 64, false, true>( \
-            weights, gate ? 0 : 1, w, experts, columns, width, cudaStreamPerThread); \
-        else grouped_moe::LaunchMatrix<GGML_TYPE_##T, 16, false, true>( \
-            weights, gate ? 0 : 1, w, experts, columns, width, cudaStreamPerThread); break;
-        NATIVE_MATRIX(IQ1_S) NATIVE_MATRIX(IQ1_M) NATIVE_MATRIX(Q2_0)
-        NATIVE_MATRIX(Q3_K) NATIVE_MATRIX(Q4_K)
-#undef NATIVE_MATRIX
-        default: return false;
-    }
+    if (!grouped_moe::NativeV41Matrix(type, weights, gate ? 0 : 1, w,
+            experts, columns, width, cudaStreamPerThread)) return false;
     grouped_moe::ScatterNativeV41<<<dim3((width+255)/256, rows*topk), 256, 0, cudaStreamPerThread>>>(
         w.products, static_cast<__nv_bfloat16 *>(outputBF16), w.routeGroups, width);
     return cudaGetLastError() == cudaSuccess;
