@@ -24492,12 +24492,14 @@ namespace fastllm {
                     std::vector<std::pair<Data, Data> > *pastKeyValue1 = nullptr;
                     dictLocker.lock();
                     auto contextIt = model->responseContextDict.dicts.find(handles[0]);
-                    const char *cooperativeEnv =
-                        std::getenv("FASTLLM_COOPERATIVE_LONG_PREFILL");
+                    static const bool cooperativeEnvEnabled = [] {
+                        const char *env =
+                            std::getenv("FASTLLM_COOPERATIVE_LONG_PREFILL");
+                        return env != nullptr && std::atoi(env) > 0;
+                    }();
                     const bool enableCooperativePrefill =
                         helperStop == nullptr && schedulerUsesDFlash &&
-                        cooperativeEnv != nullptr &&
-                        std::atoi(cooperativeEnv) > 0;
+                        cooperativeEnvEnabled;
                     if (contextIt != model->responseContextDict.dicts.end()) {
                         pastKeyValue1 = &contextIt->second->pastKeyValues;
                         if (enableCooperativePrefill) {
