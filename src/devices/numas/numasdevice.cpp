@@ -3343,7 +3343,14 @@ namespace fastllm {
                             std::make_shared<NumasMoeWeightArena>(0, config->numaCnt));
                         weight->numasNVFP4AllScalesFuseMagic = false;
                         weight->expansionBytes = weight->GetBytes();
+                        // 锁页语义与原拷贝路径保持一致（原路径按 arena 锁页）；
+                        // 这里只锁「已经存在」的权重页，不再额外占内存。
+#ifdef USE_CUDA
+                        weight->isPinned = usePinned &&
+                            FastllmCudaHostRegister(weight->numasData[0], entry.shardBytes);
+#else
                         weight->isPinned = false;
+#endif
                     }
                 }
                 registered = true;
