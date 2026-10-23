@@ -480,24 +480,30 @@ class HybridAutoTest(unittest.TestCase):
     def test_host_reserve_keeps_floor_and_caps_large_machine_budget(self):
         g, c, gpu, _ = fixture()
         a = args(moe_device_layers=-1, moe_cuda_cache=0)
-        for total, available, reserve in [(8 * GiB, 8 * GiB, GiB),
-                                          (32 * GiB, 28 * GiB, 32 * GiB // 10),
-                                          (128 * GiB, 120 * GiB, 4 * GiB)]:
+        # 目标机（121 GiB）固定预留 13 GiB；小内存按 total//8 缩放，
+        # 但至少保留 1 GiB，避免固定预留吞掉全部预算。
+        for total, reserve in [(8 * GiB, GiB), (32 * GiB, 4 * GiB),
+                               (128 * GiB, 13 * GiB)]:
             with self.subTest(total=total), patch.dict(os.environ, {}, clear=True):
-                ram = {"total": total, "available": available}
+                ram = {"total": total, "available": total}
                 p = auto.plan(a, g, c, "pp", {0: 1}, gpu, ram)
-                self.assertEqual(p["host_budget_bytes"], available - reserve)
-                # The reserve remains unavailable even when total RAM is large.
+                self.assertEqual(p["host_budget_bytes"], total - reserve)
+                # 预算跟随 total，而不是瞬时 MemAvailable：邻居进程占用
+                # 不应让同一命令在 numa/disk 之间抖动。
                 ram["available"] = p["host_estimated_bytes"] + reserve - 1
-                with self.assertRaises(ValueError):
-                    auto.plan(a, g, c, "pp", {0: 1}, gpu, ram)
+                q = auto.plan(a, g, c, "pp", {0: 1}, gpu, ram)
+                self.assertEqual(q["host_budget_bytes"], total - reserve)
 
-    def test_snapshot_fallback_counts_a_second_host_copy(self):
+    def test_host_snapshot_copy_is_only_needed_for_unpinned_experts(self):
         g, c, gpu, ram = fixture()
+        # numa：专家权重由 NUMA 分片直接借给 CUDA 专家缓存，不需要第二份主机快照。
         p = auto.plan(args(), g, c, "pp", {0: 1}, gpu, ram)
-        c = (*c[:-1], True)
-        q = auto.plan(args(), g, c, "pp", {0: 1}, gpu, ram)
-        self.assertEqual(q["host_estimated_bytes"] - p["host_estimated_bytes"], 4 * GiB)
+        q = auto.plan(args(), g, (*c[:-1], True), "pp", {0: 1}, gpu, ram)
+        self.assertEqual(q["host_estimated_bytes"], p["host_estimated_bytes"])
+        # 关掉 pinned 时才需要一份独立的主机副本。
+        with patch.dict(os.environ, {"FT_PINNED_WEIGHT": "0"}, clear=True):
+            r = auto.plan(args(), g, c, "pp", {0: 1}, gpu, ram)
+        self.assertEqual(r["host_estimated_bytes"] - p["host_estimated_bytes"], 4 * GiB)
 
     def test_cgroup_parent_and_current_usage(self):
         for v2 in (True, False):
