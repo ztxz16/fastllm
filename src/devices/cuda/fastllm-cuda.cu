@@ -736,9 +736,21 @@ void FastllmCudaSyncCurrentThreadStream() {
 }
 
 void *FastllmCudaStreamCreate(bool nonBlocking) {
-    cudaStream_t stream;
+    cudaStream_t stream = nullptr;
     unsigned int flags = nonBlocking ? cudaStreamNonBlocking : cudaStreamDefault;
     cudaError_t state = cudaStreamCreateWithFlags(&stream, flags);
+    // Hybrid PP can change its staging device after large prefill temporaries
+    // entered the idle pool. Stream metadata needs driver memory too; recover
+    // from the same pool pressure as tensor allocations, outside graph capture.
+    if (state == cudaErrorMemoryAllocation) {
+        cudaGetLastError();
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) == cudaSuccess &&
+                capture == cudaStreamCaptureStatusNone) {
+            FastllmCudaClearBigBufferCurrentDevice();
+            state = cudaStreamCreateWithFlags(&stream, flags);
+        }
+    }
     checkCudaErrors("Error: CUDA error when creating stream!", state);
     return (void*)stream;
 }
