@@ -3578,6 +3578,7 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
         }
         return true;
     }
+    #include "deepseekv41-prefill-attention.cuh"
 }
 
 // ==================== 导出接口 ====================
@@ -4364,7 +4365,7 @@ bool FastllmCudaGlm5NextHybridSparseAttention(const fastllm::Data &query,
         query.dataDeviceIds != latent.dataDeviceIds || query.dataDeviceIds != indices.dataDeviceIds ||
         !V41IsSm75()) return false;
     const int tokens = query.dims[1], heads = query.dims[2], count = indices.dims[2];
-    if (tokens >= 128 && FastllmCudaGlm5HybridPrefillAttention(
+    if (tokens >= 128 && FastllmCudaSm75PrefillAttention(
             query, latent, indices, scale, output)) return true;
     // Bound scratch independently of prompt length. Keep the reference dot,
     // denominator and PV accumulation order, including every BF16 boundary.
@@ -4594,7 +4595,8 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                                                       const fastllm::Data *cmpIdx, fastllm::Data &attnSink,
                                                       int windowSize, int startPos, float softmaxScale,
                                                       fastllm::Data &output) {
-    if (V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") && FastllmCudaV41ReferenceAttention(q,chunkKV,ringKV,compressedKV,cmpIdx,attnSink,windowSize,startPos,softmaxScale,output)) return true;
+    const bool referenceMath = V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH");
+    if (referenceMath && FastllmCudaV41ReferenceAttention(q,chunkKV,ringKV,compressedKV,cmpIdx,attnSink,windowSize,startPos,softmaxScale,output)) return true;
     if (!V41OnCuda(q) || !V41OnCuda(chunkKV) || q.dims.size() != 4 || chunkKV.dims.size() != 3 ||
         q.dims[3] != 512 || q.dims[2] <= 0 || chunkKV.dataType != DataType::BFLOAT16 ||
         (q.dataType != DataType::BFLOAT16 && q.dataType != DataType::FLOAT32)) {
@@ -4633,6 +4635,12 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     }
     int cap = hasCmp ? compressedKV->dims[1] : 0;
     int topWidth = hasCmp ? cmpIdx->dims[2] : 0;
+    const bool legacyAttention = V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN");
+    if (!legacyAttention && !referenceMath &&
+        V41TrySm75PrefillAttention(q, chunkKV, hasRing ? ringKV : nullptr,
+            hasCmp ? compressedKV : nullptr, hasCmp ? cmpIdx : nullptr, attnSink,
+            windowSize, startPos, softmaxScale, ringMode, cmpMode, output)) return true;
+    if (FastllmCudaGetThreadError()) return false;
     // Packed KV on SM75: unpack candidates once and reuse each QK dot across
     // all output dimensions. Optional scratch follows the current stream / graph.
     if (bsz == 1 && seqlen >= 1 && seqlen <= 8 && q.dataType == DataType::BFLOAT16 &&
@@ -4641,7 +4649,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
         chunkKV.dims[0] == 1 && chunkKV.dims[1] == seqlen && chunkKV.dims[2] == dim &&
         (!hasRing || ringKV->dims[0] == 1) &&
         (!hasCmp || (compressedKV->dims[0] == 1 && cmpIdx->dims[0] == 1 && cmpIdx->dims[1] == seqlen)) &&
-        attnSink.Count(0) >= heads && !V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN") && V41IsSm75()) {
+        attnSink.Count(0) >= heads && !legacyAttention && V41IsSm75()) {
         const int windowCount = int(std::min<int64_t>(windowSize, int64_t(startPos) + seqlen));
         const int64_t candidates = int64_t(windowCount) + topWidth;
         if (candidates >= 32 && candidates <= 4096 && heads <= 128) {
@@ -4740,7 +4748,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     // Tail heads are zero-padded inside the tile; only real heads read/write
     // global Q, scores, sinks and output. In particular TP8 has eight heads.
     if (q.dataType == DataType::BFLOAT16 && dim == kMmaDim &&
-        !V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN")) {
+        !legacyAttention) {
         const int tokens = bsz * seqlen;
         const int headBlocks = (heads + kMmaHeads - 1) / kMmaHeads;
         bool launched = false;
@@ -4840,7 +4848,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
         // SM75 multi-token fallback keeps the same heads, QK reduction and online softmax.
         // Padding separates the eight lanes' shared-memory banks without
         // splitting values or repeating QK. Keep the legacy path for comparison.
-        else if (sm75 && seqlen > 1 && !V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN")) {
+        else if (sm75 && seqlen > 1 && !legacyAttention) {
             // Packed Q trades extra shared loads/bit shifts for occupancy.
             // Small batches cannot amortize that work; retain their old path.
             if (seqlen >= 128)

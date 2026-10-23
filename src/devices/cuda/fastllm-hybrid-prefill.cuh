@@ -12,9 +12,9 @@ inline void FastllmCudaHybridCheck(cudaError_t status) {
 bool FastllmCudaHybridBf16Gemm(const __nv_bfloat16 *input,
         const __nv_bfloat16 *weight, __nv_bfloat16 *output,
         int rows, int columns, int width, int outputStride, void *handle);
-bool FastllmCudaGlm5HybridPrefillAttention(const fastllm::Data &query,
+bool FastllmCudaSm75PrefillAttention(const fastllm::Data &query,
         const fastllm::Data &latent, const fastllm::Data &indices,
-        float scale, fastllm::Data &output);
+        float scale, fastllm::Data &output, const fastllm::Data *sink = nullptr);
 
 bool FastllmCudaHybridHcPost(const fastllm::Data &input, const fastllm::Data &residual,
         const float *post, const float *comb, fastllm::Data &output,
