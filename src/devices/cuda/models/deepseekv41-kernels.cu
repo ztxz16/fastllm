@@ -2240,8 +2240,9 @@ namespace {
     constexpr int kAttnThreads = kAttnHeadsPerBlock * kAttnLanes;   // 256
 
 
-    template <typename QT, int HeadsPerBlock = kAttnHeadsPerBlock, bool Padded = false, int ValueSplits = 1>
-    __global__ void __launch_bounds__(HeadsPerBlock * kAttnLanes)
+    template <typename QT, int HeadsPerBlock = kAttnHeadsPerBlock, bool Padded = false,
+              int ValueSplits = 1, bool LowRegisters = false>
+    __global__ void __launch_bounds__(HeadsPerBlock * kAttnLanes, LowRegisters ? 2 : 1)
     V41SparseAttentionKernel(const QT *q, const __nv_bfloat16 *chunkKV, const __nv_bfloat16 *ringKV,
                              const __nv_bfloat16 *compressedKV, const uint8_t *ringKV8, const uint8_t *compressedKV8,
                              const int32_t *cmpIdx,
@@ -2251,6 +2252,8 @@ namespace {
                              int ringMode, int ringRowBytes, int cmpMode, int cmpRowBytes) {
         static_assert(HeadsPerBlock % 4 == 0, "8-lane heads must fill complete warps");
         static_assert(ValueSplits > 0 && 64 % ValueSplits == 0, "value slices must partition each lane segment");
+        static_assert(!LowRegisters || (std::is_same_v<QT, __nv_bfloat16> && Padded && ValueSplits == 1),
+                      "packed queries require the padded BF16 multi-token path");
         constexpr int threads = HeadsPerBlock * kAttnLanes;
         // A 65-float stride gives the eight head lanes distinct shared-memory banks.
         __shared__ float kvRow[512 + (Padded ? 8 : 0)];
@@ -2262,9 +2265,18 @@ namespace {
         const int h = blockIdx.y * HeadsPerBlock + threadIdx.x / lanesPerHead;
         const int lane = threadIdx.x % lanesPerHead;
         const QT *qrow = q + ((uint64_t)t * heads + h) * dim + lane * segment;
-        float qv[64];
-        for (int d = 0; d < segment; d++) {
-            qv[d] = h < heads ? V41Load<QT>(qrow, d) : 0.0f;
+        float qv[LowRegisters ? 1 : 64];
+        uint32_t packedQ[LowRegisters ? 32 : 1];
+        if constexpr (LowRegisters) {
+            // Keep two original BF16 values per register. Every 64-value
+            // lane segment is aligned, including partial head blocks.
+            for (int d = 0; d < 32; d++) {
+                packedQ[d] = h < heads ? reinterpret_cast<const uint32_t *>(qrow)[d] : 0;
+            }
+        } else {
+            for (int d = 0; d < segment; d++) {
+                qv[d] = h < heads ? V41Load<QT>(qrow, d) : 0.0f;
+            }
         }
         constexpr int valueSegment = segment / ValueSplits;
         const int valueOffset = ValueSplits == 1 ? 0 : blockIdx.z * valueSegment;
@@ -2317,9 +2329,24 @@ namespace {
             }
             __syncthreads();
             float dot = 0.0f;
-            const float *seg = kvRow + lane * (segment + (Padded ? 1 : 0));
-            for (int d = 0; d < segment; d++) {
-                dot += qv[d] * seg[d];
+            // Reload shared KV for PV instead of retaining 64 values across
+            // QK. Together with packed Q this permits two SM75 CTAs per SM.
+            const std::conditional_t<LowRegisters, volatile float, float> *seg =
+                kvRow + lane * (segment + (Padded ? 1 : 0));
+            if constexpr (LowRegisters) {
+                #pragma unroll
+                for (int d = 0; d < segment; d++) {
+                    uint32_t bits;
+                    // Volatile PTX keeps expansion at the use site; hoisting
+                    // all 64 FP32 queries would defeat the register saving.
+                    if (d & 1) asm volatile("and.b32 %0, %1, 0xffff0000;" : "=r"(bits) : "r"(packedQ[d / 2]));
+                    else asm volatile("shl.b32 %0, %1, 16;" : "=r"(bits) : "r"(packedQ[d / 2]));
+                    dot += __uint_as_float(bits) * seg[d];
+                }
+            } else {
+                for (int d = 0; d < segment; d++) {
+                    dot += qv[d] * seg[d];
+                }
             }
             // 8 lane 归约
             dot += __shfl_xor_sync(0xffffffff, dot, 1);
@@ -4786,10 +4813,11 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
         const bool sm75 = V41IsSm75();
         const bool smallDecode = bsz == 1 && seqlen == 1 && sm75;
         if (FastllmCudaGetThreadError()) return false;
-        auto launchScalar = [&](auto headTag, auto padTag, auto valueTag) {
+        auto launchScalar = [&](auto headTag, auto padTag, auto valueTag, auto registerTag) {
             constexpr int headGroup = decltype(headTag)::value;
             dim3 grid(bsz * seqlen, (heads + headGroup - 1) / headGroup, decltype(valueTag)::value);
-            V41SparseAttentionKernel<__nv_bfloat16, headGroup, decltype(padTag)::value, decltype(valueTag)::value><<<grid, headGroup * kAttnLanes>>>(
+            V41SparseAttentionKernel<__nv_bfloat16, headGroup, decltype(padTag)::value,
+                                     decltype(valueTag)::value, decltype(registerTag)::value><<<grid, headGroup * kAttnLanes>>>(
                 (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
                 hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
                 hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
@@ -4802,13 +4830,18 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
         // SM75 decode: 8 heads x 8 value slices distributes 64 heads over
         // 64 CTAs. Each slice retains the full QK dot and online-softmax order;
         // only independent output dimensions are partitioned (no reduction).
-        if (smallDecode) launchScalar(std::integral_constant<int, 8>{}, std::true_type{}, std::integral_constant<int, 8>{});
+        if (smallDecode) launchScalar(std::integral_constant<int, 8>{}, std::true_type{}, std::integral_constant<int, 8>{}, std::false_type{});
         // SM75 multi-token fallback keeps the same heads, QK reduction and online softmax.
         // Padding separates the eight lanes' shared-memory banks without
         // splitting values or repeating QK. Keep the legacy path for comparison.
-        else if (sm75 && seqlen > 1 && !V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN"))
-            launchScalar(std::integral_constant<int, kAttnHeadsPerBlock>{}, std::true_type{}, std::integral_constant<int, 1>{});
-        else launchScalar(std::integral_constant<int, kAttnHeadsPerBlock>{}, std::false_type{}, std::integral_constant<int, 1>{});
+        else if (sm75 && seqlen > 1 && !V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN")) {
+            // Packed Q trades extra shared loads/bit shifts for occupancy.
+            // Small batches cannot amortize that work; retain their old path.
+            if (seqlen >= 128)
+                launchScalar(std::integral_constant<int, kAttnHeadsPerBlock>{}, std::true_type{}, std::integral_constant<int, 1>{}, std::true_type{});
+            else
+                launchScalar(std::integral_constant<int, kAttnHeadsPerBlock>{}, std::true_type{}, std::integral_constant<int, 1>{}, std::false_type{});
+        } else launchScalar(std::integral_constant<int, kAttnHeadsPerBlock>{}, std::false_type{}, std::integral_constant<int, 1>{}, std::false_type{});
     } else {
         dim3 grid(bsz * seqlen, (heads + kAttnHeadsPerBlock - 1) / kAttnHeadsPerBlock);
         V41SparseAttentionKernel<float><<<grid, kAttnThreads>>>(
