@@ -80,7 +80,7 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
     const auto &layout = group.LayerLayout(table);
     const int rows = input.dims[0], hidden = layout.hidden;
     const bool layerAdmission = layout.deepSeekV41 && layout.weightType == DATA_GGUF_FORMAT &&
-        rows > 1 && allowedDevices && allowedDevices->size() > 1;
+        (rows > 1 || !origin.frequencyActive) && allowedDevices && allowedDevices->size() > 1;
     if (!SupportsCooperativeMoe(layout) || (!origin.frequencyActive && !layerAdmission) ||
         !origin.hostKeyToSlot || input.dataType != BFLOAT16 ||
         !(NativeSharedRecords(group) || (layout.weightType == DATA_GGUF_FORMAT &&
@@ -222,7 +222,7 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
         }
     }
     const int cpuRoutes = std::count(r.Owners(), r.Owners() + routes, -1);
-    // Preserve V4.1 verify's bounded admission policy: one reused miss per
+    // Cached V4.1 decode and verify admit at most one reused miss per
     // layer, on its permanent PP owner. Enabling another execution device
     // must not turn a small verify into a global cache-refill burst.
     int candidate = -1;
@@ -232,7 +232,13 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
         for (int i = 0; i < routes; ++i) {
             auto &heat = r.heat[base + r.Indices()[i]];
             heat = std::min(heat + 1, 65535u);
-            if (r.Resident()[i] < 0 && heat >= 2 && heat > bestHeat) {
+            const int owner = r.Owners()[i];
+            const bool missed = owner < 0 || work[owner]->rank.stagedSlots[i] >= 0;
+            // Single-token decode must not start another host-weight read
+            // just to populate the cache. Promote only a local staged record;
+            // verification retains its amortized layer-local refill policy.
+            const bool reusable = rows > 1 || r.stagedSlots[i] >= 0;
+            if (missed && reusable && heat >= 2 && heat > bestHeat) {
                 bestHeat = heat; candidate = i;
             }
         }
@@ -471,7 +477,8 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
             ? r.overlap->records + size_t(staged) * layout.recordStride : nullptr;
         AssertInFastLLM(EnsureCachedExperts(&group, &origin, table,
             static_cast<int32_t *>(r.lookup.cudaData), topk, stream, record,
-            r.Indices()[candidate]), "Cooperative MoE admission failed");
+            r.Indices()[candidate], record && r.overlap->numaGateType >= 0),
+            "Cooperative MoE admission failed");
         checkCudaErrors("Cooperative MoE admission done", cudaEventRecord(r.copyEnd, stream));
         checkCudaErrors("Cooperative MoE admission fence", cudaEventRecord(origin.admissionDone, stream));
     }

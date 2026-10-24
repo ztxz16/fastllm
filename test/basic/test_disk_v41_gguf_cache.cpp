@@ -5,6 +5,11 @@
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -242,9 +247,139 @@ static void TestNativeLayout(Fixture &f, int device) {
     printf("PASS: V4.1 native/canonical cache device=%d gate=%d down=%d\n",device,f.gpu[2]->ggmlType,f.gpu[3]->ggmlType);
 }
 
+#ifdef USE_NUMAS
+// Exercise cached decode on both GPUs without admitting every miss.
+// Check admitted bytes independently: a staged interleaved record must never
+// be published as canonical, even when its first execution was correct.
+static void TestCooperativeDecode(Fixture &f) {
+    if (FastllmCudaGetDeviceCount() < 2) return;
+    HostMoePlacementScope placement(true);
+    constexpr int experts=24;
+    std::vector<std::unique_ptr<Data>> owned;
+    std::vector<Data *> weights(2*(experts+1));
+    std::vector<std::vector<uint8_t>> canonical(weights.size());
+    std::vector<std::pair<Data *,std::string>> pending;
+    for (size_t i=2; i<weights.size(); ++i) {
+        auto &gpu = *f.gpu[2+(i-2)%(2*f.experts)];
+        auto host = std::make_unique<Data>(DATA_GGUF_FORMAT,gpu.ggmlType,gpu.dims);
+        host->Allocate(false);
+        FastllmCudaCopyFromDeviceToHost(host->cpuData,gpu.cudaData,gpu.GetBytes());
+        canonical[i].assign(host->cpuData,host->cpuData+host->GetBytes());
+        weights[i]=host.get();
+        pending.push_back({host.get(),i%2 ? "linear" : "linearSwiglu"});
+        owned.push_back(std::move(host));
+    }
+    SetMoeCudaCacheBytes(16*f.bytes);
+    FastllmCudaMoeCacheLayer layer{weights.data(),int(weights.size()),true,.8f};
+    Check(FastllmCudaPrepareMoeCache(&layer,1,[&] { RegisterHostMoeWeightBatch(pending,true); },true),
+          "cooperative decode cache preparation failed");
+    for (int device : {0,1}) {
+        FastllmCudaSetDevice(device);
+        FastllmCudaMoePrefillResidents view;
+        Check(FastllmCudaGetMoePrefillResidents(weights.data(),experts,view,true),"decode cache allocation failed");
+    }
+    bool dual=false, resident=false, checkedPayload=false;
+    for (int pass=0; pass<64; ++pass) {
+        const int rows=pass%5==4 ? 6 : 1, topk=3, device=pass%2, offset=3*(pass/8);
+        FastllmCudaSetDevice(device);
+        Data x(BFLOAT16,{rows,f.hidden}),ids(INT32,{rows,topk}),scores(FLOAT32,{rows,topk}),out;
+        x.Allocate(false);ids.Allocate(false);scores.Allocate(false);
+        for (int r=0; r<rows; ++r) {
+            for (int c=0; c<f.hidden; ++c)
+                ((uint16_t*)x.cpuData)[r*f.hidden+c]=Float32ToBFloat16RNEBits(std::sin((r*f.hidden+c)*.71f)*3);
+            for (int k=0; k<topk; ++k) {
+                ((int32_t*)ids.cpuData)[r*topk+k]=(offset+(k==2 && r%3==0 ? 0 : k)+r%2)%experts;
+                ((float*)scores.cpuData)[r*topk+k]=k==0 ? 0 : k==1 ? -.17f : .2f+.13f*k;
+            }
+        }
+        std::vector<int32_t> hostIds((int32_t*)ids.cpuData,(int32_t*)ids.cpuData+rows*topk);
+        std::vector<int32_t> cpuOwners(rows*topk,-1);
+        std::vector<float> cpuOracle(size_t(rows)*topk*f.hidden),gpuOracle(cpuOracle.size());
+        NumasMoeVerifyExperts((uint16_t*)x.cpuData,cpuOracle.data(),rows,weights.data(),weights.size(),
+            hostIds.data(),cpuOwners.data(),(float*)scores.cpuData,topk,0,.8f,true,32);
+        // IQ1 CPU Q8_K and GPU Q8_1 are different established contracts.
+        // Build each route's two independent results before testing dispatch.
+        FastllmCudaSetDevice(0);
+        Data oracleIds(INT32,{rows,topk});oracleIds.Allocate(false);
+        for (int i=0; i<rows*topk; ++i) ((int32_t*)oracleIds.cpuData)[i]=hostIds[i]%f.experts;
+        x.ToDevice(CUDA,{0},true);oracleIds.ToDevice(CUDA,{0},true);scores.ToDevice(CUDA,{0},true);
+        for (int r=0; r<rows; ++r) for (int k=0; k<topk; ++k) {
+            Data xi,ii,ss,result;
+            xi.FakeFrom(x,size_t(r)*f.hidden*2);xi.Resize({1,f.hidden});
+            ii.FakeFrom(oracleIds,size_t(r*topk+k)*4);ii.Resize({1,1});
+            ss.FakeFrom(scores,size_t(r*topk+k)*4);ss.Resize({1,1});
+            DoCudaMergeMOEV41Fallback(xi,result,ii,ss,f.gpu.data(),f.gpu.size(),0,.8f);
+            FastllmCudaCopyFromDeviceToHost(gpuOracle.data()+size_t(r*topk+k)*f.hidden,
+                result.cudaData,f.hidden*sizeof(float));
+        }
+        FastllmCudaSetDevice(device);
+        x.ToDevice(CUDA,{device},true);ids.ToDevice(CUDA,{device},true);scores.ToDevice(CUDA,{device},true);
+        uint64_t before[2][8]{},after[2][8]{};
+        for (int d : {0,1}) Check(fastllm_moe_cuda_cache_route_stats(d,before[d]),"decode stats before");
+        int submitted=0;
+        Check(FastllmCudaMergeMOEHybridOnDevices(x,ids,scores,out,weights.data(),weights.size(),0,
+            {0,1},[&] { ++submitted; }),"cooperative decode rejected");
+        Check(submitted==1 && FastllmCudaGetDevice()==device,"decode callback or device restore");
+        out.ToDevice(CPU);
+        for (int r=0; r<rows; ++r) {
+            std::vector<int> order(topk);
+            for (int k=0; k<topk; ++k) order[k]=k;
+            std::stable_sort(order.begin(),order.end(),[&](int a,int b) { return hostIds[r*topk+a]<hostIds[r*topk+b]; });
+            bool matched=false;
+            for (int mask=0; mask<(1<<topk) && !matched; ++mask) {
+                matched=true;
+                for (int c=0; c<f.hidden && matched; ++c) {
+                    float sum=0;
+                    for (int k : order) sum+=(mask&(1<<k) ? gpuOracle : cpuOracle)[size_t(r*topk+k)*f.hidden+c];
+                    matched=Float32ToBFloat16RNEBits(sum)==((uint16_t*)out.cpuData)[r*f.hidden+c];
+                }
+            }
+            Check(matched,"cooperative decode differs from every CPU/GPU route combination");
+        }
+        uint64_t routes=0,computed=0,hits=0;
+        std::vector<bool> cached(experts,false);
+        for (int d : {0,1}) {
+            Check(fastllm_moe_cuda_cache_route_stats(d,after[d]),"decode stats after");
+            routes+=after[d][1]-before[d][1];
+            computed+=after[d][4]-before[d][4]+after[d][5]-before[d][5];
+            hits+=after[d][6]-before[d][6];
+            FastllmCudaSetDevice(d);
+            FastllmCudaMoePrefillResidents view;
+            Check(FastllmCudaGetMoePrefillResidents(weights.data(),experts,view,false),"decode residents unavailable");
+            for (size_t i=0; i<view.weights.size(); ++i) if (view.weights[i]) {
+                if (i%2==0) {
+                    Check(!cached[i/2],"cooperative admission duplicated a peer-resident expert");
+                    cached[i/2]=true;
+                }
+                std::vector<uint8_t> actual(canonical[i+2].size());
+                FastllmCudaCopyFromDeviceToHost(actual.data(),const_cast<void *>(view.weights[i]),actual.size());
+                Check(actual==canonical[i+2],"cooperative admission published noncanonical bytes");
+                checkedPayload=true;
+            }
+        }
+        Check(routes==uint64_t(rows*topk) && computed==routes,"decode lost or duplicated routes");
+        if (rows==1) {
+            dual|=after[0][4]>before[0][4] && after[1][4]>before[1][4];
+            resident|=hits>0;
+        }
+    }
+    Check(dual && resident && checkedPayload,"decode missed dual-GPU execution or cache hits");
+    FastllmCudaReleaseMoeCache(weights.data(),weights.size());
+    SetMoeCudaCacheBytes(0);
+    std::puts("PASS: V4.1 cached decode, dual GPU, canonical admissions and mixed CPU/GPU output");
+}
+#endif
+
 int main() { try {
     if (FastllmCudaGetDeviceCount()<1) return 77;
     SetThreads(4);
+#ifdef USE_NUMAS
+    for (int type : {GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M}) {
+        FastllmCudaSetDevice(0);
+        Fixture f(type,GGML_TYPE_Q2_0,0);
+        TestCooperativeDecode(f);
+    }
+#endif
     for (auto pair : std::vector<std::pair<int,int>>{
             {GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M},{GGML_TYPE_IQ1_M,GGML_TYPE_Q2_0},
             {GGML_TYPE_Q2_0,GGML_TYPE_Q3_K},{GGML_TYPE_Q3_K,GGML_TYPE_Q4_K},

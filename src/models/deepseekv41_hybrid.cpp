@@ -173,14 +173,17 @@ namespace fastllm {
         bool tpCacheHandled = false;
         bool singleCacheHandled = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        // Verification borrows the other PP devices between graph segments;
-        // concurrent prefill stages retain exclusive ownership of their GPU.
-        const bool cooperativeVerify = !tp && single && !ctx.pipelineHostExperts &&
+        // Ordinary cached decode and verification borrow the other PP devices
+        // between graph segments. Keep DSpark scalar steps on their existing
+        // path so scalar cache history does not bias verify's scheduler.
+        // Concurrent prefill retains exclusive GPU ownership.
+        const bool cooperativeMoe = !tp && single && !ctx.pipelineHostExperts &&
             hybridMoeDevices.size() > 1 && moeWeights[2]->dataType == DATA_GGUF_FORMAT &&
-            dsparkVerify && seqlen > 1 && seqlen <= 8 && !dumpDebug &&
+            ((seqlen == 1 && !v41DsparkEnabled && FastllmCudaMoeCacheRequested()) ||
+             (dsparkVerify && seqlen > 1 && seqlen <= 8)) && !dumpDebug &&
             !V41ReferenceMathEnabled() && UsesHostMoe(overlapMoeDevice);
         // Zero-budget decode retains its measured streaming scope. Cached
-        // verification keeps its existing layer-local admission policy.
+        // decode and verification use bounded layer-local admission.
         HybridMoeDecodeStep streamingStep;
         if (!tp && !graphActive && single && seqlen == 1 && !FastllmCudaMoeCacheRequested() &&
             !dumpDebug && !V41ReferenceMathEnabled() && hasSharedExpertOut &&
@@ -196,7 +199,7 @@ namespace fastllm {
             (seqlen >= 1 && seqlen < 32) && FastllmCudaMoeCacheRequested() &&
             !dumpDebug && !V41ReferenceMathEnabled() &&
             UsesHostMoe(overlapMoeDevice);
-        if (((step && *step) || singleStageCache || streamingStep || cooperativeVerify) && hasSharedExpertOut &&
+        if (((step && *step) || singleStageCache || streamingStep || cooperativeMoe) && hasSharedExpertOut &&
             moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
             ffnInput.dataDevice == DataDevice::CUDA && ffnInput.cudaData &&
             FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
@@ -208,7 +211,7 @@ namespace fastllm {
             auto stageRoute = [&](Data &buffer, Data &source) -> Data & {
                 // Eager PP routing already owns a valid CUDA tensor. Keep it
                 // on-device; the hybrid backend batches its pinned D2H copies.
-                if ((streamingStep || cooperativeVerify) && source.dataDevice == DataDevice::CUDA &&
+                if ((streamingStep || cooperativeMoe) && source.dataDevice == DataDevice::CUDA &&
                     source.cudaData && !source.multiDeviceData &&
                     GetPointerDeviceId(source.cudaData) == device) return source;
                 V41ReplicaToCpu(buffer, source, tpDevices);
@@ -221,7 +224,7 @@ namespace fastllm {
             input.FakeFrom(ffnInput, 0);
             input.Resize({seqlen, dim});
             input.dataDeviceIds = {device};
-            if ((streamingStep || cooperativeVerify) && !ctx.pipelineHostExperts && hybridMoeDevices.size() > 1)
+            if ((streamingStep || cooperativeMoe) && !ctx.pipelineHostExperts && hybridMoeDevices.size() > 1)
                 singleCacheHandled = fastllm::RunHybridMoeOnDevices(
                     input, routeIndex, routeScore, ffnOut, moeWeights.data(),
                     (int)moeWeights.size(), layer, hybridMoeDevices, runSharedSegment);
