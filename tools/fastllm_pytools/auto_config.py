@@ -264,14 +264,21 @@ def latency_score(candidate, model, costs, args, mode, mapping, hardware, peers)
     return prefill + 512 * decode * max(1, args.max_batch)
 
 
-def _deepseek_priority(candidate, model):
+def _deepseek_priority(candidate, model, backend=None):
     """Soft targets shared by topology-local and final candidate selection."""
     chunk = candidate["chunked_prefill_size"]
     # Fully resident experts need no additional cache. Otherwise fill the
     # per-GPU cache target before spending more memory on a larger chunk.
     cache = (3 * memory.GiB if candidate["resident_layers"] == model.layers
              else candidate["moe_cuda_cache"])
-    return min(chunk, 512), min(cache, 3 * memory.GiB), chunk
+    # Disk streaming rereads/reuploads the active expert set once per chunk.
+    # Reach the 4K interactive prompt before growing its cache. The capacity
+    # solver accounts for route skew, pinned staging and the full context.
+    streamed_disk = ((backend or candidate.get("moe_device")) == "disk" and
+                     model.disk_prefill.get("streamed_mmq", False) and
+                     32 < chunk * candidate.get("max_batch", 1) <= 4096 and
+                     candidate.get("expert_transport_bytes_per_device", 0) > 0)
+    return min(chunk, 4096 if streamed_disk else 512), min(cache, 3 * memory.GiB), chunk
 
 
 def kv_residencies(args, model):
@@ -503,7 +510,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                             # available when host memory cannot hold all experts.
                             placement = (2 if p["resident_layers"] == model.layers else
                                          int(p["resident_layers"] == 0 and p["moe_cuda_cache"] > 0)) if prefer_cache else 0
-                            priority = (_deepseek_priority(p, model) if model.family == "deepseek_v41"
+                            priority = (_deepseek_priority(p, model, backend) if model.family == "deepseek_v41"
                                         else (0, 0, 0))
                             return (priority, placement, -score, -p["host_estimated_bytes"], -p["resident_layers"])
                         variants = [prepared]
@@ -616,7 +623,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                            "ranking": "estimated latency; not measured throughput", "mtp": args.mtp}
     if model.family == "deepseek_v41":
         result["automatic"]["ranking"] = (
-            "non-disk experts first; fixed context; chunk up to 512, then per-GPU expert cache up to 3 GiB, "
+            "non-disk experts first; fixed context; chunk up to 4096 for streamed disk GGUF or 512 otherwise, then per-GPU expert cache up to 3 GiB, "
             "then largest feasible chunk; PP preferred for "
             "automatic host-backed hybrid; estimated latency"
         )

@@ -771,6 +771,33 @@ class HybridAutoTest(unittest.TestCase):
         result = auto.plan(a, g, costs, 'pp', {0: 1},
                            {0: dict(total=16*GiB, free=16*GiB, capability=75)}, dict(total=64*GiB, available=64*GiB))
         self.assertEqual(result['expert_transport_bytes_per_device'], 49 * 10 * MiB + 272 * MiB)
+        disk_args = copy.copy(a)
+        disk_args.moe_device, disk_args.moe_cpu_cache = 'disk', 0
+        disk = auto.plan(disk_args, g, costs, 'pp', {0: 1},
+                         {0: dict(total=16*GiB, free=16*GiB, capability=75)},
+                         dict(total=64*GiB, available=64*GiB))
+        self.assertEqual(disk['expert_transport_bytes_per_device'], 25 * 10 * MiB + 16 * MiB)
+        self.assertLess(disk['workspace_bytes_per_device'], result['workspace_bytes_per_device'])
+        # A skewed expert group slices activations while reusing its weights;
+        # the host/NUMA path retains its original conservative capacity.
+        unsliced = auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0)
+        sliced = auto._workspace_bytes(disk_args, g, 4096, 1048576, 'pp', 0)
+        capacity = ((4096 * g.topk + 8 * 15 + 15) // 16) * 16
+        row_bytes = ((max(g.hidden, g.intermediate) + 255) // 256 * 288 +
+                     max(g.hidden, 2 * g.intermediate) * 4)
+        self.assertEqual(unsliced - sliced, (capacity - min(capacity, 2048)) * row_bytes)
+        self.assertGreaterEqual(disk['host_estimated_bytes'], 24 * (10 * MiB + 24 * 1024))
+        # Phase release and bounded disk MMQ do not depend on approximate tail replay.
+        disk_args.fast_prefill = False
+        self.assertEqual(auto._workspace_bytes(disk_args, g, 4096, 1048576, 'pp', 0), sliced)
+        disk_args.fast_prefill = True
+
+        for override in ({'FT_GPU_PREFILL': 'off'},
+                         {'FASTLLM_DISK_MOE_GPU_PREFILL_MIN_TOKENS': '4097'},
+                         {'FASTLLM_DISK_MOE_GPU_PREFILL_MIN_TOKENS': '  +4097tail'}):
+            with self.subTest(override=override), patch.dict(os.environ, override):
+                self.assertEqual(auto._workspace_bytes(disk_args, g, 4096, 1048576, 'pp', 0),
+                                 auto._workspace_bytes(disk_args, g, 4096, 1048576, 'tp', 0))
         pair = auto.plan(a, g, costs, 'pp', {0: 1, 1: 1},
                          {d: dict(total=16*GiB, free=16*GiB, capability=75) for d in (0,1)},
                          dict(total=64*GiB, available=64*GiB))
@@ -805,7 +832,9 @@ class HybridAutoTest(unittest.TestCase):
         self.assertEqual(chunk(), 8192)
         g.disk_prefill['streamed_mmq'] = True
         a.moe_device = 'disk'
-        self.assertEqual(chunk(), 8192)
+        self.assertEqual(chunk(), 4096)
+        with patch.dict(os.environ, {'FT_GPU_PREFILL': '0'}):
+            self.assertEqual(chunk(), 8192)
 
     def test_v41_host_staging_is_reused_only_with_early_cuda_placement(self):
         g = auto.geometry(self.dspark_metadata(), 'float16', 0)

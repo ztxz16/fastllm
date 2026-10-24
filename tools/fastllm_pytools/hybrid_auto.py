@@ -818,6 +818,17 @@ def _v41_streamed_mmq(model, rows, topk):
             rows * topk + model.experts * 15 + 15 <= 65535)
 
 
+def _disk_v41_streamed_mmq(args, model, rows, topk):
+    if args.moe_device != "disk" or not _v41_streamed_mmq(model, rows, topk):
+        return False
+    # Match the runtime's atoi prefix parsing, including trailing characters.
+    raw = os.environ.get("FASTLLM_DISK_MOE_GPU_PREFILL_MIN_TOKENS", "32")
+    prefix = re.match(r"\s*([+-]?[0-9]+)", raw)
+    minimum = max(1, int(prefix[1]) if prefix else 0)
+    return (os.environ.get("FT_GPU_PREFILL", "1").lower() not in ("0", "false", "off") and
+            rows >= minimum)
+
+
 def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=True):
     topk = max(model.topk, args.moe_experts)
     scores = _score_workspace(model, rows, context)
@@ -827,17 +838,19 @@ def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=Tru
     # layers are CUDA-resident. The resident GGUF route buffers survive those
     # releases and are charged separately below.
     resident_gguf = resident and all(layer in model.gguf_expert_bytes for layer in range(resident))
+    canonical_gguf = phase.get("canonical_gguf", False)
+    disk_streamed = _disk_v41_streamed_mmq(args, model, rows, topk)
     reusable = (phase and (args.moe_device in ("disk", "numa") or getattr(args, "_host_moe_shared", False)) and (resident == 0 or resident_gguf) and mode == "pp" and
-                args.max_batch == 1 and rows > phase["window"] and args.fast_prefill and
+                args.max_batch == 1 and rows > phase["window"] and
+                (args.fast_prefill or (canonical_gguf and disk_streamed)) and
                 args.dtype == "auto" and args.moe_dtype in ("", "auto") and
                 args.atype in ("auto", "bfloat16") and args.moe_atype in ("", "auto", "bfloat16") and
                 "FASTLLM_DSV41_DUMP_DIR" not in os.environ and
                 os.environ.get("FASTLLM_DSV41_REFERENCE_MATH", "0") in ("", "0"))
     # Canonical GGUF's streamed grouped MMQ currently accepts <=4096 rows.
     # Larger explicit chunks retain the conservative per-expert fallback bound.
-    canonical_gguf = phase.get("canonical_gguf", False)
     if canonical_gguf and (not gguf_mmq or not _v41_streamed_mmq(model, rows, topk) or
-                           args.moe_device == "disk"):
+                           (args.moe_device == "disk" and not disk_streamed)):
         reusable = False
     if not reusable:
         return scores + rows * (model.activation_width + topk * (model.hidden + 3 * model.intermediate)) * 4 + dense
@@ -875,6 +888,10 @@ def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=Tru
         # Bound the worst routing skew, not average experts per token: one
         # eight-expert batch can contain every route, plus 15-row padding each.
         capacity = math.ceil((rows * topk + 8 * 15) / 16) * 16
+        if disk_streamed:
+            # Disk RunPipelined slices activations at 2048 padded routes while
+            # retaining each weight group across slices, even under route skew.
+            capacity = min(capacity, 2048)
         streamed_scratch = (rows * model.hidden * 296 // 256 +
                             capacity * (math.ceil(max(model.hidden, model.intermediate) / 256) * 288 +
                                         max(model.hidden, 2 * model.intermediate) * 4) +
@@ -966,7 +983,8 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             # Explicit chunks and backends without this fast path retain the
             # conservative fallback budget below.
             if (args.chunked_prefill_size == "auto" and canonical_gguf and gguf_mmq and
-                    shared_host and mode == "pp" and resident < model.layers and rows > 4096 and
+                    (shared_host or _disk_v41_streamed_mmq(args, model, 4096, max(model.topk, args.moe_experts))) and
+                    mode == "pp" and resident < model.layers and rows > 4096 and
                     args.fast_prefill and args.atype in ("auto", "bfloat16") and
                     args.moe_atype in ("", "auto", "bfloat16") and
                     _v41_streamed_mmq(model, 4096, max(model.topk, args.moe_experts))):
@@ -993,6 +1011,18 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                 ring_records += decode_topk + 1
             transport = (ring_records * (math.ceil(record / 256) * 256) + 272 * MiB
                          if model.family == "deepseek_v41" and shared_host and record else 0)
+            disk_streamed = (canonical_gguf and gguf_mmq and
+                             _disk_v41_streamed_mmq(args, model, rows, max(model.topk, args.moe_experts)))
+            disk_staging = 0
+            if disk_streamed and record:
+                # Disk records are already canonical: one 3 x 8 ring, no
+                # restore copy or NUMA lookahead. Pinned upload slots coexist
+                # on the host; each device owns its independent bounded ring.
+                disk_ring = 24 * (math.ceil(record / 256) * 256)
+                # Two page-aligned matrices per expert, with direct-I/O padding.
+                # Host storage also includes eight next-layer read-ahead slots.
+                disk_staging = 32 * (math.ceil(record / 256) * 256 + 24 * 1024)
+                transport = disk_ring + math.ceil(record / 256) * 256 + 16 * MiB
             used = {d: common + workspace + transport + guard for d in mapping}
             reallocation = dict.fromkeys(mapping, 0)
             logical_kv = dict.fromkeys(mapping, 0)
@@ -1086,7 +1116,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                           "FASTLLM_DSV41_DUMP_DIR" not in os.environ and
                           os.environ.get("FASTLLM_DSV41_REFERENCE_MATH", "0") in ("", "0"))
             host_workspace = max(staging, workspace) if early_cuda else staging + workspace
-            host_required = host + host_workspace + GiB
+            host_required = host + host_workspace + GiB + len(mapping) * disk_staging
             if args.moe_device != "disk":
                 host_required += host_experts
                 pinned = os.environ.get("FT_PINNED_WEIGHT", "1").lower() not in ("0", "false", "off")

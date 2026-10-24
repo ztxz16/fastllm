@@ -40,6 +40,28 @@ class AutoConfigTest(unittest.TestCase):
     def args(self, *options):
         return make_normal_parser('test').parse_args(['model.gguf', '--auto', *options])
 
+    def test_streamed_disk_gguf_chunk_priority_preserves_host_policy(self):
+        self.g.family = 'deepseek_v41'
+        self.g.disk_prefill = {'canonical_gguf': True, 'streamed_mmq': True}
+        small = dict(chunked_prefill_size=512, resident_layers=0, moe_cuda_cache=2*GiB,
+                     expert_transport_bytes_per_device=256*1024**2)
+        large = dict(small, chunked_prefill_size=2048, moe_cuda_cache=GiB)
+        self.assertGreater(auto._deepseek_priority(large, self.g, 'disk'),
+                           auto._deepseek_priority(small, self.g, 'disk'))
+        prompt = dict(large, chunked_prefill_size=4096, moe_cuda_cache=GiB//2)
+        self.assertGreater(auto._deepseek_priority(prompt, self.g, 'disk'),
+                           auto._deepseek_priority(large, self.g, 'disk'))
+        for fallback in (dict(prompt, chunked_prefill_size=8192, moe_cuda_cache=3*GiB),
+                         dict(prompt, max_batch=2, moe_cuda_cache=3*GiB)):
+            self.assertGreater(auto._deepseek_priority(prompt, self.g, 'disk'),
+                               auto._deepseek_priority(fallback, self.g, 'disk'))
+        for backend in ('numa', 'cpu'):
+            self.assertLess(auto._deepseek_priority(large, self.g, backend),
+                            auto._deepseek_priority(small, self.g, backend))
+        small['expert_transport_bytes_per_device'] = large['expert_transport_bytes_per_device'] = 0
+        self.assertLess(auto._deepseek_priority(large, self.g, 'disk'),
+                        auto._deepseek_priority(small, self.g, 'disk'))
+
     def test_tracking_aliases_zero_and_subcommands(self):
         parser = _AutoArgumentParser()
         sub = parser.add_subparsers(dest='command')
