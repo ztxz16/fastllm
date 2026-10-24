@@ -29,11 +29,12 @@ template<> inline int scale(const block_iq3_xxs &x, int g) {
     return 1 + 2 * (iq3_xxs_metadata(x, g) >> 28);
 }
 // IQ2_S has independent scales for the two halves of each 32-value group.
-inline int iq2_s_scale(const block_iq2_s &x, int g, int half) {
+template<class Block> inline int iq2_s_scale(const Block &x, int g, int half) {
     return 1 + 2 * ((x.scales[g] >> (4 * half)) & 15);
 }
 template<class Block> constexpr float block_scale() { return 1.f; }
 template<> constexpr float block_scale<block_iq2_s>() { return .125f; }
+template<> constexpr float block_scale<block_iq2_xs>() { return .125f; }
 template<> constexpr float block_scale<block_iq3_xxs>() { return .25f; }
 
 #if defined(__AVX2__)
@@ -52,6 +53,14 @@ inline __m256i unpack(const block_iq2_s &x, int g) {
         iq2s_grid[q[2] | ((h << 4) & 0x300)], iq2s_grid[q[3] | ((h << 2) & 0x300)]);
     uint32_t signs;
     std::memcpy(&signs, x.qs + QK_K / 8 + 4 * g, sizeof(signs));
+    return apply_signs(values, signs);
+}
+inline __m256i unpack(const block_iq2_xs &x, int g) {
+    const uint16_t *q = x.qs + 4 * g;
+    const __m256i values = _mm256_setr_epi64x(iq2xs_grid[q[0] & 511], iq2xs_grid[q[1] & 511],
+                                           iq2xs_grid[q[2] & 511], iq2xs_grid[q[3] & 511]);
+    const uint32_t signs = uint32_t(ksigns_iq2xs[q[0] >> 9]) | (uint32_t(ksigns_iq2xs[q[1] >> 9]) << 8) |
+        (uint32_t(ksigns_iq2xs[q[2] >> 9]) << 16) | (uint32_t(ksigns_iq2xs[q[3] >> 9]) << 24);
     return apply_signs(values, signs);
 }
 inline __m256i unpack(const block_iq3_xxs &x, int g) {
@@ -104,6 +113,11 @@ inline int value(const block_iq2_s &x, int g, int j) {
     const int v = (iq2s_grid[index] >> (8 * (j % 8))) & 255;
     return x.qs[QK_K / 8 + 4 * g + lane] & (1 << (j % 8)) ? -v : v;
 }
+inline int value(const block_iq2_xs &x, int g, int j) {
+    const uint16_t q = x.qs[4 * g + j / 8];
+    const int v = (iq2xs_grid[q & 511] >> (8 * (j % 8))) & 255;
+    return ksigns_iq2xs[q >> 9] & (1 << (j % 8)) ? -v : v;
+}
 inline int value(const block_iq3_xxs &x, int g, int j) {
     const int v = (iq3xxs_grid[x.qs[8 * g + j / 4]] >> (8 * (j % 4))) & 255;
     const auto signs = ksigns_iq2xs[(iq3_xxs_metadata(x, g) >> (7 * (j / 8))) & 127];
@@ -135,7 +149,7 @@ template<class Block> inline float dot(int n, const Block *x, const block_q8_K *
             // The group scale fits in int16. Apply it in the widening
             // multiply-add instead of a second int32 vector multiply.
             __m256i scales;
-            if constexpr (std::is_same<Block, block_iq2_s>::value) {
+            if constexpr (std::is_same<Block, block_iq2_s>::value || std::is_same<Block, block_iq2_xs>::value) {
                 scales = _mm256_insertf128_si256(_mm256_castsi128_si256(
                     _mm_set1_epi16(iq2_s_scale(x[b], g, 0))),
                     _mm_set1_epi16(iq2_s_scale(x[b], g, 1)), 1);
@@ -162,7 +176,8 @@ template<class Block> inline float dot(int n, const Block *x, const block_q8_K *
         for (int g = 0; g < 8; ++g) {
             for (int j = 0; j < 32; ++j) {
                 int s;
-                if constexpr (std::is_same<Block, block_iq2_s>::value) s = iq2_s_scale(x[b], g, j / 16);
+                if constexpr (std::is_same<Block, block_iq2_s>::value || std::is_same<Block, block_iq2_xs>::value)
+                    s = iq2_s_scale(x[b], g, j / 16);
                 else s = scale(x[b], g);
                 total += s * value(x[b], g, j) * int(y[b].qs[g * 32 + j]);
             }

@@ -40,7 +40,8 @@ struct Fixture {
             auto dims = part ? std::vector<int>{hidden,inter} : std::vector<int>{2*inter,hidden};
             auto w = std::make_unique<Data>(DATA_GGUF_FORMAT,type,dims);
             w->disableGGUFRepack = true; w->isGGUFData = true;
-            if (type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M) {
+            if (type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+                type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS) {
                 w->Allocate(false);
                 for (size_t i=0; i<w->GetBytes(); ++i) w->cpuData[i] = rng()>>24;
                 for (size_t i=0; i<w->GetBytes(); i+=ggml_type_size(ggml_type(type))) {
@@ -374,7 +375,7 @@ int main() { try {
     if (FastllmCudaGetDeviceCount()<1) return 77;
     SetThreads(4);
 #ifdef USE_NUMAS
-    for (int type : {GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M}) {
+    for (int type : {GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M,GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XS,GGML_TYPE_IQ2_S,GGML_TYPE_IQ3_XXS}) {
         FastllmCudaSetDevice(0);
         Fixture f(type,GGML_TYPE_Q2_0,0);
         TestCooperativeDecode(f);
@@ -383,7 +384,10 @@ int main() { try {
     for (auto pair : std::vector<std::pair<int,int>>{
             {GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M},{GGML_TYPE_IQ1_M,GGML_TYPE_Q2_0},
             {GGML_TYPE_Q2_0,GGML_TYPE_Q3_K},{GGML_TYPE_Q3_K,GGML_TYPE_Q4_K},
-            {GGML_TYPE_Q4_K,GGML_TYPE_IQ1_S}}) {
+            {GGML_TYPE_Q4_K,GGML_TYPE_IQ1_S},
+            {GGML_TYPE_IQ1_S,GGML_TYPE_IQ2_S},{GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ1_M},
+            {GGML_TYPE_IQ2_XS,GGML_TYPE_IQ3_XXS},{GGML_TYPE_IQ2_S,GGML_TYPE_IQ2_XS},
+            {GGML_TYPE_IQ3_XXS,GGML_TYPE_IQ2_XXS}}) {
         for (int device=0; device<std::min(2,FastllmCudaGetDeviceCount()); ++device) {
             printf("gate=%d down=%d device=%d\n",pair.first,pair.second,device); fflush(stdout);
             Fixture f(pair.first,pair.second,device);

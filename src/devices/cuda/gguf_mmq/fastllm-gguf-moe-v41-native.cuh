@@ -41,6 +41,7 @@ static bool NativeV41Matrix(int type, const uint8_t *const *weights, int part,
             weights, part, w, experts, columns, width, stream); break;
         NATIVE_MATRIX(IQ1_S) NATIVE_MATRIX(IQ1_M) NATIVE_MATRIX(Q2_0)
         NATIVE_MATRIX(Q3_K) NATIVE_MATRIX(Q4_K)
+        NATIVE_MATRIX(IQ2_XXS) NATIVE_MATRIX(IQ2_XS) NATIVE_MATRIX(IQ2_S) NATIVE_MATRIX(IQ3_XXS)
 #undef NATIVE_MATRIX
         default: return false;
     }

@@ -1,4 +1,6 @@
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-gguf-projections.h"
+#include "executor.h"
 #define GGML_COMMON_DECL_CUDA
 #include "gguf.h"
 #include <cuda_bf16.h>
@@ -118,6 +120,97 @@ static void Test(int rows, int columns, int outputs, ggml_type type = GGML_TYPE_
     }
 }
 
+template<typename T>
+static void TestGroupedWoA(int tokens) {
+    using namespace fastllm;
+    constexpr bool bf16 = std::is_same<T, __nv_bfloat16>::value;
+    const auto dtype = std::is_same<T, float>::value ? FLOAT32 : bf16 ? BFLOAT16 : FLOAT16;
+    constexpr int groups = 8, columns = 256, outputs = 129;
+    Data input(dtype, {1, tokens, groups, columns});
+    Data weight(DATA_GGUF_FORMAT, GGML_TYPE_Q5_K, {groups, outputs, columns}), output;
+    input.Allocate(false); weight.Allocate(false);
+    const auto packed = Weights(GGML_TYPE_Q5_K, groups * outputs, columns);
+    memcpy(weight.cpuData, packed.data(), packed.size());
+    std::vector<float> decoded(groups * outputs * columns), sums(groups * outputs, 0);
+    ggml_type_to_float(GGML_TYPE_Q5_K)(packed.data(), decoded.data(), decoded.size());
+    for (int i = 0; i < groups * outputs; ++i)
+        for (int c = 0; c < columns; ++c) sums[i] += decoded[i*columns+c];
+    for (int t = 0; t < tokens; ++t) for (int g = 0; g < groups; ++g)
+        for (int c = 0; c < columns; ++c)
+            reinterpret_cast<T *>(input.cpuData)[(t*groups+g)*columns+c] =
+                T((t%3-1) * (127.f/128) / (1 << (g%3)));
+    input.ToDevice(CUDA, {0}, true); weight.ToDevice(CUDA, {0}, true);
+    weight.strides.clear(); // Direct GGUF imports carry ggml strides, not Data strides.
+    auto &executor = *static_cast<Executor *>(GetExecutor());
+    executor.RunOnDevice("cuda", "DeepSeekV4WoA", {{"input", &input}, {"weight", &weight}, {"output", &output}},
+                         {}, {{"groups", groups}, {"oRank", outputs}});
+    Cuda(cudaDeviceSynchronize()); output.ToDevice(CPU);
+    Check(output.dims == std::vector<int>({1,tokens,groups*outputs}) && output.dataType == dtype,
+          "GGUF grouped WoA shape/type");
+    double error = 0, norm = 0;
+    for (int t = 0; t < tokens; ++t) for (int g = 0; g < groups; ++g) for (int o = 0; o < outputs; ++o) {
+        const float expected = (t%3-1) * (127.f/128) / (1 << (g%3)) * sums[g*outputs+o];
+        const float actual = float(reinterpret_cast<T *>(output.cpuData)[(t*groups+g)*outputs+o]);
+        Check(std::isfinite(actual), "GGUF grouped WoA nonfinite output");
+        error += double(actual-expected)*(actual-expected); norm += double(expected)*expected;
+    }
+    Check(std::sqrt(error / std::max(norm,1e-30)) < .004, "GGUF grouped WoA differs from scalar Q5_K oracle");
+}
+
+template<typename T>
+static void TestGroupedGemvExact(int groups, int columns, int outputs) {
+    using namespace fastllm;
+    const auto dtype = std::is_same<T,float>::value ? FLOAT32 :
+        std::is_same<T,half>::value ? FLOAT16 : BFLOAT16;
+    Data input(dtype, {1,1,groups,columns});
+    Data weight(DATA_GGUF_FORMAT, GGML_TYPE_Q5_K, {groups,outputs,columns});
+    Data output, reference(dtype, {1,1,groups*outputs}), bias;
+    input.Allocate(false); weight.Allocate(false);
+    const auto packed = Weights(GGML_TYPE_Q5_K, groups*outputs, columns);
+    memcpy(weight.cpuData, packed.data(), packed.size());
+    input.ToDevice(CUDA, {0}, false); weight.ToDevice(CUDA, {0}, true);
+    reference.ToDevice(CUDA, {0}, false); reference.Allocate(false);
+    const size_t groupBytes = weight.Count(0) / groups;
+    weight.strides.clear();
+    auto run = [&] { Check(FastllmCudaGGUFGroupedGemv(input, weight, groups, outputs, output),
+                          "grouped GEMV rejected supported shape"); };
+    run(); Cuda(cudaDeviceSynchronize());
+    cudaGraph_t graph; cudaGraphExec_t executable;
+    Check(FastllmCudaGraphMemoryPoolBegin(), "grouped graph pool begin");
+    Check(FastllmCudaGraphBeginCapture(), "grouped graph begin");
+    run();
+    void *captured=nullptr;
+    Check(FastllmCudaGraphEndCapture(&captured), "grouped graph end");
+    graph=static_cast<cudaGraph_t>(captured);
+    std::vector<void *> reserved;
+    Check(FastllmCudaGraphMemoryPoolEnd(reserved), "grouped graph pool end");
+    Cuda(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    for (int pass=0; pass<3; ++pass) {
+        std::vector<T> values(groups*columns), actual(groups*outputs), expected(groups*outputs);
+        for (size_t i=0; i<values.size(); ++i) values[i]=T(std::sin(float(i*17+pass*13))*.25f);
+        Cuda(cudaMemcpy(input.cudaData, values.data(), values.size()*sizeof(T), cudaMemcpyHostToDevice));
+        if (pass) Cuda(cudaGraphLaunch(executable, cudaStreamPerThread)); else run();
+        for (int g=0; g<groups; ++g) {
+            Data x,y,w;
+            x.FakeFrom(input, size_t(g)*columns*sizeof(T)); x.Resize({1,columns});
+            y.FakeFrom(reference, size_t(g)*outputs*sizeof(T)); y.Resize({1,outputs});
+            w.FakeFrom(weight, g*groupBytes); w.ggmlType=GGML_TYPE_Q5_K; w.dims={outputs,columns};
+            if constexpr (std::is_same<T,float>::value)
+                Check(FastllmCudaMatMulFloatGGUF(x,w,bias,y,1,columns,outputs), "ordinary GEMV");
+            else if constexpr (std::is_same<T,half>::value)
+                Check(FastllmCudaHalfMatMulGGUF(x,w,bias,y,1,columns,outputs), "ordinary GEMV");
+            else Check(FastllmCudaBFloat16MatMulGGUF(x,w,bias,y,1,columns,outputs), "ordinary GEMV");
+        }
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        Cuda(cudaMemcpy(actual.data(), output.cudaData, actual.size()*sizeof(T), cudaMemcpyDeviceToHost));
+        Cuda(cudaMemcpy(expected.data(), reference.cudaData, expected.size()*sizeof(T), cudaMemcpyDeviceToHost));
+        Check(!memcmp(actual.data(), expected.data(), actual.size()*sizeof(T)),
+              "grouped GEMV must be bitwise equal to independent GEMVs, including graph replay");
+    }
+    Cuda(cudaGraphExecDestroy(executable)); Cuda(cudaGraphDestroy(graph));
+    FastllmCudaGraphMemoryPoolRelease(reserved);
+}
+
 int main() {
     try {
         int count = 0;
@@ -130,6 +223,16 @@ int main() {
         if (prop.major * 10 + prop.minor < 75) {
             std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: MMQ requires SM75+");
             return 0;
+        }
+        for (int groups : {1,3,8}) {
+            TestGroupedGemvExact<float>(groups, 256, 129);
+            TestGroupedGemvExact<half>(groups, 4096, 1024);
+            TestGroupedGemvExact<__nv_bfloat16>(groups, 4096, 1024);
+        }
+        for (int tokens : {1, 33, 1025}) {
+            TestGroupedWoA<float>(tokens);
+            TestGroupedWoA<__half>(tokens);
+            TestGroupedWoA<__nv_bfloat16>(tokens);
         }
         for (int rows : {33, 129, 1024, 1025, 1031, 2000, 2048, 2057}) {
             for (int columns : {128, 256, 384}) {
@@ -149,7 +252,7 @@ int main() {
         // the narrow output keeps the FP32 scratch well below its limit.
         Test<__nv_bfloat16>(4097, 32768, 129);
         Test<__nv_bfloat16>(65537, 256, 129);
-        for (auto type : {GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K}) {
+        for (auto type : {GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K, GGML_TYPE_Q5_K}) {
             std::fprintf(stderr, "CHECK: long and chunked packed type=%d\n", int(type));
             Test<float>(2057, 256, 129, type);
             Test<half>(2057, 256, 129, type);

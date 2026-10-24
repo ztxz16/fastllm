@@ -7,6 +7,7 @@
 #include "fastllm-cuda.cuh"
 #include <cuda_fp8.h>
 #include "../fastllm-gguf-iq1-grid.cuh"
+#include "../fastllm-gguf-iq2-dot.cuh"
 
 namespace {
 // The same FP8 block-32 -> BF16 -> Q8_1 boundaries as the ordinary CUDA
@@ -39,9 +40,10 @@ __device__ __forceinline__ float V41GGUFDot(const void *weight, const block_q8_1
         constexpr int qi = [] {
             if constexpr (Type == GGML_TYPE_IQ1_S) return QI1_S;
             else if constexpr (Type == GGML_TYPE_IQ1_M) return QI1_M;
+            else if constexpr (Type == GGML_TYPE_IQ2_XXS || Type == GGML_TYPE_IQ2_XS || Type == GGML_TYPE_IQ2_S) return 16;
             else return ggml_cuda_type_traits<Type>::qi;
         }();
-        constexpr int vdr = get_vdr_mmvq(Type);
+        constexpr int vdr = (Type == GGML_TYPE_IQ2_XXS || Type == GGML_TYPE_IQ2_XS || Type == GGML_TYPE_IQ2_S) ? 2 : get_vdr_mmvq(Type);
         constexpr int step = vdr*128/qi;
         const int lane = threadIdx.x%32;
         float partial[4];
@@ -54,6 +56,12 @@ __device__ __forceinline__ float V41GGUFDot(const void *weight, const block_q8_1
                     value += vec_dot_iq1_s_q8_1_grid(weight, x+b*8, b, vdr*(tid%(qi/vdr)), iqGrid);
                 else if constexpr (Type == GGML_TYPE_IQ1_M)
                     value += vec_dot_iq1_m_q8_1_grid(weight, x+b*8, b, vdr*(tid%(qi/vdr)), iqGrid);
+                else if constexpr (Type == GGML_TYPE_IQ2_XXS)
+                    value += iq2_decode::DotXXS(weight, x+b*8, b, vdr*(tid%(qi/vdr)), reinterpret_cast<const uint64_t *>(iqGrid));
+                else if constexpr (Type == GGML_TYPE_IQ2_XS)
+                    value += iq2_decode::DotXS(weight, x+b*8, b, vdr*(tid%(qi/vdr)), reinterpret_cast<const uint64_t *>(iqGrid));
+                else if constexpr (Type == GGML_TYPE_IQ2_S)
+                    value += iq2_decode::DotS(weight, x+b*8, b, vdr*(tid%(qi/vdr)), reinterpret_cast<const uint64_t *>(iqGrid));
                 else if constexpr (Type == GGML_TYPE_Q3_K)
                     value += fastllm_gguf_q3_k::Dot(weight, x+b*8, b, vdr*(tid%(qi/vdr)));
                 else value += get_vec_dot_q_cuda(Type)(weight, x+b*8, b, vdr*(tid%(qi/vdr)));
@@ -116,10 +124,16 @@ __global__ void V41GGUFProjection(const block_q8_1 *input, __nv_bfloat16 *output
     }
     const auto *x = input + size_t(Gate ? V41Route(weights, route)/topk : route)*(columns/32);
     extern __shared__ uint32_t activation[];
-    __shared__ uint32_t iqGrid[(Type == GGML_TYPE_IQ1_S || Type == GGML_TYPE_IQ1_M) ? 2048 : 1];
+    constexpr int gridWords = (Type == GGML_TYPE_IQ1_S || Type == GGML_TYPE_IQ1_M || Type == GGML_TYPE_IQ2_S) ? 2048 :
+        Type == GGML_TYPE_IQ2_XS ? 1024 : Type == GGML_TYPE_IQ2_XXS ? 512 : 2;
+    __shared__ uint64_t gridStorage[gridWords/2];
+    auto *iqGrid = reinterpret_cast<uint32_t *>(gridStorage);
     if constexpr (Type == GGML_TYPE_IQ1_S || Type == GGML_TYPE_IQ1_M) {
         for (int i = threadIdx.x; i < 2048; i += blockDim.x)
             iqGrid[i] = fastllm_iq1_grid_packed[i];
+    } else if constexpr (Type == GGML_TYPE_IQ2_XXS || Type == GGML_TYPE_IQ2_XS || Type == GGML_TYPE_IQ2_S) {
+        const uint64_t *source = Type == GGML_TYPE_IQ2_S ? iq2s_grid : Type == GGML_TYPE_IQ2_XS ? iq2xs_grid : iq2xxs_grid;
+        for (int i = threadIdx.x; i < gridWords/2; i += blockDim.x) gridStorage[i] = source[i];
     }
     for (int i = threadIdx.x; i < columns/32*int(sizeof(block_q8_1))/4; i += blockDim.x)
         activation[i] = reinterpret_cast<const uint32_t *>(x)[i];
@@ -186,6 +200,7 @@ void Project(int type, const block_q8_1 *input, __nv_bfloat16 *output,
             input, output, weights, indices, experts, topk, columns, rows, \
             ggml_row_size(GGML_TYPE_##Type, columns)); break; }
         PROJECT(Q2_0) PROJECT(Q2_K) PROJECT(Q3_K) PROJECT(Q4_K) PROJECT(IQ1_S) PROJECT(IQ1_M)
+        PROJECT(IQ2_XXS) PROJECT(IQ2_XS) PROJECT(IQ2_S) PROJECT(IQ3_XXS)
 #undef PROJECT
     }
 }
@@ -251,7 +266,9 @@ bool FastllmCudaV41GGUFSupported(int gateType, int downType) {
     const auto supported = [](int type) {
         return type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q2_K ||
             type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
-            type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M;
+            type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ||
+            type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+            type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS;
     };
     return supported(gateType) && supported(downType);
 }

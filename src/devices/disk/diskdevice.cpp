@@ -811,7 +811,7 @@ namespace fastllm {
             weight.diskWeightParts[0].fileOffset < 0) return false;
         const int type = weight.ggmlType;
         return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q4_K ||
-            type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S ||
+            type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S ||
             type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS ||
             type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ||
             type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q3_K;

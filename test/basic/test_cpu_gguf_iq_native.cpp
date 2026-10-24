@@ -214,6 +214,8 @@ int main() {
     try {
         RunQ2();
         RunIQ3SCodebook();
+        Run<block_iq2_xs>(GGML_TYPE_IQ2_XS);
+        RunR4(GGML_TYPE_IQ2_XS);
         Run<block_iq2_s>(GGML_TYPE_IQ2_S);
         Run<block_iq3_xxs>(GGML_TYPE_IQ3_XXS);
         Run<block_iq3_s>(GGML_TYPE_IQ3_S);

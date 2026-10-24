@@ -133,7 +133,9 @@ size_t FastllmCudaV41GGUFGroupedWorkspaceBytes(int gateType, int downType,
     using namespace fastllm_gguf_mmq;
     const auto supported = [](int type) {
         return type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ||
-            type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K;
+            type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
+            type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+            type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS;
     };
     if (rows <= 32 || rows > 4096 || !supported(gateType) || !supported(downType) ||
         hidden <= 0 || hidden > 24576 || hidden%256 ||
