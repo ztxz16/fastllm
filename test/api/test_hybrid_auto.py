@@ -2,7 +2,7 @@
 import copy
 import io
 import types
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import json
 import os
 from pathlib import Path
@@ -480,24 +480,30 @@ class HybridAutoTest(unittest.TestCase):
     def test_host_reserve_keeps_floor_and_caps_large_machine_budget(self):
         g, c, gpu, _ = fixture()
         a = args(moe_device_layers=-1, moe_cuda_cache=0)
-        for total, available, reserve in [(8 * GiB, 8 * GiB, GiB),
-                                          (32 * GiB, 28 * GiB, 32 * GiB // 10),
-                                          (128 * GiB, 120 * GiB, 4 * GiB)]:
+        # 目标机（121 GiB）固定预留 13 GiB；小内存按 total//8 缩放，
+        # 但至少保留 1 GiB，避免固定预留吞掉全部预算。
+        for total, reserve in [(8 * GiB, GiB), (32 * GiB, 4 * GiB),
+                               (128 * GiB, 13 * GiB)]:
             with self.subTest(total=total), patch.dict(os.environ, {}, clear=True):
-                ram = {"total": total, "available": available}
+                ram = {"total": total, "available": total}
                 p = auto.plan(a, g, c, "pp", {0: 1}, gpu, ram)
-                self.assertEqual(p["host_budget_bytes"], available - reserve)
-                # The reserve remains unavailable even when total RAM is large.
+                self.assertEqual(p["host_budget_bytes"], total - reserve)
+                # 预算跟随 total，而不是瞬时 MemAvailable：邻居进程占用
+                # 不应让同一命令在 numa/disk 之间抖动。
                 ram["available"] = p["host_estimated_bytes"] + reserve - 1
-                with self.assertRaises(ValueError):
-                    auto.plan(a, g, c, "pp", {0: 1}, gpu, ram)
+                q = auto.plan(a, g, c, "pp", {0: 1}, gpu, ram)
+                self.assertEqual(q["host_budget_bytes"], total - reserve)
 
-    def test_snapshot_fallback_counts_a_second_host_copy(self):
+    def test_host_snapshot_copy_is_only_needed_for_unpinned_experts(self):
         g, c, gpu, ram = fixture()
+        # numa：专家权重由 NUMA 分片直接借给 CUDA 专家缓存，不需要第二份主机快照。
         p = auto.plan(args(), g, c, "pp", {0: 1}, gpu, ram)
-        c = (*c[:-1], True)
-        q = auto.plan(args(), g, c, "pp", {0: 1}, gpu, ram)
-        self.assertEqual(q["host_estimated_bytes"] - p["host_estimated_bytes"], 4 * GiB)
+        q = auto.plan(args(), g, (*c[:-1], True), "pp", {0: 1}, gpu, ram)
+        self.assertEqual(q["host_estimated_bytes"], p["host_estimated_bytes"])
+        # 关掉 pinned 时才需要一份独立的主机副本。
+        with patch.dict(os.environ, {"FT_PINNED_WEIGHT": "0"}, clear=True):
+            r = auto.plan(args(), g, c, "pp", {0: 1}, gpu, ram)
+        self.assertEqual(r["host_estimated_bytes"] - p["host_estimated_bytes"], 4 * GiB)
 
     def test_cgroup_parent_and_current_usage(self):
         for v2 in (True, False):
@@ -1161,6 +1167,30 @@ class HybridAutoTest(unittest.TestCase):
         # Model calls SelectDeviceFromMap(layer + 1, block_cnt), using <=.
         self.assertEqual([auto.layer_device(i, 4, {0: 1, 1: 1}) for i in range(4)], [0, 0, 1, 1])
         self.assertEqual(auto.devices(args(device="cudapp=0,1")), ("pp", {0: 1, 1: 1}))
+
+
+
+class HostToleranceTest(unittest.TestCase):
+    def test_tolerance_default_and_clamp(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(auto.host_tolerance(), auto.DEFAULT_HOST_TOLERANCE)
+        for raw, expected in [("1.0", 1.0), ("1.05", 1.05), ("0.5", 1.0),
+                              ("2.0", 1.10), ("bad", auto.DEFAULT_HOST_TOLERANCE)]:
+            with patch.dict(os.environ, {"FASTLLM_AUTO_HOST_TOLERANCE": raw}, clear=True):
+                self.assertAlmostEqual(auto.host_tolerance(), expected)
+
+    def test_warning_only_when_over_budget(self):
+        buf = io.StringIO()
+        plan = {"host_budget_bytes": 100, "host_estimated_bytes": 103}
+        with redirect_stderr(buf):
+            returned = auto.warn_if_tolerance_used(plan)
+        self.assertIs(returned, plan)
+        self.assertIn("主机预算超", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            auto.warn_if_tolerance_used(
+                {"host_budget_bytes": 100, "host_estimated_bytes": 100})
+        self.assertEqual(buf.getvalue(), "")
 
 
 if __name__ == "__main__":

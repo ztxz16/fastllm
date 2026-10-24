@@ -55,7 +55,11 @@ namespace fastllm {
             std::vector<CudaPrefillStage> stages;
             if (!tp && BuildCudaPrefillStages(deviceMap, block_cnt, stages))
                 for (const auto &stage : stages) hybridMoeDevices.push_back(stage.device);
-            bool supported = !V41ReferenceMathEnabled() && GetCudaSharedExpert();
+            const bool cacheGateMath = !V41ReferenceMathEnabled();
+            const bool cacheGateShared = GetCudaSharedExpert();
+            int cacheHostLayers = 0, cacheWhitelistMiss = 0;
+            std::string cacheFirstMiss;
+            bool supported = cacheGateMath && cacheGateShared;
             std::vector<std::vector<Data *>> routedWeights = weights;
             std::vector<std::vector<Data *>> draftWeights;
             if (v41DsparkEnabled) {
@@ -83,13 +87,31 @@ namespace fastllm {
                 const auto device = SelectMoeDeviceForLayer(layer);
                 // GPU-resident layers are not members of the host cache.
                 if (!UsesHostMoe(device)) continue;
-                supported &= quantizedLinearNames.count("layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight");
+                ++cacheHostLayers;
+                const std::string cacheW1 =
+                    "layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight";
+                if (!quantizedLinearNames.count(cacheW1)) {
+                    ++cacheWhitelistMiss;
+                    if (cacheFirstMiss.empty()) cacheFirstMiss = cacheW1;
+                }
+                supported &= quantizedLinearNames.count(cacheW1);
                 routedWeights[layer][0] = routedWeights[layer][1] = nullptr;
                 cache.Add(routedWeights[layer], device);
             }
             if (supported && cpuHost) WarmupNumaMoeWeights(true);
-            if (!supported || !cache.Prepare(
-                    [this] { WarmupNumaMoeWeights(true); }, streamGGUF)) {
+            const bool cachePrepared = supported && cache.Prepare(
+                    [this] { WarmupNumaMoeWeights(true); }, streamGGUF);
+            if (!cachePrepared) {
+                fprintf(stderr, "[Fastllm] V4.1 expert cache disabled: math=%d cuda_shared=%d host_layers=%d "
+                    "whitelist_miss=%d first_miss=%s whitelist_size=%d prepare_called=%d streaming=%d "
+                    "block_cnt=%d moe_layers=%d dev0=%s dev20=%s dev39=%s\n",
+                    (int) cacheGateMath, (int) cacheGateShared, cacheHostLayers, cacheWhitelistMiss,
+                    cacheFirstMiss.empty() ? "-" : cacheFirstMiss.c_str(),
+                    (int) quantizedLinearNames.size(), (int) supported, (int) streamGGUF,
+                    (int) block_cnt, (int) moeDeviceLayers,
+                    block_cnt > 0 ? SelectMoeDeviceForLayer(0).c_str() : "-",
+                    block_cnt > 20 ? SelectMoeDeviceForLayer(20).c_str() : "-",
+                    block_cnt > 39 ? SelectMoeDeviceForLayer(39).c_str() : "-");
                 fprintf(stderr, "[Fastllm] V4.1 expert cache requires host FP8 block128, NVFP4 block32 or supported GGUF experts, "
                     "CUDA shared experts and ordinary math; using the configured backend.\n");
             }
