@@ -3614,6 +3614,10 @@ namespace fastllm {
                 dictLocker.unlock();
                 MySleep(0);
                 dictLocker.lock();
+                context = responseContextDict.GetHandle(handleId);
+                if (context == nullptr) {
+                    return -1;
+                }
             }
         }
     }
@@ -3701,6 +3705,10 @@ namespace fastllm {
                 dictLocker.unlock();
                 MySleep(0);
                 dictLocker.lock();
+                context = responseContextDict.GetHandle(handleId);
+                if (context == nullptr) {
+                    return -1;
+                }
             }
         }
     }
