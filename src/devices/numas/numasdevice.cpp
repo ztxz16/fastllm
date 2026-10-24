@@ -12,6 +12,7 @@
 #include "persistent_worker_group.h"
 #include "utils/hostbufferreclaim.h"
 #include "utils/hybrid_moe.h"
+#include "utils/autotune.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -442,17 +443,22 @@ namespace fastllm {
     // 共享同一条主存通路，实际吞吐不一定相同，按 route 数均分会让快卡空等慢卡。
     // 这里用真实层的耗时反馈，不做额外的合成 benchmark。
     class NumasMoeDeviceSpeedTracker {
+        std::vector<int> tuningKey;
     public:
         static NumasMoeDeviceSpeedTracker &GetInstance(const std::vector<int> &key) {
             static std::mutex registryMutex;
             static std::map<std::vector<int>, std::unique_ptr<NumasMoeDeviceSpeedTracker>> profiles;
             std::lock_guard<std::mutex> guard(registryMutex);
             auto &profile = profiles[key];
-            if (!profile) profile.reset(new NumasMoeDeviceSpeedTracker());
+            if (!profile) {
+                profile.reset(new NumasMoeDeviceSpeedTracker());
+                profile->tuningKey = key;
+            }
             return *profile;
         }
 
         void RecordGpu(int device, int expertCount, double elapsedMs) {
+            if (AutotuneRecording()) RecordAutotuneSample("numa_gpu", tuningKey, expertCount, elapsedMs, device);
             if (device < 0 || expertCount <= 0 || elapsedMs <= 0.0) {
                 return;
             }
@@ -7124,6 +7130,15 @@ namespace fastllm {
         float *scoreData = (float*)score.cpuData;
 
         auto *pool = GetHostMoePool();
+
+        std::unique_ptr<AutotuneSampleScope> tuning;
+        if (AutotuneRecording()) {
+            size_t routes = 0;
+            for (int r = 0; r < bs * topk; ++r) routes += cpuExperts.count(indexData[r] + 1);
+            tuning.reset(new AutotuneSampleScope("cpu_experts",
+                {int(weights[2]->dataType), weights[2]->ggmlType,
+                 int(weights[3]->dataType), weights[3]->ggmlType, input.dims[1], weights[2]->dims[0], bs}, routes));
+        }
 
         int dim = output.dims[1];
         int inputDim = input.dims[1];

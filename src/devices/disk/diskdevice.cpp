@@ -4,6 +4,7 @@
 #include "gguf.h"
 #include "devices/cpu/computeutils.h"
 #include "utils.h"
+#include "utils/autotune.h"
 #include "devices/moe_frequency_policy.h"
 #include "devices/moe_decode_scheduler.h"
 #ifdef USE_NUMAS
@@ -2165,6 +2166,10 @@ namespace fastllm {
 
     static std::unique_ptr<DiskCachedExpert> ReadDiskExpert(const Data *gate, const Data *down, bool repackCpu) {
         AssertInFastLLM(gate != nullptr && down != nullptr, "Disk expert weights are missing.\n");
+        std::unique_ptr<AutotuneSampleScope> tuning;
+        if (AutotuneRecording()) tuning.reset(new AutotuneSampleScope("disk_load",
+            {int(gate->dataType), gate->ggmlType, int(down->dataType), down->ggmlType},
+            gate->GetBytes() + down->GetBytes()));
         DiskExpertReadScope scope;
         DiskExpertReadBatch reads(*gate, *down);
         std::unique_ptr<DiskCachedExpert> expert(new DiskCachedExpert);

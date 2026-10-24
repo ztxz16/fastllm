@@ -5,6 +5,7 @@
 #include "utils.h"
 
 #include "executor.h"
+#include "utils/autotune.h"
 
 #include "devices/cpu/cpudevice.h"
 #include "devices/disk/diskdevice.h"
@@ -416,6 +417,7 @@ namespace fastllm {
                     fflush(stderr);
                 }
                 device->Reshape(opType, datas, floatParams, intParams);
+                AutotuneOpScope tuning(opType, sharedHostMoe ? "numa" : device->deviceType, datas, intParams);
                 device->Run(opType, datas, floatParams, intParams);
 #ifdef USE_CUDA
                 SyncCudaDeviceForProfiler(device);
@@ -495,6 +497,7 @@ namespace fastllm {
                 }
             }
             device->Reshape(opType, datas, floatParams, intParams);
+            AutotuneOpScope tuning(opType, sharedHostMoe ? "numa" : device->deviceType, datas, intParams);
             device->Run(opType, datas, floatParams, intParams);
 #ifdef USE_CUDA
             SyncCudaDeviceForProfiler(device);

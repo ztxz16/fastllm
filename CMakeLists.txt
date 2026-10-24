@@ -209,7 +209,7 @@ file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
 # all CUDA jobs have been queued. Keep them out of FASTLLM_CXX_SOURCES below.
 set(FASTLLM_LARGE_MODEL_SOURCES src/models/qwen3_5.cpp)
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/contextconfig.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
-        src/devices/disk/diskdevice.cpp
+        src/devices/disk/diskdevice.cpp src/utils/autotune.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp src/kvmem.cpp src/models/basellmkvmem.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
         src/models/deepseekv41.cpp src/models/deepseekv41_execution.cpp src/models/deepseekv41_gpu.cpp src/models/deepseekv41_hybrid.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
@@ -1001,6 +1001,13 @@ if (UNIT_TEST)
     add_executable(execution_mode_test test/basic/test_execution_mode.cpp)
     target_include_directories(execution_mode_test PRIVATE include)
     fastllm_add_checked_test(execution_mode execution_mode_test "ALL_PASS" 60)
+
+    if (UNIX)
+        add_executable(autotune_capture_test test/basic/test_autotune_capture.cpp)
+        target_link_libraries(autotune_capture_test PRIVATE fastllm)
+        target_include_directories(autotune_capture_test PRIVATE third_party/json11)
+        fastllm_add_checked_test(autotune_capture autotune_capture_test "PASS: bounded opt-in autotune capture" 60)
+    endif()
 
     if (NOT USE_ROCM)
         # Mock the CUDA boundary so hybrid lifetime contracts also run without a GPU.

@@ -171,13 +171,15 @@ def inventory(path):
     return metadata, tensors
 
 
-def host_memory(proc=Path("/proc")):
+def host_memory(proc=Path("/proc"), *, reclaim_file_cache=False):
     """Effective Linux RAM, including every visible cgroup ancestor limit.
 
-    Do not count swap or assume that charged file pages can be reclaimed. A
+    By default, do not count swap or assume charged file pages can be reclaimed. A
     parent's current usage includes siblings, which can constrain this process.
     Conservatively exclude CMA regions from the budget for pinned weights and
     non-movable allocations, even when movable pages currently occupy them.
+    Autotune can opt into crediting clean, unmapped inactive cgroup-v2 file cache;
+    filling this reclaimable cache during a trial is not an out-of-memory event.
     """
     info = {}
     for line in (proc / "meminfo").read_text().splitlines():
@@ -229,7 +231,17 @@ def host_memory(proc=Path("/proc")):
                 if raw != "max":
                     limit = int(raw)
                     usage = int(usage_file.read_text())
-                    total, available = min(total, limit), min(available, max(0, limit - usage))
+                    reclaimable = 0
+                    if reclaim_file_cache and v2:
+                        try:
+                            stats = dict((k, int(v)) for k, v in
+                                         (row.split() for row in (current / "memory.stat").read_text().splitlines()))
+                            unmapped = max(0, stats.get("file", 0) - stats.get("shmem", 0) - stats.get("file_mapped", 0))
+                            reclaimable = max(0, min(usage, stats.get("inactive_file", 0), unmapped) -
+                                              stats.get("file_dirty", 0) - stats.get("file_writeback", 0))
+                        except (OSError, ValueError):
+                            pass  # Missing/incomplete counters retain the conservative default.
+                    total, available = min(total, limit), min(available, max(0, limit - usage + reclaimable))
             if current == mount:
                 break
             current = current.parent
