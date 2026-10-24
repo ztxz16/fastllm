@@ -176,12 +176,25 @@ def host_memory(proc=Path("/proc")):
 
     Do not count swap or assume that charged file pages can be reclaimed. A
     parent's current usage includes siblings, which can constrain this process.
+    Conservatively exclude CMA regions from the budget for pinned weights and
+    non-movable allocations, even when movable pages currently occupy them.
     """
     info = {}
     for line in (proc / "meminfo").read_text().splitlines():
         key, value = line.split(":", 1)
         info[key] = int(value.split()[0]) * 1024
-    total, available = info["MemTotal"], info["MemAvailable"]
+    cma = max(info.get("CmaTotal", 0), info.get("CmaFree", 0))
+    try:
+        # KHO scratch uses MIGRATE_CMA without contributing to CmaTotal.
+        # zoneinfo reports the full regions in pages, including occupied pages
+        # that may migrate into ordinary RAM during weight registration.
+        zones = (proc / "zoneinfo").read_text()
+        cma = max(cma, sum(int(n) for n in re.findall(
+            r"^[ \t]*cma[ \t]+(\d+)[ \t]*$", zones, re.MULTILINE)) * os.sysconf("SC_PAGE_SIZE"))
+    except OSError:
+        # Older kernels or restricted proc mounts may expose only meminfo.
+        pass
+    total, available = info["MemTotal"], max(0, info["MemAvailable"] - cma)
     groups = [line.split(":", 2) for line in (proc / "self/cgroup").read_text().splitlines()]
     mounts = (proc / "self/mountinfo").read_text().splitlines()
     for line in mounts:
@@ -220,7 +233,7 @@ def host_memory(proc=Path("/proc")):
             if current == mount:
                 break
             current = current.parent
-    return {"total": total, "available": available}
+    return {"total": total, "available": available, "cma": cma}
 
 
 @dataclass
@@ -1139,7 +1152,8 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     "moe_cuda_cache": cuda_cache, "moe_cpu_cache": cpu_cache,
                     "gpu_estimated_bytes": {d: used[d] + cache[d] for d in mapping},
                     "gpu_budget_bytes": gpu_limit, "host_estimated_bytes": host_required + cpu_cache,
-                    "host_budget_bytes": host_limit, "workspace_bytes_per_device": workspace + transport,
+                    "host_budget_bytes": host_limit, "host_cma_bytes": ram.get("cma", 0),
+                    "workspace_bytes_per_device": workspace + transport,
                     "expert_transport_bytes_per_device": transport,
                     "auto_gpu_memory_limit": gpu_memory_limit,
                     "auto_host_memory_limit": host_memory_limit}

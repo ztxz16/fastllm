@@ -55,6 +55,75 @@ def write_gguf(path, metadata, tensors):
     path.write_bytes(header + b"\0" * offset)
 
 
+class HostMemoryTest(unittest.TestCase):
+    def make_proc(self, directory, fields=None, zoneinfo=None):
+        proc = Path(directory) / "proc"
+        (proc / "self").mkdir(parents=True)
+        info = {"MemTotal": 8 * GiB, "MemAvailable": 8 * GiB, **(fields or {})}
+        (proc / "meminfo").write_text("".join(
+            "%s: %d kB\n" % (name, value // 1024) for name, value in info.items()))
+        (proc / "self/cgroup").write_text("")
+        (proc / "self/mountinfo").write_text("")
+        if zoneinfo is not None:
+            (proc / "zoneinfo").write_text(zoneinfo)
+        return proc
+
+    def test_kho_budget_does_not_depend_on_current_cma_occupancy(self):
+        # KHO regions can have CmaTotal=0. Account for both occupied and free
+        # pages across zones/nodes; nr_free_cma must not be counted again.
+        for free in (0, GiB, 3 * GiB):
+            for page_size in (4096, 65536):
+                with self.subTest(free=free, page_size=page_size), tempfile.TemporaryDirectory() as d:
+                    proc = self.make_proc(d, {"CmaTotal": 0, "CmaFree": free},
+                        "Node 0, zone DMA32\n        cma %d\n      nr_free_cma %d\n"
+                        "Node 1, zone Normal\n        cma %d\n" % (
+                            GiB // page_size, free // page_size, 2 * GiB // page_size))
+                    with patch.object(auto.os, "sysconf", return_value=page_size):
+                        self.assertEqual(auto.host_memory(proc),
+                            {"total": 8 * GiB, "available": 5 * GiB, "cma": 3 * GiB})
+
+    def test_meminfo_fallback_and_overlapping_cma_counters(self):
+        cases = [({}, None, 0),
+                 ({"CmaTotal": 2 * GiB, "CmaFree": GiB}, None, 2 * GiB),
+                 ({"CmaTotal": 0, "CmaFree": GiB}, None, GiB),
+                 ({"CmaTotal": 2 * GiB, "CmaFree": GiB}, "        cma 524288\n", 2 * GiB),
+                 ({"CmaTotal": 9 * GiB}, None, 9 * GiB)]
+        for fields, zones, reserved in cases:
+            with self.subTest(fields=fields, zones=zones), tempfile.TemporaryDirectory() as d:
+                proc = self.make_proc(d, fields, zones)
+                with patch.object(auto.os, "sysconf", return_value=4096):
+                    ram = auto.host_memory(proc)
+                self.assertEqual(ram, {"total": 8 * GiB,
+                    "available": max(0, 8 * GiB - reserved), "cma": reserved})
+
+    def test_unreadable_zoneinfo_falls_back_to_meminfo(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc = self.make_proc(d, {"CmaTotal": 2 * GiB})
+            read_text = Path.read_text
+            def restricted_read(path, *args, **kwargs):
+                if path == proc / "zoneinfo":
+                    raise PermissionError("restricted proc mount")
+                return read_text(path, *args, **kwargs)
+            with patch.object(Path, "read_text", restricted_read):
+                self.assertEqual(auto.host_memory(proc)["available"], 6 * GiB)
+
+    def test_cma_budget_rejects_unsafe_host_placement_and_replans(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc = self.make_proc(d, {"CmaTotal": 3 * GiB})
+            ram = auto.host_memory(proc)
+            g, costs, gpu, _ = fixture()
+            base = auto.plan(args(moe_device_layers=-1), g, costs, "pp", {0: 1}, gpu,
+                             {"total": 8 * GiB, "available": 8 * GiB})
+            self.assertEqual(base["resident_layers"], 0)
+            with self.assertRaises(ValueError):
+                auto.plan(args(moe_device_layers=-1), g, costs, "pp", {0: 1}, gpu, ram)
+            plan = auto.plan(args(moe_device_layers="auto"), g, costs, "pp", {0: 1}, gpu, ram)
+            self.assertGreater(plan["resident_layers"], 0)
+            self.assertEqual(plan["host_budget_bytes"], 4 * GiB)
+            self.assertEqual(plan["host_cma_bytes"], 3 * GiB)
+            self.assertLessEqual(plan["host_estimated_bytes"], plan["host_budget_bytes"])
+
+
 class HybridAutoTest(unittest.TestCase):
     def test_qwen35_fp8_payload_and_scale_are_budgeted_once(self):
         metadata = dict(model_type='qwen3_5_text', num_hidden_layers=4,
@@ -516,7 +585,14 @@ class HybridAutoTest(unittest.TestCase):
                 (child / current).write_text(str(GiB))
                 (child.parent / limit).write_text(str(8 * GiB))
                 (child.parent / current).write_text(str(3 * GiB))
-                self.assertEqual(auto.host_memory(proc), {"total": 8 * GiB, "available": 5 * GiB})
+                for cma, available in [(0, 5 * GiB), (8 * GiB, 5 * GiB), (20 * GiB, 4 * GiB)]:
+                    # Apply the physical CMA constraint before intersecting it
+                    # with the parent cgroup's remaining budget, not afterwards.
+                    with self.subTest(cma=cma):
+                        (proc / "meminfo").write_text(
+                            "MemTotal: 33554432 kB\nMemAvailable: 25165824 kB\nCmaTotal: %d kB\n" % (cma // 1024))
+                        self.assertEqual(auto.host_memory(proc),
+                            {"total": 8 * GiB, "available": available, "cma": cma})
 
     def test_available_gpu_memory_is_reserved_below_ratio(self):
         g, c, gpu, ram = fixture()
