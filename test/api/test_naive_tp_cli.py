@@ -76,6 +76,21 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'prefill'):
             self.configure([], saved={'prefill_batch_tokens': 2147483648})
 
+    def test_prefill_coalescing_targets_and_caps(self):
+        values = {'prefill_batch_tokens': 16384, 'prefill_max_wait_ms': 20000,
+                  'prefill_batch_requests': 16, 'prefill_max_requests': 24,
+                  'prefill_min_decode_requests': 8}
+        for saved in (False, True):
+            options = [] if saved else [part for k, v in values.items() for part in ('--' + k, str(v))]
+            self.configure(options, saved=values if saved else None)
+            self.loaded_model.set_prefill_batching.assert_called_once_with(
+                16384, 20000, target_requests=16, max_requests=24, min_decode_requests=8)
+        for changes in ({'prefill_batch_requests': -1}, {'prefill_max_requests': 15},
+                        {'prefill_min_decode_requests': -1}, {'prefill_batch_tokens': 0},
+                        {'prefill_max_requests': 2147483648}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'prefill'):
+                self.configure([], saved={**values, **changes})
+
     def test_tp_defaults_and_explicit_slab(self):
         for ranks in (2, 4, 8):
             for slab in (None, 0, 32):

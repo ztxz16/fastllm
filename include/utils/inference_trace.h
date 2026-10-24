@@ -125,6 +125,9 @@ class Step : public Stages {
 public:
     unsigned long long id;
     const char *phase = "unknown";
+    const char *prefillDecision = nullptr;
+    int prefillCandidates = 0, activeDecode = 0;
+    long long prefillCandidateTokens = 0;
     std::vector<int> handles, lengths, contextBefore, cachedPrefix;
     long long timestampNs;
     double forwardMs = 0, forwardEmitMs = 0;
@@ -159,6 +162,11 @@ public:
                 << ",\"step_tokens_per_second\":" << Rate(tokens, elapsed)
                 << ",\"forward_trace_emit_ms\":" << forwardEmitMs
                 << ",\"previous_step_trace_emit_ms\":" << PreviousStepEmitMs() << ',';
+            if (prefillDecision)
+                out << "\"prefill_coalescing\":{\"reason\":\"" << prefillDecision
+                    << "\",\"candidates\":" << prefillCandidates
+                    << ",\"new_tokens\":" << prefillCandidateTokens
+                    << ",\"active_decode\":" << activeDecode << "},";
             WriteStages(out);
             out << "}\n";
             Output().Emit(out.str());

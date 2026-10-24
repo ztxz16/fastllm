@@ -1304,6 +1304,12 @@ extern "C" {
         model->SetChunkedPrefillSize(size);
     }
 
+    DLL_EXPORT bool set_prefill_coalescing_llm_model(int modelId, int tokens, int maxWaitMs,
+                                                   int targetRequests, int maxRequests, int minDecodeRequests) {
+        return models.GetModel(modelId)->SetPrefillBatching(tokens, maxWaitMs, targetRequests,
+                                                          maxRequests, minDecodeRequests);
+    }
+
     DLL_EXPORT bool set_prefill_batching_llm_model(int modelId, int tokens, int maxWaitMs) {
         return models.GetModel(modelId)->SetPrefillBatching(tokens, maxWaitMs);
     }

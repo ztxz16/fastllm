@@ -540,6 +540,9 @@ fastllm_lib.get_kv_cache_token_limit_llm_model.restype = ctypes.c_int
 fastllm_lib.set_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 fastllm_lib.set_prefill_batching_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
 fastllm_lib.set_prefill_batching_llm_model.restype = ctypes.c_bool
+if hasattr(fastllm_lib, "set_prefill_coalescing_llm_model"):
+    fastllm_lib.set_prefill_coalescing_llm_model.argtypes = [ctypes.c_int] * 6
+    fastllm_lib.set_prefill_coalescing_llm_model.restype = ctypes.c_bool
 
 fastllm_lib.set_model_indexer_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.set_model_indexer_dtype.restype = None
@@ -3511,14 +3514,32 @@ class model:
         """设置分块 prefill 的切片大小（首块与后续块使用相同 token 数）。"""
         fastllm_lib.set_chunked_prefill_size_llm_model(self.model, size)
 
-    def set_prefill_batching(self, tokens: int, max_wait_ms: int = 0):
-        """启动前设置 prefill 攒批目标和最长等待；目前仅支持 Naive 普通 TP GPU 推理。"""
-        if not all(isinstance(value, int) and 0 <= value <= 2147483647
-                   for value in (tokens, max_wait_ms)) or (max_wait_ms > 0 and tokens == 0):
-            raise ValueError("prefill batching requires non-negative int32 values and a positive token target when waiting")
-        if not fastllm_lib.set_prefill_batching_llm_model(self.model, tokens, max_wait_ms):
+    def set_prefill_batching(self, tokens: int, max_wait_ms: int = 0, *,
+                            target_requests: int = 0, max_requests: int = 0,
+                            min_decode_requests: int = 0):
+        """Configure bounded prefill coalescing before serving; zero tokens disables it.
+
+        Token and request targets independently release a batch. Capacity, idle
+        decode and continuing chunks also release it without waiting. Request
+        limits are per prefill batch, not the model's overall concurrency.
+        """
+        values = (tokens, max_wait_ms, target_requests, max_requests, min_decode_requests)
+        if (not all(isinstance(v, int) and 0 <= v <= 2147483647 for v in values)
+                or (tokens == 0 and any(values[1:]))
+                or (max_requests > 0 and target_requests > max_requests)):
+            raise ValueError("prefill coalescing requires non-negative int32 values, a positive token target, and target_requests <= max_requests when capped")
+        if any(values[2:]):
+            if not hasattr(fastllm_lib, "set_prefill_coalescing_llm_model"):
+                raise RuntimeError("This FastLLM library does not support the requested prefill coalescing options")
+            ok = fastllm_lib.set_prefill_coalescing_llm_model(self.model, *values)
+        else:
+            ok = fastllm_lib.set_prefill_batching_llm_model(self.model, tokens, max_wait_ms)
+        if not ok:
             raise ValueError("prefill batching must be configured before serving and currently requires ordinary Naive TP GPU inference")
-    
+        self.prefill_batching = dict(tokens=tokens, max_wait_ms=max_wait_ms,
+                                    target_requests=target_requests, max_requests=max_requests,
+                                    min_decode_requests=min_decode_requests)
+
     def set_verbose(self, verbose: int):
         fastllm_lib.set_verbose_llm_model(self.model, verbose)
     

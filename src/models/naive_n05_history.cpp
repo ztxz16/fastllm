@@ -277,6 +277,34 @@ int NaiveN05FlashModel::QueryPagedPrefixCacheExtra(ResponseContext *context, int
     return best;
 }
 
+int NaiveN05FlashModel::PreviewPagedPrefixCacheExtra(ResponseContext *context, int length,
+                                                   PrefillPrefixPreview &preview) const {
+    if (!saveHistoryChat || !context || !prefixPool) return 0;
+    struct Match { std::weak_ptr<PrefixSnapshot> snapshot; bool equal = false; };
+    struct Preview { std::unordered_map<const PrefixSnapshot *, Match> matches; };
+    if (!preview.modelState) preview.modelState = std::make_shared<Preview>();
+    auto &memo = *std::static_pointer_cast<Preview>(preview.modelState);
+    std::lock_guard<std::mutex> guard(historyMutex);
+    // Do not retain even an SWA checkpoint while waiting for more prompts.
+    // Cache only token equality; residency/generation is checked every pass.
+    if (memo.matches.size() > prefixHistory.size() * 2 + 16) {
+        for (auto it = memo.matches.begin(); it != memo.matches.end();)
+            if (it->second.snapshot.expired()) it = memo.matches.erase(it); else ++it;
+    }
+    int best = 0;
+    for (const auto &entry : prefixHistory) {
+        if (entry->length <= best || entry->length > length ||
+            entry->tokens.size() > preview.tokens.size()) continue;
+        auto &match = memo.matches[entry.get()];
+        if (match.snapshot.lock() != entry) {
+            match.snapshot = entry;
+            match.equal = std::equal(entry->tokens.begin(), entry->tokens.end(), preview.tokens.begin());
+        }
+        if (match.equal && entry->HasResidentPrefix()) best = entry->length;
+    }
+    return best;
+}
+
 bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, int length) const {
 #ifdef USE_CUDA
     auto *self = const_cast<NaiveN05FlashModel *>(this);

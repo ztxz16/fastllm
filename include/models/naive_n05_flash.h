@@ -57,6 +57,8 @@ namespace fastllm {
         std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagers(int layer, bool key) const override;
         bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
         int QueryPagedPrefixCacheExtra(ResponseContext *context, int length) const override;
+        int PreviewPagedPrefixCacheExtra(ResponseContext *context, int length,
+                                         PrefillPrefixPreview &preview) const override;
         bool RestorePagedPrefixCacheExtra(ResponseContext *context, int length) const override;
         void TryRecordResponseContext(ResponseContext *context) override;
         void OnResponseContextCreated(ResponseContext *context) override;

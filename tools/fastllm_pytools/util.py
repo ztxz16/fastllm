@@ -961,6 +961,12 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help='prefill 攒批的未缓存 token 目标，0关闭；当前仅支持 Naive 普通 TP GPU 推理；批量总预算至少为 chunked_prefill_size')
     parser.add_argument('--prefill_max_wait_ms', type=int, default=0,
                         help='prefill 攒批最长等待毫秒数，0不等待；需设置 prefill_batch_tokens；等待期间继续 decode')
+    parser.add_argument('--prefill_batch_requests', type=int, default=0,
+                        help='prefill 攒批请求数目标；与 token 目标任一达到即放行，0不设请求数目标')
+    parser.add_argument('--prefill_max_requests', type=int, default=0,
+                        help='单批 prefill 请求数上限，0仅受模型剩余请求槽位限制')
+    parser.add_argument('--prefill_min_decode_requests', type=int, default=0,
+                        help='只有活跃 decode 请求数达到此值才等待攒批；空闲时始终立即放行')
     fast_prefill = parser.add_mutually_exclusive_group()
     fast_prefill.add_argument('--fast_prefill', '--fast-prefill', action='store_true',
                              help='启用DeepSeek-V4.1近似 prefill：后段层只计算末尾滑窗，可能改变 logits；该模型的--auto默认开启')
@@ -1150,9 +1156,15 @@ def make_normal_llm_model(args, startup_progress = None):
     user_set_device = bool(args.device and args.device != "")
     prefill_batch_tokens = getattr(args, 'prefill_batch_tokens', 0)
     prefill_max_wait_ms = getattr(args, 'prefill_max_wait_ms', 0)
-    if not all(isinstance(value, int) and 0 <= value <= 2147483647
-               for value in (prefill_batch_tokens, prefill_max_wait_ms)) or (prefill_max_wait_ms > 0 and prefill_batch_tokens == 0):
-        raise ValueError("--prefill_batch_tokens and --prefill_max_wait_ms require non-negative int32 values; waiting requires a positive token target")
+    prefill_batch_requests = getattr(args, 'prefill_batch_requests', 0)
+    prefill_max_requests = getattr(args, 'prefill_max_requests', 0)
+    prefill_min_decode_requests = getattr(args, 'prefill_min_decode_requests', 0)
+    prefill_values = (prefill_batch_tokens, prefill_max_wait_ms, prefill_batch_requests,
+                      prefill_max_requests, prefill_min_decode_requests)
+    if (not all(isinstance(value, int) and 0 <= value <= 2147483647 for value in prefill_values)
+            or (prefill_batch_tokens == 0 and any(prefill_values[1:]))
+            or (prefill_max_requests > 0 and prefill_batch_requests > prefill_max_requests)):
+        raise ValueError("prefill coalescing requires non-negative int32 values, a positive token target, and batch_requests <= max_requests when capped")
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
     # Resolve this after loading a saved JSON configuration. An explicit zero
     # must remain an opt-out, including when another model previously used slabs.
@@ -2068,7 +2080,13 @@ def make_normal_llm_model(args, startup_progress = None):
                 kvmem_options.setdefault("prefill_tokens", args.chunked_prefill_size)
             model.set_kvmem(**kvmem_options)
         if prefill_batch_tokens > 0:
-            model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms)
+            if any(prefill_values[2:]):
+                model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms,
+                                          target_requests=prefill_batch_requests,
+                                          max_requests=prefill_max_requests,
+                                          min_decode_requests=prefill_min_decode_requests)
+            else:
+                model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms)
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
         model.warmup()
