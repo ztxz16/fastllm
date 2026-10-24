@@ -1510,6 +1510,39 @@ namespace {
     }
 
 
+    // Eight candidates share decoded keys; heads run in parallel. Each dot
+    // retains the scalar kernel's 128 FP32 FMAs and ordered head reduction.
+    template<typename QT, typename KT>
+    __global__ void __launch_bounds__(256)
+    V41IndexerScoreSmallBatch(const QT *q, const float *weights, const KT *k,
+            int seqlen, int m, float *out, const uint8_t *packed,
+            int mode, int rowBytes) {
+        __shared__ float queries[128][33], keys[128][9], dots[32][9];
+        const int t=blockIdx.y, batch=t/seqlen;
+        const int first=blockIdx.x*8, h=threadIdx.x/8, c=threadIdx.x%8;
+        for (int i=threadIdx.x; i<32*128; i+=256)
+            queries[i%128][i/128]=V41Load<QT>(q, size_t(t)*32*128+i);
+        for (int i=threadIdx.x; i<8*128; i+=256) {
+            const int j=first+i/128, d=i%128;
+            keys[d][i/128]=j<m ? (packed
+                ? V41LoadKvRow(packed+(size_t(batch)*m+j)*rowBytes,128,d,mode)
+                : V41Load<KT>(k,(size_t(batch)*m+j)*128+d)) : 0.f;
+        }
+        __syncthreads();
+        float dot=0.f;
+        #pragma unroll 4
+        for (int d=0; d<128; ++d) dot += queries[d][h]*keys[d][c];
+        dots[h][c]=dot;
+        __syncthreads();
+        if (threadIdx.x<8 && first+c<m) {
+            float total=0.f;
+            #pragma unroll
+            for (int head=0; head<32; ++head)
+                total += fmaxf(dots[head][c],0.f)*weights[size_t(t)*32+head];
+            out[size_t(t)*m+first+c]=total;
+        }
+    }
+
     #include "deepseekv41-prefill-indexer.cuh"
 
     // ---------------- mma / ldmatrix 内联汇编封装（SM80+） ----------------
@@ -4172,6 +4205,23 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const
     }
     if (FastllmCudaGetThreadError()) return false;
 
+    if (!legacyIndexer && V41IsSm75() && seqlen <= 8 && heads == 32) {
+        const dim3 grid((m+7)/8, bsz*seqlen);
+#define V41_SMALL_INDEX(Q,K) V41IndexerScoreSmallBatch<Q,K><<<grid,256,0,cudaStreamPerThread>>>( \
+            static_cast<const Q *>(q.cudaData), static_cast<const float *>(weights.cudaData), \
+            kQuant ? nullptr : static_cast<const K *>(k.cudaData), seqlen,m, \
+            static_cast<float *>(output.cudaData),k8,kMode,kRowBytes)
+        if (q.dataType == DataType::BFLOAT16) {
+            if (kQuant || k.dataType == DataType::BFLOAT16) { V41_SMALL_INDEX(__nv_bfloat16,__nv_bfloat16); }
+            else { V41_SMALL_INDEX(__nv_bfloat16,float); }
+        } else {
+            if (kQuant || k.dataType == DataType::BFLOAT16) { V41_SMALL_INDEX(float,__nv_bfloat16); }
+            else { V41_SMALL_INDEX(float,float); }
+        }
+#undef V41_SMALL_INDEX
+        return V41CheckLaunch("IndexerScoreSmallBatch");
+    }
+
     dim3 grid((m + kIdxThreads - 1) / kIdxThreads, bsz * seqlen);
     size_t shared = (size_t)(heads * dim + heads) * sizeof(float);
     if (kQuant) {
@@ -4689,8 +4739,9 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                     constexpr bool multi = decltype(multiToken)::value;
                     V41Sm75QuantizedAttentionGather<multi><<<dim3(count, 1, seqlen), 128, 0, cudaStreamPerThread>>>(params, rows, valid);
                     if (!V41CheckLaunch("Sm75QuantizedAttentionGather")) return false;
-                    const bool reuseHeads = seqlen >= 4 && heads >= 32 && count >= 128;
-                    if (reuseHeads)
+                    const bool reuseQueries = heads >= 32 && count >= 128;
+                    const bool reuseHeads = seqlen >= 4 && reuseQueries;
+                    if (reuseQueries)
                         V41Sm75QuantizedAttentionScores<multi, 2><<<dim3((count + 7) / 8, (heads + 3) / 4, seqlen), 128, 0, cudaStreamPerThread>>>(
                             static_cast<const __nv_bfloat16 *>(q.cudaData), rows, valid, count, heads, scores);
                     else
@@ -4704,6 +4755,12 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                         if (!V41CheckLaunch("Sm75QuantizedAttentionCoefficients")) return false;
                         if (reuseHeads)
                             V41Sm75QuantizedAttentionValues<multi, true, 4><<<dim3((heads + 3) / 4, 8, seqlen), 64, 0, cudaStreamPerThread>>>(
+                                rows, valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads, softmaxScale,
+                                static_cast<__nv_bfloat16 *>(output.cudaData), coefficients, inverseSums);
+                        else if constexpr (!multi)
+                            // Decode needs enough independent head/column CTAs.
+                            // A larger candidate tile hides loads without merging heads.
+                            V41Sm75QuantizedAttentionValues<false, true, 1, 16><<<dim3(heads, 8), 64, 0, cudaStreamPerThread>>>(
                                 rows, valid, scores, static_cast<const float *>(attnSink.cudaData), count, heads, softmaxScale,
                                 static_cast<__nv_bfloat16 *>(output.cudaData), coefficients, inverseSums);
                         else

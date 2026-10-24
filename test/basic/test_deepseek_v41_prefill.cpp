@@ -109,14 +109,16 @@ static std::vector<float> Decode(const Data &x, int storage = 0) {
     return out;
 }
 static void Attention(int device, bool quick) {
-    struct Shape { int rows, heads, start, top; };
+    struct Shape { int rows, heads, start, top; int window = 128; };
     for (auto shape : {Shape{1, 64, 2048, 512}, Shape{2, 32, 126, 33},
                        Shape{4, 33, 126, 33}, Shape{6, 64, 1, 512},
                        Shape{6, 64, 2048, 512}, Shape{8, 32, 2048, 0},
                        Shape{128, 32, 0, 0}, Shape{129, 64, 31, 33},
-                       Shape{128, 64, 2048, 512}, Shape{2048, 64, 0, 512}}) {
+                       Shape{128, 64, 2048, 512}, Shape{2048, 64, 0, 512},
+                       Shape{128, 32, 3, 513, 4}, Shape{128, 64, 3, 513, 4}}) {
         if (quick && shape.rows >= 1024) continue;
-        constexpr int window = 128, cap = 1024;
+        const int window = shape.window;
+        constexpr int cap = 1024;
         Data q(BFLOAT16, {1, shape.rows, shape.heads, 512});
         Data chunk(BFLOAT16, {1, shape.rows, 512}), ring(BFLOAT16, {1, window, 512}), cmp(BFLOAT16, {1, cap, 512});
         Data sink(FLOAT32, {shape.heads}), idx(INT32, {1, shape.rows, shape.top});

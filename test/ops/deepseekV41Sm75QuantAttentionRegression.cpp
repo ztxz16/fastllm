@@ -37,6 +37,31 @@ static void Equal(const std::vector<uint8_t> &expected, Data &actual, const std:
         }
     throw std::runtime_error(label + ": bitwise mismatch");
 }
+static void EqualPrefill(const std::vector<uint8_t> &expected, Data &actual, const std::string &label) {
+    // The shared SM75 prefill MMA path changes accumulation order. Match its
+    // numerical contract in test_deepseek_v41_prefill (which also has an FP64
+    // oracle); all decode, verify, graph and scalar fallback checks stay exact.
+    const auto &shape = actual.dims;
+    if (shape[0] != 1 || shape[1] < 128 || (shape[2] != 32 && shape[2] != 64)) {
+        Equal(expected, actual, label);
+        return;
+    }
+    const auto got = Bytes(actual);
+    Check(got.size() == expected.size() && actual.dataType == BFLOAT16, label + ": shape/type mismatch");
+    double error = 0, norm = 0, maximum = 0;
+    for (size_t i = 0; i < got.size(); i += 2) {
+        uint16_t a, b;
+        memcpy(&a, got.data() + i, 2); memcpy(&b, expected.data() + i, 2);
+        const double value = BFloat16BitsToFloat32(a), reference = BFloat16BitsToFloat32(b);
+        Check(std::isfinite(value), label + ": nonfinite result");
+        const double delta = std::abs(value - reference);
+        Check(delta <= 1e-5 + std::abs(reference) * .0082, label + ": BF16 rounding bound");
+        error += delta * delta; norm += reference * reference; maximum = std::max(maximum, delta);
+    }
+    const double relative = std::sqrt(error / std::max(norm, 1e-30));
+    Check(relative < .001, label + ": prefill relative RMS difference");
+    if (error) std::printf("%s: relative_rmse=%.8g max_abs=%.8g\n", label.c_str(), relative, maximum);
+}
 struct Case {
     int heads, window, start, width, capacity, ringMode, cmpMode, tokens;
     Data q, chunk, ring, cmp, sink, indices, packedRing, packedCmp, output;
@@ -85,14 +110,14 @@ static int PrefillChecks() {
             const auto &shape = shapes[checks % 7];
             Case c(heads,shape[0],shape[1],shape[2],format[0],format[1],301+checks,BFLOAT16,tokens);
             auto expected = c.Reference(); c.Run();
-            Equal(expected,c.output,"prefill case="+std::to_string(checks));
+            EqualPrefill(expected,c.output,"prefill case="+std::to_string(checks));
             ++checks;
         }
     // Production chunk size and independent batch rows, including all-invalid
     // compressed indices and a sink-only softmax (window == 0).
     for (int tokens : {128,2048}) for (int batch : {1,2}) {
         Case c(64,128,2048,513,1,3,503+checks,BFLOAT16,tokens,batch);
-        auto expected = c.Reference(); c.Run(); Equal(expected,c.output,"prefill batch/chunk");
+        auto expected = c.Reference(); c.Run(); EqualPrefill(expected,c.output,"prefill batch/chunk");
         ++checks;
     }
     Case masked(7,0,0,33,0,3,13,BFLOAT16,31,2);
@@ -293,7 +318,7 @@ int main(int argc, char **argv) {
             }
         }
         if (!tested) return 77;
-        printf("PASS SM75 packed attention: %d bitwise cases on %d devices; mode=%s\n",checks,tested,mode.c_str());
+        printf("PASS SM75 packed attention: %d cases on %d devices; exact decode/verify/fallback, bounded MMA prefill; mode=%s\n",checks,tested,mode.c_str());
         return 0;
     } catch (const std::exception &e) { fprintf(stderr,"FAIL %s\n",e.what()); return 1; }
 }

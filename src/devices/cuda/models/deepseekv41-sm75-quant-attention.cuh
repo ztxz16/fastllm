@@ -149,7 +149,8 @@ V41Sm75QuantizedAttentionCoefficients(const int32_t *valid, const float *scores,
 
 // Independent output dimensions can run in parallel without changing the
 // online-softmax or PV accumulation order, including skipped/duplicate indices.
-template<bool MultiToken, bool ReuseCoefficients = false, int HeadsPerBlock = 1>
+template<bool MultiToken, bool ReuseCoefficients = false, int HeadsPerBlock = 1,
+         int CandidateTile = HeadsPerBlock == 1 ? 8 : 4>
 __global__ void __launch_bounds__(64)
 V41Sm75QuantizedAttentionValues(const float *rows, const int32_t *valid,
                                 const float *scores, const float *sink,
@@ -165,7 +166,7 @@ V41Sm75QuantizedAttentionValues(const float *rows, const int32_t *valid,
     if constexpr (ReuseCoefficients) coefficients += (size_t(token) * heads + head) * count;
     // Multiple heads reuse each FP32 KV load during verification. Their
     // independent accumulators keep the original candidate/rounding order.
-    constexpr int Tile = HeadsPerBlock == 1 ? 8 : 4;
+    constexpr int Tile = CandidateTile;
     float acc[HeadsPerBlock] = {}, mx = sink[head], sum = 1.f;
     for (int base = 0; base < count; base += Tile) {
         float sc[Tile], values[Tile];
