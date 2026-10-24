@@ -5405,6 +5405,9 @@ namespace fastllm {
                 }
             }
 
+            if (layer == 0 && !tp && !f.prefill && this->deviceMap.size() == 1)
+                PrefetchDiskMoeV41(weights[layer], seqlen);
+
             // ---- Engram ----
             for (size_t l = 0; l < engram_layer_ids.size(); l++) {
                 if (engram_layer_ids[l] == layer) {
@@ -6225,6 +6228,12 @@ namespace fastllm {
         auto &expertIndex = ws->expertIndex;
         auto &expertScore = ws->expertScore;
         auto &sharedExpertOut = ws->sharedExpertOut;
+
+            // Start the next layer's bounded reads before HcPost/attention.
+            // Pipelined PP owns concurrent workspaces; retain its own ordering.
+            if (layer + 1 < block_cnt && !f.tp && !f.prefill && this->deviceMap.size() == 1)
+                PrefetchDiskMoeV41(weights[layer + 1], f.boundedPrefill && layer + 1 >= decoderSwaTailLayer
+                    ? std::min(f.seqlen, window_size) : f.seqlen);
 
             // HcPost uses residual's shape and input's element count. Keep the
             // CPU MoE output flat so next layer's MergeMOEBlock does not discard

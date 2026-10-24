@@ -2161,6 +2161,7 @@ namespace fastllm {
         int gateUnitRows = 4;
         size_t downRowBytes = 0;
         bool gate = true, fuseConvert = false, skipCrossSwiglu = false, roundDown = false;
+        bool canonical = false;
     };
 
     struct NumasMoeDecodeWorker : MultiThreadBaseOp, NumasMoeWorkerTiming {
@@ -2184,10 +2185,16 @@ namespace fastllm {
                 const int end = std::min(perNode, start + last - row);
                 const int expert = (*c.experts)[slot].first;
                 Data &weight = *c.weights[expert * 2 + (c.gate ? 0 : 1)];
-                if (c.gate) {
+                uint8_t *record = c.canonical ? weight.cpuData : weight.numasData[node];
+                if (c.gate && c.canonical) {
+                    MultiThreadGemmOp task(c.input, c.inputType, record, weight.GetDataType(),
+                        reinterpret_cast<uint8_t *>(c.gateUp + size_t(slot) * columns), FLOAT32,
+                        1, c.inputDim, columns, start, end);
+                    task.Run();
+                } else if (c.gate) {
                     MultiThreadGemmAndCrossSwigluOp task(
                         expert == 0 && c.sharedInput ? c.sharedInput : c.input,
-                        c.inputType, weight.numasData[node], weight.GetDataType(),
+                        c.inputType, record, weight.GetDataType(),
                         reinterpret_cast<uint8_t*>(c.gateUp +
                             (size_t)slot * columns + base), FLOAT32,
                         c.swiglu + (size_t)slot * c.interDim,
@@ -2200,7 +2207,7 @@ namespace fastllm {
                     auto *destination = c.downOutput + (size_t)outputSlot * columns + base;
                     MultiThreadGemmOp task(
                         c.downInput + slot * c.downRowBytes, c.downType,
-                        weight.numasData[node], weight.GetDataType(),
+                        record, weight.GetDataType(),
                         reinterpret_cast<uint8_t*>(destination), FLOAT32,
                         1, c.interDim, columns, start, end);
                     task.Run();
@@ -2230,6 +2237,22 @@ namespace fastllm {
                 const auto &expert = (*c.experts)[slot];
                 const bool quantize = activationQuantBlock == 32 ||
                     IsDeepSeekV4QuantizedWeight(*c.weights[2 * expert.first + 1]);
+                if (c.canonical) {
+                    // The disk oracle stores separate gate/up halves and
+                    // applies the route score before multiplying the up row.
+                    std::array<float, QK_K> values;
+                    const auto *projections = c.gateUp + size_t(slot) * c.interDim * 2;
+                    for (int j = 0; j < block; ++j) {
+                        float g = RoundFloat32ToBFloat16RNE(projections[start + j]);
+                        float u = RoundFloat32ToBFloat16RNE(projections[c.interDim + start + j]);
+                        if (swigluLimit > 0) { g = std::min(g, swigluLimit); u = std::clamp(u, -swigluLimit, swigluLimit); }
+                        values[j] = RoundFloat32ToBFloat16RNE((expert.second * (g / (1.f + std::exp(-g)))) * u);
+                    }
+                    QuantizeDeepSeekV4FP8Activation(values.data(), block, 32);
+                    ConvertFromFloat32(c.downInput + slot * c.downRowBytes + GetDataBytes(c.downType, 1, start),
+                        c.downType, values.data(), 1, block);
+                    continue;
+                }
                 MultiThreadDeepSeekV4NumasDownPrepareOp prepare(
                     c.gateUp + (size_t)slot * c.interDim * 2,
                     c.swiglu + (size_t)slot * c.interDim,
@@ -4076,8 +4099,8 @@ namespace fastllm {
             Data **weights, const int32_t *indices, const int32_t *gpuIndices,
             int topk, int layer, const float *routeScores, float swigluLimit,
             const std::function<void()> &submitGpu, int activationQuantBlock = 32,
-            double *cpuElapsedUs = nullptr) {
-        HostMoePlacementScope placement(weights[2]);
+            double *cpuElapsedUs = nullptr, bool canonical = false) {
+        HostMoePlacementScope placement(canonical || weights[2]->hostMoeUnbound);
         const bool scoredBfloat = routeScores != nullptr;
         const bool scoredGguf = scoredBfloat && weights[2]->dataType == DataType::DATA_GGUF_FORMAT;
         double cpuHostStart = cpuElapsedUs ? NumasProfileNowMs() * 1000 : 0;
@@ -4106,8 +4129,8 @@ namespace fastllm {
                         ((activationQuantBlock == 32 || activationQuantBlock == 128) &&
                          (scoredGguf || inter % (config->numaCnt * activationQuantBlock) == 0)),
                         "Scored MoE decode requires complete activation blocks in each NUMA shard.\n");
-        const DataType gateAct = GetNumasLinearActDataType(weights[2], 1);
-        const DataType downAct = GetNumasLinearActDataType(weights[3], 1);
+        const DataType gateAct = canonical ? weights[2]->GetLinearActDataType(1) : GetNumasLinearActDataType(weights[2], 1);
+        const DataType downAct = canonical ? weights[3]->GetLinearActDataType(1) : GetNumasLinearActDataType(weights[3], 1);
         const bool q8Down = downAct == static_cast<DataType>(
             int(DataType::DATA_GGUF_FORMAT) + GGML_TYPE_Q8_0);
         const bool quantizeDownRows = downAct >= DataType::DATA_GGUF_FORMAT &&
@@ -4154,6 +4177,8 @@ namespace fastllm {
             experts.clear();
             for (int route : routes) experts.emplace_back(indices[route] + 1, routeScores[route]);
             auto &context = work.decodeContext;
+            context.canonical = canonical;
+            struct ResetCanonical { NumasMoeDecodeContext &c; ~ResetCanonical() { c.canonical = false; } } reset{context};
             context.weights = weights; context.experts = &experts;
             context.outputRoutes = &routes;
             context.input = work.realInput.data(); context.sharedInput = nullptr;
@@ -4320,6 +4345,34 @@ namespace fastllm {
                     work.swigluOutput.data(), count, inter, pool);
         }
         finishCpu();
+    }
+
+    bool HostMoeCanonicalV41Decode(const float *input, float *output,
+            Data **weights, int weightsBatch, const int32_t *indices,
+            const float *scores, int topk, float swigluLimit) {
+        if (!input || !output || !weights || !indices || !scores || topk <= 0 ||
+            weightsBatch < 4 || weightsBatch % 2 || !weights[2] || !weights[3]) return false;
+        const int hidden = weights[2]->dims.size() == 2 ? weights[2]->dims[1] : 0;
+        const int inter = weights[3]->dims.size() == 2 ? weights[3]->dims[1] : 0;
+        if (hidden <= 0 || hidden % 256 || inter <= 0 || inter % 256) return false;
+        for (int r = 0; r < topk; ++r) {
+            const int e = indices[r] + 1;
+            if (e <= 0 || 2 * e + 1 >= weightsBatch) return false;
+            for (int part = 0; part < 2; ++part) {
+                const auto *w = weights[2 * e + part], *layout = weights[2 + part];
+                if (!w || !w->cpuData || w->dataType != DATA_GGUF_FORMAT || w->IsRepacked ||
+                    w->ggmlType != layout->ggmlType || w->dims != layout->dims) return false;
+                const auto act = ggml_type_vec_dot_type(static_cast<ggml_type>(w->ggmlType));
+                if (act != GGML_TYPE_Q8_K && act != GGML_TYPE_Q8_K32 &&
+                    act != GGML_TYPE_Q8_0 && act != GGML_TYPE_Q8_1) return false;
+                if (part && act == GGML_TYPE_Q8_1) return false;
+            }
+        }
+        if (weights[2]->dims[0] != 2 * inter || weights[3]->dims[0] != hidden) return false;
+        std::vector<int32_t> owners(topk, -1);
+        NumasMoeDecodeExpertsImpl(input, output, weights, indices, owners.data(), topk,
+            0, scores, swigluLimit, {}, 32, nullptr, true);
+        return true;
     }
 
     void NumasMoeDecodeExperts(const float *input, float *output,

@@ -354,6 +354,15 @@ namespace fastllm {
                 moeScorePtr = &cpuMoeScore;
             }
             bool cacheHandled = false;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            if (!tp && !graphActive && !dumpDebug && !V41ReferenceMathEnabled() &&
+                hasSharedExpertOut && V41DeviceSpecUsesType(moeDeviceSpec, "disk") &&
+                quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight")) {
+                DiskMergeMOE disk;
+                cacheHandled = disk.RunGpuPrefill(*moeInputPtr, *moeIndexPtr, *moeScorePtr,
+                    ffnOut, moeWeights, swiglu_limit);
+            }
+#endif
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
             if (!tp && !graphActive && !V41ReferenceMathEnabled() && hasSharedExpertOut &&
                 moeWeights[0] == nullptr && moeWeights[1] == nullptr &&

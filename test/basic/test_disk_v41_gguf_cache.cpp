@@ -23,14 +23,13 @@
 using namespace fastllm;
 static void Check(bool ok, const char *why) { if (!ok) throw std::runtime_error(why); }
 struct Fixture {
-    static constexpr int experts = 8;
-    const int hidden, inter;
+    const int experts, hidden, inter;
     std::string path;
     std::vector<std::unique_ptr<Data>> owned;
     std::vector<Data *> gpu, disk;
     uint64_t bytes = 0;
-    Fixture(int gt, int dt, int device, int width=512, int middle=256)
-        : hidden(width), inter(middle), gpu(2*(experts+1)), disk(gpu.size()) {
+    Fixture(int gt, int dt, int device, int width=512, int middle=256, int count=8)
+        : experts(count), hidden(width), inter(middle), gpu(2*(experts+1)), disk(gpu.size()) {
         char name[] = "/tmp/fastllm-disk-v41-XXXXXX";
         int fd = mkstemp(name); Check(fd >= 0, "tempfile"); path = name;
         FILE *file = fdopen(fd, "wb"); std::mt19937 rng(317+gt*17+dt);
@@ -84,7 +83,7 @@ struct Fixture {
         fclose(file);
     }
     ~Fixture() { owned.clear(); unlink(path.c_str()); }
-    std::vector<float> Run(bool lazy, int rows, int offset, int device, int topk=6) {
+    std::vector<float> Run(bool lazy, int rows, int offset, int device, int topk=6, bool grouped=false, bool gpuIo=false, int lastExpert=-1) {
         Data x(BFLOAT16,{rows,hidden}), y(BFLOAT16,{rows,hidden});
         Data ids(INT32,{rows,topk}), scores(FLOAT32,{rows,topk}),a,b,c;
         x.Allocate(false); ids.Allocate(false); scores.Allocate(false);
@@ -92,13 +91,21 @@ struct Fixture {
             for (int j=0; j<hidden; ++j) ((uint16_t *)x.cpuData)[r*hidden+j] =
                 Float32ToBFloat16RNEBits(std::sin((r*hidden+j)*.71f)*3);
             for (int k=0; k<topk; ++k) {
-                ((int32_t *)ids.cpuData)[r*topk+k] = (offset+(k==2 && r%3==0 ? 0 : k)+r%2)%experts;
-                ((float *)scores.cpuData)[r*topk+k] = k==0 ? 0 : k==1 ? -.17f : .2f+.13f*k;
+                ((int32_t *)ids.cpuData)[r*topk+k] = (offset+(k==2 && r%3==0 ? 0 : k)+(experts > 8 ? r : r%2))%experts;
+                ((float *)scores.cpuData)[r*topk+k] = topk==1 ? .37f : k==0 ? 0 : k==1 ? -.17f : .2f+.13f*k;
             }
         }
+        if (lastExpert >= 0) ((int32_t *)ids.cpuData)[(rows-1)*topk] = lastExpert;
         FastllmCudaSetDevice(device);
         x.ToDevice(CUDA,{device},true);
-        if (lazy) {
+        if (lazy && gpuIo) {
+            ids.ToDevice(CUDA,{device},true); scores.ToDevice(CUDA,{device},true);
+            void *inputPointer=x.cudaData;
+            DiskMergeMOE op;
+            Check(op.RunGpuPrefill(x,ids,scores,y,disk,.8f),"GPU disk prefill rejected");
+            Check(x.cudaData==inputPointer && x.dataDevice==CUDA && y.dataDevice==CUDA,
+                  "GPU disk prefill staged activations on CPU");
+        } else if (lazy) {
             x.ToDevice(CPU);
             std::vector<Data *> biases(disk.size());
             DataDict data={{"input",&x},{"output",&y},{"index",&ids},{"score",&scores},
@@ -106,6 +113,10 @@ struct Fixture {
             IntDict ip={{"weights___batch",int(disk.size())},{"biass___batch",int(disk.size())},
                 {"deepSeekV4Mode",1},{"activationQuantBlock",32}};
             DiskMergeMOE op; op.Run("MergeMOE",data,{{"sharedScale",0},{"swigluLimit",.8f}},ip);
+        } else if (grouped) {
+            ids.ToDevice(CUDA,{device},true); scores.ToDevice(CUDA,{device},true);
+            Check(FastllmCudaMergeMOEV41GGUFResident(x,a,b,c,y,gpu.data(),gpu.size(),ids,scores,0,.8f),
+                  "resident grouped oracle rejected");
         } else {
             std::vector<int32_t> orderIds((int32_t *)ids.cpuData,(int32_t *)ids.cpuData+rows*topk);
             ids.ToDevice(CUDA,{device},true); scores.ToDevice(CUDA,{device},true);
@@ -134,7 +145,9 @@ struct Fixture {
         }
         y.ToDevice(CPU);
         std::vector<float> out(size_t(rows)*hidden);
-        for (size_t i=0; i<out.size(); ++i) out[i]=BFloat16BitsToFloat32(((uint16_t *)y.cpuData)[i]);
+        for (size_t i=0; i<out.size(); ++i) out[i]=y.dataType==FLOAT32
+            ? RoundFloat32ToBFloat16RNE(((float *)y.cpuData)[i])
+            : BFloat16BitsToFloat32(((uint16_t *)y.cpuData)[i]);
         return out;
     }
 };
@@ -166,20 +179,53 @@ static void TestPreload(Fixture &f, int device, bool mapped = true) {
     SetMoeCpuCacheBytes(record-1);
     Check(PreloadDiskMoeCache({f.disk})==0,"undersized GGUF preload");
     Check(GetDiskMoeCacheStats().diskBytes==before.diskBytes,"unbudgeted preload read disk");
-    SetMoeCpuCacheBytes(record*Fixture::experts-1);
-    Check(PreloadDiskMoeCache({f.disk,f.disk})==record*(Fixture::experts-1),"GGUF padding/duplicate preload budget");
+    SetMoeCpuCacheBytes(record*f.experts-1);
+    Check(PreloadDiskMoeCache({f.disk,f.disk})==record*(f.experts-1),"GGUF padding/duplicate preload budget");
     auto partial = GetDiskMoeCacheStats();
-    Check(partial.cpuBytes==record*(Fixture::experts-1),"GGUF preload byte accounting");
-    Check(partial.diskBytes-before.diskBytes==f.bytes*(Fixture::experts-1),"GGUF preload read accounting");
+    Check(partial.cpuBytes==record*(f.experts-1),"GGUF preload byte accounting");
+    Check(partial.diskBytes-before.diskBytes==f.bytes*(f.experts-1),"GGUF preload read accounting");
     Check(partial.cpuHits==before.cpuHits && partial.misses==before.misses,"GGUF preload fabricated routing");
     Check(PreloadDiskMoeCache({f.disk})==0,"GGUF preload not idempotent");
-    SetMoeCpuCacheBytes(record*Fixture::experts);
+    SetMoeCpuCacheBytes(record*f.experts);
     Check(PreloadDiskMoeCache({f.disk})==record,"GGUF preload did not fill remaining capacity");
     auto full = GetDiskMoeCacheStats();
     Compare(f.Run(true,1,0,device,8),reference,0);
     Check(GetDiskMoeCacheStats().diskBytes==full.diskBytes,"preloaded GGUF reread disk");
     SetMoeCpuCacheBytes(0); TrimDiskMoeCache();
     Check(!GetDiskMoeCacheStats().cpuBytes,"GGUF preload survived disable");
+}
+// A bulk prompt must leave its hot experts ready for the first decode,
+// without exceeding the RAM cap or changing the canonical arithmetic.
+static void TestPrefillWorkingSet(Fixture &f, int device) {
+    SetMoeCpuCacheBytes(0); SetMoeCudaCacheBytes(1); TrimDiskMoeCache();
+    const auto reference = f.Run(true,1,4,device,2);
+    const uint64_t budget = 2 * PreloadRecordBytes(f);
+    SetMoeCpuCacheBytes(budget);
+    Check(PreloadDiskMoeCache({f.disk}) == budget,"working-set preload");
+    Compare(f.Run(true,128,4,device,1,false,true), f.Run(false,128,4,device,1,true),0);
+    const auto ready = GetDiskMoeCacheStats();
+    Compare(f.Run(true,1,4,device,2),reference,0);
+    const auto decoded = GetDiskMoeCacheStats();
+    Check(decoded.diskBytes == ready.diskBytes && decoded.cpuHits == ready.cpuHits+2,
+          "prefill did not retain the decode working set");
+    Check(decoded.cpuBytes+decoded.cpuWorkspaceBytes <= budget && !decoded.cudaBytes,
+          "prefill working-set budget");
+    // Decode can discover a different continuation. Repeating the same
+    // prefill must not discard that learned working set.
+    for (int pass=0; pass<32; ++pass) f.Run(true,1,6,device,2);
+    f.Run(true,128,4,device,1,false,true);
+    const auto repeated = GetDiskMoeCacheStats();
+    f.Run(true,1,6,device,2);
+    const auto continued = GetDiskMoeCacheStats();
+    Check(continued.diskBytes == repeated.diskBytes && continued.cpuHits == repeated.cpuHits+2,
+          "repeated prefill discarded decode working set");
+    // A tiny route-distribution change should not replace all learned hits.
+    Compare(f.Run(true,128,4,device,1,false,true,0), f.Run(false,128,4,device,1,true,false,0),0);
+    const auto similar = GetDiskMoeCacheStats();
+    f.Run(true,1,6,device,2);
+    Check(GetDiskMoeCacheStats().diskBytes == similar.diskBytes,
+          "similar prefill discarded decode working set");
+    SetMoeCpuCacheBytes(0); SetMoeCudaCacheBytes(0); TrimDiskMoeCache();
 }
 // Compare the cache adapter with canonical records against the same bytes in
 // NUMA's cross-interleaved layout. Include sparse routes and repeated experts.
@@ -249,6 +295,44 @@ static void TestNativeLayout(Fixture &f, int device) {
 }
 
 #ifdef USE_NUMAS
+static void TestCanonicalDecode(Fixture &f) {
+    std::vector<std::unique_ptr<Data>> owned;
+    std::vector<Data *> weights(f.gpu.size());
+    for (size_t i=2; i<weights.size(); ++i) {
+        const auto &g=*f.gpu[i];
+        auto w=std::make_unique<Data>(DATA_GGUF_FORMAT,g.ggmlType,g.dims);
+        w->disableGGUFRepack=true; w->Allocate(false);
+        FastllmCudaCopyFromDeviceToHost(w->cpuData,g.cudaData,g.GetBytes());
+        weights[i]=w.get(); owned.push_back(std::move(w));
+    }
+    const int n=6;
+    int32_t ids[n]={3,1,0,3,7,2};
+    float scores[n]={0,-.17f,.46f,.3f,.72f,1};
+    Data x(FLOAT32,{1,f.hidden}), h(FLOAT32,{1,f.inter}), gu(FLOAT32), result(FLOAT32), bias;
+    x.Allocate(false); h.Allocate(false);
+    std::vector<float> input(f.hidden), actual(size_t(n)*f.hidden), reference(actual.size());
+    for (int i=0; i<f.hidden; ++i) input[i]=RoundFloat32ToBFloat16RNE(std::sin(i*.71f)*3);
+    Check(HostMoeCanonicalV41Decode(input.data(),actual.data(),weights.data(),weights.size(),ids,scores,n,.8f),
+        "canonical CPU decode rejected");
+    memcpy(x.cpuData,input.data(),input.size()*4);
+    QuantizeDequantizeFP8E4M3Blocks((float*)x.cpuData,f.hidden,32);
+    for (int r=0; r<n; ++r) {
+        auto &gate=*weights[2*(ids[r]+1)], &down=*weights[2*(ids[r]+1)+1];
+        DoCpuLinearReshape(x,gate,gu); DoCpuLinear(x,gate,bias,gu);
+        const auto *v=(const float*)gu.cpuData;
+        for (int c=0; c<f.inter; ++c) {
+            float g=std::min(.8f,RoundFloat32ToBFloat16RNE(v[c]));
+            float u=std::clamp(RoundFloat32ToBFloat16RNE(v[f.inter+c]),-.8f,.8f);
+            ((float*)h.cpuData)[c]=RoundFloat32ToBFloat16RNE((scores[r]*(g/(1.f+std::exp(-g))))*u);
+        }
+        QuantizeDequantizeFP8E4M3Blocks((float*)h.cpuData,f.inter,32);
+        DoCpuLinearReshape(h,down,result); DoCpuLinear(h,down,bias,result);
+        for (int c=0; c<f.hidden; ++c) reference[size_t(r)*f.hidden+c]=RoundFloat32ToBFloat16RNE(((float*)result.cpuData)[c]);
+    }
+    Compare(actual,reference,0);
+    puts("PASS: canonical whole-layer CPU decode equals per-expert oracle");
+}
+
 // Exercise cached decode on both GPUs without admitting every miss.
 // Check admitted bytes independently: a staged interleaved record must never
 // be published as canonical, even when its first execution was correct.
@@ -392,10 +476,21 @@ int main() { try {
             printf("gate=%d down=%d device=%d\n",pair.first,pair.second,device); fflush(stdout);
             Fixture f(pair.first,pair.second,device);
             TestNativeLayout(f,device);
+#ifdef USE_NUMAS
+            TestCanonicalDecode(f);
+#endif
             TestPreload(f,device);
-            const uint64_t ramBudget = f.bytes*8 + Fixture::experts*2*4*4096;
+            TestPrefillWorkingSet(f,device);
+            const uint64_t ramBudget = f.bytes*8 + f.experts*2*4*4096;
             SetMoeCpuCacheBytes(0); SetMoeCudaCacheBytes(0); TrimDiskMoeCache();
+            auto beforeCold = GetDiskMoeCacheStats();
             auto cpuReference = f.Run(true,1,0,device,8);
+            auto afterCold = GetDiskMoeCacheStats();
+            // Eight routes contain one duplicate: seven leases, two weight
+            // buffers each. A prefetched batch must not reread completed leases.
+            Check(afterCold.cpuBufferAllocations + afterCold.cpuBufferReuses -
+                  beforeCold.cpuBufferAllocations - beforeCold.cpuBufferReuses == 14,
+                  "decode prefetched an expert twice");
             SetMoeCpuCacheBytes(ramBudget); SetMoeCudaCacheBytes(f.bytes*8);
             auto start=GetDiskMoeCacheStats();
             for (int pass=0; pass<16; ++pass) f.Run(true,1,pass%2,device,8);
@@ -405,7 +500,7 @@ int main() { try {
             Check(PreloadDiskMoeCache({f.disk})==0 && GetDiskMoeCacheStats().diskBytes==warm.diskBytes,
                   "preload duplicated GPU-resident GGUF experts");
             // Exactly matches the native decode oracle after all routes hit.
-            for (int rows : {1,5,8,9,33}) Compare(f.Run(true,rows,0,device),f.Run(false,rows,0,device),0);
+            for (int rows : {1,5,8,9,33}) Compare(f.Run(true,rows,0,device),f.Run(false,rows,0,device,6,rows > 32),0);
             // Shrink VRAM with RAM headroom: every canonical record must
             // survive eviction without another disk read or requantization.
             auto beforeDemotion = GetDiskMoeCacheStats();
@@ -439,7 +534,9 @@ int main() { try {
             SetMoeCpuCacheBytes(ramBudget); // Includes aligned direct-I/O padding.
             auto beforeRam = GetDiskMoeCacheStats();
             // Cold streamed prefill and then RAM hits both execute on CUDA.
-            for (int pass=0; pass<2; ++pass) Compare(f.Run(true,260,0,device,8),f.Run(false,260,0,device,8),.012);
+            for (int pass=0; pass<2; ++pass) Compare(f.Run(true,260,0,device,8),f.Run(false,260,0,device,8,true),0);
+            Compare(f.Run(true,260,0,device,8,false,true),f.Run(false,260,0,device,8,true),0);
+            Compare(f.Run(true,1024,0,device,8,false,true),f.Run(false,1024,0,device,8,true),0);
             auto ram=GetDiskMoeCacheStats(); Check(ram.cpuBytes>=f.bytes*8 && ram.cpuBytes<=GetMoeCpuCacheBytes() && ram.cpuHits>beforeRam.cpuHits,"RAM prefill cache unused");
             SetMoeCpuCacheBytes(f.bytes*2); SetMoeCudaCacheBytes(f.bytes*3); TrimDiskMoeCache();
             auto before=GetDiskMoeCacheStats();
@@ -472,6 +569,56 @@ int main() { try {
                 f.Run(true,1,3,device,8);
             }
         }
+    }
+    {
+        // More than three eight-expert groups wrap both upload rings. Mixed
+        // cache hits, duplicate routes and partial tiles retain ID-order sums.
+        Fixture f(GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ3_XXS,0,512,256,40);
+        SetMoeCpuCacheBytes(f.bytes*7); SetMoeCudaCacheBytes(f.bytes*5); TrimDiskMoeCache();
+        for (int pass=0; pass<4; ++pass) for (int rows : {33,128,513})
+            Compare(f.Run(true,rows,pass,0),f.Run(false,rows,pass,0,6,true),0);
+        for (int rows : {33,513,4096})
+            Compare(f.Run(true,rows,0,0,6,false,true),f.Run(false,rows,0,0,6,true),0);
+    }
+    for (const auto &pair : {std::make_pair(GGML_TYPE_IQ1_M,GGML_TYPE_IQ2_XXS),
+                             std::make_pair(GGML_TYPE_IQ1_S,GGML_TYPE_Q4_K),
+                             std::make_pair(GGML_TYPE_Q2_0,GGML_TYPE_Q3_K)}) {
+        // Long prompts with many experts straddle the 16/32/64-row MMQ
+        // dispatch boundaries. The resident oracle keeps its original tile.
+        Fixture f(pair.first,pair.second,0,512,256,384);
+        SetMoeCpuCacheBytes(0); SetMoeCudaCacheBytes(0); TrimDiskMoeCache();
+        for (int rows : {1024,2048})
+            Compare(f.Run(true,rows,0,0,6,false,true),f.Run(false,rows,0,0,6,true),0);
+    }
+    for (const auto &pair : {std::make_pair(GGML_TYPE_IQ1_M,GGML_TYPE_IQ2_XXS),
+                             std::make_pair(GGML_TYPE_IQ1_S,GGML_TYPE_Q3_K),
+                             std::make_pair(GGML_TYPE_Q2_0,GGML_TYPE_Q4_K)}) {
+        // Real model projection sizes, including all three tile widths in a
+        // batch; do not rely only on small synthetic reduction dimensions.
+        Fixture f(pair.first,pair.second,0,5120,2304,64);
+        SetMoeCpuCacheBytes(0); SetMoeCudaCacheBytes(0); TrimDiskMoeCache();
+        for (int rows : {1040,2064})
+            Compare(f.Run(true,rows,0,0,1,false,true),f.Run(false,rows,0,0,1,true),0);
+    }
+    {
+        // Worst-case skew exceeds the bounded activation scratch. Splitting
+        // routes must preserve every duplicate and upload each expert once.
+        Fixture f(GGML_TYPE_IQ1_M,GGML_TYPE_IQ2_XXS,0);
+        SetMoeCpuCacheBytes(0); SetMoeCudaCacheBytes(0); TrimDiskMoeCache();
+        const auto before=GetDiskMoeCacheStats();
+        for (int rows : {513,4096})
+            Compare(f.Run(true,rows,0,0,8),f.Run(false,rows,0,0,8,true),0);
+        const auto after=GetDiskMoeCacheStats();
+        Check(after.diskBytes-before.diskBytes==2*f.bytes*f.experts,"sliced prefill reread weights");
+        Check(after.cpuBufferAllocations==before.cpuBufferAllocations,"transient prefill allocated cache records");
+        const auto readStart=GetDiskMoeCacheStats();
+        PrefetchDiskMoeV41(f.disk,4096);
+        PrefetchDiskMoeV41(f.disk,4096); // Repeated hint must not queue duplicate reads.
+        Compare(f.Run(true,4096,0,0,8),f.Run(false,4096,0,0,8,true),0);
+        Check(GetDiskMoeCacheStats().diskBytes-readStart.diskBytes==f.bytes*f.experts,
+              "read-ahead duplicated consumed experts");
+        // Destruction drains even unused asynchronous hints before deleting weights.
+        PrefetchDiskMoeV41(f.disk,4096);
     }
     {
         Fixture a(GGML_TYPE_IQ1_S,GGML_TYPE_IQ1_M,0), b(GGML_TYPE_Q3_K,GGML_TYPE_Q4_K,0);

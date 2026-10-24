@@ -1,4 +1,6 @@
 #include "fastllm-gguf-mmq-common.cuh"
+#include <chrono>
+#include <thread>
 #include "fastllm-gguf-moe-stream.cuh"
 #include "fastllm-gguf-moe-glm5.h"
 #include "fastllm-cuda-v41-gguf.h"
@@ -161,14 +163,19 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
         fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
         int expertCount, const int32_t *indices, const float *scores, int topk,
         const std::unordered_set<int> &experts, bool cross, int gt, int dt, int inter,
-        bool glm5, float swigluLimit, bool nativeV41 = false) {
+        bool glm5, float swigluLimit, bool nativeV41 = false,
+        const FastllmCudaV41DiskExperts *disk = nullptr) {
     using namespace fastllm_gguf_mmq;
     using fastllm_gguf_moe::AllocateTensor;
     const int device = FastllmCudaGetDevice(), rows = input.dims[0], hidden = input.dims[1];
     auto &pipeline = *GetPipeline(device);
     std::lock_guard<std::mutex> lock(pipeline.mutex);
     FastllmCudaMoePrefillResidents resident;
-    FastllmCudaGetMoePrefillResidents(weights, expertCount, resident, glm5);
+    if (disk) {
+        resident.weights = disk->residents;
+        resident.gateType = gt; resident.downType = dt;
+        resident.hidden = hidden; resident.inter = inter;
+    } else FastllmCudaGetMoePrefillResidents(weights, expertCount, resident, glm5);
     // Generic probes can share a GLM weight table, but this pipeline restores
     // canonical records. Never read or publish those in a native NUMA cache.
     if (resident.nativeGlm && !glm5) return false;
@@ -183,11 +190,21 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     };
     std::vector<int> order;
     for (int e = 0; e < expertCount; ++e) if (!routes[e].empty()) order.push_back(e);
-    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return cached(a) > cached(b); });
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        if (cached(a) != cached(b)) return cached(a) > cached(b);
+        if (disk && disk->releaseFirst.size() == size_t(expertCount))
+            return disk->releaseFirst[a] > disk->releaseFirst[b];
+        return false;
+    });
     if (order.empty()) return false;
+    struct Work {
+        std::vector<int> counts, offsets{0}, tiles, routes;
+        size_t countsOffset, offsetsOffset, tilesOffset, routesOffset;
+    };
     struct Batch {
-        std::vector<int> experts, counts, offsets{0}, tiles, routes;
-        size_t pointersOffset, countsOffset, offsetsOffset, tilesOffset, routesOffset;
+        std::vector<int> experts;
+        std::vector<Work> work;
+        size_t pointersOffset;
         int copiesBegin = 0, copiesCount = 0;
         int lastPrefetchedGroup = -1;
     };
@@ -201,21 +218,38 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     for (size_t begin = 0; begin < order.size(); begin += batchExperts) {
         Batch batch;
         const size_t end = std::min(order.size(), begin + batchExperts);
-        for (size_t j = begin; j < end; ++j) {
-            const int e = order[j], local = j - begin;
-            batch.experts.push_back(e); batch.counts.push_back(routes[e].size());
-            batch.routes.insert(batch.routes.end(), routes[e].begin(), routes[e].end());
-            const int padded = (routes[e].size() + 15) / 16 * 16;
-            batch.routes.resize(batch.offsets.back() + padded, -1);
-            batch.offsets.push_back(batch.routes.size());
-            batch.tiles.insert(batch.tiles.end(), padded / 16, local);
-        }
-        capacity = std::max(capacity, int(batch.routes.size()));
+        batch.experts.assign(order.begin() + begin, order.begin() + end);
         batch.pointersOffset = reserve(2 * batch.experts.size() * sizeof(void *));
-        batch.countsOffset = reserve(batch.counts.size() * sizeof(int));
-        batch.offsetsOffset = reserve(batch.offsets.size() * sizeof(int));
-        batch.tilesOffset = reserve(batch.tiles.size() * sizeof(int));
-        batch.routesOffset = reserve(batch.routes.size() * sizeof(int));
+        std::vector<size_t> consumed(batch.experts.size(), 0);
+        bool more;
+        do {
+            Work work;
+            // Split only activations for a heavily routed group. Its weights
+            // stay in the same device slots until every slice finishes; neither
+            // SSD reads nor H2D copies are repeated by this workspace bound.
+            int remaining = disk ? 2048 : INT32_MAX;
+            more = false;
+            for (size_t j = 0; j < batch.experts.size(); ++j) {
+                const auto &selected = routes[batch.experts[j]];
+                const size_t take = std::min(selected.size() - consumed[j], size_t(remaining));
+                work.counts.push_back(take);
+                work.routes.insert(work.routes.end(), selected.begin() + consumed[j],
+                    selected.begin() + consumed[j] + take);
+                const int padded = (take + 15) / 16 * 16;
+                work.routes.resize(work.offsets.back() + padded, -1);
+                work.offsets.push_back(work.routes.size());
+                work.tiles.insert(work.tiles.end(), padded / 16, j);
+                consumed[j] += take;
+                remaining -= padded;
+                more |= consumed[j] < selected.size();
+            }
+            capacity = std::max(capacity, int(work.routes.size()));
+            work.countsOffset = reserve(work.counts.size() * sizeof(int));
+            work.offsetsOffset = reserve(work.offsets.size() * sizeof(int));
+            work.tilesOffset = reserve(work.tiles.size() * sizeof(int));
+            work.routesOffset = reserve(work.routes.size() * sizeof(int));
+            batch.work.push_back(std::move(work));
+        } while (more);
         batches.push_back(std::move(batch));
     }
     const auto *gu = weights[2 * (order[0] + 1)], *down = weights[2 * (order[0] + 1) + 1];
@@ -226,7 +260,7 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     // group on the GPU, just as for misses, without changing cache ownership.
     const size_t ringBytes = misses || resident.nativeGlm
         ? Pipeline::groups * batchExperts * stride : 0;
-    const size_t rawOffset = 0, canonicalOffset = ringBytes, metaOffset = 2 * ringBytes;
+    const size_t rawOffset = 0, canonicalOffset = ringBytes, metaOffset = (disk ? 1 : 2) * ringBytes;
     const size_t descOffset = reserve(2 * order.size() * sizeof(WeightCopy));
     const size_t scoreOffset = reserve(size_t(rows) * topk * sizeof(float));
     const size_t indexOffset = reserve((glm5 || nativeV41) ? size_t(rows) * topk * sizeof(int32_t) : 0);
@@ -262,8 +296,20 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     AllocateTensor(output, input.dataType, {rows, hidden}, device);
     auto *base = static_cast<uint8_t *>(workspace.cudaData);
     FastllmCudaMoePrefillPlan admission;
-    FastllmCudaPlanMoePrefill(weights, expertCount, indices, scores, rows, topk, experts, admission);
-    struct Upload { const fastllm::Data *weight; uint8_t *target; const Prefetch::Item *prefetched = nullptr; };
+    if (!disk) FastllmCudaPlanMoePrefill(weights, expertCount, indices, scores, rows, topk, experts, admission);
+    struct Upload {
+        const fastllm::Data *weight;
+        uint8_t *target;
+        const Prefetch::Item *prefetched = nullptr;
+        int expert = 0, part = 0;
+        size_t hostOffset = 0;
+    };
+    // Each matrix owns prefix/suffix space for unaligned checkpoint offsets.
+    // Unlike the device ring, direct-I/O destinations must be page aligned.
+    auto hostSize = [](size_t bytes) { return (bytes + 8192 + 4095) & ~size_t(4095); };
+    const size_t hostGateBytes = hostSize(gu->GetBytes());
+    const size_t hostDownBytes = hostSize(down->GetBytes());
+    const size_t hostStride = hostGateBytes + hostDownBytes;
     std::vector<std::vector<Upload>> uploads(batches.size());
     std::vector<WeightCopy> copies;
     std::vector<uint8_t> metadata(metaBytes, 0);
@@ -284,14 +330,14 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
                     ? static_cast<uint8_t *>(admission.weights[2 * e + part]) : nullptr;
                 const bool restore = (cross && part == 0) || Ordinary(w.ggmlType) != w.ggmlType;
                 auto *destination = !resident.nativeGlm && admitted
-                    ? admitted : base + canonicalOffset + offset;
+                    ? admitted : base + (disk ? 0 : canonicalOffset) + offset;
                 auto *target = restore ? base + rawOffset + offset : destination;
                 if (resident.nativeGlm) {
                     target = hit ? const_cast<uint8_t *>(static_cast<const uint8_t *>(resident.weights[2 * e + part]))
                                  : admitted ? admitted : base + rawOffset + offset;
                     if (!restore) destination = target;
                 }
-                const auto *prefetched = !hit && !resident.nativeGlm && pipeline.prefetch
+                const auto *prefetched = !disk && !hit && !resident.nativeGlm && pipeline.prefetch
                     ? pipeline.prefetch->Find(weights, w) : nullptr;
                 if (prefetched) {
                     batch.lastPrefetchedGroup = std::max(batch.lastPrefetchedGroup, prefetched->group);
@@ -300,7 +346,9 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
                     if (restore) target = prefetched->data;
                 }
                 pointers.push_back(destination);
-                if (!hit && !(prefetched && restore)) uploads[g].push_back({&w, target, prefetched});
+                if (!hit && !(prefetched && restore)) uploads[g].push_back({&w, target, prefetched,
+                    e + 1, part, ((g % Pipeline::groups) * batchExperts + j) * hostStride +
+                    (part ? hostGateBytes : 0)});
                 if (restore) copies.push_back({target, destination, w.ggmlType, w.dims[0], w.dims[1],
                     int(cross && part == 0), int(ggml_blck_size((ggml_type)Ordinary(w.ggmlType))),
                     int(ggml_type_size((ggml_type)Ordinary(w.ggmlType)))});
@@ -308,14 +356,57 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
         }
         batch.copiesCount = copies.size() - batch.copiesBegin;
         put(batch.pointersOffset, pointers.data(), pointers.size() * sizeof(void *));
-        put(batch.countsOffset, batch.counts.data(), batch.counts.size() * sizeof(int));
-        put(batch.offsetsOffset, batch.offsets.data(), batch.offsets.size() * sizeof(int));
-        put(batch.tilesOffset, batch.tiles.data(), batch.tiles.size() * sizeof(int));
-        put(batch.routesOffset, batch.routes.data(), batch.routes.size() * sizeof(int));
+        for (const auto &work : batch.work) {
+            put(work.countsOffset, work.counts.data(), work.counts.size() * sizeof(int));
+            put(work.offsetsOffset, work.offsets.data(), work.offsets.size() * sizeof(int));
+            put(work.tilesOffset, work.tiles.data(), work.tiles.size() * sizeof(int));
+            put(work.routesOffset, work.routes.data(), work.routes.size() * sizeof(int));
+        }
     }
     if (!copies.empty()) put(descOffset, copies.data(), copies.size() * sizeof(WeightCopy));
     put(scoreOffset, scores, size_t(rows) * topk * sizeof(float));
     if (glm5 || nativeV41) put(indexOffset, indices, size_t(rows) * topk * sizeof(int32_t));
+    struct DiskStaging {
+        uint8_t *data = nullptr;
+        std::vector<std::vector<std::future<const uint8_t *>>> reads;
+        Pipeline &pipeline;
+        explicit DiskStaging(Pipeline &p) : pipeline(p) {}
+        ~DiskStaging() {
+            // Callbacks may throw while earlier groups still use their buffers.
+            for (auto &group : reads) for (auto &read : group) if (read.valid()) read.wait();
+            if (data || !reads.empty()) {
+                cudaStreamSynchronize(pipeline.dma);
+                cudaStreamSynchronize(cudaStreamPerThread);
+            }
+        }
+    } staging(pipeline);
+    if (disk && ringBytes) {
+        auto &owned = *disk->staging;
+        const size_t hostBytes = Pipeline::groups * batchExperts * hostStride;
+        if (owned.bytes < hostBytes) {
+            if (owned.data) CUDA_CHECK(cudaFreeHost(owned.data));
+            owned.data = nullptr; owned.bytes = 0;
+            CUDA_CHECK(cudaMallocHost(&owned.data, hostBytes));
+            owned.bytes = hostBytes;
+        }
+        staging.data = static_cast<uint8_t *>(owned.data);
+    }
+    auto readGroup = [&](size_t g) {
+        if (!disk || g >= batches.size()) return;
+        auto &reads = staging.reads[g];
+        // Allocate every future slot before submitting work: packaged-task
+        // future destruction alone does not wait for an outstanding write.
+        reads.resize(uploads[g].size());
+        for (size_t i = 0; i < uploads[g].size(); ++i) {
+            const auto &u = uploads[g][i];
+            reads[i] = disk->read(u.expert, u.part, staging.data + u.hostOffset,
+                u.part ? hostDownBytes : hostGateBytes);
+        }
+    };
+    if (disk) {
+        staging.reads.resize(batches.size());
+        for (int g = 0; g < Pipeline::groups; ++g) readGroup(g);
+    }
     const auto stream = cudaStreamPerThread;
     CUDA_CHECK(cudaMemcpyAsync(base + metaOffset, metadata.data(), metaBytes, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaEventRecord(pipeline.metadata, stream));
@@ -330,11 +421,11 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     run(StreamedMoePhase::Prepare, {});
     const int maxBlocks = std::max(gu->dims[0] * (hidden / int(ggml_blck_size((ggml_type)gt))),
         down->dims[0] * (inter / int(ggml_blck_size((ggml_type)dt))));
-    for (size_t g = 0; g < batches.size(); ++g) {
+    auto finishBatch = [&](size_t g) {
         const auto &batch = batches[g];
         const int slot = g % Pipeline::groups;
-        if (g >= Pipeline::groups) CUDA_CHECK(cudaStreamWaitEvent(pipeline.dma, pipeline.released[slot], 0));
         for (const auto &upload : uploads[g]) {
+            if (disk) continue;
             if (upload.prefetched) {
                 CUDA_CHECK(cudaStreamWaitEvent(pipeline.dma,
                     pipeline.prefetch->ready[upload.prefetched->group], 0));
@@ -352,18 +443,79 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
             256, 0, pipeline.restore>>>(reinterpret_cast<const WeightCopy *>(base + metaOffset + descOffset) + batch.copiesBegin);
         CUDA_CHECK(cudaEventRecord(pipeline.restored[slot], pipeline.restore));
         CUDA_CHECK(cudaStreamWaitEvent(stream, pipeline.restored[slot], 0));
-        StreamedMoeBatch work;
-        work.experts = batch.experts.size(); work.rows = batch.routes.size();
-        work.weights = reinterpret_cast<const uint8_t *const *>(base + metaOffset + batch.pointersOffset);
-        work.counts = reinterpret_cast<const int *>(base + metaOffset + batch.countsOffset);
-        work.offsets = reinterpret_cast<const int *>(base + metaOffset + batch.offsetsOffset);
-        work.tileExperts = reinterpret_cast<const int *>(base + metaOffset + batch.tilesOffset);
-        work.routes = reinterpret_cast<const int *>(base + metaOffset + batch.routesOffset);
-        run(StreamedMoePhase::Compute, work);
+        for (const auto &slice : batch.work) {
+            StreamedMoeBatch work;
+            work.experts = batch.experts.size(); work.rows = slice.routes.size();
+            work.weights = reinterpret_cast<const uint8_t *const *>(base + metaOffset + batch.pointersOffset);
+            work.counts = reinterpret_cast<const int *>(base + metaOffset + slice.countsOffset);
+            work.offsets = reinterpret_cast<const int *>(base + metaOffset + slice.offsetsOffset);
+            work.tileExperts = reinterpret_cast<const int *>(base + metaOffset + slice.tilesOffset);
+            work.routes = reinterpret_cast<const int *>(base + metaOffset + slice.routesOffset);
+            run(StreamedMoePhase::Compute, work);
+        }
         CUDA_CHECK(cudaEventRecord(pipeline.released[slot], stream));
+    };
+    if (disk) {
+        // Read completion is independent of expert ID. Upload every ready
+        // matrix and launch any complete group, instead of blocking the host
+        // on the oldest read. Each route has its own partial; Finish still
+        // reduces in expert-ID order, so scheduling cannot change arithmetic.
+        struct Slot {
+            size_t batch, copied = 0;
+            bool submitted = false, waiting = false;
+        };
+        Slot slots[Pipeline::groups];
+        for (size_t i = 0; i < Pipeline::groups; ++i) slots[i].batch = i;
+        size_t completed = 0;
+        while (completed < batches.size()) {
+            bool progress = false;
+            for (int slot = 0; slot < Pipeline::groups; ++slot) {
+                auto &state = slots[slot];
+                const size_t g = state.batch;
+                if (g >= batches.size()) continue;
+                if (state.submitted) {
+                    const auto status = cudaEventQuery(pipeline.copied[slot]);
+                    if (status == cudaErrorNotReady) continue;
+                    CUDA_CHECK(status);
+                    // Host slots can be overwritten after DMA; device slots
+                    // retain their separate dependency on prior computation.
+                    state = {g + Pipeline::groups};
+                    readGroup(state.batch);
+                    progress = true;
+                    continue;
+                }
+                for (size_t i = 0; i < uploads[g].size(); ++i) {
+                    auto &ready = staging.reads[g][i];
+                    if (!ready.valid() || ready.wait_for(std::chrono::seconds(0)) != std::future_status::ready) continue;
+                    const auto *payload = ready.get();
+                    if (!state.waiting && g >= Pipeline::groups)
+                        CUDA_CHECK(cudaStreamWaitEvent(pipeline.dma, pipeline.released[slot], 0));
+                    state.waiting = true;
+                    const auto &u = uploads[g][i];
+                    CUDA_CHECK(cudaMemcpyAsync(u.target, payload, u.weight->GetBytes(),
+                        cudaMemcpyHostToDevice, pipeline.dma));
+                    ++state.copied;
+                    progress = true;
+                }
+                if (state.copied == uploads[g].size()) {
+                    for (int e : batches[g].experts) if (!cached(e)) disk->release(e + 1);
+                    finishBatch(g);
+                    state.submitted = true;
+                    ++completed;
+                    progress = true;
+                }
+            }
+            if (!progress) std::this_thread::sleep_for(std::chrono::microseconds(20));
+        }
+    } else {
+        for (size_t g = 0; g < batches.size(); ++g) {
+            if (g >= Pipeline::groups) CUDA_CHECK(cudaStreamWaitEvent(
+                pipeline.dma, pipeline.released[g % Pipeline::groups], 0));
+            finishBatch(g);
+        }
     }
     run(StreamedMoePhase::Finish, {});
-    FastllmCudaPublishMoePrefill(admission);
+    if (!disk) FastllmCudaPublishMoePrefill(admission);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (rows >= 1024 && !glm5 && !nativeV41 && pipeline.prefetch) pipeline.prefillOrder[weights] = order;
     return true;
@@ -606,4 +758,40 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     // A CUDA launch failure is an error, not permission to execute a second path.
     fastllm::AssertInFastLLM(ok, "GGUF NUMA grouped prefill launch failed.");
     return true;
+}
+
+
+bool FastllmCudaMergeMOEV41GGUFDisk(const fastllm::Data &input,
+        fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
+        int expertCount, const int32_t *indices, const float *scores, int topk,
+        float swigluLimit, const FastllmCudaV41DiskExperts &source) {
+    using namespace fastllm_gguf_stream;
+    if (!weights || !indices || !scores || !source.read || !source.release || !source.staging ||
+        input.dataType != fastllm::BFLOAT16 || input.dataDevice != fastllm::CUDA ||
+        !input.cudaData || input.dims.size() != 2 || expertCount <= 0 || topk <= 0 ||
+        source.residents.size() != size_t(2 * expertCount)) return false;
+    std::unordered_set<int> experts;
+    for (int r = 0; r < input.dims[0] * topk; ++r) {
+        if (indices[r] < 0 || indices[r] >= expertCount) return false;
+        experts.insert(indices[r] + 1);
+    }
+    int gt = -1, dt = -1, inter = 0;
+    for (int e : experts) {
+        const auto *g = weights[2 * e], *d = weights[2 * e + 1];
+        if (!g || !d || g->dataType != fastllm::DATA_GGUF_FORMAT ||
+            d->dataType != fastllm::DATA_GGUF_FORMAT || g->dims.size() != 2 || d->dims.size() != 2 ||
+            g->ggmlType != Ordinary(g->ggmlType) || d->ggmlType != Ordinary(d->ggmlType) ||
+            g->dims[1] != input.dims[1] || d->dims[0] != input.dims[1] || g->dims[0] != 2 * d->dims[1]) return false;
+        if (gt < 0) { gt = g->ggmlType; dt = d->ggmlType; inter = d->dims[1]; }
+        if (gt != g->ggmlType || dt != d->ggmlType || inter != d->dims[1]) return false;
+    }
+    if (!FastllmCudaV41GGUFGroupedWorkspaceBytes(gt, dt, input.dims[0], input.dims[1],
+            inter, expertCount, topk)) return false;
+    fastllm::Data gate;
+    return RunPipelined(input, gate, workspace, output, weights, expertCount,
+        indices, scores, topk, experts, false, gt, dt, inter, false, swigluLimit, true, &source);
+}
+
+FastllmCudaV41DiskStaging::~FastllmCudaV41DiskStaging() {
+    if (data) cudaFreeHost(data);
 }
