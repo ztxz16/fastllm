@@ -6175,6 +6175,7 @@ namespace fastllm {
             CacheTrieNode *child;
             if (it == cur->children.end()) {
                 child = new CacheTrieNode();
+                child->nodeId = ++nextTrieNodeId;
                 child->parent = cur; child->edgeHash = hash;
                 cur->children[hash] = child;
                 UpdateEvictableLeaf(cur);
@@ -6206,6 +6207,64 @@ namespace fastllm {
             UpdateEvictableLeaf(child);
             cur = child;
         }
+    }
+
+    int PagedCacheManager::PreviewPrefix(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match) {
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        CacheTrieNode *cur = trieRoot;
+        int count = 0;
+        auto cached = pageToTrieNode.find(match.pageId);
+        if (match.pages > 0 && match.pages <= (int)hashes.size() && cached != pageToTrieNode.end() &&
+            cached->second->nodeId == match.nodeId && cached->second->timestamp == match.generation &&
+            pageTimestamp[match.pageId] == match.generation) {
+            // Trie nodes never change their prefix path. Removing/reparenting
+            // an ancestor evicts the entire subtree, including this anchor.
+            cur = cached->second;
+            count = match.pages;
+        }
+        for (; count < (int)hashes.size(); ++count) {
+            auto it = cur->children.find(hashes[count]);
+            if (it == cur->children.end()) break;
+            auto *child = it->second;
+            if (child->pageId < 0 || pageTimestamp[child->pageId] != child->timestamp) break;
+            cur = child;
+        }
+        match = {};
+        if (count) {
+            match.nodeId = cur->nodeId;
+            match.pageId = cur->pageId;
+            match.generation = cur->timestamp;
+            match.pages = count;
+            // Only a leaf can be evicted. Refresh its recency without walking
+            // and rewriting every ancestor on each decode-time preview.
+            if (cur->evictable) evictableLeaves.erase({cur->lastAccess, cur->pageId});
+            cur->evictable = false;
+            cur->lastAccess = ++currentTimestamp;
+            UpdateEvictableLeaf(cur);
+        }
+        return count;
+    }
+
+    bool PagedCacheManager::PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
+                                                          std::vector<int> &unreferenced) {
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        unreferenced.clear();
+        if (pages == 0) return true;
+        auto it = pageToTrieNode.find(match.pageId);
+        if (pages < 0 || pages > match.pages || it == pageToTrieNode.end() ||
+            it->second->nodeId != match.nodeId || it->second->timestamp != match.generation ||
+            pageTimestamp[match.pageId] != match.generation) return false;
+        auto *node = it->second;
+        for (int depth = match.pages; depth > 0; --depth, node = node->parent) {
+            if (node == nullptr || node == trieRoot || node->pageId < 0 ||
+                pageTimestamp[node->pageId] != node->timestamp) {
+                unreferenced.clear();
+                return false;
+            }
+            if (depth <= pages && pageRefCount[node->pageId] == 0)
+                unreferenced.push_back(node->pageId);
+        }
+        return true;
     }
 
     void PagedCacheManager::Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds) {

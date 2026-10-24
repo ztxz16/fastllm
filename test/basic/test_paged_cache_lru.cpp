@@ -115,11 +115,58 @@ static void CheckRepurposedPages() {
     pool.EvictTrieSubtree(pool.trieRoot); pool.trieRoot = nullptr;
 }
 
+static std::vector<uint64_t> Hashes(PagedCacheManager &pool, const std::vector<int> &tokens) {
+    std::vector<uint64_t> hashes;
+    for (size_t i = 0; i + pool.pageLen <= tokens.size(); i += pool.pageLen)
+        hashes.push_back(PagedCacheManager::HashTokenPage(tokens.data() + i, pool.pageLen));
+    return hashes;
+}
+
+static void CheckReadOnlyPrefixPreview() {
+    PagedCacheManager pool; pool.pageLen = 128; pool.SetMaxPages(16);
+    auto tokens = Tokens(1), pages = Publish(pool, tokens);
+    auto hashes = Hashes(pool, tokens);
+    PagedPrefixMatch memo;
+    const auto refs = pool.pageRefCount;
+    std::vector<int> unreferenced;
+    for (int i = 0; i < 20; ++i) {
+        Require(pool.PreviewPrefix(hashes, memo) == 8, "preview match changed");
+        Require(pool.PreviewUnreferencedPrefixPages(memo, 6, unreferenced), "preview page budget failed");
+        Require(unreferenced.size() == 6 && pool.pageRefCount == refs && pool.FreePageCount() == 16,
+                "preview retained references or allocated pages");
+    }
+    auto held = std::vector<int>(pages.begin(), pages.begin() + 2); pool.Pick(held);
+    Require(pool.PreviewUnreferencedPrefixPages(memo, 6, unreferenced) && unreferenced.size() == 4,
+            "preview double-counted already protected prefix pages");
+    pool.ReleasePageIndices(held);
+    // A longer prefix published after a previous preview must be discovered.
+    auto longer = Tokens(1, 1280); auto all = pages; pool.Pick(all);
+    auto tail = Allocate(pool, 2); all.insert(all.end(), tail.begin(), tail.end());
+    pool.Record(longer, all); pool.ReleasePageIndices(all);
+    // Keep the same query across publication, as queued requests do.
+    PagedPrefixMatch growing; auto query = Hashes(pool, Tokens(1, 1536));
+    Require(pool.PreviewPrefix(query, growing) == 10, "long prefix missing");
+    auto complete = Tokens(1, 1536); pool.Pick(all); tail = Allocate(pool, 2);
+    all.insert(all.end(), tail.begin(), tail.end()); pool.Record(complete, all); pool.ReleasePageIndices(all);
+    Require(pool.PreviewPrefix(query, growing) == 12, "cached miss hid a newly published suffix");
+    auto pressure = Allocate(pool, 16);
+    Require(pool.PreviewPrefix(hashes, memo) == 0, "evicted endpoint reused by preview");
+    Require(pool.PreviewPrefix(query, growing) == 0, "evicted growing endpoint reused");
+    pool.ReleasePageIndices(pressure);
+    auto replacement = Publish(pool, Tokens(20000));
+    Require(pool.PreviewPrefix(hashes, memo) == 0, "physical page reuse revived old prefix");
+    memo = {}; auto replacementHashes = Hashes(pool, Tokens(20000));
+    Require(pool.PreviewPrefix(replacementHashes, memo) == 8, "replacement preview missing");
+    pool.SetMaxPages(16); Publish(pool, Tokens(30000));
+    Require(pool.PreviewPrefix(replacementHashes, memo) == 0, "pool reset revived node identity");
+    pool.EvictTrieSubtree(pool.trieRoot); pool.trieRoot = nullptr;
+}
+
 int main() {
     try {
         CheckPressure(false); CheckPressure(true);
         CheckPreviewAndReferences(); CheckAnchorAndFork();
-        CheckRepurposedPages();
+        CheckRepurposedPages(); CheckReadOnlyPrefixPreview();
         std::cout << "PAGED CACHE LRU PASS" << std::endl;
     } catch (const std::exception &error) {
         std::cerr << error.what() << std::endl;

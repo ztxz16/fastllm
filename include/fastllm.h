@@ -713,7 +713,16 @@ namespace fastllm {
         void ResetMultiDeviceState();
     };
 
+    // Non-owning match anchor. A node ID plus physical generation prevents
+    // stale anchors from being revived after eviction or allocator reuse.
+    struct PagedPrefixMatch {
+        uint64_t nodeId = 0;
+        int pageId = -1, pages = 0;
+        long long generation = 0;
+    };
+
     struct CacheTrieNode {
+        uint64_t nodeId = 0;
         int pageId = -1;
         long long timestamp = 0;
         long long lastAccess = 0;
@@ -771,6 +780,12 @@ namespace fastllm {
             static uint64_t HashTokenPage(const int *tokens, int len);
             void Record(const std::vector<int> &tokens, const std::vector<int> &pages);
             void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds);
+            // Hashes belong to an immutable, caller-validated query. These
+            // methods neither allocate KV nor acquire request page references.
+            int PreviewPrefix(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match);
+            bool PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
+                                               std::vector<int> &unreferenced);
+
 
             // Materialize free pages in the same order used by allocation.
             // This may evict unreferenced cache entries, but never reserves pages.
@@ -778,6 +793,7 @@ namespace fastllm {
             bool IsCachedPage(int pageIndex, long long generation);
 
         private:
+            uint64_t nextTrieNodeId = 0;
             std::set<std::pair<long long, int>> evictableLeaves;
             void UpdateEvictableLeaf(CacheTrieNode *node);
             void RemoveTriePage(int pageIndex);
