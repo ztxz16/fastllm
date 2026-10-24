@@ -864,6 +864,8 @@ namespace fastllm {
         bool addDummyPrefix = true;   // 是否在首位添加空格
         bool removeExtraWhitespaces = true;   // 是否将多个空格合并为一个
         bool byteAsChar = false;  // 是否将byte变为展示字符
+        std::string preTokenizer;
+        std::unordered_map<std::string, int> bpeMergeRanks;
 
         std::unordered_map <int, std::string> tokenToStringDict;
         std::unordered_map <int, float> tokenToScoreDict;

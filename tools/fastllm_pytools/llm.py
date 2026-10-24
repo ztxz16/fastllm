@@ -971,7 +971,9 @@ class tokenizer:
         if (id != -99999):
             self.model = id
         else:
-            if os.path.isfile(path):
+            if path.lower().endswith(".gguf") and os.path.isfile(path):
+                self.model = fastllm_lib.create_llm_tokenizer_fromhf(path.encode())
+            elif os.path.isfile(path):
                 self.model = fastllm_lib.create_llm_tokenizer(path.encode());
             elif os.path.isdir(path):
                 self.model = fastllm_lib.create_llm_tokenizer_fromhf(path.encode());
@@ -1535,7 +1537,8 @@ class model:
                 else:
                     report_model_load_progress("tokenizer", 0, 1)
                     try:
-                        self.hf_tokenizer = try_load_gguf_tokenizer(path)
+                        if self.config.get("gguf_architecture") != "deepseek41":
+                            self.hf_tokenizer = try_load_gguf_tokenizer(path)
                     finally:
                         report_model_load_progress("tokenizer", 1, 1)
                 if external_mtp_path and mmproj_path:
@@ -1935,10 +1938,9 @@ class model:
 
         DeepSeek-V4 ships ``encoding_dsv4.py`` instead of a Jinja chat
         template.  Prompt rendering therefore remains model-specific, but the
-        resulting text must still be tokenized by the checkpoint's Hugging
-        Face tokenizer.  FastLLM's generic native BPE path does not currently
-        reproduce every pre-tokenizer rule in this checkpoint and can split an
-        otherwise identical prompt into a different token sequence.
+        resulting text uses the checkpoint's Hugging Face tokenizer when
+        one was loaded. Standalone V4.1 GGUF uses the equivalent native
+        pre-tokenizer and BPE through the ordinary native request path.
         """
         return (
             self._is_deepseek_v4()

@@ -93,21 +93,20 @@ def inventory(path):
         metadata, first = _gguf_header(path)
         count = int(metadata.get("split.count", 1))
         if count == 1:
-            if len({t.name for t in first}) != len(first):
-                raise ValueError("Hybrid auto: duplicate tensor names")
-            return metadata, first
-        match = re.fullmatch(r"(.*)-\d{5}-of-(\d{5})\.gguf", path.name)
-        if not match or int(match[2]) != count:
-            raise ValueError("Hybrid auto: cannot resolve GGUF shards")
-        tensors = []
-        for i in range(count):
-            shard = path.with_name("%s-%05d-of-%05d.gguf" % (match[1], i + 1, count))
-            md, part = (metadata, first) if shard == path else _gguf_header(shard)
-            if int(md.get("split.no", -1)) != i or int(md.get("split.count", 0)) != count:
-                raise ValueError("Hybrid auto: inconsistent GGUF shards")
-            tensors.extend(part)
-        if len(tensors) != int(metadata.get("split.tensors.count", len(tensors))):
-            raise ValueError("Hybrid auto: incomplete GGUF tensor directory")
+            tensors = first
+        else:
+            match = re.fullmatch(r"(.*)-\d{5}-of-(\d{5})\.gguf", path.name)
+            if not match or int(match[2]) != count:
+                raise ValueError("Hybrid auto: cannot resolve GGUF shards")
+            tensors = []
+            for i in range(count):
+                shard = path.with_name("%s-%05d-of-%05d.gguf" % (match[1], i + 1, count))
+                md, part = (metadata, first) if shard == path else _gguf_header(shard)
+                if int(md.get("split.no", -1)) != i or int(md.get("split.count", 0)) != count:
+                    raise ValueError("Hybrid auto: inconsistent GGUF shards")
+                tensors.extend(part)
+            if len(tensors) != int(metadata.get("split.tensors.count", len(tensors))):
+                raise ValueError("Hybrid auto: incomplete GGUF tensor directory")
     else:
         with (path / "config.json").open() as stream:
             metadata = json.load(stream)
@@ -157,6 +156,16 @@ def inventory(path):
                     tensors.append(Tensor(key, tuple(item["shape"]), end - start, kind))
         if weight_map is not None and set(weight_map) != {t.name for t in tensors}:
             raise ValueError("Hybrid auto: incomplete safetensors checkpoint")
+    if metadata.get("general.architecture") == "deepseek41" and metadata.get("deepseek41.engram.present"):
+        name = metadata["deepseek41.engram.file"]
+        if not name or name in (".", "..") or "/" in name or "\\" in name:
+            raise ValueError("Hybrid auto: Engram must be adjacent to its GGUF backbone")
+        md, tables = _gguf_header(path.parent / name)
+        if (md.get("general.architecture") != "deepseek41-engram" or
+                not metadata.get("deepseek41.engram.source") or
+                md.get("deepseek41.engram.source") != metadata.get("deepseek41.engram.source")):
+            raise ValueError("Hybrid auto: mismatched GGUF Engram source")
+        tensors.extend(tables)
     if len({t.name for t in tensors}) != len(tensors):
         raise ValueError("Hybrid auto: duplicate tensor names")
     return metadata, tensors
@@ -235,11 +244,13 @@ class Geometry:
     kv_padding: list = field(default_factory=list)  # per-session capacity rounding bytes/layer
     tp_kv_heads: int = 0  # Qwen3.5 GQA KV heads available for TP sharding
     gguf_expert_bytes: dict = field(default_factory=dict)  # packed per-expert bytes by layer
-    disk_prefill: dict = field(default_factory=dict)  # native V4.1 BF16 workspace phases
+    disk_prefill: dict = field(default_factory=dict)  # bounded V4.1 BF16 workspace phases (native/GGUF)
 
 
 def geometry(metadata, kv_dtype, mtp, dspark=0):
     """Model adapters expose costs, while placement and budgeting stay shared."""
+    if metadata.get("general.architecture") == "deepseek41":
+        metadata = gguf.deepseek_v41_config(metadata)
     arch = metadata.get("general.architecture", "")
     config = metadata.get("text_config", metadata)
     family = str(arch or config.get("model_type", ""))
@@ -515,7 +526,7 @@ def layer_device(layer, layers, mapping):
 
 def is_lookup_table(name):
     return ("ple_embd" in name or name == "per_layer_token_embd.weight" or "ple_embedding.weight" in name or
-            "ngram_embedding" in name or ".engram.embed." in name or
+            "ngram_embedding" in name or ".engram.embed." in name or ".engram_embd." in name or
             "engram" in name and "embedding" in name)
 
 
@@ -586,6 +597,9 @@ def _deepseek_v41_weight_sizes(tensors, args):
     for tensor in tensors:
         name = tensor.name
         if tensor.kind.startswith("gguf:"):
+            if name.endswith((".ffn_gate_inp.weight", ".attn_compressor_kv.weight",
+                              ".attn_compressor_gate.weight", ".engram_q.weight", ".engram_k.weight")):
+                sizes[name] = math.prod(tensor.shape) * 4
             continue
         # GetTensorMap promotes these tensors even when --dtype is auto.
         fp32 = (name == "head.weight" and "head.scale" not in by_name or
@@ -678,7 +692,7 @@ def weight_costs(tensors, model, args):
         is_shared = "_shexp." in name or ".shared_experts." in name
         if is_expert and tensor.kind.startswith("gguf:") and layer is not None:
             gguf_layers[layer] = gguf_layers.get(layer, 0) + tensor.bytes
-        size = tensor.bytes
+        size = native_sizes.get(name, tensor.bytes)
         if is_expert and tensor.kind in ("gguf:13", "gguf:14"):
             # NUMA Q5_K/Q6_K R4 cannot currently be restored by the cache;
             # the entire cache group takes its established host snapshot.
@@ -1083,6 +1097,8 @@ def validate_options(args):
 
 def model_inputs(args):
     metadata, tensors = inventory(args.path)
+    if metadata.get("general.architecture") == "deepseek41":
+        metadata = gguf.deepseek_v41_config(metadata)
     kv_dtype = args.atype if args.kv_cache_dtype == "auto" and args.atype != "auto" else args.kv_cache_dtype
     model = geometry(metadata, kv_dtype, args.mtp, args.dspark)
     draft = getattr(args, "speculative_draft_model_path", "")

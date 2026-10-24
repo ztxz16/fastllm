@@ -49,26 +49,22 @@ def _case_ids():
 
 
 def test_vendored_encoding_matches_official():
-    """encoding_dsv41.py 除了开头的说明 docstring 之外必须与官方 encoding.py 逐字相同。"""
+    """The optional tool-history extension preserves the official default API."""
+    import importlib.util
     official_path = os.path.join(ENCODING_DIR, "encoding.py")
     if not os.path.isfile(official_path):
         _skip(f"没有 {official_path}")
         return
-    with open(official_path, encoding="utf-8") as handle:
-        official = handle.read()
-    with open(enc.__file__, encoding="utf-8") as handle:
-        vendored = handle.read()
-    # 去掉 vendored 版本开头额外插入的说明 docstring
-    marker = '"""\n\n"""\n'
-    assert marker in vendored[:2048], "vendored 文件开头格式变了"
-    stripped = vendored[vendored.index(marker) + len(marker):]
-    official_body = official[official.index('"""\n') + len('"""\n'):]
-    if stripped != official_body:
-        diff = "\n".join(list(difflib.unified_diff(
-            official_body.splitlines(), stripped.splitlines(),
-            "official/encoding.py", "ftllm/encoding_dsv41.py", lineterm=""))[:40])
-        raise AssertionError("vendored 与官方 encoding.py 不一致:\n" + diff)
-    print("     encoding_dsv41.py 与官方 encoding.py 逐字一致（仅多出说明 docstring）")
+    spec = importlib.util.spec_from_file_location("official_dsv41_encoding", official_path)
+    official = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(official)
+    for case_id in _case_ids():
+        path = os.path.join(CASES_DIR, f"test_input_{case_id}.json")
+        for mode in ("chat", "thinking"):
+            expected = official.encode_case(official.load_cases(path)[0], thinking_mode=mode)
+            actual = enc.encode_case(enc.load_cases(path)[0], thinking_mode=mode)
+            assert actual == expected, f"case {case_id}/{mode}: official encoding mismatch"
+    print("     默认 chat/thinking 编码与官方实现一致")
 
 
 def test_official_cases_encode_bytewise_identical():
@@ -133,6 +129,43 @@ def test_official_cases_tokenize_identically():
         total += len(ids)
         print(f"     case {case_id}: {len(ids)} tokens，解码后逐字还原")
     print(f"     共 {total} tokens 全部一致")
+
+
+def test_native_tokenizers_match_official():
+    """Both native HF and standalone GGUF use the official pre-tokenizer/BPE."""
+    reference = _load_tokenizer()
+    if reference is None:
+        _skip(f"没有可用的 tokenizer（{TOKENIZER_DIR}）")
+        return
+    from ftllm.llm import tokenizer as NativeTokenizer, model as NativeModel
+    import random
+
+    texts = ["", "12345678901234567890", "Hello,世界！こんにちはカタカナ", "é अआمَرْحَبًا",
+             "a\t \n\r\n  b  ", "def foo(x):\n    return x**2 + 123456789\n", "👍🏽👩‍💻", "a\U00010d40\U00010d41\U00010d42\U00010d43b",
+             "a\u1c89\u0897 b\U000113d4\U00010d8e\n"]
+    for case_id in _case_ids():
+        case = enc.load_cases(os.path.join(CASES_DIR, f"test_input_{case_id}.json"))[0]
+        texts.append(enc.encode_case(case, thinking_mode="chat")[0])
+    rng = random.Random(41)
+    alphabet = list("abZ0123456789 +-.,_!'\t\n\r中文あカéàαБاअ") + ["́", "💡", "\u2003", "\u00a0"]
+    texts += ["".join(rng.choices(alphabet, k=rng.randrange(1, 400))) for _ in range(500)]
+    for _ in range(500):
+        code = rng.randrange(0x110000)
+        if not 0xd800 <= code <= 0xdfff:
+            texts.append("ab" + chr(code) + "cd 12" + chr(code) + "34\n")
+    paths = [TOKENIZER_DIR]
+    gguf = os.environ.get("DSV41_GGUF_TOKENIZER")
+    if gguf:
+        paths.append(gguf)
+    for path in paths:
+        native = NativeTokenizer(path)
+        for index, prompt in enumerate(texts):
+            expected = reference.encode(prompt, add_special_tokens=False)
+            actual = native.encode(prompt)
+            assert actual == expected, f"native tokenizer mismatch {path} case={index}: {prompt!r}\n{actual}\n{expected}"
+            decoded = b"".join(NativeModel._decode_fastllm_token(native, token) for token in actual).decode()
+            assert decoded == prompt, f"native decode mismatch case={index}"
+        print(f"     native {path}: {len(texts)} cases, official token IDs and round-trip bytes match")
 
 
 def test_tokenizer_loads_without_mistral_warning():

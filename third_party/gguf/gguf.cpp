@@ -863,9 +863,11 @@ namespace fastllm {
             ReadGGUFTensorBytes(fileName, offset, weight->cpuData, ggml_nbytes(tensor));
 
         } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
-                   replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
+                   replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16 ||
+                   replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceBF16) {
             const bool fp32 = replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32;
-            weight->dataType = fp32 ? DataType::FLOAT32 : DataType::FLOAT16;
+            const bool bf16 = replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceBF16;
+            weight->dataType = fp32 ? DataType::FLOAT32 : bf16 ? DataType::BFLOAT16 : DataType::FLOAT16;
             weight->Resize(tensor->dims);
             weight->Allocate();
 
@@ -884,7 +886,10 @@ namespace fastllm {
             } else {
                 toFloat(original.data(), destination, weight->Count(0));
             }
-            if (!fp32) {
+            if (bf16) {
+                for (int i = 0; i < weight->Count(0); ++i)
+                    reinterpret_cast<uint16_t *>(weight->cpuData)[i] = Float32ToBFloat16RNEBits(destination[i]);
+            } else if (!fp32) {
                 Float32ToFloat16(destination, reinterpret_cast<uint16_t *>(weight->cpuData), weight->Count(0));
             }
         } else {
@@ -1100,12 +1105,13 @@ namespace fastllm {
                                 )
                         );
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
-                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
+                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16 ||
+                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceBF16) {
                         // CPU embedding can decode individual GGUF rows for
                         // models that keep the imported lookup table unchanged.
                         // Preserve floating-point imports and the CUDA embedding
                         // path, which still require the original dense layout.
-                        const bool packedEmbedding = (arch == "qwen4_exp" || arch == "glm5_next") &&
+                        const bool packedEmbedding = (arch == "qwen4_exp" || arch == "glm5_next" || arch == "deepseek_v41") &&
                             name == "token_embd.weight" &&
                             (GetLowMemMode() || !GetCudaEmbedding()) &&
                             ggml_is_quantized(tensors[i].first.type);

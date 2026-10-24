@@ -23,6 +23,7 @@
 #include "devices/disk/diskdevice.h"
 #include "utils.h"
 #include "json11.hpp"
+#include "gguf.h"
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -1828,6 +1829,7 @@ namespace fastllm {
             int dim = 0;
             int scaleBlock = 32;
             Data *diskWeight = nullptr;
+            Data *ggufWeight = nullptr;
             Data diskScale;
             std::unique_ptr<DiskEmbeddingRowReader> diskValueReader;
             std::unique_ptr<DiskEmbeddingRowReader> diskScaleReader;
@@ -2269,6 +2271,44 @@ namespace fastllm {
         if (engram_layer_ids.empty()) {
             return;
         }
+        if (V41HasKey(this->weight, "gguf_architecture")) {
+            // InitParams precedes weight loading. The integer hash tensors are
+            // read verbatim after loading, never through JSON/double or FP32.
+            auto found = this->weight.weight.find("engram_token_map.weight");
+            if (found == this->weight.weight.end() || !found->second.cpuData) return;
+            auto readIntegers = [&](const char *name, int type, size_t count, void *out) {
+                Data &data = this->weight[name];
+                AssertInFastLLM(data.dataType == DATA_GGUF_FORMAT && data.ggmlType == type &&
+                    data.cpuData && data.Count(0) == count * (type == GGML_TYPE_I32 ? 4 : 8), std::string("Invalid GGUF Engram metadata: ") + name);
+                memcpy(out, data.cpuData, count * (type == GGML_TYPE_I32 ? 4 : 8));
+            };
+            engramMeta.tokenMap.resize(found->second.Count(0) / sizeof(int32_t));
+            readIntegers("engram_token_map.weight", GGML_TYPE_I32, engramMeta.tokenMap.size(), engramMeta.tokenMap.data());
+            const size_t layers = engram_layer_ids.size(), cols = (engram_max_ngram_size - 1) * engram_n_heads;
+            std::vector<int64_t> primes(layers * cols), offsets(layers * cols), multipliers(layers * engram_max_ngram_size);
+            readIntegers("engram_primes.weight", GGML_TYPE_I64, primes.size(), primes.data());
+            readIntegers("engram_offsets.weight", GGML_TYPE_I64, offsets.size(), offsets.data());
+            readIntegers("engram_multipliers.weight", GGML_TYPE_I64, multipliers.size(), multipliers.data());
+            engramMeta.primes.clear(); engramMeta.offsets.clear(); engramMeta.multipliers.clear();
+            for (size_t i = 0; i < layers; ++i) {
+                engramMeta.primes.emplace_back(primes.begin() + i * cols, primes.begin() + (i + 1) * cols);
+                engramMeta.offsets.emplace_back(offsets.begin() + i * cols, offsets.begin() + (i + 1) * cols);
+                engramMeta.multipliers.emplace_back(multipliers.begin() + i * engram_max_ngram_size,
+                                                    multipliers.begin() + (i + 1) * engram_max_ngram_size);
+                for (size_t j = 0; j < cols; ++j)
+                    AssertInFastLLM(primes[i * cols + j] > 0 && offsets[i * cols + j] >= 0 &&
+                        offsets[i * cols + j] <= engram_num_embeddings.at(i) - primes[i * cols + j],
+                        "GGUF Engram hash range exceeds its lookup table.");
+            }
+            engramMeta.compressedVocabSize = engram_compressed_vocab_size;
+            AssertInFastLLM(engram_pad_token_id >= 0 && engram_pad_token_id < engramMeta.tokenMap.size(),
+                            "GGUF Engram pad token is out of range.");
+            for (int token : engramMeta.tokenMap)
+                AssertInFastLLM(token >= 0 && token < engram_compressed_vocab_size, "Invalid GGUF Engram token map.");
+            engramMeta.padCompressedId = engramMeta.tokenMap[engram_pad_token_id];
+            engramMeta.loaded = true;
+            return;
+        }
         std::string metaPath;
         if (V41HasKey(this->weight, "engram_meta_path")) {
             metaPath = this->weight.dicts["engram_meta_path"];
@@ -2377,6 +2417,19 @@ namespace fastllm {
                 if (tensorNameSet.count(name.string_value())) {
                     markQuantizedLinear(name.string_value());
                 }
+            }
+        }
+        if (V41HasKey(this->weight, "gguf_architecture")) {
+            // GSQ/RCO requantizes checkpoint weights, but the original model's
+            // block-32 activation quantization remains part of its arithmetic.
+            for (const auto &name : tensorNames) {
+                if (V41EndsWith(name, ".attn.wq_a.weight") || V41EndsWith(name, ".attn.wq_b.weight") ||
+                    V41EndsWith(name, ".attn.wkv.weight") || V41EndsWith(name, ".attn.wo_a.weight") ||
+                    V41EndsWith(name, ".attn.wo_b.weight") || V41EndsWith(name, ".attn.indexer.wq_b.weight") ||
+                    V41EndsWith(name, ".engram.wkv.weight") ||
+                    ((name.find(".ffn.experts.") != std::string::npos || name.find(".ffn.shared_experts.") != std::string::npos) &&
+                     (V41EndsWith(name, ".w1.weight") || V41EndsWith(name, ".w2.weight") || V41EndsWith(name, ".w3.weight"))))
+                    markQuantizedLinear(name);
             }
         }
         for (const std::string &name : tensorNames) {
@@ -2638,6 +2691,7 @@ namespace fastllm {
     }
 
     void DeepSeekV41Model::OnModelWeightsLoaded() {
+        if (V41HasKey(this->weight, "gguf_architecture")) LoadEngramMeta();
         if (engram_layer_ids.empty()) {
             return;
         }
@@ -2650,6 +2704,23 @@ namespace fastllm {
             int layer = engram_layer_ids[l];
             std::string base = "layers." + std::to_string(layer) + ".engram.embed.";
             auto table = std::make_shared<V41EngramTable>();
+            auto gguf = this->weight.weight.find(base + "weight");
+            if (gguf != this->weight.weight.end() && gguf->second.dataType == DATA_GGUF_FORMAT) {
+                Data &embedding = gguf->second;
+                AssertInFastLLM(embedding.ggmlType == GGML_TYPE_IQ4_NL && embedding.dims.size() == 2 &&
+                    embedding.dims[0] == engram_num_embeddings.at(l) && embedding.dims[1] == engram_head_dim,
+                    "DeepSeekV41: invalid GGUF Engram lookup table.");
+                table->rows = embedding.dims[0]; table->dim = embedding.dims[1];
+                table->ggufWeight = &embedding;
+                if (embedding.isDiskWeight) {
+                    table->diskWeight = &embedding;
+                    table->diskValueReader = std::make_unique<DiskEmbeddingRowReader>(embedding, 0);
+                } else AssertInFastLLM(embedding.cpuData != nullptr, "GGUF Engram requires host lookup storage.");
+                engramTables.push_back(std::static_pointer_cast<void>(table));
+                printf("[Fastllm] DeepSeek-V4.1: engram table for layer %d ready (IQ4_NL, %s).\n",
+                       layer, embedding.isDiskWeight ? "disk" : "CPU");
+                continue;
+            }
             if (this->ngramDevice == "disk") {
                 Data &embedding = this->weight[base + "weight"];
                 AssertInFastLLM(embedding.isDiskWeight && embedding.cpuData == nullptr &&
@@ -2851,7 +2922,7 @@ namespace fastllm {
             if (table.gpuTable) return;
 #endif
             const uint64_t budget = 32ULL << 20;
-            if (table.diskWeight != nullptr || rows.size() * (uint64_t)table.dim > budget) {
+            if (table.diskWeight != nullptr || table.ggufWeight != nullptr || rows.size() * (uint64_t)table.dim > budget) {
                 return;
             }
             const int dim = table.dim;
@@ -2955,6 +3026,28 @@ namespace fastllm {
             *prepMs = V41NowMs() - prepStart;
         }
         uint16_t *dst = (uint16_t*)output.cpuData;
+        if (table.ggufWeight) {
+            const size_t rowBytes = ggml_row_size(ggml_type(table.ggufWeight->ggmlType), dim);
+            const auto decode = ggml_type_to_float(ggml_type(table.ggufWeight->ggmlType));
+            std::vector<int32_t> indices;
+            for (int64_t row : rows) {
+                AssertInFastLLM(row >= 0 && row < table.rows, "GGUF Engram hash is out of range.");
+                indices.push_back(int32_t(row));
+            }
+            DiskEmbeddingRowReader::Ticket read;
+            const uint8_t *source = table.ggufWeight->cpuData;
+            if (table.diskValueReader) {
+                read = table.diskValueReader->ReadAsync(indices);
+                source = read.values.get().data();
+            }
+            // Only selected rows are expanded; the 110 GB lookup stays packed.
+            std::vector<float> decoded(dim);
+            for (size_t i = 0; i < rows.size(); ++i) {
+                decode(source + (table.diskValueReader ? i : size_t(rows[i])) * rowBytes, decoded.data(), dim);
+                for (int j = 0; j < dim; ++j) dst[i * dim + j] = Float32ToBFloat16RNEBits(decoded[j]);
+            }
+            return;
+        }
         static const FP8E4M3ToFP32Manager fp8;
         Data diskValues, diskScales;
         DiskEmbeddingRowReader::Ticket valueRead, scaleRead;

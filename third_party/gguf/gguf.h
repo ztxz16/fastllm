@@ -2153,7 +2153,8 @@ namespace fastllm {
             GGUFWeightReplaceDirect = 0, // 直接替换
             GGUFWeightReplacePacked = 1, // 拆包替换，例如[128, 2048, 2048]的矩阵替换为128个 2048 * 2048，常见于moe
             GGUFWeightReplaceForceFP32 = 2, // 强行转为FP32, 主要是Embedding
-            GGUFWeightReplaceForceFP16 = 3 // 强行转为FP16
+            GGUFWeightReplaceForceFP16 = 3, // 强行转为FP16
+            GGUFWeightReplaceForceBF16 = 4
         };
 
         GGUFWeightReplaceType type;

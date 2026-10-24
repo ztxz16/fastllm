@@ -2,6 +2,48 @@
 #include "executor.h"
 
 namespace fastllm {
+    static std::vector<GGUFWeightReplaceRule> DeepSeekV41GGUFWeightRules() {
+        using Rule = GGUFWeightReplaceRule;
+        std::vector<Rule> rules;
+        auto add = [&](const std::string &pattern, const std::string &name,
+                       Rule::GGUFWeightReplaceType type = Rule::GGUFWeightReplaceDirect) {
+            rules.emplace_back(std::regex("^" + pattern + "$"), name, type);
+        };
+        const std::string layer = "layers.$1.";
+        add(R"(token_embd\.weight)", "embed.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(output\.weight)", "head.weight");
+        add(R"(output_norm\.weight)", "norm.weight");
+        add(R"(engram_(token_map|primes|offsets|multipliers)\.weight)", "engram_$1.weight");
+        add(R"(blk\.(\d+)\.engram_embd\.weight)", layer + "engram.embed.weight");
+        add(R"(blk\.(\d+)\.engram_(q|k)\.weight)", layer + "engram.$2_weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.engram_wkv\.weight)", layer + "engram.wkv.weight");
+        add(R"(blk\.(\d+)\.(attn_norm|ffn_norm)\.weight)", layer + "$2.weight");
+        add(R"(blk\.(\d+)\.(hc_(?:attn|ffn)_(?:base|fn|scale))\.weight)", layer + "$2");
+        add(R"(blk\.(\d+)\.attn_sinks\.weight)", layer + "attn.attn_sink");
+        add(R"(blk\.(\d+)\.attn_q_(a|b)\.weight)", layer + "attn.wq_$2.weight");
+        add(R"(blk\.(\d+)\.attn_output_(a|b)\.weight)", layer + "attn.wo_$2.weight");
+        add(R"(blk\.(\d+)\.attn_kv\.weight)", layer + "attn.wkv.weight");
+        add(R"(blk\.(\d+)\.attn_q_a_norm\.weight)", layer + "attn.q_norm.weight");
+        add(R"(blk\.(\d+)\.attn_kv_a_norm\.weight)", layer + "attn.kv_norm.weight");
+        add(R"(blk\.(\d+)\.attn_compressor_(kv|gate)\.weight)", layer + "attn.compressor.w$2.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.attn_compressor_norm\.weight)", layer + "attn.compressor.norm.weight");
+        add(R"(blk\.(\d+)\.indexer\.attn_q_b\.weight)", layer + "attn.indexer.wq_b.weight", Rule::GGUFWeightReplaceForceBF16);
+        add(R"(blk\.(\d+)\.indexer\.attn_k\.weight)", layer + "attn.indexer.wk.weight", Rule::GGUFWeightReplaceForceBF16);
+        add(R"(blk\.(\d+)\.indexer\.proj\.weight)", layer + "attn.indexer.weights_proj.weight", Rule::GGUFWeightReplaceForceBF16);
+        add(R"(blk\.(\d+)\.indexer\.k_norm\.weight)", layer + "attn.indexer.k_norm.weight");
+        add(R"(blk\.(\d+)\.ffn_gate_inp\.weight)", layer + "ffn.gate.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.exp_probs_b\.bias)", layer + "ffn.gate.bias");
+        for (const auto &projection : std::vector<std::pair<std::string, std::string>>{
+                 {"gate", "w1"}, {"up", "w3"}, {"down", "w2"}}) {
+            add(R"(blk\.(\d+)\.ffn_)" + projection.first + R"(_shexp\.weight)",
+                layer + "ffn.shared_experts." + projection.second + ".weight");
+            rules.emplace_back(std::regex(R"(^blk\.(\d+)\.ffn_)" + projection.first + R"(_exps\.weight$)"),
+                std::vector<std::string>{layer + "ffn.experts.", "." + projection.second + ".weight"},
+                Rule::GGUFWeightReplacePacked);
+        }
+        return rules;
+    }
+
     static std::vector<GGUFWeightReplaceRule> Glm5NextGGUFWeightRules() {
         using Rule = GGUFWeightReplaceRule;
         const std::string base = "model.language_model.";
@@ -111,6 +153,7 @@ namespace fastllm {
 
     std::vector <GGUFWeightReplaceRule> GetGGUFWeightReplaceRules(const std::string &arch) {
         static std::map <std::string, std::vector <GGUFWeightReplaceRule> > originalArchRulesDict = {
+            {"deepseek_v41", DeepSeekV41GGUFWeightRules()},
             {"glm5_next", Glm5NextGGUFWeightRules()},
             {"qwen4_exp", Qwen4GGUFWeightRules()},
             {

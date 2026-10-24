@@ -15,6 +15,8 @@ from . import hybrid_auto as memory
 
 def apply_model_defaults(args, metadata):
     """Apply model-specific auto defaults before speculative setup/budgeting."""
+    if metadata.get("general.architecture") == "deepseek41":
+        metadata = memory.gguf.deepseek_v41_config(metadata)
     config = metadata.get("text_config", metadata)
     if not getattr(args, "auto", False):
         return
@@ -36,7 +38,9 @@ def apply_model_defaults(args, metadata):
     if family not in ("deepseek_v41", "deepseek_v41_text"):
         return
     if not explicit & speculation and not (args.mtp or args.dspark or args.speculative_algorithm or
-                                           args.speculative_draft_model_path):
+                                           args.speculative_draft_model_path) and (
+            config.get("gguf_architecture") != "deepseek41" or
+            int(config.get("num_nextn_predict_layers", 0)) > 0):
         args.dspark, args.speculative_algorithm = 5, "dspark"
     if "fast_prefill" not in explicit:
         args.fast_prefill = True
