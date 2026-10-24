@@ -729,6 +729,84 @@ class HybridAutoTest(unittest.TestCase):
             del g.gguf_expert_bytes[1]
             self.assertEqual(auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 2), generic)
 
+    def test_canonical_v41_gguf_phase_budget_keeps_persistent_mmq_scratch(self):
+        md = self.dspark_metadata()
+        md['gguf_architecture'] = 'deepseek41'
+        g = auto.geometry(md, 'fp4', 0)
+        tensors = [auto.Tensor(f'blk.{i}.ffn_gate_exps.weight', (g.hidden, g.intermediate, g.experts),
+                               10 * MiB * g.experts, 'gguf:16') for i in range(g.layers)]
+        auto.weight_costs(tensors, g, args())
+        self.assertTrue(g.disk_prefill['streamed_mmq'])
+        unsupported = copy.copy(tensors)
+        unsupported[0] = auto.Tensor(tensors[0].name, tensors[0].shape, tensors[0].bytes, 'gguf:14')
+        auto.weight_costs(unsupported, g, args())
+        self.assertFalse(g.disk_prefill['streamed_mmq'])
+        auto.weight_costs(tensors, g, args())
+        g.gguf_expert_bytes = {i: 10 * MiB for i in range(g.layers)}
+        a = args(fast_prefill=True, atype='bfloat16')
+        with patch.dict(os.environ, {}, clear=True):
+            phased = auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0)
+            generic = auto._workspace_bytes(a, g, 4096, 1048576, 'tp', 0)
+            self.assertLess(phased, generic)
+            # Even maximally skewed routing must fit, with all BF16 partials.
+            capacity = ((4096 * g.topk + 8 * 15 + 15) // 16) * 16
+            grouped = capacity * ((max(g.hidden, g.intermediate) + 255) // 256 * 288 +
+                                   max(g.hidden, 2 * g.intermediate) * 4)
+            partials = 4096 * g.topk * g.hidden * 2
+            self.assertGreater(phased, grouped + partials + 256 * MiB)
+            # Above MMQ's row limit, no optimistic phase budget is used.
+            self.assertEqual(auto._workspace_bytes(a, g, 8192, 1048576, 'pp', 0),
+                             auto._workspace_bytes(a, g, 8192, 1048576, 'tp', 0))
+            self.assertEqual(auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0, gguf_mmq=False), generic)
+            g.disk_prefill['streamed_mmq'] = False
+            self.assertEqual(auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0), generic)
+            g.disk_prefill['streamed_mmq'] = True
+            for field, value in [('fast_prefill', False), ('atype', 'float32')]:
+                previous = getattr(a, field); setattr(a, field, value)
+                self.assertEqual(auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0), generic)
+                setattr(a, field, previous)
+        a = args(fast_prefill=True, tokens=4096, max_context_length=4096, moe_device_layers=-1,
+                 chunked_prefill_size=4096)
+        costs = ([4*GiB]*g.layers, [MiB]*g.layers, 0, 0, MiB, False)
+        result = auto.plan(a, g, costs, 'pp', {0: 1},
+                           {0: dict(total=16*GiB, free=16*GiB, capability=75)}, dict(total=64*GiB, available=64*GiB))
+        self.assertEqual(result['expert_transport_bytes_per_device'], 49 * 10 * MiB + 272 * MiB)
+        pair = auto.plan(a, g, costs, 'pp', {0: 1, 1: 1},
+                         {d: dict(total=16*GiB, free=16*GiB, capability=75) for d in (0,1)},
+                         dict(total=64*GiB, available=64*GiB))
+        self.assertEqual(pair['expert_transport_bytes_per_device'],
+                         (49 + g.topk + 1) * 10 * MiB + 272 * MiB)
+        fallback = auto.plan(a, g, costs, 'pp', {0: 1},
+                            {0: dict(total=16*GiB, free=16*GiB, capability=60)},
+                            dict(total=64*GiB, available=64*GiB))
+        self.assertEqual(fallback['expert_transport_bytes_per_device'], 97 * 10 * MiB + 272 * MiB)
+        self.assertGreater(fallback['workspace_bytes_per_device'], result['workspace_bytes_per_device'])
+
+    def test_canonical_v41_auto_chunk_stays_in_streamed_mmq(self):
+        md = self.dspark_metadata()
+        md['gguf_architecture'] = 'deepseek41'
+        g = auto.geometry(md, 'fp4', 0)
+        g.disk_prefill['streamed_mmq'] = True
+        a = args(fast_prefill=True, tokens=1048576, max_context_length=1048576,
+                 moe_device_layers=-1, chunked_prefill_size='auto', moe_cuda_cache=0)
+        costs = ([GiB]*g.layers, [MiB]*g.layers, 0, 0, MiB, False)
+        gpu = {0: dict(total=64*GiB, free=64*GiB, capability=75)}
+        ram = dict(total=128*GiB, available=128*GiB)
+        def chunk():
+            return auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram)['chunked_prefill_size']
+        self.assertEqual(chunk(), 4096)
+        a.chunked_prefill_size = 8192
+        self.assertEqual(chunk(), 8192)
+        a.chunked_prefill_size = 'auto'
+        gpu[0]['capability'] = 60
+        self.assertEqual(chunk(), 8192)
+        gpu[0]['capability'] = 75
+        g.disk_prefill['streamed_mmq'] = False
+        self.assertEqual(chunk(), 8192)
+        g.disk_prefill['streamed_mmq'] = True
+        a.moe_device = 'disk'
+        self.assertEqual(chunk(), 8192)
+
     def test_v41_host_staging_is_reused_only_with_early_cuda_placement(self):
         g = auto.geometry(self.dspark_metadata(), 'float16', 0)
         a = args(tokens=4096, max_context_length=4096, moe_device_layers=2,

@@ -431,7 +431,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if hardware is None:
         hardware = cuda_hardware()
     info, peers = hardware
-    gpu = {d: query_gpu(d) for d in info}
+    gpu = {d: dict(query_gpu(d), capability=info[d].get("capability", 0)) for d in info}
     ram = ram if ram is not None else memory.host_memory()
     numa = env.use_numas if use_numa is None else use_numa
     base._host_moe_shared = numa

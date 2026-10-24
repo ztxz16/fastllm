@@ -453,8 +453,9 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
             result.kv_reallocation[i] = math.ceil(row(dim) / max(1, ratios[i]))
             result.kv_padding[i] = 256 * (row(dim) + row(idxdim, True))
         quant = metadata.get("quantization_config", {})
-        if (quant.get("quant_method") == "fp8" and quant.get("expert_dtype") == "fp4" and
-                quant.get("weight_block_size") == [32, 32]):
+        canonical_gguf = config.get("gguf_architecture") == "deepseek41"
+        if (canonical_gguf or (quant.get("quant_method") == "fp8" and quant.get("expert_dtype") == "fp4" and
+                quant.get("weight_block_size") == [32, 32])):
             hc = int(config.get("hc_mult", 4))
             heads = int(config["num_attention_heads"])
             groups, rank = int(config.get("o_groups", 8)), int(config.get("o_lora_rank", hidden))
@@ -473,6 +474,8 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
                 "woa_weight": heads * dim * rank * 4,
                 "woa_scratch": (heads * dim + groups * rank) * 4,
             }
+            if canonical_gguf:
+                result.disk_prefill["canonical_gguf"] = True
     return result
 
 
@@ -778,6 +781,11 @@ def weight_costs(tensors, model, args):
         raise ValueError("Hybrid auto: no routed experts found")
     model.gguf_expert_bytes = {layer: math.ceil(size / model.experts)
                                for layer, size in gguf_layers.items()}
+    if model.disk_prefill.get("canonical_gguf", False):
+        # Match FastllmCudaV41GGUFGroupedWorkspaceBytes, not all GGUF formats.
+        supported = {"gguf:" + str(t) for t in (11, 12, 16, 17, 18, 19, 22, 29, 42)}
+        model.disk_prefill["streamed_mmq"] = len(gguf_layers) == model.layers and all(
+            t.kind in supported for t in tensors if _is_routed_expert(t.name))
     return expert, dense, common, host, largest, snapshot
 
 
@@ -802,7 +810,15 @@ def _score_workspace(model, rows, context):
     return min(rows * per_row, max(budget, per_row))
 
 
-def _workspace_bytes(args, model, rows, context, mode, resident):
+def _v41_streamed_mmq(model, rows, topk):
+    return (model.disk_prefill.get("streamed_mmq", False) and 32 < rows <= 4096 and
+            0 < model.hidden <= 24576 and model.hidden % 256 == 0 and
+            0 < model.intermediate <= 24576 and model.intermediate % 256 == 0 and
+            0 < model.experts <= 1024 and 0 < topk <= 32 and
+            rows * topk + model.experts * 15 + 15 <= 65535)
+
+
+def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=True):
     topk = max(model.topk, args.moe_experts)
     scores = _score_workspace(model, rows, context)
     dense = model.hidden * model.intermediate * 3 * 2
@@ -817,6 +833,12 @@ def _workspace_bytes(args, model, rows, context, mode, resident):
                 args.atype in ("auto", "bfloat16") and args.moe_atype in ("", "auto", "bfloat16") and
                 "FASTLLM_DSV41_DUMP_DIR" not in os.environ and
                 os.environ.get("FASTLLM_DSV41_REFERENCE_MATH", "0") in ("", "0"))
+    # Canonical GGUF's streamed grouped MMQ currently accepts <=4096 rows.
+    # Larger explicit chunks retain the conservative per-expert fallback bound.
+    canonical_gguf = phase.get("canonical_gguf", False)
+    if canonical_gguf and (not gguf_mmq or not _v41_streamed_mmq(model, rows, topk) or
+                           args.moe_device == "disk"):
+        reusable = False
     if not reusable:
         return scores + rows * (model.activation_width + topk * (model.hidden + 3 * model.intermediate)) * 4 + dense
     # Indexer scores retain their full-context budget. WoA's FP32 fallback
@@ -847,7 +869,21 @@ def _workspace_bytes(args, model, rows, context, mode, resident):
                             (n * model.hidden + routes * model.intermediate) * 36 // 32 + grouped)
         fallback = rows * (8 * model.hidden + 6 * model.intermediate) + dense
         resident_scratch = max(resident_scratch, fallback)
-    return rows * phase["retained"] + max(attention, woa, moe) + resident_scratch + 32 * MiB
+    streamed_scratch = 0
+    if canonical_gguf and resident < model.layers:
+        # RunPipelined's direct allocation survives attention/WoA releases.
+        # Bound the worst routing skew, not average experts per token: one
+        # eight-expert batch can contain every route, plus 15-row padding each.
+        capacity = math.ceil((rows * topk + 8 * 15) / 16) * 16
+        streamed_scratch = (rows * model.hidden * 296 // 256 +
+                            capacity * (math.ceil(max(model.hidden, model.intermediate) / 256) * 288 +
+                                        max(model.hidden, 2 * model.intermediate) * 4) +
+                            rows * topk * model.hidden * 2 + 16 * MiB)
+        # Raw/canonical weight rings and lookahead are accounted in transport.
+        # Keep the 256 MiB dense dequant fallback independent of those rings.
+        woa = max(woa, rows * phase["woa"] + 256 * MiB)
+    return (rows * phase["retained"] + max(attention, woa, moe) +
+            resident_scratch + streamed_scratch + 32 * MiB)
 
 
 def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_gpu=False,
@@ -918,22 +954,44 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     cpu_auto = args.moe_cpu_cache == "auto"
     selected, selected_score = None, None
     speculative = max(args.mtp, getattr(args, "dspark", 0))
+    gguf_mmq = all(gpu[d].get("capability", 0) >= 75 for d in mapping)
     for chunk in chunks:
         rows = batch * max(chunk + (1 if args.mtp else 0), speculative + 1, model.dspark_block_size)
         for resident in residents:
-            workspace = _workspace_bytes(args, model, rows, context, mode, resident)
+            shared_host = args.moe_device == "numa" or (
+                args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False))
+            canonical_gguf = model.disk_prefill.get("canonical_gguf", False)
+            # A larger automatic chunk must not leave the streamed grouped
+            # MMQ path and spend its extra workspace at the expense of cache.
+            # Explicit chunks and backends without this fast path retain the
+            # conservative fallback budget below.
+            if (args.chunked_prefill_size == "auto" and canonical_gguf and gguf_mmq and
+                    shared_host and mode == "pp" and resident < model.layers and rows > 4096 and
+                    args.fast_prefill and args.atype in ("auto", "bfloat16") and
+                    args.moe_atype in ("", "auto", "bfloat16") and
+                    _v41_streamed_mmq(model, 4096, max(model.topk, args.moe_experts))):
+                continue
+            workspace = _workspace_bytes(args, model, rows, context, mode, resident, gguf_mmq=gguf_mmq)
             if streaming:
                 # Prefill stages one complete KV layer per device.
                 workspace += logical * layer_bytes
-            # GGUF host prefill retains raw and canonical upload rings:
-            # 3 groups x 16 experts x 2 copies, plus 256 MiB lookahead.
+            # GGUF host prefill retains raw/canonical upload rings and
+            # 256 MiB lookahead, independently of activation scratch.
             # These packed-weight buffers coexist with activation scratch and
             # the decode cache; generic top-k activation accounting omits them.
             record = max((size for layer, size in model.gguf_expert_bytes.items()
                           if expert_layer(layer, model) >= resident), default=0)
-            shared_host = args.moe_device == "numa" or (
-                args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False))
-            transport = (96 * (math.ceil(record / 256) * 256) + 272 * MiB
+            # Native V4.1 streaming has 3 x 8 experts x 2 copies. Reserve
+            # one additional record for decode frequency-admission DMA.
+            bounded_rings = gguf_mmq and _v41_streamed_mmq(model, rows, max(model.topk, args.moe_experts))
+            ring_records = (48 if canonical_gguf and bounded_rings else 96) + int(canonical_gguf)
+            # The asynchronous two-device decoder retains one additional
+            # temporary expert batch plus a restore record on each device.
+            decode_topk = max(model.topk, args.moe_experts)
+            if (canonical_gguf and gguf_mmq and mode == "pp" and len(mapping) == 2 and
+                    not speculative and args.moe_cuda_cache != 0 and 0 < decode_topk <= 16):
+                ring_records += decode_topk + 1
+            transport = (ring_records * (math.ceil(record / 256) * 256) + 272 * MiB
                          if model.family == "deepseek_v41" and shared_host and record else 0)
             used = {d: common + workspace + transport + guard for d in mapping}
             reallocation = dict.fromkeys(mapping, 0)
