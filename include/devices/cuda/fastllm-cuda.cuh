@@ -1936,6 +1936,7 @@ struct FastllmCudaMoeGGUFCacheView {
     // Only valid for the same input/shape and workspace within one MoE call.
     // Gate/down scratch may change; the input prefix must remain untouched.
     bool q8InputPrepared = false;
+    bool preserveMissing = false; // A second sparse pass must retain resident results.
     // Optional compact list of active routes into the original [rows, topk]
     // batch. Input rows and perExpert destinations use this mapping; slots
     // and activation scratch use compact order. Entries must be distinct.

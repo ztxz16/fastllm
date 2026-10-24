@@ -1441,6 +1441,12 @@ if (UNIT_TEST)
             fastllm_add_checked_test(deepseekV41GgufCooperativeCache deepseekV41GgufIndexedRegression
                 "PASS: V4.1 cached cooperative verify" 300 --cooperative-cache)
             set_tests_properties(deepseekV41GgufCooperativeCache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+            fastllm_add_checked_test(deepseekV41GgufCooperativePartialCache deepseekV41GgufIndexedRegression
+                "PASS: V4.1 cached cooperative verify" 300 --cooperative-partial-cache)
+            set_tests_properties(deepseekV41GgufCooperativePartialCache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+            fastllm_add_checked_test(deepseekV41GgufPrefillCache deepseekV41GgufIndexedRegression
+                "PASS: V4.1 GGUF prefill admission and resident reuse" 300 --prefill-cache)
+            set_tests_properties(deepseekV41GgufPrefillCache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_test(NAME deepseekV41GgufIndexed COMMAND deepseekV41GgufIndexedRegression)
             add_test(NAME deepseekV41GgufGrouped COMMAND deepseekV41GgufIndexedRegression --grouped-full)
             add_test(NAME deepseekV41GgufGroupedSparse COMMAND deepseekV41GgufIndexedRegression --sparse)

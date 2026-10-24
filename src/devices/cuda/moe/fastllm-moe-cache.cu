@@ -39,10 +39,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <new>
 #include <memory>
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <thread>
+#include <system_error>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -312,12 +317,17 @@ struct DeviceCache {
     std::vector<uint64_t> hostSlotOffsets;
     std::unique_ptr<fastllm::MoeFrequencyPolicy> frequency;
     OffloadGroup *frequencyGroup = nullptr;
-    fastllm::Data frequencyChanges;
+    fastllm::Data frequencyChanges, frequencyUpload;
     int32_t *frequencyHostChanges = nullptr;
     size_t frequencyChangeCapacity = 0;
     cudaEvent_t frequencyReadersDone = nullptr;
     cudaStream_t admissionStream = nullptr;
     cudaEvent_t admissionDone = nullptr;
+    std::unique_ptr<fastllm::MoeFrequencyPolicy::RuntimeBudget> frequencyRuntime;
+    cudaEvent_t frequencyUploadBegin = nullptr, frequencyUploadEnd = nullptr;
+    fastllm::MoeDecodeScheduler::Estimate frequencyUploadRate;
+    double frequencyStepUs = 0, frequencyCreditUs = 0;
+    uint64_t frequencyUploadBytes = 0;
     int admissionCopyBlocks = 64;
     bool frequencyActive = false;
     bool frequencyResidencyDirty = true;
@@ -354,6 +364,7 @@ struct DeviceCache {
 };
 
 struct CooperativeMoe;
+struct MailboxMoe;
 struct Glm5TensorParallel;
 struct OffloadGroup {
     OffloadLayout layout;
@@ -378,6 +389,7 @@ struct OffloadGroup {
     std::vector<fastllm_gguf_restore::Record> ggufSources;
     std::unordered_map<int, std::unique_ptr<DeviceCache> > deviceCaches;
     std::shared_ptr<CooperativeMoe> cooperativeHybrid;
+    std::shared_ptr<MailboxMoe> mailboxHybrid;
     bool tensorParallelRequested = false;
     std::shared_ptr<Glm5TensorParallel> tensorParallel;
     std::vector<int> expertDevices;
@@ -1083,6 +1095,8 @@ void ReleaseDeviceCache(DeviceCache &cache) {
     cudaFree(cache.numaPointers);
     cudaFree(cache.ggufWorkspace);
     if (cache.admissionDone) cudaEventDestroy(cache.admissionDone);
+    if (cache.frequencyUploadBegin) cudaEventDestroy(cache.frequencyUploadBegin);
+    if (cache.frequencyUploadEnd) cudaEventDestroy(cache.frequencyUploadEnd);
     if (cache.frequencyReadersDone) cudaEventDestroy(cache.frequencyReadersDone);
     cudaFreeHost(cache.frequencyHostChanges);
     if (cache.admissionStream) cudaStreamDestroy(cache.admissionStream);
@@ -2368,6 +2382,7 @@ void FastllmCudaReleaseMoeCache(
 
     int originalDevice = -1;
     cudaGetDevice(&originalDevice);
+    released->mailboxHybrid.reset();
     released->cooperativeHybrid.reset();
     released->tensorParallel.reset();
     for (auto &cache : released->deviceCaches) {
@@ -2879,7 +2894,8 @@ void FastllmCudaPlanMoePrefill(fastllm::Data **weights, int experts,
     }
     const auto &layout = group->LayerLayout(table);
     const bool supported = SharedMoePrefillSupported(*group) ||
-        (layout.weightType == fastllm::DATA_GGUF_FORMAT && !layout.deepSeekV41);
+        (layout.weightType == fastllm::DATA_GGUF_FORMAT &&
+         (!layout.deepSeekV41 || !group->ggufSources.empty()));
     if (!supported || experts > layout.experts) return;
     std::lock_guard<std::mutex> lock(group->mutex);
     const auto it = group->deviceCaches.find(FastllmCudaGetDevice());
@@ -4138,12 +4154,15 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
     if (devices) FastllmCudaPrepareMoeExpertCache(weights, weightsBatch, *devices);
     auto *cache = GetDeviceCache(*group, false);
     if (!cache) return nullptr;
-    if (!group->expertDevices.empty()) {
+    const bool cooperativeFrequency = group->layout.deepSeekV41 &&
+        group->layout.weightType == fastllm::DATA_GGUF_FORMAT && devices && devices->size() > 1;
+    if (!group->expertDevices.empty() || cooperativeFrequency) {
         const int previous = cache->device;
-        for (int device : group->expertDevices) {
+        for (int device : cooperativeFrequency ? *devices : group->expertDevices) {
             checkCudaErrors("MoE EP begin device", cudaSetDevice(device));
             if (auto *local = GetDeviceCache(*group)) {
                 PrepareFrequencyPolicy(group, local);
+                local->frequencyStepUs = 0;
                 local->frequency->BeginStep();
                 local->frequencyActive = true;
             }
@@ -4163,7 +4182,7 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
         (group->layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 ||
          group->layout.weightType == fastllm::FP8_E4M3_BLOCK_128 ||
          (group->layout.weightType == fastllm::DATA_GGUF_FORMAT &&
-          group->allowStreaming && cache->slots == 0));
+          !group->ggufSources.empty()));
     const bool frequencyScope = v41FrequencyScope || (!group->layout.deepSeekV41 && !group->layout.glm5) ||
         (group->layout.glm5 && (NativeSharedRecords(*group) ||
          group->layout.weightType == fastllm::DATA_GGUF_FORMAT));
@@ -4186,9 +4205,30 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
 
 static int EndMoeFrequencyStep(DeviceCache &cache) {
     cache.frequencyActive = false;
-    const auto admissions = cache.frequency->EndStep();
-    if (admissions.empty()) return 0;
     auto &group = *cache.frequencyGroup;
+    auto *budget = cache.frequencyStepUs > 0 ? cache.frequencyRuntime.get() : nullptr;
+    if (budget) {
+        if (cache.frequencyUploadBytes) {
+            // This step's route publication waited for the previous admission.
+            float ms = 0;
+            checkCudaErrors("MoE admission cost",cudaEventElapsedTime(&ms,
+                cache.frequencyUploadBegin,cache.frequencyUploadEnd));
+            if(ms>0) cache.frequencyUploadRate.Observe(ms*1000/cache.frequencyUploadBytes);
+            cache.frequencyUploadBytes=0;
+        }
+        budget->uploadUsPerByte = cache.frequencyUploadRate.initialized ?
+            cache.frequencyUploadRate.us : 1.0/32768; // Bootstrap; replaced by measured DMA + restore.
+        size_t largest=0;
+        for(const auto &layout:group.layerLayouts) largest=std::max(largest,layout.recordStride);
+        // Each device can spend 5% of measured MoE completion time. Carry
+        // unused time across steps, bounded to four full records, so a large
+        // expert is neither starved nor admitted in an unbounded burst.
+        cache.frequencyCreditUs=std::min(cache.frequencyCreditUs+.05*cache.frequencyStepUs,
+            4*largest*budget->uploadUsPerByte);
+        budget->maxBytes=uint64_t(cache.frequencyCreditUs/budget->uploadUsPerByte);
+    }
+    const auto admissions = cache.frequency->EndStep(budget);
+    if (admissions.empty()) return 0;
     int previousDevice = -1;
     checkCudaErrors("MoE admission device", cudaGetDevice(&previousDevice));
     checkCudaErrors("MoE admission device", cudaSetDevice(cache.device));
@@ -4224,9 +4264,25 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
         cache.frequencyChanges.ToDevice(fastllm::CUDA, {cache.device}, false);
         cache.frequencyChanges.Allocate(false);
     }
+    if (group.layout.deepSeekV41 && !group.ggufSources.empty()) {
+        size_t bytes = group.layout.recordStride;
+        for (const auto &layout : group.layerLayouts) bytes = std::max(bytes, layout.recordStride);
+        auto &scratch = cache.frequencyUpload;
+        if (scratch.expansionBytes < bytes) {
+            scratch.dataType = fastllm::INT8;
+            scratch.Resize({int(bytes)});
+            scratch.ToDevice(fastllm::CUDA, {cache.device}, false);
+            scratch.Allocate(false);
+        }
+    }
+    if (budget) {
+        if(!cache.frequencyUploadBegin) checkCudaErrors("MoE upload timing",cudaEventCreate(&cache.frequencyUploadBegin));
+        if(!cache.frequencyUploadEnd) checkCudaErrors("MoE upload timing",cudaEventCreate(&cache.frequencyUploadEnd));
+    }
     const auto stream = cache.admissionStream;
     checkCudaErrors("MoE admission readers", cudaEventRecord(cache.frequencyReadersDone, cudaStreamPerThread));
     checkCudaErrors("MoE admission readers", cudaStreamWaitEvent(stream, cache.frequencyReadersDone, 0));
+    if(budget) checkCudaErrors("MoE upload begin",cudaEventRecord(cache.frequencyUploadBegin,stream));
     for (int i = 0; i < count; ++i) {
         const auto a = admissions[i];
         const int table = a.key / group.layout.experts, expert = a.key % group.layout.experts;
@@ -4250,12 +4306,23 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
                 layout.recordStride, cudaMemcpyHostToDevice, stream));
         } else {
             const auto &source = group.ggufSources[table];
+            const uint8_t *uploaded = nullptr;
+            if (layout.deepSeekV41) {
+                // Transfer packed NUMA shards with DMA, then restore entirely
+                // in VRAM. Reading them through mapped PCIe memory ties up SMs
+                // and is much slower when several hot experts are admitted.
+                auto &scratch = cache.frequencyUpload;
+                CopyNativeGGUFExpert(group, table, expert,
+                    static_cast<uint8_t *>(scratch.cudaData), stream);
+                uploaded = static_cast<const uint8_t *>(scratch.cudaData);
+            }
             checkCudaErrors("MoE global admission", fastllm_gguf_restore::CopyRecords(source,
                 cache.numaPointers + size_t(table) * layout.experts * 2 * source.shards,
                 destination, stream, nullptr, nullptr, nullptr, nullptr, expert,
-                nullptr, -1, nullptr, false, cache.admissionCopyBlocks));
+                nullptr, -1, uploaded, false, cache.admissionCopyBlocks));
         }
         cache.uploadedExpertBytes += layout.gateBytes + layout.downBytes;
+        if(budget) cache.frequencyUploadBytes += layout.recordStride;
         cache.frequencyHostChanges[i] = a.key;
         cache.frequencyHostChanges[count + i] = a.slot;
     }
@@ -4265,6 +4332,11 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
     PublishCacheAdmissions<<<(count + 255) / 256, 256, 0, stream>>>(
         cache.keyToSlot, cache.slotKeys, cache.mappedKeyToSlot, cache.lastUsed, cache.step, changes, count);
     checkCudaErrors("MoE global admission publish", cudaGetLastError());
+    if(budget) {
+        checkCudaErrors("MoE upload end",cudaEventRecord(cache.frequencyUploadEnd,stream));
+        cache.frequencyCreditUs=std::max(0.0,cache.frequencyCreditUs-
+            cache.frequencyUploadBytes*budget->uploadUsPerByte);
+    }
     // GetDeviceCache also installs this dependency in captured cache users.
     checkCudaErrors("MoE global admission fence", cudaEventRecord(cache.admissionDone, stream));
     checkCudaErrors("MoE admission restore device", cudaSetDevice(previousDevice));
@@ -4294,6 +4366,10 @@ static void EndDeviceMoeDecode(DeviceCache &cache) {
     }
 }
 
+#ifdef USE_NUMAS
+namespace { void WaitCooperativeCpu(OffloadGroup &group); }
+#endif
+
 void FastllmCudaEndMoeDecode(void *state) {
     if (!state) return;
     auto &cache = *static_cast<DeviceCache *>(state);
@@ -4301,12 +4377,22 @@ void FastllmCudaEndMoeDecode(void *state) {
     if (cache.tensorParallelOwner) { EndGlm5Tp(*cache.tensorParallelOwner); return; }
 #endif
     auto *group = cache.frequencyGroup;
+#ifdef USE_NUMAS
+    if (group) WaitCooperativeCpu(*group);
+#endif
     if (group && !group->expertDevices.empty()) {
         for (int device : group->expertDevices) {
             const auto it = group->deviceCaches.find(device);
             if (it != group->deviceCaches.end() && it->second && it->second->frequencyActive)
                 EndDeviceMoeDecode(*it->second);
         }
+    } else if (group && group->layout.deepSeekV41 &&
+               group->layout.weightType == fastllm::DATA_GGUF_FORMAT) {
+        // PP observes each layer on its owner, but its decode scope spans all
+        // participating caches. Publish every owner's hot misses after the
+        // forward, independently of temporary CPU/GPU miss placement.
+        for (auto &entry : group->deviceCaches)
+            if (entry.second && entry.second->frequencyActive) EndDeviceMoeDecode(*entry.second);
     } else EndDeviceMoeDecode(cache);
 }
 
@@ -4325,8 +4411,18 @@ int V41CacheOption(const char *name, int fallback) {
 } // namespace
 
 #ifdef USE_NUMAS
+namespace { void WaitMailboxMoe(OffloadGroup &group); }
 #include "fastllm-moe-cooperative.cuh"
+#include "fastllm-moe-mailbox.cuh"
 #endif
+
+void FastllmCudaWaitMoeDecodeCpu(void *state) {
+#ifdef USE_NUMAS
+    if (!state) return;
+    auto *group = static_cast<DeviceCache *>(state)->frequencyGroup;
+    if (group) WaitCooperativeCpu(*group);
+#endif
+}
 
 static bool MergeMOEHybrid(const fastllm::Data &input,
         const fastllm::Data &index, const fastllm::Data &score,
@@ -4348,6 +4444,9 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
             cudaStreamIsCapturing(cudaStreamPerThread, &capture) == cudaSuccess &&
             capture == cudaStreamCaptureStatusNone) {
             auto *origin = GetDeviceCache(*group);
+            if (origin && TryMailboxMoe(*group, *origin, table, input, index, score,
+                    output, weights, layer, launchParallel, devices)) return true;
+            WaitMailboxMoe(*group);
             if (origin && TryCooperativeMoe(*group, *origin, table, input, index, score,
                     output, weights, weightsBatch, layer, launchParallel, devices)) return true;
         }

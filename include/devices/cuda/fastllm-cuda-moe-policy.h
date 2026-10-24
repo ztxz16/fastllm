@@ -21,6 +21,8 @@ bool FastllmCudaPrepareMoeExpertCache(fastllm::Data **weights, int weightsBatch,
 void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int topk,
                               const std::vector<int> *devices);
 void FastllmCudaEndMoeDecode(void *state);
+// Join deferred CPU experts before another operation borrows the host pool.
+void FastllmCudaWaitMoeDecodeCpu(void *state);
 
 // The caller hands off these devices' compute streams before borrowing them.
 // A nonempty list includes the current device and bounds every GPU used,

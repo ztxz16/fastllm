@@ -247,10 +247,11 @@ size_t V41CacheWorkspaceBytes(int rows, int routes, int hidden, int inter) {
 }
 
 __global__ void V41CachePartials(const __nv_bfloat16 *partial, float *output,
-        int hidden, int count, const int32_t *routeMap) {
+        int hidden, int count, const int32_t *routeMap, const int32_t *validSlots) {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < count) {
         const int route = i / hidden;
+        if (validSlots && validSlots[route] < 0) return;
         const size_t destination = size_t(routeMap ? routeMap[route] : route)*hidden + i%hidden;
         output[destination] = __bfloat162float(partial[i]);
     }
@@ -316,6 +317,7 @@ bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
         static_cast<const __nv_bfloat16 *>(activation.cudaData), qGate, inter);
     Project<false>(view.downType, qGate, partial, view, nullptr, 0, topk, routes, inter, hidden);
     V41CachePartials<<<(routes*hidden+255)/256, 256, 0, cudaStreamPerThread>>>(
-        partial, perExpert, hidden, routes*hidden, view.routeMap);
+        partial, perExpert, hidden, routes*hidden, view.routeMap,
+        view.preserveMissing ? view.routeSlots : nullptr);
     return cudaGetLastError() == cudaSuccess;
 }

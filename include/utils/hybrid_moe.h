@@ -54,6 +54,8 @@ public:
     ~HybridMoeDecodeStep();
     void Begin(Data **weights, int count, int topk,
                const std::vector<int> *devices = nullptr);
+    // Join deferred CPU work without ending cache observation/admission.
+    void WaitCpu();
     void Finish();
     explicit operator bool() const { return policy != nullptr; }
 private:

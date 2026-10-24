@@ -7,6 +7,7 @@
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
+#include "devices/cuda/fastllm-cuda-moe-prefill.h"
 #include <cuda_runtime.h>
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
@@ -168,7 +169,9 @@ static void CollectRegistrationFixture(std::vector<Data *> &weights, int gt, int
     if (!((gt==GGML_TYPE_IQ1_S && dt==GGML_TYPE_IQ1_M) ||
           (gt==GGML_TYPE_Q2_0 && dt==GGML_TYPE_Q3_K) ||
           (gt==GGML_TYPE_Q4_K && dt==GGML_TYPE_Q2_0) ||
-          (gt==GGML_TYPE_Q2_K && dt==GGML_TYPE_Q4_K))) return;
+          (gt==GGML_TYPE_Q2_K && dt==GGML_TYPE_Q4_K) ||
+          ((gt==GGML_TYPE_IQ2_XXS || gt==GGML_TYPE_IQ2_XS) && dt==GGML_TYPE_Q3_K) ||
+          (gt==GGML_TYPE_IQ2_S && dt==GGML_TYPE_Q4_K))) return;
     RegisteredFixture f;
     f.host.resize(50); f.gpu.resize(50);
     for (int expert=0; expert<24; ++expert) for(int part=0; part<2; ++part) {
@@ -187,11 +190,15 @@ static void CollectRegistrationFixture(std::vector<Data *> &weights, int gt, int
 }
 class StreamModelProbe : public DeepSeekV41Model {
 public:
-    void PrepareStream() {
+    void PrepareStream(int gpuPrefix = 0) {
         embed_dim = 512; block_cnt = registeredFixtures.size();
         num_experts_per_tok = 6; swiglu_limit = .8f;
         deviceMap = {{"cuda:0", 1}}; moeDeviceMap = {{"numa", 1}};
         if (cooperativeTest) deviceMap = {{"cuda:0", 1}, {"cuda:1", 1}};
+        if (gpuPrefix) {
+            moeDeviceMap={{"cuda:0",1}};layeredMoeDeviceMap={{"numa",1}};
+            moeDeviceLayers=block_cnt-gpuPrefix;
+        }
         for (size_t layer=0; layer<registeredFixtures.size(); ++layer) {
             weights.push_back(registeredFixtures[layer].host);
             biass.emplace_back(weights.back().size(), nullptr);
@@ -202,12 +209,15 @@ public:
         SetCudaSharedExpert(true);
         HybridMoeDecodeStep step;
         BeginHybridMoeStep(step, false, true, 1);
+        if(gpuPrefix) Check(bool(step),"GPU-resident first layer disabled the host cache scope");
     }
     void Run(Data &input, Data &index, Data &score, Data &output,
              int layer, int device, int &callbacks, bool graph = false) {
         const int rows = input.dims[0];
         if (!cooperativeTest) deviceMap = {{"cuda:" + std::to_string(device), 1}};
         ApplyDeviceMap({{"cuda:" + std::to_string(device), 1}}, 0, 1);
+        HybridMoeDecodeStep step;
+        BeginHybridMoeStep(step, false, true, rows);
         ws.ffnInput.CopyFrom(input); ws.expertIndex.CopyFrom(index); ws.expertScore.CopyFrom(score);
         if (layer % 2) {
             ws.expertIndex.ToDevice(CPU); ws.expertScore.ToDevice(CPU);
@@ -224,11 +234,54 @@ public:
         Check(!RunHybridMoe(ctx, nullptr), "unexpected TP streaming dispatch");
         output.CopyFrom(ws.ffnOut);
     }
+    void RunQueued(const std::vector<std::unique_ptr<Data>> &inputs,
+                   const std::vector<std::unique_ptr<Data>> &indices,
+                   const std::vector<std::unique_ptr<Data>> &scores,
+                   std::vector<std::unique_ptr<Data>> &outputs, int first) {
+        constexpr size_t bytes=128*1024;
+        void *pinned=nullptr;
+        Cuda(cudaHostAlloc(&pinned,bytes,cudaHostAllocPortable));
+        std::unique_ptr<void,decltype(&cudaFreeHost)> host(pinned,cudaFreeHost);
+        std::memset(pinned,0x5a,bytes);
+        Data transfers[2];
+        for(int d=0;d<2;++d) {
+            transfers[d].dataType=INT8; transfers[d].Resize({int(bytes)});
+            transfers[d].ToDevice(CUDA,{d},false);transfers[d].Allocate(false);
+        }
+        HybridMoeDecodeStep step; BeginHybridMoeStep(step,false,true,1);
+        const std::vector<int> devices{0,1};
+        for(size_t i=0;i<outputs.size();++i) {
+            const int layer=first+i%(block_cnt-first);
+            const int device=int(2*(layer+1)>block_cnt);
+            FastllmCudaSetDevice(device);
+            Check(fastllm::RunHybridMoeOnDevices(*inputs[layer],*indices[layer],*scores[layer],
+                *outputs[i],weights[layer].data(),weights[layer].size(),layer,devices,{}),
+                "queued cooperative layer rejected");
+            if (i % 7 == 0) {
+                // Engram borrows the host pool mid-forward. The join must
+                // use the active group even with a GPU-resident first layer.
+                step.WaitCpu();
+                Check(bool(step), "CPU join ended the active decode scope");
+            }
+            // Real decoder layers enqueue transfers between MoE calls. They
+            // must not block a later expert DMA behind a GPU mailbox waiter.
+            Cuda(cudaMemcpyAsync(transfers[device].cudaData,pinned,bytes,
+                cudaMemcpyHostToDevice,cudaStreamPerThread));
+        }
+        step.Finish();
+        std::vector<unsigned char> actual(bytes);
+        for(int d=0;d<2;++d) {
+            FastllmCudaSetDevice(d);
+            Cuda(cudaMemcpy(actual.data(),transfers[d].cudaData,bytes,cudaMemcpyDeviceToHost));
+            Check(std::all_of(actual.begin(),actual.end(),[](unsigned char v){return v==0x5a;}),
+                "queued inter-layer transfer corrupted");
+        }
+    }
 private:
     DeepSeekV41DecodeWorkspace ws;
 };
 
-static void CheckCooperativeCache() {
+static void CheckCooperativeCache(int gpuPrefix = 0) {
     FastllmCudaSetDevice(0); EnableAMX(false);
     size_t stride = 0;
     for (const auto &f : registeredFixtures)
@@ -236,13 +289,13 @@ static void CheckCooperativeCache() {
     const size_t budget = registeredFixtures.size()*4*((stride+127)&~size_t(127));
     SetMoeCudaCacheBytes(budget);
     StreamModelProbe model;
-    model.PrepareStream();
+    model.PrepareStream(gpuPrefix);
     constexpr int hidden=512, topk=6;
     constexpr int widths[] = {1,2,5,3,8,6};
     bool dualVerify=false, resident=false, cpu=false;
-    for (int pass=0; pass<18; ++pass) for (size_t layer=0; layer<registeredFixtures.size(); ++layer) {
+    for (int pass=0; pass<18; ++pass) for (size_t layer=gpuPrefix; layer<registeredFixtures.size(); ++layer) {
         const int rows=widths[pass%6];
-        const int device=int(layer*2/registeredFixtures.size());
+        const int device=int(2*(layer+1)>registeredFixtures.size());
         FastllmCudaSetDevice(device);
         auto &f=registeredFixtures[layer];
         for (auto *w:f.gpu) if (w) w->ToDevice(CUDA,{device},true);
@@ -255,6 +308,7 @@ static void CheckCooperativeCache() {
             // One nonzero route per row gives an independent exact oracle:
             // either the CPU or CUDA quantized expert may own that route.
             scores[row*topk+(row+pass)%topk]=row%2 ? -.31f : .77f;
+            if (rows==1) for(int k=0;k<topk;++k) scores[k]=.125f*(k-2);
         }
         Data input(FLOAT32,{rows,hidden},x), index(INT32,{rows,topk},CPU,ids.data());
         Data score(FLOAT32,{rows,topk},scores), output, reference, gate, activation, workspace;
@@ -271,16 +325,45 @@ static void CheckCooperativeCache() {
             f.gpu.data(),f.gpu.size(),index,score,0,.8f),"cached cooperative CUDA oracle failed");
         ToDataType(reference,BFLOAT16); ToDataType(reference,FLOAT32);
         const auto gpuExpected=Read(reference);
+        std::vector<std::vector<float>> gpuPartial;
+        if(rows==1) for(int k=0;k<topk;++k) {
+            std::vector<float> isolated(topk,0.f); isolated[k]=scores[k];
+            Data oneScore(FLOAT32,{1,topk},isolated);oneScore.ToDevice(CUDA,{device},true);
+            Check(FastllmCudaMergeMOEV41GGUFResident(input,gate,activation,workspace,reference,
+                f.gpu.data(),f.gpu.size(),index,oneScore,0,.8f),"per-route GPU oracle failed");
+            gpuPartial.push_back(Read(reference));
+        }
         uint64_t before[2][8]={};
         for(int d=0;d<2;++d) fastllm_moe_cuda_cache_route_stats(d,before[d]);
         int callbacks=0;
         model.Run(input,index,score,output,layer,device,callbacks,pass%2==0);
         Check(callbacks==1,"cached verify shared callback count changed");
+        if (GetPointerDeviceId(output.cudaData)!=device)
+            fprintf(stderr,"PP output mismatch pass=%d layer=%zu rows=%d expected=%d actual=%d gate=%d down=%d\n",
+                pass,layer,rows,device,GetPointerDeviceId(output.cudaData),f.host[2]->ggmlType,f.host[3]->ggmlType);
         Check(GetPointerDeviceId(output.cudaData)==device,"cached verify output on wrong PP device");
         ToDataType(output,FLOAT32);
         const auto actual=Read(output);
         const auto *cpuExpected=reinterpret_cast<const float *>(cpuReference.cpuData);
-        for(int row=0;row<rows;++row) {
+        if(rows==1) {
+            std::vector<int> order(topk); std::iota(order.begin(),order.end(),0);
+            std::stable_sort(order.begin(),order.end(),[&](int a,int b){return ids[a]<ids[b];});
+            // CPU and CUDA use different quantized dot products. Enumerate
+            // all expert placements, but require one common placement to
+            // match every output column, with the prescribed reduction order.
+            bool match=false;
+            for(int mask=0;mask<(1<<topk) && !match;++mask) {
+                bool same=true;
+                for(int c=0;c<hidden && same;++c) {
+                    float sum=0;
+                    for(int k:order) sum += mask&(1<<k) ? gpuPartial[k][c] : partial[k*hidden+c];
+                    same = actual[c]==RoundFloat32ToBFloat16RNE(sum);
+                }
+                match=same;
+            }
+            Check(match,"mailbox multi-expert reduction differs from every ordered CPU/GPU placement");
+        }
+        for(int row=0;rows>1 && row<rows;++row) {
             bool cpuMatch=true,gpuMatch=true;
             for(int c=0;c<hidden;++c) {
                 const int i=row*hidden+c;
@@ -305,8 +388,103 @@ static void CheckCooperativeCache() {
         uint64_t stats[5]={}; Check(fastllm_moe_cuda_cache_stats(d,stats,false),"cached verify stats unavailable");
         Check(stats[2]>0 && stats[2]<=budget && stats[3]<stats[4],"cached verify exceeded residency budget");
     }
+    // Queue a full decoder's worth of layers without a per-layer host join.
+    // This exposes stream/worker dependency cycles hidden by Read(output).
+    const int layers=registeredFixtures.size();
+    std::vector<std::unique_ptr<Data>> inputs(layers), indices(layers), scores(layers), outputs;
+    std::vector<std::vector<float>> gpuReference(layers), cpuReference(layers);
+    for(int layer=gpuPrefix;layer<layers;++layer) {
+        const int device=int(2*(layer+1)>layers);FastllmCudaSetDevice(device);
+        auto &f=registeredFixtures[layer];
+        std::vector<int32_t> ids(topk),owners(topk,-1);
+        for(int k=0;k<topk;++k) ids[k]=(k+13)%24;
+        std::vector<float> values(hidden,.125f),scales(topk,0.f);scales[2]=.625f;
+        inputs[layer]=std::make_unique<Data>(FLOAT32,std::vector<int>{1,hidden},values);
+        ToDataTypeForceCPU(*inputs[layer],BFLOAT16);
+        std::vector<float> partial(topk*hidden);
+        NumasMoeVerifyExperts(reinterpret_cast<uint16_t *>(inputs[layer]->cpuData),partial.data(),1,
+            f.host.data(),f.host.size(),ids.data(),owners.data(),scales.data(),topk,layer,.8f,true,32);
+        cpuReference[layer].assign(partial.begin()+2*hidden,partial.begin()+3*hidden);
+        for(auto &v:cpuReference[layer]) v=RoundFloat32ToBFloat16RNE(v);
+        indices[layer]=std::make_unique<Data>(INT32,std::vector<int>{1,topk});indices[layer]->Allocate();
+        std::memcpy(indices[layer]->cpuData,ids.data(),topk*4);
+        scores[layer]=std::make_unique<Data>(FLOAT32,std::vector<int>{1,topk},scales);
+        for(auto *v:{inputs[layer].get(),indices[layer].get(),scores[layer].get()})v->ToDevice(CUDA,{device},true);
+        Data gate,activation,workspace,reference;
+        Check(FastllmCudaMergeMOEV41GGUFResident(*inputs[layer],gate,activation,workspace,reference,
+            f.gpu.data(),f.gpu.size(),*indices[layer],*scores[layer],0,.8f),"queued GPU oracle failed");
+        ToDataType(reference,BFLOAT16);ToDataType(reference,FLOAT32);gpuReference[layer]=Read(reference);
+    }
+    for(int i=0;i<42;++i) {
+        const int layer=gpuPrefix+i%(layers-gpuPrefix),device=int(2*(layer+1)>layers);
+        auto out=std::make_unique<Data>();out->dataType=BFLOAT16;out->Resize({1,hidden});
+        out->ToDevice(CUDA,{device},false);out->Allocate(false);outputs.push_back(std::move(out));
+    }
+    for(int repeat=0;repeat<8;++repeat) {
+        model.RunQueued(inputs,indices,scores,outputs,gpuPrefix);
+        for(size_t i=0;i<outputs.size();++i) {
+            const int layer=gpuPrefix+i%(layers-gpuPrefix);
+            ToDataType(*outputs[i],FLOAT32);const auto value=Read(*outputs[i]);
+            Check(value==gpuReference[layer] || value==cpuReference[layer],"queued mailbox changed expert output");
+            ToDataType(*outputs[i],BFLOAT16);
+        }
+    }
     registeredFixtures.clear();
-    puts("PASS: V4.1 cached cooperative verify, dual GPU, sparse batches, exact CPU/CUDA oracle");
+    puts("PASS: V4.1 cached cooperative verify, queued decode, dual GPU, exact CPU/CUDA oracle");
+}
+
+static void CheckPrefillCache() {
+    FastllmCudaSetDevice(0); EnableAMX(false);
+    SetMoeCudaCacheBytes(4 * 1024 * 1024);
+    StreamModelProbe model;
+    model.PrepareStream();
+    constexpr int rows = 128, hidden = 512, topk = 6;
+    for (size_t layer = 0; layer < registeredFixtures.size(); ++layer) {
+        auto &f = registeredFixtures[layer];
+        if (f.gpu[2]->ggmlType == GGML_TYPE_Q2_K) continue;
+        const int device = int(2 * (layer + 1) > registeredFixtures.size());
+        FastllmCudaSetDevice(device);
+        for (auto *w : f.gpu) if (w) w->ToDevice(CUDA, {device}, true);
+        std::vector<float> x(rows * hidden), scales(rows * topk, .25f);
+        std::vector<int32_t> ids(rows * topk);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(float(i) * .031f);
+        std::unordered_set<int> selected;
+        for (int r = 0; r < rows * topk; ++r) {
+            ids[r] = r % topk;
+            selected.insert(ids[r] + 1);
+        }
+        Data input(FLOAT32, {rows, hidden}, x), index(INT32, {rows, topk}, CPU, ids.data());
+        Data score(FLOAT32, {rows, topk}, scales), gate, workspace, output, refGate, activation, refWork, reference;
+        ToDataType(input, BFLOAT16);
+        for (auto *v : {&input, &index, &score}) v->ToDevice(CUDA, {device}, true);
+        Check(FastllmCudaMergeMOEV41GGUFResident(input, refGate, activation, refWork,
+            reference, f.gpu.data(), f.gpu.size(), index, score, 0, .8f), "prefill cache oracle failed");
+        ToDataType(reference, BFLOAT16); ToDataType(reference, FLOAT32);
+        const auto expected = Read(reference);
+        for (int pass = 0; pass < 2; ++pass) {
+            Check(FastllmCudaMergeMOEGGUFHost(input, gate, workspace, output,
+                f.host.data(), 24, ids.data(), scales.data(), topk, selected, true, true, .8f, 32),
+                "prefill cache grouped dispatch failed");
+            ToDataType(output, FLOAT32);
+            const auto actual = Read(output);
+            double error = 0, norm = 0;
+            for (size_t i = 0; i < actual.size(); ++i) {
+                Check(std::isfinite(actual[i]), "prefill cache produced non-finite result");
+                error += std::pow(double(actual[i]) - expected[i], 2);
+                norm += double(expected[i]) * expected[i];
+            }
+            Check(std::sqrt(error / std::max(norm, 1e-30)) < .002,
+                "admitted/reused prefill cache differs from independent CUDA oracle");
+            FastllmCudaMoePrefillResidents residents;
+            Check(FastllmCudaGetMoePrefillResidents(f.host.data(), 24, residents),
+                "prefill cache residents unavailable");
+            int hits = 0;
+            for (int e = 0; e < topk; ++e) hits += residents.weights[2 * e] != nullptr;
+            Check(hits > 0, "canonical V4.1 GGUF prefill did not admit any hot experts");
+        }
+    }
+    registeredFixtures.clear();
+    puts("PASS: V4.1 GGUF prefill admission and resident reuse");
 }
 static void CheckRegistration() {
     FastllmCudaSetDevice(0); EnableAMX(false);
@@ -332,7 +510,7 @@ static void CheckRegistration() {
     bool simultaneousGpuRoutes = false;
     for(int pass=0;pass<(streamTest ? 12 : 5);++pass) for(size_t layer=0;layer<registeredFixtures.size();++layer) {
         auto &f=registeredFixtures[layer];
-        const int device = cooperativeTest ? int(layer * 2 / registeredFixtures.size()) :
+        const int device = cooperativeTest ? int(2 * (layer + 1) > registeredFixtures.size()) :
             streamTest ? pass % std::min(2, devices) : 0;
         FastllmCudaSetDevice(device);
         if (streamTest) for (auto *weight : f.gpu) if (weight) weight->ToDevice(CUDA, {device}, true);
@@ -566,7 +744,8 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
         std::vector<float> values(size_t(rows)*cols);
         for (float &x : values) x = normal(rng);
         const int type = part ? dt : gt;
-        if (type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M) {
+        if (type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M ||
+            type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S) {
             // These CUDA-only formats do not all have a CPU encoder. Construct valid
             // packed fixtures directly; the reference consumes the same bytes.
             w->Allocate(false);
@@ -730,17 +909,21 @@ int main(int argc, char **argv) {
             printf("PASS: production decode grids and canonical cache (%d checks, %d changed-input graph replays)\n", n, graphReplays);
             return 0;
         }
-        const bool cooperativeCacheTest = mode == "--cooperative-cache";
-        cooperativeTest = mode == "--cooperative" || cooperativeCacheTest;
+        const bool cooperativeCacheTest = mode == "--cooperative-cache" || mode == "--cooperative-partial-cache";
+        const bool prefillCacheTest = mode == "--prefill-cache";
+        cooperativeTest = mode == "--cooperative" || cooperativeCacheTest || prefillCacheTest;
         if (cooperativeTest && devices < 2) return 77;
         streamTest = mode == "--stream" || cooperativeTest;
         if (streamTest) {
 #ifdef USE_NUMAS
             for (auto pair : std::vector<std::pair<int,int>>{
                     {GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M}, {GGML_TYPE_Q2_0, GGML_TYPE_Q3_K},
-                    {GGML_TYPE_Q4_K, GGML_TYPE_Q2_0}, {GGML_TYPE_Q2_K, GGML_TYPE_Q4_K}})
+                    {GGML_TYPE_Q4_K, GGML_TYPE_Q2_0}, {GGML_TYPE_Q2_K, GGML_TYPE_Q4_K},
+                    {GGML_TYPE_IQ2_XXS, GGML_TYPE_Q3_K}, {GGML_TYPE_IQ2_XS, GGML_TYPE_Q3_K},
+                    {GGML_TYPE_IQ2_S, GGML_TYPE_Q4_K}})
                 Case(pair.first, pair.second, 512, 256, 0, false);
-            if (cooperativeCacheTest) CheckCooperativeCache();
+            if (prefillCacheTest) CheckPrefillCache();
+            else if (cooperativeCacheTest) CheckCooperativeCache(mode == "--cooperative-partial-cache" ? 1 : 0);
             else CheckRegistration();
             return 0;
 #else

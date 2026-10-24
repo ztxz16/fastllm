@@ -109,15 +109,22 @@ namespace fastllm {
         // their stable graph-owned tensors. Unsupported layouts retain NUMA.
         // Native cache requests (including --auto) enable admission directly.
         const bool nativeFrequency = weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0 ||
-                                     weights[0][2]->dataType == FP8_E4M3_BLOCK_128;
+                                     weights[0][2]->dataType == FP8_E4M3_BLOCK_128 || streamGGUF;
         if (!tp && single && seqlen == 1 && nativeFrequency &&
             FastllmCudaMoeCacheRequested() &&
             !V41ReferenceMathEnabled() && GetCudaSharedExpert() &&
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
             (this->deviceMap.empty() || V41DeviceMapUsesCuda(this->deviceMap)) &&
-            V41DeviceMapCudaDeviceCount(this->deviceMap) <= 1) {
-            step.Begin(
-                weights[0].data(), (int)weights[0].size(), num_experts_per_tok);
+            (streamGGUF || V41DeviceMapCudaDeviceCount(this->deviceMap) <= 1)) {
+            // A fixed cache budget may let auto keep initial layers fully
+            // resident. Start the shared scope from its first host table;
+            // a GPU-only first layer is not registered with the host cache.
+            int first = 0;
+            if (streamGGUF)
+                while (first < block_cnt && !UsesHostMoe(SelectMoeDeviceForLayer(first))) ++first;
+            if (first < block_cnt)
+                step.Begin(weights[first].data(), (int)weights[first].size(), num_experts_per_tok,
+                    streamGGUF ? &hybridMoeDevices : nullptr);
         }
 #endif
     }

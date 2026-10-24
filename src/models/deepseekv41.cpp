@@ -5409,6 +5409,7 @@ namespace fastllm {
             for (size_t l = 0; l < engram_layer_ids.size(); l++) {
                 if (engram_layer_ids[l] == layer) {
                     // Engram gather and NUMA MoE share the global CPU worker pool.
+                    if (f.moeStep) f.moeStep->WaitCpu();
                     std::unique_lock<std::mutex> hostLock;
                     if (f.prefill) hostLock = std::unique_lock<std::mutex>(*f.prefill->hostExperts);
                     RunEngram(layer, (int)l, segments, *curHidden);
