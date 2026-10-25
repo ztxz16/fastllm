@@ -643,8 +643,8 @@ int main() { try {
         TestPreload(f,0,false);
     }
     {
-        // Real decode dimensions exercise the large, huge-page-aligned
-        // mappings and their ordinary-page tails during D2H demotion.
+        // Real decode dimensions exercise large page-aligned mappings
+        // and their bounded reuse during D2H demotion.
         Fixture f(GGML_TYPE_IQ1_S,GGML_TYPE_Q2_0,0,5120,2304);
         TestNativeLayout(f,0);
         SetMoeCpuCacheBytes(0); SetMoeCudaCacheBytes(0); TrimDiskMoeCache();

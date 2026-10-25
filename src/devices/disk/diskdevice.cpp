@@ -690,28 +690,17 @@ namespace fastllm {
         if (!buffer) {
             // Unpooled large records return pages directly, without leaving
             // megabytes in glibc arenas for a later global malloc_trim scan.
-            // Align large anonymous buffers without rounding their physical
-            // cache charge up to huge pages. The kernel may then back complete
-            // 2 MiB interiors with THP; the tail keeps ordinary pages.
-            constexpr size_t hugePage = 2ULL << 20;
-            const size_t extra = bytes >= hugePage && hugePage % DiskHostPageSize() == 0 &&
-                bytes <= std::numeric_limits<size_t>::max() - hugePage
-                ? hugePage : 0;
-            void *p = mmap(nullptr, bytes + extra, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            // mmap already provides the alignment needed by direct I/O.
+            void *p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (p == MAP_FAILED) throw std::bad_alloc();
-            if (extra) {
-                const uintptr_t base = reinterpret_cast<uintptr_t>(p);
-                const uintptr_t aligned = (base + hugePage - 1) & ~(hugePage - 1);
-                const size_t prefix = aligned - base, suffix = extra - prefix;
-                if (prefix) munmap(p, prefix);
-                if (suffix) munmap(reinterpret_cast<void *>(aligned + bytes), suffix);
-                p = reinterpret_cast<void *>(aligned);
-#ifdef MADV_HUGEPAGE
-                // An optional hint: allocation and correctness never depend
-                // on transparent huge-page availability.
-                madvise(p, bytes, MADV_HUGEPAGE);
+#ifdef MADV_NOHUGEPAGE
+            // Cache misses and GPU demotions allocate on the decode path.
+            // Faulting THP here can synchronously compact memory for seconds,
+            // including inside pread or MADV_POPULATE_WRITE. Keep these pooled
+            // buffers on base pages even when the system THP policy is always;
+            // long-lived NUMA weight allocations keep their own page policy.
+            madvise(p, bytes, MADV_NOHUGEPAGE);
 #endif
-            }
             buffer = DiskWeightAllocation(static_cast<uint8_t *>(p), DiskWeightDeleter{bytes});
         }
         return buffer;
