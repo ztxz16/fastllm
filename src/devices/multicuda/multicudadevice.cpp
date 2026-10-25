@@ -442,6 +442,78 @@ namespace fastllm {
         return RunMultiCudaGraphEventOps(devices, events, false);
     }
 
+    struct MultiCudaGraphReplayOp : MultiThreadBaseOp {
+        int device;
+        void *exec;
+        bool ok = false;
+
+        MultiCudaGraphReplayOp(int device, void *exec) : device(device), exec(exec) {}
+
+        void Run() override {
+            FastllmCudaSetDevice(device);
+            ok = FastllmCudaGraphLaunch(exec);
+        }
+    };
+
+    bool MultiCudaLaunchGraphs(const std::vector<int> &devices, const std::vector<void *> &execs) {
+        if (devices.empty() || devices.size() != execs.size() || FastllmCudaGraphIsCapturingFast())
+            return false;
+        std::set<int> unique;
+        for (size_t i = 0; i < devices.size(); ++i) {
+            if (devices[i] < 0 || !execs[i] || !unique.insert(devices[i]).second) return false;
+        }
+
+        const int original = FastllmCudaGetDevice();
+        auto serial = [&]() {
+            bool ok = true;
+            for (size_t i = 0; i < devices.size(); ++i) {
+                FastllmCudaSetDevice(devices[i]);
+                ok = FastllmCudaGraphLaunch(execs[i]) && ok;
+            }
+            FastllmCudaSetDevice(original);
+            return ok;
+        };
+        // A worker must never wait on a dispatch lock held by its caller.
+        if (devices.size() == 1 || currentMultiCudaDedicatedWorker != nullptr ||
+            !MultiCudaDedicatedWorkersEnabled())
+            return serial();
+        // Hold the dispatch lock through both event handoffs. Another caller
+        // must not re-record the shared worker events before our waits exist.
+        auto &pool = GetMultiCudaDedicatedWorkerPool();
+        std::lock_guard<std::mutex> dispatchLock(pool.dispatchMutex);
+        std::vector<MultiCudaDedicatedWorker *> workers;
+        std::vector<MultiCudaGraphReplayOp> ops;
+        std::vector<uint64_t> ids;
+        ops.reserve(devices.size());
+        ids.reserve(devices.size());
+        for (size_t i = 0; i < devices.size(); ++i)
+            ops.emplace_back(devices[i], execs[i]);
+        bool parallel = pool.Prepare(devices, workers);
+        for (auto *worker : workers) {
+            parallel = parallel && worker->GetSubmissionEvent() && worker->GetCompletionEvent();
+        }
+
+        bool ok = true;
+        if (parallel) {
+            for (size_t i = 0; i < devices.size(); ++i) {
+                FastllmCudaSetDevice(devices[i]);
+                FastllmCudaEventRecordCurrentThread(workers[i]->GetSubmissionEvent());
+            }
+            for (size_t i = 0; i < devices.size(); ++i)
+                ids.push_back(workers[i]->Submit(&ops[i], false, true));
+            WaitMultiCudaDeviceOps(workers, ids);
+            for (size_t i = 0; i < devices.size(); ++i) {
+                FastllmCudaSetDevice(devices[i]);
+                FastllmCudaCurrentThreadStreamWaitEvent(workers[i]->GetCompletionEvent());
+                ok = ops[i].ok && ok;
+            }
+        } else {
+            return serial();
+        }
+        FastllmCudaSetDevice(original);
+        return ok;
+    }
+
     static void RunMultiCudaDeviceOpsOnTemporaryThreads(const std::vector<fastllm::MultiThreadBaseOp*> &ops) {
         if (ops.size() <= 1) {
             for (fastllm::MultiThreadBaseOp *op : ops) {

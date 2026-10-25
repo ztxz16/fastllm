@@ -237,6 +237,13 @@ namespace fastllm {
     bool MultiCudaCopyShardedActivation(Data &dst, const Data &src, const std::vector<int> &devices,
                                        bool copyData = true);
 
+    // Replay one graph per device outside capture on persistent workers.
+    // Every device, including the root, uses explicit producer/consumer
+    // event handoffs. Preserves the current device, with a serial fallback
+    // when workers are unavailable. False is an error, never a retry signal.
+    bool MultiCudaLaunchGraphs(const std::vector<int> &devices,
+                               const std::vector<void *> &execs);
+
     // 将常驻 MultiCUDA worker 的 per-thread stream 接入/并回调用线程正在捕获的
     // 每卡 CUDA Graph。events 必须与 devices 一一对应并归属相同设备。
     bool MultiCudaGraphWorkersWaitEvents(const std::vector<int> &devices,
