@@ -959,12 +959,11 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     ratio = float(args.gpu_mem_ratio)
     if not 0 < ratio <= 1:
         raise ValueError("Hybrid auto: gpu_mem_ratio must be in (0, 1]")
-    gpu_limit = {d: gpu[d]["free"] - math.ceil(gpu[d]["total"] * (1 - ratio)) for d in mapping}
+    hybrid_ratio = (.95 if getattr(args, "auto", False) and model.family == "deepseek_v41" and
+                    "gpu_mem_ratio" not in getattr(args, "_auto_explicit", ()) else ratio)
     gpu_memory_limit = _memory_limit_bytes(
         getattr(args, "auto_gpu_memory_limit", None), "auto_gpu_memory_limit"
     )
-    if gpu_memory_limit is not None:
-        gpu_limit = {d: min(limit, gpu_memory_limit) for d, limit in gpu_limit.items()}
     # The library queries free memory after creating the CUDA contexts. Keep
     # additional space for graphs, allocator granularity and library handles.
     guard = 512 * MiB
@@ -1115,6 +1114,12 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     used[d] -= transport
             if host_experts == 0 and (not allow_full_gpu or streaming):
                 continue
+            # Only host-backed V4.1 candidates get the higher automatic ratio.
+            # Full GPU plans and explicit ratios retain their existing budget.
+            candidate_ratio = hybrid_ratio if host_experts else ratio
+            gpu_limit = {d: gpu[d]["free"] - math.ceil(gpu[d]["total"] * (1 - candidate_ratio)) for d in mapping}
+            if gpu_memory_limit is not None:
+                gpu_limit = {d: min(limit, gpu_memory_limit) for d, limit in gpu_limit.items()}
             remaining = {d: gpu_limit[d] - used[d] for d in mapping}
             independent = per_device_cache and cache_auto and mode == "pp" and args.moe_device != "disk"
             cache = {}
@@ -1162,11 +1167,13 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     "total_tokens": tokens, "max_batch": batch, "chunked_prefill_size": chunk,
                     "resident_layers": resident, "resident_expert_layers": sum(x > 0 for x in experts[:resident]), "moe_device_layers": model.layers - resident if resident else -1,
                     "moe_cuda_cache": cuda_cache, "moe_cpu_cache": cpu_cache,
+                    "gpu_mem_ratio": candidate_ratio,
                     "gpu_estimated_bytes": {d: used[d] + cache[d] for d in mapping},
                     "gpu_budget_bytes": gpu_limit, "host_estimated_bytes": host_required + cpu_cache,
                     "host_budget_bytes": host_limit, "host_cma_bytes": ram.get("cma", 0),
                     "workspace_bytes_per_device": workspace + transport,
                     "expert_transport_bytes_per_device": transport,
+                    "expert_host_staging_bytes": len(mapping) * disk_staging,
                     "auto_gpu_memory_limit": gpu_memory_limit,
                     "auto_host_memory_limit": host_memory_limit}
             if independent and host_experts:

@@ -944,6 +944,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--auto_host_memory_limit', '--auto-host-memory-limit',
                         dest='auto_host_memory_limit', type=_memory_size_or_auto, default=None,
                         help='自动规划时主机内存上限，如128g；未指定则读取实际可用内存')
+    parser.add_argument('--auto_disk_cache_ratio', '--auto-disk-cache-ratio', type=float, default=0.5,
+                        help='DeepSeek-V4.1自动混合NUMA/disk时，主存缓存覆盖disk专家权重的推荐最低比例（0到1，默认0.5）；仅估算容量')
     parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹或配置文件')
     parser.add_argument('-p', '--path', type = str, required = False, default = '', help = '模型路径，fastllm模型文件或HF模型文件夹')
     parser.add_argument('-t', '--threads', type = int, default = -1,  help = '线程数量')

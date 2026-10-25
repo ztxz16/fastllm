@@ -50,6 +50,7 @@ class AutotuneTest(unittest.TestCase):
         for k in memory.AUTO_OPTIONS:
             if getattr(self.a, k) == "auto":
                 setattr(self.a, k, p[k])
+        self.a.gpu_mem_ratio = p["gpu_mem_ratio"]
         return p
 
     def pool(self, baseline):
@@ -110,6 +111,14 @@ class AutotuneTest(unittest.TestCase):
         pool = self.pool(p)
         self.assertTrue(all(not x["placement"] for x in pool))
         self.assertTrue(all(x["settings"] == pool[0]["settings"] for x in pool))
+
+    def test_mixed_auto_baseline_keeps_gpu_prefix_in_new_candidates(self):
+        mixed = next(x for x in self.pool(self.baseline()) if x['placement'])
+        vars(self.a).update(mixed['settings'])
+        pool = self.pool(mixed['plan'])
+        self.assertEqual(pool[0]['numa_layers'], mixed['numa_layers'])
+        self.assertEqual(pool[0]['placement'], mixed['placement'])
+        self.assertTrue(all(x['gpu_layers'] == mixed['gpu_layers'] for x in pool))
 
     def test_gpu_front_mapping_matches_native_prefix_partition(self):
         self.assertEqual(tune._front_map(6, 26, {0: 1, 1: 1}), {"cuda:0": 3, "cuda:1": 3, "numa": 26})
@@ -202,7 +211,8 @@ class AutotuneTest(unittest.TestCase):
         with patch.object(memory, "host_memory", return_value={"total": 24 * GiB, "available": 2 * GiB}):
             self.assertFalse(tune.fits(candidate, self.a, self.gpu.__getitem__))
 
-    def test_old_auto_entry_never_calls_tuner_or_changes_its_plan(self):
+    def test_auto_entry_applies_mixed_plan_without_calling_tuner(self):
+        self.ram = {'total': 32 * GiB, 'available': 30 * GiB}
         with tempfile.TemporaryDirectory() as d:
             Path(d, "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
             args = make_normal_parser("test").parse_args([d, "--auto", "--dspark", "0"])
@@ -224,6 +234,11 @@ class AutotuneTest(unittest.TestCase):
                 expected = auto.resolve(expected_args, self.gpu.__getitem__)
                 model = make_normal_llm_model(args)
             self.assertEqual(model.hybrid_auto_plan, expected)
+            placement = expected['autotune_placement']
+            runtime.set_device_map.assert_any_call(placement['front'], True)
+            runtime.set_moe_device_layers.assert_called_with(placement['disk_layers'])
+            runtime.set_moe_cuda_cache.assert_called_once_with(
+                expected['moe_cuda_cache'], expected['moe_cuda_cache_per_device'])
             runtime.model.assert_called_once()
 
     def test_tuned_mapping_and_cache_overrides_reach_native_before_load(self):

@@ -98,7 +98,12 @@ def candidates(base, baseline, metadata, tensors, model, gpu, ram):
     explicit = set(getattr(base, "_auto_explicit", ()))
     resident = baseline["resident_layers"]
     host_layers = model.layers - resident
-    result = [_candidate(base, baseline, host_layers if base.moe_device != "disk" else 0)]
+    numa_layers = baseline.get("autotune_placement", {}).get("front", {}).get(
+        "numa", host_layers if base.moe_device != "disk" else 0)
+    result = [_candidate(base, baseline, numa_layers)]
+    # Auto's mixed baseline reports only the disk suffix in moe_device_layers.
+    # New candidates still keep its GPU prefix, not that shorter disk suffix.
+    prepared.moe_device_layers = model.layers - resident if resident else -1
     chunks = ([base.chunked_prefill_size] if "chunked_prefill_size" in explicit else
               sorted({min(base.max_context_length, base.tokens, c) for c in (512, 1024, 2048, 4096, 8192)}))
     # Include cache/chunk trade-offs for the existing backend, preserving every
