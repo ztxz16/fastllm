@@ -504,6 +504,9 @@ class WebUIServerTests(unittest.IsolatedAsyncioTestCase):
             model_name = "demo"
             base_url = "http://test-api/v1"
 
+            def reasoning_config(self):
+                return {"supported_reasoning_efforts": [], "default_reasoning_effort": None}
+
             def stream(self, messages, **kwargs):
                 self.messages = messages
                 self.stream_kwargs = kwargs

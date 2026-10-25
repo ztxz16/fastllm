@@ -38,6 +38,7 @@ try:
         default_history_dir,
     )
     from .webui_reasoning import split_reasoning
+    from .launcher_agent_models import REASONING_EFFORTS, reasoning_options, with_model_metadata
 except ImportError:
     from code_agent import (
         CODE_EXTENSIONS, CODE_FILENAMES, CodeAgent, SourceFile, is_code_file)
@@ -60,10 +61,10 @@ except ImportError:
         default_history_dir,
     )
     from webui_reasoning import split_reasoning
+    from launcher_agent_models import REASONING_EFFORTS, reasoning_options, with_model_metadata
 
 
 WEB_MODES = {"关闭", "快速搜索", "深度浏览"}
-THINKING_LEVELS = {"关闭", "低", "中", "高"}
 MAX_WORKSPACE_IMAGES = 6
 
 
@@ -329,6 +330,7 @@ class OpenAIModelClient:
         self.model_name = str(model_name or "").strip()
         self.api_key = str(api_key or "")
         self.timeout = max(1.0, float(timeout))
+        self.model_metadata = {}
 
     def _headers(self) -> Dict[str, str]:
         headers = {
@@ -378,6 +380,8 @@ class OpenAIModelClient:
                 if not self.model_name and models:
                     self.model_name = str(models[0].get("id", "")).strip()
                 if self.model_name:
+                    self.model_metadata = next((item for item in models
+                        if item.get("id") == self.model_name), {})
                     return self.model_name
             except Exception as error:
                 last_error = error
@@ -385,21 +389,44 @@ class OpenAIModelClient:
         suffix = f"：{last_error}" if last_error is not None else ""
         raise RuntimeError(f"等待模型 API 就绪超时{suffix}")
 
-    def _thinking_args(self, level: str) -> Dict[str, Any]:
-        level = level if level in THINKING_LEVELS else "中"
-        if level == "关闭":
-            return {"chat_template_kwargs": {"enable_thinking": False}}
+    def _legacy_reasoning_efforts(self) -> Dict[str, str]:
+        # Preserve the meaning of the four labels stored by older WebUI versions.
         identity = self.model_name.lower()
         if any(name in identity for name in ("qwen3.5", "qwen3_5", "qwen3.8", "qwen3_8", "qwen4")):
-            effort = {"低": "low", "中": "medium", "高": "xhigh"}[level]
+            medium, high = "medium", "xhigh"
         elif any(name in identity for name in ("kimi-k3", "kimi_k3", "glm-5", "glm5")):
-            effort = {"低": "low", "中": "high", "高": "max"}[level]
+            medium, high = "high", "max"
         else:
-            effort = {"低": "low", "中": "medium", "高": "high"}[level]
+            medium, high = "medium", "high"
+        return {"关闭": "none", "低": "low", "中": medium, "高": high}
+
+    def reasoning_config(self) -> Dict[str, Any]:
+        service = with_model_metadata({"endpoint": self.base_url.removesuffix("/v1"),
+            "modelName": self.model_name, "modelMetadata": self.model_metadata}, self.api_key)
+        self.model_name = service["modelName"]
+        self.model_metadata = service.get("modelMetadata", {})
+        efforts, default = reasoning_options(service)
+        return {"supported_reasoning_efforts": efforts, "default_reasoning_effort": default,
+                "legacy_reasoning_efforts": self._legacy_reasoning_efforts()}
+
+    def _thinking_args(self, level: str) -> Dict[str, Any]:
+        efforts, default = reasoning_options({"modelMetadata": self.model_metadata})
+        legacy = self._legacy_reasoning_efforts()
+        effort = legacy.get(level, level)
+        if efforts:
+            if effort not in efforts:
+                effort = default
+        else:
+            if level == "default":
+                return {}
+            if level == "关闭":
+                return {"chat_template_kwargs": {"enable_thinking": False}}
+            if effort not in REASONING_EFFORTS:
+                effort = legacy["中"]
         return {
             "reasoning_effort": effort,
             "chat_template_kwargs": {
-                "enable_thinking": True,
+                "enable_thinking": effort != "none",
                 "reasoning_effort": effort,
             },
         }
@@ -799,7 +826,7 @@ class WebUIRuntime:
             max_tokens = requested if requested > 0 else -1
         return {
             "max_tokens": max_tokens,
-            "thinking_level": str(settings.get("thinking_level", "中")),
+            "thinking_level": str(settings.get("thinking_level", "default")),
             "temperature": min(
                 2.0, max(0.0, float(settings.get("temperature", 1.0)))),
             "top_p": min(
@@ -960,12 +987,9 @@ class WebUIRuntime:
 
     @staticmethod
     def _pi_thinking_level(settings: Dict[str, Any]) -> str:
-        return {
-            "关闭": "off",
-            "低": "low",
-            "中": "medium",
-            "高": "high",
-        }.get(str(settings.get("thinking_level", "中")), "medium")
+        level = str(settings.get("thinking_level", "default"))
+        return {"关闭": "off", "低": "low", "中": "medium", "高": "high",
+                "none": "off", "default": "off"}.get(level, level)
 
     @staticmethod
     def _pi_prompt(
@@ -2405,6 +2429,7 @@ def create_app(args: argparse.Namespace):
     @app.get("/api/config")
     def config():
         return {
+            **runtime.api_client.reasoning_config(),
             "title": getattr(args, "title", "FastLLM"),
             "model": (
                 runtime.api_client.model_name
