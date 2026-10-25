@@ -975,9 +975,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help='prefill 攒批最长等待毫秒数，0不等待；需设置 prefill_batch_tokens；等待期间继续 decode')
     fast_prefill = parser.add_mutually_exclusive_group()
     fast_prefill.add_argument('--fast_prefill', '--fast-prefill', action='store_true',
-                             help='启用DeepSeek-V4.1近似 prefill：后段层只计算末尾滑窗，可能改变 logits；该模型的--auto默认开启')
+                             help='开启DeepSeek-V4.1快速 prefill；该模型的--auto默认开启，可用--no_fast_prefill关闭')
     fast_prefill.add_argument('--no_fast_prefill', '--no-fast-prefill', dest='fast_prefill',
-                             action='store_false', help='关闭近似 prefill，包括覆盖--auto默认值')
+                             action='store_false', help='关闭快速 prefill，可覆盖--auto默认的开启设置')
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
                         type = _vision_device, default = None,

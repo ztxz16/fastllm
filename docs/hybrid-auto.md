@@ -1,5 +1,7 @@
 # 混合推理自动配置
 
+日常部署、参数取舍和启动器操作见 [`--auto` 参数调节指南](auto.md)。本文说明模型默认值、容量预算和后端细节。
+
 使用 `--auto` 可以一次选择完整的 CUDA 运行配置：
 
 ```sh
@@ -10,7 +12,7 @@ ftllm server /path/to/model.gguf --auto
 
 Qwen3.8-27B-FP8 已验证 `--auto`：优先选择纯 GPU TP，默认并发 4、模型原生上下文和内置 MTP5，显存不足时降低上下文。并发 MTP 验证默认采用 eager CUDA 路径，以避开批量验证 CUDA Graph 的非法内存访问；可用 `FASTLLM_QWEN35_MTP_VERIFY_CUDA_GRAPH=1` 显式覆盖。其他 Qwen3.5 架构 checkpoint 的量化格式和 MTP 权重仍需分别验证。
 
-直接运行 `ftllm` 打开的 Launcher 中，新增启动项默认选择“自动配置”，只需选择本地模型并填写模型名、监听地址、端口等服务信息。启动命令使用 `--auto`，每次启动重新读取硬件余量；表单中原有的手动推理参数和环境变量不会带入这个模式。原有长上下文、高并发和自定义模式仍保留，已保存的配置不会自动切换。
+直接运行 `ftllm` 打开的 Launcher 中，新增启动项默认选择“自动配置”。先在顶部选择模型文件或目录，再填写基础配置。资源限制、视觉模块和模型参数默认折叠：显存比例对应 `--gpu_mem_ratio`，内存上限对应 `--force_ddr_limit`，视觉模块文件对应 `--mmproj`；模型参数只保留 Chunk、最大并发、自定义参数和自定义环境变量。每次启动重新读取硬件余量，留空的参数继续自动规划。其他选项可以填写到自定义参数；自定义环境变量和启动进程继承的环境均生效。界面保留自动和自定义两种模式，旧的长上下文／高并发配置按自定义模式打开并保留参数。具体操作见[启动器指南](launcher.md)。
 
 自动配置设置中可以填写可选的“显存上限（每卡）”和“内存上限”。它们分别对应
 `--auto_gpu_memory_limit` 与 `--auto_host_memory_limit`，接受 `20g`、`128g` 等二进制容量；留空时继续读取启动时的实际可用显存和主机内存。显存上限作用于每张可见 GPU，主机内存上限作用于整个自动规划预算。这是规划上限，不会限制操作系统或其它进程的实际内存分配；规划结果不足以容纳模型时会在加载前报错。
@@ -23,11 +25,11 @@ HF safetensors 目录支持索引引用的多级分片和模型目录内的符�
 
 ## 单参数自动选择
 
-DeepSeek-V4.1 默认采用不超过模型原生窗口的 **1M（1,048,576 token）上下文、单请求**，开启 **DSpark 5**（置信度阈值默认 0.5）和 **fast_prefill**。Qwen3.5 稠密 HF 模型默认并发 4、尽量使用原生上下文；其他模型保持 **128K 上下文、单请求**。按代表性的 4K 输入、512 输出估计交互延迟。读取可见 CUDA 设备的可用显存、SM 数、内存带宽参数、PCIe 条件和 peer access 能力，比较单卡、PP、双卡等比例 TP，并联合选择专家驻留、显存缓存、主存缓存和 chunk。权重可全驻留且预算允许时，也可选择全部专家放 GPU。CPU 线程依据进程可用的物理核数选择，并预留启动和 IO 线程。
+DeepSeek-V4.1 默认采用不超过模型原生窗口的 **1M（1,048,576 token）上下文、单请求**，开启 **DSpark 5**（置信度阈值默认 0.5）和 **fast_prefill**。没有内置 DSpark 权重的 GGUF 不自动启用 DSpark。Qwen3.5 稠密 HF 模型默认并发 4、尽量使用原生上下文；其他模型保持 **128K 上下文、单请求**。按代表性的 4K 输入、512 输出估计交互延迟。读取可见 CUDA 设备的可用显存、SM 数、内存带宽参数、PCIe 条件和 peer access 能力，比较单卡、PP、双卡等比例 TP，并联合选择专家驻留、显存缓存、主存缓存和 chunk。权重可全驻留且预算允许时，也可选择全部专家放 GPU。CPU 线程依据进程可用的物理核数选择，并预留启动和 IO 线程。
 
 DeepSeek-V4.1 的 `--auto` 默认使用 **`kv_cache_dtype=fp4`**：长期压缩 KV 和 indexer key 在原模型计算中已经经过 FP4 伪量化，按匹配的网格、分组和 scale 打包是无损存储；滑窗使用其原有 FP8 网格。Flash-1017 的长期 KV 为 **890 B/token**，1M 有效载荷约 **0.869 GiB**，加上当前分配器的扩容容量和新旧缓冲重叠，规划预留约 **1.59 GiB**。此前统一选择 16 位 KV 会将这两项分别放大到 3.125 / 5.69 GiB。显式 `--kv_cache_dtype`（包括 `float16`、`bfloat16`、`fp4_e2m1`、`auto`）优先；启用 `FASTLLM_DSV41_DISABLE_FAKE_QUANT` 或不满足打包维度时不自动启用 FP4。其他模型的存储默认不变。
 
-DeepSeek-V4.1 的 `fast_prefill` 沿用已有近似注意力语义，可能改变 logits。可用 `--no_fast_prefill` 关闭；`--dspark 0` 或 `--speculative_algorithm off` 关闭推测解码。显式上下文、草稿数、阈值和 JSON 配置中的 `fast_prefill: false` 均优先；`--threads 64` 可固定线程数。预算不足时先调整自动 chunk、缓存和专家放置，仍放不下则报错，不自动缩短 1M 上下文。
+DeepSeek-V4.1 的 `--auto` 默认开启快速 Prefill；`--fast_prefill` 显式开启，`--no_fast_prefill` 关闭，省略显式设置则跟随自动规划。`--dspark 0` 或 `--speculative_algorithm off` 关闭推测解码。显式上下文、草稿数、阈值和 JSON 配置中的 `fast_prefill: false` 均优先；`--threads 64` 可固定线程数。预算不足时先调整自动 chunk、缓存和专家放置，仍放不下则报错，不自动缩短 1M 上下文。
 
 DeepSeek-V4.1 的显存估算按 KV source 层统计共享的压缩 KV 和 index key，并计入原生缓存扩容的容量余量及新旧缓冲重叠。Indexer 打分按原生分块预算估算（默认 128 MiB，遵循 `FASTLLM_DSV41_INDEX_SCORE_MB` 和 `FASTLLM_DSV41_INDEX_CHUNK`），不直接预留完整的 `chunk × context` 分数矩阵。原模型的 FP8 投影按实际保留的精度及 scale 预算，输出头、路由和其他强制展开的投影仍按原生精度计入。DeepSeek-V4.1 的自动 chunk 候选为 **8192、4096、2048、1024、512、256**；其他模型的候选上限保持 4096。候选不超过上下文长度；显式指定数值时不会自动降低。
 
@@ -105,13 +107,13 @@ CUDA/NUMA 混推在有专家显存缓存时，默认让 prefill 和 decode 复�
 
 调度器根据整层 CPU/GPU 并行执行的实测耗时调整分流；原生 DeepSeek-V4.1 和 GLM-5.3 也使用这一反馈路径。原生逐专家路径中，低路由量的已驻留专家仍可分配到 CPU，避免缓存命中引入过多小算子开销；分配到 GPU 的已驻留专家使用拥有其记录的设备。显式 `FT_EXPERT_LIMIT` 固定 CPU/GPU 分流阈值，但不固定多个 GPU 之间的专家分配；后者仍可依据实测耗时调整，BF16 分组归约不保证跨次逐位一致。辅助 GPU 可以读取已有缓存，写入仍遵循原有 owner/admission 规则。
 
-该优化保留现有投影、激活、量化和归并算子，不启用 `fast_prefill` 的近似注意力。缓存命中仍需要计算；需要布局还原时还会有 GPU 内存读写，因此 prefill 加速幅度取决于缓存覆盖率、PCIe 搬运与算子耗时。
+专家缓存优化无需开启 `--fast_prefill`。缓存命中仍需要计算；需要布局还原时还会有 GPU 内存读写，因此 prefill 加速幅度取决于缓存覆盖率、PCIe 搬运与算子耗时。
 
 排查或对照测试可设置 `FASTLLM_MOE_PREFILL_CACHE=0`，同时旁路 prefill 的驻留调度、缓存读取和写入，不关闭 decode 缓存；正常运行无需设置。在两次请求之间读取 `ftllm.llm.get_moe_cuda_cache_prefill_stats(device=0)` 并相减，可得到共享原生路径的调用数、GPU 专家/路由数、命中专家/路由数、避免上传的字节数、实际上传字节数和新写入专家数。统计读取会同步 GPU，不能放入吞吐计时区间；不包含独立 grouped GGUF 后端，GPU 内部布局还原也不计入上传字节。
 
 ## DeepSeek 混推的分块预填充与校验
 
-启用 `--fast_prefill` 后，DeepSeek-V4.1 对满足 bounded replay 条件的单请求分块预填充，只在最后一块执行后段 SWA 层与输出头；前面的块更新长期 KV。末块不超过 SWA 窗口、增量续写、图像输入或 DSpark 等情况沿用原路径。该优化沿用 `fast_prefill` 的近似注意力语义；该模型的 `--auto` 默认开启，手动启动仍需显式开启。
+DeepSeek-V4.1 手动启动时加 `--fast_prefill` 开启快速 Prefill；使用 `--auto` 时默认开启，可加 `--no_fast_prefill` 关闭。启动器中展开“模型参数”，在“自定义参数”填写 `--fast_prefill` 或 `--no_fast_prefill`；删除对应参数恢复默认。
 
 `FASTLLM_DSV41_HYBRID_PP=1` 显式启用混推跨块流水线，默认关闭。它要求 CUDA PP 层放置、NUMA 专家、`fast_prefill`、单请求 greedy，以及各级独立拥有其使用的共享 KV/index 来源；例如已验证的双卡 `--device cudapp=14:26 --tp off`。专家显存缓存、DSpark、历史复用或不兼容的层切分等情况会沿用普通路径。该入口不用于纯 GPU 或 TP 执行。
 

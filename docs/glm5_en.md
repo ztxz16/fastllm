@@ -4,7 +4,31 @@
 
 Current support covers GLM-5 DSA, GLM-5.3-Flash KDA and paged caching, and pure-CPU inference for selected GLM-5.2 checkpoints with quantized KV-B weights.
 
-## API server quick start
+## Automatic configuration (GLM-5.3-Flash)
+
+Use `--auto` for supported GLM-5.3-Flash checkpoints on Linux with NVIDIA CUDA. GLM-5, GLM-5.2, and CPU-only deployment still use the manual commands below.
+
+```sh
+ftllm server /data/models/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf \
+  --auto --model_name glm-5.3-flash --host 0.0.0.0 --port 8080
+```
+
+Pass the first GGUF shard and keep the remaining shards in the same directory. Supported `glm5next` GGUF files include configuration and tokenizer metadata and do not require `--ori`. For HF/NVFP4, pass the complete model directory instead and keep the checkpoint's default weight precision.
+
+| Adjustment | Append to the command |
+| --- | --- |
+| 32K session window, up to 2 concurrent requests | `--max_context_length 32768 --max_batch 2` |
+| Limit planning resources | `--auto_gpu_memory_limit 20g --auto_host_memory_limit 128g` |
+| Set the per-GPU expert cache | `--moe_cuda_cache 7g`; `0` disables it |
+| Set CPU threads and prefill chunk size | `--threads 32 --chunked_prefill_size 4096` |
+| Enable embedded MTP | `--mtp 3`; requires NextN draft weights |
+| Disable all speculative decoding | `--speculative_algorithm off` |
+
+GLM MTP is not enabled merely because NextN weights are present. Leave options unset to use automatic planning; see the [`--auto` tuning guide](auto_en.md) for their effects and Launcher controls.
+
+Supported GGUF expert combinations use compressed GPU caches and dynamic CPU/GPU routing. The exact format, grouped-MMQ, TP, and MTP coverage is documented in the [detailed GLM guide (Chinese)](glm5.md#glm-53-flash-gguf).
+
+## Manual configuration reference
 
 ~~~bash
 ftllm server /data/models/glm5 \

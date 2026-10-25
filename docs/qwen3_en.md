@@ -6,14 +6,28 @@ This guide covers current Qwen3.5, Qwen3.6, and Qwen3.8 models, including GGUF m
 
 Checkpoint layouts may be dense, MoE, FP8, NVFP4, or another quantized format. Keep `--dtype auto` for an initial launch, then tune from measured memory use and throughput.
 
-The dense HF Qwen3.8-27B-FP8 checkpoint supports `--auto`. It prefers all-GPU TP, sets batch 4, enables its embedded MTP5 draft, and chooses the longest native context that fits the memory budget. Other checkpoint formats need separate validation.
+## Automatic configuration (recommended)
+
+On Linux with NVIDIA CUDA, the dense HF Qwen3.8-27B-FP8 checkpoint supports `--auto`. It prefers all-GPU TP, sets batch 4, enables its embedded MTP5 draft, and chooses the longest native context that fits the memory budget. Other checkpoint formats need separate validation.
 
 ~~~bash
 ftllm server /data/models/Qwen3.8-27B-FP8 --auto \
   --model_name qwen3.8-27b --host 0.0.0.0 --port 8080
 ~~~
 
-## API server quick start
+The planner tries TP2 first, then TP4 and shorter contexts if needed. Explicit options override these choices:
+
+| Adjustment | Append to the command |
+| --- | --- |
+| 32K session window, up to 2 concurrent requests | `--max_context_length 32768 --max_batch 2` |
+| Disable speculative decoding | `--speculative_algorithm off` |
+| Use 3 embedded MTP draft tokens | `--mtp 3` |
+| Limit planning resources | `--auto_gpu_memory_limit 20g --auto_host_memory_limit 120g` |
+| Set the prefill chunk size | `--chunked_prefill_size 4096` |
+
+Remove explicit settings to restore automatic selection. Resource limits constrain planning, not the process's actual allocations. See the [`--auto` tuning guide](auto_en.md) for option effects and Launcher controls. The commands below are manual examples for fixed layouts, other formats, or CPU deployment; do not copy all their settings into an automatic launch.
+
+## Manual configuration reference
 
 ~~~bash
 ftllm server /data/models/qwen \

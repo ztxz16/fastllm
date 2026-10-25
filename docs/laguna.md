@@ -4,7 +4,9 @@
 
 FastLLM 的 Laguna 路径支持长上下文缓存、CUDA Graph、多卡张量并行、混合 MoE、NVFP4 和 INT4_GROUP32。
 
-## API Server 快速启动
+Laguna 当前尚未接入运行时 `--auto` 规划，使用本页的手动命令。自动规划的支持范围见 [`--auto` 指南](auto.md)。
+
+## API Server 快速启动（手动配置）
 
 ~~~bash
 ftllm server /data/models/laguna \

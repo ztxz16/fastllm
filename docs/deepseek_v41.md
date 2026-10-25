@@ -1,13 +1,50 @@
 # DeepSeek-V4.1-Flash 支持说明
 
-[返回 README](../README.md) · [DeepSeek-V4 部署指南](deepseek.md) · [混合推理](mixforward.md)
+[English](deepseek_v41_en.md) · [返回 README](../README.md) · [DeepSeek-V4 部署指南](deepseek.md) · [混合推理](mixforward.md)
 
 本文记录 FastLLM 对 DeepSeek-V4.1 系列（`model_type = deepseek_v41`，目前为 DeepSeek-V4.1-Flash）的支持范围、
 架构差异、启动方式与验证方法。
 
 面向自动化 agent 的 `--auto` 启动、参数覆盖和验收流程见 [模型部署速查](model-deployment-agent.md)。
 
-实现与回归入口：
+## 自动配置（推荐）
+
+Linux NVIDIA CUDA 环境下，完整 HF 目录直接使用：
+
+```sh
+ftllm server /path/to/DeepSeek-V4.1-Flash-1017 --auto \
+  --model_name deepseek-v4.1-flash --host 0.0.0.0 --port 8080
+```
+
+GSQ-RCO GGUF 使用模型文件或第一个分片，支持直接读取内置配置与分词器，无需 `--ori`：
+
+```sh
+ftllm server /path/to/model-00001-of-00002.gguf --auto \
+  --model_name deepseek-v4.1-flash --host 0.0.0.0 --port 8080
+```
+
+示例文件名需替换为实际路径。GGUF 所引用的 Engram 文件必须放在主模型旁边，文件名和来源需与元数据一致；多个量化版本可以链接到同一份匹配的 Engram 文件。HF 模型保留自己的 Engram 权重与配置。`--ngram_device disk` 控制 Engram 按需读取，与专家是否使用磁盘后端分别设置。
+
+自动模式默认单请求、最多 1M 原生窗口、FP4 KV 和快速 Prefill。带内置 DSpark 权重时默认使用 DSpark 5；没有草稿权重的 GGUF 不会自动开启。设备、chunk 和专家缓存以 `[auto]` 日志为准。显卡和主存能容纳专家时优先避免磁盘专家，Engram 仍可独立使用磁盘。
+
+| 需要调整 | 追加参数 |
+| --- | --- |
+| 32K 窗口、单请求 | `--max_context_length 32768 --max_batch 1` |
+| 限制每卡显存和总主存预算 | `--auto_gpu_memory_limit 22g --auto_host_memory_limit 120g` |
+| 指定显存比例和最终主存预算（对应启动器资源限制） | `--gpu_mem_ratio 0.9 --force_ddr_limit 120g` |
+| 固定每卡专家缓存 | `--moe_cuda_cache 7g`，`0` 关闭 |
+| 固定输入分块或 CPU 线程 | `--chunked_prefill_size 4096 --threads 32` |
+| 关闭推测解码 | `--speculative_algorithm off` |
+| 使用 5 个内置 DSpark 草稿 | `--dspark 5`，需要对应草稿权重 |
+| 调整 DSpark 阈值 | `--speculative_dspark_confidence_threshold 0.5`；`0` 关闭阈值 |
+| 开启 / 关闭快速 Prefill | `--fast_prefill` / `--no_fast_prefill` |
+
+如果需要突破自动检测的主存上限，可改用 `--force_ddr_limit 114g`：最终按 114 GiB 规划，不再扣除 CMA 或自动预留。它与 `--auto_host_memory_limit` 互斥，仅影响规划，不改变系统／容器硬限制；详见[主存预算说明](hybrid-auto.md)。
+
+删除显式设置即可恢复自动规划。资源上限不会限制进程的实际内存分配，也不会模拟 GPU 架构或算力。更多参数影响和启动器操作见 [`--auto` 调节指南](auto.md)。手动配置、架构与验证说明保留在下文。
+
+## 实现与回归入口
+
 
 - `include/models/deepseekv41.h` / `src/models/deepseekv41.cpp`：模型（继承 `DeepSeekV4Model`，复用其 MoE / HC-post / WoA / 采样等基础设施）
 - `src/models/deepseekv41_vision.cpp`：视觉编码器（ViT + aligner）与图文前向 `ForwardMultimodal`
@@ -101,21 +138,6 @@ Hybrid 模式下，磁盘表的 value 与 scale 使用已有的 I/O worker 并�
 | `FASTLLM_DSV41_ENGRAM_PREFETCH=1` | 跨层预取。后台线程提前计算下一层的 n-gram 行号；常驻表还会在缓存预算内预读表行，磁盘模式只预计算行号。后台线程只看历史窗口的快照，不引用请求状态。 |
 | `FASTLLM_DSV41_ENGRAM_MADVISE=random / hugepage / both` | 仅作用于常驻表：`random` 设置 `MADV_RANDOM`；`hugepage` 使用匿名 mmap + `MADV_HUGEPAGE` 分配，减少页表与 TLB 开销，并省掉 `std::vector` 的清零。 |
 | `FASTLLM_DSV41_ENGRAM_WKV_FP8`（默认开，=0 关） | `layers.{1,14}.engram.wkv.weight` 在真实权重里本来就是 F8_E4M3 + UE8M0 块 scale（`[25600, 6144]`，block 32x32），默认会被解量化成启动 dtype（float16），每层 157 MB 变 314 MB。打开后按原样保留 FP8，**不做任何重量化**——权重数值就是 checkpoint 里的那份，比解成 float16 还少一次舍入；省下每层 157 MB 显存与同样多的每步带宽。只有伴随的 `.scale` 张量存在时才切换，权重是 BF16 的迷你模型不受影响。 |
-
-## 自动配置（推荐）
-
-自动化部署建议先把本页和 [Agent 部署速查](model-deployment-agent.md) 交给 agent。对 V4.1 Flash，自动规划器会根据资源尝试 `fast_prefill`、DSpark、Engram 放置和长上下文预算；主机内存不足时会把 Engram/专家回退到磁盘，并在日志中给出实际配置。
-
-```bash
-ftllm server /path/to/DeepSeek-V4.1-Flash-1017 \
-  --auto --model_name deepseek-v4.1-flash-1017 \
-  --host 0.0.0.0 --port 8080
-```
-
-如果需要模拟较小机器，使用 `--auto_gpu_memory_limit 20g` 和
-`--auto_host_memory_limit 128g`；它们限制自动规划预算，省略时自动读取实际硬件。
-
-如果需要突破自动检测的主存上限，可改用 `--force_ddr_limit 114g`：最终按 114 GiB 规划，不再扣除 CMA 或自动预留。它与 `--auto_host_memory_limit` 互斥，仅影响规划，不改变系统／容器硬限制；详见[主存预算说明](hybrid-auto.md)。
 
 ## 手动配置参考
 
@@ -266,7 +288,7 @@ FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/DeepSeek-V4.1-Flash \
   --tp 8 --dtype auto --ngram_device cpu --chunked_prefill_size 512
 ```
 
-默认 MoE 设备跟随主设备，使用八卡张量并行。此命令不启用近似 `--fast_prefill`。
+默认 MoE 设备跟随主设备，使用八卡张量并行。需要快速 Prefill 时加上 `--fast_prefill`。
 
 视觉编码器（ViT + aligner）与 DSpark 草稿层仍在单卡上算。`--tp 2 --dspark 5` 可以组合使用：
 目标模型按上述方式张量并行，草稿层在第一张卡运行，共享的 `head.weight` 沿用两卡词表分片，
@@ -294,26 +316,17 @@ NUMA 的多行 BF16 输入在至少 8192 个元素时按完整 block-32 分配�
 NUMA 按多个 LLC 分散绑核时，TP 执行线程保留启动时的 CPU 亲和性，避免把专家正在使用的核
 误判为空闲核。不需要额外设置绑核环境变量。
 
-## 快速 prefill（`--fast_prefill`）
+## 快速 Prefill（`--fast_prefill`）
 
-```bash
-ftllm server /path/to/DeepSeek-V4.1-Flash --device cuda --moe_device numa \
-  --fast_prefill
+```sh
+# 自动模式默认开启；显式关闭
+ftllm server /path/to/DeepSeek-V4.1-Flash --auto --no_fast_prefill
+
+# 显式开启
+ftllm server /path/to/DeepSeek-V4.1-Flash --auto --fast_prefill
 ```
 
-默认关闭，也支持 `--fast-prefill` 写法，启动时以参数为准。
-开启后使用 decoder SWA bounded replay：每个文本 prefill chunk 完整计算到最后一个
-KV source 层，后续层只计算各请求末尾 `sliding_window` 个 token。V4.1-Flash 对应
-第 0–20 层处理完整 chunk，第 21–39 层处理末尾至多 128 token。
-长度不超过窗口的片段、包含图像嵌入或图像掩码的前向保持完整计算。
-
-压缩 KV 和 indexer key 仍完整保留，RoPE、缓存槽位和请求长度使用原始绝对位置。
-支持分块 prefill、混合批次、前缀缓存恢复及 DSpark；DSpark 的 main hidden 同步取尾部，
-verify 始终计算全部候选位置。单 token decode 和 CUDA Graph 的执行范围不变。
-
-这是**近似计算**：后段层的局部 attention 在保留窗口的起点截断，可能改变 logits，
-差异不局限于浮点舍入。开启后应按实际任务验证质量，并固定输入与 chunk 配置对比速度。
-
+手动模式默认关闭，加 `--fast_prefill` 开启；也支持 `--fast-prefill` 和 `--no-fast-prefill` 写法。恢复自动设置时删除这两个参数；如果使用 JSON 配置，还需删除 `fast_prefill` 字段。启动器里展开“模型参数”，在“自定义参数”填写 `--fast_prefill` 或 `--no_fast_prefill`，保存并重启服务；删除对应参数即可恢复默认。
 
 ## decode 与 DSpark 校验的 CUDA Graph
 

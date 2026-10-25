@@ -4,7 +4,9 @@
 
 This guide focuses on DeepSeek-V4 and DeepSeek-V4-Flash. Earlier DeepSeek models remain compatible but are no longer the primary examples.
 
-## API server quick start
+DeepSeek-V4 / V4-Flash is not currently supported by the runtime `--auto` planner. Use the manual commands on this page. For DeepSeek-V4.1, use the [V4.1 automatic deployment guide](deepseek_v41_en.md). See the [`--auto` guide](auto_en.md) for supported models.
+
+## API server quick start (manual configuration)
 
 ~~~bash
 ftllm server fastllm/DeepSeek-V4-Flash \

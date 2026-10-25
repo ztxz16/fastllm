@@ -4,7 +4,9 @@
 
 FastLLM 的 Kimi-K3 路径覆盖 KDA/MLA、分块 Prefill、CUDA/NUMA、CPU/GPU 专家、磁盘专家、外部 DSpark、XTML 服务协议和工具调用。
 
-## API Server 快速启动
+Kimi-K3 当前尚未接入运行时 `--auto` 规划，使用本页的手动命令。自动规划的支持范围见 [`--auto` 指南](auto.md)。
+
+## API Server 快速启动（手动配置）
 
 ~~~bash
 ftllm server /data/models/kimi-k3 \
