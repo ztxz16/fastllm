@@ -101,12 +101,17 @@ namespace fastllm {
                 {"curInput", &tempInput}, {"curOutput", &tempOutput}, {"output", &routedOutput}
             };
             if (ws->ffnInputQuantizedReady) moeDatas["prequantizedInput"] = &ws->ffnInputQuantized;
+            if (sharedPartial) {
+                moeDatas["v41JoinSharedPartial"] = &ws->reductionBuffers["moe_shared_tp_partial"];
+                moeDatas["v41JoinOutput"] = &ffnOut;
+            }
             ((Executor *)GetExecutor())->Run("MergeMOE", moeDatas,
                 {{"sharedScale", 1.0f}, {"swigluLimit", swiglu_limit}}, {
                 {"weights___batch", (int)moeWeights.size()}, {"biass___batch", (int)biass[layer].size()},
                 {"layer", layer}, {"gateType", (int)MoeGateSwiglu}, {"expertParallel", 1},
                 {"deepSeekV4Mode", 1}, {"activationQuantBlock", 32},
-                {"quantizeSharedExpert", 0}, {"deferRankReduction", 1}
+                {"quantizeSharedExpert", 0}, {"deferRankReduction", 1},
+                {"v41ParallelJoinLayer", sharedPartial && ctx.parallelShared ? layer : -1}
             });
         } else {
             MergeMOEBlock(input, index, score, &moeWeights, &biass[layer],
@@ -118,21 +123,18 @@ namespace fastllm {
         }
         ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
 #ifdef USE_CUDA
-        markParallel(2);
+        if (!sharedPartial) markParallel(2);
         if (sharedPartial) {
             Data &partial = ws->reductionBuffers["moe_shared_tp_partial"];
             const int count = routedOutput.Count(0);
             AssertInFastLLM(routedOutput.dataType == DataType::FLOAT32 &&
                 partial.dataType == DataType::FLOAT32 && count == partial.Count(0), "Shared TP partial shape mismatch.");
             AssertInFastLLM(MultiCudaRunDeviceCallbacks(tpDevices, [&](int, int device) {
-                Data &routed = *routedOutput.multiDeviceDatas.at(device);
                 Data &joined = *ffnOut.multiDeviceDatas.at(device);
                 AssertInFastLLM(joined.dataType == DataType::BFLOAT16 && joined.Count(0) == count,
                     "Shared TP BF16 output shape mismatch.");
-                AssertInFastLLM(FastllmCudaDeepSeekV41MoeJoinBFloat16(
-                    static_cast<const float *>(routed.cudaData),
-                    static_cast<const float *>(partial.multiDeviceDatas.at(device)->cudaData),
-                    joined.cudaData, count), "Shared TP BF16 partial addition failed.");
+                // The routed backend (or its fallback) already joined the
+                // shared partial after the parallel-branch dependency point.
                 bool ok = FastllmCudaCustomAllReduce(joined.cudaData, joined.cudaData,
                     count, DataType::BFLOAT16, device);
                 if (!ok && !FastllmCudaGetThreadError()) {

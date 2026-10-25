@@ -911,12 +911,12 @@ __global__ void SwigluRowsKernel(const T *__restrict__ gateUp,
     output[id] = FromFloat<T>(value);
 }
 
-template <typename T, typename OutT = T>
+template <typename T, typename OutT = T, bool JOIN_SHARED = false>
 __global__ void ReduceEpRowsKernel(const T *__restrict__ expertRows,
                                    const int32_t *__restrict__ globalIndices,
                                    OutT *__restrict__ output, int logicalRows,
                                    int topk,
-                                   int ownerRank, int ownerCount, int hidden) {
+                                   int ownerRank, int ownerCount, int hidden, const float *shared = nullptr) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int total = logicalRows * hidden;
     if (index >= total) {
@@ -934,6 +934,12 @@ __global__ void ReduceEpRowsKernel(const T *__restrict__ expertRows,
                     expertRows[(size_t)route * hidden + col]);
             }
         }
+    }
+    if constexpr (JOIN_SHARED) {
+        // Match V41MoeJoinBFloat16Kernel: each local branch rounds before
+        // addition, and the sum rounds again before the rank collective.
+        value = ToFloat(FromFloat<T>(value)) +
+                ToFloat(FromFloat<T>(shared[(size_t)row * hidden + col]));
     }
     output[(size_t)row * hidden + col] = FromFloat<OutT>(value);
 }
@@ -3732,7 +3738,9 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                              const float *scores, int topk, int ownerRank,
                              int ownerCount, bool deepSeekV41 = false,
                              float swigluLimit = 0.0f,
-                             const fastllm::Data *prequantizedInput = nullptr) {
+                             const fastllm::Data *prequantizedInput = nullptr,
+                             const fastllm::Data *sharedPartial = nullptr,
+                             fastllm::Data *joinedOutput = nullptr, int parallelJoinLayer = -1) {
     if (globalIndices == nullptr || scores == nullptr || topk <= 0 ||
         topk > 16 || ownerCount <= 0 ||
         input.dims.empty() || input.dataDevice != fastllm::DataDevice::CUDA) {
@@ -3922,7 +3930,15 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
 
     auto reduceRows = [&](const int32_t *indices, void *destination, int count) {
         int blocks = (count * cache->hidden + threads - 1) / threads;
-        if (deepSeekV41) {
+        if (sharedPartial != nullptr) {
+            // This marker makes the fused consumer depend on both producers
+            // when the captured shared/routed branches are made parallel.
+            if (parallelJoinLayer >= 0) FastllmCudaGraphMarkParallelJoin(parallelJoinLayer);
+            ReduceEpRowsKernel<T, T, true><<<blocks, threads, 0, cudaStreamPerThread>>>(
+                (const T *)downOutput, indices, (T *)joinedOutput->cudaData,
+                count, topk, ownerRank, ownerCount, cache->hidden,
+                (const float *)sharedPartial->cudaData);
+        } else if (deepSeekV41) {
             ReduceEpRowsKernel<T, float><<<blocks, threads, 0, cudaStreamPerThread>>>(
                 (const T *)downOutput, indices, (float *)destination,
                 count, topk, ownerRank, ownerCount, cache->hidden);
@@ -4225,6 +4241,33 @@ bool FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
     return fastllm_marlin_moe::RunMarlinMoe<__nv_bfloat16>(
         input, w1, output, weights, weightsBatch, globalIndices, scores, topk,
         ownerRank, ownerCount, deepSeekV41, swigluLimit, prequantizedInput);
+}
+
+bool FastllmCudaV41MarlinExpertParallelShared(
+        const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch, const int32_t *globalIndices,
+        const float *scores, int topk, int ownerRank, int ownerCount,
+        float swigluLimit, const fastllm::Data *prequantizedInput,
+        const fastllm::Data &sharedPartial, fastllm::Data &joinedOutput, int parallelJoinLayer) {
+    using namespace fastllm;
+    if (input.dataType != BFLOAT16 || input.dims.empty() || input.dims.back() <= 0 ||
+        input.Count(0) / input.dims.back() < 2 || input.Count(0) / input.dims.back() > 8 ||
+        input.Count(0) % input.dims.back() || topk <= 0 || topk > 16 ||
+        ownerRank < 0 || ownerRank >= ownerCount ||
+        sharedPartial.dataType != FLOAT32 || joinedOutput.dataType != BFLOAT16 ||
+        sharedPartial.dims != input.dims || joinedOutput.dims != input.dims ||
+        sharedPartial.dataDevice != CUDA || joinedOutput.dataDevice != CUDA ||
+        sharedPartial.dataDeviceIds != input.dataDeviceIds || joinedOutput.dataDeviceIds != input.dataDeviceIds ||
+        sharedPartial.multiDeviceData || joinedOutput.multiDeviceData ||
+        sharedPartial.isFake || joinedOutput.isFake ||
+        &joinedOutput == &w1 || &joinedOutput == &output || &sharedPartial == &w1 || &sharedPartial == &output ||
+        !sharedPartial.cudaData || !joinedOutput.cudaData ||
+        joinedOutput.cudaData == input.cudaData || joinedOutput.cudaData == sharedPartial.cudaData ||
+        joinedOutput.cudaData == output.cudaData) return false;
+    return fastllm_marlin_moe::RunMarlinMoe<__nv_bfloat16>(
+        input, w1, output, weights, weightsBatch, globalIndices, scores, topk,
+        ownerRank, ownerCount, true, swigluLimit, prequantizedInput,
+        &sharedPartial, &joinedOutput, parallelJoinLayer);
 }
 
 bool FastllmCudaV41MarlinGraphReady(const fastllm::Data *layerKey, int rows) {

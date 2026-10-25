@@ -7090,6 +7090,10 @@ auto st = std::chrono::system_clock::now();
         bool deepSeekV41 = false;
         const Data *prequantizedInput = nullptr;
         bool deferRankReduction = false;
+        const Data *joinSharedPartial = nullptr;
+        Data *joinOutput = nullptr;
+        int parallelJoinLayer = -1;
+        bool sharedJoined = false;
         Data *output;
         Data *pairedReduceInput;
         int rootDeviceId;
@@ -7139,7 +7143,40 @@ auto st = std::chrono::system_clock::now();
                 expertOwnerRank(expertOwnerRank), expertOwnerCount(expertOwnerCount),
                 gateType(MoeGateSwiglu) {}
 
+        bool RunMarlin(const Data &routedInput, Data **localWeights, int localCount,
+                       const int32_t *indices, const float *scores, int topk) {
+            if (joinOutput && FastllmCudaV41MarlinExpertParallelShared(
+                    routedInput, *w1, *output, localWeights, localCount, indices, scores, topk,
+                    expertOwnerRank, expertOwnerCount, swigluLimit, prequantizedInput,
+                    *joinSharedPartial, *joinOutput, parallelJoinLayer)) {
+                sharedJoined = true;
+                return true;
+            }
+            return routedInput.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfMergeMOEVllmMarlinBatch1ExpertParallel(
+                    routedInput, *w1, *output, localWeights, localCount, indices, scores, topk,
+                    expertOwnerRank, expertOwnerCount) :
+                FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
+                    routedInput, *w1, *output, localWeights, localCount, indices, scores, topk,
+                    expertOwnerRank, expertOwnerCount, deepSeekV41, swigluLimit, prequantizedInput);
+        }
+
         void Run() override {
+            sharedJoined = false;
+            RunRouted();
+            if (joinOutput && !sharedJoined) {
+                // A rejected Marlin epilogue still uses the established routed
+                // fallback followed by the same rounded join and one collective.
+                if (parallelJoinLayer >= 0) FastllmCudaGraphMarkParallelJoin(parallelJoinLayer);
+                AssertInFastLLM(output->dataType == DataType::FLOAT32 &&
+                    output->Count(0) == joinOutput->Count(0) &&
+                    FastllmCudaDeepSeekV41MoeJoinBFloat16(
+                        (const float *)output->cudaData, (const float *)joinSharedPartial->cudaData,
+                        joinOutput->cudaData, output->Count(0)), "MoE shared epilogue fallback failed.");
+            }
+        }
+
+        void RunRouted() {
             FastllmCudaSetDevice(deviceId);
             constexpr bool useVllmMarlin = true;
             if (inputReadyEvent != nullptr) {
@@ -7279,16 +7316,8 @@ auto st = std::chrono::system_clock::now();
                 }
 #endif
                 if (!ok && useVllmMarlin) {
-                    ok = input->dataType == DataType::FLOAT16 ?
-                        FastllmCudaHalfMergeMOEVllmMarlinBatch1ExpertParallel(
-                            packetInput, *w1, *output, localExpertTable->localWeights.data(),
-                            (int)localExpertTable->localWeights.size(), gpuRouteIndex,
-                            gpuRouteScore, topk, expertOwnerRank, expertOwnerCount) :
-                        FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
-                            packetInput, *w1, *output, localExpertTable->localWeights.data(),
-                            (int)localExpertTable->localWeights.size(), gpuRouteIndex,
-                            gpuRouteScore, topk, expertOwnerRank, expertOwnerCount,
-                            deepSeekV41, swigluLimit, prequantizedInput);
+                    ok = RunMarlin(packetInput, localExpertTable->localWeights.data(),
+                        (int)localExpertTable->localWeights.size(), gpuRouteIndex, gpuRouteScore, topk);
                 }
                 if (!ok && !deepSeekV41) {
                     ok = input->dataType == DataType::FLOAT16 ?
@@ -7439,21 +7468,9 @@ auto st = std::chrono::system_clock::now();
                 if (deepGemmOk) {
                     ran = true;
                 } else if (useVllmMarlin) {
-                    ran = input->dataType == DataType::FLOAT16 ?
-                        FastllmCudaHalfMergeMOEVllmMarlinBatch1ExpertParallel(
-                            *input, *w1, *output,
-                            localExpertTable->localWeights.data(),
-                            (int)localExpertTable->localWeights.size(),
-                            (const int32_t *)deviceIndex->cudaData,
-                            (const float *)deviceScore->cudaData, topk,
-                            expertOwnerRank, expertOwnerCount) :
-                        FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
-                            *input, *w1, *output,
-                            localExpertTable->localWeights.data(),
-                            (int)localExpertTable->localWeights.size(),
-                            (const int32_t *)deviceIndex->cudaData,
-                            (const float *)deviceScore->cudaData, topk,
-                            expertOwnerRank, expertOwnerCount, deepSeekV41, swigluLimit, prequantizedInput);
+                    ran = RunMarlin(*input, localExpertTable->localWeights.data(),
+                        (int)localExpertTable->localWeights.size(), (const int32_t *)deviceIndex->cudaData,
+                        (const float *)deviceScore->cudaData, topk);
                 } else if (!deepSeekV41) {
                     ran = input->dataType == DataType::FLOAT16 ?
                         FastllmCudaHalfMergeMOENVFP4Batch1ExpertParallel(
@@ -8162,6 +8179,23 @@ auto st = std::chrono::system_clock::now();
                 op->expertOwnerRank = i;
                 op->expertOwnerCount = (int)devices.size();
                 op->deferRankReduction = deferRankReduction;
+                auto joinShared = datas.find("v41JoinSharedPartial");
+                auto joinOut = datas.find("v41JoinOutput");
+                if (joinShared != datas.end() && joinOut != datas.end()) {
+                    const Data &shared = *joinShared->second;
+                    Data &joined = *joinOut->second;
+                    AssertInFastLLM(deepSeekV41 && useExpertParallel && deferRankReduction &&
+                        shared.IsTensorParallelReplicated() && joined.IsTensorParallelReplicated() &&
+                        shared.dataType == DataType::FLOAT32 && joined.dataType == DataType::BFLOAT16 &&
+                        shared.dims == input.dims && joined.dims == input.dims &&
+                        shared.multiDeviceDatas.count(device) && joined.multiDeviceDatas.count(device),
+                        "Invalid V4.1 shared epilogue tensors.");
+                    op->joinSharedPartial = shared.multiDeviceDatas.at(device);
+                    op->joinOutput = joined.multiDeviceDatas.at(device);
+                    auto parallelLayer = intParams.find("v41ParallelJoinLayer");
+                    if (parallelLayer != intParams.end()) op->parallelJoinLayer = parallelLayer->second;
+                }
+
                 auto quantized = datas.find("prequantizedInput");
                 if (deepSeekV41 && quantized != datas.end() && quantized->second) {
                     auto local = quantized->second->multiDeviceDatas.find(device);

@@ -2314,6 +2314,17 @@ bool FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
         const float *scores, int topk, int ownerRank, int ownerCount,
         bool deepSeekV41 = false, float swigluLimit = 0.0f,
         const fastllm::Data *prequantizedInput = nullptr);
+
+// Optional verification epilogue: preserve routed/shared BF16 rounding,
+// then write the BF16 input of the existing rank reduction. Returns false
+// before arithmetic for unsupported shapes; the caller retains ordinary join.
+bool FastllmCudaV41MarlinExpertParallelShared(
+        const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch, const int32_t *globalIndices,
+        const float *scores, int topk, int ownerRank, int ownerCount,
+        float swigluLimit,
+        const fastllm::Data *prequantizedInput,
+        const fastllm::Data &sharedPartial, fastllm::Data &joinedOutput, int parallelJoinLayer);
 bool FastllmCudaPrepareNVFP4E4M3Moe(fastllm::Data **weights, int weightsBatch);
 void FastllmCudaReleaseMergeMOEVllmMarlinCache(const fastllm::Data *layerKey);
 // Read-only readiness check: no repacking or allocation during graph capture.
