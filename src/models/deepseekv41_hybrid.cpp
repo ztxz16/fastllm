@@ -206,7 +206,17 @@ namespace fastllm {
             (seqlen >= 1 && seqlen < 32) && FastllmCudaMoeCacheRequested() &&
             !dumpDebug && !V41ReferenceMathEnabled() &&
             UsesHostMoe(overlapMoeDevice);
-        if (((step && *step) || singleStageCache || streamingStep || cooperativeMoe) && hasSharedExpertOut &&
+        // Concurrent requests arrive as one [rows, hidden] activation with
+        // single == false. The CUDA hybrid backend already has the exact
+        // multi-row expert-parallel/cache implementation, but the model
+        // entry point used to bypass it and call the legacy MergeMOEBlock.
+        // Keep this bounded to the verifier-sized batch so long prefill keeps
+        // its established grouped path.
+        const bool batchCacheCandidate = !tp && !graphActive && !ctx.pipelineHostExperts && !single &&
+            seqlen > 1 && seqlen < 32 && !dumpDebug &&
+            !V41ReferenceMathEnabled() && UsesHostMoe(overlapMoeDevice);
+        if (((step && *step) || singleStageCache || streamingStep || cooperativeMoe ||
+             batchCacheCandidate) && hasSharedExpertOut &&
             moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
             ffnInput.dataDevice == DataDevice::CUDA && ffnInput.cudaData &&
             FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
@@ -218,7 +228,8 @@ namespace fastllm {
             auto stageRoute = [&](Data &buffer, Data &source) -> Data & {
                 // Eager PP routing already owns a valid CUDA tensor. Keep it
                 // on-device; the hybrid backend batches its pinned D2H copies.
-                if ((streamingStep || cooperativeMoe) && source.dataDevice == DataDevice::CUDA &&
+                if ((streamingStep || cooperativeMoe || batchCacheCandidate) &&
+                    source.dataDevice == DataDevice::CUDA &&
                     source.cudaData && !source.multiDeviceData &&
                     GetPointerDeviceId(source.cudaData) == device) return source;
                 V41ReplicaToCpu(buffer, source, tpDevices);
@@ -231,7 +242,8 @@ namespace fastllm {
             input.FakeFrom(ffnInput, 0);
             input.Resize({seqlen, dim});
             input.dataDeviceIds = {device};
-            if ((streamingStep || cooperativeMoe) && !ctx.pipelineHostExperts && hybridMoeDevices.size() > 1)
+            if ((streamingStep || cooperativeMoe || batchCacheCandidate) &&
+                !ctx.pipelineHostExperts && hybridMoeDevices.size() > 1)
                 singleCacheHandled = fastllm::RunHybridMoeOnDevices(
                     input, routeIndex, routeScore, ffnOut, moeWeights.data(),
                     (int)moeWeights.size(), layer, hybridMoeDevices, runSharedSegment);
@@ -240,8 +252,10 @@ namespace fastllm {
                     input, routeIndex, routeScore, ffnOut,
                     moeWeights.data(), (int)moeWeights.size(), layer, runSharedSegment);
         }
-        if (tp && FastllmCudaMoeCacheRequested() && single &&
-            (seqlen == 1 || (dsparkVerify && seqlen <= 8)) && !dumpDebug && hasSharedExpertOut &&
+        const bool tpBatchCache = tp && !single && !graphActive && seqlen > 1 && seqlen <= 8;
+        if (tp && FastllmCudaMoeCacheRequested() &&
+            ((single && (seqlen == 1 || (dsparkVerify && seqlen <= 8))) || tpBatchCache) &&
+            !dumpDebug && hasSharedExpertOut &&
             !V41ReferenceMathEnabled() &&
             moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
             UsesHostMoe(SelectMoeDeviceForLayer(layer)) &&
@@ -310,8 +324,8 @@ namespace fastllm {
         };
         bool combineFfnPostDispatch = false;
 #ifdef USE_CUDA
-        combineFfnPostDispatch = tp && single && hasSharedExpertOut && !dumpDebug &&
-            (seqlen == 1 || dsparkVerify);
+        combineFfnPostDispatch = tp && hasSharedExpertOut && !dumpDebug &&
+            ((single && (seqlen == 1 || dsparkVerify)) || tpCacheHandled);
 #endif
         if (!tpCacheHandled && !singleCacheHandled) {
             this->ApplyMoeDeviceMapForLayer(layer);
