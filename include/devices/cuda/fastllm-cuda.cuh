@@ -996,6 +996,11 @@ bool FastllmCudaDeepSeekV41EngramApply(fastllm::Data &hidden, const fastllm::Dat
 bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
                                        int posStep, bool inverse, int originalSeqLen, float ropeFactor,
                                        int betaFast, int betaSlow, int quantMode, int quantDim, int quantBlock);
+// DSpark's root-local BF16 draft: fuse Q/KV rotary with the attention gather table.
+bool FastllmCudaDeepSeekV41DraftRotaryTable(fastllm::Data &q, fastllm::Data &kv,
+    const fastllm::Data &window, int ropeDim, float ropeBase, int startPos,
+    int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
+    const int *devicePosition, fastllm::Data &table);
 // Graph replay reads the current absolute position from a device scalar.
 bool FastllmCudaDeepSeekV41RotaryQuantPosition(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
                                        int posStep, bool inverse, int originalSeqLen, float ropeFactor,

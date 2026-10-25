@@ -1552,6 +1552,53 @@ namespace {
         V41Store<T>(base, d, v);
     }
 
+    // Independent CTAs rotate Q, rotate/quantize current KV, and copy the
+    // immutable window. This preserves the two original rotary expressions
+    // and the BF16 storage boundary before KV's block-32 quantization.
+    __global__ void V41DraftRotaryTableKernel(__nv_bfloat16 *q, __nv_bfloat16 *kv,
+            const __nv_bfloat16 *window, __nv_bfloat16 *table, V41RopeTable rope,
+            int heads, int tokens, int windowRows, int ropeDim, int startPos,
+            const int *devicePosition, int qBlocks) {
+        constexpr int dim = 512;
+        const int block = blockIdx.x;
+        if (block < qBlocks) {
+            const int idx = block * blockDim.x + threadIdx.x;
+            const int pairs = ropeDim / 2;
+            if (idx >= tokens * heads * pairs) return;
+            const int row = idx / pairs, d = idx % pairs;
+            auto *base = q + (size_t)row * dim + dim - ropeDim + 2 * d;
+            const float pos = (float)((devicePosition ? *devicePosition : startPos) + (long long)(row / heads));
+            const float ang = pos * rope.invFreq[d];
+            const float c = cosf(ang), s = sinf(ang);
+            const float a = V41Load<__nv_bfloat16>(base, 0), b = V41Load<__nv_bfloat16>(base, 1);
+            V41Store<__nv_bfloat16>(base, 0, a * c - b * s);
+            V41Store<__nv_bfloat16>(base, 1, a * s + b * c);
+        } else if (block < qBlocks + tokens) {
+            const int row = block - qBlocks, d = threadIdx.x;
+            auto *base = kv + (size_t)row * dim;
+            float v = V41Load<__nv_bfloat16>(base, d);
+            const float other = __shfl_xor_sync(0xffffffff, v, 1);
+            const int off = dim - ropeDim;
+            if (d >= off) {
+                const int k = d - off;
+                const float pos = (float)((devicePosition ? *devicePosition : startPos) + (long long)row);
+                const float ang = pos * rope.invFreq[k >> 1];
+                const float c = cosf(ang), s = sinf(ang);
+                v = (k & 1) ? (other * s + v * c) : (v * c - other * s);
+            }
+            v = V41StorageRound<__nv_bfloat16>(v);
+            const float scale = V41QuantScaleDev(V41WarpMax(fabsf(v)), 1);
+            v = V41QuantValueDev(v, scale, 1);
+            const auto result = __float2bfloat16_rn(v);
+            base[d] = result;
+            table[(size_t)(windowRows + row) * dim + d] = result;
+        } else {
+            const size_t idx = (size_t)(block - qBlocks - tokens) * blockDim.x + threadIdx.x;
+            if (idx < (size_t)windowRows * (dim / 8))
+                ((uint4*)table)[idx] = ((const uint4*)window)[idx];
+        }
+    }
+
     struct V41DecodeTransformDescriptor {
         __nv_bfloat16 *input, *window;
         int rows, dim, position, mode, inverse, quantBlock;
@@ -4654,6 +4701,46 @@ extern "C" bool FastllmCudaDeepSeekV41RotaryQuantPosition(fastllm::Data &x, int 
             ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock, rowsPerBlock, rows, devicePosition);
     }
     return V41CheckLaunch("RotaryQuant");
+}
+
+extern "C" bool FastllmCudaDeepSeekV41DraftRotaryTable(Data &q, Data &kv, const Data &window,
+        int ropeDim, float ropeBase, int startPos, int originalSeqLen, float ropeFactor,
+        int betaFast, int betaSlow, const int *devicePosition, Data &table) {
+    if (V41LegacyRotary() || V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") ||
+        V41EnvOn("FASTLLM_DSV41_DISABLE_FAKE_QUANT") ||
+        q.dims.size() != 4 || kv.dims.size() != 3 || window.dims.size() != 3 ||
+        q.dims[0] != 1 || q.dims[1] < 1 || q.dims[1] > 8 || q.dims[2] < 1 || q.dims[2] > 128 ||
+        q.dims[3] != 512 || kv.dims != std::vector<int>({1, q.dims[1], 512}) ||
+        window.dims[0] != 1 || window.dims[1] < 1 || window.dims[1] > 1024 || window.dims[2] != 512 ||
+        ropeDim < 2 || ropeDim > 128 || ropeDim % 2 || table.multiDeviceData || table.isFake ||
+        (uintptr_t)window.cudaData % 16 || (uintptr_t)table.cudaData % 16) return false;
+    const std::vector<int> device{FastllmCudaGetDevice()};
+    const Data *inputs[] = {&q, &kv, &window};
+    const uint64_t tableBytes = (uint64_t)(window.dims[1] + q.dims[1]) * 512 * 2;
+    auto overlaps = [](const Data &a, const Data &b, uint64_t bBytes = 0) {
+        const uintptr_t x = (uintptr_t)a.cudaData, y = (uintptr_t)b.cudaData;
+        return x && y && x < y + (bBytes ? bBytes : b.GetBytes()) && y < x + a.GetBytes();
+    };
+    for (int i = 0; i < 3; ++i) {
+        const Data &x = *inputs[i];
+        if (!V41OnCuda(x) || x.multiDeviceData || x.dataType != DataType::BFLOAT16 || x.dataDeviceIds != device ||
+            &x == &table || overlaps(x, table, tableBytes)) return false;
+        uint64_t stride = 1;
+        if (x.strides.size() != x.dims.size()) return false;
+        for (int j = (int)x.dims.size() - 1; j >= 0; --j) {
+            if (x.strides[j] != stride) return false;
+            stride *= x.dims[j];
+        }
+        for (int j = 0; j < i; ++j) if (overlaps(x, *inputs[j])) return false;
+    }
+    if (!V41PrepareOutput(table, DataType::BFLOAT16, {1, window.dims[1] + q.dims[1], 512})) return false;
+    const auto rope = V41BuildRope(ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
+    const int qBlocks = (q.dims[1] * q.dims[2] * (ropeDim / 2) + 511) / 512;
+    V41DraftRotaryTableKernel<<<qBlocks + q.dims[1] + (window.dims[1] + 7) / 8, 512>>>(
+        (__nv_bfloat16*)q.cudaData, (__nv_bfloat16*)kv.cudaData, (const __nv_bfloat16*)window.cudaData,
+        (__nv_bfloat16*)table.cudaData, rope, q.dims[2], q.dims[1], window.dims[1], ropeDim,
+        startPos, devicePosition, qBlocks);
+    return V41CheckLaunch("DraftRotaryTable");
 }
 
 extern "C" bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,

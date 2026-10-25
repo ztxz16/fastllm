@@ -2102,20 +2102,27 @@ namespace fastllm {
                 LinearWithActivationQuant(qkvPrepared ? qQuant : qNorm, pre + ".attn.wq_b.weight", q,
                                           false, nullptr, qkvPrepared);
                 q.Reshape({1, block, num_attention_heads, headDim});
-                DsRotaryQuant(q, windowRope, startPos, 1, false, 0, 32, -1, devicePosition);
-
                 if (!qkvPrepared) {
                     LinearWithActivationQuant(attnInput, pre + ".attn.wkv.weight", kv);
                     DsRMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
                 }
                 kv.Reshape({1, block, headDim});
-                DsRotaryQuant(kv, windowRope, startPos, 1, false, 1, 32, -1, devicePosition);
-
-                Cat(dspark.layers[stage].windowKV, kv, 1, table);
+                bool rotaryPrepared = false;
+#ifdef USE_CUDA
+                rotaryPrepared = FastllmCudaDeepSeekV41DraftRotaryTable(
+                    q, kv, dspark.layers[stage].windowKV, windowRope.ropeDim, windowRope.base, startPos,
+                    windowRope.originalSeqLen, windowRope.factor, windowRope.betaFast,
+                    windowRope.betaSlow, devicePosition, table);
+#endif
+                if (!rotaryPrepared) {
+                    DsRotaryQuant(q, windowRope, startPos, 1, false, 0, 32, -1, devicePosition);
+                    DsRotaryQuant(kv, windowRope, startPos, 1, false, 1, 32, -1, devicePosition);
+                    Cat(dspark.layers[stage].windowKV, kv, 1, table);
+                }
                 AssertInFastLLM(table.dims.size() == 3 && table.dims[1] == tableRows,
                                 "DeepSeekV41 DSpark: draft attention gather table has a wrong size.");
-                DsSparseAttention(q, kv, nullptr, &table, &attentionIndices, weight[pre + ".attn.attn_sink"],
-                                  1, 0, softmaxScale, attnOut);
+                DsSparseAttention(q, kv, nullptr, &table, &attentionIndices,
+                                  weight[pre + ".attn.attn_sink"], 1, 0, softmaxScale, attnOut);
                 DsRotaryQuant(attnOut, windowRope, startPos, 1, true, 0, 32, -1, devicePosition);
 
                 DeepSeekV4WoA(attnOut, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
