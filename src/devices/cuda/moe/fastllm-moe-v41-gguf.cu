@@ -382,7 +382,8 @@ void Project(int type, const block_q8_1 *input, __nv_bfloat16 *output,
     }
     switch (type) {
 #define PROJECT(Type) case GGML_TYPE_##Type: { \
-        constexpr int tile = (GGML_TYPE_##Type == GGML_TYPE_IQ1_S || GGML_TYPE_##Type == GGML_TYPE_IQ1_M) ? 16 : 8; \
+        constexpr int tile = (GGML_TYPE_##Type == GGML_TYPE_IQ2_XXS || GGML_TYPE_##Type == GGML_TYPE_IQ1_M) ? 32 : \
+            GGML_TYPE_##Type == GGML_TYPE_IQ1_S ? 16 : 8; \
         V41GGUFProjection<GGML_TYPE_##Type, Gate, Weights, tile><<<dim3((rows+tile-1)/tile, routes), 256, shared, cudaStreamPerThread>>>( \
             input, output, weights, indices, experts, topk, columns, rows, \
             ggml_row_size(GGML_TYPE_##Type, columns)); break; }

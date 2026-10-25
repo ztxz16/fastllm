@@ -1444,6 +1444,9 @@ if (UNIT_TEST)
             add_executable(deepseekV41GgufIndexedRegression test/ops/deepseekV41GgufIndexedRegression.cpp)
             target_link_libraries(deepseekV41GgufIndexedRegression PRIVATE fastllm)
             target_include_directories(deepseekV41GgufIndexedRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(deepseekV41GgufBatch deepseekV41GgufIndexedRegression
+                "PASS: V4.1 IQ small-batch projections" 300 --batch-grid)
+            set_tests_properties(deepseekV41GgufBatch PROPERTIES LABELS cuda)
             fastllm_add_checked_test(deepseekV41GgufHostPrefill deepseekV41GgufIndexedRegression
                 "PASS: V4.1 host grouped prefill" 300 --host-prefill)
             set_tests_properties(deepseekV41GgufHostPrefill PROPERTIES LABELS cuda)

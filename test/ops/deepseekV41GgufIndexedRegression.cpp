@@ -654,6 +654,7 @@ static bool groupedTest = false;
 static bool sparseTest = false;
 static bool hostPrefillTest = false;
 static bool decodeGridTest = false;
+static bool batchGridTest = false;
 static int graphReplays = 0;
 
 static void HostPrefill(Data &input, Data &indices, Data &scores,
@@ -771,7 +772,7 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
     }
     Data gate, activation, workspace, output, ref;
     int checks = 0;
-    for (int rows : hostPrefillTest ? std::vector<int>{33,128,2048} : decodeGridTest ? std::vector<int>{1} : sparseTest ? std::vector<int>{512,1024} : groupedTest ? std::vector<int>{33,64,129} : cacheTest ? std::vector<int>{1,5,8} : std::vector<int>{1,2,8,32}) for (int pattern = 0; pattern < 3; ++pattern) {
+    for (int rows : hostPrefillTest ? std::vector<int>{33,128,2048} : batchGridTest ? std::vector<int>{1,2,8} : decodeGridTest ? std::vector<int>{1} : sparseTest ? std::vector<int>{512,1024} : groupedTest ? std::vector<int>{33,64,129} : cacheTest ? std::vector<int>{1,5,8} : std::vector<int>{1,2,8,32}) for (int pattern = 0; pattern < 3; ++pattern) {
         std::vector<float> x(size_t(rows)*hidden), scales(rows*topk);
         for (size_t i = 0; i < x.size(); ++i)
             x[i] = pattern == 2 ? 0.f : std::ldexp(normal(rng)*30.f, int(i/32%5)-2);
@@ -905,6 +906,19 @@ int main(int argc, char **argv) {
         }
         hybridTest = mode == "--hybrid";
         cacheTest = mode == "--cache";
+        if (mode == "--batch-grid") {
+            batchGridTest = cacheTest = true;
+            int checks = 0;
+            // IQ2_XXS checkpoints mix these formats across both projections.
+            // Cover real dimensions, missing TP experts, sparse cache routes,
+            // and graph replay with changing routes and activations.
+            for (int gt : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M})
+                for (int dt : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M})
+                    checks += Case(gt, dt, 5120, 2304, devices > 1 ? 1 : 0, true);
+            printf("PASS: V4.1 IQ small-batch projections (%d checks, %d changed-input graph replays)\n",
+                checks, graphReplays);
+            return 0;
+        }
         if (mode == "--decode-grid") {
             decodeGridTest = true;
             int n = Case(GGML_TYPE_Q3_K,GGML_TYPE_Q3_K,5120,2304,0,true);
