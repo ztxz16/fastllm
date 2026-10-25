@@ -276,9 +276,12 @@ def _deepseek_priority(candidate, model, backend=None):
     # solver accounts for route skew, pinned staging and the full context.
     streamed_disk = ((backend or candidate.get("moe_device")) == "disk" and
                      model.disk_prefill.get("streamed_mmq", False) and
-                     32 < chunk * candidate.get("max_batch", 1) <= 4096 and
+                     32 < chunk <= 4096 and
                      candidate.get("expert_transport_bytes_per_device", 0) > 0)
-    return min(chunk, 4096 if streamed_disk else 512), min(cache, 3 * memory.GiB), chunk
+    # Once these targets are met, compare predicted latency. An unbounded
+    # chunk preference otherwise discards a faster fully resident GPU plan
+    # before its decode cost is considered.
+    return min(chunk, 4096 if streamed_disk else 512), min(cache, 3 * memory.GiB)
 
 
 def kv_residencies(args, model):
@@ -722,7 +725,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if model.family == "deepseek_v41":
         result["automatic"]["ranking"] = (
             "non-disk experts first; fixed context; chunk up to 4096 for streamed disk GGUF or 512 otherwise, then per-GPU expert cache up to 3 GiB, "
-            "then largest feasible chunk; automatic topology uses single GPU or PP; "
+            "then predicted latency; automatic topology uses single GPU or PP; "
             "TP requires explicit opt-in; estimated latency"
         )
     result["automatic"]["kv_streaming"] = "kvmem" in result

@@ -137,10 +137,12 @@ class AutoConfigTest(unittest.TestCase):
         prompt = dict(large, chunked_prefill_size=4096, moe_cuda_cache=GiB//2)
         self.assertGreater(auto._deepseek_priority(prompt, self.g, 'disk'),
                            auto._deepseek_priority(large, self.g, 'disk'))
-        for fallback in (dict(prompt, chunked_prefill_size=8192, moe_cuda_cache=3*GiB),
-                         dict(prompt, max_batch=2, moe_cuda_cache=3*GiB)):
-            self.assertGreater(auto._deepseek_priority(prompt, self.g, 'disk'),
-                               auto._deepseek_priority(fallback, self.g, 'disk'))
+        fallback = dict(prompt, chunked_prefill_size=8192, moe_cuda_cache=3*GiB)
+        self.assertGreater(auto._deepseek_priority(prompt, self.g, 'disk'),
+                           auto._deepseek_priority(fallback, self.g, 'disk'))
+        # Concurrent decode does not multiply V4.1's streamed prefill rows.
+        self.assertEqual(auto._deepseek_priority(dict(prompt, max_batch=4), self.g, 'disk'),
+                         auto._deepseek_priority(prompt, self.g, 'disk'))
         for backend in ('numa', 'cpu'):
             self.assertLess(auto._deepseek_priority(large, self.g, backend),
                             auto._deepseek_priority(small, self.g, backend))
@@ -333,6 +335,18 @@ class AutoConfigTest(unittest.TestCase):
         p = self.resolve(self.args('--device', 'cuda:0'))
         self.assertEqual(p['resident_layers'], self.g.layers)
         self.assertEqual(p['moe_cuda_cache'], 0)
+
+    def test_deepseek_latency_can_choose_full_gpu_over_larger_hybrid_chunk(self):
+        self.g.family = 'deepseek_v41'
+        self.g.activation_width = 1 << 20
+        self.costs = ([23 * GiB // 4] * 4, *self.costs[1:])
+        self.gpu[0] = dict(total=30 * GiB, free=30 * GiB)
+        # Both candidates meet the chunk/cache targets. A larger hybrid
+        # chunk must not veto the faster full-GPU candidate before ranking.
+        with patch.object(auto, 'latency_score', side_effect=lambda p, *rest:
+                          1 if p['resident_layers'] == self.g.layers else 100):
+            p = self.resolve(self.args('--device', 'cuda:0', '--gpu_mem_ratio', '.9', '--max_batch', '2'))
+        self.assertEqual((p['resident_layers'], p['chunked_prefill_size']), (self.g.layers, 512))
 
     def test_deepseek_implicit_embedding_is_charged_before_chunk_selection(self):
         self.g.family = 'deepseek_v41'
