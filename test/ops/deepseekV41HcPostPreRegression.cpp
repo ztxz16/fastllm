@@ -1,5 +1,5 @@
 // Fused attention mHC: independent FP64 coefficient oracle, exact residual/
-// normalized-input checks, and changing-input CUDA graph replay on every GPU.
+// normalized/quantized-input checks, and changing-input graph replay on every GPU.
 #include "fastllm.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-v41-decode.cuh"
@@ -57,7 +57,7 @@ static void Run(int device, int m, int d, int batch = 1) {
     const int n = m / batch, iter = 20;
     const float eps = 1e-6f;
     Data x, r, prevPre, prevPost, prevComb, fn, scale, base, norm, h, pre, post, comb, y, oh, opre, opost,
-        ocomb, oy;
+        ocomb, oy, quantized, referenceQuantized;
     Alloc(x, BFLOAT16, {batch, n, d}, device);
     Alloc(r, BFLOAT16, {batch, n, 4, d}, device);
     Alloc(prevPre, FLOAT32, {batch, n, 4}, device);
@@ -67,6 +67,7 @@ static void Run(int device, int m, int d, int batch = 1) {
     Alloc(scale, FLOAT32, {3}, device);
     Alloc(base, FLOAT32, {24}, device);
     Alloc(norm, FLOAT32, {d}, device);
+    Alloc(referenceQuantized, BFLOAT16, {batch, n, d}, device);
     std::mt19937 rng(51 + d + m);
     std::normal_distribution<float> normal;
     std::vector<uint16_t> xv(m * d), rv(m * 4 * d);
@@ -97,8 +98,8 @@ static void Run(int device, int m, int d, int batch = 1) {
     Upload(base, bw);
     Upload(norm, nw);
     auto call = [&] {
-        Check(FastllmCudaDeepSeekV41HcPostMixPreNorm(x, r, prevPre, prevPost, prevComb, fn, scale, base, norm,
-                                                     iter, eps, eps, h, pre, post, comb, y),
+        Check(FastllmCudaDeepSeekV41HcPostMixPreNormQuantized(x, r, prevPre, prevPost, prevComb, fn, scale, base, norm,
+                                                             iter, eps, eps, h, pre, post, comb, y, quantized),
               "fused rejected");
     };
     auto old = [&] {
@@ -123,6 +124,8 @@ static void Run(int device, int m, int d, int batch = 1) {
         Upload(r, rv);
         Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
         old();
+        Check(FastllmCudaDeepSeekV41QuantizeActivation(oy, referenceQuantized), "standalone quantizer");
+        Check(Read<uint16_t>(quantized) == Read<uint16_t>(referenceQuantized), "quantized output changed bits");
         auto hv = Read<uint16_t>(h);
         Check(hv == Read<uint16_t>(oh), "residual changed bits");
         Check(Read<uint16_t>(y) == Read<uint16_t>(oy), "normalized input changed bits");
@@ -209,6 +212,8 @@ static void Run(int device, int m, int d, int batch = 1) {
     Check(!FastllmCudaDeepSeekV41HcPostMixPreNorm(x, r, prevPre, prevPost, prevComb, fn, scale, base, norm,
                                                   iter, eps, eps, h, pre, pre, comb, y),
           "aliased outputs accepted");
+    Check(!FastllmCudaDeepSeekV41HcPostMixPreNormQuantized(x, r, prevPre, prevPost, prevComb, fn, scale, base, norm,
+          iter, eps, eps, h, pre, post, comb, y, y), "aliased quantized output accepted");
     auto dims = r.dims;
     r.dims = {1, 1, 4, d};
     Check(!FastllmCudaDeepSeekV41HcPostMixPreNorm(x, r, prevPre, prevPost, prevComb, fn, scale, base, norm,
@@ -247,7 +252,7 @@ int main(int argc, char **) {
                 }
         }
         std::cout << "PASS " << cases
-                  << " cases x3 changing-input graph replay; residual/input exact; FP64 coefficient max_abs="
+                  << " cases x3 changing-input graph replay; residual/input/quantized exact; FP64 coefficient max_abs="
                   << worstOracle << std::endl;
     } catch (const std::exception &e) {
         std::cerr << e.what() << std::endl;

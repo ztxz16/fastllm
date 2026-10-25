@@ -4342,11 +4342,11 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &pr
 
 // Fused attention post + next mHC projection, followed by the existing
 // delayed-pre normalization. Rejection is side-effect free for input tensors.
-extern "C" bool FastllmCudaDeepSeekV41HcPostMixPreNorm(const Data &input, const Data &residual,
+static bool V41HcPostMixPreNormImpl(const Data &input, const Data &residual,
         const Data &previousPre, const Data &previousPost, const Data &previousComb,
         const Data &fn, const Data &scale, const Data &base, const Data &normWeight,
         int sinkhornIters, float mixEps, float normEps, Data &hidden,
-        Data &pre, Data &post, Data &comb, Data &output) {
+        Data &pre, Data &post, Data &comb, Data &output, Data *quantizedOutput) {
     if (residual.dataType != DataType::BFLOAT16 || residual.dims.size() != 4 ||
         residual.dims[2] != 4 || residual.dims[0] <= 0 || residual.dims[1] <= 0) return false;
     const int64_t tokens64 = (int64_t)residual.dims[0] * residual.dims[1];
@@ -4365,8 +4365,8 @@ extern "C" bool FastllmCudaDeepSeekV41HcPostMixPreNorm(const Data &input, const 
         previousPost.Count(0) != tokens * 4 || previousComb.Count(0) != tokens * 16 ||
         fn.Count(0) != (uint64_t)24 * 4 * d || scale.Count(0) != 3 ||
         base.Count(0) != 24 || normWeight.Count(0) != d) return false;
-    Data *outputs[] = {&hidden, &pre, &post, &comb, &output};
-    for (int i = 0; i < 5; ++i) {
+    Data *outputs[] = {&hidden, &pre, &post, &comb, &output, quantizedOutput};
+    for (int i = 0; i < (quantizedOutput ? 6 : 5); ++i) {
         const Data *out = outputs[i];
         if (out->multiDeviceData || out->isFake) return false;
         for (const Data *in : inputs)
@@ -4381,6 +4381,7 @@ extern "C" bool FastllmCudaDeepSeekV41HcPostMixPreNorm(const Data &input, const 
         !V41PrepareOutput(post, DataType::FLOAT32, {b, n, 4}) ||
         !V41PrepareOutput(comb, DataType::FLOAT32, {b, n, 4, 4}) ||
         !V41PrepareOutput(output, DataType::BFLOAT16, {b, n, d})) return false;
+    if (quantizedOutput && !V41PrepareOutput(*quantizedOutput, DataType::BFLOAT16, {b, n, d})) return false;
 #define V41_POST_DOTS_ONE(D, O) if (!V41LaunchDependent<V41HcPostWarpDots<D, O>>(dim3((25 + O - 1) / O, tokens, 8), 32, 0, \
         (const __nv_bfloat16*)input.cudaData, (const __nv_bfloat16*)residual.cudaData, \
         (const float*)previousPost.cudaData, (const float*)previousComb.cudaData, \
@@ -4394,16 +4395,43 @@ extern "C" bool FastllmCudaDeepSeekV41HcPostMixPreNorm(const Data &input, const 
     }
 #undef V41_POST_DOTS
 #undef V41_POST_DOTS_ONE
-#define V41_POST_FINISH(I) if (!V41LaunchDependent<V41HcPreNormKernel<1024, I, true, false, 8>>(tokens * 2, 1024, 0, \
+#define V41_POST_FINISH(I, Q) if (!V41LaunchDependent<V41HcPreNormKernel<1024, I, true, Q, 8>>(tokens * 2, 1024, 0, \
         (const __nv_bfloat16*)hidden.cudaData, (const float*)previousPre.cudaData, \
         (const float*)normWeight.cudaData, (__nv_bfloat16*)output.cudaData, 4, d, normEps, \
         (const float*)scratch.cudaData, (const float*)scale.cudaData, (const float*)base.cudaData, \
-        sinkhornIters, mixEps, (float*)post.cudaData, (float*)comb.cudaData, (float*)pre.cudaData, (__nv_bfloat16*)nullptr)) return false
-    if (d <= 4096) { V41_POST_FINISH(2); }
-    else if (d <= 6144) { V41_POST_FINISH(3); }
-    else { V41_POST_FINISH(4); }
+        sinkhornIters, mixEps, (float*)post.cudaData, (float*)comb.cudaData, (float*)pre.cudaData, Q ? (__nv_bfloat16*)quantizedOutput->cudaData : nullptr)) return false
+    if (d <= 4096) {
+        if (quantizedOutput) { V41_POST_FINISH(2, true); }
+        else { V41_POST_FINISH(2, false); }
+    } else if (d <= 6144) {
+        if (quantizedOutput) { V41_POST_FINISH(3, true); }
+        else { V41_POST_FINISH(3, false); }
+    } else {
+        if (quantizedOutput) { V41_POST_FINISH(4, true); }
+        else { V41_POST_FINISH(4, false); }
+    }
 #undef V41_POST_FINISH
     return V41CheckLaunch("HcPostMixPreNorm");
+}
+
+extern "C" bool FastllmCudaDeepSeekV41HcPostMixPreNorm(const Data &input, const Data &residual,
+        const Data &previousPre, const Data &previousPost, const Data &previousComb,
+        const Data &fn, const Data &scale, const Data &base, const Data &normWeight,
+        int sinkhornIters, float mixEps, float normEps, Data &hidden,
+        Data &pre, Data &post, Data &comb, Data &output) {
+    return V41HcPostMixPreNormImpl(input, residual, previousPre, previousPost, previousComb,
+        fn, scale, base, normWeight, sinkhornIters, mixEps, normEps,
+        hidden, pre, post, comb, output, nullptr);
+}
+
+extern "C" bool FastllmCudaDeepSeekV41HcPostMixPreNormQuantized(const Data &input, const Data &residual,
+        const Data &previousPre, const Data &previousPost, const Data &previousComb,
+        const Data &fn, const Data &scale, const Data &base, const Data &normWeight,
+        int sinkhornIters, float mixEps, float normEps, Data &hidden,
+        Data &pre, Data &post, Data &comb, Data &output, Data &quantizedOutput) {
+    return V41HcPostMixPreNormImpl(input, residual, previousPre, previousPost, previousComb,
+        fn, scale, base, normWeight, sinkhornIters, mixEps, normEps,
+        hidden, pre, post, comb, output, &quantizedOutput);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41HcMix(const fastllm::Data &x, fastllm::Data &hcFn, fastllm::Data &hcScale,

@@ -54,6 +54,15 @@ extern "C" bool FastllmCudaDeepSeekV41HcPostMixPreNorm(const fastllm::Data &inpu
     fastllm::Data &hidden, fastllm::Data &pre, fastllm::Data &post,
     fastllm::Data &comb, fastllm::Data &output);
 
+// Also emits a distinct block-32 fake-FP8 BF16 copy for the expert branches.
+extern "C" bool FastllmCudaDeepSeekV41HcPostMixPreNormQuantized(const fastllm::Data &input,
+    const fastllm::Data &residual, const fastllm::Data &previousPre,
+    const fastllm::Data &previousPost, const fastllm::Data &previousComb,
+    const fastllm::Data &fn, const fastllm::Data &scale, const fastllm::Data &base,
+    const fastllm::Data &normWeight, int sinkhornIters, float mixEps, float normEps,
+    fastllm::Data &hidden, fastllm::Data &pre, fastllm::Data &post,
+    fastllm::Data &comb, fastllm::Data &output, fastllm::Data &quantizedOutput);
+
 // Full-K output-channel slice; no partial dot products or reduction across GPUs.
 // For M > 1 writes packed [M, rowCount] at offset M * rowStart in output.
 extern "C" bool FastllmCudaBFloat16FP8ReplicatedRowSlice(const fastllm::Data &input,

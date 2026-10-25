@@ -852,7 +852,8 @@ namespace fastllm {
         bool V41HcPostMixPreNorm(Data &input, Data &residual, Data &previousPre,
                 Data &previousPost, Data &previousComb, Data &fn, Data &scale, Data &base,
                 Data &normWeight, int hcMult, int iters, float mixEps, float normEps,
-                Data &hidden, Data &pre, Data &post, Data &comb, Data &output) {
+                Data &hidden, Data &pre, Data &post, Data &comb, Data &output,
+                Data *quantizedOutput = nullptr) {
             if (!V41FusedHcPreNormEnabled() || hcMult != 4 ||
                 residual.dataType != DataType::BFLOAT16 || residual.dims.size() != 4 ||
                 residual.dims[2] != 4 || residual.dims[0] <= 0 || residual.dims[1] <= 0)
@@ -899,17 +900,27 @@ namespace fastllm {
             V41AllocLike(post, DataType::FLOAT32, {b, n, 4}, residual, devices);
             V41AllocLike(comb, DataType::FLOAT32, {b, n, 4, 4}, residual, devices);
             V41AllocLike(output, DataType::BFLOAT16, {b, n, d}, residual, devices);
+            if (quantizedOutput)
+                V41AllocLike(*quantizedOutput, DataType::BFLOAT16, {b, n, d}, residual, devices);
             auto local = [&](Data &v, int device) -> Data & {
                 return devices.empty() ? v : *v.multiDeviceDatas.at(device);
             };
             const auto ranks = devices.empty() ? residual.dataDeviceIds : devices;
             std::vector<int> ok(ranks.size());
             auto run = [&](int rank, int device) {
-                ok[rank] = FastllmCudaDeepSeekV41HcPostMixPreNorm(local(input, device), local(residual, device),
-                    local(previousPre, device), local(previousPost, device), local(previousComb, device),
-                    local(fn, device), local(scale, device), local(base, device), local(normWeight, device),
-                    iters, mixEps, normEps, local(hidden, device), local(pre, device), local(post, device),
-                    local(comb, device), local(output, device));
+                if (quantizedOutput) {
+                    ok[rank] = FastllmCudaDeepSeekV41HcPostMixPreNormQuantized(local(input, device), local(residual, device),
+                        local(previousPre, device), local(previousPost, device), local(previousComb, device),
+                        local(fn, device), local(scale, device), local(base, device), local(normWeight, device),
+                        iters, mixEps, normEps, local(hidden, device), local(pre, device), local(post, device),
+                        local(comb, device), local(output, device), local(*quantizedOutput, device));
+                } else {
+                    ok[rank] = FastllmCudaDeepSeekV41HcPostMixPreNorm(local(input, device), local(residual, device),
+                        local(previousPre, device), local(previousPost, device), local(previousComb, device),
+                        local(fn, device), local(scale, device), local(base, device), local(normWeight, device),
+                        iters, mixEps, normEps, local(hidden, device), local(pre, device), local(post, device),
+                        local(comb, device), local(output, device));
+                }
             };
             if (devices.empty()) run(0, ranks[0]);
             else if (!MultiCudaRunDeviceCallbacks(devices, run)) return false;
@@ -6632,6 +6643,16 @@ namespace fastllm {
                     V41DumpTensor(segTopK[0], "fl_layer" + std::to_string(layer) + "_topk" + dumpSuffix);
                 }
             }
+            // Keep upstream single-token hybrid quantization as well as the
+            // GPU verification fusion. The router/host experts retain BF16 input.
+            const bool quantizeGpuFfn = executionMode == ExecutionMode::Gpu && tp &&
+                seqlen >= 1 && seqlen <= 8;
+            const bool quantizeSharedFfn = (tp || (executionMode == ExecutionMode::Hybrid && GetCudaSharedExpert())) &&
+                seqlen == 1 && !f.dsparkVerify;
+            const bool quantizeFfn = single && (quantizeGpuFfn || quantizeSharedFfn) &&
+                quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") &&
+                quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight");
+            ws->ffnInputQuantizedReady = false;
             bool fusedPost = false;
 #ifdef USE_CUDA
             if (f.graphActive && seqlen > 1 && !dumpDebug) {
@@ -6639,7 +6660,9 @@ namespace fastllm {
                     weight[pre + ".hc_ffn_fn"], weight[pre + ".hc_ffn_scale"],
                     weight[pre + ".hc_ffn_base"], weight[pre + ".ffn_norm.weight"],
                     hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
-                    *nextHidden, ffnPre, ffnPost, ffnComb, ffnInput);
+                    *nextHidden, ffnPre, ffnPost, ffnComb, ffnInput,
+                    quantizeFfn ? &ws->ffnInputQuantized : nullptr);
+                ws->ffnInputQuantizedReady = fusedPost && quantizeFfn;
             }
 #endif
             if (!fusedPost) V41HcPost(attnProj, *curHidden, attnPost, attnComb, *nextHidden);
@@ -6650,13 +6673,6 @@ namespace fastllm {
             }
 
             // ---- FFN (MoE)：整批 ----
-            // Keep the original BF16 input for the router and host experts.
-            // The extra output only replaces the shared expert's quantizer.
-            const bool quantizeFfn = (tp || (executionMode == ExecutionMode::Hybrid && GetCudaSharedExpert())) && single &&
-                seqlen == 1 && !f.dsparkVerify &&
-                quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") &&
-                quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight");
-            ws->ffnInputQuantizedReady = false;
             if (!fusedPost) ws->ffnInputQuantizedReady = V41HcMixPreNorm(*curHidden, attnPre, weight[pre + ".hc_ffn_fn"],
                 weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
                 weight[pre + ".ffn_norm.weight"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
