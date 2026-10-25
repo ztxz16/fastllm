@@ -172,8 +172,14 @@ namespace fastllm {
     // Stable buffers and stream dependencies permit graph capture of a
     // vocabulary-sharded projection with FP32 output and FP32/BF16 input,
     // including uneven shard widths.
+    struct MultiCudaDsparkMarkovRequest {
+        Data &embed, &head, &tokens, &outEmbeds;
+        std::shared_ptr<void> &workspace;
+        bool completed = false;
+    };
     bool MultiCudaLinearOutputGatherPersistent(Data &input, Data &weight, Data &output,
-                                               std::shared_ptr<void> &workspace);
+                                               std::shared_ptr<void> &workspace,
+                                               MultiCudaDsparkMarkovRequest *markov = nullptr);
     bool MultiCudaLinearRow(Data &input, Data &weight, Data &bias, Data &output);
     bool MultiCudaLinearColumn(Data &input, Data &weight, Data &bias, Data &output);
     struct MultiCudaAsyncMLPHandle;

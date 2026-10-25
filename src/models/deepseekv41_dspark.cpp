@@ -74,6 +74,7 @@ namespace fastllm {
         std::vector<void*> cachePointers;
         Data input, preMix, indices, position, headHidden, normalized, logits;
         Data markovTokens, markovValues, markovIndices, markovEmbeds;
+        std::shared_ptr<void> markovWorkspace;
         // The graph optimizer may run shared and routed branches concurrently.
         // Their scratch must remain disjoint throughout every replay.
         struct SharedExpertWorkspace {
@@ -2170,17 +2171,31 @@ namespace fastllm {
             DsRMSNormBF16(headHidden, weight[last + ".norm.weight"], rms_norm_eps, normed);
             // ---- head：mtp.<last>.norm + 共享 lm_head ----
             const double headStart = DsTick();
-            if (v41DsparkTpDevices.empty()) {
-                Linear(normed, weight["head.weight"], *GetEmptyData(), logits);
-            } else {
-                DsparkProjectHead(normed, logits, true);
+            bool headProjected = false, shardedMarkov = false;
+#ifdef USE_CUDA
+            if (graphState && normed.dataType == DataType::BFLOAT16 &&
+                !quantizedLinearNames.count("head.weight")) {
+                ApplyDsparkDevice(); FastllmMultiCudaSetDevice(v41DsparkTpDevices);
+                MultiCudaDsparkMarkovRequest request{markovEmbedWeight, markovHeadWeight,
+                    graphState->markovTokens, markovAll, graphState->markovWorkspace};
+                headProjected = MultiCudaLinearOutputGatherPersistent(normed, weight["head.weight"], logits,
+                    v41DsparkHeadWorkspace, &request);
+                shardedMarkov = request.completed;
             }
-            ToDataType(logits, DataType::FLOAT32);
+#endif
+            if (!headProjected) {
+                if (v41DsparkTpDevices.empty()) {
+                    Linear(normed, weight["head.weight"], *GetEmptyData(), logits);
+                } else {
+                    DsparkProjectHead(normed, logits, true);
+                }
+            }
+            if (!shardedMarkov) ToDataType(logits, DataType::FLOAT32);
 
             DsDraftTimingSlot().head = DsElapsed(headStart);
             if (graphState && !v41DsparkHeadWorkspace) graphState->disabled = true;
 #ifdef USE_CUDA
-            if (graphState) {
+            if (graphState && !shardedMarkov) {
                 AssertInFastLLM(FastllmCudaDeepSeekV41MarkovChainDevice(logits, markovEmbedWeight, markovHeadWeight,
                     block, graphState->markovTokens, graphState->markovValues, graphState->markovIndices, markovAll),
                     "DeepSeekV41 DSpark device Markov chain rejected input.");

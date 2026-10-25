@@ -187,12 +187,12 @@ namespace {
         }
     }
 
-    // Four lanes read adjacent 16-byte vectors of each BF16 row. This
-    // coalesces the 256-wide projection and shortens its serial FMA chain.
-    // Accumulation and final scores stay FP32; only the reduction order changes.
-    __global__ void DsparkMarkovGroupedScoreKernel(
+    // Four lanes read adjacent 16-byte vectors of each BF16 row. Both the
+    // root and vocabulary-sharded paths use the same FP32 accumulation order
+    // and break score ties by the smallest global token index.
+    __device__ __forceinline__ DsBest DsMarkovGroupedBest(
         const float *logits, const __nv_bfloat16 *embed, const __nv_bfloat16 *head,
-        const int *tokens, int step, int vocab, float *partialValue, int *partialIndex) {
+        const int *tokens, int step, int vocab, int start, int count) {
         constexpr int lanes = 4, rank = 256, rowsPerBlock = kDsparkMarkovThreads / lanes;
         __shared__ float e[rank];
         __shared__ DsBest reduce[kDsparkMarkovThreads];
@@ -200,8 +200,8 @@ namespace {
         __syncthreads();
         const int lane = threadIdx.x % lanes;
         const unsigned mask = ((1u << lanes) - 1) << ((threadIdx.x & 31) / lanes * lanes);
-        const int perChunk = (vocab + gridDim.x - 1) / gridDim.x;
-        const int begin = blockIdx.x * perChunk, end = min(vocab, begin + perChunk);
+        const int perChunk = (count + gridDim.x - 1) / gridDim.x;
+        const int begin = blockIdx.x * perChunk, end = min(count, begin + perChunk);
         DsBest best{-FLT_MAX, vocab};
         for (int v = begin + threadIdx.x / lanes; v < end; v += rowsPerBlock) {
             float dot = 0.0f;
@@ -218,16 +218,45 @@ namespace {
             for (int offset = lanes / 2; offset > 0; offset /= 2)
                 dot += __shfl_down_sync(mask, dot, offset, lanes);
             if (lane == 0) {
-                const float score = logits[(int64_t)step * vocab + v] + dot;
-                if (score > best.value || (score == best.value && v < best.index))
-                    best = {score, v};
+                const float score = logits[(int64_t)step * count + v] + dot;
+                if (score > best.value || (score == best.value && start + v < best.index))
+                    best = {score, start + v};
             }
         }
         DsBlockArgmax(best, reduce);
+        return best;
+    }
+
+    __global__ void DsparkMarkovGroupedScoreKernel(
+        const float *logits, const __nv_bfloat16 *embed, const __nv_bfloat16 *head,
+        const int *tokens, int step, int vocab, float *partialValue, int *partialIndex) {
+        const DsBest best = DsMarkovGroupedBest(logits, embed, head, tokens, step, vocab, 0, vocab);
         if (threadIdx.x == 0) {
             partialValue[blockIdx.x] = best.value;
             partialIndex[blockIdx.x] = best.index;
         }
+    }
+
+    __global__ void MarkovShardScore(
+        const float *logits, const __nv_bfloat16 *embed, const __nv_bfloat16 *head,
+        const int *tokens, int step, int vocab, int start, int count, unsigned long long *bestKey) {
+        const DsBest best = DsMarkovGroupedBest(logits, embed, head, tokens, step, vocab, start, count);
+        if (threadIdx.x == 0) {
+            // Canonicalize signed zero; the low bits prefer the smaller token ID.
+            const float value = best.value == 0.f ? 0.f : best.value;
+            const unsigned bits = __float_as_uint(value);
+            const unsigned ordered = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+            const unsigned long long key = ((unsigned long long)ordered << 32) | (0xffffffffu - (unsigned)best.index);
+            atomicMax(bestKey + step, key);
+        }
+    }
+
+    __global__ void MarkovShardFinish(const unsigned long long *key, const __nv_bfloat16 *embed,
+        int *tokens, int step, float *outEmbeds) {
+        const int previous = tokens[step];
+        if (outEmbeds) outEmbeds[step * 256 + threadIdx.x] =
+            __bfloat162float(embed[(int64_t)previous * 256 + threadIdx.x]);
+        if (threadIdx.x == 0) tokens[step + 1] = int(0xffffffffu - unsigned(key[step]));
     }
 
     // 第二步：归约各块的结果，写下一个 token；顺便把本步用到的嵌入存给 confidence head
@@ -403,4 +432,19 @@ extern "C" bool FastllmCudaDeepSeekV41MarkovChain(const fastllm::Data &logits,
     FastllmCudaCopyFromDeviceToHost(outTokens.data(), (int*)tokens.cudaData + 1, block * sizeof(int));
     for (int token : outTokens) if (token < 0 || token >= logits.dims[2]) return false;
     return true;
+}
+
+extern "C" bool FastllmCudaDsparkMarkovShardScore(const float *logits, const void *embed,
+    const void *head, const int *tokens, unsigned long long *keys,
+    int step, int vocab, int start, int count) {
+    MarkovShardScore<<<kDsparkMarkovGroupedChunks, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(logits,
+        (const __nv_bfloat16*)embed, (const __nv_bfloat16*)head,
+        tokens, step, vocab, start, count, keys);
+    return cudaGetLastError() == cudaSuccess;
+}
+extern "C" bool FastllmCudaDsparkMarkovShardFinish(const unsigned long long *keys,
+    const void *embed, int *tokens, float *outEmbeds, int step) {
+    MarkovShardFinish<<<1, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(keys,
+        (const __nv_bfloat16*)embed, tokens, step, outEmbeds);
+    return cudaGetLastError() == cudaSuccess;
 }
