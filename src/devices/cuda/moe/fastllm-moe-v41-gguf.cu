@@ -11,6 +11,20 @@
 #include "../fastllm-gguf-iq2-dot.cuh"
 
 namespace {
+__device__ __forceinline__ float V41Fp8Boundary(float x) {
+    const float maximum = fmaxf(warp_reduce_max(fabsf(x)), 1e-4f);
+    const unsigned bits = __float_as_uint(maximum * (1.0f/448.0f));
+    const int exponent = int((bits>>23)&255)-127+int((bits&0x7fffff)!=0);
+    const float scale = exp2f(float(exponent));
+    return __bfloat162float(__float2bfloat16_rn(
+        float(__nv_fp8_e4m3(fminf(448.f, fmaxf(-448.f, x/scale))))*scale));
+}
+__device__ __forceinline__ void V41StoreQ8(float x, block_q8_1 &q, int lane) {
+    const float maximum = warp_reduce_max(fabsf(x));
+    const float sum = warp_reduce_sum(x), scale = maximum/127.f;
+    q.qs[lane] = maximum == 0 ? 0 : int8_t(roundf(x/scale));
+    if (lane == 0) q.ds = __floats2half2_rn(scale, sum);
+}
 // The same FP8 block-32 -> BF16 -> Q8_1 boundaries as the ordinary CUDA
 // Linear path. Input conversion is shared by every selected expert.
 template<bool Fp8Boundary>
@@ -18,19 +32,9 @@ __global__ void V41GGUFQuantize(const __nv_bfloat16 *input, block_q8_1 *output, 
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c >= columns) return;
     float x = __bfloat162float(input[size_t(blockIdx.y)*columns+c]);
-    if constexpr (Fp8Boundary) {
-        const float maximum = fmaxf(warp_reduce_max(fabsf(x)), 1e-4f);
-        const unsigned bits = __float_as_uint(maximum * (1.0f/448.0f));
-        const int exponent = int((bits>>23)&255)-127+int((bits&0x7fffff)!=0);
-        const float scale = exp2f(float(exponent));
-        x = __bfloat162float(__float2bfloat16_rn(
-            float(__nv_fp8_e4m3(fminf(448.f, fmaxf(-448.f, x/scale))))*scale));
-    }
-    const float maximum = warp_reduce_max(fabsf(x));
-    const float sum = warp_reduce_sum(x), scale = maximum/127.f;
+    if constexpr (Fp8Boundary) x = V41Fp8Boundary(x);
     auto &q = output[size_t(blockIdx.y)*(columns/32)+c/32];
-    q.qs[c%32] = maximum == 0 ? 0 : int8_t(roundf(x/scale));
-    if (c%32 == 0) q.ds = __floats2half2_rn(scale, sum);
+    V41StoreQ8(x, q, c%32);
 }
 
 // Keep projection dispatch inline: sharing the fused gate/up helper changes
@@ -170,6 +174,52 @@ __device__ int V41WeightRow(const FastllmCudaMoeGGUFCacheView &view, int row, in
     return gate && view.numaGateType >= 0 ? 2*(row % (rows/2)) + row/(rows/2) : row;
 }
 
+// Compact only on the GPU: no device-to-host route-count synchronization.
+// The launch grid is bounded by the public route count; inactive CTAs exit
+// before loading a codebook or writing a zero expert matrix.
+struct V41EpWeights {
+    const uint8_t *const *weights;
+    const int32_t *routes; // count, packed -> original, original -> packed
+};
+__device__ const uint8_t *V41Weight(V41EpWeights view, const int32_t *indices,
+        int route, int experts, bool gate) {
+    return V41Weight(view.weights, indices, view.routes[1+route], experts, gate);
+}
+__device__ int V41Route(V41EpWeights view, int route) { return view.routes[1+route]; }
+__device__ int V41WeightRow(V41EpWeights, int row, int, bool) { return row; }
+template<class Weights> __device__ bool V41ActiveRoute(Weights, int) { return true; }
+__device__ bool V41ActiveRoute(V41EpWeights view, int route) { return route < view.routes[0]; }
+
+__global__ void V41EpRoutes(const uint8_t *const *weights, const int32_t *indices,
+        int32_t *routes, int count, int experts) {
+    if (threadIdx.x) return;
+    int active = 0;
+    for (int r = 0; r < count; ++r) {
+        const int e = indices[r];
+        const bool local = e >= 0 && e < experts && weights[2*e] && weights[2*e+1];
+        routes[1+count+r] = local ? active : -1;
+        if (local) routes[1+active++] = r;
+    }
+    routes[0] = active;
+}
+
+__global__ void V41EpSwigluQ8(const __nv_bfloat16 *gateup, block_q8_1 *output,
+        const int32_t *routes, const float *scores, int inter, float limit) {
+    const int route = blockIdx.y, c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (route >= routes[0] || c >= inter) return;
+    const auto *input = gateup + size_t(route)*2*inter;
+    float gate = __bfloat162float(input[c]), up = __bfloat162float(input[c+inter]);
+    if (limit > 0) {
+        gate = fminf(gate, limit);
+        up = fmaxf(-limit, fminf(up, limit));
+    }
+    float x = (gate/(1.f+expf(-gate)))*up;
+    x *= scores[routes[1+route]];
+    x = __bfloat162float(__float2bfloat16_rn(x));
+    x = V41Fp8Boundary(x);
+    V41StoreQ8(x, output[size_t(route)*(inter/32)+c/32], c%32);
+}
+
 template<ggml_type Type, bool Gate, class Weights, int RowsPerBlock = 8, int StaticColumns = 0, int VirtualWarps = 4, int LaneWidth = 32>
 __global__ void V41GGUFProjection(const block_q8_1 *input, __nv_bfloat16 *output,
         Weights weights, const int32_t *indices,
@@ -178,6 +228,7 @@ __global__ void V41GGUFProjection(const block_q8_1 *input, __nv_bfloat16 *output
         columns = StaticColumns;
     }
     const int route = blockIdx.y;
+    if (!V41ActiveRoute(weights, route)) return;
     const uint8_t *weight = V41Weight(weights, indices, route, experts, Gate);
     const int firstRow = blockIdx.x*RowsPerBlock + threadIdx.x/LaneWidth;
     // The decision is uniform within the CTA. Missing TP experts must still
@@ -274,7 +325,7 @@ void V41GGUFGateUpActBound(const block_q8_1 *input, __nv_bfloat16 *output,
 }
 
 __global__ void V41GGUFReduce(const __nv_bfloat16 *partial, float *output,
-        const int32_t *indices, int hidden, int topk) {
+        const int32_t *indices, int hidden, int topk, const int32_t *inverse = nullptr) {
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c >= hidden) return;
     const int base = blockIdx.y*topk;
@@ -287,8 +338,11 @@ __global__ void V41GGUFReduce(const __nv_bfloat16 *partial, float *output,
         order[pos] = k;
     }
     float sum = 0;
-    for (int k = 0; k < topk; ++k)
-        sum = __fadd_rn(sum, __bfloat162float(partial[size_t(base+order[k])*hidden+c]));
+    for (int k = 0; k < topk; ++k) {
+        const int route = inverse ? inverse[base+order[k]] : base+order[k];
+        const float value = route >= 0 ? __bfloat162float(partial[size_t(route)*hidden+c]) : 0.f;
+        sum = __fadd_rn(sum, value);
+    }
     // The caller adds the shared expert in FP32 before the BF16 HC boundary.
     output[size_t(blockIdx.y)*hidden+c] = sum;
 }
@@ -398,7 +452,7 @@ bool FastllmCudaRunV41GGUF(
         const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &activation,
         fastllm::Data &workspace, fastllm::Data &output, const void *weightPointers,
         const int32_t *indices, const float *scores, int gateType, int downType,
-        int hidden, int inter, int experts, int topk, float swigluLimit) {
+        int hidden, int inter, int experts, int topk, float swigluLimit, bool compactEpRoutes) {
     const int rows = input.dims[0], routes = rows*topk;
     auto *qInput = static_cast<block_q8_1 *>(workspace.cudaData);
     auto *qGate = qInput + size_t(rows)*(hidden/32);
@@ -407,10 +461,25 @@ bool FastllmCudaRunV41GGUF(
     const size_t baseBytes = (size_t(rows)*(hidden/32) + size_t(routes)*(inter/32))*sizeof(block_q8_1) +
         size_t(routes)*hidden*sizeof(__nv_bfloat16);
     const size_t offset = (baseBytes+255)&~size_t(255);
-    const bool grouped = workspace.GetBytes() > offset;
     void *groupedScratch = static_cast<char *>(workspace.cudaData)+offset;
     V41GGUFQuantize<true><<<dim3((hidden+255)/256, rows), 256, 0, cudaStreamPerThread>>>(
         static_cast<const __nv_bfloat16 *>(input.cudaData), qInput, hidden);
+    if (compactEpRoutes) {
+        auto *routeMap = static_cast<int32_t *>(groupedScratch);
+        V41EpRoutes<<<1, 32, 0, cudaStreamPerThread>>>(weights, indices, routeMap, routes, experts);
+        const V41EpWeights view{weights, routeMap};
+        Project<true>(gateType, qInput, static_cast<__nv_bfloat16 *>(gate.cudaData),
+            view, indices, experts, topk, routes, hidden, 2*inter);
+        // Fuse the two activation kernels but retain every BF16/FP8 rounding
+        // boundary, including the score multiplication before FP8 quantization.
+        V41EpSwigluQ8<<<dim3((inter+255)/256, routes), 256, 0, cudaStreamPerThread>>>(
+            static_cast<const __nv_bfloat16 *>(gate.cudaData), qGate, routeMap, scores, inter, swigluLimit);
+        Project<false>(downType, qGate, partial, view, indices, experts, topk, routes, inter, hidden);
+        V41GGUFReduce<<<dim3((hidden+255)/256, rows), 256, 0, cudaStreamPerThread>>>(
+            partial, static_cast<float *>(output.cudaData), indices, hidden, topk, routeMap+1+routes);
+        return cudaGetLastError() == cudaSuccess;
+    }
+    const bool grouped = workspace.GetBytes() > offset;
     const bool tuned = !grouped && V41UseTunedGGUF(hidden, inter);
     if (tuned) {
         ProjectGateActivation(gateType,qInput,static_cast<__nv_bfloat16 *>(gate.cudaData),

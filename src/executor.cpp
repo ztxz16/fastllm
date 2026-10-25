@@ -147,20 +147,23 @@ namespace fastllm {
             return false;
         }
 
-        // The batch-1 collective EP path accepts any participating CUDA device
-        // as its root.  Keep the hidden state and GPU route results together on
+        const bool v41 = intParams.count("deepSeekV4Mode") && intParams.at("deepSeekV4Mode") &&
+            intParams.count("activationQuantBlock") && intParams.at("activationQuantBlock") == 32;
+        const int maxRows = v41 ? 8 : 1;
+        // Small V4.1 batches and batch-1 EP accept any participating CUDA root.
+        // Keep the hidden state and GPU route results together on
         // the layer's current device instead of first copying all three tensors
         // to multicuda's deviceIds[0].  That device then packs the single NCCL
         // broadcast packet and receives the final reduce result directly.
         if (data->dataDevice == DataDevice::CUDA && data->cudaData != nullptr &&
             !data->multiDeviceData) {
             if (name == "input") {
-                return data->dims.size() > 0 && data->dims[0] == 1 &&
+                return data->dims.size() > 0 && data->dims[0] >= 1 && data->dims[0] <= maxRows &&
                        (data->dataType == DataType::FLOAT16 ||
                         data->dataType == DataType::BFLOAT16 ||
                         data->dataType == DataType::FLOAT32);
             }
-            if (data->dims.size() >= 2 && data->dims[0] == 1 && data->dims[1] <= 16) {
+            if (data->dims.size() >= 2 && data->dims[0] >= 1 && data->dims[0] <= maxRows && data->dims[1] <= 16) {
                 return (name == "index" && data->dataType == DataType::INT32) ||
                        (name == "score" && data->dataType == DataType::FLOAT32);
             }

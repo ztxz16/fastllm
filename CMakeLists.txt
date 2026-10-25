@@ -1422,6 +1422,12 @@ if (UNIT_TEST)
                 "PASS: V4.1 load placement reference" 60 --reference)
             set_tests_properties(deepseekV41LoadPlacement deepseekV41LoadPlacementReference
                 PROPERTIES LABELS cuda)
+            add_executable(deepseekV41PpEpRegression test/ops/deepseekV41PpEpRegression.cpp)
+            target_link_libraries(deepseekV41PpEpRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41PpEpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(deepseekV41PpEp deepseekV41PpEpRegression
+                "PASS: V4.1 PP3 EP3" 120)
+            set_tests_properties(deepseekV41PpEp PROPERTIES LABELS "cuda;multigpu" RUN_SERIAL TRUE)
             add_executable(deepseekV41Mxfp4PpRegression test/ops/deepseekV41Mxfp4PpRegression.cpp)
             target_link_libraries(deepseekV41Mxfp4PpRegression PRIVATE fastllm)
             target_include_directories(deepseekV41Mxfp4PpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

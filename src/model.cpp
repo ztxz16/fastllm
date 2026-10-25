@@ -468,7 +468,14 @@ namespace fastllm {
                                                   const std::string &weightName,
                                                   Data &data,
                                                   const std::vector<int> &deviceIds,
-                                                  std::map<int, int> &ratios) {
+                                                  std::map<int, int> &ratios,
+                                                  bool selectedMultiCuda) {
+        // Routed EP placement is independent of attention TP. In PP+EP the
+        // attention map contains single CUDA stages, while routed weights use
+        // multicuda; place those experts on their owner during loading instead
+        // of accumulating the whole model on the first EP device.
+        const bool v41RoutedEp = selectedMultiCuda && model->model_type == "deepseek_v41" &&
+            ParseRoutedExpertIndex(weightName) >= 0;
         if ((model->model_type != "qwen3_moe" &&
              model->model_type != "hy_v3" &&
              model->model_type != "step3p5" &&
@@ -478,7 +485,7 @@ namespace fastllm {
              model->model_type != "deepseek_v4" &&
              model->model_type != "deepseek_v41" &&
              model->model_struct != "qwen3_5") ||
-            !IsThreadTensorParallelLoadEnabled() || deviceIds.size() <= 1 ||
+            (!IsThreadTensorParallelLoadEnabled() && !v41RoutedEp) || deviceIds.size() <= 1 ||
             data.isDiskWeight || data.dims.size() != 2 ||
             (data.cpuData == nullptr && data.cudaData == nullptr && data.numasData.empty())) {
             return false;
@@ -891,7 +898,7 @@ namespace fastllm {
                 ConvertCompactE4M3NVFP4ToBlock16(data);
             }
         }
-        if (SplitSpecialWeightToCudaTpDevices(this, weightName, data, deviceIds, ratios)) {
+        if (SplitSpecialWeightToCudaTpDevices(this, weightName, data, deviceIds, ratios, selectedMultiCuda)) {
             return true;
         }
         if (deviceIds.size() > 1) {

@@ -10,7 +10,7 @@ bool FastllmCudaMergeMOEV41GGUFResident(
     const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &activation,
     fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
     int weightsBatch, const fastllm::Data &indices, const fastllm::Data &scores,
-    float sharedScale, float swigluLimit);
+    float sharedScale, float swigluLimit, bool compactEpRoutes = false);
 
 // Read-only admission for a previously warmed resident decode shape. The
 // model owns and validates graph workspace addresses; weight retirement
@@ -22,7 +22,8 @@ bool FastllmCudaRunV41GGUF(
     const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &activation,
     fastllm::Data &workspace, fastllm::Data &output, const void *weightPointers,
     const int32_t *indices, const float *scores, int gateType, int downType,
-    int hidden, int inter, int experts, int topk, float swigluLimit);
+    int hidden, int inter, int experts, int topk, float swigluLimit,
+    bool compactEpRoutes = false);
 
 // Native CUDA activation semantics (Q8_1), distinct from NUMA's Q8_K path.
 size_t FastllmCudaV41GGUFGroupedWorkspaceBytes(
