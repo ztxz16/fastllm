@@ -79,7 +79,7 @@ ANSI_ESCAPE_PATTERN = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|
 CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
 INFERENCE_SPEED_PATTERN = re.compile(
     r"^\[(Prompt|Decode)\]\s+.+?\bSpeed:\s*"
-    r"((?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+tokens\s*/\s*s\.?\s*$"
+    r"((?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+tokens\s*/\s*s\.?(?:\s+Batch:\s*\d+\.)?\s*$"
 )
 CONTEXT_WINDOW_PATTERN = re.compile(
     r"\bModel context window:\s*(\d{1,10})\s+tokens per session "

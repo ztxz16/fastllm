@@ -1084,6 +1084,10 @@ class LauncherProcessTest(unittest.TestCase):
             self.assertEqual(runtime.state()["speed"]["prefillTokensPerSecond"], 4500.0)
             self.assertEqual(runtime.state()["speed"]["decodeTokensPerSecond"], 123.0)
             self.assertEqual(runtime.state()["speed"]["decodeUpdatedAt"], 1002.0)
+            runtime._handle_inference_speed(
+                "[Prompt] 72 Tokens. Time: 0.246 s. Speed: 293.13 tokens / s. Batch: 1.",
+                runtime._generation)
+            self.assertEqual(runtime.state()["speed"]["prefillTokensPerSecond"], 293.13)
 
     def test_speed_ignores_invalid_and_previous_service_samples(self):
         with tempfile.TemporaryDirectory() as directory:
