@@ -717,10 +717,14 @@ __global__ void BuildGroupedMoeRowsKernel(
     experts[route] = expert;
     __syncthreads();
     int count = 0, leader = route;
-    for (int i = 0; i < route; ++i) {
-        if (experts[i] == expert) {
-            if (count % 8 == 0) leader = i;
-            ++count;
+    // Nonlocal and inactive lanes cannot emit a tile or a token. Their
+    // counts are unused; scanning their shared -1 entries only adds work.
+    if (local) {
+        for (int i = 0; i < route; ++i) {
+            if (experts[i] == expert) {
+                if (count % 8 == 0) leader = i;
+                ++count;
+            }
         }
     }
     const bool first = local && count % 8 == 0;
