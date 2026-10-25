@@ -42,6 +42,9 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
 void FastllmCudaCustomAllReduceReset();
 bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
                                 int dataType, int deviceId);
+// In-place unsigned maximum of one 8-byte value. Call on every active rank.
+// Alignment/capture-registration misses are rejected collectively before launch.
+bool FastllmCudaCustomScalarMaxUint64(void *value, int deviceId);
 // Optional bounded host spin for dedicated decode submission cores. The
 // pointer registration and collective fallback checks remain unchanged.
 bool FastllmCudaCustomAllReduceWithSpin(void* data, void* dest, int count,
@@ -94,6 +97,7 @@ bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
 void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int deviceId);
 void FastllmNcclBroadcastFrom(void* send, void* recv, int count, int dataType, int root, int deviceId);
 void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId);
+bool FastllmNcclAllReduceMaxUint64(void *data, int count, int deviceId);
 // Runs NCCL directly, bypassing the graph-safe custom all-reduce. Large TP
 // prefill tensors can be bandwidth-bound on the direct-peer implementation
 // even though it is faster for decode tensors.

@@ -3702,3 +3702,20 @@ void FastllmNcclReduce(void* data, void* dest, int count, int dataType, int root
         checkCudaErrors("Error: CUDA error when synchronizing NCCL reduce!", syncState);
     }
 }
+
+// Scalar messages use peer reads when eligible; larger or unsupported messages
+// retain NCCL unsigned MAX semantics.
+bool FastllmNcclAllReduceMaxUint64(void *data, int count, int deviceId) {
+    if (count == 1 && FastllmCudaCustomScalarMaxUint64(data, deviceId)) return true;
+    ncclComm_t comm = FindNcclCommNoLog(deviceId);
+    if (!comm || !data || count <= 0) return false;
+    FastllmCudaGraphRecordCollective();
+    ncclResult_t result = ncclAllReduce(data, data, count, ncclUint64, ncclMax,
+                                      comm, cudaStreamPerThread);
+    if (result != ncclSuccess) { FastllmCudaSetThreadError(); return false; }
+    if (FastllmNcclPostSyncEnabled(cudaStreamPerThread) &&
+        cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+        FastllmCudaSetThreadError(); return false;
+    }
+    return true;
+}
