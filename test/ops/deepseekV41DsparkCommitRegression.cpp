@@ -38,7 +38,9 @@ std::vector<unsigned char> Fill(Data &x, DataType type, int rows, const std::vec
 std::vector<unsigned char> Read(Data &x, int d) {
     Cu(cudaSetDevice(d));
     Cu(cudaDeviceSynchronize());
-    std::vector<unsigned char> v(x.Count(0) * x.unitSize);
+    size_t logicalBytes = x.unitSize;
+    for (int dim : x.dims) logicalBytes *= dim;
+    std::vector<unsigned char> v(logicalBytes);
     Cu(cudaMemcpy(v.data(), x.cudaData, v.size(), cudaMemcpyDeviceToHost));
     return v;
 }
@@ -137,6 +139,43 @@ void TestCopyRangeValidation(const std::vector<int> &dev) {
     unchanged();
     std::cout << "PASS batched byte ranges, unaligned and multi-kernel copies, atomic validation and aliases" << std::endl;
 }
+void TestExpandedRowBatch(const std::vector<int> &dev) {
+    for (auto type : {BFLOAT16, FLOAT16, FLOAT32}) {
+        Data src, dst;
+        auto input = Fill(src, type, 8, dev, 37);
+        Fill(dst, type, 2, dev, 9);
+        const size_t rowBytes = 512 * dst.unitSize;
+        std::vector<std::vector<unsigned char>> expected;
+        for (int d : dev) {
+            Cu(cudaSetDevice(d));
+            auto &local = *dst.multiDeviceDatas.at(d);
+            local.Expansion({1, 8, 512});
+            std::vector<unsigned char> bytes(8 * rowBytes);
+            for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (i * 23 + d * 17) % 251;
+            Cu(cudaMemcpy(local.cudaData, bytes.data(), bytes.size(), cudaMemcpyHostToDevice));
+            expected.push_back(bytes);
+        }
+        MultiCudaReplicatedCopyRange range;
+        Req(MultiCudaPrepareReplicatedRowCopy(dst, src, 2, 1, dev, range), "expanded tail prepare");
+        Req(MultiCudaCopyReplicatedRanges({range}, dev), "expanded tail batch rejected");
+        for (int d : dev) {
+            std::copy_n(input.data() + 2 * rowBytes, rowBytes, expected[d].data());
+            Cu(cudaSetDevice(d));
+            std::vector<unsigned char> got(8 * rowBytes);
+            Cu(cudaMemcpy(got.data(), dst.multiDeviceDatas.at(d)->cudaData, got.size(), cudaMemcpyDeviceToHost));
+            Req(got == expected[d], "expanded batch wrote wrong row or spare capacity");
+        }
+        auto bad = range;
+        bad.dstOffset = rowBytes;
+        Req(!MultiCudaCopyReplicatedRanges({bad}, dev), "spare capacity accepted as a live row");
+        auto stride = src.strides.back();
+        src.strides.back() = 2;
+        Req(!MultiCudaCopyReplicatedRanges({range}, dev), "strided source accepted");
+        src.strides.back() = stride;
+    }
+    std::cout << "PASS expanded FP32/FP16/BF16 tails, spare-capacity guards and strided fallback" << std::endl;
+}
+
 int main() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count < 8)
@@ -177,6 +216,12 @@ int main() {
                     Fill(cache.rawTailScore, FLOAT32, 2, dev, 0);
                     Fill(cache.compressedKV, BFLOAT16, (pos + forward) / 2, dev, 0);
                     Fill(cache.indexK, BFLOAT16, (pos + forward) / 2, dev, 0);
+                    for (Data *tail : {&cache.rawTailKV, &cache.rawTailScore}) {
+                        for (int d : dev) {
+                            Cu(cudaSetDevice(d));
+                            tail->multiDeviceDatas.at(d)->Expansion({1, 4, 512});
+                        }
+                    }
                     std::vector<void *> addr, ringAddr, inputAddr;
                     for (int d : dev) {
                         addr.push_back(cache.rawTailKV.multiDeviceDatas.at(d)->cudaData);
@@ -224,6 +269,7 @@ int main() {
                   << std::endl;
         TestBatchedWindows(m, dev);
         TestCopyRangeValidation(dev);
+        TestExpandedRowBatch(dev);
     } catch (const std::exception &e) {
         std::cerr << e.what() << std::endl;
         return 1;

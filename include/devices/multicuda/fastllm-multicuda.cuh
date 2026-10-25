@@ -221,6 +221,13 @@ namespace fastllm {
     // source/destination ranges return false, so the caller can fall back.
     bool MultiCudaCopyReplicatedRanges(const std::vector<MultiCudaReplicatedCopyRange> &ranges,
                                        const std::vector<int> &devices);
+    // Validate and prepare an owned replicated destination, without copying its
+    // payload. The returned range can join a batch of independent state writes.
+    // Keep both tensors alive until the batch completes; unsupported inputs
+    // return false before changing the destination.
+    bool MultiCudaPrepareReplicatedRowCopy(Data &dst, const Data &src, int start, int rows,
+                                           const std::vector<int> &devices,
+                                           MultiCudaReplicatedCopyRange &range);
     // Copy contiguous rows of a dense [1, tokens, width] replicated tensor
     // independently on each rank. Retains owned destination allocations and
     // replica layout; unsupported layouts/aliases return false without writes.

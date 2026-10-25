@@ -4805,6 +4805,30 @@ namespace fastllm {
         return true;
     }
 
+    // A reserved leading row capacity does not add padding inside the live
+    // rows of a [1, rows, width] tensor. Check actual logical strides so byte
+    // copies can use these caches without weakening other operator contracts.
+    static bool IsContiguousCopyData(const Data &data) {
+        if (IsCompactV41Activation(data)) return true;
+        if (data.dims.empty() || data.isKVCache || data.isLinearAttention || data.isGGUFData ||
+            (data.dataType != DataType::FLOAT32 && data.dataType != DataType::FLOAT16 &&
+             data.dataType != DataType::BFLOAT16 && data.dataType != DataType::INT32) ||
+            data.strides.size() != data.dims.size()) return false;
+        uint64_t stride = 1;
+        for (int axis = (int)data.dims.size() - 1; axis >= 0; --axis) {
+            if (data.dims[axis] <= 0 || (data.dims[axis] > 1 && data.strides[axis] != stride))
+                return false;
+            stride *= data.dims[axis];
+        }
+        return stride * data.unitSize <= data.GetBytes();
+    }
+
+    static size_t ContiguousCopyBytes(const Data &data) {
+        size_t bytes = data.unitSize;
+        for (int dim : data.dims) bytes *= dim;
+        return bytes;
+    }
+
     bool MultiCudaCopyReplicatedRanges(const std::vector<MultiCudaReplicatedCopyRange> &ranges,
                                        const std::vector<int> &devices) {
         if (ranges.empty() || devices.empty() || currentMultiCudaDedicatedWorker != nullptr ||
@@ -4822,8 +4846,8 @@ namespace fastllm {
             for (const auto &r : ranges) {
                 if (!r.src || !r.dst || !r.bytes || !r.src->IsTensorParallelReplicated() ||
                     !r.dst->IsTensorParallelReplicated() || !r.src->multiDeviceData ||
-                    !r.dst->multiDeviceData || r.dst->isFake || !IsCompactV41Activation(*r.src) ||
-                    !IsCompactV41Activation(*r.dst))
+                    !r.dst->multiDeviceData || r.dst->isFake || !IsContiguousCopyData(*r.src) ||
+                    !IsContiguousCopyData(*r.dst))
                     return false;
                 auto input = r.src->multiDeviceDatas.find(devices[rank]);
                 auto output = r.dst->multiDeviceDatas.find(devices[rank]);
@@ -4834,10 +4858,12 @@ namespace fastllm {
                     dst->dataDevice != DataDevice::CUDA || !src->cudaData || !dst->cudaData ||
                     src->dims != r.src->dims || dst->dims != r.dst->dims ||
                     src->dataType != r.src->dataType || dst->dataType != r.dst->dataType ||
-                    src->dataType != dst->dataType || !IsCompactV41Activation(*src) ||
-                    !IsCompactV41Activation(*dst) || r.srcOffset > src->GetBytes() ||
-                    r.bytes > src->GetBytes() - r.srcOffset || r.dstOffset > dst->GetBytes() ||
-                    r.bytes > dst->GetBytes() - r.dstOffset)
+                    src->dataType != dst->dataType || !IsContiguousCopyData(*src) ||
+                    !IsContiguousCopyData(*dst))
+                    return false;
+                const size_t srcBytes = ContiguousCopyBytes(*src), dstBytes = ContiguousCopyBytes(*dst);
+                if (r.srcOffset > srcBytes || r.bytes > srcBytes - r.srcOffset ||
+                    r.dstOffset > dstBytes || r.bytes > dstBytes - r.dstOffset)
                     return false;
                 auto a = (uintptr_t)src->cudaData + r.srcOffset;
                 auto b = (uintptr_t)dst->cudaData + r.dstOffset;
@@ -4879,8 +4905,9 @@ namespace fastllm {
         return true;
     }
 
-    bool MultiCudaCopyReplicatedRows(Data &dst, const Data &src, int start, int rows,
-                                      const std::vector<int> &devices) {
+    bool MultiCudaPrepareReplicatedRowCopy(Data &dst, const Data &src, int start, int rows,
+                                           const std::vector<int> &devices,
+                                           MultiCudaReplicatedCopyRange &range) {
         if (&dst == &src || devices.empty() || currentMultiCudaDedicatedWorker != nullptr ||
             !src.multiDeviceData || !src.IsTensorParallelReplicated() ||
             src.dims.size() != 3 || src.dims[0] != 1 || start < 0 || rows < 1 ||
@@ -4914,12 +4941,24 @@ namespace fastllm {
         Data shape(src.dataType, {1, rows, src.dims[2]});
         EnsureReplicatedMultiCudaScratch(dst, shape, devices);
         const size_t rowBytes = (size_t)src.dims[2] * src.unitSize;
+        SyncReplicatedRootMetaFromDevice0(dst, devices);
+        range = {&dst, &src, 0, (size_t)start * rowBytes, (size_t)rows * rowBytes};
+        FastllmCudaSetDevice(originalDevice);
+        return true;
+    }
+
+    bool MultiCudaCopyReplicatedRows(Data &dst, const Data &src, int start, int rows,
+                                      const std::vector<int> &devices) {
+        MultiCudaReplicatedCopyRange range;
+        if (!MultiCudaPrepareReplicatedRowCopy(dst, src, start, rows, devices, range))
+            return false;
+        const int originalDevice = FastllmCudaGetDevice();
         std::vector<int> ok(devices.size(), 0);
         auto copy = [&](int rank, int device) {
             ok[rank] = FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
                 dst.multiDeviceDatas.at(device)->cudaData,
-                (const uint8_t*)src.multiDeviceDatas.at(device)->cudaData + start * rowBytes,
-                rows * rowBytes);
+                (const uint8_t*)src.multiDeviceDatas.at(device)->cudaData + range.srcOffset,
+                range.bytes);
         };
         if (!MultiCudaRunDeviceCallbacks(devices, copy)) {
             for (size_t rank = 0; rank < devices.size(); ++rank) {
@@ -4928,7 +4967,6 @@ namespace fastllm {
                 FastllmCudaSyncDevice(devices[rank]);
             }
         }
-        SyncReplicatedRootMetaFromDevice0(dst, devices);
         FastllmCudaSetDevice(originalDevice);
         AssertInFastLLM(std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; }),
                         "MultiCuda replicated row copy failed.");

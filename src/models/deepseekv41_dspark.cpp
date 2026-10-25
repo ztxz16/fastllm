@@ -1531,11 +1531,12 @@ namespace fastllm {
                         "DeepSeekV41 DSpark: invalid accepted prefix length.");
         ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
         const int newLen = startPos + accept;
-        bool batchedWindows = false;
+        bool batchedWindows = false, batchedTails = false;
 #ifdef USE_CUDA
         ScopedTpDispatch commitDispatch(v41DsparkTpDevices.size() > 1, v41DsparkTpDevices);
         if (v41DsparkTpDevices.size() > 1 && startPos >= 0 && window_size > 0 && accept <= window_size) {
             std::vector<MultiCudaReplicatedCopyRange> ranges;
+            ranges.reserve(block_cnt * 4);
             bool valid = true;
             for (int layer = 0; layer < block_cnt; ++layer) {
                 if (layer >= (int)scratch.windowKV.size() || scratch.windowKV[layer].dims.size() != 3)
@@ -1555,8 +1556,37 @@ namespace fastllm {
                 if (first < accept)
                     ranges.push_back({&ring, &input, 0, first * rowBytes, (accept - first) * rowBytes});
             }
+            const bool validWindows = valid;
+            const size_t windowRanges = ranges.size();
+            // Window rows and compressor tails are independent rank-local
+            // writes. Prepare all tails before one shared worker dispatch.
+            for (int layer = 0; valid && layer < block_cnt; ++layer) {
+                if (!isKvSource[layer] || compress_ratios[layer] <= 0) continue;
+                const int total = scratch.prevRawTail[layer] + accept;
+                const int rem = total % compress_ratios[layer];
+                if (rem == 0) continue;
+                auto prepareTail = [&](Data &source, Data &tail) {
+                    MultiCudaReplicatedCopyRange range;
+                    if (!MultiCudaPrepareReplicatedRowCopy(tail, source, total - rem, rem,
+                            v41DsparkTpDevices, range)) return false;
+                    ranges.push_back(range);
+                    return true;
+                };
+                auto &cache = state.layers[layer];
+                valid = layer < (int)scratch.rawKV.size() &&
+                    prepareTail(scratch.rawKV[layer], cache.rawTailKV);
+                if (valid && compress_ratios[layer] > 1)
+                    valid = layer < (int)scratch.rawScore.size() &&
+                        prepareTail(scratch.rawScore[layer], cache.rawTailScore);
+            }
             if (valid)
+                batchedWindows = batchedTails = MultiCudaCopyReplicatedRanges(ranges, v41DsparkTpDevices);
+            // An unsupported tail must not turn the already supported window
+            // batch back into one dispatch per layer.
+            if (!batchedWindows && validWindows) {
+                ranges.resize(windowRanges);
                 batchedWindows = MultiCudaCopyReplicatedRanges(ranges, v41DsparkTpDevices);
+            }
         }
 #endif
         for (int layer = 0; layer < block_cnt; layer++) {
@@ -1595,7 +1625,7 @@ namespace fastllm {
                 }
             }
             cache.rawTail = rem;
-            if (rem > 0) {
+            if (rem > 0 && !batchedTails) {
                 AssertInFastLLM(scratch.rawKV[layer].dims.size() == 3 &&
                                 scratch.rawKV[layer].dims[1] >= total,
                                 "DeepSeekV41 DSpark: the compressor rollback buffer is too short.");
