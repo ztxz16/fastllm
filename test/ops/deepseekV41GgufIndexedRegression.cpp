@@ -250,13 +250,18 @@ public:
         }
         HybridMoeDecodeStep step; BeginHybridMoeStep(step,false,true,1);
         const std::vector<int> devices{0,1};
+        std::vector<Data *> layerWeights;
         for(size_t i=0;i<outputs.size();++i) {
             const int layer=first+i%(block_cnt-first);
             const int device=int(2*(layer+1)>block_cnt);
             FastllmCudaSetDevice(device);
+            layerWeights=weights[layer];
             Check(fastllm::RunHybridMoeOnDevices(*inputs[layer],*indices[layer],*scores[layer],
-                *outputs[i],weights[layer].data(),weights[layer].size(),layer,devices,{}),
+                *outputs[i],layerWeights.data(),layerWeights.size(),layer,devices,{}),
                 "queued cooperative layer rejected");
+            // The decoder reuses this pointer table while mailbox work is
+            // pending. Only the model-owned Data objects remain valid.
+            std::fill(layerWeights.begin(),layerWeights.end(),nullptr);
             if (i % 7 == 0) {
                 // Engram borrows the host pool mid-forward. The join must
                 // use the active group even with a GPU-resident first layer.

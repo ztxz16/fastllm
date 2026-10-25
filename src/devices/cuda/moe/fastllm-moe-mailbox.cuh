@@ -107,7 +107,9 @@ struct MailboxMoe {
     };
     struct Request {
         int table, layer, origin;
-        fastllm::Data **weights;
+        // Async work outlives the caller's reusable per-layer pointer table.
+        // Own its entries; the Data objects themselves remain model-owned.
+        std::vector<fastllm::Data *> weights;
         unsigned sequence;
         bool measure;
     };
@@ -314,7 +316,7 @@ struct MailboxMoe {
                 while (true) {
                     wake.wait(lock, [&] { return stopping || !requests.empty(); });
                     if (stopping) return;
-                    const auto request = requests.front();
+                    auto request = std::move(requests.front());
                     requests.pop_front();
                     busy = true;
                     lock.unlock();
@@ -341,7 +343,7 @@ struct MailboxMoe {
         }
         return true;
     }
-    void Run(const Request &q) {
+    void Run(Request &q) {
         const auto &layout = group.LayerLayout(q.table);
         const auto start = std::chrono::steady_clock::now();
         unsigned polls = 0;
@@ -453,7 +455,7 @@ struct MailboxMoe {
         };
         if (cpuCount) {
             double elapsed = 0;
-            NumasMoeDecodeExpertsWithOverlap(input.data(), hostOutput, q.weights, host->ids, host->owners, topk,
+            NumasMoeDecodeExpertsWithOverlap(input.data(), hostOutput, q.weights.data(), host->ids, host->owners, topk,
                                              q.layer, upload, host->scores, layout.swigluLimit, 32, &elapsed);
             cost.ObserveDecodeCpu(cpuCount, elapsed);
         } else
@@ -521,7 +523,10 @@ bool TryMailboxMoe(OffloadGroup &group, DeviceCache &origin, int table, const fa
     checkCudaErrors("Mailbox published", cudaEventRecord(s.work[root].published, cudaStreamPerThread));
     {
         std::lock_guard<std::mutex> lock(s.mutex);
-        s.requests.push_back({table, layer, root, weights, seq, measure});
+        const int weightCount = (l.experts + 1) * 2;
+        s.requests.push_back({table, layer, root,
+                              std::vector<fastllm::Data *>(weights, weights + weightCount),
+                              seq, measure});
         s.wake.notify_one();
     }
     if (shared) shared();
