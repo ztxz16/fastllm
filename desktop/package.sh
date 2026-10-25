@@ -489,11 +489,17 @@ if ((run_tests)); then
     if command -v xvfb-run >/dev/null 2>&1; then
         smoke_data="${build_root}/electron-smoke-data"
         smoke_log="${build_root}/electron-smoke.log"
+        smoke_args=(--disable-gpu)
+        # Chromium refuses root without this flag. Limit it to the build-time
+        # smoke process; the shipped launcher keeps its normal sandbox defaults.
+        if ((EUID == 0)); then
+            smoke_args+=(--no-sandbox)
+        fi
         set +e
         FTLLM_LAUNCHER_DATA_DIR="$smoke_data" \
             XDG_DATA_HOME="${smoke_data}/desktop-data" XDG_CACHE_HOME="${smoke_data}/desktop-cache" \
             timeout --signal=TERM 15s \
-            xvfb-run -a "${bundle_dir}/Fastllm-Launcher" --disable-gpu >"$smoke_log" 2>&1
+            xvfb-run -a "${bundle_dir}/Fastllm-Launcher" "${smoke_args[@]}" >"$smoke_log" 2>&1
         smoke_status=$?
         set -e
         if [[ "$smoke_status" != 0 && "$smoke_status" != 124 ]]; then
