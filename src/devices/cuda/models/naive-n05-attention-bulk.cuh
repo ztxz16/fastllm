@@ -113,6 +113,8 @@ template <int Max, bool FP8 = false> struct Storage : PackedStorage<FP8> {
     BF prob[8][Max + 8];
     int selected[128];
 };
+// Do not emit large-argument Tensor Core kernels for unsupported architectures.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 template <int Max, bool Ring, bool FP8, bool AsyncFP8 = true>
 __global__ __launch_bounds__(256) void Decode(const BF *q, Batch batch, const float *sink, BF *out,
                                               int heads, int kvHeads) {
@@ -229,4 +231,5 @@ __global__ __launch_bounds__(256) void Decode(const BF *q, Batch batch, const fl
 
 #endif
 }
+#endif
 } // namespace naive_attention_bulk

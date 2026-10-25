@@ -47,7 +47,7 @@ RUN nvcc --version
 
 # Python 3.8 用于构建，运行 wheel 需要 Python >= 3.10。
 RUN apt-get update && apt-get install -y libnuma-dev python3-pip \
-    && python3 -m pip install cmake==3.25.0 setuptools==75.3.2 wheel==0.45.1
+    && python3 -m pip install cmake==3.31.1 setuptools==75.3.2 wheel==0.45.1
 
 # -----------------------------------------------------------------
 # 新增部分：编译安装 Binutils 2.38 以升级 'as' (汇编器)

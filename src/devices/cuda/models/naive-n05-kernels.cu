@@ -3418,7 +3418,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         const fastllm::Data &weights, const fastllm::Data &liveKeys,
         const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query,
     int contextRank, int contextRanks, fastllm::Data *exchange) {
-#ifdef FASTLLM_NAIVE_DSA_MMA
+#if defined(FASTLLM_NAIVE_DSA_MMA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
     using namespace fastllm;
     namespace batch = naive_indexer_batch;
     constexpr int heads = naive_dsa_mma::kHeads, dim = naive_dsa_mma::kIndexerDim;
@@ -3527,7 +3527,7 @@ bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices) {
 void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
         const std::vector<FastllmNaiveIndexerRow> &rows,
         const fastllm::Data &exchange, int contextRanks) {
-#ifdef FASTLLM_NAIVE_DSA_MMA
+#if defined(FASTLLM_NAIVE_DSA_MMA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
     namespace batch = naive_indexer_batch;
     for (int first = 0; first < (int)rows.size(); first += batch::BatchLimit) {
         int count = std::min(batch::BatchLimit, (int)rows.size() - first);
@@ -3569,6 +3569,7 @@ template <class Kernel> bool BulkKernelSupported(Kernel kernel, size_t shared, i
 template <int Max, bool Ring>
 bool BulkAttention(const fastllm::Data &query, const float *bias,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, fastllm::Data &output) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     namespace bulk = naive_attention_bulk;
     const bool fp8 = rows.front().fp8;
     bool asyncFP8 = fp8;
@@ -3595,12 +3596,16 @@ bool BulkAttention(const fastllm::Data &query, const float *bias,
             (BF16 *)output.cudaData + (size_t)first * heads * 128, heads, kvHeads);
     }
     return true;
+#else
+    return false;
+#endif
 }
 
 #if CUDART_VERSION >= 12010
 template <int Max>
 bool HopperBulkAttention(const fastllm::Data &query, const float *bias,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, fastllm::Data &output) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     namespace bulk = naive_attention_bulk;
     if (FastllmCudaRuntimeArch() != 90 ||
         !BulkKernelSupported(bulk::HopperDecode<Max>, sizeof(bulk::TmaStorage<Max>), 90)) return false;
@@ -3620,6 +3625,9 @@ bool HopperBulkAttention(const fastllm::Data &query, const float *bias,
             (BF16 *)output.cudaData + (size_t)first * heads * 128, heads);
     }
     return true;
+#else
+    return false;
+#endif
 }
 #endif
 } // namespace
