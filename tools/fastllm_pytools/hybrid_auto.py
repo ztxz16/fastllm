@@ -854,7 +854,7 @@ def _disk_v41_streamed_mmq(args, model, rows, topk):
             rows >= minimum)
 
 
-def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=True):
+def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=True, prefill=True):
     topk = max(model.topk, args.moe_experts)
     scores = _score_workspace(model, rows, context)
     dense = model.hidden * model.intermediate * 3 * 2
@@ -865,8 +865,8 @@ def _workspace_bytes(args, model, rows, context, mode, resident, *, gguf_mmq=Tru
     resident_gguf = resident and all(layer in model.gguf_expert_bytes for layer in range(resident))
     canonical_gguf = phase.get("canonical_gguf", False)
     disk_streamed = _disk_v41_streamed_mmq(args, model, rows, topk)
-    reusable = (phase and (args.moe_device in ("disk", "numa") or getattr(args, "_host_moe_shared", False)) and (resident == 0 or resident_gguf) and mode == "pp" and
-                args.max_batch == 1 and rows > phase["window"] and
+    reusable = (prefill and phase and (args.moe_device in ("disk", "numa") or getattr(args, "_host_moe_shared", False)) and (resident == 0 or resident_gguf) and mode == "pp" and
+                rows > phase["window"] and
                 (args.fast_prefill or (canonical_gguf and disk_streamed)) and
                 args.dtype == "auto" and args.moe_dtype in ("", "auto") and
                 args.atype in ("auto", "bfloat16") and args.moe_atype in ("", "auto", "bfloat16") and
@@ -997,7 +997,12 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     speculative = max(args.mtp, getattr(args, "dspark", 0))
     gguf_mmq = all(gpu[d].get("capability", 0) >= 75 for d in mapping)
     for chunk in chunks:
-        rows = batch * max(chunk + (1 if args.mtp else 0), speculative + 1, model.dspark_block_size)
+        # V4.1 does not support batched prefill: the scheduler admits one
+        # prompt per forward, independently of the concurrent decode limit.
+        # KV/state below still cover every request and the full token budget.
+        prefill_rows = (chunk + (1 if args.mtp else 0)) * (1 if model.family == "deepseek_v41" else batch)
+        decode_rows = batch * max(speculative + 1, model.dspark_block_size)
+        rows = max(prefill_rows, decode_rows)
         for resident in residents:
             shared_host = args.moe_device == "numa" or (
                 args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False))
@@ -1013,7 +1018,14 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     args.moe_atype in ("", "auto", "bfloat16") and
                     _v41_streamed_mmq(model, 4096, max(model.topk, args.moe_experts))):
                 continue
-            workspace = _workspace_bytes(args, model, rows, context, mode, resident, gguf_mmq=gguf_mmq)
+            if model.family == "deepseek_v41":
+                # Prefill phase reuse must not discount a large decode or
+                # speculative verification batch, even when it has >128 rows.
+                workspace = max(
+                    _workspace_bytes(args, model, prefill_rows, context, mode, resident, gguf_mmq=gguf_mmq),
+                    _workspace_bytes(args, model, decode_rows, context, mode, resident, gguf_mmq=gguf_mmq, prefill=False))
+            else:
+                workspace = _workspace_bytes(args, model, rows, context, mode, resident, gguf_mmq=gguf_mmq)
             if streaming:
                 # Prefill stages one complete KV layer per device.
                 workspace += logical * layer_bytes

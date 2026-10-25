@@ -1053,8 +1053,12 @@ class HybridAutoTest(unittest.TestCase):
             numa.moe_device = "numa"
             self.assertEqual(auto._workspace_bytes(numa, g, 2048, 1048576, "pp", 0), bounded)
             self.assertGreater(bounded, auto._workspace_bytes(a, g, 256, 1048576, "pp", 0))
-            for changes in (dict(dtype="float32"), dict(atype="float32"),
-                            dict(max_batch=2), dict(fast_prefill=False)):
+            concurrent = copy.copy(a)
+            concurrent.max_batch = 4
+            self.assertEqual(auto._workspace_bytes(concurrent, g, 2048, 1048576, "pp", 0), bounded)
+            self.assertEqual(auto._workspace_bytes(concurrent, g, 2048, 1048576, "pp", 0,
+                                                   prefill=False), old)
+            for changes in (dict(dtype="float32"), dict(atype="float32"), dict(fast_prefill=False)):
                 other = copy.copy(a)
                 vars(other).update(changes)
                 self.assertEqual(auto._workspace_bytes(other, g, 2048, 1048576, "pp", 0), old)
@@ -1066,6 +1070,47 @@ class HybridAutoTest(unittest.TestCase):
                 self.assertEqual(auto._workspace_bytes(a, g, 2048, 1048576, "pp", 0), old)
             with patch.dict(os.environ, {"FASTLLM_DSV41_INDEX_SCORE_MB": "1024"}):
                 self.assertGreater(auto._workspace_bytes(a, g, 2048, 1048576, "pp", 0), bounded)
+
+    def test_v41_concurrent_decode_keeps_single_prefill_and_full_kv_budget(self):
+        md = self.dspark_metadata()
+        md['gguf_architecture'] = 'deepseek41'
+        g = auto.geometry(md, 'fp4', 0)
+        g.disk_prefill['streamed_mmq'] = True
+        g.gguf_expert_bytes = {i: MiB for i in range(g.layers)}
+        costs = ([GiB] * g.layers, [MiB] * g.layers, 0, 0, GiB, False)
+        gpu = {0: dict(total=64 * GiB, free=64 * GiB)}
+        ram = dict(total=128 * GiB, available=128 * GiB)
+        plans = []
+        with patch.dict(os.environ, {}, clear=True):
+            for batch in (1, 2, 4):
+                a = args(fast_prefill=True, tokens=batch * 1048576, max_context_length=1048576,
+                         max_batch=batch, chunked_prefill_size=4096, moe_device_layers=0)
+                p = auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram, allow_full_gpu=True)
+                plans.append(p)
+                self.assertEqual((p['max_batch'], p['context_tokens'], p['total_tokens']),
+                                 (batch, 1048576, batch * 1048576))
+                self.assertEqual(p['kv_logical_bytes_per_device'][0], batch * 1048576 * sum(g.kv))
+                self.assertEqual(p['resident_layers'], g.layers)
+            self.assertEqual(len({p['workspace_bytes_per_device'] for p in plans}), 1)
+            self.assertGreater(plans[-1]['gpu_estimated_bytes'][0], plans[0]['gpu_estimated_bytes'][0])
+            self.assertGreater(plans[-1]['kv_capacity_bytes_per_device'][0], plans[0]['kv_capacity_bytes_per_device'][0])
+
+    def test_v41_large_verify_batch_cannot_reuse_prefill_phase_budget(self):
+        md = self.dspark_metadata()
+        md['quantization_config'] = dict(quant_method='fp8', expert_dtype='fp4', weight_block_size=[32, 32])
+        g = auto.geometry(md, 'fp4', 0, 7)
+        g.gguf_expert_bytes = {i: MiB for i in range(len(g.kv))}
+        costs = ([GiB] * len(g.kv), [MiB] * len(g.kv), 0, 0, GiB, False)
+        a = args(fast_prefill=True, tokens=1048576, max_context_length=4096,
+                 max_batch=256, dspark=7, chunked_prefill_size=512, moe_device_layers=0)
+        gpu = {0: dict(total=64 * GiB, free=64 * GiB)}
+        ram = dict(total=128 * GiB, available=128 * GiB)
+        with patch.dict(os.environ, {}, clear=True):
+            fast = auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram, allow_full_gpu=True)
+            a.fast_prefill = False
+            plain = auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram, allow_full_gpu=True)
+            self.assertEqual(fast['workspace_bytes_per_device'], plain['workspace_bytes_per_device'])
+            self.assertGreater(fast['workspace_bytes_per_device'], GiB)
 
     def test_v41_reused_workspace_preserves_chunk_boundary_and_kv_reserve(self):
         md = self.dspark_metadata()
