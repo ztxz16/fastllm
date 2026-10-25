@@ -1451,6 +1451,9 @@ def make_normal_llm_model(args, startup_progress = None):
                     config = json.load(file)
             else:
                 config = gguf_config
+            if getattr(args, "mmproj", "") and config.get("gguf_architecture") == "deepseek41":
+                from .deepseek_v41_gguf import vision_config
+                config.update(vision_config(args.mmproj, config))
             architectures = config.get("architectures", [])
             architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")

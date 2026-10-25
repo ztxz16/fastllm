@@ -4248,6 +4248,9 @@ namespace fastllm {
             }
         }
 
+        if (!mmprojPath.empty() && arch == "deepseek_v41") {
+            AppendDeepSeekV41GGUFVision(model, params, mmprojPath, readGGUFTasks);
+        }
         // 3.0 更新模型信息
         model->InitParams();
         if (model->contextPlan.configured) {
@@ -4281,7 +4284,7 @@ namespace fastllm {
                 if (task.name.find(".engram.embed.") != std::string::npos)
                     model->ngramWeights.insert(task.name);
         }
-        if (!mmprojPath.empty()) {
+        if (!mmprojPath.empty() && arch != "deepseek_v41") {
             AssertInFastLLM(
                 model->model_struct == "qwen3_5",
                 "--mmproj currently supports Qwen3.5-family GGUF models only.");
@@ -4294,6 +4297,26 @@ namespace fastllm {
             for (auto &s : mmprojFileNames) {
                 printf("%s\n", s.c_str());
                 AppendGGUFTasks("qwen3_5_mmproj", s, readGGUFTasks);
+            }
+        }
+        if (!mmprojPath.empty() && arch == "deepseek_v41") {
+            std::set<std::string> backboneRouting;
+            for (const auto &task : readGGUFTasks)
+                if (task.fileName != mmprojPath && StringEndWith(task.name, ".ffn.gate.bias_vl"))
+                    backboneRouting.insert(task.name);
+            // A complete backbone already contains these tensors. Never enqueue
+            // two concurrent loads into the same weight when using an augmented projector.
+            readGGUFTasks.erase(std::remove_if(readGGUFTasks.begin(), readGGUFTasks.end(),
+                [&](const ReadGGUFTask &task) {
+                    return task.fileName == mmprojPath && backboneRouting.count(task.name);
+                }), readGGUFTasks.end());
+            std::set<std::string> names;
+            for (const auto &task : readGGUFTasks) names.insert(task.name);
+            for (int layer = 0; layer < ggufMainLayerCount; ++layer) {
+                const std::string name = "layers." + std::to_string(layer) + ".ffn.gate.bias_vl";
+                AssertInFastLLM(names.count(name),
+                    "DeepSeek V4.1 GGUF image input requires " + name +
+                    ". This text-only backbone needs an mmproj containing the original vision routing biases.");
             }
         }
         uint64_t totalLoadBytes = 0;

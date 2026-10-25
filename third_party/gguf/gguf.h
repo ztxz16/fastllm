@@ -2198,6 +2198,10 @@ namespace fastllm {
         }
     };
 
+    // Append validated vision weights and install parameters before InitParams.
+    void AppendDeepSeekV41GGUFVision(basellm *model, const json11::Json &target,
+                                    const std::string &path, std::vector<ReadGGUFTask> &tasks);
+
     void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
                                 GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType = GGUFWeightReplaceRule::GGUFWeightReplaceType::GGUFWeightReplaceDirect);
 

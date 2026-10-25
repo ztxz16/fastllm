@@ -1544,6 +1544,9 @@ class model:
                 if external_mtp_path and mmproj_path:
                     raise ValueError(
                         "external MTP and mmproj cannot be used together")
+                if mmproj_path and self.config.get("gguf_architecture") == "deepseek41":
+                    from .deepseek_v41_gguf import vision_config
+                    self.config.update(vision_config(mmproj_path, self.config))
                 if context_requested:
                     self.model = fastllm_lib.create_llm_model_from_gguf_with_context(
                         path.encode(), ori_model_path.encode(),

@@ -625,7 +625,11 @@ def _deepseek_v41_weight_sizes(tensors, args):
     for tensor in tensors:
         name = tensor.name
         if tensor.kind.startswith("gguf:"):
-            if name.endswith((".ffn_gate_inp.weight", ".attn_compressor_kv.weight",
+            if name.startswith("vision."):
+                # mmproj linears import as FP16, parameters as FP32. Quantized
+                # projector variants must reserve the converted allocation.
+                sizes[name] = max(tensor.bytes, math.prod(tensor.shape) * (2 if len(tensor.shape) > 1 else 4))
+            elif name.endswith((".ffn_gate_inp.weight", ".attn_compressor_kv.weight",
                               ".attn_compressor_gate.weight", ".engram_q.weight", ".engram_k.weight")):
                 sizes[name] = math.prod(tensor.shape) * 4
             continue
@@ -796,12 +800,16 @@ def weight_costs(tensors, model, args):
             # Text-only auto loads the idle vision tower on the host; it is
             # never replicated onto every decoder pipeline stage.
             host += size
+            if getattr(args, "mmproj", ""):
+                common += size
         elif layer is None:
             common += size
         else:
             dense[layer] += size
         if not is_table:
             largest = max(largest, size)
+    if model.family == "deepseek_v41" and getattr(args, "mmproj", ""):
+        common += 2 * GiB  # vision attention: 16 heads x 1024 queries x <=9216 keys
     if not any(expert) and model.family not in ("qwen3", "qwen35"):
         raise ValueError("Hybrid auto: no routed experts found")
     model.gguf_expert_bytes = {layer: math.ceil(size / model.experts)
@@ -1239,6 +1247,12 @@ def model_inputs(args):
         _, draft_tensors = inventory(draft)
         tensors += [Tensor(t.name if t.name.startswith("mtp.") else "mtp." + t.name,
                            t.shape, t.bytes, t.kind) for t in draft_tensors]
+    mmproj = getattr(args, "mmproj", "")
+    if mmproj and metadata.get("gguf_architecture") == "deepseek41":
+        from .deepseek_v41_gguf import vision_config
+        metadata.update(vision_config(mmproj, metadata))
+        _, vision_tensors = inventory(mmproj)
+        tensors += [Tensor("vision." + t.name, t.shape, t.bytes, t.kind) for t in vision_tensors]
     return metadata, tensors, model
 
 

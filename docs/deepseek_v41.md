@@ -530,6 +530,22 @@ DSML 块前的两个模板分隔换行不作为 assistant 正文返回，避免�
 迷你模型上精确命中与 T-1 截断命中后的贪心输出与不中断的原请求逐 bit 一致；800 token 提示词的
 首 token 延迟从 39–54 ms 降到 6 ms。
 
+## GGUF 视觉模块
+
+DeepSeek V4.1 GGUF 主模型可使用 `--mmproj /models/mmproj-BF16.gguf` 加载
+`clip` / `deepseek41v` 视觉模块。视觉配置和图像 token 从 GGUF 读取，无需 `--ori`；
+auto 另外计入转换后的视觉权重及工作区。
+
+```bash
+ftllm server /models/DeepSeek-V4.1-Flash-1017-IQ2_XXS-00001-of-00004.gguf \
+  --auto --mmproj /models/mmproj-BF16.gguf
+```
+
+图像输入还要求主干每层的 `ffn.gate.bias_vl`。部分 GSQ 纯文本导出省略了这些偏置，
+此时需要把**同一原始模型版本**的视觉路由偏置放入 mmproj（GGUF 名称为
+`blk.N.exp_probs_b_vl.bias`）。加载器会在读取大权重之前检查缺失项，不能以文本偏置替代；
+主干已有的偏置不会被 mmproj 重复加载。
+
 ## DSpark 投机解码
 
 `config.json` 的 `text_config` 里 `dspark_block_size > 0` 且 checkpoint 带 `mtp.*` 权重时可以开启。

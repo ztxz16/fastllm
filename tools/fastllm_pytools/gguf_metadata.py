@@ -230,6 +230,11 @@ def _get_gguf_model_config_cached(path, _file_size, _mtime_ns):
         keys.update("deepseek41.rope.scaling." + name for name in
                     ("type", "factor", "original_context_length", "yarn_beta_fast", "yarn_beta_slow"))
         config.update(deepseek_v41_config(read_gguf_metadata(path, keys)))
+        tokens = read_gguf_metadata(path, {"tokenizer.ggml.tokens"}).get("tokenizer.ggml.tokens", [])
+        if tokens:
+            config["vocab_size"] = len(tokens)
+            if "<｜deepseek_image｜>" in tokens:
+                config["image_token_id"] = tokens.index("<｜deepseek_image｜>")
     generation_config = {
         target: metadata[source]
         for source, target in sampling_keys.items()

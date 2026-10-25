@@ -33,6 +33,7 @@ namespace fastllm {
         add(R"(blk\.(\d+)\.indexer\.k_norm\.weight)", layer + "attn.indexer.k_norm.weight");
         add(R"(blk\.(\d+)\.ffn_gate_inp\.weight)", layer + "ffn.gate.weight", Rule::GGUFWeightReplaceForceFP32);
         add(R"(blk\.(\d+)\.exp_probs_b\.bias)", layer + "ffn.gate.bias");
+        add(R"(blk\.(\d+)\.exp_probs_b_vl\.bias)", layer + "ffn.gate.bias_vl", Rule::GGUFWeightReplaceForceFP32);
         for (const auto &projection : std::vector<std::pair<std::string, std::string>>{
                  {"gate", "w1"}, {"up", "w3"}, {"down", "w2"}}) {
             add(R"(blk\.(\d+)\.ffn_)" + projection.first + R"(_shexp\.weight)",
@@ -42,6 +43,123 @@ namespace fastllm {
                 Rule::GGUFWeightReplacePacked);
         }
         return rules;
+    }
+
+    static std::vector<GGUFWeightReplaceRule> DeepSeekV41VisionGGUFWeightRules() {
+        using Rule = GGUFWeightReplaceRule;
+        std::vector<Rule> rules;
+        auto add = [&](const std::string &pattern, const std::string &name,
+                       Rule::GGUFWeightReplaceType type = Rule::GGUFWeightReplaceForceFP16) {
+            rules.emplace_back(std::regex("^" + pattern + "$"), name, type);
+        };
+        const std::string block = "vision.blocks.$1.";
+        add(R"(mm\.([12])\.weight)", "aligner.w$1.weight");
+        add(R"(mm\.([12])\.bias)", "aligner.w$1.bias", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(v\.blk\.(\d+)\.attn_qkv\.weight)", block + "attn.wqkv.weight");
+        add(R"(v\.blk\.(\d+)\.attn_qkv\.bias)", block + "attn.wqkv.bias", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(v\.blk\.(\d+)\.attn_out\.weight)", block + "attn.wo.weight");
+        add(R"(v\.blk\.(\d+)\.attn_out\.bias)", block + "attn.wo.bias", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(v\.blk\.(\d+)\.ffn_(gate|up)\.weight)", block + "mlp.$2.weight");
+        add(R"(v\.blk\.(\d+)\.ffn_down\.weight)", block + "mlp.w2.weight");
+        add(R"(v\.blk\.(\d+)\.ln([12])\.weight)", block + "norm$2.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(v\.post_ln\.weight)", "vision.norm.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(v\.patch_embd\.weight)", "vision.patch_embed.proj.weight");
+        add(R"(v\.patch_embd\.bias)", "vision.patch_embed.proj.bias", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(v\.token_embd\.img_(start|end))", "image_$1", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(v\.image_newline)", "image_newline", Rule::GGUFWeightReplaceForceFP32);
+        // Text-only backbone exports may omit these small image-routing biases.
+        add(R"(blk\.(\d+)\.exp_probs_b_vl\.bias)", "layers.$1.ffn.gate.bias_vl", Rule::GGUFWeightReplaceForceFP32);
+        return rules;
+    }
+
+    void AppendDeepSeekV41GGUFVision(basellm *model, const json11::Json &target,
+                                 const std::string &path,
+                                 std::vector<ReadGGUFTask> &tasks) {
+        json11::Json document;
+        ReadGGUFMetaData(path, document);
+        const auto &meta = document["params"];
+        const auto require = [](bool ok, const std::string &message) {
+            AssertInFastLLM(ok, "DeepSeek V4.1 GGUF add-on: " + message);
+        };
+        const auto add = [&](const std::string &key, const json11::Json &value) {
+            require(!value.is_null(), "missing parameter " + key);
+            model->weight.AddDict(key, value.is_string() ? value.string_value() : value.dump());
+        };
+        require(target["general.architecture"].string_value() == "deepseek41",
+                "requires a DeepSeek V4.1 GGUF target");
+        std::vector<ReadGGUFTask> auxiliary;
+        require(meta["general.architecture"].string_value() == "clip" &&
+                meta["clip.projector_type"].string_value() == "deepseek41v" &&
+                meta["clip.vision.projection_dim"] == target["deepseek41.embedding_length"],
+                "incompatible vision architecture/projection dimension");
+        if (!meta["deepseek41.vision.source"].is_null())
+            require(meta["deepseek41.vision.source"] == target["deepseek41.engram.source"],
+                    "vision routing source does not match the backbone");
+        for (const auto &pair : std::vector<std::pair<std::string, std::string>>{
+                 {"hidden_size", "embedding_length"}, {"num_hidden_layers", "block_count"},
+                 {"intermediate_size", "feed_forward_length"}, {"num_attention_heads", "attention.head_count"},
+                 {"patch_size", "patch_size"}, {"downsample_ratio", "projector.scale_factor"}})
+            add("vision_config." + pair.first, meta["clip.vision." + pair.second]);
+        const auto &tokens = target["tokenizer.ggml.tokens"].array_items();
+        int imageToken = -1;
+        for (int i = 0; i < (int)tokens.size(); ++i)
+            if (tokens[i].string_value() == "<｜deepseek_image｜>") imageToken = i;
+        require(imageToken >= 0, "target tokenizer has no image token");
+        add("image_token_id", imageToken);
+        const int layers = meta["clip.vision.block_count"].int_value();
+        require(layers > 0, "empty vision encoder");
+        AppendGGUFTasks("deepseek_v41_mmproj", path, auxiliary);
+        for (int i = 0; i < layers; ++i) {
+            const std::string p = "vision.blocks." + std::to_string(i) + ".mlp.";
+            model->weightMergeRules.push_back(WeightMergeRule({
+                WeightMergeRuleSingle({p + "gate.weight", p + "up.weight"}, p + "w1.weight", "linearSwiglu")}));
+        }
+        std::map<std::string, std::vector<int>> shapes;
+        for (auto &task : auxiliary) {
+            if (task.name == "vision.patch_embed.proj.weight") {
+                auto &t = task.tensor;
+                require(t.dims.size() == 4 && t.dims[1] == 3, "invalid patch convolution");
+                t.dims = {t.dims[0], t.dims[1] * t.dims[2] * t.dims[3]};
+                t.ne[0] = t.dims[1]; t.ne[1] = t.dims[0]; t.ne[2] = t.ne[3] = 1;
+                t.nb[1] = t.nb[0] * t.ne[0]; t.nb[2] = t.nb[3] = t.nb[1] * t.ne[1];
+            }
+            require(shapes.emplace(task.name, task.tensor.dims).second, "duplicate auxiliary tensor " + task.name);
+        }
+        const auto shape = [&](const std::string &name, const std::vector<int> &expected) {
+            auto found = shapes.find(name);
+            require(found != shapes.end() && found->second == expected, "missing/invalid tensor " + name);
+        };
+        const int hidden = target["deepseek41.embedding_length"].int_value();
+        const int dim = meta["clip.vision.embedding_length"].int_value();
+        const int inter = meta["clip.vision.feed_forward_length"].int_value();
+        const int patch = meta["clip.vision.patch_size"].int_value();
+        const int scale = meta["clip.vision.projector.scale_factor"].int_value();
+        require(dim > 0 && inter > 0 && patch > 0 && scale > 0, "invalid vision dimensions");
+        shape("vision.patch_embed.proj.weight", {dim, 3 * patch * patch});
+        shape("vision.patch_embed.proj.bias", {dim});
+        shape("vision.norm.weight", {dim});
+        shape("aligner.w1.weight", {hidden, dim * scale * scale});
+        shape("aligner.w2.weight", {hidden, hidden});
+        for (const auto &name : {"aligner.w1.bias", "aligner.w2.bias", "image_start", "image_end", "image_newline"})
+            shape(name, {hidden});
+        for (int i = 0; i < layers; ++i) {
+            const std::string p = "vision.blocks." + std::to_string(i);
+            shape(p + ".attn.wqkv.weight", {3 * dim, dim});
+            shape(p + ".attn.wqkv.bias", {3 * dim});
+            shape(p + ".attn.wo.weight", {dim, dim});
+            shape(p + ".attn.wo.bias", {dim});
+            shape(p + ".norm1.weight", {dim}); shape(p + ".norm2.weight", {dim});
+            shape(p + ".mlp.gate.weight", {inter, dim}); shape(p + ".mlp.up.weight", {inter, dim});
+            shape(p + ".mlp.w2.weight", {dim, inter});
+        }
+        for (const auto &item : shapes)
+            if (item.first.compare(0, 7, "layers.") == 0)
+                require(item.second == std::vector<int>{target["deepseek41.expert_count"].int_value()},
+                        "invalid image routing bias " + item.first);
+        require(!auxiliary.empty(), "no auxiliary tensors");
+        tasks.insert(tasks.end(), auxiliary.begin(), auxiliary.end());
+        printf("[Fastllm] DeepSeek V4.1: external vision GGUF %s (%zu mapped tensors)\n",
+               path.c_str(), auxiliary.size());
     }
 
     static std::vector<GGUFWeightReplaceRule> Glm5NextGGUFWeightRules() {
@@ -154,6 +272,7 @@ namespace fastllm {
     std::vector <GGUFWeightReplaceRule> GetGGUFWeightReplaceRules(const std::string &arch) {
         static std::map <std::string, std::vector <GGUFWeightReplaceRule> > originalArchRulesDict = {
             {"deepseek_v41", DeepSeekV41GGUFWeightRules()},
+            {"deepseek_v41_mmproj", DeepSeekV41VisionGGUFWeightRules()},
             {"glm5_next", Glm5NextGGUFWeightRules()},
             {"qwen4_exp", Qwen4GGUFWeightRules()},
             {
