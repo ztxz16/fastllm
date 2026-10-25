@@ -19,14 +19,18 @@ function renderDownloadValidation(errors) {
 
 function renderDownloadCatalog() {
   const selected = elements.downloadPreset.value;
+  const expanded = new Set([...elements.downloadCatalog.querySelectorAll("details[open]")]
+    .map((group) => group.dataset.group));
   elements.downloadPreset.replaceChildren();
   elements.downloadCatalog.replaceChildren();
   for (const group of state.downloadCatalog) {
     const optgroup = document.createElement("optgroup");
     optgroup.label = localizeServerText(group.label || group.id || t("Models"));
-    const section = document.createElement("section");
+    const section = document.createElement("details");
+    section.dataset.group = group.id;
+    section.open = expanded.has(group.id);
     section.className = `download-catalog-group accent-${group.accent || "slate"}`;
-    const heading = document.createElement("div");
+    const heading = document.createElement("summary");
     heading.className = "download-catalog-heading";
     const title = document.createElement("div");
     const eyebrow = document.createElement("span");
