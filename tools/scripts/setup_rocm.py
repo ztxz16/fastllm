@@ -11,7 +11,7 @@ all_require = server_require + download_require + video_require + pptx_require +
 
 setup (
     name = "ftllm_rocm",
-    version = "0.1.8.2",
+    version = "1.9.0",
     author = "huangyuyang",
     author_email = "ztxz16@foxmail.com",
     description = "High-performance C++ inference engine for dense and MoE language models",
