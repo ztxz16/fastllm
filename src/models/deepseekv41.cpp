@@ -3044,6 +3044,7 @@ namespace fastllm {
     void DeepSeekV41Model::OnModelWeightsLoaded() {
         if (V41HasKey(this->weight, "gguf_architecture")) LoadEngramMeta();
         v41TargetHeadWeights.reset();
+        v41DsparkAttentionWeights.clear();
         if (engram_layer_ids.empty()) {
             return;
         }

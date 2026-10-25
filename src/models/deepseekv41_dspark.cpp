@@ -45,6 +45,7 @@
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-dspark.h"
+#include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-v41-decode.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
@@ -69,7 +70,7 @@ namespace fastllm {
     // created while capturing are owned by the graph allocator until teardown.
     struct DeepSeekV41DsparkWorkspace {
         int block = 0, width = 0;
-        bool disabled = false, parallelExperts = true, deviceInputs = false;
+        bool disabled = false, parallelExperts = true, deviceInputs = false, parallelAttention = false;
         std::vector<int> devices;
         std::vector<void*> cachePointers;
         Data input, preMix, indices, position, headHidden, normalized, logits;
@@ -84,6 +85,7 @@ namespace fastllm {
         // Resolve immutable packed weights during warmup and keep them alive
         // until ClearGraphs has destroyed every graph referencing them.
         std::map<int, Data> packedQkvWeights;
+        std::map<int, std::shared_ptr<void>> attentionTp;
 #ifdef USE_CUDA
         std::vector<void*> graphs, execs, starts, ends, reserved;
         void ClearGraphs() {
@@ -113,10 +115,15 @@ namespace fastllm {
         bool DsRunDraftGraph(DeepSeekV41DsparkWorkspace &state, const std::function<void()> &body) {
             const int root = state.devices.front();
             auto launch = [&]() {
-                for (size_t i = 0; i < state.devices.size(); ++i) {
-                    FastllmCudaSetDevice(state.devices[i]);
-                    AssertInFastLLM(FastllmCudaGraphLaunch(state.execs[i]),
+                if (state.parallelAttention) {
+                    AssertInFastLLM(MultiCudaLaunchGraphs(state.devices, state.execs),
                                     "DeepSeekV41 DSpark graph launch failed.");
+                } else {
+                    for (size_t i = 0; i < state.devices.size(); ++i) {
+                        FastllmCudaSetDevice(state.devices[i]);
+                        AssertInFastLLM(FastllmCudaGraphLaunch(state.execs[i]),
+                                        "DeepSeekV41 DSpark graph launch failed.");
+                    }
                 }
                 FastllmCudaSetDevice(root);
             };
@@ -347,6 +354,225 @@ namespace fastllm {
             int betaFast;
             int betaSlow;
         };
+
+#ifdef USE_CUDA
+        struct DsAttentionTpWeights {
+            Data wq, woA, woB;
+            std::vector<int> devices;
+        };
+
+        struct DsAttentionTpWorkspace {
+            struct Rank {
+                Data packet, query, table, attention, woA, partial, floatSum, sink;
+            };
+            std::shared_ptr<DsAttentionTpWeights> weights;
+            std::vector<std::unique_ptr<Rank>> ranks;
+            std::vector<std::vector<int>> inputShapes;
+            std::vector<int> devices;
+            std::vector<size_t> offsets;
+            int bytes = 0;
+            bool ready = false;
+        };
+
+        bool DsParallelAttention(const std::vector<int> &devices, Data &queryInput, Data &kv,
+                                 const Data &window, Data &indices, Data &position, Data &wq, Data &woA,
+                                 Data &woB, Data &sink, int heads, int groups, int oRank,
+                                 const DsRopeParams &rope, int startPos, float scale,
+                                 std::shared_ptr<void> &weightCache, std::shared_ptr<void> &cache,
+                                 Data &output) {
+            const int count = (int)devices.size();
+            if (count < 2 || groups <= 0 || groups % count || heads <= 0 || heads % groups || oRank <= 0 ||
+                heads / count > 128 || rope.ropeDim < 2 || rope.ropeDim > 128 || rope.ropeDim % 2 ||
+                queryInput.dataType != DataType::BFLOAT16 || queryInput.dims.size() != 3 ||
+                queryInput.dims[0] != 1 || queryInput.dims[1] < 2 || queryInput.dims[1] > 8 ||
+                kv.dataType != DataType::BFLOAT16 || window.dataType != DataType::BFLOAT16 ||
+                indices.dataType != DataType::INT32 || position.dataType != DataType::INT32 ||
+                wq.dataType != DataType::FP8_E4M3 || woB.dataType != DataType::FP8_E4M3 ||
+                woA.dataType != DataType::BFLOAT16 || sink.dataType != DataType::FLOAT32 ||
+                wq.multiDeviceData || woA.multiDeviceData || woB.multiDeviceData || sink.multiDeviceData ||
+                wq.dims.size() != 2 || woA.dims.size() != 2 || woB.dims.size() != 2 ||
+                kv.dims != std::vector<int>({1, queryInput.dims[1], 512}) || window.dims.size() != 3 ||
+                window.dims[0] != 1 || window.dims[1] < 1 || window.dims[1] > 1024 || window.dims[2] != 512 ||
+                indices.dims.size() != 3 || indices.dims[0] != 1 || indices.dims[1] != queryInput.dims[1] ||
+                wq.dims != std::vector<int>({heads * 512, queryInput.dims[2]}) ||
+                woA.dims != std::vector<int>({groups * oRank, heads / groups * 512}) ||
+                woB.dims[1] != groups * oRank || sink.Count(0) != (uint64_t)heads || position.Count(0) < 1 ||
+                DsEnvFlag("FASTLLM_DSV41_REFERENCE_MATH") || DsEnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") ||
+                DsEnvFlag("FASTLLM_DISABLE_NCCL"))
+                return false;
+            // Warmup copies raw checkpoint storage; unsupported/lazy layouts
+            // must fall back before any weight or activation is changed.
+            for (const Data *x : {&wq, &woA, &woB, &sink}) {
+                if (x->dataDevice == DataDevice::CPU ? !x->cpuData
+                                                     : x->dataDevice != DataDevice::CUDA || !x->cudaData)
+                    return false;
+            }
+            const Data *sources[] = {&queryInput, &kv, &window, &indices, &position};
+            for (const Data *x : sources) {
+                if (x->dataDevice != DataDevice::CUDA || !x->cudaData || x->multiDeviceData ||
+                    x->dataDeviceIds != std::vector<int>{devices.front()} ||
+                    x->strides.size() != x->dims.size())
+                    return false;
+                uint64_t stride = 1;
+                for (int axis = (int)x->dims.size() - 1; axis >= 0; --axis) {
+                    if (x->strides[axis] != stride) return false;
+                    stride *= x->dims[axis];
+                }
+            }
+            const int rows = queryInput.dims[1], inner = queryInput.dims[2];
+            const int localHeads = heads / count, localGroups = groups / count;
+            if (!FastllmCudaCanUseMarlinBFloat16FP8(wq, rows, inner, heads * 512) ||
+                !FastllmCudaCanUseMarlinBFloat16FP8(woB, rows, groups * oRank, woB.dims[0]) ||
+                (localGroups * oRank) % 64)
+                return false;
+            auto alloc = [](Data &x, DataType type, const std::vector<int> &dims, int device) {
+                x.dataType = type;
+                x.UpdateUnitSize();
+                x.Resize(dims);
+                x.ToDevice(DataDevice::CUDA, {device}, false);
+                x.Allocate();
+            };
+            if (!cache) {
+                if (FastllmCudaGraphIsCapturingFast()) return false;
+                auto w = std::make_shared<DsAttentionTpWorkspace>();
+                cache = w;
+                w->devices = devices;
+                auto weights = std::static_pointer_cast<DsAttentionTpWeights>(weightCache);
+                if (weights && weights->devices != devices) weights.reset();
+                if (!weights) {
+                    weights = std::make_shared<DsAttentionTpWeights>();
+                    weights->devices = devices;
+                    std::vector<int> mutableDevices = devices;
+                    auto split = [&](Data &source, Data &target, int axis) {
+                        target.CopyFrom(source);
+                        // Split owns its source buffer; stage the immutable clone before peer copies.
+                        target.ToDevice(DataDevice::CPU);
+                        target.blockM = source.blockM;
+                        target.blockK = source.blockK;
+                        target.scales = source.scales;
+                        target.isModelWeight = true;
+                        DivisionScheme ranges;
+                        const int width = source.dims[axis] / count;
+                        for (int i = 0; i < count; ++i)
+                            ranges[devices[i]].push_back({i * width, (i + 1) * width});
+                        Data bias;
+                        return SplitMultiCudaWeight(target, bias, mutableDevices, ranges, axis, true);
+                    };
+                    if (!FastllmInitNccl(devices) || !split(wq, weights->wq, 0) ||
+                        !split(woA, weights->woA, 0) || !split(woB, weights->woB, 1))
+                        return false;
+                    weightCache = weights;
+                }
+                w->weights = std::move(weights);
+                w->inputShapes = {queryInput.dims, kv.dims, window.dims, indices.dims, position.dims};
+                size_t bytes = 0;
+                for (size_t size : {queryInput.GetBytes(), kv.GetBytes(), window.GetBytes(),
+                                    indices.GetBytes(), sizeof(int32_t)}) {
+                    w->offsets.push_back(bytes);
+                    bytes = (bytes + size + 255) & ~size_t(255);
+                }
+                if (bytes > size_t(std::numeric_limits<int>::max())) return false;
+                w->bytes = (int)bytes;
+                sink.ToDevice(DataDevice::CUDA, {devices.front()}, true);
+                bool supported = true;
+                for (int i = 0; i < count; ++i) {
+                    const int device = devices[i];
+                    FastllmCudaSetDevice(device);
+                    auto r = std::make_unique<DsAttentionTpWorkspace::Rank>();
+                    alloc(r->packet, DataType::INT8, {w->bytes}, device);
+                    alloc(r->query, DataType::BFLOAT16, {1, rows, localHeads, 512}, device);
+                    alloc(r->partial, DataType::BFLOAT16, {1, rows, woB.dims[0]}, device);
+                    alloc(r->floatSum, DataType::FLOAT32, r->partial.dims, device);
+                    alloc(r->sink, DataType::FLOAT32, {localHeads}, device);
+                    FastllmCudaMemcpyBetweenDevices(device, r->sink.cudaData, devices.front(),
+                                                    (char *)sink.cudaData + i * localHeads * sizeof(float),
+                                                    localHeads * sizeof(float));
+                    supported =
+                        supported &&
+                        FastllmCudaCanUseMarlinBFloat16FP8(*w->weights->wq.multiDeviceDatas.at(device), rows,
+                                                           inner, localHeads * 512) &&
+                        FastllmCudaCanUseMarlinBFloat16FP8(*w->weights->woB.multiDeviceDatas.at(device), rows,
+                                                           localGroups * oRank, woB.dims[0]);
+                    w->ranks.push_back(std::move(r));
+                }
+                FastllmCudaSetDevice(devices.front());
+                w->ready = supported;
+            }
+            auto &w = *std::static_pointer_cast<DsAttentionTpWorkspace>(cache);
+            if (!w.ready || w.devices != devices ||
+                w.inputShapes != std::vector<std::vector<int>>{queryInput.dims, kv.dims, window.dims,
+                                                               indices.dims, position.dims})
+                return false;
+            FastllmCudaSetDevice(devices.front());
+            for (int i = 0; i < 5; ++i)
+                FastllmCudaCopyFromDeviceToDevice((char *)w.ranks[0]->packet.cudaData + w.offsets[i],
+                                                  sources[i]->cudaData,
+                                                  i == 4 ? sizeof(int32_t) : sources[i]->GetBytes());
+            struct DispatchScope {
+                bool async = MultiCudaSetPersistentAsyncDispatch(true);
+                bool ordered = MultiCudaSetWorkerOrderedCapture(false);
+                ~DispatchScope() {
+                    MultiCudaSetWorkerOrderedCapture(ordered);
+                    MultiCudaSetPersistentAsyncDispatch(async);
+                }
+            } scope;
+            const bool dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                auto &r = *w.ranks[rank];
+                FastllmNcclBroadcast(r.packet.cudaData, w.bytes, DataType::INT8, devices.front(), device);
+                // Non-owning stack views only describe the packed inputs. Wq_b
+                // consumes its raw pointer directly; no temporary heap owners.
+                auto data = [&](int i) { return (char *)r.packet.cudaData + w.offsets[i]; };
+                Data localKv(DataType::BFLOAT16, kv.dims, DataDevice::CUDA, data(1));
+                Data localWindow(DataType::BFLOAT16, window.dims, DataDevice::CUDA, data(2));
+                Data localIndices(DataType::INT32, indices.dims, DataDevice::CUDA, data(3));
+                for (Data *view : {&localKv, &localWindow, &localIndices})
+                    view->dataDeviceIds = {device};
+                const int *pos = (const int *)((char *)r.packet.cudaData + w.offsets[4]);
+                AssertInFastLLM(FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(
+                                    data(0), *w.weights->wq.multiDeviceDatas.at(device), r.query.cudaData,
+                                    rows, inner, localHeads * 512),
+                                "Draft TP Wq_b failed.");
+                AssertInFastLLM(FastllmCudaDeepSeekV41DraftRotaryTable(
+                                    r.query, localKv, localWindow, rope.ropeDim, rope.base, startPos,
+                                    rope.originalSeqLen, rope.factor, rope.betaFast, rope.betaSlow, pos,
+                                    r.table),
+                                "Draft TP rotary failed.");
+                AssertInFastLLM(FastllmCudaDeepSeekV41SparseAttention(r.query, localKv, nullptr, &r.table,
+                                                                      &localIndices, r.sink, 1, 0, scale,
+                                                                      r.attention),
+                                "Draft TP attention failed.");
+                AssertInFastLLM(
+                    FastllmCudaDeepSeekV41RotaryQuantPosition(r.attention, rope.ropeDim, rope.base, startPos,
+                                                              1, true, rope.originalSeqLen, rope.factor,
+                                                              rope.betaFast, rope.betaSlow, 0, 512, 32, pos),
+                    "Draft TP inverse rotary failed.");
+                AssertInFastLLM(FastllmCudaDeepSeekV4WoA(r.attention,
+                                                         *w.weights->woA.multiDeviceDatas.at(device),
+                                                         localGroups, oRank, r.woA),
+                                "Draft TP WoA failed.");
+                AssertInFastLLM(FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(
+                                    r.woA.cudaData, *w.weights->woB.multiDeviceDatas.at(device),
+                                    r.partial.cudaData, rows, localGroups * oRank, woB.dims[0]),
+                                "Draft TP Wo_b failed.");
+                const int elements = rows * woB.dims[0];
+                // Match row-parallel BF16 output: local GEMM rounds once,
+                // reduction accumulates in FP32, then rounds its final sum.
+                if (!FastllmCudaCustomAllReduce(r.partial.cudaData, r.partial.cudaData, elements,
+                                                DataType::BFLOAT16, device)) {
+                    AssertInFastLLM(FastllmBF16ToFloat(r.partial.cudaData, r.floatSum.cudaData, elements),
+                                    "Draft TP cast failed.");
+                    FastllmNcclAllReduceNoCustom(r.floatSum.cudaData, r.floatSum.cudaData, elements,
+                                                 DataType::FLOAT32, device);
+                    AssertInFastLLM(FastllmFloatToBF16(r.floatSum.cudaData, r.partial.cudaData, elements),
+                                    "Draft TP cast failed.");
+                }
+            });
+            AssertInFastLLM(dispatched && !FastllmCudaGetThreadError(), "Draft TP dispatch failed.");
+            FastllmCudaSetDevice(devices.front());
+            output.CopyFrom(w.ranks[0]->partial);
+            return true;
+        }
+#endif
 
         void DsRotaryQuant(Data &x, const DsRopeParams &rope, int startPos, int posStep,
                            bool inverse, int quantMode, int quantBlock, int quantDim = -1,
@@ -2099,34 +2325,49 @@ namespace fastllm {
                     LinearWithActivationQuant(attnInput, pre + ".attn.wq_a.weight", qr);
                     DsRMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
                 }
-                LinearWithActivationQuant(qkvPrepared ? qQuant : qNorm, pre + ".attn.wq_b.weight", q,
-                                          false, nullptr, qkvPrepared);
-                q.Reshape({1, block, num_attention_heads, headDim});
-                if (!qkvPrepared) {
-                    LinearWithActivationQuant(attnInput, pre + ".attn.wkv.weight", kv);
-                    DsRMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
-                }
-                kv.Reshape({1, block, headDim});
-                bool rotaryPrepared = false;
+                bool parallelAttention = false;
 #ifdef USE_CUDA
-                rotaryPrepared = FastllmCudaDeepSeekV41DraftRotaryTable(
-                    q, kv, dspark.layers[stage].windowKV, windowRope.ropeDim, windowRope.base, startPos,
-                    windowRope.originalSeqLen, windowRope.factor, windowRope.betaFast,
-                    windowRope.betaSlow, devicePosition, table);
-#endif
-                if (!rotaryPrepared) {
-                    DsRotaryQuant(q, windowRope, startPos, 1, false, 0, 32, -1, devicePosition);
-                    DsRotaryQuant(kv, windowRope, startPos, 1, false, 1, 32, -1, devicePosition);
-                    Cat(dspark.layers[stage].windowKV, kv, 1, table);
+                if (graphState && qkvPrepared && graphState->deviceInputs) {
+                    parallelAttention = DsParallelAttention(
+                        graphState->devices, qQuant, kv, dspark.layers[stage].windowKV, attentionIndices,
+                        graphState->position, weight[pre + ".attn.wq_b.weight"],
+                        weight[pre + ".attn.wo_a.weight"], weight[pre + ".attn.wo_b.weight"],
+                        weight[pre + ".attn.attn_sink"], num_attention_heads, o_groups, o_lora_rank,
+                        windowRope, startPos, softmaxScale, v41DsparkAttentionWeights[stage],
+                        graphState->attentionTp[stage], attnProj);
+                    graphState->parallelAttention |= parallelAttention;
                 }
-                AssertInFastLLM(table.dims.size() == 3 && table.dims[1] == tableRows,
-                                "DeepSeekV41 DSpark: draft attention gather table has a wrong size.");
-                DsSparseAttention(q, kv, nullptr, &table, &attentionIndices,
-                                  weight[pre + ".attn.attn_sink"], 1, 0, softmaxScale, attnOut);
-                DsRotaryQuant(attnOut, windowRope, startPos, 1, true, 0, 32, -1, devicePosition);
+#endif
+                if (!parallelAttention) {
+                    LinearWithActivationQuant(qkvPrepared ? qQuant : qNorm, pre + ".attn.wq_b.weight", q,
+                                              false, nullptr, qkvPrepared);
+                    q.Reshape({1, block, num_attention_heads, headDim});
+                    if (!qkvPrepared) {
+                        LinearWithActivationQuant(attnInput, pre + ".attn.wkv.weight", kv);
+                        DsRMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
+                    }
+                    kv.Reshape({1, block, headDim});
+                    bool rotaryPrepared = false;
+#ifdef USE_CUDA
+                    rotaryPrepared = FastllmCudaDeepSeekV41DraftRotaryTable(
+                        q, kv, dspark.layers[stage].windowKV, windowRope.ropeDim, windowRope.base, startPos,
+                        windowRope.originalSeqLen, windowRope.factor, windowRope.betaFast,
+                        windowRope.betaSlow, devicePosition, table);
+#endif
+                    if (!rotaryPrepared) {
+                        DsRotaryQuant(q, windowRope, startPos, 1, false, 0, 32, -1, devicePosition);
+                        DsRotaryQuant(kv, windowRope, startPos, 1, false, 1, 32, -1, devicePosition);
+                        Cat(dspark.layers[stage].windowKV, kv, 1, table);
+                    }
+                    AssertInFastLLM(table.dims.size() == 3 && table.dims[1] == tableRows,
+                                    "DeepSeekV41 DSpark: draft attention gather table has a wrong size.");
+                    DsSparseAttention(q, kv, nullptr, &table, &attentionIndices,
+                                      weight[pre + ".attn.attn_sink"], 1, 0, softmaxScale, attnOut);
+                    DsRotaryQuant(attnOut, windowRope, startPos, 1, true, 0, 32, -1, devicePosition);
 
-                DeepSeekV4WoA(attnOut, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
-                LinearWithActivationQuant(woAOut, pre + ".attn.wo_b.weight", attnProj);
+                    DeepSeekV4WoA(attnOut, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
+                    LinearWithActivationQuant(woAOut, pre + ".attn.wo_b.weight", attnProj);
+                }
                 bool fusedPost = false;
 #ifdef USE_CUDA
                 fusedPost = DsHcPostMixPreNorm(attnProj, *curHidden, attnPre, attnPost, attnComb,

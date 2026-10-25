@@ -573,6 +573,8 @@ namespace fastllm {
         // Exact BF16 copies of immutable target-head vocabulary shards. Keep
         // FP32 accumulation/logits and the original FP32 fallback checkpoint.
         std::shared_ptr<void> v41TargetHeadWeights;
+        // Immutable draft attention shards are shared by request graphs.
+        std::map<int, std::shared_ptr<void>> v41DsparkAttentionWeights;
         bool TryBFloat16HeadLinear(Data &input, Data &output);
     };
 }
