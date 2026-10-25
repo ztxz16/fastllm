@@ -22,6 +22,6 @@ bool FastllmCudaGGUFLinearAddPermuted(const fastllm::Data &input, fastllm::Data 
 bool FastllmCudaGGUFExtendedFromQ8(const void *input, const void *weight, void *output, int type, int rows,
                                    int columns, int outputRows, int storeMode, void *stream);
 
-// One-token grouped Q5_K WoA, with exactly the ordinary GEMV reduction order.
+// Small-batch grouped Q5_K WoA, with the ordinary four-warp GEMV reduction order.
 bool FastllmCudaGGUFGroupedGemv(const fastllm::Data &input, fastllm::Data &weight,
                               int groups, int rows, fastllm::Data &output);

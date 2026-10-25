@@ -5039,10 +5039,19 @@ namespace fastllm {
                 localGroups[device] = count;
             }
             Data emptyBias;
+            // GGUF stores WoA as [groups, rank, columns]. The generic TP
+            // splitter takes a matrix: flatten the two output axes before
+            // splitting, otherwise it copies rank columns instead of columns.
+            if (weight.dataType == DATA_GGUF_FORMAT && weight.dims.size() == 3) {
+                AssertInFastLLM(!weight.multiDeviceData &&
+                    weight.dims == std::vector<int>({groups, oRank, headsPerGroup * input.dims[3]}),
+                    "DeepSeekV4WoA MultiCuda got invalid GGUF group dimensions.\n");
+                weight.Resize({groups * oRank, headsPerGroup * input.dims[3]});
+            }
             AssertInFastLLM(SplitMultiCudaWeight(weight, emptyBias, devices, weightScheme, 0),
                             "DeepSeekV4WoA MultiCuda failed to split wo_a.\n");
             std::vector<int> outputDims = {input.dims[0], input.dims[1], groups * oRank};
-            output.dataType = DataType::BFLOAT16;
+            output.dataType = weight.dataType == DATA_GGUF_FORMAT ? input.dataType : DataType::BFLOAT16;
             PrepareV41ShardedOutput(output, devices, outputDims, 2, outputScheme);
 
             std::vector<MultiThreadBaseOp*> ops;

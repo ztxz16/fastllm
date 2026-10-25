@@ -11,4 +11,4 @@ void mul_mat_vec_q_cuda(
 
 void FastllmGgufQ5KGroupedGemv(const void *weights, const void *input,
         void *output, fastllm::DataType dtype, int groups, int columns, int rows,
-        int padded, cudaStream_t stream);
+        int padded, int tokens, cudaStream_t stream);
