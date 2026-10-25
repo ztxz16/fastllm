@@ -4572,9 +4572,17 @@ template<int splits, bool MATERIALIZED = true>
 static bool V41SparseAttentionBatchImpl(
         const std::vector<FastllmCudaV41AttentionRequest> &requests,
         fastllm::Data &attnSink, int windowSize, float softmaxScale) {
+    const int device = FastllmCudaGetDevice();
+    auto local = [device](const Data &d) {
+        return V41OnCuda(d) && !d.multiDeviceData &&
+               d.dataDeviceIds.size() == 1 && d.dataDeviceIds[0] == device;
+    };
+    // PP shares compressed KV across layers on different devices. Unlike
+    // the executor fallback, this direct entry does not migrate its inputs.
+    // Reject remote buffers before submitting descriptors, even with P2P.
     if (requests.empty() || requests.size() > 1024 || windowSize < 0 ||
         V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") || V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN") ||
-        !V41OnCuda(attnSink) || attnSink.dataType != DataType::FLOAT32) return false;
+        !local(attnSink) || attnSink.dataType != DataType::FLOAT32) return false;
     using PvShared = typename std::conditional<MATERIALIZED,
         V41MmaPvShared<splits>, V41MmaShared>::type;
     if constexpr (MATERIALIZED) {
@@ -4586,7 +4594,7 @@ static bool V41SparseAttentionBatchImpl(
     descriptors.reserve(requests.size());
     for (const auto &r : requests) {
         if (!r.q || !r.chunkKV || !r.output || r.startPos <= 0 ||
-            !V41OnCuda(*r.q) || !V41OnCuda(*r.chunkKV) ||
+            !local(*r.q) || !local(*r.chunkKV) ||
             r.q->dataType != DataType::BFLOAT16 || r.chunkKV->dataType != DataType::BFLOAT16 ||
             r.q->dims.size() != 4 || r.q->dims[0] != 1 || r.q->dims[1] != 1 ||
             r.q->dims[2] <= 0 || r.q->dims[3] != kMmaDim ||
@@ -4601,7 +4609,7 @@ static bool V41SparseAttentionBatchImpl(
         d.startPos = r.startPos;
         d.ringMode = d.cmpMode = 1;
         if (windowSize) {
-            if (!r.ringKV || !V41OnCuda(*r.ringKV) || r.ringKV->dims.size() != 3 ||
+            if (!r.ringKV || !local(*r.ringKV) || r.ringKV->dims.size() != 3 ||
                 r.ringKV->dims[0] != 1 || r.ringKV->dims[1] != windowSize) return false;
             if (r.ringKV->dataType == DataType::INT8) {
                 int block = 0;
@@ -4613,7 +4621,7 @@ static bool V41SparseAttentionBatchImpl(
             } else return false;
         }
         if (r.compressedKV && r.indices && !r.compressedKV->dims.empty() && r.compressedKV->Count(0)) {
-            if (!V41OnCuda(*r.compressedKV) || !V41OnCuda(*r.indices) ||
+            if (!local(*r.compressedKV) || !local(*r.indices) ||
                 r.compressedKV->dims.size() != 3 || r.compressedKV->dims[0] != 1 ||
                 r.indices->dataType != DataType::INT32 || r.indices->dims.size() != 3 ||
                 r.indices->dims[0] != 1 || r.indices->dims[1] != 1) return false;

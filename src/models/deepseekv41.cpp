@@ -5572,13 +5572,16 @@ namespace fastllm {
             bool batchAttention = false;
             bool batchTransforms = false, mergedAttention = false;
 #ifdef USE_CUDA
-            batchAttention = tp && !dumpDebug &&
-                std::all_of(segments.begin(), segments.end(), [layer](const DeepSeekV41Segment &seg) {
+            batchAttention = !dumpDebug && (tp || (numSegments > 1 && !f.graphActive)) &&
+                std::all_of(segments.begin(), segments.end(), [layer, tp](const DeepSeekV41Segment &seg) {
                     // Restored snapshots start on CPU. The ordinary attention
                     // path materializes the ring on every rank; the batched
-                    // decode path assumes those replicas already exist.
-                    return seg.seqlen == 1 && seg.startPos > 0 &&
-                           seg.state->layers[layer].windowKV.multiDeviceData;
+                    // decode path assumes those replicas already exist on TP.
+                    // Non-TP hybrid requests use the same descriptor kernel on
+                    // their ordinary CUDA tensors and do not need replicas.
+                    if (seg.seqlen != 1 || seg.startPos <= 0) return false;
+                    const Data &window = seg.state->layers[layer].windowKV;
+                    return !tp || window.multiDeviceData;
                 });
             std::vector<FastllmCudaV41AttentionRequest> attentionRequests;
             std::vector<V41DecodeIndexTask> indexTasks;
@@ -5592,12 +5595,12 @@ namespace fastllm {
                 // views once per forward; only their contents change per layer.
                 // Eager, capture, invalidated and speculative paths still check
                 // every row. These flags never survive a forward/request batch.
-                const bool reuseRows = f.graphReplay && f.workerOrderedGraphReplay &&
+                const bool reuseRows = tp && f.graphReplay && f.workerOrderedGraphReplay &&
                     f.decodeQkvViewsPrepared;
                 for (int s = 0; s < numSegments; ++s) {
                     if (reuseRows) {
                         // The same borrowed rows were checked in an earlier layer.
-                    } else if (single) {
+                    } else if (single && tp) {
                         AssertInFastLLM(V41DecodeSliceView(segQ[s], q, segments[s].offset, tpDevices) &&
                                         V41DecodeSliceView(segKV[s], kv, segments[s].offset, tpDevices),
                                         "DeepSeekV41 decode row view failed.");
@@ -5605,31 +5608,35 @@ namespace fastllm {
                         sliceOf(q, s, segQ[s]);
                         sliceOf(kv, s, segKV[s]);
                     }
-                    transforms.push_back({&segQ[s], nullptr, segments[s].startPos, 0, false});
-                    transforms.push_back({&segKV[s], nullptr, segments[s].startPos, 1, false});
-                }
-                f.decodeQkvViewsPrepared = true;
-                // These producers and consumers all use the dedicated rank
-                // stream during ordinary replay. Preserve the general handoff
-                // on source layers, where cache growth may use the caller stream.
-                batchTransforms = V41DecodeTransforms(transforms, rope, window_size, tpDevices,
-                    f.workerOrderedGraphReplay && !isKvSource[layer]);
-                // Independent rows can be written directly into the persistent
-                // graph boundary, avoiding an O(batch^2) chain of concatenations.
-                mergedAttention = MultiCudaCopyShardedActivation(attnOut, q, tpDevices, false);
-                if (mergedAttention && !(f.graphReplay && f.workerOrderedGraphReplay &&
-                                         f.decodeOutputViewsPrepared)) {
-                    for (int s = 0; s < numSegments; ++s) {
-                        AssertInFastLLM(V41DecodeSliceView(segAttnOut[s], attnOut, segments[s].offset, tpDevices),
-                                        "DeepSeekV41 attention output view failed.");
+                    if (tp) {
+                        transforms.push_back({&segQ[s], nullptr, segments[s].startPos, 0, false});
+                        transforms.push_back({&segKV[s], nullptr, segments[s].startPos, 1, false});
                     }
-                    f.decodeOutputViewsPrepared = true;
+                }
+                if (tp) {
+                    f.decodeQkvViewsPrepared = true;
+                    // These producers and consumers all use the dedicated rank
+                    // stream during ordinary replay. Preserve the general handoff
+                    // on source layers, where cache growth may use the caller stream.
+                    batchTransforms = V41DecodeTransforms(transforms, rope, window_size, tpDevices,
+                        f.workerOrderedGraphReplay && !isKvSource[layer]);
+                    // Independent rows can be written directly into the persistent
+                    // graph boundary, avoiding an O(batch^2) chain of concatenations.
+                    mergedAttention = MultiCudaCopyShardedActivation(attnOut, q, tpDevices, false);
+                    if (mergedAttention && !(f.graphReplay && f.workerOrderedGraphReplay &&
+                                             f.decodeOutputViewsPrepared)) {
+                        for (int s = 0; s < numSegments; ++s) {
+                            AssertInFastLLM(V41DecodeSliceView(segAttnOut[s], attnOut, segments[s].offset, tpDevices),
+                                            "DeepSeekV41 attention output view failed.");
+                        }
+                        f.decodeOutputViewsPrepared = true;
+                    }
                 }
             }
 #endif
             bool batchedCompression = false;
 #ifdef USE_CUDA
-            if (batchAttention && !quantKV && ratio > 0 && isKvSource[layer]) {
+            if (batchAttention && tp && !quantKV && ratio > 0 && isKvSource[layer]) {
                 batchedCompression = V41CompressDecodeBatch(segments, layer, ratio, rawKVAll, rawScoreAll,
                     weight[pre + ".attn.compressor.norm.weight"], rms_norm_eps, rope, isIndexSource[layer],
                     [&](Data &latent, Data &keys) {
@@ -5949,7 +5956,7 @@ namespace fastllm {
                 bool completedTogether = false;
                 std::vector<V41DecodeTransform> finishTransforms;
                 std::function<void(int, int)> beforeAttention, afterAttention;
-                if (!quantKV && std::all_of(segments.begin(), segments.end(), [](const DeepSeekV41Segment &seg) {
+                if (tp && !quantKV && std::all_of(segments.begin(), segments.end(), [](const DeepSeekV41Segment &seg) {
                         return !seg.spec || !seg.spec->deferWindow;
                     })) {
                     for (int s = 0; s < numSegments; ++s) {
@@ -5980,8 +5987,14 @@ namespace fastllm {
                                 ratio, r.startPos, std::max(1, candidate_block_size), *r.topk);
                         }
                     }
-                    if (!MultiCudaDeepSeekV41SparseAttentionBatch(attentionRequests,
-                        weight[pre + ".attn.attn_sink"], window_size, softmaxScale, tpDevices)) {
+                    // Each descriptor keeps its request's Q/KV pointers and
+                    // position. Dispatch only after all candidate lists exist.
+                    const bool batchedAttention = tp ?
+                        MultiCudaDeepSeekV41SparseAttentionBatch(attentionRequests,
+                            weight[pre + ".attn.attn_sink"], window_size, softmaxScale, tpDevices) :
+                        FastllmCudaDeepSeekV41SparseAttentionBatch(attentionRequests,
+                            weight[pre + ".attn.attn_sink"], window_size, softmaxScale);
+                    if (!batchedAttention) {
                         for (const auto &r : attentionRequests) {
                             V41SparseAttention(*r.q, *r.chunkKV, r.ringKV, r.compressedKV, r.indices,
                                 weight[pre + ".attn.attn_sink"], window_size, r.startPos, softmaxScale, *r.output, executionMode == ExecutionMode::Hybrid);
@@ -5989,7 +6002,7 @@ namespace fastllm {
                     }
                     // Do not overwrite a ring row until attention has read it.
                     bool finished = false;
-                    if (!quantKV && std::all_of(segments.begin(), segments.end(), [](const DeepSeekV41Segment &seg) {
+                    if (tp && !quantKV && std::all_of(segments.begin(), segments.end(), [](const DeepSeekV41Segment &seg) {
                             return !seg.spec || !seg.spec->deferWindow;
                         })) {
                         std::vector<V41DecodeTransform> transforms;
