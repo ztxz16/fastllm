@@ -2962,19 +2962,20 @@ namespace fastllm {
     }
 
     bool DeepSeekV41Model::DsparkPrepareQkv(int stage, const Data &input, Data &inputQuant,
-                                           Data &raw, Data &qNorm, Data &qQuant, Data &kv) {
+                                           Data &raw, Data &qNorm, Data &qQuant, Data &kv, bool inputQuantized,
+                                           Data *joinedWeight) {
 #ifdef USE_CUDA
         const std::string pre = "mtp." + std::to_string(stage) + ".attn.";
         if (V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") || V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") ||
             !quantizedLinearNames.count(pre + "wq_a.weight") ||
             !quantizedLinearNames.count(pre + "wkv.weight") ||
             !quantizedLinearNames.count(pre + "wq_b.weight")) return false;
-        // Keep the two original GEMM shapes: concatenation can move a BF16
-        // rounding boundary which subsequent FP8 quantization amplifies. Share
-        // input quantization and fuse normalization without changing those dots.
+        // A request-owned graph cache allows Q/KV to share one projection.
+        // Eager execution retains the separate GEMM shapes when no cache is supplied.
+        // Activation quantization and normalization retain their original boundaries.
         return V41QkvPrepare(input, weight[pre + "wq_a.weight"], weight[pre + "wkv.weight"],
             weight[pre + "q_norm.weight"], weight[pre + "kv_norm.weight"], rms_norm_eps,
-            inputQuant, raw, qNorm, qQuant, kv, false, nullptr, true);
+            inputQuant, raw, qNorm, qQuant, kv, inputQuantized, joinedWeight, true);
 #else
         return false;
 #endif

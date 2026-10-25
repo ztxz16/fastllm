@@ -81,6 +81,9 @@ namespace fastllm {
             Data output, gateup, activated, floatOutput;
         };
         std::vector<SharedExpertWorkspace> sharedExperts;
+        // Resolve immutable packed weights during warmup and keep them alive
+        // until ClearGraphs has destroyed every graph referencing them.
+        std::map<int, Data> packedQkvWeights;
 #ifdef USE_CUDA
         std::vector<void*> graphs, execs, starts, ends, reserved;
         void ClearGraphs() {
@@ -275,6 +278,66 @@ namespace fastllm {
             DsExecutor().Run("DeepSeekV41HcPost", {{"input", &input}, {"residual", &residual},
                 {"post", &post}, {"comb", &comb}, {"output", &output}}, {}, {});
         }
+
+#ifdef USE_CUDA
+        bool DsFusedHcEnabled() {
+            return !DsEnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
+                !DsEnvFlag("FASTLLM_DSV41_LEGACY_HCMIX") &&
+                !DsEnvFlag("FASTLLM_DSV41_LEGACY_HCMIX_DECODE") &&
+                !DsEnvFlag("FASTLLM_DSV41_DISABLE_HCPRENORM");
+        }
+#endif
+
+        void DsHcApplyPreNorm(const Data &input, const Data &pre, Data &normWeight,
+                             float eps, Data &scratch, Data &output) {
+#ifdef USE_CUDA
+            if (DsFusedHcEnabled() &&
+                FastllmCudaDeepSeekV41HcPreNorm(input, pre, normWeight, eps, output)) return;
+#endif
+            DsHcApplyPre(input, pre, scratch);
+            DsRMSNormBF16(scratch, normWeight, eps, output);
+        }
+
+        // Normalized output is always produced; return whether its quantized copy is ready.
+        bool DsHcMixPreNorm(const Data &input, const Data &previousPre,
+                           Data &fn, Data &scale, Data &base, Data &normWeight,
+                           int hcMult, int iters, float mixEps, float normEps,
+                           Data &pre, Data &post, Data &comb, Data &scratch, Data &output,
+                           Data *quantizedOutput = nullptr) {
+#ifdef USE_CUDA
+            if (DsFusedHcEnabled() && hcMult == 4 &&
+                FastllmCudaDeepSeekV41HcMixPreNorm(input, previousPre, fn, scale, base, normWeight,
+                    iters, mixEps, normEps, pre, post, comb, output, quantizedOutput))
+                return quantizedOutput != nullptr;
+#endif
+            DsHcMix(input, fn, scale, base, hcMult, iters, mixEps, normEps, pre, post, comb);
+            DsHcApplyPreNorm(input, previousPre, normWeight, normEps, scratch, output);
+            return false;
+        }
+
+#ifdef USE_CUDA
+        bool DsHcPostMixPreNorm(const Data &input, const Data &residual,
+                const Data &previousPre, const Data &previousPost, const Data &previousComb,
+                Data &fn, Data &scale, Data &base, Data &normWeight,
+                int hcMult, int iters, float mixEps, float normEps,
+                Data &hidden, Data &pre, Data &post, Data &comb, Data &output) {
+            if (!DsFusedHcEnabled() || hcMult != 4 || residual.dataDevice != DataDevice::CUDA ||
+                residual.multiDeviceData || residual.dims.size() != 4 || residual.dims[0] <= 0 ||
+                residual.dims[1] <= 0 || residual.dataType != DataType::BFLOAT16 ||
+                residual.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()}) return false;
+            const int64_t tokens = (int64_t)residual.dims[0] * residual.dims[1];
+            const int d = residual.dims[3];
+            if (tokens < 2 || tokens > 8 || d < 4096 || d > 8192 || d % 1024 ||
+                (d > 6144 && tokens <= 6)) return false;
+            for (Data *w : {&fn, &scale, &base, &normWeight}) {
+                if (w->multiDeviceData || w->dataType != DataType::FLOAT32) return false;
+                w->ToDevice(DataDevice::CUDA, residual.dataDeviceIds, true);
+            }
+            return FastllmCudaDeepSeekV41HcPostMixPreNorm(input, residual, previousPre,
+                previousPost, previousComb, fn, scale, base, normWeight,
+                iters, mixEps, normEps, hidden, pre, post, comb, output);
+        }
+#endif
 
         struct DsRopeParams {
             int ropeDim;
@@ -2019,13 +2082,19 @@ namespace fastllm {
                 const int layerId = std::max(0, block_cnt - v41DsparkLayers + stage);
                 ApplyDsparkDevice();
 
-                DsHcMix(*curHidden, weight[pre + ".hc_attn_fn"], weight[pre + ".hc_attn_scale"],
-                        weight[pre + ".hc_attn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
-                        attnPre, attnPost, attnComb);
-                DsHcApplyPre(*curHidden, layerPreMix, x);
-                DsRMSNormBF16(x, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput);
+                // Keep the original BF16 normalization and block-32 FP8 rounding,
+                // but produce QKV's quantized input in the normalization kernel.
+                const bool quantizeInput = !DsEnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") &&
+                    quantizedLinearNames.count(pre + ".attn.wq_a.weight") &&
+                    quantizedLinearNames.count(pre + ".attn.wkv.weight") &&
+                    quantizedLinearNames.count(pre + ".attn.wq_b.weight");
+                const bool inputQuantized = DsHcMixPreNorm(*curHidden, layerPreMix, weight[pre + ".hc_attn_fn"],
+                    weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
+                    weight[pre + ".attn_norm.weight"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                    attnPre, attnPost, attnComb, x, attnInput, quantizeInput ? &attnQuant : nullptr);
 
-                const bool qkvPrepared = DsparkPrepareQkv(stage, attnInput, attnQuant, qr, qNorm, qQuant, kv);
+                const bool qkvPrepared = DsparkPrepareQkv(stage, attnInput, attnQuant, qr, qNorm, qQuant, kv,
+                    inputQuantized, graphState ? &graphState->packedQkvWeights[stage] : nullptr);
                 if (!qkvPrepared) {
                     LinearWithActivationQuant(attnInput, pre + ".attn.wq_a.weight", qr);
                     DsRMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
@@ -2051,14 +2120,22 @@ namespace fastllm {
 
                 DeepSeekV4WoA(attnOut, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
                 LinearWithActivationQuant(woAOut, pre + ".attn.wo_b.weight", attnProj);
-                DsHcPost(attnProj, *curHidden, attnPost, attnComb, *nextHidden);
+                bool fusedPost = false;
+#ifdef USE_CUDA
+                fusedPost = DsHcPostMixPreNorm(attnProj, *curHidden, attnPre, attnPost, attnComb,
+                    weight[pre + ".hc_ffn_fn"], weight[pre + ".hc_ffn_scale"],
+                    weight[pre + ".hc_ffn_base"], weight[pre + ".ffn_norm.weight"],
+                    hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                    *nextHidden, ffnPre, ffnPost, ffnComb, ffnInput);
+#endif
+                if (!fusedPost) {
+                    DsHcPost(attnProj, *curHidden, attnPost, attnComb, *nextHidden);
+                    DsHcMixPreNorm(*nextHidden, attnPre, weight[pre + ".hc_ffn_fn"],
+                        weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
+                        weight[pre + ".ffn_norm.weight"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                        ffnPre, ffnPost, ffnComb, x, ffnInput);
+                }
                 std::swap(curHidden, nextHidden);
-
-                DsHcMix(*curHidden, weight[pre + ".hc_ffn_fn"], weight[pre + ".hc_ffn_scale"],
-                        weight[pre + ".hc_ffn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
-                        ffnPre, ffnPost, ffnComb);
-                DsHcApplyPre(*curHidden, attnPre, x);
-                DsRMSNormBF16(x, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput);
                 std::vector<int> ffnDims = ffnInput.dims;
                 ffnInput.Reshape({block, dim});
 
@@ -2221,8 +2298,8 @@ namespace fastllm {
 
             DsDraftTimingSlot().layers = DsElapsed(layersStart);
 
-            DsHcApplyPre(*curHidden, layerPreMix, headHidden);
-            DsRMSNormBF16(headHidden, weight[last + ".norm.weight"], rms_norm_eps, normed);
+            DsHcApplyPreNorm(*curHidden, layerPreMix, weight[last + ".norm.weight"],
+                             rms_norm_eps, headHidden, normed);
             // ---- head：mtp.<last>.norm + 共享 lm_head ----
             const double headStart = DsTick();
             bool headProjected = false, shardedMarkov = false;
