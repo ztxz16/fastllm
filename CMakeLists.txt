@@ -1143,6 +1143,14 @@ if (UNIT_TEST)
                 "PASS: disk V4.1 GGUF cache" 180)
             set_tests_properties(disk_v41_gguf_cache PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE
                 ENVIRONMENT "FT_GPU_PREFILL=1;FASTLLM_DISK_DIRECT_IO=1")
+            fastllm_add_checked_test(cuda_v41_gguf_tuned disk_v41_gguf_cache_test
+                "PASS: tuned V4.1 GGUF decode" 360 --tuned)
+            set_tests_properties(cuda_v41_gguf_tuned PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE)
+            if (USE_NUMAS)
+                fastllm_add_checked_test(cuda_v41_gguf_tuned_hybrid disk_v41_gguf_cache_test
+                    "PASS: tuned V4.1 GGUF hybrid" 900 --tuned-hybrid)
+                set_tests_properties(cuda_v41_gguf_tuned_hybrid PROPERTIES LABELS "cuda;gguf;numa" RUN_SERIAL TRUE)
+            endif()
             add_test(NAME disk_moe_cache_cuda COMMAND disk_moe_cache_test 1)
             add_test(NAME disk_moe_cache_cuda_prefill COMMAND disk_moe_cache_test 1 prefill)
             add_test(NAME disk_moe_cache_cuda_dual COMMAND disk_moe_cache_test 2)
