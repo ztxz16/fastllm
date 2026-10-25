@@ -264,6 +264,10 @@ namespace fastllm {
     bool MultiCudaRunDeviceCallbacksEnqueueOnly(
         const std::vector<int> &devices,
         const std::function<void(int, int)> &callback);
+    // Join the completion events of already-submitted callbacks on one caller
+    // stream and wait once. Only covers work on the dedicated worker streams.
+    // Returns false when a worker/event is unavailable, allowing a full drain.
+    bool MultiCudaSynchronizeDeviceCallbacks(const std::vector<int> &devices);
     bool MultiCudaCurrentThreadWaitForWorker(int device);
 
     // Broadcast a root CUDA tensor into its fixed per-device replicas, then

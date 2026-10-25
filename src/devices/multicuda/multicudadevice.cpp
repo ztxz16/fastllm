@@ -638,6 +638,34 @@ namespace fastllm {
         return true;
     }
 
+    bool MultiCudaSynchronizeDeviceCallbacks(const std::vector<int> &devices) {
+        if (devices.empty() || currentMultiCudaDedicatedWorker != nullptr ||
+            FastllmCudaGraphIsCapturingFast()) return false;
+        const int originalDevice = FastllmCudaGetDevice();
+        auto &pool = GetMultiCudaDedicatedWorkerPool();
+        {
+            // Prevent a new submission from re-recording a completion event
+            // until all waits refer to the callbacks being joined here.
+            std::lock_guard<std::mutex> dispatchLock(pool.dispatchMutex);
+            std::vector<void *> events;
+            {
+                std::lock_guard<std::mutex> lock(pool.mutex);
+                for (int device : devices) {
+                    auto it = pool.workers.find(device);
+                    if (it == pool.workers.end() || !it->second ||
+                        !it->second->GetCompletionEvent()) return false;
+                    events.push_back(it->second->GetCompletionEvent());
+                }
+            }
+            FastllmCudaSetDevice(devices.front());
+            for (void *event : events) FastllmCudaCurrentThreadStreamWaitEvent(event);
+        }
+        FastllmCudaSyncCurrentThreadStream();
+        const bool ok = !FastllmCudaGetThreadError();
+        FastllmCudaSetDevice(originalDevice);
+        return ok;
+    }
+
     bool MultiCudaCurrentThreadWaitForWorker(int device) {
         if (device < 0 || currentMultiCudaDedicatedWorker != nullptr) {
             return false;

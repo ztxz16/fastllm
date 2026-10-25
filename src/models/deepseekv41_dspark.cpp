@@ -1645,6 +1645,13 @@ namespace fastllm {
                             "DeepSeekV41 DSpark: compressed cache rollback is inconsistent at layer " +
                             std::to_string(layer));
         }
+#ifdef USE_CUDA
+        // The successful batch only uses dedicated worker streams. Join their
+        // completion events once; all cache writes still finish before return.
+        // Fallback operators retain the existing full-device lifetime barrier.
+        if (batchedWindows && batchedTails && MultiCudaSynchronizeDeviceCallbacks(v41DsparkTpDevices))
+            commitDispatch.MarkDeviceWorkComplete();
+#endif
         state.totalLen = newLen;
         if (!engram_layer_ids.empty() && (int)state.engramHistory.size() > newLen) {
             state.engramHistory.resize(newLen);
