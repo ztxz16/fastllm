@@ -25,6 +25,7 @@ struct V41FullGraph {
     Data topk, candidates, head, norm, normFloat, logits, requests, gatheredLogits;
     std::map<int, Data> mainHidden;
     std::vector<void *> ready;
+    std::vector<Data> commitDescriptors;
     std::vector<std::vector<FastllmV41FullDecodeRequest>> hostRequests;
     std::vector<std::vector<void *>> hostPlans;
     std::shared_ptr<DeepSeekV41CudaGraphState> pieces;
@@ -164,8 +165,9 @@ void V41FullAdvance(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
             }
         }
 }
-void V41FullBindVerify(V41FullGraph &g, const DeepSeekV41Segment &segment,
+void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSeekV41Segment &segment,
                       const std::vector<int> &targetLayers) {
+    auto &g = *owner;
     // Scratch views borrow graph buffers until commit/draft completes,
     // before the next target forward can overwrite them.
     auto borrow = [&](Data &view, const Data &source, int rows) {
@@ -174,22 +176,25 @@ void V41FullBindVerify(V41FullGraph &g, const DeepSeekV41Segment &segment,
     };
     auto &scratch = *segment.spec;
     const int layers = g.layers.size();
-    scratch.windowKV.resize(layers);
-    scratch.rawKV.resize(layers);
-    scratch.rawScore.resize(layers);
     scratch.prevRawTail.resize(layers);
     scratch.prevBlocks.resize(layers);
     for (int l = 0; l < layers; ++l) {
         const auto &layer = *g.layers[l];
-        borrow(scratch.windowKV[l], layer.savedKV, g.batch);
         if (!layer.config.kvSource) continue;
         scratch.prevRawTail[l] = segment.startPos % layer.config.ratio;
         scratch.prevBlocks[l] = segment.startPos / layer.config.ratio;
-        const int rows = scratch.prevRawTail[l] + segment.seqlen;
-        borrow(scratch.rawKV[l], layer.savedRawKV, rows);
-        if (layer.config.ratio > 1)
-            borrow(scratch.rawScore[l], layer.savedRawScore, rows);
     }
+    scratch.commitKV = [owner](int accepted) {
+        const auto &graph = *owner;
+        std::vector<int> ok(graph.devices.size(), 0);
+        const bool submitted = MultiCudaRunDeviceCallbacks(graph.devices, [&](int rank, int) {
+            ok[rank] = FastllmCudaV41CommitVerifiedPrefix(
+                static_cast<const FastllmV41VerifyCommitLayer *>(graph.commitDescriptors[rank].cudaData),
+                (int)graph.layers.size(), accepted, graph.batch);
+        });
+        AssertInFastLLM(submitted && std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; }),
+                        "full verifier KV commit failed");
+    };
     if (scratch.captureMain) {
         scratch.mainHidden.resize(targetLayers.size());
         for (size_t i = 0; i < targetLayers.size(); ++i)
@@ -551,6 +556,34 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                                          &g->graphs[rank], &g->execs[rank]))
                 throw std::runtime_error("full graph composition failed");
         }
+        if (verifying) {
+            g->commitDescriptors.resize(g->devices.size());
+            for (size_t rank = 0; rank < g->devices.size(); ++rank) {
+                const int device = g->devices[rank];
+                FastllmCudaSetDevice(device);
+                auto ptr = [device](const Data &data) -> void * {
+                    auto it = data.multiDeviceDatas.find(device);
+                    return it == data.multiDeviceDatas.end() || !it->second ? nullptr : it->second->cudaData;
+                };
+                const auto *requests = static_cast<const FastllmV41FullDecodeRequest *>(ptr(g->requests));
+                std::vector<FastllmV41VerifyCommitLayer> descriptors;
+                descriptors.reserve(g->layers.size());
+                for (size_t layer = 0; layer < g->layers.size(); ++layer) {
+                    const auto &l = *g->layers[layer];
+                    descriptors.push_back({
+                        requests + layer * g->batch,
+                        ptr(l.savedKV), ptr(l.savedRawKV), ptr(l.savedRawScore),
+                        l.config.window, l.config.kvSource ? l.config.ratio : 0});
+                }
+                Data &data = g->commitDescriptors[rank];
+                data.dataType = DataType::INT8;
+                data.UpdateUnitSize();
+                data.Resize({(int)(descriptors.size() * sizeof(FastllmV41VerifyCommitLayer))});
+                data.ToDevice(DataDevice::CUDA, {device}, false);
+                data.Allocate();
+                FastllmCudaCopyFromHostToDevice(data.cudaData, descriptors.data(), data.GetBytes());
+            }
+        }
         state->fullDecode = g;
         fprintf(stderr,
                 "[Fastllm] DeepSeek-V4.1 full %s graph ready: %s=%d, ranks=%zu, one graph "
@@ -640,7 +673,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
         // Root sampling reads peer-written vocabulary shards after every rank.
         FastllmCudaSetDevice(g->devices.front());
         for (void *event : g->ready) FastllmCudaCurrentThreadStreamWaitEvent(event);
-        V41FullBindVerify(*g, f.inputSegments[0], v41DsparkTargetLayerIds);
+        V41FullBindVerify(g, f.inputSegments[0], v41DsparkTargetLayerIds);
     }
     V41FullAdvance(*g, f.inputSegments);
     f.curHidden = &f.ws->hiddenStates;

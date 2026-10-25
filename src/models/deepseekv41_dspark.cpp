@@ -1534,7 +1534,10 @@ namespace fastllm {
         bool batchedWindows = false, batchedTails = false;
 #ifdef USE_CUDA
         ScopedTpDispatch commitDispatch(v41DsparkTpDevices.size() > 1, v41DsparkTpDevices);
-        if (v41DsparkTpDevices.size() > 1 && startPos >= 0 && window_size > 0 && accept <= window_size) {
+        if (scratch.commitKV) {
+            scratch.commitKV(accept);
+            batchedWindows = batchedTails = true;
+        } else if (v41DsparkTpDevices.size() > 1 && startPos >= 0 && window_size > 0 && accept <= window_size) {
             std::vector<MultiCudaReplicatedCopyRange> ranges;
             ranges.reserve(block_cnt * 4);
             bool valid = true;
@@ -1625,6 +1628,20 @@ namespace fastllm {
                 }
             }
             cache.rawTail = rem;
+#ifdef USE_CUDA
+            if (rem > 0 && scratch.commitKV) {
+                // Full graph reserve already owns enough storage; the commit
+                // kernel writes the prefix without changing its allocation.
+                for (Data *tail : {&cache.rawTailKV, &cache.rawTailScore}) {
+                    auto dims = tail->dims;
+                    dims[1] = rem;
+                    if (tail->dims != dims) tail->Resize(dims);
+                    tail->tpGlobalDims = dims;
+                    for (auto &local : tail->multiDeviceDatas)
+                        if (local.second->dims != dims) local.second->Resize(dims);
+                }
+            }
+#endif
             if (rem > 0 && !batchedTails) {
                 AssertInFastLLM(scratch.rawKV[layer].dims.size() == 3 &&
                                 scratch.rawKV[layer].dims[1] >= total,

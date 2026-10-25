@@ -34,6 +34,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -119,6 +120,9 @@ namespace fastllm {
         std::vector<Data> mainHidden;         // [目标层数]，每个 [1, seqlen, dim]
         std::vector<Data> windowKV;           // [block_cnt]，本次前向的滑窗 KV（延后写入）
         std::vector<Data> rawKV, rawScore;    // kv source 层：压缩器的原始输入流（含旧 rawTail）
+        // Full verifier graphs retain their own buffers and request descriptors.
+        // This callback commits an accepted prefix without materializing per-layer views.
+        std::function<void(int)> commitKV;
         std::vector<int> prevRawTail;         // kv source 层：前向之前的 rawTail 行数
         std::vector<int> prevBlocks;          // kv source 层：前向之前的压缩块数
         std::vector<int> tokens, draftTokens;

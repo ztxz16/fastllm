@@ -34,6 +34,16 @@ struct FastllmV41FullDecodeRequest {
     int position = 0;
 };
 
+// Immutable per-layer pointers to a full verifier's saved rows and dynamic
+// request metadata. Descriptors remain valid for the lifetime of that graph.
+struct FastllmV41VerifyCommitLayer {
+    const FastllmV41FullDecodeRequest *requests = nullptr;
+    const void *savedKV = nullptr, *savedRawKV = nullptr, *savedRawScore = nullptr;
+    int window = 128, ratio = 0;
+};
+bool FastllmCudaV41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layers,
+                                      int layerCount, int accepted, int forwarded);
+
 // Create/destroy and upload run outside capture. Prepare/Finish contain only
 // fixed-shape GPU work, and can be captured exactly once during startup.
 // Between Prepare and Finish the caller projects/normalizes newIndexKeys.
