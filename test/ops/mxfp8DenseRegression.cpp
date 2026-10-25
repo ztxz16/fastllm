@@ -46,10 +46,16 @@ int main() {
         FastllmCudaSetDevice(0);
         std::mt19937 random(59);
         int cases = 0;
-        const std::vector<std::pair<int, int>> shapes = {
+        std::vector<std::pair<int, int>> shapes = {
             {64, 128}, {128, 64}, {192, 256}, {256, 192}, {512, 5120},
             {1280, 5120}, {1792, 5120}, {4096, 1280}, {5120, 1024},
-            {4608, 5120}, {5120, 2304}};
+            {4608, 5120}, {5120, 2304}, {64, 512}, {192, 512}, {576, 5120}};
+        // Both sides of the split-K dispatch boundary, plus a non-128 N tile.
+        const int thinColumns = (properties.multiProcessorCount / 4) * 128;
+        if (thinColumns > 0) {
+            shapes.emplace_back(thinColumns, 512);
+            shapes.emplace_back(thinColumns + 128, 512);
+        }
         for (const auto &shape : shapes) {
             const int n = shape.first, k = shape.second;
             Data weight(DataType::FP8_E4M3, {n, k});
@@ -86,11 +92,15 @@ int main() {
                 launch();
                 Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
                 Cuda(cudaGraphInstantiate(&executable, graph, 0));
-                Cuda(cudaMemset(output.cudaData, 0x7f, eager.size()));
-                Cuda(cudaGraphLaunch(executable, cudaStreamPerThread));
-                Cuda(cudaDeviceSynchronize());
-                Cuda(cudaMemcpy(replay.data(), output.cudaData, replay.size(), cudaMemcpyDeviceToHost));
-                Require(replay == eager, "graph output differs from eager");
+                // Repeat small-M graphs to check that every split-K arrival
+                // counter resets and no partial sum leaks into the next replay.
+                for (int repeat = 0; repeat < (m <= 8 ? 8 : 1); ++repeat) {
+                    Cuda(cudaMemset(output.cudaData, 0x7f, eager.size()));
+                    Cuda(cudaGraphLaunch(executable, cudaStreamPerThread));
+                    Cuda(cudaDeviceSynchronize());
+                    Cuda(cudaMemcpy(replay.data(), output.cudaData, replay.size(), cudaMemcpyDeviceToHost));
+                    Require(replay == eager, "graph output differs from eager");
+                }
                 Data host;
                 host.CopyFrom(output);
                 ToDataType(host, DataType::FLOAT32);

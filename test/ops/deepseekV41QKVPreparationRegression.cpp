@@ -106,6 +106,19 @@ static int NormCases() {
             Require(Bits(pn) == Bits(qref) && Bits(pq) == Bits(quantRef) && Bits(pk) == Bits(kref),
                     "packed graph changed output");
         }
+        Data plainQ, plainKV;
+        auto plainNorm = [&] {
+            Require(FastllmCudaV41QKVNormPacked(packed, qw, kw, eps, plainQ, plainKV),
+                    "BF16 packed norm rejected");
+        };
+        plainNorm();
+        Require(Bits(plainQ) == Bits(qref) && Bits(plainKV) == Bits(kref),
+                "BF16 packed norm changed RMSNorm arithmetic");
+        if (qdim == 1280 && kdim == 512) {
+            Replay(plainNorm);
+            Require(Bits(plainQ) == Bits(qref) && Bits(plainKV) == Bits(kref),
+                    "BF16 packed norm graph changed output");
+        }
         // Exercise both sides of the register-cache boundary, including KV
         // alone selecting the uncached path and in-place KV normalization.
         const bool replayShape = (qdim == 1280 && (kdim == 512 || kdim == 2048 || kdim == 2080)) ||

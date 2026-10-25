@@ -45,6 +45,8 @@
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-dspark.h"
+#include "devices/cuda/fastllm-v41-decode.cuh"
+#include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -67,7 +69,7 @@ namespace fastllm {
     // created while capturing are owned by the graph allocator until teardown.
     struct DeepSeekV41DsparkWorkspace {
         int block = 0, width = 0;
-        bool disabled = false, parallelExperts = true;
+        bool disabled = false, parallelExperts = true, deviceInputs = false;
         std::vector<int> devices;
         std::vector<void*> cachePointers;
         Data input, preMix, indices, position, headHidden, normalized, logits;
@@ -1653,6 +1655,8 @@ namespace fastllm {
 
         // 1) main_x = main_norm(main_proj(cat(mean_hc(h_37), mean_hc(h_38), mean_hc(h_39))))
         Data combined, tmp;
+        std::vector<const Data *> inputs;
+        inputs.reserve(scratch.mainHidden.size());
         for (size_t k = 0; k < scratch.mainHidden.size(); k++) {
             const Data *hidden = &scratch.mainHidden[k];
 #ifdef USE_CUDA
@@ -1667,6 +1671,15 @@ namespace fastllm {
                 hidden = it->second;
             }
 #endif
+            inputs.push_back(hidden);
+        }
+#ifdef USE_CUDA
+        const bool joinedOnDevice = FastllmCudaNaiveDraftConcat(inputs, rows, combined);
+#else
+        const bool joinedOnDevice = false;
+#endif
+        if (!joinedOnDevice) for (size_t k = 0; k < inputs.size(); ++k) {
+            const Data *hidden = inputs[k];
             Data part;
             if (rows == hidden->dims[1]) {
                 part.CopyFrom(*hidden);
@@ -1795,47 +1808,50 @@ namespace fastllm {
         DsRopeParams windowRope = {qk_rope_head_dim, rope_base, 0, rope_factor,
                                    rope_scaling_beta_fast, rope_scaling_beta_slow};
 
-        // ---- 输入：[anchor, noise, noise, ...] ----
-        std::vector<float> idValues((uint64_t)block, (float)v41DsparkNoiseTokenId);
-        idValues[0] = (float)anchorToken;
-        Data draftIds(DataType::FLOAT32, {1, block}, idValues);
-        Data embedded;
-        DsparkEmbedInput(draftIds, embedded);
+        const int tableRows = window_size + block, width = valid + block - 1;
+        Data embedded, preMix, cmpIdxHost, cmpIdx;
+        bool inputsPrepared = false;
+        auto prepareInputs = [&]() {
+            if (inputsPrepared) return;
+            inputsPrepared = true;
+            // ---- 输入：[anchor, noise, noise, ...] ----
+            std::vector<float> idValues((uint64_t)block, (float)v41DsparkNoiseTokenId);
+            idValues[0] = (float)anchorToken;
+            Data draftIds(DataType::FLOAT32, {1, block}, idValues);
+            DsparkEmbedInput(draftIds, embedded);
 
-        Data preMix;
-        {
-            std::vector<float> values((uint64_t)block * hc_mult, 0.0f);
+            {
+                std::vector<float> values((uint64_t)block * hc_mult, 0.0f);
+                for (int i = 0; i < block; i++) {
+                    values[(uint64_t)i * hc_mult] = 1.0f;
+                }
+                preMix.CopyFrom(Data(DataType::FLOAT32, {1, block, hc_mult}, values));
+            }
+
+            // ---- 稀疏注意力的 gather 表下标 ----
+            // 现成的 DeepSeekV41SparseAttention 在片段内是因果的，而 DSpark 的草稿块内部
+            // 是全连接（官方 topk_idxs 对每个 query 给出同一张表）。这里把 windowSize 设为 1、
+            // startPos 设为 0，让"滑窗"部分只贡献 query 自己那一行，其余位置（环形缓冲里
+            // 有效的行 + 块内其它草稿行）通过 compressedKV / cmpIdx 的任意 gather 提供。
+            std::vector<int32_t> idxValues((uint64_t)block * width, -1);
             for (int i = 0; i < block; i++) {
-                values[(uint64_t)i * hc_mult] = 1.0f;
-            }
-            preMix.CopyFrom(Data(DataType::FLOAT32, {1, block, hc_mult}, values));
-        }
-
-        // ---- 稀疏注意力的 gather 表下标 ----
-        // 现成的 DeepSeekV41SparseAttention 在片段内是因果的，而 DSpark 的草稿块内部
-        // 是全连接（官方 topk_idxs 对每个 query 给出同一张表）。这里把 windowSize 设为 1、
-        // startPos 设为 0，让"滑窗"部分只贡献 query 自己那一行，其余位置（环形缓冲里
-        // 有效的行 + 块内其它草稿行）通过 compressedKV / cmpIdx 的任意 gather 提供。
-        const int tableRows = window_size + block;
-        const int width = valid + block - 1;
-        std::vector<int32_t> idxValues((uint64_t)block * width, -1);
-        for (int i = 0; i < block; i++) {
-            int32_t *row = idxValues.data() + (uint64_t)i * width;
-            int cursor = 0;
-            for (int p = startPos - valid; p < startPos; p++) {
-                row[cursor++] = p % window_size;
-            }
-            for (int j = 0; j < block; j++) {
-                if (j != i) {
-                    row[cursor++] = window_size + j;
+                int32_t *row = idxValues.data() + (uint64_t)i * width;
+                int cursor = 0;
+                for (int p = startPos - valid; p < startPos; p++) {
+                    row[cursor++] = p % window_size;
+                }
+                for (int j = 0; j < block; j++) {
+                    if (j != i) {
+                        row[cursor++] = window_size + j;
+                    }
                 }
             }
-        }
-        Data cmpIdxHost(DataType::INT32, {1, block, width});
-        cmpIdxHost.Allocate();
-        memcpy(cmpIdxHost.cpuData, idxValues.data(), idxValues.size() * sizeof(int32_t));
-        Data cmpIdx;
-        cmpIdx.CopyFrom(cmpIdxHost);
+            cmpIdxHost.dataType = DataType::INT32;
+            cmpIdxHost.Resize({1, block, width});
+            cmpIdxHost.Allocate();
+            memcpy(cmpIdxHost.cpuData, idxValues.data(), idxValues.size() * sizeof(int32_t));
+            cmpIdx.CopyFrom(cmpIdxHost);
+        };
 
         const std::string last = "mtp." + std::to_string(v41DsparkLayers - 1);
         const bool randomDraft = config.top_k > 1;
@@ -1861,24 +1877,35 @@ namespace fastllm {
             !config.tool_call_parameter_name_constraint_enabled &&
             !DsEnvFlag("FASTLLM_DSPARK_DISABLE_FUSED_MARKOV") &&
             v41MoeCudaGraphCompatible &&
-            embedded.dataDevice == DataDevice::CUDA && v41DsparkTpDevices.size() > 1 &&
+            v41DsparkTpDevices.size() > 1 &&
             !DsEnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") && !DsEnvFlag("FASTLLM_DISABLE_NCCL");
+        const Data &embedding = weight["embed.weight"];
+        const bool deviceInputs = graphEligible && embedding.dataType == DataType::BFLOAT16 &&
+            embedding.dataDevice == DataDevice::CUDA && embedding.cudaData && !embedding.multiDeviceData &&
+            !embedding.dataDeviceIds.empty() && embedding.dataDeviceIds.front() == v41DsparkTpDevices.front() &&
+            embedding.dims.size() == 2 && embedding.dims[1] == dim &&
+            embedding.strides.size() == 2 && embedding.strides[0] == dim && embedding.strides[1] == 1 &&
+            anchorToken >= 0 && anchorToken < embedding.dims[0] &&
+            v41DsparkNoiseTokenId >= 0 && v41DsparkNoiseTokenId < embedding.dims[0];
+        if (!deviceInputs) prepareInputs();
         std::vector<void*> cachePointers;
         for (auto &layer : dspark.layers) cachePointers.push_back(layer.windowKV.cudaData);
-        if (graphEligible && graphLock.try_lock()) {
+        if (deviceInputs) cachePointers.push_back(embedding.cudaData);
+        if (graphEligible && (deviceInputs || embedded.dataDevice == DataDevice::CUDA) && graphLock.try_lock()) {
             if (dspark.workspace && (dspark.workspace->devices != v41DsparkTpDevices ||
                 dspark.workspace->block != block || dspark.workspace->width != width ||
+                dspark.workspace->deviceInputs != deviceInputs ||
                 dspark.workspace->cachePointers != cachePointers)) dspark.workspace.reset();
             if (!dspark.workspace) {
                 dspark.workspace = std::make_shared<DeepSeekV41DsparkWorkspace>();
                 auto &w = *dspark.workspace;
                 w.devices = v41DsparkTpDevices; w.block = block; w.width = width;
+                w.deviceInputs = deviceInputs;
                 w.cachePointers = cachePointers;
             }
             if (!dspark.workspace->disabled) {
                 graphState = dspark.workspace.get();
                 graphState->sharedExperts.resize(v41DsparkLayers);
-                graphState->input.CopyFrom(embedded);
                 auto upload = [&](Data &dst, DataType type, const std::vector<int> &dims, const void *data) {
                     if (dst.dims.empty()) {
                         dst.dataType = type; dst.UpdateUnitSize(); dst.Resize(dims);
@@ -1886,26 +1913,39 @@ namespace fastllm {
                     }
                     FastllmCudaCopyFromHostToDevice(dst.cudaData, const_cast<void*>(data), dst.GetBytes());
                 };
-                upload(graphState->preMix, DataType::FLOAT32, preMix.dims, preMix.cpuData);
-                upload(graphState->indices, DataType::INT32, cmpIdxHost.dims, cmpIdxHost.cpuData);
-                upload(graphState->position, DataType::INT32, {1}, &startPos);
-                if (graphState->markovTokens.dims.empty()) {
-                    Data &d = graphState->markovTokens;
-                    d.dataType = DataType::INT32; d.UpdateUnitSize(); d.Resize({block + 1});
-                    d.ToDevice(DataDevice::CUDA, {v41DsparkTpDevices.front()}, false); d.Allocate();
+                const int metadata[2] = {startPos, anchorToken};
+                upload(graphState->position, DataType::INT32, {deviceInputs ? 2 : 1}, metadata);
+                if (!deviceInputs) {
+                    graphState->input.CopyFrom(embedded);
+                    upload(graphState->preMix, DataType::FLOAT32, preMix.dims, preMix.cpuData);
+                    upload(graphState->indices, DataType::INT32, cmpIdxHost.dims, cmpIdxHost.cpuData);
+                    if (graphState->markovTokens.dims.empty()) {
+                        Data &d = graphState->markovTokens;
+                        d.dataType = DataType::INT32; d.UpdateUnitSize(); d.Resize({block + 1});
+                        d.ToDevice(DataDevice::CUDA, {v41DsparkTpDevices.front()}, false); d.Allocate();
+                    }
+                    FastllmCudaCopyFromHostToDevice(graphState->markovTokens.cudaData, &anchorToken, sizeof(int));
                 }
-                FastllmCudaCopyFromHostToDevice(graphState->markovTokens.cudaData, &anchorToken, sizeof(int));
                 markovEmbedWeight.ToDevice(DataDevice::CUDA);
                 markovHeadWeight.ToDevice(DataDevice::CUDA);
             }
         }
 #endif
+        if (!graphState) prepareInputs();
         Data eagerLogits;
         Data &logits = graphState ? graphState->logits : eagerLogits;
         Data &headHidden = graphState ? graphState->headHidden : eagerHeadHidden;
         Data &normed = graphState ? graphState->normalized : eagerNormed;
         Data &markovAll = graphState ? graphState->markovEmbeds : eagerMarkov;
         auto backbone = [&]() {
+#ifdef USE_CUDA
+            if (graphState && graphState->deviceInputs) {
+                AssertInFastLLM(FastllmCudaDeepSeekV41DraftInput(weight["embed.weight"], graphState->position,
+                    v41DsparkNoiseTokenId, block, hc_mult, window_size, graphState->input,
+                    graphState->preMix, graphState->indices, graphState->markovTokens),
+                    "DeepSeekV41 DSpark device input preparation rejected input.");
+            }
+#endif
             Data hiddenStates, hiddenTemp, layerPreMix;
             hiddenStates.CopyFrom(graphState ? graphState->input : embedded);
             layerPreMix.CopyFrom(graphState ? graphState->preMix : preMix);
@@ -1971,24 +2011,34 @@ namespace fastllm {
                 {
                     const std::string gpre = pre + ".ffn.gate";
                     Data xFloat, logits;
-                    ToDataType(ffnInput, xFloat, DataType::FLOAT32);
-                    Linear(xFloat, weight[gpre + ".weight"], Data(), logits);
-                    ToDataType(logits, DataType::FLOAT32);
-                    if (std::fabs(gate_temp - 1.0f) > 1e-6f) {
-                        Mul(logits, 1.0f / gate_temp, logits);
-                    }
                     Data &gateBias = weight[gpre + ".bias"];
                     bool routed = false;
 #ifdef USE_CUDA
-                    if (logits.dataDevice == DataDevice::CUDA &&
-                        !DsEnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") &&
-                        FastllmCudaDeepSeekV4RouteScoreTransform(logits, 2)) {
-                        gateBias.ToDevice(DataDevice::CUDA);
-                        SelectExpert(logits, expertIndex, expertScore, v41DsparkTopk, true,
-                                     routed_scaling_factor, &gateBias);
-                        routed = true;
+                    if (norm_topk_prob && !DsEnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
+                        !DsEnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE")) {
+                        routed = FastllmCudaV41RouterSelectTopK(ffnInput, weight[gpre + ".weight"],
+                            gateBias, gate_temp, routed_scaling_factor, logits,
+                            expertIndex, expertScore, v41DsparkTopk);
                     }
 #endif
+                    if (!routed) {
+                        ToDataType(ffnInput, xFloat, DataType::FLOAT32);
+                        Linear(xFloat, weight[gpre + ".weight"], Data(), logits);
+                        ToDataType(logits, DataType::FLOAT32);
+                        if (std::fabs(gate_temp - 1.0f) > 1e-6f) {
+                            Mul(logits, 1.0f / gate_temp, logits);
+                        }
+#ifdef USE_CUDA
+                        if (logits.dataDevice == DataDevice::CUDA &&
+                            !DsEnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") &&
+                            FastllmCudaDeepSeekV4RouteScoreTransform(logits, 2)) {
+                            gateBias.ToDevice(DataDevice::CUDA);
+                            SelectExpert(logits, expertIndex, expertScore, v41DsparkTopk, true,
+                                         routed_scaling_factor, &gateBias);
+                            routed = true;
+                        }
+#endif
+                    }
                     if (!routed) {
                         logits.ToDevice(DataDevice::CPU);
                         gateBias.ToDevice(DataDevice::CPU);

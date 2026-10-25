@@ -44,16 +44,40 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const fastllm::Data &x, const
     int sinkhornIters, float mixEps, float normEps, fastllm::Data &pre, fastllm::Data &post,
     fastllm::Data &comb, fastllm::Data &output, fastllm::Data *quantizedOutput = nullptr);
 
+// Small BF16 multi-row attention post and next projection. Inputs must be
+// local CUDA tensors; outputs must be distinct, owned tensors.
+extern "C" bool FastllmCudaDeepSeekV41HcPostMixPreNorm(const fastllm::Data &input,
+    const fastllm::Data &residual, const fastllm::Data &previousPre,
+    const fastllm::Data &previousPost, const fastllm::Data &previousComb,
+    const fastllm::Data &fn, const fastllm::Data &scale, const fastllm::Data &base,
+    const fastllm::Data &normWeight, int sinkhornIters, float mixEps, float normEps,
+    fastllm::Data &hidden, fastllm::Data &pre, fastllm::Data &post,
+    fastllm::Data &comb, fastllm::Data &output);
+
 // Full-K output-channel slice; no partial dot products or reduction across GPUs.
+// For M > 1 writes packed [M, rowCount] at offset M * rowStart in output.
 extern "C" bool FastllmCudaBFloat16FP8ReplicatedRowSlice(const fastllm::Data &input,
     fastllm::Data &weight, fastllm::Data &output, int rowStart, int rowCount);
+
+// Local shared-expert intermediate TP partition. Input is already block-32
+// quantized BF16. Scratch/output are preallocated on the current device.
+// Produces FP32 partials; the caller merges them before its existing reduce.
+extern "C" bool FastllmCudaV41SharedExpertTP(const fastllm::Data &input,
+    fastllm::Data &gateUpWeight, fastllm::Data &downWeight,
+    fastllm::Data &gateUp, fastllm::Data &activation, fastllm::Data &output,
+    int rank, int ranks, float swigluLimit);
 
 // Concatenate native row-major FP8 matrices with matching block scales.
 // Destination is caller-owned and must be empty; setup runs before capture.
 extern "C" bool FastllmCudaConcatFp8Rows(const fastllm::Data &first,
     const fastllm::Data &second, fastllm::Data &output);
 
-// Normalize packed [Q, KV] rows and quantize Q at the existing BF16 boundary.
+// Packed BF16 RMSNorm; an optional fake-FP8 query output serves W8A8 emulation.
+extern "C" bool FastllmCudaV41QKVNormPacked(const fastllm::Data &qkv,
+    const fastllm::Data &qw, const fastllm::Data &kw, float eps,
+    fastllm::Data &qn, fastllm::Data &kn, fastllm::Data *qq = nullptr);
+
+// Compatibility wrapper retaining the original fake-FP8 query output.
 extern "C" bool FastllmCudaV41QKVNormQuantPacked(const fastllm::Data &qkv,
     const fastllm::Data &qWeight, const fastllm::Data &kvWeight, float eps,
     fastllm::Data &qNorm, fastllm::Data &qQuant, fastllm::Data &kvNorm);
@@ -70,3 +94,11 @@ extern "C" bool FastllmCudaBFloat16FP8LinearPair(const fastllm::Data &input,
 extern "C" bool FastllmCudaV41QKVNormQuant(const fastllm::Data &q, const fastllm::Data &kv,
     const fastllm::Data &qWeight, const fastllm::Data &kvWeight, float eps,
     fastllm::Data &qNorm, fastllm::Data &qQuant, fastllm::Data &kvNorm);
+
+extern "C" bool FastllmCudaV41RouterSelect(const fastllm::Data &input, fastllm::Data &weight,
+    fastllm::Data &bias, float temperature, float routeScale, fastllm::Data &logits,
+    fastllm::Data &indices, fastllm::Data &scores);
+
+extern "C" bool FastllmCudaV41RouterSelectTopK(const fastllm::Data &input, fastllm::Data &weight,
+    fastllm::Data &bias, float temperature, float routeScale, fastllm::Data &logits,
+    fastllm::Data &indices, fastllm::Data &scores, int topk);

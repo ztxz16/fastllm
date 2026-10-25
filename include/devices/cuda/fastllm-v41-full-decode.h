@@ -48,3 +48,9 @@ bool FastllmCudaV41UploadFullDecodeBatch(void *storage, void *const *plans, size
     const FastllmV41FullDecodeRequest *requests, size_t batch);
 bool FastllmCudaV41PrepareFullDecode(void *plan);
 bool FastllmCudaV41FinishFullDecode(void *plan);
+
+// Source bytes are staged in pinned storage until all asynchronous copies finish.
+struct FastllmV41HostCopy { void *dst; const void *src; size_t bytes; };
+bool FastllmCudaV41UploadFullDecodeInputs(void *storage, void *const *plans, size_t layers,
+    const FastllmV41FullDecodeRequest *requests, size_t batch,
+    const FastllmV41HostCopy *extra, size_t extraCount);

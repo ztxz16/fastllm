@@ -10,19 +10,23 @@ struct V41FullLayer {
 struct V41FullEngram {
     int index = 0;
     std::shared_ptr<V41EngramTable> table;
-    Data rows, mask, gathered, kv, quantized;
+    Data rows, mask, gathered, kv, quantized, reduction;
     std::vector<int64_t> hostRows;
     std::vector<float> hostMask;
 };
 struct V41FullGraph {
     std::vector<int> devices;
     int batch = 1, maxKeys = 131072;
-    bool verifying = false;
+    bool verifying = false, capturesInput = false;
+    Data inputIds, embedding;
+    std::vector<float> hostTokens;
     std::vector<std::unique_ptr<V41FullLayer>> layers;
     std::map<int, std::unique_ptr<V41FullEngram>> engrams;
     Data topk, candidates, head, norm, normFloat, logits, requests, gatheredLogits;
     std::map<int, Data> mainHidden;
     std::vector<void *> ready;
+    std::vector<std::vector<FastllmV41FullDecodeRequest>> hostRequests;
+    std::vector<std::vector<void *>> hostPlans;
     std::shared_ptr<DeepSeekV41CudaGraphState> pieces;
     std::vector<void *> graphs, execs;
     ~V41FullGraph() {
@@ -94,8 +98,10 @@ bool V41FullReserve(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
 
 bool V41FullUploadRank(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segments, int rank,
                        int device) {
-    std::vector<FastllmV41FullDecodeRequest> requests(g.layers.size() * g.batch);
-    std::vector<void *> plans(g.layers.size(), nullptr);
+    auto &requests = g.hostRequests[rank];
+    auto &plans = g.hostPlans[rank];
+    requests.resize(g.layers.size() * g.batch);
+    plans.resize(g.layers.size(), nullptr);
     auto ptr = [device](Data &d) -> void * {
         auto it = d.multiDeviceDatas.find(device);
         return it == d.multiDeviceDatas.end() || !it->second ? nullptr : it->second->cudaData;
@@ -113,15 +119,20 @@ bool V41FullUploadRank(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &s
         }
         plans[l] = layer.plans[rank];
     }
-    if (!FastllmCudaV41UploadFullDecodeBatch(ptr(g.requests), plans.data(), plans.size(),
-                                           requests.data(), g.batch)) return false;
+    std::vector<FastllmV41HostCopy> copies;
+    copies.reserve(2 * g.engrams.size() + 1);
     for (auto &entry : g.engrams) {
         auto &e = *entry.second;
-        FastllmCudaCopyFromHostToDevice(ptr(e.rows), e.hostRows.data(),
-                                        e.hostRows.size() * sizeof(int64_t));
-        FastllmCudaCopyFromHostToDevice(ptr(e.mask), e.hostMask.data(),
-                                        e.hostMask.size() * sizeof(float));
+        copies.push_back({ptr(e.rows), e.hostRows.data(), e.hostRows.size() * sizeof(int64_t)});
     }
+    for (auto &entry : g.engrams) {
+        auto &e = *entry.second;
+        copies.push_back({ptr(e.mask), e.hostMask.data(), e.hostMask.size() * sizeof(float)});
+    }
+    if (g.capturesInput && rank == 0)
+        copies.push_back({ptr(g.inputIds), g.hostTokens.data(), g.hostTokens.size() * sizeof(float)});
+    if (!FastllmCudaV41UploadFullDecodeInputs(ptr(g.requests), plans.data(), plans.size(),
+            requests.data(), g.batch, copies.data(), copies.size())) return false;
     return !FastllmCudaGetThreadError();
 }
 
@@ -214,12 +225,15 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         if (s.passthrough || s.graphs.size() != state->devices.size())
             return;
     for (int layer = 0; layer < block_cnt; ++layer)
-        if (!state->segments[layer * 4 + 3].containsGpuMoe) return;
+        if (!state->segments[layer * 4 + 3].containsGpuMoe ||
+            state->segments[layer * 4].kvOutputs.size() != state->devices.size()) return;
     for (auto &table : engramTables)
         if (!std::static_pointer_cast<V41EngramTable>(table)->gpuTable)
             return;
     auto g = std::make_shared<V41FullGraph>();
     g->devices = state->devices;
+    g->hostRequests.resize(g->devices.size());
+    g->hostPlans.resize(g->devices.size());
     g->batch = batch;
     g->verifying = verifying;
     g->pieces = std::make_shared<DeepSeekV41CudaGraphState>();
@@ -230,8 +244,19 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     auto alloc = [&](Data &data, DataType dtype, const std::vector<int> &dims) {
         V41AllocLike(data, dtype, dims, ws.hiddenStates, g->devices);
     };
-    alloc(g->requests, DataType::INT8,
-          {1, int(block_cnt * batch * sizeof(FastllmV41FullDecodeRequest))});
+
+    // Keep BF16 embedding outputs and token operands at fixed addresses. The
+    // ordinary/input-embedding and other precision paths retain their frontend.
+    auto &embeddingWeight = weight["embed.weight"];
+    g->capturesInput = verifying && embeddingWeight.dataType == DataType::BFLOAT16 &&
+        embeddingWeight.dataDevice == DataDevice::CUDA && embeddingWeight.cudaData &&
+        !embeddingWeight.multiDeviceData && embeddingWeight.dims.size() == 2 &&
+        embeddingWeight.dims[1] == embed_dim &&
+        GetPointerDeviceId(embeddingWeight.cudaData) == g->devices.front();
+    if (g->capturesInput) {
+        alloc(g->embedding, DataType::BFLOAT16, {1, batch, 1, embed_dim});
+        g->hostTokens.assign(batch, 0.f);
+    }
     const int blockSize = std::max(1, candidate_block_size);
     alloc(g->topk, DataType::INT32, {1, batch, index_topk});
     alloc(g->candidates, DataType::INT8, {1, batch, (g->maxKeys + blockSize - 1) / blockSize});
@@ -291,11 +316,51 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         bool dead = false;
         V41BuildEngramInputs(engramMeta, i, engram_max_ngram_size, engram_n_heads, snapshots, batch,
                              e->hostRows, e->hostMask, dead);
-        alloc(e->rows, DataType::INT32, {1, (int)e->hostRows.size() * 2});
-        alloc(e->mask, DataType::FLOAT32, {1, batch});
+        if (!g->verifying) {
+            alloc(e->rows, DataType::INT32, {1, (int)e->hostRows.size() * 2});
+            alloc(e->mask, DataType::FLOAT32, {1, batch});
+        }
         alloc(e->gathered, DataType::BFLOAT16,
               {1, batch, (int)e->hostRows.size() / batch * e->table->dim});
         g->engrams[engram_layer_ids[i]] = std::move(e);
+    }
+    size_t metadataBytes = block_cnt * batch * sizeof(FastllmV41FullDecodeRequest);
+    if (g->verifying) {
+        for (const auto &entry : g->engrams)
+            metadataBytes += entry.second->hostRows.size() * sizeof(int64_t) + batch * sizeof(float);
+        if (g->capturesInput) metadataBytes += batch * sizeof(float);
+    }
+    alloc(g->requests, DataType::INT8, {1, (int)metadataBytes});
+    if (g->verifying) {
+        size_t offset = block_cnt * batch * sizeof(FastllmV41FullDecodeRequest);
+        auto view = [&](Data &data, DataType dtype, const std::vector<int> &dims) {
+            data.multiDeviceData = true;
+            for (int device : g->devices) {
+                auto *local = new Data();
+                local->FakeFrom(*g->requests.multiDeviceDatas.at(device), offset);
+                local->dataType = dtype;
+                local->UpdateUnitSize();
+                local->Resize(dims);
+                local->expansionDims = dims;
+                local->expansionSize = local->Count(0);
+                local->expansionBytes = local->GetBytes();
+                data.multiDeviceDatas[device] = local;
+            }
+            V41SyncRootFromReplica(data, g->devices);
+            offset += data.GetBytes();
+        };
+        // All int64 rows precede float masks, preserving alignment for odd M.
+        for (auto &entry : g->engrams)
+            view(entry.second->rows, DataType::INT32, {1, (int)entry.second->hostRows.size() * 2});
+        for (auto &entry : g->engrams)
+            view(entry.second->mask, DataType::FLOAT32, {1, batch});
+        if (g->capturesInput) view(g->inputIds, DataType::FLOAT32, {1, batch});
+        AssertInFastLLM(offset == metadataBytes, "full verify metadata layout mismatch");
+    }
+    if (g->capturesInput) {
+        FastllmCudaSetDevice(g->devices.front());
+        FastllmCudaCopyFromHostToDevice(g->inputIds.multiDeviceDatas.at(g->devices.front())->cudaData,
+                                      g->hostTokens.data(), batch * sizeof(float));
     }
     // Lazy verification capture runs after this call's embedding. The warm
     // Engram children modify hiddenStates; restore its contents (not address)
@@ -322,6 +387,23 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             for (size_t rank = 0; rank < children.size(); ++rank)
                 children[rank].push_back(s.graphs[rank]);
         };
+        if (g->capturesInput) {
+            capture([&] {
+                MultiCudaRunDeviceCallbacks(g->devices, [&](int rank, int device) {
+                    auto &local = *g->embedding.multiDeviceDatas.at(device);
+                    if (rank == 0)
+                        AssertInFastLLM(FastllmCudaEmbeddingDirect(
+                            *g->inputIds.multiDeviceDatas.at(device), embeddingWeight, local),
+                            "full verify embedding failed");
+                    FastllmNcclBroadcastFrom(
+                        local.cudaData, local.cudaData, batch * embed_dim, DataType::BFLOAT16,
+                        g->devices.front(), device);
+                    const int rowBytes = embed_dim * sizeof(uint16_t);
+                    FastllmCudaRepeat(local.cudaData, ws.hiddenStates.multiDeviceDatas.at(device)->cudaData,
+                        batch, hc_mult, rowBytes, hc_mult * rowBytes, rowBytes, rowBytes);
+                });
+            });
+        }
         for (int l = 0; l < block_cnt; ++l) {
             const std::string prefix = "layers." + std::to_string(l);
             auto engram = g->engrams.find(l);
@@ -340,7 +422,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                         AssertInFastLLM(ok, "full graph Engram gather failed");
                     });
                     LinearWithActivationQuant(e.gathered, prefix + ".engram.wkv.weight", e.kv, true,
-                                              &e.quantized);
+                                              &e.quantized, false,
+                                              &e.reduction);
                     V41EngramApply(ws.hiddenStates, e.kv, weight[prefix + ".engram.q_weight"],
                                    weight[prefix + ".engram.k_weight"], &e.mask, rms_norm_eps);
                 });
@@ -368,7 +451,9 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 FastllmV41FullDecodeBuffers b;
                 b.requests = static_cast<FastllmV41FullDecodeRequest *>(ptr(g->requests)) + l * batch;
                 b.q = ptr(ws.q);
-                b.kv = ptr(ws.kv);
+                // Consume the address written by this layer's captured pre
+                // graph, even if another layer later replaced ws.kv storage.
+                b.kv = state->segments[l * 4].kvOutputs.at(rank);
                 b.output = ptr(ws.attnOut);
                 b.rawKV = ptr(ws.rawKVAll);
                 b.rawScore = ptr(ws.rawScoreAll);
@@ -421,9 +506,11 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         capture([&] {
             V41HcApplyPre(ws.hiddenStates, ws.ffnPre, g->head);
             V41RMSNormBF16(g->head, weight["norm.weight"], rms_norm_eps, g->norm);
-            ToDataType(g->norm, g->normFloat, DataType::FLOAT32);
             weight["head.weight"].tpLinearType = TP_LINEAR_ROW;
-            Linear(g->normFloat, weight["head.weight"], *GetEmptyData(), g->logits);
+            if (!TryBFloat16HeadLinear(g->norm, g->logits)) {
+                ToDataType(g->norm, g->normFloat, DataType::FLOAT32);
+                Linear(g->normFloat, weight["head.weight"], *GetEmptyData(), g->logits);
+            }
             if (verifying) {
                 if (g->gatheredLogits.dims.empty()) {
                     FastllmCudaSetDevice(g->devices.front());
@@ -489,18 +576,39 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     FastllmCudaSetDevice(original);
 }
 
-bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f) {
+bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepared) {
     // Verification warmup uses the same composition/replay path as requests.
     // Ordinary decode still builds its full graph explicitly after warmup.
     if (!f.graphReplay || !f.graphState || (v41CudaGraphWarmingUp && !f.dsparkVerify) || f.quantKV ||
         f.hasImageTokens || f.inputEmbeds)
         return false;
+    // Building a graph warms its children and therefore still needs the eager
+    // input on its first call. Only an existing graph may bypass that frontend.
+    if (!inputsPrepared && (!f.graphState->fullDecode ||
+            !std::static_pointer_cast<V41FullGraph>(f.graphState->fullDecode)->capturesInput))
+        return false;
+    if (!inputsPrepared) {
+        // Preserve the address checks normally performed by PrepareInputs.
+        // Forced-invalidation diagnostics use that frontend's recapture path.
+        if (V41DecodeCudaGraphInvalidateEvery() > 0) return false;
+        std::vector<const void *> current;
+        CollectForwardGraphPointers(f, current);
+        if (current != f.graphState->boundaryPointers) return false;
+    }
     if (f.dsparkVerify && !f.graphState->fullVerifyAttempted) {
         f.graphState->fullVerifyAttempted = true;
         BuildFullDecodeGraph(f.seqlen, f.inputSegments);
     }
     if (!f.graphState->fullDecode) return false;
     auto g = std::static_pointer_cast<V41FullGraph>(f.graphState->fullDecode);
+    if (g->capturesInput) {
+        if ((int)f.tokenIds.size() != g->batch) return false;
+        const int vocab = weight["embed.weight"].dims[0];
+        for (int i = 0; i < g->batch; ++i) {
+            if (f.tokenIds[i] < 0 || f.tokenIds[i] >= vocab) return false;
+            g->hostTokens[i] = f.tokenIds[i];
+        }
+    }
     if (!V41FullReserve(*g, f.inputSegments))
         return false;
     const auto snapshots = V41SnapshotSegments(f.inputSegments, engram_max_ngram_size);
@@ -537,6 +645,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f) {
     V41FullAdvance(*g, f.inputSegments);
     f.curHidden = &f.ws->hiddenStates;
     f.preMixPtr = &f.ws->ffnPre;
+    if (!inputsPrepared) ++f.graphState->replayCount;
     f.fullGraphHead = &g->head;
     f.fullGraphLogits = g->verifying ? &g->gatheredLogits : &g->logits;
     return true;

@@ -7503,10 +7503,10 @@ auto st = std::chrono::system_clock::now();
              MultiCudaEnvFlagEnabled("FASTLLM_MULTICUDA_MOE_EXPERT_PARALLEL"));
         const bool deferRankReduction = intParams.count("deferRankReduction") &&
             intParams.at("deferRankReduction");
-        AssertInFastLLM(!deferRankReduction || (deepSeekV41 && n == 1 && useExpertParallel &&
+        AssertInFastLLM(!deferRankReduction || (deepSeekV41 && n >= 1 && n <= 8 && useExpertParallel &&
             input.multiDeviceData && input.IsTensorParallelReplicated() &&
             input.dataType == DataType::BFLOAT16 && !hasSharedExpert && !pairedReduceInput),
-            "Deferred MoE reduction requires native BF16 single-token EP replicas.\n");
+            "Deferred MoE reduction requires native BF16 small-batch EP replicas.\n");
         if (useExpertParallel && hasSharedExpert && !weights[0]->multiDeviceData) {
             AssertInFastLLM(weights[1] != nullptr && weights[0]->dims.size() == 2 &&
                             weights[1]->dims.size() == 2 &&

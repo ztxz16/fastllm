@@ -42,7 +42,10 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool dense_fp32 = false,
           const bool add_residual = false,
           const bool fuse_swiglu = false,
-          const bool bf16_output = false>
+          const bool bf16_output = false,
+          // Small-M MXFP8: independent partials, deterministic last-CTA reduce.
+          const bool parallel_fp32_reduce = false,
+          const bool fp32_output = false>
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
 }

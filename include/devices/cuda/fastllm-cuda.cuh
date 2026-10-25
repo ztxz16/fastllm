@@ -374,6 +374,11 @@ bool FastllmCudaMarlinHalfFP8Gemm(const void *a, const uint32_t *b_q_weight,
 // SM80+ BF16 / E4M3 / E8M0 block-32; preserves generic row-major weights.
 bool FastllmCudaMarlinBFloat16MXFP8Gemm(const void *a, const uint32_t *weight,
     const uint8_t *scales, void *c, int rows, int columns, int inner, int *workspace);
+// Small-M MXFP8 partial dot products, with FP32 output and no BF16 rounding.
+bool FastllmCudaMarlinBFloat16MXFP8GemmToFloat(const void *a, const uint32_t *weight,
+    const uint8_t *scales, float *c, int rows, int columns, int inner, int *workspace);
+bool FastllmCudaTryMarlinBFloat16MatMulFP8E4M3ToFloat(const void *input,
+    fastllm::Data &weight, float *output, int rows, int inner, int columns);
 bool FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(const void *input,
     fastllm::Data &weight, void *output, int rows, int inner, int columns);
 // SM120 W8A8 MXFP8 linear: FP8 E4M3 weights with exact block-32 UE8M0
@@ -560,6 +565,10 @@ bool FastllmCudaV41Mxfp4Linear(const fastllm::Data &input, const fastllm::Data &
 bool FastllmCudaDeepSeekV41MoeHcPost(const fastllm::Data &input,
     const fastllm::Data &shared, const fastllm::Data &residual,
     const fastllm::Data &post, const fastllm::Data &comb, fastllm::Data &output);
+// Round each FP32 local branch to BF16, then round their sum to BF16.
+// The distinct output is ready for a BF16 collective; inputs are not modified.
+bool FastllmCudaDeepSeekV41MoeJoinBFloat16(const float *routed, const float *shared,
+                                        void *output, int count);
 // BF16 routed rows: preserve activation rounding before block-32 FP8 quantization.
 bool FastllmCudaDeepSeekV41BFloat16SwigluQuantized(const void *input, void *output,
         int rows, int intermediate, float limit, const float *routeScales);

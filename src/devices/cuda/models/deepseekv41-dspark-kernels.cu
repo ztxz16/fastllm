@@ -44,6 +44,12 @@ namespace {
     constexpr int kDsparkMarkovMaxRank = 512;
     // 分块数：够填满 GPU 就行，太多会让归约那一步变慢
     constexpr int kDsparkMarkovChunks = 128;
+    constexpr int kDsparkMarkovGroupedChunks = 256;
+
+    bool DsGroupedScore(const Data &weight, int vocab, int rank) {
+        return weight.dataType == DataType::BFLOAT16 && rank == 256 && vocab >= 32768 &&
+            ((uintptr_t)weight.cudaData & 15) == 0;
+    }
 
     __device__ __forceinline__ float DsLoad(const half *p, int i) {
         return __half2float(p[i]);
@@ -55,6 +61,27 @@ namespace {
 
     __device__ __forceinline__ float DsLoad(const float *p, int i) {
         return p[i];
+    }
+
+    // Input construction is pure copying and integer indexing. Keep it in the
+    // graph so each replay only uploads the position and anchor (eight bytes).
+    __global__ void DsparkInputKernel(const uint16_t *embedding, const int *metadata,
+        int noiseToken, int block, int hcMult, int dim, int windowSize,
+        uint16_t *hidden, float *preMix, int *indices, int *tokens) {
+        const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+        const int anchor = metadata[1], width = windowSize + block - 1;
+        if (i < (int64_t)block * hcMult * dim) {
+            const int row = i / ((int64_t)hcMult * dim), channel = i % dim;
+            hidden[i] = embedding[(int64_t)(row ? noiseToken : anchor) * dim + channel];
+        }
+        if (i < block * hcMult) preMix[i] = i % hcMult == 0 ? 1.0f : 0.0f;
+        if (i < (int64_t)block * width) {
+            const int row = i / width, col = i % width;
+            const int draft = col - windowSize;
+            indices[i] = col < windowSize ? (metadata[0] - windowSize + col) % windowSize
+                : windowSize + draft + (draft >= row);
+        }
+        if (i == 0) tokens[0] = anchor;
     }
 
     struct DsBest {
@@ -160,6 +187,49 @@ namespace {
         }
     }
 
+    // Four lanes read adjacent 16-byte vectors of each BF16 row. This
+    // coalesces the 256-wide projection and shortens its serial FMA chain.
+    // Accumulation and final scores stay FP32; only the reduction order changes.
+    __global__ void DsparkMarkovGroupedScoreKernel(
+        const float *logits, const __nv_bfloat16 *embed, const __nv_bfloat16 *head,
+        const int *tokens, int step, int vocab, float *partialValue, int *partialIndex) {
+        constexpr int lanes = 4, rank = 256, rowsPerBlock = kDsparkMarkovThreads / lanes;
+        __shared__ float e[rank];
+        __shared__ DsBest reduce[kDsparkMarkovThreads];
+        e[threadIdx.x] = __bfloat162float(embed[(int64_t)tokens[step] * rank + threadIdx.x]);
+        __syncthreads();
+        const int lane = threadIdx.x % lanes;
+        const unsigned mask = ((1u << lanes) - 1) << ((threadIdx.x & 31) / lanes * lanes);
+        const int perChunk = (vocab + gridDim.x - 1) / gridDim.x;
+        const int begin = blockIdx.x * perChunk, end = min(vocab, begin + perChunk);
+        DsBest best{-FLT_MAX, vocab};
+        for (int v = begin + threadIdx.x / lanes; v < end; v += rowsPerBlock) {
+            float dot = 0.0f;
+#pragma unroll
+            for (int i = 0; i < rank / (8 * lanes); ++i) {
+                const int d = (i * lanes + lane) * 8;
+                const uint4 packed = *(const uint4*)(head + (int64_t)v * rank + d);
+                const __nv_bfloat16 *values = (const __nv_bfloat16*)&packed;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    dot = fmaf(__bfloat162float(values[j]), e[d + j], dot);
+            }
+#pragma unroll
+            for (int offset = lanes / 2; offset > 0; offset /= 2)
+                dot += __shfl_down_sync(mask, dot, offset, lanes);
+            if (lane == 0) {
+                const float score = logits[(int64_t)step * vocab + v] + dot;
+                if (score > best.value || (score == best.value && v < best.index))
+                    best = {score, v};
+            }
+        }
+        DsBlockArgmax(best, reduce);
+        if (threadIdx.x == 0) {
+            partialValue[blockIdx.x] = best.value;
+            partialIndex[blockIdx.x] = best.index;
+        }
+    }
+
     // 第二步：归约各块的结果，写下一个 token；顺便把本步用到的嵌入存给 confidence head
     template <typename WT>
     __global__ void DsparkMarkovReduceKernel(const float *partialValue, const int *partialIndex, int chunks,
@@ -213,14 +283,44 @@ namespace {
                        float *partialValue, int *partialIndex, float *outEmbeds) {
         const WT *embedData = (const WT*)embedWeight.cudaData;
         const WT *headData = (const WT*)headWeight.cudaData;
+        const bool grouped = DsGroupedScore(headWeight, vocab, rank);
+        const int chunks = grouped ? kDsparkMarkovGroupedChunks : kDsparkMarkovChunks;
         for (int step = 0; step < block; step++) {
-            DsparkMarkovScoreKernel<WT><<<kDsparkMarkovChunks, kDsparkMarkovThreads>>>(
+            if (grouped) {
+                DsparkMarkovGroupedScoreKernel<<<chunks, kDsparkMarkovThreads>>>(
+                    logits, (const __nv_bfloat16*)embedData, (const __nv_bfloat16*)headData,
+                    tokens, step, vocab, partialValue, partialIndex);
+            } else DsparkMarkovScoreKernel<WT><<<kDsparkMarkovChunks, kDsparkMarkovThreads>>>(
                 logits, embedData, headData, tokens, step, vocab, rank, partialValue, partialIndex);
             DsparkMarkovReduceKernel<WT><<<1, kDsparkMarkovThreads>>>(
-                partialValue, partialIndex, kDsparkMarkovChunks, embedData, tokens, step, rank,
+                partialValue, partialIndex, chunks, embedData, tokens, step, rank,
                 tokens, outEmbeds);
         }
     }
+}
+
+extern "C" bool FastllmCudaDeepSeekV41DraftInput(const Data &embedding, const Data &metadata,
+    int noiseToken, int block, int hcMult, int windowSize,
+    Data &hidden, Data &preMix, Data &indices, Data &tokens) {
+    if (!DsOnCuda(embedding) || embedding.dataType != DataType::BFLOAT16 ||
+        (embedding.dataDeviceIds.empty() || embedding.dataDeviceIds.front() != FastllmCudaGetDevice()) ||
+        embedding.dims.size() != 2 || embedding.dims[0] <= noiseToken || noiseToken < 0 ||
+        embedding.dims[1] <= 0 || embedding.strides.size() != 2 ||
+        embedding.strides[0] != embedding.dims[1] || embedding.strides[1] != 1 ||
+        !DsOnCuda(metadata) || metadata.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
+        metadata.dataType != DataType::INT32 || metadata.dims != std::vector<int>{2} ||
+        metadata.strides.size() != 1 || metadata.strides[0] != 1 ||
+        block <= 0 || block > 8 || hcMult <= 0 || windowSize <= 0) return false;
+    const int dim = embedding.dims[1], width = windowSize + block - 1;
+    if (!DsPrepareOutput(hidden, DataType::BFLOAT16, {1, block, hcMult, dim}) ||
+        !DsPrepareOutput(preMix, DataType::FLOAT32, {1, block, hcMult}) ||
+        !DsPrepareOutput(indices, DataType::INT32, {1, block, width}) ||
+        !DsPrepareOutput(tokens, DataType::INT32, {block + 1})) return false;
+    const int64_t count = std::max((int64_t)block * hcMult * dim, (int64_t)block * width);
+    DsparkInputKernel<<<(count + 255) / 256, 256>>>((const uint16_t*)embedding.cudaData,
+        (const int*)metadata.cudaData, noiseToken, block, hcMult, dim, windowSize,
+        (uint16_t*)hidden.cudaData, (float*)preMix.cudaData, (int*)indices.cudaData, (int*)tokens.cudaData);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 // logits: [1, block, vocab] FLOAT32；embedWeight / headWeight: [vocab, rank] FP16 / BF16 / FP32。
@@ -261,8 +361,10 @@ extern "C" bool FastllmCudaDeepSeekV41MarkovChainDevice(const fastllm::Data &log
         return false;
     }
 
-    if (!DsPrepareOutput(values, DataType::FLOAT32, {kDsparkMarkovChunks}) ||
-        !DsPrepareOutput(indices, DataType::INT32, {kDsparkMarkovChunks})) return false;
+    const int chunks = DsGroupedScore(headWeight, vocab, rank)
+        ? kDsparkMarkovGroupedChunks : kDsparkMarkovChunks;
+    if (!DsPrepareOutput(values, DataType::FLOAT32, {chunks}) ||
+        !DsPrepareOutput(indices, DataType::INT32, {chunks})) return false;
     int *tokens = (int*)tokenBuffer.cudaData;
     float *partialValue = (float*)values.cudaData;
     int *partialIndex = (int*)indices.cudaData;

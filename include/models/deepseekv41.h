@@ -379,11 +379,12 @@ namespace fastllm {
 
         // Retain tensor storage until this scope drains all TP ranks.
         class ScopedTpDispatch {
-            bool enabled, previous = false;
+            bool enabled, previous = false, deviceWorkComplete = false;
             const std::vector<int> &devices;
         public:
             ScopedTpDispatch(bool enabled, const std::vector<int> &devices);
             ~ScopedTpDispatch();
+            void MarkDeviceWorkComplete() { deviceWorkComplete = true; }
             ScopedTpDispatch(const ScopedTpDispatch &) = delete;
             ScopedTpDispatch &operator=(const ScopedTpDispatch &) = delete;
         };
@@ -418,7 +419,7 @@ namespace fastllm {
         void PrepareForward(ForwardWorkspace &);
         void PrepareForwardInputs(ForwardWorkspace &);
 #ifdef USE_CUDA
-        bool TryFullDecodeGraph(ForwardWorkspace &);
+        bool TryFullDecodeGraph(ForwardWorkspace &, bool inputsPrepared);
         void BuildFullDecodeGraph(int batch, const std::vector<DeepSeekV41Segment> &segments);
 #endif
         void BeginForwardLayer(ForwardWorkspace &, int layer);
@@ -563,6 +564,11 @@ namespace fastllm {
         // 对一批片段做 Engram：各片段分别算哈希行号，查表 / wkv / 门控按整批执行
         void RunEngram(int layer, int engramLayerIndex, const std::vector<DeepSeekV41Segment> &segments,
                        Data &hiddenStates, EngramPrefetch *prefetch);
+
+        // Exact BF16 copies of immutable target-head vocabulary shards. Keep
+        // FP32 accumulation/logits and the original FP32 fallback checkpoint.
+        std::shared_ptr<void> v41TargetHeadWeights;
+        bool TryBFloat16HeadLinear(Data &input, Data &output);
     };
 }
 

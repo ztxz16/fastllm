@@ -1896,9 +1896,10 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
                                         dataType, localEligible, rankData, hostSpinMicroseconds)) {
         return false;
     }
-    if (dataType == fastllm::DataType::BFLOAT16 && state.taggedPeer &&
-        state.taggedPeer->CanUse(count)) {
-        const bool launched = state.taggedPeer->Launch(data, dest, count, rank);
+    if ((dataType == fastllm::DataType::BFLOAT16 || dataType == fastllm::DataType::FLOAT32) &&
+        state.taggedPeer && state.taggedPeer->CanUse(count)) {
+        const bool launched = state.taggedPeer->Launch(
+            data, dest, count, rank, dataType == fastllm::DataType::FLOAT32);
         if (cudaGetLastError() != cudaSuccess) {
             FastllmCudaSetThreadError();
             return false;
@@ -3111,7 +3112,7 @@ bool FastllmCudaCustomAllReduceAndGather(void *routed, void *dest,
             fastllm::FLOAT32, eligible, routedData) ||
         !FindOrRegisterCustomArPointers(state, rank, shared, count,
             fastllm::BFLOAT16, eligible, sharedData)) return false;
-    if (state.taggedPeer && state.taggedPeer->CanUse(count)) {
+    if (state.taggedPeer && state.taggedPeer->CanUseJoint(count)) {
         const bool launched = state.taggedPeer->LaunchJoint(routed, dest, shared, count, rank);
         if (cudaGetLastError() != cudaSuccess) {
             FastllmCudaSetThreadError();

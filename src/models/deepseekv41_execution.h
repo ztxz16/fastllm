@@ -6,6 +6,7 @@
 
 namespace fastllm {
     struct DeepSeekV41HybridWorkspace;
+    enum class V41SharedExpertPartition : uint8_t { Replicated, OutputRows, Intermediate };
     struct DeepSeekV41DecodeWorkspace {
         // Reuse request-row views and overwritten indexer outputs across
         // decode calls. Per-forward validity flags still start empty: retained
@@ -24,7 +25,7 @@ namespace fastllm {
         Data attnInputFloat, rawKVAll, rawScoreAll, qIdxAll, idxWeights, idxWeightsAll;
         Data ffnInput, ffnOut, gateInput, gateLogits, expertIndex, expertScore;
         Data sharedGateup, sharedSwiglu, sharedExpertOut;
-        bool sharedExpertSharded = false;  // Valid only until the joint MoE collective.
+        V41SharedExpertPartition sharedExpertPartition = V41SharedExpertPartition::Replicated;
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
         Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
         std::unique_ptr<DeepSeekV41HybridWorkspace> hybrid;
@@ -93,7 +94,7 @@ struct DeepSeekV41Model::ForwardState {
     void HybridExperts(int layer);
     void BeginHybridStep();
     void PrepareInputs();
-    bool FullGraph();
+    bool FullGraph(bool inputsPrepared = true);
     std::vector<int> Finish();
 };
 }
