@@ -28,6 +28,7 @@
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "fastllm-v41-decode.cuh"
+#include "devices/cuda/fastllm-append-only-cuda-rows.h"
 #include "devices/cuda/fastllm-v41-engram.h"
 #include "deepseekv41-reference.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
@@ -5669,6 +5670,12 @@ namespace fastllm {
                 DeepSeekV41LayerCache &cache = (f.prefill ? f.prefill->request->layers : seg.state->layers)[layer];
                 const int startPos = seg.startPos;
                 const int segLen = seg.seqlen;
+#ifdef USE_CUDA
+                if (startPos == 0 || startPos < cache.totalLen) {
+                    if (cache.compressedReaders) cache.compressedReaders->Invalidate();
+                    if (cache.indexReaders) cache.indexReaders->Invalidate();
+                }
+#endif
 
                 Data *qSeg = batchAttention ? &segQ[s] : sliceOf(q, s, segQ[s]);
                 if (!batchTransforms) V41RotaryQuant(*qSeg, rope, startPos, 1, false, 0, 32);
@@ -5763,6 +5770,34 @@ namespace fastllm {
                                     "DeepSeekV41: compressed cache is out of sync at layer " + std::to_string(layer));
                     if (srcCache.compressedBlocks > 0) {
                         compressedKV = &srcCache.compressedKV;
+                        Data *indexKeys = &srcCache.indexK;
+#ifdef USE_CUDA
+                        // PP readers must not migrate a shared source cache away
+                        // from its writer. Reuse device-local prefixes, appending
+                        // only new rows. TP, graphs and speculation retain their
+                        // own cache/rollback protocols.
+                        const bool cacheReaders = tpDevices.empty() && !v41DsparkEnabled &&
+                            !f.graphActive && !f.dsparkVerify && !seg.spec && segLen == 1 &&
+                            qSeg->dataDevice == DataDevice::CUDA && qSeg->dataDeviceIds.size() == 1;
+                        if (cacheReaders) {
+                            const int device = qSeg->dataDeviceIds[0];
+                            if (!srcCache.compressedReaders)
+                                srcCache.compressedReaders = std::make_shared<CudaAppendOnlyRows>();
+                            if (Data *local = srcCache.compressedReaders->Get(srcCache.compressedKV, device))
+                                compressedKV = local;
+                            if (needIndexer) {
+                                if (!srcCache.indexReaders)
+                                    srcCache.indexReaders = std::make_shared<CudaAppendOnlyRows>();
+                                if (Data *local = srcCache.indexReaders->Get(srcCache.indexK, device))
+                                    indexKeys = local;
+                            }
+                        } else {
+                            // Includes prefill/replay and any fallback mode: an
+                            // existing prefix may be rewritten before next decode.
+                            if (srcCache.compressedReaders) srcCache.compressedReaders->Invalidate();
+                            if (srcCache.indexReaders) srcCache.indexReaders->Invalidate();
+                        }
+#endif
                         if (needIndexer) {
 #ifdef USE_CUDA
                             if (batchAttention && !quantKV) {
@@ -5771,7 +5806,7 @@ namespace fastllm {
                                 const bool useCandidates = segHasCandidates[s] && candidate_source_layer_id >= 0 &&
                                     candidate_source_layer_id < layer;
                                 indexTasks.push_back({sliceOf(qIdxAll, s, segIndexQ[s]),
-                                    sliceOf(idxWeightsAll, s, segIndexWeight[s]), &srcCache.indexK,
+                                    sliceOf(idxWeightsAll, s, segIndexWeight[s]), indexKeys,
                                     &segCandidate[s], &segTopK[s], startPos, writeCandidates, useCandidates});
                                 if (writeCandidates) segHasCandidates[s] = 1;
                                 cmpIdx = &segTopK[s];
@@ -5788,12 +5823,12 @@ namespace fastllm {
                                                        candidate_source_layer_id < layer;
                             // 分数矩阵是 [token, m]，长上下文下会非常大（1M 上下文时每个 token 512 K 个候选）。
                             // 按 token 维分块调用打分 / 候选块 / top-k，把峰值显存钉在一个固定预算内。
-                            const int scoreM = srcCache.indexK.dims.size() == 3 ? srcCache.indexK.dims[1] : 0;
+                            const int scoreM = indexKeys->dims.size() == 3 ? indexKeys->dims[1] : 0;
                             int chunkTokens = V41IndexScoreChunk(segLen, scoreM);
                             bool partitionedIndexer = false;
 #ifdef USE_CUDA
                             partitionedIndexer = !dumpDebug && V41PrefillIndexerTp(
-                                *qIdx, *idxWeightsScaled, srcCache.indexK, segCandidate[s], segTopK[s],
+                                *qIdx, *idxWeightsScaled, *indexKeys, segCandidate[s], segTopK[s],
                                 isCandidateLayer, useCandidates, ratio, startPos, indexTopK,
                                 candidate_block_size, candidate_topk_blocks, tpDevices);
 #endif
@@ -5801,7 +5836,7 @@ namespace fastllm {
                                 if (isCandidateLayer) segHasCandidates[s] = 1;
                             } else if (chunkTokens >= segLen) {
                                 Data score;
-                                V41IndexerScore(*qIdx, *idxWeightsScaled, srcCache.indexK, ratio, startPos, score);
+                                V41IndexerScore(*qIdx, *idxWeightsScaled, *indexKeys, ratio, startPos, score);
                                 if (dumpDebug) {
                                     V41DumpTensor(*qIdx, "fl_layer" + std::to_string(layer) + "_idxq" + dumpSuffix);
                                     V41DumpTensor(*idxWeightsScaled, "fl_layer" + std::to_string(layer) + "_idxw" + dumpSuffix);
@@ -5831,7 +5866,7 @@ namespace fastllm {
                                     Data qChunk, wChunk, score, candChunk, topkChunk;
                                     Split(*qIdx, 1, c0, c1, qChunk);
                                     Split(*idxWeightsScaled, 1, c0, c1, wChunk);
-                                    V41IndexerScore(qChunk, wChunk, srcCache.indexK, ratio, startPos + c0, score);
+                                    V41IndexerScore(qChunk, wChunk, *indexKeys, ratio, startPos + c0, score);
                                     Data *candPtr = nullptr;
                                     if (isCandidateLayer) {
                                         V41CandidateBlocks(score, candidate_block_size, candidate_topk_blocks, ratio,
