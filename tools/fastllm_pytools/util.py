@@ -941,9 +941,13 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--auto_gpu_memory_limit', '--auto-gpu-memory-limit',
                         dest='auto_gpu_memory_limit', type=_memory_size_or_auto, default=None,
                         help='自动规划时每张可见GPU的显存上限，如20g；未指定则读取实际可用显存')
-    parser.add_argument('--auto_host_memory_limit', '--auto-host-memory-limit',
+    host_memory = parser.add_mutually_exclusive_group()
+    host_memory.add_argument('--auto_host_memory_limit', '--auto-host-memory-limit',
                         dest='auto_host_memory_limit', type=_memory_size_or_auto, default=None,
-                        help='自动规划时主机内存上限，如128g；未指定则读取实际可用内存')
+                        help='收紧自动规划的主机内存上限，如128g；不能超过检测到的可用预算')
+    host_memory.add_argument('--force_ddr_limit', '--force-ddr-limit',
+                        dest='force_ddr_limit', type=_memory_size_or_auto, default=None,
+                        help='强制指定最终主存规划预算，如114g；替代CMA/cgroup检测及自动预留后的预算，不改变系统硬限制，过大可能OOM；与auto_host_memory_limit互斥')
     parser.add_argument('--auto_disk_cache_ratio', '--auto-disk-cache-ratio', type=float, default=0.5,
                         help='DeepSeek-V4.1自动混合NUMA/disk时，主存缓存覆盖disk专家权重的推荐最低比例（0到1，默认0.5）；仅估算容量')
     parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹或配置文件')

@@ -82,6 +82,20 @@ class AutotuneTest(unittest.TestCase):
             self.assertIn("autotune_profile", saved)
             self.assertIn("autotune_prompt", saved)
 
+    def test_forced_host_budget_survives_candidate_planning_and_live_recheck(self):
+        self.a.force_ddr_limit = '32g'
+        baseline = self.baseline()
+        pool = self.pool(baseline)
+        self.assertGreater(len(pool), 1)
+        for candidate in pool:
+            self.assertEqual(candidate['plan']['host_budget_bytes'], 32 * GiB)
+            with patch.object(memory, 'host_memory', return_value={'total': GiB, 'available': 0}):
+                self.assertTrue(tune.fits(candidate, self.a, self.gpu.__getitem__))
+                self.assertFalse(tune.fits(candidate, self.a, lambda d: {'total': 8 * GiB, 'free': GiB}))
+        self.a.force_ddr_limit = baseline['host_estimated_bytes'] - 1
+        with patch.object(memory, 'host_memory', return_value=self.ram):
+            self.assertFalse(tune.fits(pool[0], self.a, self.gpu.__getitem__))
+
     def test_candidates_keep_baseline_and_account_for_both_gpu_pools(self):
         p = self.baseline()
         before = copy.deepcopy(vars(self.a)), copy.deepcopy(p)

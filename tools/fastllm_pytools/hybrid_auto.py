@@ -27,9 +27,11 @@ def requested(args):
 
 
 def _memory_limit_bytes(value, label):
-    """Return an optional explicit planner cap in bytes."""
+    """Return an optional explicit planner memory size in bytes."""
     if value is None or str(value).strip().lower() in ("", "auto"):
         return None
+    if isinstance(value, bool):
+        raise ValueError("Hybrid auto: %s is invalid" % label)
     try:
         from .util import _memory_size_bytes
         result = _memory_size_bytes(value)
@@ -38,6 +40,21 @@ def _memory_limit_bytes(value, label):
     if result <= 0:
         raise ValueError("Hybrid auto: %s must be positive" % label)
     return result
+
+
+def host_budget(args, ram):
+    """Return the effective host budget and normalized cap/override options."""
+    limit = _memory_limit_bytes(getattr(args, "auto_host_memory_limit", None), "auto_host_memory_limit")
+    override = _memory_limit_bytes(getattr(args, "force_ddr_limit", None), "force_ddr_limit")
+    # Saved JSON settings and direct API calls bypass argparse's exclusivity.
+    if limit is not None and override is not None:
+        raise ValueError("Hybrid auto: --force_ddr_limit and --auto_host_memory_limit are mutually exclusive")
+    budget = ram["available"] - min(4 * GiB, max(GiB, ram["total"] // 10))
+    if override is not None:
+        budget = override
+    elif limit is not None:
+        budget = min(budget, limit)
+    return budget, limit, override
 
 
 @dataclass(frozen=True)
@@ -975,12 +992,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
     # The library queries free memory after creating the CUDA contexts. Keep
     # additional space for graphs, allocator granularity and library handles.
     guard = 512 * MiB
-    host_limit = ram["available"] - min(4 * GiB, max(GiB, ram["total"] // 10))
-    host_memory_limit = _memory_limit_bytes(
-        getattr(args, "auto_host_memory_limit", None), "auto_host_memory_limit"
-    )
-    if host_memory_limit is not None:
-        host_limit = min(host_limit, host_memory_limit)
+    host_limit, host_memory_limit, host_memory_override = host_budget(args, ram)
     # DeepSeek's prefill path can amortize the indexed attention and MoE
     # dispatch over a larger block for every host-backed expert backend.  The
     # capacity solver still rejects 8192 when the GPU workspace cannot hold it.
@@ -1195,7 +1207,8 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                     "expert_transport_bytes_per_device": transport,
                     "expert_host_staging_bytes": len(mapping) * disk_staging,
                     "auto_gpu_memory_limit": gpu_memory_limit,
-                    "auto_host_memory_limit": host_memory_limit}
+                    "auto_host_memory_limit": host_memory_limit,
+                    "force_ddr_limit": host_memory_override}
             if independent and host_experts:
                 candidate["moe_cuda_cache_per_device"] = cache
             if model.family == "deepseek_v41":

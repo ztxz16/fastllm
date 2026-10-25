@@ -287,6 +287,7 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--gpu_mem_ratio` | `0.9` | 可用于模型与缓存的 GPU 显存比例 |
 | `--auto_gpu_memory_limit` | 未设置 | `--auto` 时限制每张可见 GPU 的规划显存，例如 `20g`；未设置则读取实际可用显存 |
 | `--auto_host_memory_limit` | 未设置 | `--auto` 时限制自动规划使用的主机内存总量，例如 `128g`；未设置则读取实际可用内存 |
+| `--force_ddr_limit` | 未设置 | 强制指定最终主存规划预算，例如 `114g`，可超过自动检测上限，不再扣除 CMA 或自动预留；与 `--auto_host_memory_limit` 互斥，不修改系统内存硬限制，见[预算说明](docs/hybrid-auto.md) |
 | `--moe_cuda_cache` / `--moe-cuda-cache` | `0` | GPU 专家权重缓存预算，例如 `3g`（3 GiB）；`0` 关闭。配合 CUDA 主计算与 CPU/NUMA/disk 专家使用，KV Cache、普通权重及工作区另算；见[专家缓存说明](docs/cuda-expert-cache.md) |
 | `--moe_cpu_cache` / `--moe-cpu-cache` | `0` | `--moe_device disk` 的专家内存缓存总预算，例如 `32g`；可与显存专家缓存同时使用，见[磁盘多级缓存](docs/cuda-expert-cache.md#disk-backed-multilevel-cache) |
 | `--kv_cache_limit` | `auto` | KV Cache 最大使用量 |

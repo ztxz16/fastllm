@@ -323,10 +323,7 @@ def choose_winner(trials):
 def fits(candidate, args, query_gpu):
     """Re-read live CMA/cgroup/GPU limits after each child releases its model."""
     ram = memory.host_memory(reclaim_file_cache=True)
-    host = ram["available"] - min(4 * GiB, max(GiB, ram["total"] // 10))
-    cap = memory._memory_limit_bytes(args.auto_host_memory_limit, "auto_host_memory_limit")
-    if cap is not None:
-        host = min(host, cap)
+    host, _, _ = memory.host_budget(args, ram)
     plan = candidate["plan"]
     if plan["host_estimated_bytes"] > host:
         return False

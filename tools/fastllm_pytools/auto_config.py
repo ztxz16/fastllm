@@ -481,7 +481,8 @@ def _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model, info, 
                            "cuda_graph": os.environ.get("FASTLLM_CUDA_GRAPH", "1") != "0",
                            "mtp_verify_cuda_graph": os.environ.get(verify_graph_env, "1") != "0",
                            "gpu_memory_limit": result.get("auto_gpu_memory_limit"),
-                           "host_memory_limit": result.get("auto_host_memory_limit")}
+                           "host_memory_limit": result.get("auto_host_memory_limit"),
+                           "force_ddr_limit": result.get("force_ddr_limit")}
     print("[auto] " + json.dumps(result, sort_keys=True), flush=True)
     return result
 
@@ -737,6 +738,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         result.setdefault("notes", []).append("Native fake-quantized KV uses lossless FP4 packing (FP8 sliding window)")
     result["automatic"]["gpu_memory_limit"] = result.get("auto_gpu_memory_limit")
     result["automatic"]["host_memory_limit"] = result.get("auto_host_memory_limit")
+    result["automatic"]["force_ddr_limit"] = result.get("force_ddr_limit")
     result["automatic"]["disk_cache_ratio"] = ratio
     if chosen.dspark:
         result["automatic"]["dspark_confidence_threshold"] = chosen.speculative_dspark_confidence_threshold

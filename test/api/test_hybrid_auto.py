@@ -561,6 +561,26 @@ class HybridAutoTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     auto.plan(a, g, c, "pp", {0: 1}, gpu, ram)
 
+    def test_explicit_host_budget_bypasses_detection_but_still_checks_capacity(self):
+        g, costs, gpu, ram = fixture()
+        a = args(moe_device_layers=-1, moe_cuda_cache=0)
+        normal = auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+        required = normal["host_estimated_bytes"]
+        # Simulate CMA/cgroup accounting leaving less than the required RAM.
+        detected = {"total": 2 * GiB, "available": 0, "cma": GiB}
+        with self.assertRaises(ValueError):
+            auto.plan(a, g, costs, "pp", {0: 1}, gpu, detected)
+        a.force_ddr_limit = required
+        forced = auto.plan(a, g, costs, "pp", {0: 1}, gpu, detected)
+        self.assertEqual(forced["host_budget_bytes"], required)
+        self.assertEqual(forced["force_ddr_limit"], required)
+        self.assertEqual(forced["gpu_budget_bytes"], normal["gpu_budget_bytes"])
+        self.assertEqual(detected, {"total": 2 * GiB, "available": 0, "cma": GiB})
+        # An explicit budget remains a capacity constraint, even below detection.
+        a.force_ddr_limit = required - 1
+        with self.assertRaises(ValueError):
+            auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+
     def test_snapshot_fallback_counts_a_second_host_copy(self):
         g, c, gpu, ram = fixture()
         p = auto.plan(args(), g, c, "pp", {0: 1}, gpu, ram)

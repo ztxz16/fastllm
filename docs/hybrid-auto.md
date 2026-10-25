@@ -55,6 +55,16 @@ Qwen4 自动混推在主存充足时优先将目标专家全部放在主存，�
 
 主存预算从检测到的可用主存中扣除总主存的 10%，预留量最低 1 GiB、最高 4 GiB；显式 `--auto_host_memory_limit` 仍可进一步收紧预算。加载暂存、运行工作区和 KV 镜像另计入预计用量。这是规划预算，不是进程内存硬上限。
 
+需要突破自动检测上限时，可显式指定最终主存预算：
+
+```sh
+ftllm server /path/to/model.gguf --auto --force_ddr_limit 114g
+```
+
+`--force_ddr_limit`（别名 `--force-ddr-limit`）将最终预算直接设为指定值。`114g` 即 114 GiB，不再受检测到的可用主存或 cgroup 余量约束，也不再扣除 CMA 和自动预留；权重、KV、工作区、加载暂存和专家缓存的预计用量仍必须装进这个预算。它与只允许收紧预算的 `--auto_host_memory_limit` 互斥；省略或设为 `auto` 时保持原有检测行为，支持与其他内存参数相同的容量单位。
+
+该参数仅改变规划，不改变真实可分配内存、CMA 配置或系统／容器硬限制；预算过大仍可能导致分配失败或 OOM。`[auto]` 中的 `host_budget_bytes` 是实际采用的预算，`automatic.force_ddr_limit` 记录显式指定值。逐项自动预算和 `--autotune` 的候选规划也使用此值；autotune 实测时的低内存和 swap 保护仍保留。
+
 DeepSeek-V4.1 的单卡／PP 自动规划在无法让专家全部常驻显卡和主存时，会沿用已选的 GPU 驻留前缀、chunk 和上下文，再估算 `GPU → NUMA → disk` 的连续层分界。`--auto_disk_cache_ratio`（也可写 `--auto-disk-cache-ratio`）控制剩余 disk 专家权重可被主存缓存覆盖的推荐最低比例，默认 `0.5`，范围为 `0` 到 `1`：
 
 ```sh
@@ -142,6 +152,7 @@ Qwen4、GLM-5.3 和 DeepSeek-V4.1 的混合推理命令支持以下可选值：
 | `--chunked_prefill_size auto` | 在 4096、2048、1024、512、256 中选择满足内存预算的切片；DeepSeek-V4.1 所有主机专家后端额外优先考虑 8192，且不超过上下文长度 |
 | `--auto_gpu_memory_limit 20g` | 将自动规划的每张 GPU 显存预算限制为不超过 20 GiB |
 | `--auto_host_memory_limit 128g` | 将自动规划的主机内存预算限制为不超过 128 GiB |
+| `--force_ddr_limit 114g` | 强制将最终主存预算设为 114 GiB，允许超过自动检测上限；与 `--auto_host_memory_limit` 互斥 |
 
 只有写成 `auto` 的参数才参与自动选择。原有数值及默认值保持不变。
 `moe_device_layers` 的数值仍表示**末尾使用 `moe_device` 的层数**，不是 GPU 驻留层数；`-1` 表示全部专家层使用该设备。

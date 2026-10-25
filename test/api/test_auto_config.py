@@ -384,6 +384,45 @@ class AutoConfigTest(unittest.TestCase):
         a = self.args()
         self.assertIsNone(a.auto_gpu_memory_limit)
         self.assertIsNone(a.auto_host_memory_limit)
+        self.assertIsNone(a.force_ddr_limit)
+
+    def test_host_budget_override_is_final_and_auto_preserves_defaults(self):
+        normal = self.resolve(self.args())
+        self.assertEqual(normal, self.resolve(self.args('--force_ddr_limit', 'auto')))
+        for flag, value, expected in (('--force_ddr_limit', '40g', 40 * GiB),
+                                      ('--force-ddr-limit', '20GiB', 20 * GiB)):
+            with self.subTest(flag=flag):
+                p = self.resolve(self.args(flag, value))
+                self.assertEqual(p['host_budget_bytes'], expected)
+                self.assertEqual(p['automatic']['force_ddr_limit'], expected)
+                self.assertIsNone(p['automatic']['host_memory_limit'])
+                self.assertEqual(p['gpu_budget_bytes'], normal['gpu_budget_bytes'])
+
+    def test_host_budget_override_can_avoid_disk_experts(self):
+        self.mixed_fixture()
+        normal = self.resolve(self.args())
+        self.assertGreater(normal['disk_expert_bytes'], 0)
+        a = self.args('--force_ddr_limit', '40g')
+        forced = self.resolve(a)
+        self.assertEqual(a.moe_device, 'numa')
+        self.assertEqual(forced['moe_cpu_cache'], 0)
+        self.assertGreater(forced['host_estimated_bytes'], normal['host_budget_bytes'])
+        self.assertLessEqual(forced['host_estimated_bytes'], 40 * GiB)
+
+    def test_host_budget_and_limit_are_mutually_exclusive_in_cli_and_saved_settings(self):
+        with patch('sys.stderr', io.StringIO()), self.assertRaises(SystemExit):
+            self.args('--auto_host_memory_limit', '20g', '--force_ddr_limit', '40g')
+        a = self.args('--force_ddr_limit', '40g')
+        a.auto_host_memory_limit = '20g'  # Saved JSON bypasses argparse.
+        with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
+            self.resolve(a)
+
+    def test_host_budget_override_rejects_invalid_saved_values(self):
+        for value in (0, -1, float('inf'), float('nan'), True, 'invalid'):
+            a = self.args()
+            a.force_ddr_limit = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'force_ddr_limit'):
+                self.resolve(a)
 
     def test_memory_limits_cannot_inflate_detected_capacity(self):
         normal = self.resolve(self.args())

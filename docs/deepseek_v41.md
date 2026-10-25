@@ -115,6 +115,8 @@ ftllm server /path/to/DeepSeek-V4.1-Flash-1017 \
 如果需要模拟较小机器，使用 `--auto_gpu_memory_limit 20g` 和
 `--auto_host_memory_limit 128g`；它们限制自动规划预算，省略时自动读取实际硬件。
 
+如果需要突破自动检测的主存上限，可改用 `--force_ddr_limit 114g`：最终按 114 GiB 规划，不再扣除 CMA 或自动预留。它与 `--auto_host_memory_limit` 互斥，仅影响规划，不改变系统／容器硬限制；详见[主存预算说明](hybrid-auto.md)。
+
 ## 手动配置参考
 
 下面以单张 CUDA GPU + 大内存主机为例（专家与 Engram 表放在 CPU 内存；显存需求取决于上下文和 chunk）：
