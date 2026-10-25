@@ -121,7 +121,7 @@ static void CacheCompute(Data &input, Data &indices, Data &scores, std::vector<D
         static_cast<const float *>(scores.cudaData),topk,limit,static_cast<float *>(partial.cudaData)),
         "canonical cache compute rejected fixture"); };
     run();
-    if (rows == 5) {
+    {
         cudaGraph_t graph; cudaGraphExec_t exec;
         Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
         run(); Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph));
@@ -772,7 +772,7 @@ static int Case(int gt, int dt, int hidden, int inter, int device, bool missing)
     }
     Data gate, activation, workspace, output, ref;
     int checks = 0;
-    for (int rows : hostPrefillTest ? std::vector<int>{33,128,2048} : batchGridTest ? std::vector<int>{1,2,8} : decodeGridTest ? std::vector<int>{1} : sparseTest ? std::vector<int>{512,1024} : groupedTest ? std::vector<int>{33,64,129} : cacheTest ? std::vector<int>{1,5,8} : std::vector<int>{1,2,8,32}) for (int pattern = 0; pattern < 3; ++pattern) {
+    for (int rows : hostPrefillTest ? std::vector<int>{33,128,2048} : batchGridTest ? std::vector<int>{1,2,5,8} : decodeGridTest ? std::vector<int>{1} : sparseTest ? std::vector<int>{512,1024} : groupedTest ? std::vector<int>{33,64,129} : cacheTest ? std::vector<int>{1,5,8} : std::vector<int>{1,2,8,32}) for (int pattern = 0; pattern < 3; ++pattern) {
         std::vector<float> x(size_t(rows)*hidden), scales(rows*topk);
         for (size_t i = 0; i < x.size(); ++i)
             x[i] = pattern == 2 ? 0.f : std::ldexp(normal(rng)*30.f, int(i/32%5)-2);
