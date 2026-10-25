@@ -36,6 +36,8 @@ ftllm launch
 
 ## 界面与 Agent
 
+API 服务启动后，顶部「API 信息」可查看并复制当前服务的 Base URL、模型名称和 API Key。Key 默认隐藏，可点击显示。远程访问时请将回环地址替换为服务器地址，或转发对应的 API 端口。
+
 Launcher 的「界面主题」提供浅色模式和黑夜模式，默认浅色并记住手动选择。工作室会同步切换主题，保留当前会话和输入草稿。
 
 左侧导航分为「模型管理」和「agent」两组。agent 包含工作室、**DeepSeek Harness**、**OpenCode**、**Codex**、**Claude Code**；后四者可通过分组旁或页面中的“管理”安装、升级和删除独立运行环境，复用现有插件管理。安装无需启动模型，删除保留会话和工作目录。Harness 嵌入原生页面并连接当前模型 API，也可点击“安装并打开 Harness”。无需预装 Node/npm，会话保存位置和部署限制见 [Harness 接入说明](launcher-harness.md)。

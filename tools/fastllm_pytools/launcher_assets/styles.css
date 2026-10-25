@@ -518,6 +518,8 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .automatic-config-dialog-heading p { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .automatic-config-dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
 .automatic-config-dialog-error { color: #a43340; font-size: 12px; line-height: 1.6; }
+.api-info-dialog .field { display: grid; gap: 8px; margin-block: 16px; }
+.api-info-dialog input { width: 100%; min-width: 0; box-sizing: border-box; }
 .automatic-config-status {
   margin-top: 12px;
   padding: 11px 12px;

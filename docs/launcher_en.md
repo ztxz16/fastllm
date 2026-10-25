@@ -36,6 +36,8 @@ Selecting a card fills in the corresponding ModelScope ID. These three variants 
 
 ## Appearance and agents
 
+Once the API server is running, **API information** in the top bar shows and copies its Base URL, model name, and API key. The key is hidden until revealed. For remote access, replace a loopback address with the server address or forward the API port.
+
 Launcher’s **Appearance** selector offers Light and Dark modes. It defaults to Light and remembers your selection. Studio switches with Launcher while preserving the current conversation and draft.
 
 Navigation has two groups: **Model management** and **agent**. The agent group contains Studio, **DeepSeek Harness**, **OpenCode**, **Codex**, and **Claude Code**. Use **Manage** beside the group or on an agent page to install, upgrade, or remove the last four tools through the existing plugin system. Installation works without a running model; removal keeps sessions and workspaces. Harness embeds its native interface and connects it to the active model API. **Install and open Harness** is also available, with installation progress shown on the page. No existing Node/npm installation is required. See the [Harness integration guide (Chinese)](launcher-harness.md) for storage locations and deployment limitations.

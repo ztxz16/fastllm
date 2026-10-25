@@ -96,6 +96,34 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         self.server_thread.join(timeout=5)
         self.assertFalse(self.server_thread.is_alive())
 
+    def test_api_info_shows_running_model_masks_key_and_clears_on_close(self):
+        self.runtime._service_api_key = 'private-live-key'
+        self.assertTrue(self.page.locator('#open-api-info + #open-endpoint').count())
+        self.page.locator('#open-api-info').click()
+        expect(self.page.locator('#api-info-dialog')).to_be_visible()
+        expect(self.page.locator('#api-info-url')).to_have_value('http://127.0.0.1:19001/v1')
+        expect(self.page.locator('#api-info-model')).to_have_value('browser-model')
+        expect(self.page.locator('#api-info-key')).to_have_value('private-live-key')
+        expect(self.page.locator('#api-info-key')).to_have_attribute('type', 'password')
+        self.page.locator('#api-info-reveal').click()
+        expect(self.page.locator('#api-info-key')).to_have_attribute('type', 'text')
+        self.context.grant_permissions(['clipboard-read', 'clipboard-write'])
+        self.page.locator('#api-info-copy').click()
+        self.assertIn('Model: browser-model', self.page.evaluate('navigator.clipboard.readText()'))
+        self.page.set_viewport_size({'width':390, 'height':844})
+        bounds = self.page.locator('#api-info-dialog').bounding_box()
+        self.assertGreaterEqual(bounds['x'], 0)
+        self.assertLessEqual(bounds['x'] + bounds['width'], 390)
+        button = self.page.locator('#open-api-info').bounding_box()
+        self.assertLessEqual(button['x'] + button['width'], 390)
+        self.page.keyboard.press('Escape')
+        expect(self.page.locator('#api-info-dialog')).to_be_hidden()
+        expect(self.page.locator('#api-info-key')).to_have_value('')
+        self.page.locator('#open-api-info').click()
+        self.runtime._state['sessionId'] = 'changed'
+        self.page.clock.fast_forward(2000)
+        expect(self.page.locator('#api-info-dialog')).to_be_hidden()
+
     def assert_loaded(self):
         expect(self.page.locator('#webui-content')).to_be_visible()
         expect(self.page.locator('#webui-content').locator('#prompt')).to_be_visible()

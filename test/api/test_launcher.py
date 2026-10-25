@@ -431,6 +431,29 @@ class LauncherConfigTest(unittest.TestCase):
 
         self.assertTrue(any("必须一致" in error for error in preview["errors"]))
 
+    def test_api_info_requires_authentication_and_uses_live_service(self):
+        from fastapi.testclient import TestClient
+        client = TestClient(create_launcher_app(self.runtime, "control-secret"))
+        headers = {"X-FTLLM-Launcher-Token": "control-secret"}
+        path = "/api/runtime/api-info"
+        self.assertEqual(client.get(path).status_code, 403)
+        self.assertEqual(client.get(path, headers=headers).status_code, 400)
+        self.runtime._state.update(command="server", phase="running", ready=True,
+                                   sessionId="live-session", endpoint="http://127.0.0.1:8080/", modelName="live-model")
+        self.runtime._service_api_key = "live-secret"
+        self.runtime._process = SimpleNamespace(poll=lambda: None)
+        try:
+            response = client.get(path, headers=headers)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {"sessionId":"live-session", "baseUrl":"http://127.0.0.1:8080/v1",
+                                               "model":"live-model", "apiKey":"live-secret"})
+            self.assertIn("no-store", response.headers["cache-control"])
+            self.assertNotIn("live-secret", client.get("/api/runtime", headers=headers).text)
+            self.runtime._process = SimpleNamespace(poll=lambda: 1)
+            self.assertEqual(client.get(path, headers=headers).status_code, 400)
+        finally:
+            self.runtime._process = None
+
     def test_api_key_is_redacted_from_preview(self):
         preview = self.runtime.preview(self.config(api_key="local-secret"))
 

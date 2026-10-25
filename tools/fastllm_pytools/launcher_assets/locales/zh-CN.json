@@ -301,7 +301,12 @@
     "自定义环境变量": "自定义环境变量",
     "例如 CUDA_VISIBLE_DEVICES=0,1": "例如 CUDA_VISIBLE_DEVICES=0,1",
     "使用 KEY=VALUE 格式，多个变量用空格或换行分隔。": "使用 KEY=VALUE 格式，多个变量用空格或换行分隔。",
-    "缓存与采样": "缓存与采样"
+    "缓存与采样": "缓存与采样",
+    "API 信息": "API 信息",
+    "当前服务的连接配置。远程访问时，请使用服务器地址并开放或转发对应端口。": "当前服务的连接配置。远程访问时，请使用服务器地址并开放或转发对应端口。",
+    "显示 API Key": "显示 API Key",
+    "复制 API 信息": "复制 API 信息",
+    "模型名称": "模型名称"
   },
   "messages": {
     "Pi Agent": "Pi 智能体",
@@ -740,7 +745,13 @@
     "视觉模块必须是已存在的本地 .gguf 文件。": "视觉模块必须是已存在的本地 .gguf 文件。",
     "内存上限必须是正数内存大小，例如 120g；留空表示自动规划。": "内存上限必须是正数内存大小，例如 120g；留空表示自动规划。",
     "强制主存预算不能与自动主存上限同时设置。": "强制主存预算不能与自动主存上限同时设置。",
-    "Fastllm 量化 · 完整仓库": "Fastllm 量化 · 完整仓库"
+    "Fastllm 量化 · 完整仓库": "Fastllm 量化 · 完整仓库",
+    "Show API Key": "显示 API Key",
+    "Hide API Key": "隐藏 API Key",
+    "No API Key required": "无需 API Key",
+    "API information copied.": "已复制 API 信息。",
+    "Copy failed. Select and copy the fields manually.": "复制失败，请选中字段手动复制。",
+    "Start an API Server before viewing API information.": "请先启动 API 服务，再查看 API 信息。"
   },
   "patterns": [
     {

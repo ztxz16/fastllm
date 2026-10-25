@@ -149,7 +149,9 @@ function cacheElements() {
     "app-version", "shutdown-launcher", "status-dot", "status-title", "status-message",
     "inference-status-bar", "prefill-speed", "decode-speed",
     "context-window-metric", "context-window",
-    "open-endpoint", "stop-runtime", "profile-count", "profile-list", "new-profile",
+    "open-endpoint", "open-api-info", "api-info-dialog", "api-info-close", "api-info-url",
+    "api-info-model", "api-info-key", "api-info-reveal", "api-info-copy",
+    "stop-runtime", "profile-count", "profile-list", "new-profile",
     "current-view-title", "profile-search", "profile-results",
     "open-webui", "webui-placeholder", "webui-status",
     "webui-content", "webui-retry", "agent-runtime-card", "agent-runtime-title",
@@ -559,7 +561,7 @@ function bindEvents() {
   });
   document.addEventListener("keydown", (event) => {
     // The native modal handles focus trapping and Escape before the editor.
-    if (elements.automaticConfigDialog.open) return;
+    if (elements.automaticConfigDialog.open || elements.apiInfoDialog.open) return;
     if (!elements.confirmationModal.classList.contains("hidden")) {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -589,6 +591,19 @@ function bindEvents() {
   elements.saveProfile.addEventListener("click", saveProfileAndClose);
   elements.stopRuntime.addEventListener("click", stopRuntime);
   elements.openEndpoint.addEventListener("click", openEndpoint);
+  elements.openApiInfo.addEventListener("click", openApiInfo);
+  elements.apiInfoClose.addEventListener("click", () => elements.apiInfoDialog.close());
+  elements.apiInfoDialog.addEventListener("close", () => {
+    elements.apiInfoUrl.value = elements.apiInfoModel.value = elements.apiInfoKey.value = "";
+    delete elements.apiInfoDialog.dataset.sessionId;
+  });
+  elements.apiInfoReveal.addEventListener("click", () => {
+    const visible = elements.apiInfoKey.type === "password";
+    elements.apiInfoKey.type = visible ? "text" : "password";
+    elements.apiInfoReveal.setAttribute("aria-pressed", String(visible));
+    elements.apiInfoReveal.textContent = t(visible ? "Hide API Key" : "Show API Key");
+  });
+  elements.apiInfoCopy.addEventListener("click", copyApiInfo);
   elements.clearLogs.addEventListener("click", clearLogs);
   elements.refreshHardware.addEventListener("click", loadHardware);
   elements.shutdownLauncher.addEventListener("click", shutdownLauncher);
@@ -740,6 +755,9 @@ function renderRuntime() {
   elements.stopRuntime.classList.toggle("hidden", !active);
   elements.stopRuntime.disabled = phase === "stopping";
   elements.openEndpoint.disabled = !runtime.ready;
+  elements.openApiInfo.disabled = !runtime.ready || isWebui;
+  if (elements.apiInfoDialog.open && (!runtime.ready || isWebui
+      || elements.apiInfoDialog.dataset.sessionId !== runtime.sessionId)) elements.apiInfoDialog.close();
   elements.openEndpoint.textContent = isWebui ? t("Open WebUI") : t("Open API documentation");
   renderInferenceSpeed();
   renderContextWindow();
@@ -834,6 +852,44 @@ function openEndpoint() {
   const endpoint = state.runtime.endpoint.replace(/\/$/, "");
   const url = state.runtime.command === "webui" ? endpoint : `${endpoint}/docs`;
   window.open(url, "_blank", "noopener,noreferrer");
+}
+
+async function openApiInfo() {
+  try {
+    const info = await request("/api/runtime/api-info");
+    if (info.sessionId !== state.runtime?.sessionId || !state.runtime?.ready) return;
+    elements.apiInfoDialog.dataset.sessionId = info.sessionId;
+    elements.apiInfoUrl.value = info.baseUrl;
+    elements.apiInfoModel.value = info.model;
+    elements.apiInfoKey.value = info.apiKey;
+    elements.apiInfoKey.placeholder = t("No API Key required");
+    elements.apiInfoKey.type = "password";
+    elements.apiInfoReveal.textContent = t("Show API Key");
+    elements.apiInfoReveal.setAttribute("aria-pressed", "false");
+    elements.apiInfoReveal.disabled = !info.apiKey;
+    elements.apiInfoDialog.showModal();
+  } catch (error) {
+    showToast(friendlyError(error), "error");
+  }
+}
+
+async function copyApiInfo() {
+  const text = `Base URL: ${elements.apiInfoUrl.value}\nModel: ${elements.apiInfoModel.value}\nAPI Key: ${elements.apiInfoKey.value || t("No API Key required")}`;
+  try {
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+    else {
+      const input = document.createElement("textarea");
+      input.value = text;
+      elements.apiInfoDialog.append(input);
+      try {
+        input.select();
+        if (!document.execCommand("copy")) throw new Error(t("Copy failed. Select and copy the fields manually."));
+      } finally { input.remove(); }
+    }
+    showToast(t("API information copied."), "success");
+  } catch (error) {
+    showToast(friendlyError(error), "error");
+  }
 }
 
 async function shutdownLauncher() {

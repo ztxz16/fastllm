@@ -574,6 +574,18 @@ class LauncherRuntime:
     def open_harness(self, launcher_host, browser_origin, *, install=False):
         return self.open_agent("harness", launcher_host, browser_origin, install=install)
 
+    def api_info(self):
+        # Credentials are returned only by the authenticated, explicit info
+        # request, never in the periodically polled runtime snapshot.
+        with self._lock:
+            if (self._state["command"] != "server" or not self._state["ready"]
+                    or self._state["phase"] != "running" or self._process is None
+                    or self._process.poll() is not None):
+                raise LauncherError("Start an API Server before viewing API information.")
+            return {"sessionId": self._state["sessionId"],
+                    "baseUrl": self._state["endpoint"].rstrip("/") + "/v1",
+                    "model": self._state["modelName"], "apiKey": self._service_api_key}
+
     def open_agent(self, agent_id, launcher_host, browser_origin, *, install=False):
         if agent_id not in {"harness", "opencode", "codex", "claude"}:
             raise LauncherError("Unknown agent.")
@@ -2224,6 +2236,10 @@ def create_launcher_app(
     @app.get("/api/runtime")
     async def runtime_state():
         return runtime.state()
+
+    @app.get("/api/runtime/api-info")
+    async def api_info():
+        return runtime.api_info()
 
     @app.post("/api/webui/open")
     async def open_webui(request: Request):
