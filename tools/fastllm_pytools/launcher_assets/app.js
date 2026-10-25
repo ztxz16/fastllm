@@ -156,7 +156,7 @@ function cacheElements() {
     "agent-runtime-message", "agent-runtime-progress", "agent-runtime-error", "install-agent-runtime",
     "config-path", "profile-editor-modal", "profile-editor-title", "launch-form",
     "close-profile-editor", "save-state", "ori-field", "auto-configure-profile",
-    "clear-profile-config", "automatic-config-status", "automatic-resource-limits",
+    "clear-profile-config", "automatic-config-status", "automatic-resource-limits", "automatic-tuning",
     "profile-parameters", "profile-editor-description", "configuration-mode-options",
     "configuration-mode-description", "automatic-config-actions",
     "configuration-mode-settings", "automatic-config-dialog", "automatic-mode-options",
@@ -172,7 +172,7 @@ function cacheElements() {
     "speculative-mtp-field", "speculative-draft-tokens-field", "speculative-path-field", "speculative-mode-hint",
     "start-runtime", "clear-logs", "log-count", "log-output",
     "refresh-hardware", "hardware-status", "hardware-grid", "path-suggestions",
-    "choose-model-folder", "choose-draft-model-folder", "folder-picker-modal", "folder-picker-title",
+    "choose-model-folder", "choose-draft-model-folder", "choose-vision-module", "folder-picker-modal", "folder-picker-title",
     "folder-picker-close", "folder-picker-current", "folder-picker-up",
     "folder-picker-location", "folder-picker-drive-field", "folder-picker-drive",
     "folder-picker-list", "folder-picker-status", "folder-picker-cancel",
@@ -533,6 +533,7 @@ function bindEvents() {
     if (event.target === elements.profileEditorModal) closeProfileEditor();
   });
   elements.chooseModelFolder.addEventListener("click", () => openFolderPicker("model", elements.chooseModelFolder));
+  elements.chooseVisionModule.addEventListener("click", () => openFolderPicker("mmproj", elements.chooseVisionModule, {fileExtension: ".gguf"}));
   elements.chooseDraftModelFolder.addEventListener("click", () => openFolderPicker("speculative_draft_model_path", elements.chooseDraftModelFolder));
   elements.validationSummary.addEventListener("click", () => focusValidationError());
   elements.folderPickerClose.addEventListener("click", () => closeFolderPicker());

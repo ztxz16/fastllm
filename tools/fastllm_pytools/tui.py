@@ -87,6 +87,11 @@ class DeployConfig:
     gpu_mem_ratio: str = "0.9"
     auto_gpu_memory_limit: str = ""
     auto_host_memory_limit: str = ""
+    force_ddr_limit: str = ""
+    # Separate overrides keep saved manual settings from silently pinning --auto.
+    auto_gpu_mem_ratio: str = ""
+    auto_max_batch: str = ""
+    auto_chunked_prefill_size: str = ""
     chunked_prefill_size: str = "auto"
     kv_cache_dtype: str = "auto"
     moe_atype: str = "auto"
@@ -111,6 +116,7 @@ class DeployConfig:
     webui_think: str = "false"
     cache_dir: str = ""
     ori: str = ""
+    mmproj: str = ""
     extra_args: str = ""
     env_vars: str = ""
     config_mode: str = "custom"
@@ -974,13 +980,26 @@ def _normalize_speculative_config(config: DeployConfig) -> DeployConfig:
     return config
 
 
+AUTO_TUNING_OPTIONS = {
+    "auto_" + name: name for name in ("gpu_mem_ratio", "max_batch", "chunked_prefill_size")
+}
+
+
+def _runtime_auto_options(config: DeployConfig):
+    for field_name, option in AUTO_TUNING_OPTIONS.items():
+        value = _optional_text(getattr(config, field_name))
+        if value:
+            yield field_name, option, value
+
+
 def _runtime_auto_config(config: DeployConfig) -> DeployConfig:
-    """Keep only service settings; hidden manual overrides must not pin --auto."""
+    """Keep service settings and explicit auto overrides, excluding manual fields."""
     if config.config_mode != "auto" or config.command != "server":
         return config
     service_fields = ("name", "command", "model", "model_name", "host", "port",
                       "api_key", "hide_input", "config_mode", "auto_gpu_memory_limit",
-                      "auto_host_memory_limit")
+                      "auto_host_memory_limit", "force_ddr_limit", "mmproj",
+                      "extra_args", "env_vars", *AUTO_TUNING_OPTIONS)
     return DeployConfig(**{name: getattr(config, name) for name in service_fields})
 
 
@@ -1158,10 +1177,16 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
                               ("--host", config.host.strip()), ("--port", config.port.strip()),
                               ("--api_key", config.api_key.strip())):
             _add_option(argv, option, value)
-        _add_option(argv, "--auto_gpu_memory_limit", config.auto_gpu_memory_limit.strip())
-        _add_option(argv, "--auto_host_memory_limit", config.auto_host_memory_limit.strip())
+        _add_option(argv, "--auto_gpu_memory_limit", _optional_text(config.auto_gpu_memory_limit))
+        _add_option(argv, "--auto_host_memory_limit", _optional_text(config.auto_host_memory_limit))
+        _add_option(argv, "--force_ddr_limit", _optional_text(config.force_ddr_limit))
+        _add_option(argv, "--mmproj", _expand_user_path(config.mmproj.strip()))
+        for _, option, value in _runtime_auto_options(config):
+            _add_option(argv, "--" + option, value)
         if config.hide_input:
             argv.append("--hide_input")
+        if config.extra_args.strip():
+            argv.extend(shlex.split(config.extra_args))
         return argv
 
     if config.command == "webui":
@@ -1193,6 +1218,8 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
         _optional_text(str(config.ngram_device).strip().lower()),
     )
     _add_option(argv, "--gpu_mem_ratio", _optional_text(config.gpu_mem_ratio))
+    _add_option(argv, "--force_ddr_limit", _optional_text(config.force_ddr_limit))
+    _add_option(argv, "--mmproj", _expand_user_path(config.mmproj.strip()))
     if config.low_gpu_mem:
         argv.append("--low_gpu_mem")
     _add_option(argv, "--chunked_prefill_size", _optional_text(config.chunked_prefill_size))
@@ -1269,6 +1296,16 @@ def validate_config(config: DeployConfig, field_errors: Optional[List[dict]] = N
     ori_path = _expand_user_path(config.ori.strip())
     if is_gguf_model(config.model) and ori_path and not os.path.isdir(ori_path):
         add_error("模型配置文件夹必须是已存在的本地目录。", "ori")
+
+    if config.command != "webui":
+        mmproj_path = _expand_user_path(config.mmproj.strip())
+        if mmproj_path:
+            if not is_gguf_model(config.model):
+                add_error("视觉模块需要配合 GGUF 主模型使用。", "mmproj")
+            if not mmproj_path.lower().endswith(".gguf") or not os.path.isfile(mmproj_path):
+                add_error("视觉模块必须是已存在的本地 .gguf 文件。", "mmproj")
+        if not _is_optional_memory_limit(config.force_ddr_limit):
+            add_error("内存上限必须是正数内存大小，例如 120g；留空表示自动规划。", "force_ddr_limit")
 
     if config.command in ("server", "webui"):
         try:
@@ -1353,6 +1390,17 @@ def validate_config(config: DeployConfig, field_errors: Optional[List[dict]] = N
                                   ("auto_host_memory_limit", "自动规划内存上限")):
             if not _is_optional_memory_limit(getattr(config, field_name)):
                 add_error(f"{label}必须是正数内存大小，例如 20g；留空表示自动读取。", field_name)
+        from argparse import ArgumentTypeError
+        from .util import _positive_int
+        for field_name, option, value in _runtime_auto_options(config):
+            try:
+                if option == "gpu_mem_ratio":
+                    if not _is_ratio(value):
+                        raise ValueError("ratio must be in (0, 1]")
+                else:
+                    _positive_int(value)
+            except (ArgumentTypeError, ValueError):
+                add_error(f"自动配置参数 --{option} 的值无效；留空表示自动规划。", field_name)
 
     if config.command == "server" and not config.host.strip():
         add_error("监听地址不能为空。", "host")
@@ -1390,11 +1438,24 @@ def validate_config(config: DeployConfig, field_errors: Optional[List[dict]] = N
     if not _is_optional_float(config.repeat_penalty, min_value=0):
         add_error("repeat_penalty 必须是大于等于 0 的数字，或留空使用模型默认值。", "repeat_penalty")
 
+    extra_options = set()
     if config.extra_args.strip():
         try:
-            shlex.split(config.extra_args)
+            extra_options = {arg[2:].split("=", 1)[0].replace("-", "_")
+                             for arg in shlex.split(config.extra_args) if arg.startswith("--")}
         except ValueError as exc:
             add_error(f"额外参数无法解析: {exc}", "extra_args")
+    if config.command != "webui":
+        forced_fields = ["force_ddr_limit"] if _optional_text(config.force_ddr_limit) else []
+        capped_fields = (["auto_host_memory_limit"] if config.command == "server" and config.config_mode == "auto"
+                         and _optional_text(config.auto_host_memory_limit) else [])
+        if "force_ddr_limit" in extra_options:
+            forced_fields.append("extra_args")
+        if "auto_host_memory_limit" in extra_options:
+            capped_fields.append("extra_args")
+        if forced_fields and capped_fields:
+            add_error("强制主存预算不能与自动主存上限同时设置。",
+                      *dict.fromkeys(forced_fields + capped_fields))
     if config.env_vars.strip():
         try:
             parse_env_vars(config.env_vars)

@@ -500,7 +500,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .automatic-resource-limits-heading::before { content: "›"; color: var(--primary); font-size: 17px; line-height: 1; transform: rotate(0deg); transition: transform .15s ease; }
 .automatic-resource-limits[open] .automatic-resource-limits-heading { margin-bottom: 10px; }
 .automatic-resource-limits[open] .automatic-resource-limits-heading::before { transform: rotate(90deg); }
-.automatic-resource-limits-heading strong { color: #43574b; font-size: 12px; }
+.automatic-resource-limits-heading strong { flex: 1; color: #43574b; font-size: 12px; }
 .automatic-resource-limits-heading small { color: var(--subtle); font-size: 10px; }
 .profile-validation .validation-message { color: #a43340; background: #fff0f1; }
 .folder-picker-entry.selected { color: var(--primary); background: var(--primary-soft); }
