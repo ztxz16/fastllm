@@ -1190,6 +1190,9 @@ namespace fastllm {
     void Data::CopyFrom(const Data &ori) {
         if (this == &ori) return;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+#ifdef FASTLLM_ENABLE_CUTLASS_MXFP8_SM120
+        FastllmCudaReleaseMxfp8CutlassCache(this);
+#endif
         if (!this->isFake && this->extraCudaData.size() >= 7)
             FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
 #endif
@@ -2320,6 +2323,9 @@ namespace fastllm {
         if (isFake)
             return;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+#ifdef FASTLLM_ENABLE_CUTLASS_MXFP8_SM120
+        FastllmCudaReleaseMxfp8CutlassCache(this);
+#endif
         if (!this->isFake && this->extraCudaData.size() >= 7)
             FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
 #endif
@@ -2534,6 +2540,9 @@ namespace fastllm {
             return;
         }
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+#ifdef FASTLLM_ENABLE_CUTLASS_MXFP8_SM120
+        FastllmCudaReleaseMxfp8CutlassCache(this);
+#endif
         if (!this->isFake && this->extraCudaData.size() >= 7)
             FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
 #endif
@@ -2908,6 +2917,9 @@ namespace fastllm {
             return;
         }
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+#ifdef FASTLLM_ENABLE_CUTLASS_MXFP8_SM120
+        FastllmCudaReleaseMxfp8CutlassCache(this);
+#endif
         if (!this->isFake && this->extraCudaData.size() >= 7)
             FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
 #endif

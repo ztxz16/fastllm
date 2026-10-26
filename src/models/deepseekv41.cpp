@@ -2560,14 +2560,28 @@ namespace fastllm {
 
     void DeepSeekV41Model::LinearWithActivationQuant(Data &input, const std::string &weightName,
                                                     Data &output, bool replicated, Data *scratch,
-                                                    bool inputQuantized, Data *reductionScratch) {
+                                                    bool inputQuantized, Data *reductionScratch,
+                                                    bool preserveQuantizedInput) {
         Data local;
         Data *source = &input;
         if (quantizedLinearNames.count(weightName)) {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)
+            // Fuse only existing block-32 quantization boundaries. Explicit
+            // scratch shared by sibling projections must be materialized first.
+            auto tryMxfp8 = [&]() {
+                return !replicated && !V41ReferenceMathEnabled() &&
+                    !V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") &&
+                    FastllmCudaTryMxfp8QuantizedLinear(*source, weight[weightName], output);
+            };
+            if ((!preserveQuantizedInput || inputQuantized) && tryMxfp8()) return;
+#endif
             if (!inputQuantized) {
                 source = scratch != nullptr ? scratch : &local;
                 V41Executor().Run("DeepSeekV41QuantizeActivation", {{"input", &input}, {"output", source}}, {}, {});
             }
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)
+            if (preserveQuantizedInput && !inputQuantized && tryMxfp8()) return;
+#endif
 #ifdef USE_CUDA
             // Keep checkpoint block boundaries when checking numerical alignment.
             // A full-K GEMM can cross a BF16 rounding boundary even though both
@@ -5351,7 +5365,7 @@ namespace fastllm {
             LinearWithActivationQuant(input, name, output, replicated,
                 scratch != nullptr ? scratch : (ws == &localWorkspace && (!tp || seqlen > 1) ?
                     (tp ? nullptr : &ws->quantizedActivation) : &ws->quantizedActivations[name]), inputQuantized,
-                ws == &localWorkspace && seqlen > 1 ? nullptr : &ws->reductionBuffers[name]);
+                ws == &localWorkspace && seqlen > 1 ? nullptr : &ws->reductionBuffers[name], scratch != nullptr);
         };
             ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
             std::string pre = "layers." + std::to_string(layer);
@@ -6071,6 +6085,16 @@ namespace fastllm {
                 attnOutAll->Reshape(originalDims);
             }
 #endif
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)
+            // V4.1's inverse-RoPE output is already quantized in blocks of 32.
+            // Its loader preserves WoA as BF16: the fast path verifies an exact
+            // FP8 reconstruction once, otherwise retaining the BF16 fallback.
+            if (!referenceWoA && !tp && !V41ReferenceMathEnabled() &&
+                !V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") &&
+                quantizedLinearNames.count(pre + ".attn.wo_a.weight"))
+                referenceWoA = FastllmCudaTryMxfp8WoA(*attnOutAll,
+                    weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
+#endif
             if (!referenceWoA) DeepSeekV4WoA(*attnOutAll, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
             ReleaseForwardPrefill(f, {&attnOut, &catTmp[0], &catTmp[1]});
             for (Data &part : segAttnOut) ReleaseForwardPrefill(f, {&part});
@@ -6579,7 +6603,7 @@ namespace fastllm {
             LinearWithActivationQuant(input, name, output, replicated,
                 scratch != nullptr ? scratch : (ws == &localWorkspace && (!tp || seqlen > 1) ?
                     (tp ? nullptr : &ws->quantizedActivation) : &ws->quantizedActivations[name]), inputQuantized,
-                ws == &localWorkspace && seqlen > 1 ? nullptr : &ws->reductionBuffers[name]);
+                ws == &localWorkspace && seqlen > 1 ? nullptr : &ws->reductionBuffers[name], scratch != nullptr);
         };
 
         const std::string pre = "layers." + std::to_string(layer);
