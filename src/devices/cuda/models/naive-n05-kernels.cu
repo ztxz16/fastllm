@@ -9,6 +9,7 @@
 #include "naive-n05-prefill.cuh"
 #include "naive-n05-prefill-hopper.cuh"
 #include "naive-n05-prefill-split.cuh"
+#include "naive-n05-swa-query.cuh"
 #ifdef FASTLLM_ENABLE_NAIVE_QKV_SM90
 #include "naive-n05-qkv.cuh"
 #endif
@@ -3300,6 +3301,21 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         query.dataType == BFLOAT16 && key.dataType == FP8_E4M3 && value.dataType == FP8_E4M3 &&
         key.dims[2] % 8 == 0 && (size_t)query.cudaData % 16 == 0 &&
         (size_t)key.cudaData % 16 == 0 && (size_t)value.cudaData % 16 == 0) {
+        // Neighboring causal windows overlap. Share their cache reads while
+        // retaining each query's original MMA order and BF16 rounding.
+        if (queries >= 1024 && pastLength >= 127 && count == 128 &&
+            (int64_t)pastLength + queries <= keys) {
+            auto grouped = naive_prefill_mma::SwaQueryTile<4>;
+            const size_t bytes = sizeof(naive_prefill_mma::SwaQueryStorage<4>);
+            if (BulkKernelSupported(grouped, bytes, 80)) {
+                grouped<<<dim3((queries + 3) / 4, heads / 8), 256, bytes>>>(
+                    (const BF16 *)query.cudaData, FastllmNaiveKV(key), FastllmNaiveKV(value),
+                    sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+                    (BF16 *)output.cudaData, queries, heads, kvHeads, key.dims[2], keys, pastLength);
+                CheckLaunch();
+                return;
+            }
+        }
         auto kernel = naive_prefill_mma::Generic<128, 128>;
         const size_t shared = sizeof(naive_prefill_mma::Storage<128>);
         if (BulkKernelSupported(kernel, shared, 80)) {
