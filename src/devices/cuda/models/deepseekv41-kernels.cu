@@ -5236,7 +5236,7 @@ bool FastllmCudaGlm5NextHybridSparseAttention(const fastllm::Data &query,
     return true;
 }
 
-template<int splits, bool MATERIALIZED = true>
+template<int splits, bool MATERIALIZED = true, bool PIPELINED = false>
 static bool V41SparseAttentionBatchImpl(
         const std::vector<FastllmCudaV41AttentionRequest> &requests,
         fastllm::Data &attnSink, int windowSize, float softmaxScale) {
@@ -5251,12 +5251,15 @@ static bool V41SparseAttentionBatchImpl(
     if (requests.empty() || requests.size() > 1024 || windowSize < 0 ||
         V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") || V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN") ||
         !local(attnSink) || attnSink.dataType != DataType::FLOAT32) return false;
-    using PvShared = typename std::conditional<MATERIALIZED,
+    using SerialShared = typename std::conditional<MATERIALIZED,
         V41MmaPvShared<splits>, V41MmaShared>::type;
+    using Shared = typename std::conditional<PIPELINED,
+        V41MmaPvPipelineShared<splits>, SerialShared>::type;
     if constexpr (MATERIALIZED) {
         if (!V41MmaKernelReady<V41SparseAttentionScoresKernel<true>, kMmaThreads, sizeof(V41MmaShared)>()) return false;
     }
-    if (!V41MmaKernelReady<V41SparseAttentionMmaKernel<splits, MATERIALIZED, true>, kMmaThreads, sizeof(PvShared)>()) return false;
+    if (!V41MmaKernelReady<V41SparseAttentionMmaKernel<splits, MATERIALIZED, true, PIPELINED>,
+                           kMmaThreads, sizeof(Shared)>()) return false;
     int heads = 0, maxTiles = 0;
     std::vector<V41AttentionDescriptor> descriptors;
     descriptors.reserve(requests.size());
@@ -5337,7 +5340,7 @@ static bool V41SparseAttentionBatchImpl(
         0, 0, 0, nullptr, 0, 0, 0, 0, 0, deviceDescriptors)) return false;
     if (!V41CheckLaunch("BatchedSparseAttentionScores")) return false;
     }
-    if (!V41LaunchDependent<V41SparseAttentionMmaKernel<splits, MATERIALIZED, true>>(dim3(requests.size(), headBlocks, splits), kMmaThreads, sizeof(PvShared),
+    if (!V41LaunchDependent<V41SparseAttentionMmaKernel<splits, MATERIALIZED, true, PIPELINED>>(dim3(requests.size(), headBlocks, splits), kMmaThreads, sizeof(Shared),
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         (const float*)attnSink.cudaData, 1, heads, windowSize, 0, 0, 0, softmaxScale,
         nullptr, 0, 0, 0, 0, 0, nullptr, deviceDescriptors)) return false;
@@ -5364,6 +5367,17 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttentionBatch(
     }
     if (batch * headBlocks >= 64)
         return V41SparseAttentionBatchImpl<2>(requests, attnSink, windowSize, softmaxScale);
+    // Two-stage PV overlaps the next KV tile for the small verification
+    // batches. Larger batches already have enough CTAs and use the serial path.
+    // Async copies consume BF16 rows directly; packed KV needs dequantization.
+    if (batch >= 2 && batch <= 6 && V41IsSm<9, 0>() &&
+        std::all_of(requests.begin(), requests.end(), [](const FastllmCudaV41AttentionRequest &r) {
+            return (!r.ringKV || r.ringKV->dataType == DataType::BFLOAT16) &&
+                   (!r.compressedKV || r.compressedKV->dataType == DataType::BFLOAT16);
+        }) && V41MmaKernelReady<
+            V41SparseAttentionMmaKernel<8, true, true, true>, kMmaThreads,
+            sizeof(V41MmaPvPipelineShared<8>)>())
+        return V41SparseAttentionBatchImpl<8, true, true>(requests, attnSink, windowSize, softmaxScale);
     return V41SparseAttentionBatchImpl<8>(requests, attnSink, windowSize, softmaxScale);
 }
 
