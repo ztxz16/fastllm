@@ -2212,6 +2212,13 @@ if (UNIT_TEST)
         set_tests_properties(naive_n05_fp8_kv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "ALL FP8 CHECKS PASSED")
 
+        add_executable(naive_n05_indexer_context_test test/basic/test_naive_n05_indexer_context.cpp)
+        target_link_libraries(naive_n05_indexer_context_test PRIVATE fastllm)
+        target_include_directories(naive_n05_indexer_context_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_indexer_context COMMAND naive_n05_indexer_context_test)
+        set_tests_properties(naive_n05_indexer_context PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "PASS [0-9]+ context-shard checks")
+
         add_executable(naive_n05_fp8_conversion_test test/basic/test_naive_n05_fp8_conversion.cu)
         target_link_libraries(naive_n05_fp8_conversion_test PRIVATE fastllm)
         set_target_properties(naive_n05_fp8_conversion_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

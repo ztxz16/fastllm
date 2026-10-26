@@ -56,6 +56,18 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
                 self.configure(options + ([] if saved else ['--indexer_tp_storage', 'layer_shard']),
                                model_type=model, saved=saved)
 
+    def test_context_sharded_indexer_requires_kvmem_and_cuda_tp(self):
+        for saved in (False, True):
+            settings = {'tp': '4', 'indexer_tp_storage': 'context_shard', 'kvmem': '{}'}
+            options = [] if saved else [v for k, value in settings.items() for v in ('--' + k, value)]
+            self.configure(options, saved=settings if saved else None)
+            self.assertEqual(self.model_options['indexer_tp_storage'], 'context_shard')
+        for options, model in [(['--tp', '4'], 'naive_n05_flash'),
+                               (['--tp', '1', '--kvmem', '{}'], 'naive_n05_flash'),
+                               (['--tp', '4', '--kvmem', '{}'], 'llama')]:
+            with self.subTest(options=options, model=model), self.assertRaisesRegex(ValueError, '[Ii]ndexer'):
+                self.configure(options + ['--indexer_tp_storage', 'context_shard'], model_type=model)
+
     def test_prefill_batching_cli_and_saved_settings(self):
         for options, saved in [(['--tp', '8', '--prefill_batch_tokens', '16384',
                                   '--prefill_max_wait_ms', '20', '--chunked_prefill_size', '8192'], None),
