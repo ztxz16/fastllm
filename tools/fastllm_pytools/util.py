@@ -948,8 +948,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--indexer_dtype', choices=['auto', 'fp8', 'fp8_e4m3'], default='auto',
                         help='Naive DSA Indexer 类型；fp8 独立量化 Indexer Q/K 并压缩 K 缓存，auto 保持模型默认路径')
-    parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard'], default='replicated',
-                        help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；默认各卡复制')
+    parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard', 'context_shard'], default='replicated',
+                        help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；context_shard 在 KVMem 下按上下文分片并合并全局 TopK；默认各卡复制')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3（含 Naive N0.5 CUDA）或fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kvmem', type=str, default=None,
@@ -1863,13 +1863,15 @@ def make_normal_llm_model(args, startup_progress = None):
 
     tp_arg = getattr(args, "tp", "")
     indexer_storage = getattr(args, "indexer_tp_storage", "replicated")
-    if indexer_storage not in ("replicated", "layer_shard"):
-        raise ValueError("indexer_tp_storage must be replicated or layer_shard")
-    if indexer_storage == "layer_shard":
+    if indexer_storage not in ("replicated", "layer_shard", "context_shard"):
+        raise ValueError("indexer_tp_storage must be replicated, layer_shard or context_shard")
+    if indexer_storage in ("layer_shard", "context_shard"):
         if not is_naive_n05_model:
-            raise ValueError("Indexer layer_shard storage currently supports Naive DSA models only")
+            raise ValueError(f"Indexer {indexer_storage} storage currently supports Naive DSA models only")
         if _thread_tp_cuda_device_count(tp_arg or os.environ.get("FASTLLM_TP", "")) < 2:
-            raise ValueError("Indexer layer_shard storage requires --tp with at least two CUDA devices")
+            raise ValueError(f"Indexer {indexer_storage} storage requires --tp with at least two CUDA devices")
+    if indexer_storage == "context_shard" and not getattr(args, "kvmem", None):
+        raise ValueError("Indexer context_shard storage requires --kvmem")
     if (tp_arg != ""):
         os.environ["FASTLLM_TP"] = tp_arg
         if (_uses_thread_tp(tp_arg)):

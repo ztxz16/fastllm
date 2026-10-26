@@ -1443,8 +1443,8 @@ class model:
                   indexer_tp_storage: str = "replicated"):
         if indexer_dtype not in ("auto", "fp8", "fp8_e4m3"):
             raise ValueError("indexer_dtype must be auto, fp8 or fp8_e4m3")
-        if indexer_tp_storage not in ("replicated", "layer_shard"):
-            raise ValueError("indexer_tp_storage must be replicated or layer_shard")
+        if indexer_tp_storage not in ("replicated", "layer_shard", "context_shard"):
+            raise ValueError("indexer_tp_storage must be replicated, layer_shard or context_shard")
         if indexer_tp_storage != "replicated" and not hasattr(fastllm_lib, "set_model_indexer_tp_storage"):
             raise RuntimeError("The loaded FastLLM library does not support Indexer TP storage; rebuild FastLLM.")
         if (isinstance(max_context_length, bool) or not isinstance(max_context_length, int) or

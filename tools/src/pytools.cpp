@@ -793,12 +793,12 @@ extern "C" {
 
     DLL_EXPORT void set_model_indexer_tp_storage(int modelId, const char *storage) {
         const std::string value = storage;
-        fastllm::AssertInFastLLM(value == "replicated" || value == "layer_shard",
-                                "indexer_tp_storage should be replicated or layer_shard.");
+        fastllm::AssertInFastLLM(value == "replicated" || value == "layer_shard" || value == "context_shard",
+                                "indexer_tp_storage should be replicated, layer_shard or context_shard.");
         auto *model = dynamic_cast<fastllm::NaiveN05FlashModel *>(models.GetModel(modelId));
         fastllm::AssertInFastLLM(model || value == "replicated",
-                                "Indexer layer_shard storage currently supports Naive DSA models only.");
-        if (model) model->SetIndexerTPStorage(value == "layer_shard");
+                                "Sharded Indexer storage currently supports Naive DSA models only.");
+        if (model) model->SetIndexerTPStorage(value == "layer_shard", value == "context_shard");
     }
 
     DLL_EXPORT void set_model_kv_cache_dtype(int modelId, char *kv_cache_dtype) {
