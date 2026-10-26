@@ -42,6 +42,21 @@ namespace {
         return result;
     }
 #ifdef USE_CUDA
+    void RunContextDecodeIndexer(const Data &query, const Data &weights, const Data &live,
+            const std::vector<FastllmNaiveIndexerRow> &rows, Data &exchange,
+            int rank, int ranks, int page, int gpu, bool fp8Query) {
+        const int part = rows.size() * 2048 * 2;
+        exchange.dataType = INT32;
+        exchange.Resize({ranks * part});
+        exchange.ToDevice(query.dataDevice, query.dataDeviceIds, false);
+        exchange.Allocate(false);
+        AssertInFastLLM(FastllmCudaNaiveBatchDecodeIndexer(query, weights, live, rows, fp8Query,
+            rank, ranks, &exchange, page), "Unsupported context-sharded decode Indexer layout.");
+        if (!FastllmCudaCustomAllGatherRows(exchange.cudaData, ranks * part, 4096, FLOAT32, gpu))
+            AssertInFastLLM(FastllmNcclAllGather((int *)exchange.cudaData + rank * part,
+                exchange.cudaData, part, INT32, gpu), "Indexer context all-gather failed.");
+        FastllmCudaNaiveMergeDecodeIndexer(live, rows, exchange, ranks, page);
+    }
     // Copy stored KV bits between a request's window and chronological scratch.
     // At most one side wraps; copies are ordered with attention on the rank stream.
     void CopySwaWindow(const Data &key, const Data &value, Data &targetKey, Data &targetValue,
@@ -87,12 +102,16 @@ void NaiveN05FlashModel::SetIndexerDataType(DataType type) {
 
 }
 
-void NaiveN05FlashModel::SetIndexerTPStorage(bool shardByLayer) {
+void NaiveN05FlashModel::SetIndexerTPStorage(bool shardByLayer, bool shardByContext) {
     AssertInFastLLM(!tpPrepared && !tpServingState && tpKVPool.empty() && activePrefixes.empty(),
                     "Set Indexer TP storage before warmup or inference.");
     AssertInFastLLM(!shardByLayer || (tpDevices.size() > 1 && !GetKVCacheInCPU()),
                     "Indexer layer_shard storage requires CUDA TP with at least two devices.");
+    AssertInFastLLM(!shardByContext || (!shardByLayer && tpDevices.size() > 1 &&
+        !GetKVCacheInCPU() && GetPageLen() % tpDevices.size() == 0),
+        "Indexer context_shard requires CUDA TP and a page length divisible by TP size.");
     indexerLayerSharding = shardByLayer;
+    indexerContextSharding = shardByContext;
 }
 
 int NaiveN05FlashModel::CacheReserveCapacity(const GenerationConfig &config) const {
@@ -220,7 +239,7 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
             auto sidecar = sparseKv->indexSidecars.find(&manager);
             if (sidecar != sparseKv->indexSidecars.end()) {
                 Data &index = *sidecar->second;
-                size_t indexBytes = size_t(manager.pageLen) * index.dims[3] * index.unitSize;
+                size_t indexBytes = size_t(index.dims[1]) * index.dims[3] * index.unitSize;
                 FastllmCudaCopyFromDeviceToDevice((char *)index.cudaData + page * indexBytes,
                     (char *)index.cudaData + old * indexBytes, indexBytes);
             }
@@ -831,7 +850,8 @@ Data NaiveN05FlashModel::RunTarget(
                     batch->Value(sequence, layer).multiDeviceDatas.at(gpu),
                     localIndexer ? &indexKeys[sequence] : nullptr,
                     layerCache ? layerCache + sequence * cacheStride : nullptr,
-                    sparseLayer && localIndexer ? separateIndexCaches[sequence].get() : nullptr});
+                    sparseLayer && localIndexer ? separateIndexCaches[sequence].get() : nullptr,
+                    indexerContextSharding ? tpRank : 0});
             }
 #ifndef USE_ROCM
             if (mergedQkv)
@@ -890,12 +910,16 @@ Data NaiveN05FlashModel::RunTarget(
                         &part.decode, &part.indices, sequence, part.capacity, indexTable(sequence)});
             }
             const int ranks = tensorParallel ? (int)tpDevices.size() : 1;
-            const bool contextParallel = !indexerLayerSharding && !verifying && decodeWorkspace && ranks > 1 &&
+            const bool contextParallel = !indexerLayerSharding && !indexerContextSharding && !verifying && decodeWorkspace && ranks > 1 &&
                 rows.size() >= 4 && buf.capacity >= std::max(65536, ranks * 4096) &&
                 FastllmCudaNaiveIndexerContextSupported(tpDevices) &&
                 buf.decode.indexScores.Count(0) >= (size_t)ranks * rows.size() * indexTopK * 2;
             Data &exchange = buf.decode.indexScores;
-            batchIndexerPrepared = FastllmCudaNaiveBatchDecodeIndexer(batchIndexQ,
+            if (indexerContextSharding) {
+                RunContextDecodeIndexer(batchIndexQ, batchIndexWeights, buf.liveKeys, rows,
+                    buf.indexContextExchange, tpRank, ranks, GetPageLen(), gpu, indexFp8);
+                batchIndexerPrepared = true;
+            } else batchIndexerPrepared = FastllmCudaNaiveBatchDecodeIndexer(batchIndexQ,
                 batchIndexWeights, buf.liveKeys, rows, indexFp8,
                 contextParallel ? tpRank : 0, contextParallel ? ranks : 1,
                 contextParallel ? &exchange : nullptr);
@@ -937,7 +961,7 @@ Data NaiveN05FlashModel::RunTarget(
         const int prefillRanks = tensorParallel ? (int)tpDevices.size() : 1;
         bool batchPrefillIndex = batch && batch->Size() > 1 && batch->Size() <= 8 &&
             !decodeWorkspace && !verifying && sparseLayer && tpEp8MegaState &&
-            indexerLayerSharding && tpIndexerPeerAccess && indexFp8 && indexHeads == 16 &&
+            ((indexerLayerSharding && tpIndexerPeerAccess) || indexerContextSharding) && indexFp8 && indexHeads == 16 &&
             indexDim == 128 && indexTopK == 2048 &&
             (prefillRanks == 2 || prefillRanks == 4 || prefillRanks == 8) &&
             FastllmCudaRuntimeArch() == 90;
@@ -957,6 +981,9 @@ Data NaiveN05FlashModel::RunTarget(
         int attendPhase = 0;
         std::vector<FastllmNaivePrefillIndexerItem> prefillItems;
         std::vector<std::unique_ptr<Data>> prefillViews;
+        // Sequential prefill reuses one chronological history per rank. A deferred
+        // batch retains its bounded per-request histories until the scoring launch.
+        Data &contextGather = buf.indexContextGather;
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &cacheKey, Data &cacheValue,
                           TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, int sequence = 0) {
@@ -1000,7 +1027,10 @@ Data NaiveN05FlashModel::RunTarget(
                         FastllmCudaNaivePackIndexer(indexKey, buf.packedIndexer);
                         input = &buf.packedIndexer;
                     }
-                    if (decodeWorkspace)
+                    if (indexerContextSharding)
+                        FastllmCudaNaiveContextIndexerWrite(separateIndex, *input, localPast,
+                            decodeWorkspace ? &buf.liveKeys : nullptr, tpRank, tpDevices.size());
+                    else if (decodeWorkspace)
                         FastllmCudaNaivePagedWrite(separateIndex, *input, 0, &buf.liveKeys);
                     else AppendCache(separateIndex, *input, kvCacheDataType, 0);
                 }
@@ -1058,6 +1088,20 @@ Data NaiveN05FlashModel::RunTarget(
                             indexWeights.FakeFrom(batchIndexWeights, (size_t)sequence * indexHeads * batchIndexWeights.unitSize);
                         } else if (localIndexer) prepareIndexQuery(normed, positions, indexQ, indexWeights);
                         const Data *scoreKey = &scoringKey;
+                        if (indexerContextSharding && !decodeWorkspace) {
+                            // Prefill consumes a chronological view. Only this request's
+                            // active history is gathered; the persistent pool stays sharded.
+                            const int keys = localPast + length;
+                            FastllmCudaNaiveContextIndexerGather(scoringKey, keys, tpRank, ranks, contextGather);
+                            const int words = contextGather.GetBytes() / (ranks * sizeof(int));
+                            AssertInFastLLM(FastllmNcclAllGather((int *)contextGather.cudaData + tpRank * words,
+                                contextGather.cudaData, words, INT32, gpu), "Indexer prefill gather failed.");
+                            // A deferred prefill batch retains at most eight independent
+                            // histories; the sequential path reuses one rank-wide buffer.
+                            FastllmCudaNaiveContextIndexerUnpack(contextGather, keys,
+                                GetPageLen(), ranks, buf.indexContextFull);
+                            scoreKey = &buf.indexContextFull;
+                        }
                         Data peerIndex;
                         if (parallelIndex && indexerLayerSharding) {
                             // Keep the only Indexer KV copy on its owning GPU. Peers
@@ -1089,7 +1133,13 @@ Data NaiveN05FlashModel::RunTarget(
                             }
                         }
                         if (decodeWorkspace) {
-                            if (graphVerify) FastllmCudaNaiveGraphVerifyIndexer(indexQ, indexWeights, scoringKey,
+                            if (indexerContextSharding) {
+                                AssertInFastLLM(!graphVerify, "Context-sharded Indexer does not support speculative verification.");
+                                std::vector<FastllmNaiveIndexerRow> rows{{&scoringKey, &buf.decode, &indices,
+                                    0, buf.capacity, indexTable(sequence)}};
+                                RunContextDecodeIndexer(indexQ, indexWeights, buf.liveKeys, rows,
+                                    buf.indexContextExchange, tpRank, ranks, GetPageLen(), gpu, indexFp8);
+                            } else if (graphVerify) FastllmCudaNaiveGraphVerifyIndexer(indexQ, indexWeights, scoringKey,
                                 buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
                             else FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights, scoringKey,
                                 buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices,
@@ -1132,7 +1182,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 rankIndices.FakeFrom(indices, (size_t)tpRank * rows * indexTopK * sizeof(int));
                                 const bool mergedParts = balanced && indexTopK == 2048 &&
                                     FastllmCudaNaiveBalancedIndexer(indexQ, indexWeights, *scoreKey,
-                                        localPast, tpRank, ranks, indexFp8, indexerLayerSharding, rankIndices);
+                                        localPast, tpRank, ranks, indexFp8, indexerLayerSharding || indexerContextSharding, rankIndices);
                                 for (int part = 0; !mergedParts && part < parts; ++part) {
                                     const int first = part == 0 ? tpRank * partRows :
                                         length - (tpRank + 1) * partRows;
@@ -1145,12 +1195,12 @@ Data NaiveN05FlashModel::RunTarget(
                                     localIndices.FakeFrom(indices,
                                         (size_t)(tpRank * rows + part * partRows) * indexTopK * sizeof(int));
                                     FastllmCudaNaiveIndexer(localQ, localWeights, *scoreKey, indexHeads, indexDim,
-                                        localPast + first, indexTopK, indexFp8, localIndices, indexerLayerSharding);
+                                        localPast + first, indexTopK, indexFp8, localIndices, indexerLayerSharding || indexerContextSharding);
                                 }
                                 FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, indices);
                                 if (balanced) balancedIndexRanks = ranks;
                             }
-                            else FastllmCudaNaiveIndexer(indexQ, indexWeights, scoringKey, indexHeads, indexDim,
+                            else FastllmCudaNaiveIndexer(indexQ, indexWeights, *scoreKey, indexHeads, indexDim,
                                                         localPast, indexTopK, indexFp8, indices);
                         }
                     }

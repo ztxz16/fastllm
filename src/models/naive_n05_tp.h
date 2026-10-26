@@ -10,6 +10,7 @@ struct NaiveN05FlashModel::TargetWorkspace {
     Data routerInput, router, expertIndex, expertScore;
     Data w1, w2, w3, tempInput, tempOutput, moeOutput, moeInputTemp, moeOutputTemp;
     Data indexQ, indexKey, indexKeyFloat, indexWeights, indices, indexBroadcast, positions;
+    Data indexContextGather, indexContextFull, indexContextExchange;
     Data last, logits, logitsBf16, inputIds, liveKeys;
     Data sparsePointers, sparseLengths, sparseSelected;
     Data denseGate, denseUp, denseDown;
@@ -26,7 +27,7 @@ struct NaiveN05FlashModel::TPDecodeState {
     struct Storage {
         // All pre-captured shapes share these allocations. Inputs and the KV
         // table keep their maximum-batch strides even for smaller graphs.
-        Data inputStorage, cacheTable, cacheMaps, indexScores;
+        Data inputStorage, cacheTable, cacheMaps, indexScores, indexExchange;
         std::shared_ptr<void> linearGraphWorkspace;
         std::vector<unsigned char> hostInput;
         std::vector<void *> hostCache;

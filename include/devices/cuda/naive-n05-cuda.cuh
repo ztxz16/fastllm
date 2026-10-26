@@ -116,6 +116,7 @@ struct FastllmNaiveRopeCacheRow {
     const fastllm::Data *indexKey;
     const void *const *cache = nullptr;
     const fastllm::Data *indexCache = nullptr; // Separate GPU Indexer: cache[2] contiguous, cache[4] paged.
+    int indexerContextRank = 0;
 };
 bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     const fastllm::Data &v, const fastllm::Data &positions,
@@ -255,13 +256,19 @@ struct FastllmNaiveIndexerRow {
 bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     const fastllm::Data &weights, const fastllm::Data &liveKeys,
     const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query,
-    int contextRank = 0, int contextRanks = 1, fastllm::Data *exchange = nullptr);
+    int contextRank = 0, int contextRanks = 1, fastllm::Data *exchange = nullptr, int contextPageLen = 0);
 // Collective dispatch must agree across the entire TP group, including mixed GPUs.
 bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices);
 // Merge rank-major (score bits, logical position) pairs after an all-gather.
 void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
     const std::vector<FastllmNaiveIndexerRow> &rows, const fastllm::Data &exchange,
-    int contextRanks);
+    int contextRanks, int contextPageLen = 0);
+void FastllmCudaNaiveContextIndexerWrite(fastllm::Data &cache, const fastllm::Data &input,
+    int start, const fastllm::Data *live, int rank, int ranks);
+void FastllmCudaNaiveContextIndexerGather(const fastllm::Data &cache, int keys,
+    int rank, int ranks, fastllm::Data &exchange);
+void FastllmCudaNaiveContextIndexerUnpack(const fastllm::Data &exchange, int keys,
+    int page, int ranks, fastllm::Data &full);
 void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
     const fastllm::Data &key, const fastllm::Data &value,
     const fastllm::Data &indices, const fastllm::Data &sink,

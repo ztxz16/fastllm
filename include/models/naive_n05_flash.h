@@ -24,7 +24,7 @@ namespace fastllm {
         ~NaiveN05FlashModel() override;
         void InitParams() override;
         void SetIndexerDataType(DataType dataType) override;
-        void SetIndexerTPStorage(bool shardByLayer);
+        void SetIndexerTPStorage(bool shardByLayer, bool shardByContext = false);
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &names) override;
         int Forward(const Data &inputIds, const Data &attentionMask,
@@ -315,6 +315,7 @@ namespace fastllm {
         bool indexFp8 = true;
         bool fp8IndexerCache = false;
         bool indexerLayerSharding = false;
+        bool indexerContextSharding = false;
         bool tpIndexerPeerAccess = false;
         int IndexerOwnerRank(int layer) const {
             return std::count(slidingLayers.begin(), slidingLayers.begin() + layer, 0) % tpDevices.size();

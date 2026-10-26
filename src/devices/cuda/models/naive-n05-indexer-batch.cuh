@@ -16,15 +16,26 @@ struct Row {
     int sequence, stride;
     const void *const *cache;
     int cpRank = 0, cpRanks = 1;
+    int contextPageLen = 0;
+    __device__ int LocalCount(int rank) const {
+        int localPage = contextPageLen / cpRanks;
+        return (*live / contextPageLen) * localPage + min(localPage, max(0, *live % contextPageLen - rank * localPage));
+    }
+    __device__ int LogicalPosition(int position) const {
+        if (!contextPageLen) return Begin() + position;
+        int localPage = contextPageLen / cpRanks;
+        return position / localPage * contextPageLen + cpRank * localPage + position % localPage;
+    }
     const unsigned *merged = nullptr;
     int mergedRows = 0, mergedRow = 0;
     __device__ int Chunk() const {
         return ((*live + cpRanks * 64 - 1) / (cpRanks * 64)) * 64;
     }
-    __device__ int Begin() const { return cpRanks > 1 ? cpRank * Chunk() : 0; }
+    __device__ int Begin() const { return contextPageLen ? 0 : cpRanks > 1 ? cpRank * Chunk() : 0; }
     __device__ int MergeWidth() const { return min(Chunk(), naive_topk::kTopK); }
     __device__ int Count() const {
         int n = *live;
+        if (contextPageLen && !merged) return LocalCount(cpRank);
         if (merged) {
             if (!n) return 0;
             int chunk = Chunk();
@@ -447,11 +458,10 @@ __global__ void Sort(Batch batch) {
 // exchange. No KV copies or additional per-request score allocations.
 __global__ void PackLocal(Batch batch) {
     const Row &r = batch.rows[blockIdx.x];
-    int first = r.Begin();
     for (int i = threadIdx.x; i < naive_topk::kTopK; i += blockDim.x) {
         int position = r.indices[i];
         r.workspace->candidates.keys[i] = position >= 0 ? r.scores[position] : 0;
-        r.workspace->candidates.positions[i] = position >= 0 ? first + position : -1;
+        r.workspace->candidates.positions[i] = position >= 0 ? r.LogicalPosition(position) : -1;
     }
 }
 __global__ void CopyPacked(Batch batch, unsigned *exchange, int rows, int first) {
@@ -462,4 +472,35 @@ __global__ void CopyPacked(Batch batch, unsigned *exchange, int rows, int first)
         out[i * 2 + 1] = r.workspace->candidates.positions[i];
     }
 }
+
+__global__ void ClearContextIndices(Batch batch) {
+    const Row &r = batch.rows[blockIdx.x];
+    for (int i = threadIdx.x; i < naive_topk::kTopK; i += blockDim.x) r.indices[i] = -1;
+}
+// Every local list is sorted by (score descending, logical position ascending).
+// Binary-search the other lists to obtain each candidate's exact global rank.
+// The unique logical position breaks ties across interleaved context shards.
+__global__ void MergeContextCandidates(Batch batch) {
+    const Row &r = batch.rows[blockIdx.y];
+    constexpr int K = naive_topk::kTopK;
+    int i = blockIdx.x * blockDim.x + threadIdx.x, owner = i / K, local = i % K;
+    if (owner >= r.cpRanks || local >= min(K, r.LocalCount(owner))) return;
+    const unsigned *source = r.merged + ((size_t)owner * r.mergedRows + r.mergedRow) * K * 2;
+    unsigned score = source[local * 2]; int position = source[local * 2 + 1];
+    int global = local;
+    for (int peer = 0; peer < r.cpRanks; ++peer) if (peer != owner) {
+        const unsigned *list = r.merged + ((size_t)peer * r.mergedRows + r.mergedRow) * K * 2;
+        int lo = 0, hi = min(K, r.LocalCount(peer));
+        while (lo < hi) {
+            int mid = (lo + hi) / 2; unsigned other = list[mid * 2];
+            int otherPosition = list[mid * 2 + 1];
+            if (other > score || (other == score && otherPosition < position)) lo = mid + 1;
+            else hi = mid;
+        }
+        global += lo;
+        if (global >= K) return;
+    }
+    r.indices[global] = position;
+}
+
 } // namespace naive_indexer_batch

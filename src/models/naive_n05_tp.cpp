@@ -383,6 +383,9 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
     tpSwaRingCache = GetFastllmEnv().cudaGraph && FastllmNaiveKVType(kvCacheDataType) &&
         window == 128 && sliding.headDim == 192 && sliding.valueDim == 128 &&
         sliding.heads / ranks < 64;
+    AssertInFastLLM(!indexerContextSharding || (kvMemConfig.enabled && indexFp8 && indexHeads == 16 &&
+        indexDim == 128 && indexTopK == 2048 && FastllmCudaNaiveIndexerContextSupported(tpDevices)),
+        "Indexer context_shard requires KVMem, the 16x128 FP8-query Indexer and CUDA SM80+ TP.");
     tpPrepared = true;
 #endif
 }
@@ -457,6 +460,8 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
             if (!table.cudaData) throw CudaWorkspaceExhausted("Naive graph cache table pool exhausted.");
         } else allocate(storage->cacheTable, INT32, tableElements);
         allocate(storage->indexScores, INT32, (int)scoreElements);
+        if (indexerContextSharding)
+            allocate(storage->indexExchange, INT32, storage->maxRows * tpDevices.size() * indexTopK * 2);
         storage->buffers.cacheTable = (const void *const *)storage->cacheTable.cudaData;
         storage->buffers.tableRows = maxRows;
         if (!sparseKv && kvCacheDataType == BFLOAT16 && FastllmCudaNaiveDSAMapsSupported() && full.headDim == 192 && full.valueDim == 128 &&
@@ -775,6 +780,10 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
         auto &storage = *state->ranks[rank]->storage;
         auto &buf = storage.buffers;
         buf.capacity = capacity;
+        if (indexerContextSharding) {
+            buf.indexContextExchange.FakeFrom(storage.indexExchange, 0);
+            buf.indexContextExchange.Resize({rows * (int)tpDevices.size() * indexTopK * 2});
+        }
         if (capacity > 2048) {
             // Decode Indexer CP reuses the score arena after packing local
             // candidates; graph variants keep the same allocation/address.
