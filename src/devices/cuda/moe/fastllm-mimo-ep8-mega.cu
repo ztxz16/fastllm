@@ -20,7 +20,7 @@ constexpr int H = 4096, I = 2048, E = 256, K = 8, CAP = 128;
 constexpr int BM = 32, BN = 256, BK = 128, STAGES = 4, SMS = 78;
 constexpr int PREFILL_BM = 64;
 constexpr int PREFILL_FIRST_CAP = 128;
-constexpr int PREFILL_CAP = 1024, PREFILL_BN = 256, PREFILL_STAGES = 4;
+constexpr int PREFILL_CAP = 8192, PREFILL_BN = 256, PREFILL_STAGES = 4;
 thread_local std::string error;
 void check(cudaError_t c) {
     if (c != cudaSuccess)
@@ -126,7 +126,7 @@ static auto kernel() {
     if constexpr (Prefill) {
         return &sm90_fp8_mega_moe_impl<capacity, H, I, E, K, LOCAL_E, bm,
             PREFILL_BN, BK, pool, sfpool, PREFILL_STAGES, 64, 64, 256, SMS, R,
-            cute::numeric_limits<float>::infinity(), true, 0, false, false, true, false, false>;
+            cute::numeric_limits<float>::infinity(), true, 0, false, false, true, true, false>;
     } else {
         return &fastllm_tile_sg::sm90_fp8_mega_moe_impl<capacity, H, I, E, K, LOCAL_E, bm,
             BN, BK, pool, sfpool, STAGES, 64, 64, 256, SMS, R,
@@ -218,6 +218,9 @@ static void *Create(const void *const *gate, const void *const *down,
         check(cudaFuncSetAttribute(kernel<128, true>(), cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM));
         check(cudaFuncSetAttribute(kernel<256, true>(), cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM));
         check(cudaFuncSetAttribute(kernel<512, true>(), cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM));
+        check(cudaFuncSetAttribute(kernel<1024, true>(), cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM));
+        check(cudaFuncSetAttribute(kernel<2048, true>(), cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM));
+        check(cudaFuncSetAttribute(kernel<4096, true>(), cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM));
         check(cudaFuncSetAttribute(kernel<PREFILL_CAP, true>(), cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM));
         return layer.release();
     } catch (const std::exception &e) {
@@ -307,6 +310,9 @@ static int RunPrefill(void *handle, const void *const *peers,
             case 128: return Run<128, true>(handle, x, y, idx, scores, rows, peers);
             case 256: return Run<256, true>(handle, x, y, idx, scores, rows, peers);
             case 512: return Run<512, true>(handle, x, y, idx, scores, rows, peers);
+            case 1024: return Run<1024, true>(handle, x, y, idx, scores, rows, peers);
+            case 2048: return Run<2048, true>(handle, x, y, idx, scores, rows, peers);
+            case 4096: return Run<4096, true>(handle, x, y, idx, scores, rows, peers);
             case PREFILL_CAP: return Run<PREFILL_CAP, true>(handle, x, y, idx, scores, rows, peers);
         }
     }
