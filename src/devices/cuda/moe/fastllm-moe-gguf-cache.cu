@@ -1248,7 +1248,7 @@ bool FastllmCudaMergeMOEV41GGUFResident(
         const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &activation,
         fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
         int weightsBatch, const fastllm::Data &indices, const fastllm::Data &scores,
-        float sharedScale, float swigluLimit) {
+        float sharedScale, float swigluLimit, bool compactEpRoutes) {
     using fastllm_gguf_moe::AllocateTensor;
     const int device = FastllmCudaGetDevice();
     if (input.dataDevice != fastllm::CUDA || input.dataType != fastllm::BFLOAT16 ||
@@ -1270,6 +1270,7 @@ bool FastllmCudaMergeMOEV41GGUFResident(
     if (hidden <= 0 || inter <= 0 || hidden > 24576 || inter > 24576 ||
         hidden%256 || inter%256 || layer->hidden != hidden) return false;
     const int rows = input.dims[0], topk = indices.dims[1], routes = rows*topk;
+    if (compactEpRoutes && (rows > 8 || topk > 16)) return false;
     size_t bytes = (size_t(rows)*(hidden/32) + size_t(routes)*(inter/32))*sizeof(block_q8_1) +
         size_t(routes)*hidden*sizeof(__nv_bfloat16);
     const size_t groupedBytes = FastllmCudaV41GGUFGroupedWorkspaceBytes(layer->gateType, layer->downType,
@@ -1278,15 +1279,16 @@ bool FastllmCudaMergeMOEV41GGUFResident(
     // or hardware; do not multiply every token with a GEMV kernel.
     if (rows > 32 && !groupedBytes) return false;
     bytes = ((bytes+255)&~size_t(255)) + groupedBytes;
+    if (compactEpRoutes) bytes += (1 + 2*routes)*sizeof(int32_t);
     if (routes > 65535 || bytes > size_t(INT32_MAX)) return false;
     AllocateTensor(gate, fastllm::BFLOAT16, {routes, 2*inter}, device);
-    AllocateTensor(activation, fastllm::BFLOAT16, {routes, inter}, device);
+    if (!compactEpRoutes) AllocateTensor(activation, fastllm::BFLOAT16, {routes, inter}, device);
     AllocateTensor(workspace, fastllm::INT8, {int(bytes)}, device);
     AllocateTensor(output, fastllm::FLOAT32, {rows, hidden}, device);
     fastllm::AssertInFastLLM(FastllmCudaRunV41GGUF(input, gate, activation, workspace,
         output, layer->table, static_cast<const int32_t *>(indices.cudaData),
         static_cast<const float *>(scores.cudaData), layer->gateType, layer->downType,
-        hidden, inter, layer->experts, topk, swigluLimit), "V4.1 resident GGUF CUDA launch failed.");
+        hidden, inter, layer->experts, topk, swigluLimit, compactEpRoutes), "V4.1 resident GGUF CUDA launch failed.");
     if (rows <= 32)
         layer->v41DecodeTopks[rows - 1].fetch_or(uint32_t(1) << (topk - 1), std::memory_order_release);
     return true;

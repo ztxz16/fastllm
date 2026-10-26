@@ -31,8 +31,24 @@ __global__ void ScatterNativeV41(const float *products, __nv_bfloat16 *output,
 }
 
 static bool NativeV41Matrix(int type, const uint8_t *const *weights, int part,
-        Workspace &w, int experts, int columns, int width, cudaStream_t stream) {
+        Workspace &w, int experts, int columns, int width, cudaStream_t stream, bool streamed = false) {
     if (type == GGML_TYPE_IQ1_S) ensure_iq1s_grid(stream);
+    // Streaming groups mix small and busy experts. Select a tile from each
+    // expert's actual rows, keeping native quantization/accumulation traits.
+    if (streamed && w.inputRows >= 1024 &&
+        ggml_cuda_info().devices[ggml_cuda_get_device()].cc == CC_TURING) {
+#define STREAM_MATRIX(T) case GGML_TYPE_##T: \
+        LaunchMatrix<GGML_TYPE_##T, 16, true, true>(weights, part, w, experts, columns, width, stream); \
+        LaunchMatrix<GGML_TYPE_##T, 32, true, true>(weights, part, w, experts, columns, width, stream); \
+        LaunchMatrix<GGML_TYPE_##T, 64, true, true>(weights, part, w, experts, columns, width, stream); return true;
+        switch (type) {
+            STREAM_MATRIX(IQ1_S) STREAM_MATRIX(IQ1_M) STREAM_MATRIX(Q2_0)
+            STREAM_MATRIX(Q3_K) STREAM_MATRIX(Q4_K)
+            STREAM_MATRIX(IQ2_XXS) STREAM_MATRIX(IQ2_XS) STREAM_MATRIX(IQ2_S) STREAM_MATRIX(IQ3_XXS)
+            default: return false;
+        }
+#undef STREAM_MATRIX
+    }
     switch (type) {
 #define NATIVE_MATRIX(T) case GGML_TYPE_##T: \
         if (w.inputRows >= 1024) LaunchMatrix<GGML_TYPE_##T, 64, false, true>( \
@@ -41,6 +57,7 @@ static bool NativeV41Matrix(int type, const uint8_t *const *weights, int part,
             weights, part, w, experts, columns, width, stream); break;
         NATIVE_MATRIX(IQ1_S) NATIVE_MATRIX(IQ1_M) NATIVE_MATRIX(Q2_0)
         NATIVE_MATRIX(Q3_K) NATIVE_MATRIX(Q4_K)
+        NATIVE_MATRIX(IQ2_XXS) NATIVE_MATRIX(IQ2_XS) NATIVE_MATRIX(IQ2_S) NATIVE_MATRIX(IQ3_XXS)
 #undef NATIVE_MATRIX
         default: return false;
     }

@@ -79,13 +79,13 @@ static bool RunNativeV41Streamed(StreamedMoePhase phase, const __nv_bfloat16 *in
             s.input, s.quantized, batch.routes, batch.offsets + batch.experts, hidden, capacity, topk);
         else GatherNativeV41<false><<<gather, 256, 0, stream>>>(
             s.input, s.quantized, batch.routes, batch.offsets + batch.experts, hidden, capacity, topk);
-        if (!NativeV41Matrix(gt, batch.weights, 0, w, batch.experts, hidden, 2 * inter, stream)) return false;
+        if (!NativeV41Matrix(gt, batch.weights, 0, w, batch.experts, hidden, 2 * inter, stream, true)) return false;
         const dim3 activation(inter / 256, batch.rows);
         if (dt == GGML_TYPE_IQ1_S) ActivateQuantizeNativeV41Streamed<true><<<activation, 256, 0, stream>>>(
             s.products, s.quantized, batch.routes, scores, inter, capacity, limit);
         else ActivateQuantizeNativeV41Streamed<false><<<activation, 256, 0, stream>>>(
             s.products, s.quantized, batch.routes, scores, inter, capacity, limit);
-        if (!NativeV41Matrix(dt, batch.weights, 1, w, batch.experts, inter, hidden, stream)) return false;
+        if (!NativeV41Matrix(dt, batch.weights, 1, w, batch.experts, inter, hidden, stream, true)) return false;
         ScatterNativeV41Streamed<<<(batch.rows * hidden + 255) / 256, 256, 0, stream>>>(
             s.products, partials, batch.routes, batch.rows, hidden);
     }

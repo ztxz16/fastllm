@@ -18,7 +18,7 @@ except ImportError:
 
 DEFAULT_SETTINGS = {
     "system_prompt": "",
-    "thinking_level": "中",
+    "thinking_level": "default",
     "web_mode": "关闭",
     "agent_mode": "chat",
 }

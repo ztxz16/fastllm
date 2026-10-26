@@ -17,6 +17,99 @@
 namespace py = pybind11;
 #endif
 namespace fastllm {
+    namespace {
+        struct UnicodeRange { uint32_t first, last; uint8_t mask; };
+        constexpr UnicodeRange unicodeCategories[] = {
+#include "unicode-categories.inc"
+        };
+        unsigned UnicodeCategory(uint32_t c) {
+            auto end = std::end(unicodeCategories);
+            auto it = std::lower_bound(std::begin(unicodeCategories), end, c,
+                [](const UnicodeRange &range, uint32_t value) { return range.last < value; });
+            return it != end && it->first <= c ? it->mask : 0;
+        }
+        bool UnicodeSpace(uint32_t c) {
+            return (c >= 9 && c <= 13) || c == 32 || c == 0x85 || c == 0xa0 || c == 0x1680 ||
+                (c >= 0x2000 && c <= 0x200a) || c == 0x2028 || c == 0x2029 || c == 0x202f ||
+                c == 0x205f || c == 0x3000;
+        }
+        // The three ordered Split expressions in the official tokenizer are
+        // applied before ByteLevel encoding. Keep byte offsets, including all
+        // unmatched spans, so neither normalization nor whitespace is lost.
+        std::vector<std::string> DeepSeekV41PreTokens(const std::string &text) {
+            struct Char { uint32_t value; size_t byte; unsigned category; };
+            std::vector<Char> chars;
+            for (size_t i = 0; i < text.size();) {
+                size_t start = i;
+                uint32_t c = uint8_t(text[i++]);
+                int extra = c < 0x80 ? 0 : c < 0xe0 ? 1 : c < 0xf0 ? 2 : 3;
+                if (extra) c &= (1u << (6 - extra)) - 1;
+                while (extra-- && i < text.size()) c = (c << 6) | (uint8_t(text[i++]) & 63);
+                chars.push_back({c, start, UnicodeCategory(c)});
+            }
+            chars.push_back({0, text.size(), 0});
+            using Span = std::pair<size_t, size_t>;
+            std::vector<Span> spans{{0, chars.size() - 1}};
+            auto split = [&](const std::function<size_t(size_t, size_t)> &match) {
+                std::vector<Span> next;
+                for (auto span : spans) {
+                    size_t plain = span.first, i = plain;
+                    while (i < span.second) {
+                        size_t end = match(i, span.second);
+                        if (end > i) {
+                            if (plain < i) next.emplace_back(plain, i);
+                            next.emplace_back(i, end); plain = i = end;
+                        } else ++i;
+                    }
+                    if (plain < span.second) next.emplace_back(plain, span.second);
+                }
+                spans.swap(next);
+            };
+            split([&](size_t i, size_t end) {
+                size_t j = i;
+                while (j < end && j - i < 3 && (chars[j].category & 4)) ++j;
+                return j;
+            });
+            split([&](size_t i, size_t end) {
+                size_t j = i;
+                while (j < end && ((chars[j].value >= 0x4e00 && chars[j].value <= 0x9fa5) ||
+                                   (chars[j].value >= 0x3040 && chars[j].value <= 0x30ff))) ++j;
+                return j;
+            });
+            split([&](size_t i, size_t end) {
+                auto letter = [&](size_t j) { return j < end && ((chars[j].value >= 'A' && chars[j].value <= 'Z') ||
+                    (chars[j].value >= 'a' && chars[j].value <= 'z')); };
+                auto word = [&](size_t j) { return j < end && (chars[j].category & 3); };
+                auto newline = [&](size_t j) { return chars[j].value == '\r' || chars[j].value == '\n'; };
+                const uint32_t c = chars[i].value;
+                const bool asciiPunctuation = c < 128 && std::string("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~").find(char(c)) != std::string::npos;
+                size_t j = i;
+                if (asciiPunctuation && letter(i + 1)) {
+                    j = i + 2; while (letter(j)) ++j; return j;
+                }
+                if (!newline(i) && !(chars[i].category & (1 | 8 | 16)) && word(i + 1)) ++j;
+                if (word(j)) { do { ++j; } while (word(j)); return j; }
+                j = i + (c == ' ');
+                if (j < end && (chars[j].category & (8 | 16))) {
+                    do { ++j; } while (j < end && (chars[j].category & (8 | 16)));
+                    while (j < end && newline(j)) ++j;
+                    return j;
+                }
+                j = i; size_t lastNewline = i;
+                while (j < end && UnicodeSpace(chars[j].value)) {
+                    if (newline(j)) lastNewline = j + 1;
+                    ++j;
+                }
+                if (lastNewline > i) return lastNewline;
+                if (j == end || j <= i + 1) return j;
+                return j - 1; // \s+(?!\S) leaves the final space for the next word.
+            });
+            std::vector<std::string> result;
+            for (auto span : spans) result.push_back(text.substr(chars[span.first].byte,
+                chars[span.second].byte - chars[span.first].byte));
+            return result;
+        }
+    }
 
     Tokenizer::TrieNode::TrieNode() {
         this->tokenId = -999999;
@@ -70,6 +163,8 @@ namespace fastllm {
         tokenToStringDict.clear();
         tokenToScoreDict.clear();
         stringToTokenDict.clear();
+        bpeMergeRanks.clear();
+        preTokenizer.clear();
     }
 
     void Tokenizer::Insert(const std::string &s, int tokenId, float score) {
@@ -131,7 +226,14 @@ namespace fastllm {
         if (now->tokenId == -999999) {
             return;
         }
-        q.push(SymbolPairs(now->score, l, r, symbols[l].len + symbols[r].len));
+        float score = now->score;
+        if (preTokenizer == "joyai-llm") {
+            auto rank = bpeMergeRanks.find(std::string(symbols[l].s + symbols[l].pos, symbols[l].len) + " " +
+                                          std::string(symbols[r].s + symbols[r].pos, symbols[r].len));
+            if (rank == bpeMergeRanks.end()) return;
+            score = -float(rank->second);
+        }
+        q.push(SymbolPairs(score, l, r, symbols[l].len + symbols[r].len));
     }
 
     int Tokenizer::GetRank(std::vector <Symbol> &symbols, PartitionLinkNode *cur, int skip) {
@@ -310,6 +412,7 @@ namespace fastllm {
     }
 
     std::vector<float> Tokenizer::BytePairEncode(const std::string &s) {
+            if (s.empty()) return {};
             std::vector<Symbol> symbols;
             for (int i = 0; i < s.size(); i++) {
                 if (i + 3 < s.size() && s[i] == '<' && s[i + 1] == 'F' && s[i + 2] == 'L' && s[i + 3] == 'M') {
@@ -425,6 +528,17 @@ namespace fastllm {
         if (this->type == TokenizerType::BPE || this->type == TokenizerType::GLM) {
             std::string &s = const_cast<std::string &>(ori);
             std::vector<float> v;
+            auto encodePlain = [&](const std::string &plain) {
+                if (preTokenizer == "joyai-llm") {
+                    for (const auto &part : DeepSeekV41PreTokens(plain)) {
+                        auto ids = BytePairEncode(Normalize(part, false));
+                        v.insert(v.end(), ids.begin(), ids.end());
+                    }
+                } else {
+                    auto ids = BytePairEncode(Normalize(plain, false));
+                    v.insert(v.end(), ids.begin(), ids.end());
+                }
+            };
             if (!this->specialTokens.empty()) {
                 int findPos = 0;
                 while (findPos < (int)s.length()) {
@@ -458,15 +572,15 @@ namespace fastllm {
                         } else
 #endif
                         {
-                            std::string ns = Normalize(subStr, false);
-                            std::vector<float> &&subTokenIds = BytePairEncode(ns);
-                            v.insert(v.end(), subTokenIds.begin(), subTokenIds.end());
+                            encodePlain(subStr);
                         }
                     }
                     if (nextSpecialTokenPos >= 0) {
                         v.push_back(nextSpecialToken);
                     }
                 }
+            } else if (preTokenizer == "joyai-llm") {
+                encodePlain(ori);
             } else {
                 std::string ns = Normalize(ori);
                 v = BytePairEncode(ns);
@@ -662,6 +776,22 @@ namespace fastllm {
     }
 
     std::string Tokenizer::DecodeTokens(const std::vector<int> &tokens) {
+        if (preTokenizer == "joyai-llm") {
+            std::string decoded;
+            for (int id : tokens) {
+                const auto &token = tokenToStringDict.at(id);
+                if (std::find(specialTokens.begin(), specialTokens.end(), token) != specialTokens.end()) {
+                    decoded += token;
+                } else {
+                    for (wchar_t c : converter.from_bytes(token)) {
+                        auto it = byteCharDict.find(c);
+                        decoded += it != byteCharDict.end() ? std::string(1, char(it->second)) :
+                            c <= 255 ? std::string(1, char(c)) : converter.to_bytes(c);
+                    }
+                }
+            }
+            return decoded;
+        }
         std::string ret = "";
         for (int i = 0; i < tokens.size(); i++) {
             std::string s = tokenToStringDict[tokens[i]];

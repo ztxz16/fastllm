@@ -505,7 +505,12 @@ case "${package_name,,}" in
 esac
 [[ "$package_version" =~ ^[A-Za-z0-9][A-Za-z0-9._+!-]*$ ]] \
     || die "wheel 版本字符串不安全：${package_version}"
-[[ "$wheel_tag" == *manylinux*"x86_64"* ]] || die "wheel 不是 manylinux x86_64：${wheel_tag}"
+# make_whl.sh emits linux_x86_64 after its GLIBC audit. Accept that tag
+# as well as manylinux; audit_elf_glibc below still checks every bundled ELF.
+case "$wheel_tag" in
+    *manylinux*x86_64*|*-linux_x86_64) ;;
+    *) die "wheel 不是 Linux x86_64：${wheel_tag}" ;;
+esac
 
 package_slug="${package_name,,}"
 package_slug="${package_slug//_/-}"
@@ -548,6 +553,7 @@ for glibc_minor in {35..17}; do
     download_target_args+=(--platform "manylinux_2_${glibc_minor}_x86_64")
 done
 download_target_args+=(
+    --platform linux_x86_64
     --platform manylinux2014_x86_64
     --platform manylinux2010_x86_64
     --platform manylinux1_x86_64

@@ -23,10 +23,12 @@
 #include "devices/disk/diskdevice.h"
 #include "utils.h"
 #include "json11.hpp"
+#include "gguf.h"
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "fastllm-v41-decode.cuh"
+#include "devices/cuda/fastllm-append-only-cuda-rows.h"
 #include "devices/cuda/fastllm-v41-engram.h"
 #include "deepseekv41-reference.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
@@ -1828,6 +1830,7 @@ namespace fastllm {
             int dim = 0;
             int scaleBlock = 32;
             Data *diskWeight = nullptr;
+            Data *ggufWeight = nullptr;
             Data diskScale;
             std::unique_ptr<DiskEmbeddingRowReader> diskValueReader;
             std::unique_ptr<DiskEmbeddingRowReader> diskScaleReader;
@@ -2269,6 +2272,44 @@ namespace fastllm {
         if (engram_layer_ids.empty()) {
             return;
         }
+        if (V41HasKey(this->weight, "gguf_architecture")) {
+            // InitParams precedes weight loading. The integer hash tensors are
+            // read verbatim after loading, never through JSON/double or FP32.
+            auto found = this->weight.weight.find("engram_token_map.weight");
+            if (found == this->weight.weight.end() || !found->second.cpuData) return;
+            auto readIntegers = [&](const char *name, int type, size_t count, void *out) {
+                Data &data = this->weight[name];
+                AssertInFastLLM(data.dataType == DATA_GGUF_FORMAT && data.ggmlType == type &&
+                    data.cpuData && data.Count(0) == count * (type == GGML_TYPE_I32 ? 4 : 8), std::string("Invalid GGUF Engram metadata: ") + name);
+                memcpy(out, data.cpuData, count * (type == GGML_TYPE_I32 ? 4 : 8));
+            };
+            engramMeta.tokenMap.resize(found->second.Count(0) / sizeof(int32_t));
+            readIntegers("engram_token_map.weight", GGML_TYPE_I32, engramMeta.tokenMap.size(), engramMeta.tokenMap.data());
+            const size_t layers = engram_layer_ids.size(), cols = (engram_max_ngram_size - 1) * engram_n_heads;
+            std::vector<int64_t> primes(layers * cols), offsets(layers * cols), multipliers(layers * engram_max_ngram_size);
+            readIntegers("engram_primes.weight", GGML_TYPE_I64, primes.size(), primes.data());
+            readIntegers("engram_offsets.weight", GGML_TYPE_I64, offsets.size(), offsets.data());
+            readIntegers("engram_multipliers.weight", GGML_TYPE_I64, multipliers.size(), multipliers.data());
+            engramMeta.primes.clear(); engramMeta.offsets.clear(); engramMeta.multipliers.clear();
+            for (size_t i = 0; i < layers; ++i) {
+                engramMeta.primes.emplace_back(primes.begin() + i * cols, primes.begin() + (i + 1) * cols);
+                engramMeta.offsets.emplace_back(offsets.begin() + i * cols, offsets.begin() + (i + 1) * cols);
+                engramMeta.multipliers.emplace_back(multipliers.begin() + i * engram_max_ngram_size,
+                                                    multipliers.begin() + (i + 1) * engram_max_ngram_size);
+                for (size_t j = 0; j < cols; ++j)
+                    AssertInFastLLM(primes[i * cols + j] > 0 && offsets[i * cols + j] >= 0 &&
+                        offsets[i * cols + j] <= engram_num_embeddings.at(i) - primes[i * cols + j],
+                        "GGUF Engram hash range exceeds its lookup table.");
+            }
+            engramMeta.compressedVocabSize = engram_compressed_vocab_size;
+            AssertInFastLLM(engram_pad_token_id >= 0 && engram_pad_token_id < engramMeta.tokenMap.size(),
+                            "GGUF Engram pad token is out of range.");
+            for (int token : engramMeta.tokenMap)
+                AssertInFastLLM(token >= 0 && token < engram_compressed_vocab_size, "Invalid GGUF Engram token map.");
+            engramMeta.padCompressedId = engramMeta.tokenMap[engram_pad_token_id];
+            engramMeta.loaded = true;
+            return;
+        }
         std::string metaPath;
         if (V41HasKey(this->weight, "engram_meta_path")) {
             metaPath = this->weight.dicts["engram_meta_path"];
@@ -2377,6 +2418,19 @@ namespace fastllm {
                 if (tensorNameSet.count(name.string_value())) {
                     markQuantizedLinear(name.string_value());
                 }
+            }
+        }
+        if (V41HasKey(this->weight, "gguf_architecture")) {
+            // GSQ/RCO requantizes checkpoint weights, but the original model's
+            // block-32 activation quantization remains part of its arithmetic.
+            for (const auto &name : tensorNames) {
+                if (V41EndsWith(name, ".attn.wq_a.weight") || V41EndsWith(name, ".attn.wq_b.weight") ||
+                    V41EndsWith(name, ".attn.wkv.weight") || V41EndsWith(name, ".attn.wo_a.weight") ||
+                    V41EndsWith(name, ".attn.wo_b.weight") || V41EndsWith(name, ".attn.indexer.wq_b.weight") ||
+                    V41EndsWith(name, ".engram.wkv.weight") ||
+                    ((name.find(".ffn.experts.") != std::string::npos || name.find(".ffn.shared_experts.") != std::string::npos) &&
+                     (V41EndsWith(name, ".w1.weight") || V41EndsWith(name, ".w2.weight") || V41EndsWith(name, ".w3.weight"))))
+                    markQuantizedLinear(name);
             }
         }
         for (const std::string &name : tensorNames) {
@@ -2638,6 +2692,7 @@ namespace fastllm {
     }
 
     void DeepSeekV41Model::OnModelWeightsLoaded() {
+        if (V41HasKey(this->weight, "gguf_architecture")) LoadEngramMeta();
         if (engram_layer_ids.empty()) {
             return;
         }
@@ -2650,6 +2705,23 @@ namespace fastllm {
             int layer = engram_layer_ids[l];
             std::string base = "layers." + std::to_string(layer) + ".engram.embed.";
             auto table = std::make_shared<V41EngramTable>();
+            auto gguf = this->weight.weight.find(base + "weight");
+            if (gguf != this->weight.weight.end() && gguf->second.dataType == DATA_GGUF_FORMAT) {
+                Data &embedding = gguf->second;
+                AssertInFastLLM(embedding.ggmlType == GGML_TYPE_IQ4_NL && embedding.dims.size() == 2 &&
+                    embedding.dims[0] == engram_num_embeddings.at(l) && embedding.dims[1] == engram_head_dim,
+                    "DeepSeekV41: invalid GGUF Engram lookup table.");
+                table->rows = embedding.dims[0]; table->dim = embedding.dims[1];
+                table->ggufWeight = &embedding;
+                if (embedding.isDiskWeight) {
+                    table->diskWeight = &embedding;
+                    table->diskValueReader = std::make_unique<DiskEmbeddingRowReader>(embedding, 0);
+                } else AssertInFastLLM(embedding.cpuData != nullptr, "GGUF Engram requires host lookup storage.");
+                engramTables.push_back(std::static_pointer_cast<void>(table));
+                printf("[Fastllm] DeepSeek-V4.1: engram table for layer %d ready (IQ4_NL, %s).\n",
+                       layer, embedding.isDiskWeight ? "disk" : "CPU");
+                continue;
+            }
             if (this->ngramDevice == "disk") {
                 Data &embedding = this->weight[base + "weight"];
                 AssertInFastLLM(embedding.isDiskWeight && embedding.cpuData == nullptr &&
@@ -2851,7 +2923,7 @@ namespace fastllm {
             if (table.gpuTable) return;
 #endif
             const uint64_t budget = 32ULL << 20;
-            if (table.diskWeight != nullptr || rows.size() * (uint64_t)table.dim > budget) {
+            if (table.diskWeight != nullptr || table.ggufWeight != nullptr || rows.size() * (uint64_t)table.dim > budget) {
                 return;
             }
             const int dim = table.dim;
@@ -2955,6 +3027,28 @@ namespace fastllm {
             *prepMs = V41NowMs() - prepStart;
         }
         uint16_t *dst = (uint16_t*)output.cpuData;
+        if (table.ggufWeight) {
+            const size_t rowBytes = ggml_row_size(ggml_type(table.ggufWeight->ggmlType), dim);
+            const auto decode = ggml_type_to_float(ggml_type(table.ggufWeight->ggmlType));
+            std::vector<int32_t> indices;
+            for (int64_t row : rows) {
+                AssertInFastLLM(row >= 0 && row < table.rows, "GGUF Engram hash is out of range.");
+                indices.push_back(int32_t(row));
+            }
+            DiskEmbeddingRowReader::Ticket read;
+            const uint8_t *source = table.ggufWeight->cpuData;
+            if (table.diskValueReader) {
+                read = table.diskValueReader->ReadAsync(indices);
+                source = read.values.get().data();
+            }
+            // Only selected rows are expanded; the 110 GB lookup stays packed.
+            std::vector<float> decoded(dim);
+            for (size_t i = 0; i < rows.size(); ++i) {
+                decode(source + (table.diskValueReader ? i : size_t(rows[i])) * rowBytes, decoded.data(), dim);
+                for (int j = 0; j < dim; ++j) dst[i * dim + j] = Float32ToBFloat16RNEBits(decoded[j]);
+            }
+            return;
+        }
         static const FP8E4M3ToFP32Manager fp8;
         Data diskValues, diskScales;
         DiskEmbeddingRowReader::Ticket valueRead, scaleRead;
@@ -5312,10 +5406,14 @@ namespace fastllm {
                 }
             }
 
+            if (layer == 0 && !tp && !f.prefill && this->deviceMap.size() == 1)
+                PrefetchDiskMoeV41(weights[layer], seqlen);
+
             // ---- Engram ----
             for (size_t l = 0; l < engram_layer_ids.size(); l++) {
                 if (engram_layer_ids[l] == layer) {
                     // Engram gather and NUMA MoE share the global CPU worker pool.
+                    if (f.moeStep) f.moeStep->WaitCpu();
                     std::unique_lock<std::mutex> hostLock;
                     if (f.prefill) hostLock = std::unique_lock<std::mutex>(*f.prefill->hostExperts);
                     RunEngram(layer, (int)l, segments, *curHidden);
@@ -5474,13 +5572,16 @@ namespace fastllm {
             bool batchAttention = false;
             bool batchTransforms = false, mergedAttention = false;
 #ifdef USE_CUDA
-            batchAttention = tp && !dumpDebug &&
-                std::all_of(segments.begin(), segments.end(), [layer](const DeepSeekV41Segment &seg) {
+            batchAttention = !dumpDebug && (tp || (numSegments > 1 && !f.graphActive)) &&
+                std::all_of(segments.begin(), segments.end(), [layer, tp](const DeepSeekV41Segment &seg) {
                     // Restored snapshots start on CPU. The ordinary attention
                     // path materializes the ring on every rank; the batched
-                    // decode path assumes those replicas already exist.
-                    return seg.seqlen == 1 && seg.startPos > 0 &&
-                           seg.state->layers[layer].windowKV.multiDeviceData;
+                    // decode path assumes those replicas already exist on TP.
+                    // Non-TP hybrid requests use the same descriptor kernel on
+                    // their ordinary CUDA tensors and do not need replicas.
+                    if (seg.seqlen != 1 || seg.startPos <= 0) return false;
+                    const Data &window = seg.state->layers[layer].windowKV;
+                    return !tp || window.multiDeviceData;
                 });
             std::vector<FastllmCudaV41AttentionRequest> attentionRequests;
             std::vector<V41DecodeIndexTask> indexTasks;
@@ -5494,12 +5595,12 @@ namespace fastllm {
                 // views once per forward; only their contents change per layer.
                 // Eager, capture, invalidated and speculative paths still check
                 // every row. These flags never survive a forward/request batch.
-                const bool reuseRows = f.graphReplay && f.workerOrderedGraphReplay &&
+                const bool reuseRows = tp && f.graphReplay && f.workerOrderedGraphReplay &&
                     f.decodeQkvViewsPrepared;
                 for (int s = 0; s < numSegments; ++s) {
                     if (reuseRows) {
                         // The same borrowed rows were checked in an earlier layer.
-                    } else if (single) {
+                    } else if (single && tp) {
                         AssertInFastLLM(V41DecodeSliceView(segQ[s], q, segments[s].offset, tpDevices) &&
                                         V41DecodeSliceView(segKV[s], kv, segments[s].offset, tpDevices),
                                         "DeepSeekV41 decode row view failed.");
@@ -5507,31 +5608,35 @@ namespace fastllm {
                         sliceOf(q, s, segQ[s]);
                         sliceOf(kv, s, segKV[s]);
                     }
-                    transforms.push_back({&segQ[s], nullptr, segments[s].startPos, 0, false});
-                    transforms.push_back({&segKV[s], nullptr, segments[s].startPos, 1, false});
-                }
-                f.decodeQkvViewsPrepared = true;
-                // These producers and consumers all use the dedicated rank
-                // stream during ordinary replay. Preserve the general handoff
-                // on source layers, where cache growth may use the caller stream.
-                batchTransforms = V41DecodeTransforms(transforms, rope, window_size, tpDevices,
-                    f.workerOrderedGraphReplay && !isKvSource[layer]);
-                // Independent rows can be written directly into the persistent
-                // graph boundary, avoiding an O(batch^2) chain of concatenations.
-                mergedAttention = MultiCudaCopyShardedActivation(attnOut, q, tpDevices, false);
-                if (mergedAttention && !(f.graphReplay && f.workerOrderedGraphReplay &&
-                                         f.decodeOutputViewsPrepared)) {
-                    for (int s = 0; s < numSegments; ++s) {
-                        AssertInFastLLM(V41DecodeSliceView(segAttnOut[s], attnOut, segments[s].offset, tpDevices),
-                                        "DeepSeekV41 attention output view failed.");
+                    if (tp) {
+                        transforms.push_back({&segQ[s], nullptr, segments[s].startPos, 0, false});
+                        transforms.push_back({&segKV[s], nullptr, segments[s].startPos, 1, false});
                     }
-                    f.decodeOutputViewsPrepared = true;
+                }
+                if (tp) {
+                    f.decodeQkvViewsPrepared = true;
+                    // These producers and consumers all use the dedicated rank
+                    // stream during ordinary replay. Preserve the general handoff
+                    // on source layers, where cache growth may use the caller stream.
+                    batchTransforms = V41DecodeTransforms(transforms, rope, window_size, tpDevices,
+                        f.workerOrderedGraphReplay && !isKvSource[layer]);
+                    // Independent rows can be written directly into the persistent
+                    // graph boundary, avoiding an O(batch^2) chain of concatenations.
+                    mergedAttention = MultiCudaCopyShardedActivation(attnOut, q, tpDevices, false);
+                    if (mergedAttention && !(f.graphReplay && f.workerOrderedGraphReplay &&
+                                             f.decodeOutputViewsPrepared)) {
+                        for (int s = 0; s < numSegments; ++s) {
+                            AssertInFastLLM(V41DecodeSliceView(segAttnOut[s], attnOut, segments[s].offset, tpDevices),
+                                            "DeepSeekV41 attention output view failed.");
+                        }
+                        f.decodeOutputViewsPrepared = true;
+                    }
                 }
             }
 #endif
             bool batchedCompression = false;
 #ifdef USE_CUDA
-            if (batchAttention && !quantKV && ratio > 0 && isKvSource[layer]) {
+            if (batchAttention && tp && !quantKV && ratio > 0 && isKvSource[layer]) {
                 batchedCompression = V41CompressDecodeBatch(segments, layer, ratio, rawKVAll, rawScoreAll,
                     weight[pre + ".attn.compressor.norm.weight"], rms_norm_eps, rope, isIndexSource[layer],
                     [&](Data &latent, Data &keys) {
@@ -5572,6 +5677,12 @@ namespace fastllm {
                 DeepSeekV41LayerCache &cache = (f.prefill ? f.prefill->request->layers : seg.state->layers)[layer];
                 const int startPos = seg.startPos;
                 const int segLen = seg.seqlen;
+#ifdef USE_CUDA
+                if (startPos == 0 || startPos < cache.totalLen) {
+                    if (cache.compressedReaders) cache.compressedReaders->Invalidate();
+                    if (cache.indexReaders) cache.indexReaders->Invalidate();
+                }
+#endif
 
                 Data *qSeg = batchAttention ? &segQ[s] : sliceOf(q, s, segQ[s]);
                 if (!batchTransforms) V41RotaryQuant(*qSeg, rope, startPos, 1, false, 0, 32);
@@ -5666,6 +5777,34 @@ namespace fastllm {
                                     "DeepSeekV41: compressed cache is out of sync at layer " + std::to_string(layer));
                     if (srcCache.compressedBlocks > 0) {
                         compressedKV = &srcCache.compressedKV;
+                        Data *indexKeys = &srcCache.indexK;
+#ifdef USE_CUDA
+                        // PP readers must not migrate a shared source cache away
+                        // from its writer. Reuse device-local prefixes, appending
+                        // only new rows. TP, graphs and speculation retain their
+                        // own cache/rollback protocols.
+                        const bool cacheReaders = tpDevices.empty() && !v41DsparkEnabled &&
+                            !f.graphActive && !f.dsparkVerify && !seg.spec && segLen == 1 &&
+                            qSeg->dataDevice == DataDevice::CUDA && qSeg->dataDeviceIds.size() == 1;
+                        if (cacheReaders) {
+                            const int device = qSeg->dataDeviceIds[0];
+                            if (!srcCache.compressedReaders)
+                                srcCache.compressedReaders = std::make_shared<CudaAppendOnlyRows>();
+                            if (Data *local = srcCache.compressedReaders->Get(srcCache.compressedKV, device))
+                                compressedKV = local;
+                            if (needIndexer) {
+                                if (!srcCache.indexReaders)
+                                    srcCache.indexReaders = std::make_shared<CudaAppendOnlyRows>();
+                                if (Data *local = srcCache.indexReaders->Get(srcCache.indexK, device))
+                                    indexKeys = local;
+                            }
+                        } else {
+                            // Includes prefill/replay and any fallback mode: an
+                            // existing prefix may be rewritten before next decode.
+                            if (srcCache.compressedReaders) srcCache.compressedReaders->Invalidate();
+                            if (srcCache.indexReaders) srcCache.indexReaders->Invalidate();
+                        }
+#endif
                         if (needIndexer) {
 #ifdef USE_CUDA
                             if (batchAttention && !quantKV) {
@@ -5674,7 +5813,7 @@ namespace fastllm {
                                 const bool useCandidates = segHasCandidates[s] && candidate_source_layer_id >= 0 &&
                                     candidate_source_layer_id < layer;
                                 indexTasks.push_back({sliceOf(qIdxAll, s, segIndexQ[s]),
-                                    sliceOf(idxWeightsAll, s, segIndexWeight[s]), &srcCache.indexK,
+                                    sliceOf(idxWeightsAll, s, segIndexWeight[s]), indexKeys,
                                     &segCandidate[s], &segTopK[s], startPos, writeCandidates, useCandidates});
                                 if (writeCandidates) segHasCandidates[s] = 1;
                                 cmpIdx = &segTopK[s];
@@ -5691,12 +5830,12 @@ namespace fastllm {
                                                        candidate_source_layer_id < layer;
                             // 分数矩阵是 [token, m]，长上下文下会非常大（1M 上下文时每个 token 512 K 个候选）。
                             // 按 token 维分块调用打分 / 候选块 / top-k，把峰值显存钉在一个固定预算内。
-                            const int scoreM = srcCache.indexK.dims.size() == 3 ? srcCache.indexK.dims[1] : 0;
+                            const int scoreM = indexKeys->dims.size() == 3 ? indexKeys->dims[1] : 0;
                             int chunkTokens = V41IndexScoreChunk(segLen, scoreM);
                             bool partitionedIndexer = false;
 #ifdef USE_CUDA
                             partitionedIndexer = !dumpDebug && V41PrefillIndexerTp(
-                                *qIdx, *idxWeightsScaled, srcCache.indexK, segCandidate[s], segTopK[s],
+                                *qIdx, *idxWeightsScaled, *indexKeys, segCandidate[s], segTopK[s],
                                 isCandidateLayer, useCandidates, ratio, startPos, indexTopK,
                                 candidate_block_size, candidate_topk_blocks, tpDevices);
 #endif
@@ -5704,7 +5843,7 @@ namespace fastllm {
                                 if (isCandidateLayer) segHasCandidates[s] = 1;
                             } else if (chunkTokens >= segLen) {
                                 Data score;
-                                V41IndexerScore(*qIdx, *idxWeightsScaled, srcCache.indexK, ratio, startPos, score);
+                                V41IndexerScore(*qIdx, *idxWeightsScaled, *indexKeys, ratio, startPos, score);
                                 if (dumpDebug) {
                                     V41DumpTensor(*qIdx, "fl_layer" + std::to_string(layer) + "_idxq" + dumpSuffix);
                                     V41DumpTensor(*idxWeightsScaled, "fl_layer" + std::to_string(layer) + "_idxw" + dumpSuffix);
@@ -5734,7 +5873,7 @@ namespace fastllm {
                                     Data qChunk, wChunk, score, candChunk, topkChunk;
                                     Split(*qIdx, 1, c0, c1, qChunk);
                                     Split(*idxWeightsScaled, 1, c0, c1, wChunk);
-                                    V41IndexerScore(qChunk, wChunk, srcCache.indexK, ratio, startPos + c0, score);
+                                    V41IndexerScore(qChunk, wChunk, *indexKeys, ratio, startPos + c0, score);
                                     Data *candPtr = nullptr;
                                     if (isCandidateLayer) {
                                         V41CandidateBlocks(score, candidate_block_size, candidate_topk_blocks, ratio,
@@ -5817,7 +5956,7 @@ namespace fastllm {
                 bool completedTogether = false;
                 std::vector<V41DecodeTransform> finishTransforms;
                 std::function<void(int, int)> beforeAttention, afterAttention;
-                if (!quantKV && std::all_of(segments.begin(), segments.end(), [](const DeepSeekV41Segment &seg) {
+                if (tp && !quantKV && std::all_of(segments.begin(), segments.end(), [](const DeepSeekV41Segment &seg) {
                         return !seg.spec || !seg.spec->deferWindow;
                     })) {
                     for (int s = 0; s < numSegments; ++s) {
@@ -5848,8 +5987,14 @@ namespace fastllm {
                                 ratio, r.startPos, std::max(1, candidate_block_size), *r.topk);
                         }
                     }
-                    if (!MultiCudaDeepSeekV41SparseAttentionBatch(attentionRequests,
-                        weight[pre + ".attn.attn_sink"], window_size, softmaxScale, tpDevices)) {
+                    // Each descriptor keeps its request's Q/KV pointers and
+                    // position. Dispatch only after all candidate lists exist.
+                    const bool batchedAttention = tp ?
+                        MultiCudaDeepSeekV41SparseAttentionBatch(attentionRequests,
+                            weight[pre + ".attn.attn_sink"], window_size, softmaxScale, tpDevices) :
+                        FastllmCudaDeepSeekV41SparseAttentionBatch(attentionRequests,
+                            weight[pre + ".attn.attn_sink"], window_size, softmaxScale);
+                    if (!batchedAttention) {
                         for (const auto &r : attentionRequests) {
                             V41SparseAttention(*r.q, *r.chunkKV, r.ringKV, r.compressedKV, r.indices,
                                 weight[pre + ".attn.attn_sink"], window_size, r.startPos, softmaxScale, *r.output, executionMode == ExecutionMode::Hybrid);
@@ -5857,7 +6002,7 @@ namespace fastllm {
                     }
                     // Do not overwrite a ring row until attention has read it.
                     bool finished = false;
-                    if (!quantKV && std::all_of(segments.begin(), segments.end(), [](const DeepSeekV41Segment &seg) {
+                    if (tp && !quantKV && std::all_of(segments.begin(), segments.end(), [](const DeepSeekV41Segment &seg) {
                             return !seg.spec || !seg.spec->deferWindow;
                         })) {
                         std::vector<V41DecodeTransform> transforms;
@@ -6131,6 +6276,12 @@ namespace fastllm {
         auto &expertIndex = ws->expertIndex;
         auto &expertScore = ws->expertScore;
         auto &sharedExpertOut = ws->sharedExpertOut;
+
+            // Start the next layer's bounded reads before HcPost/attention.
+            // Pipelined PP owns concurrent workspaces; retain its own ordering.
+            if (layer + 1 < block_cnt && !f.tp && !f.prefill && this->deviceMap.size() == 1)
+                PrefetchDiskMoeV41(weights[layer + 1], f.boundedPrefill && layer + 1 >= decoderSwaTailLayer
+                    ? std::min(f.seqlen, window_size) : f.seqlen);
 
             // HcPost uses residual's shape and input's element count. Keep the
             // CPU MoE output flat so next layer's MergeMOEBlock does not discard

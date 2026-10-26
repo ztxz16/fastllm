@@ -83,6 +83,42 @@ void quantize_row_q8_1_cuda(
     quantize_q8_1<<<num_blocks, block_size, 0, stream>>>(x, vy, kx0, kx0_padded);
 }
 
+bool FastllmCudaGGUFGroupedGemv(const fastllm::Data &input, fastllm::Data &weight,
+        int groups, int rows, fastllm::Data &output) {
+    using namespace fastllm;
+    if (input.dims.size() != 4 || input.dims[0] <= 0 || input.dims[1] <= 0 ||
+        int64_t(input.dims[0]) * input.dims[1] > MMVQ_MAX_BATCH_SIZE ||
+        groups <= 0 || rows <= 0 || input.dims[2] % groups ||
+        weight.dataType != DATA_GGUF_FORMAT || weight.ggmlType != GGML_TYPE_Q5_K ||
+        !input.cudaData || !weight.cudaData ||
+        (input.dataType != FLOAT32 && input.dataType != FLOAT16 && input.dataType != BFLOAT16)) return false;
+    const int columns = input.dims[2] / groups * input.dims[3];
+    const int tokens = input.dims[0] * input.dims[1];
+    if (columns <= 0 || columns % 256 ||
+        weight.Count(0) != size_t(groups) * rows * ggml_row_size(GGML_TYPE_Q5_K, columns)) return false;
+    // Keep specialized single-GEMV shapes on their existing path.
+    if (columns == 2560 && rows >= 2048) return false;
+    const int padded = (columns + 511) / 512 * 512;
+    auto *q8 = static_cast<block_q8_1 *>(FastllmCudaMalloc(
+        size_t(tokens) * groups * padded / QK8_1 * sizeof(block_q8_1)));
+    output.dataType = input.dataType; output.UpdateUnitSize();
+    output.Resize({input.dims[0], input.dims[1], groups * rows});
+    output.dataDevice = CUDA; output.dataDeviceIds = input.dataDeviceIds;
+    output.Allocate(false);
+    const auto stream = cudaStreamPerThread;
+    if (input.dataType == FLOAT32)
+        quantize_row_q8_1_cuda(static_cast<const float *>(input.cudaData), q8, columns, groups * tokens, 1, padded, GGML_TYPE_Q5_K, stream);
+    else if (input.dataType == FLOAT16)
+        quantize_row_q8_1_cuda(static_cast<const half *>(input.cudaData), q8, columns, groups * tokens, 1, padded, GGML_TYPE_Q5_K, stream);
+    else
+        quantize_row_q8_1_cuda(static_cast<const __nv_bfloat16 *>(input.cudaData), q8, columns, groups * tokens, 1, padded, GGML_TYPE_Q5_K, stream);
+    FastllmGgufQ5KGroupedGemv(weight.cudaData, q8, output.cudaData, input.dataType,
+        groups, columns, rows, padded, tokens, stream);
+    checkCudaErrors("GGUF grouped WoA", cudaGetLastError());
+    if (!FastllmCudaFreeAfterCurrentThreadStream(q8)) FastllmCudaFree(q8);
+    return true;
+}
+
 bool get_has_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q2_K   : return true;

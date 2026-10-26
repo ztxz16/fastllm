@@ -500,7 +500,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .automatic-resource-limits-heading::before { content: "›"; color: var(--primary); font-size: 17px; line-height: 1; transform: rotate(0deg); transition: transform .15s ease; }
 .automatic-resource-limits[open] .automatic-resource-limits-heading { margin-bottom: 10px; }
 .automatic-resource-limits[open] .automatic-resource-limits-heading::before { transform: rotate(90deg); }
-.automatic-resource-limits-heading strong { color: #43574b; font-size: 12px; }
+.automatic-resource-limits-heading strong { flex: 1; color: #43574b; font-size: 12px; }
 .automatic-resource-limits-heading small { color: var(--subtle); font-size: 10px; }
 .profile-validation .validation-message { color: #a43340; background: #fff0f1; }
 .folder-picker-entry.selected { color: var(--primary); background: var(--primary-soft); }
@@ -518,6 +518,8 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .automatic-config-dialog-heading p { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .automatic-config-dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
 .automatic-config-dialog-error { color: #a43340; font-size: 12px; line-height: 1.6; }
+.api-info-dialog .field { display: grid; gap: 8px; margin-block: 16px; }
+.api-info-dialog input { width: 100%; min-width: 0; box-sizing: border-box; }
 .automatic-config-status {
   margin-top: 12px;
   padding: 11px 12px;
@@ -699,7 +701,12 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .download-catalog-group.accent-violet { background: linear-gradient(135deg, #ffffff 0%, #faf8ff 100%); }
 .download-catalog-group.accent-orange { background: linear-gradient(135deg, #ffffff 0%, #fffaf3 100%); }
 .download-catalog-group.accent-slate { background: linear-gradient(135deg, #ffffff 0%, #f7f9fb 100%); }
-.download-catalog-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.download-catalog-heading { display: flex; align-items: center; gap: 18px; cursor: pointer; list-style: none; }
+.download-catalog-heading::-webkit-details-marker { display: none; }
+.download-catalog-heading::before { content: "›"; flex-shrink: 0; color: var(--primary); font-size: 17px; line-height: 1; transition: transform .15s ease; }
+.download-catalog-group[open] > .download-catalog-heading::before { transform: rotate(90deg); }
+.download-catalog-heading > div { flex-shrink: 0; }
+.download-catalog-heading > p { margin-left: auto; }
 .download-catalog-eyebrow { color: var(--primary); font-size: 9px; font-weight: 780; letter-spacing: 1.2px; }
 .download-catalog-group h2 { margin-top: 4px; font-size: 15px; letter-spacing: -.2px; }
 .download-catalog-group p { max-width: 560px; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.5; }
@@ -907,6 +914,8 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .editor-navigation { gap: 1px; }
   .editor-navigation button { flex: 1; min-width: 0; padding: 10px 4px; font-size: 11px; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }
   #profile-parameters > .form-section, #profile-parameters > .advanced-section { scroll-margin-top: 95px; }
+  .download-catalog-heading { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; }
+  .download-catalog-heading > p { grid-column: 2; margin-left: 0; }
   .configuration-mode-options, .automatic-mode-options { grid-template-columns: 1fr; }
   .configuration-mode-card { padding: 13px; }
   .configuration-mode-card small { margin-top: 4px; }

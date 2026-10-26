@@ -1,6 +1,6 @@
 # Linux x86_64 wheel 构建
 
-发布环境采用 Ubuntu 20.04 / glibc 2.31、GCC 11、CUDA 12.9 和 Binutils 2.38，
+发布环境采用 Ubuntu 20.04 / glibc 2.31、GCC 11、CUDA 12.9、CMake 3.31.1 和 Binutils 2.38，
 目标是兼容 Ubuntu 20.04/22.04。运行 wheel 需要 Python >= 3.10；构建 Python 可用 3.8。
 
 在仓库根目录执行：
@@ -36,7 +36,7 @@ NVCC 内部线程会叠加在 CUDA 并行任务上，普通机器应降低线程
 在 Python 3.10/3.11 虚拟环境中安装：
 
 ```bash
-python -m pip install -c tools/wheel/runtime-cu129.txt build-fastllm/tools/dist/ftllm-0.1.8.2-py3-none-linux_x86_64.whl
+python -m pip install -c tools/wheel/runtime-cu129.txt build-fastllm/tools/dist/ftllm-1.9.0-py3-none-linux_x86_64.whl
 python -c 'from ftllm import llm; print(llm.get_cpu_threads())'
 ```
 

@@ -4,7 +4,7 @@
 
 当前路径覆盖 GLM-5 DSA、GLM-5.3-Flash KDA 与分页缓存，以及部分 GLM-5.2 量化 KV-B checkpoint 的纯 CPU 推理。
 
-自动化部署建议先把本页和 [Agent 部署速查](model-deployment-agent.md) 交给 agent，并优先使用 `--auto`。下面的手动命令用于固定设备、缓存和量化路径。
+GLM-5.3-Flash 在 Linux NVIDIA CUDA 环境下优先使用 `--auto`。GLM-5、GLM-5.2 以及纯 CPU 部署仍使用下方手动配置。自动化部署也可参考 [Agent 部署速查](model-deployment-agent.md)。
 
 ## 自动配置（推荐）
 
@@ -16,6 +16,18 @@ ftllm server /data/models/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf \
 
 GGUF 只需指定第一个分片，其他分片保留在同一目录。需要限制规划预算时，增加
 `--auto_gpu_memory_limit 20g` 或 `--auto_host_memory_limit 128g`。
+
+HF/NVFP4 模型把路径替换为完整模型目录即可；已有量化权重通常保留默认精度。常用覆盖项：
+
+| 需要调整 | 追加参数 |
+| --- | --- |
+| 缩小窗口或调整并发 | `--max_context_length 32768 --max_batch 2` |
+| 固定每卡专家缓存 | `--moe_cuda_cache 7g`，`0` 关闭 |
+| 固定 CPU 线程或输入分块 | `--threads 32 --chunked_prefill_size 4096` |
+| 使用内置 MTP | `--mtp 3`，需要 checkpoint 包含 NextN 草稿权重 |
+| 关闭全部推测解码 | `--speculative_algorithm off` |
+
+自动模式不会仅因模型带有 NextN 权重就默认启用 GLM MTP。参数影响、预算和启动器入口见 [`--auto` 调节指南](auto.md)；不需要固定的参数保持省略。
 
 ## 手动配置参考
 

@@ -98,6 +98,11 @@ void HybridMoeDecodeStep::Begin(Data **weights, int count, int topk,
     policy = FastllmCudaBeginMoeDecode(weights, count, topk, devices);
 #endif
 }
+void HybridMoeDecodeStep::WaitCpu() {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+    FastllmCudaWaitMoeDecodeCpu(policy);
+#endif
+}
 void HybridMoeDecodeStep::Finish() {
     if (!policy) return;
 #if defined(USE_CUDA) && !defined(USE_ROCM)

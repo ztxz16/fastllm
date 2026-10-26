@@ -930,12 +930,26 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = _AutoArgumentParser(description = des, add_help = add_help)
     parser.add_argument('--auto', action='store_true',
                         help='自动选择CUDA混推配置：DeepSeek-V4.1默认1M上下文、DSpark 5和fast_prefill，其他模型默认128K；显式参数优先')
+    parser.add_argument('--autotune', action='store_true',
+                        help='启动前独立实测调参（DeepSeek-V4.1 PP）：以原auto为基线，比较少量NUMA/disk方案；不改变--auto行为')
+    parser.add_argument('--autotune_budget', '--autotune-budget', type=_positive_int, default=1800,
+                        help='调参子进程的总时间上限（秒，含加载；默认1800）；最终服务加载不计入')
+    parser.add_argument('--autotune_profile', '--autotune-profile', default='',
+                        help='调参记录JSON路径；默认写入~/.cache/fastllm/autotune，历史数据仅用于候选排序')
+    parser.add_argument('--autotune_prompt', '--autotune-prompt', default='',
+                        help='用于调参的UTF-8文本文件；默认使用内置长文本任务，不使用随机token估算专家局部性')
     parser.add_argument('--auto_gpu_memory_limit', '--auto-gpu-memory-limit',
                         dest='auto_gpu_memory_limit', type=_memory_size_or_auto, default=None,
                         help='自动规划时每张可见GPU的显存上限，如20g；未指定则读取实际可用显存')
-    parser.add_argument('--auto_host_memory_limit', '--auto-host-memory-limit',
+    host_memory = parser.add_mutually_exclusive_group()
+    host_memory.add_argument('--auto_host_memory_limit', '--auto-host-memory-limit',
                         dest='auto_host_memory_limit', type=_memory_size_or_auto, default=None,
-                        help='自动规划时主机内存上限，如128g；未指定则读取实际可用内存')
+                        help='收紧自动规划的主机内存上限，如128g；不能超过检测到的可用预算')
+    host_memory.add_argument('--force_ddr_limit', '--force-ddr-limit',
+                        dest='force_ddr_limit', type=_memory_size_or_auto, default=None,
+                        help='强制指定最终主存规划预算，如114g；替代CMA/cgroup检测及自动预留后的预算，不改变系统硬限制，过大可能OOM；与auto_host_memory_limit互斥')
+    parser.add_argument('--auto_disk_cache_ratio', '--auto-disk-cache-ratio', type=float, default=0.5,
+                        help='DeepSeek-V4.1自动混合NUMA/disk时，主存缓存覆盖disk专家权重的推荐最低比例（0到1，默认0.5）；仅估算容量')
     parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹或配置文件')
     parser.add_argument('-p', '--path', type = str, required = False, default = '', help = '模型路径，fastllm模型文件或HF模型文件夹')
     parser.add_argument('-t', '--threads', type = int, default = -1,  help = '线程数量')
@@ -969,9 +983,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help='只有活跃 decode 请求数达到此值才等待攒批；空闲时始终立即放行')
     fast_prefill = parser.add_mutually_exclusive_group()
     fast_prefill.add_argument('--fast_prefill', '--fast-prefill', action='store_true',
-                             help='启用DeepSeek-V4.1近似 prefill：后段层只计算末尾滑窗，可能改变 logits；该模型的--auto默认开启')
+                             help='开启DeepSeek-V4.1快速 prefill；该模型的--auto默认开启，可用--no_fast_prefill关闭')
     fast_prefill.add_argument('--no_fast_prefill', '--no-fast-prefill', dest='fast_prefill',
-                             action='store_false', help='关闭近似 prefill，包括覆盖--auto默认值')
+                             action='store_false', help='关闭快速 prefill，可覆盖--auto默认的开启设置')
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
                         type = _vision_device, default = None,
@@ -1137,7 +1151,8 @@ def make_normal_llm_model(args, startup_progress = None):
                 args_config = json.load(file)
                 cli_explicit = set(getattr(args, "_auto_explicit", ()))
                 explicit = cli_explicit | set(args_config)
-                unified_auto = getattr(args, "auto", False) or args_config.get("auto", False)
+                unified_auto = (getattr(args, "auto", False) or args_config.get("auto", False) or
+                                getattr(args, "autotune", False) or args_config.get("autotune", False))
                 for it in args_config.keys():
                     # The positional model is the configuration file itself;
                     # its saved model/path still needs resolving. Other supplied
@@ -1148,6 +1163,9 @@ def make_normal_llm_model(args, startup_progress = None):
                         os.environ[it] = str(args_config[it])
                     setattr(args, it, args_config[it])
                 args._auto_explicit = sorted(explicit)
+
+    if getattr(args, "autotune", False):
+        args.auto = True
 
     if getattr(args, "auto", False):
         args._auto_explicit = [name for name in getattr(args, "_auto_explicit", ())
@@ -1451,6 +1469,9 @@ def make_normal_llm_model(args, startup_progress = None):
                     config = json.load(file)
             else:
                 config = gguf_config
+            if getattr(args, "mmproj", "") and config.get("gguf_architecture") == "deepseek41":
+                from .deepseek_v41_gguf import vision_config
+                config.update(vision_config(args.mmproj, config))
             architectures = config.get("architectures", [])
             architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")
@@ -1706,7 +1727,16 @@ def make_normal_llm_model(args, startup_progress = None):
                 raise
             pass
     automatic_plan = None
-    if getattr(args, "auto", False):
+    if getattr(args, "autotune", False):
+        from ftllm import llm
+        from .autotune import resolve as resolve_autotune
+        automatic_plan = resolve_autotune(args, llm.get_cuda_memory_info)
+        user_set_device = user_set_moe_device = True
+    elif getattr(args, "_autotune_plan", None) is not None:
+        # Isolated tuning workers already carry a capacity-checked concrete plan.
+        automatic_plan = args._autotune_plan
+        user_set_device = user_set_moe_device = True
+    elif getattr(args, "auto", False):
         from ftllm import llm
         from .auto_config import resolve as resolve_auto_config
         automatic_plan = resolve_auto_config(args, llm.get_cuda_memory_info)
@@ -1966,6 +1996,11 @@ def make_normal_llm_model(args, startup_progress = None):
                 llm.set_moe_device_layers(args.moe_device_layers)
             else:
                 llm.set_device_map(args.moe_device, True)
+    if automatic_plan and "autotune_placement" in automatic_plan:
+        placement = automatic_plan["autotune_placement"]
+        llm.set_device_map(placement["front"], True)
+        llm.set_layered_moe_device_map("disk")
+        llm.set_moe_device_layers(placement["disk_layers"])
     llm.set_cpu_threads(args.threads)
     llm.set_cpu_low_mem(args.low)
     if (args.cuda_embedding or getattr(args, "low_gpu_mem", False)):

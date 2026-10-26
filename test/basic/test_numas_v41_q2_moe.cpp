@@ -137,6 +137,7 @@ int main(int argc, char **argv) {
         // Q4_K_R4 consumes Q8_K32, while Q2_K_R4 consumes Q8_K.
         const bool q2Down = decodeOrVerify && argc > 4 && std::string(argv[4]) == "q2";
         const bool q2ZeroDown = iq1s || iq1m || (decodeOrVerify && argc > 4 && std::string(argv[4]) == "q2_0");
+        const bool iq1 = verify && argc > 4 && std::string(argv[4]) == "iq1";
         std::vector<std::unique_ptr<Data>> owned;
         std::vector<Data*> weights(2 * (experts + 1), nullptr), biases(weights);
         std::vector<std::unique_ptr<Data>> boundOwned;
@@ -147,7 +148,7 @@ int main(int argc, char **argv) {
         std::vector<std::vector<uint8_t>> canonical(weights.size());
         for (int e = disk ? 0 : 1; e <= experts; ++e) for (int part = 0; part < 2; ++part) {
             int rows = part ? hidden : 2 * inter, cols = part ? inter : hidden;
-            auto type = part && q2ZeroDown ? GGML_TYPE_Q2_0 :
+            auto type = iq1 ? (part ? GGML_TYPE_IQ1_M : GGML_TYPE_IQ1_S) : part && q2ZeroDown ? GGML_TYPE_Q2_0 :
                 part && !q2Down ? GGML_TYPE_Q4_K : GGML_TYPE_Q2_K;
             if (!part && (iq1s || iq1m)) type = iq1s ? GGML_TYPE_IQ1_S : GGML_TYPE_IQ1_M;
             auto weight = e == 0 ? std::make_unique<Data>(FLOAT16, std::vector<int>{rows, cols}) :
@@ -173,7 +174,7 @@ int main(int argc, char **argv) {
                 const size_t bytes = ggml_type_size(type);
                 for (size_t offset = 0; offset < weight->GetBytes(); offset += bytes) {
                     uint8_t *block = weight->cpuData + offset;
-                    if (iq1s) memcpy(block, &scale, sizeof(scale));
+                    if (type == GGML_TYPE_IQ1_S) memcpy(block, &scale, sizeof(scale));
                     else {
                         auto *q = reinterpret_cast<block_iq1_m *>(block);
                         uint16_t scales[4]; memcpy(scales, q->scales, sizeof(scales));
@@ -380,29 +381,61 @@ int main(int argc, char **argv) {
                 printf("CPU/NUMA bitwise PASS rows=%d hidden=%d inter=%d\n", rows, hidden, inter);
             }
             if (verify) {
-                // The cache verifier uses the grouped path even for one row.
-                // Compare its scalar fallback exactly, including untouched GPU
-                // route slots, signed routing and non-BF16 clamp thresholds.
+                // Reduced output must match the scalar fallback; per-route
+                // output must match independent single-row decode calls.
+                // Include GPU-owned slots, signed scores and non-BF16 limits.
                 RestoreEnv fast("FASTLLM_DSV4_DISABLE_NUMAS_MOE_LARGE_FAST");
-                for (bool perRoute : {false, true}) for (bool subset : {false, true}) {
+                for (bool perRoute : {false, true}) for (int subset : {0, 1, 2, 3}) {
                     if (subset && !perRoute) continue;
                     std::vector<int32_t> gpuIds(ids.size(), -1);
                     if (subset) for (size_t i = 0; i < ids.size(); ++i)
-                        if (ids[i] % 2) gpuIds[i] = ids[i];
+                        if (subset == 2 || (subset == 1 && ids[i] % 2) ||
+                            (subset == 3 && (ids[i] + i / topk) % 3)) gpuIds[i] = ids[i];
                     const size_t bytes = size_t(rows) * hidden *
                         (perRoute ? topk * sizeof(float) : sizeof(uint16_t));
                     std::vector<uint8_t> reference(bytes), actual(bytes);
-                    for (float limit : {0.f, 1.234567f, 10.f}) {
+                    for (int block : {32, 128}) for (float limit : {0.f, 1.234567f, 10.f}) {
                         auto run = [&](std::vector<uint8_t> &buffer) {
                             std::fill(buffer.begin(), buffer.end(), 0x5a);
                             NumasMoeVerifyExperts(inputBits.data(), buffer.data(), rows,
                                 weights.data(), weights.size(), ids.data(), gpuIds.data(),
-                                scores.data(), topk, 0, limit, perRoute);
+                                scores.data(), topk, 0, limit, perRoute, block);
                         };
-                        setenv(fast.key, "1", 1); run(reference);
-                        unsetenv(fast.key); run(actual);
+                        if (perRoute) {
+                            std::fill(reference.begin(), reference.end(), 0x5a);
+                            for (int row = 0; row < rows; ++row)
+                                NumasMoeVerifyExperts(inputBits.data() + row * hidden,
+                                    reference.data() + size_t(row) * topk * hidden * sizeof(float), 1,
+                                    weights.data(), weights.size(), ids.data() + row * topk,
+                                    gpuIds.data() + row * topk, scores.data() + row * topk,
+                                    topk, 0, limit, true, block);
+                        } else {
+                            setenv(fast.key, "1", 1); run(reference);
+                            unsetenv(fast.key);
+                        }
+                        run(actual);
                         if (reference != actual)
-                            throw std::runtime_error("Q2 cache verifier differs from scalar fallback");
+                            throw std::runtime_error("GGUF verifier differs from reference");
+                        if (perRoute) {
+                            // A throwing GPU submission must drain CPU jobs and
+                            // leave the borrowed workspace safe for the next call.
+                            if (rows == 3 && subset == 3 && block == 32 && limit == 0.f) {
+                                bool caught = false;
+                                try {
+                                    NumasMoeVerifyExpertsWithOverlap(inputBits.data(), actual.data(), rows,
+                                        weights.data(), weights.size(), ids.data(), gpuIds.data(), scores.data(),
+                                        topk, 0, limit, true, block, [] { throw std::runtime_error("submit"); });
+                                } catch (const std::runtime_error &) { caught = true; }
+                                if (!caught) throw std::runtime_error("GPU submission exception lost");
+                            }
+                            std::fill(actual.begin(), actual.end(), 0x5a);
+                            int submitted = 0;
+                            NumasMoeVerifyExpertsWithOverlap(inputBits.data(), actual.data(), rows,
+                                weights.data(), weights.size(), ids.data(), gpuIds.data(), scores.data(),
+                                topk, 0, limit, true, block, [&] { ++submitted; });
+                            if (submitted != 1 || reference != actual)
+                                throw std::runtime_error("GGUF overlap verifier changed output or submission count");
+                        }
                     }
                 }
                 // The same preparation capability also admits V4 block-128
@@ -419,10 +452,11 @@ int main(int argc, char **argv) {
                     std::vector<uint8_t> reference(check.cpuData, check.cpuData + check.GetBytes());
                     unsetenv(fast.key); merge();
                     if (memcmp(reference.data(), check.cpuData, reference.size()))
-                        throw std::runtime_error("Q2 grouped block-128 differs from scalar fallback");
+                        throw std::runtime_error("GGUF grouped block-128 differs from scalar fallback");
                 }
-                printf("Q2 verifier exact: rows=%d hidden=%d inter=%d down=%s\n",
-                       rows, hidden, inter, q2Down ? "Q2" : "Q4");
+                printf("GGUF verifier exact: rows=%d hidden=%d inter=%d gate=%s down=%s\n",
+                       rows, hidden, inter, ggml_type_name((ggml_type)weights[2]->ggmlType),
+                       ggml_type_name((ggml_type)weights[3]->ggmlType));
                 continue;
             }
             if (decode) {

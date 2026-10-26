@@ -527,7 +527,44 @@ static void TestSharedOverlap() {
     Require(probed[0] && probed[1] && probed[2], "single-expert calibration starved a GPU or CPU");
 }
 
+static void TestAdmissionPayback() {
+    using Policy=fastllm::MoeFrequencyPolicy;
+    fastllm::MoeCacheConfig config;config.halfLife=0;config.replacementMargin=0;
+    Policy p({0,0,0},{0},1,config,{100,100,100});
+    Policy::RuntimeBudget budget;budget.maxBytes=99;budget.uploadUsPerByte=1;budget.savedUsPerKey={1,1,1};
+    int e=0;p.BeginStep();p.Observe(0,&e,1);
+    Require(p.EndStep(&budget).empty(),"runtime byte cap was exceeded");
+    budget.maxBytes=100;
+    p.BeginStep();p.Observe(0,&e,1);
+    Require(p.EndStep(&budget).empty(),"unprofitable transfer was admitted");
+    budget.uploadUsPerByte=.01;
+    p.BeginStep();p.Observe(0,&e,1);
+    const auto accepted=p.EndStep(&budget);
+    Require(accepted.size()==1 && accepted[0].key==0,"profitable bounded transfer was rejected");
+    // Reducing a backend's allowance must not discard measured heat or
+    // alter residency; pending candidates can be reconsidered later.
+    budget.maxBytes=0;e=1;
+    p.BeginStep();for(int n=0;n<8;++n)p.Observe(0,&e,1);
+    Require(p.EndStep(&budget).empty() && p.Slot(0)==0,"zero runtime budget mutated residency");
+    budget.maxBytes=100;p.BeginStep();p.Observe(0,&e,1);
+    Require(p.EndStep(&budget).size()==1 && p.Slot(1)==0,"budget discarded pending candidate heat");
+}
+
+static void TestDecodeCompletion() {
+    fastllm::MoeDecodeCompletionPolicy p;
+    Require(p.Allow(4,2,0), "unmeasured split was not allowed to calibrate");
+    p.Observe(4,0,100); p.Observe(4,2,180);
+    Require(!p.Allow(4,2,1), "full-layer regression was hidden by cheap individual kernels");
+    Require(p.Allow(3,2,1), "completion timing leaked across different miss counts");
+    Require(p.Allow(4,2,126), "completion policy stopped probing a rejected path");
+    p.Observe(4,2,50);
+    Require(p.Allow(4,2,127), "completion policy could not recover after transfer improved");
+    Require(p.Allow(4,0,1), "completion policy rejected CPU fallback");
+}
+
 int main() {
+    TestDecodeCompletion();
+    TestAdmissionPayback();
     TestFrequencyAdmission();
     TestPrefillAdmission();
     TestPrefillPreservesDecode();

@@ -2,6 +2,88 @@
 
 // Included after the shared cache and batched workspace definitions.
 namespace {
+// One persistent coordinator per cache group. CPU experts retain the same
+// NUMA workers/arithmetic; only the host submission thread is released early.
+class CooperativeCpuTask {
+    std::mutex mutex;
+    std::condition_variable wake, complete;
+    std::thread worker;
+    std::function<void()> task;
+    std::exception_ptr error;
+    bool stopping = false, busy = false, attempted = false;
+    std::atomic<unsigned> *hostReady = nullptr;
+    unsigned *deviceReady = nullptr;
+    unsigned sequence = 0;
+public:
+    bool Prepare() {
+        if (attempted) return hostReady != nullptr;
+        attempted = true;
+        void *host = nullptr;
+        if (cudaHostAlloc(&host, sizeof(std::atomic<unsigned>),
+                cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
+            (void)cudaGetLastError(); return false;
+        }
+        if (cudaHostGetDevicePointer(&deviceReady, host, 0) != cudaSuccess) {
+            (void)cudaGetLastError(); cudaFreeHost(host); return false;
+        }
+        hostReady = new (host) std::atomic<unsigned>(0);
+        try { worker = std::thread([this] {
+            std::unique_lock<std::mutex> lock(mutex);
+            while (true) {
+                wake.wait(lock, [&] { return stopping || bool(task); });
+                if (stopping) return;
+                auto run = std::exchange(task, {});
+                const unsigned current = sequence;
+                lock.unlock();
+                std::exception_ptr failure;
+                try { run(); } catch (...) { failure = std::current_exception(); }
+                // Always release a queued GPU waiter, including on failure.
+                // Finish rethrows on the calling thread before results escape.
+                hostReady->store(current, std::memory_order_release);
+                lock.lock();
+                error = failure; busy = false;
+                complete.notify_all();
+            }
+        }); } catch (const std::system_error &) {
+            cudaFreeHost(hostReady); hostReady = nullptr; deviceReady = nullptr;
+            return false;
+        }
+        return true;
+    }
+    void Submit(std::function<void()> run) {
+        std::lock_guard<std::mutex> lock(mutex);
+        fastllm::AssertInFastLLM(!busy, "Cooperative CPU workspace is still in use");
+        ++sequence; busy = true; task = std::move(run); wake.notify_one();
+    }
+    void Finish() {
+        std::unique_lock<std::mutex> lock(mutex);
+        complete.wait(lock, [&] { return !busy; });
+        auto failure = std::exchange(error, nullptr);
+        if (failure) std::rethrow_exception(failure);
+    }
+    const unsigned *Ready() const { return deviceReady; }
+    unsigned Sequence() const { return sequence; }
+    ~CooperativeCpuTask() {
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            complete.wait(lock, [&] { return !busy; });
+            stopping = true; wake.notify_one();
+        }
+        if (worker.joinable()) worker.join();
+        if (hostReady) cudaFreeHost(hostReady);
+    }
+};
+
+__global__ void CooperativeMoeWaitCpu(const unsigned *ready, unsigned sequence) {
+    if (threadIdx.x != 0) return;
+    while (*reinterpret_cast<const volatile unsigned *>(ready) != sequence) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        __nanosleep(200);
+#endif
+    }
+    __threadfence_system();
+}
+
 bool SupportsCooperativeMoe(const OffloadLayout &layout) {
     return layout.glm5 || (layout.deepSeekV41 && layout.weightType == fastllm::DATA_GGUF_FORMAT);
 }
@@ -55,6 +137,17 @@ struct CooperativeMoe {
     std::vector<float> cpuInput;
     std::mutex mutex;
     DeviceWork *previousRoot = nullptr;
+    CooperativeCpuTask cpuTask;
+    int cpuTimingLayer = -1, cpuTimingRoutes = 0;
+    double cpuElapsed = 0;
+
+    void FinishCpu() {
+        cpuTask.Finish();
+        if (cpuTimingLayer >= 0) {
+            cpu[cpuTimingLayer].ObserveDecodeCpu(cpuTimingRoutes, cpuElapsed);
+            cpuTimingLayer = -1;
+        }
+    }
 
     ~CooperativeMoe() {
         // A peer's pinned result may still be read by the origin GPU's H2D.
@@ -80,7 +173,7 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
     const auto &layout = group.LayerLayout(table);
     const int rows = input.dims[0], hidden = layout.hidden;
     const bool layerAdmission = layout.deepSeekV41 && layout.weightType == DATA_GGUF_FORMAT &&
-        rows > 1 && allowedDevices && allowedDevices->size() > 1;
+        (rows > 1 || !origin.frequencyActive) && allowedDevices && allowedDevices->size() > 1;
     if (!SupportsCooperativeMoe(layout) || (!origin.frequencyActive && !layerAdmission) ||
         !origin.hostKeyToSlot || input.dataType != BFLOAT16 ||
         !(NativeSharedRecords(group) || (layout.weightType == DATA_GGUF_FORMAT &&
@@ -137,6 +230,7 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
     auto &state = *shared;
     std::lock_guard<std::mutex> lock(state.mutex);
     if (state.previousRoot) checkCudaErrors("Cooperative MoE previous gather", cudaEventSynchronize(state.previousRoot->rank.done));
+    state.FinishCpu();
     std::vector<CooperativeMoe::DeviceWork *> work;
     const int timingLayer = (rows - 1) * group.tableKeys.size() + table;
     const int timingLayers = FASTLLM_CUDA_MOE_CACHE_MAX_BATCH * group.tableKeys.size();
@@ -222,7 +316,7 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
         }
     }
     const int cpuRoutes = std::count(r.Owners(), r.Owners() + routes, -1);
-    // Preserve V4.1 verify's bounded admission policy: one reused miss per
+    // Cached V4.1 decode and verify admit at most one reused miss per
     // layer, on its permanent PP owner. Enabling another execution device
     // must not turn a small verify into a global cache-refill burst.
     int candidate = -1;
@@ -232,7 +326,13 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
         for (int i = 0; i < routes; ++i) {
             auto &heat = r.heat[base + r.Indices()[i]];
             heat = std::min(heat + 1, 65535u);
-            if (r.Resident()[i] < 0 && heat >= 2 && heat > bestHeat) {
+            const int owner = r.Owners()[i];
+            const bool missed = owner < 0 || work[owner]->rank.stagedSlots[i] >= 0;
+            // Single-token decode must not start another host-weight read
+            // just to populate the cache. Promote only a local staged record;
+            // verification retains its amortized layer-local refill policy.
+            const bool reusable = rows > 1 || r.stagedSlots[i] >= 0;
+            if (missed && reusable && heat >= 2 && heat > bestHeat) {
                 bestHeat = heat; candidate = i;
             }
         }
@@ -414,11 +514,26 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
             state.cpuInput.resize(hidden);
             const auto *bf = reinterpret_cast<const uint16_t *>(r.host);
             for (int c = 0; c < hidden; ++c) state.cpuInput[c] = BFloat16BitsToFloat32(bf[c]);
-            double elapsed = 0;
-            NumasMoeDecodeExpertsWithOverlap(state.cpuInput.data(), r.CpuOutput(), weights,
-                r.Indices(), r.Owners(), topk, layer, submitGpu, r.Scores(), layout.swigluLimit,
-                layout.deepSeekV41 ? 32 : 128, &elapsed);
-            state.cpu[timingLayer].ObserveDecodeCpu(cpuRoutes, elapsed);
+            if (layout.deepSeekV41 && layout.weightType == DATA_GGUF_FORMAT && state.cpuTask.Prepare()) {
+                state.cpuTimingLayer = timingLayer; state.cpuTimingRoutes = cpuRoutes;
+                const float limit = layout.swigluLimit;
+                state.cpuTask.Submit([&state, &r, weights, topk, layer, limit] {
+                    NumasMoeDecodeExpertsWithOverlap(state.cpuInput.data(), r.CpuOutput(), weights,
+                        r.Indices(), r.Owners(), topk, layer, {}, r.Scores(), limit, 32, &state.cpuElapsed);
+                });
+                submitGpu();
+                // The pinned result is consumed only after the CPU publishes
+                // completion. Later CUDA work can be queued without a host join.
+                CooperativeMoeWaitCpu<<<1, 32, 0, cudaStreamPerThread>>>(
+                    state.cpuTask.Ready(), state.cpuTask.Sequence());
+                checkCudaErrors("Cooperative MoE CPU waiter", cudaGetLastError());
+            } else {
+                double elapsed = 0;
+                NumasMoeDecodeExpertsWithOverlap(state.cpuInput.data(), r.CpuOutput(), weights,
+                    r.Indices(), r.Owners(), topk, layer, submitGpu, r.Scores(), layout.swigluLimit,
+                    layout.deepSeekV41 ? 32 : 128, &elapsed);
+                state.cpu[timingLayer].ObserveDecodeCpu(cpuRoutes, elapsed);
+            }
         } else {
             double elapsed = 0;
             NumasMoeVerifyExpertsWithOverlap(reinterpret_cast<const uint16_t *>(r.host), r.CpuOutput(), rows,
@@ -471,7 +586,8 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
             ? r.overlap->records + size_t(staged) * layout.recordStride : nullptr;
         AssertInFastLLM(EnsureCachedExperts(&group, &origin, table,
             static_cast<int32_t *>(r.lookup.cudaData), topk, stream, record,
-            r.Indices()[candidate]), "Cooperative MoE admission failed");
+            r.Indices()[candidate], record && r.overlap->numaGateType >= 0),
+            "Cooperative MoE admission failed");
         checkCudaErrors("Cooperative MoE admission done", cudaEventRecord(r.copyEnd, stream));
         checkCudaErrors("Cooperative MoE admission fence", cudaEventRecord(origin.admissionDone, stream));
     }
@@ -485,5 +601,13 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
         if (d == 0) stats[7] += r.admitted;
     }
     return true;
+}
+
+void WaitCooperativeCpu(OffloadGroup &group) {
+    WaitMailboxMoe(group);
+    auto &state = group.cooperativeHybrid;
+    if (!state) return;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->FinishCpu();
 }
 } // namespace

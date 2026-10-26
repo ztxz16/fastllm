@@ -70,6 +70,8 @@ inline bool PrepareTmaBatch(TmaBatch &batch, const FastllmNaiveDSARow *rows, int
     }
     return true;
 }
+// Hopper uses large grid-constant arguments unavailable on older architectures.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
 template <int Max>
 __global__ __launch_bounds__(256) void HopperDecode(const BF *q,
                                                     const __grid_constant__ TmaBatch batch,
@@ -155,5 +157,6 @@ __global__ __launch_bounds__(256) void HopperDecode(const BF *q,
 
 #endif
 }
+#endif
 } // namespace naive_attention_bulk
 #endif

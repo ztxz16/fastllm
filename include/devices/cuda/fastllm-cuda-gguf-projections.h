@@ -21,3 +21,7 @@ bool FastllmCudaGGUFLinearAddPermuted(const fastllm::Data &input, fastllm::Data 
 // Internal bridge: both GGUF MMVQ families use the same block_q8_1 layout.
 bool FastllmCudaGGUFExtendedFromQ8(const void *input, const void *weight, void *output, int type, int rows,
                                    int columns, int outputRows, int storeMode, void *stream);
+
+// Small-batch grouped Q5_K WoA, with the ordinary four-warp GEMV reduction order.
+bool FastllmCudaGGUFGroupedGemv(const fastllm::Data &input, fastllm::Data &weight,
+                              int groups, int rows, fastllm::Data &output);

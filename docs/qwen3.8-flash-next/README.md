@@ -12,7 +12,7 @@
 
 ## 自动配置（推荐）
 
-本地 HF/NVFP4 目录直接交给自动规划器即可：
+Linux NVIDIA CUDA 环境下，本地 HF/NVFP4 目录直接交给自动规划器即可：
 
 ```bash
 ftllm server /data/models/Qwen3.8-Flash-Next-NVFP4 \
@@ -30,6 +30,20 @@ ftllm server /data/models/Qwen3.8-Flash-Next-GSQ-RCO/Q2_0/Qwen3.8-Flash-Next-GSQ
 
 显存或主机内存需要人为限额时，附加 `--auto_gpu_memory_limit 20g` 或
 `--auto_host_memory_limit 128g`；省略时自动读取机器配置。启动日志会给出最终的设备、专家缓存和 chunk 设置。
+
+资源上限是规划预算，不是运行时内存硬限制。自动模式只填写需要覆盖的参数：
+
+| 需要调整 | 追加参数 |
+| --- | --- |
+| 缩小会话窗口 | `--max_context_length 32768` |
+| 调整并发 | `--max_batch 2` |
+| 固定每卡专家缓存 | `--moe_cuda_cache 7g`，`0` 关闭 |
+| 固定线程或输入分块 | `--threads 32 --chunked_prefill_size 4096` |
+| 内置 MTP 草稿数 | `--mtp 3`，需要对应权重；`0` 关闭 |
+| 加载匹配的外置 MTP | `--draft /path/to/mtp.gguf` |
+| 关闭全部推测解码 | `--speculative_algorithm off` |
+
+`--auto` 本身不自动启用 Flash-Next MTP。指定受支持的外置 MTP GGUF 后，默认使用 3 个草稿 token；可用 `--draft_tokens` 覆盖。自动模式默认保留前缀缓存和历史复用。完整参数影响与启动器操作见 [`--auto` 调节指南](../auto.md)。
 
 ## 手动配置参考
 

@@ -4,7 +4,9 @@
 
 本文面向 DeepSeek-V4 与 DeepSeek-V4-Flash。早期 DeepSeek 模型仍可兼容运行，但不再作为本指南的主要示例。
 
-## API Server 快速启动
+DeepSeek-V4 / V4-Flash 当前尚未接入运行时 `--auto` 规划，使用本页的手动命令。DeepSeek-V4.1 请改看 [V4.1 自动部署指南](deepseek_v41.md#自动配置推荐)。自动规划的支持范围见 [`--auto` 指南](auto.md)。
+
+## API Server 快速启动（手动配置）
 
 ~~~bash
 ftllm server fastllm/DeepSeek-V4-Flash \

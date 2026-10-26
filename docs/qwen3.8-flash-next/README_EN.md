@@ -10,7 +10,40 @@ Install a FastLLM version that supports the model and prepare a complete local m
 
 Hybrid inference requires enough host memory. Store the model on an SSD when using disk-backed PLE.
 
-## Quick start
+## Automatic configuration (recommended)
+
+On Linux with NVIDIA CUDA, pass the complete HF/NVFP4 model directory:
+
+```sh
+ftllm server /data/models/Qwen3.8-Flash-Next-NVFP4 \
+  --auto --model_name qwen3.8-flash-next --host 0.0.0.0 --port 8080
+```
+
+For GSQ GGUF, pass the first shard and keep the remaining shards in the same directory. Replace the sample path with the actual filename:
+
+```sh
+ftllm server /data/models/Qwen3.8-Flash-Next-GSQ-RCO/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
+  --auto --model_name qwen3.8-flash-next --host 0.0.0.0 --port 8080
+```
+
+Only add options you want to override:
+
+| Adjustment | Append to the command |
+| --- | --- |
+| Limit planning resources | `--auto_gpu_memory_limit 20g --auto_host_memory_limit 128g` |
+| Set the session window | `--max_context_length 32768` |
+| Set concurrency | `--max_batch 2` |
+| Set the per-GPU expert cache | `--moe_cuda_cache 7g`; `0` disables it |
+| Set threads and prefill chunk size | `--threads 32 --chunked_prefill_size 4096` |
+| Set embedded MTP draft tokens | `--mtp 3`; requires matching weights; `0` disables it |
+| Load a matching external MTP model | `--draft /path/to/mtp.gguf` |
+| Disable all speculative decoding | `--speculative_algorithm off` |
+
+Resource limits are planning budgets, not runtime memory caps. `--auto` alone does not enable Flash-Next MTP. A supported external MTP GGUF defaults to 3 draft tokens; override with `--draft_tokens`. Automatic mode keeps prefix and history reuse enabled by default. See the [`--auto` tuning guide](../auto_en.md) for option effects and Launcher controls.
+
+The following commands are manual examples for fixed layouts and troubleshooting. Their thread counts and cache sizes are specific examples, not requirements for automatic mode.
+
+## Manual configuration reference
 
 Run the backbone on one GPU and the experts on the CPU NUMA backend:
 

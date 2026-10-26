@@ -139,6 +139,12 @@ namespace fastllm {
         const float *routeScores, float swigluLimit, int activationQuantBlock,
         double *cpuElapsedUs);
 
+    // Borrow canonical disk/RAM GGUF records without NUMA registration or
+    // repacking. Reuse whole-layer decode workers; preserve disk V4.1 math.
+    bool HostMoeCanonicalV41Decode(const float *input, float *output,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const float *scores, int topk, float swigluLimit);
+
     // FP32 verifier subset, returning unweighted [row, route, hidden] values.
     // An expert must have the same CPU/GPU ownership in every input row.
     void NumasMoeDecodeExpertsBatch(const float *input, float *output, int rows,

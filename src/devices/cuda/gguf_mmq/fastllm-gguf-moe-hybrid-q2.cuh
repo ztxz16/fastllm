@@ -31,7 +31,7 @@ __global__ void PackSums(block_q8_1_mmq *input, int rows, int capacity) {
     if (row >= rows)
         return;
     auto &q = input[size_t(blockIdx.y) * capacity + row];
-    int v = __dp4a(reinterpret_cast<const int *>(q.qs)[lane], 0x01010101, 0);
+    int v = ggml_cuda_dp4a(reinterpret_cast<const int *>(q.qs)[lane], 0x01010101, 0);
     v += __shfl_xor_sync(0xffffffff, v, 1);
     v += __shfl_xor_sync(0xffffffff, v, 2);
     unsigned packed = 0;

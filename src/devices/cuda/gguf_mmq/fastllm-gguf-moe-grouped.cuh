@@ -169,10 +169,10 @@ __global__ void Matmul(const uint8_t *const *weights, int part,
     if (packedTile%(Tile/kTile)) return;
     const int localTile = packedTile/(Tile/kTile);
     const int padded = ((columns+255)/256)*256;
-    if constexpr (SelectRows && Type == GGML_TYPE_Q2_K) {
+    if constexpr (SelectRows && !NativeV41 && Type == GGML_TYPE_Q2_K) {
         hybrid_q2_mmq::Compute<Tile>(weights[2*e+part], input+begin,
             output+size_t(begin)*width, padded, width, stride, counts[e], capacity, localTile);
-    } else if constexpr (SelectRows && Type == GGML_TYPE_Q4_K) {
+    } else if constexpr (SelectRows && !NativeV41 && Type == GGML_TYPE_Q4_K) {
         mul_mat_q_process_tile<Type, Tile, MMQ_NWARPS, true, false, hybrid_q4_mmq_type_traits, (Tile > kTile)>(
             reinterpret_cast<const char *>(weights[2*e+part]),
             reinterpret_cast<const char *>(input+begin), output+size_t(begin)*width,
@@ -282,7 +282,7 @@ static void LaunchMatrix(const uint8_t *const *weights, int part, Workspace &w,
     const int cc = ggml_cuda_info().devices[device].cc;
     constexpr ggml_type SharedType = Type == GGML_TYPE_Q2_0 ? GGML_TYPE_Q8_0 :
         (Type == GGML_TYPE_Q4_K || (NativeV41 && Type == GGML_TYPE_IQ1_S)) ? GGML_TYPE_Q2_K : Type;
-    constexpr bool packedQ2 = SelectRows && Type == GGML_TYPE_Q2_K;
+    constexpr bool packedQ2 = SelectRows && !NativeV41 && Type == GGML_TYPE_Q2_K;
     const int shared = packedQ2 ? (Tile*MMQ_TILE_Y_K + hybrid_q2_mmq::kOutputTile*MMQ_MMA_TILE_X_K_Q2_K)*sizeof(int)
         : mmq_get_shmem<SharedType>(Tile, get_mmq_y_host(cc), cc);
     static std::once_flag initialized[GGML_CUDA_MAX_DEVICES];

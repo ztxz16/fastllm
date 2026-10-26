@@ -18,6 +18,7 @@ bool registered = false, streaming = false, prepareResult = true, beginResult = 
 double preparedFraction = 1.0;
 int begun = 0, ended = 0;
 std::vector<int> endOrder;
+std::vector<int> waitOrder;
 }
 
 // Exercise the model/runtime boundary without allocating GPU or host weights.
@@ -42,6 +43,9 @@ void FastllmCudaEndMoeDecode(void *state) {
     ++ended;
     endOrder.push_back(*static_cast<int *>(state));
     delete static_cast<int *>(state);
+}
+void FastllmCudaWaitMoeDecodeCpu(void *state) {
+    if (state) waitOrder.push_back(*static_cast<int *>(state));
 }
 bool FastllmCudaPrefetchMoeGGUFHost(Data **, int) { return false; }
 bool FastllmCudaMergeMOEHybrid(const Data &, const Data &, const Data &, Data &,
@@ -123,6 +127,10 @@ int main() {
         step.Begin(target.data(), target.size(), 2);
         HybridMoeDecodeStep moved(std::move(step));
         Check(!step && moved, "move left two policy owners");
+        step.WaitCpu();
+        moved.WaitCpu();
+        Check(waitOrder == std::vector<int>{1} && moved && ended == 0,
+              "CPU wait lost the active policy or ended it early");
         throw 1; // Simulate cancellation after ownership transfer.
     } catch (int) {}
     Check(ended == 1, "exception did not finish exactly one policy");
@@ -132,6 +140,8 @@ int main() {
         step.Begin(draft.data(), draft.size(), 1);
         step.Finish();
         step.Finish();
+        step.WaitCpu();
+        Check(waitOrder == std::vector<int>{1}, "finished policy retained a CPU waiter");
     }
     Check(begun == 3 && ended == 3, "restarted or explicit-finish policy leaked/double-ended");
     {

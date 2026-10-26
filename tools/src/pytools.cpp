@@ -6,6 +6,7 @@
 #include "models/naive_n05_flash.h"
 #include "devices/disk/diskdevice.h"
 #include "moe_cache_config.h"
+#include "utils/autotune.h"
 
 #include <cstring>
 #include <csignal>
@@ -46,6 +47,14 @@ static thread_local std::string fastllmPytoolsWarmupError;
 static thread_local std::string fastllmPytoolsContextResult;
 
 extern "C" {
+    DLL_EXPORT bool start_autotune_recording(const char *path) {
+        try { return path && fastllm::StartAutotuneRecording(path); }
+        catch (...) { return false; }
+    }
+    DLL_EXPORT bool stop_autotune_recording() {
+        try { return fastllm::StopAutotuneRecording(); }
+        catch (...) { return false; }
+    }
     typedef void (*FastllmModelLoadProgressCallback)(const char *stage,
                                                      uint64_t current,
                                                      uint64_t total,

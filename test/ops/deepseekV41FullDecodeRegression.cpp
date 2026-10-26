@@ -67,21 +67,71 @@ static void Equal(const Data &a, const Data &b, const char *name) {
 }
 #include "deepseekV41FullVerifyRegression.inc"
 
+static void RunAttentionLocalityRegression(int devices) {
+    int checks = 0;
+    for (bool packed : {false, true}) {
+        Data q, chunk, ring, compressed, indices, sink, ring8, compressed4;
+        Fill(q, {1, 1, 64, 512}, 1);
+        Fill(chunk, {1, 1, 512}, 2);
+        Fill(ring, {1, 128, 512}, 3);
+        Fill(compressed, {1, 32, 512}, 4);
+        Fill(indices, {1, 1, 8}, 5, DataType::INT32);
+        Fill(sink, {64}, 6, DataType::FLOAT32);
+        Check(FastllmCudaDeepSeekV41QuantizeKV(ring, ring8, 1, 32), "pack locality ring");
+        Check(FastllmCudaDeepSeekV41QuantizeKV(compressed, compressed4, 3, 16), "pack locality KV");
+        Data *window = packed ? &ring8 : &ring;
+        Data *cmp = packed ? &compressed4 : &compressed;
+        Data output[2], expected[2];
+        std::vector<FastllmCudaV41AttentionRequest> requests{
+            {&q, &chunk, window, cmp, &indices, &output[0], 64},
+            {&q, &chunk, window, cmp, &indices, &output[1], 129}};
+        auto run = [&] {
+            return FastllmCudaDeepSeekV41SparseAttentionBatch(requests, sink, 128, 1.f / std::sqrt(512.f));
+        };
+        Check(run(), "local attention rejected");
+        Cuda(cudaDeviceSynchronize());
+        for (int i = 0; i < 2; ++i) {
+            expected[i].CopyFrom(output[i]);
+            expected[i].ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        }
+        for (int remote = 1; remote < std::min(devices, 3); ++remote) {
+            for (Data *input : {&q, &chunk, window, cmp, &indices, &sink}) {
+                input->ToDevice(DataDevice::CUDA, std::vector<int>{remote});
+                FastllmCudaSetDevice(0);
+                Check(!run(), "remote attention input accepted");
+                Cuda(cudaDeviceSynchronize());
+                for (int i = 0; i < 2; ++i) Equal(output[i], expected[i], "rejected call changed output");
+                // The executor fallback migrates remote PP inputs before use.
+                input->ToDevice(DataDevice::CUDA, std::vector<int>{0});
+                FastllmCudaSetDevice(0);
+                Check(run(), "migrated attention input rejected");
+                Cuda(cudaDeviceSynchronize());
+                for (int i = 0; i < 2; ++i) Equal(output[i], expected[i], "migrated attention");
+                ++checks;
+            }
+        }
+    }
+    std::cout << "PASS " << checks << " attention locality checks; BF16/FP8/FP4" << std::endl;
+}
+
 int main(int argc, char **argv) {
     int devices = 0, major = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 1 ||
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess ||
         major < 8)
         return 77;
-    bool verify = false;
+    bool verify = false, locality = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--stress") { stress = true; amplitude = 1.f; }
         if (std::string(argv[i]) == "--pooled") pooled = true;
         if (std::string(argv[i]) == "--verify") verify = true;
+        if (std::string(argv[i]) == "--locality") locality = true;
     }
+    if (locality && devices < 2) return 77;
     try {
         ApplyDeviceMap({{"cpu", 1}}, 0, 1);
         FastllmCudaSetDevice(0);
+        if (locality) { RunAttentionLocalityRegression(devices); return 0; }
         if (verify) { RunVerifyRegression(); return 0; }
         int checked = 0;
         for (int batch : {1, 2, 4, 8, 16, 128})

@@ -3,6 +3,8 @@
 #include "naive-n05-topk.cuh"
 #include <type_traits>
 
+// This batched Tensor Core path requires SM80; older targets cannot encode its large arguments.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 namespace naive_indexer_batch {
 using BF16 = __nv_bfloat16;
 struct Row {
@@ -504,3 +506,4 @@ __global__ void MergeContextCandidates(Batch batch) {
 }
 
 } // namespace naive_indexer_batch
+#endif

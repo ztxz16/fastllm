@@ -19,6 +19,13 @@ public:
     static constexpr float prefillReplacementFactor = 1.25f;
     static constexpr float prefillReplacementMargin = 1.0f;
     struct Admission { int key = -1, slot = -1; };
+    // Optional backend measurements; callers without them keep the existing
+    // policy. Admission must repay its DMA/restore cost within this horizon.
+    struct RuntimeBudget {
+        uint64_t maxBytes = UINT64_MAX;
+        double uploadUsPerByte = 0, horizon = 32;
+        std::vector<double> savedUsPerKey;
+    };
 
     MoeFrequencyPolicy(std::vector<int> keyPartitions, std::vector<int> slotPartitions,
                        int layers, MoeCacheConfig config = {},
@@ -137,11 +144,20 @@ public:
     // admissions cannot improve the hit count of the step that selected them.
     // Returned slots are reserved in the policy; the caller publishes payload
     // and device residency together before the next cache lookup.
-    std::vector<Admission> EndStep() {
+    std::vector<Admission> EndStep(const RuntimeBudget *runtime = nullptr) {
         if (!active) return {};
         active = false;
         if (decodeSteps % config.updateInterval != 0) return {};
         std::vector<Admission> plan;
+        const uint64_t byteLimit = std::min(config.maxBytes ? config.maxBytes : UINT64_MAX,
+            runtime ? runtime->maxBytes : UINT64_MAX);
+        if (runtime && runtime->savedUsPerKey.size() != keys.size())
+            throw std::invalid_argument("invalid MoE admission cost measurements");
+        double samples = double(decodeSteps);
+        if (runtime && config.halfLife > 0) {
+            samples = -std::expm1(-double(decodeSteps) * std::log(2.0) / config.halfLife) /
+                      -std::expm1(-std::log(2.0) / config.halfLife);
+        }
         if (config.maxReplacements > 0 && !slots.empty()) {
             // The heaps persist across tokens. Only observed experts and
             // changed slots move; no full candidate sort or resident rebuild.
@@ -154,7 +170,7 @@ public:
                 double bestGain = 0;
                 for (int g = 0; g < int(groups.size()); ++g) {
                     if (candidates[g].ids.empty() ||
-                        (config.maxBytes && groups[g].bytes > config.maxBytes - bytes)) continue;
+                        groups[g].bytes > byteLimit - bytes) continue;
                     const int candidate = candidates[g].ids.front();
                     if (keys[candidate].score <= 0 || keys[candidate].score < config.minHeat) continue;
                     auto &part = residents[groups[g].partition];
@@ -167,6 +183,16 @@ public:
                         }
                         double gain = old < 0 ? 1e10 : keys[candidate].score -
                             keys[old].score * config.replacementFactor - config.replacementMargin;
+                        if (runtime && runtime->uploadUsPerByte > 0 &&
+                            runtime->savedUsPerKey[candidate] > 0) {
+                            const double saved = runtime->savedUsPerKey[candidate];
+                            const double oldSaved = old < 0 ? 0 : runtime->savedUsPerKey[old];
+                            const double future = (keys[candidate].score * saved -
+                                (old < 0 ? 0 : keys[old].score * config.replacementFactor *
+                                    (oldSaved > 0 ? oldSaved : saved)) - config.replacementMargin * saved) *
+                                runtime->horizon / std::max(1.0, samples);
+                            if (future <= groups[g].bytes * runtime->uploadUsPerByte) break;
+                        }
                         if (config.rankByBytes) gain /= double(groups[g].bytes);
                         if (gain > bestGain) {
                             bestGain = gain;

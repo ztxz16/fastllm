@@ -46,6 +46,7 @@ namespace fastllm {
     // of the normalized FLOAT32 patches, computed by the native Python adapter.
     using DeepSeekV41ImageCacheKeys = std::vector<std::vector<int>>;
     struct DeepSeekV41DecodeWorkspace;
+    struct CudaAppendOnlyRows;
     // 单层的推理缓存
     struct DeepSeekV41LayerCache {
         int totalLen = 0;             // 已经进入本层的 token 数
@@ -58,6 +59,8 @@ namespace fastllm {
         Data rawTailKV;               // FP32 [rawTail, headDim]，尚未凑满一组的 compressor 原始输入
         Data rawTailScore;            // FP32 [rawTail, headDim]
         int rawTail = 0;
+        // Request-local read replicas; canonical caches stay on their writer GPU.
+        std::shared_ptr<CudaAppendOnlyRows> compressedReaders, indexReaders;
     };
 
     // 一张图在 prompt 中占据的 span（含 image_start / image_newline / image_end）及其嵌入

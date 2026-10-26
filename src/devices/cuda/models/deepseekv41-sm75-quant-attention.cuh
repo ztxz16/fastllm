@@ -49,9 +49,9 @@ __global__ void V41Sm75QuantizedAttentionGather(V41Sm75QuantizedAttention p,
                                          : __bfloat162float(row[d]);
 }
 
-// Four candidates x four heads per CTA. Each QK dot is computed once, using
-// the scalar kernel's 64 ordered FMAs and the same eight-lane reduction.
-template<bool MultiToken>
+// Four warps x four heads per CTA. Verification reuses each query for two
+// candidates, retaining the scalar kernel's 64 FMAs and eight-lane reduction.
+template<bool MultiToken, int CandidatesPerWarp = 1>
 __global__ void __launch_bounds__(128)
 V41Sm75QuantizedAttentionScores(const __nv_bfloat16 *q, const float *rows,
                                 const int32_t *valid, int count, int heads,
@@ -62,14 +62,19 @@ V41Sm75QuantizedAttentionScores(const __nv_bfloat16 *q, const float *rows,
     valid += size_t(token) * count;
     scores += size_t(token) * heads * count;
     // Four padding floats keep each lane's 64-element segment float4 aligned.
-    __shared__ __align__(16) float keys[4][544], queries[4][544];
+    __shared__ __align__(16) float keys[4 * CandidatesPerWarp][544], queries[4][544];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int c = blockIdx.x * 4 + warp;
+    const int first = (blockIdx.x * 4 + warp) * CandidatesPerWarp;
     const int h = blockIdx.y * 4 + lane / 8;
-    const bool present = c < count && valid[c];
-    if (present) {
-        for (int d = lane; d < 512; d += 32)
-            keys[warp][d + (d / 64) * 4] = rows[size_t(c) * 512 + d];
+    bool present[CandidatesPerWarp];
+    #pragma unroll
+    for (int j = 0; j < CandidatesPerWarp; ++j) {
+        const int c = first + j;
+        present[j] = c < count && valid[c];
+        if (present[j]) {
+            for (int d = lane; d < 512; d += 32)
+                keys[warp * CandidatesPerWarp + j][d + (d / 64) * 4] = rows[size_t(c) * 512 + d];
+        }
     }
     for (int i = threadIdx.x; i < 4 * 512; i += 128) {
         const int head = blockIdx.y * 4 + i / 512, d = i % 512;
@@ -77,22 +82,28 @@ V41Sm75QuantizedAttentionScores(const __nv_bfloat16 *q, const float *rows,
             ? __bfloat162float(q[size_t(head) * 512 + d]) : 0.f;
     }
     __syncthreads();
-    if (!present) return;
     const int segment = (lane % 8) * 68;
-    float dot = 0.f;
+    float dot[CandidatesPerWarp] = {};
     #pragma unroll
     for (int d = 0; d < 64; d += 4) {
         const float4 a = *reinterpret_cast<const float4 *>(&queries[lane / 8][segment + d]);
-        const float4 b = *reinterpret_cast<const float4 *>(&keys[warp][segment + d]);
-        dot += a.x * b.x;
-        dot += a.y * b.y;
-        dot += a.z * b.z;
-        dot += a.w * b.w;
+        #pragma unroll
+        for (int j = 0; j < CandidatesPerWarp; ++j) if (present[j]) {
+            const float4 b = *reinterpret_cast<const float4 *>(&keys[warp * CandidatesPerWarp + j][segment + d]);
+            dot[j] += a.x * b.x;
+            dot[j] += a.y * b.y;
+            dot[j] += a.z * b.z;
+            dot[j] += a.w * b.w;
+        }
     }
-    dot += __shfl_xor_sync(0xffffffff, dot, 1);
-    dot += __shfl_xor_sync(0xffffffff, dot, 2);
-    dot += __shfl_xor_sync(0xffffffff, dot, 4);
-    if (lane % 8 == 0 && h < heads) scores[size_t(h) * count + c] = dot;
+    #pragma unroll
+    for (int j = 0; j < CandidatesPerWarp; ++j) {
+        dot[j] += __shfl_xor_sync(0xffffffff, dot[j], 1);
+        dot[j] += __shfl_xor_sync(0xffffffff, dot[j], 2);
+        dot[j] += __shfl_xor_sync(0xffffffff, dot[j], 4);
+        if (present[j] && lane % 8 == 0 && h < heads)
+            scores[size_t(h) * count + first + j] = dot[j];
+    }
 }
 
 // Compute the online-softmax coefficients once per head/token, rather than
@@ -138,7 +149,8 @@ V41Sm75QuantizedAttentionCoefficients(const int32_t *valid, const float *scores,
 
 // Independent output dimensions can run in parallel without changing the
 // online-softmax or PV accumulation order, including skipped/duplicate indices.
-template<bool MultiToken, bool ReuseCoefficients = false>
+template<bool MultiToken, bool ReuseCoefficients = false, int HeadsPerBlock = 1,
+         int CandidateTile = HeadsPerBlock == 1 ? 8 : 4>
 __global__ void __launch_bounds__(64)
 V41Sm75QuantizedAttentionValues(const float *rows, const int32_t *valid,
                                 const float *scores, const float *sink,
@@ -149,40 +161,49 @@ V41Sm75QuantizedAttentionValues(const float *rows, const int32_t *valid,
     valid += size_t(token) * count;
     scores += size_t(token) * heads * count;
     output += size_t(token) * heads * 512;
-    const int head = blockIdx.x, d = blockIdx.y * 64 + threadIdx.x;
+    static_assert(ReuseCoefficients || HeadsPerBlock == 1, "head reuse needs shared softmax coefficients");
+    const int head = blockIdx.x * HeadsPerBlock, d = blockIdx.y * 64 + threadIdx.x;
     if constexpr (ReuseCoefficients) coefficients += (size_t(token) * heads + head) * count;
-    // Two warps per CTA and eight prefetched candidates preserve the ordered
-    // recurrence while improving memory-level parallelism on SM75.
-    constexpr int Tile = 8;
-    float acc = 0.f, mx = sink[head], sum = 1.f;
+    // Multiple heads reuse each FP32 KV load during verification. Their
+    // independent accumulators keep the original candidate/rounding order.
+    constexpr int Tile = CandidateTile;
+    float acc[HeadsPerBlock] = {}, mx = sink[head], sum = 1.f;
     for (int base = 0; base < count; base += Tile) {
         float sc[Tile], values[Tile];
-        float2 coeff[Tile];
+        float2 coeff[HeadsPerBlock][Tile];
         bool present[Tile];
         #pragma unroll
         for (int j = 0; j < Tile; ++j) {
             const int c = base + j;
             present[j] = c < count && valid[c];
             if (present[j]) {
-                if constexpr (ReuseCoefficients) coeff[j] = coefficients[c];
-                else sc[j] = scores[size_t(head) * count + c];
+                if constexpr (ReuseCoefficients) {
+                    #pragma unroll
+                    for (int h = 0; h < HeadsPerBlock; ++h) if (head + h < heads)
+                        coeff[h][j] = coefficients[size_t(h) * count + c];
+                } else sc[j] = scores[size_t(head) * count + c];
                 values[j] = rows[size_t(c) * 512 + d];
             }
         }
         #pragma unroll
         for (int j = 0; j < Tile; ++j) if (present[j]) {
             if constexpr (ReuseCoefficients) {
-                acc = acc * coeff[j].x + coeff[j].y * values[j];
+                #pragma unroll
+                for (int h = 0; h < HeadsPerBlock; ++h) if (head + h < heads)
+                    acc[h] = acc[h] * coeff[h][j].x + coeff[h][j].y * values[j];
             } else {
                 const float s = sc[j] * scale;
                 const float next = fmaxf(mx, s);
                 const float alpha = __expf(mx - next), prob = __expf(s - next);
                 sum = sum * alpha + prob;
-                acc = acc * alpha + prob * values[j];
+                acc[0] = acc[0] * alpha + prob * values[j];
                 mx = next;
             }
         }
     }
-    const float inv = ReuseCoefficients ? inverseSums[size_t(token) * heads + head] : 1.f / sum;
-    output[size_t(head) * 512 + d] = __float2bfloat16_rn(acc * inv);
+    #pragma unroll
+    for (int h = 0; h < HeadsPerBlock; ++h) if (head + h < heads) {
+        const float inv = ReuseCoefficients ? inverseSums[size_t(token) * heads + head + h] : 1.f / sum;
+        output[size_t(head + h) * 512 + d] = __float2bfloat16_rn(acc[h] * inv);
+    }
 }

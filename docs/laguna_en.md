@@ -4,7 +4,9 @@
 
 FastLLM supports Laguna long-context caching, CUDA Graph, multi-GPU tensor parallelism, hybrid MoE, NVFP4, and INT4_GROUP32.
 
-## API server quick start
+Laguna is not currently supported by the runtime `--auto` planner. Use the manual commands on this page. See the [`--auto` guide](auto_en.md) for supported models.
+
+## API server quick start (manual configuration)
 
 ~~~bash
 ftllm server /data/models/laguna \

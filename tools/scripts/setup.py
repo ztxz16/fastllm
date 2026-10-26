@@ -13,7 +13,7 @@ video_require = ['imageio', 'imageio-ffmpeg']
 all_require = server_require + download_require + tokenizer_require + video_require + pptx_require + document_require + data_require
 
 PACKAGE_INFO = {
-    "release": {"name": "ftllm", "version": "0.1.8.2"},
+    "release": {"name": "ftllm", "version": "1.9.0"},
     "nightly": {"name": "ftllm-nightly", "version": "0.0.0.3"},
 }
 

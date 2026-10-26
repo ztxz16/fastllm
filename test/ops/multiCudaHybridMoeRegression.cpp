@@ -58,19 +58,22 @@ static std::vector<float> Read(Data &root) {
     return out;
 }
 struct Scratch { Data w1, w2, w3, in, out; };
-static void Run(Data &in, Data &ix, Data &sc, std::vector<Data *> &weights, Scratch &s, Data &out) {
+static void Run(Data &in, Data &ix, Data &sc, std::vector<Data *> &weights, Scratch &s, Data &out, const std::string &placement) {
     std::vector<Data *> bias(weights.size(), nullptr);
-    ApplyDeviceMap({{"multicuda:0,1,2,3,4,5,6,7", 1}}, 0, 1);
+    ApplyDeviceMap({{placement, 1}}, 0, 1);
     MergeMOE(in, ix, sc, weights, bias, s.w1, s.w2, s.w3, s.in, s.out,
              1.0f, out, 0, MoeGateSwiglu, true, 10.0f, true, nullptr, 32);
 }
 int main() {
     int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 8) return 77;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) return 77;
     try {
         SetThreads(8);
-        SetDeviceMap({{"multicuda:0,1,2,3,4,5,6,7", 1}});
-        std::vector<int> ranks(8); std::iota(ranks.begin(), ranks.end(), 0);
+        const int rankCount = std::min(devices, 8);
+        std::vector<int> ranks(rankCount); std::iota(ranks.begin(), ranks.end(), 0);
+        std::string placement = "multicuda:0";
+        for (int rank = 1; rank < rankCount; ++rank) placement += "," + std::to_string(rank);
+        SetDeviceMap({{placement, 1}});
         constexpr int H = 256, E = 16;
         int checks = 0;
         for (int firstRows : {1, 2, 5, 8}) for (int topk : {1, 3, 6}) {
@@ -84,8 +87,8 @@ int main() {
             }
             Scratch candidateScratch, referenceScratch;
             void *stable = nullptr;
-            // Shape changes use the conservative synchronous fallback. Return
-            // to the original shape must reuse the original persistent buffer.
+            // Large shapes use the synchronous fallback; small shapes have
+            // separate buffers. Returning to a shape must reuse its address.
             for (int iteration = 0; iteration < 12; ++iteration) {
                 int rows = iteration == 9 ? 9 : iteration == 10 ? (firstRows == 2 ? 3 : 2) : firstRows;
                 std::vector<float> x(rows * H), scores(rows * topk), oracle(rows * H, 0.0f);
@@ -93,7 +96,7 @@ int main() {
                 for (size_t j = 0; j < x.size(); ++j)
                     x[j] = Bf(std::ldexp(float(int((j * 17 + iteration * 11) % 79) - 39) / 7.0f, int(j / 32 % 4) - 2));
                 for (int row = 0; row < rows; ++row) for (int k = 0; k < topk; ++k) {
-                    int e = iteration % 4 == 0 ? (k * 8) % E : (row * 7 + k * 3 + iteration) % E;
+                    int e = iteration % 4 == 0 ? (k * rankCount) % E : (row * 7 + k * 3 + iteration) % E;
                     ids[row * topk + k] = e;
                     float score = (iteration + k) % 5 == 0 ? 0.0f : (k % 2 ? .34f : 1.75f);
                     scores[row * topk + k] = score;
@@ -115,7 +118,7 @@ int main() {
                 std::memcpy(index.cpuData, ids.data(), ids.size() * 4);
                 for (Data *d : {&input, &index, &score}) d->ToDevice(DataDevice::CUDA, {0}, true);
                 Data output;
-                Run(input, index, score, weights, candidateScratch, output);
+                Run(input, index, score, weights, candidateScratch, output, placement);
                 auto actual = Read(output);
                 if (rows == firstRows) {
                     Require(output.cudaDataBorrowed, "persistent hybrid path was not used");
@@ -125,7 +128,7 @@ int main() {
                 Data refInput, refIndex, refScore, reference;
                 refInput.CopyFrom(input); refIndex.CopyFrom(index); refScore.CopyFrom(score);
                 for (Data *d : {&refInput, &refIndex, &refScore}) PrepareMultiCudaReplicatedData(*d, ranks, true);
-                Run(refInput, refIndex, refScore, weights, referenceScratch, reference);
+                Run(refInput, refIndex, refScore, weights, referenceScratch, reference, placement);
                 Require(actual == Read(reference), "packed hybrid path differs from replicated EP reference");
                 for (size_t j = 0; j < actual.size(); ++j) {
                     if (std::abs(actual[j] - oracle[j]) > 2e-6f * std::max(1.0f, std::abs(oracle[j]))) {

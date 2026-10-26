@@ -5,7 +5,7 @@ import {
 } from "../../assets/app.js";
 
 let profileRenderSignature = "";
-let folderPickerTarget = null, folderPickerDirectoriesOnly = false;
+let folderPickerTarget = null, folderPickerDirectoriesOnly = false, folderPickerFileExtension = "";
 const AUTOMATIC_CONFIGURATION_DEFAULTS = Object.freeze({
   device: "auto",
   cuda_device_id: "0",
@@ -15,6 +15,10 @@ const AUTOMATIC_CONFIGURATION_DEFAULTS = Object.freeze({
   gpu_mem_ratio: "0.9",
   auto_gpu_memory_limit: "",
   auto_host_memory_limit: "",
+  auto_gpu_mem_ratio: "",
+  force_ddr_limit: "",
+  auto_max_batch: "",
+  auto_chunked_prefill_size: "",
   low_gpu_mem: false,
   max_batch: "auto",
   max_context_length: "auto",
@@ -43,6 +47,17 @@ function cloneConfig(config) {
 }
 
 function fillForm(config) {
+  // Old presets already contain concrete settings; reopen them as custom.
+  if (["long_context", "high_concurrency"].includes(config?.config_mode)) {
+    config = { ...config, config_mode: "custom" };
+  }
+  // Preserve legacy cap semantics instead of turning them into forced budgets.
+  if (config?.config_mode === "auto") {
+    const limits = ["auto_gpu_memory_limit", "auto_host_memory_limit"]
+      .filter((field) => config[field] && config[field] !== "auto")
+      .map((field) => `--${field} ${JSON.stringify(config[field])}`);
+    config = { ...config, extra_args: [...limits, config.extra_args].filter(Boolean).join(" ") };
+  }
   state.speculativeCountField = initialSpeculativeTokenField(config || {});
   for (const input of elements.launchForm.querySelectorAll("[data-field]")) {
     const value = config?.[input.dataset.field];
@@ -58,7 +73,6 @@ function fillForm(config) {
   state.dirty = false;
   renderSaveState();
   updateConditionalFields();
-  renderProfilePresentation();
 }
 
 function collectForm() {
@@ -66,6 +80,8 @@ function collectForm() {
   for (const input of elements.launchForm.querySelectorAll("[data-field]")) {
     config[input.dataset.field] = input.type === "checkbox" ? input.checked : input.value;
   }
+  config.auto_gpu_memory_limit = "";
+  config.auto_host_memory_limit = "";
   config.config_mode = elements.configurationModeOptions.querySelector("[data-config-mode]:checked")?.value || "custom";
   return config;
 }
@@ -75,7 +91,9 @@ function isSimpleNewProfile() {
 }
 
 function renderProfilePresentation() {
-  const mode = collectForm().config_mode;
+  const config = collectForm();
+  const mode = config.config_mode;
+  const isWebui = config.command === "webui";
   const runtimeAuto = mode === "auto";
   const simple = isSimpleNewProfile() || runtimeAuto;
   elements.launchForm.classList.toggle("simple-profile", simple);
@@ -83,7 +101,12 @@ function renderProfilePresentation() {
   elements.profileParameters.classList.toggle("hidden", simple && !runtimeAuto);
   elements.automaticConfigActions.classList.toggle("hidden", simple);
   elements.configurationModeSettings.classList.toggle("hidden", state.currentIndex !== null && !runtimeAuto);
-  elements.automaticResourceLimits.classList.toggle("hidden", mode !== "auto");
+  for (const field of elements.launchForm.querySelectorAll("[data-auto-field]")) {
+    field.classList.toggle("hidden", !runtimeAuto || isWebui);
+  }
+  for (const field of elements.launchForm.querySelectorAll("[data-manual-field]")) {
+    field.classList.toggle("hidden", runtimeAuto || isWebui);
+  }
   elements.profileEditorDescription.textContent = runtimeAuto
     ? configurationModeDescription(mode)
     : state.currentIndex === null
@@ -95,8 +118,6 @@ function renderProfilePresentation() {
 function configurationModeDescription(mode) {
   const descriptions = {
     auto: t("Choose a model and service settings. Devices, memory and inference settings are planned when the service starts."),
-    long_context: t("One conversation at a time; context capacity follows the model and available memory."),
-    high_concurrency: t("Automatic batching; context capacity follows the model and available memory."),
     custom: t("Set parameters yourself, or use automatic configuration as a starting point.")
   };
   return descriptions[mode] || descriptions.custom;
@@ -108,7 +129,7 @@ function openAutomaticConfigurationDialog() {
     return;
   }
   const config = collectForm();
-  const mode = ["auto", "long_context", "high_concurrency"].includes(config.config_mode) ? config.config_mode : "auto";
+  const mode = "auto";
   elements.automaticModeOptions.replaceChildren();
   for (const card of elements.configurationModeOptions.children) {
     if (card.querySelector("input").value === "custom") continue;
@@ -231,6 +252,9 @@ function defaultServicePort(command) {
 function updateConditionalFields() {
   const config = collectForm();
   const isWebui = config.command === "webui";
+  for (const id of ["automatic-resource-limits", "vision-module"]) {
+    document.getElementById(id).classList.toggle("hidden", isWebui);
+  }
   const speculativeOff = config.speculative_algorithm === "off";
   const mtpCount = speculativeTokenField() === "mtp";
   elements.speculativeMtpField.classList.toggle("hidden", speculativeOff || !mtpCount);
@@ -269,6 +293,7 @@ function updateConditionalFields() {
   elements.serverApiKeyField.classList.toggle("hidden", isWebui);
   elements.serverHideInputField.classList.toggle("hidden", isWebui);
   elements.launchCommandKicker.textContent = isWebui ? "FTLLM WEBUI" : "FTLLM SERVER";
+  renderProfilePresentation();
 }
 
 function initialSpeculativeTokenField(config) {
@@ -877,6 +902,8 @@ function showProfileEditor() {
   document.body.classList.add("modal-open");
   elements.launchForm.scrollTop = 0;
   elements.automaticResourceLimits.open = false;
+  elements.automaticTuning.open = false;
+  document.getElementById("vision-module").open = false;
   elements.launchForm.querySelector("#editor-advanced").open = !isSimpleNewProfile();
 }
 
@@ -1163,12 +1190,13 @@ function schedulePathSuggestions(input) {
   }, 180);
 }
 
-function openFolderPicker(field, trigger, {input: target, directoriesOnly = false} = {}) {
+function openFolderPicker(field, trigger, {input: target, directoriesOnly = false, fileExtension = ""} = {}) {
   state.folderPickerField = field;
   state.folderPickerTrigger = trigger;
   const input = target || elements.launchForm.querySelector(`[data-field="${field}"]`);
   folderPickerTarget = input;
   folderPickerDirectoriesOnly = directoriesOnly;
+  folderPickerFileExtension = fileExtension;
   state.folderPickerResult = null;
   elements.folderPickerModal.classList.remove("hidden");
   document.body.classList.add("modal-open");
@@ -1206,7 +1234,9 @@ async function loadFolderPicker(path) {
       throw new Error(t("The folder browser response is invalid."));
     }
     state.folderPickerResult = result;
-    state.folderPickerSelectedFile = folderPickerDirectoriesOnly ? "" : result.selectedFile || "";
+    state.folderPickerSelectedFile = !folderPickerDirectoriesOnly
+      && (!folderPickerFileExtension || result.selectedFile?.toLowerCase().endsWith(folderPickerFileExtension))
+      ? result.selectedFile || "" : "";
     elements.folderPickerCurrent.value = result.path;
   } catch (error) {
     if (requestId !== state.folderPickerRequestId) return;
@@ -1220,10 +1250,12 @@ async function loadFolderPicker(path) {
 
 function renderFolderPicker() {
   elements.folderPickerTitle.textContent = folderPickerDirectoriesOnly ? t("Choose a workspace folder")
+    : state.folderPickerField === "mmproj" ? t("Choose a vision module file")
     : state.folderPickerField === "speculative_draft_model_path"
     ? t("Choose a draft model file or folder") : t("Choose a model file or folder");
   document.getElementById("folder-picker-description").textContent = folderPickerDirectoriesOnly
     ? t("Browse the machine running Launcher. Open a folder, then select the current folder.")
+    : folderPickerFileExtension ? t("Choose a GGUF vision module file on the machine running Launcher.")
     : t("Browse the machine running Launcher. Open a folder, then select a file or use the current folder.");
   elements.folderPickerModal.querySelector(".folder-picker-kicker").textContent = folderPickerDirectoriesOnly
     ? "WORKSPACE LOCATION" : "MODEL LOCATION";
@@ -1247,12 +1279,13 @@ function renderFolderPicker() {
   elements.folderPickerList.replaceChildren();
   elements.folderPickerStatus.className = "folder-picker-status";
   elements.folderPickerStatus.textContent = "";
-  elements.folderPickerSelect.textContent = state.folderPickerSelectedFile
+  elements.folderPickerSelect.textContent = state.folderPickerSelectedFile || folderPickerFileExtension
     ? t("Select this file") : t("Select this folder");
   elements.folderPickerSelect.disabled = (
     state.folderPickerLoading
     || Boolean(state.folderPickerError)
     || !state.folderPickerResult?.path
+    || Boolean(folderPickerFileExtension && !state.folderPickerSelectedFile)
   );
   elements.folderPickerUp.disabled = (
     state.folderPickerLoading
@@ -1282,7 +1315,9 @@ function renderFolderPicker() {
 
   const result = state.folderPickerResult;
   const folders = result?.folders || [];
-  const files = folderPickerDirectoriesOnly ? [] : result?.files || [];
+  const files = folderPickerDirectoriesOnly ? [] : (result?.files || []).filter(
+    (entry) => !folderPickerFileExtension || entry.path.toLowerCase().endsWith(folderPickerFileExtension)
+  );
   if (!folders.length && !files.length) {
     const empty = document.createElement("div");
     empty.className = "folder-picker-placeholder";
@@ -1333,7 +1368,7 @@ function renderFolderPicker() {
 
 function selectCurrentFolder() {
   if (state.folderPickerLoading || state.folderPickerError) return;
-  const path = state.folderPickerSelectedFile || state.folderPickerResult?.path;
+  const path = state.folderPickerSelectedFile || (!folderPickerFileExtension && state.folderPickerResult?.path);
   if (!path) return;
   const input = folderPickerTarget;
   input.value = path;

@@ -468,7 +468,14 @@ namespace fastllm {
                                                   const std::string &weightName,
                                                   Data &data,
                                                   const std::vector<int> &deviceIds,
-                                                  std::map<int, int> &ratios) {
+                                                  std::map<int, int> &ratios,
+                                                  bool selectedMultiCuda) {
+        // Routed EP placement is independent of attention TP. In PP+EP the
+        // attention map contains single CUDA stages, while routed weights use
+        // multicuda; place those experts on their owner during loading instead
+        // of accumulating the whole model on the first EP device.
+        const bool v41RoutedEp = selectedMultiCuda && model->model_type == "deepseek_v41" &&
+            ParseRoutedExpertIndex(weightName) >= 0;
         if ((model->model_type != "qwen3_moe" &&
              model->model_type != "hy_v3" &&
              model->model_type != "step3p5" &&
@@ -478,7 +485,7 @@ namespace fastllm {
              model->model_type != "deepseek_v4" &&
              model->model_type != "deepseek_v41" &&
              model->model_struct != "qwen3_5") ||
-            !IsThreadTensorParallelLoadEnabled() || deviceIds.size() <= 1 ||
+            (!IsThreadTensorParallelLoadEnabled() && !v41RoutedEp) || deviceIds.size() <= 1 ||
             data.isDiskWeight || data.dims.size() != 2 ||
             (data.cpuData == nullptr && data.cudaData == nullptr && data.numasData.empty())) {
             return false;
@@ -891,7 +898,7 @@ namespace fastllm {
                 ConvertCompactE4M3NVFP4ToBlock16(data);
             }
         }
-        if (SplitSpecialWeightToCudaTpDevices(this, weightName, data, deviceIds, ratios)) {
+        if (SplitSpecialWeightToCudaTpDevices(this, weightName, data, deviceIds, ratios, selectedMultiCuda)) {
             return true;
         }
         if (deviceIds.size() > 1) {
@@ -2950,6 +2957,18 @@ namespace fastllm {
                 ErrorInFastLLM("Model with a supported tokenizer_class: " + tokenizerClass + "，but has no \"tokenizer.json\"!");
             }
             auto tokenizer = json11::Json::parse(ReadAllFile(tokenizerFile), error);
+            if (model->model_struct == "deepseek_v41") {
+                auto &native = model->weight.tokenizer;
+                native.preTokenizer = "joyai-llm";
+                native.addDummyPrefix = false;
+                native.removeExtraWhitespaces = false;
+                int rank = 0;
+                for (const auto &merge : tokenizer["model"]["merges"].array_items()) {
+                    const std::string pair = merge.is_string() ? merge.string_value() :
+                        merge[0].string_value() + " " + merge[1].string_value();
+                    native.bpeMergeRanks.emplace(pair, rank++);
+                }
+            }
             for (auto &it : tokenizer["model"]["vocab"].object_items()) {
                 model->weight.AddTokenizerWord(it.first, it.second.int_value(), 1.0f);
             }
@@ -3034,7 +3053,16 @@ namespace fastllm {
     }
 
     // 从hf文件夹读取分词
+    static basellm *CreateLLMModelFromGGUFMetadata(const json11::Json &params, const std::string &arch);
+
     std::unique_ptr<basellm> CreateLLMTokenizerFromHF(const std::string &modelPath) {
+        if (StringEndWith(modelPath, ".gguf")) {
+            json11::Json metadata;
+            ReadGGUFMetaData(modelPath, metadata);
+            const auto &params = metadata["params"];
+            return std::unique_ptr<basellm>(CreateLLMModelFromGGUFMetadata(
+                params, params["general.architecture"].string_value()));
+        }
         std::string error;
         std::string path = modelPath;
         if (path.back() != '/' || path.back() != '\\') {
@@ -3191,6 +3219,7 @@ namespace fastllm {
 
     std::string ConvertGGUFTypeToFastllmType(const std::string &type) {
         static std::map <std::string, std::string> ggufTypeToFastllmTypeDict = {
+            {"deepseek41", "deepseek_v41"}, {"deepseek_v41_text", "deepseek_v41"},
             {"qwen2", "qwen2"}, // llama
             {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
             {"qwen35", "qwen3_5"}, {"qwen3_5", "qwen3_5"}, // qwen3.5
@@ -3295,6 +3324,30 @@ namespace fastllm {
         };
         for (const auto &alias : aliases) {
             addAlias(alias.first, alias.second);
+        }
+
+        if (model->model_struct == "deepseek_v41") {
+            for (const auto &alias : std::vector<std::pair<std::string, std::string>>{
+                     {"o_lora_rank", "attention.output_lora_rank"}, {"o_groups", "attention.output_group_count"},
+                     {"sliding_window", "attention.sliding_window"}, {"compress_ratios", "attention.compress_ratios"},
+                     {"compress_rope_theta", "attention.compress_rope_freq_base"},
+                     {"index_n_heads", "attention.indexer.head_count"}, {"index_head_dim", "attention.indexer.key_length"},
+                     {"index_topk", "attention.indexer.top_k"}, {"candidate_block_size", "attention.candidate_block_size"},
+                     {"candidate_topk_blocks", "attention.candidate_topk_blocks"},
+                     {"candidate_source_layer_id", "attention.candidate_source_layer_id"},
+                     {"hc_mult", "hyper_connection.count"}, {"hc_sinkhorn_iters", "hyper_connection.sinkhorn_iterations"},
+                     {"hc_eps", "hyper_connection.epsilon"}, {"scoring_func", "expert_scoring_func"},
+                     {"engram_layer_ids", "engram.layer_ids"}, {"engram_num_embeddings", "engram.num_embeddings"},
+                     {"rope_scaling.type", "rope.scaling.type"}, {"rope_scaling.factor", "rope.scaling.factor"},
+                     {"rope_scaling.original_max_position_embeddings", "rope.scaling.original_context_length"},
+                     {"rope_scaling.beta_fast", "rope.scaling.yarn_beta_fast"},
+                     {"rope_scaling.beta_slow", "rope.scaling.yarn_beta_slow"}}) addAlias(alias.first, alias.second);
+            const auto limits = GetGGUFArchParam(params, arch, "swiglu_clamp_exp").array_items();
+            const auto sharedLimits = GetGGUFArchParam(params, arch, "swiglu_clamp_shexp").array_items();
+            AssertInFastLLM(!limits.empty() && sharedLimits == limits &&
+                std::all_of(limits.begin(), limits.end(), [&](const json11::Json &x) { return x == limits[0]; }),
+                "DeepSeek V4.1 GGUF requires a uniform SwiGLU clamp.");
+            AddGGUFDictIfMissing(model, "swiglu_limit", GGUFJsonToDictValue(limits[0]));
         }
 
         if (model->model_struct == "qwen4_exp") {
@@ -3469,9 +3522,12 @@ namespace fastllm {
         std::unordered_map<std::string, float> mergeScores;
         if (tokenizerModel == "gpt2") {
             model->weight.tokenizer.type = Tokenizer::TokenizerType::BPE;
+            model->weight.tokenizer.preTokenizer = params["tokenizer.ggml.pre"].string_value();
             mergeScores.reserve(mergeItems.size());
             for (size_t i = 0; i < mergeItems.size(); i++) {
                 const std::string &pair = mergeItems[i].string_value();
+                if (model->weight.tokenizer.preTokenizer == "joyai-llm")
+                    model->weight.tokenizer.bpeMergeRanks.emplace(pair, int(i));
                 const size_t separator = pair.find(' ', 1);
                 if (separator == std::string::npos) {
                     continue;
@@ -4161,6 +4217,9 @@ namespace fastllm {
         }
 
         arch = ConvertGGUFTypeToFastllmType(arch);
+        if (arch == "deepseek_v41") {
+            model->weight.AddDict("model_directory", ParentDirectoryWithSlash(ggufFileNames[0]));
+        }
         // Preserve the source-format marker with --ori too: GLM's GGUF
         // decay and split MLA projections still need layout restoration.
         if (arch == "glm5_next") {
@@ -4189,6 +4248,9 @@ namespace fastllm {
             }
         }
 
+        if (!mmprojPath.empty() && arch == "deepseek_v41") {
+            AppendDeepSeekV41GGUFVision(model, params, mmprojPath, readGGUFTasks);
+        }
         // 3.0 更新模型信息
         model->InitParams();
         if (model->contextPlan.configured) {
@@ -4206,7 +4268,23 @@ namespace fastllm {
         for (auto &s : ggufFileNames) {
             AppendGGUFTasks(arch, s, readGGUFTasks);
         }
-        if (!mmprojPath.empty()) {
+        if (arch == "deepseek_v41" && params["deepseek41.engram.present"].bool_value()) {
+            const std::string name = params["deepseek41.engram.file"].string_value();
+            AssertInFastLLM(!name.empty() && name.find_first_of("/\\") == std::string::npos &&
+                            name != "." && name != "..", "Invalid DeepSeek V4.1 Engram filename.");
+            const std::string engramPath = ParentDirectoryWithSlash(ggufFileNames[0]) + name;
+            json11::Json engram;
+            ReadGGUFMetaData(engramPath, engram);
+            AssertInFastLLM(engram["params"]["general.architecture"].string_value() == "deepseek41-engram" &&
+                !params["deepseek41.engram.source"].string_value().empty() &&
+                engram["params"]["deepseek41.engram.source"] == params["deepseek41.engram.source"],
+                "DeepSeek V4.1 GGUF Engram source does not match the backbone.");
+            AppendGGUFTasks(arch, engramPath, readGGUFTasks);
+            for (const auto &task : readGGUFTasks)
+                if (task.name.find(".engram.embed.") != std::string::npos)
+                    model->ngramWeights.insert(task.name);
+        }
+        if (!mmprojPath.empty() && arch != "deepseek_v41") {
             AssertInFastLLM(
                 model->model_struct == "qwen3_5",
                 "--mmproj currently supports Qwen3.5-family GGUF models only.");
@@ -4219,6 +4297,26 @@ namespace fastllm {
             for (auto &s : mmprojFileNames) {
                 printf("%s\n", s.c_str());
                 AppendGGUFTasks("qwen3_5_mmproj", s, readGGUFTasks);
+            }
+        }
+        if (!mmprojPath.empty() && arch == "deepseek_v41") {
+            std::set<std::string> backboneRouting;
+            for (const auto &task : readGGUFTasks)
+                if (task.fileName != mmprojPath && StringEndWith(task.name, ".ffn.gate.bias_vl"))
+                    backboneRouting.insert(task.name);
+            // A complete backbone already contains these tensors. Never enqueue
+            // two concurrent loads into the same weight when using an augmented projector.
+            readGGUFTasks.erase(std::remove_if(readGGUFTasks.begin(), readGGUFTasks.end(),
+                [&](const ReadGGUFTask &task) {
+                    return task.fileName == mmprojPath && backboneRouting.count(task.name);
+                }), readGGUFTasks.end());
+            std::set<std::string> names;
+            for (const auto &task : readGGUFTasks) names.insert(task.name);
+            for (int layer = 0; layer < ggufMainLayerCount; ++layer) {
+                const std::string name = "layers." + std::to_string(layer) + ".ffn.gate.bias_vl";
+                AssertInFastLLM(names.count(name),
+                    "DeepSeek V4.1 GGUF image input requires " + name +
+                    ". This text-only backbone needs an mmproj containing the original vision routing biases.");
             }
         }
         uint64_t totalLoadBytes = 0;
@@ -4356,6 +4454,11 @@ namespace fastllm {
             }
             AssertInFastLLM(!dflashReadTaskDict.empty(),
                             "No DFlash tensors were mapped for the GGUF target.");
+        }
+        if (model->model_struct == "deepseek_v41") {
+            // Register V4.1 activation boundaries and streaming PP placement;
+            // GGUF keeps its own tensor types and import mapping.
+            model->GetTensorMap(tensors);
         }
         model->OnWeightsCreated(allWeightNames);
         const WeightMergeIndex mergeIndex(model->weightMergeRules);

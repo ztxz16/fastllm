@@ -269,6 +269,35 @@ static void IndexerChecks() {
     std::cout << "PASS indexer: " << checks << " decode/prefill, batched, tail, packed KV, graph and scalar fallback cases\n";
 }
 
+static void IndexerSmallBatchExactChecks() {
+    for (int dev=0; dev<deviceCount; ++dev) {
+        SelectDevice(dev);
+        if (FastllmCudaRuntimeArch()!=75) continue;
+        for (auto qt : {DataType::FLOAT32,DataType::BFLOAT16})
+        for (auto kt : {DataType::FLOAT32,DataType::BFLOAT16})
+        for (int tokens : {1,5,8}) for (int count : {7,129,4096}) {
+            auto q=Random(qt,{2,tokens,32,128},101);
+            auto weights=Random(DataType::FLOAT32,{2,tokens,32},202);
+            auto keys=Random(kt,{2,count,128},303);
+            for (int storage : {0,1,2,3}) {
+                Data packed,out;
+                if (storage) Check(FastllmCudaDeepSeekV41QuantizeKV(keys,packed,storage,storage==3?16:32),"index exact pack");
+                auto run=[&] { Check(FastllmCudaDeepSeekV41IndexerScore(q,weights,storage?packed:keys,
+                    4,259,out),"small-batch index exact"); };
+                setenv("FASTLLM_DSV41_LEGACY_INDEXER","1",1); run();
+                const auto expected=Bytes(out);
+                unsetenv("FASTLLM_DSV41_LEGACY_INDEXER"); run();
+                Check(expected==Bytes(out),"SM75 parallel indexer differs bitwise from scalar");
+                if (tokens==5 && count==129) {
+                    ReplayGraph(run);
+                    Check(expected==Bytes(out),"SM75 parallel indexer graph result changed");
+                }
+            }
+        }
+    }
+    std::cout << "PASS indexer small batch: exact scalar scores, FP32/BF16/packed KV, tails and graph replay\n";
+}
+
 static void FallbackChecks() {
     for (int dev = 0; dev < deviceCount; ++dev) {
         SelectDevice(dev);
@@ -486,7 +515,7 @@ int main(int argc, char **argv) {
         if (section == "all" || section == "heads") AttentionHeadShardChecks();
         if (section == "all" || section == "attention") AttentionChecks();
         if (section == "all" || section == "attention") AttentionGraphLifetimeChecks();
-        if (section == "all" || section == "indexer") IndexerChecks();
+        if (section == "all" || section == "indexer") { IndexerChecks(); IndexerSmallBatchExactChecks(); }
         if (section == "all" || section == "fallback") FallbackChecks();
         if (section == "all" || section == "rmsnorm") RmsNormChecks();
         if (section == "all" || section == "capacity") AttentionCapacityFallbackCheck();

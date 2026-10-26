@@ -13,7 +13,7 @@
 | Qwen3.8 27B FP8 | `--auto`；纯 GPU TP、MTP、并发 4、尽量使用原生上下文 | `Qwen/Qwen3.8-27B-FP8` |
 | Qwen3.8 27B 其他格式 | 手动 CUDA / TP，按量化格式单独验证 | `Qwen/Qwen3.8-27B`、`QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` |
 | Qwen3.8-Flash-Next GSQ-RCO | `--auto`；GGUF 需要把首个分片作为模型路径 | `Q2_0`、`IQ2_XS`、`IQ3_XXS`、`IQ3_S`，下载时保留对应子目录和 `mmproj` |
-| DeepSeek V4.1 Flash | `--auto`；主机内存不足时按日志改用磁盘专家 | `deepseek-ai/DeepSeek-V4.1-Flash-1017` |
+| DeepSeek V4.1 Flash | `--auto`；支持 HF 和 GSQ-RCO GGUF，Engram 文件需完整 | `deepseek-ai/DeepSeek-V4.1-Flash-1017` 或匹配的 GGUF 量化版本 |
 | GLM-5.3-Flash | `--auto`；GGUF 需要把首个分片作为模型路径 | 本地完整 HF/NVFP4 目录或 `glm5next` GGUF 分片，见 [GLM 指南](glm5.md) |
 
 自动化流程应等待日志出现就绪事件，再请求 `/v1/models` 检查 `id` 和上下文窗口，最后发送一个短请求验证输出。不要根据进程已经启动就判定模型可用。
@@ -59,6 +59,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"用一句话介绍自己。"}],"max_tokens":64}'
 ```
+
+日常参数调整与启动器操作见 [`--auto` 调节指南](auto.md)。
 
 ## 手动参数与覆盖规则
 
@@ -135,8 +137,7 @@ Qwen3.8-Flash-Next 和 GLM 的 GGUF 分片必须保留同目录的其余分片�
 | `--dspark 7` | DeepSeek V4.1 内置 DSpark，每轮最多 7 个草稿 token |
 | `--mtp 3` | 支持 MTP 的 Qwen/其它模型启用 MTP |
 | `--draft` / `--speculative_draft_model_path` | 指定外部 DFlash/MTP 草稿目录 |
-| `--fast_prefill` | 启用模型支持的快速 prefill；DeepSeek V4.1 使用近似注意力，可能改变 logits 和输出 |
-| `--no_fast_prefill` | 关闭快速 prefill，做精度或回归对照 |
+| `--fast_prefill` / `--no_fast_prefill` | 开启 / 关闭 DeepSeek V4.1 快速 Prefill；该模型的 `--auto` 默认开启，省略显式设置即可跟随自动规划 |
 | `--speculative_dspark_confidence_threshold 0.5` | DSpark 草稿置信度门槛；提高时通常更早停止草稿生成，接受率和速度需实测 |
 
 DeepSeek V4.1 的自动模式默认规划不超过原生窗口的 1M 上下文、DSpark 5 和 `fast_prefill`；预算不足且调整专家放置、缓存和 chunk 后仍不可行时会报错，不自动缩短窗口。显式 `--dspark 0`、`--no_fast_prefill` 或上下文参数会覆盖默认值。GSQ GGUF 的量化布局由文件决定，不要再额外指定在线量化类型。

@@ -83,7 +83,10 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
     const preferredLocale = localeResources[locale] ? locale : (() => { try { const saved = localStorage.getItem("fastllm.locale"); if (localeResources[saved]) return saved; } catch (_) {} return "zh-CN"; })();
     const state = { config: {}, conversations: [], activeId: null, record: null, pending: [], uploading: 0, tasks: new Map(), stopping: new Set(), loadSequence: 0, agent: "chat", locale: preferredLocale, menuConversationId: null, renameConversationId: null, deleteConversationId: null, workspaceDirectory: null, workspaceLoading: false };
     const icon = `<img src="${new URL(iconUrl || localUrl("/assets/fastllm_icon.svg"), location.origin).href.replaceAll('"', "&quot;")}" alt="" draggable="false">`;
-    const thinkingOptions = [["关闭","thinking.off"],["低","thinking.low"],["中","thinking.medium"],["高","thinking.high"]];
+    function thinkingOptions() {
+      return (state.config.supported_reasoning_efforts || []).map(effort =>
+        [effort, effort === "none" ? "thinking.off" : `thinking.${effort}`]);
+    }
     const conversationOptions = [["关闭","mode.chat"],["快速搜索","mode.web_fast"],["深度浏览","mode.web_deep"]];
     const agentLabelKeys = {knowledge:"agent.knowledge",data:"agent.data",ppt:"agent.ppt",code:"agent.code",workspace:"agent.workspace"};
     const toolLabelKeys = {
@@ -470,8 +473,19 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
     }
 
     function renderModes() {
-      if (!state.record) return; const thinking = state.record.settings.thinking_level || "中"; const webMode = state.record.settings.web_mode || "关闭";
-      $("#thinkingLabel").textContent = t(Object.fromEntries(thinkingOptions)[thinking] || "thinking.medium"); $("#thinkingButton").classList.toggle("active",thinking !== "关闭"); renderMenu($("#thinkingMenu"),thinkingOptions,thinking,"thinking_level");
+      if (!state.record) return;
+      const options = thinkingOptions();
+      const saved = state.record.settings.thinking_level;
+      const legacy = state.config.legacy_reasoning_efforts || {};
+      const selected = legacy[saved] || saved;
+      const thinking = options.some(([value]) => value === selected) ? selected
+        : state.config.default_reasoning_effort || "default";
+      state.record.settings.thinking_level = thinking;
+      const webMode = state.record.settings.web_mode || "关闭";
+      $("#thinkingLabel").textContent = t(Object.fromEntries(options)[thinking] || "thinking.default");
+      $("#thinkingButton").classList.toggle("active", thinking !== "none" && thinking !== "default");
+      $("#thinkingButton").disabled = isConversationGenerating() || !options.length;
+      renderMenu($("#thinkingMenu"), options, thinking, "thinking_level");
       $("#webLabel").textContent = t(Object.fromEntries(conversationOptions)[webMode] || "mode.chat"); $("#webButton").classList.toggle("active",webMode !== "关闭"); renderConversationMenu(webMode); renderAgentSelection();
     }
 
@@ -544,7 +558,8 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
     function syncGenerationUI() {
       const running = isConversationGenerating(); const task = state.tasks.get(state.activeId); const stopping = Boolean(task?.stopping || state.stopping.has(state.activeId));
       $("#prompt").disabled = running; $("#sendButton").hidden = running; $("#sendButton").disabled = running; $("#stopButton").hidden = !running; $("#stopButton").disabled = stopping; $("#stopButton").title = t(stopping ? "composer.stopping" : "composer.stop"); $("#stopButton").setAttribute("aria-label",t(stopping ? "composer.stopping" : "composer.stop"));
-      $("#attachButton").disabled = running; for (const selector of ["#agentButton","#webButton","#thinkingButton","#topSettings"]) $(selector).disabled = running;
+      $("#attachButton").disabled = running; for (const selector of ["#agentButton","#webButton","#topSettings"]) $(selector).disabled = running;
+      $("#thinkingButton").disabled = running || !thinkingOptions().length;
     }
 
     async function stopActiveGeneration() {
@@ -680,6 +695,7 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
     async function refreshConfig() {
       state.config = await (await api("/api/config")).json();
       renderWorkspaceAvailability();
+      renderModes();
     }
 
     $("#closeHTMLPreview").onclick = guard(() => $("#htmlPreviewDialog").close());

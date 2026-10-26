@@ -4,7 +4,9 @@
 
 FastLLM supports Kimi-K3 KDA/MLA, chunked prefill, CUDA/NUMA execution, CPU/GPU and disk experts, external DSpark, XTML serving, and tool calling.
 
-## API server quick start
+Kimi-K3 is not currently supported by the runtime `--auto` planner. Use the manual commands on this page. See the [`--auto` guide](auto_en.md) for supported models.
+
+## API server quick start (manual configuration)
 
 ~~~bash
 ftllm server /data/models/kimi-k3 \

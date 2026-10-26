@@ -139,8 +139,13 @@ class AgentProxy:
             if not self._authorized(request):
                 return JSONResponse({"error": f"Open {self.name} from Launcher."}, status_code=403)
             try:
+                # An empty async iterator still sends a chunked request body.
+                # Bodyless GET/HEAD requests must stay bodyless for upstreams
+                # that close the connection without consuming request data.
+                body = request.stream() if (request.headers.get("transfer-encoding")
+                    or request.headers.get("content-length", "0") != "0") else None
                 upstream_request = app.state.client.build_request(request.method, target(request.scope),
-                    headers=self._headers(request.headers), content=request.stream())
+                    headers=self._headers(request.headers), content=body)
                 response = await app.state.client.send(upstream_request, stream=True)
             except httpx.HTTPError:
                 return JSONResponse({"error": f"{self.name} is unavailable. Reopen it from Launcher."}, status_code=502)
@@ -156,6 +161,8 @@ class AgentProxy:
                 # fixed appearance adapter; JS, SSE and terminal streams stay streamed.
                 try:
                     document = await response.aread()
+                except httpx.HTTPError:
+                    return JSONResponse({"error": f"{self.name} is unavailable. Reopen it from Launcher."}, status_code=502)
                 finally:
                     await response.aclose()
                 parents = html.escape(json.dumps(self._parent_origins(request)), quote=True)

@@ -1,7 +1,13 @@
 # 文档索引
 
+[English](README_EN.md)
+
 - [快速开始](../README.md)
 - [模型部署指南](../README.md#模型部署指南)
+- [`--auto` 参数调节与启动器](auto.md)：常用参数的影响、命令示例和日志检查
+- [启动器与工作室](launcher.md)：配置管理、聊天和 Agent
+- [手动部署与完整参数参考](deployment.md)：设备配置、模型格式、下载导出和源码安装
+- [自动规划原理与模型默认值](hybrid-auto.md)
 - [Benchmark](benchmark.md)：按模型保存最终结果及测量范围
 - [开发与验证记录](development-validation.md)：文档分工、测试入口和 Benchmark 记录要求
 - [Agent 部署速查](model-deployment-agent.md)：建议交给自动化 agent 先阅读

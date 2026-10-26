@@ -55,6 +55,75 @@ def write_gguf(path, metadata, tensors):
     path.write_bytes(header + b"\0" * offset)
 
 
+class HostMemoryTest(unittest.TestCase):
+    def make_proc(self, directory, fields=None, zoneinfo=None):
+        proc = Path(directory) / "proc"
+        (proc / "self").mkdir(parents=True)
+        info = {"MemTotal": 8 * GiB, "MemAvailable": 8 * GiB, **(fields or {})}
+        (proc / "meminfo").write_text("".join(
+            "%s: %d kB\n" % (name, value // 1024) for name, value in info.items()))
+        (proc / "self/cgroup").write_text("")
+        (proc / "self/mountinfo").write_text("")
+        if zoneinfo is not None:
+            (proc / "zoneinfo").write_text(zoneinfo)
+        return proc
+
+    def test_kho_budget_does_not_depend_on_current_cma_occupancy(self):
+        # KHO regions can have CmaTotal=0. Account for both occupied and free
+        # pages across zones/nodes; nr_free_cma must not be counted again.
+        for free in (0, GiB, 3 * GiB):
+            for page_size in (4096, 65536):
+                with self.subTest(free=free, page_size=page_size), tempfile.TemporaryDirectory() as d:
+                    proc = self.make_proc(d, {"CmaTotal": 0, "CmaFree": free},
+                        "Node 0, zone DMA32\n        cma %d\n      nr_free_cma %d\n"
+                        "Node 1, zone Normal\n        cma %d\n" % (
+                            GiB // page_size, free // page_size, 2 * GiB // page_size))
+                    with patch.object(auto.os, "sysconf", return_value=page_size):
+                        self.assertEqual(auto.host_memory(proc),
+                            {"total": 8 * GiB, "available": 5 * GiB, "cma": 3 * GiB})
+
+    def test_meminfo_fallback_and_overlapping_cma_counters(self):
+        cases = [({}, None, 0),
+                 ({"CmaTotal": 2 * GiB, "CmaFree": GiB}, None, 2 * GiB),
+                 ({"CmaTotal": 0, "CmaFree": GiB}, None, GiB),
+                 ({"CmaTotal": 2 * GiB, "CmaFree": GiB}, "        cma 524288\n", 2 * GiB),
+                 ({"CmaTotal": 9 * GiB}, None, 9 * GiB)]
+        for fields, zones, reserved in cases:
+            with self.subTest(fields=fields, zones=zones), tempfile.TemporaryDirectory() as d:
+                proc = self.make_proc(d, fields, zones)
+                with patch.object(auto.os, "sysconf", return_value=4096):
+                    ram = auto.host_memory(proc)
+                self.assertEqual(ram, {"total": 8 * GiB,
+                    "available": max(0, 8 * GiB - reserved), "cma": reserved})
+
+    def test_unreadable_zoneinfo_falls_back_to_meminfo(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc = self.make_proc(d, {"CmaTotal": 2 * GiB})
+            read_text = Path.read_text
+            def restricted_read(path, *args, **kwargs):
+                if path == proc / "zoneinfo":
+                    raise PermissionError("restricted proc mount")
+                return read_text(path, *args, **kwargs)
+            with patch.object(Path, "read_text", restricted_read):
+                self.assertEqual(auto.host_memory(proc)["available"], 6 * GiB)
+
+    def test_cma_budget_rejects_unsafe_host_placement_and_replans(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc = self.make_proc(d, {"CmaTotal": 3 * GiB})
+            ram = auto.host_memory(proc)
+            g, costs, gpu, _ = fixture()
+            base = auto.plan(args(moe_device_layers=-1), g, costs, "pp", {0: 1}, gpu,
+                             {"total": 8 * GiB, "available": 8 * GiB})
+            self.assertEqual(base["resident_layers"], 0)
+            with self.assertRaises(ValueError):
+                auto.plan(args(moe_device_layers=-1), g, costs, "pp", {0: 1}, gpu, ram)
+            plan = auto.plan(args(moe_device_layers="auto"), g, costs, "pp", {0: 1}, gpu, ram)
+            self.assertGreater(plan["resident_layers"], 0)
+            self.assertEqual(plan["host_budget_bytes"], 4 * GiB)
+            self.assertEqual(plan["host_cma_bytes"], 3 * GiB)
+            self.assertLessEqual(plan["host_estimated_bytes"], plan["host_budget_bytes"])
+
+
 class HybridAutoTest(unittest.TestCase):
     def test_qwen35_fp8_payload_and_scale_are_budgeted_once(self):
         metadata = dict(model_type='qwen3_5_text', num_hidden_layers=4,
@@ -492,6 +561,26 @@ class HybridAutoTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     auto.plan(a, g, c, "pp", {0: 1}, gpu, ram)
 
+    def test_explicit_host_budget_bypasses_detection_but_still_checks_capacity(self):
+        g, costs, gpu, ram = fixture()
+        a = args(moe_device_layers=-1, moe_cuda_cache=0)
+        normal = auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+        required = normal["host_estimated_bytes"]
+        # Simulate CMA/cgroup accounting leaving less than the required RAM.
+        detected = {"total": 2 * GiB, "available": 0, "cma": GiB}
+        with self.assertRaises(ValueError):
+            auto.plan(a, g, costs, "pp", {0: 1}, gpu, detected)
+        a.force_ddr_limit = required
+        forced = auto.plan(a, g, costs, "pp", {0: 1}, gpu, detected)
+        self.assertEqual(forced["host_budget_bytes"], required)
+        self.assertEqual(forced["force_ddr_limit"], required)
+        self.assertEqual(forced["gpu_budget_bytes"], normal["gpu_budget_bytes"])
+        self.assertEqual(detected, {"total": 2 * GiB, "available": 0, "cma": GiB})
+        # An explicit budget remains a capacity constraint, even below detection.
+        a.force_ddr_limit = required - 1
+        with self.assertRaises(ValueError):
+            auto.plan(a, g, costs, "pp", {0: 1}, gpu, ram)
+
     def test_snapshot_fallback_counts_a_second_host_copy(self):
         g, c, gpu, ram = fixture()
         p = auto.plan(args(), g, c, "pp", {0: 1}, gpu, ram)
@@ -516,7 +605,14 @@ class HybridAutoTest(unittest.TestCase):
                 (child / current).write_text(str(GiB))
                 (child.parent / limit).write_text(str(8 * GiB))
                 (child.parent / current).write_text(str(3 * GiB))
-                self.assertEqual(auto.host_memory(proc), {"total": 8 * GiB, "available": 5 * GiB})
+                for cma, available in [(0, 5 * GiB), (8 * GiB, 5 * GiB), (20 * GiB, 4 * GiB)]:
+                    # Apply the physical CMA constraint before intersecting it
+                    # with the parent cgroup's remaining budget, not afterwards.
+                    with self.subTest(cma=cma):
+                        (proc / "meminfo").write_text(
+                            "MemTotal: 33554432 kB\nMemAvailable: 25165824 kB\nCmaTotal: %d kB\n" % (cma // 1024))
+                        self.assertEqual(auto.host_memory(proc),
+                            {"total": 8 * GiB, "available": available, "cma": cma})
 
     def test_available_gpu_memory_is_reserved_below_ratio(self):
         g, c, gpu, ram = fixture()
@@ -729,6 +825,113 @@ class HybridAutoTest(unittest.TestCase):
             del g.gguf_expert_bytes[1]
             self.assertEqual(auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 2), generic)
 
+    def test_canonical_v41_gguf_phase_budget_keeps_persistent_mmq_scratch(self):
+        md = self.dspark_metadata()
+        md['gguf_architecture'] = 'deepseek41'
+        g = auto.geometry(md, 'fp4', 0)
+        tensors = [auto.Tensor(f'blk.{i}.ffn_gate_exps.weight', (g.hidden, g.intermediate, g.experts),
+                               10 * MiB * g.experts, 'gguf:16') for i in range(g.layers)]
+        auto.weight_costs(tensors, g, args())
+        self.assertTrue(g.disk_prefill['streamed_mmq'])
+        unsupported = copy.copy(tensors)
+        unsupported[0] = auto.Tensor(tensors[0].name, tensors[0].shape, tensors[0].bytes, 'gguf:14')
+        auto.weight_costs(unsupported, g, args())
+        self.assertFalse(g.disk_prefill['streamed_mmq'])
+        auto.weight_costs(tensors, g, args())
+        g.gguf_expert_bytes = {i: 10 * MiB for i in range(g.layers)}
+        a = args(fast_prefill=True, atype='bfloat16')
+        with patch.dict(os.environ, {}, clear=True):
+            phased = auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0)
+            generic = auto._workspace_bytes(a, g, 4096, 1048576, 'tp', 0)
+            self.assertLess(phased, generic)
+            # Even maximally skewed routing must fit, with all BF16 partials.
+            capacity = ((4096 * g.topk + 8 * 15 + 15) // 16) * 16
+            grouped = capacity * ((max(g.hidden, g.intermediate) + 255) // 256 * 288 +
+                                   max(g.hidden, 2 * g.intermediate) * 4)
+            partials = 4096 * g.topk * g.hidden * 2
+            self.assertGreater(phased, grouped + partials + 256 * MiB)
+            # Above MMQ's row limit, no optimistic phase budget is used.
+            self.assertEqual(auto._workspace_bytes(a, g, 8192, 1048576, 'pp', 0),
+                             auto._workspace_bytes(a, g, 8192, 1048576, 'tp', 0))
+            self.assertEqual(auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0, gguf_mmq=False), generic)
+            g.disk_prefill['streamed_mmq'] = False
+            self.assertEqual(auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0), generic)
+            g.disk_prefill['streamed_mmq'] = True
+            for field, value in [('fast_prefill', False), ('atype', 'float32')]:
+                previous = getattr(a, field); setattr(a, field, value)
+                self.assertEqual(auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0), generic)
+                setattr(a, field, previous)
+        a = args(fast_prefill=True, tokens=4096, max_context_length=4096, moe_device_layers=-1,
+                 chunked_prefill_size=4096)
+        costs = ([4*GiB]*g.layers, [MiB]*g.layers, 0, 0, MiB, False)
+        result = auto.plan(a, g, costs, 'pp', {0: 1},
+                           {0: dict(total=16*GiB, free=16*GiB, capability=75)}, dict(total=64*GiB, available=64*GiB))
+        self.assertEqual(result['expert_transport_bytes_per_device'], 49 * 10 * MiB + 272 * MiB)
+        disk_args = copy.copy(a)
+        disk_args.moe_device, disk_args.moe_cpu_cache = 'disk', 0
+        disk = auto.plan(disk_args, g, costs, 'pp', {0: 1},
+                         {0: dict(total=16*GiB, free=16*GiB, capability=75)},
+                         dict(total=64*GiB, available=64*GiB))
+        self.assertEqual(disk['expert_transport_bytes_per_device'], 25 * 10 * MiB + 16 * MiB)
+        self.assertLess(disk['workspace_bytes_per_device'], result['workspace_bytes_per_device'])
+        # A skewed expert group slices activations while reusing its weights;
+        # the host/NUMA path retains its original conservative capacity.
+        unsliced = auto._workspace_bytes(a, g, 4096, 1048576, 'pp', 0)
+        sliced = auto._workspace_bytes(disk_args, g, 4096, 1048576, 'pp', 0)
+        capacity = ((4096 * g.topk + 8 * 15 + 15) // 16) * 16
+        row_bytes = ((max(g.hidden, g.intermediate) + 255) // 256 * 288 +
+                     max(g.hidden, 2 * g.intermediate) * 4)
+        self.assertEqual(unsliced - sliced, (capacity - min(capacity, 2048)) * row_bytes)
+        self.assertGreaterEqual(disk['host_estimated_bytes'], 24 * (10 * MiB + 24 * 1024))
+        # Phase release and bounded disk MMQ do not depend on approximate tail replay.
+        disk_args.fast_prefill = False
+        self.assertEqual(auto._workspace_bytes(disk_args, g, 4096, 1048576, 'pp', 0), sliced)
+        disk_args.fast_prefill = True
+
+        for override in ({'FT_GPU_PREFILL': 'off'},
+                         {'FASTLLM_DISK_MOE_GPU_PREFILL_MIN_TOKENS': '4097'},
+                         {'FASTLLM_DISK_MOE_GPU_PREFILL_MIN_TOKENS': '  +4097tail'}):
+            with self.subTest(override=override), patch.dict(os.environ, override):
+                self.assertEqual(auto._workspace_bytes(disk_args, g, 4096, 1048576, 'pp', 0),
+                                 auto._workspace_bytes(disk_args, g, 4096, 1048576, 'tp', 0))
+        pair = auto.plan(a, g, costs, 'pp', {0: 1, 1: 1},
+                         {d: dict(total=16*GiB, free=16*GiB, capability=75) for d in (0,1)},
+                         dict(total=64*GiB, available=64*GiB))
+        self.assertEqual(pair['expert_transport_bytes_per_device'],
+                         (49 + g.topk + 1) * 10 * MiB + 272 * MiB)
+        fallback = auto.plan(a, g, costs, 'pp', {0: 1},
+                            {0: dict(total=16*GiB, free=16*GiB, capability=60)},
+                            dict(total=64*GiB, available=64*GiB))
+        self.assertEqual(fallback['expert_transport_bytes_per_device'], 97 * 10 * MiB + 272 * MiB)
+        self.assertGreater(fallback['workspace_bytes_per_device'], result['workspace_bytes_per_device'])
+
+    def test_canonical_v41_auto_chunk_stays_in_streamed_mmq(self):
+        md = self.dspark_metadata()
+        md['gguf_architecture'] = 'deepseek41'
+        g = auto.geometry(md, 'fp4', 0)
+        g.disk_prefill['streamed_mmq'] = True
+        a = args(fast_prefill=True, tokens=1048576, max_context_length=1048576,
+                 moe_device_layers=-1, chunked_prefill_size='auto', moe_cuda_cache=0)
+        costs = ([GiB]*g.layers, [MiB]*g.layers, 0, 0, MiB, False)
+        gpu = {0: dict(total=64*GiB, free=64*GiB, capability=75)}
+        ram = dict(total=128*GiB, available=128*GiB)
+        def chunk():
+            return auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram)['chunked_prefill_size']
+        self.assertEqual(chunk(), 4096)
+        a.chunked_prefill_size = 8192
+        self.assertEqual(chunk(), 8192)
+        a.chunked_prefill_size = 'auto'
+        gpu[0]['capability'] = 60
+        self.assertEqual(chunk(), 8192)
+        gpu[0]['capability'] = 75
+        g.disk_prefill['streamed_mmq'] = False
+        self.assertEqual(chunk(), 8192)
+        g.disk_prefill['streamed_mmq'] = True
+        a.moe_device = 'disk'
+        self.assertEqual(chunk(), 4096)
+        with patch.dict(os.environ, {'FT_GPU_PREFILL': '0'}):
+            self.assertEqual(chunk(), 8192)
+
     def test_v41_host_staging_is_reused_only_with_early_cuda_placement(self):
         g = auto.geometry(self.dspark_metadata(), 'float16', 0)
         a = args(tokens=4096, max_context_length=4096, moe_device_layers=2,
@@ -870,8 +1073,12 @@ class HybridAutoTest(unittest.TestCase):
             numa.moe_device = "numa"
             self.assertEqual(auto._workspace_bytes(numa, g, 2048, 1048576, "pp", 0), bounded)
             self.assertGreater(bounded, auto._workspace_bytes(a, g, 256, 1048576, "pp", 0))
-            for changes in (dict(dtype="float32"), dict(atype="float32"),
-                            dict(max_batch=2), dict(fast_prefill=False)):
+            concurrent = copy.copy(a)
+            concurrent.max_batch = 4
+            self.assertEqual(auto._workspace_bytes(concurrent, g, 2048, 1048576, "pp", 0), bounded)
+            self.assertEqual(auto._workspace_bytes(concurrent, g, 2048, 1048576, "pp", 0,
+                                                   prefill=False), old)
+            for changes in (dict(dtype="float32"), dict(atype="float32"), dict(fast_prefill=False)):
                 other = copy.copy(a)
                 vars(other).update(changes)
                 self.assertEqual(auto._workspace_bytes(other, g, 2048, 1048576, "pp", 0), old)
@@ -883,6 +1090,47 @@ class HybridAutoTest(unittest.TestCase):
                 self.assertEqual(auto._workspace_bytes(a, g, 2048, 1048576, "pp", 0), old)
             with patch.dict(os.environ, {"FASTLLM_DSV41_INDEX_SCORE_MB": "1024"}):
                 self.assertGreater(auto._workspace_bytes(a, g, 2048, 1048576, "pp", 0), bounded)
+
+    def test_v41_concurrent_decode_keeps_single_prefill_and_full_kv_budget(self):
+        md = self.dspark_metadata()
+        md['gguf_architecture'] = 'deepseek41'
+        g = auto.geometry(md, 'fp4', 0)
+        g.disk_prefill['streamed_mmq'] = True
+        g.gguf_expert_bytes = {i: MiB for i in range(g.layers)}
+        costs = ([GiB] * g.layers, [MiB] * g.layers, 0, 0, GiB, False)
+        gpu = {0: dict(total=64 * GiB, free=64 * GiB)}
+        ram = dict(total=128 * GiB, available=128 * GiB)
+        plans = []
+        with patch.dict(os.environ, {}, clear=True):
+            for batch in (1, 2, 4):
+                a = args(fast_prefill=True, tokens=batch * 1048576, max_context_length=1048576,
+                         max_batch=batch, chunked_prefill_size=4096, moe_device_layers=0)
+                p = auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram, allow_full_gpu=True)
+                plans.append(p)
+                self.assertEqual((p['max_batch'], p['context_tokens'], p['total_tokens']),
+                                 (batch, 1048576, batch * 1048576))
+                self.assertEqual(p['kv_logical_bytes_per_device'][0], batch * 1048576 * sum(g.kv))
+                self.assertEqual(p['resident_layers'], g.layers)
+            self.assertEqual(len({p['workspace_bytes_per_device'] for p in plans}), 1)
+            self.assertGreater(plans[-1]['gpu_estimated_bytes'][0], plans[0]['gpu_estimated_bytes'][0])
+            self.assertGreater(plans[-1]['kv_capacity_bytes_per_device'][0], plans[0]['kv_capacity_bytes_per_device'][0])
+
+    def test_v41_large_verify_batch_cannot_reuse_prefill_phase_budget(self):
+        md = self.dspark_metadata()
+        md['quantization_config'] = dict(quant_method='fp8', expert_dtype='fp4', weight_block_size=[32, 32])
+        g = auto.geometry(md, 'fp4', 0, 7)
+        g.gguf_expert_bytes = {i: MiB for i in range(len(g.kv))}
+        costs = ([GiB] * len(g.kv), [MiB] * len(g.kv), 0, 0, GiB, False)
+        a = args(fast_prefill=True, tokens=1048576, max_context_length=4096,
+                 max_batch=256, dspark=7, chunked_prefill_size=512, moe_device_layers=0)
+        gpu = {0: dict(total=64 * GiB, free=64 * GiB)}
+        ram = dict(total=128 * GiB, available=128 * GiB)
+        with patch.dict(os.environ, {}, clear=True):
+            fast = auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram, allow_full_gpu=True)
+            a.fast_prefill = False
+            plain = auto.plan(a, g, costs, 'pp', {0: 1}, gpu, ram, allow_full_gpu=True)
+            self.assertEqual(fast['workspace_bytes_per_device'], plain['workspace_bytes_per_device'])
+            self.assertGreater(fast['workspace_bytes_per_device'], GiB)
 
     def test_v41_reused_workspace_preserves_chunk_boundary_and_kv_reserve(self):
         md = self.dspark_metadata()

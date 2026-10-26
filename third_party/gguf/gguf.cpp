@@ -180,8 +180,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
         }},
         {GGML_TYPE_IQ2_XS, ggml_type_traits{/* type_name */"iq2_xs", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq2_xs),/* is_quantized */  true,
-            /* vec_dot */ nullptr,
-            /* vec_dot_type */ GGML_TYPE_F32,
+            /* vec_dot */ ggml_vec_dot_iq2_xs_q8_K,
+            /* vec_dot_type */ GGML_TYPE_Q8_K,
             /* to_float */ (ggml_to_float_t) dequantize_row_iq2_xs,
             // .from_float_ref           = nullptr,
         }},
@@ -484,6 +484,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq2_xs),
             .is_quantized             = true,
+            .vec_dot                  = ggml_vec_dot_iq2_xs_q8_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
             .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xs,
             // .from_float_ref           = nullptr,
         }},
@@ -861,9 +863,11 @@ namespace fastllm {
             ReadGGUFTensorBytes(fileName, offset, weight->cpuData, ggml_nbytes(tensor));
 
         } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
-                   replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
+                   replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16 ||
+                   replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceBF16) {
             const bool fp32 = replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32;
-            weight->dataType = fp32 ? DataType::FLOAT32 : DataType::FLOAT16;
+            const bool bf16 = replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceBF16;
+            weight->dataType = fp32 ? DataType::FLOAT32 : bf16 ? DataType::BFLOAT16 : DataType::FLOAT16;
             weight->Resize(tensor->dims);
             weight->Allocate();
 
@@ -882,7 +886,10 @@ namespace fastllm {
             } else {
                 toFloat(original.data(), destination, weight->Count(0));
             }
-            if (!fp32) {
+            if (bf16) {
+                for (int i = 0; i < weight->Count(0); ++i)
+                    reinterpret_cast<uint16_t *>(weight->cpuData)[i] = Float32ToBFloat16RNEBits(destination[i]);
+            } else if (!fp32) {
                 Float32ToFloat16(destination, reinterpret_cast<uint16_t *>(weight->cpuData), weight->Count(0));
             }
         } else {
@@ -1098,12 +1105,13 @@ namespace fastllm {
                                 )
                         );
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
-                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
+                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16 ||
+                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceBF16) {
                         // CPU embedding can decode individual GGUF rows for
                         // models that keep the imported lookup table unchanged.
                         // Preserve floating-point imports and the CUDA embedding
                         // path, which still require the original dense layout.
-                        const bool packedEmbedding = (arch == "qwen4_exp" || arch == "glm5_next") &&
+                        const bool packedEmbedding = (arch == "qwen4_exp" || arch == "glm5_next" || arch == "deepseek_v41") &&
                             name == "token_embd.weight" &&
                             (GetLowMemMode() || !GetCudaEmbedding()) &&
                             ggml_is_quantized(tensors[i].first.type);

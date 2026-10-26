@@ -8,6 +8,42 @@ legacy choice list.
 
 MODELSCOPE_DOWNLOAD_GROUPS = (
     {
+        "id": "deepseek-v41",
+        "label": "DeepSeek · V4.1 Flash",
+        "description": "大 MoE 混合推理模型，建议使用自动规划器部署。",
+        "accent": "orange",
+        "models": (
+            {
+                "preset": "deepseek-v41-flash-1017",
+                "id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+                "label": "DeepSeek V4.1 Flash · 1017",
+                "meta": "约 510 GB · 混合推理",
+                "include": "",
+            },
+            {
+                "preset": "deepseek-v41-fastllm-3.0bit",
+                "id": "huangyuyang/DeepSeek-V4.1-Flash-1017-Fastllm-3.0bit",
+                "label": "Fastllm · 3.0bit",
+                "meta": "Fastllm 量化 · 完整仓库",
+                "include": "",
+            },
+            {
+                "preset": "deepseek-v41-fastllm-2.5bit",
+                "id": "huangyuyang/DeepSeek-V4.1-Flash-1017-Fastllm-2.5bit",
+                "label": "Fastllm · 2.5bit",
+                "meta": "Fastllm 量化 · 完整仓库",
+                "include": "",
+            },
+            {
+                "preset": "deepseek-v41-fastllm-2.0bit",
+                "id": "huangyuyang/DeepSeek-V4.1-Flash-1017-Fastllm-2.0bit",
+                "label": "Fastllm · 2.0bit",
+                "meta": "Fastllm 量化 · 完整仓库",
+                "include": "",
+            },
+        ),
+    },
+    {
         "id": "qwen38-27b",
         "label": "Qwen3.8 · 27B",
         "description": "稠密主模型，覆盖原始、FP8、NVFP4 与 DFlash2 草稿权重。",
@@ -83,21 +119,6 @@ MODELSCOPE_DOWNLOAD_GROUPS = (
                 "label": "GSQ-RCO Coder · IQ1_M",
                 "meta": "代码场景",
                 "include": "IQ1_M/*,mmproj-*.gguf",
-            },
-        ),
-    },
-    {
-        "id": "deepseek-v41",
-        "label": "DeepSeek · V4.1 Flash",
-        "description": "大 MoE 混合推理模型，建议使用自动规划器部署。",
-        "accent": "orange",
-        "models": (
-            {
-                "preset": "deepseek-v41-flash-1017",
-                "id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
-                "label": "DeepSeek V4.1 Flash · 1017",
-                "meta": "约 510 GB · 混合推理",
-                "include": "",
             },
         ),
     },
