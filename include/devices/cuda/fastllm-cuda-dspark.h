@@ -21,4 +21,12 @@ bool FastllmCudaDeepSeekV41MarkovChainDevice(const fastllm::Data &logits,
     const fastllm::Data &embedWeight, const fastllm::Data &headWeight, int block,
     fastllm::Data &tokens, fastllm::Data &partialValue, fastllm::Data &partialIndex,
     fastllm::Data &outEmbeds);
+// Full-support temperature sampling. Retains the actual normalized proposal q
+// for chain rejection. The caller supplies a valid anchor in tokens[0]; all
+// outputs stay on device. Scratch can be reused between sequential steps.
+// Like the Qwen Gumbel primitive, warm the fixed vocabulary before capture.
+bool FastllmCudaDeepSeekV41MarkovSampleDevice(const fastllm::Data &logits,
+    const fastllm::Data &embedWeight, const fastllm::Data &headWeight,
+    int block, float temperature, fastllm::Data &tokens, fastllm::Data &probs,
+    fastllm::Data &scratch, fastllm::Data &outEmbeds);
 }

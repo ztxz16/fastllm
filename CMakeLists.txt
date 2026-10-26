@@ -1727,6 +1727,13 @@ if (UNIT_TEST)
         add_test(NAME deepseek_v41_sm120_prefill COMMAND deepseek_v41_sm120_prefill_test)
         set_tests_properties(deepseek_v41_sm120_prefill PROPERTIES
                              LABELS cuda TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_executable(deepseekV41DsparkSamplingRegression test/ops/deepseekV41DsparkSamplingRegression.cpp)
+        target_include_directories(deepseekV41DsparkSamplingRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_compile_definitions(deepseekV41DsparkSamplingRegression PRIVATE CUDA_API_PER_THREAD_DEFAULT_STREAM)
+        target_link_libraries(deepseekV41DsparkSamplingRegression PRIVATE fastllm)
+        add_test(NAME deepseek_v41_dspark_sampling COMMAND deepseekV41DsparkSamplingRegression)
+        set_tests_properties(deepseek_v41_dspark_sampling PROPERTIES
+                             LABELS cuda TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_executable(deepseek_v41_hybrid_attention_test test/basic/test_deepseek_v41_hybrid_attention.cpp)
         target_include_directories(deepseek_v41_hybrid_attention_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         target_link_libraries(deepseek_v41_hybrid_attention_test PRIVATE fastllm)

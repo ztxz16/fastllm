@@ -71,6 +71,8 @@ namespace fastllm {
     struct DeepSeekV41DsparkWorkspace {
         int block = 0, width = 0;
         bool disabled = false, parallelExperts = true, deviceInputs = false, parallelAttention = false;
+        bool sampledMarkov = false;
+        float temperature = 1.0f;
         std::vector<int> devices;
         std::vector<void*> cachePointers;
         Data input, preMix, indices, position, headHidden, normalized, logits;
@@ -2207,22 +2209,38 @@ namespace fastllm {
         // A full window has a fixed gather width. Short prefixes, CPU routing,
         // reference math and unsupported expert layouts keep the eager path.
         std::unique_lock<std::mutex> graphLock(v41CudaGraphMutex, std::defer_lock);
+        const int vocab = weight["head.weight"].dims[0];
+        const bool fusedMarkovAllowed = !config.tool_call_name_constraint_enabled &&
+            !config.tool_call_parameter_name_constraint_enabled && !DsEnvFlag("FASTLLM_DSPARK_DISABLE_FUSED_MARKOV");
+        auto denseMarkovWeight = [](const Data &w) {
+            return !w.multiDeviceData && w.dims.size() == 2 && w.strides.size() == 2 &&
+                w.strides[0] == w.dims[1] && w.strides[1] == 1;
+        };
+        // Filtered and constrained proposals retain the general sampler. The
+        // full-support path saves its actual conditional q for rejection.
+        const bool sampledMarkov = randomDraft && config.top_k >= vocab && config.top_p == 1.0f &&
+            std::isfinite(config.temperature) && config.temperature > 0.0f &&
+            denseMarkovWeight(markovEmbedWeight) && denseMarkovWeight(markovHeadWeight);
+        auto prepareProposalProbs = [&](int device, int vocabulary) {
+            FastllmCudaSetDevice(device);
+            dspark.proposalProbs.ToDevice(DataDevice::CUDA, {device}, false);
+            dspark.proposalProbs.Resize({block, vocabulary});
+            dspark.proposalProbs.Allocate();
+        };
         const bool graphMarkov = markovEmbedWeight.dims.size() == 2 && markovHeadWeight.dims.size() == 2 &&
             markovEmbedWeight.dims[1] > 0 && markovEmbedWeight.dims[1] <= 512 &&
             markovHeadWeight.dims[1] == markovEmbedWeight.dims[1] &&
-            markovEmbedWeight.dims[0] >= weight["head.weight"].dims[0] &&
-            markovHeadWeight.dims[0] >= weight["head.weight"].dims[0] &&
+            markovEmbedWeight.dims[0] >= vocab && markovHeadWeight.dims[0] >= vocab &&
             anchorToken >= 0 && anchorToken < markovEmbedWeight.dims[0] &&
             markovEmbedWeight.dataType == markovHeadWeight.dataType &&
             (markovEmbedWeight.dataType == DataType::BFLOAT16 ||
              markovEmbedWeight.dataType == DataType::FLOAT16 || markovEmbedWeight.dataType == DataType::FLOAT32);
         const bool graphEligible = graphMarkov && DsDraftGraphEnabled() && valid == window_size && block <= 8 &&
-            !randomDraft && !config.tool_call_name_constraint_enabled &&
-            !config.tool_call_parameter_name_constraint_enabled &&
-            !DsEnvFlag("FASTLLM_DSPARK_DISABLE_FUSED_MARKOV") &&
+            fusedMarkovAllowed && (!randomDraft || sampledMarkov) &&
             v41MoeCudaGraphCompatible &&
             v41DsparkTpDevices.size() > 1 &&
             !DsEnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") && !DsEnvFlag("FASTLLM_DISABLE_NCCL");
+        if (graphEligible && randomDraft) prepareProposalProbs(FastllmCudaGetDevice(), vocab);
         const Data &embedding = weight["embed.weight"];
         const bool deviceInputs = graphEligible && embedding.dataType == DataType::BFLOAT16 &&
             embedding.dataDevice == DataDevice::CUDA && embedding.cudaData && !embedding.multiDeviceData &&
@@ -2235,16 +2253,20 @@ namespace fastllm {
         std::vector<void*> cachePointers;
         for (auto &layer : dspark.layers) cachePointers.push_back(layer.windowKV.cudaData);
         if (deviceInputs) cachePointers.push_back(embedding.cudaData);
+        if (sampledMarkov) cachePointers.push_back(dspark.proposalProbs.cudaData);
         if (graphEligible && (deviceInputs || embedded.dataDevice == DataDevice::CUDA) && graphLock.try_lock()) {
             if (dspark.workspace && (dspark.workspace->devices != v41DsparkTpDevices ||
                 dspark.workspace->block != block || dspark.workspace->width != width ||
                 dspark.workspace->deviceInputs != deviceInputs ||
+                dspark.workspace->sampledMarkov != sampledMarkov ||
+                (sampledMarkov && dspark.workspace->temperature != config.temperature) ||
                 dspark.workspace->cachePointers != cachePointers)) dspark.workspace.reset();
             if (!dspark.workspace) {
                 dspark.workspace = std::make_shared<DeepSeekV41DsparkWorkspace>();
                 auto &w = *dspark.workspace;
                 w.devices = v41DsparkTpDevices; w.block = block; w.width = width;
                 w.deviceInputs = deviceInputs;
+                w.sampledMarkov = sampledMarkov; w.temperature = config.temperature;
                 w.cachePointers = cachePointers;
             }
             if (!dspark.workspace->disabled) {
@@ -2552,7 +2574,7 @@ namespace fastllm {
             const double headStart = DsTick();
             bool headProjected = false, shardedMarkov = false;
 #ifdef USE_CUDA
-            if (graphState && normed.dataType == DataType::BFLOAT16 &&
+            if (graphState && !randomDraft && normed.dataType == DataType::BFLOAT16 &&
                 !quantizedLinearNames.count("head.weight")) {
                 ApplyDsparkDevice(); FastllmMultiCudaSetDevice(v41DsparkTpDevices);
                 MultiCudaDsparkMarkovRequest request{markovEmbedWeight, markovHeadWeight,
@@ -2575,8 +2597,12 @@ namespace fastllm {
             if (graphState && !v41DsparkHeadWorkspace) graphState->disabled = true;
 #ifdef USE_CUDA
             if (graphState && !shardedMarkov) {
-                AssertInFastLLM(FastllmCudaDeepSeekV41MarkovChainDevice(logits, markovEmbedWeight, markovHeadWeight,
-                    block, graphState->markovTokens, graphState->markovValues, graphState->markovIndices, markovAll),
+                const bool ok = randomDraft ? FastllmCudaDeepSeekV41MarkovSampleDevice(logits,
+                    markovEmbedWeight, markovHeadWeight, block, config.temperature,
+                    graphState->markovTokens, dspark.proposalProbs, graphState->markovValues, markovAll) :
+                    FastllmCudaDeepSeekV41MarkovChainDevice(logits, markovEmbedWeight, markovHeadWeight,
+                    block, graphState->markovTokens, graphState->markovValues, graphState->markovIndices, markovAll);
+                AssertInFastLLM(ok,
                     "DeepSeekV41 DSpark device Markov chain rejected input.");
             }
 #endif
@@ -2589,28 +2615,20 @@ namespace fastllm {
 
         // ---- markov head：逐位置加 bigram 偏置后生成候选 ----
         //
-        // 这条链天然串行（每一步要用上一步的 token 去查嵌入），用通用算子拼出来的话
-        // 每步都得把 token 取回主机，于是每步一次完整的设备同步。实测迷你模型上 5 步
-        // 就要 2.6 ms，比整个目标模型的一次前向还贵，而 DSpark 在真实模型上的总收益
-        // 也才几毫秒。所以 CUDA 上走一个把整条链留在设备上的融合 kernel，
-        // 主机只在最后取回一次；其它设备（或 dtype / 布局不满足前提时）退回下面的通用实现。
+        // CUDA 融合路径把串行 token 依赖留在设备上，每轮只回读一次。
+        // 截断采样、工具约束及不支持的 dtype / 布局继续使用通用实现。
         const double markovStart = DsTick();
         dspark.sampledProposal = randomDraft;
-#ifdef USE_CUDA
-        if (randomDraft) {
-            AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.cudaData,
-                            "DeepSeekV41 DSpark: random draft logits must be on CUDA.");
-            const int device = logits.dataDeviceIds.empty() ? FastllmCudaGetDevice() : logits.dataDeviceIds[0];
-            FastllmCudaSetDevice(device);
-            dspark.proposalProbs.ToDevice(DataDevice::CUDA, {device}, false);
-            dspark.proposalProbs.Resize({block, logits.dims.back()});
-            dspark.proposalProbs.Allocate();
-        }
-#endif
         const int markovRank = markovEmbedWeight.dims.size() == 2 ? markovEmbedWeight.dims[1]
                                                                   : v41DsparkMarkovRank;
         bool fusedMarkov = false;
 #ifdef USE_CUDA
+        if (randomDraft && !graphState) {
+            AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.cudaData,
+                            "DeepSeekV41 DSpark: random draft logits must be on CUDA.");
+            const int device = logits.dataDeviceIds.empty() ? FastllmCudaGetDevice() : logits.dataDeviceIds[0];
+            prepareProposalProbs(device, logits.dims.back());
+        }
         if (graphState) {
             tokens.resize(block);
             FastllmCudaCopyFromDeviceToHost(tokens.data(), (int*)graphState->markovTokens.cudaData + 1,
@@ -2618,12 +2636,26 @@ namespace fastllm {
             fusedMarkov = true;
             DsDraftTimingSlot().markovFused = true;
         }
-        if (!fusedMarkov && !randomDraft && !config.tool_call_name_constraint_enabled &&
-            !config.tool_call_parameter_name_constraint_enabled && !DsEnvFlag("FASTLLM_DSPARK_DISABLE_FUSED_MARKOV") && logits.dataDevice == DataDevice::CUDA) {
+        if (!fusedMarkov && fusedMarkovAllowed && logits.dataDevice == DataDevice::CUDA &&
+            (!randomDraft || (sampledMarkov && graphMarkov && block <= 8))) {
+            if (!logits.dataDeviceIds.empty()) FastllmCudaSetDevice(logits.dataDeviceIds[0]);
             markovEmbedWeight.ToDevice(DataDevice::CUDA);
             markovHeadWeight.ToDevice(DataDevice::CUDA);
-            fusedMarkov = FastllmCudaDeepSeekV41MarkovChain(logits, markovEmbedWeight, markovHeadWeight,
-                                                            anchorToken, block, tokens, markovAll);
+            if (randomDraft) {
+                Data tokenBuffer(DataType::INT32, {block + 1}), scratch;
+                tokenBuffer.ToDevice(DataDevice::CUDA, {FastllmCudaGetDevice()}, false);
+                tokenBuffer.Allocate();
+                FastllmCudaCopyFromHostToDevice(tokenBuffer.cudaData, &anchorToken, sizeof(int));
+                fusedMarkov = FastllmCudaDeepSeekV41MarkovSampleDevice(logits, markovEmbedWeight,
+                    markovHeadWeight, block, config.temperature, tokenBuffer, dspark.proposalProbs, scratch, markovAll);
+                if (fusedMarkov) {
+                    tokens.resize(block);
+                    FastllmCudaCopyFromDeviceToHost(tokens.data(), (int*)tokenBuffer.cudaData + 1, block * sizeof(int));
+                }
+            } else {
+                fusedMarkov = FastllmCudaDeepSeekV41MarkovChain(logits, markovEmbedWeight, markovHeadWeight,
+                    anchorToken, block, tokens, markovAll);
+            }
             DsDraftTimingSlot().markovFused = fusedMarkov;
         }
 #endif
