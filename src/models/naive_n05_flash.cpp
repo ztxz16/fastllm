@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include "devices/cuda/naive-n05-cuda.cuh"
 #ifdef USE_CUDA
+#include "naive_n05_indexer_tp.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
@@ -1106,6 +1107,13 @@ Data NaiveN05FlashModel::RunTarget(
                     const bool parallelIndex = !decodeWorkspace && !verifying && tpEp8MegaState && ranks > 1 &&
                         (!indexerLayerSharding || tpIndexerPeerAccess) && length % (ranks * 64) == 0 &&
                         (int64_t)(length / (2 * ranks)) * pastKey.dims[1] >= 1024 * 1024;
+                    // Prefix restoration often leaves a non-64-aligned query tail.
+                    // Partition those queries too, retaining the original score dispatch.
+                    const bool raggedParallelIndex = !decodeWorkspace && !verifying && tensorParallel &&
+                        ranks > 1 && !indexerLayerSharding && indexFp8 && indexHeads == 16 && indexDim == 128 &&
+                        length % (ranks * 64) != 0 && length >= ranks * 128 &&
+                        (int64_t)RaggedIndexerRows(length, ranks) * indexTopK <= INT_MAX &&
+                        (int64_t)(length / ranks) * pastKey.dims[1] >= 1024 * 1024;
                     if ((localIndexer || parallelIndex) && !batchIndexerPrepared) {
                         Data rowIndexQ, rowIndexWeights;
                         Data &indexQ = batchIndexPrepared ? rowIndexQ : buf.indexQ;
@@ -1228,6 +1236,18 @@ Data NaiveN05FlashModel::RunTarget(
                                 }
                                 FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, indices);
                                 if (balanced) balancedIndexRanks = ranks;
+                            }
+                            else if (raggedParallelIndex) {
+                                Data temporary;
+                                Data &gathered = length % ranks ? temporary : indices;
+                                ScoreRaggedIndexer(indexQ, indexWeights, *scoreKey, localPast,
+                                    indexTopK, indexFp8, tpRank, ranks, gathered);
+                                const int rows = RaggedIndexerRows(length, ranks);
+                                AssertInFastLLM(FastllmNcclAllGather(
+                                    (int *)gathered.cudaData + (size_t)tpRank * rows * indexTopK,
+                                    gathered.cudaData, rows * indexTopK, INT32, gpu),
+                                    "Ragged Indexer AllGather failed.");
+                                if (length % ranks) CompactRaggedIndexer(gathered, length, ranks, indices);
                             }
                             else FastllmCudaNaiveIndexer(indexQ, indexWeights, *scoreKey, indexHeads, indexDim,
                                                         localPast, indexTopK, indexFp8, indices);

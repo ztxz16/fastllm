@@ -1,4 +1,5 @@
 #include "fastllm.h"
+#include "../../src/models/naive_n05_indexer_tp.h"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "utils/utils.h"
 #include <cuda_runtime_api.h>
@@ -235,12 +236,32 @@ static void TestIndexerPrefillShards() {
     }
 }
 
+static void TestIndexerRaggedShards() {
+    for (int rows : {513, 1025, 4144}) for (int ranks : {2, 4, 8}) {
+        if (rows < ranks * 128) continue;
+        constexpr int past = 8192, heads = 16, dim = 128, topK = 2048;
+        Data q(BFLOAT16), w(BFLOAT16), key(BFLOAT16), full, gathered, compact;
+        Upload(q, {1, rows, heads * dim}, 53);
+        Upload(w, {1, rows, heads}, 71);
+        Upload(key, {1, past + rows, dim}, 113);
+        for (bool tied : {false, true}) {
+            if (tied) Require(cudaMemset(w.cudaData, 0, w.GetBytes()) == cudaSuccess, "zero weights failed");
+            FastllmCudaNaiveIndexer(q, w, key, heads, dim, past, topK, true, full);
+            for (int rank = 0; rank < ranks; ++rank)
+                ScoreRaggedIndexer(q, w, key, past, topK, true, rank, ranks, gathered);
+            CompactRaggedIndexer(gathered, rows, ranks, compact);
+            Require(Read<int>(full) == Read<int>(compact), "Ragged Indexer changed exact TopK ordering");
+            ++checks;
+        }
+    }
+}
+
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     try {
         SetThreads(4);
-        TestAttentionGroupedScores(); TestAttentionSwa(); TestIndexerPrefillShards();
+        TestAttentionGroupedScores(); TestAttentionSwa(); TestIndexerPrefillShards(); TestIndexerRaggedShards();
         Require(cudaDeviceSynchronize()==cudaSuccess,"prefill CUDA synchronization failed");
         std::printf("Naive prefill regression passed: %d cases\n",checks);
     } catch (const std::exception &e) { std::fprintf(stderr,"%s\n",e.what()); return 1; }
