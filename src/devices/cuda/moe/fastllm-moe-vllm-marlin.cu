@@ -54,7 +54,7 @@ using MarlinMoeKernelFn = void (*)(
     int, bool, int, int, int, int, int *, bool, bool, bool);
 
 static MarlinMoeKernelFn GetMarlinMoeKernel(int threadK, int threadN,
-                                            int &threads, int tileRows = 8) {
+                                            int &threads, int tileRows = 8, bool foldBias = false) {
     if (tileRows == 32 && threadK == 64 && threadN == 128) {
         threads = 128;
         return marlin_kernel::Marlin<
@@ -71,6 +71,11 @@ static MarlinMoeKernelFn GetMarlinMoeKernel(int threadK, int threadN,
     }
     if (threadK == 64 && threadN == 128) {
         threads = 128;
+        if (foldBias) return marlin_kernel::Marlin<
+            marlin_types::kBFloat16.id(), marlin_types::kFE2M1f.id(),
+            marlin_types::kBFloat16.id(), marlin_types::kFE8M0fnu.id(),
+            128, 1, 8, 4, true, 4, 2, false, false, false, true>;
+
         return marlin_kernel::Marlin<
             marlin_types::kBFloat16.id(), marlin_types::kFE2M1f.id(),
             marlin_types::kBFloat16.id(), marlin_types::kFE8M0fnu.id(),
@@ -247,6 +252,17 @@ static bool PrepareMarlinMoeKernels(int device) {
     return true;
 }
 
+// Optional exact-arithmetic MXFP4 specialization. Readiness is established
+// while building the layer cache, never inside CUDA Graph capture.
+static bool PrepareMarlinMoeFoldedBiasKernel() {
+    int threads = 0;
+    auto kernel = GetMarlinMoeKernel(64, 128, threads, 8, true);
+    const bool ready = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        GetMarlinMoeSharedMemorySize(64, 128)) == cudaSuccess;
+    if (!ready) cudaGetLastError();
+    return ready;
+}
+
 // Optional prefill tile. The ordinary eight-row kernels remain usable on
 // devices that cannot launch it.
 static bool PrepareMarlinMoePrefillKernel(int device) {
@@ -335,9 +351,9 @@ static bool LaunchMarlinMoe(
         int topk, bool multiplyTopkWeights, int numGroups, int rows,
         int outputColumns, int inputColumns, int *workspace,
         cudaStream_t stream, int threadK, int threadN, int sms,
-        int blocksPerSm, int tileRows = 8) {
+        int blocksPerSm, int tileRows = 8, bool foldBias = false) {
     int threads = 0;
-    MarlinMoeKernelFn kernel = GetMarlinMoeKernel(threadK, threadN, threads, tileRows);
+    MarlinMoeKernelFn kernel = GetMarlinMoeKernel(threadK, threadN, threads, tileRows, foldBias);
     if (kernel == nullptr || activation == nullptr || weight == nullptr ||
         output == nullptr || temporaryOutput == nullptr || scales == nullptr ||
         sortedTokenIds == nullptr || expertIds == nullptr ||
@@ -540,7 +556,7 @@ __global__ void InspectRowPackedNvfp4Kernel(const uint8_t *source, int rows,
 // not alter the byte; only the two permutations need to be materialized.
 __global__ void PermuteMxfp4ScalesKernel(const uint8_t *__restrict__ source,
                                          uint8_t *__restrict__ destination,
-                                         int outputRows, int groups) {
+                                         int outputRows, int groups, int *unsafeBias = nullptr) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     int count = outputRows * groups;
     if (id >= count) {
@@ -558,7 +574,11 @@ __global__ void PermuteMxfp4ScalesKernel(const uint8_t *__restrict__ source,
     int transposedFlat = block + scaleSource;
     int group = transposedFlat / outputRows;
     int row = transposedFlat - group * outputRows;
-    destination[id] = source[(size_t)row * groups + group];
+    const uint8_t exponent = source[(size_t)row * groups + group];
+    destination[id] = exponent;
+    // Preserve the compact scales for every fallback and other batch shape.
+    // One unsafe byte disables bias folding for the whole layer.
+    if (unsafeBias && (exponent == 0 || exponent >= 128)) atomicExch(unsafeBias, 1);
 }
 
 // Convert planar raw E4M3 block-16 scales into Marlin's special S0E5M3
@@ -1557,6 +1577,7 @@ struct MarlinLayerCache {
     std::atomic<bool> retired {false};
     int device = -1;
     int computeMajor = 0;
+    bool foldMxfp4Bias = false;
     int experts = 0;
     int hidden = 0;
     int intermediate = 0;
@@ -1731,6 +1752,12 @@ static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
     cache.intermediate = intermediate;
     cache.topk = topk;
     cache.sms = sms;
+    int minor = 0;
+    cache.foldMxfp4Bias = cache.computeMajor == 9 && sms == 78 &&
+        hidden == 5120 && intermediate == 2304 &&
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
+        minor == 0 && PrepareMarlinMoeFoldedBiasKernel();
+
     cache.gateWeight = (uint8_t *)AllocateDirect(gateWeightBytes * experts);
     cache.downWeight = (uint8_t *)AllocateDirect(downWeightBytes * experts);
     cache.gateScale = (uint8_t *)AllocateDirect(gateScaleBytes * experts);
@@ -1761,7 +1788,7 @@ static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
     }
 
     size_t transposeBytes = std::max(gateWeightBytes, downWeightBytes);
-    uint32_t *transposed = (uint32_t *)AllocateDirect(transposeBytes);
+    uint32_t *transposed = (uint32_t *)AllocateDirect(transposeBytes + sizeof(int));
     if (transposed == nullptr) {
         ReleaseCacheStorage(cache);
         return false;
@@ -1772,6 +1799,11 @@ static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
     cudaError_t state = cudaMemsetAsync(cache.workspace, 0,
                                         (size_t)sms * 4 * sizeof(int), stream);
     success = state == cudaSuccess;
+    int unsafeBias = 0;
+    int *unsafeBiasDevice = cache.foldMxfp4Bias ?
+        reinterpret_cast<int *>(reinterpret_cast<uint8_t *>(transposed) + transposeBytes) : nullptr;
+    if (success && unsafeBiasDevice)
+        success = cudaMemsetAsync(unsafeBiasDevice, 0, sizeof(int), stream) == cudaSuccess;
     constexpr int threads = 256;
     for (int expert = 0; expert < experts && success; ++expert) {
         int slot = 2 + expert * 2;
@@ -1797,7 +1829,7 @@ static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
                                    threads, 0, stream>>>(
             (const uint8_t *)gate->cudaData + gateWeightBytes,
             cache.gateScale + gateScaleBytes * expert,
-            intermediate * 2, hidden / 32);
+            intermediate * 2, hidden / 32, unsafeBiasDevice);
 
         int downPackedK = intermediate / 8;
         int downWords = hidden * downPackedK;
@@ -1817,12 +1849,16 @@ static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
                                    threads, 0, stream>>>(
             (const uint8_t *)down->cudaData + downWeightBytes,
             cache.downScale + downScaleBytes * expert,
-            hidden, intermediate / 32);
+            hidden, intermediate / 32, unsafeBiasDevice);
         success = cudaGetLastError() == cudaSuccess;
     }
+    if (success && unsafeBiasDevice)
+        success = cudaMemcpyAsync(&unsafeBias, unsafeBiasDevice, sizeof(int),
+                                  cudaMemcpyDeviceToHost, stream) == cudaSuccess;
     if (success) {
         success = cudaStreamSynchronize(stream) == cudaSuccess;
     }
+    cache.foldMxfp4Bias = cache.foldMxfp4Bias && unsafeBias == 0;
     ReleaseDirect(transposed);
     if (!success) {
         ReleaseCacheStorage(cache);
@@ -3970,6 +4006,7 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
             const bool h20Compact = deepSeekV41 && compactRoutes &&
                 cache->computeMajor == 9 && cache->sms == 78 && cache->hidden == 5120 &&
                 cache->intermediate == 2304;
+            const bool foldMxfp4Bias = h20Compact && cache->foldMxfp4Bias;
             if (compactRoutes) {
                 BuildGroupedMoeRowsKernel<<<1, 128, 0, cudaStreamPerThread>>>(
                     chunkIndices, sortedTokenIds, expertIds, nullptr,
@@ -3997,7 +4034,7 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                     cache->numTokensPadded, chunkScores, topk, false, gateGroups,
                     count, cache->intermediate * 2, cache->hidden,
                     cache->workspace, cudaStreamPerThread, tileRows == 32 || compactRoutes ? 64 : gateThreadK,
-                    gateThreadN, cache->sms, h20Compact ? 4 : tileRows == 32 ? 2 : gateBlocksPerSm, tileRows) ||
+                    gateThreadN, cache->sms, h20Compact ? 4 : tileRows == 32 ? 2 : gateBlocksPerSm, tileRows, foldMxfp4Bias) ||
                 !checkStage("grouped gate/up GEMM")) {
                 return false;
             }
@@ -4013,7 +4050,7 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                     cache->numTokensPadded, chunkScores, 1, !deepSeekV41, downGroups,
                     routes, cache->hidden, cache->intermediate,
                     cache->workspace, cudaStreamPerThread, downThreadK,
-                    downThreadN, cache->sms, h20Compact ? 4 : tileRows == 32 ? 2 : downBlocksPerSm, tileRows) ||
+                    downThreadN, cache->sms, h20Compact ? 4 : tileRows == 32 ? 2 : downBlocksPerSm, tileRows, foldMxfp4Bias) ||
                 !checkStage("grouped down GEMM")) {
                 return false;
             }
