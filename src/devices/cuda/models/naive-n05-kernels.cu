@@ -8,6 +8,7 @@
 #include "naive-n05-attention-hopper.cuh"
 #include "naive-n05-prefill.cuh"
 #include "naive-n05-prefill-hopper.cuh"
+#include "naive-n05-prefill-split.cuh"
 #ifdef FASTLLM_ENABLE_NAIVE_QKV_SM90
 #include "naive-n05-qkv.cuh"
 #endif
@@ -3210,6 +3211,26 @@ static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
         readKey = &stagedKey; readValue = &stagedValue;
     }
     Output(output, BFLOAT16, {1, queries, heads * 128});
+    // Split the long sparse case to keep full probabilities out of CTA
+    // shared memory. Preserve the exact normalized BF16 values and PV order.
+    if (groupedHeads == 16 && count == 2048 &&
+        (uint64_t)queries * heads * 2056 * sizeof(BF16) <= (size_t(512) << 20)) {
+        Data probabilities;
+        Output(probabilities, BFLOAT16, {queries, heads, 2056});
+        auto *p = (BF16 *)probabilities.cudaData;
+        const auto *ids = indices.dims.empty() ? nullptr : (const int *)indices.cudaData;
+        const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        mma::SplitQK<2048,0,2><<<dim3(queries,heads/16),256,sizeof(mma::QKStorage<2>)>>>(
+            (const BF16 *)query.cudaData, FastllmNaiveKV(*readKey),
+            ids, p, heads, kvHeads, key.dims[2], keys, count, pastLength, causal, indexTile);
+        mma::SplitNormalize<2048><<<dim3(queries,heads/8),256>>>(p,bias,heads,count);
+        mma::SplitPV<2048,0,2><<<dim3(queries,heads/16),256,sizeof(mma::PVStorage<2>)>>>(
+            p, FastllmNaiveKV(*readValue), ids,
+            (BF16 *)output.cudaData, heads, kvHeads, keys, count,
+            pastLength, causal, indexTile);
+        CheckLaunch();
+        return true;
+    }
     kernel<<<dim3(queries, heads / groupedHeads), 256, shared>>>(
         (const BF16 *)query.cudaData, FastllmNaiveKV(*readKey), FastllmNaiveKV(*readValue),
         indices.dims.empty() ? nullptr : (const int *)indices.cudaData,

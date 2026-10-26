@@ -1955,6 +1955,12 @@ if (UNIT_TEST)
             "PASS: exact sampled TopK" 120)
         set_tests_properties(naive_n05_topk_threshold PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
+        add_executable(naive_n05_prefill_split_test test/basic/test_naive_n05_prefill_split.cu)
+        set_target_properties(naive_n05_prefill_split_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(naive_n05_prefill_split naive_n05_prefill_split_test
+            "PASS: split prefill attention" 120)
+        set_tests_properties(naive_n05_prefill_split PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
         add_executable(naive_n05_prefill_test test/basic/test_naive_n05_prefill.cpp)
         target_link_libraries(naive_n05_prefill_test PRIVATE fastllm)
         target_include_directories(naive_n05_prefill_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
