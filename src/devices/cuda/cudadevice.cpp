@@ -8923,6 +8923,9 @@ namespace fastllm {
 
     struct CudaMergeMoeFromCpuWorkspace {
         std::mutex mutex;
+#ifdef FASTLLM_ENABLE_DSV41_MXFP4_SM120
+        Data mxfp4Scratch;
+#endif
 #ifndef USE_ROCM
         Data ggufGate;
         Data ggufWorkspace;
@@ -9315,9 +9318,13 @@ namespace fastllm {
             } else {
                 DoCudaLinearReshape(
                     tempInput, *weights[i * 2], tempMiddle);
-                DoCudaLinear(
-                    tempInput, *weights[i * 2],
-                    *GetEmptyData(), tempMiddle);
+                bool nativeGate = false;
+#ifdef FASTLLM_ENABLE_DSV41_MXFP4_SM120
+                if (deepSeekV41Mode && i != 0)
+                    nativeGate = FastllmCudaV41Mxfp4Linear(tempInput, *weights[i * 2],
+                        tempMiddle, workspace.mxfp4Scratch);
+#endif
+                if (!nativeGate) DoCudaLinear(tempInput, *weights[i * 2], *GetEmptyData(), tempMiddle);
 
                 if (deepSeekV4Mode) {
                     AssertInFastLLM(
@@ -9335,9 +9342,13 @@ namespace fastllm {
                 }
                 DoCudaLinearReshape(
                     tempSwiglu, *weights[i * 2 + 1], tempOutput);
-                DoCudaLinear(
-                    tempSwiglu, *weights[i * 2 + 1],
-                    *GetEmptyData(), tempOutput);
+                bool nativeDown = false;
+#ifdef FASTLLM_ENABLE_DSV41_MXFP4_SM120
+                if (deepSeekV41Mode && i != 0)
+                    nativeDown = FastllmCudaV41Mxfp4Linear(tempSwiglu, *weights[i * 2 + 1],
+                        tempOutput, workspace.mxfp4Scratch);
+#endif
+                if (!nativeDown) DoCudaLinear(tempSwiglu, *weights[i * 2 + 1], *GetEmptyData(), tempOutput);
             }
 
             if (deepSeekV41Mode) {

@@ -537,9 +537,12 @@ if (USE_CUDA)
             ${FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE}
             ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE}
             src/devices/cuda/linear/fastllm-linear-fp8-mxfp8.cu
+            src/devices/cuda/moe/fastllm-moe-mxfp4-sm120.cu
             src/devices/cuda/linear/fastllm-native-nvfp4-tma-sm120.cu)
         set_property(SOURCE src/fastllm.cpp src/models/deepseekv41.cpp
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)
+        set_property(SOURCE src/devices/cuda/cudadevice.cpp
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DSV41_MXFP4_SM120)
         set_source_files_properties(
             src/devices/cuda/linear/fastllm-native-lowbit-prefill.cu
             PROPERTIES COMPILE_DEFINITIONS FASTLLM_NATIVE_PREFILL_SM120)
@@ -1426,6 +1429,11 @@ if (UNIT_TEST)
     if (USE_CUDA)
         target_include_directories(deepseekV41PrecisionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         if (FASTLLM_CUDA_SM120_SOURCES)
+            add_executable(cuda_v41_mxfp4_test test/basic/test_cuda_v41_mxfp4.cpp)
+            target_link_libraries(cuda_v41_mxfp4_test PRIVATE fastllm)
+            target_include_directories(cuda_v41_mxfp4_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(cuda_v41_mxfp4 cuda_v41_mxfp4_test "PASS V4.1 W4A8:" 300)
+            set_tests_properties(cuda_v41_mxfp4 PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
             add_executable(cuda_mxfp8_linear_test test/basic/test_cuda_mxfp8_linear.cpp)
             target_link_libraries(cuda_mxfp8_linear_test PRIVATE fastllm)
             target_include_directories(cuda_mxfp8_linear_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

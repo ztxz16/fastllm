@@ -552,6 +552,9 @@ bool FastllmCudaSigmoidMulTo(fastllm::Data &input,
 bool FastllmCudaClamp(fastllm::Data &input, bool hasMin, float minValue, bool hasMax, float maxValue);
 bool FastllmCudaGlm5NextClampedSilu(const fastllm::Data &input, float limit, fastllm::Data &output);
 
+// Input must already use V4.1's block-32 activation quantization.
+bool FastllmCudaV41Mxfp4Linear(const fastllm::Data &input, const fastllm::Data &weight,
+                             fastllm::Data &output, fastllm::Data &scratch);
 // FP32 routed-expert sum and BF16 shared expert, with an explicit BF16
 // rounding boundary before the HC residual transform.
 bool FastllmCudaDeepSeekV41MoeHcPost(const fastllm::Data &input,
