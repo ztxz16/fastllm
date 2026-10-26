@@ -511,12 +511,18 @@ void SortTopKPairs(const unsigned *input, const int *positions, int count,
 // Select a bounded superset of the top K before sorting it. A radix prefix can
 // stop as soon as at most capacity entries remain; no possible winner is lost.
 // If equal scores straddle a full candidate buffer, retain the lowest indices.
+template<bool Sampled>
 __device__ __forceinline__ void SelectTopKCompactRow(const float *input, unsigned long long *selected, int *offsets,
                                   int queries, int count, int topK, int capacity) {
     constexpr int threads = 256, warps = threads / 32;
     using Scan = cub::BlockScan<int, threads>;
     __shared__ typename Scan::TempStorage scan;
-    __shared__ int histogram[warps][256];
+    using SampleSort = cub::BlockRadixSort<unsigned, threads, 4>;
+    __shared__ union {
+        int histogram[warps][256];
+        typename SampleSort::TempStorage sampleSort;
+    } temporary;
+    auto &histogram = temporary.histogram;
     __shared__ unsigned prefix;
     __shared__ int rank, candidateCount, selectedCount, tiesSeen;
     int row = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
@@ -532,6 +538,58 @@ __device__ __forceinline__ void SelectTopKCompactRow(const float *input, unsigne
         for (int col = t; col < count; col += threads)
             output[col] = TopKOrder(OrderedScoreBits(input[col]), col);
         return;
+    }
+    // Estimate a threshold cheaply, but never use an approximate TopK.
+    // The full scan must prove that the retained superset fits and has >= K
+    // entries; otherwise discard it and run the original exact radix search.
+    if constexpr (Sampled) if ((int64_t)count >= 4LL * capacity && keep >= 256) {
+        constexpr int sampleCount = threads * 4;
+        unsigned sampled[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int col = (int)((int64_t)(t * 4 + i) * count / sampleCount);
+            sampled[i] = OrderedScoreBits(input[col]);
+        }
+        // Only estimate a threshold here. Round down after sorting the
+        // high bits; the full scan still proves a bounded exact superset.
+        SampleSort(temporary.sampleSort).SortDescending(sampled, 16, 32);
+        const int sampleRank = max(0, min(sampleCount - 1,
+            (int)(((int64_t)keep + capacity) * sampleCount / (2LL * count)) - 1));
+        if (t == sampleRank / 4) prefix = sampled[sampleRank % 4] & 0xffff0000u;
+        __syncthreads();
+        unsigned threshold = prefix;
+        // One shared reservation per warp and tile, preserving every
+        // candidate and its original index for the exact final sort.
+        constexpr int Items = 8;
+        for (int base = 0; base < count; base += threads * Items) {
+            unsigned bits[Items], ballots[Items];
+            int total = 0;
+            #pragma unroll
+            for (int i = 0; i < Items; ++i) {
+                int col = base + t + i * threads;
+                bits[i] = col < count ? OrderedScoreBits(input[col]) : 0;
+                ballots[i] = __ballot_sync(0xffffffff, col < count && bits[i] >= threshold);
+                total += __popc(ballots[i]);
+            }
+            if (total) {
+                int offset = lane == 0 ? atomicAdd(&selectedCount, total) : 0;
+                offset = __shfl_sync(0xffffffff, offset, 0);
+                #pragma unroll
+                for (int i = 0; i < Items; ++i) {
+                    int pos = offset + __popc(ballots[i] & ((1u << lane) - 1));
+                    if ((ballots[i] & (1u << lane)) && pos < capacity)
+                        output[pos] = TopKOrder(bits[i], base + t + i * threads);
+                    offset += __popc(ballots[i]);
+                }
+            }
+        }
+        __syncthreads();
+        if (selectedCount >= keep && selectedCount <= capacity) {
+            if (t == 0) offsets[queries + row] = row * capacity + selectedCount;
+            return;
+        }
+        if (t == 0) { prefix = 0; rank = keep; selectedCount = 0; tiesSeen = 0; }
+        __syncthreads();
     }
     unsigned mask = 0;
     for (int shift = 24; shift >= 0; shift -= 8) {
@@ -608,11 +666,25 @@ __device__ __forceinline__ void SelectTopKCompactRow(const float *input, unsigne
     }
 }
 
+template<bool Sampled>
 __global__ void SelectTopKCompact(const float *scores, unsigned long long *selected, int *offsets, int queries,
                                   int keys, int queryStart, int topK, int capacity, int partRows = 0, int gap = 0) {
     int row = blockIdx.x;
     int count = queryStart + row + 1 + (partRows && row >= partRows ? gap : 0);
-    SelectTopKCompactRow(scores + (size_t)row * keys, selected, offsets, queries, count, topK, capacity);
+    SelectTopKCompactRow<Sampled>(scores + (size_t)row * keys, selected, offsets, queries, count, topK, capacity);
+}
+// Keep long/short contexts on the original compiled kernel. The sample is
+// useful when its upper tail has enough observations to bracket K reliably.
+void LaunchSelectTopKCompact(const float *scores, unsigned long long *selected, int *offsets,
+                            int queries, int keys, int queryStart, int topK, int capacity,
+                            int partRows = 0, int gap = 0) {
+    if ((int64_t)keys >= 4LL * capacity && (int64_t)keys <= 32LL * capacity && topK >= 256) {
+        SelectTopKCompact<true><<<queries, 256>>>(scores, selected, offsets, queries,
+            keys, queryStart, topK, capacity, partRows, gap);
+    } else {
+        SelectTopKCompact<false><<<queries, 256>>>(scores, selected, offsets, queries,
+            keys, queryStart, topK, capacity, partRows, gap);
+    }
 }
 #ifdef FASTLLM_NAIVE_DSA_MMA
 __global__ void SelectBatchTopK(naive_dsa_mma::PrefillIndexerBatch batch, const float *scores,
@@ -621,7 +693,7 @@ __global__ void SelectBatchTopK(naive_dsa_mma::PrefillIndexerBatch batch, const 
     const auto &e = batch.Find(row);
     int local = row - e.rowOffset;
     int count = e.past + (local < e.part ? e.first + local : e.second + local - e.part) + 1;
-    SelectTopKCompactRow(scores + e.scoreOffset + (size_t)local * e.keys, selected, offsets, batch.rows, count, 2048,
+    SelectTopKCompactRow<false>(scores + e.scoreOffset + (size_t)local * e.keys, selected, offsets, batch.rows, count, 2048,
                          4096);
 }
 #endif
@@ -2294,7 +2366,7 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
         auto *input = (unsigned long long *)encoded.cudaData;
         auto *begin = (int *)offsets.cudaData;
         if (compact) {
-            SelectTopKCompact<<<queries, 256>>>((const float *)scores.cudaData,
+            LaunchSelectTopKCompact((const float *)scores.cudaData,
                 input, begin, queries, keys, queryStart, topK, sortStride);
         } else {
             EncodeTopK<<<dim3((keys + 255) / 256, queries), 256>>>(
@@ -2920,7 +2992,7 @@ bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::
         (const BF16 *)q.cudaData, FastllmNaiveKV(keys), (const float *)scale.cudaData, (const BF16 *)w.cudaData,
         (float *)scores.cudaData, rows, count, start, keys.dims[2], part, gap);
     }
-    SelectTopKCompact<<<rows, 256>>>((const float *)scores.cudaData, (unsigned long long *)encoded.cudaData,
+    LaunchSelectTopKCompact((const float *)scores.cudaData, (unsigned long long *)encoded.cudaData,
                                      (int *)offsets.cudaData, rows, count, start, 2048, 4096, part, gap);
     SortTopKCompact<<<rows, 256>>>((const unsigned long long *)encoded.cudaData, (int *)offsets.cudaData,
                                    (int *)indices.cudaData, rows, 4096, 2048, count);

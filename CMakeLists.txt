@@ -1948,6 +1948,13 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_attention COMMAND naive_n05_attention_test)
         set_tests_properties(naive_n05_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
+        add_executable(naive_n05_topk_threshold_test test/basic/test_naive_n05_topk_threshold.cpp)
+        target_link_libraries(naive_n05_topk_threshold_test PRIVATE fastllm)
+        target_include_directories(naive_n05_topk_threshold_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(naive_n05_topk_threshold naive_n05_topk_threshold_test
+            "PASS: exact sampled TopK" 120)
+        set_tests_properties(naive_n05_topk_threshold PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
         add_executable(naive_n05_prefill_test test/basic/test_naive_n05_prefill.cpp)
         target_link_libraries(naive_n05_prefill_test PRIVATE fastllm)
         target_include_directories(naive_n05_prefill_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
