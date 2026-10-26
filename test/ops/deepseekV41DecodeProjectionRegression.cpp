@@ -1,4 +1,5 @@
 #include "fastllm.h"
+#include "executor.h"
 #include "utils.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-v41-decode.cuh"
@@ -71,6 +72,8 @@ static int CheckMixNorm() {
                     "fused mix/norm quantization rejected");
                 Require(Bits(quantReference) == Bits(quantFusedOut),
                         "fused mHC quantization differs from the standalone block-32 quantizer");
+                Require(Bits(out[0]) == Bits(out[1]),
+                        "fused quantization changed the router/host expert input");
                 ++cases;
             }
         }
@@ -267,14 +270,61 @@ static int CheckFusedSwigluQuantization() {
             "unsupported quantization group mutated output");
     return cases + 1;
 }
-int main() {
+static int CheckMoeHcPost() {
+    int cases = 0;
+    for (auto type : {DataType::BFLOAT16, DataType::FLOAT32})
+    for (int hc : {1, 2, 3, 4})
+    for (int rows : {1, 8, 128}) {
+        const int dim = rows == 128 ? 4096 : 96;
+        Data routed, shared, residual, post, comb, sum, sharedFloat, rounded, reference, fused;
+        Fill(routed, {rows, dim}, type, 31, 2.0f);
+        Fill(shared, {rows, dim}, DataType::BFLOAT16, 37, 1.0f);
+        Fill(residual, {1, rows, hc, dim}, DataType::BFLOAT16, 41, 0.3f);
+        Fill(post, {1, rows, hc}, DataType::FLOAT32, 43, 1.0f);
+        Fill(comb, {1, rows, hc, hc}, DataType::FLOAT32, 47, 1.0f);
+        const auto routedBits = Bits(routed), sharedBits = Bits(shared);
+        sum.CopyFrom(routed);
+        ToDataType(shared, sharedFloat, type);
+        FastllmCudaAddTo(sum, sharedFloat, 1.0f);
+        ToDataType(sum, rounded, DataType::BFLOAT16);
+        static_cast<Executor *>(GetExecutor())->Run("DeepSeekV41HcPost",
+            {{"input", &rounded}, {"residual", &residual}, {"post", &post},
+             {"comb", &comb}, {"output", &reference}}, {}, {});
+        Require(FastllmCudaDeepSeekV41MoeHcPost(routed, shared, residual, post, comb, fused),
+                "fused MoE post rejected");
+        Require(Bits(reference) == Bits(fused), "fused MoE post changed intermediate rounding");
+        // Replays must neither overwrite the routed/shared producer buffers
+        // nor allocate on the graph's steady-state path.
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        Require(FastllmCudaDeepSeekV41MoeHcPost(routed, shared, residual, post, comb, fused),
+                "captured MoE post rejected");
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+        Check(cudaStreamSynchronize(cudaStreamPerThread));
+        Require(Bits(reference) == Bits(fused) && Bits(routed) == routedBits && Bits(shared) == sharedBits,
+                "MoE post replay changed output or its producer buffers");
+        Check(cudaGraphExecDestroy(exec));
+        Check(cudaGraphDestroy(graph));
+        ++cases;
+    }
+    return cases;
+}
+int main(int argc, char **argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     try {
         ApplyDeviceMap({{"cuda:0", 1}}, 0, 1);
         FastllmCudaSetDevice(0);
+        if (argc > 1 && std::strcmp(argv[1], "--hybrid-post") == 0) {
+            const int cases = CheckMixNorm() + CheckMoeHcPost();
+            std::printf("PASS V4.1 hybrid pre/post: %d bitwise cases and graph replays\n", cases);
+            return 0;
+        }
         const int cases = CheckMixNorm() + CheckHcDecodeDots() + CheckRouter() + CheckWoA() +
-                          CheckFusedSwigluQuantization();
+                          CheckFusedSwigluQuantization() + CheckMoeHcPost();
         std::printf("PASS V4.1 decode projections: %d cases (exact fallback and FP64 Tensor Core oracle)\n", cases);
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());

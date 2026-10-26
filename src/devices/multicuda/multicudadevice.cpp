@@ -4848,7 +4848,7 @@ namespace fastllm {
                 localInput.Allocate(false);
                 FastllmCudaCopyFromHostToDevice(localInput.cudaData, cpuInput, inputBytes);
             }
-            if (mixed) {
+            if (mixed || localInput.dataType == DataType::BFLOAT16) {
                 AssertInFastLLM(FastllmCudaDeepSeekV41MoeHcPost(localInput, localShared,
                     *residual.multiDeviceDatas.at(device), *post.multiDeviceDatas.at(device),
                     *comb.multiDeviceDatas.at(device), *output.multiDeviceDatas.at(device)),

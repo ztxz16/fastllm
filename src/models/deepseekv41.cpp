@@ -6119,7 +6119,9 @@ namespace fastllm {
             }
 
             // ---- FFN (MoE)：整批 ----
-            const bool quantizeFfn = executionMode == ExecutionMode::Gpu && tp && single &&
+            // Keep the original BF16 input for the router and host experts.
+            // The extra output only replaces the shared expert's quantizer.
+            const bool quantizeFfn = (tp || (executionMode == ExecutionMode::Hybrid && GetCudaSharedExpert())) && single &&
                 seqlen == 1 && !f.dsparkVerify &&
                 quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") &&
                 quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight");
@@ -6326,8 +6328,10 @@ namespace fastllm {
             bool ffnPostDone = false;
 #ifdef USE_CUDA
             if (combineFfnPostDispatch) {
-                ffnPostDone = MultiCudaDeepSeekV41AddHcPost(
-                    ffnOut, sharedExpertOut, *curHidden, ffnPost, ffnComb, *nextHidden);
+                ffnPostDone = f.tp ? MultiCudaDeepSeekV41AddHcPost(
+                    ffnOut, sharedExpertOut, *curHidden, ffnPost, ffnComb, *nextHidden) :
+                    FastllmCudaDeepSeekV41MoeHcPost(
+                        ffnOut, sharedExpertOut, *curHidden, ffnPost, ffnComb, *nextHidden);
                 if (!ffnPostDone) {
                     if (ffnOut.dataDevice == DataDevice::CPU && ffnOut.cpuData != nullptr) {
                         // Rejection occurs before AddTo. Rebuild the old view

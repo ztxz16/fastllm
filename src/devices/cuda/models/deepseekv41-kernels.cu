@@ -1076,8 +1076,8 @@ namespace {
         }
     }
 
-    template <int HC>
-    __global__ void V41MoeHcPostKernel(const float *input, const __nv_bfloat16 *shared, const __nv_bfloat16 *residual, const float *post,
+    template <typename T, int HC>
+    __global__ void V41MoeHcPostKernel(const T *input, const __nv_bfloat16 *shared, const __nv_bfloat16 *residual, const float *post,
                                     const float *comb, __nv_bfloat16 *output, uint64_t count, int dim) {
         const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= count / HC) return;
@@ -1086,10 +1086,10 @@ namespace {
         float r[4];
 #pragma unroll
         for (int src = 0; src < HC; src++) r[src] = V41Load<__nv_bfloat16>(residual, (t * HC + src) * dim + d);
-        // Match FP32 routed sum + BF16 shared output, then the explicit
+        // Match the routed sum + BF16 shared output, then the explicit
         // BF16 rounding before the HC residual transform. Do not fuse this
         // rounding boundary into the following FP32 multiply-adds.
-        const float sum = __fadd_rn(input[idx], __bfloat162float(shared[idx]));
+        const float sum = __fadd_rn(V41Load<T>(input, idx), __bfloat162float(shared[idx]));
         const float x = __bfloat162float(__float2bfloat16_rn(sum));
 #pragma unroll
         for (int target = 0; target < HC; target++) {
@@ -5220,7 +5220,8 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data &input, const f
 extern "C" bool FastllmCudaDeepSeekV41MoeHcPost(const fastllm::Data &input, const fastllm::Data &shared, const fastllm::Data &residual,
     const fastllm::Data &post, const fastllm::Data &comb, fastllm::Data &output) {
     if (!V41OnCuda(input) || !V41OnCuda(residual) || !V41OnCuda(post) || !V41OnCuda(comb) ||
-        input.dataType != DataType::FLOAT32 || residual.dataType != DataType::BFLOAT16 ||
+        (input.dataType != DataType::FLOAT32 && input.dataType != DataType::BFLOAT16) ||
+        residual.dataType != DataType::BFLOAT16 ||
         shared.dataType != DataType::BFLOAT16 || !V41OnCuda(shared) ||
         shared.Count(0) != input.Count(0) || residual.dims.size() != 4 ||
         post.dataType != DataType::FLOAT32 || comb.dataType != DataType::FLOAT32 ||
@@ -5231,16 +5232,19 @@ extern "C" bool FastllmCudaDeepSeekV41MoeHcPost(const fastllm::Data &input, cons
         comb.Count(0) != post.Count(0) * hc) return false;
     if (!V41PrepareOutput(output, residual.dataType, residual.dims)) return false;
     const int blocks = (count / hc + 255) / 256;
-#define V41_MOE_HCPOST(H) V41MoeHcPostKernel<H><<<blocks, 256>>>( \
-    (const float*)input.cudaData, (const __nv_bfloat16*)shared.cudaData, \
+#define V41_MOE_HCPOST(T, H) V41MoeHcPostKernel<T, H><<<blocks, 256>>>( \
+    (const T*)input.cudaData, (const __nv_bfloat16*)shared.cudaData, \
     (const __nv_bfloat16*)residual.cudaData, (const float*)post.cudaData, \
     (const float*)comb.cudaData, (__nv_bfloat16*)output.cudaData, count, dim)
-    switch (hc) {
-        case 1: V41_MOE_HCPOST(1); break;
-        case 2: V41_MOE_HCPOST(2); break;
-        case 3: V41_MOE_HCPOST(3); break;
-        case 4: V41_MOE_HCPOST(4); break;
+#define V41_MOE_HCPOST_TYPE(T) switch (hc) { \
+    case 1: V41_MOE_HCPOST(T, 1); break; \
+    case 2: V41_MOE_HCPOST(T, 2); break; \
+    case 3: V41_MOE_HCPOST(T, 3); break; \
+    case 4: V41_MOE_HCPOST(T, 4); break; \
     }
+    if (input.dataType == DataType::BFLOAT16) { V41_MOE_HCPOST_TYPE(__nv_bfloat16); }
+    else { V41_MOE_HCPOST_TYPE(float); }
+#undef V41_MOE_HCPOST_TYPE
 #undef V41_MOE_HCPOST
     return V41CheckLaunch("MoeHcPost");
 }

@@ -38,6 +38,20 @@ static std::vector<float> Read(const Data &data) {
 // Exercise the model boundary, not only the resident operator: a hybrid model
 // can have GPU-resident GGUF layers whose routed sum is FP32, shared output FP16.
 static bool hybridTest = false;
+// Complete the model's deferred local post with an identity HC transform,
+// so the independent MoE oracle below still checks the rounded expert sum.
+static void CompleteHybridPost(DeepSeekV41DecodeWorkspace &ws, int device) {
+    const int rows = ws.ffnInput.dims[0], dim = ws.ffnInput.dims[1];
+    Data residual(BFLOAT16, {1, rows, 1, dim});
+    residual.Allocate(0.f);
+    Data post(FLOAT32, {1, rows, 1}, std::vector<float>(rows, 1.f));
+    Data comb(FLOAT32, {1, rows, 1, 1}, std::vector<float>(rows, 0.f)), out;
+    for (Data *data : {&residual, &post, &comb}) data->ToDevice(CUDA, {device}, true);
+    Check(FastllmCudaDeepSeekV41MoeHcPost(ws.ffnOut, ws.sharedExpertOut, residual, post, comb, out),
+          "deferred hybrid post rejected");
+    out.Reshape({rows, dim});
+    ws.ffnOut.CopyFrom(out);
+}
 static void HybridAddition(Data &input, Data &indices, Data &scores,
                            std::vector<Data *> &weights, const std::vector<float> &routed,
                            float limit, int device) {
@@ -69,7 +83,10 @@ static void HybridAddition(Data &input, Data &indices, Data &scores,
         ws.sharedExpertOut.ToDevice(CUDA, {device}, true);
         DeepSeekV41MoeContext ctx{ws, weights, devices, 0, input.dims[0],
             false, true, false, false, false, shared, false, [] {}, [] {}};
-        Check(!model.RunHybridMoe(ctx, nullptr), "unexpected TP dispatch");
+        const bool deferred = model.RunHybridMoe(ctx, nullptr);
+        Check(deferred == (shared && sharedType == BFLOAT16 && input.dataType == BFLOAT16),
+              "incorrect local post dispatch");
+        if (deferred) CompleteHybridPost(ws, device);
         Check(ws.ffnOut.dataType == input.dataType, "hybrid MoE did not restore activation type");
         for (size_t i = 0; i < values.size(); ++i) values[i] = routed[i] + (shared ? values[i] : 0.f);
         Data expected(FLOAT32, input.dims, values);
@@ -231,7 +248,7 @@ public:
                 ++callbacks;
                 if (cooperativeTest) FastllmCudaSetDevice(1-device);
             }, [] {}};
-        Check(!RunHybridMoe(ctx, nullptr), "unexpected TP streaming dispatch");
+        if (RunHybridMoe(ctx, nullptr)) CompleteHybridPost(ws, device);
         output.CopyFrom(ws.ffnOut);
     }
     void RunQueued(const std::vector<std::unique_ptr<Data>> &inputs,
