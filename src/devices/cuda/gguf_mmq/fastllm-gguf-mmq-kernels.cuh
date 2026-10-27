@@ -6,8 +6,9 @@
 
 namespace fastllm_gguf_mmq {
 #include "mmq.cuh"
-// Defined only in the IQ1 instantiation unit; other types discard the call.
-static void ensure_iq1s_grid(cudaStream_t stream);
+// Keep the initializer with the translation unit that owns the IQ1 table.
+// NVCC/MSVC also requires a definition when other types discard the call.
+#include "fastllm-gguf-mmq-iq1.cuh"
 constexpr int kBlackwellDirectTileThreshold = 1000;
 
 template <ggml_type type, int mmq_x, int nwarps, bool need_check>
