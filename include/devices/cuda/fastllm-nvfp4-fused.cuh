@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -34,7 +35,7 @@ __device__ __forceinline__ float2 Decode(uint32_t q, half2 scale) {
 }
 template <class T> __device__ __forceinline__ float2 LoadPair(const T *p) {
     uint32_t b = __ldg(reinterpret_cast<const uint32_t *>(p));
-    if constexpr (__is_same(T, half))
+    if constexpr (std::is_same_v<T, half>)
         return __half22float2(*reinterpret_cast<half2 *>(&b));
     else
         return __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(&b));

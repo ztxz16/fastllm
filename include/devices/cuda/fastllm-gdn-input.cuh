@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -66,7 +67,7 @@ __global__ __launch_bounds__(Warps * 32, 2) void InputConvKernel(
                 uint32_t bits = __ldg(
                     reinterpret_cast<const uint32_t *>(input + (size_t)(firstBatch + b) * K + col + p * 2));
                 float2 a;
-                if constexpr (__is_same(T, half))
+                if constexpr (std::is_same_v<T, half>)
                     a = __half22float2(*reinterpret_cast<const half2 *>(&bits));
                 else
                     a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&bits));

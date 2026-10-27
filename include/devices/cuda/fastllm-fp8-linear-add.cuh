@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -44,7 +45,7 @@ __global__ __launch_bounds__(256, 2) void Kernel(const T *__restrict__ input,
                 // A naturally aligned pair is shared by every output row.
                 uint32_t bits = __ldg(reinterpret_cast<const uint32_t *>(input + col + p * 2));
                 float2 a;
-                if constexpr (__is_same(T, half))
+                if constexpr (std::is_same_v<T, half>)
                     a = __half22float2(*reinterpret_cast<const half2 *>(&bits));
                 else
                     a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&bits));

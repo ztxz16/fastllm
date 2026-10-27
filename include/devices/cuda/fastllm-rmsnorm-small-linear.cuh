@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -11,7 +12,7 @@ template <class T, int D, int B = 256, int R = 2>
 __global__ __launch_bounds__(B) void Kernel(const T *input, const float *norm, const T *weight,
                                             const float *bias, T *normalized, T *output, int N, float eps) {
     constexpr int P = D / (B * 2), W = B / 32;
-    static_assert(__is_same(T, half) || __is_same(T, __nv_bfloat16));
+    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
     static_assert(B >= 32 && B <= 1024 && B % 32 == 0);
     static_assert(D > 0 && D % (B * 2) == 0 && R > 0 && R <= B);
     int tid = threadIdx.x, lane = tid % 32, row = blockIdx.x * R;
@@ -24,7 +25,7 @@ __global__ __launch_bounds__(B) void Kernel(const T *input, const float *norm, c
     for (int j = 0; j < P; ++j) {
         int pair = tid + j * B;
         uint32_t bits = reinterpret_cast<const uint32_t *>(input)[pair];
-        if constexpr (__is_same(T, half))
+        if constexpr (std::is_same_v<T, half>)
             x[j] = __half22float2(*reinterpret_cast<half2 *>(&bits));
         else
             x[j] = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(&bits));
@@ -35,7 +36,7 @@ __global__ __launch_bounds__(B) void Kernel(const T *input, const float *norm, c
         for (int r = 0; r < R; ++r) {
             uint32_t wb =
                 row + r < N ? reinterpret_cast<const uint32_t *>(weight + size_t(row + r) * D)[pair] : 0;
-            if constexpr (__is_same(T, half))
+            if constexpr (std::is_same_v<T, half>)
                 w[r][j] = __half22float2(*reinterpret_cast<half2 *>(&wb));
             else
                 w[r][j] = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(&wb));

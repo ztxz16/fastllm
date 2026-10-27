@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -13,7 +14,7 @@ __global__ __launch_bounds__(Warps * 32,
                              2) void Kernel(const T *__restrict__ input, const uint8_t *__restrict__ weight,
                                             const float *__restrict__ scales, const BiasT *__restrict__ bias,
                                             T *__restrict__ output, int K, int N) {
-    static_assert(__is_same(T, half) || __is_same(T, __nv_bfloat16));
+    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
     static_assert(Values == 8 || Values == 16);
     static_assert(Chains > 0 && (Chains & (Chains - 1)) == 0);
     static_assert(Warps > 0 && Warps <= 32 && Rows > 0);
@@ -57,7 +58,7 @@ __global__ __launch_bounds__(Warps * 32,
                 // A naturally aligned pair is shared by every output row.
                 uint32_t bits = __ldg(reinterpret_cast<const uint32_t *>(input + col + p * 2));
                 float2 a;
-                if constexpr (__is_same(T, half))
+                if constexpr (std::is_same_v<T, half>)
                     a = __half22float2(*reinterpret_cast<const half2 *>(&bits));
                 else
                     a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&bits));
@@ -115,7 +116,7 @@ __global__ __launch_bounds__(256, 2) void TailKernel(
         float2 x;
         if (col + 1 < K) {
             uint32_t bits = __ldg(reinterpret_cast<const uint32_t *>(input + col));
-            if constexpr (__is_same(T, half)) x = __half22float2(*reinterpret_cast<half2 *>(&bits));
+            if constexpr (std::is_same_v<T, half>) x = __half22float2(*reinterpret_cast<half2 *>(&bits));
             else x = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(&bits));
         } else {
             x = make_float2(float(input[col]), 0.f);

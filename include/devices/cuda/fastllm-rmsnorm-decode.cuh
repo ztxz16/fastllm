@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -11,7 +12,7 @@ namespace normdecode {
 // safe. Each warp repeats the final reduction, avoiding a second block barrier.
 template <class T, int D = 5120, int B = 512>
 __global__ __launch_bounds__(B) void Kernel(const T *input, const float *weight, T *output, float eps) {
-    static_assert(__is_same(T, half) || __is_same(T, __nv_bfloat16));
+    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
     static_assert(D == 5120 && B == 512);
     constexpr int LegacyThreads = 1024, Groups = LegacyThreads / B;
     constexpr int Pairs = (D / 2 + LegacyThreads - 1) / LegacyThreads;
@@ -30,7 +31,7 @@ __global__ __launch_bounds__(B) void Kernel(const T *input, const float *weight,
                 values[g][j] = reinterpret_cast<const uint32_t *>(input)[pair];
                 weights[g][j] = reinterpret_cast<const float2 *>(weight)[pair];
                 float2 value;
-                if constexpr (__is_same(T, half))
+                if constexpr (std::is_same_v<T, half>)
                     value = __half22float2(*reinterpret_cast<half2 *>(&values[g][j]));
                 else
                     value = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(&values[g][j]));
@@ -66,13 +67,13 @@ __global__ __launch_bounds__(B) void Kernel(const T *input, const float *weight,
             int pair = tid + g * B + j * LegacyThreads;
             if (pair < D / 2) {
                 float2 value;
-                if constexpr (__is_same(T, half))
+                if constexpr (std::is_same_v<T, half>)
                     value = __half22float2(*reinterpret_cast<half2 *>(&values[g][j]));
                 else
                     value = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(&values[g][j]));
                 float a = (value.x * scale) * weights[g][j].x;
                 float b = (value.y * scale) * weights[g][j].y;
-                if constexpr (__is_same(T, half))
+                if constexpr (std::is_same_v<T, half>)
                     reinterpret_cast<half2 *>(output)[pair] = __floats2half2_rn(a, b);
                 else
                     reinterpret_cast<__nv_bfloat162 *>(output)[pair] = __floats2bfloat162_rn(a, b);

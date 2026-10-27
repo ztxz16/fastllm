@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 #include <cstdlib>
 #include <cstring>
 #include <cuda_bf16.h>
@@ -94,7 +95,7 @@ __device__ __forceinline__ void SimtBody(const T *__restrict__ x, const uint8_t 
                 uint32_t bits =
                     __ldg(reinterpret_cast<const uint32_t *>(x + size_t(t) * K + base + pair * 2));
                 float2 a;
-                if constexpr (__is_same(T, half))
+                if constexpr (std::is_same_v<T, half>)
                     a = __half22float2(*reinterpret_cast<half2 *>(&bits));
                 else
                     a = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(&bits));
@@ -144,7 +145,7 @@ __device__ __forceinline__ void SimtBody(const T *__restrict__ x, const uint8_t 
                             T p1 = T(acc[t][r + 1][0] * scales[row + r + 1] +
                                      (bias ? float(bias[row + r + 1]) : 0.f));
                             uint32_t bits;
-                            if constexpr (__is_same(T, half)) {
+                            if constexpr (std::is_same_v<T, half>) {
                                 half2 p = __halves2half2(p0, p1);
                                 if constexpr (Add)
                                     p = __hadd2(
@@ -209,7 +210,7 @@ __global__ __launch_bounds__(Warps * 32, 2) void MmaKernel(const T *__restrict__
                                                            int K, int N, int totalRows = Tokens) {
 #if __CUDA_ARCH__ >= 800 || (__CUDA_ARCH__ == 750 && !defined(CUDA_NO_TENSOR_CORE))
 #if __CUDA_ARCH__ == 750
-    if constexpr (!__is_same(T, half)) {
+    if constexpr (!std::is_same_v<T, half>) {
         SimtBody<T, Tokens, Warps, 16 / Warps, 8, Add, BiasT>(x, w, scales, bias, y, K, N);
         return;
     }
@@ -249,7 +250,7 @@ __global__ __launch_bounds__(Warps * 32, 2) void MmaKernel(const T *__restrict__
                 __nv_fp8x2_e4m3 q;
                 q.__x = uint16_t(words[j] >> ((part % 2) * 16));
                 __half2 h = static_cast<__half2>(q);
-                if constexpr (__is_same(T, half))
+                if constexpr (std::is_same_v<T, half>)
                     av[j] = *reinterpret_cast<uint32_t *>(&h);
                 else {
                     float2 f = __half22float2(h);
@@ -275,7 +276,7 @@ __global__ __launch_bounds__(Warps * 32, 2) void MmaKernel(const T *__restrict__
                          : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
                          : "r"(av[2]), "r"(av[3]), "r"(v1));
 #else
-            if constexpr (__is_same(T, half))
+            if constexpr (std::is_same_v<T, half>)
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                              : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
@@ -349,7 +350,7 @@ inline bool Launch(const T *x, const uint8_t *w, const float *scales, const Bias
             return true;                                                                \
         }                                                                               \
     } while (false)
-    if constexpr (__is_same(T, half)) {
+    if constexpr (std::is_same_v<T, half>) {
         if (UseSm75Mma(device)) {
             if (K >= 4096)
                 FASTLLM_FP8_SMALL_LAUNCH((N + 15) / 16, 512, MmaKernel<T, Tokens, 16, Add, BiasT>);
@@ -397,7 +398,7 @@ inline bool Dispatch(const T *x, const uint8_t *w, const float *scales, const Bi
     if (device < 0 && cudaGetDevice(&device) != cudaSuccess) return false;
     // Keep larger batches on the existing GEMM path. Tile the remaining
     // small batches uniformly; the last token tile is guarded in the kernel.
-    if constexpr (__is_same(T, half)) {
+    if constexpr (std::is_same_v<T, half>) {
         if (tokens > 8 && tokens <= 32 && UseSm75Mma(device)) {
             constexpr int Warps = 16;
             if constexpr (CheckOnly)

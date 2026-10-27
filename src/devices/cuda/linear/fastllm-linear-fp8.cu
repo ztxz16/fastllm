@@ -1,3 +1,4 @@
+#include <type_traits>
 #include <climits>
 #include <stdexcept>
 #include "devices/cuda/fastllm-fp8-small-t.cuh"
@@ -274,7 +275,7 @@ __global__ void FastllmQuantizeLinearWeightNVFP4Block16Kernel(
                 const float decoded = int4.useZeroPoint
                     ? params.x * (q - params.y) : params.x * q + params.y;
                 value = __half2float(__float2half_rn(decoded));
-            } else if constexpr (__is_same(T, uint8_t)) {
+            } else if constexpr (std::is_same_v<T, uint8_t>) {
                 __nv_fp8_e4m3 code;
                 code.__x = input[(size_t)sourceRow * columns + column];
                 value = float(code) * rowScales[sourceRow];
@@ -1020,7 +1021,7 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
         return false;
     if (batch > 1) {
         if (N > 65536 && batch != 8 &&
-            (!__is_same(T, half) || !fastllm::fp8small::UseSm75Mma(device)))
+            (!std::is_same_v<T, half> || !fastllm::fp8small::UseSm75Mma(device)))
             return false;
         return fastllm::fp8small::CanRun<T>(device, K, N, batch);
     }
@@ -1041,7 +1042,7 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
 template <class T>
 static bool TryFastllmRowFP8(T *input, uint8_t *weight, T *output, T *bias, float *scales, int batch, int K,
                              int N, int blockM, int blockK) {
-    if constexpr (__is_same(T, half)) {
+    if constexpr (std::is_same_v<T, half>) {
         int device = 0;
         if (batch == 1 && K % 256 == 0 && cudaGetDevice(&device) == cudaSuccess &&
             fastllm::fp8small::UseSm75Mma(device) &&
