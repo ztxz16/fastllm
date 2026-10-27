@@ -21,7 +21,8 @@ class PowerShellHelperTests(unittest.TestCase):
                       ";. " + quote(COMMON) + ";Get-FastllmCudaArch")
             encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
             return subprocess.run(
-                [POWERSHELL, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                 "-EncodedCommand", encoded],
                 capture_output=True, text=True,
             )
 
