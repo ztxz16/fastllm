@@ -309,6 +309,28 @@ static void TestVerifyIndexerView(int rows, int past, bool fp8) {
         ++checks;
     }
 }
+// Normalizing a chunk must match the same rows in a full batch, including
+// in-place output. The large batch exercises the general reduction kernel.
+static void TestRMSNormChunks() {
+    Data input(BFLOAT16), weight(FLOAT32), reference(BFLOAT16);
+    Upload(input, {257, 4096}, 711);
+    Upload(weight, {4096}, 712);
+    Upload(reference, input.dims, 0);
+    Require(FastllmCudaKimiK3RMSNorm(input, weight, reference, 1e-5f), "batch norm");
+    auto expected = Read<uint16_t>(reference);
+    for (int rows : {1, 2, 7, 8, 31, 128}) {
+        Data chunk(BFLOAT16), output(BFLOAT16);
+        Upload(chunk, {rows, 4096}, 711);
+        Upload(output, chunk.dims, 0);
+        Require(FastllmCudaKimiK3RMSNorm(chunk, weight, output, 1e-5f), "chunk norm");
+        auto actual = Read<uint16_t>(output);
+        Require(std::equal(actual.begin(), actual.end(), expected.begin()), "chunk norm differs");
+        Require(FastllmCudaKimiK3RMSNorm(chunk, weight, chunk, 1e-5f), "in-place chunk norm");
+        Require(Read<uint16_t>(chunk) == actual, "in-place norm differs");
+        ++checks;
+    }
+}
+
 static void TestDraftAttention(int dim, int rows, int window, bool shortAttention,
                                int heads = 8, int kvHeads = 2) {
     const int storage = window + rows;
@@ -658,6 +680,8 @@ int main() {
             for (bool shortAttention : {false, true})
                 TestDraftAttention(dim, rows, 1024, shortAttention);
         TestDraftAttention(128, 7, 1024, false, 32, 4);
+        TestDraftAttention(128, 31, 1024, false, 32, 4);
+        TestRMSNormChunks();
         printf("DECODE GRAPH PASS checks=%d\n", checks);
         return 0;
     } catch (const std::exception &e) {

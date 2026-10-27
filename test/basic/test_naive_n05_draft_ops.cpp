@@ -30,7 +30,7 @@ int main() {
         int checks = 0;
         // The unchanged two-row GEMV is an exact oracle for the new one-row
         // layout, including bias conversion, tail output tiles and cancellation.
-        for (int outputs : {1, 7, 8, 9, 255, 513, 19072, 152576}) {
+        for (int outputs : {1, 7, 8, 9, 255, 513, 16383, 16384, 16385, 19072, 152576}) {
             Data x = BF({1, 256}, 71);
             Data twice, bias = BF({outputs}, 31);
             ToDataType(bias, FLOAT32);

@@ -8883,12 +8883,14 @@ namespace {
     }
 
 #ifndef USE_ROCM
-    // Cache one decode row while preserving the generic kernel's accumulation
+    // Cache each row while preserving the generic kernel's accumulation
     // order and the BF16 rounding before and after applying the FP32 weight.
     __global__ void KimiK3RMSNorm4096Kernel(
             const __nv_bfloat16 *input, const float *weight,
             __nv_bfloat16 *output, float eps) {
         constexpr int CHANNELS = 4096;
+        input += (size_t)blockIdx.x * CHANNELS;
+        output += (size_t)blockIdx.x * CHANNELS;
         constexpr int VALUES_PER_THREAD = CHANNELS / KIMI_K3_CUDA_THREADS;
         __shared__ float warpSums[KIMI_K3_CUDA_THREADS / 32];
         float values[VALUES_PER_THREAD];
@@ -9344,8 +9346,9 @@ bool FastllmCudaKimiK3RMSNorm(
     int channels = input.dims.back();
     int rows = (int)(input.Count(0) / channels);
 #ifndef USE_ROCM
-    if (rows == 1 && channels == 4096) {
-        KimiK3RMSNorm4096Kernel<<<1, KIMI_K3_CUDA_THREADS>>>(
+    if (channels == 4096 && (rows == 1 ||
+        (rows > 1 && rows <= 128 && FastllmCudaRuntimeArch() == 90))) {
+        KimiK3RMSNorm4096Kernel<<<rows, KIMI_K3_CUDA_THREADS>>>(
             (const __nv_bfloat16 *)input.cudaData, (const float *)weight.cudaData,
             (__nv_bfloat16 *)output.cudaData, eps);
     } else

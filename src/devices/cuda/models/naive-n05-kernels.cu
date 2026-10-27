@@ -1445,6 +1445,50 @@ __global__ void AttentionScoresPrefill(const BF16 *q, FastllmNaiveKV k, const in
     }
 }
 
+// Reuse K across neighboring Q heads with the original dot-product order.
+// A bounded grid strides over live keys, including during graph replay.
+__global__ void DraftAttentionScores(const BF16 *q, FastllmNaiveKV k, float *scores,
+        int heads, int kvHeads, DraftLength liveKeys, DraftLength livePast, int window) {
+    constexpr int Dim = 128, KeysPerWarp = 4, HeadTile = 4;
+    const int keys = liveKeys, past = livePast, query = blockIdx.y;
+    const int firstHead = blockIdx.x * HeadTile, kh = firstHead / (heads / kvHeads);
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    float queries[HeadTile][4];
+    #pragma unroll
+    for (int h = 0; h < HeadTile; ++h)
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            queries[h][j] = (float)q[((size_t)query * heads + firstHead + h) * Dim + lane + j * 32];
+    for (int first = blockIdx.z * 16 + warp * KeysPerWarp; first < keys; first += gridDim.z * 16) {
+        int key[KeysPerWarp];
+        bool valid[KeysPerWarp];
+        float dot[HeadTile][KeysPerWarp] = {};
+        #pragma unroll
+        for (int i = 0; i < KeysPerWarp; ++i) {
+            key[i] = KeyIndex(nullptr, query, first + i, keys, past, window);
+            valid[i] = first + i < keys && key[i] < keys;
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            #pragma unroll
+            for (int i = 0; i < KeysPerWarp; ++i) if (valid[i]) {
+                float value = (float)k.Row(key[i], kvHeads * Dim)[kh * Dim + lane + j * 32];
+                #pragma unroll
+                for (int h = 0; h < HeadTile; ++h) dot[h][i] += queries[h][j] * value;
+            }
+        }
+        #pragma unroll
+        for (int h = 0; h < HeadTile; ++h)
+            #pragma unroll
+            for (int i = 0; i < KeysPerWarp; ++i) {
+                float sum = WarpSum(dot[h][i]);
+                if (lane == 0 && first + i < keys)
+                    scores[((size_t)query * heads + firstHead + h) * keys + first + i] =
+                        valid[i] ? RoundBF16(RoundBF16(sum) * rsqrtf((float)Dim)) : -INFINITY;
+            }
+    }
+}
+
 // Reuse each K load across two Q heads in the same KV group. One key per
 // warp keeps the register tile small; each dot retains the original lane
 // accumulation, warp reduction and BF16 rounding order.
@@ -1543,13 +1587,14 @@ __global__ void AttentionValuesPrefill(const float *prob, FastllmNaiveKV v, cons
 // Stage a small V column tile cooperatively, then accumulate each output in
 // the original key order. Small draft blocks need more CTAs than prefill's
 // four-head kernel; splitting output columns does not change the reduction.
+template <int Columns = 16, int Padding = 8>
 __global__ void DraftAttentionValues(const float *prob, FastllmNaiveKV v, BF16 *out,
         int heads, int kvHeads, int dim, DraftLength liveKeys, DraftLength livePast, int window) {
-    constexpr int Columns = 16, Tile = 128;
+    constexpr int Tile = 128;
     const int query = blockIdx.y, h = blockIdx.x, column = blockIdx.z * Columns;
     const int t = threadIdx.x, keys = liveKeys, past = livePast, kh = h / (heads / kvHeads);
     const float *p = prob + ((size_t)query * heads + h) * keys;
-    __shared__ __align__(16) BF16 values[Columns][Tile + 8];
+    __shared__ __align__(16) BF16 values[Columns][Tile + Padding];
     __shared__ float weights[Tile];
     float sum = 0;
     for (int first = 0; first < keys; first += Tile) {
@@ -4989,15 +5034,26 @@ void FastllmCudaNaiveDraftAttention(const fastllm::Data &query,
             heads, kvHeads, dim, dim, key.dims[2], keys, 256, past, window, false);
     } else {
         Output(scores, FLOAT32, {rows, heads, window + rows - 1});
-        auto kernel = dim == 128 ? AttentionScoresPrefill<128, DraftLength, DraftLength, 64>
-                    : dim <= 192 ? AttentionScoresPrefill<192, DraftLength, DraftLength>
-                                 : AttentionScoresPrefill<256, DraftLength, DraftLength>;
-        const int tiles = dim == 128 ? (scores.dims.back() + 63) / 64 : 1;
-        kernel<<<dim3(heads, rows, tiles), 128>>>(q, k, nullptr, (float *)scores.cudaData,
-            heads, kvHeads, dim, key.dims[2], keys, keys, past, window, false);
+        if (dim == 128 && window <= 1024 && (heads / kvHeads) % 4 == 0 &&
+            FastllmCudaRuntimeArch() == 90) {
+            DraftAttentionScores<<<dim3(heads / 4, rows, 16), 128>>>(q, k,
+                (float *)scores.cudaData, heads, kvHeads, keys, past, window);
+        } else {
+            auto kernel = dim == 128 ? AttentionScoresPrefill<128, DraftLength, DraftLength, 64>
+                        : dim <= 192 ? AttentionScoresPrefill<192, DraftLength, DraftLength>
+                                     : AttentionScoresPrefill<256, DraftLength, DraftLength>;
+            const int tiles = dim == 128 ? (scores.dims.back() + 63) / 64 : 1;
+            kernel<<<dim3(heads, rows, tiles), 128>>>(q, k, nullptr, (float *)scores.cudaData,
+                heads, kvHeads, dim, key.dims[2], keys, keys, past, window, false);
+        }
         AttentionSoftmax<<<rows * heads, 256>>>((float *)scores.cudaData, nullptr, heads, keys);
-        if (dim == 128)
-            DraftAttentionValues<<<dim3(heads, rows, dim / 16), 256>>>(
+        if (dim == 128 && FastllmCudaRuntimeArch() == 90)
+            // Two BF16 padding elements spread column reads over all banks.
+            // A full warp computes outputs; the remaining warps stage V.
+            DraftAttentionValues<32, 2><<<dim3(heads, rows, dim / 32), 128>>>(
+                (float *)scores.cudaData, v, out, heads, kvHeads, dim, keys, past, window);
+        else if (dim == 128)
+            DraftAttentionValues<><<<dim3(heads, rows, dim / 16), 256>>>(
                 (float *)scores.cudaData, v, out, heads, kvHeads, dim, keys, past, window);
         else
             AttentionValuesPrefill<<<dim3((heads + 3) / 4, rows), 128>>>((float *)scores.cudaData,
