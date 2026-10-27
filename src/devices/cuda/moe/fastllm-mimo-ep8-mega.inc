@@ -153,7 +153,7 @@ void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,
         output.dims[0] > 0 && output.dims[1] > 0 && output.cudaData &&
         output.dataDevice == DataDevice::CUDA &&
         output.dataDeviceIds == std::vector<int>{state.devices[rank]} &&
-        (output.dataType == BFLOAT16 || output.dataType == INT32),
+        (output.dataType == BFLOAT16 || output.dataType == fastllm::INT32),
         "Invalid MiMo EP prefill AllGather tensor.");
     const int total = output.dims[0];
     const size_t rowBytes = (size_t)output.dims[1] * output.unitSize;

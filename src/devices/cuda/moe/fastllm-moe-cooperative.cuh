@@ -181,7 +181,7 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
         rows < 1 || rows > FASTLLM_CUDA_MOE_CACHE_MAX_BATCH || input.dims[1] != hidden ||
         !PackedCacheRows(index) || !PackedCacheRows(score) ||
         index.dims[0] != rows || index.dims != score.dims || index.dims[1] <= 0 ||
-        index.dims[1] > kMaxTopK || index.dataType != INT32 || score.dataType != FLOAT32 ||
+        index.dims[1] > kMaxTopK || index.dataType != fastllm::INT32 || score.dataType != FLOAT32 ||
         index.dataDevice != CUDA || score.dataDevice != CUDA || !index.cudaData || !score.cudaData) return false;
     cudaStreamCaptureStatus originCapture;
     if (cudaStreamIsCapturing(cudaStreamPerThread, &originCapture) != cudaSuccess ||
@@ -367,8 +367,8 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
         gpuRoutes[d] = at;
         // All allocations precede CPU/GPU dispatch; cudaMalloc can synchronize.
         if (at) {
-            allocate(w.batchSlots, INT32, {routes}, w.cudaDevice);
-            allocate(w.batchRoutes, INT32, {routes}, w.cudaDevice);
+            allocate(w.batchSlots, fastllm::INT32, {routes}, w.cudaDevice);
+            allocate(w.batchRoutes, fastllm::INT32, {routes}, w.cudaDevice);
             allocate(w.scores, FLOAT32, {rows, topk}, w.cudaDevice);
             allocate(w.gate, BFLOAT16, {routes, layout.inter}, w.cudaDevice);
             if (layout.weightType == DATA_GGUF_FORMAT)
@@ -380,9 +380,9 @@ bool TryCooperativeMoe(OffloadGroup &group, DeviceCache &origin, int table,
         }
     }
     checkCudaErrors("Cooperative MoE output device", cudaSetDevice(origin.device));
-    allocate(r.ids, INT32, {rows, topk}, origin.device);
-    allocate(r.owners, INT32, {rows, topk}, origin.device);
-    if (candidate >= 0) allocate(r.lookup, INT32, {2 * FastllmCudaMoeExpertParallel::maxRoutes}, origin.device);
+    allocate(r.ids, fastllm::INT32, {rows, topk}, origin.device);
+    allocate(r.owners, fastllm::INT32, {rows, topk}, origin.device);
+    if (candidate >= 0) allocate(r.lookup, fastllm::INT32, {2 * FastllmCudaMoeExpertParallel::maxRoutes}, origin.device);
     if (work.size() > 1) allocate(root.received, FLOAT32, {routes, hidden}, origin.device);
     allocate(output, BFLOAT16, {rows, hidden}, origin.device);
     // Only the expert's permanent owner updates its frequency. Temporary

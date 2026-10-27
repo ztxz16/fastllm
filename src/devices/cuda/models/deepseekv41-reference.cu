@@ -469,7 +469,7 @@ extern "C" bool FastllmCudaV41ReferenceAttention(const Data &q, const Data &chun
         (compressed && (!Valid(*compressed) || compressed->dims.size() != 3 || compressed->dims[0] != 1 ||
                         compressed->dims[2] != 512)) ||
         (idx &&
-         (!compressed || idx->dataDevice != DataDevice::CUDA || !idx->cudaData || idx->dataType != INT32 ||
+         (!compressed || idx->dataDevice != DataDevice::CUDA || !idx->cudaData || idx->dataType != fastllm::INT32 ||
           idx->dims.size() != 3 || idx->dims[0] != 1 || idx->dims[1] != q.dims[1])))
         return false;
     sink.ToDevice(DataDevice::CUDA);
@@ -488,7 +488,7 @@ extern "C" bool FastllmCudaV41ReferenceAttention(const Data &q, const Data &chun
     }
     cudaMemcpyAsync((float *)keys.cudaData + (start ? window * dim : 0), kv.cudaData, size_t(rows) * dim * 4,
                     cudaMemcpyDeviceToDevice);
-    Prepare(indices, INT32, {1, rows, slots + width});
+    Prepare(indices, fastllm::INT32, {1, rows, slots + width});
     MakeIndices<<<(rows * (slots + width) + 255) / 256, 256>>>((int *)indices.cudaData,
                                                                width ? (const int *)idx->cudaData : nullptr,
                                                                rows, window, start, slots, width, offset);

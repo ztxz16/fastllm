@@ -3528,7 +3528,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         work.ready = PackedCacheRows(index) && PackedCacheRows(score) &&
             index.dims[0] == work.rows && index.dims == score.dims &&
             index.dims[1] > 0 && index.dims[1] <= kMaxTopK &&
-            index.dataDevice == DataDevice::CUDA && index.dataType == INT32 && index.cudaData &&
+            index.dataDevice == DataDevice::CUDA && index.dataType == fastllm::INT32 && index.cudaData &&
             score.dataDevice == DataDevice::CUDA && score.dataType == FLOAT32 && score.cudaData;
         if (work.ready) {
             work.topk = index.dims[1];
@@ -3617,11 +3617,11 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         tensor.ToDevice(DataDevice::CUDA, {device}, false);
         tensor.Allocate(false);
     };
-    allocate(work.ids, INT32, {rows, topk});
-    if (!batchExperts) allocate(work.selected, INT32, {rows, topk});
+    allocate(work.ids, fastllm::INT32, {rows, topk});
+    if (!batchExperts) allocate(work.selected, fastllm::INT32, {rows, topk});
     allocate(work.scores, FLOAT32, {rows, topk});
-    allocate(work.owners, INT32, {rows, topk});
-    allocate(work.lookup, INT32, {2 * maxRoutes});
+    allocate(work.owners, fastllm::INT32, {rows, topk});
+    allocate(work.lookup, fastllm::INT32, {2 * maxRoutes});
     if (rank != routingRank) {
         std::copy(root.Scores(), root.Scores() + routes, work.Scores());
         std::copy(root.Indices(), root.Indices() + routes, work.Indices());
@@ -3784,8 +3784,8 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             stagedOffsets[i + 1] = at;
         }
         // The final slot holds a dynamic resident count for graph replay.
-        allocate(work.batchSlots, INT32, {maxRoutes + 1});
-        allocate(work.batchRoutes, INT32, {routes});
+        allocate(work.batchSlots, fastllm::INT32, {maxRoutes + 1});
+        allocate(work.batchRoutes, fastllm::INT32, {routes});
         const size_t bytes = v41Batch
             ? FastllmCudaMoeGGUFCacheWorkspaceBytes(hidden, layout.inter)
             : FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(hidden, layout.inter, rows, topk);

@@ -49,7 +49,7 @@ bool FastllmCudaGlm5NextDsaPrefill(const fastllm::Data &query,
         query.dims[3] != 512 || latent.dataType != BFLOAT16 ||
         latent.dims.size() != 3 || latent.dims[0] != 1 || latent.dims[2] != 512 ||
         latent.dims[1] <= 0 || latent.dims[1] > INT_MAX / 4 ||
-        indices.dataType != INT32 || indices.dims.size() != 3 ||
+        indices.dataType != fastllm::INT32 || indices.dims.size() != 3 ||
         indices.dims[0] != 1 || indices.dims[1] != query.dims[1] ||
         indices.dims[2] <= 0 || indices.dims[2] > INT_MAX - 63 ||
         !std::isfinite(scale) || scale <= 0 || &output == &query ||
@@ -77,7 +77,7 @@ bool FastllmCudaGlm5NextDsaPrefill(const fastllm::Data &query,
     Prepare(bytes, INT8, {tokens, 512}, device);
     Prepare(scales, FLOAT32, {tokens, 4}, device);
     Prepare(packed, INT8, {tokens, 528}, device);
-    Prepare(padded, INT32, {rows, paddedWidth}, device);
+    Prepare(padded, fastllm::INT32, {rows, paddedWidth}, device);
     Prepare(lse, FLOAT32, {rows, 64}, device);
     Prepare(output, BFLOAT16, query.dims, device);
 

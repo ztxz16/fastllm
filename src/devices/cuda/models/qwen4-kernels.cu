@@ -3709,7 +3709,7 @@ bool FastllmCudaQwen4SelectBlocks(const fastllm::Data &scores,
         scores.dims[1] != 1 || scores.dims[2] <= 0 || selectedK <= 0 ||
         compressRatio <= 0 || queryStart < 0 ||
         (queryStart + 1) / compressRatio > scores.dims[2]) return false;
-    selected.dataType = INT32;
+    selected.dataType = fastllm::INT32;
     selected.UpdateUnitSize();
     selected.Resize({1, selectedK});
     selected.ToDevice(DataDevice::CUDA, scores.dataDeviceIds, false);
@@ -3723,17 +3723,17 @@ bool FastllmCudaQwen4ExpandSelectedBlocks(const fastllm::Data &selected,
         int keyLength, int queryStart, int compressRatio, fastllm::Data &indices,
         const fastllm::Data *pageTable, int pageLen) {
     using namespace fastllm;
-    if (selected.dataDevice != DataDevice::CUDA || selected.dataType != INT32 ||
+    if (selected.dataDevice != DataDevice::CUDA || selected.dataType != fastllm::INT32 ||
         !selected.cudaData || selected.dims.size() != 2 || selected.dims[0] <= 0 ||
         selected.dims[1] <= 0 || compressRatio <= 0 || queryStart < 0 ||
         (int64_t)queryStart + selected.dims[0] > keyLength) return false;
     if (pageTable != nullptr && (pageLen <= 0 ||
-        pageTable->dataDevice != DataDevice::CUDA || pageTable->dataType != INT32 ||
+        pageTable->dataDevice != DataDevice::CUDA || pageTable->dataType != fastllm::INT32 ||
         !pageTable->cudaData || pageTable->Count(0) < (uint64_t)(keyLength + pageLen - 1) / pageLen ||
         pageTable->dataDeviceIds != selected.dataDeviceIds)) return false;
     const int rows = selected.dims[0], count = selected.dims[1];
     const int width = count * compressRatio + compressRatio - 1;
-    indices.dataType = INT32;
+    indices.dataType = fastllm::INT32;
     indices.Resize({rows, width});
     indices.ToDevice(DataDevice::CUDA, selected.dataDeviceIds, false);
     indices.Allocate(false);
@@ -3751,18 +3751,18 @@ bool FastllmCudaHybridDsaSelect(const fastllm::Data &scores, const fastllm::Data
     using namespace fastllm;
     if (scores.dataDevice != DataDevice::CUDA || scores.dataType != FLOAT32 || !scores.cudaData ||
         scores.dims.size() != 3 || scores.dims[0] != 1 || scores.dims[1] != 1 || scores.dims[2] < 512 ||
-        position.dataDevice != DataDevice::CUDA || position.dataType != INT32 || !position.cudaData ||
+        position.dataDevice != DataDevice::CUDA || position.dataType != fastllm::INT32 || !position.cudaData ||
         position.Count(0) != 1 || position.dataDeviceIds != scores.dataDeviceIds ||
-        pageTable.dataDevice != DataDevice::CUDA || pageTable.dataType != INT32 || !pageTable.cudaData ||
+        pageTable.dataDevice != DataDevice::CUDA || pageTable.dataType != fastllm::INT32 || !pageTable.cudaData ||
         pageTable.dataDeviceIds != scores.dataDeviceIds || pageLen <= 0) return false;
-    Data selected(INT32);
+    Data selected(fastllm::INT32);
     selected.Resize({1, 512});
     selected.ToDevice(DataDevice::CUDA, scores.dataDeviceIds, false);
     selected.Allocate(false);
     const auto *meta = (const int32_t *)position.cudaData;
     if (!Qwen4SelectBlocksRaw((const float*)scores.cudaData, (int32_t*)selected.cudaData,
             1, scores.dims[2], 512, -2, 4, meta)) return false;
-    indices.dataType = INT32;
+    indices.dataType = fastllm::INT32;
     indices.UpdateUnitSize();
     indices.Resize({1, 2051});
     indices.ToDevice(DataDevice::CUDA, scores.dataDeviceIds, false);
@@ -5213,7 +5213,7 @@ bool FastllmCudaQwen4SparsePrefill(const fastllm::Data &query, const fastllm::Da
 #else
     using namespace fastllm;
     if (query.dataType != FLOAT16 || key.dataType != FLOAT16 || value.dataType != FLOAT16 ||
-        output.dataType != FLOAT16 || indices.dataType != INT32 || query.dims.size() != 3 ||
+        output.dataType != FLOAT16 || indices.dataType != fastllm::INT32 || query.dims.size() != 3 ||
         key.dims.size() != 3 || value.dims != key.dims || indices.dims.size() != 2 || groups <= 0 ||
         int64_t(query.dims[0]) != int64_t(key.dims[0]) * groups || query.dims[1] != indices.dims[0] ||
         query.dims[2] != key.dims[2] || query.dims[2] % 16 || query.dims[2] <= 0 ||
@@ -5316,7 +5316,7 @@ bool FastllmCudaQwen4SparseDecode(const fastllm::Data &query, const fastllm::Dat
 #else
     using namespace fastllm;
     if (query.dataType != FLOAT16 || key.dataType != FLOAT16 || value.dataType != FLOAT16 ||
-        indices.dataType != INT32 || query.dims.size() != 3 || key.dims.size() != 3 ||
+        indices.dataType != fastllm::INT32 || query.dims.size() != 3 || key.dims.size() != 3 ||
         value.dims != key.dims || indices.dims.size() != 2 || groups <= 0 || groups > 32 ||
         int64_t(query.dims[0]) != int64_t(key.dims[0]) * groups || query.dims[1] != 1 ||
         indices.dims[0] != 1 || query.dims[2] != key.dims[2] || query.dims[2] <= 0 ||

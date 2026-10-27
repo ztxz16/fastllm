@@ -474,7 +474,7 @@ bool TryMailboxMoe(OffloadGroup &group, DeviceCache &origin, int table, const fa
         !group.expertDevices.empty() || !devices || devices->size() != 2 || (*devices)[0] == (*devices)[1] ||
         input.dims.size() != 2 || input.dims[0] != 1 || input.dims[1] != l.hidden || input.dataType != BFLOAT16 ||
         index.dims.size() != 2 || index.dims[0] != 1 || index.dims != score.dims || index.dims[1] < 1 ||
-        index.dims[1] > 16 || index.dataType != INT32 || score.dataType != FLOAT32 || index.dataDevice != CUDA ||
+        index.dims[1] > 16 || index.dataType != fastllm::INT32 || score.dataType != FLOAT32 || index.dataDevice != CUDA ||
         score.dataDevice != CUDA || !index.cudaData || !score.cudaData || !PackedCacheRows(index) ||
         !PackedCacheRows(score) || !origin.frequencyActive)
         return false;

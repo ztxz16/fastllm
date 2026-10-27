@@ -84,7 +84,7 @@ struct Glm5TensorParallel {
             Allocate(r.scratch, FLOAT32, {maxRoutes,2048}, d);
             Allocate(r.result, FLOAT32, {maxRoutes,4096}, d);
             Allocate(r.cpu, FLOAT32, {maxRoutes,4096}, d);
-            for (auto *meta : {&r.slots, &r.map, &r.ids, &r.owners}) Allocate(*meta, INT32, {maxRoutes}, d);
+            for (auto *meta : {&r.slots, &r.map, &r.ids, &r.owners}) Allocate(*meta, fastllm::INT32, {maxRoutes}, d);
             Allocate(r.scores, FLOAT32, {maxRoutes}, d);
             checkCudaErrors("TP gate event", cudaEventCreateWithFlags(&r.gate, cudaEventDisableTiming));
             checkCudaErrors("TP down event", cudaEventCreate(&r.down));
@@ -189,7 +189,7 @@ bool RunGlm5Tp(OffloadGroup &group, int table, const fastllm::Data &input,
     const int origin = FastllmCudaGetDevice();
     const int routes = rows * topk;
     AssertInFastLLM(topk > 0 && topk <= kMaxTopK && index.dims == std::vector<int>({rows,topk}) &&
-        score.dims == index.dims && index.dataType == INT32 && score.dataType == FLOAT32 &&
+        score.dims == index.dims && index.dataType == fastllm::INT32 && score.dataType == FLOAT32 &&
         index.cudaData && score.cudaData,
         "Invalid MoE TP routes.");
     s.Observe();
