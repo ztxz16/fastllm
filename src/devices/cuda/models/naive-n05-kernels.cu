@@ -37,6 +37,14 @@
 #define FASTLLM_NAIVE_DSA_MMA
 #include "naive-n05-dsa-mma.cuh"
 #include "naive-n05-indexer-batch.cuh"
+#include "naive-n05-indexer-staged.cuh"
+#if CUDART_VERSION >= 12040
+#include "naive-n05-indexer-compact.cuh"
+#endif
+#include "naive-n05-indexer-sortpack.cuh"
+#include "naive-n05-indexer-wide-select.cuh"
+#include "naive-n05-context-merge.cuh"
+#include "naive-n05-context-merge-chunk.cuh"
 #endif
 
 namespace {
@@ -837,8 +845,11 @@ struct RopeCacheRow {
     bool separateIndex = false;
     int indexPageLen = 0, indexContextRank = 0;
 };
-constexpr int kRopeCacheBatch = 32;
+constexpr int kRopeArgumentBytes = CUDART_VERSION >= 12010 ? 32764 : 4096;
+constexpr int kRopeCacheBatch = std::min(192, (kRopeArgumentBytes - 128) / int(sizeof(RopeCacheRow)));
 struct RopeCacheBatch { RopeCacheRow rows[kRopeCacheBatch]; };
+#include "naive-n05-rope-compact.cuh"
+#include "naive-n05-rope-request.cuh"
 
 template <bool Packed>
 __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
@@ -2541,13 +2552,46 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
     if (!PrepareBatchRopeCache(q, k, v, positions, rows, liveKeys, heads, kvHeads,
             dim, valueDim, rotaryDim, theta, valueScale, window, packedQkv, ring,
             descriptors, indexDim)) return false;
+    // Compact only graph-bound decode requests with the screened geometry.
+    // Validate the complete batch before any kernel can modify Q or KV.
+#if CUDART_VERSION >= 12010
+    const bool compactGeometry = count >= 80 && count <= kCompactRopeRequests &&
+        heads == 16 && kvHeads == (ring ? 2 : 1) && dim == 192 && valueDim == 128 &&
+        rotaryDim == 64 && indexDim == (ring ? 0 : 128) && window == (ring ? 128 : 0);
+    if (compactGeometry && FastllmCudaRuntimeArch() == 90) {
+        CompactRopeRequests packed{};
+        if (PackRope(descriptors.data(), count, packed)) {
+            if (ring) {
+                auto kernel = packedQkv ? RequestRope<true, CompactRopeRequests, 2>
+                                       : RequestRope<false, CompactRopeRequests, 2>;
+                kernel<<<count, 128>>>(packed, heads, kvHeads, dim, valueDim, indexDim,
+                    rotaryDim, theta, __float2bfloat16_rn(valueScale), window, ring);
+            } else {
+                auto kernel = packedQkv ? RequestRope<true, CompactRopeRequests, 1>
+                                       : RequestRope<false, CompactRopeRequests, 1>;
+                kernel<<<count, 128>>>(packed, heads, kvHeads, dim, valueDim, indexDim,
+                    rotaryDim, theta, __float2bfloat16_rn(valueScale), window, ring);
+            }
+            CheckLaunch();
+            return true;
+        }
+    }
+#endif
     // Validate every cache before launching, so a fallback cannot double-rotate Q.
     for (int first = 0; first < count; first += kRopeCacheBatch) {
         const int batchSize = std::min(kRopeCacheBatch, count - first);
         RopeCacheBatch batch{};
         std::copy_n(descriptors.begin() + first, batchSize, batch.rows);
-        auto kernel = packedQkv ? BatchRopeAppendCache<true> : BatchRopeAppendCache<false>;
-        kernel<<<dim3(heads + 2 * kvHeads + (indexDim != 0), batchSize), 128>>>(batch,
+        // One CTA per request amortizes angle calculation for sufficiently
+        // large batches. Keep the original launch for small or wider shapes.
+        const bool requestFusion = batchSize >= 80 && rotaryDim > 0 &&
+            rotaryDim <= 192 && rotaryDim % 2 == 0 && rotaryDim <= dim &&
+            (!indexDim || (indexDim == 128 && rotaryDim <= indexDim));
+        auto kernel = requestFusion ? (packedQkv ? RequestRope<true> : RequestRope<false>)
+                                    : (packedQkv ? BatchRopeAppendCache<true> : BatchRopeAppendCache<false>);
+        const dim3 grid = requestFusion ? dim3(batchSize)
+            : dim3(heads + 2 * kvHeads + (indexDim != 0), batchSize);
+        kernel<<<grid, 128>>>(batch,
             heads, kvHeads, dim, valueDim, indexDim, rotaryDim, theta,
             __float2bfloat16_rn(valueScale), window, ring);
     }
@@ -3787,42 +3831,152 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             (uintptr_t)row.key->cudaData % 16 == 0;
     }
 
+    auto prepareRow = [&](int index) {
+        const auto &row = rows[index];
+        auto &scratch = *row.scratch;
+        Output(scratch.indexQuery, BFLOAT16, {heads, dim});
+        Output(scratch.indexScale, FLOAT32, {heads});
+        Output(scratch.indexScores, INT32, {row.capacity});
+        Output(scratch.topk, INT32, {(int)(sizeof(naive_topk::Workspace) / sizeof(int))});
+        Output(*row.indices, INT32, {1, naive_topk::kTopK});
+        batch::Row descriptor = {FastllmNaiveKV(*row.key),
+            (const int *)liveKeys.cudaData + row.sequence, (BF16 *)scratch.indexQuery.cudaData,
+            (float *)scratch.indexScale.cudaData, (unsigned *)scratch.indexScores.cudaData,
+            (naive_topk::Workspace *)scratch.topk.cudaData, (int *)row.indices->cudaData,
+            row.sequence, row.key->dims[2], row.cache};
+        descriptor.cpRank = contextRank;
+        descriptor.cpRanks = contextRanks;
+        descriptor.contextPageLen = contextPageLen;
+        return descriptor;
+    };
+    bool compactScores = false;
+    std::vector<batch::Row> compactRows;
+#if CUDART_VERSION >= 12040
+    // Only combine descriptor chunks for the validated large Hopper CP4
+    // paged-FP8 layout. Small batches and other layouts keep their old path.
+    compactScores = hopper && cacheType == FP8_E4M3 && cp && contextRanks == 4 &&
+        contextPageLen == 128 && rows.size() > batch::BatchLimit &&
+        rows.size() <= naive_indexer_compact::CompactLimit;
+    for (const auto &row : rows)
+        compactScores = compactScores && row.key->dims[2] == rows.front().key->dims[2];
+    compactScores = compactScores &&
+        BulkKernelSupported(naive_indexer_compact::Scores<true>, 0, 90);
+    if (compactScores) {
+        namespace compact = naive_indexer_compact;
+        compact::CompactBatch descriptors{};
+        compactRows.reserve(rows.size());
+        int capacity = 0;
+        for (int i = 0; i < (int)rows.size(); ++i) {
+            compactRows.push_back(prepareRow(i));
+            const auto &r = compactRows.back();
+            descriptors.rows[i] = {r.key.base, r.key.pages, r.cache, r.key.offset,
+                r.live, r.query, r.scale, r.scores, r.sequence};
+            if (!i) {
+                descriptors.stride = r.stride;
+                descriptors.pageLen = r.key.pageLen;
+                descriptors.pageShift = r.key.pageShift;
+                descriptors.cpRank = contextRank;
+                descriptors.cpRanks = contextRanks;
+                descriptors.contextPageLen = contextPageLen;
+                descriptors.scaledIndexer = r.key.scaledIndexer;
+            }
+            capacity = std::max(capacity, rows[i].capacity);
+        }
+        capacity = ((capacity + contextPageLen - 1) / contextPageLen) *
+            (contextPageLen / contextRanks);
+        compact::QuantizeCompact<<<dim3(heads, rows.size()), dim>>>(
+            (const BF16 *)query.cudaData, descriptors);
+        const int blocks = DecodeIndexerScoreBlocks(rows.size(),
+            (capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, 128);
+        // Flat caches retain the original score kernel; only native32-key
+        // pages reuse an address across the two16-key halves.
+        if (descriptors.pageLen == 32 &&
+            BulkKernelSupported(compact::Scores<true, true>, 0, 90)) {
+            compact::Scores<true, true><<<dim3(blocks, rows.size()), 128>>>(
+                (const BF16 *)weights.cudaData, descriptors);
+        } else {
+            compact::Scores<true><<<dim3(blocks, rows.size()), 128>>>(
+                (const BF16 *)weights.cudaData, descriptors);
+        }
+    }
+#endif
+
+#if CUDART_VERSION >= 12040
+    // Scores for every row have finished before this branch. Only combine
+    // the already validated Hopper/FP8/CP4 layout; retain all other paths.
+    if (compactScores && rows.size() <= batch::kLocalTopKLimit) {
+        int capacity = 0;
+        for (const auto &row : rows) capacity = std::max(capacity, row.capacity);
+        capacity = ((capacity + contextPageLen - 1) / contextPageLen) *
+            (contextPageLen / contextRanks);
+        auto select = naive_indexer_wide_select::SelectWide<batch::LocalTopKBatch>;
+        auto sort = naive_indexer_sortpack::SortPack<256, 5, true, true, batch::LocalTopKBatch>;
+        auto copy = batch::CopyPacked<batch::LocalTopKBatch>;
+        constexpr size_t bytes = naive_indexer_sortpack::SortBytes<256, 5, true>();
+        if (capacity > 16384 && capacity <= 65536 &&
+                BulkKernelSupported(select, 0, 90) &&
+                BulkKernelSupported(sort, bytes, 90) &&
+                BulkKernelSupported(copy, 0, 90)) {
+            batch::LocalTopKBatch descriptors{};
+            descriptors.rank=contextRank; descriptors.ranks=contextRanks;
+            descriptors.page=contextPageLen;
+            for (int i=0; i<(int)compactRows.size(); ++i) {
+                const auto &r=compactRows[i];
+                descriptors.rows[i]={r.live, r.scores, r.workspace, r.indices};
+            }
+            select<<<rows.size(), 1024>>>(descriptors);
+            sort<<<rows.size(), 256, bytes>>>(descriptors);
+            // Exchange storage may alias score slices. All selection and
+            // sorting must finish before any packed candidate is copied.
+            copy<<<rows.size(), naive_topk::kThreads>>>(descriptors,
+                (unsigned *)exchange->cudaData, rows.size(), 0);
+            CheckLaunch();
+            return true;
+        }
+    }
+#endif
+
     for (int first = 0; first < (int)rows.size(); first += batch::BatchLimit) {
         const int count = std::min(batch::BatchLimit, (int)rows.size() - first);
         batch::Batch descriptors{};
         int capacity = 0;
         for (int i = 0; i < count; ++i) {
             const auto &row = rows[first + i];
-            auto &scratch = *row.scratch;
-            Output(scratch.indexQuery, BFLOAT16, {heads, dim});
-            Output(scratch.indexScale, FLOAT32, {heads});
-            Output(scratch.indexScores, INT32, {row.capacity});
-            Output(scratch.topk, INT32, {(int)(sizeof(naive_topk::Workspace) / sizeof(int))});
-            Output(*row.indices, INT32, {1, naive_topk::kTopK});
-            descriptors.rows[i] = {FastllmNaiveKV(*row.key),
-                (const int *)liveKeys.cudaData + row.sequence, (BF16 *)scratch.indexQuery.cudaData,
-                (float *)scratch.indexScale.cudaData, (unsigned *)scratch.indexScores.cudaData,
-                (naive_topk::Workspace *)scratch.topk.cudaData, (int *)row.indices->cudaData,
-                row.sequence, row.key->dims[2], row.cache};
-            descriptors.rows[i].cpRank = contextRank;
-            descriptors.rows[i].cpRanks = contextRanks;
-            descriptors.rows[i].contextPageLen = contextPageLen;
+            descriptors.rows[i] = compactScores ? compactRows[first + i] : prepareRow(first + i);
             capacity = std::max(capacity, row.capacity);
         }
         if (contextPageLen) capacity = ((capacity + contextPageLen - 1) / contextPageLen) * (contextPageLen / contextRanks);
         else if (cp) capacity = ((capacity + contextRanks * 64 - 1) / (contextRanks * 64)) * 64;
-        batch::Quantize<<<dim3(heads, count), dim>>>((const BF16 *)query.cudaData, descriptors);
-        const bool fp8Keys = cacheType == FP8_E4M3 || rows.front().key->kvCacheFp8Indexer;
-        // Native FP8 tiles use less shared memory and admit more resident CTAs.
-        const int scoreBlocks = DecodeIndexerScoreBlocks(count,
-            (capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, hopper && fp8Keys && CUDART_VERSION >= 12040 ? 64 : 32);
-        const dim3 grid(scoreBlocks, count);
-        if (hopper) {
-            auto kernel = fp8Keys ? batch::HopperScores<true, (CUDART_VERSION >= 12040)> : batch::HopperScores<false>;
-            kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+        if (!compactScores) {
+            batch::Quantize<<<dim3(heads, count), dim>>>((const BF16 *)query.cudaData, descriptors);
+            const bool fp8Keys = cacheType == FP8_E4M3 || rows.front().key->kvCacheFp8Indexer;
+            // Native FP8 tiles use less shared memory and admit more resident CTAs.
+            const int scoreBlocks = DecodeIndexerScoreBlocks(count,
+                (capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, hopper && fp8Keys && CUDART_VERSION >= 12040 ? 64 : 32);
+            const dim3 grid(scoreBlocks, count);
+    #if CUDART_VERSION >= 12040
+            // Check the compiled PTX image as well as the runtime GPU: an SM80
+            // image JITed on Hopper must retain the original compatible path.
+            if (hopper && cacheType == FP8_E4M3 && rows.size() >= 16 &&
+                BulkKernelSupported(batch::HopperScoresSharedHead, 0, 90)) {
+                batch::HopperScoresSharedHead<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+            } else
+    #endif
+            if (hopper) {
+                auto kernel = fp8Keys ? batch::HopperScores<true, (CUDART_VERSION >= 12040)> : batch::HopperScores<false>;
+                kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+            }
+            else batch::Scores<<<grid, naive_dsa_mma::kThreads>>>((const BF16 *)weights.cudaData, descriptors);
         }
-        else batch::Scores<<<grid, naive_dsa_mma::kThreads>>>((const BF16 *)weights.cudaData, descriptors);
-        if (capacity > 16384) {
+        // Bound the single-CTA row work; retain the existing paths for
+        // short rows, small batches, other CP layouts and architectures.
+        const bool wideSelect = cp && contextRanks == 4 && contextPageLen &&
+            rows.size() >= 16 && capacity > 16384 && capacity <= 65536 &&
+            FastllmCudaRuntimeArch() == 90 &&
+            BulkKernelSupported(naive_indexer_wide_select::SelectWide<>, 0, 90);
+        if (wideSelect) {
+            naive_indexer_wide_select::SelectWide<<<count, 1024>>>(descriptors);
+        } else if (capacity > 16384) {
             const int blocks = std::min(naive_topk::kMaxBlocks, (capacity + 4095) / 4096);
             for (int shift = 24; shift >= 0; shift -= 8) {
                 batch::SplitHistogram<><<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors, shift);
@@ -3830,11 +3984,28 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             }
             batch::SplitCompact<><<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors);
         } else batch::Select<><<<count, naive_topk::kThreads>>>(descriptors);
-        batch::Sort<><<<count, naive_topk::kThreads>>>(descriptors);
-        if (cp) {
-            batch::PackLocal<<<count, naive_topk::kThreads>>>(descriptors);
-            packedBatches.push_back(descriptors);
+        bool packed = false;
+        if (cp && contextRanks == 4 && contextPageLen && hopper && rows.size() >= 16) {
+            namespace sortpack = naive_indexer_sortpack;
+            if (rows.size() >= 128) {
+                constexpr size_t bytes = sortpack::SortBytes<256, 5, true>();
+                if (BulkKernelSupported(sortpack::SortPack<256, 5, true>, bytes, 90)) {
+                    sortpack::SortPack<256, 5, true><<<count, 256, bytes>>>(descriptors);
+                    packed = true;
+                }
+            } else {
+                constexpr size_t bytes = sortpack::SortBytes<512, 6, true>();
+                if (BulkKernelSupported(sortpack::SortPack<512, 6, true>, bytes, 90)) {
+                    sortpack::SortPack<512, 6, true><<<count, 512, bytes>>>(descriptors);
+                    packed = true;
+                }
+            }
         }
+        if (!packed) {
+            batch::Sort<><<<count, naive_topk::kThreads>>>(descriptors);
+            if (cp) batch::PackLocal<<<count, naive_topk::kThreads>>>(descriptors);
+        }
+        if (cp) packedBatches.push_back(descriptors);
     }
     // Scores may alias the exchange arena. Finish packing every row before
     // any copy can overwrite another row's score slice (CUDA 12.0 batches).
@@ -3888,8 +4059,27 @@ void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
             r.mergedRows = rows.size(); r.mergedRow = first + i;
         }
         if (contextPageLen) {
-            batch::ClearContextIndices<<<count, 256>>>(descriptors);
-            batch::MergeContextCandidates<<<dim3((contextRanks * naive_topk::kTopK + 255) / 256, count), 256>>>(descriptors);
+            constexpr size_t mergeSharedBytes = 6 * naive_topk::kTopK * sizeof(unsigned long long);
+            bool merged = false;
+            if (contextRanks == 4 && count >= 64) {
+                // Locate one interval per thread, then merge four adjacent
+                // keys in the same score/position order. Larger descriptor
+                // batches benefit from more independently active warps.
+                auto kernel = count >= 128
+                    ? merge_chunk_screen::MergeFourChunked<1024, 4>
+                    : merge_chunk_screen::MergeFourChunked<512, 4>;
+                if (BulkKernelSupported(kernel, mergeSharedBytes, 90)) {
+                    kernel<<<count, count >= 128 ? 1024 : 512, mergeSharedBytes>>>(descriptors);
+                    merged = true;
+                } else if (BulkKernelSupported(merge_screen::MergeFour<512, true>, mergeSharedBytes, 90)) {
+                    merge_screen::MergeFour<512, true><<<count, 512, mergeSharedBytes>>>(descriptors);
+                    merged = true;
+                }
+            }
+            if (!merged) {
+                batch::ClearContextIndices<<<count, 256>>>(descriptors);
+                batch::MergeContextCandidates<<<dim3((contextRanks * naive_topk::kTopK + 255) / 256, count), 256>>>(descriptors);
+            }
         } else {
             batch::Select<true><<<count, naive_topk::kThreads>>>(descriptors);
             batch::Sort<true><<<count, naive_topk::kThreads>>>(descriptors);
@@ -3914,6 +4104,67 @@ template <class Kernel> bool BulkKernelSupported(Kernel kernel, size_t shared, i
         found = cache.emplace(key, ok).first;
     }
     return found->second;
+}
+
+
+// Overlap the next packed FP8 tile load with current BF16 MMA. The kernel
+// retains the original QK/PV reduction order and global softmax tree.
+bool PrefetchDSAAttention(const fastllm::Data &query, const float *bias,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads,
+        fastllm::Data &output) {
+    namespace bulk = pipeline_bulk;
+    if (FastllmCudaRuntimeArch() != 90 || heads != 16 || kvHeads != 1 || rows.size() < 32)
+        return false;
+    for (const auto &row : rows)
+        if (!row.fp8 || !row.indices || row.selectedCount != 2048 || row.keyStride % 16 ||
+            (uintptr_t)row.key % 16 || (uintptr_t)row.value % 16)
+            return false;
+    // Share KV loads across two eight-warp groups without changing per-head
+    // accumulation. Keep small batches and unsupported resources on the old path.
+    if (rows.size() >= 64 && rows.size() <= bulk::MaxBatchLimit) {
+        auto sharedHeads = bulk::Decode<2048, false, true, true, true, true, true,
+            bulk::MaxBatchLimit, true>;
+        constexpr size_t shared = sizeof(bulk::Storage<2048, true, 16>);
+        if (BulkKernelSupported(sharedHeads, shared, 90)) {
+            bulk::BatchT<bulk::MaxBatchLimit> descriptors{};
+            std::copy(rows.begin(), rows.end(), descriptors.rows);
+            sharedHeads<<<dim3(heads / 16, rows.size()), 512, shared>>>(
+                (const BF16 *)query.cudaData, descriptors, bias,
+                (BF16 *)output.cudaData, heads, kvHeads);
+            return true;
+        }
+    }
+    // A larger descriptor only helps here when it removes the second
+    // launch. Keep the original specialization for small and larger batches.
+    if (rows.size() > bulk::BatchLimit && rows.size() <= bulk::MaxBatchLimit) {
+        auto expanded = bulk::Decode<2048, false, true, true, true, true, true,
+            bulk::MaxBatchLimit>;
+        constexpr size_t shared = sizeof(bulk::Storage<2048, true>);
+        if (BulkKernelSupported(expanded, shared, 90)) {
+            bulk::BatchT<bulk::MaxBatchLimit> descriptors{};
+            std::copy(rows.begin(), rows.end(), descriptors.rows);
+            expanded<<<dim3(heads / 8, rows.size()), 256, shared>>>(
+                (const BF16 *)query.cudaData, descriptors, bias,
+                (BF16 *)output.cudaData, heads, kvHeads);
+            return true;
+        }
+    }
+    const bool adjacentHeads = rows.size() >= 128;
+    auto kernel = adjacentHeads
+        ? bulk::Decode<2048, false, true, true, true, true, true>
+        : bulk::Decode<2048, false, true, true, true, true, false>;
+    constexpr size_t shared = sizeof(bulk::Storage<2048, true>);
+    if (!BulkKernelSupported(kernel, shared, 90)) return false;
+    for (int first = 0; first < (int)rows.size(); first += bulk::BatchLimit) {
+        const int count = std::min(bulk::BatchLimit, (int)rows.size() - first);
+        bulk::Batch batch{};
+        std::copy_n(rows.begin() + first, count, batch.rows);
+        const dim3 grid = adjacentHeads ? dim3(heads / 8, count) : dim3(count, heads / 8);
+        kernel<<<grid, 256, shared>>>(
+            (const BF16 *)query.cudaData + (size_t)first * heads * 192, batch, bias,
+            (BF16 *)output.cudaData + (size_t)first * heads * 128, heads, kvHeads);
+    }
+    return true;
 }
 
 template <int Max, bool Ring>

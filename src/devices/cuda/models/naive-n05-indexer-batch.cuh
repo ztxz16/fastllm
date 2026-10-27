@@ -66,6 +66,34 @@ constexpr int ArgumentBytes = 4096;
 constexpr int BatchLimit = (ArgumentBytes - 128) / sizeof(Row);
 struct Batch { Row rows[BatchLimit]; };
 
+__device__ __forceinline__ Row TopKRow(const Batch &batch, int i) {
+    return batch.rows[i];
+}
+#if CUDART_VERSION >= 12010
+struct LocalTopKRow {
+    const int *live;
+    unsigned *scores;
+    naive_topk::Workspace *workspace;
+    int *indices;
+};
+constexpr int kLocalTopKLimit = 512;
+struct LocalTopKBatch {
+    int rank, ranks, page;
+    LocalTopKRow rows[kLocalTopKLimit];
+};
+static_assert(sizeof(LocalTopKRow) == 32);
+static_assert(sizeof(LocalTopKBatch) + 128 <= ArgumentBytes);
+__device__ __forceinline__ Row TopKRow(const LocalTopKBatch &batch, int i) {
+    const auto &x = batch.rows[i];
+    Row row{};
+    row.live=x.live; row.scores=x.scores;
+    row.workspace=x.workspace; row.indices=x.indices;
+    row.cpRank=batch.rank; row.cpRanks=batch.ranks; row.contextPageLen=batch.page;
+    return row;
+}
+#endif
+
+
 // Long mixed-context batches used to launch one CTA for every key tile of the
 // longest row. Keep enough CTAs to fill Hopper, then let each CTA process a
 // strided sequence of tiles. Scores and TopK order remain unchanged.
@@ -466,8 +494,13 @@ __global__ void PackLocal(Batch batch) {
         r.workspace->candidates.positions[i] = position >= 0 ? r.LogicalPosition(position) : -1;
     }
 }
-__global__ void CopyPacked(Batch batch, unsigned *exchange, int rows, int first) {
-    const Row &r = batch.rows[blockIdx.x];
+template<class BatchType = Batch>
+__global__ void CopyPacked(
+#if CUDART_VERSION >= 12010
+        const __grid_constant__
+#endif
+        BatchType batch, unsigned *exchange, int rows, int first) {
+    const Row r = TopKRow(batch, blockIdx.x);
     unsigned *out = exchange + ((size_t)r.cpRank * rows + first + blockIdx.x) * naive_topk::kTopK * 2;
     for (int i = threadIdx.x; i < naive_topk::kTopK; i += blockDim.x) {
         out[i * 2] = r.workspace->candidates.keys[i];
