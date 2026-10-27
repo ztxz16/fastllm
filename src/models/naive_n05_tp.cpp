@@ -1213,7 +1213,7 @@ Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const 
     SetCurrentThreadExecutor(executor.get());
     if (tpDecodeState && tpDecodeState->active && !tpDecodeState->disabled)
         return ForwardTensorParallelDecode(rank, inputIds, positions, kv, config, embedding, capture,
-            candidateResult, batch, selection && selection->cudaSampling);
+            candidateResult, batch, selection && (selection->cudaSampling || selection->cudaLogits));
     // Generic operators can move their inputs. Give every worker its own IDs.
     Data localIds(inputIds), localPositions(positions);
     TargetWorkspace *workspace = batch ? tpBatchWorkspaces.at(rank).get() : capture && capture->verifying
@@ -1227,7 +1227,7 @@ Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const 
         ForceDeviceSync();
         return Data();
     }
-    if (!isIntermediateChunkedPrefill && !(selection && selection->cudaSampling))
+    if (!isIntermediateChunkedPrefill && !(selection && (selection->cudaSampling || selection->cudaLogits)))
         logits.ToDevice(DataDevice::CPU);
     ForceDeviceSync();
     return logits;
@@ -1262,7 +1262,8 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         });
     if (compact) selection->count = std::min(selection->count, vocab);
     const int count = compact ? selection->count : 0;
-    const bool cudaSampling = selection && selection->cudaSampling && !isIntermediateChunkedPrefill;
+    const bool cudaSampling = selection && (selection->cudaSampling || selection->cudaLogits) &&
+        !isIntermediateChunkedPrefill;
     LogitsSelection fullLogits;
     const int rows = batch ? batch->Size() : capture && capture->verifying ? inputIds.dims[1] : 1;
     const int sequences = batch ? batch->Size() : 1;
@@ -1757,6 +1758,10 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     if (trace) trace->Mark("kv_commit_prefix_ms");
     if (isIntermediateChunkedPrefill) return Data();
     if (cudaSampling) {
+        if (selection->cudaLogits) {
+            FastllmCudaSetDevice(tpDevices.front());
+            return Data(cudaLogits);
+        }
         selection->sampledTokens = SampleCudaLogits(cudaLogits,
             batch ? batch->configs : std::vector<GenerationConfig>{config});
         if (trace) trace->Mark("sampling_ms");

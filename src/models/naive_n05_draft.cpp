@@ -1044,6 +1044,19 @@ int NaiveN05FlashModel::ForwardDraft(
         return SpeculativeDistribution(values, vocab, config, history);
     };
     auto selection = SelectLogits(config, true);
+    // Reuse Qwen3.5's GPU proposal/rejection sampler for unrestricted top-p.
+    // This shares ordinary CUDA sampling's top-p boundary/tie handling.
+    // Its finite top-k semantics differ from the legacy CPU sampler; penalties,
+    // masks and minimum-output constraints also retain that generic fallback.
+#ifdef USE_CUDA
+    if (baseLogits.dataDevice == DataDevice::CUDA && SelectLogits(config).cudaSampling) {
+        context.proposalProbs.ToDevice(DataDevice::CUDA, baseLogits.dataDeviceIds, false);
+        context.proposalProbs.Resize({limit, vocab});
+        context.proposalProbs.Allocate(false);
+        selection.count = 0; // Even a vocabulary fitting compact top-k needs full device logits.
+        selection.cudaLogits = true;
+    }
+#endif
     Data proposalPartial, proposalTop;
     std::vector<float> proposalCandidates(selection.count * 2);
     std::vector<int> proposed;
@@ -1075,7 +1088,17 @@ int NaiveN05FlashModel::ForwardDraft(
             TopK(logits, top, 1);
             top.ToDevice(DataDevice::CPU);
             previous = (int)((float *)top.cpuData)[0];
-        } else {
+        }
+#ifdef USE_CUDA
+        else if (selection.cudaLogits) {
+            FastllmCudaSetDevice(logits.dataDeviceIds.at(0));
+            AssertInFastLLM(FastllmCudaMtpSampleDraft((float *)logits.cudaData,
+                (float *)context.proposalProbs.cudaData + (size_t)step * vocab,
+                &config.temperature, &config.top_k, &config.top_p, &previous, 1, vocab),
+                "Naive CUDA proposal sampling failed.");
+        }
+#endif
+        else {
 #ifdef USE_CUDA
             if (logits.dataDevice == DataDevice::CUDA &&
                 FastllmNaiveCanSelectLogits(vocab, 0, selection.count, false)) {
@@ -1108,6 +1131,22 @@ int NaiveN05FlashModel::ForwardDraft(
     ApplyDraftDevice();
     samplingTokens = lastTokens.units.empty() ? LastTokensUnit(config.last_n) : lastTokens.units[0];
     int accepted = 0, next = -1;
+#ifdef USE_CUDA
+    if (selection.cudaLogits) {
+        AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.dataType == FLOAT32 &&
+            logits.dataDeviceIds == context.proposalProbs.dataDeviceIds,
+            "Naive CUDA verification logits are on the wrong device.");
+        FastllmCudaSetDevice(logits.dataDeviceIds.at(0));
+        const int rows = proposed.size() + 1;
+        std::vector<float> temperatures(rows, config.temperature), topPs(rows, config.top_p);
+        std::vector<int> topKs(rows, config.top_k), sampled(rows);
+        AssertInFastLLM(FastllmCudaMtpRejectionSampling((float *)logits.cudaData,
+            (float *)context.proposalProbs.cudaData, temperatures.data(), topKs.data(), topPs.data(),
+            proposed.data(), sampled.data(), &accepted, 1, proposed.size(), vocab),
+            "Naive CUDA rejection sampling failed.");
+        next = sampled[accepted];
+    } else
+#endif
     if (greedy) {
         // For point-mass p and q, standard rejection sampling reduces exactly
         // to matching argmax tokens and emitting the target argmax on rejection.

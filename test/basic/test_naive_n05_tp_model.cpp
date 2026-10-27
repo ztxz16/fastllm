@@ -1674,7 +1674,7 @@ class Fixture : public NaiveN05FlashModel {
     void VerifySelections(int ranks) {
         draftTargetLayers = {0, 1};
         int checks = 0;
-        for (int topk : {1, 4, 50}) {
+        for (int topk : {1, 4, 50, 256}) {
             GenerationConfig cfg; cfg.top_k = topk; cfg.temperature = .7f; cfg.top_p = .8f;
             std::vector<std::vector<float>> expectedLogits;
             std::vector<std::map<int, std::vector<char>>> expectedHidden;
@@ -1687,6 +1687,7 @@ class Fixture : public NaiveN05FlashModel {
                     Data input(FLOAT32, {1, rows}, ids), positions(FLOAT32, {1, rows}, pos);
                     TargetCapture capture; capture.verifying = past > 0;
                     auto selection = SelectLogits(cfg, true);
+                    if (topk == 256) selection.cudaLogits = true;
                     if (!reference) capture.selection = &selection;
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
                     int launches = verifyGraphLaunches;
@@ -1697,7 +1698,16 @@ class Fixture : public NaiveN05FlashModel {
                         expectedLogits.emplace_back((float *)logits.cpuData, (float *)logits.cpuData + logits.Count(0));
                         expectedHidden.emplace_back();
                     } else {
-                        if (selection.candidates.dims.empty() || !logits.dims.empty())
+                        if (topk == 256) {
+                            if (logits.dataDevice != DataDevice::CUDA ||
+                                logits.dataDeviceIds != std::vector<int>{0} ||
+                                !selection.candidates.dims.empty() || !selection.sampledTokens.empty())
+                                throw std::runtime_error("verify device logits missing or sampled early");
+                            logits.ToDevice(DataDevice::CPU);
+                            if (logits.Count(0) != expectedLogits[step].size() ||
+                                std::memcmp(logits.cpuData, expectedLogits[step].data(), logits.GetBytes()))
+                                throw std::runtime_error("verify device logits differ from CPU shards");
+                        } else if (selection.candidates.dims.empty() || !logits.dims.empty())
                             throw std::runtime_error("verify compact output missing");
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
                         if (step == 3 && verifyGraphLaunches - launches != ranks)
@@ -1710,7 +1720,7 @@ class Fixture : public NaiveN05FlashModel {
                             for (int row = 0; row < outputRows; ++row)
                                 if (((float *)top.cpuData)[row * 2] != ((float *)selection.candidates.cpuData)[row * 2])
                                     throw std::runtime_error("compact greedy verify token mismatch");
-                        } else {
+                        } else if (topk < 256) {
                             for (int row = 0; row < outputRows; ++row) {
                                 auto p = SpeculativeDistribution(expectedLogits[step].data() + row * 256, 256, cfg, LastTokensUnit());
                                 auto q = SpeculativeTopKDistribution((float *)selection.candidates.cpuData + row * topk * 2, topk, 256, cfg);

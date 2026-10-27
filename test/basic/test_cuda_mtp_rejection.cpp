@@ -36,10 +36,16 @@ std::vector<double> Oracle(const std::vector<float> &logits, float t, int k, flo
     for (auto &v : p) v /= sum;
     auto original = p;
     // FastLLM's joint sampler uses strict-greater counts/mass, including ties.
-    for (int i = 0; i < (int)p.size(); ++i) {
-        double mass = 0; int count = 0;
-        for (double v : original) if (v > original[i]) { mass += v; ++count; }
-        if ((k > 0 && count >= k) || mass >= topP) p[i] = 0;
+    std::vector<int> order(p.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return original[a] > original[b]; });
+    double mass = 0;
+    for (int first = 0, end; first < (int)order.size(); first = end) {
+        for (end = first + 1; end < (int)order.size() &&
+                original[order[end]] == original[order[first]]; ++end) {}
+        for (int i = first; i < end; ++i)
+            if ((k > 0 && first >= k) || mass >= topP) p[order[i]] = 0;
+        for (int i = first; i < end; ++i) mass += original[order[i]];
     }
     sum = std::accumulate(p.begin(), p.end(), 0.0);
     for (auto &v : p) v /= sum;
@@ -256,6 +262,41 @@ void ChainCase(const char *name, std::vector<float> p, std::vector<float> qdist,
         name, drafts, vocab, double(counts[0])/batch, double(counts[1])/batch,
         double(counts[2])/batch, double(prefix[0])/batch, double(allAccepted)/batch);
 }
+void FullVocabularyCase() {
+    const int vocab = 152576, rows = 4;
+    const float temperatures[] = {1, .7f, 1.5f, 1};
+    const float topPs[] = {.95f, .5f, 1, .01f};
+    const int topK = vocab;
+    std::vector<float> logits(rows * vocab);
+    for (int row = 0; row < rows; ++row)
+        for (int id = 0; id < vocab; ++id)
+            logits[row * vocab + id] = -float((id * 73 + row * 19) % 1000) / 16;
+    Buffer input(logits), proposals(logits.size());
+    std::vector<float> saved;
+    for (int row = 0; row < rows; ++row) {
+        int token = -1;
+        Require(FastllmCudaMtpSampleDraft(input.p + (size_t)row * vocab,
+            proposals.p + (size_t)row * vocab, temperatures + row, &topK,
+            topPs + row, &token, 1, vocab), "full-vocabulary proposal failed");
+        std::vector<float> source(logits.begin() + row * vocab, logits.begin() + (row + 1) * vocab);
+        auto expected = Oracle(source, temperatures[row], vocab, topPs[row]);
+        auto actual = proposals.Read();
+        Require(token >= 0 && token < vocab && expected[token] > 0,
+                "full-vocabulary proposal outside nucleus support");
+        double error = 0, sum = 0;
+        for (int id = 0; id < vocab; ++id) {
+            error += std::fabs(actual[row * vocab + id] - expected[id]);
+            sum += actual[row * vocab + id];
+        }
+        Require(error < 1e-4 && std::fabs(sum - 1) < 1e-5,
+                "full-vocabulary q disagrees with the joint sampler oracle");
+        // Later proposal steps must not overwrite earlier persistent q rows.
+        Require(std::equal(saved.begin(), saved.end(), actual.begin()),
+                "later draft step overwrote a saved proposal row");
+        saved.assign(actual.begin(), actual.begin() + (row + 1) * vocab);
+    }
+    std::puts("152576-token vocabulary, sequential q rows, temperatures/top-p/ties: PASS");
+}
 }
 int main() {
     int n = 0;
@@ -265,8 +306,10 @@ int main() {
         FilterCase();
         DeviceFilterCase();
         MarkovGraphCase();
+        FullVocabularyCase();
         ChainCase("identical", {.6f,.3f,.1f}, {.6f,.3f,.1f}, 3, 32);
         ChainCase("different", {.6f,.3f,.1f}, {.3f,.5f,.2f}, 3, 17);
+        ChainCase("seven drafts", {.6f,.3f,.1f}, {.3f,.5f,.2f}, 7, 32);
         ChainCase("two-wide", {.6f,.3f,.1f}, {.3f,.5f,.2f}, 3, 18);
         ChainCase("loop exit", {.6f,.3f,.1f}, {.95f,.04f,.01f}, 1, 32);
         ChainCase("disjoint", {0,1,0}, {1,0,0}, 3, 32);

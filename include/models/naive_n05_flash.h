@@ -158,6 +158,7 @@ namespace fastllm {
             int count = 0;
             bool greedy = false;
             bool cudaSampling = false;
+            bool cudaLogits = false; // Keep full logits on device for rejection sampling.
             float invTemperature = 1.0f;
             Data candidates; // CPU [rows, count * 2], (global token ID, score).
             std::vector<int> sampledTokens;
@@ -180,6 +181,7 @@ namespace fastllm {
             int committed = 0;
             std::vector<std::pair<Data, Data>> kv;
             std::shared_ptr<DraftWorkspace> workspace;
+            Data proposalProbs{FLOAT32}; // Actual GPU proposal distributions, retained until verification.
             std::deque<std::pair<int, int>> pending;
             std::mt19937_64 random{std::random_device{}()};
             uint64_t rounds = 0, proposed = 0, accepted = 0;
