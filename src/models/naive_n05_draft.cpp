@@ -636,7 +636,7 @@ Data NaiveN05FlashModel::RunDraftTarget(const Data &inputIds, const Data &positi
 }
 
 void NaiveN05FlashModel::CommitTargetCache(std::vector<std::pair<Data, Data>> &kv,
-        int past, int count) {
+        int past, int count, bool ringVerify) {
 #ifdef USE_CUDA
     auto commit = [&](int device) {
         for (int layer = 0; layer < block_cnt; ++layer) {
@@ -644,6 +644,11 @@ void NaiveN05FlashModel::CommitTargetCache(std::vector<std::pair<Data, Data>> &k
             auto &pair = kv[layer];
             Data &key = device < 0 ? pair.first : *pair.first.multiDeviceDatas.at(device);
             Data &value = device < 0 ? pair.second : *pair.second.multiDeviceDatas.at(device);
+            if (slidingLayers[layer] && ringVerify) {
+                FastllmCudaSetDevice(key.dataDeviceIds.at(0));
+                FastllmCudaNaiveCommitSwaVerify(key, value, past, count);
+                continue;
+            }
             key.Resize({1, length, key.dims[2]});
             value.Resize({1, length, value.dims[2]});
             if (slidingLayers[layer]) {
@@ -1138,7 +1143,7 @@ int NaiveN05FlashModel::ForwardDraft(
         }
     }
     int committed = accepted + 1;
-    CommitTargetCache(kv, oldLength, committed);
+    CommitTargetCache(kv, oldLength, committed, capture.ringVerify);
     CommitDraftContext(capture, committed, context, kv);
     ++context.rounds;
     context.proposed += proposed.size();

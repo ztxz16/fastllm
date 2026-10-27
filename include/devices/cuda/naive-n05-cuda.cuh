@@ -108,7 +108,7 @@ bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     const fastllm::Data &positions, fastllm::Data &key, fastllm::Data &value,
     const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
     int rotaryDim, float theta, float valueScale, int window,
-    const fastllm::Data *packedQkv = nullptr, bool ring = false);
+    const fastllm::Data *packedQkv = nullptr, bool ring = false, bool ringVerify = false);
 // One decode token per independent cache. Descriptors are captured as kernel
 // arguments; optional device indirection updates KV bindings without recapture.
 struct FastllmNaiveRopeCacheRow {
@@ -136,6 +136,9 @@ bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
 // Uses shared memory only, preserves allocations and host dimensions.
 void FastllmCudaNaiveSwaCacheLayout(fastllm::Data &key, fastllm::Data &value,
     int past, bool toRing);
+// Accept rows staged at [128, 128+count), preserving rejected history bitwise.
+void FastllmCudaNaiveCommitSwaVerify(fastllm::Data &key, fastllm::Data &value,
+    int past, int count);
 // Keep the allocation and logical row order when retaining a sliding suffix.
 void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int keep);
 // Exact descending score / ascending position order for each query row.
@@ -279,7 +282,7 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
 // Fixed-shape verification graphs keep one live prefix length per query.
 void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,
     const fastllm::Data &newKey, const fastllm::Data &newValue,
-    const fastllm::Data &liveKeys, int window);
+    const fastllm::Data &liveKeys, int window, bool ringVerify = false);
 void FastllmCudaNaiveGraphVerifyIndexer(const fastllm::Data &query,
     const fastllm::Data &weights, const fastllm::Data &packedKeys,
     const fastllm::Data &liveKeys, int capacity, bool fp8Query,
@@ -289,7 +292,7 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
     const fastllm::Data &indices, const fastllm::Data &sink,
     const fastllm::Data &liveKeys, int capacity, int heads, int kvHeads,
     int dim, int valueDim, int window,
-    FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &output, bool ringVerify = false);
 
 // Fixed draft inputs and attention read the live absolute prefix on the GPU.
 void FastllmCudaNaiveDraftInput(const fastllm::Data &id, const fastllm::Data &embedding,

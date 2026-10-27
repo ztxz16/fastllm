@@ -342,6 +342,15 @@ __global__ void SwaCacheLayout(T *key, T *value, int kc, int vc, int count, int 
     }
 }
 
+template <typename T>
+__global__ void CommitSwaVerify(T *key, T *value, int kc, int vc, int past) {
+    int column = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
+    const int slot = (past + row) & (kSwaWindow - 1);
+    if (column < kc) key[(size_t)slot * kc + column] = key[(size_t)(kSwaWindow + row) * kc + column];
+    else if ((column -= kc) < vc)
+        value[(size_t)slot * vc + column] = value[(size_t)(kSwaWindow + row) * vc + column];
+}
+
 template <typename T, bool Dynamic = false>
 __global__ void TrimCachePairTiled(T *key, T *value, int keyColumns,
                                  int valueColumns, int drop, int keep, const int *decodeKeys = nullptr) {
@@ -920,6 +929,7 @@ struct RopeCacheRow {
     void *indexCache = nullptr;
     bool separateIndex = false;
     int indexPageLen = 0, indexContextRank = 0;
+    bool ringVerify = false;
 };
 constexpr int kRopeArgumentBytes = CUDART_VERSION >= 12010 ? 32764 : 4096;
 constexpr int kRopeCacheBatch = std::min(192, (kRopeArgumentBytes - 128) / int(sizeof(RopeCacheRow)));
@@ -939,7 +949,8 @@ __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
     const int *length = r.length;
     const int keyRows = r.keyRows, valueRows = r.valueRows, cachePast = r.cachePast;
     const int past = length ? (window ? min(*length - 1, window - 1) : *length - 1) : cachePast;
-    const int row = ring ? ((*length - 1) & (kSwaWindow - 1)) : past + token;
+    const int row = r.ringVerify ? kSwaWindow + token :
+        ring ? ((*length - 1) & (kSwaWindow - 1)) : past + token;
     if (past < 0) {
         if (head < heads)
             for (int d = threadIdx.x; d < dim; d += blockDim.x)
@@ -1708,7 +1719,7 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
         const int row = blockIdx.y;
         q += (size_t)row * heads * kSwaQkDim;
         out += (size_t)row * heads * kSwaValueDim;
-        if constexpr (MaxKeys == kSwaWindow) {
+        if constexpr (MaxKeys == kSwaWindow && !Ring) {
             // Verification appends all rows before attention. Read each
             // causal window directly instead of copying it into scratch.
             const int end = (int)liveKeys + row;
@@ -1717,9 +1728,12 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
             v += (size_t)begin * kvHeads * kSwaValueDim;
         }
     }
-    int firstKey = 0;
+    int firstKey = 0, prefixEnd = 0;
     if constexpr (Ring) {
-        if constexpr (std::is_same<Length, BatchSwaKeys>::value)
+        if constexpr (Verify) {
+            prefixEnd = *liveKeys.length - 1;
+            firstKey = max(0, prefixEnd + (int)blockIdx.y + 1 - kSwaWindow);
+        } else if constexpr (std::is_same<Length, BatchSwaKeys>::value)
             firstKey = max(0, liveKeys.length[blockIdx.y] - kSwaWindow);
         else firstKey = max(0, *liveKeys.length - kSwaWindow);
     }
@@ -1727,17 +1741,22 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
     __shared__ __align__(16) BF16 values[MaxKeys][OutputTile];
     int h = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
     int kvHead = h / (heads / kvHeads), firstDim = blockIdx.z * OutputTile;
+    auto cacheRow = [&](int slot) {
+        const int row = firstKey + slot;
+        return Ring ? (Verify && row >= prefixEnd ? kSwaWindow + row - prefixEnd
+                                                  : row & (kSwaWindow - 1)) : slot;
+    };
     if (v.fp8) {
         for (int i = t; i < keys * (OutputTile / 8); i += Threads) {
             int row = i / (OutputTile / 8), col = i % (OutputTile / 8) * 8;
-            const int physical = Ring ? ((firstKey + row) & (kSwaWindow - 1)) : row;
+            const int physical = cacheRow(row);
             *(uint4 *)&values[row][col] = (v.Row(physical, kvHeads * kSwaValueDim) +
                 kvHead * kSwaValueDim + firstDim + col).Load8();
         }
     } else {
         for (int i = t; i < keys * OutputTile; i += Threads) {
             int row = i / OutputTile, col = i % OutputTile;
-            const int physical = Ring ? ((firstKey + row) & (kSwaWindow - 1)) : row;
+            const int physical = cacheRow(row);
             values[row][col] = v.Row(physical, kvHeads * kSwaValueDim)[kvHead * kSwaValueDim + firstDim + col];
         }
     }
@@ -1745,7 +1764,7 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
     #pragma unroll
     for (int i = 0; i < kSwaQkDim / 32; ++i) query[i] = (float)q[(size_t)h * kSwaQkDim + lane + i * 32];
     for (int slot = warp; slot < keys; slot += Threads / 32) {
-        const int physical = Ring ? ((firstKey + slot) & (kSwaWindow - 1)) : slot;
+        const int physical = cacheRow(slot);
         float dot = 0;
         #pragma unroll
         for (int i = 0; i < kSwaQkDim / 32; ++i)
@@ -1835,7 +1854,15 @@ void LaunchShortAttention(const BF16 *q, FastllmNaiveKV k, FastllmNaiveKV v,
                              : AttentionShortDecode<256, DecodeKeys, false, 1024>;
         }
     }
-    if constexpr (!Verify) {
+    if constexpr (Verify) {
+        if (ring) {
+            if (threads == 1024)
+                kernel = AttentionShortDecode<kSwaWindow, DecodeKeys, true, 1024, 64, true>;
+            else if (threads == 512)
+                kernel = AttentionShortDecode<kSwaWindow, DecodeKeys, true, 512, 64, true>;
+            else kernel = AttentionShortDecode<kSwaWindow, DecodeKeys, true, kSwaThreads, kSwaOutputTile, true>;
+        }
+    } else {
         if (ring) kernel = threads == 1024
             ? AttentionShortDecode<kSwaWindow, DecodeKeys, false, 1024, kSwaOutputTile, true>
             : AttentionShortDecode<kSwaWindow, DecodeKeys, false, kSwaThreads, kSwaOutputTile, true>;
@@ -2564,12 +2591,15 @@ bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, const fastllm::Data &indexKey,
         const fastllm::Data &positions, fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
-        int rotaryDim, float theta, float valueScale, int window, const fastllm::Data *packedQkv, bool ring) {
+        int rotaryDim, float theta, float valueScale, int window, const fastllm::Data *packedQkv, bool ring, bool ringVerify) {
     RopeCacheRow row{};
     int indexDim = 0;
     if (!PrepareRopeCache(q, k, v, indexKey, positions, key, value, liveKeys,
             heads, kvHeads, dim, valueDim, rotaryDim, theta, valueScale, window,
             packedQkv, ring, row, indexDim)) return false;
+    if (ringVerify && (ring || window != kSwaWindow || !row.length || q.dims[1] > 8 ||
+        std::min(row.keyRows, row.valueRows) < kSwaWindow + q.dims[1])) return false;
+    row.ringVerify = ringVerify;
     auto kernel = packedQkv ? RopeAppendCache<true> : RopeAppendCache<false>;
     kernel<<<q.dims[1] * (heads + 2 * kvHeads + (indexDim != 0)), 128>>>(row,
         heads, kvHeads, dim, valueDim, indexDim, rotaryDim, theta,
@@ -3529,11 +3559,11 @@ __global__ void AppendDecodeKV(FastllmNaiveKVWriteRow key, FastllmNaiveKVWriteRo
 }
 
 __global__ void AppendVerifyKV(FastllmNaiveKVWriteRow key, FastllmNaiveKVWriteRow value, const BF16 *newKey,
-        const BF16 *newValue, const int *length, int kc, int vc, int window) {
+        const BF16 *newValue, const int *length, int kc, int vc, int window, bool ringVerify) {
     int column = blockIdx.x * blockDim.x + threadIdx.x;
     const int query = blockIdx.y;
     const int past = window ? min(*length - 1, window - 1) : *length - 1;
-    const int row = past + query;
+    const int row = (ringVerify ? kSwaWindow : past) + query;
     if (column < kc) key[(size_t)row * kc + column] = newKey[(size_t)query * kc + column];
     else if ((column -= kc) < vc)
         value[(size_t)row * vc + column] = newValue[(size_t)query * vc + column];
@@ -3777,6 +3807,27 @@ void FastllmCudaNaiveSwaCacheLayout(fastllm::Data &key, fastllm::Data &value,
     if (key.dataType == FP8_E4M3) launch((uint8_t *)nullptr);
     else launch((BF16 *)nullptr);
     CheckLaunch();
+}
+
+void FastllmCudaNaiveCommitSwaVerify(fastllm::Data &key, fastllm::Data &value,
+        int past, int count) {
+    using namespace fastllm;
+    AssertInFastLLM(past >= 0 && count >= 0 && count <= 8 &&
+        FastllmNaiveKVType(key.dataType) && key.dataType == value.dataType &&
+        key.expansionDims.size() == 3 && value.expansionDims.size() == 3 &&
+        std::min(key.expansionDims[1], value.expansionDims[1]) >= kSwaWindow + count,
+        "Invalid staged SWA verification commit.");
+    if (count) {
+        const int kc = key.dims[2], vc = value.dims[2];
+        const dim3 grid((kc + vc + 255) / 256, count);
+        if (key.dataType == FP8_E4M3)
+            CommitSwaVerify<<<grid, 256>>>((uint8_t *)key.cudaData, (uint8_t *)value.cudaData, kc, vc, past);
+        else CommitSwaVerify<<<grid, 256>>>((BF16 *)key.cudaData, (BF16 *)value.cudaData, kc, vc, past);
+        CheckLaunch();
+    }
+    const int kept = std::min(past + count, kSwaWindow - 1);
+    key.Resize({1, kept, key.dims[2]});
+    value.Resize({1, kept, value.dims[2]});
 }
 
 void FastllmCudaNaiveTrimDecodeCache(fastllm::Data &key, fastllm::Data &value,
@@ -4610,7 +4661,7 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
 
 void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &newKey, const fastllm::Data &newValue,
-        const fastllm::Data &liveKeys, int window) {
+        const fastllm::Data &liveKeys, int window, bool ringVerify) {
     const int kc = key.dims[2], vc = value.dims[2], rows = newKey.dims[1];
     if (key.kvCacheFp8Indexer) {
         WriteIndexerCache<<<rows, 128>>>(FastllmNaiveKV(key), (const BF16 *)newKey.cudaData,
@@ -4620,7 +4671,7 @@ void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,
     }
     AppendVerifyKV<<<dim3((kc + vc + 255) / 256, rows), 256>>>({key.cudaData, key.dataType == fastllm::FP8_E4M3},
         {value.cudaData, value.dataType == fastllm::FP8_E4M3}, (const BF16 *)newKey.cudaData,
-        (const BF16 *)newValue.cudaData, (const int *)liveKeys.cudaData, kc, vc, window);
+        (const BF16 *)newValue.cudaData, (const int *)liveKeys.cudaData, kc, vc, window, ringVerify);
     CheckLaunch();
 }
 
@@ -4980,7 +5031,7 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
         const fastllm::Data &indices, const fastllm::Data &sink,
         const fastllm::Data &liveKeys, int capacity, int heads, int kvHeads,
         int dim, int valueDim, int window,
-        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output, bool ringVerify) {
     using namespace fastllm;
     const int rows = query.dims[1];
     Output(output, BFLOAT16, {1, rows, heads * valueDim});
@@ -4992,7 +5043,7 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
         auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
         auto *out = (BF16 *)output.cudaData;
         LaunchShortAttention<true>(q, k, v, bias, out, rows, heads, kvHeads,
-            key.dims[2], keys, window != 0);
+            key.dims[2], keys, window != 0, ringVerify);
         CheckLaunch();
         return;
     }

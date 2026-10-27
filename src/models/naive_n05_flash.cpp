@@ -1027,6 +1027,7 @@ Data NaiveN05FlashModel::RunTarget(
             if (attendPhase == 2) localPast -= length;
             const bool ringCache = tensorParallel && slidingLayers[layer] && tpSwaRingCache;
             const bool ringDecode = ringCache && decodeWorkspace && !graphVerify;
+            const bool ringVerify = ringCache && graphVerify && capture->ringVerify;
             Data noIndices;
             Data *selected = attendPhase == 2 ? &indices : &noIndices;
             int balancedIndexRanks = attendPhase == 2 ? prefillRanks : 0;
@@ -1039,7 +1040,7 @@ Data NaiveN05FlashModel::RunTarget(
                 }
                 // Graph replay reads/writes the ring directly. Eager prefill/fallback
                 // uses the existing contiguous kernels and restores the ring once.
-                // Verify was linearized outside capture by ForwardTensorParallel.
+                // Verification stages candidates after the ring or was linearized outside capture.
                 if (ringCache && !decodeWorkspace && !verifying && !sharedSwa)
                     FastllmCudaNaiveSwaCacheLayout(pastKey, pastValue, globalPast, false);
                 // Sliding layers retain only window-1 rows between chunks. Keep their
@@ -1069,7 +1070,7 @@ Data NaiveN05FlashModel::RunTarget(
                     FastllmCudaNaiveRopeAppendCache(q, k, v, localIndexer && !sparseLayer ? indexKey : noIndexKey,
                         positions, pastKey, pastValue, decodeWorkspace ? buf.liveKeys : noLiveKeys, cfg.heads, cfg.kvHeads,
                         cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale,
-                        slidingLayers[layer] ? window : 0, mergedQkv ? &qkv : nullptr, ringDecode));
+                        slidingLayers[layer] ? window : 0, mergedQkv ? &qkv : nullptr, ringDecode, ringVerify));
                 if (fusedCache && !decodeWorkspace) {
                     pastKey.Resize({1, localPast + length, pastKey.dims[2]});
                     pastValue.Resize({1, localPast + length, pastValue.dims[2]});
@@ -1094,7 +1095,7 @@ Data NaiveN05FlashModel::RunTarget(
                     }
                     if (decodeWorkspace) {
                         if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, *cacheInput, v,
-                            buf.liveKeys, slidingLayers[layer] ? window : 0);
+                            buf.liveKeys, slidingLayers[layer] ? window : 0, ringVerify);
                         else FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, *cacheInput, v,
                             buf.liveKeys, slidingLayers[layer] ? window : 0, ringDecode);
                     } else {
@@ -1307,7 +1308,7 @@ Data NaiveN05FlashModel::RunTarget(
             } else if (decodeWorkspace) {
                 if (graphVerify) FastllmCudaNaiveGraphVerifyAttention(q, attentionKey, attentionValue, *selected, sink,
                     buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
-                    slidingLayers[layer] ? window : 0, buf.decode, attn);
+                    slidingLayers[layer] ? window : 0, buf.decode, attn, ringVerify);
                 else FastllmCudaNaiveDecodeAttention(q, attentionKey, attentionValue, *selected, sink,
                     buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                     slidingLayers[layer] ? window : 0, buf.decode, attn, ringDecode);

@@ -1789,6 +1789,7 @@ class Fixture : public NaiveN05FlashModel {
             cfg.input_token_length = prompt;
             cfg.output_token_limit = 96;
             cfg.output_logits = true;
+            bool candidateRing = false;
             auto forward = [&](auto &kv, int start, int count, bool verifying) {
                 std::vector<float> ids(count), pos(count);
                 for (int row = 0; row < count; ++row) {
@@ -1799,6 +1800,7 @@ class Fixture : public NaiveN05FlashModel {
                 TargetCapture capture;
                 capture.verifying = verifying;
                 Data out = RunDraftTarget(input, positions, kv, cfg, capture);
+                if (&kv == &candidate) candidateRing = capture.ringVerify;
                 out.ToDevice(DataDevice::CPU);
                 if (out.dims != std::vector<int>({1, verifying ? count : 1, 256}) ||
                     capture.hidden.size() != 2)
@@ -1821,7 +1823,7 @@ class Fixture : public NaiveN05FlashModel {
                                        std::to_string(past) + " row " + std::to_string(row));
                     ++checks;
                 }
-                CommitTargetCache(candidate, past, keep);
+                CommitTargetCache(candidate, past, keep, candidateRing);
                 for (int layer = 0; layer < 2; ++layer)
                     if (candidate[layer].first.dims != reference[layer].first.dims)
                         throw std::runtime_error("graph rollback metadata mismatch");
@@ -2510,7 +2512,8 @@ int main(int argc, char **argv) {
             SetCudaEmbedding(true);
             failVerifyBegin = argc > 3 && std::string(argv[3]) == "failbegin";
             failVerifyInstantiate = argc > 3 && std::string(argv[3]) == "failinstantiate";
-            Fixture fixture(ranks, true, true);
+            Fixture fixture(ranks, true, true, argc > 5 && std::string(argv[5]) == "ring");
+            if (argc > 4 && std::string(argv[4]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
             fixture.VerifyGraphBlocks();
             return 0;
         }

@@ -1000,7 +1000,8 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     state->cachePointers = std::move(pointers);
     state->cacheCapacities = std::move(capacities);
     state->ncclGeneration = generation;
-    if (tpEp8MegaState && verifying) return false;
+    // Verification keeps all causal rows replicated in the resident EP arena.
+    // Its descriptors and barriers are prepared before capture, as for BS1.
     for (int rank = 0; rank < ranks; ++rank) {
         FastllmCudaSetDevice(tpDevices[rank]);
         if (!FastllmCudaNaiveDecodeGraphSupported()) return false;
@@ -1401,7 +1402,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         Embedding(inputIds, weight["model.embed_tokens.weight"], embedding);
     if (trace) trace->Mark("embedding_ms");
     const bool verify = capture && capture->verifying;
-    if (verify && tpSwaRingCache) {
+    auto linearizeVerifyRing = [&]() {
         runRanks([&](int rank) {
             FastllmCudaSetDevice(tpDevices[rank]);
             const int past = key(0, 0).dims.empty() ? 0 : key(0, 0).dims[1];
@@ -1410,7 +1411,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                     *key(0, layer).multiDeviceDatas.at(tpDevices[rank]),
                     *value(0, layer).multiDeviceDatas.at(tpDevices[rank]), past, false);
         });
-    }
+    };
     struct RestoreState {
         std::shared_ptr<TPDecodeState> &active, &saved;
         bool swapped;
@@ -1425,6 +1426,18 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     auto &cacheLengths = reuseServingCache ? tpServingState->cacheLengths : localCacheLengths;
     bool graphDecode = PrepareTensorParallelDecode(inputIds, kv, verify,
         compact ? *selection : fullLogits, cacheLengths, batch, capture && capture->collectHidden);
+    bool ringVerify = verify && tpSwaRingCache && graphDecode;
+    if (ringVerify) {
+        for (int layer = 0; layer < block_cnt; ++layer) if (slidingLayers[layer])
+            for (int device : tpDevices)
+                for (const Data *cache : {key(0, layer).multiDeviceDatas.at(device),
+                                         value(0, layer).multiDeviceDatas.at(device)})
+                    ringVerify = ringVerify && cache->expansionDims.size() == 3 &&
+                        cache->expansionDims[1] >= window + rows;
+    }
+    if (verify && tpSwaRingCache && !ringVerify) linearizeVerifyRing();
+    if (graphDecode && verify)
+        for (auto &rank : tpDecodeState->ranks) rank->features.ringVerify = ringVerify;
     // Retain each rank's scratch and communication addresses per execution mode.
     // The existing collective registration still validates the complete tuple.
     if (capture && capture->verifying && tpVerifyWorkspaces.empty()) {
@@ -1572,6 +1585,12 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             });
             fprintf(stderr, "[Fastllm] Naive TP decode graph capture failed; using eager for this cache.\n");
             graphDecode = false;
+            if (ringVerify) {
+                // Capture did not execute any writes. Eager kernels require
+                // the chronological prefix, including on a failed capture.
+                linearizeVerifyRing();
+                ringVerify = false;
+            }
         } else state.captured = true;
     }
     // Startup uses borrowed descriptor-only caches, not normal request-owned
@@ -1624,6 +1643,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     }
     if (graphDecode)
         tpDecodeState->mode = tpDecodeState->captured ? TPDecodeState::Replay : TPDecodeState::Warm;
+    if (capture) capture->ringVerify = ringVerify;
     if (trace) {
         trace->mode = graphDecode ? (tpDecodeState->captured ? "cuda_graph" : "graph_warmup") : "eager";
         trace->Mark("graph_capture_reserve_ms");

@@ -2203,6 +2203,10 @@ if (UNIT_TEST)
         target_include_directories(naive_n05_rope_cache_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME naive_n05_rope_cache COMMAND naive_n05_rope_cache_test)
         set_tests_properties(naive_n05_rope_cache PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        add_executable(naive_n05_swa_verify_test test/basic/test_cuda_naive_swa_verify.cu)
+        target_link_libraries(naive_n05_swa_verify_test PRIVATE fastllm)
+        add_test(NAME naive_n05_swa_verify COMMAND naive_n05_swa_verify_test)
+        set_tests_properties(naive_n05_swa_verify PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         if ("src/devices/cuda/models/naive-n05-qkv.cu" IN_LIST FASTLLM_CUDA_SM90_SOURCES)
             add_executable(naive_n05_qkv_test test/basic/test_cuda_naive_qkv.cu)
             target_link_libraries(naive_n05_qkv_test PRIVATE fastllm)
@@ -2363,6 +2367,18 @@ if (UNIT_TEST)
                     COMMAND naive_n05_verify_graph_test 8 verify_graph ${NAIVE_VERIFY_MODE})
                 set_tests_properties(naive_n05_verify_${NAIVE_VERIFY_MODE}
                     PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "VERIFY GRAPH PASS")
+                foreach(NAIVE_RING_TYPE bf16 fp8)
+                    add_test(NAME naive_n05_verify_ring_${NAIVE_RING_TYPE}_${NAIVE_VERIFY_MODE}
+                        COMMAND naive_n05_verify_graph_test 8 verify_graph ${NAIVE_VERIFY_MODE} ${NAIVE_RING_TYPE} ring)
+                    set_tests_properties(naive_n05_verify_ring_${NAIVE_RING_TYPE}_${NAIVE_VERIFY_MODE}
+                        PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                        PASS_REGULAR_EXPRESSION "VERIFY GRAPH PASS")
+                endforeach()
+                add_test(NAME naive_n05_verify_fp8_kv_${NAIVE_VERIFY_MODE}
+                    COMMAND naive_n05_verify_graph_test 8 verify_graph ${NAIVE_VERIFY_MODE} fp8)
+                set_tests_properties(naive_n05_verify_fp8_kv_${NAIVE_VERIFY_MODE}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                     PASS_REGULAR_EXPRESSION "VERIFY GRAPH PASS")
             endforeach()
             foreach(NAIVE_HISTORY_RANKS 2 4 8)

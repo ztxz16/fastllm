@@ -169,6 +169,7 @@ namespace fastllm {
             LogitsSelection *selection = nullptr;
             bool verifying = false;
             bool collectHidden = true;
+            bool ringVerify = false; // Candidates are staged after the retained SWA ring.
             std::map<int, Data> hidden;
             std::vector<PrefixSnapshots> prefixes;
         };
@@ -219,7 +220,7 @@ namespace fastllm {
         Data RunDraftTarget(const Data &inputIds, const Data &positions,
                             std::vector<std::pair<Data, Data>> &kv,
                             const GenerationConfig &config, TargetCapture &capture);
-        void CommitTargetCache(std::vector<std::pair<Data, Data>> &kv, int past, int count);
+        void CommitTargetCache(std::vector<std::pair<Data, Data>> &kv, int past, int count, bool ringVerify = false);
         int ForwardDraft(const Data &inputIds, const Data &positions,
                          std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
@@ -289,7 +290,7 @@ namespace fastllm {
         std::vector<std::vector<std::unique_ptr<PagedCacheManager>>> tpPagedCaches;
         bool tpPrepared = false;
         // Fixed at TP preparation so toggling CUDA Graph cannot change live KV
-        // layout. Prefill/eager and verify temporarily use chronological rows.
+        // layout. Prefill/eager fallback temporarily uses chronological rows.
         bool tpSwaRingCache = false;
         bool tpEp8Mega = false;
         std::shared_ptr<FastllmCudaMimoEp8Mega> tpEp8MegaState;
