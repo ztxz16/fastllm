@@ -11,6 +11,7 @@
 
 #include <array>
 #include <atomic>
+#include <deque>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -331,7 +332,9 @@ namespace fastllm {
             bool ready = false;
         };
         bool speculativeCaptureLinearReplay = false;
-        std::vector<std::map<int, std::unique_ptr<DFlashLinearReplay>>> dflashLinearReplay;
+        // deque grows without copying maps whose values have unique ownership.
+        // MSVC's map move constructor is not noexcept, so vector may try to copy.
+        std::deque<std::map<int, std::unique_ptr<DFlashLinearReplay>>> dflashLinearReplay;
         // Verify graphs capture addresses in this scratch storage.
         unsigned long long speculativeLinearStateGeneration = 0;
         // Single-request verification scratch, serialized by mtpCacheMutex.
