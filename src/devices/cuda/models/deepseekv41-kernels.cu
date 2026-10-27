@@ -1988,13 +1988,13 @@ namespace {
     // Decode uses heads as the MMA rows instead of padding one token to the
     // prefill kernel's 64 rows. Keep the dot-product and ordered head-sum
     // operations unchanged; the prefill kernel remains the general fallback.
-    template <bool BATCHED = false, bool PERSISTENT = false>
+    template <bool BATCHED = false, bool PERSISTENT = false, bool MULTIROW = false>
     __global__ void __launch_bounds__(256)
     V41IndexerScoreDecodeMmaKernel(const __nv_bfloat16 *q, const float *weights,
                                    const __nv_bfloat16 *k, int heads, int m,
                                    int ratio, int startPos, float *out,
                                    const uint8_t *k8, int kMode, int kRowBytes, int vecUnpack,
-                                   const V41DecodeIndexDescriptor *items = nullptr) {
+                                   const V41DecodeIndexDescriptor *items = nullptr, int queryRows = 1) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
         __shared__ __nv_bfloat16 ks[64][136];
         __shared__ __nv_bfloat16 qs[16][136];
@@ -2004,6 +2004,17 @@ namespace {
             const auto item = items[b];
             q = item.query; k = item.keys; weights = item.weights; out = item.scores;
             heads = item.heads; m = item.count; startPos = item.position; b = 0;
+        } else if constexpr (MULTIROW) {
+            // Each query keeps decode's head-wise MMA and accumulation order.
+            // Keys are shared by rows of the same request, not across requests.
+            const int request = b / queryRows, row = b % queryRows;
+            q += (size_t)b * heads * 128;
+            weights += (size_t)b * heads;
+            out += (size_t)b * m;
+            if (k) k += (size_t)request * m * 128;
+            if (k8) k8 += (size_t)request * m * kRowBytes;
+            startPos += row;
+            b = 0;
         }
         const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
         const int visible = ratio > 0 ? min(m, (startPos + 1) / ratio) : m;
@@ -4956,6 +4967,15 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const
                 (float*)output.cudaData, k8, kMode, kRowBytes, V41Fp4VecUnpack() ? 1 : 0);
             return V41CheckLaunch("IndexerScoreDecodeMma");
         }
+        if (seqlen >= 2 && seqlen <= 8 && heads > 0 && bsz <= 65535 / seqlen &&
+            V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<false, false, true>, 256>()) {
+            V41IndexerScoreDecodeMmaKernel<false, false, true><<<dim3((m + 63) / 64, bsz * seqlen), 256>>>(
+                (const __nv_bfloat16*)q.cudaData, (const float*)weights.cudaData,
+                kQuant ? nullptr : (const __nv_bfloat16*)k.cudaData, heads, m, ratio, startPos,
+                (float*)output.cudaData, k8, kMode, kRowBytes, V41Fp4VecUnpack() ? 1 : 0,
+                nullptr, seqlen);
+            return V41CheckLaunch("IndexerScoreSmallChunkMma");
+        }
         if (FastllmCudaGetThreadError()) return false;
         if (V41MmaKernelReady<V41IndexerScoreMmaKernel, kIdxMmaThreads>()) {
             dim3 mmaGrid((m + kIdxBJ - 1) / kIdxBJ, (seqlen + kIdxBT - 1) / kIdxBT, bsz);
@@ -5631,15 +5651,23 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
         !legacyAttention) {
         const int tokens = bsz * seqlen;
         const int headBlocks = (heads + kMmaHeads - 1) / kMmaHeads;
+        const bool smallVerify = tokens >= 2 && tokens <= 8 && startPos > 0 && !ringFp8 && !cmpFp8;
+        const bool splitValues = tokens == 1 || smallVerify;
         bool launched = false;
-        auto launch = [&](auto splitTag) {
+        auto launch = [&](auto splitTag, auto pipelineTag) {
             constexpr int splits = decltype(splitTag)::value;
-            using PvShared = V41MmaPvShared<splits>;
+            constexpr bool pipeline = decltype(pipelineTag)::value;
+            using PvShared = typename std::conditional<pipeline,
+                V41MmaPvPipelineShared<splits>, V41MmaPvShared<splits>>::type;
+            using QkShared = typename std::conditional<pipeline,
+                V41MmaScoresPrefetchShared, V41MmaShared>::type;
+            constexpr int qkThreads = pipeline ? kQkPrefetchCandidates * 4 : kMmaThreads;
             const int candidateTiles = ((startPos == 0 ? std::min(seqlen, windowSize) : windowSize) + topWidth + 63) / 64;
             const uint64_t scratchBytes = (uint64_t)tokens * heads * candidateTiles * 64 * sizeof(float);
-            if (tokens == 1 && candidateTiles >= 4 && scratchBytes <= 4 * 1024 * 1024 &&
-                V41MmaKernelReady<V41SparseAttentionScoresKernel<>, kMmaThreads, sizeof(V41MmaShared)>() &&
-                V41MmaKernelReady<V41SparseAttentionMmaKernel<splits, true>, kMmaThreads, sizeof(PvShared)>()) {
+            if (splitValues && (!smallVerify || !FastllmCudaGraphIsCapturing()) &&
+                candidateTiles >= 4 && scratchBytes <= 4 * 1024 * 1024 &&
+                V41MmaKernelReady<V41SparseAttentionScoresKernel<false, pipeline>, qkThreads, sizeof(QkShared)>() &&
+                V41MmaKernelReady<V41SparseAttentionMmaKernel<splits, true, false, pipeline>, kMmaThreads, sizeof(PvShared)>()) {
                 void *allocation = nullptr;
                 const auto allocated = FastllmCudaTryMalloc(&allocation, scratchBytes);
                 if (allocated == FASTLLM_CUDA_TRY_MALLOC_ERROR) return false;
@@ -5654,7 +5682,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                         }
                     } scratch{scores};
                     launched = true;
-                    V41SparseAttentionScoresKernel<><<<dim3(tokens, headBlocks, candidateTiles), kMmaThreads, sizeof(V41MmaShared)>>>(
+                    V41SparseAttentionScoresKernel<false, pipeline><<<dim3(tokens, headBlocks, candidateTiles * (pipeline ? 2 : 1)), qkThreads, sizeof(QkShared)>>>(
                         (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
                         hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
                         hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
@@ -5664,7 +5692,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                         seqlen, heads, windowSize, cap, topWidth, startPos, scores,
                         ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0);
                     if (!V41CheckLaunch("SparseAttentionScores")) return false;
-                    V41SparseAttentionMmaKernel<splits, true><<<dim3(tokens, headBlocks, splits), kMmaThreads, sizeof(PvShared)>>>(
+                    V41SparseAttentionMmaKernel<splits, true, false, pipeline><<<dim3(tokens, headBlocks, splits), kMmaThreads, sizeof(PvShared)>>>(
                         (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
                         hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
                         hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
@@ -5695,8 +5723,14 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                 ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0);
             return V41CheckLaunch("SparseAttentionMma");
         };
-        const bool ok = tokens == 1 ? launch(std::integral_constant<int, 8>{})
-                                    : launch(std::integral_constant<int, 1>{});
+        const bool pipeline = smallVerify && heads == 8 && V41IsSm<9, 0>() &&
+            V41MmaKernelReady<V41SparseAttentionScoresKernel<false, true>, kQkPrefetchCandidates * 4,
+                sizeof(V41MmaScoresPrefetchShared)>() &&
+            V41MmaKernelReady<V41SparseAttentionMmaKernel<8, true, false, true>, kMmaThreads,
+                sizeof(V41MmaPvPipelineShared<8>)>();
+        const bool ok = pipeline ? launch(std::integral_constant<int, 8>{}, std::true_type{}) :
+            splitValues ? launch(std::integral_constant<int, 8>{}, std::false_type{}) :
+                          launch(std::integral_constant<int, 1>{}, std::false_type{});
         // An unsupported image/resource configuration has submitted nothing.
         // Never retry a failed kernel launch: its execution state is unknown.
         if (launched) return ok;
