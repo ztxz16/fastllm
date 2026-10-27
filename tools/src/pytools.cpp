@@ -176,7 +176,13 @@ extern "C" {
             s.diskBytes, s.uploads, s.cpuEvictions, s.cudaEvictions,
             s.cpuCudaOverlapBytes, s.cudaDemotions, s.cudaDemotionBytes,
             s.cpuWorkspaceBytes, s.cpuBufferReuses, s.cpuBufferAllocations,
-            s.cpuReclaims, s.asyncMaintenance};
+            s.cpuReclaims, s.asyncMaintenance,
+            s.cpuBufferMmaps, s.cpuBufferMunmaps, s.cpuBufferSplits, s.cpuBufferCoalesces,
+            s.canonicalPromotionChecks, s.canonicalPromotionRejects, s.canonicalResidenceRejects,
+            s.canonicalUploadBytes, s.canonicalUploadUs, s.canonicalDownloadUs,
+            s.decodeHandoffD2HCopies, s.decodeHandoffD2HBytes, s.decodeHandoffWaitUs,
+            s.decodeOutputH2DCopies, s.decodeOutputH2DBytes,
+            s.residentReadbackCopies, s.residentReadbackBytes, s.residentReadbackWaitUs};
         const int count = sizeof(result) / sizeof(result[0]);
         if (values && capacity > 0) std::copy_n(result, std::min(capacity, count), values);
         return count;

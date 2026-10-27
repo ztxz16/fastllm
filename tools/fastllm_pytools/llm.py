@@ -831,7 +831,13 @@ def get_disk_moe_cache_stats():
              "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions",
              "cpu_cuda_overlap_bytes", "cuda_demotions", "cuda_demotion_bytes",
              "cpu_workspace_bytes", "cpu_buffer_reuses", "cpu_buffer_allocations",
-             "cpu_reclaims", "async_maintenance")
+             "cpu_reclaims", "async_maintenance",
+             "cpu_buffer_mmaps", "cpu_buffer_munmaps", "cpu_buffer_splits", "cpu_buffer_coalesces",
+             "canonical_promotion_checks", "canonical_promotion_rejects", "canonical_residence_rejects",
+             "canonical_upload_bytes", "canonical_upload_us", "canonical_download_us",
+             "decode_handoff_d2h_copies", "decode_handoff_d2h_bytes", "decode_handoff_wait_us",
+             "decode_output_h2d_copies", "decode_output_h2d_bytes",
+             "resident_readback_copies", "resident_readback_bytes", "resident_readback_wait_us")
     if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
         values = (ctypes.c_uint64 * len(names))()
         count = fastllm_lib.get_disk_moe_cache_stats_v2(values, len(names))

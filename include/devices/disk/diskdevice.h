@@ -38,6 +38,14 @@ namespace fastllm {
         uint64_t cpuCudaOverlapBytes = 0, cudaDemotions = 0, cudaDemotionBytes = 0;
         uint64_t cpuWorkspaceBytes = 0, cpuBufferReuses = 0, cpuBufferAllocations = 0;
         uint64_t cpuReclaims = 0, asyncMaintenance = 0;
+        uint64_t cpuBufferMmaps = 0, cpuBufferMunmaps = 0, cpuBufferSplits = 0, cpuBufferCoalesces = 0;
+        uint64_t canonicalPromotionChecks = 0, canonicalPromotionRejects = 0, canonicalResidenceRejects = 0;
+        // Host wall time including allocation/page preparation and transfer waits.
+        uint64_t canonicalUploadBytes = 0, canonicalUploadUs = 0;
+        uint64_t canonicalDownloadUs = 0; // Bytes are already counted by cudaDemotionBytes.
+        uint64_t decodeHandoffD2HCopies = 0, decodeHandoffD2HBytes = 0, decodeHandoffWaitUs = 0;
+        uint64_t decodeOutputH2DCopies = 0, decodeOutputH2DBytes = 0;
+        uint64_t residentReadbackCopies = 0, residentReadbackBytes = 0, residentReadbackWaitUs = 0;
     };
     // CUDA bytes are summed across devices; the configured CUDA budget is per GPU.
     DiskMoeCacheStats GetDiskMoeCacheStats();
@@ -53,6 +61,11 @@ namespace fastllm {
     // Bounded prediction from previous prefill routes. Hints only overlap I/O;
     // selected expert IDs and output math are always determined by the router.
     void PrefetchDiskMoeV41(const std::vector<Data *> &weights, int rows);
+
+    // Disk V4.1 single-token handoff only; unsupported layouts leave outputs
+    // unchanged and use the ordinary executor's staging.
+    bool StageDiskMoeV41Inputs(const Data &input, const Data &index, const Data &score,
+                               Data &hostInput, Data &hostIndex, Data &hostScore);
 
     // The TP owner submits one host MoE operation, sharing its RAM tier while
     // allowing resident experts on every participating CUDA device to run.
@@ -77,13 +90,16 @@ namespace fastllm {
     };
 
     class DiskMergeMOE : CpuMergeMOE {
+        enum class CachedMode { Cpu, GpuPrefill, GpuDecode };
         bool RunCached(const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams,
-                       bool gpuPrefillOnly = false);
+                       CachedMode mode = CachedMode::Cpu);
     public:
         // Leaves input/output on CUDA when the complete routed prefill fits.
         // A false result leaves the caller free to use the ordinary executor.
         bool RunGpuPrefill(Data &input, Data &index, Data &score, Data &output,
                            std::vector<Data *> &weights, float swigluLimit);
+        bool RunGpuDecode(Data &input, Data &index, Data &score, Data &output,
+                          std::vector<Data *> &weights, float swigluLimit);
 
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);

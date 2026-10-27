@@ -102,7 +102,8 @@ struct Fixture {
             ids.ToDevice(CUDA,{device},true); scores.ToDevice(CUDA,{device},true);
             void *inputPointer=x.cudaData;
             DiskMergeMOE op;
-            Check(op.RunGpuPrefill(x,ids,scores,y,disk,.8f),"GPU disk prefill rejected");
+            Check(rows == 1 ? op.RunGpuDecode(x,ids,scores,y,disk,.8f)
+                            : op.RunGpuPrefill(x,ids,scores,y,disk,.8f),"GPU disk handoff rejected");
             Check(x.cudaData==inputPointer && x.dataDevice==CUDA && y.dataDevice==CUDA,
                   "GPU disk prefill staged activations on CPU");
         } else if (lazy) {
@@ -546,9 +547,45 @@ static void TestTunedHybrid() {
 }
 #endif
 
+static void TestDiskDecodeHandoff() {
+    for (auto types : {std::pair<int,int>{GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XXS},
+                       {GGML_TYPE_IQ1_M,GGML_TYPE_IQ2_XS}}) {
+        Fixture f(types.first,types.second,0,512,256,12);
+        for (int gpuRecords : {0,2,12}) {
+            SetMoeCpuCacheBytes(0);SetMoeCudaCacheBytes(0);TrimDiskMoeCache();
+            SetMoeCpuCacheBytes(1ULL<<30);SetMoeCudaCacheBytes(f.bytes*gpuRecords);
+            for (int i=0;i<48;++i) f.Run(true,1,i%f.experts,0,6,false,true);
+            auto before=GetDiskMoeCacheStats();
+            for (int i=0;i<5;++i) {
+                // Same expert kernels/order/rounding with CPU or CUDA I/O,
+                // including duplicate routes (top-k > expert count below).
+                const auto reference=f.Run(true,1,i,0);
+                Compare(f.Run(true,1,i,0,6,false,true),reference,0);
+            }
+            auto after=GetDiskMoeCacheStats();
+            Check(after.decodeOutputH2DCopies>=before.decodeOutputH2DCopies+5,"decode upload adapter bypassed");
+            Check(after.cpuBytes+after.cpuWorkspaceBytes<=GetMoeCpuCacheBytes(),"handoff RAM budget");
+            // Resident weights must be rejected by this disk-only entry point.
+            Data x(BFLOAT16,{1,512}),ids(INT32,{1,1}),scores(FLOAT32,{1,1}),out;
+            DiskMergeMOE op;
+            Check(!op.RunGpuDecode(x,ids,scores,out,f.gpu,.8f),"accepted non-disk weights");
+        }
+    }
+    Fixture duplicate(GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ1_M,0,512,256,4);
+    SetMoeCpuCacheBytes(1ULL<<30);SetMoeCudaCacheBytes(duplicate.bytes*2);TrimDiskMoeCache();
+    for(int i=0;i<40;++i)duplicate.Run(true,1,i%4,0,8,false,true);
+    for(int i=0;i<8;++i) {
+        const auto reference=duplicate.Run(true,1,i,0,8);
+        Compare(duplicate.Run(true,1,i,0,8,false,true),reference,0);
+    }
+    SetMoeCpuCacheBytes(0);SetMoeCudaCacheBytes(0);TrimDiskMoeCache();
+    puts("PASS: disk decode pinned handoff, mixed tiers, duplicate routes and non-disk rejection");
+}
+
 int main(int argc, char **argv) { try {
     if (FastllmCudaGetDeviceCount()<1) return 77;
     SetThreads(4);
+    if (argc > 1 && !strcmp(argv[1], "--disk-decode-handoff")) { TestDiskDecodeHandoff(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "--tuned")) { TestTunedDecode(); return 0; }
 #ifdef USE_NUMAS
     if (argc > 1 && !strcmp(argv[1], "--tuned-hybrid")) {

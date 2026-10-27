@@ -1138,6 +1138,13 @@ if (UNIT_TEST)
             endif()
         endif()
 
+        add_executable(disk_weight_buffer_pool_test test/basic/test_disk_weight_buffer_pool.cpp)
+        target_include_directories(disk_weight_buffer_pool_test PRIVATE src)
+        target_link_libraries(disk_weight_buffer_pool_test PRIVATE Threads::Threads)
+        fastllm_add_checked_test(disk_weight_buffer_pool disk_weight_buffer_pool_test "PASS: disk mapped buffer" 60)
+        add_executable(disk_moe_replacement_cost_test test/basic/test_disk_moe_replacement_cost.cpp)
+        target_include_directories(disk_moe_replacement_cost_test PRIVATE src)
+        fastllm_add_checked_test(disk_moe_replacement_cost disk_moe_replacement_cost_test "PASS: disk replacement" 30)
         add_executable(disk_moe_cache_test test/basic/test_disk_moe_cache.cpp)
         target_link_libraries(disk_moe_cache_test PRIVATE fastllm)
         add_test(NAME disk_moe_cache COMMAND disk_moe_cache_test)
@@ -1166,6 +1173,9 @@ if (UNIT_TEST)
                 "PASS: disk V4.1 GGUF cache" 180)
             set_tests_properties(disk_v41_gguf_cache PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE
                 ENVIRONMENT "FT_GPU_PREFILL=1;FASTLLM_DISK_DIRECT_IO=1")
+            fastllm_add_checked_test(disk_v41_decode_handoff disk_v41_gguf_cache_test
+                "PASS: disk decode pinned handoff" 180 --disk-decode-handoff)
+            set_tests_properties(disk_v41_decode_handoff PROPERTIES LABELS "cuda;disk" RUN_SERIAL TRUE)
             fastllm_add_checked_test(cuda_v41_gguf_tuned disk_v41_gguf_cache_test
                 "PASS: tuned V4.1 GGUF decode" 360 --tuned)
             set_tests_properties(cuda_v41_gguf_tuned PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE)

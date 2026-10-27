@@ -304,9 +304,19 @@ namespace fastllm {
 #endif
         if (!tpCacheHandled && !singleCacheHandled) {
             if (overlapShared) {
-                V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
-                V41ReplicaToCpu(cpuMoeIndex, expertIndex, tpDevices);
-                V41ReplicaToCpu(cpuMoeScore, expertScore, tpDevices);
+                bool diskStaged = false;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+                if (!tp && !graphActive && !dumpDebug && !V41ReferenceMathEnabled() && seqlen == 1 &&
+                        V41DeviceSpecUsesType(overlapMoeDevice, "disk") &&
+                        moeWeights[2]->isDiskWeight && moeWeights[2]->dataType == DATA_GGUF_FORMAT)
+                    diskStaged = StageDiskMoeV41Inputs(ffnInput, expertIndex, expertScore,
+                        cpuMoeInput, cpuMoeIndex, cpuMoeScore);
+#endif
+                if (!diskStaged) {
+                    V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
+                    V41ReplicaToCpu(cpuMoeIndex, expertIndex, tpDevices);
+                    V41ReplicaToCpu(cpuMoeScore, expertScore, tpDevices);
+                }
             }
             runSharedSegment();
         }
@@ -389,6 +399,9 @@ namespace fastllm {
                 DiskMergeMOE disk;
                 cacheHandled = disk.RunGpuPrefill(*moeInputPtr, *moeIndexPtr, *moeScorePtr,
                     ffnOut, moeWeights, swiglu_limit);
+                if (!cacheHandled && seqlen == 1)
+                    cacheHandled = disk.RunGpuDecode(*moeInputPtr, *moeIndexPtr, *moeScorePtr,
+                        ffnOut, moeWeights, swiglu_limit);
             }
 #endif
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
