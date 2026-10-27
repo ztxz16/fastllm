@@ -3298,6 +3298,8 @@ namespace {
                 s += __shfl_xor_sync(0xffffffff, s, 2);
                 s += __shfl_xor_sync(0xffffffff, s, 4);
                 s += __shfl_xor_sync(0xffffffff, s, 8);
+                // Finish every lane's oldMx read before the owner updates it.
+                __syncwarp();
                 if (sub == 0) {
                     float a = __expf(oldMx - newMx);
                     sh.alpha[row] = a;
@@ -3354,6 +3356,8 @@ namespace {
         }
 #endif
     }
+
+    #include "deepseekv41-sm120-prefill.cuh"
 
     // Check the compiled image as well as hardware. An SM75 PTX image JITed
     // on a newer GPU still contains the #if-disabled MMA body. Resource or
@@ -4919,6 +4923,27 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
         }
     }
 
+
+    // Reuse the gathered KV across two head groups without changing numerical
+    // boundaries. Resource/image checks happen before submission; unsupported
+    // builds and shapes retain the generic MMA path below.
+    if (!legacyAttention && !referenceMath && q.dataType == DataType::BFLOAT16 &&
+        seqlen >= 128 && heads >= 32 && V41IsSm<12, 0>() &&
+        !V41EnvOn("FASTLLM_DSV41_DISABLE_SM120_PREFILL") &&
+        V41MmaKernelReady<V41SparseAttentionSm120PrefillKernel, 512, sizeof(V41Sm120PrefillShared)>()) {
+        V41SparseAttentionSm120PrefillKernel<<<dim3(bsz * seqlen, (heads + 31) / 32), 512, sizeof(V41Sm120PrefillShared)>>>(
+            (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
+            hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
+            hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
+            ringFp8 ? (const uint8_t*)ringKV->cudaData : nullptr,
+            cmpFp8 ? (const uint8_t*)compressedKV->cudaData : nullptr,
+            hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
+            (const float*)attnSink.cudaData, seqlen, heads, windowSize, cap, topWidth, startPos,
+            softmaxScale, (__nv_bfloat16*)output.cudaData,
+            ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0);
+        return V41CheckLaunch("SparseAttentionSm120Prefill");
+    }
+    if (FastllmCudaGetThreadError()) return false;
 
     // BF16 mma 快速路径（SM80+，head_dim 512，q 为 BF16）。
     // FASTLLM_DSV41_LEGACY_ATTN=1 可退回下面的 FP32 标量 kernel 做对比 / 排查。

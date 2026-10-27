@@ -376,6 +376,14 @@ bool FastllmCudaMarlinBFloat16MXFP8Gemm(const void *a, const uint32_t *weight,
     const uint8_t *scales, void *c, int rows, int columns, int inner, int *workspace);
 bool FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(const void *input,
     fastllm::Data &weight, void *output, int rows, int inner, int columns);
+// SM120 W8A8 MXFP8 linear: FP8 E4M3 weights with exact block-32 UE8M0
+// scales, BF16 input/output.  The implementation is optional and returns
+// false when the current device or weight layout is unsupported.
+void FastllmCudaReleaseMxfp8CutlassCache(const fastllm::Data *weight);
+bool FastllmCudaTryMxfp8QuantizedLinear(const fastllm::Data &input,
+    fastllm::Data &weight, fastllm::Data &output);
+bool FastllmCudaTryMxfp8WoA(const fastllm::Data &input,
+    const fastllm::Data &weight, int groups, int rank, fastllm::Data &output);
 // SM75+ weight-only NVFP4 Marlin (W4A16, group size 16).  SM75 selects the
 // two-stage Turing specialization; SM80+ selects the four-stage kernel.
 // Small-batch residual epilogue: same Marlin FP32 reduction, no temporary output.

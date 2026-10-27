@@ -536,7 +536,10 @@ if (USE_CUDA)
             ${FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE}
             ${FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE}
             ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE}
+            src/devices/cuda/linear/fastllm-linear-fp8-mxfp8.cu
             src/devices/cuda/linear/fastllm-native-nvfp4-tma-sm120.cu)
+        set_property(SOURCE src/fastllm.cpp src/models/deepseekv41.cpp
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)
         set_source_files_properties(
             src/devices/cuda/linear/fastllm-native-lowbit-prefill.cu
             PROPERTIES COMPILE_DEFINITIONS FASTLLM_NATIVE_PREFILL_SM120)
@@ -742,6 +745,9 @@ if (FASTLLM_CUDA_SM120_SOURCES)
     set_target_properties(fastllm_cuda_sm120 PROPERTIES
         CUDA_ARCHITECTURES "120f"
         POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_cuda_sm120 BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+        "${FASTLLM_CUTLASS_DIR}/include")
     set(FASTLLM_CUDA_SM120_OBJECTS $<TARGET_OBJECTS:fastllm_cuda_sm120>)
 endif()
 
@@ -1419,6 +1425,14 @@ if (UNIT_TEST)
         "Queued multimodal/text request isolation: PASS" 60)
     if (USE_CUDA)
         target_include_directories(deepseekV41PrecisionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        if (FASTLLM_CUDA_SM120_SOURCES)
+            add_executable(cuda_mxfp8_linear_test test/basic/test_cuda_mxfp8_linear.cpp)
+            target_link_libraries(cuda_mxfp8_linear_test PRIVATE fastllm)
+            target_include_directories(cuda_mxfp8_linear_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME cuda_mxfp8_linear COMMAND cuda_mxfp8_linear_test)
+            set_tests_properties(cuda_mxfp8_linear PROPERTIES
+                                 LABELS cuda TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endif()
         add_test(NAME deepseekV41PrecisionCuda COMMAND deepseekV41PrecisionRegression --cuda)
         if (NOT USE_ROCM)
             add_executable(deepseekV41LoadPlacement test/ops/deepseekV41LoadPlacement.cpp)
@@ -1659,6 +1673,12 @@ if (UNIT_TEST)
         target_link_libraries(deepseekV41SamplingRegression PRIVATE fastllm)
         add_test(NAME deepseek_v41_sampling COMMAND deepseekV41SamplingRegression)
         set_tests_properties(deepseek_v41_sampling PROPERTIES
+                             LABELS cuda TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_executable(deepseek_v41_sm120_prefill_test test/basic/test_deepseek_v41_sm120_prefill.cpp)
+        target_include_directories(deepseek_v41_sm120_prefill_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(deepseek_v41_sm120_prefill_test PRIVATE fastllm)
+        add_test(NAME deepseek_v41_sm120_prefill COMMAND deepseek_v41_sm120_prefill_test)
+        set_tests_properties(deepseek_v41_sm120_prefill PROPERTIES
                              LABELS cuda TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_executable(deepseek_v41_hybrid_attention_test test/basic/test_deepseek_v41_hybrid_attention.cpp)
         target_include_directories(deepseek_v41_hybrid_attention_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
