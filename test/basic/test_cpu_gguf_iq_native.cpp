@@ -1,4 +1,5 @@
 #include "ggml-iq-native.h"
+#include "ggml-iq-batch.h"
 #include "gguf_iq2_s_r4_fixture.h"
 #include "devices/cpu/computeutils.h"
 #include <cmath>
@@ -210,8 +211,57 @@ static void RunQ2() {
     }
 }
 
+static void RunIQ2Batch(ggml_type type) {
+    std::mt19937 rng(177+type);
+    const auto dot=ggml_type_vec_dot(type);
+    for (int columns : {256,768,2304,5120}) for (int rows : {1,2,3,4,5,6,7,8,9,17,32}) {
+        const int blocks=columns/QK_K;
+        const size_t stride=ggml_row_size(type,columns), block=ggml_type_size(type);
+        std::vector<uint8_t> weights(12*stride);
+        for (auto &v:weights) v=rng();
+        const uint16_t scales[]={0,0x2800,0xb000,0x2c80,1,0x8155};
+        for (size_t off=0;off<weights.size();off+=block)
+            memcpy(weights.data()+off,&scales[(off/block)%6],2);
+        std::vector<block_q8_K> activation(rows*blocks);
+        for (auto &v:activation) {
+            v.d=(int(rng()%15)-7)/128.f;
+            for (int i=0;i<QK_K;++i) v.qs[i]=int(rng()%256)-128;
+        }
+        std::vector<const void*> inputs(rows);
+        for (int r=0;r<rows;++r) inputs[r]=activation.data()+((r*7+1)%rows)*blocks;
+        std::vector<float> actual(rows+2,-12345.f), expected(rows);
+        for (int w=0;w<12;++w) {
+            for (int r=0;r<rows;++r) dot(columns,&expected[r],0,weights.data()+w*stride,0,inputs[r],0,1);
+            ggml_vec_dot_iq2_q8_K_batch(type,columns,weights.data()+w*stride,inputs.data(),actual.data()+1,rows);
+            Check(actual.front()==-12345.f && actual.back()==-12345.f,"IQ2 batch output boundary");
+            Check(!memcmp(expected.data(),actual.data()+1,rows*sizeof(float)),"IQ2 batch changed single-row bits");
+        }
+        const auto *pack=get_repack_info(type);
+        if (!pack) continue;
+        std::vector<uint8_t> packed(weights.size());
+        pack->repack(12,columns,(const char*)weights.data(),(char*)packed.data(),false);
+        // Scatter output independently of the permuted/duplicate source rows.
+        std::vector<float> got(rows*2*12,-12345.f), ref(got);
+        for (int first=0;first<rows;first+=8) {
+            const int n=std::min(8,rows-first);
+            mmid_row_mapping map[8];
+            for (int r=0;r<n;++r) map[r]={2*(first+r),(first+r)*7%rows};
+            DataInfo info{got.data()+4,(const char*)activation.data(),12,size_t(blocks)*sizeof(block_q8_K),0,1,map,0};
+            GetMulMatFunction(pack->new_type,n)(columns,packed.data()+4*stride,stride,info,4);
+            for (int r=0;r<n;++r) {
+                DataInfo one{ref.data()+map[r].i1*12+4,(const char*)(activation.data()+map[r].i2*blocks),12,size_t(blocks)*sizeof(block_q8_K),0,1,nullptr,0};
+                GetMulMatFunction(pack->new_type,1)(columns,packed.data()+4*stride,stride,one,4);
+            }
+        }
+        Check(!memcmp(got.data(),ref.data(),got.size()*sizeof(float)),"IQ2 R4 mapped batch changed single-row bits or guards");
+    }
+    puts("PASS: IQ2 canonical/R4 multirow exact bits, tails, mapped input/output and guards");
+}
+
 int main() {
     try {
+        RunIQ2Batch(GGML_TYPE_IQ2_XXS);
+        RunIQ2Batch(GGML_TYPE_IQ2_XS);
         RunQ2();
         RunIQ3SCodebook();
         Run<block_iq2_xs>(GGML_TYPE_IQ2_XS);

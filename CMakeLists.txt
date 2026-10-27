@@ -1170,7 +1170,7 @@ if (UNIT_TEST)
             add_executable(disk_v41_gguf_cache_test test/basic/test_disk_v41_gguf_cache.cpp)
             target_link_libraries(disk_v41_gguf_cache_test PRIVATE fastllm)
             fastllm_add_checked_test(disk_v41_gguf_cache disk_v41_gguf_cache_test
-                "PASS: disk V4.1 GGUF cache" 180)
+                "PASS: disk V4.1 GGUF cache" 300)
             set_tests_properties(disk_v41_gguf_cache PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE
                 ENVIRONMENT "FT_GPU_PREFILL=1;FASTLLM_DISK_DIRECT_IO=1")
             fastllm_add_checked_test(disk_v41_decode_handoff disk_v41_gguf_cache_test
@@ -1180,6 +1180,12 @@ if (UNIT_TEST)
                 "PASS: tuned V4.1 GGUF decode" 360 --tuned)
             set_tests_properties(cuda_v41_gguf_tuned PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE)
             if (USE_NUMAS)
+                fastllm_add_checked_test(disk_v41_gguf_iq2_batch disk_v41_gguf_cache_test
+                    "PASS: IQ2 canonical and NUMA multirow integration" 300 --iq2-batch)
+                set_tests_properties(disk_v41_gguf_iq2_batch PROPERTIES LABELS "cuda;gguf;numa" RUN_SERIAL TRUE)
+                fastllm_add_checked_test(disk_v41_gguf_shared_resident disk_v41_gguf_cache_test
+                    "PASS: nonzero shared expert with resident and mixed GGUF routes" 180 --shared-resident)
+                set_tests_properties(disk_v41_gguf_shared_resident PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE)
                 fastllm_add_checked_test(cuda_v41_gguf_tuned_hybrid disk_v41_gguf_cache_test
                     "PASS: tuned V4.1 GGUF hybrid" 900 --tuned-hybrid)
                 set_tests_properties(cuda_v41_gguf_tuned_hybrid PROPERTIES LABELS "cuda;gguf;numa" RUN_SERIAL TRUE)

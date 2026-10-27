@@ -2,6 +2,7 @@
 #include "utils.h"
 #include "gguf.h"
 #include "devices/disk/diskdevice.h"
+#include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
@@ -83,7 +84,7 @@ struct Fixture {
         fclose(file);
     }
     ~Fixture() { owned.clear(); unlink(path.c_str()); }
-    std::vector<float> Run(bool lazy, int rows, int offset, int device, int topk=6, bool grouped=false, bool gpuIo=false, int lastExpert=-1) {
+    std::vector<float> Run(bool lazy, int rows, int offset, int device, int topk=6, bool grouped=false, bool gpuIo=false, int lastExpert=-1, float sharedScale=0) {
         Data x(BFLOAT16,{rows,hidden}), y(BFLOAT16,{rows,hidden});
         Data ids(INT32,{rows,topk}), scores(FLOAT32,{rows,topk}),a,b,c;
         x.Allocate(false); ids.Allocate(false); scores.Allocate(false);
@@ -113,7 +114,7 @@ struct Fixture {
                 {"weights",(Data *)disk.data()},{"biass",(Data *)biases.data()},{"w1",&a},{"w2",&b},{"w3",&c}};
             IntDict ip={{"weights___batch",int(disk.size())},{"biass___batch",int(disk.size())},
                 {"deepSeekV4Mode",1},{"activationQuantBlock",32}};
-            DiskMergeMOE op; op.Run("MergeMOE",data,{{"sharedScale",0},{"swigluLimit",.8f}},ip);
+            DiskMergeMOE op; op.Run("MergeMOE",data,{{"sharedScale",sharedScale},{"swigluLimit",.8f}},ip);
         } else if (grouped) {
             ids.ToDevice(CUDA,{device},true); scores.ToDevice(CUDA,{device},true);
             Check(FastllmCudaMergeMOEV41GGUFResident(x,a,b,c,y,gpu.data(),gpu.size(),ids,scores,0,.8f),
@@ -123,7 +124,28 @@ struct Fixture {
             ids.ToDevice(CUDA,{device},true); scores.ToDevice(CUDA,{device},true);
             // One route at a time avoids duplicate-row scatter races in the
             // legacy fallback. Sum in stable expert order, with one final BF16 boundary.
+            auto routedWeights = gpu;
+            routedWeights[0] = routedWeights[1] = nullptr;
             y.Allocate(false);
+            std::vector<float> shared;
+            if (gpu[0] && gpu[1]) {
+                Data sx, sy(BFLOAT16,{rows,hidden});
+                sx.CopyFrom(x); sx.ToDevice(CPU);
+                Data si(INT32,{rows,1}), ss(FLOAT32,{rows,1}), a,b,c;
+                si.Allocate(false); ss.Allocate(false);
+                si.Resize({rows,0}); ss.Resize({rows,0});
+                std::vector<Data*> table{gpu[0],gpu[1],gpu[0],gpu[1]}, biases(4,nullptr);
+                DataDict data={{"input",&sx},{"output",&sy},{"index",&si},{"score",&ss},
+                    {"weights",(Data*)table.data()},{"biass",(Data*)biases.data()},
+                    {"w1",&a},{"w2",&b},{"w3",&c}};
+                IntDict ip={{"weights___batch",4},{"biass___batch",4},
+                    {"deepSeekV4Mode",1},{"activationQuantBlock",32},{"diskMoeDecode",1}};
+                struct SharedOracle : CpuMergeMOE { using CpuMergeMOE::Run; } op;
+                op.Run("MergeMOE",data,{{"sharedScale",sharedScale},{"swigluLimit",.8f}},ip);
+                shared.resize(size_t(rows)*hidden);
+                for (size_t j=0;j<shared.size();++j) shared[j]=sy.dataType==FLOAT32 ?
+                    ((float*)sy.cpuData)[j] : BFloat16BitsToFloat32(((uint16_t*)sy.cpuData)[j]);
+            }
             for (int r=0; r<rows; ++r) {
                 std::vector<int> order(topk);
                 for (int k=0; k<topk; ++k) order[k]=k;
@@ -136,10 +158,12 @@ struct Fixture {
                     xi.FakeFrom(x,size_t(r)*hidden*2); xi.Resize({1,hidden});
                     ii.FakeFrom(ids,size_t(r*topk+k)*4); ii.Resize({1,1});
                     ss.FakeFrom(scores,size_t(r*topk+k)*4); ss.Resize({1,1});
-                    DoCudaMergeMOEV41Fallback(xi,out,ii,ss,gpu.data(),gpu.size(),0,.8f);
+                    DoCudaMergeMOEV41Fallback(xi,out,ii,ss,routedWeights.data(),routedWeights.size(),0,.8f);
                     out.ToDevice(CPU);
                     for (int c=0; c<hidden; ++c) sum[c]+=((float *)out.cpuData)[c];
                 }
+                if (!shared.empty())
+                    for (int j=0;j<hidden;++j) sum[j]+=shared[size_t(r)*hidden+j];
                 for (int c=0; c<hidden; ++c)
                     ((uint16_t *)y.cpuData)[r*hidden+c]=Float32ToBFloat16RNEBits(sum[c]);
             }
@@ -334,6 +358,64 @@ static void TestCanonicalDecode(Fixture &f) {
     }
     Compare(actual,reference,0);
     puts("PASS: canonical whole-layer CPU decode equals per-expert oracle");
+    // Cover arbitrary small batches and the eight-row dot tile's tails. Each
+    // route may select a different expert; duplicates must remain independent.
+    for (int rows : {1,2,3,4,5,6,7,8,9,17,31,32}) {
+        std::vector<float> batch(size_t(rows)*f.hidden), got(batch.size()), expected(batch.size());
+        std::vector<int32_t> batchIds(rows);
+        std::vector<float> batchScores(rows);
+        for (int r=0; r<rows; ++r) {
+            batchIds[r]=ids[r%n]; batchScores[r]=scores[r%n];
+            for (int c=0; c<f.hidden; ++c)
+                batch[size_t(r)*f.hidden+c]=RoundFloat32ToBFloat16RNE(std::sin((r*f.hidden+c)*.31f)*3);
+            Check(HostMoeCanonicalV41Decode(batch.data()+size_t(r)*f.hidden,
+                expected.data()+size_t(r)*f.hidden,weights.data(),weights.size(),
+                &batchIds[r],&batchScores[r],1,.8f),"canonical row oracle rejected");
+        }
+        Check(HostMoeCanonicalV41Batch(batch.data(),got.data(),rows,weights.data(),weights.size(),
+            batchIds.data(),batchScores.data(),.8f),"canonical CPU batch rejected");
+        Compare(got,expected,0);
+    }
+    puts("PASS: canonical CPU batches 1,2,3,4,5,6,7,8,9,17,31,32 equal row oracle");
+}
+
+// The shared route must neither disable routed batching nor enter its scored
+// arithmetic. A zero shared expert isolates the routed result exactly.
+static void TestSharedRoute(Fixture &f, int device) {
+    SetMoeCpuCacheBytes(1ULL<<30); SetMoeCudaCacheBytes(0); TrimDiskMoeCache();
+    Data gate(FLOAT32,{2*f.inter,f.hidden}), down(FLOAT32,{f.hidden,f.inter});
+    gate.Allocate(0.f); down.Allocate(0.f);
+    for (int rows : {1,2,3,4,5,6,8,9,17,32}) {
+        auto expected=f.Run(true,rows,0,device);
+        f.disk[0]=&gate; f.disk[1]=&down;
+        auto actual=f.Run(true,rows,0,device);
+        f.disk[0]=f.disk[1]=nullptr;
+        Compare(actual,expected,0);
+    }
+    puts("PASS: shared expert preserves routed CPU batching");
+}
+
+static void TestSharedResident(Fixture &f, int device) {
+    SetMoeCpuCacheBytes(1ULL<<30); SetMoeCudaCacheBytes(f.bytes*f.experts); TrimDiskMoeCache();
+    for (int pass=0;pass<2*f.experts;++pass) f.Run(true,1,pass%2,device,8);
+    Data gate(FLOAT32,{2*f.inter,f.hidden}), down(FLOAT32,{f.hidden,f.inter});
+    gate.Allocate(false); down.Allocate(false);
+    for (size_t i=0;i<gate.Count(0);++i) ((float*)gate.cpuData)[i]=.01f*std::sin(i*.17f);
+    for (size_t i=0;i<down.Count(0);++i) ((float*)down.cpuData)[i]=.01f*std::cos(i*.13f);
+    f.gpu[0]=f.disk[0]=&gate; f.gpu[1]=f.disk[1]=&down;
+    const auto before=GetDiskMoeCacheStats();
+    for (int rows : {1,2,3,4,5,6,7,8,9,17,32,33})
+        Compare(f.Run(true,rows,0,device,6,false,false,-1,.37f),
+                f.Run(false,rows,0,device,6,false,false,-1,.37f),0);
+    Check(GetDiskMoeCacheStats().cudaHits>before.cudaHits,"shared batch did not hit GPU cache");
+    Check(GetDiskMoeCacheStats().diskBytes==before.diskBytes,"resident shared batch read disk");
+    // Leave both GPU and CPU contributions in the same per-route reduction.
+    SetMoeCudaCacheBytes(3*f.bytes); TrimDiskMoeCache();
+    for (int rows : {1,3,6,9,17,32})
+        Compare(f.Run(true,rows,0,device,6,false,false,-1,.37f),
+                f.Run(false,rows,0,device,6,false,false,-1,.37f),.06);
+    f.gpu[0]=f.gpu[1]=f.disk[0]=f.disk[1]=nullptr;
+    puts("PASS: nonzero shared expert with resident and mixed GGUF routes");
 }
 
 // Exercise cached decode on both GPUs without admitting every miss.
@@ -386,7 +468,7 @@ static void TestCooperativeDecode(Fixture &f, bool compareLegacy = false) {
     bool dual=false, resident=false, checkedPayload=false;
     uint64_t totalGpu=0, totalCpu=0, totalHits=0, totalAdmissions=0;
     for (int pass=0; pass<64; ++pass) {
-        const int rows=pass%5==4 ? 6 : 1, topk=3, device=pass%2, offset=3*(pass/8);
+        const int rows=pass%5==4 ? 2+(pass/5)%7 : 1, topk=3, device=pass%2, offset=3*(pass/8);
         FastllmCudaSetDevice(device);
         Data x(BFLOAT16,{rows,f.hidden}),ids(INT32,{rows,topk}),scores(FLOAT32,{rows,topk}),out;
         x.Allocate(false);ids.Allocate(false);scores.Allocate(false);
@@ -504,7 +586,7 @@ static void TestTunedDecode() {
                     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS}) {
         for (auto shape : {std::pair<int,int>{1024,1024}, {5120,2304}}) {
             Fixture f(type,type,0,shape.first,shape.second,6);
-            for (int rows : {1,8}) {
+            for (int rows : {1,2,3,4,5,6,7,8,9,17,32}) {
                 setenv("FASTLLM_V41_GGUF_LEGACY","1",1);
                 auto reference=f.Run(false,rows,0,0,6,true);
                 setenv("FASTLLM_V41_GGUF_LEGACY","0",1);
@@ -582,10 +664,39 @@ static void TestDiskDecodeHandoff() {
     puts("PASS: disk decode pinned handoff, mixed tiers, duplicate routes and non-disk rejection");
 }
 
+static void TestColdBatchBound() {
+    // The cold routed set exceeds the bounded batch's weight leases.
+    // Remaining experts must stream without deadlocking or rereading.
+    Fixture f(GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ1_M,0,5120,2304,24);
+    SetMoeCpuCacheBytes(0); SetMoeCudaCacheBytes(0); TrimDiskMoeCache();
+    const auto before=GetDiskMoeCacheStats();
+    Compare(f.Run(true,32,0,0,1),f.Run(false,32,0,0,1),.06);
+    Check(GetDiskMoeCacheStats().diskBytes-before.diskBytes==24*f.bytes,
+          "bounded cold batch reread expert");
+}
+
 int main(int argc, char **argv) { try {
     if (FastllmCudaGetDeviceCount()<1) return 77;
     SetThreads(4);
     if (argc > 1 && !strcmp(argv[1], "--disk-decode-handoff")) { TestDiskDecodeHandoff(); return 0; }
+#ifdef USE_NUMAS
+    if (argc > 1 && !strcmp(argv[1], "--iq2-batch")) {
+        for (int type : {GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XS}) {
+            Fixture f(type,type,0);
+            TestCanonicalDecode(f);
+            TestCooperativeDecode(f);
+        }
+        puts("PASS: IQ2 canonical and NUMA multirow integration");
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--shared-resident")) {
+        for (int device=0;device<std::min(2,FastllmCudaGetDeviceCount());++device) {
+            Fixture f(GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XS,device);
+            TestSharedResident(f,device);
+        }
+        return 0;
+    }
+#endif
     if (argc > 1 && !strcmp(argv[1], "--tuned")) { TestTunedDecode(); return 0; }
 #ifdef USE_NUMAS
     if (argc > 1 && !strcmp(argv[1], "--tuned-hybrid")) {
@@ -612,6 +723,7 @@ int main(int argc, char **argv) { try {
             TestNativeLayout(f,device);
 #ifdef USE_NUMAS
             TestCanonicalDecode(f);
+            TestSharedRoute(f,device);
 #endif
             TestPreload(f,device);
             TestPrefillWorkingSet(f,device);
@@ -634,7 +746,7 @@ int main(int argc, char **argv) { try {
             Check(PreloadDiskMoeCache({f.disk})==0 && GetDiskMoeCacheStats().diskBytes==warm.diskBytes,
                   "preload duplicated GPU-resident GGUF experts");
             // Exactly matches the native decode oracle after all routes hit.
-            for (int rows : {1,5,8,9,33}) Compare(f.Run(true,rows,0,device),f.Run(false,rows,0,device,6,rows > 32),0);
+            for (int rows : {1,2,3,4,5,6,8,9,33}) Compare(f.Run(true,rows,0,device),f.Run(false,rows,0,device,6,rows > 32),0);
             // Shrink VRAM with RAM headroom: every canonical record must
             // survive eviction without another disk read or requantization.
             auto beforeDemotion = GetDiskMoeCacheStats();
@@ -704,6 +816,7 @@ int main(int argc, char **argv) { try {
             }
         }
     }
+    TestColdBatchBound();
     {
         // More than three eight-expert groups wrap both upload rings. Mixed
         // cache hits, duplicate routes and partial tiles retain ID-order sums.

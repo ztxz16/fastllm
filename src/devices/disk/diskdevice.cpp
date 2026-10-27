@@ -4024,7 +4024,7 @@ namespace fastllm {
             if (weights[0] && weights[1]) routes[0].push_back({token, sharedScale, -1});
         }
         std::vector<float> sum(gpuPrefillOnly ? 0 : (size_t)tokens * hidden, 0.0f);
-        bool nativeGlm = false, nativeV41GGUF = false;
+        bool nativeGlm = false, nativeV41GGUF = false, routedV41GGUF = topk > 0;
 #ifdef USE_CUDA
         nativeGlm = routes[0].empty() && topk > 0;
         for (int e = 1; e <= count && nativeGlm; ++e) if (!routes[e].empty()) {
@@ -4033,12 +4033,14 @@ namespace fastllm {
                 glmGGUF(weights[2 * e], weights[2 * e + 1]);
         }
 #endif
-        nativeV41GGUF = routes[0].empty() && topk > 0;
-        for (int e = 1; e <= count && nativeV41GGUF; ++e) if (!routes[e].empty()) {
-            nativeV41GGUF = weights[2 * e] && weights[2 * e + 1] &&
+        for (int e = 1; e <= count && routedV41GGUF; ++e) if (!routes[e].empty()) {
+            routedV41GGUF = weights[2 * e] && weights[2 * e + 1] &&
                 weights[2 * e]->isDiskWeight && weights[2 * e + 1]->isDiskWeight &&
                 v41GGUF(weights[2 * e], weights[2 * e + 1]);
         }
+        // A shared expert has its own arithmetic, but must not disable the
+        // canonical CPU batch for the independent routed experts.
+        nativeV41GGUF = routedV41GGUF && routes[0].empty();
         bool changedPrefillRoutes = false;
         if (nativeV41GGUF && tokens > 32) {
             float change = 0;
@@ -4064,7 +4066,8 @@ namespace fastllm {
         // or maintains the cache. Bound completed + in-flight payloads as well
         // as task count. GPU prefill may widen this after selecting an offloaded
         // expert; CPU-only execution keeps its existing streaming window.
-        int prefetchWindow = nativeV41GGUF || (v4 && quantBlock == 32 && tokens == 1) ? 8 : prefetchDepth;
+        int prefetchWindow = nativeV41GGUF || (routedV41GGUF && tokens <= 32) ||
+            (v4 && quantBlock == 32 && tokens == 1) ? 8 : prefetchDepth;
         auto readBytes = [&](int id) {
             uint64_t bytes = 0;
             for (const Data *w : {weights[id * 2], weights[id * 2 + 1]}) {
@@ -4428,7 +4431,8 @@ namespace fastllm {
 #endif
         // Bound per-route result staging independently of prompt length. Large
         // chunks retain the streaming path; decode/verify batch all GPU hits.
-        if ((nativeGlm || nativeV41GGUF) && device >= 0 && uint64_t(tokens) * topk * hidden * sizeof(float) <= (64ULL << 20)) {
+        if ((nativeGlm || routedV41GGUF) && device >= 0 &&
+            uint64_t(tokens) * (topk + !routes[0].empty()) * hidden * sizeof(float) <= (64ULL << 20)) {
             for (int d : cudaDevices) {
                 std::vector<DiskCachedExpert *> selected(count, nullptr);
                 bool any = false, uniform = true;
@@ -4442,7 +4446,11 @@ namespace fastllm {
                         hit->down->ggmlType == downLayout->ggmlType && hit->down->dims == downLayout->dims;
                 }
                 if (any && uniform) {
-                    auto batch = std::make_unique<DiskGGUFResidentBatch>(input, score, index, selected, d, nativeV41GGUF);
+                    auto batch = std::make_unique<DiskGGUFResidentBatch>(input, score, index, selected, d, routedV41GGUF);
+                    // Shared experts retain their own arithmetic and are added
+                    // last. Their CPU result must not alias a routed GPU slot.
+                    if (!routes[0].empty())
+                        batch->perRoute.resize(size_t(tokens) * (topk + 1) * hidden);
                     batch->Launch(limit);
                     residentDevices.insert(d);
                     if (!resident) resident = std::move(batch);
@@ -4453,16 +4461,31 @@ namespace fastllm {
         }
 #endif
 #ifdef USE_NUMAS
-        if (nativeV41GGUF && tokens == 1 && !V41ReferenceMathEnabled()) {
+        if (routedV41GGUF && tokens <= 32 && !V41ReferenceMathEnabled() &&
+                uint64_t(tokens) * topk * hidden * sizeof(float) <= (64ULL << 20)) {
             cpuBatchOutput.dataType = FLOAT32; cpuBatchOutput.UpdateUnitSize();
-            cpuBatchOutput.Resize({topk, hidden}); cpuBatchOutput.Allocate(false);
+            cpuBatchOutput.Resize({tokens * topk, hidden}); cpuBatchOutput.Allocate(false);
             int outputOffset = 0;
-            std::vector<float> x(hidden);
-            for (int c = 0; c < hidden; ++c)
-                x[c] = ReadDiskFloatValue(input.cpuData, input.dataType, c);
+            std::vector<float> x;
             std::vector<int> waiting;
-            for (int e = 1; e <= count; ++e)
-                if (!routes[e].empty() && !cudaHit(cache.entries.at(weights[2 * e]))) waiting.push_back(e);
+            uint64_t coldBytes = 0;
+            bool coldLimitReached = false;
+            for (int e = 1; e <= count; ++e) if (!routes[e].empty()) {
+                const auto &entry = cache.entries.at(weights[2 * e]);
+                if (cudaHit(entry)) continue;
+                if (!entry.cpu) {
+                    const uint64_t bytes = readBytes(e);
+                    // Results survive until ID-order reduction, so their cold
+                    // weight leases also need a bound. Later misses retain the
+                    // ordinary streaming path instead of accumulating a layer.
+                    if (coldLimitReached || (coldBytes && coldBytes + bytes > (128ULL << 20))) {
+                        coldLimitReached = true;
+                        continue;
+                    }
+                    coldBytes += bytes;
+                }
+                waiting.push_back(e);
+            }
             // Run RAM hits while SSD reads are in flight. Subsequently consume
             // every ready miss without a barrier on the rest of the read batch.
             // Store per-expert results; reduction below keeps expert-ID order.
@@ -4471,6 +4494,7 @@ namespace fastllm {
                 std::vector<int32_t> ids;
                 std::vector<float> scales;
                 std::vector<int> selected, remaining;
+                x.clear();
                 for (int e : waiting) {
                     auto &entry = cache.entries.at(weights[2 * e]);
                     auto *host = entry.cpu.get();
@@ -4483,7 +4507,14 @@ namespace fastllm {
                         decodeLoaded[e] = pending->second.get(); pendingReads.erase(pending);
                         host = decodeLoaded[e].get();
                     }
-                    for (const auto &r : routes[e]) { ids.push_back(selected.size()); scales.push_back(r.score); }
+                    for (const auto &r : routes[e]) {
+                        ids.push_back(selected.size()); scales.push_back(r.score);
+                        if (tokens > 1 || x.empty()) {
+                            const size_t offset = x.size(); x.resize(offset + hidden);
+                            for (int c = 0; c < hidden; ++c)
+                                x[offset + c] = ReadDiskFloatValue(input.cpuData, input.dataType, size_t(r.token) * hidden + c);
+                        }
+                    }
                     selected.push_back(e);
                     table.push_back(host->gate.get()); table.push_back(host->down.get());
                 }
@@ -4491,12 +4522,16 @@ namespace fastllm {
                 if (!selected.empty()) {
                     const auto started = std::chrono::steady_clock::now();
                     auto *destination = reinterpret_cast<float *>(cpuBatchOutput.cpuData) + size_t(outputOffset) * hidden;
-                    if (HostMoeCanonicalV41Decode(x.data(), destination, table.data(), table.size(),
-                            ids.data(), scales.data(), ids.size(), limit)) {
+                    const bool computed = tokens == 1 ?
+                        HostMoeCanonicalV41Decode(x.data(), destination, table.data(), table.size(),
+                            ids.data(), scales.data(), ids.size(), limit) :
+                        HostMoeCanonicalV41Batch(x.data(), destination, ids.size(), table.data(), table.size(),
+                            ids.data(), scales.data(), limit);
+                    if (computed) {
                         uint64_t bytes = 0;
                         for (size_t i = 2; i < table.size(); ++i) bytes += table[i]->GetBytes();
                         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
-                        if (bytes) cache.canonicalCpuUsPerByte.Observe(us / bytes);
+                        if (tokens == 1 && bytes) cache.canonicalCpuUsPerByte.Observe(us / bytes);
                         for (int e : selected) { cpuBatchStarts[e] = outputOffset; outputOffset += routes[e].size(); }
                     }
                 } else {
@@ -4681,7 +4716,7 @@ namespace fastllm {
             bool queuedResident = false;
 #ifdef USE_CUDA
             queuedResident = v41Queued[expert] ||
-                (gpu && gpu != transientGpu.get() && residentDevices.count(gpu->device));
+                (expert > 0 && gpu && gpu != transientGpu.get() && residentDevices.count(gpu->device));
 #endif
             for (size_t first = 0; !cpuBatched && !queuedResident && first < tasks.size(); first += 256) {
                 int batch = std::min<size_t>(256, tasks.size() - first);
