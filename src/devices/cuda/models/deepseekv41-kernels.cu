@@ -6297,8 +6297,9 @@ struct V41FullDecodePlan {
         for (void *p : {static_cast<void *>(transforms),
                        static_cast<void *>(index), static_cast<void *>(attention),
                        static_cast<void *>(indexScores), static_cast<void *>(blockScores),
-                       static_cast<void *>(attentionScores), static_cast<void *>(topKMemory),
-                       static_cast<void *>(candidateBlocks), static_cast<void *>(candidateCounts)}) if (p) cudaFree(p);
+                       static_cast<void *>(attentionScores), static_cast<void *>(topKMemory)}) if (p) cudaFree(p);
+        if (candidateBlocks && !buffers.candidateBlocks) cudaFree(candidateBlocks);
+        if (candidateCounts && !buffers.candidateCounts) cudaFree(candidateCounts);
         cudaSetDevice(old);
     }
 };
@@ -6483,7 +6484,10 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         (c.ratio && (!b.topk || !b.candidates)) ||
         (c.kvSource && (!c.ratio || !b.rawKV || !b.joined || !b.latents || !b.compressNorm ||
           (c.ratio == 2 && (!b.rawScore || !b.scores)))) ||
-        (c.indexSource && (!c.ratio || !b.indexQ || !b.indexWeights || (c.kvSource && !b.newIndexKeys))))
+        (c.indexSource && (!c.ratio || !b.indexQ || !b.indexWeights || (c.kvSource && !b.newIndexKeys))) ||
+        (bool(b.candidateBlocks) != bool(b.candidateCounts)) ||
+        (b.reuseCandidates && !b.candidateBlocks) ||
+        (b.candidateBlocks && (!c.indexSource || !c.useCandidates || c.writeCandidates)))
         return nullptr;
     auto p = std::make_unique<V41FullDecodePlan>();
     p->config = c; p->buffers = b; p->device = FastllmCudaGetDevice();
@@ -6538,8 +6542,12 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         ok = ok && alloc(&p->topKMemory, layout.Bytes(c.batch));
         p->topKWorkspace = V41TopKLayout(p->topKMemory, c.batch, c.maxKeys, c.topK, c.blockSize);
     }
-    if (c.indexSource && c.useCandidates && !c.writeCandidates)
-        ok = ok && alloc(&p->candidateBlocks, (size_t)c.batch * blocks) && alloc(&p->candidateCounts, c.batch);
+    if (c.indexSource && c.useCandidates && !c.writeCandidates) {
+        p->candidateBlocks = static_cast<int *>(b.candidateBlocks);
+        p->candidateCounts = static_cast<int *>(b.candidateCounts);
+        if (!p->candidateBlocks)
+            ok = ok && alloc(&p->candidateBlocks, (size_t)c.batch * blocks) && alloc(&p->candidateCounts, c.batch);
+    }
     if (!b.requests)
         ok = ok && cudaHostAlloc(reinterpret_cast<void **>(&p->host), (size_t)c.batch * sizeof(*p->host), cudaHostAllocDefault) == cudaSuccess &&
              cudaEventCreateWithFlags(&p->copied, cudaEventDisableTiming) == cudaSuccess;
@@ -6646,7 +6654,8 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
     if (c.indexSource) {
         V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3((c.indexHeads + 3) / 4, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 4, p->rope, c.ropeDim, c.window);
         if (p->candidateBlocks) {
-            V41CompactIndexCandidates<<<c.batch, 256, 0, cudaStreamPerThread>>>(p->index, c.blockSize, c.ratio);
+            if (!b.reuseCandidates)
+                V41CompactIndexCandidates<<<c.batch, 256, 0, cudaStreamPerThread>>>(p->index, c.blockSize, c.ratio);
             V41IndexerScoreDecodeMmaKernel<true, true, false, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
                 nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
         } else {

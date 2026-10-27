@@ -26,6 +26,12 @@ struct FastllmV41FullDecodeBuffers {
     // Optional caller-owned request slice. It must outlive the plan and graphs.
     void *requests = nullptr;
     void *savedKV = nullptr, *savedRawKV = nullptr, *savedRawScore = nullptr;
+    // Optional caller-owned [batch, ceil(maxKeys / blockSize)] block IDs and
+    // [batch] counts. A consumer may reuse a preceding producer's list only
+    // for the same mask, per-row visible range and stream-ordered replay.
+    // The producer must run again after every mask/position update.
+    void *candidateBlocks = nullptr, *candidateCounts = nullptr;
+    bool reuseCandidates = false;
 };
 
 struct FastllmV41FullDecodeRequest {

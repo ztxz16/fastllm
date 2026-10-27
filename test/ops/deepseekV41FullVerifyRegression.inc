@@ -6,16 +6,19 @@ static void RunVerifyRegression() {
     for (int tokens : {2, 3, 4, 5, 6, 7, 8})
         for (int ratio : {0, 1, 2})
             for (int mask : {0, 1, 2}) {
-                if ((!ratio && mask) || (longContext && heads != 8))
+                if ((!ratio && mask) || (longContext && heads != 8) ||
+                    (sharedCandidates && (heads != 8 || mask != 2)))
                     continue;
                 FastllmV41FullDecodeConfig c;
                 c.batch = tokens;
                 c.heads = heads;
+                c.indexHeads = indexHeads;
                 c.verifying = true;
                 c.ratio = ratio;
                 c.kvSource = c.indexSource = ratio != 0;
                 c.maxKeys = longContext ? 1048576 : 32768;
                 c.candidateTopK = 16;
+                if (sharedCandidates || mask == 1) c.blockSize = 8;
                 c.writeCandidates = mask == 1;
                 c.useCandidates = mask == 2;
                 c.softmaxScale = 1 / std::sqrt(512.f);
@@ -25,8 +28,8 @@ static void RunVerifyRegression() {
                 Fill(q, {1, tokens, heads, 512}, 1);
                 Fill(kv, {1, tokens, 512}, 2);
                 Fill(out, q.dims, 3);
-                Fill(iq, {1, tokens, 32, 128}, 4);
-                Fill(iw, {1, tokens, 32}, 5, FLOAT32);
+                Fill(iq, {1, tokens, indexHeads, 128}, 4);
+                Fill(iw, {1, tokens, indexHeads}, 5, FLOAT32);
                 Fill(sink, {heads}, 6, FLOAT32);
                 Fill(top, {1, tokens, 512}, 7, INT32);
                 Fill(cand, {1, tokens, maxBlocks}, 8, INT8);
@@ -72,6 +75,8 @@ static void RunVerifyRegression() {
                 b.savedKV = saved.cudaData;
                 b.savedRawKV = savedRaw.cudaData;
                 b.savedRawScore = savedScore.cudaData;
+                CandidateReuseProducer producer;
+                producer.Setup(c, b);
                 void *plan = FastllmCudaV41CreateFullDecode(c, b);
                 Check(plan, "verify plan");
                 std::vector<FastllmV41FullDecodeRequest> requests(tokens);
@@ -79,16 +84,19 @@ static void RunVerifyRegression() {
                     for (int i = 0; i < tokens; ++i)
                         requests[i] = {r.cudaData,    cmp.cudaData,       keys.cudaData,
                                        tail.cudaData, tailScore.cudaData, pos + i};
+                    Check(producer.Upload(requests.data(), tokens), "candidate producer upload");
                     Check(FastllmCudaV41UploadFullDecode(plan, requests.data(), tokens),
                           "verify upload");
                 };
                 upload(1, ring);
+                producer.Launch();
                 Check(FastllmCudaV41PrepareFullDecode(plan) && FastllmCudaV41FinishFullDecode(plan),
                       "verify warmup");
                 Cuda(cudaDeviceSynchronize());
                 cudaGraph_t graph;
                 cudaGraphExec_t exec;
                 Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+                producer.Launch();
                 Check(FastllmCudaV41PrepareFullDecode(plan) && FastllmCudaV41FinishFullDecode(plan),
                       "verify capture");
                 Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));

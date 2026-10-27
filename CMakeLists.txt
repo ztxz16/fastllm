@@ -1598,7 +1598,12 @@ if (UNIT_TEST)
                 "PASS [0-9]+ changing-context graph replays; stress=0" 900 --long-context)
             fastllm_add_checked_test(deepseekV41FullVerifyLongContext deepseekV41FullDecodeRegression
                 "PASS [0-9]+ full verify graph replays" 900 --verify --long-context)
+            fastllm_add_checked_test(deepseekV41CandidateReuse deepseekV41FullDecodeRegression
+                "PASS [0-9]+ changing-context graph replays; stress=0" 900 --shared-candidates --long-context)
+            fastllm_add_checked_test(deepseekV41CandidateReuseVerify deepseekV41FullDecodeRegression
+                "PASS [0-9]+ full verify graph replays" 900 --verify --shared-candidates --long-context)
             set_tests_properties(deepseekV41FullDecodeLongContext deepseekV41FullVerifyLongContext
+                deepseekV41CandidateReuse deepseekV41CandidateReuseVerify
                 PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             set_tests_properties(deepseekV41FullDecode deepseekV41FullDecodeStress
                 deepseekV41FullDecodePooled deepseekV41FullVerify deepseekV41AttentionLocality

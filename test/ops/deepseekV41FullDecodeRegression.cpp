@@ -25,6 +25,7 @@ static float amplitude = .3f;
 static bool stress = false;
 static bool pooled = false;
 static bool longContext = false;
+static int indexHeads = 32;
 static void Fill(Data &d, const std::vector<int> &dims, int seed,
                  DataType type = DataType::BFLOAT16) {
     if (type == DataType::INT32 || type == DataType::INT8) {
@@ -69,6 +70,46 @@ static void Equal(const Data &a, const Data &b, const char *name) {
     if (x != y)
         throw std::runtime_error(std::string("bits changed: ") + name);
 }
+// Exercise caller-owned candidate storage against the independent eager
+// reference, with a producer that cannot modify the consumer's Q/KV or cache.
+static bool sharedCandidates = false;
+struct CandidateReuseProducer {
+    Data q, kv, iq, out, saved, blocks, counts, q0, kv0, iq0;
+    void *plan = nullptr;
+    ~CandidateReuseProducer() { FastllmCudaV41DestroyFullDecode(plan); }
+    void Setup(const FastllmV41FullDecodeConfig &config, FastllmV41FullDecodeBuffers &b) {
+        if (!sharedCandidates || !config.useCandidates) return;
+        const int n = config.batch;
+        Fill(q, {1, n, config.heads, 512}, 41);
+        Fill(kv, {1, n, 512}, 42);
+        Fill(iq, {1, n, config.indexHeads, 128}, 43);
+        Fill(out, q.dims, 44); Fill(saved, kv.dims, 45);
+        Fill(blocks, {n, (config.maxKeys + config.blockSize - 1) / config.blockSize}, 0, DataType::INT32);
+        Fill(counts, {n}, 0, DataType::INT32);
+        q0.CopyFrom(q); kv0.CopyFrom(kv); iq0.CopyFrom(iq);
+        b.candidateBlocks = blocks.cudaData; b.candidateCounts = counts.cudaData;
+        auto c = config; c.kvSource = false; c.verifying = true;
+        auto producer = b;
+        producer.q = q.cudaData; producer.kv = kv.cudaData; producer.indexQ = iq.cudaData;
+        producer.output = out.cudaData; producer.savedKV = saved.cudaData; producer.requests = nullptr;
+        plan = FastllmCudaV41CreateFullDecode(c, producer);
+        Check(plan, "candidate producer create");
+        b.reuseCandidates = true;
+        auto invalid = b; invalid.candidateCounts = nullptr;
+        Check(!FastllmCudaV41CreateFullDecode(config, invalid), "partial candidate workspace accepted");
+        invalid.candidateBlocks = nullptr;
+        Check(!FastllmCudaV41CreateFullDecode(config, invalid), "reuse without workspace accepted");
+    }
+    bool Upload(const FastllmV41FullDecodeRequest *rows, size_t count) {
+        return !plan || FastllmCudaV41UploadFullDecode(plan, rows, count);
+    }
+    void Launch() {
+        if (!plan) return;
+        CopyDevice(q, q0); CopyDevice(kv, kv0); CopyDevice(iq, iq0);
+        Check(FastllmCudaV41PrepareFullDecode(plan) && FastllmCudaV41FinishFullDecode(plan),
+              "candidate producer replay");
+    }
+};
 #include "deepseekV41FullVerifyRegression.inc"
 
 static void RunAttentionLocalityRegression(int devices) {
@@ -130,7 +171,10 @@ int main(int argc, char **argv) {
         if (std::string(argv[i]) == "--pooled") pooled = true;
         if (std::string(argv[i]) == "--verify") verify = true;
         if (std::string(argv[i]) == "--locality") locality = true;
+        if (std::string(argv[i]).rfind("--index-heads=", 0) == 0)
+            indexHeads = std::stoi(std::string(argv[i]).substr(14));
         if (std::string(argv[i]) == "--long-context") longContext = true;
+        if (std::string(argv[i]) == "--shared-candidates") sharedCandidates = true;
     }
     if (locality && devices < 2) return 77;
     try {
@@ -142,17 +186,20 @@ int main(int argc, char **argv) {
         for (int batch : {1, 2, 4, 8, 16, 128})
             for (int ratio : {0, 1, 2})
                 for (int maskMode : {0, 1, 2}) {
-                    if ((!ratio && maskMode) || ((stress || longContext) && batch != 1))
+                    if ((!ratio && maskMode) || ((stress || longContext || indexHeads != 32) && batch != 1) ||
+                        (sharedCandidates && (batch != 1 || maskMode != 2)))
                         continue;
                     const int maxKeys = longContext ? 1048576 : batch == 128 ? 2048 : 32768;
                     FastllmV41FullDecodeConfig c;
                     c.batch = batch;
+                    c.indexHeads = indexHeads;
                     c.ratio = ratio;
                     c.maxKeys = maxKeys;
                     c.indexSource = ratio != 0;
                     c.writeCandidates = maskMode == 1;
                     c.useCandidates = maskMode == 2;
                     c.candidateTopK = 16;
+                    if (sharedCandidates || (maskMode == 1 && !stress)) c.blockSize = 8;
                     c.softmaxScale = 1 / std::sqrt(512.f);
                     const int maxBlocks = (maxKeys + c.blockSize - 1) / c.blockSize;
                     Data q, kv, out, iq, iw, sink, top, cand, q0, kv0, iq0, qr, kr, orr, iqr, tr,
@@ -160,8 +207,8 @@ int main(int argc, char **argv) {
                     Fill(q, {1, batch, 8, 512}, 1);
                     Fill(kv, {1, batch, 512}, 2);
                     Fill(out, {1, batch, 8, 512}, 3);
-                    Fill(iq, {1, batch, 32, 128}, 4);
-                    Fill(iw, {1, batch, 32}, 5, DataType::FLOAT32);
+                    Fill(iq, {1, batch, indexHeads, 128}, 4);
+                    Fill(iw, {1, batch, indexHeads}, 5, DataType::FLOAT32);
                     Fill(sink, {8}, 6, DataType::FLOAT32);
                     Fill(top, {1, batch, 512}, 7, DataType::INT32);
                     Fill(cand, {1, batch, maxBlocks}, 8, DataType::INT8);
@@ -215,9 +262,12 @@ int main(int argc, char **argv) {
                     unsupported.ratio = 3;
                     Check(!FastllmCudaV41CreateFullDecode(unsupported, b),
                           "unsupported ratio accepted");
+                    CandidateReuseProducer producer;
+                    producer.Setup(c, b);
                     void *plan = FastllmCudaV41CreateFullDecode(c, b);
                     Check(plan, "plan create");
                     auto upload = [&](const FastllmV41FullDecodeRequest *rows, size_t count) {
+                        if (!producer.Upload(rows, count)) return false;
                         if (!pooled) return FastllmCudaV41UploadFullDecode(plan, rows, count);
                         if (count != size_t(batch)) {
                             void *plans[] = {plan};
@@ -245,6 +295,7 @@ int main(int argc, char **argv) {
                     Check(upload(requests.data(), batch),
                           "initial upload");
                     Cuda(cudaMemsetAsync(cand.cudaData, 1, cand.GetBytes(), cudaStreamPerThread));
+                    producer.Launch();
                     Check(FastllmCudaV41PrepareFullDecode(plan) &&
                               FastllmCudaV41FinishFullDecode(plan),
                           "warmup");
@@ -253,6 +304,7 @@ int main(int argc, char **argv) {
                     cudaGraphExec_t exec;
                     Cuda(cudaStreamBeginCapture(cudaStreamPerThread,
                                                 cudaStreamCaptureModeThreadLocal));
+                    producer.Launch();
                     Check(FastllmCudaV41PrepareFullDecode(plan) &&
                               FastllmCudaV41FinishFullDecode(plan),
                           "capture");
@@ -298,8 +350,8 @@ int main(int argc, char **argv) {
                             trans.push_back({&vq[i], nullptr, pos, 0, false});
                             trans.push_back({&vk[i], nullptr, pos, 1, false});
                             if (ratio) {
-                                View(viq[i], iqr, (size_t)i * 32 * 128 * 2, {1, 1, 32, 128});
-                                View(viw[i], iw, (size_t)i * 32 * 4, {1, 1, 32});
+                                View(viq[i], iqr, (size_t)i * indexHeads * 128 * 2, {1, 1, indexHeads, 128});
+                                View(viw[i], iw, (size_t)i * indexHeads * 4, {1, 1, indexHeads});
                                 View(vkeys[i], keys[i], 0, {1, count, 128});
                                 View(vcmp[i], cmps[i], 0, {1, count, 512});
                                 View(vtop[i], tr, (size_t)i * 512 * 4,

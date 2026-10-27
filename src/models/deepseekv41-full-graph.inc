@@ -23,6 +23,7 @@ struct V41FullGraph {
     std::vector<std::unique_ptr<V41FullLayer>> layers;
     std::map<int, std::unique_ptr<V41FullEngram>> engrams;
     Data topk, candidates, head, norm, normFloat, logits, requests, gatheredLogits;
+    Data candidateBlocks, candidateCounts;
     std::map<int, Data> mainHidden;
     std::vector<void *> ready;
     std::vector<Data> commitDescriptors;
@@ -273,6 +274,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     const int blockSize = std::max(1, candidate_block_size);
     alloc(g->topk, DataType::INT32, {1, batch, index_topk});
     alloc(g->candidates, DataType::INT8, {1, batch, (g->maxKeys + blockSize - 1) / blockSize});
+    alloc(g->candidateBlocks, DataType::INT32, {batch, (g->maxKeys + blockSize - 1) / blockSize});
+    alloc(g->candidateCounts, DataType::INT32, {batch});
     for (int l = 0; l < block_cnt; ++l) {
         auto layer = std::make_unique<V41FullLayer>();
         auto &c = layer->config;
@@ -417,6 +420,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 });
             });
         }
+        int candidateWorkspaceRatio = -1;
         for (int l = 0; l < block_cnt; ++l) {
             const std::string prefix = "layers." + std::to_string(l);
             auto engram = g->engrams.find(l);
@@ -450,6 +454,15 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             for (size_t rank = 0; rank < children.size(); ++rank)
                 children[rank].push_back(state->segments[l * 4].graphs[rank]);
             auto &layer = *g->layers[l];
+            // Every layer receives the same per-query positions. Only share
+            // lists with matching compression ratios; a new mask invalidates
+            // the previous producer even when its addresses stay unchanged.
+            if (layer.config.writeCandidates) candidateWorkspaceRatio = -1;
+            const bool shareCandidates = layer.config.indexSource && layer.config.useCandidates &&
+                !layer.config.writeCandidates &&
+                (candidateWorkspaceRatio < 0 || candidateWorkspaceRatio == layer.config.ratio);
+            const bool reuseCandidates = shareCandidates && candidateWorkspaceRatio == layer.config.ratio;
+            if (shareCandidates) candidateWorkspaceRatio = layer.config.ratio;
             if (layer.config.kvSource)
                 PrepareMultiCudaReplicatedData(weight[prefix + ".attn.compressor.norm.weight"],
                                                g->devices, true);
@@ -478,6 +491,11 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 b.indexWeights = ptr(ws.idxWeightsAll);
                 b.topk = ptr(g->topk);
                 b.candidates = ptr(g->candidates);
+                if (shareCandidates) {
+                    b.candidateBlocks = ptr(g->candidateBlocks);
+                    b.candidateCounts = ptr(g->candidateCounts);
+                    b.reuseCandidates = reuseCandidates;
+                }
                 b.sink = ptr(weight[prefix + ".attn.attn_sink"]);
                 if (verifying) {
                     b.savedKV = ptr(layer.savedKV);
