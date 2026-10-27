@@ -317,10 +317,11 @@ def _discover_windows_dll_dirs() -> List[str]:
     for path in candidates:
         if not isinstance(path, str) or not os.path.isdir(path):
             continue
-        normalized = os.path.normcase(os.path.abspath(path))
+        absolute = os.path.realpath(os.path.abspath(path))
+        normalized = os.path.normcase(absolute)
         if normalized not in seen:
             seen.add(normalized)
-            result.append(os.path.abspath(path))
+            result.append(absolute)
     return result
 
 def _prepare_windows_dll_search_path() -> List[str]:

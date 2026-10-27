@@ -15,7 +15,7 @@ class WindowsDllSearchTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.package = self.root / "ftllm"
         self.package.mkdir()
         self.environment = {}
@@ -86,6 +86,20 @@ class WindowsDllSearchTests(unittest.TestCase):
         self.prepare()
         self.register.assert_any_call(str(available))
         self.assertIn(handle, self.namespace["_windows_dll_directory_handles"])
+
+    def test_short_path_or_symlink_alias_is_registered_only_once(self):
+        dependency = self.root / "dependencies"
+        dependency.mkdir()
+        alias = str(self.root / "directory-alias")
+        path_api = Mock(wraps=os.path)
+        path_api.isdir.side_effect = lambda path: path == alias or os.path.isdir(path)
+        path_api.realpath.side_effect = lambda path: (
+            str(dependency) if path == alias else os.path.realpath(path)
+        )
+        self.namespace["os"].path = path_api
+        self.environment["PATH"] = os.pathsep.join([str(dependency), alias])
+        self.assertEqual(self.prepare(), [str(self.package), str(dependency)])
+        self.assertEqual(self.register.call_count, 2)
 
 
 if __name__ == "__main__":
