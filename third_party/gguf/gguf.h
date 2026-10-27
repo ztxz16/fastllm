@@ -1790,6 +1790,7 @@ enum ggml_type {
         // GGML_TYPE_Q4_0_4_4 = 31, support has been removed from gguf files
         // GGML_TYPE_Q4_0_4_8 = 32,
         // GGML_TYPE_Q4_0_8_8 = 33,
+        GGML_TYPE_MXFP4   = 39,
         GGML_TYPE_TQ1_0   = 34,
         GGML_TYPE_TQ2_0   = 35,
         // GGML_TYPE_IQ4_NL_4_4 = 36,
@@ -2198,9 +2199,10 @@ namespace fastllm {
         }
     };
 
-    // Append validated vision weights and install parameters before InitParams.
-    void AppendDeepSeekV41GGUFVision(basellm *model, const json11::Json &target,
-                                    const std::string &path, std::vector<ReadGGUFTask> &tasks);
+    // Append validated auxiliary weights and install parameters before InitParams.
+    void AppendDeepSeekV41GGUFAux(basellm *model, const json11::Json &target,
+                                 const std::string &path, bool vision,
+                                 std::vector<ReadGGUFTask> &tasks);
 
     void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
                                 GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType = GGUFWeightReplaceRule::GGUFWeightReplaceType::GGUFWeightReplaceDirect);

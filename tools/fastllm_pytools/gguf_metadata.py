@@ -118,9 +118,9 @@ def read_gguf_metadata(path, keys):
     return result
 
 
-def read_gguf_tensor_names(path):
+def read_gguf_tensor_info(path):
     """Read the tensor directory, skipping metadata values and tensor data."""
-    names = set()
+    tensors = {}
     with open(path, "rb") as stream:
         if _read_exact(stream, 4) != b"GGUF":
             raise ValueError("not a GGUF file: %s" % path)
@@ -133,12 +133,21 @@ def read_gguf_tensor_names(path):
             _read_string(stream, materialize=False)
             _read_value(stream, _read_number(stream, "I"), materialize=False)
         for _ in range(tensor_count):
-            names.add(_read_string(stream))
+            name = _read_string(stream)
             dimensions = _read_number(stream, "I")
             if not 1 <= dimensions <= 4:
                 raise ValueError("invalid GGUF tensor dimensions")
-            _read_exact(stream, dimensions * 8 + 4 + 8)  # shape, type, offset
-    return names
+            shape = tuple(reversed([_read_number(stream, "Q") for _ in range(dimensions)]))
+            kind = _read_number(stream, "I")
+            _read_number(stream, "Q")  # offset
+            if name in tensors:
+                raise ValueError("duplicate GGUF tensor: " + name)
+            tensors[name] = (shape, kind)
+    return tensors
+
+
+def read_gguf_tensor_names(path):
+    return set(read_gguf_tensor_info(path))
 
 
 _ARCHITECTURE_CONFIGS = {

@@ -349,7 +349,7 @@ def mixed_disk_plan(args, baseline, metadata, tensors, model, gpu, ram, ratio):
     # Separate NUMA and disk upload rings persist together. Activation scratch
     # is reusable, so budget the larger backend workspace plus both rings.
     for boundary in range(model.layers - 1, resident, -1):
-        kept = [size if memory.expert_layer(i, model) < boundary else 0
+        kept = [size if memory.expert_layer(i, model) < boundary or i in getattr(model, "eager_expert_layers", ()) else 0
                 for i, size in enumerate(experts)]
         disk_bytes = sum(experts) - sum(kept)
         if not disk_bytes:

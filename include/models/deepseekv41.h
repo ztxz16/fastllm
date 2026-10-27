@@ -198,6 +198,7 @@ namespace fastllm {
         ~DeepSeekV41Model() override;
 
         void InitParams() override;
+        std::string SelectSpecialWeightDevice(const std::string &weightName, int layerId) const override;
 
         std::map<std::string, std::vector<std::pair<std::string, DataType> > >
                 GetTensorMap(const std::vector<std::string> &tensorNames) override;

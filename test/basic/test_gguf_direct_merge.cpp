@@ -18,6 +18,39 @@ struct Files {
 int main() {
     try {
         Files files;
+        {
+            // Exercise every FP4 code and two exponent values. Import must
+            // preserve values while changing half-block pairs to adjacent pairs.
+            std::vector<uint8_t> packed(34);
+            for (int b = 0; b < 2; ++b) {
+                packed[b * 17] = 126 + b;
+                for (int j = 0; j < 16; ++j)
+                    packed[b * 17 + 1 + j] = j | ((15 - j) << 4);
+            }
+            { std::ofstream file(files.a, std::ios::binary);
+              file.write(reinterpret_cast<const char *>(packed.data()), packed.size()); }
+            Data header(DATA_GGUF_FORMAT, GGML_TYPE_MXFP4, {2, 32});
+            auto tensor = *static_cast<ggml_tensor *>(header.ggmlTensor);
+            tensor.dims = {2, 32};
+            Data imported;
+            WeightImportGGUFTensor(&imported, &tensor, files.a, 0,
+                                   GGUFWeightReplaceRule::GGUFWeightReplaceDirect);
+            Check(imported.dataType == NVFP4 && imported.GetBytes() == 34,
+                  "MXFP4 import expanded its storage");
+            const auto *scales = GetNVFP4ScaleData(imported);
+            for (int b = 0; b < 2; ++b) {
+                Check(scales[b] == 126 + b, "MXFP4 exponent changed");
+                for (int j = 0; j < 32; ++j) {
+                    int code = (imported.cpuData[b * 16 + j / 2] >> (4 * (j % 2))) & 15;
+                    Check(code == (j < 16 ? j : 31 - j), "MXFP4 element order changed");
+                }
+            }
+            std::string name = "expert";
+            ReadGGUFTask task(name, nullptr, tensor, files.a, 0);
+            std::vector<int> dims; uint64_t bytes;
+            Check(!GetGGUFDirectMergeLayout({&task, &task}, dims, bytes),
+                  "MXFP4 import conversion was bypassed by direct merge");
+        }
         const ggml_type types[] = {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
             GGML_TYPE_Q4_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K,
             GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS,

@@ -547,23 +547,29 @@ DSML 块前的两个模板分隔换行不作为 assistant 正文返回，避免�
 迷你模型上精确命中与 T-1 截断命中后的贪心输出与不中断的原请求逐 bit 一致；800 token 提示词的
 首 token 延迟从 39–54 ms 降到 6 ms。
 
-## GGUF 视觉模块
+## DSpark 投机解码
 
-DeepSeek V4.1 GGUF 主模型可使用 `--mmproj /models/mmproj-BF16.gguf` 加载
-`clip` / `deepseek41v` 视觉模块。视觉配置和图像 token 从 GGUF 读取，无需 `--ori`；
-auto 另外计入转换后的视觉权重及工作区。
+### 外置 GGUF 草稿与视觉模块
+
+DeepSeek V4.1 GGUF 主模型可以通过 `--draft`（或 `--dspark_model`）加载 Unsloth 的
+`dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf`。加载器识别 `dflash` 架构，校验主干维度，
+复用现有 V4.1 DSpark 验证、回滚和专家分流；它与 Qwen 的 DFlash2 是不同路径。
 
 ```bash
 ftllm server /models/DeepSeek-V4.1-Flash-1017-IQ2_XXS-00001-of-00004.gguf \
-  --auto --mmproj /models/mmproj-BF16.gguf
+  --auto --draft /models/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf
 ```
 
+默认使用文件中的训练 block（1017 版为 5），可用 `--dspark N` 或 `--draft_tokens N` 调整。
+`--speculative_algorithm off` 会同时关闭草稿加载。auto 计入草稿权重、状态和验证工作区；
+MXFP4 专家无损转换为原生紧凑布局，磁盘主干的草稿专家保持 CPU/NUMA 常驻，计入主存预算。
+
+`--mmproj /models/mmproj-BF16.gguf` 支持 `clip` / `deepseek41v` 视觉模块，也可以和上述草稿一起加载。
+视觉配置从 GGUF 读取，无需 `--ori`；auto 另外预留视觉权重和工作区。
 图像输入还要求主干每层的 `ffn.gate.bias_vl`。部分 GSQ 纯文本导出省略了这些偏置，
 此时需要把**同一原始模型版本**的视觉路由偏置放入 mmproj（GGUF 名称为
-`blk.N.exp_probs_b_vl.bias`）。加载器会在读取大权重之前检查缺失项，不能以文本偏置替代；
-主干已有的偏置不会被 mmproj 重复加载。
+`blk.N.exp_probs_b_vl.bias`）。加载器会在读取大权重之前检查缺失项，不能以文本偏置替代。
 
-## DSpark 投机解码
 
 `config.json` 的 `text_config` 里 `dspark_block_size > 0` 且 checkpoint 带 `mtp.*` 权重时可以开启。
 启动加 `--speculative_algorithm dspark --dspark 5`。`--dspark N` 指每轮最多校验 N 个候选，

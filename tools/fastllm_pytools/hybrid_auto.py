@@ -721,6 +721,7 @@ def weight_costs(tensors, model, args):
     common, host, largest = 0, 0, 0
     snapshot = False
     gguf_layers = {}
+    model.eager_expert_layers = set()
     packed_sizes = _packed_fp4_sizes(tensors, args)
     native_sizes = (_deepseek_v41_weight_sizes(tensors, args) if model.family == "deepseek_v41" else
                     _qwen35_weight_sizes(tensors, args) if model.family == "qwen35" else {})
@@ -745,8 +746,10 @@ def weight_costs(tensors, model, args):
             raise ValueError("Hybrid auto: tensor layer outside model")
         is_expert = _is_routed_expert(name)
         is_shared = "_shexp." in name or ".shared_experts." in name
-        if is_expert and tensor.kind.startswith("gguf:") and layer is not None:
+        if is_expert and tensor.kind.startswith("gguf:") and layer is not None and not is_draft:
             gguf_layers[layer] = gguf_layers.get(layer, 0) + tensor.bytes
+        if is_draft and is_expert and tensor.kind == "gguf:39":
+            model.eager_expert_layers.add(layer)
         size = native_sizes.get(name, tensor.bytes)
         if is_expert and tensor.kind in ("gguf:13", "gguf:14"):
             # NUMA Q5_K/Q6_K R4 cannot currently be restored by the cache;
@@ -841,7 +844,7 @@ def weight_costs(tensors, model, args):
         # Match FastllmCudaV41GGUFGroupedWorkspaceBytes, not all GGUF formats.
         supported = {"gguf:" + str(t) for t in (11, 12, 16, 17, 18, 19, 22, 29, 42)}
         model.disk_prefill["streamed_mmq"] = len(gguf_layers) == model.layers and all(
-            t.kind in supported for t in tensors if _is_routed_expert(t.name))
+            t.kind in supported for t in tensors if _is_routed_expert(t.name) and not t.name.startswith("mtp."))
     return expert, dense, common, host, largest, snapshot
 
 
@@ -1096,6 +1099,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                 for d in targets:
                     used[d] += implicit_embedding_bytes
             host_experts = 0
+            eager_host_experts = 0
             host_by_device = dict.fromkeys(mapping, 0)
             for layer in range(len(experts)):
                 targets = list(mapping) if mode == "tp" else [layer_device(layer, model.layers, mapping)]
@@ -1106,6 +1110,8 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                 if layer >= model.layers and args.mtp and model.family == "qwen4":
                     resident_bytes = experts[layer]  # Qwen draft experts stay on CUDA
                 host_experts += experts[layer] - resident_bytes
+                if layer in getattr(model, "eager_expert_layers", ()):
+                    eager_host_experts += experts[layer] - resident_bytes
                 for d in targets:
                     host_by_device[d] += experts[layer] - resident_bytes
                     kv_bytes = (tokens + (speculative if model.dspark_block_size else 0)) * model.kv[layer]
@@ -1185,6 +1191,8 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
                           os.environ.get("FASTLLM_DSV41_REFERENCE_MATH", "0") in ("", "0"))
             host_workspace = max(staging, workspace) if early_cuda else staging + workspace
             host_required = host + host_workspace + GiB + len(mapping) * disk_staging
+            if args.moe_device == "disk":
+                host_required += eager_host_experts
             if args.moe_device != "disk":
                 host_required += host_experts
                 pinned = os.environ.get("FT_PINNED_WEIGHT", "1").lower() not in ("0", "false", "off")
@@ -1197,7 +1205,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             else:
                 host_required += tokens * sum(model.kv)  # request mirrors / saved prefix
             cpu_cache = 0 if args.moe_device != "disk" else (
-                max(0, min(host_experts, host_limit - host_required)) if cpu_auto else args.moe_cpu_cache)
+                max(0, min(host_experts - eager_host_experts, host_limit - host_required)) if cpu_auto else args.moe_cpu_cache)
             cpu_cache = cpu_cache // MiB * MiB if cpu_auto else cpu_cache
             if host_required + cpu_cache > host_limit:
                 continue
@@ -1249,7 +1257,7 @@ def validate_options(args):
             args.custom or args.lora or args.multimodal or args.rope_scaling or
             getattr(args, "speculative_algorithm", "") not in ("", "off", "mtp", "dspark") or
             (getattr(args, "speculative_algorithm", "") == "dspark" and
-             (getattr(args, "speculative_draft_model_path", "") or args.dspark <= 0))):
+             (args.dspark <= 0 or (getattr(args, "speculative_draft_model_path", "") and not str(args.speculative_draft_model_path).lower().endswith(".gguf"))))):
         raise ValueError("Hybrid auto does not yet budget KVMem, custom KV limits, weight overrides, adapters, vision or external speculative algorithms; use explicit parameters")
     if any(k.startswith("FASTLLM_MOE_CUDA_CACHE_BYTES_") for k in os.environ):
         raise ValueError("Hybrid auto cannot combine with per-device cache environment overrides; use explicit cache parameters")
@@ -1259,12 +1267,17 @@ def model_inputs(args):
     metadata, tensors = inventory(args.path)
     if metadata.get("general.architecture") == "deepseek41":
         metadata = gguf.deepseek_v41_config(metadata)
+    draft = getattr(args, "speculative_draft_model_path", "")
+    deepseek_draft = draft and metadata.get("gguf_architecture") == "deepseek41"
+    if deepseek_draft:
+        from .deepseek_v41_gguf import dspark_config, draft_tensor_name
+        metadata.update(dspark_config(draft, metadata))
     kv_dtype = args.atype if args.kv_cache_dtype == "auto" and args.atype != "auto" else args.kv_cache_dtype
     model = geometry(metadata, kv_dtype, args.mtp, args.dspark)
-    draft = getattr(args, "speculative_draft_model_path", "")
     if draft:
         _, draft_tensors = inventory(draft)
-        tensors += [Tensor(t.name if t.name.startswith("mtp.") else "mtp." + t.name,
+        tensors += [Tensor(draft_tensor_name(t.name, metadata["num_nextn_predict_layers"])
+                           if deepseek_draft else t.name if t.name.startswith("mtp.") else "mtp." + t.name,
                            t.shape, t.bytes, t.kind) for t in draft_tensors]
     mmproj = getattr(args, "mmproj", "")
     if mmproj and metadata.get("gguf_architecture") == "deepseek41":

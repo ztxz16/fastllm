@@ -822,6 +822,17 @@ namespace fastllm {
 
     // ==================== 参数与权重 ====================
 
+    std::string DeepSeekV41Model::SelectSpecialWeightDevice(const std::string &name, int layerId) const {
+        const std::string device = basellm::SelectSpecialWeightDevice(name, layerId);
+        // External GGUF MXFP4 is converted to the native compact layout once.
+        // It cannot be lazily read as native FP4 directly from the GGUF file.
+        if (name.compare(0, 4, "mtp.") == 0 && weight.dicts.count("dspark_external_gguf") &&
+            (device == "disk" || device.compare(0, 5, "disk:") == 0)) {
+            return GetFastllmEnv().activateNuma ? "numa" : "cpu";
+        }
+        return device;
+    }
+
     void DeepSeekV41Model::InitDsparkParams() {
         v41DsparkTokens = std::max(0, DsEnvInt("FASTLLM_DSPARK_TOKENS", 0));
         v41DsparkBlockSize = 0;
@@ -2029,7 +2040,8 @@ namespace fastllm {
                         }
 #endif
                     }
-                    this->ApplyMoeDeviceMapForLayer(layerId);
+                    ((Executor*)GetExecutor())->SetFirstDevice(
+                        SelectSpecialWeightDevice(pre + ".ffn.experts.0.gateup.weight", layerId));
                     bool hybrid = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
                     if (hasSharedExpertOut &&

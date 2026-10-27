@@ -1557,13 +1557,17 @@ class model:
                             self.hf_tokenizer = try_load_gguf_tokenizer(path)
                     finally:
                         report_model_load_progress("tokenizer", 1, 1)
-                if external_mtp_path and mmproj_path:
-                    raise ValueError(
-                        "external MTP and mmproj cannot be used together")
-                if mmproj_path and self.config.get("gguf_architecture") == "deepseek41":
-                    from .deepseek_v41_gguf import vision_config
-                    self.config.update(vision_config(mmproj_path, self.config))
-                if context_requested:
+                if external_mtp_path and mmproj_path and self.config.get("gguf_architecture") != "deepseek41":
+                    raise ValueError("external MTP and mmproj cannot be used together")
+                if self.config.get("gguf_architecture") == "deepseek41":
+                    from .deepseek_v41_gguf import dspark_config, vision_config
+                    if external_mtp_path:
+                        self.config.update(dspark_config(external_mtp_path, self.config))
+                    if mmproj_path:
+                        self.config.update(vision_config(mmproj_path, self.config))
+                if context_requested or (external_mtp_path and mmproj_path):
+                    if not hasattr(fastllm_lib, "create_llm_model_from_gguf_with_context"):
+                        raise RuntimeError("the loaded FastLLM library does not support combined GGUF add-ons")
                     self.model = fastllm_lib.create_llm_model_from_gguf_with_context(
                         path.encode(), ori_model_path.encode(),
                         external_mtp_path.encode(), mmproj_path.encode(),
