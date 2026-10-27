@@ -558,7 +558,9 @@ if (USE_CUDA)
         message(STATUS "DeepSeek-V4 SM120 DeepGEMM WoA kernel: OFF")
     endif()
 
+    # These C++ units include CUDA runtime/driver headers without going through nvcc.
     set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp
+        src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_kvmem.cpp
         APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
 
     # GLM53 prefill uses architecture-specific register and matrix-load
