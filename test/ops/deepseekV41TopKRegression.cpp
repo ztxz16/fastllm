@@ -47,9 +47,21 @@ static void Run(int device, int rows, int length, int blockSize, int pattern, bo
     std::vector<unsigned char> mask(size_t(rows) * blocks);
     std::mt19937 random(173 + device + rows + length);
     for (auto &value : host) {
-        value = pattern == 0   ? float(int(random() % 100000) - 50000) * .001f
-                : pattern == 1 ? float(int(random() % 13) - 6)
-                               : 1.f;
+        if (pattern == 0) value = float(int(random() % 100000) - 50000) * .001f;
+        else if (pattern == 1) value = float(int(random() % 13) - 6);
+        else if (pattern == 2) value = 1.f;
+        else if (pattern == 3) {
+            // Many distinct FP32 keys in a single FP16 coarse bucket.
+            unsigned bits = 0x3f800000u + random() % 10000;
+            std::memcpy(&value, &bits, sizeof(value));
+        } else if (pattern == 4) {
+            value = float(int(random() % 200001) - 100000) * 100.f;
+        } else {
+            unsigned bits = random();
+            if (pattern == 5) bits &= 0x800007ffu; // Signed zero and subnormals.
+            else if ((bits & 0x7f800000u) == 0x7f800000u) bits &= ~0x00800000u;
+            std::memcpy(&value, &bits, sizeof(value));
+        }
     }
     for (auto &value : mask)
         value = random() % 5 == 0;
@@ -179,6 +191,15 @@ int main(int argc, char **argv) {
                     for (bool masked : {false, true})
                         for (int pattern : {0, 1, 2}) {
                             Run(device, rows, length, pattern == 1 ? 3 : 8, pattern, masked);
+                            ++cases;
+                        }
+        }
+        if (longContext) {
+            for (int rows : {1, 6, 8})
+                for (int length : {65537, 262145})
+                    for (bool masked : {false, true})
+                        for (int pattern : {3, 4, 5, 6}) {
+                            Run(0, rows, length, 8, pattern, masked);
                             ++cases;
                         }
         }

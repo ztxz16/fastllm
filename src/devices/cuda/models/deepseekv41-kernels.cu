@@ -2405,7 +2405,7 @@ namespace {
             int before = 0, total = 0;
             Scan(scan).ExclusiveSum(count, before, total);
             const int greater = total - before - count;
-            if (remaining > greater && remaining <= greater + count) {
+            if (count > 0 && remaining > greater && remaining <= greater + count) {
                 selected[0] = threadIdx.x;
                 selected[1] = remaining - greater;
             }
@@ -2545,7 +2545,7 @@ namespace {
     //      第 1 趟顺带把落在选中桶里的 key 压缩进共享内存，后 3 趟只扫这几百个 key；
     //   3. 「严格大于阈值的个数」不再单独扫一趟：radix select 结束时的 remaining
     //      恰好是需要从等于阈值的元素里取的个数（tieBudget）；
-    //   4. 写出阶段：prefill 使用打包 BlockScan，decode 使用 warp ballot / 前缀和，
+    //   4. 写出阶段：各 warp 独立扫描连续区间，warp 间只做一次前缀和，
     //      输出位置 = 前面 greater 的个数 + min(tieBudget, 前面 tie 的个数)。
     //
     // 共享内存里的候选块下标由 candList（动态共享内存）承载，listCap == 0 表示不压缩。
@@ -2557,7 +2557,13 @@ namespace {
     constexpr int kTopKShardKeys = 8192;
     constexpr int kTopKParallelMinKeys = 2 * kTopKShardKeys;
 
+    constexpr int kTopKCoarseBins = 1024;
+    constexpr int kTopKCoarseStride = kTopKCoarseBins + 1;
+    constexpr int kTopKCompactCapacity = 8192;
+
     struct V41TopKWorkspace {
+        int *histograms = nullptr, *counts = nullptr, *offsets = nullptr;
+        bool global = false, compactCandidates = false;
         float *scores = nullptr;
         int32_t *indices = nullptr;
         uint8_t *valid = nullptr;
@@ -2565,11 +2571,15 @@ namespace {
 
         size_t Bytes(int rows) const {
             return (size_t)rows * parts * width *
-                (sizeof(float) + sizeof(int32_t) + sizeof(uint8_t));
+                (sizeof(float) + sizeof(int32_t) + sizeof(uint8_t)) +
+                (global ? (size_t)rows * (parts * kTopKCoarseStride + parts + 2) * sizeof(int) :
+                 compactCandidates ? (size_t)rows * sizeof(int) : 0);
         }
     };
-    V41TopKWorkspace V41TopKLayout(void *memory, int rows, int keys, int width, int blockSize) {
+    V41TopKWorkspace V41TopKLayout(void *memory, int rows, int keys, int width, int blockSize, bool global = false, bool compactCandidates = false) {
         V41TopKWorkspace w;
+        w.compactCandidates = compactCandidates;
+        w.global = global;
         w.shardSize = ((kTopKShardKeys + blockSize - 1) / blockSize) * blockSize;
         w.parts = (keys + w.shardSize - 1) / w.shardSize;
         w.width = width;
@@ -2578,16 +2588,30 @@ namespace {
             w.scores = static_cast<float *>(memory);
             w.indices = reinterpret_cast<int32_t *>(w.scores + count);
             w.valid = reinterpret_cast<uint8_t *>(w.indices + count);
+            if (global) {
+                w.histograms = reinterpret_cast<int *>(w.valid + count);
+                w.counts = w.histograms + (size_t)rows * w.parts * kTopKCoarseStride;
+                w.offsets = w.counts + rows;
+            } else if (compactCandidates) {
+                w.counts = reinterpret_cast<int *>(w.valid + count);
+            }
         }
         return w;
     }
 
-    template <bool BATCHED = false, int LEVEL = 0, bool PARALLEL_SELECT = true, int SELECT_THREADS = kSelThreads>
-    __global__ void __launch_bounds__(SELECT_THREADS) V41TopKKernel(const float *score, const uint8_t *candidates, int seqlen, int m,
+    struct V41TopKCounts { int greater, tie; };
+    struct V41TopKAddCounts {
+        __device__ V41TopKCounts operator()(V41TopKCounts a, V41TopKCounts b) const {
+            return {a.greater + b.greater, a.tie + b.tie};
+        }
+    };
+
+    template <bool BATCHED = false, int LEVEL = 0, int THREADS = kSelThreads>
+    __device__ void V41TopKSelect(const float *score, const uint8_t *candidates, int seqlen, int m,
                                   int numBlocks, int blockSize, int blockShift, int width,
                                   int ratio, int startPos, int listCap, int32_t *out,
                                   const V41DecodeIndexDescriptor *items, V41TopKWorkspace workspace) {
-        typedef cub::BlockScan<int, SELECT_THREADS> BlockScan;
+        typedef cub::BlockScan<int, THREADS> BlockScan;
         __shared__ typename BlockScan::TempStorage scanStorage;
         __shared__ unsigned hist[256];
         __shared__ unsigned survivors[kTopKSurvivorCap];
@@ -2634,6 +2658,10 @@ namespace {
             row = workspace.scores + partialBase;
             cand = workspace.valid + partialBase;
             visible = parts * workspace.width;
+            if (workspace.counts && workspace.counts[requestRow] >= 0) {
+                visible = workspace.counts[requestRow];
+                cand = nullptr;
+            }
             numBlocks = visible;
             blockSize = 1; blockShift = 0; listCap = 0;
         }
@@ -2643,7 +2671,7 @@ namespace {
         int nCandBlocks = 0;
         if (canCompact) {
             int running = 0;
-            for (int st = 0; st < numBlocks; st += SELECT_THREADS) {
+            for (int st = 0; st < numBlocks; st += THREADS) {
                 const int blk = st + threadIdx.x;
                 const int keepIt = (blk < numBlocks && cand[blk] != 0 && (blk << blockShift) < visible) ? 1 : 0;
                 int rank = 0, tot = 0;
@@ -2668,10 +2696,10 @@ namespace {
         // ---- 第 1 趟：全量直方图（高 8 bit），同时得到可用元素总数 ----
         if (threadIdx.x < 256) hist[threadIdx.x] = 0;
         __syncthreads();
-        for (int p = threadIdx.x; p < nDomain; p += SELECT_THREADS) {
+        for (int p = threadIdx.x; p < nDomain; p += THREADS) {
             const int j = V41_TOPK_INDEX(p);
             if (V41_TOPK_OK(j)) {
-                atomicAdd(&hist[V41FloatKey(row[j]) >> 24], 1u);
+                V41HistogramIncrement(hist, V41FloatKey(row[j]) >> 24, nDomain >= 8192);
             }
         }
         __syncthreads();
@@ -2684,31 +2712,17 @@ namespace {
         int tieBudget = 0;
         const bool selectAll = total <= width;
         if (!selectAll) {
-            if constexpr (PARALLEL_SELECT) {
-                const int greater = total - binPrefix - binCount;
-                if (binCount > 0 && width > greater && width <= greater + binCount) {
-                    meta[0] = threadIdx.x;
-                    meta[1] = width - greater;
-                    meta[2] = binCount;
-                }
-            } else {
-                if (threadIdx.x == 0) {
-                    int cnt = width, digit = 255;
-                    for (; digit >= 0; digit--) {
-                        const int c = (int)hist[digit];
-                        if (cnt <= c) {
-                            break;
-                        }
-                        cnt -= c;
-                    }
-                    if (digit < 0) {
-                        digit = 0;
-                    }
-                    meta[0] = digit;
-                    meta[1] = cnt;
-                    meta[2] = (int)hist[digit];
-                }
+
+            // Each thread owns one radix bin. The block prefix already tells
+            // us how many keys are greater, so the winning bin needs no serial
+            // scan over all 256 bins on thread zero.
+            const int greater = total - binPrefix - binCount;
+            if (binCount > 0 && width > greater && width <= greater + binCount) {
+                meta[0] = threadIdx.x;
+                meta[1] = width - greater;
+                meta[2] = binCount;
             }
+
             __syncthreads();
             int digit = meta[0];
             int remaining = meta[1];
@@ -2722,7 +2736,7 @@ namespace {
                     meta[3] = 0;
                 }
                 __syncthreads();
-                for (int p = threadIdx.x; p < nDomain; p += SELECT_THREADS) {
+                for (int p = threadIdx.x; p < nDomain; p += THREADS) {
                     const int j = V41_TOPK_INDEX(p);
                     if (V41_TOPK_OK(j)) {
                         const unsigned key = V41FloatKey(row[j]);
@@ -2741,51 +2755,35 @@ namespace {
                 __syncthreads();
                 const unsigned mask = 0xffffffffu << (shift + 8);
                 if (useShared) {
-                    for (int s = threadIdx.x; s < survivorCount; s += SELECT_THREADS) {
+                    for (int s = threadIdx.x; s < survivorCount; s += THREADS) {
                         const unsigned key = survivors[s];
                         if ((key & mask) == prefix) {
-                            atomicAdd(&hist[(key >> shift) & 255], 1u);
+                            V41HistogramIncrement(hist, (key >> shift) & 255, nDomain >= 8192);
                         }
                     }
                 } else {
-                    for (int p = threadIdx.x; p < nDomain; p += SELECT_THREADS) {
+                    for (int p = threadIdx.x; p < nDomain; p += THREADS) {
                         const int j = V41_TOPK_INDEX(p);
                         if (V41_TOPK_OK(j)) {
                             const unsigned key = V41FloatKey(row[j]);
                             if ((key & mask) == prefix) {
-                                atomicAdd(&hist[(key >> shift) & 255], 1u);
+                                V41HistogramIncrement(hist, (key >> shift) & 255, nDomain >= 8192);
                             }
                         }
                     }
                 }
                 __syncthreads();
-                if constexpr (PARALLEL_SELECT) {
-                    const int count = threadIdx.x < 256 ? (int)hist[threadIdx.x] : 0;
-                    int prefixCount = 0, totalCount = 0;
-                    BlockScan(scanStorage).ExclusiveSum(count, prefixCount, totalCount);
-                    __syncthreads();
-                    const int greater = totalCount - prefixCount - count;
-                    if (count > 0 && remaining > greater && remaining <= greater + count) {
-                        meta[0] = threadIdx.x;
-                        meta[1] = remaining - greater;
-                    }
-                } else {
-                    if (threadIdx.x == 0) {
-                        int cnt = remaining, d = 255;
-                        for (; d >= 0; d--) {
-                            const int c = (int)hist[d];
-                            if (cnt <= c) {
-                                break;
-                            }
-                            cnt -= c;
-                        }
-                        if (d < 0) {
-                            d = 0;
-                        }
-                        meta[0] = d;
-                        meta[1] = cnt;
-                    }
+
+                const int count = threadIdx.x < 256 ? hist[threadIdx.x] : 0;
+                int before = 0, active = 0;
+                BlockScan(scanStorage).ExclusiveSum(count, before, active);
+                __syncthreads();
+                const int greater = active - before - count;
+                if (count > 0 && remaining > greater && remaining <= greater + count) {
+                    meta[0] = threadIdx.x;
+                    meta[1] = remaining - greater;
                 }
+
                 __syncthreads();
                 digit = meta[0];
                 remaining = meta[1];
@@ -2797,93 +2795,53 @@ namespace {
             tieBudget = remaining;
         }
 
-        // Warp-prefix emission adapted from Strata src/dsv41/ds4_kernels.cu
-        // (c33fa7ba6d0d), MIT, Copyright (c) 2026 Niko1221 and contributors.
-        // Unlike its greater-then-ties layout, merge both ranks here so that
-        // FastLLM's globally ascending selected-index / attention order stays exact.
-        if constexpr (PARALLEL_SELECT) {
-            __shared__ int warpGreater[32], warpEqual[32];
-            __shared__ int cumulativeGreater, cumulativeTie;
-            if (threadIdx.x == 0) { cumulativeGreater = 0; cumulativeTie = 0; }
-            __syncthreads();
-            const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-            constexpr int warps = SELECT_THREADS / 32;
-            const unsigned below = (1u << lane) - 1u;
-            for (int st = 0; st < nDomain; st += SELECT_THREADS) {
-                const int p = st + threadIdx.x;
-                const int j = p < nDomain ? V41_TOPK_INDEX(p) : -1;
-                const bool ok = j >= 0 && V41_TOPK_OK(j);
-                const unsigned key = ok ? V41FloatKey(row[j]) : negInf;
-                const bool greater = ok && key > negInf && (selectAll || key > threshold);
-                const bool equal = ok && key > negInf && !selectAll && key == threshold;
-                const unsigned bg = __ballot_sync(0xffffffffu, greater);
-                const unsigned be = __ballot_sync(0xffffffffu, equal);
-                if (lane == 0) { warpGreater[warp] = __popc(bg); warpEqual[warp] = __popc(be); }
-                __syncthreads();
-                if (warp == 0) {
-                    const int g = lane < warps ? warpGreater[lane] : 0;
-                    const int e = lane < warps ? warpEqual[lane] : 0;
-                    int gs = g, es = e;
-#pragma unroll
-                    for (int offset = 1; offset < 32; offset <<= 1) {
-                        const int a = __shfl_up_sync(0xffffffffu, gs, offset);
-                        const int b = __shfl_up_sync(0xffffffffu, es, offset);
-                        if (lane >= offset) { gs += a; es += b; }
-                    }
-                    if (lane < warps) {
-                        warpGreater[lane] = cumulativeGreater + gs - g;
-                        warpEqual[lane] = cumulativeTie + es - e;
-                    }
-                    __syncwarp();
-                    if (lane == 31) { cumulativeGreater += gs; cumulativeTie += es; }
-                }
-                __syncthreads();
-                const int gBefore = warpGreater[warp] + __popc(bg & below);
-                const int tBefore = warpEqual[warp] + __popc(be & below);
-                if (greater || (equal && tBefore < tieBudget)) {
-                    const int slot = gBefore + min(tieBudget, tBefore);
-                    if (slot < width) orow[slot] = j;
-                }
-                __syncthreads();
-            }
-        } else {
-            // ---- 最后一趟：按升序写出 ----
-            int runningGreater = 0, runningTie = 0;
-            for (int st = 0; st < nDomain; st += SELECT_THREADS) {
-                const int p = st + threadIdx.x;
-                const int j = p < nDomain ? V41_TOPK_INDEX(p) : -1;
-                const bool ok = j >= 0 && V41_TOPK_OK(j);
-                const unsigned key = ok ? V41FloatKey(row[j]) : negInf;
-                int isGreater = 0, isTie = 0;
-                if (ok && key > negInf) {
-                    if (selectAll || key > threshold) {
-                        isGreater = 1;
-                    } else if (key == threshold) {
-                        isTie = 1;
-                    }
-                }
-                int packedPrefix = 0, packedTotal = 0;
-                BlockScan(scanStorage).ExclusiveSum(isGreater * 1024 + isTie, packedPrefix, packedTotal);
-                __syncthreads();
-                const int gBefore = runningGreater + (packedPrefix >> 10);
-                const int tBefore = runningTie + (packedPrefix & 1023);
-                if (isGreater || (isTie && tBefore < tieBudget)) {
-                    const int pos = gBefore + min(tieBudget, tBefore);
-                    if (pos < width) {
-                        orow[pos] = j;
-                    }
-                }
-                runningGreater += packedTotal >> 10;
-                runningTie += packedTotal & 1023;
-            }
+        // Warps own consecutive intervals of the index-ordered domain.
+        // Coalesced reads and warp ballots replace one block scan per tile;
+        // only the prefix between warps needs a block-wide scan.
+        using OutputScan = cub::BlockScan<V41TopKCounts, THREADS>;
+        __shared__ typename OutputScan::TempStorage outputStorage;
+        const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+        const int span = ((nDomain + THREADS - 1) / THREADS) * 32;
+        const int first = warp * span, last = min(nDomain, first + span);
+        auto classify = [&](int p) -> V41TopKCounts {
+            if (p >= nDomain) return {0, 0};
+            const int j = V41_TOPK_INDEX(p);
+            if (!V41_TOPK_OK(j)) return {0, 0};
+            const unsigned key = V41FloatKey(row[j]);
+            if (key <= negInf) return {0, 0};
+            if (selectAll || key > threshold) return {1, 0};
+            return {0, key == threshold ? 1 : 0};
+        };
+        V41TopKCounts local{0, 0}, before;
+        for (int tile = first; tile < last; tile += 32) {
+            const auto flags = classify(tile + lane);
+            local.greater += __popc(__ballot_sync(0xffffffffu, flags.greater));
+            local.tie += __popc(__ballot_sync(0xffffffffu, flags.tie));
         }
-        for (int p = keep + threadIdx.x; p < width; p += SELECT_THREADS) {
+        if (lane != 0) local = {0, 0};
+        OutputScan(outputStorage).ExclusiveScan(local, before, V41TopKCounts{0, 0}, V41TopKAddCounts{});
+        before.greater = __shfl_sync(0xffffffffu, before.greater, 0);
+        before.tie = __shfl_sync(0xffffffffu, before.tie, 0);
+        const unsigned lower = (1u << lane) - 1u;
+        for (int tile = first; tile < last; tile += 32) {
+            const auto flags = classify(tile + lane);
+            const unsigned greaterMask = __ballot_sync(0xffffffffu, flags.greater);
+            const unsigned tieMask = __ballot_sync(0xffffffffu, flags.tie);
+            const int tieBefore = before.tie + __popc(tieMask & lower);
+            if (flags.greater || (flags.tie && tieBefore < tieBudget)) {
+                const int pos = before.greater + __popc(greaterMask & lower) + min(tieBudget, tieBefore);
+                if (pos < width) orow[pos] = V41_TOPK_INDEX(tile + lane);
+            }
+            before.greater += __popc(greaterMask);
+            before.tie += __popc(tieMask);
+        }
+        for (int p = keep + threadIdx.x; p < width; p += THREADS) {
             orow[p] = -1;
         }
         if constexpr (LEVEL == 1) {
             if (hierarchical) {
                 __syncthreads();
-                for (int j = threadIdx.x; j < width; j += kSelThreads) {
+                for (int j = threadIdx.x; j < width; j += THREADS) {
                     const int index = orow[j];
                     workspace.valid[partialBase + j] = index >= 0;
                     workspace.scores[partialBase + j] = index >= 0 ? row[index] : 0.f;
@@ -2892,13 +2850,197 @@ namespace {
             }
         } else if constexpr (LEVEL == 2) {
             __syncthreads();
-            for (int j = threadIdx.x; j < width; j += kSelThreads) {
+            for (int j = threadIdx.x; j < width; j += THREADS) {
                 const int index = orow[j];
                 if (index >= 0) orow[j] = workspace.indices[partialBase + index];
             }
         }
 #undef V41_TOPK_INDEX
 #undef V41_TOPK_OK
+    }
+
+    // Keep the original launch surface for short rows, uncommon shapes and
+    // exact overflow recovery. Global preselection uses the same selector.
+    template <bool BATCHED = false, int LEVEL = 0, int THREADS = kSelThreads>
+    __global__ void __launch_bounds__(THREADS) V41TopKKernel(const float *score, const uint8_t *candidates, int seqlen, int m,
+                                  int numBlocks, int blockSize, int blockShift, int width,
+                                  int ratio, int startPos, int listCap, int32_t *out,
+                                  const V41DecodeIndexDescriptor *items, V41TopKWorkspace workspace) {
+        V41TopKSelect<BATCHED, LEVEL, THREADS>(score, candidates, seqlen, m, numBlocks, blockSize,
+            blockShift, width, ratio, startPos, listCap, out, items, workspace);
+    }
+
+    // A monotone FP16 bucket is only a prefilter. Every retained value keeps
+    // its FP32 bits; the existing selector resolves the exact boundary and ties.
+    // Bound the shortlist and recover with the original hierarchy on overflow.
+    struct V41TopKGlobalArgs {
+        const float *scores;
+        const uint8_t *candidates;
+        int seqlen, count, blocks, blockSize, blockShift, width, ratio, position, listCap;
+        int32_t *output;
+        const V41DecodeIndexDescriptor *items;
+    };
+    struct V41TopKRow {
+        const float *scores;
+        int visible, width;
+    };
+    template <bool BATCHED>
+    __device__ V41TopKRow V41GlobalTopKRow(const V41TopKGlobalArgs &a, int row) {
+        if constexpr (BATCHED) {
+            const auto item = a.items[row];
+            return {item.scores, min(item.count, (item.position + 1) / a.ratio), item.width};
+        } else {
+            return {a.scores + (size_t)row * a.count,
+                min(a.count, (a.position + row % a.seqlen + 1) / a.ratio), a.width};
+        }
+    }
+    __device__ unsigned V41TopKCoarseKey(float value) {
+        const unsigned bits = __half_as_ushort(__float2half_rn(value));
+        return ((bits & 0x8000) ? (~bits & 65535) : (bits | 0x8000)) >> 6;
+    }
+    template <bool BATCHED, int LEVEL, int THREADS>
+    __device__ void V41GlobalTopKFallback(const V41TopKGlobalArgs &a, V41TopKWorkspace w) {
+        V41TopKSelect<BATCHED, LEVEL, THREADS>(a.scores, a.candidates, a.seqlen, a.count,
+            a.blocks, a.blockSize, a.blockShift, a.width, a.ratio, a.position,
+            a.listCap, a.output, a.items, w);
+    }
+
+    template <bool BATCHED>
+    __global__ void __launch_bounds__(512) V41TopKGlobalHistogram(V41TopKGlobalArgs a, V41TopKWorkspace w) {
+        using Scan = cub::BlockScan<int, 512>;
+        __shared__ typename Scan::TempStorage temp;
+        __shared__ unsigned hist[kTopKCoarseBins], nonfinite;
+        const int row = blockIdx.y, part = blockIdx.x, tid = threadIdx.x;
+        const auto r = V41GlobalTopKRow<BATCHED>(a, row);
+        const int first = part * w.shardSize, end = min(r.visible, first + w.shardSize);
+        if (r.visible <= kTopKParallelMinKeys || first >= end) return;
+        for (int bin = tid; bin < kTopKCoarseBins; bin += 512) hist[bin] = 0;
+        if (tid == 0) nonfinite = 0;
+        __syncthreads();
+        for (int j = first + tid; j < end; j += 512) {
+            const float value = r.scores[j];
+            if (!isfinite(value)) atomicOr(&nonfinite, 1u);
+            atomicAdd(hist + V41TopKCoarseKey(value), 1u);
+        }
+        __syncthreads();
+        int values[2] = {int(hist[tid * 2]), int(hist[tid * 2 + 1])}, before[2], total;
+        Scan(temp).ExclusiveSum(values, before, total);
+        const size_t base = ((size_t)row * w.parts + part) * kTopKCoarseStride;
+        for (int i = 0; i < 2; ++i) w.histograms[base + tid * 2 + i] = total - before[i];
+        if (tid == 0) w.histograms[base + kTopKCoarseBins] = nonfinite;
+    }
+
+    template <bool BATCHED>
+    __global__ void __launch_bounds__(1024) V41TopKGlobalThreshold(V41TopKGlobalArgs a, V41TopKWorkspace w) {
+        __shared__ int sums[kTopKCoarseBins + 1], selected, retained, nonfinite;
+        using Scan = cub::BlockScan<int, 1024>;
+        __shared__ typename Scan::TempStorage temp;
+        const int row = blockIdx.x, bin = threadIdx.x;
+        const auto r = V41GlobalTopKRow<BATCHED>(a, row);
+        if (r.visible <= kTopKParallelMinKeys) {
+            if (bin == 0) w.counts[row] = -1;
+            return;
+        }
+        const int parts = (r.visible + w.shardSize - 1) / w.shardSize;
+        int count = 0;
+        for (int part = 0; part < parts; ++part)
+            count += w.histograms[((size_t)row * w.parts + part) * kTopKCoarseStride + bin];
+        sums[bin] = count;
+        if (bin == 0) { sums[kTopKCoarseBins] = 0; nonfinite = 0; }
+        __syncthreads();
+        if (bin < parts && w.histograms[((size_t)row * w.parts + bin) * kTopKCoarseStride + kTopKCoarseBins])
+            atomicOr(&nonfinite, 1);
+        if (sums[0] <= r.width) {
+            if (bin == 0) { selected = 0; retained = sums[0]; }
+        } else if (count >= r.width && sums[bin + 1] < r.width) {
+            selected = bin; retained = count;
+        }
+        __syncthreads();
+        if (bin == 0) w.counts[row] = !nonfinite && retained <= kTopKCompactCapacity &&
+            retained <= w.parts * w.width ? retained : -1;
+        const int local = bin < parts ?
+            w.histograms[((size_t)row * w.parts + bin) * kTopKCoarseStride + selected] : 0;
+        int before;
+        Scan(temp).ExclusiveSum(local, before);
+        if (bin < w.parts) w.offsets[(size_t)row * (w.parts + 1) + bin] = before;
+        if (bin == 0) w.offsets[(size_t)row * (w.parts + 1) + w.parts] = selected;
+    }
+
+    template <bool BATCHED>
+    __global__ void __launch_bounds__(256) V41TopKGlobalCollect(V41TopKGlobalArgs a, V41TopKWorkspace w) {
+        const int row = blockIdx.y, part = blockIdx.x;
+        const auto r = V41GlobalTopKRow<BATCHED>(a, row);
+        if (w.counts[row] < 0) { V41GlobalTopKFallback<BATCHED, 1, 256>(a, w); return; }
+        const int first = part * w.shardSize, length = min(r.visible - first, w.shardSize);
+        if (length <= 0) return;
+        const int threshold = w.offsets[(size_t)row * (w.parts + 1) + w.parts];
+        const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+        const int span = ((length + 255) / 256) * 32, start = warp * span, end = min(length, start + span);
+        int local = 0;
+        for (int tile = start; tile < end; tile += 32) {
+            const int j = first + tile + lane;
+            const bool keep = tile + lane < length && V41TopKCoarseKey(r.scores[j]) >= threshold;
+            local += __popc(__ballot_sync(0xffffffffu, keep));
+        }
+        using Scan = cub::BlockScan<int, 256>;
+        __shared__ typename Scan::TempStorage temp;
+        int prefix;
+        Scan(temp).ExclusiveSum(lane == 0 ? local : 0, prefix);
+        prefix = __shfl_sync(0xffffffffu, prefix, 0);
+        const size_t base = (size_t)row * w.parts * w.width + w.offsets[(size_t)row * (w.parts + 1) + part];
+        for (int tile = start; tile < end; tile += 32) {
+            const int j = first + tile + lane;
+            const bool eligible = tile + lane < length;
+            const float value = eligible ? r.scores[j] : -INFINITY;
+            const bool keep = eligible && V41TopKCoarseKey(value) >= threshold;
+            const unsigned mask = __ballot_sync(0xffffffffu, keep);
+            if (keep) {
+                const int pos = prefix + __popc(mask & ((1u << lane) - 1));
+                w.scores[base + pos] = value; w.indices[base + pos] = j;
+            }
+            prefix += __popc(mask);
+        }
+    }
+    template <bool BATCHED>
+    __global__ void __launch_bounds__(1024) V41TopKGlobalFinish(V41TopKGlobalArgs a, V41TopKWorkspace w) {
+        V41GlobalTopKFallback<BATCHED, 2, 1024>(a, w);
+    }
+    template <bool BATCHED>
+    void V41LaunchGlobalTopK(const V41TopKGlobalArgs &a, V41TopKWorkspace w, int rows) {
+        V41TopKGlobalHistogram<BATCHED><<<dim3(w.parts, rows), 512, 0, cudaStreamPerThread>>>(a, w);
+        V41TopKGlobalThreshold<BATCHED><<<rows, 1024, 0, cudaStreamPerThread>>>(a, w);
+        V41TopKGlobalCollect<BATCHED><<<dim3(w.parts, rows), 256, (size_t)a.listCap * sizeof(int), cudaStreamPerThread>>>(a, w);
+        V41TopKGlobalFinish<BATCHED><<<rows, 1024, 0, cudaStreamPerThread>>>(a, w);
+    }
+
+    // The score producer already has an index-ordered, causal candidate list.
+    // Pack it directly instead of selecting K independently in every shard.
+    // Dense masks and oversized tie sets retain the original hierarchy.
+    __global__ void __launch_bounds__(256) V41TopKCandidateGather(
+        const V41DecodeIndexDescriptor *items, int ratio, int blockSize, int blockShift,
+        int listCap, V41TopKWorkspace w) {
+        const int row = blockIdx.y, part = blockIdx.x;
+        const auto item = items[row];
+        const int visible = min(item.count, (item.position + 1) / ratio);
+        const int blocks = item.candidateCount ? *item.candidateCount : -1;
+        int count = -1;
+        if (blocks >= 0 && item.candidateBlocks && visible > kTopKParallelMinKeys) {
+            count = blocks * blockSize;
+            if (blocks) count -= max(0, (item.candidateBlocks[blocks - 1] + 1) * blockSize - visible);
+            if (count > w.parts * w.width) count = -1;
+        }
+        if (part == 0 && threadIdx.x == 0) w.counts[row] = count;
+        if (count < 0) {
+            V41TopKSelect<true, 1>(nullptr, nullptr, 1, 0, 0, blockSize, blockShift, 0,
+                ratio, 0, listCap, nullptr, items, w);
+            return;
+        }
+        const size_t base = (size_t)row * w.parts * w.width;
+        for (int p = part * w.width + threadIdx.x; p < min(count, (part + 1) * w.width); p += 256) {
+            const int index = item.candidateBlocks[p / blockSize] * blockSize + p % blockSize;
+            w.scores[base + p] = item.scores[index];
+            w.indices[base + p] = index;
+        }
     }
 
     // ---------------- SparseAttention ----------------
@@ -5441,19 +5583,34 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, co
     // own persistent hierarchical workspaces. Eager scratch is stream ordered.
     if (m > kTopKParallelMinKeys && width <= 512 && bs <= kTopKShardKeys &&
         (int64_t)bsz * seqlen <= 128 && !FastllmCudaGraphIsCapturing()) {
-        auto layout = V41TopKLayout(nullptr, bsz * seqlen, m, width, bs);
+        const bool globalTopK = !cand && width == 512 && m >= 65536 &&
+            m <= 1024 * kTopKShardKeys && bsz * seqlen <= 8 &&
+            V41MmaKernelReady<V41TopKGlobalFinish<false>, 1024>();
+        auto layout = V41TopKLayout(nullptr, bsz * seqlen, m, width, bs, globalTopK);
         void *memory = nullptr;
         const auto status = FastllmCudaTryMalloc(&memory, layout.Bytes(bsz * seqlen));
         if (status == FASTLLM_CUDA_TRY_MALLOC_ERROR) return false;
         if (status == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
-            const auto w = V41TopKLayout(memory, bsz * seqlen, m, width, bs);
-            V41TopKKernel<false, 1><<<dim3(w.parts, bsz * seqlen), kSelThreads,
-                (size_t)listCap * sizeof(int)>>>(
-                (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
-                ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, w);
-            V41TopKKernel<false, 2><<<bsz * seqlen, kSelThreads>>>(
-                (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
-                ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, w);
+            const auto w = V41TopKLayout(memory, bsz * seqlen, m, width, bs, globalTopK);
+            if (globalTopK) {
+                V41TopKGlobalArgs a{(const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift,
+                    width, ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr};
+                V41LaunchGlobalTopK<false>(a, w, bsz * seqlen);
+            } else {
+                V41TopKKernel<false, 1><<<dim3(w.parts, bsz * seqlen), kSelThreads,
+                    (size_t)listCap * sizeof(int)>>>(
+                    (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
+                    ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, w);
+                if (bsz * seqlen <= 8 && V41MmaKernelReady<V41TopKKernel<false, 2, 1024>, 1024>()) {
+                    V41TopKKernel<false, 2, 1024><<<bsz * seqlen, 1024>>>(
+                        (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
+                        ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, w);
+                } else {
+                    V41TopKKernel<false, 2><<<bsz * seqlen, kSelThreads>>>(
+                        (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
+                        ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, w);
+                }
+            }
             const bool ok = V41CheckLaunch("IndexerTopKHierarchical");
             if (!FastllmCudaFreeAfterCurrentThreadStream(memory)) {
                 FastllmCudaSyncCurrentThreadStream();
@@ -5463,11 +5620,11 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, co
         }
     }
     if (seqlen > 1 || m <= width) {
-        V41TopKKernel<false, 0, false, 256><<<bsz * seqlen, kSelThreads, (size_t)listCap * sizeof(int)>>>(
+        V41TopKKernel<false, 0, 256><<<bsz * seqlen, kSelThreads, (size_t)listCap * sizeof(int)>>>(
             (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
             ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, {});
     } else {
-        V41TopKKernel<false, 0, true, 1024><<<bsz * seqlen, 1024, (size_t)listCap * sizeof(int)>>>(
+        V41TopKKernel<false, 0, 1024><<<bsz * seqlen, 1024, (size_t)listCap * sizeof(int)>>>(
             (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
             ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, {});
     }
@@ -6461,7 +6618,7 @@ extern "C" bool FastllmCudaV41DecodeIndexerBatch(
     int shift = -1;
     for (int i = 0; i < 31; ++i) if ((1 << i) == blockSize) { shift = i; break; }
     const int listCap = shift >= 0 ? std::min(maxBlocks, 4096) : 0;
-    V41TopKKernel<true, 0, true, 1024><<<items.size(), 1024, (size_t)listCap * sizeof(int), cudaStreamPerThread>>>(
+    V41TopKKernel<true, 0, 1024><<<items.size(), 1024, (size_t)listCap * sizeof(int), cudaStreamPerThread>>>(
         nullptr, nullptr, 1, 0, 0, blockSize, shift, 0, ratio, 0, listCap, nullptr, device, {});
     const bool ok = V41CheckLaunch("DecodeIndexerBatch");
     if (!borrowed && !FastllmCudaFreeAfterCurrentThreadStream(storage)) {
@@ -6477,7 +6634,7 @@ constexpr int kFullDecodeTransforms = 5;
 
 struct V41FullDecodePlan {
     bool indexPairs = false;
-    bool qkPrefetch = false, indexPrefetch = false;
+    bool qkPrefetch = false, wideTopKMerge = false, indexPrefetch = false;
     bool fuseIndexBlocks = false, wideCandidateSelect = false;
     FastllmV41FullDecodeConfig config;
     FastllmV41FullDecodeBuffers buffers;
@@ -6729,6 +6886,8 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
     p->qkPrefetch = p->pvPipeline && V41MmaKernelReady<
         V41SparseAttentionScoresKernel<true, true>, kQkPrefetchCandidates * 4,
         sizeof(V41MmaScoresPrefetchShared)>();
+    p->wideTopKMerge = c.batch <= 8 &&
+        V41MmaKernelReady<V41TopKKernel<true, 2, 1024>, 1024>();
     p->indexPrefetch = c.indexSource && !c.useCandidates && c.indexHeads <= 32 &&
         V41IsSm<9, 0>() && V41MmaKernelReady<
             V41IndexerScoreDecodeMmaKernel<true, true, false, false, true>, 256>();
@@ -6760,9 +6919,14 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         alloc(&p->indexScores, (size_t)c.batch * c.maxKeys) && alloc(&p->blockScores, (size_t)c.batch * blocks);
     if (c.indexSource && c.maxKeys > kTopKParallelMinKeys && c.topK <= 512 &&
         c.blockSize <= kTopKShardKeys) {
-        auto layout = V41TopKLayout(nullptr, c.batch, c.maxKeys, c.topK, c.blockSize);
+        const bool globalTopK = !c.useCandidates && c.topK == 512 && c.maxKeys >= 65536 &&
+            c.maxKeys <= 1024 * kTopKShardKeys && c.batch <= 8 &&
+            V41MmaKernelReady<V41TopKGlobalFinish<true>, 1024>();
+        const bool compactTopK = c.useCandidates && !c.writeCandidates && c.topK == 512 &&
+            c.batch <= 8 && p->wideTopKMerge;
+        auto layout = V41TopKLayout(nullptr, c.batch, c.maxKeys, c.topK, c.blockSize, globalTopK, compactTopK);
         ok = ok && alloc(&p->topKMemory, layout.Bytes(c.batch));
-        p->topKWorkspace = V41TopKLayout(p->topKMemory, c.batch, c.maxKeys, c.topK, c.blockSize);
+        p->topKWorkspace = V41TopKLayout(p->topKMemory, c.batch, c.maxKeys, c.topK, c.blockSize, globalTopK, compactTopK);
     }
     if (c.indexSource && c.useCandidates && !c.writeCandidates) {
         p->candidateBlocks = static_cast<int *>(b.candidateBlocks);
@@ -6912,17 +7076,34 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
                 V41CandidateSelectKernel<true><<<c.batch, kSelThreads, 0, cudaStreamPerThread>>>(nullptr, 0, c.candidateTopK, nullptr, p->index);
             }
         }
-        if (p->topKMemory) {
+        if (p->topKWorkspace.global) {
+            V41TopKGlobalArgs a{nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift,
+                0, c.ratio, 0, p->listCap, nullptr, p->index};
+            V41LaunchGlobalTopK<true>(a, p->topKWorkspace, c.batch);
+        } else if (p->topKWorkspace.compactCandidates) {
+            V41TopKCandidateGather<<<dim3(p->topKWorkspace.parts, c.batch), 256,
+                (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
+                p->index, c.ratio, c.blockSize, p->blockShift, p->listCap, p->topKWorkspace);
+            V41TopKKernel<true, 2, 1024><<<c.batch, 1024, 0, cudaStreamPerThread>>>(
+                nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
+                p->listCap, nullptr, p->index, p->topKWorkspace);
+        } else if (p->topKMemory) {
             V41TopKKernel<true, 1><<<dim3(p->topKWorkspace.parts, c.batch), kSelThreads,
                 (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
                 nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
                 p->listCap, nullptr, p->index, p->topKWorkspace);
-            V41TopKKernel<true, 2><<<c.batch, kSelThreads, 0, cudaStreamPerThread>>>(
-                nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
-                p->listCap, nullptr, p->index, p->topKWorkspace);
+            if (p->wideTopKMerge) {
+                V41TopKKernel<true, 2, 1024><<<c.batch, 1024, 0, cudaStreamPerThread>>>(
+                    nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
+                    p->listCap, nullptr, p->index, p->topKWorkspace);
+            } else {
+                V41TopKKernel<true, 2><<<c.batch, kSelThreads, 0, cudaStreamPerThread>>>(
+                    nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
+                    p->listCap, nullptr, p->index, p->topKWorkspace);
+            }
         } else {
-        V41TopKKernel<true, 0, true, 1024><<<c.batch, 1024, (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
-            nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0, p->listCap, nullptr, p->index, {});
+            V41TopKKernel<true, 0, 1024><<<c.batch, 1024, (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
+                nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0, p->listCap, nullptr, p->index, {});
         }
     }
     const bool attentionOk = p->qkPrefetch ? V41FullDecodeAttention<8, true, true, true>(*p) :
