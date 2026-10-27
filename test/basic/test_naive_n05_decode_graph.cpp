@@ -309,8 +309,9 @@ static void TestVerifyIndexerView(int rows, int past, bool fp8) {
         ++checks;
     }
 }
-static void TestDraftAttention(int dim, int rows, int window, bool shortAttention) {
-    const int heads = 8, kvHeads = 2, storage = window + rows;
+static void TestDraftAttention(int dim, int rows, int window, bool shortAttention,
+                               int heads = 8, int kvHeads = 2) {
+    const int storage = window + rows;
     Data q(BFLOAT16), key(BFLOAT16), value(BFLOAT16), nk(BFLOAT16), nv(BFLOAT16);
     Data live(INT32), scores, actual;
     Upload(q, {1, rows, heads * dim}, 101);
@@ -656,6 +657,7 @@ int main() {
         for (int dim : {32, 128, 256}) for (int rows : {2, 7, 8})
             for (bool shortAttention : {false, true})
                 TestDraftAttention(dim, rows, 1024, shortAttention);
+        TestDraftAttention(128, 7, 1024, false, 32, 4);
         printf("DECODE GRAPH PASS checks=%d\n", checks);
         return 0;
     } catch (const std::exception &e) {

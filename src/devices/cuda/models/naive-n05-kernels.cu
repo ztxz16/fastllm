@@ -1402,7 +1402,7 @@ __global__ void AttentionScoresDecodeShared(const BF16 *q, FastllmNaiveKV k,
 // but retain Q in registers and interleave four independent selected keys.
 // The bounded query register tile leaves larger head dimensions on the
 // general kernel; this path is only used for multiple-query prefill.
-template <int MaxDim, typename Length = int, typename Past = int>
+template <int MaxDim, typename Length = int, typename Past = int, int KeyTile = 0>
 __global__ void AttentionScoresPrefill(const BF16 *q, FastllmNaiveKV k, const int *indices,
                                       float *scores, int heads, int kvHeads, int dim,
                                       int keyStride, Length liveKeys, Length liveCount, Past livePast,
@@ -1417,7 +1417,9 @@ __global__ void AttentionScoresPrefill(const BF16 *q, FastllmNaiveKV k, const in
     for (int j = 0; j < MaxDim / 32; ++j)
         if (lane + j * 32 < dim)
             queryValues[j] = (float)q[((size_t)query * heads + h) * dim + lane + j * 32];
-    for (int first = warp * keysPerWarp; first < count; first += warps * keysPerWarp) {
+    const int begin = KeyTile ? blockIdx.z * KeyTile : 0;
+    const int end = KeyTile ? min(count, begin + KeyTile) : count;
+    for (int first = begin + warp * keysPerWarp; first < end; first += warps * keysPerWarp) {
         int key[keysPerWarp];
         bool valid[keysPerWarp];
         float dot[keysPerWarp];
@@ -1536,6 +1538,42 @@ __global__ void AttentionValuesPrefill(const float *prob, FastllmNaiveKV v, cons
         for (int j = 0; j < columns; ++j)
             out[((size_t)query * heads + h) * dim + d + j] = __float2bfloat16(sum[j]);
     }
+}
+
+// Stage a small V column tile cooperatively, then accumulate each output in
+// the original key order. Small draft blocks need more CTAs than prefill's
+// four-head kernel; splitting output columns does not change the reduction.
+__global__ void DraftAttentionValues(const float *prob, FastllmNaiveKV v, BF16 *out,
+        int heads, int kvHeads, int dim, DraftLength liveKeys, DraftLength livePast, int window) {
+    constexpr int Columns = 16, Tile = 128;
+    const int query = blockIdx.y, h = blockIdx.x, column = blockIdx.z * Columns;
+    const int t = threadIdx.x, keys = liveKeys, past = livePast, kh = h / (heads / kvHeads);
+    const float *p = prob + ((size_t)query * heads + h) * keys;
+    __shared__ __align__(16) BF16 values[Columns][Tile + 8];
+    __shared__ float weights[Tile];
+    float sum = 0;
+    for (int first = 0; first < keys; first += Tile) {
+        const int count = min(Tile, keys - first);
+        if (t < count) weights[t] = p[first + t];
+        for (int i = t; i < count * (Columns / 8); i += blockDim.x) {
+            int slot = i / (Columns / 8), d = i % (Columns / 8) * 8;
+            int key = KeyIndex(nullptr, query, first + slot, keys, past, window);
+            uint4 packed = key < keys
+                ? (v.Row(key, kvHeads * dim) + kh * dim + column + d).Load8()
+                : make_uint4(0, 0, 0, 0);
+            const BF16 *bf = (const BF16 *)&packed;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) values[d + j][slot] = bf[j];
+        }
+        __syncthreads();
+        if (t < Columns) {
+            for (int slot = 0; slot < count; ++slot)
+                sum = fmaf(weights[slot], (float)values[t][slot], sum);
+        }
+        __syncthreads();
+    }
+    if (t < Columns)
+        out[((size_t)query * heads + h) * dim + column + t] = __float2bfloat16(sum);
 }
 
 template <typename Length = int>
@@ -4951,13 +4989,19 @@ void FastllmCudaNaiveDraftAttention(const fastllm::Data &query,
             heads, kvHeads, dim, dim, key.dims[2], keys, 256, past, window, false);
     } else {
         Output(scores, FLOAT32, {rows, heads, window + rows - 1});
-        auto kernel = dim <= 192 ? AttentionScoresPrefill<192, DraftLength, DraftLength>
-                                : AttentionScoresPrefill<256, DraftLength, DraftLength>;
-        kernel<<<dim3(heads, rows), 128>>>(q, k, nullptr, (float *)scores.cudaData,
+        auto kernel = dim == 128 ? AttentionScoresPrefill<128, DraftLength, DraftLength, 64>
+                    : dim <= 192 ? AttentionScoresPrefill<192, DraftLength, DraftLength>
+                                 : AttentionScoresPrefill<256, DraftLength, DraftLength>;
+        const int tiles = dim == 128 ? (scores.dims.back() + 63) / 64 : 1;
+        kernel<<<dim3(heads, rows, tiles), 128>>>(q, k, nullptr, (float *)scores.cudaData,
             heads, kvHeads, dim, key.dims[2], keys, keys, past, window, false);
         AttentionSoftmax<<<rows * heads, 256>>>((float *)scores.cudaData, nullptr, heads, keys);
-        AttentionValuesPrefill<<<dim3((heads + 3) / 4, rows), 128>>>((float *)scores.cudaData,
-            v, nullptr, out, heads, kvHeads, dim, keys, keys, past, window, false);
+        if (dim == 128)
+            DraftAttentionValues<<<dim3(heads, rows, dim / 16), 256>>>(
+                (float *)scores.cudaData, v, out, heads, kvHeads, dim, keys, past, window);
+        else
+            AttentionValuesPrefill<<<dim3((heads + 3) / 4, rows), 128>>>((float *)scores.cudaData,
+                v, nullptr, out, heads, kvHeads, dim, keys, keys, past, window, false);
     }
     CheckLaunch();
 }
