@@ -282,7 +282,7 @@ def _deepseek_priority(candidate, model, backend=None):
     # Once these targets are met, compare predicted latency. An unbounded
     # chunk preference otherwise discards a faster fully resident GPU plan
     # before its decode cost is considered.
-    return min(chunk, 4096 if streamed_disk else 512), min(cache, 3 * memory.GiB)
+    return min(chunk, 4096 if streamed_disk else 1024), min(cache, 3 * memory.GiB)
 
 
 def kv_residencies(args, model):
@@ -735,7 +735,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                            "ranking": "estimated latency; not measured throughput", "mtp": args.mtp}
     if model.family == "deepseek_v41":
         result["automatic"]["ranking"] = (
-            "non-disk experts first; fixed context; chunk up to 4096 for streamed disk GGUF or 512 otherwise, then per-GPU expert cache up to 3 GiB, "
+            "non-disk experts first; fixed context; chunk up to 4096 for streamed disk GGUF or 1024 otherwise, then per-GPU expert cache up to 3 GiB, "
             "then predicted latency; automatic topology uses single GPU or PP; "
             "TP requires explicit opt-in; estimated latency"
         )

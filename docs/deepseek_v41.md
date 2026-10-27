@@ -27,6 +27,8 @@ ftllm server /path/to/model-00001-of-00002.gguf --auto \
 
 自动模式默认单请求、最多 1M 原生窗口、FP4 KV 和快速 Prefill。带内置 DSpark 权重时默认使用 DSpark 5；没有草稿权重的 GGUF 不会自动开启。设备、chunk 和专家缓存以 `[auto]` 日志为准。显卡和主存能容纳专家时优先避免磁盘专家，Engram 仍可独立使用磁盘。
 
+上下文长度和内存预算允许时，自动规划先保证 chunk 1024，再争取每卡 3 GiB 专家缓存，之后按预计延迟选择更大的 chunk 或缓存。流式 GGUF 磁盘专家路径优先争取 chunk 4096。预算不足时允许缩小 chunk，显式指定的 chunk 和缓存参数仍优先。
+
 | 需要调整 | 追加参数 |
 | --- | --- |
 | 32K 窗口、单请求 | `--max_context_length 32768 --max_batch 1` |
