@@ -2305,13 +2305,42 @@ namespace {
     // 共享内存里的候选块下标由 candList（动态共享内存）承载，listCap == 0 表示不压缩。
     constexpr int kTopKSurvivorCap = 1024;
 
-    // Parallel radix-bin selection preserves exact integer counts and ties.
-    // The prior path scanned up to 256 shared bins on a single thread/pass.
-    template <bool BATCHED = false, bool PARALLEL_SELECT = true, int SELECT_THREADS = (PARALLEL_SELECT ? 1024 : 256)>
+    // Exact two-level selection: each contiguous shard retains at most K
+    // indices, then a second selection merges them. Shards and local outputs
+    // are index ordered, so equal-score tie breaking remains global-index order.
+    constexpr int kTopKShardKeys = 8192;
+    constexpr int kTopKParallelMinKeys = 2 * kTopKShardKeys;
+
+    struct V41TopKWorkspace {
+        float *scores = nullptr;
+        int32_t *indices = nullptr;
+        uint8_t *valid = nullptr;
+        int parts = 0, width = 0, shardSize = 0;
+
+        size_t Bytes(int rows) const {
+            return (size_t)rows * parts * width *
+                (sizeof(float) + sizeof(int32_t) + sizeof(uint8_t));
+        }
+    };
+    V41TopKWorkspace V41TopKLayout(void *memory, int rows, int keys, int width, int blockSize) {
+        V41TopKWorkspace w;
+        w.shardSize = ((kTopKShardKeys + blockSize - 1) / blockSize) * blockSize;
+        w.parts = (keys + w.shardSize - 1) / w.shardSize;
+        w.width = width;
+        if (memory) {
+            const size_t count = (size_t)rows * w.parts * width;
+            w.scores = static_cast<float *>(memory);
+            w.indices = reinterpret_cast<int32_t *>(w.scores + count);
+            w.valid = reinterpret_cast<uint8_t *>(w.indices + count);
+        }
+        return w;
+    }
+
+    template <bool BATCHED = false, int LEVEL = 0, bool PARALLEL_SELECT = true, int SELECT_THREADS = kSelThreads>
     __global__ void __launch_bounds__(SELECT_THREADS) V41TopKKernel(const float *score, const uint8_t *candidates, int seqlen, int m,
                                   int numBlocks, int blockSize, int blockShift, int width,
                                   int ratio, int startPos, int listCap, int32_t *out,
-                                  const V41DecodeIndexDescriptor *items = nullptr) {
+                                  const V41DecodeIndexDescriptor *items, V41TopKWorkspace workspace) {
         typedef cub::BlockScan<int, SELECT_THREADS> BlockScan;
         __shared__ typename BlockScan::TempStorage scanStorage;
         __shared__ unsigned hist[256];
@@ -2319,7 +2348,8 @@ namespace {
         __shared__ int meta[4];             // 0: digit, 1: remaining, 2: 候选块个数
         extern __shared__ int candList[];
 
-        int t = blockIdx.x;
+        int t = LEVEL == 1 ? blockIdx.y : blockIdx.x;
+        const int requestRow = t;
         if (BATCHED) {
             const auto item = items[t];
             score = item.scores; candidates = item.useCandidates ? item.candidates : nullptr;
@@ -2328,11 +2358,39 @@ namespace {
             listCap = candidates ? min(numBlocks, listCap) : 0;
         }
         const int i = t % seqlen;
-        const int visible = min(m, (startPos + i + 1) / ratio);
+        int visible = min(m, (startPos + i + 1) / ratio);
         const float *row = score + (uint64_t)t * m;
         const uint8_t *cand = candidates == nullptr ? nullptr : candidates + (uint64_t)t * numBlocks;
         int32_t *orow = out + (uint64_t)t * width;
         const unsigned negInf = V41FloatKey(-INFINITY);
+        const bool hierarchical = LEVEL && visible > kTopKParallelMinKeys;
+        int shardOffset = 0;
+        size_t partialBase = (size_t)requestRow * workspace.parts * workspace.width;
+        if constexpr (LEVEL == 1) {
+            if (!hierarchical) {
+                if (blockIdx.x != 0) return;
+            } else {
+                shardOffset = blockIdx.x * workspace.shardSize;
+                if (shardOffset >= visible) return;
+                const int firstBlock = shardOffset / blockSize;
+                row += shardOffset;
+                if (cand) cand += firstBlock;
+                visible = min(visible - shardOffset, workspace.shardSize);
+                numBlocks = max(0, min(numBlocks - firstBlock,
+                    (visible + blockSize - 1) / blockSize));
+                listCap = min(listCap, numBlocks);
+                partialBase += (size_t)blockIdx.x * workspace.width;
+                orow = workspace.indices + partialBase;
+            }
+        } else if constexpr (LEVEL == 2) {
+            if (!hierarchical) return;
+            const int parts = (visible + workspace.shardSize - 1) / workspace.shardSize;
+            row = workspace.scores + partialBase;
+            cand = workspace.valid + partialBase;
+            visible = parts * workspace.width;
+            numBlocks = visible;
+            blockSize = 1; blockShift = 0; listCap = 0;
+        }
 
         // ---- 候选块下标的升序压缩 ----
         const bool canCompact = cand != nullptr && listCap > 0 && blockShift >= 0;
@@ -2575,6 +2633,23 @@ namespace {
         }
         for (int p = keep + threadIdx.x; p < width; p += SELECT_THREADS) {
             orow[p] = -1;
+        }
+        if constexpr (LEVEL == 1) {
+            if (hierarchical) {
+                __syncthreads();
+                for (int j = threadIdx.x; j < width; j += kSelThreads) {
+                    const int index = orow[j];
+                    workspace.valid[partialBase + j] = index >= 0;
+                    workspace.scores[partialBase + j] = index >= 0 ? row[index] : 0.f;
+                    if (index >= 0) orow[j] = shardOffset + index;
+                }
+            }
+        } else if constexpr (LEVEL == 2) {
+            __syncthreads();
+            for (int j = threadIdx.x; j < width; j += kSelThreads) {
+                const int index = orow[j];
+                if (index >= 0) orow[j] = workspace.indices[partialBase + index];
+            }
         }
 #undef V41_TOPK_INDEX
 #undef V41_TOPK_OK
@@ -5111,14 +5186,39 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, co
     const int kListCap = 4096;
     const int listCap = (cand != nullptr && blockShift >= 0 && numBlocks > 0)
                         ? std::min(numBlocks, kListCap) : 0;
+    // Standalone captures keep the zero-workspace route; full decode plans
+    // own persistent hierarchical workspaces. Eager scratch is stream ordered.
+    if (m > kTopKParallelMinKeys && width <= 512 && bs <= kTopKShardKeys &&
+        (int64_t)bsz * seqlen <= 128 && !FastllmCudaGraphIsCapturing()) {
+        auto layout = V41TopKLayout(nullptr, bsz * seqlen, m, width, bs);
+        void *memory = nullptr;
+        const auto status = FastllmCudaTryMalloc(&memory, layout.Bytes(bsz * seqlen));
+        if (status == FASTLLM_CUDA_TRY_MALLOC_ERROR) return false;
+        if (status == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+            const auto w = V41TopKLayout(memory, bsz * seqlen, m, width, bs);
+            V41TopKKernel<false, 1><<<dim3(w.parts, bsz * seqlen), kSelThreads,
+                (size_t)listCap * sizeof(int)>>>(
+                (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
+                ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, w);
+            V41TopKKernel<false, 2><<<bsz * seqlen, kSelThreads>>>(
+                (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
+                ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, w);
+            const bool ok = V41CheckLaunch("IndexerTopKHierarchical");
+            if (!FastllmCudaFreeAfterCurrentThreadStream(memory)) {
+                FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaFree(memory);
+            }
+            return ok;
+        }
+    }
     if (seqlen > 1 || m <= width) {
-        V41TopKKernel<false, false><<<bsz * seqlen, kSelThreads, (size_t)listCap * sizeof(int)>>>(
+        V41TopKKernel<false, 0, false, 256><<<bsz * seqlen, kSelThreads, (size_t)listCap * sizeof(int)>>>(
             (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
-            ratio, startPos, listCap, (int32_t*)output.cudaData);
+            ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, {});
     } else {
-        V41TopKKernel<false, true, 1024><<<bsz * seqlen, 1024, (size_t)listCap * sizeof(int)>>>(
+        V41TopKKernel<false, 0, true, 1024><<<bsz * seqlen, 1024, (size_t)listCap * sizeof(int)>>>(
             (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
-            ratio, startPos, listCap, (int32_t*)output.cudaData);
+            ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, {});
     }
     return V41CheckLaunch("IndexerTopK");
 }
@@ -6110,8 +6210,8 @@ extern "C" bool FastllmCudaV41DecodeIndexerBatch(
     int shift = -1;
     for (int i = 0; i < 31; ++i) if ((1 << i) == blockSize) { shift = i; break; }
     const int listCap = shift >= 0 ? std::min(maxBlocks, 4096) : 0;
-    V41TopKKernel<true, true, 1024><<<items.size(), 1024, (size_t)listCap * sizeof(int), cudaStreamPerThread>>>(
-        nullptr, nullptr, 1, 0, 0, blockSize, shift, 0, ratio, 0, listCap, nullptr, device);
+    V41TopKKernel<true, 0, true, 1024><<<items.size(), 1024, (size_t)listCap * sizeof(int), cudaStreamPerThread>>>(
+        nullptr, nullptr, 1, 0, 0, blockSize, shift, 0, ratio, 0, listCap, nullptr, device, {});
     const bool ok = V41CheckLaunch("DecodeIndexerBatch");
     if (!borrowed && !FastllmCudaFreeAfterCurrentThreadStream(storage)) {
         cudaStreamSynchronize(cudaStreamPerThread);
@@ -6136,6 +6236,8 @@ struct V41FullDecodePlan {
     V41DecodeIndexDescriptor *index = nullptr;
     V41AttentionDescriptor *attention = nullptr;
     float *indexScores = nullptr, *blockScores = nullptr, *attentionScores = nullptr;
+    uint8_t *topKMemory = nullptr;
+    V41TopKWorkspace topKWorkspace;
     cudaEvent_t copied = nullptr;
     ~V41FullDecodePlan() {
         int old = 0; cudaGetDevice(&old); cudaSetDevice(device);
@@ -6148,7 +6250,7 @@ struct V41FullDecodePlan {
         for (void *p : {static_cast<void *>(transforms),
                        static_cast<void *>(index), static_cast<void *>(attention),
                        static_cast<void *>(indexScores), static_cast<void *>(blockScores),
-                       static_cast<void *>(attentionScores)}) if (p) cudaFree(p);
+                       static_cast<void *>(attentionScores), static_cast<void *>(topKMemory)}) if (p) cudaFree(p);
         cudaSetDevice(old);
     }
 };
@@ -6373,6 +6475,12 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         alloc(&p->attention, c.batch) && alloc(&p->attentionScores, (size_t)c.batch * c.heads * p->tiles * kMmaNC);
     if (c.indexSource) ok = ok && alloc(&p->index, c.batch) &&
         alloc(&p->indexScores, (size_t)c.batch * c.maxKeys) && alloc(&p->blockScores, (size_t)c.batch * blocks);
+    if (c.indexSource && c.maxKeys > kTopKParallelMinKeys && c.topK <= 512 &&
+        c.blockSize <= kTopKShardKeys) {
+        auto layout = V41TopKLayout(nullptr, c.batch, c.maxKeys, c.topK, c.blockSize);
+        ok = ok && alloc(&p->topKMemory, layout.Bytes(c.batch));
+        p->topKWorkspace = V41TopKLayout(p->topKMemory, c.batch, c.maxKeys, c.topK, c.blockSize);
+    }
     if (!b.requests)
         ok = ok && cudaHostAlloc(reinterpret_cast<void **>(&p->host), (size_t)c.batch * sizeof(*p->host), cudaHostAllocDefault) == cudaSuccess &&
              cudaEventCreateWithFlags(&p->copied, cudaEventDisableTiming) == cudaSuccess;
@@ -6483,8 +6591,18 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
             V41BlockScoreKernel<true><<<c.batch, 256, 0, cudaStreamPerThread>>>(nullptr, 1, 0, c.blockSize, 0, c.ratio, 0, nullptr, p->index);
             V41CandidateSelectKernel<true><<<c.batch, kSelThreads, 0, cudaStreamPerThread>>>(nullptr, 0, c.candidateTopK, nullptr, p->index);
         }
-        V41TopKKernel<true, true, 1024><<<c.batch, 1024, (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
-            nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0, p->listCap, nullptr, p->index);
+        if (p->topKMemory) {
+            V41TopKKernel<true, 1><<<dim3(p->topKWorkspace.parts, c.batch), kSelThreads,
+                (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
+                nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
+                p->listCap, nullptr, p->index, p->topKWorkspace);
+            V41TopKKernel<true, 2><<<c.batch, kSelThreads, 0, cudaStreamPerThread>>>(
+                nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
+                p->listCap, nullptr, p->index, p->topKWorkspace);
+        } else {
+        V41TopKKernel<true, 0, true, 1024><<<c.batch, 1024, (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
+            nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0, p->listCap, nullptr, p->index, {});
+        }
     }
     const bool attentionOk = p->qkPrefetch ? V41FullDecodeAttention<8, true, true, true>(*p) :
         p->pvPipeline ? V41FullDecodeAttention<8, true, true>(*p) :

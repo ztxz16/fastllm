@@ -10,6 +10,7 @@
 #include <vector>
 
 using namespace fastllm;
+static bool longContext = false;
 
 static void Cuda(cudaError_t status) {
     if (status != cudaSuccess)
@@ -35,7 +36,8 @@ static void Allocate(Data &data, DataType type, const std::vector<int> &dims, in
 
 static void Run(int device, int rows, int length, int blockSize, int pattern, bool masked) {
     const int blocks = (length + blockSize - 1) / blockSize;
-    const int width = std::min(512, length), ratio = 2, start = length;
+    const int width = std::min(512, length), ratio = 2;
+    const int start = longContext ? 2 * length - rows : length;
     Data scores, candidates, output;
     Allocate(scores, FLOAT32, {1, rows, length}, device);
     Allocate(candidates, INT8, {1, rows, blocks}, device);
@@ -74,18 +76,15 @@ static void Run(int device, int rows, int length, int blockSize, int pattern, bo
                              cudaMemcpyHostToDevice, cudaStreamPerThread));
         Cuda(cudaMemcpyAsync(candidates.cudaData, mask.data(), mask.size(), cudaMemcpyHostToDevice,
                              cudaStreamPerThread));
-        Cuda(cudaMemsetAsync(output.cudaData, 0x55, rows * width * sizeof(int), cudaStreamPerThread));
-        Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
-        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
-        std::vector<int> actual(rows * width), expected(rows * width, -1);
-        Cuda(cudaMemcpy(actual.data(), output.cudaData, actual.size() * sizeof(int), cudaMemcpyDeviceToHost));
+        std::vector<int> expected(rows * width, -1);
         for (int row = 0; row < rows; ++row) {
             std::vector<int> indices;
             const int visible = std::min(length, (start + row + 1) / ratio);
             for (int index = 0; index < visible; ++index)
                 if (!masked || mask[row * blocks + index / blockSize])
                     indices.push_back(index);
-            std::sort(indices.begin(), indices.end(), [&](int a, int b) {
+            std::partial_sort(indices.begin(), indices.begin() + std::min(indices.size(), size_t(width)),
+                              indices.end(), [&](int a, int b) {
                 unsigned ka = FloatKey(host[row * length + a]);
                 unsigned kb = FloatKey(host[row * length + b]);
                 return ka == kb ? a < b : ka > kb;
@@ -95,28 +94,42 @@ static void Run(int device, int rows, int length, int blockSize, int pattern, bo
             std::sort(indices.begin(), indices.end());
             std::copy(indices.begin(), indices.end(), expected.begin() + row * width);
         }
-        Check(actual == expected, "CPU reference or changed-input graph replay mismatch");
+        for (bool graphReplay : {false, true}) {
+            Cuda(cudaMemsetAsync(output.cudaData, 0x55, rows * width * sizeof(int), cudaStreamPerThread));
+            if (graphReplay) Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+            else launch();
+            Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+            std::vector<int> actual(rows * width);
+            Cuda(cudaMemcpy(actual.data(), output.cudaData, actual.size() * sizeof(int), cudaMemcpyDeviceToHost));
+            Check(actual == expected, "CPU reference or changed-input graph replay mismatch");
+        }
     }
     Cuda(cudaGraphExecDestroy(exec));
     Cuda(cudaGraphDestroy(graph));
 }
 
-int main() {
+int main(int argc, char **argv) {
+    longContext = argc > 1 && std::string(argv[1]) == "--long-context";
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
         return 77;
     try {
         int cases = 0;
-        for (int device = 0; device < devices; ++device) {
+        for (int device = 0; device < (longContext ? 1 : devices); ++device) {
             Cuda(cudaSetDevice(device));
             for (int rows : {1, 2, 3, 4, 5, 6, 7, 8})
-                for (int length : {1, 255, 512, 513, 1130, 2310, 8192, 8193, 16384, 16385, 32769})
+                for (int length : (longContext
+                        ? std::vector<int>{32769, 131073, 262145, 1048576}
+                        : std::vector<int>{1, 255, 512, 513, 1130, 2310, 8192, 8193, 16384, 16385, 32769}))
                     for (bool masked : {false, true})
                         for (int pattern : {0, 1, 2}) {
                             Run(device, rows, length, pattern == 1 ? 3 : 8, pattern, masked);
                             ++cases;
                         }
         }
+        Cuda(cudaSetDevice(0));
+        Run(0, 6, 32769, 16384, 1, true);
+        ++cases;
         std::cout << "PASS " << cases
                   << " cases x 3 changing-input graph replays; CPU index/tie/padding oracle" << std::endl;
     } catch (const std::exception &error) {

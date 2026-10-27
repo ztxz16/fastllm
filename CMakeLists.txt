@@ -1571,7 +1571,16 @@ if (UNIT_TEST)
             target_compile_definitions(deepseekV41SmallIndexerRegression PRIVATE CUDA_API_PER_THREAD_DEFAULT_STREAM)
             fastllm_add_checked_test(deepseekV41SmallIndexer deepseekV41SmallIndexerRegression
                 "PASS [0-9]+ small-chunk indexer rows bitwise identical" 300)
-            set_tests_properties(deepseekV41SmallIndexer PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+            add_executable(deepseekV41TopKRegression test/ops/deepseekV41TopKRegression.cpp)
+            target_link_libraries(deepseekV41TopKRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41TopKRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            target_compile_definitions(deepseekV41TopKRegression PRIVATE CUDA_API_PER_THREAD_DEFAULT_STREAM)
+            fastllm_add_checked_test(deepseekV41TopK deepseekV41TopKRegression
+                "PASS [0-9]+ cases x 3 changing-input graph replays" 900)
+            fastllm_add_checked_test(deepseekV41TopKLongContext deepseekV41TopKRegression
+                "PASS [0-9]+ cases x 3 changing-input graph replays" 900 --long-context)
+            set_tests_properties(deepseekV41SmallIndexer deepseekV41TopK deepseekV41TopKLongContext
+                PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_executable(deepseekV41FullDecodeRegression test/ops/deepseekV41FullDecodeRegression.cpp)
             target_link_libraries(deepseekV41FullDecodeRegression PRIVATE fastllm)
             target_include_directories(deepseekV41FullDecodeRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
