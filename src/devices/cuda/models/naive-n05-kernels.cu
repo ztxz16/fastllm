@@ -665,14 +665,14 @@ __device__ void SortTopKCompactRow(const unsigned long long *input, const int *e
 __global__ void SortTopKCompact(const unsigned long long *input, const int *ends,
         int *indices, int queries, int stride, int topK, int keyCount) {
     union Storage {
-        CompactTopKSort<8>::TempStorage small;
+        CompactTopKSort<8>::TempStorage compact;
         CompactTopKSort<12>::TempStorage medium;
         CompactTopKSort<16>::TempStorage large;
     };
     __shared__ Storage storage;
     const int count = ends[queries + blockIdx.x] - blockIdx.x * stride;
     if (count <= 2048)
-        SortTopKCompactRow<8>(input, ends, indices, queries, stride, topK, keyCount, storage.small);
+        SortTopKCompactRow<8>(input, ends, indices, queries, stride, topK, keyCount, storage.compact);
     else if (count <= 3072)
         SortTopKCompactRow<12>(input, ends, indices, queries, stride, topK, keyCount, storage.medium);
     else
@@ -3790,7 +3790,7 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
         const int device = FastllmCudaGetDevice();
         auto found = supported.find(device);
         if (found == supported.end()) {
-            auto small = cudaFuncSetAttribute(dsa::SoftmaxSparseValues<2048, 16>,
+            auto smallStatus = cudaFuncSetAttribute(dsa::SoftmaxSparseValues<2048, 16>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(dsa::SparseStorage<2048, 16>));
             auto large = cudaFuncSetAttribute(dsa::SoftmaxSparseValues<2048, 32>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(dsa::SparseStorage<2048, 32>));
@@ -3800,7 +3800,7 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(dsa::GroupStorage<1024, 4, 16>));
             auto denseLarge = cudaFuncSetAttribute(dsa::GroupedValues<2048, 4, 16, false>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(dsa::GroupStorage<2048, 4, 16>));
-            bool available = small == cudaSuccess && large == cudaSuccess && grouped == cudaSuccess &&
+            bool available = smallStatus == cudaSuccess && large == cudaSuccess && grouped == cudaSuccess &&
                 denseSmall == cudaSuccess && denseLarge == cudaSuccess;
             if (!available) cudaGetLastError();
             found = supported.emplace(device, available).first;
