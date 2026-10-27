@@ -3,6 +3,8 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <cstring>
 #include <iostream>
 #include <random>
@@ -108,6 +110,50 @@ static void Run(int device, int rows, int length, int blockSize, int pattern, bo
     Cuda(cudaGraphDestroy(graph));
 }
 
+static void RunCandidates(int rows, int length, int blockSize, int pattern) {
+    const int blocks = (length + blockSize - 1) / blockSize;
+    const int keep = pattern == 1 ? 16 : 2048, ratio = 2;
+    Data scores, output;
+    Allocate(scores, FLOAT32, {1, rows, length}, 0);
+    std::vector<float> host(size_t(rows) * length);
+    std::mt19937 rng(73 + rows + length + pattern);
+    for (int replay = 0; replay < 3; ++replay) {
+        for (size_t i = 0; i < host.size(); ++i) {
+            float value = pattern == 0 ? float(int(rng() % 100003) - 50001) * .001f :
+                          pattern == 1 ? float(int((i + replay) % 13) - 6) : 1.f;
+            if ((i + replay) % 31 == 0) value = -INFINITY;
+            if ((i + replay) % 127 == 0) value = std::numeric_limits<float>::quiet_NaN();
+            host[i] = value;
+        }
+        const int start = std::max(0, 2 * length - rows - replay * 7);
+        std::vector<uint8_t> expected(size_t(rows) * blocks);
+        for (int row = 0; row < rows; ++row) {
+            const int visible = std::min(length, (start + row + 1) / ratio);
+            std::vector<unsigned> keys(blocks);
+            for (int block = 0; block < blocks; ++block) {
+                float maximum = -INFINITY;
+                for (int j = block * blockSize; j < std::min(visible, (block + 1) * blockSize); ++j)
+                    maximum = std::fmax(maximum, host[size_t(row) * length + j]);
+                if (visible && block == (visible - 1) / blockSize) maximum = INFINITY;
+                keys[block] = FloatKey(maximum);
+            }
+            auto sorted = keys;
+            const int kth = std::min(keep, blocks) - 1;
+            std::nth_element(sorted.begin(), sorted.begin() + kth, sorted.end(), std::greater<unsigned>());
+            for (int block = 0; block < blocks; ++block)
+                expected[size_t(row) * blocks + block] = keys[block] >= sorted[kth] && keys[block] > FloatKey(-INFINITY);
+        }
+        Cuda(cudaMemcpyAsync(scores.cudaData, host.data(), host.size() * sizeof(float),
+                             cudaMemcpyHostToDevice, cudaStreamPerThread));
+        Check(FastllmCudaDeepSeekV41CandidateBlocks(scores, blockSize, keep, ratio, start, output),
+              "candidate selection rejected");
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        std::vector<uint8_t> actual(expected.size());
+        Cuda(cudaMemcpy(actual.data(), output.cudaData, actual.size(), cudaMemcpyDeviceToHost));
+        Check(actual == expected, "candidate CPU threshold/tie/newest-block oracle mismatch");
+    }
+}
+
 int main(int argc, char **argv) {
     longContext = argc > 1 && std::string(argv[1]) == "--long-context";
     int devices = 0;
@@ -115,6 +161,15 @@ int main(int argc, char **argv) {
         return 77;
     try {
         int cases = 0;
+        if (argc > 1 && std::string(argv[1]) == "--candidates") {
+            Cuda(cudaSetDevice(0));
+            for (int rows : {1, 2, 6, 8})
+                for (int length : {1, 513, 16385, 131073, 262145, 1048576})
+                    for (int block : {3, 8, 64})
+                        for (int pattern : {0, 1, 2}) { RunCandidates(rows, length, block, pattern); ++cases; }
+            std::cout << "PASS " << cases << " candidate masks x 3 changing inputs; CPU threshold/tie/causal oracle" << std::endl;
+            return 0;
+        }
         for (int device = 0; device < (longContext ? 1 : devices); ++device) {
             Cuda(cudaSetDevice(device));
             for (int rows : {1, 2, 3, 4, 5, 6, 7, 8})

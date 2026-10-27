@@ -1579,13 +1579,20 @@ if (UNIT_TEST)
                 "PASS [0-9]+ cases x 3 changing-input graph replays" 900)
             fastllm_add_checked_test(deepseekV41TopKLongContext deepseekV41TopKRegression
                 "PASS [0-9]+ cases x 3 changing-input graph replays" 900 --long-context)
-            set_tests_properties(deepseekV41SmallIndexer deepseekV41TopK deepseekV41TopKLongContext
+            fastllm_add_checked_test(deepseekV41CandidateBlocks deepseekV41TopKRegression
+                "PASS [0-9]+ candidate masks x 3 changing inputs" 900 --candidates)
+            set_tests_properties(deepseekV41SmallIndexer deepseekV41TopK deepseekV41TopKLongContext deepseekV41CandidateBlocks
                 PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_executable(deepseekV41FullDecodeRegression test/ops/deepseekV41FullDecodeRegression.cpp)
             target_link_libraries(deepseekV41FullDecodeRegression PRIVATE fastllm)
             target_include_directories(deepseekV41FullDecodeRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             fastllm_add_checked_test(deepseekV41FullDecode deepseekV41FullDecodeRegression
                 "PASS [0-9]+ changing-context graph replays; stress=0" 300)
+            foreach(index_heads IN ITEMS 1 17 64)
+                fastllm_add_checked_test(deepseekV41IndexHeads${index_heads} deepseekV41FullDecodeRegression
+                    "PASS [0-9]+ changing-context graph replays; stress=0" 300 --index-heads=${index_heads})
+                set_tests_properties(deepseekV41IndexHeads${index_heads} PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+            endforeach()
             fastllm_add_checked_test(deepseekV41FullDecodeStress deepseekV41FullDecodeRegression
                 "PASS [0-9]+ changing-context graph replays; stress=1" 300 --stress)
             fastllm_add_checked_test(deepseekV41FullDecodePooled deepseekV41FullDecodeRegression
@@ -1594,6 +1601,8 @@ if (UNIT_TEST)
                 "PASS [0-9]+ full verify graph replays" 300 --verify)
             fastllm_add_checked_test(deepseekV41AttentionLocality deepseekV41FullDecodeRegression
                 "PASS [0-9]+ attention locality checks" 60 --locality)
+            fastllm_add_checked_test(deepseekV41VerifyIndexHeads17 deepseekV41FullDecodeRegression
+                "PASS [0-9]+ full verify graph replays" 300 --verify --index-heads=17)
             fastllm_add_checked_test(deepseekV41FullDecodeLongContext deepseekV41FullDecodeRegression
                 "PASS [0-9]+ changing-context graph replays; stress=0" 900 --long-context)
             fastllm_add_checked_test(deepseekV41FullVerifyLongContext deepseekV41FullDecodeRegression
@@ -1602,11 +1611,10 @@ if (UNIT_TEST)
                 "PASS [0-9]+ changing-context graph replays; stress=0" 900 --shared-candidates --long-context)
             fastllm_add_checked_test(deepseekV41CandidateReuseVerify deepseekV41FullDecodeRegression
                 "PASS [0-9]+ full verify graph replays" 900 --verify --shared-candidates --long-context)
-            set_tests_properties(deepseekV41FullDecodeLongContext deepseekV41FullVerifyLongContext
-                deepseekV41CandidateReuse deepseekV41CandidateReuseVerify
-                PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             set_tests_properties(deepseekV41FullDecode deepseekV41FullDecodeStress
-                deepseekV41FullDecodePooled deepseekV41FullVerify deepseekV41AttentionLocality
+                deepseekV41FullDecodePooled deepseekV41FullVerify deepseekV41VerifyIndexHeads17 deepseekV41AttentionLocality
+                deepseekV41FullDecodeLongContext deepseekV41FullVerifyLongContext
+                deepseekV41CandidateReuse deepseekV41CandidateReuseVerify
                 PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_executable(deepseekV41DecodeProjectionRegression test/ops/deepseekV41DecodeProjectionRegression.cpp)
             target_link_libraries(deepseekV41DecodeProjectionRegression PRIVATE fastllm)
