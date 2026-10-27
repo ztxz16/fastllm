@@ -10,3 +10,17 @@ void Launch(const __nv_bfloat16 *q, FastllmNaiveKV keys, const float *scales,
             const __nv_bfloat16 *weights, float *scores,
             int queries, int keyCount, int past, int stride);
 }
+
+// Temporary opt-in FP8 experiment. The accepted source tree is untouched.
+namespace naive_indexer {
+struct ExperimentalEntry {
+    FastllmNaiveKV key;
+    const __nv_bfloat16 *q, *weights;
+    const float *scales;
+    float *scores;
+    int rows, keys, past, stride, part = 0, gap = 0;
+};
+// Bitmask of entries dispatched; zero preserves the caller's original path.
+unsigned LaunchExperimentalFP8(const ExperimentalEntry *entries, int count);
+unsigned long long ExperimentalFP8Launches();
+}

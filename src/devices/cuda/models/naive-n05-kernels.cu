@@ -2745,6 +2745,12 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
 #ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
         // WGMMA's smaller query tile repeats more K reads. For shared peer KV,
         // use the larger MMA tile below to reduce traffic to the owning GPU.
+        else if ([&]() {
+            naive_indexer::ExperimentalEntry entry{FastllmNaiveKV(packedKeys),
+                (const BF16 *)q.cudaData, (const BF16 *)weights.cudaData, (const float *)qScale.cudaData,
+                (float *)scores.cudaData, queries, keys, queryStart, stride};
+            return naive_indexer::LaunchExperimentalFP8(&entry, 1) != 0;
+        }()) {}
         else if (!peerKeys && naive_indexer::Prepare()) {
             naive_indexer::Launch((const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
                 (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
@@ -2857,9 +2863,18 @@ bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::
     naive_dsa_mma::QuantizeBalancedIndexer<<<rows * 16, 128>>>(
         (const BF16 *)query.cudaData, (const BF16 *)weights.cudaData, (BF16 *)q.cudaData, (float *)scale.cudaData,
         (BF16 *)w.cudaData, part, first, second);
+    bool experimental = false;
+#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
+    naive_indexer::ExperimentalEntry entry{FastllmNaiveKV(keys), (const BF16 *)q.cudaData,
+        (const BF16 *)w.cudaData, (const float *)scale.cudaData, (float *)scores.cudaData,
+        rows, count, start, keys.dims[2], part, gap};
+    experimental = naive_indexer::LaunchExperimentalFP8(&entry, 1) != 0;
+#endif
+    if (!experimental) {
     naive_dsa_mma::IndexerScores<true><<<dim3((past + second + part + 63) / 64, (rows + 31) / 32), 128>>>(
         (const BF16 *)q.cudaData, FastllmNaiveKV(keys), (const float *)scale.cudaData, (const BF16 *)w.cudaData,
         (float *)scores.cudaData, rows, count, start, keys.dims[2], part, gap);
+    }
     SelectTopKCompact<<<rows, 256>>>((const float *)scores.cudaData, (unsigned long long *)encoded.cudaData,
                                      (int *)offsets.cudaData, rows, count, start, 2048, 4096, part, gap);
     SortTopKCompact<<<rows, 256>>>((const unsigned long long *)encoded.cudaData, (int *)offsets.cudaData,
@@ -2923,9 +2938,32 @@ bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillI
     Output(offsets, INT32, {2, batch.rows});
     naive_dsa_mma::QuantizeBatchIndexer<<<batch.rows * 16, 128>>>(batch, (BF16 *)q.cudaData, (float *)scale.cudaData,
                                                                   (BF16 *)w.cudaData);
+    unsigned experimentalMask = 0;
+#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
+    naive_indexer::ExperimentalEntry experimentalEntries[8];
+    for (int i = 0; i < batch.count; ++i) {
+        const auto &e = batch.entries[i];
+        experimentalEntries[i] = {e.key, (const BF16 *)q.cudaData + (size_t)e.rowOffset * 2048,
+            (const BF16 *)w.cudaData + e.rowOffset * 16, (const float *)scale.cudaData + e.rowOffset * 16,
+            (float *)scores.cudaData + e.scoreOffset, e.rows, e.keys, e.past + e.first, e.stride,
+            e.part, e.second - e.first - e.part};
+    }
+    experimentalMask = naive_indexer::LaunchExperimentalFP8(experimentalEntries, batch.count);
+#endif
+    if (!experimentalMask) {
     naive_dsa_mma::BatchIndexerScores<<<dim3((maxKeys + 63) / 64, (maxRows + 31) / 32, batch.count), 128>>>(
         batch, (const BF16 *)q.cudaData, (const float *)scale.cudaData, (const BF16 *)w.cudaData,
         (float *)scores.cudaData);
+    } else {
+        for (int i = 0; i < batch.count; ++i) if (!(experimentalMask & (1u << i))) {
+            const auto &e = batch.entries[i];
+            naive_dsa_mma::IndexerScores<true><<<dim3((e.past + e.second + e.part + 63) / 64,
+                (e.rows + 31) / 32), 128>>>((const BF16 *)q.cudaData + (size_t)e.rowOffset * 2048,
+                e.key, (const float *)scale.cudaData + e.rowOffset * 16,
+                (const BF16 *)w.cudaData + e.rowOffset * 16, (float *)scores.cudaData + e.scoreOffset,
+                e.rows, e.keys, e.past + e.first, e.stride, e.part, e.second - e.first - e.part);
+        }
+    }
     SelectBatchTopK<<<batch.rows, 256>>>(batch, (const float *)scores.cudaData, (unsigned long long *)encoded.cudaData,
                                          (int *)offsets.cudaData);
     SortBatchTopK<<<batch.rows, 256>>>(batch, (const unsigned long long *)encoded.cudaData,
