@@ -10511,7 +10511,7 @@ bool FastllmRecurrentGatedDeltaRuleBFloat16Slots(
     for (const Data *data : {&norm, &aLog, &dtBias}) {
         if (!FastllmGdnResidentContiguous(*data, FLOAT32, device)) return false;
     }
-    if (!FastllmGdnResidentContiguous(slotIds, INT32, device) || slotIds.Count(0) != (uint64_t)batch ||
+    if (!FastllmGdnResidentContiguous(slotIds, fastllm::INT32, device) || slotIds.Count(0) != (uint64_t)batch ||
         statePool.dims.size() != 4 || statePool.dims[0] < batch ||
         statePool.dims[1] != valueHeads || statePool.dims[2] != 128 || statePool.dims[3] != 128 ||
         conv.dims.back() != (2 * keyHeads + valueHeads) * 128 ||
@@ -10591,7 +10591,7 @@ bool FastllmCudaBFloat16ConvSiluSlots(
     if (!FastllmGdnResidentContiguous(pool, BFLOAT16, device) ||
         !FastllmGdnResidentContiguous(input, BFLOAT16, device) ||
         !FastllmGdnResidentContiguous(weight, FLOAT32, device) ||
-        !FastllmGdnResidentContiguous(slots, INT32, device) || slots.Count(0) != (uint64_t)batch ||
+        !FastllmGdnResidentContiguous(slots, fastllm::INT32, device) || slots.Count(0) != (uint64_t)batch ||
         pool.dims.size() != 4 || pool.dims[0] < batch || pool.dims[1] != 1 || pool.dims[3] != 4) return false;
     const int channels = pool.dims[2];
     if (input.dims != std::vector<int>({batch, channels, 1}) ||
