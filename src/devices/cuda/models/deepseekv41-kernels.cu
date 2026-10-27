@@ -2196,11 +2196,15 @@ namespace {
         __nv_bfloat16 keys[64][136];
         __nv_bfloat16 queries[2][32][136];
         float scores[16][64];
+        // Reused by every key tile; preserve the FP32 weights exactly.
+        float weights[2][32];
     };
-    template<bool BLOCK_MAX = false>
-    __global__ void __launch_bounds__(256)
+    template<bool BLOCK_MAX = false, int THREADS = 256>
+    __global__ void __launch_bounds__(THREADS)
     V41IndexerScorePairKernel(const V41DecodeIndexDescriptor *items, int rows, int ratio) {
+        static_assert(THREADS == 128 || THREADS == 256, "paired index score supports 128 or 256 threads");
     #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        constexpr int tilesPerWarp = 64 / (THREADS / 32) / 8;
         extern __shared__ __align__(16) unsigned char storage[];
         auto &sh = *reinterpret_cast<V41PairedIndexShared *>(storage);
         const int first = blockIdx.y * 2, nr = min(2, rows - first);
@@ -2214,19 +2218,20 @@ namespace {
                 const int visible = min(item.count, (item.position + 1) / ratio);
                 if (blockIdx.x == 0)
                     for (int b = (visible + item.candidateBlockSize - 1) / item.candidateBlockSize + tid;
-                         b < item.blocks; b += 256) item.blockScores[b] = -INFINITY;
+                         b < item.blocks; b += THREADS) item.blockScores[b] = -INFINITY;
             }
         }
         if (blockIdx.x * 64 >= end) return;
         for (int r = 0; r < nr; ++r) {
             const auto item = items[first + r];
-            for (int v = tid; v < ((item.heads + 15) / 16) * 256; v += 256)
+            if (tid < item.heads) sh.weights[r][tid] = item.weights[tid];
+            for (int v = tid; v < ((item.heads + 15) / 16) * 256; v += THREADS)
                 *reinterpret_cast<float4 *>(&sh.queries[r][v / 16][v % 16 * 8]) = v / 16 < item.heads
                     ? *reinterpret_cast<const float4 *>(item.query + v / 16 * 128 + v % 16 * 8)
                     : make_float4(0, 0, 0, 0);
         }
         auto loadKeys = [&](int tile) {
-            for (int v = tid; v < 64 * 16; v += 256) {
+            for (int v = tid; v < 64 * 16; v += THREADS) {
                 const int key = tile + v / 16, d = v % 16 * 8;
                 const bool valid = key < last.count;
                 auto *dst = &sh.keys[v / 16][d];
@@ -2244,23 +2249,30 @@ namespace {
                 if (tile >= visible) continue;
                 float total = 0.f;
                 for (int h0 = 0; h0 < item.heads; h0 += 16) {
-                    float acc[4] = {0, 0, 0, 0};
+                    float acc[tilesPerWarp][4] = {};
                     const int ar = ((lane >> 3) & 1) * 8 + (lane & 7), ac = (lane >> 4) * 8;
-                    const int br = warp * 8 + (lane & 7), bc = ((lane >> 3) & 1) * 8;
+                    const int bc = ((lane >> 3) & 1) * 8;
     #pragma unroll
                     for (int kk = 0; kk < 128; kk += 16) {
-                        uint32_t a[4], b[2];
+                        uint32_t a[4];
                         V41LdmX4(a, &sh.queries[r][h0 + ar][kk + ac]);
-                        V41LdmX2(b, &sh.keys[br][kk + bc]);
-                        V41MmaBf16(acc, a, b);
+    #pragma unroll
+                        for (int u = 0; u < tilesPerWarp; ++u) {
+                            uint32_t b[2];
+                            V41LdmX2(b, &sh.keys[(warp * tilesPerWarp + u) * 8 + (lane & 7)][kk + bc]);
+                            V41MmaBf16(acc[u], a, b);
+                        }
                     }
-                    const int row = lane >> 2, col = warp * 8 + (lane & 3) * 2;
-                    sh.scores[row][col] = acc[0]; sh.scores[row][col + 1] = acc[1];
-                    sh.scores[row + 8][col] = acc[2]; sh.scores[row + 8][col + 1] = acc[3];
+    #pragma unroll
+                    for (int u = 0; u < tilesPerWarp; ++u) {
+                        const int row = lane >> 2, col = (warp * tilesPerWarp + u) * 8 + (lane & 3) * 2;
+                        sh.scores[row][col] = acc[u][0]; sh.scores[row][col + 1] = acc[u][1];
+                        sh.scores[row + 8][col] = acc[u][2]; sh.scores[row + 8][col + 1] = acc[u][3];
+                    }
                     __syncthreads();
                     if (tid < 64)
                         for (int h = 0; h < min(16, item.heads - h0); ++h)
-                            total += fmaxf(sh.scores[h][tid], 0.f) * item.weights[h0 + h];
+                            total += fmaxf(sh.scores[h][tid], 0.f) * sh.weights[r][h0 + h];
                     __syncthreads();
                 }
                 if (tid < 64 && tile + tid < item.count) item.scores[tile + tid] = total;
@@ -2278,6 +2290,18 @@ namespace {
             __syncthreads();
         }
     #endif
+    }
+
+    template<int THREADS>
+    void V41LaunchIndexerScorePair(const V41DecodeIndexDescriptor *items, int rows, int ratio, bool blockMax) {
+        const dim3 grid(THREADS == 128 ? 256 : 128, (rows + 1) / 2);
+        if (blockMax) {
+            V41IndexerScorePairKernel<true, THREADS><<<grid, THREADS,
+                sizeof(V41PairedIndexShared), cudaStreamPerThread>>>(items, rows, ratio);
+        } else {
+            V41IndexerScorePairKernel<false, THREADS><<<grid, THREADS,
+                sizeof(V41PairedIndexShared), cudaStreamPerThread>>>(items, rows, ratio);
+        }
     }
 
     // ---------------- radix select（k-th largest） ----------------
@@ -6633,7 +6657,7 @@ namespace {
 constexpr int kFullDecodeTransforms = 5;
 
 struct V41FullDecodePlan {
-    bool indexPairs = false;
+    bool indexPairs = false, indexPairNarrow = false;
     bool qkPrefetch = false, wideTopKMerge = false, indexPrefetch = false;
     bool fuseIndexBlocks = false, wideCandidateSelect = false;
     FastllmV41FullDecodeConfig config;
@@ -6903,6 +6927,12 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         V41MmaKernelReady<V41IndexerScorePairKernel<false>, 256, sizeof(V41PairedIndexShared)>() &&
         (!p->fuseIndexBlocks ||
          V41MmaKernelReady<V41IndexerScorePairKernel<true>, 256, sizeof(V41PairedIndexShared)>());
+    // SM90 can reuse each query MMA operand across two eight-key tiles
+    // per warp. Keep the 256-thread implementation as the general path.
+    p->indexPairNarrow = p->indexPairs && c.indexHeads == 32 && V41IsSm<9, 0>() &&
+        V41MmaKernelReady<V41IndexerScorePairKernel<false, 128>, 128, sizeof(V41PairedIndexShared)>() &&
+        (!p->fuseIndexBlocks ||
+         V41MmaKernelReady<V41IndexerScorePairKernel<true, 128>, 128, sizeof(V41PairedIndexShared)>());
     p->rope = V41BuildRope(c.ropeDim, c.ropeBase, c.originalSeqLen, c.ropeFactor, c.betaFast, c.betaSlow);
     const int blocks = (c.maxKeys + c.blockSize - 1) / c.blockSize;
     for (int shift = 0; shift < 30; ++shift) if ((1 << shift) == c.blockSize) p->blockShift = shift;
@@ -7040,13 +7070,10 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
     if (c.indexSource) {
         V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3((c.indexHeads + 3) / 4, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 4, p->rope, c.ropeDim, c.window);
         if (p->indexPairs) {
-            if (p->fuseIndexBlocks) {
-                V41IndexerScorePairKernel<true><<<dim3(128, (c.batch + 1) / 2), 256,
-                    sizeof(V41PairedIndexShared), cudaStreamPerThread>>>(p->index, c.batch, c.ratio);
-            } else {
-                V41IndexerScorePairKernel<false><<<dim3(128, (c.batch + 1) / 2), 256,
-                    sizeof(V41PairedIndexShared), cudaStreamPerThread>>>(p->index, c.batch, c.ratio);
-            }
+            if (p->indexPairNarrow)
+                V41LaunchIndexerScorePair<128>(p->index, c.batch, c.ratio, p->fuseIndexBlocks);
+            else
+                V41LaunchIndexerScorePair<256>(p->index, c.batch, c.ratio, p->fuseIndexBlocks);
         } else if (p->fuseIndexBlocks) {
             if (p->indexPrefetch) {
                 V41IndexerScoreDecodeMmaKernel<true, true, false, false, true, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
