@@ -597,34 +597,46 @@ namespace {
 
     // Ascending reduction tree matches FastllmGemvFp32Fp32Kernel2.
     // BF16 converts exactly to FP32 in registers; no activation cast buffer.
+    template<int Tokens>
     __global__ void V41RouterScoresKernel(const __nv_bfloat16 *input, const float *weight,
-                                          float *scores, int dim, int experts, float invTemp) {
+                                          float *scores, int dim, int experts, float invTemp, int rows) {
         const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
-        const int expert = blockIdx.x, token = blockIdx.y;
-        float sum = 0.0f;
+        const int expert = blockIdx.x, first = blockIdx.y * Tokens;
+        float sums[Tokens] = {};
 #pragma unroll 4
-        for (int i = tid; i < dim; i += 256)
-            sum += __bfloat162float(input[(size_t)token * dim + i]) * weight[(size_t)expert * dim + i];
+        for (int i = tid; i < dim; i += 256) {
+            const float coefficient = weight[(size_t)expert * dim + i];
 #pragma unroll
-        for (int offset = 1; offset < 32; offset *= 2) {
-            const float other = __shfl_down_sync(0xffffffff, sum, offset);
-            if ((lane & (2 * offset - 1)) == 0) sum += other;
+            for (int t=0;t<Tokens;++t)
+                if (first+t<rows) sums[t] += __bfloat162float(input[(size_t)(first+t)*dim+i]) * coefficient;
         }
-        __shared__ float partial[8];
-        if (lane == 0) partial[warp] = sum;
-        __syncthreads();
-        if (warp == 0) {
-            sum = lane < 8 ? partial[lane] : 0.0f;
+        __shared__ float partial[Tokens][8];
 #pragma unroll
-            for (int offset = 1; offset < 8; offset *= 2) {
+        for (int t=0;t<Tokens;++t) {
+            float sum=sums[t];
+#pragma unroll
+            for (int offset = 1; offset < 32; offset *= 2) {
                 const float other = __shfl_down_sync(0xffffffff, sum, offset);
                 if ((lane & (2 * offset - 1)) == 0) sum += other;
             }
-            if (lane == 0) {
-                const float value = __fmul_rn(__fadd_rn(sum, 0.0f), invTemp);
-                const float softplus = value > 20.0f ? value :
-                    (value < -20.0f ? expf(value) : log1pf(expf(value)));
-                scores[(size_t)token * experts + expert] = sqrtf(softplus);
+            if (lane == 0) partial[t][warp] = sum;
+        }
+        __syncthreads();
+        if (warp == 0) {
+#pragma unroll
+            for (int t=0;t<Tokens;++t) {
+                float sum = lane < 8 ? partial[t][lane] : 0.0f;
+#pragma unroll
+                for (int offset = 1; offset < 8; offset *= 2) {
+                    const float other = __shfl_down_sync(0xffffffff, sum, offset);
+                    if ((lane & (2 * offset - 1)) == 0) sum += other;
+                }
+                if (lane == 0 && first+t<rows) {
+                    const float value = __fmul_rn(__fadd_rn(sum, 0.0f), invTemp);
+                    const float softplus = value > 20.0f ? value :
+                        (value < -20.0f ? expf(value) : log1pf(expf(value)));
+                    scores[(size_t)(first+t)*experts+expert] = sqrtf(softplus);
+                }
             }
         }
     }
@@ -3869,9 +3881,15 @@ extern "C" bool FastllmCudaV41RouterScores(const Data &input, Data &weight,
     dims.back() = weight.dims[0];
     if (!V41PrepareOutput(scores, DataType::FLOAT32, dims)) return false;
     const float invTemp = fabsf(temperature - 1.0f) > 1e-6f ? 1.0f / temperature : 1.0f;
-    V41RouterScoresKernel<<<dim3(weight.dims[0], input.Count(0) / input.dims.back()), 256>>>(
-        (const __nv_bfloat16 *)input.cudaData, (const float *)weight.cudaData,
-        (float *)scores.cudaData, weight.dims[1], weight.dims[0], invTemp);
+    const int rows = input.Count(0) / input.dims.back();
+    if (rows == 1)
+        V41RouterScoresKernel<1><<<dim3(weight.dims[0],rows),256>>>(
+            (const __nv_bfloat16 *)input.cudaData,(const float *)weight.cudaData,
+            (float *)scores.cudaData,weight.dims[1],weight.dims[0],invTemp,rows);
+    else
+        V41RouterScoresKernel<2><<<dim3(weight.dims[0],(rows+1)/2),256>>>(
+            (const __nv_bfloat16 *)input.cudaData,(const float *)weight.cudaData,
+            (float *)scores.cudaData,weight.dims[1],weight.dims[0],invTemp,rows);
     return V41CheckLaunch("RouterScores");
 }
 

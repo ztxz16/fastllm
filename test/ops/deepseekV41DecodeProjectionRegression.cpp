@@ -44,7 +44,7 @@ static std::vector<float> Floats(const Data &data) {
 static int CheckMixNorm() {
     int cases = 0;
     for (int dim : {4096, 4128, 5120, 6144, 8192}) {
-        for (int batch : {1, 2, 4, 8, 15}) {
+        for (int batch : {1, 2, 3, 4, 5, 6, 7, 8, 15}) {
             for (float amplitude : {0.3f, 2.0f}) {
                 Data input, previousPre, fn, scale, base, weight, pre[2], post[2], comb[2], out[2];
                 Data quantReference;
@@ -102,7 +102,7 @@ static int CheckHcDecodeDots() {
     int cases = 0;
     for (auto type : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32})
     for (int dim : {63, 4095, 4096, 4098, 5120, 6144, 8190, 8192, 8193})
-    for (int batch : {1, 2, 3, 4, 8, 9, 15}) {
+    for (int batch : {1, 2, 3, 4, 5, 6, 7, 8, 9, 15}) {
         Data input, repeated, fn, scale, base, pre[2], post[2], comb[2];
         Fill(input, {1, batch, 4, dim}, type, batch + dim, dim == 63 ? 0.0f : 0.8f);
         Fill(fn, {24, 4 * dim}, DataType::FLOAT32, 3, 0.07f);
@@ -135,7 +135,7 @@ static int CheckHcDecodeDots() {
 static int CheckRouter() {
     int cases = 0;
     for (int dim : {64, 513, 5120}) for (int experts : {64, 384, 1024})
-    for (int batch : {1, 2, 4, 8}) for (float temperature : {1.0f, 0.7f, 2.0f}) {
+    for (int batch : {1, 2, 3, 4, 5, 6, 7, 8}) for (float temperature : {1.0f, 0.7f, 2.0f}) {
         Data input, weight, cast, reference, actual;
         Fill(input, {batch, dim}, DataType::BFLOAT16, 1, 0.8f);
         Fill(weight, {experts, dim}, DataType::FLOAT32, 2, 0.15f);
