@@ -240,6 +240,14 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     g->hostRequests.resize(g->devices.size());
     g->hostPlans.resize(g->devices.size());
     g->batch = batch;
+    // Reserve the configured context before capture. Growing these operands
+    // during a live request would invalidate graph addresses and require a
+    // warm replay that can modify its KV state. Keep short-context capacity
+    // unchanged; long-context models retain the same graph across boundaries.
+    int contextCapacity = max_positions;
+    if (tokensLimit > 0 && (contextCapacity <= 0 || tokensLimit < contextCapacity))
+        contextCapacity = tokensLimit;
+    g->maxKeys = std::max(g->maxKeys, contextCapacity);
     g->verifying = verifying;
     g->pieces = std::make_shared<DeepSeekV41CudaGraphState>();
     g->pieces->PrepareDevices(g->devices, true);
@@ -587,8 +595,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         state->fullDecode = g;
         fprintf(stderr,
                 "[Fastllm] DeepSeek-V4.1 full %s graph ready: %s=%d, ranks=%zu, one graph "
-                "per rank/step\n",
-                verifying ? "verify" : "decode", verifying ? "tokens" : "batch", batch, g->devices.size());
+                "per rank/step, maxKeys=%d\n",
+                verifying ? "verify" : "decode", verifying ? "tokens" : "batch", batch, g->devices.size(), g->maxKeys);
     } catch (const std::exception &error) {
         if (poolOpen)
             FastllmCudaGraphMemoryPoolAbort();

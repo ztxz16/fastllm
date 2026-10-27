@@ -6,7 +6,7 @@ static void RunVerifyRegression() {
     for (int tokens : {2, 3, 4, 5, 6, 7, 8})
         for (int ratio : {0, 1, 2})
             for (int mask : {0, 1, 2}) {
-                if (!ratio && mask)
+                if ((!ratio && mask) || (longContext && heads != 8))
                     continue;
                 FastllmV41FullDecodeConfig c;
                 c.batch = tokens;
@@ -14,7 +14,7 @@ static void RunVerifyRegression() {
                 c.verifying = true;
                 c.ratio = ratio;
                 c.kvSource = c.indexSource = ratio != 0;
-                c.maxKeys = 32768;
+                c.maxKeys = longContext ? 1048576 : 32768;
                 c.candidateTopK = 16;
                 c.writeCandidates = mask == 1;
                 c.useCandidates = mask == 2;
@@ -93,8 +93,10 @@ static void RunVerifyRegression() {
                       "verify capture");
                 Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
                 Cuda(cudaGraphInstantiate(&exec, graph, 0));
-                for (int pos : {1, 2, 125, 126, 127, 128, 509, 510, 511, 1021, 1022, 1023, 4095,
-                                8192, 16383}) {
+                for (int pos : (longContext
+                                ? std::vector<int>{131071, 131072, 262143, 262144, 1048560}
+                                : std::vector<int>{1, 2, 125, 126, 127, 128, 509, 510, 511, 1021, 1022, 1023, 4095,
+                                8192, 16383})) {
                     Data &r = pos >= 509 ? relocated : ring;
                     CopyDevice(q, q0);
                     CopyDevice(kv, k0);

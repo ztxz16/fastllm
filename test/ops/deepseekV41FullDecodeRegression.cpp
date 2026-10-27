@@ -24,14 +24,9 @@ static void Cuda(cudaError_t e) {
 static float amplitude = .3f;
 static bool stress = false;
 static bool pooled = false;
+static bool longContext = false;
 static void Fill(Data &d, const std::vector<int> &dims, int seed,
                  DataType type = DataType::BFLOAT16) {
-    size_t n = 1;
-    for (int v : dims)
-        n *= v;
-    std::vector<float> values(n);
-    for (size_t i = 0; i < n; ++i)
-        values[i] = std::sin(float((i * 17 + seed * 13) % 1009)) * amplitude;
     if (type == DataType::INT32 || type == DataType::INT8) {
         d.dataType = type;
         d.Resize(dims);
@@ -40,6 +35,15 @@ static void Fill(Data &d, const std::vector<int> &dims, int seed,
         d.ToDevice(DataDevice::CUDA, std::vector<int>{0});
         return;
     }
+    size_t n = 1;
+    for (int v : dims)
+        n *= v;
+    std::vector<float> values(n);
+    float pattern[1009];
+    for (int i = 0; i < 1009; ++i)
+        pattern[i] = std::sin(float(i)) * amplitude;
+    for (size_t i = 0; i < n; ++i)
+        values[i] = pattern[(i * 17 + seed * 13) % 1009];
     Data cpu(DataType::FLOAT32, dims, values);
     ToDataType(cpu, type);
     d.CopyFrom(cpu);
@@ -126,6 +130,7 @@ int main(int argc, char **argv) {
         if (std::string(argv[i]) == "--pooled") pooled = true;
         if (std::string(argv[i]) == "--verify") verify = true;
         if (std::string(argv[i]) == "--locality") locality = true;
+        if (std::string(argv[i]) == "--long-context") longContext = true;
     }
     if (locality && devices < 2) return 77;
     try {
@@ -137,9 +142,9 @@ int main(int argc, char **argv) {
         for (int batch : {1, 2, 4, 8, 16, 128})
             for (int ratio : {0, 1, 2})
                 for (int maskMode : {0, 1, 2}) {
-                    if ((!ratio && maskMode) || (stress && batch != 1))
+                    if ((!ratio && maskMode) || ((stress || longContext) && batch != 1))
                         continue;
-                    const int maxKeys = batch == 128 ? 2048 : 32768;
+                    const int maxKeys = longContext ? 1048576 : batch == 128 ? 2048 : 32768;
                     FastllmV41FullDecodeConfig c;
                     c.batch = batch;
                     c.ratio = ratio;
@@ -253,8 +258,9 @@ int main(int argc, char **argv) {
                           "capture");
                     Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
                     Cuda(cudaGraphInstantiate(&exec, graph, 0));
-                    for (int position :
-                         {1, 126, 127, 510, 511, 1022, 1023, 2046, 8192, 16384, 32766}) {
+                    for (int position : (longContext
+                         ? std::vector<int>{131071, 131072, 262143, 262144, 1048560}
+                         : std::vector<int>{1, 126, 127, 510, 511, 1022, 1023, 2046, 8192, 16384, 32766})) {
                         if ((position + batch + 1) / (ratio ? ratio : 1) > maxKeys)
                             continue;
                         CopyDevice(q, q0);

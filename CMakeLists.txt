@@ -1578,6 +1578,12 @@ if (UNIT_TEST)
                 "PASS [0-9]+ full verify graph replays" 300 --verify)
             fastllm_add_checked_test(deepseekV41AttentionLocality deepseekV41FullDecodeRegression
                 "PASS [0-9]+ attention locality checks" 60 --locality)
+            fastllm_add_checked_test(deepseekV41FullDecodeLongContext deepseekV41FullDecodeRegression
+                "PASS [0-9]+ changing-context graph replays; stress=0" 900 --long-context)
+            fastllm_add_checked_test(deepseekV41FullVerifyLongContext deepseekV41FullDecodeRegression
+                "PASS [0-9]+ full verify graph replays" 900 --verify --long-context)
+            set_tests_properties(deepseekV41FullDecodeLongContext deepseekV41FullVerifyLongContext
+                PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             set_tests_properties(deepseekV41FullDecode deepseekV41FullDecodeStress
                 deepseekV41FullDecodePooled deepseekV41FullVerify deepseekV41AttentionLocality
                 PROPERTIES LABELS cuda RUN_SERIAL TRUE)
