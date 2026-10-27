@@ -28,6 +28,7 @@
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "fastllm-v41-decode.cuh"
+#include "devices/cuda/fastllm-cuda-gguf-projections.h"
 #include "devices/cuda/fastllm-append-only-cuda-rows.h"
 #include "devices/cuda/fastllm-v41-engram.h"
 #include "deepseekv41-reference.cuh"
@@ -888,12 +889,16 @@ namespace fastllm {
                 input.dims.back() % 32 || !std::isfinite(eps) || eps < 0) return false;
             const uint64_t rows = input.Count(0) / input.dims.back();
             if (rows < 1 || rows > 8 || (rows > 1 && !joinedWeight && !separateBatch)) return false;
-            const bool packed = rows > 1 && joinedWeight != nullptr;
+            const bool gguf = qw.dataType == DATA_GGUF_FORMAT && kw.dataType == DATA_GGUF_FORMAT;
+            const bool packed = !gguf && rows > 1 && joinedWeight != nullptr;
+            if (gguf && input.dims.back() % 256) return false;
             for (const Data *w : {&qw, &kw}) {
-                if (w->dataType != DataType::FP8_E4M3 || w->IsRepacked || w->dims.size() != 2 ||
+                if (w->IsRepacked || w->dims.size() != 2 ||
                     w->dims[1] != input.dims.back() || w->dims[0] < 512 || w->dims[0] >= 4096 ||
-                    w->dims[0] % 32 || w->blockM < 4 || (w->blockM & (w->blockM - 1)) ||
-                    w->blockK <= 1 || (w->blockK & (w->blockK - 1))) return false;
+                    w->dims[0] % 32) return false;
+                if (!gguf && (w->dataType != DataType::FP8_E4M3 ||
+                    w->blockM < 4 || (w->blockM & (w->blockM - 1)) ||
+                    w->blockK <= 1 || (w->blockK & (w->blockK - 1)))) return false;
             }
             if (qnw.dataType != DataType::FLOAT32 || knw.dataType != DataType::FLOAT32 ||
                 qnw.Count(0) != (uint64_t)qw.dims[0] || knw.Count(0) != (uint64_t)kw.dims[0]) return false;
@@ -935,6 +940,12 @@ namespace fastllm {
             V41AllocLike(kv, DataType::BFLOAT16, kdims, input, devices);
             auto run = [&](const Data &x, Data &wq, Data &wk, Data &nq, Data &nk,
                            Data &xq, Data &qraw, Data &qout, Data &qq, Data &kout, Data *joined) {
+                if (gguf) {
+                    Data *weights[] = {&wq, &wk}, *outputs[] = {&qraw, &kout};
+                    return (inputQuantized || FastllmCudaDeepSeekV41QuantizeActivation(x, xq)) &&
+                        FastllmCudaGGUFLinearShared(xq, weights, outputs, 2) &&
+                        FastllmCudaV41QKVNormQuant(qraw, kout, nq, nk, eps, qout, qq, kout);
+                }
                 if (packed) {
                     Data bias;
                     return (inputQuantized || FastllmCudaDeepSeekV41QuantizeActivation(x, xq)) &&

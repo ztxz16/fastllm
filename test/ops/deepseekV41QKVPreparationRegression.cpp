@@ -1,4 +1,6 @@
 #include "fastllm.h"
+#include "models/deepseekv41.h"
+#include "gguf.h"
 #include "utils.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-v41-decode.cuh"
@@ -293,13 +295,59 @@ static int MergedCases() {
             }
     return cases;
 }
+static int GgufModelCases() {
+    struct Model : DeepSeekV41Model {
+        using DeepSeekV41Model::DsparkPrepareQkv;
+        using DeepSeekV41Model::quantizedLinearNames;
+        using DeepSeekV41Model::rms_norm_eps;
+    } model;
+    const std::string prefix="mtp.0.attn.";
+    for (const char *name : {"wq_a.weight","wkv.weight","wq_b.weight"})
+        model.quantizedLinearNames.insert(prefix+name);
+    int count=0;
+    for (int inner : {512,5120}) for (int type : {GGML_TYPE_Q8_0,GGML_TYPE_Q5_K}) {
+        for (auto item : {std::pair<const char*,int>{"wq_a.weight",1280},{"wkv.weight",512}}) {
+            Data w(DATA_GGUF_FORMAT,type,{item.second,inner}); w.disableGGUFRepack=true;
+            std::vector<float> values(size_t(item.second)*inner);
+            for(size_t i=0;i<values.size();++i)values[i]=.04f*std::sin(float(i%1013));
+            w.CreateFromOriData(WeightType::LINEAR,FLOAT32,(uint8_t*)values.data(),nullptr,nullptr);
+            model.weight[prefix+item.first].CopyFrom(w);
+        }
+        Fill(model.weight[prefix+"q_norm.weight"],{1280},FLOAT32,3,1.3f);
+        Fill(model.weight[prefix+"kv_norm.weight"],{512},FLOAT32,4,.7f);
+        const int savedThreshold = FastllmCudaGetLinearExactBatchThreshold();
+        for(int threshold : {0,9}) for(int rows : {1,2,3,4,5,6,7,8}) for(float amplitude : {0.f,.8f,256.f}) {
+            FastllmCudaSetLinearExactBatchThreshold(threshold);
+            Data x,xq,q,k,qn,kn,qq,iq,raw,actualQ,actualQuant,actualK;
+            Fill(x,{1,rows,inner},BFLOAT16,1,amplitude); Quant(x,xq);
+            Linear(xq,model.weight[prefix+"wq_a.weight"],Data(),q);
+            Linear(xq,model.weight[prefix+"wkv.weight"],Data(),k);
+            RMSNorm(q,model.weight[prefix+"q_norm.weight"],model.rms_norm_eps,qn);
+            RMSNorm(k,model.weight[prefix+"kv_norm.weight"],model.rms_norm_eps,kn); Quant(qn,qq);
+            const bool prepared=model.DsparkPrepareQkv(0,x,iq,raw,actualQ,actualQuant,actualK);
+            // SM100+ retains its ordinary eight-row GGUF dispatch.
+            if (rows==8 && FastllmCudaRuntimeArch()>=100) {
+                Require(!prepared,"GGUF model QKV bypassed the eight-row fallback");
+                ++count;
+                continue;
+            }
+            Require(prepared,"GGUF model QKV rejected");
+            Require(Bits(xq)==Bits(iq) && Bits(q)==Bits(raw) && Bits(qn)==Bits(actualQ) &&
+                    Bits(qq)==Bits(actualQuant) && Bits(kn)==Bits(actualK),"GGUF model QKV changed original boundaries");
+            ++count;
+        }
+        FastllmCudaSetLinearExactBatchThreshold(savedThreshold);
+    }
+    printf("PASS GGUF model QKV: %d bitwise cases\n",count);
+    return count;
+}
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     try {
         ApplyDeviceMap({{"cuda:0", 1}}, 0, 1);
         FastllmCudaSetDevice(0);
-        const int cases = NormCases() + ProjectionCases();
+        const int cases = NormCases() + ProjectionCases() + GgufModelCases();
         const int merged = MergedCases();
         std::printf("PASS %d merged projection cases with independent FP64 oracle\n", merged);
         std::printf("PASS V4.1 QKV preparation: %d exact cases plus graph/fallback checks\n", cases);
