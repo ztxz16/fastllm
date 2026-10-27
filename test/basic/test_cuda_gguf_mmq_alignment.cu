@@ -158,18 +158,21 @@ static void TestGroupedWoA(int tokens) {
 }
 
 template<typename T>
-static void TestGroupedGemvExact(int groups, int columns, int outputs) {
+static void TestGroupedGemvExact(int groups, int columns, int outputs, int tokens) {
     using namespace fastllm;
     const auto dtype = std::is_same<T,float>::value ? FLOAT32 :
         std::is_same<T,half>::value ? FLOAT16 : BFLOAT16;
-    Data input(dtype, {1,1,groups,columns});
+    const int batch = tokens%2 == 0 ? 2 : 1;
+    Data input(dtype, {batch,tokens/batch,groups,columns});
     Data weight(DATA_GGUF_FORMAT, GGML_TYPE_Q5_K, {groups,outputs,columns});
-    Data output, reference(dtype, {1,1,groups*outputs}), bias;
+    Data output, reference(dtype, {tokens+1,outputs}), groupedInput(dtype,{tokens,columns}), bias;
     input.Allocate(false); weight.Allocate(false);
     const auto packed = Weights(GGML_TYPE_Q5_K, groups*outputs, columns);
     memcpy(weight.cpuData, packed.data(), packed.size());
     input.ToDevice(CUDA, {0}, false); weight.ToDevice(CUDA, {0}, true);
     reference.ToDevice(CUDA, {0}, false); reference.Allocate(false);
+    groupedInput.ToDevice(CUDA, {0}, false); groupedInput.Allocate(false);
+    Cuda(cudaMemset(input.cudaData,0,size_t(tokens)*groups*columns*sizeof(T)));
     const size_t groupBytes = weight.Count(0) / groups;
     weight.strides.clear();
     auto run = [&] { Check(FastllmCudaGGUFGroupedGemv(input, weight, groups, outputs, output),
@@ -186,29 +189,79 @@ static void TestGroupedGemvExact(int groups, int columns, int outputs) {
     Check(FastllmCudaGraphMemoryPoolEnd(reserved), "grouped graph pool end");
     Cuda(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
     for (int pass=0; pass<3; ++pass) {
-        std::vector<T> values(groups*columns), actual(groups*outputs), expected(groups*outputs);
+        std::vector<T> values(tokens*groups*columns), actual(tokens*groups*outputs), expected(actual.size());
         for (size_t i=0; i<values.size(); ++i) values[i]=T(std::sin(float(i*17+pass*13))*.25f);
         Cuda(cudaMemcpy(input.cudaData, values.data(), values.size()*sizeof(T), cudaMemcpyHostToDevice));
         if (pass) Cuda(cudaGraphLaunch(executable, cudaStreamPerThread)); else run();
         for (int g=0; g<groups; ++g) {
-            Data x,y,w;
-            x.FakeFrom(input, size_t(g)*columns*sizeof(T)); x.Resize({1,columns});
-            y.FakeFrom(reference, size_t(g)*outputs*sizeof(T)); y.Resize({1,outputs});
+            std::vector<T> groupValues(size_t(tokens)*columns), groupOutput(size_t(tokens)*outputs);
+            for (int r=0; r<tokens; ++r)
+                memcpy(groupValues.data()+size_t(r)*columns,values.data()+size_t(r*groups+g)*columns,columns*sizeof(T));
+            Cuda(cudaMemcpy(groupedInput.cudaData,groupValues.data(),groupValues.size()*sizeof(T),cudaMemcpyHostToDevice));
+            Data w;
             w.FakeFrom(weight, g*groupBytes); w.ggmlType=GGML_TYPE_Q5_K; w.dims={outputs,columns};
+            Cuda(cudaMemset(reference.cudaData,0x5a,reference.GetBytes()));
             if constexpr (std::is_same<T,float>::value)
-                Check(FastllmCudaMatMulFloatGGUF(x,w,bias,y,1,columns,outputs), "ordinary GEMV");
+                Check(FastllmCudaMatMulFloatGGUF(groupedInput,w,bias,reference,tokens,columns,outputs), "ordinary GEMV");
             else if constexpr (std::is_same<T,half>::value)
-                Check(FastllmCudaHalfMatMulGGUF(x,w,bias,y,1,columns,outputs), "ordinary GEMV");
-            else Check(FastllmCudaBFloat16MatMulGGUF(x,w,bias,y,1,columns,outputs), "ordinary GEMV");
+                Check(FastllmCudaHalfMatMulGGUF(groupedInput,w,bias,reference,tokens,columns,outputs), "ordinary GEMV");
+            else Check(FastllmCudaBFloat16MatMulGGUF(groupedInput,w,bias,reference,tokens,columns,outputs), "ordinary GEMV");
+            Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+            Cuda(cudaMemcpy(groupOutput.data(),reference.cudaData,groupOutput.size()*sizeof(T),cudaMemcpyDeviceToHost));
+            std::vector<unsigned char> guard(size_t(outputs)*sizeof(T));
+            Cuda(cudaMemcpy(guard.data(),static_cast<char *>(reference.cudaData)+groupOutput.size()*sizeof(T),
+                            guard.size(),cudaMemcpyDeviceToHost));
+            for (auto value : guard) Check(value==0x5a, "ordinary GEMV overwrote output guard");
+            for (int r=0; r<tokens; ++r)
+                memcpy(expected.data()+size_t(r*groups+g)*outputs,groupOutput.data()+size_t(r)*outputs,outputs*sizeof(T));
         }
         Cuda(cudaStreamSynchronize(cudaStreamPerThread));
         Cuda(cudaMemcpy(actual.data(), output.cudaData, actual.size()*sizeof(T), cudaMemcpyDeviceToHost));
-        Cuda(cudaMemcpy(expected.data(), reference.cudaData, expected.size()*sizeof(T), cudaMemcpyDeviceToHost));
         Check(!memcmp(actual.data(), expected.data(), actual.size()*sizeof(T)),
               "grouped GEMV must be bitwise equal to independent GEMVs, including graph replay");
     }
     Cuda(cudaGraphExecDestroy(executable)); Cuda(cudaGraphDestroy(graph));
     FastllmCudaGraphMemoryPoolRelease(reserved);
+}
+
+template<typename T, ggml_type Type = GGML_TYPE_Q8_0>
+static void TestQuantizedBatchExact(int rows,int columns,int outputs) {
+    using namespace fastllm;
+    constexpr bool bf16=std::is_same<T,__nv_bfloat16>::value;
+    const auto dtype=std::is_same<T,float>::value?FLOAT32:bf16?BFLOAT16:FLOAT16;
+    Data x(dtype,{rows,columns}),w(DATA_GGUF_FORMAT,Type,{outputs,columns}),y(dtype,{rows+1,outputs}),bias;
+    x.Allocate();w.Allocate();
+    if constexpr (Type == GGML_TYPE_Q8_0) {
+        auto *blocks=reinterpret_cast<block_q8_0 *>(w.cpuData);
+        for(size_t i=0;i<w.GetBytes()/sizeof(block_q8_0);++i) {
+            blocks[i].d=__float2half_rn(std::ldexp(.007f,int(i%9)-4));
+            for(int j=0;j<32;++j)blocks[i].qs[j]=int((i*17+j*23)%256)-128;
+        }
+    } else {
+        const auto packed=Weights(Type,outputs,columns);
+        memcpy(w.cpuData,packed.data(),packed.size());
+    }
+    for(int i=0;i<rows*columns;++i)reinterpret_cast<T *>(x.cpuData)[i]=T(std::sin(i*.37f)*std::ldexp(1.f,(i/32)%7-3));
+    x.ToDevice(CUDA,{0},true);w.ToDevice(CUDA,{0},true);y.ToDevice(CUDA,{0},false);y.Allocate();
+    Cuda(cudaMemset(y.cudaData,0x5a,y.GetBytes()));
+    auto run=[&](Data &a,Data &b,int n) {
+        if constexpr(std::is_same<T,float>::value)Check(FastllmCudaMatMulFloatGGUF(a,w,bias,b,n,columns,outputs),"GGUF FP32 failed");
+        else if constexpr(bf16)Check(FastllmCudaBFloat16MatMulGGUF(a,w,bias,b,n,columns,outputs),"GGUF BF16 failed");
+        else Check(FastllmCudaHalfMatMulGGUF(a,w,bias,b,n,columns,outputs),"GGUF half failed");
+    };
+    run(x,y,rows);
+    std::vector<unsigned char> actual(y.GetBytes()),expected(size_t(rows)*outputs*sizeof(T));
+    Cuda(cudaMemcpy(actual.data(),y.cudaData,actual.size(),cudaMemcpyDeviceToHost));
+    for(int row=0;row<rows;++row) {
+        Data xi,yi(dtype,{1,outputs});xi.FakeFrom(x,size_t(row)*columns*sizeof(T));xi.Resize({1,columns});
+        yi.ToDevice(CUDA,{0},false);yi.Allocate();run(xi,yi,1);
+        Cuda(cudaMemcpy(expected.data()+size_t(row)*outputs*sizeof(T),yi.cudaData,yi.GetBytes(),cudaMemcpyDeviceToHost));
+    }
+    if (memcmp(actual.data(),expected.data(),expected.size())) {
+        fprintf(stderr,"GGUF exact mismatch type=%d dtype=%d rows=%d K=%d N=%d threshold=%d\n",int(Type),int(dtype),rows,columns,outputs,FastllmCudaGetLinearExactBatchThreshold());
+        throw std::runtime_error("GGUF batch differs from single-row arithmetic");
+    }
+    for(size_t i=expected.size();i<actual.size();++i)Check(actual[i]==0x5a,"GGUF batch overwrote output guard");
 }
 
 int main() {
@@ -224,12 +277,38 @@ int main() {
             std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: MMQ requires SM75+");
             return 0;
         }
-        for (int groups : {1,3,8}) {
-            TestGroupedGemvExact<float>(groups, 256, 129);
-            TestGroupedGemvExact<half>(groups, 4096, 1024);
-            TestGroupedGemvExact<__nv_bfloat16>(groups, 4096, 1024);
+        const int savedThreshold = fastllm::FastllmCudaGetLinearExactBatchThreshold();
+        // Explicit exact-batch mode retains the single-token reduction tree.
+        fastllm::FastllmCudaSetLinearExactBatchThreshold(9);
+        for (int rows : {1,2,3,4,5,6,7,8}) for (int columns : {256,768,5120}) for (int outputs : {129,512,1280}) {
+            TestQuantizedBatchExact<half>(rows,columns,outputs);
+            TestQuantizedBatchExact<__nv_bfloat16>(rows,columns,outputs);
         }
-        for (int tokens : {1, 33, 1025}) {
+        for (int rows : {1,2,3,4,5,6,7,8})
+            for (int columns : {1024,1280,1536,1792,2048,2304,2560,2816})
+                for (int outputs : {129,2049}) {
+                    TestQuantizedBatchExact<float,GGML_TYPE_Q5_K>(rows,columns,outputs);
+                    TestQuantizedBatchExact<half,GGML_TYPE_Q5_K>(rows,columns,outputs);
+                    TestQuantizedBatchExact<__nv_bfloat16,GGML_TYPE_Q5_K>(rows,columns,outputs);
+                }
+        // The independent grouped GEMV keeps the legacy reduction tree.
+        // Check ordinary B5-B8 as well as exact-batch mode and its boundary,
+        // including odd output tails and replay with different activations.
+        for (int threshold : {0,6,9}) {
+            fastllm::FastllmCudaSetLinearExactBatchThreshold(threshold);
+            for (int tokens : {1,2,3,4,5,6,7,8}) for (int columns : {1280,2304}) {
+                TestGroupedGemvExact<float>(3, columns, 2049, tokens);
+                TestGroupedGemvExact<half>(3, columns, 2049, tokens);
+                TestGroupedGemvExact<__nv_bfloat16>(3, columns, 2049, tokens);
+            }
+        }
+        fastllm::FastllmCudaSetLinearExactBatchThreshold(savedThreshold);
+        for (int tokens : {1,2,3,4,5,6,7,8}) for (int groups : {1,3,8}) {
+            TestGroupedGemvExact<float>(groups, 256, 129, tokens);
+            TestGroupedGemvExact<half>(groups, 768, 257, tokens);
+            TestGroupedGemvExact<__nv_bfloat16>(groups, 4096, 1024, tokens);
+        }
+        for (int tokens : {1, 5, 8, 9, 17, 33, 1025}) {
             TestGroupedWoA<float>(tokens);
             TestGroupedWoA<__half>(tokens);
             TestGroupedWoA<__nv_bfloat16>(tokens);
