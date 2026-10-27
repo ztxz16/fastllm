@@ -2089,10 +2089,17 @@ struct FastllmCudaMoeExpertParallelStats {
     // gpuRoutes includes temporary uploads; the difference is streamed work.
     std::vector<uint64_t> residentRoutes;
 };
+#if defined(_WIN32) || defined(_WIN64)
+// MSVC requires C++ linkage for functions returning nontrivial C++ objects.
+extern "C++" {
+#endif
 std::shared_ptr<FastllmCudaMoeExpertParallel> FastllmCudaCreateMoeExpertParallel(int ranks);
 // Read only between calls, after all ranks have finished expert dispatch.
 FastllmCudaMoeExpertParallelStats FastllmCudaGetMoeExpertParallelStats(
         const FastllmCudaMoeExpertParallel &state);
+#if defined(_WIN32) || defined(_WIN64)
+}
+#endif
 // Capture the single-row routing readback after an established EP warmup.
 // Buffers remain owned by state; callers must retain it for the graph lifetime.
 bool FastllmCudaMoeExpertParallelReadback(FastllmCudaMoeExpertParallel &state, int rank,
