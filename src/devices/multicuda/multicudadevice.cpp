@@ -30,6 +30,10 @@
 #include <tuple>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <strings.h>
+#endif
+
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
@@ -37,6 +41,14 @@
 #endif
 
 namespace fastllm {
+    static bool MultiCudaEnvIsTrue(const char *value) {
+#if defined(_WIN32)
+        return !strcmp(value, "1") || !_stricmp(value, "true");
+#else
+        return !strcmp(value, "1") || !strcasecmp(value, "true");
+#endif
+    }
+
     static void SyncCudaAndCheck(int device, const char *where);
     void DeviceGetInfos(int deviceId, std::string &specialId, int &mallocType);
 
@@ -5895,7 +5907,7 @@ namespace fastllm {
             data.dataType != DataType::BFLOAT16 ||
             data.Count(0) > (uint64_t)std::numeric_limits<int>::max()) return false;
         if (const char *disabled = getenv("FASTLLM_DISABLE_NCCL")) {
-            if (!strcmp(disabled, "1") || !strcasecmp(disabled, "true")) return false;
+            if (MultiCudaEnvIsTrue(disabled)) return false;
         }
         // FP16 ToDataType uses round-toward-zero, while the custom
         // collective rounds to nearest. Keep that dtype on its original path.
@@ -5939,7 +5951,7 @@ namespace fastllm {
         }
         bool useNccl = FastllmInitNccl(devices);
         if (const char *disabled = getenv("FASTLLM_DISABLE_NCCL")) {
-            if (!strcmp(disabled, "1") || !strcasecmp(disabled, "true")) useNccl = false;
+            if (MultiCudaEnvIsTrue(disabled)) useNccl = false;
         }
         if (useNccl) {
             if (!MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
