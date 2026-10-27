@@ -2375,10 +2375,11 @@ namespace fastllm {
                 }
                 return future;
             }
-            std::packaged_task<std::unique_ptr<DiskCachedExpert>()> next(
+            auto next = std::make_shared<std::packaged_task<std::unique_ptr<DiskCachedExpert>()>>(
                 [=] { return ReadDiskExpert(gate, down, repackCpu); });
-            auto future = next.get_future();
-            Submit(Task([next = std::move(next)]() mutable { next(); }), parallelism);
+            auto future = next->get_future();
+            // MSVC's packaged_task implementation stores a copyable callback.
+            Submit(Task([next] { (*next)(); }), parallelism);
             return future;
         }
         std::future<void> Submit(Task next, int parallelism = 1) {
