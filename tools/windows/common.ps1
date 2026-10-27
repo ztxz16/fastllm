@@ -36,9 +36,14 @@ function Get-FastllmCMake([string]$Requested = "") {
 function Get-FastllmCudaArch {
     # Keep the Windows release defaults aligned with the Linux wheel script.
     $source = Get-Content -LiteralPath (Join-Path $RepoRoot "make_whl.sh") -Raw -Encoding UTF8
-    $match = [regex]::Match($source, '(?m)^CUDA_ARCH_LIST="([^"]+)"')
-    if (-not $match.Success) { throw "Cannot read CUDA_ARCH_LIST from make_whl.sh." }
-    return $match.Groups[1].Value
+    foreach ($pattern in @(
+        '(?m)^CUDA_ARCH_LIST=\$\{CUDA_ARCH_LIST:-[''"]([^''"]+)[''"]\}',
+        '(?m)^CUDA_ARCH_LIST=[''"]([^''"]+)[''"]'
+    )) {
+        $match = [regex]::Match($source, $pattern)
+        if ($match.Success) { return $match.Groups[1].Value }
+    }
+    throw "Cannot read CUDA_ARCH_LIST from make_whl.sh."
 }
 
 function Get-FastllmRuntimeLock {
