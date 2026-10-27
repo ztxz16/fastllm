@@ -189,7 +189,30 @@ void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width) {
     cache.Expansion({1, capacity, width});
 }
 
+// Page-index vectors are owned by the current rank task until this returns.
+// Complete every upload before callers can reuse their host storage or capture
+// a graph. General cache preparation keeps its original synchronous path.
+void NaiveN05FlashModel::UploadPagedCacheTables(const std::vector<Data *> &pendingPageTables) {
+#ifdef USE_CUDA
+    if (pendingPageTables.empty()) return;
+    try {
+        for (Data *cache : pendingPageTables)
+            FastllmCudaCopyFromHostToDeviceAsync(cache->cudaData, cache->pageIndex.data(),
+                cache->pageIndex.size() * sizeof(int), cudaStreamPerThread);
+    } catch (...) {
+        FastllmCudaSyncCurrentThreadStream();
+        throw;
+    }
+    FastllmCudaSyncCurrentThreadStream();
+#endif
+}
+
 bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manager, int end) {
+    return PreparePagedCache(cache, manager, end, nullptr);
+}
+
+bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manager, int end,
+                                         std::vector<Data *> *pendingPageTables) {
 #ifdef USE_CUDA
     const int width = manager.dims[3], capacity = std::min(max_positions,
         std::min(tokensLimit > 0 ? tokensLimit : INT_MAX, manager.maxPages * manager.pageLen));
@@ -253,7 +276,10 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
         changed = true;
     }
     if (changed) {
-        FastllmCudaCopyFromHostToDevice(cache.cudaData, cache.pageIndex.data(), cache.pageIndex.size() * sizeof(int));
+        if (pendingPageTables)
+            pendingPageTables->push_back(&cache);
+        else
+            FastllmCudaCopyFromHostToDevice(cache.cudaData, cache.pageIndex.data(), cache.pageIndex.size() * sizeof(int));
         tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
     }
     cache.lastPageLen = previous ? (previous - 1) % cache.pageLen + 1 : 0;
@@ -480,9 +506,12 @@ std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputId
         AssertInFastLLM(seqLens[b] > 0 && positionIds[b] &&
             (b >= (int)attentionMask.size() || !attentionMask[b] || attentionMask[b]->dims.empty()),
             "Naive batch expects unpadded sequences with explicit positions.");
-        for (int layer = 0; layer < block_cnt; ++layer)
-            AssertInFastLLM(pastKeyValues[b * block_cnt + layer].first &&
-                pastKeyValues[b * block_cnt + layer].second, "Naive batch has a null KV descriptor.");
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            // Keep every KV check, but construct its diagnostic only on failure.
+            if (!pastKeyValues[b * block_cnt + layer].first ||
+                !pastKeyValues[b * block_cnt + layer].second)
+                AssertInFastLLM(false, "Naive batch has a null KV descriptor.");
+        }
         const auto &key = requests.Key(b, 0);
         const int past = key.dims.empty() ? 0 : key.dims[1];
         AssertInFastLLM((int64_t)past + seqLens[b] <= max_positions,

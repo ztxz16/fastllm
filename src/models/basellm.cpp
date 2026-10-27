@@ -3104,10 +3104,14 @@ namespace fastllm {
                             return true;
                         };
                         std::vector <std::pair <int, int> > orders;
+                        bool hasPrefillRequests = false;
                         for (auto &it : model->responseContextDict.dicts) {
+                            hasPrefillRequests |= it.second->curTokens == 0;
                             orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
                         }
-                        if (batchPrefill) {
+                        // Without prefill requests the admission comparator reduces
+                        // to pair ordering; avoid a map lookup on every comparison.
+                        if (batchPrefill && hasPrefillRequests) {
                             // Preserve admission order while gathering. Restoring a
                             // prefix shortens currentTokens; sorting by that length
                             // would otherwise keep pinning new requests' KV pages.

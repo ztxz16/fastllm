@@ -1288,18 +1288,26 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             std::vector<std::vector<int>> limits(tpDevices.size(), std::vector<int>(growing.size(), INT_MAX));
             runRanks([&](int rank) {
                 FastllmCudaSetDevice(tpDevices[rank]);
-                for (size_t i = 0; i < growing.size(); ++i) {
-                    const int row = growing[i], next = key(row, 0).dims[1] + 1;
-                    for (int layer = 0; layer < block_cnt; ++layer) if (!slidingLayers[layer])
-                    for (int part = 0; part < 2; ++part) {
-                        Data &root = part ? value(row, layer) : key(row, layer);
-                        Data &local = *root.multiDeviceDatas.at(tpDevices[rank]);
-                        changes[rank] += PreparePagedCache(local,
-                            *tpPagedCaches[rank][layer * 2 + part], next);
-                        limits[rank][i] = std::min(limits[rank][i],
-                            (int)local.pageIndex.size() * local.pageLen);
+                std::vector<Data *> pendingPageTables;
+                try {
+                    for (size_t i = 0; i < growing.size(); ++i) {
+                        const int row = growing[i], next = key(row, 0).dims[1] + 1;
+                        for (int layer = 0; layer < block_cnt; ++layer) if (!slidingLayers[layer])
+                        for (int part = 0; part < 2; ++part) {
+                            Data &root = part ? value(row, layer) : key(row, layer);
+                            Data &local = *root.multiDeviceDatas.at(tpDevices[rank]);
+                            changes[rank] += PreparePagedCache(local,
+                                *tpPagedCaches[rank][layer * 2 + part], next, &pendingPageTables);
+                            limits[rank][i] = std::min(limits[rank][i],
+                                (int)local.pageIndex.size() * local.pageLen);
+                        }
                     }
+                } catch (...) {
+                    // Preserve completed cache updates if a later allocation fails.
+                    UploadPagedCacheTables(pendingPageTables);
+                    throw;
                 }
+                UploadPagedCacheTables(pendingPageTables);
             });
             for (size_t i = 0; i < growing.size(); ++i) {
                 int limit = INT_MAX;
