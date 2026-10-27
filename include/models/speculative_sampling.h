@@ -4,7 +4,10 @@
 #include "utils/utils.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <numeric>
+#include <limits>
 
 namespace fastllm {
 
@@ -42,6 +45,50 @@ inline std::vector<float> SpeculativeTopKDistribution(
         [&](int i) { return candidates[i * 2 + 1]; });
 }
 
+// Stable radix sorting preserves the score-descending/token-ID-ascending order
+// of the comparison sort. Full-vocabulary top-p otherwise builds a large heap
+// for every draft and verified position. Small/unsupported inputs retain that
+// generic implementation; finite top-k still uses partial_sort.
+inline bool SortSpeculativeVocabulary(const std::vector<float> &values,
+                                      std::vector<int> &order) {
+    if (order.size() < 1024 || !std::numeric_limits<float>::is_iec559 ||
+        sizeof(float) != sizeof(uint32_t)) return false;
+    std::vector<uint32_t> keys(values.size());
+    uint32_t usedBits = 0;
+    for (int token : order) {
+        float value = values[token];
+        if (!std::isfinite(value)) return false;
+        // Both zeros compare equal in the original comparator.
+        if (value == 0.0f) value = 0.0f;
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        usedBits |= bits;
+        keys[token] = bits & 0x80000000u ? bits : ~bits ^ 0x80000000u;
+    }
+    // BF16 (and other exactly representable values) need fewer radix passes.
+    // Dropping common zero low bits preserves float ordering across both signs.
+    unsigned firstByte = 0;
+    while (firstByte < 32 && (usedBits & 255u) == 0) {
+        firstByte += 8;
+        usedBits >>= 8;
+    }
+    std::vector<int> scratch(order.size());
+    for (unsigned shift = firstByte; shift < 32; shift += 8) {
+        size_t offsets[256] = {};
+        for (int token : order) ++offsets[(keys[token] >> shift) & 255u];
+        size_t position = 0;
+        for (size_t &offset : offsets) {
+            size_t count = offset;
+            offset = position;
+            position += count;
+        }
+        for (int token : order)
+            scratch[offsets[(keys[token] >> shift) & 255u]++] = token;
+        order.swap(scratch);
+    }
+    return true;
+}
+
 // The same temperature, repetition, top-k and top-p order as LLMSampling.
 // Keep the complete, normalized proposal distribution: rejection sampling
 // needs q for every token, including tokens the draft did not select.
@@ -69,9 +116,11 @@ inline std::vector<float> SpeculativeDistribution(
     AssertInFastLLM(!order.empty(), "Empty speculative sampling support.");
     int count = std::min<int>(std::max(1, config.top_k), order.size());
     if (config.temperature <= 0) count = 1;
-    std::partial_sort(order.begin(), order.begin() + count, order.end(), [&](int a, int b) {
-        return values[a] > values[b] || (values[a] == values[b] && a < b);
-    });
+    if (count != (int)order.size() || !SortSpeculativeVocabulary(values, order)) {
+        std::partial_sort(order.begin(), order.begin() + count, order.end(), [&](int a, int b) {
+            return values[a] > values[b] || (values[a] == values[b] && a < b);
+        });
+    }
     return SpeculativeTopKDistribution(count, vocab, config,
         [&](int i) { return order[i]; }, [&](int i) { return values[order[i]]; });
 }
