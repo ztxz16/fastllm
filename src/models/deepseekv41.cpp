@@ -4172,25 +4172,7 @@ namespace fastllm {
     // ==================== 前向 ====================
 
     namespace {
-        // 只更新调度器读取的第 0 层占位 KV（kvCacheId == 0）
-        void V41UpdateStubKV(Data &key, Data &value, int totalLen) {
-            int paddedLen = (std::max(totalLen, 1) / 128 + 1) * 128;
-            std::vector<float> zeros((uint64_t)totalLen, 0.0f);
-            Data stubKey(DataType::FLOAT32, {1, totalLen, 1}, zeros);
-            Data stubValue(DataType::FLOAT32, {1, totalLen, 1}, zeros);
-            stubKey.SetKVCache();
-            stubValue.SetKVCache();
-            stubKey.Expansion({1, paddedLen, 1});
-            stubValue.Expansion({1, paddedLen, 1});
-            key.FreeSpace();
-            value.FreeSpace();
-            key = Data();
-            value = Data();
-            key.CopyFrom(stubKey);
-            value.CopyFrom(stubValue);
-            key.SetKVCache();
-            value.SetKVCache();
-        }
+        #include "deepseekv41-stub-kv.inc"
 
         int V41FirstPosition(const Data *positionIds) {
             if (positionIds == nullptr || positionIds->dims.size() == 0 || positionIds->Count(0) == 0) {
