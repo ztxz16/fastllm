@@ -1663,7 +1663,7 @@ Data NaiveN05FlashModel::RunTarget(
                 addMlpResidual(moeOutput, !(tensorParallel && tpEp8MegaState));
         }
         prefillNormReady = fusePrefillNorm && mlpNormWeight;
-        if (capture && capture->collectHidden &&
+        if (capture && capture->collectHidden && tpRank <= 0 &&
             std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end())
             Copy(hidden, capture->hidden[layer]);
     }

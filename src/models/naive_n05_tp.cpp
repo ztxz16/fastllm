@@ -1045,7 +1045,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
                 buffers.sequences[sequence]->capacity = state->sequenceCapacities[sequence];
         }
         state->ranks[rank]->features.verifying = verifying;
-        state->ranks[rank]->features.collectHidden = collectHidden && rank == 0;
+        state->ranks[rank]->features.collectHidden = collectHidden;
     }
     state->disabled = false;
     state->active = true;
@@ -1448,7 +1448,9 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     std::vector<TargetCapture> captures(capture || recording ? tpDevices.size() : 0);
     for (int rank = 0; rank < (int)captures.size(); ++rank) {
         captures[rank].verifying = verify;
-        captures[rank].collectHidden = capture && capture->collectHidden && rank == 0;
+        // EP prefill collectives must see the same feature requirement on every rank.
+        // RunTarget keeps the actual feature copies on rank zero.
+        captures[rank].collectHidden = capture && capture->collectHidden;
         if (recording) captures[rank].prefixes = prefixes;
     }
     std::vector<Data> logits(compact || cudaSampling ? 0 : tpDevices.size());
