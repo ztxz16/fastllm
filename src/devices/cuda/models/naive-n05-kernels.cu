@@ -5047,6 +5047,32 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
         CheckLaunch();
         return;
     }
+    if (rows > 1 && !window && dim == 192 && valueDim == 128 &&
+        heads % kvHeads == 0 && (capacity <= 2048 || !indices.dims.empty())) {
+        // Each verification row shares the cache but has its own causal length
+        // and sparse selection. Device length pointers also stay valid on replay.
+        FastllmNaiveKV k(key), v(value);
+        std::vector<FastllmNaiveDSARow> batch(rows);
+        for (int row = 0; row < rows; ++row) {
+            auto &r = batch[row];
+            r.key = k.base;
+            r.value = v.base;
+            r.keyPages = k.pages;
+            r.valuePages = v.pages;
+            r.pageLen = k.pageLen;
+            r.fp8 = k.fp8;
+            r.capacity = capacity;
+            r.keyStride = key.dims[2];
+            r.liveKeys = (const int *)liveKeys.cudaData + row;
+            if (!indices.dims.empty()) {
+                r.indices = (const int *)indices.cudaData + (size_t)row * 2048;
+                r.selectedCount = 2048;
+            }
+        }
+        FastllmCudaNaiveBatchDSADecode(query, sink, batch, heads, kvHeads,
+                                      dim, valueDim, scratch, output);
+        return;
+    }
     const bool grouped = heads % kvHeads == 0 && (heads / kvHeads) % 4 == 0;
     const bool shared = grouped && (heads / kvHeads) % kDecodeSharedHeads == 0;
     if (rows > 1 && !window && !indices.dims.empty() && grouped && !shared &&

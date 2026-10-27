@@ -635,6 +635,12 @@ int main() {
         }
         TestVerifyGraph(0, 256, {3, 120, 127, 248, 7}, true);
         TestVerifyGraph(0, 2047, {256, 511, 2039, 257}, true);
+        // Multiple queries must keep separate causal lengths even when the
+        // shared cache contains all candidates, including after length rollback.
+        for (int rows : {2, 7, 8})
+            for (int capacity : {512, 1024})
+                TestVerifyGraph(0, capacity, {1, 255, capacity - rows, 63}, true, rows);
+
         for (int w : {8, 128})
             TestVerifyGraph(w, 256, {3, 120, 127, 128, 32768, 7}, true);
         for (bool fp8 : {false, true})
