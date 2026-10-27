@@ -4874,7 +4874,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                     const bool reuseQueries = heads >= 32 && count >= 128;
                     const bool reuseHeads = seqlen >= 4 && reuseQueries;
                     if (reuseQueries)
-                        V41Sm75QuantizedAttentionScores<multi, 2><<<dim3((count + 7) / 8, (heads + 3) / 4, seqlen), 128, 0, cudaStreamPerThread>>>(
+                        V41Sm75QuantizedAttentionScores<multi, 4, 16><<<dim3((count + 15) / 16, (heads + 3) / 4, seqlen), 128, 0, cudaStreamPerThread>>>(
                             static_cast<const __nv_bfloat16 *>(q.cudaData), rows, valid, count, heads, scores);
                     else
                         V41Sm75QuantizedAttentionScores<multi><<<dim3((count + 3) / 4, (heads + 3) / 4, seqlen), 128, 0, cudaStreamPerThread>>>(
