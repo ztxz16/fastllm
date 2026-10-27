@@ -1815,6 +1815,22 @@ bool NaiveN05FlashModel::HasVerificationGraph() const {
 #endif
 }
 
+#ifdef USE_CUDA
+struct NaiveN05FlashModel::DraftHeadState {
+    int device;
+    std::vector<std::unique_ptr<Executor>> executors;
+    void *ready;
+    explicit DraftHeadState(const std::vector<int> &ids)
+        : device(ids.front()), executors(ids.size()), ready(FastllmCudaEventCreate()) {}
+    ~DraftHeadState() {
+        const int previous = FastllmCudaGetDevice();
+        FastllmCudaSetDevice(device);
+        FastllmCudaEventDestroy(ready);
+        FastllmCudaSetDevice(previous);
+    }
+};
+#endif
+
 Data NaiveN05FlashModel::RunDraftHead(Data &hidden) {
     if (tpDevices.empty()) {
         Data output;
@@ -1840,29 +1856,34 @@ Data NaiveN05FlashModel::RunDraftHead(Data &hidden) {
         tpDraftHeadOutput.Resize({1, rows, vocab});
         tpDraftHeadOutput.ToDevice(DataDevice::CUDA, std::vector<int>{owner}, false);
         tpDraftHeadOutput.Allocate(false);
-        struct ReadyEvent {
-            void *event = FastllmCudaEventCreate();
-            ~ReadyEvent() { FastllmCudaEventDestroy(event); }
-        } ready;
-        FastllmCudaEventRecordCurrentThread(ready.event);
+        // TP devices stay fixed after weight registration.
+        if (!tpDraftHeadState)
+            tpDraftHeadState = std::make_shared<DraftHeadState>(tpDevices);
+        auto &state = *tpDraftHeadState;
+        FastllmCudaEventRecordCurrentThread(state.ready);
         std::vector<std::exception_ptr> errors(tpDevices.size());
         tpWorkers.Run(tpDevices, [&](int rank) {
             const int device = tpDevices[rank];
             FastllmCudaSetDevice(device);
-            Executor executor;
-            executor.SetFirstDevice("cuda:" + std::to_string(device));
+            // Workers retain their dispatcher; its operator registry is
+            // independent of the hidden rows and vocabulary shard contents.
+            auto &executor = state.executors[rank];
+            if (!executor) {
+                executor = std::make_unique<Executor>();
+                executor->SetFirstDevice("cuda:" + std::to_string(device));
+            }
             struct Restore {
                 void *previous;
                 ~Restore() { SetCurrentThreadExecutor(previous); }
             } restore{GetExecutor()};
-            SetCurrentThreadExecutor(&executor);
+            SetCurrentThreadExecutor(executor.get());
             Data &input = tpDraftHeadInputs[rank], &logits = tpDraftHeadLogits[rank];
             input.dataType = BFLOAT16;
             input.UpdateUnitSize();
             input.Resize(hidden.dims);
             input.ToDevice(DataDevice::CUDA, std::vector<int>{device}, false);
             input.Allocate(false);
-            FastllmCudaCurrentThreadStreamWaitEvent(ready.event);
+            FastllmCudaCurrentThreadStreamWaitEvent(state.ready);
             AssertInFastLLM(FastllmCudaMemcpyPeerAsyncCurrentThread(device, input.cudaData,
                 owner, hidden.cudaData, hidden.GetBytes()), "Naive draft head input copy failed.");
             Data &head = *weight["lm_head.weight"].multiDeviceDatas.at(device);

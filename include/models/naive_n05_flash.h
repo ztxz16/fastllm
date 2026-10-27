@@ -298,6 +298,8 @@ namespace fastllm {
         std::vector<std::shared_ptr<TargetWorkspace>> tpBatchWorkspaces;
         std::vector<Data> tpDraftHeadInputs, tpDraftHeadLogits;
         Data tpDraftHeadOutput;
+        struct DraftHeadState;
+        std::shared_ptr<DraftHeadState> tpDraftHeadState;
         PersistentWorkerGroup tpWorkers;
         std::vector<std::vector<std::vector<Data *>>> tpMoeWeights, tpMoeBiases;
         std::vector<std::pair<int, int>> tpVocabRanges;
