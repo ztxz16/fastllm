@@ -1000,7 +1000,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     state->cachePointers = std::move(pointers);
     state->cacheCapacities = std::move(capacities);
     state->ncclGeneration = generation;
-    // Verification keeps all causal rows replicated in the resident EP arena.
+    // Decode and verification share the resident EP dispatch arena.
     // Its descriptors and barriers are prepared before capture, as for BS1.
     for (int rank = 0; rank < ranks; ++rank) {
         FastllmCudaSetDevice(tpDevices[rank]);

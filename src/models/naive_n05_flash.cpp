@@ -647,8 +647,9 @@ Data NaiveN05FlashModel::RunTarget(
     };
     int length = inputIds.dims[1];
     const int epRanks = tensorParallel ? (int)tpDevices.size() : 1;
+    // Share verification tokens across EP ranks as in batch decode.
     const bool shardMoe = tensorParallel && tpEp8MegaState && decodeWorkspace &&
-        !verifying && length >= epRanks && length % epRanks == 0;
+        length >= epRanks && length % epRanks == 0;
     // Small prefill chunks use MegaMoE's replicated (up to 64 rows) path.
     // Larger chunks dispatch contiguous token shards, including uneven tails.
     const bool shardPrefillRouter = tensorParallel && tpEp8MegaState &&
