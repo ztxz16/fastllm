@@ -4,6 +4,7 @@
 #include "naive-n05-topk.cuh"
 #include "devices/cuda/naive-n05-kv.cuh"
 #include "naive-n05-dsa-decode.cuh"
+#include "naive-n05-attention-prefetch.cuh"
 #include "naive-n05-attention-hopper.cuh"
 #include "naive-n05-prefill.cuh"
 #include "naive-n05-prefill-hopper.cuh"
@@ -4284,9 +4285,10 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
     if (bulk) {
         Output(output, BFLOAT16, {1, (int)rows.size(), heads * valueDim});
         const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
-        bool launched = false;
+        bool launched = sparse &&
+            PrefetchDSAAttention(query, bias, rows, heads, kvHeads, output);
 #if CUDART_VERSION >= 12010
-        if (dense && kvHeads == 1)
+        if (!launched && dense && kvHeads == 1)
             launched = count <= 1024 ? HopperBulkAttention<1024>(query, bias, rows, heads, output)
                                      : HopperBulkAttention<2048>(query, bias, rows, heads, output);
 #endif
@@ -4320,6 +4322,13 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
         hopper = found->second;
     }
     Output(output, BFLOAT16, {1, (int)rows.size(), heads * valueDim});
+    // Share the sparse V tile across four heads for this scalar GQA shape.
+    // Each head keeps the existing softmax tree and ordered PV accumulation.
+    // Other shapes and unsupported compiled images retain their original path.
+    const bool grouped16 = hopper && sparse && heads == 16 && kvHeads == 1 &&
+        rows.size() >= 2 && rows.size() < 32 &&
+        BulkKernelSupported(dsa::GroupedValues<2048, 4, 8, true>,
+            sizeof(dsa::GroupStorage<2048, 4, 8>), 90);
     const int chunkSize = std::min((int)rows.size(), FastllmNaiveDSABatchLimit);
     // Reuse the score workspace. Fusion and sparse partials only use shared memory.
     Output(scratch.attentionScores, FLOAT32, {chunkSize, heads, std::max(1, count)});
@@ -4335,7 +4344,7 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
             const bool sharedHeads = heads == 8 && kvHeads == 1;
             // Larger sparse batches have enough CTAs to amortize a descriptor
             // and page lookup over more keys without changing each dot product.
-            if (sharedHeads && sparse && batch >= 8)
+            if (grouped16 || (sharedHeads && sparse && batch >= 8))
                 dsa::DirectScores<16, 4><<<dim3(heads, (count + 63) / 64, batch), 128>>>(
                     q, descriptors, scores, heads, kvHeads, count);
             else if (sharedHeads && sparse && batch >= 2)
@@ -4346,7 +4355,11 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
                     q, descriptors, scores, heads, kvHeads, count);
             // Share V across heads, with wider output tiles for larger dense
             // batches. Each head retains the original softmax/PV arithmetic.
-            if (sharedHeads && dense && batch >= 3 && count <= 1024)
+            if (grouped16)
+                dsa::GroupedValues<2048, 4, 8, true><<<dim3(heads / 4, 16, batch), 1024,
+                    sizeof(dsa::GroupStorage<2048, 4, 8>)>>>(scores, bias, descriptors, out,
+                    heads, kvHeads, count);
+            else if (sharedHeads && dense && batch >= 3 && count <= 1024)
                 dsa::GroupedValues<1024, 4, 16, false><<<dim3(heads / 4, 8, batch), 1024,
                     sizeof(dsa::GroupStorage<1024, 4, 16>)>>>(scores, bias, descriptors, out,
                     heads, kvHeads, count);
@@ -4424,17 +4437,28 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
             CheckLaunch(); return;
         }
     }
-    const int threads = heads == 8 || heads == 16 ? 1024 : kSwaThreads;
-    auto kernel = threads == 1024
-        ? AttentionShortDecode<kSwaWindow, BatchSwaKeys, false, 1024, kSwaOutputTile, true>
-        : AttentionShortDecode<kSwaWindow, BatchSwaKeys, false, kSwaThreads, kSwaOutputTile, true>;
+    // Compute all output columns in one CTA instead of repeating QK and
+    // softmax for four column tiles. Arithmetic within each output is unchanged.
+    const bool wideTile = FastllmCudaRuntimeArch() == 90 && heads == 16 &&
+        (kvHeads == 1 || kvHeads == 2) &&
+        rows.size() >= 4 && rows.size() < 32;
+    const int outputTile = wideTile ? 128 : kSwaOutputTile;
+    const int threads = wideTile && rows.size() >= 16 ? 512
+        : (heads == 8 || heads == 16 ? 1024 : kSwaThreads);
+    auto kernel = wideTile
+        ? (threads == 512
+            ? AttentionShortDecode<kSwaWindow, BatchSwaKeys, false, 512, 128, true>
+            : AttentionShortDecode<kSwaWindow, BatchSwaKeys, false, 1024, 128, true>)
+        : (threads == 1024
+            ? AttentionShortDecode<kSwaWindow, BatchSwaKeys, false, 1024, kSwaOutputTile, true>
+            : AttentionShortDecode<kSwaWindow, BatchSwaKeys, false, kSwaThreads, kSwaOutputTile, true>);
     const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
     for (int first = 0; first < (int)rows.size(); first += kSwaBatchLimit) {
         const int count = std::min(kSwaBatchLimit, (int)rows.size() - first);
         BatchSwaKeys keys{};
         std::copy_n(rows.begin() + first, count, keys.rows);
         keys.length = (const int *)liveKeys.cudaData + first;
-        kernel<<<dim3(heads, count, kSwaValueDim / kSwaOutputTile), threads>>>(
+        kernel<<<dim3(heads, count, kSwaValueDim / outputTile), threads>>>(
             (const BF16 *)query.cudaData + (size_t)first * heads * kSwaQkDim,
             nullptr, nullptr, bias, (BF16 *)output.cudaData + (size_t)first * heads * kSwaValueDim,
             heads, kvHeads, kvHeads * kSwaQkDim, keys);
