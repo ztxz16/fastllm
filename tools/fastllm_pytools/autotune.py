@@ -322,7 +322,7 @@ def choose_winner(trials):
 
 def fits(candidate, args, query_gpu):
     """Re-read live CMA/cgroup/GPU limits after each child releases its model."""
-    ram = memory.host_memory(reclaim_file_cache=True)
+    ram = memory.host_memory()
     host, _, _ = memory.host_budget(args, ram)
     plan = candidate["plan"]
     if plan["host_estimated_bytes"] > host:
@@ -420,7 +420,7 @@ def probe(base, candidate, prompt, directory, deadline):
                                          calibration_error="calibration reached time budget; timed requests completed")
                             return value  # finally still reaps the process group before another load.
                     raise TimeoutError("autotune time budget exhausted (including model loading)")
-                ram = memory.host_memory(reclaim_file_cache=True)
+                ram = memory.host_memory()
                 minimum_ram = ram["available"] if minimum_ram is None else min(minimum_ram, ram["available"])
                 if ram["available"] < min(GiB, ram["total"] // 50):
                     raise RuntimeError("autotune stopped: usable non-CMA/cgroup RAM below safety floor")
@@ -470,7 +470,7 @@ def resolve(args, query_gpu):
     base = copy.deepcopy(args)
     base.auto = True
     hardware = auto.cuda_hardware()
-    ram = memory.host_memory(reclaim_file_cache=True)
+    ram = memory.host_memory()
     # Tuning reloads several processes. Leave an extra GiB for the parent and
     # ordinary free-memory drift; this is exclusive to the new entry point.
     ram["available"] = max(0, ram["available"] - GiB)

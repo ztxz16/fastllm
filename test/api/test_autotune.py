@@ -425,23 +425,35 @@ class TuningMemoryTest(unittest.TestCase):
     def stats(self, group, **values):
         (group / "memory.stat").write_text("".join("%s %d\n" % item for item in values.items()))
 
-    def test_96g_cache_pressure_does_not_change_legacy_auto(self):
+    def test_default_auto_credits_clean_file_cache(self):
         with tempfile.TemporaryDirectory() as d:
             proc, _ = self.layout(d)
-            old = memory.host_memory(proc)
-            tuned = memory.host_memory(proc, reclaim_file_cache=True)
+            old = memory.host_memory(proc, reclaim_file_cache=False)
+            tuned = memory.host_memory(proc)
             self.assertEqual(old, {"total": 96 * GiB, "available": 0, "cma": 9 * GiB})
             self.assertEqual(tuned, {"total": 96 * GiB, "available": 24 * GiB, "cma": 9 * GiB})
-            self.assertEqual(memory.host_memory(proc), old)
+            self.assertEqual(memory.host_memory(proc), tuned)
 
-    def test_mapped_shared_dirty_and_writeback_pages_are_not_credited(self):
+    def test_active_mapped_file_pages_are_credited_but_not_shared_or_dirty(self):
         with tempfile.TemporaryDirectory() as d:
             proc, child = self.layout(d)
             self.stats(child, file=24 * GiB, inactive_file=24 * GiB,
                        file_mapped=4 * GiB, shmem=3 * GiB, file_dirty=2 * GiB, file_writeback=GiB)
-            self.assertEqual(memory.host_memory(proc, reclaim_file_cache=True)["available"], 14 * GiB)
+            self.assertEqual(memory.host_memory(proc, reclaim_file_cache=True)["available"], 18 * GiB)
             self.stats(child, file=24 * GiB, inactive_file=0, active_file=24 * GiB)
-            self.assertEqual(memory.host_memory(proc, reclaim_file_cache=True)["available"], 0)
+            self.assertEqual(memory.host_memory(proc, reclaim_file_cache=True)["available"], 24 * GiB)
+
+    def test_v1_hierarchical_file_cache_credit(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc, child = self.layout(d)
+            mount = child.parent.parent
+            (proc / 'self/cgroup').write_text('3:memory:/parent/worker\n')
+            (proc / 'self/mountinfo').write_text('1 0 0:1 / %s rw - cgroup cgroup rw,memory\n' % mount)
+            (child / 'memory.limit_in_bytes').write_text(str(96 * GiB))
+            (child / 'memory.usage_in_bytes').write_text(str(96 * GiB))
+            self.stats(child, cache=GiB, total_cache=24 * GiB, total_shmem=3 * GiB,
+                       total_dirty=2 * GiB, total_writeback=GiB)
+            self.assertEqual(memory.host_memory(proc)['available'], 18 * GiB)
 
     def test_parent_usage_and_siblings_still_bound_available_memory(self):
         with tempfile.TemporaryDirectory() as d:
