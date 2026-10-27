@@ -14,7 +14,9 @@
 #include "naive-n05-indexer.cuh"
 #endif
 #include <cuda_bf16.h>
+#ifdef FASTLLM_USE_NCCL
 #include <nccl.h>
+#endif
 #include <cuda_fp8.h>
 #include <cub/block/block_scan.cuh>
 #include <cub/block/block_radix_sort.cuh>
@@ -4455,6 +4457,7 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
     }
 }
 
+#ifdef FASTLLM_USE_NCCL
 namespace {
 struct DraftTPGroup { std::vector<int> devices; std::vector<ncclComm_t> comms; };
 }
@@ -4492,3 +4495,13 @@ void FastllmCudaNaiveDraftTPReduce(void *opaque, int rank, fastllm::Data &data) 
     fastllm::AssertInFastLLM(ncclAllReduce(data.cudaData, data.cudaData, data.Count(0), ncclBfloat16,
         ncclSum, group->comms[rank], cudaStreamPerThread) == ncclSuccess, "Draft TP reduction failed.");
 }
+
+#else
+void *FastllmCudaNaiveDraftTPCreate(const std::vector<int> &) {
+    return nullptr;
+}
+void FastllmCudaNaiveDraftTPDestroy(void *) {}
+void FastllmCudaNaiveDraftTPReduce(void *, int, fastllm::Data &) {
+    fastllm::AssertInFastLLM(false, "Draft TP reduction requires USE_NCCL=ON.");
+}
+#endif

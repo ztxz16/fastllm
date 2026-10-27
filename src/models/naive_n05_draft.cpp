@@ -98,6 +98,12 @@ bool NaiveN05FlashModel::PrepareDraftTP() {
     if (draftTP) return true;
     const char *option = std::getenv("FASTLLM_DSPARK_TP");
     if (!option || !*option || std::string(option) == "1") return false;
+#ifndef FASTLLM_USE_NCCL
+    // The draft subgroup owns a separate communicator from the target model.
+    // Reject it before splitting weights when that backend is unavailable.
+    AssertInFastLLM(false, "FASTLLM_DSPARK_TP requires USE_NCCL=ON.");
+    return false;
+#endif
     const std::string setting(option);
     const bool mlpOnly = setting.compare(0, 4, "mlp:") == 0;
     const std::string count = mlpOnly ? setting.substr(4) : setting;
