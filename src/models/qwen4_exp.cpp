@@ -62,6 +62,7 @@
 #endif
 
 namespace fastllm {
+    void Float32ToFloat16(float *float32, uint16_t *float16, int len);
 #ifdef USE_NUMAS
     void RegisterNumas(fastllm::Data *data, std::string weightType);
 #endif
@@ -2211,8 +2212,8 @@ namespace fastllm {
             Data dense(DataType::FLOAT16, out.dims);
             dense.Allocate();
             // Match GGUF's FP16 import conversion for unaligned TP layouts.
-            extern void Float32ToFloat16(float *, uint16_t *, int);
-            Float32ToFloat16(values.data(), (uint16_t *)dense.cpuData, values.size());
+            fastllm::Float32ToFloat16(values.data(), (uint16_t *)dense.cpuData,
+                                     (int)values.size());
             dense.name = out.name;
             dense.isGGUFData = true;
             out.CopyFrom(dense);
