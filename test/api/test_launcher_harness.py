@@ -47,7 +47,39 @@ server.serve_forever()
 
 
 class HarnessRuntimeTest(unittest.TestCase):
+    def test_output_budget_allows_long_reasoning_with_context_headroom(self):
+        for context, expected in [(131072, 32768), (65536, 32768),
+                                  (32768, 16384), (16384, 8192),
+                                  (8192, 4096), (1, 1), (None, 4096)]:
+            with self.subTest(context=context):
+                config = HarnessRuntime._patch({
+                    'modelName': 'qwen3.5', 'endpoint': 'http://127.0.0.1:8000',
+                    'contextWindowTokens': context}, '127.0.0.1')
+                provider = next(item for item in config if item.get('id') == 'llm-pi-ai')
+                model = provider['config']['providers']['fastllm']['models'][0]
+                self.assertEqual(model['maxTokens'], expected)
+
+    def test_model_input_modalities_follow_server_metadata(self):
+        for metadata, expected in [
+            ({"input_modalities": ["text", "image"]}, ["text", "image"]),
+            ({"inputModalities": ["text", "image"]}, ["text", "image"]),
+            ({"input_modalities": ["text"]}, ["text"]),
+            ({"input_modalities": ["text", "audio"]}, ["text"]),
+            ({}, ["text"]),
+        ]:
+            with self.subTest(metadata=metadata):
+                config = HarnessRuntime._patch({
+                    "modelName": "custom-alias", "endpoint": "http://localhost:8000",
+                    "modelMetadata": metadata}, "127.0.0.1")
+                provider = next(row for row in config if row.get("id") == "llm-pi-ai")
+                model = provider["config"]["providers"]["fastllm"]["models"][0]
+                self.assertEqual(model.get("input"), expected)
+
     def setUp(self):
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("FTLLM_HARNESS_EXPERIMENTAL_RECOVERY", None)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -86,6 +118,10 @@ class HarnessRuntimeTest(unittest.TestCase):
             model = config["providers"]["fastllm"]
             self.assertEqual(model["baseURL"], "http://127.0.0.1:8001/v1")
             self.assertEqual(model["models"][0]["contextWindow"], 32768)
+            self.assertEqual(model["compat"]["maxTokensField"], "max_tokens")
+            self.assertFalse(model["compat"]["supportsDeveloperRole"])
+            self.assertFalse(any(entry["id"] == "fastllm-harness-recovery"
+                                 for row in probe["patch"] for entry in row.get("insert", [])))
             self.assertEqual(next(p["config"]["host"] for p in probe["patch"] if p.get("id") == "webserver"), "127.0.0.1")
             self.assertNotIn("private-api-key", json.dumps(probe))
             self.assertEqual(probe["cwd"], str(self.root / "workspace"))
@@ -96,6 +132,28 @@ class HarnessRuntimeTest(unittest.TestCase):
             self.assertEqual(self.harness.state()["phase"], "stopped")
             self.assertTrue((self.root / "home/probe.json").exists())
             self.assertFalse(list(self.root.glob("launch-*")))
+            retained = (self.root / "logs/latest.log").read_text()
+            self.assertIn("dsh web:", retained)
+            self.assertNotIn("private-launch-token", retained)
+
+    def test_recovery_extension_requires_explicit_experimental_opt_in(self):
+        script = self.root / "fake.py"
+        script.write_text(FAKE_HARNESS)
+        with patch.object(self.harness, "_command", return_value=[sys.executable, str(script)]):
+            for setting in ("0", "false", "1"):
+                with self.subTest(setting=setting), patch.dict(os.environ,
+                        {"FTLLM_HARNESS_EXPERIMENTAL_RECOVERY": setting}):
+                    self.harness.start(self.service, "", "127.0.0.1", "http://localhost:8000")
+                    result = self.wait_phase("running", "failed")
+                    self.assertEqual(result["phase"], "running", result)
+                    probe = json.loads((self.root / "home/probe.json").read_text())
+                    recovery = [entry for row in probe["patch"] for entry in row.get("insert", [])
+                                if entry["id"] == "fastllm-harness-recovery"]
+                    self.assertEqual(len(recovery), 1 if setting == "1" else 0)
+                    if recovery:
+                        self.assertTrue(Path(recovery[0]["name"]).is_file())
+                        self.assertEqual(recovery[0]["config"], {"provider": "fastllm", "maxRecoveries": 2})
+                    self.harness.stop()
 
     def test_startup_failure_redacts_tokens_and_model_key(self):
         script = self.root / "fail.py"
@@ -106,6 +164,27 @@ class HarnessRuntimeTest(unittest.TestCase):
         self.assertNotIn("private-api-key", result["error"])
         self.assertNotIn("private-launch-token", result["error"])
         self.assertEqual(result["url"], "")
+        retained = (self.root / "logs/latest.log").read_text()
+        self.assertIn("error", retained)
+        self.assertNotIn("private-api-key", retained)
+        self.assertNotIn("private-launch-token", retained)
+
+    def test_log_retention_is_bounded_private_and_redacted(self):
+        source = self.root / "raw.log"
+        source.write_text("x" * 70000 + "\nAuthorization: Bearer private-bearer\n"
+                          "http://localhost/?token=private-token&api_key=private-query\nprivate-key\n")
+        self.harness._save_log(source, "private-key")
+        latest = self.root / "logs/latest.log"
+        retained = latest.read_text()
+        self.assertLess(latest.stat().st_size, 65536)
+        for secret in ("private-bearer", "private-token", "private-query", "private-key"):
+            self.assertNotIn(secret, retained)
+        if os.name != "nt":
+            self.assertEqual(latest.stat().st_mode & 0o777, 0o600)
+        source.write_text("second run\n")
+        self.harness._save_log(source, "")
+        self.assertEqual(latest.read_text(), "second run\n")
+        self.assertEqual((self.root / "logs/previous.log").read_text(), retained)
 
     def test_stop_finishes_active_harness_stream_before_closing_proxy(self):
         import httpx

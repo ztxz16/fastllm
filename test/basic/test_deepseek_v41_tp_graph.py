@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Expand the CPU fixture to CUDA TP dimensions and compare eager/graph execution.
+
+Requires numpy, torch, safetensors and 1/2/4/8 CUDA GPUs. The fixed input tokens
+exercise Engram, shared KV, both indexer stages and changing request lengths.
+"""
+import argparse
+import json
+import os
+import re
+from pathlib import Path
+import subprocess
+import tempfile
+
+import torch
+from safetensors.torch import load_file, save_file
+from test_deepseek_v41_cpu_fixture import unpack
+
+
+def prepare(directory, hc_mult=4, expert_cache=False, fp8_dense=False,
+            moe_intermediate_size=1024, expert_count=4):
+    unpack(str(Path(__file__).with_name('deepseek_v41_fixture.npz')), str(directory))
+    config = json.loads((directory / 'config.json').read_text())
+    # Keep at least one 128-element weight-split unit per rank, including
+    # the vocabulary and FFN. Tiny empty shards do not model the real TP8 case.
+    config['text_config'].update(num_attention_heads=64, head_dim=512,
+                                 index_head_dim=128, moe_intermediate_size=moe_intermediate_size,
+                                 vocab_size=1024, hc_mult=hc_mult, o_groups=8,
+                                 o_lora_rank=128)
+    if expert_cache:
+        config['text_config']['n_routed_experts'] = expert_count
+    (directory / 'config.json').write_text(json.dumps(config))
+    weights = load_file(str(directory / 'model.safetensors'))
+    for name, tensor in list(weights.items()):
+        value = tensor
+        if hc_mult == 4 and name.endswith(('hc_attn_fn', 'hc_ffn_fn')):
+            value = (tensor.float().repeat(3, 2) / 2).to(tensor.dtype)
+        elif hc_mult == 4 and name.endswith(('hc_attn_base', 'hc_ffn_base')):
+            value = tensor.repeat(3)
+        elif hc_mult == 4 and name.endswith(('engram.q_weight', 'engram.k_weight')):
+            value = tensor.repeat(2, 1)
+        elif hc_mult == 4 and name.endswith('engram.wkv.weight'):
+            value = tensor.reshape(3, 128, -1)[[0, 1, 0, 1, 2]].reshape(640, -1)
+        elif name in ('embed.weight', 'head.weight'):
+            value = tensor.repeat(8, 1)
+        elif '.attn.indexer.' in name:
+            if name.endswith('k_norm.weight'):
+                value = tensor.repeat(2)
+            elif name.endswith('wk.weight'):
+                value = (tensor.float().repeat(2, 4) / 4).to(tensor.dtype)
+            elif name.endswith('wq_b.weight'):
+                value = tensor.reshape(2, 64, -1).repeat(1, 2, 1).reshape(256, -1)
+        elif '.attn.' in name:
+            if name.endswith('attn_sink'):
+                value = tensor.repeat(16)
+            elif name.endswith('wq_b.weight'):
+                value = tensor.reshape(4, 128, -1).repeat(16, 4, 1).reshape(32768, -1)
+            elif name.endswith(('wkv.weight', 'wgate.weight')):
+                value = tensor.repeat(4, 1)
+            elif name.endswith(('kv_norm.weight', 'compressor.norm.weight')):
+                value = tensor.repeat(4)
+            elif name.endswith('wo_a.weight'):
+                value = (tensor.float().repeat(16, 16) / 16).to(tensor.dtype)
+            elif name.endswith('wo_b.weight'):
+                value = (tensor.float().repeat(1, 16) / 16).to(tensor.dtype)
+        elif '.ffn.' in name and '.gate.' not in name:
+            if name.endswith(('.w1.weight', '.w3.weight')):
+                value = tensor.repeat(moe_intermediate_size // 128, 1)
+            elif name.endswith('.w2.weight'):
+                copies = moe_intermediate_size // 128
+                value = (tensor.float().repeat(1, copies) / copies).to(tensor.dtype)
+        weights[name] = value.contiguous()
+    if expert_cache:
+        # At least 16 records are required by the cache. Duplicate the two
+        # fixture experts, then store block-32 E2M1 weights and UE8M0 scales.
+        values = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.])
+        for name, tensor in list(weights.items()):
+            if '.ffn.gate.' in name:
+                weights[name] = tensor.repeat(expert_count // 2, *([1] * (tensor.ndim - 1)))
+            if '.ffn.experts.' not in name:
+                continue
+            expert = int(name.split('.experts.')[1].split('.')[0])
+            blocks = tensor.float().reshape(tensor.shape[0], -1, 32)
+            exponent = (blocks.abs().amax(-1).clamp_min(1e-12) / 6).log2().ceil()
+            scaled = blocks / exponent.exp2().unsqueeze(-1)
+            codes = (scaled.abs().unsqueeze(-1) - values).abs().argmin(-1).to(torch.uint8)
+            codes |= (scaled < 0).to(torch.uint8) * 8
+            codes = codes.reshape(tensor.shape)
+            packed = codes[:, ::2] | (codes[:, 1::2] << 4)
+            scale = (exponent + 127).to(torch.uint8)
+            for replica in range(expert, expert_count, 2):
+                target = name.replace(f'.experts.{expert}.', f'.experts.{replica}.')
+                weights[target] = packed.clone()
+                weights[target.removesuffix('weight') + 'scale'] = scale.clone()
+    if fp8_dense:
+        from deepseek_v41_reference import quantize_fp8_block32
+        for name, tensor in list(weights.items()):
+            if (name.endswith('.weight') and tensor.ndim == 2 and
+                any(part in name for part in ('.attn.wq_a.', '.attn.wq_b.', '.attn.wkv.',
+                    '.attn.wo_a.', '.attn.wo_b.', '.attn.indexer.wq_b.', '.ffn.shared_experts.'))):
+                quantized, scale, _ = quantize_fp8_block32(tensor)
+                weights[name] = quantized
+                weights[name.removesuffix('weight') + 'scale'] = scale
+    save_file(weights, str(directory / 'model.safetensors'))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--binary', required=True)
+    parser.add_argument('--hc-mult', type=int, choices=(2, 4), default=4)
+    parser.add_argument('--tp-size', type=int, choices=(1, 2, 4, 8), default=2)
+    backend = parser.add_mutually_exclusive_group()
+    backend.add_argument('--expert-cache', action='store_true')
+    backend.add_argument('--gpu-experts', action='store_true')
+    backend.add_argument('--disk-experts', action='store_true')
+    parser.add_argument('--ngram-device', choices=('cpu', 'disk', 'cuda'), default='cpu')
+    parser.add_argument('--fp8-dense', action='store_true',
+                        help='exercise block-32 FP8 weights and persistent activation quantization buffers')
+    parser.add_argument('--eager-only', action='store_true',
+                        help='compare synchronous/asynchronous TP verification without CUDA Graph')
+    parser.add_argument('--full-verify', action='store_true',
+                        help='require full target verification graphs with native FP4 experts and GPU Engram')
+    args = parser.parse_args()
+    if args.full_verify:
+        if args.expert_cache or args.disk_experts or args.eager_only or args.hc_mult != 4 or args.tp_size == 1:
+            parser.error('--full-verify requires GPU experts, hc-mult=4 and TP >= 2')
+        args.gpu_experts = args.fp8_dense = True
+        args.ngram_device = 'cuda'
+    with tempfile.TemporaryDirectory(prefix='v41-tp-graph-') as path:
+        directory = Path(path)
+        prepare(directory, args.hc_mult, args.expert_cache or args.full_verify, args.fp8_dense,
+                expert_count=2 * args.tp_size if args.full_verify else 4)
+        env = dict(os.environ, FASTLLM_SKIP_WARMUP='1', FASTLLM_DSV41_REFERENCE_MATH='0',
+                   FASTLLM_DSV41_DISABLE_FAKE_QUANT='0' if args.fp8_dense else '1',
+                   FASTLLM_DSV41_CUDA_GRAPH_DEBUG='1')
+        command = [args.binary, str(directory), '--tp-size', str(args.tp_size)] + (['--expert-cache'] if args.expert_cache else [])
+        if args.gpu_experts:
+            command.append('--gpu-experts')
+        if args.disk_experts:
+            command.append('--disk-experts')
+        if args.ngram_device == 'disk':
+            command.append('--disk-engram')
+        if args.ngram_device == 'cuda':
+            command.append('--gpu-engram')
+        if args.fp8_dense:
+            command.append('--fp8-dense')
+        if args.eager_only:
+            command.append('--eager-only')
+        if args.expert_cache:
+            env.update(FT_NUMAS='1', FT_THREADS='2', FASTLLM_DSV41_MOE_CACHE_TRACE='1')
+        result = subprocess.run(command, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
+        print(result.stdout)
+        if result.returncode == 77:
+            raise SystemExit(77)
+        result.check_returncode()
+        assert 'PASS: eager verification 1..8, features and rollback match across requests' in result.stdout
+        if args.eager_only or args.disk_experts:
+            assert 'decode CUDA graph captured:' not in result.stdout
+            if args.disk_experts:
+                assert 'CUDA Graph bypassed for disk expert weights' in result.stdout
+                if not args.eager_only:
+                    assert 'PASS: disk experts preserve eager results with CUDA Graph requested' in result.stdout
+        else:
+            assert 'PASS: DSpark graph shapes 1..8, main features and rollback match across requests' in result.stdout
+            assert 'decode CUDA graph captured:' in result.stdout, 'graph was not exercised'
+            for tokens in range(1, 9):
+                assert re.search(r'graph captured:.*tokens=%d\b' % tokens, result.stdout), 'missing graph shape %d' % tokens
+                assert 'graph replay: tokens=%d' % tokens in result.stdout, 'shape %d never replayed' % tokens
+        if args.full_verify:
+            for tokens in range(2, 9):
+                assert f'full verify graph ready: tokens={tokens},' in result.stdout
+        assert 'giving up' not in result.stdout and 'graph disabled' not in result.stdout
+        if args.expert_cache:
+            assert re.search(r'V4.1 verify cache:.* [1-9]\d* GPU routes', result.stdout), 'verify never used GPU experts'
+
+
+if __name__ == '__main__':
+    main()

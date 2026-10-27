@@ -190,6 +190,7 @@ struct FastllmSm120Fp8SwapABConfig {
 };
 
 struct FastllmCutlassFp8Scratch {
+    std::mutex mutex;
     cutlass::float_e4m3_t *input = nullptr;
     float *inputScales = nullptr;
     size_t inputElems = 0;
@@ -202,6 +203,7 @@ struct FastllmCutlassFp8Scratch {
 };
 
 struct FastllmCutlassFp8WeightCache {
+    std::mutex mutex;
     cutlass::float_e4m3_t *weightTN = nullptr;
     float *weightScales = nullptr;
     const float *hostScales = nullptr;
@@ -213,6 +215,9 @@ struct FastllmCutlassFp8WeightCache {
     int blockK = 0;
 };
 
+// Registry locks protect CPU-only map access. Never hold them across CUDA
+// calls: a stream may be waiting for a TP peer that needs another cache entry.
+// Entries are never erased, so their addresses remain valid after lookup.
 static std::mutex g_cutlassScratchMutex;
 static std::map<int, FastllmCutlassFp8Scratch> g_cutlassScratchByDevice;
 static std::mutex g_cutlassWeightMutex;
@@ -755,8 +760,13 @@ static bool FastllmCutlassEnsureScratch(
     size_t inputElems = (size_t)rows * cols;
     size_t scaleElems = (size_t)rows * scaleCols;
     int device = FastllmCudaGetDevice();
-    std::lock_guard<std::mutex> guard(g_cutlassScratchMutex);
-    auto &deviceScratch = g_cutlassScratchByDevice[device];
+    FastllmCutlassFp8Scratch *entry = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(g_cutlassScratchMutex);
+        entry = &g_cutlassScratchByDevice[device];
+    }
+    std::lock_guard<std::mutex> guard(entry->mutex);
+    auto &deviceScratch = *entry;
     if (FastllmCutlassIsStreamCapturing(stream) &&
         (deviceScratch.inputElems < inputElems || deviceScratch.scaleElems < scaleElems)) {
         return false;
@@ -802,23 +812,23 @@ static bool FastllmCutlassEnsureWeightCache(
         return false;
     }
     int device = FastllmCudaGetDevice();
-    std::lock_guard<std::mutex> guard(g_cutlassWeightMutex);
-    auto cacheKey = std::make_pair(device, key);
-    auto it = g_cutlassWeightCache.find(cacheKey);
-    if (it != g_cutlassWeightCache.end()) {
-        auto &entry = it->second;
-        if (entry.weightTN != nullptr &&
-            entry.inFeatures == inFeatures && entry.outFeatures == outFeatures &&
-            entry.blockM == weight.blockM && entry.blockK == weight.blockK &&
-            entry.hostScales == weight.scales.data() && entry.scaleCount == weight.scales.size()) {
-            cache = &entry;
-            return true;
-        }
+    FastllmCutlassFp8WeightCache *entryPtr = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(g_cutlassWeightMutex);
+        entryPtr = &g_cutlassWeightCache[std::make_pair(device, key)];
+    }
+    std::lock_guard<std::mutex> guard(entryPtr->mutex);
+    auto &entry = *entryPtr;
+    if (entry.weightTN != nullptr &&
+        entry.inFeatures == inFeatures && entry.outFeatures == outFeatures &&
+        entry.blockM == weight.blockM && entry.blockK == weight.blockK &&
+        entry.hostScales == weight.scales.data() && entry.scaleCount == weight.scales.size()) {
+        cache = &entry;
+        return true;
     }
     if (FastllmCutlassIsStreamCapturing(stream)) {
         return false;
     }
-    auto &entry = g_cutlassWeightCache[cacheKey];
     if (entry.weightTN != nullptr && entry.ownsWeightTN) {
         FastllmCudaFree(entry.weightTN);
     }

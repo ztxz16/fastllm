@@ -146,6 +146,34 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    // DeepSeek-V4.1 专用算子的多卡包装。除注意力（按 query head 切分）之外，
+    // V4.1 的压缩 KV、两级 indexer 与 Hyper-Connections 系数在每张卡上各算一份
+    // （复制），因此绝大多数算子只需要把输入/输出换成本卡副本后原样下发。
+    class MultiCudaDeepSeekV41Op : BaseOperator {
+    public:
+        explicit MultiCudaDeepSeekV41Op(BaseOperator *cudaOp) : cudaOp(cudaOp) {}
+
+    private:
+        BaseOperator *cudaOp;
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        // V4.1 有若干算子只有 output 没有 input（IndexerScore / CandidateBlocks /
+        // SparseAttention ...），BaseOperator 的默认 Reshape 会解引用不存在的
+        // "input" 项。形状由每卡下发时的 cudaOp->Reshape 决定，这里留空。
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    // 复制布局下的 CatDirect：V4.1 的压缩 KV / indexer key / 滑窗 KV 缓存都是
+    // 每卡一份，追加必须落到每张卡的本地缓存上，否则副本会与 root 不一致。
+    class MultiCudaCatDirectOp : CudaCatDirectOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    // 标量乘：复制布局下逐卡就地执行，切分布局下每卡只处理本地分片。
+    class MultiCudaMulOp : CudaMulOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class MultiCudaAppendPagedCacheOp : BaseOperator {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);

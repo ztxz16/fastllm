@@ -1,5 +1,6 @@
 import ctypes
 import concurrent.futures
+import functools
 import math
 import os
 import glob
@@ -7,7 +8,6 @@ import threading
 import asyncio
 import copy
 import json
-import math
 import importlib.util
 import importlib.metadata as importlib_metadata
 import logging
@@ -67,6 +67,19 @@ except ImportError:
         build_step3p7_prompt,
         normalize_step3p7_conversation,
         prepare_step3p7_multimodal_inputs,
+    )
+
+try:
+    from .deepseek_v41_multimodal import (
+        build_deepseek_v41_multimodal_payload,
+        normalize_deepseek_v41_conversation,
+        prepare_deepseek_v41_multimodal_inputs,
+    )
+except ImportError:
+    from deepseek_v41_multimodal import (
+        build_deepseek_v41_multimodal_payload,
+        normalize_deepseek_v41_conversation,
+        prepare_deepseek_v41_multimodal_inputs,
     )
 
 try:
@@ -138,6 +151,20 @@ def _discover_nvidia_lib_dirs() -> List[str]:
     # De-duplicate while preserving order
     return list(dict.fromkeys(dirs))
 
+def _find_pip_nccl() -> Optional[str]:
+    """libnccl.so.2 shipped by a pip nvidia-nccl-* wheel, if installed."""
+    try:
+        spec = importlib.util.find_spec("nvidia.nccl")
+    except Exception:
+        return None
+    if spec is None or spec.submodule_search_locations is None:
+        return None
+    for root in spec.submodule_search_locations:
+        candidate = os.path.join(root, "lib", "libnccl.so.2")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
 def _preload_cuda_runtime_dependencies() -> Dict[str, Any]:
     # Try system runtime first. If a machine only has pip nvidia-* packages,
     # the fallback search below will preload those shared libraries.
@@ -154,6 +181,21 @@ def _preload_cuda_runtime_dependencies() -> Dict[str, Any]:
         "libnccl.so.2",
     ]
     unresolved = set(base_names)
+    # NCCL: prefer the pip wheel (nvidia-nccl-*) when present. That is the copy
+    # torch links against; all libnccl.so.2 share one SONAME, so whichever is
+    # loaded first with RTLD_GLOBAL wins for the whole process. Preloading an
+    # older system NCCL first makes a later `import torch` fail with
+    # "undefined symbol: ncclCommWindowDeregister" (transformers imports torch
+    # to load tokenizers), and the HF tokenizer silently falls back.
+    pip_nccl = _find_pip_nccl()
+    if pip_nccl is not None:
+        try:
+            _load_library(pip_nccl)
+            diagnostics["loaded"].append(pip_nccl)
+            unresolved.discard("libnccl.so.2")
+        except Exception as e:
+            diagnostics["failed"].append(f"{pip_nccl}: {e}")
+            pip_nccl = None
     for libname in [
         "libcuda.so.1",
         "libcudart.so.12", "libcudart.so",
@@ -161,6 +203,8 @@ def _preload_cuda_runtime_dependencies() -> Dict[str, Any]:
         "libcublas.so.12", "libcublas.so",
         "libnccl.so.2", "libnccl.so",
     ]:
+        if pip_nccl is not None and libname.startswith("libnccl.so"):
+            continue
         try:
             _load_library(libname)
             diagnostics["loaded"].append(libname)
@@ -471,6 +515,12 @@ fastllm_lib.create_llm_model_fromhf_with_config.restype = ctypes.c_int
 fastllm_lib.create_llm_model_from_gguf.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 fastllm_lib.create_llm_model_from_gguf.restype = ctypes.c_int
 
+if hasattr(fastllm_lib, "create_llm_model_from_gguf_with_context"):
+    fastllm_lib.create_llm_model_from_gguf_with_context.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.c_int, ctypes.c_char_p]
+    fastllm_lib.create_llm_model_from_gguf_with_context.restype = ctypes.c_int
+
 if hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp"):
     fastllm_lib.create_llm_model_from_gguf_with_mtp.argtypes = [
         ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
@@ -515,6 +565,12 @@ fastllm_lib.fetch_response_tokens_batch_llm_model.argtypes = [
     ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int
 ]
 fastllm_lib.fetch_response_tokens_batch_llm_model.restype = ctypes.c_int
+
+fastllm_lib.fetch_response_tokens_batch_with_statistics_llm_model.argtypes = [
+    ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int)
+]
+fastllm_lib.fetch_response_tokens_batch_with_statistics_llm_model.restype = ctypes.c_int
 
 fastllm_lib.fetch_response_logits_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
 fastllm_lib.fetch_response_logits_llm_model.restype = ctypes.c_int
@@ -561,9 +617,29 @@ fastllm_lib.set_layered_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p
 fastllm_lib.set_moe_device_layers.argtypes = [ctypes.c_int]
 fastllm_lib.set_ngram_device.argtypes = [ctypes.c_char_p]
 fastllm_lib.set_moe_cuda_cache.argtypes = [ctypes.c_uint64]
+if hasattr(fastllm_lib, "set_moe_cache_policy"):
+    fastllm_lib.set_moe_cache_policy.argtypes = [
+        ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_int,
+        ctypes.c_float, ctypes.c_bool]
+    fastllm_lib.set_moe_cache_policy.restype = ctypes.c_bool
+if hasattr(fastllm_lib, "fastllm_moe_cuda_cache_stats"):
+    fastllm_lib.fastllm_moe_cuda_cache_stats.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64), ctypes.c_bool]
+    fastllm_lib.fastllm_moe_cuda_cache_stats.restype = ctypes.c_bool
+fastllm_lib.set_moe_cpu_cache.argtypes = [ctypes.c_uint64]
+fastllm_lib.get_disk_moe_cache_stats.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
+    fastllm_lib.get_disk_moe_cache_stats_v2.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_int]
+    fastllm_lib.get_disk_moe_cache_stats_v2.restype = ctypes.c_int
 
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
+
+fastllm_lib.supports_kvmem_prefix_cache_llm_model.argtypes = [ctypes.c_int]
+fastllm_lib.supports_kvmem_prefix_cache_llm_model.restype = ctypes.c_bool
+fastllm_lib.set_kvmem_llm_model.argtypes = (
+    [ctypes.c_int, ctypes.c_bool] + [ctypes.c_int] * 6 + [ctypes.c_uint64, ctypes.c_int])
+fastllm_lib.set_kvmem_llm_model.restype = ctypes.c_char_p
 
 fastllm_lib.set_kv_cache_limit_llm_model.argtypes = [ctypes.c_int, ctypes.c_int64]
 
@@ -579,7 +655,14 @@ fastllm_lib.get_kv_cache_token_limit_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.get_kv_cache_token_limit_llm_model.restype = ctypes.c_int
 
 fastllm_lib.set_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+fastllm_lib.set_prefill_batching_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+fastllm_lib.set_prefill_batching_llm_model.restype = ctypes.c_bool
 
+fastllm_lib.set_model_indexer_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
+fastllm_lib.set_model_indexer_dtype.restype = None
+if hasattr(fastllm_lib, "set_model_indexer_tp_storage"):
+    fastllm_lib.set_model_indexer_tp_storage.argtypes = [ctypes.c_int, ctypes.c_char_p]
+    fastllm_lib.set_model_indexer_tp_storage.restype = None
 fastllm_lib.set_model_kv_cache_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 
 fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
@@ -721,11 +804,158 @@ def set_cuda_graph(cuda_graph):
 def set_cuda_slab(mb: int):
     fastllm_lib.set_cuda_slab(ctypes.c_int(mb));
 
-def set_moe_cuda_cache(bytes_: int):
+def set_moe_cuda_cache(bytes_: int, device_bytes=None):
+    """Set cache budgets before loading; a scalar call clears device overrides."""
     bytes_ = int(bytes_)
     if bytes_ < 0 or bytes_ > (1 << 64) - 1:
         raise ValueError("MoE CUDA cache size must fit in uint64")
-    fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
+    budgets = {} if device_bytes is None else {int(d): int(b) for d, b in device_bytes.items()}
+    if any(d < 0 or d > (1 << 31) - 1 or b < 0 or b > bytes_ for d, b in budgets.items()):
+        raise ValueError("Per-device cache budgets must be nonnegative and within the scalar ceiling")
+    setter = getattr(fastllm_lib, "set_moe_cuda_cache_device", None)
+    if budgets and setter is None:
+        raise RuntimeError("Per-device cache planning requires a matching native library")
+    fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_))
+    if budgets:
+        setter.argtypes = [ctypes.c_int, ctypes.c_uint64]
+        setter.restype = None
+        for device, budget in budgets.items():
+            setter(device, budget)
+
+def get_cuda_memory_info(device: int):
+    """Return free/total CUDA bytes for a visible ordinal, or fail closed."""
+    query = getattr(fastllm_lib, "get_cuda_memory_info", None)
+    if query is None:
+        raise RuntimeError("Hybrid auto requires a matching native library")
+    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_bool
+    values = (ctypes.c_uint64 * 2)()
+    if not query(int(device), values):
+        raise RuntimeError("Cannot measure memory on CUDA device %d" % device)
+    return {"free": int(values[0]), "total": int(values[1])}
+
+def set_moe_cache_policy(*, half_life=128., update_interval=1, max_replacements=96,
+                         max_bytes=0, min_heat=1., margin=1., factor=1.,
+                         min_residence=0, prefill_prior=0., rank_by_bytes=False):
+    """Configure GGUF/NVFP4/FP8 hybrid decode admission before model loading.
+
+    Counts and byte limits apply per device/update, across all layers. max_bytes=0
+    imposes no byte cap; max_replacements=0 disables decode admission.
+    One decode step may verify several speculative tokens. half_life=0 disables
+    decay. prefill_prior weights rescaled prompt heat and
+    does not discard resident payloads. Existing cache policies keep their config.
+    """
+    for name, value, minimum in (("update_interval", update_interval, 1),
+                                  ("max_replacements", max_replacements, 0),
+                                  ("min_residence", min_residence, 0)):
+        if not isinstance(value, int) or not minimum <= value <= (1 << 31) - 1:
+            raise ValueError(f"{name} must be an integer in [{minimum}, 2147483647]")
+    if not isinstance(max_bytes, int) or not 0 <= max_bytes <= (1 << 64) - 1:
+        raise ValueError("max_bytes must fit in uint64")
+    for name, value, minimum in (("half_life", half_life, 0), ("min_heat", min_heat, 0),
+                                  ("margin", margin, 0), ("factor", factor, 1),
+                                  ("prefill_prior", prefill_prior, 0)):
+        if not math.isfinite(value) or value < minimum:
+            raise ValueError(f"{name} must be finite and >= {minimum}")
+    if prefill_prior > 1:
+        raise ValueError("prefill_prior must be in [0, 1]")
+    native = getattr(fastllm_lib, "set_moe_cache_policy", None)
+    if native is None:
+        raise RuntimeError("MoE cache policy configuration requires an updated native library")
+    if not native(half_life, update_interval, max_replacements, max_bytes,
+                  min_heat, margin, factor, min_residence, prefill_prior, rank_by_bytes):
+        raise ValueError("Invalid MoE cache policy configuration")
+
+def get_moe_cuda_cache_stats(device: int = 0, reset: bool = False):
+    """Synchronize a CUDA device and read expert-cache query counters outside inference timing.
+
+    Hits/misses include GPU-assigned queries and prefetch, excluding CPU-only
+    routes. Use get_moe_cuda_cache_route_stats for full hybrid route residency.
+    Reset clears these query counters only; cached weights and LRU residency are retained.
+    Byte and slot counts cover all prepared expert tables on the selected device.
+    """
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_stats", None)
+    if query is None:
+        raise RuntimeError("GPU expert-cache statistics require an updated CUDA build")
+    values = (ctypes.c_uint64 * 5)()
+    if not query(int(device), values, bool(reset)):
+        raise RuntimeError("Could not read GPU expert-cache statistics")
+    result = dict(zip(("hits", "misses", "payload_bytes", "slots", "records"), values))
+    routes = result["hits"] + result["misses"]
+    result["hit_rate"] = result["hits"] / routes if routes else None
+    return result
+
+def get_moe_cuda_cache_route_stats(device: int = 0, phase: str = None):
+    """Read cumulative hybrid expert-route counters between requests.
+
+    Residency is measured across all routed experts before CPU/GPU dispatch,
+    excluding prefetch lookups. Includes draft and small-prefill calls through
+    the hybrid backend; grouped prefill, multi-GPU EP and pure-GPU mode are
+    not counted. Optional phase: decode, verify, draft, small_prefill. Phase
+    attribution requires explicit model scopes; untagged calls and deferred
+    cache admissions are excluded. Host inference must be idle; this also
+    synchronizes the GPU.
+    Subtract snapshots for per-request counts; cache and scheduler are retained.
+    """
+    phases = {"decode": 0, "verify": 1, "draft": 2, "small_prefill": 3}
+    if phase is not None and phase not in phases:
+        raise ValueError("Unknown MoE route phase: " + str(phase))
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_phase_stats" if phase is not None else
+                    "fastllm_moe_cuda_cache_route_stats", None)
+    if query is None:
+        raise RuntimeError("Full-route expert-cache statistics require an updated CUDA build")
+    query.argtypes = [ctypes.c_int] + ([ctypes.c_int] if phase is not None else []) + [ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_bool
+    values = (ctypes.c_uint64 * 8)()
+    args = [int(device)] + ([phases[phase]] if phase is not None else []) + [values]
+    if not query(*args):
+        raise RuntimeError("Could not read full-route expert-cache statistics")
+    result = dict(zip(("calls", "routes", "resident_routes", "nonresident_routes",
+                       "gpu_routes", "cpu_routes", "resident_gpu_routes", "prefetched_experts"), values))
+    routes = result["routes"]
+    result["hit_rate"] = result["resident_routes"] / routes if routes else None
+    result["gpu_fraction"] = result["gpu_routes"] / routes if routes else None
+    return result
+
+def get_moe_cuda_cache_prefill_stats(device: int = 0):
+    """Read native host-prefill cache transport counts between requests.
+
+    Includes direct resident aliases and on-device restoration of shared NUMA
+    layouts. Grouped GGUF has a separate path and is not included. Reused bytes
+    count host uploads avoided; temporary on-device conversion is not a hit
+    penalty. Synchronizes the device; subtract snapshots without resetting.
+    """
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_prefill_stats", None)
+    if query is None:
+        raise RuntimeError("Prefill cache statistics require an updated CUDA build")
+    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_bool
+    values = (ctypes.c_uint64 * 8)()
+    if not query(int(device), values):
+        raise RuntimeError("Could not read prefill cache statistics")
+    return dict(zip(("calls", "gpu_experts", "gpu_routes", "resident_experts", "resident_routes",
+                     "reused_bytes", "uploaded_bytes", "admitted_experts"), values))
+
+def set_moe_cpu_cache(bytes_: int):
+    bytes_ = int(bytes_)
+    if bytes_ < 0 or bytes_ > (1 << 64) - 1:
+        raise ValueError("MoE CPU cache size must fit in uint64")
+    fastllm_lib.set_moe_cpu_cache(ctypes.c_uint64(bytes_))
+
+def get_disk_moe_cache_stats():
+    """Process-wide route counts, resident bytes and bounded cache workspace stats."""
+    names = ("cpu_bytes", "cuda_bytes", "cpu_hits", "cuda_hits", "misses",
+             "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions",
+             "cpu_cuda_overlap_bytes", "cuda_demotions", "cuda_demotion_bytes",
+             "cpu_workspace_bytes", "cpu_buffer_reuses", "cpu_buffer_allocations",
+             "cpu_reclaims", "async_maintenance")
+    if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
+        values = (ctypes.c_uint64 * len(names))()
+        count = fastllm_lib.get_disk_moe_cache_stats_v2(values, len(names))
+        return dict(zip(names[:count], values))
+    values = (ctypes.c_uint64 * 9)()
+    fastllm_lib.get_disk_moe_cache_stats(values)
+    return dict(zip(names[:9], values))
 
 def disable_cuda_malloc():
     fastllm_lib.disable_cuda_malloc();
@@ -863,7 +1093,9 @@ class tokenizer:
         if (id != -99999):
             self.model = id
         else:
-            if os.path.isfile(path):
+            if path.lower().endswith(".gguf") and os.path.isfile(path):
+                self.model = fastllm_lib.create_llm_tokenizer_fromhf(path.encode())
+            elif os.path.isfile(path):
                 self.model = fastllm_lib.create_llm_tokenizer(path.encode());
             elif os.path.isdir(path):
                 self.model = fastllm_lib.create_llm_tokenizer_fromhf(path.encode());
@@ -1176,6 +1408,17 @@ def encode_hf_prompt(tokenizer, prompt: str):
     add_special_tokens = not (avoid_duplicate_bos and bos_token and prompt.startswith(bos_token))
     return tokenizer.encode(prompt, add_special_tokens = add_special_tokens)
 
+def _same_template_input(left, right):
+    # Templates can iterate tool properties and arguments in insertion order.
+    # Ordinary dict equality would allow reusing IDs for a different prompt.
+    if isinstance(left, dict) and isinstance(right, dict):
+        return (list(left) == list(right) and
+                all(_same_template_input(left[key], right[key]) for key in left))
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return (len(left) == len(right) and
+                all(_same_template_input(a, b) for a, b in zip(left, right)))
+    return left == right
+
 def apply_hf_chat_template(tokenizer, conversation, add_generation_prompt = True,
                            tokenize = False, enable_thinking = None, tools = None,
                            thinking_alias = False, thinking_effort = None,
@@ -1214,6 +1457,37 @@ def apply_hf_chat_template(tokenizer, conversation, add_generation_prompt = True
         ret = ret.tolist()
     return ret
 
+# transformers 会对这些模型真的去修补 pre_tokenizer 的正则，别去动它们。
+_MISTRAL_TOKENIZER_MODEL_TYPES = {
+    "mistral", "mistral3", "voxtral", "ministral", "pixtral",
+}
+
+
+def _hf_tokenizer_compat_kwargs(path):
+    """transformers>=5 对缺少 transformers_version 的本地目录会报 fix_mistral_regex 告警。
+
+    这个告警只是提示（不传该参数时 transformers 并不会改动 tokenizer），但对
+    DeepSeek 这类非 Mistral 模型是纯噪音——本地转换/裁剪出来的目录几乎都没有
+    transformers_version 字段。显式传 fix_mistral_regex=False 表示“确认不需要
+    这个修补”，从源头消掉告警，同时把行为固定下来，不再依赖调用处的全局
+    logging.disable。
+    """
+    try:
+        import transformers
+        if int(str(transformers.__version__).split(".")[0]) < 5:
+            return {}
+        config_path = os.path.join(path, "config.json")
+        if not os.path.isfile(config_path):
+            return {}
+        with open(config_path, encoding = "utf-8") as config_file:
+            model_type = str(json.load(config_file).get("model_type", ""))
+        if model_type in _MISTRAL_TOKENIZER_MODEL_TYPES:
+            return {}
+        return {"fix_mistral_regex": False}
+    except Exception:
+        return {}
+
+
 def try_load_hf_tokenizer(path):
     if _is_step3p5_model_dir(path):
         ret = _load_fast_tokenizer_from_tokenizer_json(path)
@@ -1231,17 +1505,30 @@ def try_load_hf_tokenizer(path):
             # 2. 完全禁止所有 logging 输出
             logging.disable(logging.CRITICAL)  # 禁用所有日志（包括 ERROR, WARNING, INFO, DEBUG）
             from transformers import AutoTokenizer
-            ret = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
+            compat_kwargs = _hf_tokenizer_compat_kwargs(path)
+            try:
+                ret = AutoTokenizer.from_pretrained(
+                    path, trust_remote_code = True, **compat_kwargs)
+            except TypeError as error:
+                # Newer Qwen2 tokenizers already supply this keyword to their
+                # backend. Retry without our compatibility override.
+                if "fix_mistral_regex" not in compat_kwargs or "multiple values" not in str(error) or "fix_mistral_regex" not in str(error):
+                    raise
+                ret = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
         finally:
             logging.disable(original_level)  # 恢复原来的日志级别
             if original_use_torch is None:
                 os.environ.pop("USE_TORCH", None)
             else:
                 os.environ["USE_TORCH"] = original_use_torch
-    except:
+    except Exception as error:
         ret = _load_fast_tokenizer_from_tokenizer_json(path) if _is_step3p5_model_dir(path) else None
         if ret is None:
             print("Load AutoTokenizer failed. (you can try install transformers)")
+            print(f"  reason: {type(error).__name__}: {error}")
+            print("  WARNING: falling back to the FastLLM native tokenizer. For checkpoints that ship "
+                  "tokenizer.json (e.g. DeepSeek-V4/V4.1) it can split text differently from the "
+                  "official tokenizer, which silently degrades output quality.")
             print("Try load fastllm tokenizer.")
         else:
             return ret
@@ -1267,7 +1554,15 @@ class model:
                   external_mtp_path: str = "",
                   mmproj_path: str = "",
                   max_context_length: int = -1,
-                  rope_scaling = None):
+                  rope_scaling = None,
+                  indexer_dtype: str = "auto",
+                  indexer_tp_storage: str = "replicated"):
+        if indexer_dtype not in ("auto", "fp8", "fp8_e4m3"):
+            raise ValueError("indexer_dtype must be auto, fp8 or fp8_e4m3")
+        if indexer_tp_storage not in ("replicated", "layer_shard"):
+            raise ValueError("indexer_tp_storage must be replicated or layer_shard")
+        if indexer_tp_storage != "replicated" and not hasattr(fastllm_lib, "set_model_indexer_tp_storage"):
+            raise RuntimeError("The loaded FastLLM library does not support Indexer TP storage; rebuild FastLLM.")
         if (isinstance(max_context_length, bool) or not isinstance(max_context_length, int) or
                 max_context_length != -1 and not 0 < max_context_length <= 2147483647):
             raise ValueError("max_context_length must be a positive 32-bit integer")
@@ -1278,9 +1573,13 @@ class model:
         if not isinstance(rope_scaling, str):
             raise ValueError("rope_scaling must be yarn or a JSON object")
         context_requested = max_context_length > 0 or bool(rope_scaling)
-        if context_requested and (id != -99999 or graph is not None or model_json or not os.path.isdir(path)):
-            raise ValueError("Context options currently require a Hugging Face model directory")
-        if context_requested and not hasattr(fastllm_lib, "create_llm_model_fromhf_with_context"):
+        is_gguf = os.path.isfile(path) and str(path).lower().endswith(".gguf")
+        if context_requested and (id != -99999 or graph is not None or model_json or
+                                  not (os.path.isdir(path) or is_gguf)):
+            raise ValueError("Context options require a Hugging Face model directory or GGUF file")
+        context_loader = ("create_llm_model_from_gguf_with_context" if is_gguf else
+                          "create_llm_model_fromhf_with_context")
+        if context_requested and not hasattr(fastllm_lib, context_loader):
             raise RuntimeError("The native FastLLM library must be rebuilt to support context options")
         self.context_config = None
         if (graph != None):
@@ -1365,13 +1664,26 @@ class model:
                 else:
                     report_model_load_progress("tokenizer", 0, 1)
                     try:
-                        self.hf_tokenizer = try_load_gguf_tokenizer(path)
+                        if self.config.get("gguf_architecture") != "deepseek41":
+                            self.hf_tokenizer = try_load_gguf_tokenizer(path)
                     finally:
                         report_model_load_progress("tokenizer", 1, 1)
                 if external_mtp_path and mmproj_path:
                     raise ValueError(
                         "external MTP and mmproj cannot be used together")
-                if external_mtp_path:
+                if mmproj_path and self.config.get("gguf_architecture") == "deepseek41":
+                    from .deepseek_v41_gguf import vision_config
+                    self.config.update(vision_config(mmproj_path, self.config))
+                if context_requested:
+                    self.model = fastllm_lib.create_llm_model_from_gguf_with_context(
+                        path.encode(), ori_model_path.encode(),
+                        external_mtp_path.encode(), mmproj_path.encode(),
+                        max_context_length, rope_scaling.encode())
+                    if self.model < 0:
+                        raise ValueError(fastllm_lib.get_llm_context_result().decode("utf-8", errors="replace"))
+                    if mmproj_path:
+                        self.mmproj_path = mmproj_path
+                elif external_mtp_path:
                     if not hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp"):
                         raise RuntimeError(
                             "the loaded FastLLM library does not support "
@@ -1419,6 +1731,7 @@ class model:
                         self.hf_tokenizer.chat_template = chat_template
                         self.force_chat_template = True
                 skip_tokenizer = self._has_hf_chat_template()
+                self._prepare_deepseek_v41_engram_meta(path)
                 if model_json != "":
                     self.model = fastllm_lib.create_llm_model_fromhf_with_config(
                         path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
@@ -1502,6 +1815,13 @@ class model:
             'temperature': 1.0
         }
 
+        # DeepSeek-V4.1 Flash recommends temperature=1 and top_p=1.
+        # Disable top-k truncation instead of inheriting the greedy top_k=1.
+        if (architecture == "DeepseekV41ForCausalLM" or
+                model_type in ("deepseek_v41", "deepseek_v41_text") or
+                text_model_type == "deepseek_v41_text"):
+            self.default_generation_config.update(top_p=1.0, top_k=0)
+
         # Modern GGUF files can embed the recommended sampler settings.  Use
         # them when there is no Hugging Face generation_config.json sidecar.
         self.default_generation_config.update({
@@ -1523,6 +1843,10 @@ class model:
         print(f"[Fastllm] default generation config: {self.default_generation_config}")
         if (kv_cache_dtype != "" and kv_cache_dtype != "auto"):
             self.set_kv_cache_dtype(kv_cache_dtype)
+        if indexer_dtype != "auto":
+            fastllm_lib.set_model_indexer_dtype(self.model, indexer_dtype.encode())
+        if indexer_tp_storage != "replicated":
+            fastllm_lib.set_model_indexer_tp_storage(self.model, indexer_tp_storage.encode())
         self._refresh_context_config()
 
     def _refresh_context_config(self):
@@ -1674,7 +1998,39 @@ class model:
             enable_thinking=enable_thinking,
         )
 
+    def _prepare_deepseek_v41_engram_meta(self, path: str) -> None:
+        """DeepSeek-V4.1 的 Engram 哈希依赖 tokenizer 归一化派生的 token 映射，
+        C++ 侧在加载时读取 engram_meta.json；这里在模型创建前保证它存在。"""
+        config_path = os.path.join(path, "config.json")
+        if not os.path.isfile(config_path):
+            return
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception:
+            return
+        model_type = str(config.get("model_type", ""))
+        if model_type not in ("deepseek_v41", "deepseek_v41_text"):
+            return
+        try:
+            from ftllm.deepseek_v41_engram import ensure_engram_meta
+            ensure_engram_meta(path)
+        except Exception as e:
+            print("[ftllm] warning: failed to prepare DeepSeek-V4.1 engram meta:", e)
+
+    def _is_deepseek_v41(self) -> bool:
+        if self._get_architecture() == "DeepseekV41ForCausalLM":
+            return True
+        try:
+            mt = self.config.get("model_type", "") if isinstance(getattr(self, "config", None), dict) else ""
+            return str(mt) in ("deepseek_v41", "deepseek_v41_text")
+        except Exception:
+            return False
+
     def _is_deepseek_v4(self) -> bool:
+        """DeepSeek-V4 系列（含 V4.1）：共用 encoding 风格的 prompt 渲染与工具调用处理。"""
+        if self._is_deepseek_v41():
+            return True
         if self._get_architecture() == "DeepseekV4ForCausalLM":
             return True
         try:
@@ -1683,15 +2039,40 @@ class model:
         except Exception:
             return False
 
+    def remember_deepseek_v41_tool_output(self, raw, content, tool_calls,
+                                          thinking=False, reasoning_content=None):
+        if not self._is_deepseek_v41():
+            return
+        if not hasattr(self, "_deepseek_v41_tool_history"):
+            from ftllm.deepseek_v41_history import ToolHistory
+            self._deepseek_v41_tool_history = ToolHistory()
+        self._deepseek_v41_tool_history.remember(raw, {
+            "content": content, "tool_calls": tool_calls,
+            "reasoning_content": reasoning_content,
+        }, thinking=thinking)
+
+    def _deepseek_encode_messages(self, reasoning_effort = None):
+        """返回与当前模型版本匹配的官方 encode_messages（V4.1 的 DSML 标签与 V4 不同）。
+
+        V4.1 额外支持数值 reasoning effort（1-100 或 low/high/max），由服务端
+        透传进来；V4 的 encode_messages 没有这个参数，忽略即可。
+        """
+        if self._is_deepseek_v41():
+            from ftllm.encoding_dsv41 import encode_messages
+            return functools.partial(
+                encode_messages, reasoning_effort=reasoning_effort,
+                tool_history=getattr(self, "_deepseek_v41_tool_history", None))
+        from ftllm.encoding_dsv4 import encode_messages
+        return encode_messages
+
     def _uses_hf_deepseek_v4_tokenizer(self) -> bool:
         """Use the checkpoint tokenizer after rendering the official V4 prompt.
 
         DeepSeek-V4 ships ``encoding_dsv4.py`` instead of a Jinja chat
         template.  Prompt rendering therefore remains model-specific, but the
-        resulting text must still be tokenized by the checkpoint's Hugging
-        Face tokenizer.  FastLLM's generic native BPE path does not currently
-        reproduce every pre-tokenizer rule in this checkpoint and can split an
-        otherwise identical prompt into a different token sequence.
+        resulting text uses the checkpoint's Hugging Face tokenizer when
+        one was loaded. Standalone V4.1 GGUF uses the equivalent native
+        pre-tokenizer and BPE through the ordinary native request path.
         """
         return (
             self._is_deepseek_v4()
@@ -1774,6 +2155,28 @@ class model:
         messages.insert(0, {"role": "system", "tools": tools})
         return messages
 
+    def _prepare_deepseek_v41_multimodal(self, conversation, images, tools, enable_thinking,
+                                         reasoning_effort = None):
+        """DeepSeek-V4.1 图文输入：官方 encode_messages 渲染带占位符的 prompt，再展开图像 span。
+        有 HF tokenizer 时与纯文本路径一样用它编码，否则退回 fastllm 原生 tokenizer。"""
+        from ftllm.encoding_dsv41 import encode_messages
+        if self.hf_tokenizer is not None:
+            encode_fn = lambda prompt: encode_hf_prompt(self.hf_tokenizer, prompt)
+        else:
+            encode_fn = lambda prompt: self.encode(prompt)
+        conversation = normalize_deepseek_v41_conversation(copy.deepcopy(conversation), len(images))
+        conversation = self._inject_deepseek_v4_tools(conversation, tools)
+        thinking_mode = "thinking" if enable_thinking else "chat"
+        return prepare_deepseek_v41_multimodal_inputs(
+            conversation = conversation,
+            images = images,
+            model_config = self.config,
+            encode_messages = encode_messages,
+            encode_fn = encode_fn,
+            thinking_mode = thinking_mode,
+            reasoning_effort = reasoning_effort,
+        )
+
     def get_prompt(self,
                    query: str,
                    history: List[Tuple[str, str]] = None) -> str:
@@ -1783,7 +2186,7 @@ class model:
 
         # DeepSeek-V4 系列模型未提供 Jinja chat_template，使用官方 encoding_dsv4 编码
         if (self._is_deepseek_v4() and not self.force_chat_template):
-            from ftllm.encoding_dsv4 import encode_messages
+            encode_messages = self._deepseek_encode_messages()
             thinking_mode = "thinking" if self.enable_thinking else "chat"
             return encode_messages(self._build_messages(query, history), thinking_mode=thinking_mode)
 
@@ -1822,6 +2225,19 @@ class model:
 
     def eval(self):
         return self;
+
+    def get_vocab_size(self):
+        """Return the output vocabulary bound used by unrestricted sampling."""
+        config = getattr(self, "config", {})
+        text_config = config.get("text_config") or config
+        size = text_config.get("vocab_size")
+        if size is None and self.hf_tokenizer is not None:
+            size = max(self.hf_tokenizer.get_vocab().values(), default=-1) + 1
+        if size is None:
+            size = fastllm_lib.get_tokenizer_vocab_size(self.model)
+        if int(size) <= 0:
+            raise ValueError("Cannot determine vocabulary size for unrestricted sampling")
+        return int(size)
 
     def build_tokenizer_decode_token_cache(self):
         if self.tokenizer_decode_token_cache is not None:
@@ -1934,7 +2350,7 @@ class model:
             for i in range(len(conversation)):
                 if ("content" in conversation[i] and isinstance(conversation[i]["content"], str)):
                     conversation[i]["content"] = [{"type": "text", "text": conversation[i]["content"]}]
-        elif model_struct in ("dots3_note", "glm5_next"):
+        elif model_struct in ("dots3_note", "glm5_next", "naive_n05_flash"):
             # These chat templates iterate over argument objects, while the
             # OpenAI wire protocol stores function.arguments as a JSON string.
             # Normalize assistant tool-call history before rendering so a
@@ -1974,6 +2390,8 @@ class model:
                             tool_choice = None, chat_template_kwargs = None) -> int:
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
+        if getattr(self, "kvmem_enabled", False) and (images or videos):
+            raise ValueError("KVMem currently supports text-only requests")
         multimodal_images = list(images or [])
         multimodal_videos = list(videos or [])
         if multimodal_images or multimodal_videos:
@@ -1982,6 +2400,12 @@ class model:
                 architecture = self.config["architectures"][0]
             except:
                 architecture = ""
+            if self._is_deepseek_v41():
+                if multimodal_videos:
+                    raise ValueError("DeepSeek-V4.1 does not support video input.")
+                native_inputs = self._prepare_deepseek_v41_multimodal(
+                    conversation, multimodal_images, tools, enable_thinking, thinking_effort)
+                return len(native_inputs["input_ids"])
             if architecture == "Gemma4ForConditionalGeneration":
                 if self.hf_tokenizer is None:
                     raise ValueError("Gemma4 multimodal token counting needs a Hugging Face tokenizer.")
@@ -2016,6 +2440,9 @@ class model:
                     enable_thinking = enable_thinking,
                     encode_vision = False,
                     encode_fn = self.encode,
+                    tools = tools,
+                    tool_choice = tool_choice,
+                    chat_template_kwargs = chat_template_kwargs,
                 )
                 return len(native_inputs["input_ids"])
             if architecture == "Step3p7ForConditionalGeneration":
@@ -2045,7 +2472,7 @@ class model:
         except:
             architecture = ""
         if self._uses_hf_deepseek_v4_tokenizer():
-            from ftllm.encoding_dsv4 import encode_messages
+            encode_messages = self._deepseek_encode_messages(thinking_effort)
             thinking_mode = "thinking" if enable_thinking else "chat"
             rendered_conversation = self._inject_deepseek_v4_tools(
                 copy.deepcopy(conversation), tools)
@@ -2077,7 +2504,8 @@ class model:
                          enable_thinking, tools, thinking_effort, tool_choice,
                          chat_template_kwargs],
                         ensure_ascii = False,
-                        sort_keys = True,
+                        # Templates can render tool properties/arguments in
+                        # insertion order; distinct orders must not share IDs.
                         separators = (",", ":"))
                 except (TypeError, ValueError):
                     cache_key = None
@@ -2110,7 +2538,7 @@ class model:
                         tokenize = True,
                         enable_thinking = enable_thinking,
                         tools = tools,
-                        thinking_alias = self._is_kimi_k3(),
+                        thinking_alias = True,
                         thinking_effort = thinking_effort,
                         tool_choice = tool_choice,
                         chat_template_kwargs = chat_template_kwargs)
@@ -2148,7 +2576,7 @@ class model:
             return len(input_ids)
         else:
             if self._is_deepseek_v4() and not self.force_chat_template:
-                from ftllm.encoding_dsv4 import encode_messages
+                encode_messages = self._deepseek_encode_messages()
                 thinking_mode = "thinking" if enable_thinking else "chat"
                 prompt = encode_messages(conversation, thinking_mode=thinking_mode)
             elif self._is_qwen35():
@@ -2310,7 +2738,7 @@ class model:
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
                     if self._uses_hf_deepseek_v4_tokenizer():
-                        from ftllm.encoding_dsv4 import encode_messages
+                        encode_messages = self._deepseek_encode_messages()
                         thinking_mode = (
                             "thinking" if self.enable_thinking else "chat")
                         prompt = encode_messages(
@@ -2353,7 +2781,7 @@ class model:
                     prompt = self._render_qwen35_text_prompt(
                         conversation, add_generation_prompt)
                 elif self._is_deepseek_v4() and not self.force_chat_template:
-                    from ftllm.encoding_dsv4 import encode_messages
+                    encode_messages = self._deepseek_encode_messages()
                     thinking_mode = "thinking" if self.enable_thinking else "chat"
                     prompt = encode_messages(conversation, thinking_mode=thinking_mode)
                 else:
@@ -2497,6 +2925,26 @@ class model:
                                                             max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                             False, stop_token_len, stop_token_list)
                 return handle
+            elif self._is_deepseek_v41():
+                if (len(multimodal_videos) > 0):
+                    raise ValueError("DeepSeek-V4.1 does not support video input.")
+                if (conversation is None or len(conversation) == 0):
+                    prompt_text = query if self.direct_query else self.get_prompt(query, history)
+                    conversation = [{"role": "user", "content": prompt_text}]
+                native_inputs = self._prepare_deepseek_v41_multimodal(
+                    conversation, multimodal_images, tools, enable_thinking, thinking_effort)
+                payload_config, payload = build_deepseek_v41_multimodal_payload(native_inputs)
+                payload_json = json.dumps(payload_config)
+                payload_buffer = ctypes.create_string_buffer(payload) if payload else None
+                input = native_inputs["input_ids"]
+                stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+                handle = fastllm_lib.launch_response_llm_model_multimodal(
+                    self.model, len(input), (ctypes.c_int * len(input))(*input),
+                    payload_json.encode(), payload_buffer,
+                    max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                    False, stop_token_len, stop_token_list
+                )
+                return handle
             elif (architecture == "Gemma4ForConditionalGeneration"):
                 tokenizer = self.hf_tokenizer
                 if tokenizer is None:
@@ -2561,6 +3009,9 @@ class model:
                     add_generation_prompt = add_generation_prompt,
                     enable_thinking = enable_thinking,
                     encode_fn = self.encode,
+                    tools = tools,
+                    tool_choice = tool_choice,
+                    chat_template_kwargs = chat_template_kwargs,
                 )
                 payload_config, payload = build_qwen35_multimodal_payload(
                     native_inputs, tokenizer, model_config = self.config
@@ -2630,6 +3081,7 @@ class model:
                 type = "ChatGLM3"
             if (not(history)):
                 history = [];
+            can_reuse_token_count = False
             if (type == "ChatGLM3"):
                 input = tokenizer.build_chat_input(query, history=history)["input_ids"].reshape(-1).tolist()
             else:
@@ -2637,20 +3089,20 @@ class model:
                 direct_template_tokens = None
                 can_reuse_token_count = (
                     conversation is not None and len(conversation) != 0 and
-                    not self.save_history and
                     pending_text_input_token_cache is not None and
-                    pending_text_input_token_cache.get("conversation") == conversation and
+                    _same_template_input(pending_text_input_token_cache.get("conversation"), conversation) and
                     pending_text_input_token_cache.get("add_generation_prompt") == add_generation_prompt and
                     pending_text_input_token_cache.get("enable_thinking") == enable_thinking and
-                    pending_text_input_token_cache.get("tools") == tools and
+                    _same_template_input(pending_text_input_token_cache.get("tools"), tools) and
                     pending_text_input_token_cache.get("thinking_effort") == thinking_effort and
-                    pending_text_input_token_cache.get("tool_choice") == tool_choice and
-                    pending_text_input_token_cache.get("chat_template_kwargs") == chat_template_kwargs)
+                    _same_template_input(pending_text_input_token_cache.get("tool_choice"), tool_choice) and
+                    _same_template_input(pending_text_input_token_cache.get("chat_template_kwargs"), chat_template_kwargs))
                 if can_reuse_token_count:
                     input = pending_text_input_token_cache["input_ids"]
                 elif (conversation != None and len(conversation) != 0):
                     if self._uses_hf_deepseek_v4_tokenizer():
-                        from ftllm.encoding_dsv4 import encode_messages
+                        encode_messages = self._deepseek_encode_messages(
+                            thinking_effort)
                         thinking_mode = (
                             "thinking" if enable_thinking else "chat")
                         rendered_conversation = self._inject_deepseek_v4_tools(
@@ -2699,7 +3151,13 @@ class model:
                                                         max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                         False, stop_token_len, stop_token_list)
             if (self.save_history):
-                self.current_tokenizer_cache[handle] = [[prompt], [input]]
+                if can_reuse_token_count:
+                    # Native KV history is independent of this Python text
+                    # cache. Reused IDs have no rendered prompt snapshot; an
+                    # empty snapshot would match unrelated future requests.
+                    self.current_tokenizer_cache.pop(handle, None)
+                else:
+                    self.current_tokenizer_cache[handle] = [[prompt], [input]]
             return handle
         else:
             prompt = ""
@@ -2708,7 +3166,8 @@ class model:
                     prompt = self._render_qwen35_text_prompt(
                         conversation, add_generation_prompt, enable_thinking)
                 elif self._is_deepseek_v4() and not self.force_chat_template:
-                    from ftllm.encoding_dsv4 import encode_messages
+                    encode_messages = self._deepseek_encode_messages(
+                        thinking_effort)
                     thinking_mode = "thinking" if enable_thinking else "chat"
                     conversation = self._inject_deepseek_v4_tools(conversation, tools)
                     prompt = encode_messages(conversation, thinking_mode=thinking_mode)
@@ -2834,27 +3293,29 @@ class model:
         is_prefill = True
         start_time = time.time()
 
-        def capture_response_statistics():
-            if response_statistics is None:
-                return
-            statistics = self.get_response_statistics(handle)
-            if statistics is not None:
-                response_statistics.update(statistics)
-
         # DSpark commits at most a small speculative block per scheduler turn,
         # but more than one block may be ready when the HTTP consumer is slow.
         # Drain a generous bounded batch through one C call and one scheduler
         # mutex acquisition.
         fetch_batch_capacity = 64
         fetch_batch_buffer = (ctypes.c_int * fetch_batch_capacity)()
+        fetch_statistics = (ctypes.c_int * 3)()
 
         def fetch_ready_tokens():
-            count = fastllm_lib.fetch_response_tokens_batch_llm_model(
+            count = fastllm_lib.fetch_response_tokens_batch_with_statistics_llm_model(
                 self.model, handle, fetch_batch_buffer,
-                fetch_batch_capacity)
+                fetch_batch_capacity, fetch_statistics)
             if count <= 0:
                 return count, []
             return count, [fetch_batch_buffer[i] for i in range(count)]
+
+        def capture_response_statistics():
+            # The terminal fetch releases the handle. Only use the snapshot
+            # returned by that same call; a lookup could read a new request.
+            if response_statistics is not None and fetch_statistics[0] >= 0:
+                response_statistics.update(zip(
+                    ("cached_input_tokens", "missed_input_tokens", "output_tokens"),
+                    fetch_statistics))
 
         if (self._can_apply_hf_chat_template() or
                 self._uses_hf_deepseek_v4_tokenizer()):
@@ -3057,16 +3518,23 @@ class model:
         fastllm_lib.release_memory(self.model)
     
     def set_save_history(self, save: bool):
-        self.save_history = True
+        if (getattr(self, "kvmem_enabled", False) and save and
+                not fastllm_lib.supports_kvmem_prefix_cache_llm_model(self.model)):
+            raise ValueError("This model's KVMem backend does not support history caching")
+        self.save_history = bool(save)
         fastllm_lib.set_save_history(self.model, save)
 
     def set_atype(self, atype: str):
+        if getattr(self, "kvmem_enabled", False):
+            raise ValueError("Set compute dtype before configuring KVMem")
         fastllm_lib.set_model_atype(self.model, str(atype).encode())
 
     def set_moe_atype(self, moe_atype: str):
         fastllm_lib.set_model_moe_atype(self.model, str(moe_atype).encode())
 
     def set_kv_cache_dtype(self, kv_cache_dtype: str):
+        if getattr(self, "kvmem_enabled", False):
+            raise ValueError("Set KV dtype before configuring KVMem")
         fastllm_lib.set_model_kv_cache_dtype(self.model, str(kv_cache_dtype).encode())
 
     def warmup(self):
@@ -3080,6 +3548,50 @@ class model:
     
     def set_cuda_shared_expert(self, cuda_shared_expert: bool):
         fastllm_lib.set_cuda_shared_expert(cuda_shared_expert)
+
+    def set_kvmem(self, *, enabled=True, max_tokens=32768, resident_tokens=8192,
+                  sink_tokens=128, recent_tokens=2048, retrieval_tokens=4096,
+                  prefill_tokens=512, host_mib=8192, retrieval_interval=64):
+        """Opt into host-backed KV before warmup.
+
+        Qwen3/3.5 use sparse retrieval on one GPU, changing attention once the
+        resident budget is exceeded. Qwen3.5 also supports DFlash/MTP.
+        Qwen4/QSA in Hybrid execution mode keeps the original selection and stores
+        exact FP16 KV in pinned host memory, caching at most resident_tokens per layer
+        on its CUDA device. Prefill temporarily stages one full attention layer
+        on each device, reusing that workspace between layers. This also supports
+        PP/TP and CUDA Graph; sink/recent/retrieval policy parameters do not apply
+        to native QSA. Pure GPU and CPU execution modes do not enable Qwen4 KVMem.
+        Qwen4 resident_tokens must be divisible by 4. Prefix reuse and concurrent
+        requests are disabled in those adapters; the full max_tokens context
+        remains available. MiMo/Naive N0.5 supports CUDA TP with an explicit
+        max_batch set before KVMem, BF16/FP8 KV and CUDA Graph. Its Indexer stays
+        on GPU and preserves exact TopK; prefill stages one layer at a time.
+        MiMo KVMem supports shared paged prefixes and GPU SWA checkpoints; draft models remain disabled.
+        Its global physical pool can be set with set_max_tokens / --tokens before
+        configuring KVMem, independently of the per-request max_tokens limit.
+        host_mib covers all requests, ranks and KV layers (including graph padding).
+        For Qwen3/3.5, token budgets except max_tokens must align to the KV page.
+        retrieval_interval controls their speculative score reuse in committed
+        tokens; it need not be page aligned. Use 1 to refresh every verify round.
+        """
+        values = (max_tokens, resident_tokens, sink_tokens, recent_tokens,
+                  retrieval_tokens, prefill_tokens)
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be bool")
+        if any(type(value) is not int or not 0 <= value <= 2147483647 for value in values):
+            raise ValueError("KVMem token budgets must be nonnegative 32-bit integers")
+        if type(host_mib) is not int or not 0 < host_mib < (1 << 44):
+            raise ValueError("host_mib must be a positive integer below 2**44")
+        if type(retrieval_interval) is not int or not 1 <= retrieval_interval <= 2147483647:
+            raise ValueError("retrieval_interval must be a positive 32-bit integer")
+        error = fastllm_lib.set_kvmem_llm_model(
+            self.model, enabled, *values, host_mib << 20, retrieval_interval)
+        if error:
+            raise ValueError(error.decode("utf-8", errors="replace"))
+        self.kvmem_enabled = enabled
+        if enabled and not fastllm_lib.supports_kvmem_prefix_cache_llm_model(self.model):
+            self.save_history = False
 
     def set_kv_cache_limit(self, limit: str):
         limit_bytes = 0
@@ -3099,6 +3611,8 @@ class model:
         fastllm_lib.set_kv_cache_limit_llm_model(self.model, ctypes.c_int64(limit_bytes))
     
     def set_max_batch(self, batch: int):
+        if getattr(self, "kvmem_enabled", False) and batch != self.get_max_batch():
+            raise ValueError("Set max_batch before configuring KVMem")
         fastllm_lib.set_max_batch_llm_model(self.model, batch)
 
     def get_max_batch(self):
@@ -3118,6 +3632,14 @@ class model:
     def set_chunked_prefill_size(self, size: int):
         """设置分块 prefill 的切片大小（首块与后续块使用相同 token 数）。"""
         fastllm_lib.set_chunked_prefill_size_llm_model(self.model, size)
+
+    def set_prefill_batching(self, tokens: int, max_wait_ms: int = 0):
+        """启动前设置 prefill 攒批目标和最长等待；目前仅支持 Naive 普通 TP GPU 推理。"""
+        if not all(isinstance(value, int) and 0 <= value <= 2147483647
+                   for value in (tokens, max_wait_ms)) or (max_wait_ms > 0 and tokens == 0):
+            raise ValueError("prefill batching requires non-negative int32 values and a positive token target when waiting")
+        if not fastllm_lib.set_prefill_batching_llm_model(self.model, tokens, max_wait_ms):
+            raise ValueError("prefill batching must be configured before serving and currently requires ordinary Naive TP GPU inference")
     
     def set_verbose(self, verbose: int):
         fastllm_lib.set_verbose_llm_model(self.model, verbose)

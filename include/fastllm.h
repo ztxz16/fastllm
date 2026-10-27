@@ -51,7 +51,6 @@ namespace fastllm {
         bool cudaTriton = false;
         bool useFusedTransferAttn = true;
         bool useFusedGdnPrefill = true;
-        std::string debugTokenId;
     };
 
     const FastllmEnv &GetFastllmEnv();
@@ -104,6 +103,8 @@ namespace fastllm {
     int GetCudaSlabMB();
     void SetMoeCudaCacheBytes(uint64_t bytes);
     uint64_t GetMoeCudaCacheBytes();
+    void SetMoeCpuCacheBytes(uint64_t bytes);
+    uint64_t GetMoeCpuCacheBytes();
     int GetThreads();
     bool GetKVCacheInCPU();
     bool GetHistoryCacheInCPU();
@@ -179,6 +180,8 @@ namespace fastllm {
         std::map <std::string, std::vector <std::string> > tool_call_allowed_parameter_names;
         std::vector <std::string> tool_call_parameter_name_prefixes;
         std::vector <int> tool_call_allowed_token_ids;
+        // Emitted prefix snapshot; speculative branches advance a private copy.
+        std::string tool_call_generated_text;
         bool tool_call_content_sampling_enabled = false;
         // Set on the per-step config after Kimi-K3 has drained DSpark's
         // scheduler-ahead queue. DSpark then samples from its batched target
@@ -346,6 +349,9 @@ namespace fastllm {
         // Internal NUMA layout: each 32-row tile stores packed block-16
         // weights, then FP32 scales, retaining gate/up row interleaving.
         NVFP4_BLOCK_16_PLANAR = 1011,
+        // Internal CPU row layout: one FP32 global multiplier followed by
+        // [8 packed E2M1 bytes, 1 raw E4M3 scale byte] per block of 16.
+        NVFP4_BLOCK_16_E4M3_PACKED = 1012,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
@@ -412,7 +418,7 @@ namespace fastllm {
         const std::vector<float> &globalScales,
         int blockK, int blockM, uint8_t *destination,
         int destinationRowStart, int destinationRows,
-        bool crossSwiglu = false, bool planar = false);
+        bool crossSwiglu = false, bool planar = false, bool compactScales = false);
     void ConvertCompactE4M3NVFP4ToBlock16(
         Data &data, bool crossSwiglu = false);
 
@@ -486,6 +492,8 @@ namespace fastllm {
     };
 
     class PagedCacheManager;
+    struct KvMemConfig;
+    class KvMemCache;
 
     class Data {
     public:
@@ -493,12 +501,20 @@ namespace fastllm {
 
         long long cacheUid = 0; // 用来标注Cache id
         bool isKVCache = false; // 是否是KV Cache TODO: 做一些KVCache的管理
+        // Naive DSA: the key row ends in 128 E4M3 values + FP32 scale,
+        // padded to 144 bytes so the main attention row remains aligned.
+        bool kvCacheFp8Indexer = false;
         bool isLinearAttention = false; // 是否是线性attention的缓存（永远保持同样的形状）
         bool isLinearAttentionTransposed = false; // 线性attention recurrent state是否物理存成[V,K]
 
         // Paged KV Cache的相关信息
         // 当isKVCache = true且isPagedKVCache = true时，下面这些信息才有意义
         bool isPagedKVCache = false; // 是否是分片的KV Cache
+        // Optional request-owned sparse KV storage; pageIndex is a borrowed view.
+        std::shared_ptr<const KvMemConfig> kvMemConfig;
+        std::shared_ptr<KvMemCache> kvMemCache;
+        // Optional lifetime lease for model-owned, borrowed KV storage.
+        std::shared_ptr<void> kvStorageOwner;
         int pageLen = 128; // 每个page的长度（token数）
         PagedCacheManager *pagedKVCacheData = nullptr; // 存储kv cached的数据，shape为 [maxPages, pageLen, numHeads, headDim]
         std::vector <int> pageIndex; // 目前使用的Index编号
@@ -587,10 +603,14 @@ namespace fastllm {
         void *ggmlTensor = nullptr;
         int ggmlType = -1;
         bool IsRepacked = false;
+        // CUDA-only in-place NVFP4 row-major codes + tiled E4M3 scales.
+        bool cudaNativeNvfp4Layout = false;
         bool disableGGUFRepack = false;
         bool forceGGUFFp32Dequant = false;
 
         std::vector <uint8_t*> numasData; // numa数据
+        // Registered host-MoE shards may use one unbound CPU domain.
+        bool hostMoeUnbound = false;
         // True only when RegisterNumas has verified that every inline E8M0
         // scale in an NVFP4 block32 shard can absorb the kernel's 2^64
         // compensation without overflow.  Unknown and ineligible weights
@@ -698,6 +718,9 @@ namespace fastllm {
     struct CacheTrieNode {
         int pageId = -1;
         long long timestamp = 0;
+        long long lastAccess = 0;
+        int unusedIndex = -1;
+        bool evictable = false;
         std::unordered_map<uint64_t, CacheTrieNode*> children;
         CacheTrieNode *parent = nullptr;
         uint64_t edgeHash = 0;
@@ -750,6 +773,18 @@ namespace fastllm {
             static uint64_t HashTokenPage(const int *tokens, int len);
             void Record(const std::vector<int> &tokens, const std::vector<int> &pages);
             void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds);
+
+            // Materialize free pages in the same order used by allocation.
+            // This may evict unreferenced cache entries, but never reserves pages.
+            void PreviewUnusedPageIndices(int count, std::vector<int> &pages);
+            bool IsCachedPage(int pageIndex, long long generation);
+
+        private:
+            std::set<std::pair<long long, int>> evictableLeaves;
+            void UpdateEvictableLeaf(CacheTrieNode *node);
+            void RemoveTriePage(int pageIndex);
+            void ReleasePageIndexLocked(int pageIndex);
+            void PrepareFreePages(int count);
     };
 
     struct PartitionLinkNode {
@@ -833,6 +868,8 @@ namespace fastllm {
         bool addDummyPrefix = true;   // 是否在首位添加空格
         bool removeExtraWhitespaces = true;   // 是否将多个空格合并为一个
         bool byteAsChar = false;  // 是否将byte变为展示字符
+        std::string preTokenizer;
+        std::unordered_map<std::string, int> bpeMergeRanks;
 
         std::unordered_map <int, std::string> tokenToStringDict;
         std::unordered_map <int, float> tokenToScoreDict;
@@ -964,7 +1001,8 @@ namespace fastllm {
                 float sharedScale, Data &output, int layer = 0, MoeGateType gateType = MoeGateSwiglu,
                 bool expertParallel = false, float swigluLimit = 0.0f,
                 bool deepSeekV4Mode = false,
-                Data *pairedReduceInput = nullptr);
+                Data *pairedReduceInput = nullptr, int activationQuantBlock = 128,
+                bool quantizeSharedExpert = false);
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,
                 Data &gate, Data &up, Data &down, Data &w1,
@@ -1372,7 +1410,8 @@ namespace fastllm {
 
     void LlamaRotatePosition2DPart(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim, int part); // 2D position embedding for llama，前后各一半的维度旋转
 
-    void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale); // RoPE encoding，直接用rope_theta和rope_scale计算，无需sin/cos缓存
+    // preciseFreq matches the inverse-frequency rounding of the former text RoPE tables.
+    void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale, bool preciseFreq = false); // RoPE encoding，直接用rope_theta和rope_scale计算，无需sin/cos缓存
 
     void Llama3RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
                             float factor, float originalMaxPosition,

@@ -98,6 +98,14 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
 // VO-split was originally reserved for head dimensions above 256. D256 with
 // CTA16 also needs it on 64 KiB-smem GPUs: time-sharing the K/V tile is what
 // makes this short-query shape launchable on SM75.
+// A custom small-query policy can request explicit output-stage ordering.
+// Existing attention policies keep their original generated code.
+template <typename Variant, typename = void>
+struct NeedsDFlashOutputSync : std::false_type {};
+template <typename Variant>
+struct NeedsDFlashOutputSync<Variant, std::void_t<decltype(Variant::dflash_sync_output)>>
+    : std::bool_constant<Variant::dflash_sync_output> {};
+
 constexpr bool use_vo_split_shape(const uint32_t num_warps_kv,
                                   const uint32_t cta_tile_q,
                                   const uint32_t head_dim_vo) {
@@ -1971,6 +1979,11 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
         }
       }
     }
+    if constexpr (NeedsDFlashOutputSync<typename KTraits::AttentionVariant>::value) {
+      // The reduction arrays alias the FP16 output staging area. Every warp
+      // must finish reading the reduction before any Q warp reuses it.
+      __syncthreads();
+    }
   }
 }
 
@@ -2033,6 +2046,11 @@ __device__ __forceinline__ void write_o_reg_gmem(
         }
       }
 
+      if constexpr (NeedsDFlashOutputSync<typename KTraits::AttentionVariant>::value) {
+        // Lanes read each other's staged FP16 values below. SM75 independent
+        // thread scheduling requires a warp memory barrier between phases.
+        __syncwarp();
+      }
       uint32_t o_smem_offset_w = o_smem->template get_permuted_offset<UPCAST_STRIDE_O>(
           warp_idx_x * KTraits::NUM_MMA_Q * 16 + lane_idx / 8, lane_idx % 8);
 
@@ -2173,16 +2191,23 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     const uint32_t lane_idx = tid.x, warp_idx = get_warp_idx<KTraits>(tid.y, tid.z);
     const uint32_t num_qo_heads = num_kv_heads * group_size;
 
-    const uint32_t max_chunk_size = partition_kv ? ceil_div(kv_len, num_chunks) : kv_len;
-    const uint32_t chunk_start = partition_kv ? chunk_idx * max_chunk_size : 0;
-    const uint32_t chunk_end =
-        partition_kv ? min((chunk_idx + 1) * max_chunk_size, kv_len) : kv_len;
-    const uint32_t chunk_size = chunk_end - chunk_start;
-
     auto block = cg::this_thread_block();
     auto smem = reinterpret_cast<uint8_t*>(&smem_storage);
     AttentionVariant variant(params, /*batch_idx=*/0, smem);
     const uint32_t window_left = variant.window_left;
+
+    const uint32_t max_chunk_size = partition_kv ? ceil_div(kv_len, num_chunks) : kv_len;
+    // Every query in this CTA masks the keys before window_start. Skip whole
+    // KV tiles, retaining the original tile boundaries and accumulation order.
+    // Split-KV keeps its original partitions and merge bookkeeping.
+    const uint32_t window_start = AttentionVariant::uses_sliding_window
+        ? sub_if_greater_or_zero(kv_len + (bx * CTA_TILE_Q) / group_size, qo_len + window_left)
+        : 0;
+    const uint32_t chunk_start = partition_kv ? chunk_idx * max_chunk_size
+                                             : (window_start / CTA_TILE_KV) * CTA_TILE_KV;
+    const uint32_t chunk_end =
+        partition_kv ? min((chunk_idx + 1) * max_chunk_size, kv_len) : kv_len;
+    const uint32_t chunk_size = chunk_end - chunk_start;
 
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     constexpr uint32_t O_FRAG_D = KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT
@@ -2498,7 +2523,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCache
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          bool ENABLE_SM75_FP16_VO_SPLIT, typename Params>
+          bool ENABLE_SM75_FP16_VO_SPLIT, typename Params, bool ENABLE_SPLIT_KV = true>
 cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Params::DTypeO* tmp,
                                                  cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
@@ -2660,7 +2685,7 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
               num_chunks = 0;
             }
 
-            if (num_chunks <= 1 || tmp == nullptr) {
+            if (!ENABLE_SPLIT_KV || num_chunks <= 1 || tmp == nullptr) {
               // Enough parallelism, do not split-kv
               params.partition_kv = false;
               void* args[] = {(void*)&params};
@@ -2668,7 +2693,7 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
               dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-            } else {
+            } else if constexpr (ENABLE_SPLIT_KV) {
               // Use cooperative groups to increase occupancy
               params.partition_kv = true;
               float* tmp_lse = (float*)(tmp + num_chunks * qo_len * num_qo_heads * HEAD_DIM_VO);
@@ -2683,8 +2708,8 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
               if constexpr (AttentionVariant::use_softmax) {
-                FLASHINFER_CUDA_CALL(MergeStates(tmp, tmp_lse, o, lse, num_chunks, qo_len,
-                                                 num_qo_heads, HEAD_DIM_VO, stream));
+                FLASHINFER_CUDA_CALL(MergeStatesDispatched<HEAD_DIM_VO>(tmp, tmp_lse, o, lse, num_chunks, qo_len,
+                                                 num_qo_heads, stream));
               } else {
                 FLASHINFER_CUDA_CALL(
                     AttentionSum(tmp, o, num_chunks, qo_len, num_qo_heads, HEAD_DIM_VO, stream));
@@ -2698,7 +2723,7 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          typename Params>
+          typename Params, bool ENABLE_SPLIT_KV = true>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
                                               cudaStream_t stream) {
   // Pass an explicit specialization flag to both the host planner and kernel.
@@ -2715,12 +2740,12 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                                   (params.num_qo_heads / params.num_kv_heads);
     if (use_sm75_single_prefill_vo_split(capability.first, capability.second, packed_qo_len)) {
       return SinglePrefillWithKVCacheDispatchedImpl<HEAD_DIM_QK, HEAD_DIM_VO,
-          POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, true>(
+          POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, true, Params, ENABLE_SPLIT_KV>(
               params, tmp, stream);
     }
   }
   return SinglePrefillWithKVCacheDispatchedImpl<HEAD_DIM_QK, HEAD_DIM_VO,
-      POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, false>(
+      POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, false, Params, ENABLE_SPLIT_KV>(
           params, tmp, stream);
 }
 
@@ -4317,9 +4342,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
             }
             if constexpr (AttentionVariant::use_softmax) {
-              FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+              FLASHINFER_CUDA_CALL(VariableLengthMergeStatesDispatched<HEAD_DIM_VO>(
                   tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-                  params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+                  params.total_num_rows, num_qo_heads, enable_pdl, stream));
             } else {
               FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
                   tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
@@ -4506,9 +4531,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
             }
             if constexpr (AttentionVariant::use_softmax) {
-              FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+              FLASHINFER_CUDA_CALL(VariableLengthMergeStatesDispatched<HEAD_DIM_VO>(
                   tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-                  params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+                  params.total_num_rows, num_qo_heads, enable_pdl, stream));
             } else {
               FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
                   tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,

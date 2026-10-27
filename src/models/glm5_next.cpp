@@ -1,11 +1,20 @@
 #include "glm5_next.h"
+#include "utils/hybrid_moe.h"
+#include "glm5_next_mla_prefill.h"
+#include "glm5_next_dsa.h"
+#include "glm5_next_gguf.h"
 
 #include "blocks/baseblock.h"
 #include "gguf.h"
+#include "executor.h"
 #include "utils.h"
+#include "devices/disk/diskdevice.h"
 
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-gguf-projections.h"
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "utils/cuda_chunked_prefill.h"
 #endif
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
@@ -17,15 +26,90 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <set>
+
+#include "glm5_next_tp.h"
 
 namespace fastllm {
     const std::string Glm5NextModel::languagePrefix =
         "model.language_model.";
 
     namespace {
+        // Group independent projections without retaining quantized activations
+        // across calls. Nonresident/non-GGUF weights and larger batches use Linear.
+        void Glm5NextLinearGroup(Data &input, std::initializer_list<Data *> weights,
+                                std::initializer_list<Data *> outputs) {
+            AssertInFastLLM(weights.size() == outputs.size(),
+                "GLM projection group size mismatch.");
+#ifdef USE_CUDA
+            bool shared = input.dataDevice == DataDevice::CUDA &&
+                input.dataType == DataType::BFLOAT16 && !input.dims.empty() &&
+                input.dims.back() > 0 && input.Count(0) / input.dims.back() <= 8;
+            for (auto *w : weights) {
+                shared = shared && w->dataType == DataType::DATA_GGUF_FORMAT &&
+                    w->dataDevice == DataDevice::CUDA && w->cudaData != nullptr &&
+                    w->dims.size() == 2 && w->dims[1] == input.dims.back();
+            }
+            if (shared) {
+                auto output = outputs.begin();
+                for (auto *w : weights) {
+                    Data &o = **output++;
+                    o.dataType = input.dataType;
+                    o.UpdateUnitSize();
+                    auto dims = input.dims;
+                    dims.back() = w->dims[0];
+                    o.Resize(dims);
+                    o.ToDevice(DataDevice::CUDA, input.dataDeviceIds, false);
+                    o.Allocate(false);
+                }
+                if (FastllmCudaGGUFLinearShared(input, weights.begin(), outputs.begin(),
+                        (int)weights.size())) return;
+            }
+#endif
+            auto output = outputs.begin();
+            for (auto *w : weights) Linear(input, *w, Data(), **output++);
+        }
+
+        // Activations are contiguous [1, rows, ...]; these views never own
+        // request state and remain valid for their parent tensor's lifetime.
+        void ViewGlm5NextRows(const Data &source, int first, int rows, Data &view) {
+            AssertInFastLLM(source.dims.size() >= 2 && source.dims[0] == 1 &&
+                first >= 0 && rows > 0 && first + rows <= source.dims[1],
+                "GLM-5.3 activation row view is out of range.");
+            view.FakeFrom(source, first * (source.GetBytes() / source.dims[1]));
+            auto dims = source.dims;
+            dims[1] = rows;
+            view.Resize(dims);
+        }
+
+        void AppendGlm5NextRows(Data &output, const Data &rows, int totalRows) {
+            if (output.dims.empty()) {
+                output.CopyFrom(rows);
+                auto dims = rows.dims;
+                dims[1] = totalRows;
+                if (totalRows != rows.dims[1]) output.Expansion(dims);
+            } else {
+                CatDirect(output, rows, 1);
+            }
+            if (output.dims[1] == totalRows) output.expansionDims.clear();
+        }
+
+        void InitializeGlm5NextPagedDescriptor(Data &cache, const Data &current) {
+            if (cache.dims.empty() && cache.pageIndex.empty() &&
+                cache.pagedKVCacheData == nullptr) {
+                cache.dataType = current.dataType;
+                cache.UpdateUnitSize();
+                cache.dataDevice = current.dataDevice;
+                cache.dataDeviceIds = current.dataDeviceIds;
+                cache.SetKVCache();
+            }
+            AssertInFastLLM(cache.dataType == current.dataType,
+                "GLM-5.3 paged-cache descriptor dtype mismatch.");
+        }
+
         void FlattenGlm5NextTextConfig(
                 std::map<std::string, std::string> &dicts) {
             const std::string prefix = "text_config.";
@@ -175,6 +259,35 @@ namespace fastllm {
                 Glm5NextWriteFloat(data, index, value);
             }
             data.ToDevice(originalDevice, originalDeviceIds);
+        }
+
+        void Glm5NextHcPreNorm(Data &input, Data &fn, Data &scale,
+                Data &base, Data &norm, int hcMult, int sinkhornIters,
+                float eps, float normEps, Data &output, Data &post, Data &comb,
+                bool hybrid = false) {
+#ifdef USE_CUDA
+            auto *executor = static_cast<Executor*>(GetExecutor());
+            const bool prefill = hybrid && input.dims.size() == 4 && input.dims[1] >= 64;
+            if (input.dims.size() == 4 && input.dims[0] == 1 &&
+                input.dims[1] >= 1 && (input.dims[1] <= 8 || prefill) &&
+                input.dims[2] == 4 && input.dims[3] == 4096 &&
+                executor->GetFirstDeviceType() == "cuda") {
+                const auto devices = executor->GetDeviceIds("cuda");
+                for (Data *x : {&input, &fn, &scale, &base, &norm})
+                    x->ToDevice(DataDevice::CUDA, devices);
+                FastllmCudaSetDevice(GetPointerDeviceId(input.cudaData));
+#ifndef USE_ROCM
+                if (hybrid && FastllmCudaGlm5NextHybridHcPreNorm(input, fn, scale, base, norm,
+                        hcMult, sinkhornIters, eps, normEps, output, post, comb)) return;
+#endif
+                if (FastllmCudaGlm5NextHcPreNorm(input, fn, scale, base, norm,
+                        hcMult, sinkhornIters, eps, normEps, output, post, comb)) return;
+            }
+#endif
+            Data mixed;
+            DeepSeekV4HcPre(input, fn, scale, base, hcMult, sinkhornIters,
+                eps, normEps, mixed, post, comb);
+            KimiK3RMSNorm(mixed, norm, normEps, output);
         }
 
         void Glm5NextHcMean(const Data &input, Data &output) {
@@ -369,7 +482,7 @@ namespace fastllm {
     Glm5NextModel::Glm5NextModel() {
         model_type = "glm5_next";
         model_struct = "glm5_next";
-        canDoBatchForward = false;
+        canDoBatchForward = true;
         dataType = DataType::BFLOAT16;
         kvCacheDataType = DataType::BFLOAT16;
         moeAtype = DataType::BFLOAT16;
@@ -388,6 +501,10 @@ namespace fastllm {
             languagePrefix + "layers.*.self_attn.g_a_proj.weight",
             languagePrefix + "layers.*.self_attn.g_b_proj.weight",
             languagePrefix + "layers.*.self_attn.o_proj.weight",
+            languagePrefix + "layers.*.self_attn.indexer.wq_b.weight",
+            languagePrefix + "layers.*.self_attn.indexer.wk.weight",
+            languagePrefix + "layers.*.self_attn.indexer.weights_proj.weight",
+            languagePrefix + "layers.*.self_attn.indexer.index_kpool_compress_gate",
             languagePrefix + "layers.*.self_attn.q_a_proj.weight",
             languagePrefix + "layers.*.self_attn.q_b_proj.weight",
             languagePrefix + "layers.*.self_attn.kv_a_proj_with_mqa.weight",
@@ -411,6 +528,12 @@ namespace fastllm {
 
     Glm5NextModel::~Glm5NextModel() {
         ShutdownRuntime();
+        hybridDecodeState.reset();
+        threadTpState.reset();
+#ifdef USE_CUDA
+        prefillPipeline.reset();
+#endif
+        if (threadTpRank < 0) ReleaseMoeCudaCache(expertWeights);
         {
             std::lock_guard<std::mutex> guard(historyCacheMutex);
             pendingHistoryCache.reset();
@@ -425,7 +548,11 @@ namespace fastllm {
             std::lock_guard<std::mutex> guard(mtpStatesMutex);
             mtpStates.clear();
         }
-        ClearAllPagedCacheManagers();
+        {
+            std::lock_guard<std::mutex> guard(indexerCachesMutex);
+            indexerCaches.clear();
+        }
+        if (threadTpRank < 0) ClearAllPagedCacheManagers();
     }
 
     void Glm5NextModel::SetDataType(DataType dataType) {
@@ -483,12 +610,35 @@ namespace fastllm {
         rms_norm_eps = requiredFloat("rms_norm_eps");
 
         indexTopK = requiredInt("index_topk");
+        const char *backendEnv = std::getenv("FASTLLM_GLM5_NEXT_DSA_BACKEND");
+        const std::string backend = backendEnv && backendEnv[0] ? backendEnv : "auto";
+        AssertInFastLLM(backend == "auto" || backend == "bf16" || backend == "dense",
+            "FASTLLM_GLM5_NEXT_DSA_BACKEND must be auto, bf16 or dense.");
+        dsaBackend = backend == "dense" ? DsaBackend::Dense :
+            backend == "bf16" ? DsaBackend::BFloat16 : DsaBackend::Auto;
+        if (UsesDsa()) {
+            AssertInFastLLM(requiredInt("index_n_heads") == 32 &&
+                requiredInt("index_head_dim") == 128 && requiredInt("index_kpool") == 4,
+                "GLM DSA requires the 32-head, 128-dim, KPool-4 configuration.");
+        }
         max_positions = requiredInt("max_position_embeddings");
         useCompressedMla = !Glm5NextEnvEnabled(
             "FASTLLM_GLM5_NEXT_EXPANDED_DSA");
         mtpDraftsPerStep = Glm5NextEnvInt(
             "FASTLLM_GLM5_NEXT_ENABLE_MTP", 0, 0, 8);
         mtpEnabled = mtpDraftsPerStep > 0;
+        if (const char *value = std::getenv("FASTLLM_GLM5_NEXT_MTP_MIN_P")) {
+            if (*value) {
+                char *end = nullptr;
+                mtpMinProbability = std::strtof(value, &end);
+                AssertInFastLLM(end != value && *end == '\0' &&
+                    std::isfinite(mtpMinProbability) && mtpMinProbability >= 0 && mtpMinProbability <= 1,
+                    "FASTLLM_GLM5_NEXT_MTP_MIN_P must be in [0, 1].");
+            }
+        }
+        AssertInFastLLM(!UsesDsa() || useCompressedMla,
+            "GLM DSA requires compressed MLA; "
+            "FASTLLM_GLM5_NEXT_DSA_BACKEND=dense restores the legacy dense path.");
         const int nextnLayers = requiredInt("num_nextn_predict_layers");
         AssertInFastLLM(
             !mtpEnabled || nextnLayers == 1,
@@ -569,7 +719,7 @@ namespace fastllm {
             if (!kdaLayers[layer]) {
                 if (useCompressedMla) {
                     elementsInKVCachePerToken +=
-                        kvLoraRank + mlaPaddedPeHeadDim;
+                        kvLoraRank + mlaPaddedPeHeadDim + (UsesDsa() ? 128 / 4 : 0);
                 } else {
                     elementsInKVCachePerToken +=
                         (long long)num_attention_heads *
@@ -579,7 +729,7 @@ namespace fastllm {
         }
         if (mtpEnabled) {
             elementsInKVCachePerToken += useCompressedMla ?
-                kvLoraRank + mlaPaddedPeHeadDim :
+                kvLoraRank + mlaPaddedPeHeadDim + (UsesDsa() ? 128 / 4 : 0) :
                 (long long)num_attention_heads *
                     (qkHeadDim + valueHeadDim);
         }
@@ -634,12 +784,14 @@ namespace fastllm {
             }
         }
 
+        if (threadTpRank < 0) InitExecutionMode();
+        InitThreadTp();
         std::cout
             << "[GLM-5.3] Hybrid text model: 34 KDA + 11 DSA layers, "
             << "42 MoE layers, BF16 activations.\n"
             << "[GLM-5.3] Context window restored to " << max_positions
             << " tokens. DSA above Top-" << indexTopK
-            << (useCompressedMla ?
+            << (UsesDsa() ? " uses KPool-4 learned sparse MLA. " : useCompressedMla ?
                 " uses exact compressed paged MLA with " :
                 " uses legacy expanded paged attention with ")
             << fastllm::GetPageLen() << "-token cache pages.\n";
@@ -649,6 +801,9 @@ namespace fastllm {
                 << " maximum draft token(s) per verification step, "
                 << "adaptive depth, and automatic exact-verifier "
                 << "fallback.\n";
+            if (mtpMinProbability > 0)
+                std::cout << "[GLM-5.3 MTP] Greedy draft confidence threshold: "
+                          << mtpMinProbability << ".\n";
         }
     }
 
@@ -659,6 +814,8 @@ namespace fastllm {
         std::map<std::string,
                  std::vector<std::pair<std::string, DataType>>> result;
         const std::string layersPrefix = languagePrefix + "layers.";
+        const std::set<std::string> tensorNameSet(
+            tensorNames.begin(), tensorNames.end());
 
         for (const std::string &name : tensorNames) {
             if (name == languagePrefix + "embed_tokens.weight") {
@@ -694,8 +851,16 @@ namespace fastllm {
             }
             const std::string suffix = name.substr(position + 1);
 
-            if (suffix.rfind("self_attn.indexer.", 0) == 0 ||
-                Glm5NextEndsWith(suffix, ".weight_scale_inv")) {
+            if (suffix.rfind("self_attn.indexer.", 0) == 0) {
+                if (UsesDsa() && (isMtpLayer || !kdaLayers[layer])) {
+                    const bool fp32 = suffix.find("k_norm.") != std::string::npos ||
+                        suffix.find("weights_proj.") != std::string::npos ||
+                        Glm5NextEndsWith(suffix, "index_kpool_compress_ape");
+                    result[name].emplace_back(name, fp32 ? DataType::FLOAT32 : DataType::BFLOAT16);
+                }
+                continue;
+            }
+            if (Glm5NextEndsWith(suffix, ".weight_scale_inv")) {
                 continue;
             }
             if (isMtpLayer &&
@@ -744,8 +909,26 @@ namespace fastllm {
                  Glm5NextEndsWith(suffix, ".weight")) ||
                 (suffix.rfind("mlp.experts.", 0) == 0 &&
                  Glm5NextEndsWith(suffix, ".weight"))) {
-                result[name].emplace_back(
-                    name, DataType::DATA_AUTO_LINEAR);
+                DataType type = DataType::DATA_AUTO_LINEAR;
+                if (suffix.rfind("mlp.experts.", 0) == 0) {
+                    const std::string base = name.substr(
+                        0, name.size() - std::strlen(".weight"));
+                    const std::string device = SelectMoeDeviceForLayer(
+                        std::min(layer, block_cnt - 1));
+                    // Preserve ModelOpt's E4M3 block scales and separate
+                    // gate/up globals on CUDA and NUMA experts. The loader
+                    // validates the source dtype before accepting this marker.
+                    // NUMA consumes the packed scales directly, including
+                    // the CUDA hybrid-prefill path.
+                    // Scalar weight_scale_2 is absent from tensorNames;
+                    // the generic loader reads it from the safetensors index.
+                    if ((device.rfind("cuda", 0) == 0 ||
+                         device == "numa" || device.rfind("numa:", 0) == 0) &&
+                        tensorNameSet.count(base + ".weight_scale")) {
+                        type = DataType::NVFP4_BLOCK_16_E4M3_PACKED;
+                    }
+                }
+                result[name].emplace_back(name, type);
                 continue;
             }
 
@@ -777,7 +960,35 @@ namespace fastllm {
         return result;
     }
 
+    void Glm5NextModel::InitExecutionMode() {
+        std::vector<std::string> placements;
+        const std::string fallback = ((Executor*)GetExecutor())->GetFirstDeviceType();
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            auto main = SelectDeviceFromMap(deviceMap, layer + 1, block_cnt);
+            if (main.empty()) main = fallback;
+            placements.push_back(main);
+            if (!denseMlpLayers[layer]) {
+                const auto moe = SelectMoeDeviceForLayer(layer);
+                placements.push_back(moe.empty() ? main : moe);
+            }
+        }
+        // A zero-layer fixture still has a meaningful embedding/output device.
+        if (placements.empty()) {
+            auto main = SelectDeviceFromMap(deviceMap, 1, 1);
+            placements.push_back(main.empty() ? fallback : main);
+        }
+        const char *requested = std::getenv("FASTLLM_EXECUTION_MODE");
+        executionMode = ResolveExecutionMode(requested, placements);
+        std::printf("[Fastllm] FASTLLM_EXECUTION_MODE=%s -> %s (GLM-5.3)\n",
+            requested ? requested : "auto", ExecutionModeName(executionMode));
+    }
+
     void Glm5NextModel::OnModelWeightsLoaded() {
+        const auto &ggufArch = weight.dicts["gguf_architecture"];
+        if (ggufArch == "glm5next" || ggufArch == "glm5-next") {
+            glm5_next_detail::RestoreGgufWeights(weight, block_cnt + (mtpEnabled ? 1 : 0),
+                num_attention_heads, qkNopeHeadDim, valueHeadDim, kvLoraRank);
+        }
         auto require = [&](const std::string &name) -> Data& {
             auto it = weight.weight.find(name);
             AssertInFastLLM(
@@ -790,6 +1001,13 @@ namespace fastllm {
         require(languagePrefix + "norm.weight");
         require("lm_head.weight");
 
+        if (UsesDsa()) {
+            for (int layer = 0; layer < block_cnt + (mtpEnabled ? 1 : 0); ++layer) if (layer == block_cnt || !kdaLayers[layer]) {
+                const std::string prefix = languagePrefix + "layers." + std::to_string(layer) + ".self_attn.indexer.";
+                for (const char *suffix : {"wq_b.weight", "wk.weight", "k_norm.weight", "k_norm.bias",
+                        "weights_proj.weight", "index_kpool_compress_gate", "index_kpool_compress_ape"}) require(prefix + suffix);
+            }
+        }
         expertWeights.assign(block_cnt, {});
         expertBiases.assign(block_cnt, {});
         mtpExpertWeights.clear();
@@ -912,6 +1130,8 @@ namespace fastllm {
                 "GLM-5.3 MTP eh_proj has an invalid shape.");
             mtpWeightsReady = true;
         }
+        PrepareDiskMoeCache(expertWeights);
+        if (executionMode == ExecutionMode::Hybrid) PrepareHybridMoeCache();
     }
 
     int Glm5NextModel::GetHistoryCacheSequenceLength(
@@ -962,7 +1182,8 @@ namespace fastllm {
         if (memory.sequenceLength <= 0 ||
             memory.sequenceLength != (int)memory.tokens.size() ||
             (int)memory.pastKeyValues.size() < block_cnt ||
-            (int)kdaLayers.size() < block_cnt) {
+            (int)kdaLayers.size() < block_cnt ||
+            (UsesDsa() && (int)memory.indexer.size() != block_cnt)) {
             return false;
         }
         for (int layer = 0; layer < block_cnt; layer++) {
@@ -987,6 +1208,11 @@ namespace fastllm {
                     return false;
                 }
                 continue;
+            }
+            if (UsesDsa()) {
+                const auto &cache = memory.indexer[layer];
+                if (cache.tokens != memory.sequenceLength ||
+                    cache.keys.dims != std::vector<int>({1, memory.sequenceLength / 4, 128})) return false;
             }
             auto validPaged = [&](const Data &cache, int cacheHeads,
                                   int headDim) {
@@ -1069,9 +1295,28 @@ namespace fastllm {
         if (context == nullptr) {
             return;
         }
+        RemoveThreadTpRequest(&context->pastKeyValues);
+        RemoveHybridDecodeRequest(&context->pastKeyValues);
         {
             std::lock_guard<std::mutex> guard(mtpStatesMutex);
+            auto it = mtpStates.find(&context->pastKeyValues);
+            if (verbose && it != mtpStates.end() && it->second) {
+                const auto &state = *it->second;
+                std::cout << "[GLM-5.3 MTP stats] verify_steps=" << state.verifySteps
+                          << " verified_drafts=" << state.verifiedDrafts
+                          << " accepted_drafts=" << state.acceptedDrafts
+                          << " confidence_checks=" << state.confidenceChecks
+                          << " confidence_stops=" << state.confidenceStops << "\n";
+            }
+            if (it != mtpStates.end() && it->second) {
+                std::lock_guard<std::mutex> indexerGuard(indexerCachesMutex);
+                indexerCaches.erase(&it->second->pastKeyValues);
+            }
             mtpStates.erase(&context->pastKeyValues);
+        }
+        {
+            std::lock_guard<std::mutex> guard(indexerCachesMutex);
+            indexerCaches.erase(&context->pastKeyValues);
         }
         std::lock_guard<std::mutex> guard(responseContextsMutex);
         responseContexts.erase(&context->pastKeyValues);
@@ -1079,6 +1324,7 @@ namespace fastllm {
 
     bool Glm5NextModel::TryRestoreHistoryCache(
             std::vector<int> &inputTokens, int &cacheLen) {
+        if (threadTpState) return false;
         if (mtpEnabled) {
             std::lock_guard<std::mutex> guard(historyCacheMutex);
             pendingHistoryCache.reset();
@@ -1265,8 +1511,23 @@ namespace fastllm {
             }
         }
 
+        if (UsesDsa()) {
+            std::lock_guard<std::mutex> guard(indexerCachesMutex);
+            auto it = indexerCaches.find(&pastKeyValues);
+            if (it == indexerCaches.end() || (int)it->second.size() != block_cnt) return;
+            for (int layer = 0; layer < block_cnt; ++layer) if (!kdaLayers[layer]) {
+                const auto &cache = it->second[layer];
+                if (cache.tokens != sequenceLength) return;
+                for (const Data *data : {&cache.keys, &cache.tailKeys, &cache.tailGates}) {
+                    const uint64_t bytes = data->dims.empty() ? 0 : data->GetBytes();
+                    estimatedBytes += bytes;
+                    recurrentBytes += bytes;
+                }
+            }
+        }
+
         // DSA pages remain in their runtime pools and are retained by reference;
-        // only the fixed-size KDA recurrent state needs a physical snapshot.
+        // KDA recurrent state and the pooled Indexer state need physical snapshots.
         bool storeOnCpu = GetHistoryCacheInCPU() ||
             !recurrentSourcesOnCuda ||
             recurrentBytes > historyCacheGpuStateLimitBytes;
@@ -1419,6 +1680,24 @@ namespace fastllm {
                     memory->pastKeyValues[layer].second);
             }
         }
+        if (UsesDsa()) {
+            std::lock_guard<std::mutex> guard(indexerCachesMutex);
+            const auto &sources = indexerCaches.at(&pastKeyValues);
+            memory->indexer.resize(block_cnt);
+            for (int layer = 0; layer < block_cnt; ++layer) if (!kdaLayers[layer]) {
+                auto &target = memory->indexer[layer];
+                const auto &source = sources[layer];
+                target.tokens = source.tokens;
+                for (auto pair : {std::make_pair(&source.keys, &target.keys),
+                                  std::make_pair(&source.tailKeys, &target.tailKeys),
+                                  std::make_pair(&source.tailGates, &target.tailGates)}) {
+                    if (!pair.first->dims.empty()) {
+                        copyTensor(*pair.first, *pair.second);
+                        memory->bytes += pair.second->expansionBytes;
+                    }
+                }
+            }
+        }
         if (!CanRestoreHistoryCache(*memory)) {
             for (int layer = 0; layer < block_cnt; layer++) {
                 DebugGlm5NextCacheDescriptor(
@@ -1514,6 +1793,24 @@ namespace fastllm {
                     context->pastKeyValues[layer].second);
             }
         }
+        if (UsesDsa()) {
+            std::lock_guard<std::mutex> guard(indexerCachesMutex);
+            auto &targets = indexerCaches[&context->pastKeyValues];
+            targets.clear(); targets.resize(block_cnt);
+            for (int layer = 0; layer < block_cnt; ++layer) if (!kdaLayers[layer]) {
+                const auto &source = memory.indexer[layer];
+                auto &target = targets[layer];
+                target.tokens = source.tokens;
+                for (auto pair : {std::make_pair(&source.keys, &target.keys),
+                                  std::make_pair(&source.tailKeys, &target.tailKeys),
+                                  std::make_pair(&source.tailGates, &target.tailGates)}) {
+                    if (!pair.first->dims.empty()) {
+                        restoreTensor(*pair.first, *pair.second);
+                        pair.second->lockInCPU = false;
+                    }
+                }
+            }
+        }
         AssertInFastLLM(
             GetHistoryCacheSequenceLength(context->pastKeyValues) ==
                 memory.sequenceLength,
@@ -1529,93 +1826,125 @@ namespace fastllm {
 
     void Glm5NextModel::RunKdaAttention(
             int layerIndex, Data &input, int sequence,
-            std::vector<std::pair<Data, Data>> &pastKeyValues,
-            Data &output,
-            KdaReplayCapture *replayCapture) {
+            const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
+            Data &output, KdaReplayCapture *replayCapture) {
+        const int batch = (int)requestCaches.size();
+        AssertInFastLLM(batch == 1 || (batch == sequence && replayCapture == nullptr),
+            "GLM-5.3 KDA batch requires one token per request.");
         const std::string prefix = languagePrefix + "layers." +
             std::to_string(layerIndex) + ".self_attn.";
-        Data qCache, kCache, vCache;
-        BindGlm5NextConvCacheViews(
-            pastKeyValues[layerIndex].first,
-            input,
-            shortConvKernel - 1, kdaHeads * kdaHeadDim,
-            qCache, kCache, vCache);
-        Data &state = pastKeyValues[layerIndex].second;
 
-        auto runChunk = [&](Data &chunkInput, int chunkSequence,
-                            Data &chunkOutput) {
+        auto runChunk = [&](Data &chunkInput, int chunkSequence, Data &chunkOutput) {
             Data qProjected, kProjected, vProjected;
-            Linear(chunkInput, weight[prefix + "q_proj.weight"],
-                   Data(), qProjected);
-            Linear(chunkInput, weight[prefix + "k_proj.weight"],
-                   Data(), kProjected);
-            Linear(chunkInput, weight[prefix + "v_proj.weight"],
-                   Data(), vProjected);
-            if (replayCapture != nullptr) {
-                replayCapture->qProjected.CopyFrom(qProjected);
-                replayCapture->kProjected.CopyFrom(kProjected);
-                replayCapture->vProjected.CopyFrom(vProjected);
+            Data gateLowRank, rawGate, rawBetaBfloat16, rawBeta, gateLow;
+            const bool hybridDecode = executionMode == ExecutionMode::Hybrid && !mtpEnabled &&
+                threadTpRank < 0 && batch == 1 && chunkSequence == 1 && replayCapture == nullptr;
+            if (hybridDecode && TryHybridKdaInputProjections(layerIndex, chunkInput,
+                    gateLowRank, rawBetaBfloat16, gateLow)) {
+                // Keep the quantized projections together so they can share
+                // their input quantization; BF16 gates use the hybrid helper.
+                Glm5NextLinearGroup(chunkInput,
+                    {&weight[prefix + "q_proj.weight"], &weight[prefix + "k_proj.weight"],
+                     &weight[prefix + "v_proj.weight"]}, {&qProjected, &kProjected, &vProjected});
+            } else {
+                Glm5NextLinearGroup(chunkInput,
+                    {&weight[prefix + "q_proj.weight"], &weight[prefix + "k_proj.weight"],
+                     &weight[prefix + "v_proj.weight"], &weight[prefix + "f_a_proj.weight"],
+                     &weight[prefix + "b_proj.weight"], &weight[prefix + "g_a_proj.weight"]},
+                    {&qProjected, &kProjected, &vProjected, &gateLowRank, &rawBetaBfloat16, &gateLow});
             }
-
-            Data q, k, v;
-            KimiK3CausalConv1D(
-                qProjected, weight[prefix + "q_conv1d.weight"],
-                shortConvKernel, qCache, q);
-            KimiK3CausalConv1D(
-                kProjected, weight[prefix + "k_conv1d.weight"],
-                shortConvKernel, kCache, k);
-            KimiK3CausalConv1D(
-                vProjected, weight[prefix + "v_conv1d.weight"],
-                shortConvKernel, vCache, v);
-            q.Reshape({1, chunkSequence, kdaHeads, kdaHeadDim});
-            k.Reshape({1, chunkSequence, kdaHeads, kdaHeadDim});
-            v.Reshape({1, chunkSequence, kdaHeads, kdaHeadDim});
-
-            Data gateLowRank, rawGate;
-            Linear(chunkInput, weight[prefix + "f_a_proj.weight"],
-                   Data(), gateLowRank);
-            Linear(gateLowRank, weight[prefix + "f_b_proj.weight"],
-                   Data(), rawGate);
-            rawGate.Reshape(
-                {1, chunkSequence, kdaHeads, kdaHeadDim});
-
-            Data rawBetaBfloat16, rawBeta;
-            Linear(chunkInput, weight[prefix + "b_proj.weight"],
-                   Data(), rawBetaBfloat16);
+            if (hybridDecode) {
+                Data hybridOutput;
+                if (TryHybridKdaDecode(layerIndex, qProjected, kProjected, vProjected,
+                        gateLowRank, gateLow, rawBetaBfloat16, (*requestCaches[0])[layerIndex], hybridOutput)) {
+                    hybridOutput.Reshape({1, 1, kdaHeads * kdaHeadDim});
+                    Linear(hybridOutput, weight[prefix + "o_proj.weight"], Data(), chunkOutput);
+                    return;
+                }
+            }
+            Linear(gateLowRank, weight[prefix + "f_b_proj.weight"], Data(), rawGate);
             ToDataType(rawBetaBfloat16, rawBeta, DataType::FLOAT32);
-            if (replayCapture != nullptr) {
-                replayCapture->k.CopyFrom(k);
-                replayCapture->v.CopyFrom(v);
-                replayCapture->rawGate.CopyFrom(rawGate);
-                replayCapture->rawBeta.CopyFrom(rawBeta);
-            }
+
+            auto runState = [&](Data &projectedQ, Data &projectedK, Data &projectedV,
+                                Data &stateGate, Data &stateBeta,
+                                std::pair<Data, Data> &cache, Data &attention) {
+                const int rows = projectedQ.dims[1];
+                Data qCache, kCache, vCache;
+                BindGlm5NextConvCacheViews(cache.first, projectedQ,
+                    shortConvKernel - 1, kdaHeads * kdaHeadDim, qCache, kCache, vCache);
+                if (replayCapture != nullptr) {
+                    replayCapture->qProjected.CopyFrom(projectedQ);
+                    replayCapture->kProjected.CopyFrom(projectedK);
+                    replayCapture->vProjected.CopyFrom(projectedV);
+                }
+                Data q, k, v;
+                KimiK3CausalConv1D(projectedQ, weight[prefix + "q_conv1d.weight"],
+                                  shortConvKernel, qCache, q);
+                KimiK3CausalConv1D(projectedK, weight[prefix + "k_conv1d.weight"],
+                                  shortConvKernel, kCache, k);
+                KimiK3CausalConv1D(projectedV, weight[prefix + "v_conv1d.weight"],
+                                  shortConvKernel, vCache, v);
+                q.Reshape({1, rows, kdaHeads, kdaHeadDim});
+                k.Reshape({1, rows, kdaHeads, kdaHeadDim});
+                v.Reshape({1, rows, kdaHeads, kdaHeadDim});
+                stateGate.Reshape({1, rows, kdaHeads, kdaHeadDim});
+                if (replayCapture != nullptr) {
+                    replayCapture->k.CopyFrom(k);
+                    replayCapture->v.CopyFrom(v);
+                    replayCapture->rawGate.CopyFrom(stateGate);
+                    replayCapture->rawBeta.CopyFrom(stateBeta);
+                }
+                KimiK3RecurrentKDAOutputOnly(q, k, v, stateGate, stateBeta,
+                    weight[prefix + "A_log"], weight[prefix + "dt_bias"],
+                    gateLowerBound, cache.second, attention, true, true);
+                cache.second.SetKVCache();
+                cache.second.isLinearAttention = true;
+            };
 
             Data attention;
-            KimiK3RecurrentKDAOutputOnly(
-                q, k, v, rawGate, rawBeta,
-                weight[prefix + "A_log"],
-                weight[prefix + "dt_bias"], gateLowerBound,
-                state, attention, true, true);
-
-            Data gateLow, gate;
-            Linear(chunkInput, weight[prefix + "g_a_proj.weight"],
-                   Data(), gateLow);
-            Linear(gateLow, weight[prefix + "g_b_proj.weight"],
-                   Data(), gate);
-            gate.Reshape(
-                {1, chunkSequence, kdaHeads, kdaHeadDim});
+            bool batchedState = false;
+#ifdef USE_CUDA
+            if (batch > 1) {
+                std::vector<Data*> convCaches, states;
+                for (auto *request : requestCaches) {
+                    convCaches.push_back(&(*request)[layerIndex].first);
+                    states.push_back(&(*request)[layerIndex].second);
+                }
+                batchedState = FastllmCudaKimiK3KdaBatchDecode(
+                    qProjected, kProjected, vProjected, rawGate, rawBeta,
+                    weight[prefix + "q_conv1d.weight"], weight[prefix + "k_conv1d.weight"],
+                    weight[prefix + "v_conv1d.weight"], weight[prefix + "A_log"], weight[prefix + "dt_bias"],
+                    convCaches, states, kdaHeads, kdaHeadDim, shortConvKernel, gateLowerBound, attention);
+            }
+#endif
+            if (batch == 1) {
+                runState(qProjected, kProjected, vProjected, rawGate, rawBeta,
+                         (*requestCaches[0])[layerIndex], attention);
+            } else if (!batchedState) {
+                for (int row = 0; row < batch; ++row) {
+                    Data q, k, v, gate, beta, rowAttention;
+                    ViewGlm5NextRows(qProjected, row, 1, q);
+                    ViewGlm5NextRows(kProjected, row, 1, k);
+                    ViewGlm5NextRows(vProjected, row, 1, v);
+                    ViewGlm5NextRows(rawGate, row, 1, gate);
+                    ViewGlm5NextRows(rawBeta, row, 1, beta);
+                    runState(q, k, v, gate, beta,
+                             (*requestCaches[row])[layerIndex], rowAttention);
+                    AppendGlm5NextRows(attention, rowAttention, batch);
+                }
+            }
+            Data gate;
+            Linear(gateLow, weight[prefix + "g_b_proj.weight"], Data(), gate);
+            gate.Reshape({1, chunkSequence, kdaHeads, kdaHeadDim});
             Data gatedAttention;
-            KimiK3RMSNormSigmoidGate(
-                attention, gate, weight[prefix + "o_norm.weight"],
-                rms_norm_eps, gatedAttention);
-            gatedAttention.Reshape(
-                {1, chunkSequence, kdaHeads * kdaHeadDim});
-            Linear(gatedAttention, weight[prefix + "o_proj.weight"],
-                   Data(), chunkOutput);
+            KimiK3RMSNormSigmoidGate(attention, gate, weight[prefix + "o_norm.weight"],
+                                   rms_norm_eps, gatedAttention);
+            gatedAttention.Reshape({1, chunkSequence, kdaHeads * kdaHeadDim});
+            Linear(gatedAttention, weight[prefix + "o_proj.weight"], Data(), chunkOutput);
         };
 
         const int chunkSize = 1024;
-        if (sequence <= chunkSize) {
+        if (batch > 1 || sequence <= chunkSize) {
             runChunk(input, sequence, output);
         } else {
             for (int start = 0; start < sequence; start += chunkSize) {
@@ -1623,39 +1952,76 @@ namespace fastllm {
                 Data chunkInput, chunkOutput;
                 Split(input, 1, start, end, chunkInput);
                 runChunk(chunkInput, end - start, chunkOutput);
-                if (start == 0) {
-                    Copy(chunkOutput, output);
-                    output.Expansion(input.dims);
-                } else {
-                    CatDirect(output, chunkOutput, 1);
-                }
+                AppendGlm5NextRows(output, chunkOutput, sequence);
             }
-            output.expansionDims.clear();
         }
-        state.SetKVCache();
-        // The KDA recurrent matrix is also a fixed-size state.  Keeping both
-        // members marked makes schedulers and cache accounting consistently
-        // skip token-length handling for KDA layers.
-        state.isLinearAttention = true;
     }
 
     void Glm5NextModel::RunSparseAttention(
             int layerIndex, Data &input, int sequence,
             std::vector<std::pair<Data, Data>> &pastKeyValues,
-            Data &output) {
+            Data &output, Glm5NextIndexerCache *indexer) {
         if (useCompressedMla) {
             RunCompressedMlaAttention(
-                layerIndex, input, sequence, pastKeyValues, output);
+                layerIndex, input, sequence, {&pastKeyValues}, output, indexer);
         } else {
             RunExpandedSparseAttention(
                 layerIndex, input, sequence, pastKeyValues, output);
         }
     }
 
+    std::pair<Data &, Data &> Glm5NextModel::PrepareMlaWeights(int layerIndex) {
+        const std::string kvWeightName = languagePrefix + "layers." +
+            std::to_string(layerIndex) + ".self_attn.kv_b_proj.weight";
+        const std::string keyWeightName = kvWeightName + "__mla_key";
+        const std::string valueWeightName = kvWeightName + "__mla_value";
+        auto combined = weight.weight.find(kvWeightName);
+        if (combined != weight.weight.end()) {
+            // References survive insertions that rehash the weight map.
+            Data &kvWeight = combined->second;
+            Data &keyWeight = weight.weight.try_emplace(keyWeightName).first->second;
+            Data &valueWeight = weight.weight.try_emplace(valueWeightName).first->second;
+            AssertInFastLLM(
+                kvWeight.Count(0) ==
+                    (uint64_t)num_attention_heads *
+                    (qkNopeHeadDim + valueHeadDim) * kvLoraRank,
+                "GLM-5.3 KV-B projection weight has an invalid size.");
+            kvWeight.Reshape({num_attention_heads,
+                qkNopeHeadDim + valueHeadDim, kvLoraRank});
+            Split(kvWeight, 1, 0, qkNopeHeadDim, keyWeight);
+            Split(kvWeight, 1, qkNopeHeadDim,
+                  qkNopeHeadDim + valueHeadDim, valueWeight);
+            weight.weight.erase(kvWeightName);
+        }
+        auto keyWeight = weight.weight.find(keyWeightName);
+        auto valueWeight = weight.weight.find(valueWeightName);
+        AssertInFastLLM(keyWeight != weight.weight.end() &&
+            valueWeight != weight.weight.end(),
+            "GLM-5.3 compressed MLA split weights are missing.");
+        if (keyWeight->second.dims == std::vector<int>({
+                num_attention_heads, kvLoraRank, qkNopeHeadDim})) {
+            PermuteSelf(keyWeight->second, {0, 2, 1});
+        }
+        if (valueWeight->second.dims == std::vector<int>({
+                num_attention_heads, kvLoraRank, valueHeadDim})) {
+            PermuteSelf(valueWeight->second, {0, 2, 1});
+        }
+        AssertInFastLLM(
+            keyWeight->second.dims == std::vector<int>({
+                num_attention_heads, qkNopeHeadDim, kvLoraRank}) &&
+            valueWeight->second.dims == std::vector<int>({
+                num_attention_heads, valueHeadDim, kvLoraRank}),
+            "GLM-5.3 compressed MLA split weights have invalid shapes.");
+        return {keyWeight->second, valueWeight->second};
+    }
+
     void Glm5NextModel::RunCompressedMlaAttention(
             int layerIndex, Data &input, int sequence,
-            std::vector<std::pair<Data, Data>> &pastKeyValues,
-            Data &output) {
+            const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
+            Data &output, Glm5NextIndexerCache *indexer) {
+        const int batch = (int)requestCaches.size();
+        AssertInFastLLM(batch == 1 || (batch == sequence && indexer == nullptr),
+            "GLM-5.3 MLA batch requires one token per request.");
         AssertInFastLLM(
             qkRopeHeadDim == 0 && qkHeadDim == qkNopeHeadDim &&
             kvLoraRank == 512 && mlaPaddedPeHeadDim == 64,
@@ -1663,30 +2029,55 @@ namespace fastllm {
         const std::string prefix = languagePrefix + "layers." +
             std::to_string(layerIndex) + ".self_attn.";
 
-        Data qResidual, qNormalized, query;
-        Linear(input, weight[prefix + "q_a_proj.weight"],
-               Data(), qResidual);
-        KimiK3RMSNorm(
-            qResidual, weight[prefix + "q_a_layernorm.weight"],
-            rms_norm_eps, qNormalized);
-        Linear(qNormalized, weight[prefix + "q_b_proj.weight"],
-               Data(), query);
-        qResidual.FreeSpace();
-        qNormalized.FreeSpace();
-        ToDataType(query, DataType::BFLOAT16);
-        query.Reshape(
-            {1, sequence, num_attention_heads, qkNopeHeadDim});
-        PermuteSelf(query, {0, 2, 1, 3});
+        Data qResidual, qNormalized, query, compressedKv, latentKv;
+        auto projectMla = [&](Data &source, Data &qNormalized, Data &query, Data &latentKv) {
+            Glm5NextLinearGroup(source,
+                {&weight[prefix + "q_a_proj.weight"], &weight[prefix + "kv_a_proj_with_mqa.weight"]},
+                {&qResidual, &compressedKv});
+            KimiK3RMSNorm(
+                qResidual, weight[prefix + "q_a_layernorm.weight"],
+                rms_norm_eps, qNormalized);
+            Linear(qNormalized, weight[prefix + "q_b_proj.weight"],
+                   Data(), query);
+            ToDataType(query, DataType::BFLOAT16);
+            query.Reshape(
+                {1, sequence, num_attention_heads, qkNopeHeadDim});
+            PermuteSelf(query, {0, 2, 1, 3});
 
-        Data compressedKv, latentKv;
-        Linear(input, weight[prefix + "kv_a_proj_with_mqa.weight"],
-               Data(), compressedKv);
-        KimiK3RMSNorm(
-            compressedKv, weight[prefix + "kv_a_layernorm.weight"],
-            rms_norm_eps, latentKv);
-        compressedKv.FreeSpace();
-        ToDataType(latentKv, DataType::BFLOAT16);
-        latentKv.Reshape({1, sequence, kvLoraRank});
+            KimiK3RMSNorm(
+                compressedKv, weight[prefix + "kv_a_layernorm.weight"],
+                rms_norm_eps, latentKv);
+            compressedKv.FreeSpace();
+            ToDataType(latentKv, DataType::BFLOAT16);
+            latentKv.Reshape({1, sequence, kvLoraRank});
+        };
+#ifdef USE_CUDA
+        glm5_next_detail::DsaProjections decodeProjections;
+        const bool projectedDecode = executionMode == ExecutionMode::Hybrid && threadTpRank < 0 &&
+            batch == 1 && sequence == 1 && indexer == nullptr && UsesDsa() &&
+            !requestCaches[0]->at(layerIndex).second.dims.empty() &&
+            requestCaches[0]->at(layerIndex).second.dims[1] >= indexTopK &&
+            TryHybridMlaProjections(layerIndex, input,
+                {&qNormalized, &query, &latentKv, &decodeProjections.keys, &decodeProjections.gates,
+                 &decodeProjections.query, &decodeProjections.headWeights},
+                [&](Data &fixedInput, std::vector<Data> &out) {
+                    projectMla(fixedInput, out[0], out[1], out[2]);
+                    glm5_next_detail::DsaProjections dsa;
+                    if (!TryHybridDsaProjections(layerIndex, fixedInput, out[0],
+                            dsa.keys, dsa.gates, dsa.query, dsa.headWeights)) {
+                        glm5_next_detail::ProjectDsaKeys(fixedInput, weight, prefix + "indexer.", dsa);
+                        glm5_next_detail::ProjectDsaQueries(fixedInput, out[0], weight, prefix + "indexer.", dsa);
+                    }
+                    glm5_next_detail::RotateAndQuantizeIndexer(dsa.query, out[7], out[5], true);
+                    out[3].CopyFrom(dsa.keys);
+                    out[4].CopyFrom(dsa.gates);
+                    out[6].CopyFrom(dsa.headWeights);
+                });
+        decodeProjections.queryQuantized = projectedDecode;
+#else
+        const bool projectedDecode = false;
+#endif
+        if (!projectedDecode) projectMla(input, qNormalized, query, latentKv);
 
         // GLM-5.3 has qk_rope_head_dim=0. A zero positional component is
         // mathematically neutral and lets the existing (512, 64) paged MLA
@@ -1697,153 +2088,225 @@ namespace fastllm {
         keyPe.Resize({1, sequence, mlaPaddedPeHeadDim});
         keyPe.Allocate(0.0f);
 
-        Data &keyPeCache = pastKeyValues[layerIndex].first;
-        Data &latentKvCache = pastKeyValues[layerIndex].second;
-        auto initializePagedDescriptor = [](Data &cache,
-                                             const Data &current) {
-            if (cache.dims.empty() && cache.pageIndex.empty() &&
-                cache.pagedKVCacheData == nullptr) {
-                cache.dataType = current.dataType;
-                cache.UpdateUnitSize();
-                cache.dataDevice = current.dataDevice;
-                cache.dataDeviceIds = current.dataDeviceIds;
-                cache.SetKVCache();
-            }
-            AssertInFastLLM(
-                cache.dataType == current.dataType,
-                "GLM-5.3 MLA paged-cache descriptor dtype mismatch.");
-        };
-        initializePagedDescriptor(keyPeCache, keyPe);
-        initializePagedDescriptor(latentKvCache, latentKv);
-        PagedCacheManager *keyPeManager = AllocatePagedCacheManager(
-            layerIndex * 2,
-            PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
-            keyPe);
-        PagedCacheManager *latentKvManager = AllocatePagedCacheManager(
-            layerIndex * 2 + 1,
-            PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
-            latentKv);
-        AssertInFastLLM(
-            keyPeManager != nullptr && latentKvManager != nullptr,
-            "GLM-5.3 failed to allocate compressed MLA cache managers.");
-        AppendPagedCache(*keyPeManager, keyPeCache, keyPe);
-        AppendPagedCache(*latentKvManager, latentKvCache, latentKv);
-        keyPe.FreeSpace();
-        latentKv.FreeSpace();
-        AssertInFastLLM(
-            Glm5NextPagedCacheLength(keyPeCache) == keyPeCache.dims[1] &&
-            Glm5NextPagedCacheLength(latentKvCache) ==
-                latentKvCache.dims[1] &&
-            keyPeCache.dims[1] == latentKvCache.dims[1] &&
-            keyPeCache.pageLen == latentKvCache.pageLen &&
-            keyPeCache.lastPageLen == latentKvCache.lastPageLen &&
-            keyPeCache.pageIndex == latentKvCache.pageIndex,
-            "GLM-5.3 compressed MLA caches are out of sync.");
+        auto mlaWeights = PrepareMlaWeights(layerIndex);
+        Data &keyWeight = mlaWeights.first;
+        Data &valueWeight = mlaWeights.second;
 
-        const std::string kvWeightName = prefix + "kv_b_proj.weight";
-        const std::string keyWeightName = kvWeightName + "__mla_key";
-        const std::string valueWeightName = kvWeightName + "__mla_value";
-        auto combined = weight.weight.find(kvWeightName);
-        if (combined != weight.weight.end()) {
-            weight.weight.try_emplace(keyWeightName);
-            weight.weight.try_emplace(valueWeightName);
-            combined = weight.weight.find(kvWeightName);
-            auto keyWeight = weight.weight.find(keyWeightName);
-            auto valueWeight = weight.weight.find(valueWeightName);
-            AssertInFastLLM(
-                combined->second.Count(0) ==
-                    (uint64_t)num_attention_heads *
-                    (qkNopeHeadDim + valueHeadDim) * kvLoraRank,
-                "GLM-5.3 KV-B projection weight has an invalid size.");
-            combined->second.Reshape({
-                num_attention_heads,
-                qkNopeHeadDim + valueHeadDim,
-                kvLoraRank});
-            Split(combined->second, 1, 0, qkNopeHeadDim,
-                  keyWeight->second);
-            Split(combined->second, 1, qkNopeHeadDim,
-                  qkNopeHeadDim + valueHeadDim,
-                  valueWeight->second);
-            weight.weight.erase(combined);
-        }
-        auto keyWeightIt = weight.weight.find(keyWeightName);
-        auto valueWeightIt = weight.weight.find(valueWeightName);
-        AssertInFastLLM(
-            keyWeightIt != weight.weight.end() &&
-            valueWeightIt != weight.weight.end(),
-            "GLM-5.3 compressed MLA split weights are missing.");
-        Data &keyWeight = keyWeightIt->second;
-        Data &valueWeight = valueWeightIt->second;
-        if (keyWeight.dims == std::vector<int>({
-                num_attention_heads, kvLoraRank, qkNopeHeadDim})) {
-            PermuteSelf(keyWeight, {0, 2, 1});
-        }
-        if (valueWeight.dims == std::vector<int>({
-                num_attention_heads, kvLoraRank, valueHeadDim})) {
-            PermuteSelf(valueWeight, {0, 2, 1});
-        }
-        AssertInFastLLM(
-            keyWeight.dims == std::vector<int>({
-                num_attention_heads, qkNopeHeadDim, kvLoraRank}) &&
-            valueWeight.dims == std::vector<int>({
-                num_attention_heads, valueHeadDim, kvLoraRank}),
-            "GLM-5.3 compressed MLA split weights have invalid shapes.");
-
-        PermuteSelf(query, {0, 2, 1, 3});
-        Data queryPe(DataType::BFLOAT16);
-        queryPe.dataDevice = query.dataDevice;
-        queryPe.dataDeviceIds = query.dataDeviceIds;
-        queryPe.Resize({
-            1, sequence, num_attention_heads, mlaPaddedPeHeadDim});
-        queryPe.Allocate(0.0f);
-        PermuteSelf(query, {2, 0, 1, 3});
-        query.Reshape({
-            num_attention_heads, sequence, qkNopeHeadDim});
-
-        Data absorbedQuery;
+        query.Reshape({num_attention_heads, sequence, qkNopeHeadDim});
         bool exactSmallBatchMatmul = false;
 #ifdef USE_CUDA
         exactSmallBatchMatmul = sequence > 1 &&
             FastllmCudaGetLinearExactBatchThreshold() >= sequence;
 #endif
-        auto appendAttentionRow = [](Data &destination,
-                                     const Data &row) {
-            if (destination.dims.empty()) {
-                destination.CopyFrom(row);
-                return;
+#ifdef USE_CUDA
+        std::unique_lock<std::mutex> indexerGuard(indexerCachesMutex, std::defer_lock);
+        if (UsesDsa() && indexer == nullptr) indexerGuard.lock();
+        glm5_next_detail::DsaProjections projections;
+        if (batch > 1 && UsesDsa()) {
+            glm5_next_detail::ProjectDsaKeys(input, weight, prefix + "indexer.", projections);
+            bool needQueries = false;
+            for (const auto *cache : requestCaches) {
+                const auto &kv = (*cache)[layerIndex].second;
+                needQueries |= !kv.dims.empty() && kv.dims[1] + 1 > indexTopK;
             }
-            Data combined;
-            Cat(destination, row, 1, combined);
-            destination.CopyFrom(combined);
-        };
+            if (needQueries) glm5_next_detail::ProjectDsaQueries(
+                input, qNormalized, weight, prefix + "indexer.", projections);
+        }
+#else
+        AssertInFastLLM(!UsesDsa(), "GLM DSA requires a CUDA build.");
+#endif
+        Data absorbedQuery, latentAttention;
+        std::vector<Data> requestIndices(batch);
+        for (int request = 0; request < batch; ++request) {
+            auto &pastKeyValues = *requestCaches[request];
+            const int rows = batch == 1 ? sequence : 1;
+            const int first = batch == 1 ? 0 : request;
+            Data rowKeyPe, rowLatentKv, rowInput, rowNormalized;
+            ViewGlm5NextRows(keyPe, first, rows, rowKeyPe);
+            ViewGlm5NextRows(latentKv, first, rows, rowLatentKv);
+            ViewGlm5NextRows(input, first, rows, rowInput);
+            ViewGlm5NextRows(qNormalized, first, rows, rowNormalized);
+            Data &keyPeCache = pastKeyValues[layerIndex].first;
+            Data &latentKvCache = pastKeyValues[layerIndex].second;
+            InitializeGlm5NextPagedDescriptor(keyPeCache, rowKeyPe);
+            InitializeGlm5NextPagedDescriptor(latentKvCache, rowLatentKv);
+            PagedCacheManager *keyPeManager = AllocatePagedCacheManager(
+                (layerIndex + std::max(0, threadTpRank) * (block_cnt + 1)) * 2,
+                PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+                rowKeyPe);
+            PagedCacheManager *latentKvManager = AllocatePagedCacheManager(
+                (layerIndex + std::max(0, threadTpRank) * (block_cnt + 1)) * 2 + 1,
+                PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+                rowLatentKv);
+            AssertInFastLLM(
+                keyPeManager != nullptr && latentKvManager != nullptr,
+                "GLM-5.3 failed to allocate compressed MLA cache managers.");
+            AppendPagedCache(*keyPeManager, keyPeCache, rowKeyPe);
+            AppendPagedCache(*latentKvManager, latentKvCache, rowLatentKv);
+            AssertInFastLLM(
+                Glm5NextPagedCacheLength(keyPeCache) == keyPeCache.dims[1] &&
+                Glm5NextPagedCacheLength(latentKvCache) ==
+                    latentKvCache.dims[1] &&
+                keyPeCache.dims[1] == latentKvCache.dims[1] &&
+                keyPeCache.pageLen == latentKvCache.pageLen &&
+                keyPeCache.lastPageLen == latentKvCache.lastPageLen &&
+                keyPeCache.pageIndex == latentKvCache.pageIndex,
+                "GLM-5.3 compressed MLA caches are out of sync.");
+
+            Data &dsaIndices = requestIndices[request];
+#ifdef USE_CUDA
+            if (projectedDecode && batch == 1 && rows == 1 &&
+                TryHybridMlaDecode(layerIndex, query, decodeProjections.keys, decodeProjections.gates,
+                    decodeProjections.query, decodeProjections.headWeights, keyWeight, valueWeight,
+                    output, requestCaches)) return;
+            if (UsesDsa()) {
+                auto *requestIndexer = indexer;
+                if (requestIndexer == nullptr) {
+                    auto &caches = indexerCaches[&pastKeyValues];
+                    if ((int)caches.size() <= layerIndex) caches.resize(std::max(block_cnt, layerIndex + 1));
+                    requestIndexer = &caches[layerIndex];
+                }
+                glm5_next_detail::DsaProjections rowProjections;
+                if (batch > 1) {
+                    ViewGlm5NextRows(projections.keys, request, 1, rowProjections.keys);
+                    ViewGlm5NextRows(projections.gates, request, 1, rowProjections.gates);
+                    if (!projections.query.dims.empty()) {
+                        ViewGlm5NextRows(projections.query, request, 1, rowProjections.query);
+                        ViewGlm5NextRows(projections.headWeights, request, 1, rowProjections.headWeights);
+                    }
+                }
+                glm5_next_detail::BuildDsaIndices(rowInput, rowNormalized, weight,
+                    prefix + "indexer.", latentKvCache.dims[1] - rows, indexTopK,
+                    *requestIndexer, dsaIndices, rows == 1 ? &latentKvCache : nullptr,
+                    batch > 1 ? &rowProjections : projectedDecode ? &decodeProjections : nullptr,
+                    executionMode == ExecutionMode::Hybrid);
+            }
+            if (batch == 1 && dsaIndices.dims.empty() && sequence >= 64 &&
+                FastllmCudaGetLinearExactBatchThreshold() < sequence) {
+                Data prefillOutput;
+                if (glm5_next_detail::TryMhaPrefill(query, latentKvCache, keyWeight,
+                        valueWeight, prefillOutput, 1.0f / std::sqrt((float)qkHeadDim))) {
+                    PermuteSelf(prefillOutput, {1, 0, 2});
+                    prefillOutput.Reshape({1, sequence, num_attention_heads * valueHeadDim});
+                    Linear(prefillOutput, weight[prefix + "o_proj.weight"], Data(), output);
+                    return;
+                }
+            }
+#endif
+        }
         if (exactSmallBatchMatmul) {
-            for (int row = 0; row < sequence; row++) {
-                Data rowQuery, rowAbsorbed;
-                Split(query, 1, row, row + 1, rowQuery);
-                MatMul(rowQuery, keyWeight, rowAbsorbed);
-                appendAttentionRow(absorbedQuery, rowAbsorbed);
+            bool projected = false;
+#ifdef USE_CUDA
+            projected = FastllmCudaBatchMatMulSingleRows(query, keyWeight, absorbedQuery, false);
+#endif
+            if (!projected) {
+                for (int row = 0; row < sequence; row++) {
+                    Data rowQuery, rowAbsorbed;
+                    Split(query, 1, row, row + 1, rowQuery);
+                    MatMul(rowQuery, keyWeight, rowAbsorbed);
+                    AppendGlm5NextRows(absorbedQuery, rowAbsorbed, sequence);
+                }
             }
         } else {
             MatMul(query, keyWeight, absorbedQuery);
         }
         query.FreeSpace();
         ToDataType(absorbedQuery, DataType::BFLOAT16);
-        Data latentAttention;
-        MergeMLAPaged(
-            absorbedQuery, queryPe, keyPeCache, latentKvCache,
-            latentAttention,
-            1.0f / std::sqrt((float)qkHeadDim));
+        bool batchedAttention = false;
+#ifdef USE_CUDA
+        const bool hasSparse = std::any_of(requestIndices.begin(), requestIndices.end(),
+            [](const Data &indices) { return !indices.dims.empty(); });
+        if (batch > 1 && FastllmCudaFlashInferDataTypeSupported(absorbedQuery.dataType) &&
+            (!hasSparse || dsaBackend == DsaBackend::Auto)) {
+            std::vector<const Data*> peCaches, latentCaches, indices;
+            std::vector<int> lengths;
+            for (int request = 0; request < batch; ++request) {
+                const auto &cache = (*requestCaches[request])[layerIndex];
+                peCaches.push_back(&cache.first);
+                latentCaches.push_back(&cache.second);
+                const bool sparse = !requestIndices[request].dims.empty();
+                indices.push_back(sparse ? &requestIndices[request] : nullptr);
+                const int tokens = cache.second.dims[1];
+                lengths.push_back(sparse ? std::min(tokens / 4, 512) * 4 + tokens % 4 : tokens);
+            }
+            Data queryPe(DataType::BFLOAT16);
+            queryPe.Resize({1, batch, num_attention_heads, mlaPaddedPeHeadDim});
+            queryPe.ToDevice(absorbedQuery.dataDevice, absorbedQuery.dataDeviceIds, false);
+            queryPe.Allocate(0.0f);
+            latentAttention.dataType = absorbedQuery.dataType;
+            latentAttention.Resize(absorbedQuery.dims);
+            latentAttention.ToDevice(absorbedQuery.dataDevice, absorbedQuery.dataDeviceIds, false);
+            latentAttention.Allocate();
+            batchedAttention = FastllmCudaMLAPagedBatch(absorbedQuery, queryPe, peCaches, latentCaches,
+                lengths, indices, latentAttention, 1.0f / std::sqrt((float)qkHeadDim));
+            if (!batchedAttention) {
+                latentAttention.FreeSpace();
+                latentAttention.Resize({});
+            }
+        }
+#endif
+        for (int request = 0; !batchedAttention && request < batch; ++request) {
+            const int rows = batch == 1 ? sequence : 1;
+            auto &keyPeCache = (*requestCaches[request])[layerIndex].first;
+            auto &latentKvCache = (*requestCaches[request])[layerIndex].second;
+            auto &dsaIndices = requestIndices[request];
+            Data rowQuery, rowAttention;
+            Data *attentionQuery = &absorbedQuery;
+            Data *attentionResult = &latentAttention;
+            if (batch > 1) {
+                // HND rows are strided across heads, so gather only the small
+                // query tensor; the much larger KV pages remain in place.
+                Split(absorbedQuery, 1, request, request + 1, rowQuery);
+                attentionQuery = &rowQuery;
+                attentionResult = &rowAttention;
+            }
+#ifdef USE_CUDA
+            if (!dsaIndices.dims.empty()) {
+                glm5_next_detail::SparseLatentAttention(*attentionQuery, latentKvCache,
+                    dsaIndices, 1.0f / std::sqrt((float)qkHeadDim), *attentionResult,
+                    dsaBackend == DsaBackend::Auto, rows == 1 ? &keyPeCache : nullptr,
+                    executionMode == ExecutionMode::Hybrid);
+            } else if (UsesDsa() &&
+                       !FastllmCudaFlashInferDataTypeSupported(attentionQuery->dataType)) {
+                glm5_next_detail::DenseLatentAttentionFallback(*attentionQuery, latentKvCache,
+                    1.0f / std::sqrt((float)qkHeadDim), *attentionResult,
+                    executionMode == ExecutionMode::Hybrid);
+            } else
+#endif
+            {
+                Data queryPe(DataType::BFLOAT16);
+                queryPe.dataDevice = attentionQuery->dataDevice;
+                queryPe.dataDeviceIds = attentionQuery->dataDeviceIds;
+                queryPe.Resize({1, rows, num_attention_heads, mlaPaddedPeHeadDim});
+                queryPe.Allocate(0.0f);
+                MergeMLAPaged(*attentionQuery, queryPe, keyPeCache, latentKvCache,
+                    *attentionResult, 1.0f / std::sqrt((float)qkHeadDim));
+            }
+            if (batch > 1) AppendGlm5NextRows(latentAttention, rowAttention, batch);
+        }
+#ifdef USE_CUDA
+        if (indexerGuard.owns_lock()) indexerGuard.unlock();
+#endif
         absorbedQuery.FreeSpace();
-        queryPe.FreeSpace();
+        keyPe.FreeSpace();
+        latentKv.FreeSpace();
+        qResidual.FreeSpace();
+        qNormalized.FreeSpace();
 
         Data attentionHeads;
         if (exactSmallBatchMatmul) {
-            for (int row = 0; row < sequence; row++) {
-                Data rowAttention, rowHeads;
-                Split(latentAttention, 1, row, row + 1,
-                      rowAttention);
-                MatMulTransB(rowAttention, valueWeight, rowHeads);
-                appendAttentionRow(attentionHeads, rowHeads);
+            bool projected = false;
+#ifdef USE_CUDA
+            projected = FastllmCudaBatchMatMulSingleRows(latentAttention, valueWeight, attentionHeads, true);
+#endif
+            if (!projected) {
+                for (int row = 0; row < sequence; row++) {
+                    Data rowAttention, rowHeads;
+                    Split(latentAttention, 1, row, row + 1,
+                          rowAttention);
+                    MatMulTransB(rowAttention, valueWeight, rowHeads);
+                    AppendGlm5NextRows(attentionHeads, rowHeads, sequence);
+                }
             }
         } else {
             MatMulTransB(
@@ -1911,28 +2374,14 @@ namespace fastllm {
 
         Data &keyCache = pastKeyValues[layerIndex].first;
         Data &valueCache = pastKeyValues[layerIndex].second;
-        auto initializePagedDescriptor = [](Data &cache,
-                                             const Data &current) {
-            if (cache.dims.empty() && cache.pageIndex.empty() &&
-                cache.pagedKVCacheData == nullptr) {
-                cache.dataType = current.dataType;
-                cache.UpdateUnitSize();
-                cache.dataDevice = current.dataDevice;
-                cache.dataDeviceIds = current.dataDeviceIds;
-                cache.SetKVCache();
-            }
-            AssertInFastLLM(
-                cache.dataType == current.dataType,
-                "GLM-5.3 DSA paged-cache descriptor dtype mismatch.");
-        };
-        initializePagedDescriptor(keyCache, key);
-        initializePagedDescriptor(valueCache, value);
+        InitializeGlm5NextPagedDescriptor(keyCache, key);
+        InitializeGlm5NextPagedDescriptor(valueCache, value);
         PagedCacheManager *keyManager = AllocatePagedCacheManager(
-            layerIndex * 2,
+            (layerIndex + std::max(0, threadTpRank) * (block_cnt + 1)) * 2,
             PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
             key);
         PagedCacheManager *valueManager = AllocatePagedCacheManager(
-            layerIndex * 2 + 1,
+            (layerIndex + std::max(0, threadTpRank) * (block_cnt + 1)) * 2 + 1,
             PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
             value);
         AssertInFastLLM(
@@ -1977,6 +2426,12 @@ namespace fastllm {
             !gateUp.dims.empty() && gateUp.dims.back() % 2 == 0,
             "GLM-5.3 merged gate/up output has an invalid shape.");
         const int intermediate = gateUp.dims.back() / 2;
+#ifdef USE_CUDA
+        if (FastllmCudaGlm5NextClampedSilu(gateUp, swigluLimit, gate)) {
+            Linear(gate, downWeight, Data(), output);
+            return;
+        }
+#endif
         Split(gateUp, -1, 0, intermediate, gate);
         Split(gateUp, -1, intermediate, 2 * intermediate, up);
         Glm5NextClamp(gate, false, 0.0f, true, swigluLimit);
@@ -1986,81 +2441,46 @@ namespace fastllm {
         Linear(gate, downWeight, Data(), output);
     }
 
-    void Glm5NextModel::RunMoe(
-            int layerIndex, Data &input, int sequence, Data &output) {
-        RunMoeWithPrefix(
-            layerIndex,
-            languagePrefix + "layers." + std::to_string(layerIndex) +
-                ".mlp.",
-            expertWeights[layerIndex], expertBiases[layerIndex],
-            input, sequence, output);
-    }
-
     void Glm5NextModel::RunMoeWithPrefix(
             int deviceLayer, const std::string &mlp,
-            std::vector<Data*> &weights,
-            std::vector<Data*> &biases,
+            std::vector<Data*> &weights, std::vector<Data*> &biases,
             Data &input, int sequence, Data &output) {
-        const std::vector<int> outputDims = input.dims;
-        input.Reshape({sequence, embed_dim});
+        if (executionMode == ExecutionMode::Gpu)
+            RunGpuMoeWithPrefix(deviceLayer, mlp, weights, biases, input, sequence, output);
+        else
+            RunHybridMoeWithPrefix(deviceLayer, mlp, weights, biases, input, sequence, output);
+    }
 
+    void Glm5NextModel::RunSharedMoe(
+            int deviceLayer, const std::string &mlp, Data &input,
+            Data &output, bool &sharedReady) {
+        if (sharedReady) return;
+        if (GetCudaSharedExpert() || threadTpRank >= 0) {
+            ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
+        } else {
+            ApplyMoeDeviceMapForLayer(deviceLayer);
+        }
+        RunClampedMlp(input,
+            weight[mlp + "shared_experts.gateup_proj.weight"],
+            weight[mlp + "shared_experts.down_proj.weight"], output);
+        sharedReady = true;
+    }
+
+    void Glm5NextModel::RouteMoe(
+            int deviceLayer, const std::string &mlp, Data &input,
+            Data &routerInput, Data &routerScores, Data &expertIndex, Data &expertScore) {
         ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
-        Data routerInput, routerScores;
-        ToDataType(input, routerInput, DataType::FLOAT32);
-        Linear(routerInput, weight[mlp + "gate.weight"],
-               Data(), routerScores);
-        Sigmoid(routerScores, routerScores);
-        Data expertIndex, expertScore;
+        if (executionMode != ExecutionMode::Hybrid || !TryHybridRouterScores(mlp, input, routerScores)) {
+            ToDataType(input, routerInput, DataType::FLOAT32);
+            Linear(routerInput, weight[mlp + "gate.weight"], Data(), routerScores);
+            Sigmoid(routerScores, routerScores);
+        }
         SelectExpert(
             routerScores, expertIndex, expertScore,
             num_experts_per_tok, norm_topk_prob,
             routed_scaling_factor,
             &weight[mlp + "gate.e_score_correction_bias"]);
 
-#if defined(USE_CUDA) && defined(USE_NUMAS)
-        const std::string routedDevice =
-            SelectMoeDeviceForLayer(deviceLayer);
-        const bool prefetchNumasSmallBatch =
-            sequence >= 1 &&
-            sequence <= kNumasMoePrefetchMaxRows &&
-            GetCudaSharedExpert() &&
-            (routedDevice == "numa" ||
-             routedDevice.rfind("numa:", 0) == 0) &&
-            std::getenv(
-                "FASTLLM_GLM5_DISABLE_NUMAS_MOE_OVERLAP") == nullptr;
-        if (prefetchNumasSmallBatch) {
-            PrefetchNumasMoeDecodeInput(
-                input, expertIndex, expertScore, deviceLayer);
-        }
-#endif
-
-        if (GetCudaSharedExpert()) {
-            ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
-        } else {
-            ApplyMoeDeviceMapForLayer(deviceLayer);
-        }
-        RunClampedMlp(
-            input,
-            weight[mlp + "shared_experts.gateup_proj.weight"],
-            weight[mlp + "shared_experts.down_proj.weight"],
-            output);
-
-        Data w1, w2, w3, tempInput, tempOutput;
-        Data moeInputTemp, moeOutputTemp, routedOutput;
-        ApplyMoeDeviceMapForLayer(deviceLayer);
-        MergeMOEBlock(
-            &input, &expertIndex, &expertScore,
-            &weights, &biases,
-            &w1, &w2, &w3, &tempInput, &tempOutput,
-            0.0f, &routedOutput, deviceLayer,
-            input.dataType, moeAtype,
-            &moeInputTemp, &moeOutputTemp,
-            MoeGateSwiglu, false, swigluLimit, true);
-
-        ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
-        AddTo(output, routedOutput);
-        input.Reshape(outputDims);
-        output.Reshape(outputDims);
     }
 
     int Glm5NextModel::Sample(
@@ -2082,9 +2502,19 @@ namespace fastllm {
             lastHidden = &lastHiddenView;
         }
         Data outputLogits;
-        Linear(*lastHidden, weight["lm_head.weight"],
+        Linear(*lastHidden, OutputHead(),
                Data(), outputLogits);
+        int token;
+        if (TryHybridGreedy(outputLogits, generationConfig, token)) return token;
         ToDataType(outputLogits, DataType::FLOAT32);
+        return SampleLogits(outputLogits, generationConfig, lastTokens, logits);
+    }
+
+    int Glm5NextModel::SampleLogits(
+            Data &outputLogits,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<float> *logits) {
         if (generationConfig.output_logits && logits != nullptr) {
             outputLogits.ToDevice(DataDevice::CPU);
             const int vocabulary = outputLogits.dims.back();
@@ -2121,7 +2551,7 @@ namespace fastllm {
             "GLM-5.3 MTP target logits have an invalid row count.");
         const int rows = hiddenStates.dims[1];
         Data outputLogits;
-        Linear(hiddenStates, weight["lm_head.weight"],
+        Linear(hiddenStates, OutputHead(),
                Data(), outputLogits);
         ToDataType(outputLogits, DataType::FLOAT32);
 
@@ -2209,10 +2639,23 @@ namespace fastllm {
                 continue;
             }
 #ifdef USE_NUMAS
-            if (moeDevice.rfind("numa", 0) == 0 &&
+            HostMoePlacementScope placement(moeDevice == "cpu");
+            if (IsSharedHostMoeDevice(moeDevice) &&
                 CanUseNumasMoeExactSmallBatch(rows)) {
                 continue;
             }
+#ifndef USE_ROCM
+            if (IsSharedHostMoeDevice(moeDevice) && moeAtype == DataType::BFLOAT16 &&
+                layer < (int)expertWeights.size()) {
+                const auto &experts = expertWeights[layer];
+                // The prepared GGUF hybrid path preserves decode arithmetic
+                // on AVX2, including the multi-row TP expert-cache adapter.
+                if (CanUseNumasMoeExactGgufBatch(rows, experts.data(), (int)experts.size()) &&
+                    FastllmCudaCanRunMoeHybrid(const_cast<Data **>(experts.data()), (int)experts.size())) {
+                    continue;
+                }
+            }
+#endif
 #endif
             return false;
         }
@@ -2223,12 +2666,46 @@ namespace fastllm {
     void Glm5NextModel::CaptureTargetRuntimeCheckpoint(
             const std::vector<std::pair<Data, Data>> &pastKeyValues,
             TargetRuntimeCheckpoint &checkpoint) {
+        if (threadTpState) {
+            auto &tp = *threadTpState;
+#ifdef USE_CUDA
+            // ApplyDeviceMap changes executor routing, not the active CUDA device.
+            Glm5NextCudaDeviceScope restoreDevice;
+#endif
+            std::lock_guard<std::mutex> lock(tp.forwardMutex);
+            auto &caches = tp.requests.at(&pastKeyValues);
+            checkpoint.ranks.resize(tp.ranks.size());
+            for (size_t r = 0; r < tp.ranks.size(); ++r) {
+#ifdef USE_CUDA
+                FastllmCudaSetDevice(tp.devices[r]);
+#endif
+                ApplyDeviceMap(tp.ranks[r]->deviceMap, 0, block_cnt);
+                tp.ranks[r]->CaptureTargetRuntimeCheckpoint(r == 0 ? pastKeyValues : caches[r], checkpoint.ranks[r]);
+#ifdef USE_CUDA
+                ForceDeviceSync();
+#endif
+            }
+            ApplyDeviceMap(deviceMap, 0, block_cnt);
+            checkpoint.ready = true;
+            return;
+        }
         AssertInFastLLM(
             (int)pastKeyValues.size() >= block_cnt,
             "GLM-5.3 MTP cannot checkpoint an incomplete target cache.");
         checkpoint.kdaFirst.resize(block_cnt);
         checkpoint.kdaSecond.resize(block_cnt);
         checkpoint.sparseLengths.assign(block_cnt, -1);
+#ifdef USE_CUDA
+        if (UsesDsa()) {
+            std::lock_guard<std::mutex> guard(indexerCachesMutex);
+            auto &caches = indexerCaches.at(&pastKeyValues);
+            checkpoint.indexer.resize(block_cnt);
+            for (int layer = 0; layer < block_cnt; ++layer) if (!kdaLayers[layer]) {
+                ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
+                glm5_next_detail::CaptureIndexerCheckpoint(caches[layer], checkpoint.indexer[layer], true);
+            }
+        }
+#endif
         for (int layer = 0; layer < block_cnt; layer++) {
             if (kdaLayers[layer]) {
                 checkpoint.kdaFirst[layer].CopyFrom(
@@ -2255,6 +2732,30 @@ namespace fastllm {
             const std::vector<KdaReplayCapture> &kdaReplay,
             int committedInputs,
             int verificationInputs) {
+        if (threadTpState) {
+            auto &tp = *threadTpState;
+#ifdef USE_CUDA
+            // ApplyDeviceMap changes executor routing, not the active CUDA device.
+            Glm5NextCudaDeviceScope restoreDevice;
+#endif
+            std::lock_guard<std::mutex> lock(tp.forwardMutex);
+            auto &caches = tp.requests.at(&pastKeyValues);
+            auto &replays = tp.replays.at(&pastKeyValues);
+            AssertInFastLLM(checkpoint.ranks.size() == tp.ranks.size(), "GLM TP MTP checkpoint is incomplete.");
+            for (size_t r = 0; r < tp.ranks.size(); ++r) {
+#ifdef USE_CUDA
+                FastllmCudaSetDevice(tp.devices[r]);
+#endif
+                ApplyDeviceMap(tp.ranks[r]->deviceMap, 0, block_cnt);
+                tp.ranks[r]->CommitTargetVerificationPrefix(r == 0 ? pastKeyValues : caches[r],
+                    checkpoint.ranks[r], replays[r], committedInputs, verificationInputs);
+#ifdef USE_CUDA
+                ForceDeviceSync();
+#endif
+            }
+            ApplyDeviceMap(deviceMap, 0, block_cnt);
+            return;
+        }
         AssertInFastLLM(
             checkpoint.ready && committedInputs > 0 &&
             committedInputs < verificationInputs &&
@@ -2274,6 +2775,16 @@ namespace fastllm {
                         oldLength + verificationInputs,
                     "GLM-5.3 MTP DSA verification cache has an "
                     "invalid length.");
+#ifdef USE_CUDA
+                if (UsesDsa()) {
+                    ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
+                    std::lock_guard<std::mutex> guard(indexerCachesMutex);
+                    glm5_next_detail::CommitIndexerPrefix(indexerCaches.at(&pastKeyValues)[layer],
+                        checkpoint.indexer.at(layer), committedInputs,
+                        weight[languagePrefix + "layers." + std::to_string(layer) +
+                            ".self_attn.indexer.index_kpool_compress_ape"]);
+                }
+#endif
                 TrimGlm5NextPagedCache(
                     pastKeyValues[layer].first,
                     oldLength + committedInputs);
@@ -2324,7 +2835,7 @@ namespace fastllm {
             const std::vector<int> &inputTokens,
             const std::vector<int> &positions,
             Data *nextHiddenStates,
-            bool sampleToken) {
+            bool sampleToken, float *topProbability) {
         const int sequence = (int)inputTokens.size();
         AssertInFastLLM(
             sequence > 0 && positions.size() == inputTokens.size() &&
@@ -2402,6 +2913,9 @@ namespace fastllm {
             hiddenStates,
             weight[prefix + "post_attention_layernorm.weight"],
             rms_norm_eps, normalizedFfn);
+        // Keep the draft policy alive through its head and every early return.
+        auto draftCache = executionMode == ExecutionMode::Hybrid
+            ? BeginHybridDraftMoe(normalizedFfn, sequence) : HybridMoeDecodeStep{};
         RunMoeWithPrefix(
             block_cnt - 1, prefix + "mlp.",
             mtpExpertWeights, mtpExpertBiases,
@@ -2425,11 +2939,41 @@ namespace fastllm {
         KimiK3RMSNorm(
             lastHidden, weight[prefix + "shared_head.norm.weight"],
             rms_norm_eps, sampleHidden);
-        Linear(sampleHidden, weight["lm_head.weight"],
+        Linear(sampleHidden, OutputHead(),
                Data(), outputLogits);
         ToDataType(outputLogits, DataType::FLOAT32);
         TopK(outputLogits, top, 1);
         top.ToDevice(DataDevice::CPU);
+        if (topProbability != nullptr) {
+            bool computed = false;
+#ifdef USE_CUDA
+            if (outputLogits.dataDevice == DataDevice::CUDA &&
+                !outputLogits.multiDeviceData && outputLogits.cudaData != nullptr) {
+                if (!outputLogits.dataDeviceIds.empty())
+                    FastllmCudaSetDevice(outputLogits.dataDeviceIds[0]);
+                Data probability(DataType::FLOAT32, {1});
+                probability.ToDevice(DataDevice::CUDA, outputLogits.dataDeviceIds);
+                probability.Allocate();
+                // Reuse the full-vocabulary reduction already used by Qwen MTP.
+                computed = FastllmCudaQwen4TopProbability(
+                    static_cast<const float *>(outputLogits.cudaData),
+                    static_cast<float *>(probability.cudaData), outputLogits.dims.back(),
+                    reinterpret_cast<const float *>(top.cpuData)[1]);
+                if (computed) {
+                    probability.ToDevice(DataDevice::CPU);
+                    *topProbability = reinterpret_cast<const float *>(probability.cpuData)[0];
+                }
+            }
+#endif
+            if (!computed) {
+                Data probabilities, probabilityTop;
+                Softmax(outputLogits, probabilities, -1);
+                TopK(probabilities, probabilityTop, 1);
+                probabilityTop.ToDevice(DataDevice::CPU);
+                *topProbability = reinterpret_cast<const float *>(probabilityTop.cpuData)[1];
+            }
+            if (!std::isfinite(*topProbability)) *topProbability = 0;
+        }
         return (int)(reinterpret_cast<float *>(top.cpuData)[0] + 1.0e-3f);
     }
 
@@ -2437,7 +2981,7 @@ namespace fastllm {
             MtpRuntimeState &state,
             const Data &targetHiddenStates,
             const std::vector<int> &inputTokens,
-            const std::vector<int> &positions) {
+            const std::vector<int> &positions, float minProbability) {
         AssertInFastLLM(
             !inputTokens.empty() && inputTokens.size() == positions.size(),
             "GLM-5.3 MTP proposal input is empty or misaligned.");
@@ -2453,9 +2997,20 @@ namespace fastllm {
         state.activeDraftLimit = draftLimit;
         Data hiddenStates[2];
         int currentHidden = 0;
+        float probability = 0;
+        auto admit = [&] {
+            if (minProbability <= 0) return true;
+            ++state.confidenceChecks;
+            if (std::isfinite(probability) && probability >= minProbability) return true;
+            ++state.confidenceStops;
+            return false;
+        };
         int proposal = RunMtpDraft(
             state, targetHiddenStates, inputTokens, positions,
-            &hiddenStates[currentHidden], true);
+            &hiddenStates[currentHidden], true, minProbability > 0 ? &probability : nullptr);
+        // The first draft consumes committed input only. If it is rejected,
+        // retain those caches and let the next ordinary target step advance.
+        if (!admit()) return;
         state.proposals.push_back(proposal);
         if (draftLimit <= 1) {
             return;
@@ -2470,16 +3025,29 @@ namespace fastllm {
             committedKeyLength == committedValueLength,
             "GLM-5.3 MTP draft caches are out of sync.");
 
+        Glm5NextIndexerCheckpoint draftIndexer;
+#ifdef USE_CUDA
+        if (UsesDsa()) glm5_next_detail::CaptureIndexerCheckpoint(
+            indexerCaches.at(&state.pastKeyValues)[block_cnt], draftIndexer, false);
+#endif
         int nextPosition = positions.back() + 1;
         for (int draft = 1; draft < draftLimit; draft++) {
             const int nextHidden = 1 - currentHidden;
             proposal = RunMtpDraft(
                 state, hiddenStates[currentHidden], {proposal},
-                {nextPosition}, &hiddenStates[nextHidden], true);
+                {nextPosition}, &hiddenStates[nextHidden], true,
+                minProbability > 0 ? &probability : nullptr);
+            if (!admit()) break;
             state.proposals.push_back(proposal);
             currentHidden = nextHidden;
             nextPosition++;
         }
+#ifdef USE_CUDA
+        if (UsesDsa()) glm5_next_detail::CommitIndexerPrefix(
+            indexerCaches.at(&state.pastKeyValues)[block_cnt], draftIndexer, 0,
+            weight[languagePrefix + "layers." + std::to_string(block_cnt) +
+                ".self_attn.indexer.index_kpool_compress_ape"]);
+#endif
         TrimGlm5NextPagedCache(mtpKey, committedKeyLength);
         TrimGlm5NextPagedCache(mtpValue, committedValueLength);
     }
@@ -2493,6 +3061,7 @@ namespace fastllm {
             const LastTokensManager &lastTokens,
             std::vector<float> *logits,
             MtpRuntimeState &state) {
+        const float minProbability = generationConfig.IsSimpleGreedy() ? mtpMinProbability : 0;
         if (!state.pendingOutputTokens.empty()) {
             const std::pair<int, int> pending =
                 state.pendingOutputTokens.front();
@@ -2594,7 +3163,7 @@ namespace fastllm {
                 hasPairedHidden && !mtpTokens.empty(),
                 "GLM-5.3 MTP failed to align the final prompt chunk.");
             GenerateMtpProposalChain(
-                state, pairedHidden, mtpTokens, mtpPositions);
+                state, pairedHidden, mtpTokens, mtpPositions, minProbability);
 #ifdef USE_CUDA
             // A later scheduler call can run on another host worker and CUDA
             // stream.  Publish both target and request-local draft state
@@ -2641,6 +3210,11 @@ namespace fastllm {
         const bool useBatchedVerifier =
             CanUseExactBatchedMtpVerification(
                 (int)candidateTokens.size());
+        if (verbose && state.verifySteps == 0) {
+            std::cout << "[GLM-5.3 MTP verifier] mode="
+                      << (useBatchedVerifier ? "batched" : "sequential")
+                      << " rows=" << candidateTokens.size() << "\n";
+        }
 
 #ifdef USE_CUDA
         // Verification is logically a sequence of decode rows. Force every
@@ -2746,6 +3320,9 @@ namespace fastllm {
             acceptedDrafts < (int)targetTokens.size(),
             "GLM-5.3 MTP verification did not produce a recovery token.");
         const int committedInputs = acceptedDrafts + 1;
+        ++state.verifySteps;
+        state.verifiedDrafts += proposals.size();
+        state.acceptedDrafts += acceptedDrafts;
         std::vector<int> verifiedOutputs;
         verifiedOutputs.reserve(committedInputs);
         for (int i = 0; i < acceptedDrafts; i++) {
@@ -2757,7 +3334,11 @@ namespace fastllm {
         if (state.activeDraftLimit <= 0) {
             state.activeDraftLimit = currentDepth;
         }
-        if (acceptedDrafts == currentDepth) {
+        if (acceptedDrafts == currentDepth && currentDepth < state.activeDraftLimit) {
+            // Confidence truncation is not a rejection and does not establish
+            // that the full adaptive depth succeeded either.
+            state.consecutiveFullAccepts = 0;
+        } else if (acceptedDrafts == currentDepth) {
             state.consecutiveFullAccepts++;
             const int acceptsBeforeGrowing =
                 std::max(2, 2 * (currentDepth - 1));
@@ -2810,7 +3391,7 @@ namespace fastllm {
             state, committedTargetHidden, verifiedOutputs,
             std::vector<int>(
                 candidatePositions.begin(),
-                candidatePositions.begin() + committedInputs));
+                candidatePositions.begin() + committedInputs), minProbability);
 #ifdef USE_CUDA
         ForceDeviceSync();
 #endif
@@ -2849,6 +3430,8 @@ namespace fastllm {
                 inputIds, attentionMask, positionIds, pastKeyValues,
                 generationConfig, lastTokens, logits, *state);
         }
+        if (threadTpState) return ForwardThreadTp(inputIds, pastKeyValues,
+            generationConfig, lastTokens, logits);
         const int sequence = inputIds.dims[1];
         ResponseContext *context = nullptr;
         if (saveHistoryChat) {
@@ -2924,6 +3507,194 @@ namespace fastllm {
             generationConfig, lastTokens, logits, true);
     }
 
+    std::vector<int> Glm5NextModel::ForwardBatch(
+            int batch, const Data &inputIds,
+            const std::vector<Data*> &attentionMasks,
+            const std::vector<Data*> &positionIds,
+            const std::vector<int> &seqLens,
+            std::vector<std::pair<Data*, Data*>> &pastKeyValues,
+            const std::vector<GenerationConfig> &generationConfigs,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float>*> *logits) {
+        AssertInFastLLM(
+            batch > 0 && (int)seqLens.size() == batch &&
+            (int)attentionMasks.size() == batch &&
+            (int)positionIds.size() == batch &&
+            (int)generationConfigs.size() == batch &&
+            (int)pastKeyValues.size() == batch * block_cnt &&
+            (logits == nullptr || (int)logits->size() == batch),
+            "GLM-5.3 ForwardBatch received inconsistent arguments.");
+        int total = 0;
+        bool decodeBatch = !threadTpState && batch > 1 && !(mtpEnabled && mtpWeightsReady);
+        for (int length : seqLens) {
+            AssertInFastLLM(length > 0, "GLM-5.3 batch contains an empty request.");
+            total += length;
+            decodeBatch = decodeBatch && length == 1;
+        }
+        AssertInFastLLM(
+            inputIds.dims == std::vector<int>({1, total}),
+            "GLM-5.3 ForwardBatch input does not match seqLens.");
+
+        // Keep the original cache vector identity: DSA indexer and MTP state
+        // are keyed by it. Copying individual KV tensors loses that state.
+        std::vector<std::vector<std::pair<Data, Data>>*> requestCaches(batch, nullptr);
+        {
+            std::lock_guard<std::mutex> guard(responseContextsMutex);
+            for (int row = 0; row < batch; ++row) {
+                for (const auto &entry : responseContexts) {
+                    auto &cache = entry.second->pastKeyValues;
+                    if ((int)cache.size() >= block_cnt &&
+                        &cache[0].first == pastKeyValues[row * block_cnt].first) {
+                        requestCaches[row] = &cache;
+                        break;
+                    }
+                }
+                AssertInFastLLM(requestCaches[row] != nullptr,
+                    "GLM-5.3 ForwardBatch requires request-owned KV caches.");
+                for (int layer = 0; layer < block_cnt; ++layer) {
+                    const auto &cache = (*requestCaches[row])[layer];
+                    const auto &pointers = pastKeyValues[row * block_cnt + layer];
+                    AssertInFastLLM(pointers.first == &cache.first &&
+                        pointers.second == &cache.second,
+                        "GLM-5.3 batch KV caches belong to different requests.");
+                }
+            }
+        }
+
+        Data hiddenStates, batchLogits;
+        if (decodeBatch) {
+            ForwardEmbedding(inputIds, hiddenStates);
+            ForwardLayers(hiddenStates, 0, block_cnt, requestCaches);
+            Data finalHidden;
+            ForwardOutput(hiddenStates, generationConfigs[0], lastTokens,
+                          nullptr, false, &finalHidden);
+            Linear(finalHidden, weight["lm_head.weight"], Data(), batchLogits);
+            ToDataType(batchLogits, DataType::FLOAT32);
+        }
+        std::vector<int> result;
+        result.reserve(batch);
+        int offset = 0;
+        for (int row = 0; row < batch; ++row) {
+            LastTokensManager tokens;
+            if (row < (int)lastTokens.units.size()) {
+                tokens.units.push_back(lastTokens.units[row]);
+            }
+            auto *rowLogits = logits == nullptr ? nullptr : (*logits)[row];
+            if (decodeBatch) {
+                // Sampling may move or modify logits, so give it an owned
+                // row while sharing the expensive vocabulary projection.
+                Data scores;
+                Split(batchLogits, 1, row, row + 1, scores);
+                result.push_back(SampleLogits(scores, generationConfigs[row],
+                                             tokens, rowLogits));
+            } else {
+                // Preserve prompt/history checkpointing and per-request MTP.
+                Data input;
+                Split(inputIds, 1, offset, offset + seqLens[row], input);
+                result.push_back(Forward(input,
+                    attentionMasks[row] == nullptr ? Data() : *attentionMasks[row],
+                    positionIds[row] == nullptr ? Data() : *positionIds[row],
+                    *requestCaches[row], generationConfigs[row], tokens, rowLogits));
+            }
+            offset += seqLens[row];
+        }
+        return result;
+    }
+
+    bool Glm5NextModel::TryForwardChunkedPrefill(
+            const Data &inputIds, const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<float> *logits, int &outputToken) {
+        if (executionMode == ExecutionMode::Hybrid)
+            return TryForwardHybridChunkedPrefill(inputIds, attentionMask, pastKeyValues,
+                generationConfig, lastTokens, logits, outputToken);
+        if (threadTpState) return false;
+        (void)positionIds; // This model derives causal positions from its caches.
+#ifdef USE_CUDA
+        const int chunkSize = GetChunkedPrefillSize();
+        // Skipping discarded intermediate samples must not change the random
+        // generator's consumption for sampling-based generation.
+        if (!generationConfig.IsSimpleGreedy() ||
+            mtpEnabled || saveHistoryChat || !useCompressedMla ||
+            GetKVCacheInCPU() || GetHistoryCacheInCPU() ||
+            GetLowMemMode() || MoeCudaCacheRequested() ||
+            GetFastllmEnv().printProfile || FastllmCudaGraphIsCapturingFast() ||
+            inputIds.dataDevice != DataDevice::CPU ||
+            inputIds.dataType != DataType::FLOAT32 || inputIds.cpuData == nullptr ||
+            inputIds.dims.size() != 2 || inputIds.dims[0] != 1 ||
+            chunkSize <= 0 || inputIds.dims[1] <= chunkSize ||
+            !attentionMask.dims.empty()) {
+            return false;
+        }
+        // Prefix/history restoration and continuation prefill retain their
+        // existing path. No partially populated recurrent state is admitted.
+        for (const auto &cache : pastKeyValues) {
+            if (!cache.first.dims.empty() || !cache.second.dims.empty() ||
+                !cache.first.pageIndex.empty() || !cache.second.pageIndex.empty()) {
+                return false;
+            }
+        }
+        std::vector<CudaPrefillStage> stages;
+        if (!BuildCudaPrefillStages(deviceMap, block_cnt, stages)) return false;
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            if (!denseMlpLayers[layer] && SelectMoeDeviceForLayer(layer) !=
+                    SelectDeviceFromMap(deviceMap, layer + 1, block_cnt)) {
+                return false;
+            }
+        }
+
+        // All eligibility checks precede mutation. After work starts, errors
+        // propagate after draining the workers; never retry partially appended
+        // KV/KDA state through the serial fallback.
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            if (!kdaLayers[layer]) {
+                ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
+                PrepareMlaWeights(layer);
+            }
+        }
+        if ((int)pastKeyValues.size() < block_cnt) pastKeyValues.resize(block_cnt);
+        // Keep the registry stable while workers access distinct layer entries.
+        // This also prevents request removal from freeing an in-flight indexer.
+        std::lock_guard<std::mutex> indexerGuard(indexerCachesMutex);
+        auto &indexer = indexerCaches[&pastKeyValues];
+        if (indexer.empty()) indexer.resize(block_cnt);
+        if (!prefillPipeline) prefillPipeline.reset(new CudaChunkedPrefillPipeline());
+        std::vector<int> devices;
+        for (const auto &stage : stages) devices.push_back(stage.device);
+        const int sequence = inputIds.dims[1];
+        const int chunks = 1 + (sequence - 1) / chunkSize;
+        const float *tokens = reinterpret_cast<const float *>(inputIds.cpuData);
+        if (verbose) {
+            printf("[Prompt] Pipelined prefill: %zu CUDA stages, %d chunks (%d tokens/chunk).\n",
+                   stages.size(), chunks, chunkSize);
+            fflush(stdout);
+        }
+        prefillPipeline->Run(devices, chunks, DataType::BFLOAT16,
+            {1, chunkSize, hcMult, embed_dim},
+            [&](int rank, int chunk, Data &hiddenStates) {
+                if (rank == 0) {
+                    const int start = chunk * chunkSize;
+                    const int length = std::min(chunkSize, sequence - start);
+                    Data chunkInput(DataType::FLOAT32, {1, length},
+                        std::vector<float>(tokens + start, tokens + start + length));
+                    ForwardEmbedding(chunkInput, hiddenStates);
+                }
+                ForwardLayers(hiddenStates, stages[rank].firstLayer,
+                    stages[rank].endLayer, {&pastKeyValues}, nullptr, &indexer);
+                if (rank + 1 == (int)stages.size() && chunk + 1 == chunks) {
+                    outputToken = ForwardOutput(hiddenStates, generationConfig,
+                                                lastTokens, logits, true);
+                }
+            });
+        return true;
+#else
+        return false;
+#endif
+    }
+
     int Glm5NextModel::ForwardImpl(
             const Data &inputIds,
             const Data &attentionMask,
@@ -2935,6 +3706,8 @@ namespace fastllm {
             bool sampleOutput,
             Data *targetHiddenStates,
             std::vector<KdaReplayCapture> *kdaReplay) {
+        if (threadTpState) return ForwardThreadTp(inputIds, pastKeyValues,
+            generationConfig, lastTokens, logits, sampleOutput, targetHiddenStates, kdaReplay);
         (void)attentionMask;
         (void)positionIds;
         AssertInFastLLM(
@@ -2944,94 +3717,131 @@ namespace fastllm {
         if ((int)pastKeyValues.size() < block_cnt) {
             pastKeyValues.resize(block_cnt);
         }
-        const int sequence = inputIds.dims[1];
-
         if (kdaReplay != nullptr) {
             kdaReplay->clear();
             kdaReplay->resize(block_cnt);
         }
+        Data hiddenStates;
+        ForwardEmbedding(inputIds, hiddenStates);
+        ForwardLayers(hiddenStates, 0, block_cnt, {&pastKeyValues}, kdaReplay);
+        return ForwardOutput(hiddenStates, generationConfig, lastTokens,
+                             logits, sampleOutput, targetHiddenStates);
+    }
+
+    void Glm5NextModel::ForwardEmbedding(
+            const Data &inputIds, Data &hiddenStates) {
+        const int sequence = inputIds.dims[1];
         ApplyDeviceMap(deviceMap, 0, block_cnt);
-        Data embedding, hiddenStates, hiddenStatesTemp;
+        Data embedding;
         Embedding(
             inputIds, weight[languagePrefix + "embed_tokens.weight"],
             embedding);
         ToDataType(embedding, DataType::BFLOAT16);
         embedding.Reshape({1, sequence, 1, embed_dim});
         Repeat(embedding, 2, hcMult, hiddenStates);
+    }
 
-        Data *current = &hiddenStates;
-        Data *next = &hiddenStatesTemp;
-        for (int layer = 0; layer < block_cnt; layer++) {
-            ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
-            const std::string prefix = languagePrefix + "layers." +
-                std::to_string(layer) + ".";
+    void Glm5NextModel::ForwardLayers(
+            Data &hiddenStates, int firstLayer, int endLayer,
+            const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
+            std::vector<KdaReplayCapture> *kdaReplay,
+            std::vector<Glm5NextIndexerCache> *indexer) {
+        if (executionMode == ExecutionMode::Gpu)
+            ForwardGpuLayers(hiddenStates, firstLayer, endLayer, requestCaches, kdaReplay, indexer);
+        else
+            ForwardHybridLayers(hiddenStates, firstLayer, endLayer, requestCaches, kdaReplay, indexer);
+    }
 
-            Data attentionInput, attentionPost, attentionComb;
-            DeepSeekV4HcPre(
-                *current, weight[prefix + "hc_attn_fn"],
+    void Glm5NextModel::RunAttentionBlock(
+            int layer, const std::string &prefix, Data &input, Data &output,
+            const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
+            std::vector<KdaReplayCapture> *kdaReplay,
+            std::vector<Glm5NextIndexerCache> *indexer) {
+        const int sequence = input.dims[1];
+        const int batch = requestCaches.size();
+        auto runAttention = [&](Data &input, Data &output) {
+            Data normalizedAttention, attentionPost, attentionComb;
+            Glm5NextHcPreNorm(
+                input, weight[prefix + "hc_attn_fn"],
                 weight[prefix + "hc_attn_scale"],
-                weight[prefix + "hc_attn_base"], hcMult,
+                weight[prefix + "hc_attn_base"],
+                weight[prefix + "input_layernorm.weight"], hcMult,
                 hcSinkhornIters, hcEps, rms_norm_eps,
-                attentionInput, attentionPost, attentionComb);
-            Data normalizedAttention;
-            KimiK3RMSNorm(
-                attentionInput,
-                weight[prefix + "input_layernorm.weight"],
-                rms_norm_eps, normalizedAttention);
+                normalizedAttention, attentionPost, attentionComb, executionMode == ExecutionMode::Hybrid);
             Data attentionOutput;
             if (kdaLayers[layer]) {
-                RunKdaAttention(
-                    layer, normalizedAttention, sequence,
-                    pastKeyValues, attentionOutput,
-                    kdaReplay == nullptr ? nullptr :
-                        &(*kdaReplay)[layer]);
+                RunKdaAttention(layer, normalizedAttention, sequence, requestCaches,
+                    attentionOutput, kdaReplay == nullptr ? nullptr : &(*kdaReplay)[layer]);
+            } else if (batch > 1 && useCompressedMla) {
+                RunCompressedMlaAttention(layer, normalizedAttention, sequence,
+                                          requestCaches, attentionOutput);
+            } else if (batch > 1) {
+                // The optional expanded-cache backend retains its existing
+                // request-local attention implementation.
+                for (int row = 0; row < batch; ++row) {
+                    Data rowInput, rowOutput;
+                    ViewGlm5NextRows(normalizedAttention, row, 1, rowInput);
+                    RunSparseAttention(layer, rowInput, 1, *requestCaches[row], rowOutput);
+                    AppendGlm5NextRows(attentionOutput, rowOutput, batch);
+                }
             } else {
-                RunSparseAttention(
-                    layer, normalizedAttention, sequence,
-                    pastKeyValues, attentionOutput);
+                RunSparseAttention(layer, normalizedAttention, sequence,
+                    *requestCaches[0], attentionOutput,
+                    indexer == nullptr ? nullptr : &(*indexer)[layer]);
             }
-            DeepSeekV4HcPost(
-                attentionOutput, *current,
-                attentionPost, attentionComb, *next);
-            std::swap(current, next);
-
-            Data ffnInput, ffnPost, ffnComb;
-            DeepSeekV4HcPre(
-                *current, weight[prefix + "hc_ffn_fn"],
-                weight[prefix + "hc_ffn_scale"],
-                weight[prefix + "hc_ffn_base"], hcMult,
-                hcSinkhornIters, hcEps, rms_norm_eps,
-                ffnInput, ffnPost, ffnComb);
-            Data normalizedFfn;
-            KimiK3RMSNorm(
-                ffnInput,
-                weight[prefix + "post_attention_layernorm.weight"],
-                rms_norm_eps, normalizedFfn);
-            Data ffnOutput;
-            if (denseMlpLayers[layer]) {
-                RunClampedMlp(
-                    normalizedFfn,
-                    weight[prefix + "mlp.gateup_proj.weight"],
-                    weight[prefix + "mlp.down_proj.weight"],
-                    ffnOutput);
-            } else {
-                RunMoe(layer, normalizedFfn, sequence, ffnOutput);
-            }
-            DeepSeekV4HcPost(
-                ffnOutput, *current, ffnPost, ffnComb, *next);
-            std::swap(current, next);
+            ThreadTpAllReduce(attentionOutput);
+            DeepSeekV4HcPost(attentionOutput, input, attentionPost, attentionComb, output);
+        };
+#ifdef USE_CUDA
+        if (threadTpRank >= 0 && sequence == 1 && batch == 1 && kdaLayers[layer] &&
+            kdaReplay == nullptr && threadTpOwner->activeGraphs) {
+            Data graphOutput;
+            threadTpOwner->RunKdaGraph(threadTpRank, layer, input, graphOutput, runAttention);
+            output.CopyFrom(graphOutput);
+        } else
+#endif
+        {
+            runAttention(input, output);
         }
+    }
 
+    void Glm5NextModel::PrepareFfnBlock(
+            const std::string &prefix, Data &input, Data &normalizedFfn,
+            Data &ffnPost, Data &ffnComb) {
+        Glm5NextHcPreNorm(
+            input, weight[prefix + "hc_ffn_fn"],
+            weight[prefix + "hc_ffn_scale"],
+            weight[prefix + "hc_ffn_base"],
+            weight[prefix + "post_attention_layernorm.weight"], hcMult,
+            hcSinkhornIters, hcEps, rms_norm_eps,
+            normalizedFfn, ffnPost, ffnComb, executionMode == ExecutionMode::Hybrid);
+    }
+
+    void Glm5NextModel::FinishFfnBlock(
+            Data &ffnOutput, Data &input, Data &ffnPost, Data &ffnComb, Data &output) {
+        ThreadTpAllReduce(ffnOutput);
+        DeepSeekV4HcPost(
+            ffnOutput, input, ffnPost, ffnComb, output);
+    }
+
+    int Glm5NextModel::ForwardOutput(
+            Data &hiddenStates,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<float> *logits, bool sampleOutput,
+            Data *targetHiddenStates) {
         if (!sampleOutput && targetHiddenStates == nullptr) {
             return 0;
         }
 
         ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
         Data collapsed, finalHidden;
-        Glm5NextHcMean(*current, collapsed);
-        KimiK3RMSNorm(
-            collapsed, weight[languagePrefix + "norm.weight"],
-            rms_norm_eps, finalHidden);
+        if (!TryHybridOutputNorm(hiddenStates, finalHidden)) {
+            Glm5NextHcMean(hiddenStates, collapsed);
+            KimiK3RMSNorm(
+                collapsed, weight[languagePrefix + "norm.weight"],
+                rms_norm_eps, finalHidden);
+        }
         if (targetHiddenStates != nullptr) {
             targetHiddenStates->CopyFrom(finalHidden);
         }

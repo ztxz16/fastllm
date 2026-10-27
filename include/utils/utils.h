@@ -60,24 +60,13 @@
 #elif defined(__GNUC__) || defined(__clang__)
     #include <cpuid.h> // For __get_cpuid, __get_cpuid_count
     #include <x86intrin.h> // For _xgetbv (usually included by cpuid.h or available)
-    // GCC/Clang might not have _xgetbv as an intrinsic like MSVC,
-    // or it might be in a different header.
-    // If _xgetbv is not found, you might need to implement it with inline assembly.
-    #ifndef _XCR_XFEATURE_ENABLED_MASK // Often defined with _xgetbv
-    #define _XCR_XFEATURE_ENABLED_MASK 0
-    #if __GNUC__ < 8 && !defined(USE_ROCM)
-    static uint64_t _xgetbv(uint32_t xcr_index) {
+    // This helper is called only after checking CPUID.OSXSAVE. Inline assembly
+    // keeps CPU detection buildable even when the baseline has no XSAVE/AVX.
+    static inline uint64_t fastllm_xgetbv(uint32_t xcr_index) {
         uint32_t eax, edx;
-        __asm__ __volatile__ (
-            "xgetbv"
-            : "=a" (eax), "=d" (edx)  // Output operands: eax, edx
-            : "c" (xcr_index)         // Input operand: ecx (xcr_index)
-            :                         // Clobbered registers (none explicitly clobbered by xgetbv beyond outputs)
-        );
+        __asm__ __volatile__("xgetbv" : "=a"(eax), "=d"(edx) : "c"(xcr_index));
         return ((uint64_t)edx << 32) | eax;
     }
-    #endif
-    #endif
 #else
     #warning "CPUID detection not implemented for this compiler."
 #endif
@@ -166,7 +155,11 @@ namespace fastllm {
             bool os_amx_enabled = false; // OS state support for AMX
 
             if (os_supports_xsave) {
-                uint64_t xcr0 = _xgetbv(_XCR_XFEATURE_ENABLED_MASK);
+#if defined(_MSC_VER)
+                uint64_t xcr0 = _xgetbv(0);
+#else
+                uint64_t xcr0 = fastllm_xgetbv(0);
+#endif
                 
                 // Check for AVX support (bits 1 and 2)
                 if ((xcr0 & 0x6) == 0x6) {
@@ -397,10 +390,10 @@ namespace fastllm {
     // Simulate the official DeepSeek FP8 activation path while retaining a
     // BF16 buffer for CPU GEMM kernels: block-128 E4M3FN, UE8M0 power-of-two
     // scale, saturating RNE conversion, then dequantize and round to BF16.
-    inline void QuantizeDequantizeFP8E4M3Block128(float *values, int len) {
+    inline void QuantizeDequantizeFP8E4M3Blocks(float *values, int len, int blockSize) {
         static const FP8E4M3ToFP32Manager fp8;
-        for (int start = 0; start < len; start += 128) {
-            int end = std::min(start + 128, len);
+        for (int start = 0; start < len; start += blockSize) {
+            int end = std::min(start + blockSize, len);
             float amax = 1e-4f;
             bool allBFloat16 = true;
             for (int i = start; i < end; i++) {
@@ -433,6 +426,10 @@ namespace fastllm {
                 }
             }
         }
+    }
+
+    inline void QuantizeDequantizeFP8E4M3Block128(float *values, int len) {
+        QuantizeDequantizeFP8E4M3Blocks(values, len, 128);
     }
 
     static double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {

@@ -5,6 +5,7 @@
 #include "utils.h"
 
 #include "executor.h"
+#include "utils/autotune.h"
 
 #include "devices/cpu/cpudevice.h"
 #include "devices/disk/diskdevice.h"
@@ -33,6 +34,42 @@
 #endif
 
 namespace fastllm {
+    static bool UsesSharedHostMoe(BaseDevice *device, const DataDict &datas, const IntDict &params) {
+        if (device->deviceType == "numa") return true;
+#ifdef USE_NUMAS
+        if (device->deviceType == "cpu") return CanRunHostMoe(datas, params);
+#endif
+        return false;
+    }
+
+    static bool TensorNeedsDeviceCopy(
+            const std::string &opType, const std::string &name,
+            BaseDevice *device, const DataDict &datas, bool sharedHostMoe) {
+        if (name == "output" ||
+            (opType == "SelectExpert" && (name == "index" || name == "score"))) {
+            return false;
+        }
+#ifdef USE_CUDA
+        if (opType == "MergeMOE" &&
+            (device->deviceType == "cuda" || sharedHostMoe) &&
+            (name == "w1" || name == "w2" || name == "w3")) {
+            // CUDA/shared host MoE overwrites these workspaces before reading them (or
+            // leaves them unused). Moving between layer devices must allocate
+            // on the destination without transferring the previous layer's data.
+            // Keep input semantics if a caller also binds this Data as an input.
+            const Data *workspace = datas.at(name);
+            for (const char *input : {"input", "index", "score"}) {
+                auto it = datas.find(input);
+                if (it != datas.end() && it->second == workspace) {
+                    return true;
+                }
+            }
+            return false;
+        }
+#endif
+        return true;
+    }
+
 #ifdef USE_CUDA
     static bool KeepKimiK3NumaTensorOnSource(
             const std::string &opType, const std::string &name,
@@ -49,16 +86,14 @@ namespace fastllm {
         return name == "input" || name == "index" || name == "score";
     }
 
-    static bool KeepNumasMergeMoeTensorOnSource(
-            const std::string &opType, const std::string &name,
-            BaseDevice *device, const Data *data) {
-        if (opType != "MergeMOE" || device == nullptr ||
-            device->deviceType != "numa" || data == nullptr ||
+    static bool KeepHostMoeTensorOnSource(
+            const std::string &name, const Data *data, bool sharedHostMoe) {
+        if (!sharedHostMoe || data == nullptr ||
             data->dataDevice != DataDevice::CUDA ||
             data->cudaData == nullptr || data->multiDeviceData) {
             return false;
         }
-        // The hybrid NUMA/CUDA implementation stages its CPU activation in a
+        // The shared host/CUDA implementation stages its CPU activation in a
         // reusable pinned buffer and keeps the CUDA mirror for GPU experts.
         // Letting the generic executor move these tensors first creates a
         // pageable D2H allocation and discards/reallocates the reusable CUDA
@@ -112,20 +147,23 @@ namespace fastllm {
             return false;
         }
 
-        // The batch-1 collective EP path accepts any participating CUDA device
-        // as its root.  Keep the hidden state and GPU route results together on
+        const bool v41 = intParams.count("deepSeekV4Mode") && intParams.at("deepSeekV4Mode") &&
+            intParams.count("activationQuantBlock") && intParams.at("activationQuantBlock") == 32;
+        const int maxRows = v41 ? 8 : 1;
+        // Small V4.1 batches and batch-1 EP accept any participating CUDA root.
+        // Keep the hidden state and GPU route results together on
         // the layer's current device instead of first copying all three tensors
         // to multicuda's deviceIds[0].  That device then packs the single NCCL
         // broadcast packet and receives the final reduce result directly.
         if (data->dataDevice == DataDevice::CUDA && data->cudaData != nullptr &&
             !data->multiDeviceData) {
             if (name == "input") {
-                return data->dims.size() > 0 && data->dims[0] == 1 &&
+                return data->dims.size() > 0 && data->dims[0] >= 1 && data->dims[0] <= maxRows &&
                        (data->dataType == DataType::FLOAT16 ||
                         data->dataType == DataType::BFLOAT16 ||
                         data->dataType == DataType::FLOAT32);
             }
-            if (data->dims.size() >= 2 && data->dims[0] == 1 && data->dims[1] <= 16) {
+            if (data->dims.size() >= 2 && data->dims[0] >= 1 && data->dims[0] <= maxRows && data->dims[1] <= 16) {
                 return (name == "index" && data->dataType == DataType::INT32) ||
                        (name == "score" && data->dataType == DataType::FLOAT32);
             }
@@ -298,6 +336,7 @@ namespace fastllm {
             SelectCudaDeviceForCandidate(device);
 #endif
             if (device->CanRun(opType, datas, floatParams, intParams)) {
+                const bool sharedHostMoe = opType == "MergeMOE" && UsesSharedHostMoe(device, datas, intParams);
                 bool intParamsSize = intParams.size();
                 for (auto &it: datas) {
                     if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
@@ -355,17 +394,11 @@ namespace fastllm {
                         }
                     } else {
                         if (it.second) {
-                            bool copyData = true;
-                            if (it.first == "output") {
-                                copyData = false;
-                            } else if (opType == "SelectExpert" && (it.first == "index" || it.first == "score")) {
-                                copyData = false;
-                            }
+                            const bool copyData = TensorNeedsDeviceCopy(opType, it.first, device, datas, sharedHostMoe);
 #ifdef USE_CUDA
                             if (!KeepKimiK3NumaTensorOnSource(
                                     opType, it.first, device, it.second) &&
-                                !KeepNumasMergeMoeTensorOnSource(
-                                    opType, it.first, device, it.second) &&
+                                !KeepHostMoeTensorOnSource(it.first, it.second, sharedHostMoe) &&
                                 !KeepMultiCudaMergeMoeTensorOnSource(
                                     opType, it.first, device, it.second,
                                     intParams)) {
@@ -377,7 +410,17 @@ namespace fastllm {
                         }
                     }
                 }
+                static const bool traceOps = std::getenv("FASTLLM_TRACE_OPS") != nullptr;
+                if (traceOps) {
+                    auto wIt = datas.find("weight");
+                    const char *wName = (wIt != datas.end() && wIt->second != nullptr &&
+                                         !wIt->second->name.empty()) ? wIt->second->name.c_str() : "";
+                    fprintf(stderr, "[op] %s on %s %s\n", opType.c_str(),
+                            device->deviceType.c_str(), wName);
+                    fflush(stderr);
+                }
                 device->Reshape(opType, datas, floatParams, intParams);
+                AutotuneOpScope tuning(opType, sharedHostMoe ? "numa" : device->deviceType, datas, intParams);
                 device->Run(opType, datas, floatParams, intParams);
 #ifdef USE_CUDA
                 SyncCudaDeviceForProfiler(device);
@@ -410,6 +453,7 @@ namespace fastllm {
             if (!device->CanRun(opType, datas, floatParams, intParams)) {
                 continue;
             }
+            const bool sharedHostMoe = opType == "MergeMOE" && UsesSharedHostMoe(device, datas, intParams);
             bool intParamsSize = intParams.size();
             for (auto &it: datas) {
                 if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
@@ -439,15 +483,11 @@ namespace fastllm {
                     }
                 } else {
                     if (it.second) {
-                        bool copyData = true;
-                        if (it.first == "output") {
-                            copyData = false;
-                        } else if (opType == "SelectExpert" && (it.first == "index" || it.first == "score")) {
-                            copyData = false;
-                        }
+                        const bool copyData = TensorNeedsDeviceCopy(opType, it.first, device, datas, sharedHostMoe);
 #ifdef USE_CUDA
                         if (!KeepKimiK3NumaTensorOnSource(
                                 opType, it.first, device, it.second) &&
+                            !KeepHostMoeTensorOnSource(it.first, it.second, sharedHostMoe) &&
                             !KeepMultiCudaMergeMoeTensorOnSource(
                                 opType, it.first, device, it.second,
                                 intParams)) {
@@ -460,6 +500,7 @@ namespace fastllm {
                 }
             }
             device->Reshape(opType, datas, floatParams, intParams);
+            AutotuneOpScope tuning(opType, sharedHostMoe ? "numa" : device->deviceType, datas, intParams);
             device->Run(opType, datas, floatParams, intParams);
 #ifdef USE_CUDA
             SyncCudaDeviceForProfiler(device);

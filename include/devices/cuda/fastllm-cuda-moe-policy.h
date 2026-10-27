@@ -1,9 +1,52 @@
 #pragma once
 
+#include <functional>
+#include <vector>
+
 namespace fastllm { class Data; }
 
 // Decode-only mode selection; the ordinary cache and hybrid capability APIs
 // keep their existing meaning. Begin/End bracket a complete sampled token.
 bool FastllmCudaUseMoeHybrid(fastllm::Data **weights, int weightsBatch);
 void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int topk);
+// Configure supported GLM TP2 caches before allocating per-device caches.
+bool FastllmCudaPrepareMoeTensorParallel(fastllm::Data **weights, int weightsBatch,
+                                       const std::vector<int> &devices);
+// Whole experts belong to devices[expert_id % devices.size()]. Configure before
+// prefill so both prefill admission and decode use the same ownership.
+bool FastllmCudaPrepareMoeExpertCache(fastllm::Data **weights, int weightsBatch,
+                                    const std::vector<int> &devices);
+// A supported TP group distributes complete experts across its devices.
+// Other formats and zero-cache configurations retain ordinary hybrid execution.
+void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int topk,
+                              const std::vector<int> *devices);
 void FastllmCudaEndMoeDecode(void *state);
+// Join deferred CPU experts before another operation borrows the host pool.
+void FastllmCudaWaitMoeDecodeCpu(void *state);
+
+// The caller hands off these devices' compute streams before borrowing them.
+// A nonempty list includes the current device and bounds every GPU used,
+// including fallback. Empty retains ordinary hybrid behavior. Cache admission
+// remains independent of temporary expert execution.
+bool FastllmCudaMergeMOEHybridOnDevices(const fastllm::Data &input,
+    const fastllm::Data &index, const fastllm::Data &score, fastllm::Data &output,
+    fastllm::Data **weights, int weightsBatch, int layer,
+    const std::vector<int> &devices, const std::function<void()> &launchParallel);
+
+// Set before allocating device caches. Main and draft groups share the model's
+// configured per-device budget instead of each allocating the entire budget.
+bool FastllmCudaSetMoeCacheBudgetFraction(fastllm::Data **weights, int count, double fraction);
+
+// Attribute small-batch routes without changing cache or scheduling decisions.
+// Scopes are thread-local and nest across model callbacks.
+enum class FastllmMoeRoutePhase { Unspecified = -1, Decode, Verify, Draft, SmallPrefill };
+FastllmMoeRoutePhase FastllmCudaSetMoeRoutePhase(FastllmMoeRoutePhase phase);
+class FastllmCudaMoeRouteScope {
+    FastllmMoeRoutePhase previous;
+public:
+    explicit FastllmCudaMoeRouteScope(FastllmMoeRoutePhase phase)
+        : previous(FastllmCudaSetMoeRoutePhase(phase)) {}
+    ~FastllmCudaMoeRouteScope() { FastllmCudaSetMoeRoutePhase(previous); }
+    FastllmCudaMoeRouteScope(const FastllmCudaMoeRouteScope &) = delete;
+    FastllmCudaMoeRouteScope &operator=(const FastllmCudaMoeRouteScope &) = delete;
+};

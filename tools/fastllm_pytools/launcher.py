@@ -30,14 +30,15 @@ from .launcher_harness import HarnessRuntime
 from .launcher_opencode import OpenCodeRuntime
 from .launcher_codex import CodexRuntime
 from .launcher_claude import ClaudeRuntime
-from .launcher_mtp import detect_mtp_support
+from .launcher_mtp import detect_mtp_support, _dspark_config
+from .model_catalog import MODELSCOPE_DOWNLOAD_GROUPS
+from .modelscope_download import _filter_file_sizes
 from .startup_progress import PROGRESS_PREFIX
 from .ui_hardware import detect_hardware
 from .ui_plugins import BUNDLED_PLUGINS, PluginRegistry, install_plugin_routes, mount_studio_assets
 from .tui import (
     DEFAULT_MODELSCOPE_MODEL_ID,
     DeployConfig,
-    MODELSCOPE_MODEL_GROUPS,
     build_fastllm_env,
     build_fastllm_argv,
     complete_path_prefix,
@@ -78,7 +79,7 @@ ANSI_ESCAPE_PATTERN = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|
 CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
 INFERENCE_SPEED_PATTERN = re.compile(
     r"^\[(Prompt|Decode)\]\s+.+?\bSpeed:\s*"
-    r"((?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+tokens\s*/\s*s\.?\s*$"
+    r"((?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+tokens\s*/\s*s\.?(?:\s+Batch:\s*\d+\.)?\s*$"
 )
 CONTEXT_WINDOW_PATTERN = re.compile(
     r"\bModel context window:\s*(\d{1,10})\s+tokens per session "
@@ -123,6 +124,8 @@ MOE_MODEL_TYPES = frozenset({
     "deepseek_v2",
     "deepseek_v3",
     "deepseek_v4",
+    "deepseek_v41",
+    "deepseek_v41_text",
     "dots3_note",
     "glm5_next",
     "glm5_next_text",
@@ -194,6 +197,7 @@ class DownloadConfig:
     revision: str = "master"
     max_workers: int = 4
     token: str = ""
+    include: str = ""
 
 
 def _modelscope_is_available() -> bool:
@@ -251,6 +255,7 @@ def _coerce_download_config(payload: Any) -> DownloadConfig:
     )
     revision = text_value("revision", "master").strip() or "master"
     token = text_value("token")
+    include = text_value("include").strip()
     try:
         raw_max_workers = payload.get("maxWorkers", 4)
         max_workers = 0 if isinstance(raw_max_workers, bool) else int(raw_max_workers)
@@ -262,6 +267,7 @@ def _coerce_download_config(payload: Any) -> DownloadConfig:
         revision=revision,
         max_workers=max_workers,
         token=token,
+        include=include,
     )
 
 
@@ -298,11 +304,22 @@ def _validate_download_config(config: DownloadConfig) -> List[str]:
         errors.append("Concurrent downloads must be an integer from 1 to 64.")
     if len(config.token) > 8192 or CONTROL_CHARACTER_PATTERN.search(config.token):
         errors.append("Access token contains invalid characters.")
+    include_patterns = _download_include_patterns(config.include)
+    if len(config.include) > 8192 or CONTROL_CHARACTER_PATTERN.search(config.include):
+        errors.append("Download file patterns contain invalid characters.")
+    elif len(include_patterns) > 64:
+        errors.append("Download file patterns may contain at most 64 entries.")
+    elif any(len(pattern) > 512 or pattern.startswith("-") for pattern in include_patterns):
+        errors.append("Each download file pattern must be at most 512 characters and cannot start with '-'.")
     return errors
 
 
+def _download_include_patterns(value: str) -> List[str]:
+    return [item.strip() for item in re.split(r"[,;\n]+", value or "") if item.strip()]
+
+
 def _download_arguments(config: DownloadConfig) -> List[str]:
-    return [
+    arguments = [
         "download",
         "--model",
         config.model_id,
@@ -313,6 +330,9 @@ def _download_arguments(config: DownloadConfig) -> List[str]:
         "--max-workers",
         str(config.max_workers),
     ]
+    for pattern in _download_include_patterns(config.include):
+        arguments.extend(("--include", pattern))
+    return arguments
 
 
 def _download_argv(config: DownloadConfig) -> List[str]:
@@ -321,9 +341,29 @@ def _download_argv(config: DownloadConfig) -> List[str]:
 
 
 def _download_display_command(config: DownloadConfig) -> str:
-    argv = ["modelscope", *_download_arguments(config)]
-    suffix = "  [Token injected through environment]" if config.token else ""
+    argv = _download_argv(config)
+    suffix = "  # [Token injected through environment]" if config.token else ""
     return " ".join(shlex.quote(part) for part in argv) + suffix
+
+
+def _downloaded_model_path(config: DownloadConfig) -> str:
+    """Choose an unambiguous GGUF entry point, keeping HF directories intact."""
+    root = Path(config.target_dir)
+    patterns = _download_include_patterns(config.include)
+    if not patterns and (root / "config.json").is_file():
+        return str(root)
+    candidates = []
+    for path in root.rglob("*.gguf"):
+        if not path.is_file() or path.name.lower().startswith("mmproj"):
+            continue
+        if not _filter_file_sizes({path.relative_to(root).as_posix(): 0}, patterns):
+            continue
+        shard = re.fullmatch(r".*-(\d{5})-of-\d{5}\.gguf", path.name)
+        if shard and shard[1] != "00001":
+            continue
+        candidates.append(path)
+    # Multiple variants require the user to select the intended checkpoint.
+    return str(candidates[0]) if len(candidates) == 1 else str(root)
 
 
 def _display_endpoint(config: DeployConfig) -> str:
@@ -490,8 +530,8 @@ class LauncherRuntime:
         configs = load_saved_configs(self.config_path)
         config = new_deploy_config(configs)
         config.command = "server"
-        config.config_mode = "long_context"
-        config.low_gpu_mem = True
+        config.config_mode = "auto"
+        config.device = "auto"
         return asdict(config)
 
     def _close_webui_locked(self):
@@ -534,6 +574,18 @@ class LauncherRuntime:
     def open_harness(self, launcher_host, browser_origin, *, install=False):
         return self.open_agent("harness", launcher_host, browser_origin, install=install)
 
+    def api_info(self):
+        # Credentials are returned only by the authenticated, explicit info
+        # request, never in the periodically polled runtime snapshot.
+        with self._lock:
+            if (self._state["command"] != "server" or not self._state["ready"]
+                    or self._state["phase"] != "running" or self._process is None
+                    or self._process.poll() is not None):
+                raise LauncherError("Start an API Server before viewing API information.")
+            return {"sessionId": self._state["sessionId"],
+                    "baseUrl": self._state["endpoint"].rstrip("/") + "/v1",
+                    "model": self._state["modelName"], "apiKey": self._service_api_key}
+
     def open_agent(self, agent_id, launcher_host, browser_origin, *, install=False):
         if agent_id not in {"harness", "opencode", "codex", "claude"}:
             raise LauncherError("Unknown agent.")
@@ -563,16 +615,17 @@ class LauncherRuntime:
         }
 
     def download_catalog(self) -> List[Dict[str, Any]]:
-        groups = []
-        for key, label, choices in MODELSCOPE_MODEL_GROUPS:
-            models = [
-                {"id": model_id, "label": model_label}
-                for model_id, model_label in choices
-                if model_id != "custom"
-            ]
-            if models:
-                groups.append({"id": key, "label": label, "models": models})
-        return groups
+        return [
+            {
+                "id": group["id"],
+                "label": group["label"],
+                "description": group.get("description", ""),
+                "accent": group.get("accent", "slate"),
+                "models": [dict(model) for model in group.get("models", ())],
+            }
+            for group in MODELSCOPE_DOWNLOAD_GROUPS
+            if group.get("models")
+        ]
 
     def save_profile(self, index: Optional[int], payload: Any) -> Dict[str, Any]:
         config = _coerce_config(payload)
@@ -699,6 +752,7 @@ class LauncherRuntime:
                 "pid": None,
                 "modelId": config.model_id,
                 "destination": config.target_dir,
+                "modelPath": "",
                 "progress": 0.0,
                 "progressIndeterminate": True,
                 "downloadedBytes": 0,
@@ -739,7 +793,7 @@ class LauncherRuntime:
         )
         threading.Thread(
             target=self._watch_download,
-            args=(process, generation),
+            args=(process, generation, config),
             name="ftllm-launcher-download",
             daemon=True,
         ).start()
@@ -797,8 +851,14 @@ class LauncherRuntime:
                 "message": f"Downloading model... Overall progress {progress:.1f}%",
             })
 
-    def _watch_download(self, process, generation: int):
+    def _watch_download(self, process, generation: int, config: DownloadConfig):
         exit_code = process.wait()
+        model_path = config.target_dir
+        if exit_code == 0:
+            try:
+                model_path = _downloaded_model_path(config)
+            except OSError:
+                pass  # A disappearing destination must not strand the watcher.
         with self._lock:
             if generation != self._download_generation:
                 return
@@ -821,6 +881,7 @@ class LauncherRuntime:
                     else f"Model download failed (code={exit_code})"
                 ),
                 "exitCode": exit_code,
+                "modelPath": model_path if completed else "",
             })
             destination = self._download_state["destination"]
             message = self._download_state["message"]
@@ -1581,6 +1642,7 @@ def inspect_launch_model(model_path: str, name: str = "") -> Dict[str, Any]:
         "textModelType": text_model_type,
         "parameterBillions": parameter_billions,
         "weightBytes": weight_bytes,
+        "residentBytesLowerBound": _estimate_deepseek_v41_resident_bytes(config, text_config),
         "quantization": quantization["name"],
         "recommendedDtype": quantization["dtype"],
         "sourceBytesPerParameter": quantization["sourceBytesPerParameter"],
@@ -1591,12 +1653,60 @@ def inspect_launch_model(model_path: str, name: str = "") -> Dict[str, Any]:
     }
 
 
+DEEPSEEK_V41_MODEL_TYPES = ("deepseek_v41", "deepseek_v41_text")
+
+
+def _estimate_deepseek_v41_resident_bytes(config: Dict[str, Any], text_config: Dict[str, Any]) -> int:
+    """DeepSeek-V4.1 常驻内存下界（按 config 计算）。
+
+    FP4 路由专家（约 270 GB）与两张 FP8 Engram 表（各约 100 GB）都常驻主机内存；
+    权重文件不全（下载中、缺少 index）或按参数量估算时会漏掉这两块，导致自动模式
+    低估内存需求而选错 moe_device，所以这里直接按结构计算。
+    """
+    model_type = _first_text(config.get("model_type")).lower()
+    text_model_type = _first_text(text_config.get("model_type")).lower()
+    if model_type not in DEEPSEEK_V41_MODEL_TYPES and text_model_type not in DEEPSEEK_V41_MODEL_TYPES:
+        return 0
+    cfg = text_config if text_config else config
+    layers = int(_positive_number(cfg.get("num_hidden_layers")))
+    hidden = int(_positive_number(cfg.get("hidden_size")))
+    inter = int(_positive_number(cfg.get("moe_intermediate_size")))
+    experts = int(_positive_number(cfg.get("n_routed_experts")))
+    shared = int(_positive_number(cfg.get("n_shared_experts")))
+    vocab = int(_positive_number(cfg.get("vocab_size")))
+    if not (layers and hidden and inter):
+        return 0
+    # 路由专家：FP4（0.5 B/参数）+ 每 32 个一组的 UE8M0 scale
+    expert_bytes = layers * experts * 3 * hidden * inter * (0.5 + 1.0 / 32)
+    # Engram 表：FP8 + 每 32 列一个 UE8M0 scale，行数 = engram_num_embeddings
+    engram_rows = cfg.get("engram_num_embeddings")
+    if not isinstance(engram_rows, list):
+        engram_rows = []
+    engram_dim = int(_positive_number(cfg.get("engram_head_dim")))
+    engram_bytes = sum(_positive_number(rows) for rows in engram_rows) * engram_dim * (1.0 + 1.0 / 32)
+    # 稠密部分（embedding / head / 注意力 / indexer / 共享专家）按 fp16 反量化后计
+    q_lora = int(_positive_number(cfg.get("q_lora_rank")))
+    heads = int(_positive_number(cfg.get("num_attention_heads")))
+    head_dim = int(_positive_number(cfg.get("head_dim")))
+    o_lora = int(_positive_number(cfg.get("o_lora_rank")))
+    index_heads = int(_positive_number(cfg.get("index_n_heads")))
+    index_dim = int(_positive_number(cfg.get("index_head_dim")))
+    dense_params = 2 * vocab * hidden + layers * (
+        hidden * q_lora + q_lora * heads * head_dim + hidden * head_dim + heads * head_dim * o_lora
+        + 3 * hidden * inter * shared + 2 * hidden * index_heads * index_dim
+    )
+    dense_bytes = dense_params * 2.0
+    return int(expert_bytes + engram_bytes + dense_bytes)
+
+
 def _estimate_launch_model_bytes(metadata: Dict[str, Any]) -> int:
     weight_bytes = int(_positive_number(metadata.get("weightBytes")))
     if not weight_bytes:
         parameters = _positive_number(metadata.get("parameterBillions")) * 1e9
         source_bytes = _positive_number(metadata.get("sourceBytesPerParameter")) or 2.0
         weight_bytes = int(parameters * source_bytes)
+    # 结构决定的常驻内存下界（目前只有 DeepSeek-V4.1 提供），文件统计偏小时以它为准
+    weight_bytes = max(weight_bytes, int(_positive_number(metadata.get("residentBytesLowerBound"))))
     if weight_bytes <= 0:
         return 0
     return int(weight_bytes * 1.1 + 1.25 * GIB)
@@ -1811,8 +1921,15 @@ def recommend_launch_config(
             build = normalized_hardware["build"]
             if (config["device"] in ("cuda", "tp")
                     and build.get("USE_CUDA") is not False and not build.get("USE_ROCM")):
-                config["mtp"] = "3"
-                config["speculative_algorithm"] = "mtp"
+                model_config = _read_model_config_for_recommendation(expanded_path)
+                dspark_source, dspark_block = _dspark_config(model_config or {})
+                if dspark_block > 0:
+                    # DeepSeek-V4 / V4.1 的草稿层就在 checkpoint 里，按训练 block 校验
+                    config["draft_tokens"] = str(dspark_block)
+                    config["speculative_algorithm"] = "dspark"
+                else:
+                    config["mtp"] = "3"
+                    config["speculative_algorithm"] = "mtp"
             else:
                 speculative_reason = "cuda_required"
 
@@ -1835,6 +1952,9 @@ def recommend_launch_config(
             "modelType": metadata["modelType"],
             "parameterBillions": round(parameter_billions, 2),
             "weightGiB": round(weight_bytes / GIB, 2),
+            "residentGiB": round(
+                _positive_number(metadata.get("residentBytesLowerBound")) / GIB, 2
+            ),
             "quantization": metadata["quantization"],
             "isMoe": bool(metadata["isMoe"]),
             "usesNgram": bool(metadata["usesNgram"]),
@@ -2117,6 +2237,10 @@ def create_launcher_app(
     @app.get("/api/runtime")
     async def runtime_state():
         return runtime.state()
+
+    @app.get("/api/runtime/api-info")
+    async def api_info():
+        return runtime.api_info()
 
     @app.post("/api/webui/open")
     async def open_webui(request: Request):

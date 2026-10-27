@@ -1,8 +1,11 @@
 #include <map>
 #include <limits>
+#include <memory>
+#include <stdexcept>
 
 #include <assert.h>
 #include "gguf.h"
+#include "ggufdirectmerge.h"
 
 typedef uint16_t ggml_fp16_t;
 GGML_API float       ggml_fp16_to_fp32(ggml_fp16_t);
@@ -50,6 +53,12 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             nullptr, GGML_TYPE_F32,
             /* to_float */ (ggml_to_float_t) ggml_fp16_to_fp32_row,
             // .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
+        }},
+        {GGML_TYPE_Q2_0, ggml_type_traits{/* type_name */"q2_0", /* blck_size */QK2_0,
+            /* type_size */ sizeof(block_q2_0), /* is_quantized */ true,
+            /* vec_dot */ ggml_vec_dot_q2_0_q8_0,
+            /* vec_dot_type */ GGML_TYPE_Q8_0,
+            /* to_float */ (ggml_to_float_t) dequantize_row_q2_0,
         }},
         {GGML_TYPE_Q4_0, ggml_type_traits{/* type_name */"q4_0", /* blck_size */QK4_0,
             /* type_size */ sizeof(block_q4_0),/* is_quantized */  true,
@@ -169,34 +178,46 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             // .to_float                 = (ggml_to_float_t) dequantize_row_q2_K,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q2_K_ref,
         }},
-        {GGML_TYPE_IQ2_XS, {/* type_name */"iq2_xs", /* blck_size */QK_K,
+        {GGML_TYPE_IQ2_XS, ggml_type_traits{/* type_name */"iq2_xs", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq2_xs),/* is_quantized */  true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xs,
+            /* vec_dot */ ggml_vec_dot_iq2_xs_q8_K,
+            /* vec_dot_type */ GGML_TYPE_Q8_K,
+            /* to_float */ (ggml_to_float_t) dequantize_row_iq2_xs,
             // .from_float_ref           = nullptr,
         }},
-        {GGML_TYPE_IQ3_XXS, {/* type_name */"iq3_xxs", /* blck_size */QK_K,
+        {GGML_TYPE_IQ3_XXS, ggml_type_traits{/* type_name */"iq3_xxs", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq3_xxs),/* is_quantized */  true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq3_xxs,
+            /* vec_dot */ ggml_vec_dot_iq3_xxs_q8_K,
+            /* vec_dot_type */ GGML_TYPE_Q8_K,
+            /* to_float */ (ggml_to_float_t) dequantize_row_iq3_xxs,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq3_xxs_ref,
         }},
-        {GGML_TYPE_IQ3_S, {/* type_name */"iq3_s", /* blck_size */QK_K,
+        {GGML_TYPE_IQ3_S, ggml_type_traits{/* type_name */"iq3_s", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq3_s),/* is_quantized */  true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq3_s,
+            /* vec_dot */ ggml_vec_dot_iq3_s_q8_K,
+            /* vec_dot_type */ GGML_TYPE_Q8_K,
+            /* to_float */ (ggml_to_float_t) dequantize_row_iq3_s,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq3_s_ref,
         }},
-        {GGML_TYPE_IQ2_S, {/* type_name */"iq2_s", /* blck_size */QK_K,
+        {GGML_TYPE_IQ2_S, ggml_type_traits{/* type_name */"iq2_s", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq2_s),/* is_quantized */  true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq2_s,
+            /* vec_dot */ ggml_vec_dot_iq2_s_q8_K,
+            /* vec_dot_type */ GGML_TYPE_Q8_K,
+            /* to_float */ (ggml_to_float_t) dequantize_row_iq2_s,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq2_s_ref,
         }},
-        {GGML_TYPE_IQ1_S, {/* type_name */"iq1_s", /* blck_size */QK_K,
+        {GGML_TYPE_IQ1_S, ggml_type_traits{/* type_name */"iq1_s", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq1_s),/* is_quantized */  true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq1_s,
+            /* vec_dot */ nullptr,
+            /* vec_dot_type */ GGML_TYPE_F32,
+            /* to_float */ (ggml_to_float_t) dequantize_row_iq1_s,
             // .from_float_ref           = nullptr,
         }},
-        {GGML_TYPE_IQ1_M, {/* type_name */"iq1_m", /* blck_size */QK_K,
+        {GGML_TYPE_IQ1_M, ggml_type_traits{/* type_name */"iq1_m", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq1_m),/* is_quantized */  true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq1_m,
+            /* vec_dot */ nullptr,
+            /* vec_dot_type */ GGML_TYPE_F32,
+            /* to_float */ (ggml_to_float_t) dequantize_row_iq1_m,
             // .from_float_ref           = nullptr,
         }},
         {GGML_TYPE_IQ4_NL, ggml_type_traits{/* type_name */"iq4_nl", /* blck_size */QK4_NL,
@@ -207,7 +228,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
         }},
         {GGML_TYPE_IQ4_XS, ggml_type_traits{/* type_name */"iq4_xs", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq4_xs),/* is_quantized */  true,
-            nullptr, GGML_TYPE_F32,
+            ggml_vec_dot_iq4_xs_q8_K, GGML_TYPE_Q8_K,
             /* to_float */ (ggml_to_float_t) dequantize_row_iq4_xs,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_xs_ref,
         }},
@@ -275,6 +296,15 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .is_quantized             = false,
             .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row,
             // .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
+        }},
+        {GGML_TYPE_Q2_0, ggml_type_traits{
+            .type_name                = "q2_0",
+            .blck_size                = QK2_0,
+            .type_size                = sizeof(block_q2_0),
+            .is_quantized             = true,
+            .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
+            .vec_dot_type             = GGML_TYPE_Q8_0,
+            .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
         }},
         {GGML_TYPE_Q4_0, ggml_type_traits{
             .type_name                = "q4_0",
@@ -454,7 +484,9 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq2_xs),
             .is_quantized             = true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xs,
+            .vec_dot                  = ggml_vec_dot_iq2_xs_q8_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
+            .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xs,
             // .from_float_ref           = nullptr,
         }},
         {GGML_TYPE_IQ2_XS_R4, {
@@ -472,7 +504,9 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq3_xxs),
             .is_quantized             = true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq3_xxs,
+            .vec_dot                  = ggml_vec_dot_iq3_xxs_q8_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
+            .to_float                 = (ggml_to_float_t) dequantize_row_iq3_xxs,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq3_xxs_ref,
         }},
         {GGML_TYPE_IQ3_XXS_R4, {
@@ -482,7 +516,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .is_quantized             = true,
             .vec_dot                  = nullptr,
             .vec_dot_type             = GGML_TYPE_Q8_K,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq3_xxs,
+            // R4 interleaves four rows and cannot use the plain IQ decoder.
+            .to_float                 = nullptr,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq3_xxs_ref,
         }},
         {GGML_TYPE_IQ3_S, {
@@ -490,7 +525,9 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq3_s),
             .is_quantized             = true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq3_s,
+            .vec_dot                  = ggml_vec_dot_iq3_s_q8_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
+            .to_float                 = (ggml_to_float_t) dequantize_row_iq3_s,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq3_s_ref,
         }},
         {GGML_TYPE_IQ2_S, {
@@ -498,9 +535,9 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq2_s),
             .is_quantized             = true,
-            .vec_dot                  = nullptr,
+            .vec_dot                  = ggml_vec_dot_iq2_s_q8_K,
             .vec_dot_type             = GGML_TYPE_Q8_K,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq2_s,
+            .to_float                 = (ggml_to_float_t) dequantize_row_iq2_s,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq2_s_ref,
         }},
         {GGML_TYPE_IQ2_S_R4, {
@@ -510,7 +547,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .is_quantized             = true,
             .vec_dot                  = nullptr,
             .vec_dot_type             = GGML_TYPE_Q8_K,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xs,
+            // R4 interleaves four rows and cannot use the plain IQ decoder.
+            .to_float                 = nullptr,
             // .from_float_ref           = nullptr,
         }},
         {GGML_TYPE_IQ1_S, {
@@ -520,7 +558,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .is_quantized             = true,
             .vec_dot                  = ggml_vec_dot_iq1_s_q8_K,
             .vec_dot_type             = GGML_TYPE_Q8_K,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq1_s,
+            .to_float                 = (ggml_to_float_t) dequantize_row_iq1_s,
             // .from_float_ref           = nullptr,
         }},
         {GGML_TYPE_IQ1_M, {
@@ -530,7 +568,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .is_quantized             = true,
             .vec_dot                  = ggml_vec_dot_iq1_m_q8_K,
             .vec_dot_type             = GGML_TYPE_Q8_K,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq1_m,
+            .to_float                 = (ggml_to_float_t) dequantize_row_iq1_m,
             // .from_float_ref           = nullptr,
         }},
         {GGML_TYPE_IQ4_NL, {
@@ -548,6 +586,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq4_xs),
             .is_quantized             = true,
+            .vec_dot                  = ggml_vec_dot_iq4_xs_q8_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
             .to_float                 = (ggml_to_float_t) dequantize_row_iq4_xs,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_xs_ref,
         }},
@@ -715,6 +755,82 @@ namespace fastllm {
 
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
 
+    bool GetGGUFDirectMergeLayout(const std::vector<const ReadGGUFTask*> &inputs,
+                                  std::vector<int> &dims, uint64_t &bytes) {
+        dims.clear();
+        bytes = 0;
+        if (inputs.size() < 2 || inputs.front() == nullptr) return false;
+        const auto &first = inputs.front()->tensor;
+        if (first.dims.empty() || first.dims.size() > 2) return false;
+        const auto traits = type_traits.find(first.type);
+        if (traits == type_traits.end() || traits->second.nrows > 1 ||
+            traits->second.row_meta_size != 0 ||
+            (traits->second.is_quantized && traits->second.to_float == nullptr)) return false;
+        // Formats without a row decoder may already interleave multiple rows;
+        // byte strides alone cannot establish safe concatenation boundaries.
+        const int64_t block = traits->second.blck_size;
+        const size_t unit = traits->second.type_size;
+        if (block <= 0 || unit == 0) return false;
+        std::vector<int> merged = first.dims;
+        int64_t rows = 0;
+        uint64_t total = 0;
+        for (const auto *input : inputs) {
+            if (input == nullptr || input->replaceType !=
+                    GGUFWeightReplaceRule::GGUFWeightReplaceDirect) return false;
+            const auto &tensor = input->tensor;
+            if (tensor.type != first.type || tensor.dims.size() != merged.size()) return false;
+            for (size_t d = 0; d < merged.size(); ++d) {
+                if (tensor.dims[d] <= 0 || (d != 0 && tensor.dims[d] != merged[d])) return false;
+            }
+            // Require dense rows containing complete quantization blocks.
+            uint64_t stride = unit;
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                const int64_t n = d < (int)tensor.dims.size() ?
+                    tensor.dims[tensor.dims.size() - 1 - d] : 1;
+                if (tensor.ne[d] != n ||
+                    (d < (int)tensor.dims.size() && tensor.nb[d] != stride)) return false;
+                if (d == 0 && n % block != 0) return false;
+                const uint64_t factor = d == 0 ? n / block : n;
+                if (factor > std::numeric_limits<uint64_t>::max() / stride) return false;
+                stride *= factor;
+            }
+            if (ggml_nbytes(&tensor) != stride ||
+                stride > std::numeric_limits<uint64_t>::max() - total) return false;
+            total += stride;
+            rows += tensor.dims[0];
+            if (rows > std::numeric_limits<int>::max()) return false;
+        }
+        if (total > std::numeric_limits<size_t>::max()) return false;
+        merged[0] = (int)rows;
+        dims = std::move(merged);
+        bytes = total;
+        return true;
+    }
+
+    void ReadGGUFTensorBytes(const std::string &fileName, uint64_t offset,
+                             uint8_t *destination, uint64_t bytes) {
+        struct CloseFile { void operator()(FILE *file) const { fclose(file); } };
+        std::unique_ptr<FILE, CloseFile> file(fopen(fileName.c_str(), "rb"));
+        if (!file) throw std::runtime_error("Cannot open GGUF weight file: " + fileName);
+        if (offset > (uint64_t)std::numeric_limits<int64_t>::max())
+            throw std::runtime_error("GGUF weight offset is out of range: " + fileName);
+#if defined(_WIN32) || defined(_WIN64)
+        const int seekResult = _fseeki64(file.get(), (int64_t)offset, SEEK_SET);
+#else
+        if (offset > (uint64_t)std::numeric_limits<off_t>::max())
+            throw std::runtime_error("GGUF weight offset exceeds platform range: " + fileName);
+        const int seekResult = fseeko(file.get(), (off_t)offset, SEEK_SET);
+#endif
+        if (seekResult != 0) throw std::runtime_error("Cannot seek GGUF weight file: " + fileName);
+        while (bytes != 0) {
+            const size_t chunk = (size_t)std::min<uint64_t>(bytes, 1ULL << 30);
+            if (fread(destination, 1, chunk, file.get()) != chunk)
+                throw std::runtime_error("Truncated GGUF weight file: " + fileName);
+            destination += chunk;
+            bytes -= chunk;
+        }
+    }
+
     void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
                                 GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType) {
         // Keep the source-format marker even when a GGUF tensor is imported as
@@ -744,81 +860,38 @@ namespace fastllm {
                 (*(ggml_tensor*)weight->ggmlTensor) = *tensor;
             }
 
-            FILE *fi = fopen(fileName.c_str(), "rb");
-    #if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fi, offset, 0);
-    #else
-            fseek(fi, offset, 0);
-    #endif
-            int ret = fread(weight->cpuData, 1, ggml_nbytes(tensor), fi);
-            fclose(fi);
-/*
-            auto repack = get_repack_info(tensor->type);
-            if (repack != nullptr && regex_search(tensor->name, std::regex(R"(blk.(\d+).ffn_(gate|up|down)_exps.weight)"))) {
-                int nrows = tensor->ne[1], n_per_row = tensor->ne[0];
-                auto row_size = ggml_row_size(tensor->type, n_per_row);
-                std::vector<uint8_t> qtmp(repack->num_rows * row_size);
-                uint8_t *qcur = (uint8_t*)weight->cpuData;
-                for (int row = 0; row < nrows; row += repack->num_rows) {
-                    memcpy(qtmp.data(), qcur, repack->num_rows * row_size);
-                    repack->repack(repack->num_rows, n_per_row, (const char *)qtmp.data(), (char *)qcur, false);
-                    qcur += repack->num_rows * row_size;
-                }
+            ReadGGUFTensorBytes(fileName, offset, weight->cpuData, ggml_nbytes(tensor));
 
-                ((ggml_tensor*)weight->ggmlTensor)->type = repack->new_type;
-                weight->ggmlType = (int)repack->new_type;
+        } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
+                   replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16 ||
+                   replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceBF16) {
+            const bool fp32 = replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32;
+            const bool bf16 = replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceBF16;
+            weight->dataType = fp32 ? DataType::FLOAT32 : bf16 ? DataType::BFLOAT16 : DataType::FLOAT16;
+            weight->Resize(tensor->dims);
+            weight->Allocate();
+
+            const size_t bytes = ggml_nbytes(tensor);
+            std::vector<uint8_t> original(bytes);
+            ReadGGUFTensorBytes(fileName, offset, original.data(), bytes);
+
+            const auto toFloat = ggml_type_to_float(tensor->type);
+            AssertInFastLLM(tensor->type == GGML_TYPE_F32 || toFloat != nullptr,
+                "WeightImportGGUFTensor: weight " + tensor->name + "(type " +
+                ggml_type_name(tensor->type) + ") can't convert to fp32.");
+            std::vector<float> floatData(fp32 ? 0 : weight->Count(0));
+            float *destination = fp32 ? reinterpret_cast<float *>(weight->cpuData) : floatData.data();
+            if (tensor->type == GGML_TYPE_F32) {
+                std::memcpy(destination, original.data(), bytes);
             } else {
-                // printf("name = %s, type = %s\n", tensor->name.c_str(), ggml_type_name(tensor->type));
-                // weight->PrintShape();
+                toFloat(original.data(), destination, weight->Count(0));
             }
-*/
-        } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32) {
-            weight->dataType = DataType::FLOAT32;    
-            weight->Resize(tensor->dims);
-            weight->Allocate();
-
-            auto len = ggml_nbytes(tensor);
-            std::vector <uint8_t> oriData;
-            oriData.resize(len);
-
-            FILE *fi = fopen(fileName.c_str(), "rb");
-    #if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fi, offset, 0);
-    #else
-            fseek(fi, offset, 0);
-    #endif
-            int ret = fread(oriData.data(), 1, ggml_nbytes(tensor), fi);
-            fclose(fi);
-
-            auto toFloat = ggml_type_to_float(tensor->type);
-            AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight " + tensor->name + "(type " + 
-                ggml_type_name(tensor->type) + ") can't convert to fp32.");
-            toFloat(oriData.data(), (float*)weight->cpuData, weight->Count(0));
-        } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
-            weight->dataType = DataType::FLOAT16;    
-            weight->Resize(tensor->dims);
-            weight->Allocate();
-
-            auto len = ggml_nbytes(tensor);
-            std::vector <uint8_t> oriData;
-            std::vector <float> floatData;
-            oriData.resize(len);
-            floatData.resize(weight->Count(0));
-
-            FILE *fi = fopen(fileName.c_str(), "rb");
-    #if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fi, offset, 0);
-    #else
-            fseek(fi, offset, 0);
-    #endif
-            int ret = fread(oriData.data(), 1, ggml_nbytes(tensor), fi);
-            fclose(fi);
-
-            auto toFloat = ggml_type_to_float(tensor->type);
-            AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight " + tensor->name + "(type " + 
-                ggml_type_name(tensor->type) + ") can't convert to fp32.");
-            toFloat(oriData.data(), floatData.data(), weight->Count(0));
-            Float32ToFloat16(floatData.data(), (uint16_t*)weight->cpuData, weight->Count(0));
+            if (bf16) {
+                for (int i = 0; i < weight->Count(0); ++i)
+                    reinterpret_cast<uint16_t *>(weight->cpuData)[i] = Float32ToBFloat16RNEBits(destination[i]);
+            } else if (!fp32) {
+                Float32ToFloat16(destination, reinterpret_cast<uint16_t *>(weight->cpuData), weight->Count(0));
+            }
         } else {
             ErrorInFastLLM("WeightImportGGUFTensor: Unsupport replace type.");
         }
@@ -1032,7 +1105,16 @@ namespace fastllm {
                                 )
                         );
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
-                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
+                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16 ||
+                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceBF16) {
+                        // CPU embedding can decode individual GGUF rows for
+                        // models that keep the imported lookup table unchanged.
+                        // Preserve floating-point imports and the CUDA embedding
+                        // path, which still require the original dense layout.
+                        const bool packedEmbedding = (arch == "qwen4_exp" || arch == "glm5_next" || arch == "deepseek_v41") &&
+                            name == "token_embd.weight" &&
+                            (GetLowMemMode() || !GetCudaEmbedding()) &&
+                            ggml_is_quantized(tensors[i].first.type);
                         name = std::regex_replace(name, it.pattern, it.names[0]);
                         if (name == "ignore") {
                             break;
@@ -1040,7 +1122,7 @@ namespace fastllm {
                         tasks.push_back (
                             ReadGGUFTask (
                                 name, nullptr, tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second, 
-                                it.type
+                                packedEmbedding ? GGUFWeightReplaceRule::GGUFWeightReplaceDirect : it.type
                             )
                         );
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplacePacked) {

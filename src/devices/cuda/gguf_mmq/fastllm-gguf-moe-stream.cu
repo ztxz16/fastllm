@@ -1,0 +1,797 @@
+#include "fastllm-gguf-mmq-common.cuh"
+#include <chrono>
+#include <thread>
+#include "fastllm-gguf-moe-stream.cuh"
+#include "fastllm-gguf-moe-glm5.h"
+#include "fastllm-cuda-v41-gguf.h"
+#include "devices/cuda/fastllm-moe-prefetch.h"
+#include "../moe/fastllm-moe-gguf-common.cuh"
+#include "../moe/fastllm-moe-gguf-restore.cuh"
+
+// Host NUMA shards remain immutable. Selected experts reuse resident records
+// or pass through bounded GPU scratch before optional cache admission.
+namespace fastllm_gguf_stream {
+struct WeightCopy {
+    const uint8_t *source;
+    uint8_t *destination;
+    int type, rows, columns, cross, blockSize, blockBytes;
+};
+
+static int Ordinary(int type) {
+    type = fastllm_gguf_restore::Ordinary(type);
+    switch (type) {
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M: case GGML_TYPE_Q2_0:
+        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q8_0:
+            return type;
+        default: return -1;
+    }
+}
+
+__global__ void Restore(const WeightCopy *copies) {
+    const WeightCopy w = copies[blockIdx.y];
+    const int blocks = w.columns / w.blockSize;
+    const int lane = threadIdx.x%32;
+    // A warp restores one quantized block with contiguous field stores.
+    for (int i = blockIdx.x*(blockDim.x/32)+threadIdx.x/32;
+         i < w.rows*blocks; i += gridDim.x*(blockDim.x/32)) {
+        const int row = i/blocks, col = i%blocks;
+        const int srcRow = w.cross ? 2*(row%(w.rows/2)) + row/(w.rows/2) : row;
+        if (fastllm_gguf_restore::Ordinary(w.type) != w.type) {
+            fastllm_gguf_restore::Block(w.source, w.destination, w.type, blocks, srcRow, col, i);
+        } else {
+            const int bytes = w.blockBytes;
+            for (int b = lane; b < bytes; b += 32)
+                w.destination[size_t(i)*bytes+b] = w.source[size_t(srcRow*blocks+col)*bytes+b];
+        }
+    }
+}
+
+static size_t Align(size_t bytes) { return (bytes+255)&~size_t(255); }
+
+static void UploadWeight(const fastllm::Data &weight, uint8_t *target, cudaStream_t stream) {
+    if (weight.cpuData) {
+        CUDA_CHECK(cudaMemcpyAsync(target, weight.cpuData, weight.GetBytes(), cudaMemcpyHostToDevice, stream));
+    } else {
+        const size_t shardBytes = weight.GetBytes() / weight.numasData.size();
+        for (size_t node = 0; node < weight.numasData.size(); ++node)
+            CUDA_CHECK(cudaMemcpyAsync(target + node * shardBytes, weight.numasData[node],
+                shardBytes, cudaMemcpyHostToDevice, stream));
+    }
+}
+
+struct DownUpload {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t begin = nullptr, ready = nullptr;
+    DownUpload() {
+        // Restore must run between MMQ CTAs so it can release staging for
+        // the next transfer. Equal-priority MMQ can otherwise starve uploads.
+        int leastPriority = 0, greatestPriority = 0;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, greatestPriority));
+        CUDA_CHECK(cudaEventCreateWithFlags(&begin, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+    }
+    ~DownUpload() {
+        CUDA_CHECK(cudaStreamDestroy(stream));
+        CUDA_CHECK(cudaEventDestroy(begin));
+        CUDA_CHECK(cudaEventDestroy(ready));
+    }
+};
+// A bounded raw-weight lookahead. Only already registered host storage may be
+// queued here; unsupported/pageable sources retain the ordinary streamed path.
+struct Prefetch {
+    static constexpr size_t budget = size_t(256) * 1024 * 1024;
+    static constexpr int groups = 16, expertsPerGroup = 16;
+    struct Item {
+        uint8_t *data;
+        const uint8_t *host;
+        size_t bytes;
+        int type, group;
+    };
+    uint8_t *buffer = nullptr;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t ready[groups]{};
+    int pendingGroups = 0;
+    fastllm::Data **table = nullptr;
+    std::unordered_map<const fastllm::Data *, Item> items;
+    Prefetch() {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        for (auto &event : ready) CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    }
+    void Drain() {
+        if (pendingGroups) CUDA_CHECK(cudaEventSynchronize(ready[pendingGroups - 1]));
+        pendingGroups = 0;
+    }
+    ~Prefetch() {
+        Drain();
+        if (buffer) CUDA_CHECK(cudaFree(buffer));
+        for (auto event : ready) CUDA_CHECK(cudaEventDestroy(event));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+    }
+    static const uint8_t *Host(const fastllm::Data &w) {
+        return w.cpuData ? w.cpuData : w.numasData.empty() ? nullptr : w.numasData[0];
+    }
+    static bool Pinned(const void *source) {
+        if (!source) return false;
+        cudaPointerAttributes attr{};
+        const auto status = cudaPointerGetAttributes(&attr, source);
+        if (status != cudaSuccess) { cudaGetLastError(); return false; }
+        return attr.type == cudaMemoryTypeHost;
+    }
+    const Item *Find(fastllm::Data **weights, const fastllm::Data &w) const {
+        if (table != weights) return nullptr;
+        auto it = items.find(&w);
+        if (it == items.end() || it->second.bytes != w.GetBytes() ||
+            it->second.type != w.ggmlType || it->second.host != Host(w)) return nullptr;
+        return &it->second;
+    }
+};
+
+// The caller serializes model layers; reuse transfer resources per device.
+struct Pipeline {
+    static constexpr int groups = 3, experts = 16;
+    std::mutex mutex;
+    std::unique_ptr<Prefetch> prefetch;
+    std::unordered_map<fastllm::Data **, std::vector<int>> prefillOrder;
+    cudaStream_t dma = nullptr, restore = nullptr;
+    cudaEvent_t metadata = nullptr, copied[groups]{}, restored[groups]{}, released[groups]{};
+    Pipeline() {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&dma, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&restore, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&metadata, cudaEventDisableTiming));
+        for (int i = 0; i < groups; ++i) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&copied[i], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&restored[i], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&released[i], cudaEventDisableTiming));
+        }
+    }
+};
+static Pipeline *GetPipeline(int device, bool create = true) {
+    static std::mutex mutex;
+    static auto *pipelines = new std::map<int, std::unique_ptr<Pipeline>>;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!create && !pipelines->count(device)) return nullptr;
+    auto &pipeline = (*pipelines)[device];
+    if (!pipeline) pipeline.reset(new Pipeline());
+    return pipeline.get();
+}
+
+static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
+        fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
+        int expertCount, const int32_t *indices, const float *scores, int topk,
+        const std::unordered_set<int> &experts, bool cross, int gt, int dt, int inter,
+        bool glm5, float swigluLimit, bool nativeV41 = false,
+        const FastllmCudaV41DiskExperts *disk = nullptr) {
+    using namespace fastllm_gguf_mmq;
+    using fastllm_gguf_moe::AllocateTensor;
+    const int device = FastllmCudaGetDevice(), rows = input.dims[0], hidden = input.dims[1];
+    auto &pipeline = *GetPipeline(device);
+    std::lock_guard<std::mutex> lock(pipeline.mutex);
+    FastllmCudaMoePrefillResidents resident;
+    if (disk) {
+        resident.weights = disk->residents;
+        resident.gateType = gt; resident.downType = dt;
+        resident.hidden = hidden; resident.inter = inter;
+    } else FastllmCudaGetMoePrefillResidents(weights, expertCount, resident, glm5);
+    // Generic probes can share a GLM weight table, but this pipeline restores
+    // canonical records. Never read or publish those in a native NUMA cache.
+    if (resident.nativeGlm && !glm5) return false;
+    std::vector<std::vector<int>> routes(expertCount);
+    for (int r = 0; r < rows * topk; ++r) {
+        const int e = indices[r];
+        if (e >= 0 && e < expertCount && experts.count(e + 1)) routes[e].push_back(r);
+    }
+    auto cached = [&](int e) {
+        return resident.gateType == gt && resident.downType == dt && resident.hidden == hidden &&
+            resident.inter == inter && 2 * e + 1 < int(resident.weights.size()) && resident.weights[2 * e];
+    };
+    std::vector<int> order;
+    for (int e = 0; e < expertCount; ++e) if (!routes[e].empty()) order.push_back(e);
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        if (cached(a) != cached(b)) return cached(a) > cached(b);
+        if (disk && disk->releaseFirst.size() == size_t(expertCount))
+            return disk->releaseFirst[a] > disk->releaseFirst[b];
+        return false;
+    });
+    if (order.empty()) return false;
+    struct Work {
+        std::vector<int> counts, offsets{0}, tiles, routes;
+        size_t countsOffset, offsetsOffset, tilesOffset, routesOffset;
+    };
+    struct Batch {
+        std::vector<int> experts;
+        std::vector<Work> work;
+        size_t pointersOffset;
+        int copiesBegin = 0, copiesCount = 0;
+        int lastPrefetchedGroup = -1;
+    };
+    std::vector<Batch> batches;
+    int capacity = 0;
+    // V4.1's mixed Q2_0/Q4_K layers have larger records than low-bit gates.
+    // Bound both upload rings so they fit the hybrid transport reservation.
+    const int batchExperts = nativeV41 ? 8 : Pipeline::experts;
+    size_t metaBytes = 0;
+    auto reserve = [&](size_t bytes) { const size_t at = metaBytes; metaBytes += Align(bytes); return at; };
+    for (size_t begin = 0; begin < order.size(); begin += batchExperts) {
+        Batch batch;
+        const size_t end = std::min(order.size(), begin + batchExperts);
+        batch.experts.assign(order.begin() + begin, order.begin() + end);
+        batch.pointersOffset = reserve(2 * batch.experts.size() * sizeof(void *));
+        std::vector<size_t> consumed(batch.experts.size(), 0);
+        bool more;
+        do {
+            Work work;
+            // Split only activations for a heavily routed group. Its weights
+            // stay in the same device slots until every slice finishes; neither
+            // SSD reads nor H2D copies are repeated by this workspace bound.
+            int remaining = disk ? 2048 : INT32_MAX;
+            more = false;
+            for (size_t j = 0; j < batch.experts.size(); ++j) {
+                const auto &selected = routes[batch.experts[j]];
+                const size_t take = std::min(selected.size() - consumed[j], size_t(remaining));
+                work.counts.push_back(take);
+                work.routes.insert(work.routes.end(), selected.begin() + consumed[j],
+                    selected.begin() + consumed[j] + take);
+                const int padded = (take + 15) / 16 * 16;
+                work.routes.resize(work.offsets.back() + padded, -1);
+                work.offsets.push_back(work.routes.size());
+                work.tiles.insert(work.tiles.end(), padded / 16, j);
+                consumed[j] += take;
+                remaining -= padded;
+                more |= consumed[j] < selected.size();
+            }
+            capacity = std::max(capacity, int(work.routes.size()));
+            work.countsOffset = reserve(work.counts.size() * sizeof(int));
+            work.offsetsOffset = reserve(work.offsets.size() * sizeof(int));
+            work.tilesOffset = reserve(work.tiles.size() * sizeof(int));
+            work.routesOffset = reserve(work.routes.size() * sizeof(int));
+            batch.work.push_back(std::move(work));
+        } while (more);
+        batches.push_back(std::move(batch));
+    }
+    const auto *gu = weights[2 * (order[0] + 1)], *down = weights[2 * (order[0] + 1) + 1];
+    const size_t gateWeightBytes = Align(gu->GetBytes());
+    const size_t stride = gateWeightBytes + Align(down->GetBytes());
+    const bool misses = std::any_of(order.begin(), order.end(), [&](int e) { return !cached(e); });
+    // Native EP residents remain R4 in cache. Restore their bounded working
+    // group on the GPU, just as for misses, without changing cache ownership.
+    const size_t ringBytes = misses || resident.nativeGlm
+        ? Pipeline::groups * batchExperts * stride : 0;
+    const size_t rawOffset = 0, canonicalOffset = ringBytes, metaOffset = (disk ? 1 : 2) * ringBytes;
+    const size_t descOffset = reserve(2 * order.size() * sizeof(WeightCopy));
+    const size_t scoreOffset = reserve(size_t(rows) * topk * sizeof(float));
+    const size_t indexOffset = reserve((glm5 || nativeV41) ? size_t(rows) * topk * sizeof(int32_t) : 0);
+    const size_t computeOffset = metaOffset + metaBytes;
+    const size_t bytes = Align(computeOffset + StreamedMoeWorkspaceBytes(rows, hidden, inter, topk, capacity, nativeV41));
+    const size_t gateBytes = nativeV41 ? 0 : size_t(rows) * topk * inter * (input.dataType == fastllm::FLOAT32 ? 4 : 2);
+    // This eager-only workspace persists across layers. Tiny routing-driven
+    // growth used to leave each retired hundreds-of-MiB block in the general
+    // tensor pool. Own it directly so growth releases the old allocation;
+    // RunPipelined synchronizes every consumer before returning.
+    if (workspace.isFake || workspace.cudaDataBorrowed) return false;
+    size_t reservedBytes = std::max(bytes, workspace.expansionBytes);
+    if (!workspace.cudaData || workspace.expansionBytes < bytes ||
+        (gateBytes && (!gate.cudaData || gate.expansionBytes < gateBytes)) || !workspace.directMemory) {
+        size_t freeBytes = 0, totalBytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+        const size_t reusable = (workspace.cudaData ? workspace.expansionBytes : 0) +
+            (gateBytes && gate.cudaData ? gate.expansionBytes : 0);
+        const size_t reserve = 256 * size_t(1024 * 1024);
+        if (bytes + gateBytes + reserve > freeBytes + reusable) return false;
+        // Bound slack while avoiding another cudaMalloc for a few more routes.
+        constexpr size_t quantum = 16 * size_t(1024 * 1024);
+        const size_t rounded = (reservedBytes + quantum - 1) / quantum * quantum;
+        if (rounded + gateBytes + reserve <= freeBytes + reusable) reservedBytes = rounded;
+    }
+    if (reservedBytes / 256 > size_t(INT32_MAX)) return false;
+    if (!workspace.directMemory) {
+        workspace.FreeSpace();
+        workspace.directMemory = true;
+    }
+    AllocateTensor(workspace, fastllm::INT8, {int(reservedBytes / 256), 256}, device);
+    if (gateBytes) AllocateTensor(gate, input.dataType, {rows * topk, inter}, device);
+    AllocateTensor(output, input.dataType, {rows, hidden}, device);
+    auto *base = static_cast<uint8_t *>(workspace.cudaData);
+    FastllmCudaMoePrefillPlan admission;
+    if (!disk) FastllmCudaPlanMoePrefill(weights, expertCount, indices, scores, rows, topk, experts, admission);
+    struct Upload {
+        const fastllm::Data *weight;
+        uint8_t *target;
+        const Prefetch::Item *prefetched = nullptr;
+        int expert = 0, part = 0;
+        size_t hostOffset = 0;
+    };
+    // Each matrix owns prefix/suffix space for unaligned checkpoint offsets.
+    // Unlike the device ring, direct-I/O destinations must be page aligned.
+    auto hostSize = [](size_t bytes) { return (bytes + 8192 + 4095) & ~size_t(4095); };
+    const size_t hostGateBytes = hostSize(gu->GetBytes());
+    const size_t hostDownBytes = hostSize(down->GetBytes());
+    const size_t hostStride = hostGateBytes + hostDownBytes;
+    std::vector<std::vector<Upload>> uploads(batches.size());
+    std::vector<WeightCopy> copies;
+    std::vector<uint8_t> metadata(metaBytes, 0);
+    auto put = [&](size_t offset, const void *source, size_t size) { std::memcpy(metadata.data() + offset, source, size); };
+    for (size_t g = 0; g < batches.size(); ++g) {
+        auto &batch = batches[g];
+        std::vector<const void *> pointers;
+        batch.copiesBegin = copies.size();
+        for (size_t j = 0; j < batch.experts.size(); ++j) {
+            const int e = batch.experts[j];
+            for (int part = 0; part < 2; ++part) {
+                const auto &w = *weights[2 * (e + 1) + part];
+                const bool hit = cached(e);
+                if (hit && !resident.nativeGlm) { pointers.push_back(resident.weights[2 * e + part]); continue; }
+                const size_t offset = ((g % Pipeline::groups) * batchExperts + j) * stride +
+                    (part ? gateWeightBytes : 0);
+                auto *admitted = 2 * e + part < int(admission.weights.size())
+                    ? static_cast<uint8_t *>(admission.weights[2 * e + part]) : nullptr;
+                const bool restore = (cross && part == 0) || Ordinary(w.ggmlType) != w.ggmlType;
+                auto *destination = !resident.nativeGlm && admitted
+                    ? admitted : base + (disk ? 0 : canonicalOffset) + offset;
+                auto *target = restore ? base + rawOffset + offset : destination;
+                if (resident.nativeGlm) {
+                    target = hit ? const_cast<uint8_t *>(static_cast<const uint8_t *>(resident.weights[2 * e + part]))
+                                 : admitted ? admitted : base + rawOffset + offset;
+                    if (!restore) destination = target;
+                }
+                const auto *prefetched = !disk && !hit && !resident.nativeGlm && pipeline.prefetch
+                    ? pipeline.prefetch->Find(weights, w) : nullptr;
+                if (prefetched) {
+                    batch.lastPrefetchedGroup = std::max(batch.lastPrefetchedGroup, prefetched->group);
+                    // Restore reads the prefetched raw record directly; plain
+                    // formats copy into their canonical/admission destination.
+                    if (restore) target = prefetched->data;
+                }
+                pointers.push_back(destination);
+                if (!hit && !(prefetched && restore)) uploads[g].push_back({&w, target, prefetched,
+                    e + 1, part, ((g % Pipeline::groups) * batchExperts + j) * hostStride +
+                    (part ? hostGateBytes : 0)});
+                if (restore) copies.push_back({target, destination, w.ggmlType, w.dims[0], w.dims[1],
+                    int(cross && part == 0), int(ggml_blck_size((ggml_type)Ordinary(w.ggmlType))),
+                    int(ggml_type_size((ggml_type)Ordinary(w.ggmlType)))});
+            }
+        }
+        batch.copiesCount = copies.size() - batch.copiesBegin;
+        put(batch.pointersOffset, pointers.data(), pointers.size() * sizeof(void *));
+        for (const auto &work : batch.work) {
+            put(work.countsOffset, work.counts.data(), work.counts.size() * sizeof(int));
+            put(work.offsetsOffset, work.offsets.data(), work.offsets.size() * sizeof(int));
+            put(work.tilesOffset, work.tiles.data(), work.tiles.size() * sizeof(int));
+            put(work.routesOffset, work.routes.data(), work.routes.size() * sizeof(int));
+        }
+    }
+    if (!copies.empty()) put(descOffset, copies.data(), copies.size() * sizeof(WeightCopy));
+    put(scoreOffset, scores, size_t(rows) * topk * sizeof(float));
+    if (glm5 || nativeV41) put(indexOffset, indices, size_t(rows) * topk * sizeof(int32_t));
+    struct DiskStaging {
+        uint8_t *data = nullptr;
+        std::vector<std::vector<std::future<const uint8_t *>>> reads;
+        Pipeline &pipeline;
+        explicit DiskStaging(Pipeline &p) : pipeline(p) {}
+        ~DiskStaging() {
+            // Callbacks may throw while earlier groups still use their buffers.
+            for (auto &group : reads) for (auto &read : group) if (read.valid()) read.wait();
+            if (data || !reads.empty()) {
+                cudaStreamSynchronize(pipeline.dma);
+                cudaStreamSynchronize(cudaStreamPerThread);
+            }
+        }
+    } staging(pipeline);
+    if (disk && ringBytes) {
+        auto &owned = *disk->staging;
+        const size_t hostBytes = Pipeline::groups * batchExperts * hostStride;
+        if (owned.bytes < hostBytes) {
+            if (owned.data) CUDA_CHECK(cudaFreeHost(owned.data));
+            owned.data = nullptr; owned.bytes = 0;
+            CUDA_CHECK(cudaMallocHost(&owned.data, hostBytes));
+            owned.bytes = hostBytes;
+        }
+        staging.data = static_cast<uint8_t *>(owned.data);
+    }
+    auto readGroup = [&](size_t g) {
+        if (!disk || g >= batches.size()) return;
+        auto &reads = staging.reads[g];
+        // Allocate every future slot before submitting work: packaged-task
+        // future destruction alone does not wait for an outstanding write.
+        reads.resize(uploads[g].size());
+        for (size_t i = 0; i < uploads[g].size(); ++i) {
+            const auto &u = uploads[g][i];
+            reads[i] = disk->read(u.expert, u.part, staging.data + u.hostOffset,
+                u.part ? hostDownBytes : hostGateBytes);
+        }
+    };
+    if (disk) {
+        staging.reads.resize(batches.size());
+        for (int g = 0; g < Pipeline::groups; ++g) readGroup(g);
+    }
+    const auto stream = cudaStreamPerThread;
+    CUDA_CHECK(cudaMemcpyAsync(base + metaOffset, metadata.data(), metaBytes, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaEventRecord(pipeline.metadata, stream));
+    CUDA_CHECK(cudaStreamWaitEvent(pipeline.restore, pipeline.metadata, 0));
+    auto run = [&](StreamedMoePhase phase, const StreamedMoeBatch &batch) {
+        fastllm::AssertInFastLLM(RunStreamedMoe(phase, input, gate, output, base + computeOffset,
+            capacity, hidden, inter, topk, gt, dt, batch,
+            reinterpret_cast<const float *>(base + metaOffset + scoreOffset), glm5, swigluLimit,
+            (glm5 || nativeV41) ? reinterpret_cast<const int32_t *>(base + metaOffset + indexOffset) : nullptr, nativeV41),
+            "Streamed GGUF prefill failed.");
+    };
+    run(StreamedMoePhase::Prepare, {});
+    const int maxBlocks = std::max(gu->dims[0] * (hidden / int(ggml_blck_size((ggml_type)gt))),
+        down->dims[0] * (inter / int(ggml_blck_size((ggml_type)dt))));
+    auto finishBatch = [&](size_t g) {
+        const auto &batch = batches[g];
+        const int slot = g % Pipeline::groups;
+        for (const auto &upload : uploads[g]) {
+            if (disk) continue;
+            if (upload.prefetched) {
+                CUDA_CHECK(cudaStreamWaitEvent(pipeline.dma,
+                    pipeline.prefetch->ready[upload.prefetched->group], 0));
+                CUDA_CHECK(cudaMemcpyAsync(upload.target, upload.prefetched->data,
+                    upload.weight->GetBytes(), cudaMemcpyDeviceToDevice, pipeline.dma));
+            } else UploadWeight(*upload.weight, upload.target, pipeline.dma);
+        }
+        CUDA_CHECK(cudaEventRecord(pipeline.copied[slot], pipeline.dma));
+        CUDA_CHECK(cudaStreamWaitEvent(pipeline.restore, pipeline.copied[slot], 0));
+        // All prefetch groups share one stream; the last event covers earlier groups.
+        if (batch.lastPrefetchedGroup >= 0)
+            CUDA_CHECK(cudaStreamWaitEvent(pipeline.restore,
+                pipeline.prefetch->ready[batch.lastPrefetchedGroup], 0));
+        if (batch.copiesCount) Restore<<<dim3(std::min(64, (maxBlocks + 7) / 8), batch.copiesCount),
+            256, 0, pipeline.restore>>>(reinterpret_cast<const WeightCopy *>(base + metaOffset + descOffset) + batch.copiesBegin);
+        CUDA_CHECK(cudaEventRecord(pipeline.restored[slot], pipeline.restore));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, pipeline.restored[slot], 0));
+        for (const auto &slice : batch.work) {
+            StreamedMoeBatch work;
+            work.experts = batch.experts.size(); work.rows = slice.routes.size();
+            work.weights = reinterpret_cast<const uint8_t *const *>(base + metaOffset + batch.pointersOffset);
+            work.counts = reinterpret_cast<const int *>(base + metaOffset + slice.countsOffset);
+            work.offsets = reinterpret_cast<const int *>(base + metaOffset + slice.offsetsOffset);
+            work.tileExperts = reinterpret_cast<const int *>(base + metaOffset + slice.tilesOffset);
+            work.routes = reinterpret_cast<const int *>(base + metaOffset + slice.routesOffset);
+            run(StreamedMoePhase::Compute, work);
+        }
+        CUDA_CHECK(cudaEventRecord(pipeline.released[slot], stream));
+    };
+    if (disk) {
+        // Read completion is independent of expert ID. Upload every ready
+        // matrix and launch any complete group, instead of blocking the host
+        // on the oldest read. Each route has its own partial; Finish still
+        // reduces in expert-ID order, so scheduling cannot change arithmetic.
+        struct Slot {
+            size_t batch, copied = 0;
+            bool submitted = false, waiting = false;
+        };
+        Slot slots[Pipeline::groups];
+        for (size_t i = 0; i < Pipeline::groups; ++i) slots[i].batch = i;
+        size_t completed = 0;
+        while (completed < batches.size()) {
+            bool progress = false;
+            for (int slot = 0; slot < Pipeline::groups; ++slot) {
+                auto &state = slots[slot];
+                const size_t g = state.batch;
+                if (g >= batches.size()) continue;
+                if (state.submitted) {
+                    const auto status = cudaEventQuery(pipeline.copied[slot]);
+                    if (status == cudaErrorNotReady) continue;
+                    CUDA_CHECK(status);
+                    // Host slots can be overwritten after DMA; device slots
+                    // retain their separate dependency on prior computation.
+                    state = {g + Pipeline::groups};
+                    readGroup(state.batch);
+                    progress = true;
+                    continue;
+                }
+                for (size_t i = 0; i < uploads[g].size(); ++i) {
+                    auto &ready = staging.reads[g][i];
+                    if (!ready.valid() || ready.wait_for(std::chrono::seconds(0)) != std::future_status::ready) continue;
+                    const auto *payload = ready.get();
+                    if (!state.waiting && g >= Pipeline::groups)
+                        CUDA_CHECK(cudaStreamWaitEvent(pipeline.dma, pipeline.released[slot], 0));
+                    state.waiting = true;
+                    const auto &u = uploads[g][i];
+                    CUDA_CHECK(cudaMemcpyAsync(u.target, payload, u.weight->GetBytes(),
+                        cudaMemcpyHostToDevice, pipeline.dma));
+                    ++state.copied;
+                    progress = true;
+                }
+                if (state.copied == uploads[g].size()) {
+                    for (int e : batches[g].experts) if (!cached(e)) disk->release(e + 1);
+                    finishBatch(g);
+                    state.submitted = true;
+                    ++completed;
+                    progress = true;
+                }
+            }
+            if (!progress) std::this_thread::sleep_for(std::chrono::microseconds(20));
+        }
+    } else {
+        for (size_t g = 0; g < batches.size(); ++g) {
+            if (g >= Pipeline::groups) CUDA_CHECK(cudaStreamWaitEvent(
+                pipeline.dma, pipeline.released[g % Pipeline::groups], 0));
+            finishBatch(g);
+        }
+    }
+    run(StreamedMoePhase::Finish, {});
+    if (!disk) FastllmCudaPublishMoePrefill(admission);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (rows >= 1024 && !glm5 && !nativeV41 && pipeline.prefetch) pipeline.prefillOrder[weights] = order;
+    return true;
+}
+} // namespace fastllm_gguf_stream
+
+bool FastllmCudaPrefetchMoeGGUFHost(fastllm::Data **weights, int expertCount) {
+    using namespace fastllm_gguf_stream;
+    if (!weights || expertCount <= 0) return false;
+    cudaStreamCaptureStatus capture;
+    CUDA_CHECK(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
+    if (capture != cudaStreamCaptureStatusNone) return false;
+    auto &pipeline = *GetPipeline(FastllmCudaGetDevice());
+    std::lock_guard<std::mutex> lock(pipeline.mutex);
+    if (!pipeline.prefetch) pipeline.prefetch.reset(new Prefetch());
+    auto previous = pipeline.prefillOrder.find(weights);
+    if (previous == pipeline.prefillOrder.end()) return false;
+    FastllmCudaMoePrefillResidents resident;
+    FastllmCudaGetMoePrefillResidents(weights, expertCount, resident, false);
+    if (resident.nativeGlm) return false;
+    std::vector<const fastllm::Data *> plan;
+    size_t bytes = 0;
+    for (int e : previous->second) {
+        if (e < 0 || e >= expertCount) continue;
+        if (2 * e + 1 < int(resident.weights.size()) && resident.weights[2 * e]) continue;
+        const auto *gate = weights[2 * (e + 1)], *down = weights[2 * (e + 1) + 1];
+        bool valid = gate && down;
+        if (valid) for (const auto *w : {gate, down}) {
+            valid = valid && w->dataType == fastllm::DATA_GGUF_FORMAT &&
+                Ordinary(w->ggmlType) >= 0 && !w->numasData.empty();
+            if (w->cpuData) valid = valid && Prefetch::Pinned(w->cpuData);
+            else for (const auto *p : w->numasData) valid = valid && Prefetch::Pinned(p);
+        }
+        if (!valid) continue;
+        const size_t extra = Align(gate->GetBytes()) + Align(down->GetBytes());
+        if (bytes + extra > Prefetch::budget ||
+            plan.size() / 2 >= Prefetch::groups * Prefetch::expertsPerGroup) break;
+        plan.push_back(gate); plan.push_back(down); bytes += extra;
+    }
+    if (plan.empty()) return false;
+    auto &ahead = *pipeline.prefetch;
+    ahead.Drain();
+    ahead.items.clear(); ahead.table = nullptr;
+    if (!ahead.buffer) {
+        size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        if (free < Prefetch::budget + size_t(1024) * 1024 * 1024) return false;
+        const auto status = cudaMalloc(reinterpret_cast<void **>(&ahead.buffer), Prefetch::budget);
+        if (status == cudaErrorMemoryAllocation) { cudaGetLastError(); return false; }
+        CUDA_CHECK(status);
+    }
+    size_t offset = 0;
+    for (size_t i = 0; i < plan.size(); ++i) {
+        const auto &w = *plan[i];
+        const int group = i / (2 * Prefetch::expertsPerGroup);
+        UploadWeight(w, ahead.buffer + offset, ahead.stream);
+        ahead.items.emplace(&w, Prefetch::Item{ahead.buffer + offset,
+            Prefetch::Host(w), w.GetBytes(), w.ggmlType, group});
+        offset += Align(w.GetBytes());
+        if ((i + 1) % (2 * Prefetch::expertsPerGroup) == 0 || i + 1 == plan.size()) {
+            CUDA_CHECK(cudaEventRecord(ahead.ready[group], ahead.stream));
+            ahead.pendingGroups = group + 1;
+        }
+    }
+    ahead.table = weights;
+    return true;
+}
+
+void FastllmCudaWaitMoeGGUFHostPrefetch(void *stream) {
+    using namespace fastllm_gguf_stream;
+    auto *pipeline = GetPipeline(FastllmCudaGetDevice(), false);
+    if (!pipeline) return;
+    std::lock_guard<std::mutex> lock(pipeline->mutex);
+    const auto &ahead = pipeline->prefetch;
+    if (ahead && ahead->pendingGroups)
+        CUDA_CHECK(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(stream),
+            ahead->ready[ahead->pendingGroups - 1], 0));
+}
+
+void FastllmCudaClearMoeGGUFHostPrefetch() {
+    using namespace fastllm_gguf_stream;
+    auto *existing = GetPipeline(FastllmCudaGetDevice(), false);
+    if (!existing) return;
+    auto &pipeline = *existing;
+    std::lock_guard<std::mutex> lock(pipeline.mutex);
+    pipeline.prefetch.reset();
+    pipeline.prefillOrder.clear();
+}
+
+bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
+        fastllm::Data &gate, fastllm::Data &workspace, fastllm::Data &output,
+        fastllm::Data **weights, int expertCount, const int32_t *indices,
+        const float *scores, int topk, const std::unordered_set<int> &experts,
+        bool crossSwiglu, bool deepSeekV4Mode, float swigluLimit,
+        int activationQuantBlock) {
+    using namespace fastllm_gguf_stream;
+    using fastllm_gguf_moe::AllocateTensor;
+    if (!weights || !indices || !scores || input.dims.size() != 2 ||
+        input.dims[0] <= 32 || input.dims[0] > 4096 || topk <= 0 || topk > 32 ||
+        expertCount <= 0 || expertCount > 1024 || experts.empty() || experts.count(0) ||
+        input.dataDevice != fastllm::CUDA || !input.cudaData ||
+        !fastllm_gguf_moe::IsActivationType(input.dataType)) return false;
+    const bool glm5 = deepSeekV4Mode && activationQuantBlock == 128;
+    // GLM keeps positive Q8_K scales without V4.1's FP8 block-32 conversion.
+    if (deepSeekV4Mode && ((activationQuantBlock != 32 && !glm5) ||
+        input.dataType != fastllm::BFLOAT16)) return false;
+    const int device = FastllmCudaGetDevice(), rows = input.dims[0], hidden = input.dims[1];
+    cudaStreamCaptureStatus capture;
+    CUDA_CHECK(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
+    if (capture != cudaStreamCaptureStatusNone) return false;
+    int gt = -1, dt = -1, inter = 0;
+    // Validate the entire subset before allocating, copying, or changing output.
+    // The selected expert IDs use NUMA's +1 convention (slot 0 is shared).
+    for (int e : experts) {
+        if (e <= 0 || e > expertCount) return false;
+        auto *gu = weights[2*e], *down = weights[2*e+1];
+        if (!gu || !down || gu->dims.size() != 2 || down->dims.size() != 2 ||
+            gu->dims[1] != hidden || gu->dims[0] != 2*down->dims[1] ||
+            down->dims[0] != hidden) return false;
+        const int g = Ordinary(gu->ggmlType), d = Ordinary(down->ggmlType);
+        if (gt < 0) { gt = g; dt = d; inter = down->dims[1]; }
+        if (g < 0 || d < 0 || g != gt || d != dt || inter != down->dims[1]) return false;
+        for (int part = 0; part < 2; ++part) {
+            const auto *w = weights[2*e+part];
+            if (w->dataType != fastllm::DATA_GGUF_FORMAT || w->dims[0]%4 ||
+                w->dims[1]%ggml_blck_size((ggml_type)Ordinary(w->ggmlType)) ||
+                (!w->cpuData && (w->numasData.empty() ||
+                 w->dims[0]%(4*w->numasData.size()) ||
+                 std::any_of(w->numasData.begin(), w->numasData.end(),
+                    [](const uint8_t *p) { return p == nullptr; })))) return false;
+        }
+    }
+    // Native V4.1 Q8_1 arithmetic differs from the Q8_K host path below.
+    // Reuse the resident projection kernels, but upload only bounded groups.
+    if (deepSeekV4Mode && !glm5 && FastllmCudaV41GGUFGroupedWorkspaceBytes(
+            gt, dt, rows, hidden, inter, expertCount, topk))
+        return RunPipelined(input, gate, workspace, output, weights, expertCount,
+            indices, scores, topk, experts, crossSwiglu, gt, dt, inter, false, swigluLimit, true);
+    // IQ1_M gate/up currently uses per-route DP4A in grouped MMQ. On long
+    // prefill, the existing per-expert GEMM reuses these weights much better.
+    // Keep that implementation until a matrix IQ1_M gate kernel is available.
+    if (gt == GGML_TYPE_IQ1_M) return false;
+    const size_t mmqBytes = glm5 ? fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(
+        gt, dt, rows, hidden, inter, expertCount, topk) : FastllmCudaMoeGGUFGroupedWorkspaceBytes(
+        gt, dt, rows, hidden, inter, expertCount, topk, deepSeekV4Mode);
+    if (!mmqBytes) return false;
+    if (!deepSeekV4Mode || glm5) return RunPipelined(input, gate, workspace, output, weights,
+        expertCount, indices, scores, topk, experts, crossSwiglu, gt, dt, inter, glm5, swigluLimit);
+    // Two bounded upload slots: gate and down restore on separate streams.
+    // Canonical weights and routing live through both projections.
+    // Never alias in-flight DMA with MMQ scratch.
+    // Only the legacy V4.1 Q2_K/Q4_K path needs full-subset descriptors.
+    struct Source {
+        const fastllm::Data *weight;
+        size_t offset;
+        int slot;
+        bool restore;
+    };
+    std::vector<Source> sources;
+    size_t packedBytes = 0, stagingBytes = 0;
+    int maxBlocks = 0;
+    for (int e : experts) for (int part = 0; part < 2; ++part) {
+        const auto *w = weights[2*e+part];
+        const bool restore = (crossSwiglu && part == 0) || Ordinary(w->ggmlType) != w->ggmlType;
+        const size_t weightBytes = Align(w->GetBytes());
+        sources.push_back({w, packedBytes, 2*(e-1)+part, restore});
+        packedBytes += weightBytes;
+        stagingBytes = std::max(stagingBytes, weightBytes);
+        maxBlocks = std::max(maxBlocks, w->dims[0] *
+            (w->dims[1]/int(ggml_blck_size((ggml_type)Ordinary(w->ggmlType)))));
+    }
+    const size_t tableOffset = packedBytes + 2*stagingBytes;
+    const size_t descOffset = tableOffset+Align(2*expertCount*sizeof(void *));
+    const size_t indexOffset = descOffset+Align(sources.size()*sizeof(WeightCopy));
+    const size_t scoreOffset = indexOffset+Align(size_t(rows)*topk*sizeof(int32_t));
+    const size_t mmqOffset = scoreOffset+Align(size_t(rows)*topk*sizeof(float));
+    const size_t bytes = Align(mmqOffset + mmqBytes);
+    if (bytes/256 > size_t(INT32_MAX)) return false;
+    const size_t gateBytes = size_t(rows)*topk*inter*(input.dataType == fastllm::FLOAT32 ? 4 : 2);
+    size_t freeBytes = 0, totalBytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+    const size_t reusable = (workspace.cudaData ? workspace.expansionBytes : 0) +
+        (gate.cudaData ? gate.expansionBytes : 0);
+    if (bytes+gateBytes+256*size_t(1024*1024) > freeBytes+reusable) return false;
+    // Full V4.1 worker subsets can exceed 2 GiB even while fitting VRAM.
+    // A two-dimensional byte tensor keeps each dimension in the int range.
+    AllocateTensor(workspace, fastllm::INT8, {int(bytes/256), 256}, device);
+    AllocateTensor(gate, input.dataType, {rows*topk, inter}, device);
+    AllocateTensor(output, input.dataType, {rows, hidden}, device);
+    auto *base = static_cast<uint8_t *>(workspace.cudaData);
+    const auto stream = cudaStreamPerThread;
+    DownUpload downUpload;
+    std::vector<const void *> table(2*expertCount, nullptr);
+    std::vector<WeightCopy> copies;
+    std::vector<int> copyIndices(sources.size(), -1);
+    for (size_t i = 0; i < sources.size(); ++i) {
+        const auto &src = sources[i];
+        const auto &w = *src.weight;
+        auto *target = base+src.offset;
+        table[src.slot] = target;
+        if (src.restore) {
+            auto *upload = base+packedBytes+(src.slot%2)*stagingBytes;
+            copyIndices[i] = copies.size();
+            copies.push_back({upload, target, w.ggmlType, w.dims[0], w.dims[1],
+                int(crossSwiglu && src.slot%2 == 0),
+                int(ggml_blck_size((ggml_type)Ordinary(w.ggmlType))),
+                int(ggml_type_size((ggml_type)Ordinary(w.ggmlType)))});
+        }
+    }
+    if (!copies.empty()) CUDA_CHECK(cudaMemcpyAsync(base+descOffset, copies.data(),
+        copies.size()*sizeof(WeightCopy), cudaMemcpyHostToDevice, stream));
+    auto upload = [&](size_t sourceIndex, cudaStream_t uploadStream) {
+        const auto &src = sources[sourceIndex];
+        const auto &w = *src.weight;
+        auto *target = src.restore ? const_cast<uint8_t *>(copies[copyIndices[sourceIndex]].source) : base+src.offset;
+        UploadWeight(w, target, uploadStream);
+        if (src.restore) {
+            const bool kR4 = w.ggmlType == GGML_TYPE_Q2_K_R4 || w.ggmlType == GGML_TYPE_Q4_K_R4;
+            const int gridLimit = kR4 ? 16*fastllm_gguf_mmq::ggml_cuda_info().devices[device].nsm : 64;
+            Restore<<<std::min(gridLimit, (maxBlocks+7)/8), 256, 0, uploadStream>>>(
+                reinterpret_cast<const WeightCopy *>(base+descOffset)+copyIndices[sourceIndex]);
+        }
+    };
+    for (size_t i = 0; i < sources.size(); ++i)
+        if (sources[i].slot%2 == 0) upload(i, stream);
+    CUDA_CHECK(cudaMemcpyAsync(base+tableOffset, table.data(), table.size()*sizeof(void *), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(base+indexOffset, indices, size_t(rows)*topk*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(base+scoreOffset, scores, size_t(rows)*topk*sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaEventRecord(downUpload.begin, stream));
+    CUDA_CHECK(cudaStreamWaitEvent(downUpload.stream, downUpload.begin, 0));
+    for (size_t i = 0; i < sources.size(); ++i)
+        if (sources[i].slot%2) upload(i, downUpload.stream);
+    CUDA_CHECK(cudaEventRecord(downUpload.ready, downUpload.stream));
+    CUDA_CHECK(cudaGetLastError());
+    const bool ok = fastllm_gguf_mmq::RunGrouped(input, gate, output, base+tableOffset,
+        reinterpret_cast<const int32_t *>(base+indexOffset),
+        reinterpret_cast<const float *>(base+scoreOffset), base+mmqOffset,
+        gt, dt, hidden, inter, expertCount, topk, deepSeekV4Mode, swigluLimit, downUpload.ready);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // A CUDA launch failure is an error, not permission to execute a second path.
+    fastllm::AssertInFastLLM(ok, "GGUF NUMA grouped prefill launch failed.");
+    return true;
+}
+
+
+bool FastllmCudaMergeMOEV41GGUFDisk(const fastllm::Data &input,
+        fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
+        int expertCount, const int32_t *indices, const float *scores, int topk,
+        float swigluLimit, const FastllmCudaV41DiskExperts &source) {
+    using namespace fastllm_gguf_stream;
+    if (!weights || !indices || !scores || !source.read || !source.release || !source.staging ||
+        input.dataType != fastllm::BFLOAT16 || input.dataDevice != fastllm::CUDA ||
+        !input.cudaData || input.dims.size() != 2 || expertCount <= 0 || topk <= 0 ||
+        source.residents.size() != size_t(2 * expertCount)) return false;
+    std::unordered_set<int> experts;
+    for (int r = 0; r < input.dims[0] * topk; ++r) {
+        if (indices[r] < 0 || indices[r] >= expertCount) return false;
+        experts.insert(indices[r] + 1);
+    }
+    int gt = -1, dt = -1, inter = 0;
+    for (int e : experts) {
+        const auto *g = weights[2 * e], *d = weights[2 * e + 1];
+        if (!g || !d || g->dataType != fastllm::DATA_GGUF_FORMAT ||
+            d->dataType != fastllm::DATA_GGUF_FORMAT || g->dims.size() != 2 || d->dims.size() != 2 ||
+            g->ggmlType != Ordinary(g->ggmlType) || d->ggmlType != Ordinary(d->ggmlType) ||
+            g->dims[1] != input.dims[1] || d->dims[0] != input.dims[1] || g->dims[0] != 2 * d->dims[1]) return false;
+        if (gt < 0) { gt = g->ggmlType; dt = d->ggmlType; inter = d->dims[1]; }
+        if (gt != g->ggmlType || dt != d->ggmlType || inter != d->dims[1]) return false;
+    }
+    if (!FastllmCudaV41GGUFGroupedWorkspaceBytes(gt, dt, input.dims[0], input.dims[1],
+            inter, expertCount, topk)) return false;
+    fastllm::Data gate;
+    return RunPipelined(input, gate, workspace, output, weights, expertCount,
+        indices, scores, topk, experts, false, gt, dt, inter, false, swigluLimit, true, &source);
+}
+
+FastllmCudaV41DiskStaging::~FastllmCudaV41DiskStaging() {
+    if (data) cudaFreeHost(data);
+}

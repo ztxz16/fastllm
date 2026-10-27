@@ -1128,6 +1128,9 @@ namespace fastllm {
                 return holder;
             };
 
+            const bool useKvMem = (bool)(*batchPastKeys)[0]->kvMemConfig;
+            Data kvMemRawQ, kvMemRawK;
+            if (useKvMem) isPrefill = true;
             if (!isPrefill && (*batchPastKeys)[0]->pagedKVCacheData == nullptr) {
                 isPrefill = true;
             }
@@ -1149,6 +1152,10 @@ namespace fastllm {
                 if (doQKNorm) {
                     Qwen3CudaRMSNorm(runner, *q, *qNormWeight, rmsNormEps, *q);
                     Qwen3CudaRMSNorm(runner, k, *kNormWeight, rmsNormEps, k);
+                }
+                if (useKvMem) {
+                    kvMemRawQ.CopyFrom(*q);
+                    kvMemRawK.CopyFrom(k);
                 }
                 qwen3cuda::Qwen3CudaRopeEncoding(runner, *q, *allPositionIds, rotaryDim, curRopeTheta, ropeScale, ropeConfig);
                 qwen3cuda::Qwen3CudaRopeEncoding(runner, k, *allPositionIds, rotaryDim, curRopeTheta, ropeScale, ropeConfig);
@@ -1176,7 +1183,10 @@ namespace fastllm {
                     return desc;
                 };
 
-                if (batch == 1) {
+                if (useKvMem) {
+                    KvMemAppend(kvMemRawQ, kvMemRawK, k, v,
+                                *(*batchPastKeys)[0], *(*batchPastValues)[0]);
+                } else if (batch == 1) {
                     Data kCacheDesc = makeCacheDesc(k, (*batchPastKeys)[0]->dataType);
                     Data vCacheDesc = makeCacheDesc(v, (*batchPastValues)[0]->dataType);
                     int cacheLayerIdx = pagedCacheLayerOffset + layerIdx;
@@ -1571,6 +1581,7 @@ namespace fastllm {
     }
 
     void Qwen3Model::OnAutoWarmupFinished() {
+        if (kvMemConfig.enabled) return;
 #ifdef USE_CUDA
         if (GetFastllmEnv().cudaGraph) {
             if (threadTpWorkerGroup.HasWorkers()) {
@@ -1732,7 +1743,7 @@ namespace fastllm {
         return false;
 #else
         const int maxCudaGraphDecodeBatch = 32;
-        if (!Qwen3CudaGraphEnabled() || batch <= 0 || batch > maxCudaGraphDecodeBatch ||
+        if (kvMemConfig.enabled || !Qwen3CudaGraphEnabled() || batch <= 0 || batch > maxCudaGraphDecodeBatch ||
             !all1 || isPrefill || (int)seqLens.size() < batch ||
             (int)pastKeyValues.size() < batch * block_cnt) {
             return false;
@@ -2662,12 +2673,14 @@ namespace fastllm {
         std::map<int, int> ratios;
         if (!CanUseGPUForward() ||
             !GetQwen3GPUForwardDevices(this->deviceMap, devices, ratios)) {
+            if (kvMemConfig.enabled) throw std::invalid_argument("KVMem requires one CUDA device");
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
             }
             return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
+        PrepareKvMemCaches(batch, (int)devices.size(), pastKeyValues);
         bool tensorParallel = devices.size() > 1;
         bool useCpuEmbedding = !GetCudaEmbedding() || GetLowMemMode();
         const DataType computeType = ResolveQwen3ThreadTpComputeType(this->dataType);
@@ -3064,6 +3077,12 @@ namespace fastllm {
         const std::vector <GenerationConfig> &generationConfigs,
         const LastTokensManager &lastTokens,
         std::vector <std::vector <float>*> *retLogits) {
+        if (kvMemConfig.enabled) {
+            if (!CanUseGPUForward()) throw std::invalid_argument("KVMem requires the direct CUDA forward path");
+            return ForwardGPU(batch, inputIds, attentionMask, positionIds, seqLens,
+                              pastKeyValues, generationConfigs, lastTokens, retLogits);
+        }
+
         int seqLen = inputIds.dims[1];
 
         Data qkv;

@@ -1,0 +1,8 @@
+#include "fastllm-gguf-mmq-kernels.cuh"
+
+namespace fastllm_gguf_mmq {
+FASTLLM_INSTANTIATE_MMQ(GGML_TYPE_IQ3_XXS)
+FASTLLM_INSTANTIATE_MMQ(GGML_TYPE_IQ3_S)
+FASTLLM_INSTANTIATE_MMQ(GGML_TYPE_IQ4_NL)
+FASTLLM_INSTANTIATE_MMQ(GGML_TYPE_IQ4_XS)
+} // namespace fastllm_gguf_mmq

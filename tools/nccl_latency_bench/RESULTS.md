@@ -27,21 +27,3 @@ With `NCCL_DEBUG=TRACE`, automatic selection for 4096 bytes was reported as:
 ```text
 AllReduce: 4096 Bytes -> Algo RING proto SIMPLE channel{Lo..Hi}={0..0}
 ```
-
-## Why the earlier PyTorch result was about 129 us
-
-The earlier test launched two Python processes and timed every operation as:
-
-```python
-begin = time.perf_counter_ns()
-dist.all_reduce(tensor)
-torch.cuda.synchronize()
-```
-
-That measured about 129 us/op. It includes Python and PyTorch dispatch, two
-processes reaching each collective at slightly different times, CUDA runtime
-submission, and a host synchronization after every operation. It is therefore
-not a measurement of NCCL device-side latency alone.
-
-For this machine, the directly measured steady-state NCCL value is about 16.5 us
-with automatic protocol selection, or 11.5 us when forcing the LL protocol.

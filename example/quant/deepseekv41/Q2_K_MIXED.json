@@ -1,0 +1,17 @@
+[
+    {
+        "key": ".*",
+        "dtype": "float16",
+        "comment": "Keep ordinary linear weights at FP16; model-specific protected weights retain their mapped precision."
+    },
+    {
+        "key": "^layers\\.[0-9]+\\.ffn\\.experts\\.[0-9]+\\.w[13]\\.weight$",
+        "dtype": "ggml_q2_k",
+        "comment": "Routed expert gate and up projections use Q2_K."
+    },
+    {
+        "key": "^layers\\.[0-9]+\\.ffn\\.experts\\.[0-9]+\\.w2\\.weight$",
+        "dtype": "ggml_q4_k",
+        "comment": "Routed expert down projections use Q4_K. DSpark and Engram are copied unchanged by the exporter."
+    }
+]

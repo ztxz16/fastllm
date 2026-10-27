@@ -3,6 +3,7 @@
 //
 
 #include "devices/cpu/computeutils.h"
+#include "devices/cpu/deepseekv41-reference-math.h"
 #include "devices/cpu/cpudevice.h"
 
 #include <cstring>
@@ -29,6 +30,9 @@ namespace fastllm {
     extern FP16ToFP32Manager fp16tofp32;
     extern BF16ToFP32Manager bf16tofp32;
     extern FP8E4M3ToFP32Manager fp8e4m3tofp32;
+    extern bool V41ReferenceLinear_AVX512F(const void *input, const uint8_t *weight,
+        const float *bias, float *output, int n, int m, int k, int st, int end,
+        int blockK, const float *scales, const uint8_t *scaleBytes, bool bf16Input, const float *fp8Table);
     extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
     extern void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
@@ -510,8 +514,21 @@ namespace fastllm {
 
         auto vec_dot_type = ggml_type_vec_dot_type(weightType);
         auto vec_dot = ggml_type_vec_dot(weightType);
-        if (GetMulMatFunction(weightType, 1) != nullptr) {
-            int part = (n == 1 ? (end - st) : 64);
+        if (auto single = GetMulMatFunction(weightType, 1)) {
+            // Decode needs only the one-row kernel. Avoid allocating a table
+            // and resolving all eight batch sizes for every worker slice.
+            if (n == 1) {
+                const size_t weightRowBytes = ggml_row_size(weightType, m);
+                const size_t inputRowBytes = ggml_row_size(vec_dot_type, m);
+                DataInfo info{outputData + st, (const char *)q8kInputData,
+                    (size_t)k, inputRowBytes, 0, 1, nullptr, 0};
+                single(m, weightData + size_t(st) * weightRowBytes,
+                       weightRowBytes, info, end - st);
+                if (biasData)
+                    for (int j = st; j < end; ++j) outputData[j] += biasData[j];
+                return true;
+            }
+            const int part = 64;
             int oldSt = st, oldEnd = end;
 
             int maxRows = 8;
@@ -550,13 +567,17 @@ namespace fastllm {
                 st = end;
             }
         } else if (vec_dot != nullptr) {
+            // These strides are constant for the whole operation. Resolving
+            // GGUF type metadata for every output row is costly for small dots.
+            const size_t weightRowBytes = ggml_row_size(weightType, m);
+            const size_t inputRowBytes = ggml_row_size(vec_dot_type, m);
             for (int i = 0; i < n; i++) {
+                const uint8_t *inputRow = q8kInputData + size_t(i) * inputRowBytes;
                 for (int j = st; j < end; j++) {
-                    float now = 0.0f;
                     vec_dot (
-                        m, &outputData[i * k + j], 0, 
-                        weightData + j * ggml_row_size(weightType, m), 0, 
-                        q8kInputData + i * ggml_row_size(vec_dot_type, m), 0, 
+                        m, &outputData[i * k + j], 0,
+                        weightData + size_t(j) * weightRowBytes, 0,
+                        inputRow, 0,
                         1
                     );
                     outputData[i * k + j] += (biasData ? biasData[j] : 0.0f);
@@ -816,6 +837,11 @@ namespace fastllm {
     extern bool LinearFloat32NVFP4E8M0_AVX512F_Kernel(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end, int blockK, int blockM, uint8_t *scaleBytes,
         int ks, int ms);
+    extern bool LinearFloat32NVFP4E8M0Decode_AVX2_Kernel(const float *input, const uint8_t *weight,
+        const uint8_t *scales, float *output, int m, int k, int first, int last);
+    extern bool LinearFloat32NVFP4E8M0DecodeRows_AVX2_Kernel(const float *input,
+        const uint8_t *weight, const uint8_t *scales, float *output,
+        int rows, int m, int k, int first, int last);
     extern bool LinearFloat32NVFP4E8M0_AVX2_Kernel(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end, int blockK, int blockM, uint8_t *scaleBytes,
         int ks, int ms);
@@ -834,6 +860,28 @@ namespace fastllm {
         static float magicScale = pow(2, 120);
         int ks = (k - 1) / blockK + 1;
         int ms = (m - 1) / blockM + 1;
+        if (V41ReferenceMathEnabled() && blockM == 32 && m % 32 == 0) {
+            if (cpuInstructInfo.hasAVX512F && V41ReferenceLinear_AVX512F(inputData, weightData,
+                    biasData, outputData, n, m, k, st, end, blockK, scales, nullptr, true, fp8e4m3tofp32.dict))
+                return;
+            std::vector<float> values(m);
+            for (int token = 0; token < n; ++token) {
+                for (int j = 0; j < m; ++j) values[j] = BFloat16BitsToFloat32(inputData[token*m+j]);
+                for (int row = st; row < end; ++row) {
+                    float sum = 0;
+                    for (int block = 0; block < ms; ++block) {
+                        float partial = 0;
+                        for (int j = block*32; j < (block+1)*32; ++j) {
+                            partial += values[j] * fp8e4m3tofp32.dict[weightData[(size_t)row*m+j]];
+                        }
+                        volatile float scaled = partial * scales[(row/blockK)*ms+block];
+                        sum += scaled;
+                    }
+                    outputData[token*k+row] = sum + (biasData ? biasData[row] : 0.0f);
+                }
+            }
+            return;
+        }
         if (cpuInstructInfo.hasAVX512BF16) {
             if (LinearBFloat16FP8E4M3_AVX512BF16_Kernel(
                 inputData, weightData, biasData, outputData, n, m, k, st, end,
@@ -1190,7 +1238,40 @@ namespace fastllm {
         }
     }
 
+    template<bool BF16Input>
+    static void V41ReferenceNVFP4(const void *input, const uint8_t *weight, const float *bias,
+                                float *output, int n, int m, int k, int st, int end,
+                                int blockK, const float *scales, const uint8_t *scaleBytes) {
+        const int blocks=m/32, packed=m/2;
+        const float grid[16]={0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6};
+        for (int token=0;token<n;++token) {
+            std::vector<float> values(m);
+            for(int j=0;j<m;++j) values[j]=BF16Input
+                ? BFloat16BitsToFloat32(((const uint16_t*)input)[token*m+j]) : ((const float*)input)[token*m+j];
+            for(int row=st;row<end;++row) {
+                float sum=0;
+                for(int b=0;b<blocks;++b) {
+                    float partial=0;
+                    for(int j=b*32;j<(b+1)*32;++j) {
+                        int code=(weight[(size_t)row*packed+j/2]>>((j&1)*4))&15;
+                        partial+=values[j]*grid[code];
+                    }
+                    volatile float scaled=partial*GetNVFP4ScaleValue_Base(scales,scaleBytes,(size_t)(row/blockK)*blocks+b);
+                    sum+=scaled;
+                }
+                output[token*k+row]=sum+(bias?bias[row]:0.0f);
+            }
+        }
+    }
+
     void MultiThreadLinearBFloat16NVFP4Op::Run() {
+        if (V41ReferenceMathEnabled() && blockM == 32 && m % 32 == 0) {
+            if (cpuInstructInfo.hasAVX512F && V41ReferenceLinear_AVX512F(inputData, weightData,
+                    biasData, outputData, n, m, k, st, end, blockK, scales, scaleBytes, true, nullptr))
+                return;
+            V41ReferenceNVFP4<true>(inputData,weightData,biasData,outputData,n,m,k,st,end,blockK,scales,scaleBytes);
+            return;
+        }
         int ms = (m - 1) / blockM + 1;
         int ks = (k - 1) / blockK + 1;
         int packedM = (m + 1) / 2;
@@ -1242,6 +1323,13 @@ namespace fastllm {
     }
 
     void MultiThreadLinearFloat32NVFP4Op::Run() {
+        if (V41ReferenceMathEnabled() && blockM == 32 && m % 32 == 0) {
+            if (cpuInstructInfo.hasAVX512F && V41ReferenceLinear_AVX512F(inputData, weightData,
+                    biasData, outputData, n, m, k, st, end, blockK, scales, scaleBytes, false, nullptr))
+                return;
+            V41ReferenceNVFP4<false>(inputData,weightData,biasData,outputData,n,m,k,st,end,blockK,scales,scaleBytes);
+            return;
+        }
         int ms = (m - 1) / blockM + 1;
         int ks = (k - 1) / blockK + 1;
         int packedM = (m + 1) / 2;
@@ -1279,6 +1367,12 @@ namespace fastllm {
                     return;
                 }
             } else if (scaleBytes != nullptr) {
+                if (compactDecode && n == 1 && blockK == 1 && blockM == 32 && !biasData &&
+                    LinearFloat32NVFP4E8M0Decode_AVX2_Kernel(inputData, weightData, scaleBytes,
+                        outputData, m, k, st, end)) return;
+                if (compactDecode && n >= 2 && n <= 6 && blockK == 1 && blockM == 32 && !biasData &&
+                    LinearFloat32NVFP4E8M0DecodeRows_AVX2_Kernel(inputData, weightData, scaleBytes,
+                        outputData, n, m, k, st, end)) return;
                 if (LinearFloat32NVFP4E8M0_AVX2_Kernel(inputData, weightData, biasData, outputData,
                     n, m, k, st, end, blockK, blockM, scaleBytes, ks, ms)) {
                     return;
@@ -2175,7 +2269,7 @@ namespace fastllm {
 
     void LaunchLinearFloat32NVFP4(float *inputData, Data &weight, float *outputData, float *biasData,
         int n, int m, int k,
-        std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum, bool compactDecode) {
         float *scaleFloats = nullptr;
         uint8_t *scaleBytes = nullptr;
         PrepareNVFP4LinearScales(
@@ -2189,6 +2283,7 @@ namespace fastllm {
             }
             ops[startTid + i] = new MultiThreadLinearFloat32NVFP4Op(inputData, weight.cpuData, biasData, outputData,
                                     n, m, k, cur, end, scaleFloats, scaleBytes, weight.blockK, weight.blockM);
+            static_cast<MultiThreadLinearFloat32NVFP4Op *>(ops[startTid + i])->compactDecode = compactDecode;
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
@@ -2573,20 +2668,23 @@ namespace fastllm {
             if (q8kInputs.size() < n * rowCount) {
                 q8kInputs.resize(n * rowCount);
             }
-            if (n > 1) {
+            // Tiny expert batches cost less to quantize on the caller than to
+            // dispatch a second wave of worker tasks. Keep the matmul parallel.
+            if (n > 1 && (n > 3 || (int64_t)n * m > 16384)) {
                 std::vector<fastllm::MultiThreadFloat32ToQ8KOp*> ops;
-                int per = n / threadNum;
+                const int quantThreads = std::min(n, threadNum);
+                int per = n / quantThreads;
                 int cur = 0;
-                for (int i = 0; i < threadNum; i++) {
-                    int end = cur + per + (cur + per * (threadNum - i) < n);
+                for (int i = 0; i < quantThreads; i++) {
+                    int end = cur + per + (cur + per * (quantThreads - i) < n);
                     ops.push_back(new MultiThreadFloat32ToQ8KOp(
                         inputData + cur * m, (uint8_t*)(q8kInputs.data() + cur * rowCount), (end - cur) * m, tensor->type));
                     cur = end;
                 }
-                for (int i = 0; i < threadNum; i++) {
+                for (int i = 0; i < quantThreads; i++) {
                     pool->PushOp(startTid + i, ops[i]);
                 }
-                for (int i = 0; i < threadNum; i++) {
+                for (int i = 0; i < quantThreads; i++) {
                     pool->Wait(startTid + i);
                     delete ops[i];
                 }

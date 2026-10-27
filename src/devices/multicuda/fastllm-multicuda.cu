@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <vector>
 #include <chrono>
+#include <condition_variable>
+#include <cmath>
+#include <cerrno>
 #include <algorithm>
 #include <cctype>
 #include <condition_variable>
@@ -22,12 +25,18 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <stdexcept>
 
 #include "fastllm-cuda.cuh"
 #include "fastllm-multicuda.cuh"
 #ifdef FASTLLM_USE_NCCL
 #include <nccl.h>
 #include "devices/multicuda/ncclsubmitrendezvous.h"
+#endif
+#include "devices/multicuda/tp2prefill.h"
+#include "devices/cuda/fastllm-cuda-fp8.h"
+#if defined(FASTLLM_USE_NCCL) && !defined(USE_ROCM)
+#include "devices/multicuda/tp2mlppipeline.cuh"
 #endif
 #include "fastllm.h"
 #include "utils.h"
@@ -1316,6 +1325,7 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     curLen += copyLen;
                 }
             } else if (weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E8M0 ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0) {
                 size_t rowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
@@ -1508,6 +1518,7 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     curLen += copyLen;
                 }
             } else if (weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E8M0 ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0) {
                 const size_t packedBlock = weight.dataType ==
@@ -1517,7 +1528,15 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     8 + sizeof(float) : packedBlock / 2 + sizeof(uint8_t);
                 size_t srcRowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
                 size_t dstRowBytes = fastllm::GetDataBytes(weight.dataType, 1, len);
+                const size_t header = weight.dataType ==
+                    fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED ? sizeof(float) : 0;
+                if (header) {
+                    state = FastllmCudaMemcpy2D(deviceWeightData, dstRowBytes,
+                        sourceWeightData, srcRowBytes, header, kSize,
+                        GetCudaMemcpyType(mallocType, sourceWeightType), deviceId, rootDevice);
+                }
                 for (auto &it : div) {
+                    if (state != cudaSuccess) break;
                     int copyLen = it.second - it.first;
                     fastllm::AssertInFastLLM(
                         it.first % packedBlock == 0 &&
@@ -1528,9 +1547,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                         cudaSetDevice(rootDevice);
                     }
                     size_t dstOffsetBytes =
-                        static_cast<size_t>(curLen / packedBlock) * blockBytes;
+                        header + static_cast<size_t>(curLen / packedBlock) * blockBytes;
                     size_t srcOffsetBytes =
-                        static_cast<size_t>(it.first / packedBlock) * blockBytes;
+                        header + static_cast<size_t>(it.first / packedBlock) * blockBytes;
                     size_t copyBytes =
                         static_cast<size_t>(copyLen / packedBlock) * blockBytes;
                     state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstOffsetBytes,
@@ -2092,6 +2111,12 @@ static std::map<int, ncclComm_t> g_ncclComms;
 // Follows the main communicator group's lifetime. As with g_ncclComms,
 // initialization/replacement must not overlap active collectives.
 static std::unique_ptr<fastllm::NcclSubmitRendezvous> g_ncclSubmitRendezvous;
+#ifndef USE_ROCM
+// Experimental opt-in, initialized with the main communicator before warmup.
+// Keep small collectives and graph capture on the established paths.
+static std::unique_ptr<fastllm::TP2WHT6AllReduce> g_tp2WHT6AllReduce;
+static std::map<int, std::unique_ptr<fastllm::TP2MlpPipeline>> g_tp2MlpPipelines;
+#endif
 
 struct FastllmNcclGraphPeerComms {
     int devices[2] = {-1, -1};
@@ -2565,6 +2590,167 @@ static ncclComm_t FindNcclCommNoLog(int deviceId) {
 }
 #endif
 
+// Blocking NCCL calls (including GroupEnd/CommAbort) cannot be bounded by
+// polling their return value. A watchdog bounds the whole startup attempt;
+// timed-out collectives cannot safely fall back to inference in this process.
+#ifdef FASTLLM_USE_NCCL
+class FastllmNcclInitWatchdog {
+public:
+    FastllmNcclInitWatchdog() {
+        long timeoutMs = 60000;
+        if (const char *value = std::getenv("FASTLLM_NCCL_INIT_TIMEOUT_MS")) {
+            char *end = nullptr;
+            errno = 0;
+            long parsed = std::strtol(value, &end, 10);
+            if (errno == 0 && end != value && *end == '\0' &&
+                parsed > 0 && parsed <= 3600000) {
+                timeoutMs = parsed;
+            } else {
+                std::fprintf(stderr, "[Fastllm] Invalid FASTLLM_NCCL_INIT_TIMEOUT_MS; using 60000 ms.\n");
+            }
+        }
+        worker = std::thread([this, timeoutMs] {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (!cv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                             [this] { return finished; })) {
+                std::fprintf(stderr,
+                    "[Fastllm] NCCL initialization/self-test timed out after %ld ms; terminating to avoid invalid TP results.\n",
+                    timeoutMs);
+                std::fflush(stderr);
+                // Do not run CUDA/NCCL cleanup or static destructors while
+                // another thread may be stuck inside the driver/library.
+                std::_Exit(EXIT_FAILURE);
+            }
+        });
+    }
+    ~FastllmNcclInitWatchdog() { Finish(); }
+    void Finish() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            finished = true;
+        }
+        cv.notify_one();
+        if (worker.joinable()) worker.join();
+    }
+private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool finished = false;
+    std::thread worker;
+};
+
+[[noreturn]] static void FastllmNcclInitFailed(
+        const std::vector<ncclComm_t> &comms, const char *reason) {
+    std::fprintf(stderr,
+        "[Fastllm] NCCL %s. Check the loaded NCCL library, CUDA runtime/driver and GPU connectivity.\n",
+        reason);
+    std::fflush(stderr);
+    // NCCL itself may write its detailed diagnostic to buffered stdout.
+    std::fflush(stdout);
+    // A failed group may still have outstanding work. Abort before releasing
+    // anything it can access; the startup watchdog also bounds this cleanup.
+    for (ncclComm_t comm : comms) {
+        if (comm != nullptr) ncclCommAbort(comm);
+    }
+    // Failure must not wait for stdin, report success, or run CUDA destructors.
+    // The driver reclaims startup buffers when this process exits.
+    std::_Exit(EXIT_FAILURE);
+}
+
+static bool FastllmNcclSelfTest(const std::vector<int> &devices) {
+    const int numGPUs = (int)devices.size();
+    const int count = 1024;
+    const float expect = (float)numGPUs * (numGPUs + 1) / 2.0f;
+    std::vector<void*> buffers(numGPUs, nullptr);
+    std::vector<float> host(count);
+    auto cudaOk = [](cudaError_t result, const char *stage, int device) {
+        if (result == cudaSuccess) return true;
+        std::fprintf(stderr, "[Fastllm] NCCL self-test %s on device %d: %s\n",
+                     stage, device, cudaGetErrorString(result));
+        return false;
+    };
+    auto ncclOk = [](ncclResult_t result, const char *stage, int device) {
+        if (result == ncclSuccess) return true;
+        std::fprintf(stderr, "[Fastllm] NCCL self-test %s on device %d: %s\n",
+                     stage, device, ncclGetErrorString(result));
+        return false;
+    };
+    int originalDevice = -1;
+    bool ok = cudaOk(cudaGetDevice(&originalDevice), "get device", -1);
+    for (int i = 0; i < numGPUs && ok; ++i) {
+        std::fill(host.begin(), host.end(), (float)(i + 1));
+        ok = cudaOk(cudaSetDevice(devices[i]), "select device", devices[i]) &&
+             cudaOk(cudaMalloc(&buffers[i], count * sizeof(float)), "allocate", devices[i]) &&
+             cudaOk(cudaMemcpy(buffers[i], host.data(), count * sizeof(float),
+                               cudaMemcpyHostToDevice), "upload", devices[i]);
+    }
+    if (ok && ncclOk(ncclGroupStart(), "group start", -1)) {
+        // One host thread submits all ranks: grouping is required even for
+        // older NCCL versions, otherwise the first rank may wait for peers.
+        for (int i = 0; i < numGPUs && ok; ++i) {
+            ok = cudaOk(cudaSetDevice(devices[i]), "select device", devices[i]) &&
+                 ncclOk(ncclAllReduce(buffers[i], buffers[i], count, ncclFloat, ncclSum,
+                                     g_ncclComms[devices[i]], cudaStreamPerThread),
+                        "all-reduce launch", devices[i]);
+        }
+        // Always close a successfully opened group, including a partial launch.
+        bool groupOk = ncclOk(ncclGroupEnd(), "group end", -1);
+        ok = ok && groupOk;
+    } else {
+        ok = false;
+    }
+
+    // CUDA synchronization alone can wait forever on an NCCL async error.
+    // Poll every outstanding rank so a failure on any peer is noticed early.
+    std::vector<bool> complete(numGPUs, false);
+    int remaining = numGPUs;
+    while (ok && remaining > 0) {
+        for (int i = 0; i < numGPUs && ok; ++i) {
+            if (complete[i]) continue;
+            ncclResult_t asyncError = ncclSuccess;
+            ok = ncclOk(ncclCommGetAsyncError(g_ncclComms[devices[i]], &asyncError),
+                        "query async error", devices[i]) &&
+                 ncclOk(asyncError, "async error", devices[i]) &&
+                 cudaOk(cudaSetDevice(devices[i]), "select device", devices[i]);
+            if (!ok) break;
+            cudaError_t status = cudaStreamQuery(cudaStreamPerThread);
+            if (status == cudaSuccess) {
+                complete[i] = true;
+                --remaining;
+            } else if (status != cudaErrorNotReady) {
+                ok = cudaOk(status, "query completion", devices[i]);
+            }
+        }
+        if (ok && remaining > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    for (int i = 0; i < numGPUs && ok; ++i) {
+        ok = cudaOk(cudaSetDevice(devices[i]), "select device", devices[i]) &&
+             cudaOk(cudaMemcpy(host.data(), buffers[i], count * sizeof(float),
+                               cudaMemcpyDeviceToHost), "read result", devices[i]);
+        if (!ok) break;
+        for (int j = 0; j < count; ++j) {
+            if (!std::isfinite(host[j]) || std::fabs(host[j] - expect) > 1e-3f) {
+                std::fprintf(stderr,
+                    "[Fastllm] NCCL self-test mismatch on device %d at element %d: expected %f, got %f\n",
+                    devices[i], j, expect, host[j]);
+                ok = false;
+                break;
+            }
+        }
+    }
+    // On failure the caller aborts all communicators and terminates. Do not
+    // cudaFree buffers that an incomplete collective could still be using.
+    if (!ok) return false;
+    for (int i = 0; i < numGPUs; ++i) {
+        if (!cudaOk(cudaSetDevice(devices[i]), "select device", devices[i]) ||
+            !cudaOk(cudaFree(buffers[i]), "free buffer", devices[i])) return false;
+    }
+    return cudaOk(cudaSetDevice(originalDevice), "restore device", originalDevice);
+}
+#endif
+
 uint64_t FastllmGetNcclGeneration() {
     return g_ncclGeneration.load(std::memory_order_acquire);
 }
@@ -2623,12 +2809,18 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
         return true;
     }
 
+    FastllmNcclInitWatchdog startupWatchdog;
+
     // Publish a new generation before tearing down the old group. Even if a
     // future initialization error prevents custom state from being rebuilt,
     // every rank will consistently reject the stale state and use NCCL.
     g_ncclGeneration.fetch_add(1, std::memory_order_acq_rel);
     FastllmCudaCustomAllReduceReset();
     g_ncclSubmitRendezvous.reset();
+#ifndef USE_ROCM
+    g_tp2WHT6AllReduce.reset();
+    g_tp2MlpPipelines.clear();
+#endif
 
     for (auto &it : g_ncclComms) {
         if (it.second != nullptr) {
@@ -2651,8 +2843,8 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     // 注意：这会阻塞，直到所有卡都就绪
     ncclResult_t initRes = ncclCommInitAll(comms.data(), numGPUs, uniqueDevices.data());
     if (initRes != ncclSuccess) {
-        printf("Error: ncclCommInitAll failed: %s\n", ncclGetErrorString(initRes));
-        return false;
+        std::fprintf(stderr, "[Fastllm] ncclCommInitAll failed: %s\n", ncclGetErrorString(initRes));
+        FastllmNcclInitFailed(comms, "communicator initialization failed");
     }
 
     // 将生成的 comms 存入 map，方便后续通过 deviceId 查找
@@ -2660,12 +2852,20 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
         g_ncclComms[uniqueDevices[i]] = comms[i];
         g_ncclRanks[uniqueDevices[i]] = i;
     }
-        
+
+    if (!FastllmNcclSelfTest(uniqueDevices)) {
+        FastllmNcclInitFailed(comms, "self-test failed");
+    }
+    startupWatchdog.Finish();
+
     g_ncclInitialized = true;
     g_ncclWorldSize = numGPUs;
-    // Odd TP sizes cannot use the custom all-reduce. Keep the established
-    // even-rank path unchanged, including its NCCL fallback.
-    if (numGPUs % 2 != 0) {
+    // Every multi-rank TP group meets around NCCL submission: even-rank
+    // collectives also fall back to NCCL for large tensors, and a rank
+    // entering the next GEMM/allocator while a peer is still submitting can
+    // deadlock on the CUDA driver lock (upstream #722: TP=2 + MTP long
+    // context prefill stalled at the 256-page boundary).
+    if (numGPUs > 1) {
         g_ncclSubmitRendezvous.reset(new fastllm::NcclSubmitRendezvous(numGPUs));
     }
     // Initialize the optional graph-safe small all-reduce before any captured
@@ -2675,6 +2875,48 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     // 通知 CUDA 分配器：NCCL 已激活。此后真实 cudaMalloc 前会先排空在途集合通信，
     // 避免 cudaMalloc 与 NCCL 主机 proxy 争用 CUDA 驱动锁导致的跨 rank 死锁。
     FastllmCudaSetNcclActive(true);
+#ifndef USE_ROCM
+    auto enabled = [](const char *name) {
+        const char *value = std::getenv(name);
+        return value && std::strcmp(value, "1") == 0;
+    };
+    const bool wht6 = enabled("FASTLLM_TP2_WHT6_ALLREDUCE");
+    const bool overlap = enabled("FASTLLM_TP2_MLP_OVERLAP");
+    if (numGPUs == 2 && (wht6 || overlap)) {
+        // Decide for the whole group before either rank can enter a collective.
+        // Other architectures keep their existing paths even if flags are set.
+        bool ampere = true;
+        for (int device : uniqueDevices) {
+            cudaDeviceProp properties{};
+            cudaError_t status = cudaGetDeviceProperties(&properties, device);
+            if (status != cudaSuccess) {
+                cudaGetLastError();
+                ampere = false;
+                break;
+            }
+            ampere = ampere && properties.major == 8 &&
+                (properties.minor == 0 || properties.minor == 6);
+        }
+        if (ampere && overlap) {
+            for (int device : uniqueDevices) {
+                g_tp2MlpPipelines.emplace(device, std::make_unique<fastllm::TP2MlpPipeline>());
+            }
+        }
+        if (ampere && wht6) {
+            auto candidate = std::make_unique<fastllm::TP2WHT6AllReduce>();
+            cudaError_t status = candidate->Init(uniqueDevices[0], uniqueDevices[1]);
+            if (status == cudaSuccess) {
+                g_tp2WHT6AllReduce = std::move(candidate);
+                printf("[Fastllm] TP2 WHT6 enabled: GPU %d/%d, 1-32 MiB, eager FP16 contributions.\n",
+                       uniqueDevices[0], uniqueDevices[1]);
+            } else {
+                printf("[Fastllm] TP2 WHT6 initialization failed (%s); using NCCL.\n",
+                       cudaGetErrorString(status));
+                cudaGetLastError();
+            }
+        }
+    }
+#endif
     printf("NCCL Initialized for %d devices.\n", numGPUs);
     return true;
 #endif
@@ -2896,18 +3138,19 @@ struct alignas(128) FastllmTP2P2PSignal {
     // Two synchronization points and two alternating slots prevent a faster
     // rank from overwriting a flag before its peer has observed it.
     uint32_t flags[2][2][FASTLLM_TP2_P2P_MAX_BLOCKS][2];
-    uint64_t inputPointers[2][FASTLLM_TP2_P2P_MAX_BLOCKS][2];
 };
 
 struct FastllmTP2P2PState {
     struct HostPointerSlot {
         std::atomic<uint32_t> sequences[2];
         std::atomic<uintptr_t> inputPointers[2];
+        std::atomic<bool> eligible[2];
 
         HostPointerSlot() {
             for (int rank = 0; rank < 2; rank++) {
                 sequences[rank].store(0, std::memory_order_relaxed);
                 inputPointers[rank].store(0, std::memory_order_relaxed);
+                eligible[rank].store(true, std::memory_order_relaxed);
             }
         }
     };
@@ -2929,36 +3172,6 @@ struct FastllmTP2P2PState {
 FastllmTP2P2PState &FastllmGetTP2P2PState() {
     static FastllmTP2P2PState state;
     return state;
-}
-
-bool FastllmTP2P2PEnabled() {
-    static bool enabled = []() {
-        const char *env = std::getenv("FASTLLM_CUDA_TP2_P2P_ALLREDUCE");
-        if (env == nullptr || env[0] == '\0') {
-            return true;
-        }
-        std::string value(env);
-        std::transform(value.begin(), value.end(), value.begin(),
-                       [](unsigned char c) { return (char)std::tolower(c); });
-        return value != "0" && value != "false" && value != "off" &&
-               value != "no";
-    }();
-    return enabled;
-}
-
-bool FastllmTP2P2PHostPointerExchangeEnabled() {
-    static bool enabled = []() {
-        const char *env = std::getenv("FASTLLM_CUDA_TP2_HOST_POINTER_EXCHANGE");
-        if (env == nullptr || env[0] == '\0') {
-            return true;
-        }
-        std::string value(env);
-        std::transform(value.begin(), value.end(), value.begin(),
-                       [](unsigned char c) { return (char)std::tolower(c); });
-        return value != "0" && value != "false" && value != "off" &&
-               value != "no";
-    }();
-    return enabled;
 }
 
 __device__ __forceinline__ void FastllmTP2StoreRelease(uint32_t *address,
@@ -3025,68 +3238,6 @@ struct alignas(16) FastllmTP2Packed {
     T values[16 / sizeof(T)];
 };
 
-template <typename T>
-__global__ __launch_bounds__(512, 1) void FastllmTP2P2PReduceAddDirectKernel(
-        T *dst, const T *residual, const T *localInput, int count,
-        FastllmTP2P2PSignal *selfSignal,
-        FastllmTP2P2PSignal *peerSignal,
-        int rank, uint32_t sequence) {
-    const int peerRank = 1 - rank;
-    const int slot = sequence & 1;
-    if (threadIdx.x == 0) {
-        peerSignal->inputPointers[slot][blockIdx.x][rank] =
-            (uint64_t)(uintptr_t)localInput;
-        // The pointer is published by this kernel. A system release/acquire
-        // pair makes that remote pointer visible before either rank
-        // dereferences it.
-        FastllmTP2StoreReleaseSystem(
-            &peerSignal->flags[0][slot][blockIdx.x][rank], sequence);
-        while (FastllmTP2LoadAcquireSystem(
-                   &selfSignal->flags[0][slot][blockIdx.x][peerRank]) !=
-               sequence) {
-        }
-    }
-    __syncthreads();
-
-    using Packed = FastllmTP2Packed<T>;
-    constexpr int valuesPerPack = 16 / sizeof(T);
-    const int packedCount = count / valuesPerPack;
-    Packed *packedDst = (Packed*)dst;
-    const Packed *packedResidual = (const Packed*)residual;
-    const Packed *packedLocal = (const Packed*)localInput;
-    const Packed *packedPeer = (const Packed*)(uintptr_t)
-        selfSignal->inputPointers[slot][blockIdx.x][peerRank];
-    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
-         index < packedCount; index += gridDim.x * blockDim.x) {
-        Packed localValue = packedLocal[index];
-        Packed peerValue = packedPeer[index];
-        Packed rank0 = rank == 0 ? localValue : peerValue;
-        Packed rank1 = rank == 0 ? peerValue : localValue;
-        Packed residualValue = packedResidual[index];
-#pragma unroll
-        for (int i = 0; i < valuesPerPack; i++) {
-            rank0.values[i] = FastllmTP2AddValue(
-                residualValue.values[i], rank0.values[i]);
-            rank0.values[i] = FastllmTP2AddValue(
-                rank0.values[i], rank1.values[i]);
-        }
-        packedDst[index] = rank0;
-    }
-
-    // Keep localInput alive until the peer has completed all remote reads.
-    // No memory publication is needed here, so the lightweight final barrier
-    // is sufficient and matches vLLM's one-stage all-reduce protocol.
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        FastllmTP2StoreRelease(
-            &peerSignal->flags[1][slot][blockIdx.x][rank], sequence);
-        while (FastllmTP2LoadAcquire(
-                   &selfSignal->flags[1][slot][blockIdx.x][peerRank]) !=
-               sequence) {
-        }
-    }
-}
-
 // FastLLM runs TP ranks in persistent host workers in the same process, so
 // peer-access UVA pointers can be exchanged before launch.  Keeping pointer
 // publication out of the GPU kernel removes one system-scope release/acquire
@@ -3151,10 +3302,6 @@ bool FastllmInitTP2P2PState(FastllmTP2P2PState &state) {
     std::lock_guard<std::mutex> guard(state.initMutex);
     if (state.initialized) {
         return state.available;
-    }
-    if (!FastllmTP2P2PEnabled()) {
-        state.initialized = true;
-        return false;
     }
     // NCCL establishes the rank-to-device mapping. If it is not ready yet,
     // leave initialization retryable rather than permanently disabling the
@@ -3236,21 +3383,6 @@ bool FastllmInitTP2P2PState(FastllmTP2P2PState &state) {
 }
 
 template <typename T>
-void FastllmLaunchTP2P2PReduceAddDirect(
-        T *dst, const T *residual, const T *localInput, int count,
-        FastllmTP2P2PSignal *selfSignal,
-        FastllmTP2P2PSignal *peerSignal,
-        int rank, uint32_t sequence, cudaStream_t stream) {
-    constexpr int valuesPerPack = 16 / sizeof(T);
-    int packedCount = count / valuesPerPack;
-    int blocks = std::max(1, std::min(FASTLLM_TP2_P2P_MAX_BLOCKS,
-                                     (packedCount + 511) / 512));
-    FastllmTP2P2PReduceAddDirectKernel<T><<<blocks, 512, 0, stream>>>(
-        dst, residual, localInput, count,
-        selfSignal, peerSignal, rank, sequence);
-}
-
-template <typename T>
 void FastllmLaunchTP2P2PReduceAddKnownPeer(
         T *dst, const T *residual, const T *localInput,
         const T *peerInput, int count,
@@ -3268,12 +3400,14 @@ void FastllmLaunchTP2P2PReduceAddKnownPeer(
 
 const void *FastllmTP2P2PExchangeHostPointer(
         FastllmTP2P2PState &state, int rank, uint32_t sequence,
-        const void *localInput) {
+        const void *localInput, bool locallyEligible = true,
+        bool *bothEligible = nullptr) {
     const int slot = sequence & 1;
     const int peerRank = 1 - rank;
     auto &hostSlot = state.hostPointerSlots[slot];
     hostSlot.inputPointers[rank].store(
         (uintptr_t)localInput, std::memory_order_relaxed);
+    hostSlot.eligible[rank].store(locallyEligible, std::memory_order_relaxed);
     hostSlot.sequences[rank].store(sequence, std::memory_order_release);
 
     // Both TP ranks are persistent workers.  A short spin keeps their CUDA
@@ -3286,11 +3420,112 @@ const void *FastllmTP2P2PExchangeHostPointer(
             std::this_thread::yield();
         }
     }
+    if (bothEligible != nullptr) {
+        *bothEligible = locallyEligible &&
+            hostSlot.eligible[peerRank].load(std::memory_order_relaxed);
+    }
     return (const void*)hostSlot.inputPointers[peerRank].load(
         std::memory_order_relaxed);
 }
 
+// One packed vector per thread stays in registers until both ranks finish
+// reading it. In particular, dest may alias localInput: storing before the
+// second barrier would race with the peer's input load.
+template <typename T>
+__global__ __launch_bounds__(512, 1) void FastllmTP2P2PReduceKnownPeerKernel(
+        T *dst, const T *localInput, const T *peerInput, int count,
+        FastllmTP2P2PSignal *selfSignal, FastllmTP2P2PSignal *peerSignal,
+        int rank, uint32_t sequence) {
+    const int peerRank = 1 - rank;
+    const int slot = sequence & 1;
+    if (threadIdx.x == 0) {
+        FastllmTP2StoreReleaseSystem(
+            &peerSignal->flags[0][slot][blockIdx.x][rank], sequence);
+        while (FastllmTP2LoadAcquireSystem(
+                   &selfSignal->flags[0][slot][blockIdx.x][peerRank]) != sequence) {}
+    }
+    __syncthreads();
+    using Packed = FastllmTP2Packed<T>;
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool valid = index < count / (16 / sizeof(T));
+    Packed sum;
+    if (valid) {
+        Packed local = ((const Packed*)localInput)[index];
+        Packed peer = ((const Packed*)peerInput)[index];
+#pragma unroll
+        for (int i = 0; i < 16 / sizeof(T); ++i) {
+            sum.values[i] = rank == 0 ? FastllmTP2AddValue(local.values[i], peer.values[i])
+                                     : FastllmTP2AddValue(peer.values[i], local.values[i]);
+        }
+    }
+    asm volatile("" ::: "memory");
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        FastllmTP2StoreRelease(&peerSignal->flags[1][slot][blockIdx.x][rank], sequence);
+        while (FastllmTP2LoadAcquire(
+                   &selfSignal->flags[1][slot][blockIdx.x][peerRank]) != sequence) {}
+    }
+    __syncthreads();
+    if (valid) ((Packed*)dst)[index] = sum;
+}
+
+template <typename T>
+void FastllmLaunchTP2P2PReduce(
+        void *dst, const void *data, const void *peerData, int count,
+        FastllmTP2P2PState &state, int rank, uint32_t sequence) {
+    const int packedCount = count / (16 / sizeof(T));
+    const int blocks = (packedCount + 511) / 512;
+    FastllmTP2P2PReduceKnownPeerKernel<T><<<blocks, 512, 0, cudaStreamPerThread>>>(
+        (T*)dst, (const T*)data, (const T*)peerData, count,
+        state.signals[rank], state.signals[1 - rank], rank, sequence);
+}
+
 } // namespace
+
+bool FastllmTryTP2P2PAllReduce(void* data, void* dest, int count,
+                             int dataType, int deviceId) {
+    if (!data || !dest || count <= 0 || g_ncclWorldSize != 2 || g_ncclRanks.size() != 2 ||
+        (dataType != fastllm::DataType::FLOAT16 &&
+         dataType != fastllm::DataType::BFLOAT16 &&
+         dataType != fastllm::DataType::FLOAT32) ||
+        FastllmCudaGetNcclForceSync()) return false;
+    const size_t bytes = (size_t)count *
+        (dataType == fastllm::DataType::FLOAT32 ? sizeof(float) : sizeof(uint16_t));
+    if (bytes % 16 || bytes > FASTLLM_TP2_P2P_MAX_BLOCKS * 512ULL * 16) return false;
+    cudaSetDevice(deviceId);
+    // Graph-enabled models also submit eager prefixes and draft work. Only
+    // actual capture must avoid the host pointer/sequence protocol.
+    if (FastllmCudaGraphIsCapturingFast()) return false;
+    FastllmTP2P2PState &state = FastllmGetTP2P2PState();
+    if (!FastllmInitTP2P2PState(state)) return false;
+    // State belongs to its original device pair. A later model/communicator
+    // must not reuse its peer signals with a different rank mapping.
+    for (int r = 0; r < 2; ++r) {
+        auto it = g_ncclRanks.find(state.devices[r]);
+        if (it == g_ncclRanks.end() || it->second != r) return false;
+    }
+    auto rankIt = g_ncclRanks.find(deviceId);
+    if (rankIt == g_ncclRanks.end()) return false;
+    const int rank = rankIt->second;
+    const uint32_t sequence = state.sequence[rank].fetch_add(1, std::memory_order_relaxed) + 1;
+    bool bothEligible = false;
+    const void *peerData = FastllmTP2P2PExchangeHostPointer(
+        state, rank, sequence, data,
+        (uintptr_t)data % 16 == 0 && (uintptr_t)dest % 16 == 0, &bothEligible);
+    if (!bothEligible) return false;
+    if (dataType == fastllm::DataType::FLOAT16)
+        FastllmLaunchTP2P2PReduce<half>(dest, data, peerData, count, state, rank, sequence);
+    else if (dataType == fastllm::DataType::BFLOAT16)
+        FastllmLaunchTP2P2PReduce<__nv_bfloat16>(dest, data, peerData, count, state, rank, sequence);
+    else FastllmLaunchTP2P2PReduce<float>(dest, data, peerData, count, state, rank, sequence);
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("[Fastllm] TP2 P2P sum launch failed on cuda:%d (%s).\n",
+               deviceId, cudaGetErrorString(error));
+        FastllmCudaSetThreadError();
+    }
+    return true;
+}
 
 static bool FastllmCanUseTP2P2PAllReduceAddImpl(
         int count, int dataType, int deviceId, int *rankOut) {
@@ -3333,6 +3568,136 @@ static bool FastllmCanUseTP2P2PAllReduceAddImpl(
     return true;
 }
 
+bool FastllmCanUseTP2WHT6AllReduceAdd(int count, int dataType, int deviceId) {
+#if defined(FASTLLM_USE_NCCL) && !defined(USE_ROCM)
+    if (!g_tp2WHT6AllReduce || g_ncclWorldSize != 2 ||
+        dataType != fastllm::DataType::FLOAT16 || count <= 0) return false;
+    size_t bytes = (size_t)count * sizeof(half);
+    if (bytes < 1024ULL * 1024 || bytes > fastllm::TP2WHT6AllReduce::Capacity) return false;
+    if (g_ncclRanks.find(deviceId) == g_ncclRanks.end()) return false;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    cudaError_t status = cudaStreamIsCapturing(cudaStreamPerThread, &capture);
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        checkCudaErrors("Error: TP2 WHT6 capture query failed!", status);
+        return false;
+    }
+    return capture == cudaStreamCaptureStatusNone;
+#else
+    return false;
+#endif
+}
+
+bool FastllmTryTP2WHT6AllReduceAdd(const fastllm::Data &partial,
+                                  fastllm::Data &residual, int deviceId) {
+#if defined(FASTLLM_USE_NCCL) && !defined(USE_ROCM)
+    if (!g_tp2WHT6AllReduce || partial.dataType != residual.dataType || partial.Count(0) != residual.Count(0) ||
+        !partial.cudaData || !residual.cudaData ||
+        !FastllmCanUseTP2WHT6AllReduceAdd(partial.Count(0), partial.dataType, deviceId)) return false;
+    int count = partial.Count(0);
+    size_t bytes = (size_t)count * sizeof(half);
+    auto rank = g_ncclRanks.find(deviceId);
+    cudaError_t status = g_tp2WHT6AllReduce->Run(rank->second, partial.cudaData, residual.cudaData,
+        count, cudaStreamPerThread, residual.cudaData);
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "Error: TP2 WHT6 AllReduce GPU %d: %s (%s)\n", deviceId,
+                     cudaGetErrorString(status), g_tp2WHT6AllReduce->Error().c_str());
+        if (g_ncclSubmitRendezvous) g_ncclSubmitRendezvous->Abort("TP2 WHT6 AllReduce failed");
+        FastllmCudaSetThreadError();
+        return true; // Never take NCCL fallback after entering the collective.
+    }
+    if (FastllmNcclPostSyncEnabled(cudaStreamPerThread)) {
+        status = cudaStreamSynchronize(cudaStreamPerThread);
+        checkCudaErrors("Error: TP2 WHT6 warmup synchronization failed!", status);
+    } else {
+        static thread_local bool reported = false;
+        if (!reported) {
+            reported = true;
+            printf("[Fastllm] TP2 WHT6 active on GPU %d: %zu -> %zu bytes, residual uncompressed.\n",
+                   deviceId, bytes, ((size_t)count + 31) / 32 * sizeof(fastllm::TP2HostWHT6Block));
+        }
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool FastllmTryTP2MlpOverlap(const fastllm::Data &input,
+        fastllm::Data &gateUp, const fastllm::Data &gateUpBias,
+        fastllm::Data &down, const fastllm::Data &downBias,
+        fastllm::Data &residual, int deviceId) {
+#if defined(FASTLLM_USE_NCCL) && !defined(USE_ROCM)
+    if (g_tp2MlpPipelines.empty() || g_ncclWorldSize != 2 || !g_ncclSubmitRendezvous ||
+        FastllmCudaGetNcclForceSync() ||
+        !gateUpBias.dims.empty() || !downBias.dims.empty() ||
+        input.dataType != fastllm::DataType::FLOAT16 ||
+        residual.dataType != fastllm::DataType::FLOAT16 ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        residual.dataDevice != fastllm::DataDevice::CUDA ||
+        !input.cudaData || !residual.cudaData || input.dims.empty() ||
+        input.dims.back() != 5120 || input.Count(0) != 2048 * 5120 ||
+        residual.Count(0) != input.Count(0) ||
+        gateUp.dims != std::vector<int>({17408, 5120}) ||
+        down.dims != std::vector<int>({5120, 8704})) {
+        return false;
+    }
+    auto validWeight = [](const fastllm::Data &weight) {
+        return weight.dataType == fastllm::DataType::FP8_E4M3 &&
+            FastllmCudaHasFp8MarlinLayout(weight) && weight.cudaData &&
+            weight.blockM == 128 && weight.blockK == 128;
+    };
+    if (!validWeight(gateUp) || !validWeight(down)) return false;
+    auto rankIt = g_ncclRanks.find(deviceId);
+    auto commIt = g_ncclComms.find(deviceId);
+    if (rankIt == g_ncclRanks.end() || commIt == g_ncclComms.end() || !commIt->second) return false;
+    using Backend = fastllm::TP2MlpReduction::Backend;
+    Backend backend = g_tp2WHT6AllReduce ? Backend::WHT6 : Backend::Nccl;
+    fastllm::TP2MlpReduction reduction(rankIt->second, backend, commIt->second,
+        g_ncclSubmitRendezvous.get(), g_tp2WHT6AllReduce.get());
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    cudaError_t captureState = cudaStreamIsCapturing(cudaStreamPerThread, &capture);
+    if (captureState != cudaSuccess) {
+        reduction.Abort("TP2 MLP stream capture query failed");
+        FastllmCudaSetThreadError();
+        throw std::runtime_error("TP2 MLP stream capture query failed");
+    }
+    if (capture != cudaStreamCaptureStatusNone) return false;
+    // Entries are created with the idle communicator, and never inserted by
+    // serving threads. Each device has exactly one TP worker and pipeline.
+    auto pipelineIt = g_tp2MlpPipelines.find(deviceId);
+    if (pipelineIt == g_tp2MlpPipelines.end()) return false;
+    auto *pipeline = pipelineIt->second.get();
+    auto require = [&](cudaError_t status) {
+        if (status != cudaSuccess) {
+            reduction.Abort(cudaGetErrorString(status));
+            FastllmCudaSetThreadError();
+            throw std::runtime_error(std::string("TP2 MLP overlap: ") + cudaGetErrorString(status));
+        }
+    };
+    if (!pipeline->Matches(2048, 5120, 8704)) {
+        // Drain earlier compute-stream collectives before the first raw CUDA
+        // allocation. The steady-state path only uses the preallocated storage.
+        require(cudaStreamSynchronize(cudaStreamPerThread));
+        require(pipeline->Init(2048, 5120, 8704));
+        std::printf("[Fastllm] TP2 MLP overlap active on GPU %d: 2048 tokens -> 4 x 512, cuBLAS + %s.\n",
+                    deviceId, reduction.Name());
+        std::fflush(stdout);
+    }
+    if (!FastllmCudaDequantFp8MarlinForCublas(gateUp, pipeline->GateUpWeight()) ||
+        !FastllmCudaDequantFp8MarlinForCublas(down, pipeline->DownWeight())) {
+        require(cudaErrorInvalidValue);
+    }
+    require(cudaGetLastError());
+    require(pipeline->Run(static_cast<const half *>(input.cudaData),
+        static_cast<half *>(residual.cudaData), getFastllmCublasHandle(),
+        reduction, cudaStreamPerThread));
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool FastllmCanUseTP2P2PAllReduceAdd(int count, int dataType, int deviceId) {
     return FastllmCanUseTP2P2PAllReduceAddImpl(
         count, dataType, deviceId, nullptr);
@@ -3359,51 +3724,22 @@ bool FastllmTryTP2P2PAllReduceAdd(void* data, void* dest, int count,
         1, std::memory_order_relaxed) + 1;
     cudaSetDevice(deviceId);
     cudaStream_t stream = cudaStreamPerThread;
-    const void *peerData = nullptr;
-    if (FastllmTP2P2PHostPointerExchangeEnabled()) {
-        peerData = FastllmTP2P2PExchangeHostPointer(
-            state, rank, sequence, data);
-    }
+    const void *peerData = FastllmTP2P2PExchangeHostPointer(state, rank, sequence, data);
     if (dataType == fastllm::DataType::FLOAT16) {
-        if (peerData != nullptr) {
-            FastllmLaunchTP2P2PReduceAddKnownPeer(
-                (half*)dest, (const half*)dest, (const half*)data,
-                (const half*)peerData, count,
-                state.signals[rank], state.signals[1 - rank],
-                rank, sequence, stream);
-        } else {
-            FastllmLaunchTP2P2PReduceAddDirect(
-                (half*)dest, (const half*)dest, (const half*)data, count,
-                state.signals[rank], state.signals[1 - rank],
-                rank, sequence, stream);
-        }
+        FastllmLaunchTP2P2PReduceAddKnownPeer(
+            (half*)dest, (const half*)dest, (const half*)data,
+            (const half*)peerData, count, state.signals[rank], state.signals[1 - rank],
+            rank, sequence, stream);
     } else if (dataType == fastllm::DataType::BFLOAT16) {
-        if (peerData != nullptr) {
-            FastllmLaunchTP2P2PReduceAddKnownPeer(
-                (__nv_bfloat16*)dest, (const __nv_bfloat16*)dest,
-                (const __nv_bfloat16*)data, (const __nv_bfloat16*)peerData,
-                count, state.signals[rank], state.signals[1 - rank],
-                rank, sequence, stream);
-        } else {
-            FastllmLaunchTP2P2PReduceAddDirect(
-                (__nv_bfloat16*)dest, (const __nv_bfloat16*)dest,
-                (const __nv_bfloat16*)data, count,
-                state.signals[rank], state.signals[1 - rank],
-                rank, sequence, stream);
-        }
+        FastllmLaunchTP2P2PReduceAddKnownPeer(
+            (__nv_bfloat16*)dest, (const __nv_bfloat16*)dest,
+            (const __nv_bfloat16*)data, (const __nv_bfloat16*)peerData,
+            count, state.signals[rank], state.signals[1 - rank], rank, sequence, stream);
     } else {
-        if (peerData != nullptr) {
-            FastllmLaunchTP2P2PReduceAddKnownPeer(
-                (float*)dest, (const float*)dest, (const float*)data,
-                (const float*)peerData, count,
-                state.signals[rank], state.signals[1 - rank],
-                rank, sequence, stream);
-        } else {
-            FastllmLaunchTP2P2PReduceAddDirect(
-                (float*)dest, (const float*)dest, (const float*)data, count,
-                state.signals[rank], state.signals[1 - rank],
-                rank, sequence, stream);
-        }
+        FastllmLaunchTP2P2PReduceAddKnownPeer(
+            (float*)dest, (const float*)dest, (const float*)data,
+            (const float*)peerData, count, state.signals[rank], state.signals[1 - rank],
+            rank, sequence, stream);
     }
     cudaError_t result = cudaGetLastError();
     if (result != cudaSuccess) {
@@ -3541,13 +3877,46 @@ void FastllmNcclBroadcastFrom(void* send, void* recv, int count, int dataType, i
         return;
     }
 
+    // Eager ranks must finish preparing and submitting the same collective
+    // before one enters a new cuBLAS kernel/module. Otherwise lazy CUDA driver
+    // initialization can block the rank whose broadcast is still missing.
+    // The loading/warmup path keeps its existing GPU sync; graph capture must
+    // not participate in a host rendezvous.
+    auto *rendezvous = FastllmCudaGetNcclForceSync() ? nullptr : g_ncclSubmitRendezvous.get();
+    int rank = -1;
+    if (rendezvous != nullptr) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        cudaError_t state = cudaStreamIsCapturing(stream, &capture);
+        if (state != cudaSuccess) {
+            rendezvous->Abort("Broadcast stream capture query failed");
+            cudaGetLastError();
+            FastllmCudaSetThreadError();
+            return;
+        }
+        if (capture != cudaStreamCaptureStatusNone) rendezvous = nullptr;
+        else {
+            auto it = g_ncclRanks.find(deviceId);
+            if (it != g_ncclRanks.end()) rank = it->second;
+        }
+    }
+    auto waitForRanks = [&](fastllm::NcclSubmitRendezvous::Phase phase) {
+        if (rendezvous == nullptr || rendezvous->Wait(rank, phase, count, dataType)) return true;
+        printf("Error: Broadcast submission on device %d: %s\n",
+               deviceId, rendezvous->Error().c_str());
+        FastllmCudaSetThreadError();
+        return false;
+    };
+    if (!waitForRanks(fastllm::NcclSubmitRendezvous::Before)) return;
+    FastllmCudaGraphRecordCollective();
     ncclResult_t res = ncclBroadcast(send, recv, count, ncclType, rootRank, comm, stream);
     
     if (res != ncclSuccess) {
+        if (rendezvous != nullptr) rendezvous->Abort("ncclBroadcast submission failed");
         printf("Error: ncclBroadcast failed on device %d: %s\n", deviceId, ncclGetErrorString(res));
         FastllmCudaSetThreadError();
         return;
     }
+    if (!waitForRanks(fastllm::NcclSubmitRendezvous::After)) return;
     // 发射后立即同步：保证返回时集合通信已完成，不残留在途通信。无 P2P 的多卡(经 PCIe/SHM)下，
     // 若集合通信在途时另一线程触发真实 cudaMalloc(持 CUDA 驱动锁并隐式同步)，会与 NCCL 主机 proxy
     // 争用驱动锁形成跨 rank 死锁。同步发射可彻底消除该竞态。
@@ -3565,7 +3934,7 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
 // 功能：将所有卡上的 data 数据进行 Sum 求和，结果保存在 dest 中 (支持 in-place，即 data == dest)
 static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
                                     int dataType, int deviceId,
-                                    bool allowCustomAllReduce) {
+                                    bool allowCustomAllReduce, int hostSpinMicroseconds = 0) {
     if (data == nullptr || dest == nullptr || count <= 0) {
         return;
     }
@@ -3654,7 +4023,8 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
         }
     }
     auto waitForRanks = [&](fastllm::NcclSubmitRendezvous::Phase phase) {
-        if (rendezvous == nullptr || rendezvous->Wait(rank, phase, count, dataType)) {
+        if (rendezvous == nullptr || rendezvous->Wait(rank, phase, count, dataType,
+                std::chrono::microseconds(hostSpinMicroseconds))) {
             return true;
         }
         printf("Error: AllReduce submission on device %d: %s\n",
@@ -3670,6 +4040,7 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
         return;
     }
     // 注意：ncclAllReduce 发射是异步的
+    FastllmCudaGraphRecordCollective();
     ncclResult_t res = ncclAllReduce(data, dest, count, ncclType, ncclSum, comm, stream);
     
     if (res != ncclSuccess) {
@@ -3700,6 +4071,11 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count,
                                   int dataType, int deviceId) {
     FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, false);
+}
+
+void FastllmNcclAllReduceNoCustomWithSpin(void* data, void* dest, int count,
+                                       int dataType, int deviceId, int hostSpinMicroseconds) {
+    FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, false, hostSpinMicroseconds);
 }
 
 bool FastllmNcclAllGather(const void* data, void* dest, int count,
@@ -3739,6 +4115,7 @@ bool FastllmNcclAllGather(const void* data, void* dest, int count,
         return false;
     }
     const cudaStream_t stream = cudaStreamPerThread;
+    FastllmCudaGraphRecordCollective();
     const ncclResult_t result = ncclAllGather(data, dest, count, type, comm, stream);
     if (result != ncclSuccess) {
         printf("Error: ncclAllGather failed on device %d: %s\n",
@@ -3749,6 +4126,52 @@ bool FastllmNcclAllGather(const void* data, void* dest, int count,
     if (FastllmNcclPostSyncEnabled(stream)) {
         const cudaError_t state = cudaStreamSynchronize(stream);
         checkCudaErrors("Error: CUDA error when synchronizing NCCL allgather!", state);
+        return state == cudaSuccess;
+    }
+    return true;
+#endif
+}
+
+bool FastllmNcclReduceScatter(const void* data, void* dest, int count,
+                             int dataType, int deviceId) {
+#ifndef FASTLLM_USE_NCCL
+    const size_t typeBytes = FastllmNcclDataTypeBytes(dataType);
+    if (!data || !dest || count <= 0 || !typeBytes ||
+        !g_ncclInitialized || g_ncclRanks.find(deviceId) == g_ncclRanks.end()) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    const size_t bytes = static_cast<size_t>(count) * typeBytes;
+    // Reduce each contiguous receive slice to its communicator rank. Each
+    // participant enters the same sequence of mapped/staged collectives.
+    for (int rootRank = 0; rootRank < g_ncclWorldSize; ++rootRank) {
+        const auto *slice = static_cast<const uint8_t *>(data) + rootRank * bytes;
+        if (!FastllmRunHostCollective(FastllmHostCollectiveKind::Reduce,
+                slice, dest, count, dataType, rootRank, deviceId)) {
+            return false;
+        }
+    }
+    return true;
+#else
+    ncclComm_t comm = FindNcclCommNoLog(deviceId);
+    ncclDataType_t type = ncclFloat;
+    if (data == nullptr || dest == nullptr || count <= 0 || comm == nullptr ||
+        !FastllmNcclResolveDataType(dataType, type, "ReduceScatter")) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    const cudaStream_t stream = cudaStreamPerThread;
+    FastllmCudaGraphRecordCollective();
+    const ncclResult_t result = ncclReduceScatter(data, dest, count, type, ncclSum, comm, stream);
+    if (result != ncclSuccess) {
+        printf("Error: ncclReduceScatter failed on device %d: %s\n",
+               deviceId, ncclGetErrorString(result));
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    if (FastllmNcclPostSyncEnabled(stream)) {
+        const cudaError_t state = cudaStreamSynchronize(stream);
+        checkCudaErrors("Error: CUDA error when synchronizing NCCL reduce-scatter!", state);
         return state == cudaSuccess;
     }
     return true;
@@ -3814,6 +4237,7 @@ void FastllmNcclReduce(void* data, void* dest, int count, int dataType, int root
     }
 
     cudaStream_t stream = cudaStreamPerThread;
+    FastllmCudaGraphRecordCollective();
     ncclResult_t res = ncclReduce(data, dest, count, ncclType, ncclSum, rootRank, comm, stream);
     if (res != ncclSuccess) {
         printf("Error: ncclReduce failed on device %d: %s\n", deviceId, ncclGetErrorString(res));

@@ -1,11 +1,12 @@
 import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import types
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from unittest.mock import MagicMock, patch
 
 
@@ -19,6 +20,17 @@ from fastllm_pytools.util import make_normal_llm_model, make_normal_parser
 
 
 class SpeculativeDraftCliAliasesTest(unittest.TestCase):
+    def test_mtp_confidence_is_optional_and_validates_probability(self):
+        parser = make_normal_parser("test")
+        self.assertIsNone(parser.parse_args([]).mtp_min_p)
+        for flag in ("--mtp_min_p", "--mtp-min-p"):
+            for value in ("0", "0.5", "1"):
+                self.assertEqual(parser.parse_args([flag, value]).mtp_min_p, float(value))
+            for value in ("-0.1", "1.1", "nan", "inf", "invalid"):
+                with self.subTest(flag=flag, value=value), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args([flag, value])
+
     def configure_without_target(self, argv):
         args = make_normal_parser("test").parse_args(argv)
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as error:
@@ -146,14 +158,15 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                 "FASTLLM_DFLASH_MODEL_PATH": "/stale/dflash",
                 "FASTLLM_DFLASH_BLOCK_SIZE": "8",
             }
-            with patch.dict(os.environ, stale_speculative_env, clear=True):
-                args = self.configure_without_target(["--draft", draft_path])
-                self.assertEqual(args.speculative_algorithm, "mtp")
-                self.assertEqual(args.mtp, 5)
-                self.assertEqual(args.speculative_draft_model_path,
-                                 os.path.abspath(draft_path))
-                for env_name in stale_speculative_env:
-                    self.assertNotIn(env_name, os.environ)
+            for options in ([], ["--auto"]):
+                with self.subTest(options=options), patch.dict(os.environ, stale_speculative_env, clear=True):
+                    args = self.configure_without_target(["--draft", draft_path, *options])
+                    self.assertEqual(args.speculative_algorithm, "mtp")
+                    self.assertEqual(args.mtp, 5)
+                    self.assertEqual(args.speculative_draft_model_path,
+                                     os.path.abspath(draft_path))
+                    for env_name in stale_speculative_env:
+                        self.assertNotIn(env_name, os.environ)
 
     def test_mtp_file_is_auto_detected_and_uses_draft_tokens(self):
         with tempfile.TemporaryDirectory() as draft_path:
@@ -179,6 +192,39 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different MTP draft counts"):
                 make_normal_llm_model(args)
 
+    def test_qwen4_mtp_gguf_without_adjacent_config(self):
+        def string(value):
+            data = value.encode()
+            return struct.pack("<Q", len(data)) + data
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "mtp.gguf")
+            def write(architecture, name):
+                with open(path, "wb") as file:
+                    file.write(b"GGUF" + struct.pack("<IQQ", 3, 1, 1))
+                    file.write(string("general.architecture") + struct.pack("<I", 8) + string(architecture))
+                    file.write(string(name) + struct.pack("<IQQIQ", 2, 256, 256, 1, 0))
+            write("qwen4exp-mtp", "mtp.fc_hidden.weight")
+            for options, expected in [
+                ([], 5),
+                (["--mtp", "3"], 3),
+                (["--auto"], 3),
+                (["--auto", "--mtp", "5"], 5),
+                (["--auto", "--draft_tokens", "7"], 7),
+            ]:
+                with self.subTest(options=options), patch.dict(os.environ, {}, clear=True):
+                    args = self.configure_without_target(["--draft", path, *options])
+                    self.assertEqual(args.speculative_algorithm, "mtp")
+                    self.assertEqual(args.mtp, expected)
+                    self.assertEqual(args.speculative_draft_model_path, path)
+            for architecture, name, message in [
+                ("qwen4exp", "mtp.fc_hidden.weight", "qwen4exp-mtp architecture"),
+                ("qwen4exp-mtp", "output.weight", "only mtp"),
+            ]:
+                write(architecture, name)
+                args = make_normal_parser("test").parse_args(["--draft", path, "--mtp", "3"])
+                with self.assertRaisesRegex(ValueError, message):
+                    make_normal_llm_model(args)
+
     def test_external_mtp_requires_qwen35_config(self):
         with tempfile.TemporaryDirectory() as draft_path:
             self.write_draft_config(draft_path, {
@@ -192,6 +238,55 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
             ])
             with self.assertRaisesRegex(ValueError,
                                         "must be Qwen3.5"):
+                make_normal_llm_model(args)
+
+    def test_glm53_embedded_mtp_reaches_model_loader(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            self.write_draft_config(model_path, {
+                "architectures": ["Glm5NextForConditionalGeneration"],
+                "model_type": "glm5_next",
+                "text_config": {"model_type": "glm5_next_text", "num_nextn_predict_layers": 1},
+            })
+            for options, expected in [
+                (["--mtp", "3"], 3),
+                (["--mtp", "3", "--mtp_min_p", "0.5"], 3),
+                (["--mtp", "3", "--mtp-min-p", "0"], 3),
+                (["--speculative_algorithm", "mtp", "--draft_tokens", "5"], 5),
+                (["--speculative_algorithm", "off", "--mtp", "3"], 0),
+            ]:
+                with self.subTest(options=options):
+                    args = make_normal_parser("test").parse_args([
+                        model_path, "--device", "cuda", "--moe_device", "numa", *options,
+                    ])
+                    fake_model = MagicMock()
+                    fake_model.get_max_input_len.return_value = 4096
+                    fake_model.get_max_batch.return_value = 1
+                    fake_ftllm = types.ModuleType("ftllm")
+                    fake_ftllm.llm = MagicMock()
+                    fake_ftllm.llm.model.return_value = fake_model
+                    with patch.dict(os.environ, {}, clear=True), \
+                            patch.dict(sys.modules, {"ftllm": fake_ftllm}), \
+                            redirect_stdout(io.StringIO()):
+                        self.assertIs(make_normal_llm_model(args), fake_model)
+                        self.assertEqual(os.environ["FASTLLM_GLM5_NEXT_ENABLE_MTP"], str(expected))
+                        self.assertEqual(args.mtp, expected)
+                        if args.mtp_min_p is not None:
+                            self.assertEqual(os.environ["FASTLLM_GLM5_NEXT_MTP_MIN_P"], str(args.mtp_min_p))
+                            self.assertNotIn("FASTLLM_QWEN4_MTP_MIN_P", os.environ)
+                        self.assertEqual(fake_ftllm.llm.model.call_args.kwargs["external_mtp_path"], "")
+
+    def test_glm53_mtp_rejects_external_draft(self):
+        with tempfile.TemporaryDirectory() as model_path, tempfile.TemporaryDirectory() as draft_path:
+            self.write_draft_config(model_path, {
+                "architectures": ["Glm5NextForConditionalGeneration"],
+                "model_type": "glm5_next",
+            })
+            self.write_mtp_checkpoint(draft_path)
+            args = make_normal_parser("test").parse_args([
+                model_path, "--mtp", "3", "--draft", draft_path,
+            ])
+            with patch.dict(os.environ, {}, clear=True), \
+                    self.assertRaisesRegex(ValueError, "GLM-5.3 MTP uses the checkpoint's embedded"):
                 make_normal_llm_model(args)
 
     def test_deepseek_v4_mtp_uses_embedded_dspark(self):
@@ -229,6 +324,61 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                               output.getvalue())
                 self.assertEqual(
                     fake_llm.model.call_args.kwargs["external_mtp_path"], "")
+
+    def test_naive_external_dspark_accepts_full_anchor_first_block(self):
+        with tempfile.TemporaryDirectory() as model_path, tempfile.TemporaryDirectory() as draft_path:
+            self.write_draft_config(model_path, {
+                "architectures": ["NaiveN05FlashForCausalLM"],
+                "model_type": "naive_n05_flash",
+            })
+            self.write_draft_config(draft_path, {
+                "architectures": ["DSparkDraftModel"], "block_size": 7,
+            })
+            args = make_normal_parser("test").parse_args([
+                model_path, "--device", "cuda", "--moe_device", "numa",
+                "--draft", draft_path, "--draft_tokens", "7", "-t", "4",
+            ])
+            fake_model = MagicMock()
+            fake_model.get_max_input_len.return_value = 4096
+            fake_model.get_max_batch.return_value = 1
+            fake_ftllm = types.ModuleType("ftllm")
+            fake_ftllm.llm = MagicMock()
+            fake_ftllm.llm.model.return_value = fake_model
+            with patch.dict(os.environ, {}, clear=True), \
+                    patch.dict(sys.modules, {"ftllm": fake_ftllm}), redirect_stdout(io.StringIO()):
+                self.assertIs(make_normal_llm_model(args), fake_model)
+                self.assertEqual(args.speculative_algorithm, "dspark")
+                self.assertEqual(os.environ["FASTLLM_DSPARK_MODEL_PATH"], draft_path)
+                self.assertEqual(os.environ["FASTLLM_DSPARK_TOKENS"], "7")
+
+    def test_deepseek_v41_dspark_accepts_shorter_and_longer_blocks(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            self.write_draft_config(model_path, {
+                "architectures": ["DeepseekV41ForCausalLM"],
+                "model_type": "deepseek_v41",
+                "text_config": {
+                    "dspark_block_size": 5,
+                    "dspark_target_layer_ids": [40, 41, 42],
+                    "dspark_noise_token_id": 128799,
+                },
+            })
+            for tokens in (3, 5, 7):
+                with self.subTest(tokens=tokens):
+                    args = make_normal_parser("test").parse_args([
+                        model_path, "--device", "cuda", "--dspark", str(tokens),
+                    ])
+                    fake_model = MagicMock()
+                    fake_model.get_max_input_len.return_value = 4096
+                    fake_model.get_max_batch.return_value = 1
+                    fake_ftllm = types.ModuleType("ftllm")
+                    fake_ftllm.llm = MagicMock()
+                    fake_ftllm.llm.model.return_value = fake_model
+                    with patch.dict(os.environ, {}, clear=True), \
+                            patch.dict(sys.modules, {"ftllm": fake_ftllm}), \
+                            redirect_stdout(io.StringIO()):
+                        self.assertIs(make_normal_llm_model(args), fake_model)
+                        self.assertEqual(os.environ["FASTLLM_DSPARK_TOKENS"], str(tokens))
+                        self.assertEqual(args.speculative_algorithm, "dspark")
 
     def test_deepseek_v4_mtp_rejects_shorter_than_trained_block(self):
         with tempfile.TemporaryDirectory() as model_path:

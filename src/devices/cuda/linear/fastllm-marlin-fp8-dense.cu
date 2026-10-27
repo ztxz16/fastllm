@@ -13,7 +13,11 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <map>
+#include <set>
 
 #define MARLIN_NAMESPACE_NAME fastllm_marlin_dense_fp8
 #include "marlin_dense_fp8/kernel.h"
@@ -151,13 +155,46 @@ static KernelFn PickKernel(int sizeM, int threadK, int threadN, int groupBlocks,
 #undef RET_K
 #undef RET_K_STAGES
 
-// Explicit FE2M1 + special FE4M3 scale, group16 (group_blocks=1).  vLLM uses
-// stages=2 on SM75 and stages=4 on every newer architecture.
-#define RET_FP4(STAGES, THREADS, TM, TN, TK, M8)                               \
-    return MARLIN_NAMESPACE_NAME::Marlin<                                     \
-        vllm::kFloat16.id(), vllm::kFE2M1f.id(), vllm::kFloat16.id(),        \
-        vllm::kFE4M3fn.id(), (THREADS), (TM), (TN), (TK), (M8),              \
-        (STAGES), 1, false>
+// BF16 activations and E4M3 weights with exact E8M0 block-32 scales.
+// Keep the existing FP16/group-128 kernels and dispatch unchanged.
+static KernelFn PickBf16Mxfp8Kernel(int rows, int tile) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    // Do not instantiate BF16 MMA for Turing device images. The host-side
+    // architecture guard keeps these calls on the ordinary CUDA fallback.
+    return nullptr;
+#else
+#define MXFP8(TM, M8, TN, TK) \
+    return MARLIN_NAMESPACE_NAME::Marlin< \
+        vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), vllm::kBFloat16.id(), \
+        vllm::kFE8M0fnu.id(), 128, TM, TN, TK, M8, 4, 2, false>
+    if (tile == 1) {
+        if (rows <= 8) MXFP8(1, true, 4, 8);
+        if (rows <= 16) MXFP8(1, false, 4, 8);
+        if (rows <= 32) MXFP8(2, false, 4, 8);
+        if (rows <= 48) MXFP8(3, false, 4, 8);
+        MXFP8(4, false, 4, 8);
+    }
+    if (rows <= 8) MXFP8(1, true, 8, 4);
+    if (rows <= 16) MXFP8(1, false, 8, 4);
+    if (rows <= 32) MXFP8(2, false, 8, 4);
+    if (rows <= 48) MXFP8(3, false, 8, 4);
+    MXFP8(4, false, 8, 4);
+#undef MXFP8
+#endif
+}
+
+// Explicit FE2M1 + special FE4M3 scale, group16 (group_blocks=1).
+// Only SM75 selects stages=2; newer architectures select stages=4.
+// The SM75 64x256x64 prefill tile specializes the fixed dense reduction
+// flags to remove unused bias/atomic paths and register spills. Bias
+// remains in the outer epilogue. Small-M and SM80+ keep their pipeline.
+#define RET_FP4(STAGES, THREADS, TM, TN, TK, M8)                            \
+    return MARLIN_NAMESPACE_NAME::Marlin<                                   \
+        vllm::kFloat16.id(), vllm::kFE2M1f.id(), vllm::kFloat16.id(),       \
+        vllm::kFE4M3fn.id(), (THREADS), (TM), (TN), (TK), (M8),             \
+        (STAGES), 1, false,                                                 \
+        ((STAGES) == 2 && (THREADS) == 256 && (TM) == 4 &&                  \
+         (TN) == 16 && (TK) == 4 && !(M8))>
 #define RET_FP4_FOR_ARCH(THREADS, TM, TN, TK, M8)                             \
     do {                                                                      \
         if (stages == 2) RET_FP4(2, THREADS, TM, TN, TK, M8);                \
@@ -173,6 +210,25 @@ static KernelFn PickFp4Kernel(int sizeM, int threadK, int threadN,
     const bool useM8 = m8 || sizeM <= 8;
 
     if (useM8) {
+        // These dense calls always have no bias/atomics and use FP32 reduction.
+        // Specialize those fixed flags without changing the tile, weight layout,
+        // or scratch requirements. Keep other architectures on their old path.
+        if (stages == 4 && DeviceArch() == 120) {
+#define RET_FP4_DENSE(THREADS, TN, TK) \
+            return MARLIN_NAMESPACE_NAME::Marlin< \
+                vllm::kFloat16.id(), vllm::kFE2M1f.id(), vllm::kFloat16.id(), \
+                vllm::kFE4M3fn.id(), THREADS, 1, TN, TK, true, 4, 1, false, true>
+            if (threadK == 128 && threadN == 128) {
+                threads = 256; RET_FP4_DENSE(256, 8, 8);
+            }
+            if (threadK == 64 && threadN == 128) {
+                threads = 128; RET_FP4_DENSE(128, 8, 4);
+            }
+            if (threadK == 128 && threadN == 64) {
+                threads = 128; RET_FP4_DENSE(128, 4, 8);
+            }
+#undef RET_FP4_DENSE
+        }
         if (threadK == 128 && threadN == 128) {
             threads = 256;
             RET_FP4_FOR_ARCH(256, 1, 8, 8, true);
@@ -217,6 +273,34 @@ static KernelFn PickFp4Kernel(int sizeM, int threadK, int threadN,
     }
     return nullptr;
 }
+// Only instantiate the m<=8 residual variants. The original kernel table
+// and its prefill / non-residual dispatch remain unchanged.
+static KernelFn PickFp4AddKernel(int threadK, int threadN, int stages, int &threads) {
+#define ADD_KERNEL(STAGES, THREADS, TN, TK) \
+    MARLIN_NAMESPACE_NAME::Marlin<vllm::kFloat16.id(), vllm::kFE2M1f.id(), \
+        vllm::kFloat16.id(), vllm::kFE4M3fn.id(), THREADS, 1, TN, TK, true, \
+        STAGES, 1, false, true, true>
+#define PICK_ADD(THREADS, TN, TK) \
+    do { threads = THREADS; return stages == 2 ? ADD_KERNEL(2, THREADS, TN, TK) \
+                                              : ADD_KERNEL(4, THREADS, TN, TK); } while (0)
+    if (stages != 2 && stages != 4) return nullptr;
+    if (threadK == 128 && threadN == 128) PICK_ADD(256, 8, 8);
+    if (threadK == 64 && threadN == 128) PICK_ADD(128, 8, 4);
+    if (threadK == 128 && threadN == 64) PICK_ADD(128, 4, 8);
+    return nullptr;
+#undef PICK_ADD
+#undef ADD_KERNEL
+}
+
+static KernelFn PickFp4SwigluKernel(int stages) {
+#define FP4_SWIGLU(STAGES) \
+    MARLIN_NAMESPACE_NAME::Marlin<vllm::kFloat16.id(), vllm::kFE2M1f.id(), \
+        vllm::kFloat16.id(), vllm::kFE4M3fn.id(), 256, 1, 8, 8, true, \
+        STAGES, 1, false, true, false, true>
+    return stages == 2 ? FP4_SWIGLU(2) : FP4_SWIGLU(4);
+#undef FP4_SWIGLU
+}
+
 #undef RET_FP4_FOR_ARCH
 #undef RET_FP4
 
@@ -252,6 +336,21 @@ static bool SelectTile(int sizeM, int sizeN, int sizeK, int deviceArch,
 
 static bool SelectFp4Tile(int sizeM, int sizeN, int sizeK,
                           int &threadK, int &threadN) {
+    // A narrower N tile gives small-M matrices more independent output
+    // stripes and less cross-CTA reduction. Bound this policy to the tested
+    // SM120 shape range; wide matrices and other architectures keep their
+    // original priority. The limit scales with the device's SM count.
+    if (sizeM >= 1 && sizeM <= 8 && sizeN >= 2048 && sizeN % 64 == 0 &&
+        sizeK >= 1024 && sizeK <= 32768 && sizeK % 128 == 0 && DeviceArch() == 120) {
+        int device = 0, sms = 0;
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
+            sizeN / 64 <= sms) {
+            threadK = 128;
+            threadN = 64;
+            return true;
+        }
+    }
     static const int smallM[][2] = {{128, 128}, {64, 128}, {128, 64}};
     static const int largeM[][2] = {{64, 256}, {64, 128}, {128, 64}};
     const int (*configs)[2] = sizeM <= 16 ? smallM : largeM;
@@ -264,6 +363,75 @@ static bool SelectFp4Tile(int sizeM, int sizeN, int sizeK,
         }
     }
     return false;
+}
+
+// The original launch reserves all 64 KiB of SM75 shared memory for one
+// resident CTA. These measured M=1..8 shapes can use two resident CTAs without
+// changing the weight layout or growing the per-weight reduction scratch.
+// Enable tuning by default only for the measured 68-SM Turing device and
+// shapes. Other shapes, prefill, and architectures keep their dispatch;
+// FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE=0 restores the untuned launch.
+static int Sm75Nvfp4DecodeTuneMode() {
+    static const int mode = []() {
+        const char *value = std::getenv("FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE");
+        if (value == nullptr) return 3;
+        if (!std::strcmp(value, "1")) return 3;
+        if (!std::strcmp(value, "linear")) return 1;
+        if (!std::strcmp(value, "swiglu")) return 2;
+        return 0;
+    }();
+    return mode;
+}
+
+static bool Sm75Nvfp4DecodeTuneShape(int sizeM, int sizeN, int sizeK, bool swiglu) {
+    if (sizeM < 1 || sizeM > 8 ||
+        !(Sm75Nvfp4DecodeTuneMode() & (swiglu ? 2 : 1))) return false;
+    return swiglu ? sizeN == 17408 && sizeK == 5120 :
+        sizeN == 5120 && (sizeK == 3072 || sizeK == 8704);
+}
+
+static bool TuneSm75Nvfp4DecodeLaunch(
+        int device, int arch, int sizeM, int sizeN, int sizeK,
+        int sms, bool swiglu, KernelFn &kernel, int &threads,
+        int &blocks, int &shared) {
+    if (arch != 75 || sms != 68 ||
+        !Sm75Nvfp4DecodeTuneShape(sizeM, sizeN, sizeK, swiglu)) return false;
+
+    int tunedThreads = threads;
+    KernelFn tunedKernel = swiglu ? kernel :
+        PickFp4Kernel(sizeM, 128, 64, true, 2, tunedThreads);
+    if (tunedKernel == nullptr) return false;
+    constexpr int tunedShared = 32 * 1024;
+    // The paired N128/K128 epilogue needs 22 KiB; the N64/K128 projection
+    // needs 13 KiB. 32 KiB admits two CTAs while retaining a safety margin.
+    // At two CTAs/SM, N<=128 uses at most the existing sms*8*256 FP32
+    // scratch elements and fewer than the existing sms*4 lock entries.
+    static thread_local std::map<std::pair<int, KernelFn>, int> residency;
+    const auto key = std::make_pair(device, tunedKernel);
+    auto it = residency.find(key);
+    if (it == residency.end()) {
+        int active = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active, tunedKernel, tunedThreads, tunedShared) != cudaSuccess) {
+            return false;
+        }
+        it = residency.emplace(key, active).first;
+    }
+    // Marlin uses inter-CTA spin barriers. Never launch more persistent
+    // CTAs than can be resident together on the device.
+    if (it->second < 2) return false;
+    kernel = tunedKernel;
+    threads = tunedThreads;
+    blocks = 2 * sms;
+    shared = tunedShared;
+    static thread_local std::set<std::pair<int, std::pair<int, int>>> reported;
+    if (reported.emplace(device, std::make_pair(sizeM, swiglu ? -sizeK : sizeK)).second) {
+        printf("[Fastllm] SM75 NVFP4 decode tuned GPU %d: M=%d N=%d K=%d "
+               "swiglu=%d blocks=%d threads=%d shared=%d.\n",
+               device, sizeM, sizeN, sizeK, swiglu ? 1 : 0,
+               blocks, threads, shared);
+    }
+    return true;
 }
 
 static bool PrepareKernels(int device) {
@@ -382,6 +550,13 @@ static CTmpBuf &GetCTmp(int device) {
 static bool EnsureCTmp(int device, size_t elems) {
     CTmpBuf &b = GetCTmp(device);
     if (b.device == device && b.ptr != nullptr && b.elems >= elems) return true;
+    // A captured graph keeps this address even when later eager prefills use
+    // larger M tiles. Reserve the largest reduction tile on first use so the
+    // cached buffer never moves underneath an existing FP8/NVFP4 graph.
+    int sms = 0;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) !=
+            cudaSuccess || sms <= 0) return false;
+    elems = std::max(elems, (size_t)sms * 64 * 256);
     int prev = -1;
     cudaGetDevice(&prev);
     if (prev != device) cudaSetDevice(device);
@@ -396,6 +571,23 @@ static bool EnsureCTmp(int device, size_t elems) {
 }
 
 }  // namespace
+
+extern "C" bool FastllmCudaMarlinNVFP4DecodeTuneEnabled(
+        int size_m, int size_n, int size_k, bool swiglu) {
+    if (!Sm75Nvfp4DecodeTuneShape(size_m, size_n, size_k, swiglu)) return false;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    static thread_local std::map<int, bool> devices;
+    auto it = devices.find(device);
+    if (it == devices.end()) {
+        int arch = 0, sms = 0;
+        bool supported = DeviceOk(&arch) && arch == 75 &&
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
+            sms == 68;
+        it = devices.emplace(device, supported).first;
+    }
+    return it->second;
+}
 
 extern "C" bool FastllmCudaMarlinNVFP4Supported(int size_n, int size_k) {
     if (!DeviceOk() || size_n <= 0 || size_k <= 0 ||
@@ -483,6 +675,54 @@ extern "C" bool FastllmCudaMarlinHalfFP8Gemm(
     return true;
 }
 
+extern "C" bool FastllmCudaMarlinBFloat16MXFP8Gemm(
+        const void *a, const uint32_t *weight, const uint8_t *scales,
+        void *c, int rows, int columns, int inner, int *workspace) {
+    int arch = 0;
+    if (!DeviceOk(&arch) || arch < 80 || rows <= 0 || columns <= 0 ||
+        inner <= 0 || columns % 64 || inner % 64 ||
+        (columns % 128 && inner % 128) || !a || !weight || !scales ||
+        !c || !workspace) return false;
+    int device = 0, sms = 0, shared = 0;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (sms <= 0 || shared <= 0 || !EnsureCTmp(device, (size_t)sms * 64 * 256))
+        return false;
+    const int tile = columns % 128 != 0 ? 1 : 0;
+    // Configure every tail specialization before entering a capture. A later
+    // prefill may have a different tail, but the captured scratch never moves.
+    static thread_local std::set<int> prepared;
+    if (!prepared.count(device)) {
+        cudaStreamCaptureStatus capture;
+        if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+            capture != cudaStreamCaptureStatusNone) return false;
+        for (int kind : {0, 1}) for (int m : {8, 16, 32, 48, 64}) {
+            if (cudaFuncSetAttribute(PickBf16Mxfp8Kernel(m, kind),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, shared) != cudaSuccess)
+                return false;
+        }
+        prepared.emplace(device);
+    }
+    for (int row = 0; row < rows;) {
+        int count = rows - row;
+        if (count >= 64) count = std::min(count / 64, 128) * 64;
+        const int chunkTile = tile;
+        KernelFn kernel = PickBf16Mxfp8Kernel(count, chunkTile);
+        kernel<<<sms, 128, shared, cudaStreamPerThread>>>(
+            reinterpret_cast<const int4 *>(static_cast<const uint16_t *>(a) + (size_t)row * inner),
+            reinterpret_cast<const int4 *>(weight),
+            reinterpret_cast<int4 *>(static_cast<uint16_t *>(c) + (size_t)row * columns),
+            reinterpret_cast<int4 *>(GetCTmp(device).ptr), nullptr, nullptr,
+            reinterpret_cast<const int4 *>(scales), nullptr, nullptr, nullptr,
+            inner / 32, count, columns, inner, inner, workspace,
+            false, false, true, shared);
+        if (cudaPeekAtLastError() != cudaSuccess) return false;
+        row += count;
+    }
+    return true;
+}
+
 extern "C" bool FastllmCudaMarlinHalfNVFP4Gemm(
         const void *a, const uint32_t *b_q_weight, const void *b_scales,
         const float *global_scale, void *c,
@@ -531,11 +771,19 @@ extern "C" bool FastllmCudaMarlinHalfNVFP4Gemm(
             chunkM, threadK, threadN, chunkM <= 8, stages, threads);
         if (kernel == nullptr) return false;
 
+        int blocks = sms;
+        int launchShared = maxShared;
+        if (size_m <= 8) {
+            TuneSm75Nvfp4DecodeLaunch(
+                device, arch, chunkM, size_n, size_k, sms, false,
+                kernel, threads, blocks, launchShared);
+        }
+
         const half *chunkA = reinterpret_cast<const half *>(a) +
                              (size_t)row * size_k;
         half *chunkC = reinterpret_cast<half *>(c) +
                        (size_t)row * size_n;
-        kernel<<<sms, threads, maxShared, cudaStreamPerThread>>>(
+        kernel<<<blocks, threads, launchShared, cudaStreamPerThread>>>(
             reinterpret_cast<const int4 *>(chunkA),
             reinterpret_cast<const int4 *>(b_q_weight),
             reinterpret_cast<int4 *>(chunkC),
@@ -545,11 +793,119 @@ extern "C" bool FastllmCudaMarlinHalfNVFP4Gemm(
             nullptr, nullptr,
             numGroups, chunkM, size_n, size_k, size_k, workspace,
             /*has_bias=*/false, /*use_atomic_add=*/false,
-            /*use_fp32_reduce=*/true, maxShared);
+            /*use_fp32_reduce=*/true, launchShared);
         if (cudaPeekAtLastError() != cudaSuccess) return false;
 
         row += chunkM;
         remaining -= chunkM;
     }
+    return true;
+}
+
+extern "C" bool FastllmCudaMarlinNVFP4AddSupported(int size_n, int size_k) {
+    if (!DeviceOk() || size_n <= 0 || size_k <= 0 || size_n % 128 || size_k % 128)
+        return false;
+    int device = 0, maxShared = 0, threadK = 0, threadN = 0, threads = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        !SelectFp4Tile(8, size_n, size_k, threadK, threadN)) return false;
+    KernelFn kernel = PickFp4AddKernel(threadK, threadN, DeviceArch() == 75 ? 2 : 4, threads);
+    if (!kernel) return false;
+    static thread_local std::map<std::pair<int, KernelFn>, bool> ready;
+    const auto key = std::make_pair(device, kernel);
+    auto it = ready.find(key);
+    if (it != ready.end()) return it->second;
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) return false;
+    cudaFuncAttributes attr{};
+    bool ok = cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                     device) == cudaSuccess && maxShared > 0 &&
+        cudaFuncGetAttributes(&attr, kernel) == cudaSuccess && attr.maxThreadsPerBlock >= threads &&
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             maxShared) == cudaSuccess;
+    if (!ok) cudaGetLastError();
+    ready.emplace(key, ok);
+    return ok;
+}
+
+extern "C" bool FastllmCudaMarlinHalfNVFP4Add(
+        const void *a, const uint32_t *b_q_weight, const void *b_scales,
+        const float *global_scale, void *c, int size_m, int size_n, int size_k,
+        int *workspace, void *c_tmp) {
+    if (size_m < 2 || size_m > 8 || !a || !b_q_weight || !b_scales ||
+        !global_scale || !c || !workspace || !c_tmp ||
+        !FastllmCudaMarlinNVFP4AddSupported(size_n, size_k)) return false;
+    int device = 0, sms = 0, maxShared = 0, threadK = 0, threadN = 0, threads = 0;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (sms <= 0 || maxShared <= 0 ||
+        !SelectFp4Tile(size_m, size_n, size_k, threadK, threadN)) return false;
+    KernelFn kernel = PickFp4AddKernel(threadK, threadN, DeviceArch() == 75 ? 2 : 4, threads);
+    if (!kernel) return false;
+    kernel<<<sms, threads, maxShared, cudaStreamPerThread>>>(
+        reinterpret_cast<const int4*>(a), reinterpret_cast<const int4*>(b_q_weight),
+        reinterpret_cast<int4*>(c), reinterpret_cast<int4*>(c_tmp), nullptr, nullptr,
+        reinterpret_cast<const int4*>(b_scales), global_scale, nullptr, nullptr,
+        size_k / 16, size_m, size_n, size_k, size_k, workspace,
+        false, false, true, maxShared);
+    // After a launch, failures are errors: never retry by adding residual twice.
+    if (cudaGetLastError() != cudaSuccess) throw "NVFP4 residual GEMM launch failed";
+    return true;
+}
+
+extern "C" bool FastllmCudaMarlinNVFP4SwigluSupported(int size_n, int size_k) {
+    const int arch = DeviceArch();
+    if (!DeviceOk() || (arch != 75 && arch != 120) || size_n < 256 || size_n % 256 ||
+        size_k < 128 || size_k % 128) return false;
+    // Pair gate/up tiles only in the measured wide-matrix range on SM120.
+    // Small matrices keep their existing narrow tile and separate activation.
+    if (arch == 120 && (size_n < 16384 || size_n > 65536 ||
+                       size_k < 4096 || size_k > 32768)) return false;
+    int device = 0, maxShared = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    static thread_local std::map<int, bool> ready;
+    auto it = ready.find(device);
+    if (it != ready.end()) return it->second;
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) return false;
+    cudaFuncAttributes attr{};
+    KernelFn kernel = PickFp4SwigluKernel(DeviceArch() == 75 ? 2 : 4);
+    bool ok = cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                     device) == cudaSuccess && maxShared > 0 &&
+        cudaFuncGetAttributes(&attr, kernel) == cudaSuccess && attr.maxThreadsPerBlock >= 256 &&
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, maxShared) == cudaSuccess;
+    if (!ok) cudaGetLastError();
+    ready.emplace(device, ok);
+    return ok;
+}
+
+extern "C" bool FastllmCudaMarlinHalfNVFP4Swiglu(
+        const void *a, const uint32_t *b_q_weight, const void *b_scales,
+        const float *global_scale, void *c, int size_m, int size_n, int size_k,
+        int *workspace, void *c_tmp) {
+    if (size_m < 1 || size_m > 8 ||
+        (size_m == 1 && !FastllmCudaMarlinNVFP4DecodeTuneEnabled(1, size_n, size_k, true)) ||
+        !a || !b_q_weight || !b_scales ||
+        !global_scale || !c || !workspace || !c_tmp ||
+        !FastllmCudaMarlinNVFP4SwigluSupported(size_n, size_k)) return false;
+    int device = 0, sms = 0, maxShared = 0;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (sms <= 0 || maxShared <= 0) return false;
+    KernelFn kernel = PickFp4SwigluKernel(DeviceArch() == 75 ? 2 : 4);
+    int threads = 256, blocks = sms, launchShared = maxShared;
+    TuneSm75Nvfp4DecodeLaunch(
+        device, DeviceArch(), size_m, size_n, size_k, sms, true,
+        kernel, threads, blocks, launchShared);
+    kernel<<<blocks, threads, launchShared, cudaStreamPerThread>>>(
+        reinterpret_cast<const int4*>(a), reinterpret_cast<const int4*>(b_q_weight),
+        reinterpret_cast<int4*>(c), reinterpret_cast<int4*>(c_tmp), nullptr, nullptr,
+        reinterpret_cast<const int4*>(b_scales), global_scale, nullptr, nullptr,
+        size_k / 16, size_m, size_n, size_k, size_k, workspace,
+        false, false, true, launchShared);
+    if (cudaGetLastError() != cudaSuccess) throw "NVFP4 SwiGLU GEMM launch failed";
     return true;
 }

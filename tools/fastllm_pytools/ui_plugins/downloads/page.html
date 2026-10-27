@@ -3,10 +3,12 @@
               <div>
                 <span class="eyebrow">MODELSCOPE DOWNLOAD</span>
                 <h1>把模型下载到本机</h1>
-                <p>选择一个喜欢的模型，下载后即可创建启动项目。支持断点续传。</p>
+                <p>按模型簇选择官方权重、GSQ 量化或混合推理模型；选中卡片会自动填入下载范围。</p>
               </div>
               <button id="download-use-last" class="hero-secondary hidden" type="button">用于启动配置</button>
             </div>
+
+            <section id="download-catalog" class="download-catalog" aria-label="模型簇"></section>
 
             <div class="download-layout">
               <form id="download-form" class="download-card">
@@ -35,6 +37,11 @@
                       <span>保存目录 <b>*</b></span>
                       <input data-download-field="targetDir" data-path-input data-directories-only type="text" list="path-suggestions" placeholder="~/.cache/fastllm/modelscope/model-name" spellcheck="false">
                       <small>目录已存在时会校验缓存并继续未完成的下载。</small>
+                    </label>
+                    <label class="field span-2">
+                      <span>下载范围（可选）</span>
+                      <input data-download-field="include" type="text" placeholder="Q2_0/*,mmproj-*.gguf" spellcheck="false">
+                      <small>多个匹配规则用逗号分隔；留空下载整个仓库。GSQ 量化建议选择页面中的版本卡片。</small>
                     </label>
                     <label class="field">
                       <span>Revision</span>

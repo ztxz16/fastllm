@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -23,10 +24,12 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include "fastllm-custom-allreduce-tagged.cuh"
 
 namespace {
 
@@ -297,6 +300,76 @@ __device__ __forceinline__ void CustomArBarrierPublish(
     }
 }
 
+// Owned slices are never overwritten, so peers can copy them directly without
+// a staging buffer or arithmetic. Matching start/final barriers publish prior
+// writes and prevent the next operator from reusing a source before all reads.
+template <int Ranks, bool Flatten>
+__global__ __launch_bounds__(kCustomArThreads, 1)
+void FastllmCustomAllGatherInplaceKernel(CustomArRankData *rankData,
+        CustomArRankSignals allSignals, CustomArSignal *selfSignal,
+        uint4 *output, int rank, int part) {
+    CustomArRankData pointers = *rankData;
+    CustomArBarrierStart<Ranks>(allSignals, selfSignal, rank);
+    const int stride = gridDim.x * blockDim.x;
+    const int thread = blockIdx.x * blockDim.x + threadIdx.x;
+    if constexpr (Flatten) {
+        // Small messages have fewer than one CTA of payload per peer.
+        // Flattening (source, offset) pairs keeps every participating thread
+        // on one remote copy instead of serializing all peers through the few
+        // payload threads.
+        const int copies = part * (Ranks - 1);
+        for (int index = thread; index < copies; index += stride) {
+            int source = index / part;
+            const int offset = index - source * part;
+            if (source >= rank) ++source;
+            output[source * part + offset] =
+                reinterpret_cast<const uint4 *>(pointers.ptrs[source])[source * part + offset];
+        }
+    } else {
+        for (int offset = thread; offset < part; offset += stride) {
+#pragma unroll
+            for (int source = 0; source < Ranks; ++source)
+                if (source != rank)
+                    output[source * part + offset] =
+                        reinterpret_cast<const uint4 *>(pointers.ptrs[source])[source * part + offset];
+        }
+    }
+    CustomArBarrierFinal<Ranks>(allSignals, selfSignal, rank);
+}
+
+// A joint small-message collective: retain rank-ordered FP32 arithmetic and
+// gather each owner's already-rounded BF16 rows without doing arithmetic.
+// A packet belongs to the same CTA on every rank. Both results stay in
+// registers until all peers have finished reading that packet.
+template <int Ranks>
+__global__ __launch_bounds__(kCustomArThreads, 1)
+void FastllmCustomAllReduceAndGatherKernel(CustomArRankData *routedData,
+        CustomArRankData *sharedData, CustomArRankSignals allSignals,
+        CustomArSignal *selfSignal, float4 *routedOutput, uint2 *sharedOutput,
+        int rank, int packedCount) {
+    CustomArRankData routed = *routedData, shared = *sharedData;
+    CustomArBarrierStart<Ranks>(allSignals, selfSignal, rank);
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    float4 sum{};
+    uint2 value{};
+    if (index < packedCount) {
+        sum = reinterpret_cast<const float4 *>(routed.ptrs[0])[index];
+#pragma unroll
+        for (int peer = 1; peer < Ranks; ++peer) {
+            float4 x = reinterpret_cast<const float4 *>(routed.ptrs[peer])[index];
+            sum.x += x.x; sum.y += x.y; sum.z += x.z; sum.w += x.w;
+        }
+        const int owner = index / (packedCount / Ranks);
+        value = reinterpret_cast<const uint2 *>(shared.ptrs[owner])[index];
+    }
+    CustomArBarrierFinal<Ranks>(allSignals, selfSignal, rank);
+    __syncthreads();
+    if (index < packedCount) {
+        routedOutput[index] = sum;
+        sharedOutput[index] = value;
+    }
+}
+
 template <typename T, int Ranks>
 __global__ __launch_bounds__(kCustomArThreads, 1)
 void FastllmCustomAllReduceKernel(CustomArRankData *rankData,
@@ -412,6 +485,7 @@ void FastllmCustomAllReduceTwoStageKernel(
     // consumer threads.  The start barrier of the next collective also keeps
     // this shared scratch from being reused before every rank finishes gather.
     for (int offset = thread; offset < largestPart; offset += stride) {
+        P values[Ranks];
 #pragma unroll
         for (int source = 0; source < Ranks; ++source) {
             const int sourceCount = source == Ranks - 1
@@ -419,7 +493,19 @@ void FastllmCustomAllReduceTwoStageKernel(
             if (offset < sourceCount) {
                 const P *sourceScratch =
                     reinterpret_cast<const P *>(allScratch.scratch[source]);
-                packedOutput[source * part + offset] = sourceScratch[offset];
+                values[source] = sourceScratch[offset];
+            }
+        }
+        // Issue peer reads before their dependent output stores, allowing
+        // remote memory latency to overlap across ranks. This compiler fence
+        // does not replace the system-scope publication barrier above.
+        asm volatile("" ::: "memory");
+#pragma unroll
+        for (int source = 0; source < Ranks; ++source) {
+            const int sourceCount = source == Ranks - 1
+                ? packedCount - source * part : part;
+            if (offset < sourceCount) {
+                packedOutput[source * part + offset] = values[source];
             }
         }
     }
@@ -865,6 +951,258 @@ void FastllmCustomAllReducePushAddKernel(
     }
 }
 
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+// BF16 collective/residual rounding stays unchanged. Packed small-row RMSNorm
+// uses a 512-thread FP32 square-sum tree; the larger path keeps the established
+// 256-thread tree and overlaps affine loads with communication through PDL.
+using CustomArNormBF16 = __nv_bfloat16;
+__device__ __forceinline__ float CustomArNormRound(float x) {
+    return __bfloat162float(__float2bfloat16_rn(x));
+}
+__device__ __forceinline__ float CustomArNormWarpSum(float x) {
+    for (int d = 16; d; d >>= 1)
+        x += __shfl_down_sync(0xffffffffu, x, d);
+    return x;
+}
+using CustomArNormPacketType = CustomArPacked<CustomArNormBF16>::P;
+__device__ __forceinline__ void CustomArNormPacket(CustomArNormPacketType reduced, CustomArNormBF16 *hidden,
+                                                 const float *weight, CustomArNormBF16 *output, float eps,
+                                                 float *sums, int t) {
+    CustomArNormPacketType residual = ((CustomArNormPacketType *)hidden)[t];
+    float4 wa = ((const float4 *)weight)[t * 2], wb = ((const float4 *)weight)[t * 2 + 1];
+    float cached[8], affine[8] = {wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w}, sum = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        cached[i] = CustomArNormRound((float)residual.data[i] + (float)reduced.data[i]);
+        sum += cached[i] * cached[i];
+    }
+    sum = CustomArNormWarpSum(sum);
+    if (t % 32 == 0)
+        sums[t / 32] = sum;
+    __syncthreads();
+    if (t < 32) {
+        float total = CustomArNormWarpSum(t < 16 ? sums[t] : 0);
+        if (t == 0)
+            sums[0] = total;
+    }
+    __syncthreads();
+    float scale = rsqrtf(sums[0] / 4096 + eps);
+    CustomArNormPacketType norm;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        residual.data[i] = __float2bfloat16_rn(cached[i]);
+        norm.data[i] = __float2bfloat16_rn(CustomArNormRound(cached[i] * scale) * affine[i]);
+    }
+    ((CustomArNormPacketType *)hidden)[t] = residual;
+    ((CustomArNormPacketType *)output)[t] = norm;
+}
+template <int Ranks>
+__device__ __forceinline__ CustomArNormPacketType CustomArReducePacket(CustomArRankData p, int offset) {
+    CustomArNormPacketType first = ((const CustomArNormPacketType *)p.ptrs[0])[offset];
+    float sum[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        sum[i] = (float)first.data[i];
+#pragma unroll
+    for (int peer = 1; peer < Ranks; ++peer) {
+        CustomArNormPacketType v = ((const CustomArNormPacketType *)p.ptrs[peer])[offset];
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            sum[i] += (float)v.data[i];
+    }
+    CustomArNormPacketType result;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        result.data[i] = __float2bfloat16_rn(sum[i]);
+    return result;
+}
+template <int Ranks, bool Direct>
+__global__ __launch_bounds__(512, 1) void FastllmCustomAllReduceRMSNormKernel(
+    CustomArRankData *data, CustomArRankSignals signals, CustomArSignal *self, CustomArRankScratch scratch,
+    CustomArNormBF16 *hidden, const float *weight, CustomArNormBF16 *output, float eps, int rank) {
+    __shared__ float sums[16];
+    // One CTA owns one complete row; the launcher caps the grid at the
+    // number of available collective signal slots.
+    int t = threadIdx.x, row = blockIdx.x;
+    CustomArRankData p = *data;
+    constexpr int part = 512 / Ranks, pitch = part + 512 % Ranks;
+    CustomArBarrierStart<Ranks>(signals, self, rank);
+    if constexpr (!Direct) {
+        if (t < (rank == Ranks - 1 ? pitch : part))
+            ((CustomArNormPacketType *)scratch.scratch[rank])[row * pitch + t] =
+                CustomArReducePacket<Ranks>(p, row * 512 + rank * part + t);
+        CustomArBarrierPublish<Ranks>(signals, self, rank);
+    }
+    // Publish completes all reads of the original input. Two-stage peers now
+    // read only scratch; the next collective's start barrier cannot pass until
+    // every peer has finished this kernel, so it also protects scratch reuse.
+    CustomArNormPacketType v;
+    if constexpr (Direct)
+        v = CustomArReducePacket<Ranks>(p, row * 512 + t);
+    else {
+        int peer = min(t / part, Ranks - 1);
+        v = ((const CustomArNormPacketType *)scratch.scratch[peer])[row * pitch + t - peer * part];
+    }
+    CustomArNormPacket(v, hidden + row * 4096, weight, output + row * 4096, eps, sums, t);
+    if constexpr (Direct)
+        CustomArBarrierFinal<Ranks>(signals, self, rank);
+}
+template <int Ranks, bool TwoStage>
+__global__ void FastllmCustomAllReduceResidualKernel(CustomArRankData *data, CustomArRankSignals signals,
+                                                   CustomArSignal *self, CustomArRankScratch scratch,
+                                                   CustomArNormBF16 *hidden, int rank, int packedCount) {
+    CustomArRankData p = *data;
+    int t = blockIdx.x * blockDim.x + threadIdx.x, stride = blockDim.x * gridDim.x;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+    CustomArBarrierStart<Ranks>(signals, self, rank);
+    if constexpr (TwoStage) {
+        int part = packedCount / Ranks, first = rank * part,
+            last = rank == Ranks - 1 ? packedCount : first + part;
+        for (int i = first + t; i < last; i += stride)
+            ((CustomArNormPacketType *)scratch.scratch[rank])[i - first] = CustomArReducePacket<Ranks>(p, i);
+        CustomArBarrierPublish<Ranks>(signals, self, rank);
+        for (int offset = t; offset < part + packedCount % Ranks; offset += stride) {
+            CustomArNormPacketType values[Ranks], residuals[Ranks];
+#pragma unroll
+            for (int peer = 0; peer < Ranks; ++peer) {
+                int n = peer == Ranks - 1 ? packedCount - peer * part : part;
+                if (offset < n) {
+                    values[peer] = ((const CustomArNormPacketType *)scratch.scratch[peer])[offset];
+                    residuals[peer] = ((CustomArNormPacketType *)hidden)[peer * part + offset];
+                }
+            }
+            asm volatile("" ::: "memory");
+#pragma unroll
+            for (int peer = 0; peer < Ranks; ++peer) {
+                int n = peer == Ranks - 1 ? packedCount - peer * part : part;
+                if (offset < n) {
+                    CustomArAddPacket<CustomArNormBF16>(values[peer], residuals[peer]);
+                    ((CustomArNormPacketType *)hidden)[peer * part + offset] = values[peer];
+                }
+            }
+        }
+    } else {
+        for (int i = t; i < packedCount; i += stride) {
+            CustomArNormPacketType value = CustomArReducePacket<Ranks>(p, i),
+                                   residual = ((CustomArNormPacketType *)hidden)[i];
+            CustomArAddPacket<CustomArNormBF16>(value, residual);
+            ((CustomArNormPacketType *)hidden)[i] = value;
+        }
+        CustomArBarrierFinal<Ranks>(signals, self, rank);
+    }
+}
+__global__ void FastllmCustomRMSNormPdlKernel(const CustomArNormBF16 *input, const float *weight,
+                                           CustomArNormBF16 *output, float eps) {
+    __shared__ float sums[8];
+    float value[16], affine[16], partial = 0;
+    int row = blockIdx.x;
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+        affine[i] = weight[threadIdx.x + i * 256];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+        value[i] = (float)input[row * 4096 + threadIdx.x + i * 256];
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+        partial += value[i] * value[i];
+    partial = CustomArNormWarpSum(partial);
+    if (threadIdx.x % 32 == 0)
+        sums[threadIdx.x / 32] = partial;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float total = CustomArNormWarpSum(threadIdx.x < 8 ? sums[threadIdx.x] : 0);
+        if (threadIdx.x == 0)
+            sums[0] = total;
+    }
+    __syncthreads();
+    float scale = rsqrtf(sums[0] / 4096 + eps);
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+        output[row * 4096 + threadIdx.x + i * 256] =
+            __float2bfloat16_rn(CustomArNormRound(value[i] * scale) * affine[i]);
+}
+
+template <int Ranks, int RowsPerBlock>
+__global__ __launch_bounds__(256 * RowsPerBlock, 1)
+void FastllmCustomAllGatherRMSNormKernel(CustomArRankData *data,
+        CustomArRankSignals signals, CustomArSignal *self, CustomArNormBF16 *hidden,
+        const float *weight, CustomArNormBF16 *output, float eps, int rank, int rows) {
+    __shared__ float sums[RowsPerBlock][8];
+    CustomArRankData pointers = *data;
+    CustomArBarrierStart<Ranks>(signals, self, rank);
+    // The launcher fits all row groups into the existing collective signal
+    // slots. Each group keeps the same 256-lane RMSNorm reduction tree.
+    const int t = threadIdx.x % 256, slot = threadIdx.x / 256;
+    const int row = blockIdx.x * RowsPerBlock + slot;
+    const auto *branch = row < rows
+        ? (const CustomArNormBF16 *)pointers.ptrs[row / (rows / Ranks)] + row * 4096 : nullptr;
+    float value[16], affine[16], partial = 0;
+    if (row < rows) {
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            int c = t + i * 256;
+            value[i] = CustomArNormRound((float)hidden[row * 4096 + c] + (float)branch[c]);
+            affine[i] = weight[c];
+        }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            hidden[row * 4096 + t + i * 256] = __float2bfloat16_rn(value[i]);
+            partial += value[i] * value[i];
+        }
+    }
+    partial = CustomArNormWarpSum(partial);
+    if (t % 32 == 0) sums[slot][t / 32] = partial;
+    __syncthreads();
+    if (t < 32) {
+        float total = CustomArNormWarpSum(t < 8 ? sums[slot][t] : 0);
+        if (t == 0) sums[slot][0] = total;
+    }
+    __syncthreads();
+    float scale = rsqrtf(sums[slot][0] / 4096 + eps);
+    if (row < rows) {
+#pragma unroll
+        for (int i = 0; i < 16; ++i)
+            output[row * 4096 + t + i * 256] =
+                __float2bfloat16_rn(CustomArNormRound(value[i] * scale) * affine[i]);
+    }
+    // Protect the owner slices until every peer has finished reading, even
+    // when the next graph node immediately reuses the MoE output allocation.
+    CustomArBarrierFinal<Ranks>(signals, self, rank);
+}
+
+template <int Ranks>
+__global__ void FastllmCustomAllGatherResidualKernel(CustomArRankData *data,
+        CustomArRankSignals signals, CustomArSignal *self,
+        CustomArNormBF16 *hidden, int rank, int part) {
+    CustomArRankData pointers = *data;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+    CustomArBarrierStart<Ranks>(signals, self, rank);
+    for (int offset = blockIdx.x * blockDim.x + threadIdx.x;
+         offset < part; offset += gridDim.x * blockDim.x) {
+        CustomArNormPacketType values[Ranks], residuals[Ranks];
+#pragma unroll
+        for (int peer = 0; peer < Ranks; ++peer) {
+            int i = peer * part + offset;
+            values[peer] = ((const CustomArNormPacketType *)pointers.ptrs[peer])[i];
+            residuals[peer] = ((const CustomArNormPacketType *)hidden)[i];
+        }
+#pragma unroll
+        for (int peer = 0; peer < Ranks; ++peer) {
+            CustomArAddPacket<CustomArNormBF16>(values[peer], residuals[peer]);
+            ((CustomArNormPacketType *)hidden)[peer * part + offset] = values[peer];
+        }
+    }
+    CustomArBarrierFinal<Ranks>(signals, self, rank);
+}
+#endif
+
 struct CustomArState {
     std::mutex mutex;
     std::condition_variable condition;
@@ -882,6 +1220,7 @@ struct CustomArState {
     CustomArRankSignals allSignals{};
     CustomArRankScratch allScratch{};
     CustomArPushWorkspaces allPushWorkspaces{};
+    std::unique_ptr<CustomArTaggedPeer> taggedPeer;
     void *inplaceScratch[kCustomArMaxRanks]{};
     int pushBlocks = 0;
     bool pushAvailable = false;
@@ -889,15 +1228,28 @@ struct CustomArState {
     bool captureFallbackLogged = false;
     std::map<std::vector<uintptr_t>, std::vector<CustomArRankData *> > registrations;
 
-    uint64_t generation = 0;
+    std::atomic<uint64_t> generation{0};
     int arrived = 0;
     int pendingCount = 0;
     int pendingType = -1;
     bool pendingMismatch = false;
+    // Per-rank call ordinals identify *which* tensor a peer is on.  The
+    // pointer tuple alone pairs ranks by arrival order, so any asymmetry in
+    // the ranks' collective call streams shifts every later round (silent
+    // wrong results, or an out-of-range read of a freed peer buffer).
+    uint64_t rankCallSequence[kCustomArMaxRanks]{};
+    uint64_t pendingSequences[kCustomArMaxRanks]{};
+    bool sequenceDesyncLogged = false;
     bool lastRegistrationOk = false;
     bool lastRegistrationMissDuringCapture = false;
     std::vector<void *> pendingInputs;
     std::vector<char> pendingCapturing;
+    // Pointer-local guard results (non-null and 16-byte aligned).  Unlike the
+    // byte size and dtype, a pointer's alignment can differ from rank to rank,
+    // so this must not be decided locally: every rank folds its own flag in
+    // here and the rendezvous makes the launch-or-fall-back decision
+    // collective.
+    std::vector<char> pendingAligned;
     std::vector<CustomArRankData *> lastRankData;
 };
 
@@ -909,11 +1261,15 @@ CustomArState &GetCustomArState() {
 struct CustomArAllocation {
     int device = -1;
     void *pointer = nullptr;
+    std::unique_ptr<CustomArTaggedPeer> taggedPeer;
 };
 
 std::vector<CustomArAllocation> DetachCustomArAllocationsLocked(
         CustomArState &state) {
     std::vector<CustomArAllocation> allocations;
+    if (state.taggedPeer) {
+        allocations.push_back({-1, nullptr, std::move(state.taggedPeer)});
+    }
     auto collect = [&](int rank, void *pointer) {
         if (pointer != nullptr && rank >= 0 &&
             rank < (int)state.devices.size()) {
@@ -953,6 +1309,10 @@ void DrainAndReleaseCustomArAllocations(
         FastllmCudaSyncDevice(device);
     }
     for (const CustomArAllocation &allocation : allocations) {
+        if (allocation.taggedPeer) {
+            allocation.taggedPeer->ReleaseAfterDrain();
+            continue;
+        }
         if (allocation.device < 0 || allocation.pointer == nullptr) {
             continue;
         }
@@ -1036,6 +1396,7 @@ public:
         target.activeCalls++;
         state = &target;
         rank = rankIt->second;
+        FastllmCudaGraphRecordCollective();
         return true;
     }
 
@@ -1076,6 +1437,17 @@ bool BuildCustomArRegistration(CustomArState &state,
     bool ok = true;
     for (int rank = 0; rank < (int)inputs.size(); ++rank) {
         FastllmCudaSetDevice(state.devices[rank]);
+        // Registration runs on the last arriving worker, including for its
+        // peers' devices. Their pools may contain temporaries returned while
+        // writes are still queued on another per-thread stream. Drain those
+        // writers before reusing storage for this persistent pointer table.
+        // This is only the cold registration path; cached tuples and graph
+        // replay do not synchronize here.
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
         rankData[rank] = reinterpret_cast<CustomArRankData *>(
             FastllmCudaMalloc(sizeof(CustomArRankData)));
         if (rankData[rank] == nullptr) {
@@ -1085,6 +1457,14 @@ bool BuildCustomArRegistration(CustomArState &state,
         cudaError_t copyState = cudaMemcpy(rankData[rank], &hostData,
                                            sizeof(hostData),
                                            cudaMemcpyHostToDevice);
+        // The last arriving worker publishes metadata for every GPU on its
+        // own per-thread streams. A pageable H2D cudaMemcpy may return before
+        // the device copy completes; the other workers consume these tables
+        // on different streams as soon as the host rendezvous is released.
+        // Finish each cold registration before publishing the pointer tuple.
+        if (copyState == cudaSuccess) {
+            copyState = cudaStreamSynchronize(cudaStreamPerThread);
+        }
         if (copyState != cudaSuccess) {
             cudaGetLastError();
             ok = false;
@@ -1107,7 +1487,9 @@ bool BuildCustomArRegistration(CustomArState &state,
 
 bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
                                     void *input, int count, int dataType,
-                                    CustomArRankData *&rankData) {
+                                    bool localEligible,
+                                    CustomArRankData *&rankData,
+                                    int hostSpinMicroseconds = 0) {
     // Registration is itself collective.  A local-pointer-only lookup is
     // unsafe because allocators can reuse an address on some ranks but not on
     // others; hit ranks would launch while miss ranks wait for registration.
@@ -1131,6 +1513,7 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
         state.pendingMismatch = false;
         state.pendingInputs.assign(state.devices.size(), nullptr);
         state.pendingCapturing.assign(state.devices.size(), 0);
+        state.pendingAligned.assign(state.devices.size(), 0);
     } else if (state.pendingCount != count || state.pendingType != dataType) {
         state.pendingMismatch = true;
     }
@@ -1140,6 +1523,8 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
     } else {
         state.pendingInputs[rank] = input;
         state.pendingCapturing[rank] = capturing ? 1 : 0;
+        state.pendingAligned[rank] = localEligible ? 1 : 0;
+        state.pendingSequences[rank] = state.rankCallSequence[rank]++;
     }
     state.pendingMismatch = state.pendingMismatch || !captureQueryOk;
     state.arrived++;
@@ -1149,6 +1534,32 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
         bool inputsValid = !state.pendingMismatch;
         for (void *ptr : inputs) {
             inputsValid = inputsValid && ptr != nullptr;
+        }
+        // Fold in every rank's local pointer-eligibility (non-null and 16-byte
+        // aligned).  A rank with an unusable local view must not have bailed
+        // out before arriving here: had it done so its peers would spin in this
+        // rendezvous, or in the device barrier, forever.  One bad rank now
+        // drops all ranks to NCCL together.
+        for (char eligible : state.pendingAligned) {
+            inputsValid = inputsValid && eligible != 0;
+        }
+        // A desynchronised call stream shifts the arrival-order pairing by
+        // one; refuse the round so it falls back to NCCL instead of
+        // reducing the wrong peer tensor (or reading a freed buffer).
+        for (int other = 1; other < (int)state.devices.size() && inputsValid;
+             ++other) {
+            if (state.pendingSequences[other] != state.pendingSequences[0]) {
+                inputsValid = false;
+                state.pendingMismatch = true;
+                if (rank == 0 && !state.sequenceDesyncLogged) {
+                    state.sequenceDesyncLogged = true;
+                    std::fprintf(stderr,
+                                 "[Fastllm] custom all-reduce call "
+                                 "sequences desynchronized across ranks; "
+                                 "falling back to NCCL.\n");
+                    std::fflush(stderr);
+                }
+            }
         }
         std::vector<uintptr_t> key;
         key.reserve(inputs.size());
@@ -1181,6 +1592,22 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
         state.generation++;
         state.condition.notify_all();
     } else {
+        // Dedicated decode submitters can meet without a scheduler wake-up.
+        // Keep the full tuple/eligibility rendezvous and its sleeping fallback;
+        // only the generation is read without holding the registration mutex.
+        if (hostSpinMicroseconds > 0 && !capturing) {
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::microseconds(hostSpinMicroseconds);
+            lock.unlock();
+            unsigned spins = 0;
+            while (state.generation.load(std::memory_order_acquire) == waitGeneration) {
+                if ((++spins & 63U) == 0) {
+                    if (std::chrono::steady_clock::now() >= deadline) break;
+                    std::this_thread::yield();
+                }
+            }
+            lock.lock();
+        }
         state.condition.wait(lock, [&state, waitGeneration]() {
             return state.generation != waitGeneration;
         });
@@ -1215,7 +1642,7 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
 
 template <typename T>
 bool LaunchCustomAr(CustomArState &state, CustomArRankData *rankData,
-                    T *output, int rank, int count, bool writeAfterBarrier) {
+                    T *output, int rank, int count, bool writeAfterBarrier, int threads) {
     constexpr int packedWidth = CustomArPacked<T>::size;
     int packedCount = count / packedWidth;
     const size_t bytes = (size_t)count * sizeof(T);
@@ -1229,19 +1656,19 @@ bool LaunchCustomAr(CustomArState &state, CustomArRankData *rankData,
         ? packedCount / ranks + packedCount % ranks
         : packedCount;
     int blocks = std::max(1, std::min(kCustomArMaxBlocks,
-                          (workPackedCount + kCustomArThreads - 1) /
-                              kCustomArThreads));
+                          (workPackedCount + threads - 1) /
+                              threads));
 #define CUSTOM_AR_RANK_CASE(RANKS)                                           \
     case RANKS:                                                              \
         if (useTwoStage) {                                                   \
             FastllmCustomAllReduceTwoStageKernel<T, RANKS>                   \
-                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
+                <<<blocks, threads, 0, cudaStreamPerThread>>>(               \
                     rankData, state.allSignals,                              \
                     state.allSignals.signals[rank], state.allScratch,        \
                     output, rank, packedCount);                              \
         } else {                                                             \
             FastllmCustomAllReduceKernel<T, RANKS>                           \
-                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
+                <<<blocks, threads, 0, cudaStreamPerThread>>>(               \
                     rankData, state.allSignals,                              \
                     state.allSignals.signals[rank], output, rank,            \
                     packedCount, writeAfterBarrier);                         \
@@ -1431,10 +1858,20 @@ bool LaunchCustomArPairAdd(CustomArState &state,
 
 bool RunCustomArCandidate(void *data, void *dest, int count,
                           int dataType, int deviceId,
-                          bool requireEnabledPath = false) {
-    if (data == nullptr || dest == nullptr || count <= 0) {
+                          bool requireEnabledPath = false, int rowElements = 0,
+                          int hostSpinMicroseconds = 0) {
+    if (count <= 0 || rowElements < 0 || (rowElements && count % rowElements)) {
         return false;
     }
+    // The kernels access data/dest as 16-byte aligned packets; a misaligned or
+    // null view would fault on the device (cudaErrorMisalignedAddress, Xid
+    // 13).  Whether *this* rank's pointers are usable is local information and
+    // must not be decided here: a rank that returned early would leave its
+    // peers waiting in the rendezvous (or in the device barrier) forever.
+    // Record the flag and let the collective rendezvous below drop every rank
+    // to NCCL together.
+    const bool localEligible = data != nullptr && dest != nullptr &&
+        (((uintptr_t)data | (uintptr_t)dest) & 15u) == 0;
     size_t typeBytes = CustomArTypeBytes(dataType);
     size_t bytes = (size_t)count * typeBytes;
     if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
@@ -1445,17 +1882,42 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
     CustomArState &state = GetCustomArState();
     int rank = -1;
     CustomArCallLease lease;
-    if (!lease.Acquire(state, bytes, dataType, deviceId,
+    // Both custom kernels sum ranks 0..N-1 in FP32 and round once.
+    // Keep that arithmetic when a verification block crosses the automatic
+    // message-size threshold; otherwise switching to NCCL changes logits.
+    const size_t policyBytes = rowElements ? (size_t)rowElements * typeBytes : bytes;
+    if (policyBytes % 16 != 0) return false;
+    if (!lease.Acquire(state, policyBytes, dataType, deviceId,
                        requireEnabledPath, rank)) {
         return false;
     }
 
     CustomArRankData *rankData = nullptr;
     if (!FindOrRegisterCustomArPointers(state, rank, data, count,
-                                        dataType, rankData)) {
+                                        dataType, localEligible, rankData, hostSpinMicroseconds)) {
         return false;
     }
+    if (dataType == fastllm::DataType::BFLOAT16 && state.taggedPeer &&
+        state.taggedPeer->CanUse(count)) {
+        const bool launched = state.taggedPeer->Launch(data, dest, count, rank);
+        if (cudaGetLastError() != cudaSuccess) {
+            FastllmCudaSetThreadError();
+            return false;
+        }
+        return launched;
+    }
     const bool useTwoStage = CustomArUseTwoStage(state.devices.size(), bytes);
+    // A small block of decode rows gives each rank only a few KiB of the
+    // reduce-scatter shard. More, smaller CTAs overlap peer-read latency while
+    // retaining every start/publish barrier and the rank-ordered FP32 sum.
+    // Row-wise collectives keep their existing compact geometry.
+    const bool compactRows = rowElements > 0 && count > rowElements &&
+        count / rowElements <= 8 && policyBytes <= kCustomArAutoSmallBytes;
+    // A two-stage shard of at most 32 KiB otherwise occupies only one or
+    // two 512-thread CTAs. Smaller CTAs overlap peer traffic on more SMs.
+    const bool smallShard = state.devices.size() == 8 && bytes <= 256 * 1024;
+    const int threads = !useTwoStage ? kCustomArThreads : compactRows ? 64 :
+        smallShard ? 128 : kCustomArThreads;
     const bool fusedCopyBack =
         data == dest && !useTwoStage &&
         bytes <= (size_t)kCustomArMaxBlocks * kCustomArThreads * 16 &&
@@ -1469,15 +1931,15 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
     if (dataType == fastllm::DataType::FLOAT16) {
         launched = LaunchCustomAr(state, rankData,
                                   reinterpret_cast<half *>(kernelDest),
-                                  rank, count, fusedCopyBack);
+                                  rank, count, fusedCopyBack, threads);
     } else if (dataType == fastllm::DataType::BFLOAT16) {
         launched = LaunchCustomAr(
             state, rankData, reinterpret_cast<__nv_bfloat16 *>(kernelDest),
-            rank, count, fusedCopyBack);
+            rank, count, fusedCopyBack, threads);
     } else if (dataType == fastllm::DataType::FLOAT32) {
         launched = LaunchCustomAr(state, rankData,
                                   reinterpret_cast<float *>(kernelDest),
-                                  rank, count, fusedCopyBack);
+                                  rank, count, fusedCopyBack, threads);
     }
     if (!launched) {
         return false;
@@ -1502,10 +1964,17 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
 bool RunCustomArPairAddCandidate(void *first, void *second, void *dest,
                                  int count, int dataType, int deviceId,
                                  bool requireEnabledPath = false) {
-    if (first == nullptr || second == nullptr || dest == nullptr ||
-        count <= 0) {
+    if (count <= 0) {
         return false;
     }
+    // The kernel reads first/second and writes dest as 16-byte aligned
+    // packets; a misaligned or null view would fault on the device
+    // (cudaErrorMisalignedAddress, Xid 13).  This is local information, so it
+    // goes into the collective rendezvous rather than an early return (see
+    // RunCustomArCandidate).
+    const bool localEligible = first != nullptr && second != nullptr &&
+        dest != nullptr &&
+        (((uintptr_t)first | (uintptr_t)second | (uintptr_t)dest) & 15u) == 0;
     const size_t typeBytes = CustomArTypeBytes(dataType);
     const size_t bytes = (size_t)count * typeBytes;
     if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
@@ -1524,9 +1993,11 @@ bool RunCustomArPairAddCandidate(void *first, void *second, void *dest,
     CustomArRankData *firstRankData = nullptr;
     CustomArRankData *secondRankData = nullptr;
     if (!FindOrRegisterCustomArPointers(
-            state, rank, first, count, dataType, firstRankData) ||
+            state, rank, first, count, dataType, localEligible,
+            firstRankData) ||
         !FindOrRegisterCustomArPointers(
-            state, rank, second, count, dataType, secondRankData)) {
+            state, rank, second, count, dataType, localEligible,
+            secondRankData)) {
         return false;
     }
     if (dataType == fastllm::DataType::FLOAT16) {
@@ -1550,9 +2021,15 @@ bool RunCustomArPairAddCandidate(void *first, void *second, void *dest,
 bool RunCustomArAddCandidate(void *data, void *dest, int count,
                              int dataType, int deviceId,
                              bool requireEnabledPath = false) {
-    if (data == nullptr || dest == nullptr || count <= 0) {
+    if (count <= 0) {
         return false;
     }
+    // The kernel reads data/dest as 16-byte aligned packets; a misaligned or
+    // null view would fault on the device (cudaErrorMisalignedAddress, Xid
+    // 13).  This is local information, so it goes into the collective
+    // rendezvous rather than an early return (see RunCustomArCandidate).
+    const bool localEligible = data != nullptr && dest != nullptr &&
+        (((uintptr_t)data | (uintptr_t)dest) & 15u) == 0;
     size_t typeBytes = CustomArTypeBytes(dataType);
     size_t bytes = (size_t)count * typeBytes;
     if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
@@ -1571,7 +2048,7 @@ bool RunCustomArAddCandidate(void *data, void *dest, int count,
 
     CustomArRankData *rankData = nullptr;
     if (!FindOrRegisterCustomArPointers(state, rank, data, count,
-                                        dataType, rankData)) {
+                                        dataType, localEligible, rankData)) {
         return false;
     }
     if (dataType == fastllm::DataType::FLOAT16) {
@@ -1872,9 +2349,12 @@ bool CheckCustomArCorrectnessTyped(const CustomArState &state,
             expected[index] += CustomArHostToFloat<T>(host[index]);
         }
         FastllmCudaSetDevice(state.devices[rank]);
+        // The rank workers consume these buffers on other per-thread streams.
+        // Pageable H2D copies and memset may still be running when they return.
         ok = cudaMemcpy(buffers.inputs[rank], host.data(), bytes,
                         cudaMemcpyHostToDevice) == cudaSuccess &&
-             cudaMemset(buffers.outputs[rank], 0, bytes) == cudaSuccess;
+             cudaMemset(buffers.outputs[rank], 0, bytes) == cudaSuccess &&
+             cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
         if (!ok) {
             cudaGetLastError();
         }
@@ -2219,11 +2699,19 @@ void FastllmCudaCustomAllReduceReset() {
         state.pendingCount = 0;
         state.pendingType = -1;
         state.pendingMismatch = false;
+        for (uint64_t &sequence : state.rankCallSequence) {
+            sequence = 0;
+        }
+        for (uint64_t &sequence : state.pendingSequences) {
+            sequence = 0;
+        }
+        state.sequenceDesyncLogged = false;
         state.lastRegistrationOk = false;
         state.lastRegistrationMissDuringCapture = false;
         state.captureFallbackLogged = false;
         state.pendingInputs.clear();
         state.pendingCapturing.clear();
+        state.pendingAligned.clear();
         state.lastRankData.clear();
         state.generation++;
     }
@@ -2396,6 +2884,9 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
             }
         }
     }
+    if (ok) {
+        state.taggedPeer = CustomArTaggedPeer::Create(devices);
+    }
     FastllmCudaSetDevice(originalDevice);
     if (!ok) {
         state.enabledPaths.store(0, std::memory_order_release);
@@ -2493,6 +2984,316 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
 bool FastllmCudaCustomAllReduce(void *data, void *dest, int count,
                                 int dataType, int deviceId) {
     return RunCustomArCandidate(data, dest, count, dataType, deviceId, true);
+}
+
+bool FastllmCudaCustomAllReduceWithSpin(void *data, void *dest, int count,
+                                      int dataType, int deviceId, int hostSpinMicroseconds) {
+    return RunCustomArCandidate(data, dest, count, dataType, deviceId, true, 0,
+                                hostSpinMicroseconds);
+}
+
+bool FastllmCudaCustomAllReduceRows(void *data, void *dest, int count,
+                                    int rowElements, int dataType, int deviceId) {
+    if (rowElements <= 0) return false;
+    return RunCustomArCandidate(data, dest, count, dataType, deviceId, true, rowElements);
+}
+
+bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
+        const float *weight, void *output, int count, int channels,
+        float eps, int dataType, int deviceId) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    if (dataType != fastllm::BFLOAT16 || channels != 4096 || count <= 0 ||
+        count % channels || (size_t)count * 2 > CustomArMaxBytes() ||
+        !std::isfinite(eps) || eps <= 0) return false;
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    if (!lease.Acquire(state, channels * 2, dataType, deviceId, true, rank)) return false;
+    // Fold pointer/architecture eligibility into the collective rendezvous:
+    // a single unsupported rank must send every peer through the fallback.
+    const bool aligned = data && residual && weight && output &&
+        (((uintptr_t)data | (uintptr_t)residual | (uintptr_t)weight | (uintptr_t)output) & 15u) == 0;
+    auto disjoint = [count](const void *a, const void *b) {
+        uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+        return (x > y ? x - y : y - x) >= (size_t)count * 2;
+    };
+    const bool eligible = aligned && FastllmCudaRuntimeArch() == 90 &&
+        disjoint(data, residual) && disjoint(data, output) && disjoint(residual, output);
+    CustomArRankData *pointers = nullptr;
+    if (!FindOrRegisterCustomArPointers(state, rank, data, count, dataType,
+                                      eligible, pointers)) return false;
+    const int rows = count / channels;
+    auto *hidden = (CustomArNormBF16 *)residual;
+    auto *normed = (CustomArNormBF16 *)output;
+    const bool twoStage = CustomArUseTwoStage(state.devices.size(), (size_t)count * 2);
+    const int threads = twoStage && rows <= 128 ? 256 : 512;
+    const int packed = count / 8, ranks = state.devices.size();
+    const int work = twoStage ? packed / ranks + packed % ranks : packed;
+    const int blocks = std::min(kCustomArMaxBlocks, (work + threads - 1) / threads);
+#define CUSTOM_AR_NORM_RANK_CASE(RANKS)                                      \
+    case RANKS:                                                             \
+        if (rows <= 8 || (RANKS == 2 && rows <= kCustomArMaxBlocks))          \
+            FastllmCustomAllReduceRMSNormKernel<RANKS, true>                 \
+                <<<rows, 512, 0, cudaStreamPerThread>>>(                    \
+                    pointers, state.allSignals, state.allSignals.signals[rank], \
+                    state.allScratch, hidden, weight, normed, eps, rank);    \
+        else if (rows <= kCustomArMaxBlocks)                                 \
+            FastllmCustomAllReduceRMSNormKernel<RANKS, false>                \
+                <<<rows, 512, 0, cudaStreamPerThread>>>(                    \
+                    pointers, state.allSignals, state.allSignals.signals[rank], \
+                    state.allScratch, hidden, weight, normed, eps, rank);    \
+        else if (twoStage)                                                  \
+            FastllmCustomAllReduceResidualKernel<RANKS, true>                \
+                <<<blocks, threads, 0, cudaStreamPerThread>>>(               \
+                    pointers, state.allSignals, state.allSignals.signals[rank], \
+                    state.allScratch, hidden, rank, packed);                \
+        else                                                                \
+            FastllmCustomAllReduceResidualKernel<RANKS, false>               \
+                <<<blocks, threads, 0, cudaStreamPerThread>>>(               \
+                    pointers, state.allSignals, state.allSignals.signals[rank], \
+                    state.allScratch, hidden, rank, packed);                \
+        break
+    switch (ranks) {
+        CUSTOM_AR_NORM_RANK_CASE(2);
+        CUSTOM_AR_NORM_RANK_CASE(4);
+        CUSTOM_AR_NORM_RANK_CASE(6);
+        CUSTOM_AR_NORM_RANK_CASE(8);
+        default: return false;
+    }
+#undef CUSTOM_AR_NORM_RANK_CASE
+    cudaError_t status = cudaGetLastError();
+    if (status == cudaSuccess && rows > kCustomArMaxBlocks) {
+        cudaLaunchConfig_t config{};
+        config.gridDim = dim3(rows);
+        config.blockDim = dim3(256);
+        config.stream = cudaStreamPerThread;
+        cudaLaunchAttribute attribute{};
+        attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute.val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = &attribute;
+        config.numAttrs = 1;
+        status = cudaLaunchKernelEx(&config, FastllmCustomRMSNormPdlKernel,
+            (const CustomArNormBF16 *)hidden, weight, normed, eps);
+    }
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        std::fprintf(stderr, "[Fastllm] fused all-reduce RMSNorm failed on GPU %d: %s.\n",
+                     deviceId, cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool FastllmCudaCustomAllReduceAndGather(void *routed, void *dest,
+        void *shared, int count, int deviceId) {
+    if (count <= 0 || count % 8 ||
+        count / 4 > kCustomArThreads * kCustomArMaxBlocks ||
+        (size_t)count * sizeof(float) > CustomArMaxBytes()) return false;
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    if (!lease.Acquire(state, (size_t)count * sizeof(float), fastllm::FLOAT32,
+                       deviceId, true, rank)) return false;
+    const int ranks = (int)state.devices.size();
+    if (count % (ranks * 8)) return false;
+    auto disjoint = [](const void *a, size_t na, const void *b, size_t nb) {
+        uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+        return x <= y ? y - x >= na : x - y >= nb;
+    };
+    const size_t routedBytes = (size_t)count * 4, sharedBytes = (size_t)count * 2;
+    // Rank-local eligibility must participate in the pointer rendezvous: no
+    // rank can return early while other ranks wait for its pointer or barrier.
+    const bool eligible = routed && dest && shared &&
+        (((uintptr_t)routed | (uintptr_t)dest | (uintptr_t)shared) & 15u) == 0 &&
+        (routed == dest || disjoint(routed, routedBytes, dest, routedBytes)) &&
+        disjoint(routed, routedBytes, shared, sharedBytes) &&
+        disjoint(dest, routedBytes, shared, sharedBytes);
+    CustomArRankData *routedData = nullptr, *sharedData = nullptr;
+    if (!FindOrRegisterCustomArPointers(state, rank, routed, count,
+            fastllm::FLOAT32, eligible, routedData) ||
+        !FindOrRegisterCustomArPointers(state, rank, shared, count,
+            fastllm::BFLOAT16, eligible, sharedData)) return false;
+    if (state.taggedPeer && state.taggedPeer->CanUse(count)) {
+        const bool launched = state.taggedPeer->LaunchJoint(routed, dest, shared, count, rank);
+        if (cudaGetLastError() != cudaSuccess) {
+            FastllmCudaSetThreadError();
+            return false;
+        }
+        return launched;
+    }
+    // Spread small messages across more CTAs without exceeding signal capacity.
+    // Larger messages retain the original 512-thread blocks.
+    const int threads =
+        count / 4 <= 128 * kCustomArMaxBlocks ? 128 : kCustomArThreads;
+    const int blocks = (count / 4 + threads - 1) / threads;
+#define CUSTOM_AR_GATHER_CASE(RANKS)                                        \
+    case RANKS:                                                            \
+        FastllmCustomAllReduceAndGatherKernel<RANKS>                        \
+            <<<blocks, threads, 0, cudaStreamPerThread>>>(                   \
+                routedData, sharedData, state.allSignals,                  \
+                state.allSignals.signals[rank], (float4 *)dest,            \
+                (uint2 *)shared, rank, count / 4);                         \
+        break
+    switch (ranks) {
+        CUSTOM_AR_GATHER_CASE(2);
+        CUSTOM_AR_GATHER_CASE(4);
+        CUSTOM_AR_GATHER_CASE(6);
+        CUSTOM_AR_GATHER_CASE(8);
+        default: return false;
+    }
+#undef CUSTOM_AR_GATHER_CASE
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        std::fprintf(stderr, "[Fastllm] joint reduce/gather failed on GPU %d: %s.\n",
+                     deviceId, cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaCustomAllGatherRows(void *data, int count, int rowElements,
+                                   int dataType, int deviceId) {
+    if (count <= 0 || rowElements <= 0 || count % rowElements) return false;
+    const size_t typeBytes = CustomArTypeBytes(dataType);
+    const size_t bytes = (size_t)count * typeBytes;
+    const size_t policyBytes = (size_t)rowElements * typeBytes;
+    if (!typeBytes || bytes > CustomArMaxBytes() || policyBytes % 16) return false;
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    if (!lease.Acquire(state, policyBytes, dataType, deviceId, true, rank)) return false;
+    const int ranks = (int)state.devices.size();
+    if (bytes % (ranks * 16)) return false;
+    CustomArRankData *rankData = nullptr;
+    if (!FindOrRegisterCustomArPointers(state, rank, data, count, dataType,
+            data && ((uintptr_t)data & 15u) == 0, rankData)) return false;
+    const int part = bytes / (ranks * 16);
+    const int blocks = std::max(1, std::min(kCustomArMaxBlocks,
+        (part + kCustomArThreads - 1) / kCustomArThreads));
+#define CUSTOM_AG_RANK_CASE(RANKS)                                           \
+    case RANKS:                                                             \
+        if (RANKS > 2 && part <= kCustomArThreads / 2)                       \
+            FastllmCustomAllGatherInplaceKernel<RANKS, true>                  \
+                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
+                    rankData, state.allSignals, state.allSignals.signals[rank], \
+                    reinterpret_cast<uint4 *>(data), rank, part);            \
+        else                                                                 \
+            FastllmCustomAllGatherInplaceKernel<RANKS, false>                 \
+                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
+                    rankData, state.allSignals, state.allSignals.signals[rank], \
+                    reinterpret_cast<uint4 *>(data), rank, part);            \
+        break
+    switch (ranks) {
+        CUSTOM_AG_RANK_CASE(2);
+        CUSTOM_AG_RANK_CASE(4);
+        CUSTOM_AG_RANK_CASE(6);
+        CUSTOM_AG_RANK_CASE(8);
+        default: return false;
+    }
+#undef CUSTOM_AG_RANK_CASE
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        std::fprintf(stderr, "[Fastllm] custom all-gather launch failed on GPU %d: %s.\n",
+                     deviceId, cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaCustomAllGatherAddRMSNorm(void *data, void *residual,
+        const float *weight, void *output, int count, int channels,
+        float eps, int dataType, int deviceId) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    if (dataType != fastllm::BFLOAT16 || channels != 4096 || count <= 0 ||
+        count % channels || (size_t)count * 2 > CustomArMaxBytes() ||
+        !std::isfinite(eps) || eps <= 0) return false;
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    if (!lease.Acquire(state, channels * 2, dataType, deviceId, true, rank)) return false;
+    const int rows = count / channels, ranks = state.devices.size();
+    const bool aligned = data && residual && weight && output &&
+        (((uintptr_t)data | (uintptr_t)residual | (uintptr_t)weight | (uintptr_t)output) & 15u) == 0;
+    auto disjoint = [count](const void *a, const void *b) {
+        uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+        return (x > y ? x - y : y - x) >= (size_t)count * 2;
+    };
+    const bool eligible = aligned && rows % ranks == 0 && FastllmCudaRuntimeArch() == 90 &&
+        disjoint(data, residual) && disjoint(data, output) && disjoint(residual, output);
+    CustomArRankData *pointers = nullptr;
+    if (!FindOrRegisterCustomArPointers(state, rank, data, count, dataType,
+                                      eligible, pointers)) return false;
+    auto *hidden = (CustomArNormBF16 *)residual;
+    auto *normed = (CustomArNormBF16 *)output;
+    const int rowsPerBlock = rows <= 32 ? 1 : rows <= 64 ? 2 : 4;
+    // Once the bounded collective grid would serialize row groups, coalesce
+    // the peer reads and residual stores, then let PDL launch one Norm CTA per
+    // row. Both paths use the same 256-thread reduction and existing buffers.
+    const bool splitNorm = rows > 4 * kCustomArMaxBlocks;
+    const int part = count / (ranks * 8);
+    const int blocks = std::min(splitNorm ? (part + 511) / 512 :
+                               (rows + rowsPerBlock - 1) / rowsPerBlock, kCustomArMaxBlocks);
+#define CUSTOM_AG_NORM_RANK_CASE(RANKS)                                      \
+    case RANKS:                                                             \
+        if (splitNorm)                                                      \
+            FastllmCustomAllGatherResidualKernel<RANKS>                      \
+            <<<blocks, 512, 0, cudaStreamPerThread>>>(                       \
+                pointers, state.allSignals, state.allSignals.signals[rank], \
+                hidden, rank, part);                                       \
+        else if (rowsPerBlock == 1)                                         \
+            FastllmCustomAllGatherRMSNormKernel<RANKS, 1>                    \
+            <<<blocks, 256, 0, cudaStreamPerThread>>>(                       \
+                pointers, state.allSignals, state.allSignals.signals[rank], \
+                hidden, weight, normed, eps, rank, rows);                   \
+        else if (rowsPerBlock == 2)                                         \
+            FastllmCustomAllGatherRMSNormKernel<RANKS, 2>                    \
+            <<<blocks, 512, 0, cudaStreamPerThread>>>(                       \
+                pointers, state.allSignals, state.allSignals.signals[rank], \
+                hidden, weight, normed, eps, rank, rows);                   \
+        else                                                               \
+            FastllmCustomAllGatherRMSNormKernel<RANKS, 4>                    \
+            <<<blocks, 1024, 0, cudaStreamPerThread>>>(                      \
+                pointers, state.allSignals, state.allSignals.signals[rank], \
+                hidden, weight, normed, eps, rank, rows);                   \
+        break
+    switch (ranks) {
+        CUSTOM_AG_NORM_RANK_CASE(2);
+        CUSTOM_AG_NORM_RANK_CASE(4);
+        CUSTOM_AG_NORM_RANK_CASE(6);
+        CUSTOM_AG_NORM_RANK_CASE(8);
+        default: return false;
+    }
+#undef CUSTOM_AG_NORM_RANK_CASE
+    cudaError_t status = cudaGetLastError();
+    if (status == cudaSuccess && splitNorm) {
+        cudaLaunchConfig_t config{};
+        config.gridDim = dim3(rows);
+        config.blockDim = dim3(256);
+        config.stream = cudaStreamPerThread;
+        cudaLaunchAttribute attribute{};
+        attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute.val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = &attribute;
+        config.numAttrs = 1;
+        status = cudaLaunchKernelEx(&config, FastllmCustomRMSNormPdlKernel,
+            (const CustomArNormBF16 *)hidden, weight, normed, eps);
+    }
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        // In the split path the residual kernel may already be queued. A
+        // fallback would add it twice; only pre-launch rejection returns false.
+        throw std::runtime_error(std::string("Fused all-gather RMSNorm launch failed: ") +
+                                 cudaGetErrorString(status));
+    }
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool FastllmCudaCustomAllReducePairAdd(void *first, void *second, void *dest,

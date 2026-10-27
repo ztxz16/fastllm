@@ -18,6 +18,9 @@ namespace fastllm {
     void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output);
     void DoCudaSwigluReshape(Data &input, Data &output);
     void DoCudaSwiglu(Data &input, Data &output);
+    bool CanUseCudaCutlassSwigluLinear(int rows, bool tensorParallel = false);
+    bool CanUseCudaTritonSwigluLinear(int rows = 0, bool hasBias = false, bool packedWeight = false);
+    bool DoCudaTritonSwigluLinear(Data &input, Data &weight, const Data &bias, Data &output);
     void DoCudaGegluReshape(Data &input, Data &output);
     void DoCudaGeglu(Data &input, Data &output);
     void DoCudaSplitReshape(Data &input, int axis, int start, int end, Data &output);
@@ -26,7 +29,11 @@ namespace fastllm {
     void DoCudaCatDirectBatch(Data **input0s, Data **input1s, int batch, int axis);
     void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis);
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
-        Data **weights, Data **biass, float sharedScale, MoeGateType gateType = MoeGateSwiglu, int weightsBatch = -1);
+        Data **weights, Data **biass, float sharedScale, MoeGateType gateType = MoeGateSwiglu, int weightsBatch = -1, float swigluLimit = 0.0f, bool deepSeekV41 = false);
+    // Eager reference for unsupported V4.1 layouts and numerical regression.
+    // Requires the original expert allocations; unavailable after Marlin repack.
+    void DoCudaMergeMOEV41Fallback(Data &input, Data &output, Data &index, Data &score,
+        Data **weights, int weightsBatch, float sharedScale, float swigluLimit);
     void DoCudaFusedMOE(Data &input, Data &output, Data &index, Data &score,
         Data &gate, Data &up, Data &down, Data &w1,
         MoeGateType gateType = MoeGateSwiglu, float swigluLimit = 0.0f,
@@ -365,6 +372,67 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class CudaDeepSeekV41HcMixOp : CpuDeepSeekV41HcMixOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41HcApplyPreOp : CpuDeepSeekV41HcApplyPreOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41EngramApplyOp : CpuDeepSeekV41EngramApplyOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41RotaryQuantOp : CpuDeepSeekV41RotaryQuantOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41CompressOp : CpuDeepSeekV41CompressOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41IndexerScoreOp : CpuDeepSeekV41IndexerScoreOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41CandidateBlocksOp : CpuDeepSeekV41CandidateBlocksOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41IndexerTopKOp : CpuDeepSeekV41IndexerTopKOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41SparseAttentionOp : CpuDeepSeekV41SparseAttentionOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41WindowStoreOp : CpuDeepSeekV41WindowStoreOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41QuantizeActivationOp : CpuDeepSeekV41QuantizeActivationOp {
+    public:
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaDeepSeekV41QuantizeKVOp : CpuDeepSeekV41QuantizeKVOp {
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class CudaCatOp : CpuCatOp {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
@@ -476,6 +544,7 @@ namespace fastllm {
     };
 
     class CudaMakeDecayMaskOp : CpuMakeDecayMaskOp {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 

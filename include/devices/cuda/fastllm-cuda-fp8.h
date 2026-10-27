@@ -10,3 +10,7 @@ class Data;
 // Returns false for ineligible weights/row counts or a deferred conversion,
 // without changing the weight storage.
 bool FastllmCudaWarmupFp8E4M3Sm70(fastllm::Data &weight, int rows);
+
+// Marlin-packed FP8 -> FP16 with Marlin's rounded scales; cuBLAS alpha=1.
+// Keeps the packed source intact for decode. Uses cudaStreamPerThread.
+bool FastllmCudaDequantFp8MarlinForCublas(fastllm::Data &weight, void *destination);

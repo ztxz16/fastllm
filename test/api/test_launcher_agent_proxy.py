@@ -91,6 +91,14 @@ class AgentProxyTest(unittest.TestCase):
         self.assertEqual(self.received[-1]["authorization"], self.proxy.authorization)
         self.assertNotIn("cookie", self.received[-1])
 
+    def test_get_stays_bodyless_and_post_keeps_its_body(self):
+        self.client.get(self.proxy.url)
+        response = self.client.get('/native')
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('transfer-encoding', self.received[-1])
+        response = self.client.post('/message', content='message body')
+        self.assertEqual(response.json()['body'], 'message body')
+
     def test_appearance_is_added_only_to_opencode_documents_and_keeps_authentication(self):
         self.assertEqual(self.client.get('/_ftllm/opencode/appearance.js').status_code, 403)
         self.client.get(self.proxy.url)

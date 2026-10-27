@@ -90,6 +90,8 @@ namespace fastllm {
 
         virtual void WarmUp(); // 预热
 
+        bool SupportsKvMem() const override { return true; }
+        uint64_t KvMemLayerBytesPerToken(int) const override { return 4ULL * num_key_value_heads * head_dim; }
         virtual bool CanUseGPUForward() const override;
 
         virtual void OnAutoWarmupFinished() override;

@@ -1,12 +1,38 @@
 # Qwen3.5 / Qwen3.6 / Qwen3.8 部署指南
 
+面向自动化 agent 的模型簇选择、`--auto` 启动和参数表见 [模型部署速查](model-deployment-agent.md)。建议把该页交给 agent 先读，再按本页的手动参数做固定实验。
+
 [English](qwen3_en.md) · [返回 README](../README.md) · [Qwen4-Exp](qwen4.md) · [Benchmark](benchmarks/qwen3.md)
 
 本文面向当前 Qwen3.5、Qwen3.6 和 Qwen3.8 模型，包含 GGUF 多模态部署说明。Qwen4-Exp / Qwen3.8-Flash-Next 使用独立架构，请阅读 [Qwen4-Exp 部署说明](qwen4.md)。
 
 不同 checkpoint 可能是稠密、MoE、FP8、NVFP4 或其他量化格式。首次启动建议保留 `--dtype auto`，再根据显存和实测结果调整。
 
-## API Server 快速启动
+## 自动配置（推荐）
+
+Qwen3.8 27B 属于 Qwen3.5 架构。Qwen3.8-27B-FP8 的稠密 HF checkpoint 已验证 `--auto`，默认使用纯 GPU TP、并发 4 和内置 MTP5，按预算选择最长的原生上下文。其他格式仍可使用下方 CUDA/TP 手动配置。Flash-Next 混合推理见[独立指南](qwen3.8-flash-next/README.md)。
+
+~~~bash
+ftllm server /data/models/Qwen3.8-27B-FP8 \
+  --auto --model_name qwen3.8-27b \
+  --host 0.0.0.0 --port 8080
+~~~
+
+`--auto` 优先尝试双卡 TP，显存不足时尝试四卡 TP 和较短上下文。显式指定 `--tp`、`--max_batch`、`--max_context_length`、`--tokens` 或 `--mtp 0` 可覆盖默认值。`--auto_gpu_memory_limit` 和 `--auto_host_memory_limit` 仅约束自动规划预算。
+
+在 Linux NVIDIA CUDA 环境下，先用上面的命令启动，再按需追加：
+
+| 需要调整 | 追加参数 |
+| --- | --- |
+| 单会话 32K 窗口、最多 2 个并发 | `--max_context_length 32768 --max_batch 2` |
+| 关闭推测解码 | `--speculative_algorithm off` |
+| 改用 3 个内置 MTP 草稿 | `--mtp 3` |
+| 限制规划资源 | `--auto_gpu_memory_limit 20g --auto_host_memory_limit 120g` |
+| 固定输入分块 | `--chunked_prefill_size 4096` |
+
+删除显式参数即可恢复自动选择。参数影响和启动器操作见 [`--auto` 调节指南](auto.md)。下方手动命令适用于固定设备、其他格式或 CPU 部署；不要把整组手动参数追加到 `--auto`。
+
+## 手动配置参考
 
 ~~~bash
 ftllm server /data/models/qwen \
@@ -100,7 +126,7 @@ ftllm server /data/models/qwen \
   --gpu_mem_ratio 0.9
 ~~~
 
-`--max_context_length` 是输入与输出合计上限。超出模型声明值时须指定有效的 `--rope_scaling`，容量不足会在启动时失败。Qwen3 的 YaRN 需要明确原始长度（常见为 32768）；具体配置和验证范围见[上下文扩展](context-length-extension-design.md)。实际窗口可从 `/v1/models` 查询。
+`--max_context_length` 是输入与输出合计上限。超出模型声明值时须指定有效的 `--rope_scaling`，容量不足会在启动时失败。Qwen3 的 YaRN 需要明确原始长度（常见为 32768）；具体配置和验证范围见[上下文扩展](context-length-extension.md)。实际窗口可从 `/v1/models` 查询。
 
 ## MTP
 

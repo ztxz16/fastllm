@@ -10,6 +10,7 @@
 
 #include "utils.h"
 #include "fastllm.h"
+#include "gguf.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -21,6 +22,72 @@
 
 namespace fastllm {
     extern void AddBiasAVX512(float *outputData, float *biasData, int n, int k, int st, int end);
+
+#ifdef __AVX512BF16__
+    template <int rows>
+    static void GemvBFloat16IQ4XSRows(const uint16_t *input, const uint8_t *weights,
+                                    size_t rowBytes, float *output, int columns) {
+        const __m128i levels = _mm_setr_epi8(
+            -127, -104, -83, -65, -49, -35, -22, -10,
+            1, 13, 25, 38, 53, 69, 89, 113);
+        const __m128i mask = _mm_set1_epi8(15);
+        const block_iq4_xs *w[rows];
+        __m512 sums[rows];
+        for (int r = 0; r < rows; ++r) {
+            w[r] = reinterpret_cast<const block_iq4_xs *>(weights + r * rowBytes);
+            sums[r] = _mm512_setzero_ps();
+        }
+        for (int b = 0; b < columns / QK_K; ++b) {
+            float scales[rows];
+            for (int r = 0; r < rows; ++r) {
+                scales[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(w[r][b].d)));
+            }
+            for (int s = 0; s < 8; ++s) {
+                const auto x = (__m512bh)_mm512_loadu_si512(input + b * QK_K + s * 32);
+                for (int r = 0; r < rows; ++r) {
+                    const auto &q = w[r][b];
+                    const int scale = ((q.scales_l[s / 2] >> (4 * (s % 2))) & 15) |
+                                      (((q.scales_h >> (2 * s)) & 3) << 4);
+                    const auto d = _mm512_set1_ps(scales[r] * (scale - 32));
+                    const auto bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q.qs + s * 16));
+                    const auto lo = _mm_shuffle_epi8(levels, _mm_and_si128(bits, mask));
+                    const auto hi = _mm_shuffle_epi8(levels, _mm_and_si128(_mm_srli_epi16(bits, 4), mask));
+                    const auto f0 = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(lo)));
+                    const auto f1 = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(hi)));
+                    // Preserve the fallback's FP32 dequant -> BF16 RNE boundary
+                    // and its sequential 32-element dot accumulation. Only the
+                    // temporary FP32/BF16 weight matrices are eliminated.
+                    const auto values = _mm512_cvtne2ps_pbh(f1, f0);
+                    sums[r] = _mm512_dpbf16_ps(sums[r], values, x);
+                }
+            }
+        }
+        for (int r = 0; r < rows; ++r) output[r] = _mm512_reduce_add_ps(sums[r]);
+    }
+#endif
+
+    bool FastllmGemmBFloat16IQ4XS_AVX512BF16(
+            const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+            int n, int m, int k, int st, int end) {
+#ifdef __AVX512BF16__
+        if (n != 1 || m <= 0 || m % QK_K != 0 || st < 0 || end < st || end > k ||
+            lda < long(m * sizeof(uint16_t)) || ldc < long(k * sizeof(float)) ||
+            ldb < long(size_t(m / QK_K) * sizeof(block_iq4_xs))) return false;
+        const auto *input = static_cast<const uint16_t *>(A);
+        const auto *weights = static_cast<const uint8_t *>(B);
+        auto *output = static_cast<float *>(C);
+        int r = st;
+        for (; r + 4 <= end; r += 4) {
+            GemvBFloat16IQ4XSRows<4>(input, weights + r * ldb, ldb, output + r, m);
+        }
+        for (; r < end; ++r) {
+            GemvBFloat16IQ4XSRows<1>(input, weights + r * ldb, ldb, output + r, m);
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
 
     bool Float32ToBFloat16_AVX512BF16_RNE(float *float32, uint16_t *bfloat16, int len) {
 #ifdef __AVX512BF16__
@@ -601,15 +668,31 @@ namespace fastllm {
     }
 
 #ifdef __AVX512BF16__
+    static inline __m512bh FP8E4M3ToBFloat16_AVX512BF16(__m256i bytes) {
+        const __m512i words = _mm512_cvtepu8_epi16(bytes);
+        const __m512i magnitude = _mm512_and_si512(words, _mm512_set1_epi16(0x7f));
+        const __m512i sign = _mm512_slli_epi16(
+            _mm512_and_si512(words, _mm512_set1_epi16(0x80)), 8);
+        // Convert to actual BF16 values before the dot product. Scaling an
+        // exponent-biased dot product by 2^120 afterwards loses small products
+        // because VDPBF16PS flushes subnormal FP32 intermediates to zero.
+        const __m512i normal = _mm512_add_epi16(
+            _mm512_slli_epi16(magnitude, 4), _mm512_set1_epi16(0x3c00));
+        const __m512i subnormalTable = _mm512_setr_epi32(
+            0x3b000000, 0x3bc03b80, 0x3c203c00, 0x3c603c40,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        const __m512i subnormal = _mm512_permutexvar_epi16(magnitude, subnormalTable);
+        const __mmask32 tiny = _mm512_cmplt_epi16_mask(magnitude, _mm512_set1_epi16(8));
+        return (__m512bh)_mm512_or_si512(sign, _mm512_mask_mov_epi16(normal, tiny, subnormal));
+    }
+
     static inline void
     LinearBFloat16FP8E4M3Block128TwoRows_AVX512BF16(
             const uint16_t *inputData, const uint8_t *weightData,
             float *outputData, int m, int k, int st, int end,
-            size_t perRow, float magicScale) {
+            size_t perRow) {
         constexpr int blockM = 128;
         const int numBlocks = (m + blockM - 1) / blockM;
-        const __m256i signMask = _mm256_set1_epi8((char)0x80);
-        const __m256i valueMask = _mm256_set1_epi8(0x7f);
 
         for (int outputRow = st; outputRow < end; outputRow++) {
             __m512 sum0 = _mm512_setzero_ps();
@@ -629,13 +712,7 @@ namespace fastllm {
                      column += 32) {
                     const __m256i bytes = _mm256_loadu_si256(
                         (const __m256i*)(fp8 + column - blockStart));
-                    const __m512i signWords = _mm512_cvtepu8_epi16(
-                        _mm256_and_si256(bytes, signMask));
-                    const __m512i valueWords = _mm512_cvtepu8_epi16(
-                        _mm256_and_si256(bytes, valueMask));
-                    const __m512bh weights = (__m512bh)_mm512_or_si512(
-                        _mm512_slli_epi16(signWords, 8),
-                        _mm512_slli_epi16(valueWords, 4));
+                    const __m512bh weights = FP8E4M3ToBFloat16_AVX512BF16(bytes);
                     const __m512bh input0 =
                         (__m512bh)_mm512_loadu_si512(
                             (const __m512i*)(inputData + column));
@@ -658,25 +735,322 @@ namespace fastllm {
             }
 
             outputData[outputRow] =
-                _mm512_reduce_add_ps(sum0) * magicScale;
+                _mm512_reduce_add_ps(sum0);
             outputData[(size_t)k + outputRow] =
-                _mm512_reduce_add_ps(sum1) * magicScale;
+                _mm512_reduce_add_ps(sum1);
         }
     }
 
 #endif
+
+    // Eager finegrained FP8 uses FP32 -> FP16 RTZ -> E4M3 RNE, with an
+    // ordinary amax/448 scale. Do not use the power-of-two DeepSeek encoder.
+    bool QuantizeEagerFP8_AVX512BF16(const float *values, uint8_t *output, int rows, int columns) {
+#ifdef __AVX512BF16__
+        if (columns % 16 != 0) return false;
+        const size_t rowBytes = GetDataBytes(DataType::FP8_E4M3_BLOCK_128, 1, columns);
+        for (int row = 0; row < rows; ++row) {
+            for (int start = 0; start < columns; start += 128) {
+                const int count = std::min(128, columns - start);
+                const float *source = values + (size_t)row * columns + start;
+                uint8_t *target = output + (size_t)row * rowBytes + (start / 128) * 132;
+                __m512 maximum = _mm512_setzero_ps();
+                for (int i = 0; i < count; i += 16) {
+                    __m512 v = _mm512_castsi512_ps(_mm512_and_si512(
+                        _mm512_castps_si512(_mm512_loadu_ps(source + i)), _mm512_set1_epi32(0x7fffffff)));
+                    maximum = _mm512_max_ps(v, maximum);
+                }
+                const float scale = _mm512_reduce_max_ps(maximum) * (1.0f / 448.0f);
+                const __m512 divisor = _mm512_set1_ps(std::max(scale, 1e-12f));
+                for (int i = 0; i < count; i += 16) {
+                    const __m512 normalized = _mm512_div_ps(_mm512_loadu_ps(source + i), divisor);
+                    const __m512i bits = _mm512_and_si512(_mm512_castps_si512(normalized), _mm512_set1_epi32(0xffffe000u));
+                    const __m512i sign = _mm512_and_si512(_mm512_srli_epi32(bits, 24), _mm512_set1_epi32(128));
+                    const __m512i magnitude = _mm512_and_si512(bits, _mm512_set1_epi32(0x7fffffff));
+                    const __m512i clipped = _mm512_min_epu32(magnitude, _mm512_set1_epi32(0x43e00000)); // 448
+                    const __m512i rounded = _mm512_add_epi32(clipped, _mm512_add_epi32(
+                        _mm512_set1_epi32(0x7ffff), _mm512_and_si512(_mm512_srli_epi32(clipped, 20), _mm512_set1_epi32(1))));
+                    __m512i code = _mm512_srli_epi32(_mm512_sub_epi32(rounded, _mm512_set1_epi32(0x3c000000)), 20);
+                    const __m512i tiny = _mm512_cvt_roundps_epi32(
+                        _mm512_mul_ps(_mm512_castsi512_ps(clipped), _mm512_set1_ps(512.0f)),
+                        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                    code = _mm512_mask_mov_epi32(code, _mm512_cmplt_epu32_mask(clipped, _mm512_set1_epi32(0x3c800000)), tiny);
+                    code = _mm512_mask_mov_epi32(code, _mm512_cmpgt_epu32_mask(magnitude, _mm512_set1_epi32(0x7f800000)), _mm512_set1_epi32(127));
+                    _mm_storeu_si128((__m128i *)(target + i), _mm512_cvtepi32_epi8(_mm512_or_si512(code, sign)));
+                }
+                std::memcpy(target + count, &scale, sizeof(scale));
+            }
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
+#ifdef __AVX512BF16__
+    template<int Rows, int Cols>
+    static inline void GemmEagerFP8Tile(const uint16_t *a, const float *scales, const uint8_t *b,
+                                       long ldb, uint8_t *c, long ldc, int m, int col) {
+        const int blocks = (m + 127) / 128;
+        float sums[Rows][Cols] = {};
+        for (int block = 0; block < blocks; ++block) {
+            const int start = block * 128, count = std::min(128, m - start);
+            __m512 accum[Rows][Cols];
+#pragma GCC unroll 8
+            for (int r = 0; r < Rows; ++r)
+#pragma GCC unroll 4
+                for (int j = 0; j < Cols; ++j) accum[r][j] = _mm512_setzero_ps();
+            for (int i = 0; i < count; i += 32) {
+                __m512bh inputs[Rows];
+#pragma GCC unroll 8
+                for (int r = 0; r < Rows; ++r)
+                    inputs[r] = (__m512bh)_mm512_loadu_si512(a + (size_t)r * m + start + i);
+#pragma GCC unroll 4
+                for (int j = 0; j < Cols; ++j) {
+                    const __m512bh weights = FP8E4M3ToBFloat16_AVX512BF16(
+                        _mm256_loadu_si256((const __m256i *)(b + (size_t)(col + j) * ldb + block * 132 + i)));
+#pragma GCC unroll 8
+                    for (int r = 0; r < Rows; ++r)
+                        accum[r][j] = _mm512_dpbf16_ps(accum[r][j], inputs[r], weights);
+                }
+            }
+#pragma GCC unroll 4
+            for (int j = 0; j < Cols; ++j) {
+                float bs;
+                std::memcpy(&bs, b + (size_t)(col + j) * ldb + block * 132 + count, sizeof(bs));
+#pragma GCC unroll 8
+                for (int r = 0; r < Rows; ++r) {
+                    // Preserve the dot reduction and separate scale rounding.
+                    float dot = _mm512_reduce_add_ps(accum[r][j]);
+                    sums[r][j] += (dot * scales[r * blocks + block]) * bs;
+                }
+            }
+        }
+        for (int r = 0; r < Rows; ++r)
+            for (int j = 0; j < Cols; ++j) ((float *)(c + r * ldc))[col + j] = sums[r][j];
+    }
+
+    template<int Rows>
+    static void GemmEagerFP8Rows(const uint16_t *a, const float *scales, const uint8_t *b,
+                                long ldb, uint8_t *c, long ldc, int m, int st, int end) {
+        // Tile both tokens and outputs, sharing weight conversion across tokens
+        // and activation loads across outputs without spilling vector registers.
+        constexpr int Cols = Rows <= 2 ? 1 : (Rows <= 4 ? 4 : 2);
+        int col = st;
+        for (; col + Cols <= end; col += Cols)
+            GemmEagerFP8Tile<Rows, Cols>(a, scales, b, ldb, c, ldc, m, col);
+        switch (end - col) {
+            case 3: GemmEagerFP8Tile<Rows, 3>(a, scales, b, ldb, c, ldc, m, col); break;
+            case 2: GemmEagerFP8Tile<Rows, 2>(a, scales, b, ldb, c, ldc, m, col); break;
+            case 1: GemmEagerFP8Tile<Rows, 1>(a, scales, b, ldb, c, ldc, m, col); break;
+        }
+    }
+    // Transpose 16 BF16-pair vectors, using the same unpack/shuffle stages
+    // as the AMX weight packer. Each result holds one K pair for 16 outputs.
+    static inline void TransposeEagerFP8Pairs(__m512i *v) {
+        __m512i t[16];
+        for (int i = 0; i < 16; i += 2) {
+            t[i] = _mm512_unpacklo_epi32(v[i], v[i + 1]);
+            t[i + 1] = _mm512_unpackhi_epi32(v[i], v[i + 1]);
+        }
+        for (int i = 0; i < 16; i += 4) {
+            v[i] = _mm512_unpacklo_epi64(t[i], t[i + 2]);
+            v[i + 1] = _mm512_unpackhi_epi64(t[i], t[i + 2]);
+            v[i + 2] = _mm512_unpacklo_epi64(t[i + 1], t[i + 3]);
+            v[i + 3] = _mm512_unpackhi_epi64(t[i + 1], t[i + 3]);
+        }
+        for (int i = 0; i < 4; ++i) {
+            t[i] = _mm512_shuffle_i32x4(v[i], v[i + 4], 0x88);
+            t[i + 4] = _mm512_shuffle_i32x4(v[i], v[i + 4], 0xdd);
+            t[i + 8] = _mm512_shuffle_i32x4(v[i + 8], v[i + 12], 0x88);
+            t[i + 12] = _mm512_shuffle_i32x4(v[i + 8], v[i + 12], 0xdd);
+        }
+        for (int i = 0; i < 8; ++i) {
+            v[i] = _mm512_shuffle_i32x4(t[i], t[i + 8], 0x88);
+            v[i + 8] = _mm512_shuffle_i32x4(t[i], t[i + 8], 0xdd);
+        }
+    }
+
+    template<int Rows, int Cols>
+    static inline void GemmEagerFP8PackedTile(
+            const uint16_t *a, const uint16_t *b, const float *as,
+            const float *bs, float *output, int m, int blocks,
+            int columns, int count) {
+        __m512 accum[Rows][Cols];
+#pragma GCC unroll 8
+        for (int r = 0; r < Rows; ++r)
+#pragma GCC unroll 2
+            for (int c = 0; c < Cols; ++c) accum[r][c] = _mm512_setzero_ps();
+        for (int pair = 0; pair < count / 2; ++pair) {
+            __m512bh weights[Cols];
+#pragma GCC unroll 2
+            for (int c = 0; c < Cols; ++c)
+                weights[c] = (__m512bh)_mm512_loadu_si512(b + c * 16 * 128 + pair * 32);
+#pragma GCC unroll 8
+            for (int r = 0; r < Rows; ++r) {
+                uint32_t activation;
+                std::memcpy(&activation, a + (size_t)r * m + pair * 2, sizeof(activation));
+                const __m512bh value = (__m512bh)_mm512_set1_epi32(activation);
+#pragma GCC unroll 2
+                for (int c = 0; c < Cols; ++c)
+                    accum[r][c] = _mm512_dpbf16_ps(accum[r][c], value, weights[c]);
+            }
+        }
+#pragma GCC unroll 2
+        for (int c = 0; c < Cols; ++c) {
+            const __m512 weightScale = _mm512_loadu_ps(bs + c * 16);
+#pragma GCC unroll 8
+            for (int r = 0; r < Rows; ++r) {
+                // Scale only after the 128-element dot, in the original order.
+                __m512 value = _mm512_mul_ps(accum[r][c], _mm512_set1_ps(as[r * blocks]));
+                value = _mm512_mul_ps(value, weightScale);
+                float *out = output + r * columns + c * 16;
+                _mm512_storeu_ps(out, _mm512_add_ps(_mm512_loadu_ps(out), value));
+            }
+        }
+    }
+
+    static void GemmEagerFP8Prefill(
+            const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+            int n, int m, int st, int end) {
+        const int blocks = (m + 127) / 128;
+        const int columns = (end - st + 15) / 16 * 16;
+        thread_local std::vector<uint16_t> activations, packedWeight;
+        thread_local std::vector<float> activationScales, weightScales, sums;
+        activations.resize((size_t)n * m);
+        activationScales.resize((size_t)n * blocks);
+        packedWeight.resize((size_t)columns * 128);
+        weightScales.resize(columns);
+        sums.assign((size_t)n * columns, 0.0f);
+        // Resolve TLS once. In a shared library, repeated vector::data()
+        // expressions can emit __tls_get_addr calls inside the hot loops.
+        uint16_t *activationData = activations.data();
+        uint16_t *packedData = packedWeight.data();
+        float *activationScaleData = activationScales.data();
+        float *weightScaleData = weightScales.data();
+        float *sumData = sums.data();
+        for (int row = 0; row < n; ++row) for (int block = 0; block < blocks; ++block) {
+            const int start = block * 128, count = std::min(128, m - start);
+            const uint8_t *source = (const uint8_t *)A + (size_t)row * lda + block * 132;
+            for (int i = 0; i < count; i += 32) {
+                _mm512_storeu_si512(activationData + (size_t)row * m + start + i,
+                    (__m512i)FP8E4M3ToBFloat16_AVX512BF16(
+                        _mm256_loadu_si256((const __m256i *)(source + i))));
+            }
+            std::memcpy(&activationScaleData[row * blocks + block], source + count, sizeof(float));
+        }
+        // Pack only the current scale block, not another full model copy.
+        // A normal 64-column task needs 16 KiB of decoded weight scratch.
+        for (int block = 0; block < blocks; ++block) {
+            const int start = block * 128, count = std::min(128, m - start);
+            for (int col = 0; col < columns; col += 16) {
+                for (int i = 0; i < count; i += 32) {
+                    __m512i pairs[16];
+                    for (int j = 0; j < 16; ++j) {
+                        pairs[j] = col + j < end - st ?
+                            (__m512i)FP8E4M3ToBFloat16_AVX512BF16(_mm256_loadu_si256(
+                                (const __m256i *)((const uint8_t *)B + (size_t)(st + col + j) * ldb + block * 132 + i))) :
+                            _mm512_setzero_si512();
+                    }
+                    TransposeEagerFP8Pairs(pairs);
+                    for (int j = 0; j < 16; ++j)
+                        _mm512_storeu_si512(packedData + col * 128 + (i / 2 + j) * 32, pairs[j]);
+                }
+                for (int j = 0; j < 16; ++j) {
+                    weightScaleData[col + j] = 0;
+                    if (col + j < end - st)
+                        std::memcpy(&weightScaleData[col + j], (const uint8_t *)B +
+                            (size_t)(st + col + j) * ldb + block * 132 + count, sizeof(float));
+                }
+            }
+            for (int row = 0; row < n; row += 8) for (int col = 0; col < columns; col += 32) {
+                const uint16_t *a = activationData + (size_t)row * m + start;
+                const uint16_t *b = packedData + col * 128;
+                const float *as = activationScaleData + row * blocks + block;
+                const float *bs = weightScaleData + col;
+                float *out = sumData + (size_t)row * columns + col;
+#define FASTLLM_EAGER_FP8_TILE(R) \
+                if (col + 32 <= columns) GemmEagerFP8PackedTile<R, 2>(a, b, as, bs, out, m, blocks, columns, count); \
+                else GemmEagerFP8PackedTile<R, 1>(a, b, as, bs, out, m, blocks, columns, count)
+                switch (std::min(8, n - row)) {
+                    case 8: FASTLLM_EAGER_FP8_TILE(8); break;
+                    case 7: FASTLLM_EAGER_FP8_TILE(7); break;
+                    case 6: FASTLLM_EAGER_FP8_TILE(6); break;
+                    case 5: FASTLLM_EAGER_FP8_TILE(5); break;
+                    case 4: FASTLLM_EAGER_FP8_TILE(4); break;
+                    case 3: FASTLLM_EAGER_FP8_TILE(3); break;
+                    case 2: FASTLLM_EAGER_FP8_TILE(2); break;
+                    case 1: FASTLLM_EAGER_FP8_TILE(1); break;
+                }
+#undef FASTLLM_EAGER_FP8_TILE
+            }
+        }
+        for (int row = 0; row < n; ++row)
+            std::memcpy((uint8_t *)C + (size_t)row * ldc + st * sizeof(float),
+                        sumData + (size_t)row * columns, (end - st) * sizeof(float));
+    }
+#endif
+
+    bool FastllmGemmFP8Block128_AVX512BF16(
+            const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+            int n, int m, int st, int end) {
+#ifdef __AVX512BF16__
+        if (m % 32 != 0) return false;
+        // Small expert groups cannot amortize the transpose. Keep the
+        // original row-dot kernel for decode and short prompts.
+        if (n >= 16 && end - st >= 16) {
+            GemmEagerFP8Prefill(A, lda, B, ldb, C, ldc, n, m, st, end);
+            return true;
+        }
+        // Small and ragged expert groups use up to eight rows per weight pass.
+        thread_local std::vector<uint16_t> decoded;
+        thread_local std::vector<float> scales;
+        const int blocks = (m + 127) / 128;
+        decoded.resize((size_t)std::min(n, 8) * m);
+        scales.resize((size_t)std::min(n, 8) * blocks);
+        uint16_t *decodedData = decoded.data();
+        float *scaleData = scales.data();
+        for (int row = 0; row < n; row += 8) {
+            const int rows = std::min(8, n - row);
+            for (int r = 0; r < rows; ++r) for (int block = 0; block < blocks; ++block) {
+                const int start = block * 128, count = std::min(128, m - start);
+                const uint8_t *a = (const uint8_t *)A + (size_t)(row + r) * lda + block * 132;
+                for (int i = 0; i < count; i += 32) {
+                    _mm512_storeu_si512(decodedData + (size_t)r * m + start + i,
+                        (__m512i)FP8E4M3ToBFloat16_AVX512BF16(_mm256_loadu_si256((const __m256i *)(a + i))));
+                }
+                std::memcpy(scaleData + r * blocks + block, a + count, sizeof(float));
+            }
+            uint8_t *c = (uint8_t *)C + (size_t)row * ldc;
+#define FASTLLM_FP8_ROWS(R) case R: GemmEagerFP8Rows<R>(decodedData, scaleData, (const uint8_t *)B, ldb, c, ldc, m, st, end); break
+            switch (rows) {
+                FASTLLM_FP8_ROWS(1);
+                FASTLLM_FP8_ROWS(2);
+                FASTLLM_FP8_ROWS(3);
+                FASTLLM_FP8_ROWS(4);
+                FASTLLM_FP8_ROWS(5);
+                FASTLLM_FP8_ROWS(6);
+                FASTLLM_FP8_ROWS(7);
+                FASTLLM_FP8_ROWS(8);
+            }
+#undef FASTLLM_FP8_ROWS
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
 
     bool LinearBFloat16_FP8E4M3BLOCK128_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
 #ifdef __AVX512BF16__
         static int block_size = 128;
         size_t perRow = GetDataBytes(DataType::FP8_E4M3_BLOCK_128, 1, m);
-        float magicScale = pow(2, 120);
 
         if (n == 2) {
             LinearBFloat16FP8E4M3Block128TwoRows_AVX512BF16(
                 inputData, weightData, outputData,
-                m, k, st, end, perRow, magicScale);
+                m, k, st, end, perRow);
             return true;
         }
         for (int i = 0; i < n; i++) {
@@ -684,8 +1058,6 @@ namespace fastllm {
             float *floatC = outputData + i * k;
 
             int j = st;
-            __m256i v_a_mask_byte = _mm256_set1_epi8(0x80); 
-            __m256i v_b_mask_byte = _mm256_set1_epi8(0x7F); 
             
             for (; j < end; j++) {
                 float now = 0.0f;
@@ -722,17 +1094,8 @@ namespace fastllm {
                         // 注意：fp8B指向当前block的开始，所以需要用 (l - blockStart) 作为偏移
                         __m256i va_bytes = _mm256_loadu_si256((__m256i*)(fp8B + (l - blockStart)));
 
-                        __m256i va_masked_bytes = _mm256_and_si256(va_bytes, v_a_mask_byte);
-                        __m512i va_promoted_words = _mm512_cvtepu8_epi16(va_masked_bytes);
-                        __m512i v_a_term_shifted = _mm512_slli_epi16(va_promoted_words, 8);
+                        __m512bh v_weights_bf16 = FP8E4M3ToBFloat16_AVX512BF16(va_bytes);
 
-                        __m256i vb_masked_bytes = _mm256_and_si256(va_bytes, v_b_mask_byte);
-                        __m512i vb_promoted_words = _mm512_cvtepu8_epi16(vb_masked_bytes);
-                        __m512i v_b_term_shifted = _mm512_slli_epi16(vb_promoted_words, 4);
-
-                        __m512i v_result = _mm512_or_si512(v_a_term_shifted, v_b_term_shifted);
-                        __m512bh v_weights_bf16 = (__m512bh)v_result;
-                        
                         // 3. Compute dot product: v_sum += v_input_bf16 * v_weights_bf16
                         v_sum = _mm512_dpbf16_ps(v_sum, v_input_bf16, v_weights_bf16);
                     }
@@ -745,7 +1108,7 @@ namespace fastllm {
                     last_sum = _mm512_fmadd_ps(v_sum, vScale, last_sum);
                 }
                 
-                now += _mm512_reduce_add_ps(last_sum) * magicScale;
+                now += _mm512_reduce_add_ps(last_sum);
                 floatC[j] = now;
             }
         }
@@ -1036,12 +1399,140 @@ namespace fastllm {
         }
     }
 
+    // A grouped expert prefill contains several tokens using the same weight
+    // rows. Decode each block once, then update independent token accumulators.
+    // Preserve each output's dpbf16/FMA accumulation and final reduction.
+    // COMBINE_SCALE moves the exact magic power of two onto bounded scales;
+    // other values retain the singleton kernel's separate scale multiply.
+    template <int TOKENS, int COLS, bool useLookup, bool COMBINE_SCALE>
+    static inline void LinearBFloat16NVFP4BatchCols_AVX512BF16(
+        const uint16_t *input, const uint8_t *weightRows, const float *biasData, float *output,
+        int outputCol, int m, int k, int blockK, const float *scales, const uint8_t *scaleBytes
+    ) {
+        __m512 acc[TOKENS][COLS];
+#pragma GCC unroll 8
+        for (int t = 0; t < TOKENS; ++t) {
+#pragma GCC unroll 4
+            for (int c = 0; c < COLS; ++c) acc[t][c] = _mm512_setzero_ps();
+        }
+        const int blocks = m / 32, packedM = m / 2;
+        const bool commonScale = outputCol / blockK == (outputCol + COLS - 1) / blockK;
+        const __m512 magic = _mm512_set1_ps(NVFP4_MAGIC_SCALE);
+        const __m512i lookup = NVFP4BFloat16Lookup_AVX512BF16();
+        for (int block = 0; block < blocks; ++block) {
+            __m512bh inputs[TOKENS];
+#pragma GCC unroll 8
+            for (int t = 0; t < TOKENS; ++t)
+                inputs[t] = (__m512bh)_mm512_loadu_si512(input + (size_t)t * m + block * 32);
+            auto getScale = [&](size_t index) {
+                if constexpr (COMBINE_SCALE) {
+                    return scales ? scales[index] * NVFP4_MAGIC_SCALE :
+                        NVFP4_E8M0_COMBINED_SCALE_LOOKUP[scaleBytes[index]];
+                }
+                return GetNVFP4ScaleValue(scales, scaleBytes, index);
+            };
+            const float sharedScale = getScale((size_t)(outputCol / blockK) * blocks + block);
+#pragma GCC unroll 4
+            for (int c = 0; c < COLS; ++c) {
+                const __m512bh weight = NVFP4ToBFloat16Linear_AVX512BF16<useLookup>(
+                    weightRows + (size_t)c * packedM + block * 16, lookup);
+                const __m512 scale = _mm512_set1_ps(commonScale ? sharedScale :
+                    getScale((size_t)((outputCol + c) / blockK) * blocks + block));
+#pragma GCC unroll 8
+                for (int t = 0; t < TOKENS; ++t) {
+                    const __m512 dot = _mm512_dpbf16_ps(_mm512_setzero_ps(), inputs[t], weight);
+                    if constexpr (COMBINE_SCALE)
+                        acc[t][c] = _mm512_fmadd_ps(dot, scale, acc[t][c]);
+                    else
+                        acc[t][c] = _mm512_fmadd_ps(_mm512_mul_ps(dot, magic), scale, acc[t][c]);
+                }
+            }
+        }
+#pragma GCC unroll 8
+        for (int t = 0; t < TOKENS; ++t) {
+#pragma GCC unroll 4
+            for (int c = 0; c < COLS; ++c)
+                output[(size_t)t * k + c] = (biasData ? biasData[outputCol + c] : 0.0f) +
+                    _mm512_reduce_add_ps(acc[t][c]);
+        }
+    }
+
+    template <int TOKENS, bool useLookup, bool COMBINE_SCALE>
+    static inline void LinearBFloat16NVFP4Batch_AVX512BF16(
+        const uint16_t *input, const uint8_t *weight, const float *bias, float *output,
+        int m, int k, int st, int end, int blockK, const float *scales, const uint8_t *scaleBytes
+    ) {
+        constexpr int COLS = TOKENS > 4 ? 2 : 4;
+        int row = st;
+        for (; row + COLS <= end; row += COLS)
+            LinearBFloat16NVFP4BatchCols_AVX512BF16<TOKENS, COLS, useLookup, COMBINE_SCALE>(
+                input, weight + (size_t)row * (m / 2), bias, output + row,
+                row, m, k, blockK, scales, scaleBytes);
+#define V41_NVFP4_BATCH_TAIL(COLS) \
+        case COLS: LinearBFloat16NVFP4BatchCols_AVX512BF16<TOKENS, COLS, useLookup, COMBINE_SCALE>( \
+            input, weight + (size_t)row * (m / 2), bias, output + row, \
+            row, m, k, blockK, scales, scaleBytes); break
+        switch (end - row) {
+            V41_NVFP4_BATCH_TAIL(1);
+            V41_NVFP4_BATCH_TAIL(2);
+            V41_NVFP4_BATCH_TAIL(3);
+        }
+#undef V41_NVFP4_BATCH_TAIL
+    }
+
     template <bool useLookup>
     static inline bool LinearBFloat16NVFP4_AVX512BF16_Run(
         uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end, int blockK, int blockM,
         const float *scales, const uint8_t *scaleBytes, int ms
     ) {
+        static const bool reuseTokens = std::getenv("FASTLLM_DSV41_DISABLE_NVFP4_TOKEN_REUSE") == nullptr;
+        if (n > 1 && blockM == 32 && m % 32 == 0 && reuseTokens) {
+            // Multiplying by the magic power of two is exact while finite.
+            // Move it to the scale to remove a multiply per token/block, but
+            // retain the original path for inputs or scales that could overflow.
+            uint16_t maxInput = 0;
+            for (size_t i = 0; i < (size_t)n * m; ++i)
+                maxInput = std::max(maxInput, uint16_t(inputData[i] & 0x7fff));
+            bool combineScale = maxInput <= 0x7b80; // abs(input) <= 2^120, excluding NaN/Inf
+            const size_t scaleBegin = (size_t)(st / blockK) * ms;
+            const size_t scaleEnd = (size_t)((end + blockK - 1) / blockK) * ms;
+            if (scales) {
+                for (size_t i = scaleBegin; i < scaleEnd; ++i)
+                    combineScale = combineScale && std::fabs(scales[i]) <= 0x1p63f;
+            } else {
+                uint8_t minScale = 255, maxScale = 0;
+                for (size_t i = scaleBegin; i < scaleEnd; ++i) {
+                    minScale = std::min(minScale, scaleBytes[i]);
+                    maxScale = std::max(maxScale, scaleBytes[i]);
+                }
+                // E8M0 zero is a subnormal FP32 scale. Keep its original
+                // multiply so callers' denormals-are-zero mode is respected.
+                combineScale = combineScale && minScale > 0 && maxScale <= 190;
+            }
+            for (int token = 0; token < n; token += 8) {
+                const uint16_t *input = inputData + (size_t)token * m;
+                float *output = outputData + (size_t)token * k;
+#define V41_NVFP4_BATCH_TOKENS(TOKENS) \
+                case TOKENS: \
+                    if (combineScale) LinearBFloat16NVFP4Batch_AVX512BF16<TOKENS, useLookup, true>( \
+                        input, weightData, biasData, output, m, k, st, end, blockK, scales, scaleBytes); \
+                    else LinearBFloat16NVFP4Batch_AVX512BF16<TOKENS, useLookup, false>( \
+                        input, weightData, biasData, output, m, k, st, end, blockK, scales, scaleBytes); break
+                switch (std::min(8, n - token)) {
+                    V41_NVFP4_BATCH_TOKENS(1);
+                    V41_NVFP4_BATCH_TOKENS(2);
+                    V41_NVFP4_BATCH_TOKENS(3);
+                    V41_NVFP4_BATCH_TOKENS(4);
+                    V41_NVFP4_BATCH_TOKENS(5);
+                    V41_NVFP4_BATCH_TOKENS(6);
+                    V41_NVFP4_BATCH_TOKENS(7);
+                    V41_NVFP4_BATCH_TOKENS(8);
+                }
+#undef V41_NVFP4_BATCH_TOKENS
+            }
+            return true;
+        }
         int packedM = m >> 1;
         for (int i = 0; i < n; i++) {
             const uint16_t *input = inputData + (size_t)i * m;
@@ -1079,6 +1570,100 @@ namespace fastllm {
     }
 #endif
 
+#if defined(__AVX512BF16__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    template <int ROWS, bool useLookup, bool PLANAR, bool COMPACT = false>
+    static void FastllmGemmBFloat16NVFP4Block16FullBlocks_AVX512BF16_Run(
+        const void *A, long lda,
+        const void *B, long ldb,
+        void *C, long ldc,
+        int m, int st, int end
+    ) {
+        const int blocks = m / 16;
+        constexpr int weightStride = COMPACT ? 9 : (PLANAR ? 8 : 12);
+        constexpr int scaleStride = COMPACT ? 9 : (PLANAR ? sizeof(float) : 12);
+        static constexpr FP8E4M3ToFP32Manager fp8ToFloat;
+        const __m512 magicVec = _mm512_set1_ps(NVFP4_MAGIC_SCALE);
+        const __m512i bf16Lookup = NVFP4BFloat16Lookup_AVX512BF16();
+        for (int j = st; j < end; j++) {
+            const uint8_t *rowStart = (const uint8_t*)B +
+                (PLANAR ? NVFP4PlanarWeightOffset(j, blocks) : (size_t)j * ldb);
+            float globalScale = 1.0f;
+            if constexpr (COMPACT) {
+                memcpy(&globalScale, rowStart, sizeof(float));
+                rowStart += sizeof(float);
+            }
+            const uint8_t *rowScales = PLANAR
+                ? (const uint8_t*)B + NVFP4PlanarScaleOffset(j, blocks) : rowStart + 8;
+            __m512 scaledSums[ROWS];
+            for (int row = 0; row < ROWS; row++) {
+                scaledSums[row] = _mm512_setzero_ps();
+            }
+            for (int block = 0; block < blocks; block += 2) {
+                float scale0, scale1;
+                if constexpr (COMPACT) {
+                    scale0 = fp8ToFloat.dict[rowScales[block * scaleStride]] * globalScale;
+                    scale1 = fp8ToFloat.dict[rowScales[(block + 1) * scaleStride]] * globalScale;
+                } else {
+                    memcpy(&scale0, rowScales + block * scaleStride, sizeof(float));
+                    memcpy(&scale1, rowScales + (block + 1) * scaleStride, sizeof(float));
+                }
+                // Each half of the dot product belongs to one block. Keep
+                // their scales separate, so unequal scales need neither a
+                // branch nor a second weight decode / dot product.
+                const __m512 scaleVec = _mm512_mask_blend_ps(
+                    0xff00, _mm512_set1_ps(scale0), _mm512_set1_ps(scale1));
+                const __m512bh vw = NVFP4TwoBlock16ToBFloat16_AVX512BF16<useLookup>(
+                    rowStart + block * weightStride,
+                    rowStart + (block + 1) * weightStride, bf16Lookup);
+                // Reuse the decoded weights and scales across input rows,
+                // as in the block-32 kernel. Scaling stays in FP32 after
+                // dpbf16; only the accumulation order changes.
+                for (int row = 0; row < ROWS; row++) {
+                    const uint16_t *input = (const uint16_t*)(
+                        (const uint8_t*)A + (size_t)row * lda);
+                    const __m512bh vi = (__m512bh)_mm512_loadu_si512(input + block * 16);
+                    const __m512 sum = _mm512_dpbf16_ps(_mm512_setzero_ps(), vi, vw);
+                    scaledSums[row] = _mm512_fmadd_ps(
+                        _mm512_mul_ps(sum, magicVec), scaleVec, scaledSums[row]);
+                }
+            }
+            for (int row = 0; row < ROWS; row++) {
+                float *output = (float*)((uint8_t*)C + (size_t)row * ldc);
+                output[j] = _mm512_reduce_add_ps(scaledSums[row]);
+            }
+        }
+    }
+    template <bool useLookup, bool PLANAR, bool COMPACT = false>
+    static bool RunNVFP4Block16FullRows_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int st, int end
+    ) {
+        if (m <= 0 || (m & 31) != 0) return false;
+        int row = 0;
+        for (; row + 8 <= n; row += 8) {
+            FastllmGemmBFloat16NVFP4Block16FullBlocks_AVX512BF16_Run<8, useLookup, PLANAR, COMPACT>(
+                (const uint8_t*)A + (size_t)row * lda, lda, B, ldb,
+                (uint8_t*)C + (size_t)row * ldc, ldc, m, st, end);
+        }
+#define FASTLLM_RUN_NVFP4_BLOCK16_ROWS(ROWS) \
+        FastllmGemmBFloat16NVFP4Block16FullBlocks_AVX512BF16_Run<ROWS, useLookup, PLANAR, COMPACT>( \
+            (const uint8_t*)A + (size_t)row * lda, lda, B, ldb, \
+            (uint8_t*)C + (size_t)row * ldc, ldc, m, st, end); \
+        break
+        switch (n - row) {
+            case 1: FASTLLM_RUN_NVFP4_BLOCK16_ROWS(1);
+            case 2: FASTLLM_RUN_NVFP4_BLOCK16_ROWS(2);
+            case 3: FASTLLM_RUN_NVFP4_BLOCK16_ROWS(3);
+            case 4: FASTLLM_RUN_NVFP4_BLOCK16_ROWS(4);
+            case 5: FASTLLM_RUN_NVFP4_BLOCK16_ROWS(5);
+            case 6: FASTLLM_RUN_NVFP4_BLOCK16_ROWS(6);
+            case 7: FASTLLM_RUN_NVFP4_BLOCK16_ROWS(7);
+        }
+#undef FASTLLM_RUN_NVFP4_BLOCK16_ROWS
+        return true;
+    }
+#endif
+
     template <bool useLookup, bool PLANAR = false>
     static bool FastllmGemmBFloat16NVFP4Block16_AVX512BF16_Run(
         const void *A, long lda,
@@ -1087,6 +1672,8 @@ namespace fastllm {
         int n, int m, int k, int st, int end
     ) {
 #if defined(__AVX512BF16__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+        if (RunNVFP4Block16FullRows_AVX512BF16<useLookup, PLANAR>(
+                A, lda, B, ldb, C, ldc, n, m, st, end)) return true;
         const __m512 magicVec = _mm512_set1_ps(NVFP4_MAGIC_SCALE);
         const __m512i bf16Lookup =
             NVFP4BFloat16Lookup_AVX512BF16();
@@ -1167,6 +1754,22 @@ namespace fastllm {
                 A, lda, B, ldb, C, ldc, n, m, k, st, end) :
             FastllmGemmBFloat16NVFP4Block16_AVX512BF16_Run<false>(
                 A, lda, B, ldb, C, ldc, n, m, k, st, end);
+    }
+
+    bool FastllmGemmBFloat16NVFP4Block16E4M3Packed_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int k, int st, int end
+    ) {
+#if defined(__AVX512BF16__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+        static const bool useLookup =
+            std::getenv("FASTLLM_DSV4_DISABLE_CPU_NVFP4_LUT") == nullptr;
+        return useLookup ? RunNVFP4Block16FullRows_AVX512BF16<true, false, true>(
+            A, lda, B, ldb, C, ldc, n, m, st, end) :
+            RunNVFP4Block16FullRows_AVX512BF16<false, false, true>(
+            A, lda, B, ldb, C, ldc, n, m, st, end);
+#else
+        return false;
+#endif
     }
 
     template <bool useLookup, bool PLANAR = false>

@@ -17,6 +17,7 @@
 #ifdef USE_CUDA
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
+#include "devices/cuda/glm5-next-cuda.cuh"
 #include "devices/cuda/fastllm-awq-sm70.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
@@ -3993,6 +3994,8 @@ namespace {
         // Unaligned TP projections retain their logical shape while Marlin
         // pads only the packed output channels. Include odd row strides,
         // the K64/N128 tile, small scratch fallback, and the production shape.
+        // M=49/64 cover the dense prefill tile; M=1025 crosses the row-chunk
+        // boundary and verifies that its small-M tail still works in graphs.
         for (const auto &shape : std::vector<std::pair<int, int>>{
                  {208, 256}, {255, 128}, {257, 128},
                  {208, 192}, {8240, 5120}}) {
@@ -4008,7 +4011,7 @@ namespace {
                 fastllm::DataType::FLOAT32, {logicalN},
                 MakeRegressionValues(logicalN, 0.31f, 0.015f));
 
-            for (int rows : {1, 8, 31, 65}) {
+            for (int rows : {1, 8, 31, 49, 64, 65, 1025}) {
                 const std::string label = "NVFP4 Marlin padded N=" +
                     std::to_string(logicalN) + " K=" + std::to_string(sizeK) +
                     " M=" + std::to_string(rows);
@@ -4021,8 +4024,9 @@ namespace {
                 fastllm::Data observed = MakeCudaTensor(
                     fastllm::DataType::FLOAT16, {rows, logicalN},
                     std::vector<float>((size_t)rows * logicalN, 0.0f));
-                const fastllm::Data &selectedBias = rows == 1 || rows == 31
-                    ? noBias : paddedBias;
+                const fastllm::Data &selectedBias =
+                    rows == 1 || rows == 31 || rows == 49
+                        ? noBias : paddedBias;
                 FastllmCudaSetNcclForceSync(false);
                 Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
                            x, nativeWeight, selectedBias, expected,
@@ -4044,7 +4048,7 @@ namespace {
                 ExpectFloatNear(expectedValues, ToFloatVector(observed),
                                 2.0e-2f, 2.0e-3f, label);
 
-                if (rows == 8) {
+                if (rows == 8 || rows == 1025) {
                     // Exercise both tail-resident and pooled padded outputs
                     // under graph capture, repeated replay, and pool reuse.
                     FastllmCudaSetNcclForceSync(false);
@@ -4889,6 +4893,180 @@ namespace {
                         "CUDA Kimi-K3 state-only KDA replay");
 
         std::cout << "CUDA Kimi-K3 recurrent KDA regression: PASS\n";
+    }
+
+    void RunCudaKdaBatchDecodeRegression() {
+        using namespace fastllm;
+        FastllmCudaSetDevice(0);
+        ScopedFirstDevice device("cuda:0");
+        constexpr int heads = 4, dim = 128, channels = heads * dim, history = 3;
+        auto make = [&](DataType type, std::vector<int> dims, float seed, float scale) {
+            int count = 1;
+            for (int n : dims) count *= n;
+            return MakeCudaTensor(type, dims, MakeRegressionValues(count, seed, scale));
+        };
+        Data qw = make(DataType::FLOAT32, {channels, 1, 4}, 1.0f, .2f);
+        Data kw = make(DataType::FLOAT32, {channels, 1, 4}, 2.0f, .2f);
+        Data vw = make(DataType::FLOAT32, {channels, 1, 4}, 3.0f, .2f);
+        Data aLog = make(DataType::FLOAT32, {heads}, 4.0f, .2f);
+        Data bias = make(DataType::FLOAT32, {channels}, 5.0f, .2f);
+        for (int capacity : {2, 8, 64}) {
+            std::vector<Data> conv(capacity), states(capacity), refConv(capacity), refStates(capacity);
+            for (int row = 0; row < capacity; ++row) {
+                conv[row].CopyFrom(make(DataType::BFLOAT16, {3, history, channels}, 1.7f + row, .3f));
+                states[row].CopyFrom(make(DataType::FLOAT32, {1, heads, dim, dim}, 2.3f + row, .1f));
+                refConv[row].CopyFrom(conv[row]);
+                refStates[row].CopyFrom(states[row]);
+            }
+            for (int step = 0; step < 4; ++step) {
+                // Shrink, reorder, then restore the original membership. Inactive
+                // requests must retain their state while others continue decoding.
+                int batch = step == 2 ? std::max(2, capacity / 2) : capacity;
+                Data q = make(DataType::BFLOAT16, {1, batch, channels}, .3f + step, .7f);
+                Data k = make(DataType::BFLOAT16, q.dims, .7f + step, .7f);
+                Data v = make(DataType::BFLOAT16, q.dims, 1.1f + step, .7f);
+                Data gate = make(DataType::BFLOAT16, q.dims, 1.3f + step, .7f);
+                Data beta = make(DataType::FLOAT32, {1, batch, heads}, 1.9f + step, .7f);
+                std::vector<Data*> convPointers, statePointers;
+                std::vector<float> reference;
+                for (int row = 0; row < batch; ++row) {
+                    int slot = step % 2 ? capacity - 1 - row : row;
+                    convPointers.push_back(&conv[slot]);
+                    statePointers.push_back(&states[slot]);
+                    Data iq, ik, iv, ig, ib, cq, ck, cv, rq, rk, rv, output;
+                    Split(q, 1, row, row + 1, iq);
+                    Split(k, 1, row, row + 1, ik);
+                    Split(v, 1, row, row + 1, iv);
+                    Split(gate, 1, row, row + 1, ig);
+                    Split(beta, 1, row, row + 1, ib);
+                    Data *views[] = {&cq, &ck, &cv};
+                    for (int stream = 0; stream < 3; ++stream) {
+                        views[stream]->FakeFrom(refConv[slot], (size_t)stream * history * channels * 2);
+                        views[stream]->Resize({1, history, channels});
+                    }
+                    KimiK3CausalConv1D(iq, qw, 4, cq, rq);
+                    KimiK3CausalConv1D(ik, kw, 4, ck, rk);
+                    KimiK3CausalConv1D(iv, vw, 4, cv, rv);
+                    for (auto *tensor : {&rq, &rk, &rv, &ig}) tensor->Reshape({1, 1, heads, dim});
+                    KimiK3RecurrentKDAOutputOnly(rq, rk, rv, ig, ib, aLog, bias,
+                        -5.0f, refStates[slot], output, true, true);
+                    auto values = ToFloatVector(output);
+                    reference.insert(reference.end(), values.begin(), values.end());
+                }
+                Data output;
+                Expect(FastllmCudaKimiK3KdaBatchDecode(q, k, v, gate, beta, qw, kw, vw,
+                    aLog, bias, convPointers, statePointers, heads, dim, 4, -5.0f, output),
+                    "KDA batch path was not accepted");
+                ExpectFloatNear(reference, ToFloatVector(output), 0, 0, "Batched KDA output");
+                for (int slot = 0; slot < capacity; ++slot) {
+                    ExpectFloatNear(ToFloatVector(refConv[slot]), ToFloatVector(conv[slot]), 0, 0,
+                        "Batched KDA convolution state");
+                    ExpectFloatNear(ToFloatVector(refStates[slot]), ToFloatVector(states[slot]), 0, 0,
+                        "Batched KDA recurrent state");
+                }
+            }
+        }
+        std::cout << "CUDA batched KDA output/state, shrink/reorder/growth: PASS\n";
+    }
+
+    void RunCudaMlaBatchDecodeCase(fastllm::DataType type, int dimension, int batch) {
+        using namespace fastllm;
+        const int heads = batch == 64 ? 64 : 4, pageLen = 4;
+        auto make = [&](std::vector<int> dims, float seed) {
+            int count = 1;
+            for (int n : dims) count *= n;
+            return MakeCudaTensor(type, dims, MakeRegressionValues(count, seed, .17f));
+        };
+        Data q = make({heads, batch, dimension}, .7f);
+        Data qp = make({1, batch, heads, 64}, 1.1f);
+        Data peExample = make({1, 1, 64}, 0), kvExample = make({1, 1, dimension}, 0);
+        auto *peManager = AllocatePagedCacheManager(12000, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+            peExample, pageLen, batch * 12);
+        auto *kvManager = AllocatePagedCacheManager(12001, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+            kvExample, pageLen, batch * 12);
+        std::vector<Data> peCaches(batch), kvCaches(batch);
+        for (int row = 0; row < batch; ++row) {
+            int tokens = 7 + 5 * (row % 7);
+            Data pe = make({1, tokens, 64}, row + .1f);
+            Data kv = make({1, tokens, dimension}, row + .3f);
+            for (auto *cache : {&peCaches[row], &kvCaches[row]}) {
+                cache->dataType = type;
+                cache->UpdateUnitSize();
+                cache->ToDevice(DataDevice::CUDA, {0}, false);
+                cache->SetKVCache();
+            }
+            AppendPagedCache(*peManager, peCaches[row], pe);
+            AppendPagedCache(*kvManager, kvCaches[row], kv);
+        }
+        enum class Mode { Dense, Sparse, Mixed };
+        // Repeat sparse mode to verify reuse of the cached schedule.
+        for (Mode mode : {Mode::Dense, Mode::Sparse, Mode::Mixed, Mode::Sparse}) {
+            std::vector<Data> selected(batch);
+            std::vector<const Data*> pes, kvs, indices;
+            std::vector<int> lengths;
+            Data expected;
+            for (int row = 0; row < batch; ++row) {
+                int slot = mode == Mode::Mixed ? batch - 1 - row : row;
+                pes.push_back(&peCaches[slot]);
+                kvs.push_back(&kvCaches[slot]);
+                const int tokens = kvCaches[slot].dims[1];
+                const bool sparse = mode == Mode::Sparse || (mode == Mode::Mixed && row % 2);
+                int length = sparse ? (tokens + 1) / 2 : tokens;
+                lengths.push_back(length);
+                if (sparse) {
+                    selected[row].dataType = DataType::INT32;
+                    selected[row].Resize({length});
+                    selected[row].Allocate();
+                    auto *data = (int32_t*)selected[row].cpuData;
+                    for (int i = 0; i < length; ++i) {
+                        int token = tokens - 1 - i * 2;
+                        data[i] = kvCaches[slot].pageIndex[token / pageLen] * pageLen + token % pageLen;
+                    }
+                    selected[row].ToDevice(DataDevice::CUDA, {0}, true);
+                }
+                indices.push_back(sparse ? &selected[row] : nullptr);
+                Data rowQ, rowPe, result;
+                Split(q, 1, row, row + 1, rowQ);
+                Split(qp, 1, row, row + 1, rowPe);
+                result.dataType = type;
+                result.Resize(rowQ.dims);
+                result.ToDevice(DataDevice::CUDA, {0}, false);
+                result.Allocate();
+                Expect(FastllmCudaMLAPaged(rowQ, rowPe, *pes.back(), *kvs.back(),
+                    result, .1f, length, indices.back()), "Serial paged MLA rejected");
+                if (row == 0) {
+                    expected.CopyFrom(result);
+                    expected.Expansion({heads, batch, dimension});
+                } else CatDirect(expected, result, 1);
+            }
+            expected.expansionDims.clear();
+            Data output;
+            output.dataType = type;
+            output.Resize(q.dims);
+            output.ToDevice(DataDevice::CUDA, {0}, false);
+            output.Allocate();
+            Expect(FastllmCudaMLAPagedBatch(q, qp, pes, kvs, lengths, indices, output, .1f),
+                "Batched paged MLA rejected");
+            // Split-K scheduling may change BF16/FP16 reduction rounding.
+            ExpectFloatNear(ToFloatVector(expected), ToFloatVector(output), .002f, .015f,
+                "Batched dense/sparse/mixed MLA output");
+        }
+    }
+
+    void RunCudaMlaBatchDecodeRegression() {
+        using namespace fastllm;
+        FastllmCudaSetDevice(0);
+        ScopedFirstDevice device("cuda:0");
+        ClearAllPagedCacheManagers();
+        for (DataType type : {DataType::BFLOAT16, DataType::FLOAT16}) {
+            for (int dimension : {128, 512}) {
+                for (int batch : {2, 8, 64}) {
+                    RunCudaMlaBatchDecodeCase(type, dimension, batch);
+                    ClearAllPagedCacheManagers();
+                }
+            }
+        }
+        std::cout << "CUDA batched MLA dense/sparse/mixed, BF16/FP16, rank 128/512: PASS\n";
     }
 
     void RunCudaMergeMlaPagedChunkRegression() {
@@ -11275,6 +11453,148 @@ namespace {
         }
     }
 
+    void RunCudaSmallBatchDecodeRegression() {
+        FastllmCudaSetDevice(0);
+        const int previousThreshold = fastllm::FastllmCudaGetLinearExactBatchThreshold();
+        fastllm::FastllmCudaSetLinearExactBatchThreshold(0);
+        fastllm::Data emptyBias;
+
+        // Exercise automatic dispatch, with distinct rows and both sides of
+        // the short/aligned reduction boundary. Exact-batch mode stays off.
+        for (auto type : {fastllm::DataType::FLOAT32, fastllm::DataType::BFLOAT16}) {
+            for (int m : (type == fastllm::DataType::FLOAT32 ?
+                          std::vector<int>{4096} : std::vector<int>{128, 256, 259})) {
+                const int k = type == fastllm::DataType::FLOAT32 ? 288 : 2049;
+                const auto values = MakeRegressionValues(8 * m, 0.37f, 0.21f);
+                for (bool withBias : {false, true}) {
+                    auto weight = MakeCudaTensor(type, {k, m},
+                        MakeRegressionValues((size_t)k * m, 0.83f, 0.031f));
+                    auto bias = MakeCudaTensor(fastllm::DataType::FLOAT32, {k},
+                        MakeRegressionValues(k, 1.13f, 0.27f));
+                    const auto &caseBias = withBias ? bias : emptyBias;
+                    auto launch = [&](fastllm::Data &input, fastllm::Data &output, int n) {
+                        return type == fastllm::DataType::FLOAT32 ?
+                            FastllmCudaMatMulFloat32(input, weight, caseBias, output, n, m, k) :
+                            FastllmCudaBFloat16MatMulBFloat16(input, weight, caseBias, output, n, m, k);
+                    };
+                    std::vector<float> reference;
+                    for (int row = 0; row < 8; row++) {
+                        auto input = MakeCudaTensor(type, {1, m},
+                            std::vector<float>(values.begin() + row * m, values.begin() + (row + 1) * m));
+                        auto output = MakeCudaTensor(type, {1, k}, std::vector<float>(k));
+                        Expect(launch(input, output, 1), "small-batch linear reference failed");
+                        auto rowValues = ToFloatVector(output);
+                        reference.insert(reference.end(), rowValues.begin(), rowValues.end());
+                    }
+                    for (int n = 2; n <= 8; n++) {
+                        auto input = MakeCudaTensor(type, {n, m},
+                            std::vector<float>(values.begin(), values.begin() + n * m));
+                        auto output = MakeCudaTensor(type, {n, k}, std::vector<float>(n * k));
+                        Expect(launch(input, output, n), "automatic small-batch linear failed");
+                        // The established B8 GEMM path rounds before bias and
+                        // may also use a different reduction for unaligned m.
+                        const float tol = type == fastllm::DataType::BFLOAT16 &&
+                            n == 8 && (withBias || m == 259) ? 0.016f : 0.0f;
+                        ExpectFloatNear(std::vector<float>(reference.begin(), reference.begin() + n * k),
+                            ToFloatVector(output), tol, tol,
+                            "automatic small-batch linear n=" + std::to_string(n) + " m=" + std::to_string(m));
+                    }
+                }
+            }
+        }
+        std::cout << "Small-batch automatic linear: PASS\n";
+
+        // Nine rows select the legacy generic kernel; compare prefixes so
+        // fixed Top-K preserves scores and legacy ordering even at ties.
+        for (int experts : {256, 288}) {
+            for (bool tied : {false, true}) {
+                for (bool withBias : {false, true}) {
+                    for (bool normalize : {false, true}) {
+                        auto values = MakeRegressionValues(9 * experts, 0.43f, 0.19f);
+                        for (int row = 0; row < 9; row++) {
+                            for (int e = 0; e < experts; e++) {
+                                values[row * experts + e] = tied ? 0.1f * (row + 1) :
+                                    0.5f + values[row * experts + e];
+                            }
+                        }
+                        auto bias = MakeCudaTensor(fastllm::DataType::FLOAT32, {experts},
+                            tied ? std::vector<float>(experts, 0.01f) :
+                            MakeRegressionValues(experts, 0.71f, 0.037f));
+                        auto select = [&](int n, std::vector<int32_t> &indices, std::vector<float> &scores) {
+                            auto logits = MakeCudaTensor(fastllm::DataType::FLOAT32, {n, experts},
+                                std::vector<float>(values.begin(), values.begin() + n * experts));
+                            auto index = MakeIntTensor({n, 8}, std::vector<int32_t>(n * 8, -1));
+                            index.ToDevice(fastllm::DataDevice::CUDA);
+                            auto score = MakeCudaTensor(fastllm::DataType::FLOAT32, {n, 8}, std::vector<float>(n * 8));
+                            Expect(FastllmCudaSelectExpert(logits, withBias ? &bias : nullptr,
+                                index, score, 8, normalize, 2.5f), "small-batch Top-K failed");
+                            indices = ToIntVector(index);
+                            scores = ToFloatVector(score);
+                        };
+                        std::vector<int32_t> referenceIndex;
+                        std::vector<float> referenceScore;
+                        select(9, referenceIndex, referenceScore);
+                        for (int n = 1; n <= 8; n++) {
+                            std::vector<int32_t> index;
+                            std::vector<float> score;
+                            select(n, index, score);
+                            ExpectIntEqual(std::vector<int32_t>(referenceIndex.begin(), referenceIndex.begin() + n * 8),
+                                index, "small-batch legacy Top-K indices");
+                            ExpectFloatNear(std::vector<float>(referenceScore.begin(), referenceScore.begin() + n * 8),
+                                score, 0.0f, 0.0f, "small-batch legacy Top-K scores");
+                        }
+                    }
+                }
+            }
+        }
+        std::cout << "Small-batch expert Top-K: PASS\n";
+
+        constexpr int hidden = 4096, flat = 4 * hidden;
+        const auto values = MakeRegressionValues(8 * flat, 0.23f, 0.06f);
+        auto scale = MakeCudaTensor(fastllm::DataType::FLOAT32, {3}, {0.71f, 0.83f, 0.57f});
+        auto base = MakeCudaTensor(fastllm::DataType::FLOAT32, {24}, MakeRegressionValues(24, 1.11f, 0.12f));
+        auto norm = MakeCudaTensor(fastllm::DataType::FLOAT32, {hidden},
+            MakeRegressionValues(hidden, 0.79f, 0.31f));
+        for (auto fnType : {fastllm::DataType::FLOAT32, fastllm::DataType::BFLOAT16}) {
+            auto fn = MakeCudaTensor(fnType, {24, flat}, MakeRegressionValues(24 * flat, 0.67f, 0.008f));
+            for (bool glmRounding : {false, true}) {
+                // The DeepSeek entry point requires FP32 HC weights.
+                if (!glmRounding && fnType != fastllm::DataType::FLOAT32) continue;
+                auto launch = [&](fastllm::Data &input, fastllm::Data &output, fastllm::Data &post, fastllm::Data &comb) {
+                    auto kernel = glmRounding ? FastllmCudaGlm5NextHcPreNorm : FastllmCudaDeepSeekV4HcPreNorm;
+                    return kernel(input, fn, scale, base, norm, 4, 20, 1e-6f, 1e-5f, output, post, comb);
+                };
+                std::vector<float> reference[3];
+                for (int row = 0; row < 8; row++) {
+                    auto input = MakeCudaTensor(fastllm::DataType::BFLOAT16, {1, 1, 4, hidden},
+                        std::vector<float>(values.begin() + row * flat, values.begin() + (row + 1) * flat));
+                    fastllm::Data outputs[3];
+                    Expect(launch(input, outputs[0], outputs[1], outputs[2]), "single-row HC reference failed");
+                    for (int i = 0; i < 3; i++) {
+                        auto rowValues = ToFloatVector(outputs[i]);
+                        reference[i].insert(reference[i].end(), rowValues.begin(), rowValues.end());
+                    }
+                }
+                for (int n = 8; n >= 1; n--) {
+                    auto input = MakeCudaTensor(fastllm::DataType::BFLOAT16, {1, n, 4, hidden},
+                        std::vector<float>(values.begin(), values.begin() + n * flat));
+                    fastllm::Data outputs[3];
+                    Expect(launch(input, outputs[0], outputs[1], outputs[2]), "small-batch fused HC failed");
+                    for (int i = 0; i < 3; i++) {
+                        ExpectFloatNear(std::vector<float>(reference[i].begin(), reference[i].begin() + reference[i].size() / 8 * n),
+                            ToFloatVector(outputs[i]), 0.0f, 0.0f, "small-batch fused HC row independence");
+                    }
+                }
+                auto unsupported = MakeCudaTensor(fastllm::DataType::BFLOAT16,
+                    {1, 9, 4, hidden}, std::vector<float>(9 * flat));
+                fastllm::Data outputs[3];
+                Expect(!launch(unsupported, outputs[0], outputs[1], outputs[2]), "HC prefill fallback boundary changed");
+            }
+        }
+        fastllm::FastllmCudaSetLinearExactBatchThreshold(previousThreshold);
+        std::cout << "Small-batch fused HC: PASS\n";
+    }
+
     void RunCudaExactSmallBatchLinearRegression() {
         FastllmCudaSetDevice(0);
         fastllm::Data emptyBias;
@@ -11356,14 +11676,22 @@ namespace {
 
         auto runBf16Case = [&](int inputDim, int outputDim,
                                bool withBias) {
-            const std::vector<float> allInputs = makeValues(
-                (size_t)5 * inputDim,
+            auto variedValues = [&](size_t count, uint32_t seed, float scale) {
+                auto values = makeValues(count, seed, scale);
+                // Mixed exponents exercise rounding and cancellation, which
+                // small fixed-point dot products can leave entirely exact.
+                for (size_t i = 0; i < count; ++i)
+                    values[i] = std::ldexp(values[i], (int)(i % 13) - 6);
+                return values;
+            };
+            const std::vector<float> allInputs = variedValues(
+                (size_t)9 * inputDim,
                 0x51f2a9d3u + inputDim, 1.0f / 64.0f);
             fastllm::Data weight = MakeCudaTensor(
                 fastllm::DataType::BFLOAT16,
                 {outputDim, inputDim},
-                makeValues((size_t)outputDim * inputDim,
-                           0xa73c19e5u + outputDim, 1.0f / 256.0f));
+                variedValues((size_t)outputDim * inputDim,
+                             0xa73c19e5u + outputDim, 1.0f / 256.0f));
             fastllm::Data bias = withBias ? MakeCudaTensor(
                 fastllm::DataType::FLOAT32, {outputDim},
                 makeValues(outputDim, 0x138bd24fu, 1.0f / 128.0f)) :
@@ -11376,7 +11704,7 @@ namespace {
                 return FastllmCudaBFloat16MatMulBFloat16(
                     input, caseWeight, caseBias, output, n, m, k);
             };
-            for (int rows = 2; rows <= 5; rows++) {
+            for (int rows = 2; rows <= 9; rows++) {
                 verifyRows(
                     "BF16xBF16 m=" + std::to_string(inputDim) +
                         " k=" + std::to_string(outputDim) +
@@ -11530,6 +11858,10 @@ namespace {
         for (bool withBias : {false, true}) {
             runBf16Case(256, 257, withBias);
             runBf16Case(259, 193, withBias);
+            // Exercise multiple accumulation iterations in the shared-weight
+            // kernel, including its unaligned path and the row-9 fallback.
+            runBf16Case(4096, 257, withBias);
+            runBf16Case(4103, 193, withBias);
             runFp32Case(
                 fastllm::DataType::BFLOAT16,
                 256, 257, withBias);
@@ -13768,7 +14100,8 @@ namespace {
             fastllm::DataDevice *mergeOutputDevice = nullptr,
             bool keepCudaInputMirror = false,
             int cudaInputDevice = -1,
-            bool prefetchCudaInput = false) {
+            bool prefetchCudaInput = false,
+            int activationQuantBlock = 128) {
         const int inputDim = weights.routedGate.dims[1];
         const int outputDim = weights.routedDown.dims[0];
         fastllm::Data input = MakeTensor(
@@ -13840,7 +14173,7 @@ namespace {
                 input, index, score, weightPtrs, biasPtrs,
                 w1, w2, w3, curInput, curOutput,
                 0.0f, output, 0, fastllm::MoeGateSwiglu,
-                false, 7.0f, true);
+                false, 7.0f, true, nullptr, activationQuantBlock);
         }
         Expect(output.dataType == fastllm::DataType::BFLOAT16,
                "DeepSeek-V4 NUMA MergeMOE output dtype mismatch.");
@@ -14052,6 +14385,20 @@ namespace {
                    "DeepSeek-V4 NUMA FP8 grouped decode changed BF16 "
                    "output bits at batch " +
                        std::to_string(smallBatch) + ".");
+        }
+        // Cover block-32 quantization when verifier rows span CPU workers.
+        for (int dim : {1024, 5120}) {
+            MoeWeights v41Weights = {
+                MakeDeepSeekV4Nvfp4MoeWeight(interDim * 2, dim, 37, "test.v41_parallel_quant_gate"),
+                MakeDeepSeekV4Nvfp4MoeWeight(dim, interDim, 43, "test.v41_parallel_quant_down")
+            };
+            for (int rows : {2, 3, 5, 6, 8, 2}) {
+                setenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE", "1", 1);
+                auto reference = RunNumasDeepSeekV4LargeMoeCase(v41Weights, rows, nullptr, false, -1, false, 32);
+                unsetenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE");
+                auto actual = RunNumasDeepSeekV4LargeMoeCase(v41Weights, rows, nullptr, false, -1, false, 32);
+                Expect(reference == actual, "V4.1 parallel block-32 quantization changed BF16 output bits.");
+            }
         }
         if (hadGroupedDecodeDisable) {
             setenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE",
@@ -14764,6 +15111,19 @@ int main(int argc, char **argv) {
             RunCudaNVFP4Sm70TurboMindRegression();
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--cuda-batch-attention") {
+            Expect(FastllmCudaGetDeviceCount() > 0, "Batched attention regression requires CUDA.");
+            RunCudaKdaBatchDecodeRegression();
+            RunCudaMlaBatchDecodeRegression();
+            RunCudaMergeMlaPagedChunkRegression();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--cuda-small-batch-decode") {
+            Expect(FastllmCudaGetDeviceCount() > 0, "small-batch decode regression requires CUDA.");
+            RunCudaSmallBatchDecodeRegression();
+            std::cout << "CUDA small-batch decode regressions: PASS\n";
+            return 0;
+        }
         if (argc == 2 &&
             std::string(argv[1]) == "--cuda-exact-small-batch-linear") {
             Expect(FastllmCudaGetDeviceCount() > 0,
@@ -15119,6 +15479,7 @@ int main(int argc, char **argv) {
             RunCudaInt4GroupHalfWeightRoundingRegression();
             RunCudaFp8LinearAddRegression();
             RunCudaExactSmallBatchLinearRegression();
+            RunCudaSmallBatchDecodeRegression();
             RunCudaFp16WarpRowsGemvRegression();
             RunCudaFusedRouterSelectionRegression();
             RunCudaQwen35RouterSharedGateFusionRegression();

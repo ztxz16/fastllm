@@ -17,6 +17,8 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from urllib.request import urlopen
 
+from .agent_native_runtime import prepare_node
+
 
 HARNESS_VERSION = "0.1.5-alpha.1"
 NODE_VERSION = "24.20.0"
@@ -207,6 +209,7 @@ def install_runtime(directory, progress, cancelled, *, upgrade=False):
             _extract_node(archive, staging / "node", cancelled)
             archive.unlink()
             node = staging / ("node/node.exe" if os.name == "nt" else "node/bin/node")
+            prepare_node(node)
             npm = staging / ("node/node_modules/npm/bin/npm-cli.js" if os.name == "nt" else "node/lib/node_modules/npm/bin/npm-cli.js")
             environment = os.environ.copy()
             environment["PATH"] = str(node.parent) + os.pathsep + environment.get("PATH", "")

@@ -6,11 +6,12 @@ import time
 import uuid
 
 import shortuuid
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ErrorResponse(BaseModel):
     object: str = "error"
+    type: str = "BadRequestError"
     message: str
     code: int
 
@@ -94,6 +95,7 @@ class ChatCompletionRequest(BaseModel):
     top_k: Optional[int] = None
     n: Optional[int] = 1
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = Field(default=None, gt=0)
     min_tokens: Optional[int] = 0
     stop: Optional[Union[str, List[str]]] = None
     stream: Optional[bool] = False
@@ -108,10 +110,22 @@ class ChatCompletionRequest(BaseModel):
         ChatCompletionNamedToolChoiceParam,
     ]] = "auto"
     parallel_tool_calls: Optional[bool] = None
-    reasoning_effort: Optional[Literal[
+    # DeepSeek-V4.1 takes a numeric reasoning budget (1-100) in addition to the
+    # named levels, so the field accepts ints as well.  Each model's resolver in
+    # fastllm_completion validates the value it actually supports.
+    reasoning_effort: Optional[Union[Literal[
         "none", "minimal", "low", "medium", "high", "xhigh", "max"
-    ]] = None
+    ], int]] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    response_format: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def normalize_completion_token_limit(self):
+        # Modern Chat Completions clients use this field. Normalize it once so
+        # backend generation, tool parsing and finish reasons use one budget.
+        if self.max_completion_tokens is not None:
+            self.max_tokens = self.max_completion_tokens
+        return self
 
 
 class ResponsesRequest(BaseModel):

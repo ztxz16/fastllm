@@ -128,7 +128,8 @@ namespace fastllm {
         bool expertParallel = false,
         float swigluLimit = 0.0f,
         bool deepSeekV4Mode = false,
-        Data *pairedReduceInput = nullptr
+        Data *pairedReduceInput = nullptr, int activationQuantBlock = 128,
+        bool quantizeSharedExpert = false
     );
 
     class basellm;
@@ -160,7 +161,10 @@ namespace fastllm {
         Data *precomputedLogits = nullptr,
         Data *precomputedGreedyIds = nullptr,
         Data *precomputedGreedyScores = nullptr,
-        const std::map<int, void*> *precomputedReadyEvents = nullptr
+        const std::map<int, void*> *precomputedReadyEvents = nullptr,
+        // CUDA Graph outputs retain their storage. Read-only greedy sampling
+        // can use them directly; other sampling modes receive an owned copy.
+        bool preservePrecomputedLogits = false
     );
 }
 

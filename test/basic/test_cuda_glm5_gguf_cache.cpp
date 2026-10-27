@@ -1,0 +1,1284 @@
+#include "fastllm.h"
+#include "executor.h"
+#include "utils.h"
+#include "gguf.h"
+#include "../../src/devices/cuda/gguf_mmq/fastllm-gguf-moe-glm5.h"
+#include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/multicuda/fastllm-multicuda.cuh"
+#include "devices/numas/numasdevice.h"
+#include "devices/numas/numas.h"
+#include "cuda_delayed_down_upload.h"
+#include <cuda_runtime.h>
+#include <algorithm>
+#include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <random>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+namespace fastllm {
+void RegisterNumas(Data *, std::string);
+void DoCudaMergeMOEFromCPU(Data &, Data &, Data &, Data &, Data &, Data &, Data &,
+    Data **, Data **, float, bool, const std::unordered_set<int> &, bool, MoeGateType,
+    bool, float, int, bool, bool);
+}
+using namespace fastllm;
+static void Require(bool ok, const char *why) { if (!ok) throw std::runtime_error(why); }
+static void Cuda(cudaError_t e) { Require(e == cudaSuccess, cudaGetErrorString(e)); }
+static float Bf(float x) { return RoundFloat32ToBFloat16RNE(x); }
+static void Q8(std::vector<float> &v) {
+    std::vector<block_q8_K> q(v.size() / QK_K);
+    iqk_quantize_row_q8_K(v.data(), q.data(), v.size(), GGML_TYPE_Q8_K, GGML_TYPE_IQ2_XXS);
+    for (size_t c = 0; c < v.size(); ++c) v[c] = q[c / QK_K].d * q[c / QK_K].qs[c % QK_K];
+}
+static float Compare(const std::vector<float> &a, const std::vector<float> &b, const char *label) {
+    double error = 0, norm = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        Require(std::isfinite(a[i]), "nonfinite result");
+        error += std::pow(double(a[i]) - b[i], 2); norm += double(b[i]) * b[i];
+    }
+    const float relative = std::sqrt(error / std::max(norm, 1e-15));
+    if (relative > .008f) {
+        std::fprintf(stderr, "%s relative L2 = %.8f\n", label, relative);
+        throw std::runtime_error(label);
+    }
+    return relative;
+}
+static void OrdinaryNumas(Data &x, Data &ids, Data &scores, Data &out,
+                          std::vector<Data *> &weights, int layer) {
+    Data a,b,c,d,e;
+    std::vector<Data *> biases(weights.size());
+    static_cast<Executor *>(GetExecutor())->RunOnDevice("numa", "MergeMOE",
+        {{"input",&x},{"index",&ids},{"score",&scores},{"output",&out},
+         {"weights",reinterpret_cast<Data *>(weights.data())},
+         {"biass",reinterpret_cast<Data *>(biases.data())},
+         {"w1",&a},{"w2",&b},{"w3",&c},{"curInput",&d},{"curOutput",&e}},
+        {{"swigluLimit",.125f}},{{"weights___batch",int(weights.size())},
+         {"biass___batch",int(weights.size())},{"layer",layer},
+         {"deepSeekV4Mode",1},{"activationQuantBlock",128}});
+}
+
+struct DirectLayoutFixture {
+    int gateType, downType;
+    size_t gateBytes, downBytes;
+    std::vector<uint8_t> canonical;
+    explicit DirectLayoutFixture(const std::vector<Data *> &weights) {
+        gateType=weights[2]->ggmlType; downType=weights[3]->ggmlType;
+        gateBytes=weights[2]->GetBytes(); downBytes=weights[3]->GetBytes();
+        canonical.resize(2*(gateBytes+downBytes));
+        for (int e=0;e<2;++e) {
+            memcpy(canonical.data()+e*(gateBytes+downBytes),weights[2+2*e]->cpuData,gateBytes);
+            memcpy(canonical.data()+e*(gateBytes+downBytes)+gateBytes,weights[3+2*e]->cpuData,downBytes);
+        }
+    }
+    void Check(const std::vector<Data *> &weights, int hidden, int inter) const {
+        const size_t stride=gateBytes+downBytes;
+        std::vector<uint8_t> packed(canonical.size());
+        for (int e=0;e<2;++e) for (int part=0;part<2;++part) {
+            const auto &shards=weights[2+2*e+part]->numasData;
+            const size_t bytes=(part ? downBytes : gateBytes)/shards.size();
+            for (size_t n=0;n<shards.size();++n)
+                memcpy(packed.data()+e*stride+(part ? gateBytes : 0)+n*bytes,shards[n],bytes);
+        }
+        const int gateStorage=weights[2]->ggmlType, downStorage=weights[3]->ggmlType;
+        Require(FastllmCudaMoeGlm5GGUFCacheNumaSupported(gateStorage,downStorage,hidden,inter),
+                "GLM NUMA layout capability missing");
+        Data ordinary(INT8,{int(canonical.size())},CPU,const_cast<uint8_t *>(canonical.data()));
+        Data native(INT8,{int(packed.size())},CPU,packed.data());
+        ordinary.ToDevice(CUDA); native.ToDevice(CUDA);
+        Data unaligned(INT8,{int(packed.size()+4)});
+        unaligned.ToDevice(CUDA);unaligned.Allocate(false);
+        Cuda(cudaMemcpy(static_cast<uint8_t *>(unaligned.cudaData)+4,native.cudaData,packed.size(),cudaMemcpyDeviceToDevice));
+        constexpr int topk=3;
+        for (int rows : {1,2,3,4,7,9,17,32}) for (bool compact : {false,true}) {
+            const int routes=rows*topk;
+            std::vector<uint16_t> x(rows*hidden);
+            std::vector<int32_t> slots, map;
+            std::vector<float> scores(routes);
+            for (int i=0;i<rows*hidden;++i) x[i]=Float32ToBFloat16RNEBits(float((i*17)%61-30)/23.f);
+            for (int r=0;r<routes;++r) {
+                scores[r]=r%3==0 ? 0.f : r%3==1 ? -.125f : .3125f;
+                if (!compact || r%3!=1) {map.push_back(r);slots.push_back(r%5==0 ? -1 : (r+r/topk)%2);}
+            }
+            std::reverse(map.begin(),map.end());
+            Data input(BFLOAT16,{rows,hidden},CPU,x.data()), ds(FLOAT32,{routes},CPU,scores.data());
+            Data di(INT32,{int(slots.size())},CPU,slots.data()), dm(INT32,{int(map.size())},CPU,map.data());
+            input.ToDevice(CUDA);ds.ToDevice(CUDA);di.ToDevice(CUDA);dm.ToDevice(CUDA);
+            std::vector<float> output[4];
+            std::vector<uint16_t> gates[4];
+            for (int variant=0;variant<4;++variant) {
+                Data scratch(FLOAT32,{rows*(hidden+topk*inter)+4}), result(FLOAT32,{routes,hidden}), activation;
+                scratch.ToDevice(CUDA);scratch.Allocate(false);result.ToDevice(CUDA);result.Allocate(false);
+                Cuda(cudaMemset(result.cudaData,0,result.GetBytes()));
+                // An external workspace may only have float alignment. This
+                // variant also compares the vector decoder with its fallback.
+                const size_t offset=variant==2 ? sizeof(float) : 0;
+                FastllmCudaMoeGGUFCacheView view{
+                    variant==3 ? static_cast<const uint8_t *>(unaligned.cudaData)+4 :
+                        static_cast<const uint8_t *>(variant ? native.cudaData : ordinary.cudaData),
+                    static_cast<const int32_t *>(di.cudaData),stride,gateBytes,gateType,downType,hidden,inter,
+                    static_cast<uint8_t *>(scratch.cudaData)+offset,size_t(scratch.GetBytes())-offset};
+                if (compact) {view.routeMap=static_cast<const int32_t *>(dm.cudaData);view.routeCount=map.size();}
+                if (variant) {view.numaGateType=gateStorage;view.numaDownType=downStorage;}
+                for (int reuse=0;reuse<2;++reuse) {
+                    view.q8InputPrepared=reuse!=0;
+                    Require(FastllmCudaMoeGlm5GGUFCacheCompute(input,activation,view,
+                        static_cast<const float *>(ds.cudaData),topk,.125f,static_cast<float *>(result.cudaData)),
+                        "GLM direct layout computation rejected");
+                }
+                if (rows==1 && !compact && variant<2) {
+                    cudaGraph_t graph;
+                    cudaGraphExec_t executable;
+                    Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
+                    Require(FastllmCudaMoeGlm5GGUFCacheCompute(input,activation,view,
+                        static_cast<const float *>(ds.cudaData),topk,.125f,static_cast<float *>(result.cudaData)),
+                        "GLM cached layout capture rejected");
+                    Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph));
+                    Cuda(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0));
+                    Cuda(cudaGraphLaunch(executable,cudaStreamPerThread));
+                    Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                    Cuda(cudaGraphExecDestroy(executable));
+                    Cuda(cudaGraphDestroy(graph));
+                }
+                // Delay down weights on a separate stream. Gate/up must finish
+                // before that upload, and the staged result must be bit-exact
+                // with the complete-record path, for both layouts and row maps.
+                if (rows==1 || rows==3 || rows==17) {
+                    std::vector<float> reference(routes*hidden), staged(reference.size());
+                    Cuda(cudaMemcpy(reference.data(),result.cudaData,result.GetBytes(),cudaMemcpyDeviceToHost));
+                    Data partial(INT8,{int(canonical.size())});
+                    partial.ToDevice(CUDA);partial.Allocate(false);
+                    Cuda(cudaMemset(partial.cudaData,0,partial.GetBytes()));
+                    for (int e=0;e<2;++e)
+                        Cuda(cudaMemcpy(static_cast<uint8_t *>(partial.cudaData)+e*stride,
+                            view.records+e*stride,gateBytes,cudaMemcpyDeviceToDevice));
+                    fastllm_test::DelayedDownUpload upload;
+                    upload.Hold();
+                    for (int e=0;e<2;++e)
+                        Cuda(cudaMemcpyAsync(static_cast<uint8_t *>(partial.cudaData)+e*stride+gateBytes,
+                            view.records+e*stride+gateBytes,downBytes,cudaMemcpyDeviceToDevice,upload.stream));
+                    Cuda(cudaEventRecord(upload.downReady,upload.stream));
+                    view.records=static_cast<const uint8_t *>(partial.cudaData);
+                    Require(FastllmCudaMoeGlm5GGUFCacheComputeStaged(input,activation,view,
+                        static_cast<const float *>(ds.cudaData),topk,.125f,static_cast<float *>(result.cudaData),
+                        {upload.downReady,upload.gateDone,upload.downStart}),"GLM staged layout computation rejected");
+                    Cuda(cudaEventSynchronize(upload.gateDone));
+                    const bool earlyGate=!upload.timedOut && cudaEventQuery(upload.downReady)==cudaErrorNotReady;
+                    upload.release=true;
+                    Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                    Cuda(cudaMemcpy(staged.data(),result.cudaData,result.GetBytes(),cudaMemcpyDeviceToHost));
+                    Require(staged==reference,"GLM split-stage arithmetic changed");
+                    Require(earlyGate,"GLM gate waited for down upload");
+                }
+                result.ToDevice(CPU);
+                output[variant].assign(reinterpret_cast<float *>(result.cpuData),
+                    reinterpret_cast<float *>(result.cpuData)+routes*hidden);
+                activation.ToDevice(CPU);
+                gates[variant].assign(reinterpret_cast<uint16_t *>(activation.cpuData),
+                    reinterpret_cast<uint16_t *>(activation.cpuData)+slots.size()*inter);
+            }
+            for (int variant=1;variant<4;++variant) {
+                Require(gates[0]==gates[variant],"GLM NUMA gate differs from canonical GPU arithmetic");
+                Require(output[0]==output[variant],"GLM NUMA layout differs from canonical GPU arithmetic");
+            }
+        }
+    }
+};
+
+static void CheckVerifyCpu(std::vector<Data *> &weights, int hidden, int layer) {
+    constexpr int topk=3;
+    Require(CanRunNumasMoeDecodeExperts(weights.data(), weights.size()),
+            "registered verifier weights must support exact decode");
+    for (int rows : {1,2,3,4,7,9,17,32}) for (int mode=0;mode<3;++mode) {
+        std::vector<uint16_t> x(rows*hidden);
+        std::vector<float> fx(rows*hidden), scores(rows*topk), expected(rows*topk*hidden,123.f), actual(expected);
+        std::vector<int32_t> ids(rows*topk), owners(rows*topk);
+        for (int i=0;i<rows*hidden;++i) {fx[i]=Bf(float((i*13)%67-33)/19.f);x[i]=Float32ToBFloat16RNEBits(fx[i]);}
+        for (int r=0;r<rows*topk;++r) {
+            ids[r]=r%2; scores[r]=r%3==0 ? 0.f : r%3==1 ? -.125f : .3125f;
+            owners[r]=(mode==2 || (mode==1 && (r/topk==0 || ids[r]==0))) ? 0 : -1;
+        }
+        for (int row=0;row<rows;++row) NumasMoeDecodeExperts(fx.data()+row*hidden,
+            expected.data()+row*topk*hidden,weights.data(),ids.data()+row*topk,
+            owners.data()+row*topk,topk,layer,scores.data()+row*topk,.125f,128);
+        const auto caller = std::this_thread::get_id();
+        int submits=0;double cpuUs=-1;
+        const bool delay=rows==3 && mode==1;
+        const auto start=std::chrono::steady_clock::now();
+        NumasMoeVerifyExpertsWithOverlap(x.data(),actual.data(),rows,weights.data(),weights.size(),
+            ids.data(),owners.data(),scores.data(),topk,layer,.125f,true,128,[&] {
+                Require(std::this_thread::get_id()==caller,"GPU submission moved off the caller thread");
+                ++submits;if(delay) std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            },&cpuUs);
+        const double wallUs=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-start).count();
+        const bool anyCpu=std::any_of(owners.begin(),owners.end(),[](int owner){return owner<0;});
+        Require(submits==1 && (anyCpu ? cpuUs>0 : cpuUs==0),"verify callback/timing missing");
+        Require(!delay || cpuUs<wallUs*.5,"verify CPU estimate includes callback-only stall");
+        Require(actual==expected,"multi-row scored CPU differs from sequential decode or overwrites GPU routes");
+        std::fill(actual.begin(),actual.end(),123.f);
+        submits=0;
+        NumasMoeVerifyExpertsWithOverlap(x.data(),actual.data(),rows,weights.data(),weights.size(),
+            ids.data(),owners.data(),scores.data(),topk,layer,.125f,true,128,[&] {
+                Require(std::this_thread::get_id()==caller,"prepared GPU submission moved threads");
+                ++submits;
+            },&cpuUs,true);
+        Require(submits==1 && actual==expected,"prepared verifier changes CPU arithmetic or route ownership");
+        if (rows>1 && mode==1) {
+            std::fill(actual.begin(),actual.end(),123.f);
+            bool caught=false;
+            try {
+                NumasMoeVerifyExpertsWithOverlap(x.data(),actual.data(),rows,weights.data(),weights.size(),
+                    ids.data(),owners.data(),scores.data(),topk,layer,.125f,true,128,
+                    [] {throw std::runtime_error("expected submit failure");},&cpuUs,true);
+            } catch (const std::runtime_error &error) {
+                caught=std::string(error.what())=="expected submit failure";
+            }
+            Require(caught && actual==expected,"GPU failure did not drain all CPU rows before returning");
+        }
+    }
+}
+
+enum class ExpertCacheTestMode { Parallel, Verify, VerifyNoCache, VerifyFullCache };
+
+static void CheckExpertCache(std::vector<Data *> *weights, int tables, int hidden, int inter,
+                             ExpertCacheTestMode mode) {
+    constexpr int topk=6;
+    const bool single=mode!=ExpertCacheTestMode::Parallel;
+    const bool noCache=mode==ExpertCacheTestMode::VerifyNoCache;
+    const bool fullCache=mode==ExpertCacheTestMode::VerifyFullCache;
+    const int experts=(weights[0].size()-2)/2;
+    const std::vector<int> devices=single ? std::vector<int>{0} : std::vector<int>{1,0};
+    const std::vector<int> noDevices;
+    std::vector<std::unique_ptr<Data>> records;
+    std::vector<size_t> strides, gateBytes;
+    for(int t=0;t<tables;++t) {
+        const size_t gate=weights[t][2]->GetBytes(), down=weights[t][3]->GetBytes(), stride=gate+down;
+        std::vector<uint8_t> packed(experts*stride);
+        for(int e=0;e<experts;++e) for(int part=0;part<2;++part) {
+            const auto &shards=weights[t][2+2*e+part]->numasData;
+            const size_t bytes=(part ? down : gate)/shards.size();
+            for(size_t n=0;n<shards.size();++n)
+                std::memcpy(packed.data()+e*stride+(part ? gate : 0)+n*bytes,shards[n],bytes);
+        }
+        auto data=std::make_unique<Data>(INT8,std::vector<int>{int(packed.size())},CPU,packed.data());
+        data->ToDevice(CUDA,std::vector<int>{0}); records.push_back(std::move(data));
+        strides.push_back(stride);gateBytes.push_back(gate);
+    }
+    bool allHit=false,mixed=false,evicted=false,sawCpu=false,sawStaged=false;
+    uint64_t previousUploads=0;
+    for(int step=0;step<24*tables;++step) {
+        const int t=step%tables, rows=1+(step/tables)%9;
+        const int origin=single ? 0 : step%2, count=rows*topk, first=step<12*tables ? 0 : 12;
+        std::vector<uint16_t> x(rows*hidden);
+        std::vector<int32_t> ids(count);
+        std::vector<float> scores(count);
+        for(int i=0;i<rows*hidden;++i)x[i]=Float32ToBFloat16RNEBits((i/hidden)%3==1 ? 0.f : float((i*17)%67-33)/21.f);
+        for(int row=0;row<rows;++row)for(int k=0;k<topk;++k) {
+            ids[row*topk+k]=first+(k+row)%8;
+            scores[row*topk+k]=k==0 ? 0.f : k==1 ? -.125f : .3125f;
+        }
+        for(int row=0;row<rows;++row) ids[row*topk+2]=ids[row*topk+3];
+        // Same packed records and complete reduction dimension as the ordinary
+        // unsharded GPU adapter. All-hit output must be bitwise identical.
+        Cuda(cudaSetDevice(0));
+        Data rx(BFLOAT16,{rows,hidden},CPU,x.data()),ri(INT32,{count},CPU,ids.data()),
+             rs(FLOAT32,{count},CPU,scores.data()),scratch(FLOAT32,{rows*(hidden+topk*inter)}),
+             per(FLOAT32,{count,hidden}),activation;
+        rx.ToDevice(CUDA,std::vector<int>{0});
+        ri.ToDevice(CUDA,std::vector<int>{0});
+        rs.ToDevice(CUDA,std::vector<int>{0});
+        scratch.ToDevice(CUDA,std::vector<int>{0});scratch.Allocate(false);
+        per.ToDevice(CUDA,std::vector<int>{0});per.Allocate(false);
+        const int gate=weights[t][2]->ggmlType,down=weights[t][3]->ggmlType;
+        auto ordinary=[](int type) {
+            switch(type){case GGML_TYPE_IQ2_XXS_R4:return int(GGML_TYPE_IQ2_XXS);
+                case GGML_TYPE_Q2_K_R4:return int(GGML_TYPE_Q2_K);
+                case GGML_TYPE_Q3_K_R4:return int(GGML_TYPE_Q3_K);
+                case GGML_TYPE_Q4_K_R4:return int(GGML_TYPE_Q4_K);
+                case GGML_TYPE_IQ2_S_R4:return int(GGML_TYPE_IQ2_S);
+                case GGML_TYPE_IQ3_XXS_R4:return int(GGML_TYPE_IQ3_XXS);default:return type;}
+        };
+        FastllmCudaMoeGGUFCacheView v{static_cast<uint8_t *>(records[t]->cudaData),
+            static_cast<int32_t *>(ri.cudaData),strides[t],gateBytes[t],ordinary(gate),ordinary(down),
+            hidden,inter,scratch.cudaData,size_t(scratch.GetBytes())};
+        v.numaGateType=gate;v.numaDownType=down;
+        Require(FastllmCudaMoeGlm5GGUFCacheCompute(rx,activation,v,static_cast<float *>(rs.cudaData),topk,.125f,
+            static_cast<float *>(per.cudaData)),"GGUF oracle rejected");
+        per.ToDevice(CPU);std::vector<uint16_t> expected(rows*hidden);
+        for(int row=0;row<rows;++row) {
+            std::vector<int> order(topk);for(int k=0;k<topk;++k)order[k]=k;
+            std::stable_sort(order.begin(),order.end(),[&](int a,int b){return ids[row*topk+a]<ids[row*topk+b];});
+            for(int c=0;c<hidden;++c) {
+                float sum=0;for(int k:order)sum+=reinterpret_cast<float *>(per.cpuData)[(row*topk+k)*hidden+c];
+                expected[row*hidden+c]=Float32ToBFloat16RNEBits(sum);
+            }
+        }
+        Cuda(cudaSetDevice(origin));
+        Data input(BFLOAT16,{rows,hidden},CPU,x.data()),index(INT32,{rows,topk},CPU,ids.data()),
+             score(FLOAT32,{rows,topk},CPU,scores.data()),output;
+        input.ToDevice(CUDA,std::vector<int>{origin});
+        index.ToDevice(CUDA,std::vector<int>{origin});
+        score.ToDevice(CUDA,std::vector<int>{origin});
+        // Exercise both implicit and explicit device selection for every quantization pair.
+        const auto &requestedDevices=single && (step/tables)%2 ? noDevices : devices;
+        void *state=FastllmCudaBeginMoeDecode(weights[t].data(),weights[t].size(),topk,
+            requestedDevices.empty() ? nullptr : &requestedDevices);
+        Require(state!=nullptr,"GGUF cache scope unavailable");
+        uint64_t before[2][8]{},after[2][8]{},beforeCache[2][5]{};
+        for(int d:devices) {
+            Require(fastllm_moe_cuda_cache_route_stats(d,before[d]),"GGUF before routes");
+            Require(fastllm_moe_cuda_cache_stats(d,beforeCache[d],false),"GGUF before cache counters");
+        }
+        Cuda(cudaSetDevice(origin));int callbacks=0;
+        Require(FastllmCudaMergeMOEHybridOnDevices(input,index,score,output,weights[t].data(),weights[t].size(),
+            t,requestedDevices,
+            [&]{++callbacks;Cuda(cudaSetDevice(single ? origin : 1-origin));}),"GGUF cache dispatch rejected");
+        Require(callbacks==1 && FastllmCudaGetDevice()==origin,"GGUF callback or device restoration");
+        FastllmCudaEndMoeDecode(state);
+        uint64_t routes=0,hits=0,computed=0,queries=0,queryHits=0;
+        for(int d:devices) {
+            Require(fastllm_moe_cuda_cache_route_stats(d,after[d]),"GGUF after routes");
+            routes+=after[d][1]-before[d][1];hits+=after[d][2]-before[d][2];
+            computed+=after[d][4]-before[d][4]+after[d][5]-before[d][5];
+            sawCpu|=after[d][5]>before[d][5];
+            sawStaged|=after[d][4]-before[d][4]>after[d][2]-before[d][2];
+            uint64_t cache[5]{};
+            Require(fastllm_moe_cuda_cache_stats(d,cache,false),"GGUF cache counters");
+            queryHits+=cache[0]-beforeCache[d][0];
+            queries+=cache[0]-beforeCache[d][0]+cache[1]-beforeCache[d][1];
+            if(single) {
+                if(noCache) Require(cache[2]==0 && cache[3]==0 && cache[0]==0,
+                    "zero-cache verify allocated resident experts or reported hits");
+                else {
+                    Require(cache[2]>0 && cache[3]>0,"verify cache is empty");
+                    Require(fullCache ? cache[3]==cache[4] : cache[3]<cache[4],
+                        "verify cache capacity does not match the test mode");
+                }
+            }
+        }
+        Require(routes==count && computed==count && hits<=routes,"GGUF duplicated or lost logical routes");
+        Require(queries==routes && queryHits==hits,"GGUF cache query counters differ from logical routes");
+        output.ToDevice(CPU);
+        if(hits==routes) {
+            allHit=true;
+            Require(std::memcmp(output.cpuData,expected.data(),expected.size()*2)==0,"GGUF all-hit differs from unsharded GPU output");
+        } else {
+            mixed|=hits>0;
+            std::vector<float> a(expected.size()),b(expected.size());
+            for(size_t i=0;i<a.size();++i){a[i]=BFloat16BitsToFloat32(reinterpret_cast<uint16_t *>(output.cpuData)[i]);b[i]=BFloat16BitsToFloat32(expected[i]);}
+            Compare(a,b,"GGUF CPU/miss/cached mixture vs GPU oracle");
+        }
+        if(single) continue;
+        uint64_t stats[2][6]{};
+        for(int d=0;d<2;++d)Require(fastllm_moe_cuda_cache_ep_stats(d,stats[d]),"EP physical counters");
+        Require(stats[0][0]==2 && stats[1][0]==2 && stats[0][1]==stats[1][1] &&
+            stats[0][3]==stats[1][3],"EP cache capacities diverged");
+        for (int d=0;d<2;++d) {
+            Cuda(cudaSetDevice(d));
+            FastllmCudaMoePrefillResidents residents;
+            Require(FastllmCudaGetMoePrefillResidents(weights[t].data(),experts,residents,false) &&
+                residents.ownerCount==2 && residents.ownerRank==1-d && residents.nativeGlm,
+                "EP prefill view lost native ownership");
+            for(int e=0;e<experts;++e) if(residents.weights[e*2])
+                Require(e%2==1-d && residents.weights[e*2+1],"EP expert stored on the wrong device");
+        }
+        Require(stats[0][1]<uint64_t(tables*experts),"EP eviction test unexpectedly fits all experts");
+        if(step==12*tables-1) {
+            Require(stats[0][2]==stats[0][1],"EP replacement test did not fill the cache");
+            previousUploads=stats[0][5];
+        }
+        if(step==24*tables-1)evicted=stats[0][5]>previousUploads && stats[0][4]>0;
+    }
+    if(single) {
+        if(!noCache) Require(allHit,"verify test missed all-hit execution");
+        if(!fullCache) Require(sawCpu && sawStaged,"verify test missed CPU or streamed GPU routes");
+        if(!noCache && !fullCache) Require(mixed,"verify test missed mixed hit/miss execution");
+    } else Require(allHit && mixed && evicted,"EP test missed hits, mixed routes or replacement");
+    for(int d:devices) {
+        uint64_t cache[5]{};
+        Require(fastllm_moe_cuda_cache_stats(d,cache,true),"GGUF counter reset");
+        Require(fastllm_moe_cuda_cache_stats(d,cache,false) && cache[0]==0 && cache[1]==0 &&
+            (noCache ? cache[2]==0 && cache[3]==0 : cache[2]>0 && cache[3]>0),
+            "cache reset changed capacity or left stale counts");
+    }
+    std::puts(single ? "PASS: GLM GGUF verify, rows 1-9, output, routing and cache capacity" :
+        "PASS: GLM GGUF EP cache, whole experts, modulo ownership, frequency, replacement, rows 1-9, bitwise all-hit");
+}
+
+static void CheckHostPrefill(std::vector<Data *> *tables, int count, int hidden, bool noCache) {
+    constexpr int topk=6;
+    const int experts=(tables[0].size()-2)/2;
+    float worst=0;
+    Cuda(cudaSetDevice(0));
+    for (int rows : {33,65,129,257,1025,4096}) for (int t=0;t<count;++t) {
+        if (tables[t][3]->ggmlType==GGML_TYPE_IQ4_XS) continue;
+        Data x(BFLOAT16,{rows,hidden}),ids(INT32,{rows,topk}),scores(FLOAT32,{rows,topk}),reference;
+        x.Allocate();ids.Allocate();scores.Allocate();
+        for (int i=0;i<rows*hidden;++i) reinterpret_cast<uint16_t *>(x.cpuData)[i]=
+            Float32ToBFloat16RNEBits(i/hidden%5==0 ? 0.f : float((i*17)%73-36)/23.f);
+        std::unordered_set<int> selected;
+        for (int row=0;row<rows;++row) for (int k=0;k<topk;++k) {
+            const int e=(row+7*(k==3 ? 2 : k))%experts;
+            reinterpret_cast<int *>(ids.cpuData)[row*topk+k]=e;
+            reinterpret_cast<float *>(scores.cpuData)[row*topk+k]=k==0 ? 0.f : k==1 ? -.125f : .3125f;
+            selected.insert(e+1);
+        }
+        // Include a GPU subset with missing routes. The CPU oracle zeros only
+        // those scores; its arithmetic and routing remain independent.
+        Data oracleScores; oracleScores.CopyFrom(scores);
+        if (rows==65) {
+            for (int e=1;e<=experts;++e) if (e%4==0) selected.erase(e);
+            for (int i=0;i<rows*topk;++i)
+                if (!selected.count(reinterpret_cast<int *>(ids.cpuData)[i]+1))
+                    reinterpret_cast<float *>(oracleScores.cpuData)[i]=0;
+        }
+        // CPU-only input gives an independent NUMA arithmetic oracle.
+        OrdinaryNumas(x,ids,oracleScores,reference,tables[t],t);
+        reference.ToDevice(CPU);
+        std::vector<float> expected(rows*hidden);
+        for (size_t i=0;i<expected.size();++i)
+            expected[i]=BFloat16BitsToFloat32(reinterpret_cast<uint16_t *>(reference.cpuData)[i]);
+        x.ToDevice(CUDA,std::vector<int>{0});
+        Data activation,workspace,output(BFLOAT16,{rows,hidden});
+        output.ToDevice(CUDA,std::vector<int>{0});output.Allocate(false);
+        std::vector<uint16_t> first;
+        for (int pass=0;pass<2;++pass) {
+            Require(FastllmCudaMergeMOEGGUFHost(x,activation,workspace,output,tables[t].data(),experts,
+                reinterpret_cast<int32_t *>(ids.cpuData),reinterpret_cast<float *>(scores.cpuData),
+                topk,selected,true,true,.125f,128),"GLM host prefill did not select grouped MMQ");
+            std::vector<uint16_t> bits(rows*hidden);
+            Cuda(cudaMemcpy(bits.data(),output.cudaData,bits.size()*2,cudaMemcpyDeviceToHost));
+            std::vector<float> actual(bits.size());
+            for (size_t i=0;i<bits.size();++i) actual[i]=BFloat16BitsToFloat32(bits[i]);
+            worst=std::max(worst,Compare(actual,expected,"GLM streamed MMQ vs NUMA"));
+            if (!pass) first=bits;
+            else Require(bits==first,"GLM cached prefill changed streamed MMQ arithmetic");
+            FastllmCudaMoePrefillResidents view;
+            if (noCache) {
+                uint64_t stats[5]{};
+                Require(fastllm_moe_cuda_cache_stats(0,stats,false) && stats[2]==0 && stats[3]==0,
+                    "zero-cache prefill allocated resident payload");
+            } else {
+                Require(FastllmCudaGetMoePrefillResidents(tables[t].data(),experts,view,false) && !view.nativeGlm,
+                    "single-GPU canonical prefill cache unavailable");
+                int resident=0;
+                for (int e:selected) resident+=view.weights[2*(e-1)]!=nullptr;
+                Require(resident==int(selected.size()),"single-GPU prefill failed to fill selected experts");
+            }
+        }
+    }
+    std::printf("PASS: GLM GGUF streamed prefill, single GPU, cache=%d, >3 expert batches, rows 33/65/129/257/1025/4096; max relative L2 %.8f\n",
+        !noCache,worst);
+}
+
+static void CheckExpertPrefill(std::vector<Data *> *tables, int count, int hidden, bool numa=false) {
+    constexpr int topk=6;
+    const int experts=(tables[0].size()-2)/2;
+    const std::vector<int> devices{1,0};
+    for(int rows : (numa ? std::vector<int>{33,129} : std::vector<int>{2,33,129})) {
+        std::vector<std::vector<uint16_t>> expected(2*count);
+        uint64_t uploads[2]{};
+        for(int pass=0;pass<3;++pass) {
+            if(pass==1) {
+                Require(FastllmCudaPrepareMoeExpertCache(tables[0].data(),tables[0].size(),devices),
+                    "EP prefill ownership setup failed");
+            }
+            for(int t=0;t<count;++t) for(int d=0;d<2;++d) {
+                Cuda(cudaSetDevice(d));
+                Data input(BFLOAT16,{rows,hidden}),ids(INT32,{rows,topk}),scores(FLOAT32,{rows,topk});
+                input.Allocate();ids.Allocate();scores.Allocate();
+                for(int i=0;i<rows*hidden;++i)
+                    reinterpret_cast<uint16_t *>(input.cpuData)[i]=Float32ToBFloat16RNEBits(float(i%37-18)/23.f);
+                std::unordered_set<int> selected;
+                for(int row=0;row<rows;++row)for(int k=0;k<topk;++k) {
+                    const int e=(row+k)%8;
+                    reinterpret_cast<int *>(ids.cpuData)[row*topk+k]=e;
+                    reinterpret_cast<float *>(scores.cpuData)[row*topk+k]=k==0 ? 0.f : k==1 ? -.125f : .3125f;
+                    selected.insert(e+1);
+                }
+                input.ToDevice(CUDA,std::vector<int>{d});
+                if(pass==1 && t==0) {
+                    // The prefill speed estimator invokes ordinary GGUF math
+                    // on the same table. Its restored payload must not replace
+                    // native records, whether the expert is cold or resident.
+                    FastllmCudaMoePrefillResidents view;
+                    Require(FastllmCudaGetMoePrefillResidents(tables[t].data(),experts,view,true),"probe cache unavailable");
+                    uint64_t before[6]{},after[6]{};
+                    Require(fastllm_moe_cuda_cache_ep_stats(d,before),"probe before stats");
+                    Data px(BFLOAT16,{65,hidden}),pi(INT32,{65,1}),ps(FLOAT32,{65,1}),po(BFLOAT16,{65,hidden}),pa,pb,pc;
+                    px.Allocate();pi.Allocate();ps.Allocate();
+                    for(int j=0;j<65*hidden;++j)reinterpret_cast<uint16_t *>(px.cpuData)[j]=Float32ToBFloat16RNEBits(float(j%17-8)/23.f);
+                    for(int j=0;j<65;++j){reinterpret_cast<int *>(pi.cpuData)[j]=0;reinterpret_cast<float *>(ps.cpuData)[j]=1;}
+                    px.ToDevice(CUDA,std::vector<int>{d});std::vector<Data*> biases(tables[t].size());
+                    DoCudaMergeMOEFromCPU(px,po,pi,ps,pa,pb,pc,tables[t].data(),biases.data(),0,true,{1},true,
+                        MoeGateSwiglu,false,0,128,false,true);
+                    Require(fastllm_moe_cuda_cache_ep_stats(d,after) && before[5]==after[5],
+                        "generic GGUF probe polluted native expert cache");
+                }
+                Data output(BFLOAT16,{rows,hidden}),w1,w2,w3;
+                std::vector<Data *> biases(tables[t].size());
+                // An unregistered table key bypasses cache lookup for the
+                // reference while borrowing the same original NUMA weights.
+                const auto &source=*tables[t][2];
+                Data key(DATA_GGUF_FORMAT,source.ggmlType,source.dims);
+                key.isFake=true;key.IsRepacked=source.IsRepacked;
+                key.isGGUFData=source.isGGUFData;key.isModelWeight=source.isModelWeight;
+                key.forceGGUFFp32Dequant=source.forceGGUFFp32Dequant;
+                key.numasData=source.numasData;
+                auto uncached=tables[t];uncached[2]=&key;
+                if(numa) {
+                    NumasMoeCudaAssistScope assist(&devices);
+                    OrdinaryNumas(input,ids,scores,output,pass ? tables[t] : uncached,t);
+                }
+                else DoCudaMergeMOEFromCPU(input,output,ids,scores,w1,w2,w3,
+                    pass ? tables[t].data() : uncached.data(),biases.data(),
+                    0,true,selected,true,MoeGateSwiglu,true,.125f,128,false,true);
+                Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                std::vector<uint16_t> actual(rows*hidden);
+                output.ToDevice(CPU);
+                std::memcpy(actual.data(),output.cpuData,actual.size()*2);
+                Cuda(cudaSetDevice(d));
+                for(auto value:actual) Require((value & 0x7f80)!=0x7f80,"nonfinite EP prefill output");
+                if(!pass) {expected[t*2+d]=actual;continue;}
+                if(numa) {
+                    std::vector<float> a(actual.size()),b(actual.size());
+                    for(size_t i=0;i<a.size();++i){a[i]=BFloat16BitsToFloat32(actual[i]);b[i]=BFloat16BitsToFloat32(expected[t*2+d][i]);}
+                    Compare(a,b,"EP NUMA prefill differs from streamed GPU output");
+                } else Require(actual==expected[t*2+d],"EP prefill cache changed CUDA output");
+                FastllmCudaMoePrefillResidents view;
+                Require(FastllmCudaGetMoePrefillResidents(tables[t].data(),experts,view,false) && view.nativeGlm,
+                    "EP prefill residents missing");
+                int resident=0;
+                for(int e=0;e<experts;++e)if(view.weights[e*2]) {
+                    ++resident;Require(e%2==1-d,"EP prefill admitted another GPU's expert");
+                    for(int part=0;part<2;++part) {
+                        const auto &w=*tables[t][(e+1)*2+part];
+                        std::vector<uint8_t> bytes(w.GetBytes());
+                        Cuda(cudaMemcpy(bytes.data(),view.weights[e*2+part],bytes.size(),cudaMemcpyDeviceToHost));
+                        const size_t shardBytes=bytes.size()/w.numasData.size();
+                        for(size_t n=0;n<w.numasData.size();++n)
+                            Require(!memcmp(bytes.data()+n*shardBytes,w.numasData[n],shardBytes),
+                                "EP prefill cache changed native NUMA storage");
+                    }
+                }
+                Require(resident>0,"EP prefill admitted no experts");
+            }
+            if(pass)for(int d=0;d<2;++d) {
+                uint64_t stats[6]{};Require(fastllm_moe_cuda_cache_ep_stats(d,stats),"EP prefill stats");
+                if(pass==1){uploads[d]=stats[5];Require(uploads[d]>0,"EP prefill uploaded no bytes");}
+                else Require(stats[5]==uploads[d],"EP prefill reuploaded resident weights");
+            }
+        }
+    }
+    std::puts(numa ?
+        "PASS: GLM GGUF EP prefill, NUMA/two-GPU integration, native bytes, rows 33/129" :
+        "PASS: GLM GGUF EP prefill, reversed devices, native bytes, bitwise cached output, rows 2/33/129");
+}
+
+static void CheckPackedIQ(int devices) {
+    constexpr int experts = 3, topk = 4;
+    std::mt19937 rng(71443);
+    int checks = 0;
+    for (int device = 0; device < devices; ++device) {
+        Cuda(cudaSetDevice(device));
+        for (int hidden : {4096, 2048}) {
+            constexpr int inter = 2048;
+            const size_t gateRow = hidden / QK_K * sizeof(block_iq2_xxs);
+            const size_t gateBytes = 2 * inter * gateRow;
+            const size_t downBytes = size_t(hidden) * inter / QK_K * sizeof(block_iq3_xxs);
+            const size_t stride = gateBytes + downBytes;
+            std::vector<uint8_t> canonical(experts * stride), native(canonical.size());
+            for (int e = 0; e < experts; ++e) {
+                auto *g = reinterpret_cast<block_iq2_xxs *>(canonical.data() + e * stride);
+                for (size_t b = 0; b < gateBytes / sizeof(*g); ++b) {
+                    g[b].d = 0x1400 + (rng() & 1023); // Finite positive FP16 scales.
+                    for (auto &q : g[b].qs) q = rng();
+                }
+                auto *d = reinterpret_cast<block_iq3_xxs *>(canonical.data() + e * stride + gateBytes);
+                for (size_t b = 0; b < downBytes / sizeof(*d); ++b) {
+                    d[b].d = 0x1400 + (rng() & 1023);
+                    for (auto &q : d[b].qs) q = rng();
+                }
+                for (int row = 0; row < inter; ++row) for (int part = 0; part < 2; ++part)
+                    memcpy(native.data() + e * stride + (2 * row + part) * gateRow,
+                        canonical.data() + e * stride + (row + part * inter) * gateRow, gateRow);
+                memcpy(native.data() + e * stride + gateBytes, canonical.data() + e * stride + gateBytes, downBytes);
+            }
+            Data records(INT8, {int(canonical.size())}, CPU, canonical.data());
+            Data interleaved(INT8, {int(native.size())}, CPU, native.data());
+            records.ToDevice(CUDA); interleaved.ToDevice(CUDA);
+            for (int rows : {1, 2, 32, 33}) for (bool compact : {false, true}) {
+                const int total = rows * topk;
+                std::vector<uint16_t> x(rows * hidden);
+                std::vector<float> scores(total);
+                std::vector<int32_t> slots, map;
+                for (int i = 0; i < rows * hidden; ++i)
+                    x[i] = Float32ToBFloat16RNEBits(i / hidden % 2 ? 0.f : float(int(rng() % 127) - 63) / 31.f);
+                for (int r = total - 1; r >= 0; --r) {
+                    scores[r] = r % 3 == 0 ? 0.f : r % 3 == 1 ? -.125f : .3125f;
+                    if (!compact || r % topk != 1) { map.push_back(r); slots.push_back(r % (experts + 1) - 1); }
+                }
+                const int routes = slots.size();
+                Data input(BFLOAT16, {rows, hidden}, CPU, x.data()), ds(FLOAT32, {total}, CPU, scores.data());
+                Data di(INT32, {routes}, CPU, slots.data()), dm(INT32, {routes}, CPU, map.data());
+                input.ToDevice(CUDA); ds.ToDevice(CUDA); di.ToDevice(CUDA); dm.ToDevice(CUDA);
+                const size_t minimum = size_t(rows) * (hidden + topk * inter);
+                const size_t capacity = minimum + std::max(size_t(rows) * hidden, size_t(routes) * inter);
+                Data scratch(FLOAT32, {int(capacity + 1)}), result(FLOAT32, {total, hidden}), activation;
+                scratch.ToDevice(CUDA); scratch.Allocate(false); result.ToDevice(CUDA); result.Allocate(false);
+                std::vector<float> reference, prefix, output(total * hidden), quantized(rows * hidden);
+                std::vector<uint16_t> gateReference, gate(routes * inter);
+                for (int variant = 0; variant < 4; ++variant) {
+                    // Minimal scratch selects the generic reference without an
+                    // environment override. Check extra scratch, unaligned
+                    // scratch, and native interleaved gate/up against it.
+                    auto *workspace = static_cast<float *>(scratch.cudaData) + (variant == 2 ? 1 : 0);
+                    FastllmCudaMoeGGUFCacheView view{
+                        static_cast<const uint8_t *>(variant == 3 ? interleaved.cudaData : records.cudaData),
+                        static_cast<const int32_t *>(di.cudaData), stride, gateBytes,
+                        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS, hidden, inter,
+                        workspace, (variant == 0 ? minimum : capacity) * sizeof(float)};
+                    if (compact) { view.routeMap = static_cast<const int32_t *>(dm.cudaData); view.routeCount = routes; }
+                    if (variant == 3) { view.numaGateType = view.gateType; view.numaDownType = view.downType; }
+                    for (int reuse = 0; reuse < 2; ++reuse) {
+                        view.q8InputPrepared = reuse != 0;
+                        Cuda(cudaMemset(result.cudaData, 0x5a, result.GetBytes()));
+                        Require(FastllmCudaMoeGlm5GGUFCacheCompute(input, activation, view,
+                            static_cast<const float *>(ds.cudaData), topk, compact ? 0.f : 7.f,
+                            static_cast<float *>(result.cudaData)), "packed IQ dispatch rejected");
+                        Cuda(cudaMemcpy(output.data(), result.cudaData, result.GetBytes(), cudaMemcpyDeviceToHost));
+                        Cuda(cudaMemcpy(gate.data(), activation.cudaData, gate.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+                        Cuda(cudaMemcpy(quantized.data(), workspace, quantized.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                        if (variant == 0 && reuse == 0) { reference = output; gateReference = gate; prefix = quantized; }
+                        Require(!memcmp(output.data(), reference.data(), output.size() * sizeof(float)) &&
+                            gate == gateReference, "packed IQ differs from generic arithmetic");
+                        Require(!memcmp(quantized.data(), prefix.data(), quantized.size() * sizeof(float)),
+                            "packed IQ overwrote reusable canonical input");
+                        ++checks;
+                    }
+                    if (hidden == 4096 && rows == 1 && !compact && variant == 1) {
+                        Data partial(INT8, {int(canonical.size())}); partial.ToDevice(CUDA); partial.Allocate(false);
+                        for (int e = 0; e < experts; ++e)
+                            Cuda(cudaMemcpy(static_cast<uint8_t *>(partial.cudaData) + e * stride,
+                                view.records + e * stride, gateBytes, cudaMemcpyDeviceToDevice));
+                        fastllm_test::DelayedDownUpload upload;
+                        upload.Hold();
+                        for (int e = 0; e < experts; ++e)
+                            Cuda(cudaMemcpyAsync(static_cast<uint8_t *>(partial.cudaData) + e * stride + gateBytes,
+                                view.records + e * stride + gateBytes, downBytes, cudaMemcpyDeviceToDevice, upload.stream));
+                        Cuda(cudaEventRecord(upload.downReady, upload.stream)); view.records = static_cast<const uint8_t *>(partial.cudaData);
+                        Require(FastllmCudaMoeGlm5GGUFCacheComputeStaged(input, activation, view,
+                            static_cast<const float *>(ds.cudaData), topk, 7.f, static_cast<float *>(result.cudaData),
+                            {upload.downReady, upload.gateDone, upload.downStart}), "packed IQ staged dispatch rejected");
+                        Cuda(cudaEventSynchronize(upload.gateDone));
+                        const bool earlyGate = !upload.timedOut && cudaEventQuery(upload.downReady) == cudaErrorNotReady;
+                        upload.release = true; Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                        Cuda(cudaMemcpy(output.data(), result.cudaData, result.GetBytes(), cudaMemcpyDeviceToHost));
+                        Require(earlyGate && !memcmp(output.data(), reference.data(), output.size() * sizeof(float)),
+                            "packed IQ delayed down upload changed ordering or output");
+                    }
+                }
+            }
+        }
+    }
+    std::printf("PASS: GLM GGUF packed IQ, %d exact checks, both layouts, scratch alignment/capacity, input reuse and staged upload\n", checks);
+}
+
+static void CheckTpBatch(int devices) {
+    if (devices != 2) {
+        std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: GLM cache TP requires two GPUs");
+        return;
+    }
+    for (int device = 0; device < devices; ++device) {
+        cudaDeviceProp prop{};
+        Cuda(cudaGetDeviceProperties(&prop, device));
+        if (prop.major != 7 || prop.minor != 5) {
+            std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: GLM cache TP requires SM75");
+            return;
+        }
+        int peer = 0;
+        Cuda(cudaDeviceCanAccessPeer(&peer, device, 1 - device));
+        if (!peer) {
+            std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: GLM cache TP requires peer access");
+            return;
+        }
+    }
+    constexpr int hidden = 4096, inter = 2048, topk = 6, experts = 24, tables = 4;
+    SetThreads(8);
+    SetMoeCudaCacheBytes(256ULL << 20);
+    std::mt19937 rng(71593);
+    std::vector<std::unique_ptr<Data>> owned;
+    std::vector<Data *> weights[tables];
+    FastllmCudaMoeCacheLayer layers[tables];
+    for (int table = 0; table < tables; ++table) {
+        weights[table].resize(2 * (experts + 1));
+        for (int expert = 0; expert < experts; ++expert) for (int part = 0; part < 2; ++part) {
+            const auto type = table == 3 ? (part ? GGML_TYPE_Q3_K : GGML_TYPE_Q2_K) :
+                             part ? (table == 0 ? GGML_TYPE_IQ3_XXS : GGML_TYPE_IQ4_XS) :
+                                    (table == 2 ? GGML_TYPE_IQ2_S : GGML_TYPE_IQ2_XXS);
+            auto w = std::make_unique<Data>(DATA_GGUF_FORMAT, type,
+                std::vector<int>{part ? hidden : 2 * inter, part ? inter : hidden});
+            w->isModelWeight = w->isGGUFData = true;
+            w->Allocate(false);
+            if (table == 3) {
+                // MTP uses Q2_K/Q3_K, whose scale fields are not at byte zero.
+                std::vector<float> source(w->dims[0] * w->dims[1]);
+                for (auto &v : source) v = float(int(rng() % 199) - 99) / 4096.f;
+                ggml_type_from_float_ref(type)(source.data(), w->cpuData, source.size());
+            } else {
+                for (size_t i = 0; i < w->GetBytes(); ++i) w->cpuData[i] = rng() >> 24;
+                for (size_t i = 0; i < w->GetBytes(); i += ggml_type_size(type)) {
+                    const uint16_t scale = float_to_half(std::ldexp(1.f, -13 + int(rng() % 3)));
+                    std::memcpy(w->cpuData + i, &scale, 2);
+                }
+            }
+            weights[table][2 * (expert + 1) + part] = w.get();
+            owned.push_back(std::move(w));
+        }
+        layers[table] = {weights[table].data(), int(weights[table].size()), false, .125f, true};
+    }
+    Require(FastllmCudaPrepareMoeCache(layers, tables, [&] {
+        for (auto &table : weights) for (size_t i = 2; i < table.size(); ++i)
+            RegisterNumas(table[i], i % 2 ? "linearColumn" : "linearSwiglu");
+    }), "TP batch registration rejected");
+    const std::vector<int> devicesUsed{0, 1};
+    for (auto &table : weights)
+        Require(FastllmCudaPrepareMoeTensorParallel(table.data(), table.size(), devicesUsed),
+            "TP batch preparation rejected");
+    float worst = 0;
+    int checks = 0;
+    // Start with several rows to catch the old adapter's single-row rejection.
+    // Then shrink/grow scratch, change the output owner, and reuse cache slots.
+    for (int pass = 0; pass < 2; ++pass) for (int rows : {4, 1, 2, 8, 3, 4}) {
+        const int routes = rows * topk;
+        std::vector<uint16_t> x(rows * hidden);
+        std::vector<int32_t> ids(routes), cpuOnly(topk, -1);
+        std::vector<float> scores(routes), per(topk * hidden), rowInput(hidden), expected(rows * hidden);
+        for (int i = 0; i < rows * hidden; ++i)
+            x[i] = Float32ToBFloat16RNEBits(float((i * 17 + pass) % 61 - 30) / 23.f);
+        for (int r = 0; r < routes; ++r) {
+            ids[r] = (r / topk * 3 + (r % topk) / 2 + pass * 7) % experts;
+            scores[r] = r % 3 == 0 ? 0.f : r % 3 == 1 ? -.125f : .3125f;
+        }
+        for (int table = 0; table < tables; ++table) {
+            for (int row = 0; row < rows; ++row) {
+                for (int c = 0; c < hidden; ++c) rowInput[c] = BFloat16BitsToFloat32(x[row * hidden + c]);
+                NumasMoeDecodeExpertsWithOverlap(rowInput.data(), per.data(), weights[table].data(),
+                    ids.data() + row * topk, cpuOnly.data(), topk, table, [] {},
+                    scores.data() + row * topk, .125f, 128, nullptr);
+                std::vector<int> order(topk);
+                for (int k = 0; k < topk; ++k) order[k] = k;
+                std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+                    return ids[row * topk + a] < ids[row * topk + b];
+                });
+                for (int c = 0; c < hidden; ++c) {
+                    float sum = 0;
+                    for (int k : order) sum += per[k * hidden + c];
+                    expected[row * hidden + c] = Bf(sum);
+                }
+            }
+            const int device = (pass + table) % 2;
+            Cuda(cudaSetDevice(device));
+            Data input(BFLOAT16, {rows, hidden}, CPU, x.data()), index(INT32, {rows, topk}, CPU, ids.data()),
+                 score(FLOAT32, {rows, topk}, CPU, scores.data()), output;
+            for (auto *v : {&input, &index, &score}) v->ToDevice(CUDA, std::vector<int>{device});
+            void *state = FastllmCudaBeginMoeDecode(weights[table].data(), weights[table].size(), topk, &devicesUsed);
+            Require(state != nullptr, "TP batch scope missing");
+            int callbacks = 0;
+            Require(FastllmCudaMergeMOEHybridOnDevices(input, index, score, output,
+                weights[table].data(), weights[table].size(), table, devicesUsed,
+                [&] { ++callbacks; Cuda(cudaSetDevice(1 - device)); }), "TP batch adapter rejected");
+            FastllmCudaEndMoeDecode(state);
+            Require(callbacks == 1, "TP batch callback count wrong");
+            output.ToDevice(CPU);
+            std::vector<float> actual(rows * hidden);
+            for (int c = 0; c < rows * hidden; ++c)
+                actual[c] = BFloat16BitsToFloat32(reinterpret_cast<uint16_t *>(output.cpuData)[c]);
+            worst = std::max(worst, Compare(actual, expected, "TP batch vs single-row CPU"));
+            ++checks;
+        }
+    }
+    for (int device : devicesUsed) {
+        uint64_t stats[8]{};
+        Require(fastllm_moe_cuda_cache_route_stats(device, stats) &&
+            stats[0] == uint64_t(checks) && stats[2] && stats[5],
+            "TP batch did not exercise both resident GPU and CPU routes");
+    }
+    FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+    ClearNumasMoeRuntimeCache();
+    std::printf("PASS: GLM TP batch rows1/2/3/4/8, %d checks, both output owners, max relative L2 %.8f\n", checks, worst);
+}
+
+static void CheckIQ4DownQuantization() {
+    cudaDeviceProp properties{};
+    Cuda(cudaGetDeviceProperties(&properties, 0));
+    if (properties.major != 7 || properties.minor != 5) {
+        std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: GLM row TP requires SM75");
+        return;
+    }
+    Cuda(cudaSetDevice(0));
+    constexpr int hidden = 4096, inter = 2048;
+    Data weights(DATA_GGUF_FORMAT, GGML_TYPE_IQ4_XS, {hidden, inter});
+    weights.Allocate();
+    std::memset(weights.cpuData, 0, weights.GetBytes());
+    auto *blocks = reinterpret_cast<block_iq4_xs *>(weights.cpuData);
+    for (int row = 0; row < hidden; ++row) {
+        auto &block = blocks[row * (inter / QK_K)];
+        block.d = float_to_half(1.f);
+        block.scales_h = 0xaaaa;
+        block.scales_l[0] = 0x10;
+        std::memset(block.qs, 0x88, sizeof(block.qs));
+    }
+    // Only channels 32..63 have nonzero weights. The maximum activation at
+    // channel 0 sets the Q8_K scale; all weighted activations round to zero.
+    // A stale BF16 down path instead returns 32 / 1024 for every output.
+    std::vector<uint16_t> values(inter, 0);
+    values[0] = Float32ToBFloat16RNEBits(1.f);
+    for (int c = 32; c < 64; ++c) values[c] = Float32ToBFloat16RNEBits(1.f / 1024);
+    int32_t slot = 0;
+    float score = 1.f;
+    Data record(INT8, {int(weights.GetBytes())}, CPU, weights.cpuData);
+    Data activation(BFLOAT16, {1, inter}, CPU, values.data());
+    Data slots(INT32, {1}, CPU, &slot), scores(FLOAT32, {1}, CPU, &score);
+    Data input(BFLOAT16, {1, hidden}), scratch(FLOAT32, {hidden}), output(FLOAT32, {hidden});
+    for (auto *data : {&record, &activation, &slots, &scores}) data->ToDevice(CUDA);
+    for (auto *data : {&input, &scratch, &output}) { data->ToDevice(CUDA); data->Allocate(); }
+    for (int rank = 0; rank < 2; ++rank) {
+        const size_t shardBytes = record.GetBytes() / 2;
+        FastllmCudaMoeGGUFCacheView view{
+            static_cast<uint8_t *>(record.cudaData) + rank * shardBytes,
+            static_cast<int32_t *>(slots.cudaData), shardBytes, 0,
+            GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_XS, hidden, inter,
+            scratch.cudaData, size_t(scratch.GetBytes())};
+        Require(FastllmCudaMoeGlm5GGUFTpStage(true, rank, input, activation,
+            view, static_cast<float *>(scores.cudaData), 1, 10.f,
+            static_cast<float *>(output.cudaData)), "IQ4_XS TP down rejected");
+    }
+    output.ToDevice(CPU);
+    for (int c = 0; c < hidden; ++c)
+        Require(reinterpret_cast<float *>(output.cpuData)[c] == 0.f,
+            "IQ4_XS TP down skipped the Q8_K activation boundary");
+    std::puts("PASS: IQ4_XS TP down preserves Q8_K activation quantization");
+}
+
+int main(int argc, char **argv) {
+    try {
+        const std::string option=argc>1 ? argv[1] : "";
+        const bool hostPrefill=option=="--host-prefill" || option=="--host-prefill-no-cache";
+        const bool numaPrefill=option=="--ep-numa-prefill";
+        const bool expertPrefill=numaPrefill || option=="--ep-prefill";
+        const bool expertCache=expertPrefill || option=="--ep-cache";
+        const bool resident=option=="--resident";
+        const bool ppCache=option=="--pp-cache" || option=="--pp-frequency";
+        ExpertCacheTestMode cacheMode=ExpertCacheTestMode::Parallel;
+        if(option=="--verify") cacheMode=ExpertCacheTestMode::Verify;
+        else if(option=="--verify-no-cache") cacheMode=ExpertCacheTestMode::VerifyNoCache;
+        else if(option=="--verify-full-cache") cacheMode=ExpertCacheTestMode::VerifyFullCache;
+        const bool verify=cacheMode!=ExpertCacheTestMode::Parallel;
+        const bool noCache=option=="--no-cache" || option=="--host-prefill-no-cache" ||
+            cacheMode==ExpertCacheTestMode::VerifyNoCache;
+        const bool frequency=noCache || option=="--frequency" || option=="--pp-frequency";
+        int devices = 0;
+        if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices || (expertCache && devices<2)) {
+            std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: CUDA unavailable"); return 0;
+        }
+        if (option == "--packed-iq") { CheckPackedIQ(devices); return 0; }
+        if (option == "--iq4-down") { CheckIQ4DownQuantization(); return 0; }
+        if (option == "--tp-batch") { CheckTpBatch(devices); return 0; }
+        constexpr int hidden=512, topk=6, tables=8;
+        const int experts=hostPrefill ? 56 : 24;
+        const int inter=resident ? 512 : 256;
+        SetThreads(8);
+        // Exercise both prefill GPU workers without relying on timing-based
+        // decisions from the speed estimator for these small test matrices.
+        if(numaPrefill) setenv("FT_EXPERT_LIMIT","1",1);
+        setenv("FASTLLM_GLM5_MOE_CACHE_PREFETCH",frequency ? "1" : "0",1);
+        std::mt19937 rng(71443);
+        std::vector<std::unique_ptr<Data>> owned;
+        std::vector<Data *> weights[tables];
+        std::vector<std::vector<float>> dense[tables];
+        FastllmCudaMoeCacheLayer layers[tables];
+        std::vector<std::unique_ptr<Data>> tpOwned;
+        std::vector<Data *> tpWeights[tables][2];
+        size_t stride=0;
+        std::vector<DirectLayoutFixture> directFixtures;
+        for (int t=0;t<tables;++t) {
+            weights[t].resize(2*(experts+1)); dense[t].resize(2*experts);
+            for (int e=0;e<experts;++e) for (int part=0;part<2;++part) {
+                const auto type=t<4 ? (part ? (t%2 ? GGML_TYPE_IQ4_XS : GGML_TYPE_IQ3_XXS) :
+                                      (t<2 ? GGML_TYPE_IQ2_XXS : GGML_TYPE_IQ2_S)) :
+                    t==4 ? GGML_TYPE_Q2_K : t==5 ? GGML_TYPE_Q3_K :
+                    t==6 || part ? GGML_TYPE_Q4_K : GGML_TYPE_Q2_K;
+                const int rows=part ? hidden : 2*inter, cols=part ? inter : hidden;
+                auto w=std::make_unique<Data>(DATA_GGUF_FORMAT,type,std::vector<int>{rows,cols});
+                w->isModelWeight=true; w->isGGUFData=true;
+                w->forceGGUFFp32Dequant=expertPrefill && t%2; w->Allocate(false);
+                if (t>=4) {
+                    std::vector<float> source(rows*cols);
+                    for (auto &v:source) v=float(int(rng()%199)-99)/4096.f;
+                    ggml_type_from_float_ref(type)(source.data(),w->cpuData,source.size());
+                } else {
+                    for (size_t i=0;i<w->GetBytes();++i) w->cpuData[i]=rng()>>24;
+                    const size_t block=ggml_type_size(type);
+                    for (size_t off=0;off<w->GetBytes();off+=block) {
+                        const uint16_t scale=float_to_half(std::ldexp(resident ? (1.f + float(rng()%37)/64.f) : 1.f,-12+int(rng()%3)));
+                        memcpy(w->cpuData+off,&scale,2);
+                    }
+                }
+                auto &matrix=dense[t][2*e+part];matrix.resize(rows*cols);
+                ggml_type_to_float(type)(w->cpuData,matrix.data(),matrix.size());
+                weights[t][2*(e+1)+part]=w.get();owned.push_back(std::move(w));
+            }
+            stride=std::max(stride,weights[t][2]->GetBytes()+weights[t][3]->GetBytes());
+            layers[t]={weights[t].data(),int(weights[t].size()),false,.125f,true};
+            if (ppCache) layers[t].cacheDevice = t == 4 ? std::min(1, devices-1) : 0;
+            if (!resident) directFixtures.emplace_back(weights[t]);
+        }
+        stride=(stride+127)/128*128;
+        unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
+        unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");
+        int cacheSlots=tables*(frequency ? 16 : 4);
+        if(verify) cacheSlots=tables*8;
+        if(cacheMode==ExpertCacheTestMode::VerifyFullCache) cacheSlots=tables*experts;
+        if(hostPrefill) cacheSlots=tables*experts;
+        SetMoeCudaCacheBytes(noCache ? 0 : stride*cacheSlots);
+        if (resident) {
+            for (int t=0;t<tables;++t) for (size_t i=2;i<weights[t].size();++i) {
+                auto &w = *weights[t][i];
+                w.ToDevice(CUDA, std::vector<int>{(t/2) % std::min(2, devices)});
+                Require(w.cudaData && !w.cpuData && w.numasData.empty(),
+                        "resident expert retained host storage");
+            }
+            if (devices >= 2) for (int t=0;t<tables;++t) {
+                for (int r=0;r<2;++r) tpWeights[t][r].resize(weights[t].size());
+                for (size_t i=2;i<weights[t].size();++i) {
+                    auto source=std::make_unique<Data>();
+                    source->CopyFrom(*weights[t][i]); source->ToDevice(CPU);
+                    source->isModelWeight=true;
+                    const int axis=i%2 ? 1 : 0;
+                    DivisionScheme scheme;
+                    for (int r=0;r<2;++r) for (int part=0;part<(axis==0 ? 2 : 1);++part)
+                        scheme[r].push_back({part*inter+r*inter/2,part*inter+(r+1)*inter/2});
+                    std::vector<int> ranks{0,1}; Data bias;
+                    Require(SplitMultiCudaWeight(*source,bias,ranks,scheme,axis,true),"GLM TP expert split failed");
+                    Require(!source->cpuData && source->numasData.empty(),"GLM TP expert retained CPU copy");
+                    for (int r=0;r<2;++r) {
+                        tpWeights[t][r][i]=source->multiDeviceDatas.at(r);
+                        tpWeights[t][r][i]->ClearTensorParallelLayout();
+                    }
+                    tpOwned.push_back(std::move(source));
+                }
+            }
+        } else {
+            if (noCache) Require(!FastllmCudaPrepareMoeCache(layers,tables,[] {}),
+                "zero-cache streaming must be explicitly prepared");
+            Require(FastllmCudaPrepareMoeCache(layers,tables,[&] {
+                for (auto &table:weights) for (size_t i=2;i<table.size();++i)
+                    RegisterNumas(table[i],i%2 ? "linearColumn" : "linearSwiglu");
+            },noCache),"GLM GGUF registration rejected");
+            Require(FastllmCudaCanRunMoeHybrid(weights[0].data(),weights[0].size()),"hybrid unavailable");
+            Require(!FastllmCudaCanRunMoeCache(weights[0].data(),weights[0].size()),"generic unscored math admitted");
+            Require(!FastllmCudaMoeGlm5GGUFCacheSupported(GGML_TYPE_Q5_K,GGML_TYPE_IQ4_XS,hidden,inter),
+                    "unsupported GLM pair admitted");
+            for (int t=0;t<tables;++t) {
+                directFixtures[t].Check(weights[t],hidden,inter);
+                CheckVerifyCpu(weights[t],hidden,t);
+            }
+            std::puts("PASS: GLM direct NUMA layout and scored CPU verify rows 1/2/3/4/7/9/17");
+        }
+        if(hostPrefill) {
+            CheckHostPrefill(weights,tables,hidden,noCache);
+            FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size());
+            ClearNumasMoeRuntimeCache();return 0;
+        }
+        if(expertCache || verify) {
+            if(expertPrefill) CheckExpertPrefill(weights,tables,hidden,numaPrefill);
+            else CheckExpertCache(weights,tables,hidden,inter,cacheMode);
+            FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size());
+            ClearNumasMoeRuntimeCache();return 0;
+        }
+        float worst=0;
+        bool sawCpu=false, sawMixed=false, sawGpu=false, sawStaged=false;
+        bool sawCooperative[2]{};
+        for (int step=0;step<(frequency ? 32 : 8);++step) {
+            const int t=step%tables;
+            std::vector<float> x(hidden),scores(topk),expected(hidden),per(topk*hidden);
+            std::vector<uint16_t> bx(hidden);
+            std::vector<int32_t> ids(topk);
+            for (int c=0;c<hidden;++c) {
+                x[c]=Bf(std::ldexp(float(int(rng()%97)-48)/19.f,c/32%4-2));
+                bx[c]=Float32ToBFloat16RNEBits(x[c]);
+            }
+            for (int r=0;r<topk;++r) {
+                ids[r]=(step*7+r*3)%experts;
+                scores[r]=r==0 ? 0 : r==1 ? -.125f : float(r+1)/16;
+            }
+            ids[2]=ids[3]; // duplicate expert with distinct route scores
+            auto qx=x;Q8(qx);
+            for (int r=0;r<topk;++r) {
+                const auto &g=dense[t][2*ids[r]], &d=dense[t][2*ids[r]+1];
+                std::vector<float> mid(inter);
+                for (int row=0;row<inter;++row) {
+                    double gate=0,up=0;
+                    for (int c=0;c<hidden;++c) {
+                        gate+=double(g[row*hidden+c])*qx[c];
+                        up+=double(g[(row+inter)*hidden+c])*qx[c];
+                    }
+                    const float a=std::min(Bf(gate),.125f), b=std::clamp(Bf(up),-.125f,.125f);
+                    mid[row]=Bf((a/(1+std::exp(-a)))*b*scores[r]);
+                }
+                Q8(mid);
+                for (int row=0;row<hidden;++row) {
+                    double v=0;for(int c=0;c<inter;++c) v+=double(d[row*inter+c])*mid[c];
+                    per[r*hidden+row]=Bf(v);
+                }
+            }
+            // GLM reduces in increasing expert-id order, preserving duplicates.
+            std::vector<int> order(topk);for(int r=0;r<topk;++r)order[r]=r;
+            std::stable_sort(order.begin(),order.end(),[&](int a,int b){return ids[a]<ids[b];});
+            for(int c=0;c<hidden;++c) {float v=0;for(int r:order)v+=per[r*hidden+c];expected[c]=Bf(v);}
+            if (resident) {
+                const int device = (t/2) % std::min(2, devices);
+                Cuda(cudaSetDevice(device));
+                for (int rows : {1, 3, 17, 32, 33, 65, 257, 1025}) {
+                    std::vector<uint16_t> batchX(rows * hidden);
+                    std::vector<int32_t> batchIds(rows * topk);
+                    std::vector<float> batchScores(rows * topk), reference(rows * hidden);
+                    for (int row=0; row<rows; ++row) {
+                        for (int c=0; c<hidden; ++c) {
+                            batchX[row*hidden+c] = row%2 ? 0 : bx[c];
+                            reference[row*hidden+c] = row%2 ? 0 : expected[c];
+                        }
+                        for (int k=0; k<topk; ++k) {
+                            batchIds[row*topk+k] = ids[(k+row)%topk];
+                            batchScores[row*topk+k] = scores[(k+row)%topk];
+                        }
+                    }
+                    Data input(BFLOAT16,{rows,hidden},CPU,batchX.data()), index(INT32,{rows,topk},CPU,batchIds.data()),
+                         score(FLOAT32,{rows,topk},CPU,batchScores.data()), activation, workspace, out;
+                    input.ToDevice(CUDA,std::vector<int>{device}); index.ToDevice(CUDA,std::vector<int>{device}); score.ToDevice(CUDA,std::vector<int>{device});
+                    Require(FastllmCudaMergeMOEGlm5GGUFResident(input,activation,workspace,out,
+                        weights[t].data(),weights[t].size(),static_cast<const int32_t *>(index.cudaData),
+                        static_cast<const float *>(score.cudaData),topk,.125f), "resident GLM rejected");
+                    const size_t grouped = fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(
+                        weights[t][2]->ggmlType,weights[t][3]->ggmlType,std::min(rows,1024),
+                        hidden,inter,experts,topk);
+                    if (rows>32 && grouped) Require(workspace.GetBytes()==grouped,
+                        "supported prefill did not select grouped workspace");
+                    if (weights[t][3]->ggmlType==GGML_TYPE_IQ4_XS)
+                        Require(grouped==0,"IQ4_XS unexpectedly admitted to grouped path");
+                    out.ToDevice(CPU);
+                    std::vector<float> actual(rows*hidden);
+                    for (int c=0;c<rows*hidden;++c)
+                        actual[c]=BFloat16BitsToFloat32(reinterpret_cast<uint16_t *>(out.cpuData)[c]);
+                    worst=std::max(worst,Compare(actual,reference,"resident vs scalar oracle"));
+                    if (devices >= 2) {
+                        std::vector<float> sum(rows*hidden,0);
+                        for (int rank=0;rank<2;++rank) {
+                            Cuda(cudaSetDevice(rank));
+                            Data tx(BFLOAT16,{rows,hidden},CPU,batchX.data()), ti(INT32,{rows,topk},CPU,batchIds.data()),
+                                ts(FLOAT32,{rows,topk},CPU,batchScores.data()), ta, tw, to;
+                            tx.ToDevice(CUDA,std::vector<int>{rank}); ti.ToDevice(CUDA,std::vector<int>{rank});
+                            ts.ToDevice(CUDA,std::vector<int>{rank});
+                            Require(FastllmCudaMergeMOEGlm5GGUFResident(tx,ta,tw,to,
+                                tpWeights[t][rank].data(),tpWeights[t][rank].size(),
+                                static_cast<const int32_t *>(ti.cudaData),static_cast<const float *>(ts.cudaData),
+                                topk,.125f),"GLM TP resident shard rejected");
+                            to.ToDevice(CPU);
+                            for (int c=0;c<rows*hidden;++c)
+                                sum[c]+=BFloat16BitsToFloat32(reinterpret_cast<uint16_t *>(to.cpuData)[c]);
+                        }
+                        for (auto &v:sum) v=Bf(v);
+                        worst=std::max(worst,Compare(sum,reference,"resident TP sum vs full scalar oracle"));
+                        Cuda(cudaSetDevice(device));
+                    }
+                }
+                continue;
+            }
+            Data hx(BFLOAT16,{1,hidden},CPU,bx.data()),hi(INT32,{1,topk},CPU,ids.data()),
+                 hs(FLOAT32,{1,topk},CPU,scores.data()),ordinary;
+            OrdinaryNumas(hx,hi,hs,ordinary,weights[t],t);
+            ordinary.ToDevice(CPU);
+            std::vector<float> cpu(hidden);
+            for(int c=0;c<hidden;++c) cpu[c]=BFloat16BitsToFloat32(reinterpret_cast<uint16_t*>(ordinary.cpuData)[c]);
+            worst=std::max(worst,Compare(cpu,expected,"ordinary NUMA vs scalar oracle"));
+            // Exercise scored CPU subsets directly, including duplicate routes
+            // with different scores and the all-GPU callback-only case.
+            std::vector<int32_t> mask(topk, -1);
+            const int subsetGpu = step % (topk + 1);
+            for (int r=0;r<subsetGpu;++r) mask[r]=ids[r];
+            std::vector<float> subset(topk*hidden, 123.f), subsetExpected(subset);
+            for (int r=subsetGpu;r<topk;++r)
+                std::copy_n(per.data()+r*hidden,hidden,subsetExpected.data()+r*hidden);
+            auto checkSubset=[&](const char *label) {
+                Require(std::all_of(subset.begin(),subset.begin()+subsetGpu*hidden,
+                    [](float v){return v==123.f;}),"GPU-owned route modified by CPU");
+                const std::vector<float> actual(subset.begin()+subsetGpu*hidden,subset.end());
+                const std::vector<float> reference(subsetExpected.begin()+subsetGpu*hidden,subsetExpected.end());
+                worst=std::max(worst,Compare(actual,reference,label));
+            };
+            double cpuUs=-1;
+            int submitted=0;
+            NumasMoeDecodeExpertsWithOverlap(x.data(),subset.data(),weights[t].data(),
+                ids.data(),mask.data(),topk,t,[&]{++submitted;},
+                scores.data(),.125f,128,&cpuUs);
+            Require(submitted==1 && (subsetGpu==topk ? cpuUs==0 : cpuUs>0),
+                    "scored subset callback or CPU timing missing");
+            checkSubset("scored CPU subset vs scalar oracle");
+            if (step==0) {
+                auto begin=std::chrono::steady_clock::now();
+                NumasMoeDecodeExpertsWithOverlap(x.data(),subset.data(),weights[t].data(),
+                    ids.data(),mask.data(),topk,t,[]{std::this_thread::sleep_for(std::chrono::milliseconds(20));},
+                    scores.data(),.125f,128,&cpuUs);
+                const double wallUs=std::chrono::duration<double,std::micro>(
+                    std::chrono::steady_clock::now()-begin).count();
+                Require(cpuUs>0 && cpuUs<wallUs*.5,
+                        "scored CPU timing included the GPU callback stall");
+                checkSubset("timed scored CPU subset");
+                bool caught=false;
+                try {
+                    NumasMoeDecodeExpertsWithOverlap(x.data(),subset.data(),weights[t].data(),
+                        ids.data(),mask.data(),topk,t,[]{throw std::runtime_error("expected submit failure");},
+                        scores.data(),.125f,128,&cpuUs);
+                } catch(const std::runtime_error &) {caught=true;}
+                Require(caught,"scored subset swallowed callback failure");
+                NumasMoeDecodeExpertsWithOverlap(x.data(),subset.data(),weights[t].data(),
+                    ids.data(),mask.data(),topk,t,[]{},scores.data(),.125f,128,&cpuUs);
+                checkSubset("scored CPU callback recovery");
+            }
+            for(int device=0;device<std::min(2,devices);++device) {
+                if (ppCache && layers[t].cacheDevice != device) continue;
+                Cuda(cudaSetDevice(device));
+                Data input(BFLOAT16,{1,hidden},CPU,bx.data()),index(INT32,{1,topk},CPU,ids.data()),
+                     score(FLOAT32,{1,topk},CPU,scores.data()),out;
+                input.ToDevice(CUDA,std::vector<int>{device});
+                index.ToDevice(CUDA,std::vector<int>{device});score.ToDevice(CUDA,std::vector<int>{device});
+                // Refill outside Begin/End, then resume frequency admission.
+                // This also verifies that End restores ordinary routing.
+                for(int split : noCache ? std::vector<int>{-1,-1,-1} :
+                                frequency ? std::vector<int>{-1,-1,-1,6,-1,0} :
+                                            std::vector<int>{0,2,6,6,0}) {
+                    setenv("FASTLLM_GLM5_MOE_CACHE_GPU_EXPERTS",std::to_string(split).c_str(),1);
+                    void *state=nullptr;
+                    if (split < 0) {
+                        // A stale calibration override must not refill misses.
+                        setenv("FASTLLM_GLM5_MOE_CACHE_GPU_EXPERTS","0",1);
+                        state=FastllmCudaBeginMoeDecode(weights[t].data(),weights[t].size(),topk);
+                        Require(state!=nullptr,"GLM frequency policy unavailable");
+                    }
+                    uint64_t before[8]={},after[8]={};
+                    Require(fastllm_moe_cuda_cache_route_stats(device,before),"before counters");
+                    int callbacks=0;
+                    Require(FastllmCudaMergeMOEHybrid(input,index,score,out,weights[t].data(),weights[t].size(),t,[&]{
+                        ++callbacks;if(devices>1)Cuda(cudaSetDevice(1-device));
+                    }),"GGUF GLM hybrid rejected");
+                    Require(callbacks==1,"shared callback missing");
+                    FastllmCudaEndMoeDecode(state);
+                    Require(fastllm_moe_cuda_cache_route_stats(device,after),"after counters");
+                    Require(after[0]-before[0]==1 && after[1]-before[1]==topk,"missing routes");
+                    const auto gpu=after[4]-before[4];
+                    if (noCache) Require(after[2]==0 && after[6]==0 && after[7]==0,
+                        "zero-cache dispatch retained or prefetched experts");
+                    if (split < 0) {
+                        const auto resident=after[2]-before[2];
+                        Require(gpu>=resident && after[6]-before[6]==resident &&
+                                gpu+after[5]-before[5]==topk,
+                                "frequency staged dispatch lost resident or CPU routes");
+                        sawStaged|=gpu>resident;
+                        Require(after[7]==before[7],"frequency also ran legacy prefetch");
+                        sawCpu|=gpu<topk; sawMixed|=gpu>0 && gpu<topk; sawGpu|=gpu==topk;
+                    } else Require(gpu==split && after[5]-before[5]==topk-split,"wrong dispatch");
+                    Require(after[2]-before[2]+after[3]-before[3]==topk,"wrong residency count");
+                    out.ToDevice(CPU);std::vector<float> actual(hidden);
+                    for(int c=0;c<hidden;++c)actual[c]=BFloat16BitsToFloat32(reinterpret_cast<uint16_t*>(out.cpuData)[c]);
+                    if(gpu==0) Require(std::memcmp(out.cpuData,ordinary.cpuData,hidden*2)==0,
+                        "CPU-only cache route changed ordinary GLM GGUF arithmetic");
+                    worst=std::max(worst,Compare(actual,expected,"hybrid vs scalar oracle"));
+                }
+            }
+            if (frequency && !ppCache && devices > 1) {
+                // Exercise arbitrary verifier widths as well as decode; rotate
+                // routes and alternate zero/nonzero inputs between rows to catch wrong maps.
+                for (int rows : {1, 2, 5}) {
+                    const int device = step % 2;
+                    Cuda(cudaSetDevice(device));
+                    std::vector<uint16_t> batchX(rows * hidden);
+                    std::vector<int32_t> batchIds(rows * topk);
+                    std::vector<float> batchScores(rows * topk), batchExpected(rows * hidden);
+                    for (int row=0;row<rows;++row) {
+                        // A zero activation row must produce zero regardless of its
+                        // score/route order, while other rows retain the oracle.
+                        for (int c=0;c<hidden;++c) {
+                            batchX[row*hidden+c]=row%2 ? 0 : bx[c];
+                            batchExpected[row*hidden+c]=row%2 ? 0 : expected[c];
+                        }
+                        for (int k=0;k<topk;++k) {
+                            batchIds[row*topk+k]=ids[(k+row)%topk];
+                            batchScores[row*topk+k]=scores[(k+row)%topk];
+                        }
+                    }
+                    Data input(BFLOAT16,{rows,hidden},CPU,batchX.data()), index(INT32,{rows,topk},CPU,batchIds.data()),
+                         score(FLOAT32,{rows,topk},CPU,batchScores.data()), out;
+                    input.ToDevice(CUDA,std::vector<int>{device}); index.ToDevice(CUDA,std::vector<int>{device}); score.ToDevice(CUDA,std::vector<int>{device});
+                    void *state = FastllmCudaBeginMoeDecode(weights[t].data(),weights[t].size(),topk);
+                    Require(state != nullptr, "cooperative policy unavailable");
+                    uint64_t before[2][8]{}, after[2][8]{};
+                    for (int d=0;d<2;++d) Require(fastllm_moe_cuda_cache_route_stats(d,before[d]),"cooperative before");
+                    Cuda(cudaSetDevice(device));
+                    int callbacks=0;
+                    Require(FastllmCudaMergeMOEHybridOnDevices(input,index,score,out,
+                        weights[t].data(),weights[t].size(),t,{0,1},[&]{++callbacks; Cuda(cudaSetDevice(1-device));}),
+                        "cooperative GGUF rejected");
+                    Require(callbacks==1 && FastllmCudaGetDevice()==device,"cooperative callback/device restore");
+                    FastllmCudaEndMoeDecode(state);
+                    uint64_t total=0, computed=0;
+                    for (int d=0;d<2;++d) {
+                        Require(fastllm_moe_cuda_cache_route_stats(d,after[d]),"cooperative after");
+                        total+=after[d][1]-before[d][1];
+                        computed+=after[d][4]-before[d][4]+after[d][5]-before[d][5];
+                        sawCooperative[d]|=after[d][4]>before[d][4];
+                        if(noCache) Require(after[d][2]==0 && after[d][6]==0,"cooperative unexpectedly cached weights");
+                    }
+                    Require(total==rows*topk && computed==rows*topk,"cooperative routes lost or duplicated");
+                    out.ToDevice(CPU); std::vector<float> actual(rows*hidden);
+                    for(int c=0;c<rows*hidden;++c) actual[c]=BFloat16BitsToFloat32(reinterpret_cast<uint16_t*>(out.cpuData)[c]);
+                    worst=std::max(worst,Compare(actual,batchExpected,"cooperative vs scalar oracle"));
+                }
+            }
+        }
+        if (resident) {
+            std::printf("PASS: GLM GGUF resident experts, freed host weights, both GPUs, GEMV/grouped rows 1/3/17/32/33/65/257/1025; max relative L2 %.8f\n",worst);
+            return 0;
+        }
+        for(int device=0;device<std::min(2,devices);++device) {
+            uint64_t stats[5]={};Require(fastllm_moe_cuda_cache_stats(device,stats,false),"query counters");
+            if (ppCache) {
+                Require(stats[0] && stats[1] && stats[3] > 0, "PP cache not exercised");
+                if (device == 1) Require(stats[3] == uint64_t(experts), "PP Q2 capacity reserved foreign formats");
+                Cuda(cudaSetDevice(device));
+                for (int t=0;t<tables;++t) if (layers[t].cacheDevice != device) {
+                    FastllmCudaMoePrefillResidents view;
+                    Require(FastllmCudaGetMoePrefillResidents(weights[t].data(),experts,view,false), "PP resident view missing");
+                    Require(std::all_of(view.weights.begin(),view.weights.end(),[](const void *p){return !p;}),
+                            "PP cache admitted another stage's experts");
+                }
+                continue;
+            }
+            Require(noCache ? stats[0]==0 && stats[1]>0 && stats[2]==0 && stats[3]==0 :
+                stats[0] && stats[1] && (frequency ? stats[3]>=uint64_t(tables*16) && stats[3]<tables*experts : stats[3]==uint64_t(tables*4)),
+                    "cache cold/hot/eviction or compact slots missing");
+        }
+        if (frequency) Require(sawCpu && sawMixed && (noCache || sawGpu) && sawStaged,
+                               "frequency did not exercise CPU, resident and staged GPU routes");
+        if (frequency && !ppCache && devices > 1) Require(sawCooperative[0] && sawCooperative[1], "cooperative path did not exercise both GPUs");
+        FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size());
+        ClearNumasMoeRuntimeCache();
+        std::printf("PASS: GLM GGUF cache CPU/mixed/GPU, scalar oracle, duplicates, scores, clamp, eviction, counters; max relative L2 %.8f\n",worst);
+        return 0;
+    } catch(const std::exception &e) { std::fprintf(stderr,"FAIL: %s\n",e.what());return 1; }
+}

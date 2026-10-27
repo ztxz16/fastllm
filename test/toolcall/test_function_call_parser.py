@@ -969,6 +969,9 @@ class FunctionCallParserTest(unittest.TestCase):
         self.assertEqual(len(diagnostics), 1)
         self.assertEqual(diagnostics[0].code, "invalid_tool_name")
         self.assertEqual(diagnostics[0].tool_name, "get_wearher")
+        self.assertEqual(parser.finalize_stream(), diagnostics)
+        self.assertEqual(parser.finalize_stream(), diagnostics)
+        self.assertTrue(parser.flush_stream_tool_calls().has_invalid_tool_block)
 
     def test_stream_forward_unknown_tools_preserves_raw_unknown_name(self):
         with patch.dict("os.environ",

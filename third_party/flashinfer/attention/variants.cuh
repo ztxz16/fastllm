@@ -31,6 +31,7 @@ DEFINE_HAS_MEMBER(maybe_mask_indptr)
 template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
 struct DefaultAttention : AttentionVariantBase {
   static constexpr bool use_softmax = true;
+  static constexpr bool uses_sliding_window = use_sliding_window;
 
   uint8_t* custom_mask_ptr;
   uint32_t qo_len, kv_len;

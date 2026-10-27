@@ -1,0 +1,104 @@
+MiMo EP8 with built-in MegaMoE
+
+Start through the standard FastLLM CLI (chat/run/server/benchmark):
+  ftllm server MODEL --tp 8 --ep 8 [other existing options]
+
+--ep 8 automatically selects the built-in W8A8 MegaMoE backend. No separate
+MegaMoE enable flag or shared-library path is required. --ep 1 selects the
+original MoE tensor-parallel path; omitting --ep also defaults to that path
+unless an explicit environment setting is present. Attention stays TP8.
+Saved launch JSON accepts "tp": "8", "ep": 8.
+
+Build FastLLM with CUDA as usual, targeting SM90, for example:
+  cmake -S . -B build -DUSE_CUDA=ON -DCUDA_ARCH=90
+  cmake --build build -j 16 --target fastllm_tools
+
+Linux CUDA >= 12.8 is required; CUDA 13 was used for validation. SM90 builds
+include this backend automatically. CMake links the CUDA kernel into
+libfastllm_tools.so; it never dlopens a separate EP8 adapter. CUDA_ARCH=native
+also enables it when CMake detects SM90. Other architecture builds retain
+their existing backends and reject an explicit unsupported --ep 8 request.
+
+The kernel is adapted from DeepGEMM source, not an independently authored
+replacement. Its pinned header subset, MIT license, original source hashes
+and adaptation details are in third_party/deep_gemm_ep8. It uses repository
+CUTLASS/CUTE headers. Building and inference require neither the DeepGEMM
+Python package nor a third-party DeepGEMM binary or Python JIT.
+
+Independent reference check (requires PyTorch + DeepGEMM, CUDA 13):
+  python3 tools/mega_moe_sm90/check_ep8.py \
+    --lib /absolute/path/build/tools/ftllm/libfastllm_tools.so \
+    --output /absolute/path/ep8_check.json
+The reference dependency is only for validation, not production inference.
+
+For C++ callers, set FASTLLM_TP=8 and FASTLLM_EP=8 before model creation.
+FASTLLM_EP is the single native EP setting; --ep takes precedence over it.
+EP placement is resolved once before weight loading; changing the environment
+later cannot switch it.
+
+Reproduce the adapted vendored header without third-party packages:
+  python3 tools/mega_moe_sm90/direct_weights.py --check
+
+Scope and layout:
+  Linux CUDA, eight H20 GPUs, compute capability 9.0 and 78 SMs per GPU,
+  with all-to-all CUDA peer access. Explicit --ep 8 on unsupported hardware
+  raises an error instead of silently using TP.
+  Token sharding is implemented only in this backend; other models, GPU
+  architectures and EP sizes do not automatically use it.
+  MiMo hidden=4096, intermediate=2048, experts=256, top-k=8, SwiGLU,
+  FP8 E4M3 expert weights with 128x128 block scales, BF16 activations/KV.
+  Attention and dense layers remain TP8. Each card owns 32 complete experts.
+  The loader places each expert directly on its owner; it does not first
+  create eight TP shards or retain a second packed copy of the weights.
+  Select EP before model creation; changing placement requires a reload.
+
+  Inputs larger than 64 rows are split into eight disjoint contiguous token
+  ranges. Each token is dispatched once, and each rank processes its range
+  in local chunks of at most 64 rows. Balanced shard lengths differ by at
+  most one row; idle sources still enter each EP round with zero rows.
+  Completed shards are gathered with NVLink peer copies directly into the
+  existing output tensors. Host rendezvous and per-thread stream completion
+  ensure all sources are ready and remain alive until every reader finishes.
+  This eager-only path allocates no padded output, activation scratch,
+  collective workspace or larger EP arena; uneven tails need no padding.
+  Inputs of at most 64 rows retain the replicated, collective-free path:
+  logical BS1 decode still dispatches eight copies to avoid adding a gather
+  to its latency-sensitive graph. Router projection remains replicated.
+
+  Attention decode supports CUDA Graph for 1..4 concurrent requests. The
+  graph eligibility check accepts the resident EP state instead of requiring
+  every expert TP shard on every card. Each request retains its own KV cache;
+  changes in request order/count, KV addresses/capacity or attention region
+  invalidate the existing batch graph rather than retaining one per shape.
+  Verification and batches larger than four retain eager execution.
+  Large prefill processes up to 512 distinct tokens per EP round across the
+  eight 64-row shards, using the same bounded temporary storage.
+  The host queries the compiled kernel capacity; there is no runtime flag.
+  The model's TP worker serializes calls on cudaStreamPerThread.
+
+Memory and precision:
+  Original weight bytes stay in their native layout. Gate/up tiles are
+  interleaved in shared memory, not in an extra GPU weight buffer.
+  FastLLM owns 46,050,048 bytes (43.92 MiB) of persistent symmetric workspace
+  per card, capped at 48 MiB. This is 29.82 MiB more than the original eight-row
+  path, and is shared across all layers/chunks and both prefill and decode.
+  The 32 local experts share 6080 token slots instead of reserving 512 slots
+  per expert. The bound is floor((8*64*8 + 32*(64-1))/64)*64: total possible
+  routes plus at most 63 padding slots per expert, rounded down because the
+  sum of aligned expert spans is itself a multiple of 64. Scaling-factor
+  storage uses 128 rows per 64-row tile. This includes all layer descriptors; no
+  per-layer H2D descriptor uploads occur during decode. This storage must
+  not alias transient attention scratch or be zeroed between calls.
+  EP allocates only expert scales, avoiding TP's unused expert bias caches.
+  Compare total model memory, including the workspace, against the native
+  TP baseline. Between-request measurements are not peak-memory counters.
+
+  MegaMoE uses W8A8: BF16 input and intermediate activations are quantized to
+  FP8, and output is BF16. It is not numerically equivalent to native W8A16;
+  logits and generated tokens can change. Selecting --ep 8 selects W8A8.
+  Unit checks compare all eight ranks to installed DeepGEMM W8A8 with the
+  same weights/routes and cover 1/2/8/9/16/32/63/64 rows, spread/one-owner routes,
+  idle source ranks, uneven row counts, a pattern filling all 6080 pool slots,
+  untouched idle-output guards, repeated calls, allocation guards and
+  CUDA Graph replay. Full-model logits need a separate regression
+  check because these unit checks do not establish W8A16 equivalence.

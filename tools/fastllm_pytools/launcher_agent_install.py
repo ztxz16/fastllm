@@ -5,6 +5,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from .agent_native_runtime import prepare_node
+
 from .harness_install import (_check_cancelled, _download_node, _extract_node,
                               _installation_lock, _run_command)
 
@@ -45,6 +47,7 @@ def install_runtime(directory, agent, progress, cancelled, *, upgrade=False):
             _extract_node(archive, staging / "node", cancelled)
             archive.unlink()
             node = staging / ("node/node.exe" if os.name == "nt" else "node/bin/node")
+            prepare_node(node)
             npm = staging / ("node/node_modules/npm/bin/npm-cli.js" if os.name == "nt"
                              else "node/lib/node_modules/npm/bin/npm-cli.js")
             environment = os.environ.copy()

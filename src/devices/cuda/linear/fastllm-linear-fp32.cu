@@ -64,7 +64,10 @@ bool FastllmCudaMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight,
 
     const bool exactRows = n > 1 &&
         n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
-    if (exactRows && n <= 65535) {
+    // Small-output projections (such as MoE routers) benefit from the
+    // existing GEMV reduction, with independent rows in grid.y.
+    const bool smallBatch = n > 1 && n <= 8 && k <= 1024;
+    if ((smallBatch || exactRows) && n <= 65535) {
         FastllmGemvFp32Fp32Kernel2<256, 1>
             <<<dim3(k, n), 256>>>(
                 cudaInput, (float *)weight.cudaData, cudaOutput,

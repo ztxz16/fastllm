@@ -523,6 +523,12 @@ class FunctionCallParser:
                 finalizer(self._request))
             if self._stream_final_result.invalid_tool_calls:
                 diagnostics.extend(self._stream_final_result.diagnostics)
+        if not self.has_valid_streamed_tool_calls:
+            # Suppressing every invalid call must not turn an attempted
+            # action into a successful text-only stop for agent clients.
+            # Explicit unknown-tool forwarding still counts as a valid call.
+            diagnostics.extend(diagnostic for diagnostic in self.stream_diagnostics
+                               if diagnostic not in diagnostics)
         truncated = finish_reason == "length" and self.incomplete_tool_call
         parser_error = None
         parser_error_fn = getattr(self.parser, "streaming_parse_error", None)
@@ -752,6 +758,8 @@ class FunctionCallParser:
         return bool(_get_value(self._tool_function(name), "strict"))
 
     def _constraint_type(self) -> str:
+        if self.tool_parser_name in {"deepseek_v41", "deepseek_v41_text"}:
+            return "deepseek_v41_dsml"
         if self.tool_parser_name == "deepseek_v4":
             return "deepseek_v4_dsml"
         if self.tool_parser_name in {"dots", "dots3_note"}:

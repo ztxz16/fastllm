@@ -47,6 +47,7 @@ class AgentReasoningTest(unittest.TestCase):
 
     def test_native_agent_catalogs_offer_only_the_models_native_efforts(self):
         for model_type, expected, default in (("qwen3_5", ["none", "low", "medium", "xhigh"], "xhigh"),
+                ("naive_n05_flash", ["none", "low"], "none"),
                 ("kimi_k3", ["none", "low", "high", "max"], "max"), (None, [], None)):
             with self.subTest(model_type=model_type), tempfile.TemporaryDirectory() as directory:
                 service = dict(SERVICE, modelMetadata=FastLLmModel("my-alias",
@@ -66,10 +67,11 @@ class AgentReasoningTest(unittest.TestCase):
                     self.assertEqual(opencode["variants"]["high"], {"disabled": True})
                 harness = {p["id"]: p for p in HarnessRuntime._patch(service, "127.0.0.1") if "id" in p}
                 provider = harness["llm-pi-ai"]["config"]["providers"]["fastllm"]
-                self.assertEqual(provider.get("reasoning"), default)
+                harness_default = "off" if default == "none" else default
+                self.assertEqual(provider.get("reasoning"), harness_default)
                 self.assertEqual(provider["models"][0]["reasoningEfforts"],
                     {"off" if effort == "none" else effort: effort for effort in expected} if expected else False)
-                self.assertEqual(harness["agent-default-model"]["config"].get("reasoningEffort"), default)
+                self.assertEqual(harness["agent-default-model"]["config"].get("reasoningEffort"), harness_default)
 
     def test_codex_forwards_supported_effort_and_rejects_invalid_or_stale_selections(self):
         with tempfile.TemporaryDirectory() as directory:

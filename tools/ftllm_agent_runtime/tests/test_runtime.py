@@ -315,12 +315,157 @@ def test_runtime_rejects_an_empty_agent_response(tmp_path: Path):
         binary=str(binary),
     )
 
-    with pytest.raises(PiAgentError, match="without assistant output"):
+    with pytest.raises(PiAgentError, match="without.*assistant output"):
         list(runtime.stream(
             "Inspect the project.",
             [{"name": "app.py", "text": "answer = 42\n"}],
             "Use the read-only project tools.",
         ))
+
+
+@pytest.mark.parametrize("reason", ["length", "error", "aborted"])
+@pytest.mark.parametrize("event_type", ["message_end", "turn_end", "agent_end"])
+def test_runtime_does_not_report_interrupted_model_output_as_done(
+    tmp_path: Path, reason: str, event_type: str
+):
+    message = {"role": "assistant", "stopReason": reason,
+               "errorMessage": "test backend failure",
+               "content": [{"type": "text", "text": "I will fix the remaining files"}]}
+    terminal = ({"type": event_type, "messages": [message]}
+                if event_type == "agent_end" else
+                {"type": event_type, "message": message})
+    binary = _fake_pi_binary(tmp_path, [
+        {"type": "turn_start"},
+        {"type": "message_update", "assistantMessageEvent": {
+            "type": "text_delta", "delta": "I will fix the remaining files"}},
+        terminal,
+        {"type": "agent_end"},
+    ])
+    runtime = PiAgentRuntime(api_base="http://localhost:8000/v1",
+                             model="demo", binary=str(binary))
+    emitted = []
+    with pytest.raises(PiAgentError, match="output token limit|test backend failure|aborted"):
+        for event in runtime.stream("Fix the project.", [], "Finish the task.",
+                                    working_directory=str(tmp_path)):
+            emitted.append(event)
+    assert not any(event['type'] == 'done' for event in emitted)
+
+
+@pytest.mark.parametrize("previous_answer", [False, True])
+def test_runtime_rejects_thinking_only_final_turn(tmp_path: Path, previous_answer: bool):
+    events = []
+    if previous_answer:
+        events += [
+            {"type": "turn_start"},
+            {"type": "message_update", "assistantMessageEvent": {
+                "type": "text_delta", "delta": "I will inspect the project."}},
+            {"type": "turn_end"},
+        ]
+    events += [
+        {"type": "turn_start"},
+        {"type": "message_update", "assistantMessageEvent": {
+            "type": "thinking_delta", "delta": "Let me think about the changes."}},
+        {"type": "turn_end", "message": {"role": "assistant", "stopReason": "stop",
+             "content": [{"type": "thinking", "thinking": "Let me think."}]}},
+        {"type": "agent_end"},
+    ]
+    binary = _fake_pi_binary(tmp_path, events)
+    runtime = PiAgentRuntime(api_base="http://localhost:8000/v1",
+                             model="demo", binary=str(binary))
+    with pytest.raises(PiAgentError, match="without.*(answer|output)"):
+        list(runtime.stream("Fix the project.", [], "Finish the task.",
+                            working_directory=str(tmp_path)))
+
+
+@pytest.mark.parametrize("reason", ["error", "length"])
+def test_runtime_allows_pi_to_retry_an_error_before_final_success(tmp_path: Path, reason: str):
+    binary = _fake_pi_binary(tmp_path, [
+        {"type": "turn_start"},
+        {"type": "message_end", "message": {"role": "assistant",
+             "stopReason": reason, "errorMessage": "temporary failure", "content": []}},
+        {"type": "turn_end"},
+        {"type": "agent_end", "willRetry": reason == "error"},
+        *([{"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3,
+            "delayMs": 1, "errorMessage": "temporary failure"}]
+          if reason == "error" else [
+              {"type": "compaction_start", "reason": "overflow"},
+              {"type": "compaction_end", "reason": "overflow",
+               "aborted": False, "willRetry": True, "result": {}},
+          ]),
+        {"type": "turn_start"},
+        {"type": "message_update", "assistantMessageEvent": {
+            "type": "text_delta", "delta": "Task complete."}},
+        {"type": "turn_end", "message": {"role": "assistant", "stopReason": "stop",
+             "content": [{"type": "text", "text": "Task complete."}]}},
+        {"type": "agent_end", "willRetry": False},
+        {"type": "agent_settled"},
+    ])
+    runtime = PiAgentRuntime(api_base="http://localhost:8000/v1",
+                             model="demo", binary=str(binary))
+    events = list(runtime.stream("Fix the project.", [], "Finish the task.",
+                                 working_directory=str(tmp_path)))
+    assert events[-1] == {"type": "done", "turns": 2}
+
+
+@pytest.mark.parametrize("settled", [False, True])
+def test_runtime_modern_rpc_requires_settled_and_reports_final_failure(tmp_path: Path, settled: bool):
+    failed = {"role": "assistant", "stopReason": "error",
+              "errorMessage": "retries exhausted", "content": []}
+    events = [
+        {"type": "turn_start"},
+        {"type": "message_end", "message": failed},
+        {"type": "turn_end", "message": failed},
+        {"type": "agent_end", "messages": [failed], "willRetry": False},
+    ]
+    if settled:
+        events.append({"type": "agent_settled"})
+    runtime = PiAgentRuntime(api_base="http://localhost:8000/v1", model="demo",
+        binary=str(_fake_pi_binary(tmp_path, events)))
+    with pytest.raises(PiAgentError, match="retries exhausted" if settled else "before agent_settled"):
+        list(runtime.stream("Finish.", [], "Complete the task.", working_directory=str(tmp_path)))
+
+
+@pytest.mark.parametrize("reason", ["error", "length"])
+def test_runtime_reports_exhausted_recovery_without_done(tmp_path: Path, reason: str):
+    failed = {"role": "assistant", "stopReason": reason,
+              "errorMessage": "backend unavailable", "content": []}
+    recovery = ([{"type": "auto_retry_start"},
+                 {"type": "auto_retry_end", "success": False, "finalError": "backend unavailable"}]
+                if reason == "error" else [
+                    {"type": "compaction_start", "reason": "overflow"},
+                    {"type": "compaction_end", "reason": "overflow", "aborted": False,
+                     "willRetry": False, "errorMessage": "compaction failed"}])
+    events = [{"type": "turn_start"},
+              {"type": "turn_end", "message": failed},
+              {"type": "agent_end", "messages": [failed], "willRetry": reason == "error"},
+              *recovery, {"type": "agent_settled"}]
+    runtime = PiAgentRuntime(api_base="http://localhost:8000/v1", model="demo",
+                            binary=str(_fake_pi_binary(tmp_path, events)))
+    emitted = []
+    with pytest.raises(PiAgentError, match="backend unavailable|output token limit"):
+        for event in runtime.stream("Finish.", [], "Complete the task.", working_directory=str(tmp_path)):
+            emitted.append(event)
+    assert not any(event["type"] == "done" for event in emitted)
+
+
+def test_runtime_cancellation_during_pi_recovery(tmp_path: Path):
+    binary = tmp_path / "pi"
+    binary.write_text(
+        '#!/usr/bin/env python3\nimport json, sys, time\n'
+        'json.loads(sys.stdin.readline())\n'
+        'print(json.dumps({"type":"agent_end","willRetry":True}), flush=True)\n'
+        'time.sleep(30)\n')
+    binary.chmod(0o755)
+    runtime = PiAgentRuntime(api_base="http://localhost:8000/v1", model="demo", binary=str(binary))
+    cancel = threading.Event()
+    timer = threading.Timer(0.2, cancel.set)
+    timer.start()
+    try:
+        with pytest.raises(PiAgentCancelled):
+            list(runtime.stream("Finish.", [], "Complete the task.",
+                working_directory=str(tmp_path), cancel_event=cancel))
+    finally:
+        timer.cancel()
 
 
 def test_runtime_cancellation_terminates_a_running_process(tmp_path: Path):

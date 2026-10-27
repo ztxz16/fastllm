@@ -35,7 +35,10 @@ namespace fastllm {
 
     class BaseDevice {
     public:
-        virtual ~BaseDevice() = default;
+        BaseDevice() = default;
+        BaseDevice(const BaseDevice &) = delete;
+        BaseDevice &operator=(const BaseDevice &) = delete;
+        virtual ~BaseDevice();
 
         virtual bool Malloc (void **ret, size_t size) = 0; // 分配尺寸为size的空间  
         virtual bool Malloc (void **ret, Data &data); // 分配形状为dims的空间  
@@ -61,6 +64,7 @@ namespace fastllm {
         std::vector <int> deviceIds;
         std::map <int, int> deviceIdsRatio;
 
+        // Operators registered by a device are owned by that device.
         std::map <std::string, BaseOperator*> ops;
     };
 }

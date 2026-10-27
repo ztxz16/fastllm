@@ -15,6 +15,9 @@ if [ $? != 0 ]; then
     exit -1
 fi
 
+# Python 文件更新不一定触发 C++ 重新链接，安装前同步最新工具代码。
+cmake -E copy_directory ../tools/fastllm_pytools tools/ftllm || exit 1
+
 cd tools
 pip install .[all]
 #python3 setup.py sdist build

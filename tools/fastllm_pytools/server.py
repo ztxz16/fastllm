@@ -9,12 +9,13 @@ import threading
 import time
 import uvicorn
 from fastapi import Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .openai_server.protocal.openai_protocol import *
 from .openai_server.protocal.anthropic_protocol import *
 from .openai_server.fastllm_completion import FastLLmCompletion
+from .openai_server.streaming_response import SSEStreamingResponse
 from .openai_server.fastllm_embed import FastLLmEmbed
 from .openai_server.fastllm_reranker import FastLLmReranker
 from .openai_server.fastllm_model import FastLLmModel
@@ -142,9 +143,8 @@ async def create_chat_completion(request: ChatCompletionRequest,
         return JSONResponse(content = generator.model_dump(),
                             status_code = generator.code)
     if request.stream:
-        return StreamingResponse(content = generator[0],
-                                 background = generator[1], 
-                                 media_type = "text/event-stream")
+        return SSEStreamingResponse(content = generator[0],
+                                    background = generator[1])
     else:
         assert isinstance(generator, ChatCompletionResponse)
         return JSONResponse(content = generator.model_dump())
@@ -159,9 +159,8 @@ async def create_response(request: ResponsesRequest,
         return JSONResponse(content = generator.model_dump(),
                             status_code = generator.code)
     if request.stream:
-        return StreamingResponse(content = generator[0],
-                                 background = generator[1],
-                                 media_type = "text/event-stream")
+        return SSEStreamingResponse(content = generator[0],
+                                    background = generator[1])
     else:
         assert isinstance(generator, ResponsesResponse)
         return JSONResponse(content = generator.model_dump())
@@ -178,9 +177,8 @@ async def create_anthropic_message(request: AnthropicMessageRequest,
                                 "type": error_type, "message": generator.message}},
                             status_code = generator.code)
     if request.stream:
-        return StreamingResponse(content = generator[0],
-                                 background = generator[1],
-                                 media_type = "text/event-stream")
+        return SSEStreamingResponse(content = generator[0],
+                                    background = generator[1])
     else:
         assert isinstance(generator, AnthropicMessageResponse)
         return JSONResponse(content = generator.model_dump(exclude_none = True))

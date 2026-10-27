@@ -74,6 +74,7 @@ DEFINE_HAS_MEMBER(v_scale)
 
 struct AttentionVariantBase {
   constexpr static bool use_softmax = true;
+  constexpr static bool uses_sliding_window = false;
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx,
                             { return logits; })
 

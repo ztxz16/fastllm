@@ -25,7 +25,7 @@ MODEL_NOTES = {
     "moe_dtype": ("仅覆盖 MoE 专家权重的类型，可与主权重 --dtype 不同；留空沿用运行时策略。较低精度可节省内存，模型支持和精度需自行验证。", "int4g128"),
     "atype": ("中间计算精度，常用 auto、float16、float32；区别于存储权重的 --dtype。具体支持取决于模型和设备。", "float16"),
     "moe_atype": ("MoE 层的激活计算精度：auto、float32、float16、bfloat16。留空时沿用运行时策略。", "bfloat16"),
-    "kv_cache_dtype": ("控制普通注意力的 KV 缓存精度，不改变权重精度。auto、float16、bfloat16、fp8_e4m3；fp4 仅适用于已支持的 Qwen3.5 CUDA 路径，并非所有模型通用。", "fp8_e4m3"),
+    "kv_cache_dtype": ("控制普通注意力的 KV 缓存精度，不改变权重精度。auto、float16、bfloat16、fp8_e4m3；fp4 仅适用于已支持的 Qwen3.5 CUDA 路径与 DeepSeek-V4.1（后者为无损存储，890 B/token），并非所有模型通用。", "fp8_e4m3"),
     "cuda_embedding": ("不带值。让支持的模型在 GPU 上执行 embedding，会增加显存需求；同时指定 --low_gpu_mem 时此开关被覆盖。", ""),
     "kv_cache_limit": ("KV 缓存容量，支持带单位的值，例如 5G、512M；auto 让运行时处理。它不是模型权重占用上限，也不是单会话长度。", "5G"),
     "max_batch": ("同时处理的请求数量上限；-1 使用运行时默认策略。提高并发通常需要更多 KV 缓存，单请求延迟可能增加。", "4"),

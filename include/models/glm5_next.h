@@ -2,6 +2,7 @@
 #define FASTLLM_GLM5_NEXT_H
 
 #include "basellm.h"
+#include "utils/execution_mode.h"
 
 #include <cstdint>
 #include <deque>
@@ -12,9 +13,29 @@
 #include <vector>
 
 namespace fastllm {
+    class HybridMoeDecodeStep;
+    struct HybridPrefillContext;
+    class CudaChunkedPrefillPipeline;
+
+    struct Glm5NextIndexerCheckpoint {
+        Data tailKeys, tailGates;
+        int tokens = 0;
+    };
+
+    struct Glm5NextIndexerCache {
+        Data keys, tailKeys, tailGates;
+        Data replayKeys, replayGates;
+        bool captureReplay = false;
+        Data hadamard; // immutable workspace, not part of prefix snapshots
+        Data pageTable; // derived GPU page map; rebuild after page/history changes
+        std::vector<int> pageTableIds;
+        int tokens = 0;
+    };
+
     class Glm5NextModel : public basellm {
     public:
         Glm5NextModel();
+        ExecutionMode GetExecutionMode() const { return executionMode; }
         ~Glm5NextModel() override;
 
         void InitParams() override;
@@ -24,6 +45,12 @@ namespace fastllm {
         GetTensorMap(const std::vector<std::string> &tensorNames) override;
 
         void OnModelWeightsLoaded() override;
+        int GetWeightLoadPriority(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        bool ShouldLoadWeightSeriallyBeforeOthers(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        void OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) override;
+        void OnWeightLoadGroupFinished() override;
 
         void SetDataType(DataType dataType) override;
 
@@ -39,6 +66,10 @@ namespace fastllm {
         // model-specific snapshots below.
         bool UseGenericHistoryCache() const override { return false; }
 
+        bool RetainCudaWorkspace() const override { return true; }
+
+        bool ShouldDelaySpecialWeightCudaMove(const std::string &) const override;
+
         int Forward(
                 const Data &inputIds,
                 const Data &attentionMask,
@@ -48,7 +79,25 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector<float> *logits = nullptr) override;
 
+        std::vector<int> ForwardBatch(
+                int batch, const Data &inputIds,
+                const std::vector<Data*> &attentionMasks,
+                const std::vector<Data*> &positionIds,
+                const std::vector<int> &seqLens,
+                std::vector<std::pair<Data*, Data*>> &pastKeyValues,
+                const std::vector<GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector<std::vector<float>*> *logits = nullptr) override;
+
         bool NeedAttentionMask(int qlen, int klen) override;
+
+        bool TryForwardChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask,
+                const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken) override;
 
         std::string MakeInput(
                 const std::string &history,
@@ -62,6 +111,59 @@ namespace fastllm {
                 const std::string &output) override;
 
     private:
+        friend struct Glm5NextGGUFTestAccess;
+        ExecutionMode executionMode = ExecutionMode::Cpu;
+        void InitExecutionMode();
+        void PrepareHybridMoeCache();
+        int StreamingHybridLayer(const std::string &name) const;
+        void StageHybridWeights();
+        int hybridLoadingLayer = -1;
+        bool TryForwardHybridChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken);
+        HybridMoeDecodeStep BeginHybridDraftMoe(const Data &input, int sequence);
+        struct HybridDecodeState;
+        bool TryHybridRouterScores(const std::string &mlp, Data &input, Data &scores);
+        bool TryHybridOutputNorm(Data &input, Data &output);
+        bool TryHybridGreedy(Data &logits, const GenerationConfig &config, int &token);
+        std::shared_ptr<HybridDecodeState> hybridDecodeState;
+        bool TryHybridDecodePrepare(int layer, const std::string &prefix, Data &input,
+                Data &attention, Data &normalizedFfn, Data &post, Data &comb,
+                const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches);
+        void RemoveHybridDecodeRequest(const std::vector<std::pair<Data, Data>> *key);
+        bool TryHybridKdaInputProjections(int layer, Data &input, Data &f, Data &beta, Data &g);
+        bool TryHybridKdaDecode(int layer, Data &q, Data &k, Data &v,
+                Data &f, Data &g, Data &beta, std::pair<Data, Data> &cache, Data &output);
+        bool TryHybridMlaProjections(int layer, Data &input, const std::vector<Data *> &outputs,
+                const std::function<void(Data &, std::vector<Data> &)> &body);
+        bool TryHybridDsaProjections(int layer, Data &input, Data &normalized,
+            Data &key, Data &gate, Data &query, Data &head);
+        bool TryHybridMlaDecode(int layer, Data &query, Data &key, Data &gate,
+                Data &indexQuery, Data &headWeights, Data &keyWeight, Data &valueWeight, Data &output,
+                const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches);
+        struct ThreadTpState;
+        std::unique_ptr<ThreadTpState> threadTpState;
+        ThreadTpState *threadTpOwner = nullptr;
+        int threadTpRank = -1;
+        void InitThreadTp();
+        int ThreadTpExpertLayer(const std::string &name) const;
+        int StreamingThreadTpLayer(const std::string &name) const;
+        void StageThreadTpWeight(const std::string &name);
+        void PrepareThreadTp();
+        void ThreadTpAllReduce(Data &data);
+        void RemoveThreadTpRequest(const std::vector<std::pair<Data, Data>> *key);
+        struct KdaReplayCapture;
+        Data &OutputHead();
+        int ForwardThreadTp(const Data &inputIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens, std::vector<float> *logits,
+                bool sampleOutput = true, Data *targetHiddenStates = nullptr,
+                std::vector<KdaReplayCapture> *kdaReplay = nullptr);
+
         struct KdaReplayCapture {
             Data qProjected;
             Data kProjected;
@@ -76,6 +178,8 @@ namespace fastllm {
             std::vector<Data> kdaFirst;
             std::vector<Data> kdaSecond;
             std::vector<int> sparseLengths;
+            std::vector<Glm5NextIndexerCheckpoint> indexer;
+            std::vector<TargetRuntimeCheckpoint> ranks;
             bool ready = false;
         };
 
@@ -89,6 +193,8 @@ namespace fastllm {
             int targetTokensConsumed = 0;
             int activeDraftLimit = 0;
             int consecutiveFullAccepts = 0;
+            uint64_t verifiedDrafts = 0, acceptedDrafts = 0, verifySteps = 0;
+            uint64_t confidenceChecks = 0, confidenceStops = 0;
             bool disabled = false;
             TargetRuntimeCheckpoint targetCheckpoint;
             std::vector<KdaReplayCapture> kdaReplay;
@@ -97,6 +203,7 @@ namespace fastllm {
         struct HistoryCacheMemory {
             std::vector<int> tokens;
             std::vector<std::pair<Data, Data>> pastKeyValues;
+            std::vector<Glm5NextIndexerCache> indexer;
             int sequenceLength = 0;
             uint64_t bytes = 0;
             bool recurrentStateOnCpu = false;
@@ -125,6 +232,49 @@ namespace fastllm {
                 std::vector<float> *logits,
                 MtpRuntimeState &state);
 
+        void ForwardEmbedding(const Data &inputIds, Data &hiddenStates);
+
+        void ForwardLayers(
+                Data &hiddenStates, int firstLayer, int endLayer,
+                const std::vector<std::vector<std::pair<Data, Data>>*>
+                    &requestCaches,
+                std::vector<KdaReplayCapture> *kdaReplay = nullptr,
+                std::vector<Glm5NextIndexerCache> *indexer = nullptr);
+
+        void ForwardGpuLayers(
+                Data &hiddenStates, int firstLayer, int endLayer,
+                const std::vector<std::vector<std::pair<Data, Data>>*>
+                    &requestCaches,
+                std::vector<KdaReplayCapture> *kdaReplay = nullptr,
+                std::vector<Glm5NextIndexerCache> *indexer = nullptr);
+
+        void ForwardHybridLayers(
+                Data &hiddenStates, int firstLayer, int endLayer,
+                const std::vector<std::vector<std::pair<Data, Data>>*>
+                    &requestCaches,
+                std::vector<KdaReplayCapture> *kdaReplay = nullptr,
+                std::vector<Glm5NextIndexerCache> *indexer = nullptr,
+                HybridPrefillContext *prefill = nullptr);
+
+        void RunAttentionBlock(int layer, const std::string &prefix,
+                Data &input, Data &output,
+                const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
+                std::vector<KdaReplayCapture> *kdaReplay,
+                std::vector<Glm5NextIndexerCache> *indexer);
+        void PrepareFfnBlock(const std::string &prefix, Data &input,
+                Data &normalizedFfn, Data &ffnPost, Data &ffnComb);
+        void FinishFfnBlock(Data &ffnOutput, Data &input,
+                Data &ffnPost, Data &ffnComb, Data &output);
+
+        int ForwardOutput(
+                Data &hiddenStates,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits, bool sampleOutput,
+                Data *targetHiddenStates = nullptr);
+
+        std::pair<Data &, Data &> PrepareMlaWeights(int layerIndex);
+
         bool MtpSupportsGenerationConfig(
                 const GenerationConfig &generationConfig) const;
 
@@ -136,13 +286,13 @@ namespace fastllm {
                 const std::vector<int> &inputTokens,
                 const std::vector<int> &positions,
                 Data *nextHiddenStates,
-                bool sampleToken);
+                bool sampleToken, float *topProbability = nullptr);
 
         void GenerateMtpProposalChain(
                 MtpRuntimeState &state,
                 const Data &targetHiddenStates,
                 const std::vector<int> &inputTokens,
-                const std::vector<int> &positions);
+                const std::vector<int> &positions, float minProbability = 0);
 
         void CaptureTargetRuntimeCheckpoint(
                 const std::vector<std::pair<Data, Data>> &pastKeyValues,
@@ -180,19 +330,19 @@ namespace fastllm {
 
         void RunKdaAttention(
                 int layerIndex, Data &input, int sequence,
-                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
                 Data &output,
                 KdaReplayCapture *replayCapture = nullptr);
 
         void RunSparseAttention(
                 int layerIndex, Data &input, int sequence,
                 std::vector<std::pair<Data, Data>> &pastKeyValues,
-                Data &output);
+                Data &output, Glm5NextIndexerCache *indexer = nullptr);
 
         void RunCompressedMlaAttention(
                 int layerIndex, Data &input, int sequence,
-                std::vector<std::pair<Data, Data>> &pastKeyValues,
-                Data &output);
+                const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
+                Data &output, Glm5NextIndexerCache *indexer = nullptr);
 
         void RunExpandedSparseAttention(
                 int layerIndex, Data &input, int sequence,
@@ -203,17 +353,43 @@ namespace fastllm {
                 Data &input, Data &gateUpWeight, Data &downWeight,
                 Data &output);
 
-        void RunMoe(
-                int layerIndex, Data &input, int sequence, Data &output);
-
         void RunMoeWithPrefix(
                 int deviceLayer, const std::string &mlpPrefix,
                 std::vector<Data*> &weights,
                 std::vector<Data*> &biases,
                 Data &input, int sequence, Data &output);
 
+        void RunGpuMoeWithPrefix(
+                int deviceLayer, const std::string &mlpPrefix,
+                std::vector<Data*> &weights,
+                std::vector<Data*> &biases,
+                Data &input, int sequence, Data &output);
+
+        struct HybridFfnFinish {
+            Data &residual, &post, &comb, &output;
+            bool completed = false;
+        };
+        void RunHybridMoeWithPrefix(
+                int deviceLayer, const std::string &mlpPrefix,
+                std::vector<Data*> &weights,
+                std::vector<Data*> &biases,
+                Data &input, int sequence, Data &output,
+                HybridPrefillContext *prefill = nullptr,
+                HybridFfnFinish *finish = nullptr);
+
+        void RunSharedMoe(int deviceLayer, const std::string &mlp,
+                Data &input, Data &output, bool &sharedReady);
+        void RouteMoe(int deviceLayer, const std::string &mlp, Data &input,
+                Data &routerInput, Data &routerScores, Data &expertIndex, Data &expertScore);
+
         int Sample(
                 Data &hiddenStates,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits);
+
+        int SampleLogits(
+                Data &outputLogits,
                 const GenerationConfig &generationConfig,
                 const LastTokensManager &lastTokens,
                 std::vector<float> *logits);
@@ -246,8 +422,17 @@ namespace fastllm {
         float hcEps = 1e-6f;
 
         int indexTopK = 0;
+        enum class DsaBackend { Auto, BFloat16, Dense };
+        DsaBackend dsaBackend = DsaBackend::Auto;
+        bool UsesDsa() const { return dsaBackend != DsaBackend::Dense; }
+        std::map<const std::vector<std::pair<Data, Data>> *,
+                 std::vector<Glm5NextIndexerCache>> indexerCaches;
+        std::mutex indexerCachesMutex;
+#ifdef USE_CUDA
+        std::unique_ptr<CudaChunkedPrefillPipeline> prefillPipeline;
+#endif
         // DSA history is retained by page reference rather than copied.  This
-        // limit therefore applies only to the fixed-size KDA recurrent state;
+        // limit covers KDA recurrent state and the pooled Indexer cache;
         // larger state snapshots are tiered to host memory.
         uint64_t historyCacheGpuStateLimitBytes =
             1024ULL * 1024ULL * 1024ULL;
@@ -266,6 +451,7 @@ namespace fastllm {
         bool mtpEnabled = false;
         bool mtpWeightsReady = false;
         int mtpDraftsPerStep = 0;
+        float mtpMinProbability = 0;
         std::map<const std::vector<std::pair<Data, Data>> *,
                  std::shared_ptr<MtpRuntimeState>> mtpStates;
         std::mutex mtpStatesMutex;

@@ -6,10 +6,13 @@
 #define FASTLLM_QWEN4_EXP_H
 
 #include "qwen3_next.h"
+#include "utils/execution_mode.h"
+#include "devices/disk/diskdevice.h"
 
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -18,22 +21,37 @@
 #include <vector>
 
 namespace fastllm {
+    class CudaChunkedPrefillPipeline;
+    class HybridMoePeerRuntime;
     class Qwen4ExpModel : public Qwen3NextModel {
     public:
         Qwen4ExpModel();
         ~Qwen4ExpModel() override;
 
         void InitParams() override;
+        bool RetainCudaWorkspace() const override;
+        ExecutionMode GetExecutionMode() const { return executionMode; }
+        void ConfigureKvMem(const KvMemConfig &config) override;
+        bool SupportsKvMem() const override { return executionMode == ExecutionMode::Hybrid; }
+        void ValidateKvMemModel(const KvMemConfig &config) const override;
 
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &tensorNames) override;
         void OnWeightLoaded(const std::string &weightName,
                             const std::set<std::string> &finishedWeightNames) override;
         void OnModelWeightsLoaded() override;
+        int GetWeightLoadPriority(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        bool ShouldLoadWeightSeriallyBeforeOthers(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        void OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) override;
+        void OnWeightLoadGroupFinished() override;
         bool ShouldDelaySpecialWeightNumaRegistration(
                 const std::string &weightName) const override;
         bool ShouldDelaySpecialWeightCudaMove(
                 const std::string &weightName) const override;
+        std::string SelectSpecialWeightDevice(const std::string &weightName,
+                int layerId) const override;
 
         int Forward(
                 const Data &inputIds,
@@ -64,7 +82,16 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector<std::vector<float> *> *logits = nullptr) override;
 
+        bool TryForwardChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask, const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken) override;
+
         void WarmUp() override;
+        PagedCacheManager *GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
+        std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagers(
+                int layerIndex, bool isKey) const override;
 
         bool TryRestoreHistoryCache(std::vector<int> &inputTokens,
                                     int &cacheLen) override;
@@ -73,21 +100,53 @@ namespace fastllm {
         bool UseGenericHistoryCache() const override { return false; }
 
     private:
+        friend struct Qwen4PrefixCacheTestAccess;
+        friend struct Qwen4GGUFTestAccess;
         struct PrefixSnapshot;
         struct DecodeCudaGraphState;
+        struct DecodeGraphExecution;
+        struct DecodeGraphPolicy { bool hybridDense = false; bool eligible = false; };
+        DecodeGraphPolicy GpuDecodeGraphPolicy() const;
+        DecodeGraphPolicy HybridDecodeGraphPolicy(const Data &hiddenStates, bool mtpTargetGraph);
         struct PleStagingState;
         struct MtpDraftCudaGraphState;
         struct QsaHostMirrorTransfer;
+        struct ServingCache;
         struct MtpRuntimeState;
+        struct HybridTpState;
         struct ThreadTpState;
+        struct DecodeServingSlot;
+        struct RequestState;
+        struct PrefillStageContext;
+        std::map<const Data *, std::unique_ptr<DecodeServingSlot>> decodeServingSlots;
+        std::unique_ptr<DecodeServingSlot> idleDecodeServingSlot;
+        std::mutex decodeServingMutex;
+        void ReleaseDecodeServingSlot(std::unique_ptr<DecodeServingSlot> &slot);
+        void RemoveDecodeServingRequest(const Data *key, bool reusable);
+        void ResetDecodeServingState(RequestState &state, bool freezeGraphs = false);
+        bool WithDecodeServingCache(std::vector<std::pair<Data, Data>> &cache,
+                const std::function<bool(std::vector<std::pair<Data, Data>> &)> &forward);
+        std::vector<int> ForwardBatchInternal(
+                int batch, const Data &inputIds, const Data &attentionMask,
+                const Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                std::vector<std::vector<float> *> *retLogits,
+                PrefillStageContext *prefill = nullptr);
         std::unique_ptr<ThreadTpState> threadTpState;
         ThreadTpState *threadTpOwner = nullptr;
         int threadTpRank = -1;
         void InitThreadTp();
+        int StreamingThreadTpExpertLayer(const std::string &weightName) const;
+        int StreamingThreadTpReplicaLayer(const std::string &weightName) const;
+        bool IsStreamingHybridBackboneWeight(const std::string &weightName) const;
+        bool loadingHybridBackbone = false;
+        void FinishHybridBackboneLoad();
+        int SplitThreadTpWeight(const std::string &name, Data &source);
+        void StreamHybridThreadTpWeight(const std::string &name, Data &source);
         void PrepareThreadTp();
         void ThreadTpAllReduce(Data &data);
         bool ThreadTpAllTrue(bool value);
-        void RemoveThreadTpRequest(const Data *key);
+        void RemoveThreadTpRequest(const Data *key, bool completed = false);
         std::vector<int> ForwardThreadTp(
                 int batch, const Data &inputIds, const Data &attentionMask,
                 const Data &positionIds,
@@ -98,6 +157,10 @@ namespace fastllm {
                 const Data *precomputedEmbedding = nullptr);
 
         struct RequestState {
+            bool reusableGraphRequest = false;
+            bool decodeGraphsFrozen = false;
+            // Keep the model's preallocated pools alive while this request uses them.
+            std::shared_ptr<ServingCache> servingCache;
             std::shared_ptr<PleStagingState> pleStaging;
             int previousToken1 = -1;
             int previousToken2 = -1;
@@ -129,12 +192,15 @@ namespace fastllm {
             // TP dense graphs retain the legacy attention padding width even
             // when physical KV storage is reserved or reused across requests.
             int denseGraphWidth = 0;
+            // Token IDs cannot identify image/video embeddings or M-RoPE state.
+            // Keep this flag through decode, including direct C++ forwards.
+            bool hasMultimodalInput = false;
             std::vector<int> processedTokens;
             int prefixRequestId = 0;
             int lastPrefixSnapshotLen = 0;
-            // Keeps GPU-resident snapshot storage alive while restored cache
-            // tensors borrow it. The next Forward detaches mutable tensors
-            // with a device-to-device copy and releases this reference.
+            // Keeps snapshot storage alive while restoring fixed linear slots
+            // and request-local QSA state. Nonlinear KV retains page references
+            // and detaches only a shared partial page before append.
             std::shared_ptr<PrefixSnapshot> borrowedPrefixSnapshot;
             // The one-layer MTP cache is request-local. Prefix snapshots keep
             // a compact, independently owned copy only when it is aligned at
@@ -143,6 +209,52 @@ namespace fastllm {
             std::shared_ptr<MtpRuntimeState> mtpState;
             bool mtpDisabled = false;
         };
+
+        struct PrefillStageContext {
+            int firstLayer = 0, endLayer = 0;
+            bool sampleOutput = false;
+            Data *hidden = nullptr;
+            std::mutex *hostExpertMutex = nullptr;
+            RequestState *state = nullptr;
+        };
+#ifdef USE_CUDA
+        std::unique_ptr<CudaChunkedPrefillPipeline> prefillPipeline;
+#ifndef USE_ROCM
+        using HybridPeerState = HybridMoePeerRuntime;
+        std::unique_ptr<HybridPeerState> hybridPeer;
+        bool TryRunPipelineMoe(int layer, const Data &input, const Data &index,
+                const Data &score, Data &output, std::vector<Data *> &moeWeights,
+                const std::function<void()> &sharedExpert, Data **deferredPeer, bool preparedReadback);
+        bool TryPipelineMoeReadback(const Data &input, const Data &index, const Data &score);
+#endif
+#endif
+        std::map<int, Data> prefillLinearInvScales;
+
+        struct ServingCache {
+            using Pools = std::pair<std::shared_ptr<PagedCacheManager>,
+                                    std::shared_ptr<PagedCacheManager>>;
+            std::vector<Pools> layers;
+            Pools mtp;
+            // KVMem admits one request. Retain its pinned backing and bounded
+            // device allocation after warmup; each new request resets the map.
+            std::map<int, std::shared_ptr<KvMemCache>> kvMemStorage;
+            // One warmup allocation per layer, moved into the first request
+            // that needs it. Mutable QSA history is never shared by requests.
+            std::map<int, std::shared_ptr<QsaHostMirrorTransfer>> qsaHostMirrors;
+        };
+        std::shared_ptr<ServingCache> servingCache;
+        void ClearWarmupCache(std::vector<std::pair<Data, Data>> &cache);
+        void ReserveServingCache(std::vector<std::pair<Data, Data>> &warmupCache);
+        void PrepareHybridKvMemCache(int layer, const Data &key, int heads,
+                                    Data &pastKey, Data &pastValue);
+        size_t RetainHybridKvMemStorage(const std::vector<std::pair<Data, Data>> &cache,
+                                      const std::shared_ptr<KvMemCache> &mtp,
+                                      ServingCache &reserved) const;
+        void FinishHybridKvMemWarmup();
+        void AcquireServingCache(std::vector<std::pair<Data, Data>> &cache,
+                                 RequestState &state, int appendTokens = 1);
+        std::shared_ptr<QsaHostMirrorTransfer> &GetQsaHostMirror(
+                RequestState &state, int layer);
 
         struct RequestRuntimeCheckpoint {
             int previousToken1 = -1;
@@ -179,22 +291,33 @@ namespace fastllm {
             TargetRuntimeCheckpoint *runtimeCheckpoint = nullptr;
             std::vector<Data> linearReplayOutputs;
             std::vector<Data> linearReplayCoreOutputs;
-            Data linearReplayPointerWorkspace;
-            std::vector<uint8_t> linearReplayPointerCache;
+            struct LinearReplayWorkspace {
+                Data pointers;
+                std::vector<uint8_t> cache;
+            };
+            std::map<int, LinearReplayWorkspace> linearReplayWorkspaces;
             std::map<int, Data> qsaRawKeys;
             Data pleInput;
+            Data pleNormalized;
             Data greedyTokenIds;
             Data greedyTokenValues;
         };
 
         struct MtpRuntimeState {
+            // Pool ownership must outlive destruction of the KV page references.
+            RequestState attentionState;
             Data key;
             Data value;
-            RequestState attentionState;
             // Keep sampling outputs resident on CUDA across verifier cycles;
             // the host reads only the compact token-id prefix.
             Data sampledTokenIds;
             Data sampledTokenValues;
+            // Actual temperature-scaled draft distribution, as in Qwen3.5.
+            Data proposalLogits;
+            Data proposalLogsumexp;
+            float proposalTemperature = 1.0f;
+            bool sampleProposal = false;
+            int proposalCount = 0;
             std::shared_ptr<MtpDraftCudaGraphState> draftGraphState;
             std::vector<int> proposals;
             std::deque<int> pendingOutputTokens;
@@ -227,8 +350,12 @@ namespace fastllm {
             uint64_t tensorBytes = 0;
             uint64_t stateBytes = 0;
             std::vector<int> tokens;
-            std::vector<PrefixLayerSnapshot> layers;
+            // Destroy page references before releasing their pool owner.
             RequestState state;
+            std::vector<PrefixLayerSnapshot> layers;
+            // A TP hit pins the same token boundary on every rank. These
+            // references survive rank-local eviction until restore completes.
+            std::vector<std::shared_ptr<PrefixSnapshot>> ranks;
         };
 
         struct PendingPrefixRestore {
@@ -278,10 +405,13 @@ namespace fastllm {
         std::vector<int> visionDeepstackIndexes;
         std::vector<float> visionImageMean = {0.5f, 0.5f, 0.5f};
         std::vector<float> visionImageStd = {0.5f, 0.5f, 0.5f};
-        Data visionSinData;
-        Data visionCosData;
 
         bool preparedWeights = false;
+        bool ggufWeightsRestored = false;
+        void RestoreGgufWeights();
+        void RestoreGdnOutputWeight(Data &weight, int tpSize);
+        bool GdnOutputUsesTiledLayout(const Data &projection) const;
+        void RunGdnOutputProjection(Data &input, Data &weight, Data &output);
         std::atomic<int> mtpWeightsStatus{-1};
         std::mutex prepareMutex;
         mutable std::mutex stateMutex;
@@ -305,12 +435,8 @@ namespace fastllm {
         // Logical concatenation of the lazy shard metadata used by the
         // standard disk EmbeddingDirect operation.
         Data pleNgramDiskWeight;
-        // QSA cache compression applies RoPE on the host while regular
-        // attention applies it on its execution device. Keep an immutable
-        // host view so cache updates never migrate the shared sinData/cosData
-        // tensors away from CUDA during decode.
-        std::vector<float> qsaSinValues;
-        std::vector<float> qsaCosValues;
+        std::shared_ptr<DiskEmbeddingRowReader> pleDiskReader;
+        // Host QSA compression must not move the device normalization weights.
         std::map<int, std::vector<float>> qsaKeyNormValues;
         std::vector<Data *> mtpMoeWeights;
         std::vector<Data *> mtpMoeBiass;
@@ -319,11 +445,16 @@ namespace fastllm {
         // the generated token stream exact.  A packed FP8 copy cuts the three
         // bandwidth-bound draft head scans in half on supported CUDA models.
         Data mtpDraftLmHeadWeight;
+        Data mtpDraftSubsetHead;
+        std::vector<int> mtpDraftSubsetIds;
+        int mtpDraftSubsetOffset = 0;
+        bool mtpDraftSubsetAttempted = false;
         bool mtpDraftLmHeadReady = false;
         bool mtpDraftLmHeadAttempted = false;
 
         void PrepareWeights();
         void PrepareMtpDraftLmHeadWeight();
+        void PrepareMtpDraftSubsetHead();
         bool IsLinearAttentionLayer(int layer) const;
         void PrepareVision();
         void ApplyVisionRotary(Data &input, const Data &posX,
@@ -368,12 +499,18 @@ namespace fastllm {
                                  Data &normalized,
                                  Data *normalizedStorage = nullptr);
 
+        int64_t PLEHashRow(const int *shifted, int head) const;
         void RunPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output,
-                    const std::vector<int> *hostInputTokens = nullptr);
+                    const std::vector<int> *hostInputTokens = nullptr,
+                    const DiskEmbeddingRowReader::Ticket *prefetched = nullptr,
+                    Data *normalizedCapture = nullptr);
+        bool TryCommitPLEPrefix(RequestState &state, const Data &normalized,
+                                const std::vector<int> &tokens, int count);
         void RunThreadTpPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output,
-                    const std::vector<int> *hostInputTokens);
+                    const std::vector<int> *hostInputTokens,
+                    const DiskEmbeddingRowReader::Ticket *prefetched = nullptr);
         void MaterializePLEHostHistory(RequestState &state);
         void BuildQSAMask(int layer, const std::string &attentionPrefix,
                           const Data &input,
@@ -411,12 +548,48 @@ namespace fastllm {
                                 Data *alphaCapture = nullptr,
                                 Data *betaCapture = nullptr,
                                 Data *recurrentStateOutput = nullptr);
-        void RunMoE(int layer, const Data &input, Data &output);
-        void RunMoEWithPrefix(int deviceLayer,
-                              const std::string &mlpPrefix,
-                              std::vector<Data *> &moeWeights,
-                              std::vector<Data *> &moeBiass,
-                              const Data &input, Data &output);
+        struct MoEExecutionPlan {
+            ExecutionMode backend = ExecutionMode::Cpu;
+            int deviceLayer = 0;
+            std::string mlpPrefix;
+            // Borrow the original tables: caches key on their data() addresses.
+            // Device shards and quantization remain in Data; graph capability
+            // is checked for the current shape, format and TP configuration.
+            std::vector<Data *> *weights = nullptr, *bias = nullptr;
+        };
+        std::vector<MoEExecutionPlan> targetMoePlans;
+        MoEExecutionPlan draftMoePlan;
+        void PrepareMoEExecutionPlans();
+
+        struct MoEResult {
+            Data sharedOutput;
+            // The backend has queued the peer completion wait on the consumer
+            // stream. Consume this borrowed result before the next expert call
+            // reuses the peer buffer; only the graph boundary performs the join.
+            Data *peerOutput = nullptr;
+            bool sharedDeferred = false;
+            void Reset() { peerOutput = nullptr; sharedDeferred = false; }
+            int JoinMask() const { return int(sharedDeferred) + 2 * int(peerOutput != nullptr); }
+        };
+        struct MoEPrepared {
+            Data index, score;
+            MoEResult result;
+            // Optional stable, graph-owned destination; never owned here.
+            Data *outputTarget = nullptr;
+            bool readbackPrepared = false;
+        };
+        void SelectMoEExperts(Data &routerLogits, Data &index, Data &score);
+        void RunSharedExpert(const std::string &mlp, Data &input,
+                             Data &gateUp, Data &hidden, Data &gate, Data &output);
+        void PrepareMoERouting(int layer, const Data &input, MoEPrepared &prepared);
+        void RunMoE(int layer, const Data &input, Data &output,
+                   bool reduceOutput = true, PrefillStageContext *prefill = nullptr,
+                   MoEPrepared *prepared = nullptr,
+                   const std::function<void()> &sharedGraph = {});
+        void RunMoE(const MoEExecutionPlan &plan, const Data &input, Data &output,
+                    bool reduceOutput = true, PrefillStageContext *prefill = nullptr,
+                    MoEPrepared *prepared = nullptr,
+                    const std::function<void()> &sharedGraph = {});
 
         bool HasMtpWeights() const;
         bool MtpSupportsGenerationConfig(
@@ -434,7 +607,9 @@ namespace fastllm {
                         const Data *deviceTokenIds = nullptr,
                         Data *sampledTokenIds = nullptr,
                         Data *sampledTokenValues = nullptr,
-                        int sampledTokenOffset = 0);
+                        int sampledTokenOffset = 0,
+                        float *topProbability = nullptr,
+                        std::mutex *embeddingMutex = nullptr);
         void CaptureRequestRuntimeCheckpoint(
             RequestState &state,
             const std::map<int, int> &qsaLengths,
@@ -461,6 +636,68 @@ namespace fastllm {
             RequestState &state,
             const TargetRuntimeCheckpoint &checkpoint,
             TargetVerificationCapture &capture);
+        struct ForwardState;
+        struct ForwardWorkspace;
+        ExecutionMode executionMode = ExecutionMode::Cpu;
+        void InitExecutionMode();
+        void PrepareForward(ForwardWorkspace &);
+        int BeginForwardLayer(ForwardWorkspace &, int &layer);
+        void EndForwardLayer(ForwardWorkspace &, int layer);
+        std::vector<int> FinishForward(ForwardWorkspace &);
+        struct HybridExecutionScope;
+        struct DraftGraphPolicy {
+            bool device = false, tp = false, hybrid = false, placementCompatible = false;
+        };
+        DraftGraphPolicy GpuDraftGraphPolicy(int sequence) const;
+        DraftGraphPolicy HybridDraftGraphPolicy(int sequence);
+        std::vector<std::vector<int>> HybridWorkerCpuSets(const std::vector<int> &devices) const;
+        void PrefetchHybridExperts(const Data &inputIds, bool pipelinedPrefill, int layer, int endLayer);
+        void PrepareHybridExperts(bool hasMtpWeights);
+        std::vector<int> ForwardGpu(
+            int batch,
+            const Data &inputIds,
+            const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float> *> *retLogits,
+            Data *targetMultiHidden,
+            std::vector<int> *allVerificationTokens,
+            std::vector<unsigned char> *verificationAccepted,
+            TargetVerificationCapture *verificationCapture,
+            bool recordPrefixSnapshot,
+            bool allowDecodeCudaGraph,
+            bool decodeEquivalentGdn,
+            const std::vector<int> *hostInputTokens,
+            bool materializeCausalMaskOnGraphFallback,
+            const Data *precomputedEmbedding, PrefillStageContext *prefill);
+        std::vector<int> ForwardHybrid(
+            int batch,
+            const Data &inputIds,
+            const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float> *> *retLogits,
+            Data *targetMultiHidden,
+            std::vector<int> *allVerificationTokens,
+            std::vector<unsigned char> *verificationAccepted,
+            TargetVerificationCapture *verificationCapture,
+            bool recordPrefixSnapshot,
+            bool allowDecodeCudaGraph,
+            bool decodeEquivalentGdn,
+            const std::vector<int> *hostInputTokens,
+            bool materializeCausalMaskOnGraphFallback,
+            const Data *precomputedEmbedding, PrefillStageContext *prefill);
+        void RunGpuMoE(const MoEExecutionPlan &plan,
+            const Data &input, Data &output, bool reduceOutput, PrefillStageContext *prefill,
+            MoEPrepared *prepared, const std::function<void()> &sharedGraph);
+        void RunHybridMoE(const MoEExecutionPlan &plan,
+            const Data &input, Data &output, bool reduceOutput, PrefillStageContext *prefill,
+            MoEPrepared *prepared, const std::function<void()> &sharedGraph);
+
         std::vector<int> ForwardTarget(
             int batch,
             const Data &inputIds,
@@ -479,12 +716,14 @@ namespace fastllm {
             bool decodeEquivalentGdn,
             const std::vector<int> *hostInputTokens = nullptr,
             bool materializeCausalMaskOnGraphFallback = false,
-            const Data *precomputedEmbedding = nullptr);
+            const Data *precomputedEmbedding = nullptr,
+            PrefillStageContext *prefill = nullptr);
 
         bool TryRunThreadTpPrefixCudaGraph(
             Data &hiddenStates,
             std::vector<std::pair<Data, Data>> &pastKeyValues);
         bool TryRunDecodeCudaGraphBackbone(
+            ExecutionMode graphMode,
             int graphStartLayer,
             bool startBeforeAttention,
             const Data &hiddenStates,
@@ -497,11 +736,18 @@ namespace fastllm {
             RequestState &requestState,
             Data &logits,
             Data *targetMultiHidden,
-            TargetVerificationCapture *verificationCapture);
+            TargetVerificationCapture *verificationCapture,
+            int graphEndLayer = -1, Data *stageOutput = nullptr);
 
         std::shared_ptr<PrefixSnapshot> FindPrefixSnapshotLocked(
             const std::vector<int> &tokens, int maxCachedLen,
             int exactLen = -1) const;
+        static std::shared_ptr<PrefixSnapshot> FindCommonPrefixSnapshot(
+            const std::vector<Qwen4ExpModel *> &models,
+            const std::vector<int> &tokens, int maxCachedLen);
+        bool RestoreThreadTpPrefixSnapshot(
+            ResponseContext *context,
+            const std::shared_ptr<PrefixSnapshot> &snapshot);
         bool ShouldRecordPrefixSnapshot(
             const std::vector<std::pair<Data, Data>> &pastKeyValues,
             const RequestState &state, int &cachedLen) const;
@@ -510,6 +756,10 @@ namespace fastllm {
             RequestState &state);
         bool RestorePrefixSnapshot(
             ResponseContext *context,
+            const std::shared_ptr<PrefixSnapshot> &snapshot);
+        bool RestorePrefixSnapshot(
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
             const std::shared_ptr<PrefixSnapshot> &snapshot);
 
         void DumpTensorIfRequested(const std::string &name, const Data &data) const;

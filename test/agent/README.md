@@ -14,13 +14,15 @@
 
 这是一套本地冒烟/回归测试，不是 WebArena、SWE-bench、tau-bench 这类公开重环境 benchmark。
 
+MTP 反复思考问题的独立 API 复现、离线循环检测和真实输出夹具见 [mtp_loop/README.md](mtp_loop/README.md)。
+
 ## 目录结构
 
 - `setup.sh`: 安装 Python 依赖。
 - `download.sh`: 检查本地 baseline 数据；本测试没有外部数据下载。
 - `run.sh`: 调用 `agent_tool_eval.py` 执行评测。
 - `baseline/default_cases.jsonl`: 默认测试数据，当前 24 条。
-- `results/`: 运行输出目录，JSONL/summary 默认被忽略，人工整理的 `.md` 报告可提交。
+- `results/`: 运行输出目录，JSONL/summary 默认被忽略，最终结论整理到 `docs/benchmarks/`，原始报告保存在仓库外。
 
 ## 1. Setup
 

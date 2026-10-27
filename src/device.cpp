@@ -6,6 +6,12 @@
 #include "device.h"
 
 namespace fastllm {
+    BaseDevice::~BaseDevice() {
+        for (auto &entry : ops) {
+            delete entry.second;
+        }
+    }
+
     bool BaseDevice::Malloc(void **ret, Data &data) {
         return Malloc(ret, data.expansionBytes);
     }

@@ -34,6 +34,8 @@ install the existing server requirements:
 pip install -r requirements-server.txt
 ```
 
+Native generation constraints and parser validation have separate scopes; see the [constraint contract](CONSTRAINT_BACKEND.md).
+
 ## Software-Development Tool Matrix
 
 The deterministic suite now includes coding-agent style tools in addition to
@@ -142,7 +144,7 @@ python3 test/toolcall/run_live_toolcall_tests.py \
   --dump-dir /tmp/fastllm-toolcall-live-dev
 ```
 
-Known future coverage gaps:
+Coverage limits:
 
 - `parameter name="arguments"` wrapper unwrapping is not covered because the
   current DeepSeek V4 parser treats it as a normal parameter.

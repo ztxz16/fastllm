@@ -54,7 +54,7 @@ def _gpu_info() -> List[Dict[str, Any]]:
         return []
     query = (
         "index,name,memory.total,memory.free,utilization.gpu,temperature.gpu,"
-        "driver_version"
+        "driver_version,uuid"
     )
     try:
         result = subprocess.run(
@@ -75,7 +75,7 @@ def _gpu_info() -> List[Dict[str, Any]]:
     output = []
     for line in result.stdout.splitlines():
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) != 7:
+        if len(parts) != 8:
             continue
         output.append({
             "index": parts[0],
@@ -85,7 +85,20 @@ def _gpu_info() -> List[Dict[str, Any]]:
             "utilization": parts[4],
             "temperature": parts[5],
             "driver": parts[6],
+            "uuid": parts[7],
         })
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        selected = []
+        for identifier in visible.split(","):
+            identifier = identifier.strip()
+            matches = [gpu for gpu in output if gpu["index"] == identifier or
+                       (identifier.startswith("GPU-") and gpu["uuid"].startswith(identifier))]
+            if len(matches) != 1 or matches[0] in selected:
+                break
+            selected.append(matches[0])
+        # Device parameters use CUDA logical indices after visibility filtering.
+        output = [dict(gpu, index=str(index)) for index, gpu in enumerate(selected)]
     return output
 
 

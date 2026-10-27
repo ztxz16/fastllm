@@ -4,7 +4,9 @@
 
 FastLLM 的 Dots3-Note 路径支持 DSA 索引、稀疏注意力、长上下文缓存、分块 Prefill、思考内容和工具调用。
 
-## API Server 快速启动
+Dots3-Note 当前尚未接入运行时 `--auto` 规划，使用本页的手动命令。自动规划的支持范围见 [`--auto` 指南](auto.md)。
+
+## API Server 快速启动（手动配置）
 
 ~~~bash
 ftllm server /data/models/dots3-note \

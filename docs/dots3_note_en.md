@@ -4,7 +4,9 @@
 
 FastLLM supports Dots3-Note DSA indexing, sparse attention, long-context caching, chunked prefill, reasoning content, and tool calling.
 
-## API server quick start
+Dots3-Note is not currently supported by the runtime `--auto` planner. Use the manual commands on this page. See the [`--auto` guide](auto_en.md) for supported models.
+
+## API server quick start (manual configuration)
 
 ~~~bash
 ftllm server /data/models/dots3-note \

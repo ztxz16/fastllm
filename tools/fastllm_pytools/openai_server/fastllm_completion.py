@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import copy
+import contextvars
 import inspect
 import io
 import json
@@ -12,6 +13,7 @@ import tempfile
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from typing import (Any, AsyncGenerator, AsyncIterator, Dict, Iterable, List,
                     Optional, Tuple, Union)
@@ -28,6 +30,9 @@ from starlette.background import BackgroundTask
 
 from .protocal.openai_protocol import *
 from .protocal.anthropic_protocol import *
+from .structured_output import (prepare_structured_output,
+                                responses_response_format,
+                                validate_structured_output)
 
 try:
     from ..generation_errors import PromptTooLongError
@@ -68,6 +73,12 @@ except ImportError:
     )
 
 ConversationContent = Union[str, List[Dict[str, Any]]]
+
+# Keep CPU input preparation separate from the default executor: streaming
+# token fetches can occupy that executor while waiting for native inference.
+# Threads start lazily and are joined by ThreadPoolExecutor at process exit.
+_input_preparation_executor = ThreadPoolExecutor(
+    max_workers=min(4, os.cpu_count() or 1), thread_name_prefix="fastllm-input")
 
 _KIMI_K3_THINK_OPEN = "<|open|>think<|sep|>"
 _KIMI_K3_THINK_CLOSE = "<|close|>think<|sep|>"
@@ -144,6 +155,34 @@ class FastLLmCompletion:
     
   def init_fast_llm_model(self):
     pass
+
+  async def _prepare_text_request(self, prepare):
+      # Counting, one-shot tokenization reuse and native constraint/launch
+      # must stay on the same worker because their pending state is TLS.
+      pending = _input_preparation_executor.submit(
+          contextvars.copy_context().run, prepare)
+      future = asyncio.wrap_future(pending)
+      try:
+          return await asyncio.shield(future)
+      except asyncio.CancelledError:
+          # Cancellation cannot stop a running Python worker. Release any
+          # handle it creates even if the HTTP task/event loop has gone away.
+          def abort_prepared(done):
+              if done.cancelled():
+                  return
+              try:
+                  _, handle = done.result()
+              except Exception:
+                  return
+              try:
+                  self.model.abort_handle(handle)
+              except Exception:
+                  logging.exception("Failed to abort canceled input preparation")
+
+          pending.add_done_callback(abort_prepared)
+          pending.cancel()
+          future.cancel()
+          raise
   
   def create_error_response(
           self,
@@ -161,6 +200,10 @@ class FastLLmCompletion:
           temperature = 1.0
           top_k = 1
           top_p = 1.0
+      elif top_k is not None and top_k <= 0:
+          # API top_k <= 0 disables truncation. Native backends expect a
+          # positive candidate count and otherwise take their greedy path.
+          top_k = self.model.get_vocab_size()
       return do_sample, top_p, top_k, temperature
 
   def _normalize_stop_strings(
@@ -240,7 +283,9 @@ class FastLLmCompletion:
       max_length: Optional[int],
       stopped_by_stop_string: bool = False,
   ) -> str:
-      if (not stopped_by_stop_string and max_length is not None
+      # Negative legacy budgets select native unlimited output. They must not
+      # turn a natural EOS into a truncation signal for agent clients.
+      if (not stopped_by_stop_string and max_length is not None and max_length > 0
               and completion_tokens >= max_length):
           return "length"
       return "stop"
@@ -254,6 +299,14 @@ class FastLLmCompletion:
 
   def _is_deepseek_v4_reasoning_response(self, enable_thinking: bool) -> bool:
       return enable_thinking and self._is_deepseek_v4_model()
+
+  def _is_deepseek_v41_model(self) -> bool:
+      try:
+          is_deepseek_v41 = self.model._is_deepseek_v41()
+      except Exception:
+          is_deepseek_v41 = False
+      return is_deepseek_v41 and not getattr(
+          self.model, "force_chat_template", False)
 
   def _is_poolside_reasoning_response(self, enable_thinking: bool) -> bool:
       if not enable_thinking or getattr(self.model, "force_chat_template", False):
@@ -353,6 +406,12 @@ class FastLLmCompletion:
   def _is_qwen_reasoning_model(self) -> bool:
       return self._is_qwen3_5_model() or self._is_qwen4_exp_model()
 
+  def _is_naive_n05_model(self) -> bool:
+      try:
+          return self.model.get_type() == "naive_n05_flash"
+      except Exception:
+          return False
+
   def _is_qwen3_5_reasoning_response(self, enable_thinking: bool) -> bool:
       return (enable_thinking and self._is_qwen_reasoning_model()
               and not getattr(self.model, "force_chat_template", False))
@@ -384,6 +443,8 @@ class FastLLmCompletion:
               or self._is_kimi_k3_reasoning_response(enable_thinking)
               or self._is_glm5_next_reasoning_response()
               or self._is_qwen3_5_reasoning_response(enable_thinking)
+              or (enable_thinking and self._is_naive_n05_model()
+                  and not getattr(self.model, "force_chat_template", False))
               or self._is_dots3_note_reasoning_response(enable_thinking))
 
   def _resolve_kimi_k3_reasoning_effort(
@@ -403,6 +464,48 @@ class FastLLmCompletion:
               "Kimi K3 reasoning_effort must be one of: none, low, high, max")
       return effort
 
+  def _resolve_deepseek_v41_reasoning_effort(
+      self, request: ChatCompletionRequest
+  ) -> Optional[Union[int, str]]:
+      """DeepSeek-V4.1 takes a numeric reasoning budget.
+
+      ``encoding_dsv41.render_reasoning_effort`` accepts an int in [1, 100] or
+      one of the ``low``/``high``/``max`` aliases (50/75/100) and defaults to
+      ``high``.  Returning None keeps that default.
+      """
+      if not self._is_deepseek_v41_model():
+          return None
+      # Reuse the official alias table instead of restating it here.
+      from ftllm.encoding_dsv41 import REASONING_EFFORT_MAPPINGS
+      effort = request.reasoning_effort
+      template_kwargs = request.chat_template_kwargs or {}
+      if effort is None:
+          effort = template_kwargs.get(
+              "reasoning_effort", template_kwargs.get("thinking_effort"))
+      if effort is None or effort == "none":
+          # "none" disables thinking entirely; the effort prefix is then not
+          # rendered at all, so there is nothing left to resolve.
+          return None
+      if isinstance(effort, bool):
+          raise ValueError(
+              "DeepSeek-V4.1 reasoning_effort must be an integer in [1, 100] "
+              "or one of: none, low, high, max")
+      if isinstance(effort, str):
+          stripped = effort.strip()
+          if stripped in REASONING_EFFORT_MAPPINGS:
+              return stripped
+          try:
+              effort = int(stripped, 10)
+          except ValueError:
+              raise ValueError(
+                  "DeepSeek-V4.1 reasoning_effort must be an integer in "
+                  "[1, 100] or one of: none, low, high, max")
+      if not isinstance(effort, int) or not 1 <= effort <= 100:
+          raise ValueError(
+              "DeepSeek-V4.1 reasoning_effort must be an integer in [1, 100] "
+              "or one of: none, low, high, max")
+      return effort
+
   def _resolve_qwen3_5_reasoning_effort(
       self, request: ChatCompletionRequest
   ) -> Optional[str]:
@@ -413,11 +516,12 @@ class FastLLmCompletion:
       if effort is None:
           effort = template_kwargs.get(
               "reasoning_effort", template_kwargs.get("thinking_effort"))
-      if effort in {None, "none"}:
+      # Generic clients may send high/max/minimal or a numeric budget. Keep
+      # Qwen's native default instead of rejecting an otherwise valid request.
+      # "none" controls enable_thinking separately; the template still needs
+      # a supported effort even when thinking is disabled.
+      if effort not in ("low", "medium", "xhigh"):
           effort = "xhigh"
-      if effort not in {"low", "medium", "xhigh"}:
-          raise ValueError(
-              "Qwen reasoning_effort must be one of: none, low, medium, xhigh")
       return effort
 
   def _resolve_glm5_next_reasoning_effort(
@@ -773,6 +877,45 @@ class FastLLmCompletion:
           if text.endswith(tag[:length]):
               return length
       return 0
+
+  def _new_reasoning_state(self, emit_reasoning_content, preserve_xtml=False):
+      reasoning_format = "kimi_k3" if self._is_kimi_k3_model() else "think"
+      return {
+          "active": emit_reasoning_content,
+          "buffer": "",
+          "started": False,
+          "format": reasoning_format,
+          "phase": "reasoning" if emit_reasoning_content else "content",
+          "reasoning_started": False,
+          "preserve_xtml": preserve_xtml,
+          "content_buffer": "",
+          "content_started": False,
+          "content_done": False,
+      }
+
+  def _split_reasoning_response(self, result, emit_reasoning_content,
+                               preserve_xtml=False):
+      if self._is_kimi_k3_model():
+          if emit_reasoning_content:
+              result, reasoning_content = self._split_kimi_k3_reasoning(
+                  result,
+                  emit_reasoning_content,
+                  preserve_xtml=preserve_xtml)
+          else:
+              reasoning_content = None
+              if not preserve_xtml:
+                  result = self._strip_kimi_k3_response_wrapper(result)
+      elif (self._is_qwen_reasoning_model()
+            or self._is_dots3_note_model() or self._is_naive_n05_model()):
+          result, reasoning_content = self._split_qwen3_5_reasoning(
+              result, emit_reasoning_content)
+      elif self._is_glm5_next_model():
+          result, reasoning_content = self._split_glm5_next_reasoning(
+              result, emit_reasoning_content)
+      else:
+          result, reasoning_content = self._split_deepseek_v4_reasoning(
+              result, emit_reasoning_content)
+      return result, reasoning_content
 
   def _split_deepseek_v4_reasoning(
       self,
@@ -1378,6 +1521,9 @@ class FastLLmCompletion:
               enable_thinking = enable_thinking,
               encode_vision = False,
               encode_fn = self.model.encode,
+              tools = tools,
+              tool_choice = tool_choice,
+              chat_template_kwargs = chat_template_kwargs,
           )
           return len(native_inputs["input_ids"])
       if architecture == "Step3p7ForConditionalGeneration":
@@ -1523,10 +1669,12 @@ class FastLLmCompletion:
       model_type = self.model.get_type()
       chat_template = getattr(tokenizer, "chat_template", None)
       force_type = getattr(self.model, "tool_call_parser", "auto")
+      deepseek_v4_family = {
+          "deepseek_v4", "deepseek_v41", "deepseek_v41_text"}
       allow_without_chat_template = (
-          model_type == "deepseek_v4" or
+          model_type in deepseek_v4_family or
           model_type == "kimi_k3" or
-          force_type in ("deepseek_v4", "kimi_k3")
+          force_type in (*deepseek_v4_family, "kimi_k3")
       )
       if tokenizer is None and allow_without_chat_template:
           tokenizer = _EmptyToolTokenizer()
@@ -1545,10 +1693,10 @@ class FastLLmCompletion:
           force_chat_template = self.model.force_chat_template,
           force_type = getattr(self.model, "tool_call_parser", "auto"))
 
-  def _apply_qwen4_tool_choice(
+  def _apply_qwen_xml_tool_choice(
       self, messages, tools, tool_choice, parallel_tool_calls=None,
   ):
-      if self.model.get_type() != "qwen4_exp" or not tools:
+      if self.model.get_type() not in ("qwen4_exp", "naive_n05_flash") or not tools:
           return messages, tools
       if tool_choice != "required" and not isinstance(tool_choice, dict):
           return messages, tools
@@ -1701,7 +1849,7 @@ class FastLLmCompletion:
           content = parsed.content,
       )
 
-  def _normalize_anthropic_system_messages(
+  def _normalize_system_messages(
       self, conversation: List[ConversationMessage],
   ) -> List[ConversationMessage]:
       # Local model templates commonly require a single leading system message.
@@ -1734,6 +1882,7 @@ class FastLLmCompletion:
 
       if role == "assistant":
           text_blocks: List[str] = []
+          reasoning_blocks: List[str] = []
           tool_calls: List[Dict[str, Any]] = []
           for block in content:
               if not isinstance(block, dict):
@@ -1741,6 +1890,8 @@ class FastLLmCompletion:
               block_type = block.get("type")
               if block_type == "text":
                   text_blocks.append(block.get("text", ""))
+              elif block_type == "thinking":
+                  reasoning_blocks.append(block.get("thinking", ""))
               elif block_type == "tool_use":
                   tool_calls.append({
                       "id": block.get("id") or f"toolu_{shortuuid.random()}",
@@ -1758,6 +1909,7 @@ class FastLLmCompletion:
               role = role,
               content = text_content,
               tool_calls = tool_calls or None,
+              reasoning_content = "\n".join(reasoning_blocks) if reasoning_blocks else None,
           )], LoadedMedia()
 
       if role == "user":
@@ -1852,7 +2004,7 @@ class FastLLmCompletion:
 
   def _get_anthropic_stop_reason(self, completion_tokens: int,
                                  max_tokens: Optional[int]) -> str:
-      if max_tokens is not None and completion_tokens >= max_tokens:
+      if max_tokens is not None and max_tokens > 0 and completion_tokens >= max_tokens:
           return "max_tokens"
       return "end_turn"
 
@@ -1981,6 +2133,7 @@ class FastLLmCompletion:
   ) -> List[Dict[str, Any]]:
       system_parts: List[str] = []
       normalized: List[Dict[str, Any]] = []
+      preserve_system_order = self._is_deepseek_v41_model()
       for message in messages:
           if not isinstance(message, dict):
               normalized.append({"role": "user", "content": str(message)})
@@ -1993,7 +2146,12 @@ class FastLLmCompletion:
               text = self._responses_system_content_to_text(
                   message.get("content", ""))
               if text:
-                  system_parts.append(text)
+                  # V4.1 supports mid-conversation system messages. Hoisting
+                  # Codex's new-turn instructions changes the cached prefix.
+                  if preserve_system_order and normalized:
+                      normalized.append({"role": "system", "content": text})
+                  else:
+                      system_parts.append(text)
               continue
 
           message = dict(message)
@@ -2034,17 +2192,19 @@ class FastLLmCompletion:
           item_type = item.get("type")
           if item_type == "function_call":
               call_id = item.get("call_id") or item.get("id") or f"call_{shortuuid.random()}"
-              messages.append({
-                  "role": "assistant",
-                  "content": None,
-                  "tool_calls": [{
-                      "id": call_id,
-                      "type": "function",
-                      "function": {
-                          "name": item.get("name", ""),
-                          "arguments": item.get("arguments", "{}"),
-                      },
-                  }],
+              # Responses represents one assistant turn as separate text and
+              # function-call items. Keep them together for chat templates;
+              # splitting them inserts an end-of-turn marker after a progress
+              # note and teaches subsequent generations to stop there too.
+              if not messages or messages[-1].get("role") != "assistant":
+                  messages.append({"role": "assistant", "content": None})
+              messages[-1].setdefault("tool_calls", []).append({
+                  "id": call_id,
+                  "type": "function",
+                  "function": {
+                      "name": item.get("name", ""),
+                      "arguments": item.get("arguments", "{}"),
+                  },
               })
               continue
 
@@ -2055,7 +2215,7 @@ class FastLLmCompletion:
               messages.append({
                   "role": "tool",
                   "tool_call_id": item.get("call_id") or item.get("id"),
-                  "content": self._stringify_responses_tool_output(
+                  "content": self._convert_responses_content_to_chat_content(
                       item.get("output", "")),
               })
               continue
@@ -2074,10 +2234,17 @@ class FastLLmCompletion:
               role = item.get("role", "user")
               if role == "developer":
                   role = "system"
+              content = self._convert_responses_content_to_chat_content(
+                  item.get("content", ""))
+              if (role == "assistant" and messages
+                      and messages[-1].get("role") == "assistant"
+                      and messages[-1].get("content") is None
+                      and messages[-1].get("tool_calls")):
+                  messages[-1]["content"] = content
+                  continue
               messages.append({
                   "role": role,
-                  "content": self._convert_responses_content_to_chat_content(
-                      item.get("content", "")),
+                  "content": content,
               })
               continue
 
@@ -2155,6 +2322,7 @@ class FastLLmCompletion:
           tools = self._convert_responses_tools(request.tools),
           tool_choice = self._convert_responses_tool_choice(request.tool_choice),
           reasoning_effort = reasoning_effort,
+          response_format = responses_response_format(request.text),
       )
 
   def _response_token_counts(
@@ -2587,6 +2755,29 @@ class FastLLmCompletion:
           traceback.print_exc()
           return self.create_error_response(str(e))
 
+      if getattr(raw_request, "headers", {}).get("x-fastllm-codex-title-mode") == "local":
+          from .codex_title import local_codex_title
+          title = local_codex_title(request, chat_request.messages)
+          if title is not None:
+              error = await self._check_model(request)
+              if error is not None:
+                  return error
+              content = json.dumps({"title": title}, ensure_ascii=False)
+              response_id = f"resp_{shortuuid.random()}"
+              created_at = int(time.time())
+              if request.stream:
+                  async def title_stream():
+                      yield "data: " + json.dumps({
+                          "id": response_id, "created": created_at,
+                          "choices": [{"delta": {"content": content}, "finish_reason": "stop"}],
+                          "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                      }, ensure_ascii=False) + "\n\n"
+                  return self.responses_stream_generator(request, title_stream()), None
+              return self._responses_response_object(
+                  request, response_id, created_at, "completed",
+                  [self._responses_message_item(f"msg_{shortuuid.random()}", content)],
+                  ResponsesUsageInfo(), output_text=content)
+
       generator = await self.create_chat_completion(chat_request, raw_request)
       if isinstance(generator, ErrorResponse):
           return generator
@@ -2856,7 +3047,7 @@ class FastLLmCompletion:
               conversation.extend(messages)
               media.extend(message_media)
 
-          conversation = self._normalize_anthropic_system_messages(conversation)
+          conversation = self._normalize_system_messages(conversation)
           if len(conversation) == 0:
               raise Exception("Empty msg")
 
@@ -2873,6 +3064,8 @@ class FastLLmCompletion:
                   msg_dict["tool_call_id"] = msg.tool_call_id
               if msg.name is not None:
                   msg_dict["name"] = msg.name
+              if msg.reasoning_content is not None:
+                  msg_dict["reasoning_content"] = msg.reasoning_content
               messages.append(msg_dict)
       except Exception as e:
           logging.error("Error in applying anthropic request: %s", e)
@@ -2900,6 +3093,9 @@ class FastLLmCompletion:
               model=request.model, messages=[{"role": "user", "content": ""}],
               reasoning_effort=(request.output_config or {}).get("effort"))
           thinking_effort = self._resolve_kimi_k3_reasoning_effort(reasoning_request)
+          if thinking_effort is None:
+              thinking_effort = self._resolve_deepseek_v41_reasoning_effort(
+                  reasoning_request)
           template_kwargs = self._resolve_chat_template_kwargs(
               reasoning_request, self._resolve_qwen3_5_reasoning_effort(reasoning_request),
               self._resolve_glm5_next_reasoning_effort(reasoning_request))
@@ -2923,7 +3119,8 @@ class FastLLmCompletion:
 
       model_images = media.images if media.images else None
       model_videos = media.videos if media.videos else None
-      try:
+
+      def prepare_and_launch_text_request():
           input_token_len = self._compute_multimodal_input_token_len(
               messages,
               enable_thinking = enable_thinking,
@@ -2950,11 +3147,22 @@ class FastLLmCompletion:
               launch_kwargs["chat_template_kwargs"] = template_kwargs
           if self._is_kimi_k3_model():
               launch_kwargs["thinking_effort"] = thinking_effort
+          elif (self._is_deepseek_v41_model()
+                and thinking_effort is not None):
+              launch_kwargs["thinking_effort"] = thinking_effort
           if parser_request is not None:
               self._attach_tool_call_constraint_if_supported(
                   launch_kwargs, parser_request)
           handle = self.model.launch_stream_response(
               messages, **launch_kwargs)
+          return input_token_len, handle
+
+      try:
+          if not model_images and not model_videos:
+              input_token_len, handle = await self._prepare_text_request(
+                  prepare_and_launch_text_request)
+          else:
+              input_token_len, handle = prepare_and_launch_text_request()
       except (ValueError, TemplateError) as error:
           # Deterministic input/template failures must reach the SDK as a 400.
           # An uncaught exception becomes a 500, which Claude Code retries.
@@ -2968,18 +3176,21 @@ class FastLLmCompletion:
       result_generator = self._stream_response_handle_with_statistics(
           handle, response_statistics)
 
+      emit_reasoning_content = self._uses_tagged_reasoning_response(enable_thinking)
       if request.stream:
           return (self.anthropic_message_stream_generator(
               request, raw_request, result_generator, request_id,
               input_token_len, parser_request, handle = handle,
-              response_statistics = response_statistics),
+              response_statistics = response_statistics,
+              emit_reasoning_content = emit_reasoning_content),
               BackgroundTask(self.check_disconnect, raw_request, request_id, handle))
       else:
           try:
               return await self.anthropic_message_full_generator(
                   request, raw_request, handle, result_generator, request_id,
                   input_token_len, parser_request,
-                  response_statistics = response_statistics)
+                  response_statistics = response_statistics,
+                  emit_reasoning_content = emit_reasoning_content)
           except PromptTooLongError as e:
               self._release_conversation_handle(request_id, handle)
               return self.create_error_response(str(e))
@@ -3023,6 +3234,16 @@ class FastLLmCompletion:
               conversation.extend(messages)
               media.extend(message_media)
 
+          if self._is_qwen3_5_model() and any(
+                  message.role == "developer" for message in conversation):
+              # Harness/pi-ai sends developer instructions for reasoning models.
+              # Qwen3.5/3.8 templates accept one leading system message instead.
+              # Preserve native developer handling for other model families.
+              for message in conversation:
+                  if message.role == "developer":
+                      message.role = "system"
+              conversation = self._normalize_system_messages(conversation)
+
           if len(conversation) == 0:
             raise Exception("Empty msg")
           messages = []
@@ -3051,6 +3272,8 @@ class FastLLmCompletion:
             if msg.reasoning_content is not None:
                 msg_dict["reasoning_content"] = msg.reasoning_content
             messages.append(msg_dict)
+
+          messages = prepare_structured_output(messages, request.response_format)
 
       except Exception as e:
           logging.error("Error in applying chat template from request: %s", e)
@@ -3081,6 +3304,9 @@ class FastLLmCompletion:
           enable_thinking = bool(request.chat_template_kwargs["enable_thinking"])
       try:
           thinking_effort = self._resolve_kimi_k3_reasoning_effort(request)
+          if thinking_effort is None:
+              thinking_effort = (
+                  self._resolve_deepseek_v41_reasoning_effort(request))
           qwen3_5_reasoning_effort = (
               self._resolve_qwen3_5_reasoning_effort(request))
           glm5_next_reasoning_effort = (
@@ -3111,7 +3337,7 @@ class FastLLmCompletion:
       try:
           messages, tools = self._apply_dots_tool_choice(
               messages, tools, tool_choice)
-          messages, tools = self._apply_qwen4_tool_choice(
+          messages, tools = self._apply_qwen_xml_tool_choice(
               messages, tools, tool_choice, request.parallel_tool_calls)
       except ValueError as error:
           self._cleanup_temp_paths(media.temp_paths)
@@ -3141,6 +3367,10 @@ class FastLLmCompletion:
               "thinking_effort": thinking_effort,
               "tool_choice": tool_choice,
           })
+      elif self._is_deepseek_v41_model() and thinking_effort is not None:
+          # llm.py forwards this to encoding_dsv41.encode_messages as
+          # reasoning_effort.
+          launch_kwargs["thinking_effort"] = thinking_effort
       self._attach_tool_call_constraint_if_supported(
           launch_kwargs, effective_request)
 
@@ -3163,14 +3393,16 @@ class FastLLmCompletion:
           return input_len, launched_handle
 
       try:
-          can_prepare_concurrently = (
-              not model_images and not model_videos and not tools and
-              "tool_call_constraint" not in launch_kwargs)
-          if can_prepare_concurrently:
-              input_token_len, handle = await asyncio.to_thread(
+          if not model_images and not model_videos:
+              input_token_len, handle = await self._prepare_text_request(
                   prepare_and_launch_text_request)
           else:
               input_token_len, handle = prepare_and_launch_text_request()
+      except (ValueError, TemplateError) as error:
+          # Invalid input must not trigger the client's HTTP 500 retry loop.
+          return self.create_error_response(
+              f"Could not prepare model input: {error}",
+              err_type = "invalid_request_error")
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       # Store the mapping between conversation ID and handle
@@ -3185,11 +3417,14 @@ class FastLLmCompletion:
       emit_reasoning_content = self._uses_tagged_reasoning_response(enable_thinking)
       # Streaming response
       if request.stream:
-          return (self.chat_completion_stream_generator(
+          stream = self.chat_completion_stream_generator(
               effective_request, raw_request, result_generator, request_id,
               input_token_len, think = need_think_prefix,
               emit_reasoning_content = emit_reasoning_content,
-              handle = handle, response_statistics = response_statistics),
+              handle = handle, response_statistics = response_statistics)
+          if request.response_format and request.response_format.get("type") != "text":
+              stream = self._structured_output_stream(stream, request.response_format)
+          return (stream,
               BackgroundTask(self.check_disconnect, raw_request, request_id, handle))
       else:
           try:
@@ -3222,8 +3457,8 @@ class FastLLmCompletion:
     return True
 
   async def check_disconnect(self, raw_request: Request, request_id, handle: int):
-    # Starlette runs a StreamingResponse BackgroundTask after both a normal
-    # completion and a client disconnect.  A naturally exhausted generator
+    # SSEStreamingResponse runs cleanup after completion, disconnects and
+    # response failures.  A naturally exhausted generator
     # releases ownership before its terminal SSE is yielded.  Only an
     # interrupted generator remains active here, so abort it while the
     # request_id still owns the integer handle.
@@ -3255,26 +3490,9 @@ class FastLLmCompletion:
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
-      if self._is_kimi_k3_model():
-          if emit_reasoning_content:
-              result, reasoning_content = self._split_kimi_k3_reasoning(
-                  result,
-                  emit_reasoning_content,
-                  preserve_xtml=bool(request.tools))
-          else:
-              reasoning_content = None
-              if not request.tools:
-                  result = self._strip_kimi_k3_response_wrapper(result)
-      elif (self._is_qwen_reasoning_model()
-            or self._is_dots3_note_model()):
-          result, reasoning_content = self._split_qwen3_5_reasoning(
-              result, emit_reasoning_content)
-      elif self._is_glm5_next_model():
-          result, reasoning_content = self._split_glm5_next_reasoning(
-              result, emit_reasoning_content)
-      else:
-          result, reasoning_content = self._split_deepseek_v4_reasoning(
-              result, emit_reasoning_content)
+      history_raw = result
+      result, reasoning_content = self._split_reasoning_response(
+          result, emit_reasoning_content, preserve_xtml=bool(request.tools))
       result, stopped_by_stop_string = self._truncate_at_stop(
           result, self._normalize_stop_strings(request.stop))
       usage = self._chat_usage(
@@ -3291,6 +3509,11 @@ class FastLLmCompletion:
           return tool_call_info
 
       if tool_call_info.tools_called:
+          remember = getattr(self.model, "remember_deepseek_v41_tool_output", None)
+          if callable(remember):
+              remember(history_raw if emit_reasoning_content else result, tool_call_info.content,
+                       [call.model_dump(exclude_none=True) for call in tool_call_info.tool_calls],
+                       thinking=emit_reasoning_content, reasoning_content=reasoning_content)
           choice_data = ChatCompletionResponseChoice(
               index=0,
               message=ChatMessage(
@@ -3303,6 +3526,14 @@ class FastLLmCompletion:
               finish_reason='tool_calls',
           )
       else:
+          if finish_reason != "length":
+              try:
+                  validate_structured_output(tool_call_info.content, request.response_format)
+              except ValueError as error:
+                  self._release_conversation_handle(request_id, handle)
+                  return self.create_error_response(
+                      str(error), err_type="invalid_response_format",
+                      status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
           choice_data = ChatCompletionResponseChoice(
               index=0,
               message=ChatMessage(
@@ -3328,7 +3559,33 @@ class FastLLmCompletion:
           # logging.info(f"Removed completed conversation from tracking: {request_id}")
 
       return response
-      
+
+  async def _structured_output_stream(self, stream, format_spec):
+      content = []
+      try:
+          async for chunk in stream:
+              for line in chunk.splitlines():
+                  if not line.startswith("data: ") or line == "data: [DONE]":
+                      continue
+                  data = json.loads(line[6:])
+                  for choice in data.get("choices", []):
+                      delta = choice.get("delta") or {}
+                      if delta.get("content"):
+                          content.append(delta["content"])
+                      if choice.get("finish_reason") == "stop":
+                          try:
+                              validate_structured_output("".join(content), format_spec)
+                          except ValueError as error:
+                              data = self.create_streaming_error_response(
+                                  str(error), err_type="invalid_response_format",
+                                  status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+                              yield f"data: {data}\n\n"
+                              yield "data: [DONE]\n\n"
+                              return
+              yield chunk
+      finally:
+          await stream.aclose()
+
             
   async def chat_completion_stream_generator(
           self, request: ChatCompletionRequest, raw_request: Request,
@@ -3415,29 +3672,28 @@ class FastLLmCompletion:
         current_token_ids = []
         previous_text = ""
         current_text = ""
-        reasoning_format = "kimi_k3" if self._is_kimi_k3_model() else "think"
-        reasoning_state = {
-            "active": emit_reasoning_content,
-            "buffer": "",
-            "started": False,
-            "format": reasoning_format,
-            "phase": "reasoning" if emit_reasoning_content else "content",
-            "reasoning_started": False,
-            "preserve_xtml": bool(request.tools),
-            "content_buffer": "",
-            "content_started": False,
-            "content_done": False,
-        }
+        remember = (getattr(self.model, "remember_deepseek_v41_tool_output", None)
+                    if request.tools and self._is_deepseek_v41_model() else None)
+        history_content = ""
+        history_tool_calls = []
+        history_raw_parts = []
+        history_reasoning_parts = []
+        reasoning_state = self._new_reasoning_state(
+            emit_reasoning_content, preserve_xtml=bool(request.tools))
 
         stream_exhausted = False
         async for res in result_generator:
             res = self._normalize_model_delta(res)
             completion_tokens += 1
+            if remember:
+                history_raw_parts.append(res)
             delta_text = res
 
             reasoning_delta_messages, delta_text = self._consume_tagged_reasoning_delta(
                 delta_text, reasoning_state)
             for reasoning_delta_message in reasoning_delta_messages:
+                if remember:
+                    history_reasoning_parts.append(reasoning_delta_message.reasoning_content or "")
                 choice_data = ChatCompletionResponseStreamChoice(
                     index = 0,
                     delta = reasoning_delta_message,
@@ -3481,6 +3737,9 @@ class FastLLmCompletion:
                                 current_token_ids = current_token_ids,
                                 delta_token_ids = now_ids)
 
+                if remember:
+                    history_content += parse_result.content or ""
+                    history_tool_calls.extend(call.model_dump(exclude_none=True) for call in parse_result.valid_tool_calls)
                 previous_text += delta_text
                 previous_token_ids += now_ids
                 if parse_result.has_invalid_tool_block:
@@ -3658,6 +3917,11 @@ class FastLLmCompletion:
         if (final_stream_error_data is None and request.tools
                 and tool_call_parser):
             flush_result = tool_call_parser.flush_stream_tool_calls()
+            if remember and finish_reason == 'tool_calls':
+                history_content += flush_result.content or ""
+                history_tool_calls.extend(call.model_dump(exclude_none=True) for call in flush_result.valid_tool_calls)
+                remember("".join(history_raw_parts), history_content, history_tool_calls,
+                         thinking=emit_reasoning_content, reasoning_content="".join(history_reasoning_parts))
             if flush_result.content or flush_result.valid_tool_calls:
                 delta_message = DeltaMessage(
                     content = flush_result.content,
@@ -3700,7 +3964,8 @@ class FastLLmCompletion:
               request_id: str,
               input_token_len: int,
               parser_request: Optional[ChatCompletionRequest],
-              response_statistics: Optional[Dict[str, int]] = None
+              response_statistics: Optional[Dict[str, int]] = None,
+              emit_reasoning_content: bool = False
               ) -> Union[ErrorResponse, AnthropicMessageResponse]:
       model_name = self.model_name
       result = ""
@@ -3718,19 +3983,29 @@ class FastLLmCompletion:
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
+      usage = self._anthropic_usage(
+          handle, response_statistics, input_token_len, completion_tokens)
+      self._release_conversation_handle(request_id, handle)
+      result, reasoning_content = self._split_reasoning_response(
+          result, emit_reasoning_content, preserve_xtml=bool(request.tools))
       if request.tools and parser_request is not None:
-          tool_parser = self._create_tool_parser()
-          tool_call_info = tool_parser.extract_tool_calls(result, parser_request)
+          tool_call_info = self._parse_non_stream_tool_calls(
+              result, parser_request,
+              finish_reason=self._chat_finish_reason(
+                  usage.output_tokens, request.max_tokens or 32768))
+          if isinstance(tool_call_info, ErrorResponse):
+              return tool_call_info
       else:
           tool_call_info = ExtractedToolCallInformation(
               tools_called = False, tool_calls = [], content = result)
 
-      usage = self._anthropic_usage(
-          handle, response_statistics, input_token_len, completion_tokens)
+      blocks = self._build_anthropic_response_blocks(
+          tool_call_info.content, tool_call_info.tool_calls)
+      if reasoning_content:
+          blocks.insert(0, AnthropicThinkingContentBlock(thinking=reasoning_content))
       response = AnthropicMessageResponse(
           id = request_id,
-          content = self._build_anthropic_response_blocks(
-              tool_call_info.content, tool_call_info.tool_calls),
+          content = blocks,
           model = model_name,
           stop_reason = ("tool_use" if tool_call_info.tools_called
                          else self._get_anthropic_stop_reason(
@@ -3750,19 +4025,16 @@ class FastLLmCompletion:
           input_token_len: int,
           parser_request: Optional[ChatCompletionRequest],
           handle: Optional[int] = None,
-          response_statistics: Optional[Dict[str, int]] = None
+          response_statistics: Optional[Dict[str, int]] = None,
+          emit_reasoning_content: bool = False
           ) -> AsyncGenerator[str, None]:
       model_name = self.model_name
       completion_tokens = 0
       next_content_index = 0
       text_block_index = None
+      thinking_block_index = None
       tool_blocks: Dict[int, Dict[str, Any]] = {}
       emitted_tool_use = False
-
-      previous_token_ids = []
-      current_token_ids = []
-      previous_text = ""
-      current_text = ""
 
       try:
           message = AnthropicMessageResponse(
@@ -3778,40 +4050,92 @@ class FastLLmCompletion:
               "message_start", MessageStartEvent(message = message))
 
           tool_parser = (
-              self._create_tool_parser()
+              self._create_function_call_parser(parser_request)
               if request.tools and parser_request is not None
               else None
           )
 
-          async for res in result_generator:
-              if (res == "[unused16]"):
-                  res = "<think>"
-              elif (res == "[unused17]"):
-                  res = "</think>"
-              completion_tokens += 1
-              delta_text = res
+          reasoning_state = self._new_reasoning_state(
+              emit_reasoning_content, preserve_xtml=bool(request.tools))
 
-              if request.tools and parser_request is not None and tool_parser:
+          async def parsed_deltas():
+              nonlocal completion_tokens
+              previous_text = ""
+              previous_token_ids = []
+              async for res in result_generator:
+                  delta_text = self._normalize_model_delta(res)
+                  completion_tokens += 1
+                  reasoning_deltas, delta_text = self._consume_tagged_reasoning_delta(
+                      delta_text, reasoning_state)
+                  for reasoning_delta in reasoning_deltas:
+                      yield reasoning_delta
+                  if not delta_text:
+                      continue
+                  if tool_parser is None:
+                      yield DeltaMessage(content=delta_text)
+                      continue
                   now_ids = tool_parser.get_token_ids(delta_text)
-                  current_text += delta_text
-                  current_token_ids += now_ids
-
-                  delta_message = tool_parser.extract_tool_calls_streaming(
-                                  previous_text = previous_text,
-                                  current_text = current_text,
-                                  delta_text = delta_text,
-                                  previous_token_ids = previous_token_ids,
-                                  current_token_ids = current_token_ids,
-                                  delta_token_ids = [0],
-                                  request = parser_request)
-
+                  parsed = tool_parser.parse_stream_chunk(
+                      previous_text=previous_text,
+                      current_text=previous_text + delta_text,
+                      delta_text=delta_text,
+                      previous_token_ids=previous_token_ids,
+                      current_token_ids=previous_token_ids + now_ids,
+                      delta_token_ids=now_ids)
                   previous_text += delta_text
                   previous_token_ids += now_ids
-              else:
-                  delta_message = DeltaMessage(content = delta_text)
+                  yield DeltaMessage(content=parsed.content,
+                                     tool_calls=parsed.valid_tool_calls)
 
+              # A terminal native handle may be reused before we yield the
+              # parser's last buffered call or the closing SSE events.
+              self._release_conversation_handle(request_id, handle)
+              if (emit_reasoning_content
+                      and reasoning_state.get("format") != "kimi_k3"
+                      and reasoning_state.get("active")
+                      and reasoning_state.get("buffer")):
+                  yield DeltaMessage(reasoning_content=reasoning_state["buffer"])
+                  reasoning_state["buffer"] = ""
+              if tool_parser is None:
+                  return
+              usage = self._anthropic_usage(
+                  handle, response_statistics, input_token_len, completion_tokens)
+              diagnostics = tool_parser.finalize_stream(
+                  finish_reason=self._chat_finish_reason(
+                      usage.output_tokens, request.max_tokens or 32768))
+              if diagnostics:
+                  raise ValueError("Invalid tool call: " +
+                                   self._format_tool_call_diagnostics(diagnostics))
+              # Qwen can finish after </function> with the outer delimiter
+              # absent. Without finalization, clients see only the preceding
+              # text and end_turn, silently dropping the intended action.
+              parsed = tool_parser.flush_stream_tool_calls()
+              yield DeltaMessage(content=parsed.content,
+                                 tool_calls=parsed.valid_tool_calls)
+
+          async for delta_message in parsed_deltas():
               if not delta_message:
                   continue
+
+              if delta_message.reasoning_content:
+                  if thinking_block_index is None:
+                      thinking_block_index = next_content_index
+                      next_content_index += 1
+                      yield self._create_anthropic_sse_event(
+                          "content_block_start", ContentBlockStartEvent(
+                              index=thinking_block_index,
+                              content_block=AnthropicThinkingContentBlock(thinking="")))
+                  yield self._create_anthropic_sse_event(
+                      "content_block_delta", ContentBlockDeltaEvent(
+                          index=thinking_block_index,
+                          delta=AnthropicThinkingDelta(
+                              thinking=delta_message.reasoning_content)))
+
+              if (thinking_block_index is not None
+                      and (delta_message.content or delta_message.tool_calls)):
+                  yield self._create_anthropic_sse_event(
+                      "content_block_stop", ContentBlockStopEvent(index=thinking_block_index))
+                  thinking_block_index = None
 
               if delta_message.content:
                   if tool_blocks:
@@ -3891,6 +4215,9 @@ class FastLLmCompletion:
           # the old BackgroundTask abort a newly recycled numeric handle.
           self._release_conversation_handle(request_id, handle)
 
+          if thinking_block_index is not None:
+              yield self._create_anthropic_sse_event(
+                  "content_block_stop", ContentBlockStopEvent(index=thinking_block_index))
           if text_block_index is not None:
               yield self._create_anthropic_sse_event(
                   "content_block_stop",

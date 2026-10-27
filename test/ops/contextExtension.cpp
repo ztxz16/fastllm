@@ -78,6 +78,15 @@ namespace {
         Reject([&] { ResolveContextOptions(m, mm, {1000000, "yarn"}); }, "invalid sections");
         Reject([&] { ResolveContextOptions(TextConfig(), {}, {131072, yarn}); }, "unadapted model");
         Reject([&] { ResolveContextOptions(TextConfig(), text, {0, ""}); }, "zero length");
+        auto nested = MMConfig();
+        auto bounded = ResolveContextOptions(nested, {}, {131072, ""});
+        Check(bounded.declaredLength == 262144 && bounded.effectiveLength == 131072,
+              "unadapted nested text context limit");
+        Reject([&] { ResolveContextOptions(nested, {}, {524288, ""}); }, "unadapted nested extension");
+        Reject([&] { ResolveContextOptions(nested, {}, {131072, "yarn"}); }, "unadapted nested RoPE override");
+        nested["max_position_embeddings"] = "65536";
+        Check(ResolveContextOptions(nested, {}, {32768, ""}).declaredLength == 65536,
+              "root context keeps precedence for unadapted layouts");
         std::cout << "Context configuration cases passed\n";
     }
     void Device(const std::string &name) { static_cast<Executor *>(GetExecutor())->SetFirstDevice(name); }

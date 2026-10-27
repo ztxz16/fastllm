@@ -16,8 +16,9 @@ def with_model_metadata(service, api_key):
             payload = json.loads(response.read(1024 * 1024))
         entries = payload.get("data") or payload.get("models") or []
         for entry in entries:
-            if isinstance(entry, dict) and (entry.get("id") or entry.get("slug")) == service["modelName"]:
-                service["modelMetadata"] = entry
+            name = (entry.get("id") or entry.get("slug")) if isinstance(entry, dict) else None
+            if isinstance(name, str) and name and (not service["modelName"] or name == service["modelName"]):
+                service.update(modelName=name, modelMetadata=entry)
                 break
     except (OSError, ValueError, AttributeError, TypeError):
         # Older or external model servers may omit capability metadata. Opening

@@ -182,7 +182,7 @@ python test/benchmark/qwen4_tp_reuse.py --reference /tmp/tp-baseline.json \
   --output /tmp/tp-candidate.json
 ```
 
-测试比较完整文本和 token usage，覆盖短输入图复用、跨 2048 token 边界、不同内容和长度、取消后重入及并发请求。TP CUDA Graph 与 PLE 搬运说明见 [部署指南](../../docs/qwen4.md#tp-decode-的-cuda-graph)。
+测试比较完整文本和 token usage，覆盖短输入图复用、跨 2048 token 边界、不同内容和长度、取消后重入及并发请求。TP 与 CUDA Graph 的职责划分见[Qwen4 模块边界](../../docs/execution_modes.md#qwen4-模块边界)。
 
 ## Qwen4 前缀缓存回归
 
@@ -196,4 +196,18 @@ PYTHONPATH=build-proto/tools python test/benchmark/qwen4_prefix_cache.py \
 
 默认使用 CUDA 计算、NUMA 专家、FP16 激活和 CUDA Graph；模型及专家主机快照需要足够的系统内存。可通过 `--cache-gib`、`--moe-device`、`--threads`、`--graph` 调整运行配置。输出目录须没有同模式的既有结果。
 
+提示词预填充助手的代码块，减少选择输出格式带来的歧义，输出仍严格逐 token 比较。自适应专家调度可能改变 CPU/GPU 计算路径；若出现差异，应使用未修改版本对照。需要固定专家放置时可用 `--cache-gib 0`。NUMA 专家已在权重准备阶段集中注册并回收源缓冲区，无需启用 GPU 专家缓存来规避按需注册造成的主机内存膨胀；系统内存仍需容纳模型和请求状态。
+
+双卡混合推理可增加 `--tp 2 --ngram-device disk`，自动覆盖首次并发请求、Graph 恢复、默认 2048 token 快照间隔，以及从普通解码切换到 MTP。需要缩短边界用例时，可设置 `--families 511:512,512:512,513:512,1025:512`。测试内部固定边界用例的快照间隔为 1 页，默认间隔用例单独设为 16 页，无须额外设置环境变量。
+
 测试先关闭前缀缓存生成参考，再开启缓存，检查重复请求、真实前缀恢复、不同续写及共享快照复用；覆盖 4095/4096/4097 token 和 8193 token 的分块 prefill。它比较完整生成 token，并要求日志中出现预期长度的 `restore`，防止把未崩溃或仅查找到缓存误判为恢复成功。`mtp*.log` 保留原始日志，`mtp*.json` 保存各请求输出与首 token 耗时，`summary.json` 仅在所有检查通过后生成。
+
+## Qwen3.8-Flash-Next 混合部署速度
+
+`qwen38_hybrid.py` 用于对比串行分卡、TP、动态专家缓存和固定专家层驻留。
+每种配置只测一轮：4096 输入、4096 分块的原生 prefill，以及独立的
+512 输入、固定 512 输出的普通/MTP3 decode；每项先预热一次。
+使用 `--mtp 3 --chunked_prefill_size 4096 --prefix_cache false --cache_history false`
+和一个尚不存在的 `--output-dir`，其他参数按部署方式设置。
+脚本保存原始 token、到达时间、配置及设备映射，终端 `[Prompt]` 行报告原生前向吞吐。
+完整命令、指标口径和本机结果见 [Flash-Next Benchmark](../../docs/benchmarks/qwen4_exp.md)。

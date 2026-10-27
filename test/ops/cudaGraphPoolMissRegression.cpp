@@ -12,6 +12,58 @@
 
 namespace {
 
+bool RunCaptureMixedSizePoolRegression() {
+    FastllmCudaSetDevice(0);
+    constexpr size_t largeBytes = 64 * 1024;
+    constexpr size_t smallBytes = 4 * 1024;
+    // Seed the larger block first. Capture must leave it for the larger request.
+    void *large = FastllmCudaMalloc(largeBytes);
+    void *small = FastllmCudaMalloc(smallBytes);
+    if (large == nullptr || small == nullptr) return false;
+    FastllmCudaFree(large);
+    FastllmCudaFree(small);
+    if (!FastllmCudaGraphPrepareCaptureDevice() ||
+        !FastllmCudaGraphMemoryPoolBegin() || !FastllmCudaGraphBeginCapture()) {
+        return false;
+    }
+    void *first = FastllmCudaMalloc(smallBytes);
+    void *second = FastllmCudaMalloc(largeBytes);
+    bool passed = first != nullptr && second != nullptr &&
+                  !FastllmCudaGetThreadError();
+    if (passed) {
+        passed = cudaMemsetAsync(first, 0x35, smallBytes, cudaStreamPerThread) == cudaSuccess &&
+                 cudaMemsetAsync(second, 0x79, largeBytes, cudaStreamPerThread) == cudaSuccess;
+    }
+    FastllmCudaFree(first);
+    FastllmCudaFree(second);
+    void *graph = nullptr;
+    passed = FastllmCudaGraphEndCapture(&graph) && graph != nullptr && passed;
+    std::vector<void*> pins;
+    void *exec = nullptr;
+    passed = passed && FastllmCudaGraphMemoryPoolEnd(pins);
+    if (!passed) FastllmCudaGraphMemoryPoolAbort();
+    if (passed) {
+        unsigned char values[2] = {};
+        passed = FastllmCudaGraphInstantiate(graph, &exec) &&
+                 FastllmCudaGraphLaunch(exec) &&
+                 cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess &&
+                 cudaMemcpy(values, first, 1, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                 cudaMemcpy(values + 1, second, 1, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                 values[0] == 0x35 && values[1] == 0x79;
+    }
+    if (exec != nullptr) FastllmCudaGraphExecDestroy(exec);
+    if (graph != nullptr) FastllmCudaGraphDestroy(graph);
+    FastllmCudaGraphMemoryPoolRelease(pins);
+    FastllmCudaClearThreadError();
+    FastllmCudaClearGraphError();
+    // Leave the pool cold for the deliberate allocation-failure test below.
+    FastllmCudaForceFree(large);
+    FastllmCudaForceFree(small);
+    if (!passed) std::cerr << "capture exhausted a pool with sufficient mixed-size capacity\n";
+    else std::cout << "mixed-size capture pool and replay: PASS\n";
+    return passed;
+}
+
 bool RunExternalCaptureQueryRegression() {
     bool passed = false;
     std::string error;
@@ -131,16 +183,123 @@ bool RunDeferredBigBufferClearRegression() {
     return true;
 }
 
+bool RunExpansionWorkspaceReuseRegression() {
+    FastllmCudaSetDevice(0);
+    FastllmCudaClearBigBufferAll();
+    constexpr size_t bytes = 304ULL * 1024ULL * 1024ULL;
+    size_t freeBytes = 0, totalBytes = 0;
+    if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess ||
+        bytes > totalBytes / 4 || freeBytes < bytes + 128ULL * 1024ULL * 1024ULL) {
+        cudaGetLastError();
+        std::cout << "expansion workspace reuse: SKIP (insufficient free memory)\n";
+        return true;
+    }
+    auto isLive = [](void *pointer) {
+        cudaPointerAttributes attributes;
+        if (cudaPointerGetAttributes(&attributes, pointer) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+#if CUDART_VERSION < 10000
+        return attributes.memoryType == cudaMemoryTypeDevice;
+#else
+        return attributes.type == cudaMemoryTypeDevice;
+#endif
+    };
+
+    // A small KV-like tensor grows while a much larger operator workspace is
+    // idle. Growth must preserve both the tensor contents and workspace reuse.
+    const std::vector<float> expected = {1.0f, -2.0f, 3.0f, -4.0f};
+    fastllm::Data cache(fastllm::DataType::FLOAT32, {1, 4}, expected);
+    cache.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0});
+    void *workspace = FastllmCudaMalloc(bytes);
+    FastllmCudaFree(workspace);
+    cache.Expansion({2, 4});
+    std::vector<float> actual(4);
+    bool passed = cudaMemcpy(actual.data(), cache.cudaData, 4 * sizeof(float),
+                            cudaMemcpyDeviceToHost) == cudaSuccess && actual == expected;
+    passed = passed && isLive(workspace);
+    if (!passed) {
+        std::cerr << "tensor growth discarded a reusable workspace or changed contents\n";
+        return false;
+    }
+    void *reused = FastllmCudaMalloc(bytes);
+    passed = reused == workspace;
+    FastllmCudaFree(reused);
+
+    // Retention is a cache, not a reservation: pressure must reclaim idle
+    // workspace while preserving the live tensor and graph-owned allocations.
+    void *probe = nullptr;
+    passed = passed && totalBytes < std::numeric_limits<size_t>::max() &&
+        FastllmCudaTryDirectMalloc(&probe, totalBytes + 1) ==
+            FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE && probe == nullptr &&
+        !isLive(workspace) && isLive(cache.cudaData);
+    passed = passed && cudaMemcpy(actual.data(), cache.cudaData, 4 * sizeof(float),
+                                 cudaMemcpyDeviceToHost) == cudaSuccess && actual == expected;
+    if (!passed) std::cerr << "retained workspace was not reusable or reclaimable\n";
+    else std::cout << "expansion retains reusable and reclaimable workspace: PASS\n";
+    return passed;
+}
+
+bool RunPinnedWorkspaceOomRegression() {
+    FastllmCudaSetDevice(0);
+    struct RestoreCaptureMode {
+        bool previous = FastllmCudaGraphSetManagedCaptureOnly(true);
+        ~RestoreCaptureMode() { FastllmCudaGraphSetManagedCaptureOnly(previous); }
+    } restore;
+    constexpr size_t bytes = 4ULL * 1024ULL * 1024ULL;
+    void *buffer = FastllmCudaMalloc(bytes);
+    FastllmCudaFree(buffer);
+    if (!FastllmCudaGraphMemoryPoolBegin() || !FastllmCudaGraphBeginCapture()) return false;
+    buffer = FastllmCudaMalloc(bytes);
+    if (cudaMemsetAsync(buffer, 0x5a, bytes, cudaStreamPerThread) != cudaSuccess) return false;
+    FastllmCudaFree(buffer);
+    void *graph = nullptr, *exec = nullptr;
+    std::vector<void *> pins;
+    if (!FastllmCudaGraphEndCapture(&graph) || !FastllmCudaGraphMemoryPoolEnd(pins) ||
+        std::find(pins.begin(), pins.end(), buffer) == pins.end() ||
+        !FastllmCudaGraphInstantiate(graph, &exec)) return false;
+
+    // The tensor released its workspace, but the graph still owns the address.
+    // Force the allocator's OOM retry without consuming the device's capacity.
+    size_t freeBytes = 0, totalBytes = 0;
+    void *probe = nullptr;
+    bool passed = cudaMemGetInfo(&freeBytes, &totalBytes) == cudaSuccess &&
+        totalBytes < std::numeric_limits<size_t>::max() &&
+        FastllmCudaTryDirectMalloc(&probe, totalBytes + 1) ==
+            FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE && probe == nullptr;
+    cudaPointerAttributes attributes;
+    passed = passed && cudaPointerGetAttributes(&attributes, buffer) == cudaSuccess;
+#if CUDART_VERSION < 10000
+    passed = passed && attributes.memoryType == cudaMemoryTypeDevice;
+#else
+    passed = passed && attributes.type == cudaMemoryTypeDevice;
+#endif
+    unsigned char value = 0;
+    passed = passed && FastllmCudaGraphLaunch(exec) &&
+        cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess &&
+        cudaMemcpy(&value, buffer, 1, cudaMemcpyDeviceToHost) == cudaSuccess && value == 0x5a;
+    FastllmCudaGraphExecDestroy(exec);
+    FastllmCudaGraphDestroy(graph);
+    FastllmCudaGraphMemoryPoolRelease(pins);
+    if (!passed) std::cerr << "OOM retry released a graph-owned workspace\n";
+    else std::cout << "graph-owned workspace survives OOM retry: PASS\n";
+    return passed;
+}
+
 }  // namespace
 
 int main() {
     int deviceCount = 0;
     if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount <= 0) {
         std::cerr << "no CUDA device available for graph pool-miss regression\n";
-        return 2;
+        return 77;
     }
     if (!RunExternalCaptureQueryRegression()) {
         return 17;
+    }
+    if (!RunCaptureMixedSizePoolRegression()) {
+        return 18;
     }
     const int participants = std::min(deviceCount, 4);
     FastllmCudaSetDevice(0);
@@ -153,19 +312,30 @@ int main() {
     std::vector<std::string> captureErrors(participants);
     std::vector<std::unique_ptr<fastllm::Data> > capturedData(participants);
     std::vector<std::unique_ptr<fastllm::Data> > capturedDirectData(participants);
+    std::vector<void *> copySources(participants, nullptr);
+    std::vector<void *> scoreWorkspaces(participants, nullptr);
     std::vector<std::thread> workers;
     workers.reserve(participants);
     for (int device = 0; device < participants; device++) {
         workers.emplace_back([&, device]() {
             FastllmCudaSetDevice(device);
+            if (cudaMalloc(&copySources[device], 4096) != cudaSuccess) {
+                captureErrors[device] = "failed to prepare the copy source";
+                return;
+            }
+            scoreWorkspaces[device] = FastllmCudaMalloc(2);
+            if (scoreWorkspaces[device] == nullptr) {
+                captureErrors[device] = "failed to prepare the score workspace";
+                return;
+            }
+            FastllmCudaFree(scoreWorkspaces[device]);
             if (!FastllmCudaGraphBeginCapture()) {
                 captureErrors[device] = "failed to begin CUDA stream capture";
                 return;
             }
 
-            // A fresh process has no reusable FastLLM pool entries on any
-            // device. Every rank therefore takes the same deterministic
-            // capture-time pool-miss path.
+            // The only pooled block is two bytes: every Data allocation below
+            // misses, and attention can allocate only one of its two scores.
             capturedData[device] = std::make_unique<fastllm::Data>(
                 fastllm::DataType::FLOAT32, std::vector<int>{1024});
             fastllm::Data &data = *capturedData[device];
@@ -199,6 +369,24 @@ int main() {
                 return;
             }
 
+            // This copy exceeds the placeholder. Keep the failed capture valid
+            // until all ranks can abort, including a partial score allocation.
+            FastllmCudaMemcpy2DDeviceToDevice(data.cudaData, 4096,
+                copySources[device], 4096, 4096, 1);
+            fastllm::Data halfInput(fastllm::DataType::FLOAT16, {1, 1, 256});
+            halfInput.dataDevice = fastllm::DataDevice::CUDA;
+            halfInput.dataDeviceIds = {device};
+            halfInput.cudaData = data.cudaData;
+            halfInput.cudaDataBorrowed = true;
+            fastllm::Data emptyMask;
+            if (FastllmCudaHalfAttention(halfInput, halfInput, halfInput,
+                    emptyMask, halfInput, 1, 0.0625f, 1) ||
+                cudaPeekAtLastError() != cudaSuccess ||
+                FastllmCudaGraphCaptureInvalidated()) {
+                captureErrors[device] = "pool miss escaped to a CUDA copy or cuBLAS call";
+                return;
+            }
+
             void *graph = nullptr;
             if (!FastllmCudaGraphEndCapture(&graph) || graph == nullptr) {
                 captureErrors[device] =
@@ -213,11 +401,18 @@ int main() {
         worker.join();
     }
     FastllmCudaGraphMemoryPoolAbort();
-
-    for (int device = 0; device < participants; device++) {
+    for (int device = 0; device < participants; ++device) {
+        FastllmCudaSetDevice(device);
+        if (copySources[device] != nullptr) cudaFree(copySources[device]);
         if (!capturePassed[device]) {
             std::cerr << "GPU " << device << ": " << captureErrors[device]
                       << "\n";
+            return 4;
+        }
+        void *reused = FastllmCudaMalloc(2);
+        FastllmCudaFree(reused);
+        if (reused != scoreWorkspaces[device]) {
+            std::cerr << "GPU " << device << ": failed attention capture leaked its score workspace\n";
             return 4;
         }
     }
@@ -255,6 +450,12 @@ int main() {
 
     if (!RunDeferredBigBufferClearRegression()) {
         return 7;
+    }
+    if (!RunExpansionWorkspaceReuseRegression()) {
+        return 23;
+    }
+    if (!RunPinnedWorkspaceOomRegression()) {
+        return 22;
     }
 
     size_t freeBytes = 0, totalBytes = 0;

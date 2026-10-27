@@ -121,6 +121,14 @@ ftllm server DeepSeek-V3-0324-Q4_K_M-00001-of-00009.gguf --ori DeepSeek-V3
     - **简写**: `--device cudapp=N` 表示 N 卡均匀串行，例如 `--device cudapp=4` 等价于 `--device "{'cuda:0':1,'cuda:1':1,'cuda:2':1,'cuda:3':1}"`
     - **简写**: `--device cudapp=1:2:3` 表示三卡按 1:2:3 比例串行
 
+- `--vision_device`:
+  - **描述**: 指定 Qwen3.5 / Qwen3.6 / Qwen3.8 视觉编码器的运行设备，默认 `auto`。设为 `cpu` 时视觉塔权重常驻内存并在 CPU 上完成编码，可减少视觉显存占用，代价是图像编码速度明显下降。
+  - **CUDA 放置**: 单卡 CUDA 下 `auto` 使用首个前向 GPU；多卡 CUDA 视觉跟随普通 TP 的设备列表与分片比例，`cuda:N` 不单独覆盖视觉放置。详见[视觉张量并行](qwen35-vision-tp.md)。
+  - **取值**: `auto`、`cpu`、`cuda`、`cuda:N`
+  - **设备编号**: `cuda:N` 中的 `N` 是当前进程可见的 GPU 编号，受 `CUDA_VISIBLE_DEVICES` 影响；编号必须存在。无 CUDA 构建不能使用 `cuda` / `cuda:N`。
+  - **环境变量**: 未指定命令行参数时读取 `FASTLLM_QWEN35_VISION_DEVICE`，未设置时使用 `auto`；显式命令行参数优先。
+  - **示例**: `--vision_device cpu`、`--vision_device cuda:1`
+
 - `--moe_device`:
   - **描述**: 指定 MOE 层的计算设备。一般和 `--device` 指定为不同的设备来实现混合推理。如果模型不是 MOE 结构，此参数不会生效。
   - **示例**: `--moe_device cpu`、`--moe_device numa`
@@ -201,6 +209,22 @@ ftllm server DeepSeek-V3-0324-Q4_K_M-00001-of-00009.gguf --ori DeepSeek-V3
   - **描述**: 指定工具调用（function calling）的解析器类型。
   - **默认值**: `auto`（根据模型自动选择）
   - **示例**: `--tool_call_parser auto`
+
+### Qwen3.5 MTP 随机草稿
+
+MTP 对非贪心采样请求默认使用随机草稿，并保存每一步的实际草稿分布 q。目标分布 p 遵守请求的 temperature/top-k/top-p，按 `min(1, p/q)` 接受草稿；首次拒绝后从归一化的 `max(p-q, 0)` 补采，并丢弃后续草稿。单请求和多请求批处理使用同一套提案状态与拒绝采样路径。
+
+```sh
+ftllm server /path/to/model --tp 2 --mtp 5 --speculative_algorithm mtp
+```
+
+greedy 请求仍使用贪心草稿和精确匹配验证。DFlash 使用自己的提案状态和验证路径。
+
+默认通过 Gumbel-max 融合生成随机草稿，并保存温度缩放后的 logits 和归一化常数；此时 q 不做 top-k/top-p 截断，目标 p 仍保留请求的全部过滤。设置 `FASTLLM_MTP_GUMBEL=0` 可使用保存完整概率数组的实现，q 此时也经过 top-k/top-p 过滤；两者均按实际 q 做拒绝采样，关闭 Gumbel 不会切回贪心草稿。长预填充首次播种也保存对应的 q，供随后验证使用。
+
+CUDA embedding 可用时，`FASTLLM_MTP_GPU_CHAIN` 默认开启，减少草稿 token 回传。`FASTLLM_MTP_PREFIX_GRAPH` 仅在全局 CUDA Graph 开启且 GPU 草稿链生效时使用，可设为 `0` 单独关闭。它们不改变采样公式。随机草稿的收益取决于实际负载、接受率和采样开销，应比较完整解码速度。
+
+NVIDIA SM75 及以下（包括 RTX 2080 Ti）默认关闭 CUDA Graph；普通 Qwen3.5 系列推理仅在所有参与 GPU 的算力均大于 7.5 且满足自动启用条件时开启，MTP 模式不自动开启。可通过 `FASTLLM_CUDA_GRAPH=1` 显式开启或 `FASTLLM_CUDA_GRAPH=0` 显式关闭。全局 Graph 关闭时，草稿前缀 Graph 也不会运行，随机草稿和完整分布拒绝采样仍然生效。
 
 ### 服务部署参数
 

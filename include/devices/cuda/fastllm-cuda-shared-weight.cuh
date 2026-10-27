@@ -87,22 +87,59 @@ struct SharedExpertLayout {
 };
 
 namespace shared_weight_detail {
-template<class Unit>
-__device__ Unit Load(const SharedWeightView &view, void *const *pointers,
-                     uint32_t offset) {
+// Resolve the same byte view for mapped NUMA shards and concatenated uploads.
+__device__ inline size_t SourceOffset(const SharedWeightView &view, uint32_t offset,
+                                     uint32_t &shard) {
     uint32_t row = offset / view.rowBytes;
     const uint32_t column = offset - row * view.rowBytes;
     const uint32_t group = row / view.groupRows;
     row = row * view.rowGroups - group * (view.rows - 1);
-    const uint32_t shard = row / view.rowsPerShard;
-    const auto *source = static_cast<const uint8_t *>(pointers[shard]);
+    shard = row / view.rowsPerShard;
     row -= shard * view.rowsPerShard;
     const uint32_t tile = row / view.tileRows;
     const uint32_t block = column / view.blockBytes;
-    const size_t address = view.sourceOffset + size_t(tile) * view.tileStride +
+    return view.sourceOffset + size_t(tile) * view.tileStride +
         size_t(row - tile * view.tileRows) * view.rowStride +
         size_t(block) * view.blockStride + column - block * view.blockBytes;
+}
+
+template<class Unit>
+__device__ Unit Load(const SharedWeightView &view, void *const *pointers,
+                     uint32_t offset, const uint8_t *contiguous = nullptr) {
+    uint32_t shard;
+    const size_t address = SourceOffset(view, offset, shard);
+    const auto *source = pointers ? static_cast<const uint8_t *>(pointers[shard]) :
+        contiguous + size_t(shard) * view.shardBytes;
     return *reinterpret_cast<const Unit *>(source + address);
+}
+
+template<class Unit>
+__global__ void CopyRecord(SharedExpertLayout layout, const uint8_t *gate,
+        const uint8_t *down, const uint8_t *auxiliary, uint8_t *destination,
+        void *const *pointers, int stage) {
+    for (size_t offset = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * sizeof(Unit);
+         offset < layout.recordBytes; offset += size_t(gridDim.x) * blockDim.x * sizeof(Unit)) {
+        Unit value{};
+        bool write = stage < 0;
+        for (int part = 0; part < 2; ++part) {
+            if (stage >= 0 && stage != part) continue;
+            const auto &view = layout.weights[part];
+            if (offset >= view.destinationOffset && offset - view.destinationOffset < view.rows * view.rowBytes) {
+                const auto local = offset - view.destinationOffset;
+                value = Load<Unit>(view, pointers ? pointers + part * layout.shards : nullptr,
+                    local, part ? down : gate);
+                write = true;
+            }
+        }
+        // Gate computation reads both gate/up global scales. Publish all
+        // auxiliary metadata before gateReady and never rewrite it during down.
+        if (stage != 1) for (const auto &span : layout.auxiliary)
+            if (offset >= span.destinationOffset && offset - span.destinationOffset < span.bytes) {
+                value = *reinterpret_cast<const Unit *>(auxiliary + span.sourceOffset + offset - span.destinationOffset);
+                write = true;
+            }
+        if (write) *reinterpret_cast<Unit *>(destination + offset) = value;
+    }
 }
 
 template<class Unit>
@@ -202,6 +239,26 @@ __global__ void Scatter(SharedExpertLayout layout, void *const *pointers,
 }
 
 } // namespace shared_weight_detail
+
+inline bool CopySharedExpertRecord(const SharedExpertLayout &layout, void *const *pointers,
+        const uint8_t *gate, const uint8_t *down, const uint8_t *auxiliary,
+        uint8_t *destination, cudaStream_t stream, int stage = -1) {
+    if ((!pointers && (!gate || !down)) || !destination || (layout.auxiliaryBytes && !auxiliary)) return false;
+    uintptr_t alignment = layout.recordBytes | layout.auxiliaryBytes |
+        reinterpret_cast<uintptr_t>(gate) | reinterpret_cast<uintptr_t>(down) |
+        reinterpret_cast<uintptr_t>(auxiliary) | reinterpret_cast<uintptr_t>(destination);
+    for (const auto &view : layout.weights) alignment |= view.Alignment() | view.shardBytes;
+    for (const auto &span : layout.auxiliary)
+        alignment |= span.sourceOffset | span.destinationOffset | span.bytes;
+    const int blocks = std::min(256u, (layout.recordBytes + 255) / 256);
+    #define FASTLLM_RECORD_COPY(Unit) \
+        shared_weight_detail::CopyRecord<Unit><<<blocks, 256, 0, stream>>>(layout, gate, down, auxiliary, destination, pointers, stage)
+    if (!(alignment & 15)) { FASTLLM_RECORD_COPY(uint4); }
+    else if (!(alignment & 3)) { FASTLLM_RECORD_COPY(uint32_t); }
+    else { FASTLLM_RECORD_COPY(uint8_t); }
+    #undef FASTLLM_RECORD_COPY
+    return cudaGetLastError() == cudaSuccess;
+}
 
 // Prepare() validates layouts and derives source extents once when binding the
 // owner. Copy is allocation-free and graph-capturable; count stays on device.

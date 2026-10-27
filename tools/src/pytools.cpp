@@ -3,6 +3,10 @@
 //
 
 #include "model.h"
+#include "models/naive_n05_flash.h"
+#include "devices/disk/diskdevice.h"
+#include "moe_cache_config.h"
+#include "utils/autotune.h"
 
 #include <cstring>
 #include <csignal>
@@ -43,6 +47,14 @@ static thread_local std::string fastllmPytoolsWarmupError;
 static thread_local std::string fastllmPytoolsContextResult;
 
 extern "C" {
+    DLL_EXPORT bool start_autotune_recording(const char *path) {
+        try { return path && fastllm::StartAutotuneRecording(path); }
+        catch (...) { return false; }
+    }
+    DLL_EXPORT bool stop_autotune_recording() {
+        try { return fastllm::StopAutotuneRecording(); }
+        catch (...) { return false; }
+    }
     typedef void (*FastllmModelLoadProgressCallback)(const char *stage,
                                                      uint64_t current,
                                                      uint64_t total,
@@ -98,6 +110,64 @@ extern "C" {
 
     DLL_EXPORT void set_moe_cuda_cache(uint64_t bytes) {
         fastllm::SetMoeCudaCacheBytes(bytes);
+    }
+
+    DLL_EXPORT void set_moe_cuda_cache_device(int device, uint64_t bytes) {
+        fastllm::SetMoeCudaCacheDeviceBytes(device, bytes);
+    }
+
+    // CUDA ordinals obey CUDA_VISIBLE_DEVICES, unlike nvidia-smi indices.
+    DLL_EXPORT bool get_cuda_memory_info(int device, uint64_t *values) {
+#ifdef USE_CUDA
+        return values && FastllmCudaGetMemoryInfo(device, values[0], values[1]);
+#else
+        return false;
+#endif
+    }
+
+    DLL_EXPORT bool set_moe_cache_policy(float halfLife, int updateInterval,
+            int maxReplacements, uint64_t maxBytes, float minHeat, float margin,
+            float factor, int minimumResidence, float prefillPrior, bool rankByBytes) {
+        fastllm::MoeCacheConfig config;
+        config.halfLife = halfLife;
+        config.updateInterval = updateInterval;
+        config.maxReplacements = maxReplacements;
+        config.maxBytes = maxBytes;
+        config.minHeat = minHeat;
+        config.replacementMargin = margin;
+        config.replacementFactor = factor;
+        config.minimumResidence = minimumResidence;
+        config.prefillPrior = prefillPrior;
+        config.rankByBytes = rankByBytes;
+        try {
+            fastllm::SetMoeCacheConfig(config);
+            return true;
+        } catch (const std::invalid_argument &) {
+            return false;
+        }
+    }
+
+    DLL_EXPORT void set_moe_cpu_cache(uint64_t bytes) {
+        fastllm::SetMoeCpuCacheBytes(bytes);
+    }
+
+    DLL_EXPORT void get_disk_moe_cache_stats(uint64_t *values) {
+        auto s = fastllm::GetDiskMoeCacheStats();
+        uint64_t result[] = {s.cpuBytes, s.cudaBytes, s.cpuHits, s.cudaHits, s.misses,
+            s.diskBytes, s.uploads, s.cpuEvictions, s.cudaEvictions};
+        std::copy(result, result + 9, values);
+    }
+
+    DLL_EXPORT int get_disk_moe_cache_stats_v2(uint64_t *values, int capacity) {
+        auto s = fastllm::GetDiskMoeCacheStats();
+        const uint64_t result[] = {s.cpuBytes, s.cudaBytes, s.cpuHits, s.cudaHits, s.misses,
+            s.diskBytes, s.uploads, s.cpuEvictions, s.cudaEvictions,
+            s.cpuCudaOverlapBytes, s.cudaDemotions, s.cudaDemotionBytes,
+            s.cpuWorkspaceBytes, s.cpuBufferReuses, s.cpuBufferAllocations,
+            s.cpuReclaims, s.asyncMaintenance};
+        const int count = sizeof(result) / sizeof(result[0]);
+        if (values && capacity > 0) std::copy_n(result, std::min(capacity, count), values);
+        return count;
     }
 
     DLL_EXPORT void disable_cuda_malloc() {
@@ -272,13 +342,27 @@ extern "C" {
 
     static bool is_supported_tool_call_constraint_format(
             const std::string &format) {
-        return format == "deepseek_v4_dsml" || format == "dots_xml";
+        return format == "deepseek_v4_dsml" ||
+               format == "deepseek_v41_dsml" || format == "dots_xml";
     }
 
     static std::vector<std::string> default_tool_call_name_prefixes(
             const std::string &format, bool parameter) {
         if (format == "dots_xml") {
             return {parameter ? "<parameter name=\"" : "<invoke name=\""};
+        }
+        if (format == "deepseek_v41_dsml") {
+            // V4.1 renames every DSML tag with a leading space.
+            if (parameter) {
+                return {
+                    "<｜DSML｜ parameter name=\"",
+                    "<\\DSML\\ parameter name=\"",
+                };
+            }
+            return {
+                "<｜DSML｜ invoke name=\"",
+                "<\\DSML\\ invoke name=\"",
+            };
         }
         if (parameter) {
             return {
@@ -470,6 +554,29 @@ extern "C" {
         return -1;
     }
 
+    DLL_EXPORT int create_llm_model_from_gguf_with_context(
+            char *path, char *oriPath, char *mtpPath, char *mmprojPath,
+            int maxLength, char *ropeScaling) {
+        fastllmPytoolsContextResult.clear();
+        try {
+            std::lock_guard<std::mutex> guard(models.locker);
+            auto model = fastllm::CreateLLMModelFromGGUFFile(
+                path, oriPath, mtpPath == nullptr ? "" : mtpPath,
+                mmprojPath == nullptr ? "" : mmprojPath,
+                {maxLength, ropeScaling == nullptr ? "" : ropeScaling});
+            int id = models.models.size();
+            models.models[id] = std::move(model);
+            return id;
+        } catch (const std::exception &error) {
+            fastllmPytoolsContextResult = error.what();
+        } catch (const char *error) {
+            fastllmPytoolsContextResult = error == nullptr ? "unknown model initialization error" : error;
+        } catch (...) {
+            fastllmPytoolsContextResult = "unknown model initialization error";
+        }
+        return -1;
+    }
+
     DLL_EXPORT int create_llm_model_from_gguf(char *path, char *oriPath) {
         models.locker.lock();
         int id = models.models.size();
@@ -643,7 +750,8 @@ extern "C" {
 #else
             if (model->model_type == "laguna" ||
                 model->model_type == "kimi_k3" ||
-                model->model_type == "dots3_note") {
+                model->model_type == "dots3_note" ||
+                model->model_type == "naive_n05_flash") {
                 // Laguna's late-layer activations exceed the finite FP16
                 // range, while Kimi-K3's dedicated CUDA kernels and the
                 // Dots3-Note reference path consume BF16. Preserve BF16 in
@@ -682,6 +790,24 @@ extern "C" {
             fastllm::ErrorInFastLLM("set_model_atype error: atype should be float32, float16 or bfloat16.");
         }
         return;
+    }
+
+    DLL_EXPORT void set_model_indexer_dtype(int modelId, const char *dtype) {
+        std::string value = dtype;
+        fastllm::AssertInFastLLM(value == "auto" || value == "fp8" || value == "fp8_e4m3",
+                                "indexer_dtype should be auto, fp8 or fp8_e4m3.");
+        models.GetModel(modelId)->SetIndexerDataType(value == "auto"
+            ? fastllm::DATA_AUTO_NONE : fastllm::FP8_E4M3);
+    }
+
+    DLL_EXPORT void set_model_indexer_tp_storage(int modelId, const char *storage) {
+        const std::string value = storage;
+        fastllm::AssertInFastLLM(value == "replicated" || value == "layer_shard",
+                                "indexer_tp_storage should be replicated or layer_shard.");
+        auto *model = dynamic_cast<fastllm::NaiveN05FlashModel *>(models.GetModel(modelId));
+        fastllm::AssertInFastLLM(model || value == "replicated",
+                                "Indexer layer_shard storage currently supports Naive DSA models only.");
+        if (model) model->SetIndexerTPStorage(value == "layer_shard");
     }
 
     DLL_EXPORT void set_model_kv_cache_dtype(int modelId, char *kv_cache_dtype) {
@@ -909,6 +1035,11 @@ extern "C" {
         std::vector <float> imageInput;
         std::map <std::string, std::vector <fastllm::Data*> > *multimodalInput = new std::map <std::string, std::vector <fastllm::Data*> > ();
         std::string mode = multimodal_config["mode"].string_value();
+        if (mode == "deepseek_v41") {
+            // V4.1 receives already-expanded image token spans. Speculative
+            // decoding needs the complete prompt length to honor output limits.
+            config.input_token_length = input.size();
+        }
         const float *multimodalFloat = (const float*) multimodal_data;
 
         auto readShape = [](const json11::Json &node) {
@@ -1015,7 +1146,7 @@ extern "C" {
             fastllm::Data *mmTokenTypeIdsData = new fastllm::Data();
             mmTokenTypeIdsData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, mmTypeShape, mmTokenTypeIds));
             (*multimodalInput)["mm_token_type_ids"].push_back(mmTokenTypeIdsData);
-        } else if (mode == "qwen35") {
+        } else if (mode == "qwen35" || mode == "deepseek_v41") {
             if (multimodal_config["tensors"].is_array()) {
                 for (auto &tensorNode : multimodal_config["tensors"].array_items()) {
                     addTypedPayloadTensor(
@@ -1086,6 +1217,14 @@ extern "C" {
             handleId, output, maxTokens);
     }
 
+    DLL_EXPORT int fetch_response_tokens_batch_with_statistics_llm_model(
+            int modelId, int handleId, int *output, int maxTokens,
+            int *statistics) {
+        auto model = models.GetModel(modelId);
+        return model->FetchResponseTokensBatch(
+            handleId, output, maxTokens, statistics);
+    }
+
     DLL_EXPORT int fetch_response_logits_llm_model(int modelId, int handleId, float *logits) {
         auto model = models.GetModel(modelId);
         std::vector <float> retLogits;
@@ -1103,6 +1242,32 @@ extern "C" {
         }
         auto model = models.GetModel(modelId);
         model->AddPromptCache(input);
+    }
+
+    DLL_EXPORT bool supports_kvmem_prefix_cache_llm_model(int modelId) {
+        return models.GetModel(modelId)->SupportsKvMemPrefixCache();
+    }
+
+    DLL_EXPORT const char *set_kvmem_llm_model(int modelId, bool enabled, int maxTokens,
+            int residentTokens, int sinkTokens, int recentTokens, int retrievalTokens,
+            int prefillTokens, unsigned long long hostBytes, int retrievalInterval) {
+        fastllmPytoolsContextResult.clear();
+        try {
+            fastllm::KvMemConfig config;
+            config.enabled = enabled;
+            config.maxTokens = maxTokens;
+            config.residentTokens = residentTokens;
+            config.sinkTokens = sinkTokens;
+            config.recentTokens = recentTokens;
+            config.retrievalTokens = retrievalTokens;
+            config.prefillTokens = prefillTokens;
+            config.retrievalInterval = retrievalInterval;
+            config.hostBytes = hostBytes;
+            models.GetModel(modelId)->ConfigureKvMem(config);
+        } catch (const std::exception &error) {
+            fastllmPytoolsContextResult = error.what();
+        }
+        return fastllmPytoolsContextResult.c_str();
     }
 
     DLL_EXPORT void set_kv_cache_limit_llm_model(int modelId, long long bytes) {
@@ -1146,6 +1311,10 @@ extern "C" {
     DLL_EXPORT void set_chunked_prefill_size_llm_model(int modelId, int size) {
         auto model = models.GetModel(modelId);
         model->SetChunkedPrefillSize(size);
+    }
+
+    DLL_EXPORT bool set_prefill_batching_llm_model(int modelId, int tokens, int maxWaitMs) {
+        return models.GetModel(modelId)->SetPrefillBatching(tokens, maxWaitMs);
     }
 
     DLL_EXPORT void set_verbose_llm_model(int modelId, bool verbose) {

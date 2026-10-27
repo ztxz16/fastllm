@@ -136,6 +136,7 @@
           </div>
           <div class="topbar-actions">
             <button id="open-webui" class="primary-button" type="button" data-open-view="webui" disabled>打开工作室</button>
+            <button id="open-api-info" class="secondary-button" type="button" disabled>API 信息</button>
             <button id="open-endpoint" class="secondary-button" type="button" disabled>打开服务</button>
             <button id="stop-runtime" class="secondary-button danger hidden" type="button">■ 停止</button>
           </div>
@@ -163,6 +164,20 @@
         </div>
       </main>
     </div>
+
+    <dialog id="api-info-dialog" class="automatic-config-dialog api-info-dialog" aria-labelledby="api-info-title" aria-describedby="api-info-description">
+      <div class="automatic-config-dialog-heading">
+        <div><h2 id="api-info-title">API 信息</h2><p id="api-info-description">当前服务的连接配置。远程访问时，请使用服务器地址并开放或转发对应端口。</p></div>
+        <button id="api-info-close" class="small-button" type="button" aria-label="关闭窗口">×</button>
+      </div>
+      <label class="field"><span>Base URL</span><input id="api-info-url" type="text" readonly></label>
+      <label class="field"><span>模型名称</span><input id="api-info-model" type="text" readonly></label>
+      <label class="field"><span>API Key</span><input id="api-info-key" type="password" readonly autocomplete="off"></label>
+      <div class="automatic-config-dialog-actions">
+        <button id="api-info-reveal" class="secondary-button" type="button" aria-pressed="false">显示 API Key</button>
+        <button id="api-info-copy" class="primary-button" type="button">复制 API 信息</button>
+      </div>
+    </dialog>
 
     <dialog id="automatic-config-dialog" class="automatic-config-dialog" aria-labelledby="automatic-config-dialog-title" aria-describedby="automatic-config-dialog-description">
       <div class="automatic-config-dialog-heading">

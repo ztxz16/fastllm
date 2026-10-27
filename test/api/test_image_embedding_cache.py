@@ -1,5 +1,7 @@
 import argparse
 import copy
+import contextlib
+import io
 import os
 import sys
 import unittest
@@ -9,7 +11,11 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "tools")))
 from fastllm_pytools.qwen35_multimodal_native import build_qwen35_multimodal_payload
-from fastllm_pytools.util import apply_image_embedding_cache_env, make_normal_parser
+from fastllm_pytools.util import (
+    apply_image_embedding_cache_env,
+    apply_vision_device_env,
+    make_normal_parser,
+)
 
 
 class ImageEmbeddingCacheTest(unittest.TestCase):
@@ -114,6 +120,36 @@ class ImageEmbeddingCacheTest(unittest.TestCase):
             self.assertEqual(os.environ["FASTLLM_IMAGE_EMBEDDING_CACHE_BYTES"], str(1 << 30))
         apply_image_embedding_cache_env(argparse.Namespace(image_embedding_cache=0))
         self.assertEqual(os.environ["FASTLLM_IMAGE_EMBEDDING_CACHE_BYTES"], "0")
+
+    def test_cli_vision_device_and_environment(self):
+        parser = make_normal_parser("test")
+        self.assertIsNone(parser.parse_args([]).vision_device)
+        with patch.dict(os.environ, {"FASTLLM_QWEN35_VISION_DEVICE": "cpu"}):
+            apply_vision_device_env(parser.parse_args([]))
+            self.assertEqual(os.environ["FASTLLM_QWEN35_VISION_DEVICE"], "cpu")
+            apply_vision_device_env(parser.parse_args(["--vision_device", "auto"]))
+            self.assertEqual(os.environ["FASTLLM_QWEN35_VISION_DEVICE"], "auto")
+        for option in ("--vision_device", "--vision-device"):
+            args = parser.parse_args([option, "cpu"])
+            self.assertEqual(args.vision_device, "cpu")
+            apply_vision_device_env(args)
+            self.assertEqual(os.environ["FASTLLM_QWEN35_VISION_DEVICE"], "cpu")
+        apply_vision_device_env(argparse.Namespace(vision_device="cuda:1"))
+        self.assertEqual(os.environ["FASTLLM_QWEN35_VISION_DEVICE"], "cuda:1")
+        apply_vision_device_env(argparse.Namespace(vision_device="  "))
+        self.assertEqual(os.environ["FASTLLM_QWEN35_VISION_DEVICE"], "auto")
+
+    def test_vision_device_validation(self):
+        parser = make_normal_parser("test")
+        for value in ("gpu", "cuda:", "cuda:-1", "cuda:abc", "cuda:1,2", "cuda:2147483648"):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(["--vision_device", value])
+                with patch.dict(os.environ, {"FASTLLM_QWEN35_VISION_DEVICE": value}):
+                    with self.assertRaises(argparse.ArgumentTypeError):
+                        apply_vision_device_env(parser.parse_args([]))
+        apply_vision_device_env(argparse.Namespace(vision_device=" CUDA:01 "))
+        self.assertEqual(os.environ["FASTLLM_QWEN35_VISION_DEVICE"], "cuda:1")
 
 
 if __name__ == "__main__":

@@ -469,13 +469,19 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .save-state.failed { background: var(--danger-soft); color: var(--danger); }
 
 .simple-profile { width: min(100%, 760px); }
+.runtime-auto-profile .editor-navigation,
+.runtime-auto-profile #editor-speculative,
+.runtime-auto-profile #editor-hybrid,
+.runtime-auto-profile #editor-advanced,
+.runtime-auto-profile [data-inference-setting],
+.runtime-auto-profile .speculative-auto-option { display: none; }
 .model-selection-section { padding: 4px 0 24px; }
 .configuration-mode-section { padding: 22px 0 8px; border-top: 1px solid var(--line); }
 .setup-section-heading { display: flex; align-items: center; gap: 10px; margin-bottom: 15px; }
 .setup-section-heading > span { display: grid; width: 26px; height: 26px; place-items: center; border-radius: 8px; background: var(--primary-soft); color: var(--primary); font-size: 11px; font-weight: 700; }
 .setup-section-heading h3 { margin: 0; color: #25352e; font-size: 14px; }
 .model-selection-section .path-input-with-button input { height: 42px; }
-.configuration-mode-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.configuration-mode-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .configuration-mode-card { display: flex; align-items: flex-start; gap: 9px; padding: 16px 12px; border: 1px solid var(--line); border-radius: 11px; cursor: pointer; transition: border-color .15s, background .15s; }
 .configuration-mode-card:hover { border-color: #a5cbb7; }
 .configuration-mode-card:has(input:checked) { border-color: var(--primary); background: var(--primary-soft); }
@@ -488,6 +494,14 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .speculative-auto-option input { flex: 0 0 auto; margin: 3px 0 0; accent-color: var(--primary); }
 .speculative-auto-option strong { display: block; color: #25352e; font-size: 13px; }
 .speculative-auto-option small { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.automatic-resource-limits { margin-top: 14px; padding: 13px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface-soft); }
+.automatic-resource-limits-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 0; cursor: pointer; list-style: none; }
+.automatic-resource-limits-heading::-webkit-details-marker { display: none; }
+.automatic-resource-limits-heading::before { content: "›"; color: var(--primary); font-size: 17px; line-height: 1; transform: rotate(0deg); transition: transform .15s ease; }
+.automatic-resource-limits[open] .automatic-resource-limits-heading { margin-bottom: 10px; }
+.automatic-resource-limits[open] .automatic-resource-limits-heading::before { transform: rotate(90deg); }
+.automatic-resource-limits-heading strong { flex: 1; color: #43574b; font-size: 12px; }
+.automatic-resource-limits-heading small { color: var(--subtle); font-size: 10px; }
 .profile-validation .validation-message { color: #a43340; background: #fff0f1; }
 .folder-picker-entry.selected { color: var(--primary); background: var(--primary-soft); }
 .folder-picker-entry-icon.file-icon { width: 14px; height: 18px; border-radius: 2px; }
@@ -504,6 +518,8 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .automatic-config-dialog-heading p { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .automatic-config-dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
 .automatic-config-dialog-error { color: #a43340; font-size: 12px; line-height: 1.6; }
+.api-info-dialog .field { display: grid; gap: 8px; margin-block: 16px; }
+.api-info-dialog input { width: 100%; min-width: 0; box-sizing: border-box; }
 .automatic-config-status {
   margin-top: 12px;
   padding: 11px 12px;
@@ -679,6 +695,27 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .view-hero.compact-hero,
 .view-hero.hardware-hero,
 .view-hero.download-hero { min-height: 128px; }
+
+.download-catalog { display: grid; gap: 12px; margin-top: 2px; }
+.download-catalog-group { padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: linear-gradient(135deg, #ffffff 0%, #f8fbf9 100%); box-shadow: var(--shadow); }
+.download-catalog-group.accent-violet { background: linear-gradient(135deg, #ffffff 0%, #faf8ff 100%); }
+.download-catalog-group.accent-orange { background: linear-gradient(135deg, #ffffff 0%, #fffaf3 100%); }
+.download-catalog-group.accent-slate { background: linear-gradient(135deg, #ffffff 0%, #f7f9fb 100%); }
+.download-catalog-heading { display: flex; align-items: center; gap: 18px; cursor: pointer; list-style: none; }
+.download-catalog-heading::-webkit-details-marker { display: none; }
+.download-catalog-heading::before { content: "›"; flex-shrink: 0; color: var(--primary); font-size: 17px; line-height: 1; transition: transform .15s ease; }
+.download-catalog-group[open] > .download-catalog-heading::before { transform: rotate(90deg); }
+.download-catalog-heading > div { flex-shrink: 0; }
+.download-catalog-heading > p { margin-left: auto; }
+.download-catalog-eyebrow { color: var(--primary); font-size: 9px; font-weight: 780; letter-spacing: 1.2px; }
+.download-catalog-group h2 { margin-top: 4px; font-size: 15px; letter-spacing: -.2px; }
+.download-catalog-group p { max-width: 560px; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.download-catalog-models { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; margin-top: 14px; }
+.download-model-option { display: grid; gap: 5px; min-width: 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255, 255, 255, .82); color: var(--ink); text-align: left; cursor: pointer; transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease, background .16s ease; }
+.download-model-option:hover, .download-model-option:focus-visible { border-color: #93c8ab; background: white; box-shadow: 0 6px 16px rgba(29, 74, 51, .1); transform: translateY(-1px); }
+.download-model-option[aria-pressed="true"] { border-color: var(--primary); background: var(--primary-soft); box-shadow: inset 0 0 0 1px var(--primary); }
+.download-model-option strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.download-model-option small { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 
 .download-layout { display: grid; grid-template-columns: minmax(0, 1fr) 310px; align-items: start; gap: 14px; margin-top: 14px; }
 .download-status-card {
@@ -877,6 +914,8 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .editor-navigation { gap: 1px; }
   .editor-navigation button { flex: 1; min-width: 0; padding: 10px 4px; font-size: 11px; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }
   #profile-parameters > .form-section, #profile-parameters > .advanced-section { scroll-margin-top: 95px; }
+  .download-catalog-heading { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; }
+  .download-catalog-heading > p { grid-column: 2; margin-left: 0; }
   .configuration-mode-options, .automatic-mode-options { grid-template-columns: 1fr; }
   .configuration-mode-card { padding: 13px; }
   .configuration-mode-card small { margin-top: 4px; }

@@ -20,6 +20,10 @@
 #include <vector>
 
 namespace fastllm {
+    class CudaWorkspace;
+    struct Qwen35VisionTPState;
+    struct Qwen35DFlashTpMlpWorkspace;
+
     class Qwen3_5Model: public basellm {
     public:
     Qwen3_5Model (); // 构造函数
@@ -99,7 +103,12 @@ namespace fastllm {
         virtual bool NeedAttentionMask(int qlen, int klen);
 
         virtual void WarmUp(); // 预热
+        void Prepare() override; // 在 KV cache 定容前预分配视觉工作区
 
+        bool SupportsKvMem() const override { return true; }
+        uint64_t KvMemLayerBytesPerToken(int) const override { return 4ULL * num_key_value_heads * head_dim; }
+        bool KvMemLayerEligible(int layer) const override;
+        void ValidateKvMemModel(const KvMemConfig &config) const override;
         virtual bool CanUseGPUForward() const override;
 
         virtual void OnAutoWarmupFinished() override;
@@ -188,7 +197,8 @@ namespace fastllm {
                 bool firstTensorParallelRank,
                 int pagedCacheLayerOffset,
                 Data &logits,
-                Data *precomputedHiddenStates = nullptr);
+                Data *precomputedHiddenStates = nullptr,
+                bool preserveNativeLogits = false);
 
         bool ForwardSingleGPUDecodeGraph(
                 int gpuId,
@@ -233,10 +243,30 @@ namespace fastllm {
 
         int num_k_heads, num_v_heads, head_k_dim, head_v_dim;
         int mtp_num_hidden_layers = 0;
+        struct MtpDraftPrefixGraph;
         struct MtpKvCache {
             Data key;
             Data value;
             int tokens = 0;
+            // The actual proposal distribution belongs to this chain.
+            // Truncate only changes KV, never the saved proposal or tokens.
+            bool sampleProposal = false;
+            bool proposalUsesLogits = false;
+            bool deferProposalTokens = false;
+            GenerationConfig proposalConfig;
+            Data proposalProbs;
+            Data proposalLogsumexp;
+            Data proposalDeviceTokens;
+            Data proposalFloatTokens;
+            std::map<int, std::shared_ptr<MtpDraftPrefixGraph> > prefixGraphs;
+            std::vector<int> proposalTokens;
+            void BeginProposal(const GenerationConfig &config) {
+                sampleProposal = !config.IsSimpleGreedy();
+                proposalConfig = config;
+                proposalTokens.clear();
+                proposalUsesLogits = false;
+                deferProposalTokens = false;
+            }
             // TP parents keep only global shape/length; each rank owns its pages.
             std::map<int, std::unique_ptr<MtpKvCache> > shards;
 
@@ -279,13 +309,37 @@ namespace fastllm {
         bool speculativeCacheOnlyForward = false;
         Data speculativeHiddenStates;
         std::vector <Data> speculativeDFlashHiddenStates;
-        std::vector<unsigned char> speculativeTypicalAccepted;
+        std::vector<unsigned char> speculativeMtpAccepted;
+        std::vector<MtpKvCache*> speculativeMtpSamplingContexts;
         DFlashContext *speculativeDFlashSamplingContext = nullptr;
         std::vector<DFlashContext*> speculativeDFlashSamplingContexts;
         std::vector<unsigned char> speculativeDFlashAccepted;
         bool speculativeCaptureFirstTokenLinearState = false;
         int speculativeLinearStateCaptureSlots = 0;
         std::vector<std::vector<std::pair<Data, Data> > > speculativeLinearStates;
+        // Large DFlash batches retain small activations instead of one full
+        // recurrent matrix per candidate token. Entries are rank-local and
+        // prepared before TP workers run; workers never mutate the map itself.
+        struct DFlashLinearReplay {
+            Data input, conv, ba;
+            // Eager verification writes these owned scratch states, then swaps
+            // their buffers with the live states. Scratch retains the originals.
+            std::vector<Data*> stateOutputs;
+            bool statesExchanged = false;
+            Data *norm = nullptr, *aLog = nullptr, *dtBias = nullptr;
+            int keyHeads = 0, valueHeads = 0;
+            bool ready = false;
+        };
+        bool speculativeCaptureLinearReplay = false;
+        std::vector<std::map<int, std::unique_ptr<DFlashLinearReplay>>> dflashLinearReplay;
+        // Verify graphs capture addresses in this scratch storage.
+        unsigned long long speculativeLinearStateGeneration = 0;
+        // Single-request verification scratch, serialized by mtpCacheMutex.
+        // Paged-cache views are detached on scope exit; only owned GDN storage
+        // and fully overwritten prefix snapshots survive between rounds.
+        int singleMtpScratchDevice = -1;
+        std::vector<std::pair<Data, Data> > singleMtpValidationScratch;
+        std::vector<std::vector<std::pair<Data, Data> > > singleMtpPrefixScratch;
         std::vector<std::vector<int> > speculativeLinearCaptureMask;
         std::vector<std::pair<Data, Data> > speculativeFirstTokenLinearStates;
         std::vector<int> speculativeFirstTokenLinearCaptureMask;
@@ -322,6 +376,11 @@ namespace fastllm {
         std::set<int> ggufGdnRestoredLayers;
         std::vector <int> mrope_sections = {11, 11, 10};
         bool visionPrepared = false;
+        bool multimodalWarmedUp = false;
+        int visionWorkspaceMaxPatches = 0;
+        std::shared_ptr<CudaWorkspace> visionWorkspace;
+        std::shared_ptr<Qwen35VisionTPState> visionTP;
+        std::string visionDevice = "auto";
         int vision_depth = 0;
         int vision_hidden_size = 0;
         int vision_num_heads = 0;
@@ -363,10 +422,18 @@ namespace fastllm {
         bool streamingCudaLoadEnabled = false;
         int streamingCudaCurrentLoadGroup = -1;
         std::unordered_map <int, Data*> mtpDraftLmHeadWeights;
+        // Present only for a successfully prepared TP shortlist. Empty rank
+        // vectors mean that rank owns no candidate; target-head shards stay intact.
+        std::unordered_map<int, std::vector<int>> mtpDraftTpTokenIds;
         PersistentWorkerGroup threadTpWorkerGroup;
 
         bool dflashEnabled = false;
         bool dflashWeightsPrepared = false;
+        Data dflashNvfp4DraftLmHead;
+        std::unordered_map<int, Data> dflashDraftLmHeads;
+        // Logical IDs only: aligned duplicate rows are removed before top-k.
+        std::unordered_map<int, std::vector<int>> dflashDraftTokenIds;
+        std::unordered_map<std::string, Data> dflashNvfp4ViewWeights;
         int dflashWeightsPreparedDevice = -1;
         bool dflashTpBackboneDecisionMade = false;
         bool dflashTpBackbonePrepared = false;
@@ -389,9 +456,8 @@ namespace fastllm {
         float dflashRmsNormEps = 1e-6f;
         float dflashRopeTheta = 10000000.0f;
         std::vector <int> dflashTargetLayerIds;
-        Data dflashSinData;
-        Data dflashCosData;
-        int dflashRotaryCapacity = 0;
+        Data dflashRopeInvFreq;
+        float dflashRopeInvFreqTheta = 0.0f;
 
         void SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix);
         void PrepareMoeWeights();
@@ -418,6 +484,8 @@ namespace fastllm {
                 std::map<int, int> ratios);
 #endif
         void PrepareVision();
+        void BuildMultimodalTextEmbeddings(const Data &inputIds, Data &hiddenStates);
+        void SplitMultimodalTextEmbeddings(const Data &hiddenStates, int start, int end, Data &chunk);
         Data BuildFlattenedPositionIds(const std::vector <Data*> &positionIds,
                                       const std::vector <int> &seqLens,
                                       bool all1);
@@ -425,7 +493,8 @@ namespace fastllm {
                                              const Data *imageEmbeds,
                                              const Data *videoEmbeds,
                                              Data &hiddenStates);
-        void ApplyVisionRotary(Data &input, const Data &posX, const Data &posY);
+        void ApplyVisionRotary(Data &input, const Data &posX, const Data &posY,
+                               Data &sinData, Data &cosData);
         void EncodeVisualItems(const std::vector <Data*> &rawInputs,
                                const Data *gridThwData,
                                bool isVideo,
@@ -450,11 +519,17 @@ namespace fastllm {
         int DFlashDraftsPerStep() const;
         void PrepareDFlashWeightsForDevice(int device);
         void PrepareDFlashBackboneTensorParallelWeights(int device);
+        bool PrepareDFlashDraftShortlist(const std::vector<int> &devices);
+        void MapDFlashShortlistCandidates(Data &candidates) const;
+        void RunDFlashLmHead(int device, Data &input, Data &originalHead, const Data &bias, Data &output,
+                            bool useShortlist = false);
+        void RunDFlashLinear(Data &input, Data &weight, const Data &bias, Data &output, Data *halfInputScratch = nullptr);
         void RunDFlashGateupLinear(int device, Data &input,
                                    Data &linearWeight, Data &output);
         bool RunDFlashTensorParallelMlp(int device, Data &input,
                                        Data &gateupWeight,
-                                       Data &downWeight, Data &output);
+                                       Data &downWeight, Data &output,
+                                       Qwen35DFlashTpMlpWorkspace *workspace = nullptr);
         void RunDFlashDynamicConvolutionFallback(
                 const Data &source, Data &dynamicProjection,
                 Data &baseKernel, int side, int blockSize, Data &output);
@@ -462,7 +537,7 @@ namespace fastllm {
                 const float *candidateTopK, const float *selectorHidden,
                 int anchorToken, const GenerationConfig &generationConfig,
                 DFlashContext &context);
-        void EnsureDFlashRotary(int positions, int device);
+        void PrepareDFlashRotary(int device);
         void AppendDFlashTargetHidden(int device, int tokens,
                                       DFlashContext &context);
         std::vector<int> RunDFlashDraft(int device,
@@ -470,14 +545,6 @@ namespace fastllm {
                                        int anchorToken,
                                        const GenerationConfig &generationConfig,
                                        DFlashContext &context);
-        void RunDFlashDraftForward(int device,
-                                  const std::vector<int> &devices,
-                                  int anchorToken, DFlashContext &context,
-                                  Data &candidateTopK, Data &selectorHidden);
-        bool RunDFlashDraftGraph(int device,
-                                const std::vector<int> &devices,
-                                int anchorToken, DFlashContext &context,
-                                Data &candidateTopK, Data &selectorHidden);
         std::vector<std::vector<int> > RunDFlashDraftBatch(
                 int device, const std::vector<int> &devices,
                 const std::vector<int> &anchorTokens,
@@ -490,6 +557,10 @@ namespace fastllm {
         bool RequiresDFlashPrefixSnapshot(const ResponseContext *context) const;
         void AddMtpRmsNormOffset();
         void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
+        void PrepareMtpNvfp4DraftWeights(int device);
+        Data mtpNvfp4DraftLmHead;
+        std::vector<int> mtpDraftTokenIds;
+        Data mtpDraftTokenIdsCuda;
         void RunMtpFeedForward(int device, Data &hiddenStates,
                                bool tensorParallel = false, bool firstRank = true);
         bool UseMtpBackboneTp(const std::vector<int> &devices) const;
@@ -502,17 +573,20 @@ namespace fastllm {
                 const std::vector<Data*> &positionIds,
                 const std::vector<int> &sampleRows,
                 std::vector<Data> *sampledHiddenStates, bool cacheOnly);
+        std::vector<int> SampleMtpDraftLogits(int device, Data &logits,
+                                             const std::vector<MtpKvCache*> &caches);
         void PrepareMtpDraftLmHeadWeights(const std::vector<int> &devices);
+        int MapMtpDraftTpToken(int device, int localId) const;
         Data BuildMtpPositionIds(const Data &positionIds, int row, int delta);
         Data BuildMtpPositionIdsSlice(const Data &positionIds, int begin, int end, int delta);
-        int RunMtpGreedyDraft(int device, const std::vector<int> &devices,
+        int RunMtpDraft(int device, const std::vector<int> &devices,
                               MtpKvCache &cache,
                               const Data &targetHiddenStates,
                               const std::vector<int> &inputTokens,
                               const Data &positionIds, int sampleRow,
                               Data *sampledHiddenStates = nullptr,
                               bool cacheOnly = false);
-        std::vector<int> RunMtpGreedyDraftBatch(
+        std::vector<int> RunMtpDraftBatch(
                               int device,
                               const std::vector<int> &devices,
                               const std::vector<MtpKvCache*> &caches,

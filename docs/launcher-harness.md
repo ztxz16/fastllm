@@ -37,6 +37,46 @@ ftllm launch
 
 Launcher 自动配置 FastLLM 提供方的 API 地址、模型名称、密钥和已识别的上下文容量。密钥只通过子进程环境传递。工作区选择器直接显示在嵌入页中。
 
+Launcher 根据 `/v1/models` 的 `input_modalities`（兼容 `inputModalities`）向 Harness 声明图片输入能力，让 `read_image` 可以读取原生视觉模型支持的图片。缺少元数据时只声明文本；不会根据模型别名猜测视觉能力。更新后需重启模型服务和 Harness，刷新能力声明与客户端配置。
+
+原生图片能力覆盖带视觉配置的 Qwen3.5 dense/MoE、Qwen3.8-Flash-Next、DeepSeek-V4.1、CogVLM、Gemma4 和 Step3.7；GGUF + mmproj 沿用投影器能力声明。缺少视觉配置或设置 `language_model_only` 的原生检查点保持仅文本。
+
+Launcher 设置 `compat.supportsDeveloperRole: false`，让 Harness 使用 `system` 发送系统提示词，避免 Qwen 模板拒绝 `developer` 角色。直接连接 API 时，Qwen3.5/3.8 服务也会将 `developer` 指令与显式 `system` 指令按原顺序合并为开头的系统消息，保留用户消息和工具调用记录。
+
+模型输出预算通过 `compat.maxTokensField: max_tokens` 发送，兼容只支持旧字段的 FastLLM 服务。新版服务也接受 `max_completion_tokens`；两者同时提供时，以非空的 `max_completion_tokens` 为准。
+
+默认单次输出预算为 `min(32768, contextWindowTokens / 2)`（至少 1 token），思考与正文、工具参数共用该预算。例如 64K 上下文允许最多 32K 输出，32K 上下文允许最多 16K 输出；旧版最多 8K 的预算可能在长思考期间耗尽。Pi 还会根据实际对话长度预估并缩小请求预算，因此提高输出预算不能消除上下文不足造成的截断。修改后需要重启 Harness 以重新生成提供方配置。
+
+## 流式连接与诊断
+
+Harness 的 `llm-pi-ai.providers.fastllm.streamIdleTimeoutMs` 控制等待模型有效输出的空闲时限，默认 300000 毫秒。SSE 注释心跳只维持传输连接，不会重置这个时限。若报错包含 `pi-ai stream idle timeout`，应结合排队和 prefill 耗时调整该配置。模型以 `finish_reason: length` 结束则表示本次输出预算耗尽，与网络断开不同。
+
+Harness 退出时，Launcher 将最近的日志尾部脱敏后保存到 `~/.fastllm/deepseek-harness/logs/latest.log`，上一份保存在 `previous.log`。每份读取最多 64 KiB，去掉边界处的不完整行；已知模型密钥、URL 中的令牌和 Authorization 值会隐藏。日志文件在 POSIX 上以 0600 权限创建。原始临时日志仍随启动目录清理。
+
+## 实验性恢复扩展（默认关闭）
+
+Launcher 默认不加载恢复扩展。需要试用时，在启动 Launcher 前显式设置环境变量（仅值 `1` 开启）：
+
+```bash
+FTLLM_HARNESS_EXPERIMENTAL_RECOVERY=1 ftllm launch
+```
+
+取消该环境变量并重启 Launcher 和 Harness 后恢复默认行为。角色兼容、输出预算、SSE 心跳和诊断日志独立于此开关。
+
+**已知限制：** 文本续写可能重复截断处的内容；headless 标准输出只包含最后一段回答，前面的片段需从会话记录读取；恢复额度耗尽时，最后生成的一段文本可能只保存在失败尝试中，没有进入正式回答。退出码 0 不保证续写后的完整文本无重复。这些问题仍待修复。
+
+启用后，扩展使用同一会话中的实际结果继续任务：
+
+- 文本达到输出上限后，保留前文并排队一个续写回合。
+- 只有思考、没有答案或工具调用时，要求模型减少思考并给出可用输出。
+- 工具调用被服务端拒绝或截断时，将恢复提示写入会话，再要求模型重建合法调用；被拒绝的调用不会执行，之前成功的工具结果继续保留。
+
+恢复提示带有插件来源并记录在会话中。每次用户输入默认最多自动恢复 2 次，续写和上述重试共用这个额度；达到上限后返回明确错误。用户取消后不发起恢复。摘要压缩、上下文超限、网络重试仍遵循 Harness 本身的策略。
+
+上述错误恢复期间若有待处理输入，扩展会保留队列、结束当前失败轮次，并交由 Harness 在新轮次正常读取输入。即时指令保持原有顺序，排队的后续任务仍各自进入独立轮次；即使恢复额度已耗尽，新输入也会优先处理。会话记录会将交接前的轮次标为扩展主动中止，随后记录新输入的执行结果。
+
+启用时，Launcher 生成的 patch 会插入 `fastllm-harness-recovery`，其 `config.maxRecoveries` 为 2。独立使用 Harness 时，可在 patch 的 `insert` 中加载已安装 ftllm 包目录内的 `harness_recovery.mjs`，配置 `provider: fastllm`、`maxRecoveries: 2`。`maxRecoveries` 可设为 0–10；0 只禁止自动重试和续写，仍会进行错误分类及待处理输入交接，不等于卸载扩展。扩展使用 Harness 的公开插件钩子，不修改 npm 依赖。
+
 ## 数据和生命周期
 
 - 默认配置和会话保存在 `~/.fastllm/deepseek-harness/home`，默认工作目录为 `~/.fastllm/deepseek-harness/workspace`，也可以在 Harness 中选择其他工作区。

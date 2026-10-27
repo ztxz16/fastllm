@@ -16,18 +16,29 @@ class FastLLmModel:
         is_glm5_next = self._is_glm5_next(model)
         is_qwen_reasoning = (
             self._is_qwen3_5(model) or self._is_qwen4_exp(model))
-        if is_kimi_k3 or is_glm5_next:
+        is_naive_n05 = self._is_naive_n05(model)
+        is_deepseek_v41 = self._is_deepseek_v41(model)
+        if is_naive_n05:
+            # Naive exposes a thinking switch; "low" enables thinking without
+            # imposing a smaller token budget. Keep local interactive use off
+            # by default, including Codex's auxiliary title generation turns.
+            reasoning_efforts = ["none", "low"]
+            default_reasoning_effort = "none"
+        elif is_kimi_k3 or is_glm5_next:
             reasoning_efforts = ["none", "low", "high", "max"]
             default_reasoning_effort = "max"
         elif is_qwen_reasoning:
             reasoning_efforts = ["none", "low", "medium", "xhigh"]
             default_reasoning_effort = "xhigh"
+        elif is_deepseek_v41:
+            reasoning_efforts = ["none", "low", "high", "max"]
+            default_reasoning_effort = "high"
         else:
             reasoning_efforts = []
             default_reasoning_effort = None
         input_modalities = (
             ["text", "image"]
-            if getattr(model, "mmproj_path", "") else ["text"])
+            if self._supports_image_input(model) else ["text"])
 
         context_window_candidates = [
             value for value in (current_model_context_window, kv_cache_token_limit)
@@ -52,7 +63,13 @@ class FastLLmModel:
                 "app_ids": [],
                 "hidden": False,
                 "default_reasoning_level": default_reasoning_effort or "low",
-                "supported_reasoning_levels": reasoning_efforts,
+                "supported_reasoning_levels": [
+                    {"effort": effort, "description": (
+                        "Disable thinking for faster responses." if effort == "none"
+                        else "Enable thinking." if is_naive_n05
+                        else f"Use {effort} reasoning effort.")}
+                    for effort in reasoning_efforts
+                ],
                 "supported_reasoning_efforts": reasoning_efforts,
                 "supportedReasoningEfforts": reasoning_efforts,
                 "default_reasoning_effort": default_reasoning_effort,
@@ -196,6 +213,55 @@ class FastLLmModel:
             return cls._positive_int(method())
         except Exception:
             return None
+
+    @classmethod
+    def _supports_image_input(cls, model):
+        if getattr(model, "mmproj_path", ""):
+            return True
+        config = getattr(model, "config", None)
+        if not isinstance(config, dict) or config.get("language_model_only"):
+            return False
+        architectures = config.get("architectures") or []
+        architecture = architectures[0] if isinstance(architectures, list) and architectures else ""
+        is_deepseek_v41 = (
+            architecture == "DeepseekV41ForCausalLM"
+            or config.get("model_type") in {"deepseek_v41", "deepseek_v41_text"})
+        vision_config = config.get("vision_config")
+        if not isinstance(vision_config, dict) or not vision_config:
+            # DeepSeek-V4.1 also accepts the flat native checkpoint config.
+            if not (is_deepseek_v41 and cls._positive_int(config.get("vision_n_layers"))):
+                return False
+        # Native HF vision models do not use a separate GGUF projector.
+        # Match launch_stream_response, whose Qwen image route also handles
+        # Flash-Next even though its text decoder is Qwen4Exp.
+        return cls._is_qwen3_5(model) or is_deepseek_v41 or architecture in {
+            "CogVLMForCausalLM", "Gemma4ForConditionalGeneration",
+            "Step3p7ForConditionalGeneration", "Qwen3_8FlashNextForConditionalGeneration",
+        }
+
+    @classmethod
+    def _is_deepseek_v41(cls, model):
+        config = getattr(model, "config", None)
+        if not isinstance(config, dict):
+            return False
+        architectures = config.get("architectures") or []
+        architecture = architectures[0] if isinstance(architectures, list) and architectures else ""
+        return (
+            architecture == "DeepseekV41ForCausalLM"
+            or config.get("model_type") in {"deepseek_v41", "deepseek_v41_text"}
+        )
+
+    @staticmethod
+    def _is_naive_n05(model):
+        get_type = getattr(model, "get_type", None)
+        if callable(get_type):
+            try:
+                if get_type() == "naive_n05_flash":
+                    return True
+            except Exception:
+                pass
+        config = getattr(model, "config", None)
+        return isinstance(config, dict) and config.get("model_type") == "naive_n05_flash"
 
     @staticmethod
     def _is_kimi_k3(model):

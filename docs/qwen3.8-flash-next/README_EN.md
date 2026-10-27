@@ -1,0 +1,226 @@
+# Qwen3.8-Flash-Next User Guide
+
+[中文](README.md) · [Project home](../../README_EN.md)
+
+This guide covers text serving with Qwen4-Exp / Qwen3.8-Flash-Next: hybrid inference, serial and parallel use of two GPUs, expert caching, fixed GPU expert layers, MTP, and API requests. The two-GPU examples use the NVFP4 model.
+
+## Prepare the model
+
+Install a FastLLM version that supports the model and prepare a complete local model directory containing its configuration, tokenizer, and Safetensors weights. Replace `/data/models/Qwen3.8-Flash-Next-NVFP4` with your model path.
+
+Hybrid inference requires enough host memory. Store the model on an SSD when using disk-backed PLE.
+
+## Automatic configuration (recommended)
+
+On Linux with NVIDIA CUDA, pass the complete HF/NVFP4 model directory:
+
+```sh
+ftllm server /data/models/Qwen3.8-Flash-Next-NVFP4 \
+  --auto --model_name qwen3.8-flash-next --host 0.0.0.0 --port 8080
+```
+
+For GSQ GGUF, pass the first shard and keep the remaining shards in the same directory. Replace the sample path with the actual filename:
+
+```sh
+ftllm server /data/models/Qwen3.8-Flash-Next-GSQ-RCO/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
+  --auto --model_name qwen3.8-flash-next --host 0.0.0.0 --port 8080
+```
+
+Only add options you want to override:
+
+| Adjustment | Append to the command |
+| --- | --- |
+| Limit planning resources | `--auto_gpu_memory_limit 20g --auto_host_memory_limit 128g` |
+| Set the session window | `--max_context_length 32768` |
+| Set concurrency | `--max_batch 2` |
+| Set the per-GPU expert cache | `--moe_cuda_cache 7g`; `0` disables it |
+| Set threads and prefill chunk size | `--threads 32 --chunked_prefill_size 4096` |
+| Set embedded MTP draft tokens | `--mtp 3`; requires matching weights; `0` disables it |
+| Load a matching external MTP model | `--draft /path/to/mtp.gguf` |
+| Disable all speculative decoding | `--speculative_algorithm off` |
+
+Resource limits are planning budgets, not runtime memory caps. `--auto` alone does not enable Flash-Next MTP. A supported external MTP GGUF defaults to 3 draft tokens; override with `--draft_tokens`. Automatic mode keeps prefix and history reuse enabled by default. See the [`--auto` tuning guide](../auto_en.md) for option effects and Launcher controls.
+
+The following commands are manual examples for fixed layouts and troubleshooting. Their thread counts and cache sizes are specific examples, not requirements for automatic mode.
+
+## Manual configuration reference
+
+Run the backbone on one GPU and the experts on the CPU NUMA backend:
+
+```bash
+ftllm server /data/models/Qwen3.8-Flash-Next-NVFP4 \
+  --model_name qwen3.8-flash-next \
+  --host 0.0.0.0 --port 8080 \
+  --device cuda --moe_device numa \
+  --atype float16 --ngram_device disk --threads 28 \
+  --chunked_prefill_size 4096 --gpu_mem_ratio 0.9 \
+  --prefix_cache true --enable_thinking false
+```
+
+After the model loads, connect clients to `http://SERVER:8080/v1` with the model name `qwen3.8-flash-next`. Adjust the thread count for your CPU's physical cores.
+
+<a id="deployment"></a>
+
+## Two-GPU hybrid deployment
+
+These examples target two **22 GiB RTX 2080 Ti cards**, an AMD EPYC 7452, and approximately 126 GiB of host memory. Standard 11 GiB cards require smaller expert caches or fewer GPU-resident expert layers.
+
+Set the common options in Bash, then choose one deployment command:
+
+```bash
+MODEL=/data/models/Qwen3.8-Flash-Next-NVFP4
+unset FASTLLM_TP
+export CUDA_VISIBLE_DEVICES=0,1
+export FASTLLM_CUDA_GRAPH=0
+
+COMMON=(
+  --model_name qwen3.8-flash-next
+  --host 0.0.0.0 --port 8080
+  --atype float16 --ngram_device disk --threads 28
+  --mtp 3 --temperature 0 --top_k 1 --repeat_penalty 1
+  --max_batch 1 --kv_cache_limit 1g --gpu_mem_ratio 0.95
+  --chunked_prefill_size 4096
+  --prefix_cache true --enable_thinking false
+)
+```
+
+These examples disable CUDA Graph and enable prefix caching for repeated text requests. Change `--mtp 3` to `--mtp 0` if the model has no MTP weights or you want ordinary decoding.
+
+### Serial GPUs: expert cache off or on
+
+Serial deployment places consecutive backbone layers on each GPU. `cudapp=2` splits the backbone evenly between two cards.
+
+```bash
+# Expert cache disabled
+ftllm server "$MODEL" "${COMMON[@]}" \
+  --device cudapp=2 --moe_device numa --moe_cuda_cache 0
+
+# 8 GiB of expert cache per GPU
+ftllm server "$MODEL" "${COMMON[@]}" \
+  --device cudapp=2 --moe_device numa --moe_cuda_cache 8g
+```
+
+### Parallel GPUs: expert cache off or on
+
+`--tp 2` makes both GPUs work on each layer. Use it without `cudapp`.
+
+```bash
+# Expert cache disabled
+ftllm server "$MODEL" "${COMMON[@]}" \
+  --tp 2 --moe_device numa --moe_cuda_cache 0
+
+# 8 GiB of expert cache per GPU
+ftllm server "$MODEL" "${COMMON[@]}" \
+  --tp 2 --moe_device numa --moe_cuda_cache 8g
+```
+
+`--moe_cuda_cache 8g` sets a **per-GPU** budget, approximately 16 GiB across two GPUs. Leave room for backbone weights, KV cache, and temporary computation buffers.
+
+### Fixed GPU expert layers with tensor parallelism
+
+Disable the dynamic expert cache and place all experts from the first 12 layers on the GPUs, with the remaining 36 layers on NUMA:
+
+```bash
+ftllm server "$MODEL" "${COMMON[@]}" \
+  --tp 2 --moe_device numa --moe_device_layers 36 --moe_cuda_cache 0
+```
+
+`--moe_device_layers 36` means the **last 36 layers** use `--moe_device numa`. Experts in the first 12 layers are sharded across both GPUs. Reducing this number places more layers on the GPUs and uses more VRAM.
+
+### Fixed GPU expert layers with serial GPUs
+
+Use the following paired backbone and expert mappings:
+
+```bash
+ftllm server "$MODEL" "${COMMON[@]}" \
+  --device cudapp=1:7 \
+  --moe_device "{'cuda:0':6,'cuda:1':6,'numa':36}" \
+  --moe_cuda_cache 0
+```
+
+Backbone layers 0–5 run on GPU0 and layers 6–47 on GPU1. Experts in layers 0–5 reside on GPU0, layers 6–11 on GPU1, and the last 36 layers and MTP experts use NUMA. When changing layer counts, adjust both mappings so GPU experts share a device with their corresponding backbone layer.
+
+Fixed placement allocates VRAM for every expert in selected layers. Dynamic caching retains experts based on access patterns. Their speed and memory requirements differ.
+
+<a id="parameters"></a>
+
+## Common options
+
+| Option | Purpose |
+| --- | --- |
+| `--device cuda` | Single-GPU backbone |
+| `--device cudapp=2` | Backbone layers split serially across two GPUs |
+| `--tp 2` | Two-GPU tensor parallelism |
+| `--moe_device numa` | Run experts on the CPU NUMA backend |
+| `--moe_cuda_cache 0` / `8g` | Disable expert caching / set an 8 GiB per-GPU budget |
+| `--moe_device_layers 36` | Last 36 expert layers use the specified MoE device |
+| `--ngram_device disk` | Read PLE rows from disk to reduce resident host memory |
+| `--ngram_device cpu` | Keep the PLE table in host memory |
+| `--threads 28` | CPU compute threads |
+| `--mtp 0` / `3` | Disable MTP / propose up to 3 draft tokens per step |
+| `--chunked_prefill_size 4096` | Process up to 4096 input tokens per chunk |
+| `--kv_cache_limit 1g` | KV budget; adjust for context length and concurrency |
+| `--gpu_mem_ratio 0.95` | Fraction of available GPU memory to use |
+| `--prefix_cache true` | Reuse repeated text prefixes across requests |
+| `--max_context_length` | Context limit, subject to model and cache capacity |
+| `--enable_thinking true` | Enable thinking mode |
+
+### MTP
+
+MTP requires matching MTP weights in the model directory and a CUDA backbone. Experts may run on CUDA or NUMA. The maximum `--mtp` value is 8; start with 3 and adjust for your workload. Speed depends on draft acceptance. The two-GPU TP examples use greedy sampling: `--temperature 0 --top_k 1 --repeat_penalty 1`.
+
+### Memory and context length
+
+Use `--ngram_device disk` when host memory is limited. If VRAM is insufficient, reduce the expert cache or GPU-resident layer count, then adjust KV capacity, chunk size, and concurrency for your requests.
+
+Larger prefill chunks reduce the number of chunks for long inputs but require more temporary VRAM. Prefix caching reuses text prefixes; expert caching retains expert weights. They are independent settings.
+
+<a id="api"></a>
+
+## Call the service
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.8-flash-next",
+    "messages": [{"role": "user", "content": "Introduce yourself in three sentences."}],
+    "max_tokens": 512,
+    "temperature": 0,
+    "stream": false
+  }'
+```
+
+For remote requests, replace `127.0.0.1` with the server address. If you set `--api_key` at startup, include an `Authorization: Bearer YOUR_KEY` header.
+
+To use a browser chat interface:
+
+```bash
+ftllm webui --api_base http://127.0.0.1:8080/v1
+```
+
+WebUI connects to the running API service. For tool calls, add `--tool_call_parser auto` to the server command and send the standard `tools` field in API requests.
+
+<a id="performance"></a>
+
+## Performance reference
+
+See the [benchmark](../benchmarks/qwen4_exp_en.md) for configuration, throughput, memory and validation scope.
+
+<a id="gguf-resident-performance"></a>
+
+### GPU-resident GGUF experts
+
+Place all shards together and select the first shard. This configuration uses TP2 with all experts on GPU, embedding on CPU and PLE on disk. Use hybrid deployment when GPU memory is insufficient.
+
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 FASTLLM_CUDA_GRAPH=1 FT_NUMAS=1 \
+ftllm server /data/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+  --tp 2 --device cuda:0,1 --moe_device cuda:0,1 \
+  --atype float16 --low_gpu_mem --ngram_device disk --threads 28 \
+  --moe_cuda_cache 0 --mtp 0 --max_batch 1 --tokens 8192 \
+  --kv_cache_limit 1g --gpu_mem_ratio 0.95 --chunked_prefill_size 1024 \
+  --prefix_cache false --cache_history false --enable_thinking false \
+  --temperature 0 --top_k 1 --repeat_penalty 1
+```

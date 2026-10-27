@@ -30,10 +30,10 @@
 |              模型  | 加载后转换 |  离线转换  |  直接读取  |
 |-----------------: |------------|------------|------------|
 | THUDM/ChatGLM-6b | [✔](#chatglm系列) | [✔](#chatglm模型导出-默认脚本导出chatglm2-6b模型) |  |
-| THUDM/ChatGLM-6b-int8 | [✔](#Cchatglm系列) | ❌ |  |
+| THUDM/ChatGLM-6b-int8 | [✔](#chatglm系列) | ❌ |  |
 | THUDM/ChatGLM-6b-int4 | [✔](#chatglm系列) | ❌ |  |
 | THUDM/ChatGLM2-6b | [✔](#chatglm系列) | [✔](#chatglm模型导出-默认脚本导出chatglm2-6b模型) |  |
-| THUDM/glm-large-chinese |  | [✔](tools\scripts/glm_export.py) | |
+| THUDM/glm-large-chinese |  | [✔](../tools/scripts/glm_export.py) | |
 | THUDM/ChatGLM2-6b-int8 | [✔](#chatglm系列) | ❌ |  |
 | THUDM/ChatGLM2-6b-int4 | [✔](#chatglm系列) | ❌ |  |
 | THUDM/ChatGLM2-6b-32k | [✔](#chatglm系列) | [✔](#chatglm模型导出-默认脚本导出chatglm2-6b模型) |  |
@@ -85,6 +85,7 @@
 | deepseek-ai/Deepseek-Coder-6.7B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
 | deepseek-ai/Deepseek-Coder-7B-Instruct v1.5 | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
 | deepseek-ai/deepseek-coder-33b-instruct     | [√](llama_cookbook.md#deepseek-coder) | [√](llama_cookbook.md#deepseek-coder) | ✔ |
+| deepseek-ai/DeepSeek-V4.1-Flash（[说明](deepseek_v41.md)） | ✔ | ✔ | ✔ |
 | deepseek-ai/DeepSeek-V2-Chat                | √ | ✔ | √ |
 | deepseek-ai/DeepSeek-V2-Lite-Chat           | √ | ✔ | ✔ |
 | deepseek-ai/DeepSeek-Coder-V2-Instruct      | √ | ✔ | √ |
@@ -114,8 +115,8 @@
 | 01-ai/Yi-Coder-1.5B-Chat | [✔](llama_cookbook.md#yi) | [✔](llama_cookbook.md#yi) | ✔<sup>4</sup> |
 | 01-ai/Yi-Coder-9B-Chat | [✔](llama_cookbook.md#yi) | [✔](llama_cookbook.md#yi) | ✔<sup>4</sup> |
 |  |  |  |  |
-| meta-llama/Meta-Llama-3-8B-Instruct |  | [✔](tools/scripts/llama3_to_flm.py) | ✔ |
-| meta-llama/Meta-Llama-3-70B-Instruct |  | [✔](tools/scripts/llama3_to_flm.py) | ✔ |
+| meta-llama/Meta-Llama-3-8B-Instruct |  | [✔](../tools/scripts/llama3_to_flm.py) | ✔ |
+| meta-llama/Meta-Llama-3-70B-Instruct |  | [✔](../tools/scripts/llama3_to_flm.py) | ✔ |
 
 > 注4： Python ftllm用AutoTokenizer而不使用Fastllm Tokenizer可以实现加载，C++程序需要安装`libsentencepiece.so`，并在编译时打开`USE_SENTENCEPIECE`选项才能加载Tokenizer。
 

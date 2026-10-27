@@ -1,7 +1,11 @@
 import asyncio
+import ast
+import ctypes
 import json
 import os
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 
 TEST_API_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -350,6 +354,187 @@ def test_stream_and_nonstream_include_native_usage():
     asyncio.run(run_test())
 
 
+class ReusingFetchLibrary:
+    def __init__(self, payload, terminal=-1, missing_terminal=False):
+        self.payload = payload
+        self.offset = 0
+        self.calls = 0
+        self.reused = False
+        self.terminal = terminal
+        self.missing_terminal = missing_terminal
+
+    def fetch_response_tokens_batch_with_statistics_llm_model(
+            self, model, handle, output, capacity, statistics):
+        self.calls += 1
+        statistics[:] = [8000, 2000, len(self.payload)]
+        if self.calls == 1:
+            return 0  # A prefill keepalive must not become an output token.
+        count = min(capacity, len(self.payload) - self.offset)
+        if count:
+            output[:count] = self.payload[self.offset:self.offset + count]
+            self.offset += count
+            return count
+        # Simulate another request claiming the handle before the C call
+        # returns to Python. The copied terminal statistics remain our own.
+        self.reused = True
+        if self.missing_terminal:
+            statistics[:] = [-1, -1, -1]
+        return self.terminal
+
+    def fetch_response_tokens_batch_llm_model(self, model, handle, output, capacity):
+        # Also supports running this regression against the old implementation.
+        return self.fetch_response_tokens_batch_with_statistics_llm_model(
+            model, handle, output, capacity, (ctypes.c_int * 3)())
+
+
+def make_native_stream_model(use_hf, payload, terminal=-1, missing_terminal=False):
+    # Load the actual streaming method without loading a platform-specific .so.
+    # The C++ companion test covers the real scheduler lock and context removal.
+    source = Path(TOOLS_DIR) / "fastllm_pytools/llm.py"
+    tree = ast.parse(source.read_text())
+    model_class = next(n for n in tree.body
+                       if isinstance(n, ast.ClassDef) and n.name == "model")
+    method = next(n for n in model_class.body
+                  if isinstance(n, ast.AsyncFunctionDef)
+                  and n.name == "stream_response_handle_async")
+    library = ReusingFetchLibrary(payload, terminal, missing_terminal)
+    scope = {"asyncio": asyncio, "ctypes": ctypes, "fastllm_lib": library}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), scope)
+
+    class StreamModel(FakeModel):
+        model = 0
+        save_history = False
+        hf_tokenizer = SimpleNamespace(decode=lambda ids: bytes(ids).decode(errors="replace"))
+        stream_response_handle_async = scope["stream_response_handle_async"]
+
+        def _can_apply_hf_chat_template(self):
+            return use_hf
+
+        def _uses_hf_deepseek_v4_tokenizer(self):
+            return False
+
+        def _decode_fastllm_token(self, token):
+            return bytes([token])
+
+        def _raise_prompt_too_long(self, handle):
+            raise ValueError("prompt too long")
+
+        def get_response_statistics(self, handle):
+            if library.reused:
+                return {"cached_input_tokens": 0, "missed_input_tokens": 17000,
+                        "output_tokens": 0}
+            return {"cached_input_tokens": 8000, "missed_input_tokens": 2000,
+                    "output_tokens": len(payload)}
+
+    return StreamModel(), library
+
+
+def test_atomic_fetch_usage_and_handle_reuse():
+    async def run_test():
+        # The UTF-8 character straddles the 64-token fetch boundary. Neither
+        # buffering nor coalescing text may change the exact token count.
+        payload = b"a" * 63 + "中".encode() + b"b" * 64
+        for use_hf in (False, True):
+            for content, terminal, missing in (
+                    (payload, -1, False), (b"", -1, False),
+                    (payload, -1, True), (b"", -2, False)):
+                model, library = make_native_stream_model(use_hf, content, terminal, missing)
+                statistics = {}
+                chunks = []
+                try:
+                    async for chunk in model.stream_response_handle_async(7, statistics):
+                        chunks.append(chunk)
+                    assert terminal == -1
+                except ValueError as error:
+                    assert terminal == -2 and str(error) == "prompt too long"
+                assert "".join(chunks) == content.decode()
+                assert library.reused
+                assert statistics == {"cached_input_tokens": 8000,
+                                      "missed_input_tokens": 2000,
+                                      "output_tokens": len(content)}
+
+            # A cancelled consumer must not perform a terminal lookup later.
+            model, library = make_native_stream_model(use_hf, payload)
+            statistics = {}
+            stream = model.stream_response_handle_async(7, statistics)
+            await stream.__anext__()
+            calls = library.calls
+            await stream.aclose()
+            library.reused = True
+            assert library.calls == calls and statistics["output_tokens"] == len(payload)
+
+            for protocol in ("chat", "anthropic", "responses"):
+                for streaming in (False, True):
+                    completion = make_completion()
+                    completion.model, library = make_native_stream_model(use_hf, payload)
+                    completion.conversation_handles["atomic"] = 7
+                    statistics = {}
+                    stream = completion._stream_response_handle_with_statistics(7, statistics)
+                    if protocol == "anthropic":
+                        request = AnthropicMessageRequest(
+                            model="test-model", messages=[], max_tokens=len(payload), stream=streaming)
+                        if streaming:
+                            events = completion.anthropic_message_stream_generator(
+                                request, RawRequest(), stream, "atomic", 10000, None,
+                                handle=7, response_statistics=statistics)
+                        else:
+                            response = await completion.anthropic_message_full_generator(
+                                request, RawRequest(), 7, stream, "atomic", 10000, None,
+                                response_statistics=statistics)
+                            assert response.stop_reason == "max_tokens"
+                            usage = response.usage.model_dump()
+                    else:
+                        request = ChatCompletionRequest(
+                            model="test-model", messages=[], max_tokens=len(payload), stream=streaming)
+                        if streaming:
+                            events = completion.chat_completion_stream_generator(
+                                request, RawRequest(), stream, "atomic", 10000, False,
+                                handle=7, response_statistics=statistics)
+                            if protocol == "responses":
+                                events = completion.responses_stream_generator(
+                                    ResponsesRequest(model="test-model", input="hello", stream=True), events)
+                        else:
+                            response = await completion.chat_completion_full_generator(
+                                request, RawRequest(), 7, stream, "atomic", 10000,
+                                response_statistics=statistics)
+                            assert response.choices[0].finish_reason == "length"
+                            usage = response.usage.model_dump()
+                            if protocol == "responses":
+                                usage = completion._responses_usage_from_chat_usage(response.usage).model_dump()
+                    if streaming:
+                        usage = None
+                        async for event in events:
+                            for line in event.splitlines():
+                                if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+                                    continue
+                                data = json.loads(line[5:])
+                                if protocol == "responses" and data.get("type") in (
+                                        "response.completed", "response.incomplete"):
+                                    assert data["type"] == "response.incomplete"
+                                    usage = data["response"]["usage"]
+                                elif data.get("usage") is not None:
+                                    usage = data["usage"]
+                                if protocol == "anthropic" and data.get("type") == "message_delta":
+                                    assert data["delta"]["stop_reason"] == "max_tokens"
+                                if protocol == "chat":
+                                    for choice in data.get("choices", []):
+                                        if choice.get("finish_reason") is not None:
+                                            assert choice["finish_reason"] == "length"
+                    assert library.reused and usage is not None, (use_hf, protocol, streaming)
+                    if protocol == "chat":
+                        assert usage["prompt_tokens"] == 10000
+                        assert usage["completion_tokens"] == len(payload)
+                        assert usage["prompt_tokens_details"]["cached_tokens"] == 8000
+                    elif protocol == "anthropic":
+                        assert usage == {"input_tokens": 2000, "cache_creation_input_tokens": 0,
+                                         "cache_read_input_tokens": 8000, "output_tokens": len(payload)}
+                    else:
+                        assert usage["input_tokens"] == 10000 and usage["output_tokens"] == len(payload)
+                        assert usage["input_tokens_details"]["cached_tokens"] == 8000
+
+    asyncio.run(run_test())
+
+
 if __name__ == "__main__":
     test_usage_protocol_mappings()
     test_captured_terminal_usage_wins_over_reused_handle()
@@ -358,4 +543,5 @@ if __name__ == "__main__":
     test_early_stream_stop_aborts_owned_handle_before_final_yield()
     test_stream_adapter_supports_new_and_legacy_models()
     test_stream_and_nonstream_include_native_usage()
+    test_atomic_fetch_usage_and_handle_reuse()
     print("usage accounting tests passed")

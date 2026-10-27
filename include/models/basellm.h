@@ -3,9 +3,11 @@
 #define FASTLLM_BASELLM_H
 
 #include "fastllm.h"
+#include "kvmem.h"
 #include "contextconfig.h"
 #include "baseblock.h"
 #include "template.h"
+#include "utils/prefill_batch.h"
 
 #include <atomic>
 #include <thread>
@@ -32,6 +34,7 @@ namespace fastllm {
     class basellm;
 
     struct ResponseContext {
+        PrefillBatchPolicy::Clock::time_point queuedAt = PrefillBatchPolicy::Clock::now();
         bool isEnding = false; // 代表这个请求已经处理完成了，不需要再forward了，但生成的token可能还没有被fetch
         bool isAbort = false; // 代表这个请求被中断了，也就是说不会再有人来fetch它了，那么推理完之后就可以删除这个请求了
         
@@ -259,6 +262,19 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <float> *logits = nullptr);
 
+        // Called before the scheduler slices a single text prompt. Returning
+        // false must leave request state untouched; true means all chunks have
+        // completed and outputToken contains the first generated token.
+        virtual bool TryForwardChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask,
+                const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken) {
+            return false;
+        }
+
         virtual std::vector <int> ForwardBatch(
                 int batch,
                 const Data &inputIds,
@@ -348,6 +364,11 @@ namespace fastllm {
         // accepted block without one Python/ASGI round trip per token.
         virtual int FetchResponseTokensBatch(int handleId, int *output,
                                              int maxTokens);
+        // Atomically return {cached input, missed input, output} counters with
+        // the tokens, including the terminal snapshot before releasing the
+        // handle. Counters are -1 if the context no longer exists.
+        int FetchResponseTokensBatch(int handleId, int *output,
+                                     int maxTokens, int *statistics);
 
         virtual int FetchResponseLogits(int handleId, std::vector <float> &logits); // 获取指定handle的输出Logits
 
@@ -401,6 +422,9 @@ namespace fastllm {
 
         virtual void WarmupCudaRuntimeBuffers(int batch) {}
 
+        // Preserve the default cleanup unless a model opts into bounded reuse.
+        virtual bool RetainCudaWorkspace() const { return false; }
+
         // Materialize model-specific serving scratch before the final automatic
         // KV-cache calibration so its actual pool footprint is observable.
         virtual void WarmupCudaServingHighWaterBuffers() {}
@@ -420,9 +444,23 @@ namespace fastllm {
         // 默认仅在纯 GPU 设备映射下启用；有混合设备实现的模型可以覆盖此判断。
         virtual bool CanUseGPUForward() const;
 
-        // AutoWarmup 时将实际放在 NUMA 上的 MoE 专家权重全部注册，
+        // AutoWarmup 时注册 NUMA MoE 专家；接入共用后端的模型可包含 CPU 专家，
         // 避免未命中的专家在正式解码路径中触发首次分配和拷贝。
-        void WarmupNumaMoeWeights();
+        void WarmupNumaMoeWeights(bool includeCpu = false);
+
+        KvMemConfig kvMemConfig;
+        bool kvMemLocked = false;
+        void WarmupKvMem();
+        virtual void ConfigureKvMem(const KvMemConfig &config);
+        virtual bool SupportsKvMem() const { return false; }
+        virtual bool SupportsKvMemBatch() const { return false; }
+        virtual bool SupportsKvMemPrefixCache() const { return false; }
+        virtual bool KvMemLayerEligible(int layer) const { return GetKVCacheRetainedTokens(layer) < 0; }
+        // Models provide the actual per-layer KV geometry; derived models may
+        // shadow legacy head-count fields on basellm.
+        virtual uint64_t KvMemLayerBytesPerToken(int layer) const { return 0; }
+        virtual void ValidateKvMemModel(const KvMemConfig &config) const {}
+        void PrepareKvMemCaches(int batch, int devices, const std::vector<std::pair<Data*, Data*>> &caches);
 
         void AutoWarmup(); // 自动预热：use_new_engine 时使用新引擎预热，否则调用 WarmUp
 
@@ -430,6 +468,10 @@ namespace fastllm {
 
         // 模型可覆盖这三个 hook 来管理不兼容通用 pair<Data, Data> 的历史缓存。
         virtual bool TryRestoreHistoryCache(std::vector<int> &inputTokens, int &cacheLen) { return false; }
+
+        // Opt-in only: implementations must include media content in cache matching.
+        // Generic token-only history remains disabled for multimodal requests.
+        virtual bool TryRestoreMultimodalHistoryCache(ResponseContext *context) { return false; }
 
         virtual void TryRecordHistoryCache(const std::vector<int> &allTokens) {}
 
@@ -443,11 +485,18 @@ namespace fastllm {
 
         virtual void PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig);
 
+        void PrepareToolCallConstraint(GenerationConfig &generationConfig);
+        void AdvanceToolCallConstraintText(std::string &text, int tokenId);
+
         virtual void UpdateToolCallConstraintState(ResponseContext *context, int tokenId);
 
         virtual void OnResponseContextCreated(ResponseContext *context) {}
 
         virtual void OnResponseContextRemoved(ResponseContext *context) {}
+
+        // Called under dictLocker after the final forward, before admitting
+        // another request. Output queues remain available to slow consumers.
+        virtual void OnResponseContextFinished(ResponseContext *context) {}
 
         virtual bool UseGenericHistoryCache() const { return true; }
 
@@ -474,9 +523,17 @@ namespace fastllm {
         // larger aggregate batching limit.
         virtual int GetBatchedPrefillTokenLimit();
 
+        // Opt-in per model; configure before the first request. A zero token
+        // target preserves the existing scheduler, and zero wait batches only
+        // requests already queued. Unsupported models keep their old policy.
+        virtual bool SupportsPrefillBatching() const { return false; }
+        bool SetPrefillBatching(int targetTokens, int maxWaitMs);
+
         virtual void SetDataType(DataType dataType);
 
         virtual void SetKVCacheDataType(DataType dataType);
+
+        virtual void SetIndexerDataType(DataType dataType);
 
         virtual void SetMoeAtype(DataType type);
 
@@ -588,7 +645,7 @@ namespace fastllm {
                 std::vector<std::vector<Data *>> &layerWeights) const;
         bool ShouldRegisterSpecialWeightForDeviceType(const std::string &weightName, const std::string &deviceType) const;
         bool ShouldRegisterSpecialWeightForDeviceTypes(const std::string &weightName, const std::vector<std::string> &deviceTypes) const;
-        bool MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const;
+        virtual bool MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const;
 
         std::string adapterName;
 
@@ -621,6 +678,7 @@ namespace fastllm {
 
         // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
         int chunkedPrefillSize = -1;
+        PrefillBatchPolicy prefillBatchPolicy;
 
         // 由调度器在 long-prefill 的非末切片前向期间设置。支持该优化的
         // 模型可据此只更新 KV/线性状态，省去不会被消费的 lm_head 和采样。
@@ -632,6 +690,9 @@ namespace fastllm {
         void NewMainLoop();
         void GPUMainLoop();
         void RunNewMainLoop(bool useGPUForward);
+
+        // Paged models may try resident pages before restoring a host archive.
+        virtual bool DeferHistoryCacheRestore() const { return false; }
     };
 }
 

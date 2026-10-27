@@ -1,6 +1,7 @@
 """Fixed DeepSeek Harness integration, running outside the Launcher process."""
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -68,13 +69,21 @@ class HarnessRuntime(ManagedAgentRuntime):
         return None
 
     @staticmethod
-    def _patch(service, bind_host):
+    def _patch(service, bind_host, *, experimental_recovery=False):
         context = service.get("contextWindowTokens") or 8192
+        # Reasoning and tool arguments share the output budget. An 8K ceiling
+        # can exhaust a coding turn in thinking before any tool call is made.
+        # Keep half the advertised context for input; Pi applies its own
+        # per-request context clamp as the conversation grows.
+        output_budget = max(1, min(32768, context // 2))
+        metadata = service.get("modelMetadata") or {}
+        modalities = metadata.get("input_modalities", metadata.get("inputModalities", []))
+        image_input = isinstance(modalities, list) and "image" in modalities
         efforts, default = reasoning_options(service)
         # Harness names the disabled level "off"; FastLLM expects "none" on
         # the wire so it overrides a service with thinking enabled by default.
         default = "off" if default == "none" else default
-        return [
+        patch = [
             {"id": "webserver", "config": {"host": bind_host, "port": 0}},
             {"id": "agent-default-model", "config": {"provider": "fastllm", "model": service["modelName"],
                 **({"reasoningEffort": default} if default else {})}},
@@ -91,14 +100,24 @@ class HarnessRuntime(ManagedAgentRuntime):
                 "apiKeyEnv": "FTLLM_HARNESS_API_KEY",
                 **({"reasoning": default} if default else {}),
                 "models": [{"id": service["modelName"], "name": service["modelName"],
+                            "input": ["text", "image"] if image_input else ["text"],
                             "reasoningEfforts": {"off" if effort == "none" else effort: effort
                                                  for effort in efforts} if efforts else False,
-                            "contextWindow": context, "maxTokens": min(8192, context // 2)}],
-                "compat": {"supportsStore": False, "supportsReasoningEffort": True, "thinkingFormat": "openai"},
+                            "contextWindow": context, "maxTokens": output_budget}],
+                "compat": {"supportsStore": False, "supportsReasoningEffort": True,
+                           "thinkingFormat": "openai", "maxTokensField": "max_tokens",
+                           "supportsDeveloperRole": False},
             }}}},
             {"id": "session-log-deepseek", "disabled": True},
             {"id": "session-telemetry-otel", "disabled": True},
         ]
+        if experimental_recovery:
+            patch.insert(0, {"insert": [{
+                "id": "fastllm-harness-recovery",
+                "name": str(Path(__file__).with_name("harness_recovery.mjs").resolve()),
+                "config": {"provider": "fastllm", "maxRecoveries": 2},
+            }]})
+        return patch
 
     def _run(self, service, api_key, bind_host, browser_origin, cancelled, install):
         try:
@@ -128,7 +147,9 @@ class HarnessRuntime(ManagedAgentRuntime):
             # the Harness home and workspace survive stop/restart.
             with tempfile.TemporaryDirectory(prefix="launch-", dir=self.directory) as temporary:
                 patch = Path(temporary) / "launcher.patch.yml"
-                patch.write_text(json.dumps(self._patch(service, "127.0.0.1")), encoding="utf-8")
+                configuration = self._patch(service, "127.0.0.1", experimental_recovery=
+                    environment.get("FTLLM_HARNESS_EXPERIMENTAL_RECOVERY") == "1")
+                patch.write_text(json.dumps(configuration), encoding="utf-8")
                 log = Path(temporary) / "harness.log"
                 with log.open("wb") as output, log.open("rb") as reader:
                     with self._lock:
@@ -142,14 +163,56 @@ class HarnessRuntime(ManagedAgentRuntime):
                     try:
                         self._watch(process, reader, api_key, bind_host, browser_origin, cancelled)
                     finally:
-                        terminate_process(process)
+                        try:
+                            terminate_process(process)
+                        finally:
+                            self._save_log(log, api_key)
         except Exception as error:
-            diagnostic = re.sub(r"([?&]token=)[^\s)]+", r"\1[redacted]", str(error))
-            if api_key:
-                diagnostic = diagnostic.replace(api_key, "[redacted]")
+            diagnostic = self._redact_log(str(error), api_key)
             with self._lock:
                 if not cancelled.is_set():
                     self._state.update(phase="failed", url="", error=diagnostic)
+
+    @staticmethod
+    def _redact_log(text, api_key):
+        if api_key:
+            text = text.replace(api_key, "[redacted]")
+        text = re.sub(r"([?&](?:token|api_key|access_token)=)[^\s&#)]+",
+                      r"\1[redacted]", text, flags=re.IGNORECASE)
+        return re.sub(r"(Authorization\s*[:=]\s*(?:Bearer|Basic)\s+)[^\s]+",
+                      r"\1[redacted]", text, flags=re.IGNORECASE)
+
+    def _save_log(self, source, api_key):
+        # Keep a bounded diagnostic after TemporaryDirectory removes the raw log.
+        # Drop a partial leading line before redacting a bounded tail.
+        temporary = None
+        try:
+            with source.open("rb") as reader:
+                size = reader.seek(0, os.SEEK_END)
+                reader.seek(max(0, size - 65536))
+                if size > 65536:
+                    reader.readline()
+                text = reader.read().decode("utf-8", errors="replace")
+            text = self._redact_log(text, api_key)
+            directory = self.directory / "logs"
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor, temporary = tempfile.mkstemp(prefix=".harness-", dir=directory)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                output.write(text)
+            latest = directory / "latest.log"
+            if latest.exists():
+                latest.replace(directory / "previous.log")
+            os.replace(temporary, latest)
+            temporary = None
+        except OSError as error:
+            # A diagnostic write must not mask the process's actual exit reason.
+            logging.warning("Could not retain Harness diagnostic log: %s", error)
+        finally:
+            if temporary is not None:
+                try:
+                    Path(temporary).unlink(missing_ok=True)
+                except OSError:
+                    logging.warning("Could not remove temporary Harness diagnostic log")
 
     def _watch(self, process, reader, api_key, bind_host, browser_origin, cancelled):
         deadline = time.monotonic() + 120
@@ -159,9 +222,7 @@ class HarnessRuntime(ManagedAgentRuntime):
                 chunk = reader.read(65536).decode("utf-8", errors="replace")
                 tail = (tail + chunk)[-16000:]
                 if process.poll() is not None:
-                    diagnostic = re.sub(r"([?&]token=)[^\s)]+", r"\1[redacted]", tail)
-                    if api_key:
-                        diagnostic = diagnostic.replace(api_key, "[redacted]")
+                    diagnostic = self._redact_log(tail, api_key)
                     raise RuntimeError("DeepSeek Harness exited.\n" + diagnostic[-4000:])
                 if proxy is None:
                     match = re.search(r"dsh web: (http://[^\s)]+)", tail)

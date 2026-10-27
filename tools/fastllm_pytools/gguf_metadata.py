@@ -151,13 +151,56 @@ _ARCHITECTURE_CONFIGS = {
     "qwen3_5": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
     "qwen35moe": ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
     "qwen3_5_moe": ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+    "qwen4exp": ("qwen4_exp", "Qwen4ExpForCausalLM"),
+    "deepseek41": ("deepseek_v41", "DeepseekV41ForCausalLM"),
     "deepseek2": ("deepseek_v2", "DeepseekV2ForCausalLM"),
     "deepseek_v2": ("deepseek_v2", "DeepseekV2ForCausalLM"),
     "deepseek_v3": ("deepseek_v3", "DeepseekV3ForCausalLM"),
     "glm-dsa": ("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
     "glm_moe_dsa": ("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
+    "glm5next": ("glm5_next", "Glm5NextForConditionalGeneration"),
+    "glm5-next": ("glm5_next", "Glm5NextForConditionalGeneration"),
     "minimax_m2": ("minimax_m2", "MiniMaxM2ForCausalLM"),
 }
+
+
+_V41_GGUF_ALIASES = {
+    "num_hidden_layers": "block_count", "hidden_size": "embedding_length",
+    "max_position_embeddings": "context_length", "num_attention_heads": "attention.head_count",
+    "num_key_value_heads": "attention.head_count_kv", "head_dim": "attention.key_length",
+    "qk_rope_head_dim": "rope.dimension_count", "q_lora_rank": "attention.q_lora_rank",
+    "o_lora_rank": "attention.output_lora_rank", "o_groups": "attention.output_group_count",
+    "rms_norm_eps": "attention.layer_norm_rms_epsilon", "rope_theta": "rope.freq_base",
+    "n_routed_experts": "expert_count", "num_experts_per_tok": "expert_used_count",
+    "moe_intermediate_size": "expert_feed_forward_length", "n_shared_experts": "expert_shared_count",
+    "scoring_func": "expert_scoring_func", "routed_scaling_factor": "expert_weights_scale",
+    "norm_topk_prob": "expert_weights_norm", "sliding_window": "attention.sliding_window",
+    "compress_ratios": "attention.compress_ratios", "compress_rope_theta": "attention.compress_rope_freq_base",
+    "index_n_heads": "attention.indexer.head_count", "index_head_dim": "attention.indexer.key_length",
+    "index_topk": "attention.indexer.top_k", "candidate_block_size": "attention.candidate_block_size",
+    "candidate_topk_blocks": "attention.candidate_topk_blocks",
+    "candidate_source_layer_id": "attention.candidate_source_layer_id",
+    "hc_mult": "hyper_connection.count", "hc_sinkhorn_iters": "hyper_connection.sinkhorn_iterations",
+    "hc_eps": "hyper_connection.epsilon", "engram_layer_ids": "engram.layer_ids",
+    "engram_num_embeddings": "engram.num_embeddings",
+}
+for _key in ("kv_source_layer_ids", "index_source_layer_ids", "engram_head_dim", "engram_n_heads",
+             "engram_max_ngram_size", "engram_vocab_size", "engram_compressed_vocab_size", "engram_pad_token_id"):
+    _V41_GGUF_ALIASES[_key] = _key
+
+
+def deepseek_v41_config(metadata):
+    """Shared discovery/planning translation; absent draft weights stay disabled."""
+    config = {key: metadata["deepseek41." + source] for key, source in _V41_GGUF_ALIASES.items()
+              if "deepseek41." + source in metadata}
+    config.update(model_type="deepseek_v41", architectures=["DeepseekV41ForCausalLM"],
+                  gguf_architecture="deepseek41", num_nextn_predict_layers=0)
+    config["rope_scaling"] = {target: metadata["deepseek41.rope.scaling." + source]
+        for target, source in (("rope_type", "type"), ("factor", "factor"),
+                               ("original_max_position_embeddings", "original_context_length"),
+                               ("beta_fast", "yarn_beta_fast"), ("beta_slow", "yarn_beta_slow"))
+        if "deepseek41.rope.scaling." + source in metadata}
+    return config
 
 
 @lru_cache(maxsize=8)
@@ -182,6 +225,16 @@ def _get_gguf_model_config_cached(path, _file_size, _mtime_ns):
     }
     if architecture:
         config["architectures"] = [architecture]
+    if gguf_arch == "deepseek41":
+        keys = {"deepseek41." + value for value in _V41_GGUF_ALIASES.values()}
+        keys.update("deepseek41.rope.scaling." + name for name in
+                    ("type", "factor", "original_context_length", "yarn_beta_fast", "yarn_beta_slow"))
+        config.update(deepseek_v41_config(read_gguf_metadata(path, keys)))
+        tokens = read_gguf_metadata(path, {"tokenizer.ggml.tokens"}).get("tokenizer.ggml.tokens", [])
+        if tokens:
+            config["vocab_size"] = len(tokens)
+            if "<｜deepseek_image｜>" in tokens:
+                config["image_token_id"] = tokens.index("<｜deepseek_image｜>")
     generation_config = {
         target: metadata[source]
         for source, target in sampling_keys.items()
@@ -201,6 +254,12 @@ def get_gguf_model_config(path):
 
 
 _GPT2_PRETOKENIZER_PATTERNS = {
+    "glm4": (
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|"
+        r"[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|"
+        r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|"
+        r"\s+(?!\S)|\s+"
+    ),
     "qwen35": (
         r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|"
         r"[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"

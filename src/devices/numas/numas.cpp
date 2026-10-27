@@ -3,6 +3,9 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <mutex>
+#include <sys/mman.h>
+#include <unordered_map>
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
 #endif
@@ -92,15 +95,38 @@ namespace fastllm {
 
         NumaDetector () {
             if (numa_available() != -1) {
+                // Preserve a numactl/taskset mask: the NUMA probe must not
+                // widen the affinity inherited by subsequently created workers.
+                cpu_set_t originalAffinity;
+                if (sched_getaffinity(0, sizeof(originalAffinity), &originalAffinity) != 0) {
+                    canUseNuma = false;
+                    return;
+                }
                 if (numa_run_on_node(0) == -1) {
                     std::cerr << "Warning: NUMA node binding failed (non-privileged mode?)" << std::endl;
                     canUseNuma = false;
+                }
+                if (sched_setaffinity(0, sizeof(originalAffinity), &originalAffinity) != 0) {
+                    throw std::runtime_error("Failed to restore CPU affinity after NUMA probe");
                 }
             } else {
                 canUseNuma = false;
             }
         }
-    } numaDetector;
+    };
+    static NumaDetector &GetNumaDetector() {
+        static NumaDetector detector;
+        return detector;
+    }
+    bool HostMoeIsUnbound();
+    struct UnboundAllocations {
+        std::mutex mutex;
+        std::unordered_map<void *, size_t> mappings;
+    };
+    static UnboundAllocations &GetUnboundAllocations() {
+        static auto *allocations = new UnboundAllocations;
+        return *allocations;
+    }
     
     void bind_to_cpu(int cpu_id) {
         cpu_set_t cpuset;
@@ -118,7 +144,7 @@ namespace fastllm {
         if (numa_node_to_cpus(node_id, node_cpus) != 0) {
             perror("Failed to get NUMA node CPUs");
             numa_free_cpumask(node_cpus);
-            numaDetector.canUseNuma = false;
+            GetNumaDetector().canUseNuma = false;
             return;
         }
 
@@ -146,7 +172,7 @@ namespace fastllm {
         if (set_mempolicy(policy, mask->maskp, mask->size) == -1) {
             std::cerr << "set_mempolicy failed for node " << node_id 
                     << ": " << errno << " (" << strerror(errno) << ")\n";
-            numaDetector.canUseNuma = false;
+            GetNumaDetector().canUseNuma = false;
             return;
         }
         numa_free_nodemask(mask);
@@ -174,8 +200,21 @@ namespace fastllm {
         free(raw_ptr);
     }
 
-    void* allocate_aligned_numa(size_t size, int node) { 
-        if (!numaDetector.canUseNuma) {
+    void* allocate_aligned_numa(size_t size, int node) {
+        if (HostMoeIsUnbound()) {
+            // Match NUMA's page-isolated allocations without mbind. malloc
+            // arenas can share boundary pages and make cudaHostRegister of
+            // otherwise-disjoint expert buffers overlap a pinned mapping.
+            const size_t bytes = size + 63;
+            void *ptr = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (ptr == MAP_FAILED) return nullptr;
+            auto &allocations = GetUnboundAllocations();
+            std::lock_guard<std::mutex> lock(allocations.mutex);
+            allocations.mappings.emplace(ptr, bytes);
+            return ptr;
+        }
+        if (!GetNumaDetector().canUseNuma) {
             return allocate_aligned(size);
         }
         
@@ -199,7 +238,17 @@ namespace fastllm {
     }
 
     void free_aligned_numa(void* aligned_ptr, size_t size) {
-        if (!numaDetector.canUseNuma) {
+        {
+            auto &allocations = GetUnboundAllocations();
+            std::lock_guard<std::mutex> lock(allocations.mutex);
+            auto it = allocations.mappings.find(aligned_ptr);
+            if (it != allocations.mappings.end()) {
+                munmap(aligned_ptr, it->second);
+                allocations.mappings.erase(it);
+                return;
+            }
+        }
+        if (!GetNumaDetector().canUseNuma) {
             free_aligned(aligned_ptr, size);
             return;
         }

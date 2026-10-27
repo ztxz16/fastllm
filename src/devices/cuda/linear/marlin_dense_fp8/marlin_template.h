@@ -238,12 +238,15 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float   // is zero point of float16 type?
-          >
+          const bool is_zp_float,  // is zero point of float16 type?
+          const bool dense_fp32,
+          const bool add_residual,
+          const bool fuse_swiglu,
+          const bool bf16_output>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
-    int4* __restrict__ C0,        // fp16 output buffer of shape mxn
+    int4* __restrict__ C0,        // output [m,n], or [m,n/2] for fuse_swiglu
     int4* __restrict__ C_tmp,     // fp32 tmp output buffer (for reduce)
     const int4* __restrict__ b_bias_ptr,
     // float scales of input matrix, only used when is_a_8bit == true.
@@ -264,10 +267,26 @@ __global__ void Marlin(
     int prob_k,      // reduction dimension k
     int lda,         // A.stride(0), equal to prob_k is A is contiguous
     int* locks,      // extra global storage for barrier synchronization
-    bool has_bias,
-    bool use_atomic_add,   // whether to use atomic add to reduce
-    bool use_fp32_reduce,  // whether to use fp32 global reduce
+    bool has_bias_arg,
+    bool use_atomic_add_arg,   // whether to use atomic add to reduce
+    bool use_fp32_reduce_arg,  // whether to use fp32 global reduce
     int max_shared_mem) {
+  static_assert(!add_residual || (dense_fp32 && m_block_size_8 &&
+      b_type_id == vllm::kFE2M1f.id() && c_type_id == vllm::kFloat16.id()));
+  static_assert(!fuse_swiglu || (!add_residual && dense_fp32 && m_block_size_8 &&
+      threads == 256 && thread_m_blocks == 1 && thread_n_blocks == 8 &&
+      thread_k_blocks == 8 && group_blocks == 1 &&
+      a_type_id == vllm::kFloat16.id() && b_type_id == vllm::kFE2M1f.id() &&
+      c_type_id == vllm::kFloat16.id() && s_type_id == vllm::kFE4M3fn.id()));
+  // Turing MXFP4 uses losslessly converted FP16 operands but rounds the FP32
+  // result directly to BF16. No intermediate FP16 output/reduction is allowed.
+  static_assert(!bf16_output || (dense_fp32 && !add_residual && !fuse_swiglu &&
+      a_type_id == vllm::kFloat16.id() && c_type_id == vllm::kFloat16.id() &&
+      b_type_id == vllm::kFE2M1f.id() && s_type_id == vllm::kFE8M0fnu.id() &&
+      group_blocks == 2));
+  const bool has_bias = dense_fp32 ? false : has_bias_arg;
+  const bool use_atomic_add = dense_fp32 ? false : use_atomic_add_arg;
+  const bool use_fp32_reduce = dense_fp32 ? true : use_fp32_reduce_arg;
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -296,7 +315,7 @@ __global__ void Marlin(
   // Disable use_fp16_accum for NVFP4 and cases when group_size == -1 &&
   // num_bits == 4
   constexpr bool use_fp16_accum =
-      a_type_id == vllm::kFloat16.id() &&
+      a_type_id == vllm::kFloat16.id() && !bf16_output &&
       (!(b_type_id == vllm::kFE2M1f.id() && s_type_id == vllm::kFE4M3fn.id()) &&
        !(group_blocks == -1 && num_bits == 4));
   #else
@@ -857,6 +876,16 @@ __global__ void Marlin(
             b_gl_rd + (i % count) * threads +
             b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
 
+        if constexpr (fuse_swiglu) {
+          // Pair one 64-column gate tile with its matching up tile in the
+          // same CTA. The Marlin weight allocation and its 64-column packing
+          // stay unchanged; only this specialization's global reads differ.
+          // A 128-column CTA has 64 int4 values per packed row. Its two
+          // 32-int4 halves map to gate/up; this offset is independent of K.
+          b_gl_idx += -32 * slice_col +
+                      ((threadIdx.x & 32) ? b_gl_stride / 2 - 32 : 0);
+        }
+
         cp_async4(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
       }
 
@@ -884,7 +913,13 @@ __global__ void Marlin(
           // Only fetch scales if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
             if (s_sh_wr_pred) {
-              cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
+              int scale_idx = s_gl_rd;
+              if constexpr (fuse_swiglu) {
+                // The same pairing for the eight int4 scale values.
+                scale_idx += -4 * slice_col +
+                             ((threadIdx.x & 4) ? s_gl_stride / 2 - 4 : 0);
+              }
+              cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[scale_idx]);
             }
             s_gl_rd += s_gl_rd_delta * s_tb_groups;
           }
@@ -1656,8 +1691,15 @@ __global__ void Marlin(
         c0 *= global_scale_f32;
         c1 *= global_scale_f32;
       }
-      c_scalar_t2 res =
-          Cdtype::nums2num2(Cdtype::float2num(c0), Cdtype::float2num(c1));
+      c_scalar_t2 res;
+      if constexpr (bf16_output) {
+        // Only the storage type is half2; these bits receive no FP16 math.
+        res = __halves2half2(
+            __ushort_as_half(__bfloat16_as_ushort(__float2bfloat16_rn(c0))),
+            __ushort_as_half(__bfloat16_as_ushort(__float2bfloat16_rn(c1))));
+      } else {
+        res = Cdtype::nums2num2(Cdtype::float2num(c0), Cdtype::float2num(c1));
+      }
 
       // For per-column quantization we finally apply the scale here (only for
       // 4-bit)
@@ -1736,7 +1778,36 @@ __global__ void Marlin(
             atomicAdd(&C_half2[a], sh_red_half2[a]);
           }
         } else {
-          C[c_gl_wr] = sh_red[c_sh_rd];
+          if constexpr (fuse_swiglu) {
+            const int column = threadIdx.x % (2 * thread_n_blocks);
+            if (column < thread_n_blocks) {
+              int4 gate = sh_red[c_sh_rd], up = sh_red[c_sh_rd + thread_n_blocks];
+              auto *g = reinterpret_cast<half*>(&gate);
+              const auto *u = reinterpret_cast<const half*>(&up);
+#pragma unroll
+              for (int j = 0; j < 8; ++j) {
+                // Match FastllmSwigluKernel(half): round the Linear output
+                // first, then each FP16 exp/add/div/mul operation.
+                g[j] = __hmul(__hdiv(g[j], __hadd(__float2half(1.0f), hexp(-g[j]))), u[j]);
+              }
+              // Virtual N has interleaved gate/up tiles; the result is dense
+              // [M,N/2]. Only gate-half threads write the paired result.
+              C[(c_gl_wr - column) / 2 + column] = gate;
+            }
+          } else if constexpr (add_residual) {
+            // Only the final FP32 reduction owner writes C. Intermediate
+            // partial sums live in C_tmp, so the original residual is intact.
+            // sh_red already contains the rounded Linear result: preserve the
+            // separate Linear + AddTo rounding before adding the residual.
+            int4 value = sh_red[c_sh_rd], residual = C[c_gl_wr];
+            auto *v = reinterpret_cast<half2*>(&value);
+            const auto *r = reinterpret_cast<const half2*>(&residual);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[j] = __hadd2(v[j], r[j]);
+            C[c_gl_wr] = value;
+          } else {
+            C[c_gl_wr] = sh_red[c_sh_rd];
+          }
         }
         c_gl_wr += c_gl_wr_delta;
         c_sh_rd += c_sh_rd_delta;
@@ -1785,6 +1856,18 @@ __global__ void Marlin(
     start_pipes();
   }
 
+  // SM75 has synchronous global-to-shared copies. Retiring the current
+  // fragments before fetching the next ones shortens register lifetimes in
+  // the dense prefill specialization, without changing the shared pipeline.
+  // NVFP4 has no zero point, so matmul does not use its pipe argument.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+  // Block-32 shares raw scale bytes between adjacent K fragments. Copy them
+  // before matmul expands the first fragment's bytes into FP16 scales.
+  constexpr bool late_fetch = dense_fp32 && !bf16_output;
+#else
+  constexpr bool late_fetch = false;
+#endif
+
   // Main loop.
   while (slice_iters) {
     // We unroll over both the global fetch and the register load pipeline to
@@ -1796,6 +1879,7 @@ __global__ void Marlin(
     for (int pipe = 0; pipe < stages;) {
   #pragma unroll
       for (int k = 0; k < b_sh_wr_iters; k++) {
+        if constexpr (late_fetch) matmul(k, pipe);
         fetch_to_registers(k + 1, pipe % stages);
         fetch_scales_to_registers(k + 1, pipe);
         fetch_zp_to_registers(k + 1, pipe);
@@ -1808,7 +1892,8 @@ __global__ void Marlin(
         }
 
         if constexpr (!is_a_8bit) {
-          matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
+          if constexpr (!late_fetch)
+            matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
         } else {
           static_assert(group_blocks != 0 && group_blocks != 1);
           matmul_a8(k);
@@ -1895,6 +1980,15 @@ __global__ void Marlin(
       }
 
       cp_async_wait<0>();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+      if constexpr (bf16_output || (m_block_size_8 && b_type == vllm::kFE2M1f &&
+                    s_type == vllm::kFE4M3fn)) {
+        // sh_red aliases the B pipeline. On SM75 cp_async_wait is a no-op:
+        // every warp must finish its final shared B load before another
+        // warp reuses that storage for the block's FP32 partial sums.
+        __syncthreads();
+      }
+#endif
       bool last = slice_idx == slice_count - 1;
       // For per-column scales, we only fetch them here in the final step before
       // write-out

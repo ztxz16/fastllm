@@ -1,0 +1,14 @@
+{
+  "sha": "7eb86aa0fdc1248fab43c89801de4ed450e35e77",
+  "date": "2026-10-03T07:45:34Z",
+  "url": "https://github.com/flashinfer-ai/flashinfer/commit/7eb86aa0fdc1248fab43c89801de4ed450e35e77",
+  "compatibility_headers": {
+    "source_repo_commit": "42bfc71ccf6afd5c559b1a4ec5712df02b858ec5",
+    "paths": [
+      "include/flashinfer/fastdiv.cuh",
+      "include/flashinfer/fast_mod_div_compat.cuh"
+    ],
+    "reason": "Use the project vendored compatible fast-div header on CUDA 12.9; upstream fastdiv requires a newer CCCL header. Attention kernel sources are unchanged."
+  },
+  "license_note": "Apache-2.0 project license; sparse MLA kernel files carry BSD-3-Clause notices, preserved verbatim."
+}

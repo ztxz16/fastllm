@@ -2,6 +2,13 @@
 
 [中文](version.md)
 
+## V1.9.0
+
+- Added `--auto` for automatic parameter tuning and deployment.
+- Added DeepSeek-V4.1-Flash support, including the 1017 checkpoint.
+- Added multilevel caching and budget-based preloading for disk-backed experts, optimized expert and Engram reads, and reduced peak memory usage during model loading.
+- Fixed several bugs.
+
 ## V0.1.8.2
 
 - Added a web deployment launcher and an Electron desktop launcher with model downloads, launch profile management, automatic configuration for long contexts and high concurrency, and inference speed and available context displays.

@@ -196,7 +196,23 @@ static bool TritonEnvFlagDefaultEnabled(const char *name, bool fallback) {
     return TritonEnvFlagEnabled(name);
 }
 
-template <typename T>
+// Match the standalone SwiGLU's intermediate rounding before FP8 quantization.
+// In particular, computing the entire FP16 expression in FP32 changes tokens.
+__device__ __forceinline__ half LinearFp8Swiglu(half x, half y) {
+#ifdef CUDA_NO_TENSOR_CORE
+    float xf = __half2float(x), yf = __half2float(y);
+    return __float2half((xf / (1.0 + expf(-xf))) * yf);
+#else
+    return __hmul(__hdiv(x, __hadd(__float2half(1.0f), hexp(-x))), y);
+#endif
+}
+
+__device__ __forceinline__ __nv_bfloat16 LinearFp8Swiglu(__nv_bfloat16 x, __nv_bfloat16 y) {
+    float xf = __bfloat162float(x), yf = __bfloat162float(y);
+    return __float2bfloat16((xf / (1.0f + expf(-xf))) * yf);
+}
+
+template <typename T, bool fromSwiglu = false>
 __global__ void FastllmLinearFp8GroupQuant128Kernel(
     const T *__restrict__ input, uint8_t *__restrict__ output, float *__restrict__ scales,
     int totalGroups, int groupsPerRow) {
@@ -221,7 +237,14 @@ __global__ void FastllmLinearFp8GroupQuant128Kernel(
 #pragma unroll
     for (int i = 0; i < valuesPerThread; i++) {
         int offset = lane + i * threadsPerGroup;
-        float value = static_cast<float>(input[base + offset]);
+        float value;
+        if constexpr (fromSwiglu) {
+            int cols = groupsPerRow * groupSize;
+            int gateOffset = base + row * cols + offset;
+            value = static_cast<float>(LinearFp8Swiglu(input[gateOffset], input[gateOffset + cols]));
+        } else {
+            value = static_cast<float>(input[base + offset]);
+        }
         values[i] = value;
         localAbsMax = fmaxf(localAbsMax, fabsf(value));
     }
@@ -245,6 +268,7 @@ __global__ void FastllmLinearFp8GroupQuant128Kernel(
     }
 }
 
+template <bool fromSwiglu = false>
 static bool LaunchFastllmLinearFp8NativeQuant128(
     const void *input, fastllm::DataType inputType, uint8_t *output, float *scales,
     int rows, int cols) {
@@ -261,10 +285,10 @@ static bool LaunchFastllmLinearFp8NativeQuant128(
     cudaError_t state = cudaGetLastError();
     (void)state;
     if (inputType == fastllm::DataType::FLOAT16) {
-        FastllmLinearFp8GroupQuant128Kernel<half><<<grid, block, 0, stream>>>(
+        FastllmLinearFp8GroupQuant128Kernel<half, fromSwiglu><<<grid, block, 0, stream>>>(
             (const half*)input, output, scales, totalGroups, groupsPerRow);
     } else if (inputType == fastllm::DataType::BFLOAT16) {
-        FastllmLinearFp8GroupQuant128Kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+        FastllmLinearFp8GroupQuant128Kernel<__nv_bfloat16, fromSwiglu><<<grid, block, 0, stream>>>(
             (const __nv_bfloat16*)input, output, scales, totalGroups, groupsPerRow);
     } else {
         return false;
@@ -1178,12 +1202,12 @@ extern "C" int FastllmCudaRuntimeArch() {
     return arch;
 }
 
-extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(
+static bool RunTritonLinearFP8E4M3Block128(
     const char *quantCubitPath, const char *quantKernelName, int quantNumWarps, int quantShared,
     const char *matmulCubitPath, const char *matmulKernelName, int matmulNumWarps, int matmulShared,
     int blockM, int blockN, int blockK, int groupSizeM, bool packedWeight, bool stridedMatmul,
     const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output,
-    int n, int m, int k) {
+    int n, int m, int k, bool fromSwiglu) {
     if (quantCubitPath == nullptr || quantKernelName == nullptr ||
         matmulCubitPath == nullptr || matmulKernelName == nullptr ||
         quantNumWarps <= 0 || matmulNumWarps <= 0 ||
@@ -1224,6 +1248,11 @@ extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(
     }
 
     bool useNativeQuant = TritonEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8_NATIVE_QUANT", true);
+    if (fromSwiglu && (!useNativeQuant || (m % 128) != 0 ||
+                      input.dims.empty() || input.dims.back() != 2 * m ||
+                      input.Count(0) != (uint64_t)n * m * 2)) {
+        return false;
+    }
     LoadedTritonKernel *quantKernel = useNativeQuant ? nullptr :
         LoadTritonKernel(quantCubitPath, quantKernelName, quantShared);
     LoadedTritonKernel *matmulKernel = LoadTritonKernel(matmulCubitPath, matmulKernelName, matmulShared);
@@ -1265,8 +1294,12 @@ extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(
 
     CUresult result = CUDA_SUCCESS;
     if (useNativeQuant) {
-        if (!LaunchFastllmLinearFp8NativeQuant128(
-                inputData, input.dataType, scratch->inputQuant, scratch->inputScale, n, m)) {
+        bool quantOk = fromSwiglu
+            ? LaunchFastllmLinearFp8NativeQuant128<true>(
+                inputData, input.dataType, scratch->inputQuant, scratch->inputScale, n, m)
+            : LaunchFastllmLinearFp8NativeQuant128<>(
+                inputData, input.dataType, scratch->inputQuant, scratch->inputScale, n, m);
+        if (!quantOk) {
             FastllmCudaFinishInput(input, inputData);
             FastllmCudaFinishOutput(output, outputData);
             return false;
@@ -1345,6 +1378,33 @@ extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(
     FastllmCudaFinishInput(input, inputData);
     FastllmCudaFinishOutput(output, outputData);
     return CheckCu(result, "cuLaunchKernel linear_fp8_block128_matmul");
+}
+
+// Keep the existing exported ABI; only the new entry accepts gate/up input.
+extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(
+    const char *quantCubitPath, const char *quantKernelName, int quantNumWarps, int quantShared,
+    const char *matmulCubitPath, const char *matmulKernelName, int matmulNumWarps, int matmulShared,
+    int blockM, int blockN, int blockK, int groupSizeM, bool packedWeight, bool stridedMatmul,
+    const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output,
+    int n, int m, int k) {
+    return RunTritonLinearFP8E4M3Block128(
+        quantCubitPath, quantKernelName, quantNumWarps, quantShared,
+        matmulCubitPath, matmulKernelName, matmulNumWarps, matmulShared,
+        blockM, blockN, blockK, groupSizeM, packedWeight, stridedMatmul,
+        input, weight, bias, output, n, m, k, false);
+}
+
+extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128FromSwiglu(
+    const char *quantCubitPath, const char *quantKernelName, int quantNumWarps, int quantShared,
+    const char *matmulCubitPath, const char *matmulKernelName, int matmulNumWarps, int matmulShared,
+    int blockM, int blockN, int blockK, int groupSizeM, bool packedWeight, bool stridedMatmul,
+    const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output,
+    int n, int m, int k) {
+    return RunTritonLinearFP8E4M3Block128(
+        quantCubitPath, quantKernelName, quantNumWarps, quantShared,
+        matmulCubitPath, matmulKernelName, matmulNumWarps, matmulShared,
+        blockM, blockN, blockK, groupSizeM, packedWeight, stridedMatmul,
+        input, weight, bias, output, n, m, k, true);
 }
 
 extern "C" bool FastllmCudaTritonDeepSeekV4WoA(
@@ -2192,6 +2252,15 @@ extern "C" bool FastllmCudaTritonQwen4SparseAttention(
     const fastllm::Data &query, const fastllm::Data &key,
     const fastllm::Data &value, const fastllm::Data &indices,
     int group, float scale, fastllm::Data &output) {
+    auto rowMajor = [](const fastllm::Data &data) {
+        if (data.dims.empty() || data.strides.size() != data.dims.size() ||
+            data.strides.back() != 1) return false;
+        for (int i = (int)data.dims.size() - 1; i >= 0; --i) {
+            if (data.dims[i] <= 0 || (i > 0 && data.strides[i - 1] <
+                    (uint64_t)data.dims[i] * data.strides[i])) return false;
+        }
+        return true;
+    };
     const int queryHeads = query.dims.size() == 3 ? query.dims[0] : 0;
     const int sequence = query.dims.size() == 3 ? query.dims[1] : 0;
     const int headDim = query.dims.size() == 3 ? query.dims[2] : 0;
@@ -2212,17 +2281,14 @@ extern "C" bool FastllmCudaTritonQwen4SparseAttention(
         value.cudaData == nullptr || indices.cudaData == nullptr ||
         query.dims.size() != 3 || key.dims.size() != 3 ||
         value.dims != key.dims || indices.dims.size() != 2 ||
-        queryHeads <= 0 || kvHeads <= 0 || group <= 0 ||
+        queryHeads <= 0 || kvHeads <= 0 || group <= 0 || group > 16 ||
         queryHeads != kvHeads * group || sequence <= 1 ||
         keyLength <= 0 || headDim < 16 || headDim > 256 ||
         (headDim & (headDim - 1)) != 0 ||
         key.dims[2] != headDim || indices.dims[0] != sequence ||
         topk <= 0 || topk > 3072 || !std::isfinite(scale) ||
-        query.Count(0) !=
-            (uint64_t)queryHeads * sequence * headDim ||
-        key.Count(0) !=
-            (uint64_t)kvHeads * keyLength * headDim ||
-        indices.Count(0) != (uint64_t)sequence * topk) {
+        !rowMajor(query) || !rowMajor(key) || !rowMajor(value) ||
+        !rowMajor(indices)) {
         return false;
     }
 
@@ -2266,6 +2332,11 @@ extern "C" bool FastllmCudaTritonQwen4SparseAttention(
     CUdeviceptr valuePtr = (CUdeviceptr)valueData;
     CUdeviceptr indicesPtr = (CUdeviceptr)indicesData;
     CUdeviceptr outputPtr = (CUdeviceptr)outputData;
+    int64_t qHeadStride = query.strides[0], qRowStride = query.strides[1];
+    int64_t kHeadStride = key.strides[0], kRowStride = key.strides[1];
+    int64_t vHeadStride = value.strides[0], vRowStride = value.strides[1];
+    int64_t indexRowStride = indices.strides[0];
+    int64_t outHeadStride = output.strides[0], outRowStride = output.strides[1];
     int32_t sequenceArg = sequence;
     int32_t keyLengthArg = keyLength;
     CUdeviceptr globalScratch = 0;
@@ -2273,6 +2344,9 @@ extern "C" bool FastllmCudaTritonQwen4SparseAttention(
     void *args[] = {
         &queryPtr, &keyPtr, &valuePtr, &indicesPtr, &outputPtr,
         &sequenceArg, &keyLengthArg, &scale,
+        &qHeadStride, &qRowStride, &kHeadStride, &kRowStride,
+        &vHeadStride, &vRowStride, &indexRowStride,
+        &outHeadStride, &outRowStride,
         &globalScratch, &profileScratch,
     };
     CUstream stream = reinterpret_cast<CUstream>(cudaStreamPerThread);
@@ -2635,7 +2709,14 @@ extern "C" bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
         return false;
     }
 
-    int batchHeads = q.dims[0] * q.dims[1];
+    // H uses batch*heads in grid.y and O uses it in grid.z. Check before
+    // narrowing the product or allocating scratch, including direct callers.
+    const int64_t batchHeads64 = (int64_t)q.dims[0] * q.dims[1];
+    if (q.dims[0] <= 0 || q.dims[1] <= 0 ||
+        batchHeads64 > 65535 || chunks > 65535) {
+        return false;
+    }
+    const int batchHeads = (int)batchHeads64;
     TritonChunkGdnScaleScratch *scaleScratch =
         FindTritonChunkGdnScaleScratch();
     bool usePrecomputedScale =

@@ -42,6 +42,39 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
 void FastllmCudaCustomAllReduceReset();
 bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
                                 int dataType, int deviceId);
+// Optional bounded host spin for dedicated decode submission cores. The
+// pointer registration and collective fallback checks remain unchanged.
+bool FastllmCudaCustomAllReduceWithSpin(void* data, void* dest, int count,
+                                      int dataType, int deviceId, int hostSpinMicroseconds);
+// Reduce a block with the rank-ordered FP32 arithmetic selected for one row.
+// Uses the existing single-row enable policy and registers the complete block.
+// False means the caller must reduce rows separately with its ordinary path.
+bool FastllmCudaCustomAllReduceRows(void* data, void* dest, int count,
+                                    int rowElements, int dataType, int deviceId);
+// Hopper BF16 decode: allreduce(data), BF16 residual addition and Kimi-style
+// RMSNorm (BF16 normalization followed by FP32 affine and BF16 output).
+// Reads data without materializing its full reduction, updates residual, and
+// writes output. The three tensors must not overlap. Unsupported inputs or a
+// disabled custom collective return false before launching any work.
+bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
+    const float *weight, void *output, int count, int channels,
+    float eps, int dataType, int deviceId);
+// Each rank owns its equal contiguous slice of the full tensor. Gather the
+// other slices in-place, reusing the existing peer-access signals and policy.
+bool FastllmCudaCustomAllGatherRows(void* data, int count,
+                                  int rowElements, int dataType, int deviceId);
+// Rank-ordered FP32 all-reduce plus in-place BF16 equal-row all-gather.
+// dest may equal routed; shared must be disjoint from both FP32 tensors.
+// Returns false before launching work on unsupported shapes/topologies.
+bool FastllmCudaCustomAllReduceAndGather(void *routed, void *dest,
+    void *shared, int count, int deviceId);
+// Hopper BF16, width 4096: consume equal row shards directly, add to residual,
+// and apply Kimi-style RMSNorm without materializing the gathered tensor.
+// data stays unchanged; data/residual/output must be disjoint. False leaves
+// tensors untouched so the ordinary gather and norm remain the fallback.
+bool FastllmCudaCustomAllGatherAddRMSNorm(void *data, void *residual,
+    const float *weight, void *output, int count, int channels,
+    float eps, int dataType, int deviceId);
 // Reduces two independent rank-local tensors, rounds each reduction to the
 // destination type, then adds the rounded values into dest.  Keeping the two
 // reduction accumulators separate preserves the result of
@@ -64,9 +97,17 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 // Runs NCCL directly, bypassing the graph-safe custom all-reduce. Large TP
 // prefill tensors can be bandwidth-bound on the direct-peer implementation
 // even though it is faster for decode tensors.
+// Multi-rank eager calls rendezvous before and after NCCL host submission;
+// callers do not need another pair of host barriers. Capture bypasses both.
 void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count, int dataType, int deviceId);
+// Bounded host spin for callers with spare submission cores (nonpositive uses the default wait).
+void FastllmNcclAllReduceNoCustomWithSpin(void* data, void* dest, int count, int dataType,
+                                       int deviceId, int hostSpinMicroseconds);
 // Requires an initialized TP communicator and matching submissions on every rank.
 bool FastllmNcclAllGather(const void* data, void* dest, int count, int dataType, int deviceId);
+// count is the number of output elements per rank. As with AllGather, the
+// caller coordinates matching submissions on the initialized communicator.
+bool FastllmNcclReduceScatter(const void* data, void* dest, int count, int dataType, int deviceId);
 // Returns whether the TP=2 peer-access fast path can be used for this tensor.
 // Callers use this preflight to preserve their existing NCCL fallback without
 // first changing the reduction's compute or accumulation order.
@@ -76,6 +117,9 @@ bool FastllmCanUseTP2P2PAllReduceAdd(int count, int dataType, int deviceId);
 // addition into the communication kernel. Returns false without modifying the
 // tensors when the topology, data type or runtime state is not suitable.
 bool FastllmTryTP2P2PAllReduceAdd(void* data, void* dest, int count, int dataType, int deviceId);
+// Eager TP=2 small-tensor sum, including in-place reduction. Both ranks must
+// submit matching tensors. Unsupported configurations leave the tensors alone.
+bool FastllmTryTP2P2PAllReduce(void* data, void* dest, int count, int dataType, int deviceId);
 void FastllmNcclReduce(void* data, void* dest, int count, int dataType, int root, int deviceId);
 void FastllmCudaPackMoeEpPacket(void *packet, const void *hidden, size_t hiddenBytes,
                                const int32_t *indices, const float *scores, int topk);
@@ -111,11 +155,21 @@ bool FastllmMultiCudaMatMul(const fastllm::Data &input, fastllm::Data &weight, c
 }
 #endif
 
+struct FastllmCudaV41AttentionRequest;
+
 namespace fastllm {
+    // Upload a compact CPU activation once, then broadcast it to TP ranks.
+    // Unsupported layouts/devices return false before changing the input.
+    bool MultiCudaBroadcastCpuActivation(Data &input, const std::vector<int> &devices);
     // Retire EP caches keyed by a routed-expert Data object before the object's
     // address can be reused by a subsequently loaded model.
     void MultiCudaReleaseMoeWeightCaches(const Data *layerKey);
 
+    // Stable buffers and stream dependencies permit graph capture of a
+    // vocabulary-sharded projection with FP32 output and FP32/BF16 input,
+    // including uneven shard widths.
+    bool MultiCudaLinearOutputGatherPersistent(Data &input, Data &weight, Data &output,
+                                               std::shared_ptr<void> &workspace);
     bool MultiCudaLinearRow(Data &input, Data &weight, Data &bias, Data &output);
     bool MultiCudaLinearColumn(Data &input, Data &weight, Data &bias, Data &output);
     struct MultiCudaAsyncMLPHandle;
@@ -134,6 +188,27 @@ namespace fastllm {
     // fused collective can consume one partial from every device.
     bool MultiCudaLinearColumnLocal(Data &input, Data &weight, Data &bias,
                                     Data &output);
+    // Sum rank-local tensors in their current dtype and retain every replica.
+    bool MultiCudaReduceReplicated(Data &data);
+    // Optional BF16 transport with FP32 accumulation and a single final
+    // rounding. False leaves inputs untouched for the ordinary FP32 fallback.
+    bool MultiCudaTryReduceReplicatedFp32Accumulated(Data &data);
+    // Batch independent attention requests on each TP rank.
+    // workerOrdered requires producer/consumer work on the same dedicated rank
+    // streams, with buffers kept alive until the enclosing forward drains them.
+    bool MultiCudaDeepSeekV41SparseAttentionBatch(
+        const std::vector<FastllmCudaV41AttentionRequest> &requests,
+        Data &attnSink, int windowSize, float scale, const std::vector<int> &devices,
+        const std::function<void(int, int)> &before = {},
+        const std::function<void(int, int)> &after = {}, bool workerOrdered = false);
+    // Copy contiguous rows of a dense [1, tokens, width] replicated tensor
+    // independently on each rank. Retains owned destination allocations and
+    // replica layout; unsupported layouts/aliases return false without writes.
+    bool MultiCudaCopyReplicatedRows(Data &dst, const Data &src, int start, int rows,
+                                      const std::vector<int> &devices);
+    // Copy compact TP activation shards while retaining destination addresses.
+    bool MultiCudaCopyShardedActivation(Data &dst, const Data &src, const std::vector<int> &devices,
+                                       bool copyData = true);
 
     // 将常驻 MultiCUDA worker 的 per-thread stream 接入/并回调用线程正在捕获的
     // 每卡 CUDA Graph。events 必须与 devices 一一对应并归属相同设备。
@@ -147,6 +222,10 @@ namespace fastllm {
     // 保证参与计算的 tensor 生命周期覆盖整个异步区间，并在回到调用线程的
     // CUDA stream 前显式等待对应 worker event。
     bool MultiCudaSetPersistentAsyncDispatch(bool enabled);
+    // Only for an active capture whose operations and persistent tensors are
+    // all on dedicated worker streams. The caller must join the streams at
+    // entry/exit. Returns the previous thread-local setting for scoped restore.
+    bool MultiCudaSetWorkerOrderedCapture(bool enabled);
     bool MultiCudaRunDeviceCallbacks(
         const std::vector<int> &devices,
         const std::function<void(int, int)> &callback);
@@ -166,4 +245,16 @@ namespace fastllm {
     // can be captured by a multi-device CUDA Graph.
     bool MultiCudaRepeatToReplicated(Data &input, int axis, int repeatTimes,
                                      Data &output);
+    bool MultiCudaDeepSeekV41SharedSwiglu(Data &input, float limit, Data &output);
+    bool MultiCudaDeepSeekV41SharedSwigluQuantized(Data &input, float limit, Data &output);
+    // Copy a dense activation replica directly to owned CPU storage. Returns
+    // false without changing either tensor when the layout requires CopyFrom.
+    bool MultiCudaCopyReplicaToCpu(Data &dst, const Data &src,
+                                    const std::vector<int> &devices);
+    // Run the original AddTo and HcPost kernels in one rank-local dispatch.
+    // Retains the intermediate dtype rounding; false means no add was executed.
+    // A compact CPU input is copied on each worker's stream;
+    // the synchronous copy stages its source before the callback returns.
+    bool MultiCudaDeepSeekV41AddHcPost(Data &input, Data &shared, Data &residual,
+                                      Data &post, Data &comb, Data &output);
 }

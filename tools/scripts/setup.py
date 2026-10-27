@@ -3,7 +3,7 @@ import json
 import os
 from setuptools import setup
 
-server_require = ['fastapi', 'pydantic', 'openai', 'shortuuid', 'uvicorn', 'httpx>=0.27', 'websockets>=12']
+server_require = ['fastapi', 'pydantic', 'openai', 'shortuuid', 'uvicorn', 'httpx>=0.27', 'websockets>=12', 'jsonschema>=4.18']
 pptx_require = ['python-pptx>=1.0.0']
 document_require = ['pypdf>=4.0.0']
 data_require = ['pandas>=2.0.0', 'openpyxl>=3.1.0', 'XlsxWriter>=3.1.0']
@@ -37,7 +37,7 @@ if build_features.get("USE_CUDA", False) and build_features.get("USE_NCCL", Fals
     native_require.append('nvidia-nccl-cu12; platform_system == "Linux"')
 
 PACKAGE_INFO = {
-    "release": {"name": "ftllm", "version": "0.1.8.2"},
+    "release": {"name": "ftllm", "version": "1.9.0"},
     "nightly": {"name": "ftllm-nightly", "version": "0.0.0.3"},
 }
 
@@ -79,6 +79,7 @@ package_version = package_info["version"]
 setup (
     name = package_name,
     version = package_version,
+    python_requires = '>=3.10',
     author = "huangyuyang",
     author_email = "ztxz16@foxmail.com",
     description = "High-performance C++ inference engine for dense and MoE language models",
@@ -90,7 +91,7 @@ setup (
     },
     packages = ['ftllm', 'ftllm/openai_server', 'ftllm/openai_server/protocal', 'ftllm/openai_server/tool_parsers'],
     package_data = {
-        '': ['*.dll', '*.so', '*.dylib', '*.so.*', '*.html', '*.js', '*.svg', 'build_info.json',
+        '': ['*.dll', '*.so', '*.dylib', '*.so.*', '*.html', '*.js', '*.mjs', '*.svg', 'build_info.json',
              'fastllm_triton_server.py', 'launcher_assets/*',
              'launcher_assets/locales/*.json', 'webui_assets/*',
              'ui_plugins/*/*', 'plugin_assets/*']

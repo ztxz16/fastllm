@@ -33,7 +33,7 @@ bash install.sh -DUSE_TFACC=ON
 
 ### 运行demo程序
 
-我们假设已经获取了名为`model.flm`的模型（参照 [模型获取](#模型获取)，初次使用可以先下载转换好的模型)
+我们假设已经获取了名为`model.flm`的模型（参照 [模型获取](models.md)，初次使用可以先下载转换好的模型)
 
 编译完成之后在build目录下可以使用下列demo:
 

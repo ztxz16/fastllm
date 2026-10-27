@@ -22,6 +22,10 @@ Codex 页面支持会话搜索、切换、重命名、归档、逐项消息和�
 
 Codex 输入框下方提供“思考档位”，按当前模型和会话记住选择；新会话从模型默认档位开始。OpenCode 使用输入框中的 **Choose model variant** 原生菜单，Harness 使用原生模型设置中的思考档位。启动 agent 时会读取当前服务 `/v1/models` 的能力声明，模型使用别名也可识别。例如 Qwen3.5 支持 `low / medium / xhigh`，Kimi K3 支持 `low / high / max`；不会向这些模型发送不支持的通用档位。没有声明可调档位的模型继续使用服务默认设置，Codex 会显示禁用的“模型默认”及原因。更新适配代码后需重启 Launcher 并重新打开 agent；思考参数的服务端处理更新需同时重启模型服务。
 
+Qwen3.5 架构族和 Qwen4-Exp 的默认思考档位为 `xhigh`。外部客户端传入 `high`、`max`、`minimal` 或数值预算等 Qwen 不支持的通用值时，服务端回退到 `xhigh`；`low / medium / xhigh` 保持原值，`none` 仍表示关闭思考。该兼容行为覆盖 Chat Completions 的 `reasoning_effort`、Responses 的 `reasoning.effort` 和 Anthropic Messages 的 `output_config.effort`；Chat 模板参数中的 `reasoning_effort` / `thinking_effort` 也使用同一回退规则。未指定档位时仍保留服务的思考开关默认值，显式关闭思考的模板参数或 Anthropic `thinking` 设置仍优先。
+
+外部 ZCode 等客户端使用 `/v1/messages` 时，服务端会在生成结束后完成工具解析并发送最后缓冲的调用。例如 Qwen 已完整生成 `</function>`、仅缺少外层 `</tool_call>` 时，仍会发送 `tool_use`，避免客户端只收到“现在开始处理”的正文便结束。未耗尽输出预算却留下不完整工具参数，或全部调用都被判为无效时，会返回错误，不能伪装成正常 `end_turn` / `stop`；尚无有效工具调用、仅因输出预算耗尽而留下未完成调用时，仍保留 `max_tokens` / `length`，供客户端识别。Anthropic 流式响应若已输出一个完整调用、后续调用再因预算截断，目前仍返回 `tool_use`，这一混合场景尚未修复。普通文本回复的正常结束语义不变，这不能保证模型完成所有业务要求。
+
 两者都能运行命令和修改文件。Codex 使用 `workspace-write` 和 `on-request`，需要额外权限时在页面请求批准；OpenCode 使用原生权限交互。工作目录用于组织任务，不代表操作系统级隔离。它们与原来只允许前端扩展的“自定义界面”权限不同；用户自建界面仍不能声明原生执行能力。
 
 agent 管理面板复用插件注册表和管理接口，也可从 **自定义界面 → 已有自定义项与恢复 → 管理** 打开。工作室不提供外部运行环境管理。

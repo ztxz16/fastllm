@@ -19,6 +19,11 @@ namespace fastllm {
         const std::string &externalMtpPath = "",
         const std::string &mmprojPath = "");
 
+    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(
+        const std::string &fileName, const std::string &originalPath,
+        const std::string &externalMtpPath, const std::string &mmprojPath,
+        const ContextOptions &contextOptions);
+
     std::unique_ptr<basellm> CreateLLMModelFromFile(const std::string &fileName);
 
     std::unique_ptr<basellm> CreateEmptyLLMModel(const std::string &modelType);

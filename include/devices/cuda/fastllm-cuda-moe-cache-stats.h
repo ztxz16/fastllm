@@ -1,0 +1,31 @@
+#pragma once
+#include <cstdint>
+
+// Cumulative hybrid decode/verifier counters attributed to one CUDA device.
+// values[8]: layer calls, all routes, resident routes before dispatch,
+// nonresident routes, GPU execution routes, CPU execution routes,
+// resident GPU execution routes, prefetched experts.
+// Includes CPU-assigned routes; excludes prefetch lookups from residency and
+// route totals. Includes draft and small-prefill calls using the shared hybrid backend.
+// Does not include grouped prefill, Qwen4 expert parallel or pure-GPU mode.
+// GLM TP2 reports the shared route decisions on both participating devices;
+// each GPU executes a complementary shard, so do not sum these route counts.
+// Call between requests, after host inference has finished. Synchronizes the
+// device. Take snapshot differences; reading never resets scheduler or cache.
+extern "C" bool fastllm_moe_cuda_cache_route_stats(int device, uint64_t *values);
+// GLM whole-expert distribution: device count, local slots, occupied local slots,
+// local payload bytes, cached routes computed locally, uploaded expert bytes.
+// Uses the same snapshot rules as route_stats.
+extern "C" bool fastllm_moe_cuda_cache_ep_stats(int device, uint64_t *values);
+
+// Native host-expert prefill transport counters, including layout restoration.
+// values[8]: layer calls, GPU experts, GPU routes, resident experts, resident
+// routes, bytes reused without host upload, uploaded bytes, admitted experts.
+// Grouped GGUF backends have separate execution paths and are not counted here.
+// Same idle/snapshot rules as route_stats; never resets cache or policy.
+extern "C" bool fastllm_moe_cuda_cache_prefill_stats(int device, uint64_t *values);
+
+// Explicitly tagged single-device hybrid routes: 0 decode, 1 verify, 2 draft,
+// 3 small prefill. Same values/snapshot rules as route_stats. Admissions here
+// count immediate prefetches; deferred frequency-policy admissions are excluded.
+extern "C" bool fastllm_moe_cuda_cache_phase_stats(int device, int phase, uint64_t *values);

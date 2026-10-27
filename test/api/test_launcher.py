@@ -23,18 +23,20 @@ if TOOLS_DIR not in sys.path:
 
 from fastllm_pytools.launcher import (
     ASSET_DIRECTORY,
+    DownloadConfig,
     MODELSCOPE_PROGRESS_PREFIX,
     LauncherError,
     LauncherRuntime,
     _launcher_access_addresses,
     _parse_modelscope_download_progress,
+    _downloaded_model_path,
     browse_folders,
     create_launcher_app,
     fastllm_launcher,
     launcher_html,
     recommend_launch_config,
 )
-from fastllm_pytools.tui import DeployConfig, build_fastllm_argv, config_from_dict
+from fastllm_pytools.tui import DeployConfig, build_fastllm_argv, build_fastllm_env, config_from_dict
 
 
 def unused_tcp_port():
@@ -142,9 +144,9 @@ class LauncherConfigTest(unittest.TestCase):
         self.assertEqual(result["profiles"], [])
 
     def test_configuration_mode_is_saved_without_changing_legacy_profiles(self):
-        self.assertEqual(self.runtime.default_profile()["config_mode"], "long_context")
-        self.assertTrue(self.runtime.default_profile()["low_gpu_mem"])
-        for mode in ("long_context", "high_concurrency", "custom"):
+        self.assertEqual(self.runtime.default_profile()["config_mode"], "auto")
+        self.assertFalse(self.runtime.default_profile()["low_gpu_mem"])
+        for mode in ("auto", "long_context", "high_concurrency", "custom"):
             saved = self.runtime.save_profile(None, self.config(config_mode=mode))
             self.assertEqual(self.runtime.profiles()[saved["index"]]["config_mode"], mode)
             self.assertNotIn("--config_mode", self.runtime.preview(saved["profile"])["command"])
@@ -153,6 +155,146 @@ class LauncherConfigTest(unittest.TestCase):
         self.assertFalse(legacy.low_gpu_mem)
         self.assertEqual(legacy.max_batch, "3")
         self.assertEqual(legacy.max_context_length, "12345")
+
+    def test_runtime_auto_ignores_hidden_manual_overrides_and_preserves_service_settings(self):
+        saved = self.runtime.save_profile(None, self.config(
+            config_mode="auto", api_key="test-key", hide_input=True,
+            device="tp", tp="0,1", threads="invalid", max_context_length="0",
+            speculative_algorithm="dflash", speculative_draft_model_path="",
+            extra_args="--device cpu --max_context_length 1024",
+            env_vars="FT_THREADS=120 FASTLLM_CUDA_GRAPH=0", low_gpu_mem=True,
+        ))["profile"]
+        argv = build_fastllm_argv(config_from_dict(saved))
+        self.assertEqual(argv, [
+            "ftllm", "server", self.model_path, "--auto",
+            "--model_name", "qwen-local", "--host", "127.0.0.1",
+            "--port", "18080", "--api_key", "test-key", "--hide_input",
+            "--device", "cpu", "--max_context_length", "1024",
+        ])
+        self.assertEqual(build_fastllm_env(config_from_dict(saved)),
+                         {"FT_THREADS": "120", "FASTLLM_CUDA_GRAPH": "0"})
+        self.assertEqual(self.runtime.preview(saved)["errors"], [])
+        invalid = self.runtime.preview({**saved, "port": "0", "model": ""})
+        self.assertEqual({field for issue in invalid["fieldErrors"] for field in issue["fields"]},
+                         {"model", "port"})
+
+    def test_runtime_auto_passes_optional_memory_limits(self):
+        saved = self.runtime.save_profile(None, self.config(
+            config_mode="auto", auto_gpu_memory_limit="20g",
+            auto_host_memory_limit="128g",
+        ))["profile"]
+        argv = build_fastllm_argv(config_from_dict(saved))
+        self.assertIn("--auto_gpu_memory_limit", argv)
+        self.assertIn("20g", argv)
+        self.assertIn("--auto_host_memory_limit", argv)
+        self.assertIn("128g", argv)
+        self.assertEqual(self.runtime.preview(saved)["errors"], [])
+
+    def test_runtime_auto_rejects_invalid_memory_limits(self):
+        invalid = self.runtime.preview(self.config(
+            config_mode="auto", auto_gpu_memory_limit="0",
+            auto_host_memory_limit="not-a-size",
+        ))
+        self.assertEqual(
+            {field for issue in invalid["fieldErrors"] for field in issue["fields"]},
+            {"auto_gpu_memory_limit", "auto_host_memory_limit"},
+        )
+
+    def test_auto_tuning_round_trip_cli_values_and_environment(self):
+        from fastllm_pytools.util import make_normal_parser
+        saved = self.runtime.save_profile(None, self.config(
+            config_mode="auto", auto_gpu_mem_ratio="0.85", force_ddr_limit="120g",
+            auto_max_batch="2", auto_chunked_prefill_size="4096", max_batch="99",
+            extra_args='--dspark 0 --chat_template "template with spaces"',
+            env_vars='CUDA_VISIBLE_DEVICES=0,1 EXAMPLE="value with spaces"',
+        ))["profile"]
+        argv = build_fastllm_argv(config_from_dict(saved))
+        args, service_args = make_normal_parser("test").parse_known_args(argv[2:])
+        self.assertEqual(service_args, ["--model_name", "qwen-local", "--host", "127.0.0.1", "--port", "18080"])
+        for field, expected in dict(gpu_mem_ratio=.85, force_ddr_limit=120 * 1024**3,
+                                    max_batch=2, chunked_prefill_size=4096, dspark=0,
+                                    chat_template="template with spaces").items():
+            self.assertEqual(getattr(args, field), expected, field)
+            self.assertIn(field, args._auto_explicit)
+        reloaded = LauncherRuntime(self.config_path)
+        self.addCleanup(reloaded.close)
+        self.assertEqual(build_fastllm_argv(config_from_dict(reloaded.profiles()[0])), argv)
+        self.assertEqual(build_fastllm_env(config_from_dict(saved)),
+                         {"CUDA_VISIBLE_DEVICES": "0,1", "EXAMPLE": "value with spaces"})
+        self.assertEqual(self.runtime.preview(saved)["errors"], [])
+
+    def test_auto_tuning_defaults_and_manual_mode_are_isolated(self):
+        from fastllm_pytools.tui import AUTO_TUNING_OPTIONS
+        base = self.config(config_mode="auto")
+        default_argv = build_fastllm_argv(config_from_dict(base))
+        self.assertNotIn("--gpu_mem_ratio", default_argv)
+        self.assertEqual(build_fastllm_argv(config_from_dict(
+            {**base, **{field: "auto" for field in AUTO_TUNING_OPTIONS}})), default_argv)
+        manual = self.config(config_mode="custom", max_batch="4", auto_max_batch="bad",
+                             auto_gpu_mem_ratio="bad", auto_chunked_prefill_size="bad")
+        argv = build_fastllm_argv(config_from_dict(manual))
+        self.assertNotIn("--auto", argv)
+        self.assertEqual(argv[argv.index("--max_batch") + 1], "4")
+        self.assertEqual(self.runtime.preview(manual)["errors"], [])
+
+    def test_auto_tuning_reports_invalid_fields_and_custom_values(self):
+        invalid = dict(auto_max_batch="1.5", auto_chunked_prefill_size="nan",
+                       auto_gpu_mem_ratio="1.1", force_ddr_limit="0", extra_args='"', env_vars="NOT_AN_ASSIGNMENT")
+        preview = self.runtime.preview(self.config(config_mode="auto", **invalid))
+        self.assertEqual({f for e in preview["fieldErrors"] for f in e["fields"]}, set(invalid))
+        for value in ("0", "-1", "nan", "inf"):
+            self.assertTrue(self.runtime.preview(self.config(config_mode="auto", auto_gpu_mem_ratio=value))["errors"])
+
+    def test_vision_module_round_trip_and_validation(self):
+        model = os.path.join(self.temp.name, "model.gguf")
+        vision = os.path.join(self.temp.name, "mmproj with spaces.gguf")
+        for path in (model, vision):
+            with open(path, "wb"):
+                pass
+        for mode in ("auto", "custom"):
+            saved = self.runtime.save_profile(None, self.config(
+                model=model, config_mode=mode, mmproj=vision, force_ddr_limit="120g"))["profile"]
+            argv = build_fastllm_argv(config_from_dict(saved))
+            self.assertEqual(argv[argv.index("--mmproj") + 1], vision)
+            self.assertEqual(argv[argv.index("--force_ddr_limit") + 1], "120g")
+            self.assertEqual(self.runtime.preview(saved)["errors"], [])
+        for main, addon in ((self.model_path, vision), (model, self.temp.name), (model, vision + ".missing")):
+            invalid = self.runtime.preview(self.config(model=main, mmproj=addon, config_mode="auto"))
+            self.assertIn("mmproj", {f for e in invalid["fieldErrors"] for f in e["fields"]})
+        webui = self.config(model=model, command="webui", mmproj=vision)
+        self.assertNotIn("--mmproj", build_fastllm_argv(config_from_dict(webui)))
+
+    def test_host_budget_conflicts_include_custom_arguments_and_ignore_inactive_fields(self):
+        for options in (
+            {"force_ddr_limit": "120g", "auto_host_memory_limit": "120g"},
+            {"force_ddr_limit": "120g", "extra_args": "--auto-host-memory-limit=120g"},
+            {"auto_host_memory_limit": "120g", "extra_args": "--force_ddr_limit 120g"},
+            {"extra_args": "--force-ddr-limit=120g --auto_host_memory_limit 120g"},
+        ):
+            with self.subTest(options=options):
+                errors = self.runtime.preview(self.config(config_mode="auto", **options))["fieldErrors"]
+                self.assertEqual({f for e in errors for f in e["fields"]}, set(options))
+        # Saved auto-only caps must not constrain a manual launch.
+        self.assertEqual(self.runtime.preview(self.config(
+            config_mode="custom", force_ddr_limit="120g", auto_host_memory_limit="128g"))["errors"], [])
+        from fastllm_pytools.util import make_normal_parser
+        argv = build_fastllm_argv(config_from_dict(self.config(
+            config_mode="auto", force_ddr_limit="120g", auto_host_memory_limit="auto")))
+        args, _ = make_normal_parser("test").parse_known_args(argv[2:])
+        self.assertEqual(args.force_ddr_limit, 120 * 1024**3)
+        self.assertIsNone(args.auto_host_memory_limit)
+
+    def test_memory_limits_share_cli_byte_bounds_and_only_apply_in_auto_mode(self):
+        for value in ("0.1", "18446744073709551616", "nan", "-1g"):
+            with self.subTest(value=value):
+                self.assertTrue(self.runtime.preview(self.config(
+                    config_mode="auto", auto_host_memory_limit=value))["errors"])
+        for value in ("", "auto", "1Ti", "128g"):
+            with self.subTest(value=value):
+                self.assertEqual(self.runtime.preview(self.config(
+                    config_mode="auto", auto_host_memory_limit=value))["errors"], [])
+        self.assertEqual(self.runtime.preview(self.config(
+            config_mode="custom", auto_host_memory_limit="invalid"))["errors"], [])
 
     def test_configuration_modes_preserve_model_weight_context_and_chunk_defaults(self):
         model_path = os.path.join(self.temp.name, "mode-test")
@@ -307,6 +449,29 @@ class LauncherConfigTest(unittest.TestCase):
 
         self.assertTrue(any("必须一致" in error for error in preview["errors"]))
 
+    def test_api_info_requires_authentication_and_uses_live_service(self):
+        from fastapi.testclient import TestClient
+        client = TestClient(create_launcher_app(self.runtime, "control-secret"))
+        headers = {"X-FTLLM-Launcher-Token": "control-secret"}
+        path = "/api/runtime/api-info"
+        self.assertEqual(client.get(path).status_code, 403)
+        self.assertEqual(client.get(path, headers=headers).status_code, 400)
+        self.runtime._state.update(command="server", phase="running", ready=True,
+                                   sessionId="live-session", endpoint="http://127.0.0.1:8080/", modelName="live-model")
+        self.runtime._service_api_key = "live-secret"
+        self.runtime._process = SimpleNamespace(poll=lambda: None)
+        try:
+            response = client.get(path, headers=headers)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {"sessionId":"live-session", "baseUrl":"http://127.0.0.1:8080/v1",
+                                               "model":"live-model", "apiKey":"live-secret"})
+            self.assertIn("no-store", response.headers["cache-control"])
+            self.assertNotIn("live-secret", client.get("/api/runtime", headers=headers).text)
+            self.runtime._process = SimpleNamespace(poll=lambda: 1)
+            self.assertEqual(client.get(path, headers=headers).status_code, 400)
+        finally:
+            self.runtime._process = None
+
     def test_api_key_is_redacted_from_preview(self):
         preview = self.runtime.preview(self.config(api_key="local-secret"))
 
@@ -456,6 +621,53 @@ class LauncherConfigTest(unittest.TestCase):
         self.assertEqual(low_memory["strategy"], "hybrid_disk")
         self.assertEqual(low_memory["config"]["moe_device"], "disk")
 
+    def test_deepseek_v41_recommendation_counts_engram_and_fp4_experts(self):
+        model = os.path.join(self.temp.name, "DeepSeek-V4.1-Flash")
+        # 权重文件只写 40 GB（模拟下载中 / 缺少 index），常驻内存必须按结构估算：
+        # FP4 路由专家约 289 GB + 两张 FP8 Engram 表约 203 GB + 稠密部分约 16 GB
+        self.write_model(model, {
+            "architectures": ["DeepseekV41ForCausalLM"],
+            "model_type": "deepseek_v41",
+            "text_config": {
+                "model_type": "deepseek_v41_text",
+                "num_hidden_layers": 40,
+                "hidden_size": 5120,
+                "moe_intermediate_size": 2304,
+                "n_routed_experts": 384,
+                "n_shared_experts": 1,
+                "vocab_size": 129280,
+                "q_lora_rank": 1280,
+                "num_attention_heads": 64,
+                "head_dim": 512,
+                "o_lora_rank": 1024,
+                "index_n_heads": 32,
+                "index_head_dim": 128,
+                "engram_num_embeddings": [384006168, 384016682],
+                "engram_head_dim": 256,
+            },
+            "quantization_config": {"quant_method": "fp8", "expert_dtype": "fp4"},
+        }, 40)
+
+        recommendation = recommend_launch_config(
+            model,
+            self.hardware(gpu_memory_gib=(24, 24), memory_gib=943),
+        )
+
+        resident_gib = recommendation["detected"]["residentGiB"]
+        self.assertGreater(resident_gib, 450)
+        self.assertLess(resident_gib, 520)
+        self.assertEqual(recommendation["strategy"], "hybrid_numa")
+        self.assertEqual(recommendation["config"]["device"], "cuda")
+        self.assertEqual(recommendation["config"]["moe_device"], "numa")
+        self.assertFalse(recommendation["detected"]["usesNgram"])
+
+        low_memory = recommend_launch_config(
+            model,
+            self.hardware(gpu_memory_gib=(24, 24), memory_gib=400),
+        )
+        self.assertEqual(low_memory["strategy"], "hybrid_disk")
+        self.assertEqual(low_memory["config"]["moe_device"], "disk")
+
     def test_qwen_ngram_table_moves_to_disk_under_memory_pressure(self):
         model = os.path.join(self.temp.name, "Qwen4-Exp-30B")
         self.write_model(model, {
@@ -511,6 +723,7 @@ class LauncherConfigTest(unittest.TestCase):
             "targetDir": os.path.join(self.temp.name, "downloads", "qwen"),
             "revision": "master",
             "maxWorkers": "4",
+            "include": "Q2_0/*,mmproj-*.gguf",
             "token": "private-modelscope-token",
         }
         with patch(
@@ -520,9 +733,33 @@ class LauncherConfigTest(unittest.TestCase):
             preview = self.runtime.preview_download(payload)
 
         self.assertEqual(preview["errors"], [])
-        self.assertIn("modelscope download", preview["command"])
+        self.assertIn("modelscope_download.py download", preview["command"])
         self.assertNotIn("private-modelscope-token", preview["command"])
         self.assertIn("Token injected through environment", preview["command"])
+        self.assertIn("--include 'Q2_0/*'", preview["command"])
+        self.assertIn("--include 'mmproj-*.gguf'", preview["command"])
+
+    def test_downloaded_gguf_selects_filtered_first_shard_and_excludes_mmproj(self):
+        for name in ("Q2_0/model-00001-of-00002.gguf", "Q2_0/model-00002-of-00002.gguf",
+                     "IQ3_S/model.gguf", "mmproj-bf16.gguf"):
+            path = os.path.join(self.model_path, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb"):
+                pass
+        config = DownloadConfig(target_dir=self.model_path, include="Q2_0/*,mmproj-*.gguf")
+        self.assertEqual(_downloaded_model_path(config),
+                         os.path.join(self.model_path, "Q2_0/model-00001-of-00002.gguf"))
+        self.runtime._download_state["destination"] = self.model_path
+        self.runtime._watch_download(SimpleNamespace(wait=lambda: 0),
+                                    self.runtime._download_generation, config)
+        self.assertEqual(self.runtime.download_state()["modelPath"],
+                         os.path.join(self.model_path, "Q2_0/model-00001-of-00002.gguf"))
+        # Do not silently pick one variant from a complete multi-variant repo.
+        config.include = ""
+        self.assertEqual(_downloaded_model_path(config), self.model_path)
+        with open(os.path.join(self.model_path, "config.json"), "w") as stream:
+            json.dump({}, stream)
+        self.assertEqual(_downloaded_model_path(config), self.model_path)
 
     def test_download_progress_parser_rejects_invalid_events(self):
         valid = MODELSCOPE_PROGRESS_PREFIX + json.dumps({
@@ -888,6 +1125,10 @@ class LauncherProcessTest(unittest.TestCase):
             self.assertEqual(runtime.state()["speed"]["prefillTokensPerSecond"], 4500.0)
             self.assertEqual(runtime.state()["speed"]["decodeTokensPerSecond"], 123.0)
             self.assertEqual(runtime.state()["speed"]["decodeUpdatedAt"], 1002.0)
+            runtime._handle_inference_speed(
+                "[Prompt] 72 Tokens. Time: 0.246 s. Speed: 293.13 tokens / s. Batch: 1.",
+                runtime._generation)
+            self.assertEqual(runtime.state()["speed"]["prefillTokensPerSecond"], 293.13)
 
     def test_speed_ignores_invalid_and_previous_service_samples(self):
         with tempfile.TemporaryDirectory() as directory:
