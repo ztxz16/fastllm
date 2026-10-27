@@ -113,19 +113,16 @@ __global__ __launch_bounds__(256) void IndexerScores(Batch batch) {
             int valid=firstQ+row/16<rows?16:0;
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"::"r"(dst),"l"(src),"r"(valid):"memory");
         }
+        // LaunchExperimentalFP8 always stages K as local, aligned 144-byte
+        // rows. Do not resolve the generic paged/peer cache view again here.
         for (int i = tid; i < 64 * 8; i += Threads) {
             int row = i / 8, d = i % 8 * 16;
-            auto src = k.IndexRow(min(firstK + row, batch.entries[entry].keyRows - 1), stride) + d;
-            unsigned dst = (unsigned)__cvta_generic_to_shared(sk + storageOffset<true>(row, d, 64));
-            if (((size_t)src.data & 15) == 0) {
-                int valid = firstK + row < batch.entries[entry].keyRows ? 16 : 0;
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::
-                    "r"(dst), "l"(src.data), "r"(valid) : "memory");
-            } else {
-                #pragma unroll
-                for (int j=0;j<16;++j)
-                    sk[storageOffset<true>(row,d+j,64)] = firstK+row<batch.entries[entry].keyRows ? ((const unsigned char *)src.data)[j] : 0;
-            }
+            const auto *src = (const unsigned char *)k.base +
+                (size_t)min(firstK + row, batch.entries[entry].keyRows - 1) * 144 + d;
+            unsigned dst = (unsigned)__cvta_generic_to_shared(sk + storageOffset<true>(row,d,64));
+            int valid = firstK + row < batch.entries[entry].keyRows ? 16 : 0;
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::
+                "r"(dst), "l"(src), "r"(valid) : "memory");
         }
     } else {
     for (int i = tid; i < M * 16; i += Threads) {
@@ -193,7 +190,7 @@ __global__ __launch_bounds__(256) void IndexerScores(Batch batch) {
             }
             if (firstQ + row < rows && firstK + col < keys)
                 scores[(size_t)(firstQ + row) * keys + firstK + col] =
-                    firstK + col <= past + firstQ + row + (e.part && firstQ + row >= e.part ? e.gap : 0) ? total * k.IndexScale(firstK + col, stride) : -INFINITY;
+                    firstK + col <= past + firstQ + row + (e.part && firstQ + row >= e.part ? e.gap : 0) ? total * (Fp8 ? *(const float *)((const unsigned char *)k.base + (size_t)(firstK + col) * 144 + 128) : k.IndexScale(firstK + col, stride)) : -INFINITY;
         }
     }
 #endif
