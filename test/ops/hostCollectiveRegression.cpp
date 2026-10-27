@@ -96,6 +96,48 @@ template <typename T> bool Run(const std::vector<int> &devices, int dataType, in
     return errors.load() == 0;
 }
 
+template <typename T> bool RunReduceScatter(const std::vector<int> &devices,
+                                           int dataType, int count) {
+    std::atomic<int> errors{0};
+    std::vector<std::thread> workers;
+    for (int rank = 0; rank < 2; ++rank) {
+        workers.emplace_back([&, rank]() {
+            const int device = devices[rank];
+            CheckCuda(cudaSetDevice(device));
+            T *send = nullptr, *recv = nullptr;
+            CheckCuda(cudaMalloc((void **)&send, 2 * count * sizeof(T)));
+            CheckCuda(cudaMalloc((void **)&recv, count * sizeof(T)));
+            std::vector<T> input(2 * count), output(count);
+            for (int iteration = 0; iteration < 4; ++iteration) {
+                auto value = [&](int r, int i) {
+                    return FromFloat<T>((float)((i * 7 + r * 19 + iteration * 11) % 47 - 23));
+                };
+                for (int i = 0; i < 2 * count; ++i) input[i] = value(rank, i);
+                CheckCuda(cudaMemcpyAsync(send, input.data(), input.size() * sizeof(T),
+                                          cudaMemcpyHostToDevice, cudaStreamPerThread));
+                T *destination = iteration % 2 == 0 ? recv : send + rank * count;
+                if (!FastllmNcclReduceScatter(send, destination, count, dataType, device)) {
+                    std::cerr << "ReduceScatter failed on rank " << rank << '\n';
+                    std::exit(2);
+                }
+                CheckCuda(cudaMemcpyAsync(output.data(), destination, count * sizeof(T),
+                                          cudaMemcpyDeviceToHost, cudaStreamPerThread));
+                CheckCuda(cudaStreamSynchronize(cudaStreamPerThread));
+                for (int i = 0; i < count; ++i) {
+                    const int globalIndex = rank * count + i;
+                    const T expected = FromFloat<T>(ToFloat(value(0, globalIndex)) +
+                                                    ToFloat(value(1, globalIndex)));
+                    if (ToFloat(output[i]) != ToFloat(expected)) ++errors;
+                }
+            }
+            CheckCuda(cudaFree(send));
+            CheckCuda(cudaFree(recv));
+        });
+    }
+    for (auto &worker : workers) worker.join();
+    return errors.load() == 0;
+}
+
 template <typename T, typename U> T Bits(U value) {
     static_assert(sizeof(T) == sizeof(U), "Bit widths must match");
     T result;
@@ -259,6 +301,11 @@ int main() {
             ok &= Run<float>(devices, fastllm::FLOAT32, count);
             ok &= Run<int8_t>(devices, fastllm::INT8, count);
             ok &= Run<int32_t>(devices, fastllm::INT32, count);
+            ok &= RunReduceScatter<half>(devices, fastllm::FLOAT16, count);
+            ok &= RunReduceScatter<__nv_bfloat16>(devices, fastllm::BFLOAT16, count);
+            ok &= RunReduceScatter<float>(devices, fastllm::FLOAT32, count);
+            ok &= RunReduceScatter<int8_t>(devices, fastllm::INT8, count);
+            ok &= RunReduceScatter<int32_t>(devices, fastllm::INT32, count);
         }
     }
     std::cout << "host collective initialized-group regression: " << (ok ? "PASS" : "FAIL") << '\n';
