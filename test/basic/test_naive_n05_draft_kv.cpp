@@ -324,8 +324,14 @@ int main() {
                 Check(reused->committed == 2 && Bits(reused->kv[0].first) == before,
                       "fallback changed committed context");
                 model.FirstNorm().ToDevice(DataDevice::CUDA, std::vector<int>{device});
+                auto historyStorage = reused->kv[0].first.cudaData;
                 auto archived = model.Reuse(reused, true);
-                Check(archived->kv.empty(), "history request reused idle storage");
+                Check(archived->committed == 0 && !archived->kv.empty() &&
+                      archived->kv[0].first.cudaData == historyStorage,
+                      "history request did not recycle cleared storage");
+                for (const auto &pair : archived->kv)
+                    Check(pair.first.dims[1] == 0 && pair.second.dims[1] == 0,
+                          "history request retained a draft prefix");
                 auto incomplete = std::make_shared<ProjectionFixture::DraftContext>();
                 incomplete->kv.resize(3);
                 auto recovered = model.Reuse(incomplete);

@@ -195,7 +195,7 @@ static void TestResidualNorm(int channels, int rows = 1) {
         ++checks;
     }
 }
-static void TestVerifyGraph(int window, int capacity, const std::vector<int> &prefixes, bool fp8, int rows = 8, int heads = 8) {
+static void TestVerifyGraph(int window, int capacity, const std::vector<int> &prefixes, bool fp8, int rows = 8, int heads = 8, int scorePattern = 0) {
     const int dim = 192, vd = 128;
     const int kc = dim + (window ? 0 : 128), storage = (window ? window + rows : capacity) + 1;
     Data q(BFLOAT16), iq(BFLOAT16), iw(BFLOAT16), key(BFLOAT16), value(BFLOAT16);
@@ -213,6 +213,14 @@ static void TestVerifyGraph(int window, int capacity, const std::vector<int> &pr
     for (int row = 0; row < rows; ++row)
         ((int *)live.cpuData)[row] = prefixes[0] + row + 1;
     live.ToDevice(DataDevice::CUDA, {0}, true);
+    if (scorePattern == 1) Cuda(cudaMemset(iw.cudaData, 0, iw.GetBytes()));
+    if (scorePattern == 2) {
+        // More than TopK equal scores exercise stable compaction across CTAs.
+        auto repeated = Read<uint16_t>(key);
+        for (int row = 4; row < storage; ++row)
+            std::copy_n(repeated.data() + (row % 4) * kc, kc, repeated.data() + (size_t)row * kc);
+        Cuda(cudaMemcpy(key.cudaData, repeated.data(), key.GetBytes(), cudaMemcpyHostToDevice));
+    }
     auto originalK = Read<uint16_t>(key), originalV = Read<uint16_t>(value);
     auto newK = Read<uint16_t>(nk), newV = Read<uint16_t>(nv);
     FastllmNaiveDecodeScratch scratch;
@@ -676,6 +684,10 @@ int main() {
                 TestVerifyGraph(0, 32776, {2048, 32768, 2049}, fp8, rows);
         for (int heads : {4, 12, 16})
             TestVerifyGraph(0, 4096, {2048, 4088, 2049}, true, 8, heads);
+        for (bool fp8 : {false, true})
+            for (int pattern : {1, 2})
+                for (int capacity : {4096, 32776})
+                    TestVerifyGraph(0, capacity, {2048, capacity - 8, 2050}, fp8, 8, 8, pattern);
         for (int dim : {32, 128, 256}) for (int rows : {2, 7, 8})
             for (bool shortAttention : {false, true})
                 TestDraftAttention(dim, rows, 1024, shortAttention);

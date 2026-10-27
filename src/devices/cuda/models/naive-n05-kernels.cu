@@ -351,12 +351,12 @@ __global__ void CommitSwaVerify(T *key, T *value, int kc, int vc, int past) {
         value[(size_t)slot * vc + column] = value[(size_t)(kSwaWindow + row) * vc + column];
 }
 
-template <typename T, bool Dynamic = false>
+template <typename T, bool Dynamic = false, int MaxRows = kTrimMaxRows, int TileBytes = kTrimTileBytes>
 __global__ void TrimCachePairTiled(T *key, T *value, int keyColumns,
                                  int valueColumns, int drop, int keep, const int *decodeKeys = nullptr) {
     if constexpr (Dynamic) { if (*decodeKeys <= keep) return; }
-    constexpr int columns = kTrimTileBytes / sizeof(T);
-    __shared__ T rows[kTrimMaxRows * columns];
+    constexpr int columns = TileBytes / sizeof(T);
+    __shared__ T rows[MaxRows * columns];
     int keyBlocks = (keyColumns + columns - 1) / columns;
     bool isKey = blockIdx.x < keyBlocks;
     T *data = isKey ? key : value;
@@ -381,6 +381,15 @@ void LaunchTrimCachePair(T *key, T *value, int keyColumns,
         int blocks = (keyColumns + columns - 1) / columns +
                      (valueColumns + columns - 1) / columns;
         TrimCachePairTiled<<<blocks, 256>>>(key, value, keyColumns, valueColumns, drop, keep);
+    } else if (keep <= 1024) {
+        // Stage each disjoint column tile before overwriting its overlapping
+        // source. A 32-byte tile keeps the draft window within 32 KiB of shared
+        // memory and exposes parallelism across columns on every architecture.
+        constexpr int columns = 32 / sizeof(T);
+        int blocks = (keyColumns + columns - 1) / columns +
+                     (valueColumns + columns - 1) / columns;
+        TrimCachePairTiled<T, false, 1024, 32><<<blocks, 256>>>(
+            key, value, keyColumns, valueColumns, drop, keep);
     } else {
         TrimCachePair<<<(keyColumns + valueColumns + 255) / 256, 256>>>(
             key, value, keyColumns, valueColumns, drop, keep);
@@ -3985,6 +3994,22 @@ void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
     CheckLaunch();
 }
 
+#if defined(FASTLLM_NAIVE_DSA_MMA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+static void LaunchBatchDecodeIndexerTopK(const naive_indexer_batch::Batch &descriptors,
+                                        int count, int capacity) {
+    namespace batch = naive_indexer_batch;
+    if (capacity > 16384) {
+        const int blocks = std::min(naive_topk::kMaxBlocks, (capacity + 4095) / 4096);
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            batch::SplitHistogram<><<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors, shift);
+            batch::SplitThreshold<><<<count, naive_topk::kThreads>>>(descriptors, blocks, shift);
+        }
+        batch::SplitCompact<><<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors);
+    } else batch::Select<><<<count, naive_topk::kThreads>>>(descriptors);
+    batch::Sort<><<<count, naive_topk::kThreads>>>(descriptors);
+}
+#endif
+
 bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         const fastllm::Data &weights, const fastllm::Data &liveKeys,
         const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query,
@@ -5104,6 +5129,26 @@ void FastllmCudaNaiveGraphVerifyIndexer(const fastllm::Data &query,
             (const BF16 *)weights.cudaData, scoreOutput, stride, keys, capacity - 1);
     }
     auto *workspaces = (naive_topk::Workspace *)scratch.topk.cudaData;
+#if defined(FASTLLM_NAIVE_DSA_MMA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+    namespace batch = naive_indexer_batch;
+    if (FastllmCudaRuntimeArch() == 90 && rows >= 4 && rows <= batch::BatchLimit &&
+        capacity <= naive_topk::kMaxKeys) {
+        // Reuse the batched decode selector on independent causal rows. The
+        // score arithmetic and stable tie order stay unchanged; other devices
+        // and shapes retain the cooperative per-row implementation below.
+        batch::Batch descriptors{};
+        for (int row = 0; row < rows; ++row) {
+            auto &r = descriptors.rows[row];
+            r.live = (const int *)liveKeys.cudaData + row;
+            r.scores = (unsigned *)scratch.indexScores.cudaData + (size_t)row * capacity;
+            r.workspace = workspaces + row;
+            r.indices = (int *)indices.cudaData + row * naive_topk::kTopK;
+        }
+        LaunchBatchDecodeIndexerTopK(descriptors, rows, capacity);
+        CheckLaunch();
+        return;
+    }
+#endif
     for (int row = 0; row < rows; ++row) {
         auto *workspace = workspaces + row;
         auto *scores = (const unsigned *)scratch.indexScores.cudaData + (size_t)row * capacity;
