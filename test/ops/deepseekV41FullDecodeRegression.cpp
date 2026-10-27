@@ -269,8 +269,14 @@ int main(int argc, char **argv) {
                         CopyDevice(qr, q0);
                         CopyDevice(kr, kv0);
                         CopyDevice(iqr, iq0);
-                        Cuda(cudaMemsetAsync(cand.cudaData, 1, cand.GetBytes(),
-                                             cudaStreamPerThread));
+                        std::vector<uint8_t> hostMask(size_t(batch) * maxBlocks, 1);
+                        if (maskMode == 2)
+                            for (int row = 0; row < batch; ++row)
+                                for (int block = 0; block < maxBlocks; ++block)
+                                    hostMask[size_t(row) * maxBlocks + block] = position % 5 == 0 ? 0 :
+                                        position % 3 == 0 ? 1 : (block + row * 3 + position) % 11 < 2;
+                        Cuda(cudaMemcpyAsync(cand.cudaData, hostMask.data(), hostMask.size(),
+                                             cudaMemcpyHostToDevice, cudaStreamPerThread));
                         CopyDevice(cr, cand);
                         std::vector<Data> vq(batch), vk(batch), vo(batch), viq(batch), viw(batch),
                             vkeys(batch), vtop(batch), vcand(batch), vcmp(batch);

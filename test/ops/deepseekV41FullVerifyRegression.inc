@@ -108,7 +108,15 @@ static void RunVerifyRegression() {
                     CopyDevice(cmp, rc);
                     CopyDevice(keys, rk);
                     ring0.CopyFrom(r);
-                    Cuda(cudaMemsetAsync(cand.cudaData, 1, cand.GetBytes(), cudaStreamPerThread));
+                    std::vector<uint8_t> hostMask(size_t(tokens) * maxBlocks, 1);
+                    if (mask == 2) {
+                        for (int row = 0; row < tokens; ++row)
+                            for (int block = 0; block < maxBlocks; ++block)
+                                hostMask[size_t(row) * maxBlocks + block] = pos % 5 == 0 ? 0 :
+                                    pos % 3 == 0 ? 1 : (block + row * 3 + pos) % 11 < 2;
+                    }
+                    Cuda(cudaMemcpyAsync(cand.cudaData, hostMask.data(), hostMask.size(),
+                                         cudaMemcpyHostToDevice, cudaStreamPerThread));
                     auto rotary = [&](Data &x, int start, int step, int mode,
                                       bool inverse = false) {
                         Check(FastllmCudaDeepSeekV41RotaryQuant(
@@ -176,8 +184,11 @@ static void RunVerifyRegression() {
                         if (mask == 2) {
                             Fill(refCand, {1, tokens, (count + c.blockSize - 1) / c.blockSize}, 0,
                                  INT8);
-                            Cuda(cudaMemsetAsync(refCand.cudaData, 1, refCand.GetBytes(),
-                                                 cudaStreamPerThread));
+                            const int blocks = (count + c.blockSize - 1) / c.blockSize;
+                            for (int row = 0; row < tokens; ++row)
+                                Cuda(cudaMemcpyAsync((uint8_t*)refCand.cudaData + size_t(row) * blocks,
+                                    hostMask.data() + size_t(row) * maxBlocks, blocks,
+                                    cudaMemcpyHostToDevice, cudaStreamPerThread));
                         }
                         Check(FastllmCudaDeepSeekV41IndexerTopK(
                                   refScores, mask == 2 ? &refCand : nullptr, c.topK, ratio, pos,

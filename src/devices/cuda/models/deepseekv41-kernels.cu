@@ -1983,12 +1983,40 @@ namespace {
         int32_t *output;
         int heads, count, width, position, blocks;
         bool writeCandidates, useCandidates;
+        int *candidateBlocks = nullptr, *candidateCount = nullptr;
+        int candidateBlockSize = 0;
     };
+
+    // Preserve every selected block, including threshold ties. Unlike a fixed
+    // top-block budget this list cannot silently drop valid candidates.
+    __global__ void V41CompactIndexCandidates(V41DecodeIndexDescriptor *items, int blockSize, int ratio) {
+        using Scan = cub::BlockScan<int, 256>;
+        __shared__ typename Scan::TempStorage storage;
+        const auto item = items[blockIdx.x];
+        const int visible = min(item.count, (item.position + 1) / ratio);
+        if (visible <= 16384) {
+            if (threadIdx.x == 0) *item.candidateCount = -1;
+            return;
+        }
+        const int blocks = min(item.blocks, (visible + blockSize - 1) / blockSize);
+        int total = 0;
+        for (int base = 0; base < blocks; base += 256) {
+            const int block = base + threadIdx.x;
+            const int keep = block < blocks && item.candidates[block] != 0;
+            int before = 0, count = 0;
+            Scan(storage).ExclusiveSum(keep, before, count);
+            __syncthreads();
+            if (keep) item.candidateBlocks[total + before] = block;
+            total += count;
+        }
+        if (threadIdx.x == 0)
+            *item.candidateCount = total * blockSize >= visible / 2 ? -1 : total;
+    }
 
     // Decode uses heads as the MMA rows instead of padding one token to the
     // prefill kernel's 64 rows. Keep the dot-product and ordered head-sum
     // operations unchanged; the prefill kernel remains the general fallback.
-    template <bool BATCHED = false, bool PERSISTENT = false, bool MULTIROW = false>
+    template <bool BATCHED = false, bool PERSISTENT = false, bool MULTIROW = false, bool SPARSE = false>
     __global__ void __launch_bounds__(256)
     V41IndexerScoreDecodeMmaKernel(const __nv_bfloat16 *q, const float *weights,
                                    const __nv_bfloat16 *k, int heads, int m,
@@ -2000,10 +2028,19 @@ namespace {
         __shared__ __nv_bfloat16 qs[16][136];
         __shared__ float scores[16][64];
         int b = blockIdx.y;
+        const int *candidateBlocks = nullptr;
+        int candidateCount = 0, candidateBlockSize = 0;
         if (BATCHED) {
             const auto item = items[b];
             q = item.query; k = item.keys; weights = item.weights; out = item.scores;
             heads = item.heads; m = item.count; startPos = item.position; b = 0;
+            if constexpr (PERSISTENT && SPARSE) {
+                if (item.useCandidates && item.candidateBlocks && *item.candidateCount >= 0) {
+                    candidateBlocks = item.candidateBlocks;
+                    candidateCount = *item.candidateCount;
+                    candidateBlockSize = item.candidateBlockSize;
+                }
+            }
         } else if constexpr (MULTIROW) {
             // Each query keeps decode's head-wise MMA and accumulation order.
             // Keys are shared by rows of the same request, not across requests.
@@ -2018,18 +2055,24 @@ namespace {
         }
         const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
         const int visible = ratio > 0 ? min(m, (startPos + 1) / ratio) : m;
-        const int end = PERSISTENT ? visible : (int)(blockIdx.x + 1) * 64;
+        const int end = candidateBlocks ? candidateCount * candidateBlockSize :
+            PERSISTENT ? visible : (int)(blockIdx.x + 1) * 64;
+        auto keyAt = [&](int offset) {
+            return candidateBlocks ? (offset < end ? candidateBlocks[offset / candidateBlockSize] *
+                candidateBlockSize + offset % candidateBlockSize : m) : offset;
+        };
         for (int j0 = blockIdx.x * 64; j0 < end; j0 += gridDim.x * 64) {
-        if (j0 >= visible) {
+        if (!candidateBlocks && j0 >= visible) {
             if (tid < 64 && j0 + tid < m) out[(uint64_t)b * m + j0 + tid] = -INFINITY;
             return;
         }
         for (int v = tid; v < 64 * 16; v += 256) {
             const int j = v / 16, d = (v % 16) * 8;
-            if (j0 + j >= m) {
+            const int key = keyAt(j0 + j);
+            if (key >= m) {
                 *((float4*)&ks[j][d]) = make_float4(0, 0, 0, 0);
             } else if (k8 != nullptr) {
-                const uint8_t *row = k8 + ((uint64_t)b * m + j0 + j) * kRowBytes;
+                const uint8_t *row = k8 + ((uint64_t)b * m + key) * kRowBytes;
                 if (vecUnpack) V41LoadKvRow8Bf16(row, 128, d, kMode, &ks[j][d]);
                 else {
 #pragma unroll
@@ -2037,7 +2080,7 @@ namespace {
                         ks[j][d + e] = __float2bfloat16_rn(V41LoadKvRow(row, 128, d + e, kMode));
                 }
             } else {
-                *((float4*)&ks[j][d]) = *((const float4*)(k + ((uint64_t)b * m + j0 + j) * 128 + d));
+                *((float4*)&ks[j][d]) = *((const float4*)(k + ((uint64_t)b * m + key) * 128 + d));
             }
         }
         float total = 0.0f;
@@ -2069,7 +2112,10 @@ namespace {
                     total += fmaxf(scores[h][tid], 0.0f) * weights[(uint64_t)b * heads + h0 + h];
             }
         }
-        if (tid < 64 && j0 + tid < m) out[(uint64_t)b * m + j0 + tid] = total;
+        if (tid < 64) {
+            const int key = keyAt(j0 + tid);
+            if (key < m) out[(uint64_t)b * m + key] = total;
+        }
         if constexpr (PERSISTENT) __syncthreads();
         }
 #endif
@@ -6238,6 +6284,7 @@ struct V41FullDecodePlan {
     float *indexScores = nullptr, *blockScores = nullptr, *attentionScores = nullptr;
     uint8_t *topKMemory = nullptr;
     V41TopKWorkspace topKWorkspace;
+    int *candidateBlocks = nullptr, *candidateCounts = nullptr;
     cudaEvent_t copied = nullptr;
     ~V41FullDecodePlan() {
         int old = 0; cudaGetDevice(&old); cudaSetDevice(device);
@@ -6250,7 +6297,8 @@ struct V41FullDecodePlan {
         for (void *p : {static_cast<void *>(transforms),
                        static_cast<void *>(index), static_cast<void *>(attention),
                        static_cast<void *>(indexScores), static_cast<void *>(blockScores),
-                       static_cast<void *>(attentionScores), static_cast<void *>(topKMemory)}) if (p) cudaFree(p);
+                       static_cast<void *>(attentionScores), static_cast<void *>(topKMemory),
+                       static_cast<void *>(candidateBlocks), static_cast<void *>(candidateCounts)}) if (p) cudaFree(p);
         cudaSetDevice(old);
     }
 };
@@ -6261,7 +6309,8 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
         int i, FastllmV41FullDecodeConfig c, FastllmV41FullDecodeBuffers b,
         const FastllmV41FullDecodeRequest *requests, V41DecodeTransformDescriptor *transforms,
         V41DecodeIndexDescriptor *index, V41AttentionDescriptor *attention,
-        float *indexScores, float *blockScores, float *attentionScores, int tiles) {
+        float *indexScores, float *blockScores, float *attentionScores, int tiles,
+        int *candidateBlocks, int *candidateCounts) {
     const auto r = requests[i];
     const int end = c.verifying ? requests[0].position + c.batch : r.position + 1;
     const int count = c.ratio ? end / c.ratio : 0;
@@ -6291,6 +6340,11 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
             indexScores + (size_t)i * c.maxKeys, blockScores + (size_t)i * maxBlocks,
             cand, tk, c.indexHeads, count, min(count, c.topK), r.position, blocks,
             c.writeCandidates, c.useCandidates};
+        if (candidateBlocks) {
+            index[i].candidateBlocks = candidateBlocks + (size_t)i * maxBlocks;
+            index[i].candidateCount = candidateCounts + i;
+            index[i].candidateBlockSize = c.blockSize;
+        }
     }
     V41AttentionDescriptor a{};
     a.q = q;
@@ -6312,11 +6366,12 @@ __global__ void V41FullDecodePrepareKernel(
         const FastllmV41FullDecodeRequest *requests, V41DecodeTransformDescriptor *transforms,
         V41DecodeIndexDescriptor *index, V41AttentionDescriptor *attention,
         float *indexScores, float *blockScores, float *attentionScores, int tiles,
-        V41RopeTable rope) {
+        V41RopeTable rope, int *candidateBlocks, int *candidateCounts) {
     const int token = blockIdx.y;
     if (blockIdx.x == 0 && threadIdx.x == 0)
         V41FullDecodeSetupRow(token, c, b, requests, transforms, index, attention,
-                             indexScores, blockScores, attentionScores, tiles);
+                             indexScores, blockScores, attentionScores, tiles,
+                             candidateBlocks, candidateCounts);
     const bool kv = blockIdx.x == c.heads;
     auto *input = kv ? static_cast<__nv_bfloat16 *>(b.kv) + (size_t)token * 512 :
         static_cast<__nv_bfloat16 *>(b.q) + ((size_t)token * c.heads + blockIdx.x) * 512;
@@ -6449,6 +6504,8 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         if (!V41MmaKernelReady<V41SparseAttentionMmaKernel<2, true, true>, kMmaThreads, sizeof(V41MmaPvShared<2>)>()) return nullptr;
     } else if (!V41MmaKernelReady<V41SparseAttentionMmaKernel<8, true, true>, kMmaThreads, sizeof(V41MmaPvShared<8>)>()) return nullptr;
     if (c.indexSource && !V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<true, true>, 256>()) return nullptr;
+    if (c.indexSource && c.useCandidates && !c.writeCandidates &&
+        !V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<true, true, false, true>, 256>()) return nullptr;
     // The full verification plan uses BF16 KV. On SM90, overlap each
     // 64-candidate tile's math with the next KV/score gather. Keep the
     // existing path for other architectures, decode and other head groups.
@@ -6481,6 +6538,8 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         ok = ok && alloc(&p->topKMemory, layout.Bytes(c.batch));
         p->topKWorkspace = V41TopKLayout(p->topKMemory, c.batch, c.maxKeys, c.topK, c.blockSize);
     }
+    if (c.indexSource && c.useCandidates && !c.writeCandidates)
+        ok = ok && alloc(&p->candidateBlocks, (size_t)c.batch * blocks) && alloc(&p->candidateCounts, c.batch);
     if (!b.requests)
         ok = ok && cudaHostAlloc(reinterpret_cast<void **>(&p->host), (size_t)c.batch * sizeof(*p->host), cudaHostAllocDefault) == cudaSuccess &&
              cudaEventCreateWithFlags(&p->copied, cudaEventDisableTiming) == cudaSuccess;
@@ -6556,7 +6615,8 @@ bool FastllmCudaV41PrepareFullDecode(void *handle) {
     const auto &c = p->config; const auto &b = p->buffers;
     V41FullDecodePrepareKernel<<<dim3(c.heads + 1, c.batch), 512, 0, cudaStreamPerThread>>>(
         c, b, p->requests, p->transforms, p->index, p->attention,
-        p->indexScores, p->blockScores, p->attentionScores, p->tiles, p->rope);
+        p->indexScores, p->blockScores, p->attentionScores, p->tiles, p->rope,
+        p->candidateBlocks, p->candidateCounts);
     if (c.kvSource) {
         if (c.verifying)
             V41FullVerifyGather<<<c.batch, 512, 0, cudaStreamPerThread>>>(c, b, p->requests);
@@ -6585,8 +6645,14 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
     }
     if (c.indexSource) {
         V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3((c.indexHeads + 3) / 4, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 4, p->rope, c.ropeDim, c.window);
-        V41IndexerScoreDecodeMmaKernel<true, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
-            nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
+        if (p->candidateBlocks) {
+            V41CompactIndexCandidates<<<c.batch, 256, 0, cudaStreamPerThread>>>(p->index, c.blockSize, c.ratio);
+            V41IndexerScoreDecodeMmaKernel<true, true, false, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
+                nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
+        } else {
+            V41IndexerScoreDecodeMmaKernel<true, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
+                nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
+        }
         if (c.writeCandidates) {
             V41BlockScoreKernel<true><<<c.batch, 256, 0, cudaStreamPerThread>>>(nullptr, 1, 0, c.blockSize, 0, c.ratio, 0, nullptr, p->index);
             V41CandidateSelectKernel<true><<<c.batch, kSelThreads, 0, cudaStreamPerThread>>>(nullptr, 0, c.candidateTopK, nullptr, p->index);
