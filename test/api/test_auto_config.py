@@ -30,9 +30,13 @@ class AutoConfigTest(unittest.TestCase):
         self.ram = {'total': 32 * GiB, 'available': 32 * GiB}
 
     def resolve(self, a, *, use_numa=True):
+        # Keep planning-policy fixtures independent of this host's CPU quota
+        # and CUDA device count. CPU calibration has dedicated tests below.
         with patch.object(memory, 'model_inputs', return_value=({}, [], self.g)), \
                 patch.object(memory, 'geometry', return_value=self.g), \
                 patch.object(memory, 'weight_costs', return_value=self.costs), \
+                patch.object(auto, 'cpu_threads', return_value=36), \
+                patch('fastllm_pytools.util._cuda_device_count', return_value=len(self.gpu)), \
                 patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
             return auto.resolve(a, self.gpu.__getitem__, hardware=self.hardware,
                                 ram=self.ram, use_numa=use_numa)
@@ -452,6 +456,23 @@ class AutoConfigTest(unittest.TestCase):
                     patch.dict(os.environ, environment, clear=True), \
                     patch.object(Path, 'glob', return_value=[Path('node0'), Path('node1')]):
                 self.assertEqual(auto.cpu_threads(), expected)
+
+    def test_explicit_threads_skip_linear_calibration(self):
+        from fastllm_pytools import cpu_tuning
+        self.g.hidden, self.g.intermediate = 2048, 1024
+        with patch.object(cpu_tuning, 'select_threads', side_effect=AssertionError('explicit threads must skip')):
+            p = self.resolve(self.args('-t', '8'))
+        self.assertEqual(p['threads'], 8)
+
+    def test_auto_threads_record_linear_calibration(self):
+        from fastllm_pytools import cpu_tuning
+        self.g.hidden, self.g.intermediate = 2048, 1024
+        detail = {'selected': 6, 'method': 'quantized-gemv', 'elapsed_ms': 200}
+        with patch.object(cpu_tuning, 'select_threads', return_value=(6, detail)) as calibrate:
+            p = self.resolve(self.args())
+        calibrate.assert_called_once()
+        self.assertEqual(p['threads'], 6)
+        self.assertEqual(p['automatic']['cpu_thread_benchmark'], detail)
 
     def test_explicit_parameters_override_policy_even_when_equal_to_defaults(self):
         a = self.args('--device', 'cuda:1', '--tp', 'off', '--moe_cuda_cache', '0',

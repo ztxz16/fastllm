@@ -7,6 +7,7 @@
 #include "devices/disk/diskdevice.h"
 #include "moe_cache_config.h"
 #include "utils/autotune.h"
+#include "cpu_thread_bench.h"
 
 #include <cstring>
 #include <csignal>
@@ -90,6 +91,17 @@ extern "C" {
 
     DLL_EXPORT int get_cpu_threads() {
         return fastllm::GetThreads();
+    }
+
+    DLL_EXPORT const char *benchmark_cpu_linear_threads(int hidden, int intermediate, int kind,
+            const int *counts, int count, int budgetMs) {
+        static thread_local std::string result;
+        try {
+            if (!counts || count < 1 || count > 8 || hidden < 1 || intermediate < 1 ||
+                    budgetMs < 1 || budgetMs > 1000) return nullptr;
+            result = BenchmarkCpuLinearThreads(hidden, intermediate, kind, counts, count, budgetMs);
+            return result.c_str();
+        } catch (...) { return nullptr; }
     }
 
     DLL_EXPORT void set_cpu_low_mem(bool low) {

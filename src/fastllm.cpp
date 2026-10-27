@@ -523,17 +523,15 @@ namespace fastllm {
 #ifdef PY_API
         py::gil_scoped_release release;
 #endif
-        globalLocker.lock();
+        std::lock_guard<std::mutex> lock(globalLocker);
+        t = std::max(1, t);
         if (fastllmAliveThreadPool != nullptr) {
             fastllmAliveThreadPool->ResizeThreads(t);
-        } else {
-            fastllmAliveThreadPool = new AliveThreadPool(t);
         }
-        threads = fastllmAliveThreadPool->threads.size();
-        globalLocker.unlock();
-#ifdef PY_API
-        py::gil_scoped_acquire acquire;
-#endif
+        // NUMA discovery also sets a default during library initialization.
+        // Record it without creating workers, so explicit/auto configuration
+        // can replace it before the first CPU operation needs the pool.
+        threads = t;
     }
     void SetThreads(int t) {
         SetAliveThreads(t);
@@ -597,8 +595,9 @@ namespace fastllm {
     }
 
     AliveThreadPool *GetAlivePool() {
+        std::lock_guard<std::mutex> lock(globalLocker);
         if (fastllmAliveThreadPool == nullptr) {
-            SetAliveThreads(threads);
+            fastllmAliveThreadPool = new AliveThreadPool(threads);
         }
         return fastllmAliveThreadPool;
     }

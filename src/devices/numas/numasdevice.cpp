@@ -606,20 +606,20 @@ namespace fastllm {
             }
             return &config;
         }
-        numaConfigLocker.lock();
+        std::lock_guard<std::mutex> lock(numaConfigLocker);
+        static int configuredPoolThreads = -1;
         auto *pool = GetAlivePool();
-        if (fastllmNumaConfig == nullptr) {
-            // AliveThreadPool keeps previously-created worker objects when
-            // SetThreads() shrinks the active range.  Using vector::size()
-            // here silently ignored a later `-t N` and reactivated every
-            // old worker for NUMA.  NumaConfig uses worker ids from zero, so
-            // the active interval end is the requested pool size.
-            int activeThreads = pool->curActivateThreadInterval.second;
+        int activeThreads = pool->curActivateThreadInterval.second;
+        if (fastllmNumaConfig == nullptr || configuredPoolThreads != activeThreads) {
+            // NumaConfig uses worker ids from zero up to the configured
+            // pool size. SetThreads() keeps allocated and active counts equal.
             numaPoolConfigured.store(true, std::memory_order_release);
-            fastllmNumaConfig = new NumaConfig(
-                activeThreads, pool, &machineNumaInfo);
+            if (fastllmNumaConfig == nullptr) fastllmNumaConfig = new NumaConfig();
+            // Keep the config object's address stable, but refresh worker
+            // assignments after a pool resize (including newly grown workers).
+            *fastllmNumaConfig = NumaConfig(activeThreads, pool, &machineNumaInfo);
+            configuredPoolThreads = activeThreads;
         }
-        numaConfigLocker.unlock();
         
         return fastllmNumaConfig;
     }

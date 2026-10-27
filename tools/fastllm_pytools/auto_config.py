@@ -119,7 +119,7 @@ def cuda_hardware():
 
 
 def cpu_threads():
-    """Honor native thread overrides, otherwise leave launch/IO headroom."""
+    """Honor overrides; bound automatic workers by affinity and CPU quota."""
     if "FT_THREADS" in os.environ:
         return int(os.environ["FT_THREADS"])
     if "FASTLLM_NUMA_THREADS" in os.environ:
@@ -136,7 +136,8 @@ def cpu_threads():
             cores.add(((path / "physical_package_id").read_text(), (path / "core_id").read_text()))
         except OSError:
             cores.add((0, cpu))
-    return max(1, len(cores) - min(4, len(cores) // 4))
+    from .cpu_tuning import thread_limit
+    return thread_limit(len(cores))
 
 
 def topologies(args, explicit, hardware, gpu, family=None):
@@ -483,6 +484,8 @@ def _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model, info, 
                            "gpu_memory_limit": result.get("auto_gpu_memory_limit"),
                            "host_memory_limit": result.get("auto_host_memory_limit"),
                            "force_ddr_limit": result.get("force_ddr_limit")}
+    if hasattr(trial, "_cpu_thread_benchmark"):
+        result["automatic"]["cpu_thread_benchmark"] = trial._cpu_thread_benchmark
     print("[auto] " + json.dumps(result, sort_keys=True), flush=True)
     return result
 
@@ -506,6 +509,13 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if base.threads < 1:
         raise ValueError("--auto requires positive CPU threads")
     metadata, tensors, model = memory.model_inputs(base)
+    if (("threads" not in explicit or args.threads == -1) and
+            "FT_THREADS" not in os.environ and "FASTLLM_NUMA_THREADS" not in os.environ and
+            model.hidden >= 1024 and model.intermediate >= 256):
+        from .cpu_tuning import select_threads
+        kinds = {t.kind for t in tensors if memory._is_routed_expert(t.name)}
+        base.threads, base._cpu_thread_benchmark = select_threads(
+            model.hidden, model.intermediate, 16 if 'gguf:16' in kinds else 12, base.threads)
     # Dense Qwen3's graph warmup currently hits stream-capture-unsupported
     # in the deferred CUDA pool. Keep its new auto adapter on eager CUDA;
     # an explicit environment override still opts into graph execution.
@@ -740,6 +750,8 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     result["automatic"]["host_memory_limit"] = result.get("auto_host_memory_limit")
     result["automatic"]["force_ddr_limit"] = result.get("force_ddr_limit")
     result["automatic"]["disk_cache_ratio"] = ratio
+    if hasattr(chosen, "_cpu_thread_benchmark"):
+        result["automatic"]["cpu_thread_benchmark"] = chosen._cpu_thread_benchmark
     if chosen.dspark:
         result["automatic"]["dspark_confidence_threshold"] = chosen.speculative_dspark_confidence_threshold
     for name in changed:
