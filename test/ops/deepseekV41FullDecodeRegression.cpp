@@ -9,6 +9,7 @@
 #include "devices/cuda/fastllm-v41-full-decode.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -102,6 +103,25 @@ struct CandidateReuseProducer {
     }
     bool Upload(const FastllmV41FullDecodeRequest *rows, size_t count) {
         return !plan || FastllmCudaV41UploadFullDecode(plan, rows, count);
+    }
+    void Validate(const FastllmV41FullDecodeConfig &c, const std::vector<uint8_t> &mask, int position) {
+        if (!plan) return;
+        const int stride = (c.maxKeys + c.blockSize - 1) / c.blockSize;
+        std::vector<int> actual((size_t)c.batch * stride), sizes(c.batch);
+        Cuda(cudaMemcpy(actual.data(), blocks.cudaData, actual.size() * sizeof(int), cudaMemcpyDeviceToHost));
+        Cuda(cudaMemcpy(sizes.data(), counts.cudaData, sizes.size() * sizeof(int), cudaMemcpyDeviceToHost));
+        for (int row = 0; row < c.batch; ++row) {
+            const int visible = (position + row + 1) / c.ratio;
+            std::vector<int> expected;
+            if (visible > 16384)
+                for (int block = 0; block < (visible + c.blockSize - 1) / c.blockSize; ++block)
+                    if (mask[(size_t)row * stride + block]) expected.push_back(block);
+            const int size = visible <= 16384 || (int)expected.size() * c.blockSize >= visible / 2
+                ? -1 : (int)expected.size();
+            Check(sizes[row] == size, "candidate count / dense fallback oracle");
+            Check(std::equal(expected.begin(), expected.end(), actual.begin() + (size_t)row * stride),
+                  "stable candidate list oracle");
+        }
     }
     void Launch() {
         if (!plan) return;

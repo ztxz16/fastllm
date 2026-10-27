@@ -123,6 +123,10 @@ static void RunVerifyRegression() {
                                 hostMask[size_t(row) * maxBlocks + block] = pos % 5 == 0 ? 0 :
                                     pos % 3 == 0 ? 1 : (block + row * 3 + pos) % 11 < 2;
                     }
+                    // Compaction must interpret every nonzero byte as selected.
+                    if (sharedCandidates)
+                        for (size_t i = 0; i < hostMask.size(); ++i)
+                            if (hostMask[i]) hostMask[i] = i % 3 == 0 ? 255 : i % 3 == 1 ? 7 : 1;
                     Cuda(cudaMemcpyAsync(cand.cudaData, hostMask.data(), hostMask.size(),
                                          cudaMemcpyHostToDevice, cudaStreamPerThread));
                     auto rotary = [&](Data &x, int start, int step, int mode,
@@ -212,6 +216,7 @@ static void RunVerifyRegression() {
                     upload(pos, r);
                     Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
                     Cuda(cudaDeviceSynchronize());
+                    producer.Validate(c, hostMask, pos);
                     Equal(q, qr, "verify q");
                     Equal(kv, kr, "verify kv");
                     Equal(out, refOut, "verify output");

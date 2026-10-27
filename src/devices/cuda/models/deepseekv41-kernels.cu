@@ -1989,6 +1989,8 @@ namespace {
 
     // Preserve every selected block, including threshold ties. Unlike a fixed
     // top-block budget this list cannot silently drop valid candidates.
+    // Stable compaction needs one CTA scan when each thread owns an ordered
+    // contiguous span, instead of one CTA scan for every 256 mask bytes.
     __global__ void V41CompactIndexCandidates(V41DecodeIndexDescriptor *items, int blockSize, int ratio) {
         using Scan = cub::BlockScan<int, 256>;
         __shared__ typename Scan::TempStorage storage;
@@ -1999,18 +2001,33 @@ namespace {
             return;
         }
         const int blocks = min(item.blocks, (visible + blockSize - 1) / blockSize);
-        int total = 0;
-        for (int base = 0; base < blocks; base += 256) {
-            const int block = base + threadIdx.x;
-            const int keep = block < blocks && item.candidates[block] != 0;
-            int before = 0, count = 0;
-            Scan(storage).ExclusiveSum(keep, before, count);
-            __syncthreads();
-            if (keep) item.candidateBlocks[total + before] = block;
-            total += count;
+        const int span = ((blocks + 255) / 256 + 3) & ~3;
+        const int first = threadIdx.x * span, end = min(blocks, first + span);
+        const bool aligned = (reinterpret_cast<uintptr_t>(item.candidates) & 3) == 0;
+        int local = 0, j = first;
+        if (aligned) {
+            for (; j + 4 <= end; j += 4) {
+                const unsigned mask = *reinterpret_cast<const unsigned *>(item.candidates + j);
+                local += __popc(__vsetne4(mask, 0));
+            }
         }
-        if (threadIdx.x == 0)
-            *item.candidateCount = total * blockSize >= visible / 2 ? -1 : total;
+        for (; j < end; ++j) local += item.candidates[j] != 0;
+        int before, total;
+        Scan(storage).ExclusiveSum(local, before, total);
+        if (threadIdx.x == 0) *item.candidateCount = total * blockSize >= visible / 2 ? -1 : total;
+        j = first;
+        if (aligned) {
+            for (; j + 4 <= end; j += 4) {
+                const unsigned mask = *reinterpret_cast<const unsigned *>(item.candidates + j);
+                if (mask) {
+    #pragma unroll
+                    for (int d = 0; d < 4; ++d)
+                        if ((mask >> (d * 8)) & 255) item.candidateBlocks[before++] = j + d;
+                }
+            }
+        }
+        for (; j < end; ++j)
+            if (item.candidates[j]) item.candidateBlocks[before++] = j;
     }
 
     // Decode uses heads as the MMA rows instead of padding one token to the
