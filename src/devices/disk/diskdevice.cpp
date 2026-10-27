@@ -2530,13 +2530,14 @@ namespace fastllm {
             maintenanceCpuBytes = hostBytes;
             ++maintenanceGeneration;
             try {
-                maintenance = prefetch.Submit(std::packaged_task<void()>([this, work = std::move(work)]() mutable {
+                auto pending = std::make_shared<Work>(std::move(work));
+                maintenance = prefetch.Submit(std::packaged_task<void()>([this, pending]() {
                     std::lock_guard<std::mutex> lock(mutex);
                     struct ReleaseBudget {
                         uint64_t &bytes;
                         ~ReleaseBudget() { bytes = 0; }
                     } release{maintenanceCpuBytes};
-                    work();
+                    (*pending)();
                 })).share();
             } catch (...) {
                 maintenanceCpuBytes = 0;
@@ -2961,9 +2962,10 @@ namespace fastllm {
             const size_t capacity = (weight->GetBytes() + 8192 + 4095) & ~size_t(4095);
             auto *storage = ahead.storage + offset;
             auto &ready = ahead.items[weight];
-            std::packaged_task<const uint8_t *()> job([=] { return ReadDiskGGUFPinned(*weight, storage, capacity); });
-            ready = job.get_future().share();
-            cache.streamedPrefetch.Submit(std::packaged_task<void()>([job = std::move(job)]() mutable { job(); }), 8);
+            auto job = std::make_shared<std::packaged_task<const uint8_t *()>>(
+                [=] { return ReadDiskGGUFPinned(*weight, storage, capacity); });
+            ready = job->get_future().share();
+            cache.streamedPrefetch.Submit(std::packaged_task<void()>([job] { (*job)(); }), 8);
             for (const auto &p : weight->diskWeightParts) cache.stats.diskBytes += p.bytes;
             offset += capacity;
         }
@@ -4325,16 +4327,16 @@ namespace fastllm {
                 auto ahead = cache.ggufReadAhead.items.find(original);
                 auto prefetched = ahead == cache.ggufReadAhead.items.end()
                     ? std::shared_future<const uint8_t *>() : ahead->second;
-                std::packaged_task<const uint8_t *()> job([=] {
+                auto job = std::make_shared<std::packaged_task<const uint8_t *()>>([=] {
                     const uint8_t *payload;
                     if (host) { memcpy(storage, host->cpuData, original->GetBytes()); payload = storage; }
                     else payload = prefetched.valid() ? prefetched.get() : ReadDiskGGUFPinned(*original, storage, capacity);
                     if (keep) memcpy(keep->cpuData, payload, original->GetBytes());
                     return payload;
                 });
-                auto ready = job.get_future();
+                auto ready = job->get_future();
                 cache.streamedPrefetch.Submit(std::packaged_task<void()>(
-                    [job = std::move(job)]() mutable { job(); }), 8);
+                    [job] { (*job)(); }), 8);
                 return ready;
             };
             source.release = [&](int e) {
