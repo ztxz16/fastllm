@@ -220,7 +220,10 @@ struct MailboxMoe {
             view.q8InputPrepared = true;
             view.preserveMissing = true;
             const auto &source = group.ggufSources[table];
-            if (source.weights[0].type == l.gateGgmlType && source.weights[1].type == l.downGgmlType) {
+            // Match the upload layout, including IQ2 R4 records consumed
+            // directly by the projection kernels instead of being restored.
+            if (FastllmCudaV41GGUFNumaSupported(l.gateGgmlType, l.downGgmlType,
+                    source.weights[0].type, source.weights[1].type)) {
                 view.numaGateType = source.weights[0].type;
                 view.numaDownType = source.weights[1].type;
             }

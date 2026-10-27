@@ -1,6 +1,7 @@
 #include "fastllm.h"
 #include "utils.h"
 #include "gguf.h"
+#include "gguf_iq2_s_r4_fixture.h"
 #include "devices/disk/diskdevice.h"
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
@@ -257,8 +258,13 @@ static void TestPrefillWorkingSet(Fixture &f, int device) {
 static void TestNativeLayout(Fixture &f, int device, bool compareLegacy = false) {
     FastllmCudaSetDevice(device);
     const size_t downOffset = f.gpu[2]->GetBytes(), stride = f.bytes;
-    Data canonical(INT8, {int(stride*2)}), native(INT8, {int(stride*2)});
-    canonical.Allocate(false); native.Allocate(false);
+    Data canonical(INT8, {int(stride*2)}), native(INT8, {int(stride*2)}), packed(INT8, {int(stride*2)});
+    canonical.Allocate(false); native.Allocate(false); packed.Allocate(false);
+    auto packedType = [](int type) {
+        return type == GGML_TYPE_IQ2_XXS ? int(GGML_TYPE_IQ2_XXS_R4) :
+            type == GGML_TYPE_IQ2_XS ? int(GGML_TYPE_IQ2_XS_R4) :
+            type == GGML_TYPE_IQ2_S ? int(GGML_TYPE_IQ2_S_R4) : type;
+    };
     for (int e=0; e<2; ++e) {
         auto *dst = canonical.cpuData+size_t(e)*stride;
         FastllmCudaCopyFromDeviceToHost(dst, f.gpu[2+2*e]->cudaData, downOffset);
@@ -269,11 +275,23 @@ static void TestNativeLayout(Fixture &f, int device, bool compareLegacy = false)
             memcpy(packed+size_t(2*(row%f.inter)+row/f.inter)*rowBytes, dst+size_t(row)*rowBytes, rowBytes);
         memcpy(packed+downOffset, dst+downOffset, stride-downOffset);
     }
-    canonical.ToDevice(CUDA,{device},true); native.ToDevice(CUDA,{device},true);
+    for (int e=0; e<2; ++e) for (int part=0; part<2; ++part) {
+        const auto &w = *f.gpu[2+2*e+part];
+        const size_t offset = size_t(e)*stride + (part ? downOffset : 0);
+        if (packedType(w.ggmlType) != w.ggmlType) {
+            const auto *repack = get_repack_info(ggml_type(w.ggmlType));
+            const Repack iq2Fixture{GGML_TYPE_IQ2_S_R4,4,PackIQ2SR4Fixture};
+            if (!repack && w.ggmlType == GGML_TYPE_IQ2_S) repack = &iq2Fixture;
+            Check(repack != nullptr,"missing native-layout fixture packer");
+            repack->repack(w.dims[0],w.dims[1],
+                (const char*)native.cpuData+offset,(char*)packed.cpuData+offset,false);
+        } else memcpy(packed.cpuData+offset,native.cpuData+offset,w.GetBytes());
+    }
+    canonical.ToDevice(CUDA,{device},true); native.ToDevice(CUDA,{device},true); packed.ToDevice(CUDA,{device},true);
     const size_t workspaceBytes = FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(f.hidden,f.inter);
     Data scratch(INT8,{int(workspaceBytes)});
     scratch.ToDevice(CUDA,{device},false); scratch.Allocate(false);
-    for (int rows : {1,6,8}) for (bool compact : {false,true}) {
+    for (int rows : {1,2,3,4,5,6,7,8}) for (bool compact : {false,true}) {
         constexpr int topk=6;
         const int routes=compact ? rows*topk/2 : rows*topk;
         Data input(BFLOAT16,{rows,f.hidden}), scores(FLOAT32,{rows,topk});
@@ -296,14 +314,14 @@ static void TestNativeLayout(Fixture &f, int device, bool compareLegacy = false)
         view.workspace=scratch.cudaData; view.workspaceBytes=workspaceBytes;
         if (compact) { view.routeMap=(int32_t*)map.cudaData; view.routeCount=routes; }
         std::vector<uint8_t> expected;
-        for (int variant = 0; variant < (compareLegacy ? 3 : 2); ++variant) {
-            const bool interleaved = variant == (compareLegacy ? 2 : 1);
+        for (int variant = 0; variant < (compareLegacy ? 4 : 3); ++variant) {
+            const int layout = compareLegacy ? std::max(0, variant-1) : variant;
             if (compareLegacy) setenv("FASTLLM_V41_GGUF_LEGACY", variant == 0 ? "1" : "0", 1);
             std::fill_n((float*)output.cpuData, rows*topk*f.hidden, 17.f);
             output.ToDevice(CUDA,{device},true);
-            view.records=(uint8_t*)(interleaved ? native.cudaData : canonical.cudaData);
-            view.numaGateType=interleaved ? view.gateType : -1;
-            view.numaDownType=interleaved ? view.downType : -1;
+            view.records=(uint8_t*)(layout == 2 ? packed.cudaData : layout == 1 ? native.cudaData : canonical.cudaData);
+            view.numaGateType=layout == 2 ? packedType(view.gateType) : layout == 1 ? view.gateType : -1;
+            view.numaDownType=layout == 2 ? packedType(view.downType) : layout == 1 ? view.downType : -1;
             Check(FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,activation,view,
                 (float*)scores.cudaData,topk,.8f,(float*)output.cudaData),"native cache adapter rejected");
             output.ToDevice(CPU);
@@ -314,7 +332,7 @@ static void TestNativeLayout(Fixture &f, int device, bool compareLegacy = false)
         view.numaGateType=GGML_TYPE_Q2_K_R4;
         Check(!FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,activation,view,
             (float*)scores.cudaData,topk,.8f,(float*)output.cudaData),"R4 native layout accepted");
-        view.numaGateType=-1;
+        view.numaGateType=-1; view.numaDownType=view.downType;
         Check(!FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,activation,view,
             (float*)scores.cudaData,topk,.8f,(float*)output.cudaData),"partial native layout accepted");
     }
