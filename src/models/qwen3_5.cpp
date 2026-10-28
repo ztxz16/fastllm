@@ -3931,6 +3931,9 @@ namespace fastllm {
             std::vector<int> devices;
             Data inputIds;
             Data positionIds;
+            // CPU embedding and caller-provided embeddings are transient.
+            // Own their CUDA replicas for the lifetime of the captured graph.
+            Data precomputedHiddenStates;
             std::vector<std::unique_ptr<Qwen35MtpVerifyGraphDeviceState> >
                 deviceStates;
             std::vector<void*> reservedPointers;
@@ -4262,14 +4265,19 @@ namespace fastllm {
                 state.deviceStates.clear();
                 state.inputIds.FreeSpace();
                 state.positionIds.FreeSpace();
+                state.precomputedHiddenStates.FreeSpace();
                 for (auto &item : state.inputIds.multiDeviceDatas) {
                     delete item.second;
                 }
                 for (auto &item : state.positionIds.multiDeviceDatas) {
                     delete item.second;
                 }
+                for (auto &item : state.precomputedHiddenStates.multiDeviceDatas) {
+                    delete item.second;
+                }
                 state.inputIds.multiDeviceDatas.clear();
                 state.positionIds.multiDeviceDatas.clear();
+                state.precomputedHiddenStates.multiDeviceDatas.clear();
             }
             state.devices = devices;
             state.deviceStates.reserve(devices.size());
@@ -17024,7 +17032,6 @@ namespace fastllm {
             speculativeCaptureFirstTokenLinearState &&
             speculativeLinearStateCaptureSlots > 0 &&
             !speculativeCacheOnlyForward &&
-            precomputedHiddenStates == nullptr &&
             !pipelineGpuTokenHandoff &&
             batch >= 1 && !all1 && isPrefill &&
             homogeneousVerifyLength && seqLens[0] >= 2 &&
@@ -17046,6 +17053,17 @@ namespace fastllm {
                     Qwen35PrepareMtpVerifyGraphReplicatedTensor(
                         graphState.positionIds, allPositionIds, devices),
                     "Qwen3.5 failed to stage MTP verify graph inputs.\n");
+
+                Data *graphPrecomputedHiddenStates = nullptr;
+                if (precomputedHiddenStates != nullptr) {
+                    AssertInFastLLM(
+                        Qwen35PrepareMtpVerifyGraphReplicatedTensor(
+                            graphState.precomputedHiddenStates,
+                            *precomputedHiddenStates, devices),
+                        "Qwen3.5 failed to stage MTP verify graph embeddings.\n");
+                    graphPrecomputedHiddenStates =
+                        &graphState.precomputedHiddenStates;
+                }
 
                 for (int r = 0; r < (int)devices.size(); ++r) {
                     std::vector<std::pair<Data*, Data*> > &rankPast =
@@ -17076,6 +17094,9 @@ namespace fastllm {
                 appendField(speculativeCaptureDFlashHiddenStates);
                 appendField(speculativeLinearStateCaptureSlots);
                 appendField(tensorParallel);
+                const bool hasPrecomputedHiddenStates =
+                    graphPrecomputedHiddenStates != nullptr;
+                appendField(hasPrecomputedHiddenStates);
                 if (tensorParallel) {
                     appendField(speculativeLinearStateGeneration);
                 } else {
@@ -17102,6 +17123,16 @@ namespace fastllm {
                 appendField(block_cnt);
                 for (int r = 0; r < (int)devices.size(); ++r) {
                     appendField(devices[r]);
+                    if (hasPrecomputedHiddenStates) {
+                        const Data *hidden = Qwen35FindCudaTensorOnDevice(
+                            *graphPrecomputedHiddenStates, devices[r]);
+                        appendField(hidden->cudaData);
+                        appendField(hidden->dataType);
+                        appendField(hidden->dims.size());
+                        nextSignature.append(
+                            reinterpret_cast<const char*>(hidden->dims.data()),
+                            hidden->dims.size() * sizeof(int));
+                    }
                     appendField(graphState.deviceStates[r]->packedPagedMeta.cudaData);
                     std::vector<std::pair<Data*, Data*> > &rankPast =
                         tensorParallel ? localPastKeyValues[r] : pastKeyValues;
@@ -17258,7 +17289,7 @@ namespace fastllm {
                                 tensorParallel, r == 0,
                                 threadTpPagedCacheBase + r * block_cnt,
                                 graphState.deviceStates[r]->logits,
-                                nullptr);
+                                graphPrecomputedHiddenStates);
                         } catch (...) {
                             qwen35MtpVerifyGraphThreadContext = oldContext;
                             throw;
@@ -17428,7 +17459,7 @@ namespace fastllm {
                                         threadTpPagedCacheBase +
                                             r * block_cnt,
                                         graphState.deviceStates[r]->logits,
-                                        nullptr);
+                                        graphPrecomputedHiddenStates);
                                     bodyOk[r] = 1;
                                 } catch (...) {
                                     errors[r] = std::current_exception();
@@ -18479,6 +18510,12 @@ namespace fastllm {
                 double rate = attempts > 0 ?
                     (double)accepts * 100.0 / (double)attempts : 0.0;
                 printf("%s%.2f%%", i == 0 ? "" : ", ", rate);
+            }
+            printf("]. validations=%lld, pos_counts=[", validations);
+            for (int pos = 0; pos < mtpDraftsPerStep; ++pos) {
+                printf("%s%lld/%lld", pos == 0 ? "" : ", ",
+                       mtpDraftPositionAccepts[pos].load(std::memory_order_relaxed),
+                       mtpDraftPositionAttempts[pos].load(std::memory_order_relaxed));
             }
             printf("].\n");
             fflush(stdout);
@@ -22786,6 +22823,12 @@ namespace fastllm {
                 double rate = attempts > 0 ?
                     (double)accepts * 100.0 / (double)attempts : 0.0;
                 printf("%s%.2f%%", pos == 0 ? "" : ", ", rate);
+            }
+            printf("]. validations=%lld, pos_counts=[", validations);
+            for (int pos = 0; pos < draftsPerStep; ++pos) {
+                printf("%s%lld/%lld", pos == 0 ? "" : ", ",
+                       mtpDraftPositionAccepts[pos].load(std::memory_order_relaxed),
+                       mtpDraftPositionAttempts[pos].load(std::memory_order_relaxed));
             }
             printf("].\n");
             fflush(stdout);
