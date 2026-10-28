@@ -69,7 +69,7 @@ struct Fixture {
         fclose(file);
     }
     ~Fixture(){owned.clear();unlink(path.c_str());}
-    std::vector<float> Run(bool lazy,int rows,int offset,int device,int topk=3,bool handoff=false,DataType inputType=FLOAT16,bool staleCuda=false) {
+    std::vector<float> Run(bool lazy,int rows,int offset,int device,int topk=3,bool handoff=false,DataType inputType=FLOAT16,bool staleCuda=false,bool asynchronous=false) {
         static int call = 0;
         currentCase = "gate=" + std::to_string(disk[2]->ggmlType) + " down=" + std::to_string(disk[3]->ggmlType) +
             " rows=" + std::to_string(rows) + " topk=" + std::to_string(topk) + " offset=" + std::to_string(offset) +
@@ -110,7 +110,11 @@ struct Fixture {
                 scores.ToDevice(CUDA,{device},true);
                 void *xp=x.cudaData,*ip=ids.cudaData,*sp=scores.cudaData;
                 int callbacks=0;
-                Check(op.RunGpuGGUFDecode(x,ids,scores,y,table,[&]{++callbacks;}),"ordinary GPU handoff rejected");
+                if(asynchronous) {
+                    DiskMoeAsyncScope scope({disk},device,true);
+                    Check(DiskMoeAsyncScope::TryRun(0,x,ids,scores,y,[&]{++callbacks;}),"async ordinary GPU handoff rejected");
+                    scope.Finish();
+                } else Check(op.RunGpuGGUFDecode(x,ids,scores,y,table,[&]{++callbacks;}),"ordinary GPU handoff rejected");
                 Check(callbacks==1,"shared callback must run exactly once");
                 Check(x.dataDevice==CUDA && ids.dataDevice==CUDA && scores.dataDevice==CUDA &&
                     x.cudaData==xp && ids.cudaData==ip && scores.cudaData==sp,"captured inputs changed storage/placement");
@@ -280,7 +284,7 @@ static void TestPackedCudaTrim() {
     FillPackedCache(f);
     // Keep hot records in each of the three physical blocks. Logical-only
     // eviction leaves all three allocations pinned after either shrink.
-    for (int expert : {0,44,88}) f.Run(true,1,expert,0,1,true,FLOAT32,false);
+    for (int expert : {0,44,88}) f.Run(true,1,expert,0,1,true,FLOAT32,false,true);
     FastllmCudaSyncCurrentThreadStream();
     uint64_t initialFree = 0, total = 0;
     Check(FastllmCudaGetMemoryInfo(0,initialFree,total),"initial trim memory query");
@@ -300,15 +304,270 @@ static void TestPackedCudaTrim() {
             (unsigned long long)budget,(unsigned long long)stats.cudaBytes,
             (unsigned long long)(free-initialFree));
     }
-    // Reuse the synchronous adapter after its GPU pointers were invalidated,
+    // Reuse the existing mailbox after its GPU pointers were invalidated,
     // then grow the budget again. Both directions must preserve numerics.
     for (int pass = 0; pass < 3; ++pass)
-        Compare(f.Run(true,1,0,0,3,true,FLOAT32,false),f.Run(false,1,0,-1,3,false,FLOAT32));
+        Compare(f.Run(true,1,0,0,3,true,FLOAT32,false,true),f.Run(false,1,0,-1,3,false,FLOAT32));
     SetMoeCudaCacheBytes(192ULL<<20);
     for (int pass = 0; pass < 3; ++pass)
-        Compare(f.Run(true,1,0,0,3,true,FLOAT32,false),f.Run(false,1,0,-1,3,false,FLOAT32));
+        Compare(f.Run(true,1,0,0,3,true,FLOAT32,false,true),f.Run(false,1,0,-1,3,false,FLOAT32));
     SetMoeCudaCacheBytes(0);
     Check(!GetDiskMoeCacheStats().cudaBytes,"zero GPU cache after regrowth");
+}
+static void TestAsyncReleasesPrefillWorkspace() {
+    Fixture f(4,2560,640);
+    SetMoeCpuCacheBytes(f.bytes*8);
+    SetMoeCudaCacheBytes(f.bytes*4);
+    const auto expected = f.Run(false,1,0,-1,10,false,FLOAT32);
+    // Warm decode kernels before measuring driver memory, so their lazy
+    // loading cannot hide the workspace released at the phase boundary.
+    Compare(f.Run(true,1,0,0,10,true,FLOAT32,false,true),expected);
+    for (int pass = 0; pass < 2; ++pass) {
+        f.Run(true,4096,0,0,10,false,FLOAT32);
+        FastllmCudaSyncCurrentThreadStream();
+        uint64_t before = 0, after = 0, total = 0;
+        Check(FastllmCudaGetMemoryInfo(0,before,total),"prefill workspace memory query");
+        {
+            DiskMoeAsyncScope warmup({f.disk},0,true,true);
+            warmup.Finish();
+        }
+        uint64_t retained = 0;
+        Check(FastllmCudaGetMemoryInfo(0,retained,total) && retained <= before+(2ULL<<20),
+              "warmup lost the workspace before KV planning");
+        Compare(f.Run(true,1,0,0,10,true,FLOAT32,false,true),expected);
+        FastllmCudaSyncCurrentThreadStream();
+        Check(FastllmCudaGetMemoryInfo(0,after,total),"decode workspace memory query");
+        // This prompt's FP32 per-route output alone exceeds 400 MiB.
+        // Leave room for driver granularity and ordinary cache admissions.
+        Check(after > before && after-before > (256ULL<<20),
+              "decode retained the idle large-prefill workspace");
+    }
+}
+static void TestAsyncWithoutRam() {
+    for (int variant : {4,7}) for (uint64_t ram : {0ULL,1ULL}) {
+        Fixture f(variant,2560,640);
+        SetMoeCpuCacheBytes(ram);
+        SetMoeCudaCacheBytes(f.bytes*3);
+        const auto before = GetDiskMoeCacheStats();
+        const auto expected = f.Run(false,1,0,-1,3,false,FLOAT32);
+        for (int pass = 0; pass < 6; ++pass) {
+            Compare(f.Run(true,1,0,0,3,true,FLOAT32,false,true),expected);
+            const auto stats = GetDiskMoeCacheStats();
+            Check(stats.cpuBytes<=ram && stats.cudaBytes<=GetMoeCudaCacheBytes() &&
+                !stats.cpuCudaOverlapBytes,"DDR-independent promotion budgets");
+        }
+        const auto warm = GetDiskMoeCacheStats();
+        Check(warm.cudaBytes>0 && warm.uploads>before.uploads && warm.cudaHits>before.cudaHits,
+            "async GPU admission depends on DDR residency");
+        Check(warm.cpuHits-before.cpuHits+warm.cudaHits-before.cudaHits+warm.misses-before.misses==18,
+            "DDR-independent route counts");
+        std::printf("PASS no-DDR variant=%d ram=%llu uploads=%llu gpu_hits=%llu misses=%llu\n",
+            variant,(unsigned long long)ram,(unsigned long long)(warm.uploads-before.uploads),
+            (unsigned long long)(warm.cudaHits-before.cudaHits),(unsigned long long)(warm.misses-before.misses));
+        Compare(f.Run(true,1,0,0,3,true,FLOAT32,false,true),expected);
+        const auto reused = GetDiskMoeCacheStats();
+        Check(reused.cudaHits-warm.cudaHits==3 && reused.diskBytes==warm.diskBytes &&
+            reused.misses==warm.misses,"DDR-independent GPU reuse reread checkpoint");
+    }
+    {
+        // Host padding can exceed a GPU budget of exactly one payload.
+        Fixture f(4,2560,640);
+        SetMoeCpuCacheBytes(0);
+        SetMoeCudaCacheBytes(f.bytes);
+        for (int pass = 0; pass < 4; ++pass)
+            Compare(f.Run(true,1,0,0,1,true,FLOAT32,false,true),f.Run(false,1,0,-1,1,false,FLOAT32));
+        Check(GetDiskMoeCacheStats().cudaBytes==f.bytes,"exact-payload GPU budget rejected padded source");
+    }
+    {
+        Fixture f(4,2560,640);
+        SetMoeCpuCacheBytes(0);SetMoeCudaCacheBytes(f.bytes*3);
+        // The first step reaches the admission visit threshold on the next
+        // step. Abort that step after a queued layer can retain an upload
+        // source; cancellation must release all transient mapped weights.
+        const auto expected = f.Run(true,1,0,0,3,true,FLOAT32);
+        Data x(FLOAT32,{1,f.hidden}),ids(INT32,{1,3}),scores(FLOAT32,{1,3}),a,b;
+        x.Allocate(false);ids.Allocate(false);scores.Allocate(false);
+        for (int c = 0; c < f.hidden; ++c) reinterpret_cast<float *>(x.cpuData)[c]=std::sin(c*.71f)*3;
+        for (int k = 0; k < 3; ++k) {
+            reinterpret_cast<int32_t *>(ids.cpuData)[k]=k==1?2:0;
+            reinterpret_cast<float *>(scores.cpuData)[k]=k==0?0:k==1?.375f:-.125f;
+        }
+        x.ToDevice(CUDA,{0},true);ids.ToDevice(CUDA,{0},true);scores.ToDevice(CUDA,{0},true);
+        const auto before = GetDiskMoeCacheStats();
+        bool aborted = false;
+        try {
+            DiskMoeAsyncScope scope({f.disk,f.disk},0,true);
+            Check(DiskMoeAsyncScope::TryRun(0,x,ids,scores,a,{}),"queued no-DDR layer rejected");
+            DiskMoeAsyncScope::TryRun(1,x,ids,scores,b,[]{throw std::runtime_error("abort staged upload");});
+        } catch (const std::runtime_error &error) { aborted = std::string(error.what())=="abort staged upload"; }
+        const auto after = GetDiskMoeCacheStats();
+        Check(aborted && !after.cpuBytes && !after.cudaBytes,"cancelled no-DDR step admitted a source");
+        Check(after.cpuBufferMmaps-before.cpuBufferMmaps==after.cpuBufferMunmaps-before.cpuBufferMunmaps,
+            "cancelled no-DDR step retained mapped upload sources");
+        for (int pass = 0; pass < 4; ++pass) {
+            {
+                DiskMoeAsyncScope scope({f.disk,f.disk},0,true);
+                Check(DiskMoeAsyncScope::TryRun(0,x,ids,scores,a,{}),"first recovered no-DDR layer rejected");
+                Check(DiskMoeAsyncScope::TryRun(1,x,ids,scores,b,{}),"second recovered no-DDR layer rejected");
+                scope.Finish();
+            }
+            for (Data *result : {&a,&b}) {
+                result->ToDevice(CPU);
+                std::vector<float> actual(f.hidden);
+                std::memcpy(actual.data(),result->cpuData,f.hidden*sizeof(float));
+                Compare(actual,expected);
+            }
+        }
+        Check(GetDiskMoeCacheStats().cudaBytes>0,"no-DDR cache did not recover after cancellation");
+    }
+}
+static void TestAsyncDiskDecode() {
+    {
+        // The GPU record view has one quantization layout per layer. Mixed
+        // formats within a layer must use the existing per-expert fallback.
+        Fixture base(4),gateOther(7),downOther(0);
+        SetMoeCpuCacheBytes(base.bytes*6);SetMoeCudaCacheBytes(base.bytes*3);
+        Data x(FLOAT32,{1,base.hidden}),ids(INT32,{1,3}),score(FLOAT32,{1,3}),output;
+        x.Allocate(0.f);ids.Allocate(false);score.Allocate(0.f);
+        std::memset(ids.cpuData,0,ids.GetBytes());
+        x.ToDevice(CUDA,{0},true);ids.ToDevice(CUDA,{0},true);score.ToDevice(CUDA,{0},true);
+        for(bool gate:{true,false}){
+            auto mixed=base.disk;
+            mixed[gate?4:5]=gate?gateOther.disk[4]:downOther.disk[5];
+            bool accepted;
+            {
+                DiskMoeAsyncScope scope({mixed},0,true);
+                accepted=DiskMoeAsyncScope::TryRun(0,x,ids,score,output,{});
+                scope.Finish();
+            }
+            Check(!accepted,"heterogeneous ordinary GGUF layer accepted");
+        }
+    }
+    // Also exercise the generic per-route CPU fallback (non-Q2_0 down),
+    // not only the fused Q2_0 worker used by this checkpoint.
+    for (int type = 0; type < 8; ++type) {
+        Fixture f(type, type < 4 ? 512 : 2560, type < 4 ? 256 : 640);
+        SetMoeCpuCacheBytes(f.bytes*8);SetMoeCudaCacheBytes(f.bytes*4);
+        for(int pass=0;pass<4;++pass)for(int topk:{3,10,16}) {
+            if(pass==2 && topk==3)SetMoeCudaCacheBytes(f.bytes*2);
+            auto before=GetDiskMoeCacheStats();
+            Compare(f.Run(true,1,pass,0,topk,true,FLOAT32,false,true),f.Run(false,1,pass,-1,topk,false,FLOAT32));
+            auto after=GetDiskMoeCacheStats();
+            Check(after.cpuHits-before.cpuHits+after.cudaHits-before.cudaHits+after.misses-before.misses==uint64_t(topk),"async route counts");
+            Check(after.cpuBytes<=GetMoeCpuCacheBytes() && after.cudaBytes<=GetMoeCudaCacheBytes() && !after.cpuCudaOverlapBytes,"async cache budgets");
+        }
+    }
+    {
+        // Distinct layer mailboxes may refer to the same canonical weights.
+        // An admission/eviction must update every alias of a resident record.
+        Fixture f(4);SetMoeCpuCacheBytes(f.bytes*6);SetMoeCudaCacheBytes(f.bytes*3);
+        const auto expected=f.Run(false,1,0,-1,3,false,FLOAT32);
+        for(int pass=0;pass<3;++pass)Compare(f.Run(true,1,0,0,3,true,FLOAT32),expected);
+        Data x(FLOAT32,{1,f.hidden}),ids(INT32,{1,3}),scores(FLOAT32,{1,3}),a,b;
+        x.Allocate(false);ids.Allocate(false);scores.Allocate(false);
+        for(int c=0;c<f.hidden;++c)reinterpret_cast<float *>(x.cpuData)[c]=std::sin(c*.71f)*3;
+        for(int k=0;k<3;++k){
+            reinterpret_cast<int32_t *>(ids.cpuData)[k]=k==1?2:0;
+            reinterpret_cast<float *>(scores.cpuData)[k]=k==0?0:k==1?.375f:-.125f;
+        }
+        x.ToDevice(CUDA,{0},true);ids.ToDevice(CUDA,{0},true);scores.ToDevice(CUDA,{0},true);
+        for(int records:{3,1}){
+            SetMoeCudaCacheBytes(f.bytes*records);
+            const auto before=GetDiskMoeCacheStats();
+            {
+                DiskMoeAsyncScope scope({f.disk,f.disk},0,true);
+                Check(DiskMoeAsyncScope::TryRun(0,x,ids,scores,a,{}),"first aliased mailbox rejected");
+                Check(DiskMoeAsyncScope::TryRun(1,x,ids,scores,b,{}),"second aliased mailbox rejected");
+                scope.Finish();
+            }
+            for(auto *result:{&a,&b}){
+                result->ToDevice(CPU);std::vector<float> actual(f.hidden);
+                std::memcpy(actual.data(),result->cpuData,f.hidden*4);Compare(actual,expected);
+            }
+            const auto hits=GetDiskMoeCacheStats().cudaHits-before.cudaHits;
+            // Physical trim may retire the whole packed block. Every alias
+            // must then see no GPU record, rather than its old freed pointer.
+            Check(records==3?hits==6:(!before.cudaBytes?hits==0:(hits==2||hits==4)),
+                "aliased GPU record snapshot");
+        }
+    }
+    {
+        // A callback can abort after publication but before the GPU waiter.
+        // Drain and cancel that scope, then reuse the same model runtime.
+        Fixture f(4);SetMoeCpuCacheBytes(f.bytes*6);SetMoeCudaCacheBytes(f.bytes*3);
+        Data x(FLOAT32,{1,f.hidden}),ids(INT32,{1,3}),scores(FLOAT32,{1,3}),output;
+        x.Allocate(0.f);ids.Allocate(false);scores.Allocate(0.f);
+        std::memset(ids.cpuData,0,ids.GetBytes());
+        x.ToDevice(CUDA,{0},true);ids.ToDevice(CUDA,{0},true);scores.ToDevice(CUDA,{0},true);
+        bool threw=false;
+        try {
+            DiskMoeAsyncScope scope({f.disk},0,true);
+            DiskMoeAsyncScope::TryRun(0,x,ids,scores,output,[]{throw std::runtime_error("test callback abort");});
+        } catch(const std::runtime_error &) {threw=true;}
+        Check(threw,"async callback exception was swallowed");
+        Compare(f.Run(true,1,0,0,3,true,FLOAT32,false,true),f.Run(false,1,0,-1,3,false,FLOAT32));
+        {
+            DiskMoeAsyncScope scope({f.disk},0,true);
+            Check(!DiskMoeAsyncScope::TryRun(-1,x,ids,scores,output,{}),"invalid async layer accepted");
+        }
+        // Rejected asynchronous dispatch must release the cache before an
+        // ordinary synchronous fallback tries to acquire it.
+        Compare(f.Run(true,1,0,0,3,true,FLOAT32),f.Run(false,1,0,-1,3,false,FLOAT32));
+    }
+    std::vector<std::unique_ptr<Fixture>> fixtures;
+    std::vector<std::vector<Data *>> tables;
+    for(int type:{4,6,7}){fixtures.emplace_back(new Fixture(type,2560,640));tables.push_back(fixtures.back()->disk);}
+    const int hidden=fixtures[0]->hidden,topk=10;
+    uint64_t bytes=0;for(auto &f:fixtures)bytes+=f->bytes;
+    for (uint64_t ram : {bytes*6,uint64_t(0)}) {
+        SetMoeCudaCacheBytes(0);
+        SetMoeCpuCacheBytes(ram);SetMoeCudaCacheBytes(bytes*3);
+        for(int pass=0;pass<5;++pass) {
+            std::vector<std::unique_ptr<Data>> inputs,indices,scores,outputs;
+            for(size_t layer=0;layer<fixtures.size();++layer) {
+                inputs.emplace_back(new Data(FLOAT32,{1,hidden}));indices.emplace_back(new Data(INT32,{1,topk}));
+                scores.emplace_back(new Data(FLOAT32,{1,topk}));outputs.emplace_back(new Data(FLOAT32,{1,hidden}));
+                auto &x=*inputs.back(),&ids=*indices.back(),&sc=*scores.back();
+                x.Allocate(false);ids.Allocate(false);sc.Allocate(false);
+                for(int c=0;c<hidden;++c)reinterpret_cast<float *>(x.cpuData)[c]=std::sin(c*.71f)*3;
+                for(int k=0;k<topk;++k){
+                    reinterpret_cast<int32_t *>(ids.cpuData)[k]=(pass+(k==2?0:k*2))%fixtures[layer]->experts;
+                    reinterpret_cast<float *>(sc.cpuData)[k]=k==0?0:k==1?.375f:-.125f;
+                }
+                x.ToDevice(CUDA,{0},true);ids.ToDevice(CUDA,{0},true);sc.ToDevice(CUDA,{0},true);
+            }
+            auto before=GetDiskMoeCacheStats();int callbacks=0;
+            {
+                DiskMoeAsyncScope scope(tables,0,true);
+                for(size_t layer=0;layer<fixtures.size();++layer)
+                    Check(DiskMoeAsyncScope::TryRun(layer,*inputs[layer],*indices[layer],*scores[layer],*outputs[layer],[&]{++callbacks;}),"multi-layer async rejection");
+                scope.Finish();
+            }
+            Check(callbacks==int(fixtures.size()),"async shared callback count");
+            for(size_t layer=0;layer<fixtures.size();++layer){
+                outputs[layer]->ToDevice(CPU);std::vector<float> actual(hidden);
+                memcpy(actual.data(),outputs[layer]->cpuData,hidden*4);
+                Compare(actual,fixtures[layer]->Run(false,1,pass,-1,topk,false,FLOAT32));
+            }
+            auto after=GetDiskMoeCacheStats();
+            Check(after.cpuHits-before.cpuHits+after.cudaHits-before.cudaHits+after.misses-before.misses==fixtures.size()*topk,"queued async routes");
+            Check(after.cpuBytes<=GetMoeCpuCacheBytes() && after.cudaBytes<=GetMoeCudaCacheBytes() && !after.cpuCudaOverlapBytes,"queued async budgets");
+        }
+    }
+    {
+        // Partial 32-value gate blocks and route/task splits must stay valid
+        // when the configured pool changes between model steps.
+        Fixture f(4,2560,640);
+        SetMoeCpuCacheBytes(f.bytes*8);SetMoeCudaCacheBytes(f.bytes*3);
+        for(int threads:{1,3,8,16}){
+            SetThreads(threads);
+            for(int topk:{3,16})for(int pass=0;pass<2;++pass)
+                Compare(f.Run(true,1,pass,0,topk,true,FLOAT32,false,true),
+                        f.Run(false,1,pass,-1,topk,false,FLOAT32));
+        }
+        SetThreads(8);
+    }
+
 }
 static void TestMixedDiskPlacement() {
     Fixture resident(4), host(4), first(4), second(6);
@@ -326,13 +585,61 @@ static void TestMixedDiskPlacement() {
     resident.memory[2]->dataDeviceIds={0};
     Check(DiskMoeLayerIndices({first.disk,second.disk})==std::vector<int>({0,1}),"all-disk eligibility changed");
 
-    // Recognize whole CUDA layers at any position among disk layers.
+    SetMoeCpuCacheBytes((first.bytes+second.bytes)*8);
+    SetMoeCudaCacheBytes((first.bytes+second.bytes)*3);
+    const int hidden=first.hidden,topk=3;
+    // Reuse the same disk runtime with CUDA prefix, middle and suffix layers.
+    // Different quantizers make a wrong model-to-mailbox mapping observable.
     for (int residentLayer : {0,1,2}) {
         std::vector<std::vector<Data *>> tables{first.disk,second.disk};
         tables.insert(tables.begin()+residentLayer,resident.memory);
         std::vector<int> expected;
         for(int l=0;l<3;++l)if(l!=residentLayer)expected.push_back(l);
         Check(DiskMoeLayerIndices(tables,0)==expected,"mixed disk graph layer selection");
+        for(int pass=0;pass<4;++pass) {
+            Data x(FLOAT32,{1,hidden}),ids(INT32,{1,topk}),scores(FLOAT32,{1,topk});
+            Data outputs[2],untouched(FLOAT32,{1,hidden}),residentWork(FLOAT32,{1,hidden});
+            x.Allocate(false);ids.Allocate(false);scores.Allocate(false);untouched.Allocate(7.f);
+            for(int c=0;c<hidden;++c)reinterpret_cast<float *>(x.cpuData)[c]=std::sin(c*.71f)*3;
+            for(int k=0;k<topk;++k){
+                reinterpret_cast<int32_t *>(ids.cpuData)[k]=(pass+(k==2?0:k*2))%first.experts;
+                reinterpret_cast<float *>(scores.cpuData)[k]=k==0?0:k==1?.375f:-.125f;
+            }
+            x.ToDevice(CUDA,{0},true);ids.ToDevice(CUDA,{0},true);scores.ToDevice(CUDA,{0},true);
+            residentWork.Allocate(1.f);residentWork.ToDevice(CUDA,{0},true);
+            auto before=GetDiskMoeCacheStats();int callbacks=0;
+            {
+                DiskMoeAsyncScope scope(tables,0,true);
+                int diskLayer=0;
+                for(int layer=0;layer<3;++layer) {
+                    if(layer==residentLayer) {
+                        Check(!DiskMoeAsyncScope::TryRun(layer,x,ids,scores,untouched,[&]{++callbacks;}),
+                              "resident layer dispatched to disk mailbox");
+                        Check(untouched.dataDevice==CPU && reinterpret_cast<float *>(untouched.cpuData)[0]==7.f,
+                              "resident rejection changed output");
+                        // CUDA work may sit between two queued disk layers.
+                        FastllmCudaMemset0(residentWork.cudaData,residentWork.GetBytes());
+                    } else {
+                        Check(DiskMoeAsyncScope::TryRun(layer,x,ids,scores,outputs[diskLayer++],[&]{++callbacks;}),
+                              "CUDA resident layer disabled disk async dispatch");
+                    }
+                }
+                scope.Finish();
+            }
+            Check(callbacks==2,"mixed-placement shared callback count");
+            Fixture *fixtures[]={&first,&second};
+            for(int i=0;i<2;++i) {
+                outputs[i].ToDevice(CPU);
+                std::vector<float> actual(hidden);
+                memcpy(actual.data(),outputs[i].cpuData,hidden*4);
+                Compare(actual,fixtures[i]->Run(false,1,pass,-1,topk,false,FLOAT32));
+            }
+            auto after=GetDiskMoeCacheStats();
+            Check(after.cpuHits-before.cpuHits+after.cudaHits-before.cudaHits+after.misses-before.misses==2*topk,
+                  "mixed placement counted resident routes as disk");
+            Check(after.cpuBytes<=GetMoeCpuCacheBytes() && after.cudaBytes<=GetMoeCudaCacheBytes() &&
+                  !after.cpuCudaOverlapBytes,"mixed placement cache budgets");
+        }
     }
 }
 
@@ -343,18 +650,26 @@ int main(int argc,char **argv){try{
         TestPrefillMemoryPressure();puts("PASS: disk prefill memory pressure");return 0;
     }
     if(argc==2 && !std::strcmp(argv[1],"--mixed-disk")) {
-        TestMixedDiskPlacement();puts("PASS: mixed disk placement eligibility");return 0;
+        TestMixedDiskPlacement();puts("PASS: mixed CUDA and disk decode");return 0;
     }
     if(argc==2 && !std::strcmp(argv[1],"--promotion-preflight")) {
         TestPromotionPreflight();puts("PASS: fragmented GPU promotion preflight");return 0;
     }
+    if(argc==2 && !std::strcmp(argv[1],"--async-disk")) {
+        TestAsyncDiskDecode();puts("PASS: async disk decode and queued layers");return 0;
+    }
     if(argc==2 && !std::strcmp(argv[1],"--packed-trim")) {
         TestPackedCudaTrim();puts("PASS: packed GPU physical trim");return 0;
     }
-
+    if(argc==2 && !std::strcmp(argv[1],"--async-no-ram")) {
+        TestAsyncWithoutRam();puts("PASS: async GPU cache without DDR");return 0;
+    }
     TestPrefillMemoryPressure();
     TestPromotionPreflight();
     TestPackedCudaTrim();
+    TestAsyncReleasesPrefillWorkspace();
+    TestAsyncWithoutRam();
+    TestAsyncDiskDecode();
     TestMixedDiskPlacement();
     for (int variant : {4,5,6,7}) {
         Fixture actual(variant,2560,640);

@@ -458,6 +458,7 @@ if (USE_CUDA)
         src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/moe/fastllm-moe-cache.cu
         src/devices/cuda/moe/fastllm-moe-gguf-cache.cu
+        src/devices/cuda/moe/fastllm-disk-moe-async.cu
         src/devices/cuda/moe/fastllm-moe-v41-gguf.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu

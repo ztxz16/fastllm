@@ -101,6 +101,21 @@ namespace fastllm {
         DiskMoeCudaDeviceScope &operator=(const DiskMoeCudaDeviceScope &) = delete;
     };
 
+    // A single ordinary GGUF disk decode step may queue GPU work ahead of
+    // CPU experts. Finish drains all posted work and reports CPU failures.
+    // Ineligible builds/layouts keep the existing synchronous disk adapter.
+    class DiskMoeAsyncScope {
+        struct Impl;
+        std::unique_ptr<Impl> impl;
+    public:
+        DiskMoeAsyncScope(const std::vector<std::vector<Data *>> &layers, int device, bool enabled,
+                          bool retainPrefillWorkspace = false);
+        ~DiskMoeAsyncScope();
+        void Finish();
+        static bool TryRun(int layer, const Data &input, const Data &index, const Data &score,
+                           Data &output, const std::function<void()> &sharedExpert = {});
+    };
+
     class DiskDevice : BaseDevice {
     public:
         DiskDevice();

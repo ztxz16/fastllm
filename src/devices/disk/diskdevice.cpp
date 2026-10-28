@@ -2391,12 +2391,21 @@ namespace fastllm {
     };
 #endif
 
+    struct DiskMoeAsyncRuntime;
+    static void ReleaseDiskMoeAsync(const Data *weight);
     struct DiskExpertCache {
         // Invocations and deferred jobs hold this lock while using entries.
         // Public access also drains pending jobs before eviction or unload.
         std::mutex mutex;
         std::unordered_map<const Data*, DiskExpertEntry> entries;
-        uint64_t clock = 0, cpuBytes = 0;
+        std::map<const Data *, std::shared_ptr<DiskMoeAsyncRuntime>> asyncRuntimes;
+        uint64_t clock = 0, cpuBytes = 0, cudaGeneration = 0;
+        // Bounded notification log for ordinary disk mailboxes. An old reader
+        // rebuilds its snapshot after wraparound; no cache entry is retained.
+        std::array<DiskExpertEntry *, 4096> cudaChanges{};
+        void RecordCudaChange(DiskExpertEntry &entry) {
+            cudaChanges[++cudaGeneration % cudaChanges.size()] = &entry;
+        }
         uint64_t retiredCpuBytes = 0;
         uint64_t maintenanceCpuBytes = 0, maintenanceGeneration = 0;
         std::shared_future<void> maintenance;
@@ -2568,7 +2577,7 @@ namespace fastllm {
             HeapIndex(entry, device) = index;
             Slot(entry, device) = std::move(expert);
             (device < 0 ? cpuBytes : cudaBytes[device]) += bytes;
-            if (device >= 0) { entry.cudaAdmissionClock = clock; }
+            if (device >= 0) { entry.cudaAdmissionClock = clock; RecordCudaChange(entry); }
             FixHeap(index, device);
         }
         void AdmitCpu(DiskExpertEntry &entry, std::unique_ptr<DiskCachedExpert> expert) {
@@ -2644,7 +2653,7 @@ namespace fastllm {
             if (device < 0) retiredCpuBytes += bytes - slot->RecycleCpuStorage();
             (device < 0 ? cpuBytes : cudaBytes[device]) -= bytes;
             ++(device < 0 ? stats.cpuEvictions : stats.cudaEvictions);
-            if (device >= 0) { entry.cudaEvictionClock = clock; }
+            if (device >= 0) { entry.cudaEvictionClock = clock; RecordCudaChange(entry); }
             if (recycled) *recycled = std::move(slot);
             else slot.reset();
         }
@@ -2941,6 +2950,7 @@ namespace fastllm {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         if (cache.ggufReadAhead.items.count(weight)) cache.ggufReadAhead.Clear();
 #endif
+        ReleaseDiskMoeAsync(weight);
         auto it = cache.entries.find(weight);
         if (it == cache.entries.end()) return;
         cache.Evict(it->second, -1);
@@ -3839,6 +3849,10 @@ namespace fastllm {
         }
     };
 #endif
+
+} // namespace fastllm
+#include "disk-moe-async.inc"
+namespace fastllm {
 
 #include "disk-moe-compact.inc"
 
