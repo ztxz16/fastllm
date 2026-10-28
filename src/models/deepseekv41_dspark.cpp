@@ -1117,7 +1117,8 @@ namespace fastllm {
     // ==================== 参数与权重 ====================
 
     std::string DeepSeekV41Model::SelectSpecialWeightDevice(const std::string &name, int layerId) const {
-        const std::string device = basellm::SelectSpecialWeightDevice(name, layerId);
+        // Preserve target shared/dense placement before applying draft-only overrides.
+        const std::string device = DeepSeekV4Model::SelectSpecialWeightDevice(name, layerId);
         // External GGUF MXFP4 is converted to the native compact layout once.
         // It cannot be lazily read as native FP4 directly from the GGUF file.
         if (name.compare(0, 4, "mtp.") == 0 && weight.dicts.count("dspark_external_gguf") &&
