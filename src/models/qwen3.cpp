@@ -26,6 +26,7 @@
 
 #ifdef USE_CUDA
 #include "models/qwen3_cuda_common.h"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #endif
 
 namespace fastllm {
@@ -453,6 +454,8 @@ namespace fastllm {
             bool disabled = false;
             void *graph = nullptr;
             void *exec = nullptr;
+            std::vector<size_t> allocationRequests;
+            std::vector<void*> reservedPointers;
             Data inputIds;
             Data positionIds;
             Qwen3ForwardSingleBuffers buffers;
@@ -473,6 +476,7 @@ namespace fastllm {
                     FastllmCudaGraphDestroy(graph);
                     graph = nullptr;
                 }
+                FastllmCudaGraphMemoryPoolRelease(reservedPointers);
             }
         };
 
@@ -485,6 +489,9 @@ namespace fastllm {
                 FastllmCudaGraphDestroy(state.graph);
                 state.graph = nullptr;
             }
+            FastllmCudaGraphMemoryPoolRelease(state.reservedPointers);
+            state.reservedPointers.clear();
+            state.allocationRequests.clear();
             state.captured = false;
             state.warmed = false;
             state.lastInsertIndexHost.clear();
@@ -2153,45 +2160,86 @@ namespace fastllm {
                    gpuId, FastllmCudaGraphLastError());
             Qwen3DestroyCudaGraph(state);
             state.disabled = true;
+            FastllmCudaClearThreadError();
+            FastllmCudaClearGraphError();
             runWithoutGraph();
             return true;
         }
 
+        // This pool transaction belongs to the single-device decode graph.
+        // TP captures keep their existing path: the process-wide pool cannot
+        // be opened/committed independently by concurrent NCCL ranks.
+        const bool manageCapturePool = !tensorParallel;
         if (!state.warmed) {
-            runGraphBody();
+            state.allocationRequests.clear();
+            {
+                FastllmCudaAllocationRecorder record(
+                    manageCapturePool ? &state.allocationRequests : nullptr);
+                runGraphBody();
+            }
             finishWithLogits();
             state.warmed = true;
             return true;
         }
 
         void *capturedGraph = nullptr;
-        if (!FastllmCudaGraphBeginCapture()) {
-            printf("Warning: Qwen3 CUDA graph begin capture failed on gpu %d: %s. Disable graph for this GPU.\n",
-                   gpuId, FastllmCudaGraphLastError());
-            state.disabled = true;
-            runWithoutGraph();
-            return true;
-        }
-        runGraphBody();
-        if (!FastllmCudaGraphEndCapture(&capturedGraph) || capturedGraph == nullptr) {
-            printf("Warning: Qwen3 CUDA graph end capture failed on gpu %d: %s. Disable graph for this GPU.\n",
-                   gpuId, FastllmCudaGraphLastError());
-            if (capturedGraph != nullptr) {
-                FastllmCudaGraphDestroy(capturedGraph);
-            }
-            Qwen3DestroyCudaGraph(state);
-            state.disabled = true;
-            runWithoutGraph();
-            return true;
-        }
-
         void *capturedExec = nullptr;
-        if (!FastllmCudaGraphInstantiate(capturedGraph, &capturedExec) || capturedExec == nullptr) {
-            printf("Warning: Qwen3 CUDA graph instantiate failed on gpu %d: %s. Disable graph for this GPU.\n",
+        bool poolActive = false;
+        bool captureOk = true;
+        if (manageCapturePool) {
+            captureOk = FastllmCudaGraphPrepareCaptureDevice();
+            if (captureOk) {
+                // Retire deferred frees before capture. Event queries are
+                // forbidden in capture; the registered pool can then reuse
+                // these blocks without querying their completed events.
+                ForceDeviceSync();
+                captureOk = !FastllmCudaGetThreadError() &&
+                    FastllmCudaReserveGraphWorkspace(state.allocationRequests);
+            }
+            if (captureOk) {
+                poolActive = FastllmCudaGraphMemoryPoolBegin();
+                captureOk = poolActive;
+            }
+        }
+        if (captureOk) {
+            FastllmCudaClearThreadError();
+            FastllmCudaClearGraphError();
+            captureOk = FastllmCudaGraphBeginCapture();
+        }
+        if (captureOk) {
+            bool bodyThrew = false;
+            try {
+                runGraphBody();
+            } catch (...) {
+                bodyThrew = true;
+            }
+            const bool bodyFailed = bodyThrew || FastllmCudaGetThreadError() ||
+                FastllmCudaGetGraphError() || FastllmCudaGraphCaptureInvalidated();
+            const bool ended = FastllmCudaGraphEndCapture(&capturedGraph);
+            captureOk = !bodyFailed && ended && capturedGraph != nullptr;
+        }
+        if (captureOk && poolActive) {
+            // Scratch pointers become graph-owned until graph destruction,
+            // including temporaries already returned by their Data owners.
+            captureOk = FastllmCudaGraphMemoryPoolEnd(state.reservedPointers);
+            poolActive = false;
+        }
+        if (poolActive) {
+            FastllmCudaGraphMemoryPoolAbort();
+        }
+        if (captureOk) {
+            captureOk = FastllmCudaGraphInstantiate(capturedGraph, &capturedExec) &&
+                capturedExec != nullptr;
+        }
+        if (!captureOk) {
+            printf("Warning: Qwen3 CUDA graph capture failed on gpu %d: %s. Disable graph for this GPU.\n",
                    gpuId, FastllmCudaGraphLastError());
-            FastllmCudaGraphDestroy(capturedGraph);
+            if (capturedExec != nullptr) FastllmCudaGraphExecDestroy(capturedExec);
+            if (capturedGraph != nullptr) FastllmCudaGraphDestroy(capturedGraph);
             Qwen3DestroyCudaGraph(state);
             state.disabled = true;
+            FastllmCudaClearThreadError();
+            FastllmCudaClearGraphError();
             runWithoutGraph();
             return true;
         }
@@ -2205,9 +2253,14 @@ namespace fastllm {
                    gpuId, FastllmCudaGraphLastError());
             Qwen3DestroyCudaGraph(state);
             state.disabled = true;
+            FastllmCudaClearThreadError();
+            FastllmCudaClearGraphError();
             runWithoutGraph();
             return true;
         }
+        printf("[Fastllm] Qwen3 CUDA graph captured on GPU %d batch %d, pinned %zu scratch buffers.\n",
+               gpuId, batch, state.reservedPointers.size());
+        fflush(stdout);
         finishWithLogits();
         return true;
 #endif

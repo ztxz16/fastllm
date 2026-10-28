@@ -504,8 +504,8 @@ class AutoConfigTest(unittest.TestCase):
         with patch.object(memory, 'inventory', return_value=(metadata, tensors)), \
                 patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
             p = auto.resolve(a, self.gpu.__getitem__, hardware=self.hardware, ram=self.ram, use_numa=True)
-            self.assertEqual(os.environ['FASTLLM_CUDA_GRAPH'], '0')
-            self.assertFalse(p['automatic']['cuda_graph'])
+            self.assertNotIn('FASTLLM_CUDA_GRAPH', os.environ)
+            self.assertTrue(p['automatic']['cuda_graph'])
         self.assertEqual((a.max_context_length, a.moe_device_layers, a.moe_cuda_cache, a.moe_cpu_cache),
                          (40960, 0, 0, 0))
         costs = memory.weight_costs(tensors, g, a)
@@ -517,11 +517,13 @@ class AutoConfigTest(unittest.TestCase):
         for mtp, dspark in ((1, 0), (0, 7)):
             with self.assertRaises(ValueError):
                 memory.geometry(metadata, "float16", mtp, dspark)
-        with patch.object(memory, 'inventory', return_value=(metadata, tensors)), \
-                patch.dict(os.environ, {'FASTLLM_CUDA_GRAPH': '1'}, clear=True), redirect_stdout(io.StringIO()):
-            p = auto.resolve(self.args(), self.gpu.__getitem__, hardware=self.hardware, ram=self.ram, use_numa=True)
-            self.assertEqual(os.environ['FASTLLM_CUDA_GRAPH'], '1')
-            self.assertTrue(p['automatic']['cuda_graph'])
+        for value, expected in [('0', False), ('1', True)]:
+            with self.subTest(graph=value), \
+                    patch.object(memory, 'inventory', return_value=(metadata, tensors)), \
+                    patch.dict(os.environ, {'FASTLLM_CUDA_GRAPH': value}, clear=True), redirect_stdout(io.StringIO()):
+                p = auto.resolve(self.args(), self.gpu.__getitem__, hardware=self.hardware, ram=self.ram, use_numa=True)
+                self.assertEqual(os.environ['FASTLLM_CUDA_GRAPH'], value)
+                self.assertEqual(p['automatic']['cuda_graph'], expected)
 
     def test_qwen35_auto_uses_embedded_mtp_tp_and_native_context(self):
         config = dict(model_type='qwen3_5_text', num_hidden_layers=64, hidden_size=5120,
