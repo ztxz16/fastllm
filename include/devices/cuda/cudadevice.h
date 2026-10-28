@@ -30,6 +30,14 @@ namespace fastllm {
     void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis);
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
         Data **weights, Data **biass, float sharedScale, MoeGateType gateType = MoeGateSwiglu, int weightsBatch = -1, float swigluLimit = 0.0f, bool deepSeekV41 = false);
+    // Host-resident expert subsets; independent of NUMA placement. Uses
+    // grouped GGUF streaming where supported, otherwise per-expert GEMM.
+    void DoCudaMergeMOEFromCPU(Data &input, Data &output, Data &index, Data &score,
+        Data &w1, Data &w2, Data &w3, Data **weights, Data **biass,
+        float sharedScale, bool setZero, const std::unordered_set<int> &experts,
+        bool isCrossSwiglu, MoeGateType gateType, bool deepSeekV4Mode,
+        float swigluLimit, int activationQuantBlock, bool quantizeSharedExpert,
+        bool cacheAdmission);
     // Eager reference for unsupported V4.1 layouts and numerical regression.
     // Requires the original expert allocations; unavailable after Marlin repack.
     void DoCudaMergeMOEV41Fallback(Data &input, Data &output, Data &index, Data &score,

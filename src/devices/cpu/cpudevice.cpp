@@ -3914,6 +3914,9 @@ namespace fastllm {
                 for (int j = 0; j < topk; j++) {
                     int expertIdx = normalizeExpertIdx(indexData[o * topk + j]);
                     float expertScore = scoreData[o * topk + j];
+                    // The unbound prefill scheduler owns the complementary
+                    // GPU subset. Do not recompute its zero-scored routes.
+                    if (intParams.count("hostMoePrefillSubset") && expertScore == 0.0f) continue;
                     v.push_back(std::make_pair(expertIdx + 1, expertScore));
                 }
                 if (weights[0] != nullptr) {

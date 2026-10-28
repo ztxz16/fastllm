@@ -235,7 +235,7 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/context
         src/models/qwen4_exp_graph.cpp src/models/qwen4_exp_gpu_graph.cpp src/models/qwen4_exp_hybrid_graph.cpp
         src/models/qwen4_exp_hybrid.cpp src/models/qwen4_exp_hybrid_parallel.cpp src/models/qwen4_exp_tp.cpp
         src/models/qwen4_exp_pp.cpp
-        src/utils/hybrid_moe.cpp src/utils/hybrid_parallel.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp src/models/naive_n05_kvmem.cpp
+        src/utils/hybrid_moe.cpp src/utils/host_moe_prefill.cpp src/utils/hybrid_parallel.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp src/models/naive_n05_kvmem.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/glm5_next_gpu.cpp src/models/glm5_next_hybrid.cpp src/models/gpt_oss.cpp
         src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
@@ -2372,6 +2372,14 @@ if (UNIT_TEST)
         target_include_directories(cuda_qwen4_gdn_output_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         fastllm_add_checked_test(cuda_qwen4_gdn_output cuda_qwen4_gdn_output_test "ALL_PASS" 180)
         set_tests_properties(cuda_qwen4_gdn_output PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+        if (NOT USE_NUMAS)
+            add_executable(cuda_qwen4_cpu_moe_test test/basic/test_cuda_qwen4_cpu_moe.cpp)
+            target_link_libraries(cuda_qwen4_cpu_moe_test PRIVATE fastllm)
+            target_include_directories(cuda_qwen4_cpu_moe_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(cuda_qwen4_cpu_moe cuda_qwen4_cpu_moe_test "ALL_PASS" 180)
+            set_tests_properties(cuda_qwen4_cpu_moe PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+        endif()
 
         add_executable(naive_n05_decode_graph_test test/basic/test_naive_n05_decode_graph.cpp)
         target_link_libraries(naive_n05_decode_graph_test PRIVATE fastllm)

@@ -97,6 +97,16 @@ ftllm server /path/to/model.gguf --auto --device cudapp=2
 
 启动打印 `[auto]`，给出最终模式、设备、线程、chunk、驻留、缓存、上下文及内存预算；`model.hybrid_auto_plan` 保存同一结果。权重精度、路由数学和采样算法保持原有实现。
 
+## 不依赖 NUMA 的 Qwen4 GGUF prefill 分流
+
+单卡 CUDA 配合 `--moe_device cpu` 时，Qwen4 的普通 CPU 常驻 GGUF 专家也能在 prefill 中分流到 CPU/GPU，不要求 `USE_NUMAS`。Windows 可以继续使用 `-DUSE_NUMAS=OFF`；无需开启 NUMA 分配、绑核或专家显存缓存。GPU 常驻层维持原有放置，engram 设备配置不变。
+
+此路径支持 33–4096 行的 FP32/FP16/BF16 激活和现有 CUDA GGUF 反量化格式。根据每个专家的路由量与 CPU/GPU 两支的耗时反馈选择阈值，GPU 临时上传高路由量专家，CPU 同时计算其余专家，最后合并两支结果。CPU 重排权重先完成重排再交给 GPU 上传，gate/up 继续使用普通 CPU 的分半布局。当前入口限于无专家 bias 的串行 Qwen4 混推；TP、NUMA 已注册权重、磁盘专家和小批量 decode 保持各自原有路径。
+
+`FT_GPU_PREFILL=0` 关闭这一分流；`FT_EXPERT_LIMIT=<n>` 显式指定 GPU 专家的最低路由量（`0` 让所有活跃专家走 GPU），不设置时使用耗时反馈。临时上传不写入专家缓存。CPU 与 CUDA 的 GGUF 激活精度不同，合并结果不保证逐位一致。
+
+诊断时设置 `FASTLLM_PROFILE_HOST_MOE=1`，可记录每层两支的专家数、路由数和耗时；可用 `FASTLLM_PROFILE_HOST_MOE_PATH` 指定日志文件。Windows 构建还可设置 `FASTLLM_NVTX=1`，在 Nsight Systems 中查看 `host_moe_prefill/layer/<id>`、`host_moe_prefill/cpu` 和 `host_moe_prefill/gpu` 范围，确认 CPU 层的 GPU 专家计算及两支重叠情况。
+
 ## 混合推理共用的 prefill 专家缓存
 
 CUDA/NUMA 混推在有专家显存缓存时，默认让 prefill 和 decode 复用同一份缓存与热度策略。这个运行时能力也适用于手动配置，不依赖 `--auto`。Qwen 标准 MoE、DeepSeek-V4.1、GLM-5.3 共用权重传输层：原生布局一致时直接借用显存记录；布局不一致时在 GPU 上还原原有 NUMA 字节布局，包括 gate/up 行序和 FP8/NVFP4 scale。未命中的专家继续临时上传，符合热度策略的记录写入有容量上限的缓存。

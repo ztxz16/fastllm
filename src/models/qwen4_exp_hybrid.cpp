@@ -1,4 +1,5 @@
 #include "utils/nsys.h"
+#include "utils/host_moe_prefill.h"
 // Independent hybrid forward; tensor blocks and CUDA kernels remain shared.
 #include "qwen4_exp_execution.h"
 #include "qwen4_exp_hybrid.h"
@@ -333,7 +334,14 @@ namespace fastllm {
             SelectDeviceFromMap(this->deviceMap, deviceLayer + 1, this->block_cnt);
         bool hybridMoe = false;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
-        if (outputDevice.find("cuda") == 0) {
+        if (outputDevice.find("cuda") == 0 && moeDevice == "cpu" &&
+            threadTpRank < 0 && prepared == nullptr &&
+            std::all_of(moeBiass.begin(), moeBiass.end(),
+                [](const Data *bias) { return !bias || bias->dims.empty(); })) {
+            hybridMoe = RunHostMoePrefill(flattened, expertIndex, expertScore,
+                output, moeWeights.data(), int(moeWeights.size()), deviceLayer);
+        }
+        if (!hybridMoe && outputDevice.find("cuda") == 0) {
             hybridMoe = fastllm::RunHybridMoe(flattened, expertIndex, expertScore, output,
                                               moeWeights.data(), moeWeights.size(), deviceLayer);
         }
@@ -352,7 +360,18 @@ namespace fastllm {
         Data &routedOutput = writeRoutedDirectly ? output : routed;
         Data w1, w2, w3, temporaryInput, temporaryOutput;
         if (!hybridMoe) {
-            MergeMOE(flattened, expertIndex, expertScore, moeWeights, moeBiass, w1, w2, w3,
+            Data cpuInput;
+            const Data *routedInput = &flattened;
+#ifdef USE_CUDA
+            // FakeFrom borrows the GPU pointer without owning transfer storage.
+            // The generic CPU executor needs an owning tensor for its readback.
+            if (!useMoeCudaCache && moeDevice == "cpu" &&
+                flattened.dataDevice == DataDevice::CUDA) {
+                cpuInput.CopyFrom(flattened);
+                routedInput = &cpuInput;
+            }
+#endif
+            MergeMOE(*routedInput, expertIndex, expertScore, moeWeights, moeBiass, w1, w2, w3,
                      temporaryInput, temporaryOutput, 1.0f, routedOutput, deviceLayer);
         }
 #ifdef USE_CUDA
