@@ -1026,10 +1026,10 @@ int NaiveN05FlashModel::ForwardDraft(
         if (isIntermediateChunkedPrefill) return 0;
         return SampleTarget(logits, kv, config, lastTokens, retLogits, &selection);
     }
-    Data draftHidden = RunDraft(anchor, context), selected, baseLogits;
+    Data draftHidden = RunDraft(anchor, context), selected;
     // DSpark predicts after the anchor at slot 0, unlike DFlash's masked-slot-only head.
     Split(draftHidden, 1, 0, limit, selected);
-    baseLogits = RunDraftHead(selected);
+    Data baseLogits = RunDraftHead(selected);
     const int vocab = baseLogits.dims.back();
     const bool greedy = config.IsSimpleGreedy() && config.output_token_least <= 0;
     LastTokensUnit samplingTokens = lastTokens.units.empty() ? LastTokensUnit(config.last_n) : lastTokens.units[0];
