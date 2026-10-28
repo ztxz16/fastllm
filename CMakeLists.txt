@@ -1809,6 +1809,12 @@ if (UNIT_TEST)
     endif()
 
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(cuda_iq2_r4_test test/basic/test_cuda_iq2_r4.cu)
+        target_include_directories(cuda_iq2_r4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/devices/cuda)
+        target_link_libraries(cuda_iq2_r4_test PRIVATE fastllm)
+        add_test(NAME cuda_iq2_r4 COMMAND cuda_iq2_r4_test)
+        set_tests_properties(cuda_iq2_r4 PROPERTIES LABELS cuda RUN_SERIAL TRUE TIMEOUT 120)
+
         add_executable(cuda_data_transfer_test test/basic/test_cuda_data_transfer.cpp)
         target_link_libraries(cuda_data_transfer_test PRIVATE fastllm)
         target_include_directories(cuda_data_transfer_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

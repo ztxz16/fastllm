@@ -875,6 +875,31 @@ static __device__ __forceinline__ uint8_t iq_r4_signs(uint8_t packed) {
     return ksigns_iq2xs[original];
 }
 
+// The caller guarantees a 16-byte aligned destination for eight values.
+template<typename dst_t>
+static __device__ __forceinline__ void StoreDequantizedOctet(dst_t *output, const dst_t (&values)[8]) {
+    if constexpr (std::is_same<dst_t, float>::value) {
+        auto *y = reinterpret_cast<float4 *>(output);
+        y[0] = make_float4(values[0], values[1], values[2], values[3]);
+        y[1] = make_float4(values[4], values[5], values[6], values[7]);
+    } else {
+        uint32_t pairs[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint16_t a, b;
+            if constexpr (std::is_same<dst_t, __nv_bfloat16>::value) {
+                a = __bfloat16_as_ushort(values[2 * j]);
+                b = __bfloat16_as_ushort(values[2 * j + 1]);
+            } else {
+                a = __half_as_ushort(values[2 * j]);
+                b = __half_as_ushort(values[2 * j + 1]);
+            }
+            pairs[j] = uint32_t(a) | (uint32_t(b) << 16);
+        }
+        *reinterpret_cast<uint4 *>(output) = make_uint4(pairs[0], pairs[1], pairs[2], pairs[3]);
+    }
+}
+
 template<typename dst_t, bool iq3>
 static __global__ void dequantize_block_iq_r4(const void * __restrict__ vx,
                                               dst_t * __restrict__ output,
@@ -918,10 +943,57 @@ static __global__ void dequantize_block_iq_r4(const void * __restrict__ vx,
     }
 }
 
+// Map each lane to the next eight output elements while preserving the R4
+// source layout and scalar rounding. Adjacent lanes use contiguous vector stores.
+// The two IQ2 formats differ only in their grid, sign and scale encoding.
+template<typename dst_t, bool iq2xs>
+static __global__ void dequantize_iq2_r4_contiguous(const void *__restrict__ vx,
+        dst_t *__restrict__ output, int64_t columns) {
+    const int64_t index = (int64_t(blockIdx.x) * 128 + threadIdx.x) * 8;
+    const int64_t outputRow = index / columns;
+    const int64_t column = index % columns;
+    const int row = outputRow % 4;
+    const int ib = (column % QK_K) / 32, il = (column % 32) / 8;
+    const int64_t block = outputRow / 4 * (columns / QK_K) + column / QK_K;
+    uint64_t grid;
+    uint8_t signs;
+    float d;
+    if constexpr (iq2xs) {
+        const auto &x = static_cast<const block_iq2_xs_r4 *>(vx)[block];
+        const uint16_t q2 = x.qs[16 * ib + 4 * row + il];
+        grid = iq2xs_grid[q2 & 511];
+        signs = iq_r4_signs(q2 >> 9);
+        const int scale = (x.scales[4 * ib + row] >> (4 * (il / 2))) & 15;
+        d = __half2float(x.d[row]) * (0.5f + scale) * 0.25f;
+    } else {
+        const auto &x = static_cast<const block_iq2_xxs_r4 *>(vx)[block];
+        const uint8_t *sas = x.sas + 16 * ib + 4 * row;
+        const int scale = (sas[0] & 1) | ((sas[1] & 1) << 1) |
+                          ((sas[2] & 1) << 2) | ((sas[3] & 1) << 3);
+        grid = iq2xxs_grid[x.qs[16 * ib + 4 * row + il]];
+        signs = iq_r4_signs(sas[il] >> 1);
+        d = __half2float(x.d[row]) * (0.5f + scale) * 0.25f;
+    }
+    dst_t values[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int q = (grid >> (8 * j)) & 255;
+        values[j] = DequantizeCast<dst_t>::cast(d * q * ((signs & (1 << j)) ? -1.0f : 1.0f));
+    }
+    StoreDequantizedOctet(output + index, values);
+}
+
 template<typename dst_t, bool iq3>
 static void dequantize_row_iq_r4_cuda(const void *vx, dst_t *y, const int64_t nrows,
                                      const int64_t n_per_row, cudaStream_t stream) {
     const int64_t blocks = nrows * n_per_row / (4 * QK_K);
+    if (!blocks) return;
+    if constexpr (!iq3) {
+        if ((reinterpret_cast<uintptr_t>(y) & 15) == 0) {
+            dequantize_iq2_r4_contiguous<dst_t, true><<<blocks, 128, 0, stream>>>(vx, y, n_per_row);
+            return;
+        }
+    }
     dequantize_block_iq_r4<dst_t, iq3><<<blocks, 128, 0, stream>>>(vx, y, n_per_row);
 }
 
@@ -965,7 +1037,14 @@ template<typename dst_t, bool iq2s>
 static void dequantize_row_iq2_other_r4_cuda(const void *vx, dst_t *y,
         int64_t rows, int64_t columns, cudaStream_t stream) {
     const int64_t blocks = rows * columns / (4 * QK_K);
-    if (blocks) dequantize_block_iq2_other_r4<dst_t, iq2s><<<blocks, 128, 0, stream>>>(vx, y, columns);
+    if (!blocks) return;
+    if constexpr (!iq2s) {
+        if ((reinterpret_cast<uintptr_t>(y) & 15) == 0) {
+            dequantize_iq2_r4_contiguous<dst_t, false><<<blocks, 128, 0, stream>>>(vx, y, columns);
+            return;
+        }
+    }
+    dequantize_block_iq2_other_r4<dst_t, iq2s><<<blocks, 128, 0, stream>>>(vx, y, columns);
 }
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
