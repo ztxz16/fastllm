@@ -15836,6 +15836,63 @@ __global__ void FastllmTemperatureSoftmaxKernel(float *logits, float *probs, flo
     }
 }
 
+// Small decode batches cannot fill the GPU with one CTA per vocabulary row.
+// Keep compact per-tile statistics in the second probability scratch buffer;
+// the following normalization pass reuses those statistics from cache.
+template<int THREADS, int TILE>
+__global__ void FastllmTemperatureSoftmaxPartialKernel(const float *logits, float2 *partials,
+        const float *temperatures, float temperature, int vocab, int chunks) {
+    const int row = blockIdx.y, begin = blockIdx.x * TILE;
+    const float invTemp = 1.0f / (temperatures ? temperatures[row] : temperature);
+    float values[TILE / THREADS], maximum = -INFINITY;
+    #pragma unroll
+    for (int i = 0; i < TILE / THREADS; ++i) {
+        const int v = begin + threadIdx.x + i * THREADS;
+        values[i] = v < vocab ? logits[(size_t)row * vocab + v] : -INFINITY;
+        maximum = fmaxf(maximum, values[i]);
+    }
+    typedef cub::BlockReduce<float, THREADS> Reduce;
+    __shared__ typename Reduce::TempStorage storage;
+    __shared__ float tileMax;
+    maximum = Reduce(storage).Reduce(maximum, MaxReduceOp{});
+    if (threadIdx.x == 0) tileMax = maximum;
+    __syncthreads();
+    float sum = 0;
+    #pragma unroll
+    for (int i = 0; i < TILE / THREADS; ++i)
+        if (isfinite(tileMax)) sum += expf((values[i] - tileMax) * invTemp);
+    sum = Reduce(storage).Sum(sum);
+    if (threadIdx.x == 0) partials[(size_t)row * chunks + blockIdx.x] = make_float2(tileMax, sum);
+}
+
+template<int THREADS, int TILE>
+__global__ void FastllmTemperatureSoftmaxNormalizeKernel(const float *logits, float *probs,
+        const float2 *partials, const float *temperatures, float temperature, int vocab, int chunks) {
+    const int row = blockIdx.y, begin = blockIdx.x * TILE;
+    const float invTemp = 1.0f / (temperatures ? temperatures[row] : temperature);
+    const float2 *stats = partials + (size_t)row * chunks;
+    float maximum = -INFINITY;
+    for (int i = threadIdx.x; i < chunks; i += THREADS) maximum = fmaxf(maximum, stats[i].x);
+    typedef cub::BlockReduce<float, THREADS> Reduce;
+    __shared__ typename Reduce::TempStorage storage;
+    __shared__ float rowMax, inverseSum;
+    maximum = Reduce(storage).Reduce(maximum, MaxReduceOp{});
+    if (threadIdx.x == 0) rowMax = maximum;
+    __syncthreads();
+    float sum = 0;
+    for (int i = threadIdx.x; i < chunks; i += THREADS)
+        if (stats[i].y > 0) sum += stats[i].y * expf((stats[i].x - rowMax) * invTemp);
+    sum = Reduce(storage).Sum(sum);
+    if (threadIdx.x == 0) inverseSum = sum > 0 ? 1.0f / sum : 0;
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < TILE / THREADS; ++i) {
+        const int v = begin + threadIdx.x + i * THREADS;
+        if (v < vocab) probs[(size_t)row * vocab + v] =
+            expf((logits[(size_t)row * vocab + v] - rowMax) * invTemp) * inverseSum;
+    }
+}
+
 template <int BLOCK_THREADS>
 __global__ void FastllmTypicalAcceptanceKernel(
         const float *probs, const int *candidateIds,
@@ -17346,24 +17403,35 @@ struct FastllmMtpSamplingWorkspace {
     bool Prepare(float *logits, const float *hostTemperatures,
                  const int *hostTopKs, const float *hostTopPs, int rows, int vocab) {
         if (!scratch) return false;
-        std::vector<float> ts(rows), ps(rows);
-        std::vector<int> ks(rows);
-        bool needTopP = false, needTopK = false;
+        bool needTopP = false, needTopK = false, uniformTemperature = true;
         for (int i = 0; i < rows; ++i) {
             if (!std::isfinite(hostTemperatures[i]) || hostTemperatures[i] <= 0 ||
                 !std::isfinite(hostTopPs[i]) || hostTopPs[i] <= 0 || hostTopPs[i] > 1)
                 return false;
-            ts[i] = hostTemperatures[i];
-            ps[i] = hostTopPs[i];
-            ks[i] = hostTopKs[i] <= 0 ? vocab : std::min(hostTopKs[i], vocab);
-            needTopP |= ps[i] < 1;
-            needTopK |= ks[i] < vocab;
+            uniformTemperature &= hostTemperatures[i] == hostTemperatures[0];
+            needTopP |= hostTopPs[i] < 1;
+            needTopK |= hostTopKs[i] > 0 && hostTopKs[i] < vocab;
         }
-        FastllmCudaCopyFromHostToDevice(temperatures, ts.data(), rows * sizeof(float));
-        if (needTopK) FastllmCudaCopyFromHostToDevice(topKs, ks.data(), rows * sizeof(int));
-        if (needTopP) FastllmCudaCopyFromHostToDevice(topPs, ps.data(), rows * sizeof(float));
+        const bool tiled = rows <= 64 && vocab >= 16384;
+        if (!tiled || !uniformTemperature)
+            FastllmCudaCopyFromHostToDevice(temperatures, const_cast<float*>(hostTemperatures), rows * sizeof(float));
+        if (needTopK) {
+            std::vector<int> ks(rows);
+            for (int i = 0; i < rows; ++i)
+                ks[i] = hostTopKs[i] <= 0 ? vocab : std::min(hostTopKs[i], vocab);
+            FastllmCudaCopyFromHostToDevice(topKs, ks.data(), rows * sizeof(int));
+        }
+        if (needTopP)
+            FastllmCudaCopyFromHostToDevice(topPs, const_cast<float*>(hostTopPs), rows * sizeof(float));
         cudaStream_t stream = cudaStreamPerThread;
-        FastllmTemperatureSoftmaxKernel<1024><<<rows, 1024, 0, stream>>>(
+        if (tiled) {
+            const int chunks = (vocab + 4095) / 4096;
+            const float *tsDevice = uniformTemperature ? nullptr : temperatures;
+            FastllmTemperatureSoftmaxPartialKernel<256, 4096><<<dim3(chunks, rows), 256, 0, stream>>>(
+                logits, (float2*)b, tsDevice, hostTemperatures[0], vocab, chunks);
+            FastllmTemperatureSoftmaxNormalizeKernel<256, 4096><<<dim3(chunks, rows), 256, 0, stream>>>(
+                logits, a, (const float2*)b, tsDevice, hostTemperatures[0], vocab, chunks);
+        } else FastllmTemperatureSoftmaxKernel<1024><<<rows, 1024, 0, stream>>>(
             logits, a, temperatures, vocab);
         cudaError_t state = cudaGetLastError();
         if (state == cudaSuccess && needTopP) {
@@ -17427,6 +17495,9 @@ bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
     if (!ws.Prepare(logits, temperatures, topKs, topPs, rows, vocabSize)) return false;
     FastllmCudaCopyFromHostToDevice(ws.draftIds, (void*)draftTokenIds,
                                    batch * draftTokens * sizeof(int));
+    if (batch <= 8 && draftTokens <= 8 && vocabSize >= 16384)
+        return FastllmCudaMtpRejectionFromProbabilities(ws.a, proposalProbs,
+            ws.draftIds, output, acceptedDraftTokens, batch, draftTokens, vocabSize);
     cudaStream_t stream = cudaStreamPerThread;
     cudaError_t state = cudaMemsetAsync(ws.accepted, 0, batch * sizeof(int), stream);
     if (state == cudaSuccess)

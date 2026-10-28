@@ -96,8 +96,8 @@ static std::array<double, 4> Target(int prev) {
 static int Draw(const std::array<double, 4> &p, std::mt19937 &rng) {
     return std::discrete_distribution<int>(p.begin(), p.end())(rng);
 }
-static void Sampling(Probe &model, int drafts, int mode) {
-    constexpr int vocab = 128, samples = 6000;
+static void Sampling(Probe &model, int drafts, int mode, int vocab = 128) {
+    constexpr int samples = 6000;
     std::mt19937 rng(12731 + drafts * 37 + mode);
     std::vector<int> counts(64), acceptance(drafts + 1);
     std::vector<float> logits((drafts + 1) * vocab, -1000);
@@ -176,14 +176,14 @@ static void Sampling(Probe &model, int drafts, int mode) {
 // Later positions deliberately match q after the first rejection, so using the
 // total accepted count instead of the contiguous prefix cannot pass this test.
 static void BatchedRejectionReadback() {
-    constexpr int vocab = 129, sentinel = -739;
-    for (int drafts : {1, 5, 8}) for (int batch : {1, 3, 9}) {
+    constexpr int sentinel = -739;
+    for (int vocab : {129, 16385}) for (int drafts : {1, 5, 8}) for (int batch : {1, 3, 8, 9}) {
         const int rows = batch * (drafts + 1);
         std::vector<float> logits(rows * vocab, -INFINITY), q(batch * drafts * vocab);
         std::vector<int> ids(batch * drafts, 0), ks(rows, vocab);
         std::vector<float> ts(rows, 1.0f), ps(rows, 1.0f);
         for (int b = 0; b < batch; ++b) {
-            const int prefix = b % (drafts + 1);
+            const int prefix = (b + drafts) % (drafts + 1);
             for (int s = 0; s <= drafts; ++s) {
                 const int token = s == drafts ? 2 : s == prefix ? 1 : 0;
                 logits[(b * (drafts + 1) + s) * vocab + token] = 0;
@@ -203,7 +203,7 @@ static void BatchedRejectionReadback() {
             Check(output.front() == sentinel && output.back() == sentinel &&
                 accepted.front() == sentinel && accepted.back() == sentinel, "readback overrun");
             for (int b = 0; b < batch; ++b) {
-                const int prefix = b % (drafts + 1);
+                const int prefix = (b + drafts) % (drafts + 1);
                 Check(accepted[b + 1] == prefix, "wrong contiguous accepted prefix");
                 for (int s = 0; s <= prefix; ++s)
                     Check(output[1 + b * (drafts + 1) + s] ==
@@ -702,6 +702,7 @@ int main() {
     for (int drafts : {3, 4, 5, 7})
         for (int mode = 0; mode < 3; ++mode)
             Sampling(model, drafts, mode);
+    for (int mode : {0, 1, 2}) Sampling(model, 5, mode, 16385);
     Rollback(model);
     if (devices >= 2) {
         MainFeatures();
