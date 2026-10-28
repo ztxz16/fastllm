@@ -17324,9 +17324,9 @@ struct FastllmMtpSamplingWorkspace {
         size_t ao = reserve((size_t)rows * vocab * sizeof(float));
         size_t bo = reserve((size_t)rows * vocab * sizeof(float));
         size_t to = reserve(rows * sizeof(float)), ko = reserve(rows * sizeof(int));
-        size_t po = reserve(rows * sizeof(float)), oo = reserve(rows * sizeof(int));
+        size_t po = reserve(rows * sizeof(float)), oo = reserve((size_t)rows * 2 * sizeof(int));
         size_t doff = reserve(rows * sizeof(int)), ac = reserve(rows * sizeof(int));
-        size_t em = reserve(rows * sizeof(int)), va = reserve(rows * sizeof(bool));
+        size_t va = reserve(rows * sizeof(bool));
         size_t rs = reserve(rows * sizeof(flashinfer::sampling::RadixRowState));
         size_t bytes = 0;
         scratch = (uint8_t*)FastllmBorrowDequantScratch(need, &bytes, &own);
@@ -17339,7 +17339,7 @@ struct FastllmMtpSamplingWorkspace {
         temperatures = (float*)(scratch + to); topKs = (int*)(scratch + ko);
         topPs = (float*)(scratch + po); output = (int*)(scratch + oo);
         draftIds = (int*)(scratch + doff); accepted = (int*)(scratch + ac);
-        emitted = (int*)(scratch + em); valid = (bool*)(scratch + va);
+        emitted = output + rows; valid = (bool*)(scratch + va);
         rowStates = (flashinfer::sampling::RadixRowState*)(scratch + rs);
     }
     ~FastllmMtpSamplingWorkspace() { FastllmReleaseDequantScratch(scratch, own); }
@@ -17360,8 +17360,8 @@ struct FastllmMtpSamplingWorkspace {
             needTopK |= ks[i] < vocab;
         }
         FastllmCudaCopyFromHostToDevice(temperatures, ts.data(), rows * sizeof(float));
-        FastllmCudaCopyFromHostToDevice(topKs, ks.data(), rows * sizeof(int));
-        FastllmCudaCopyFromHostToDevice(topPs, ps.data(), rows * sizeof(float));
+        if (needTopK) FastllmCudaCopyFromHostToDevice(topKs, ks.data(), rows * sizeof(int));
+        if (needTopP) FastllmCudaCopyFromHostToDevice(topPs, ps.data(), rows * sizeof(float));
         cudaStream_t stream = cudaStreamPerThread;
         FastllmTemperatureSoftmaxKernel<1024><<<rows, 1024, 0, stream>>>(
             logits, a, temperatures, vocab);
@@ -17438,11 +17438,13 @@ bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
             nullptr, 0, stream);
     }
     if (state != cudaSuccess) return false;
-    FastllmCudaCopyFromDeviceToHost(output, ws.output, rows * sizeof(int));
     // emitted counts the accepted prefix; accepted also counts later positions
     // after the first rejection and must never be used as the commit length.
-    FastllmCudaCopyFromDeviceToHost(acceptedDraftTokens, ws.emitted, batch * sizeof(int));
+    std::vector<int> result(rows + batch);
+    FastllmCudaCopyFromDeviceToHost(result.data(), ws.output, result.size() * sizeof(int));
     DeviceSync();
+    std::copy_n(result.data(), rows, output);
+    std::copy_n(result.data() + rows, batch, acceptedDraftTokens);
     for (int b = 0; b < batch; ++b) {
         int n = acceptedDraftTokens[b];
         if (n < 0 || n > draftTokens) return false;
