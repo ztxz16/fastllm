@@ -570,7 +570,7 @@ namespace fastllm {
                 auto head = weight.weight.find("lm_head.weight");
                 if (head != weight.weight.end() && !head->second.dims.empty())
                     tokens->resize(std::max(tokens->size(), (size_t)head->second.dims[0]));
-                toolConstraintVocabulary = tokens;
+                toolConstraintVocabulary = std::make_shared<MimoToolVocabulary>(std::move(tokens));
             });
             std::set<int> stops(eos_token_ids.begin(), eos_token_ids.end());
             stops.insert(eos_token_id);

@@ -32,6 +32,7 @@ namespace fastllm {
     };
 
     class basellm;
+    class MimoToolVocabulary;
 
     struct PrefillPrefixPreview {
         // Query identity is checked once per request/pass, not once per layer.
@@ -517,7 +518,7 @@ namespace fastllm {
         void AdvanceToolCallConstraintText(std::string &text, int tokenId);
         void AdvanceToolCallGrammar(GenerationConfig &config, int tokenId);
         std::once_flag toolConstraintVocabularyOnce;
-        std::shared_ptr<const std::vector<std::string>> toolConstraintVocabulary;
+        std::shared_ptr<const MimoToolVocabulary> toolConstraintVocabulary;
 
         virtual void UpdateToolCallConstraintState(ResponseContext *context, int tokenId);
 

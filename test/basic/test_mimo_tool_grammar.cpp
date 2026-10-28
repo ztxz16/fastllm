@@ -1,11 +1,69 @@
 #include "models/mimo_tool_grammar.h"
 #include <iostream>
+#include <random>
 #include <stdexcept>
 
 using fastllm::MimoToolGrammar;
 static void Check(bool ok, const char *message) { if (!ok) throw std::runtime_error(message); }
+// Compare the indexed mask with the independent byte-walking token API.
+// Include marker fragments, all byte values, duplicate text, empty padding,
+// and stop tokens whose spelling would otherwise be accepted or rejected.
+static void CheckIndexedMasks() {
+    auto tokens = std::make_shared<std::vector<std::string>>();
+    for (int c = 0; c < 256; ++c) tokens->push_back(std::string(1, char(c)));
+    for (const auto &text : {"<tool_call>", "<think>", "</think><tool_call>",
+            "<function=A>", "</parameter></function></tool_call>", "function=A>",
+            "tool_call><function=B>", "parameter>x</function>", "A>", ">abc", "abc", "abc", ""})
+        tokens->push_back(text);
+    std::mt19937 random(20261028);
+    const std::string alphabet = "<>/thinktool_callfunctionparameter=ABxyz \n\t";
+    for (int i = 0; i < 512; ++i) {
+        std::string text;
+        for (int j = 0, n = 1 + random() % 20; j < n; ++j) text += alphabet[random() % alphabet.size()];
+        tokens->push_back(text);
+    }
+    const int emptyStop = tokens->size();
+    tokens->resize(tokens->size() + 37);
+    auto indexed = std::make_shared<fastllm::MimoToolVocabulary>(tokens);
+    const std::set<int> stops = {int('x'), int('<'), emptyStop, -1, int(tokens->size()) + 3};
+    const std::map<std::string, std::vector<std::string>> tools = {{"A", {"x"}}, {"B", {}}};
+    const std::vector<std::string> paths = {
+        "text<think>example <tool_call> ignored</think>more",
+        "<tool_call>\n<function=A><parameter=x>raw < 3</parameter></function></tool_call>",
+        "<tool_call> <function= B ></function> </tool_call><tool_call>",
+        "<tool_call><function=A><parameter=x>x</function>", "<tool_call><function=Unknown>"};
+    for (bool required : {false, true}) for (bool single : {false, true}) {
+        MimoToolGrammar grammar(tools, required, single);
+        grammar.Bind(indexed, stops);
+        grammar.Bind(tokens, stops); // Both overloads recognize the same binding.
+        std::set<int> visited;
+        auto check = [&](int state) {
+            if (state < 0 || !visited.insert(state).second) return;
+            auto mask = grammar.Mask(state);
+            for (int id = 0; id < (int)tokens->size(); ++id)
+                Check(bool(((*mask)[id / 32] >> (id % 32)) & 1) == (grammar.AdvanceToken(state, id) >= 0),
+                      "indexed mask differs from byte-walking oracle");
+            for (size_t id = tokens->size(); id < mask->size() * 32; ++id)
+                Check((((*mask)[id / 32] >> (id % 32)) & 1) == 0, "unused mask bits must be zero");
+        };
+        check(0);
+        for (const auto &path : paths) {
+            int state = 0;
+            for (char c : path) {
+                state = grammar.Advance(state, std::string(1, c));
+                if (state < 0) break;
+                check(state);
+            }
+        }
+        bool changed = false;
+        try { grammar.Bind(indexed, {}); } catch (const std::logic_error &) { changed = true; }
+        Check(changed, "bound stop policy cannot change");
+    }
+}
+
 int main() {
     try {
+        CheckIndexedMasks();
         const std::map<std::string, std::vector<std::string>> tools = {
             {"Bash", {"command", "description"}}, {"Read", {"path"}}, {"Ping", {}}};
         MimoToolGrammar grammar(tools);

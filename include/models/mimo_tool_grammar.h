@@ -1,6 +1,7 @@
 #ifndef FASTLLM_MIMO_TOOL_GRAMMAR_H
 #define FASTLLM_MIMO_TOOL_GRAMMAR_H
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <initializer_list>
@@ -15,6 +16,31 @@
 #include <vector>
 
 namespace fastllm {
+
+// Shared by requests using the same tokenizer. Only tokens containing '<'
+// can open a marker while reading unrestricted text or argument values.
+class MimoToolVocabulary {
+    friend class MimoToolGrammar;
+    std::shared_ptr<const std::vector<std::string>> tokens;
+    std::array<std::vector<int>, 256> plainByFirstByte;
+    std::vector<int> withMarker;
+    std::vector<uint32_t> plainMask;
+public:
+    explicit MimoToolVocabulary(std::shared_ptr<const std::vector<std::string>> tokens)
+        : tokens(std::move(tokens)) {
+        if (!this->tokens) throw std::invalid_argument("MiMo grammar needs a vocabulary.");
+        plainMask.resize((this->tokens->size() + 31) / 32);
+        for (int id = 0; id < (int)this->tokens->size(); ++id) {
+            const auto &text = (*this->tokens)[id];
+            if (text.empty()) continue;
+            if (text.find('<') != std::string::npos) withMarker.push_back(id);
+            else {
+                plainByFirstByte[(unsigned char)text.front()].push_back(id);
+                plainMask[id / 32] |= uint32_t(1) << (id % 32);
+            }
+        }
+    }
+};
 
 // MiMo's closed XML tool dialect. Argument values remain raw text; JSON/schema
 // validation belongs to the existing parser. State IDs are cheap branch copies.
@@ -38,7 +64,7 @@ class MimoToolGrammar {
     std::vector<std::vector<std::string>> bodies;
     std::vector<Node> nodes;
     std::map<StateKey, int> states;
-    std::shared_ptr<const std::vector<std::string>> vocabulary;
+    std::shared_ptr<const MimoToolVocabulary> vocabulary;
     std::set<int> stops;
     bool required, single;
     std::mutex mutex;
@@ -132,6 +158,18 @@ class MimoToolGrammar {
         for (unsigned char c : text) { state = Step(state, c); if (state < 0) break; }
         return state;
     }
+    bool PlainText(int state) const {
+        if (state < 0) return false;
+        const auto &s = nodes.at(state).state;
+        return s.prefix.empty() && (s.phase == Text || s.phase == Reasoning || s.phase == Value);
+    }
+    bool BoundTo(const std::shared_ptr<const std::vector<std::string>> &tokens,
+                 const std::set<int> &endTokens) const {
+        if (!vocabulary) return false;
+        if (vocabulary->tokens != tokens || stops != endTokens)
+            throw std::logic_error("MiMo grammar cannot change tokenizer or stop tokens.");
+        return true;
+    }
     bool EndAllowed(int state) const {
         return nodes.at(state).state.phase == Text && (!required || nodes[state].state.called);
     }
@@ -149,14 +187,16 @@ public:
         }
         Intern(State());
     }
+    void Bind(std::shared_ptr<const MimoToolVocabulary> tokens, const std::set<int> &endTokens) {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (!tokens) throw std::invalid_argument("MiMo grammar needs a vocabulary.");
+        if (BoundTo(tokens->tokens, endTokens)) return;
+        vocabulary = std::move(tokens); stops = endTokens;
+    }
     void Bind(std::shared_ptr<const std::vector<std::string>> tokens, const std::set<int> &endTokens) {
         std::lock_guard<std::mutex> guard(mutex);
-        if (vocabulary) {
-            if (vocabulary != tokens || stops != endTokens)
-                throw std::logic_error("MiMo grammar cannot change tokenizer or stop tokens.");
-            return;
-        }
-        vocabulary = std::move(tokens); stops = endTokens;
+        if (BoundTo(tokens, endTokens)) return;
+        vocabulary = std::make_shared<MimoToolVocabulary>(std::move(tokens)); stops = endTokens;
     }
     int Advance(int state, const std::string &text) {
         std::lock_guard<std::mutex> guard(mutex);
@@ -168,23 +208,49 @@ public:
     }
     int AdvanceToken(int state, int token) {
         std::lock_guard<std::mutex> guard(mutex);
-        if (!vocabulary || token < 0 || token >= (int)vocabulary->size()) return -1;
+        if (!vocabulary || token < 0 || token >= (int)vocabulary->tokens->size()) return -1;
         if (stops.count(token)) return EndAllowed(state) ? state : -1;
-        if ((*vocabulary)[token].empty()) return -1;
-        return AdvanceBytes(state, (*vocabulary)[token]);
+        if ((*vocabulary->tokens)[token].empty()) return -1;
+        return AdvanceBytes(state, (*vocabulary->tokens)[token]);
     }
     std::shared_ptr<const std::vector<uint32_t>> Mask(int state) {
         std::lock_guard<std::mutex> guard(mutex);
         if (!vocabulary || state < 0) throw std::logic_error("Invalid MiMo grammar state.");
         if (nodes.at(state).mask) return nodes[state].mask;
-        auto mask = std::make_shared<std::vector<uint32_t>>((vocabulary->size() + 31) / 32, 0);
-        int count = 0;
-        for (int token = 0; token < (int)vocabulary->size(); ++token) {
-            bool allowed = stops.count(token) ? EndAllowed(state) :
-                !(*vocabulary)[token].empty() && AdvanceBytes(state, (*vocabulary)[token]) >= 0;
-            if (allowed) { (*mask)[token / 32] |= uint32_t(1) << (token % 32); ++count; }
+        const auto &tokens = *vocabulary->tokens;
+        const auto phase = nodes[state].state.phase;
+        const bool freePhase = phase == Text || phase == Reasoning || phase == Value;
+        auto mask = std::make_shared<std::vector<uint32_t>>(vocabulary->plainMask.size(), 0);
+        if (freePhase) *mask = vocabulary->plainMask;
+        auto allow = [&](int token, bool valid) {
+            const auto bit = uint32_t(1) << (token % 32);
+            if (valid) (*mask)[token / 32] |= bit;
+            else (*mask)[token / 32] &= ~bit;
+        };
+        if (!PlainText(state)) {
+            for (int c = 0; c < 256; ++c) {
+                const auto &ids = vocabulary->plainByFirstByte[c];
+                if (ids.empty()) continue;
+                int next = Step(state, (unsigned char)c);
+                if ((freePhase && PlainText(next)) || (!freePhase && next < 0)) continue;
+                for (int token : ids) {
+                    int current = next;
+                    // These tokens contain no '<'. Once an unfinished marker
+                    // returns to unrestricted text, the remaining bytes are legal.
+                    for (size_t i = 1; i < tokens[token].size() && current >= 0 && !PlainText(current); ++i)
+                        current = Step(current, (unsigned char)tokens[token][i]);
+                    allow(token, current >= 0);
+                }
+            }
         }
-        if (!count) throw std::runtime_error("MiMo grammar has no legal token; refusing unconstrained fallback.");
+        // Marker-bearing tokens keep the generic byte-by-byte state machine.
+        for (int token : vocabulary->withMarker)
+            allow(token, AdvanceBytes(state, tokens[token]) >= 0);
+        // Stop tokens override their textual spelling, including empty entries.
+        for (int token : stops) if (token >= 0 && token < (int)tokens.size())
+            allow(token, EndAllowed(state));
+        if (std::none_of(mask->begin(), mask->end(), [](uint32_t word) { return word != 0; }))
+            throw std::runtime_error("MiMo grammar has no legal token; refusing unconstrained fallback.");
         nodes[state].mask = mask;
         return mask;
     }
