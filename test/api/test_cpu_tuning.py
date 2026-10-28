@@ -57,11 +57,30 @@ class CpuTuningTest(unittest.TestCase):
         self.assertEqual(chosen, 8)
         self.assertEqual(detail['selected'], 8)
 
-    def test_timeout_falls_back_inside_quota(self):
-        with patch.object(tuning, '_measure', side_effect=subprocess.TimeoutExpired('probe', 1.5)):
-            chosen, detail = tuning.select_threads(7168, 2048, 16, 9)
-        self.assertEqual(chosen, 8)
-        self.assertEqual(detail['fallback'], 'TimeoutExpired')
+    def test_failed_calibration_preserves_original_limit(self):
+        for limit in (1, 6, 9, 28, 128):
+            for error in (subprocess.TimeoutExpired('probe', 10), OSError('library unavailable'),
+                          subprocess.CalledProcessError(1, 'probe'), ValueError('no samples')):
+                with self.subTest(limit=limit, error=type(error).__name__), \
+                        patch.object(tuning, '_measure', side_effect=error):
+                    chosen, detail = tuning.select_threads(7168, 2048, 16, limit)
+                self.assertEqual(chosen, limit)
+                self.assertEqual(detail['fallback'], type(error).__name__)
+
+    def test_partial_samples_do_not_choose_only_completed_small_counts(self):
+        result = {'samples_ms': {'1': 4, '2': 2, '4': 1}}
+        with patch.object(tuning, '_measure', return_value=result):
+            chosen, detail = tuning.select_threads(5120, 2304, 16, 28)
+        self.assertEqual(chosen, 28)
+        self.assertEqual(detail['fallback'], 'ValueError')
+
+    def test_invalid_candidate_requires_fallback(self):
+        for invalid in (0, -1, float('inf'), float('nan')):
+            result = {'samples_ms': {'1': 4, '2': 2, '4': invalid}}
+            with self.subTest(invalid=invalid), patch.object(tuning, '_measure', return_value=result):
+                chosen, detail = tuning.select_threads(5120, 2304, 16, 4)
+            self.assertEqual(chosen, 4)
+            self.assertEqual(detail['fallback'], 'ValueError')
 
     def test_worker_is_separate_and_has_hard_timeout(self):
         tuning._measure.cache_clear()
@@ -69,7 +88,7 @@ class CpuTuningTest(unittest.TestCase):
         done = subprocess.CompletedProcess([], 0, stdout='native initialization\n' + json.dumps(value), stderr='')
         with patch.object(tuning.subprocess, 'run', return_value=done) as run:
             self.assertEqual(tuning._measure(7168, 2048, 16, (1, 2, 4)), value)
-        self.assertEqual(run.call_args.kwargs['timeout'], 1.5)
+        self.assertEqual(run.call_args.kwargs['timeout'], 10.0)
         self.assertIn('--worker', run.call_args.args[0])
         tuning._measure.cache_clear()
 

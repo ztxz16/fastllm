@@ -10,8 +10,10 @@ import subprocess
 import sys
 import time
 
-_BENCHMARK_BUDGET_MS = 450
-_WORKER_TIMEOUT_S = 1.5
+_BENCHMARK_BUDGET_MS = 1000
+# The native sampling budget does not include starting Python or loading the
+# shared library. A cold load can take seconds even for a ~50 ms calibration.
+_WORKER_TIMEOUT_S = 10.0
 
 
 def cpu_quota(proc=Path('/proc')):
@@ -105,7 +107,6 @@ def _measure(hidden, intermediate, gguf_type, counts):
 
 def select_threads(hidden, intermediate, gguf_type, limit):
     counts = candidates(limit)
-    fallback = min(limit, 8)
     started = time.monotonic()
     detail = {'method': 'quantized-gemv', 'candidates': list(counts), 'thread_limit': limit,
               'quota_cores': cpu_quota(), 'budget_ms': _BENCHMARK_BUDGET_MS,
@@ -114,15 +115,19 @@ def select_threads(hidden, intermediate, gguf_type, limit):
         result = _measure(hidden, intermediate, gguf_type, counts)
         samples = {int(k): float(v) for k, v in result['samples_ms'].items()}
         samples = {k: v for k, v in samples.items() if k in counts and math.isfinite(v) and v > 0}
-        if len(samples) < min(3, len(counts)):
-            raise ValueError('too few completed linear samples')
+        # Candidates run in ascending order. A truncated run must not choose a
+        # small count merely because the larger counts were never measured.
+        if set(samples) != set(counts):
+            raise ValueError('incomplete linear calibration samples')
         best = min(samples.values())
         # Prefer fewer workers when throughput is within 5% of the best.
         chosen = min(k for k, value in samples.items() if value <= best * 1.05)
         detail.update(result)
         detail['selected'] = chosen
     except (OSError, ValueError, subprocess.SubprocessError) as error:
-        chosen = fallback
+        # Failure is not evidence that fewer threads are faster. Keep the
+        # original limit, already bounded by affinity and cgroup CPU quota.
+        chosen = limit
         detail.update(selected=chosen, fallback=type(error).__name__)
     detail['elapsed_ms'] = round(1000 * (time.monotonic() - started), 3)
     print('[auto] CPU linear calibration: ' + json.dumps(detail, sort_keys=True), flush=True)
@@ -137,7 +142,9 @@ def _worker(request):
                     if p.suffix in ('.so', '.dll', '.dylib')), None)
     if library is None:
         raise RuntimeError('native linear calibration library is unavailable')
+    load_started = time.monotonic()
     native = ctypes.CDLL(str(library))
+    load_ms = (time.monotonic() - load_started) * 1000
     run = native.benchmark_cpu_linear_threads
     run.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int),
                     ctypes.c_int, ctypes.c_int]
@@ -145,7 +152,9 @@ def _worker(request):
     raw = run(hidden, intermediate, kind, (ctypes.c_int * len(counts))(*counts), len(counts), budget_ms)
     if not raw:
         raise RuntimeError('native linear calibration failed')
-    print(raw.decode(), flush=True)
+    result = json.loads(raw.decode())
+    result['library_load_ms'] = round(load_ms, 3)
+    print(json.dumps(result), flush=True)
 
 
 if __name__ == '__main__':
