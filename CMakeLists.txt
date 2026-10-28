@@ -235,7 +235,7 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/context
         src/models/qwen4_exp_graph.cpp src/models/qwen4_exp_gpu_graph.cpp src/models/qwen4_exp_hybrid_graph.cpp
         src/models/qwen4_exp_hybrid.cpp src/models/qwen4_exp_hybrid_parallel.cpp src/models/qwen4_exp_tp.cpp
         src/models/qwen4_exp_pp.cpp
-        src/utils/hybrid_moe.cpp src/utils/host_moe_prefill.cpp src/utils/hybrid_parallel.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp src/models/naive_n05_kvmem.cpp
+        src/utils/hybrid_moe.cpp src/utils/host_moe_prefill.cpp src/utils/host_moe_decode.cpp src/utils/hybrid_parallel.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp src/models/naive_n05_kvmem.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/glm5_next_gpu.cpp src/models/glm5_next_hybrid.cpp src/models/gpt_oss.cpp
         src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
@@ -3039,6 +3039,16 @@ endif()
 
 add_library(fastllm_tools SHARED tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PRIVATE fastllm)
+if (MSVC AND USE_CUDA AND NOT USE_ROCM)
+    # C API statistics live in the static CUDA backend. Export them from the
+    # Windows Python DLL as well as the explicitly annotated pytools wrappers.
+    target_link_options(fastllm_tools PRIVATE
+        /EXPORT:fastllm_moe_cuda_cache_stats
+        /EXPORT:fastllm_moe_cuda_cache_route_stats
+        /EXPORT:fastllm_moe_cuda_cache_phase_stats
+        /EXPORT:fastllm_moe_cuda_cache_prefill_stats)
+endif()
+
 
 set(BUILD_INFO_USE_CUDA "false")
 set(BUILD_INFO_USE_NCCL "false")

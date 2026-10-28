@@ -110,8 +110,12 @@ namespace fastllm {
             model.threadTpRank < 0 && inputIds.dims[1] == 1 &&
             Qwen4CudaOnlyDeviceMap(model.deviceMap) && !model.weights.empty() &&
             !model.weights[0].empty()) {
-            decodeStep.Begin(model.weights[0].data(), model.weights[0].size(),
-                             model.num_experts_per_tok);
+            // The first layer may be GPU-resident. Start the policy from the
+            // first registered host table, whose cache owns all host layers.
+            for(auto &table:model.weights) {
+                decodeStep.Begin(table.data(),table.size(),model.num_experts_per_tok);
+                if(decodeStep) break;
+            }
         }
     }
     Qwen4ExpModel::HybridExecutionScope::~HybridExecutionScope() = default;

@@ -543,7 +543,12 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     gpu = {d: dict(query_gpu(d), capability=info[d].get("capability", 0)) for d in info}
     ram = ram if ram is not None else memory.host_memory()
     numa = env.use_numas if use_numa is None else use_numa
-    base._host_moe_shared = numa
+    # The single-GPU Qwen GGUF host adapter borrows the original CPU allocation;
+    # these formats no longer need a second host cache snapshot without NUMA.
+    routed = [t for t in tensors if memory._is_routed_expert(t.name)]
+    ordinary_shared = (model.family == "qwen4" and len(info) == 1 and bool(routed) and
+                       all(t.kind in {"gguf:16", "gguf:22", "gguf:29", "gguf:42"} for t in routed))
+    base._host_moe_shared = numa or ordinary_shared
     if model.family == "qwen35":
         return _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model,
                                      info, gpu, ram, numa)

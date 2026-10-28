@@ -4076,6 +4076,16 @@ namespace fastllm {
                 }
 
                 stage.Next("cpu_moe/reduce_output");
+                if (intParams.count("hostMoeDecodeRoutes")) {
+                    AssertInFastLLM(n == 1 && weights[0] == nullptr &&
+                        output.dataType == FLOAT32 && output.dims == std::vector<int>({topk,m}),
+                        "Host decode route output shape mismatch.\n");
+                    // Preserve batched expert scheduling and one input quantization,
+                    // returning unweighted rows for the common CUDA reduction.
+                    for (int j=0;j<topk;++j)
+                        memcpy(output.cpuData+size_t(j)*m*sizeof(float),results[j].data(),m*sizeof(float));
+                    continue;
+                }
                 float *fLastOutput = ((float*)output.cpuData) + o * m;
                 std::vector <float> tempOutput;
                 if (output.dataType == DataType::FLOAT16 || output.dataType == DataType::BFLOAT16) {

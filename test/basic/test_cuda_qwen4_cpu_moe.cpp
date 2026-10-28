@@ -11,6 +11,9 @@
 #include "models/qwen4_exp.h"
 #include "utils.h"
 #include "utils/host_moe_prefill.h"
+#include "utils/host_moe_decode.h"
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
 #include "devices/cpu/cpudevice.h"
 
 using namespace fastllm;
@@ -172,6 +175,109 @@ static void TestSplit(int type=GGML_TYPE_Q2_0, bool repack=false, DataType dtype
     SetEnv("FT_EXPERT_LIMIT",nullptr);SetEnv("FT_GPU_PREFILL",nullptr);
 }
 
+static void TestDecodeCache(int type,bool repack,bool resident) {
+    constexpr int hidden=256,experts=32,topk=4;
+    Data storage[experts*2];
+    std::vector<Data *> weights(2*(experts+1),nullptr),bias(weights.size(),nullptr);
+    for(int e=0;e<experts;++e) {
+        Weight(storage[2*e],hidden*2,hidden,400+2*e,type,repack);
+        Weight(storage[2*e+1],hidden,hidden,401+2*e,type,repack);
+        weights[2*e+2]=&storage[2*e];weights[2*e+3]=&storage[2*e+1];
+    }
+    const uint64_t record=(storage[0].GetBytes()+storage[1].GetBytes()+127)/128*128;
+    SetMoeCudaCacheBytes(resident?record*16:0);
+    FastllmCudaMoeCacheLayer layer{weights.data(),int(weights.size())};
+    Check(FastllmCudaPrepareMoeCache(&layer,1,{},true),"ordinary cache prepare failed");
+    struct Release {std::vector<Data *> &w;~Release(){FastllmCudaReleaseMoeCache(w.data(),int(w.size()));SetMoeCudaCacheBytes(0);}} release{weights};
+    std::vector<float> values(hidden);for(int i=0;i<hidden;++i) values[i]=std::sin(i*.09f)*.1f;
+    Data x(FLOAT32,{1,hidden},values),index(fastllm::INT32,{1,topk}),score(FLOAT32,{1,topk});
+    index.Allocate();score.Allocate();
+    for(int j=0;j<topk;++j) {reinterpret_cast<int32_t *>(index.cpuData)[j]=j;reinterpret_cast<float *>(score.cpuData)[j]=.1f*(j+1);}
+    Data reference(FLOAT32,{1,hidden}),w1,w2,w3,tmpIn,tmpOut;
+    CpuReferenceMoe cpu;
+    cpu.Run("MergeMOE",{{"input",&x},{"output",&reference},{"index",&index},{"score",&score},
+        {"weights",reinterpret_cast<Data *>(weights.data())},{"biass",reinterpret_cast<Data *>(bias.data())},
+        {"w1",&w1},{"w2",&w2},{"w3",&w3},{"temporaryInput",&tmpIn},{"temporaryOutput",&tmpOut}},
+        {},{{"weights___batch",int(weights.size())},{"biass___batch",int(bias.size())}});
+    const auto expected=Read(reference);
+    x.ToDevice(CUDA,std::vector<int>{0});index.ToDevice(CUDA,std::vector<int>{0});score.ToDevice(CUDA,std::vector<int>{0});
+    uint64_t before[8]{},after[8]{};fastllm_moe_cuda_cache_route_stats(0,before);
+    double maxError=0;
+    for(int step=0;step<64;++step) {
+        void *policy=FastllmCudaBeginMoeDecode(weights.data(),int(weights.size()),topk);
+        Check(policy!=nullptr,"host decode policy unavailable");
+        Data output;
+        Check(FastllmCudaMergeMOEHybrid(x,index,score,output,weights.data(),int(weights.size()),0),"host dynamic decode rejected");
+        FastllmCudaEndMoeDecode(policy);
+        auto actual=Read(output);double err=0,mag=0;
+        for(size_t j=0;j<actual.size();++j) {Check(std::isfinite(actual[j]),"decode nonfinite");err+=std::pow(double(actual[j]-expected[j]),2);mag+=std::pow(double(expected[j]),2);}
+        maxError=std::max(maxError,std::sqrt(err/std::max(mag,1e-30)));
+    }
+    Check(fastllm_moe_cuda_cache_route_stats(0,after),"decode route statistics unavailable");
+    Check(after[0]-before[0]==64 && after[1]-before[1]==64*topk,"decode route conservation failed");
+    Check(after[4]>before[4] && after[5]>before[5],"decode did not exercise both CPU and GPU");
+    Check(after[4]-before[4]+after[5]-before[5]==64*topk,"decode duplicate or missing route");
+    if(resident) Check(after[2]>before[2],"cache never hit");
+    Check(maxError<.04,"decode split/cache differs from CPU reference");
+    if(resident) {
+        constexpr int rows=64;
+        std::vector<float> prompt(rows*hidden);
+        for(int r=0;r<rows;++r) std::copy(values.begin(),values.end(),prompt.begin()+size_t(r)*hidden);
+        Data px(FLOAT32,{rows,hidden},prompt),pi(fastllm::INT32,{rows,topk}),ps(FLOAT32,{rows,topk}),po;
+        pi.Allocate();ps.Allocate();
+        for(int r=0;r<rows;++r) for(int j=0;j<topk;++j) {
+            reinterpret_cast<int32_t *>(pi.cpuData)[r*topk+j]=j;
+            reinterpret_cast<float *>(ps.cpuData)[r*topk+j]=.1f*(j+1);
+        }
+        px.ToDevice(CUDA,std::vector<int>{0});pi.ToDevice(CUDA,std::vector<int>{0});ps.ToDevice(CUDA,std::vector<int>{0});
+        SetEnv("FT_EXPERT_LIMIT","1");HostMoePrefillStats prefillStats;
+        Check(RunHostMoePrefill(px,pi,ps,po,weights.data(),int(weights.size()),0,&prefillStats),"warm decode cache rejected prefill");
+        SetEnv("FT_EXPERT_LIMIT",nullptr);
+        const auto actual=Read(po);double error=0,magnitude=0;
+        for(size_t j=0;j<actual.size();++j) {
+            Check(std::isfinite(actual[j]),"warm cache prefill nonfinite");
+            error+=std::pow(double(actual[j]-expected[j%hidden]),2);
+            magnitude+=std::pow(double(expected[j%hidden]),2);
+        }
+        const double relative=std::sqrt(error/std::max(magnitude,1e-30));
+        Check(relative<.04,"warm decode cache changed prefill arithmetic");
+        std::printf("CACHE_PREFILL type=%d relative_rms=%.8g\n",type,relative);
+    }
+    SetEnv("FASTLLM_HOST_MOE_DECODE","0");
+    Check(!FastllmCudaCanRunMoeCacheSmallBatch(x,index,score,weights.data(),int(weights.size()),MoeGateSwiglu),"decode disable ignored");
+    SetEnv("FASTLLM_HOST_MOE_DECODE",nullptr);
+    std::printf("DECODE type=%d repack=%d resident=%d max_relative_rms=%.8g hits=%llu gpu=%llu cpu=%llu\n",
+        type,int(repack),int(resident),maxError,(unsigned long long)(after[2]-before[2]),(unsigned long long)(after[4]-before[4]),(unsigned long long)(after[5]-before[5]));
+}
+
+static void TestDecodeWorkerRecovery() {
+    constexpr int hidden=256;
+    Data gate,down;
+    Weight(gate,2*hidden,hidden,901);
+    Weight(down,hidden,hidden,902);
+    Data *weights[]={nullptr,nullptr,&gate,&down};
+    PrepareHostMoeDecodeWeights(weights,4);
+    std::vector<float> input(hidden),output(hidden);
+    for(int i=0;i<hidden;++i) input[i]=std::sin(i*.13f)*.1f;
+    const int32_t id=0,cpu=-1;
+    double elapsed=0;
+    bool caught=false;
+    try {
+        HostMoeDecodeExperts(input.data(),output.data(),weights,&id,&cpu,1,
+            [] {throw std::runtime_error("expected GPU submission error");},&elapsed);
+    } catch(const std::runtime_error &e) {
+        caught=std::strcmp(e.what(),"expected GPU submission error")==0;
+    }
+    Check(caught && elapsed>0,"GPU submission error did not join CPU worker");
+    const auto expected=output;
+    for(int step=0;step<8;++step) {
+        std::fill(output.begin(),output.end(),0);
+        HostMoeDecodeExperts(input.data(),output.data(),weights,&id,&cpu,1,[]{},&elapsed);
+        Check(output==expected && elapsed>0,"CPU decode worker failed after submission error");
+    }
+    std::puts("PASS decode worker recovery and reuse");
+}
+
 int main() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
@@ -179,6 +285,7 @@ int main() {
         return 0;
     }
     try {
+        setvbuf(stdout,nullptr,_IONBF,0);
         SetThreads(3);
         Test(1);
         Test(4);
@@ -189,6 +296,12 @@ int main() {
         TestSplit(GGML_TYPE_IQ2_S,true,BFLOAT16);
         TestSplit(GGML_TYPE_IQ1_M,false,BFLOAT16);
         TestSplit(GGML_TYPE_Q2_0,false,FLOAT16);
+        TestDecodeCache(GGML_TYPE_Q2_0,false,false);
+        TestDecodeCache(GGML_TYPE_Q2_0,false,true);
+        TestDecodeCache(GGML_TYPE_IQ2_S,true,true);
+        TestDecodeCache(GGML_TYPE_IQ2_XXS,true,true);
+        TestDecodeCache(GGML_TYPE_IQ1_M,false,true);
+        TestDecodeWorkerRecovery();
         std::puts("ALL_PASS");
         return 0;
     } catch (const std::exception &error) {

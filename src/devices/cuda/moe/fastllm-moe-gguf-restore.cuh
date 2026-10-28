@@ -162,6 +162,7 @@ struct Matrix {
 struct Record {
     Matrix weights[2];
     int shards = 0;
+    bool crossGate = true; // NUMA interleaves rows; ordinary CPU storage does not.
     size_t downOffset = 0, stride = 0;
 };
 
@@ -293,18 +294,18 @@ static __global__ void Records(Record layout, void *const *pointers,
         const int shards = deviceRecord ? 1 : layout.shards;
         if (Ordinary(w.type) == w.type) {
             const size_t alignment = part ? size_t(w.rows) * w.rowBytes / shards : w.rowBytes;
-            if (!(alignment & 15)) Rows<uint4>(w, sources, output, shards, part == 0, tile);
-            else if (!(alignment & 3)) Rows<uint32_t>(w, sources, output, shards, part == 0, tile);
-            else Rows<uint8_t>(w, sources, output, shards, part == 0, tile);
+            if (!(alignment & 15)) Rows<uint4>(w, sources, output, shards, part == 0 && layout.crossGate, tile);
+            else if (!(alignment & 3)) Rows<uint32_t>(w, sources, output, shards, part == 0 && layout.crossGate, tile);
+            else Rows<uint8_t>(w, sources, output, shards, part == 0 && layout.crossGate, tile);
         } else {
             switch (w.type) {
-                case GGML_TYPE_Q2_K_R4: PackedRows<GGML_TYPE_Q2_K_R4, block_q2_k_r4>(w, sources, output, shards, part == 0, tile); break;
-                case GGML_TYPE_Q3_K_R4: PackedRows<GGML_TYPE_Q3_K_R4, block_q3_k_r4>(w, sources, output, shards, part == 0, tile); break;
-                case GGML_TYPE_Q4_K_R4: PackedRows<GGML_TYPE_Q4_K_R4, block_q4_k_r4>(w, sources, output, shards, part == 0, tile); break;
-                case GGML_TYPE_IQ2_XXS_R4: PackedRows<GGML_TYPE_IQ2_XXS_R4, block_iq2_xxs_r4>(w, sources, output, shards, part == 0, tile); break;
-                case GGML_TYPE_IQ2_XS_R4: PackedRows<GGML_TYPE_IQ2_XS_R4, block_iq2_xs_r4>(w, sources, output, shards, part == 0, tile); break;
-                case GGML_TYPE_IQ2_S_R4: PackedRows<GGML_TYPE_IQ2_S_R4, block_iq2_s_r4>(w, sources, output, shards, part == 0, tile); break;
-                case GGML_TYPE_IQ3_XXS_R4: PackedRows<GGML_TYPE_IQ3_XXS_R4, block_iq3_xxs_r4>(w, sources, output, shards, part == 0, tile); break;
+                case GGML_TYPE_Q2_K_R4: PackedRows<GGML_TYPE_Q2_K_R4, block_q2_k_r4>(w, sources, output, shards, part == 0 && layout.crossGate, tile); break;
+                case GGML_TYPE_Q3_K_R4: PackedRows<GGML_TYPE_Q3_K_R4, block_q3_k_r4>(w, sources, output, shards, part == 0 && layout.crossGate, tile); break;
+                case GGML_TYPE_Q4_K_R4: PackedRows<GGML_TYPE_Q4_K_R4, block_q4_k_r4>(w, sources, output, shards, part == 0 && layout.crossGate, tile); break;
+                case GGML_TYPE_IQ2_XXS_R4: PackedRows<GGML_TYPE_IQ2_XXS_R4, block_iq2_xxs_r4>(w, sources, output, shards, part == 0 && layout.crossGate, tile); break;
+                case GGML_TYPE_IQ2_XS_R4: PackedRows<GGML_TYPE_IQ2_XS_R4, block_iq2_xs_r4>(w, sources, output, shards, part == 0 && layout.crossGate, tile); break;
+                case GGML_TYPE_IQ2_S_R4: PackedRows<GGML_TYPE_IQ2_S_R4, block_iq2_s_r4>(w, sources, output, shards, part == 0 && layout.crossGate, tile); break;
+                case GGML_TYPE_IQ3_XXS_R4: PackedRows<GGML_TYPE_IQ3_XXS_R4, block_iq3_xxs_r4>(w, sources, output, shards, part == 0 && layout.crossGate, tile); break;
             }
         }
         // Slot payloads include alignment padding, just like canonical snapshots.

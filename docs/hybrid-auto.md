@@ -107,6 +107,22 @@ ftllm server /path/to/model.gguf --auto --device cudapp=2
 
 诊断时设置 `FASTLLM_PROFILE_HOST_MOE=1`，可记录每层两支的专家数、路由数和耗时；可用 `FASTLLM_PROFILE_HOST_MOE_PATH` 指定日志文件。Windows 构建还可设置 `FASTLLM_NVTX=1`，在 Nsight Systems 中查看 `host_moe_prefill/layer/<id>`、`host_moe_prefill/cpu` 和 `host_moe_prefill/gpu` 范围，确认 CPU 层的 GPU 专家计算及两支重叠情况。
 
+## 不依赖 NUMA 的 Qwen4 GGUF decode 分流与缓存
+
+普通 CPU 常驻 GGUF 专家也可使用单行 FP32 decode 的 CPU/GPU 动态调度。缓存命中的专家在 GPU 计算，未命中的专家根据各层 CPU、传输和 GPU 计算的实测耗时分配到 CPU 或 GPU 临时工作区；临时 GPU 计算与缓存准入互相独立。GPU 专家缓存沿用全局热度、容量和替换策略，在完整 token 结束后准入热点专家。
+
+此路径在 `USE_NUMAS=OFF` 的 Windows 构建中可用。CPU 权重先完成原地 R4 重排，按需复制到有大小上限的页锁定上传暂存区，再传到显卡，不注册整份模型的内存页，也不创建第二份完整专家权重。普通 CPU gate/up 的分半行序与 NUMA 的交错行序分别描述，显卡缓存中的记录还原为原始 GGUF 布局。上传暂存区由缓存或临时执行工作区持有，等待传输完成后复用，权重仍由模型持有。
+
+`--moe_cuda_cache 512m` 指定显卡专家缓存预算；`0` 保留动态调度和临时 GPU 计算，但不保存常驻专家。显存不足时需减少 GPU 常驻专家层，为缓存和上传工作区留出空间。单卡 Qwen4 的 Q2_0、IQ2_S、IQ2_XXS、IQ1_M GGUF 自动内存规划也按这一份 CPU 权重预算。其他模型、TP、NUMA 已注册布局及不同激活类型继续使用各自已有路径。
+
+默认启用；`FASTLLM_HOST_MOE_DECODE=0` 旁路普通 CPU 权重的 decode 分流和缓存执行，供同进程对照使用（已经分配的缓存仍占显存）。`FASTLLM_PROFILE_HOST_MOE_DECODE=1` 输出每层的 topk、命中、GPU/CPU 路由、临时上传路由、槽位及 CPU 耗时，可用 `FASTLLM_PROFILE_HOST_MOE_DECODE_PATH` 指定文件。`FASTLLM_NVTX=1` 提供 `host_moe_decode/layer/<id>`、`host_moe_decode/cpu` 和 `host_moe_decode/gpu_submit` 范围。请求之间可读取 `get_moe_cuda_cache_stats` 和 `get_moe_cuda_cache_route_stats`，取前后差值确认缓存命中和分流；统计读取会同步 GPU，不放入测速区间。
+
+CPU 协调任务复用每个推理调用线程自己的专用 worker，不占用其内部矩阵乘法线程池，也不逐层创建和销毁线程。GPU 提交异常时仍等待 CPU 任务结束，再向调用者传播异常。
+
+Windows WDDM 可能将异步 kernel 留在软件提交队列，直到 CPU 结果汇合后的同步才实际执行。普通 CPU/GPU 混合 decode 在 GPU 分支提交后调用非阻塞的 `cudaStreamQuery`，让已提交工作及时进入设备队列；临时上传存在时也提交其 copy stream。它不等待 GPU 完成，不替代最终结果依赖。只在 CPU 与 GPU 都有专家路由时执行；`FASTLLM_HOST_MOE_WDDM_FLUSH=0` 可关闭此提交步骤作对照，不影响 NUMA 构建设置。
+
+排查并行时，区分 `host_moe_decode/gpu_submit` 的主机提交与设备 kernel 的实际起止时间。`host_moe_decode/flush_gpu`、`wake_cpu`、`wait_cpu` 标记队列提交及协调等待；`cpu_moe/dot` 位于 CPU 线程池实际的 GGUF 矩阵乘函数内，可与 CUDA `Q8Projection` kernel 对齐检查计算区间重叠，避免仅凭两个提交范围判断并行。
+
 ## 混合推理共用的 prefill 专家缓存
 
 CUDA/NUMA 混推在有专家显存缓存时，默认让 prefill 和 decode 复用同一份缓存与热度策略。这个运行时能力也适用于手动配置，不依赖 `--auto`。Qwen 标准 MoE、DeepSeek-V4.1、GLM-5.3 共用权重传输层：原生布局一致时直接借用显存记录；布局不一致时在 GPU 上还原原有 NUMA 字节布局，包括 gate/up 行序和 FP8/NVFP4 scale。未命中的专家继续临时上传，符合热度策略的记录写入有容量上限的缓存。

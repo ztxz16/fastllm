@@ -342,6 +342,8 @@ namespace fastllm {
                 output, moeWeights.data(), int(moeWeights.size()), deviceLayer);
         }
         if (!hybridMoe && outputDevice.find("cuda") == 0) {
+            FastllmCudaMoeRouteScope routeScope(flattened.dims[0]==1 ?
+                FastllmMoeRoutePhase::Decode : FastllmMoeRoutePhase::SmallPrefill);
             hybridMoe = fastllm::RunHybridMoe(flattened, expertIndex, expertScore, output,
                                               moeWeights.data(), moeWeights.size(), deviceLayer);
         }
@@ -423,7 +425,10 @@ namespace fastllm {
     }
 
     void Qwen4ExpModel::PrepareHybridExperts(bool hasMtpWeights) {
-        if (MoeCudaCacheRequested()) {
+        const bool ordinaryHost = std::any_of(weights.begin(),weights.end(),[&](const auto &table) {
+            return table.size()>2 && table[2] && table[2]->dataDevice==CPU && table[2]->cpuData && !table[2]->isDiskWeight;
+        });
+        if (MoeCudaCacheRequested() || ordinaryHost) {
             HybridMoeCachePlan cache;
             const bool includeDraft = hasMtpWeights && !weights.empty() && weights[0].size() > 2 &&
                 weights[0][2]->isGGUFData && mtpMoeWeights[2]->isGGUFData;
@@ -438,7 +443,7 @@ namespace fastllm {
 #ifdef USE_NUMAS
             registerNumaWeights = [this] { WarmupNumaMoeWeights(); };
 #endif
-            const bool cachePrepared = cache.Prepare(registerNumaWeights);
+            const bool cachePrepared = cache.Prepare(registerNumaWeights,ordinaryHost);
             if (!cachePrepared) {
                 std::fprintf(stderr, "[Fastllm] Qwen4 CUDA expert cache unavailable; using the "
                                      "configured MoE device.\n");

@@ -40,6 +40,26 @@ class AutoConfigTest(unittest.TestCase):
     def args(self, *options):
         return make_normal_parser('test').parse_args(['model.gguf', '--auto', *options])
 
+    def test_qwen_gguf_cpu_cache_uses_one_host_copy_without_numa(self):
+        self.hardware = ({0: self.hardware[0][0]}, {(0, 0): True})
+        tensor = memory.Tensor('model.language_model.layers.0.mlp.experts.0.gateup_proj.weight',
+                               (256, 128), 65536, 'gguf:22')
+        options = ('--moe_device', 'cpu', '--moe_device_layers', '-1',
+                   '--moe_cuda_cache', '512m', '--chunked_prefill_size', '512',
+                   '--max_context_length', '4096', '--max_batch', '1')
+        def run(kind):
+            observed = memory.Tensor(tensor.name, tensor.shape, tensor.bytes, kind)
+            with patch.object(memory, 'model_inputs', return_value=({}, [observed], self.g)), \
+                    patch.object(memory, 'geometry', return_value=self.g), \
+                    patch.object(memory, 'weight_costs', return_value=self.costs), \
+                    patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+                return auto.resolve(self.args(*options), self.gpu.__getitem__, hardware=self.hardware,
+                                    ram=self.ram, use_numa=False)
+        shared = run('gguf:22')
+        snapshot = run('gguf:13')
+        self.assertEqual(shared['moe_cuda_cache'], 512 << 20)
+        self.assertEqual(snapshot['host_estimated_bytes'] - shared['host_estimated_bytes'], 4 * GiB)
+
     def mixed_fixture(self):
         self.g = memory.Geometry('deepseek_v41', 8, 65536, 128, 128, 8, 64,
                                  [1024] * 8, [1 << 20] * 8, 4, 1024, 1024)

@@ -1899,9 +1899,10 @@ bool FastllmCudaMoeCacheRequested();
 // must not reenter cache APIs. Unsupported layouts or failed registration
 // leave no published cache; the configured MoE backend remains usable.
 // Borrowed shards must remain alive and unchanged until cache release.
-// Without a callback, snapshot the host weights for the ordinary CUDA cache.
+// Without a callback, ordinary CPU GGUF weights use bounded pinned upload
+// windows and retain the original host allocation. Other formats snapshot.
 // allowStreaming permits a zero resident-cache budget when a registered NUMA
-// backend can execute misses with temporary GPU uploads. It requires a callback.
+// backend or the ordinary CPU GGUF adapter can execute temporary GPU uploads.
 bool FastllmCudaPrepareMoeCache(
         const FastllmCudaMoeCacheLayer *layers, int layerCount,
         const std::function<void()> &registerNumaWeights = {}, bool allowStreaming = false);
