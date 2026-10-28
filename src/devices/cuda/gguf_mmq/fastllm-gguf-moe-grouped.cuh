@@ -411,6 +411,32 @@ struct StreamedWorkspace {
 
 // Preserve the projection and activation rounding, then quantize the value
 // still in registers. Padding participates as zero in the same 32-value max.
+__global__ void DiskIQ1MStreamedGate(const block_q8_1 *input, float *products,
+        const uint8_t *const *weights, const int *routes, const int *tiles,
+        int hidden, int inter, int topk) {
+    const int row = blockIdx.y, route = routes[row];
+    if (route < 0) return;
+    __shared__ uint64_t grid[gguf_cache_q8::Format<GGML_TYPE_IQ1_M>::gridSize];
+    extern __shared__ uint32_t activation[];
+    gguf_cache_q8::StageGrid<GGML_TYPE_IQ1_M>(grid);
+    const auto *source = input + size_t(route / topk) * (hidden / 32);
+    for (int i = threadIdx.x; i < hidden / 32 * int(sizeof(block_q8_1)) / 4; i += blockDim.x)
+        activation[i] = reinterpret_cast<const uint32_t *>(source)[i];
+    __syncthreads();
+    const int col = blockIdx.x * 8 + threadIdx.x / 32;
+    if (col >= inter) return;
+    const int expert = tiles[row / 16];
+    const auto *record = weights[2 * expert];
+    const size_t rowBytes = size_t(hidden / QK_K) * sizeof(block_iq1_m);
+    const auto *x = reinterpret_cast<const block_q8_1 *>(activation);
+    const float g = gguf_cache_q8::RowDot<GGML_TYPE_IQ1_M>(record + size_t(col) * rowBytes, x, hidden, grid);
+    const float u = gguf_cache_q8::RowDot<GGML_TYPE_IQ1_M>(record + size_t(col + inter) * rowBytes, x, hidden, grid);
+    if (threadIdx.x % 32 == 0) {
+        products[size_t(row) * 2 * inter + col] = g;
+        products[size_t(row) * 2 * inter + inter + col] = u;
+    }
+}
+
 template<class T>
 __global__ void ActivateQuantizeStreamed(const float *products,
         block_q8_1_mmq *output, T *gate, const int *routes,
@@ -486,9 +512,15 @@ static bool RunStreamed(StreamedMoePhase phase, const T *input, T *gate, T *outp
         w.counts = const_cast<int *>(batch.counts); w.offsets = const_cast<int *>(batch.offsets);
         w.tileExperts = const_cast<int *>(batch.tileExperts); w.groupRoutes = const_cast<int *>(batch.routes);
         w.quantized = s.quantized; w.products = s.products;
-        GatherQuantized<<<dim3((batch.rows + 7) / 8, ((hidden + 255) / 256) * 2), 256, 0, stream>>>(
-            s.input, s.quantized, batch.routes, batch.offsets + batch.experts, hidden, capacity, topk);
-        Matrix(gt, batch.weights, 0, w, batch.experts, hidden, 2 * inter, stream);
+        if (batch.diskIQ1M && gt == GGML_TYPE_IQ1_M) {
+            DiskIQ1MStreamedGate<<<dim3((inter + 7) / 8, batch.rows), 256,
+                size_t(hidden / 32) * sizeof(block_q8_1), stream>>>(s.input, s.products,
+                    batch.weights, batch.routes, batch.tileExperts, hidden, inter, topk);
+        } else {
+            GatherQuantized<<<dim3((batch.rows + 7) / 8, ((hidden + 255) / 256) * 2), 256, 0, stream>>>(
+                s.input, s.quantized, batch.routes, batch.offsets + batch.experts, hidden, capacity, topk);
+            Matrix(gt, batch.weights, 0, w, batch.experts, hidden, 2 * inter, stream);
+        }
         ActivateQuantizeStreamed<<<dim3((inter + 255) / 256, batch.rows), 256, 0, stream>>>(
             s.products, s.quantized, gate, batch.routes, inter, capacity);
         Matrix(dt, batch.weights, 1, w, batch.experts, inter, hidden, stream);

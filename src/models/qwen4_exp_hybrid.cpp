@@ -4,6 +4,7 @@
 #include "qwen4_exp_tp.h"
 #include "models/qwen4_paged_cache.h"
 #include "executor.h"
+#include "devices/disk/diskdevice.h"
 #include "utils.h"
 #ifdef USE_CUDA
 #ifndef USE_ROCM
@@ -403,7 +404,10 @@ namespace fastllm {
     }
 
     void Qwen4ExpModel::PrepareHybridExperts(bool hasMtpWeights) {
-        if (MoeCudaCacheRequested()) {
+        // DiskMergeMOE owns the GPU tier for whole disk layers, including
+        // models with CUDA-resident layers. Other placements keep their planner.
+        const bool diskCache = !DiskMoeLayerIndices(weights).empty();
+        if (MoeCudaCacheRequested() && !diskCache) {
             HybridMoeCachePlan cache;
             const bool includeDraft = hasMtpWeights && !weights.empty() && weights[0].size() > 2 &&
                 weights[0][2]->isGGUFData && mtpMoeWeights[2]->isGGUFData;

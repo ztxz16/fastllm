@@ -51,12 +51,35 @@ namespace fastllm {
     DiskMoeCacheStats GetDiskMoeCacheStats();
     void TrimDiskMoeCache();
     void ReleaseDiskMoeCache(const Data *weight);
-    // Fill unused RAM budget in layer order with native NVFP4 block32 experts.
+    // Fill unused RAM budget across layers with native block32 or canonical GGUF experts.
     // Entries remain evictable; loading alone does not count as a route/hit.
     uint64_t PreloadDiskMoeCache(const std::vector<std::vector<Data*>> &layers);
     // Register metadata only. Compact experts stay in their checkpoint files;
     // both bounded cache tiers use the public MoE frequency configuration.
     bool PrepareDiskMoeCache(const std::vector<std::vector<Data*>> &layers);
+
+    // Whole disk layers may share a decode step with whole CUDA-resident
+    // layers. Reject CPU/NUMA and partially placed layers; an empty result
+    // also keeps models without disk experts on their existing paths.
+    inline std::vector<int> DiskMoeLayerIndices(
+            const std::vector<std::vector<Data *>> &layers, int cudaDevice = -1) {
+        std::vector<int> indices;
+        for (size_t l = 0; l < layers.size(); ++l) {
+            const auto &table = layers[l];
+            if (table.size() < 4 || table.size() % 2 || !table[2]) return {};
+            const bool disk = table[2]->isDiskWeight;
+            for (size_t i = 2; i < table.size(); ++i) {
+                const Data *weight = table[i];
+                if (!weight || weight->isDiskWeight != disk) return {};
+                if (!disk && (weight->dataDevice != DataDevice::CUDA || !weight->cudaData ||
+                        weight->multiDeviceData || (cudaDevice >= 0 &&
+                        (weight->dataDeviceIds.size() != 1 || weight->dataDeviceIds[0] != cudaDevice))))
+                    return {};
+            }
+            if (disk) indices.push_back(int(l));
+        }
+        return indices;
+    }
 
     // Bounded prediction from previous prefill routes. Hints only overlap I/O;
     // selected expert IDs and output math are always determined by the router.
@@ -100,6 +123,11 @@ namespace fastllm {
                            std::vector<Data *> &weights, float swigluLimit);
         bool RunGpuDecode(Data &input, Data &index, Data &score, Data &output,
                           std::vector<Data *> &weights, float swigluLimit);
+        // Canonical ordinary GGUF decode. Routing and activations are staged
+        // together; the optional independent shared branch follows readback.
+        bool RunGpuGGUFDecode(Data &input, Data &index, Data &score, Data &output,
+                              std::vector<Data *> &weights,
+                              const std::function<void()> &sharedExpert = {});
 
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);

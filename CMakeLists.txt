@@ -1166,6 +1166,12 @@ if (UNIT_TEST)
             set_tests_properties(deepseek_v41_disk_shared PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         endif()
         if (USE_CUDA AND NOT USE_ROCM)
+            add_executable(disk_qwen_gguf_cache_test test/basic/test_disk_qwen_gguf_cache.cpp)
+            target_link_libraries(disk_qwen_gguf_cache_test PRIVATE fastllm)
+            fastllm_add_checked_test(disk_qwen_gguf_cache disk_qwen_gguf_cache_test
+                "PASS: disk Qwen GGUF cache" 180)
+            set_tests_properties(disk_qwen_gguf_cache PROPERTIES LABELS "cuda;disk;gguf" RUN_SERIAL TRUE
+                ENVIRONMENT "FT_GPU_PREFILL=1;FASTLLM_DISK_DIRECT_IO=1")
             if (USE_NUMAS)
                 add_executable(disk_glm5_gguf_cache_test test/basic/test_disk_glm5_gguf_cache.cpp)
                 target_link_libraries(disk_glm5_gguf_cache_test PRIVATE fastllm)

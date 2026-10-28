@@ -616,7 +616,7 @@ bool FastllmCudaMoeGGUFCacheComputeStaged(const fastllm::Data &input, fastllm::D
         const FastllmCudaMoeStageEvents &events) {
     if (input.dims.size() != 2 || input.dims[0] <= 0 || input.dims[1] != view.hidden ||
         topk <= 0 || topk > 32 || input.dims[0] > INT_MAX / topk ||
-        !scores || !view.records || !view.routeSlots ||
+        !scores || (!view.records && !view.recordPointers) || !view.routeSlots ||
         (view.activeRouteCount && !view.routeMap) ||
         (view.routeMap && (!perExpert || view.routeCount <= 0 || view.routeCount > input.dims[0]*topk)) ||
         !FastllmCudaMoeGGUFCacheSupported(view.gateType, view.hidden) ||
