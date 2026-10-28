@@ -1169,10 +1169,15 @@ int NaiveN05FlashModel::ForwardDraft(
     // Its finite top-k semantics differ from the legacy CPU sampler; penalties,
     // legacy name masks and minimum-output constraints retain that generic fallback.
 #ifdef USE_CUDA
-    if (!greedy && baseLogits.dataDevice == DataDevice::CUDA && SelectLogits(config).cudaSampling) {
-        context.proposalProbs.ToDevice(DataDevice::CUDA, baseLogits.dataDeviceIds, false);
-        context.proposalProbs.Resize({limit, vocab});
-        context.proposalProbs.Allocate(false);
+    // Grammar masks are applied per verification row. Greedy verification also
+    // keeps full logits on the device, then transfers only the masked argmax.
+    if (baseLogits.dataDevice == DataDevice::CUDA &&
+        ((greedy && config.tool_call_grammar) || (!greedy && SelectLogits(config).cudaSampling))) {
+        if (!greedy) {
+            context.proposalProbs.ToDevice(DataDevice::CUDA, baseLogits.dataDeviceIds, false);
+            context.proposalProbs.Resize({limit, vocab});
+            context.proposalProbs.Allocate(false);
+        }
         selection.count = 0; // Even a vocabulary fitting compact top-k needs full device logits.
         selection.cudaLogits = true;
     }
@@ -1280,7 +1285,7 @@ int NaiveN05FlashModel::ForwardDraft(
     samplingTokens = lastTokens.units.empty() ? LastTokensUnit(config.last_n) : lastTokens.units[0];
     int accepted = 0, next = -1;
 #ifdef USE_CUDA
-    if (selection.cudaLogits) {
+    if (!greedy && selection.cudaLogits) {
         AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.dataType == FLOAT32 &&
             logits.dataDeviceIds == context.proposalProbs.dataDeviceIds,
             "Naive CUDA verification logits are on the wrong device.");

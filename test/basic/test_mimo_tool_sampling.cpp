@@ -2,6 +2,7 @@
 #include "models/mimo_tool_grammar.h"
 #include "models/speculative_sampling.h"
 #include "fastllm-cuda.cuh"
+#include "naive-n05-cuda.cuh"
 #include <cuda_runtime.h>
 #include <iostream>
 #include <stdexcept>
@@ -29,6 +30,35 @@ int main() {
                           << " gpu=" << ((float *)gpu.cpuData)[i] << '\n';
                 Check(false, "CUDA mask differs from CPU");
             }
+
+        // Eight verifier rows have distinct masks, including ties and a masked
+        // global maximum. Keep the legacy CUDA Top1 tie rule after CPU/GPU masks.
+        std::vector<float> values(8 * vocab);
+        for (int row = 0; row < 8; ++row)
+            for (int id = 0; id < vocab; ++id)
+                values[(size_t)row * vocab + id] = row % 2 ? float((id * 73) % 113) : 7.f;
+        Data cpuVerify(FLOAT32, {8, vocab}, values), gpuVerify(FLOAT32, {8, vocab}, values);
+        gpuVerify.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        for (int row = 0; row < 8; ++row) {
+            auto bits = std::make_shared<std::vector<uint32_t>>((vocab + 31) / 32, 0);
+            for (int id : {17 + row, 256 + row, 1024 + row, vocab - 1})
+                (*bits)[id / 32] |= uint32_t(1) << (id % 32);
+            GenerationConfig cfg; cfg.tool_call_token_mask = bits;
+            ApplyToolTokenMask(cpuVerify, row, cfg);
+            ApplyToolTokenMask(gpuVerify, row, cfg);
+        }
+        Data gpuTop;
+        TopK(gpuVerify, gpuTop, 1);
+        gpuTop.ToDevice(DataDevice::CPU);
+        for (int row = 0; row < 8; ++row) {
+            const float *values = (float *)cpuVerify.cpuData + (size_t)row * vocab;
+            int best = 0;
+            for (int id = 1; id < vocab; ++id)
+                if (FastllmNaiveTop1Better(values[id], id, values[best], best)) best = id;
+            Check(((float *)gpuTop.cpuData)[row * 2] == best &&
+                  ((float *)gpuTop.cpuData)[row * 2 + 1] == values[best],
+                  "masked verifier changed the legacy CUDA Top1 tie rule");
+        }
 
         const int batch = 10000, v = 64;
         MimoToolGrammar grammar({{"A", {}}, {"B", {}}});
