@@ -64,10 +64,12 @@ def default_kv_dtype(model, metadata):
 
 def cuda_hardware():
     """Read visible CUDA ordinals, bandwidth bounds and peer access capability."""
+    library = "nvcuda.dll" if os.name == "nt" else "libcuda.so.1"
     try:
-        driver = ctypes.CDLL("libcuda.so.1")
+        driver = (ctypes.WinDLL(library) if os.name == "nt" else
+                  ctypes.CDLL(library))
     except OSError as error:
-        raise ValueError("--auto requires the Linux NVIDIA CUDA driver") from error
+        raise ValueError("--auto cannot load the NVIDIA CUDA driver (%s)" % library) from error
     signatures = {
         "cuInit": [ctypes.c_uint],
         "cuDeviceGetCount": [ctypes.POINTER(ctypes.c_int)],
@@ -97,16 +99,17 @@ def cuda_hardware():
             pci = bus.value.decode("ascii").lower()
         # sysfs is keyed by PCI identity, never by nvidia-smi's device index.
         link = 12e9
-        try:
-            path = Path("/sys/bus/pci/devices") / pci
-            # Idle GPUs downshift their current PCIe generation. Budget with
-            # the endpoint's negotiated-width/max-speed bound, not idle speed.
-            speed = float((path / "max_link_speed").read_text().split()[0])
-            lanes = int((path / "current_link_width").read_text())
-            if speed > 0 and lanes > 0:
-                link = speed * 1e9 * lanes / 8 * .8
-        except (OSError, ValueError):
-            pass
+        if os.name != "nt":
+            try:
+                path = Path("/sys/bus/pci/devices") / pci
+                # Idle GPUs downshift their current PCIe generation. Budget with
+                # the endpoint's negotiated-width/max-speed bound, not idle speed.
+                speed = float((path / "max_link_speed").read_text().split()[0])
+                lanes = int((path / "current_link_width").read_text())
+                if speed > 0 and lanes > 0:
+                    link = speed * 1e9 * lanes / 8 * .8
+            except (OSError, ValueError):
+                pass
         devices[ordinal] = {"sm": attr(16, 40), "clock_khz": attr(13, 1000000),
                             "memory_bandwidth": 2 * attr(36, 5000000) * 1000 * attr(37, 256) / 8,
                             "link_bandwidth": link, "capability": attr(75, 7) * 10 + attr(76, 0)}

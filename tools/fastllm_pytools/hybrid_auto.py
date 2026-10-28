@@ -188,8 +188,28 @@ def inventory(path):
     return metadata, tensors
 
 
-def host_memory(proc=Path("/proc"), *, reclaim_file_cache=False):
-    """Effective Linux RAM, including every visible cgroup ancestor limit.
+def _windows_host_memory():
+    """Read physical RAM, excluding the Windows page file from the budget."""
+    import ctypes
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_uint32), ("load", ctypes.c_uint32)] + [
+            (name, ctypes.c_uint64) for name in
+            ("total_phys", "avail_phys", "total_page", "avail_page",
+             "total_virtual", "avail_virtual", "avail_extended")]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    query = kernel.GlobalMemoryStatusEx
+    query.argtypes, query.restype = [ctypes.POINTER(MemoryStatus)], ctypes.c_int
+    status = MemoryStatus()
+    status.length = ctypes.sizeof(status)
+    if not query(ctypes.byref(status)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return {"total": status.total_phys, "available": status.avail_phys, "cma": 0}
+
+
+def host_memory(proc=None, *, reclaim_file_cache=False):
+    """Physical RAM on Windows; effective cgroup-constrained RAM on Linux.
 
     By default, do not count swap or assume charged file pages can be reclaimed. A
     parent's current usage includes siblings, which can constrain this process.
@@ -198,6 +218,10 @@ def host_memory(proc=Path("/proc"), *, reclaim_file_cache=False):
     Autotune can opt into crediting clean, unmapped inactive cgroup-v2 file cache;
     filling this reclaimable cache during a trial is not an out-of-memory event.
     """
+    if proc is None:
+        if os.name == "nt":
+            return _windows_host_memory()
+        proc = Path("/proc")
     info = {}
     for line in (proc / "meminfo").read_text().splitlines():
         key, value = line.split(":", 1)
