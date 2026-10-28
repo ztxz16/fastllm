@@ -21,6 +21,7 @@
 #include "executor.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
 #include "devices/disk/diskdevice.h"
+#include "deepseekv41-engram-prefetch.h"
 #include "utils.h"
 #include "json11.hpp"
 #include "gguf.h"
@@ -2941,33 +2942,6 @@ namespace fastllm {
             }
         }
 
-        // 把要用到的表行摸一遍（每 64 字节一次），把页表项与 cache line 提前拉进来。
-        // 常驻表超过缓存预算或使用磁盘 Embedding 时，后台只计算行号。
-        void V41TouchEngramRows(const V41EngramTable &table, const std::vector<int64_t> &rows) {
-#ifdef USE_CUDA
-            if (table.gpuTable) return;
-#endif
-            const uint64_t budget = 32ULL << 20;
-            if (table.diskWeight != nullptr || table.ggufWeight != nullptr || rows.size() * (uint64_t)table.dim > budget) {
-                return;
-            }
-            const int dim = table.dim;
-            const int scaleCols = dim / std::max(1, table.scaleBlock);
-            volatile uint64_t sink = 0;
-            for (size_t i = 0; i < rows.size(); i++) {
-                int64_t row = rows[i];
-                if (row < 0 || row >= table.rows) {
-                    continue;
-                }
-                const uint8_t *src = table.data + (uint64_t)row * dim;
-                for (int d = 0; d < dim; d += 64) {
-                    sink += src[d];
-                }
-                sink += table.scale[(uint64_t)row * scaleCols];
-            }
-            (void)sink;
-        }
-
         // 常驻线程池上的一段 token 区间
         struct V41EngramGatherOp : MultiThreadBaseOp {
             const std::function<void(int, int)> *worker;
@@ -2979,37 +2953,108 @@ namespace fastllm {
             }
         };
 
-        // 一次跨层预取任务。生命周期由模型持有，析构时保证 join。
-        struct V41EngramPrefetchJob {
-            std::thread worker;
-            int engramLayerIndex = -1;
-            int total = 0;
-            std::vector<int64_t> rows;
-            std::vector<float> maskValues;
-            bool hasDead = false;
-            bool ready = false;
-
-            void Join() {
-                if (worker.joinable()) {
-                    worker.join();
-                }
+        // CPU-only: safe on the prefetch worker without touching CUDA streams or
+        // the global AliveThreadPool used concurrently by NUMA MoE.
+        void V41GatherGgufEngramRows(const V41EngramTable &table,
+                const std::vector<int64_t> &rows, uint16_t *dst) {
+            const int dim = table.dim;
+            const size_t rowBytes = ggml_row_size(ggml_type(table.ggufWeight->ggmlType), dim);
+            const auto decode = ggml_type_to_float(ggml_type(table.ggufWeight->ggmlType));
+            AssertInFastLLM(decode != nullptr, "DeepSeekV41: unsupported GGUF Engram row type.");
+            for (int64_t row : rows) {
+                AssertInFastLLM(row >= 0 && row < table.rows && row <= INT32_MAX,
+                                "DeepSeekV41: GGUF Engram hash out of range.");
             }
-
-            void Reset() {
-                Join();
-                engramLayerIndex = -1;
-                total = 0;
-                ready = false;
-                hasDead = false;
-                rows.clear();
-                maskValues.clear();
+            DiskEmbeddingRowReader::Ticket read;
+            const uint8_t *source = table.ggufWeight->cpuData;
+            if (table.diskValueReader) {
+                const std::vector<int32_t> indices(rows.begin(), rows.end());
+                read = table.diskValueReader->ReadAsync(indices);
+                const auto &values = read.values.get();
+                AssertInFastLLM(values.size() == rows.size() * rowBytes,
+                                "DeepSeekV41: GGUF Engram row size mismatch.");
+                source = values.data();
             }
-
-            ~V41EngramPrefetchJob() {
-                Join();
+            // Expand only selected rows; the full lookup table stays packed.
+            std::vector<float> decoded(dim);
+            for (size_t i = 0; i < rows.size(); ++i) {
+                decode(source + (table.diskValueReader ? i : size_t(rows[i])) * rowBytes, decoded.data(), dim);
+                for (int j = 0; j < dim; ++j) dst[i * dim + j] = Float32ToBFloat16RNEBits(decoded[j]);
             }
-        };
+        }
+
+        constexpr int V41EngramPrefetchMinTokens = 128;
+
+        bool V41CanPrefetchEngramRows(const V41EngramTable &table) {
+#ifdef USE_CUDA
+            if (table.gpuTable) return false;
+#endif
+            const bool nativeRows = (table.data != nullptr && table.scale != nullptr) ||
+                                    (table.diskValueReader && table.diskScaleReader);
+            return table.ggufWeight != nullptr || nativeRows;
+        }
     }
+
+    // Forward-owned: join before snapshots, results or request state can expire.
+    // The immutable history snapshot is reused across this stage's Engram layers.
+    struct DeepSeekV41Model::EngramPrefetch {
+        std::thread worker;
+        const int endLayer;
+        const std::vector<V41EngramSegSnapshot> snapshots;
+        int engramLayerIndex = -1;
+        int total = 0;
+        std::vector<int64_t> rows;
+        std::vector<float> maskValues;
+        bool hasDead = false;
+        std::unique_ptr<Data> gathered;
+        std::exception_ptr error;
+
+        EngramPrefetch(int endLayer, std::vector<V41EngramSegSnapshot> snapshots)
+            : endLayer(endLayer), snapshots(std::move(snapshots)) {}
+
+        void Join() {
+            if (worker.joinable()) worker.join();
+        }
+
+        void Reset() {
+            Join();
+            engramLayerIndex = -1;
+            total = 0;
+            hasDead = false;
+            rows.clear();
+            maskValues.clear();
+            gathered.reset();
+            error = nullptr;
+        }
+
+        void Start(int index, int tokens, const DeepSeekV41EngramMeta &meta,
+                   int maxNgram, int heads, std::shared_ptr<V41EngramTable> table) {
+            Reset();
+            engramLayerIndex = index;
+            total = tokens;
+            worker = std::thread([this, index, tokens, &meta, maxNgram, heads, table]() {
+                try {
+                    V41BuildEngramInputs(meta, index, maxNgram, heads, snapshots, tokens,
+                                         rows, maskValues, hasDead);
+                    const int width = int(rows.size() / tokens) * table->dim;
+                    gathered.reset(new Data(DataType::BFLOAT16, {1, tokens, width}));
+                    gathered->Allocate(false);
+                    if (table->ggufWeight) {
+                        V41GatherGgufEngramRows(*table, rows, (uint16_t*)gathered->cpuData);
+                    } else {
+                        v41_engram_detail::GatherNativeRows(table->data, table->scale,
+                            table->diskValueReader.get(), table->diskScaleReader.get(),
+                            table->rows, table->dim, table->scaleBlock,
+                            rows, (uint16_t*)gathered->cpuData);
+                    }
+                } catch (...) {
+                    error = std::current_exception();
+                }
+            });
+        }
+
+        ~EngramPrefetch() { Join(); }
+    };
 
     void DeepSeekV41Model::GatherEngramRows(int layer, const std::vector<int64_t> &rows, int tokens,
                                            Data &output, double *prepMs) {
@@ -3053,25 +3098,7 @@ namespace fastllm {
         }
         uint16_t *dst = (uint16_t*)output.cpuData;
         if (table.ggufWeight) {
-            const size_t rowBytes = ggml_row_size(ggml_type(table.ggufWeight->ggmlType), dim);
-            const auto decode = ggml_type_to_float(ggml_type(table.ggufWeight->ggmlType));
-            std::vector<int32_t> indices;
-            for (int64_t row : rows) {
-                AssertInFastLLM(row >= 0 && row < table.rows, "GGUF Engram hash is out of range.");
-                indices.push_back(int32_t(row));
-            }
-            DiskEmbeddingRowReader::Ticket read;
-            const uint8_t *source = table.ggufWeight->cpuData;
-            if (table.diskValueReader) {
-                read = table.diskValueReader->ReadAsync(indices);
-                source = read.values.get().data();
-            }
-            // Only selected rows are expanded; the 110 GB lookup stays packed.
-            std::vector<float> decoded(dim);
-            for (size_t i = 0; i < rows.size(); ++i) {
-                decode(source + (table.diskValueReader ? i : size_t(rows[i])) * rowBytes, decoded.data(), dim);
-                for (int j = 0; j < dim; ++j) dst[i * dim + j] = Float32ToBFloat16RNEBits(decoded[j]);
-            }
+            V41GatherGgufEngramRows(table, rows, dst);
             return;
         }
         static const FP8E4M3ToFP32Manager fp8;
@@ -3152,11 +3179,10 @@ namespace fastllm {
     }
 
     void DeepSeekV41Model::RunEngram(int layer, int engramLayerIndex, const std::vector<DeepSeekV41Segment> &segments,
-                                     Data &hiddenStates) {
+                                     Data &hiddenStates, EngramPrefetch *prefetch) {
         AssertInFastLLM(engramMeta.loaded,
                         "DeepSeekV41: engram meta is not loaded. Generate engram_meta.json with "
                         "`python -m ftllm.deepseek_v41_engram <model_dir>`.");
-        static const bool prefetchEnabled = V41EnvFlag("FASTLLM_DSV41_ENGRAM_PREFETCH");
         V41EngramProfiler &profiler = V41Profiler();
         const bool profiling = profiler.level > 0;
         double tHash = 0.0, tPrep = 0.0, tGather = 0.0, tWkv = 0.0, tApply = 0.0, tWait = 0.0, mark = 0.0;
@@ -3167,31 +3193,22 @@ namespace fastllm {
             total += seg.seqlen;
         }
 
-        // ---- 第一段：算行号（查表索引）----
+        std::unique_ptr<Data> prefetchedGather;
         std::vector<int64_t> rows;
         std::vector<float> maskValues;
         bool hasDead = false;
-
-        V41EngramPrefetchJob *job = nullptr;
-        if (prefetchEnabled) {
-            if (this->engramPrefetch == nullptr) {
-                this->engramPrefetch = std::make_shared<V41EngramPrefetchJob>();
-            }
-            job = (V41EngramPrefetchJob*)this->engramPrefetch.get();
-            if (engramLayerIndex == 0) {
-                // 新的一次前向：丢掉上一次可能残留的任务（前向中途异常退出时会留下）
-                job->Reset();
-            }
-        }
+        EngramPrefetch *job = prefetch;
 
         bool tookPrefetched = false;
         if (job != nullptr && job->engramLayerIndex == engramLayerIndex) {
             mark = profiling ? V41NowMs() : 0.0;
             job->Join();
+            if (job->error) std::rethrow_exception(job->error);
             if (profiling) {
                 tWait = V41NowMs() - mark;
             }
-            if (job->ready && job->total == total && (int)job->maskValues.size() == total) {
+            if (job->gathered && job->total == total && (int)job->maskValues.size() == total) {
+                prefetchedGather = std::move(job->gathered);
                 rows.swap(job->rows);
                 maskValues.swap(job->maskValues);
                 hasDead = job->hasDead;
@@ -3199,43 +3216,34 @@ namespace fastllm {
             }
             job->Reset();
         }
-        std::vector<V41EngramSegSnapshot> snapshots;
-        if (!tookPrefetched || job != nullptr) {
-            snapshots = V41SnapshotSegments(segments, engram_max_ngram_size);
-        }
         if (!tookPrefetched) {
             mark = profiling ? V41NowMs() : 0.0;
             V41BuildEngramInputs(engramMeta, engramLayerIndex, engram_max_ngram_size, engram_n_heads,
-                                 snapshots, total, rows, maskValues, hasDead);
-            if (profiling) {
-                tHash = V41NowMs() - mark;
-            }
+                                 V41SnapshotSegments(segments, engram_max_ngram_size),
+                                 total, rows, maskValues, hasDead);
+            if (profiling) tHash = V41NowMs() - mark;
         }
 
-        // ---- 顺手把下一个 engram 层的行号与表行放到后台算 ----
-        // 哈希只依赖 token 历史，进入第 0 层之前就已经全部确定，所以这里不需要任何中间激活。
-        if (job != nullptr && engramLayerIndex + 1 < (int)engram_layer_ids.size() &&
-            engramLayerIndex + 1 < (int)engramTables.size()) {
-            int nextIndex = engramLayerIndex + 1;
-            job->Reset();   // 可能还挂着上一次前向留下的任务，先 join 再复用
-            job->engramLayerIndex = nextIndex;
-            job->total = total;
-            job->ready = false;
-            const DeepSeekV41EngramMeta &meta = engramMeta;
-            int maxNgram = engram_max_ngram_size, heads = engram_n_heads;
-            auto tablePtr = std::static_pointer_cast<V41EngramTable>(engramTables[nextIndex]);
-            job->worker = std::thread([job, nextIndex, total, snapshots, &meta, maxNgram, heads, tablePtr]() {
-                V41BuildEngramInputs(meta, nextIndex, maxNgram, heads, snapshots, total,
-                                     job->rows, job->maskValues, job->hasDead);
-                V41TouchEngramRows(*tablePtr, job->rows);
-                job->ready = true;
-            });
+        // Reuse the forward's snapshots, skipping GPU tables and layers outside
+        // this pipeline stage. Never replace a pending result for a later layer.
+        if (tookPrefetched) {
+            for (size_t next = engramLayerIndex + 1;
+                 next < engram_layer_ids.size() && next < engramTables.size(); ++next) {
+                if (engram_layer_ids[next] >= job->endLayer) break;
+                auto table = std::static_pointer_cast<V41EngramTable>(engramTables[next]);
+                if (!V41CanPrefetchEngramRows(*table)) continue;
+                job->Start(int(next), total, engramMeta, engram_max_ngram_size, engram_n_heads, table);
+                break;
+            }
         }
 
         // ---- 第二段：查表 + FP8→BF16 ----
         mark = profiling ? V41NowMs() : 0.0;
-        Data gathered;
-        GatherEngramRows(layer, rows, total, gathered, profiling ? &tPrep : nullptr);
+        Data localGather;
+        if (!prefetchedGather) {
+            GatherEngramRows(layer, rows, total, localGather, profiling ? &tPrep : nullptr);
+        }
+        Data &gathered = prefetchedGather ? *prefetchedGather : localGather;
         if (profiling) {
             tGather = V41NowMs() - mark - tPrep;
         }
@@ -4579,6 +4587,7 @@ namespace fastllm {
         const LastTokensManager &lastTokens;
         std::vector<std::vector<float>*> *retLogits;
         std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues;
+        std::unique_ptr<EngramPrefetch> engramPrefetch;
         int numSegments = 0;
         bool boundedPrefill = false;
         int total = 0;
@@ -5114,6 +5123,24 @@ namespace fastllm {
         auto &graphCapture = f.graphCapture;
         auto &graphPoolOpen = f.graphPoolOpen;
 #endif
+        // Tokens/history are final here. Start the first actual CPU lookup
+        // before embedding/layer 0, rather than waiting until Engram layer 1.
+        // A pipeline stage only prefetches layers that it will consume.
+        if (seqlen >= V41EngramPrefetchMinTokens && V41EnvFlagOn("FASTLLM_DSV41_ENGRAM_PREFETCH")) {
+            const int first = f.prefill ? f.prefill->firstLayer : 0;
+            const int end = f.prefill ? f.prefill->endLayer : block_cnt;
+            for (size_t i = 0; i < engram_layer_ids.size() && i < engramTables.size(); ++i) {
+                if (engram_layer_ids[i] < first || engram_layer_ids[i] >= end) continue;
+                auto table = std::static_pointer_cast<V41EngramTable>(engramTables[i]);
+                if (!V41CanPrefetchEngramRows(*table)) continue;
+                f.engramPrefetch.reset(new EngramPrefetch(end,
+                    V41SnapshotSegments(segments, engram_max_ngram_size)));
+                f.engramPrefetch->Start(int(i), seqlen, engramMeta, engram_max_ngram_size,
+                                       engram_n_heads, table);
+                break;
+            }
+        }
+
         // ---- embedding -> hc 份 ----
         // 图模式下这些张量来自常驻工作区，地址必须在两次 decode 之间保持不变。
         Data &hiddenStates = ws->hiddenStates;
@@ -5441,7 +5468,7 @@ namespace fastllm {
                     if (f.moeStep) f.moeStep->WaitCpu();
                     std::unique_lock<std::mutex> hostLock;
                     if (f.prefill) hostLock = std::unique_lock<std::mutex>(*f.prefill->hostExperts);
-                    RunEngram(layer, (int)l, segments, *curHidden);
+                    RunEngram(layer, (int)l, segments, *curHidden, f.engramPrefetch.get());
                 }
             }
 

@@ -78,4 +78,6 @@ ftllm server /path/to/DeepSeek-V4.1-Flash \
 
 Thread and chunk values are examples. Manual mode does not inherit the `--auto` defaults. KV type and cache sizes still need to fit the actual checkpoint and hardware.
 
+CPU Engram tables automatically prefetch lookup rows and their BF16 conversion for forwards of at least 128 tokens, including native FP8 and GGUF tables stored in memory or on disk. Each forward owns one history snapshot and at most one pending result, limited to the layers its pipeline stage consumes. Short forwards and GPU-resident tables use the synchronous path. Set `FASTLLM_DSV41_ENGRAM_PREFETCH=0` to disable this optimization.
+
 The [detailed Chinese guide](deepseek_v41.md) documents manual layouts, Engram metadata, TP/PP, prefix reuse, DSpark, image input, and numerical validation. Optional image and draft features require matching weights; do not assume a text GGUF contains them. Performance records are kept in the [V4.1 benchmark page (Chinese)](benchmarks/deepseek_v41.md).
