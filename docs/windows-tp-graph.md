@@ -12,9 +12,12 @@ Windows 在 `USE_CUDA=ON`、`USE_NCCL=OFF` 时，可以自动使用映射主机�
 ftllm run D:\models\Qwen3.8-27B-FP8 --tp 2 --dtype auto
 ```
 
-只沿用已有的 `FASTLLM_CUDA_GRAPH` 开关，通信实现自动选择。设为 `0` 可关闭
-Graph。Python/CLI 启动符合硬件条件的 Qwen3.5/3.6/3.8 CUDA 模型时，普通解码、
-MTP 和 DFlash 验证默认开启该开关；显式设置和 `--low` 等现有边界继续有效。
+Windows CUDA 构建的原生运行时默认开启 `FASTLLM_CUDA_GRAPH`，通信实现自动选择。
+Python/CLI/启动器的 CUDA 推理也默认开启 Graph，仍保留硬件检查和 `--low` 边界；
+各模型自行判断是否支持当前形状的捕获。显式设置 `FASTLLM_CUDA_GRAPH=0` 可关闭，
+原生 `SetCudaGraph(false)` / Python `llm.set_cuda_graph(False)` 也可覆盖默认值。
+Qwen3.5/3.6/3.8 的普通解码、MTP 和 DFlash 验证均沿用该开关，
+`--low_gpu_mem` 下的 CPU embedding 也可进入 MTP 校验 Graph。
 满足下述双卡固定形状条件时，DFlash draft 也会捕获 Graph；其他配置保留原有路径。
 `mapped-host TP2 CUDA Graph collectives: self-test passed` 表示该 GPU
 组已通过通信自检，不等同于模型已捕获 Graph；模型的图模式仍受形状等条件限制。

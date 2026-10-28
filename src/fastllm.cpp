@@ -377,7 +377,14 @@ namespace fastllm {
         this->printLogits = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_PRINT_LOGITS"));
         this->printProfile = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_PRINT_PROFILE"));
         this->skipWarmup = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_SKIP_WARMUP"));
-        this->cudaGraph = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_CUDA_GRAPH"));
+        const char *cudaGraphEnv = std::getenv("FASTLLM_CUDA_GRAPH");
+#if defined(_WIN32) && defined(USE_CUDA)
+        // Avoid CUDA queries during DLL initialization. Each model still
+        // checks capture eligibility; explicit environment settings win.
+        this->cudaGraph = cudaGraphEnv == nullptr || IsEnvValueTrueIgnoreCase(cudaGraphEnv);
+#else
+        this->cudaGraph = IsEnvValueTrueIgnoreCase(cudaGraphEnv);
+#endif
         this->cudaMemCheck = IsEnvValueEnabledUnlessFalseIgnoreCase(std::getenv("FASTLLM_CUDA_MEM_CHECK"));
         this->cudaTriton = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_CUDA_TRITON"));
 

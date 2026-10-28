@@ -694,6 +694,20 @@ def _qwen35_gguf_needs_low_memory_fast_paths(args) -> bool:
     # not viable on a 32 GiB card (for example Qwen3.5/Qwen3.8 Q8_K_XL).
     return os.path.getsize(path) >= int(total_memory * 0.90)
 
+def _configure_windows_cuda_graph(args):
+    """Default Windows CUDA inference to graph, preserving explicit overrides."""
+    if sys.platform != "win32" or "FASTLLM_CUDA_GRAPH" in os.environ:
+        return
+    device = getattr(args, "device", "")
+    if bool(getattr(args, "low", False)) or not _uses_cuda_device(device):
+        return
+    tp = getattr(args, "tp", "")
+    cuda_spec = tp if _uses_thread_tp(tp) else device
+    if _cuda_graph_auto_supported(cuda_spec):
+        os.environ["FASTLLM_CUDA_GRAPH"] = "1"
+        print("[Fastllm] Windows CUDA graph enabled by default.", flush=True)
+
+
 def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
     """Select tested Qwen3.5 CUDA fast paths without deployment env vars.
 
@@ -1919,6 +1933,7 @@ def make_normal_llm_model(args, startup_progress = None):
         # placements, after TP fallback. Keep auto intact for subsequent models.
         os.environ.setdefault("FASTLLM_EXECUTION_MODE", "auto")
     _configure_sm89_fp8_linear_triton(args)
+    _configure_windows_cuda_graph(args)
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     os.environ["FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY"] = (
         "1" if _arg_enabled(getattr(args, "fast_prefill", False)) else "0")
