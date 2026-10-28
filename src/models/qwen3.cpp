@@ -461,6 +461,13 @@ namespace fastllm {
             Qwen3ForwardSingleBuffers buffers;
             Data logitsHalf;
             Data logits;
+            // These addresses outlive the executable graph. A single captured
+            // H2D node updates all inputs, including page-boundary changes.
+            Data ioPacket;
+            Data greedyOutput;
+            void *hostInputPacket = nullptr;
+            void *hostGreedyOutput = nullptr;
+            int ioPacketWords = 0;
             std::vector<int> lastInsertIndexHost;
             std::vector<int> lastPageSizesHost;
             std::vector<int> lastPageIndexHost;
@@ -477,6 +484,8 @@ namespace fastllm {
                     graph = nullptr;
                 }
                 FastllmCudaGraphMemoryPoolRelease(reservedPointers);
+                FastllmCudaHostFree(hostInputPacket);
+                FastllmCudaHostFree(hostGreedyOutput);
             }
         };
 
@@ -501,22 +510,26 @@ namespace fastllm {
             state.lastPastKeyHosts.clear();
         }
 
-        using Qwen3CudaGraphStateKey = std::tuple<const Qwen3Model*, int, int>;
+        using Qwen3CudaGraphStateKey = std::tuple<const Qwen3Model*, int, int, bool>;
 
         static std::mutex &Qwen3CudaGraphStatesMutex() {
-            static std::mutex statesMutex;
-            return statesMutex;
+            static auto *statesMutex = new std::mutex();
+            return *statesMutex;
         }
 
         static std::map<Qwen3CudaGraphStateKey, std::unique_ptr<Qwen3CudaGraphDecodeState> > &Qwen3CudaGraphStates() {
-            static std::map<Qwen3CudaGraphStateKey, std::unique_ptr<Qwen3CudaGraphDecodeState> > states;
-            return states;
+            // The model destructor erases its states while CUDA is alive. Keep
+            // the registry itself alive through process teardown: on Windows,
+            // DLL static destructors can run after CUDA released pinned memory.
+            static auto *states = new std::map<Qwen3CudaGraphStateKey, std::unique_ptr<Qwen3CudaGraphDecodeState> >();
+            return *states;
         }
 
-        static Qwen3CudaGraphDecodeState &GetQwen3CudaGraphDecodeState(const Qwen3Model *model, int gpuId, int batch) {
+        static Qwen3CudaGraphDecodeState &GetQwen3CudaGraphDecodeState(
+                const Qwen3Model *model, int gpuId, int batch, bool greedyIO) {
             std::lock_guard<std::mutex> guard(Qwen3CudaGraphStatesMutex());
             auto &states = Qwen3CudaGraphStates();
-            auto key = std::make_tuple(model, gpuId, batch);
+            auto key = std::make_tuple(model, gpuId, batch, greedyIO);
             auto &state = states[key];
             if (state == nullptr) {
                 state.reset(new Qwen3CudaGraphDecodeState());
@@ -550,6 +563,89 @@ namespace fastllm {
 
         static bool Qwen3CudaGraphEnabled() {
             return GetFastllmEnv().cudaGraph;
+        }
+
+        static bool Qwen3CudaGraphIOEnabled() {
+            static const bool enabled = []() {
+                const char *value = std::getenv("FASTLLM_QWEN3_GRAPH_IO");
+                return value == nullptr ||
+                    (std::strcmp(value, "0") != 0 &&
+                     !IsDisabledQwen3TpSpec(value));
+            }();
+            return enabled;
+        }
+
+        static void Qwen3PrepareGreedyGraphIO(
+                Qwen3CudaGraphDecodeState &state, int device, int pageCapacity,
+                const Data &inputIds, const Data &positionIds,
+                const std::vector<int> &insertIndex, const std::vector<int> &insertPosition,
+                const std::vector<int> &qSizes, const std::vector<int> &pageSizes,
+                const std::vector<int> &planPageSizes, const std::vector<int> &pageIndex,
+                const std::vector<int> &lastPageLens) {
+            // Single-request layout: input, position, insert index/offset,
+            // query indptr[2], page indptr[2], last-page length, page indices.
+            const int words = 9 + pageCapacity;
+            if (state.ioPacketWords != words) {
+                AssertInFastLLM(!state.captured,
+                                "Qwen3 cannot resize captured graph IO.\n");
+                FastllmCudaHostFree(state.hostInputPacket);
+                state.hostInputPacket = nullptr;
+                state.hostInputPacket = FastllmCudaHostMalloc(words * sizeof(int32_t));
+                AssertInFastLLM(state.hostInputPacket != nullptr,
+                                "Qwen3 graph input pinned allocation failed.\n");
+                state.ioPacket.FreeSpace();
+                state.ioPacket.dataType = DataType::INT32;
+                state.ioPacket.dataDevice = DataDevice::CUDA;
+                state.ioPacket.dataDeviceIds = {device};
+                state.ioPacket.Resize({words});
+                state.ioPacket.Allocate(false);
+                auto view = [&](Data &data, int offset, DataType type,
+                                const std::vector<int> &dims) {
+                    data.FreeSpace();
+                    Qwen3CudaClearMultiDeviceState(data);
+                    data.FakeFrom(state.ioPacket, offset * sizeof(int32_t));
+                    data.dataType = type;
+                    data.Resize(dims);
+                };
+                view(state.inputIds, 0, DataType::FLOAT32, {1, 1});
+                view(state.positionIds, 1, DataType::FLOAT32, {1, 1});
+                view(state.buffers.insertIndexs, 2, DataType::INT32, {1});
+                view(state.buffers.insertPositions, 3, DataType::INT32, {1});
+                view(state.buffers.qSizes, 4, DataType::INT32, {2});
+                view(state.buffers.pageSizes, 6, DataType::INT32, {2});
+                view(state.buffers.lastPageLens, 8, DataType::INT32, {1});
+                view(state.buffers.pageIndexs, 9, DataType::INT32, {pageCapacity});
+                state.ioPacketWords = words;
+            }
+            if (state.hostGreedyOutput == nullptr) {
+                state.hostGreedyOutput = FastllmCudaHostMalloc(sizeof(int));
+                AssertInFastLLM(state.hostGreedyOutput != nullptr,
+                                "Qwen3 graph output pinned allocation failed.\n");
+                Qwen3CudaPrepareLocalOutput(state.greedyOutput, device);
+                state.greedyOutput.dataType = DataType::INT32;
+                state.greedyOutput.Resize({1});
+                state.greedyOutput.Allocate(false);
+            }
+            // Every successful step synchronizes before returning its token;
+            // the state mutex also prevents overwriting an in-flight packet.
+            auto *packet = (int32_t*)state.hostInputPacket;
+            std::memcpy(packet, inputIds.cpuData, sizeof(float));
+            std::memcpy(packet + 1, positionIds.cpuData, sizeof(float));
+            packet[2] = insertIndex[0];
+            packet[3] = insertPosition[0];
+            std::copy(qSizes.begin(), qSizes.end(), packet + 4);
+            std::copy(pageSizes.begin(), pageSizes.end(), packet + 6);
+            packet[8] = lastPageLens[0];
+            std::fill(packet + 9, packet + words, pageIndex.empty() ? 0 : pageIndex.back());
+            std::copy(pageIndex.begin(), pageIndex.end(), packet + 9);
+            state.buffers.insertIndexs.cpuIntDatas = insertIndex;
+            state.buffers.insertPositions.cpuIntDatas = insertPosition;
+            state.buffers.qSizes.cpuIntDatas = qSizes;
+            // Capture retains the largest immutable FlashInfer plan; device
+            // indptr and page IDs are refreshed from the packet on every replay.
+            state.buffers.pageSizes.cpuIntDatas = planPageSizes;
+            state.buffers.pageIndexs.cpuIntDatas.assign(packet + 9, packet + words);
+            state.buffers.lastPageLens.cpuIntDatas = lastPageLens;
         }
 
         static void Qwen3PrepareGraphCudaTensor(Data &dst, const Data &src, int device) {
@@ -1685,39 +1781,48 @@ namespace fastllm {
         printProgress(0, maxWarmupBatch, 0);
 
         for (int batch = 1; batch <= maxWarmupBatch; batch++) {
-            std::vector<float> inputIdsHost(batch, 1.0f);
-            Data inputIds(DataType::FLOAT32, {1, batch}, inputIdsHost);
-            std::vector<Data*> attentionMasks(batch, nullptr);
-            std::vector<int> seqLens(batch, 1);
-            std::vector<GenerationConfig> generationConfigs(batch);
-            LastTokensManager lastTokens;
-
-            std::vector<std::pair<Data, Data> > pastKeyValuesStorage;
-            std::vector<std::pair<Data*, Data*> > pastKeyValues;
-            pastKeyValuesStorage.reserve(batch * block_cnt);
-            pastKeyValues.reserve(batch * block_cnt);
-            for (int b = 0; b < batch; b++) {
-                for (int i = 0; i < block_cnt; i++) {
-                    pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType),
-                                                                  Data(this->kvCacheDataType)));
-                    pastKeyValuesStorage.back().first.SetKVCache();
-                    pastKeyValuesStorage.back().second.SetKVCache();
-                    pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage.back().first,
-                                                           &pastKeyValuesStorage.back().second));
+            // Keep the ordinary logits graph ready for requests that need EOS
+            // masking, penalties, logits, or non-greedy sampling as well.
+            const int variants = batch == 1 && devices.size() == 1 &&
+                GetCudaEmbedding() && !GetLowMemMode() && Qwen3CudaGraphIOEnabled() ? 2 : 1;
+            for (int variant = 0; variant < variants; variant++) {
+                std::vector<float> inputIdsHost(batch, 1.0f);
+                Data inputIds(DataType::FLOAT32, {1, batch}, inputIdsHost);
+                std::vector<Data*> attentionMasks(batch, nullptr);
+                std::vector<int> seqLens(batch, 1);
+                std::vector<GenerationConfig> generationConfigs(batch);
+                if (variants == 2 && variant == 0) {
+                    generationConfigs[0].output_logits = true;
                 }
-            }
+                LastTokensManager lastTokens;
 
-            for (int step = 0; step < 3; step++) {
-                std::vector<Data> positionIdsStorage;
-                std::vector<Data*> positionIds;
-                positionIdsStorage.reserve(batch);
-                positionIds.reserve(batch);
+                std::vector<std::pair<Data, Data> > pastKeyValuesStorage;
+                std::vector<std::pair<Data*, Data*> > pastKeyValues;
+                pastKeyValuesStorage.reserve(batch * block_cnt);
+                pastKeyValues.reserve(batch * block_cnt);
                 for (int b = 0; b < batch; b++) {
-                    positionIdsStorage.push_back(Data(DataType::FLOAT32, {1, 1}, {(float)step}));
-                    positionIds.push_back(&positionIdsStorage.back());
+                    for (int i = 0; i < block_cnt; i++) {
+                        pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType),
+                                                                      Data(this->kvCacheDataType)));
+                        pastKeyValuesStorage.back().first.SetKVCache();
+                        pastKeyValuesStorage.back().second.SetKVCache();
+                        pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage.back().first,
+                                                               &pastKeyValuesStorage.back().second));
+                    }
                 }
-                ForwardGPU(batch, inputIds, attentionMasks, positionIds, seqLens,
-                           pastKeyValues, generationConfigs, lastTokens, nullptr);
+
+                for (int step = 0; step < 3; step++) {
+                    std::vector<Data> positionIdsStorage;
+                    std::vector<Data*> positionIds;
+                    positionIdsStorage.reserve(batch);
+                    positionIds.reserve(batch);
+                    for (int b = 0; b < batch; b++) {
+                        positionIdsStorage.push_back(Data(DataType::FLOAT32, {1, 1}, {(float)step}));
+                        positionIds.push_back(&positionIdsStorage.back());
+                    }
+                    ForwardGPU(batch, inputIds, attentionMasks, positionIds, seqLens,
+                               pastKeyValues, generationConfigs, lastTokens, nullptr);
+                }
             }
             printProgress(batch, maxWarmupBatch, batch);
         }
@@ -1745,7 +1850,8 @@ namespace fastllm {
             bool tensorParallel,
             bool firstTensorParallelRank,
             int pagedCacheLayerOffset,
-            Data &logits) {
+            Data &logits,
+            std::vector<int> *greedyTokens) {
 #ifndef USE_CUDA
         return false;
 #else
@@ -1761,6 +1867,13 @@ namespace fastllm {
             }
         }
         if (inputIds.Count(0) != (uint64_t)batch || positionIds.Count(0) != (uint64_t)batch) {
+            return false;
+        }
+        const bool greedyIO = greedyTokens != nullptr;
+        if (greedyIO && (tensorParallel || batch != 1 ||
+            inputIds.dataDevice != DataDevice::CPU || inputIds.dataType != DataType::FLOAT32 ||
+            inputIds.cpuData == nullptr || positionIds.dataDevice != DataDevice::CPU ||
+            positionIds.dataType != DataType::FLOAT32 || positionIds.cpuData == nullptr)) {
             return false;
         }
 
@@ -1779,8 +1892,8 @@ namespace fastllm {
             return it->second;
         };
 
-        Data *localInputIds = requireLocal((Data&)inputIds, "inputIds");
-        Data *localPositionIds = requireLocal((Data&)positionIds, "positionIds");
+        Data *localInputIds = greedyIO ? (Data*)&inputIds : requireLocal((Data&)inputIds, "inputIds");
+        Data *localPositionIds = greedyIO ? (Data*)&positionIds : requireLocal((Data&)positionIds, "positionIds");
         if (localInputIds->dims.size() != 2 || localInputIds->Count(0) != (uint64_t)batch ||
             localPositionIds->dims.empty() || localPositionIds->Count(0) != (uint64_t)batch) {
             return false;
@@ -1817,7 +1930,7 @@ namespace fastllm {
         if (rope_type == RoPEType::DYMAMIC_NTK && currentTokens + 1 >= max_positions) {
             return false;
         }
-        Qwen3CudaGraphDecodeState &state = GetQwen3CudaGraphDecodeState(this, gpuId, batch);
+        Qwen3CudaGraphDecodeState &state = GetQwen3CudaGraphDecodeState(this, gpuId, batch, greedyIO);
         std::unique_lock<std::mutex> graphLock(state.mutex);
         if (state.disabled) {
             return false;
@@ -1829,8 +1942,10 @@ namespace fastllm {
         }
 
         FastllmCudaSetDevice(gpuId);
-        Qwen3PrepareGraphCudaTensor(state.inputIds, *localInputIds, gpuId);
-        Qwen3PrepareGraphCudaTensor(state.positionIds, *localPositionIds, gpuId);
+        if (!greedyIO) {
+            Qwen3PrepareGraphCudaTensor(state.inputIds, *localInputIds, gpuId);
+            Qwen3PrepareGraphCudaTensor(state.positionIds, *localPositionIds, gpuId);
+        }
 
         PagedCacheManager *graphPagedManager = pastKeyValues[0].first->pagedKVCacheData;
         int graphMaxPagesPerRequest = graphPagedManager != nullptr ? graphPagedManager->maxPages : 0;
@@ -1937,11 +2052,11 @@ namespace fastllm {
                   << ";tpRank0=" << (firstTensorParallelRank ? 1 : 0)
                   << ";batch=" << batch
                   << ";inputDims=";
-        for (int dim : state.inputIds.dims) {
+        for (int dim : localInputIds->dims) {
             signature << dim << ",";
         }
         signature << ";posDims=";
-        for (int dim : state.positionIds.dims) {
+        for (int dim : localPositionIds->dims) {
             signature << dim << ",";
         }
         signature << ";pageSizes=";
@@ -1949,8 +2064,8 @@ namespace fastllm {
             signature << pageSize << ",";
         }
         signature << ";pages=" << pageIndexCapacity
-                  << ";inputType=" << (int)state.inputIds.dataType
-                  << ";posType=" << (int)state.positionIds.dataType
+                  << ";inputType=" << (int)localInputIds->dataType
+                  << ";posType=" << (int)localPositionIds->dataType
                   << ";kCache=" << pastKeyValues[0].first->pagedKVCacheData->cudaData
                   << ";vCache=" << pastKeyValues[0].second->pagedKVCacheData->cudaData
                   << ";lmLocal=" << requireLocal(weight["lm_head.weight"], "lm_head.weight")->dims[0];
@@ -1975,7 +2090,12 @@ namespace fastllm {
             state.lastDecodePageLensHost != insertPositionHost ||
             state.lastPastKeyHosts != currentPastKeyHosts;
         bool needFullMetaCopy = graphMetaMissing || signatureChanged || anyNewPage || metadataChanged;
-        if (needFullMetaCopy) {
+        if (greedyIO) {
+            Qwen3PrepareGreedyGraphIO(state, gpuId, pageIndexCapacity,
+                inputIds, positionIds, insertIndexHost, insertPositionHost,
+                qSizesHost, pageSizesHost, graphPlanPageSizesHost, pageIndexHost,
+                lastPageLensHost);
+        } else if (needFullMetaCopy) {
             AssertInFastLLM((int)pageIndexHost.size() <= pageIndexCapacity,
                             "Qwen3 CUDA graph page metadata exceeds fixed graph capacity.\n");
             std::vector<int> paddedPageIndexHost = pageIndexHost;
@@ -2010,6 +2130,12 @@ namespace fastllm {
         }
 
         auto runGraphBody = [&]() {
+            if (greedyIO) {
+                AssertInFastLLM(FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
+                    state.ioPacket.cudaData, state.hostInputPacket,
+                    state.ioPacketWords * sizeof(int32_t)),
+                    "Qwen3 graph input upload failed.\n");
+            }
             Qwen3CudaDirectRunner cudaRunner(gpuId);
             Qwen3ForwardSingleBuffers &buf = state.buffers;
             if ((int)buf.batchPastKeys.size() != batch) {
@@ -2139,10 +2265,25 @@ namespace fastllm {
                                           "lm_head.weight.tp_bias"),
                             state.logitsHalf);
             Qwen3CudaConvertToDataType(cudaRunner, state.logitsHalf, state.logits, DataType::FLOAT32);
+            if (greedyIO) {
+                AssertInFastLLM(FastllmCudaGreedySampling(
+                    (float*)state.logits.cudaData, (int*)state.greedyOutput.cudaData,
+                    1, state.logits.dims.back()), "Qwen3 graph greedy sampling failed.\n");
+                AssertInFastLLM(FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(
+                    state.hostGreedyOutput, state.greedyOutput.cudaData, sizeof(int)),
+                    "Qwen3 graph token download failed.\n");
+            }
         };
 
         auto finishWithLogits = [&]() {
-            Qwen3PrepareGraphCudaTensor(logits, state.logits, gpuId);
+            if (greedyIO) {
+                FastllmCudaSyncCurrentThreadStream();
+                AssertInFastLLM(!FastllmCudaGetThreadError(),
+                                "Qwen3 graph token synchronization failed.\n");
+                greedyTokens->assign(1, *(int*)state.hostGreedyOutput);
+            } else {
+                Qwen3PrepareGraphCudaTensor(logits, state.logits, gpuId);
+            }
         };
 
         auto runWithoutGraph = [&]() {
@@ -2258,8 +2399,8 @@ namespace fastllm {
             runWithoutGraph();
             return true;
         }
-        printf("[Fastllm] Qwen3 CUDA graph captured on GPU %d batch %d, pinned %zu scratch buffers.\n",
-               gpuId, batch, state.reservedPointers.size());
+        printf("[Fastllm] Qwen3 CUDA graph captured on GPU %d batch %d, pinned %zu scratch buffers, greedy IO %s.\n",
+               gpuId, batch, state.reservedPointers.size(), greedyIO ? "on" : "off");
         fflush(stdout);
         finishWithLogits();
         return true;
@@ -2963,6 +3104,20 @@ namespace fastllm {
         if (devices.size() == 1) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
+            }
+            // The fast path consumes the actual host token/position on every
+            // call. It never assumes that requests or sampled tokens continue
+            // from the previous replay, including after cache reuse or reset.
+            if (batch == 1 && all1 && !useCpuEmbedding && Qwen3CudaGraphIOEnabled() &&
+                generationConfigs[0].IsSimpleGreedy() &&
+                !generationConfigs[0].output_logits &&
+                generationConfigs[0].output_token_least <= 0) {
+                std::vector<int> graphTokens;
+                if (ForwardSingleGPUDecodeGraph(devices[0], ratios, batch,
+                    gpuInputIds, allPositionIds, seqLens, pastKeyValues, all1, isPrefill,
+                    false, true, threadTpPagedCacheBase, localLogits[0], &graphTokens)) {
+                    return graphTokens;
+                }
             }
             ForwardSingleGPU(devices[0], ratios, batch, gpuInputIds, allPositionIds,
                              seqLens, pastKeyValues, all1, isPrefill,

@@ -152,7 +152,8 @@ namespace fastllm {
                 bool tensorParallel,
                 bool firstTensorParallelRank,
                 int pagedCacheLayerOffset,
-                Data &logits);
+                Data &logits,
+                std::vector<int> *greedyTokens = nullptr);
 
         void PreCaptureCudaGraphAfterWarmup();
 
