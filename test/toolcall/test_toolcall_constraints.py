@@ -145,6 +145,31 @@ class _UnsupportedDecoder:
 
 
 class ToolCallConstraintCompilerTest(unittest.TestCase):
+    def test_mimo_closed_structure_uses_request_tools(self):
+        descriptor = _descriptor(tools=[_weather_tool(), _time_tool()],
+                                 tool_choice="required", parallel_tool_calls=False).to_dict()
+        descriptor["constraint_type"] = "naive_n05_flash_tool_call"
+        spec = compile_tool_call_constraint(descriptor)
+        self.assertEqual(spec.structural_tag["format"], "mimo_xml")
+        self.assertEqual(spec.structural_tag["allowed_names"], ["get_weather", "get_time"])
+        self.assertEqual(spec.structural_tag["parameter_names_by_tool"]["get_weather"], ["city", "days"])
+        self.assertTrue(spec.structural_tag["requires_tool_call"])
+        self.assertEqual(spec.structural_tag["max_tool_calls"], 1)
+        decoder = _ToolCallConstraintDecoder()
+        result = apply_tool_call_constraint_to_decoder(decoder, spec)
+        self.assertTrue(result.applied)
+        self.assertEqual(decoder.payload["structural_tag"]["format"], "mimo_xml")
+
+    def test_mimo_named_choice_and_bad_names(self):
+        descriptor = _descriptor(tools=[_weather_tool(), _time_tool()],
+            tool_choice={"type": "function", "function": {"name": "get_time"}}).to_dict()
+        descriptor["constraint_type"] = "naive_n05_tool_call"
+        spec = compile_tool_call_constraint(descriptor)
+        self.assertEqual(spec.structural_tag["allowed_names"], ["get_time"])
+        descriptor["allowed_tool_names"] = ["bad>name"]
+        with self.assertRaises(ValueError):
+            compile_tool_call_constraint(descriptor)
+
     def test_compile_deepseek_v4_structural_tag_and_name_grammar(self):
         spec = compile_tool_call_constraint(
             _descriptor(tools=[_weather_tool(), _time_tool()]))

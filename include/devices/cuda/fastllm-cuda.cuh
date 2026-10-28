@@ -2862,4 +2862,7 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
 bool FastllmCudaLaunchNativeMoeFullGraph(void *exec, void *const *handles, int count, bool timed = true);
 bool FastllmCudaCreateNativeMoeReplayGraph(void *graph, void *const *handles, int count, void **exec);
 
+// Host bitset, applied before temperature/top-k/top-p on the calling stream.
+void FastllmCudaApplyTokenMask(float *logits, const uint32_t *mask, int vocab);
+
 #endif // FASTLLM_CUDA_CUH

@@ -3,6 +3,7 @@
 //
 
 #include "basellm.h"
+#include "models/mimo_tool_grammar.h"
 #include "utils.h"
 #include "utils/cuda_cache_budget.h"
 #include "utils/inference_trace.h"
@@ -547,12 +548,38 @@ namespace fastllm {
     }
 
     void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
+        if (context) generationConfig.tool_call_grammar_state = context->generationConfig.tool_call_grammar_state;
         generationConfig.tool_call_generated_text = context ? context->toolCallConstraintGeneratedText : "";
         PrepareToolCallConstraint(generationConfig);
     }
 
     void basellm::PrepareToolCallConstraint(GenerationConfig &generationConfig) {
         generationConfig.tool_call_allowed_token_ids.clear();
+        if (generationConfig.tool_call_grammar) {
+            std::call_once(toolConstraintVocabularyOnce, [&] {
+                AssertInFastLLM(!weight.tokenizer.tokenToStringDict.empty(),
+                    "MiMo tool grammar requires a native tokenizer vocabulary.");
+                auto tokens = std::make_shared<std::vector<std::string>>();
+                for (const auto &entry : weight.tokenizer.tokenToStringDict) {
+                    if (entry.first < 0) continue;
+                    if ((int)tokens->size() <= entry.first) tokens->resize(entry.first + 1);
+                    (*tokens)[entry.first] = weight.tokenizer.DecodeTokens({entry.first});
+                }
+                // The output head can be padded beyond the tokenizer vocabulary.
+                // Empty entries stay forbidden, but the bitset must cover all logits.
+                auto head = weight.weight.find("lm_head.weight");
+                if (head != weight.weight.end() && !head->second.dims.empty())
+                    tokens->resize(std::max(tokens->size(), (size_t)head->second.dims[0]));
+                toolConstraintVocabulary = tokens;
+            });
+            std::set<int> stops(eos_token_ids.begin(), eos_token_ids.end());
+            stops.insert(eos_token_id);
+            stops.insert(generationConfig.stop_token_ids.begin(), generationConfig.stop_token_ids.end());
+            generationConfig.tool_call_grammar->Bind(toolConstraintVocabulary, stops);
+            generationConfig.tool_call_token_mask = generationConfig.tool_call_grammar->Mask(
+                generationConfig.tool_call_grammar_state);
+            return;
+        }
         if (!generationConfig.tool_call_name_constraint_enabled &&
             !generationConfig.tool_call_parameter_name_constraint_enabled) {
             return;
@@ -594,7 +621,18 @@ namespace fastllm {
         generationConfig.tool_call_allowed_token_ids = std::move(allowedIds);
     }
 
+    void basellm::AdvanceToolCallGrammar(GenerationConfig &config, int tokenId) {
+        config.tool_call_grammar_state = config.tool_call_grammar->AdvanceToken(
+            config.tool_call_grammar_state, tokenId);
+        AssertInFastLLM(config.tool_call_grammar_state >= 0, "Invalid MiMo tool grammar transition.");
+        config.tool_call_token_mask.reset();
+    }
+
     void basellm::UpdateToolCallConstraintState(ResponseContext *context, int tokenId) {
+        if (context && context->generationConfig.tool_call_grammar && tokenId >= 0) {
+            AdvanceToolCallGrammar(context->generationConfig, tokenId);
+            return;
+        }
         if (context == nullptr ||
             (!context->generationConfig.tool_call_name_constraint_enabled &&
              !context->generationConfig.tool_call_parameter_name_constraint_enabled) ||

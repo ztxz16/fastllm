@@ -515,6 +515,9 @@ namespace fastllm {
 
         void PrepareToolCallConstraint(GenerationConfig &generationConfig);
         void AdvanceToolCallConstraintText(std::string &text, int tokenId);
+        void AdvanceToolCallGrammar(GenerationConfig &config, int tokenId);
+        std::once_flag toolConstraintVocabularyOnce;
+        std::shared_ptr<const std::vector<std::string>> toolConstraintVocabulary;
 
         virtual void UpdateToolCallConstraintState(ResponseContext *context, int tokenId);
 

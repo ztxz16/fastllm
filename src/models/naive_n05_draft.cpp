@@ -1003,8 +1003,8 @@ int NaiveN05FlashModel::ForwardDraft(
     }
     int oldLength = kv[0].first.dims.empty() ? 0 : kv[0].first.dims[1];
     AssertInFastLLM(context.committed == oldLength, "Naive target/draft cache length mismatch.");
-    // Tool constraints and content sampling change after each emitted prefix.
-    // Keep these requests single-token until branch-local masks are available.
+    // Legacy name/content constraints retain their single-token fallback.
+    // MiMo grammar below advances a private state for every proposal/verify row.
     bool constrained = config.tool_call_name_constraint_enabled ||
                        config.tool_call_parameter_name_constraint_enabled ||
                        config.tool_call_content_sampling_enabled;
@@ -1031,9 +1031,11 @@ int NaiveN05FlashModel::ForwardDraft(
     Split(draftHidden, 1, 0, limit, selected);
     Data baseLogits = RunDraftHead(selected);
     const int vocab = baseLogits.dims.back();
-    const bool greedy = config.IsSimpleGreedy() && config.output_token_least <= 0;
+    GenerationConfig samplingConfig = config;
+    samplingConfig.tool_call_token_mask.reset();
+    const bool greedy = samplingConfig.IsSimpleGreedy() && config.output_token_least <= 0;
     LastTokensUnit samplingTokens = lastTokens.units.empty() ? LastTokensUnit(config.last_n) : lastTokens.units[0];
-    auto distribution = [&](Data &logits, int row, int position, const LastTokensUnit &history) {
+    auto distribution = [&](Data &logits, int row, int position, const LastTokensUnit &history, const GenerationConfig &stepConfig) {
         logits.ToDevice(DataDevice::CPU);
         float *values = (float *)logits.cpuData + (size_t)row * vocab;
         if (config.output_token_least > position - config.input_token_length) {
@@ -1041,15 +1043,15 @@ int NaiveN05FlashModel::ForwardDraft(
             for (int id : eos_token_ids) if (id >= 0 && id < vocab) values[id] = -1e30f;
             for (int id : config.stop_token_ids) if (id >= 0 && id < vocab) values[id] = -1e30f;
         }
-        return SpeculativeDistribution(values, vocab, config, history);
+        return SpeculativeDistribution(values, vocab, stepConfig, history);
     };
     auto selection = SelectLogits(config, true);
     // Reuse Qwen3.5's GPU proposal/rejection sampler for unrestricted top-p.
     // This shares ordinary CUDA sampling's top-p boundary/tie handling.
     // Its finite top-k semantics differ from the legacy CPU sampler; penalties,
-    // masks and minimum-output constraints also retain that generic fallback.
+    // legacy name masks and minimum-output constraints retain that generic fallback.
 #ifdef USE_CUDA
-    if (baseLogits.dataDevice == DataDevice::CUDA && SelectLogits(config).cudaSampling) {
+    if (!greedy && baseLogits.dataDevice == DataDevice::CUDA && SelectLogits(config).cudaSampling) {
         context.proposalProbs.ToDevice(DataDevice::CUDA, baseLogits.dataDeviceIds, false);
         context.proposalProbs.Resize({limit, vocab});
         context.proposalProbs.Allocate(false);
@@ -1062,7 +1064,8 @@ int NaiveN05FlashModel::ForwardDraft(
     std::vector<int> proposed;
     std::vector<std::vector<float>> q;
     int previous = anchor;
-    bool gpuProposal = greedy && draftConfidenceThreshold == 0 &&
+    GenerationConfig proposalConfig = config;
+    bool gpuProposal = !config.tool_call_grammar && greedy && draftConfidenceThreshold == 0 &&
         RunDraftProposalGraph(anchor, baseLogits, context, proposed);
     for (int step = 0; !gpuProposal && step < limit; ++step) {
         Data previousId(FLOAT32, {1, 1}, {(float)previous}), latent, bias, logits;
@@ -1083,6 +1086,10 @@ int NaiveN05FlashModel::ForwardDraft(
         Split(baseLogits, 1, step, step + 1, logits);
         AddTo(logits, bias);
         ToDataType(logits, FLOAT32);
+        if (config.tool_call_grammar) {
+            PrepareToolCallConstraint(proposalConfig);
+            ApplyToolTokenMask(logits, 0, proposalConfig);
+        }
         if (greedy) {
             Data top;
             TopK(logits, top, 1);
@@ -1108,11 +1115,12 @@ int NaiveN05FlashModel::ForwardDraft(
                 q.push_back(SpeculativeTopKDistribution(proposalCandidates.data(), count, vocab, config));
             } else
 #endif
-                q.push_back(distribution(logits, 0, oldLength + step + 1, samplingTokens));
+                q.push_back(distribution(logits, 0, oldLength + step + 1, samplingTokens, proposalConfig));
             previous = SampleSpeculativeDistribution(q.back(), context.Uniform());
         }
         proposed.push_back(previous);
         samplingTokens.Push(previous);
+        if (config.tool_call_grammar) AdvanceToolCallGrammar(proposalConfig, previous);
     }
     std::vector<float> verifyIds{(float)anchor}, verifyPositions;
     for (int token : proposed) verifyIds.push_back((float)token);
@@ -1128,6 +1136,19 @@ int NaiveN05FlashModel::ForwardDraft(
     capture.verifying = true;
     capture.selection = &selection;
     Data logits = RunDraftTarget(verifyInput, verifyPos, kv, config, capture);
+    // Row i predicts after the emitted anchor and proposals [0, i). Never
+    // publish a speculative state: the scheduler advances only emitted tokens.
+    std::vector<GenerationConfig> verifyConfigs;
+    if (config.tool_call_grammar) {
+        verifyConfigs.resize(proposed.size() + 1);
+        GenerationConfig stepConfig = config;
+        for (int row = 0; row <= (int)proposed.size(); ++row) {
+            PrepareToolCallConstraint(stepConfig);
+            verifyConfigs[row] = stepConfig;
+            ApplyToolTokenMask(logits, row, stepConfig);
+            if (row < (int)proposed.size()) AdvanceToolCallGrammar(stepConfig, proposed[row]);
+        }
+    }
     ApplyDraftDevice();
     samplingTokens = lastTokens.units.empty() ? LastTokensUnit(config.last_n) : lastTokens.units[0];
     int accepted = 0, next = -1;
@@ -1166,7 +1187,7 @@ int NaiveN05FlashModel::ForwardDraft(
             if (!selection.candidates.dims.empty())
                 return SpeculativeTopKDistribution((float *)selection.candidates.cpuData +
                     (size_t)row * selection.count * 2, selection.count, vocab, config);
-            return distribution(logits, row, oldLength + row + 1, samplingTokens);
+            return distribution(logits, row, oldLength + row + 1, samplingTokens, verifyConfigs.empty() ? config : verifyConfigs[row]);
         };
         while (accepted < (int)proposed.size()) {
             auto p = targetDistribution(accepted);

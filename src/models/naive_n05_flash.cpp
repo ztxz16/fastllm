@@ -1709,17 +1709,22 @@ NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
         std::abs(config.repeat_penalty - 1.0f) > 1e-8f ||
         !config.tool_call_allowed_token_ids.empty()) return selection;
     selection.greedy = config.IsSimpleGreedy();
+    // Grammar masks are applied to the full logits before sampling, outside
+    // CUDA Graphs. Compact shard top-k cannot select before a branch-local mask.
+    if (config.tool_call_token_mask && config.top_k <= 1) selection.greedy = true;
     // Full-vocabulary top-p matches the shared CUDA sampler's distribution.
     // Finite top-k keeps its existing top-k-then-top-p semantics, as does
     // speculative verification, which needs probabilities rather than a draw.
-    if (!speculative && !selection.greedy &&
-        config.top_k >= weight.weight.at("lm_head.weight").dims[0] &&
+    if (!speculative && ((!selection.greedy &&
+        config.top_k >= weight.weight.at("lm_head.weight").dims[0]) ||
+        (selection.greedy && config.tool_call_token_mask)) &&
         std::isfinite(config.temperature) && config.temperature > 0 &&
         std::isfinite(1.0f / config.temperature) &&
         std::isfinite(config.top_p) && config.top_p > 0 && config.top_p <= 1) {
         selection.cudaSampling = true;
         return selection;
     }
+    if (config.tool_call_grammar || config.tool_call_token_mask) return LogitsSelection();
     if (selection.greedy) selection.count = 1;
     else if (config.top_k > 1 && config.top_k <= kNaiveLogitsMaxTopK &&
              std::isfinite(config.temperature) && config.temperature > 0 &&
@@ -1744,6 +1749,8 @@ std::vector<int> NaiveN05FlashModel::SampleCudaLogits(
     for (int row = 0; row < rows; ++row) {
         temperatures[row] = configs[row].temperature;
         topPs[row] = configs[row].top_p;
+        topKs[row] = std::max(1, configs[row].top_k);
+        ApplyToolTokenMask(logits, row, configs[row]);
     }
     AssertInFastLLM(FastllmCudaTopKTopPSampling((float *)logits.cudaData,
         temperatures.data(), topKs.data(), topPs.data(), tokens.data(), rows, vocab),

@@ -109,8 +109,7 @@ inline std::vector<float> SpeculativeDistribution(
     std::vector<int> order;
     order.reserve(vocab);
     for (int token = 0; token < vocab; ++token) {
-        if (config.tool_call_allowed_token_ids.empty() || std::binary_search(
-                config.tool_call_allowed_token_ids.begin(), config.tool_call_allowed_token_ids.end(), token))
+        if (config.AllowsToolToken(token))
             order.push_back(token);
     }
     AssertInFastLLM(!order.empty(), "Empty speculative sampling support.");

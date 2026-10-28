@@ -25079,3 +25079,20 @@ bool FastllmCudaGraphAppendChild(const void *child) {
     return false;
 #endif
 }
+
+__global__ void FastllmApplyTokenMaskKernel(float *logits, const uint32_t *mask, int vocab) {
+    int token = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token < vocab && !(mask[token / 32] & (uint32_t(1) << (token % 32))))
+        logits[token] = -CUDART_INF_F;
+}
+
+void FastllmCudaApplyTokenMask(float *logits, const uint32_t *mask, int vocab) {
+    static thread_local fastllm::Data storage(fastllm::INT32);
+    storage.ToDevice(fastllm::DataDevice::CUDA, {FastllmCudaGetDevice()}, false);
+    storage.Resize({(vocab + 31) / 32});
+    storage.Allocate(false);
+    FastllmCudaCopyFromHostToDevice(storage.cudaData, const_cast<uint32_t *>(mask), storage.GetBytes());
+    FastllmApplyTokenMaskKernel<<<(vocab + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        logits, (const uint32_t *)storage.cudaData, vocab);
+    checkCudaErrors("Error applying tool token mask", cudaGetLastError());
+}

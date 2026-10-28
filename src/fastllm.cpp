@@ -3502,12 +3502,24 @@ namespace fastllm {
 
     Random fastllmRandom;
 
-    static bool ToolCallConstraintAllowsToken(const GenerationConfig &config, int tokenId) {
-        const auto &allowed = config.tool_call_allowed_token_ids;
-        if (allowed.empty()) {
-            return true;
+    void ApplyToolTokenMask(Data &logits, int row, const GenerationConfig &config) {
+        if (!config.tool_call_token_mask) return;
+        const int vocab = logits.dims.back();
+        AssertInFastLLM(logits.dataType == FLOAT32 && row >= 0 &&
+            (uint64_t)(row + 1) * vocab <= logits.Count(0) &&
+            config.tool_call_token_mask->size() >= (size_t)(vocab + 31) / 32,
+            "Invalid tool grammar logits mask.");
+#ifdef USE_CUDA
+        if (logits.dataDevice == DataDevice::CUDA) {
+            FastllmCudaSetDevice(logits.dataDeviceIds.at(0));
+            FastllmCudaApplyTokenMask((float *)logits.cudaData + (size_t)row * vocab,
+                config.tool_call_token_mask->data(), vocab);
+            return;
         }
-        return std::binary_search(allowed.begin(), allowed.end(), tokenId);
+#endif
+        float *values = (float *)logits.cpuData + (size_t)row * vocab;
+        for (int token = 0; token < vocab; ++token)
+            if (!config.AllowsToolToken(token)) values[token] = -INFINITY;
     }
 
     int LLMSampling(Data &logits, int outerOffset,
@@ -3535,7 +3547,7 @@ namespace fastllm {
             topk = 1;
         }
         std::vector <std::pair <float, int> > v;
-        bool hasToolNameMask = !config.tool_call_allowed_token_ids.empty();
+        bool hasToolMask = config.tool_call_token_mask || !config.tool_call_allowed_token_ids.empty();
         if (topk <= 64) {
             v.reserve(topk);
             auto betterThan = [](const std::pair<float, int> &a,
@@ -3547,7 +3559,7 @@ namespace fastllm {
                 std::vector<std::pair<float, int> >,
                 decltype(betterThan)> heap(betterThan);
             for (int i = 0; i < vocabSize; i++) {
-                if (hasToolNameMask && !ToolCallConstraintAllowsToken(config, i)) {
+                if (hasToolMask && !config.AllowsToolToken(i)) {
                     continue;
                 }
                 std::pair<float, int> cur = std::make_pair(base[i] * invTemp, i);
@@ -3568,7 +3580,7 @@ namespace fastllm {
         } else {
             v.reserve(vocabSize);
             for (int i = 0; i < vocabSize; i++) {
-                if (hasToolNameMask && !ToolCallConstraintAllowsToken(config, i)) {
+                if (hasToolMask && !config.AllowsToolToken(i)) {
                     continue;
                 }
                 v.push_back(std::make_pair(-base[i] * invTemp, i));
@@ -3581,7 +3593,8 @@ namespace fastllm {
                 v[i].first = -v[i].first;
             }
         }
-        if (v.empty() && hasToolNameMask) {
+        AssertInFastLLM(!config.tool_call_token_mask || !v.empty(), "Empty tool grammar sampling support.");
+        if (v.empty() && hasToolMask) {
             GenerationConfig fallbackConfig = config;
             fallbackConfig.tool_call_allowed_token_ids.clear();
             return LLMSampling(logits, outerOffset, fallbackConfig, tokens);
@@ -3623,10 +3636,12 @@ namespace fastllm {
         candidateOffsets.reserve(topk);
         for (int i = 0; i < topk; i++) {
             int tokenId = (int)base[i * 2];
-            if (ToolCallConstraintAllowsToken(config, tokenId)) {
+            if (config.AllowsToolToken(tokenId)) {
                 candidateOffsets.push_back(i);
             }
         }
+        AssertInFastLLM(!config.tool_call_token_mask || !candidateOffsets.empty(),
+                       "Empty compact tool grammar sampling support.");
         if (candidateOffsets.empty() && !config.tool_call_allowed_token_ids.empty()) {
             GenerationConfig fallbackConfig = config;
             fallbackConfig.tool_call_allowed_token_ids.clear();

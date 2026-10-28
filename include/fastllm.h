@@ -157,6 +157,8 @@ namespace fastllm {
         };
     };
 
+    class MimoToolGrammar;
+
     struct GenerationConfig {
         int output_token_limit = -1; // 最多输出多少, <= 0代表无限制
         int output_token_least = 0; // 最低输出的多少
@@ -171,6 +173,16 @@ namespace fastllm {
         bool enable_hash_id = false; // 给会话添加hash id
         bool add_special_tokens = true; // prompt添加special tokens（chatglm模型生效）
         std::multiset <int> stop_token_ids;
+        std::shared_ptr<MimoToolGrammar> tool_call_grammar;
+        int tool_call_grammar_state = 0;
+        std::shared_ptr<const std::vector<uint32_t>> tool_call_token_mask;
+        bool AllowsToolToken(int token) const {
+            if (token < 0) return false;
+            if (tool_call_token_mask && ((size_t)(token / 32) >= tool_call_token_mask->size() ||
+                !((*tool_call_token_mask)[token / 32] & (uint32_t(1) << (token % 32))))) return false;
+            return tool_call_allowed_token_ids.empty() || std::binary_search(
+                tool_call_allowed_token_ids.begin(), tool_call_allowed_token_ids.end(), token);
+        }
         bool tool_call_name_constraint_enabled = false;
         std::vector <std::string> tool_call_allowed_names;
         std::vector <std::string> tool_call_invoke_name_prefixes;
@@ -191,7 +203,7 @@ namespace fastllm {
         float tool_call_content_temperature = 1.0f;
 
         bool IsSimpleGreedy() const {
-            if (!tool_call_allowed_token_ids.empty()) {
+            if (tool_call_token_mask || !tool_call_allowed_token_ids.empty()) {
                 return false;
             }
             if (fabs(repeat_penalty - 1) > 1e-8) {
@@ -203,6 +215,8 @@ namespace fastllm {
             return true;
         }
     };
+
+    void ApplyToolTokenMask(Data &logits, int row, const GenerationConfig &config);
 
     struct LastTokensUnit {
         int tot = 0;
