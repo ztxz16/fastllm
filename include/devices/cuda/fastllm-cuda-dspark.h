@@ -1,5 +1,9 @@
 #pragma once
 #include "fastllm.h"
+// A shard's stable softmax statistics and Gumbel winner, gathered as 16 bytes.
+// best is relative to maximum, with temperature already applied.
+struct FastllmDsparkSamplePartial { float maximum, sum, best; int token; };
+static_assert(sizeof(FastllmDsparkSamplePartial) == 16, "Markov sampling gather packet must be 16 bytes");
 extern "C" {
 // Dense BF16 rank-256 shards. Caller validates shapes, zeros keys before the
 // chain, and performs an unsigned MAX all-reduce between Score and Finish.
@@ -8,6 +12,16 @@ bool FastllmCudaDsparkMarkovShardScore(const float *logits, const void *embed,
     int step, int vocab, int start, int count);
 bool FastllmCudaDsparkMarkovShardFinish(const unsigned long long *keys,
     const void *embed, int *tokens, float *outEmbeds, int step);
+// BF16/rank-256 sampling shards. partials has ceil(count/64) entries; packet
+// contains one entry per rank. Gather packet after Sample, then call Normalize.
+bool FastllmCudaDsparkMarkovShardSample(const float *logits, const void *embed,
+    const void *head, const int *tokens, float *scores, float *outEmbeds,
+    FastllmDsparkSamplePartial *partials, FastllmDsparkSamplePartial *packet,
+    unsigned long long seed, unsigned long long *counter,
+    int step, int start, int count, int stride, float temperature);
+bool FastllmCudaDsparkMarkovShardNormalize(float *scores,
+    const FastllmDsparkSamplePartial *gathered, int *tokens,
+    int ranks, int step, int count, int stride, float temperature);
 
 // Full-window graph inputs. metadata is INT32 [start position, anchor token];
 // the caller supplies valid token IDs and start position >= windowSize.

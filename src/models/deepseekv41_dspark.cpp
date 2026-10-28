@@ -2575,11 +2575,15 @@ namespace fastllm {
             const double headStart = DsTick();
             bool headProjected = false, shardedMarkov = false;
 #ifdef USE_CUDA
-            if (graphState && !randomDraft && normed.dataType == DataType::BFLOAT16 &&
+            if (graphState && normed.dataType == DataType::BFLOAT16 &&
                 !quantizedLinearNames.count("head.weight")) {
                 ApplyDsparkDevice(); FastllmMultiCudaSetDevice(v41DsparkTpDevices);
                 MultiCudaDsparkMarkovRequest request{markovEmbedWeight, markovHeadWeight,
                     graphState->markovTokens, markovAll, graphState->markovWorkspace};
+                if (randomDraft) {
+                    request.proposalProbs = &dspark.proposalProbs;
+                    request.temperature = config.temperature;
+                }
                 headProjected = MultiCudaLinearOutputGatherPersistent(normed, weight["head.weight"], logits,
                     v41DsparkHeadWorkspace, &request);
                 shardedMarkov = request.completed;

@@ -176,6 +176,8 @@ namespace fastllm {
         Data &embed, &head, &tokens, &outEmbeds;
         std::shared_ptr<void> &workspace;
         bool completed = false;
+        Data *proposalProbs = nullptr;
+        float temperature = 1.0f;
     };
     bool MultiCudaLinearOutputGatherPersistent(Data &input, Data &weight, Data &output,
                                                std::shared_ptr<void> &workspace,
