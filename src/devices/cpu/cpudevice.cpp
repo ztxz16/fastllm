@@ -1,3 +1,4 @@
+#include "utils/nsys.h"
 //
 // Created by huangyuyang on 6/13/23.
 //
@@ -3908,6 +3909,7 @@ namespace fastllm {
                 floatInput = vInputs.data();
             }
             for (int o = 0; o < outer; o++) {
+                NsysRange stage("cpu_moe/prepare");
                 std::vector <std::pair <int, float> > v;
                 for (int j = 0; j < topk; j++) {
                     int expertIdx = normalizeExpertIdx(indexData[o * topk + j]);
@@ -3940,6 +3942,7 @@ namespace fastllm {
                 std::vector <int> q8kInputGateIds(v.size());
                 std::vector <int> q8kInputGateTypes;
                 q8kInputsGate.clear();
+                stage.Next("cpu_moe/quantize_input");
                 for (int j = 0; j < v.size(); j++) {
                     int idx = v[j].first;
                     ggml_type gateType = (ggml_type)weights[idx * 2]->ggmlType;
@@ -3964,6 +3967,7 @@ namespace fastllm {
                 }
 
                 for (int st = 0; st < v.size(); st++) {
+                    stage.Next("cpu_moe/gate_up");
                     int k = weights[v[st].first * 2]->dims[0];
                     int end = st, selSum = 1; // 一共处理selSum * k个输出
 
@@ -4000,6 +4004,7 @@ namespace fastllm {
                         ops[j] = nullptr;
                     }
 
+                    stage.Next("cpu_moe/swiglu_quant");
                     // swiglu
                     threadSt = 0;
                     for (int l = st; l <= end; l++) {
@@ -4043,6 +4048,7 @@ namespace fastllm {
                         );
                     }
 */
+                    stage.Next("cpu_moe/down");
                     threadSt = 0;
                     for (int l = st; l <= end; l++) {
                         int idx = v[l].first;
@@ -4066,6 +4072,7 @@ namespace fastllm {
                     st = end;
                 }
 
+                stage.Next("cpu_moe/reduce_output");
                 float *fLastOutput = ((float*)output.cpuData) + o * m;
                 std::vector <float> tempOutput;
                 if (output.dataType == DataType::FLOAT16 || output.dataType == DataType::BFLOAT16) {

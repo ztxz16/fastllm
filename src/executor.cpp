@@ -1,3 +1,4 @@
+#include "utils/nsys.h"
 //
 // Created by huangyuyang on 6/13/23.
 //
@@ -34,6 +35,21 @@
 #endif
 
 namespace fastllm {
+    static std::string NsysOpLabel(const std::string &op, BaseDevice *device,
+                                   const DataDict &datas, const IntDict &params) {
+        if (!NsysEnabled()) return {};
+        std::string label = "op/" + device->deviceType + "/" + op;
+        auto weight = datas.find("weight");
+        if (weight != datas.end() && weight->second && !weight->second->name.empty())
+            label += "/" + weight->second->name;
+        auto weights = datas.find("weights");
+        auto batch = params.find("weights___batch");
+        if (weights != datas.end() && batch != params.end() && batch->second > 2) {
+            Data *first = reinterpret_cast<Data **>(weights->second)[2];
+            if (first && !first->name.empty()) label += "/" + first->name;
+        }
+        return label;
+    }
     static bool UsesSharedHostMoe(BaseDevice *device, const DataDict &datas, const IntDict &params) {
         if (device->deviceType == "numa") return true;
 #ifdef USE_NUMAS
@@ -336,6 +352,7 @@ namespace fastllm {
             SelectCudaDeviceForCandidate(device);
 #endif
             if (device->CanRun(opType, datas, floatParams, intParams)) {
+                NsysRange operation(NsysOpLabel(opType, device, datas, intParams));
                 const bool sharedHostMoe = opType == "MergeMOE" && UsesSharedHostMoe(device, datas, intParams);
                 bool intParamsSize = intParams.size();
                 for (auto &it: datas) {
@@ -453,6 +470,7 @@ namespace fastllm {
             if (!device->CanRun(opType, datas, floatParams, intParams)) {
                 continue;
             }
+            NsysRange operation(NsysOpLabel(opType, device, datas, intParams));
             const bool sharedHostMoe = opType == "MergeMOE" && UsesSharedHostMoe(device, datas, intParams);
             bool intParamsSize = intParams.size();
             for (auto &it: datas) {

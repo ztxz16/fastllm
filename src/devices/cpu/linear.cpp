@@ -5,6 +5,7 @@
 #include "devices/cpu/computeutils.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
 #include "devices/cpu/cpudevice.h"
+#include "utils/nsys.h"
 
 #include <cstring>
 #include <thread>
@@ -446,6 +447,7 @@ namespace fastllm {
 
     
     void MultiThreadLinearFloat32GGUFOp::Run() {
+        NsysRange range("cpu_moe/dot");
         ggml_tensor *tensor = (ggml_tensor*)this->ggmlTensor;
         int rowCount = m / QK_K; // 每行有多少个block
         auto vec_dot_type = ggml_type_vec_dot_type(tensor->type);

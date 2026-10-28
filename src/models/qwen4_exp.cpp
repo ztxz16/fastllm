@@ -1,3 +1,4 @@
+#include "utils/nsys.h"
 //
 // Qwen4-Exp / Qwen3.8-Flash-Next text model.
 //
@@ -2908,6 +2909,7 @@ namespace fastllm {
                                const std::vector<int> *hostInputTokens,
                                const DiskEmbeddingRowReader::Ticket *prefetched,
                                Data *normalizedCapture) {
+        NsysRange pleRange("model/PLE");
         if (normalizedCapture != nullptr) {
             normalizedCapture->dims.clear();
             normalizedCapture->strides.clear();
@@ -3042,6 +3044,7 @@ namespace fastllm {
         state.previousToken2 = previous2;
 
         if (diskEmbedding && pleDiskReader) {
+            NsysRange diskRange("model/PLE/disk_lookup_wait_decode");
             DiskEmbeddingRowReader::Ticket lookup;
             if (prefetched && prefetched->values.valid() && prefetched->rows == diskRows) {
                 lookup = *prefetched;

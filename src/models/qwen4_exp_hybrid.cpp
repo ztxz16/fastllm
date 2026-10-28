@@ -1,3 +1,4 @@
+#include "utils/nsys.h"
 // Independent hybrid forward; tensor blocks and CUDA kernels remain shared.
 #include "qwen4_exp_execution.h"
 #include "qwen4_exp_hybrid.h"
@@ -553,6 +554,9 @@ namespace fastllm {
             const std::vector<int> *hostInputTokens,
             bool materializeCausalMaskOnGraphFallback,
             const Data *precomputedEmbedding, PrefillStageContext *prefill) {
+        NsysRange forward(NsysEnabled() ? std::string("forward/") +
+            (inputIds.Count(0) > batch ? "prefill/" : "decode/") +
+            std::to_string(inputIds.Count(0)) : std::string());
         ForwardState frame(*this, ExecutionMode::Hybrid, batch, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig,
             lastTokens, retLogits, targetMultiHidden, allVerificationTokens, verificationAccepted,
             verificationCapture, recordPrefixSnapshot, allowDecodeCudaGraph, decodeEquivalentGdn,
@@ -561,6 +565,7 @@ namespace fastllm {
         frame.Prepare();
         frame.PrefetchExperts(frame.FirstLayer());
         for (int layer = frame.FirstLayer(); layer < frame.EndLayer(); ++layer) {
+            NsysRange layerRange(NsysEnabled() ? "layer/" + std::to_string(layer) : std::string());
             const int action = frame.BeginLayer(layer);
             if (action == ForwardState::Complete) break;
             if (action == ForwardState::Skip) continue;
