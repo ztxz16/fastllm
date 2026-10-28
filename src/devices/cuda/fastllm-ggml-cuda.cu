@@ -28,8 +28,8 @@
 
 #define CUDA_QUANTIZE_BLOCK_SIZE     256
 
-template <typename T, bool Permuted = false>
-static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict__ vy, const int64_t kx, const int64_t kx0_padded, int keyHeads = 0, int groups = 0, int headDim = 0) {
+template <typename T, bool Permuted = false, bool Grouped = false>
+static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict__ vy, const int64_t kx, const int64_t kx0_padded, int keyHeads = 0, int groups = 0, int headDim = 0, int groupRows = 1) {
     const int64_t ix0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
     if (ix0 >= kx0_padded) {
@@ -50,7 +50,10 @@ static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict
         const int head = ix0 / headDim;
         source = ((head % keyHeads) * groups + head / keyHeads) * headDim + ix0 % headDim;
     }
-    const float xi = ix0 < kx ? (float)x[ix1*kx + source] : 0.0f;
+    // Grouped WoA reads token-major input and writes group-major Q8 rows.
+    // This removes the separate activation transpose before batched GEMV.
+    const int64_t sourceRow = Grouped ? (ix1 % groupRows)*groups + ix1/groupRows : ix1;
+    const float xi = ix0 < kx ? (float)x[sourceRow*kx + source] : 0.0f;
     float amax = fabsf(xi);
     float sum = xi;
 
@@ -87,7 +90,7 @@ bool FastllmCudaGGUFGroupedGemv(const fastllm::Data &input, fastllm::Data &weigh
         int groups, int rows, fastllm::Data &output) {
     using namespace fastllm;
     if (input.dims.size() != 4 || input.dims[0] <= 0 || input.dims[1] <= 0 ||
-        int64_t(input.dims[0]) * input.dims[1] > MMVQ_MAX_BATCH_SIZE ||
+        int64_t(input.dims[0])*input.dims[1] > MMVQ_MAX_BATCH_SIZE ||
         groups <= 0 || rows <= 0 || input.dims[2] % groups ||
         weight.dataType != DATA_GGUF_FORMAT || weight.ggmlType != GGML_TYPE_Q5_K ||
         !input.cudaData || !weight.cudaData ||
@@ -100,18 +103,19 @@ bool FastllmCudaGGUFGroupedGemv(const fastllm::Data &input, fastllm::Data &weigh
     if (columns == 2560 && rows >= 2048) return false;
     const int padded = (columns + 511) / 512 * 512;
     auto *q8 = static_cast<block_q8_1 *>(FastllmCudaMalloc(
-        size_t(tokens) * groups * padded / QK8_1 * sizeof(block_q8_1)));
+        size_t(groups) * tokens * padded / QK8_1 * sizeof(block_q8_1)));
     output.dataType = input.dataType; output.UpdateUnitSize();
     output.Resize({input.dims[0], input.dims[1], groups * rows});
     output.dataDevice = CUDA; output.dataDeviceIds = input.dataDeviceIds;
     output.Allocate(false);
     const auto stream = cudaStreamPerThread;
-    if (input.dataType == FLOAT32)
-        quantize_row_q8_1_cuda(static_cast<const float *>(input.cudaData), q8, columns, groups * tokens, 1, padded, GGML_TYPE_Q5_K, stream);
-    else if (input.dataType == FLOAT16)
-        quantize_row_q8_1_cuda(static_cast<const half *>(input.cudaData), q8, columns, groups * tokens, 1, padded, GGML_TYPE_Q5_K, stream);
-    else
-        quantize_row_q8_1_cuda(static_cast<const __nv_bfloat16 *>(input.cudaData), q8, columns, groups * tokens, 1, padded, GGML_TYPE_Q5_K, stream);
+    const dim3 blocks((padded+CUDA_QUANTIZE_BLOCK_SIZE-1)/CUDA_QUANTIZE_BLOCK_SIZE, groups*tokens);
+#define GROUP_QUANT(T) quantize_q8_1<T, false, true><<<blocks, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>( \
+    static_cast<const T *>(input.cudaData), q8, columns, padded, 0, groups, 0, tokens)
+    if (input.dataType == FLOAT32) { GROUP_QUANT(float); }
+    else if (input.dataType == FLOAT16) { GROUP_QUANT(half); }
+    else { GROUP_QUANT(__nv_bfloat16); }
+#undef GROUP_QUANT
     FastllmGgufQ5KGroupedGemv(weight.cudaData, q8, output.cudaData, input.dataType,
         groups, columns, rows, padded, tokens, stream);
     checkCudaErrors("GGUF grouped WoA", cudaGetLastError());

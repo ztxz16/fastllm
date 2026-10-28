@@ -1,10 +1,12 @@
 #include "models/deepseekv41.h"
 #include "utils.h"
 #include "gguf.h"
+#include "../../src/models/deepseekv41-engram-prefetch.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <stdexcept>
 #include <unistd.h>
 
@@ -44,7 +46,7 @@ struct Probe : DeepSeekV41Model {
     using DeepSeekV41Model::GatherEngramRows;
     void Prepare(const Fixture &f, bool async) {
         executionMode = async ? ExecutionMode::Hybrid : ExecutionMode::Cpu;
-        ngramDevice = "disk"; engram_layer_ids = {0}; engram_head_dim = f.dim;
+        ngramDevice = "disk"; engram_layer_ids.assign(1, 0); engram_head_dim = f.dim;
         weight.dicts["model_directory"] = "/";
         auto &embedding = weight.weight["layers.0.engram.embed.weight"];
         embedding = Data(FP8_E4M3, {f.rows, f.dim});
@@ -80,8 +82,8 @@ static void TestIQ4NL() {
         struct IQProbe : Probe {
             void PrepareIQ(const std::vector<uint8_t> &packed, const DiskWeightPart &part, bool disk, bool async) {
                 executionMode = async ? ExecutionMode::Hybrid : ExecutionMode::Cpu;
-                ngramDevice = disk ? "disk" : "cpu"; engram_layer_ids = {0}; engram_head_dim = dim;
-                engram_num_embeddings = {rows};
+                ngramDevice = disk ? "disk" : "cpu"; engram_layer_ids.assign(1, 0); engram_head_dim = dim;
+                engram_num_embeddings.assign(1, rows);
                 weight.dicts["model_directory"] = "/";
                 auto &w = weight.weight["layers.0.engram.embed.weight"];
                 w = Data(DATA_GGUF_FORMAT, GGML_TYPE_IQ4_NL, {rows, dim});
@@ -94,8 +96,18 @@ static void TestIQ4NL() {
         for (int tokens : {1, 9, 257, 1}) {
             std::vector<int64_t> ids(tokens * 24);
             for (size_t i = 0; i < ids.size(); ++i) ids[i] = i % 3 ? (i * 997 + tokens) % rows : rows - 1;
-            Data output;
+            Data output, prefetched;
+            std::future<void> work;
+            if (async) work = std::async(std::launch::async, [&]() {
+                probe.GatherEngramRows(0, ids, tokens, prefetched);
+            });
             probe.GatherEngramRows(0, ids, tokens, output);
+            if (async) {
+                work.get();
+                Check(prefetched.dims == output.dims &&
+                      !memcmp(prefetched.cpuData, output.cpuData, output.GetBytes()),
+                      "background IQ4_NL gather differs from synchronous gather");
+            }
             Check(output.dims == std::vector<int>({1,tokens,24*dim}) && output.dataType == BFLOAT16, "IQ4_NL shape/type");
             for (size_t i = 0; i < ids.size(); ++i) for (int c = 0; c < dim; ++c) {
                 const int b = c / 32, lane = c % 32;
@@ -109,8 +121,76 @@ static void TestIQ4NL() {
     }
 }
 
+static void TestNativePrefetch() {
+    const FP8E4M3ToFP32Manager fp8;
+    size_t checked = 0;
+    int cases = 0;
+    for (bool direct : {false, true}) {
+        setenv("FASTLLM_DISK_DIRECT_IO", direct ? "1" : "0", 1);
+        Fixture fixture;
+        // Every row contains every FP8 byte; 256 rows cover all UE8M0 codes,
+        // including zero/subnormal, overflow and reserved NaN scales.
+        for (int row = 0; row < fixture.rows; ++row)
+            for (int block = 0; block < fixture.dim / fixture.block; ++block)
+                fixture.scales[row * (fixture.dim / fixture.block) + block] = row & 255;
+        {
+            std::fstream file(fixture.path, std::ios::in | std::ios::out | std::ios::binary);
+            file.seekp(fixture.scalePart.fileOffset);
+            file.write(reinterpret_cast<const char *>(fixture.scales.data()), fixture.scales.size());
+            Check(bool(file), "prefetch scale fixture write");
+        }
+        Probe serial;
+        serial.Prepare(fixture, false);
+        Data value(FP8_E4M3, {fixture.rows, fixture.dim});
+        value.isDiskWeight = true; value.diskWeightParts = {fixture.valuePart};
+        Data scale(INT8, {fixture.rows, fixture.dim / fixture.block});
+        scale.isDiskWeight = true; scale.diskWeightParts = {fixture.scalePart};
+        scale.diskWeightParts[0].isScalePart = false;
+        DiskEmbeddingRowReader valueReader(value, 0), scaleReader(scale, 0);
+        for (bool disk : {false, true}) for (int tokens : {1, 7, 128, 129, 8192}) {
+            std::vector<int64_t> rows(tokens * 24);
+            for (size_t i = 0; i < rows.size(); ++i) rows[i] = (i * 997 + tokens) % fixture.rows;
+            rows[0] = fixture.rows - 1; rows[1] = 0; rows[2] = rows[0];
+            const size_t count = rows.size() * fixture.dim;
+            std::vector<uint16_t> output(count + 32, 0x5a5a);
+            auto work = std::async(std::launch::async, [&]() {
+                v41_engram_detail::GatherNativeRows(fixture.values.data(), fixture.scales.data(),
+                    disk ? &valueReader : nullptr, disk ? &scaleReader : nullptr,
+                    fixture.rows, fixture.dim, fixture.block, rows, output.data() + 16);
+            });
+            // Synchronous conversion uses the shared pool concurrently. The
+            // background helper must not publish work into that same pool.
+            Data reference;
+            serial.GatherEngramRows(0, rows, tokens, reference);
+            work.get();
+            Check(!memcmp(output.data() + 16, reference.cpuData, count * 2),
+                  "native prefetch differs from synchronous gather");
+            for (int i = 0; i < 16; ++i)
+                Check(output[i] == 0x5a5a && output[count + 16 + i] == 0x5a5a, "native prefetch guard");
+            for (size_t i = 0; i < rows.size(); ++i) for (int col = 0; col < fixture.dim; ++col) {
+                const uint8_t scaleCode = fixture.scales[rows[i] * (fixture.dim / fixture.block) + col / fixture.block];
+                const float factor = scaleCode == 255 ? std::numeric_limits<float>::quiet_NaN()
+                    : std::ldexp(1.f, int(scaleCode) - 127);
+                const uint16_t expected = Float32ToBFloat16RNEBits(
+                    fp8.dict[fixture.values[rows[i] * fixture.dim + col]] * factor);
+                Check(output[16 + i * fixture.dim + col] == expected, "native prefetch scalar oracle");
+            }
+            checked += count; ++cases;
+            std::printf("PASS native prefetch direct=%d disk=%d tokens=%d values=%zu bitwise=1\n",
+                        int(direct), int(disk), tokens, count);
+        }
+        std::vector<uint16_t> empty(32, 0x5a5a);
+        v41_engram_detail::GatherNativeRows(fixture.values.data(), fixture.scales.data(),
+            &valueReader, &scaleReader, fixture.rows, fixture.dim, fixture.block, {}, empty.data() + 16);
+        for (uint16_t bits : empty) Check(bits == 0x5a5a, "empty native prefetch guard");
+    }
+    std::printf("ALL PASS native prefetch cases=%d values=%zu bitwise=1\n", cases, checked);
+}
+
 int main() {
     try {
+        SetThreads(4);
+        TestNativePrefetch();
         TestIQ4NL();
         const FP8E4M3ToFP32Manager fp8;
         for (int threads : {1, 4}) for (bool direct : {false, true}) {

@@ -834,7 +834,13 @@ def get_disk_moe_cache_stats():
              "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions",
              "cpu_cuda_overlap_bytes", "cuda_demotions", "cuda_demotion_bytes",
              "cpu_workspace_bytes", "cpu_buffer_reuses", "cpu_buffer_allocations",
-             "cpu_reclaims", "async_maintenance")
+             "cpu_reclaims", "async_maintenance",
+             "cpu_buffer_mmaps", "cpu_buffer_munmaps", "cpu_buffer_splits", "cpu_buffer_coalesces",
+             "canonical_promotion_checks", "canonical_promotion_rejects", "canonical_residence_rejects",
+             "canonical_upload_bytes", "canonical_upload_us", "canonical_download_us",
+             "decode_handoff_d2h_copies", "decode_handoff_d2h_bytes", "decode_handoff_wait_us",
+             "decode_output_h2d_copies", "decode_output_h2d_bytes",
+             "resident_readback_copies", "resident_readback_bytes", "resident_readback_wait_us")
     if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
         values = (ctypes.c_uint64 * len(names))()
         count = fastllm_lib.get_disk_moe_cache_stats_v2(values, len(names))
@@ -1554,13 +1560,17 @@ class model:
                             self.hf_tokenizer = try_load_gguf_tokenizer(path)
                     finally:
                         report_model_load_progress("tokenizer", 1, 1)
-                if external_mtp_path and mmproj_path:
-                    raise ValueError(
-                        "external MTP and mmproj cannot be used together")
-                if mmproj_path and self.config.get("gguf_architecture") == "deepseek41":
-                    from .deepseek_v41_gguf import vision_config
-                    self.config.update(vision_config(mmproj_path, self.config))
-                if context_requested:
+                if external_mtp_path and mmproj_path and self.config.get("gguf_architecture") != "deepseek41":
+                    raise ValueError("external MTP and mmproj cannot be used together")
+                if self.config.get("gguf_architecture") == "deepseek41":
+                    from .deepseek_v41_gguf import dspark_config, vision_config
+                    if external_mtp_path:
+                        self.config.update(dspark_config(external_mtp_path, self.config))
+                    if mmproj_path:
+                        self.config.update(vision_config(mmproj_path, self.config))
+                if context_requested or (external_mtp_path and mmproj_path):
+                    if not hasattr(fastllm_lib, "create_llm_model_from_gguf_with_context"):
+                        raise RuntimeError("the loaded FastLLM library does not support combined GGUF add-ons")
                     self.model = fastllm_lib.create_llm_model_from_gguf_with_context(
                         path.encode(), ori_model_path.encode(),
                         external_mtp_path.encode(), mmproj_path.encode(),

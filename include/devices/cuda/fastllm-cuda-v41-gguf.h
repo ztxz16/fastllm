@@ -41,6 +41,7 @@ bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
     int topk, float swigluLimit, float *perExpert);
 size_t FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(int hidden, int inter);
 bool FastllmCudaV41GGUFSupported(int gateType, int downType);
+bool FastllmCudaV41GGUFNumaSupported(int gateType, int downType, int numaGateType, int numaDownType);
 
 // Resident CUDA pointers remain live until return. Read jobs fill bounded,
 // page-aligned pinned slots and return the canonical payload within each slot.

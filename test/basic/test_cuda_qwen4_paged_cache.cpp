@@ -1,5 +1,6 @@
 #include "models/qwen4_paged_cache.h"
 #include "models/qwen4_exp.h"
+#include "../../src/models/qwen4_exp_qsa.h"
 #include "executor.h"
 #include <cmath>
 #include <algorithm>
@@ -248,6 +249,54 @@ void TestSlots(int device) {
 }
 namespace fastllm {
 struct Qwen4PrefixCacheTestAccess {
+    static void TestPrefillMirrorReservation(int device) {
+        constexpr int width = 8;
+        for (int prompt : {512, 4093, 4096, 8192, 32768}) {
+            for (int output : {1, 512, 0, 1000000}) {
+                Qwen4ExpModel::QsaHostMirrorTransfer mirror;
+                mirror.ReserveForPrefill(prompt, output, width);
+                const int extra = output > 0 ? std::min(output - 1, 8192) : 8192;
+                Check(mirror.rowCapacity >= prompt + extra &&
+                      mirror.rowCapacity < prompt + extra + 4096,
+                      "QSA prefill reservation is missing or unbounded");
+                if (prompt == 512 && output == 512)
+                    Check(mirror.rowCapacity == 4096, "short request over-reserved pinned history");
+                auto *rawStorage = mirror.rawStorage;
+                auto *positionStorage = mirror.positionStorage;
+                std::vector<float> keys((size_t)prompt * width), positions(prompt);
+                std::iota(keys.begin(), keys.end(), 0.0f);
+                std::iota(positions.begin(), positions.end(), 0.0f);
+                mirror.Prepare(keys, positions, prompt, width);
+                // Cross the old 4K/32K boundary with real asynchronous copies.
+                const int count = std::min(extra, 508);
+                if (count > 0) {
+                    std::vector<float> newKeys((size_t)count * width), newPositions(count);
+                    std::iota(newKeys.begin(), newKeys.end(), (float)keys.size());
+                    std::iota(newPositions.begin(), newPositions.end(), (float)prompt);
+                    Data key, position;
+                    Tensor(key, FLOAT32, {count, width}, newKeys, device);
+                    Tensor(position, FLOAT32, {count}, newPositions, device);
+                    mirror.Queue(key, position, prompt, count, width);
+                    keys.insert(keys.end(), newKeys.begin(), newKeys.end());
+                    positions.insert(positions.end(), newPositions.begin(), newPositions.end());
+                    std::vector<float> actualKeys, actualPositions;
+                    mirror.Materialize(actualKeys, actualPositions);
+                    Check(actualKeys == keys && actualPositions == positions,
+                          "reserved QSA append changed history values");
+                }
+                Check(mirror.rawStorage == rawStorage && mirror.positionStorage == positionStorage,
+                      "decode reallocated a reserved QSA mirror");
+                mirror.Rollback(prompt);
+                std::vector<float> restoredKeys, restoredPositions;
+                mirror.Materialize(restoredKeys, restoredPositions);
+                keys.resize((size_t)prompt * width); positions.resize(prompt);
+                Check(restoredKeys == keys && restoredPositions == positions,
+                      "QSA rollback changed reserved history");
+            }
+        }
+        std::cout << "PREFILL_MIRROR_RESERVATION_PASS device=" << device << '\n';
+    }
+
     static void TestWarmupMirrors(int device) {
         Qwen4ExpModel model;
         model.block_cnt = 1;
@@ -405,6 +454,7 @@ int main() {
                 TestFused(device, type);
             }
             TestSlots(device); TestGraph(device); TestAttention(device);
+            Qwen4PrefixCacheTestAccess::TestPrefillMirrorReservation(device);
             Qwen4PrefixCacheTestAccess::TestWarmupMirrors(device);
             Qwen4PrefixCacheTestAccess::TestPools(device);
         }

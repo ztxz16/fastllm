@@ -1,7 +1,9 @@
 #include "fastllm.h"
 #include "utils.h"
 #include "gguf.h"
+#include "gguf_iq2_s_r4_fixture.h"
 #include "devices/disk/diskdevice.h"
+#include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
@@ -83,7 +85,7 @@ struct Fixture {
         fclose(file);
     }
     ~Fixture() { owned.clear(); unlink(path.c_str()); }
-    std::vector<float> Run(bool lazy, int rows, int offset, int device, int topk=6, bool grouped=false, bool gpuIo=false, int lastExpert=-1) {
+    std::vector<float> Run(bool lazy, int rows, int offset, int device, int topk=6, bool grouped=false, bool gpuIo=false, int lastExpert=-1, float sharedScale=0) {
         Data x(BFLOAT16,{rows,hidden}), y(BFLOAT16,{rows,hidden});
         Data ids(INT32,{rows,topk}), scores(FLOAT32,{rows,topk}),a,b,c;
         x.Allocate(false); ids.Allocate(false); scores.Allocate(false);
@@ -102,7 +104,8 @@ struct Fixture {
             ids.ToDevice(CUDA,{device},true); scores.ToDevice(CUDA,{device},true);
             void *inputPointer=x.cudaData;
             DiskMergeMOE op;
-            Check(op.RunGpuPrefill(x,ids,scores,y,disk,.8f),"GPU disk prefill rejected");
+            Check(rows == 1 ? op.RunGpuDecode(x,ids,scores,y,disk,.8f)
+                            : op.RunGpuPrefill(x,ids,scores,y,disk,.8f),"GPU disk handoff rejected");
             Check(x.cudaData==inputPointer && x.dataDevice==CUDA && y.dataDevice==CUDA,
                   "GPU disk prefill staged activations on CPU");
         } else if (lazy) {
@@ -112,7 +115,7 @@ struct Fixture {
                 {"weights",(Data *)disk.data()},{"biass",(Data *)biases.data()},{"w1",&a},{"w2",&b},{"w3",&c}};
             IntDict ip={{"weights___batch",int(disk.size())},{"biass___batch",int(disk.size())},
                 {"deepSeekV4Mode",1},{"activationQuantBlock",32}};
-            DiskMergeMOE op; op.Run("MergeMOE",data,{{"sharedScale",0},{"swigluLimit",.8f}},ip);
+            DiskMergeMOE op; op.Run("MergeMOE",data,{{"sharedScale",sharedScale},{"swigluLimit",.8f}},ip);
         } else if (grouped) {
             ids.ToDevice(CUDA,{device},true); scores.ToDevice(CUDA,{device},true);
             Check(FastllmCudaMergeMOEV41GGUFResident(x,a,b,c,y,gpu.data(),gpu.size(),ids,scores,0,.8f),
@@ -122,7 +125,28 @@ struct Fixture {
             ids.ToDevice(CUDA,{device},true); scores.ToDevice(CUDA,{device},true);
             // One route at a time avoids duplicate-row scatter races in the
             // legacy fallback. Sum in stable expert order, with one final BF16 boundary.
+            auto routedWeights = gpu;
+            routedWeights[0] = routedWeights[1] = nullptr;
             y.Allocate(false);
+            std::vector<float> shared;
+            if (gpu[0] && gpu[1]) {
+                Data sx, sy(BFLOAT16,{rows,hidden});
+                sx.CopyFrom(x); sx.ToDevice(CPU);
+                Data si(INT32,{rows,1}), ss(FLOAT32,{rows,1}), a,b,c;
+                si.Allocate(false); ss.Allocate(false);
+                si.Resize({rows,0}); ss.Resize({rows,0});
+                std::vector<Data*> table{gpu[0],gpu[1],gpu[0],gpu[1]}, biases(4,nullptr);
+                DataDict data={{"input",&sx},{"output",&sy},{"index",&si},{"score",&ss},
+                    {"weights",(Data*)table.data()},{"biass",(Data*)biases.data()},
+                    {"w1",&a},{"w2",&b},{"w3",&c}};
+                IntDict ip={{"weights___batch",4},{"biass___batch",4},
+                    {"deepSeekV4Mode",1},{"activationQuantBlock",32},{"diskMoeDecode",1}};
+                struct SharedOracle : CpuMergeMOE { using CpuMergeMOE::Run; } op;
+                op.Run("MergeMOE",data,{{"sharedScale",sharedScale},{"swigluLimit",.8f}},ip);
+                shared.resize(size_t(rows)*hidden);
+                for (size_t j=0;j<shared.size();++j) shared[j]=sy.dataType==FLOAT32 ?
+                    ((float*)sy.cpuData)[j] : BFloat16BitsToFloat32(((uint16_t*)sy.cpuData)[j]);
+            }
             for (int r=0; r<rows; ++r) {
                 std::vector<int> order(topk);
                 for (int k=0; k<topk; ++k) order[k]=k;
@@ -135,10 +159,12 @@ struct Fixture {
                     xi.FakeFrom(x,size_t(r)*hidden*2); xi.Resize({1,hidden});
                     ii.FakeFrom(ids,size_t(r*topk+k)*4); ii.Resize({1,1});
                     ss.FakeFrom(scores,size_t(r*topk+k)*4); ss.Resize({1,1});
-                    DoCudaMergeMOEV41Fallback(xi,out,ii,ss,gpu.data(),gpu.size(),0,.8f);
+                    DoCudaMergeMOEV41Fallback(xi,out,ii,ss,routedWeights.data(),routedWeights.size(),0,.8f);
                     out.ToDevice(CPU);
                     for (int c=0; c<hidden; ++c) sum[c]+=((float *)out.cpuData)[c];
                 }
+                if (!shared.empty())
+                    for (int j=0;j<hidden;++j) sum[j]+=shared[size_t(r)*hidden+j];
                 for (int c=0; c<hidden; ++c)
                     ((uint16_t *)y.cpuData)[r*hidden+c]=Float32ToBFloat16RNEBits(sum[c]);
             }
@@ -232,8 +258,13 @@ static void TestPrefillWorkingSet(Fixture &f, int device) {
 static void TestNativeLayout(Fixture &f, int device, bool compareLegacy = false) {
     FastllmCudaSetDevice(device);
     const size_t downOffset = f.gpu[2]->GetBytes(), stride = f.bytes;
-    Data canonical(INT8, {int(stride*2)}), native(INT8, {int(stride*2)});
-    canonical.Allocate(false); native.Allocate(false);
+    Data canonical(INT8, {int(stride*2)}), native(INT8, {int(stride*2)}), packed(INT8, {int(stride*2)});
+    canonical.Allocate(false); native.Allocate(false); packed.Allocate(false);
+    auto packedType = [](int type) {
+        return type == GGML_TYPE_IQ2_XXS ? int(GGML_TYPE_IQ2_XXS_R4) :
+            type == GGML_TYPE_IQ2_XS ? int(GGML_TYPE_IQ2_XS_R4) :
+            type == GGML_TYPE_IQ2_S ? int(GGML_TYPE_IQ2_S_R4) : type;
+    };
     for (int e=0; e<2; ++e) {
         auto *dst = canonical.cpuData+size_t(e)*stride;
         FastllmCudaCopyFromDeviceToHost(dst, f.gpu[2+2*e]->cudaData, downOffset);
@@ -244,11 +275,23 @@ static void TestNativeLayout(Fixture &f, int device, bool compareLegacy = false)
             memcpy(packed+size_t(2*(row%f.inter)+row/f.inter)*rowBytes, dst+size_t(row)*rowBytes, rowBytes);
         memcpy(packed+downOffset, dst+downOffset, stride-downOffset);
     }
-    canonical.ToDevice(CUDA,{device},true); native.ToDevice(CUDA,{device},true);
+    for (int e=0; e<2; ++e) for (int part=0; part<2; ++part) {
+        const auto &w = *f.gpu[2+2*e+part];
+        const size_t offset = size_t(e)*stride + (part ? downOffset : 0);
+        if (packedType(w.ggmlType) != w.ggmlType) {
+            const auto *repack = get_repack_info(ggml_type(w.ggmlType));
+            const Repack iq2Fixture{GGML_TYPE_IQ2_S_R4,4,PackIQ2SR4Fixture};
+            if (!repack && w.ggmlType == GGML_TYPE_IQ2_S) repack = &iq2Fixture;
+            Check(repack != nullptr,"missing native-layout fixture packer");
+            repack->repack(w.dims[0],w.dims[1],
+                (const char*)native.cpuData+offset,(char*)packed.cpuData+offset,false);
+        } else memcpy(packed.cpuData+offset,native.cpuData+offset,w.GetBytes());
+    }
+    canonical.ToDevice(CUDA,{device},true); native.ToDevice(CUDA,{device},true); packed.ToDevice(CUDA,{device},true);
     const size_t workspaceBytes = FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(f.hidden,f.inter);
     Data scratch(INT8,{int(workspaceBytes)});
     scratch.ToDevice(CUDA,{device},false); scratch.Allocate(false);
-    for (int rows : {1,6,8}) for (bool compact : {false,true}) {
+    for (int rows : {1,2,3,4,5,6,7,8}) for (bool compact : {false,true}) {
         constexpr int topk=6;
         const int routes=compact ? rows*topk/2 : rows*topk;
         Data input(BFLOAT16,{rows,f.hidden}), scores(FLOAT32,{rows,topk});
@@ -271,14 +314,14 @@ static void TestNativeLayout(Fixture &f, int device, bool compareLegacy = false)
         view.workspace=scratch.cudaData; view.workspaceBytes=workspaceBytes;
         if (compact) { view.routeMap=(int32_t*)map.cudaData; view.routeCount=routes; }
         std::vector<uint8_t> expected;
-        for (int variant = 0; variant < (compareLegacy ? 3 : 2); ++variant) {
-            const bool interleaved = variant == (compareLegacy ? 2 : 1);
+        for (int variant = 0; variant < (compareLegacy ? 4 : 3); ++variant) {
+            const int layout = compareLegacy ? std::max(0, variant-1) : variant;
             if (compareLegacy) setenv("FASTLLM_V41_GGUF_LEGACY", variant == 0 ? "1" : "0", 1);
             std::fill_n((float*)output.cpuData, rows*topk*f.hidden, 17.f);
             output.ToDevice(CUDA,{device},true);
-            view.records=(uint8_t*)(interleaved ? native.cudaData : canonical.cudaData);
-            view.numaGateType=interleaved ? view.gateType : -1;
-            view.numaDownType=interleaved ? view.downType : -1;
+            view.records=(uint8_t*)(layout == 2 ? packed.cudaData : layout == 1 ? native.cudaData : canonical.cudaData);
+            view.numaGateType=layout == 2 ? packedType(view.gateType) : layout == 1 ? view.gateType : -1;
+            view.numaDownType=layout == 2 ? packedType(view.downType) : layout == 1 ? view.downType : -1;
             Check(FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,activation,view,
                 (float*)scores.cudaData,topk,.8f,(float*)output.cudaData),"native cache adapter rejected");
             output.ToDevice(CPU);
@@ -289,7 +332,7 @@ static void TestNativeLayout(Fixture &f, int device, bool compareLegacy = false)
         view.numaGateType=GGML_TYPE_Q2_K_R4;
         Check(!FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,activation,view,
             (float*)scores.cudaData,topk,.8f,(float*)output.cudaData),"R4 native layout accepted");
-        view.numaGateType=-1;
+        view.numaGateType=-1; view.numaDownType=view.downType;
         Check(!FastllmCudaMoeV41CanonicalGGUFCacheCompute(input,activation,view,
             (float*)scores.cudaData,topk,.8f,(float*)output.cudaData),"partial native layout accepted");
     }
@@ -333,6 +376,64 @@ static void TestCanonicalDecode(Fixture &f) {
     }
     Compare(actual,reference,0);
     puts("PASS: canonical whole-layer CPU decode equals per-expert oracle");
+    // Cover arbitrary small batches and the eight-row dot tile's tails. Each
+    // route may select a different expert; duplicates must remain independent.
+    for (int rows : {1,2,3,4,5,6,7,8,9,17,31,32}) {
+        std::vector<float> batch(size_t(rows)*f.hidden), got(batch.size()), expected(batch.size());
+        std::vector<int32_t> batchIds(rows);
+        std::vector<float> batchScores(rows);
+        for (int r=0; r<rows; ++r) {
+            batchIds[r]=ids[r%n]; batchScores[r]=scores[r%n];
+            for (int c=0; c<f.hidden; ++c)
+                batch[size_t(r)*f.hidden+c]=RoundFloat32ToBFloat16RNE(std::sin((r*f.hidden+c)*.31f)*3);
+            Check(HostMoeCanonicalV41Decode(batch.data()+size_t(r)*f.hidden,
+                expected.data()+size_t(r)*f.hidden,weights.data(),weights.size(),
+                &batchIds[r],&batchScores[r],1,.8f),"canonical row oracle rejected");
+        }
+        Check(HostMoeCanonicalV41Batch(batch.data(),got.data(),rows,weights.data(),weights.size(),
+            batchIds.data(),batchScores.data(),.8f),"canonical CPU batch rejected");
+        Compare(got,expected,0);
+    }
+    puts("PASS: canonical CPU batches 1,2,3,4,5,6,7,8,9,17,31,32 equal row oracle");
+}
+
+// The shared route must neither disable routed batching nor enter its scored
+// arithmetic. A zero shared expert isolates the routed result exactly.
+static void TestSharedRoute(Fixture &f, int device) {
+    SetMoeCpuCacheBytes(1ULL<<30); SetMoeCudaCacheBytes(0); TrimDiskMoeCache();
+    Data gate(FLOAT32,{2*f.inter,f.hidden}), down(FLOAT32,{f.hidden,f.inter});
+    gate.Allocate(0.f); down.Allocate(0.f);
+    for (int rows : {1,2,3,4,5,6,8,9,17,32}) {
+        auto expected=f.Run(true,rows,0,device);
+        f.disk[0]=&gate; f.disk[1]=&down;
+        auto actual=f.Run(true,rows,0,device);
+        f.disk[0]=f.disk[1]=nullptr;
+        Compare(actual,expected,0);
+    }
+    puts("PASS: shared expert preserves routed CPU batching");
+}
+
+static void TestSharedResident(Fixture &f, int device) {
+    SetMoeCpuCacheBytes(1ULL<<30); SetMoeCudaCacheBytes(f.bytes*f.experts); TrimDiskMoeCache();
+    for (int pass=0;pass<2*f.experts;++pass) f.Run(true,1,pass%2,device,8);
+    Data gate(FLOAT32,{2*f.inter,f.hidden}), down(FLOAT32,{f.hidden,f.inter});
+    gate.Allocate(false); down.Allocate(false);
+    for (size_t i=0;i<gate.Count(0);++i) ((float*)gate.cpuData)[i]=.01f*std::sin(i*.17f);
+    for (size_t i=0;i<down.Count(0);++i) ((float*)down.cpuData)[i]=.01f*std::cos(i*.13f);
+    f.gpu[0]=f.disk[0]=&gate; f.gpu[1]=f.disk[1]=&down;
+    const auto before=GetDiskMoeCacheStats();
+    for (int rows : {1,2,3,4,5,6,7,8,9,17,32,33})
+        Compare(f.Run(true,rows,0,device,6,false,false,-1,.37f),
+                f.Run(false,rows,0,device,6,false,false,-1,.37f),0);
+    Check(GetDiskMoeCacheStats().cudaHits>before.cudaHits,"shared batch did not hit GPU cache");
+    Check(GetDiskMoeCacheStats().diskBytes==before.diskBytes,"resident shared batch read disk");
+    // Leave both GPU and CPU contributions in the same per-route reduction.
+    SetMoeCudaCacheBytes(3*f.bytes); TrimDiskMoeCache();
+    for (int rows : {1,3,6,9,17,32})
+        Compare(f.Run(true,rows,0,device,6,false,false,-1,.37f),
+                f.Run(false,rows,0,device,6,false,false,-1,.37f),.06);
+    f.gpu[0]=f.gpu[1]=f.disk[0]=f.disk[1]=nullptr;
+    puts("PASS: nonzero shared expert with resident and mixed GGUF routes");
 }
 
 // Exercise cached decode on both GPUs without admitting every miss.
@@ -385,7 +486,7 @@ static void TestCooperativeDecode(Fixture &f, bool compareLegacy = false) {
     bool dual=false, resident=false, checkedPayload=false;
     uint64_t totalGpu=0, totalCpu=0, totalHits=0, totalAdmissions=0;
     for (int pass=0; pass<64; ++pass) {
-        const int rows=pass%5==4 ? 6 : 1, topk=3, device=pass%2, offset=3*(pass/8);
+        const int rows=pass%5==4 ? 2+(pass/5)%7 : 1, topk=3, device=pass%2, offset=3*(pass/8);
         FastllmCudaSetDevice(device);
         Data x(BFLOAT16,{rows,f.hidden}),ids(INT32,{rows,topk}),scores(FLOAT32,{rows,topk}),out;
         x.Allocate(false);ids.Allocate(false);scores.Allocate(false);
@@ -503,7 +604,7 @@ static void TestTunedDecode() {
                     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS}) {
         for (auto shape : {std::pair<int,int>{1024,1024}, {5120,2304}}) {
             Fixture f(type,type,0,shape.first,shape.second,6);
-            for (int rows : {1,8}) {
+            for (int rows : {1,2,3,4,5,6,7,8,9,17,32}) {
                 setenv("FASTLLM_V41_GGUF_LEGACY","1",1);
                 auto reference=f.Run(false,rows,0,0,6,true);
                 setenv("FASTLLM_V41_GGUF_LEGACY","0",1);
@@ -546,9 +647,74 @@ static void TestTunedHybrid() {
 }
 #endif
 
+static void TestDiskDecodeHandoff() {
+    for (auto types : {std::pair<int,int>{GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XXS},
+                       {GGML_TYPE_IQ1_M,GGML_TYPE_IQ2_XS}}) {
+        Fixture f(types.first,types.second,0,512,256,12);
+        for (int gpuRecords : {0,2,12}) {
+            SetMoeCpuCacheBytes(0);SetMoeCudaCacheBytes(0);TrimDiskMoeCache();
+            SetMoeCpuCacheBytes(1ULL<<30);SetMoeCudaCacheBytes(f.bytes*gpuRecords);
+            for (int i=0;i<48;++i) f.Run(true,1,i%f.experts,0,6,false,true);
+            auto before=GetDiskMoeCacheStats();
+            for (int i=0;i<5;++i) {
+                // Same expert kernels/order/rounding with CPU or CUDA I/O,
+                // including duplicate routes (top-k > expert count below).
+                const auto reference=f.Run(true,1,i,0);
+                Compare(f.Run(true,1,i,0,6,false,true),reference,0);
+            }
+            auto after=GetDiskMoeCacheStats();
+            Check(after.decodeOutputH2DCopies>=before.decodeOutputH2DCopies+5,"decode upload adapter bypassed");
+            Check(after.cpuBytes+after.cpuWorkspaceBytes<=GetMoeCpuCacheBytes(),"handoff RAM budget");
+            // Resident weights must be rejected by this disk-only entry point.
+            Data x(BFLOAT16,{1,512}),ids(INT32,{1,1}),scores(FLOAT32,{1,1}),out;
+            DiskMergeMOE op;
+            Check(!op.RunGpuDecode(x,ids,scores,out,f.gpu,.8f),"accepted non-disk weights");
+        }
+    }
+    Fixture duplicate(GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ1_M,0,512,256,4);
+    SetMoeCpuCacheBytes(1ULL<<30);SetMoeCudaCacheBytes(duplicate.bytes*2);TrimDiskMoeCache();
+    for(int i=0;i<40;++i)duplicate.Run(true,1,i%4,0,8,false,true);
+    for(int i=0;i<8;++i) {
+        const auto reference=duplicate.Run(true,1,i,0,8);
+        Compare(duplicate.Run(true,1,i,0,8,false,true),reference,0);
+    }
+    SetMoeCpuCacheBytes(0);SetMoeCudaCacheBytes(0);TrimDiskMoeCache();
+    puts("PASS: disk decode pinned handoff, mixed tiers, duplicate routes and non-disk rejection");
+}
+
+static void TestColdBatchBound() {
+    // The cold routed set exceeds the bounded batch's weight leases.
+    // Remaining experts must stream without deadlocking or rereading.
+    Fixture f(GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ1_M,0,5120,2304,24);
+    SetMoeCpuCacheBytes(0); SetMoeCudaCacheBytes(0); TrimDiskMoeCache();
+    const auto before=GetDiskMoeCacheStats();
+    Compare(f.Run(true,32,0,0,1),f.Run(false,32,0,0,1),.06);
+    Check(GetDiskMoeCacheStats().diskBytes-before.diskBytes==24*f.bytes,
+          "bounded cold batch reread expert");
+}
+
 int main(int argc, char **argv) { try {
     if (FastllmCudaGetDeviceCount()<1) return 77;
     SetThreads(4);
+    if (argc > 1 && !strcmp(argv[1], "--disk-decode-handoff")) { TestDiskDecodeHandoff(); return 0; }
+#ifdef USE_NUMAS
+    if (argc > 1 && !strcmp(argv[1], "--iq2-batch")) {
+        for (int type : {GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XS}) {
+            Fixture f(type,type,0);
+            TestCanonicalDecode(f);
+            TestCooperativeDecode(f);
+        }
+        puts("PASS: IQ2 canonical and NUMA multirow integration");
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--shared-resident")) {
+        for (int device=0;device<std::min(2,FastllmCudaGetDeviceCount());++device) {
+            Fixture f(GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XS,device);
+            TestSharedResident(f,device);
+        }
+        return 0;
+    }
+#endif
     if (argc > 1 && !strcmp(argv[1], "--tuned")) { TestTunedDecode(); return 0; }
 #ifdef USE_NUMAS
     if (argc > 1 && !strcmp(argv[1], "--tuned-hybrid")) {
@@ -575,6 +741,7 @@ int main(int argc, char **argv) { try {
             TestNativeLayout(f,device);
 #ifdef USE_NUMAS
             TestCanonicalDecode(f);
+            TestSharedRoute(f,device);
 #endif
             TestPreload(f,device);
             TestPrefillWorkingSet(f,device);
@@ -597,7 +764,7 @@ int main(int argc, char **argv) { try {
             Check(PreloadDiskMoeCache({f.disk})==0 && GetDiskMoeCacheStats().diskBytes==warm.diskBytes,
                   "preload duplicated GPU-resident GGUF experts");
             // Exactly matches the native decode oracle after all routes hit.
-            for (int rows : {1,5,8,9,33}) Compare(f.Run(true,rows,0,device),f.Run(false,rows,0,device,6,rows > 32),0);
+            for (int rows : {1,2,3,4,5,6,8,9,33}) Compare(f.Run(true,rows,0,device),f.Run(false,rows,0,device,6,rows > 32),0);
             // Shrink VRAM with RAM headroom: every canonical record must
             // survive eviction without another disk read or requantization.
             auto beforeDemotion = GetDiskMoeCacheStats();
@@ -667,6 +834,7 @@ int main(int argc, char **argv) { try {
             }
         }
     }
+    TestColdBatchBound();
     {
         // More than three eight-expert groups wrap both upload rings. Mixed
         // cache hits, duplicate routes and partial tiles retain ID-order sums.

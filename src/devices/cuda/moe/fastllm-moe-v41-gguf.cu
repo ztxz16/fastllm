@@ -40,8 +40,8 @@ __global__ void V41GGUFQuantize(const __nv_bfloat16 *input, block_q8_1 *output, 
 
 // Keep projection dispatch inline: sharing the fused gate/up helper changes
 // NVCC register allocation for generic projection kernels despite equal math.
-template<ggml_type Type, int VirtualWarps = 4, int LaneWidth = 32>
-__device__ __forceinline__ float V41GGUFDot(const void *weight, const block_q8_1 *x, int columns, const uint32_t *iqGrid) {
+template<ggml_type Type, int VirtualWarps = 4, int LaneWidth = 32, bool Packed = false>
+__device__ __forceinline__ float V41GGUFDot(const void *weight, const block_q8_1 *x, int columns, const uint32_t *iqGrid, int packedRow = 0) {
     if constexpr (Type == GGML_TYPE_Q2_0) {
         return gguf_cache_q8::RowDot<Type>(weight, x, columns, nullptr);
     } else {
@@ -65,11 +65,11 @@ __device__ __forceinline__ float V41GGUFDot(const void *weight, const block_q8_1
                 else if constexpr (Type == GGML_TYPE_IQ1_M)
                     value += vec_dot_iq1_m_q8_1_grid(weight, x+b*8, b, vdr*(tid%(qi/vdr)), iqGrid);
                 else if constexpr (Type == GGML_TYPE_IQ2_XXS)
-                    value += iq2_decode::DotXXS<(VirtualWarps != 4)>(weight, x+b*8, b, vdr*(tid%(qi/vdr)), reinterpret_cast<const uint64_t *>(iqGrid));
+                    value += iq2_decode::DotXXS<(VirtualWarps != 4), Packed>(weight, x+b*8, b, vdr*(tid%(qi/vdr)), reinterpret_cast<const uint64_t *>(iqGrid), packedRow);
                 else if constexpr (Type == GGML_TYPE_IQ2_XS)
-                    value += iq2_decode::DotXS<(VirtualWarps != 4)>(weight, x+b*8, b, vdr*(tid%(qi/vdr)), reinterpret_cast<const uint64_t *>(iqGrid));
+                    value += iq2_decode::DotXS<(VirtualWarps != 4), Packed>(weight, x+b*8, b, vdr*(tid%(qi/vdr)), reinterpret_cast<const uint64_t *>(iqGrid), packedRow);
                 else if constexpr (Type == GGML_TYPE_IQ2_S)
-                    value += iq2_decode::DotS<(VirtualWarps != 4)>(weight, x+b*8, b, vdr*(tid%(qi/vdr)), reinterpret_cast<const uint64_t *>(iqGrid));
+                    value += iq2_decode::DotS<(VirtualWarps != 4), Packed>(weight, x+b*8, b, vdr*(tid%(qi/vdr)), reinterpret_cast<const uint64_t *>(iqGrid), packedRow);
                 else if constexpr (Type == GGML_TYPE_Q3_K)
                     value += fastllm_gguf_q3_k::Dot(weight, x+b*8, b, vdr*(tid%(qi/vdr)));
                 else value += get_vec_dot_q_cuda(Type)(weight, x+b*8, b, vdr*(tid%(qi/vdr)));
@@ -105,18 +105,18 @@ __device__ __forceinline__ float V41GGUFDot(const void *weight, const block_q8_1
     }
 }
 
-template<ggml_type Type>
-__device__ __forceinline__ float V41BlockDot(const void *weight,const block_q8_1 *x,int b,int q,const uint32_t*grid) {
+template<ggml_type Type, bool Packed = false>
+__device__ __forceinline__ float V41BlockDot(const void *weight,const block_q8_1 *x,int b,int q,const uint32_t*grid,int packedRow = 0) {
     if constexpr(Type==GGML_TYPE_IQ1_S)return vec_dot_iq1_s_q8_1_grid(weight,x+b*8,b,q,grid);
     else if constexpr(Type==GGML_TYPE_IQ1_M)return vec_dot_iq1_m_q8_1_grid(weight,x+b*8,b,q,grid);
-    else if constexpr(Type==GGML_TYPE_IQ2_XXS)return iq2_decode::DotXXS<true>(weight,x+b*8,b,q,reinterpret_cast<const uint64_t*>(grid));
-    else if constexpr(Type==GGML_TYPE_IQ2_XS)return iq2_decode::DotXS<true>(weight,x+b*8,b,q,reinterpret_cast<const uint64_t*>(grid));
-    else if constexpr(Type==GGML_TYPE_IQ2_S)return iq2_decode::DotS<true>(weight,x+b*8,b,q,reinterpret_cast<const uint64_t*>(grid));
+    else if constexpr(Type==GGML_TYPE_IQ2_XXS)return iq2_decode::DotXXS<true,Packed>(weight,x+b*8,b,q,reinterpret_cast<const uint64_t*>(grid),packedRow);
+    else if constexpr(Type==GGML_TYPE_IQ2_XS)return iq2_decode::DotXS<true,Packed>(weight,x+b*8,b,q,reinterpret_cast<const uint64_t*>(grid),packedRow);
+    else if constexpr(Type==GGML_TYPE_IQ2_S)return iq2_decode::DotS<true,Packed>(weight,x+b*8,b,q,reinterpret_cast<const uint64_t*>(grid),packedRow);
     else if constexpr(Type==GGML_TYPE_Q3_K)return fastllm_gguf_q3_k::Dot(weight,x+b*8,b,q);
     else return get_vec_dot_q_cuda(Type)(weight,x+b*8,b,q);
 }
-template<ggml_type Type,int LaneWidth>
-__device__ __forceinline__ float2 V41PairDot(const void *gate,const void *up,const block_q8_1*x,int columns,const uint32_t*grid) {
+template<ggml_type Type,int LaneWidth,bool Packed = false>
+__device__ __forceinline__ float2 V41PairDot(const void *gate,const void *up,const block_q8_1*x,int columns,const uint32_t*grid,int gateRow = 0,int upRow = 0) {
     if constexpr(Type==GGML_TYPE_Q2_0)return make_float2(V41GGUFDot<Type,1,LaneWidth>(gate,x,columns,grid),V41GGUFDot<Type,1,LaneWidth>(up,x,columns,grid));
     else {
         constexpr int qi=[] {
@@ -134,8 +134,8 @@ __device__ __forceinline__ float2 V41PairDot(const void *gate,const void *up,con
             const int tid=lane+LaneWidth*w,q=vdr*(tid%(qi/vdr));
             float g=0,u=0;
             for(int b=tid/(qi/vdr);b<columns/256;b+=step*4) {
-                g+=V41BlockDot<Type>(gate,x,b,q,grid);
-                u+=V41BlockDot<Type>(up,x,b,q,grid);
+                g+=V41BlockDot<Type,Packed>(gate,x,b,q,grid,gateRow);
+                u+=V41BlockDot<Type,Packed>(up,x,b,q,grid,upRow);
             }
             pg[w]=g;pu[w]=u;
         }
@@ -221,6 +221,12 @@ __global__ void V41EpSwigluQ8(const __nv_bfloat16 *gateup, block_q8_1 *output,
     V41StoreQ8(x, output[size_t(route)*(inter/32)+c/32], c%32);
 }
 
+template<class Weights> __device__ bool V41WeightPacked(Weights, bool) { return false; }
+__device__ bool V41WeightPacked(const FastllmCudaMoeGGUFCacheView &view, bool gate) {
+    const int storage = gate ? view.numaGateType : view.numaDownType;
+    return storage >= 0 && storage != (gate ? view.gateType : view.downType);
+}
+
 template<ggml_type Type, bool Gate, class Weights, int RowsPerBlock = 8, int StaticColumns = 0, int VirtualWarps = 4, int LaneWidth = 32>
 __global__ void V41GGUFProjection(const block_q8_1 *input, __nv_bfloat16 *output,
         Weights weights, const int32_t *indices,
@@ -256,8 +262,19 @@ __global__ void V41GGUFProjection(const block_q8_1 *input, __nv_bfloat16 *output
         activation[i] = reinterpret_cast<const uint32_t *>(x)[i];
     __syncthreads();
     for (int row = firstRow; row < rows && row < (blockIdx.x+1)*RowsPerBlock; row += 256/LaneWidth) {
-        const float value = V41GGUFDot<Type, VirtualWarps, LaneWidth>(weight+size_t(V41WeightRow(weights, row, rows, Gate))*rowBytes,
-            reinterpret_cast<const block_q8_1 *>(activation), columns, iqGrid);
+        const int sourceRow = V41WeightRow(weights, row, rows, Gate);
+        float value;
+        if constexpr (Type == GGML_TYPE_IQ2_XXS || Type == GGML_TYPE_IQ2_XS || Type == GGML_TYPE_IQ2_S) {
+            if (V41WeightPacked(weights, Gate))
+                value = V41GGUFDot<Type, VirtualWarps, LaneWidth, true>(weight+size_t(sourceRow/4)*4*rowBytes,
+                    reinterpret_cast<const block_q8_1 *>(activation), columns, iqGrid, sourceRow%4);
+            else
+                value = V41GGUFDot<Type, VirtualWarps, LaneWidth>(weight+size_t(sourceRow)*rowBytes,
+                    reinterpret_cast<const block_q8_1 *>(activation), columns, iqGrid);
+        } else {
+            value = V41GGUFDot<Type, VirtualWarps, LaneWidth>(weight+size_t(sourceRow)*rowBytes,
+                reinterpret_cast<const block_q8_1 *>(activation), columns, iqGrid);
+        }
         if (threadIdx.x%LaneWidth == 0) output[size_t(route)*rows+row] = __float2bfloat16_rn(value);
     }
 }
@@ -289,10 +306,21 @@ __device__ __forceinline__ void V41GGUFGateUpActBody(const block_q8_1 *input, __
         const int row = blockIdx.x*Tile+r;
         float g=0, u=0;
         if (weight && row < inter) {
-            const auto pair=V41PairDot<Type,LaneWidth>(
-                weight+size_t(V41WeightRow(weights,row,2*inter,true))*rowBytes,
-                weight+size_t(V41WeightRow(weights,row+inter,2*inter,true))*rowBytes,
-                reinterpret_cast<const block_q8_1 *>(activation),columns,iqGrid);
+            const int gateRow = V41WeightRow(weights,row,2*inter,true);
+            const int upRow = V41WeightRow(weights,row+inter,2*inter,true);
+            float2 pair;
+            if constexpr (Type == GGML_TYPE_IQ2_XXS || Type == GGML_TYPE_IQ2_XS || Type == GGML_TYPE_IQ2_S) {
+                if (V41WeightPacked(weights,true))
+                    pair=V41PairDot<Type,LaneWidth,true>(
+                        weight+size_t(gateRow/4)*4*rowBytes,weight+size_t(upRow/4)*4*rowBytes,
+                        reinterpret_cast<const block_q8_1 *>(activation),columns,iqGrid,gateRow%4,upRow%4);
+                else
+                    pair=V41PairDot<Type,LaneWidth>(weight+size_t(gateRow)*rowBytes,weight+size_t(upRow)*rowBytes,
+                        reinterpret_cast<const block_q8_1 *>(activation),columns,iqGrid);
+            } else {
+                pair=V41PairDot<Type,LaneWidth>(weight+size_t(gateRow)*rowBytes,weight+size_t(upRow)*rowBytes,
+                    reinterpret_cast<const block_q8_1 *>(activation),columns,iqGrid);
+            }
             g=pair.x;u=pair.y;
         }
         if (threadIdx.x%LaneWidth==0) {
@@ -543,6 +571,16 @@ bool FastllmCudaV41GGUFSupported(int gateType, int downType) {
     };
     return supported(gateType) && supported(downType);
 }
+bool FastllmCudaV41GGUFNumaSupported(int gateType, int downType, int numaGateType, int numaDownType) {
+    const auto matches = [](int canonical, int storage) {
+        return canonical == storage ||
+            (canonical == GGML_TYPE_IQ2_XXS && storage == GGML_TYPE_IQ2_XXS_R4) ||
+            (canonical == GGML_TYPE_IQ2_XS && storage == GGML_TYPE_IQ2_XS_R4) ||
+            (canonical == GGML_TYPE_IQ2_S && storage == GGML_TYPE_IQ2_S_R4);
+    };
+    return FastllmCudaV41GGUFSupported(gateType, downType) &&
+        matches(gateType, numaGateType) && matches(downType, numaDownType);
+}
 size_t FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(int hidden, int inter) {
     if (hidden <= 0 || inter <= 0 || hidden%256 || inter%256) return 0;
     // Decode and DSpark verification, at most eight rows and sixteen routes/row.
@@ -560,7 +598,7 @@ bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
         (!view.records && !view.recordPointers) || !view.routeSlots || !view.workspace || !scores || !perExpert ||
         view.activeRouteCount || (view.routeMap && (view.routeCount < 1 || view.routeCount > input.dims[0]*topk)) ||
         !((view.numaGateType < 0 && view.numaDownType < 0) ||
-          (view.numaGateType == view.gateType && view.numaDownType == view.downType)))
+          FastllmCudaV41GGUFNumaSupported(view.gateType, view.downType, view.numaGateType, view.numaDownType)))
         return false;
     const int rows = input.dims[0], routes = view.routeMap ? view.routeCount : rows*topk;
     const int hidden = view.hidden, inter = view.inter;

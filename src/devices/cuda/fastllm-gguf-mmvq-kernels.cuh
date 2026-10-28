@@ -39,12 +39,39 @@ static __device__ void mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
-        if constexpr (type == GGML_TYPE_Q5_K && ncols_y >= 2 && ncols_y <= 4) {
-            const FastllmQ5MmvqFragment fragment(
-                ((const block_q5_K *)vx)[row0 * blocks_per_row_x + kbx], kqs);
+        if constexpr (type == GGML_TYPE_Q5_K && ncols_y >= 2) {
 #pragma unroll
-            for (int j = 0; j < ncols_y; ++j)
-                tmp[j][0] += fragment.Dot(&y[j * blocks_per_col_y + kby], kqs);
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                if (row0 + i < nrows_x) {
+                    const FastllmQ5MmvqFragment fragment(
+                        ((const block_q5_K *)vx)[(row0 + i) * blocks_per_row_x + kbx], kqs);
+#pragma unroll
+                    for (int j = 0; j < ncols_y; ++j)
+                        tmp[j][i] += fragment.Dot(&y[j * blocks_per_col_y + kby], kqs);
+                }
+            }
+        } else if constexpr (type == GGML_TYPE_Q8_0 && ncols_y >= 2) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                if (row0 + i < nrows_x) {
+                    const auto &weight = static_cast<const block_q8_0 *>(vx)[(row0+i)*blocks_per_row_x+kbx];
+                    const float scale = __half2float(weight.d);
+                    int packed[VDR_Q8_0_Q8_1_MMVQ];
+#pragma unroll
+                    for (int k = 0; k < VDR_Q8_0_Q8_1_MMVQ; ++k)
+                        packed[k] = get_int_b2(weight.qs, kqs+k);
+#pragma unroll
+                    for (int j = 0; j < ncols_y; ++j) {
+                        const auto &activation = y[j*blocks_per_col_y+kby];
+                        int values[VDR_Q8_0_Q8_1_MMVQ];
+#pragma unroll
+                        for (int k = 0; k < VDR_Q8_0_Q8_1_MMVQ; ++k)
+                            values[k] = get_int_b4(activation.qs, kqs+k);
+                        tmp[j][i] += vec_dot_q8_0_q8_1_impl<float,VDR_Q8_0_Q8_1_MMVQ>(
+                            packed, values, scale, __low2float(activation.ds));
+                    }
+                }
+            }
         } else if constexpr (type == GGML_TYPE_Q6_K && ncols_y >= 2 && ncols_y <= 4) {
             const FastllmQ6MmvqFragment fragment(
                 ((const block_q6_K *)vx)[row0 * blocks_per_row_x + kbx], kqs);
@@ -188,31 +215,39 @@ static void mul_mat_vec_q_cuda_T(
 #include "fastllm-gguf-small-mmvq.cuh"
 #endif
 
-// Pack independent decode outputs into one CTA while retaining the legacy
-// four-warp dot-product and reduction order in four virtual warp groups.
-// This reduces CTA scheduling overhead for short Q4_K and broad Q5_K/Q6_K projections.
-template <ggml_type type, typename Output, int Inputs = 1, int StoreMode = 0>
+// Pack independent outputs into one CTA while retaining the legacy dot-product
+// order. Exact batches use four virtual warp groups; ordinary B5-B8 uses one.
+template <ggml_type type, typename Output, int Inputs = 1, int StoreMode = 0,
+          int ReductionWarps = 4>
 static __global__ void FastllmGgufMmvqWarpRows(
         const void * __restrict__ weights, const block_q8_1 * __restrict__ input,
         Output * __restrict__ output, int columns, int rows, int inputStride, int outputStride) {
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     constexpr int qi = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
-    constexpr int blocksPerIter = vdr * 4 * WARP_SIZE / qi;
+    static_assert(ReductionWarps == 1 || ReductionWarps == 4, "invalid reduction width");
+    constexpr int blocksPerIter = vdr * ReductionWarps * WARP_SIZE / qi;
     constexpr vec_dot_q_cuda_t dot = get_vec_dot_q_cuda(type);
     const int blocksPerRow = columns / qk;
     const int row = blockIdx.x * 4 + threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     if (row >= rows) return;
-    float partial[Inputs][4] = {};
+    float partial[Inputs][ReductionWarps] = {};
 #pragma unroll
-    for (int warp = 0; warp < 4; ++warp) {
+    for (int warp = 0; warp < ReductionWarps; ++warp) {
         const int tid = warp * WARP_SIZE + lane;
         const int qs = vdr * (tid % (qi / vdr));
         for (int block = tid / (qi / vdr); block < blocksPerRow; block += blocksPerIter) {
             if constexpr (Inputs == 1) {
                 partial[0][warp] += dot(weights, input + block * (qk / QK8_1),
                     row * blocksPerRow + block, qs);
+            } else if constexpr (type == GGML_TYPE_Q5_K) {
+                const FastllmQ5MmvqFragment fragment(
+                    static_cast<const block_q5_K *>(weights)[row * blocksPerRow + block], qs);
+#pragma unroll
+                for (int j = 0; j < Inputs; ++j)
+                    partial[j][warp] += fragment.Dot(
+                        input + j * (inputStride / QK8_1) + block * (qk / QK8_1), qs);
             } else {
                 const FastllmQ6MmvqFragment fragment(
                     static_cast<const block_q6_K *>(weights)[row * blocksPerRow + block], qs);
@@ -225,7 +260,10 @@ static __global__ void FastllmGgufMmvqWarpRows(
     }
 #pragma unroll
     for (int j = 0; j < Inputs; ++j) {
-        const float sum = warp_reduce_sum(((partial[j][0] + partial[j][1]) + partial[j][2]) + partial[j][3]);
+        float sum = partial[j][0];
+#pragma unroll
+        for (int warp = 1; warp < ReductionWarps; ++warp) sum += partial[j][warp];
+        sum = warp_reduce_sum(sum);
         if (lane == 0) FastllmGgufStore<StoreMode>(output + j * outputStride + row, sum);
     }
 }
@@ -242,6 +280,34 @@ void mul_mat_vec_q_cuda(
             fastllm_gguf_q4_k::Supports(vx, vy, ncols_x, nrows_x)) {
             fastllm_gguf_q4_k::Launch(vx, static_cast<const block_q8_1 *>(vy), dst,
                                      ncols_x, nrows_x, stream);
+            return;
+        }
+    }
+    if constexpr (StoreMode == 0 && type == GGML_TYPE_Q5_K) {
+        // Pack four output channels per CTA. Preserve the original one-warp
+        // reduction for ordinary B5-B8, and four-warp reduction for B2-B4 or
+        // an explicitly requested exact batch.
+        // Wider K and small output matrices retain the existing kernel.
+        if (ncols_y >= 2 && ncols_y <= 8 &&
+            ne2 == 1 && !ids_data && nrows_dst >= nrows_x &&
+            ncols_x >= 1280 && ncols_x <= 2560 && nrows_x >= 2048 &&
+            FastllmCudaRuntimeArch() == 75) {
+#define Q5_WARP_LAUNCH(B, W) \
+            FastllmGgufMmvqWarpRows<type, OType, B, 0, W><<<(nrows_x + 3) / 4, 128, 0, stream>>>( \
+                vx, static_cast<const block_q8_1 *>(vy), dst, ncols_x, nrows_x, nrows_y, nrows_dst)
+#define Q5_WARP_ROWS(B) case B: { \
+            if constexpr (B > 4) { \
+                if (B >= fastllm::FastllmCudaGetLinearExactBatchThreshold()) { \
+                    Q5_WARP_LAUNCH(B, 1); break; \
+                } \
+            } \
+            Q5_WARP_LAUNCH(B, 4); break; }
+            switch (ncols_y) {
+                Q5_WARP_ROWS(2); Q5_WARP_ROWS(3); Q5_WARP_ROWS(4);
+                Q5_WARP_ROWS(5); Q5_WARP_ROWS(6); Q5_WARP_ROWS(7); Q5_WARP_ROWS(8);
+            }
+#undef Q5_WARP_ROWS
+#undef Q5_WARP_LAUNCH
             return;
         }
     }

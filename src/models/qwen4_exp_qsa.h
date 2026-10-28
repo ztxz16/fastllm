@@ -8,7 +8,7 @@ namespace fastllm {
         void Prepare(const std::vector<float> &rawKeys, const std::vector<float> &positions,
                      int expectedRows, int rowWidth);
 
-        void Reserve(int rows, int rowWidth);
+        void ReserveForPrefill(int promptRows, int outputLimit, int rowWidth);
 
         void Materialize(std::vector<float> &rawKeys, std::vector<float> &positions);
 
@@ -20,6 +20,8 @@ namespace fastllm {
                    int rowWidth);
 
       private:
+        friend struct Qwen4PrefixCacheTestAccess;
+
         void Synchronize();
 
         void EnsureCapacity(int requiredRows, int rowWidth);

@@ -119,7 +119,7 @@ def cuda_hardware():
 
 
 def cpu_threads():
-    """Honor native thread overrides, otherwise leave launch/IO headroom."""
+    """Honor overrides; bound automatic workers by affinity and CPU quota."""
     if "FT_THREADS" in os.environ:
         return int(os.environ["FT_THREADS"])
     if "FASTLLM_NUMA_THREADS" in os.environ:
@@ -136,7 +136,8 @@ def cpu_threads():
             cores.add(((path / "physical_package_id").read_text(), (path / "core_id").read_text()))
         except OSError:
             cores.add((0, cpu))
-    return max(1, len(cores) - min(4, len(cores) // 4))
+    from .cpu_tuning import thread_limit
+    return thread_limit(len(cores))
 
 
 def topologies(args, explicit, hardware, gpu, family=None):
@@ -281,7 +282,7 @@ def _deepseek_priority(candidate, model, backend=None):
     # Once these targets are met, compare predicted latency. An unbounded
     # chunk preference otherwise discards a faster fully resident GPU plan
     # before its decode cost is considered.
-    return min(chunk, 4096 if streamed_disk else 512), min(cache, 3 * memory.GiB)
+    return min(chunk, 4096 if streamed_disk else 1024), min(cache, 3 * memory.GiB)
 
 
 def kv_residencies(args, model):
@@ -348,7 +349,7 @@ def mixed_disk_plan(args, baseline, metadata, tensors, model, gpu, ram, ratio):
     # Separate NUMA and disk upload rings persist together. Activation scratch
     # is reusable, so budget the larger backend workspace plus both rings.
     for boundary in range(model.layers - 1, resident, -1):
-        kept = [size if memory.expert_layer(i, model) < boundary else 0
+        kept = [size if memory.expert_layer(i, model) < boundary or i in getattr(model, "eager_expert_layers", ()) else 0
                 for i, size in enumerate(experts)]
         disk_bytes = sum(experts) - sum(kept)
         if not disk_bytes:
@@ -483,6 +484,8 @@ def _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model, info, 
                            "gpu_memory_limit": result.get("auto_gpu_memory_limit"),
                            "host_memory_limit": result.get("auto_host_memory_limit"),
                            "force_ddr_limit": result.get("force_ddr_limit")}
+    if hasattr(trial, "_cpu_thread_benchmark"):
+        result["automatic"]["cpu_thread_benchmark"] = trial._cpu_thread_benchmark
     print("[auto] " + json.dumps(result, sort_keys=True), flush=True)
     return result
 
@@ -506,6 +509,13 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if base.threads < 1:
         raise ValueError("--auto requires positive CPU threads")
     metadata, tensors, model = memory.model_inputs(base)
+    if (("threads" not in explicit or args.threads == -1) and
+            "FT_THREADS" not in os.environ and "FASTLLM_NUMA_THREADS" not in os.environ and
+            model.hidden >= 1024 and model.intermediate >= 256):
+        from .cpu_tuning import select_threads
+        kinds = {t.kind for t in tensors if memory._is_routed_expert(t.name)}
+        base.threads, base._cpu_thread_benchmark = select_threads(
+            model.hidden, model.intermediate, 16 if 'gguf:16' in kinds else 12, base.threads)
     # Dense Qwen3's graph warmup currently hits stream-capture-unsupported
     # in the deferred CUDA pool. Keep its new auto adapter on eager CUDA;
     # an explicit environment override still opts into graph execution.
@@ -725,7 +735,7 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
                            "ranking": "estimated latency; not measured throughput", "mtp": args.mtp}
     if model.family == "deepseek_v41":
         result["automatic"]["ranking"] = (
-            "non-disk experts first; fixed context; chunk up to 4096 for streamed disk GGUF or 512 otherwise, then per-GPU expert cache up to 3 GiB, "
+            "non-disk experts first; fixed context; chunk up to 4096 for streamed disk GGUF or 1024 otherwise, then per-GPU expert cache up to 3 GiB, "
             "then predicted latency; automatic topology uses single GPU or PP; "
             "TP requires explicit opt-in; estimated latency"
         )
@@ -740,6 +750,8 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     result["automatic"]["host_memory_limit"] = result.get("auto_host_memory_limit")
     result["automatic"]["force_ddr_limit"] = result.get("force_ddr_limit")
     result["automatic"]["disk_cache_ratio"] = ratio
+    if hasattr(chosen, "_cpu_thread_benchmark"):
+        result["automatic"]["cpu_thread_benchmark"] = chosen._cpu_thread_benchmark
     if chosen.dspark:
         result["automatic"]["dspark_confidence_threshold"] = chosen.speculative_dspark_confidence_threshold
     for name in changed:

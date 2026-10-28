@@ -26,6 +26,12 @@ struct FastllmV41FullDecodeBuffers {
     // Optional caller-owned request slice. It must outlive the plan and graphs.
     void *requests = nullptr;
     void *savedKV = nullptr, *savedRawKV = nullptr, *savedRawScore = nullptr;
+    // Optional caller-owned [batch, ceil(maxKeys / blockSize)] block IDs and
+    // [batch] counts. A consumer may reuse a preceding producer's list only
+    // for the same mask, per-row visible range and stream-ordered replay.
+    // The producer must run again after every mask/position update.
+    void *candidateBlocks = nullptr, *candidateCounts = nullptr;
+    bool reuseCandidates = false;
 };
 
 struct FastllmV41FullDecodeRequest {
@@ -33,6 +39,16 @@ struct FastllmV41FullDecodeRequest {
     void *rawTailKV = nullptr, *rawTailScore = nullptr;
     int position = 0;
 };
+
+// Immutable per-layer pointers to a full verifier's saved rows and dynamic
+// request metadata. Descriptors remain valid for the lifetime of that graph.
+struct FastllmV41VerifyCommitLayer {
+    const FastllmV41FullDecodeRequest *requests = nullptr;
+    const void *savedKV = nullptr, *savedRawKV = nullptr, *savedRawScore = nullptr;
+    int window = 128, ratio = 0;
+};
+bool FastllmCudaV41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layers,
+                                      int layerCount, int accepted, int forwarded);
 
 // Create/destroy and upload run outside capture. Prepare/Finish contain only
 // fixed-shape GPU work, and can be captured exactly once during startup.
@@ -48,3 +64,9 @@ bool FastllmCudaV41UploadFullDecodeBatch(void *storage, void *const *plans, size
     const FastllmV41FullDecodeRequest *requests, size_t batch);
 bool FastllmCudaV41PrepareFullDecode(void *plan);
 bool FastllmCudaV41FinishFullDecode(void *plan);
+
+// Source bytes are staged in pinned storage until all asynchronous copies finish.
+struct FastllmV41HostCopy { void *dst; const void *src; size_t bytes; };
+bool FastllmCudaV41UploadFullDecodeInputs(void *storage, void *const *plans, size_t layers,
+    const FastllmV41FullDecodeRequest *requests, size_t batch,
+    const FastllmV41HostCopy *extra, size_t extraCount);

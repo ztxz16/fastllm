@@ -1215,6 +1215,7 @@ def make_normal_llm_model(args, startup_progress = None):
     draft_text_config = {}
     draft_has_mtp_weights = False
     draft_is_mtp_gguf = False
+    draft_is_dspark_gguf = False
     if speculative_draft_path:
         speculative_draft_path = os.path.abspath(
             os.path.expanduser(speculative_draft_path))
@@ -1222,6 +1223,15 @@ def make_normal_llm_model(args, startup_progress = None):
         draft_is_mtp_gguf = draft_is_file and speculative_draft_path.lower().endswith(".gguf")
         if draft_is_mtp_gguf:
             metadata = read_gguf_metadata(speculative_draft_path, {"general.architecture"})
+            draft_is_dspark_gguf = metadata.get("general.architecture") == "dflash"
+            if draft_is_dspark_gguf:
+                from .deepseek_v41_gguf import dspark_config
+                draft_config = dspark_config(speculative_draft_path)
+                if speculative_algorithm and speculative_algorithm != "dspark":
+                    raise ValueError("DeepSeek DSpark GGUF requires the dspark algorithm")
+                speculative_algorithm = "dspark"
+                draft_is_mtp_gguf = False
+        if draft_is_mtp_gguf:
             if metadata.get("general.architecture") != "qwen4exp-mtp":
                 raise ValueError("external MTP GGUF must have qwen4exp-mtp architecture")
             names = read_gguf_tensor_names(speculative_draft_path)
@@ -1231,7 +1241,7 @@ def make_normal_llm_model(args, startup_progress = None):
             draft_text_config = {"model_type": "qwen4_exp", "mtp_num_hidden_layers": 1}
             if speculative_algorithm and speculative_algorithm != "mtp":
                 raise ValueError("Qwen4 MTP GGUF requires the mtp speculative algorithm")
-        else:
+        elif not draft_is_dspark_gguf:
             draft_config_dir = (os.path.dirname(speculative_draft_path)
                                 if draft_is_file else speculative_draft_path)
             draft_config_path = os.path.join(draft_config_dir, "config.json")
@@ -1370,6 +1380,13 @@ def make_normal_llm_model(args, startup_progress = None):
         args.mtp = mtp
         args.speculative_draft_model_path = speculative_draft_path
         args.speculative_algorithm = "mtp"
+    elif draft_is_dspark_gguf:
+        if draft_tokens > 0 and dspark_tokens > 0 and draft_tokens != dspark_tokens:
+            raise ValueError("--draft_tokens and --dspark specify different token counts")
+        dspark_tokens = draft_tokens if draft_tokens > 0 else dspark_tokens or draft_config["dspark_block_size"]
+        args.dspark = dspark_tokens
+        args.speculative_draft_model_path = speculative_draft_path
+        _configure_embedded_dspark(args)
     elif speculative_draft_path:
         if not os.path.isdir(speculative_draft_path):
             raise ValueError(
@@ -1469,6 +1486,8 @@ def make_normal_llm_model(args, startup_progress = None):
                     config = json.load(file)
             else:
                 config = gguf_config
+            if draft_is_dspark_gguf:
+                config.update(dspark_config(speculative_draft_path, config))
             if getattr(args, "mmproj", "") and config.get("gguf_architecture") == "deepseek41":
                 from .deepseek_v41_gguf import vision_config
                 config.update(vision_config(args.mmproj, config))
@@ -1536,7 +1555,7 @@ def make_normal_llm_model(args, startup_progress = None):
                     speculative_algorithm = args.speculative_algorithm
                     _configure_embedded_dspark(args)
             if speculative_algorithm == "dspark":
-                if speculative_draft_path:
+                if speculative_draft_path and not draft_is_dspark_gguf:
                     if (architecture != "KimiK3ForConditionalGeneration" and
                             model_type != "kimi_k3" and not is_naive_n05_model):
                         raise ValueError(
@@ -2071,7 +2090,7 @@ def make_normal_llm_model(args, startup_progress = None):
                             chat_template = args.chat_template,
                             tool_call_parser = args.tool_call_parser,
                             external_mtp_path = (speculative_draft_path
-                                if speculative_algorithm == "mtp" else ""),
+                                if speculative_algorithm == "mtp" or draft_is_dspark_gguf else ""),
                             mmproj_path = args.mmproj,
                             max_context_length = -1 if legacy_context_limit else max_context_length,
                             rope_scaling = rope_scaling,

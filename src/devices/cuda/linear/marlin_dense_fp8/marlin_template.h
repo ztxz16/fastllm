@@ -242,7 +242,9 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool dense_fp32,
           const bool add_residual,
           const bool fuse_swiglu,
-          const bool bf16_output>
+          const bool bf16_output,
+          const bool parallel_fp32_reduce,
+          const bool fp32_output>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -271,6 +273,10 @@ __global__ void Marlin(
     bool use_atomic_add_arg,   // whether to use atomic add to reduce
     bool use_fp32_reduce_arg,  // whether to use fp32 global reduce
     int max_shared_mem) {
+  static_assert(!parallel_fp32_reduce || (dense_fp32 && m_block_size_8 &&
+      thread_m_blocks == 1 && a_type_id == vllm::kBFloat16.id() &&
+      c_type_id == vllm::kBFloat16.id() && b_type_id == vllm::kFE4M3fn.id() &&
+      s_type_id == vllm::kFE8M0fnu.id() && group_blocks == 2));
   static_assert(!add_residual || (dense_fp32 && m_block_size_8 &&
       b_type_id == vllm::kFE2M1f.id() && c_type_id == vllm::kFloat16.id()));
   static_assert(!fuse_swiglu || (!add_residual && dense_fp32 && m_block_size_8 &&
@@ -283,6 +289,11 @@ __global__ void Marlin(
   static_assert(!bf16_output || (dense_fp32 && !add_residual && !fuse_swiglu &&
       a_type_id == vllm::kFloat16.id() && c_type_id == vllm::kFloat16.id() &&
       b_type_id == vllm::kFE2M1f.id() && s_type_id == vllm::kFE8M0fnu.id() &&
+      group_blocks == 2));
+  static_assert(!fp32_output || (dense_fp32 && m_block_size_8 &&
+      thread_m_blocks == 1 && !add_residual && !fuse_swiglu && !bf16_output &&
+      a_type_id == vllm::kBFloat16.id() && c_type_id == vllm::kBFloat16.id() &&
+      b_type_id == vllm::kFE4M3fn.id() && s_type_id == vllm::kFE8M0fnu.id() &&
       group_blocks == 2));
   const bool has_bias = dense_fp32 ? false : has_bias_arg;
   const bool use_atomic_add = dense_fp32 ? false : use_atomic_add_arg;
@@ -496,7 +507,7 @@ __global__ void Marlin(
 
     if (slice_col == n_tiles) {
       A += 16 * thread_m_blocks * lda / (is_a_8bit ? 16 : 8);
-      C += 16 * thread_m_blocks * prob_n / 8;
+      C += 16 * thread_m_blocks * prob_n / (fp32_output ? 4 : 8);
       slice_col = 0;
       par_id++;
     }
@@ -515,7 +526,7 @@ __global__ void Marlin(
       slice_col = slice_col_par % n_tiles;
       slice_iters = k_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
-      C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
+      C = C0 + 16 * thread_m_blocks / (fp32_output ? 4 : 8) * par_id * prob_n;
       if (is_a_8bit) {
         __syncthreads();
         int a_s_gl_rd = par_id * 16 * thread_m_blocks + threadIdx.x;
@@ -533,7 +544,7 @@ __global__ void Marlin(
       slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % n_tiles;
       par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
-      C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
+      C = C0 + 16 * thread_m_blocks / (fp32_output ? 4 : 8) * par_id * prob_n;
     }
     if (!in_part2) {
       init_part1_slice();
@@ -1656,6 +1667,61 @@ __global__ void Marlin(
     }
   };
 
+  // Each stripe has at most two split slices. Keep their FP32 fragments in
+  // separate slots; the last arriving CTA reduces in the original descending
+  // stripe order. No CTA waits for another one to finish its accumulation.
+  auto global_reduce_parallel = [&]() {
+    constexpr int active_threads = 32 * tb_n_warps;
+    constexpr int c_size = 16 * thread_m_blocks * 16 * thread_n_blocks / 4;
+    constexpr int th_size = thread_m_blocks * 8;
+    // A stripe can split its starting and ending columns. A partial starting
+    // at K=0 uses slot 1; a partial starting inside a column uses slot 0.
+    const int own_slot = 2 * blockIdx.x + (slice_row == 0);
+    if (threadIdx.x < active_threads) {
+      int4* fragments = reinterpret_cast<int4*>(&frag_c);
+      #pragma unroll
+      for (int k = 0; k < th_size; k += 2)
+        C_tmp[own_slot * c_size + active_threads * k + threadIdx.x] = fragments[k];
+    }
+    // Publish every writer before the CTA leader's release. The acquire chain
+    // on this counter and the following CTA barrier make all partials visible.
+    __threadfence();
+    __syncthreads();
+    __shared__ int reduce_last;
+    if (threadIdx.x == 0) {
+      int previous;
+      asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;"
+                   : "=r"(previous) : "l"(&locks[locks_off]) : "memory");
+      reduce_last = previous == slice_count - 1;
+    }
+    __syncthreads();
+    const bool last_arrival = reduce_last;
+    if (!last_arrival) return false;
+    if (threadIdx.x < active_threads) {
+      int4* fragments = reinterpret_cast<int4*>(&frag_c);
+      const int column_start = slice_col_par * k_tiles;
+      const int first_block = column_start / iters;
+      const int last_block = div_ceil(column_start + k_tiles, iters) - 1;
+      for (int block = last_block; block >= first_block; --block) {
+        const int slot = 2 * block + (block * iters <= column_start);
+        #pragma unroll
+        for (int k = 0; k < th_size; k += 2) {
+          int4 partial = C_tmp[slot * c_size + active_threads * k + threadIdx.x];
+          if (block == last_block) fragments[k] = partial;
+          else {
+            float* sum = reinterpret_cast<float*>(&fragments[k]);
+            const float* add = reinterpret_cast<const float*>(&partial);
+            #pragma unroll
+            for (int f = 0; f < 4; ++f) sum[f] = __fadd_rn(add[f], sum[f]);
+          }
+        }
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) locks[locks_off] = 0;
+    return true;
+  };
+
   // Write out the reduce final result in the correct layout. We only actually
   // reshuffle matrix fragments in this step, the reduction above is performed
   // in fragment layout.
@@ -1690,6 +1756,13 @@ __global__ void Marlin(
       if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
         c0 *= global_scale_f32;
         c1 *= global_scale_f32;
+      }
+      if constexpr (fp32_output) {
+        // Same fragment mapping as BF16, retaining all accumulator bits.
+        // The existing reduction workspace covers this doubled output tile.
+        reinterpret_cast<float*>(sh_red)[idx] = c0;
+        reinterpret_cast<float*>(sh_red)[idx + 8 * c_sh_stride] = c1;
+        return;
       }
       c_scalar_t2 res;
       if constexpr (bf16_output) {
@@ -1778,7 +1851,10 @@ __global__ void Marlin(
             atomicAdd(&C_half2[a], sh_red_half2[a]);
           }
         } else {
-          if constexpr (fuse_swiglu) {
+          if constexpr (fp32_output) {
+            C[2 * c_gl_wr] = sh_red[2 * c_sh_rd];
+            C[2 * c_gl_wr + 1] = sh_red[2 * c_sh_rd + 1];
+          } else if constexpr (fuse_swiglu) {
             const int column = threadIdx.x % (2 * thread_n_blocks);
             if (column < thread_n_blocks) {
               int4 gate = sh_red[c_sh_rd], up = sh_red[c_sh_rd + thread_n_blocks];
@@ -1863,7 +1939,7 @@ __global__ void Marlin(
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
   // Block-32 shares raw scale bytes between adjacent K fragments. Copy them
   // before matmul expands the first fragment's bytes into FP16 scales.
-  constexpr bool late_fetch = dense_fp32 && !bf16_output;
+  constexpr bool late_fetch = dense_fp32 && !bf16_output && !fp32_output;
 #else
   constexpr bool late_fetch = false;
 #endif
@@ -1980,6 +2056,13 @@ __global__ void Marlin(
       }
 
       cp_async_wait<0>();
+      if constexpr (m_block_size_8 && a_type_id == vllm::kBFloat16.id() &&
+                    b_type_id == vllm::kFE4M3fn.id() &&
+                    s_type_id == vllm::kFE8M0fnu.id()) {
+        // The reduction aliases the B pipeline. cp.async.wait is per thread;
+        // all warps must finish reading B before any warp overwrites sh_red.
+        __syncthreads();
+      }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
       if constexpr (bf16_output || (m_block_size_8 && b_type == vllm::kFE2M1f &&
                     s_type == vllm::kFE4M3fn)) {
@@ -2094,13 +2177,17 @@ __global__ void Marlin(
 
       if (slice_count > 1 && !use_atomic_add) {
         // only globally reduce if there is more than one block in a slice
-        barrier_acquire(&locks[locks_off], slice_idx);
-        if (use_fp32_reduce) {
-          global_reduce_fp32(slice_idx == 0, last);
+        if constexpr (parallel_fp32_reduce) {
+          last = global_reduce_parallel();
         } else {
-          global_reduce_fp16(slice_idx == 0, last);
+          barrier_acquire(&locks[locks_off], slice_idx);
+          if (use_fp32_reduce) {
+            global_reduce_fp32(slice_idx == 0, last);
+          } else {
+            global_reduce_fp16(slice_idx == 0, last);
+          }
+          barrier_release(&locks[locks_off], last);
         }
-        barrier_release(&locks[locks_off], last);
       }
 
       if (has_bias && last) {

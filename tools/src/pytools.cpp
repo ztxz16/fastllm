@@ -7,6 +7,7 @@
 #include "devices/disk/diskdevice.h"
 #include "moe_cache_config.h"
 #include "utils/autotune.h"
+#include "cpu_thread_bench.h"
 
 #include <cstring>
 #include <csignal>
@@ -92,6 +93,17 @@ extern "C" {
         return fastllm::GetThreads();
     }
 
+    DLL_EXPORT const char *benchmark_cpu_linear_threads(int hidden, int intermediate, int kind,
+            const int *counts, int count, int budgetMs) {
+        static thread_local std::string result;
+        try {
+            if (!counts || count < 1 || count > 8 || hidden < 1 || intermediate < 1 ||
+                    budgetMs < 1 || budgetMs > 1000) return nullptr;
+            result = BenchmarkCpuLinearThreads(hidden, intermediate, kind, counts, count, budgetMs);
+            return result.c_str();
+        } catch (...) { return nullptr; }
+    }
+
     DLL_EXPORT void set_cpu_low_mem(bool low) {
         fastllm::SetLowMemMode(low);
     }
@@ -164,7 +176,13 @@ extern "C" {
             s.diskBytes, s.uploads, s.cpuEvictions, s.cudaEvictions,
             s.cpuCudaOverlapBytes, s.cudaDemotions, s.cudaDemotionBytes,
             s.cpuWorkspaceBytes, s.cpuBufferReuses, s.cpuBufferAllocations,
-            s.cpuReclaims, s.asyncMaintenance};
+            s.cpuReclaims, s.asyncMaintenance,
+            s.cpuBufferMmaps, s.cpuBufferMunmaps, s.cpuBufferSplits, s.cpuBufferCoalesces,
+            s.canonicalPromotionChecks, s.canonicalPromotionRejects, s.canonicalResidenceRejects,
+            s.canonicalUploadBytes, s.canonicalUploadUs, s.canonicalDownloadUs,
+            s.decodeHandoffD2HCopies, s.decodeHandoffD2HBytes, s.decodeHandoffWaitUs,
+            s.decodeOutputH2DCopies, s.decodeOutputH2DBytes,
+            s.residentReadbackCopies, s.residentReadbackBytes, s.residentReadbackWaitUs};
         const int count = sizeof(result) / sizeof(result[0]);
         if (values && capacity > 0) std::copy_n(result, std::min(capacity, count), values);
         return count;

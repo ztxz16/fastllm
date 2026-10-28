@@ -195,10 +195,6 @@ struct block_iq4_ks_r4 {
     uint8_t qs[QK_K * 2];
 };
 
-// MXFP4 is not a public FastLLM GGUF type yet. A private unused value keeps
-// the imported template definitions well-formed without exposing the type.
-#define GGML_TYPE_MXFP4 static_cast<ggml_type>(39)
-
 template <ggml_type type>
 struct ggml_cuda_type_traits;
 

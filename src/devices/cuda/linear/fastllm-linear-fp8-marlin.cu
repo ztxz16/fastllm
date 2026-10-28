@@ -9,6 +9,7 @@
 
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
+#include "devices/cuda/fastllm-cuda-linear-output.h"
 #include "fastllm-cublas-prefill.cuh"
 #include "devices/cuda/fastllm-cuda-fp8.h"
 #include "fastllm-fp8-marlin-gemv.cuh"
@@ -24,6 +25,8 @@
 #include <cstring>
 #include <mutex>
 #include <map>
+#include <memory>
+#include <tuple>
 #include <vector>
 
 void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(
@@ -44,12 +47,23 @@ struct BFloatFp8Auxiliary {
 };
 struct BFloatFp8AuxiliaryRegistry {
     std::mutex mutex;
+    std::map<const fastllm::Data *, std::shared_ptr<fastllm::Data>> routerBFloat16;
     std::map<const fastllm::Data *, BFloatFp8Auxiliary> weights;
     std::map<int, size_t> dequantizedBytes;
+    std::map<const fastllm::Data *, std::map<std::tuple<bool, int, int>,
+        std::shared_ptr<fastllm::Data>>> intermediateShards;
+    std::map<const fastllm::Data *, std::map<std::pair<int, int>, std::shared_ptr<fastllm::Data>>> rowShards;
 };
 BFloatFp8AuxiliaryRegistry &BFloatFp8Registry() {
     static auto *registry = new BFloatFp8AuxiliaryRegistry;
     return *registry;
+}
+
+// Data invalidation hooks visit owners with at least seven auxiliary slots.
+// Cached slices may be created before the source ever runs a GEMM, so every
+// cache must mark its owner rather than relying on Marlin preparation.
+void MarkAuxiliaryOwner(fastllm::Data &weight) {
+    if (weight.extraCudaData.size() < 7) weight.extraCudaData.resize(7, nullptr);
 }
 
 constexpr int FP8_MARLIN_CONVERT_MAX_M = 8;
@@ -577,10 +591,29 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(
 }
 
 
+// Numerical eligibility does not depend on warmup or allocation state. The
+// BF16 GEMV fallback also consumes the original BF16 activation if packing is
+// temporarily unavailable during capture. Keep other scale formats unchanged.
+extern "C" bool FastllmCudaCanUseMarlinBFloat16FP8(const fastllm::Data &weight,
+        int rows, int inner, int columns) {
+    int arch = 0;
+    if (!Fp8MarlinDeviceSupported(arch) || arch < 80 || rows < 2 || rows > 8 ||
+        weight.dataType != fastllm::DataType::FP8_E4M3 || weight.IsRepacked || weight.isFake ||
+        weight.blockM != 32 || weight.blockK != 32 || inner <= 0 || columns <= 0 ||
+        inner % 64 || columns % 64 || (columns % 128 && inner % 128) ||
+        weight.dims != std::vector<int>{columns, inner} || HasFp8MarlinOnDevice(weight)) return false;
+    if (weight.extraCudaData.size() > 6 && weight.extraCudaData[4]) return true;
+    if (weight.scales.size() != (size_t)(columns / 32) * (inner / 32)) return false;
+    for (float scale : weight.scales) {
+        int exponent = 0;
+        if (std::frexp(scale, &exponent) != 0.5f || exponent < -118 || exponent > 120) return false;
+    }
+    return true;
+}
+
 // Auxiliary packed copy: preserve the row-major source for generic GEMV and
 // cuBLAS fallback, unlike the pre-existing destructive FP16/group-128 path.
-extern "C" bool FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(
-        const void *input, fastllm::Data &weight, void *output,
+extern "C" bool FastllmCudaPrepareMarlinBFloat16FP8(fastllm::Data &weight,
         int rows, int inner, int columns) {
     constexpr int packedIndex = 4, scalesIndex = 5, locksIndex = 6;
     int arch = 0;
@@ -649,6 +682,18 @@ extern "C" bool FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(
         std::lock_guard<std::mutex> lock(registry.mutex);
         registry.weights[&weight] = {device, packed, deviceScales, locks, nullptr, 0};
     }
+    return true;
+}
+
+static bool TryMarlinBFloat16MatMulFP8E4M3(
+        const void *input, fastllm::Data &weight, void *output,
+        int rows, int inner, int columns, bool floatOutput) {
+    constexpr int packedIndex = 4, scalesIndex = 5, locksIndex = 6;
+    if (!FastllmCudaPrepareMarlinBFloat16FP8(weight, rows, inner, columns)) return false;
+    if (floatOutput) return FastllmCudaMarlinBFloat16MXFP8GemmToFloat(input,
+        (const uint32_t *)weight.extraCudaData[packedIndex],
+        (const uint8_t *)weight.extraCudaData[scalesIndex], (float *)output,
+        rows, columns, inner, (int *)weight.extraCudaData[locksIndex]);
     return FastllmCudaMarlinBFloat16MXFP8Gemm(input,
         (const uint32_t *)weight.extraCudaData[packedIndex],
         (const uint8_t *)weight.extraCudaData[scalesIndex], output,
@@ -656,18 +701,210 @@ extern "C" bool FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(
 }
 
 
+extern "C" bool FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(
+        const void *input, fastllm::Data &weight, void *output,
+        int rows, int inner, int columns) {
+    return TryMarlinBFloat16MatMulFP8E4M3(input, weight, output, rows, inner, columns, false);
+}
+
+extern "C" bool FastllmCudaTryMarlinBFloat16MatMulFP8E4M3ToFloat(
+        const void *input, fastllm::Data &weight, float *output,
+        int rows, int inner, int columns) {
+    if (rows < 1 || rows > 8) return false;
+    return TryMarlinBFloat16MatMulFP8E4M3(input, weight, output, rows, inner, columns, true);
+}
+
+fastllm::Data *FastllmCudaFP8RowShard(fastllm::Data &weight, int start, int count) {
+    using namespace fastllm;
+    const int device = FastllmCudaGetDevice();
+    if (weight.dataType != DataType::FP8_E4M3 || weight.isFake || weight.IsRepacked ||
+        weight.multiDeviceData || weight.dataDevice != DataDevice::CUDA ||
+        weight.dataDeviceIds != std::vector<int>{device} || !weight.cudaData ||
+        weight.dims.size() != 2 || weight.dims[1] <= 0 || weight.blockK <= 0 || weight.blockM <= 0 ||
+        start < 0 || count <= 0 || start > weight.dims[0] - count ||
+        start % weight.blockK || count % weight.blockK ||
+        HasFp8MarlinOnDevice(weight)) return nullptr;
+    auto &registry = BFloatFp8Registry();
+    const auto key = std::make_pair(start, count);
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto owner = registry.rowShards.find(&weight);
+        if (owner != registry.rowShards.end()) {
+            auto found = owner->second.find(key);
+            if (found != owner->second.end()) return found->second.get();
+        }
+    }
+    if (FastllmCudaGraphIsCapturingFast()) return nullptr;
+    const int groups = (weight.dims[1] - 1) / weight.blockM + 1;
+    const size_t firstScale = size_t(start / weight.blockK) * groups;
+    const size_t scaleCount = size_t(count / weight.blockK) * groups;
+    if (firstScale > weight.scales.size() || scaleCount > weight.scales.size() - firstScale)
+        return nullptr;
+    auto shard = std::make_shared<Data>(DataType::FP8_E4M3, std::vector<int>{count, weight.dims[1]});
+    shard->blockM = weight.blockM;
+    shard->blockK = weight.blockK;
+    shard->scales.assign(weight.scales.begin() + firstScale, weight.scales.begin() + firstScale + scaleCount);
+    shard->dataDevice = DataDevice::CUDA;
+    shard->dataDeviceIds = {device};
+    shard->Allocate(false);
+    if (!FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(shard->cudaData,
+            (const uint8_t *)weight.cudaData + size_t(start) * weight.dims[1], shard->GetBytes()))
+        throw std::runtime_error("FP8 output-channel shard copy failed.");
+    // Publish only after the immutable copy is available to other streams.
+    if (cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess)
+        throw std::runtime_error("FP8 output-channel shard synchronization failed.");
+    Data *result;
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        MarkAuxiliaryOwner(weight);
+        result = registry.rowShards[&weight].emplace(key, shard).first->second.get();
+    }
+    return result;
+}
+
+// Immutable intermediate-TP slices. Both forms share the same zero padding,
+// so the paired-row activation feeds the column slice without a pack kernel.
+static fastllm::Data *FP8IntermediateShard(fastllm::Data &weight,
+                                         int start, int count, bool pairedRows) {
+    using namespace fastllm;
+    const int device = FastllmCudaGetDevice();
+    if (weight.dataType != DataType::FP8_E4M3 || weight.isFake || weight.IsRepacked ||
+        weight.multiDeviceData || weight.dataDevice != DataDevice::CUDA ||
+        weight.dataDeviceIds != std::vector<int>{device} || !weight.cudaData ||
+        weight.dims.size() != 2 || weight.blockM != 32 || weight.blockK != 32 ||
+        weight.dims[0] <= 0 || weight.dims[1] <= 0 ||
+        weight.dims[0] % 32 || weight.dims[1] % 32 ||
+        start < 0 || count <= 0 || start % 32 || count % 32 ||
+        HasFp8MarlinOnDevice(weight)) return nullptr;
+    const int channels = pairedRows ? weight.dims[0] / 2 : weight.dims[1];
+    if ((pairedRows && weight.dims[0] % 64) || start > channels - count) return nullptr;
+    int arch = 0;
+    if (!Fp8MarlinDeviceSupported(arch) || arch < 80) return nullptr;
+    const auto key = std::make_tuple(pairedRows, start, count);
+    auto &registry = BFloatFp8Registry();
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto owner = registry.intermediateShards.find(&weight);
+        if (owner != registry.intermediateShards.end()) {
+            auto found = owner->second.find(key);
+            if (found != owner->second.end()) return found->second.get();
+        }
+    }
+    if (FastllmCudaGraphIsCapturingFast()) return nullptr;
+    const int padded = (count + 63) / 64 * 64;
+    const int rows = pairedRows ? 2 * padded : weight.dims[0];
+    const int inner = pairedRows ? weight.dims[1] : padded;
+    const int oldGroups = weight.dims[1] / 32, groups = inner / 32;
+    if (weight.scales.size() != size_t(weight.dims[0] / 32) * oldGroups) return nullptr;
+    auto shard = std::make_shared<Data>(DataType::FP8_E4M3, std::vector<int>{rows, inner});
+    shard->blockM = shard->blockK = 32;
+    shard->scales.assign(size_t(rows / 32) * groups, 1.0f);
+    if (pairedRows) {
+        for (int half = 0; half < 2; ++half) {
+            const size_t src = size_t((half * channels + start) / 32) * oldGroups;
+            const size_t dst = size_t(half * padded / 32) * groups;
+            std::copy_n(weight.scales.begin() + src, size_t(count / 32) * groups,
+                        shard->scales.begin() + dst);
+        }
+    } else {
+        for (int row = 0; row < rows / 32; ++row)
+            std::copy_n(weight.scales.begin() + size_t(row) * oldGroups + start / 32,
+                        count / 32, shard->scales.begin() + size_t(row) * groups);
+    }
+    shard->dataDevice = DataDevice::CUDA;
+    shard->dataDeviceIds = {device};
+    shard->Allocate(false);
+    bool ok = cudaMemsetAsync(shard->cudaData, 0, shard->GetBytes(), cudaStreamPerThread) == cudaSuccess;
+    if (pairedRows) {
+        for (int half = 0; half < 2; ++half)
+            ok = (cudaMemcpyAsync((uint8_t *)shard->cudaData + size_t(half) * padded * inner,
+                (const uint8_t *)weight.cudaData + size_t(half * channels + start) * inner,
+                size_t(count) * inner, cudaMemcpyDeviceToDevice, cudaStreamPerThread) == cudaSuccess) && ok;
+    } else {
+        ok = (cudaMemcpy2DAsync(shard->cudaData, inner,
+            (const uint8_t *)weight.cudaData + start, weight.dims[1], count, rows,
+            cudaMemcpyDeviceToDevice, cudaStreamPerThread) == cudaSuccess) && ok;
+    }
+    // Publish only once both bytes and scale metadata are ready on all streams.
+    ok = (cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess) && ok;
+    if (!ok) throw std::runtime_error("FP8 intermediate shard copy failed.");
+    Data *result;
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        MarkAuxiliaryOwner(weight);
+        result = registry.intermediateShards[&weight].emplace(key, shard).first->second.get();
+    }
+    return result;
+}
+
+fastllm::Data *FastllmCudaFP8PairedRowShard(fastllm::Data &weight, int start, int count) {
+    return FP8IntermediateShard(weight, start, count, true);
+}
+
+fastllm::Data *FastllmCudaFP8ColumnShard(fastllm::Data &weight, int start, int count) {
+    return FP8IntermediateShard(weight, start, count, false);
+}
+
+fastllm::Data *FastllmCudaExactRouterBFloat16Weight(fastllm::Data &weight) {
+    using namespace fastllm;
+    if (weight.isFake || weight.multiDeviceData || weight.dataType != DataType::FLOAT32 ||
+        weight.dataDevice != DataDevice::CUDA || !weight.cudaData ||
+        weight.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
+        weight.dims.size() != 2 || weight.dims[0] <= 0 || weight.dims[1] <= 0) return nullptr;
+    auto &registry = BFloatFp8Registry();
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto found = registry.routerBFloat16.find(&weight);
+        if (found != registry.routerBFloat16.end()) return found->second.get();
+    }
+    if (FastllmCudaGraphIsCapturingFast()) return nullptr;
+    auto compact = std::make_shared<Data>();
+    if (!FastllmCudaTryCompactBFloat16Weight(weight, *compact)) compact.reset();
+    Data *result;
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        MarkAuxiliaryOwner(weight);
+        result = registry.routerBFloat16.emplace(&weight, compact).first->second.get();
+    }
+    return result;
+}
+
 extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {
     if (weight.isFake) return;
     auto &registry = BFloatFp8Registry();
     BFloatFp8Auxiliary owned;
+    std::shared_ptr<fastllm::Data> routerBFloat16;
+    std::map<std::pair<int, int>, std::shared_ptr<fastllm::Data>> shards;
+    std::map<std::tuple<bool, int, int>, std::shared_ptr<fastllm::Data>> intermediateShards;
     {
         std::lock_guard<std::mutex> lock(registry.mutex);
+        auto routerIt = registry.routerBFloat16.find(&weight);
+        if (routerIt != registry.routerBFloat16.end()) {
+            routerBFloat16 = std::move(routerIt->second);
+            registry.routerBFloat16.erase(routerIt);
+        }
+        auto tpIt = registry.intermediateShards.find(&weight);
+        if (tpIt != registry.intermediateShards.end()) {
+            intermediateShards = std::move(tpIt->second);
+            registry.intermediateShards.erase(tpIt);
+        }
+        auto sliceIt = registry.rowShards.find(&weight);
+        if (sliceIt != registry.rowShards.end()) {
+            shards = std::move(sliceIt->second);
+            registry.rowShards.erase(sliceIt);
+        }
         auto it = registry.weights.find(&weight);
-        if (it == registry.weights.end()) return;
-        owned = it->second;
-        registry.dequantizedBytes[owned.device] -= owned.dequantizedBytes;
-        registry.weights.erase(it);
+        if (it != registry.weights.end()) {
+            owned = it->second;
+            registry.dequantizedBytes[owned.device] -= owned.dequantizedBytes;
+            registry.weights.erase(it);
+        }
     }
+    // Data destruction can reenter this registry. Release outside its mutex.
+    shards.clear();
+    intermediateShards.clear();
+    routerBFloat16.reset();
+    if (owned.device < 0) return;
     const int previous = FastllmCudaGetDevice();
     FastllmCudaSetDevice(owned.device);
     void *pointers[] = {owned.packed, owned.scales, owned.locks, owned.dequantized};

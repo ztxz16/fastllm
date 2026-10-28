@@ -304,9 +304,19 @@ namespace fastllm {
 #endif
         if (!tpCacheHandled && !singleCacheHandled) {
             if (overlapShared) {
-                V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
-                V41ReplicaToCpu(cpuMoeIndex, expertIndex, tpDevices);
-                V41ReplicaToCpu(cpuMoeScore, expertScore, tpDevices);
+                bool diskStaged = false;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+                if (!tp && !graphActive && !dumpDebug && !V41ReferenceMathEnabled() && seqlen == 1 &&
+                        V41DeviceSpecUsesType(overlapMoeDevice, "disk") &&
+                        moeWeights[2]->isDiskWeight && moeWeights[2]->dataType == DATA_GGUF_FORMAT)
+                    diskStaged = StageDiskMoeV41Inputs(ffnInput, expertIndex, expertScore,
+                        cpuMoeInput, cpuMoeIndex, cpuMoeScore);
+#endif
+                if (!diskStaged) {
+                    V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
+                    V41ReplicaToCpu(cpuMoeIndex, expertIndex, tpDevices);
+                    V41ReplicaToCpu(cpuMoeScore, expertScore, tpDevices);
+                }
             }
             runSharedSegment();
         }
@@ -327,6 +337,20 @@ namespace fastllm {
         combineFfnPostDispatch = tp && hasSharedExpertOut && !dumpDebug &&
             ((single && (seqlen == 1 || dsparkVerify)) || tpCacheHandled);
 #endif
+        // Decide only after the routed producer has joined and its usual
+        // upload has completed. CPU/GPU expert scheduling remains unchanged.
+        auto deferLocalPost = [&] {
+#ifdef USE_CUDA
+            return !tp && !dumpDebug && !V41ReferenceMathEnabled() && hasSharedExpertOut &&
+                ffnInput.dataType == DataType::BFLOAT16 &&
+                sharedExpertOut.dataType == DataType::BFLOAT16 &&
+                (ffnOut.dataType == DataType::BFLOAT16 || ffnOut.dataType == DataType::FLOAT32) &&
+                !ffnOut.multiDeviceData && !sharedExpertOut.multiDeviceData &&
+                ffnOut.dataDevice == DataDevice::CUDA && sharedExpertOut.dataDevice == DataDevice::CUDA;
+#else
+            return false;
+#endif
+        };
         if (!tpCacheHandled && !singleCacheHandled) {
             this->ApplyMoeDeviceMapForLayer(layer);
             // 路由专家在 multicuda 上按专家并行（每卡一部分专家 + all-reduce），
@@ -375,6 +399,9 @@ namespace fastllm {
                 DiskMergeMOE disk;
                 cacheHandled = disk.RunGpuPrefill(*moeInputPtr, *moeIndexPtr, *moeScorePtr,
                     ffnOut, moeWeights, swiglu_limit);
+                if (!cacheHandled && seqlen == 1)
+                    cacheHandled = disk.RunGpuDecode(*moeInputPtr, *moeIndexPtr, *moeScorePtr,
+                        ffnOut, moeWeights, swiglu_limit);
             }
 #endif
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
@@ -412,7 +439,8 @@ namespace fastllm {
                 if (!(tp && ffnOut.multiDeviceData && sharedExpertOut.multiDeviceData)) {
                     ffnOut.ToDevice(sharedExpertOut.dataDevice);
                 }
-                addSharedExpert();
+                combineFfnPostDispatch = deferLocalPost();
+                if (!combineFfnPostDispatch) addSharedExpert();
             }
             if (!combineFfnPostDispatch && ffnOut.dataType != ffnInput.dataType) {
                 ToDataType(ffnOut, ffnInput.dataType);
@@ -427,8 +455,11 @@ namespace fastllm {
         }
         if (singleCacheHandled) {
             ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
-            addSharedExpert();
-            if (ffnOut.dataType != ffnInput.dataType) ToDataType(ffnOut, ffnInput.dataType);
+            combineFfnPostDispatch = deferLocalPost();
+            if (!combineFfnPostDispatch) {
+                addSharedExpert();
+                if (ffnOut.dataType != ffnInput.dataType) ToDataType(ffnOut, ffnInput.dataType);
+            }
         }
         return combineFfnPostDispatch;
     }
