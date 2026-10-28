@@ -13,6 +13,9 @@ struct FastllmV41FullDecodeConfig {
     // A verification plan treats batch rows as one causal chunk. Ring writes
     // remain deferred until acceptance; the saved raw stream supports rollback.
     bool verifying = false;
+    // Packed E4M3 + one UE8M0 scale per 32 values. Ordinary decode only;
+    // verifier commit descriptors currently retain BF16 cache storage.
+    bool fp8KV = false;
     bool kvSource = false, indexSource = false;
     bool writeCandidates = false, useCandidates = false;
 };

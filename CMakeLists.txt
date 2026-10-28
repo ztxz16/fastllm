@@ -1629,6 +1629,10 @@ if (UNIT_TEST)
                 "PASS [0-9]+ changing-context graph replays; stress=1" 300 --stress)
             fastllm_add_checked_test(deepseekV41FullDecodePooled deepseekV41FullDecodeRegression
                 "PASS [0-9]+ changing-context graph replays; stress=0" 300 --pooled)
+            fastllm_add_checked_test(deepseekV41FullDecodeFP8 deepseekV41FullDecodeRegression
+                "PASS [0-9]+ FP8 full decode rows" 900 --fp8)
+            fastllm_add_checked_test(deepseekV41FullDecodeFP8LongContext deepseekV41FullDecodeRegression
+                "PASS [0-9]+ FP8 full decode rows" 900 --fp8 --long-context)
             fastllm_add_checked_test(deepseekV41FullVerify deepseekV41FullDecodeRegression
                 "PASS [0-9]+ full verify graph replays" 300 --verify)
             fastllm_add_checked_test(deepseekV41AttentionLocality deepseekV41FullDecodeRegression
@@ -1644,6 +1648,7 @@ if (UNIT_TEST)
             fastllm_add_checked_test(deepseekV41CandidateReuseVerify deepseekV41FullDecodeRegression
                 "PASS [0-9]+ full verify graph replays" 900 --verify --shared-candidates --long-context)
             set_tests_properties(deepseekV41FullDecode deepseekV41FullDecodeStress
+                deepseekV41FullDecodeFP8 deepseekV41FullDecodeFP8LongContext
                 deepseekV41FullDecodePooled deepseekV41FullVerify deepseekV41VerifyIndexHeads17 deepseekV41AttentionLocality
                 deepseekV41FullDecodeLongContext deepseekV41FullVerifyLongContext
                 deepseekV41CandidateReuse deepseekV41CandidateReuseVerify

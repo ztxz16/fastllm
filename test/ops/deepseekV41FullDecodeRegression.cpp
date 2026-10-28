@@ -131,6 +131,7 @@ struct CandidateReuseProducer {
     }
 };
 #include "deepseekV41FullVerifyRegression.inc"
+#include "deepseekV41FullDecodeFP8Regression.inc"
 
 static void RunAttentionLocalityRegression(int devices) {
     int checks = 0;
@@ -185,11 +186,12 @@ int main(int argc, char **argv) {
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess ||
         major < 8)
         return 77;
-    bool verify = false, locality = false;
+    bool verify = false, locality = false, fp8 = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--stress") { stress = true; amplitude = 1.f; }
         if (std::string(argv[i]) == "--pooled") pooled = true;
         if (std::string(argv[i]) == "--verify") verify = true;
+        if (std::string(argv[i]) == "--fp8") fp8 = true;
         if (std::string(argv[i]) == "--locality") locality = true;
         if (std::string(argv[i]).rfind("--index-heads=", 0) == 0)
             indexHeads = std::stoi(std::string(argv[i]).substr(14));
@@ -201,6 +203,7 @@ int main(int argc, char **argv) {
         ApplyDeviceMap({{"cpu", 1}}, 0, 1);
         FastllmCudaSetDevice(0);
         if (locality) { RunAttentionLocalityRegression(devices); return 0; }
+        if (fp8) { RunFP8DecodeRegression(); return 0; }
         if (verify) { RunVerifyRegression(); return 0; }
         int checked = 0;
         for (int batch : {1, 2, 4, 8, 16, 128})

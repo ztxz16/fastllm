@@ -69,9 +69,18 @@ bool V41FullReserve(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
             auto &cache = s.state->layers[l];
             if (cfg.ratio && (s.startPos + (long long)s.seqlen) / cfg.ratio > g.maxKeys)
                 return false;
-            if (cache.windowKV.dataType != DataType::BFLOAT16 || !cache.windowKV.multiDeviceData ||
+            const DataType cacheType = cfg.fp8KV ? DataType::INT8 : DataType::BFLOAT16;
+            const int kvWidth = cfg.fp8KV ? 528 : 512, indexWidth = cfg.fp8KV ? 132 : 128;
+            auto validRows = [&](const Data &data, int width) {
+                return data.dims.empty() || (data.dataType == cacheType && data.dims.size() == 3 &&
+                    data.dims[0] == 1 && data.dims[2] == width);
+            };
+            if (!validRows(cache.windowKV, kvWidth) || cache.windowKV.dims.empty() ||
+                cache.windowKV.dims[1] != cfg.window || !cache.windowKV.multiDeviceData ||
                 !cache.windowKV.IsTensorParallelReplicated())
                 return false;
+            if (cfg.kvSource && (!validRows(cache.compressedKV, kvWidth) ||
+                (cfg.indexSource && !validRows(cache.indexK, indexWidth)))) return false;
             for (int device : g.devices) {
                 auto it = cache.windowKV.multiDeviceDatas.find(device);
                 if (it == cache.windowKV.multiDeviceDatas.end() || !it->second ||
@@ -87,9 +96,10 @@ bool V41FullReserve(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
                 continue;
             auto &cache = s.state->layers[l];
             const int rows = (s.startPos + s.seqlen) / cfg.ratio;
-            V41ReserveDecodeRows(cache.compressedKV, DataType::BFLOAT16, 512, rows, g.devices);
+            const DataType cacheType = cfg.fp8KV ? DataType::INT8 : DataType::BFLOAT16;
+            V41ReserveDecodeRows(cache.compressedKV, cacheType, cfg.fp8KV ? 528 : 512, rows, g.devices);
             if (cfg.indexSource)
-                V41ReserveDecodeRows(cache.indexK, DataType::BFLOAT16, 128, rows, g.devices);
+                V41ReserveDecodeRows(cache.indexK, cacheType, cfg.fp8KV ? 132 : 128, rows, g.devices);
             if (cfg.ratio == 2) {
                 V41ReserveDecodeRows(cache.rawTailKV, DataType::FLOAT32, 512, 2, g.devices);
                 V41ReserveDecodeRows(cache.rawTailScore, DataType::FLOAT32, 512, 2, g.devices);
@@ -207,11 +217,12 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
 void DeepSeekV41Model::BuildFullDecodeGraph(
     int batch, const std::vector<DeepSeekV41Segment> &segments) {
     const bool verifying = segments.size() == 1 && segments[0].spec && segments[0].spec->deferWindow;
-    // Small BF16-KV target chunks share decode's fixed operands and dynamic
-    // request descriptors. Other shapes keep the segmented/eager path.
+    // Ordinary decode supports BF16 and packed FP8 caches. Verifier commit
+    // descriptors still use BF16; other formats retain the segmented path.
+    const bool fp8KV = kvCacheDataType == DataType::FP8_E4M3;
     if (batch < 1 || batch > (verifying ? 8 : 16) || executionMode != ExecutionMode::Gpu ||
         (!verifying && v41DsparkEnabled) ||
-        (kvCacheDataType == DataType::FP8_E4M3 || kvCacheDataType == DataType::FP4_E2M1) ||
+        (kvCacheDataType == DataType::FP4_E2M1 || (fp8KV && verifying)) ||
         (!verifying && !v41CudaGraphWarmingUp) || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128 ||
         weight["head.weight"].dataType != DataType::FLOAT32)
         return;
@@ -281,6 +292,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         auto &c = layer->config;
         c.batch = batch;
         c.verifying = verifying;
+        c.fp8KV = fp8KV;
         c.heads = num_attention_heads / g->devices.size();
         c.indexHeads = index_n_heads;
         c.ratio = compress_ratios[l];
@@ -638,7 +650,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
 bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepared) {
     // Verification warmup uses the same composition/replay path as requests.
     // Ordinary decode still builds its full graph explicitly after warmup.
-    if (!f.graphReplay || !f.graphState || (v41CudaGraphWarmingUp && !f.dsparkVerify) || f.quantKV ||
+    if (!f.graphReplay || !f.graphState || (v41CudaGraphWarmingUp && !f.dsparkVerify) ||
+        (f.quantKV && (f.dsparkVerify || kvCacheDataType != DataType::FP8_E4M3)) ||
         f.hasImageTokens || f.inputEmbeds)
         return false;
     // Building a graph warms its children and therefore still needs the eager
