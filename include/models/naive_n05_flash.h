@@ -107,6 +107,8 @@ namespace fastllm {
             std::vector<Data> storage;
             std::vector<size_t> offsets;
             size_t slotBytes = 0;
+            // Serialized by historyMutex. Metadata previews never own slots.
+            uint64_t historyVersion = 0;
             int SlotCount(int requests, int64_t budget) const {
                 if (!slotBytes) return 0;
                 // Reserve all active checkpoints before spending spare budget

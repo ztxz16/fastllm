@@ -696,6 +696,7 @@ namespace fastllm {
             reusablePrefixLen = 0;
         }
 
+        std::map<int, std::vector<uint64_t>> recordHashes;
         std::function<void(Data&)> recordPagedCache = [&](Data &cache) {
             if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
                 bool recordedLocal = false;
@@ -713,7 +714,12 @@ namespace fastllm {
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
                 auto pages = cache.pageIndex;
                 if (cache.lastPageLen < cache.pageLen) pages.pop_back();
-                cache.pagedKVCacheData->Record(this->allTokens, pages);
+                const int pageLen = cache.pagedKVCacheData->pageLen;
+                auto &hashes = recordHashes[pageLen];
+                const int count = std::min(this->allTokens.size() / pageLen, pages.size());
+                for (int i = hashes.size(); i < count; ++i)
+                    hashes.push_back(PagedCacheManager::HashTokenPage(this->allTokens.data() + i * pageLen, pageLen));
+                cache.pagedKVCacheData->RecordPrefix(hashes, pages);
             }
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -1405,12 +1411,15 @@ namespace fastllm {
             }
         }
         if (probeManager != nullptr) {
+            if (!ctx->prefillPreview) ctx->prefillPreview = std::make_unique<PrefillPrefixPreview>();
+            auto &preview = *ctx->prefillPreview;
+            preview.Reset(ctx->currentTokens);
             std::map<PagedCacheManager*, std::vector<int> > queriedPages;
             auto queryManager = [&](PagedCacheManager *manager) -> std::vector<int>& {
                 auto it = queriedPages.find(manager);
                 if (it == queriedPages.end()) {
                     std::vector<int> pages;
-                    manager->Query(ctx->currentTokens, pages);
+                    manager->QueryPrefix(preview.Hashes(manager->pageLen), preview.matches[manager], pages);
                     it = queriedPages.insert(std::make_pair(manager, std::move(pages))).first;
                 }
                 return it->second;
@@ -3201,7 +3210,6 @@ namespace fastllm {
                                     if (ctx->isEnding || ctx->curTokens != 0) continue;
                                     if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
                                         ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxPromptTokens) continue;
-                                    ctx->prefillPreview.reset();
                                     if (model->DeferHistoryCacheRestore()) {
                                         const auto &cache = ctx->pastKeyValues[model->kvCacheId].first;
                                         const long long before = allocatedTokens(cache);
@@ -3210,6 +3218,7 @@ namespace fastllm {
                                         RestoreDeferredHistory(model, ctx);
                                         lenSum += allocatedTokens(cache) - before;
                                     }
+                                    ctx->prefillPreview.reset();
                                     const int count = ctx->currentTokens.size();
                                     const bool single = count > prefillChunk || !ctx->multimodalInput.empty();
                                     if (!plannedPrefills.empty() && (single || pendingTokens + count > prefillBatchLimit)) {
@@ -3637,7 +3646,11 @@ namespace fastllm {
                                 }
                                 if (it.second->isEnding == false) {
                                     model->UpdateToolCallConstraintState(it.second, curRet);
-                                    it.second->currentTokens = std::vector<int>{curRet};
+                                    if (it.second->curTokens > 0 && it.second->currentTokens.size() == 1)
+                                        it.second->currentTokens[0] = curRet;
+                                    else
+                                        // Release a potentially large prompt buffer once.
+                                        it.second->currentTokens = std::vector<int>{curRet};
                                     it.second->resultTokenQueue.push(curRet);
                                     QueueGeneratedResultLogits(it.second, logits, i);
                                     it.second->allTokens.push_back(curRet);

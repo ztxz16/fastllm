@@ -73,10 +73,24 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         auto *pool = model.GetPagedKVCacheManager(0, true);
         auto refs = pool->pageRefCount;
         PrefillPrefixPreview preview; preview.Reset(c->currentTokens);
+        Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8192, preview) == 8192,
+                "short preview did not honor its limit");
         for (int i = 0; i < 20; ++i)
             Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8448, preview) == model.WindowHit(*c),
                     "SWA preview differs from actual query");
         Require(pool->pageRefCount == refs, "SWA preview pinned full KV");
+        // Publication changes the candidate set even if the request itself is
+        // unchanged. Keep another owner of the replaced checkpoint to ensure
+        // invalidation does not depend on weak-pointer expiry alone.
+        auto held = model.prefixHistory.back();
+        auto replacement = model.Request(0);
+        model.Checkpoint(*replacement, 0, 8192);
+        model.Checkpoint(*replacement, 8192, 200);
+        model.Checkpoint(*replacement, 8447, 1);
+        model.Publish(*replacement); model.Drain(*replacement);
+        Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8448, preview) == model.WindowHit(*c),
+                "publication reused a retired candidate");
+        held.reset();
         // Weak metadata must not keep the four checkpoint slots alive.
         model.prefixHistory.clear();
         Require(model.prefixPool->freeSlots.size() == 4, "preview pinned an SWA checkpoint");
