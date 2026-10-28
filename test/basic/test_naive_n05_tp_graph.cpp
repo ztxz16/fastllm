@@ -4,8 +4,9 @@
 // Standalone shared-library fixture (Linux): link against libfastllm_tools.so
 // with -ldl -Wl,-export-dynamic and CUDA's per-thread default stream.
 // Run eager, graph, failbegin and failinstantiate in separate processes:
-//   test_naive_n05_tp_graph MODE OUTPUT.bin
-// All four binary outputs must match; each mode checks metadata and launches.
+//   test_naive_n05_tp_graph MODE OUTPUT.bin [legacy|paged]
+// All four outputs must match within each cache layout. Legacy tests allocation
+// ownership transfer; paged tests pool lifetime and request-owned page references.
 #include "models/naive_n05_flash.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include <cmath>
@@ -146,8 +147,10 @@ class Fixture : public NaiveN05FlashModel {
             }
         }
     }
-    void Run(const char *path, bool graphs) {
-        WarmUp();
+    void Run(const char *path, bool graphs, bool paged) {
+        // WarmUp enables the paged pool. The legacy fixture intentionally uses
+        // direct Forward initialization to keep exercising standalone KV storage.
+        if (paged) WarmUp();
         std::ofstream out(path, std::ios::binary);
         for (int prompt : {3, 125, 254, 510, 2046, 2049}) {
             std::vector<std::pair<Data, Data>> kv;
@@ -180,7 +183,7 @@ class Fixture : public NaiveN05FlashModel {
         }
         for (int limit : {1, 2}) {
             maxBatch = limit;
-            RunRequests(out, graphs);
+            RunRequests(out, graphs, paged);
         }
         RunSelections(out);
     }
@@ -233,7 +236,20 @@ class Fixture : public NaiveN05FlashModel {
         }
         std::cout << "TP GREEDY AND SAMPLING PASS 102 token comparisons" << std::endl;
     }
-    void RunRequests(std::ofstream &out, bool graphs) {
+    void RunRequests(std::ofstream &out, bool graphs, bool paged) {
+        struct PoolSnapshot {
+            int device, part;
+            PagedCacheManager *manager;
+            void *storage;
+            std::vector<int> refs;
+        };
+        std::vector<PoolSnapshot> pools;
+        for (int part = 0; part < 2; ++part)
+            for (auto entry : GetPagedKVCacheManagers(0, part == 0))
+                pools.push_back({entry.first, part, entry.second,
+                                 entry.second->cudaData, entry.second->pageRefCount});
+        if (pools.size() != (paged ? 16u : 0u))
+            throw std::runtime_error("fixture did not select the requested KV layout");
         std::vector<void *> previous;
         int request = 0;
         auto run = [&](int prompt, bool cancelled, bool queued, bool reuse, bool execute = true) {
@@ -250,7 +266,7 @@ class Fixture : public NaiveN05FlashModel {
             OnResponseContextCreated(context);
             auto &kv = context->pastKeyValues;
             bool restored = kv[0].first.multiDeviceData;
-            if (restored != (graphs && reuse))
+            if (restored != (!paged && graphs && reuse))
                 throw std::runtime_error("unexpected request KV allocation reuse");
             for (auto &layer : kv)
                 for (Data *root : {&layer.first, &layer.second})
@@ -286,6 +302,23 @@ class Fixture : public NaiveN05FlashModel {
                     throw std::runtime_error("second request did not replay on first decode");
                 if (kv[0].first.dims[1] != past || kv[1].first.dims[1] != std::min(past, 7))
                     throw std::runtime_error("reused cache metadata mismatch");
+                for (const auto &pool : pools) {
+                    const Data &root = pool.part ? kv[0].second : kv[0].first;
+                    const Data &local = *root.multiDeviceDatas.at(pool.device);
+                    if (!local.isPagedKVCache || local.pagedKVCacheData != pool.manager ||
+                        local.dims[1] != past ||
+                        local.pageIndex.size() != (size_t)((past + local.pageLen - 1) / local.pageLen))
+                        throw std::runtime_error("request did not use its own paged KV metadata");
+                    for (int page : local.pageIndex)
+                        if (page < 0 || page >= pool.manager->maxPages ||
+                            pool.manager->pageRefCount.at(page) <= pool.refs.at(page))
+                            throw std::runtime_error("request does not own its KV page references");
+                    if (pool.manager->cudaData != pool.storage)
+                        throw std::runtime_error("request replaced model-owned KV pool storage");
+                }
+                if (paged && graphs && step == 6 &&
+                    launches.load() - before != ((failBegin || failInstantiate) ? 0 : 8))
+                    throw std::runtime_error("paged request did not reach graph replay or safe fallback");
             }
             if (execute && expectReplay && captures.load() != beforeCaptures)
                 throw std::runtime_error("reused request unexpectedly recaptured");
@@ -297,6 +330,9 @@ class Fixture : public NaiveN05FlashModel {
             context->isEnding = !cancelled;
             RemoveResponseContext(handle);
             if (queued) RemoveResponseContext(pending);
+            for (const auto &pool : pools)
+                if (pool.manager->pageRefCount != pool.refs || pool.manager->cudaData != pool.storage)
+                    throw std::runtime_error("completed or cancelled request leaked KV pages");
             std::cout << "request=" << request++ << " prompt=" << prompt << " restored=" << restored
                       << " captures=" << captures.load() - beforeCaptures << std::endl;
         };
@@ -317,8 +353,10 @@ int main(int argc, char **argv) {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 8)
             return 77;
         setvbuf(stdout, nullptr, _IONBF, 0);
-        if (argc != 3)
+        if (argc != 3 && argc != 4)
             return 2;
+        const std::string cacheMode = argc == 4 ? argv[3] : "paged";
+        if (cacheMode != "legacy" && cacheMode != "paged") return 2;
         bool graph = std::string(argv[1]) != "eager";
         failBegin = std::string(argv[1]) == "failbegin";
         failInstantiate = std::string(argv[1]) == "failinstantiate";
@@ -328,7 +366,7 @@ int main(int argc, char **argv) {
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
         Fixture model;
-        model.Run(argv[2], graph);
+        model.Run(argv[2], graph, cacheMode == "paged");
         std::cout << "TP GRAPH MODEL PASS" << std::endl;
     } catch (const std::exception &e) {
         std::cerr << e.what() << std::endl;

@@ -2354,7 +2354,7 @@ if (UNIT_TEST)
             # Keep the reduction tree fixed across the separate eager/graph
             # processes: auto tuning can otherwise choose different backends.
             set_tests_properties(naive_n05_tp_graph PROPERTIES
-                ENVIRONMENT "FASTLLM_CUDA_CUSTOM_ALLREDUCE=1" LABELS cuda RUN_SERIAL TRUE TIMEOUT 730
+                ENVIRONMENT "FASTLLM_CUDA_CUSTOM_ALLREDUCE=1" LABELS cuda RUN_SERIAL TRUE TIMEOUT 1450
                 SKIP_REGULAR_EXPRESSION "FASTLLM_TEST_SKIP_NO_DEVICE")
             add_test(NAME naive_n05_tp_fp8_graph COMMAND "${CMAKE_COMMAND}"
                 "-DTEST_EXECUTABLE=$<TARGET_FILE:naive_n05_tp_graph_test>"
@@ -2362,7 +2362,7 @@ if (UNIT_TEST)
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/test/basic/run_naive_tp_graph_test.cmake")
             set_tests_properties(naive_n05_tp_fp8_graph PROPERTIES
                 ENVIRONMENT "FASTLLM_TEST_NAIVE_FP8=1;FASTLLM_CUDA_CUSTOM_ALLREDUCE=1" LABELS "cuda;multigpu"
-                RUN_SERIAL TRUE TIMEOUT 730 SKIP_REGULAR_EXPRESSION "FASTLLM_TEST_SKIP_NO_DEVICE")
+                RUN_SERIAL TRUE TIMEOUT 1450 SKIP_REGULAR_EXPRESSION "FASTLLM_TEST_SKIP_NO_DEVICE")
         endif()
 
         add_executable(naive_n05_tp_test test/basic/test_naive_n05_tp.cpp)
