@@ -26,14 +26,25 @@ namespace fastllm {
         // per-device budgets; expert dispatch handles their cache fallback.
         const bool tpHostMoe =
             threadTpRank >= 0 && threadTpOwner != nullptr && threadTpOwner->hybrid.hostMoe;
-        const bool moeCudaCache =
-            !tpHostMoe && hiddenStates.dims.size() == 3 && hiddenStates.dims[1] > 0 &&
+        const bool cacheShapeSupported =
+            hiddenStates.dims.size() == 3 && hiddenStates.dims[1] > 0 &&
             hiddenStates.dims[1] <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
-            (hiddenStates.dims[1] == 1 || mtpTargetGraph) && !this->weights.empty() &&
-            !this->weights[0].empty() && MoeCudaCacheAvailable(this->weights[0]);
-        const bool hybridMoe =
-            !tpHostMoe && !this->weights.empty() && !this->weights[0].empty() &&
-            FastllmCudaUseMoeHybrid(this->weights[0].data(), this->weights[0].size());
+            (hiddenStates.dims[1] == 1 || mtpTargetGraph);
+        bool moeCudaCache = false;
+        bool hybridMoe = false;
+        if (!tpHostMoe) {
+            // A CUDA-resident prefix is not registered with the host cache.
+            // Find the actual host tables, including the ordinary CPU backend
+            // used when NUMA is disabled. Keep their CPU decisions outside
+            // capture by selecting the existing dense-segment graph path.
+            for (auto &table : this->weights) {
+                if (table.empty()) continue;
+                hybridMoe |= FastllmCudaUseMoeHybrid(table.data(), table.size());
+                if (cacheShapeSupported && !moeCudaCache)
+                    moeCudaCache = MoeCudaCacheAvailable(table);
+                if (hybridMoe && (moeCudaCache || !cacheShapeSupported)) break;
+            }
+        }
         const bool hybridDenseGraph = (tpHostMoe || hybridMoe) && hiddenStates.dims.size() == 3 &&
                                       (hiddenStates.dims[1] == 1 || mtpTargetGraph);
         const bool moeDeviceMapGraphCompatible =
@@ -69,7 +80,8 @@ namespace fastllm {
     }
 
 #ifdef USE_CUDA
-    void Qwen4ExpModel::DecodeGraphExecution::RunHybridDenseBody(int layer) {
+    void Qwen4ExpModel::DecodeGraphExecution::RunHybridDensePrefix(
+            int layer, Data &input, Data &injection) {
         ApplyDeviceMap(model.deviceMap, layer + 1, model.block_cnt);
         const std::string attentionHyperPrefix =
             model.languagePrefix + "layers." + std::to_string(layer) + ".attn_hyper_connection.";
@@ -93,9 +105,12 @@ namespace fastllm {
                                       model.weight[attentionHyperPrefix + "hc_norm.weight"],
                                       graphState->hiddenStates[0], attentionNorm);
         }
-        Data input, injection, output;
         model.HyperMixNormalized(attentionNorm, attentionHyperPrefix, input, &injection);
-        attentionNorm.FreeSpace();
+    }
+
+    void Qwen4ExpModel::DecodeGraphExecution::RunHybridDenseBody(int layer) {
+        Data input, injection, output;
+        RunHybridDensePrefix(layer, input, injection);
         if (model.IsLinearAttentionLayer(layer)) {
             model.RunLinearAttention(
                 layer, input, pastKeyValues[layer].first, pastKeyValues[layer].second, output,
@@ -121,6 +136,11 @@ namespace fastllm {
             FastllmCudaSetThreadError();
             return;
         }
+        RunHybridDenseSuffix(layer, output, injection);
+    }
+
+    void Qwen4ExpModel::DecodeGraphExecution::RunHybridDenseSuffix(
+            int layer, const Data &output, const Data &injection) {
         const std::string mlpHyperPrefix =
             model.languagePrefix + "layers." + std::to_string(layer) + ".mlp_hyper_connection.";
         Data mlpNorm;
@@ -136,6 +156,39 @@ namespace fastllm {
             model.TryPipelineMoeReadback(boundary.input, boundary.moe.index, boundary.moe.score);
 #endif
     }
+    void Qwen4ExpModel::DecodeGraphExecution::RunHybridEagerAttention(int layer) {
+        auto &boundary = graphState->hybridBoundaries[layer];
+        const auto *previous = layer > graphStartLayer
+                                   ? &graphState->hybridBoundaries[layer - 1].moe
+                                   : nullptr;
+        const int joinMask = previous ? previous->result.JoinMask() : 0;
+        // Existing dense/shared/final graph keys are nonnegative. Odd negative
+        // keys identify prefix topology; even negative keys identify suffixes.
+        const int prefixKey = -2 * (layer + (model.block_cnt + 1) * joinMask) - 1;
+        const int suffixKey = -2 * (layer + 1);
+        runCapturedSegment(prefixKey, [&]() {
+            RunHybridDensePrefix(layer, boundary.attentionInput, boundary.attentionInjection);
+        });
+
+        // Keep the exact ordinary attention path, including QSA, KV growth,
+        // logical lengths, projection reductions and masks, outside capture.
+        Data attentionOutput;
+        model.RunFullAttention(
+            layer, boundary.attentionInput,
+            hybridCausalMask ? *hybridCausalMask : attentionMask,
+            graphState->positionIds, qsaDeviceCompatibleMask, pastKeyValues[layer].first,
+            pastKeyValues[layer].second, requestState, attentionOutput,
+            verificationCapture ? &verificationCapture->qsaRawKeys[layer] : nullptr);
+        const void *previousOutput = boundary.attentionOutput.cudaData;
+        AssertInFastLLM(
+            Qwen4PrepareDecodeGraphTensor(boundary.attentionOutput, attentionOutput, device) &&
+                (previousOutput == nullptr || previousOutput == boundary.attentionOutput.cudaData),
+            "Qwen4 eager attention graph boundary changed storage.");
+        runCapturedSegment(suffixKey, [&]() {
+            RunHybridDenseSuffix(layer, boundary.attentionOutput, boundary.attentionInjection);
+        });
+    }
+
     void Qwen4ExpModel::DecodeGraphExecution::RunHybridFinalBody() {
         auto &last = graphState->hybridBoundaries[graphEndLayer - 1];
         if (last.moe.result.peerOutput)
@@ -182,7 +235,7 @@ namespace fastllm {
         for (int layer = graphStartLayer; layer < graphEndLayer; ++layer) {
             const bool linearAttention = model.IsLinearAttentionLayer(layer);
             if (hybridEagerAttention && !linearAttention) {
-                RunHybridDenseBody(layer);
+                RunHybridEagerAttention(layer);
             } else {
                 const int variant = linearAttention  ? 0
                                     : mtpTargetGraph ? model.indexerCompressRatio

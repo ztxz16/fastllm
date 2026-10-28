@@ -27,6 +27,11 @@ namespace fastllm {
             Data injection;
             Data output;
             MoEPrepared moe;
+            // Eager attention sits between two fixed dense graphs. These
+            // tensors outlive capture/replay and never alias eager scratch.
+            Data attentionInput;
+            Data attentionInjection;
+            Data attentionOutput;
         };
         // CPU experts execute between dense graphs. Each boundary owns stable
         // storage, with dtype and shape established by its eager warmup.
@@ -89,6 +94,9 @@ namespace fastllm {
         void PrepareHybridMask();
         void RunHybrid();
         void RunHybridDenseBody(int layer);
+        void RunHybridDensePrefix(int layer, Data &input, Data &injection);
+        void RunHybridDenseSuffix(int layer, const Data &output, const Data &injection);
+        void RunHybridEagerAttention(int layer);
         void RunHybridFinalBody();
     };
 #endif

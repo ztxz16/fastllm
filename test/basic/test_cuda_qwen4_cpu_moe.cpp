@@ -9,6 +9,9 @@
 #include "executor.h"
 #include "gguf.h"
 #include "models/qwen4_exp.h"
+#include "../../src/models/qwen4_exp_graph.h"
+#include "../../src/models/qwen4_exp_execution.h"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "utils.h"
 #include "utils/host_moe_prefill.h"
 #include "utils/host_moe_decode.h"
@@ -20,6 +23,26 @@ using namespace fastllm;
 
 namespace fastllm {
 struct Qwen4GGUFTestAccess {
+    static void TestDenseBoundaryGraphs();
+    static std::pair<bool, bool> GraphPolicy(std::vector<Data *> &hostWeights,
+                                            int sequence, bool registeredHost = true,
+                                            bool cpuPlacement = true) {
+        Qwen4ExpModel model;
+        Data residentExpert;
+        // Distinct identities model a CUDA prefix, followed by a registered
+        // host table. The policy must not infer all layers from weights[0].
+        model.weights = {{nullptr, nullptr, &residentExpert, &residentExpert}};
+        if (registeredHost) model.weights.push_back(hostWeights);
+        model.moeDeviceMap = cpuPlacement
+            ? std::map<std::string, int>{{"cuda:0", 1}, {"cpu", 1}}
+            : std::map<std::string, int>{{"cuda:0", 1}};
+        Data hidden(FLOAT32, {1, sequence, 256});
+        const auto policy = model.HybridDecodeGraphPolicy(hidden, false);
+        // The test borrows the registration owned by TestDecodeCache.
+        model.weights.clear();
+        return {policy.hybridDense, policy.eligible};
+    }
+
     static void Run(Qwen4ExpModel &model, const Data &input, Data &output,
                     std::vector<Data *> &weights, std::vector<Data *> &bias) {
         Qwen4ExpModel::MoEExecutionPlan plan;
@@ -206,6 +229,20 @@ static void TestDecodeCache(int type,bool repack,bool resident) {
     for(int step=0;step<64;++step) {
         void *policy=FastllmCudaBeginMoeDecode(weights.data(),int(weights.size()),topk);
         Check(policy!=nullptr,"host decode policy unavailable");
+        if (step == 0) {
+            const auto graph = Qwen4GGUFTestAccess::GraphPolicy(weights, 1);
+            Check(graph.first && graph.second,
+                  "CUDA prefix / ordinary CPU suffix did not select dense graphs");
+            const auto unsupported = Qwen4GGUFTestAccess::GraphPolicy(weights, 1, false);
+            Check(!unsupported.first && !unsupported.second,
+                  "unregistered CPU backend was admitted to full graph capture");
+            const auto prefill = Qwen4GGUFTestAccess::GraphPolicy(
+                weights, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH + 1);
+            Check(!prefill.first && !prefill.second,
+                  "prefill was admitted to a decode graph");
+            const auto gpu = Qwen4GGUFTestAccess::GraphPolicy(weights, 1, false, false);
+            Check(!gpu.first && gpu.second, "CUDA-only graph policy regressed");
+        }
         Data output;
         Check(FastllmCudaMergeMOEHybrid(x,index,score,output,weights.data(),int(weights.size()),0),"host dynamic decode rejected");
         FastllmCudaEndMoeDecode(policy);
@@ -278,6 +315,112 @@ static void TestDecodeWorkerRecovery() {
     std::puts("PASS decode worker recovery and reuse");
 }
 
+// Exercise the actual prefix/suffix at the model's decode dimensions. The
+// intervening attention output deliberately changes on every replay; attention
+// itself stays eager and is not replaced or approximated by this change.
+void fastllm::Qwen4GGUFTestAccess::TestDenseBoundaryGraphs() {
+    constexpr int hidden=2560, hc=4, lowRank=320;
+    Qwen4ExpModel model;
+    model.block_cnt=2; model.embed_dim=hidden; model.hcCount=hc;
+    model.num_experts=512; model.num_experts_per_tok=10; model.norm_topk_prob=true;
+    model.deviceMap={{"cuda:0",1}};
+    FastllmCudaSetDevice(0);
+    ((Executor *)GetExecutor())->SetFirstDevice("cuda:0");
+    auto weight=[&](const std::string &name, std::vector<int> dims, bool norm, int seed) {
+        int count=1; for(int d:dims) count*=d;
+        std::vector<float> v(count);
+        for(int i=0;i<count;++i) v[i]=norm?1.0f:std::sin(float((i+seed)%1021)*.031f)*.004f;
+        Data source(norm?FLOAT32:FLOAT16,dims,v);
+        model.weight[name].CopyFrom(source);
+        model.weight[name].ToDevice(CUDA,std::vector<int>{0});
+    };
+    for(int layer=0;layer<2;++layer) {
+        const auto prefix=model.languagePrefix+"layers."+std::to_string(layer)+".";
+        for(const auto &branch:{"attn_hyper_connection.","mlp_hyper_connection."}) {
+            const auto path=prefix+branch;
+            weight(path+"hc_norm.weight",{hc*hidden},true,0);
+            weight(path+"input_mix_weight_down.weight",{lowRank,hc*hidden},false,13+layer);
+            weight(path+"block_inject_weight.weight",{hc,hc*hidden},false,23+layer);
+            weight(path+"input_mix_weight_up.weight",{hc*hidden,lowRank},false,37+layer);
+        }
+        weight(prefix+"mlp.gate.weight",{512,hidden},false,51+layer);
+    }
+    auto fill=[](Data &destination,int width,int seed) {
+        std::vector<float> v(width);
+        for(int i=0;i<width;++i) v[i]=std::sin(float(i+seed)*.017f)*.1f;
+        Data source(FLOAT32,{1,1,width},v);source.ToDevice(CUDA,std::vector<int>{0});
+        Check(Qwen4PrepareDecodeGraphTensor(destination,source,0),"boundary input copy failed");
+    };
+    auto bytes=[](Data &data) {
+        ForceDeviceSync();Data copy;copy.CopyFrom(data);copy.ToDevice(CPU);
+        return std::vector<uint8_t>(copy.cpuData,copy.cpuData+copy.GetBytes());
+    };
+    int replayCount=0;
+    for(int variant=0;variant<5;++variant) {
+        const int layer=variant==0?0:1, mask=variant==0?0:variant-1;
+        Qwen4ExpModel::DecodeCudaGraphState eager, captured;
+        eager.device=captured.device=0;
+        Data peers[2],empty;
+        std::vector<std::pair<Data,Data>> kv(2);
+        Qwen4ExpModel::RequestState request;
+        auto initialize=[&](Qwen4ExpModel::DecodeCudaGraphState &state,Data &peer,int step) {
+            fill(state.hiddenStates[0],hc*hidden,step*97);
+            fill(state.hiddenStates[1],hc*hidden,step*101);
+            auto &previous=state.hybridBoundaries[0];
+            fill(previous.output,hidden,step*103);
+            fill(previous.injection,hc,step*107);
+            fill(previous.moe.result.sharedOutput,hidden,step*109);
+            fill(peer,hidden,step*113);
+            previous.moe.result.sharedDeferred=(mask&1)!=0;
+            previous.moe.result.peerOutput=(mask&2)?&peer:nullptr;
+        };
+        auto execution=[&](Qwen4ExpModel::DecodeCudaGraphState &state) {
+            return Qwen4ExpModel::DecodeGraphExecution{model,&state,0,2,1,0,100,
+                0,0,false,false,false,true,true,false,true,true,
+                empty,empty,kv,request,nullptr,{}, {}};
+        };
+        auto a=execution(eager), b=execution(captured);
+        auto &ea=eager.hybridBoundaries[layer];auto &cb=captured.hybridBoundaries[layer];
+        auto prefix=[&] {b.RunHybridDensePrefix(layer,cb.attentionInput,cb.attentionInjection);};
+        auto suffix=[&] {b.RunHybridDenseSuffix(layer,cb.attentionOutput,cb.attentionInjection);};
+        auto capture=[&](int key,const std::function<void()> &body) {
+            auto &segment=captured.segments[key];
+            {FastllmCudaAllocationRecorder recorder(&segment.allocationRequests);body();}
+            Check(FastllmCudaGraphPrepareCaptureDevice(),"prepare capture failed");ForceDeviceSync();
+            Check(FastllmCudaReserveGraphWorkspace(segment.allocationRequests),"reserve capture workspace failed");
+            Check(FastllmCudaGraphMemoryPoolBegin(),"capture pool failed");
+            Check(FastllmCudaGraphBeginCapture(),"begin capture failed");body();
+            Check(FastllmCudaGraphEndCapture(&segment.graph),"end capture failed");
+            Check(FastllmCudaGraphMemoryPoolEnd(segment.reservedPointers),"end pool failed");
+            Check(FastllmCudaGraphInstantiate(segment.graph,&segment.exec),"instantiate failed");
+        };
+        initialize(captured,peers[1],0);capture(0,prefix);
+        Check(FastllmCudaGraphLaunch(captured.segments[0].exec),"initial prefix replay failed");
+        fill(cb.attentionOutput,hidden,0);capture(1,suffix);
+        for(int step=1;step<=8;++step) {
+            initialize(eager,peers[0],step);initialize(captured,peers[1],step);
+            a.RunHybridDensePrefix(layer,ea.attentionInput,ea.attentionInjection);
+            Check(FastllmCudaGraphLaunch(captured.segments[0].exec),"prefix replay failed");
+            Check(bytes(ea.attentionInput)==bytes(cb.attentionInput),"prefix replay changed input");
+            Check(bytes(ea.attentionInjection)==bytes(cb.attentionInjection),"prefix replay changed injection");
+            // Same stable bridge as production, refreshed after eager attention.
+            const void *address=cb.attentionOutput.cudaData;
+            fill(ea.attentionOutput,hidden,step*127);fill(cb.attentionOutput,hidden,step*127);
+            Check(cb.attentionOutput.cudaData==address,"attention bridge address changed");
+            a.RunHybridDenseSuffix(layer,ea.attentionOutput,ea.attentionInjection);
+            Check(FastllmCudaGraphLaunch(captured.segments[1].exec),"suffix replay failed");
+            Check(bytes(eager.hiddenStates[1])==bytes(captured.hiddenStates[1]),"suffix residual differs");
+            Check(bytes(ea.input)==bytes(cb.input),"suffix input differs");
+            Check(bytes(ea.injection)==bytes(cb.injection),"suffix injection differs");
+            Check(bytes(ea.moe.index)==bytes(cb.moe.index),"suffix router indices differ");
+            Check(bytes(ea.moe.score)==bytes(cb.moe.score),"suffix router scores differ");
+            replayCount+=2;
+        }
+        ForceDeviceSync();
+    }
+    std::printf("PASS dense attention boundary graphs: %d replays, first layer + four join masks, bitwise equal\n",replayCount);
+}
+
 int main() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
@@ -302,6 +445,7 @@ int main() {
         TestDecodeCache(GGML_TYPE_IQ2_XXS,true,true);
         TestDecodeCache(GGML_TYPE_IQ1_M,false,true);
         TestDecodeWorkerRecovery();
+        Qwen4GGUFTestAccess::TestDenseBoundaryGraphs();
         std::puts("ALL_PASS");
         return 0;
     } catch (const std::exception &error) {
