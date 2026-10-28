@@ -310,6 +310,9 @@ void FastllmCudaNaiveDraftEmbedding(const fastllm::Data &ids, int step,
 void FastllmCudaNaiveDraftArgmax(const fastllm::Data &base,
     const fastllm::Data &bias, int step, fastllm::Data &partial,
     fastllm::Data &ids);
+// Merge one BF16 draft row and bias with BF16 rounding, then apply its token mask.
+void FastllmCudaNaiveDraftSamplingLogits(const fastllm::Data &base,
+    const fastllm::Data &bias, const fastllm::Data &mask, int step, fastllm::Data &output);
 // Join leading rows of dense, equal-width BF16 features on the current GPU.
 // Unsupported layouts return false before modifying output.
 bool FastllmCudaNaiveDraftConcat(const std::vector<const fastllm::Data *> &inputs,

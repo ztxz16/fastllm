@@ -3,6 +3,7 @@
 #include "json11.hpp"
 #include "executor.h"
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
@@ -44,6 +45,21 @@ struct NaiveN05FlashModel::DraftWorkspace {
         std::vector<void *> weights;
         Data logits, ids, latent, bias, partial;
     } proposal;
+    struct SamplingProposal {
+        std::vector<Graph> graphs;
+        std::array<void *, 3> inputs{};
+        Data logits, ids, latent, bias, row, mask;
+        void *sampler = nullptr;
+        float temperature = -1, topP = -1;
+        int topK = 0;
+        bool disabled = false;
+        void Clear() {
+            for (auto &graph : graphs) graph.Clear();
+            graphs.clear();
+            FastllmCudaMtpDestroyDraftSampler(sampler);
+            sampler = nullptr;
+        }
+    } sampling;
     struct ContextLayer { Data raw, key, value; };
     int device = -1;
     bool disabled = false;
@@ -60,6 +76,7 @@ struct NaiveN05FlashModel::DraftWorkspace {
         if (device >= 0) FastllmCudaSetDevice(device);
         for (auto &graph : graphs) graph.Clear();
         proposal.graph.Clear();
+        sampling.Clear();
         if (ready) FastllmCudaEventDestroy(ready);
         if (done) FastllmCudaEventDestroy(done);
         // Data frees use their recorded device; restore the caller's selection.
@@ -617,6 +634,107 @@ bool NaiveN05FlashModel::RunDraftProposalGraph(int anchor, const Data &baseLogit
 #endif
 }
 
+bool NaiveN05FlashModel::RunDraftSamplingStep(int previous, int step, const Data &baseLogits,
+        DraftContext &context, const GenerationConfig &config, int &token) {
+#ifdef USE_CUDA
+    if (!GetFastllmEnv().cudaGraph || !context.workspace || baseLogits.dataType != BFLOAT16 ||
+        baseLogits.dims.size() != 3 || baseLogits.dims[0] != 1 ||
+        baseLogits.dims[1] <= 0 || baseLogits.dims[1] > draftBlock ||
+        step < 0 || step >= baseLogits.dims[1] || baseLogits.dims[2] >= (1 << 24))
+        return false;
+    ApplyDraftDevice();
+    const int device = FastllmCudaGetDevice(), vocab = baseLogits.dims.back();
+    const int rows = baseLogits.dims[1], words = (vocab + 31) / 32;
+    const auto &devices = baseLogits.dataDeviceIds;
+    if (context.workspace->device != device || baseLogits.dataDevice != DataDevice::CUDA ||
+        (devices.size() != 1 || devices.front() != device) || previous < 0 || previous >= vocab ||
+        context.proposalProbs.dims != std::vector<int>({rows, vocab}) ||
+        context.proposalProbs.dataDevice != DataDevice::CUDA ||
+        context.proposalProbs.dataDeviceIds != devices)
+        return false;
+    Data &w1 = weight["dspark.markov_head.markov_w1.weight"];
+    Data &w2 = weight["dspark.markov_head.markov_w2.weight"];
+    if (w1.dataType != BFLOAT16 || w2.dataType != BFLOAT16 || w1.dims.size() != 2 ||
+        w1.dims[0] != vocab || w2.dims != w1.dims) return false;
+    w1.ToDevice(DataDevice::CUDA, devices);
+    w2.ToDevice(DataDevice::CUDA, devices);
+    auto &p = context.workspace->sampling;
+    const std::array<void *, 3> inputs{w1.cudaData, w2.cudaData, context.proposalProbs.cudaData};
+    if (p.inputs != inputs || p.logits.dims != baseLogits.dims ||
+        p.temperature != config.temperature || p.topK != config.top_k || p.topP != config.top_p) {
+        p.Clear(); p.disabled = false;
+        p.inputs = inputs;
+        p.temperature = config.temperature; p.topK = config.top_k; p.topP = config.top_p;
+    }
+    if (p.disabled || (step > 0 && !p.sampler)) return false;
+    if (step == 0) {
+        Copy(baseLogits, p.logits);
+        for (auto item : {std::make_pair(&p.ids, rows + 1), std::make_pair(&p.mask, words)}) {
+            item.first->dataType = item.first == &p.ids ? FLOAT32 : INT32;
+            item.first->Resize({item.second});
+            item.first->ToDevice(DataDevice::CUDA, devices, false);
+            item.first->Allocate(false);
+        }
+        p.graphs.resize(rows);
+        if (!p.sampler)
+            p.sampler = FastllmCudaMtpCreateDraftSampler(vocab, config.temperature, config.top_k, config.top_p);
+        if (!p.sampler) { p.disabled = true; return false; }
+    }
+    if (config.tool_call_token_mask) {
+        AssertInFastLLM(config.tool_call_token_mask->size() >= (size_t)words, "Invalid draft sampling mask.");
+        FastllmCudaCopyFromHostToDevice(p.mask.cudaData, const_cast<uint32_t *>(config.tool_call_token_mask->data()), words * sizeof(uint32_t));
+    } else if (step == 0) {
+        std::vector<uint32_t> mask(words, ~uint32_t(0));
+        FastllmCudaCopyFromHostToDevice(p.mask.cudaData, mask.data(), words * sizeof(uint32_t));
+    }
+    float id = previous;
+    FastllmCudaCopyFromHostToDevice((float *)p.ids.cudaData + step, &id, sizeof(id));
+    AssertInFastLLM(FastllmCudaMtpDraftSamplerSetSeed(p.sampler), "Cannot update draft sampling seed.");
+    auto body = [&] {
+        FastllmCudaNaiveDraftEmbedding(p.ids, step, w1, p.latent);
+        DraftLinear(p.latent, w2, p.bias);
+        FastllmCudaNaiveDraftSamplingLogits(p.logits, p.bias, p.mask, step, p.row);
+        AssertInFastLLM(FastllmCudaMtpDraftSamplerRun(p.sampler, (float *)p.row.cudaData,
+            (float *)context.proposalProbs.cudaData + (size_t)step * vocab,
+            (float *)p.ids.cudaData + step + 1), "Draft graph sampling failed.");
+    };
+    auto &graph = p.graphs[step];
+    if (graph.exec) {
+        AssertInFastLLM(FastllmCudaGraphLaunch(graph.exec), "Draft sampling graph replay failed.");
+    } else {
+        body();
+        bool pool = FastllmCudaGraphPrepareCaptureDevice() && FastllmCudaGraphMemoryPoolBegin(), ok = false;
+        if (pool) {
+            FastllmCudaClearThreadError();
+            if (FastllmCudaGraphBeginCapture()) {
+                try { body(); }
+                catch (...) {
+                    FastllmCudaGraphEndCapture(&graph.graph);
+                    FastllmCudaGraphMemoryPoolEnd(graph.reserved);
+                    graph.Clear(); p.disabled = true;
+                    throw;
+                }
+                bool clean = !FastllmCudaGetThreadError();
+                ok = FastllmCudaGraphEndCapture(&graph.graph) && clean;
+            }
+            ok = FastllmCudaGraphMemoryPoolEnd(graph.reserved) && ok;
+            if (ok) ok = FastllmCudaGraphInstantiate(graph.graph, &graph.exec);
+        }
+        if (!ok) {
+            graph.Clear(); p.disabled = true;
+            FastllmCudaClearLastError(); FastllmCudaClearThreadError();
+            return false;
+        }
+    }
+    FastllmCudaCopyFromDeviceToHost(&id, (float *)p.ids.cudaData + step + 1, sizeof(id));
+    token = (int)id;
+    AssertInFastLLM(token >= 0 && token < vocab, "Draft sampling graph produced an invalid token.");
+    return true;
+#else
+    return false;
+#endif
+}
+
 void NaiveN05FlashModel::ApplyDraftDevice() {
     if (tpDevices.empty()) ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
     else ApplyDeviceMap({{"cuda:" + std::to_string(tpDevices.front()), 1}}, 1, 1);
@@ -1068,55 +1186,64 @@ int NaiveN05FlashModel::ForwardDraft(
     bool gpuProposal = !config.tool_call_grammar && greedy && draftConfidenceThreshold == 0 &&
         RunDraftProposalGraph(anchor, baseLogits, context, proposed);
     for (int step = 0; !gpuProposal && step < limit; ++step) {
-        Data previousId(FLOAT32, {1, 1}, {(float)previous}), latent, bias, logits;
-        Embedding(previousId, weight["dspark.markov_head.markov_w1.weight"], latent);
-        ToDataType(latent, BFLOAT16);
-        if (step > 0 && draftConfidenceThreshold > 0) {
-            Data h, features, confidence;
-            Split(draftHidden, 1, step, step + 1, h);
-            Cat(h, latent, -1, features);
-            ToDataType(features, FLOAT32);
-            Linear(features, weight["dspark.confidence_head.proj.weight"],
-                   weight["dspark.confidence_head.proj.bias"], confidence);
-            confidence.ToDevice(DataDevice::CPU);
-            float probability = 1.0f / (1.0f + std::exp(-((float *)confidence.cpuData)[0]));
-            if (probability < draftConfidenceThreshold) break;
-        }
-        DraftLinear(latent, weight["dspark.markov_head.markov_w2.weight"], bias);
-        Split(baseLogits, 1, step, step + 1, logits);
-        AddTo(logits, bias);
-        ToDataType(logits, FLOAT32);
         if (config.tool_call_grammar) {
             PrepareToolCallConstraint(proposalConfig);
-            ApplyToolTokenMask(logits, 0, proposalConfig);
         }
-        if (greedy) {
-            Data top;
-            TopK(logits, top, 1);
-            top.ToDevice(DataDevice::CPU);
-            previous = (int)((float *)top.cpuData)[0];
-        }
+        bool sampled = false;
 #ifdef USE_CUDA
-        else if (selection.cudaLogits) {
-            FastllmCudaSetDevice(logits.dataDeviceIds.at(0));
-            AssertInFastLLM(FastllmCudaMtpSampleDraft((float *)logits.cudaData,
-                (float *)context.proposalProbs.cudaData + (size_t)step * vocab,
-                &config.temperature, &config.top_k, &config.top_p, &previous, 1, vocab),
-                "Naive CUDA proposal sampling failed.");
-        }
+        if (!greedy && selection.cudaLogits && draftConfidenceThreshold == 0)
+            sampled = RunDraftSamplingStep(previous, step, baseLogits, context, proposalConfig, previous);
 #endif
-        else {
+        if (!sampled) {
+            Data previousId(FLOAT32, {1, 1}, {(float)previous}), latent, bias, logits;
+            Embedding(previousId, weight["dspark.markov_head.markov_w1.weight"], latent);
+            ToDataType(latent, BFLOAT16);
+            if (step > 0 && draftConfidenceThreshold > 0) {
+                Data h, features, confidence;
+                Split(draftHidden, 1, step, step + 1, h);
+                Cat(h, latent, -1, features);
+                ToDataType(features, FLOAT32);
+                Linear(features, weight["dspark.confidence_head.proj.weight"],
+                       weight["dspark.confidence_head.proj.bias"], confidence);
+                confidence.ToDevice(DataDevice::CPU);
+                float probability = 1.0f / (1.0f + std::exp(-((float *)confidence.cpuData)[0]));
+                if (probability < draftConfidenceThreshold) break;
+            }
+            DraftLinear(latent, weight["dspark.markov_head.markov_w2.weight"], bias);
+            Split(baseLogits, 1, step, step + 1, logits);
+            AddTo(logits, bias);
+            ToDataType(logits, FLOAT32);
+            if (config.tool_call_grammar) {
+                ApplyToolTokenMask(logits, 0, proposalConfig);
+            }
+            if (greedy) {
+                Data top;
+                TopK(logits, top, 1);
+                top.ToDevice(DataDevice::CPU);
+                previous = (int)((float *)top.cpuData)[0];
+            }
 #ifdef USE_CUDA
-            if (logits.dataDevice == DataDevice::CUDA &&
-                FastllmNaiveCanSelectLogits(vocab, 0, selection.count, false)) {
-                int count = std::min(selection.count, vocab);
-                FastllmCudaNaiveLogitsSelect(logits, 0, count, false, 1.0f, proposalPartial, proposalTop);
-                FastllmCudaCopyFromDeviceToHost(proposalCandidates.data(), proposalTop.cudaData, proposalTop.GetBytes());
-                q.push_back(SpeculativeTopKDistribution(proposalCandidates.data(), count, vocab, config));
-            } else
+            else if (selection.cudaLogits) {
+                FastllmCudaSetDevice(logits.dataDeviceIds.at(0));
+                AssertInFastLLM(FastllmCudaMtpSampleDraft((float *)logits.cudaData,
+                    (float *)context.proposalProbs.cudaData + (size_t)step * vocab,
+                    &config.temperature, &config.top_k, &config.top_p, &previous, 1, vocab),
+                    "Naive CUDA proposal sampling failed.");
+            }
 #endif
-                q.push_back(distribution(logits, 0, oldLength + step + 1, samplingTokens, proposalConfig));
-            previous = SampleSpeculativeDistribution(q.back(), context.Uniform());
+            else {
+#ifdef USE_CUDA
+                if (logits.dataDevice == DataDevice::CUDA &&
+                    FastllmNaiveCanSelectLogits(vocab, 0, selection.count, false)) {
+                    int count = std::min(selection.count, vocab);
+                    FastllmCudaNaiveLogitsSelect(logits, 0, count, false, 1.0f, proposalPartial, proposalTop);
+                    FastllmCudaCopyFromDeviceToHost(proposalCandidates.data(), proposalTop.cudaData, proposalTop.GetBytes());
+                    q.push_back(SpeculativeTopKDistribution(proposalCandidates.data(), count, vocab, config));
+                } else
+#endif
+                    q.push_back(distribution(logits, 0, oldLength + step + 1, samplingTokens, proposalConfig));
+                previous = SampleSpeculativeDistribution(q.back(), context.Uniform());
+            }
         }
         proposed.push_back(previous);
         samplingTokens.Push(previous);

@@ -4812,6 +4812,14 @@ __device__ void Top1BlockMax(float &score, int &id) {
         Top1WarpMax(score, id);
     }
 }
+__global__ void DraftSamplingLogits(const BF16 *base, const BF16 *bias,
+        const uint32_t *mask, float *output, int vocab) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < vocab)
+        output[i] = (mask[i / 32] & (uint32_t(1) << (i % 32)))
+            ? RoundBF16((float)base[i] + (float)bias[i]) : -INFINITY;
+}
+
 __global__ void DraftArgmaxPartial(const BF16 *base, const BF16 *bias,
                                   float2 *partial, int vocab) {
     float best = -INFINITY;
@@ -5001,6 +5009,15 @@ void FastllmCudaNaiveDraftArgmax(const fastllm::Data &base,
         (const BF16 *)bias.cudaData, (float2 *)partial.cudaData, vocab);
     DraftArgmaxFinish<<<1, 256>>>((const float2 *)partial.cudaData, blocks,
         (float *)ids.cudaData, step);
+    CheckLaunch();
+}
+void FastllmCudaNaiveDraftSamplingLogits(const fastllm::Data &base,
+        const fastllm::Data &bias, const fastllm::Data &mask, int step, fastllm::Data &output) {
+    int vocab = base.dims.back();
+    Output(output, fastllm::FLOAT32, {1, 1, vocab});
+    DraftSamplingLogits<<<(vocab + 255) / 256, 256>>>(
+        (const BF16 *)base.cudaData + (size_t)step * vocab, (const BF16 *)bias.cudaData,
+        (const uint32_t *)mask.cudaData, (float *)output.cudaData, vocab);
     CheckLaunch();
 }
 bool FastllmCudaNaiveDraftConcat(const std::vector<const fastllm::Data *> &inputs,

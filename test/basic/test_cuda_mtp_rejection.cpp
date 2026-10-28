@@ -297,6 +297,167 @@ void FullVocabularyCase() {
     }
     std::puts("152576-token vocabulary, sequential q rows, temperatures/top-p/ties: PASS");
 }
+void GraphTopPCase() {
+    for (int vocab : {65535, 65536, 152576}) {
+        for (int parameter = 0; parameter < 6; ++parameter) {
+            const float temperature = parameter == 4 ? .2f : parameter == 5 ? 1.5f : 1.f;
+            const float topP = parameter == 0 ? 1.f : parameter == 1 ? .5f :
+                               parameter == 2 ? .01f : .95f;
+            const int topK = parameter == 4 ? 50 : parameter == 5 ? 1 : vocab;
+            Buffer logits(vocab), q(vocab), reference(vocab), token(1);
+            void *sampler = FastllmCudaMtpCreateDraftSampler(vocab, temperature, topK, topP);
+            Require(sampler != nullptr, "cannot create top-p graph sampler");
+            std::vector<float> input(vocab, 0);
+            Check(cudaMemcpy(logits.p, input.data(), vocab * sizeof(float), cudaMemcpyHostToDevice));
+            Require(FastllmCudaMtpDraftSamplerSetSeed(sampler), "top-p graph seed failed");
+            Require(FastllmCudaMtpDraftSamplerRun(sampler, logits.p, q.p, token.p), "top-p warmup failed");
+            Check(cudaStreamSynchronize(cudaStreamPerThread));
+            cudaGraph_t graph;
+            cudaGraphExec_t executable;
+            Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+            Require(FastllmCudaMtpDraftSamplerRun(sampler, logits.p, q.p, token.p), "top-p capture failed");
+            Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+            Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+            for (int phase = 0; phase < 8; ++phase) {
+                for (int id = 0; id < vocab; ++id) {
+                    // Alternate sparse shortcuts and broad/overflow fallbacks in the same graph.
+                    float x = -30.f;
+                    if (phase == 0) x = id == 111 ? 0 : -30;
+                    if (phase == 1) x = 0;
+                    if (phase == 2) x = id < 32 ? -float(id % 7) / 2 : -30;
+                    if (phase == 3) x = id < 1800 ? -float(id % 3) / 8 : -30;
+                    if (phase == 4) x = id % 101 == 0 ? -float(id % 19) : -INFINITY;
+                    if (phase == 5) x = id == vocab - 1 ? 0 : -INFINITY;
+                    if (phase == 6) x = id < 2 ? std::log(.5f) : -INFINITY;
+                    if (phase == 7) x = -float((id * 73) % 1000) / 16;
+                    input[id] = x;
+                }
+                Check(cudaMemcpy(logits.p, input.data(), vocab * sizeof(float), cudaMemcpyHostToDevice));
+                int unused;
+                Require(FastllmCudaMtpSampleDraft(logits.p, reference.p, &temperature, &topK,
+                    &topP, &unused, 1, vocab), "top-p reference failed");
+                Require(FastllmCudaMtpDraftSamplerSetSeed(sampler), "top-p replay seed failed");
+                Check(cudaGraphLaunch(executable, cudaStreamPerThread));
+                auto actual = q.Read(), expected = reference.Read();
+                double error = 0, sum = 0;
+                for (int id = 0; id < vocab; ++id) {
+                    Require(std::isfinite(actual[id]) && actual[id] >= 0,
+                            "top-p graph produced an invalid probability");
+                    Require((actual[id] > 0) == (expected[id] > 0),
+                            "top-p graph changed the filtered support");
+                    error += std::fabs(actual[id] - expected[id]);
+                    sum += actual[id];
+                }
+                Require(error < 1e-4 && std::fabs(sum - 1) < 1e-5,
+                        "top-p graph disagrees with full-vocabulary reference");
+                int id = (int)token.Read()[0];
+                Require(id >= 0 && id < vocab && expected[id] > 0, "top-p graph sampled outside support");
+            }
+            Check(cudaGraphExecDestroy(executable));
+            Check(cudaGraphDestroy(graph));
+            FastllmCudaMtpDestroyDraftSampler(sampler);
+        }
+    }
+    std::puts("graph top-p: sparse/dense transitions, ties, masks, joint top-k, fallback boundaries: PASS");
+}
+
+void GraphSamplerCase() {
+    const int vocab = 152576, repeats = 2048;
+    const int selected[] = {17, 111, vocab - 1};
+    const float ts = 1, pp = .95f;
+    const int kk = vocab;
+    Buffer logits(vocab), q(vocab), reference(vocab), token(1);
+    void *state = FastllmCudaMtpCreateDraftSampler(vocab, ts, kk, pp);
+    Require(state != nullptr, "cannot create graph sampler");
+    std::vector<float> input(vocab, -INFINITY);
+    for (int i = 0; i < 3; ++i) input[selected[i]] = std::log((3-i)/6.f);
+    Check(cudaMemcpy(logits.p, input.data(), vocab * sizeof(float), cudaMemcpyHostToDevice));
+    Require(FastllmCudaMtpDraftSamplerSetSeed(state), "graph seed update failed");
+    Require(FastllmCudaMtpDraftSamplerRun(state, logits.p, q.p, token.p), "graph warmup failed");
+    Check(cudaStreamSynchronize(cudaStreamPerThread));
+    cudaGraph_t graph;
+    cudaGraphExec_t executable;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    Require(FastllmCudaMtpDraftSamplerRun(state, logits.p, q.p, token.p), "graph capture failed");
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    for (int phase = 0; phase < 2; ++phase) {
+        const float probabilities[2][3] = {{.6f,.3f,.1f}, {.1f,.2f,.7f}};
+        for (int i = 0; i < 3; ++i) input[selected[i]] = std::log(probabilities[phase][i]);
+        Check(cudaMemcpy(logits.p, input.data(), vocab * sizeof(float), cudaMemcpyHostToDevice));
+        int unused;
+        Require(FastllmCudaMtpSampleDraft(logits.p, reference.p, &ts, &kk, &pp, &unused, 1, vocab),
+                "graph reference sampling failed");
+        auto expected = reference.Read();
+        int counts[3] = {}, unchanged = 0, last = -1;
+        for (int n = 0; n < repeats; ++n) {
+            Require(FastllmCudaMtpDraftSamplerSetSeed(state), "replay seed update failed");
+            Check(cudaGraphLaunch(executable, cudaStreamPerThread));
+            float id;
+            Check(cudaMemcpy(&id, token.p, sizeof(id), cudaMemcpyDeviceToHost));
+            auto found = std::find(selected, selected + 3, (int)id);
+            Require(found != selected + 3, "graph sampled outside its probability support");
+            ++counts[found-selected];
+            unchanged += (int)id == last;
+            last = (int)id;
+        }
+        auto actual = q.Read();
+        double error = 0;
+        for (int i = 0; i < vocab; ++i) {
+            Require((actual[i] > 0) == (expected[i] > 0), "graph q support changed");
+            error += std::fabs(actual[i] - expected[i]);
+        }
+        Require(error < 1e-6, "graph q differs from the eager sampler");
+        Require(unchanged < repeats * .85, "graph replay reused a fixed random draw");
+        for (int i = 0; i < 3; ++i)
+            Require(std::fabs(double(counts[i])/repeats - probabilities[phase][i]) < .045,
+                    "graph draws disagree with the saved q distribution");
+    }
+    Check(cudaGraphExecDestroy(executable));
+    Check(cudaGraphDestroy(graph));
+    FastllmCudaMtpDestroyDraftSampler(state);
+    std::puts("sampling Graph: changing logits, fresh RNG, saved q, independent scratch: PASS");
+}
+void LargeVocabularyCase() {
+    for (int vocab : {65535, 65536, 65537, 152576, 153001}) {
+        const int rows = vocab == 65537 ? 33 : 8;
+        std::vector<float> logits((size_t)rows * vocab), ts(rows), ps(rows);
+        std::vector<int> ks(rows), ids(rows);
+        for (int row = 0; row < rows; ++row) {
+            ts[row] = row % 4 == 0 ? .2f : row % 4 == 1 ? .7f : row % 4 == 2 ? 1 : 1.5f;
+            ps[row] = row % 4 == 0 ? 1 : row % 4 == 1 ? .95f : row % 4 == 2 ? .5f : .01f;
+            ks[row] = row % 3 == 0 ? 0 : row % 3 == 1 ? 50 : vocab;
+            for (int id = 0; id < vocab; ++id) {
+                float value = -float((id * 73 + row * 19) % 1000) / 16;
+                if (row % 4 == 0) value = 0; // Equal-probability ties.
+                if (row % 4 == 2 && id % 101 != 0) value = -INFINITY;
+                if (row % 4 == 3) value = id == vocab - 1 ? 0 : -INFINITY;
+                logits[(size_t)row * vocab + id] = value;
+            }
+        }
+        Buffer input(logits), proposals(logits.size());
+        Require(FastllmCudaMtpSampleDraft(input.p, proposals.p, ts.data(), ks.data(), ps.data(),
+                                         ids.data(), rows, vocab), "large-vocabulary sampling failed");
+        auto actual = proposals.Read();
+        for (int row = 0; row < rows; ++row) {
+            auto begin = logits.begin() + (size_t)row * vocab;
+            auto expected = Oracle(std::vector<float>(begin, begin + vocab), ts[row], ks[row], ps[row]);
+            double error = 0, sum = 0;
+            for (int id = 0; id < vocab; ++id) {
+                float p = actual[(size_t)row * vocab + id];
+                Require(std::isfinite(p) && p >= 0, "invalid large-vocabulary probability");
+                Require((p > 0) == (expected[id] > 0), "large-vocabulary filter support changed");
+                error += std::fabs(p - expected[id]);
+                sum += p;
+            }
+            Require(error < 1e-4 && std::fabs(sum - 1) < 1e-5,
+                    "large-vocabulary probabilities disagree with CPU oracle");
+            Require(ids[row] >= 0 && ids[row] < vocab && expected[ids[row]] > 0,
+                    "large-vocabulary token outside filtered support");
+        }
+    }
+    std::puts("large-vocabulary dispatch boundaries, masks, ties, joint filtering: PASS");
+}
 }
 int main() {
     int n = 0;
@@ -307,6 +468,9 @@ int main() {
         DeviceFilterCase();
         MarkovGraphCase();
         FullVocabularyCase();
+        LargeVocabularyCase();
+        GraphSamplerCase();
+        GraphTopPCase();
         ChainCase("identical", {.6f,.3f,.1f}, {.6f,.3f,.1f}, 3, 32);
         ChainCase("different", {.6f,.3f,.1f}, {.3f,.5f,.2f}, 3, 17);
         ChainCase("seven drafts", {.6f,.3f,.1f}, {.3f,.5f,.2f}, 7, 32);

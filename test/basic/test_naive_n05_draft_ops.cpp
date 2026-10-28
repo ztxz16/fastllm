@@ -4,6 +4,7 @@
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include <cuda_runtime_api.h>
 #include <cmath>
+#include <cstring>
 #include <algorithm>
 #include <iostream>
 #include <limits>
@@ -71,7 +72,24 @@ int main() {
                     FastllmCudaNaiveDraftArgmax(base, bias, row, partial, ids);
                     Data host(ids); host.ToDevice(DataDevice::CPU);
                     Require(((float *)host.cpuData)[row + 1] == ((float *)top.cpuData)[0], "fused argmax differs from Top1");
-                    ++checks;
+                    auto maskBits = std::make_shared<std::vector<uint32_t>>((vocab + 31) / 32, ~uint32_t(0));
+                    for (int i = 0; i < vocab; ++i)
+                        if ((i + row) % 3 == 0) (*maskBits)[i / 32] &= ~(uint32_t(1) << (i % 32));
+                    Data mask(INT32, {(int)maskBits->size()});
+                    mask.Allocate();
+                    std::memcpy(mask.cpuData, maskBits->data(), maskBits->size() * sizeof(uint32_t));
+                    mask.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+                    GenerationConfig config; config.tool_call_token_mask = maskBits;
+                    ApplyToolTokenMask(logits, 0, config);
+                    Data fused;
+                    FastllmCudaNaiveDraftSamplingLogits(base, bias, mask, row, fused);
+                    fused.ToDevice(DataDevice::CPU); logits.ToDevice(DataDevice::CPU);
+                    for (int i = 0; i < vocab; ++i) {
+                        float a = ((float *)fused.cpuData)[i], b = ((float *)logits.cpuData)[i];
+                        Require((std::isnan(a) && std::isnan(b)) || std::memcmp(&a, &b, sizeof(float)) == 0,
+                                "fused sampling logits changed BF16 rounding or mask");
+                    }
+                    checks += 2;
                 }
             }
         }

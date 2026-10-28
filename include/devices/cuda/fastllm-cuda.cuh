@@ -1726,6 +1726,14 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
                                   int *output,
                                   int batch, int vocabSize);
+// Request-owned sampling workspace for CUDA Graph capture. Parameters are fixed
+// at creation; SetSeed runs outside capture before every execution. Run only
+// enqueues device work and writes both the actual q distribution and sampled ID.
+void *FastllmCudaMtpCreateDraftSampler(int vocab, float temperature, int topK, float topP);
+void FastllmCudaMtpDestroyDraftSampler(void *sampler);
+bool FastllmCudaMtpDraftSamplerSetSeed(void *sampler);
+bool FastllmCudaMtpDraftSamplerRun(void *sampler, float *logits, float *proposalProbs,
+                                 float *deviceToken);
 // proposalProbs is a persistent CUDA buffer; other arrays except logits are host arrays.
 // Draft sampling and verification intersect top-k/top-p on the original softmax.
 bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,

@@ -213,6 +213,8 @@ namespace fastllm {
         bool AppendDraftContextTP(Data &hidden, int start, DraftContext &context);
         bool RunDraftTP(int anchor, DraftContext &context, Data &output);
         bool RunDraftGraph(int anchor, DraftContext &context, Data &output);
+        bool RunDraftSamplingStep(int previous, int step, const Data &baseLogits,
+            DraftContext &context, const GenerationConfig &config, int &token);
         bool RunDraftProposalGraph(int anchor, const Data &baseLogits,
                                    DraftContext &context, std::vector<int> &proposed);
         Data RunDraft(int anchor, DraftContext &context);
