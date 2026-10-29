@@ -3292,6 +3292,24 @@ class FastLLmCompletion:
       if request.frequency_penalty and request.frequency_penalty != 0.0:
         frequency_penalty = request.frequency_penalty
 
+      clover_options = None
+      if getattr(self.model, "config", {}).get("model_type") == "clover_moe":
+          clover_options = dict(request.clover_options or {})
+          # OpenAI additive penalties are independent of repetition scaling.
+          # An omitted field uses the checkpoint default; explicit zero disables it.
+          for key in ("presence_penalty", "frequency_penalty"):
+              value = getattr(request, key)
+              if key in request.model_fields_set and value is not None:
+                  clover_options[key] = value
+              else:
+                  clover_options.setdefault(key, default_gen[key])
+          frequency_penalty = (request.repetition_penalty if request.repetition_penalty is not None
+                               else default_gen['repetition_penalty'])
+          if request.do_sample is not None:
+              do_sample = request.do_sample and request.temperature != 0
+          elif not any(getattr(request, key) is not None for key in ("temperature", "top_p", "top_k")):
+              do_sample = default_gen.get("do_sample", False)
+
       max_length = request.max_tokens if request.max_tokens else 32768
       min_length = request.min_tokens if request.min_tokens else 0
       stop_strings = self._normalize_stop_strings(request.stop)
@@ -3362,6 +3380,8 @@ class FastLLmCompletion:
       }
       if chat_template_kwargs is not None:
           launch_kwargs["chat_template_kwargs"] = chat_template_kwargs
+      if clover_options is not None:
+          launch_kwargs["clover_options"] = clover_options
       if self._is_kimi_k3_model():
           launch_kwargs.update({
               "thinking_effort": thinking_effort,

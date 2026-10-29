@@ -1065,7 +1065,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
-                        help = "投机解码算法；off 关闭，或选择 mtp、dspark、dflash")
+                        help = "投机解码算法；off 关闭，或选择 mtp、dspark、dflash、clover")
     parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path",
                         "--draft", "--draft_model_path", "--dspark_model",
                         dest = "speculative_draft_model_path", type = str, default = "",
@@ -1074,7 +1074,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置")
     parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
                         dest = "speculative_num_draft_tokens", type = int, default = -1,
-                        help = "DFlash 每轮 block token 数（含 anchor），默认读取 draft config")
+                        help = "DFlash/Clover 每轮 block token 数（含 anchor）")
     parser.add_argument("--speculative_dspark_block_size", "--speculative-dspark-block-size",
                         dest = "speculative_dspark_block_size", type = int, default = -1,
                         help = "DSpark block size；默认读取 draft config")
@@ -1291,9 +1291,11 @@ def make_normal_llm_model(args, startup_progress = None):
                 "--draft_tokens and --dspark specify different token counts")
         dspark_tokens = draft_tokens
         args.dspark = dspark_tokens
-    if speculative_algorithm and speculative_algorithm not in ("mtp", "dspark", "dflash"):
+    if speculative_algorithm and speculative_algorithm not in ("mtp", "dspark", "dflash", "clover"):
         raise ValueError(
-            "--speculative_algorithm currently supports off, mtp, dspark or dflash")
+            "--speculative_algorithm currently supports off, mtp, dspark, dflash or clover")
+    if speculative_algorithm == "clover" and (mtp or dspark_tokens or speculative_draft_path or draft_tokens > 0):
+        raise ValueError("Clover shares the target model; use --speculative_num_draft_tokens for its block width")
     if speculative_algorithm == "dspark" and mtp > 0:
         raise ValueError("MTP and DSpark cannot be enabled together")
     if (speculative_algorithm == "dspark" and not speculative_draft_path and
@@ -1479,6 +1481,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_glm5_next_model = False
     is_deepseek_v4_model = False
     is_dots3_note_model = False
+    is_clover_model = False
     if (os.path.exists(config_path) or gguf_config is not None):
         try:
             if gguf_config is None:
@@ -1494,6 +1497,7 @@ def make_normal_llm_model(args, startup_progress = None):
             architectures = config.get("architectures", [])
             architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")
+            is_clover_model = model_type == "clover_moe"
             is_naive_n05_model = _is_naive_n05_family(config)
             if is_naive_n05_model:
                 is_thread_tp_moe_model = True
@@ -1745,6 +1749,11 @@ def make_normal_llm_model(args, startup_progress = None):
             if speculative_algorithm:
                 raise
             pass
+    if is_clover_model:
+        from .clover_config import prepare as prepare_clover
+        prepare_clover(args, config)
+    elif speculative_algorithm == "clover":
+        raise ValueError("--speculative_algorithm clover requires a Clover checkpoint")
     automatic_plan = None
     if getattr(args, "autotune", False):
         from ftllm import llm
@@ -2098,6 +2107,10 @@ def make_normal_llm_model(args, startup_progress = None):
                             indexer_tp_storage = indexer_storage)
         if hybrid_auto_plan is not None:
             model.hybrid_auto_plan = hybrid_auto_plan
+        if is_clover_model:
+            model.configure_clover(
+                mode="self_speculative" if args.speculative_algorithm == "clover" else "low_confidence",
+                block_size=(args.speculative_num_draft_tokens if args.speculative_num_draft_tokens > 0 else 32))
         llm.report_model_load_progress("weights_finalize", 0, 1)
         if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
             model.enable_thinking = False
