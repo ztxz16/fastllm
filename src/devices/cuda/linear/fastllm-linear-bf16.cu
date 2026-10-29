@@ -18,6 +18,9 @@ FastllmCudaLinearGraphScope::FastllmCudaLinearGraphScope(std::shared_ptr<void> &
     auto &current = fastllm_bf16_lt::SerialGraphWorkspace();
     previous = std::move(current);
     current = std::static_pointer_cast<fastllm_bf16_lt::Workspace>(workspace);
+    // Warmup can use eager Lt even if the graph lease pool is full. Capturing
+    // a different GEMV/GEMM fallback would then change its reduction order.
+    if (!current && FastllmCudaGraphIsCapturingFast()) FastllmCudaSetThreadError();
 }
 
 FastllmCudaLinearGraphScope::~FastllmCudaLinearGraphScope() {

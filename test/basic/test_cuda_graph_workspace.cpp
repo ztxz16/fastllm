@@ -56,5 +56,33 @@ int main() {
     size_t freeBytes=0,totalBytes=0; CHECK(cudaMemGetInfo(&freeBytes,&totalBytes));
     REQUIRE(!FastllmCudaReserveGraphWorkspace({totalBytes+(size_t(1)<<20)}));
     REQUIRE(!FastllmCudaGetThreadError());REQUIRE(!FastllmCudaGetGraphError());
+#ifndef USE_ROCM
+    // Exhaust independent Lt leases. Eager may still use its own workspace,
+    // so an empty serial lease must reject capture instead of freezing GEMV.
+    std::vector<std::shared_ptr<void>> leases(32);
+    bool exhausted = false;
+    for (auto &lease : leases) {
+        FastllmCudaLinearGraphScope scope(lease);
+        if (!lease) { exhausted = true; break; }
+    }
+    REQUIRE(exhausted);
+    std::shared_ptr<void> missing;
+    FastllmCudaClearThreadError();
+    REQUIRE(FastllmCudaGraphBeginCapture());
+    { FastllmCudaLinearGraphScope scope(missing); }
+    REQUIRE(FastllmCudaGetThreadError());
+    graph = nullptr;
+    REQUIRE(FastllmCudaGraphEndCapture(&graph));
+    FastllmCudaGraphDestroy(graph);
+    FastllmCudaClearThreadError();
+    leases.clear();
+    { FastllmCudaLinearGraphScope scope(missing); REQUIRE(missing); }
+    REQUIRE(FastllmCudaGraphBeginCapture());
+    { FastllmCudaLinearGraphScope scope(missing); }
+    REQUIRE(!FastllmCudaGetThreadError());
+    graph = nullptr;
+    REQUIRE(FastllmCudaGraphEndCapture(&graph));
+    FastllmCudaGraphDestroy(graph);
+#endif
     puts("PASS: graph workspace: nested recording, occupied warmup pool, 8 graph replays, capture guard, capacity fallback");
 }
