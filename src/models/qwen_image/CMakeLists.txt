@@ -6,6 +6,10 @@ target_compile_options(fastllm_qwen_image PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
 set_target_properties(fastllm_qwen_image PROPERTIES CUDA_STANDARD 17 CXX_STANDARD 17
     CUDA_ARCHITECTURES "${FASTLLM_CUDA_ARCHITECTURES}" LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+add_executable(qwen_image_server server.cpp)
+target_include_directories(qwen_image_server PRIVATE ${PROJECT_SOURCE_DIR}/example/webui)
+target_link_libraries(qwen_image_server PRIVATE fastllm_qwen_image pthread)
+set_target_properties(qwen_image_server PROPERTIES CXX_STANDARD 17)
 add_executable(qwen_image_generate ${PROJECT_SOURCE_DIR}/tools/qwen_image/generate.cpp)
 target_link_libraries(qwen_image_generate PRIVATE fastllm_qwen_image)
 set_target_properties(qwen_image_generate PROPERTIES CXX_STANDARD 17)
