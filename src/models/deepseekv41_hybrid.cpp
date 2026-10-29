@@ -326,6 +326,7 @@ namespace fastllm {
             }
             runSharedSegment();
         }
+        if (ctx.joinSharedSegment) ctx.joinSharedSegment();
         ctx.releaseSharedScratch();
 
         // Add in the routed result's precision, then round once at the MoE

@@ -4704,11 +4704,29 @@ namespace fastllm {
 
             std::shared_ptr<void> fullDecode;
             bool fullVerifyAttempted = false;
+            void *sharedStream = nullptr, *sharedReady = nullptr, *sharedDone = nullptr;
+            bool sharedPending = false;
+
+            void JoinShared() {
+                if (!sharedPending) return;
+                FastllmCudaCurrentThreadStreamWaitEvent(sharedDone);
+                sharedPending = false;
+            }
 
             void DestroyCapturedGraph() {
+                const int oriDevice = FastllmCudaGetDevice();
+                if (sharedStream) {
+                    FastllmCudaSetDevice(devices[0]);
+                    FastllmCudaStreamSynchronize(sharedStream);
+                    FastllmCudaStreamDestroy(sharedStream);
+                    FastllmCudaEventDestroy(sharedReady);
+                    FastllmCudaEventDestroy(sharedDone);
+                    sharedStream = sharedReady = sharedDone = nullptr;
+                    sharedPending = false;
+                    FastllmCudaSetDevice(oriDevice);
+                }
                 fullDecode.reset();
                 fullVerifyAttempted = false;
-                const int oriDevice = FastllmCudaGetDevice();
                 for (auto &segment : segments) {
                     for (size_t i = 0; i < segment.composedExecs.size(); ++i) {
                         FastllmCudaSetDevice(deviceStates[i].device);
@@ -5209,6 +5227,45 @@ namespace fastllm {
     }
     void DeepSeekV41Model::ForwardState::HybridExperts(int layer) {
         auto ctx=work->model.MakeForwardMoeContext(*work, layer);
+#ifdef USE_CUDA
+        // Only replay an established, independent shared-expert graph. Eager,
+        // capture, TP and diagnostic paths retain their existing ordering.
+        const int sharedIndex = kV41GraphSegmentsPerLayer * layer + 3;
+        if (work->graphReplay && !work->tp && work->single &&
+            work->seqlen == 1 && !work->dsparkVerify && !work->dumpDebug &&
+            ctx.hasSharedExpertOut && work->moeStep && *work->moeStep &&
+            ctx.moeWeights.size() > 2 && ctx.moeWeights[2] &&
+            ctx.moeWeights[2]->dataType == NVFP4_BLOCK_32_E8M0 &&
+            !V41EnvFlag("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP") &&
+            !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
+            (V41DecodeCudaGraphReplayMask() & 8) &&
+            sharedIndex < (int)work->graphState->segments.size()) {
+            const auto &segment = work->graphState->segments[sharedIndex];
+            if (!segment.passthrough && segment.execs.size() == 1 && segment.execs[0]) {
+                ctx.runSharedSegment = [&, sharedIndex] {
+                    auto &state = *work->graphState;
+                    if (!state.sharedStream) {
+                        state.sharedStream = FastllmCudaStreamCreate();
+                        state.sharedReady = FastllmCudaEventCreate();
+                        state.sharedDone = FastllmCudaEventCreate();
+                    }
+                    // The input producer precedes ready. Routed experts use
+                    // separate scratch; join sharedDone before either output
+                    // is consumed or the shared scratch can be reused.
+                    FastllmCudaEventRecordCurrentThread(state.sharedReady);
+                    FastllmCudaStreamWaitEvent(state.sharedStream, state.sharedReady);
+                    if (FastllmCudaGraphLaunchOnStream(state.segments[sharedIndex].execs[0], state.sharedStream)) {
+                        FastllmCudaEventRecord(state.sharedDone, state.sharedStream);
+                        state.sharedPending = true;
+                        return;
+                    }
+                    work->model.GiveUpForwardGraph(*work, "shared expert stream");
+                    work->model.RunForwardSharedExpert(*work, layer);
+                };
+                ctx.joinSharedSegment = [&] { work->graphState->JoinShared(); };
+            }
+        }
+#endif
         work->combineFfnPostDispatch=work->model.RunHybridMoe(ctx, work->moeStep ? &*work->moeStep : nullptr);
     }
     std::vector<int> DeepSeekV41Model::ForwardState::Finish() { return work->model.FinishForward(*work); }
