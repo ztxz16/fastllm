@@ -2371,6 +2371,36 @@ if (UNIT_TEST)
                     PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
                     PASS_REGULAR_EXPRESSION "SWA RING TOGGLE PASS")
             endforeach()
+            foreach(NAIVE_BATCH_KV bf16 fp8)
+                add_test(NAME naive_n05_verify_batch_${NAIVE_BATCH_KV}
+                    COMMAND naive_n05_verify_graph_test 8 verify_batch ${NAIVE_BATCH_KV})
+                set_tests_properties(naive_n05_verify_batch_${NAIVE_BATCH_KV} PROPERTIES
+                    LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "VERIFY BATCH PASS")
+            endforeach()
+            foreach(NAIVE_BATCH_DRAFT split merged)
+                add_test(NAME naive_n05_draft_batch_${NAIVE_BATCH_DRAFT}
+                    COMMAND naive_n05_verify_graph_test 1 draft_batch ${NAIVE_BATCH_DRAFT})
+                set_tests_properties(naive_n05_draft_batch_${NAIVE_BATCH_DRAFT} PROPERTIES
+                    LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120
+                    PASS_REGULAR_EXPRESSION "DRAFT BATCH PASS")
+            endforeach()
+            foreach(NAIVE_BATCH_FAILURE failbegin failinstantiate)
+                add_test(NAME naive_n05_draft_batch_${NAIVE_BATCH_FAILURE}
+                    COMMAND naive_n05_verify_graph_test 1 draft_batch merged 7 ${NAIVE_BATCH_FAILURE})
+                set_tests_properties(naive_n05_draft_batch_${NAIVE_BATCH_FAILURE} PROPERTIES
+                    LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+                add_test(NAME naive_n05_verify_batch_${NAIVE_BATCH_FAILURE}
+                    COMMAND naive_n05_verify_graph_test 8 verify_batch fp8 ${NAIVE_BATCH_FAILURE})
+                set_tests_properties(naive_n05_verify_batch_${NAIVE_BATCH_FAILURE} PROPERTIES
+                    LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            endforeach()
+            foreach(NAIVE_DRAFT_BLOCK 2 5 8 15)
+                add_test(NAME naive_n05_draft_batch_block${NAIVE_DRAFT_BLOCK}
+                    COMMAND naive_n05_verify_graph_test 1 draft_batch merged ${NAIVE_DRAFT_BLOCK})
+                set_tests_properties(naive_n05_draft_batch_block${NAIVE_DRAFT_BLOCK} PROPERTIES
+                    LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+            endforeach()
             add_test(NAME naive_n05_verify_selection_graph COMMAND naive_n05_verify_graph_test 8 selection)
             set_tests_properties(naive_n05_verify_selection_graph
                 PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240

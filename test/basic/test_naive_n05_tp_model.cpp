@@ -2,6 +2,7 @@
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "models/naive_n05_flash.h"
+#include "../../src/models/naive_n05_tp.h"
 #include "models/speculative_sampling.h"
 #include "utils/utils.h"
 #include <cmath>
@@ -64,6 +65,24 @@ extern "C" bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
 }
 #endif
 using namespace fastllm;
+namespace fastllm {
+struct NaiveN05GraphTestAccess {
+    static void CheckSharedVerificationWorkspace(const NaiveN05FlashModel &model, int ranks) {
+        // Acceptance tails and request churn must not consume one Lt lease
+        // per graph: the bounded pool is shared with concurrent owners.
+        for (int rank = 0; rank < ranks; ++rank) {
+            void *lease = nullptr;
+            for (const auto &state : model.tpBatchVerifyGraphs) {
+                if (rank >= (int)state->ranks.size()) continue;
+                void *current = state->ranks[rank]->storage->linearGraphWorkspace.get();
+                if (current && lease && current != lease)
+                    throw std::runtime_error("verification shapes duplicated their Lt lease");
+                if (current) lease = current;
+            }
+        }
+    }
+};
+}
 // Cross-algorithm BF16 logits can differ because GEMM and single-row GEMV
 // use different FP32 reduction orders. Keep the existing model-smoke relative
 // error/cosine limits, and bound isolated outliers too. Metadata and same-path
@@ -1671,6 +1690,106 @@ class Fixture : public NaiveN05FlashModel {
         return out;
     }
 
+    void VerifyBatches() {
+        draftTargetLayers = {0, 1};
+        GenerationConfig cfg;
+        for (std::vector<int> past : {std::vector<int>{257, 2307, 43, 511, 2043, 4089, 31, 3007},
+                                     std::vector<int>{2045, 4093, 127, 2047, 1023, 63, 41, 3017},
+                                     std::vector<int>{2307, 2312, 2317, 2322, 2327, 2332, 2337, 2342}}) {
+        using Cache = std::vector<std::pair<Data, Data>>;
+        std::vector<Cache> reference(past.size()), actual(past.size());
+        auto input = [](int sequence, int start, int rows, bool positions) {
+            std::vector<float> values(rows);
+            for (int i = 0; i < rows; ++i)
+                values[i] = positions ? start + i : ((start + i) * 13 + sequence * 71) % 256;
+            return Data(FLOAT32, {1, rows}, values);
+        };
+        for (int b = 0; b < (int)past.size(); ++b) for (Cache *cache : {&reference[b], &actual[b]}) {
+            cache->resize(block_cnt);
+            TargetCapture capture;
+            RunDraftTarget(input(b, 0, past[b], false), input(b, 0, past[b], true), *cache, cfg, capture);
+        }
+        const bool rebind = past.front() == 2307;
+        const bool boundary = past.front() == 2045;
+        int checks = 0;
+        for (auto lengths : {std::vector<int>{6, 6}, {6, 6}, {6, 6}, {6, 3, 1}, {6, 3, 1}, {2, 6, 4}, {2, 6, 4}, {6, 6, 6, 6, 6, 6}, {6, 6, 6, 6, 6, 6}, {6, 6, 6, 6, 6, 6, 6, 6}, {6, 6, 6, 6, 6, 6, 6, 6}, {8, 7, 6, 5, 4, 3, 2, 1}, {8, 7, 6, 5, 4, 3, 2, 1}, {6, 6}}) {
+            if (rebind && checks) {
+                std::rotate(actual.begin(), actual.begin() + 1, actual.end());
+                std::rotate(reference.begin(), reference.begin() + 1, reference.end());
+                std::rotate(past.begin(), past.begin() + 1, past.end());
+            }
+            const int batch = lengths.size();
+            std::vector<float> ids, positions;
+            std::vector<std::vector<float>> expected(batch);
+            std::vector<bool> referenceRing(batch);
+            std::vector<std::pair<Data *, Data *>> caches;
+            std::vector<GenerationConfig> configs(batch, cfg);
+            for (int b = 0; b < batch; ++b) {
+                Data id = input(b, past[b], lengths[b], false), pos = input(b, past[b], lengths[b], true);
+                ids.insert(ids.end(), (float *)id.cpuData, (float *)id.cpuData + lengths[b]);
+                positions.insert(positions.end(), (float *)pos.cpuData, (float *)pos.cpuData + lengths[b]);
+                TargetCapture capture; capture.verifying = true;
+                SetCudaGraph(false);
+                Data logits = RunDraftTarget(id, pos, reference[b], cfg, capture);
+                SetCudaGraph(true);
+                referenceRing[b] = capture.ringVerify;
+                logits.ToDevice(DataDevice::CPU);
+                expected[b].assign((float *)logits.cpuData, (float *)logits.cpuData + logits.Count(0));
+                for (auto &layer : actual[b]) caches.emplace_back(&layer.first, &layer.second);
+            }
+            TargetBatch requests{caches, configs, lengths, block_cnt};
+            TargetCapture capture; capture.verifying = true;
+            LogitsSelection selection; selection.cudaLogits = true; capture.selection = &selection;
+            Cache unused;
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+            const int launches = verifyGraphLaunches, captures = verifyGraphCaptures;
+#endif
+            Data logits = RunDraftTarget(Data(FLOAT32, {1, (int)ids.size()}, ids),
+                Data(FLOAT32, {1, (int)positions.size()}, positions), unused, cfg, capture, &requests);
+            #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+            if (!boundary && checks == 4 && !failVerifyBegin && !failVerifyInstantiate &&
+                verifyGraphLaunches - launches != ranks)
+                throw std::runtime_error("multi-request verification did not replay one graph per rank");
+            if (rebind && checks == 4 && !failVerifyBegin && !failVerifyInstantiate &&
+                verifyGraphCaptures != captures)
+                throw std::runtime_error("request replacement recaptured its verification graph");
+#endif
+            NaiveN05GraphTestAccess::CheckSharedVerificationWorkspace(*this, ranks);
+            if (logits.dataDevice != DataDevice::CUDA || logits.Count(0) != ids.size() * 256)
+                throw std::runtime_error("batch verification did not return all device rows");
+            logits.ToDevice(DataDevice::CPU);
+            std::vector<Cache *> commitCaches;
+            std::vector<int> commitPast, commitCounts;
+            for (int b = 0; b < batch; ++b) {
+                commitCaches.push_back(&actual[b]); commitPast.push_back(past[b]);
+                commitCounts.push_back(std::min(lengths[b], 1 + (b + checks + b) % 5));
+            }
+            CommitTargetCaches(commitCaches, commitPast, commitCounts, capture.ringVerify);
+            int offset = 0;
+            for (int b = 0; b < batch; ++b) {
+                RequireCloseLogits((float *)logits.cpuData + offset * 256, expected[b], "batch verify logits b=" + std::to_string(b) + " past=" + std::to_string(past[b]) + " check=" + std::to_string(checks));
+                offset += lengths[b];
+                // Different rollback lengths, followed by another verify round,
+                // exercise sequence isolation and the second request's SWA ring.
+                const int keep = std::min(lengths[b], 1 + (b + checks) % 5);
+                CommitTargetCache(reference[b], past[b], keep, referenceRing[b]);
+
+                past[b] += keep;
+                for (int layer = 0; layer < block_cnt; ++layer) {
+                    if (actual[b][layer].first.dims != reference[b][layer].first.dims)
+                        throw std::runtime_error("batch verify rollback metadata mismatch");
+                    for (const auto &rank : actual[b][layer].first.multiDeviceDatas)
+                        if (rank.second->dims != reference[b][layer].first.multiDeviceDatas.at(rank.first)->dims)
+                            throw std::runtime_error("batch verify rank rollback metadata mismatch");
+                }
+                ++checks;
+            }
+        }
+        std::cout << "VERIFY BATCH PASS checks=" << checks << " relative=" << largestLogitRelative
+                  << " maximum=" << largestLogitAbsolute << std::endl;
+        }
+    }
+
     void VerifySelections(int ranks) {
         draftTargetLayers = {0, 1};
         int checks = 0;
@@ -1739,7 +1858,7 @@ class Fixture : public NaiveN05FlashModel {
                             throw std::runtime_error("compact verify hidden state mismatch");
                     }
                     int keep = past && rows > 1 ? rows - 1 : rows;
-                    CommitTargetCache(kv, past, keep); past += keep; ++step;
+                    CommitTargetCache(kv, past, keep, capture.ringVerify); past += keep; ++step;
                     if (!reference) ++checks;
                 }
             }
@@ -1754,7 +1873,7 @@ class Fixture : public NaiveN05FlashModel {
         GenerationConfig cfg;
         TargetCapture capture;
         RunDraftTarget(ids, pos, kv, cfg, capture);
-        for (int rows : {1, 2, 7, 3, 8, 7}) {
+        for (int rows : {1, 2, 7, 3, 8, 7, 5, 10, 15, 5}) {
             Data hidden(BFLOAT16, {1, rows, 256});
             hidden.Allocate();
             for (int i = 0; i < hidden.Count(0); ++i) {
@@ -1787,13 +1906,15 @@ class Fixture : public NaiveN05FlashModel {
             if (differing)
                 throw std::runtime_error("head differs");
         }
-        std::cout << "HEAD PASS checks=6" << std::endl;
+        std::cout << "HEAD PASS checks=10" << std::endl;
     }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
     void VerifyGraphBlocks() {
         draftTargetLayers = {0, 1};
         int checks = 0;
-        for (int prompt : {3, 120, 254, 510, 2045, 2049, 4090}) {
+        for (int prompt : {3, 120, 254, 510, 2045, 2049, 4090})
+        for (int block : {1, 2, 3, 4, 5, 6, 7, 8}) {
+            const int previousLaunches = verifyGraphLaunches;
             std::vector<std::pair<Data, Data>> reference(2), candidate(2);
             GenerationConfig cfg;
             cfg.input_token_length = prompt;
@@ -1824,11 +1945,12 @@ class Fixture : public NaiveN05FlashModel {
             forward(reference, 0, prompt, false);
             forward(candidate, 0, prompt, false);
             int past = prompt;
-            for (int keep : {1, 4, 8, 3, 7, 8}) {
-                auto block = forward(candidate, past, 8, true);
+            for (int requested : {1, 4, 8, 3, 7, 8}) {
+                const int keep = std::min(requested, block);
+                auto logits = forward(candidate, past, block, true);
                 for (int row = 0; row < keep; ++row) {
                     auto one = forward(reference, past + row, 1, false);
-                    RequireCloseLogits(block.data() + row * 256, one,
+                    RequireCloseLogits(logits.data() + row * 256, one,
                                        "graph verification differs from decode at " +
                                        std::to_string(past) + " row " + std::to_string(row));
                     ++checks;
@@ -1839,6 +1961,9 @@ class Fixture : public NaiveN05FlashModel {
                         throw std::runtime_error("graph rollback metadata mismatch");
                 past += keep;
             }
+            if (prompt == 2049 && expectVerifyGraph && !failVerifyBegin &&
+                !failVerifyInstantiate && verifyGraphLaunches == previousLaunches)
+                throw std::runtime_error("verification block shape never replayed: " + std::to_string(block));
         }
         if (expectVerifyGraph &&
             (!verifyGraphCaptures ||
@@ -2053,11 +2178,11 @@ static void VerifyRowAllReduce(int ranks) {
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
 class DraftFixture : public NaiveN05FlashModel {
   public:
-    DraftFixture(bool merged = false, int kvHeads = 2, int owner = 0) {
+    DraftFixture(bool merged = false, int kvHeads = 2, int owner = 0, int block = 7) {
         embed_dim = 256;
         block_cnt = 2;
         draftLayers = 2;
-        draftBlock = 7;
+        draftBlock = block;
         draftHeads = 8;
         draftKvHeads = kvHeads;
         draftHeadDim = 32;
@@ -2212,6 +2337,129 @@ class DraftFixture : public NaiveN05FlashModel {
                   << " maximum=" << largestLogitAbsolute << " captures=" << verifyGraphCaptures << " launches=" << verifyGraphLaunches << std::endl;
         unsetenv("FASTLLM_DSPARK_TP");
     }
+    void RunBatchChecks() {
+        auto hidden = [&](int rows, int seed) {
+            Data h(BFLOAT16, {1, rows, embed_dim}); h.Allocate();
+            for (int i = 0; i < h.Count(0); ++i)
+                ((uint16_t *)h.cpuData)[i] = Float32ToBFloat16RNEBits(std::sin((i + seed) * .137f));
+            h.ToDevice(DataDevice::CUDA, std::vector<int>{0}); return h;
+        };
+        auto read = [](const Data &x) {
+            size_t count = 1;
+            for (int dim : x.dims) count *= dim;
+            std::vector<uint16_t> bits(count);
+            if (x.dataType != BFLOAT16 || x.dataDevice != DataDevice::CUDA ||
+                cudaMemcpy(bits.data(), x.cudaData, count * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("draft batch read failed");
+            std::vector<float> values;
+            values.reserve(count);
+            for (uint16_t bit : bits) values.push_back(BFloat16BitsToFloat32(bit));
+            return values;
+        };
+        std::vector<std::shared_ptr<DraftContext>> reference, actual;
+        std::vector<DraftContext *> contexts;
+        std::vector<int> anchors{11, 57, 19, 101, 7, 83, 29, 217}, past{80, 1023, 32768, 249, 250, 3, 1024, 511};
+        for (int p : past) {
+            reference.push_back(CreateDraftContext()); actual.push_back(CreateDraftContext());
+            Data h = hidden(std::min(p, draftWindow - 1), p);
+            AppendDraftContext(h, p - h.dims[1], *reference.back());
+            AppendDraftContext(h, p - h.dims[1], *actual.back());
+            contexts.push_back(actual.back().get());
+        }
+        int checks = 0, batchReplays = 0;
+        for (int round = 0; round < 5; ++round) {
+            std::vector<std::vector<float>> expected;
+            for (int b = 0; b < (int)anchors.size(); ++b) {
+                Data h = RunDraft(anchors[b], *reference[b]); expected.push_back(read(h));
+            }
+            Data result;
+            int launches = verifyGraphLaunches;
+            if (!RunDraftBatch(anchors, contexts, result)) throw std::runtime_error("draft batch fell back");
+            batchReplays += verifyGraphLaunches - launches;
+            auto values = read(result);
+            SetCudaGraph(false);
+            Data eager;
+            if (!RunDraftBatch(anchors, contexts, eager) || values != read(eager))
+                throw std::runtime_error("batch draft graph/eager differs bitwise");
+            SetCudaGraph(true);
+            if (values.size() != anchors.size() * draftBlock * embed_dim) throw std::runtime_error("draft batch rows missing");
+            for (int b = 0; b < (int)anchors.size(); ++b) {
+                RequireCloseLogits(values.data() + b * draftBlock * embed_dim, expected[b], "draft batch hidden");
+                Data solo = RunDraft(anchors[b], *actual[b]);
+                auto soloValues = read(solo);
+                RequireCloseLogits(soloValues.data(), expected[b], "draft batch to single transition");
+                if (actual[b]->committed != past[b]) throw std::runtime_error("draft batch committed proposals");
+                for (int layer = 0; layer < draftLayers; ++layer) {
+                    for (int part = 0; part < 2; ++part) {
+                        Data &a = part ? actual[b]->kv[layer].second : actual[b]->kv[layer].first;
+                        Data &r = part ? reference[b]->kv[layer].second : reference[b]->kv[layer].first;
+                        if (a.dims != r.dims || read(a) != read(r))
+                            throw std::runtime_error("draft batch overwrote committed KV");
+                    }
+                }
+                const int keep = 1 + (round + b) % 6;
+                Data h = hidden(keep, past[b] + b * 91);
+                AppendDraftContext(h, past[b], *reference[b]); AppendDraftContext(h, past[b], *actual[b]);
+                past[b] += keep; anchors[b] = (anchors[b] + 29) % 256; ++checks;
+            }
+        }
+        // Compare mixed accepted lengths against independent commits, then
+        // consume the committed caches in the next draft block.
+        for (int turn = 0; turn < 5; ++turn) {
+            std::vector<int> lengths(anchors.size(), 8), counts;
+            TargetCapture capture;
+            for (int layer : draftTargetLayers) capture.hidden[layer].CopyFrom(hidden(8 * anchors.size(), 1009 + layer + turn));
+            for (int b = 0; b < (int)anchors.size(); ++b) {
+                counts.push_back(1 + (b + turn) % 8);
+                TargetCapture single;
+                for (int layer : draftTargetLayers) Split(capture.hidden.at(layer), 1, b * 8, (b + 1) * 8, single.hidden[layer]);
+                std::vector<std::pair<Data, Data>> unused;
+                CommitDraftContext(single, counts.back(), *reference[b], unused);
+            }
+            if (!CommitDraftContexts(capture, lengths, counts, contexts)) throw std::runtime_error("draft commit batch fell back");
+            for (int b = 0; b < (int)anchors.size(); ++b) {
+                if (actual[b]->committed != reference[b]->committed) throw std::runtime_error("batch commit length differs");
+                for (int layer = 0; layer < draftLayers; ++layer) for (int part = 0; part < 2; ++part) {
+                    auto &a = part ? actual[b]->kv[layer].second : actual[b]->kv[layer].first;
+                    auto &r = part ? reference[b]->kv[layer].second : reference[b]->kv[layer].first;
+                    if (a.dims != r.dims) throw std::runtime_error("batch commit KV shape differs");
+                    auto av = read(a), rv = read(r); RequireCloseLogits(av.data(), rv, "batch committed KV");
+                }
+                Data a = RunDraft(anchors[b], *actual[b]), r = RunDraft(anchors[b], *reference[b]);
+                auto av = read(a), rv = read(r); RequireCloseLogits(av.data(), rv, "draft after batch commit");
+                ++checks;
+            }
+        }
+        // Reorder and resize the active set, exceeding the bounded graph cache.
+        // Each captured KV binding must remain isolated from the next request set.
+        for (int rotation = 0; rotation < 3; ++rotation) for (int count : {2, 3, 4, 8}) {
+            std::vector<int> ids;
+            std::vector<DraftContext *> selected;
+            for (int i = 0; i < count; ++i) {
+                const int at = (i + rotation) % contexts.size();
+                ids.push_back(anchors[at]); selected.push_back(contexts[at]);
+            }
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                Data actual, eager;
+                SetCudaGraph(true);
+                int launches = verifyGraphLaunches;
+                if (!RunDraftBatch(ids, selected, actual)) throw std::runtime_error("resized draft batch fell back");
+                batchReplays += verifyGraphLaunches - launches;
+                auto values = read(actual);
+                SetCudaGraph(false);
+                if (!RunDraftBatch(ids, selected, eager) || values != read(eager))
+                    throw std::runtime_error("resized draft graph/eager differs bitwise");
+                SetCudaGraph(true); ++checks;
+            }
+        }
+        if (!failVerifyBegin && !failVerifyInstantiate && batchReplays == 0)
+            throw std::runtime_error("batch draft never replayed a graph");
+        if ((failVerifyBegin || failVerifyInstantiate) && batchReplays != 0)
+            throw std::runtime_error("batch draft failed capture did not fall back");
+        std::cout << "DRAFT BATCH PASS checks=" << checks << " graph_replays=" << batchReplays << " relative=" << largestLogitRelative
+                  << " maximum=" << largestLogitAbsolute << std::endl;
+    }
+
     void Run() {
         int checks = 0;
         auto read = [](const Data &value) {
@@ -2329,7 +2577,33 @@ int main(int argc, char **argv) {
         SetThreads(4);
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
+        if (argc > 2 && std::string(argv[2]) == "verify_batch") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+            failVerifyBegin = argc > 4 && std::string(argv[4]) == "failbegin";
+            failVerifyInstantiate = argc > 4 && std::string(argv[4]) == "failinstantiate";
+#endif
+            Fixture fixture(ranks, false, true, true, true);
+            if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.VerifyBatches();
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+            if (!verifyGraphCaptures || ((failVerifyBegin || failVerifyInstantiate) && verifyGraphLaunches))
+                throw std::runtime_error("batch graph capture/fallback was not exercised");
+            std::cout << "BATCH GRAPH captures=" << verifyGraphCaptures << " launches=" << verifyGraphLaunches << std::endl;
+#endif
+            return 0;
+        }
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (argc > 2 && std::string(argv[2]) == "draft_batch") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            failGraphDevice = 0;
+            if (argc > 5) {
+                failVerifyBegin = std::string(argv[5]) == "failbegin";
+                failVerifyInstantiate = std::string(argv[5]) == "failinstantiate";
+            }
+            DraftFixture fixture(argc > 3 && std::string(argv[3]) == "merged", 2, 0, argc > 4 ? std::stoi(argv[4]) : 7);
+            fixture.RunBatchChecks(); return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "kvmem_pool") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, false, true, true, true);

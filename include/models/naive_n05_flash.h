@@ -177,6 +177,11 @@ namespace fastllm {
         struct DraftTPState;
         std::shared_ptr<DraftTPState> draftTP;
         struct DraftWorkspace;
+        // Bounded LRU; graph-owned inputs are refreshed on every replay.
+        std::vector<std::shared_ptr<DraftWorkspace>> draftBatchWorkspaces;
+        std::vector<std::shared_ptr<DraftWorkspace>> draftProposalWorkspaces;
+        // Single-device draft graphs execute serially, including request churn.
+        std::map<int, std::shared_ptr<void>> draftLinearGraphWorkspaces;
         struct DraftContext {
             int committed = 0;
             std::vector<std::pair<Data, Data>> kv;
@@ -218,13 +223,32 @@ namespace fastllm {
         bool RunDraftProposalGraph(int anchor, const Data &baseLogits,
                                    DraftContext &context, std::vector<int> &proposed);
         Data RunDraft(int anchor, DraftContext &context);
+        bool RunDraftBatch(const std::vector<int> &anchors,
+                           const std::vector<DraftContext *> &contexts, Data &normalized);
         void ApplyDraftDevice();
         Data &DraftWeight(const std::string &name);
         Data RunDraftHead(Data &hidden);
         Data RunDraftTarget(const Data &inputIds, const Data &positions,
                             std::vector<std::pair<Data, Data>> &kv,
-                            const GenerationConfig &config, TargetCapture &capture);
+                            const GenerationConfig &config, TargetCapture &capture,
+                            const TargetBatch *batch = nullptr);
         void CommitTargetCache(std::vector<std::pair<Data, Data>> &kv, int past, int count, bool ringVerify = false);
+        void CommitTargetCaches(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+            const std::vector<int> &past, const std::vector<int> &counts, bool ringVerify);
+        bool CommitDraftContexts(TargetCapture &capture, const std::vector<int> &lengths,
+            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts);
+        struct DraftRound;
+        void PrepareDraftRound(DraftRound &round, const Data *preparedLogits = nullptr);
+        bool PrepareDraftBatch(std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &baseLogits);
+        bool PrepareDraftBatchGraph(std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &baseLogits);
+        void PrepareDraftAcceptance(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits);
+        int FinishDraftRound(DraftRound &round, Data &logits, TargetCapture &capture,
+                             std::vector<std::pair<Data, Data>> &kv);
+        std::vector<int> ForwardDraftBatch(int batch, const Data &inputIds,
+                const std::vector<Data *> &positions, const std::vector<int> &lengths,
+                std::vector<std::pair<Data *, Data *>> &kv,
+                const std::vector<GenerationConfig> &configs, const LastTokensManager &lastTokens,
+                std::vector<std::vector<float> *> *retLogits);
         int ForwardDraft(const Data &inputIds, const Data &positions,
                          std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
@@ -240,6 +264,7 @@ namespace fastllm {
 
     private:
         friend struct NaiveN05PrefixCacheTestAccess;
+        friend struct NaiveN05GraphTestAccess;
         // Only request lifecycle callbacks (serialized by dictLocker) own this
         // single idle allocation set. No token contents are reused.
         std::vector<std::pair<Data, Data>> tpIdleCache;
@@ -259,7 +284,8 @@ namespace fastllm {
         std::shared_ptr<CudaWorkspace> RequestKVPool(int device, size_t bytes) const;
         void PrepareSwaPrefillWorkspace(int rank, int length);
         struct TPDecodeState;
-        std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState, tpBatchState;
+        std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState, tpBatchState, tpBatchVerifyState;
+        std::vector<std::shared_ptr<TPDecodeState>> tpBatchVerifyGraphs;
         struct TPServingState;
         std::shared_ptr<TPServingState> tpServingState;
         std::atomic<uint64_t> tpCacheEpoch{0};

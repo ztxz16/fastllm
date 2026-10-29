@@ -49,11 +49,11 @@ struct NaiveN05FlashModel::TPDecodeState {
     std::vector<int> devices;
     std::vector<std::unique_ptr<Rank>> ranks;
     std::vector<void *> cachePointers, reservedPointers;
-    std::vector<int> cacheCapacities;
-    std::vector<int> sequenceRegions, sequenceCapacities;
+    std::vector<int> cacheCapacities, cacheLayouts;
+    std::vector<int> sequenceRegions, sequenceCapacities, sequenceRows;
     uint64_t ncclGeneration = 0;
     int capacity = 0, region = 0, rows = 1;
-    bool verifying = false, collectHidden = false;
+    bool verifying = false, collectHidden = false, dynamicCache = false;
     LogitsSelection selection;
     bool warmed = false, captured = false, disabled = false, active = false;
     void ClearGraphs();
