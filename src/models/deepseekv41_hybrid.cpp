@@ -110,7 +110,12 @@ namespace fastllm {
         // Native cache requests (including --auto) enable admission directly.
         const bool nativeFrequency = weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0 ||
                                      weights[0][2]->dataType == FP8_E4M3_BLOCK_128 || streamGGUF;
-        if (!tp && single && seqlen == 1 && nativeFrequency &&
+        // Native verification uses the same global admission policy as decode.
+        // Otherwise every layer can independently replace a cache entry, and
+        // the next layer drains that upload before launching its experts.
+        const bool nativeVerify = v41DsparkEnabled && weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0 &&
+                                  seqlen > 1 && seqlen <= 8;
+        if (!tp && single && (seqlen == 1 || nativeVerify) && nativeFrequency &&
             FastllmCudaMoeCacheRequested() &&
             !V41ReferenceMathEnabled() && GetCudaSharedExpert() &&
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
@@ -226,9 +231,10 @@ namespace fastllm {
             // The router may return CPU tensors. Stage only its small
             // result, never migrate the input/output of a captured segment.
             auto stageRoute = [&](Data &buffer, Data &source) -> Data & {
-                // Eager PP routing already owns a valid CUDA tensor. Keep it
-                // on-device; the hybrid backend batches its pinned D2H copies.
-                if ((streamingStep || cooperativeMoe || batchCacheCandidate) &&
+                // Graph segments and eager PP routing already own valid CUDA
+                // tensors. Borrow them without changing ownership; the hybrid
+                // backend batches its pinned readback on the producing stream.
+                if (((step && *step) || singleStageCache || streamingStep || cooperativeMoe || batchCacheCandidate) &&
                     source.dataDevice == DataDevice::CUDA &&
                     source.cudaData && !source.multiDeviceData &&
                     GetPointerDeviceId(source.cudaData) == device) return source;

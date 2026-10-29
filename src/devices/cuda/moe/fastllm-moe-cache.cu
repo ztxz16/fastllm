@@ -3423,7 +3423,7 @@ bool FastllmCudaMoeExpertParallelReadback(FastllmCudaMoeExpertParallel &state, i
 // of the model's activation boundary and ordered expert reduction.
 static bool ComputeBatchExperts(const fastllm::Data &input, fastllm::Data &activation,
         fastllm::Data &output, const OffloadLayout &layout, const FastllmCudaMoeGGUFCacheView &view,
-        const float *scores, int topk, float *perExpert) {
+        const float *scores, int topk, float *perExpert, bool grouped = false) {
     if (layout.weightType == fastllm::DATA_GGUF_FORMAT)
         return ComputeGGUFExperts(input, activation, output, layout, view, scores, topk, perExpert);
     if (layout.glm5)
@@ -3433,6 +3433,10 @@ static bool ComputeBatchExperts(const fastllm::Data &input, fastllm::Data &activ
         return ComputeScoredFP8Experts(input, activation, layout, view.records, view.routeSlots,
             scores, topk, perExpert, view.routeMap, view.routeCount);
     if (layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0) return false;
+    if (grouped && fastllm::TryCudaTritonMxfp4Grouped(input, activation,
+            view.records, view.routeSlots, view.routeMap, scores, perExpert,
+            view.workspace, view.routeCount, layout.hidden, layout.inter,
+            topk, layout.recordStride, layout.downOffset, layout.swigluLimit)) return true;
     using namespace fastllm::cuda::dsv41_cache;
     Gate<true><<<dim3(layout.inter / 32, view.routeCount), 512, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16 *)input.cudaData, view.routeSlots, view.records, scores,
@@ -3735,7 +3739,8 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     // One rendezvous both collects those plans and publishes the decision.
     state.Barrier([&] {
         if (count == 1) {
-            if (overlap) plan.selected = overlap->layers[timingLayer].SelectMisses(reuse.size(), hits, reuse.data());
+            if (overlap)
+                plan.selected = overlap->layers[timingLayer].SelectMisses(reuse.size(), hits, reuse.data());
         } else {
             state.cpuExpert.resize(root.group->tableKeys.size() * FastllmCudaMoeExpertParallel::maxRows);
             fastllm::MoeDecodeOverlapScheduler::SelectParallelMisses(state.plans, state.cpuExpert[timingLayer]);
@@ -3762,6 +3767,9 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         cpuCount += work.Owners()[r] < 0;
     }
     const int gpuCount = hits + stagedRoutes;
+    const bool groupedEnabled = v41Batch && layout.weightType == NVFP4_BLOCK_32_E8M0 &&
+        fastllm::CudaTritonMxfp4GroupedEnabled();
+    int groupedResident = 0;
     std::array<int, maxRoutes + 1> stagedOffsets;
     stagedOffsets[0] = hits;
     if (batchExperts && gpuCount) {
@@ -3775,6 +3783,26 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             return left != right ? left < right : a < b;
         });
         for (int i = 0; i < hits; ++i) work.BatchSlots()[i] = work.Resident()[work.BatchRoutes()[i]];
+        if (groupedEnabled) {
+            // Keep repeated slots together at the front. Singleton experts
+            // retain GEMV instead of wasting a padded Tensor Core tile.
+            std::array<int, maxRoutes> slots, maps;
+            int target = 0;
+            for (bool repeated : {true, false}) {
+                for (int first = 0; first < hits;) {
+                    int end = first + 1;
+                    while (end < hits && work.BatchSlots()[end] == work.BatchSlots()[first]) ++end;
+                    if ((end - first > 1) == repeated)
+                        for (int i = first; i < end; ++i) {
+                            slots[target] = work.BatchSlots()[i]; maps[target++] = work.BatchRoutes()[i];
+                        }
+                    first = end;
+                }
+                if (repeated) groupedResident = target;
+            }
+            std::copy_n(slots.data(), hits, work.BatchSlots());
+            std::copy_n(maps.data(), hits, work.BatchRoutes());
+        }
         for (int i = 0; i < staged; ++i) {
             for (int r = 0; r < routes; ++r) if (stagedSlot[r] == i) {
                 work.BatchSlots()[at] = i;
@@ -3788,7 +3816,10 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         const size_t bytes = v41Batch
             ? FastllmCudaMoeGGUFCacheWorkspaceBytes(hidden, layout.inter)
             : FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(hidden, layout.inter, rows, topk);
-        if (batchGGUF && bytes) allocate(work.batchWorkspace, INT8, {int(bytes)});
+        if (groupedEnabled) {
+            const size_t rawBytes = size_t(routes) * 2 * layout.inter * sizeof(uint16_t);
+            allocate(work.batchWorkspace, INT8, {int(std::max(bytes, rawBytes))});
+        } else if (batchGGUF && bytes) allocate(work.batchWorkspace, INT8, {int(bytes)});
     }
     work.admitted = candidate >= 0 && work.cache->slots > 0 && cpuCount + stagedRoutes > 0;
     if (work.admitted && !work.cache->admissionStream) {
@@ -3874,9 +3905,21 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
                     if (!scoredBatch && !mappedUpload) TouchResidentRoutes<<<1, 256, 0, cudaStreamPerThread>>>(
                         batchView.routeSlots, batchView.routeMap, work.cache->lastUsed,
                         work.cache->step, work.cache->hitCount, hits, rows, topk);
-                    const bool computed = ComputeBatchExperts(*gpuInput, work.gate, output,
-                        layout, batchView, static_cast<float *>(work.scores.cudaData), topk, work.GpuOutput());
-                    if (!computed) return false;
+                    auto compute = [&](const FastllmCudaMoeGGUFCacheView &view, bool grouped) {
+                        return ComputeBatchExperts(*gpuInput, work.gate, output, layout, view,
+                            static_cast<float *>(work.scores.cudaData), topk, work.GpuOutput(), grouped);
+                    };
+                    if (groupedResident >= 4) {
+                        auto repeated = batchView; repeated.routeCount = groupedResident;
+                        if (!compute(repeated, true)) return false;
+                        if (groupedResident < hits) {
+                            auto singletons = batchView;
+                            singletons.routeSlots += groupedResident;
+                            singletons.routeMap += groupedResident;
+                            singletons.routeCount = hits - groupedResident;
+                            if (!compute(singletons, false)) return false;
+                        }
+                    } else if (!compute(batchView, false)) return false;
                 } else {
                     // Snapshot residency for the entire verifier before any admission.
                     // Repeated experts consequently keep one owner across all rows and

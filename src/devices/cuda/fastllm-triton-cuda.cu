@@ -1615,6 +1615,37 @@ extern "C" bool FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
         mergeResult, "cuLaunchKernel deepseek_v4_sparse_decode_merge");
 }
 
+extern "C" bool FastllmCudaTritonMxfp4Grouped(const char *const *cubins, const char *const *names,
+                                              const int *shared, const fastllm::Data &input,
+                                              fastllm::Data &activation, const unsigned char *records,
+                                              const int *slots, const int *routes, const float *scores,
+                                              float *output, void *scratch, int count) {
+    LoadedTritonKernel *kernels[3];
+    for (int i = 0; i < 3; ++i) {
+        kernels[i] = LoadTritonKernel(cubins[i], names[i], shared[i]);
+        if (!kernels[i])
+            return false;
+    }
+    // Buffers are cache-owned CUDA allocations. No transfers or repacking.
+    CUdeviceptr x = (CUdeviceptr)FastllmCudaPrepareInput(input);
+    CUdeviceptr a = (CUdeviceptr)FastllmCudaPrepareOutput(activation);
+    CUdeviceptr w = (CUdeviceptr)records, s = (CUdeviceptr)slots, r = (CUdeviceptr)routes;
+    CUdeviceptr score = (CUdeviceptr)scores, out = (CUdeviceptr)output, raw = (CUdeviceptr)scratch;
+    CUdeviceptr globalScratch = 0, profileScratch = 0;
+    void *gateArgs[] = {&x, &w, &s, &r, &raw, &count, &globalScratch, &profileScratch};
+    void *actArgs[] = {&raw, &r, &score, &a, &globalScratch, &profileScratch};
+    void *downArgs[] = {&a, &w, &s, &r, &out, &count, &globalScratch, &profileScratch};
+    CUresult result =
+        LaunchTritonKernel(kernels[0], 72, count, 1, 128, shared[0], gateArgs, CU_STREAM_PER_THREAD);
+    if (result == CUDA_SUCCESS)
+        result = LaunchTritonKernel(kernels[1], 18, count, 1, 128, shared[1], actArgs, CU_STREAM_PER_THREAD);
+    if (result == CUDA_SUCCESS)
+        result = LaunchTritonKernel(kernels[2], 80, count, 1, 128, shared[2], downArgs, CU_STREAM_PER_THREAD);
+    FastllmCudaFinishInput(input, (void *)x);
+    FastllmCudaFinishOutput(activation, (void *)a);
+    return CheckCu(result, "cuLaunchKernel mxfp4_grouped");
+}
+
 extern "C" bool FastllmCudaTritonDeepSeekV4SqrtSoftplusRouter(
     const char *cubinPath, const char *kernelName,
     int numWarps, int shared, int numExperts, int topk, int blockN,

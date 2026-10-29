@@ -29,6 +29,91 @@ except Exception as exc:  # pragma: no cover - this is reported through /compile
 
 if triton is not None:
     @triton.jit
+    def fastllm_mxfp4_grouped_gemm(
+        X,
+        W,
+        Slots,
+        Routes,
+        Y,
+        H: tl.constexpr,
+        I: tl.constexpr,
+        TOPK: tl.constexpr,
+        COUNT,
+        STRIDE: tl.constexpr,
+        DOWN: tl.constexpr,
+        GATE: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+    ):
+        first = tl.program_id(1)
+        slot = tl.load(Slots + first)
+        prev = tl.load(Slots + first - 1, first > 0, other=-2)
+        if slot >= 0 and slot != prev:
+            m = tl.arange(0, 16)
+            q = first + m
+            same = tl.load(Slots + q, (q < COUNT) & (m < 8), other=-2) == slot
+            route = tl.load(Routes + q, (q < COUNT) & (m < 8), other=0)
+            n = tl.program_id(0) * BN + tl.arange(0, BN)
+            kk = tl.arange(0, BK)
+            K: tl.constexpr = H if GATE else I
+            N: tl.constexpr = 2 * I if GATE else H
+            row = route // TOPK if GATE else route
+            acc = tl.full((16, BN), 0, tl.float32)
+            for begin in range(0, K, 2 * BK):
+                k = begin + 2 * kk
+                xe = tl.load(X + row[:, None] * K + k[None, :], same[:, None] & (k[None, :] < K), other=0)
+                xo = tl.load(X + row[:, None] * K + k[None, :] + 1, same[:, None] & (k[None, :] + 1 < K), other=0)
+                offset = (
+                    slot.to(tl.int64) * STRIDE
+                    + (0 if GATE else DOWN)
+                    + (n[:, None].to(tl.int64) * (K // 32) + k[None, :] // 32) * 17
+                )
+                packed = tl.load(
+                    W + offset + (k[None, :] % 32) // 2, (n[:, None] < N) & (k[None, :] < K), other=0
+                ).to(tl.uint32)
+                exponent = tl.load(W + offset + 16, (n[:, None] < N) & (k[None, :] < K), other=127).to(tl.uint32)
+                scale = (
+                    tl.where(exponent == 0, 0x00400000, tl.where(exponent == 255, 0x7FC00000, exponent << 23))
+                    .to(tl.uint32)
+                    .to(tl.float32, bitcast=True)
+                )
+                code = packed & 15
+                mag = code & 7
+                bits = tl.where(mag >= 2, (mag + 252) << 22, mag * 0x3F000000) | ((code & 8) << 28)
+                even = (bits.to(tl.float32, bitcast=True) * scale).to(tl.bfloat16)
+                code = packed >> 4
+                mag = code & 7
+                bits = tl.where(mag >= 2, (mag + 252) << 22, mag * 0x3F000000) | ((code & 8) << 28)
+                odd = (bits.to(tl.float32, bitcast=True) * scale).to(tl.bfloat16)
+                acc = tl.dot(xe, tl.trans(even), acc)
+                acc = tl.dot(xo, tl.trans(odd), acc)
+            rounded = acc.to(tl.bfloat16)
+            tl.store(Y + route[:, None] * N + n[None, :], rounded, same[:, None] & (n[None, :] < N))
+
+
+    @triton.jit
+    def fastllm_mxfp4_grouped_activate(
+        Raw, Routes, Scores, Y, I: tl.constexpr, LIMIT: tl.constexpr, B: tl.constexpr
+    ):
+        route = tl.load(Routes + tl.program_id(1))
+        c = tl.program_id(0) * B + tl.arange(0, B)
+        g = tl.load(Raw + route * 2 * I + c, c < I, other=0).to(tl.float32)
+        u = tl.load(Raw + route * 2 * I + I + c, c < I, other=0).to(tl.float32)
+        if LIMIT > 0:
+            g = tl.minimum(g, LIMIT)
+            u = tl.maximum(-LIMIT, tl.minimum(u, LIMIT))
+        val = ((g / (1 + libdevice.exp(-g)) * u) * tl.load(Scores + route)).to(tl.bfloat16).to(tl.float32)
+        blocks = tl.reshape(tl.abs(val), (B // 32, 32))
+        amax = tl.maximum(tl.max(blocks, 1), 1e-4) / 448.0
+        bits = amax.to(tl.uint32, bitcast=True)
+        e = ((bits >> 23) & 255).to(tl.int32) - 127 + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        scales = libdevice.exp2(e.to(tl.float32))
+        scale = tl.reshape(tl.broadcast_to(scales[:, None], (B // 32, 32)), (B,))
+        q = tl.maximum(-448.0, tl.minimum(448.0, val / scale)).to(tl.float8e4nv).to(tl.float32) * scale
+        tl.store(Y + route * I + c, q.to(tl.bfloat16), c < I)
+
+
+    @triton.jit
     def _fastllm_fp8e4m3_to_float(x):
         x = x.to(tl.uint32)
         bits = ((x & 0x80) << 8) | ((x & 0x7F) << 7)
@@ -3496,7 +3581,7 @@ def compile_chunk_gdn_recompute(payload):
 
 def _compile_cubin(
     fn, signature, constexprs, arch, num_warps, num_stages, cubin_path,
-    extra_divisible_by_16=None,
+    extra_divisible_by_16=None, enable_fp_fusion=True,
 ):
     extra_divisible_by_16 = set(extra_divisible_by_16 or ())
     attrs = {
@@ -3514,7 +3599,7 @@ def _compile_cubin(
         src = ASTSource(fn=fn, signature=signature, constexprs=constexprs, attrs=attrs)
     target = GPUTarget("cuda", arch, 32)
     backend = triton.compiler.make_backend(target)
-    options = backend.parse_options({"num_warps": num_warps, "num_stages": num_stages})
+    options = backend.parse_options({"num_warps": num_warps, "num_stages": num_stages, "enable_fp_fusion": enable_fp_fusion})
     ccinfo = triton.compile(src, target=target, options=options.__dict__)
     cubin_path.write_bytes(ccinfo.asm[backend.binary_ext])
     return ccinfo
@@ -4548,9 +4633,102 @@ def compile_merge_moe_fp8(payload):
     return meta
 
 
+
+def mxfp4_grouped_cache_paths(payload):
+    arch = require_int(payload, "arch")
+    # Fixed original DSV4.1 layout and rounding, with runtime route count.
+    base = f"mxfp4_grouped_v2_sm{arch}_h5120_i2304_k6_n64_k64_w4_s3"
+    root = Path(payload["cache_dir"])
+    return {
+        name: root / f"{base}_{name}.cubin" for name in ("gate", "activate", "down")
+    }, root / f"{base}.json"
+
+
+def compile_mxfp4_grouped(payload):
+    if triton is None:
+        raise RuntimeError(f"failed to import triton: {_triton_error}")
+    arch = require_int(payload, "arch")
+    if arch not in {120, 121}:
+        raise ValueError("grouped MXFP4 requires SM12x")
+    paths, meta_path = mxfp4_grouped_cache_paths(payload)
+    if meta_path.exists() and all(p.exists() for p in paths.values()):
+        return json.loads(meta_path.read_text())
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    h, i, topk = 5120, 2304, 6
+    down = 2 * i * (h // 32) * 17
+    stride = down + h * (i // 32) * 17
+    signature = dict(
+        X="*bf16",
+        W="*u8",
+        Slots="*i32",
+        Routes="*i32",
+        Y="*bf16",
+        H="constexpr",
+        I="constexpr",
+        TOPK="constexpr",
+        COUNT="i32",
+        STRIDE="constexpr",
+        DOWN="constexpr",
+        GATE="constexpr",
+        BN="constexpr",
+        BK="constexpr",
+    )
+    constants = dict(H=h, I=i, TOPK=topk, STRIDE=stride, DOWN=down, BN=64, BK=64)
+    infos = {}
+    for name in ("gate", "down"):
+        sig = dict(signature, Y="*bf16" if name == "gate" else "*fp32")
+        infos[name] = _compile_cubin(
+            fastllm_mxfp4_grouped_gemm,
+            sig,
+            dict(constants, GATE=name == "gate"),
+            arch,
+            4,
+            3,
+            paths[name],
+            enable_fp_fusion=False,
+        )
+    infos["activate"] = _compile_cubin(
+        fastllm_mxfp4_grouped_activate,
+        dict(
+            Raw="*bf16",
+            Routes="*i32",
+            Scores="*fp32",
+            Y="*bf16",
+            I="constexpr",
+            LIMIT="constexpr",
+            B="constexpr",
+        ),
+        dict(I=i, LIMIT=10.0, B=128),
+        arch,
+        4,
+        1,
+        paths["activate"],
+        enable_fp_fusion=False,
+    )
+    meta = dict(
+        ok=True,
+        op="mxfp4_grouped",
+        version=2,
+        arch=arch,
+        kernels={
+            k: dict(
+                cubin=str(paths[k]),
+                kernel=v.metadata.name,
+                shared=int(v.metadata.shared),
+                num_warps=int(v.metadata.num_warps),
+            )
+            for k, v in infos.items()
+        },
+    )
+    meta_path.write_text(json.dumps(meta, sort_keys=True))
+    return meta
+
+
 def handle_compile(payload):
     op = payload.get("op")
     with _compile_lock:
+        if op == "mxfp4_grouped":
+            return compile_mxfp4_grouped(payload)
         if op == "linear":
             return compile_linear(payload)
         if op == "chunk_gdn_prefill":
