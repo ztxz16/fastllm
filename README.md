@@ -100,6 +100,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | Kimi-K3 | [Kimi-K3 指南](docs/kimi_k3.md) |
 | GLM-5 / GLM-5.3-Flash | [GLM-5 指南](docs/glm5.md) |
 | Dots3-Note / Laguna | [Dots3-Note](docs/dots3_note.md) · [Laguna](docs/laguna.md) |
+| HY-Nomas | [世界模型与 HTTP Demo 部署](docs/hy_nomas.md) |
 
 其他模型见[支持列表](docs/models.md)。让 Agent 帮忙部署时，可先提供[模型与参数速查](docs/model-deployment-agent.md)。实测速度与硬件、请求和量化格式有关，见 [Benchmark](docs/benchmark.md)。
 
