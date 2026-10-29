@@ -641,7 +641,7 @@ if (USE_CUDA)
         src/devices/multicuda/fastllm-custom-allreduce.cu)
 
     add_compile_definitions(FASTLLM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublasLt cublas nccl cuda ${CMAKE_DL_LIBS})
+    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublasLt cublas nccl cuda)
     set(CMAKE_CUDA_ARCHITECTURES ${FASTLLM_CUDA_ARCHITECTURES})
 endif()
 
@@ -806,6 +806,9 @@ if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_glm53/include")
     set(FASTLLM_GLM53_FLASHINFER_OBJECTS $<TARGET_OBJECTS:fastllm_glm53_flashinfer_sm120>)
 endif()
+
+# Disk loading also uses dlsym in CPU-only builds and the Python extension.
+list(APPEND FASTLLM_LINKED_LIBS ${CMAKE_DL_LIBS})
 
 if (PY_API)
     if(POLICY CMP0148)
