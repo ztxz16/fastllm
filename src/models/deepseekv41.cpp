@@ -2735,6 +2735,26 @@ namespace fastllm {
         // FASTLLM_DSV41_ENGRAM_WKV_FP8=0 可退回解量化。
         static const bool wkvFp8 = V41EnvFlagOn("FASTLLM_DSV41_ENGRAM_WKV_FP8") && !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH");
         std::set<std::string> tensorNameSet(tensorNames.begin(), tensorNames.end());
+        // Restrict compact storage to the single-CUDA hybrid path. TP/full-GPU
+        // graph layouts and explicit reference math retain their current weights.
+        bool compactProjections = false;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        compactProjections = executionMode == ExecutionMode::Hybrid &&
+            V41DeviceMapUsesCuda(deviceMap) && !V41DeviceMapUsesMultiCuda(deviceMap) &&
+            V41DeviceMapCudaDeviceCount(deviceMap) == 1 && FastllmCudaRuntimeArch() >= 80 &&
+            !V41ReferenceMathEnabled() && std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr;
+#endif
+        auto compactCheckpoint = [&](const std::string &name, bool head) {
+            auto dir = weight.dicts.find("model_directory");
+            if (!compactProjections || dir == weight.dicts.end()) return false;
+            V41SafeTensorInfo source, scale;
+            if (!V41FindSafeTensor(dir->second, name, source) || source.shape.size() != 2) return false;
+            if (head) return source.dtype == "BF16";
+            const std::string scaleName = name.substr(0, name.size() - strlen("weight")) + "scale";
+            return source.dtype == "F8_E4M3" && V41FindSafeTensor(dir->second, scaleName, scale) &&
+                (scale.dtype == "F8_E8M0" || scale.dtype == "U8") && scale.shape.size() == 2 &&
+                source.shape[0] == scale.shape[0] * 32 && source.shape[1] == scale.shape[1] * 32;
+        };
         auto markQuantizedLinear = [&](const std::string &name) {
             quantizedLinearNames.insert(name);
             if (V41EndsWith(name, ".w1.weight")) {
@@ -2812,7 +2832,9 @@ namespace fastllm {
             if (name == "head.weight" && !quantizedLinearNames.count(name)) {
                 // The original ParallelHead promotes the BF16 checkpoint
                 // weight to FP32 and returns FP32 logits without BF16 rounding.
-                result[name].push_back({name, DataType::FLOAT32});
+                // BF16 checkpoint values are retained exactly; only storage
+                // shrinks. The head still accumulates and emits FP32 logits.
+                result[name].push_back({name, compactCheckpoint(name, true) ? DataType::BFLOAT16 : DataType::FLOAT32});
                 continue;
             }
             if (V41EndsWith(name, ".attn.wkv.weight") && quantizedLinearNames.count(name)) {
@@ -2824,7 +2846,7 @@ namespace fastllm {
             if (V41EndsWith(name, ".attn.wo_a.weight")) {
                 // The original converter dequantizes this grouped projection
                 // to BF16, while retaining its explicit activation quantizer.
-                result[name].push_back({name, DataType::BFLOAT16});
+                result[name].push_back({name, compactCheckpoint(name, false) ? DataType::FP8_E4M3 : DataType::BFLOAT16});
                 continue;
             }
             // 磁盘表复用通用惰性加载；常驻表保留紧凑 UE8M0 scale，避免展开整张 scale 表。
@@ -3516,8 +3538,27 @@ namespace fastllm {
     }
 
     bool DeepSeekV41Model::TryBFloat16HeadLinear(Data &input, Data &output) {
-#ifdef USE_CUDA
         Data &headWeight = weight["head.weight"];
+        if (!quantizedLinearNames.count("head.weight") && !input.multiDeviceData &&
+            !headWeight.multiDeviceData && !output.multiDeviceData &&
+            (input.dataType == DataType::BFLOAT16 || input.dataType == DataType::FLOAT32) &&
+            headWeight.dataType == DataType::BFLOAT16 && headWeight.dims.size() == 2 &&
+            !input.dims.empty() && input.dims.back() == headWeight.dims[1] &&
+            &input != &output && &headWeight != &output) {
+#ifdef USE_CUDA
+            if (!V41ReferenceMathEnabled() && input.dataType == DataType::BFLOAT16 &&
+                FastllmCudaBFloat16LinearFloat32(input, headWeight, output)) return true;
+#endif
+            // Keep FP32 accumulation and logits on every compact-head fallback,
+            // including CPU execution and draft projections. Do not retain the
+            // expanded weight in the model or reduce FP32 inputs to BF16.
+            Data floatInput, floatWeight;
+            ToDataType(input, floatInput, DataType::FLOAT32);
+            ToDataType(headWeight, floatWeight, DataType::FLOAT32);
+            Linear(floatInput, floatWeight, *GetEmptyData(), output);
+            return true;
+        }
+#ifdef USE_CUDA
         if (executionMode != ExecutionMode::Gpu || V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") ||
             input.dataType != DataType::BFLOAT16 || !input.multiDeviceData ||
             !input.IsTensorParallelReplicated() || input.dims.empty() || &input == &output ||
@@ -6601,12 +6642,18 @@ namespace fastllm {
 #endif
 #if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)
             // V4.1's inverse-RoPE output is already quantized in blocks of 32.
-            // Its loader preserves WoA as BF16: the fast path verifies an exact
-            // FP8 reconstruction once, otherwise retaining the BF16 fallback.
+            // Compact weights use checkpoint FP8 bytes directly. Other layouts
+            // still verify an exact reconstruction of their BF16 weights.
             if (!referenceWoA && !tp && !V41ReferenceMathEnabled() &&
                 !V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") &&
                 quantizedLinearNames.count(pre + ".attn.wo_a.weight"))
                 referenceWoA = FastllmCudaTryMxfp8WoA(*attnOutAll,
+                    weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
+#endif
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            if (!referenceWoA && !tp && !V41ReferenceMathEnabled() &&
+                weight[pre + ".attn.wo_a.weight"].dataType == DataType::FP8_E4M3)
+                referenceWoA = FastllmCudaDeepSeekV41CompactWoA(*attnOutAll,
                     weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
 #endif
             if (!referenceWoA) DeepSeekV4WoA(*attnOutAll, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
@@ -7085,7 +7132,8 @@ namespace fastllm {
             preserveHeadLogits = true;
         }
 #endif
-        if (!precomputedHeadLogits && weight["head.weight"].dataType == DataType::FLOAT32) {
+        if (!precomputedHeadLogits && (weight["head.weight"].dataType == DataType::FLOAT32 ||
+            (weight["head.weight"].dataType == DataType::BFLOAT16 && !quantizedLinearNames.count("head.weight")))) {
             V41RMSNormBF16(headInput, weight["norm.weight"], rms_norm_eps, referenceHeadNorm);
             if (!TryBFloat16HeadLinear(referenceHeadNorm, referenceHeadLogits)) {
                 ToDataType(referenceHeadNorm, DataType::FLOAT32);

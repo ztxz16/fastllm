@@ -1283,6 +1283,7 @@ namespace fastllm {
     }
 
     void DeepSeekV41Model::DsparkProjectHead(Data &input, Data &output, bool persistent) {
+        if (v41DsparkTpDevices.empty() && TryBFloat16HeadLinear(input, output)) return;
 #ifdef USE_CUDA
         if (persistent && input.dataType == DataType::BFLOAT16 && !v41DsparkTpDevices.empty() &&
             !quantizedLinearNames.count("head.weight")) {
@@ -2587,7 +2588,8 @@ namespace fastllm {
 #endif
             if (!headProjected) {
                 if (v41DsparkTpDevices.empty()) {
-                    Linear(normed, weight["head.weight"], *GetEmptyData(), logits);
+                    if (!TryBFloat16HeadLinear(normed, logits))
+                        Linear(normed, weight["head.weight"], *GetEmptyData(), logits);
                 } else {
                     DsparkProjectHead(normed, logits, true);
                 }

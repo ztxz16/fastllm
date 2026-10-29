@@ -1182,6 +1182,11 @@ if (UNIT_TEST)
         add_test(NAME disk_moe_cache COMMAND disk_moe_cache_test)
         set_tests_properties(disk_moe_cache PROPERTIES TIMEOUT 180)
 
+        add_executable(deepseek_v41_compact_head_test test/basic/test_deepseek_v41_compact_head.cpp)
+        target_link_libraries(deepseek_v41_compact_head_test PRIVATE fastllm)
+        fastllm_add_checked_test(deepseek_v41_compact_head deepseek_v41_compact_head_test
+            "PASS: CPU compact head" 60)
+
         add_executable(deepseek_v41_disk_shared_test test/basic/test_deepseek_v41_disk_shared.cpp)
         target_link_libraries(deepseek_v41_disk_shared_test PRIVATE fastllm)
         find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -2626,6 +2631,12 @@ if (UNIT_TEST)
         set_tests_properties(cuda_moe_shared_prefill cuda_moe_shared_prefill_model_shape PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
         set_tests_properties(cuda_moe_cache_compact PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(cuda_dsv41_compact_projections_test test/basic/test_cuda_dsv41_compact_projections.cu)
+        target_link_libraries(cuda_dsv41_compact_projections_test PRIVATE fastllm)
+        set_target_properties(cuda_dsv41_compact_projections_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_dsv41_compact_projections COMMAND cuda_dsv41_compact_projections_test)
+        set_tests_properties(cuda_dsv41_compact_projections PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
         if (USE_NUMAS)
             add_executable(cuda_dsv41_moe_cache_test test/basic/test_cuda_dsv41_moe_cache.cu)

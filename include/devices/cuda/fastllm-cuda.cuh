@@ -1335,6 +1335,8 @@ bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data &q, const f
                                                  int prefixLen = 0,
                                                  bool nonCausalBlock = false,
                                                  const int32_t *decodeMeta = nullptr);
+bool FastllmCudaDeepSeekV41CompactWoA(const fastllm::Data &input, const fastllm::Data &weight,
+                                     int groups, int rank, fastllm::Data &output);
 bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::Data &woA,
                               int groups, int oRank, fastllm::Data &output,
                               bool allowTriton = true);

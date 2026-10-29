@@ -417,14 +417,16 @@ extern "C" bool FastllmCudaTryMxfp8WoA(const fastllm::Data &input,
         weight.dataDevice != fastllm::DataDevice::CUDA || !weight.cudaData ||
         input.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
         weight.dataDeviceIds != input.dataDeviceIds ||
-        weight.dataType != fastllm::DataType::BFLOAT16 || weight.dims.size() != 2 ||
+        (weight.dataType != fastllm::DataType::BFLOAT16 && weight.dataType != fastllm::DataType::FP8_E4M3) || weight.dims.size() != 2 ||
         groups <= 0 || rank <= 0 || rank % 128) return false;
     const int rows = input.dims[0] * input.dims[1], cols = weight.dims[1];
     if (rows < 128 || cols <= 0 || cols % 128 || weight.dims[0] != groups * rank ||
         input.Count(0) != (size_t)rows * groups * cols) return false;
     const uint8_t *weightScales = nullptr;
     const uint8_t *weightData = static_cast<const uint8_t *>(weight.cudaData);
-    if (!EnsureLosslessMxfp8Weight(weight, groups * rank, cols, weightData, weightScales)) return false;
+    if (weight.dataType == fastllm::DataType::FP8_E4M3) {
+        if (!EnsureMxfp8WeightScales(weight, groups * rank, cols, weightScales)) return false;
+    } else if (!EnsureLosslessMxfp8Weight(weight, groups * rank, cols, weightData, weightScales)) return false;
     output.dataType = fastllm::DataType::BFLOAT16;
     output.UpdateUnitSize();
     output.Resize({input.dims[0], input.dims[1], groups * rank});
