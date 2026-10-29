@@ -1202,10 +1202,12 @@ class TokenizerCache:
     def __init__ (self):
         from collections import deque
         self.caches = deque(maxlen = 100)
+        self.lock = threading.Lock()
     
     def add(self, prompt, tokens):
         # print("add cache", prompt[:100], tokens[:100])
-        self.caches.append([prompt, tokens])
+        with self.lock:
+            self.caches.append([prompt, tokens])
     
     def prompt_can_match(self, prompt, cur_len, s):
         if (cur_len + len(s) > len(prompt)):
@@ -1219,7 +1221,11 @@ class TokenizerCache:
         max_len = 0
         use_cahce_prompt = ""
         use_cache_tokens = []
-        for it in self.caches:
+        # Tokenization runs in parallel with completed requests adding history.
+        # Iterate a stable snapshot without holding the lock during encoding.
+        with self.lock:
+            caches = tuple(self.caches)
+        for it in caches:
             cur_tokens = []
             cur_prompt = ""
             cur_len = 0
