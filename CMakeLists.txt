@@ -2638,6 +2638,12 @@ if (UNIT_TEST)
 
         set_tests_properties(cuda_moe_cache_compact PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+        add_executable(cuda_shared_weight_upload_test test/basic/test_cuda_shared_weight_upload.cu)
+        target_link_libraries(cuda_shared_weight_upload_test PRIVATE fastllm)
+        set_target_properties(cuda_shared_weight_upload_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_shared_weight_upload COMMAND cuda_shared_weight_upload_test)
+        set_tests_properties(cuda_shared_weight_upload PROPERTIES LABELS "cuda;moe;numa" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+
         add_executable(cuda_dsv41_compact_projections_test test/basic/test_cuda_dsv41_compact_projections.cu)
         target_link_libraries(cuda_dsv41_compact_projections_test PRIVATE fastllm)
         set_target_properties(cuda_dsv41_compact_projections_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

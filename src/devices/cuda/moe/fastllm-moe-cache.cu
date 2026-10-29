@@ -4306,9 +4306,14 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
         cache.frequencyChanges.ToDevice(fastllm::CUDA, {cache.device}, false);
         cache.frequencyChanges.Allocate(false);
     }
-    if (group.layout.deepSeekV41 && !group.ggufSources.empty()) {
+    const bool stagedShared = group.layout.deepSeekV41 &&
+        group.layout.weightType == fastllm::NVFP4_BLOCK_32_E8M0 &&
+        group.sharedLayout.shards && !group.sharedLayout.auxiliaryBytes;
+    if (stagedShared || (group.layout.deepSeekV41 && !group.ggufSources.empty())) {
         size_t bytes = group.layout.recordStride;
         for (const auto &layout : group.layerLayouts) bytes = std::max(bytes, layout.recordStride);
+        if (stagedShared) bytes = std::max(bytes,
+            size_t(group.sharedLayout.sourceBytes[0]) + group.sharedLayout.sourceBytes[1]);
         auto &scratch = cache.frequencyUpload;
         if (scratch.expansionBytes < bytes) {
             scratch.dataType = fastllm::INT8;
@@ -4338,10 +4343,15 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
         } else if (group.sharedLayout.shards) {
             const auto &shared = group.sharedLayout;
             const size_t key = size_t(table) * layout.experts + expert;
-            fastllm::AssertInFastLLM(fastllm::cuda::CopySharedExpertRecord(shared,
+            const bool copied = stagedShared ? fastllm::cuda::UploadSharedExpertRecord(shared,
+                group.numaPointers.data() + key * 2 * shared.shards,
+                static_cast<uint8_t *>(cache.frequencyUpload.cudaData),
+                cache.frequencyUpload.expansionBytes, destination, stream) :
+                fastllm::cuda::CopySharedExpertRecord(shared,
                 cache.numaPointers + key * 2 * shared.shards, nullptr, nullptr,
                 shared.auxiliaryBytes ? group.deviceHostRecords + key * shared.auxiliaryBytes : nullptr,
-                destination, stream), "MoE shared global admission failed.");
+                destination, stream);
+            fastllm::AssertInFastLLM(copied, "MoE shared global admission failed.");
         } else if (group.ggufSources.empty()) {
             checkCudaErrors("MoE global admission", cudaMemcpyAsync(destination,
                 group.hostRecords + group.layerHostOffsets[table] + size_t(expert) * layout.recordStride,

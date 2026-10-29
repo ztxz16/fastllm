@@ -260,6 +260,36 @@ inline bool CopySharedExpertRecord(const SharedExpertLayout &layout, void *const
     return cudaGetLastError() == cudaSuccess;
 }
 
+// Upload each pinned NUMA shard contiguously, then restore the canonical
+// record entirely in VRAM. Reuse staging only on this stream after the gather;
+// the caller publishes cache residency after both operations have completed.
+// Layouts with separate auxiliary metadata retain their existing adapter.
+inline bool UploadSharedExpertRecord(const SharedExpertLayout &layout,
+        void *const *hostPointers, uint8_t *staging, size_t stagingBytes,
+        uint8_t *destination, cudaStream_t stream) {
+    const size_t bytes = size_t(layout.sourceBytes[0]) + layout.sourceBytes[1];
+    if (!hostPointers || !staging || !destination || staging == destination ||
+        layout.auxiliaryBytes || !bytes || stagingBytes < bytes) return false;
+    for (int part = 0; part < 2; ++part) {
+        const auto &view = layout.weights[part];
+        if (!view.Valid(layout.shards, layout.recordBytes) || !view.shardBytes ||
+            uint64_t(view.shardBytes) * layout.shards != layout.sourceBytes[part]) return false;
+        for (unsigned shard = 0; shard < layout.shards; ++shard)
+            if (!hostPointers[part * layout.shards + shard]) return false;
+    }
+    size_t offset = 0;
+    for (int part = 0; part < 2; ++part) {
+        const size_t shardBytes = layout.weights[part].shardBytes;
+        for (unsigned shard = 0; shard < layout.shards; ++shard) {
+            if (cudaMemcpyAsync(staging + offset, hostPointers[part * layout.shards + shard],
+                    shardBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return false;
+            offset += shardBytes;
+        }
+    }
+    return CopySharedExpertRecord(layout, nullptr, staging,
+        staging + layout.sourceBytes[0], nullptr, destination, stream);
+}
+
 // Prepare() validates layouts and derives source extents once when binding the
 // owner. Copy is allocation-free and graph-capturable; count stays on device.
 inline bool CopySharedExpertRecords(const SharedExpertLayout &layout,
