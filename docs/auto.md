@@ -19,6 +19,7 @@ ftllm server /path/to/model --auto
 | Qwen4 / Qwen3.8-Flash-Next | 优先 `--auto`，见 [Flash-Next 指南](qwen3.8-flash-next/README.md) |
 | GLM-5.3-Flash | 优先 `--auto`，见 [GLM 指南](glm5.md) |
 | DeepSeek-V4.1 | 优先 `--auto`，见 [V4.1 指南](deepseek_v41.md) |
+| Clover-35B-A3B-Preview | 原版 BF16、单张 SM80+ GPU、串行请求，见 [Clover 指南](clover.md) |
 | DeepSeek-V4、Kimi-K3、Dots3-Note、Laguna、GLM-5/5.2 | 尚未接入运行时自动规划，使用各自指南的手动命令 |
 
 支持模型推理不等于支持 `--auto`。CPU-only、Windows 和 ROCm 使用对应的手动部署方式。
