@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HY-Nomas · 交互世界 · fastllm</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101419;color:#e7edf2;font:15px system-ui,sans-serif}main{max-width:1180px;margin:28px auto;padding:24px}h1{font-size:30px;margin:0 0 8px}.muted{color:#a6b4c1;line-height:1.7}.layout{display:grid;grid-template-columns:330px 1fr;gap:24px;margin-top:24px}.card{background:#1a222c;border:1px solid #334150;border-radius:16px;padding:22px}label{display:block;margin:14px 0 7px}textarea,input,select,button{font:inherit;border-radius:8px;border:1px solid #47596c;padding:10px}textarea,input,select{background:#101820;color:#fff;width:100%}textarea{height:140px;resize:vertical}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}button{background:#8fd9ce;color:#132321;font-weight:600;cursor:pointer;margin:16px 6px 0 0}button.secondary{background:transparent;color:#ddd}button[aria-pressed="true"]{outline:2px solid #b4fff0;background:#c8fff6}button:disabled{opacity:.4;cursor:default}button:focus-visible,canvas:focus-visible{outline:2px solid #b4fff0;outline-offset:3px}canvas{display:block;width:100%;background:#0c1015;border-radius:8px;image-rendering:auto}progress{width:100%;margin:16px 0 10px;accent-color:#8fd9ce}pre{white-space:pre-wrap;word-break:break-all;color:#a6b4c1;font-size:12px}a{color:#8fd9ce}.notice{padding:12px 16px;border-left:3px solid #8fd9ce;background:#192c2d;border-radius:5px;line-height:1.7}#status{min-height:25px;line-height:1.6}[hidden]{display:none!important}.player-controls{display:flex;align-items:center;gap:12px;margin-top:12px}.player-controls button{margin:0;min-width:76px}.player-controls label{margin:0;white-space:nowrap}.player-controls select{width:auto;margin-left:auto}#seek{padding:0;accent-color:#8fd9ce}#frame-info{font-variant-numeric:tabular-nums;font-size:12px;margin:6px 0;color:#a6b4c1}.navigation{display:grid;grid-template-columns:1fr 1fr;gap:18px;border-top:1px solid #334150;margin-top:18px;padding-top:16px}.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.pad button{margin:0;padding:9px 3px;font-size:13px}.pad .up{grid-column:2}.pad .left{grid-column:1}.pad-title{color:#a6b4c1;margin-bottom:10px;font-size:13px}details summary{cursor:pointer;color:#a6b4c1;font-size:13px;margin-top:10px}.session{font-size:13px;color:#8fd9ce;margin-bottom:12px}kbd{font:12px monospace;color:#b4c8d7}.hint{font-size:13px;margin-bottom:0;line-height:1.7}@media(max-width:800px){.layout{grid-template-columns:1fr}.layout.has-world .viewer{grid-row:1}.layout.has-world canvas{max-height:38vh;object-fit:contain}.layout.has-world .navigation{margin-top:10px;padding-top:10px}main{margin:0 auto;padding:18px}.navigation{gap:12px}}
+</style>
+<main><h1>HY-Nomas <span class="muted">/ fastllm</span></h1>
+<p class="muted">创建场景，通过移动和转向探索模型生成的世界。</p>
+<p class="notice" id="precision">FP32 交互预览 · 沿用场景历史，每段生成 20 帧。连续探索会边播放边生成；启用平稳播放时，播放速度会随实际生成速度降低。</p>
+<div class="layout" id="layout"><section class="card"><form id="form">
+<label for="mode">模式</label><select id="mode"><option value="world">交互世界</option><option value="video">独立短视频</option></select>
+<label for="prompt">场景描述</label><textarea id="prompt" required>First-person view inside a spacious wooden cabin, a table and chairs in the center, large windows overlooking a green forest, warm daylight, realistic details.</textarea>
+<div class="row"><div><label for="size">画面尺寸</label><select id="size"><option>128 × 128</option><option>256 × 160</option><option>256 × 256</option><option selected>384 × 224</option><option>512 × 288</option></select></div><div><label for="frames">每次帧数</label><select id="frames"><option value="20">20 帧</option><option value="16">16 帧</option><option value="32">32 帧</option><option value="40">40 帧</option></select></div></div>
+<label for="seed">随机种子</label><input id="seed" type="number" min="0" max="4294967295" value="42" required>
+<button id="apply-scene" type="button" disabled>修改当前场景</button><p id="prompt-status" class="muted hint">创建场景后，可以修改描述并保留当前世界历史。</p>
+<button id="generate">创建场景</button><button id="cancel" class="secondary" type="button" disabled>取消</button><button id="reset" class="secondary" type="button" disabled>结束场景</button></form>
+<p class="muted hint">点击按钮，或点击画面后用 W/A/S/D 移动、方向键转向。单步模式每次按键操作一次；连续模式可点按或按住方向键/按钮；点按至少执行一段，持续按住会继续移动，松开后原地观察。方向变更在下一段生效。</p>
+<p class="muted hint">修改描述会引导后续画面，保留当前世界历史；每段仅 0.83 秒，变化可能延迟或被模型忽略。修改完成后，移动、转向和原地观察会探索当前场景，不重复下达修改指令。只有“按描述继续生成”会再次使用当前描述，并取消相机约束。首次应用新描述需重新编码，会比普通移动慢。</p>
+<p class="muted hint">首次创建需读取权重。当前最多保留最近 6 段历史；服务重启后需重新创建场景。</p><p><a href="/docs" target="_blank">HTTP API 文档</a></p></section>
+<section class="card viewer"><div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px"><div class="session" id="session-info" style="margin:0">尚未创建场景</div><button id="edit-scene" class="secondary" type="button" style="margin:0;white-space:nowrap" disabled>修改场景描述</button></div><canvas id="video" width="640" height="400" tabindex="0" aria-label="交互世界画面，点击后使用 W A S D 移动和方向键转向"></canvas>
+<details id="player" hidden><summary>回看本段画面 / 播放速度</summary><div class="player-controls"><button id="play" type="button">播放</button><label for="speed">速度</label><select id="speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option></select></div><label for="seek">本次操作的画面进度</label><input id="seek" type="range" min="0" max="0" step="1" value="0"><div id="frame-info"></div></details>
+<progress id="progress" value="0" max="100"></progress><div id="status">创建场景后即可移动、转向</div>
+<div id="navigation" class="navigation"><div><div class="pad-title">移动 · W / A / S / D</div><div class="pad"><button id="forward" class="up" type="button" disabled>前进 W</button><button id="left" class="left" type="button" disabled>左移 A</button><button id="backward" type="button" disabled>后退 S</button><button id="right" type="button" disabled>右移 D</button></div></div><div><div class="pad-title">视角 · 方向键</div><div class="pad"><button id="look_up" class="up" type="button" disabled>抬头 ↑</button><button id="look_left" class="left" type="button" disabled>左转 ←</button><button id="look_down" type="button" disabled>低头 ↓</button><button id="look_right" type="button" disabled>右转 →</button></div></div><button id="stay" class="secondary" type="button" disabled>原地观察</button><button id="follow_prompt" type="button" disabled>按描述继续生成</button></div>
+<div><button id="continuous" type="button" disabled>连续探索</button><label style="display:inline;font-size:13px"><input id="paced" type="checkbox" checked style="width:auto">平稳播放（慢速时放慢画面）</label></div><p class="muted hint" id="control-info"></p><p class="muted hint" id="performance"></p><pre id="details"></pre></section></div></main>
+<script>
+const $=id=>document.getElementById(id);
+const actions={forward:'前进',backward:'后退',left:'左移',right:'右移',look_left:'左转',look_right:'右转',look_up:'抬头',look_down:'低头',stay:'原地观察',follow_prompt:'按描述继续生成'};
+let active=null,world=null,busy=false,images=[],timer=null,playing=false,currentFrame=0,fps=24,epoch=0,originFrame=0,loop=true;
+let continuous=false,desiredAction="stay",pendingAction=null,adaptiveRate=1,lastJob=null,promptUpdate=null,promptError='',activePromptRevision=0;
+const heldActions=new Map();
+const frameLoads=new Map();
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+fetch('/health').then(r=>r.json()).then(h=>{if(h.precision==='bf16')$('precision').textContent='BF16 实验模式：整模型误差对照尚未通过。相机操作会生成下一段画面，需等待推理。';}).catch(()=>{});
+async function api(url,options={}) {
+  const response=await fetch(url,options),data=await response.json();
+  if(!response.ok)throw Error(data.error?.message||JSON.stringify(data.detail||data));
+  return data;
+}
+const post=(url,body)=>api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+function controls() {
+  const interactive=$('mode').value==='world';
+  $('layout').classList.toggle('has-world',Boolean(world)&&interactive);
+  for(const id of ['generate','mode','size','seed'])$(id).disabled=busy||Boolean(promptUpdate);
+  $('prompt').disabled=busy&&!(interactive&&world);
+  $('apply-scene').hidden=!interactive;
+  $('edit-scene').hidden=!interactive;
+  $('edit-scene').disabled=!interactive||!world;
+  $('apply-scene').disabled=!interactive||!world||!['ready','generating'].includes(world.status)||Boolean(promptUpdate)||!$('prompt').value.trim();
+  $('prompt-status').hidden=!interactive;
+  $('prompt-status').textContent=promptError||(promptUpdate?'正在保存新描述…':world?
+    (world.prompt!==undefined&&$('prompt').value!==world.prompt?'描述已编辑，点击“修改当前场景”后生效。':
+     world.prompt_revision===1&&world.applied_prompt_revision===0?'正在创建场景；仍可编辑后续段的描述。':
+     world.prompt_revision>world.applied_prompt_revision?
+       (active&&activePromptRevision===world.prompt_revision?'正在按新描述生成画面，保留当前世界历史…':'新描述已接受，将用于下一段；已提交的旧片段保持原描述。'):
+     '描述已用于生成；现在移动会探索当前场景。点击“按描述继续生成”才会再次按此描述生成。'):
+    '创建场景后，可以修改描述并保留当前世界历史。');
+  $('frames').disabled=busy||interactive;
+  if(interactive)$('frames').value='20';
+  $('cancel').disabled=!active;
+  $('reset').disabled=busy||continuous||Boolean(promptUpdate)||!world;
+  $('continuous').disabled=(!continuous&&(busy||Boolean(promptUpdate)))||!interactive||!world||world.segments===0||['failed','complete'].includes(world.status);
+  $('continuous').textContent=continuous?'停止连续探索':'连续探索';
+  $('generate').textContent=interactive?(world?'重建场景':'创建场景'):'生成视频';
+  $('navigation').hidden=!interactive;
+  for(const action of Object.keys(actions))$(action).disabled=Boolean(promptUpdate)||(!continuous&&busy)||!interactive||!world||(!continuous&&world.status!=='ready')||world.segments===0;
+  showControl();
+  $('session-info').textContent=world?`同一场景 · 已生成 ${world.segments} 段 / ${world.generated_frames} 帧`:(interactive?'尚未创建场景':'独立短视频');
+}
+function drawFrame(index) {
+  if(!images.length)return;
+  currentFrame=Math.max(0,Math.min(images.length-1,index));
+  const canvas=$('video');
+  canvas.getContext('2d').drawImage(images[currentFrame],0,0,canvas.width,canvas.height);
+  $('seek').value=currentFrame;
+  $('frame-info').textContent=`第 ${currentFrame+1} / ${images.length} 帧 · ${(currentFrame/fps).toFixed(2)} / ${(images.length/fps).toFixed(2)} 秒`;
+}
+function tick() {
+  if(!playing||!images.length)return;
+  const rate=Number($('speed').value)*adaptiveRate,elapsed=Math.max(0,performance.now()-epoch);
+  const index=originFrame+Math.floor(elapsed*fps*rate/1000);
+  if(!loop&&index>=images.length-1){drawFrame(images.length-1);setPlaying(false);return;}
+  drawFrame(index%images.length);
+  timer=setTimeout(tick,1000/(fps*rate));
+}
+function setPlaying(value) {
+  clearTimeout(timer);timer=null;
+  playing=Boolean(value&&images.length);
+  epoch=performance.now();originFrame=currentFrame;
+  $('play').textContent=playing?'暂停':'播放';
+  $('play').setAttribute('aria-label',playing?'暂停播放':'开始播放');
+  if(playing)tick();
+}
+$('play').onclick=()=>{stopContinuous();if(!playing&&!loop&&currentFrame===images.length-1)drawFrame(0);setPlaying(!playing);};
+$('seek').oninput=()=>{stopContinuous();setPlaying(false);drawFrame(Number($('seek').value));};
+$('speed').onchange=()=>{setPlaying(playing);updatePerformance();};
+function updatePerformance(){const job=lastJob;$('performance').textContent=job?.generation_seconds?`本段推理 ${job.generation_seconds.toFixed(2)} 秒 · 实际生成 ${job.generation_fps} FPS · 播放 ${(fps*adaptiveRate*Number($('speed').value)).toFixed(1)} FPS` : '';}
+document.addEventListener('visibilitychange',()=>{if(document.hidden){stopContinuous();}else if(playing)setPlaying(true);});
+function preload(job){
+  for(const url of job.output?.frames||[])if(!frameLoads.has(url)){
+    const promise=new Promise((resolve,reject)=>{const image=new Image();image.onload=()=>resolve(image);image.onerror=()=>reject(Error('读取画面失败，可刷新页面重试'));image.src=url;});
+    promise.catch(()=>{});frameLoads.set(url,promise);
+  }
+}
+async function showResult(job) {
+  $('status').textContent='正在加载画面…';
+  preload(job);
+  const loaded=await Promise.all(job.output.frames.map(url=>frameLoads.get(url)));
+  while(continuous&&playing)await sleep(25); // At most one segment waits for playback.
+  frameLoads.clear();
+  if(!loaded.length)throw Error('生成结果没有画面');
+  setPlaying(false);images=loaded;fps=Number(job.fps)||24;
+  adaptiveRate=continuous&&$('paced').checked&&job.segment_index>1?Math.min(1,images.length/(fps*Math.max(.01,job.total_seconds||job.generation_seconds)*1.05)):1;
+  lastJob=job;updatePerformance();
+  currentFrame=0;loop=!job.world_id;
+  $('video').width=job.width;$('video').height=job.height;$('seek').max=images.length-1;$('player').hidden=false;$('player').open=!job.world_id;$('progress').value=100;
+  $('status').textContent=job.world_id?`${job.segment_index===1?'场景已创建':(actions[job.action]||'操作')+'完成'}，可继续移动或转向`:`已生成 ${images.length} 帧 · ${fps} FPS · 循环播放`;
+  drawFrame(0);setPlaying(true);
+}
+async function refreshWorld() {
+  if(world)world=await api('/v1/worlds/'+world.id);
+}
+function showProgress(job){
+  const stages={queued:'排队中',text_encoding:'理解场景并读取权重',denoising:job.world_id?'根据动作和历史生成下一段':'生成视频',decoding:'还原画面',saving:'传输画面'};
+  $('status').textContent=(continuous?'连续探索 · 正在生成 '+actions[job.action]+' · ':'')+(stages[job.stage]||job.status);$('progress').value=job.progress;preload(job);
+}
+async function awaitJob(job){
+  const terminal=j=>['completed','failed','cancelled'].includes(j.status);
+  if(!terminal(job)&&typeof EventSource==='function'){
+    try{return await new Promise((resolve,reject)=>{
+      const source=new EventSource(job.events_url||'/v1/videos/'+job.id+'/events');
+      source.onmessage=event=>{try{const next=JSON.parse(event.data);showProgress(next);if(terminal(next)){source.close();resolve(next);}}catch(error){source.close();reject(error);}};
+      source.onerror=()=>{source.close();reject(Error('事件连接中断'));};
+      source.addEventListener('expired',()=>{source.close();reject(Error('任务已过期'));});
+    });}catch{} // Polling also recovers through HTTP proxies without SSE support.
+  }
+  while(!terminal(job)){showProgress(job);await sleep(250);job=await api('/v1/videos/'+encodeURIComponent(job.id));}
+  return job;
+}
+async function followJob(job) {
+  frameLoads.clear();
+  active=job.id;activePromptRevision=job.prompt_revision||0;controls();
+  $('details').textContent=(job.world_id?'场景 '+job.world_id+'\n':'')+'任务 '+job.id;
+  history.replaceState(null,'',job.world_id?'?world='+encodeURIComponent(job.world_id):'?video='+encodeURIComponent(job.id));
+  try {
+    job=await awaitJob(job);
+    if(job.status==='failed')throw Error(job.error?.message||'生成失败');
+    if(job.status==='cancelled'){stopContinuous();$('status').textContent='已取消，本次操作未推进场景';return;}
+    await showResult(job);
+  } finally {await refreshWorld();}
+}
+function idle(){active=null;activePromptRevision=0;busy=false;controls();}
+function showControl(){
+  const selected=pendingAction||desiredAction;
+  $('control-info').textContent=continuous?`下一段：${actions[selected]} · 已开始的生成会按原方向完成`:'移动、转向和原地观察只探索当前场景，不重复修改指令。';
+  for(const action of Object.keys(actions))$(action).setAttribute('aria-pressed',String(continuous&&selected===action));
+}
+function pressAction(source,action){
+  heldActions.delete(source);heldActions.set(source,action);
+  desiredAction=action;pendingAction=action;showControl();
+}
+function releaseAction(source){
+  heldActions.delete(source);
+  desiredAction=Array.from(heldActions.values()).at(-1)||'stay';showControl();
+}
+function takeAction(){const action=pendingAction||desiredAction;pendingAction=null;showControl();return action;}
+function stopContinuous(){continuous=false;desiredAction='stay';pendingAction=null;heldActions.clear();controls();}
+$('continuous').onclick=async()=>{
+  if(continuous){stopContinuous();$('status').textContent='已停止连续探索，当前任务完成后停留在新视角';return;}
+  if(busy||!world||world.status!=='ready')return;
+  continuous=true;desiredAction='stay';pendingAction=null;heldActions.clear();controls();
+  while(continuous&&world?.status==='ready'){
+    if(promptUpdate)await promptUpdate;
+    if(!continuous||world?.status!=='ready')break;
+    const action=takeAction();
+    await move(action);
+  }
+  stopContinuous();
+};
+$('form').onsubmit=async event=>{
+  event.preventDefault();if(busy||promptUpdate)return;
+  busy=true;controls();setPlaying(false);$('progress').value=0;$('status').textContent='提交任务…';
+  try {
+    const [width,height]=$('size').value.split(' × ').map(Number);
+    const body={model:'hy-nomas',messages:[{role:'user',content:$('prompt').value}],width,height,num_frames:Number($('frames').value),seed:Number($('seed').value),steps:8};
+    if($('mode').value==='world') {
+      if(world){await api('/v1/worlds/'+world.id,{method:'DELETE'});world=null;}
+      world=await post('/v1/worlds',body);
+      await followJob(await api('/v1/videos/'+world.current_job));
+    } else await followJob(await post('/v1/videos',body));
+  } catch(error){$('status').textContent=error.message;}
+  finally{idle();}
+};
+async function move(action) {
+  if(busy||promptUpdate||!world||world.status!=='ready'||world.segments===0)return;
+  busy=true;controls();if(!continuous){setPlaying(false);drawFrame(images.length-1);}$('progress').value=0;$('status').textContent=(actions[action]||'操作')+'…';
+  try{await followJob(await post('/v1/worlds/'+world.id+'/actions',{action}));}
+  catch(error){stopContinuous();$('status').textContent=error.message;try{await refreshWorld();}catch{}}
+  finally{idle();}
+}
+$('prompt').oninput=()=>{promptError='';controls();};
+$('edit-scene').onclick=()=>{$('prompt').focus({preventScroll:true});$('prompt').scrollIntoView({behavior:'smooth',block:'center'});};
+$('apply-scene').onclick=async()=>{
+  if(promptUpdate||!world||!['ready','generating'].includes(world.status))return;
+  const id=world.id,prompt=$('prompt').value;
+  if(!prompt.trim())return;
+  promptError='';
+  promptUpdate=(async()=>{
+    try{
+      const accepted=await api('/v1/worlds/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt})});
+      // Do not let a delayed PATCH response overwrite newer generation state.
+      if(world?.id!==id)return false;
+      world.prompt=accepted.prompt;world.prompt_revision=accepted.prompt_revision;return true;
+    }
+    catch(error){promptError=error.message;return false;}
+  })();
+  controls();
+  const accepted=await promptUpdate;promptUpdate=null;controls();
+  // A scene edit follows text without imposing a stationary camera. An active
+  // job keeps its original conditions; the next continuous segment uses text.
+  if(accepted&&world?.id===id){
+    if(continuous){pendingAction='follow_prompt';showControl();}
+    else if(!busy&&world.status==='ready')await move('follow_prompt');
+  }
+};
+for(const action of Object.keys(actions)){
+  const button=$(action);
+  button.onclick=event=>{if(continuous){if(!event||event.detail===0){pendingAction=action;showControl();}return;}return move(action);};
+  button.onpointerdown=event=>{if(!continuous)return;event.preventDefault();button.setPointerCapture(event.pointerId);pressAction('pointer:'+event.pointerId,action);};
+  button.onpointerup=button.onpointercancel=button.onlostpointercapture=event=>releaseAction('pointer:'+event.pointerId);
+}
+document.addEventListener('keydown',event=>{
+  if(event.repeat||event.ctrlKey||event.metaKey||event.altKey||/^(INPUT|TEXTAREA|SELECT)$/.test(event.target.tagName)||$('mode').value!=='world')return;
+  const keys={w:'forward',s:'backward',a:'left',d:'right',ArrowLeft:'look_left',ArrowRight:'look_right',ArrowUp:'look_up',ArrowDown:'look_down'};
+  const action=keys[event.key]||keys[event.key.toLowerCase()];
+  if(action){event.preventDefault();if(continuous){pressAction('key:'+(event.code||event.key.toLowerCase()),action);}else move(action);}
+});
+document.addEventListener('keyup',event=>releaseAction('key:'+(event.code||event.key.toLowerCase())));
+window.addEventListener('blur',stopContinuous);
+$('reset').onclick=async()=>{
+  if(busy||!world)return;busy=true;controls();
+  try{await api('/v1/worlds/'+world.id,{method:'DELETE'});world=null;history.replaceState(null,'',location.pathname);setPlaying(false);$('status').textContent='场景已结束，可以创建新场景';}
+  catch(error){$('status').textContent=error.message;}
+  finally{idle();}
+};
+$('mode').onchange=controls;
+$('cancel').onclick=async()=>{
+  stopContinuous();
+  if(active)try{await post('/v1/videos/'+encodeURIComponent(active)+'/cancel',{});$('status').textContent='正在取消…';}
+  catch(error){$('status').textContent=error.message;}
+};
+async function restore() {
+  const params=new URLSearchParams(location.search),savedWorld=params.get('world'),savedVideo=params.get('video');
+  if(!savedWorld&&!savedVideo)return;
+  busy=true;controls();
+  try {
+    if(savedWorld&&/^world_[a-f0-9]{32}$/.test(savedWorld)) {
+      $('mode').value='world';world=await api('/v1/worlds/'+savedWorld);restoreWorldInputs();
+      const video=world.status==='generating'?world.current_job:world.latest_video;
+      if(video)await followJob(await api('/v1/videos/'+video));
+    } else if(savedVideo&&/^video_[a-f0-9]{32}$/.test(savedVideo)) {
+      const job=await api('/v1/videos/'+savedVideo);$('mode').value=job.world_id?'world':'video';
+      if(job.world_id){world=await api('/v1/worlds/'+job.world_id);restoreWorldInputs();}
+      await followJob(job);
+    }
+  } catch(error){$('status').textContent=error.message;}
+  finally{idle();}
+}
+function restoreWorldInputs(){
+  if(world.prompt!==undefined)$('prompt').value=world.prompt;
+  $('size').value=`${world.width} × ${world.height}`;$('seed').value=world.seed;
+}
+controls();restore();
+</script></html>
