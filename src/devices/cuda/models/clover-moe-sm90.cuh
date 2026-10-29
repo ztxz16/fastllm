@@ -1,0 +1,308 @@
+// Native SM90 TMA staging for Clover's grouped BF16 experts. CUDA/PTX only.
+// The generic WMMA path remains available on SM80 and for small decode blocks.
+#pragma once
+#include <cuda.h>
+#include <map>
+#include <tuple>
+
+#ifdef FASTLLM_ENABLE_CLOVER_MOE_SM90
+bool FastllmCudaCloverWgmmaAvailable();
+void FastllmCudaCloverWgmmaExperts(const CUtensorMap *inputMap, const CUtensorMap *gateMap,
+    const CUtensorMap *middleMap, const CUtensorMap *downMap, const float *scores,
+    const int *workspace, void *middle, void *parts, void *packedMiddle,
+    int rows, int hidden, int intermediate, int experts, int tiles, cudaStream_t stream);
+#endif
+
+#if CUDART_VERSION >= 12000
+namespace {
+struct CloverExpertMaps { CUtensorMap input, weight; };
+__device__ __forceinline__ unsigned CloverSharedAddress(const void *p) {
+    return (unsigned)__cvta_generic_to_shared(p);
+}
+__device__ __forceinline__ int CloverSwizzle128(int p) {
+    return p ^ (((p >> 6) & 7) << 3);
+}
+__device__ __forceinline__ void CloverTmaLoad(void *dst, const CUtensorMap *map,
+        int k, int row, unsigned long long *barrier) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2,%3}], [%4];" ::
+        "r"(CloverSharedAddress(dst)), "l"(map), "r"(k), "r"(row),
+        "r"(CloverSharedAddress(barrier)) : "memory");
+#endif
+}
+__device__ __forceinline__ void CloverTmaWait(unsigned long long *barrier, int phase) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("{ .reg .pred p; wait_loop: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1; @!p bra wait_loop; }" ::
+        "r"(CloverSharedAddress(barrier)), "r"(phase) : "memory");
+#endif
+}
+__device__ __forceinline__ void CloverMma16816(float *c, const unsigned *a, const unsigned *b) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" :
+        "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) :
+        "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
+}
+template<bool WarpRows, int TileRows = 16>
+__global__ void CloverPackExpertInput(const __nv_bfloat16 *input, const int *workspace,
+        __nv_bfloat16 *packed, int rows, int hidden, int experts, int topk) {
+    const int *tiles = workspace + (size_t)experts * (rows + 1);
+    if (blockIdx.y >= tiles[0]) return;
+    int index = tiles[blockIdx.y + 1], expert = index / (rows + 1), start = index % (rows + 1);
+    // Large prefills assign one row per warp and four rows per CTA. Small
+    // blocks retain one CTA per row to expose enough independent work.
+    int row = WarpRows ? blockIdx.x * 4 + threadIdx.x / 32 : blockIdx.x;
+    int task = start + row < workspace[expert * (rows + 1) + rows] ? workspace[index + row] : -1;
+    auto *dst = reinterpret_cast<uint4 *>(packed + ((size_t)blockIdx.y * TileRows + row) * hidden);
+    for (int d = WarpRows ? threadIdx.x % 32 : threadIdx.x;
+         d < hidden / 8; d += WarpRows ? 32 : blockDim.x) {
+        uint4 value = make_uint4(0, 0, 0, 0);
+        if (task >= 0) {
+            const auto *src = input + (size_t)(task / topk) * hidden;
+            if ((reinterpret_cast<uintptr_t>(src) & 15) == 0) value = reinterpret_cast<const uint4 *>(src)[d];
+            else {
+                // Tensor views may begin at an unaligned BF16 element. Copy
+                // their bits without arithmetic conversions.
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    reinterpret_cast<uint16_t *>(&value)[j] = reinterpret_cast<const uint16_t *>(src)[d * 8 + j];
+            }
+        }
+        dst[d] = value;
+    }
+}
+
+__device__ __forceinline__ void CloverStoreExpertPair(__nv_bfloat16 *p, float x, float y) {
+    // Preserve both BF16 rounding boundaries; tensor views may be unaligned.
+    auto v = __floats2bfloat162_rn(x, y);
+    if ((reinterpret_cast<uintptr_t>(p) & 3) == 0)
+        *(__nv_bfloat162 *)p = v;
+    else {
+        p[0] = __low2bfloat16(v);
+        p[1] = __high2bfloat16(v);
+    }
+}
+
+template<bool Gate, int K> constexpr int CloverTmaExpertSharedBytes() {
+    return 2 * (16 + 64 * (Gate ? 2 : 1)) * K * sizeof(__nv_bfloat16);
+}
+template<bool Gate, int K = 64>
+__global__ void CloverTmaExpertGemm(const __grid_constant__ CloverExpertMaps maps,
+        const float *scores, const int *workspace, __nv_bfloat16 *output,
+        __nv_bfloat16 *packedMiddle, int rows, int hidden, int intermediate, int experts) {
+#if __CUDA_ARCH__ >= 900
+    constexpr int M = 16, N = 64, Stages = 2;
+    constexpr int StageElements = (M + N * (Gate ? 2 : 1)) * K;
+    const int *tiles = workspace + (size_t)experts * (rows + 1);
+    if (blockIdx.y >= tiles[0]) return;
+    int tid = threadIdx.x, lane = tid % 32, warp = tid / 32, column = blockIdx.x * N;
+    int index = tiles[blockIdx.y + 1], expert = index / (rows + 1), start = index % (rows + 1);
+    int inputWidth = Gate ? hidden : intermediate, outputWidth = Gate ? intermediate : hidden;
+    extern __shared__ __align__(1024) __nv_bfloat16 storage[];
+    __shared__ unsigned long long barriers[Stages];
+    __shared__ int tasks[M];
+    if (tid < M) tasks[tid] = start + tid < workspace[expert * (rows + 1) + rows] ? workspace[index + tid] : -1;
+    if (tid == 0) {
+#pragma unroll
+        for (int i = 0; i < Stages; ++i)
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(CloverSharedAddress(barriers + i)) : "memory");
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    }
+    __syncthreads();
+    auto load = [&](int step) {
+        bool valid = step * K < inputWidth;
+        int stage = step % Stages;
+        auto *ptr = storage + stage * StageElements;
+        int weightRow = expert * outputWidth * (Gate ? 2 : 1) + column;
+        if (tid == 0 && valid)
+            asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::
+                "r"(CloverSharedAddress(barriers + stage)), "r"(StageElements * 2) : "memory");
+        // K=128 assigns its two64-element TMA chunks to different warps.
+        // Publish the total transaction count before either warp issues a load.
+        // K=64 retains its single issuer and needs no extra CTA barrier.
+        if constexpr (K > 64) __syncthreads();
+        if ((K == 64 ? tid == 0 : lane == 0) && valid) {
+            for (int chunk = K == 64 ? 0 : warp; chunk < K / 64; chunk += 4) {
+                CloverTmaLoad(ptr + chunk * M * 64, &maps.input,
+                    step * K + chunk * 64, blockIdx.y * M, barriers + stage);
+                CloverTmaLoad(ptr + M * K + chunk * N * 64, &maps.weight,
+                    step * K + chunk * 64, weightRow, barriers + stage);
+                if (Gate) CloverTmaLoad(ptr + (M + N) * K + chunk * N * 64, &maps.weight,
+                    step * K + chunk * 64, weightRow + outputWidth, barriers + stage);
+            }
+        }
+    };
+    for (int s = 0; s < Stages; ++s) load(s);
+    float acc[2][4] = {}, up[Gate ? 2 : 1][4] = {};
+    for (int step = 0; step * K < inputWidth; ++step) {
+        int stage = step % Stages;
+        CloverTmaWait(barriers + stage, (step / Stages) & 1);
+        auto *a = storage + stage * StageElements, *b = a + M * K;
+#pragma unroll
+        for (int j = 0; j < K; j += 16) {
+            unsigned ar[4], br[2];
+            unsigned ap = CloverSharedAddress(a + (j / 64) * M * 64 + CloverSwizzle128((lane % 16) * 64 + j % 64 + (lane / 16) * 8));
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" :
+                "=r"(ar[0]), "=r"(ar[1]), "=r"(ar[2]), "=r"(ar[3]) : "r"(ap) : "memory");
+#pragma unroll
+            for (int n = 0; n < 2; ++n) {
+                int offset = (j / 64) * N * 64 + CloverSwizzle128((warp * 16 + n * 8 + lane % 8) * 64 + j % 64 + ((lane / 8) % 2) * 8);
+                unsigned bp = CloverSharedAddress(b + offset);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(br[0]), "=r"(br[1]) : "r"(bp) : "memory");
+                CloverMma16816(acc[n], ar, br);
+                if (Gate) {
+                    bp = CloverSharedAddress(b + N * K + offset);
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(br[0]), "=r"(br[1]) : "r"(bp) : "memory");
+                    CloverMma16816(up[n], ar, br);
+                }
+            }
+        }
+        // Order every consumer's generic shared reads before the async proxy
+        // overwrites this stage. A CTA barrier alone is not a proxy fence.
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        __syncthreads();
+        load(step + Stages);
+    }
+#pragma unroll
+    for (int n = 0; n < 2; ++n) {
+#pragma unroll
+        for (int j = 0; j < 4; j += 2) {
+            int row = lane / 4 + (j / 2) * 8;
+            int col = column + warp * 16 + n * 8 + (lane % 4) * 2, task = tasks[row];
+            float values[2] = {acc[n][j], acc[n][j + 1]};
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                if (Gate) {
+                    float g = __bfloat162float(__float2bfloat16(values[h]));
+                    float u = __bfloat162float(__float2bfloat16(up[n][j + h]));
+                    values[h] = g / (1.f + expf(-g)) * u;
+                } else if (task >= 0)
+                    values[h] *= scores[task];
+            }
+            if (task >= 0)
+                CloverStoreExpertPair(output + (size_t)task * outputWidth + col, values[0], values[1]);
+            if (Gate)
+                CloverStoreExpertPair(packedMiddle + ((size_t)blockIdx.y * M + row) * intermediate + col,
+                                      task >= 0 ? values[0] : 0.f, task >= 0 ? values[1] : 0.f);
+        }
+    }
+#endif
+}
+bool CloverTmaAvailable() {
+    int device;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    static thread_local int previous = -1;
+    static thread_local bool available = false;
+    if (device != previous) {
+        cudaFuncAttributes attributes;
+        if (cudaFuncGetAttributes(&attributes, CloverTmaExpertGemm<true>) != cudaSuccess) return false;
+        // SM80 PTX can be JIT-compiled on SM90, but its preprocessed kernel
+        // contains no TMA instructions. Check the virtual architecture too.
+        available = attributes.binaryVersion / 10 == 9 && attributes.ptxVersion >= 90;
+        if (available && cudaFuncSetAttribute(CloverTmaExpertGemm<true, 128>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                CloverTmaExpertSharedBytes<true, 128>()) != cudaSuccess) return false;
+        previous = device;
+    }
+    return available;
+}
+bool CloverMakeExpertMap(CUtensorMap &map, const void *ptr, int inner, int outer, int tileRows) {
+    cuuint64_t shape[2] = {(cuuint64_t)inner, (cuuint64_t)outer}, stride[1] = {(cuuint64_t)inner * 2};
+    cuuint32_t box[2] = {64, (cuuint32_t)tileRows}, steps[2] = {1, 1};
+    return cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void *)ptr, shape, stride, box, steps,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+}
+int CloverExpertTileRows(int rows, int experts, int topk) {
+#ifdef FASTLLM_ENABLE_CLOVER_MOE_SM90
+    // Larger tiles amortize WGMMA setup only when enough routes populate them.
+    if (rows >= 2048 && (size_t)rows * topk >= (size_t)experts * 64 &&
+        FastllmCudaCloverWgmmaAvailable()) return 64;
+#endif
+    return 16;
+}
+// Return before launching anything if a tensor map cannot be prepared, so the
+// caller can safely use the generic grouped implementation.
+bool CloverExpertsTma(const void *input, const void *gateUp, const void *down, const int *indices,
+                      const float *scores, void *middle, void *parts, void *output, int rows, int hidden,
+                      int intermediate, int experts, int topk, cudaStream_t stream, int *workspace,
+                      void *packed, const void *shared, const void *sharedGate) {
+    int tileRows = CloverExpertTileRows(rows, experts, topk);
+    int tiles = min(experts, rows * topk) + (rows * topk + tileRows - 1) / tileRows, device;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    auto *packedInput = (__nv_bfloat16 *)packed;
+    auto *packedMiddle = packedInput + (size_t)tiles * tileRows * hidden;
+    using Key = std::tuple<int, const void *, const void *, const void *, int, int, int, int, int>;
+    static thread_local std::map<Key, std::pair<CloverExpertMaps, CloverExpertMaps>> cached;
+    Key key{device, packed, gateUp, down, hidden, intermediate, tiles, experts, tileRows};
+    auto it = cached.find(key);
+    if (it == cached.end()) {
+        CloverExpertMaps gateMaps, downMaps;
+        if (!CloverMakeExpertMap(gateMaps.input, packedInput, hidden, tiles * tileRows, tileRows) ||
+            !CloverMakeExpertMap(gateMaps.weight, gateUp, hidden, experts * intermediate * 2, 64) ||
+            !CloverMakeExpertMap(downMaps.input, packedMiddle, intermediate, tiles * tileRows, tileRows) ||
+            !CloverMakeExpertMap(downMaps.weight, down, intermediate, experts * hidden, 64)) return false;
+        // Descriptors are copied into kernel parameters at launch. Eviction
+        // does not invalidate a queued launch or a captured CUDA graph.
+        if (cached.size() >= 256) cached.clear();
+        it = cached.emplace(key, std::make_pair(gateMaps, downMaps)).first;
+    }
+    CloverBuildExpertRows(indices, workspace, rows, topk, experts, stream);
+#ifdef FASTLLM_ENABLE_CLOVER_MOE_SM90
+    if (tileRows == 64) {
+        CloverExpertTiles<64><<<1, 256, 0, stream>>>(workspace, rows, experts);
+        CloverPackExpertInput<true, 64><<<dim3(16, tiles), 128, 0, stream>>>(
+            (const __nv_bfloat16 *)input, workspace, packedInput, rows, hidden, experts, topk);
+        FastllmCudaCloverWgmmaExperts(&it->second.first.input, &it->second.first.weight,
+            &it->second.second.input, &it->second.second.weight, scores, workspace,
+            middle, parts, packedMiddle, rows, hidden, intermediate, experts, tiles, stream);
+    } else {
+#endif
+    CloverExpertTiles<16><<<1, 256, 0, stream>>>(workspace, rows, experts);
+    if (rows >= 1024)
+        CloverPackExpertInput<true><<<dim3(4, tiles), 128, 0, stream>>>(
+            (const __nv_bfloat16 *)input, workspace, packedInput, rows, hidden, experts, topk);
+    else CloverPackExpertInput<false><<<dim3(16, tiles), min(256, hidden / 8), 0, stream>>>(
+            (const __nv_bfloat16 *)input, workspace, packedInput, rows, hidden, experts, topk);
+    // Wider K amortizes setup for small captured blocks. Large prefills and
+    // widths not divisible by128 retain the established64-element kernel.
+    if (rows <= 32 && hidden % 128 == 0)
+        CloverTmaExpertGemm<true, 128><<<dim3(intermediate / 64, tiles), 128,
+            CloverTmaExpertSharedBytes<true, 128>(), stream>>>(it->second.first,
+            scores, workspace, (__nv_bfloat16 *)middle, packedMiddle, rows, hidden, intermediate, experts);
+    else
+        CloverTmaExpertGemm<true><<<dim3(intermediate / 64, tiles), 128,
+            CloverTmaExpertSharedBytes<true, 64>(), stream>>>(it->second.first,
+            scores, workspace, (__nv_bfloat16 *)middle, packedMiddle, rows, hidden, intermediate, experts);
+    CloverTmaExpertGemm<false><<<dim3(hidden / 64, tiles), 128,
+        CloverTmaExpertSharedBytes<false, 64>(), stream>>>(it->second.second,
+        scores, workspace, (__nv_bfloat16 *)parts, nullptr, rows, hidden, intermediate, experts);
+#ifdef FASTLLM_ENABLE_CLOVER_MOE_SM90
+    }
+#endif
+    if (shared)
+        CloverSumExperts<true>((const __nv_bfloat16 *)parts, indices, (__nv_bfloat16 *)output, rows, hidden,
+                               topk, stream, (const __nv_bfloat16 *)shared,
+                               (const __nv_bfloat16 *)sharedGate);
+    else
+        CloverSumExperts<false>((const __nv_bfloat16 *)parts, indices, (__nv_bfloat16 *)output, rows, hidden,
+                                topk, stream, nullptr, nullptr);
+    return true;
+}
+}
+#endif
+
+std::size_t FastllmCudaCloverExpertsPackedBytes(int rows, int hidden, int intermediate, int experts, int topk) {
+#if CUDART_VERSION >= 12000
+    // The caller chooses TMA for prefill or a captured small-block MoE.
+    // Small eager blocks retain their existing low-latency path.
+    if (rows < 4 || hidden < 512 || hidden % 64 || intermediate < 128 || intermediate % 64 ||
+        experts < 1 || experts > 256 || topk < 1 || topk > 16 || topk > experts ||
+        rows > 65535 / topk || !CloverTmaAvailable()) return 0;
+    int tileRows = CloverExpertTileRows(rows, experts, topk);
+    size_t tiles = min(experts, rows * topk) + (rows * topk + tileRows - 1) / tileRows;
+    return tiles * tileRows * ((size_t)hidden + intermediate) * sizeof(__nv_bfloat16);
+#else
+    return 0;
+#endif
+}

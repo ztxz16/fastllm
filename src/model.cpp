@@ -36,6 +36,7 @@
 #include "qwen4_exp.h"
 #include "kimi_k3.h"
 #include "qwen3_5.h"
+#include "clover.h"
 #include "step3p5.h"
 #include "laguna.h"
 #include "minimax_m2.h"
@@ -1013,6 +1014,8 @@ namespace fastllm {
         } else if (modelType == "qwen3_5" || modelType == "qwen3_5_moe" || modelType == "qwen3_5_moe_text") {
             model = new Qwen3_5Model();
             model->model_type = modelType;
+        } else if (modelType == "clover_moe") {
+            model = new CloverModel();
         } else if (modelType == "step3p5" || modelType == "step3p7") {
             model = new Step3p5Model();
             model->model_type = "step3p5";

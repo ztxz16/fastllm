@@ -230,7 +230,7 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/context
         src/utils/hybrid_moe.cpp src/utils/hybrid_parallel.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp src/models/naive_n05_kvmem.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/glm5_next_gpu.cpp src/models/glm5_next_hybrid.cpp src/models/gpt_oss.cpp
-        src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
+        src/models/clover.cpp src/models/clover_sampling.cpp src/models/clover_generation.cpp src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
         third_party/json11/json11.cpp
         third_party/gguf/gguf.cpp third_party/gguf/ggml-quant.cpp third_party/gguf/ggml-iqk.cpp third_party/gguf/ggml-dequantize.cpp
         third_party/gguf/gguf-adapter.cpp
@@ -487,6 +487,8 @@ if (USE_CUDA)
         src/devices/cuda/models/deepseekv41-engram.cu
         src/devices/cuda/models/deepseekv41-reference.cu
         src/devices/cuda/models/deepseekv41-dspark-kernels.cu
+        src/devices/cuda/models/clover-kernels.cu
+        src/devices/cuda/models/clover-attention.cu
         src/devices/cuda/models/qwen4-kernels.cu)
 
     set_source_files_properties(src/devices/cuda/models/deepseekv41-reference.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
@@ -510,10 +512,13 @@ if (USE_CUDA)
           CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES "(^|;)90(-real|-virtual)?(;|$)")))
         list(APPEND FASTLLM_CUDA_SM90_SOURCES
             src/devices/cuda/models/naive-n05-qkv.cu
-            src/devices/cuda/models/naive-n05-indexer.cu)
+            src/devices/cuda/models/naive-n05-indexer.cu
+            src/devices/cuda/models/clover-moe-wgmma.cu)
         set_property(SOURCE src/devices/cuda/models/naive-n05-kernels.cu
             APPEND PROPERTY COMPILE_DEFINITIONS
                 FASTLLM_ENABLE_NAIVE_QKV_SM90 FASTLLM_ENABLE_NAIVE_INDEXER_SM90)
+        set_property(SOURCE src/devices/cuda/models/clover-kernels.cu
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_CLOVER_MOE_SM90)
     endif()
 
     # EP4/EP8 uses an isolated, pinned DeepGEMM source subset. Compile the kernel
@@ -570,7 +575,7 @@ if (USE_CUDA)
     endif()
 
     # These C++ units include CUDA runtime/driver headers without going through nvcc.
-    set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp
+    set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp src/models/clover.cpp
         src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_kvmem.cpp
         APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
 
@@ -2979,6 +2984,18 @@ if (UNIT_TEST)
         add_test(NAME qwen4TpMtpCollective COMMAND qwen4TpMtpCollectiveRegression)
         set_tests_properties(qwen4TpMtpCollective PROPERTIES
             LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        foreach(component Sampling Gdn Experts Graph)
+            set(target clover${component}Regression)
+            string(TOLOWER ${component} component_lower)
+            add_executable(${target} test/ops/${target}.cpp)
+            target_link_libraries(${target} fastllm)
+            target_include_directories(${target} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME clover_${component_lower} COMMAND ${target})
+            set_tests_properties(clover_${component_lower} PROPERTIES
+                LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77)
+        endforeach()
+        set_tests_properties(clover_graph PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 
         add_executable(bf16MoeRegression test/ops/bf16MoeRegression.cpp)
         target_link_libraries(bf16MoeRegression fastllm)
