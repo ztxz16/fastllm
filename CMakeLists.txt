@@ -24,6 +24,12 @@ option(BUILD_CLI "build cli" OFF)
 
 option(UNIT_TEST "build unit tests" OFF)
 
+option(BUILD_HY_NOMAS "build the native HY-Nomas continuous-tensor backend" OFF)
+
+if(BUILD_HY_NOMAS AND NOT USE_CUDA)
+    message(FATAL_ERROR "BUILD_HY_NOMAS requires USE_CUDA=ON")
+endif()
+
 if(NOT DEFINED CUDA_ARCH)
     if(DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CUDA_ARCH "${CMAKE_CUDA_ARCHITECTURES}")
@@ -634,6 +640,10 @@ if (USE_CUDA)
     add_compile_definitions(FASTLLM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublasLt cublas nccl cuda ${CMAKE_DL_LIBS})
     set(CMAKE_CUDA_ARCHITECTURES ${FASTLLM_CUDA_ARCHITECTURES})
+endif()
+
+if(BUILD_HY_NOMAS)
+    add_subdirectory(src/models/hy_nomas)
 endif()
 
 if(USE_ROCM)
