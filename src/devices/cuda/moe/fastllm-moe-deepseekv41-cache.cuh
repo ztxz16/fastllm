@@ -37,13 +37,19 @@ __device__ __forceinline__ float2 FP4Pair(unsigned packed, unsigned exponent) {
     unsigned bits = SelectBits(exponent << 23, 0x00400000u, exponent != 0);
     bits = SelectBits(bits, 0x7fc00000u, exponent != 255);
     const float scale = __uint_as_float(bits);
-    // E2M1 magnitudes are exact FP16 values with zero low bytes. Two
-    // register byte permutations decode both values, without a memory LUT.
-    // FP16 here only represents unscaled {0,.5,1,1.5,2,3,4,6}; scale and
-    // products still use FP32 and the original BF16 rounding.
+    // SM12x family targets can unpack E2M1 directly. Generic/older targets
+    // retain the register LUT. Only exact, unscaled values pass through FP16;
+    // scaling, BF16 rounding and FP32 accumulation stay unchanged.
+#if defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && \
+    __CUDA_ARCH_FAMILY_SPECIFIC__ >= 1200 && __CUDA_ARCH_FAMILY_SPECIFIC__ < 1300
+    unsigned halves;
+    asm("{ .reg .b8 lo, hi; mov.b16 {lo,hi}, %1; cvt.rn.f16x2.e2m1x2 %0, lo; }"
+        : "=r"(halves) : "h"((unsigned short)packed));
+#else
     const unsigned lut = __byte_perm(0x3e3c3800u, 0x46444240u, packed & 0x77u);
     unsigned halves = __byte_perm(lut, 0u, 0x1404u);
     halves |= ((packed & 8u) << 12) | ((packed & 128u) << 24);
+#endif
     const float2 values = __half22float2(*reinterpret_cast<const __half2 *>(&halves));
     return make_float2(BFloat(__fmul_rn(values.x,scale)), BFloat(__fmul_rn(values.y,scale)));
 }
