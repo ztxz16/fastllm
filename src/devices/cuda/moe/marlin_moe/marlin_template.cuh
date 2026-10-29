@@ -50,7 +50,7 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,
           const bool m_block_size_8, const int stages,
           const int group_blocks, const bool is_zp_float,
           const bool nvfp4_gate_up = false,
-          const bool full_k = false>
+          const bool full_k = false, const bool fold_mxfp4_bias = false>
 __global__ void Marlin(
     const int4 *__restrict__ A, const int4 *__restrict__ B,
     int4 *__restrict__ C, int4 *__restrict__ C_tmp,
@@ -243,7 +243,7 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,  // A ScalarTy
                                    // with a separate quantization scale
           const bool is_zp_float,  // is zero point of float16 type?
           const bool nvfp4_gate_up = false,  // independent gate/up global scales
-          const bool full_k = false
+          const bool full_k = false, const bool fold_mxfp4_bias = false
           >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -1316,7 +1316,7 @@ __global__ void Marlin(
         sub_zp_and_dequant<scalar_32bit_t, b_type_id, dequant_skip_flop>(
             q, frag_b_ptr, zp);
       } else {
-        dequant<scalar_32bit_t, b_type_id, dequant_skip_flop>(q, frag_b_ptr);
+        dequant<scalar_32bit_t, b_type_id, dequant_skip_flop || fold_mxfp4_bias>(q, frag_b_ptr);
       }
     }
   };
@@ -1362,6 +1362,16 @@ __global__ void Marlin(
     if constexpr (s_type == fastllm_marlin_moe_types::kFE4M3fn || s_type == fastllm_marlin_moe_types::kFE8M0fnu) {
       int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
       int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
+      if constexpr (fold_mxfp4_bias) {
+        static_assert(a_type == fastllm_marlin_moe_types::kBFloat16 &&
+                      b_type == fastllm_marlin_moe_types::kFE2M1f &&
+                      s_type == fastllm_marlin_moe_types::kFE8M0fnu);
+        // Repacking validated every exponent in [1,127]. Fold the exact
+        // FP4 2^126 bias into E8M0 scales, avoiding a second BF16 multiply.
+        // Each byte remains <=253, so this addition cannot carry between bytes.
+        s_quant_0 = static_cast<int>(static_cast<uint32_t>(s_quant_0) + 0x7e7e7e7eu);
+        s_quant_1 = static_cast<int>(static_cast<uint32_t>(s_quant_1) + 0x7e7e7e7eu);
+      }
 
       dequant_fp8_scales<c_scalar_t2, s_type_id>(
           s_quant_0, reinterpret_cast<c_scalar_t2*>(&frag_s[k2]));
@@ -2082,8 +2092,9 @@ __global__ void Marlin(
 
       cp_async_wait<0>();
       if constexpr (a_type == fastllm_marlin_moe_types::kBFloat16 &&
-                    s_type == fastllm_marlin_moe_types::kFE4M3fn) {
-        // BF16 NVFP4 reduction can overlap the last B-fragment
+                    (s_type == fastllm_marlin_moe_types::kFE4M3fn ||
+                     s_type == fastllm_marlin_moe_types::kFE8M0fnu)) {
+        // BF16 FP4 reduction can overlap the last B-fragment
         // fetch in shared memory. cp_async_wait is per-thread: wait for
         // every warp before reusing the storage for reduction.
         __syncthreads();

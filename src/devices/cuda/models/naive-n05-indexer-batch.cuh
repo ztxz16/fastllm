@@ -3,8 +3,9 @@
 #include "naive-n05-topk.cuh"
 #include <type_traits>
 
-// This batched Tensor Core path requires SM80; older targets cannot encode its large arguments.
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+// Keep launch stubs in SM70/SM75-only builds too; large arguments require SM70.
+// Tensor Core bodies and runtime dispatch still require SM80.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 namespace naive_indexer_batch {
 using BF16 = __nv_bfloat16;
 struct Row {
@@ -18,15 +19,26 @@ struct Row {
     int sequence, stride;
     const void *const *cache;
     int cpRank = 0, cpRanks = 1;
+    int contextPageLen = 0;
+    __device__ int LocalCount(int rank) const {
+        int localPage = contextPageLen / cpRanks;
+        return (*live / contextPageLen) * localPage + min(localPage, max(0, *live % contextPageLen - rank * localPage));
+    }
+    __device__ int LogicalPosition(int position) const {
+        if (!contextPageLen) return Begin() + position;
+        int localPage = contextPageLen / cpRanks;
+        return position / localPage * contextPageLen + cpRank * localPage + position % localPage;
+    }
     const unsigned *merged = nullptr;
     int mergedRows = 0, mergedRow = 0;
     __device__ int Chunk() const {
         return ((*live + cpRanks * 64 - 1) / (cpRanks * 64)) * 64;
     }
-    __device__ int Begin() const { return cpRanks > 1 ? cpRank * Chunk() : 0; }
+    __device__ int Begin() const { return contextPageLen ? 0 : cpRanks > 1 ? cpRank * Chunk() : 0; }
     __device__ int MergeWidth() const { return min(Chunk(), naive_topk::kTopK); }
     __device__ int Count() const {
         int n = *live;
+        if (contextPageLen && !merged) return LocalCount(cpRank);
         if (merged) {
             if (!n) return 0;
             int chunk = Chunk();
@@ -54,6 +66,34 @@ constexpr int ArgumentBytes = 4096;
 // Leave room for the other arguments and their alignment.
 constexpr int BatchLimit = (ArgumentBytes - 128) / sizeof(Row);
 struct Batch { Row rows[BatchLimit]; };
+
+__device__ __forceinline__ Row TopKRow(const Batch &batch, int i) {
+    return batch.rows[i];
+}
+#if CUDART_VERSION >= 12010
+struct LocalTopKRow {
+    const int *live;
+    unsigned *scores;
+    naive_topk::Workspace *workspace;
+    int *indices;
+};
+constexpr int kLocalTopKLimit = 512;
+struct LocalTopKBatch {
+    int rank, ranks, page;
+    LocalTopKRow rows[kLocalTopKLimit];
+};
+static_assert(sizeof(LocalTopKRow) == 32);
+static_assert(sizeof(LocalTopKBatch) + 128 <= ArgumentBytes);
+__device__ __forceinline__ Row TopKRow(const LocalTopKBatch &batch, int i) {
+    const auto &x = batch.rows[i];
+    Row row{};
+    row.live=x.live; row.scores=x.scores;
+    row.workspace=x.workspace; row.indices=x.indices;
+    row.cpRank=batch.rank; row.cpRanks=batch.ranks; row.contextPageLen=batch.page;
+    return row;
+}
+#endif
+
 
 // Long mixed-context batches used to launch one CTA for every key tile of the
 // longest row. Keep enough CTAs to fill Hopper, then let each CTA process a
@@ -449,20 +489,55 @@ __global__ void Sort(Batch batch) {
 // exchange. No KV copies or additional per-request score allocations.
 __global__ void PackLocal(Batch batch) {
     const Row &r = batch.rows[blockIdx.x];
-    int first = r.Begin();
     for (int i = threadIdx.x; i < naive_topk::kTopK; i += blockDim.x) {
         int position = r.indices[i];
         r.workspace->candidates.keys[i] = position >= 0 ? r.scores[position] : 0;
-        r.workspace->candidates.positions[i] = position >= 0 ? first + position : -1;
+        r.workspace->candidates.positions[i] = position >= 0 ? r.LogicalPosition(position) : -1;
     }
 }
-__global__ void CopyPacked(Batch batch, unsigned *exchange, int rows, int first) {
-    const Row &r = batch.rows[blockIdx.x];
+template<class BatchType = Batch>
+__global__ void CopyPacked(
+#if CUDART_VERSION >= 12010
+        const __grid_constant__
+#endif
+        BatchType batch, unsigned *exchange, int rows, int first) {
+    const Row r = TopKRow(batch, blockIdx.x);
     unsigned *out = exchange + ((size_t)r.cpRank * rows + first + blockIdx.x) * naive_topk::kTopK * 2;
     for (int i = threadIdx.x; i < naive_topk::kTopK; i += blockDim.x) {
         out[i * 2] = r.workspace->candidates.keys[i];
         out[i * 2 + 1] = r.workspace->candidates.positions[i];
     }
 }
+
+__global__ void ClearContextIndices(Batch batch) {
+    const Row &r = batch.rows[blockIdx.x];
+    for (int i = threadIdx.x; i < naive_topk::kTopK; i += blockDim.x) r.indices[i] = -1;
+}
+// Every local list is sorted by (score descending, logical position ascending).
+// Binary-search the other lists to obtain each candidate's exact global rank.
+// The unique logical position breaks ties across interleaved context shards.
+__global__ void MergeContextCandidates(Batch batch) {
+    const Row &r = batch.rows[blockIdx.y];
+    constexpr int K = naive_topk::kTopK;
+    int i = blockIdx.x * blockDim.x + threadIdx.x, owner = i / K, local = i % K;
+    if (owner >= r.cpRanks || local >= min(K, r.LocalCount(owner))) return;
+    const unsigned *source = r.merged + ((size_t)owner * r.mergedRows + r.mergedRow) * K * 2;
+    unsigned score = source[local * 2]; int position = source[local * 2 + 1];
+    int global = local;
+    for (int peer = 0; peer < r.cpRanks; ++peer) if (peer != owner) {
+        const unsigned *list = r.merged + ((size_t)peer * r.mergedRows + r.mergedRow) * K * 2;
+        int lo = 0, hi = min(K, r.LocalCount(peer));
+        while (lo < hi) {
+            int mid = (lo + hi) / 2; unsigned other = list[mid * 2];
+            int otherPosition = list[mid * 2 + 1];
+            if (other > score || (other == score && otherPosition < position)) lo = mid + 1;
+            else hi = mid;
+        }
+        global += lo;
+        if (global >= K) return;
+    }
+    r.indices[global] = position;
+}
+
 } // namespace naive_indexer_batch
 #endif

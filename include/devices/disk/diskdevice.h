@@ -38,21 +38,57 @@ namespace fastllm {
         uint64_t cpuCudaOverlapBytes = 0, cudaDemotions = 0, cudaDemotionBytes = 0;
         uint64_t cpuWorkspaceBytes = 0, cpuBufferReuses = 0, cpuBufferAllocations = 0;
         uint64_t cpuReclaims = 0, asyncMaintenance = 0;
+        uint64_t cpuBufferMmaps = 0, cpuBufferMunmaps = 0, cpuBufferSplits = 0, cpuBufferCoalesces = 0;
+        uint64_t canonicalPromotionChecks = 0, canonicalPromotionRejects = 0, canonicalResidenceRejects = 0;
+        // Host wall time including allocation/page preparation and transfer waits.
+        uint64_t canonicalUploadBytes = 0, canonicalUploadUs = 0;
+        uint64_t canonicalDownloadUs = 0; // Bytes are already counted by cudaDemotionBytes.
+        uint64_t decodeHandoffD2HCopies = 0, decodeHandoffD2HBytes = 0, decodeHandoffWaitUs = 0;
+        uint64_t decodeOutputH2DCopies = 0, decodeOutputH2DBytes = 0;
+        uint64_t residentReadbackCopies = 0, residentReadbackBytes = 0, residentReadbackWaitUs = 0;
     };
     // CUDA bytes are summed across devices; the configured CUDA budget is per GPU.
     DiskMoeCacheStats GetDiskMoeCacheStats();
     void TrimDiskMoeCache();
     void ReleaseDiskMoeCache(const Data *weight);
-    // Fill unused RAM budget in layer order with native NVFP4 block32 experts.
+    // Fill unused RAM budget across layers with native block32 or canonical GGUF experts.
     // Entries remain evictable; loading alone does not count as a route/hit.
     uint64_t PreloadDiskMoeCache(const std::vector<std::vector<Data*>> &layers);
     // Register metadata only. Compact experts stay in their checkpoint files;
     // both bounded cache tiers use the public MoE frequency configuration.
     bool PrepareDiskMoeCache(const std::vector<std::vector<Data*>> &layers);
 
+    // Whole disk layers may share a decode step with whole CUDA-resident
+    // layers. Reject CPU/NUMA and partially placed layers; an empty result
+    // also keeps models without disk experts on their existing paths.
+    inline std::vector<int> DiskMoeLayerIndices(
+            const std::vector<std::vector<Data *>> &layers, int cudaDevice = -1) {
+        std::vector<int> indices;
+        for (size_t l = 0; l < layers.size(); ++l) {
+            const auto &table = layers[l];
+            if (table.size() < 4 || table.size() % 2 || !table[2]) return {};
+            const bool disk = table[2]->isDiskWeight;
+            for (size_t i = 2; i < table.size(); ++i) {
+                const Data *weight = table[i];
+                if (!weight || weight->isDiskWeight != disk) return {};
+                if (!disk && (weight->dataDevice != DataDevice::CUDA || !weight->cudaData ||
+                        weight->multiDeviceData || (cudaDevice >= 0 &&
+                        (weight->dataDeviceIds.size() != 1 || weight->dataDeviceIds[0] != cudaDevice))))
+                    return {};
+            }
+            if (disk) indices.push_back(int(l));
+        }
+        return indices;
+    }
+
     // Bounded prediction from previous prefill routes. Hints only overlap I/O;
     // selected expert IDs and output math are always determined by the router.
     void PrefetchDiskMoeV41(const std::vector<Data *> &weights, int rows);
+
+    // Disk V4.1 single-token handoff only; unsupported layouts leave outputs
+    // unchanged and use the ordinary executor's staging.
+    bool StageDiskMoeV41Inputs(const Data &input, const Data &index, const Data &score,
+                               Data &hostInput, Data &hostIndex, Data &hostScore);
 
     // The TP owner submits one host MoE operation, sharing its RAM tier while
     // allowing resident experts on every participating CUDA device to run.
@@ -63,6 +99,21 @@ namespace fastllm {
         ~DiskMoeCudaDeviceScope();
         DiskMoeCudaDeviceScope(const DiskMoeCudaDeviceScope &) = delete;
         DiskMoeCudaDeviceScope &operator=(const DiskMoeCudaDeviceScope &) = delete;
+    };
+
+    // A single ordinary GGUF disk decode step may queue GPU work ahead of
+    // CPU experts. Finish drains all posted work and reports CPU failures.
+    // Ineligible builds/layouts keep the existing synchronous disk adapter.
+    class DiskMoeAsyncScope {
+        struct Impl;
+        std::unique_ptr<Impl> impl;
+    public:
+        DiskMoeAsyncScope(const std::vector<std::vector<Data *>> &layers, int device, bool enabled,
+                          bool retainPrefillWorkspace = false);
+        ~DiskMoeAsyncScope();
+        void Finish();
+        static bool TryRun(int layer, const Data &input, const Data &index, const Data &score,
+                           Data &output, const std::function<void()> &sharedExpert = {});
     };
 
     class DiskDevice : BaseDevice {
@@ -77,13 +128,21 @@ namespace fastllm {
     };
 
     class DiskMergeMOE : CpuMergeMOE {
+        enum class CachedMode { Cpu, GpuPrefill, GpuDecode };
         bool RunCached(const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams,
-                       bool gpuPrefillOnly = false);
+                       CachedMode mode = CachedMode::Cpu);
     public:
         // Leaves input/output on CUDA when the complete routed prefill fits.
         // A false result leaves the caller free to use the ordinary executor.
         bool RunGpuPrefill(Data &input, Data &index, Data &score, Data &output,
                            std::vector<Data *> &weights, float swigluLimit);
+        bool RunGpuDecode(Data &input, Data &index, Data &score, Data &output,
+                          std::vector<Data *> &weights, float swigluLimit);
+        // Canonical ordinary GGUF decode. Routing and activations are staged
+        // together; the optional independent shared branch follows readback.
+        bool RunGpuGGUFDecode(Data &input, Data &index, Data &score, Data &output,
+                              std::vector<Data *> &weights,
+                              const std::function<void()> &sharedExpert = {});
 
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);

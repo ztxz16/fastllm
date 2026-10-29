@@ -2698,8 +2698,50 @@ extern "C" bool FastllmCudaBFloat16FP8LinearPair(const fastllm::Data &input,
     return true;
 }
 
-// A channel slice preserves the original full-K dot product and rounding.
-// The caller gathers disjoint output slices; it never sums partial products.
+extern "C" bool FastllmCudaV41SharedExpertTP(const fastllm::Data &input,
+        fastllm::Data &gateUpWeight, fastllm::Data &downWeight,
+        fastllm::Data &gateUp, fastllm::Data &activation, fastllm::Data &output,
+        int rank, int ranks, float swigluLimit) {
+    using namespace fastllm;
+    const int device = FastllmCudaGetDevice();
+    auto local = [device](const Data &d) {
+        return !d.multiDeviceData && d.dataDevice == DataDevice::CUDA && d.cudaData &&
+               d.dataDeviceIds == std::vector<int>{device};
+    };
+    if (ranks < 2 || rank < 0 || rank >= ranks || input.dims.empty() ||
+        input.dataType != DataType::BFLOAT16 || output.dataType != DataType::FLOAT32 ||
+        gateUp.dataType != DataType::BFLOAT16 || activation.dataType != DataType::BFLOAT16 ||
+        gateUpWeight.dataType != DataType::FP8_E4M3 || downWeight.dataType != DataType::FP8_E4M3 ||
+        gateUpWeight.dims.size() != 2 || downWeight.dims.size() != 2 ||
+        !local(input) || !local(gateUpWeight) || !local(downWeight) ||
+        !local(gateUp) || !local(activation) || !local(output)) return false;
+    const int inner = input.dims.back(), mid = downWeight.dims[1], width = downWeight.dims[0];
+    if (inner <= 0 || width <= 0 || mid <= 0 || mid % (ranks * 32) ||
+        gateUpWeight.dims != std::vector<int>{2 * mid, inner}) return false;
+    const uint64_t rowCount = input.Count(0) / inner;
+    if (rowCount < 1 || rowCount > 8) return false;
+    const int rows = rowCount, count = mid / ranks;
+    const int padded = (count + 63) / 64 * 64;
+    auto gdims = input.dims, adims = input.dims, odims = input.dims;
+    gdims.back() = 2 * padded; adims.back() = padded; odims.back() = width;
+    if (gateUp.dims != gdims || activation.dims != adims ||
+        output.dims != odims || &output == &input || &gateUp == &activation ||
+        &gateUp == &input || &activation == &input) return false;
+    Data *gateShard = FastllmCudaFP8PairedRowShard(gateUpWeight, rank * count, count);
+    Data *downShard = FastllmCudaFP8ColumnShard(downWeight, rank * count, count);
+    if (!gateShard || !downShard ||
+        !FastllmCudaPrepareMarlinBFloat16FP8(*gateShard, rows, inner, 2 * padded) ||
+        !FastllmCudaPrepareMarlinBFloat16FP8(*downShard, rows, padded, width)) return false;
+    if (!FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(input.cudaData,
+            *gateShard, gateUp.cudaData, rows, inner, 2 * padded)) return false;
+    if (!FastllmCudaDeepSeekV41SharedSwigluQuantized(gateUp, swigluLimit, activation)) return false;
+    return FastllmCudaTryMarlinBFloat16MatMulFP8E4M3ToFloat(activation.cudaData,
+        *downShard, (float *)output.cudaData, rows, padded, width);
+}
+
+// Each channel slice computes a full-K dot product before BF16 rounding.
+// Multirow GEMM tiling can change the FP32 reduction order. The caller gathers
+// disjoint completed slices; it never sums rounded partial products.
 extern "C" bool FastllmCudaBFloat16FP8ReplicatedRowSlice(
         const fastllm::Data &input, fastllm::Data &weight,
         fastllm::Data &output, int rowStart, int rowCount) {
@@ -2707,8 +2749,10 @@ extern "C" bool FastllmCudaBFloat16FP8ReplicatedRowSlice(
         output.dataType != fastllm::DataType::BFLOAT16 ||
         weight.dataType != fastllm::DataType::FP8_E4M3 || weight.IsRepacked ||
         weight.dims.size() != 2 || input.dims.empty() ||
-        input.Count(0) != (uint64_t)weight.dims[1] ||
-        output.Count(0) != (uint64_t)weight.dims[0] ||
+        weight.dims[0] <= 0 || weight.dims[1] <= 0 || input.dims.back() != weight.dims[1] ||
+        input.Count(0) == 0 || input.Count(0) / weight.dims[1] > INT_MAX ||
+        output.dims.empty() || output.dims.back() != weight.dims[0] ||
+        output.Count(0) / weight.dims[0] != input.Count(0) / weight.dims[1] ||
         rowStart < 0 || rowStart >= weight.dims[0] ||
         rowCount <= 0 || rowCount > weight.dims[0] - rowStart ||
         weight.blockK <= 0 || rowStart % weight.blockK ||
@@ -2716,7 +2760,17 @@ extern "C" bool FastllmCudaBFloat16FP8ReplicatedRowSlice(
         !input.cudaData || !weight.cudaData || output.dataDevice != fastllm::DataDevice::CUDA ||
         FastllmCudaFp8E4M3HasSm70Layout(weight)) return false;
     const int m = weight.dims[1], k = weight.dims[0];
+    const int rows = input.Count(0) / m;
     fastllm::Data emptyBias;
+    if (rows > 1) {
+        fastllm::Data *shard = FastllmCudaFP8RowShard(weight, rowStart, rowCount);
+        if (!shard) return false;
+        output.Allocate();
+        // Rank-major packed output: [rank, input row, local output channel].
+        fastllm::Data localOutput(fastllm::DataType::BFLOAT16, {rows, rowCount},
+            fastllm::DataDevice::CUDA, (uint16_t *)output.cudaData + size_t(rowStart) * rows);
+        return FastllmCudaBFloat16MatMulFP8E4M3(input, *shard, emptyBias, localOutput, rows, m, rowCount);
+    }
     FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, emptyBias, k);
     output.Allocate();
     LaunchFastllmGemmBF16FP8E4M3(

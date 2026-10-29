@@ -157,12 +157,44 @@ static KernelFn PickKernel(int sizeM, int threadK, int threadN, int groupBlocks,
 
 // BF16 activations and E4M3 weights with exact E8M0 block-32 scales.
 // Keep the existing FP16/group-128 kernels and dispatch unchanged.
-static KernelFn PickBf16Mxfp8Kernel(int rows, int tile) {
+static KernelFn PickBf16Mxfp8Kernel(int rows, int tile, bool parallelReduce = false, bool floatOutput = false) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
     // Do not instantiate BF16 MMA for Turing device images. The host-side
     // architecture guard keeps these calls on the ordinary CUDA fallback.
     return nullptr;
 #else
+    if (tile == 2) {
+        if (rows > 8 || floatOutput) return nullptr;
+#define MXFP8_WIDE(P) \
+        return MARLIN_NAMESPACE_NAME::Marlin< \
+            vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), vllm::kBFloat16.id(), \
+            vllm::kFE8M0fnu.id(), 256, 1, 8, 8, true, 4, 2, false, \
+            true, false, false, false, P>
+        if (parallelReduce) MXFP8_WIDE(true);
+        MXFP8_WIDE(false);
+#undef MXFP8_WIDE
+    }
+    if (floatOutput) {
+#define MXFP8_FLOAT(TN, TK) \
+        return MARLIN_NAMESPACE_NAME::Marlin< \
+            vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), vllm::kBFloat16.id(), \
+            vllm::kFE8M0fnu.id(), 128, 1, TN, TK, true, 4, 2, false, \
+            true, false, false, false, false, true>
+        if (rows > 8) return nullptr;
+        if (tile == 1) MXFP8_FLOAT(4, 8);
+        MXFP8_FLOAT(8, 4);
+#undef MXFP8_FLOAT
+    }
+    if (parallelReduce) {
+#define MXFP8_PARALLEL(TN, TK) \
+        return MARLIN_NAMESPACE_NAME::Marlin< \
+            vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), vllm::kBFloat16.id(), \
+            vllm::kFE8M0fnu.id(), 128, 1, TN, TK, true, 4, 2, false, \
+            true, false, false, false, true>
+        if (tile == 1) MXFP8_PARALLEL(4, 8);
+        MXFP8_PARALLEL(8, 4);
+#undef MXFP8_PARALLEL
+    }
 #define MXFP8(TM, M8, TN, TK) \
     return MARLIN_NAMESPACE_NAME::Marlin< \
         vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), vllm::kBFloat16.id(), \
@@ -181,6 +213,24 @@ static KernelFn PickBf16Mxfp8Kernel(int rows, int tile) {
     MXFP8(4, false, 8, 4);
 #undef MXFP8
 #endif
+}
+
+// Exact storage layout of the BF16/E4M3/E8M0 kernel above. B and the
+// reduction tile alias; scales and the four-stage A pipeline follow them.
+// Reserving the device's entire shared memory prevents other graph branches
+// from occupying the same SM even when most of that reservation is unused.
+static int Bf16Mxfp8SharedBytes(int rows, int tile) {
+    const int threadN = tile == 1 ? 64 : 128;
+    const int threadK = tile == 0 ? 64 : 128;
+    const int mBlocks = rows <= 8 ? 1 : std::min(4, (rows + 15) / 16);
+    const int tileM = rows <= 8 ? 8 : 16 * mBlocks;
+    const int bPipeline = 4 * threadN * threadK;
+    const int reduction = (2 * (threadN / 16) + 1) * 16 * mBlocks * 16;
+    const int bReductionBias = std::max(std::max(bPipeline, reduction),
+        std::min(bPipeline, reduction) + threadN * 2);
+    const int scales = 4 * (threadK / 32) * threadN;
+    const int aPipeline = 4 * tileM * threadK * 2;
+    return bReductionBias + scales + aPipeline;
 }
 
 // Explicit FE2M1 + special FE4M3 scale, group16 (group_blocks=1).
@@ -675,18 +725,20 @@ extern "C" bool FastllmCudaMarlinHalfFP8Gemm(
     return true;
 }
 
-extern "C" bool FastllmCudaMarlinBFloat16MXFP8Gemm(
+static bool BFloat16MXFP8Gemm(
         const void *a, const uint32_t *weight, const uint8_t *scales,
-        void *c, int rows, int columns, int inner, int *workspace) {
+        void *c, int rows, int columns, int inner, int *workspace, bool floatOutput) {
     int arch = 0;
     if (!DeviceOk(&arch) || arch < 80 || rows <= 0 || columns <= 0 ||
         inner <= 0 || columns % 64 || inner % 64 ||
         (columns % 128 && inner % 128) || !a || !weight || !scales ||
-        !c || !workspace) return false;
+        !c || !workspace || (floatOutput && rows > 8)) return false;
     int device = 0, sms = 0, shared = 0;
     cudaGetDevice(&device);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
     cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    // Small-M parallel reduction needs two 16-row fragments per CTA, at
+    // most 2 * sms * 16 * 128 floats; this existing workspace is larger.
     if (sms <= 0 || shared <= 0 || !EnsureCTmp(device, (size_t)sms * 64 * 256))
         return false;
     const int tile = columns % 128 != 0 ? 1 : 0;
@@ -702,17 +754,47 @@ extern "C" bool FastllmCudaMarlinBFloat16MXFP8Gemm(
                     cudaFuncAttributeMaxDynamicSharedMemorySize, shared) != cudaSuccess)
                 return false;
         }
+        for (int kind : {0, 1}) {
+            if (cudaFuncSetAttribute(PickBf16Mxfp8Kernel(8, kind, true),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    Bf16Mxfp8SharedBytes(8, kind)) != cudaSuccess) return false;
+        }
+        for (int kind : {0, 1}) {
+            if (cudaFuncSetAttribute(PickBf16Mxfp8Kernel(8, kind, false, true),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    Bf16Mxfp8SharedBytes(8, kind)) != cudaSuccess) return false;
+        }
+        if (arch == 90) for (bool reduce : {false, true}) {
+            if (cudaFuncSetAttribute(PickBf16Mxfp8Kernel(8, 2, reduce),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    Bf16Mxfp8SharedBytes(8, 2)) != cudaSuccess) return false;
+        }
         prepared.emplace(device);
     }
     for (int row = 0; row < rows;) {
         int count = rows - row;
         if (count >= 64) count = std::min(count / 64, 128) * 64;
-        const int chunkTile = tile;
-        KernelFn kernel = PickBf16Mxfp8Kernel(count, chunkTile);
-        kernel<<<sms, 128, shared, cudaStreamPerThread>>>(
+        int chunkTile = tile;
+        // Hopper: wider K tiles shorten the short-batch weight pipeline.
+        // Single-row, FP32-output and other architectures retain their dispatch.
+        if (!floatOutput && rows >= 2 && rows <= 8 && arch == 90 &&
+            inner % 128 == 0 && columns % 128 == 0) {
+            if (columns <= 1024) chunkTile = 1;
+            else if (inner >= 1280) chunkTile = 2;
+        }
+        // Avoid the serial split-K dependency chain only for thin small-M
+        // projections. Wider tiles have few contributors and favor the old
+        // reduction. Keep the partition, MMA order, and FP32 summation order.
+        const int threadN = chunkTile == 1 ? 64 : 128;
+        const bool parallelReduce = !floatOutput && count <= 8 && inner >= 512 &&
+                                    columns / threadN <= sms / 4;
+        KernelFn kernel = PickBf16Mxfp8Kernel(count, chunkTile, parallelReduce, floatOutput);
+        const int launchShared = Bf16Mxfp8SharedBytes(count, chunkTile);
+        if (launchShared > shared) return false;
+        kernel<<<sms, chunkTile == 2 ? 256 : 128, launchShared, cudaStreamPerThread>>>(
             reinterpret_cast<const int4 *>(static_cast<const uint16_t *>(a) + (size_t)row * inner),
             reinterpret_cast<const int4 *>(weight),
-            reinterpret_cast<int4 *>(static_cast<uint16_t *>(c) + (size_t)row * columns),
+            reinterpret_cast<int4 *>(static_cast<char *>(c) + (size_t)row * columns * (floatOutput ? 4 : 2)),
             reinterpret_cast<int4 *>(GetCTmp(device).ptr), nullptr, nullptr,
             reinterpret_cast<const int4 *>(scales), nullptr, nullptr, nullptr,
             inner / 32, count, columns, inner, inner, workspace,
@@ -721,6 +803,18 @@ extern "C" bool FastllmCudaMarlinBFloat16MXFP8Gemm(
         row += count;
     }
     return true;
+}
+
+extern "C" bool FastllmCudaMarlinBFloat16MXFP8Gemm(
+        const void *a, const uint32_t *weight, const uint8_t *scales,
+        void *c, int rows, int columns, int inner, int *workspace) {
+    return BFloat16MXFP8Gemm(a, weight, scales, c, rows, columns, inner, workspace, false);
+}
+
+extern "C" bool FastllmCudaMarlinBFloat16MXFP8GemmToFloat(
+        const void *a, const uint32_t *weight, const uint8_t *scales,
+        float *c, int rows, int columns, int inner, int *workspace) {
+    return BFloat16MXFP8Gemm(a, weight, scales, c, rows, columns, inner, workspace, true);
 }
 
 extern "C" bool FastllmCudaMarlinHalfNVFP4Gemm(

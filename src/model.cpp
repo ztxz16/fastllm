@@ -4117,7 +4117,10 @@ namespace fastllm {
         json11::Json externalMtpTextConfig;
         const bool externalMtpGGUF = !externalMtpPath.empty() &&
             StringEndWith(externalMtpPath, ".gguf");
-        if (externalMtpGGUF) {
+        const bool externalDsparkGGUF = externalMtpGGUF && model->model_struct == "deepseek_v41";
+        if (externalDsparkGGUF) {
+            AppendDeepSeekV41GGUFAux(model, params, externalMtpPath, false, readGGUFTasks);
+        } else if (externalMtpGGUF) {
             AssertInFastLLM(model->model_struct == "qwen4_exp",
                 "External MTP GGUF requires a Qwen4-Exp target.");
             json11::Json mtpMetadata;
@@ -4249,7 +4252,7 @@ namespace fastllm {
         }
 
         if (!mmprojPath.empty() && arch == "deepseek_v41") {
-            AppendDeepSeekV41GGUFVision(model, params, mmprojPath, readGGUFTasks);
+            AppendDeepSeekV41GGUFAux(model, params, mmprojPath, true, readGGUFTasks);
         }
         // 3.0 更新模型信息
         model->InitParams();
@@ -4610,7 +4613,7 @@ namespace fastllm {
                             auto *task = readGGUFTaskDict[weightName];
                             tensorBytes = ggml_nbytes(&task->tensor);
                             const WeightType diskType = GetDiskLazyWeightType(model, weightName, tensorBytes, mergeIndex);
-                            if (diskType != WeightType::NONE &&
+                            if (diskType != WeightType::NONE && task->tensor.type != GGML_TYPE_MXFP4 &&
                                 task->replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
                                 SetDiskGGUFWeightMeta(*task->weight, task->tensor, task->fileName, task->offset);
                                 task->weight->weightType = diskType;
@@ -4917,7 +4920,7 @@ namespace fastllm {
         }
         loadGGUFWeights(parallelTensors);
         model->OnWeightLoadGroupFinished();
-        if (externalMtpGGUF) {
+        if (externalMtpGGUF && !externalDsparkGGUF) {
             // qwen4exp-mtp stores raw HF norm weights, unlike target GGUF's
             // effective gamma. Let Qwen4 PrepareWeights apply the HF +1 once.
             for (auto &item : model->weight.weight) {

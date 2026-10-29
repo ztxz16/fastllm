@@ -3509,6 +3509,8 @@ namespace fastllm {
         float swigluLimit = floatParams.find("swigluLimit") != floatParams.end() ?
                             floatParams.find("swigluLimit")->second : 0.0f;
         const bool compactDecode = intParams.count("diskMoeDecode") && intParams.at("diskMoeDecode");
+        const bool diskRouteOutputs = compactDecode && intParams.count("diskMoePerRoute") &&
+                                      intParams.at("diskMoePerRoute");
         bool deepSeekV4Mode = intParams.find("deepSeekV4Mode") != intParams.end() &&
                               intParams.find("deepSeekV4Mode")->second != 0;
         int activationQuantBlock = intParams.count("activationQuantBlock") ? intParams.at("activationQuantBlock") : 128;
@@ -3565,6 +3567,7 @@ namespace fastllm {
                 if (weights[i] != nullptr &&
                     weights[i]->dataType == DataType::DATA_GGUF_FORMAT &&
                     !weights[i]->IsRepacked &&
+                    !(diskRouteOutputs && weights[i]->disableGGUFRepack) &&
                     uniqueWeights.insert(weights[i]).second) {
                     repackWeights.push_back(weights[i]);
                 }
@@ -3890,6 +3893,12 @@ namespace fastllm {
         } else if ((input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16 ||
                     input.dataType == DataType::BFLOAT16) &&
                 (weights[2]->dataType == DataType::DATA_GGUF_FORMAT)) {
+            // The disk hierarchy combines GPU and CPU routes in expert-ID
+            // order. Let that caller reuse this batched Q8 projection without
+            // first rounding/reducing the independent CPU contributions.
+            const bool diskPerRoute = diskRouteOutputs && n == 1 && input.dims[0] == 1 &&
+                !weights[0] && !weights[1] && output.dataType == FLOAT32 &&
+                output.dims == std::vector<int>({topk, input.dims[1]});
             int outer = n;
             float *floatInput = (float*)input.cpuData;
             std::vector <float> vInputs;
@@ -3938,6 +3947,36 @@ namespace fastllm {
                 auto *pool = GetAlivePool();
                 int threads = pool->threads.size();
                 ops.resize(threads);
+                struct DiskSingleProjection : MultiThreadLinearFloat32GGUFOp {
+                    using MultiThreadLinearFloat32GGUFOp::MultiThreadLinearFloat32GGUFOp;
+                    void Run() override {
+                        const auto type=static_cast<DataType>(int(DATA_GGUF_FORMAT)+
+                            int(static_cast<ggml_tensor *>(ggmlTensor)->type));
+                        LinearQ8K_GGUF_Kernel(q8kInputData,weightData,biasData,outputData,
+                                              n,m,k,st,end,type,type);
+                    }
+                };
+                auto launchProjection=[&](uint8_t *quant,uint8_t *data,float *target,float *bias,
+                                          Data *weight,int width,int rows,int first,int count){
+                    if(!diskPerRoute){
+                        LaunchLinearQ8KGGUF(quant,data,target,bias,weight,1,width,rows,ops,pool,first,count);
+                        return;
+                    }
+                    // Reuse the existing single-row kernel, which resolves
+                    // only that shape and hoists the constant GGUF strides.
+                    // Other CPU paths keep their ordinary worker operator.
+                    weight->Repack();
+                    const int blocks=rows/8,per=blocks/count;
+                    int begin=0;
+                    for(int tid=0;tid<count;++tid){
+                        int end=begin+per+(begin+per*(count-tid)<blocks);
+                        if(tid==count-1)end=blocks;
+                        ops[first+tid]=new DiskSingleProjection(quant,data,bias,target,weight->ggmlTensor,
+                                                                1,width,rows,begin*8,end*8);
+                        begin=end;
+                    }
+                    for(int tid=0;tid<count;++tid)pool->PushOp(first+tid,ops[first+tid]);
+                };
 
                 std::vector <std::vector <uint8_t> > &q8kInputsDown = moeIntSingleVarManager.uinputsDown;
                 q8kInputsDown.resize(v.size());
@@ -3997,8 +4036,8 @@ namespace fastllm {
                         int curK = weight->dims[0];
                         int curThread = (curK / k) * base;
                         
-                        LaunchLinearQ8KGGUF(q8kInputsGate[q8kInputGateIds[l]].data(), weightData,
-                            outputData, biasData, weight, 1, m, curK, ops, pool, threadSt, curThread);
+                        launchProjection(q8kInputsGate[q8kInputGateIds[l]].data(), weightData,
+                            outputData, biasData, weight, m, curK, threadSt, curThread);
                         threadSt += curThread;
                     }
                     for (int j = 0; j < ops.size(); j++) {
@@ -4062,8 +4101,8 @@ namespace fastllm {
                         auto &uinputDown = q8kInputsDown[l];
                         int curThread = (curK / k) * base;
 
-                        LaunchLinearQ8KGGUF(uinputDown.data(), weightDown->cpuData, results[l].data(), nullptr, weightDown, 
-                            1, mid, m, ops, pool, threadSt, curThread);
+                        launchProjection(uinputDown.data(), weightDown->cpuData, results[l].data(), nullptr,
+                            weightDown, mid, m, threadSt, curThread);
                         threadSt += curThread;               
                     }
 
@@ -4084,6 +4123,14 @@ namespace fastllm {
                     // returning unweighted rows for the common CUDA reduction.
                     for (int j=0;j<topk;++j)
                         memcpy(output.cpuData+size_t(j)*m*sizeof(float),results[j].data(),m*sizeof(float));
+                    continue;
+                }
+                if (diskPerRoute) {
+                    for (size_t j = 0; j < v.size(); ++j) {
+                        float *dst = reinterpret_cast<float *>(output.cpuData) + j * m;
+                        const float scale = v[j].second;
+                        for (int col = 0; col < m; ++col) dst[col] = results[j][col] * scale;
+                    }
                     continue;
                 }
                 float *fLastOutput = ((float*)output.cpuData) + o * m;

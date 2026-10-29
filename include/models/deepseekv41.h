@@ -34,6 +34,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -119,6 +120,9 @@ namespace fastllm {
         std::vector<Data> mainHidden;         // [目标层数]，每个 [1, seqlen, dim]
         std::vector<Data> windowKV;           // [block_cnt]，本次前向的滑窗 KV（延后写入）
         std::vector<Data> rawKV, rawScore;    // kv source 层：压缩器的原始输入流（含旧 rawTail）
+        // Full verifier graphs retain their own buffers and request descriptors.
+        // This callback commits an accepted prefix without materializing per-layer views.
+        std::function<void(int)> commitKV;
         std::vector<int> prevRawTail;         // kv source 层：前向之前的 rawTail 行数
         std::vector<int> prevBlocks;          // kv source 层：前向之前的压缩块数
         std::vector<int> tokens, draftTokens;
@@ -198,6 +202,7 @@ namespace fastllm {
         ~DeepSeekV41Model() override;
 
         void InitParams() override;
+        std::string SelectSpecialWeightDevice(const std::string &weightName, int layerId) const override;
 
         std::map<std::string, std::vector<std::pair<std::string, DataType> > >
                 GetTensorMap(const std::vector<std::string> &tensorNames) override;
@@ -354,10 +359,6 @@ namespace fastllm {
         int engram_compressed_vocab_size = 0;
         DeepSeekV41EngramMeta engramMeta;
         std::vector<std::shared_ptr<void> > engramTables;   // 每个 engram 层一张表（实现见 cpp）
-        // 跨层预取：两个 engram 层相距很远（默认层 1 与层 14），而哈希只依赖 token 历史、
-        // 不依赖中间激活，所以下一层的行号与表行可以在本层计算时后台算好。
-        // 由 FASTLLM_DSV41_ENGRAM_PREFETCH 打开，默认关闭（实现见 cpp）。
-        std::shared_ptr<void> engramPrefetch;
 
         // -------- 请求状态 --------
         // 状态同时按 &pastKeyValues（单请求 Forward）与 &pastKeyValues[0].first（调度器的多请求
@@ -382,11 +383,12 @@ namespace fastllm {
 
         // Retain tensor storage until this scope drains all TP ranks.
         class ScopedTpDispatch {
-            bool enabled, previous = false;
+            bool enabled, previous = false, deviceWorkComplete = false;
             const std::vector<int> &devices;
         public:
             ScopedTpDispatch(bool enabled, const std::vector<int> &devices);
             ~ScopedTpDispatch();
+            void MarkDeviceWorkComplete() { deviceWorkComplete = true; }
             ScopedTpDispatch(const ScopedTpDispatch &) = delete;
             ScopedTpDispatch &operator=(const ScopedTpDispatch &) = delete;
         };
@@ -415,12 +417,13 @@ namespace fastllm {
             const Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
             std::vector<float> *logits, int &outputToken);
+        struct EngramPrefetch;
         struct ForwardWorkspace;
         struct ForwardState;
         void PrepareForward(ForwardWorkspace &);
         void PrepareForwardInputs(ForwardWorkspace &);
 #ifdef USE_CUDA
-        bool TryFullDecodeGraph(ForwardWorkspace &);
+        bool TryFullDecodeGraph(ForwardWorkspace &, bool inputsPrepared);
         void BuildFullDecodeGraph(int batch, const std::vector<DeepSeekV41Segment> &segments);
 #endif
         void BeginForwardLayer(ForwardWorkspace &, int layer);
@@ -513,7 +516,8 @@ namespace fastllm {
         void DsparkEmbedInput(const Data &inputIds, Data &hiddenStates);
         void DsparkProjectHead(Data &input, Data &output, bool persistent = false);
         bool DsparkPrepareQkv(int stage, const Data &input, Data &inputQuant,
-                              Data &raw, Data &qNorm, Data &qQuant, Data &kv);
+                              Data &raw, Data &qNorm, Data &qQuant, Data &kv, bool inputQuantized = false,
+                              Data *joinedWeight = nullptr);
         bool DsparkTensorNeeded(const std::string &name) const;
         // 支持贪心 / CUDA 采样及逐位置工具名、参数名约束
         bool DsparkSupportsRequest(const GenerationConfig &config,
@@ -564,7 +568,14 @@ namespace fastllm {
 
         // 对一批片段做 Engram：各片段分别算哈希行号，查表 / wkv / 门控按整批执行
         void RunEngram(int layer, int engramLayerIndex, const std::vector<DeepSeekV41Segment> &segments,
-                       Data &hiddenStates);
+                       Data &hiddenStates, EngramPrefetch *prefetch);
+
+        // Exact BF16 copies of immutable target-head vocabulary shards. Keep
+        // FP32 accumulation/logits and the original FP32 fallback checkpoint.
+        std::shared_ptr<void> v41TargetHeadWeights;
+        // Immutable draft attention shards are shared by request graphs.
+        std::map<int, std::shared_ptr<void>> v41DsparkAttentionWeights;
+        bool TryBFloat16HeadLinear(Data &input, Data &output);
     };
 }
 

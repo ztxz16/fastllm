@@ -388,7 +388,8 @@ namespace fastllm {
             }
         }
 
-        // 重置线程数
+        // Record the default only; the shared CPU pool is created lazily
+        // after explicit/automatic thread configuration has been applied.
         SetThreads(threads);
 
         // 初始化 cpuIds

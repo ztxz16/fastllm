@@ -1285,3 +1285,78 @@ bool FastllmCudaBFloat16LinearFloat32(const fastllm::Data &input, const fastllm:
     if (status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("BF16 linear with FP32 output failed");
     return true;
 }
+
+bool FastllmCudaTryPackBFloat16Weights(const fastllm::Data &first,
+        const fastllm::Data *second, fastllm::Data &packed) {
+    using namespace fastllm;
+    if (FastllmCudaGraphIsCapturing() || FastllmCudaRuntimeArch() < 80 ||
+        &packed == &first || &packed == second || packed.isFake || packed.multiDeviceData)
+        return false;
+    const int device = FastllmCudaGetDevice();
+    for (const Data *w : {&first, second}) {
+        if (!w) continue;
+        if (w->dataType != FLOAT32 || w->dataDevice != CUDA || !w->cudaData ||
+            w->multiDeviceData || w->dims.size() != 2 || w->dims[0] <= 0 || w->dims[1] <= 0 ||
+            w->dataDeviceIds != std::vector<int>{device} || w->IsRepacked ||
+            (packed.cudaData && packed.cudaData == w->cudaData) ||
+            (second && w->dims[1] != first.dims[1])) return false;
+    }
+    const int64_t rows = (int64_t)first.dims[0] + (second ? second->dims[0] : 0);
+    if (rows > std::numeric_limits<int>::max()) return false;
+    packed.dataType = BFLOAT16; packed.UpdateUnitSize();
+    packed.Resize({(int)rows, first.dims[1]});
+    packed.ToDevice(CUDA, std::vector<int>{device}, false); packed.Allocate(false);
+    int *flag = (int*)FastllmCudaMalloc(sizeof(int));
+    FastllmCudaMemset0(flag, sizeof(int));
+    uint64_t offset = 0;
+    for (const Data *w : {&first, second}) {
+        if (!w) continue;
+        FastllmCompactBFloat16ExactKernel<<<(w->Count(0) + 255) / 256, 256>>>(
+            (const float*)w->cudaData, (uint16_t*)packed.cudaData + offset, w->Count(0), flag);
+        offset += w->Count(0);
+    }
+    int inexact = 1;
+    FastllmCudaCopyFromDeviceToHost(&inexact, flag, sizeof(int));
+    FastllmCudaFree(flag);
+    return inexact == 0;
+}
+
+namespace {
+__global__ void FastllmSplitLinearFloat32Kernel(const float *input, float *first,
+        float *second, uint64_t count, int firstWidth, int width) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int col = i % width;
+    const uint64_t row = i / width;
+    if (col < firstWidth) first[row * firstWidth + col] = input[i];
+    else second[row * (width - firstWidth) + col - firstWidth] = input[i];
+}
+}
+
+bool FastllmCudaBFloat16LinearPairFloat32(const fastllm::Data &input,
+        const fastllm::Data &packed, int firstWidth, fastllm::Data &first,
+        fastllm::Data &second, fastllm::Data &scratch) {
+    using namespace fastllm;
+    if (packed.dims.size() != 2 || firstWidth <= 0 || firstWidth >= packed.dims[0] ||
+        input.dims.empty() || input.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
+        &first == &second || &first == &scratch || &second == &scratch)
+        return false;
+    for (const Data *out : {&first, &second, &scratch})
+        if (out == &input || out == &packed || out->multiDeviceData || out->isFake ||
+            (out->cudaData && (out->cudaData == input.cudaData || out->cudaData == packed.cudaData)))
+            return false;
+    if ((first.cudaData && (first.cudaData == second.cudaData || first.cudaData == scratch.cudaData)) ||
+        (second.cudaData && second.cudaData == scratch.cudaData)) return false;
+    // Validate and submit the GEMM before the split. No intermediate BF16 rounding.
+    if (!FastllmCudaBFloat16LinearFloat32(input, packed, scratch)) return false;
+    const int width = packed.dims[0];
+    for (Data *out : {&first, &second}) {
+        auto dims = input.dims; dims.back() = out == &first ? firstWidth : width - firstWidth;
+        out->dataType = FLOAT32; out->UpdateUnitSize(); out->Resize(dims);
+        out->ToDevice(CUDA, input.dataDeviceIds, false); out->Allocate(false);
+    }
+    FastllmSplitLinearFloat32Kernel<<<(scratch.Count(0) + 255) / 256, 256>>>(
+        (const float*)scratch.cudaData, (float*)first.cudaData, (float*)second.cudaData,
+        scratch.Count(0), firstWidth, width);
+    return true;
+}

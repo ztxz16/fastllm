@@ -45,7 +45,13 @@ namespace fastllm {
                 if (hybridMoe && (moeCudaCache || !cacheShapeSupported)) break;
             }
         }
-        const bool hybridDenseGraph = (tpHostMoe || hybridMoe) && hiddenStates.dims.size() == 3 &&
+        // Disk experts execute outside each dense graph, through the same
+        // stable input/output boundaries as the host expert backend. Whole
+        // CUDA-resident layers use those boundaries too, without disk dispatch.
+        const bool diskMoe = !tpHostMoe && !mtpTargetGraph &&
+            hiddenStates.dims.size() == 3 && hiddenStates.dims[1] == 1 &&
+            !DiskMoeLayerIndices(this->weights).empty();
+        const bool hybridDenseGraph = (tpHostMoe || hybridMoe || diskMoe) && hiddenStates.dims.size() == 3 &&
                                       (hiddenStates.dims[1] == 1 || mtpTargetGraph);
         const bool moeDeviceMapGraphCompatible =
             (Qwen4CudaOnlyDeviceMap(this->moeDeviceMap) &&

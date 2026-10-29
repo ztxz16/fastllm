@@ -20,6 +20,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
+#include "deepseekv41-router.cuh"
+#include "deepseekv41-router-tc.cuh"
+#include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-v41-full-decode.h"
 #include "fastllm-v41-decode.cuh"
 //
@@ -146,9 +149,29 @@ namespace {
         }
     };
 
-    bool V41UploadDescriptors(void *dst, const void *src, size_t bytes) {
-        if (bytes > 128 * 1024 || FastllmCudaGraphIsCapturingFast())
-            return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+    bool V41UploadCopies(const FastllmV41HostCopy &first,
+                         const FastllmV41HostCopy *extra, size_t extraCount) {
+        if (extraCount == SIZE_MAX || (extraCount && !extra)) return false;
+        const size_t count = extraCount + 1;
+        auto copyAt = [&](size_t i) -> const FastllmV41HostCopy & {
+            return i == 0 ? first : extra[i - 1];
+        };
+        size_t bytes = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const auto &copy = copyAt(i);
+            if (!copy.dst || !copy.src || !copy.bytes ||
+                copy.bytes > SIZE_MAX - bytes) return false;
+            bytes += copy.bytes;
+        }
+        auto synchronous = [&] {
+            for (size_t i = 0; i < count; ++i) {
+                const auto &copy = copyAt(i);
+                if (cudaMemcpy(copy.dst, copy.src, copy.bytes,
+                               cudaMemcpyHostToDevice) != cudaSuccess) return false;
+            }
+            return true;
+        };
+        if (bytes > 128 * 1024 || FastllmCudaGraphIsCapturingFast()) return synchronous();
         static thread_local std::map<int, std::unique_ptr<V41DescriptorUploads>> pools;
         const int device = FastllmCudaGetDevice();
         auto &pool = pools[device];
@@ -168,20 +191,47 @@ namespace {
             const size_t capacity = (bytes + 4095) & ~size_t(4095);
             if (cudaHostAlloc(&replacement, capacity, cudaHostAllocDefault) != cudaSuccess) {
                 cudaGetLastError();
-                return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+                return synchronous();
             }
             if (slot.host) cudaFreeHost(slot.host);
             slot.host = replacement; slot.capacity = capacity;
         }
-        std::memcpy(slot.host, src, bytes);
-        if (cudaMemcpyAsync(dst, slot.host, bytes, cudaMemcpyHostToDevice, cudaStreamPerThread) != cudaSuccess)
-            return false;
+        size_t offset = 0;
+        bool contiguous = true;
+        for (size_t i = 0; i < count; ++i) {
+            const auto &copy = copyAt(i);
+            std::memcpy(static_cast<char *>(slot.host) + offset, copy.src, copy.bytes);
+            contiguous &= reinterpret_cast<uintptr_t>(copy.dst) ==
+                          reinterpret_cast<uintptr_t>(first.dst) + offset;
+            offset += copy.bytes;
+        }
+        // Adjacent pointers may belong to separate allocations. Only merge
+        // when the entire destination range belongs to one device allocation.
+        contiguous = contiguous && count > 1 &&
+                     FastllmCudaValidatePointerRange(first.dst, bytes, device);
+        offset = 0;
+        for (size_t i = 0; i < (contiguous ? 1 : count); ++i) {
+            const auto &copy = copyAt(i);
+            char *host = static_cast<char *>(slot.host) + offset;
+            if (cudaMemcpyAsync(copy.dst, host, contiguous ? bytes : copy.bytes,
+                    cudaMemcpyHostToDevice, cudaStreamPerThread) != cudaSuccess) {
+                // Earlier copies may already read this slot. Do not recycle it
+                // before they have finished, including on the failure path.
+                cudaStreamSynchronize(cudaStreamPerThread);
+                return false;
+            }
+            offset += copy.bytes;
+        }
         if (cudaEventRecord(slot.copied, cudaStreamPerThread) != cudaSuccess) {
             cudaStreamSynchronize(cudaStreamPerThread);
             return false;
         }
         slot.pending = true;
         return true;
+    }
+
+    bool V41UploadDescriptors(void *dst, const void *src, size_t bytes) {
+        return V41UploadCopies({dst, src, bytes}, nullptr, 0);
     }
 
     // ---------------- 类型转换 ----------------
@@ -597,34 +647,46 @@ namespace {
 
     // Ascending reduction tree matches FastllmGemvFp32Fp32Kernel2.
     // BF16 converts exactly to FP32 in registers; no activation cast buffer.
+    template<int Tokens>
     __global__ void V41RouterScoresKernel(const __nv_bfloat16 *input, const float *weight,
-                                          float *scores, int dim, int experts, float invTemp) {
+                                          float *scores, int dim, int experts, float invTemp, int rows) {
         const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
-        const int expert = blockIdx.x, token = blockIdx.y;
-        float sum = 0.0f;
+        const int expert = blockIdx.x, first = blockIdx.y * Tokens;
+        float sums[Tokens] = {};
 #pragma unroll 4
-        for (int i = tid; i < dim; i += 256)
-            sum += __bfloat162float(input[(size_t)token * dim + i]) * weight[(size_t)expert * dim + i];
+        for (int i = tid; i < dim; i += 256) {
+            const float coefficient = weight[(size_t)expert * dim + i];
 #pragma unroll
-        for (int offset = 1; offset < 32; offset *= 2) {
-            const float other = __shfl_down_sync(0xffffffff, sum, offset);
-            if ((lane & (2 * offset - 1)) == 0) sum += other;
+            for (int t=0;t<Tokens;++t)
+                if (first+t<rows) sums[t] += __bfloat162float(input[(size_t)(first+t)*dim+i]) * coefficient;
         }
-        __shared__ float partial[8];
-        if (lane == 0) partial[warp] = sum;
-        __syncthreads();
-        if (warp == 0) {
-            sum = lane < 8 ? partial[lane] : 0.0f;
+        __shared__ float partial[Tokens][8];
 #pragma unroll
-            for (int offset = 1; offset < 8; offset *= 2) {
+        for (int t=0;t<Tokens;++t) {
+            float sum=sums[t];
+#pragma unroll
+            for (int offset = 1; offset < 32; offset *= 2) {
                 const float other = __shfl_down_sync(0xffffffff, sum, offset);
                 if ((lane & (2 * offset - 1)) == 0) sum += other;
             }
-            if (lane == 0) {
-                const float value = __fmul_rn(__fadd_rn(sum, 0.0f), invTemp);
-                const float softplus = value > 20.0f ? value :
-                    (value < -20.0f ? expf(value) : log1pf(expf(value)));
-                scores[(size_t)token * experts + expert] = sqrtf(softplus);
+            if (lane == 0) partial[t][warp] = sum;
+        }
+        __syncthreads();
+        if (warp == 0) {
+#pragma unroll
+            for (int t=0;t<Tokens;++t) {
+                float sum = lane < 8 ? partial[t][lane] : 0.0f;
+#pragma unroll
+                for (int offset = 1; offset < 8; offset *= 2) {
+                    const float other = __shfl_down_sync(0xffffffff, sum, offset);
+                    if ((lane & (2 * offset - 1)) == 0) sum += other;
+                }
+                if (lane == 0 && first+t<rows) {
+                    const float value = __fmul_rn(__fadd_rn(sum, 0.0f), invTemp);
+                    const float softplus = value > 20.0f ? value :
+                        (value < -20.0f ? expf(value) : log1pf(expf(value)));
+                    scores[(size_t)(first+t)*experts+expert] = sqrtf(softplus);
+                }
             }
         }
     }
@@ -947,6 +1009,79 @@ namespace {
         V41HcDecodeDotsBody<__nv_bfloat16, TILE>(x, fn, flatDim, mix);
     }
 
+    // A CTA owns one of the original dot kernel's eight logical warps.
+    // Keep every lane's strided FMA sequence and XOR reduction unchanged; the
+    // finish kernel sums the eight warp results in the original left-to-right
+    // order. Post uses separate multiply/add and rounds to BF16 before the dot.
+    __device__ __forceinline__ void V41DependencyWait() {
+#if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        cudaGridDependencySynchronize();
+#endif
+    }
+    __device__ __forceinline__ void V41DependencyLaunch() {
+#if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
+    }
+
+    template <int DIM, int OUTPUTS>
+    __global__ __launch_bounds__(32, 1)
+    void V41HcPostWarpDots(const __nv_bfloat16 *__restrict__ input,
+            const __nv_bfloat16 *__restrict__ residual, const float *__restrict__ post,
+            const float *__restrict__ comb, const float *__restrict__ fn,
+            __nv_bfloat16 *__restrict__ hidden, float *__restrict__ mix) {
+        V41DependencyWait();
+        V41DependencyLaunch();
+        constexpr int iterations = DIM / 256;
+        const int token = blockIdx.y, first = blockIdx.x * OUTPUTS;
+        const int tid = blockIdx.z * 32 + threadIdx.x;
+        input += token * DIM;
+        residual += token * 4 * DIM;
+        hidden += token * 4 * DIM;
+        post += token * 4;
+        comb += token * 16;
+        mix += (token * 8 + blockIdx.z) * 25;
+        float values[4][iterations];
+#pragma unroll
+        for (int i = 0; i < iterations; ++i) {
+            const int col = tid + i * 256;
+            float r[4], x = __bfloat162float(input[col]);
+#pragma unroll
+            for (int source = 0; source < 4; ++source)
+                r[source] = __bfloat162float(residual[source * DIM + col]);
+#pragma unroll
+            for (int target = 0; target < 4; ++target) {
+                float sum = 0.0f;
+#pragma unroll
+                for (int source = 0; source < 4; ++source)
+                    sum = __fadd_rn(sum, __fmul_rn(comb[source * 4 + target], r[source]));
+                const auto rounded = __float2bfloat16_rn(
+                    __fadd_rn(__fmul_rn(post[target], x), sum));
+                values[target][i] = __bfloat162float(rounded);
+                if (first == 0) hidden[target * DIM + col] = rounded;
+            }
+        }
+        float acc[OUTPUTS] = {};
+#pragma unroll
+        for (int target = 0; target < 4; ++target) {
+#pragma unroll
+            for (int i = 0; i < iterations; ++i) {
+#pragma unroll
+                for (int o = 0; o < OUTPUTS; ++o) {
+                    const float value = values[target][i];
+                    const float weight = first + o >= 24 ? value :
+                        fn[(first + o) * 4 * DIM + target * DIM + tid + i * 256];
+                    acc[o] += value * weight;
+                }
+            }
+        }
+#pragma unroll
+        for (int o = 0; o < OUTPUTS; ++o) {
+            const float value = V41WarpSum(acc[o]);
+            if (threadIdx.x == 0 && first + o < 25) mix[first + o] = value;
+        }
+    }
+
     // Reuse each FP32 coefficient across four tokens while parallelizing
     // the 25 independent dot products. Per-output FMA and reduction order
     // remain the same as the portable HcMix implementation.
@@ -1134,7 +1269,7 @@ namespace {
     //     跨 warp 的 warp_sums 归约、rsqrtf(val / channels + eps) 与写出的 lo * s * w
     //     都与 RMSNorm kernel 一致。
     // 所以 THREAD_PER_BLOCK 必须与 LaunchFastllmRMSNormBFloat16 对同一个 channels 的选择相同。
-    template <int THREAD_PER_BLOCK, int MAX_ITER, bool FINISH_MIX = false, bool QUANTIZE_OUTPUT = false>
+    template <int THREAD_PER_BLOCK, int MAX_ITER, bool FINISH_MIX = false, bool QUANTIZE_OUTPUT = false, int MIX_WARPS = 1>
     __global__ void __launch_bounds__(THREAD_PER_BLOCK)
     V41HcPreNormKernel(const __nv_bfloat16 *x, const float *pre, const float *weight,
                        __nv_bfloat16 *out, int hcMult, int channels, float eps,
@@ -1142,14 +1277,37 @@ namespace {
                        const float *mixBase = nullptr, int sinkhornIters = 0,
                        float mixEps = 0, float *post = nullptr, float *comb = nullptr, float *nextPre = nullptr,
                        __nv_bfloat16 *quantized = nullptr) {
+        V41DependencyWait();
+        V41DependencyLaunch();
         // The model consumes the PREVIOUS sublayer's pre coefficients.
         // Finish and normalization are independent, so separate CTAs overlap
         // them in one launch. Keep both original reduction orders.
         if constexpr (FINISH_MIX) {
             if ((blockIdx.x & 1) == 0) {
-                if (threadIdx.x < 32)
-                    V41HcFinishRow(mix, mixScale, mixBase, hcMult * channels,
-                        sinkhornIters, mixEps, eps, nextPre, post, comb, blockIdx.x / 2);
+                if constexpr (MIX_WARPS == 1) {
+                    if (threadIdx.x < 32)
+                        V41HcFinishRow(mix, mixScale, mixBase, hcMult * channels,
+                            sinkhornIters, mixEps, eps, nextPre, post, comb, blockIdx.x / 2);
+                } else {
+                    __shared__ float reduced[25];
+                    if (threadIdx.x < 32) {
+                        const int lane = threadIdx.x, row = blockIdx.x / 2;
+                        if (lane < 25) {
+                            float value = 0.0f;
+#pragma unroll
+                            for (int split = 0; split < MIX_WARPS; ++split)
+                                value += mix[((uint64_t)row * MIX_WARPS + split) * 25 + lane];
+                            reduced[lane] = value;
+                        }
+                        __syncwarp();
+                        // Preserve the old dot kernel's eight-warp sum order.
+                        // Coefficient output uses row zero here, then offsets
+                        // the three destinations to this token's actual row.
+                        V41HcFinishRow(reduced, mixScale, mixBase, hcMult * channels,
+                            sinkhornIters, mixEps, eps, nextPre + row * 4,
+                            post + row * 4, comb + row * 16, 0);
+                    }
+                }
                 return;
             }
         }
@@ -1392,6 +1550,53 @@ namespace {
             v = V41QuantValueDev(v, scale, quantMode);
         }
         V41Store<T>(base, d, v);
+    }
+
+    // Independent CTAs rotate Q, rotate/quantize current KV, and copy the
+    // immutable window. This preserves the two original rotary expressions
+    // and the BF16 storage boundary before KV's block-32 quantization.
+    __global__ void V41DraftRotaryTableKernel(__nv_bfloat16 *q, __nv_bfloat16 *kv,
+            const __nv_bfloat16 *window, __nv_bfloat16 *table, V41RopeTable rope,
+            int heads, int tokens, int windowRows, int ropeDim, int startPos,
+            const int *devicePosition, int qBlocks) {
+        constexpr int dim = 512;
+        const int block = blockIdx.x;
+        if (block < qBlocks) {
+            const int idx = block * blockDim.x + threadIdx.x;
+            const int pairs = ropeDim / 2;
+            if (idx >= tokens * heads * pairs) return;
+            const int row = idx / pairs, d = idx % pairs;
+            auto *base = q + (size_t)row * dim + dim - ropeDim + 2 * d;
+            const float pos = (float)((devicePosition ? *devicePosition : startPos) + (long long)(row / heads));
+            const float ang = pos * rope.invFreq[d];
+            const float c = cosf(ang), s = sinf(ang);
+            const float a = V41Load<__nv_bfloat16>(base, 0), b = V41Load<__nv_bfloat16>(base, 1);
+            V41Store<__nv_bfloat16>(base, 0, a * c - b * s);
+            V41Store<__nv_bfloat16>(base, 1, a * s + b * c);
+        } else if (block < qBlocks + tokens) {
+            const int row = block - qBlocks, d = threadIdx.x;
+            auto *base = kv + (size_t)row * dim;
+            float v = V41Load<__nv_bfloat16>(base, d);
+            const float other = __shfl_xor_sync(0xffffffff, v, 1);
+            const int off = dim - ropeDim;
+            if (d >= off) {
+                const int k = d - off;
+                const float pos = (float)((devicePosition ? *devicePosition : startPos) + (long long)row);
+                const float ang = pos * rope.invFreq[k >> 1];
+                const float c = cosf(ang), s = sinf(ang);
+                v = (k & 1) ? (other * s + v * c) : (v * c - other * s);
+            }
+            v = V41StorageRound<__nv_bfloat16>(v);
+            const float scale = V41QuantScaleDev(V41WarpMax(fabsf(v)), 1);
+            v = V41QuantValueDev(v, scale, 1);
+            const auto result = __float2bfloat16_rn(v);
+            base[d] = result;
+            table[(size_t)(windowRows + row) * dim + d] = result;
+        } else {
+            const size_t idx = (size_t)(block - qBlocks - tokens) * blockDim.x + threadIdx.x;
+            if (idx < (size_t)windowRows * (dim / 8))
+                ((uint4*)table)[idx] = ((const uint4*)window)[idx];
+        }
     }
 
     struct V41DecodeTransformDescriptor {
@@ -1778,60 +1983,189 @@ namespace {
         int32_t *output;
         int heads, count, width, position, blocks;
         bool writeCandidates, useCandidates;
+        int *candidateBlocks = nullptr, *candidateCount = nullptr;
+        int candidateBlockSize = 0;
     };
+
+    // Preserve every selected block, including threshold ties. Unlike a fixed
+    // top-block budget this list cannot silently drop valid candidates.
+    // Stable compaction needs one CTA scan when each thread owns an ordered
+    // contiguous span, instead of one CTA scan for every 256 mask bytes.
+    __global__ void V41CompactIndexCandidates(V41DecodeIndexDescriptor *items, int blockSize, int ratio) {
+        using Scan = cub::BlockScan<int, 256>;
+        __shared__ typename Scan::TempStorage storage;
+        const auto item = items[blockIdx.x];
+        const int visible = min(item.count, (item.position + 1) / ratio);
+        if (visible <= 16384) {
+            if (threadIdx.x == 0) *item.candidateCount = -1;
+            return;
+        }
+        const int blocks = min(item.blocks, (visible + blockSize - 1) / blockSize);
+        const int span = ((blocks + 255) / 256 + 3) & ~3;
+        const int first = threadIdx.x * span, end = min(blocks, first + span);
+        const bool aligned = (reinterpret_cast<uintptr_t>(item.candidates) & 3) == 0;
+        int local = 0, j = first;
+        if (aligned) {
+            for (; j + 4 <= end; j += 4) {
+                const unsigned mask = *reinterpret_cast<const unsigned *>(item.candidates + j);
+                local += __popc(__vsetne4(mask, 0));
+            }
+        }
+        for (; j < end; ++j) local += item.candidates[j] != 0;
+        int before, total;
+        Scan(storage).ExclusiveSum(local, before, total);
+        if (threadIdx.x == 0) *item.candidateCount = total * blockSize >= visible / 2 ? -1 : total;
+        j = first;
+        if (aligned) {
+            for (; j + 4 <= end; j += 4) {
+                const unsigned mask = *reinterpret_cast<const unsigned *>(item.candidates + j);
+                if (mask) {
+    #pragma unroll
+                    for (int d = 0; d < 4; ++d)
+                        if ((mask >> (d * 8)) & 255) item.candidateBlocks[before++] = j + d;
+                }
+            }
+        }
+        for (; j < end; ++j)
+            if (item.candidates[j]) item.candidateBlocks[before++] = j;
+    }
 
     // Decode uses heads as the MMA rows instead of padding one token to the
     // prefill kernel's 64 rows. Keep the dot-product and ordered head-sum
     // operations unchanged; the prefill kernel remains the general fallback.
-    template <bool BATCHED = false, bool PERSISTENT = false>
+    __device__ __forceinline__ void V41CopyAsync16(void *dst, const void *src, bool valid);
+    template <bool BATCHED = false, bool PERSISTENT = false, bool MULTIROW = false, bool SPARSE = false, bool PREFETCH = false, bool BLOCK_MAX = false>
     __global__ void __launch_bounds__(256)
     V41IndexerScoreDecodeMmaKernel(const __nv_bfloat16 *q, const float *weights,
                                    const __nv_bfloat16 *k, int heads, int m,
                                    int ratio, int startPos, float *out,
                                    const uint8_t *k8, int kMode, int kRowBytes, int vecUnpack,
-                                   const V41DecodeIndexDescriptor *items = nullptr) {
+                                   const V41DecodeIndexDescriptor *items = nullptr, int queryRows = 1) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
-        __shared__ __nv_bfloat16 ks[64][136];
-        __shared__ __nv_bfloat16 qs[16][136];
+        __shared__ __nv_bfloat16 ks[PREFETCH ? 2 : 1][64][136];
+        __shared__ __nv_bfloat16 qs[PERSISTENT ? 32 : 16][136];
         __shared__ float scores[16][64];
         int b = blockIdx.y;
+        const int *candidateBlocks = nullptr;
+        int candidateCount = 0, candidateBlockSize = 0, scoreBlocks = 0;
+        float *blockScores = nullptr;
         if (BATCHED) {
             const auto item = items[b];
             q = item.query; k = item.keys; weights = item.weights; out = item.scores;
             heads = item.heads; m = item.count; startPos = item.position; b = 0;
+            if constexpr (BLOCK_MAX) {
+                blockScores = item.blockScores; scoreBlocks = item.blocks;
+                candidateBlockSize = item.candidateBlockSize;
+            }
+            if constexpr (PERSISTENT && SPARSE) {
+                if (item.useCandidates && item.candidateBlocks && *item.candidateCount >= 0) {
+                    candidateBlocks = item.candidateBlocks;
+                    candidateCount = *item.candidateCount;
+                    candidateBlockSize = item.candidateBlockSize;
+                }
+            }
+        } else if constexpr (MULTIROW) {
+            // Each query keeps decode's head-wise MMA and accumulation order.
+            // Keys are shared by rows of the same request, not across requests.
+            const int request = b / queryRows, row = b % queryRows;
+            q += (size_t)b * heads * 128;
+            weights += (size_t)b * heads;
+            out += (size_t)b * m;
+            if (k) k += (size_t)request * m * 128;
+            if (k8) k8 += (size_t)request * m * kRowBytes;
+            startPos += row;
+            b = 0;
         }
         const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
         const int visible = ratio > 0 ? min(m, (startPos + 1) / ratio) : m;
-        const int end = PERSISTENT ? visible : (int)(blockIdx.x + 1) * 64;
+        const int end = candidateBlocks ? candidateCount * candidateBlockSize :
+            PERSISTENT ? visible : (int)(blockIdx.x + 1) * 64;
+        auto keyAt = [&](int offset) {
+            return candidateBlocks ? (offset < end ? candidateBlocks[offset / candidateBlockSize] *
+                candidateBlockSize + offset % candidateBlockSize : m) : offset;
+        };
+        if constexpr (BLOCK_MAX) {
+            // Verifier rows share the full chunk capacity but have distinct
+            // causal ends. Do not expose stale scores from future blocks.
+            if (blockIdx.x == 0)
+                for (int b = (visible + candidateBlockSize - 1) / candidateBlockSize + tid;
+                     b < scoreBlocks; b += 256) blockScores[b] = -INFINITY;
+        }
+        // Persistent CTAs visit many key tiles with the same query. Retain
+        // both 16-head groups in shared memory without changing MMA or the
+        // ordered FP32 head accumulation. Larger head counts keep streaming.
+        const bool cacheQuery = PERSISTENT && heads <= 32;
+        if constexpr (PERSISTENT) {
+            if (blockIdx.x * 64 >= end) return;
+            if (cacheQuery) {
+                for (int v = tid; v < ((heads + 15) / 16) * 256; v += 256)
+                    *((float4 *)&qs[v / 16][(v % 16) * 8]) = v / 16 < heads
+                        ? *((const float4 *)(q + ((uint64_t)b * heads + v / 16) * 128 + (v % 16) * 8))
+                        : make_float4(0, 0, 0, 0);
+                __syncthreads();
+            }
+        }
+        const bool pipeline = PREFETCH && k8 == nullptr && end > 16384;
+        int stage = 0;
+        auto prefetchKeys = [&](int tile, int buffer) {
+            for (int v = tid; v < 64 * 16; v += 256) {
+                const int j = v / 16, d = (v % 16) * 8, key = keyAt(tile + j);
+                const bool valid = key < m;
+                V41CopyAsync16(&ks[buffer][j][d],
+                    k + ((uint64_t)b * m + (valid ? key : 0)) * 128 + d, valid);
+            }
+        };
+        if constexpr (PREFETCH) {
+            if (pipeline) {
+                prefetchKeys(blockIdx.x * 64, 0);
+                asm volatile("cp.async.commit_group;" ::: "memory");
+            }
+        }
         for (int j0 = blockIdx.x * 64; j0 < end; j0 += gridDim.x * 64) {
-        if (j0 >= visible) {
+        if (!candidateBlocks && j0 >= visible) {
             if (tid < 64 && j0 + tid < m) out[(uint64_t)b * m + j0 + tid] = -INFINITY;
             return;
         }
-        for (int v = tid; v < 64 * 16; v += 256) {
-            const int j = v / 16, d = (v % 16) * 8;
-            if (j0 + j >= m) {
-                *((float4*)&ks[j][d]) = make_float4(0, 0, 0, 0);
-            } else if (k8 != nullptr) {
-                const uint8_t *row = k8 + ((uint64_t)b * m + j0 + j) * kRowBytes;
-                if (vecUnpack) V41LoadKvRow8Bf16(row, 128, d, kMode, &ks[j][d]);
-                else {
-#pragma unroll
-                    for (int e = 0; e < 8; ++e)
-                        ks[j][d + e] = __float2bfloat16_rn(V41LoadKvRow(row, 128, d + e, kMode));
+        if constexpr (PREFETCH) {
+            if (pipeline) {
+                asm volatile("cp.async.wait_group 0;" ::: "memory");
+                __syncthreads();
+                const int next = j0 + gridDim.x * 64;
+                if (next < end) {
+                    prefetchKeys(next, stage ^ 1);
+                    asm volatile("cp.async.commit_group;" ::: "memory");
                 }
-            } else {
-                *((float4*)&ks[j][d]) = *((const float4*)(k + ((uint64_t)b * m + j0 + j) * 128 + d));
+            }
+        }
+        if (!pipeline) {
+            for (int v = tid; v < 64 * 16; v += 256) {
+                const int j = v / 16, d = (v % 16) * 8;
+                const int key = keyAt(j0 + j);
+                if (key >= m) {
+                    *((float4*)&ks[stage][j][d]) = make_float4(0, 0, 0, 0);
+                } else if (k8 != nullptr) {
+                    const uint8_t *row = k8 + ((uint64_t)b * m + key) * kRowBytes;
+                    if (vecUnpack) V41LoadKvRow8Bf16(row, 128, d, kMode, &ks[stage][j][d]);
+                    else {
+#pragma unroll
+                        for (int e = 0; e < 8; ++e)
+                            ks[stage][j][d + e] = __float2bfloat16_rn(V41LoadKvRow(row, 128, d + e, kMode));
+                    }
+                } else {
+                    *((float4*)&ks[stage][j][d]) = *((const float4*)(k + ((uint64_t)b * m + key) * 128 + d));
+                }
             }
         }
         float total = 0.0f;
         for (int h0 = 0; h0 < heads; h0 += 16) {
             __syncthreads();
             const int h = tid / 16, d = (tid % 16) * 8;
-            *((float4*)&qs[h][d]) = h0 + h < heads
-                ? *((const float4*)(q + ((uint64_t)b * heads + h0 + h) * 128 + d))
-                : make_float4(0, 0, 0, 0);
-            __syncthreads();
+            if (!cacheQuery) {
+                *((float4*)&qs[h][d]) = h0 + h < heads
+                    ? *((const float4*)(q + ((uint64_t)b * heads + h0 + h) * 128 + d))
+                    : make_float4(0, 0, 0, 0);
+                __syncthreads();
+            }
             float acc[4] = {0, 0, 0, 0};
             const int ar = ((lane >> 3) & 1) * 8 + (lane & 7);
             const int ac = (lane >> 4) * 8;
@@ -1840,8 +2174,8 @@ namespace {
 #pragma unroll
             for (int kk = 0; kk < 128; kk += 16) {
                 uint32_t a[4], bb[2];
-                V41LdmX4(a, &qs[ar][kk + ac]);
-                V41LdmX2(bb, &ks[br][kk + bc]);
+                V41LdmX4(a, &qs[(cacheQuery ? h0 : 0) + ar][kk + ac]);
+                V41LdmX2(bb, &ks[stage][br][kk + bc]);
                 V41MmaBf16(acc, a, bb);
             }
             const int row = lane >> 2, col = warp * 8 + (lane & 3) * 2;
@@ -1853,10 +2187,138 @@ namespace {
                     total += fmaxf(scores[h][tid], 0.0f) * weights[(uint64_t)b * heads + h0 + h];
             }
         }
-        if (tid < 64 && j0 + tid < m) out[(uint64_t)b * m + j0 + tid] = total;
+        if (tid < 64) {
+            const int key = keyAt(j0 + tid);
+            if (key < m) out[(uint64_t)b * m + key] = total;
+        }
+        if constexpr (BLOCK_MAX) {
+            float maximum = tid < 64 && j0 + tid < visible ? fmaxf(-INFINITY, total) : -INFINITY;
+            for (int offset = candidateBlockSize / 2; offset; offset /= 2)
+                maximum = fmaxf(maximum, __shfl_down_sync(0xffffffffu, maximum, offset, candidateBlockSize));
+            if (tid < 64 && tid % candidateBlockSize == 0 && j0 + tid < visible) {
+                const int block = (j0 + tid) / candidateBlockSize;
+                // The newest causal block is pinned in the original algorithm.
+                blockScores[block] = block == (visible - 1) / candidateBlockSize ? INFINITY : maximum;
+            }
+        }
         if constexpr (PERSISTENT) __syncthreads();
+        if constexpr (PREFETCH) if (pipeline) stage ^= 1;
         }
 #endif
+    }
+
+    // BF16 verification queries share old index keys. Keep each row's MMA and
+    // ordered FP32 head reduction, while loading each 64-key tile once per pair.
+    struct V41PairedIndexShared {
+        __nv_bfloat16 keys[64][136];
+        __nv_bfloat16 queries[2][32][136];
+        float scores[16][64];
+        // Reused by every key tile; preserve the FP32 weights exactly.
+        float weights[2][32];
+    };
+    template<bool BLOCK_MAX = false, int THREADS = 256>
+    __global__ void __launch_bounds__(THREADS)
+    V41IndexerScorePairKernel(const V41DecodeIndexDescriptor *items, int rows, int ratio) {
+        static_assert(THREADS == 128 || THREADS == 256, "paired index score supports 128 or 256 threads");
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        constexpr int tilesPerWarp = 64 / (THREADS / 32) / 8;
+        extern __shared__ __align__(16) unsigned char storage[];
+        auto &sh = *reinterpret_cast<V41PairedIndexShared *>(storage);
+        const int first = blockIdx.y * 2, nr = min(2, rows - first);
+        const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+        const auto shared = items[first];
+        const auto last = items[first + nr - 1];
+        const int end = min(last.count, (last.position + 1) / ratio);
+        for (int r = 0; r < nr; ++r) {
+            const auto item = items[first + r];
+            if constexpr (BLOCK_MAX) {
+                const int visible = min(item.count, (item.position + 1) / ratio);
+                if (blockIdx.x == 0)
+                    for (int b = (visible + item.candidateBlockSize - 1) / item.candidateBlockSize + tid;
+                         b < item.blocks; b += THREADS) item.blockScores[b] = -INFINITY;
+            }
+        }
+        if (blockIdx.x * 64 >= end) return;
+        for (int r = 0; r < nr; ++r) {
+            const auto item = items[first + r];
+            if (tid < item.heads) sh.weights[r][tid] = item.weights[tid];
+            for (int v = tid; v < ((item.heads + 15) / 16) * 256; v += THREADS)
+                *reinterpret_cast<float4 *>(&sh.queries[r][v / 16][v % 16 * 8]) = v / 16 < item.heads
+                    ? *reinterpret_cast<const float4 *>(item.query + v / 16 * 128 + v % 16 * 8)
+                    : make_float4(0, 0, 0, 0);
+        }
+        auto loadKeys = [&](int tile) {
+            for (int v = tid; v < 64 * 16; v += THREADS) {
+                const int key = tile + v / 16, d = v % 16 * 8;
+                const bool valid = key < last.count;
+                auto *dst = &sh.keys[v / 16][d];
+                const auto *src = shared.keys + (size_t)(valid ? key : 0) * 128 + d;
+                *reinterpret_cast<float4 *>(dst) = valid
+                    ? *reinterpret_cast<const float4 *>(src) : make_float4(0, 0, 0, 0);
+            }
+        };
+        for (int tile = blockIdx.x * 64; tile < end; tile += gridDim.x * 64) {
+            loadKeys(tile);
+            __syncthreads();
+            for (int r = 0; r < nr; ++r) {
+                const auto item = items[first + r];
+                const int visible = min(item.count, (item.position + 1) / ratio);
+                if (tile >= visible) continue;
+                float total = 0.f;
+                for (int h0 = 0; h0 < item.heads; h0 += 16) {
+                    float acc[tilesPerWarp][4] = {};
+                    const int ar = ((lane >> 3) & 1) * 8 + (lane & 7), ac = (lane >> 4) * 8;
+                    const int bc = ((lane >> 3) & 1) * 8;
+    #pragma unroll
+                    for (int kk = 0; kk < 128; kk += 16) {
+                        uint32_t a[4];
+                        V41LdmX4(a, &sh.queries[r][h0 + ar][kk + ac]);
+    #pragma unroll
+                        for (int u = 0; u < tilesPerWarp; ++u) {
+                            uint32_t b[2];
+                            V41LdmX2(b, &sh.keys[(warp * tilesPerWarp + u) * 8 + (lane & 7)][kk + bc]);
+                            V41MmaBf16(acc[u], a, b);
+                        }
+                    }
+    #pragma unroll
+                    for (int u = 0; u < tilesPerWarp; ++u) {
+                        const int row = lane >> 2, col = (warp * tilesPerWarp + u) * 8 + (lane & 3) * 2;
+                        sh.scores[row][col] = acc[u][0]; sh.scores[row][col + 1] = acc[u][1];
+                        sh.scores[row + 8][col] = acc[u][2]; sh.scores[row + 8][col + 1] = acc[u][3];
+                    }
+                    __syncthreads();
+                    if (tid < 64)
+                        for (int h = 0; h < min(16, item.heads - h0); ++h)
+                            total += fmaxf(sh.scores[h][tid], 0.f) * sh.weights[r][h0 + h];
+                    __syncthreads();
+                }
+                if (tid < 64 && tile + tid < item.count) item.scores[tile + tid] = total;
+                if constexpr (BLOCK_MAX) {
+                    const int size = item.candidateBlockSize;
+                    float maximum = tid < 64 && tile + tid < visible ? fmaxf(-INFINITY, total) : -INFINITY;
+                    for (int offset = size / 2; offset; offset /= 2)
+                        maximum = fmaxf(maximum, __shfl_down_sync(0xffffffffu, maximum, offset, size));
+                    if (tid < 64 && tid % size == 0 && tile + tid < visible) {
+                        const int block = (tile + tid) / size;
+                        item.blockScores[block] = block == (visible - 1) / size ? INFINITY : maximum;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    #endif
+    }
+
+    template<int THREADS>
+    void V41LaunchIndexerScorePair(const V41DecodeIndexDescriptor *items, int rows, int ratio, bool blockMax) {
+        const dim3 grid(THREADS == 128 ? 256 : 128, (rows + 1) / 2);
+        if (blockMax) {
+            V41IndexerScorePairKernel<true, THREADS><<<grid, THREADS,
+                sizeof(V41PairedIndexShared), cudaStreamPerThread>>>(items, rows, ratio);
+        } else {
+            V41IndexerScorePairKernel<false, THREADS><<<grid, THREADS,
+                sizeof(V41PairedIndexShared), cudaStreamPerThread>>>(items, rows, ratio);
+        }
     }
 
     // ---------------- radix select（k-th largest） ----------------
@@ -1868,8 +2330,25 @@ namespace {
 
     constexpr int kSelThreads = 256;
 
+    // Combine equal-bin updates within each warp. Radix passes over positive
+    // scores often put an entire warp into one exponent bin; one integer
+    // atomic preserves the exact count without serializing all 32 lanes.
+    __device__ __forceinline__ void V41HistogramIncrement(unsigned *hist, unsigned bin, bool aggregate = true) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        if (aggregate) {
+            const unsigned peers = __match_any_sync(__activemask(), bin);
+            if ((threadIdx.x & 31) == __ffs(peers) - 1)
+                atomicAdd(hist + bin, (unsigned)__popc(peers));
+        } else {
+            atomicAdd(hist + bin, 1u);
+        }
+#else
+        atomicAdd(hist + bin, 1u);
+#endif
+    }
+
     // 返回第 k 大的 key（keys 由 getKey(i) 给出，i in [0, n)）。若 n <= k，返回 0。
-    template <typename GetKey>
+    template <int THREADS = kSelThreads, typename GetKey>
     __device__ unsigned V41RadixSelect(int n, int k, GetKey getKey, unsigned *hist /* shared, 16 */) {
         unsigned prefix = 0;
         int remaining = k;
@@ -1879,7 +2358,7 @@ namespace {
             }
             __syncthreads();
             unsigned mask = shift == 28 ? 0u : (0xffffffffu << (shift + 4));
-            for (int i = threadIdx.x; i < n; i += kSelThreads) {
+            for (int i = threadIdx.x; i < n; i += THREADS) {
                 unsigned key = getKey(i);
                 if ((key & mask) == prefix) {
                     atomicAdd(&hist[(key >> shift) & 15], 1u);
@@ -1945,8 +2424,42 @@ namespace {
         }
     }
 
-    template <bool BATCHED = false>
-    __global__ void V41CandidateSelectKernel(const float *blockScore, int numBlocks, int topkBlocks, uint8_t *mask,
+    // Byte radix and warp-aggregated integer counts preserve the exact FP32
+    // threshold, including all boundary ties, without eight full rescans.
+    template <int THREADS>
+    __device__ unsigned V41CandidateThreshold(const float *values, int n, int keep) {
+        using Scan = cub::BlockScan<int, THREADS>;
+        __shared__ typename Scan::TempStorage scan;
+        __shared__ unsigned bins[256], selected[2];
+        unsigned prefix = 0;
+        int remaining = keep;
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            if (threadIdx.x < 256) bins[threadIdx.x] = 0;
+            __syncthreads();
+            const unsigned mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+            for (int i = threadIdx.x; i < n; i += THREADS) {
+                const unsigned key = V41FloatKey(values[i]);
+                if ((key & mask) == prefix) V41HistogramIncrement(bins, (key >> shift) & 255);
+            }
+            __syncthreads();
+            const int count = threadIdx.x < 256 ? bins[threadIdx.x] : 0;
+            int before = 0, total = 0;
+            Scan(scan).ExclusiveSum(count, before, total);
+            const int greater = total - before - count;
+            if (count > 0 && remaining > greater && remaining <= greater + count) {
+                selected[0] = threadIdx.x;
+                selected[1] = remaining - greater;
+            }
+            __syncthreads();
+            prefix |= selected[0] << shift;
+            remaining = selected[1];
+            __syncthreads();
+        }
+        return prefix;
+    }
+
+    template <bool BATCHED = false, int THREADS = kSelThreads>
+    __global__ void __launch_bounds__(THREADS) V41CandidateSelectKernel(const float *blockScore, int numBlocks, int topkBlocks, uint8_t *mask,
                                                const V41DecodeIndexDescriptor *items = nullptr) {
         int t = blockIdx.x;
         if (BATCHED) {
@@ -1958,24 +2471,14 @@ namespace {
         uint8_t *mrow = mask + (uint64_t)t * numBlocks;
         __shared__ unsigned hist[16];
         int keep = min(topkBlocks, numBlocks);
-        unsigned threshold = V41RadixSelect(numBlocks, keep,
-            [&](int i) { return V41FloatKey(brow[i]); }, hist);
+        unsigned threshold = numBlocks >= 4096 && keep > 0
+            ? V41CandidateThreshold<THREADS>(brow, numBlocks, keep)
+            : V41RadixSelect<THREADS>(numBlocks, keep, [&](int i) { return V41FloatKey(brow[i]); }, hist);
         const unsigned negInf = V41FloatKey(-INFINITY);
-        // 严格大于的全部保留，等于阈值的按预算保留（顺序无关紧要，候选掩码只需数量约束）
-        for (int i = threadIdx.x; i < numBlocks; i += kSelThreads) {
-            unsigned key = V41FloatKey(brow[i]);
-            uint8_t v = 0;
-            if (key > threshold && key > negInf) {
-                v = 1;
-            }
-            mrow[i] = v;
-        }
-        __syncthreads();
-        for (int i = threadIdx.x; i < numBlocks; i += kSelThreads) {
-            unsigned key = V41FloatKey(brow[i]);
-            if (key == threshold && key > negInf) {
-                mrow[i] = 1;   // 阈值上的块全部保留（可能略多于 topkBlocks，只放宽候选范围）
-            }
+        // All threshold ties remain eligible, even if more than topkBlocks.
+        for (int i = threadIdx.x; i < numBlocks; i += THREADS) {
+            const unsigned key = V41FloatKey(brow[i]);
+            mrow[i] = key >= threshold && key > negInf;
         }
     }
 
@@ -2083,27 +2586,81 @@ namespace {
     //      第 1 趟顺带把落在选中桶里的 key 压缩进共享内存，后 3 趟只扫这几百个 key；
     //   3. 「严格大于阈值的个数」不再单独扫一趟：radix select 结束时的 remaining
     //      恰好是需要从等于阈值的元素里取的个数（tieBudget）；
-    //   4. 写出阶段：prefill 使用打包 BlockScan，decode 使用 warp ballot / 前缀和，
+    //   4. 写出阶段：各 warp 独立扫描连续区间，warp 间只做一次前缀和，
     //      输出位置 = 前面 greater 的个数 + min(tieBudget, 前面 tie 的个数)。
     //
     // 共享内存里的候选块下标由 candList（动态共享内存）承载，listCap == 0 表示不压缩。
     constexpr int kTopKSurvivorCap = 1024;
 
-    // Parallel radix-bin selection preserves exact integer counts and ties.
-    // The prior path scanned up to 256 shared bins on a single thread/pass.
-    template <bool BATCHED = false, bool PARALLEL_SELECT = true, int SELECT_THREADS = (PARALLEL_SELECT ? 1024 : 256)>
-    __global__ void __launch_bounds__(SELECT_THREADS) V41TopKKernel(const float *score, const uint8_t *candidates, int seqlen, int m,
+    // Exact two-level selection: each contiguous shard retains at most K
+    // indices, then a second selection merges them. Shards and local outputs
+    // are index ordered, so equal-score tie breaking remains global-index order.
+    constexpr int kTopKShardKeys = 8192;
+    constexpr int kTopKParallelMinKeys = 2 * kTopKShardKeys;
+
+    constexpr int kTopKCoarseBins = 1024;
+    constexpr int kTopKCoarseStride = kTopKCoarseBins + 1;
+    constexpr int kTopKCompactCapacity = 8192;
+
+    struct V41TopKWorkspace {
+        int *histograms = nullptr, *counts = nullptr, *offsets = nullptr;
+        bool global = false, compactCandidates = false;
+        float *scores = nullptr;
+        int32_t *indices = nullptr;
+        uint8_t *valid = nullptr;
+        int parts = 0, width = 0, shardSize = 0;
+
+        size_t Bytes(int rows) const {
+            return (size_t)rows * parts * width *
+                (sizeof(float) + sizeof(int32_t) + sizeof(uint8_t)) +
+                (global ? (size_t)rows * (parts * kTopKCoarseStride + parts + 2) * sizeof(int) :
+                 compactCandidates ? (size_t)rows * sizeof(int) : 0);
+        }
+    };
+    V41TopKWorkspace V41TopKLayout(void *memory, int rows, int keys, int width, int blockSize, bool global = false, bool compactCandidates = false) {
+        V41TopKWorkspace w;
+        w.compactCandidates = compactCandidates;
+        w.global = global;
+        w.shardSize = ((kTopKShardKeys + blockSize - 1) / blockSize) * blockSize;
+        w.parts = (keys + w.shardSize - 1) / w.shardSize;
+        w.width = width;
+        if (memory) {
+            const size_t count = (size_t)rows * w.parts * width;
+            w.scores = static_cast<float *>(memory);
+            w.indices = reinterpret_cast<int32_t *>(w.scores + count);
+            w.valid = reinterpret_cast<uint8_t *>(w.indices + count);
+            if (global) {
+                w.histograms = reinterpret_cast<int *>(w.valid + count);
+                w.counts = w.histograms + (size_t)rows * w.parts * kTopKCoarseStride;
+                w.offsets = w.counts + rows;
+            } else if (compactCandidates) {
+                w.counts = reinterpret_cast<int *>(w.valid + count);
+            }
+        }
+        return w;
+    }
+
+    struct V41TopKCounts { int greater, tie; };
+    struct V41TopKAddCounts {
+        __device__ V41TopKCounts operator()(V41TopKCounts a, V41TopKCounts b) const {
+            return {a.greater + b.greater, a.tie + b.tie};
+        }
+    };
+
+    template <bool BATCHED = false, int LEVEL = 0, int THREADS = kSelThreads>
+    __device__ void V41TopKSelect(const float *score, const uint8_t *candidates, int seqlen, int m,
                                   int numBlocks, int blockSize, int blockShift, int width,
                                   int ratio, int startPos, int listCap, int32_t *out,
-                                  const V41DecodeIndexDescriptor *items = nullptr) {
-        typedef cub::BlockScan<int, SELECT_THREADS> BlockScan;
+                                  const V41DecodeIndexDescriptor *items, V41TopKWorkspace workspace) {
+        typedef cub::BlockScan<int, THREADS> BlockScan;
         __shared__ typename BlockScan::TempStorage scanStorage;
         __shared__ unsigned hist[256];
         __shared__ unsigned survivors[kTopKSurvivorCap];
         __shared__ int meta[4];             // 0: digit, 1: remaining, 2: 候选块个数
         extern __shared__ int candList[];
 
-        int t = blockIdx.x;
+        int t = LEVEL == 1 ? blockIdx.y : blockIdx.x;
+        const int requestRow = t;
         if (BATCHED) {
             const auto item = items[t];
             score = item.scores; candidates = item.useCandidates ? item.candidates : nullptr;
@@ -2112,18 +2669,50 @@ namespace {
             listCap = candidates ? min(numBlocks, listCap) : 0;
         }
         const int i = t % seqlen;
-        const int visible = min(m, (startPos + i + 1) / ratio);
+        int visible = min(m, (startPos + i + 1) / ratio);
         const float *row = score + (uint64_t)t * m;
         const uint8_t *cand = candidates == nullptr ? nullptr : candidates + (uint64_t)t * numBlocks;
         int32_t *orow = out + (uint64_t)t * width;
         const unsigned negInf = V41FloatKey(-INFINITY);
+        const bool hierarchical = LEVEL && visible > kTopKParallelMinKeys;
+        int shardOffset = 0;
+        size_t partialBase = (size_t)requestRow * workspace.parts * workspace.width;
+        if constexpr (LEVEL == 1) {
+            if (!hierarchical) {
+                if (blockIdx.x != 0) return;
+            } else {
+                shardOffset = blockIdx.x * workspace.shardSize;
+                if (shardOffset >= visible) return;
+                const int firstBlock = shardOffset / blockSize;
+                row += shardOffset;
+                if (cand) cand += firstBlock;
+                visible = min(visible - shardOffset, workspace.shardSize);
+                numBlocks = max(0, min(numBlocks - firstBlock,
+                    (visible + blockSize - 1) / blockSize));
+                listCap = min(listCap, numBlocks);
+                partialBase += (size_t)blockIdx.x * workspace.width;
+                orow = workspace.indices + partialBase;
+            }
+        } else if constexpr (LEVEL == 2) {
+            if (!hierarchical) return;
+            const int parts = (visible + workspace.shardSize - 1) / workspace.shardSize;
+            row = workspace.scores + partialBase;
+            cand = workspace.valid + partialBase;
+            visible = parts * workspace.width;
+            if (workspace.counts && workspace.counts[requestRow] >= 0) {
+                visible = workspace.counts[requestRow];
+                cand = nullptr;
+            }
+            numBlocks = visible;
+            blockSize = 1; blockShift = 0; listCap = 0;
+        }
 
         // ---- 候选块下标的升序压缩 ----
         const bool canCompact = cand != nullptr && listCap > 0 && blockShift >= 0;
         int nCandBlocks = 0;
         if (canCompact) {
             int running = 0;
-            for (int st = 0; st < numBlocks; st += SELECT_THREADS) {
+            for (int st = 0; st < numBlocks; st += THREADS) {
                 const int blk = st + threadIdx.x;
                 const int keepIt = (blk < numBlocks && cand[blk] != 0 && (blk << blockShift) < visible) ? 1 : 0;
                 int rank = 0, tot = 0;
@@ -2148,10 +2737,10 @@ namespace {
         // ---- 第 1 趟：全量直方图（高 8 bit），同时得到可用元素总数 ----
         if (threadIdx.x < 256) hist[threadIdx.x] = 0;
         __syncthreads();
-        for (int p = threadIdx.x; p < nDomain; p += SELECT_THREADS) {
+        for (int p = threadIdx.x; p < nDomain; p += THREADS) {
             const int j = V41_TOPK_INDEX(p);
             if (V41_TOPK_OK(j)) {
-                atomicAdd(&hist[V41FloatKey(row[j]) >> 24], 1u);
+                V41HistogramIncrement(hist, V41FloatKey(row[j]) >> 24, nDomain >= 8192);
             }
         }
         __syncthreads();
@@ -2164,31 +2753,17 @@ namespace {
         int tieBudget = 0;
         const bool selectAll = total <= width;
         if (!selectAll) {
-            if constexpr (PARALLEL_SELECT) {
-                const int greater = total - binPrefix - binCount;
-                if (binCount > 0 && width > greater && width <= greater + binCount) {
-                    meta[0] = threadIdx.x;
-                    meta[1] = width - greater;
-                    meta[2] = binCount;
-                }
-            } else {
-                if (threadIdx.x == 0) {
-                    int cnt = width, digit = 255;
-                    for (; digit >= 0; digit--) {
-                        const int c = (int)hist[digit];
-                        if (cnt <= c) {
-                            break;
-                        }
-                        cnt -= c;
-                    }
-                    if (digit < 0) {
-                        digit = 0;
-                    }
-                    meta[0] = digit;
-                    meta[1] = cnt;
-                    meta[2] = (int)hist[digit];
-                }
+
+            // Each thread owns one radix bin. The block prefix already tells
+            // us how many keys are greater, so the winning bin needs no serial
+            // scan over all 256 bins on thread zero.
+            const int greater = total - binPrefix - binCount;
+            if (binCount > 0 && width > greater && width <= greater + binCount) {
+                meta[0] = threadIdx.x;
+                meta[1] = width - greater;
+                meta[2] = binCount;
             }
+
             __syncthreads();
             int digit = meta[0];
             int remaining = meta[1];
@@ -2202,7 +2777,7 @@ namespace {
                     meta[3] = 0;
                 }
                 __syncthreads();
-                for (int p = threadIdx.x; p < nDomain; p += SELECT_THREADS) {
+                for (int p = threadIdx.x; p < nDomain; p += THREADS) {
                     const int j = V41_TOPK_INDEX(p);
                     if (V41_TOPK_OK(j)) {
                         const unsigned key = V41FloatKey(row[j]);
@@ -2221,51 +2796,35 @@ namespace {
                 __syncthreads();
                 const unsigned mask = 0xffffffffu << (shift + 8);
                 if (useShared) {
-                    for (int s = threadIdx.x; s < survivorCount; s += SELECT_THREADS) {
+                    for (int s = threadIdx.x; s < survivorCount; s += THREADS) {
                         const unsigned key = survivors[s];
                         if ((key & mask) == prefix) {
-                            atomicAdd(&hist[(key >> shift) & 255], 1u);
+                            V41HistogramIncrement(hist, (key >> shift) & 255, nDomain >= 8192);
                         }
                     }
                 } else {
-                    for (int p = threadIdx.x; p < nDomain; p += SELECT_THREADS) {
+                    for (int p = threadIdx.x; p < nDomain; p += THREADS) {
                         const int j = V41_TOPK_INDEX(p);
                         if (V41_TOPK_OK(j)) {
                             const unsigned key = V41FloatKey(row[j]);
                             if ((key & mask) == prefix) {
-                                atomicAdd(&hist[(key >> shift) & 255], 1u);
+                                V41HistogramIncrement(hist, (key >> shift) & 255, nDomain >= 8192);
                             }
                         }
                     }
                 }
                 __syncthreads();
-                if constexpr (PARALLEL_SELECT) {
-                    const int count = threadIdx.x < 256 ? (int)hist[threadIdx.x] : 0;
-                    int prefixCount = 0, totalCount = 0;
-                    BlockScan(scanStorage).ExclusiveSum(count, prefixCount, totalCount);
-                    __syncthreads();
-                    const int greater = totalCount - prefixCount - count;
-                    if (count > 0 && remaining > greater && remaining <= greater + count) {
-                        meta[0] = threadIdx.x;
-                        meta[1] = remaining - greater;
-                    }
-                } else {
-                    if (threadIdx.x == 0) {
-                        int cnt = remaining, d = 255;
-                        for (; d >= 0; d--) {
-                            const int c = (int)hist[d];
-                            if (cnt <= c) {
-                                break;
-                            }
-                            cnt -= c;
-                        }
-                        if (d < 0) {
-                            d = 0;
-                        }
-                        meta[0] = d;
-                        meta[1] = cnt;
-                    }
+
+                const int count = threadIdx.x < 256 ? hist[threadIdx.x] : 0;
+                int before = 0, active = 0;
+                BlockScan(scanStorage).ExclusiveSum(count, before, active);
+                __syncthreads();
+                const int greater = active - before - count;
+                if (count > 0 && remaining > greater && remaining <= greater + count) {
+                    meta[0] = threadIdx.x;
+                    meta[1] = remaining - greater;
                 }
+
                 __syncthreads();
                 digit = meta[0];
                 remaining = meta[1];
@@ -2277,91 +2836,252 @@ namespace {
             tieBudget = remaining;
         }
 
-        // Warp-prefix emission adapted from Strata src/dsv41/ds4_kernels.cu
-        // (c33fa7ba6d0d), MIT, Copyright (c) 2026 Niko1221 and contributors.
-        // Unlike its greater-then-ties layout, merge both ranks here so that
-        // FastLLM's globally ascending selected-index / attention order stays exact.
-        if constexpr (PARALLEL_SELECT) {
-            __shared__ int warpGreater[32], warpEqual[32];
-            __shared__ int cumulativeGreater, cumulativeTie;
-            if (threadIdx.x == 0) { cumulativeGreater = 0; cumulativeTie = 0; }
-            __syncthreads();
-            const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-            constexpr int warps = SELECT_THREADS / 32;
-            const unsigned below = (1u << lane) - 1u;
-            for (int st = 0; st < nDomain; st += SELECT_THREADS) {
-                const int p = st + threadIdx.x;
-                const int j = p < nDomain ? V41_TOPK_INDEX(p) : -1;
-                const bool ok = j >= 0 && V41_TOPK_OK(j);
-                const unsigned key = ok ? V41FloatKey(row[j]) : negInf;
-                const bool greater = ok && key > negInf && (selectAll || key > threshold);
-                const bool equal = ok && key > negInf && !selectAll && key == threshold;
-                const unsigned bg = __ballot_sync(0xffffffffu, greater);
-                const unsigned be = __ballot_sync(0xffffffffu, equal);
-                if (lane == 0) { warpGreater[warp] = __popc(bg); warpEqual[warp] = __popc(be); }
-                __syncthreads();
-                if (warp == 0) {
-                    const int g = lane < warps ? warpGreater[lane] : 0;
-                    const int e = lane < warps ? warpEqual[lane] : 0;
-                    int gs = g, es = e;
-#pragma unroll
-                    for (int offset = 1; offset < 32; offset <<= 1) {
-                        const int a = __shfl_up_sync(0xffffffffu, gs, offset);
-                        const int b = __shfl_up_sync(0xffffffffu, es, offset);
-                        if (lane >= offset) { gs += a; es += b; }
-                    }
-                    if (lane < warps) {
-                        warpGreater[lane] = cumulativeGreater + gs - g;
-                        warpEqual[lane] = cumulativeTie + es - e;
-                    }
-                    __syncwarp();
-                    if (lane == 31) { cumulativeGreater += gs; cumulativeTie += es; }
-                }
-                __syncthreads();
-                const int gBefore = warpGreater[warp] + __popc(bg & below);
-                const int tBefore = warpEqual[warp] + __popc(be & below);
-                if (greater || (equal && tBefore < tieBudget)) {
-                    const int slot = gBefore + min(tieBudget, tBefore);
-                    if (slot < width) orow[slot] = j;
-                }
-                __syncthreads();
-            }
-        } else {
-            // ---- 最后一趟：按升序写出 ----
-            int runningGreater = 0, runningTie = 0;
-            for (int st = 0; st < nDomain; st += SELECT_THREADS) {
-                const int p = st + threadIdx.x;
-                const int j = p < nDomain ? V41_TOPK_INDEX(p) : -1;
-                const bool ok = j >= 0 && V41_TOPK_OK(j);
-                const unsigned key = ok ? V41FloatKey(row[j]) : negInf;
-                int isGreater = 0, isTie = 0;
-                if (ok && key > negInf) {
-                    if (selectAll || key > threshold) {
-                        isGreater = 1;
-                    } else if (key == threshold) {
-                        isTie = 1;
-                    }
-                }
-                int packedPrefix = 0, packedTotal = 0;
-                BlockScan(scanStorage).ExclusiveSum(isGreater * 1024 + isTie, packedPrefix, packedTotal);
-                __syncthreads();
-                const int gBefore = runningGreater + (packedPrefix >> 10);
-                const int tBefore = runningTie + (packedPrefix & 1023);
-                if (isGreater || (isTie && tBefore < tieBudget)) {
-                    const int pos = gBefore + min(tieBudget, tBefore);
-                    if (pos < width) {
-                        orow[pos] = j;
-                    }
-                }
-                runningGreater += packedTotal >> 10;
-                runningTie += packedTotal & 1023;
-            }
+        // Warps own consecutive intervals of the index-ordered domain.
+        // Coalesced reads and warp ballots replace one block scan per tile;
+        // only the prefix between warps needs a block-wide scan.
+        using OutputScan = cub::BlockScan<V41TopKCounts, THREADS>;
+        __shared__ typename OutputScan::TempStorage outputStorage;
+        const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+        const int span = ((nDomain + THREADS - 1) / THREADS) * 32;
+        const int first = warp * span, last = min(nDomain, first + span);
+        auto classify = [&](int p) -> V41TopKCounts {
+            if (p >= nDomain) return {0, 0};
+            const int j = V41_TOPK_INDEX(p);
+            if (!V41_TOPK_OK(j)) return {0, 0};
+            const unsigned key = V41FloatKey(row[j]);
+            if (key <= negInf) return {0, 0};
+            if (selectAll || key > threshold) return {1, 0};
+            return {0, key == threshold ? 1 : 0};
+        };
+        V41TopKCounts local{0, 0}, before;
+        for (int tile = first; tile < last; tile += 32) {
+            const auto flags = classify(tile + lane);
+            local.greater += __popc(__ballot_sync(0xffffffffu, flags.greater));
+            local.tie += __popc(__ballot_sync(0xffffffffu, flags.tie));
         }
-        for (int p = keep + threadIdx.x; p < width; p += SELECT_THREADS) {
+        if (lane != 0) local = {0, 0};
+        OutputScan(outputStorage).ExclusiveScan(local, before, V41TopKCounts{0, 0}, V41TopKAddCounts{});
+        before.greater = __shfl_sync(0xffffffffu, before.greater, 0);
+        before.tie = __shfl_sync(0xffffffffu, before.tie, 0);
+        const unsigned lower = (1u << lane) - 1u;
+        for (int tile = first; tile < last; tile += 32) {
+            const auto flags = classify(tile + lane);
+            const unsigned greaterMask = __ballot_sync(0xffffffffu, flags.greater);
+            const unsigned tieMask = __ballot_sync(0xffffffffu, flags.tie);
+            const int tieBefore = before.tie + __popc(tieMask & lower);
+            if (flags.greater || (flags.tie && tieBefore < tieBudget)) {
+                const int pos = before.greater + __popc(greaterMask & lower) + min(tieBudget, tieBefore);
+                if (pos < width) orow[pos] = V41_TOPK_INDEX(tile + lane);
+            }
+            before.greater += __popc(greaterMask);
+            before.tie += __popc(tieMask);
+        }
+        for (int p = keep + threadIdx.x; p < width; p += THREADS) {
             orow[p] = -1;
+        }
+        if constexpr (LEVEL == 1) {
+            if (hierarchical) {
+                __syncthreads();
+                for (int j = threadIdx.x; j < width; j += THREADS) {
+                    const int index = orow[j];
+                    workspace.valid[partialBase + j] = index >= 0;
+                    workspace.scores[partialBase + j] = index >= 0 ? row[index] : 0.f;
+                    if (index >= 0) orow[j] = shardOffset + index;
+                }
+            }
+        } else if constexpr (LEVEL == 2) {
+            __syncthreads();
+            for (int j = threadIdx.x; j < width; j += THREADS) {
+                const int index = orow[j];
+                if (index >= 0) orow[j] = workspace.indices[partialBase + index];
+            }
         }
 #undef V41_TOPK_INDEX
 #undef V41_TOPK_OK
+    }
+
+    // Keep the original launch surface for short rows, uncommon shapes and
+    // exact overflow recovery. Global preselection uses the same selector.
+    template <bool BATCHED = false, int LEVEL = 0, int THREADS = kSelThreads>
+    __global__ void __launch_bounds__(THREADS) V41TopKKernel(const float *score, const uint8_t *candidates, int seqlen, int m,
+                                  int numBlocks, int blockSize, int blockShift, int width,
+                                  int ratio, int startPos, int listCap, int32_t *out,
+                                  const V41DecodeIndexDescriptor *items, V41TopKWorkspace workspace) {
+        V41TopKSelect<BATCHED, LEVEL, THREADS>(score, candidates, seqlen, m, numBlocks, blockSize,
+            blockShift, width, ratio, startPos, listCap, out, items, workspace);
+    }
+
+    // A monotone FP16 bucket is only a prefilter. Every retained value keeps
+    // its FP32 bits; the existing selector resolves the exact boundary and ties.
+    // Bound the shortlist and recover with the original hierarchy on overflow.
+    struct V41TopKGlobalArgs {
+        const float *scores;
+        const uint8_t *candidates;
+        int seqlen, count, blocks, blockSize, blockShift, width, ratio, position, listCap;
+        int32_t *output;
+        const V41DecodeIndexDescriptor *items;
+    };
+    struct V41TopKRow {
+        const float *scores;
+        int visible, width;
+    };
+    template <bool BATCHED>
+    __device__ V41TopKRow V41GlobalTopKRow(const V41TopKGlobalArgs &a, int row) {
+        if constexpr (BATCHED) {
+            const auto item = a.items[row];
+            return {item.scores, min(item.count, (item.position + 1) / a.ratio), item.width};
+        } else {
+            return {a.scores + (size_t)row * a.count,
+                min(a.count, (a.position + row % a.seqlen + 1) / a.ratio), a.width};
+        }
+    }
+    __device__ unsigned V41TopKCoarseKey(float value) {
+        const unsigned bits = __half_as_ushort(__float2half_rn(value));
+        return ((bits & 0x8000) ? (~bits & 65535) : (bits | 0x8000)) >> 6;
+    }
+    template <bool BATCHED, int LEVEL, int THREADS>
+    __device__ void V41GlobalTopKFallback(const V41TopKGlobalArgs &a, V41TopKWorkspace w) {
+        V41TopKSelect<BATCHED, LEVEL, THREADS>(a.scores, a.candidates, a.seqlen, a.count,
+            a.blocks, a.blockSize, a.blockShift, a.width, a.ratio, a.position,
+            a.listCap, a.output, a.items, w);
+    }
+
+    template <bool BATCHED>
+    __global__ void __launch_bounds__(512) V41TopKGlobalHistogram(V41TopKGlobalArgs a, V41TopKWorkspace w) {
+        using Scan = cub::BlockScan<int, 512>;
+        __shared__ typename Scan::TempStorage temp;
+        __shared__ unsigned hist[kTopKCoarseBins], nonfinite;
+        const int row = blockIdx.y, part = blockIdx.x, tid = threadIdx.x;
+        const auto r = V41GlobalTopKRow<BATCHED>(a, row);
+        const int first = part * w.shardSize, end = min(r.visible, first + w.shardSize);
+        if (r.visible <= kTopKParallelMinKeys || first >= end) return;
+        for (int bin = tid; bin < kTopKCoarseBins; bin += 512) hist[bin] = 0;
+        if (tid == 0) nonfinite = 0;
+        __syncthreads();
+        for (int j = first + tid; j < end; j += 512) {
+            const float value = r.scores[j];
+            if (!isfinite(value)) atomicOr(&nonfinite, 1u);
+            atomicAdd(hist + V41TopKCoarseKey(value), 1u);
+        }
+        __syncthreads();
+        int values[2] = {int(hist[tid * 2]), int(hist[tid * 2 + 1])}, before[2], total;
+        Scan(temp).ExclusiveSum(values, before, total);
+        const size_t base = ((size_t)row * w.parts + part) * kTopKCoarseStride;
+        for (int i = 0; i < 2; ++i) w.histograms[base + tid * 2 + i] = total - before[i];
+        if (tid == 0) w.histograms[base + kTopKCoarseBins] = nonfinite;
+    }
+
+    template <bool BATCHED>
+    __global__ void __launch_bounds__(1024) V41TopKGlobalThreshold(V41TopKGlobalArgs a, V41TopKWorkspace w) {
+        __shared__ int sums[kTopKCoarseBins + 1], selected, retained, nonfinite;
+        using Scan = cub::BlockScan<int, 1024>;
+        __shared__ typename Scan::TempStorage temp;
+        const int row = blockIdx.x, bin = threadIdx.x;
+        const auto r = V41GlobalTopKRow<BATCHED>(a, row);
+        if (r.visible <= kTopKParallelMinKeys) {
+            if (bin == 0) w.counts[row] = -1;
+            return;
+        }
+        const int parts = (r.visible + w.shardSize - 1) / w.shardSize;
+        int count = 0;
+        for (int part = 0; part < parts; ++part)
+            count += w.histograms[((size_t)row * w.parts + part) * kTopKCoarseStride + bin];
+        sums[bin] = count;
+        if (bin == 0) { sums[kTopKCoarseBins] = 0; nonfinite = 0; }
+        __syncthreads();
+        if (bin < parts && w.histograms[((size_t)row * w.parts + bin) * kTopKCoarseStride + kTopKCoarseBins])
+            atomicOr(&nonfinite, 1);
+        if (sums[0] <= r.width) {
+            if (bin == 0) { selected = 0; retained = sums[0]; }
+        } else if (count >= r.width && sums[bin + 1] < r.width) {
+            selected = bin; retained = count;
+        }
+        __syncthreads();
+        if (bin == 0) w.counts[row] = !nonfinite && retained <= kTopKCompactCapacity &&
+            retained <= w.parts * w.width ? retained : -1;
+        const int local = bin < parts ?
+            w.histograms[((size_t)row * w.parts + bin) * kTopKCoarseStride + selected] : 0;
+        int before;
+        Scan(temp).ExclusiveSum(local, before);
+        if (bin < w.parts) w.offsets[(size_t)row * (w.parts + 1) + bin] = before;
+        if (bin == 0) w.offsets[(size_t)row * (w.parts + 1) + w.parts] = selected;
+    }
+
+    template <bool BATCHED>
+    __global__ void __launch_bounds__(256) V41TopKGlobalCollect(V41TopKGlobalArgs a, V41TopKWorkspace w) {
+        const int row = blockIdx.y, part = blockIdx.x;
+        const auto r = V41GlobalTopKRow<BATCHED>(a, row);
+        if (w.counts[row] < 0) { V41GlobalTopKFallback<BATCHED, 1, 256>(a, w); return; }
+        const int first = part * w.shardSize, length = min(r.visible - first, w.shardSize);
+        if (length <= 0) return;
+        const int threshold = w.offsets[(size_t)row * (w.parts + 1) + w.parts];
+        const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+        const int span = ((length + 255) / 256) * 32, start = warp * span, end = min(length, start + span);
+        int local = 0;
+        for (int tile = start; tile < end; tile += 32) {
+            const int j = first + tile + lane;
+            const bool keep = tile + lane < length && V41TopKCoarseKey(r.scores[j]) >= threshold;
+            local += __popc(__ballot_sync(0xffffffffu, keep));
+        }
+        using Scan = cub::BlockScan<int, 256>;
+        __shared__ typename Scan::TempStorage temp;
+        int prefix;
+        Scan(temp).ExclusiveSum(lane == 0 ? local : 0, prefix);
+        prefix = __shfl_sync(0xffffffffu, prefix, 0);
+        const size_t base = (size_t)row * w.parts * w.width + w.offsets[(size_t)row * (w.parts + 1) + part];
+        for (int tile = start; tile < end; tile += 32) {
+            const int j = first + tile + lane;
+            const bool eligible = tile + lane < length;
+            const float value = eligible ? r.scores[j] : -INFINITY;
+            const bool keep = eligible && V41TopKCoarseKey(value) >= threshold;
+            const unsigned mask = __ballot_sync(0xffffffffu, keep);
+            if (keep) {
+                const int pos = prefix + __popc(mask & ((1u << lane) - 1));
+                w.scores[base + pos] = value; w.indices[base + pos] = j;
+            }
+            prefix += __popc(mask);
+        }
+    }
+    template <bool BATCHED>
+    __global__ void __launch_bounds__(1024) V41TopKGlobalFinish(V41TopKGlobalArgs a, V41TopKWorkspace w) {
+        V41GlobalTopKFallback<BATCHED, 2, 1024>(a, w);
+    }
+    template <bool BATCHED>
+    void V41LaunchGlobalTopK(const V41TopKGlobalArgs &a, V41TopKWorkspace w, int rows) {
+        V41TopKGlobalHistogram<BATCHED><<<dim3(w.parts, rows), 512, 0, cudaStreamPerThread>>>(a, w);
+        V41TopKGlobalThreshold<BATCHED><<<rows, 1024, 0, cudaStreamPerThread>>>(a, w);
+        V41TopKGlobalCollect<BATCHED><<<dim3(w.parts, rows), 256, (size_t)a.listCap * sizeof(int), cudaStreamPerThread>>>(a, w);
+        V41TopKGlobalFinish<BATCHED><<<rows, 1024, 0, cudaStreamPerThread>>>(a, w);
+    }
+
+    // The score producer already has an index-ordered, causal candidate list.
+    // Pack it directly instead of selecting K independently in every shard.
+    // Dense masks and oversized tie sets retain the original hierarchy.
+    __global__ void __launch_bounds__(256) V41TopKCandidateGather(
+        const V41DecodeIndexDescriptor *items, int ratio, int blockSize, int blockShift,
+        int listCap, V41TopKWorkspace w) {
+        const int row = blockIdx.y, part = blockIdx.x;
+        const auto item = items[row];
+        const int visible = min(item.count, (item.position + 1) / ratio);
+        const int blocks = item.candidateCount ? *item.candidateCount : -1;
+        int count = -1;
+        if (blocks >= 0 && item.candidateBlocks && visible > kTopKParallelMinKeys) {
+            count = blocks * blockSize;
+            if (blocks) count -= max(0, (item.candidateBlocks[blocks - 1] + 1) * blockSize - visible);
+            if (count > w.parts * w.width) count = -1;
+        }
+        if (part == 0 && threadIdx.x == 0) w.counts[row] = count;
+        if (count < 0) {
+            V41TopKSelect<true, 1>(nullptr, nullptr, 1, 0, 0, blockSize, blockShift, 0,
+                ratio, 0, listCap, nullptr, items, w);
+            return;
+        }
+        const size_t base = (size_t)row * w.parts * w.width;
+        for (int p = part * w.width + threadIdx.x; p < min(count, (part + 1) * w.width); p += 256) {
+            const int index = item.candidateBlocks[p / blockSize] * blockSize + p % blockSize;
+            w.scores[base + p] = item.scores[index];
+            w.indices[base + p] = index;
+        }
     }
 
     // ---------------- SparseAttention ----------------
@@ -2891,6 +3611,32 @@ namespace {
     };
 
 
+
+    // Two independent stages; probabilities and online-softmax state stay
+    // shared so candidate order, BF16 rounding and MMA accumulation are unchanged.
+    template <int VALUE_SPLITS>
+    struct V41MmaPvPipelineShared {
+        struct Stage {
+            __nv_bfloat16 kvs[kMmaNC][kMmaDim / VALUE_SPLITS + 8];
+            float sc[kMmaHeads][kMmaNC];
+            int valid[kMmaNC];
+        } stages[2];
+        __nv_bfloat16 ps[kMmaHeads][kMmaPStride];
+        float mx[kMmaHeads], lsum[kMmaHeads], alpha[kMmaHeads];
+    };
+
+    __device__ __forceinline__ void V41CopyAsync16(void *dst, const void *src, bool valid) {
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        const uint32_t shared = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+        // Preserve L1 reuse between nearby queries. A zero source size fills
+        // masked slots without dereferencing their candidate address.
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" ::
+            "r"(shared), "l"(src), "r"(valid ? 16 : 0) : "memory");
+    #else
+        *static_cast<float4 *>(dst) = valid ? *static_cast<const float4 *>(src) : make_float4(0,0,0,0);
+    #endif
+    }
+
     struct V41AttentionDescriptor {
         const __nv_bfloat16 *q, *chunkKV, *ringKV, *compressedKV;
         const uint8_t *ringKV8, *compressedKV8;
@@ -2903,8 +3649,15 @@ namespace {
 
     // Independent candidate tiles materialize QK once. The consumer keeps
     // the original 64-slot online softmax and BF16 probability sequence.
-    template<bool BATCHED = false>
-    __global__ void __launch_bounds__(kMmaThreads)
+    constexpr int kQkPrefetchCandidates = 32;
+    struct V41MmaScoresPrefetchShared {
+        __nv_bfloat16 qs[kMmaHeads][kMmaKvStride];
+        __nv_bfloat16 kvs[kQkPrefetchCandidates][kMmaKvStride];
+        float sc[kMmaHeads][kQkPrefetchCandidates];
+    };
+
+    template<bool BATCHED = false, bool PREFETCH = false>
+    __global__ void __launch_bounds__(PREFETCH ? kQkPrefetchCandidates * 4 : kMmaThreads)
     V41SparseAttentionScoresKernel(const __nv_bfloat16 *q, const __nv_bfloat16 *chunkKV, const __nv_bfloat16 *ringKV,
                                 const __nv_bfloat16 *compressedKV, const uint8_t *ringKV8, const uint8_t *compressedKV8,
                                 const int32_t *cmpIdx, int seqlen, int heads,
@@ -2912,18 +3665,26 @@ namespace {
                                 float *scores,
                                 int ringMode, int ringRowBytes, int cmpMode, int cmpRowBytes, int vecUnpack,
                                 const V41AttentionDescriptor *descriptors = nullptr) {
+        constexpr int CANDIDATES = PREFETCH ? kQkPrefetchCandidates : kMmaNC;
+        constexpr int threads = CANDIDATES * 4, warps = CANDIDATES / 8;
+        V41DependencyWait();
+        V41DependencyLaunch();
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
         if constexpr (BATCHED) {
             const auto &d = descriptors[blockIdx.x];
             q=d.q; chunkKV=d.chunkKV; ringKV=d.ringKV; compressedKV=d.compressedKV;
-            ringKV8=d.ringKV8; compressedKV8=d.compressedKV8; cmpIdx=d.indices;
+            cmpIdx=d.indices;
             cap=d.cap; topWidth=d.topWidth; startPos=d.startPos; scores=d.scores;
-            ringMode=d.ringMode; ringRowBytes=d.ringRowBytes; cmpMode=d.cmpMode;
-            cmpRowBytes=d.cmpRowBytes; vecUnpack=d.vecUnpack;
-            if (blockIdx.z >= (windowSize + topWidth + kMmaNC - 1) / kMmaNC) return;
+            if constexpr (!PREFETCH) {
+                ringKV8=d.ringKV8; compressedKV8=d.compressedKV8;
+                ringMode=d.ringMode; ringRowBytes=d.ringRowBytes; cmpMode=d.cmpMode;
+                cmpRowBytes=d.cmpRowBytes; vecUnpack=d.vecUnpack;
+            }
+            if (blockIdx.z >= ((windowSize + topWidth + kMmaNC - 1) / kMmaNC) * (kMmaNC / CANDIDATES)) return;
         }
         extern __shared__ char v41MmaSharedRaw[];
-        V41MmaShared &sh = *reinterpret_cast<V41MmaShared*>(v41MmaSharedRaw);
+        using Shared = typename std::conditional<PREFETCH, V41MmaScoresPrefetchShared, V41MmaShared>::type;
+        Shared &sh = *reinterpret_cast<Shared*>(v41MmaSharedRaw);
 
         const int t = BATCHED ? 0 : blockIdx.x;                       // b * seqlen + i
         const int b = t / seqlen, i = t % seqlen;
@@ -2933,11 +3694,17 @@ namespace {
         const int warp = threadIdx.x >> 5;
         const int lane = threadIdx.x & 31;
 
-        for (int v = threadIdx.x; v < kMmaHeads * (kMmaDim / 8); v += kMmaThreads) {
+        for (int v = threadIdx.x; v < kMmaHeads * (kMmaDim / 8); v += threads) {
             int hh = v / (kMmaDim / 8), dv = v % (kMmaDim / 8);
-            *((float4*)&sh.qs[hh][dv * 8]) = h0 + hh < heads
-                ? *((const float4*)(q + ((uint64_t)t * heads + h0 + hh) * kMmaDim) + dv)
-                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if constexpr (PREFETCH) {
+                const bool valid = h0 + hh < heads;
+                V41CopyAsync16(&sh.qs[hh][dv * 8],
+                    valid ? q + ((uint64_t)t * heads + h0 + hh) * kMmaDim + dv * 8 : q, valid);
+            } else {
+                *((float4*)&sh.qs[hh][dv * 8]) = h0 + hh < heads
+                    ? *((const float4*)(q + ((uint64_t)t * heads + h0 + hh) * kMmaDim) + dv)
+                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
         }
 
         const int winSlots = startPos == 0 ? min(seqlen, windowSize) : windowSize;
@@ -2953,9 +3720,11 @@ namespace {
         const int qkBRow = qkN * 8 + (lane & 7);
         const int qkBColBlk = ((lane >> 3) & 1) * 8;
         const int tile = blockIdx.z;
-        const int tileStart = tile * kMmaNC;
-        __syncthreads();
-        for (int slot = warp; slot < kMmaNC; slot += kMmaWarps) {
+        // The smaller producer tile still writes the original padded
+        // 64-candidate score layout; PV's online softmax is unchanged.
+        const int tileStart = tile * CANDIDATES;
+        if constexpr (!PREFETCH) __syncthreads();
+        for (int slot = warp; slot < CANDIDATES; slot += warps) {
             const int c = tileStart + slot;
             const __nv_bfloat16 *src = nullptr;
             const uint8_t *src8 = nullptr;
@@ -2968,7 +3737,7 @@ namespace {
                         ok = false;
                     } else if (p >= chunkStart) {
                         src = chunkKV + ((uint64_t)b * seqlen + (p - chunkStart)) * kMmaDim;
-                    } else if (ringKV8 != nullptr) {
+                    } else if (!PREFETCH && ringKV8 != nullptr) {
                         src8 = ringKV8 + ((uint64_t)b * windowSize + (p % windowSize)) * ringRowBytes;
                         src8Mode = ringMode;
                     } else {
@@ -2978,7 +3747,7 @@ namespace {
                     int idx = idxRow[c - winSlots];
                     if (idx < 0 || idx >= cap) {
                         ok = false;
-                    } else if (compressedKV8 != nullptr) {
+                    } else if (!PREFETCH && compressedKV8 != nullptr) {
                         src8 = compressedKV8 + ((uint64_t)b * cap + idx) * cmpRowBytes;
                         src8Mode = cmpMode;
                     } else {
@@ -2986,7 +3755,10 @@ namespace {
                     }
                 }
             }
-            if (!ok) {
+            if constexpr (PREFETCH) {
+                for (int v = lane; v < kMmaDim / 8; v += 32)
+                    V41CopyAsync16(&sh.kvs[slot][v * 8], ok ? src + v * 8 : q, ok);
+            } else if (!ok) {
                 for (int v = lane; v < kMmaDim / 8; v += 32) {
                     *((float4*)&sh.kvs[slot][v * 8]) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                 }
@@ -3006,6 +3778,12 @@ namespace {
                     *((float4*)&sh.kvs[slot][v * 8]) = *((const float4*)src + v);
                 }
             }
+        }
+        // Q and KV use disjoint shared storage until this wait and CTA
+        // barrier publish every thread's asynchronous copies to MMA peers.
+        if constexpr (PREFETCH) {
+            asm volatile("cp.async.commit_group;" ::: "memory");
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
         }
         __syncthreads();
 
@@ -3031,16 +3809,16 @@ namespace {
         }
         __syncthreads();
 
-        for (int v = threadIdx.x; v < kMmaHeads * kMmaNC; v += kMmaThreads) {
-            const int row = v / kMmaNC, col = v % kMmaNC;
+        for (int v = threadIdx.x; v < kMmaHeads * CANDIDATES; v += threads) {
+            const int row = v / CANDIDATES, col = v % CANDIDATES;
             if (h0 + row < heads) {
-                scores[(((uint64_t)t * heads + h0 + row) * tilesTotal + tile) * kMmaNC + col] = sh.sc[row][col];
+                scores[((uint64_t)t * heads + h0 + row) * tilesTotal * kMmaNC + tileStart + col] = sh.sc[row][col];
             }
         }
 #endif
     }
 
-    template <int VALUE_SPLITS, bool MATERIALIZED = false, bool BATCHED = false>
+    template <int VALUE_SPLITS, bool MATERIALIZED = false, bool BATCHED = false, bool PIPELINED = false>
     __global__ void __launch_bounds__(kMmaThreads)
     V41SparseAttentionMmaKernel(const __nv_bfloat16 *q, const __nv_bfloat16 *chunkKV, const __nv_bfloat16 *ringKV,
                                 const __nv_bfloat16 *compressedKV, const uint8_t *ringKV8, const uint8_t *compressedKV8,
@@ -3049,6 +3827,8 @@ namespace {
                                 __nv_bfloat16 *out,
                                 int ringMode, int ringRowBytes, int cmpMode, int cmpRowBytes, int vecUnpack,
                                 const float *scores = nullptr, const V41AttentionDescriptor *descriptors = nullptr) {
+        V41DependencyWait();
+        V41DependencyLaunch();
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
         if constexpr (BATCHED) {
             const auto &d = descriptors[blockIdx.x];
@@ -3059,7 +3839,9 @@ namespace {
             cmpRowBytes=d.cmpRowBytes; vecUnpack=d.vecUnpack;
         }
         extern __shared__ char v41MmaSharedRaw[];
-        using Shared = typename std::conditional<MATERIALIZED, V41MmaPvShared<VALUE_SPLITS>, V41MmaShared>::type;
+        using SerialShared = typename std::conditional<MATERIALIZED, V41MmaPvShared<VALUE_SPLITS>, V41MmaShared>::type;
+        using Shared = typename std::conditional<PIPELINED, V41MmaPvPipelineShared<VALUE_SPLITS>, SerialShared>::type;
+        static_assert(!PIPELINED || MATERIALIZED, "Pipeline requires materialized QK");
         Shared &sh = *reinterpret_cast<Shared*>(v41MmaSharedRaw);
 
         const int t = BATCHED ? 0 : blockIdx.x;                       // b * seqlen + i
@@ -3116,10 +3898,56 @@ namespace {
         const int pvAColBlk = (lane >> 4) * 8;
         const int pvBRow = lane & 15;
 
+        auto preload = [&](int tileIndex) {
+            if constexpr (PIPELINED) {
+                auto &dst = sh.stages[tileIndex & 1];
+                for (int item = threadIdx.x; item < kMmaNC * (loadDim / 16); item += kMmaThreads) {
+                    const int slot = item / (loadDim / 16), vector = item % (loadDim / 16);
+                    const int c = tileIndex * kMmaNC + slot;
+                    const __nv_bfloat16 *src = chunkKV;
+                    bool ok = c < totalCand;
+                    if (ok) {
+                        if (c < winSlots) {
+                            const int p = winStart + c;
+                            ok = p >= 0 && p <= pos;
+                            if (ok) src = p >= chunkStart ?
+                                chunkKV + ((uint64_t)b * seqlen + p - chunkStart) * kMmaDim :
+                                ringKV + ((uint64_t)b * windowSize + p % windowSize) * kMmaDim;
+                        } else {
+                            const int idx = idxRow[c - winSlots];
+                            ok = idx >= 0 && idx < cap;
+                            if (ok) src = compressedKV + ((uint64_t)b * cap + idx) * kMmaDim;
+                        }
+                    }
+                    V41CopyAsync16(&dst.kvs[slot][vector * 16], src + loadBase + vector * 16, ok);
+                    V41CopyAsync16(&dst.kvs[slot][vector * 16 + 8], src + loadBase + vector * 16 + 8, ok);
+                    if (vector == 0) dst.valid[slot] = ok;
+                }
+                for (int item = threadIdx.x; item < kMmaHeads * kMmaNC / 4; item += kMmaThreads) {
+                    const int row = item / (kMmaNC / 4), col = item % (kMmaNC / 4) * 4;
+                    const bool valid = h0 + row < heads;
+                    const float *src = valid ?
+                        scores + (((uint64_t)t * heads + h0 + row) * tilesTotal + tileIndex) * kMmaNC + col : scores;
+                    V41CopyAsync16(&dst.sc[row][col], src, valid);
+                }
+                asm volatile("cp.async.commit_group;" ::: "memory");
+            }
+        };
+        if constexpr (PIPELINED) preload(0);
+
         for (int tile = 0; tile < tilesTotal; tile++) {
+            auto &tileData = [&]() -> auto & {
+                if constexpr (PIPELINED) return sh.stages[tile & 1];
+                else return sh;
+            }();
             const int tileStart = tile * kMmaNC;
+            // wait_group completes each thread's copies; the CTA barrier
+            // publishes them to peers and retires reads of the previous stage.
+            if constexpr (PIPELINED) asm volatile("cp.async.wait_group 0;" ::: "memory");
             __syncthreads();
-            if constexpr (MATERIALIZED) {
+            if constexpr (PIPELINED) {
+                if (tile + 1 < tilesTotal) preload(tile + 1);
+            } else if constexpr (MATERIALIZED) {
                 // Distribute short value slices across threads, instead of
                 // reserving a mostly idle warp for each candidate. This only
                 // changes loads; probability rounding and PV order stay intact.
@@ -3155,7 +3983,7 @@ namespace {
                         }
                     }
                 }
-                __nv_bfloat16 *dst = &sh.kvs[slot][vector * 16];
+                __nv_bfloat16 *dst = &tileData.kvs[slot][vector * 16];
                 if (!ok) {
                     ((float4*)dst)[0] = make_float4(0.f,0.f,0.f,0.f);
                     ((float4*)dst)[1] = make_float4(0.f,0.f,0.f,0.f);
@@ -3172,7 +4000,7 @@ namespace {
                     ((float4*)dst)[0] = ((const float4*)(src+loadBase+vector*16))[0];
                     ((float4*)dst)[1] = ((const float4*)(src+loadBase+vector*16))[1];
                 }
-                if (vector == 0) sh.valid[slot] = ok ? 1 : 0;
+                if (vector == 0) tileData.valid[slot] = ok ? 1 : 0;
             }
             } else {
             for (int slot = warp; slot < kMmaNC; slot += kMmaWarps) {
@@ -3208,35 +4036,37 @@ namespace {
                 }
                 if (!ok) {
                     for (int v = lane; v < loadDim / 8; v += 32) {
-                        *((float4*)&sh.kvs[slot][v * 8]) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                        *((float4*)&tileData.kvs[slot][v * 8]) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                     }
                 } else if (src8 != nullptr) {
                     // 就地解到 BF16 片段再进 mma；FP4 的值在 BF16 上是精确的
                     if (vecUnpack) {
                         // Decode only the current output slice in 16-value groups.
                         for (int v = lane; v < loadDim / 16; v += 32)
-                            V41LoadKvRow16Bf16(src8, kMmaDim, loadBase + v * 16, src8Mode, &sh.kvs[slot][v * 16]);
+                            V41LoadKvRow16Bf16(src8, kMmaDim, loadBase + v * 16, src8Mode, &tileData.kvs[slot][v * 16]);
                     } else {
                         for (int d = lane; d < loadDim; d += 32) {
-                            sh.kvs[slot][d] = __float2bfloat16_rn(V41LoadKvRow(src8, kMmaDim, loadBase + d, src8Mode));
+                            tileData.kvs[slot][d] = __float2bfloat16_rn(V41LoadKvRow(src8, kMmaDim, loadBase + d, src8Mode));
                         }
                     }
                 } else {
                     for (int v = lane; v < loadDim / 8; v += 32) {
-                        *((float4*)&sh.kvs[slot][v * 8]) = *((const float4*)(src + loadBase) + v);
+                        *((float4*)&tileData.kvs[slot][v * 8]) = *((const float4*)(src + loadBase) + v);
                     }
                 }
                 if (lane == 0) {
-                    sh.valid[slot] = ok ? 1 : 0;
+                    tileData.valid[slot] = ok ? 1 : 0;
                 }
             }
             }
-            __syncthreads();
+            if constexpr (!PIPELINED) __syncthreads();
 
-            if constexpr (MATERIALIZED) {
+            if constexpr (PIPELINED) {
+                // Both stage buffers were made visible by the wait + CTA barrier above.
+            } else if constexpr (MATERIALIZED) {
                 for (int v = threadIdx.x; v < kMmaHeads * kMmaNC; v += kMmaThreads) {
                     const int row = v / kMmaNC, col = v % kMmaNC;
-                    sh.sc[row][col] = h0 + row < heads
+                    tileData.sc[row][col] = h0 + row < heads
                         ? scores[(((uint64_t)t * heads + h0 + row) * tilesTotal + tile) * kMmaNC + col]
                         : 0.0f;
                 }
@@ -3249,18 +4079,18 @@ namespace {
     #pragma unroll 2
                     for (int k = 0; k < kMmaDim; k += 32) {
                         V41LdmX4(a, &sh.qs[qkARow][k + qkAColBlk]);
-                        V41LdmX2(bb, &sh.kvs[qkBRow][k + qkBColBlk]);
+                        V41LdmX2(bb, &tileData.kvs[qkBRow][k + qkBColBlk]);
                         V41MmaBf16(d0, a, bb);
                         V41LdmX4(a, &sh.qs[qkARow][k + 16 + qkAColBlk]);
-                        V41LdmX2(bb, &sh.kvs[qkBRow][k + 16 + qkBColBlk]);
+                        V41LdmX2(bb, &tileData.kvs[qkBRow][k + 16 + qkBColBlk]);
                         V41MmaBf16(d1, a, bb);
                     }
                     const int r = qkM * 16 + (lane >> 2);
                     const int c = qkN * 8 + (lane & 3) * 2;
-                    sh.sc[r][c] = d0[0] + d1[0];
-                    sh.sc[r][c + 1] = d0[1] + d1[1];
-                    sh.sc[r + 8][c] = d0[2] + d1[2];
-                    sh.sc[r + 8][c + 1] = d0[3] + d1[3];
+                    tileData.sc[r][c] = d0[0] + d1[0];
+                    tileData.sc[r][c + 1] = d0[1] + d1[1];
+                    tileData.sc[r + 8][c] = d0[2] + d1[2];
+                    tileData.sc[r + 8][c + 1] = d0[3] + d1[3];
                 }
                 __syncthreads();
 
@@ -3275,8 +4105,8 @@ namespace {
 #pragma unroll
                 for (int c = 0; c < perThread; c++) {
                     int col = sub * perThread + c;
-                    bool ok = sh.valid[col] != 0;
-                    float v = ok ? sh.sc[row][col] * scale : -FLT_MAX;
+                    bool ok = tileData.valid[col] != 0;
+                    float v = ok ? tileData.sc[row][col] * scale : -FLT_MAX;
                     oks[c] = ok;
                     vals[c] = v;
                     m = fmaxf(m, v);
@@ -3298,7 +4128,9 @@ namespace {
                 s += __shfl_xor_sync(0xffffffff, s, 2);
                 s += __shfl_xor_sync(0xffffffff, s, 4);
                 s += __shfl_xor_sync(0xffffffff, s, 8);
-                // Finish every lane's oldMx read before the owner updates it.
+                // Every lane must finish reading the previous maximum before
+                // lane 0 overwrites it; shuffle synchronization is not a
+                // shared-memory barrier under independent thread scheduling.
                 __syncwarp();
                 if (sub == 0) {
                     float a = __expf(oldMx - newMx);
@@ -3326,7 +4158,7 @@ namespace {
 #pragma unroll
                     for (int n = 0; n < kMmaPvTiles; n++) {
                         uint32_t bb[2];
-                        V41LdmX2T(bb, &sh.kvs[k + pvBRow][(MATERIALIZED ? 0 : valueBase) + pvSlice * kMmaDimSlice + n * 8]);
+                        V41LdmX2T(bb, &tileData.kvs[k + pvBRow][(MATERIALIZED ? 0 : valueBase) + pvSlice * kMmaDimSlice + n * 8]);
                         V41MmaBf16(acc[n], a, bb);
                     }
                 }
@@ -3422,6 +4254,43 @@ namespace {
     }
 
     bool V41IsSm75() { return V41IsSm<7, 5>(); }
+    template <auto Kernel, typename... Args>
+    bool V41LaunchDependent(dim3 grid, dim3 block, size_t shared, Args... args) {
+#if CUDART_VERSION >= 12000
+        static thread_local int capable[16] = {};
+        const int device = FastllmCudaGetDevice();
+        bool pdl = false;
+        if (device >= 0 && device < 16) {
+            if (!capable[device]) {
+                int major = 0; cudaFuncAttributes attr{};
+                const bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+                    cudaFuncGetAttributes(&attr, Kernel) == cudaSuccess;
+                capable[device] = ok && major >= 9 && attr.binaryVersion >= 90 && attr.ptxVersion >= 90 ? 1 : -1;
+            }
+            pdl = capable[device] == 1;
+        }
+        if (!pdl) {
+            Kernel<<<grid, block, shared, cudaStreamPerThread>>>(args...);
+            return cudaPeekAtLastError() == cudaSuccess;
+        }
+        cudaLaunchConfig_t cfg{}; cfg.gridDim = grid; cfg.blockDim = block;
+        cfg.dynamicSmemBytes = shared; cfg.stream = cudaStreamPerThread;
+        cudaLaunchAttribute attr{}; attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr.val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = &attr; cfg.numAttrs = pdl ? 1 : 0;
+        const auto status = cudaLaunchKernelEx(&cfg, Kernel, args...);
+        if (status != cudaSuccess) {
+            FastllmCudaSetThreadError();
+            fprintf(stderr, "[Fastllm] V4.1 dependent launch failed: %s\n", cudaGetErrorString(status));
+            return false;
+        }
+        return true;
+#else
+        Kernel<<<grid, block, shared, cudaStreamPerThread>>>(args...);
+        return cudaPeekAtLastError() == cudaSuccess;
+#endif
+    }
+
 
     void V41LaunchHcDecodeDots(const __nv_bfloat16 *x, const float *fn,
                               int tokens, int flatDim, float *mix) {
@@ -3529,7 +4398,7 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
     // Match FastllmRMSNormKernelInner1<512>: pairwise loading, FMA order,
     // shuffle-down tree, and BF16 output rounding. Q quantization consumes that
     // rounded value, never the unrounded FP32 expression.
-    template <int CACHE_PAIRS = 0>
+    template <int CACHE_PAIRS = 0, bool QUANTIZE_QUERY = true>
     __global__ void V41QKVNormQuantKernel(const __nv_bfloat16 *q, const __nv_bfloat16 *kv,
             const float *qw, const float *kw, __nv_bfloat16 *qn, __nv_bfloat16 *qq,
             __nv_bfloat16 *kn, int qdim, int kdim, int qStride, int kStride, float eps) {
@@ -3573,7 +4442,7 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
                 v.y = __float2bfloat16_rn(__bfloat162float(v.y) * s * w.y);
                 output[i] = v;
             }
-            if (query) {
+            if (query && QUANTIZE_QUERY) {
                 float maximum = fmaxf(fabsf(__bfloat162float(v.x)), fabsf(__bfloat162float(v.y)));
                 // Sixteen lanes hold one contiguous 32-element quantization block.
                 for (int offset = 8; offset; offset >>= 1)
@@ -3582,6 +4451,56 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
                 v.x = __float2bfloat16_rn(V41QuantValueDev(__bfloat162float(v.x), qs, 1));
                 v.y = __float2bfloat16_rn(V41QuantValueDev(__bfloat162float(v.y), qs, 1));
                 if (i < dim / 2) reinterpret_cast<__nv_bfloat162 *>(qq)[(size_t)token * (dim / 2) + i] = v;
+            }
+        }
+    }
+
+    // Two physical warps groups reproduce all sixteen logical warp sums in
+    // the existing order, with fewer idle threads for the short KV row.
+    __global__ void V41QKVNormPackedBf16Kernel(const __nv_bfloat16 *qkv,
+            const float *qw, const float *kw, __nv_bfloat16 *qn, __nv_bfloat16 *kn,
+            int qdim, int kdim, float eps) {
+        V41DependencyWait(); V41DependencyLaunch();
+        const bool query = !(blockIdx.x & 1);
+        const int token = blockIdx.x / 2, dim = query ? qdim : kdim;
+        const auto *input = reinterpret_cast<const __nv_bfloat162*>(qkv + token * (qdim + kdim) + (query ? 0 : qdim));
+        auto *output = reinterpret_cast<__nv_bfloat162*>(query ? qn : kn) + token * (dim / 2);
+        const float *weight = query ? qw : kw;
+        const int tid = threadIdx.x, lane = tid & 31;
+        __shared__ float warpSums[16];
+        __nv_bfloat162 values[2][2]; float2 weights[2][2];
+        float sums[2] = {};
+#pragma unroll
+        for (int v = 0; v < 2; ++v) {
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int at = tid + v * 256 + i * 512;
+                if (at < dim / 2) {
+                    const auto value = input[at]; values[v][i] = value;
+                    weights[v][i] = make_float2(weight[2 * at], weight[2 * at + 1]);
+                    const float lo = __bfloat162float(value.x), hi = __bfloat162float(value.y);
+                    sums[v] += lo * lo + hi * hi;
+                }
+            }
+            for (int offset = 16; offset; offset >>= 1)
+                sums[v] += __shfl_down_sync(0xffffffff, sums[v], offset);
+            if (!lane) warpSums[v * 8 + tid / 32] = sums[v];
+        }
+        __syncthreads();
+        float sum = lane < 16 ? warpSums[lane] : 0.f;
+        for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffff, sum, offset);
+        const float scale = rsqrtf(__shfl_sync(0xffffffff, sum, 0) / dim + eps);
+#pragma unroll
+        for (int v = 0; v < 2; ++v) {
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int at = tid + v * 256 + i * 512;
+                if (at < dim / 2) {
+                    auto value = values[v][i]; const auto w = weights[v][i];
+                    value.x = __float2bfloat16_rn(__bfloat162float(value.x) * scale * w.x);
+                    value.y = __float2bfloat16_rn(__bfloat162float(value.y) * scale * w.y);
+                    output[at] = value;
+                }
             }
         }
     }
@@ -3754,8 +4673,8 @@ bool FastllmCudaDeepSeekV41SharedSwigluQuantized(const fastllm::Data &input, flo
     return V41RunSharedSwiglu<true>(input, limit, output, routeScales);
 }
 
-extern "C" bool FastllmCudaV41QKVNormQuantPacked(const Data &qkv,
-        const Data &qw, const Data &kw, float eps, Data &qn, Data &qq, Data &kn) {
+extern "C" bool FastllmCudaV41QKVNormPacked(const Data &qkv,
+        const Data &qw, const Data &kw, float eps, Data &qn, Data &kn, Data *qq) {
     const int device = FastllmCudaGetDevice();
     auto local = [device](const Data &d) {
         return V41OnCuda(d) && !d.multiDeviceData &&
@@ -3776,33 +4695,49 @@ extern "C" bool FastllmCudaV41QKVNormQuantPacked(const Data &qkv,
     const int qdim = qCount, kdim = kCount, stride = qdim + kdim;
     if (qkv.dims.back() != stride || (uintptr_t)qkv.cudaData % 4) return false;
     const uint64_t tokens = qkv.Count(0) / stride;
-    if (!tokens || tokens > 8 || &qn == &qq || &qn == &kn || &qq == &kn) return false;
+    if (!tokens || tokens > 8 || &qn == qq || &qn == &kn || qq == &kn) return false;
     auto overlaps = [](const void *a, size_t na, const void *b, size_t nb) {
         const uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
         return a && b && (x <= y ? y - x < na : x - y < nb);
     };
-    for (Data *out : {&qn, &qq, &kn}) {
+    for (Data *out : {&qn, qq, &kn}) {
+        if (!out) continue;
         const size_t bytes = tokens * (out == &kn ? kdim : qdim) * 2;
         if ((uintptr_t)out->cudaData % 4) return false;
         for (const Data *src : {&qkv, &qw, &kw})
             if (out == src || overlaps(out->cudaData, bytes, src->cudaData, src->GetBytes())) return false;
     }
     const size_t qb = tokens * qdim * 2, kb = tokens * kdim * 2;
-    if (overlaps(qn.cudaData, qb, qq.cudaData, qb) || overlaps(qn.cudaData, qb, kn.cudaData, kb) ||
-        overlaps(qq.cudaData, qb, kn.cudaData, kb)) return false;
+    if (overlaps(qn.cudaData, qb, kn.cudaData, kb) || (qq &&
+        (overlaps(qn.cudaData, qb, qq->cudaData, qb) ||
+         overlaps(qq->cudaData, qb, kn.cudaData, kb)))) return false;
     auto qdims = qkv.dims, kdims = qkv.dims;
     qdims.back() = qdim; kdims.back() = kdim;
     if (!V41PrepareOutput(qn, DataType::BFLOAT16, qdims) ||
-        !V41PrepareOutput(qq, DataType::BFLOAT16, qdims) ||
+        (qq && !V41PrepareOutput(*qq, DataType::BFLOAT16, qdims)) ||
         !V41PrepareOutput(kn, DataType::BFLOAT16, kdims)) return false;
-#define V41_PACKED_NORM(C) V41QKVNormQuantKernel<C><<<tokens * 2, 512>>>( \
+    if (!qq && qdim <= 2048 && kdim <= 2048) {
+        if (!V41LaunchDependent<V41QKVNormPackedBf16Kernel>(tokens * 2, 256, 0,
+            (const __nv_bfloat16*)qkv.cudaData, (const float*)qw.cudaData, (const float*)kw.cudaData,
+            (__nv_bfloat16*)qn.cudaData, (__nv_bfloat16*)kn.cudaData, qdim, kdim, eps)) return false;
+        return V41CheckLaunch("QKVNormPackedBf16");
+    }
+#define V41_PACKED_NORM(C, Q) V41QKVNormQuantKernel<C, Q><<<tokens * 2, 512>>>( \
         (const __nv_bfloat16*)qkv.cudaData, (const __nv_bfloat16*)qkv.cudaData + qdim, \
         (const float*)qw.cudaData, (const float*)kw.cudaData, (__nv_bfloat16*)qn.cudaData, \
-        (__nv_bfloat16*)qq.cudaData, (__nv_bfloat16*)kn.cudaData, qdim, kdim, stride, stride, eps)
-    if (qdim <= 2048 && kdim <= 2048) V41_PACKED_NORM(2);
-    else V41_PACKED_NORM(0);
+        Q ? (__nv_bfloat16*)qq->cudaData : nullptr, (__nv_bfloat16*)kn.cudaData, qdim, kdim, stride, stride, eps)
+    if (qdim <= 2048 && kdim <= 2048) {
+        if (qq) V41_PACKED_NORM(2, true); else V41_PACKED_NORM(2, false);
+    } else {
+        if (qq) V41_PACKED_NORM(0, true); else V41_PACKED_NORM(0, false);
+    }
 #undef V41_PACKED_NORM
     return V41CheckLaunch("QKVNormQuantPacked");
+}
+
+extern "C" bool FastllmCudaV41QKVNormQuantPacked(const Data &qkv,
+        const Data &qw, const Data &kw, float eps, Data &qn, Data &qq, Data &kn) {
+    return FastllmCudaV41QKVNormPacked(qkv, qw, kw, eps, qn, kn, &qq);
 }
 
 extern "C" bool FastllmCudaV41QKVNormQuant(const Data &q, const Data &kv,
@@ -3856,6 +4791,92 @@ extern "C" bool FastllmCudaV41QKVNormQuant(const Data &q, const Data &kv,
     return V41CheckLaunch("QKVNormQuant");
 }
 
+extern "C" bool FastllmCudaV41RouterSelectTopK(const Data &input, Data &weight,
+        Data &bias, float temperature, float routeScale, Data &logits,
+        Data &indices, Data &scores, int topk) {
+#ifdef CUDA_NO_TENSOR_CORE
+    return false;
+#else
+    if (!V41OnCuda(input) || input.multiDeviceData || weight.multiDeviceData || bias.multiDeviceData ||
+        input.dataType != DataType::BFLOAT16 || weight.dataType != DataType::FLOAT32 ||
+        bias.dataType != DataType::FLOAT32 || input.dims.empty() || input.dims.back() <= 0 ||
+        weight.dims.size() != 2 || !((weight.dims[0] == 384 && topk == 6) || (weight.dims[0] == 128 && topk == 3)) || weight.dims[1] != input.dims.back() ||
+        weight.dims[1] % 128 || bias.Count(0) != (uint64_t)weight.dims[0] || !std::isfinite(temperature) || temperature <= 0 ||
+        &input == &logits || &input == &indices || &input == &scores || &weight == &logits ||
+        &bias == &logits || &weight == &indices || &weight == &scores ||
+        &bias == &indices || &bias == &scores || &logits == &indices || &logits == &scores || &indices == &scores) return false;
+    const int experts = weight.dims[0];
+    const int rows = input.Count(0) / input.dims.back();
+    const int arch = FastllmCudaRuntimeArch();
+    if (rows < 5 || rows > 8 || arch < 80) return false;
+    const int device = FastllmCudaGetDevice();
+    if (input.dataDeviceIds.empty() || input.dataDeviceIds.front() != device) return false;
+    weight.ToDevice(DataDevice::CUDA, {device}, true);
+    Data *compact = FastllmCudaExactRouterBFloat16Weight(weight);
+    if (!compact) return false;
+    bias.ToDevice(DataDevice::CUDA, {device}, true);
+    auto dims = input.dims; dims.back() = experts;
+    if (!V41PrepareOutput(logits, DataType::FLOAT32, dims) ||
+        !V41PrepareOutput(indices, DataType::INT32, {rows, topk}) ||
+        !V41PrepareOutput(scores, DataType::FLOAT32, {rows, topk})) return false;
+    // Inspect the compile target as well as hardware: a compute_75/80 PTX
+    // fallback lacks the Tensor Core / SM90 instructions of newer targets.
+    static thread_local std::map<int, int> compiledTargets;
+    auto target = compiledTargets.find(device);
+    if (target == compiledTargets.end()) {
+        if (FastllmCudaGraphIsCapturingFast()) return false;
+        cudaFuncAttributes attrs = {};
+        if (cudaFuncGetAttributes(&attrs, V41TcRouterPipeline<8,8,640,1,true>) != cudaSuccess) return false;
+        target = compiledTargets.emplace(device, attrs.ptxVersion).first;
+    }
+    if (target->second < 80) return false;
+    const bool pdl = arch >= 90 && target->second >= 90;
+    const bool cluster = pdl && arch < 100 && weight.dims[1] == 5120;
+    float *partial = nullptr;
+    if (!cluster) {
+        static thread_local std::map<int, std::unique_ptr<Data>> scratch;
+        auto found = scratch.find(device);
+        if (found == scratch.end()) {
+            if (FastllmCudaGraphIsCapturingFast()) return false;
+            auto buffer = std::make_unique<Data>(DataType::FLOAT32, std::vector<int>{16, 8, 384});
+            buffer->ToDevice(DataDevice::CUDA, {device}, false); buffer->Allocate(false);
+            found = scratch.emplace(device, std::move(buffer)).first;
+        }
+        partial = (float*)found->second->cudaData;
+    }
+    const float invTemp = fabsf(temperature - 1.f) > 1e-6f ? 1.f / temperature : 1.f;
+    cudaError_t status;
+    if (cluster) status = V41TcLaunchPipeline<8,8,640,1,true>(
+        (const __nv_bfloat16*)input.cudaData, (const __nv_bfloat16*)compact->cudaData,
+        partial, (float*)logits.cudaData, rows, experts, weight.dims[1], invTemp, cudaStreamPerThread, pdl);
+    else status = V41TcLaunchPipeline<4,16,128,2,false>(
+        (const __nv_bfloat16*)input.cudaData, (const __nv_bfloat16*)compact->cudaData,
+        partial, (float*)logits.cudaData, rows, experts, weight.dims[1], invTemp, cudaStreamPerThread, pdl);
+    if (status != cudaSuccess) { cudaGetLastError(); return false; }
+    auto select = topk == 3 ? V41TcRouterTopK<128, 3> : V41TcRouterTopK<384, 6>;
+#if CUDART_VERSION >= 12000
+    cudaLaunchConfig_t cfg = {}; cfg.gridDim = rows; cfg.blockDim = 32; cfg.stream = cudaStreamPerThread;
+    cudaLaunchAttribute attr = {}; attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1; cfg.attrs = &attr; cfg.numAttrs = pdl ? 1 : 0;
+    status = cudaLaunchKernelEx(&cfg, select, (const float*)logits.cudaData,
+        (const float*)bias.cudaData, (int*)indices.cudaData, (float*)scores.cudaData, routeScale);
+    if (status != cudaSuccess) { cudaGetLastError(); return false; }
+    return V41CheckLaunch("RouterTopK");
+#else
+    select<<<rows,32,0,cudaStreamPerThread>>>((const float*)logits.cudaData,
+        (const float*)bias.cudaData, (int*)indices.cudaData, (float*)scores.cudaData, routeScale);
+    return V41CheckLaunch("RouterTopK");
+#endif
+#endif
+}
+
+extern "C" bool FastllmCudaV41RouterSelect(const Data &input, Data &weight,
+        Data &bias, float temperature, float routeScale, Data &logits,
+        Data &indices, Data &scores) {
+    return FastllmCudaV41RouterSelectTopK(input, weight, bias, temperature, routeScale,
+                                       logits, indices, scores, 6);
+}
+
 extern "C" bool FastllmCudaV41RouterScores(const Data &input, Data &weight,
                                             float temperature, Data &scores) {
     if (!V41OnCuda(input) || input.multiDeviceData || weight.multiDeviceData ||
@@ -3869,9 +4890,33 @@ extern "C" bool FastllmCudaV41RouterScores(const Data &input, Data &weight,
     dims.back() = weight.dims[0];
     if (!V41PrepareOutput(scores, DataType::FLOAT32, dims)) return false;
     const float invTemp = fabsf(temperature - 1.0f) > 1e-6f ? 1.0f / temperature : 1.0f;
-    V41RouterScoresKernel<<<dim3(weight.dims[0], input.Count(0) / input.dims.back()), 256>>>(
-        (const __nv_bfloat16 *)input.cudaData, (const float *)weight.cudaData,
-        (float *)scores.cudaData, weight.dims[1], weight.dims[0], invTemp);
+    const int rows = input.Count(0) / input.dims.back();
+    if (rows >= 2 && weight.dims[0] >= 256 && weight.dims[1] >= 1024) {
+        const int arch = FastllmCudaRuntimeArch();
+        const bool streaming = arch >= 90 && arch < 100;
+#define V41_ROUTER_ROWS(M) case M: \
+        if (streaming) V41RouterScoresRowsKernel<M, true><<<weight.dims[0], 256>>>( \
+            (const __nv_bfloat16*)input.cudaData, (const float*)weight.cudaData, \
+            (float*)scores.cudaData, weight.dims[0], weight.dims[1], invTemp); \
+        else V41RouterScoresRowsKernel<M, false><<<weight.dims[0], 256>>>( \
+            (const __nv_bfloat16*)input.cudaData, (const float*)weight.cudaData, \
+            (float*)scores.cudaData, weight.dims[0], weight.dims[1], invTemp); \
+        break
+        switch (rows) {
+            V41_ROUTER_ROWS(2); V41_ROUTER_ROWS(3); V41_ROUTER_ROWS(4);
+            V41_ROUTER_ROWS(5); V41_ROUTER_ROWS(6); V41_ROUTER_ROWS(7); V41_ROUTER_ROWS(8);
+        }
+#undef V41_ROUTER_ROWS
+        return V41CheckLaunch("RouterScoresRows");
+    }
+    if (rows == 1)
+        V41RouterScoresKernel<1><<<dim3(weight.dims[0],rows),256>>>(
+            (const __nv_bfloat16 *)input.cudaData,(const float *)weight.cudaData,
+            (float *)scores.cudaData,weight.dims[1],weight.dims[0],invTemp,rows);
+    else
+        V41RouterScoresKernel<2><<<dim3(weight.dims[0],(rows+1)/2),256>>>(
+            (const __nv_bfloat16 *)input.cudaData,(const float *)weight.cudaData,
+            (float *)scores.cudaData,weight.dims[1],weight.dims[0],invTemp,rows);
     return V41CheckLaunch("RouterScores");
 }
 
@@ -3914,6 +4959,100 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &pr
     else { if (quantizedOutput) V41_MIX_NORM(4, true); else V41_MIX_NORM(4, false); }
 #undef V41_MIX_NORM
     return V41CheckLaunch("HcMixPreNorm");
+}
+
+// Fused attention post + next mHC projection, followed by the existing
+// delayed-pre normalization. Rejection is side-effect free for input tensors.
+static bool V41HcPostMixPreNormImpl(const Data &input, const Data &residual,
+        const Data &previousPre, const Data &previousPost, const Data &previousComb,
+        const Data &fn, const Data &scale, const Data &base, const Data &normWeight,
+        int sinkhornIters, float mixEps, float normEps, Data &hidden,
+        Data &pre, Data &post, Data &comb, Data &output, Data *quantizedOutput) {
+    if (residual.dataType != DataType::BFLOAT16 || residual.dims.size() != 4 ||
+        residual.dims[2] != 4 || residual.dims[0] <= 0 || residual.dims[1] <= 0) return false;
+    const int64_t tokens64 = (int64_t)residual.dims[0] * residual.dims[1];
+    const int d = residual.dims[3];
+    if (tokens64 < 2 || tokens64 > 8 || d < 4096 || d > 8192 || d % 1024) return false;
+    const int tokens = (int)tokens64, b = residual.dims[0], n = residual.dims[1];
+    const Data *inputs[] = {&input, &residual, &previousPre, &previousPost, &previousComb,
+                           &fn, &scale, &base, &normWeight};
+    const std::vector<int> device{FastllmCudaGetDevice()};
+    for (const Data *v : inputs) {
+        if (!V41OnCuda(*v) || v->multiDeviceData || v->dataDeviceIds != device ||
+            v->dataType != (v == &input || v == &residual ? DataType::BFLOAT16 : DataType::FLOAT32))
+            return false;
+    }
+    if (input.Count(0) != (uint64_t)tokens * d || previousPre.Count(0) != tokens * 4 ||
+        previousPost.Count(0) != tokens * 4 || previousComb.Count(0) != tokens * 16 ||
+        fn.Count(0) != (uint64_t)24 * 4 * d || scale.Count(0) != 3 ||
+        base.Count(0) != 24 || normWeight.Count(0) != d) return false;
+    Data *outputs[] = {&hidden, &pre, &post, &comb, &output, quantizedOutput};
+    for (int i = 0; i < (quantizedOutput ? 6 : 5); ++i) {
+        const Data *out = outputs[i];
+        if (out->multiDeviceData || out->isFake) return false;
+        for (const Data *in : inputs)
+            if (out == in || (out->cudaData && out->cudaData == in->cudaData)) return false;
+        for (int j = 0; j < i; ++j)
+            if (out == outputs[j] || (out->cudaData && out->cudaData == outputs[j]->cudaData)) return false;
+    }
+    Data scratch;
+    if (!V41PrepareOutput(hidden, DataType::BFLOAT16, residual.dims) ||
+        !V41PrepareOutput(scratch, DataType::FLOAT32, {tokens, 8, 25}) ||
+        !V41PrepareOutput(pre, DataType::FLOAT32, {b, n, 4}) ||
+        !V41PrepareOutput(post, DataType::FLOAT32, {b, n, 4}) ||
+        !V41PrepareOutput(comb, DataType::FLOAT32, {b, n, 4, 4}) ||
+        !V41PrepareOutput(output, DataType::BFLOAT16, {b, n, d})) return false;
+    if (quantizedOutput && !V41PrepareOutput(*quantizedOutput, DataType::BFLOAT16, {b, n, d})) return false;
+#define V41_POST_DOTS_ONE(D, O) if (!V41LaunchDependent<V41HcPostWarpDots<D, O>>(dim3((25 + O - 1) / O, tokens, 8), 32, 0, \
+        (const __nv_bfloat16*)input.cudaData, (const __nv_bfloat16*)residual.cudaData, \
+        (const float*)previousPost.cudaData, (const float*)previousComb.cudaData, \
+        (const float*)fn.cudaData, (__nv_bfloat16*)hidden.cudaData, (float*)scratch.cudaData)) return false
+#define V41_POST_DOTS(D) case D: \
+        if (tokens <= 6) { V41_POST_DOTS_ONE(D, 2); } \
+        else { V41_POST_DOTS_ONE(D, 4); } break
+    switch (d) {
+        V41_POST_DOTS(4096); V41_POST_DOTS(5120); V41_POST_DOTS(6144);
+        V41_POST_DOTS(7168); V41_POST_DOTS(8192);
+    }
+#undef V41_POST_DOTS
+#undef V41_POST_DOTS_ONE
+#define V41_POST_FINISH(I, Q) if (!V41LaunchDependent<V41HcPreNormKernel<1024, I, true, Q, 8>>(tokens * 2, 1024, 0, \
+        (const __nv_bfloat16*)hidden.cudaData, (const float*)previousPre.cudaData, \
+        (const float*)normWeight.cudaData, (__nv_bfloat16*)output.cudaData, 4, d, normEps, \
+        (const float*)scratch.cudaData, (const float*)scale.cudaData, (const float*)base.cudaData, \
+        sinkhornIters, mixEps, (float*)post.cudaData, (float*)comb.cudaData, (float*)pre.cudaData, Q ? (__nv_bfloat16*)quantizedOutput->cudaData : nullptr)) return false
+    if (d <= 4096) {
+        if (quantizedOutput) { V41_POST_FINISH(2, true); }
+        else { V41_POST_FINISH(2, false); }
+    } else if (d <= 6144) {
+        if (quantizedOutput) { V41_POST_FINISH(3, true); }
+        else { V41_POST_FINISH(3, false); }
+    } else {
+        if (quantizedOutput) { V41_POST_FINISH(4, true); }
+        else { V41_POST_FINISH(4, false); }
+    }
+#undef V41_POST_FINISH
+    return V41CheckLaunch("HcPostMixPreNorm");
+}
+
+extern "C" bool FastllmCudaDeepSeekV41HcPostMixPreNorm(const Data &input, const Data &residual,
+        const Data &previousPre, const Data &previousPost, const Data &previousComb,
+        const Data &fn, const Data &scale, const Data &base, const Data &normWeight,
+        int sinkhornIters, float mixEps, float normEps, Data &hidden,
+        Data &pre, Data &post, Data &comb, Data &output) {
+    return V41HcPostMixPreNormImpl(input, residual, previousPre, previousPost, previousComb,
+        fn, scale, base, normWeight, sinkhornIters, mixEps, normEps,
+        hidden, pre, post, comb, output, nullptr);
+}
+
+extern "C" bool FastllmCudaDeepSeekV41HcPostMixPreNormQuantized(const Data &input, const Data &residual,
+        const Data &previousPre, const Data &previousPost, const Data &previousComb,
+        const Data &fn, const Data &scale, const Data &base, const Data &normWeight,
+        int sinkhornIters, float mixEps, float normEps, Data &hidden,
+        Data &pre, Data &post, Data &comb, Data &output, Data &quantizedOutput) {
+    return V41HcPostMixPreNormImpl(input, residual, previousPre, previousPost, previousComb,
+        fn, scale, base, normWeight, sinkhornIters, mixEps, normEps,
+        hidden, pre, post, comb, output, &quantizedOutput);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41HcMix(const fastllm::Data &x, fastllm::Data &hcFn, fastllm::Data &hcScale,
@@ -4213,6 +5352,46 @@ extern "C" bool FastllmCudaDeepSeekV41RotaryQuantPosition(fastllm::Data &x, int 
     return V41CheckLaunch("RotaryQuant");
 }
 
+extern "C" bool FastllmCudaDeepSeekV41DraftRotaryTable(Data &q, Data &kv, const Data &window,
+        int ropeDim, float ropeBase, int startPos, int originalSeqLen, float ropeFactor,
+        int betaFast, int betaSlow, const int *devicePosition, Data &table) {
+    if (V41LegacyRotary() || V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") ||
+        V41EnvOn("FASTLLM_DSV41_DISABLE_FAKE_QUANT") ||
+        q.dims.size() != 4 || kv.dims.size() != 3 || window.dims.size() != 3 ||
+        q.dims[0] != 1 || q.dims[1] < 1 || q.dims[1] > 8 || q.dims[2] < 1 || q.dims[2] > 128 ||
+        q.dims[3] != 512 || kv.dims != std::vector<int>({1, q.dims[1], 512}) ||
+        window.dims[0] != 1 || window.dims[1] < 1 || window.dims[1] > 1024 || window.dims[2] != 512 ||
+        ropeDim < 2 || ropeDim > 128 || ropeDim % 2 || table.multiDeviceData || table.isFake ||
+        (uintptr_t)window.cudaData % 16 || (uintptr_t)table.cudaData % 16) return false;
+    const std::vector<int> device{FastllmCudaGetDevice()};
+    const Data *inputs[] = {&q, &kv, &window};
+    const uint64_t tableBytes = (uint64_t)(window.dims[1] + q.dims[1]) * 512 * 2;
+    auto overlaps = [](const Data &a, const Data &b, uint64_t bBytes = 0) {
+        const uintptr_t x = (uintptr_t)a.cudaData, y = (uintptr_t)b.cudaData;
+        return x && y && x < y + (bBytes ? bBytes : b.GetBytes()) && y < x + a.GetBytes();
+    };
+    for (int i = 0; i < 3; ++i) {
+        const Data &x = *inputs[i];
+        if (!V41OnCuda(x) || x.multiDeviceData || x.dataType != DataType::BFLOAT16 || x.dataDeviceIds != device ||
+            &x == &table || overlaps(x, table, tableBytes)) return false;
+        uint64_t stride = 1;
+        if (x.strides.size() != x.dims.size()) return false;
+        for (int j = (int)x.dims.size() - 1; j >= 0; --j) {
+            if (x.strides[j] != stride) return false;
+            stride *= x.dims[j];
+        }
+        for (int j = 0; j < i; ++j) if (overlaps(x, *inputs[j])) return false;
+    }
+    if (!V41PrepareOutput(table, DataType::BFLOAT16, {1, window.dims[1] + q.dims[1], 512})) return false;
+    const auto rope = V41BuildRope(ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
+    const int qBlocks = (q.dims[1] * q.dims[2] * (ropeDim / 2) + 511) / 512;
+    V41DraftRotaryTableKernel<<<qBlocks + q.dims[1] + (window.dims[1] + 7) / 8, 512>>>(
+        (__nv_bfloat16*)q.cudaData, (__nv_bfloat16*)kv.cudaData, (const __nv_bfloat16*)window.cudaData,
+        (__nv_bfloat16*)table.cudaData, rope, q.dims[2], q.dims[1], window.dims[1], ropeDim,
+        startPos, devicePosition, qBlocks);
+    return V41CheckLaunch("DraftRotaryTable");
+}
+
 extern "C" bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
                                                   int posStep, bool inverse, int originalSeqLen, float ropeFactor,
                                                   int betaFast, int betaSlow, int quantMode, int quantDim,
@@ -4291,6 +5470,15 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const
                 kQuant ? nullptr : (const __nv_bfloat16*)k.cudaData, heads, m, ratio, startPos,
                 (float*)output.cudaData, k8, kMode, kRowBytes, V41Fp4VecUnpack() ? 1 : 0);
             return V41CheckLaunch("IndexerScoreDecodeMma");
+        }
+        if (seqlen >= 2 && seqlen <= 8 && heads > 0 && bsz <= 65535 / seqlen &&
+            V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<false, false, true>, 256>()) {
+            V41IndexerScoreDecodeMmaKernel<false, false, true><<<dim3((m + 63) / 64, bsz * seqlen), 256>>>(
+                (const __nv_bfloat16*)q.cudaData, (const float*)weights.cudaData,
+                kQuant ? nullptr : (const __nv_bfloat16*)k.cudaData, heads, m, ratio, startPos,
+                (float*)output.cudaData, k8, kMode, kRowBytes, V41Fp4VecUnpack() ? 1 : 0,
+                nullptr, seqlen);
+            return V41CheckLaunch("IndexerScoreSmallChunkMma");
         }
         if (FastllmCudaGetThreadError()) return false;
         if (V41MmaKernelReady<V41IndexerScoreMmaKernel, kIdxMmaThreads>()) {
@@ -4371,7 +5559,12 @@ extern "C" bool FastllmCudaDeepSeekV41CandidateBlocks(const fastllm::Data &score
     }
     V41BlockScoreKernel<<<tokens, 256>>>((const float*)score.cudaData, seqlen, m, blockSize, numBlocks,
                                          ratio, startPos, blockScore);
-    V41CandidateSelectKernel<<<tokens, kSelThreads>>>(blockScore, numBlocks, topkBlocks, (uint8_t*)output.cudaData);
+    if (tokens <= 8 && numBlocks >= 4096 &&
+        V41MmaKernelReady<V41CandidateSelectKernel<false, 1024>, 1024>()) {
+        V41CandidateSelectKernel<false, 1024><<<tokens, 1024>>>(blockScore, numBlocks, topkBlocks, (uint8_t*)output.cudaData);
+    } else {
+        V41CandidateSelectKernel<<<tokens, kSelThreads>>>(blockScore, numBlocks, topkBlocks, (uint8_t*)output.cudaData);
+    }
     bool ok = V41CheckLaunch("CandidateBlocks");
     // Both producers and the only consumer use this thread's CUDA stream.
     // Delay pool reuse until that stream completes, without draining other
@@ -4427,14 +5620,54 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, co
     const int kListCap = 4096;
     const int listCap = (cand != nullptr && blockShift >= 0 && numBlocks > 0)
                         ? std::min(numBlocks, kListCap) : 0;
+    // Standalone captures keep the zero-workspace route; full decode plans
+    // own persistent hierarchical workspaces. Eager scratch is stream ordered.
+    if (m > kTopKParallelMinKeys && width <= 512 && bs <= kTopKShardKeys &&
+        (int64_t)bsz * seqlen <= 128 && !FastllmCudaGraphIsCapturing()) {
+        const bool globalTopK = !cand && width == 512 && m >= 65536 &&
+            m <= 1024 * kTopKShardKeys && bsz * seqlen <= 8 &&
+            V41MmaKernelReady<V41TopKGlobalFinish<false>, 1024>();
+        auto layout = V41TopKLayout(nullptr, bsz * seqlen, m, width, bs, globalTopK);
+        void *memory = nullptr;
+        const auto status = FastllmCudaTryMalloc(&memory, layout.Bytes(bsz * seqlen));
+        if (status == FASTLLM_CUDA_TRY_MALLOC_ERROR) return false;
+        if (status == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+            const auto w = V41TopKLayout(memory, bsz * seqlen, m, width, bs, globalTopK);
+            if (globalTopK) {
+                V41TopKGlobalArgs a{(const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift,
+                    width, ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr};
+                V41LaunchGlobalTopK<false>(a, w, bsz * seqlen);
+            } else {
+                V41TopKKernel<false, 1><<<dim3(w.parts, bsz * seqlen), kSelThreads,
+                    (size_t)listCap * sizeof(int)>>>(
+                    (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
+                    ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, w);
+                if (bsz * seqlen <= 8 && V41MmaKernelReady<V41TopKKernel<false, 2, 1024>, 1024>()) {
+                    V41TopKKernel<false, 2, 1024><<<bsz * seqlen, 1024>>>(
+                        (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
+                        ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, w);
+                } else {
+                    V41TopKKernel<false, 2><<<bsz * seqlen, kSelThreads>>>(
+                        (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
+                        ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, w);
+                }
+            }
+            const bool ok = V41CheckLaunch("IndexerTopKHierarchical");
+            if (!FastllmCudaFreeAfterCurrentThreadStream(memory)) {
+                FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaFree(memory);
+            }
+            return ok;
+        }
+    }
     if (seqlen > 1 || m <= width) {
-        V41TopKKernel<false, false><<<bsz * seqlen, kSelThreads, (size_t)listCap * sizeof(int)>>>(
+        V41TopKKernel<false, 0, 256><<<bsz * seqlen, kSelThreads, (size_t)listCap * sizeof(int)>>>(
             (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
-            ratio, startPos, listCap, (int32_t*)output.cudaData);
+            ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, {});
     } else {
-        V41TopKKernel<false, true, 1024><<<bsz * seqlen, 1024, (size_t)listCap * sizeof(int)>>>(
+        V41TopKKernel<false, 0, 1024><<<bsz * seqlen, 1024, (size_t)listCap * sizeof(int)>>>(
             (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
-            ratio, startPos, listCap, (int32_t*)output.cudaData);
+            ratio, startPos, listCap, (int32_t*)output.cudaData, nullptr, {});
     }
     return V41CheckLaunch("IndexerTopK");
 }
@@ -4572,7 +5805,7 @@ bool FastllmCudaGlm5NextHybridSparseAttention(const fastllm::Data &query,
     return true;
 }
 
-template<int splits, bool MATERIALIZED = true>
+template<int splits, bool MATERIALIZED = true, bool PIPELINED = false>
 static bool V41SparseAttentionBatchImpl(
         const std::vector<FastllmCudaV41AttentionRequest> &requests,
         fastllm::Data &attnSink, int windowSize, float softmaxScale) {
@@ -4587,12 +5820,15 @@ static bool V41SparseAttentionBatchImpl(
     if (requests.empty() || requests.size() > 1024 || windowSize < 0 ||
         V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") || V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN") ||
         !local(attnSink) || attnSink.dataType != DataType::FLOAT32) return false;
-    using PvShared = typename std::conditional<MATERIALIZED,
+    using SerialShared = typename std::conditional<MATERIALIZED,
         V41MmaPvShared<splits>, V41MmaShared>::type;
+    using Shared = typename std::conditional<PIPELINED,
+        V41MmaPvPipelineShared<splits>, SerialShared>::type;
     if constexpr (MATERIALIZED) {
         if (!V41MmaKernelReady<V41SparseAttentionScoresKernel<true>, kMmaThreads, sizeof(V41MmaShared)>()) return false;
     }
-    if (!V41MmaKernelReady<V41SparseAttentionMmaKernel<splits, MATERIALIZED, true>, kMmaThreads, sizeof(PvShared)>()) return false;
+    if (!V41MmaKernelReady<V41SparseAttentionMmaKernel<splits, MATERIALIZED, true, PIPELINED>,
+                           kMmaThreads, sizeof(Shared)>()) return false;
     int heads = 0, maxTiles = 0;
     std::vector<V41AttentionDescriptor> descriptors;
     descriptors.reserve(requests.size());
@@ -4668,15 +5904,15 @@ static bool V41SparseAttentionBatchImpl(
             descriptors.size() * sizeof(V41AttentionDescriptor))) return false;
     const int headBlocks = (heads + kMmaHeads - 1) / kMmaHeads;
     if constexpr (MATERIALIZED) {
-    V41SparseAttentionScoresKernel<true><<<dim3(requests.size(), headBlocks, maxTiles), kMmaThreads, sizeof(V41MmaShared), cudaStreamPerThread>>>(
+    if (!V41LaunchDependent<V41SparseAttentionScoresKernel<true>>(dim3(requests.size(), headBlocks, maxTiles), kMmaThreads, sizeof(V41MmaShared),
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1, heads, windowSize,
-        0, 0, 0, nullptr, 0, 0, 0, 0, 0, deviceDescriptors);
+        0, 0, 0, nullptr, 0, 0, 0, 0, 0, deviceDescriptors)) return false;
     if (!V41CheckLaunch("BatchedSparseAttentionScores")) return false;
     }
-    V41SparseAttentionMmaKernel<splits, MATERIALIZED, true><<<dim3(requests.size(), headBlocks, splits), kMmaThreads, sizeof(PvShared), cudaStreamPerThread>>>(
+    if (!V41LaunchDependent<V41SparseAttentionMmaKernel<splits, MATERIALIZED, true, PIPELINED>>(dim3(requests.size(), headBlocks, splits), kMmaThreads, sizeof(Shared),
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         (const float*)attnSink.cudaData, 1, heads, windowSize, 0, 0, 0, softmaxScale,
-        nullptr, 0, 0, 0, 0, 0, nullptr, deviceDescriptors);
+        nullptr, 0, 0, 0, 0, 0, nullptr, deviceDescriptors)) return false;
     return V41CheckLaunch("BatchedSparseAttentionValues");
 }
 
@@ -4700,6 +5936,17 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttentionBatch(
     }
     if (batch * headBlocks >= 64)
         return V41SparseAttentionBatchImpl<2>(requests, attnSink, windowSize, softmaxScale);
+    // Two-stage PV overlaps the next KV tile for the small verification
+    // batches. Larger batches already have enough CTAs and use the serial path.
+    // Async copies consume BF16 rows directly; packed KV needs dequantization.
+    if (batch >= 2 && batch <= 6 && V41IsSm<9, 0>() &&
+        std::all_of(requests.begin(), requests.end(), [](const FastllmCudaV41AttentionRequest &r) {
+            return (!r.ringKV || r.ringKV->dataType == DataType::BFLOAT16) &&
+                   (!r.compressedKV || r.compressedKV->dataType == DataType::BFLOAT16);
+        }) && V41MmaKernelReady<
+            V41SparseAttentionMmaKernel<8, true, true, true>, kMmaThreads,
+            sizeof(V41MmaPvPipelineShared<8>)>())
+        return V41SparseAttentionBatchImpl<8, true, true>(requests, attnSink, windowSize, softmaxScale);
     return V41SparseAttentionBatchImpl<8>(requests, attnSink, windowSize, softmaxScale);
 }
 
@@ -4753,6 +6000,90 @@ extern "C" bool FastllmCudaDeepSeekV41HybridSparseAttention(const fastllm::Data 
         (__nv_bfloat16 *)output.cudaData, ring, chunk, windowSize, startPos);
     return V41CheckLaunch("HybridDecodeValues");
 }
+
+// Keep templated kernel launches outside a generic lambda: NVCC's generated
+// host stub triggers MSVC C1001 when instantiating the pipelined specialization.
+// This only changes dispatch scope; kernel arguments and numerical paths stay
+// identical on every platform.
+struct V41MmaAttentionLauncher {
+    const fastllm::Data &q, &chunkKV;
+    const fastllm::Data *ringKV, *compressedKV, *cmpIdx;
+    fastllm::Data &attnSink, &output;
+    int windowSize, startPos, seqlen, heads, cap, topWidth;
+    int ringMode, ringRowBytes, cmpMode, cmpRowBytes, tokens, headBlocks;
+    float softmaxScale;
+    bool hasRing, hasCmp, ringFp8, cmpFp8, vecUnpack, splitValues, smallVerify;
+    bool &launched;
+
+    template<int splits, bool pipeline>
+    bool Run() {
+        using PvShared = typename std::conditional<pipeline,
+            V41MmaPvPipelineShared<splits>, V41MmaPvShared<splits>>::type;
+        using QkShared = typename std::conditional<pipeline,
+            V41MmaScoresPrefetchShared, V41MmaShared>::type;
+        constexpr int qkThreads = pipeline ? kQkPrefetchCandidates * 4 : kMmaThreads;
+        const int candidateTiles = ((startPos == 0 ? std::min(seqlen, windowSize) : windowSize) + topWidth + 63) / 64;
+        const uint64_t scratchBytes = (uint64_t)tokens * heads * candidateTiles * 64 * sizeof(float);
+        if (splitValues && (!smallVerify || !FastllmCudaGraphIsCapturing()) &&
+            candidateTiles >= 4 && scratchBytes <= 4 * 1024 * 1024 &&
+            V41MmaKernelReady<V41SparseAttentionScoresKernel<false, pipeline>, qkThreads, sizeof(QkShared)>() &&
+            V41MmaKernelReady<V41SparseAttentionMmaKernel<splits, true, false, pipeline>, kMmaThreads, sizeof(PvShared)>()) {
+            void *allocation = nullptr;
+            const auto allocated = FastllmCudaTryMalloc(&allocation, scratchBytes);
+            if (allocated == FASTLLM_CUDA_TRY_MALLOC_ERROR) return false;
+            if (allocated == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+                float *scores = (float*)allocation;
+                // Graph-aware pool ownership prevents another stream or graph
+                // from reusing this temporary before both kernels finish.
+                struct Scratch {
+                    void *ptr;
+                    ~Scratch() {
+                        if (!FastllmCudaFreeAfterCurrentThreadStream(ptr)) FastllmCudaFree(ptr);
+                    }
+                } scratch{scores};
+                launched = true;
+                V41SparseAttentionScoresKernel<false, pipeline><<<dim3(tokens, headBlocks, candidateTiles * (pipeline ? 2 : 1)), qkThreads, sizeof(QkShared)>>>(
+                    (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
+                    hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
+                    hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
+                    ringFp8 ? (const uint8_t*)ringKV->cudaData : nullptr,
+                    cmpFp8 ? (const uint8_t*)compressedKV->cudaData : nullptr,
+                    hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
+                    seqlen, heads, windowSize, cap, topWidth, startPos, scores,
+                    ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0);
+                if (!V41CheckLaunch("SparseAttentionScores")) return false;
+                V41SparseAttentionMmaKernel<splits, true, false, pipeline><<<dim3(tokens, headBlocks, splits), kMmaThreads, sizeof(PvShared)>>>(
+                    (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
+                    hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
+                    hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
+                    ringFp8 ? (const uint8_t*)ringKV->cudaData : nullptr,
+                    cmpFp8 ? (const uint8_t*)compressedKV->cudaData : nullptr,
+                    hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
+                    (const float*)attnSink.cudaData, seqlen, heads, windowSize, cap, topWidth, startPos,
+                    softmaxScale, (__nv_bfloat16*)output.cudaData,
+                    ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0, scores);
+                return V41CheckLaunch("SparseAttentionMaterialized");
+            }
+            // Optional scratch did not fit (including a graph pool miss).
+            // The fused MMA path needs no additional global workspace.
+        }
+        if (FastllmCudaGetThreadError()) return false;
+        if (!V41MmaKernelReady<V41SparseAttentionMmaKernel<splits>, kMmaThreads,
+                               sizeof(V41MmaShared)>()) return false;
+        launched = true;
+        V41SparseAttentionMmaKernel<splits><<<dim3(tokens, headBlocks, splits), kMmaThreads, sizeof(V41MmaShared)>>>(
+            (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
+            hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
+            hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
+            ringFp8 ? (const uint8_t*)ringKV->cudaData : nullptr,
+            cmpFp8 ? (const uint8_t*)compressedKV->cudaData : nullptr,
+            hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
+            (const float*)attnSink.cudaData, seqlen, heads, windowSize, cap, topWidth, startPos,
+            softmaxScale, (__nv_bfloat16*)output.cudaData,
+            ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0);
+        return V41CheckLaunch("SparseAttentionMma");
+    }
+};
 
 extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, const fastllm::Data &chunkKV,
                                                       const fastllm::Data *ringKV, const fastllm::Data *compressedKV,
@@ -4856,7 +6187,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                     const bool reuseQueries = heads >= 32 && count >= 128;
                     const bool reuseHeads = seqlen >= 4 && reuseQueries;
                     if (reuseQueries)
-                        V41Sm75QuantizedAttentionScores<multi, 2><<<dim3((count + 7) / 8, (heads + 3) / 4, seqlen), 128, 0, cudaStreamPerThread>>>(
+                        V41Sm75QuantizedAttentionScores<multi, 4, 16><<<dim3((count + 15) / 16, (heads + 3) / 4, seqlen), 128, 0, cudaStreamPerThread>>>(
                             static_cast<const __nv_bfloat16 *>(q.cudaData), rows, valid, count, heads, scores);
                     else
                         V41Sm75QuantizedAttentionScores<multi><<<dim3((count + 3) / 4, (heads + 3) / 4, seqlen), 128, 0, cudaStreamPerThread>>>(
@@ -4953,72 +6284,20 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
         !legacyAttention) {
         const int tokens = bsz * seqlen;
         const int headBlocks = (heads + kMmaHeads - 1) / kMmaHeads;
+        const bool smallVerify = tokens >= 2 && tokens <= 8 && startPos > 0 && !ringFp8 && !cmpFp8;
+        const bool splitValues = tokens == 1 || smallVerify;
         bool launched = false;
-        auto launch = [&](auto splitTag) {
-            constexpr int splits = decltype(splitTag)::value;
-            using PvShared = V41MmaPvShared<splits>;
-            const int candidateTiles = ((startPos == 0 ? std::min(seqlen, windowSize) : windowSize) + topWidth + 63) / 64;
-            const uint64_t scratchBytes = (uint64_t)tokens * heads * candidateTiles * 64 * sizeof(float);
-            if (tokens == 1 && candidateTiles >= 4 && scratchBytes <= 4 * 1024 * 1024 &&
-                V41MmaKernelReady<V41SparseAttentionScoresKernel<>, kMmaThreads, sizeof(V41MmaShared)>() &&
-                V41MmaKernelReady<V41SparseAttentionMmaKernel<splits, true>, kMmaThreads, sizeof(PvShared)>()) {
-                void *allocation = nullptr;
-                const auto allocated = FastllmCudaTryMalloc(&allocation, scratchBytes);
-                if (allocated == FASTLLM_CUDA_TRY_MALLOC_ERROR) return false;
-                if (allocated == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
-                    float *scores = (float*)allocation;
-                    // Graph-aware pool ownership prevents another stream or graph
-                    // from reusing this temporary before both kernels finish.
-                    struct Scratch {
-                        void *ptr;
-                        ~Scratch() {
-                            if (!FastllmCudaFreeAfterCurrentThreadStream(ptr)) FastllmCudaFree(ptr);
-                        }
-                    } scratch{scores};
-                    launched = true;
-                    V41SparseAttentionScoresKernel<><<<dim3(tokens, headBlocks, candidateTiles), kMmaThreads, sizeof(V41MmaShared)>>>(
-                        (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
-                        hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
-                        hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
-                        ringFp8 ? (const uint8_t*)ringKV->cudaData : nullptr,
-                        cmpFp8 ? (const uint8_t*)compressedKV->cudaData : nullptr,
-                        hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
-                        seqlen, heads, windowSize, cap, topWidth, startPos, scores,
-                        ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0);
-                    if (!V41CheckLaunch("SparseAttentionScores")) return false;
-                    V41SparseAttentionMmaKernel<splits, true><<<dim3(tokens, headBlocks, splits), kMmaThreads, sizeof(PvShared)>>>(
-                        (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
-                        hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
-                        hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
-                        ringFp8 ? (const uint8_t*)ringKV->cudaData : nullptr,
-                        cmpFp8 ? (const uint8_t*)compressedKV->cudaData : nullptr,
-                        hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
-                        (const float*)attnSink.cudaData, seqlen, heads, windowSize, cap, topWidth, startPos,
-                        softmaxScale, (__nv_bfloat16*)output.cudaData,
-                        ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0, scores);
-                    return V41CheckLaunch("SparseAttentionMaterialized");
-                }
-                // Optional scratch did not fit (including a graph pool miss).
-                // The fused MMA path needs no additional global workspace.
-            }
-            if (FastllmCudaGetThreadError()) return false;
-            if (!V41MmaKernelReady<V41SparseAttentionMmaKernel<splits>, kMmaThreads,
-                                   sizeof(V41MmaShared)>()) return false;
-            launched = true;
-            V41SparseAttentionMmaKernel<splits><<<dim3(tokens, headBlocks, splits), kMmaThreads, sizeof(V41MmaShared)>>>(
-                (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
-                hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
-                hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
-                ringFp8 ? (const uint8_t*)ringKV->cudaData : nullptr,
-                cmpFp8 ? (const uint8_t*)compressedKV->cudaData : nullptr,
-                hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
-                (const float*)attnSink.cudaData, seqlen, heads, windowSize, cap, topWidth, startPos,
-                softmaxScale, (__nv_bfloat16*)output.cudaData,
-                ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0);
-            return V41CheckLaunch("SparseAttentionMma");
-        };
-        const bool ok = tokens == 1 ? launch(std::integral_constant<int, 8>{})
-                                    : launch(std::integral_constant<int, 1>{});
+        V41MmaAttentionLauncher launch{q, chunkKV, ringKV, compressedKV, cmpIdx,
+            attnSink, output, windowSize, startPos, seqlen, heads, cap, topWidth,
+            ringMode, ringRowBytes, cmpMode, cmpRowBytes, tokens, headBlocks, softmaxScale,
+            hasRing, hasCmp, ringFp8, cmpFp8, vecUnpack, splitValues, smallVerify, launched};
+        const bool pipeline = smallVerify && heads == 8 && V41IsSm<9, 0>() &&
+            V41MmaKernelReady<V41SparseAttentionScoresKernel<false, true>, kQkPrefetchCandidates * 4,
+                sizeof(V41MmaScoresPrefetchShared)>() &&
+            V41MmaKernelReady<V41SparseAttentionMmaKernel<8, true, false, true>, kMmaThreads,
+                sizeof(V41MmaPvPipelineShared<8>)>();
+        const bool ok = pipeline ? launch.Run<8, true>() :
+            splitValues ? launch.Run<8, false>() : launch.Run<1, false>();
         // An unsupported image/resource configuration has submitted nothing.
         // Never retry a failed kernel launch: its execution state is unknown.
         if (launched) return ok;
@@ -5217,6 +6496,27 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data &input, const f
     return V41CheckLaunch("HcPost");
 }
 
+__global__ void V41MoeJoinBFloat16Kernel(const float *routed, const float *shared,
+                                        __nv_bfloat16 *output, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        // Match BF16 branch outputs and the subsequent BF16 tensor addition.
+        // Rounding only the FP32 combined sum would have different semantics.
+        const float a = __bfloat162float(__float2bfloat16_rn(routed[i]));
+        const float b = __bfloat162float(__float2bfloat16_rn(shared[i]));
+        output[i] = __float2bfloat16_rn(a + b);
+    }
+}
+
+extern "C" bool FastllmCudaDeepSeekV41MoeJoinBFloat16(
+        const float *routed, const float *shared, void *output, int count) {
+    if (!routed || !shared || !output || count <= 0 ||
+        output == routed || output == shared) return false;
+    V41MoeJoinBFloat16Kernel<<<(count + 255) / 256, 256>>>(
+        routed, shared, static_cast<__nv_bfloat16 *>(output), count);
+    return V41CheckLaunch("MoeJoinBFloat16");
+}
+
 extern "C" bool FastllmCudaDeepSeekV41MoeHcPost(const fastllm::Data &input, const fastllm::Data &shared, const fastllm::Data &residual,
     const fastllm::Data &post, const fastllm::Data &comb, fastllm::Data &output) {
     if (!V41OnCuda(input) || !V41OnCuda(residual) || !V41OnCuda(post) || !V41OnCuda(comb) ||
@@ -5377,8 +6677,8 @@ extern "C" bool FastllmCudaV41DecodeIndexerBatch(
     int shift = -1;
     for (int i = 0; i < 31; ++i) if ((1 << i) == blockSize) { shift = i; break; }
     const int listCap = shift >= 0 ? std::min(maxBlocks, 4096) : 0;
-    V41TopKKernel<true, true, 1024><<<items.size(), 1024, (size_t)listCap * sizeof(int), cudaStreamPerThread>>>(
-        nullptr, nullptr, 1, 0, 0, blockSize, shift, 0, ratio, 0, listCap, nullptr, device);
+    V41TopKKernel<true, 0, 1024><<<items.size(), 1024, (size_t)listCap * sizeof(int), cudaStreamPerThread>>>(
+        nullptr, nullptr, 1, 0, 0, blockSize, shift, 0, ratio, 0, listCap, nullptr, device, {});
     const bool ok = V41CheckLaunch("DecodeIndexerBatch");
     if (!borrowed && !FastllmCudaFreeAfterCurrentThreadStream(storage)) {
         cudaStreamSynchronize(cudaStreamPerThread);
@@ -5392,16 +6692,22 @@ namespace {
 constexpr int kFullDecodeTransforms = 5;
 
 struct V41FullDecodePlan {
+    bool indexPairs = false, indexPairNarrow = false;
+    bool qkPrefetch = false, wideTopKMerge = false, indexPrefetch = false;
+    bool fuseIndexBlocks = false, wideCandidateSelect = false;
     FastllmV41FullDecodeConfig config;
     FastllmV41FullDecodeBuffers buffers;
     int device = 0, tiles = 0, splits = 8, listCap = 0, blockShift = -1;
-    bool fused = false, pending = false;
+    bool fused = false, pending = false, pvPipeline = false;
     V41RopeTable rope;
     FastllmV41FullDecodeRequest *host = nullptr, *requests = nullptr;
     V41DecodeTransformDescriptor *transforms = nullptr;
     V41DecodeIndexDescriptor *index = nullptr;
     V41AttentionDescriptor *attention = nullptr;
     float *indexScores = nullptr, *blockScores = nullptr, *attentionScores = nullptr;
+    uint8_t *topKMemory = nullptr;
+    V41TopKWorkspace topKWorkspace;
+    int *candidateBlocks = nullptr, *candidateCounts = nullptr;
     cudaEvent_t copied = nullptr;
     ~V41FullDecodePlan() {
         int old = 0; cudaGetDevice(&old); cudaSetDevice(device);
@@ -5414,7 +6720,9 @@ struct V41FullDecodePlan {
         for (void *p : {static_cast<void *>(transforms),
                        static_cast<void *>(index), static_cast<void *>(attention),
                        static_cast<void *>(indexScores), static_cast<void *>(blockScores),
-                       static_cast<void *>(attentionScores)}) if (p) cudaFree(p);
+                       static_cast<void *>(attentionScores), static_cast<void *>(topKMemory)}) if (p) cudaFree(p);
+        if (candidateBlocks && !buffers.candidateBlocks) cudaFree(candidateBlocks);
+        if (candidateCounts && !buffers.candidateCounts) cudaFree(candidateCounts);
         cudaSetDevice(old);
     }
 };
@@ -5425,7 +6733,8 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
         int i, FastllmV41FullDecodeConfig c, FastllmV41FullDecodeBuffers b,
         const FastllmV41FullDecodeRequest *requests, V41DecodeTransformDescriptor *transforms,
         V41DecodeIndexDescriptor *index, V41AttentionDescriptor *attention,
-        float *indexScores, float *blockScores, float *attentionScores, int tiles) {
+        float *indexScores, float *blockScores, float *attentionScores, int tiles,
+        int *candidateBlocks, int *candidateCounts) {
     const auto r = requests[i];
     const int end = c.verifying ? requests[0].position + c.batch : r.position + 1;
     const int count = c.ratio ? end / c.ratio : 0;
@@ -5455,6 +6764,11 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
             indexScores + (size_t)i * c.maxKeys, blockScores + (size_t)i * maxBlocks,
             cand, tk, c.indexHeads, count, min(count, c.topK), r.position, blocks,
             c.writeCandidates, c.useCandidates};
+        index[i].candidateBlockSize = c.blockSize;
+        if (candidateBlocks) {
+            index[i].candidateBlocks = candidateBlocks + (size_t)i * maxBlocks;
+            index[i].candidateCount = candidateCounts + i;
+        }
     }
     V41AttentionDescriptor a{};
     a.q = q;
@@ -5476,17 +6790,23 @@ __global__ void V41FullDecodePrepareKernel(
         const FastllmV41FullDecodeRequest *requests, V41DecodeTransformDescriptor *transforms,
         V41DecodeIndexDescriptor *index, V41AttentionDescriptor *attention,
         float *indexScores, float *blockScores, float *attentionScores, int tiles,
-        V41RopeTable rope) {
+        V41RopeTable rope, int *candidateBlocks, int *candidateCounts) {
     const int token = blockIdx.y;
     if (blockIdx.x == 0 && threadIdx.x == 0)
         V41FullDecodeSetupRow(token, c, b, requests, transforms, index, attention,
-                             indexScores, blockScores, attentionScores, tiles);
+                             indexScores, blockScores, attentionScores, tiles,
+                             candidateBlocks, candidateCounts);
     const bool kv = blockIdx.x == c.heads;
     auto *input = kv ? static_cast<__nv_bfloat16 *>(b.kv) + (size_t)token * 512 :
         static_cast<__nv_bfloat16 *>(b.q) + ((size_t)token * c.heads + blockIdx.x) * 512;
     const V41DecodeTransformDescriptor item{
         input, nullptr, 1, 512, requests[token].position, kv ? 1 : 0, 0, 32};
     V41DecodeTransformRow(item, 0, threadIdx.x, rope, c.ropeDim, c.window);
+    // This lane owns the transformed element. Saving it here preserves the
+    // exact KV bytes and avoids a separate launch after attention. The saved
+    // rows are speculative scratch; committed ring/tail storage is untouched.
+    if (kv && c.verifying)
+        static_cast<__nv_bfloat16 *>(b.savedKV)[(size_t)token * 512 + threadIdx.x] = input[threadIdx.x];
 }
 
 // Select a subset of the transform descriptors without uploading or reallocating.
@@ -5551,23 +6871,24 @@ __global__ void V41FullVerifyGather(FastllmV41FullDecodeConfig c,
     }
 }
 
-__global__ void V41FullVerifySaveKV(const __nv_bfloat16 *kv, __nv_bfloat16 *saved) {
-    const size_t i = (size_t)blockIdx.x * 512 + threadIdx.x;
-    saved[i] = kv[i];
-}
-
-template<int SPLITS, bool MATERIALIZED>
-void V41FullDecodeAttention(V41FullDecodePlan &p) {
+template<int SPLITS, bool MATERIALIZED, bool PIPELINED = false, bool QK_PREFETCH = false>
+bool V41FullDecodeAttention(V41FullDecodePlan &p) {
     const auto &c = p.config;
     const int headBlocks = (c.heads + kMmaHeads - 1) / kMmaHeads;
-    using Shared = typename std::conditional<MATERIALIZED, V41MmaPvShared<SPLITS>, V41MmaShared>::type;
-    if constexpr (MATERIALIZED)
-        V41SparseAttentionScoresKernel<true><<<dim3(c.batch, headBlocks, p.tiles), kMmaThreads,
-                sizeof(V41MmaShared), cudaStreamPerThread>>>(
+    using SerialShared = typename std::conditional<MATERIALIZED, V41MmaPvShared<SPLITS>, V41MmaShared>::type;
+    using Shared = typename std::conditional<PIPELINED, V41MmaPvPipelineShared<SPLITS>, SerialShared>::type;
+    if constexpr (MATERIALIZED && QK_PREFETCH) {
+        if (!V41LaunchDependent<V41SparseAttentionScoresKernel<true, true>>(
+            dim3(c.batch, headBlocks, p.tiles * (kMmaNC / kQkPrefetchCandidates)), kQkPrefetchCandidates * 4,
+            sizeof(V41MmaScoresPrefetchShared),
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1, c.heads, c.window,
-            0, 0, 0, nullptr, 0, 0, 0, 0, 0, p.attention);
-    V41SparseAttentionMmaKernel<SPLITS, MATERIALIZED, true><<<dim3(c.batch, headBlocks, SPLITS),
-            kMmaThreads, sizeof(Shared), cudaStreamPerThread>>>(
+            0, 0, 0, nullptr, 0, 0, 0, 0, 0, p.attention)) return false;
+    } else if constexpr (MATERIALIZED) {
+        if (!V41LaunchDependent<V41SparseAttentionScoresKernel<true>>(dim3(c.batch, headBlocks, p.tiles), kMmaThreads, sizeof(V41MmaShared),
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1, c.heads, c.window,
+            0, 0, 0, nullptr, 0, 0, 0, 0, 0, p.attention)) return false;
+    }
+    return V41LaunchDependent<V41SparseAttentionMmaKernel<SPLITS, MATERIALIZED, true, PIPELINED>>(dim3(c.batch, headBlocks, SPLITS), kMmaThreads, sizeof(Shared),
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         static_cast<const float *>(p.buffers.sink), 1, c.heads, c.window, 0, 0, 0, c.softmaxScale,
         nullptr, 0, 0, 0, 0, 0, nullptr, p.attention);
@@ -5586,7 +6907,10 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         (c.ratio && (!b.topk || !b.candidates)) ||
         (c.kvSource && (!c.ratio || !b.rawKV || !b.joined || !b.latents || !b.compressNorm ||
           (c.ratio == 2 && (!b.rawScore || !b.scores)))) ||
-        (c.indexSource && (!c.ratio || !b.indexQ || !b.indexWeights || (c.kvSource && !b.newIndexKeys))))
+        (c.indexSource && (!c.ratio || !b.indexQ || !b.indexWeights || (c.kvSource && !b.newIndexKeys))) ||
+        (bool(b.candidateBlocks) != bool(b.candidateCounts)) ||
+        (b.reuseCandidates && !b.candidateBlocks) ||
+        (b.candidateBlocks && (!c.indexSource || !c.useCandidates || c.writeCandidates)))
         return nullptr;
     auto p = std::make_unique<V41FullDecodePlan>();
     p->config = c; p->buffers = b; p->device = FastllmCudaGetDevice();
@@ -5607,6 +6931,43 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         if (!V41MmaKernelReady<V41SparseAttentionMmaKernel<2, true, true>, kMmaThreads, sizeof(V41MmaPvShared<2>)>()) return nullptr;
     } else if (!V41MmaKernelReady<V41SparseAttentionMmaKernel<8, true, true>, kMmaThreads, sizeof(V41MmaPvShared<8>)>()) return nullptr;
     if (c.indexSource && !V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<true, true>, 256>()) return nullptr;
+    if (c.indexSource && c.useCandidates && !c.writeCandidates &&
+        !V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<true, true, false, true>, 256>()) return nullptr;
+    // The full verification plan uses BF16 KV. On SM90, overlap each
+    // 64-candidate tile's math with the next KV/score gather. Keep the
+    // existing path for other architectures, decode and other head groups.
+    p->pvPipeline = c.verifying && c.batch >= 2 && c.batch <= 8 && c.heads == 8 &&
+        V41IsSm<9, 0>() && V41MmaKernelReady<
+            V41SparseAttentionMmaKernel<8, true, true, true>, kMmaThreads,
+            sizeof(V41MmaPvPipelineShared<8>)>();
+    // Only the SM90 small verification BF16 path uses the smaller QK
+    // producer tile. Keep decode, other head counts and precisions unchanged.
+    p->qkPrefetch = p->pvPipeline && V41MmaKernelReady<
+        V41SparseAttentionScoresKernel<true, true>, kQkPrefetchCandidates * 4,
+        sizeof(V41MmaScoresPrefetchShared)>();
+    p->wideTopKMerge = c.batch <= 8 &&
+        V41MmaKernelReady<V41TopKKernel<true, 2, 1024>, 1024>();
+    p->indexPrefetch = c.indexSource && !c.useCandidates && c.indexHeads <= 32 &&
+        V41IsSm<9, 0>() && V41MmaKernelReady<
+            V41IndexerScoreDecodeMmaKernel<true, true, false, false, true>, 256>();
+    p->wideCandidateSelect = c.writeCandidates && c.batch <= 8 &&
+        V41MmaKernelReady<V41CandidateSelectKernel<true, 1024>, 1024>();
+    p->fuseIndexBlocks = c.indexSource && c.writeCandidates && c.blockSize <= 32 &&
+        (c.blockSize & (c.blockSize - 1)) == 0 &&
+        V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<true, true, false, false, false, true>, 256>();
+    if (p->fuseIndexBlocks && p->indexPrefetch &&
+        !V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<true, true, false, false, true, true>, 256>()) p->indexPrefetch = false;
+    p->indexPairs = c.verifying && c.batch >= 2 && c.batch <= 8 && c.indexSource &&
+        !c.useCandidates && c.indexHeads <= 32 &&
+        V41MmaKernelReady<V41IndexerScorePairKernel<false>, 256, sizeof(V41PairedIndexShared)>() &&
+        (!p->fuseIndexBlocks ||
+         V41MmaKernelReady<V41IndexerScorePairKernel<true>, 256, sizeof(V41PairedIndexShared)>());
+    // SM90 can reuse each query MMA operand across two eight-key tiles
+    // per warp. Keep the 256-thread implementation as the general path.
+    p->indexPairNarrow = p->indexPairs && c.indexHeads == 32 && V41IsSm<9, 0>() &&
+        V41MmaKernelReady<V41IndexerScorePairKernel<false, 128>, 128, sizeof(V41PairedIndexShared)>() &&
+        (!p->fuseIndexBlocks ||
+         V41MmaKernelReady<V41IndexerScorePairKernel<true, 128>, 128, sizeof(V41PairedIndexShared)>());
     p->rope = V41BuildRope(c.ropeDim, c.ropeBase, c.originalSeqLen, c.ropeFactor, c.betaFast, c.betaSlow);
     const int blocks = (c.maxKeys + c.blockSize - 1) / c.blockSize;
     for (int shift = 0; shift < 30; ++shift) if ((1 << shift) == c.blockSize) p->blockShift = shift;
@@ -5621,6 +6982,23 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         alloc(&p->attention, c.batch) && alloc(&p->attentionScores, (size_t)c.batch * c.heads * p->tiles * kMmaNC);
     if (c.indexSource) ok = ok && alloc(&p->index, c.batch) &&
         alloc(&p->indexScores, (size_t)c.batch * c.maxKeys) && alloc(&p->blockScores, (size_t)c.batch * blocks);
+    if (c.indexSource && c.maxKeys > kTopKParallelMinKeys && c.topK <= 512 &&
+        c.blockSize <= kTopKShardKeys) {
+        const bool globalTopK = !c.useCandidates && c.topK == 512 && c.maxKeys >= 65536 &&
+            c.maxKeys <= 1024 * kTopKShardKeys && c.batch <= 8 &&
+            V41MmaKernelReady<V41TopKGlobalFinish<true>, 1024>();
+        const bool compactTopK = c.useCandidates && !c.writeCandidates && c.topK == 512 &&
+            c.batch <= 8 && p->wideTopKMerge;
+        auto layout = V41TopKLayout(nullptr, c.batch, c.maxKeys, c.topK, c.blockSize, globalTopK, compactTopK);
+        ok = ok && alloc(&p->topKMemory, layout.Bytes(c.batch));
+        p->topKWorkspace = V41TopKLayout(p->topKMemory, c.batch, c.maxKeys, c.topK, c.blockSize, globalTopK, compactTopK);
+    }
+    if (c.indexSource && c.useCandidates && !c.writeCandidates) {
+        p->candidateBlocks = static_cast<int *>(b.candidateBlocks);
+        p->candidateCounts = static_cast<int *>(b.candidateCounts);
+        if (!p->candidateBlocks)
+            ok = ok && alloc(&p->candidateBlocks, (size_t)c.batch * blocks) && alloc(&p->candidateCounts, c.batch);
+    }
     if (!b.requests)
         ok = ok && cudaHostAlloc(reinterpret_cast<void **>(&p->host), (size_t)c.batch * sizeof(*p->host), cudaHostAllocDefault) == cudaSuccess &&
              cudaEventCreateWithFlags(&p->copied, cudaEventDisableTiming) == cudaSuccess;
@@ -5651,9 +7029,11 @@ bool V41ValidateFullDecodeRequests(const V41FullDecodePlan *p,
 }
 } // namespace
 
-bool FastllmCudaV41UploadFullDecodeBatch(void *storage, void *const *plans, size_t layers,
-        const FastllmV41FullDecodeRequest *requests, size_t batch) {
-    if (!storage || !plans || !requests || !layers || !batch ||
+bool FastllmCudaV41UploadFullDecodeInputs(void *storage, void *const *plans, size_t layers,
+        const FastllmV41FullDecodeRequest *requests, size_t batch,
+        const FastllmV41HostCopy *extra, size_t extraCount) {
+    if (extraCount == SIZE_MAX || (extraCount && !extra) ||
+        !storage || !plans || !requests || !layers || !batch ||
         layers > SIZE_MAX / batch / sizeof(*requests) || FastllmCudaGraphIsCapturingFast())
         return false;
     auto *deviceRequests = static_cast<FastllmV41FullDecodeRequest *>(storage);
@@ -5665,7 +7045,12 @@ bool FastllmCudaV41UploadFullDecodeBatch(void *storage, void *const *plans, size
     }
     // The bounded pinned staging pool retains each source until its copy event
     // completes. The upload and graph replay use the same worker stream.
-    return V41UploadDescriptors(storage, requests, layers * batch * sizeof(*requests));
+    return V41UploadCopies({storage, requests, layers * batch * sizeof(*requests)}, extra, extraCount);
+}
+
+bool FastllmCudaV41UploadFullDecodeBatch(void *storage, void *const *plans, size_t layers,
+        const FastllmV41FullDecodeRequest *requests, size_t batch) {
+    return FastllmCudaV41UploadFullDecodeInputs(storage, plans, layers, requests, batch, nullptr, 0);
 }
 
 bool FastllmCudaV41UploadFullDecode(void *handle, const FastllmV41FullDecodeRequest *requests, size_t count) {
@@ -5689,7 +7074,8 @@ bool FastllmCudaV41PrepareFullDecode(void *handle) {
     const auto &c = p->config; const auto &b = p->buffers;
     V41FullDecodePrepareKernel<<<dim3(c.heads + 1, c.batch), 512, 0, cudaStreamPerThread>>>(
         c, b, p->requests, p->transforms, p->index, p->attention,
-        p->indexScores, p->blockScores, p->attentionScores, p->tiles, p->rope);
+        p->indexScores, p->blockScores, p->attentionScores, p->tiles, p->rope,
+        p->candidateBlocks, p->candidateCounts);
     if (c.kvSource) {
         if (c.verifying)
             V41FullVerifyGather<<<c.batch, 512, 0, cudaStreamPerThread>>>(c, b, p->requests);
@@ -5718,24 +7104,79 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
     }
     if (c.indexSource) {
         V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3((c.indexHeads + 3) / 4, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 4, p->rope, c.ropeDim, c.window);
-        V41IndexerScoreDecodeMmaKernel<true, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
-            nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
-        if (c.writeCandidates) {
-            V41BlockScoreKernel<true><<<c.batch, 256, 0, cudaStreamPerThread>>>(nullptr, 1, 0, c.blockSize, 0, c.ratio, 0, nullptr, p->index);
-            V41CandidateSelectKernel<true><<<c.batch, kSelThreads, 0, cudaStreamPerThread>>>(nullptr, 0, c.candidateTopK, nullptr, p->index);
+        if (p->indexPairs) {
+            if (p->indexPairNarrow)
+                V41LaunchIndexerScorePair<128>(p->index, c.batch, c.ratio, p->fuseIndexBlocks);
+            else
+                V41LaunchIndexerScorePair<256>(p->index, c.batch, c.ratio, p->fuseIndexBlocks);
+        } else if (p->fuseIndexBlocks) {
+            if (p->indexPrefetch) {
+                V41IndexerScoreDecodeMmaKernel<true, true, false, false, true, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
+                    nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
+            } else {
+                V41IndexerScoreDecodeMmaKernel<true, true, false, false, false, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
+                    nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
+            }
+        } else if (p->candidateBlocks) {
+            if (!b.reuseCandidates)
+                V41CompactIndexCandidates<<<c.batch, 256, 0, cudaStreamPerThread>>>(p->index, c.blockSize, c.ratio);
+            V41IndexerScoreDecodeMmaKernel<true, true, false, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
+                nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
+        } else if (p->indexPrefetch) {
+            V41IndexerScoreDecodeMmaKernel<true, true, false, false, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
+                nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
+        } else {
+            V41IndexerScoreDecodeMmaKernel<true, true><<<dim3(128, c.batch), 256, 0, cudaStreamPerThread>>>(
+                nullptr, nullptr, nullptr, 0, 0, c.ratio, 0, nullptr, nullptr, 0, 0, 0, p->index);
         }
-        V41TopKKernel<true, true, 1024><<<c.batch, 1024, (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
-            nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0, p->listCap, nullptr, p->index);
+        if (c.writeCandidates) {
+            if (!p->fuseIndexBlocks)
+                V41BlockScoreKernel<true><<<c.batch, 256, 0, cudaStreamPerThread>>>(nullptr, 1, 0, c.blockSize, 0, c.ratio, 0, nullptr, p->index);
+            if (p->wideCandidateSelect) {
+                V41CandidateSelectKernel<true, 1024><<<c.batch, 1024, 0, cudaStreamPerThread>>>(nullptr, 0, c.candidateTopK, nullptr, p->index);
+            } else {
+                V41CandidateSelectKernel<true><<<c.batch, kSelThreads, 0, cudaStreamPerThread>>>(nullptr, 0, c.candidateTopK, nullptr, p->index);
+            }
+        }
+        if (p->topKWorkspace.global) {
+            V41TopKGlobalArgs a{nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift,
+                0, c.ratio, 0, p->listCap, nullptr, p->index};
+            V41LaunchGlobalTopK<true>(a, p->topKWorkspace, c.batch);
+        } else if (p->topKWorkspace.compactCandidates) {
+            V41TopKCandidateGather<<<dim3(p->topKWorkspace.parts, c.batch), 256,
+                (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
+                p->index, c.ratio, c.blockSize, p->blockShift, p->listCap, p->topKWorkspace);
+            V41TopKKernel<true, 2, 1024><<<c.batch, 1024, 0, cudaStreamPerThread>>>(
+                nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
+                p->listCap, nullptr, p->index, p->topKWorkspace);
+        } else if (p->topKMemory) {
+            V41TopKKernel<true, 1><<<dim3(p->topKWorkspace.parts, c.batch), kSelThreads,
+                (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
+                nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
+                p->listCap, nullptr, p->index, p->topKWorkspace);
+            if (p->wideTopKMerge) {
+                V41TopKKernel<true, 2, 1024><<<c.batch, 1024, 0, cudaStreamPerThread>>>(
+                    nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
+                    p->listCap, nullptr, p->index, p->topKWorkspace);
+            } else {
+                V41TopKKernel<true, 2><<<c.batch, kSelThreads, 0, cudaStreamPerThread>>>(
+                    nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0,
+                    p->listCap, nullptr, p->index, p->topKWorkspace);
+            }
+        } else {
+            V41TopKKernel<true, 0, 1024><<<c.batch, 1024, (size_t)p->listCap * sizeof(int), cudaStreamPerThread>>>(
+                nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0, p->listCap, nullptr, p->index, {});
+        }
     }
-    if (p->splits == 8) V41FullDecodeAttention<8, true>(*p);
-    else if (p->splits == 2) V41FullDecodeAttention<2, true>(*p);
-    else if (p->fused) V41FullDecodeAttention<1, false>(*p);
-    else V41FullDecodeAttention<1, true>(*p);
+    const bool attentionOk = p->qkPrefetch ? V41FullDecodeAttention<8, true, true, true>(*p) :
+        p->pvPipeline ? V41FullDecodeAttention<8, true, true>(*p) :
+        p->splits == 8 ? V41FullDecodeAttention<8, true>(*p) :
+        p->splits == 2 ? V41FullDecodeAttention<2, true>(*p) :
+        p->fused ? V41FullDecodeAttention<1, false>(*p) : V41FullDecodeAttention<1, true>(*p);
+    if (!attentionOk) return false;
     // Independent descriptors share one launch; each row retains its original math.
     if (c.verifying) {
         V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3(c.heads, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms, p->rope, c.ropeDim, c.window);
-        V41FullVerifySaveKV<<<c.batch, 512, 0, cudaStreamPerThread>>>(
-            static_cast<const __nv_bfloat16 *>(b.kv), static_cast<__nv_bfloat16 *>(b.savedKV));
     } else {
         V41DecodeTransformsKernel<kFullDecodeTransforms, 2><<<dim3(c.heads, c.batch * 2), 512, 0, cudaStreamPerThread>>>(p->transforms, p->rope, c.ropeDim, c.window);
     }

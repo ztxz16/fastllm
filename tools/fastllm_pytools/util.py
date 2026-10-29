@@ -977,8 +977,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--indexer_dtype', choices=['auto', 'fp8', 'fp8_e4m3'], default='auto',
                         help='Naive DSA Indexer 类型；fp8 独立量化 Indexer Q/K 并压缩 K 缓存，auto 保持模型默认路径')
-    parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard'], default='replicated',
-                        help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；默认各卡复制')
+    parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard', 'context_shard'], default='replicated',
+                        help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；context_shard 在 KVMem 下按上下文分片并合并全局 TopK；默认各卡复制')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3（含 Naive N0.5 CUDA）或fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kvmem', type=str, default=None,
@@ -990,6 +990,12 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help='prefill 攒批的未缓存 token 目标，0关闭；当前仅支持 Naive 普通 TP GPU 推理；批量总预算至少为 chunked_prefill_size')
     parser.add_argument('--prefill_max_wait_ms', type=int, default=0,
                         help='prefill 攒批最长等待毫秒数，0不等待；需设置 prefill_batch_tokens；等待期间继续 decode')
+    parser.add_argument('--prefill_batch_requests', type=int, default=0,
+                        help='prefill 攒批请求数目标；与 token 目标任一达到即放行，0不设请求数目标')
+    parser.add_argument('--prefill_max_requests', type=int, default=0,
+                        help='单批 prefill 请求数上限，0仅受模型剩余请求槽位限制')
+    parser.add_argument('--prefill_min_decode_requests', type=int, default=0,
+                        help='只有活跃 decode 请求数达到此值才等待攒批；空闲时始终立即放行')
     fast_prefill = parser.add_mutually_exclusive_group()
     fast_prefill.add_argument('--fast_prefill', '--fast-prefill', action='store_true',
                              help='开启DeepSeek-V4.1快速 prefill；该模型的--auto默认开启，可用--no_fast_prefill关闭')
@@ -1183,9 +1189,15 @@ def make_normal_llm_model(args, startup_progress = None):
     user_set_device = bool(args.device and args.device != "")
     prefill_batch_tokens = getattr(args, 'prefill_batch_tokens', 0)
     prefill_max_wait_ms = getattr(args, 'prefill_max_wait_ms', 0)
-    if not all(isinstance(value, int) and 0 <= value <= 2147483647
-               for value in (prefill_batch_tokens, prefill_max_wait_ms)) or (prefill_max_wait_ms > 0 and prefill_batch_tokens == 0):
-        raise ValueError("--prefill_batch_tokens and --prefill_max_wait_ms require non-negative int32 values; waiting requires a positive token target")
+    prefill_batch_requests = getattr(args, 'prefill_batch_requests', 0)
+    prefill_max_requests = getattr(args, 'prefill_max_requests', 0)
+    prefill_min_decode_requests = getattr(args, 'prefill_min_decode_requests', 0)
+    prefill_values = (prefill_batch_tokens, prefill_max_wait_ms, prefill_batch_requests,
+                      prefill_max_requests, prefill_min_decode_requests)
+    if (not all(isinstance(value, int) and 0 <= value <= 2147483647 for value in prefill_values)
+            or (prefill_batch_tokens == 0 and any(prefill_values[1:]))
+            or (prefill_max_requests > 0 and prefill_batch_requests > prefill_max_requests)):
+        raise ValueError("prefill coalescing requires non-negative int32 values, a positive token target, and batch_requests <= max_requests when capped")
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
     # Resolve this after loading a saved JSON configuration. An explicit zero
     # must remain an opt-out, including when another model previously used slabs.
@@ -1218,6 +1230,7 @@ def make_normal_llm_model(args, startup_progress = None):
     draft_text_config = {}
     draft_has_mtp_weights = False
     draft_is_mtp_gguf = False
+    draft_is_dspark_gguf = False
     if speculative_draft_path:
         speculative_draft_path = os.path.abspath(
             os.path.expanduser(speculative_draft_path))
@@ -1225,6 +1238,15 @@ def make_normal_llm_model(args, startup_progress = None):
         draft_is_mtp_gguf = draft_is_file and speculative_draft_path.lower().endswith(".gguf")
         if draft_is_mtp_gguf:
             metadata = read_gguf_metadata(speculative_draft_path, {"general.architecture"})
+            draft_is_dspark_gguf = metadata.get("general.architecture") == "dflash"
+            if draft_is_dspark_gguf:
+                from .deepseek_v41_gguf import dspark_config
+                draft_config = dspark_config(speculative_draft_path)
+                if speculative_algorithm and speculative_algorithm != "dspark":
+                    raise ValueError("DeepSeek DSpark GGUF requires the dspark algorithm")
+                speculative_algorithm = "dspark"
+                draft_is_mtp_gguf = False
+        if draft_is_mtp_gguf:
             if metadata.get("general.architecture") != "qwen4exp-mtp":
                 raise ValueError("external MTP GGUF must have qwen4exp-mtp architecture")
             names = read_gguf_tensor_names(speculative_draft_path)
@@ -1234,7 +1256,7 @@ def make_normal_llm_model(args, startup_progress = None):
             draft_text_config = {"model_type": "qwen4_exp", "mtp_num_hidden_layers": 1}
             if speculative_algorithm and speculative_algorithm != "mtp":
                 raise ValueError("Qwen4 MTP GGUF requires the mtp speculative algorithm")
-        else:
+        elif not draft_is_dspark_gguf:
             draft_config_dir = (os.path.dirname(speculative_draft_path)
                                 if draft_is_file else speculative_draft_path)
             draft_config_path = os.path.join(draft_config_dir, "config.json")
@@ -1373,6 +1395,13 @@ def make_normal_llm_model(args, startup_progress = None):
         args.mtp = mtp
         args.speculative_draft_model_path = speculative_draft_path
         args.speculative_algorithm = "mtp"
+    elif draft_is_dspark_gguf:
+        if draft_tokens > 0 and dspark_tokens > 0 and draft_tokens != dspark_tokens:
+            raise ValueError("--draft_tokens and --dspark specify different token counts")
+        dspark_tokens = draft_tokens if draft_tokens > 0 else dspark_tokens or draft_config["dspark_block_size"]
+        args.dspark = dspark_tokens
+        args.speculative_draft_model_path = speculative_draft_path
+        _configure_embedded_dspark(args)
     elif speculative_draft_path:
         if not os.path.isdir(speculative_draft_path):
             raise ValueError(
@@ -1472,6 +1501,8 @@ def make_normal_llm_model(args, startup_progress = None):
                     config = json.load(file)
             else:
                 config = gguf_config
+            if draft_is_dspark_gguf:
+                config.update(dspark_config(speculative_draft_path, config))
             if getattr(args, "mmproj", "") and config.get("gguf_architecture") == "deepseek41":
                 from .deepseek_v41_gguf import vision_config
                 config.update(vision_config(args.mmproj, config))
@@ -1539,7 +1570,7 @@ def make_normal_llm_model(args, startup_progress = None):
                     speculative_algorithm = args.speculative_algorithm
                     _configure_embedded_dspark(args)
             if speculative_algorithm == "dspark":
-                if speculative_draft_path:
+                if speculative_draft_path and not draft_is_dspark_gguf:
                     if (architecture != "KimiK3ForConditionalGeneration" and
                             model_type != "kimi_k3" and not is_naive_n05_model):
                         raise ValueError(
@@ -1896,13 +1927,15 @@ def make_normal_llm_model(args, startup_progress = None):
 
     tp_arg = getattr(args, "tp", "")
     indexer_storage = getattr(args, "indexer_tp_storage", "replicated")
-    if indexer_storage not in ("replicated", "layer_shard"):
-        raise ValueError("indexer_tp_storage must be replicated or layer_shard")
-    if indexer_storage == "layer_shard":
+    if indexer_storage not in ("replicated", "layer_shard", "context_shard"):
+        raise ValueError("indexer_tp_storage must be replicated, layer_shard or context_shard")
+    if indexer_storage in ("layer_shard", "context_shard"):
         if not is_naive_n05_model:
-            raise ValueError("Indexer layer_shard storage currently supports Naive DSA models only")
+            raise ValueError(f"Indexer {indexer_storage} storage currently supports Naive DSA models only")
         if _thread_tp_cuda_device_count(tp_arg or os.environ.get("FASTLLM_TP", "")) < 2:
-            raise ValueError("Indexer layer_shard storage requires --tp with at least two CUDA devices")
+            raise ValueError(f"Indexer {indexer_storage} storage requires --tp with at least two CUDA devices")
+    if indexer_storage == "context_shard" and not getattr(args, "kvmem", None):
+        raise ValueError("Indexer context_shard storage requires --kvmem")
     if (tp_arg != ""):
         os.environ["FASTLLM_TP"] = tp_arg
         if (_uses_thread_tp(tp_arg)):
@@ -2073,7 +2106,7 @@ def make_normal_llm_model(args, startup_progress = None):
                             chat_template = args.chat_template,
                             tool_call_parser = args.tool_call_parser,
                             external_mtp_path = (speculative_draft_path
-                                if speculative_algorithm == "mtp" else ""),
+                                if speculative_algorithm == "mtp" or draft_is_dspark_gguf else ""),
                             mmproj_path = args.mmproj,
                             max_context_length = -1 if legacy_context_limit else max_context_length,
                             rope_scaling = rope_scaling,
@@ -2119,7 +2152,13 @@ def make_normal_llm_model(args, startup_progress = None):
                 kvmem_options.setdefault("prefill_tokens", args.chunked_prefill_size)
             model.set_kvmem(**kvmem_options)
         if prefill_batch_tokens > 0:
-            model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms)
+            if any(prefill_values[2:]):
+                model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms,
+                                          target_requests=prefill_batch_requests,
+                                          max_requests=prefill_max_requests,
+                                          min_decode_requests=prefill_min_decode_requests)
+            else:
+                model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms)
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
         model.warmup()

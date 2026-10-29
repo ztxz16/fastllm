@@ -42,6 +42,9 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
 void FastllmCudaCustomAllReduceReset();
 bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
                                 int dataType, int deviceId);
+// In-place unsigned maximum of one 8-byte value. Call on every active rank.
+// Alignment/capture-registration misses are rejected collectively before launch.
+bool FastllmCudaCustomScalarMaxUint64(void *value, int deviceId);
 // Optional bounded host spin for dedicated decode submission cores. The
 // pointer registration and collective fallback checks remain unchanged.
 bool FastllmCudaCustomAllReduceWithSpin(void* data, void* dest, int count,
@@ -94,6 +97,7 @@ bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
 void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int deviceId);
 void FastllmNcclBroadcastFrom(void* send, void* recv, int count, int dataType, int root, int deviceId);
 void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId);
+bool FastllmNcclAllReduceMaxUint64(void *data, int count, int deviceId);
 // Runs NCCL directly, bypassing the graph-safe custom all-reduce. Large TP
 // prefill tensors can be bandwidth-bound on the direct-peer implementation
 // even though it is faster for decode tensors.
@@ -168,8 +172,14 @@ namespace fastllm {
     // Stable buffers and stream dependencies permit graph capture of a
     // vocabulary-sharded projection with FP32 output and FP32/BF16 input,
     // including uneven shard widths.
+    struct MultiCudaDsparkMarkovRequest {
+        Data &embed, &head, &tokens, &outEmbeds;
+        std::shared_ptr<void> &workspace;
+        bool completed = false;
+    };
     bool MultiCudaLinearOutputGatherPersistent(Data &input, Data &weight, Data &output,
-                                               std::shared_ptr<void> &workspace);
+                                               std::shared_ptr<void> &workspace,
+                                               MultiCudaDsparkMarkovRequest *markov = nullptr);
     bool MultiCudaLinearRow(Data &input, Data &weight, Data &bias, Data &output);
     bool MultiCudaLinearColumn(Data &input, Data &weight, Data &bias, Data &output);
     struct MultiCudaAsyncMLPHandle;
@@ -201,6 +211,23 @@ namespace fastllm {
         Data &attnSink, int windowSize, float scale, const std::vector<int> &devices,
         const std::function<void(int, int)> &before = {},
         const std::function<void(int, int)> &after = {}, bool workerOrdered = false);
+    struct MultiCudaReplicatedCopyRange {
+        Data *dst;
+        const Data *src;
+        size_t dstOffset, srcOffset, bytes;
+    };
+    // Batch independent byte ranges of compact replicas without allocations.
+    // Validate the whole batch before writing; overlapping destinations or
+    // source/destination ranges return false, so the caller can fall back.
+    bool MultiCudaCopyReplicatedRanges(const std::vector<MultiCudaReplicatedCopyRange> &ranges,
+                                       const std::vector<int> &devices);
+    // Validate and prepare an owned replicated destination, without copying its
+    // payload. The returned range can join a batch of independent state writes.
+    // Keep both tensors alive until the batch completes; unsupported inputs
+    // return false before changing the destination.
+    bool MultiCudaPrepareReplicatedRowCopy(Data &dst, const Data &src, int start, int rows,
+                                           const std::vector<int> &devices,
+                                           MultiCudaReplicatedCopyRange &range);
     // Copy contiguous rows of a dense [1, tokens, width] replicated tensor
     // independently on each rank. Retains owned destination allocations and
     // replica layout; unsupported layouts/aliases return false without writes.
@@ -209,6 +236,13 @@ namespace fastllm {
     // Copy compact TP activation shards while retaining destination addresses.
     bool MultiCudaCopyShardedActivation(Data &dst, const Data &src, const std::vector<int> &devices,
                                        bool copyData = true);
+
+    // Replay one graph per device outside capture on persistent workers.
+    // Every device, including the root, uses explicit producer/consumer
+    // event handoffs. Preserves the current device, with a serial fallback
+    // when workers are unavailable. False is an error, never a retry signal.
+    bool MultiCudaLaunchGraphs(const std::vector<int> &devices,
+                               const std::vector<void *> &execs);
 
     // 将常驻 MultiCUDA worker 的 per-thread stream 接入/并回调用线程正在捕获的
     // 每卡 CUDA Graph。events 必须与 devices 一一对应并归属相同设备。
@@ -237,12 +271,17 @@ namespace fastllm {
     bool MultiCudaRunDeviceCallbacksEnqueueOnly(
         const std::vector<int> &devices,
         const std::function<void(int, int)> &callback);
+    // Join the completion events of already-submitted callbacks on one caller
+    // stream and wait once. Only covers work on the dedicated worker streams.
+    // Returns false when a worker/event is unavailable, allowing a full drain.
+    bool MultiCudaSynchronizeDeviceCallbacks(const std::vector<int> &devices);
     bool MultiCudaCurrentThreadWaitForWorker(int device);
 
     // Broadcast a root CUDA tensor into its fixed per-device replicas, then
     // execute Repeat independently on every device.  This keeps the output
     // replicas current without rebuilding their storage, so the whole handoff
     // can be captured by a multi-device CUDA Graph.
+    // Unsupported NCCL dtypes return false without changing either tensor.
     bool MultiCudaRepeatToReplicated(Data &input, int axis, int repeatTimes,
                                      Data &output);
     bool MultiCudaDeepSeekV41SharedSwiglu(Data &input, float limit, Data &output);

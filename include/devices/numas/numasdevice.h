@@ -144,6 +144,11 @@ namespace fastllm {
     bool HostMoeCanonicalV41Decode(const float *input, float *output,
         Data **weights, int weightsBatch, const int32_t *indices,
         const float *scores, int topk, float swigluLimit);
+    // One routed expert per input row. Group repeated experts without copying
+    // their canonical weights or changing the disk backend's arithmetic.
+    bool HostMoeCanonicalV41Batch(const float *input, float *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const float *scores, float swigluLimit);
 
     // FP32 verifier subset, returning unweighted [row, route, hidden] values.
     // An expert must have the same CPU/GPU ownership in every input row.

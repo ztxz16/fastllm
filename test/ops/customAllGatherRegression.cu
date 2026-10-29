@@ -70,7 +70,7 @@ __global__ void AdvanceJoint(int *step) { ++*step; }
 
 static void RunJoint(int rank, int ranks, int &errors) {
     Check(cudaSetDevice(rank));
-    const int capacity = ranks * 4096;
+    const int capacity = ranks * 5120;
     float *input, *output;
     unsigned short *shared;
     int *state;
@@ -90,7 +90,7 @@ static void RunJoint(int rank, int ranks, int &errors) {
         if (FastllmCudaCustomAllReduceAndGather(in, out, gather, count, rank)) std::abort();
     }
     // TP8 crosses the 128-thread / 36-block dispatch boundary.
-    for (int part : {256, 640, 2304, 2312, 4096}) {
+    for (int part : {256, 640, 1280, 1920, 2304, 2312, 2560, 3200, 3840, 4096, 4480, 5120}) {
         const int count = ranks * part;
         for (bool inplace : {false, true}) {
             float *destination = inplace ? input : output;
@@ -210,7 +210,7 @@ int main(int argc, char **argv) {
     FastllmCudaCustomAllReduceReset();
     for (int error : errors) if (error) return 1;
     if (joint)
-        std::printf("Joint reduce/gather: %d GPUs, five sizes, in/out-of-place, changing values, skewed graphs PASS\n", ranks);
+        std::printf("Joint reduce/gather: %d GPUs, twelve sizes, in/out-of-place, changing values, skewed graphs PASS\n", ranks);
     else
         std::printf("Custom AllGather: %d GPUs, six shard widths x five batches, eager +64 skewed graph replays PASS\n", ranks);
     return 0;

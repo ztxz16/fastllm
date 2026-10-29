@@ -140,3 +140,5 @@ void Launch(const BF *q, FastllmNaiveKV keys, const float *scales, const BF *wei
                     kSharedBytes>>>(q, keys, scales, weights, scores, queries, keyCount, past, stride);
 }
 } // namespace naive_indexer
+
+#include "naive-n05-indexer-experimental.cuh"

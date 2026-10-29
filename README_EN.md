@@ -32,6 +32,23 @@ For AMD GPUs, see [ROCm installation (Chinese)](docs/rocm.md). For CPU-only and 
 
 ### Browser launch
 
+For multiple independent replicas on one Linux host, `ftllm deploy` adds background
+process supervision and streaming request routing while reusing native server arguments.
+Existing `ftllm serve/server` behavior is unchanged. See [deployment configuration](docs/deploy.md).
+
+~~~bash
+# API server, listening on 0.0.0.0:8080 by default
+ftllm server Qwen/Qwen3-0.6B
+
+# Command-line chat
+ftllm run Qwen/Qwen3-0.6B
+
+# WebUI, connected to the API server above; listens on 127.0.0.1:1616 by default
+ftllm webui --api_base http://127.0.0.1:8080/v1
+~~~
+
+Run the browser deployment launcher directly:
+
 ```sh
 ftllm
 ```

@@ -263,6 +263,258 @@ static void PrefillIndexerPaths(int queries, int length, bool paged, bool remote
     fflush(stdout);
 }
 
+// The merged launch must preserve every selected position, including ties.
+static void BalancedPrefillIndexer(bool paged, bool remote) {
+    if (FastllmCudaRuntimeArch() != 90)
+        return;
+    constexpr int length = 1024, keys = 65537;
+    FP8Tensor raw(keys, 320, 121, paged);
+    Data input(BFLOAT16), packed, q(BFLOAT16), w(BFLOAT16);
+    Upload(input, {1, keys, 128}, 127);
+    FastllmCudaNaivePackIndexer(input, packed);
+    Upload(q, {1, length, 2048}, 131);
+    Upload(w, {1, length, 16}, 137);
+    if (remote) {
+        q.ToDevice(DataDevice::CUDA, {1}, true);
+        w.ToDevice(DataDevice::CUDA, {1}, true);
+        FastllmCudaSetDevice(1);
+    }
+    for (const Data *key : {&raw.data(), &packed})
+        for (int ranks : {2, 4, 8}) {
+            int rows = length / ranks, part = rows / 2;
+            for (bool ties : {false, true}) {
+                if (ties)
+                    Cuda(cudaMemset(w.cudaData, 0, w.GetBytes()));
+                else {
+                    FastllmCudaSetDevice(0);
+                    Data fresh(BFLOAT16);
+                    Upload(fresh, {1, length, 16}, 137);
+                    if (remote)
+                        fresh.ToDevice(DataDevice::CUDA, {1}, true);
+                    FastllmCudaSetDevice(remote ? 1 : 0);
+                    Cuda(cudaMemcpy(w.cudaData, fresh.cudaData, w.GetBytes(), cudaMemcpyDeviceToDevice));
+                }
+                for (int rank = 0; rank < ranks; ++rank) {
+                    Data expected(INT32), actual;
+                    expected.Resize({rows, 2048});
+                    expected.ToDevice(DataDevice::CUDA, q.dataDeviceIds, false);
+                    expected.Allocate(false);
+                    for (int range = 0; range < 2; ++range) {
+                        int first = range ? length - (rank + 1) * part : rank * part;
+                        Data a(BFLOAT16, {1, part, 2048}), b(BFLOAT16, {1, part, 16}), out(INT32, {part, 2048});
+                        a.FakeFrom(q, (size_t)first * 2048 * 2);
+                        b.FakeFrom(w, (size_t)first * 16 * 2);
+                        out.FakeFrom(expected, (size_t)range * part * 2048 * 4);
+                        FastllmCudaNaiveIndexer(a, b, *key, 16, 128, keys - length + first, 2048, true, out, true);
+                    }
+                    Require(FastllmCudaNaiveBalancedIndexer(q, w, *key, keys - length, rank, ranks, true, true, actual),
+                            "balanced prefill unexpectedly declined");
+                    Require(Read<int>(expected) == Read<int>(actual), "balanced prefill changed TopK/tie order");
+                    auto saved = Read<int>(actual);
+                    Require(
+                        !FastllmCudaNaiveBalancedIndexer(q, w, *key, keys - length, rank, ranks, true, false, actual),
+                        "balanced prefill changed non-peer arithmetic");
+                    Require(saved == Read<int>(actual), "rejected balanced prefill touched output");
+                    ++checks;
+                }
+            }
+        }
+    FastllmCudaSetDevice(0);
+    printf("BALANCED PREFILL PASS paged=%d remote=%d\n", paged, remote);
+    fflush(stdout);
+}
+
+// Ragged requests share launches, never cache addresses or causal positions.
+static void BatchBalancedPrefillIndexer(bool paged, bool remote, bool eight = false) {
+    if (FastllmCudaRuntimeArch() != 90)
+        return;
+    constexpr int ranks = 4, topK = 2048;
+    std::vector<int> lengths = eight ? std::vector<int>(8, 512) : std::vector<int>{512, 1024, 1536, 4096};
+    std::vector<int> contexts = eight ? std::vector<int>(8, 32769) : std::vector<int>{32769, 16385, 8193, 65537};
+    struct Request {
+        std::unique_ptr<FP8Tensor> raw;
+        Data packed, q{BFLOAT16}, weights{BFLOAT16}, expected{INT32}, storage{INT32}, output;
+        const Data *key = nullptr;
+    };
+    std::vector<std::unique_ptr<Request>> requests;
+    for (int i = 0; i < (int)lengths.size(); ++i) {
+        auto item = std::make_unique<Request>();
+        item->raw = std::make_unique<FP8Tensor>(contexts[i], 320, 151 + i, paged);
+        if (i % 3 == 2) {
+            Data input(BFLOAT16);
+            Upload(input, {1, contexts[i], 128}, 161 + i);
+            FastllmCudaNaivePackIndexer(input, item->packed);
+            item->key = &item->packed;
+        } else
+            item->key = i % 3 ? &item->raw->dense : &item->raw->data();
+        Upload(item->q, {1, lengths[i], 2048}, 171 + i);
+        Upload(item->weights, {1, lengths[i], 16}, 181 + i);
+        if (remote) {
+            item->q.ToDevice(DataDevice::CUDA, {1}, true);
+            item->weights.ToDevice(DataDevice::CUDA, {1}, true);
+        }
+        FastllmCudaSetDevice(remote ? 1 : 0);
+        const int rows = lengths[i] / ranks;
+        item->expected.Resize({rows, topK});
+        item->expected.ToDevice(DataDevice::CUDA, {remote ? 1 : 0}, false);
+        item->expected.Allocate(false);
+        item->storage.Resize({rows + 2, topK});
+        item->storage.ToDevice(DataDevice::CUDA, {remote ? 1 : 0}, false);
+        item->storage.Allocate(false);
+        Cuda(cudaMemset(item->storage.cudaData, 0x5a, item->storage.GetBytes()));
+        item->output.Resize({rows, topK});
+        item->output.FakeFrom(item->storage, topK * sizeof(int));
+        requests.push_back(std::move(item));
+        FastllmCudaSetDevice(0);
+    }
+    FastllmCudaSetDevice(remote ? 1 : 0);
+    for (bool ties : {false, true}) {
+        if (ties)
+            for (auto &r : requests)
+                Cuda(cudaMemset(r->weights.cudaData, 0, r->weights.GetBytes()));
+        for (int rank : {0, 1, 3}) {
+            std::vector<FastllmNaivePrefillIndexerItem> items;
+            for (int i = 0; i < (int)requests.size(); ++i) {
+                auto &r = *requests[i];
+                const int part = lengths[i] / (2 * ranks);
+                for (int range = 0; range < 2; ++range) {
+                    int first = range ? lengths[i] - (rank + 1) * part : rank * part;
+                    Data q(BFLOAT16, {1, part, 2048}), w(BFLOAT16, {1, part, 16}), out(INT32, {part, topK});
+                    q.FakeFrom(r.q, (size_t)first * 2048 * 2);
+                    w.FakeFrom(r.weights, (size_t)first * 16 * 2);
+                    out.FakeFrom(r.expected, (size_t)range * part * topK * 4);
+                    FastllmCudaNaiveIndexer(q, w, *r.key, 16, 128, contexts[i] - lengths[i] + first, topK, true, out,
+                                            true);
+                }
+                items.push_back({&r.q, &r.weights, r.key, &r.output, contexts[i] - lengths[i]});
+            }
+            Require(FastllmCudaNaiveBatchBalancedIndexer(items, rank, ranks, true, true), "batch balanced declined");
+            std::vector<std::vector<int>> saved;
+            for (auto &r : requests) {
+                Require(Read<int>(r->expected) == Read<int>(r->output), "batch balanced TopK/tie mismatch");
+                auto whole = Read<int>(r->storage);
+                for (int i = 0; i < topK; ++i)
+                    Require(whole[i] == 0x5a5a5a5a && whole[whole.size() - topK + i] == 0x5a5a5a5a,
+                            "batch output guard overwritten");
+                saved.push_back(whole);
+                ++checks;
+            }
+            items.back().past = -1;
+            Require(!FastllmCudaNaiveBatchBalancedIndexer(items, rank, ranks, true, true), "invalid batch accepted");
+            items.back().past = contexts.back() - lengths.back();
+            if (!eight) {
+                // Metadata-only large contexts must decline before reading KV.
+                std::vector<std::unique_ptr<Data>> largeKeys;
+                auto large = items;
+                for (auto &item : large) {
+                    auto key = std::make_unique<Data>(item.keys->dataType, item.keys->dims);
+                    key->FakeFrom(*item.keys, 0);
+                    key->dims[1] = 200000;
+                    item.keys = key.get();
+                    item.past = 200000 - item.query->dims[1];
+                    largeKeys.push_back(std::move(key));
+                }
+                Require(!FastllmCudaNaiveBatchBalancedIndexer(large, rank, ranks, true, true), "score budget exceeded");
+            }
+            items.resize(9, items[0]);
+            Require(!FastllmCudaNaiveBatchBalancedIndexer(items, rank, ranks, true, true), "oversized batch accepted");
+            for (int i = 0; i < (int)requests.size(); ++i)
+                Require(saved[i] == Read<int>(requests[i]->storage), "declined batch changed output");
+        }
+    }
+    FastllmCudaSetDevice(0);
+    printf("BATCH BALANCED PREFILL PASS paged=%d remote=%d requests=%zu\n", paged, remote, requests.size());
+    fflush(stdout);
+}
+static void FusedPrefillAttention(bool paged) {
+    for (int rows : {32, 65, 256, 2048})
+        for (int kvHeads : {1, 2}) {
+            const int heads = kvHeads * 16, length = 8193;
+            FP8Tensor key(length, kvHeads * 192 + 128, 91, paged), value(length, kvHeads * 128, 97, paged);
+            Data q(BFLOAT16), sink(FLOAT32), idx(INT32), reference, actual;
+            Upload(q, {1, rows, heads * 192}, 53);
+            Upload(sink, {heads}, 71);
+            idx.Resize({rows, 2048});
+            idx.Allocate();
+            for (int r = 0; r < rows; ++r)
+                for (int i = 0; i < 2048; ++i) {
+                    int k = (i * 137 + r * 13) % length;
+                    if (r == 0 || i % 97 == 0)
+                        k = -1;
+                    else if (i % 193 == 0)
+                        k = length + 1;
+                    ((int *)idx.cpuData)[r * 2048 + i] = k;
+                }
+            idx.ToDevice(DataDevice::CUDA, {0}, true);
+            for (bool causal : {false, true}) {
+                // Dense BF16 contains the exact dequantized FP8 values and uses
+                // the materialized-score fallback instead of the FP8 fused path.
+                FastllmCudaNaiveAttention(q, key.dense, value.dense, idx, sink, heads, kvHeads, 192, 128,
+                                          length - rows, 0, reference, causal);
+                FastllmCudaNaiveAttention(q, key.data(), value.data(), idx, sink, heads, kvHeads, 192, 128,
+                                          length - rows, 0, actual, causal);
+                Require(Read<uint16_t>(actual) == Read<uint16_t>(reference), "fused FP8 prefill changed exact output");
+                ++checks;
+                if (causal && rows % 8 == 0) {
+                    Data balanced(INT32);
+                    balanced.Resize({rows, 2048});
+                    balanced.Allocate();
+                    int tile = rows / 8;
+                    auto original = Read<int>(idx);
+                    for (int row = 0; row < rows; ++row) {
+                        int rank = std::min(row, rows - 1 - row) / tile;
+                        int target = (2 * rank + (row >= rows / 2)) * tile + row % tile;
+                        std::memcpy((int *)balanced.cpuData + target * 2048, original.data() + row * 2048, 2048 * 4);
+                    }
+                    balanced.ToDevice(DataDevice::CUDA, {0}, true);
+                    bool fused = FastllmCudaNaiveBalancedAttention(q, key.data(), value.data(), balanced, sink, heads,
+                                                                   kvHeads, length - rows, 4, actual);
+                    Require(fused == (rows >= 2048 && FastllmCudaRuntimeArch() == 90), "balanced fused dispatch");
+                    Require(Read<uint16_t>(actual) == Read<uint16_t>(reference),
+                            "balanced fused FP8 prefill changed exact output");
+                    ++checks;
+                }
+            }
+        }
+    printf("FUSED FP8 PREFILL PASS paged=%d\n", paged);
+    fflush(stdout);
+}
+
+static void PrefillSwaStaging(bool paged) {
+    for (int rows : {33, 256, 257, 1024})
+        for (int past : {0, 127, 7935}) {
+            const int heads = 16, kvHeads = 2, length = past + rows;
+            FP8Tensor key(length, kvHeads * 192, 91, paged), value(length, kvHeads * 128, 97, paged);
+            Data q(BFLOAT16), sink(FLOAT32), idx, reference, actual;
+            Upload(q, {1, rows, heads * 192}, 53);
+            Upload(sink, {heads}, 71);
+            auto kb = Read<uint8_t>(paged ? key.pool : key.encoded),
+                 vb = Read<uint8_t>(paged ? value.pool : value.encoded);
+            // Chunks below the staging threshold read FP8 directly. Every
+            // query retains its absolute causal position and the same cache.
+            std::vector<uint16_t> expected;
+            for (int first = 0; first < rows;) {
+                const int count = rows - first < 256 ? rows - first : 128;
+                Data chunk;
+                chunk.Resize({1, count, heads * 192});
+                chunk.FakeFrom(q, (size_t)first * heads * 192 * q.unitSize);
+                FastllmCudaNaiveAttention(chunk, key.data(), value.data(), idx, sink, heads, kvHeads, 192, 128,
+                                          past + first, 128, reference);
+                auto values = Read<uint16_t>(reference);
+                expected.insert(expected.end(), values.begin(), values.end());
+                first += count;
+            }
+            FastllmCudaNaiveAttention(q, key.data(), value.data(), idx, sink, heads, kvHeads, 192, 128, past, 128,
+                                      actual);
+            Require(expected == Read<uint16_t>(actual), "SWA staging changed exact output");
+            Require(kb == Read<uint8_t>(paged ? key.pool : key.encoded), "SWA staging modified stored key");
+            Require(vb == Read<uint8_t>(paged ? value.pool : value.encoded), "SWA staging modified stored value");
+            ++checks;
+        }
+    printf("SWA PREFILL STAGING PASS paged=%d\n", paged);
+    fflush(stdout);
+}
+
 static void FP8SWA(int batch) {
     Data q(BFLOAT16), sink(FLOAT32), live(INT32), a, b;
     Upload(q, {1, batch, 8 * 192}, 31);
@@ -466,6 +718,15 @@ int main() {
                 FastllmCudaSetDevice(0);
             }
         }
+        for (bool paged : {false, true}) {
+            PrefillSwaStaging(paged);
+            FusedPrefillAttention(paged);
+            BatchBalancedPrefillIndexer(paged, false);
+            if (peerAccess) BatchBalancedPrefillIndexer(paged, true);
+            BalancedPrefillIndexer(paged,false);
+            if(peerAccess)BalancedPrefillIndexer(paged,true);
+        }
+        BatchBalancedPrefillIndexer(true, peerAccess != 0, true);
         for (bool paged : {false, true}) {
             PrefillIndexerPaths(32, 32769, paged, peerAccess != 0);
             PrefillIndexerPaths(65, 16385, paged, peerAccess != 0);

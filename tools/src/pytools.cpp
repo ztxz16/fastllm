@@ -7,6 +7,7 @@
 #include "devices/disk/diskdevice.h"
 #include "moe_cache_config.h"
 #include "utils/autotune.h"
+#include "cpu_thread_bench.h"
 
 #include <cstring>
 #include <csignal>
@@ -92,6 +93,17 @@ extern "C" {
         return fastllm::GetThreads();
     }
 
+    DLL_EXPORT const char *benchmark_cpu_linear_threads(int hidden, int intermediate, int kind,
+            const int *counts, int count, int budgetMs) {
+        static thread_local std::string result;
+        try {
+            if (!counts || count < 1 || count > 8 || hidden < 1 || intermediate < 1 ||
+                    budgetMs < 1 || budgetMs > 1000) return nullptr;
+            result = BenchmarkCpuLinearThreads(hidden, intermediate, kind, counts, count, budgetMs);
+            return result.c_str();
+        } catch (...) { return nullptr; }
+    }
+
     DLL_EXPORT void set_cpu_low_mem(bool low) {
         fastllm::SetLowMemMode(low);
     }
@@ -164,7 +176,13 @@ extern "C" {
             s.diskBytes, s.uploads, s.cpuEvictions, s.cudaEvictions,
             s.cpuCudaOverlapBytes, s.cudaDemotions, s.cudaDemotionBytes,
             s.cpuWorkspaceBytes, s.cpuBufferReuses, s.cpuBufferAllocations,
-            s.cpuReclaims, s.asyncMaintenance};
+            s.cpuReclaims, s.asyncMaintenance,
+            s.cpuBufferMmaps, s.cpuBufferMunmaps, s.cpuBufferSplits, s.cpuBufferCoalesces,
+            s.canonicalPromotionChecks, s.canonicalPromotionRejects, s.canonicalResidenceRejects,
+            s.canonicalUploadBytes, s.canonicalUploadUs, s.canonicalDownloadUs,
+            s.decodeHandoffD2HCopies, s.decodeHandoffD2HBytes, s.decodeHandoffWaitUs,
+            s.decodeOutputH2DCopies, s.decodeOutputH2DBytes,
+            s.residentReadbackCopies, s.residentReadbackBytes, s.residentReadbackWaitUs};
         const int count = sizeof(result) / sizeof(result[0]);
         if (values && capacity > 0) std::copy_n(result, std::min(capacity, count), values);
         return count;
@@ -802,12 +820,12 @@ extern "C" {
 
     DLL_EXPORT void set_model_indexer_tp_storage(int modelId, const char *storage) {
         const std::string value = storage;
-        fastllm::AssertInFastLLM(value == "replicated" || value == "layer_shard",
-                                "indexer_tp_storage should be replicated or layer_shard.");
+        fastllm::AssertInFastLLM(value == "replicated" || value == "layer_shard" || value == "context_shard",
+                                "indexer_tp_storage should be replicated, layer_shard or context_shard.");
         auto *model = dynamic_cast<fastllm::NaiveN05FlashModel *>(models.GetModel(modelId));
         fastllm::AssertInFastLLM(model || value == "replicated",
-                                "Indexer layer_shard storage currently supports Naive DSA models only.");
-        if (model) model->SetIndexerTPStorage(value == "layer_shard");
+                                "Sharded Indexer storage currently supports Naive DSA models only.");
+        if (model) model->SetIndexerTPStorage(value == "layer_shard", value == "context_shard");
     }
 
     DLL_EXPORT void set_model_kv_cache_dtype(int modelId, char *kv_cache_dtype) {
@@ -1311,6 +1329,12 @@ extern "C" {
     DLL_EXPORT void set_chunked_prefill_size_llm_model(int modelId, int size) {
         auto model = models.GetModel(modelId);
         model->SetChunkedPrefillSize(size);
+    }
+
+    DLL_EXPORT bool set_prefill_coalescing_llm_model(int modelId, int tokens, int maxWaitMs,
+                                                   int targetRequests, int maxRequests, int minDecodeRequests) {
+        return models.GetModel(modelId)->SetPrefillBatching(tokens, maxWaitMs, targetRequests,
+                                                          maxRequests, minDecodeRequests);
     }
 
     DLL_EXPORT bool set_prefill_batching_llm_model(int modelId, int tokens, int maxWaitMs) {

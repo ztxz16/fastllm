@@ -374,6 +374,11 @@ bool FastllmCudaMarlinHalfFP8Gemm(const void *a, const uint32_t *b_q_weight,
 // SM80+ BF16 / E4M3 / E8M0 block-32; preserves generic row-major weights.
 bool FastllmCudaMarlinBFloat16MXFP8Gemm(const void *a, const uint32_t *weight,
     const uint8_t *scales, void *c, int rows, int columns, int inner, int *workspace);
+// Small-M MXFP8 partial dot products, with FP32 output and no BF16 rounding.
+bool FastllmCudaMarlinBFloat16MXFP8GemmToFloat(const void *a, const uint32_t *weight,
+    const uint8_t *scales, float *c, int rows, int columns, int inner, int *workspace);
+bool FastllmCudaTryMarlinBFloat16MatMulFP8E4M3ToFloat(const void *input,
+    fastllm::Data &weight, float *output, int rows, int inner, int columns);
 bool FastllmCudaTryMarlinBFloat16MatMulFP8E4M3(const void *input,
     fastllm::Data &weight, void *output, int rows, int inner, int columns);
 // SM120 W8A8 MXFP8 linear: FP8 E4M3 weights with exact block-32 UE8M0
@@ -560,6 +565,10 @@ bool FastllmCudaV41Mxfp4Linear(const fastllm::Data &input, const fastllm::Data &
 bool FastllmCudaDeepSeekV41MoeHcPost(const fastllm::Data &input,
     const fastllm::Data &shared, const fastllm::Data &residual,
     const fastllm::Data &post, const fastllm::Data &comb, fastllm::Data &output);
+// Round each FP32 local branch to BF16, then round their sum to BF16.
+// The distinct output is ready for a BF16 collective; inputs are not modified.
+bool FastllmCudaDeepSeekV41MoeJoinBFloat16(const float *routed, const float *shared,
+                                        void *output, int count);
 // BF16 routed rows: preserve activation rounding before block-32 FP8 quantization.
 bool FastllmCudaDeepSeekV41BFloat16SwigluQuantized(const void *input, void *output,
         int rows, int intermediate, float limit, const float *routeScales);
@@ -987,6 +996,11 @@ bool FastllmCudaDeepSeekV41EngramApply(fastllm::Data &hidden, const fastllm::Dat
 bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
                                        int posStep, bool inverse, int originalSeqLen, float ropeFactor,
                                        int betaFast, int betaSlow, int quantMode, int quantDim, int quantBlock);
+// DSpark's root-local BF16 draft: fuse Q/KV rotary with the attention gather table.
+bool FastllmCudaDeepSeekV41DraftRotaryTable(fastllm::Data &q, fastllm::Data &kv,
+    const fastllm::Data &window, int ropeDim, float ropeBase, int startPos,
+    int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
+    const int *devicePosition, fastllm::Data &table);
 // Graph replay reads the current absolute position from a device scalar.
 bool FastllmCudaDeepSeekV41RotaryQuantPosition(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
                                        int posStep, bool inverse, int originalSeqLen, float ropeFactor,
@@ -2316,6 +2330,17 @@ bool FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
         const float *scores, int topk, int ownerRank, int ownerCount,
         bool deepSeekV41 = false, float swigluLimit = 0.0f,
         const fastllm::Data *prequantizedInput = nullptr);
+
+// Optional verification epilogue: preserve routed/shared BF16 rounding,
+// then write the BF16 input of the existing rank reduction. Returns false
+// before arithmetic for unsupported shapes; the caller retains ordinary join.
+bool FastllmCudaV41MarlinExpertParallelShared(
+        const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch, const int32_t *globalIndices,
+        const float *scores, int topk, int ownerRank, int ownerCount,
+        float swigluLimit,
+        const fastllm::Data *prequantizedInput,
+        const fastllm::Data &sharedPartial, fastllm::Data &joinedOutput, int parallelJoinLayer);
 bool FastllmCudaPrepareNVFP4E4M3Moe(fastllm::Data **weights, int weightsBatch);
 void FastllmCudaReleaseMergeMOEVllmMarlinCache(const fastllm::Data *layerKey);
 // Read-only readiness check: no repacking or allocation during graph capture.

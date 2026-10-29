@@ -13,6 +13,7 @@ bool NaiveN05FlashModel::SetSaveHistoryChat(bool save) {
     saveHistoryChat = save;
     if (!save) {
         prefixHistory.clear();
+        if (prefixPool) ++prefixPool->historyVersion;
         activePrefixes.clear();
     }
     return true;
@@ -58,8 +59,10 @@ void NaiveN05FlashModel::RetirePrefixSnapshot(std::shared_ptr<PrefixSnapshot> &s
     auto it = std::find(prefixHistory.begin(), prefixHistory.end(), snapshot);
     // A fork may still need this published checkpoint. Dropping its history
     // entry cannot free the slot while another request holds it.
-    if (it != prefixHistory.end() && snapshot.use_count() == 2)
+    if (it != prefixHistory.end() && snapshot.use_count() == 2) {
         prefixHistory.erase(it);
+        ++prefixPool->historyVersion;
+    }
     snapshot.reset();
 }
 
@@ -109,6 +112,7 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
             }
         }
         if (slot < 0) {
+            ++prefixPool->historyVersion;
             // Reclaim orphan windows before evicting a usable, recently used
             // checkpoint. Full KV and window pools share no physical copies.
             prefixHistory.erase(std::remove_if(prefixHistory.begin(), prefixHistory.end(),
@@ -214,6 +218,7 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
         !context->multimodalInput.empty()) return;
     auto active = activePrefixes.find(&context->pastKeyValues.front().first);
     if (active == activePrefixes.end()) return;
+    ++prefixPool->historyVersion;
     PrefixSnapshots snapshots = active->second.prefill;
     if (active->second.decode) snapshots.push_back(active->second.decode);
     for (const auto &snapshot : snapshots) {
@@ -265,6 +270,10 @@ bool NaiveN05FlashModel::TryRecordPagedPrefixCacheExtra(ResponseContext *context
 
 int NaiveN05FlashModel::QueryPagedPrefixCacheExtra(ResponseContext *context, int length) const {
     if (!saveHistoryChat || !context || !prefixPool) return 0;
+    if (context->prefillPreview) {
+        context->prefillPreview->Reset(context->currentTokens);
+        return PreviewPagedPrefixCacheExtra(context, length, *context->prefillPreview);
+    }
     std::lock_guard<std::mutex> guard(historyMutex);
     int best = 0;
     for (const auto &entry : prefixHistory) {
@@ -272,6 +281,48 @@ int NaiveN05FlashModel::QueryPagedPrefixCacheExtra(ResponseContext *context, int
             entry->HasResidentPrefix() &&
             entry->tokens.size() <= context->currentTokens.size() &&
             std::equal(entry->tokens.begin(), entry->tokens.end(), context->currentTokens.begin()))
+            best = entry->length;
+    }
+    return best;
+}
+
+int NaiveN05FlashModel::PreviewPagedPrefixCacheExtra(ResponseContext *context, int length,
+                                                   PrefillPrefixPreview &preview) const {
+    if (!saveHistoryChat || !context || !prefixPool) return 0;
+    struct PrefixPreview {
+        struct Match { std::weak_ptr<PrefixSnapshot> snapshot; bool equal = false; };
+        std::unordered_map<const PrefixSnapshot *, Match> matches;
+        std::vector<std::weak_ptr<PrefixSnapshot>> candidates;
+        uint64_t version = 0;
+        bool initialized = false;
+    };
+    if (!preview.modelState) preview.modelState = std::make_shared<PrefixPreview>();
+    auto &memo = *std::static_pointer_cast<PrefixPreview>(preview.modelState);
+    std::lock_guard<std::mutex> guard(historyMutex);
+    // Do not retain even an SWA checkpoint while waiting for more prompts.
+    // Cache only token equality; residency/generation is checked every pass.
+    if (!memo.initialized || memo.version != prefixPool->historyVersion) {
+        if (memo.matches.size() > prefixHistory.size() * 2 + 16) {
+            for (auto it = memo.matches.begin(); it != memo.matches.end();)
+                if (it->second.snapshot.expired()) it = memo.matches.erase(it); else ++it;
+        }
+        memo.candidates.clear();
+        for (const auto &entry : prefixHistory) {
+            if (entry->tokens.size() > preview.tokens.size()) continue;
+            auto &match = memo.matches[entry.get()];
+            if (match.snapshot.lock() != entry) {
+                match.snapshot = entry;
+                match.equal = std::equal(entry->tokens.begin(), entry->tokens.end(), preview.tokens.begin());
+            }
+            if (match.equal) memo.candidates.push_back(entry);
+        }
+        memo.version = prefixPool->historyVersion;
+        memo.initialized = true;
+    }
+    int best = 0;
+    for (const auto &candidate : memo.candidates) {
+        auto entry = candidate.lock();
+        if (entry && entry->length > best && entry->length <= length && entry->HasResidentPrefix())
             best = entry->length;
     }
     return best;

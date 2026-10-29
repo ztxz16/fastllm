@@ -27,6 +27,8 @@ ftllm server /path/to/model-00001-of-00002.gguf --auto \
 
 自动模式默认单请求、最多 1M 原生窗口、FP4 KV 和快速 Prefill。带内置 DSpark 权重时默认使用 DSpark 5；没有草稿权重的 GGUF 不会自动开启。设备、chunk 和专家缓存以 `[auto]` 日志为准。显卡和主存能容纳专家时优先避免磁盘专家，Engram 仍可独立使用磁盘。
 
+上下文长度和内存预算允许时，自动规划先保证 chunk 1024，再争取每卡 3 GiB 专家缓存，之后按预计延迟选择更大的 chunk 或缓存。流式 GGUF 磁盘专家路径优先争取 chunk 4096。预算不足时允许缩小 chunk，显式指定的 chunk 和缓存参数仍优先。
+
 | 需要调整 | 追加参数 |
 | --- | --- |
 | 32K 窗口、单请求 | `--max_context_length 32768 --max_batch 1` |
@@ -135,7 +137,7 @@ Hybrid 模式下，磁盘表的 value 与 scale 使用已有的 I/O worker 并�
 
 | 开关 | 作用 |
 |---|---|
-| `FASTLLM_DSV41_ENGRAM_PREFETCH=1` | 跨层预取。后台线程提前计算下一层的 n-gram 行号；常驻表还会在缓存预算内预读表行，磁盘模式只预计算行号。后台线程只看历史窗口的快照，不引用请求状态。 |
+| `FASTLLM_DSV41_ENGRAM_PREFETCH`（默认开，=0 关） | 至少 128 token 时，后台提前计算当前流水线阶段内 CPU Engram 层的 n-gram 行号，并完成常驻或磁盘表的查表与 BF16 转换，支持原始 FP8 和 GGUF 表。每次前向只保留一份历史快照、最多一批预取结果；短请求和 GPU 常驻表保持同步路径。 |
 | `FASTLLM_DSV41_ENGRAM_MADVISE=random / hugepage / both` | 仅作用于常驻表：`random` 设置 `MADV_RANDOM`；`hugepage` 使用匿名 mmap + `MADV_HUGEPAGE` 分配，减少页表与 TLB 开销，并省掉 `std::vector` 的清零。 |
 | `FASTLLM_DSV41_ENGRAM_WKV_FP8`（默认开，=0 关） | `layers.{1,14}.engram.wkv.weight` 在真实权重里本来就是 F8_E4M3 + UE8M0 块 scale（`[25600, 6144]`，block 32x32），默认会被解量化成启动 dtype（float16），每层 157 MB 变 314 MB。打开后按原样保留 FP8，**不做任何重量化**——权重数值就是 checkpoint 里的那份，比解成 float16 还少一次舍入；省下每层 157 MB 显存与同样多的每步带宽。只有伴随的 `.scale` 张量存在时才切换，权重是 BF16 的迷你模型不受影响。 |
 
@@ -545,23 +547,29 @@ DSML 块前的两个模板分隔换行不作为 assistant 正文返回，避免�
 迷你模型上精确命中与 T-1 截断命中后的贪心输出与不中断的原请求逐 bit 一致；800 token 提示词的
 首 token 延迟从 39–54 ms 降到 6 ms。
 
-## GGUF 视觉模块
+## DSpark 投机解码
 
-DeepSeek V4.1 GGUF 主模型可使用 `--mmproj /models/mmproj-BF16.gguf` 加载
-`clip` / `deepseek41v` 视觉模块。视觉配置和图像 token 从 GGUF 读取，无需 `--ori`；
-auto 另外计入转换后的视觉权重及工作区。
+### 外置 GGUF 草稿与视觉模块
+
+DeepSeek V4.1 GGUF 主模型可以通过 `--draft`（或 `--dspark_model`）加载 Unsloth 的
+`dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf`。加载器识别 `dflash` 架构，校验主干维度，
+复用现有 V4.1 DSpark 验证、回滚和专家分流；它与 Qwen 的 DFlash2 是不同路径。
 
 ```bash
 ftllm server /models/DeepSeek-V4.1-Flash-1017-IQ2_XXS-00001-of-00004.gguf \
-  --auto --mmproj /models/mmproj-BF16.gguf
+  --auto --draft /models/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf
 ```
 
+默认使用文件中的训练 block（1017 版为 5），可用 `--dspark N` 或 `--draft_tokens N` 调整。
+`--speculative_algorithm off` 会同时关闭草稿加载。auto 计入草稿权重、状态和验证工作区；
+MXFP4 专家无损转换为原生紧凑布局，磁盘主干的草稿专家保持 CPU/NUMA 常驻，计入主存预算。
+
+`--mmproj /models/mmproj-BF16.gguf` 支持 `clip` / `deepseek41v` 视觉模块，也可以和上述草稿一起加载。
+视觉配置从 GGUF 读取，无需 `--ori`；auto 另外预留视觉权重和工作区。
 图像输入还要求主干每层的 `ffn.gate.bias_vl`。部分 GSQ 纯文本导出省略了这些偏置，
 此时需要把**同一原始模型版本**的视觉路由偏置放入 mmproj（GGUF 名称为
-`blk.N.exp_probs_b_vl.bias`）。加载器会在读取大权重之前检查缺失项，不能以文本偏置替代；
-主干已有的偏置不会被 mmproj 重复加载。
+`blk.N.exp_probs_b_vl.bias`）。加载器会在读取大权重之前检查缺失项，不能以文本偏置替代。
 
-## DSpark 投机解码
 
 `config.json` 的 `text_config` 里 `dspark_block_size > 0` 且 checkpoint 带 `mtp.*` 权重时可以开启。
 启动加 `--speculative_algorithm dspark --dspark 5`。`--dspark N` 指每轮最多校验 N 个候选，
@@ -789,7 +797,7 @@ Graph fixture 需要 PyTorch、safetensors、numpy 和两张 CUDA GPU；覆盖�
 | `FASTLLM_DSV41_INDEX_SCORE_MB` | indexer 分数矩阵的显存预算（MB，默认 128），决定 token 维分块大小 |
 | `FASTLLM_DSV41_INDEX_CHUNK` | 直接指定 indexer 的 token 分块大小（覆盖上面的预算推算） |
 | `FASTLLM_DSV41_ENGRAM_PROFILE` | Engram 查表 / 转换 / 投影分段计时（见 "Engram 元数据"） |
-| `FASTLLM_DSV41_ENGRAM_PREFETCH` | 跨层预取下一个 Engram 层的行号与表行 |
+| `FASTLLM_DSV41_ENGRAM_PREFETCH` | 默认对至少 128 token 的 CPU Engram 表预取行号与 BF16 行，设为 0 关闭 |
 | `FASTLLM_DSV41_ENGRAM_MADVISE` | Engram 表的内存访问提示（random / hugepage / both） |
 | `FASTLLM_DSV41_ENGRAM_WKV_FP8` | `engram.wkv` 保留 checkpoint 里的 FP8 精度，不解量化 |
 | `FASTLLM_DSV41_DISABLE_FAKE_QUANT` | 关闭 FP8 / FP4 伪量化（仅用于对齐调试） |

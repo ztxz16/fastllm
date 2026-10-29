@@ -8382,3 +8382,94 @@ void ggml_vec_dot_iq1_q8_K_batch(ggml_type type, int n, const void *weight,
     const auto dot = type == GGML_TYPE_IQ1_M ? ggml_vec_dot_iq1_m_q8_K : ggml_vec_dot_iq1_s_q8_K;
     for (; row < rows; ++row) dot(n, outputs + row, 0, weight, 0, inputs[row], 0, 1);
 }
+
+#include "ggml-iq-batch.h"
+
+#if defined(__AVX2__)
+static inline float IQ2BatchScale(ggml_half value) {
+#if defined(__F16C__)
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(value)));
+#else
+    return GGML_FP16_TO_FP32(value);
+#endif
+}
+static void iq2_xxs_q8_K_pair(int n, const block_iq2_xxs *x,
+        const void *const *inputs, float *outputs) {
+    const auto *signs = reinterpret_cast<const uint64_t *>(keven_signs_q2xs);
+    const block_q8_K *y[2] = {static_cast<const block_q8_K *>(inputs[0]),
+                              static_cast<const block_q8_K *>(inputs[1])};
+    __m256 acc[2] = {_mm256_setzero_ps(), _mm256_setzero_ps()};
+    for (int b=0;b<n/QK_K;++b) {
+        __m256i sum1[2] = {}, sum2[2] = {};
+        for (int g=0;g<8;g+=2) {
+            uint32_t meta[4];
+            memcpy(meta,x[b].qs+4*g,sizeof(meta));
+            const auto *q=reinterpret_cast<const uint8_t *>(meta);
+            const __m256i values[2] = {
+                _mm256_setr_epi64x(iq2xxs_grid[q[0]],iq2xxs_grid[q[1]],iq2xxs_grid[q[2]],iq2xxs_grid[q[3]]),
+                _mm256_setr_epi64x(iq2xxs_grid[q[8]],iq2xxs_grid[q[9]],iq2xxs_grid[q[10]],iq2xxs_grid[q[11]])};
+            const __m256i sign[2] = {
+                _mm256_setr_epi64x(signs[meta[1]&127],signs[(meta[1]>>7)&127],signs[(meta[1]>>14)&127],signs[(meta[1]>>21)&127]),
+                _mm256_setr_epi64x(signs[meta[3]&127],signs[(meta[3]>>7)&127],signs[(meta[3]>>14)&127],signs[(meta[3]>>21)&127])};
+            const __m256i scale[2] = {_mm256_set1_epi16(2*(meta[1]>>28)+1),
+                                      _mm256_set1_epi16(2*(meta[3]>>28)+1)};
+            for (int r=0;r<2;++r) {
+                const auto a=_mm256_loadu_si256((const __m256i *)(y[r][b].qs+32*g));
+                const auto c=_mm256_loadu_si256((const __m256i *)(y[r][b].qs+32*(g+1)));
+                sum1[r]=_mm256_add_epi32(sum1[r],_mm256_madd_epi16(
+                    _mm256_maddubs_epi16(values[0],_mm256_sign_epi8(a,sign[0])),scale[0]));
+                sum2[r]=_mm256_add_epi32(sum2[r],_mm256_madd_epi16(
+                    _mm256_maddubs_epi16(values[1],_mm256_sign_epi8(c,sign[1])),scale[1]));
+            }
+        }
+        const float dx=IQ2BatchScale(x[b].d);
+        for (int r=0;r<2;++r)
+            acc[r]=_mm256_fmadd_ps(_mm256_set1_ps(dx*y[r][b].d),
+                _mm256_cvtepi32_ps(_mm256_add_epi32(sum1[r],sum2[r])),acc[r]);
+    }
+    for (int r=0;r<2;++r) outputs[r]=.125f*hsum_float_8(acc[r]);
+}
+
+static void iq2_xs_q8_K_pair(int n, const block_iq2_xs *x,
+        const void *const *inputs, float *outputs) {
+    const block_q8_K *y[2] = {static_cast<const block_q8_K *>(inputs[0]),
+                              static_cast<const block_q8_K *>(inputs[1])};
+    __m256 acc[2] = {_mm256_setzero_ps(), _mm256_setzero_ps()};
+    for (int b=0;b<n/QK_K;++b) {
+        __m256i sum[2] = {};
+        for (int g=0;g<8;++g) {
+            const auto qx=iq_native::unpack(x[b],g);
+            const auto scales=_mm256_insertf128_si256(_mm256_castsi128_si256(
+                _mm_set1_epi16(iq_native::iq2_s_scale(x[b],g,0))),
+                _mm_set1_epi16(iq_native::iq2_s_scale(x[b],g,1)),1);
+            for (int r=0;r<2;++r) {
+                const auto qy=_mm256_loadu_si256((const __m256i *)(y[r][b].qs+32*g));
+                const auto pair=_mm256_maddubs_epi16(_mm256_abs_epi8(qy),_mm256_sign_epi8(qx,qy));
+                sum[r]=_mm256_add_epi32(sum[r],_mm256_madd_epi16(pair,scales));
+            }
+        }
+        const float dx=IQ2BatchScale(x[b].d);
+        for (int r=0;r<2;++r)
+            acc[r]=_mm256_add_ps(acc[r],_mm256_mul_ps(_mm256_set1_ps(dx*y[r][b].d),_mm256_cvtepi32_ps(sum[r])));
+    }
+    for (int r=0;r<2;++r) {
+        __m128 sum=_mm_add_ps(_mm256_castps256_ps128(acc[r]),_mm256_extractf128_ps(acc[r],1));
+        sum=_mm_add_ps(sum,_mm_movehl_ps(sum,sum));
+        outputs[r]=.125f*_mm_cvtss_f32(_mm_add_ss(sum,_mm_movehdup_ps(sum)));
+    }
+}
+#endif
+
+void ggml_vec_dot_iq2_q8_K_batch(ggml_type type, int n, const void *weight,
+        const void *const *inputs, float *outputs, int rows) {
+    assert((type==GGML_TYPE_IQ2_XXS || type==GGML_TYPE_IQ2_XS) && n%QK_K==0 && rows>0);
+    int row=0;
+#if defined(__AVX2__)
+    for (;row+1<rows;row+=2) {
+        if (type==GGML_TYPE_IQ2_XXS) iq2_xxs_q8_K_pair(n,static_cast<const block_iq2_xxs *>(weight),inputs+row,outputs+row);
+        else iq2_xs_q8_K_pair(n,static_cast<const block_iq2_xs *>(weight),inputs+row,outputs+row);
+    }
+#endif
+    const auto dot=type==GGML_TYPE_IQ2_XXS ? ggml_vec_dot_iq2_xxs_q8_K : ggml_vec_dot_iq2_xs_q8_K;
+    for (;row<rows;++row) dot(n,outputs+row,0,weight,0,inputs[row],0,1);
+}

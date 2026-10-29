@@ -6,6 +6,7 @@
 #include "qwen4_exp_tp.h"
 #include "models/qwen4_paged_cache.h"
 #include "executor.h"
+#include "devices/disk/diskdevice.h"
 #include "utils.h"
 #ifdef USE_CUDA
 #ifndef USE_ROCM
@@ -278,6 +279,24 @@ namespace fastllm {
             }
         }
 #endif
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (runRoutedExperts && moeDevice == "disk" && batch * sequence == 1) {
+            selectExperts();
+            if (DiskMoeAsyncScope::TryRun(deviceLayer, flattened, expertIndex, expertScore, output,
+                    [&] { runSharedExpert(sharedOutput); })) {
+                finishHybrid();
+                return;
+            }
+            if (!FastllmCudaGraphIsCapturingFast()) {
+                DiskMergeMOE disk;
+                if (disk.RunGpuGGUFDecode(flattened, expertIndex, expertScore, output, moeWeights,
+                        [&] { runSharedExpert(sharedOutput); })) {
+                    finishHybrid();
+                    return;
+                }
+            }
+        }
+#endif
         runSharedExpert(runRoutedExperts ? sharedOutput : output);
 
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
@@ -373,7 +392,16 @@ namespace fastllm {
                 routedInput = &cpuInput;
             }
 #endif
-            MergeMOE(*routedInput, expertIndex, expertScore, moeWeights, moeBiass, w1, w2, w3,
+            // Disk dispatch changes routing tensors to CPU placement. Keep
+            // captured routing buffers resident and owned by the dense graph.
+            Data diskIndex, diskScore;
+            Data *routedIndex = &expertIndex, *routedScore = &expertScore;
+            if (prepared && moeDevice == "disk") {
+                diskIndex.CopyFrom(expertIndex);
+                diskScore.CopyFrom(expertScore);
+                routedIndex = &diskIndex; routedScore = &diskScore;
+            }
+            MergeMOE(*routedInput, *routedIndex, *routedScore, moeWeights, moeBiass, w1, w2, w3,
                      temporaryInput, temporaryOutput, 1.0f, routedOutput, deviceLayer);
         }
 #ifdef USE_CUDA
@@ -428,7 +456,10 @@ namespace fastllm {
         const bool ordinaryHost = std::any_of(weights.begin(),weights.end(),[&](const auto &table) {
             return table.size()>2 && table[2] && table[2]->dataDevice==CPU && table[2]->cpuData && !table[2]->isDiskWeight;
         });
-        if (MoeCudaCacheRequested() || ordinaryHost) {
+        // DiskMergeMOE owns the GPU tier for whole disk layers, including
+        // models with CUDA-resident layers. Other placements keep their planner.
+        const bool diskCache = !DiskMoeLayerIndices(weights).empty();
+        if ((MoeCudaCacheRequested() || ordinaryHost) && !diskCache) {
             HybridMoeCachePlan cache;
             const bool includeDraft = hasMtpWeights && !weights.empty() && weights[0].size() > 2 &&
                 weights[0][2]->isGGUFData && mtpMoeWeights[2]->isGGUFData;
@@ -581,6 +612,22 @@ namespace fastllm {
         NsysRange forward(NsysEnabled() ? std::string("forward/") +
             (inputIds.Count(0) > batch ? "prefill/" : "decode/") +
             std::to_string(inputIds.Count(0)) : std::string());
+        int asyncDevice = 0;
+        bool asyncDisk = false;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (batch == 1 && inputIds.dims == std::vector<int>({1, 1}) &&
+            !DiskMoeLayerIndices(weights).empty() &&
+            !prefill && !threadTpState && threadTpRank < 0 && Qwen4MtpDraftsPerStep() == 0 &&
+            std::getenv("FASTLLM_QWEN4_DUMP_DIR") == nullptr && Qwen4CudaOnlyDeviceMap(deviceMap)) {
+            std::map<int, int> ratios;
+            const auto devices = ParseDeviceIds(SelectDeviceFromMap(deviceMap, 1, block_cnt), "cuda", ratios);
+            asyncDisk = devices.size() == 1;
+            if (asyncDisk) asyncDevice = devices[0];
+            for (int l = 1; l < block_cnt && asyncDisk; ++l)
+                asyncDisk = SelectDeviceFromMap(deviceMap, l + 1, block_cnt) == SelectDeviceFromMap(deviceMap, 1, block_cnt);
+        }
+#endif
+        DiskMoeAsyncScope diskAsync(weights, asyncDevice, asyncDisk, autoWarmupRunning.load());
         ForwardState frame(*this, ExecutionMode::Hybrid, batch, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig,
             lastTokens, retLogits, targetMultiHidden, allVerificationTokens, verificationAccepted,
             verificationCapture, recordPrefixSnapshot, allowDecodeCudaGraph, decodeEquivalentGdn,
@@ -597,6 +644,8 @@ namespace fastllm {
             frame.PrefetchExperts(layer + 1);
             frame.EndLayer(layer);
         }
-        return frame.Finish();
+        auto result = frame.Finish();
+        diskAsync.Finish();
+        return result;
     }
 } // namespace fastllm

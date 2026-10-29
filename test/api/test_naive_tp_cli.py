@@ -56,6 +56,18 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
                 self.configure(options + ([] if saved else ['--indexer_tp_storage', 'layer_shard']),
                                model_type=model, saved=saved)
 
+    def test_context_sharded_indexer_requires_kvmem_and_cuda_tp(self):
+        for saved in (False, True):
+            settings = {'tp': '4', 'indexer_tp_storage': 'context_shard', 'kvmem': '{}'}
+            options = [] if saved else [v for k, value in settings.items() for v in ('--' + k, value)]
+            self.configure(options, saved=settings if saved else None)
+            self.assertEqual(self.model_options['indexer_tp_storage'], 'context_shard')
+        for options, model in [(['--tp', '4'], 'naive_n05_flash'),
+                               (['--tp', '1', '--kvmem', '{}'], 'naive_n05_flash'),
+                               (['--tp', '4', '--kvmem', '{}'], 'llama')]:
+            with self.subTest(options=options, model=model), self.assertRaisesRegex(ValueError, '[Ii]ndexer'):
+                self.configure(options + ['--indexer_tp_storage', 'context_shard'], model_type=model)
+
     def test_prefill_batching_cli_and_saved_settings(self):
         for options, saved in [(['--tp', '8', '--prefill_batch_tokens', '16384',
                                   '--prefill_max_wait_ms', '20', '--chunked_prefill_size', '8192'], None),
@@ -75,6 +87,21 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
                 self.configure(options)
         with self.assertRaisesRegex(ValueError, 'prefill'):
             self.configure([], saved={'prefill_batch_tokens': 2147483648})
+
+    def test_prefill_coalescing_targets_and_caps(self):
+        values = {'prefill_batch_tokens': 16384, 'prefill_max_wait_ms': 20000,
+                  'prefill_batch_requests': 16, 'prefill_max_requests': 24,
+                  'prefill_min_decode_requests': 8}
+        for saved in (False, True):
+            options = [] if saved else [part for k, v in values.items() for part in ('--' + k, str(v))]
+            self.configure(options, saved=values if saved else None)
+            self.loaded_model.set_prefill_batching.assert_called_once_with(
+                16384, 20000, target_requests=16, max_requests=24, min_decode_requests=8)
+        for changes in ({'prefill_batch_requests': -1}, {'prefill_max_requests': 15},
+                        {'prefill_min_decode_requests': -1}, {'prefill_batch_tokens': 0},
+                        {'prefill_max_requests': 2147483648}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'prefill'):
+                self.configure([], saved={**values, **changes})
 
     def test_tp_defaults_and_explicit_slab(self):
         for ranks in (2, 4, 8):

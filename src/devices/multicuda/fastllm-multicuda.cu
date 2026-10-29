@@ -4078,6 +4078,61 @@ void FastllmNcclAllReduceNoCustomWithSpin(void* data, void* dest, int count,
     FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, false, hostSpinMicroseconds);
 }
 
+#ifdef FASTLLM_USE_NCCL
+// Match AllReduce/Broadcast's host submission boundaries. A fast rank must
+// not enter a synchronizing CUDA/cuBLAS initialization while another rank
+// still has not submitted this collective. No GPU completion wait is added.
+template <class Submit>
+static bool FastllmNcclSubmitGatherScatter(const char *operation, int count,
+                                          int dataType, int deviceId, Submit submit) {
+    const cudaStream_t stream = cudaStreamPerThread;
+    auto *rendezvous = FastllmCudaGetNcclForceSync() ? nullptr : g_ncclSubmitRendezvous.get();
+    int rank = -1;
+    if (rendezvous != nullptr) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        const cudaError_t state = cudaStreamIsCapturing(stream, &capture);
+        if (state != cudaSuccess) {
+            rendezvous->Abort("Gather/Scatter stream capture query failed");
+            cudaGetLastError();
+            FastllmCudaSetThreadError();
+            return false;
+        }
+        // Captured collectives are only recorded, not submitted. Keep both
+        // boundaries out of capture, including captures done rank by rank.
+        if (capture != cudaStreamCaptureStatusNone) rendezvous = nullptr;
+        else {
+            auto it = g_ncclRanks.find(deviceId);
+            if (it != g_ncclRanks.end()) rank = it->second;
+        }
+    }
+    auto waitForRanks = [&](fastllm::NcclSubmitRendezvous::Phase phase) {
+        if (rendezvous == nullptr || rendezvous->Wait(rank, phase, count, dataType)) return true;
+        printf("Error: %s submission on device %d: %s\n",
+               operation, deviceId, rendezvous->Error().c_str());
+        FastllmCudaSetThreadError();
+        return false;
+    };
+    if (!waitForRanks(fastllm::NcclSubmitRendezvous::Before)) return false;
+    FastllmCudaGraphRecordCollective();
+    const ncclResult_t result = submit(stream);
+    if (result != ncclSuccess) {
+        if (rendezvous != nullptr) rendezvous->Abort("Gather/Scatter NCCL submission failed");
+        printf("Error: nccl%s failed on device %d: %s\n",
+               operation, deviceId, ncclGetErrorString(result));
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    if (!waitForRanks(fastllm::NcclSubmitRendezvous::After)) return false;
+    if (FastllmNcclPostSyncEnabled(stream)) {
+        const cudaError_t state = cudaStreamSynchronize(stream);
+        checkCudaErrors("Error: CUDA error when synchronizing NCCL gather/scatter!", state);
+        return state == cudaSuccess;
+    }
+    return true;
+}
+
+#endif
+
 bool FastllmNcclAllGather(const void* data, void* dest, int count,
                          int dataType, int deviceId) {
 #ifndef FASTLLM_USE_NCCL
@@ -4111,24 +4166,12 @@ bool FastllmNcclAllGather(const void* data, void* dest, int count,
     ncclDataType_t type = ncclFloat;
     if (data == nullptr || dest == nullptr || count <= 0 || comm == nullptr ||
         !FastllmNcclResolveDataType(dataType, type, "AllGather")) {
+        if (g_ncclSubmitRendezvous) g_ncclSubmitRendezvous->Abort("invalid AllGather arguments");
         FastllmCudaSetThreadError();
         return false;
     }
-    const cudaStream_t stream = cudaStreamPerThread;
-    FastllmCudaGraphRecordCollective();
-    const ncclResult_t result = ncclAllGather(data, dest, count, type, comm, stream);
-    if (result != ncclSuccess) {
-        printf("Error: ncclAllGather failed on device %d: %s\n",
-               deviceId, ncclGetErrorString(result));
-        FastllmCudaSetThreadError();
-        return false;
-    }
-    if (FastllmNcclPostSyncEnabled(stream)) {
-        const cudaError_t state = cudaStreamSynchronize(stream);
-        checkCudaErrors("Error: CUDA error when synchronizing NCCL allgather!", state);
-        return state == cudaSuccess;
-    }
-    return true;
+    return FastllmNcclSubmitGatherScatter("AllGather", count, dataType, deviceId,
+        [&](cudaStream_t stream) { return ncclAllGather(data, dest, count, type, comm, stream); });
 #endif
 }
 
@@ -4157,24 +4200,12 @@ bool FastllmNcclReduceScatter(const void* data, void* dest, int count,
     ncclDataType_t type = ncclFloat;
     if (data == nullptr || dest == nullptr || count <= 0 || comm == nullptr ||
         !FastllmNcclResolveDataType(dataType, type, "ReduceScatter")) {
+        if (g_ncclSubmitRendezvous) g_ncclSubmitRendezvous->Abort("invalid ReduceScatter arguments");
         FastllmCudaSetThreadError();
         return false;
     }
-    const cudaStream_t stream = cudaStreamPerThread;
-    FastllmCudaGraphRecordCollective();
-    const ncclResult_t result = ncclReduceScatter(data, dest, count, type, ncclSum, comm, stream);
-    if (result != ncclSuccess) {
-        printf("Error: ncclReduceScatter failed on device %d: %s\n",
-               deviceId, ncclGetErrorString(result));
-        FastllmCudaSetThreadError();
-        return false;
-    }
-    if (FastllmNcclPostSyncEnabled(stream)) {
-        const cudaError_t state = cudaStreamSynchronize(stream);
-        checkCudaErrors("Error: CUDA error when synchronizing NCCL reduce-scatter!", state);
-        return state == cudaSuccess;
-    }
-    return true;
+    return FastllmNcclSubmitGatherScatter("ReduceScatter", count, dataType, deviceId,
+        [&](cudaStream_t stream) { return ncclReduceScatter(data, dest, count, type, ncclSum, comm, stream); });
 #endif
 }
 
@@ -4248,5 +4279,29 @@ void FastllmNcclReduce(void* data, void* dest, int count, int dataType, int root
         cudaError_t syncState = cudaStreamSynchronize(stream);
         checkCudaErrors("Error: CUDA error when synchronizing NCCL reduce!", syncState);
     }
+#endif
+}
+
+// Scalar messages use peer reads when eligible; larger or unsupported messages
+// retain NCCL unsigned MAX semantics.
+bool FastllmNcclAllReduceMaxUint64(void *data, int count, int deviceId) {
+    if (count == 1 && FastllmCudaCustomScalarMaxUint64(data, deviceId)) return true;
+#ifndef FASTLLM_USE_NCCL
+    // A one-rank reduction is an identity. Reject unsupported multi-rank
+    // shapes instead of introducing a mandatory NCCL link.
+    return data && count > 0 && g_ncclInitialized && g_ncclWorldSize == 1 &&
+        g_ncclRanks.find(deviceId) != g_ncclRanks.end();
+#else
+    ncclComm_t comm = FindNcclCommNoLog(deviceId);
+    if (!comm || !data || count <= 0) return false;
+    FastllmCudaGraphRecordCollective();
+    ncclResult_t result = ncclAllReduce(data, data, count, ncclUint64, ncclMax,
+                                      comm, cudaStreamPerThread);
+    if (result != ncclSuccess) { FastllmCudaSetThreadError(); return false; }
+    if (FastllmNcclPostSyncEnabled(cudaStreamPerThread) &&
+        cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+        FastllmCudaSetThreadError(); return false;
+    }
+    return true;
 #endif
 }

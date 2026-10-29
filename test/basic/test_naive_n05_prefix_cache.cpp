@@ -65,6 +65,47 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         prefixHistory.clear();
     }
 
+    static void BudgetPreviewOwnership() {
+        NaiveN05PrefixCacheTestAccess model(4);
+        auto c = model.Request(0);
+        model.Checkpoint(*c, 0, 8192); model.Checkpoint(*c, 8192, 200);
+        model.Checkpoint(*c, 8447, 1); model.Publish(*c); model.Drain(*c);
+        auto *pool = model.GetPagedKVCacheManager(0, true);
+        auto refs = pool->pageRefCount;
+        PrefillPrefixPreview preview; preview.Reset(c->currentTokens);
+        Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8192, preview) == 8192,
+                "short preview did not honor its limit");
+        for (int i = 0; i < 20; ++i)
+            Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8448, preview) == model.WindowHit(*c),
+                    "SWA preview differs from actual query");
+        Require(pool->pageRefCount == refs, "SWA preview pinned full KV");
+        // Publication changes the candidate set even if the request itself is
+        // unchanged. Keep another owner of the replaced checkpoint to ensure
+        // invalidation does not depend on weak-pointer expiry alone.
+        auto held = model.prefixHistory.back();
+        auto replacement = model.Request(0);
+        model.Checkpoint(*replacement, 0, 8192);
+        model.Checkpoint(*replacement, 8192, 200);
+        model.Checkpoint(*replacement, 8447, 1);
+        model.Publish(*replacement); model.Drain(*replacement);
+        Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8448, preview) == model.WindowHit(*c),
+                "publication reused a retired candidate");
+        held.reset();
+        // Weak metadata must not keep the four checkpoint slots alive.
+        model.prefixHistory.clear();
+        Require(model.prefixPool->freeSlots.size() == 4, "preview pinned an SWA checkpoint");
+        Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8448, preview) == 0,
+                "preview resurrected removed SWA checkpoint");
+        auto other = model.Request(1); model.Checkpoint(*other, 0, 8192);
+        model.Publish(*other); model.Drain(*other);
+        c->currentTokens = other->currentTokens; preview.Reset(c->currentTokens);
+        Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8448, preview) == model.WindowHit(*c),
+                "query mutation reused stale token equality");
+        pool->SetMaxPages(390625);
+        Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8448, preview) == 0,
+                "preview trusted token equality after full KV eviction");
+    }
+
     static void Capacity() {
         PrefixPool pool;
         pool.slotBytes = 3194880;
@@ -222,6 +263,7 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
 
 int main() {
     try {
+        fastllm::NaiveN05PrefixCacheTestAccess::BudgetPreviewOwnership();
         fastllm::NaiveN05PrefixCacheTestAccess::Capacity();
         fastllm::NaiveN05PrefixCacheTestAccess::PinnedPressure();
         fastllm::NaiveN05PrefixCacheTestAccess::FourPerRequest();

@@ -65,7 +65,7 @@ __device__ void Enqueue(bool take, int item, int *queue, int &total, Scan::TempS
     __syncthreads();
 }
 
-__global__ void Plan(Storage s, const int *requests, const int *lengths,
+__global__ void PlanResidentCount(Storage s, const int *requests, const int *lengths,
                      const int *selected, const int *counts, const int *const *selectedRows) {
     const int b = blockIdx.x, t = threadIdx.x, request = requests[b];
     const int capacity = s.cfg.residentTokens, width = s.cfg.maxSelected;
@@ -113,10 +113,18 @@ __global__ void Plan(Storage s, const int *requests, const int *lengths,
     // Complete hit protection before examining any victim. Empty slots are
     // consumed first; otherwise a rotating order avoids repeatedly evicting
     // the same low-numbered slots. Selected hits can never be victims.
-    for (int pass = 0; pass < 2 && navailable < nmiss; ++pass) {
+    // Each unique insertion increments misses; each removed resident row
+    // increments evictions. Create/Reset clear both counters and the map.
+    // Their unsigned difference is therefore the exact current occupancy,
+    // even across counter wrap. DeviceStats exposes a read-only pointer.
+    const bool full = nmiss &&
+        s.stats[request].misses - s.stats[request].evictions ==
+            static_cast<unsigned long long>(capacity);
+    for (int pass = full ? 1 : 0; pass < 2 && navailable < nmiss; ++pass) {
         for (size_t first = 0; first < size_t(capacity) && navailable < nmiss; first += blockDim.x) {
             const size_t i = first + t;
-            const int slot = (size_t(start) + i) % capacity;
+            const size_t sum = size_t(start) + i;
+            const int slot = int(sum >= size_t(capacity) ? sum - capacity : sum);
             const bool take = i < size_t(capacity) && !protect[slot] &&
                 (pass == 0 ? tokens[slot] < 0 : tokens[slot] >= 0);
             Enqueue(take, slot, available, navailable, tmp);
@@ -138,7 +146,10 @@ __global__ void Plan(Storage s, const int *requests, const int *lengths,
         s.lengths[b] = length ? capacity : 0;
         s.pointers[2 * b] = s.key + size_t(request) * capacity * s.cfg.keyRowBytes;
         s.pointers[2 * b + 1] = s.value + size_t(request) * capacity * s.cfg.valueRowBytes;
-        if (nmiss) s.cursor[request] = (available[nmiss - 1] + 1) % capacity;
+        if (nmiss) {
+            const int next = available[nmiss - 1] + 1;
+            s.cursor[request] = next == capacity ? 0 : next;
+        }
         auto &stats = s.stats[request];
         stats.hits += nhit; stats.misses += nmiss; stats.evictions += nevicted;
         stats.copiedBytes += size_t(nmiss) * (s.cfg.keyRowBytes + s.cfg.valueRowBytes);
@@ -159,10 +170,12 @@ __device__ size_t HistoryRow(Storage s, const int *pages, int request, int token
     return pages ? size_t(pages[size_t(request) * s.pagesPerRequest + token / s.cfg.pageLen]) *
         s.cfg.pageLen + token % s.cfg.pageLen : size_t(request) * s.cfg.maxTokens + token;
 }
+template<int Threads>
 __global__ void Refill(Storage s, const int *requests) {
     const int b = blockIdx.y, request = requests[b], lane = threadIdx.x % 32;
     const int count = s.missCounts[b];
-    for (size_t i = blockIdx.x * 8 + threadIdx.x / 32; i < size_t(count); i += gridDim.x * 8) {
+    constexpr int warps = Threads / 32;
+    for (size_t i = blockIdx.x * warps + threadIdx.x / 32; i < size_t(count); i += gridDim.x * warps) {
         const int token = s.misses[size_t(b) * s.cfg.maxSelected + i];
         const int slot = s.available[size_t(b) * s.cfg.residentTokens + i];
         const size_t srcK = HistoryRow(s, s.keyPages, request, token);
@@ -209,6 +222,7 @@ __global__ void GatherHistory(Storage s, const int *kp, const int *vp, int token
 struct KvMemSparseCache::Impl {
     Storage s{};
     int device = 0, multiprocessors = 1;
+    bool wideRefillSupported = false;
     void *hostKey = nullptr, *hostValue = nullptr;
     size_t hostBytes = 0, deviceBytes = 0;
     std::vector<void *> allocations;
@@ -260,6 +274,7 @@ KvMemSparseCache::KvMemSparseCache(const KvMemSparseConfig &c) : impl(new Impl) 
     cudaDeviceProp prop{}; Check(cudaGetDeviceProperties(&prop, p.device));
     if (!prop.canMapHostMemory) throw std::runtime_error("KVMem sparse: mapped host memory unavailable");
     p.multiprocessors = prop.multiProcessorCount;
+    p.wideRefillSupported = prop.major == 9 && prop.maxThreadsPerBlock >= 1024;
     const size_t logicalRows = Product(c.maxRequests, c.maxTokens);
     const size_t hostRows = c.totalTokens ? c.totalTokens : logicalRows;
     const size_t hotRows = Product(c.maxRequests, c.residentTokens);
@@ -361,13 +376,21 @@ void KvMemSparseCache::Resolve(const int *requests, const int *lengths, const in
     if (batch < 0 || batch > impl->s.cfg.maxBatch || (batch && (!requests || !lengths)))
         throw std::invalid_argument("KVMem sparse: invalid resolve inputs");
     if (!batch) return;
-    Plan<<<batch, 256, 0, stream>>>(impl->s, requests, lengths, selected, counts, selectedRows);
+    PlanResidentCount<<<batch, 256, 0, stream>>>(impl->s, requests, lengths, selected, counts, selectedRows);
     Check(cudaGetLastError());
     // Bound launch overhead for all-hit or heavily padded graphs, while large
     // misses loop within resident warps instead of creating one CTA per token.
-    const int blocks = std::min({128, (impl->s.cfg.maxSelected - 1) / 8 + 1,
-                                 (impl->multiprocessors * 4 + batch - 1) / batch});
-    Refill<<<dim3(blocks, batch), 256, 0, stream>>>(impl->s, requests);
+    if (impl->wideRefillSupported && batch >= 64 && impl->s.cfg.maxSelected >= 256) {
+        // More outstanding mapped-host reads per request on Hopper. Keep the
+        // original launch for small batches, short selections and other GPUs.
+        const int blocks = std::min({128, (impl->s.cfg.maxSelected - 1) / 32 + 1,
+                                     (impl->multiprocessors * 2 + batch - 1) / batch});
+        Refill<1024><<<dim3(blocks, batch), 1024, 0, stream>>>(impl->s, requests);
+    } else {
+        const int blocks = std::min({128, (impl->s.cfg.maxSelected - 1) / 8 + 1,
+                                     (impl->multiprocessors * 4 + batch - 1) / batch});
+        Refill<256><<<dim3(blocks, batch), 256, 0, stream>>>(impl->s, requests);
+    }
     Check(cudaGetLastError());
 }
 void KvMemSparseCache::ResolveFromPointers(const void *const *keys, int pointerStride,

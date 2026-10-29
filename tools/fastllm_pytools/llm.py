@@ -658,6 +658,9 @@ fastllm_lib.get_kv_cache_token_limit_llm_model.restype = ctypes.c_int
 fastllm_lib.set_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 fastllm_lib.set_prefill_batching_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
 fastllm_lib.set_prefill_batching_llm_model.restype = ctypes.c_bool
+if hasattr(fastllm_lib, "set_prefill_coalescing_llm_model"):
+    fastllm_lib.set_prefill_coalescing_llm_model.argtypes = [ctypes.c_int] * 6
+    fastllm_lib.set_prefill_coalescing_llm_model.restype = ctypes.c_bool
 
 fastllm_lib.set_model_indexer_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.set_model_indexer_dtype.restype = None
@@ -949,7 +952,13 @@ def get_disk_moe_cache_stats():
              "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions",
              "cpu_cuda_overlap_bytes", "cuda_demotions", "cuda_demotion_bytes",
              "cpu_workspace_bytes", "cpu_buffer_reuses", "cpu_buffer_allocations",
-             "cpu_reclaims", "async_maintenance")
+             "cpu_reclaims", "async_maintenance",
+             "cpu_buffer_mmaps", "cpu_buffer_munmaps", "cpu_buffer_splits", "cpu_buffer_coalesces",
+             "canonical_promotion_checks", "canonical_promotion_rejects", "canonical_residence_rejects",
+             "canonical_upload_bytes", "canonical_upload_us", "canonical_download_us",
+             "decode_handoff_d2h_copies", "decode_handoff_d2h_bytes", "decode_handoff_wait_us",
+             "decode_output_h2d_copies", "decode_output_h2d_bytes",
+             "resident_readback_copies", "resident_readback_bytes", "resident_readback_wait_us")
     if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
         values = (ctypes.c_uint64 * len(names))()
         count = fastllm_lib.get_disk_moe_cache_stats_v2(values, len(names))
@@ -1560,8 +1569,8 @@ class model:
                   indexer_tp_storage: str = "replicated"):
         if indexer_dtype not in ("auto", "fp8", "fp8_e4m3"):
             raise ValueError("indexer_dtype must be auto, fp8 or fp8_e4m3")
-        if indexer_tp_storage not in ("replicated", "layer_shard"):
-            raise ValueError("indexer_tp_storage must be replicated or layer_shard")
+        if indexer_tp_storage not in ("replicated", "layer_shard", "context_shard"):
+            raise ValueError("indexer_tp_storage must be replicated, layer_shard or context_shard")
         if indexer_tp_storage != "replicated" and not hasattr(fastllm_lib, "set_model_indexer_tp_storage"):
             raise RuntimeError("The loaded FastLLM library does not support Indexer TP storage; rebuild FastLLM.")
         if (isinstance(max_context_length, bool) or not isinstance(max_context_length, int) or
@@ -1669,13 +1678,17 @@ class model:
                             self.hf_tokenizer = try_load_gguf_tokenizer(path)
                     finally:
                         report_model_load_progress("tokenizer", 1, 1)
-                if external_mtp_path and mmproj_path:
-                    raise ValueError(
-                        "external MTP and mmproj cannot be used together")
-                if mmproj_path and self.config.get("gguf_architecture") == "deepseek41":
-                    from .deepseek_v41_gguf import vision_config
-                    self.config.update(vision_config(mmproj_path, self.config))
-                if context_requested:
+                if external_mtp_path and mmproj_path and self.config.get("gguf_architecture") != "deepseek41":
+                    raise ValueError("external MTP and mmproj cannot be used together")
+                if self.config.get("gguf_architecture") == "deepseek41":
+                    from .deepseek_v41_gguf import dspark_config, vision_config
+                    if external_mtp_path:
+                        self.config.update(dspark_config(external_mtp_path, self.config))
+                    if mmproj_path:
+                        self.config.update(vision_config(mmproj_path, self.config))
+                if context_requested or (external_mtp_path and mmproj_path):
+                    if not hasattr(fastllm_lib, "create_llm_model_from_gguf_with_context"):
+                        raise RuntimeError("the loaded FastLLM library does not support combined GGUF add-ons")
                     self.model = fastllm_lib.create_llm_model_from_gguf_with_context(
                         path.encode(), ori_model_path.encode(),
                         external_mtp_path.encode(), mmproj_path.encode(),
@@ -3634,14 +3647,32 @@ class model:
         """设置分块 prefill 的切片大小（首块与后续块使用相同 token 数）。"""
         fastllm_lib.set_chunked_prefill_size_llm_model(self.model, size)
 
-    def set_prefill_batching(self, tokens: int, max_wait_ms: int = 0):
-        """启动前设置 prefill 攒批目标和最长等待；目前仅支持 Naive 普通 TP GPU 推理。"""
-        if not all(isinstance(value, int) and 0 <= value <= 2147483647
-                   for value in (tokens, max_wait_ms)) or (max_wait_ms > 0 and tokens == 0):
-            raise ValueError("prefill batching requires non-negative int32 values and a positive token target when waiting")
-        if not fastllm_lib.set_prefill_batching_llm_model(self.model, tokens, max_wait_ms):
+    def set_prefill_batching(self, tokens: int, max_wait_ms: int = 0, *,
+                            target_requests: int = 0, max_requests: int = 0,
+                            min_decode_requests: int = 0):
+        """Configure bounded prefill coalescing before serving; zero tokens disables it.
+
+        Token and request targets independently release a batch. Capacity, idle
+        decode and continuing chunks also release it without waiting. Request
+        limits are per prefill batch, not the model's overall concurrency.
+        """
+        values = (tokens, max_wait_ms, target_requests, max_requests, min_decode_requests)
+        if (not all(isinstance(v, int) and 0 <= v <= 2147483647 for v in values)
+                or (tokens == 0 and any(values[1:]))
+                or (max_requests > 0 and target_requests > max_requests)):
+            raise ValueError("prefill coalescing requires non-negative int32 values, a positive token target, and target_requests <= max_requests when capped")
+        if any(values[2:]):
+            if not hasattr(fastllm_lib, "set_prefill_coalescing_llm_model"):
+                raise RuntimeError("This FastLLM library does not support the requested prefill coalescing options")
+            ok = fastllm_lib.set_prefill_coalescing_llm_model(self.model, *values)
+        else:
+            ok = fastllm_lib.set_prefill_batching_llm_model(self.model, tokens, max_wait_ms)
+        if not ok:
             raise ValueError("prefill batching must be configured before serving and currently requires ordinary Naive TP GPU inference")
-    
+        self.prefill_batching = dict(tokens=tokens, max_wait_ms=max_wait_ms,
+                                    target_requests=target_requests, max_requests=max_requests,
+                                    min_decode_requests=min_decode_requests)
+
     def set_verbose(self, verbose: int):
         fastllm_lib.set_verbose_llm_model(self.model, verbose)
     

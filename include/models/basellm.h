@@ -33,7 +33,34 @@ namespace fastllm {
 
     class basellm;
 
+    struct PrefillPrefixPreview {
+        // Query identity is checked once per request/pass, not once per layer.
+        std::vector<int> tokens;
+        std::map<int, std::vector<uint64_t>> pageHashes;
+        std::map<PagedCacheManager *, PagedPrefixMatch> matches;
+        std::shared_ptr<void> modelState; // metadata only; never owns KV or checkpoints
+        void Reset(const std::vector<int> &input) {
+            if (tokens != input) {
+                tokens = input;
+                pageHashes.clear();
+                matches.clear();
+                modelState.reset();
+            }
+        }
+        const std::vector<uint64_t> &Hashes(int pageLen) {
+            auto it = pageHashes.find(pageLen);
+            if (it == pageHashes.end()) {
+                std::vector<uint64_t> hashes;
+                for (size_t i = 0; i + pageLen <= tokens.size(); i += pageLen)
+                    hashes.push_back(PagedCacheManager::HashTokenPage(tokens.data() + i, pageLen));
+                it = pageHashes.emplace(pageLen, std::move(hashes)).first;
+            }
+            return it->second;
+        }
+    };
+
     struct ResponseContext {
+        std::unique_ptr<PrefillPrefixPreview> prefillPreview;
         PrefillBatchPolicy::Clock::time_point queuedAt = PrefillBatchPolicy::Clock::now();
         bool isEnding = false; // 代表这个请求已经处理完成了，不需要再forward了，但生成的token可能还没有被fetch
         bool isAbort = false; // 代表这个请求被中断了，也就是说不会再有人来fetch它了，那么推理完之后就可以删除这个请求了
@@ -527,7 +554,12 @@ namespace fastllm {
         // target preserves the existing scheduler, and zero wait batches only
         // requests already queued. Unsupported models keep their old policy.
         virtual bool SupportsPrefillBatching() const { return false; }
-        bool SetPrefillBatching(int targetTokens, int maxWaitMs);
+        bool SetPrefillBatching(int targetTokens, int maxWaitMs, int targetRequests = 0,
+                               int maxRequests = 0, int minDecodeRequests = 0);
+        virtual int PreviewPagedPrefixCacheExtra(ResponseContext *context, int length,
+                                                 PrefillPrefixPreview &) const {
+            return QueryPagedPrefixCacheExtra(context, length);
+        }
 
         virtual void SetDataType(DataType dataType);
 

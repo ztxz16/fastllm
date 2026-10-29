@@ -30,6 +30,8 @@ GGML_API void        ggml_bf16_to_fp32_row(const ggml_bf16_t *bf16, float *fp32,
 
 #if (defined(_MSC_VER) && _MSC_VER <= 1922) || (defined(__GNUC__) && __GNUC__ < 8 && !defined(__clang__))  // VS 2015/2017
 std::map <ggml_type, ggml_type_traits> type_traits = {
+        // Imported losslessly to native compact FP4 before execution.
+        {GGML_TYPE_MXFP4, {"mxfp4", 32, 17, true, nullptr, GGML_TYPE_Q8_0}},
         {GGML_TYPE_I8, {/* type_name */"i8", /* blck_size */1,
             /* type_size */ sizeof(int8_t),/* is_quantized */  false,
         }},
@@ -253,6 +255,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
 };
 #else
 std::map <ggml_type, ggml_type_traits> type_traits = {
+        {GGML_TYPE_MXFP4, {"mxfp4", 32, 17, true, nullptr, GGML_TYPE_Q8_0}},
         {GGML_TYPE_I8, {
             .type_name                = "i8",
             .blck_size                = 1,
@@ -833,6 +836,34 @@ namespace fastllm {
 
     void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
                                 GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType) {
+        if (tensor->type == GGML_TYPE_MXFP4) {
+            AssertInFastLLM(replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect &&
+                            tensor->dims.size() == 2 && tensor->dims[1] % 32 == 0,
+                            "MXFP4 GGUF import requires a block-aligned matrix.");
+            weight->dataType = DataType::NVFP4;
+            weight->blockK = 1;
+            weight->blockM = 32;
+            weight->Resize(tensor->dims);
+            weight->UpdateUnitSize();
+            weight->Allocate();
+            const size_t blocks = (size_t)tensor->dims[0] * tensor->dims[1] / 32;
+            auto *scales = GetNVFP4ScaleData(*weight);
+            AssertInFastLLM(scales != nullptr, "MXFP4 GGUF compact allocation failed.");
+            std::vector<uint8_t> source(blocks * 17);
+            ReadGGUFTensorBytes(fileName, offset, source.data(), source.size());
+            for (size_t b = 0; b < blocks; ++b) {
+                const uint8_t *src = source.data() + b * 17;
+                uint8_t *dst = weight->cpuData + b * 16;
+                scales[b] = src[0];
+                // GGUF pairs element j with j+16; native FP4 pairs 2j with
+                // 2j+1, with the even element in the low nibble.
+                for (int j = 0; j < 8; ++j) {
+                    dst[j] = (src[1 + 2*j] & 15) | ((src[2 + 2*j] & 15) << 4);
+                    dst[j + 8] = (src[1 + 2*j] >> 4) | (src[2 + 2*j] & 240);
+                }
+            }
+            return;
+        }
         // Keep the source-format marker even when a GGUF tensor is imported as
         // a plain floating-point Data object.  Some architectures need to
         // distinguish GGUF's canonicalized parameters from their native

@@ -145,10 +145,10 @@ __global__ __launch_bounds__(kThreads) void Values(const float *prob, FastllmNai
 // Store the original E4M3 quantization result exactly in BF16, with its FP32
 // block scale kept separately. Do not round dequantized FP32 values to BF16.
 __device__ __forceinline__ void QuantizeIndexerRow(const BF16 *input, BF16 *values, float *scales,
-        int stride, int offset, bool roundScale) {
+        int stride, int offset, bool roundScale, int sourceRow = -1) {
     __shared__ float maximum[128];
     const int d = threadIdx.x, row = blockIdx.x;
-    float x = (float)input[(size_t)row * stride + offset + d];
+    float x = (float)input[(size_t)(sourceRow < 0 ? row : sourceRow) * stride + offset + d];
     maximum[d] = fabsf(x);
     __syncthreads();
     for (int step = 64; step; step >>= 1) {
@@ -165,6 +165,43 @@ __device__ __forceinline__ void QuantizeIndexerRow(const BF16 *input, BF16 *valu
 __global__ void QuantizeIndexer(const BF16 *input, BF16 *values, float *scales,
         int stride, int offset, bool roundScale = false) {
     QuantizeIndexerRow(input, values, scales, stride, offset, roundScale);
+}
+
+// Passed by value so launch metadata has no asynchronous host-buffer lifetime.
+struct PrefillIndexerEntry {
+    const BF16 *query, *weights;
+    FastllmNaiveKV key;
+    int *output;
+    size_t scoreOffset;
+    int rowOffset, rows, part, first, second, past, keys, stride;
+};
+struct PrefillIndexerBatch {
+    PrefillIndexerEntry entries[8];
+    int count, rows;
+    __device__ __forceinline__ const PrefillIndexerEntry &Find(int row) const {
+        int i = 0;
+        while (i + 1 < count && row >= entries[i + 1].rowOffset)
+            ++i;
+        return entries[i];
+    }
+};
+__global__ void QuantizeBatchIndexer(PrefillIndexerBatch batch, BF16 *q, float *scales, BF16 *weights) {
+    const int headRow = blockIdx.x, row = headRow / 16;
+    const auto &entry = batch.Find(row);
+    const int local = row - entry.rowOffset;
+    const int source =
+        (local < entry.part ? entry.first + local : entry.second + local - entry.part) * 16 + headRow % 16;
+    QuantizeIndexerRow(entry.query, q, scales, 128, 0, false, source);
+    if (threadIdx.x == 0)
+        weights[headRow] = entry.weights[source];
+}
+// Gather the two balanced ranges while preserving the ordinary quantizer.
+__global__ void QuantizeBalancedIndexer(const BF16 *input, const BF16 *weights,
+        BF16 *q, float *scales, BF16 *outWeights, int partRows, int first, int second) {
+    int headRow = blockIdx.x, row = headRow / 16;
+    int sourceRow = (row < partRows ? first + row : second + row - partRows) * 16 + headRow % 16;
+    QuantizeIndexerRow(input, q, scales, 128, 0, false, sourceRow);
+    if (threadIdx.x == 0) outWeights[headRow] = weights[sourceRow];
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -269,14 +306,15 @@ __global__ void IndexerDecodeScores(const BF16 *q, FastllmNaiveKV packedKeys,
 // Hopper overlaps the next head's Q load with MMA using two 32-row buffers.
 // The original 64-row schedule remains available for other CUDA architectures.
 template<bool Pipeline>
-__global__ __launch_bounds__(Pipeline ? 128 : 256) void IndexerScores(const BF16 *q, FastllmNaiveKV k,
+__device__ __forceinline__ void IndexerScoresTile(const BF16 *q, FastllmNaiveKV k,
         const float *qscale, const BF16 *weights,
-        float *scores, int queries, int keys, int past, int keyStride) {
+        float *scores, int queries, int keys, int past, int keyStride, int partRows = 0, int gap = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int Rows = Pipeline ? 32 : 64, Stages = Pipeline ? 2 : 1;
     __shared__ __align__(16) BF16 qs[Stages][Rows][136], ks[64][136];
     __shared__ float qw[Stages][Rows], qsc[Stages][Rows];
     const int firstQ = blockIdx.y * Rows, firstK = blockIdx.x * 64;
+    if (partRows && firstQ >= partRows) past += gap;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     if (firstK > past + min(queries - 1, firstQ + Rows - 1)) {
         for (int i = tid; i < Rows * 64; i += Rows * 4) {
@@ -362,4 +400,20 @@ __global__ __launch_bounds__(Pipeline ? 128 : 256) void IndexerScores(const BF16
 #endif
 }
 
+template <bool Pipeline>
+__global__ __launch_bounds__(Pipeline ? 128 : 256) void IndexerScores(const BF16 *q, FastllmNaiveKV k,
+                                                                      const float *qscale, const BF16 *weights,
+                                                                      float *scores, int queries, int keys, int past,
+                                                                      int keyStride, int partRows = 0, int gap = 0) {
+    IndexerScoresTile<Pipeline>(q, k, qscale, weights, scores, queries, keys, past, keyStride, partRows, gap);
+}
+__global__ __launch_bounds__(128) void BatchIndexerScores(PrefillIndexerBatch batch, const BF16 *q, const float *scales,
+                                                          const BF16 *weights, float *scores) {
+    const auto &e = batch.entries[blockIdx.z];
+    if (blockIdx.y * 32 >= e.rows || blockIdx.x * 64 >= e.past + e.second + e.part)
+        return;
+    IndexerScoresTile<true>(q + (size_t)e.rowOffset * 2048, e.key, scales + e.rowOffset * 16,
+                            weights + e.rowOffset * 16, scores + e.scoreOffset, e.rows, e.keys, e.past + e.first,
+                            e.stride, e.part, e.second - e.first - e.part);
+}
 } // namespace naive_dsa_mma

@@ -533,6 +533,7 @@ if (USE_CUDA)
         src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/moe/fastllm-moe-cache.cu
         src/devices/cuda/moe/fastllm-moe-gguf-cache.cu
+        src/devices/cuda/moe/fastllm-disk-moe-async.cu
         src/devices/cuda/moe/fastllm-moe-v41-gguf.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
@@ -548,6 +549,7 @@ if (USE_CUDA)
         src/devices/cuda/models/naive-n05-experts.cu
         src/devices/cuda/models/deepseekv4-kernels.cu
         src/devices/cuda/models/deepseekv41-kernels.cu
+        src/devices/cuda/models/deepseekv41-commit.cu
         src/devices/cuda/models/deepseekv41-engram.cu
         src/devices/cuda/models/deepseekv41-reference.cu
         src/devices/cuda/models/deepseekv41-dspark-kernels.cu
@@ -633,7 +635,9 @@ if (USE_CUDA)
         message(STATUS "DeepSeek-V4 SM120 DeepGEMM WoA kernel: OFF")
     endif()
 
+    # These C++ units include CUDA runtime/driver headers without going through nvcc.
     set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp
+        src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_kvmem.cpp
         APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
 
     # GLM53 prefill uses architecture-specific register and matrix-load
@@ -934,6 +938,12 @@ target_link_libraries(quant fastllm)
 
 if (UNIT_TEST)
     enable_testing()
+    find_package(Threads REQUIRED)
+    add_executable(alive_thread_pool_test test/basic/test_alive_thread_pool.cpp)
+    target_include_directories(alive_thread_pool_test PRIVATE include)
+    target_link_libraries(alive_thread_pool_test PRIVATE Threads::Threads)
+    add_test(NAME alive_thread_pool COMMAND alive_thread_pool_test)
+    set_tests_properties(alive_thread_pool PROPERTIES TIMEOUT 30)
     add_executable(response_statistics_test test/basic/test_response_statistics.cpp)
     target_link_libraries(response_statistics_test PRIVATE fastllm)
     add_test(NAME response_statistics COMMAND response_statistics_test)
@@ -953,6 +963,9 @@ if (UNIT_TEST)
         set_tests_properties(${name} PROPERTIES TIMEOUT ${outer_timeout}
             SKIP_REGULAR_EXPRESSION "FASTLLM_TEST_SKIP_NO_DEVICE")
     endfunction()
+    add_executable(deepseekV41StubKVRegression test/ops/deepseekV41StubKVRegression.cpp)
+    target_link_libraries(deepseekV41StubKVRegression PRIVATE fastllm)
+    fastllm_add_checked_test(deepseekV41StubKV deepseekV41StubKVRegression "PASS [0-9]+ scheduler stub states" 60)
     add_executable(kvmem_pages_test test/basic/test_kvmem_pages.cpp src/kvmem.cpp)
     target_include_directories(kvmem_pages_test PRIVATE include)
     set_target_properties(kvmem_pages_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
@@ -1158,6 +1171,19 @@ if (UNIT_TEST)
     target_link_libraries(device_operator_lifetime_test PRIVATE fastllm)
     add_test(NAME device_operator_lifetime COMMAND device_operator_lifetime_test)
 
+    add_executable(disk_weight_buffer_pool_test test/basic/test_disk_weight_buffer_pool.cpp)
+    target_include_directories(disk_weight_buffer_pool_test PRIVATE src)
+    target_link_libraries(disk_weight_buffer_pool_test PRIVATE Threads::Threads)
+    fastllm_add_checked_test(disk_weight_buffer_pool disk_weight_buffer_pool_test "PASS: disk mapped buffer" 60)
+    if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(disk_qwen_gguf_cache_test test/basic/test_disk_qwen_gguf_cache.cpp)
+        target_link_libraries(disk_qwen_gguf_cache_test PRIVATE fastllm)
+        fastllm_add_checked_test(disk_qwen_gguf_cache disk_qwen_gguf_cache_test
+            "PASS: disk Qwen GGUF cache" 180)
+        set_tests_properties(disk_qwen_gguf_cache PROPERTIES LABELS "cuda;disk;gguf" RUN_SERIAL TRUE
+            ENVIRONMENT "FT_GPU_PREFILL=1;FASTLLM_DISK_DIRECT_IO=1")
+    endif()
+
     if (NOT WIN32)
         add_executable(glm5_next_gguf_test test/basic/test_glm5_next_gguf.cpp)
         target_link_libraries(glm5_next_gguf_test PRIVATE fastllm)
@@ -1231,6 +1257,9 @@ if (UNIT_TEST)
             endif()
         endif()
 
+        add_executable(disk_moe_replacement_cost_test test/basic/test_disk_moe_replacement_cost.cpp)
+        target_include_directories(disk_moe_replacement_cost_test PRIVATE src)
+        fastllm_add_checked_test(disk_moe_replacement_cost disk_moe_replacement_cost_test "PASS: disk replacement" 30)
         add_executable(disk_moe_cache_test test/basic/test_disk_moe_cache.cpp)
         target_link_libraries(disk_moe_cache_test PRIVATE fastllm)
         add_test(NAME disk_moe_cache COMMAND disk_moe_cache_test)
@@ -1256,13 +1285,22 @@ if (UNIT_TEST)
             add_executable(disk_v41_gguf_cache_test test/basic/test_disk_v41_gguf_cache.cpp)
             target_link_libraries(disk_v41_gguf_cache_test PRIVATE fastllm)
             fastllm_add_checked_test(disk_v41_gguf_cache disk_v41_gguf_cache_test
-                "PASS: disk V4.1 GGUF cache" 180)
+                "PASS: disk V4.1 GGUF cache" 300)
             set_tests_properties(disk_v41_gguf_cache PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE
                 ENVIRONMENT "FT_GPU_PREFILL=1;FASTLLM_DISK_DIRECT_IO=1")
+            fastllm_add_checked_test(disk_v41_decode_handoff disk_v41_gguf_cache_test
+                "PASS: disk decode pinned handoff" 180 --disk-decode-handoff)
+            set_tests_properties(disk_v41_decode_handoff PROPERTIES LABELS "cuda;disk" RUN_SERIAL TRUE)
             fastllm_add_checked_test(cuda_v41_gguf_tuned disk_v41_gguf_cache_test
                 "PASS: tuned V4.1 GGUF decode" 360 --tuned)
             set_tests_properties(cuda_v41_gguf_tuned PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE)
             if (USE_NUMAS)
+                fastllm_add_checked_test(disk_v41_gguf_iq2_batch disk_v41_gguf_cache_test
+                    "PASS: IQ2 canonical and NUMA multirow integration" 300 --iq2-batch)
+                set_tests_properties(disk_v41_gguf_iq2_batch PROPERTIES LABELS "cuda;gguf;numa" RUN_SERIAL TRUE)
+                fastllm_add_checked_test(disk_v41_gguf_shared_resident disk_v41_gguf_cache_test
+                    "PASS: nonzero shared expert with resident and mixed GGUF routes" 180 --shared-resident)
+                set_tests_properties(disk_v41_gguf_shared_resident PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE)
                 fastllm_add_checked_test(cuda_v41_gguf_tuned_hybrid disk_v41_gguf_cache_test
                     "PASS: tuned V4.1 GGUF hybrid" 900 --tuned-hybrid)
                 set_tests_properties(cuda_v41_gguf_tuned_hybrid PROPERTIES LABELS "cuda;gguf;numa" RUN_SERIAL TRUE)
@@ -1632,11 +1670,41 @@ if (UNIT_TEST)
         add_test(NAME deepseekV41Sm75QuantAttention COMMAND deepseekV41Sm75QuantAttentionRegression)
         set_tests_properties(deepseekV41Sm75QuantAttention PROPERTIES LABELS cuda TIMEOUT 300 SKIP_RETURN_CODE 77)
         if (NOT USE_ROCM)
+            add_executable(deepseekV41BatchAttentionRegression test/ops/deepseekV41BatchAttentionRegression.cpp)
+            target_link_libraries(deepseekV41BatchAttentionRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41BatchAttentionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            target_compile_definitions(deepseekV41BatchAttentionRegression PRIVATE CUDA_API_PER_THREAD_DEFAULT_STREAM)
+            fastllm_add_checked_test(deepseekV41BatchAttention deepseekV41BatchAttentionRegression
+                "PASS [0-9]+ mixed KV attention requests bitwise identical" 300)
+            set_tests_properties(deepseekV41BatchAttention PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+            add_executable(deepseekV41SmallIndexerRegression test/ops/deepseekV41SmallIndexerRegression.cpp)
+            target_link_libraries(deepseekV41SmallIndexerRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41SmallIndexerRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            target_compile_definitions(deepseekV41SmallIndexerRegression PRIVATE CUDA_API_PER_THREAD_DEFAULT_STREAM)
+            fastllm_add_checked_test(deepseekV41SmallIndexer deepseekV41SmallIndexerRegression
+                "PASS [0-9]+ small-chunk indexer rows bitwise identical" 300)
+            add_executable(deepseekV41TopKRegression test/ops/deepseekV41TopKRegression.cpp)
+            target_link_libraries(deepseekV41TopKRegression PRIVATE fastllm)
+            target_include_directories(deepseekV41TopKRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            target_compile_definitions(deepseekV41TopKRegression PRIVATE CUDA_API_PER_THREAD_DEFAULT_STREAM)
+            fastllm_add_checked_test(deepseekV41TopK deepseekV41TopKRegression
+                "PASS [0-9]+ cases x 3 changing-input graph replays" 900)
+            fastllm_add_checked_test(deepseekV41TopKLongContext deepseekV41TopKRegression
+                "PASS [0-9]+ cases x 3 changing-input graph replays" 900 --long-context)
+            fastllm_add_checked_test(deepseekV41CandidateBlocks deepseekV41TopKRegression
+                "PASS [0-9]+ candidate masks x 3 changing inputs" 900 --candidates)
+            set_tests_properties(deepseekV41SmallIndexer deepseekV41TopK deepseekV41TopKLongContext deepseekV41CandidateBlocks
+                PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_executable(deepseekV41FullDecodeRegression test/ops/deepseekV41FullDecodeRegression.cpp)
             target_link_libraries(deepseekV41FullDecodeRegression PRIVATE fastllm)
             target_include_directories(deepseekV41FullDecodeRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             fastllm_add_checked_test(deepseekV41FullDecode deepseekV41FullDecodeRegression
                 "PASS [0-9]+ changing-context graph replays; stress=0" 300)
+            foreach(index_heads IN ITEMS 1 17 64)
+                fastllm_add_checked_test(deepseekV41IndexHeads${index_heads} deepseekV41FullDecodeRegression
+                    "PASS [0-9]+ changing-context graph replays; stress=0" 300 --index-heads=${index_heads})
+                set_tests_properties(deepseekV41IndexHeads${index_heads} PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+            endforeach()
             fastllm_add_checked_test(deepseekV41FullDecodeStress deepseekV41FullDecodeRegression
                 "PASS [0-9]+ changing-context graph replays; stress=1" 300 --stress)
             fastllm_add_checked_test(deepseekV41FullDecodePooled deepseekV41FullDecodeRegression
@@ -1645,8 +1713,20 @@ if (UNIT_TEST)
                 "PASS [0-9]+ full verify graph replays" 300 --verify)
             fastllm_add_checked_test(deepseekV41AttentionLocality deepseekV41FullDecodeRegression
                 "PASS [0-9]+ attention locality checks" 60 --locality)
+            fastllm_add_checked_test(deepseekV41VerifyIndexHeads17 deepseekV41FullDecodeRegression
+                "PASS [0-9]+ full verify graph replays" 300 --verify --index-heads=17)
+            fastllm_add_checked_test(deepseekV41FullDecodeLongContext deepseekV41FullDecodeRegression
+                "PASS [0-9]+ changing-context graph replays; stress=0" 900 --long-context)
+            fastllm_add_checked_test(deepseekV41FullVerifyLongContext deepseekV41FullDecodeRegression
+                "PASS [0-9]+ full verify graph replays" 900 --verify --long-context)
+            fastllm_add_checked_test(deepseekV41CandidateReuse deepseekV41FullDecodeRegression
+                "PASS [0-9]+ changing-context graph replays; stress=0" 900 --shared-candidates --long-context)
+            fastllm_add_checked_test(deepseekV41CandidateReuseVerify deepseekV41FullDecodeRegression
+                "PASS [0-9]+ full verify graph replays" 900 --verify --shared-candidates --long-context)
             set_tests_properties(deepseekV41FullDecode deepseekV41FullDecodeStress
-                deepseekV41FullDecodePooled deepseekV41FullVerify deepseekV41AttentionLocality
+                deepseekV41FullDecodePooled deepseekV41FullVerify deepseekV41VerifyIndexHeads17 deepseekV41AttentionLocality
+                deepseekV41FullDecodeLongContext deepseekV41FullVerifyLongContext
+                deepseekV41CandidateReuse deepseekV41CandidateReuseVerify
                 PROPERTIES LABELS cuda RUN_SERIAL TRUE)
             add_executable(deepseekV41DecodeProjectionRegression test/ops/deepseekV41DecodeProjectionRegression.cpp)
             target_link_libraries(deepseekV41DecodeProjectionRegression PRIVATE fastllm)
@@ -1667,6 +1747,13 @@ if (UNIT_TEST)
             fastllm_add_checked_test(multiCudaReplicatedRows multiCudaReplicatedRowsRegression
                 "PASS [0-9]+ replicated row slices" 300)
             set_tests_properties(multiCudaReplicatedRows PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+            add_executable(multiCudaRepeatRegression test/ops/multiCudaRepeatRegression.cpp)
+            target_link_libraries(multiCudaRepeatRegression PRIVATE fastllm)
+            target_include_directories(multiCudaRepeatRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(multiCudaRepeat multiCudaRepeatRegression
+                "PASS [0-9]+ INT16/FP8_E4M3 rejection and CUDA fallback checks" 300)
+            set_tests_properties(multiCudaRepeat PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
             add_executable(bfloat16FloatOutputRegression test/ops/bfloat16FloatOutputRegression.cpp)
             target_link_libraries(bfloat16FloatOutputRegression PRIVATE fastllm)
@@ -1738,6 +1825,13 @@ if (UNIT_TEST)
             fastllm_add_checked_test(fp8BFloat16Cache fp8BFloat16CacheRegression
                 "PASS BF16 FP8 auxiliary cache" 300)
             set_tests_properties(fp8BFloat16Cache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+            add_executable(mxfp8DenseRegression test/ops/mxfp8DenseRegression.cpp)
+            target_link_libraries(mxfp8DenseRegression PRIVATE fastllm)
+            target_include_directories(mxfp8DenseRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(mxfp8Dense mxfp8DenseRegression
+                "PASS [0-9]+ eager [+] graph shapes" 300)
+            set_tests_properties(mxfp8Dense PROPERTIES LABELS cuda RUN_SERIAL TRUE)
         endif()
     endif()
     add_executable(nvfp4Block32GemmRegression test/ops/nvfp4Block32GemmRegression.cpp)
@@ -1786,6 +1880,13 @@ if (UNIT_TEST)
         target_link_libraries(deepseek_v41_sm120_prefill_test PRIVATE fastllm)
         add_test(NAME deepseek_v41_sm120_prefill COMMAND deepseek_v41_sm120_prefill_test)
         set_tests_properties(deepseek_v41_sm120_prefill PROPERTIES
+                             LABELS cuda TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_executable(deepseekV41DsparkSamplingRegression test/ops/deepseekV41DsparkSamplingRegression.cpp)
+        target_include_directories(deepseekV41DsparkSamplingRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_compile_definitions(deepseekV41DsparkSamplingRegression PRIVATE CUDA_API_PER_THREAD_DEFAULT_STREAM)
+        target_link_libraries(deepseekV41DsparkSamplingRegression PRIVATE fastllm)
+        add_test(NAME deepseek_v41_dspark_sampling COMMAND deepseekV41DsparkSamplingRegression)
+        set_tests_properties(deepseek_v41_dspark_sampling PROPERTIES
                              LABELS cuda TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_executable(deepseek_v41_hybrid_attention_test test/basic/test_deepseek_v41_hybrid_attention.cpp)
         target_include_directories(deepseek_v41_hybrid_attention_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -1884,6 +1985,12 @@ if (UNIT_TEST)
     endif()
 
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(cuda_iq2_r4_test test/basic/test_cuda_iq2_r4.cu)
+        target_include_directories(cuda_iq2_r4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/devices/cuda)
+        target_link_libraries(cuda_iq2_r4_test PRIVATE fastllm)
+        add_test(NAME cuda_iq2_r4 COMMAND cuda_iq2_r4_test)
+        set_tests_properties(cuda_iq2_r4 PROPERTIES LABELS cuda RUN_SERIAL TRUE TIMEOUT 120)
+
         add_executable(cuda_data_transfer_test test/basic/test_cuda_data_transfer.cpp)
         target_link_libraries(cuda_data_transfer_test PRIVATE fastllm)
         target_include_directories(cuda_data_transfer_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -2074,6 +2181,25 @@ if (UNIT_TEST)
         target_include_directories(naive_n05_attention_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME naive_n05_attention COMMAND naive_n05_attention_test)
         set_tests_properties(naive_n05_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+        add_executable(naive_n05_topk_threshold_test test/basic/test_naive_n05_topk_threshold.cpp)
+        target_link_libraries(naive_n05_topk_threshold_test PRIVATE fastllm)
+        target_include_directories(naive_n05_topk_threshold_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(naive_n05_topk_threshold naive_n05_topk_threshold_test
+            "PASS: exact sampled TopK" 120)
+        set_tests_properties(naive_n05_topk_threshold PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(naive_n05_prefill_split_test test/basic/test_naive_n05_prefill_split.cu)
+        set_target_properties(naive_n05_prefill_split_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(naive_n05_prefill_split naive_n05_prefill_split_test
+            "PASS: split prefill attention" 120)
+        set_tests_properties(naive_n05_prefill_split PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(naive_n05_swa_query_test test/basic/test_naive_n05_swa_query.cu)
+        set_target_properties(naive_n05_swa_query_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(naive_n05_swa_query naive_n05_swa_query_test
+            "PASS: exact SWA query reuse" 120)
+        set_tests_properties(naive_n05_swa_query PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
         add_executable(naive_n05_prefill_test test/basic/test_naive_n05_prefill.cpp)
         target_link_libraries(naive_n05_prefill_test PRIVATE fastllm)
@@ -2337,7 +2463,7 @@ if (UNIT_TEST)
             # Keep the reduction tree fixed across the separate eager/graph
             # processes: auto tuning can otherwise choose different backends.
             set_tests_properties(naive_n05_tp_graph PROPERTIES
-                ENVIRONMENT "FASTLLM_CUDA_CUSTOM_ALLREDUCE=1" LABELS cuda RUN_SERIAL TRUE TIMEOUT 730
+                ENVIRONMENT "FASTLLM_CUDA_CUSTOM_ALLREDUCE=1" LABELS cuda RUN_SERIAL TRUE TIMEOUT 1450
                 SKIP_REGULAR_EXPRESSION "FASTLLM_TEST_SKIP_NO_DEVICE")
             add_test(NAME naive_n05_tp_fp8_graph COMMAND "${CMAKE_COMMAND}"
                 "-DTEST_EXECUTABLE=$<TARGET_FILE:naive_n05_tp_graph_test>"
@@ -2345,7 +2471,7 @@ if (UNIT_TEST)
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/test/basic/run_naive_tp_graph_test.cmake")
             set_tests_properties(naive_n05_tp_fp8_graph PROPERTIES
                 ENVIRONMENT "FASTLLM_TEST_NAIVE_FP8=1;FASTLLM_CUDA_CUSTOM_ALLREDUCE=1" LABELS "cuda;multigpu"
-                RUN_SERIAL TRUE TIMEOUT 730 SKIP_REGULAR_EXPRESSION "FASTLLM_TEST_SKIP_NO_DEVICE")
+                RUN_SERIAL TRUE TIMEOUT 1450 SKIP_REGULAR_EXPRESSION "FASTLLM_TEST_SKIP_NO_DEVICE")
         endif()
 
         add_executable(naive_n05_tp_test test/basic/test_naive_n05_tp.cpp)
@@ -2401,6 +2527,13 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_fp8_kv COMMAND naive_n05_fp8_kv_test)
         set_tests_properties(naive_n05_fp8_kv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "ALL FP8 CHECKS PASSED")
+
+        add_executable(naive_n05_indexer_context_test test/basic/test_naive_n05_indexer_context.cpp)
+        target_link_libraries(naive_n05_indexer_context_test PRIVATE fastllm)
+        target_include_directories(naive_n05_indexer_context_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_indexer_context COMMAND naive_n05_indexer_context_test)
+        set_tests_properties(naive_n05_indexer_context PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "PASS [0-9]+ context-shard checks")
 
         add_executable(naive_n05_fp8_conversion_test test/basic/test_naive_n05_fp8_conversion.cu)
         target_link_libraries(naive_n05_fp8_conversion_test PRIVATE fastllm)
@@ -2984,6 +3117,21 @@ if (UNIT_TEST)
         target_include_directories(ncclOddTpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME ncclOddTp COMMAND ncclOddTpRegression)
         set_tests_properties(ncclOddTp PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
+        add_executable(ncclGatherScatterRegression test/ops/ncclGatherScatterRegression.cu)
+        target_link_libraries(ncclGatherScatterRegression fastllm)
+        target_include_directories(ncclGatherScatterRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME ncclGatherScatter COMMAND ncclGatherScatterRegression)
+        add_test(NAME ncclGatherFailure COMMAND ncclGatherScatterRegression gather-failure)
+        add_test(NAME ncclScatterFailure COMMAND ncclGatherScatterRegression scatter-failure)
+        set_tests_properties(ncclGatherScatter ncclGatherFailure ncclScatterFailure PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(ncclPrefillSubmitRegression test/ops/ncclPrefillSubmitRegression.cu)
+        target_link_libraries(ncclPrefillSubmitRegression PRIVATE fastllm cublas)
+        target_include_directories(ncclPrefillSubmitRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME ncclPrefillSubmit COMMAND ncclPrefillSubmitRegression)
+        set_tests_properties(ncclPrefillSubmit PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 60 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
             add_executable(ncclInitRegression test/ops/ncclInitRegression.cpp)
             target_link_libraries(ncclInitRegression PRIVATE fastllm ${CMAKE_DL_LIBS})

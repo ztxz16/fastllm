@@ -70,7 +70,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     // Dedicated control storage must survive attention/cuBLAS calls. Sharing
     // the old transient scratch would race remote dispatch writes against a
     // later rank's memset. Bound it; retain no duplicate/repacked FP8 weights.
-    AssertInFastLLM(bytes > 0 && bytes <= 48 * 1024 * 1024,
+    AssertInFastLLM(bytes > 0 && bytes <= 96 * 1024 * 1024,
                    "MiMo EP symmetric workspace exceeds its memory budget.");
     auto state = std::make_shared<FastllmCudaMimoEp8Mega>();
     state->devices = devices;

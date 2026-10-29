@@ -485,12 +485,11 @@ void DecodeOverlapWorkspace::ConfigureLayout(const OffloadGroup &group, int tabl
     const auto &layout = group.LayerLayout(table);
     if (group.ggufSources.empty() || group.ordinaryHost) return;
     const auto &source = group.ggufSources[table];
-    // V4.1 can read interleaved gate/up rows directly when the quantization
-    // blocks themselves are canonical. R4 packing still needs restoration.
+    // Keep native NUMA records when the projection can decode their packing
+    // directly, including IQ2 R4; persistent cache admission stays canonical.
     const bool supported = layout.deepSeekV41
-        ? source.weights[0].type == layout.gateGgmlType &&
-          source.weights[1].type == layout.downGgmlType &&
-          FastllmCudaV41GGUFSupported(layout.gateGgmlType, layout.downGgmlType)
+        ? FastllmCudaV41GGUFNumaSupported(layout.gateGgmlType, layout.downGgmlType,
+            source.weights[0].type, source.weights[1].type)
         : layout.glm5
         ? FastllmCudaMoeGlm5GGUFCacheNumaSupported(source.weights[0].type,
             source.weights[1].type, layout.hidden, layout.inter)

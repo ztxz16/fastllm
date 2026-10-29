@@ -280,6 +280,14 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
         const size_t reusable = (workspace.cudaData ? workspace.expansionBytes : 0) +
             (gateBytes && gate.cudaData ? gate.expansionBytes : 0);
         const size_t reserve = 256 * size_t(1024 * 1024);
+        if (disk && bytes + gateBytes + reserve > freeBytes + reusable) {
+            // Driver free memory excludes idle tensors in the general pool.
+            // Reclaim only on disk prefill pressure, before rejecting the
+            // batched path. The allocator preserves live, graph-pinned and
+            // in-flight buffers; retain the same safety margin after retry.
+            FastllmCudaClearBigBufferCurrentDevice();
+            CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+        }
         if (bytes + gateBytes + reserve > freeBytes + reusable) return false;
         // Bound slack while avoiding another cudaMalloc for a few more routes.
         constexpr size_t quantum = 16 * size_t(1024 * 1024);
@@ -446,6 +454,7 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
         for (const auto &slice : batch.work) {
             StreamedMoeBatch work;
             work.experts = batch.experts.size(); work.rows = slice.routes.size();
+            work.diskIQ1M = disk && !nativeV41 && !glm5 && gt == GGML_TYPE_IQ1_M;
             work.weights = reinterpret_cast<const uint8_t *const *>(base + metaOffset + batch.pointersOffset);
             work.counts = reinterpret_cast<const int *>(base + metaOffset + slice.countsOffset);
             work.offsets = reinterpret_cast<const int *>(base + metaOffset + slice.offsetsOffset);
@@ -761,13 +770,13 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
 }
 
 
-bool FastllmCudaMergeMOEV41GGUFDisk(const fastllm::Data &input,
+static bool MergeMOEGGUFDisk(const fastllm::Data &input,
         fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
         int expertCount, const int32_t *indices, const float *scores, int topk,
-        float swigluLimit, const FastllmCudaV41DiskExperts &source) {
+        float swigluLimit, const FastllmCudaV41DiskExperts &source, bool v41) {
     using namespace fastllm_gguf_stream;
     if (!weights || !indices || !scores || !source.read || !source.release || !source.staging ||
-        input.dataType != fastllm::BFLOAT16 || input.dataDevice != fastllm::CUDA ||
+        input.dataType != (v41 ? fastllm::BFLOAT16 : fastllm::FLOAT32) || input.dataDevice != fastllm::CUDA ||
         !input.cudaData || input.dims.size() != 2 || expertCount <= 0 || topk <= 0 ||
         source.residents.size() != size_t(2 * expertCount)) return false;
     std::unordered_set<int> experts;
@@ -785,11 +794,33 @@ bool FastllmCudaMergeMOEV41GGUFDisk(const fastllm::Data &input,
         if (gt < 0) { gt = g->ggmlType; dt = d->ggmlType; inter = d->dims[1]; }
         if (gt != g->ggmlType || dt != d->ggmlType || inter != d->dims[1]) return false;
     }
-    if (!FastllmCudaV41GGUFGroupedWorkspaceBytes(gt, dt, input.dims[0], input.dims[1],
-            inter, expertCount, topk)) return false;
+    // IQ1_M gate has a disk-only Q8 dot fallback; an IQ1_M down matrix still
+    // uses the ordinary expert path. Other backends retain their admission.
+    if (!v41 && dt == GGML_TYPE_IQ1_M) return false;
+    const size_t bytes = v41 ? FastllmCudaV41GGUFGroupedWorkspaceBytes(gt, dt,
+        input.dims[0], input.dims[1], inter, expertCount, topk) :
+        FastllmCudaMoeGGUFGroupedWorkspaceBytes(gt, dt, input.dims[0], input.dims[1],
+            inter, expertCount, topk, false);
+    if (!bytes) return false;
     fastllm::Data gate;
     return RunPipelined(input, gate, workspace, output, weights, expertCount,
-        indices, scores, topk, experts, false, gt, dt, inter, false, swigluLimit, true, &source);
+        indices, scores, topk, experts, false, gt, dt, inter, false, swigluLimit, v41, &source);
+}
+
+bool FastllmCudaMergeMOEV41GGUFDisk(const fastllm::Data &input,
+        fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
+        int expertCount, const int32_t *indices, const float *scores, int topk,
+        float swigluLimit, const FastllmCudaV41DiskExperts &source) {
+    return MergeMOEGGUFDisk(input, workspace, output, weights, expertCount,
+        indices, scores, topk, swigluLimit, source, true);
+}
+
+bool FastllmCudaMergeMOEGGUFDisk(const fastllm::Data &input,
+        fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
+        int expertCount, const int32_t *indices, const float *scores, int topk,
+        const FastllmCudaV41DiskExperts &source) {
+    return MergeMOEGGUFDisk(input, workspace, output, weights, expertCount,
+        indices, scores, topk, 0.f, source, false);
 }
 
 FastllmCudaV41DiskStaging::~FastllmCudaV41DiskStaging() {

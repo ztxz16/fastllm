@@ -32,6 +32,22 @@ AMD GPU 见 [ROCm 安装](docs/rocm.md)；CPU-only 和其他平台见[源码安�
 
 ### 浏览器启动
 
+单机多副本可使用独立的 `ftllm deploy` 组件，复用原生服务参数，提供后台进程管理和
+流式请求路由；现有 `ftllm serve/server` 用法不变。配置与命令见 [多副本部署](docs/deploy.md)。
+
+~~~bash
+# API Server，默认监听 0.0.0.0:8080
+ftllm server Qwen/Qwen3-0.6B
+
+# 命令行对话
+ftllm run Qwen/Qwen3-0.6B
+
+# WebUI，连接上面的 API Server，默认监听 127.0.0.1:1616
+ftllm webui --api_base http://127.0.0.1:8080/v1
+~~~
+
+浏览器部署启动器可直接运行：
+
 ```sh
 ftllm
 ```

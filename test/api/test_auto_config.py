@@ -30,9 +30,13 @@ class AutoConfigTest(unittest.TestCase):
         self.ram = {'total': 32 * GiB, 'available': 32 * GiB}
 
     def resolve(self, a, *, use_numa=True):
+        # Keep planning-policy fixtures independent of this host's CPU quota
+        # and CUDA device count. CPU calibration has dedicated tests below.
         with patch.object(memory, 'model_inputs', return_value=({}, [], self.g)), \
                 patch.object(memory, 'geometry', return_value=self.g), \
                 patch.object(memory, 'weight_costs', return_value=self.costs), \
+                patch.object(auto, 'cpu_threads', return_value=36), \
+                patch('fastllm_pytools.util._cuda_device_count', return_value=len(self.gpu)), \
                 patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
             return auto.resolve(a, self.gpu.__getitem__, hardware=self.hardware,
                                 ram=self.ram, use_numa=use_numa)
@@ -149,7 +153,7 @@ class AutoConfigTest(unittest.TestCase):
     def test_streamed_disk_gguf_chunk_priority_preserves_host_policy(self):
         self.g.family = 'deepseek_v41'
         self.g.disk_prefill = {'canonical_gguf': True, 'streamed_mmq': True}
-        small = dict(chunked_prefill_size=512, resident_layers=0, moe_cuda_cache=2*GiB,
+        small = dict(chunked_prefill_size=1024, resident_layers=0, moe_cuda_cache=2*GiB,
                      expert_transport_bytes_per_device=256*1024**2)
         large = dict(small, chunked_prefill_size=2048, moe_cuda_cache=GiB)
         self.assertGreater(auto._deepseek_priority(large, self.g, 'disk'),
@@ -266,14 +270,18 @@ class AutoConfigTest(unittest.TestCase):
         return ('--moe_device', 'numa', '--moe_device_layers', '-1')
 
     def test_deepseek_cache_target_precedes_larger_chunk(self):
-        options = self.deepseek_cache_fixture()
+        # Latency ranking depends on CPU throughput, not the test host's cores.
+        options = (*self.deepseek_cache_fixture(), '--threads', '8')
         p = self.resolve(self.args(*options))
         large = self.resolve(self.args(*options, '--chunked_prefill_size', '2048'))
         small = self.resolve(self.args(*options, '--chunked_prefill_size', '512'))
+        medium = self.resolve(self.args(*options, '--chunked_prefill_size', '1024'))
         self.assertEqual((p['mode'], p['chunked_prefill_size']), ('pp', 1024))
         self.assertGreaterEqual(p['moe_cuda_cache'], 3 * GiB)
         self.assertLess(large['moe_cuda_cache'], 3 * GiB)
-        # Once 3 GiB fits, grow the chunk rather than maximizing cache alone.
+        # After the 1024 / 3 GiB targets, latency wins over a larger chunk.
+        self.assertGreaterEqual(medium['moe_cuda_cache'], 3 * GiB)
+        self.assertEqual(medium['moe_cuda_cache'], p['moe_cuda_cache'])
         self.assertGreater(small['moe_cuda_cache'], p['moe_cuda_cache'])
 
     def test_deepseek_chunk_floor_precedes_cache_target_and_can_fall_back(self):
@@ -282,10 +290,10 @@ class AutoConfigTest(unittest.TestCase):
         self.gpu[0]['free'] = 21 * GiB // 4
         p = self.resolve(self.args(*options))
         small = self.resolve(self.args(*options, '--chunked_prefill_size', '256'))
-        self.assertEqual(p['chunked_prefill_size'], 512)
+        self.assertEqual(p['chunked_prefill_size'], 1024)
         self.assertLess(p['moe_cuda_cache'], 3 * GiB)
         self.assertGreaterEqual(small['moe_cuda_cache'], 3 * GiB)
-        # Both targets are soft: retain a safe plan when even 512 cannot fit.
+        # Both targets are soft: retain a safe plan when 1024 cannot fit.
         self.gpu[0]['free'] = 5 * GiB // 2
         fallback = self.resolve(self.args(*options))
         self.assertEqual(fallback['chunked_prefill_size'], 256)
@@ -358,7 +366,7 @@ class AutoConfigTest(unittest.TestCase):
 
     def test_deepseek_latency_can_choose_full_gpu_over_larger_hybrid_chunk(self):
         self.g.family = 'deepseek_v41'
-        self.g.activation_width = 1 << 20
+        self.g.activation_width = 1 << 19
         self.costs = ([23 * GiB // 4] * 4, *self.costs[1:])
         self.gpu[0] = dict(total=30 * GiB, free=30 * GiB)
         # Both candidates meet the chunk/cache targets. A larger hybrid
@@ -366,7 +374,7 @@ class AutoConfigTest(unittest.TestCase):
         with patch.object(auto, 'latency_score', side_effect=lambda p, *rest:
                           1 if p['resident_layers'] == self.g.layers else 100):
             p = self.resolve(self.args('--device', 'cuda:0', '--gpu_mem_ratio', '.9', '--max_batch', '2'))
-        self.assertEqual((p['resident_layers'], p['chunked_prefill_size']), (self.g.layers, 512))
+        self.assertEqual((p['resident_layers'], p['chunked_prefill_size']), (self.g.layers, 1024))
 
     def test_deepseek_implicit_embedding_is_charged_before_chunk_selection(self):
         self.g.family = 'deepseek_v41'
@@ -472,6 +480,23 @@ class AutoConfigTest(unittest.TestCase):
                     patch.dict(os.environ, environment, clear=True), \
                     patch.object(Path, 'glob', return_value=[Path('node0'), Path('node1')]):
                 self.assertEqual(auto.cpu_threads(), expected)
+
+    def test_explicit_threads_skip_linear_calibration(self):
+        from fastllm_pytools import cpu_tuning
+        self.g.hidden, self.g.intermediate = 2048, 1024
+        with patch.object(cpu_tuning, 'select_threads', side_effect=AssertionError('explicit threads must skip')):
+            p = self.resolve(self.args('-t', '8'))
+        self.assertEqual(p['threads'], 8)
+
+    def test_auto_threads_record_linear_calibration(self):
+        from fastllm_pytools import cpu_tuning
+        self.g.hidden, self.g.intermediate = 2048, 1024
+        detail = {'selected': 6, 'method': 'quantized-gemv', 'elapsed_ms': 200}
+        with patch.object(cpu_tuning, 'select_threads', return_value=(6, detail)) as calibrate:
+            p = self.resolve(self.args())
+        calibrate.assert_called_once()
+        self.assertEqual(p['threads'], 6)
+        self.assertEqual(p['automatic']['cpu_thread_benchmark'], detail)
 
     def test_explicit_parameters_override_policy_even_when_equal_to_defaults(self):
         a = self.args('--device', 'cuda:1', '--tp', 'off', '--moe_cuda_cache', '0',

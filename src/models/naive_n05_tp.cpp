@@ -4,6 +4,7 @@
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "executor.h"
 #include "utils.h"
+#include "utils/inference_trace.h"
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
@@ -25,6 +26,19 @@ bool FastllmCudaMergeMOEUsedGraphUnsafeFallback();
 
 namespace {
 #ifdef USE_CUDA
+// One reusable event set per rank worker. Created only for an enabled trace,
+// and never recorded while a CUDA Graph is being captured.
+struct InferenceTimingEvents {
+    void *begin = FastllmCudaEventCreateTiming();
+    void *modelEnd = FastllmCudaEventCreateTiming();
+    void *end = FastllmCudaEventCreateTiming();
+    ~InferenceTimingEvents() {
+        FastllmCudaEventDestroy(begin);
+        FastllmCudaEventDestroy(modelEnd);
+        FastllmCudaEventDestroy(end);
+    }
+};
+
 // KV descriptors belong to individual requests. Partition by request, rather
 // than device, so workers write disjoint objects and contiguous result ranges.
 // Keep small batches on the caller; their scan is cheaper than a worker handoff.
@@ -369,6 +383,9 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
     tpSwaRingCache = GetFastllmEnv().cudaGraph && FastllmNaiveKVType(kvCacheDataType) &&
         window == 128 && sliding.headDim == 192 && sliding.valueDim == 128 &&
         sliding.heads / ranks < 64;
+    AssertInFastLLM(!indexerContextSharding || (kvMemConfig.enabled && indexFp8 && indexHeads == 16 &&
+        indexDim == 128 && indexTopK == 2048 && FastllmCudaNaiveIndexerContextSupported(tpDevices)),
+        "Indexer context_shard requires KVMem, the 16x128 FP8-query Indexer and CUDA SM80+ TP.");
     tpPrepared = true;
 #endif
 }
@@ -443,6 +460,8 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
             if (!table.cudaData) throw CudaWorkspaceExhausted("Naive graph cache table pool exhausted.");
         } else allocate(storage->cacheTable, INT32, tableElements);
         allocate(storage->indexScores, INT32, (int)scoreElements);
+        if (indexerContextSharding)
+            allocate(storage->indexExchange, INT32, storage->maxRows * tpDevices.size() * indexTopK * 2);
         storage->buffers.cacheTable = (const void *const *)storage->cacheTable.cudaData;
         storage->buffers.tableRows = maxRows;
         if (!sparseKv && kvCacheDataType == BFLOAT16 && FastllmCudaNaiveDSAMapsSupported() && full.headDim == 192 && full.valueDim == 128 &&
@@ -761,6 +780,10 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
         auto &storage = *state->ranks[rank]->storage;
         auto &buf = storage.buffers;
         buf.capacity = capacity;
+        if (indexerContextSharding) {
+            buf.indexContextExchange.FakeFrom(storage.indexExchange, 0);
+            buf.indexContextExchange.Resize({rows * (int)tpDevices.size() * indexTopK * 2});
+        }
         if (capacity > 2048) {
             // Decode Indexer CP reuses the score arena after packing local
             // candidates; graph variants keep the same allocation/address.
@@ -1217,7 +1240,9 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config, TargetCapture *capture,
         LogitsSelection *selection, const TargetBatch *batch) {
 #ifdef USE_CUDA
+    auto *trace = inference_trace::CurrentForward();
     PrepareTensorParallel();
+    if (trace) trace->ranks.resize(tpDevices.size());
     std::vector<std::pair<Data *, Data *>> singleKV;
     std::vector<GenerationConfig> singleConfigs;
     std::vector<int> singleLengths;
@@ -1263,18 +1288,26 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             std::vector<std::vector<int>> limits(tpDevices.size(), std::vector<int>(growing.size(), INT_MAX));
             runRanks([&](int rank) {
                 FastllmCudaSetDevice(tpDevices[rank]);
-                for (size_t i = 0; i < growing.size(); ++i) {
-                    const int row = growing[i], next = key(row, 0).dims[1] + 1;
-                    for (int layer = 0; layer < block_cnt; ++layer) if (!slidingLayers[layer])
-                    for (int part = 0; part < 2; ++part) {
-                        Data &root = part ? value(row, layer) : key(row, layer);
-                        Data &local = *root.multiDeviceDatas.at(tpDevices[rank]);
-                        changes[rank] += PreparePagedCache(local,
-                            *tpPagedCaches[rank][layer * 2 + part], next);
-                        limits[rank][i] = std::min(limits[rank][i],
-                            (int)local.pageIndex.size() * local.pageLen);
+                std::vector<Data *> pendingPageTables;
+                try {
+                    for (size_t i = 0; i < growing.size(); ++i) {
+                        const int row = growing[i], next = key(row, 0).dims[1] + 1;
+                        for (int layer = 0; layer < block_cnt; ++layer) if (!slidingLayers[layer])
+                        for (int part = 0; part < 2; ++part) {
+                            Data &root = part ? value(row, layer) : key(row, layer);
+                            Data &local = *root.multiDeviceDatas.at(tpDevices[rank]);
+                            changes[rank] += PreparePagedCache(local,
+                                *tpPagedCaches[rank][layer * 2 + part], next, &pendingPageTables);
+                            limits[rank][i] = std::min(limits[rank][i],
+                                (int)local.pageIndex.size() * local.pageLen);
+                        }
                     }
+                } catch (...) {
+                    // Preserve completed cache updates if a later allocation fails.
+                    UploadPagedCacheTables(pendingPageTables);
+                    throw;
                 }
+                UploadPagedCacheTables(pendingPageTables);
             });
             for (size_t i = 0; i < growing.size(); ++i) {
                 int limit = INT_MAX;
@@ -1362,9 +1395,11 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     }
     // CPU embedding uses the shared worker pool; compute it once on the
     // caller instead of concurrently entering that pool from every rank.
+    if (trace) trace->Mark("tp_kv_prepare_ms");
     Data embedding;
     if (!GetCudaEmbedding() || GetLowMemMode())
         Embedding(inputIds, weight["model.embed_tokens.weight"], embedding);
+    if (trace) trace->Mark("embedding_ms");
     const bool verify = capture && capture->verifying;
     if (verify && tpSwaRingCache) {
         runRanks([&](int rank) {
@@ -1429,13 +1464,25 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         cudaLogits.Allocate(false);
     }
 
-    auto forwardRanks = [&]() {
+    if (trace) trace->Mark("graph_setup_ms");
+    auto forwardRanks = [&](bool measured = false) {
         runRanks([&](int rank) {
+            InferenceTimingEvents *events = nullptr;
+            inference_trace::Clock::time_point rankStart;
+            if (measured && trace) {
+                FastllmCudaSetDevice(tpDevices[rank]);
+                static thread_local std::unique_ptr<InferenceTimingEvents> timing;
+                if (!timing) timing.reset(new InferenceTimingEvents());
+                events = timing.get();
+                rankStart = inference_trace::Clock::now();
+                FastllmCudaEventRecordCurrentThread(events->begin);
+            }
             Data local = ForwardSingleGPU(rank, inputIds, positions, kv, config,
                                           embedding.dims.empty() ? nullptr : &embedding,
                                           captures.empty() ? nullptr : &captures[rank],
                                           compact ? candidates.data() + (size_t)rank * rows * count * 2 : nullptr,
                                           compact || cudaSampling ? selection : nullptr, batch);
+            if (events) FastllmCudaEventRecordCurrentThread(events->modelEnd);
             if (cudaSampling && !local.dims.empty()) {
                 const auto range = tpVocabRanges[rank];
                 const size_t width = (range.second - range.first) * sizeof(float);
@@ -1447,8 +1494,22 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                 AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
                     (float *)cudaLogits.cudaData + range.first, (size_t)vocab * sizeof(float),
                     local.cudaData, width, width, rows), "Naive CUDA sampling: logits copy failed.");
+                if (events) FastllmCudaEventRecordCurrentThread(events->end);
                 FastllmCudaSyncCurrentThreadStream();
-            } else if (!compact && !cudaSampling) logits[rank].CopyFrom(local);
+            } else {
+                if (!compact && !cudaSampling) logits[rank].CopyFrom(local);
+                if (events) FastllmCudaEventRecordCurrentThread(events->end);
+            }
+            if (events) {
+                auto waitStart = inference_trace::Clock::now();
+                FastllmCudaEventSynchronize(events->end);
+                auto &result = trace->ranks[rank];
+                result.device = tpDevices[rank];
+                result.observerWaitMs = inference_trace::Milliseconds(waitStart, inference_trace::Clock::now());
+                result.modelGpuMs = FastllmCudaEventElapsedTime(events->begin, events->modelEnd);
+                result.gatherGpuMs = FastllmCudaEventElapsedTime(events->modelEnd, events->end);
+                result.wallMs = inference_trace::Milliseconds(rankStart, inference_trace::Clock::now());
+            }
         });
     };
     if (graphDecode && tpDecodeState->warmed && !tpDecodeState->captured &&
@@ -1561,7 +1622,12 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     }
     if (graphDecode)
         tpDecodeState->mode = tpDecodeState->captured ? TPDecodeState::Replay : TPDecodeState::Warm;
-    forwardRanks();
+    if (trace) {
+        trace->mode = graphDecode ? (tpDecodeState->captured ? "cuda_graph" : "graph_warmup") : "eager";
+        trace->Mark("graph_capture_reserve_ms");
+    }
+    forwardRanks(true);
+    if (trace) trace->Mark("tp_execute_ms");
     bool committedRootMetadata = false;
     if (graphDecode) {
         const size_t localSlots = (size_t)sequences * block_cnt * tpDevices.size() * 2;
@@ -1666,10 +1732,12 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         }
     });
     if (capture) capture->hidden = std::move(captures[0].hidden);
+    if (trace) trace->Mark("kv_commit_prefix_ms");
     if (isIntermediateChunkedPrefill) return Data();
     if (cudaSampling) {
         selection->sampledTokens = SampleCudaLogits(cudaLogits,
             batch ? batch->configs : std::vector<GenerationConfig>{config});
+        if (trace) trace->Mark("sampling_ms");
         return Data();
     }
     if (compact) {

@@ -370,6 +370,24 @@ void FastllmCustomAllReduceAndGatherKernel(CustomArRankData *routedData,
     }
 }
 
+// Scalar uint64 maximum: exact integer ordering, including encoded argmax keys.
+template <int Ranks>
+__global__ void FastllmCustomScalarMaxUint64Kernel(CustomArRankData *data,
+        CustomArRankSignals signals, CustomArSignal *self, unsigned long long *output, int rank) {
+    const CustomArRankData pointers = *data;
+    CustomArBarrierStart<Ranks>(signals, self, rank);
+    unsigned long long value = threadIdx.x < Ranks ?
+        *(const unsigned long long*)pointers.ptrs[threadIdx.x] : 0;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        const unsigned long long other = __shfl_down_sync(0xffffffffu, value, offset);
+        value = value > other ? value : other;
+    }
+    CustomArBarrierFinal<Ranks>(signals, self, rank);
+    __syncthreads();
+    if (threadIdx.x == 0) *output = value;
+}
+
 template <typename T, int Ranks>
 __global__ __launch_bounds__(kCustomArThreads, 1)
 void FastllmCustomAllReduceKernel(CustomArRankData *rankData,
@@ -1897,9 +1915,10 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
                                         dataType, localEligible, rankData, hostSpinMicroseconds)) {
         return false;
     }
-    if (dataType == fastllm::DataType::BFLOAT16 && state.taggedPeer &&
-        state.taggedPeer->CanUse(count)) {
-        const bool launched = state.taggedPeer->Launch(data, dest, count, rank);
+    if ((dataType == fastllm::DataType::BFLOAT16 || dataType == fastllm::DataType::FLOAT32) &&
+        state.taggedPeer && state.taggedPeer->CanUse(count)) {
+        const bool launched = state.taggedPeer->Launch(
+            data, dest, count, rank, dataType == fastllm::DataType::FLOAT32);
         if (cudaGetLastError() != cudaSuccess) {
             FastllmCudaSetThreadError();
             return false;
@@ -3116,7 +3135,7 @@ bool FastllmCudaCustomAllReduceAndGather(void *routed, void *dest,
             fastllm::FLOAT32, eligible, routedData) ||
         !FindOrRegisterCustomArPointers(state, rank, shared, count,
             fastllm::BFLOAT16, eligible, sharedData)) return false;
-    if (state.taggedPeer && state.taggedPeer->CanUse(count)) {
+    if (state.taggedPeer && state.taggedPeer->CanUseJoint(count)) {
         const bool launched = state.taggedPeer->LaunchJoint(routed, dest, shared, count, rank);
         if (cudaGetLastError() != cudaSuccess) {
             FastllmCudaSetThreadError();
@@ -3306,4 +3325,33 @@ bool FastllmCudaCustomAllReduceAdd(void *data, void *dest, int count,
                                    int dataType, int deviceId) {
     return RunCustomArAddCandidate(data, dest, count, dataType, deviceId,
                                    true);
+}
+
+bool FastllmCudaCustomScalarMaxUint64(void *value, int deviceId) {
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    // Reuse the small-message P2P eligibility; the integer kernel uses exactly
+    // the same system-scope barriers as the calibrated float path.
+    if (!lease.Acquire(state, sizeof(unsigned long long), fastllm::FLOAT32,
+                       deviceId, true, rank)) return false;
+    CustomArRankData *pointers = nullptr;
+    // A distinct rendezvous tag prevents pairing a mismatched SUM/MAX round.
+    constexpr int scalarMaxRegistration = -2;
+    const bool eligible = value && (((uintptr_t)value & 7u) == 0);
+    if (!FindOrRegisterCustomArPointers(state, rank, value, 1,
+            scalarMaxRegistration, eligible, pointers)) return false;
+#define CUSTOM_MAX_CASE(N) case N: FastllmCustomScalarMaxUint64Kernel<N> \
+        <<<1, 32, 0, cudaStreamPerThread>>>(pointers, state.allSignals, \
+            state.allSignals.signals[rank], (unsigned long long*)value, rank); break
+    switch (state.devices.size()) {
+        CUSTOM_MAX_CASE(2);
+        CUSTOM_MAX_CASE(4);
+        CUSTOM_MAX_CASE(6);
+        CUSTOM_MAX_CASE(8);
+        default: return false;
+    }
+#undef CUSTOM_MAX_CASE
+    if (cudaGetLastError() != cudaSuccess) { FastllmCudaSetThreadError(); return false; }
+    return true;
 }

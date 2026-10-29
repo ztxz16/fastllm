@@ -49,9 +49,10 @@ __global__ void V41Sm75QuantizedAttentionGather(V41Sm75QuantizedAttention p,
                                          : __bfloat162float(row[d]);
 }
 
-// Four warps x four heads per CTA. Verification reuses each query for two
-// candidates, retaining the scalar kernel's 64 FMAs and eight-lane reduction.
-template<bool MultiToken, int CandidatesPerWarp = 1>
+// Four heads per CTA. Split each lane's 64 dimensions into smaller tiles to
+// lower shared-memory use; reuse each query tile across several candidates.
+// Keep the scalar kernel's FMA order and eight-lane reduction exactly.
+template<bool MultiToken, int CandidatesPerWarp = 1, int Tile = 64>
 __global__ void __launch_bounds__(128)
 V41Sm75QuantizedAttentionScores(const __nv_bfloat16 *q, const float *rows,
                                 const int32_t *valid, int count, int heads,
@@ -61,40 +62,46 @@ V41Sm75QuantizedAttentionScores(const __nv_bfloat16 *q, const float *rows,
     rows += size_t(token) * count * 512;
     valid += size_t(token) * count;
     scores += size_t(token) * heads * count;
-    // Four padding floats keep each lane's 64-element segment float4 aligned.
-    __shared__ __align__(16) float keys[4 * CandidatesPerWarp][544], queries[4][544];
+    static_assert(Tile > 0 && Tile % 4 == 0 && 64 % Tile == 0, "invalid QK tile");
+    constexpr int Stride = 8 * (Tile + 4);
+    __shared__ __align__(16) float keys[4 * CandidatesPerWarp][Stride], queries[4][Stride];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int first = (blockIdx.x * 4 + warp) * CandidatesPerWarp;
     const int h = blockIdx.y * 4 + lane / 8;
     bool present[CandidatesPerWarp];
     #pragma unroll
-    for (int j = 0; j < CandidatesPerWarp; ++j) {
-        const int c = first + j;
-        present[j] = c < count && valid[c];
-        if (present[j]) {
-            for (int d = lane; d < 512; d += 32)
-                keys[warp * CandidatesPerWarp + j][d + (d / 64) * 4] = rows[size_t(c) * 512 + d];
-        }
-    }
-    for (int i = threadIdx.x; i < 4 * 512; i += 128) {
-        const int head = blockIdx.y * 4 + i / 512, d = i % 512;
-        queries[i / 512][d + (d / 64) * 4] = head < heads
-            ? __bfloat162float(q[size_t(head) * 512 + d]) : 0.f;
-    }
-    __syncthreads();
-    const int segment = (lane % 8) * 68;
+    for (int j = 0; j < CandidatesPerWarp; ++j)
+        present[j] = first + j < count && valid[first + j];
     float dot[CandidatesPerWarp] = {};
     #pragma unroll
-    for (int d = 0; d < 64; d += 4) {
-        const float4 a = *reinterpret_cast<const float4 *>(&queries[lane / 8][segment + d]);
+    for (int tile = 0; tile < 64; tile += Tile) {
         #pragma unroll
         for (int j = 0; j < CandidatesPerWarp; ++j) if (present[j]) {
-            const float4 b = *reinterpret_cast<const float4 *>(&keys[warp * CandidatesPerWarp + j][segment + d]);
-            dot[j] += a.x * b.x;
-            dot[j] += a.y * b.y;
-            dot[j] += a.z * b.z;
-            dot[j] += a.w * b.w;
+            for (int i = lane; i < 8 * Tile; i += 32)
+                keys[warp * CandidatesPerWarp + j][i + (i / Tile) * 4] =
+                    rows[size_t(first + j) * 512 + (i / Tile) * 64 + tile + i % Tile];
         }
+        for (int i = threadIdx.x; i < 4 * 8 * Tile; i += 128) {
+            const int head = blockIdx.y * 4 + i / (8 * Tile), d = i % (8 * Tile);
+            queries[i / (8 * Tile)][d + (d / Tile) * 4] = head < heads
+                ? __bfloat162float(q[size_t(head) * 512 + (d / Tile) * 64 + tile + d % Tile]) : 0.f;
+        }
+        __syncthreads();
+        const int segment = (lane % 8) * (Tile + 4);
+        #pragma unroll
+        for (int d = 0; d < Tile; d += 4) {
+            const float4 a = *reinterpret_cast<const float4 *>(&queries[lane / 8][segment + d]);
+            #pragma unroll
+            for (int j = 0; j < CandidatesPerWarp; ++j) if (present[j]) {
+                const float4 b = *reinterpret_cast<const float4 *>(&keys[warp * CandidatesPerWarp + j][segment + d]);
+                dot[j] += a.x * b.x;
+                dot[j] += a.y * b.y;
+                dot[j] += a.z * b.z;
+                dot[j] += a.w * b.w;
+            }
+        }
+        // Every warp must finish reading before the next tile overwrites it.
+        if (tile + Tile < 64) __syncthreads();
     }
     #pragma unroll
     for (int j = 0; j < CandidatesPerWarp; ++j) {

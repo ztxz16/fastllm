@@ -86,3 +86,26 @@ ctest --test-dir BUILD -R '^naive_n05_kvmem_' --output-on-failure
 ```
 
 回归覆盖同 TP 配置的开关 logits、BF16/FP8 KV、独立缩放 FP8 Indexer、短上下文、超出热缓存容量的 TopK、Graph/eager 切换、请求顺序变化、槽位复用及混合长度 batched prefill。`naive_n05_kvmem_prefix_*` 还覆盖重复输入、并发共享前缀分叉、排队请求超过热槽数、页/SWA 淘汰回退、恢复错误隔离和不重捕获 Graph。
+
+### Indexer 上下文分片
+
+Naive DSA 的 CUDA TP 可使用 `--indexer_tp_storage context_shard`：每层 Indexer
+K 缓存按上下文分到所有 TP rank，decode 各卡评分并选择本地 TopK，再交换候选、
+合并精确全局 TopK。分数相同时仍按原始 token 位置排序，保留 FP8 评分精度和
+量化方式。持久 Indexer 缓存总量不增加；prefill 临时重组当前请求的历史，
+顺序执行时复用一个工作区，合批 prefill 至多保留八份历史，并沿用原有评分工作区预算。
+分页、前缀共享和写时复制沿用主 KV 的页表。
+
+此模式要求 `--kvmem`、至少两张 SM80+ CUDA GPU、页长可被 TP 卡数整除，
+以及 16×128 FP8-query Indexer、TopK=2048。默认仍为 `replicated`；
+`layer_shard` 保留原有逐层存储和广播路径。它不改变 DSA/SWA 主 KV 的精度，
+不改变模型、GPU、NUMA 或服务容量参数。
+
+回归测试 `naive_n05_indexer_context` 不加载模型，在单 GPU 上模拟 TP2/4/8 的独立
+页表，逐字节比较缓存与评分，逐项比较稳定 TopK；也覆盖 CUDA Graph 的长度和
+缓存地址变化、分页边界、前缀写时复制，以及 16/32/64 等常用 batch 和大批次描述分组边界。
+
+```bash
+cmake --build build --target naive_n05_indexer_context_test
+ctest --test-dir build -R '^naive_n05_indexer_context$' --output-on-failure
+```

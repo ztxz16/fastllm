@@ -18,6 +18,7 @@
 #include "models/qwen4_paged_cache.h"
 
 #include "devices/cpu/alivethreadpool.h"
+#include "devices/disk/diskdevice.h"
 #include "executor.h"
 #include "gguf.h"
 #include "json11.hpp"
@@ -342,8 +343,14 @@ namespace fastllm {
             headDim = rowWidth;
         }
 
-        void Qwen4ExpModel::QsaHostMirrorTransfer::Reserve(int rows, int rowWidth) {
-            EnsureCapacity(rows, rowWidth);
+        void Qwen4ExpModel::QsaHostMirrorTransfer::ReserveForPrefill(
+                int promptRows, int outputLimit, int rowWidth) {
+            const int decodeRows = outputLimit > 0
+                ? std::min(outputLimit - 1, kQwen4DenseCacheMaxGrowth)
+                : kQwen4DenseCacheMaxGrowth;
+            const int rows = (int)std::min<int64_t>(
+                (int64_t)promptRows + decodeRows, std::numeric_limits<int>::max());
+            EnsureCapacity(Qwen4RoundUpCacheCapacity(rows, 4096), rowWidth);
         }
 
         void Qwen4ExpModel::QsaHostMirrorTransfer::Materialize(std::vector<float> &rawKeys,
@@ -428,13 +435,12 @@ namespace fastllm {
                 return;
             }
             Synchronize();
-            // Leave one normal prefill chunk of decode headroom. Otherwise a
-            // prompt ending exactly at 32K would reallocate all twelve host
-            // mirrors on its first decode token.
-            const int initialRows = requiredRows >= 4096 ? 36864 : 4096;
-            int grownRows = std::max(requiredRows, initialRows);
+            // Prefill reserves its prompt and bounded decode headroom. Keep
+            // short requests small; later appends retain geometric growth.
+            int grownRows = std::max(requiredRows, 4096);
             if (rowCapacity > 0) {
-                grownRows = std::max(grownRows, rowCapacity * 2);
+                grownRows = (int)std::min<int64_t>(std::numeric_limits<int>::max(),
+                    std::max<int64_t>(grownRows, (int64_t)rowCapacity * 2));
             }
             float *newRaw = reinterpret_cast<float *>(
                 FastllmCudaHostMalloc(
@@ -10418,17 +10424,14 @@ namespace fastllm {
                 ensureFallbackCausalMask();
                 layerPositionIds = &positionsFor(attentionInput);
 #ifdef USE_CUDA
-                if (prefill && qsaPreviousLength == 0 && qsaDeviceCompatibleMask &&
+                if (qsaPreviousLength == 0 && qsaDeviceCompatibleMask &&
                     attentionInput.dataDevice == CUDA) {
-                    // The complete prompt is known before the first pipeline
-                    // chunk. Reserve its mirror once, rounded up for decode
-                    // headroom, instead of copying pinned history and
-                    // synchronizing the device halfway through long prefill.
-                    const int rows = Qwen4RoundUpCacheCapacity(
-                        generationConfig.input_token_length < std::numeric_limits<int>::max()
-                            ? generationConfig.input_token_length + 1
-                            : generationConfig.input_token_length, 4096);
-                    GetQsaHostMirror(*requestState, layer)->Reserve(rows, indexerHeadDim);
+                    // Both ordinary and pipelined prefill know the complete
+                    // prompt before their first chunk. Reserve before decode
+                    // can cross an aligned QSA compression-group boundary.
+                    GetQsaHostMirror(*requestState, layer)->ReserveForPrefill(
+                        std::max(generationConfig.input_token_length, inputIds.dims[1]),
+                        generationConfig.output_token_limit, indexerHeadDim);
                 }
 #endif
                 RunFullAttention(layer, attentionInput,
@@ -11366,6 +11369,16 @@ namespace fastllm {
             throw;
         }
         ClearWarmupCache(cache);
+        if (!threadTpState && threadTpRank < 0 && GetMoeCpuCacheBytes() &&
+            std::any_of(weights.begin(), weights.end(), [](const auto &layer) {
+                return layer.size() > 3 && layer[2] && layer[3] &&
+                    layer[2]->isDiskWeight && layer[3]->isDiskWeight &&
+                    layer[2]->dataType == DATA_GGUF_FORMAT && layer[3]->dataType == DATA_GGUF_FORMAT;
+            })) {
+            const uint64_t added = PreloadDiskMoeCache(weights);
+            if (added) std::printf("[Fastllm] Qwen4 disk GGUF RAM preload: %.2f MiB within configured cache budget.\n",
+                added / double(1ULL << 20));
+        }
 #if defined(__GLIBC__)
         if (threadTpState) malloc_trim(0);
 #endif

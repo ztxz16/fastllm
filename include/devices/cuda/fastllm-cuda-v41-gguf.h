@@ -41,6 +41,7 @@ bool FastllmCudaMoeV41CanonicalGGUFCacheCompute(
     int topk, float swigluLimit, float *perExpert);
 size_t FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(int hidden, int inter);
 bool FastllmCudaV41GGUFSupported(int gateType, int downType);
+bool FastllmCudaV41GGUFNumaSupported(int gateType, int downType, int numaGateType, int numaDownType);
 
 // Resident CUDA pointers remain live until return. Read jobs fill bounded,
 // page-aligned pinned slots and return the canonical payload within each slot.
@@ -62,3 +63,9 @@ bool FastllmCudaMergeMOEV41GGUFDisk(const fastllm::Data &input,
     fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
     int experts, const int32_t *indices, const float *scores, int topk,
     float swigluLimit, const FastllmCudaV41DiskExperts &source);
+// Ordinary canonical GGUF, FP32 activation/accumulation, same bounded disk
+// transport. Unsupported types leave the caller on its existing expert path.
+bool FastllmCudaMergeMOEGGUFDisk(const fastllm::Data &input,
+    fastllm::Data &workspace, fastllm::Data &output, fastllm::Data **weights,
+    int experts, const int32_t *indices, const float *scores, int topk,
+    const FastllmCudaV41DiskExperts &source);

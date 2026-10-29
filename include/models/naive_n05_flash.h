@@ -24,7 +24,7 @@ namespace fastllm {
         ~NaiveN05FlashModel() override;
         void InitParams() override;
         void SetIndexerDataType(DataType dataType) override;
-        void SetIndexerTPStorage(bool shardByLayer);
+        void SetIndexerTPStorage(bool shardByLayer, bool shardByContext = false);
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &names) override;
         int Forward(const Data &inputIds, const Data &attentionMask,
@@ -57,6 +57,8 @@ namespace fastllm {
         std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagers(int layer, bool key) const override;
         bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
         int QueryPagedPrefixCacheExtra(ResponseContext *context, int length) const override;
+        int PreviewPagedPrefixCacheExtra(ResponseContext *context, int length,
+                                         PrefillPrefixPreview &preview) const override;
         bool RestorePagedPrefixCacheExtra(ResponseContext *context, int length) const override;
         void TryRecordResponseContext(ResponseContext *context) override;
         void OnResponseContextCreated(ResponseContext *context) override;
@@ -105,6 +107,8 @@ namespace fastllm {
             std::vector<Data> storage;
             std::vector<size_t> offsets;
             size_t slotBytes = 0;
+            // Serialized by historyMutex. Metadata previews never own slots.
+            uint64_t historyVersion = 0;
             int SlotCount(int requests, int64_t budget) const {
                 if (!slotBytes) return 0;
                 // Reserve all active checkpoints before spending spare budget
@@ -189,6 +193,9 @@ namespace fastllm {
         void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0);
         void ReserveCache(Data &cache, int capacity, int width);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
+        bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end,
+                               std::vector<Data *> *pendingPageTables);
+        void UploadPagedCacheTables(const std::vector<Data *> &pendingPageTables);
         static void TrimCache(Data &cache, int length);
         int SampleTarget(Data &logits, std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
@@ -313,6 +320,7 @@ namespace fastllm {
         bool indexFp8 = true;
         bool fp8IndexerCache = false;
         bool indexerLayerSharding = false;
+        bool indexerContextSharding = false;
         bool tpIndexerPeerAccess = false;
         int IndexerOwnerRank(int layer) const {
             return std::count(slidingLayers.begin(), slidingLayers.begin() + layer, 0) % tpDevices.size();

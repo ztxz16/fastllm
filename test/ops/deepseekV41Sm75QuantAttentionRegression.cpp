@@ -216,16 +216,16 @@ static int CoefficientChecks() {
     // Odd heads/candidate counts exercise float2 scratch alignment and partial
     // warps. Cover both sides of the coefficient dispatch and its largest list.
     for (int tokens : {1,3,4,5,7,8}) for (int width : {32,127,128,511,512,513,4096})
-        for (int pattern : {0,1,2}) {
-            Case c(7,0,0,width,0,3,1009+checks,BFLOAT16,tokens);
+        for (int heads : {7,33}) for (int pattern : {0,1,2}) {
+            Case c(heads,0,0,width,0,3,1009+checks,BFLOAT16,tokens);
             if (pattern == 0) {
                 std::vector<int32_t> invalid(size_t(tokens)*width,-1);
                 Cuda(cudaMemcpy(c.indices.cudaData,invalid.data(),invalid.size()*sizeof(int32_t),cudaMemcpyHostToDevice));
             } else if (pattern == 1) {
                 // Large scores, negative/positive sinks, and tied zero scores
                 // must retain the scalar online-softmax result exactly.
-                Data q = Random(BFLOAT16,{1,tokens,7,512},233+checks,10000.f);
-                Data sink = Random(FLOAT32,{7},431+checks,10000.f);
+                Data q = Random(BFLOAT16,{1,tokens,heads,512},233+checks,10000.f);
+                Data sink = Random(FLOAT32,{heads},431+checks,10000.f);
                 Cuda(cudaMemcpy(c.q.cudaData,q.cudaData,q.GetBytes(),cudaMemcpyDeviceToDevice));
                 Cuda(cudaMemcpy(c.sink.cudaData,sink.cudaData,sink.GetBytes(),cudaMemcpyDeviceToDevice));
             } else {
@@ -243,7 +243,7 @@ static int VerifyChecks(bool smoke) {
     const int formats[][2]={{1,3},{0,3},{1,0},{3,3},{2,2},{0,2},{3,0},{1,1}};
     const int shapes[][3]={{128,0,33},{128,125,65},{128,127,512},{128,129,512},
                            {4,0,33},{4,3,65},{128,8192,0},{128,8192,513},{0,0,1024}};
-    for (int tokens : {2,3,6,8}) for (int heads : {1,7,32,64})
+    for (int tokens : {2,3,4,5,6,7,8}) for (int heads : {1,7,32,33,64})
         for (const auto &shape : shapes) for (const auto &format : formats) {
             if (smoke && (tokens!=6 || heads!=32 || shape[1]!=127)) continue;
             Case c(heads,shape[0],shape[1],shape[2],format[0],format[1],101+checks,BFLOAT16,tokens);

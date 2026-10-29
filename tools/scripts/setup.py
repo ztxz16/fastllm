@@ -89,7 +89,7 @@ setup (
             'ftllm=ftllm.cli:main'
         ]
     },
-    packages = ['ftllm', 'ftllm/openai_server', 'ftllm/openai_server/protocal', 'ftllm/openai_server/tool_parsers'],
+    packages = ['ftllm', 'ftllm/deploy', 'ftllm/openai_server', 'ftllm/openai_server/protocal', 'ftllm/openai_server/tool_parsers'],
     package_data = {
         '': ['*.dll', '*.so', '*.dylib', '*.so.*', '*.html', '*.js', '*.mjs', '*.svg', 'build_info.json',
              'fastllm_triton_server.py', 'launcher_assets/*',
@@ -102,8 +102,9 @@ setup (
         'jinja2>=3.1.0',
     ] + native_require + all_require,
     extras_require={
-        'all': all_require,
+        'all': all_require + ['aiohttp'],
         'server': server_require,
+        'deploy': server_require + ['aiohttp'],
         'webui': webui_require,
         'pptx': pptx_require,
         'document': document_require,

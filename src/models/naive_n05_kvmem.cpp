@@ -71,6 +71,7 @@ void NaiveN05FlashModel::InitSparseKv() {
     if (sparseKv) return;
     const int owners = DecodeGraphBatchBuckets(maxBatch).back(), ranks = tpDevices.size();
     const int page = GetPageLen(), windowCapacity = (window + 127) / 128 * 128;
+    const int indexPage = indexerContextSharding ? page / ranks : page;
     const int tokens = (kvMemConfig.maxTokens + page - 1) / page * page;
     const int pages = tokensLimit / page, unit = kvCacheDataType == FP8_E4M3 ? 1 : 2;
     auto state = std::make_shared<SparseKvState>();
@@ -106,7 +107,7 @@ void NaiveN05FlashModel::InitSparseKv() {
                     tokens * 4ULL + ((tokens / page + 3) / 4 * 4) * 8ULL + indexTopK * 8ULL + 128) +
                     size_t(owners) * (kvMemConfig.residentTokens * 4ULL + indexTopK * 4ULL + 32);
                 if (HasLocalIndexer(layer, rank))
-                    deviceBytes += size_t(tokensLimit) * IndexerCacheWidth(kvCacheDataType) * unit;
+                    deviceBytes += size_t(pages) * indexPage * IndexerCacheWidth(kvCacheDataType) * unit;
             }
         }
         deviceBytes += size_t(tokens) * std::max(1, full.kvHeads / ranks) *
@@ -158,10 +159,10 @@ void NaiveN05FlashModel::InitSparseKv() {
             }
             if (HasLocalIndexer(layer, rank)) {
                 auto index = std::make_unique<PagedCacheManager>();
-                index->pageLen = page; index->maxPages = pages;
+                index->pageLen = indexPage; index->maxPages = pages;
                 index->kvCacheFp8Indexer = fp8IndexerCache;
                 index->dataType = kvCacheDataType; index->UpdateUnitSize();
-                index->Resize({pages, page, 1, IndexerCacheWidth(kvCacheDataType)});
+                index->Resize({pages, indexPage, 1, IndexerCacheWidth(kvCacheDataType)});
                 index->ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false); index->Allocate(false);
                 measured += index->GetBytes();
                 state->indexSidecars.emplace(managers[layer * 2].get(), index.get());
@@ -285,7 +286,7 @@ void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data
                                 cudaMemsetAsync((char *)local.pagedKVCacheData->cudaData + page * bytes, 0, bytes, cudaStreamPerThread);
                                 if (!part && r.indexers[layer]) {
                                     auto &index = *r.indexers[layer];
-                                    bytes = size_t(local.pageLen) * index.dims[3] * index.unitSize;
+                                    bytes = size_t(index.dims[1]) * index.dims[3] * index.unitSize;
                                     cudaMemsetAsync((char *)index.cudaData + page * bytes, 0, bytes, cudaStreamPerThread);
                                 }
                             }
@@ -324,13 +325,17 @@ Data NaiveN05FlashModel::SparseIndexer(int layer, int rank, const Data &key) con
     auto &storage = *sparseKv->ranks[rank]->indexers[layer];
     const int width = storage.dims[3];
     result.FakeFrom(key, 0);
-    result.Resize({1, key.dims[1], width});
+    const int page = storage.dims[1];
+    const int length = indexerContextSharding
+        ? (key.dims[1] / key.pageLen) * page + std::clamp(key.dims[1] % key.pageLen - rank * page, 0, page)
+        : key.dims[1];
+    result.Resize({1, length, width});
     result.isPagedKVCache = true;
-    result.pageLen = key.pageLen;
+    result.pageLen = page;
     result.pagedKVCacheData = &storage;
     // This view borrows K's device table, without copying its CPU page vector
     // on every decode step. Bound writes by the pages actually attached.
-    const int capacity = key.pageIndex.size() * key.pageLen;
+    const int capacity = key.pageIndex.size() * result.pageLen;
     result.expansionDims = {1, capacity, width};
     result.strides = {size_t(capacity) * width, (size_t)width, 1};
     result.kvCacheFp8Indexer = fp8IndexerCache;
