@@ -317,6 +317,52 @@ static void TestVerifyIndexerView(int rows, int past, bool fp8) {
         ++checks;
     }
 }
+// Independent causal blocks, mixed lengths and descriptor chunking must agree
+// with the original one-query Indexer, including output-view canaries.
+static void TestBatchVerifyIndexer(int requests, bool fp8) {
+    int total = 0;
+    std::vector<int> offsets, widths, past;
+    for (int i = 0; i < requests; ++i) {
+        offsets.push_back(total);
+        widths.push_back(1 + i % 8);
+        past.push_back(i == 0 ? 32765 : i % 3 == 0 ? 127 : i % 3 == 1 ? 2045 : 4097);
+        total += widths.back();
+    }
+    Data q(BFLOAT16), w(BFLOAT16), live;
+    Upload(q, {1, total, 2048}, 871);
+    Upload(w, {1, total, 16}, 872);
+    std::vector<Data> keys(requests, Data(BFLOAT16)), storage(requests, Data(INT32)), outputs(requests);
+    std::vector<FastllmNaiveVerifyIndexerItem> items;
+    for (int i = 0; i < requests; ++i) {
+        Upload(keys[i], {1, past[i] + widths[i], 320}, 873 + i);
+        storage[i].Resize({widths[i] * 2048 + 32}); storage[i].Allocate();
+        std::fill((int *)storage[i].cpuData, (int *)storage[i].cpuData + storage[i].Count(0), 0x12345678);
+        storage[i].ToDevice(DataDevice::CUDA, {0}, true);
+        outputs[i].Resize({widths[i], 2048}); outputs[i].FakeFrom(storage[i], 0);
+        items.push_back({&keys[i], &outputs[i], offsets[i], widths[i], past[i]});
+    }
+    FastllmNaiveDecodeScratch scratch;
+    Require(FastllmCudaNaiveBatchVerifyIndexer(q, w, items, fp8, scratch, live), "batch verification Indexer unavailable");
+    for (int i = 0; i < requests; ++i) {
+        auto got = Read<int>(storage[i]);
+        Require(std::all_of(got.begin() + widths[i] * 2048, got.end(),
+            [](int v) { return v == 0x12345678; }), "batched Indexer output canary overwritten");
+        for (int row = 0; row < widths[i]; ++row) {
+            Data qr(BFLOAT16, {1, 1, 2048}), wr(BFLOAT16, {1, 1, 16});
+            Data kr(BFLOAT16, {1, past[i] + row + 1, 320}), expected;
+            qr.FakeFrom(q, (size_t)(offsets[i] + row) * 2048 * 2);
+            wr.FakeFrom(w, (size_t)(offsets[i] + row) * 16 * 2);
+            kr.FakeFrom(keys[i], 0);
+            FastllmCudaNaiveIndexer(qr, wr, kr, 16, 128, past[i] + row, 2048, fp8, expected);
+            auto ref = Read<int>(expected);
+            Require(std::equal(ref.begin(), ref.end(), got.begin() + row * 2048),
+                "batched verification Indexer differs from independent causal row");
+            ++checks;
+        }
+    }
+    std::printf("BATCH VERIFY INDEXER PASS requests=%d rows=%d fp8_query=%d\n", requests, total, fp8);
+}
+
 // Normalizing a chunk must match the same rows in a full batch, including
 // in-place output. The large batch exercises the general reduction kernel.
 static void TestRMSNormChunks() {
@@ -561,7 +607,7 @@ static void TestRouterBatch(int batch, int pattern) {
         Cuda(cudaMemcpy(weight.cudaData, values.data(), weight.GetBytes(), cudaMemcpyHostToDevice));
     }
     int previous = FastllmCudaGetLinearExactBatchThreshold();
-    FastllmCudaSetLinearExactBatchThreshold(9);
+    FastllmCudaSetLinearExactBatchThreshold(batch + 1);
     Graph graph;
     graph.Capture([&]() {
         Require(FastllmCudaNaiveRouterSigmoid(input, weight, actual), "batch router unsupported");
@@ -622,6 +668,7 @@ int main() {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
             return 77;
         FastllmCudaSetDevice(0);
+        for (int requests : {2, 70}) for (bool fp8 : {false, true}) TestBatchVerifyIndexer(requests, fp8);
         for (int rows : {1, 2, 3, 4, 8, 33}) TestIndexerKeyNorm(rows);
         if (!FastllmCudaNaiveDecodeGraphSupported())
             return 77;
@@ -631,7 +678,7 @@ int main() {
             TestPaddedAttention(batch, 8, 192, 128, sparse, fp8);
             TestPaddedAttention(batch, 2, 64, 256, sparse, fp8);
         }
-        for (int batch = 1; batch <= 8; ++batch)
+        for (int batch : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 24, 32, 48, 64, 128})
             for (int pattern = 0; pattern < 3; ++pattern) TestRouterBatch(batch, pattern);
         for (int batch : {1, 2, 3, 4, 17})
             for (int heads : {4, 8, 16})

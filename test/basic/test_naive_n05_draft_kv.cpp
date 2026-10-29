@@ -162,12 +162,47 @@ int ProjectTests(int layers, int inner, int columns) {
     }
     return checks;
 }
+static void MixedBatch(int count, int window) {
+    constexpr int heads = 2, dim = 64, width = heads * dim;
+    std::vector<Data> raw(count), norms(count);
+    std::vector<std::pair<Data, Data>> actual(count), expected(count);
+    std::vector<FastllmNaiveDraftKVUpdate> updates;
+    for (int i = 0; i < count; ++i) {
+        int rows = 1 + i % 8, old = i % 3 == 0 ? 3 : window - 1, start = i % 3 == 0 ? 3 : 32767 + i;
+        raw[i].CopyFrom(BF({1, rows, 2 * width}, 91 + i));
+        norms[i].CopyFrom(Data(FLOAT32, {dim}, std::vector<float>(dim, 1.0f)));
+        norms[i].ToDevice(DataDevice::CUDA, std::vector<int>{device});
+        for (int part = 0; part < 2; ++part) {
+            Data initial = BF({1, old, width}, i * 71 + part);
+            Append(part ? actual[i].second : actual[i].first, initial, window + 16);
+            Append(part ? expected[i].second : expected[i].first, initial, window + 16);
+        }
+        updates.push_back({&raw[i], &norms[i], &actual[i].first, &actual[i].second, start});
+        Data key, value; Split(raw[i], 2, 0, width, key); Split(raw[i], 2, width, 2 * width, value);
+        key.Reshape({1, rows * heads, dim}); KimiK3RMSNorm(key, norms[i], 1e-5f, key); key.Reshape({1, rows, width});
+        std::vector<float> positions(rows); for (int r = 0; r < rows; ++r) positions[r] = start + r;
+        Data pos(FLOAT32, {1, rows}, positions); pos.ToDevice(DataDevice::CUDA, std::vector<int>{device});
+        FastllmCudaNaiveRope(key, pos, heads, dim, dim, 10000.f);
+        Append(expected[i].first, key, window + 16); Append(expected[i].second, value, window + 16);
+        FastllmCudaNaiveTrimCache(expected[i].first, expected[i].second, window - 1);
+    }
+    Check(FastllmCudaNaiveBatchDraftKV(updates, heads, dim, window, window + 16, 1e-5f, 10000.f), "mixed KV batch rejected");
+    for (int i = 0; i < count; ++i) {
+        Check(actual[i].first.dims == expected[i].first.dims, "mixed KV metadata differs");
+        Check(Bits(actual[i].first) == Bits(expected[i].first) && Bits(actual[i].second) == Bits(expected[i].second), "mixed KV differs bitwise");
+    }
+    auto before = Bits(actual.front().first);
+    updates.back().norm = nullptr;
+    Check(!FastllmCudaNaiveBatchDraftKV(updates, heads, dim, window, window + 16, 1e-5f, 10000.f), "invalid mixed KV accepted");
+    Check(Bits(actual.front().first) == before, "mixed KV preflight altered earlier request");
+}
 int main() {
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
             return 77;
         ApplyDeviceMap({{"cuda:0", 1}}, 1, 1);
+        for (int n : {2, 8, 80}) for (int window : {17, 1024, 1152}) MixedBatch(n, window);
         int checks = 0;
         for (int dim : {64, 128, 256})
             for (int rows : {1, 2, 3, 4, 5, 6, 7, 8})

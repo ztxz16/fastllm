@@ -37,16 +37,41 @@ static void Fill(Data &d, unsigned seed) {
     }
     Check(cudaMemcpy(d.cudaData, v.data(), v.size() * 2, cudaMemcpyHostToDevice));
 }
+static void BatchCommit(int requests, DataType type) {
+    std::vector<Data> keys(requests), values(requests), rk(requests), rv(requests);
+    std::vector<FastllmNaiveCacheCommit> updates;
+    for (int i = 0; i < requests; ++i) {
+        const int kc = 128 + i % 3 * 64, vc = 64 + i % 4 * 32;
+        for (Data *d : {&keys[i], &values[i], &rk[i], &rv[i]}) {
+            d->dataType = type; d->UpdateUnitSize();
+            int width = d == &keys[i] || d == &rk[i] ? kc : vc;
+            Init(*d, {1, 144, width}); d->expansionDims = d->dims;
+            std::vector<unsigned char> bytes(d->GetBytes());
+            for (size_t j = 0; j < bytes.size(); ++j) bytes[j] = (j * 17 + i * 37) % 256;
+            Write(*d, bytes); d->Resize({1, 127, width});
+        }
+        int past = i % 3 == 0 ? 3 : 123 + i * 1023, count = i % 9;
+        updates.push_back({&keys[i], &values[i], past, count});
+        FastllmCudaNaiveCommitSwaVerify(rk[i], rv[i], past, count);
+    }
+    FastllmCudaNaiveBatchCommitSwaVerify(updates);
+    for (int i = 0; i < requests; ++i) {
+        Require(keys[i].dims == rk[i].dims && values[i].dims == rv[i].dims, "batch SWA commit metadata differs");
+        Require(Read(keys[i], (size_t)144 * keys[i].dims[2] * keys[i].unitSize) == Read(rk[i], (size_t)144 * rk[i].dims[2] * rk[i].unitSize), "batch SWA key commit differs");
+        Require(Read(values[i], (size_t)144 * values[i].dims[2] * values[i].unitSize) == Read(rv[i], (size_t)144 * rv[i].dims[2] * rv[i].unitSize), "batch SWA value commit differs");
+    }
+}
 int main() {
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
             return 77;
         Check(cudaSetDevice(0));
+        for (int n : {2, 8, 80}) for (DataType type : {BFLOAT16, FP8_E4M3}) BatchCommit(n, type);
         int checks = 0;
         for (DataType type : {BFLOAT16, FP8_E4M3})
-            for (int heads : {8, 16, 32})
-                for (int rows : {1, 2, 6, 8})
+            for (int heads : {4, 8, 16, 32})
+                for (int rows : {1, 2, 3, 4, 5, 6, 7, 8})
                     for (int past : {0, 1, 120, 127, 128, 129, 254, 4095}) {
                         Data q(BFLOAT16), qr(BFLOAT16), k(BFLOAT16), v(BFLOAT16), packed(BFLOAT16),
                             pos(FLOAT32), live(INT32);
@@ -110,6 +135,52 @@ int main() {
                         };
                         fused(false);
                         fused(true);
+                        for (bool ring : {false, true}) {
+                            std::vector<FastllmNaiveSWARow> descriptors(rows);
+                            for (int row = 0; row < rows; ++row) {
+                                auto &d = descriptors[row];
+                                d.key = ring ? key.cudaData : kr.cudaData;
+                                d.value = ring ? value.cudaData : vr.cudaData;
+                                d.fp8 = type == FP8_E4M3;
+                                d.ring = ring;
+                                d.length = (ring ? past : std::min(past, 127)) + row + 1;
+                                d.verifyOffset = ring ? row : -1;
+                            }
+                            Data batched;
+                            FastllmCudaNaiveBatchSWADecode(ring ? q : qr, sink, descriptors,
+                                empty, heads, 1, batched);
+                            Require(Read(batched) == Read(ref), "batched causal SWA differs bitwise");
+                            ++checks;
+                        }
+                        // Cross the descriptor chunk boundary with independent
+                        // query payloads. Reference each request separately.
+                        if (past == 4095 && rows % 2 == 0 && (heads == 8 || heads == 16)) {
+                            for (int requests : {2, 3, 4, 8, 16, 33, 40}) {
+                                Data queries(BFLOAT16), batched;
+                                Init(queries, {1, rows * requests, heads * 192});
+                                Fill(queries, 918 + requests);
+                                std::vector<FastllmNaiveSWARow> descriptors(rows * requests);
+                                for (int i = 0; i < rows * requests; ++i) {
+                                    auto &d = descriptors[i]; d.key = key.cudaData; d.value = value.cudaData;
+                                    d.fp8 = type == FP8_E4M3; d.length = past + i % rows + 1;
+                                    d.verifyOffset = i % rows;
+                                }
+                                FastllmCudaNaiveBatchSWADecode(queries, sink, descriptors, empty,
+                                    heads, 1, batched);
+                                auto got = Read(batched);
+                                for (int request = 0; request < requests; ++request) {
+                                    Data query(BFLOAT16, {1, rows, heads * 192}), expected;
+                                    query.FakeFrom(queries, (size_t)request * rows * heads * 192 * 2);
+                                    FastllmCudaNaiveGraphVerifyAttention(query, key, value, empty, sink, live,
+                                        256, heads, 1, 192, 128, 128, refScratch, expected, true);
+                                    auto values = Read(expected);
+                                    Require(std::equal(values.begin(), values.end(),
+                                        got.begin() + (size_t)request * rows * heads * 128 * 2),
+                                        "large batch staged SWA differs from independent request");
+                                    ++checks;
+                                }
+                            }
+                        }
                         Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
                         fused(true);
                         cudaGraph_t graph;

@@ -1730,6 +1730,11 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
 // at creation; SetSeed runs outside capture before every execution. Run only
 // enqueues device work and writes both the actual q distribution and sampled ID.
 void *FastllmCudaMtpCreateDraftSampler(int vocab, float temperature, int topK, float topP);
+void *FastllmCudaMtpCreateDraftSamplerBatch(int rows, int vocab,
+    const float *temperatures, const int *topKs, const float *topPs);
+// Per-row persistent workspace; offset separates successive draws in one graph.
+bool FastllmCudaMtpDraftSamplerRunBatch(void *sampler, float *logits, float *proposalProbs,
+    float *deviceTokens, uint64_t offset);
 void FastllmCudaMtpDestroyDraftSampler(void *sampler);
 bool FastllmCudaMtpDraftSamplerSetSeed(void *sampler);
 bool FastllmCudaMtpDraftSamplerRun(void *sampler, float *logits, float *proposalProbs,

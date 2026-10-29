@@ -17525,7 +17525,7 @@ __global__ void FastllmMtpTopPApply(const float *probs, float *output, const flo
 // Intersect top-k/top-p on the original temperature softmax, matching the
 // ordinary CUDA sampler. Filtering and renormalizing top-k first changes p.
 struct FastllmMtpSamplingWorkspace {
-    const int vocab;
+    const int vocab, rows;
     uint8_t *scratch = nullptr;
     bool own = false, dedicated = false, needTopP = false, needTopK = false;
     bool uniformTemperature = true;
@@ -17540,7 +17540,7 @@ struct FastllmMtpSamplingWorkspace {
     FastllmMtpTopPState *topPState = nullptr;
     float2 *topPCuts = nullptr;
     explicit FastllmMtpSamplingWorkspace(int rows, int vocab, bool dedicated = false)
-        : vocab(vocab), dedicated(dedicated) {
+        : vocab(vocab), rows(rows), dedicated(dedicated) {
         size_t need = 0;
         auto reserve = [&](size_t bytes) {
             size_t offset = need;
@@ -17559,7 +17559,9 @@ struct FastllmMtpSamplingWorkspace {
         softmaxTiles = dedicated && rows <= 32 && vocab >= 65536 ? (vocab + 4095) / 4096 : 0;
         size_t sm = reserve((size_t)rows * softmaxTiles * sizeof(float2));
         size_t so = dedicated ? reserve(sizeof(uint64_t)) : 0;
-        const bool compactTopP = dedicated && softmaxTiles;
+        // The exact sparse shortcut is independent of workspace ownership and
+        // softmax tiling. Every row retains the full-vocabulary fallback.
+        const bool compactTopP = vocab >= 65536 && rows <= 65535;
         size_t tp = compactTopP ? reserve(rows * sizeof(FastllmMtpTopPState)) : 0;
         size_t tc = compactTopP ? reserve(rows * sizeof(float2)) : 0;
         size_t bytes = 0;
@@ -17677,8 +17679,9 @@ struct FastllmMtpSamplingWorkspace {
                Normalize(logits, rows, vocab);
     }
 };
-__global__ void FastllmMtpSampleIdToFloat(const int *token, float *output) {
-    *output = (float)*token;
+__global__ void FastllmMtpSampleIdToFloat(const int *token, float *output, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) output[i] = (float)token[i];
 }
 uint64_t FastllmMtpSamplingSeed() {
     static thread_local std::mt19937_64 rng(std::random_device{}());
@@ -17690,9 +17693,13 @@ uint64_t FastllmMtpSamplingSeed() {
 // scratch. Update the device seed before each replay; the graph must not capture
 // a fixed host RNG seed.
 void *FastllmCudaMtpCreateDraftSampler(int vocab, float temperature, int topK, float topP) {
-    if (vocab <= 0) return nullptr;
-    auto *state = new FastllmMtpSamplingWorkspace(1, vocab, true);
-    if (!state->UploadParameters(&temperature, &topK, &topP, 1, vocab)) {
+    return FastllmCudaMtpCreateDraftSamplerBatch(1, vocab, &temperature, &topK, &topP);
+}
+void *FastllmCudaMtpCreateDraftSamplerBatch(int rows, int vocab,
+        const float *temperatures, const int *topKs, const float *topPs) {
+    if (rows <= 0 || vocab <= 0 || !temperatures || !topKs || !topPs) return nullptr;
+    auto *state = new FastllmMtpSamplingWorkspace(rows, vocab, true);
+    if (!state->UploadParameters(temperatures, topKs, topPs, rows, vocab)) {
         delete state;
         return nullptr;
     }
@@ -17704,23 +17711,28 @@ void FastllmCudaMtpDestroyDraftSampler(void *sampler) {
 bool FastllmCudaMtpDraftSamplerSetSeed(void *sampler) {
     if (!sampler) return false;
     auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(sampler);
-    uint64_t seed = FastllmMtpSamplingSeed();
+    // FlashInfer uses seed[0], with the row index as the Philox subsequence.
+    const uint64_t seed = FastllmMtpSamplingSeed();
     return cudaMemcpy(ws.seed, &seed, sizeof(seed), cudaMemcpyHostToDevice) == cudaSuccess;
 }
 bool FastllmCudaMtpDraftSamplerRun(void *sampler, float *logits, float *proposalProbs,
                                   float *deviceToken) {
+    return FastllmCudaMtpDraftSamplerRunBatch(sampler, logits, proposalProbs, deviceToken, 0);
+}
+bool FastllmCudaMtpDraftSamplerRunBatch(void *sampler, float *logits, float *proposalProbs,
+                                      float *deviceToken, uint64_t offset) {
     if (!sampler || !logits || !proposalProbs || !deviceToken) return false;
     auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(sampler);
-    if (!ws.Normalize(logits, 1, ws.vocab)) return false;
+    if (!ws.Normalize(logits, ws.rows, ws.vocab)) return false;
     cudaStream_t stream = cudaStreamPerThread;
-    cudaError_t result = cudaMemcpyAsync(proposalProbs, ws.a, (size_t)ws.vocab * sizeof(float),
+    cudaError_t result = cudaMemcpyAsync(proposalProbs, ws.a, (size_t)ws.rows * ws.vocab * sizeof(float),
                                          cudaMemcpyDeviceToDevice, stream);
     if (result == cudaSuccess)
         result = flashinfer::sampling::SamplingFromProb<float, int, 1>(
-            proposalProbs, ws.output, ws.valid, nullptr, 1, ws.vocab, true,
-            ws.seed, 0, nullptr, 0, stream);
+            proposalProbs, ws.output, ws.valid, nullptr, ws.rows, ws.vocab, true,
+            ws.seed, 0, nullptr, offset, stream);
     if (result != cudaSuccess) return false;
-    FastllmMtpSampleIdToFloat<<<1, 1, 0, stream>>>(ws.output, deviceToken);
+    FastllmMtpSampleIdToFloat<<<(ws.rows + 127) / 128, 128, 0, stream>>>(ws.output, deviceToken, ws.rows);
     return cudaGetLastError() == cudaSuccess;
 }
 
