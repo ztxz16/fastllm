@@ -3550,8 +3550,10 @@ namespace fastllm {
         // plus host-side metadata per batch.  Capturing the largest batch first
         // gives every Data object enough capacity for the smaller graph shapes.
         struct Qwen35DFlashComputeWorkspace;
+        struct Qwen35GdnPrefillGraphState;
         struct Qwen35CudaGraphWorkspace {
             std::shared_ptr<Qwen35DFlashComputeWorkspace> dflashCompute;
+            std::shared_ptr<Qwen35GdnPrefillGraphState> gdnPrefill;
             std::mutex mutex;
             Qwen35CudaGraphDecodeState *activeState = nullptr;
             int capacityBatch = 0;
@@ -12980,6 +12982,145 @@ namespace fastllm {
         Data storage; // Declared before the borrowed Data at the call site.
         std::vector<Data*> outputs;
     };
+    namespace {
+    static bool Qwen35GdnPrefillGraphEnabled() {
+#ifdef _WIN32
+        return Qwen35CudaGraphEnabled();
+#else
+        return false;
+#endif
+    }
+
+    // One bounded workspace per model/device, shared sequentially by all GDN
+    // layers. Only the configured full prefill chunk is captured. Tail chunks
+    // keep the eager path; accumulated context length is not a GDN dimension.
+    // Staging inputs, weights and state avoids retaining any caller scratch or
+    // request-cache pointers in the graph, including when requests are reset.
+    struct Qwen35GdnPrefillGraphState {
+        int device;
+        // Scratch and graph launches use the per-thread default stream.
+        // The server may replace its scheduler thread between requests; the
+        // CPU workspace mutex alone does not order those CUDA streams.
+        std::thread::id ownerThread = std::this_thread::get_id();
+        std::vector<int> signature;
+        Data convInput, baInput, norm, aLog, dtBias, state;
+        Data q, k, v, b, a, g, qRepeat, kRepeat, qq, qTemp;
+        Data kkPad, vvPad, bbPad, ggPad, decayMask, kBeta, vBeta;
+        Data attn, at, kCumdecay, gExp, coreAttnOut, coreTemp;
+        void *graph = nullptr, *exec = nullptr;
+        std::vector<void*> reserved;
+        bool warmed = false, disabled = false;
+
+        explicit Qwen35GdnPrefillGraphState(int device,
+                                           const std::vector<int> &signature)
+            : device(device), signature(signature) {}
+
+        void ClearGraph() {
+            if (exec) FastllmCudaGraphExecDestroy(exec);
+            if (graph) FastllmCudaGraphDestroy(graph);
+            if (!reserved.empty()) FastllmCudaGraphMemoryPoolRelease(reserved);
+            exec = graph = nullptr;
+            reserved.clear();
+        }
+
+        ~Qwen35GdnPrefillGraphState() {
+            const int previous = FastllmCudaGetDevice();
+            FastllmCudaSetDevice(device);
+            ForceDeviceSync();
+            ClearGraph();
+            for (Data *data : {&convInput, &baInput, &norm, &aLog, &dtBias, &state,
+                              &q, &k, &v, &b, &a, &g, &qRepeat, &kRepeat, &qq, &qTemp,
+                              &kkPad, &vvPad, &bbPad, &ggPad, &decayMask, &kBeta,
+                              &vBeta, &attn, &at, &kCumdecay, &gExp, &coreAttnOut,
+                              &coreTemp}) {
+                data->FreeSpace();
+            }
+            FastllmCudaSetDevice(previous);
+        }
+
+        void Prepare(Data &dst, DataType type, const std::vector<int> &dims) {
+            if (dst.cudaData) {
+                AssertInFastLLM(dst.dataType == type && dst.dims == dims,
+                                "GDN prefill graph input shape changed.\n");
+                return;
+            }
+            dst.dataType = type;
+            dst.UpdateUnitSize();
+            dst.dataDevice = DataDevice::CUDA;
+            dst.dataDeviceIds = {device};
+            dst.Resize(dims);
+            dst.Allocate(false);
+        }
+
+        void Stage(Data &dst, const Data &src) {
+            AssertInFastLLM(src.dataDevice == DataDevice::CUDA && src.cudaData,
+                            "GDN prefill graph requires CUDA input.\n");
+            Prepare(dst, src.dataType, src.dims);
+            AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                                dst.cudaData, src.cudaData, src.GetBytes()),
+                            "GDN prefill graph input copy failed.\n");
+        }
+
+        template<class Body> void Run(Body &&body) {
+            if (!warmed) {
+                body();
+                warmed = true;
+                return;
+            }
+            auto launch = [&]() {
+                if (!FastllmCudaGraphLaunch(exec))
+                    throw std::runtime_error("GDN prefill graph launch failed");
+            };
+            if (exec) { launch(); return; }
+            FastllmCudaClearThreadError();
+            FastllmCudaClearGraphError();
+            bool pool = FastllmCudaGraphPrepareCaptureDevice() &&
+                        FastllmCudaGraphMemoryPoolBegin();
+            bool captured = false;
+            if (pool && FastllmCudaGraphBeginCapture()) {
+                try {
+                    body();
+                } catch (...) {
+                    const bool captureFailure = FastllmCudaGraphCaptureInvalidated();
+                    void *failed = nullptr;
+                    FastllmCudaGraphEndCapture(&failed);
+                    if (failed) FastllmCudaGraphDestroy(failed);
+                    FastllmCudaGraphMemoryPoolAbort();
+                    if (!captureFailure) throw;
+                    pool = false;
+                }
+                if (pool) {
+                    captured = FastllmCudaGraphEndCapture(&graph) && graph &&
+                        !FastllmCudaGetThreadError();
+                    if (captured) {
+                        captured = FastllmCudaGraphMemoryPoolEnd(reserved);
+                        pool = false;
+                    }
+                    if (captured)
+                        captured = FastllmCudaGraphInstantiate(graph, &exec);
+                }
+            }
+            if (captured) {
+                printf("[GDN Prefill Graph] captured tokens=%d; shared across layers.\n",
+                       signature[0]);
+                fflush(stdout);
+                launch();
+                return;
+            }
+            if (pool) FastllmCudaGraphMemoryPoolAbort();
+            ClearGraph();
+            disabled = true;
+            FastllmCudaClearThreadError();
+            FastllmCudaClearGraphError();
+            printf("[GDN Prefill Graph] capture unavailable; using eager execution.\n");
+            fflush(stdout);
+            // Capture records operations without advancing the staged state.
+            // Execute exactly once, then publish that state back to the caller.
+            body();
+        }
+    };
+    } // namespace
+
 #endif
 
     void Qwen3_5Model::ForwardSingleGPU(
@@ -14749,7 +14890,67 @@ namespace fastllm {
                 bool deferredGdnOutputLayout = false;
                 int deferredGdnOutputSeqLen = 0;
                 int deferredGdnOutputPaddedSeqLen = 0;
-                auto runChunkLinearAttention = [&]() {
+                auto runChunkLinearAttentionBody = [&,
+                        &eager_q = q, &eager_k = k, &eager_v = v,
+                        &eager_b = b, &eager_a = a, &eager_g = g,
+                        &eager_qRepeat = qRepeat, &eager_kRepeat = kRepeat, &eager_qq = qq,
+                        &eager_qTemp = qTemp, &eager_kkPad = kkPad, &eager_vvPad = vvPad,
+                        &eager_bbPad = bbPad, &eager_ggPad = ggPad, &eager_decayMask = decayMask,
+                        &eager_kBeta = kBeta, &eager_vBeta = vBeta, &eager_attn = attn,
+                        &eager_at = at, &eager_kCumdecay = kCumdecay, &eager_gExp = gExp,
+                        &eager_coreAttnOut = coreAttnOut, &eager_coreTemp = coreTemp,
+                        eagerConv = convOutputForRecurrent,
+                        eagerState = chunkPastValue,
+                        eagerConvSplit = ensureConvQkvSplit,
+                        eagerBaSplit = ensureBaSplit](Qwen35GdnPrefillGraphState *gs) {
+                    Data &q = gs ? gs->q : eager_q;
+                    Data &k = gs ? gs->k : eager_k;
+                    Data &v = gs ? gs->v : eager_v;
+                    Data &b = gs ? gs->b : eager_b;
+                    Data &a = gs ? gs->a : eager_a;
+                    Data &g = gs ? gs->g : eager_g;
+                    Data &qRepeat = gs ? gs->qRepeat : eager_qRepeat;
+                    Data &kRepeat = gs ? gs->kRepeat : eager_kRepeat;
+                    Data &qq = gs ? gs->qq : eager_qq;
+                    Data &qTemp = gs ? gs->qTemp : eager_qTemp;
+                    Data &kkPad = gs ? gs->kkPad : eager_kkPad;
+                    Data &vvPad = gs ? gs->vvPad : eager_vvPad;
+                    Data &bbPad = gs ? gs->bbPad : eager_bbPad;
+                    Data &ggPad = gs ? gs->ggPad : eager_ggPad;
+                    Data &decayMask = gs ? gs->decayMask : eager_decayMask;
+                    Data &kBeta = gs ? gs->kBeta : eager_kBeta;
+                    Data &vBeta = gs ? gs->vBeta : eager_vBeta;
+                    Data &attn = gs ? gs->attn : eager_attn;
+                    Data &at = gs ? gs->at : eager_at;
+                    Data &kCumdecay = gs ? gs->kCumdecay : eager_kCumdecay;
+                    Data &gExp = gs ? gs->gExp : eager_gExp;
+                    Data &coreAttnOut = gs ? gs->coreAttnOut : eager_coreAttnOut;
+                    Data &coreTemp = gs ? gs->coreTemp : eager_coreTemp;
+                    Data *convOutputForRecurrent = gs ? &gs->convInput : eagerConv;
+                    Data *chunkPastValue = gs ? &gs->state : eagerState;
+                    Data &gdnNorm = gs ? gs->norm :
+                        *requireLocal(inv_scale_data, "linear_attn.inv_scale");
+                    Data &gdnALog = gs ? gs->aLog : *requireLocal(weight[aLogName], aLogName);
+                    Data &gdnDtBias = gs ? gs->dtBias : *requireLocal(weight[dtBiasName], dtBiasName);
+                    bool graphConvSplit = false, graphBaSplit = false;
+                    auto ensureConvQkvSplit = [&]() {
+                        if (!gs) { eagerConvSplit(); return; }
+                        if (graphConvSplit) return;
+                        Qwen3CudaSplit(cudaRunner, gs->convInput, -1, 0, localKd, q);
+                        Qwen3CudaSplit(cudaRunner, gs->convInput, -1, localKd, localKd * 2, k);
+                        Qwen3CudaSplit(cudaRunner, gs->convInput, -1, localKd * 2, localKd * 2 + localVd, v);
+                        q.Reshape({1, seqlen, localKeyHeads, head_k_dim});
+                        k.Reshape({1, seqlen, localKeyHeads, head_k_dim});
+                        v.Reshape({1, seqlen, localValueHeads, head_v_dim});
+                        graphConvSplit = true;
+                    };
+                    auto ensureBaSplit = [&]() {
+                        if (!gs) { eagerBaSplit(); return; }
+                        if (graphBaSplit) return;
+                        Qwen3CudaSplit(cudaRunner, gs->baInput, -1, 0, localValueHeads, b);
+                        Qwen3CudaSplit(cudaRunner, gs->baInput, -1, localValueHeads, 2 * localValueHeads, a);
+                        graphBaSplit = true;
+                    };
                     int chunkSize = 64;
                     bool baPostProcessReady = false;
                     auto ensureBaPostProcess = [&]() {
@@ -14760,14 +14961,15 @@ namespace fastllm {
 #ifdef USE_CUDA
                         if (uniformPrefill) {
                             Data *combinedBaSource =
-                                hasMergedGdnInLinear ? &gdnMerged : &baMerged;
-                            int combinedBaOffset = hasMergedGdnInLinear ?
+                                gs ? &gs->baInput :
+                                (hasMergedGdnInLinear ? &gdnMerged : &baMerged);
+                            int combinedBaOffset = !gs && hasMergedGdnInLinear ?
                                 localQkvDim + localVd : 0;
                             combinedBaPostProcess =
                                 FastllmCudaTryCombinedBaSigmoidMambaSoftplus(
                                     *combinedBaSource,
-                                    *requireLocal(weight[aLogName], aLogName),
-                                    *requireLocal(weight[dtBiasName], dtBiasName),
+                                    gdnALog,
+                                    gdnDtBias,
                                     batch, uniformPrefillSeqLen,
                                     combinedBaSource->dims.back(),
                                     combinedBaOffset, localValueHeads,
@@ -14786,8 +14988,8 @@ namespace fastllm {
                             }
                             Qwen35CudaSigmoidMambaSoftplus(
                                 cudaRunner, b, a,
-                                *requireLocal(weight[aLogName], aLogName),
-                                *requireLocal(weight[dtBiasName], dtBiasName), g);
+                                gdnALog,
+                                gdnDtBias, g);
                         }
                         baPostProcessReady = true;
                     };
@@ -14824,8 +15026,7 @@ namespace fastllm {
                         // tensors while reading V directly from the combined
                         // source, avoiding all three Q/K/V split copies.
                         Data *linearNormWeight =
-                            requireLocal(inv_scale_data,
-                                         "linear_attn.inv_scale");
+                            &gdnNorm;
                         fusedPostConv =
                             FastllmCudaTryTritonChunkGdnPostConv(
                                 *convOutputForRecurrent, *linearNormWeight,
@@ -14854,17 +15055,17 @@ namespace fastllm {
                     }
                     if (batchedRaggedPrefill) {
                         Data *combinedBaSource =
-                            hasMergedGdnInLinear ? &gdnMerged : &baMerged;
-                        int combinedBaOffset = hasMergedGdnInLinear ?
+                            gs ? &gs->baInput :
+                                (hasMergedGdnInLinear ? &gdnMerged : &baMerged);
+                        int combinedBaOffset = !gs && hasMergedGdnInLinear ?
                             localQkvDim + localVd : 0;
                         logicalRagged = fuseOutputDecayMask &&
                             FastllmCudaTryChunkGdnRaggedPostConv(
                                 *convOutputForRecurrent,
-                                *requireLocal(inv_scale_data,
-                                              "linear_attn.inv_scale"),
+                                gdnNorm,
                                 *combinedBaSource,
-                                *requireLocal(weight[aLogName], aLogName),
-                                *requireLocal(weight[dtBiasName], dtBiasName),
+                                gdnALog,
+                                gdnDtBias,
                                 combinedBaOffset, seqLens, chunkSize,
                                 localKeyHeads, localValueHeads,
                                 head_k_dim, head_v_dim, rms_norm_eps,
@@ -14896,13 +15097,11 @@ namespace fastllm {
                             }
                             Qwen3CudaRMSNorm(
                                 cudaRunner, q,
-                                *requireLocal(inv_scale_data,
-                                              "linear_attn.inv_scale"),
+                                gdnNorm,
                                 rms_norm_eps, q);
                             Qwen3CudaRMSNorm(
                                 cudaRunner, k,
-                                *requireLocal(inv_scale_data,
-                                              "linear_attn.inv_scale"),
+                                gdnNorm,
                                 rms_norm_eps, k);
                             normalizedBeforeRepeat = true;
                             packedRagged =
@@ -14959,13 +15158,11 @@ namespace fastllm {
                         if (!normalizedBeforeRepeat) {
                             Qwen3CudaRMSNorm(
                                 cudaRunner, q,
-                                *requireLocal(inv_scale_data,
-                                              "linear_attn.inv_scale"),
+                                gdnNorm,
                                 rms_norm_eps, q);
                             Qwen3CudaRMSNorm(
                                 cudaRunner, k,
-                                *requireLocal(inv_scale_data,
-                                              "linear_attn.inv_scale"),
+                                gdnNorm,
                                 rms_norm_eps, k);
                         }
                         Qwen3CudaPermuteSelf(cudaRunner, q, {0, 2, 1, 3});
@@ -15186,6 +15383,92 @@ namespace fastllm {
                             state->isLinearAttentionTransposed = false;
                         }
                     }
+                };
+                auto runChunkLinearAttention = [&]() {
+                    const bool eligible = singleUniformPrefill && !tensorParallel &&
+                        !kvMemConfig.enabled && !GetFastllmEnv().cudaTriton &&
+                        !speculativeCaptureFirstTokenLinearState &&
+                        Qwen35GdnPrefillGraphEnabled() &&
+                        seqlen == GetChunkedPrefillSize() &&
+                        seqlen >= 64 && seqlen <= 512 && seqlen % 64 == 0 &&
+                        (chunkPastValue->dims.empty() ||
+                         chunkPastValue->dataType == DataType::FLOAT16);
+                    if (!eligible) { runChunkLinearAttentionBody(nullptr); return; }
+                    Data &norm = *requireLocal(inv_scale_data, "linear_attn.inv_scale");
+                    Data &aLog = *requireLocal(weight[aLogName], aLogName);
+                    Data &dtBias = *requireLocal(weight[dtBiasName], dtBiasName);
+                    std::vector<int> signature = {seqlen, localKeyHeads, localValueHeads,
+                        head_k_dim, head_v_dim};
+                    for (const Data *data : {convOutputForRecurrent, &norm, &aLog, &dtBias}) {
+                        signature.push_back((int)data->dataType);
+                        signature.push_back((int)data->dims.size());
+                        signature.insert(signature.end(), data->dims.begin(), data->dims.end());
+                    }
+                    auto &workspace = GetQwen35CudaGraphWorkspace(this, gpuId);
+                    std::lock_guard<std::mutex> guard(workspace.mutex);
+                    if (!workspace.gdnPrefill) {
+                        // Native transpose/GDN kernels borrow the attention
+                        // float arena. Create its fixed, process-lifetime buffer
+                        // before warmup so capture cannot retain the growable
+                        // fallback temp buffer. The GDN recurrence caps its
+                        // window at 64 MiB; also bound the transpose tensors.
+                        size_t scratchBytes = 0;
+                        void *scratch = FastllmCudaGetFlashInferFloatWorkspace(&scratchBytes);
+                        const uint64_t transposeBytes = (uint64_t)seqlen *
+                            localValueHeads * std::max(head_k_dim, head_v_dim) * sizeof(uint16_t);
+                        if (!scratch || scratchBytes < ((size_t)64 << 20) ||
+                            scratchBytes < transposeBytes) {
+                            runChunkLinearAttentionBody(nullptr);
+                            return;
+                        }
+                        workspace.gdnPrefill.reset(new Qwen35GdnPrefillGraphState(gpuId, signature));
+                    }
+                    auto &gs = *workspace.gdnPrefill;
+                    // Do not accumulate graphs for every tail length or replace
+                    // an in-flight graph when a caller changes its chunk size.
+                    if (gs.signature != signature || gs.disabled) {
+                        runChunkLinearAttentionBody(nullptr);
+                        return;
+                    }
+                    if (gs.ownerThread != std::this_thread::get_id()) {
+                        // Also drain users of the shared attention scratch on
+                        // the previous PTDS. Same-thread layers/chunks stay
+                        // entirely asynchronous; this is only a worker handoff.
+                        ForceDeviceSync();
+                        gs.ownerThread = std::this_thread::get_id();
+                        if (!gs.exec) gs.warmed = false;
+                    }
+                    if (chunkPastValue->dims.empty()) {
+                        chunkPastValue->dataDevice = DataDevice::CUDA;
+                        chunkPastValue->dataDeviceIds = {gpuId};
+                        chunkPastValue->Resize({1, localValueHeads, head_k_dim, head_v_dim});
+                        chunkPastValue->Allocate(0.0f);
+                    }
+                    AssertInFastLLM(Qwen35EnsureCudaLinearAttnStateKVLayout(*chunkPastValue),
+                                    "GDN prefill graph cannot restore recurrent state layout.\n");
+                    gs.Stage(gs.convInput, *convOutputForRecurrent);
+                    gs.Stage(gs.norm, norm);
+                    gs.Stage(gs.aLog, aLog);
+                    gs.Stage(gs.dtBias, dtBias);
+                    gs.Stage(gs.state, *chunkPastValue);
+                    Data &baSource = hasMergedGdnInLinear ? gdnMerged : baMerged;
+                    const int baOffset = hasMergedGdnInLinear ? localQkvDim + localVd : 0;
+                    gs.Prepare(gs.baInput, baSource.dataType, {1, seqlen, 2 * localValueHeads});
+                    const size_t width = 2 * localValueHeads * baSource.unitSize;
+                    AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
+                        gs.baInput.cudaData, width,
+                        (const uint8_t*)baSource.cudaData + baOffset * baSource.unitSize,
+                        baSource.dims.back() * baSource.unitSize, width, seqlen),
+                        "GDN prefill graph BA copy failed.\n");
+                    gs.Run([&]() { runChunkLinearAttentionBody(&gs); });
+                    AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                        chunkPastValue->cudaData, gs.state.cudaData, gs.state.GetBytes()),
+                        "GDN prefill graph state copy failed.\n");
+                    chunkPastValue->isLinearAttentionTransposed = false;
+                    Qwen35PrepareGraphCudaTensor(coreAttnOut, gs.coreAttnOut, gpuId, true);
+                    deferredGdnOutputLayout = true;
+                    deferredGdnOutputSeqLen = seqlen;
+                    deferredGdnOutputPaddedSeqLen = seqlen;
                 };
                 if (fusedBatchSpeculativeSequence) {
                     // coreAttnOut is already produced request-by-request by

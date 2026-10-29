@@ -125,3 +125,14 @@ DLL，可以显式启用：
 Windows 脚本直接读取 `make_whl.sh` 中的默认架构；公共工具位于
 `tools/windows/common.ps1`。增量打包时会清理构建目录中上次生成的包元数据，
 确保新 wheel 使用当前源码的版本号。
+
+## Qwen3.5 / Qwen3.8 GDN prefill Graph
+
+Windows CUDA 构建默认启用 GDN prefill 的固定分块 Graph，沿用
+`FASTLLM_CUDA_GRAPH` 总开关，无需单独配置。Linux 保持原有路径。
+
+当前覆盖单卡、单请求、FP16 激活/递推状态、原生 CUDA 算子的主分块：
+`--chunked_prefill_size` 须为 64 的整数倍且在 64–512 之间，本次 token 数须等于
+配置的分块大小。Triton、KVMem、TP、MTP 状态捕获和其他形状保留原路径；
+显式缩小 attention 临时工作区到不足 64 MiB 时也保留原路径。
+此功能不依赖 NUMA，可以继续使用 `USE_NUMAS=OFF` 构建。
