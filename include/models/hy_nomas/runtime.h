@@ -27,6 +27,7 @@ struct Tensor {
 class Runtime {
 public:
     explicit Runtime(int device);
+    Runtime(int device, bool fp32);
     void activate();
     bool isFloat32() const { return fp32_; }
     ~Runtime();

@@ -6,19 +6,31 @@ set_directory_properties(PROPERTIES
     COMPILE_DEFINITIONS ""
     INCLUDE_DIRECTORIES "")
 
-add_library(fastllm_nomas SHARED
-    attention.cu runtime.cu model.cpp tokenizer.cpp pipeline.cpp
+add_library(fastllm_continuous STATIC
+    attention.cu runtime.cu tokenizer.cpp
     ${PROJECT_SOURCE_DIR}/third_party/json11/json11.cpp)
-target_include_directories(fastllm_nomas PRIVATE
+target_include_directories(fastllm_continuous PUBLIC
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/third_party/json11
     ${PROJECT_SOURCE_DIR}/third_party/flashinfer)
-target_compile_options(fastllm_nomas PRIVATE
+target_compile_options(fastllm_continuous PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
     $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
-set_target_properties(fastllm_nomas PROPERTIES
+set_target_properties(fastllm_continuous PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
     CUDA_STANDARD 17
     CXX_STANDARD 17
     CUDA_ARCHITECTURES "${FASTLLM_CUDA_ARCHITECTURES}"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-target_link_libraries(fastllm_nomas PRIVATE cublas cublasLt)
+target_link_libraries(fastllm_continuous PUBLIC cublas cublasLt)
+
+if(BUILD_HY_NOMAS)
+    add_library(fastllm_nomas SHARED bindings.cpp model.cpp pipeline.cpp)
+    target_link_libraries(fastllm_nomas PRIVATE fastllm_continuous)
+    target_compile_options(fastllm_nomas PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+        $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+    set_target_properties(fastllm_nomas PROPERTIES CUDA_STANDARD 17 CXX_STANDARD 17
+        CUDA_ARCHITECTURES "${FASTLLM_CUDA_ARCHITECTURES}"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
