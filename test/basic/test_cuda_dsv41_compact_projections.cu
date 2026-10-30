@@ -215,10 +215,38 @@ void woa(int tokens, int groups, int rank, int hidden, const std::string &real, 
         cudaGraphDestroy(g);
     }
 }
+// A precision-specific handle must not change the ordinary cuBLAS state or
+// initialize CUDA resources during a first-use graph capture.
+void woaHandleIsolation() {
+#if !defined(USE_ROCM) && CUBLAS_VERSION >= 11000
+    auto ordinary = getFastllmCublasHandle();
+    cublasMath_t before, after, strictMode;
+    CHECK(cublasGetMathMode(ordinary, &before) == CUBLAS_STATUS_SUCCESS);
+    cudaGraph_t graph = nullptr;
+    CUDA_OK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    CHECK(getFastllmCublasFp32ReductionHandle() == nullptr);
+    CUDA_OK(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    CUDA_OK(cudaGraphDestroy(graph));
+
+    auto strict = getFastllmCublasFp32ReductionHandle();
+    CHECK(strict && strict != ordinary);
+    CHECK(cublasGetMathMode(strict, &strictMode) == CUBLAS_STATUS_SUCCESS);
+    CHECK((int(strictMode) & CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION) != 0);
+    CHECK(cublasGetMathMode(ordinary, &after) == CUBLAS_STATUS_SUCCESS && after == before);
+    CUDA_OK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    CHECK(getFastllmCublasFp32ReductionHandle() == strict);
+    CUDA_OK(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    CUDA_OK(cudaGraphDestroy(graph));
+    CHECK(getFastllmCublasHandle() == ordinary);
+    std::puts("WOA_HANDLE_PASS isolated precision state and first-use capture fallback");
+#endif
+}
+
 int main(int argc, char **argv) {
     CUDA_OK(cudaSetDevice(0));
     if (FastllmCudaRuntimeArch() < 80)
         return 77;
+    woaHandleIsolation();
     std::string real = argc > 1 ? argv[1] : "";
     for (int rows : {1, 4, 8, 16})
         head(rows, 512, 257, "");

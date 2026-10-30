@@ -135,6 +135,9 @@ void *FastllmCudaPrepareOutput(fastllm::Data &output);
 void FastllmCudaFinishInput(const fastllm::Data &input, void *data);
 void FastllmCudaFinishOutput(fastllm::Data &output, void *data);
 cublasHandle_t getFastllmCublasHandle();
+// Separate, immutable precision mode for BF16 output with FP32 reductions.
+// Returns null if unsupported or first requested during graph capture.
+cublasHandle_t getFastllmCublasFp32ReductionHandle();
 
 void FastllmCudaPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *cudaIndex);
 void FastllmCudaPickOutputFloat(float *partOutput, float *output, int rows, int cols, int *index, float *scales);

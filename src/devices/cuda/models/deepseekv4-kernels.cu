@@ -6158,7 +6158,15 @@ bool DeepSeekV4LaunchWoAGemm(const fastllm::Data &o, const fastllm::Data &woA,
     int groupDim = headsPerGroup * headDim;
     int fullDim = heads * headDim;
     float alpha = 1.0f, beta = 0.0f;
+#if !defined(USE_ROCM) && CUBLAS_VERSION >= 11000
+    // FP32 compute alone still permits BF16 split reductions in cuBLAS.
+    // Keep Tensor Cores, but preserve FP32 intermediates for the small BF16
+    // verification path. Single-token decode and FP8 weights never enter it.
+    auto handle = bf16Verify ? getFastllmCublasFp32ReductionHandle() : getFastllmCublasHandle();
+    if (!handle) return false;
+#else
     auto handle = getFastllmCublasHandle();
+#endif
 
     if (o.dataType == fastllm::DataType::BFLOAT16 && woA.dataType == fastllm::DataType::BFLOAT16) {
         bool complete = true;

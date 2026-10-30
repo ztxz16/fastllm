@@ -463,9 +463,11 @@ struct FastllmCublasState {
     cublasHandle_t handle = nullptr;
     void *workspace = nullptr;
 };
-static std::map<int, std::unique_ptr<FastllmCublasState>> s_fastllmCublasHandleMap;
+// Precision modes use distinct handles/workspaces; never mutate a handle
+// another operator or graph family may be using.
+static std::map<std::pair<int, bool>, std::unique_ptr<FastllmCublasState>> s_fastllmCublasHandleMap;
 static std::mutex s_fastllmCublasHandleMapMutex;
-cublasHandle_t getFastllmCublasHandle() {
+static cublasHandle_t GetFastllmCublasHandle(bool fp32Reduction) {
     int id = -1;
     cudaGetDevice(&id);
     FastllmCublasState *state;
@@ -474,7 +476,7 @@ cublasHandle_t getFastllmCublasHandle() {
         // wait for this rank's pending NCCL work; holding a cross-device lock
         // would prevent another rank from reaching the matching collective.
         std::lock_guard<std::mutex> guard(s_fastllmCublasHandleMapMutex);
-        auto &entry = s_fastllmCublasHandleMap[id];
+        auto &entry = s_fastllmCublasHandleMap[{id, fp32Reduction}];
         if (!entry) entry = std::make_unique<FastllmCublasState>();
         state = entry.get();
     }
@@ -489,6 +491,13 @@ cublasHandle_t getFastllmCublasHandle() {
         // stable after creation so warmed GEMMs can be captured and replayed.
         return state->handle;
     }
+    if (fp32Reduction) {
+        // Warmed handles are capture-safe. A first-use capture must take the
+        // caller's allocation-free fallback instead of initializing cuBLAS.
+        cudaStreamCaptureStatus capture;
+        if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+            capture != cudaStreamCaptureStatusNone) return nullptr;
+    }
     cublasHandle_t handler = nullptr;
     auto stat = cublasCreate(&handler);
 
@@ -502,6 +511,14 @@ cublasHandle_t getFastllmCublasHandle() {
             cublasDestroy(handler);
             exit(0);
         }
+#if !defined(USE_ROCM) && CUBLAS_VERSION >= 11000
+        if (fp32Reduction && cublasSetMathMode(handler,
+                static_cast<cublasMath_t>(CUBLAS_DEFAULT_MATH |
+                    CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)) != CUBLAS_STATUS_SUCCESS) {
+            cublasDestroy(handler);
+            return nullptr;
+        }
+#endif
         if (fastllm::GetFastllmEnv().cudaGraph) {
             static size_t graphWorkspaceBytes = []() {
                 const char *env = std::getenv("FASTLLM_CUBLAS_GRAPH_WORKSPACE_MB");
@@ -533,6 +550,18 @@ cublasHandle_t getFastllmCublasHandle() {
     }
 
     return handler;
+}
+
+cublasHandle_t getFastllmCublasHandle() {
+    return GetFastllmCublasHandle(false);
+}
+
+cublasHandle_t getFastllmCublasFp32ReductionHandle() {
+#if !defined(USE_ROCM) && CUBLAS_VERSION >= 11000
+    return GetFastllmCublasHandle(true);
+#else
+    return nullptr;
+#endif
 }
 
 std::vector <long long> FastllmCudaGetFreeSizes() {
