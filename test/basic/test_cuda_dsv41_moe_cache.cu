@@ -165,6 +165,63 @@ static void TestDotGateUp() {
     std::printf("DOT_GATE_UP_PASS 512 projection pairs: finite bits and NaN cases\n");
 }
 
+// Replay the tiled resident path with changing routes; the ordinary path is
+// the numerical reference, including absent slots and block-32 FP8 rounding.
+static void TestResidentGate() {
+    constexpr int topk = 6, inter = 96;
+    size_t cases = 0;
+    for (int hidden : {256, 768, 5120}) {
+        const size_t stride = size_t(hidden / 32) * 17 * inter * 2;
+        std::vector<uint8_t> weights(topk * stride);
+        std::vector<__nv_bfloat16> input(hidden), reference(topk * inter), actual(topk * inter);
+        uint8_t *dw; __nv_bfloat16 *dx, *da, *db; int32_t *ds; float *dr;
+        Check(cudaMalloc(&dw, weights.size())); Check(cudaMalloc(&dx, hidden * sizeof(*dx)));
+        Check(cudaMalloc(&da, reference.size() * sizeof(*da))); Check(cudaMalloc(&db, actual.size() * sizeof(*db)));
+        Check(cudaMalloc(&ds, topk * sizeof(*ds))); Check(cudaMalloc(&dr, topk * sizeof(*dr)));
+        const float scores[topk] = {0.0f, -0.125f, 0.3f, 0.9f, 1.0f, -0.5f};
+        Check(cudaMemcpy(dr, scores, sizeof(scores), cudaMemcpyHostToDevice));
+        cudaStream_t stream; cudaGraph_t graph; cudaGraphExec_t exec;
+        Check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        Check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        fastllm::cuda::dsv41_cache::Gate<<<dim3(inter / 32, topk), 512, 0, stream>>>(
+            dx, ds, dw, dr, da, hidden, inter, stride, 10.0f);
+        fastllm::cuda::dsv41_cache::GateResident<<<dim3(inter / 32, topk), 512, 0, stream>>>(
+            dx, ds, dw, dr, db, hidden, inter, stride, 10.0f);
+        Check(cudaStreamEndCapture(stream, &graph));
+        Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        for (int seed = 0; seed < 4; ++seed) {
+            std::mt19937 rng(100 + seed);
+            for (auto &v : input) v = __float2bfloat16_rn((int(rng() % 4096) - 2048) / 4096.0f);
+            for (size_t n = 0; n < weights.size(); n += 17) {
+                for (int b = 0; b < 16; ++b) weights[n + b] = uint8_t(rng());
+                const uint8_t edges[] = {0, 1, 117, 126, 254, 255};
+                weights[n + 16] = seed == 3 ? edges[n / stride] : uint8_t(117 + rng() % 10);
+            }
+            Check(cudaMemcpy(dw, weights.data(), weights.size(), cudaMemcpyHostToDevice));
+            Check(cudaMemcpy(dx, input.data(), input.size() * sizeof(*dx), cudaMemcpyHostToDevice));
+            for (int mask = 0; mask < 64; ++mask) {
+                int32_t slots[topk];
+                for (int r = 0; r < topk; ++r) slots[r] = mask & (1 << r) ? topk - r - 1 : -1;
+                Check(cudaMemcpyAsync(ds, slots, sizeof(slots), cudaMemcpyHostToDevice, stream));
+                Check(cudaMemsetAsync(da, 0x3f, reference.size() * sizeof(*da), stream));
+                Check(cudaMemsetAsync(db, 0x3f, actual.size() * sizeof(*db), stream));
+                Check(cudaGraphLaunch(exec, stream)); Check(cudaStreamSynchronize(stream));
+                Check(cudaMemcpy(reference.data(), da, reference.size() * sizeof(*da), cudaMemcpyDeviceToHost));
+                Check(cudaMemcpy(actual.data(), db, actual.size() * sizeof(*db), cudaMemcpyDeviceToHost));
+                for (size_t n = 0; n < reference.size(); ++n)
+                    Require(std::memcmp(&reference[n], &actual[n], sizeof(*da)) == 0 ||
+                        (std::isnan(__bfloat162float(reference[n])) && std::isnan(__bfloat162float(actual[n]))),
+                        "resident gate changed BF16/FP8 rounding or stale route output");
+                ++cases;
+            }
+        }
+        Check(cudaGraphExecDestroy(exec)); Check(cudaGraphDestroy(graph)); Check(cudaStreamDestroy(stream));
+        for (void *p : {static_cast<void *>(dw), static_cast<void *>(dx), static_cast<void *>(da),
+                static_cast<void *>(db), static_cast<void *>(ds), static_cast<void *>(dr)}) Check(cudaFree(p));
+    }
+    std::printf("RESIDENT_GATE_PASS %zu graph replays: route masks, partial tiles and scale edges\n", cases);
+}
+
 static void Quant(std::vector<float> &v, int blockSize = 32) {
     for (size_t start = 0; start < v.size(); start += blockSize) {
         float maximum = 1e-4f;
@@ -375,7 +432,7 @@ int main(int argc, char **argv) {
             }
             std::printf("FP4_PAIR_PASS pairs=%d values=%d\n", pairs, 2 * pairs);
         }
-        if (!fp8) TestDotGateUp();
+        if (!fp8) { TestDotGateUp(); TestResidentGate(); }
         // Preserve the existing V4 block-128 helper while extending V4.1.
         for (int block : {32, 128})
             for (bool quantize : {false, true}) {
