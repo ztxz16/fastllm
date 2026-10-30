@@ -43,19 +43,20 @@ __device__ __forceinline__ void CloverMma16816(float *c, const unsigned *a, cons
         "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 #endif
 }
-template<bool WarpRows, int TileRows = 16>
+template<int RowsPerBlock = 1, int TileRows = 16>
 __global__ void CloverPackExpertInput(const __nv_bfloat16 *input, const int *workspace,
         __nv_bfloat16 *packed, int rows, int hidden, int experts, int topk) {
     const int *tiles = workspace + (size_t)experts * (rows + 1);
     if (blockIdx.y >= tiles[0]) return;
     int index = tiles[blockIdx.y + 1], expert = index / (rows + 1), start = index % (rows + 1);
-    // Large prefills assign one row per warp and four rows per CTA. Small
-    // blocks retain one CTA per row to expose enough independent work.
-    int row = WarpRows ? blockIdx.x * 4 + threadIdx.x / 32 : blockIdx.x;
+    // Decode uses two rows per CTA for the measured 2048-wide geometry;
+    // prefill keeps four warp-sized rows. Other shapes retain one row.
+    const int lanes = blockDim.x / RowsPerBlock;
+    int row = blockIdx.x * RowsPerBlock + threadIdx.x / lanes;
     int task = start + row < workspace[expert * (rows + 1) + rows] ? workspace[index + row] : -1;
     auto *dst = reinterpret_cast<uint4 *>(packed + ((size_t)blockIdx.y * TileRows + row) * hidden);
-    for (int d = WarpRows ? threadIdx.x % 32 : threadIdx.x;
-         d < hidden / 8; d += WarpRows ? 32 : blockDim.x) {
+    for (int d = threadIdx.x % lanes;
+         d < hidden / 8; d += lanes) {
         uint4 value = make_uint4(0, 0, 0, 0);
         if (task >= 0) {
             const auto *src = input + (size_t)(task / topk) * hidden;
@@ -251,7 +252,7 @@ bool CloverExpertsTma(const void *input, const void *gateUp, const void *down, c
 #ifdef FASTLLM_ENABLE_CLOVER_MOE_SM90
     if (tileRows == 64) {
         CloverExpertTiles<64><<<1, 256, 0, stream>>>(workspace, rows, experts);
-        CloverPackExpertInput<true, 64><<<dim3(16, tiles), 128, 0, stream>>>(
+        CloverPackExpertInput<4, 64><<<dim3(16, tiles), 128, 0, stream>>>(
             (const __nv_bfloat16 *)input, workspace, packedInput, rows, hidden, experts, topk);
         FastllmCudaCloverWgmmaExperts(&it->second.first.input, &it->second.first.weight,
             &it->second.second.input, &it->second.second.weight, scores, workspace,
@@ -260,9 +261,12 @@ bool CloverExpertsTma(const void *input, const void *gateUp, const void *down, c
 #endif
     CloverExpertTiles<16><<<1, 256, 0, stream>>>(workspace, rows, experts);
     if (rows >= 1024)
-        CloverPackExpertInput<true><<<dim3(4, tiles), 128, 0, stream>>>(
+        CloverPackExpertInput<4><<<dim3(4, tiles), 128, 0, stream>>>(
             (const __nv_bfloat16 *)input, workspace, packedInput, rows, hidden, experts, topk);
-    else CloverPackExpertInput<false><<<dim3(16, tiles), min(256, hidden / 8), 0, stream>>>(
+    else if (rows >= 16 && rows <= 64 && hidden == 2048)
+        CloverPackExpertInput<2><<<dim3(8, tiles), 256, 0, stream>>>(
+            (const __nv_bfloat16 *)input, workspace, packedInput, rows, hidden, experts, topk);
+    else CloverPackExpertInput<><<<dim3(16, tiles), min(256, hidden / 8), 0, stream>>>(
             (const __nv_bfloat16 *)input, workspace, packedInput, rows, hidden, experts, topk);
     // Wider K amortizes setup for small captured blocks. Large prefills and
     // widths not divisible by128 retain the established64-element kernel.
