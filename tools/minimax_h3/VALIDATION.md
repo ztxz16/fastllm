@@ -14,8 +14,9 @@ Apache-2.0 许可。原生实现按其张量布局、运算顺序、调度与分
 许可全文见仓库 [LICENSE](../../LICENSE)。
 
 当前覆盖文字生成音视频（T2VA）。首尾帧、参考图像/视频/音频条件尚未实现。
-仅支持 FP32 权重展开和计算，关闭 TF32；这是官方实现的 **FP32 数值基线**，
-不等同于声称与官方默认 BF16/混合精度输出逐位相同。
+默认 BF16 混合精度，另保留 `--precision fp32` 严格数值基线，关闭 TF32。
+BF16 下保留官方的 FP32 输入/输出投影与时间嵌入，采样状态、视频/音频 VAE 也保持 FP32。
+这不等同于声称与官方默认输出逐位相同。
 
 文本编码器为 Qwen3-VL 前 50 层的 pre-final-norm 残差。视频和音频分开归一化、使用不同
 sigma shift，并按官方规则打包进同一个 DiT。视频 VAE 同时覆盖空间切片与时间交叠，
@@ -39,18 +40,18 @@ H3_OUT=/workspace2/experiments/minimax-h3-native
 python3 test/minimax_h3/test_geometry.py --library "$H3_LIB"
 python3 test/minimax_h3/test_tokenizer.py --model "$H3_MODEL/tokenizer" --library "$H3_LIB"
 python3 test/minimax_h3/compare_transformer.py --model "$H3_MODEL/transformer" \
-  --library "$H3_LIB" --output "$H3_OUT/block-fp32"
+  --library "$H3_LIB" --precision fp32 --output "$H3_OUT/block-fp32"
 python3 test/minimax_h3/compare_dit.py --model "$H3_MODEL/transformer" \
-  --library "$H3_LIB" --output "$H3_OUT/dit-fp32"
+  --library "$H3_LIB" --precision fp32 --output "$H3_OUT/dit-fp32"
 python3 test/minimax_h3/compare_text.py --model "$H3_MODEL" \
-  --library "$H3_LIB" --output "$H3_OUT/text-fp32"
+  --library "$H3_LIB" --precision fp32 --output "$H3_OUT/text-fp32"
 python3 test/minimax_h3/compare_video.py --model "$H3_MODEL/vae" \
   --library "$H3_LIB" --tiled --frames 12 --height 18 --width 4 --output "$H3_OUT/video-tiled-fp32"
 python3 test/minimax_h3/compare_audio.py --model "$H3_MODEL/audio_vae" \
   --library "$H3_LIB" --output "$H3_OUT/audio-fp32"
 python3 test/minimax_h3/compare_pipeline.py --model "$H3_MODEL" \
   --binary build-h3/src/models/minimax_h3/minimax_h3_generate \
-  --text-fixture "$H3_OUT/text-fp32" --width 128 --height 128 --frames 124 --steps 50 \
+  --precision fp32 --text-fixture "$H3_OUT/text-fp32" --width 128 --height 128 --frames 124 --steps 50 \
   --output "$H3_OUT/pipeline-128-50-fp32"
 ```
 
@@ -65,9 +66,8 @@ python3 test/minimax_h3/compare_pipeline.py --model "$H3_MODEL" \
 ## 已完成的 FP32 验证（2026-10-30）
 
 硬件为物理 GPU 7：RTX PRO 5000 72GB Blackwell，CUDA 13.0；参考环境为
-PyTorch 2.14.0+cu130、Transformers 5.20.2。源码为 FastLLM
-`ed6a83aebb73508dd05d7e72ecab113a7fc51add` 上的未提交 H3 工作区，不能把基线 SHA
-单独当作已包含此功能的版本。
+PyTorch 2.14.0+cu130、Transformers 5.20.2。FP32 基线已提交至 `9235b6a7`；
+下表记录切换 BF16 默认路径之前的结果。
 
 128×128、124 帧、50 点采样（49 次 DiT），提示词为上述脚本默认的弹钢琴小猫。
 同一份最终原生输出分别与官方默认 memory-efficient attention 和显式 math SDPA
@@ -119,17 +119,8 @@ FFprobe 确认 MP4 内为 H.264、24 fps、124 帧和 32 kHz 双声道 AAC。
 缓存的状态。另测取消后的显存回收：整卡从 42228 MiB 回到测试前的 4820 MiB
 （同卡两个空闲 H3 服务）；异常清理增加同步，确保异步内存池释放缓存后才报告取消。
 
-快速优化用例为 256×256、124 帧、4 个采样点，prompt=`cat`、seed=42。优化前后
-逐步视频/音频 latent、最终 RGB、音频波形等 11 个原始快照文件逐位一致，所有数学
-算子、舍入与阈值均保持不变。该用例用于数值与速度对照，不用于评判少步生成的画质。
-
-短测试确认收益后，补跑了 128×128、124 帧、50 点的完整回归。优化后 103 个原始
-输出文件与原精度基线逐位相同，并再次通过官方 math attention 的差分；因此前述
-最终误差表保持不变。
-
-提交前清理移除了 BF16 计算试验分支、精度开关及重复的 Runtime/权重对象，保留
-FP32 路径与原始权重缓存。再次运行上述快速用例和完整用例，分别得到 11/11、
-103/103 个原始文件逐位一致，官方 math attention 差分仍通过相同阈值。
+FP32 原始权重缓存优化的短任务和完整 49 步回归分别保持 11/11、103/103 个输出文件
+逐位一致；详细配置和速度记录见 [Benchmark](../../docs/benchmarks/minimax_h3.md)。
 
 开启和关闭 `UNIT_TEST` 两种 CMake 构建均通过。测试关闭时可独立生成
 `minimax_h3_generate` / `minimax_h3_server`，不构建 ctypes 比较桥接库。
@@ -137,3 +128,52 @@ FP32 路径与原始权重缓存。再次运行上述快速用例和完整用例
 
 共享运行时的变更还需要运行 `test/qwen_image/compare_reference.py`，覆盖已有文本、DiT
 和 VAE 数值回归。速度及显存测量集中在 [Benchmark](../../docs/benchmarks/minimax_h3.md)。
+
+## BF16 默认路径（2026-10-30，9235b6a7 之后）
+
+依据 [Diffusers 示例](https://github.com/huggingface/diffusers/blob/aae97e79e8e6a55e0b43114f9c8916c06d4bca8c/docs/source/en/api/pipelines/minimax_h3.md)
+的 `load_components(dtype=torch.bfloat16)` 与
+[SGLang 精度配置](https://github.com/sgl-project/sglang/blob/3b6c28b0b9aff784115bafeecc67f37e1fe43454/python/sglang/multimodal_gen/configs/pipeline_configs/minimax_h3.py)：
+DiT、文本编码器默认 BF16；SGLang 的视频 VAE 权重为 FP32、解码默认 FP16 autocast，音频 VAE 为 FP32。
+本实现首先切换文本和 DiT；视频 VAE 仍是 FP32，未声称复刻 SGLang 的全部精度策略。
+
+复用连续张量运行时的 BF16 GEMM、FlashInfer attention、激活、切片和张量操作。
+H3 RMSNorm 在 FP32 归约和乘权重之后舍入，RoPE、调制与残差保留 eager BF16 的舍入边界。
+AdaLN 缓存按每一步的时间输入形状计算，第一步为一行，其余通常两行，避免合并时间点
+改变 GEMM 归约。所有层和输出头复用每个计划的 SiLU 与类型转换结果。
+未引入新的推理依赖或 H3 环境变量。
+
+CLI、HTTP 服务和差分测试统一用 `--precision bf16|fp32`，默认 BF16。
+参考模型在两种精度下均按层加载，避免重复维护驻留和流式两套分支。`compare_dit.py --isolated-blocks` 会把官方
+各层输入分别交给原生同一层，检查局部误差，同时报告完整前向的累积误差；其通过状态
+仅代表逐层检查，不代表完整前向精度通过。
+
+- 文本第 50 层相对 L2：`8.44525e-4`。
+- 50 个 DiT 层分别输入官方参考张量，最大相对 L2：`3.62394e-3`，全部低于已有的 BF16 单层阈值 `1e-2`。
+- 合成随机输入的完整 50 层 DiT：视频/音频相对 L2 为 `0.0397141` / `0.136651`，
+  仍超过 `1e-2` 阈值；没有放宽该阈值。
+- 128×128、124 帧、4 点采样，端到端原生 BF16 对官方 BF16 auto：最终视频 latent
+  相对 L2 `0.0870529`，音频 latent `0.0719304`，音频波形 `0.167790`，RGB 平均通道差
+  `6.35234/255`、最大通道差 `158/255`。**未通过原 FP32 端到端严格阈值**。
+- 控制实验中，官方 BF16 自身从 auto attention 切换到 math，最终视频/音频 latent
+  相对 L2 分别为 `0.0723410` / `0.0414258`。这证明低精度后端差异会在迭代中放大，
+  但不能据此证明原生误差全部来自后端或画质已经等价。
+
+`compare_pipeline.py --precision bf16` 保留原始逐步报告和严格断言，当前上述用例会返回
+非零状态；没有把失败改为通过。该少步用例用于数值诊断，不是生成质量评测。
+输出质量和长轨迹 BF16 一致性仍需后续验证；FP32 对比模式用于保留严格参考。
+
+保留的 FP32 模式重新运行 128×128、124 帧、50 点调度，并与同一份官方 math 参考比较：
+视频 latent 相对 L2 `1.65346e-5`，音频 latent `1.80171e-5`，音频波形 `1.47940e-4`，
+RGB 最大通道差 `1`、平均差 `0.00145992`。原严格阈值全部通过。第一步 AdaLN 现在按
+真实的一行 GEMM 计算，所以不再承诺与旧原生输出逐位一致。
+
+BF16 的 `UNIT_TEST=ON/OFF` 构建及 HTTP 回归通过，包含已驻留完整 DiT 后取消、队列
+校验、multipart 恢复生成与 MP4 下载。独立取消检查中，整卡显存从 `39532 MiB`
+回到测试前的 `2828 MiB`（包含同卡两个空闲 H3 服务）。没有恢复 Qwen 服务。
+198 组调度与 4 组打包布局再次逐位匹配；共享运行时源码未改动。
+
+整理前后，在 128×128、124 帧、4 点采样及同一份初始噪声下，BF16 和 FP32 各
+11 个原始文件全部逐位一致（文本、初始噪声、3 步音视频 latent、RGB 与音频波形）。
+参考模型改成统一流式加载后，文本的 50 个、DiT 的 52 个参考张量也与原记录逐位一致。
+因此上述清理不改变已测精度，完整 BF16 未通过项仍然保留。
