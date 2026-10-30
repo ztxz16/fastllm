@@ -73,6 +73,9 @@ public:
     Tensor pixelNoise(uint64_t seed, int firstFrame, int frames, int height, int width);
     Tensor cast(const Tensor &, DType dtype);
     Tensor linear(const Tensor &x, const Tensor &weight, const Tensor *bias = nullptr);
+    // Output storage must not be shared with inputs. For 16-bit biased GEMM,
+    // its address must retain the cuBLASLt plan's 256-byte alignment.
+    void linearInto(const Tensor &x, const Tensor &weight, Tensor &out, const Tensor *bias = nullptr);
     Tensor norm(const Tensor &x, bool rms, const Tensor *weight = nullptr,
                 const Tensor *bias = nullptr, float eps = 1e-6f, int width = 0);
     Tensor activation(const Tensor &x, bool gelu = false);
@@ -122,6 +125,8 @@ public:
     const Tensor &get(const std::string &name);
     const Tensor *optional(const std::string &name);
     Tensor linear(const Tensor &x, const std::string &prefix, bool separateBias = false);
+    // A supplied output cannot be combined with separateBias.
+    Tensor linear(const Tensor &x, const std::string &prefix, bool separateBias, Tensor *out);
     void clear();
     // Optional lossless host cache for callers that swap model stages.
     void offload();

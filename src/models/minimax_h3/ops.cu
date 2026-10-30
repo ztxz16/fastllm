@@ -82,6 +82,16 @@ __global__ void modulation(const T *x, const T *y, const T *m, const int *indice
         out[i] = T(v);
     }
 }
+__global__ void residualBf16Pairs(const __nv_bfloat162 *x, const __nv_bfloat162 *y,
+                                  const __nv_bfloat162 *m, const int *indices, __nv_bfloat162 *out,
+                                  int width, int modCols, int gate) {
+    size_t row = size_t(blockIdx.x) * width;
+    size_t mod = size_t(indices[blockIdx.x]) * modCols + gate * width;
+    for (int c = threadIdx.x; c < width; c += blockDim.x) {
+        // Keep BF16 multiplication and addition separate, matching eager rounding.
+        out[row + c] = __hadd2(x[row + c], __hmul2(y[row + c], m[mod + c]));
+    }
+}
 template <class T>
 __global__ void rotate(const T *x, const float *cs, const float *sn, T *out, size_t n, int c, int d, int rd) {
     for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
@@ -270,6 +280,12 @@ Tensor Runtime::residualRows(const Tensor &x, const Tensor &y, const Tensor &m, 
         modulation<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
             ptr<float>(x), ptr<float>(y), ptr<float>(m), ptr<int>(idx), ptr<float>(out), x.size(), x.cols,
             m.cols, gate, 0);
+    else if (x.cols >= 512 && x.cols % 2 == 0 && m.cols % 2 == 0 &&
+             ((reinterpret_cast<uintptr_t>(x.data) | reinterpret_cast<uintptr_t>(y.data) |
+               reinterpret_cast<uintptr_t>(m.data)) % alignof(__nv_bfloat162) == 0))
+        residualBf16Pairs<<<x.rows, 256, 0, cudaStreamPerThread>>>(
+            ptr<__nv_bfloat162>(x), ptr<__nv_bfloat162>(y), ptr<__nv_bfloat162>(m), ptr<int>(idx),
+            ptr<__nv_bfloat162>(out), x.cols / 2, m.cols / 2, gate);
     else
         modulation<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
             ptr<B>(x), ptr<B>(y), ptr<B>(m), ptr<int>(idx), ptr<B>(out), x.size(), x.cols, m.cols, gate, 0);

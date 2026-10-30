@@ -361,14 +361,24 @@ std::vector<uint8_t> Runtime::downloadPixelRGB(const Tensor &x,int width,int hei
     return out;
 }
 Tensor Runtime::linear(const Tensor &x,const Tensor &w,const Tensor *bias) {
+    Tensor out(x.rows,w.rows,x.dtype);
+    linearInto(x,w,out,bias);
+    return out;
+}
+void Runtime::linearInto(const Tensor &x,const Tensor &w,Tensor &out,const Tensor *bias) {
     require(x.cols==w.cols,"linear dimension mismatch"); require(!bias || bias->size()==size_t(w.rows),"linear bias mismatch");
     require(x.dtype==w.dtype && (!bias || bias->dtype==x.dtype),"linear dtype mismatch");
-    Tensor out(x.rows,w.rows,x.dtype); float one=1,zero=0;
+    require(out.data && out.rows==x.rows && out.cols==w.rows && out.dtype==x.dtype,"linear output shape/dtype mismatch");
+    require(out.storage!=x.storage && out.storage!=w.storage && (!bias || out.storage!=bias->storage),
+            "linear output must not share input storage");
+    require(x.isFloat32() || !bias || reinterpret_cast<uintptr_t>(out.data)%256==0,
+            "16-bit biased linear output must be 256-byte aligned");
+    float one=1,zero=0;
     if(x.isFloat32()) {
         check(cublasSgemm(static_cast<cublasHandle_t>(blas_),CUBLAS_OP_T,CUBLAS_OP_N,w.rows,x.rows,x.cols,
             &one,as<float>(w),w.cols,as<float>(x),x.cols,&zero,as<float>(out),out.cols));
         if(bias) addBias<float><<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<float>(out),as<float>(*bias),as<float>(out),out.size(),out.cols);
-        check(cudaGetLastError()); return out;
+        check(cudaGetLastError()); return;
     }
     auto scalarType=x.dtype==DType::FP16 ? CUDA_R_16F : CUDA_R_16BF;
     if(bias) {
@@ -402,7 +412,7 @@ Tensor Runtime::linear(const Tensor &x,const Tensor &w,const Tensor *bias) {
             w.rows,x.rows,x.cols,&one,w.data,scalarType,w.cols,x.data,scalarType,x.cols,
             &zero,out.data,scalarType,w.rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
     }
-    check(cudaGetLastError()); return out;
+    check(cudaGetLastError());
 }
 Tensor Runtime::norm(const Tensor &x,bool rms,const Tensor *w,const Tensor *bias,float eps,int width) {
     if(!width) width=x.cols;
@@ -684,8 +694,18 @@ const Tensor &Weights::get(const std::string &name) {
     return i.cache.emplace(name,std::move(value)).first->second;
 }
 Tensor Weights::linear(const Tensor &x,const std::string &prefix,bool separateBias) {
+    return linear(x,prefix,separateBias,nullptr);
+}
+Tensor Weights::linear(const Tensor &x,const std::string &prefix,bool separateBias,Tensor *output) {
+    require(!output || !separateBias,"linear output cannot be combined with separate bias");
     auto &w=get(prefix+".weight"); auto bias=optional(prefix+".bias");
-    auto out=impl_->rt.linear(x,w,separateBias?nullptr:bias);
+    Tensor out;
+    if(output) {
+        impl_->rt.linearInto(x,w,*output,bias);
+        out=*output;
+    } else {
+        out=impl_->rt.linear(x,w,separateBias?nullptr:bias);
+    }
     if(separateBias && bias) out=impl_->rt.bias(out,*bias);
     return out;
 }

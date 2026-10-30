@@ -114,6 +114,9 @@ Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tenso
 }
 Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
     std::vector<Tensor> chunks;
+    Tensor out;
+    if (!x.isFloat32())
+        out = Tensor(x.rows, config_.hidden, x.dtype);
     // Bound BF16 scratch and preserve the original sub-512 tail GEMM: folding
     // it into a larger batch selects a different reduction/rounding algorithm.
     // FP32 diagnostics retain all their original GEMM shapes.
@@ -123,9 +126,16 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
         if (count > 512)
             count -= count % 512;
         auto y = weights_.linear(x.rowSlice(first, count), p + ".net.0.proj");
-        chunks.push_back(weights_.linear(rt_.siluMultiply(y), p + ".net.2"));
+        if (out.data) {
+            auto target = out.rowSlice(first, count);
+            weights_.linear(rt_.siluMultiply(y), p + ".net.2", false, &target);
+        } else {
+            chunks.push_back(weights_.linear(rt_.siluMultiply(y), p + ".net.2"));
+        }
         first += count;
     }
+    if (out.data)
+        return out;
     return chunks.size() == 1 ? chunks[0] : rt_.concat(chunks);
 }
 Tensor Transformer::refine(const Tensor &input) {
