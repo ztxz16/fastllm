@@ -372,7 +372,7 @@ void Normalization(int rows, int width, bool gated, bool centered) {
     Check(cudaGraphLaunch(executable, cudaStreamPerThread)); check();
     Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
 }
-void AttentionPreparation(int tokens, int qh, int kh, int rotaryDim, int position) {
+void AttentionPreparation(int tokens, int qh, int kh, int rotaryDim, int position, bool fused = false) {
     std::mt19937 rng(271 + tokens + position);
     std::normal_distribution<float> normal(0.f, .7f);
     const size_t qcount = (size_t)tokens * qh * 256, kcount = (size_t)tokens * kh * 256;
@@ -394,10 +394,23 @@ void AttentionPreparation(int tokens, int qh, int kh, int rotaryDim, int positio
     Require(FastllmCudaCloverNorm(k.p, (float *)wk.p, nullptr, refK.p, tokens * kh, 256, 1.e-6f, true), "reference K norm");
     Require(FastllmCudaCloverRotary(refQ.p, tokens, qh, 256, rotaryDim, position, 1.e7f), "reference Q rotary");
     Require(FastllmCudaCloverRotary(refK.p, tokens, kh, 256, rotaryDim, position, 1.e7f), "reference K rotary");
+    const int stride = (qh + kh) * 512 + 17;
+    std::vector<uint16_t> packed((size_t)tokens * stride + 128, BF16(123.f)), value(kcount);
+    for (auto &x : value) x = BF16(normal(rng));
+    for (int row = 0; row < tokens; ++row) {
+        auto dst = packed.begin() + 64 + (size_t)row * stride;
+        std::copy_n(qgate.begin() + (size_t)row * qh * 512, qh * 512, dst);
+        std::copy_n(key.begin() + (size_t)row * kh * 256, kh * 256, dst + qh * 512);
+        std::copy_n(value.begin() + (size_t)row * kh * 256, kh * 256, dst + qh * 512 + kh * 256);
+    }
+    Buffer fusedInput(packed.size() * 2), outV(kGuard.size() * 2);
+    fusedInput.Put(packed); outV.Put(kGuard);
     auto launch = [&]() {
-        return FastllmCudaCloverPrepareAttention(qg.p, k.p, (float *)wq.p, (float *)wk.p,
+        return FastllmCudaCloverPrepareAttention(fused ? (uint16_t *)fusedInput.p + 64 : qg.p,
+            fused ? (uint16_t *)fusedInput.p + 64 + qh * 512 : k.p, (float *)wq.p, (float *)wk.p,
             (uint16_t *)outQ.p + 64, (uint16_t *)outK.p + 64, (uint16_t *)outG.p + 64,
-            tokens, qh, kh, rotaryDim, position, 1.e7f, 1.e-6f);
+            tokens, qh, kh, rotaryDim, position, 1.e7f, 1.e-6f, nullptr, fused ? stride : 0,
+            fused ? (uint16_t *)outV.p + 64 : nullptr);
     };
     auto check = [&]() {
         auto a = outQ.Get<uint16_t>(qGuard.size()), b = outK.Get<uint16_t>(kGuard.size()), c = outG.Get<uint16_t>(qGuard.size());
@@ -409,6 +422,13 @@ void AttentionPreparation(int tokens, int qh, int kh, int rotaryDim, int positio
             Require(a[i] == qGuard[i] && a[qcount + 64 + i] == qGuard[i] &&
                 c[i] == qGuard[i] && c[qcount + 64 + i] == qGuard[i] &&
                 b[i] == kGuard[i] && b[kcount + 64 + i] == kGuard[i], "attention preparation output guard");
+        }
+        if (fused) {
+            auto actualV = outV.Get<uint16_t>(kGuard.size());
+            Require(std::equal(value.begin(), value.end(), actualV.begin() + 64), "fused V unpack differs");
+            for (int i = 0; i < 64; ++i)
+                Require(actualV[i] == kGuard[i] && actualV[kcount + 64 + i] == kGuard[i], "V output guard");
+            Require(fusedInput.Get<uint16_t>(packed.size()) == packed, "fused QKV input modified");
         }
         Require(qg.Get<uint16_t>(qgate.size()) == qgate && k.Get<uint16_t>(key.size()) == key,
             "attention preparation changed inputs");
@@ -545,9 +565,10 @@ int main() {
             ResidualNormalization(17, width, centered);
         ResidualNormalization(1025, 128, true);
         ResidualNormalization(1025, 256, false);
+        for (bool fused : {false, true})
         for (int tokens : {1, 2, 16, 32, 257}) for (int rotary : {2, 64, 128, 256}) {
-            AttentionPreparation(tokens, 16, 2, rotary, 4096);
-            AttentionPreparation(tokens, 1, 1, rotary, 0);
+            AttentionPreparation(tokens, 16, 2, rotary, 4096, fused);
+            AttentionPreparation(tokens, 1, 1, rotary, 0, fused);
         }
         for (int tokens : {1, 2, 4, 8, 16, 32}) for (bool masked : {false, true}) {
             Preview(3, tokens, 2, 4, masked); Preview(1, tokens, 16, 32, masked);

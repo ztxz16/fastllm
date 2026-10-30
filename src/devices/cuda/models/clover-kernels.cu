@@ -684,14 +684,17 @@ __global__ void CloverRotary(__nv_bfloat16 *input, int heads, int dim,
 __global__ void CloverPrepareAttention(const __nv_bfloat16 *qgate, const __nv_bfloat16 *key,
         const float *qWeight, const float *kWeight, __nv_bfloat16 *query,
         __nv_bfloat16 *normalizedKey, __nv_bfloat16 *gate, int queryHeads, int keyHeads,
-        int rotaryDim, int position, float theta, float eps) {
+        int rotaryDim, int position, float theta, float eps, int qkvStride, __nv_bfloat16 *value) {
     CloverDependencyStart();
     constexpr int dim = 256;
     const int d = threadIdx.x, token = blockIdx.y;
     const bool isQuery = blockIdx.x < queryHeads;
     const int head = isQuery ? blockIdx.x : blockIdx.x - queryHeads;
     const size_t row = (size_t)token * (isQuery ? queryHeads : keyHeads) + head;
-    const auto *source = isQuery ? qgate + row * dim * 2 : key + row * dim;
+    const auto *source = isQuery
+        ? qgate + (size_t)token * (qkvStride ? qkvStride : queryHeads * dim * 2) + head * dim * 2
+        : key + (size_t)token * (qkvStride ? qkvStride : keyHeads * dim) + head * dim;
+    if (!isQuery && value) value[row * dim + d] = source[keyHeads * dim + d];
     const auto *weight = isQuery ? qWeight : kWeight;
     auto *destination = (isQuery ? query : normalizedKey) + row * dim;
     __shared__ float scratch[8];
@@ -1211,15 +1214,18 @@ bool FastllmCudaCloverRotary(void *input, int tokens, int heads, int dim, int ro
 }
 bool FastllmCudaCloverPrepareAttention(const void *qgate, const void *key, const float *qWeight,
         const float *kWeight, void *query, void *normalizedKey, void *gate, int tokens,
-        int queryHeads, int keyHeads, int rotaryDim, int position, float theta, float eps, void *stream) {
+        int queryHeads, int keyHeads, int rotaryDim, int position, float theta, float eps, void *stream,
+        int qkvStride, void *value) {
     if (!qgate || !key || !qWeight || !kWeight || !query || !normalizedKey || !gate ||
         tokens < 1 || tokens > 65535 || queryHeads < 1 || keyHeads < 1 ||
         queryHeads > 65535 || keyHeads > 65535 || rotaryDim < 2 || rotaryDim > 256 ||
-        rotaryDim % 2 || position < 0 || theta <= 0.f || eps <= 0.f) return false;
+        rotaryDim % 2 || position < 0 || theta <= 0.f || eps <= 0.f ||
+        qkvStride < 0 || (qkvStride && (qkvStride < (queryHeads + keyHeads) * 512 || !value)) ||
+        (!qkvStride && value)) return false;
     return CloverLaunch<CloverPrepareAttention>(dim3(queryHeads + keyHeads, tokens), 256, 0, Stream(stream),
         (const __nv_bfloat16 *)qgate, (const __nv_bfloat16 *)key, qWeight, kWeight,
         (__nv_bfloat16 *)query, (__nv_bfloat16 *)normalizedKey, (__nv_bfloat16 *)gate,
-        queryHeads, keyHeads, rotaryDim, position, theta, eps);
+        queryHeads, keyHeads, rotaryDim, position, theta, eps, qkvStride, (__nv_bfloat16 *)value);
 }
 bool FastllmCudaCloverRoute(const void *logits, int *indices, float *scores,
         int *scratchIds, float *scratchScores, unsigned char *allowed,

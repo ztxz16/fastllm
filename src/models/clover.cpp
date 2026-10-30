@@ -208,6 +208,8 @@ void CloverModel::EnsureResident() {
         if (linearLayers[i]) merge(p + "linear_attn.fused_in_proj.weight", {
             p + "linear_attn.in_proj_qkv.weight", p + "linear_attn.in_proj_z.weight",
             p + "linear_attn.in_proj_a.weight", p + "linear_attn.in_proj_b.weight"});
+        else merge(p + "self_attn.qkv_proj.weight", {
+            p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight"}, 1, true);
         merge(p + "mlp.router_shared_gate.weight", {
             p + "mlp.gate.weight", p + "mlp.shared_expert_gate.weight"}, 64, true);
         merge(p + "mlp.shared_expert.gate_up_proj.weight", {
@@ -330,9 +332,13 @@ void CloverModel::FullAttention(Data &input, int layer, std::pair<Data, Data> &c
 #ifdef USE_CUDA
     std::string p = Layer(layer) + "self_attn.";
     Data qgate, k, v, y;
-    Linear(input, weight[p + "q_proj.weight"], *GetEmptyData(), qgate);
-    Linear(input, weight[p + "k_proj.weight"], *GetEmptyData(), k);
-    Linear(input, weight[p + "v_proj.weight"], *GetEmptyData(), v);
+    if (input.dims[0] >= 16 && input.dims[0] <= blockSize) {
+        Linear(input, weight[p + "qkv_proj.weight"], *GetEmptyData(), qgate);
+    } else {
+        Linear(input, weight[p + "q_proj.weight"], *GetEmptyData(), qgate);
+        Linear(input, weight[p + "k_proj.weight"], *GetEmptyData(), k);
+        Linear(input, weight[p + "v_proj.weight"], *GetEmptyData(), v);
+    }
     FullAttentionCore(qgate, k, v, layer, cache, position, preview, y);
     Linear(y, weight[p + "o_proj.weight"], *GetEmptyData(), output);
 #endif
@@ -343,17 +349,23 @@ void CloverModel::FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
     const int t = qgate.dims[0];
     std::string p = Layer(layer) + "self_attn.";
     Data q, gate, qn, kn, attentionWorkspace;
-    k.Reshape({t, num_key_value_heads, head_dim}); v.Reshape(k.dims);
+    const int qColumns = 2 * num_attention_heads * head_dim;
+    const int kvColumns = num_key_value_heads * head_dim;
+    const bool fused = qgate.dims.back() == qColumns + 2 * kvColumns;
+    if (fused) PrepareCloverData(v, BFLOAT16, {t, num_key_value_heads, head_dim}, cudaDevice);
+    else { k.Reshape({t, num_key_value_heads, head_dim}); v.Reshape(k.dims); }
     if (t <= blockSize) {
         auto &qw = weight[p + "q_norm.weight"], &kw = weight[p + "k_norm.weight"];
         Check(qw.dataType == FLOAT32 && kw.dataType == FLOAT32 &&
             qw.Count(0) == head_dim && kw.Count(0) == head_dim, "invalid Q/K normalization weights");
         PrepareCloverData(qn, BFLOAT16, {t, num_attention_heads, head_dim}, cudaDevice);
-        PrepareCloverData(kn, BFLOAT16, k.dims, cudaDevice);
+        PrepareCloverData(kn, BFLOAT16, v.dims, cudaDevice);
         PrepareCloverData(gate, BFLOAT16, qn.dims, cudaDevice);
-        Check(FastllmCudaCloverPrepareAttention(qgate.cudaData, k.cudaData, (float *)qw.cudaData,
+        Check(FastllmCudaCloverPrepareAttention(qgate.cudaData,
+            fused ? (uint16_t *)qgate.cudaData + qColumns : k.cudaData, (float *)qw.cudaData,
             (float *)kw.cudaData, qn.cudaData, kn.cudaData, gate.cudaData, t, num_attention_heads,
-            num_key_value_heads, rotary_dim, position, ropeTheta, rms_norm_eps), "attention preparation failed");
+            num_key_value_heads, rotary_dim, position, ropeTheta, rms_norm_eps, nullptr,
+            fused ? qColumns + 2 * kvColumns : 0, fused ? v.cudaData : nullptr), "attention preparation failed");
     } else {
         qgate.Reshape({t, num_attention_heads, 2 * head_dim});
         Split(qgate, 2, 0, head_dim, q); Split(qgate, 2, head_dim, 2 * head_dim, gate);
@@ -624,15 +636,12 @@ void CloverModel::ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens
         // uses per-request views; it writes directly into the combined buffer.
         const std::string p = Layer(layer) + (linearLayers[layer] ? "linear_attn." : "self_attn.");
         const int attentionDim = linearLayers[layer] ? valueHeads * 128 : num_attention_heads * head_dim;
-        Data projected, keys, values, attended;
+        Data projected, attended;
         PrepareCloverData(attended, BFLOAT16, {rows, attentionDim}, cudaDevice);
         if (linearLayers[layer])
             project(norm, weight[p + "fused_in_proj.weight"], projected);
-        else {
-            project(norm, weight[p + "q_proj.weight"], projected);
-            project(norm, weight[p + "k_proj.weight"], keys);
-            project(norm, weight[p + "v_proj.weight"], values);
-        }
+        else
+            project(norm, weight[p + "qkv_proj.weight"], projected);
         for (int b = 0; b < batch; ++b) {
             Data input(BFLOAT16, {width, projected.dims.back()}), output(BFLOAT16, {width, attentionDim});
             input.FakeFrom(projected, (size_t)b * width * projected.dims.back() * sizeof(uint16_t));
@@ -641,9 +650,7 @@ void CloverModel::ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens
                 GdnCore(input, layer, (*caches[b])[layer], preview, output,
                     snapshots.empty() ? nullptr : &snapshots[b]->layers[layer]);
             else {
-                Data k(BFLOAT16, {width, keys.dims.back()}), v(BFLOAT16, {width, values.dims.back()});
-                k.FakeFrom(keys, (size_t)b * width * keys.dims.back() * sizeof(uint16_t));
-                v.FakeFrom(values, (size_t)b * width * values.dims.back() * sizeof(uint16_t));
+                Data k, v;
                 FullAttentionCore(input, k, v, layer, (*caches[b])[layer], positions[b], preview, output);
             }
         }
