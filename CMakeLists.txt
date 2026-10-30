@@ -2995,6 +2995,11 @@ if (UNIT_TEST)
             add_test(NAME clover_${component_lower} COMMAND ${target})
             set_tests_properties(clover_${component_lower} PROPERTIES
                 LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77)
+            if (NOT component STREQUAL "Sampling")
+                add_test(NAME clover_${component_lower}_fp16 COMMAND ${target} fp16)
+                set_tests_properties(clover_${component_lower}_fp16 PROPERTIES
+                    LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            endif()
         endforeach()
         set_tests_properties(clover_graph PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 

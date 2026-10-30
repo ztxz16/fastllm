@@ -1,6 +1,7 @@
 #include "models/clover.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -9,11 +10,33 @@
 #include <stdexcept>
 using namespace fastllm;
 namespace {
+bool fp16 = false;
 void Require(bool ok, const char *message) { if (!ok) throw std::runtime_error(message); }
 uint16_t Bf16(float value) {
     uint32_t bits; std::memcpy(&bits, &value, 4);
     bits += 0x7fff + ((bits >> 16) & 1);
     return bits >> 16;
+}
+void ProjectionPrecision() {
+    // FP16 inputs with large cancelling partial sums. FP16 accumulation can
+    // overflow even though every expected output is exactly representable.
+    for (int rows : {1, 2, 8, 16}) {
+        constexpr int width = 512, columns = 16;
+        Data x(FLOAT16, {rows, width}), w(FLOAT16, {columns, width}), y(FLOAT16, {rows, columns});
+        x.Allocate(); w.Allocate(); y.Allocate();
+        for (int r = 0; r < rows; ++r) for (int d = 0; d < width; ++d)
+            ((uint16_t *)x.cpuData)[r * width + d] = __half_raw(__float2half_rn(d == width - 1 ? 1.f + (r % 4) * .25f : 1.f)).x;
+        for (int c = 0; c < columns; ++c) for (int d = 0; d < width; ++d)
+            ((uint16_t *)w.cpuData)[c * width + d] = __half_raw(__float2half_rn((2048.f + c * 16) * (d < width / 2 ? 1.f : -1.f))).x;
+        for (auto *v : {&x, &w, &y}) v->ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        Require(FastllmCudaHalfMatMulFloat16Fp32(x.cudaData, w.cudaData, y.cudaData, rows, width, columns), "FP16 FP32-accumulating projection");
+        y.ToDevice(DataDevice::CPU);
+        for (int r = 0; r < rows; ++r) for (int c = 0; c < columns; ++c) {
+            uint16_t expected = __half_raw(__float2half_rn(-(2048.f + c * 16) * (r % 4) * .25f)).x;
+            float value = __half2float(__half(__half_raw{((uint16_t *)y.cpuData)[r * columns + c]}));
+            Require(value == __half2float(__half(__half_raw{expected})), "projection lost FP32 accumulation");
+        }
+    }
 }
 void Populate(CloverModel &m, int seed) {
     m.weight.dicts = {{"hidden_size", "512"}, {"num_hidden_layers", "1"},
@@ -51,6 +74,7 @@ void Populate(CloverModel &m, int seed) {
     weight(p + "mlp.shared_expert.up_proj.weight", {128, 512});
     weight(p + "mlp.shared_expert.down_proj.weight", {512, 128});
     weight(p + "mlp.shared_expert_gate.weight", {1, 512});
+    if (fp16) m.SetDataType(FLOAT16);
     m.WarmUp();
 }
 std::vector<unsigned char> Bytes(const Data &x) {
@@ -112,7 +136,10 @@ std::vector<std::vector<unsigned char>> RunBatch(int seed, bool graphs, int batc
             maximum = std::max(maximum, std::abs(x-y));
             diff2 += (x-y)*(x-y); ref2 += y*y;
         }
-        Require(maximum <= .04f && diff2 <= 2.5e-5 * std::max(ref2, 1e-10), "batch/serial BF16 logits differ");
+        if (maximum > .04f || diff2 > 2.5e-5 * std::max(ref2, 1e-10))
+            std::cerr << "batch=" << batch << " rows=" << actual.dims[0] << " max_abs=" << maximum
+                      << " relative_l2=" << std::sqrt(diff2 / std::max(ref2, 1e-10)) << std::endl;
+        Require(maximum <= .04f && diff2 <= 2.5e-5 * std::max(ref2, 1e-10), "batch/serial logits differ");
     };
     for (int width : {2, 4, 8, 16, 32, 16}) {
         std::vector<std::vector<int>> tokens(batch, std::vector<int>(width));
@@ -152,13 +179,15 @@ std::vector<std::vector<unsigned char>> RunBatch(int seed, bool graphs, int batc
 }
 
 }
-int main() {
+int main(int argc, char **argv) {
+    fp16 = argc > 1 && std::string(argv[1]) == "fp16";
     const char *env = std::getenv("FASTLLM_CUDA_GRAPH");
     const bool hadEnv = env != nullptr; const std::string old = env ? env : "";
     auto restore = [&]() { if (hadEnv) setenv("FASTLLM_CUDA_GRAPH", old.c_str(), 1); else unsetenv("FASTLLM_CUDA_GRAPH"); };
     try {
         int count = 0; if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
         cudaSetDevice(0); SetThreads(2); SetDeviceMap({{"cuda:0", 1}}); SetCudaEmbedding(true);
+        if (fp16) ProjectionPrecision();
         for (int seed : {13, 29, 71}) {
             auto batched = RunBatch(seed, false);
             Require(RunBatch(seed, true) == batched, "batch graph replay differs from eager");

@@ -24,6 +24,22 @@ void PrepareCloverData(Data &data, DataType type, const std::vector<int> &dims, 
     data.ToDevice(DataDevice::CUDA, std::vector<int>{device}, false);
     if (zero) data.Allocate(0.f); else data.Allocate(false);
 }
+// Keep FP16 storage with FP32 accumulation for every projection shape.
+// The general FP16 backend can select FP16 accumulation, which changes router
+// decisions between serial and batched forwards of this recurrent model.
+void CloverLinear(Data &input, Data &weight, const Data &bias, Data &output) {
+    if (input.dataType != FLOAT16) { Linear(input, weight, bias, output); return; }
+    Check(bias.dims.empty() && weight.dataType == FLOAT16 && weight.dims.size() == 2 &&
+          input.dims.back() == weight.dims[1], "invalid FP16 projection");
+    int device = 0;
+    Check(cudaGetDevice(&device) == cudaSuccess, "projection device query failed");
+    auto shape = input.dims; shape.back() = weight.dims[0];
+    PrepareCloverData(output, FLOAT16, shape, device);
+    const int m = weight.dims[1], k = weight.dims[0], n = input.Count(0) / m;
+    Check(FastllmCudaHalfMatMulFloat16Fp32(input.cudaData, weight.cudaData, output.cudaData, n, m, k),
+          "FP16 projection failed");
+}
+
 #endif
 std::string Layer(int i) { return "model.layers." + std::to_string(i) + "."; }
 }
@@ -82,12 +98,12 @@ CloverModel::CloverModel() {
         "model.layers.*.mlp.shared_expert.*_proj.weight", "model.layers.*.mlp.shared_expert_gate.weight"};
 }
 void CloverModel::SetDataType(DataType type) {
-    Check(type == BFLOAT16, "activations must be BF16");
-    dataType = type;
+    Check(type == BFLOAT16 || type == FLOAT16, "activations must be BF16 or FP16");
+    Check(!resident || dataType == type, "cannot change precision after initialization");
+    dataType = kvCacheDataType = type;
 }
 void CloverModel::SetKVCacheDataType(DataType type) {
-    Check(type == BFLOAT16, "attention KV must be BF16; recurrent state remains FP32");
-    kvCacheDataType = type;
+    SetDataType(type); // Attention KV follows activations; recurrent state remains FP32.
 }
 void CloverModel::InitParams() {
     basellm::InitParams();
@@ -182,11 +198,16 @@ void CloverModel::EnsureResident() {
         }
     }
     FastllmCudaSetDevice(cudaDevice);
+    int major = 0;
+    Check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, cudaDevice) == cudaSuccess,
+          "cannot query CUDA capability");
+    if (major < 8) dataType = kvCacheDataType = FLOAT16;
     hostExperts.resize(block_cnt, false);
     std::vector<std::pair<Data *, Data *>> hostLayers(block_cnt);
     for (int i = 0; i < block_cnt; ++i) {
         const auto device = SelectMoeDeviceForLayer(i);
         hostExperts[i] = IsSharedHostMoeDevice(device);
+        Check(!hostExperts[i] || dataType == BFLOAT16, "NUMA routed experts currently require BF16 activations");
         Check(hostExperts[i] || device.empty() || device == "cuda" || device == "cuda:" + std::to_string(cudaDevice),
               "unsupported routed expert placement");
         if (hostExperts[i]) hostLayers[i] = {&weight[Layer(i) + "mlp.experts.gate_up_proj"],
@@ -195,6 +216,8 @@ void CloverModel::EnsureResident() {
     for (auto &item : weight.weight) {
         bool host = false;
         for (const auto &pair : hostLayers) host |= pair.first == &item.second || pair.second == &item.second;
+        if (!host && item.second.dataType == BFLOAT16 && dataType == FLOAT16)
+            ToDataTypeForceCPU(item.second, FLOAT16);
         if (host) item.second.ToDevice(DataDevice::CPU);
         else item.second.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice});
     }
@@ -206,11 +229,11 @@ void CloverModel::EnsureResident() {
         int rows = 0;
         for (const auto &name : sources) {
             auto &w = weight[name];
-            Check(w.dataType == BFLOAT16 && w.dims.size() == 2 && w.dims[1] == embed_dim, "invalid fused projection weight");
+            Check(w.dataType == dataType && w.dims.size() == 2 && w.dims[1] == embed_dim, "invalid fused projection weight");
             rows += w.dims[0];
         }
         auto &fused = weight[destination];
-        PrepareCloverData(fused, BFLOAT16, {(rows + alignment - 1) / alignment * alignment, embed_dim},
+        PrepareCloverData(fused, dataType, {(rows + alignment - 1) / alignment * alignment, embed_dim},
                          cudaDevice, rows % alignment != 0);
         fused.name = destination; fused.isModelWeight = true; fused.weightType = WeightType::LINEAR;
         size_t offset = 0;
@@ -255,10 +278,10 @@ void CloverModel::Norm(Data &input, const std::string &name, Data &output, Data 
 #ifdef USE_CUDA
     auto &w = weight[name];
     Check(w.dataType == FLOAT32 && w.Count(0) == input.dims.back(), "invalid normalization weight");
-    PrepareCloverData(output, BFLOAT16, input.dims, cudaDevice);
+    PrepareCloverData(output, dataType, input.dims, cudaDevice);
     Check(FastllmCudaCloverNorm(input.cudaData, (float *)w.cudaData,
         gate ? gate->cudaData : nullptr, output.cudaData, input.Count(0) / input.dims.back(),
-        input.dims.back(), rms_norm_eps, zeroCentered), "normalization failed");
+        input.dims.back(), rms_norm_eps, zeroCentered, nullptr, dataType == FLOAT16), "normalization failed");
 #endif
 }
 void CloverModel::AddNorm(Data &residual, Data &input, const std::string &name, Data &output) {
@@ -266,9 +289,9 @@ void CloverModel::AddNorm(Data &residual, Data &input, const std::string &name, 
     auto &w = weight[name];
     Check(residual.dims == input.dims && w.dataType == FLOAT32 && w.Count(0) == input.dims.back(),
         "invalid residual normalization shape or weight");
-    PrepareCloverData(output, BFLOAT16, input.dims, cudaDevice);
+    PrepareCloverData(output, dataType, input.dims, cudaDevice);
     Check(FastllmCudaCloverAddNorm(residual.cudaData, input.cudaData, (float *)w.cudaData,
-        output.cudaData, input.Count(0) / input.dims.back(), input.dims.back(), rms_norm_eps, true),
+        output.cudaData, input.Count(0) / input.dims.back(), input.dims.back(), rms_norm_eps, true, nullptr, dataType == FLOAT16),
         "residual normalization failed");
 #endif
 }
@@ -276,10 +299,10 @@ void CloverModel::Gdn(Data &input, int layer, std::pair<Data, Data> &cache, bool
 #ifdef USE_CUDA
     std::string p = Layer(layer) + "linear_attn.";
     Data projected, normalized;
-    Linear(input, weight[p + "fused_in_proj.weight"], *GetEmptyData(), projected);
+    CloverLinear(input, weight[p + "fused_in_proj.weight"], *GetEmptyData(), projected);
     auto *cachePointer = &cache;
     GdnCoreBatch(projected, layer, &cachePointer, 1, preview, normalized, snapshots ? &snapshots : nullptr);
-    Linear(normalized, weight[p + "out_proj.weight"], *GetEmptyData(), output);
+    CloverLinear(normalized, weight[p + "out_proj.weight"], *GetEmptyData(), output);
 #endif
 }
 void CloverModel::GdnCoreBatch(Data &projected, int layer, std::pair<Data, Data> *const *caches, int batch,
@@ -292,11 +315,11 @@ void CloverModel::GdnCoreBatch(Data &projected, int layer, std::pair<Data, Data>
     CloverCudaGdnCaches pointers;
     for (int b = 0; b < batch; ++b) {
         auto &conv = caches[b]->first; auto &state = caches[b]->second;
-        if (conv.dims.empty()) PrepareCloverData(conv, BFLOAT16, {1, channels, 3}, cudaDevice, true);
+        if (conv.dims.empty()) PrepareCloverData(conv, dataType, {1, channels, 3}, cudaDevice, true);
         if (state.dims.empty()) PrepareCloverData(state, FLOAT32, {1, valueHeads, 128, 128}, cudaDevice, true);
         pointers.conv[b] = conv.cudaData; pointers.state[b] = (float *)state.cudaData;
         if (snapshots) {
-            PrepareCloverData(snapshots[b]->first, BFLOAT16, {t, 1, channels, 3}, cudaDevice);
+            PrepareCloverData(snapshots[b]->first, dataType, {t, 1, channels, 3}, cudaDevice);
             PrepareCloverData(snapshots[b]->second, FLOAT32, {t, 1, valueHeads, 128, 128}, cudaDevice);
             pointers.convSnapshots[b] = snapshots[b]->first.cudaData;
             pointers.stateSnapshots[b] = (float *)snapshots[b]->second.cudaData;
@@ -304,35 +327,35 @@ void CloverModel::GdnCoreBatch(Data &projected, int layer, std::pair<Data, Data>
     }
     const auto *indirect = batch > 1 ? &pointers : nullptr;
     Data raw, mixed, g, beta, y, z, causalWorkspace;
-    PrepareCloverData(raw, BFLOAT16, {rows, channels}, cudaDevice);
-    PrepareCloverData(z, BFLOAT16, {rows, valueHeads, 128}, cudaDevice);
+    PrepareCloverData(raw, dataType, {rows, channels}, cudaDevice);
+    PrepareCloverData(z, dataType, {rows, valueHeads, 128}, cudaDevice);
     PrepareCloverData(g, FLOAT32, {rows, valueHeads}, cudaDevice);
-    if (!preview) PrepareCloverData(beta, BFLOAT16, {rows, valueHeads}, cudaDevice);
+    if (!preview) PrepareCloverData(beta, dataType, {rows, valueHeads}, cudaDevice);
     Check(FastllmCudaCloverUnpackGdn(projected.cudaData, (float *)weight[p + "A_log"].cudaData,
         (float *)weight[p + "dt_bias"].cudaData, raw.cudaData, z.cudaData, (float *)g.cudaData,
-        beta.cudaData, rows, channels, valueHeads, nullptr), "GDN projection unpack failed");
-    PrepareCloverData(mixed, BFLOAT16, {rows, channels}, cudaDevice);
+        beta.cudaData, rows, channels, valueHeads, nullptr, dataType == FLOAT16), "GDN projection unpack failed");
+    PrepareCloverData(mixed, dataType, {rows, channels}, cudaDevice);
     if (preview)
         Check(FastllmCudaCloverPreviewConv(raw.cudaData, pointers.conv[0],
             weight[p + "conv1d.weight"].cudaData, weight[p + "conv_right_weight"].cudaData,
-            nullptr, nullptr, mixed.cudaData, batch, t, channels, nullptr, indirect), "preview convolution failed");
+            nullptr, nullptr, mixed.cudaData, batch, t, channels, nullptr, indirect, dataType == FLOAT16), "preview convolution failed");
     else
         Check(FastllmCudaCloverCausalConv(raw.cudaData, pointers.conv[0],
-            weight[p + "conv1d.weight"].cudaData, mixed.cudaData, pointers.convSnapshots[0], batch, t, channels, nullptr, indirect), "causal convolution failed");
+            weight[p + "conv1d.weight"].cudaData, mixed.cudaData, pointers.convSnapshots[0], batch, t, channels, nullptr, indirect, dataType == FLOAT16), "causal convolution failed");
     // Read strided views directly from the convolved QKV buffer. This removes
     // three copies while keeping the BF16 values and FP32 recurrence unchanged.
     const auto *q = static_cast<const uint16_t *>(mixed.cudaData);
     const auto *k = q + keyHeads * 128;
     const auto *v = q + keyHeads * 256;
-    PrepareCloverData(y, BFLOAT16, {rows, valueHeads, 128}, cudaDevice);
+    PrepareCloverData(y, dataType, {rows, valueHeads, 128}, cudaDevice);
     if (preview)
         Check(FastllmCudaCloverPreviewGdn(q, k, v, (float *)g.cudaData,
             pointers.state[0], (float *)weight[p + "bd_softmax_logit_scale"].cudaData,
             (float *)weight[p + "bd_softmax_history_bias"].cudaData,
             (float *)weight[p + "bd_softmax_history_c"].cudaData,
-            nullptr, nullptr, y.cudaData, batch, t, keyHeads, valueHeads, nullptr, channels, indirect), "preview GDN failed");
+            nullptr, nullptr, y.cudaData, batch, t, keyHeads, valueHeads, nullptr, channels, indirect, dataType == FLOAT16), "preview GDN failed");
     else {
-        size_t blockBytes = batch == 1 && !snapshots && t >= 2048 && valueHeads >= 16
+        size_t blockBytes = dataType == BFLOAT16 && batch == 1 && !snapshots && t >= 2048 && valueHeads >= 16
             ? FastllmCudaCloverPrefillGdnWorkspaceBytes(1, t, keyHeads, valueHeads) : 0;
         if (blockBytes) {
             if (gdnPrefillWorkspace.GetBytes() < blockBytes)
@@ -347,7 +370,7 @@ void CloverModel::GdnCoreBatch(Data &projected, int layer, std::pair<Data, Data>
                 {rows, 2 * keyHeads * 128 + valueHeads}, cudaDevice);
             Check(FastllmCudaCloverCausalGdn(q, k, v, (float *)g.cudaData,
                 beta.cudaData, pointers.state[0], y.cudaData, pointers.stateSnapshots[0],
-                batch, t, keyHeads, valueHeads, nullptr, (float *)causalWorkspace.cudaData, channels, indirect), "causal GDN failed");
+                batch, t, keyHeads, valueHeads, nullptr, (float *)causalWorkspace.cudaData, channels, indirect, dataType == FLOAT16), "causal GDN failed");
         }
     }
     z.Reshape(y.dims);
@@ -361,14 +384,14 @@ void CloverModel::FullAttention(Data &input, int layer, std::pair<Data, Data> &c
     std::string p = Layer(layer) + "self_attn.";
     Data qgate, k, v, y;
     if (input.dims[0] >= 16 && input.dims[0] <= blockSize) {
-        Linear(input, weight[p + "qkv_proj.weight"], *GetEmptyData(), qgate);
+        CloverLinear(input, weight[p + "qkv_proj.weight"], *GetEmptyData(), qgate);
     } else {
-        Linear(input, weight[p + "q_proj.weight"], *GetEmptyData(), qgate);
-        Linear(input, weight[p + "k_proj.weight"], *GetEmptyData(), k);
-        Linear(input, weight[p + "v_proj.weight"], *GetEmptyData(), v);
+        CloverLinear(input, weight[p + "q_proj.weight"], *GetEmptyData(), qgate);
+        CloverLinear(input, weight[p + "k_proj.weight"], *GetEmptyData(), k);
+        CloverLinear(input, weight[p + "v_proj.weight"], *GetEmptyData(), v);
     }
     FullAttentionCore(qgate, k, v, layer, cache, position, preview, y);
-    Linear(y, weight[p + "o_proj.weight"], *GetEmptyData(), output);
+    CloverLinear(y, weight[p + "o_proj.weight"], *GetEmptyData(), output);
 #endif
 }
 void CloverModel::FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
@@ -380,29 +403,29 @@ void CloverModel::FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
     const int qColumns = 2 * num_attention_heads * head_dim;
     const int kvColumns = num_key_value_heads * head_dim;
     const bool fused = qgate.dims.back() == qColumns + 2 * kvColumns;
-    if (fused) PrepareCloverData(v, BFLOAT16, {t, num_key_value_heads, head_dim}, cudaDevice);
+    if (fused) PrepareCloverData(v, dataType, {t, num_key_value_heads, head_dim}, cudaDevice);
     else { k.Reshape({t, num_key_value_heads, head_dim}); v.Reshape(k.dims); }
     if (t <= blockSize) {
         auto &qw = weight[p + "q_norm.weight"], &kw = weight[p + "k_norm.weight"];
         Check(qw.dataType == FLOAT32 && kw.dataType == FLOAT32 &&
             qw.Count(0) == head_dim && kw.Count(0) == head_dim, "invalid Q/K normalization weights");
-        PrepareCloverData(qn, BFLOAT16, {t, num_attention_heads, head_dim}, cudaDevice);
-        PrepareCloverData(kn, BFLOAT16, v.dims, cudaDevice);
-        PrepareCloverData(gate, BFLOAT16, qn.dims, cudaDevice);
+        PrepareCloverData(qn, dataType, {t, num_attention_heads, head_dim}, cudaDevice);
+        PrepareCloverData(kn, dataType, v.dims, cudaDevice);
+        PrepareCloverData(gate, dataType, qn.dims, cudaDevice);
         Check(FastllmCudaCloverPrepareAttention(qgate.cudaData,
             fused ? (uint16_t *)qgate.cudaData + qColumns : k.cudaData, (float *)qw.cudaData,
             (float *)kw.cudaData, qn.cudaData, kn.cudaData, gate.cudaData, t, num_attention_heads,
             num_key_value_heads, rotary_dim, position, ropeTheta, rms_norm_eps, nullptr,
-            fused ? qColumns + 2 * kvColumns : 0, fused ? v.cudaData : nullptr), "attention preparation failed");
+            fused ? qColumns + 2 * kvColumns : 0, fused ? v.cudaData : nullptr, dataType == FLOAT16), "attention preparation failed");
     } else {
         qgate.Reshape({t, num_attention_heads, 2 * head_dim});
         Split(qgate, 2, 0, head_dim, q); Split(qgate, 2, head_dim, 2 * head_dim, gate);
         Norm(q, p + "q_norm.weight", qn); Norm(k, p + "k_norm.weight", kn);
-        Check(FastllmCudaCloverRotary(qn.cudaData, t, num_attention_heads, head_dim, rotary_dim, position, ropeTheta), "Q rotary failed");
-        Check(FastllmCudaCloverRotary(kn.cudaData, t, num_key_value_heads, head_dim, rotary_dim, position, ropeTheta), "K rotary failed");
+        Check(FastllmCudaCloverRotary(qn.cudaData, t, num_attention_heads, head_dim, rotary_dim, position, ropeTheta, nullptr, dataType == FLOAT16), "Q rotary failed");
+        Check(FastllmCudaCloverRotary(kn.cudaData, t, num_key_value_heads, head_dim, rotary_dim, position, ropeTheta, nullptr, dataType == FLOAT16), "K rotary failed");
     }
     auto append = [&](Data &dst, const Data &src) {
-        dst.dataType = BFLOAT16; dst.UpdateUnitSize();
+        dst.dataType = dataType; dst.UpdateUnitSize();
         dst.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice});
         int required = position + t;
         if (dst.expansionDims.empty() || dst.expansionDims[0] < required)
@@ -410,7 +433,7 @@ void CloverModel::FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
         CatDirect(dst, src, 0);
     };
     append(cache.first, kn); append(cache.second, v);
-    PrepareCloverData(y, BFLOAT16, {t, num_attention_heads, head_dim}, cudaDevice);
+    PrepareCloverData(y, dataType, {t, num_attention_heads, head_dim}, cudaDevice);
     // Small query blocks otherwise expose only a few CTAs across the KV heads.
     // The FlashInfer planner splits the history and merges their softmax states.
     if (t <= blockSize && position + t > 256) {
@@ -419,14 +442,14 @@ void CloverModel::FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
         PrepareCloverData(attentionWorkspace, INT32, {int((bytes + 3) / 4)}, cudaDevice);
     }
     bool ok = FastllmCudaCloverAttention(qn.cudaData, cache.first.cudaData, cache.second.cudaData,
-        y.cudaData, t, position, num_attention_heads, num_key_value_heads, preview, nullptr, attentionWorkspace.cudaData);
+        y.cudaData, t, position, num_attention_heads, num_key_value_heads, preview, nullptr, attentionWorkspace.cudaData, dataType == FLOAT16);
     // Restore even on unsupported attention dispatch. Spare bytes are never
     // considered committed history and are overwritten by the next append.
     if (preview) {
         cache.first.Resize({position, num_key_value_heads, head_dim});
         cache.second.Resize({position, num_key_value_heads, head_dim});
     }
-    Check(ok, "BF16 attention requires a supported CUDA architecture");
+    Check(ok, "attention dispatch failed");
     SigmoidMulTo(y, gate);
     y.Reshape({t, num_attention_heads * head_dim});
 #endif
@@ -440,14 +463,14 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
         Data sharedGateUp, sharedMiddle, shared, sharedScale;
         // Keep the established prefill/short-tail reduction geometry.
         const bool fusedGate = graphAllowed && t >= 16;
-        Linear(input, weight[p + "shared_expert.gate_up_proj.weight"], *GetEmptyData(), sharedGateUp);
+        CloverLinear(input, weight[p + "shared_expert.gate_up_proj.weight"], *GetEmptyData(), sharedGateUp);
         Swiglu(sharedGateUp, sharedMiddle);
-        Linear(sharedMiddle, weight[p + "shared_expert.down_proj.weight"], *GetEmptyData(), shared);
+        CloverLinear(sharedMiddle, weight[p + "shared_expert.down_proj.weight"], *GetEmptyData(), shared);
         Data router, ids, scores, scratchIds, scratchScores, allowed, middle, parts, expertWorkspace,
             packedExperts;
         if (!fusedGate)
-            Linear(input, weight[p + "shared_expert_gate.weight"], *GetEmptyData(), sharedScale);
-        Linear(input, weight[p + (fusedGate ? "router_shared_gate.weight" : "gate.weight")], *GetEmptyData(), router);
+            CloverLinear(input, weight[p + "shared_expert_gate.weight"], *GetEmptyData(), sharedScale);
+        CloverLinear(input, weight[p + (fusedGate ? "router_shared_gate.weight" : "gate.weight")], *GetEmptyData(), router);
         const int routerStride = router.dims.back();
         PrepareCloverData(ids, INT32, {t, num_experts_per_tok}, cudaDevice);
         PrepareCloverData(scores, FLOAT32, ids.dims, cudaDevice);
@@ -460,7 +483,7 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
         Check(FastllmCudaCloverRoute(router.cudaData, (int *)ids.cudaData, (float *)scores.cudaData,
             (int *)scratchIds.cudaData, (float *)scratchScores.cudaData, (unsigned char *)allowed.cudaData,
             batch, t / batch, num_experts, num_experts_per_tok, preview && coresetEnabled ? coresetTopP : 0.f,
-            nullptr, routerStride), "routing failed");
+            nullptr, routerStride, dataType == FLOAT16), "routing failed");
         if (hostExperts[layer]) {
             if (fusedGate) Split(router, 1, num_experts, num_experts + 1, sharedScale);
             hybridMoe->SetPrefill(!graphAllowed && t > blockSize);
@@ -471,12 +494,13 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
             AddTo(output, shared);
             return;
         }
-        PrepareCloverData(middle, BFLOAT16, {t, num_experts_per_tok, intermediate}, cudaDevice);
-        PrepareCloverData(parts, BFLOAT16, {t, num_experts_per_tok, embed_dim}, cudaDevice);
-        PrepareCloverData(output, BFLOAT16, input.dims, cudaDevice);
+        PrepareCloverData(middle, dataType, {t, num_experts_per_tok, intermediate}, cudaDevice);
+        PrepareCloverData(parts, dataType, {t, num_experts_per_tok, embed_dim}, cudaDevice);
+        PrepareCloverData(output, dataType, input.dims, cudaDevice);
         if (t >= 4) PrepareCloverData(expertWorkspace, INT32,
             {num_experts * (t + 1) + num_experts + (t * num_experts_per_tok + 15) / 16 + 1}, cudaDevice);
-        size_t packedBytes = FastllmCudaCloverExpertsPackedBytes(t, embed_dim, intermediate, num_experts, num_experts_per_tok);
+        size_t packedBytes = dataType == BFLOAT16
+            ? FastllmCudaCloverExpertsPackedBytes(t, embed_dim, intermediate, num_experts, num_experts_per_tok) : 0;
         if (packedBytes && (t > blockSize || graphPath)) PrepareCloverData(packedExperts, INT32, {int((packedBytes + 3) / 4)}, cudaDevice);
         Check(FastllmCudaCloverExperts(input.cudaData, weight[p + "experts.gate_up_proj"].cudaData,
                                        weight[p + "experts.down_proj"].cudaData, (int *)ids.cudaData,
@@ -485,7 +509,7 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
                                        num_experts_per_tok, nullptr, (int *)expertWorkspace.cudaData,
                                        packedExperts.cudaData, shared.cudaData,
                                        fusedGate ? (uint16_t *)router.cudaData + num_experts : sharedScale.cudaData,
-                                       fusedGate ? routerStride : 1),
+                                       fusedGate ? routerStride : 1, dataType == FLOAT16),
               "experts failed");
     };
     const int width = t / batch;
@@ -502,7 +526,7 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
         auto candidate = std::make_unique<MoeGraphs::Entry>();
         bool poolActive = false, captureActive = false, ready = false;
         try {
-            PrepareCloverData(candidate->input, BFLOAT16, input.dims, cudaDevice);
+            PrepareCloverData(candidate->input, dataType, input.dims, cudaDevice);
             Check(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(candidate->input.cudaData,
                 input.cudaData, input.GetBytes()), "MoE graph input copy failed");
             // MoE has no committed state. Warmup resolves lazy GEMM resources
@@ -568,7 +592,7 @@ void CloverModel::ForwardLogits(const std::vector<int> &tokens,
     std::vector<float> values(tokens.begin(), tokens.end());
     Data ids(FLOAT32, {1, (int)tokens.size()}, values), hidden;
     Embedding(ids, weight["model.embed_tokens.weight"], hidden);
-    ToDataType(hidden, BFLOAT16);
+    ToDataType(hidden, dataType);
     hidden.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice});
     hidden.Reshape({(int)tokens.size(), embed_dim});
     Data norm;
@@ -600,7 +624,7 @@ void CloverModel::ForwardLogits(const std::vector<int> &tokens,
         Split(hidden, 0, tokens.size() - 1, tokens.size(), last);
         Norm(last, "model.norm.weight", final);
     } else Norm(hidden, "model.norm.weight", final);
-    Linear(final, weight["lm_head.weight"], *GetEmptyData(), logits);
+    CloverLinear(final, weight["lm_head.weight"], *GetEmptyData(), logits);
     ToDataType(logits, FLOAT32);
 }
 
@@ -648,23 +672,23 @@ void CloverModel::ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens
     }
     Data ids(FLOAT32, {batch, width}, values), hidden, norm;
     Embedding(ids, weight["model.embed_tokens.weight"], hidden);
-    ToDataType(hidden, BFLOAT16);
+    ToDataType(hidden, dataType);
     hidden.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice});
     hidden.Reshape({rows, embed_dim});
     auto project = [&](Data &input, Data &matrix, Data &output) {
         if (rows <= 32) {
-            Linear(input, matrix, *GetEmptyData(), output);
+            CloverLinear(input, matrix, *GetEmptyData(), output);
             return;
         }
         // Larger M selects a different BF16 reduction. Preserve the validated
         // M=16/32 dispatch while writing into one combined allocation.
-        PrepareCloverData(output, BFLOAT16, {rows, matrix.dims[0]}, cudaDevice);
+        PrepareCloverData(output, dataType, {rows, matrix.dims[0]}, cudaDevice);
         for (int row = 0; row < rows; row += 32) {
             const int count = std::min(32, rows - row);
-            Data x(BFLOAT16, {count, input.dims.back()}), y(BFLOAT16, {count, matrix.dims[0]});
+            Data x(dataType, {count, input.dims.back()}), y(dataType, {count, matrix.dims[0]});
             x.FakeFrom(input, (size_t)row * input.dims.back() * sizeof(uint16_t));
             y.FakeFrom(output, (size_t)row * matrix.dims[0] * sizeof(uint16_t));
-            Linear(x, matrix, *GetEmptyData(), y);
+            CloverLinear(x, matrix, *GetEmptyData(), y);
         }
     };
     for (int layer = 0; layer < block_cnt; ++layer) {
@@ -675,7 +699,7 @@ void CloverModel::ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens
         const std::string p = Layer(layer) + (linearLayers[layer] ? "linear_attn." : "self_attn.");
         const int attentionDim = linearLayers[layer] ? valueHeads * 128 : num_attention_heads * head_dim;
         Data projected, attended;
-        PrepareCloverData(attended, BFLOAT16, {rows, attentionDim}, cudaDevice);
+        PrepareCloverData(attended, dataType, {rows, attentionDim}, cudaDevice);
         if (linearLayers[layer])
             project(norm, weight[p + "fused_in_proj.weight"], projected);
         else
@@ -691,7 +715,7 @@ void CloverModel::ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens
                 snapshots.empty() ? nullptr : snapshotPointers);
         } else {
             for (int b = 0; b < batch; ++b) {
-                Data input(BFLOAT16, {width, projected.dims.back()}), output(BFLOAT16, {width, attentionDim});
+                Data input(dataType, {width, projected.dims.back()}), output(dataType, {width, attentionDim});
                 input.FakeFrom(projected, (size_t)b * width * projected.dims.back() * sizeof(uint16_t));
                 output.FakeFrom(attended, (size_t)b * width * attentionDim * sizeof(uint16_t));
                 Data k, v;
@@ -713,7 +737,7 @@ void CloverModel::ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens
     }
     Data final, combined;
     Norm(hidden, "model.norm.weight", final);
-    Linear(final, weight["lm_head.weight"], *GetEmptyData(), combined);
+    CloverLinear(final, weight["lm_head.weight"], *GetEmptyData(), combined);
     logits.resize(batch);
     for (int b = 0; b < batch; ++b) {
         Data view(combined.dataType, {width, combined.dims.back()});

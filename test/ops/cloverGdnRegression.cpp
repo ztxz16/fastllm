@@ -1,5 +1,6 @@
 #include "devices/cuda/fastllm-clover.h"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <vector>
 namespace {
+bool fp16 = false;
 void Check(cudaError_t code) { if (code != cudaSuccess) throw std::runtime_error(cudaGetErrorString(code)); }
 void Require(bool ok, const char *message) { if (!ok) throw std::runtime_error(message); }
 struct Buffer {
@@ -21,13 +23,18 @@ struct Buffer {
         std::vector<T> x(n); Check(cudaMemcpy(x.data(), p, n * sizeof(T), cudaMemcpyDeviceToHost)); return x;
     }
 };
-uint16_t BF16(float x) {
+uint16_t Round16(float x) {
+    if (fp16) return __half_raw(__float2half_rn(x)).x;
     uint32_t bits; std::memcpy(&bits, &x, 4); bits += 0x7fff + ((bits >> 16) & 1); return bits >> 16;
 }
-float Float(uint16_t x) { uint32_t bits = uint32_t(x) << 16; float y; std::memcpy(&y, &bits, 4); return y; }
+float Float(uint16_t x) {
+    if (fp16) return __half2float(__half(__half_raw{x}));
+    uint32_t bits = uint32_t(x) << 16;
+    float y; std::memcpy(&y, &bits, 4); return y;
+}
 std::vector<uint16_t> Pack(const std::vector<uint16_t> &q, const std::vector<uint16_t> &k,
         const std::vector<uint16_t> &v, int rows, int kh, int vh, int stride) {
-    std::vector<uint16_t> packed((size_t)rows * stride + 128, BF16(123.f));
+    std::vector<uint16_t> packed((size_t)rows * stride + 128, Round16(123.f));
     for (int row = 0; row < rows; ++row) {
         auto *dst = packed.data() + 64 + (size_t)row * stride;
         std::copy_n(q.data() + (size_t)row * kh * 128, kh * 128, dst);
@@ -46,16 +53,16 @@ void Convolution(int batch, int tokens, int channels) {
     std::mt19937 rng(911 + tokens + channels);
     std::normal_distribution<float> normal(0.f, .7f);
     const size_t count = (size_t)batch * tokens * channels, historyCount = (size_t)batch * channels * 3;
-    auto random = [&](size_t n) { std::vector<uint16_t> x(n); for (auto &v : x) v = BF16(normal(rng)); return x; };
+    auto random = [&](size_t n) { std::vector<uint16_t> x(n); for (auto &v : x) v = Round16(normal(rng)); return x; };
     auto input = random(count), history = random(historyCount), weight = random((size_t)channels * 4);
-    std::vector<uint16_t> outputGuard(count + 128, BF16(123.f));
-    std::vector<uint16_t> snapshotGuard(count * 3 + 128, BF16(123.f));
+    std::vector<uint16_t> outputGuard(count + 128, Round16(123.f));
+    std::vector<uint16_t> snapshotGuard(count * 3 + 128, Round16(123.f));
     Buffer x(count * 2), h(historyCount * 2), w(weight.size() * 2),
         y(outputGuard.size() * 2), snapshots(snapshotGuard.size() * 2);
     x.Put(input); w.Put(weight); y.Put(outputGuard); snapshots.Put(snapshotGuard);
     auto launch = [&](bool withSnapshots) {
         Require(FastllmCudaCloverCausalConv(x.p, h.p, w.p, (uint16_t *)y.p + 64,
-            withSnapshots ? (uint16_t *)snapshots.p + 64 : nullptr, batch, tokens, channels), "causal convolution launch");
+            withSnapshots ? (uint16_t *)snapshots.p + 64 : nullptr, batch, tokens, channels, nullptr, nullptr, fp16), "causal convolution launch");
     };
     // A non-null snapshot buffer selects the original token-wise kernel.
     // Check it against the published BF16-product/FP32-sum contract before
@@ -76,8 +83,8 @@ void Convolution(int batch, int tokens, int channels) {
         for (int b = 0; b < batch; ++b) for (int t = 0; t < tokens; ++t) for (int c = 0; c < channels; ++c) {
             float sum = 0.f;
             for (int tap = 0; tap < 4; ++tap)
-                sum += Float(BF16(Float(source(b, t + tap - 3, c)) * Float(weight[c * 4 + tap])));
-            float expected = Float(BF16(sum / (1.f + std::exp(-sum))));
+                sum += Float(Round16(Float(source(b, t + tap - 3, c)) * Float(weight[c * 4 + tap])));
+            float expected = Float(Round16(sum / (1.f + std::exp(-sum))));
             Close(Float(actual[64 + ((size_t)b * tokens + t) * channels + c]), expected, .0005f, .008f);
             for (int tap = 0; tap < 3; ++tap)
                 Require(actualSnapshots[64 + (((size_t)t * batch + b) * channels + c) * 3 + tap] ==
@@ -104,12 +111,12 @@ void Convolution(int batch, int tokens, int channels) {
 }
 void Run(int batch, int tokens, int kh, int vh, bool cpuReference) {
     std::mt19937 rng(789 + tokens); std::normal_distribution<float> normal(0.f, 1.f);
-    auto random = [&](size_t n, float scale) { std::vector<uint16_t> x(n); for (auto &v : x) v = BF16(normal(rng) * scale); return x; };
+    auto random = [&](size_t n, float scale) { std::vector<uint16_t> x(n); for (auto &v : x) v = Round16(normal(rng) * scale); return x; };
     auto q = random((size_t)batch * tokens * kh * 128, 1.f), k = random(q.size(), 1.f);
     auto v = random((size_t)batch * tokens * vh * 128, .4f);
     std::vector<uint16_t> beta(batch * tokens * vh);
     std::vector<float> g(beta.size()), initial((size_t)batch * vh * 128 * 128);
-    for (auto &x : beta) x = BF16(float(rng() % 1000) / 1000.f);
+    for (auto &x : beta) x = Round16(float(rng() % 1000) / 1000.f);
     for (auto &x : g) x = -.2f * float(rng() % 1000) / 1000.f;
     for (auto &x : initial) x = normal(rng) * .03f;
     const size_t snapCount = tokens <= 32 ? initial.size() * tokens : 1;
@@ -126,7 +133,7 @@ void Run(int batch, int tokens, int kh, int vh, bool cpuReference) {
         Require(FastllmCudaCloverCausalGdn(strided ? base : dq.p, strided ? base + kh * 128 : dk.p,
             strided ? base + kh * 256 : dv.p, (float *)dg.p, db.p, (float *)state.p,
             output.p, tokens <= 32 ? (float *)snaps.p : nullptr, batch, tokens, kh, vh, nullptr,
-            prepared ? (float *)workspace.p + 64 : nullptr, strided ? stride : 0), "GDN launch");
+            prepared ? (float *)workspace.p + 64 : nullptr, strided ? stride : 0, nullptr, fp16), "GDN launch");
     };
     state.Put(initial); launch(false);
     auto expected = output.Get<uint16_t>(v.size());
@@ -144,7 +151,7 @@ void Run(int batch, int tokens, int kh, int vh, bool cpuReference) {
     Require(fused.Get<uint16_t>(packed.size()) == packed, "causal GDN wrote its strided inputs");
     for (int badStride : {-1, vh * 128 - 1})
         Require(!FastllmCudaCloverCausalGdn(dq.p, dk.p, dv.p, (float *)dg.p, db.p,
-            (float *)state.p, output.p, nullptr, batch, tokens, kh, vh, nullptr, nullptr, badStride), "invalid causal stride accepted");
+            (float *)state.p, output.p, nullptr, batch, tokens, kh, vh, nullptr, nullptr, badStride, nullptr, fp16), "invalid causal stride accepted");
     if (cpuReference) {
         // Independent scalar form of the published recurrent_commit_torch:
         // normalize Q/K, decay S, apply the beta-scaled delta, then query S.
@@ -164,7 +171,7 @@ void Run(int batch, int tokens, int kh, int vh, bool cpuReference) {
                 float delta = (Float(v[(row * vh + h) * 128 + d]) - remembered) * rate;
                 float y = 0.f;
                 for (int j = 0; j < 128; ++j) { s[j] += kn[j] * delta; y += s[j] * qn[j]; }
-                refOutput[(row * vh + h) * 128 + d] = BF16(y);
+                refOutput[(row * vh + h) * 128 + d] = Round16(y);
             }
         }
         for (size_t i = 0; i < expected.size(); ++i) Close(Float(expected[i]), Float(refOutput[i]), .002f, .008f);
@@ -173,7 +180,7 @@ void Run(int batch, int tokens, int kh, int vh, bool cpuReference) {
     cudaGraph_t graph; cudaGraphExec_t executable;
     Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); launch(true, true);
     Check(cudaStreamEndCapture(cudaStreamPerThread, &graph)); Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
-    for (auto &x : q) x = BF16(normal(rng));
+    for (auto &x : q) x = Round16(normal(rng));
     packed = Pack(q, k, v, batch * tokens, kh, vh, stride); fused.Put(packed);
     dq.Put(q); state.Put(initial); launch(false);
     expected = output.Get<uint16_t>(v.size()); expectedState = state.Get<float>(initial.size()); if (tokens <= 32) expectedSnaps = snaps.Get<float>(snapCount);
@@ -188,12 +195,12 @@ void BlockPrefill(int batch, int tokens, int kh, int vh, bool weakDecay) {
     std::uniform_real_distribution<float> uniform(0.f, 1.f);
     const size_t rows = (size_t)batch * tokens, states = (size_t)batch * vh * 128 * 128;
     const int stride = (2 * kh + vh) * 128 + 3;
-    auto random = [&](size_t n) { std::vector<uint16_t> x(n); for (auto &v : x) v = BF16(normal(rng)); return x; };
+    auto random = [&](size_t n) { std::vector<uint16_t> x(n); for (auto &v : x) v = Round16(normal(rng)); return x; };
     auto q = random(rows * kh * 128), k = random(q.size()), v = random(rows * vh * 128);
     std::vector<float> gates(rows * vh), initial(states + 64, 123.f);
-    std::vector<uint16_t> beta(rows * vh), outputGuard(v.size() + 128, BF16(123.f));
+    std::vector<uint16_t> beta(rows * vh), outputGuard(v.size() + 128, Round16(123.f));
     for (auto &x : gates) x = -uniform(rng) * (weakDecay ? .001f : .3f);
-    for (auto &x : beta) x = BF16(uniform(rng));
+    for (auto &x : beta) x = Round16(uniform(rng));
     for (size_t i = 32; i < states + 32; ++i) initial[i] = normal(rng) * .1f;
     auto packed = Pack(q, k, v, rows, kh, vh, stride);
     std::vector<unsigned char> workGuard(bytes + 256, 173);
@@ -220,7 +227,7 @@ void BlockPrefill(int batch, int tokens, int kh, int vh, bool weakDecay) {
         referenceState.Put(initial); referenceOutput.Put(outputGuard);
         Require(FastllmCudaCloverCausalGdn(qp, kp, vp, (float *)g.p, b.p,
             (float *)referenceState.p + 32, (uint16_t *)referenceOutput.p + 64, nullptr,
-            batch, tokens, kh, vh, nullptr, (float *)scalarWork.p, stride), "scalar block reference launch");
+            batch, tokens, kh, vh, nullptr, (float *)scalarWork.p, stride, nullptr, fp16), "scalar block reference launch");
         auto y = output.Get<uint16_t>(outputGuard.size()), ref = referenceOutput.Get<uint16_t>(outputGuard.size());
         auto s = state.Get<float>(initial.size()), rs = referenceState.Get<float>(initial.size());
         double yd = 0., yn = 0., sd = 0., sn = 0.;
@@ -252,7 +259,7 @@ void BlockPrefill(int batch, int tokens, int kh, int vh, bool weakDecay) {
     Require(launch(bytes, work), "block prefill capture");
     Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
     Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
-    for (auto &x : q) x = BF16(normal(rng));
+    for (auto &x : q) x = Round16(normal(rng));
     for (size_t i = 32; i < states + 32; ++i) initial[i] = normal(rng) * .1f;
     packed = Pack(q, k, v, rows, kh, vh, stride); input.Put(packed); state.Put(initial);
     Require(launch(bytes, work), "refreshed block prefill"); checkReference();
@@ -270,23 +277,23 @@ void ResidualNormalization(int rows, int width, bool centered, bool unaligned = 
     const size_t count = (size_t)rows * width, size = count + 2 * offset;
     std::mt19937 rng(1201 + rows + width);
     std::normal_distribution<float> normal(0.f, .7f);
-    std::vector<uint16_t> input(size, BF16(123.f)), residual = input, guard = input;
+    std::vector<uint16_t> input(size, Round16(123.f)), residual = input, guard = input;
     std::vector<float> weights(width);
     Buffer x(size * 2), h(size * 2), expectedH(size * 2), w(width * 4), y(size * 2), expectedY(size * 2);
     auto refresh = [&]() {
         for (size_t i = offset; i < offset + count; ++i) {
-            input[i] = BF16(normal(rng)); residual[i] = BF16(normal(rng));
-            if (i % 7 == 0) residual[i] = BF16(-Float(input[i]));
-            if (i % 13 == 0) { input[i] = BF16(1.e-20f); residual[i] = BF16(-1.e-20f); }
-            if (i % 29 == 0) { input[i] = BF16(1.e10f); residual[i] = BF16(-1.e10f); }
+            input[i] = Round16(normal(rng)); residual[i] = Round16(normal(rng));
+            if (i % 7 == 0) residual[i] = Round16(-Float(input[i]));
+            if (i % 13 == 0) { input[i] = Round16(1.e-20f); residual[i] = Round16(-1.e-20f); }
+            if (i % 29 == 0) { input[i] = Round16(fp16 ? 100.f : 1.e10f); residual[i] = Round16(fp16 ? -100.f : -1.e10f); }
         }
         for (auto &v : weights) v = normal(rng);
         x.Put(input); h.Put(residual); w.Put(weights); y.Put(guard); expectedY.Put(guard);
         auto rounded = residual;
-        for (size_t i = offset; i < offset + count; ++i) rounded[i] = BF16(Float(residual[i]) + Float(input[i]));
+        for (size_t i = offset; i < offset + count; ++i) rounded[i] = Round16(Float(residual[i]) + Float(input[i]));
         expectedH.Put(rounded);
         Require(FastllmCudaCloverNorm((uint16_t *)expectedH.p + offset, (float *)w.p, nullptr,
-            (uint16_t *)expectedY.p + offset, rows, width, 1.e-6f, centered), "residual norm reference launch");
+            (uint16_t *)expectedY.p + offset, rows, width, 1.e-6f, centered, nullptr, fp16), "residual norm reference launch");
         auto expected = expectedY.Get<uint16_t>(size);
         // Independent RMS equation checks the original normalization path;
         // exact comparison below additionally preserves its reduction tree.
@@ -297,13 +304,13 @@ void ResidualNormalization(int rows, int width, bool centered, bool unaligned = 
             for (int d = 0; d < width; ++d) {
                 size_t i = offset + (size_t)row * width + d;
                 float reference = Float(rounded[i]) * inv * (weights[d] + (centered ? 1. : 0.));
-                Close(Float(expected[i]), Float(BF16(reference)), .0005f, .008f);
+                Close(Float(expected[i]), Float(Round16(reference)), .0005f, .008f);
             }
         }
         return std::make_pair(rounded, expected);
     };
     auto launch = [&]() { return FastllmCudaCloverAddNorm((uint16_t *)h.p + offset,
-        (uint16_t *)x.p + offset, (float *)w.p, (uint16_t *)y.p + offset, rows, width, 1.e-6f, centered); };
+        (uint16_t *)x.p + offset, (float *)w.p, (uint16_t *)y.p + offset, rows, width, 1.e-6f, centered, nullptr, fp16); };
     auto expected = refresh();
     auto check = [&]() {
         Require(h.Get<uint16_t>(size) == expected.first, "fused residual rounding or guard differs");
@@ -311,9 +318,9 @@ void ResidualNormalization(int rows, int width, bool centered, bool unaligned = 
         Require(x.Get<uint16_t>(size) == input, "fused normalization changed addition input");
     };
     Require(launch(), "residual norm launch"); check();
-    Require(!FastllmCudaCloverAddNorm(h.p, x.p, (float *)w.p, h.p, rows, width, 1.e-6f, centered),
+    Require(!FastllmCudaCloverAddNorm(h.p, x.p, (float *)w.p, h.p, rows, width, 1.e-6f, centered, nullptr, fp16),
         "residual/output alias accepted");
-    Require(!FastllmCudaCloverAddNorm(h.p, x.p, (float *)w.p, y.p, 0, width, 1.e-6f, centered),
+    Require(!FastllmCudaCloverAddNorm(h.p, x.p, (float *)w.p, y.p, 0, width, 1.e-6f, centered, nullptr, fp16),
         "invalid residual norm shape accepted");
     cudaGraph_t graph; cudaGraphExec_t executable;
     Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
@@ -327,11 +334,11 @@ void Normalization(int rows, int width, bool gated, bool centered) {
     std::mt19937 rng(rows + width);
     std::normal_distribution<float> normal(0.f, 1.f);
     const size_t count = (size_t)rows * width;
-    const uint16_t sentinel = BF16(123.f);
+    const uint16_t sentinel = Round16(123.f);
     std::vector<uint16_t> input(count), gate(count), guarded(count + 128, sentinel);
     std::vector<float> weight(width);
-    for (auto &x : input) x = BF16(normal(rng));
-    for (auto &x : gate) x = BF16(normal(rng));
+    for (auto &x : input) x = Round16(normal(rng));
+    for (auto &x : gate) x = Round16(normal(rng));
     for (auto &x : weight) x = normal(rng);
     Buffer x(count * 2), g(count * 2), w(width * 4), out(guarded.size() * 2), ref(count * 2);
     x.Put(input); g.Put(gate); w.Put(weight); out.Put(guarded);
@@ -341,7 +348,7 @@ void Normalization(int rows, int width, bool gated, bool centered) {
             Require(FastllmCudaCloverNorm((uint16_t *)x.p + offset, (float *)w.p,
                 gated ? (uint16_t *)g.p + offset : nullptr,
                 bulk ? (uint16_t *)out.p + 64 : (uint16_t *)ref.p + offset,
-                bulk ? rows : std::min(511, rows - row), width, 1.e-6f, centered, nullptr), "norm launch");
+                bulk ? rows : std::min(511, rows - row), width, 1.e-6f, centered, nullptr, fp16), "norm launch");
         }
     };
     auto check = [&]() {
@@ -358,7 +365,7 @@ void Normalization(int rows, int width, bool gated, bool centered) {
                 size_t pos = (size_t)row * width + d;
                 double value = Float(input[pos]) * inv * (weight[d] + (centered ? 1.f : 0.f));
                 if (gated) { double z = Float(gate[pos]); value *= z / (1. + std::exp(-z)); }
-                Close(Float(actual[pos + 64]), Float(BF16(value)), .001f, .008f);
+                Close(Float(actual[pos + 64]), Float(Round16(value)), .001f, .008f);
             }
         }
     };
@@ -367,8 +374,8 @@ void Normalization(int rows, int width, bool gated, bool centered) {
     Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); launch(true);
     Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
     Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
-    for (auto &v : input) v = BF16(normal(rng));
-    for (auto &v : gate) v = BF16(normal(rng));
+    for (auto &v : input) v = Round16(normal(rng));
+    for (auto &v : gate) v = Round16(normal(rng));
     x.Put(input); g.Put(gate); launch(false);
     Check(cudaGraphLaunch(executable, cudaStreamPerThread)); check();
     Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
@@ -379,8 +386,8 @@ void AttentionPreparation(int tokens, int qh, int kh, int rotaryDim, int positio
     const size_t qcount = (size_t)tokens * qh * 256, kcount = (size_t)tokens * kh * 256;
     std::vector<uint16_t> qgate(qcount * 2), key(kcount), query(qcount), gate(qcount);
     std::vector<float> qw(256), kw(256);
-    for (auto &x : qgate) x = BF16(normal(rng));
-    for (auto &x : key) x = BF16(normal(rng));
+    for (auto &x : qgate) x = Round16(normal(rng));
+    for (auto &x : key) x = Round16(normal(rng));
     for (int i = 0; i < 256; ++i) { qw[i] = normal(rng); kw[i] = normal(rng); }
     for (size_t row = 0; row < qcount / 256; ++row) for (int d = 0; d < 256; ++d) {
         query[row * 256 + d] = qgate[row * 512 + d];
@@ -389,15 +396,15 @@ void AttentionPreparation(int tokens, int qh, int kh, int rotaryDim, int positio
     Buffer qg(qgate.size() * 2), k(kcount * 2), q(qcount * 2), wq(1024), wk(1024),
         refQ(qcount * 2), refK(kcount * 2), outQ((qcount + 128) * 2), outK((kcount + 128) * 2), outG((qcount + 128) * 2);
     qg.Put(qgate); k.Put(key); q.Put(query); wq.Put(qw); wk.Put(kw);
-    std::vector<uint16_t> qGuard(qcount + 128, BF16(123.f)), kGuard(kcount + 128, BF16(123.f));
+    std::vector<uint16_t> qGuard(qcount + 128, Round16(123.f)), kGuard(kcount + 128, Round16(123.f));
     outQ.Put(qGuard); outG.Put(qGuard); outK.Put(kGuard);
-    Require(FastllmCudaCloverNorm(q.p, (float *)wq.p, nullptr, refQ.p, tokens * qh, 256, 1.e-6f, true), "reference Q norm");
-    Require(FastllmCudaCloverNorm(k.p, (float *)wk.p, nullptr, refK.p, tokens * kh, 256, 1.e-6f, true), "reference K norm");
-    Require(FastllmCudaCloverRotary(refQ.p, tokens, qh, 256, rotaryDim, position, 1.e7f), "reference Q rotary");
-    Require(FastllmCudaCloverRotary(refK.p, tokens, kh, 256, rotaryDim, position, 1.e7f), "reference K rotary");
+    Require(FastllmCudaCloverNorm(q.p, (float *)wq.p, nullptr, refQ.p, tokens * qh, 256, 1.e-6f, true, nullptr, fp16), "reference Q norm");
+    Require(FastllmCudaCloverNorm(k.p, (float *)wk.p, nullptr, refK.p, tokens * kh, 256, 1.e-6f, true, nullptr, fp16), "reference K norm");
+    Require(FastllmCudaCloverRotary(refQ.p, tokens, qh, 256, rotaryDim, position, 1.e7f, nullptr, fp16), "reference Q rotary");
+    Require(FastllmCudaCloverRotary(refK.p, tokens, kh, 256, rotaryDim, position, 1.e7f, nullptr, fp16), "reference K rotary");
     const int stride = (qh + kh) * 512 + 17;
-    std::vector<uint16_t> packed((size_t)tokens * stride + 128, BF16(123.f)), value(kcount);
-    for (auto &x : value) x = BF16(normal(rng));
+    std::vector<uint16_t> packed((size_t)tokens * stride + 128, Round16(123.f)), value(kcount);
+    for (auto &x : value) x = Round16(normal(rng));
     for (int row = 0; row < tokens; ++row) {
         auto dst = packed.begin() + 64 + (size_t)row * stride;
         std::copy_n(qgate.begin() + (size_t)row * qh * 512, qh * 512, dst);
@@ -411,7 +418,7 @@ void AttentionPreparation(int tokens, int qh, int kh, int rotaryDim, int positio
             fused ? (uint16_t *)fusedInput.p + 64 + qh * 512 : k.p, (float *)wq.p, (float *)wk.p,
             (uint16_t *)outQ.p + 64, (uint16_t *)outK.p + 64, (uint16_t *)outG.p + 64,
             tokens, qh, kh, rotaryDim, position, 1.e7f, 1.e-6f, nullptr, fused ? stride : 0,
-            fused ? (uint16_t *)outV.p + 64 : nullptr);
+            fused ? (uint16_t *)outV.p + 64 : nullptr, fp16);
     };
     auto check = [&]() {
         auto a = outQ.Get<uint16_t>(qGuard.size()), b = outK.Get<uint16_t>(kGuard.size()), c = outG.Get<uint16_t>(qGuard.size());
@@ -446,10 +453,10 @@ void AttentionPreparation(int tokens, int qh, int kh, int rotaryDim, int positio
 }
 void Preview(int batch, int tokens, int kh, int vh, bool masked) {
     std::mt19937 rng(42 + tokens); std::normal_distribution<float> normal(0.f, .2f);
-    auto random = [&](size_t n) { std::vector<uint16_t> x(n); for (auto &v : x) v = BF16(normal(rng)); return x; };
+    auto random = [&](size_t n) { std::vector<uint16_t> x(n); for (auto &v : x) v = Round16(normal(rng)); return x; };
     int major = 0;
     Check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0));
-    const bool tensorPreview = major >= 8 && (tokens == 16 || tokens == 32);
+    const bool tensorPreview = !fp16 && major >= 8 && (tokens == 16 || tokens == 32);
     const int rows = batch * tokens, stride = (2 * kh + vh) * 128 + 17;
     auto q = random((size_t)rows * kh * 128), k = random(q.size()), v = random((size_t)rows * vh * 128);
     auto packed = Pack(q, k, v, rows, kh, vh, stride);
@@ -471,7 +478,7 @@ void Preview(int batch, int tokens, int kh, int vh, bool masked) {
         return FastllmCudaCloverPreviewGdn(strided ? base : dq.p, strided ? base + kh * 128 : dk.p,
             strided ? base + kh * 256 : dv.p, (float *)dg.p, (float *)ds.p, (float *)dscale.p,
             (float *)dbias.p, (float *)dhc.p, masked ? (int *)dslots.p : nullptr,
-            masked ? (unsigned char *)dvalid.p : nullptr, out.p, batch, tokens, kh, vh, nullptr, rowStride);
+            masked ? (unsigned char *)dvalid.p : nullptr, out.p, batch, tokens, kh, vh, nullptr, rowStride, nullptr, fp16);
     };
     Require(launch(false, 0), "preview contiguous launch");
     auto expected = out.Get<uint16_t>(v.size());
@@ -496,7 +503,7 @@ void Preview(int batch, int tokens, int kh, int vh, bool masked) {
             }
             for (auto &x : qn) {
                 x = float(x / std::sqrt(qs + 1.e-6));
-                if (tensorPreview) x = Float(BF16(x));
+                if (tensorPreview) x = Float(Round16(x));
             }
             int count = 0; for (int j = 0; j < tokens; ++j) count += !masked || valid[b * tokens + j];
             std::vector<double> weights(tokens + 1);
@@ -512,7 +519,7 @@ void Preview(int batch, int tokens, int kh, int vh, bool masked) {
                 double dot = 0.;
                 for (int d = 0; d < 128; ++d) {
                     double normalized = kn[d] / std::sqrt(ks + 1.e-6);
-                    if (tensorPreview) normalized = Float(BF16(float(normalized)));
+                    if (tensorPreview) normalized = Float(Round16(float(normalized)));
                     dot += double(qn[d]) * normalized;
                 }
                 weights[j] = dot * scale[h]; maximum = std::max(maximum, weights[j]);
@@ -523,11 +530,11 @@ void Preview(int batch, int tokens, int kh, int vh, bool masked) {
             for (int d = 0; d < 128; ++d) {
                 double history = 0., local = 0.;
                 const float *s = state.data() + (((size_t)slot * vh + h) * 128 + d) * 128;
-                for (int j = 0; j < 128; ++j) history += double(qn[j]) * (tensorPreview ? Float(BF16(s[j])) : s[j]);
+                for (int j = 0; j < 128; ++j) history += double(qn[j]) * (tensorPreview ? Float(Round16(s[j])) : s[j]);
                 for (int j = 0; j < tokens; ++j)
-                    local += (tensorPreview ? Float(BF16(float(weights[j]))) : weights[j]) * Float(v[(((size_t)b * tokens + j) * vh + h) * 128 + d]);
+                    local += (tensorPreview ? Float(Round16(float(weights[j]))) : weights[j]) * Float(v[(((size_t)b * tokens + j) * vh + h) * 128 + d]);
                 float reference = float(weights[tokens] * history / std::sqrt(128.) * std::exp(g[row * vh + h]) + local);
-                Close(Float(expected[((size_t)row * vh + h) * 128 + d]), Float(BF16(reference)), .001f, .01f);
+                Close(Float(expected[((size_t)row * vh + h) * 128 + d]), Float(Round16(reference)), .001f, .01f);
             }
         }
     };
@@ -537,8 +544,8 @@ void Preview(int batch, int tokens, int kh, int vh, bool masked) {
     Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
     Require(launch(true, stride), "preview capture launch");
     Check(cudaStreamEndCapture(cudaStreamPerThread, &graph)); Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
-    for (auto &x : q) x = BF16(normal(rng));
-    for (auto &x : v) x = BF16(normal(rng));
+    for (auto &x : q) x = Round16(normal(rng));
+    for (auto &x : v) x = Round16(normal(rng));
     if (masked) { std::fill(valid.begin(), valid.end(), 0); valid[0] = 1; slots[0] = 0; }
     packed = Pack(q, k, v, rows, kh, vh, stride);
     dq.Put(q); dv.Put(v); fused.Put(packed); dslots.Put(slots); dvalid.Put(valid);
@@ -550,7 +557,7 @@ void IndirectCaches(int batch, int tokens) {
     const int kh = 2, vh = 4, channels = (2 * kh + vh) * 128, rows = batch * tokens;
     const size_t hist = channels * 3, stateSize = vh * 128 * 128;
     std::mt19937 rng(1257 + batch * tokens); std::normal_distribution<float> normal(0.f, .2f);
-    auto random = [&](size_t n) { std::vector<uint16_t> x(n); for (auto &v : x) v = BF16(normal(rng)); return x; };
+    auto random = [&](size_t n) { std::vector<uint16_t> x(n); for (auto &v : x) v = Round16(normal(rng)); return x; };
     auto input = random((size_t)rows * channels), weight = random(channels * 4), right = random(channels * 3);
     auto beta = random(rows * vh);
     std::vector<float> g(rows * vh, -.1f), scale(vh, 2.f), bias(vh, -.3f), hc(vh, .2f);
@@ -578,7 +585,7 @@ void IndirectCaches(int batch, int tokens) {
     auto reset = [&]() {
         for (auto *buffers : {&actual, &reference}) for (int b = 0; b < batch; ++b) {
             (*buffers)[4*b]->Put(histories[b]); (*buffers)[4*b+1]->Put(states[b]);
-            (*buffers)[4*b+2]->Put(std::vector<uint16_t>(tokens * hist + 128, BF16(123.f)));
+            (*buffers)[4*b+2]->Put(std::vector<uint16_t>(tokens * hist + 128, Round16(123.f)));
             (*buffers)[4*b+3]->Put(std::vector<float>(tokens * stateSize + 128, 123.f));
         }
     };
@@ -591,28 +598,28 @@ void IndirectCaches(int batch, int tokens) {
                 auto *y = (uint16_t *)refOutput.p + (size_t)b * tokens * vh * 128;
                 auto *in = (uint16_t *)x.p + (size_t)b * tokens * channels;
                 if (preview) {
-                    Require(FastllmCudaCloverPreviewConv(in, h, w.p, rw.p, nullptr, nullptr, mx, 1, tokens, channels), "serial preview conv");
+                    Require(FastllmCudaCloverPreviewConv(in, h, w.p, rw.p, nullptr, nullptr, mx, 1, tokens, channels, nullptr, nullptr, fp16), "serial preview conv");
                     Require(FastllmCudaCloverPreviewGdn(mx, mx+kh*128, mx+kh*256, (float *)dg.p+b*tokens*vh,
-                        s, (float *)ds.p, (float *)dh.p, (float *)dc.p, nullptr, nullptr, y, 1, tokens, kh, vh, nullptr, channels), "serial preview GDN");
+                        s, (float *)ds.p, (float *)dh.p, (float *)dc.p, nullptr, nullptr, y, 1, tokens, kh, vh, nullptr, channels, nullptr, fp16), "serial preview GDN");
                 } else {
-                    Require(FastllmCudaCloverCausalConv(in, h, w.p, mx, (uint16_t *)reference[4*b+2]->p+64, 1, tokens, channels), "serial causal conv");
+                    Require(FastllmCudaCloverCausalConv(in, h, w.p, mx, (uint16_t *)reference[4*b+2]->p+64, 1, tokens, channels, nullptr, nullptr, fp16), "serial causal conv");
                     Require(FastllmCudaCloverCausalGdn(mx, mx+kh*128, mx+kh*256, (float *)dg.p+b*tokens*vh,
                         (uint16_t *)db.p+b*tokens*vh, s, y, (float *)reference[4*b+3]->p+64, 1, tokens, kh, vh,
-                        nullptr, (float *)workspace.p, channels), "serial causal GDN");
+                        nullptr, (float *)workspace.p, channels, nullptr, fp16), "serial causal GDN");
                 }
             }
         };
         auto launch = [&]() {
             auto *mx = (uint16_t *)mixed.p;
             if (preview) {
-                Require(FastllmCudaCloverPreviewConv(x.p, nullptr, w.p, rw.p, nullptr, nullptr, mx, batch, tokens, channels, nullptr, &caches), "indirect preview conv");
+                Require(FastllmCudaCloverPreviewConv(x.p, nullptr, w.p, rw.p, nullptr, nullptr, mx, batch, tokens, channels, nullptr, &caches, fp16), "indirect preview conv");
                 Require(FastllmCudaCloverPreviewGdn(mx, mx+kh*128, mx+kh*256, (float *)dg.p, nullptr,
                     (float *)ds.p, (float *)dh.p, (float *)dc.p, nullptr, nullptr, output.p, batch, tokens, kh, vh,
-                    nullptr, channels, &caches), "indirect preview GDN");
+                    nullptr, channels, &caches, fp16), "indirect preview GDN");
             } else {
-                Require(FastllmCudaCloverCausalConv(x.p, nullptr, w.p, mx, nullptr, batch, tokens, channels, nullptr, &caches), "indirect causal conv");
+                Require(FastllmCudaCloverCausalConv(x.p, nullptr, w.p, mx, nullptr, batch, tokens, channels, nullptr, &caches, fp16), "indirect causal conv");
                 Require(FastllmCudaCloverCausalGdn(mx, mx+kh*128, mx+kh*256, (float *)dg.p, db.p, nullptr,
-                    output.p, nullptr, batch, tokens, kh, vh, nullptr, (float *)workspace.p, channels, &caches), "indirect causal GDN");
+                    output.p, nullptr, batch, tokens, kh, vh, nullptr, (float *)workspace.p, channels, &caches, fp16), "indirect causal GDN");
             }
         };
         auto check = [&]() {
@@ -634,11 +641,42 @@ void IndirectCaches(int batch, int tokens) {
     }
 }
 
+void Attention(int tokens, int cached, bool preview) {
+    constexpr int heads = 4, kvHeads = 2, width = 256;
+    std::mt19937 rng(72 + tokens + cached); std::normal_distribution<float> normal(0.f, .4f);
+    std::vector<uint16_t> q(tokens * heads * width), k((tokens + cached) * kvHeads * width), v(k.size());
+    for (auto *a : {&q, &k, &v}) for (auto &x : *a) x = Round16(normal(rng));
+    Buffer dq(q.size() * 2), dk(k.size() * 2), dv(v.size() * 2), out(q.size() * 2);
+    dq.Put(q); dk.Put(k); dv.Put(v);
+    Require(FastllmCudaCloverAttention(dq.p, dk.p, dv.p, out.p, tokens, cached,
+        heads, kvHeads, preview, nullptr, nullptr, fp16), "attention launch");
+    auto actual = out.Get<uint16_t>(q.size());
+    for (int row = 0; row < tokens; ++row) for (int h = 0; h < heads; ++h) {
+        int count = cached + (preview ? tokens : row + 1), kh = h / (heads / kvHeads);
+        std::vector<double> logits(count); double maximum = -1.e100, sum = 0;
+        for (int j = 0; j < count; ++j) {
+            double value = 0;
+            for (int d = 0; d < width; ++d)
+                value += double(Float(q[(row * heads + h) * width + d])) * Float(k[(j * kvHeads + kh) * width + d]);
+            logits[j] = value / 16; maximum = std::max(maximum, logits[j]);
+        }
+        for (auto &x : logits) { x = std::exp(x - maximum); sum += x; }
+        for (int d = 0; d < width; ++d) {
+            double value = 0;
+            for (int j = 0; j < count; ++j) value += logits[j] * Float(v[(j * kvHeads + kh) * width + d]);
+            Close(Float(actual[(row * heads + h) * width + d]), float(value / sum), fp16 ? .0003f : .002f, .01f);
+        }
+    }
 }
-int main() {
+
+}
+int main(int argc, char **argv) {
+    fp16 = argc > 1 && std::string(argv[1]) == "fp16";
     try {
         int count = 0; if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
         Check(cudaSetDevice(0));
+        for (int tokens : {1, 16, 65}) for (int cached : {0, 137, 513})
+            for (bool preview : {false, true}) Attention(tokens, cached, preview);
         for (int batch : {2, 3, 8}) for (int tokens : {1, 16, 32}) IndirectCaches(batch, tokens);
         for (int tokens : {1, 2, 3, 127, 128, 129}) Convolution(2, tokens, 2048);
         Convolution(2, 129, 2051);
@@ -653,9 +691,11 @@ int main() {
         Require(!FastllmCudaCloverPrefillGdnWorkspaceBytes(1, 0, 2, 4) &&
             !FastllmCudaCloverPrefillGdnWorkspaceBytes(1, 64, 3, 4) &&
             !FastllmCudaCloverPrefillGdnWorkspaceBytes(65535, 65535, 16, 32), "invalid prefill geometry accepted");
+        if (!fp16) {
         for (int tokens : {1, 63, 64, 65, 129, 1025}) BlockPrefill(2, tokens, 2, 4, tokens == 129);
         BlockPrefill(1, 4096, 16, 32, false);
         BlockPrefill(1, 4096, 16, 32, true);
+        }
         for (int width : {128, 256}) for (int rows : {31, 512, 1023, 1024, 1025, 4099})
             for (bool gated : {false, true}) for (bool centered : {false, true})
                 Normalization(rows, width, gated, centered);

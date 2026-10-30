@@ -88,7 +88,12 @@ template<bool Gate, int K> constexpr int CloverTmaExpertSharedBytes() {
     return 2 * (16 + 64 * (Gate ? 2 : 1)) * K * sizeof(__nv_bfloat16);
 }
 template<bool Gate, int K = 64>
-__global__ void CloverTmaExpertGemm(const __grid_constant__ CloverExpertMaps maps,
+__global__ void CloverTmaExpertGemm(
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+        const __grid_constant__ CloverExpertMaps maps,
+#else
+        const CloverExpertMaps maps,
+#endif
         const float *scores, const int *workspace, __nv_bfloat16 *output,
         __nv_bfloat16 *packedMiddle, int rows, int hidden, int intermediate, int experts) {
 #if __CUDA_ARCH__ >= 900
@@ -285,11 +290,11 @@ bool CloverExpertsTma(const void *input, const void *gateUp, const void *down, c
     }
 #endif
     if (shared)
-        CloverSumExperts<true>((const __nv_bfloat16 *)parts, indices, (__nv_bfloat16 *)output, rows, hidden,
+        CloverSumExperts<__nv_bfloat16, true>((const __nv_bfloat16 *)parts, indices, (__nv_bfloat16 *)output, rows, hidden,
                                topk, stream, (const __nv_bfloat16 *)shared,
                                (const __nv_bfloat16 *)sharedGate, sharedGateStride);
     else
-        CloverSumExperts<false>((const __nv_bfloat16 *)parts, indices, (__nv_bfloat16 *)output, rows, hidden,
+        CloverSumExperts<__nv_bfloat16, false>((const __nv_bfloat16 *)parts, indices, (__nv_bfloat16 *)output, rows, hidden,
                                 topk, stream, nullptr, nullptr, 1);
     return true;
 }

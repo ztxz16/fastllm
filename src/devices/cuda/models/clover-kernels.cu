@@ -3,14 +3,29 @@
 // Native CUDA implementation; no Transformers, Triton or SGLang runtime needed.
 #include "devices/cuda/fastllm-clover.h"
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <cstddef>
 #include <cstdint>
 #include <mma.h>
 #include <type_traits>
+#include <algorithm>
 
 namespace {
+template<typename T> __device__ T CloverCast(float x);
+template<> __device__ __nv_bfloat16 CloverCast<__nv_bfloat16>(float x) { return __float2bfloat16(x); }
+template<> __device__ __half CloverCast<__half>(float x) { return __float2half_rn(x); }
+__device__ float CloverFloat(__nv_bfloat16 x) { return __bfloat162float(x); }
+__device__ float CloverFloat(__half x) { return __half2float(x); }
+template<typename T> using CloverPair = std::conditional_t<std::is_same_v<T, __half>, __half2, __nv_bfloat162>;
+template<typename T> __device__ CloverPair<T> CloverCast2(float x, float y) {
+    if constexpr (std::is_same_v<T, __half>) return __floats2half2_rn(x, y);
+    else return __floats2bfloat162_rn(x, y);
+}
+__device__ float2 CloverFloat2(__half2 x) { return __half22float2(x); }
+__device__ float2 CloverFloat2(__nv_bfloat162 x) { return __bfloat1622float2(x); }
+
 // PDL hides launch/prologue latency without changing the dependency or
 // arithmetic order. Every thread waits before reading predecessor outputs;
 // all CTAs trigger before any early return. Ordinary stream launches and
@@ -67,11 +82,11 @@ __device__ __forceinline__ float WarpSum(float x) {
     return __shfl_sync(0xffffffff, x, 0);
 }
 
-template<bool Indirect>
-__global__ void CloverPreviewConv(const __nv_bfloat16 *input,
-        const __nv_bfloat16 *history, const __nv_bfloat16 *weight,
-        const __nv_bfloat16 *rightWeight, const int *slots,
-        const unsigned char *valid, __nv_bfloat16 *output, int tokens, int channels, CloverCudaGdnCaches caches) {
+template<typename T, bool Indirect>
+__global__ void CloverPreviewConv(const T *input,
+        const T *history, const T *weight,
+        const T *rightWeight, const int *slots,
+        const unsigned char *valid, T *output, int tokens, int channels, CloverCudaGdnCaches caches) {
     CloverDependencyStart();
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= channels) return;
@@ -79,39 +94,39 @@ __global__ void CloverPreviewConv(const __nv_bfloat16 *input,
     const size_t row = (size_t)request * tokens + token;
     const int slot = slots ? slots[request] : request;
     if (slot < 0 || (valid && !valid[row])) {
-        output[row * channels + channel] = __float2bfloat16(0.f);
+        output[row * channels + channel] = CloverCast<T>(0.f);
         return;
     }
-    if constexpr (Indirect) history = (const __nv_bfloat16 *)caches.conv[slot];
+    if constexpr (Indirect) history = (const T *)caches.conv[slot];
     const int cacheSlot = Indirect ? 0 : slot;
     float sum = 0.f;
     for (int tap = 0; tap < 4; ++tap) {
         const int source = token + tap - 3;
         float x = 0.f;
         if (source < 0)
-            x = __bfloat162float(history[((size_t)cacheSlot * channels + channel) * 3 + source + 3]);
+            x = CloverFloat(history[((size_t)cacheSlot * channels + channel) * 3 + source + 3]);
         else if (!valid || valid[(size_t)request * tokens + source])
-            x = __bfloat162float(input[((size_t)request * tokens + source) * channels + channel]);
-        sum += x * __bfloat162float(weight[channel * 4 + tap]);
+            x = CloverFloat(input[((size_t)request * tokens + source) * channels + channel]);
+        sum += x * CloverFloat(weight[channel * 4 + tap]);
     }
     for (int distance = 1; distance < 4; ++distance) {
         const int source = token + distance;
         if (source < tokens && (!valid || valid[(size_t)request * tokens + source]))
-            sum += __bfloat162float(input[((size_t)request * tokens + source) * channels + channel]) *
-                   __bfloat162float(rightWeight[channel * 3 + distance - 1]);
+            sum += CloverFloat(input[((size_t)request * tokens + source) * channels + channel]) *
+                   CloverFloat(rightWeight[channel * 3 + distance - 1]);
     }
-    output[row * channels + channel] = __float2bfloat16(sum / (1.f + expf(-sum)));
+    output[row * channels + channel] = CloverCast<T>(sum / (1.f + expf(-sum)));
 }
 
 // A CTA evaluates several queries against the same head. Key normalization,
 // value loads and state loads are shared; each query keeps the original FP32
 // accumulation order and BF16 output boundary.
-template<int FixedTokens, int Queries, bool Indirect>
-__global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
-        const __nv_bfloat16 *key, const __nv_bfloat16 *value, const float *g,
+template<typename T, int FixedTokens, int Queries, bool Indirect>
+__global__ void CloverPreviewGdn(const T *query,
+        const T *key, const T *value, const float *g,
         const float *state, const float *logitScale, const float *historyBias,
         const float *historyScale, const int *slots, const unsigned char *valid,
-        __nv_bfloat16 *output, int runtimeTokens, int keyHeads, int valueHeads, int qkStride, int vStride, CloverCudaGdnCaches caches) {
+        T *output, int runtimeTokens, int keyHeads, int valueHeads, int qkStride, int vStride, CloverCudaGdnCaches caches) {
     CloverDependencyStart();
     constexpr int dim = 128, Capacity = FixedTokens ? FixedTokens : 32;
     const int tokens = FixedTokens ? FixedTokens : runtimeTokens;
@@ -122,7 +137,7 @@ __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
     if (slot < 0) {
 #pragma unroll
         for (int qi = 0; qi < Queries; ++qi)
-            output[(((size_t)request * tokens + first + qi) * valueHeads + head) * dim + d] = __float2bfloat16(0.f);
+            output[(((size_t)request * tokens + first + qi) * valueHeads + head) * dim + d] = CloverCast<T>(0.f);
         return;
     }
     if constexpr (Indirect) state = caches.state[slot];
@@ -133,7 +148,7 @@ __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
 #pragma unroll
     for (int qi = 0; qi < Queries; ++qi) {
         const size_t row = (size_t)request * tokens + first + qi;
-        qv[qi] = !valid || valid[row] ? __bfloat162float(query[row * qkStride + keyHead * dim + d]) : 0.f;
+        qv[qi] = !valid || valid[row] ? CloverFloat(query[row * qkStride + keyHead * dim + d]) : 0.f;
         float sum = WarpSum(qv[qi] * qv[qi]);
         if (lane == 0) partial[qi][warp] = sum;
     }
@@ -147,7 +162,7 @@ __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
         const size_t offset = ((size_t)request * tokens + t) * qkStride + keyHead * dim;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            v[i] = __bfloat162float(key[offset + lane + i * 32]);
+            v[i] = CloverFloat(key[offset + lane + i * 32]);
             sum += v[i] * v[i];
         }
         const float inv = rsqrtf(WarpSum(sum) + 1.e-6f);
@@ -217,7 +232,7 @@ __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
     float locals[Queries] = {};
 #pragma unroll
     for (int t = 0; t < tokens; ++t) {
-        const float v = __bfloat162float(value[((size_t)request * tokens + t) * vStride + head * dim + d]);
+        const float v = CloverFloat(value[((size_t)request * tokens + t) * vStride + head * dim + d]);
 #pragma unroll
         for (int qi = 0; qi < Queries; ++qi) locals[qi] += weights[qi][t] * v;
     }
@@ -226,7 +241,7 @@ __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
         const size_t row = (size_t)request * tokens + first + qi;
         const float result = historyWeight[qi] * histories[qi][d] * (1.f / sqrtf(128.f)) *
             expf(g[row * valueHeads + head]) + locals[qi];
-        output[(row * valueHeads + head) * dim + d] = __float2bfloat16(!valid || valid[row] ? result : 0.f);
+        output[(row * valueHeads + head) * dim + d] = CloverCast<T>(!valid || valid[row] ? result : 0.f);
     }
 }
 
@@ -244,32 +259,32 @@ bool ValidBlock(int batch, int tokens) {
     return batch > 0 && batch <= 65535 && tokens > 0 && tokens <= 32 && 32 % tokens == 0;
 }
 
-template<bool Indirect>
-__global__ void CloverCausalConv(const __nv_bfloat16 *input,
-        const __nv_bfloat16 *history, const __nv_bfloat16 *weight,
-        __nv_bfloat16 *output, __nv_bfloat16 *snapshots, int batch, int tokens, int channels, CloverCudaGdnCaches caches) {
+template<typename T, bool Indirect>
+__global__ void CloverCausalConv(const T *input,
+        const T *history, const T *weight,
+        T *output, T *snapshots, int batch, int tokens, int channels, CloverCudaGdnCaches caches) {
     CloverDependencyStart();
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= channels) return;
     const int request = blockIdx.z, token = blockIdx.y;
     if constexpr (Indirect) {
-        history = (const __nv_bfloat16 *)caches.conv[request];
-        snapshots = (__nv_bfloat16 *)caches.convSnapshots[request];
+        history = (const T *)caches.conv[request];
+        snapshots = (T *)caches.convSnapshots[request];
     }
     const int cacheSlot = Indirect ? 0 : request, cacheBatch = Indirect ? 1 : batch;
     float sum = 0.f;
     for (int tap = 0; tap < 4; ++tap) {
         const int source = token + tap - 3;
-        const __nv_bfloat16 x = source < 0
+        const T x = source < 0
             ? history[((size_t)cacheSlot * channels + channel) * 3 + source + 3]
             : input[((size_t)request * tokens + source) * channels + channel];
         // The official causal convolution rounds each product to input dtype
         // before its FP32 accumulation. Preview intentionally uses FP32 products.
-        sum += __bfloat162float(__float2bfloat16(__bfloat162float(x) *
-                                               __bfloat162float(weight[channel * 4 + tap])));
+        sum += CloverFloat(CloverCast<T>(CloverFloat(x) *
+                                               CloverFloat(weight[channel * 4 + tap])));
     }
     output[((size_t)request * tokens + token) * channels + channel] =
-        __float2bfloat16(sum / (1.f + expf(-sum)));
+        CloverCast<T>(sum / (1.f + expf(-sum)));
     if (snapshots) {
         for (int tap = 0; tap < 3; ++tap) {
             const int source = token + tap - 2;
@@ -282,15 +297,16 @@ __global__ void CloverCausalConv(const __nv_bfloat16 *input,
 
 // Reuse each input and weight across eight adjacent outputs. Each thread
 // retains three BF16 samples; multiplication rounding and tap order match
-// CloverCausalConv. A separate commit keeps old history readable by all CTAs.
-__global__ void CloverTiledCausalConv(const __nv_bfloat16 *input, const __nv_bfloat16 *history,
-        const __nv_bfloat16 *weight, __nv_bfloat16 *output, int tokens, int channels) {
+// CloverCausalConv<T>. A separate commit keeps old history readable by all CTAs.
+template<typename T>
+__global__ void CloverTiledCausalConv(const T *input, const T *history,
+        const T *weight, T *output, int tokens, int channels) {
     CloverDependencyStart();
     constexpr int Tile = 8;
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     int batch = blockIdx.z, base = blockIdx.y * Tile;
-    __nv_bfloat16 x[4], w[4];
+    T x[4], w[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) w[j] = weight[c * 4 + j];
 #pragma unroll
@@ -306,23 +322,23 @@ __global__ void CloverTiledCausalConv(const __nv_bfloat16 *input, const __nv_bfl
         float sum = 0.f;
 #pragma unroll
         for (int j = 0; j < 4; ++j)
-            sum += __bfloat162float(__float2bfloat16(__bfloat162float(x[j]) * __bfloat162float(w[j])));
+            sum += CloverFloat(CloverCast<T>(CloverFloat(x[j]) * CloverFloat(w[j])));
         output[((size_t)batch * tokens + base + t) * channels + c] =
-            __float2bfloat16(sum / (1.f + expf(-sum)));
+            CloverCast<T>(sum / (1.f + expf(-sum)));
         x[0] = x[1]; x[1] = x[2]; x[2] = x[3];
     }
 }
 
-template<bool Indirect>
-__global__ void CloverCommitConv(const __nv_bfloat16 *input, __nv_bfloat16 *history,
+template<typename T, bool Indirect>
+__global__ void CloverCommitConv(const T *input, T *history,
         int tokens, int channels, CloverCudaGdnCaches caches) {
     CloverDependencyStart();
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= channels) return;
     const int request = blockIdx.y;
-    if constexpr (Indirect) history = (__nv_bfloat16 *)caches.conv[request];
+    if constexpr (Indirect) history = (T *)caches.conv[request];
     const int cacheSlot = Indirect ? 0 : request;
-    __nv_bfloat16 tail[3];
+    T tail[3];
     for (int tap = 0; tap < 3; ++tap) {
         const int source = tokens + tap - 3;
         tail[tap] = source < 0
@@ -333,7 +349,8 @@ __global__ void CloverCommitConv(const __nv_bfloat16 *input, __nv_bfloat16 *hist
         history[((size_t)cacheSlot * channels + channel) * 3 + tap] = tail[tap];
 }
 
-__global__ void CloverPrepareCausalGdn(const __nv_bfloat16 *query, const __nv_bfloat16 *key,
+template<typename T>
+__global__ void CloverPrepareCausalGdn(const T *query, const T *key,
         const float *g, float *qout, float *kout, float *decay,
         int tokens, int keyHeads, int valueHeads, int qkStride) {
     CloverDependencyStart();
@@ -343,8 +360,8 @@ __global__ void CloverPrepareCausalGdn(const __nv_bfloat16 *query, const __nv_bf
     size_t inputOffset = row * qkStride + head * 128;
     float q[4], k[4], qs = 0.f, ks = 0.f;
     for (int j = 0; j < 4; ++j) {
-        q[j] = __bfloat162float(query[inputOffset + lane + j * 32]);
-        k[j] = __bfloat162float(key[inputOffset + lane + j * 32]);
+        q[j] = CloverFloat(query[inputOffset + lane + j * 32]);
+        k[j] = CloverFloat(key[inputOffset + lane + j * 32]);
         qs += q[j] * q[j]; ks += k[j] * k[j];
     }
     float qinv = rsqrtf(WarpSum(qs) + 1.e-6f) / sqrtf(128.f);
@@ -357,10 +374,10 @@ __global__ void CloverPrepareCausalGdn(const __nv_bfloat16 *query, const __nv_bf
     for (int i = lane; i < ratio; i += 32)
         decay[row * valueHeads + head * ratio + i] = expf(g[row * valueHeads + head * ratio + i]);
 }
-template<bool Prepared, bool Indirect>
-__global__ void CloverCausalGdn(const __nv_bfloat16 *query, const __nv_bfloat16 *key,
-        const __nv_bfloat16 *value, const float *g, const __nv_bfloat16 *beta,
-        float *state, __nv_bfloat16 *output, float *snapshots,
+template<typename T, bool Prepared, bool Indirect>
+__global__ void CloverCausalGdn(const T *query, const T *key,
+        const T *value, const float *g, const T *beta,
+        float *state, T *output, float *snapshots,
         int batch, int tokens, int keyHeads, int valueHeads, const float *prepared, int qkStride, int vStride, CloverCudaGdnCaches caches) {
     CloverDependencyStart();
     const int lane = threadIdx.x % 32, valueIndex = blockIdx.x * 8 + threadIdx.x / 32;
@@ -385,8 +402,8 @@ __global__ void CloverCausalGdn(const __nv_bfloat16 *query, const __nv_bfloat16 
                 q[j] = prepared[qkOffset + lane + j * 32];
                 k[j] = prepared[qkCount + qkOffset + lane + j * 32];
             } else {
-                q[j] = __bfloat162float(query[inputOffset + lane + j * 32]);
-                k[j] = __bfloat162float(key[inputOffset + lane + j * 32]);
+                q[j] = CloverFloat(query[inputOffset + lane + j * 32]);
+                k[j] = CloverFloat(key[inputOffset + lane + j * 32]);
                 qs += q[j] * q[j]; ks += k[j] * k[j];
             }
         }
@@ -400,8 +417,8 @@ __global__ void CloverCausalGdn(const __nv_bfloat16 *query, const __nv_bfloat16 
             s[j] *= decay;
             remembered += s[j] * k[j];
         }
-        const float delta = (__bfloat162float(value[row * vStride + head * 128 + valueIndex]) -
-                             WarpSum(remembered)) * __bfloat162float(beta[row * valueHeads + head]);
+        const float delta = (CloverFloat(value[row * vStride + head * 128 + valueIndex]) -
+                             WarpSum(remembered)) * CloverFloat(beta[row * valueHeads + head]);
         float y = 0.f;
         for (int j = 0; j < 4; ++j) {
             s[j] += k[j] * delta;
@@ -410,7 +427,7 @@ __global__ void CloverCausalGdn(const __nv_bfloat16 *query, const __nv_bfloat16 
                 snapshots[(size_t)token * cacheBatch * valueHeads * 128 * 128 + stateOffset + lane + j * 32] = s[j];
         }
         y = WarpSum(y);
-        if (lane == 0) output[(row * valueHeads + head) * 128 + valueIndex] = __float2bfloat16(y);
+        if (lane == 0) output[(row * valueHeads + head) * 128 + valueIndex] = CloverCast<T>(y);
     }
     for (int j = 0; j < 4; ++j) state[stateOffset + lane + j * 32] = s[j];
 }
@@ -418,8 +435,9 @@ __global__ void CloverCausalGdn(const __nv_bfloat16 *query, const __nv_bfloat16 
 // Eight lanes own each row, retaining the original four-term partial sums.
 // The first two levels of the old 32-lane reduction move into registers;
 // the remaining shuffle tree and the FP32 state recurrence are unchanged.
-__global__ void CloverPrefillGdn(const float *prepared, const __nv_bfloat16 *value,
-        const __nv_bfloat16 *beta, float *state, __nv_bfloat16 *output,
+template<typename T>
+__global__ void CloverPrefillGdn(const float *prepared, const T *value,
+        const T *beta, float *state, T *output,
         int batch, int tokens, int keyHeads, int valueHeads, int vStride) {
     CloverDependencyStart();
     constexpr int Group = 8, Threads = 128, Tile = 32, Values = Threads / Group, Parts = 32 / Group;
@@ -444,12 +462,12 @@ __global__ void CloverPrefillGdn(const float *prepared, const __nv_bfloat16 *val
         for (int i = threadIdx.x; i < Tile * Values; i += Threads) {
             int token = base + i / Values, d = blockIdx.x * Values + i % Values;
             if (token < tokens)
-                vtile[i] = __bfloat162float(value[((size_t)request * tokens + token) * vStride + head * 128 + d]);
+                vtile[i] = CloverFloat(value[((size_t)request * tokens + token) * vStride + head * 128 + d]);
         }
         if (threadIdx.x < Tile && base + threadIdx.x < tokens) {
             size_t pos = ((size_t)request * tokens + base + threadIdx.x) * valueHeads + head;
             decays[threadIdx.x] = prepared[2 * qkCount + pos];
-            rates[threadIdx.x] = __bfloat162float(beta[pos]);
+            rates[threadIdx.x] = CloverFloat(beta[pos]);
         }
         __syncthreads();
         for (int t = 0; t < Tile && base + t < tokens; ++t) {
@@ -490,7 +508,7 @@ __global__ void CloverPrefillGdn(const float *prepared, const __nv_bfloat16 *val
                 result += __shfl_down_sync(0xffffffff, result, step, Group);
             if (lane == 0)
                 output[(((size_t)request * tokens + base + t) * valueHeads + head) * 128 + valueIndex] =
-                    __float2bfloat16(result);
+                    CloverCast<T>(result);
         }
         __syncthreads();
     }
@@ -503,23 +521,25 @@ cudaStream_t Stream(void *stream) {
 }
 } // namespace
 
-bool FastllmCudaCloverPreviewConv(const void *input, const void *history, const void *weight,
+template<typename T>
+bool FastllmCudaCloverPreviewConvImpl(const void *input, const void *history, const void *weight,
                                   const void *rightWeight, const int *slots, const unsigned char *valid,
                                   void *output, int batch, int tokens, int channels, void *stream, const CloverCudaGdnCaches *caches) {
     if (!input || (!history && !caches) || !weight || !rightWeight || !output || !ValidBlock(batch, tokens) ||
         channels <= 0 || !ValidCaches(caches, batch, true))
         return false;
     auto launch = [&](auto indirect) {
-        return CloverLaunch<CloverPreviewConv<decltype(indirect)::value>>(
+        return CloverLaunch<CloverPreviewConv<T, decltype(indirect)::value>>(
             dim3((channels + 255) / 256, tokens, batch), 256, 0, Stream(stream),
-            static_cast<const __nv_bfloat16 *>(input), static_cast<const __nv_bfloat16 *>(history),
-            static_cast<const __nv_bfloat16 *>(weight), static_cast<const __nv_bfloat16 *>(rightWeight), slots,
-            valid, static_cast<__nv_bfloat16 *>(output), tokens, channels, caches ? *caches : CloverCudaGdnCaches{});
+            static_cast<const T *>(input), static_cast<const T *>(history),
+            static_cast<const T *>(weight), static_cast<const T *>(rightWeight), slots,
+            valid, static_cast<T *>(output), tokens, channels, caches ? *caches : CloverCudaGdnCaches{});
     };
     return caches ? launch(std::true_type{}) : launch(std::false_type{});
 }
 
-bool FastllmCudaCloverPreviewGdn(const void *query, const void *key, const void *value, const float *g,
+template<typename T>
+bool FastllmCudaCloverPreviewGdnImpl(const void *query, const void *key, const void *value, const float *g,
                                  const float *state, const float *logitScale, const float *historyBias,
                                  const float *historyScale, const int *slots, const unsigned char *valid,
                                  void *output, int batch, int tokens, int keyHeads, int valueHeads,
@@ -528,12 +548,13 @@ bool FastllmCudaCloverPreviewGdn(const void *query, const void *key, const void 
         !ValidBlock(batch, tokens) || !ValidCaches(caches, batch, false) || keyHeads <= 0 || valueHeads <= 0 || valueHeads > 65535 ||
         valueHeads % keyHeads || qkvRowStride < 0 || (qkvRowStride && qkvRowStride < valueHeads * 128))
         return false;
+    if constexpr (std::is_same_v<T, __nv_bfloat16>)
     if ((tokens == 16 || tokens == 32) && CloverPreviewMmaAvailable()) {
         auto launch = [&](auto width, auto indirect) {
             return CloverLaunch<CloverPreviewGdnMma<decltype(width)::value, decltype(indirect)::value>>(
                 dim3(tokens / 16, valueHeads, batch), 256, 0, Stream(stream),
-                (const __nv_bfloat16 *)query, (const __nv_bfloat16 *)key, (const __nv_bfloat16 *)value,
-                g, state, logitScale, historyBias, historyScale, slots, valid, (__nv_bfloat16 *)output,
+                (const T *)query, (const T *)key, (const T *)value,
+                g, state, logitScale, historyBias, historyScale, slots, valid, (T *)output,
                 keyHeads, valueHeads, qkvRowStride ? qkvRowStride : keyHeads * 128,
                 qkvRowStride ? qkvRowStride : valueHeads * 128, caches ? *caches : CloverCudaGdnCaches{});
         };
@@ -545,10 +566,10 @@ bool FastllmCudaCloverPreviewGdn(const void *query, const void *key, const void 
     auto dispatch = [&](auto indirect) {
         auto launch = [&](auto width, auto count) {
             constexpr int queries = decltype(count)::value;
-            return CloverLaunch<CloverPreviewGdn<decltype(width)::value, queries, decltype(indirect)::value>>(
+            return CloverLaunch<CloverPreviewGdn<T, decltype(width)::value, queries, decltype(indirect)::value>>(
                 dim3(tokens / queries, valueHeads, batch), 128, 0, Stream(stream),
-                (const __nv_bfloat16 *)query, (const __nv_bfloat16 *)key, (const __nv_bfloat16 *)value,
-                g, state, logitScale, historyBias, historyScale, slots, valid, (__nv_bfloat16 *)output,
+                (const T *)query, (const T *)key, (const T *)value,
+                g, state, logitScale, historyBias, historyScale, slots, valid, (T *)output,
                 tokens, keyHeads, valueHeads, qkvRowStride ? qkvRowStride : keyHeads * 128,
                 qkvRowStride ? qkvRowStride : valueHeads * 128, caches ? *caches : CloverCudaGdnCaches{});
         };
@@ -570,30 +591,31 @@ bool FastllmCudaCloverPreviewGdn(const void *query, const void *key, const void 
     return caches ? dispatch(std::true_type{}) : dispatch(std::false_type{});
 }
 
-bool FastllmCudaCloverCausalConv(const void *input, void *history, const void *weight, void *output,
+template<typename T>
+bool FastllmCudaCloverCausalConvImpl(const void *input, void *history, const void *weight, void *output,
                                  void *snapshots, int batch, int tokens, int channels, void *stream, const CloverCudaGdnCaches *caches) {
     if (!input || (!history && !caches) || !weight || !output || batch <= 0 || batch > 65535 || tokens <= 0 ||
         tokens > 65535 || channels <= 0 || !ValidCaches(caches, batch, true))
         return false;
     auto dispatch = [&](auto indirect) {
         if (!caches && !snapshots && tokens >= 128 && channels >= 2048) {
-            if (!CloverLaunch<CloverTiledCausalConv>(dim3((channels + 255) / 256, (tokens + 7) / 8, batch), 256,
-                                                     0, Stream(stream), static_cast<const __nv_bfloat16 *>(input),
-                                                     static_cast<const __nv_bfloat16 *>(history),
-                                                     static_cast<const __nv_bfloat16 *>(weight),
-                                                     static_cast<__nv_bfloat16 *>(output), tokens, channels))
+            if (!CloverLaunch<CloverTiledCausalConv<T>>(dim3((channels + 255) / 256, (tokens + 7) / 8, batch), 256,
+                                                     0, Stream(stream), static_cast<const T *>(input),
+                                                     static_cast<const T *>(history),
+                                                     static_cast<const T *>(weight),
+                                                     static_cast<T *>(output), tokens, channels))
                 return false;
         } else {
-            if (!CloverLaunch<CloverCausalConv<decltype(indirect)::value>>(
+            if (!CloverLaunch<CloverCausalConv<T, decltype(indirect)::value>>(
                     dim3((channels + 255) / 256, tokens, batch), 256, 0, Stream(stream),
-                    static_cast<const __nv_bfloat16 *>(input), static_cast<const __nv_bfloat16 *>(history),
-                    static_cast<const __nv_bfloat16 *>(weight), static_cast<__nv_bfloat16 *>(output),
-                    static_cast<__nv_bfloat16 *>(snapshots), batch, tokens, channels, caches ? *caches : CloverCudaGdnCaches{}))
+                    static_cast<const T *>(input), static_cast<const T *>(history),
+                    static_cast<const T *>(weight), static_cast<T *>(output),
+                    static_cast<T *>(snapshots), batch, tokens, channels, caches ? *caches : CloverCudaGdnCaches{}))
                 return false;
         }
-        return CloverLaunch<CloverCommitConv<decltype(indirect)::value>>(dim3((channels + 255) / 256, batch), 256, 0, Stream(stream),
-                                              static_cast<const __nv_bfloat16 *>(input),
-                                              static_cast<__nv_bfloat16 *>(history), tokens, channels, caches ? *caches : CloverCudaGdnCaches{});
+        return CloverLaunch<CloverCommitConv<T, decltype(indirect)::value>>(dim3((channels + 255) / 256, batch), 256, 0, Stream(stream),
+                                              static_cast<const T *>(input),
+                                              static_cast<T *>(history), tokens, channels, caches ? *caches : CloverCudaGdnCaches{});
     };
     return caches ? dispatch(std::true_type{}) : dispatch(std::false_type{});
 }
@@ -613,7 +635,8 @@ bool FastllmCudaCloverPrefillGdn(const void *query, const void *key, const void 
         batch, tokens, keyHeads, valueHeads, qkvRowStride, workspace, workspaceBytes, stream);
 }
 
-bool FastllmCudaCloverCausalGdn(const void *query, const void *key, const void *value, const float *g,
+template<typename T>
+bool FastllmCudaCloverCausalGdnImpl(const void *query, const void *key, const void *value, const float *g,
                                 const void *beta, float *state, void *output, float *snapshots, int batch,
                                 int tokens, int keyHeads, int valueHeads, void *stream, float *workspace,
                                 int qkvRowStride, const CloverCudaGdnCaches *caches) {
@@ -626,31 +649,31 @@ bool FastllmCudaCloverCausalGdn(const void *query, const void *key, const void *
     auto dispatch = [&](auto indirect) {
         if (workspace && tokens >= 16 && tokens <= 65535) {
             size_t qk = (size_t)batch * tokens * keyHeads * 128;
-            if (!CloverLaunch<CloverPrepareCausalGdn>(dim3(keyHeads, tokens, batch), 32, 0, Stream(stream),
-                                                      (const __nv_bfloat16 *)query, (const __nv_bfloat16 *)key, g,
+            if (!CloverLaunch<CloverPrepareCausalGdn<T>>(dim3(keyHeads, tokens, batch), 32, 0, Stream(stream),
+                                                      (const T *)query, (const T *)key, g,
                                                       workspace, workspace + qk, workspace + 2 * qk, tokens,
                                                       keyHeads, valueHeads, qkStride))
                 return false;
             if (!caches && !snapshots && tokens >= 128 && valueHeads >= 16) {
-                if (!CloverLaunch<CloverPrefillGdn>(dim3(8, valueHeads, batch), 128, 0, Stream(stream), workspace,
-                                                    (const __nv_bfloat16 *)value, (const __nv_bfloat16 *)beta,
-                                                    state, (__nv_bfloat16 *)output, batch, tokens, keyHeads,
+                if (!CloverLaunch<CloverPrefillGdn<T>>(dim3(8, valueHeads, batch), 128, 0, Stream(stream), workspace,
+                                                    (const T *)value, (const T *)beta,
+                                                    state, (T *)output, batch, tokens, keyHeads,
                                                     valueHeads, vStride))
                     return false;
             } else {
-                if (!CloverLaunch<CloverCausalGdn<true, decltype(indirect)::value>>(
-                        dim3(16, valueHeads, batch), 256, 0, Stream(stream), (const __nv_bfloat16 *)query,
-                        (const __nv_bfloat16 *)key, (const __nv_bfloat16 *)value, g, (const __nv_bfloat16 *)beta,
-                        state, (__nv_bfloat16 *)output, snapshots, batch, tokens, keyHeads, valueHeads, workspace,
+                if (!CloverLaunch<CloverCausalGdn<T, true, decltype(indirect)::value>>(
+                        dim3(16, valueHeads, batch), 256, 0, Stream(stream), (const T *)query,
+                        (const T *)key, (const T *)value, g, (const T *)beta,
+                        state, (T *)output, snapshots, batch, tokens, keyHeads, valueHeads, workspace,
                         qkStride, vStride, caches ? *caches : CloverCudaGdnCaches{}))
                     return false;
             }
         } else {
-            if (!CloverLaunch<CloverCausalGdn<false, decltype(indirect)::value>>(
+            if (!CloverLaunch<CloverCausalGdn<T, false, decltype(indirect)::value>>(
                     dim3(16, valueHeads, batch), 256, 0, Stream(stream),
-                    static_cast<const __nv_bfloat16 *>(query), static_cast<const __nv_bfloat16 *>(key),
-                    static_cast<const __nv_bfloat16 *>(value), g, static_cast<const __nv_bfloat16 *>(beta), state,
-                    static_cast<__nv_bfloat16 *>(output), snapshots, batch, tokens, keyHeads, valueHeads, nullptr,
+                    static_cast<const T *>(query), static_cast<const T *>(key),
+                    static_cast<const T *>(value), g, static_cast<const T *>(beta), state,
+                    static_cast<T *>(output), snapshots, batch, tokens, keyHeads, valueHeads, nullptr,
                     qkStride, vStride, caches ? *caches : CloverCudaGdnCaches{}))
                 return false;
         }
@@ -670,34 +693,35 @@ __device__ float BlockSum(float x, float *scratch) {
     __syncthreads();
     return scratch[0];
 }
-__global__ void CloverNorm(const __nv_bfloat16 *input, const float *weight,
-        const __nv_bfloat16 *gate, __nv_bfloat16 *output, int width,
+template<typename T>
+__global__ void CloverNorm(const T *input, const float *weight,
+        const T *gate, T *output, int width,
         float eps, bool zeroCentered) {
     CloverDependencyStart();
     __shared__ float scratch[8];
     const size_t offset = (size_t)blockIdx.x * width;
     float sum = 0.f;
     for (int d = threadIdx.x; d < width; d += 256) {
-        float x = __bfloat162float(input[offset + d]);
+        float x = CloverFloat(input[offset + d]);
         sum += x * x;
     }
     float inv = rsqrtf(BlockSum(sum, scratch) / width + eps);
     for (int d = threadIdx.x; d < width; d += 256) {
-        float x = __bfloat162float(input[offset + d]) * inv *
+        float x = CloverFloat(input[offset + d]) * inv *
                   (weight[d] + (zeroCentered ? 1.f : 0.f));
         if (gate) {
-            float z = __bfloat162float(gate[offset + d]);
+            float z = CloverFloat(gate[offset + d]);
             x *= z / (1.f + expf(-z));
         }
-        output[offset + d] = __float2bfloat16(x);
+        output[offset + d] = CloverCast<T>(x);
     }
 }
 // Preserve the original 256-thread RMS reduction and BF16 residual boundary.
 // The common hidden width keeps rounded values in registers, avoiding a
 // global read-after-write dependency before the normalized output store.
-template<int Width>
-__global__ void CloverAddNorm(__nv_bfloat16 *residual, const __nv_bfloat16 *input,
-        const float *weight, __nv_bfloat16 *output, int width, float eps, bool zeroCentered) {
+template<typename T, int Width>
+__global__ void CloverAddNorm(T *residual, const T *input,
+        const float *weight, T *output, int width, float eps, bool zeroCentered) {
     CloverDependencyStart();
     __shared__ float scratch[8];
     const int columns = Width ? Width : width;
@@ -705,9 +729,9 @@ __global__ void CloverAddNorm(__nv_bfloat16 *residual, const __nv_bfloat16 *inpu
     float values[Width ? Width / 256 : 1], sum = 0.f;
 #pragma unroll
     for (int d = threadIdx.x, j = 0; d < columns; d += 256, ++j) {
-        auto rounded = __float2bfloat16(__bfloat162float(residual[offset + d]) +
-                                      __bfloat162float(input[offset + d]));
-        float x = __bfloat162float(rounded);
+        auto rounded = CloverCast<T>(CloverFloat(residual[offset + d]) +
+                                      CloverFloat(input[offset + d]));
+        float x = CloverFloat(rounded);
         if constexpr (Width) values[j] = x;
         else residual[offset + d] = rounded;
         sum += x * x;
@@ -718,16 +742,16 @@ __global__ void CloverAddNorm(__nv_bfloat16 *residual, const __nv_bfloat16 *inpu
         float x;
         if constexpr (Width) {
             x = values[j];
-            residual[offset + d] = __float2bfloat16(x);
-        } else x = __bfloat162float(residual[offset + d]);
-        output[offset + d] = __float2bfloat16(x * inv * (weight[d] + (zeroCentered ? 1.f : 0.f)));
+            residual[offset + d] = CloverCast<T>(x);
+        } else x = CloverFloat(residual[offset + d]);
+        output[offset + d] = CloverCast<T>(x * inv * (weight[d] + (zeroCentered ? 1.f : 0.f)));
     }
 }
 // Two adjacent columns per lane preserve the original 256-thread RMS
 // reduction while using vectorized BF16 accesses and only one CTA barrier.
-template<bool Add>
-__global__ void CloverHiddenNorm(const __nv_bfloat16 *input, __nv_bfloat16 *residual,
-        const float *weight, const __nv_bfloat16 *gate, __nv_bfloat16 *output,
+template<typename T, bool Add>
+__global__ void CloverHiddenNorm(const T *input, T *residual,
+        const float *weight, const T *gate, T *output,
         float eps, bool zeroCentered) {
     CloverDependencyStart();
     const int tid = threadIdx.x, lane = tid % 32;
@@ -737,10 +761,10 @@ __global__ void CloverHiddenNorm(const __nv_bfloat16 *input, __nv_bfloat16 *resi
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int d = tid * 2 + j * 256;
-        float2 x = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(input + offset + d));
+        float2 x = CloverFloat2(*reinterpret_cast<const CloverPair<T> *>(input + offset + d));
         if constexpr (Add) {
-            float2 h = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(residual + offset + d));
-            x = __bfloat1622float2(__floats2bfloat162_rn(x.x + h.x, x.y + h.y));
+            float2 h = CloverFloat2(*reinterpret_cast<const CloverPair<T> *>(residual + offset + d));
+            x = CloverFloat2(CloverCast2<T>(x.x + h.x, x.y + h.y));
         }
         values[j] = x;
         a += x.x * x.x; b += x.y * x.y;
@@ -759,21 +783,21 @@ __global__ void CloverHiddenNorm(const __nv_bfloat16 *input, __nv_bfloat16 *resi
         const int d = tid * 2 + j * 256;
         const float2 x = values[j];
         if constexpr (Add)
-            *reinterpret_cast<__nv_bfloat162 *>(residual + offset + d) = __floats2bfloat162_rn(x.x, x.y);
+            *reinterpret_cast<CloverPair<T> *>(residual + offset + d) = CloverCast2<T>(x.x, x.y);
         float u = x.x * inv * (weight[d] + (zeroCentered ? 1.f : 0.f));
         float v = x.y * inv * (weight[d + 1] + (zeroCentered ? 1.f : 0.f));
         if (gate) {
-            float2 z = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(gate + offset + d));
+            float2 z = CloverFloat2(*reinterpret_cast<const CloverPair<T> *>(gate + offset + d));
             u *= z.x / (1.f + expf(-z.x)); v *= z.y / (1.f + expf(-z.y));
         }
-        *reinterpret_cast<__nv_bfloat162 *>(output + offset + d) = __floats2bfloat162_rn(u, v);
+        *reinterpret_cast<CloverPair<T> *>(output + offset + d) = CloverCast2<T>(u, v);
     }
 }
 // Small normalization widths use one warp per row for bulk prefill. Each
-// 32-element partial and its reduction order match CloverNorm's CTA tree.
-template<int Width>
-__global__ void CloverWarpNorm(const __nv_bfloat16 *input, const float *weight,
-        const __nv_bfloat16 *gate, __nv_bfloat16 *output, int rows, float eps, bool zeroCentered) {
+// 32-element partial and its reduction order match CloverNorm<T>'s CTA tree.
+template<typename T, int Width>
+__global__ void CloverWarpNorm(const T *input, const float *weight,
+        const T *gate, T *output, int rows, float eps, bool zeroCentered) {
     CloverDependencyStart();
     const int row = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (row >= rows) return;
@@ -782,7 +806,7 @@ __global__ void CloverWarpNorm(const __nv_bfloat16 *input, const float *weight,
     float x[Parts], sums[Parts];
 #pragma unroll
     for (int j = 0; j < Parts; ++j) {
-        x[j] = __bfloat162float(input[offset + j * 32 + lane]);
+        x[j] = CloverFloat(input[offset + j * 32 + lane]);
         sums[j] = WarpSum(x[j] * x[j]);
     }
 #pragma unroll
@@ -793,38 +817,40 @@ __global__ void CloverWarpNorm(const __nv_bfloat16 *input, const float *weight,
     for (int j = 0; j < Parts; ++j) {
         float y = x[j] * inv * (weight[j * 32 + lane] + (zeroCentered ? 1.f : 0.f));
         if (gate) {
-            float z = __bfloat162float(gate[offset + j * 32 + lane]);
+            float z = CloverFloat(gate[offset + j * 32 + lane]);
             y *= z / (1.f + expf(-z));
         }
-        output[offset + j * 32 + lane] = __float2bfloat16(y);
+        output[offset + j * 32 + lane] = CloverCast<T>(y);
     }
 }
-__global__ void CloverRotary(__nv_bfloat16 *input, int heads, int dim,
+template<typename T>
+__global__ void CloverRotary(T *input, int heads, int dim,
         int rotaryDim, int position, float theta) {
     CloverDependencyStart();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= heads * rotaryDim / 2) return;
     int h = i / (rotaryDim / 2), d = i % (rotaryDim / 2);
     float phase = (position + blockIdx.y) * (1.f / powf(theta, 2.f * d / rotaryDim));
-    float c = __bfloat162float(__float2bfloat16(cosf(phase)));
-    float s = __bfloat162float(__float2bfloat16(sinf(phase)));
+    float c = CloverFloat(CloverCast<T>(cosf(phase)));
+    float s = CloverFloat(CloverCast<T>(sinf(phase)));
     size_t p = ((size_t)blockIdx.y * heads + h) * dim + d;
-    float x = __bfloat162float(input[p]), y = __bfloat162float(input[p + rotaryDim / 2]);
+    float x = CloverFloat(input[p]), y = CloverFloat(input[p + rotaryDim / 2]);
     // Eager BF16 rotary rounds each multiply before adding/subtracting.
-    float xc = __bfloat162float(__float2bfloat16(x * c));
-    float ys = __bfloat162float(__float2bfloat16(y * s));
-    float yc = __bfloat162float(__float2bfloat16(y * c));
-    float xs = __bfloat162float(__float2bfloat16(x * s));
-    input[p] = __float2bfloat16(xc - ys);
-    input[p + rotaryDim / 2] = __float2bfloat16(yc + xs);
+    float xc = CloverFloat(CloverCast<T>(x * c));
+    float ys = CloverFloat(CloverCast<T>(y * s));
+    float yc = CloverFloat(CloverCast<T>(y * c));
+    float xs = CloverFloat(CloverCast<T>(x * s));
+    input[p] = CloverCast<T>(xc - ys);
+    input[p + rotaryDim / 2] = CloverCast<T>(yc + xs);
 }
 
 // Decode Q/gate split, Q/K RMSNorm and partial RoPE share one CTA per head.
 // Retain the 256-thread norm tree and every BF16 rounding boundary.
-__global__ void CloverPrepareAttention(const __nv_bfloat16 *qgate, const __nv_bfloat16 *key,
-        const float *qWeight, const float *kWeight, __nv_bfloat16 *query,
-        __nv_bfloat16 *normalizedKey, __nv_bfloat16 *gate, int queryHeads, int keyHeads,
-        int rotaryDim, int position, float theta, float eps, int qkvStride, __nv_bfloat16 *value) {
+template<typename T>
+__global__ void CloverPrepareAttention(const T *qgate, const T *key,
+        const float *qWeight, const float *kWeight, T *query,
+        T *normalizedKey, T *gate, int queryHeads, int keyHeads,
+        int rotaryDim, int position, float theta, float eps, int qkvStride, T *value) {
     CloverDependencyStart();
     constexpr int dim = 256;
     const int d = threadIdx.x, token = blockIdx.y;
@@ -838,24 +864,24 @@ __global__ void CloverPrepareAttention(const __nv_bfloat16 *qgate, const __nv_bf
     const auto *weight = isQuery ? qWeight : kWeight;
     auto *destination = (isQuery ? query : normalizedKey) + row * dim;
     __shared__ float scratch[8];
-    __shared__ __nv_bfloat16 normalized[dim];
-    const float x = __bfloat162float(source[d]);
+    __shared__ T normalized[dim];
+    const float x = CloverFloat(source[d]);
     const float inv = rsqrtf(BlockSum(x * x, scratch) / dim + eps);
-    normalized[d] = __float2bfloat16(x * inv * (weight[d] + 1.f));
+    normalized[d] = CloverCast<T>(x * inv * (weight[d] + 1.f));
     if (isQuery) gate[row * dim + d] = source[dim + d];
     __syncthreads();
     if (d >= rotaryDim) destination[d] = normalized[d];
     if (d < rotaryDim / 2) {
         float phase = (position + token) * (1.f / powf(theta, 2.f * d / rotaryDim));
-        float c = __bfloat162float(__float2bfloat16(cosf(phase)));
-        float s = __bfloat162float(__float2bfloat16(sinf(phase)));
-        float a = __bfloat162float(normalized[d]), b = __bfloat162float(normalized[d + rotaryDim / 2]);
-        float ac = __bfloat162float(__float2bfloat16(a * c));
-        float bs = __bfloat162float(__float2bfloat16(b * s));
-        float bc = __bfloat162float(__float2bfloat16(b * c));
-        float as = __bfloat162float(__float2bfloat16(a * s));
-        destination[d] = __float2bfloat16(ac - bs);
-        destination[d + rotaryDim / 2] = __float2bfloat16(bc + as);
+        float c = CloverFloat(CloverCast<T>(cosf(phase)));
+        float s = CloverFloat(CloverCast<T>(sinf(phase)));
+        float a = CloverFloat(normalized[d]), b = CloverFloat(normalized[d + rotaryDim / 2]);
+        float ac = CloverFloat(CloverCast<T>(a * c));
+        float bs = CloverFloat(CloverCast<T>(b * s));
+        float bc = CloverFloat(CloverCast<T>(b * c));
+        float as = CloverFloat(CloverCast<T>(a * s));
+        destination[d] = CloverCast<T>(ac - bs);
+        destination[d + rotaryDim / 2] = CloverCast<T>(bc + as);
     }
 }
 
@@ -884,12 +910,13 @@ __device__ void CloverSort256(float &value, int &id, float *sharedValue, int *sh
         }
     }
 }
-__global__ void CloverRoute(const __nv_bfloat16 *logits, const unsigned char *allowed,
+template<typename T>
+__global__ void CloverRoute(const T *logits, const unsigned char *allowed,
         int *indices, float *scores, int tokens, int experts, int topk, bool normalizeTopK, int stride) {
     __shared__ float values[256], reduction[8], maximum;
     __shared__ int sortedIds[256], ranks[256];
     int e = threadIdx.x, row = blockIdx.x;
-    float x = e < experts ? __bfloat162float(logits[(size_t)row * stride + e]) : -CUDART_INF_F;
+    float x = e < experts ? CloverFloat(logits[(size_t)row * stride + e]) : -CUDART_INF_F;
     if (allowed && e < experts && !allowed[(row / tokens) * experts + e]) x = -CUDART_INF_F;
     float sorted = x; int id = e;
     CloverSort256(sorted, id, values, sortedIds, experts);
@@ -940,17 +967,19 @@ __global__ void CloverCoreset(const int *ids, const float *scores,
         allowed[(size_t)blockIdx.x * experts + id] = e == 0 || before < topP;
     }
 }
-__device__ void CloverExpertGateRow(const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
-        const int *indices, __nv_bfloat16 *middle, int hidden, int intermediate,
+template<typename T>
+__device__ void CloverExpertGateRow(const T *input, const T *weight,
+        const int *indices, T *middle, int hidden, int intermediate,
         int experts, int topk, int task, int d) {
     int lane = threadIdx.x % 32;
     if (d >= intermediate) return;
     int expert = indices[task];
     if (expert < 0 || expert >= experts) return;
-    const __nv_bfloat16 *x = input + (size_t)(task / topk) * hidden;
-    const __nv_bfloat16 *w = weight + ((size_t)expert * intermediate * 2 + d) * hidden;
+    const T *x = input + (size_t)(task / topk) * hidden;
+    const T *w = weight + ((size_t)expert * intermediate * 2 + d) * hidden;
     float gate = 0.f, up = 0.f;
-    if (hidden % 8 == 0) {
+    if (hidden % 8 == 0 && ((reinterpret_cast<uintptr_t>(x) |
+            reinterpret_cast<uintptr_t>(w)) & 15) == 0) {
         float ga[4] = {}, ua[4] = {};
         for (int k = lane * 8; k < hidden; k += 256) {
             uint4 xv = *(const uint4 *)(x + k);
@@ -958,9 +987,9 @@ __device__ void CloverExpertGateRow(const __nv_bfloat16 *input, const __nv_bfloa
             uint4 uv = *(const uint4 *)(w + (size_t)intermediate * hidden + k);
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                float2 a = __bfloat1622float2(((const __nv_bfloat162 *)&xv)[j]);
-                float2 g = __bfloat1622float2(((const __nv_bfloat162 *)&gv)[j]);
-                float2 u = __bfloat1622float2(((const __nv_bfloat162 *)&uv)[j]);
+                float2 a = CloverFloat2(((const CloverPair<T> *)&xv)[j]);
+                float2 g = CloverFloat2(((const CloverPair<T> *)&gv)[j]);
+                float2 u = CloverFloat2(((const CloverPair<T> *)&uv)[j]);
                 ga[j] += a.x * g.x; ga[j] += a.y * g.y;
                 ua[j] += a.x * u.x; ua[j] += a.y * u.y;
             }
@@ -969,57 +998,61 @@ __device__ void CloverExpertGateRow(const __nv_bfloat16 *input, const __nv_bfloa
         up = (ua[0] + ua[1]) + (ua[2] + ua[3]);
     } else {
         for (int k = lane; k < hidden; k += 32) {
-            float a = __bfloat162float(x[k]);
-            gate += a * __bfloat162float(w[k]);
-            up += a * __bfloat162float(w[(size_t)intermediate * hidden + k]);
+            float a = CloverFloat(x[k]);
+            gate += a * CloverFloat(w[k]);
+            up += a * CloverFloat(w[(size_t)intermediate * hidden + k]);
         }
     }
     gate = WarpSum(gate); up = WarpSum(up);
     if (lane == 0) {
-        gate = __bfloat162float(__float2bfloat16(gate));
-        up = __bfloat162float(__float2bfloat16(up));
-        middle[(size_t)task * intermediate + d] = __float2bfloat16(gate / (1.f + expf(-gate)) * up);
+        gate = CloverFloat(CloverCast<T>(gate));
+        up = CloverFloat(CloverCast<T>(up));
+        middle[(size_t)task * intermediate + d] = CloverCast<T>(gate / (1.f + expf(-gate)) * up);
     }
 }
-__device__ void CloverExpertDownRow(const __nv_bfloat16 *middle, const __nv_bfloat16 *weight,
-        const int *indices, const float *scores, __nv_bfloat16 *parts,
+template<typename T>
+__device__ void CloverExpertDownRow(const T *middle, const T *weight,
+        const int *indices, const float *scores, T *parts,
         int hidden, int intermediate, int experts, int task, int d) {
     int lane = threadIdx.x % 32;
     if (d >= hidden) return;
     int expert = indices[task];
     if (expert < 0 || expert >= experts) return;
-    const __nv_bfloat16 *x = middle + (size_t)task * intermediate;
-    const __nv_bfloat16 *w = weight + ((size_t)expert * hidden + d) * intermediate;
+    const T *x = middle + (size_t)task * intermediate;
+    const T *w = weight + ((size_t)expert * hidden + d) * intermediate;
     float sum = 0.f;
-    if (intermediate % 8 == 0) {
+    if (intermediate % 8 == 0 && ((reinterpret_cast<uintptr_t>(x) |
+            reinterpret_cast<uintptr_t>(w)) & 15) == 0) {
         float partial[4] = {};
         for (int k = lane * 8; k < intermediate; k += 256) {
             uint4 xv = *(const uint4 *)(x + k), wv = *(const uint4 *)(w + k);
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                float2 a = __bfloat1622float2(((const __nv_bfloat162 *)&xv)[j]);
-                float2 b = __bfloat1622float2(((const __nv_bfloat162 *)&wv)[j]);
+                float2 a = CloverFloat2(((const CloverPair<T> *)&xv)[j]);
+                float2 b = CloverFloat2(((const CloverPair<T> *)&wv)[j]);
                 partial[j] += a.x * b.x; partial[j] += a.y * b.y;
             }
         }
         sum = (partial[0] + partial[1]) + (partial[2] + partial[3]);
     } else {
         for (int k = lane; k < intermediate; k += 32)
-            sum += __bfloat162float(x[k]) * __bfloat162float(w[k]);
+            sum += CloverFloat(x[k]) * CloverFloat(w[k]);
     }
     sum = WarpSum(sum);
-    if (lane == 0) parts[(size_t)task * hidden + d] = __float2bfloat16(sum * scores[task]);
+    if (lane == 0) parts[(size_t)task * hidden + d] = CloverCast<T>(sum * scores[task]);
 }
-__global__ void CloverExpertGate(const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
-        const int *indices, __nv_bfloat16 *middle, int hidden, int intermediate,
+template<typename T>
+__global__ void CloverExpertGate(const T *input, const T *weight,
+        const int *indices, T *middle, int hidden, int intermediate,
         int experts, int topk) {
-    CloverExpertGateRow(input, weight, indices, middle, hidden, intermediate, experts,
+    CloverExpertGateRow<T>(input, weight, indices, middle, hidden, intermediate, experts,
         topk, blockIdx.y, blockIdx.x * 8 + threadIdx.x / 32);
 }
-__global__ void CloverExpertDown(const __nv_bfloat16 *middle, const __nv_bfloat16 *weight,
-        const int *indices, const float *scores, __nv_bfloat16 *parts,
+template<typename T>
+__global__ void CloverExpertDown(const T *middle, const T *weight,
+        const int *indices, const float *scores, T *parts,
         int hidden, int intermediate, int experts) {
-    CloverExpertDownRow(middle, weight, indices, scores, parts, hidden, intermediate,
+    CloverExpertDownRow<T>(middle, weight, indices, scores, parts, hidden, intermediate,
         experts, blockIdx.y, blockIdx.x * 8 + threadIdx.x / 32);
 }
 // Group routes in their original token order. An expert can occur at most
@@ -1157,19 +1190,22 @@ __device__ __forceinline__ void CloverCopyAsync16(void *destination, const void 
     unsigned address = (unsigned)__cvta_generic_to_shared(destination);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::
         "r"(address), "l"(source), "r"(valid ? 16 : 0));
+#else
+    *(uint4 *)destination = valid ? *(const uint4 *)source : make_uint4(0, 0, 0, 0);
 #endif
 }
 
 // Up to 16 token rows share a weight tile, including experts with only one
 // active row. Compact descriptors avoid empty expert launches and separate
-// sparse GEMVs that reread weights for each token. The BF16 Tensor Core
-// products accumulate in FP32; only the reference's gate/up and routed-down
-// boundaries round to BF16. This implementation uses CUDA's WMMA API on SM80+.
-template<bool Gate, int N, int K>
-__global__ void CloverExpertGemm(const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
-        const float *scores, const int *workspace, __nv_bfloat16 *output,
+// sparse GEMVs that reread weights for each token. Tensor Core products
+// accumulate in FP32; gate/up and routed-down boundaries round to storage
+// precision. WMMA requires SM70+ for FP16 and SM80+ for BF16.
+template<typename T, bool Gate, int N, int K>
+__global__ void CloverExpertGemm(const T *input, const T *weight,
+        const float *scores, const int *workspace, T *output,
         int rows, int hidden, int intermediate, int experts, int topk) {
-#if __CUDA_ARCH__ >= 800
+#if __CUDA_ARCH__ >= 700
+    if constexpr (std::is_same_v<T, __half> || __CUDA_ARCH__ >= 800) {
     using namespace nvcuda;
     constexpr int M = 16, LD = K + 8;
     const int *tiles = workspace + (size_t)experts * (rows + 1);
@@ -1179,7 +1215,7 @@ __global__ void CloverExpertGemm(const __nv_bfloat16 *input, const __nv_bfloat16
     const int inputWidth = Gate ? hidden : intermediate;
     const int outputWidth = Gate ? intermediate : hidden;
     const int column = blockIdx.x * N, tid = threadIdx.x, warp = tid / 32;
-    __shared__ __align__(32) __nv_bfloat16 a[2 * M * LD], b[2 * N * LD], u[Gate ? 2 * N * LD : 1];
+    __shared__ __align__(32) T a[2 * M * LD], b[2 * N * LD], u[Gate ? 2 * N * LD : 1];
     __shared__ int tasks[M], inputRows[M];
     if (tid < M) {
         int task = start + tid < count ? workspace[index + tid] : -1;
@@ -1194,7 +1230,8 @@ __global__ void CloverExpertGemm(const __nv_bfloat16 *input, const __nv_bfloat16
         auto *pa = a + stage * M * LD;
         auto *pb = b + stage * N * LD;
         auto *pu = Gate ? u + stage * N * LD : nullptr;
-        if (inputWidth % 8 == 0) {
+        if (inputWidth % 8 == 0 && ((reinterpret_cast<uintptr_t>(input) |
+            reinterpret_cast<uintptr_t>(weight)) & 15) == 0) {
             for (int i = tid * 8; i < M * K; i += N * 2 * 8) {
                 int row = inputRows[i / K], d = k + i % K;
                 bool valid = row >= 0 && d < inputWidth;
@@ -1213,30 +1250,34 @@ __global__ void CloverExpertGemm(const __nv_bfloat16 *input, const __nv_bfloat16
             for (int i = tid; i < M * K; i += N * 2) {
                 int row = inputRows[i / K], d = k + i % K;
                 pa[(i / K) * LD + i % K] = row >= 0 && d < inputWidth
-                    ? input[(size_t)row * inputWidth + d] : __float2bfloat16(0.f);
+                    ? input[(size_t)row * inputWidth + d] : CloverCast<T>(0.f);
             }
             for (int i = tid; i < N * K; i += N * 2) {
                 int n = column + i / K, d = k + i % K;
                 size_t offset = ((size_t)expert * outputWidth * (Gate ? 2 : 1) + n) * inputWidth + d;
-                pb[(i / K) * LD + i % K] = n < outputWidth && d < inputWidth ? weight[offset] : __float2bfloat16(0.f);
+                pb[(i / K) * LD + i % K] = n < outputWidth && d < inputWidth ? weight[offset] : CloverCast<T>(0.f);
                 if (Gate) pu[(i / K) * LD + i % K] = n < outputWidth && d < inputWidth
-                    ? weight[offset + (size_t)outputWidth * inputWidth] : __float2bfloat16(0.f);
+                    ? weight[offset + (size_t)outputWidth * inputWidth] : CloverCast<T>(0.f);
             }
         }
+#if __CUDA_ARCH__ >= 800
         asm volatile("cp.async.commit_group;");
+#endif
     };
     load(0, 0);
     for (int k = 0; k < inputWidth; k += K) {
         int stage = (k / K) % 2;
+#if __CUDA_ARCH__ >= 800
         asm volatile("cp.async.wait_group 0;");
+#endif
         __syncthreads();
         if (k + K < inputWidth) load(k + K, 1 - stage);
         auto *pa = a + stage * M * LD;
         auto *pb = b + stage * N * LD;
         auto *pu = Gate ? u + stage * N * LD : nullptr;
         for (int j = 0; j < K; j += 16) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> fa;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> fb;
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, T, wmma::row_major> fa;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::col_major> fb;
             wmma::load_matrix_sync(fa, pa + j, LD);
             wmma::load_matrix_sync(fb, pb + warp * 16 * LD + j, LD);
             wmma::mma_sync(acc, fa, fb, acc);
@@ -1257,31 +1298,33 @@ __global__ void CloverExpertGemm(const __nv_bfloat16 *input, const __nv_bfloat16
         if (task < 0 || n >= outputWidth) continue;
         float v = result[i];
         if (Gate) {
-            v = __bfloat162float(__float2bfloat16(v));
-            float uv = __bfloat162float(__float2bfloat16(upResult[i]));
+            v = CloverFloat(CloverCast<T>(v));
+            float uv = CloverFloat(CloverCast<T>(upResult[i]));
             v = v / (1.f + expf(-v)) * uv;
         } else v *= scores[task];
-        output[(size_t)task * outputWidth + n] = __float2bfloat16(v);
+        output[(size_t)task * outputWidth + n] = CloverCast<T>(v);
+    }
     }
 #endif
 }
 
+template<typename T>
 bool CloverTensorCores() {
     int device;
     if (cudaGetDevice(&device) != cudaSuccess) return false;
-    static thread_local int previous = -1, major = 0;
+    static thread_local int previous = -1, capability = 0;
     if (device != previous) {
         cudaFuncAttributes attributes;
-        if (cudaFuncGetAttributes(&attributes, CloverExpertGemm<true, 32, 128>) != cudaSuccess) return false;
-        major = attributes.binaryVersion / 10;
+        if (cudaFuncGetAttributes(&attributes, CloverExpertGemm<T, true, 32, 128>) != cudaSuccess) return false;
+        capability = std::min(attributes.binaryVersion, attributes.ptxVersion);
         previous = device;
     }
-    return major >= 8;
+    return capability >= (std::is_same_v<T, __half> ? 70 : 80);
 }
-template <bool Shared>
-__global__ void CloverExpertSum(const __nv_bfloat16 *parts, const int *indices, __nv_bfloat16 *output,
-                                int hidden, int topk, const __nv_bfloat16 *shared,
-                                const __nv_bfloat16 *sharedGate, int sharedGateStride) {
+template<typename T, bool Shared>
+__global__ void CloverExpertSum(const T *parts, const int *indices, T *output,
+                                int hidden, int topk, const T *shared,
+                                const T *sharedGate, int sharedGateStride) {
     int d = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
     __shared__ int order[16];
     // Sort the routes once per CTA, preserving the reference accumulation order.
@@ -1295,22 +1338,22 @@ __global__ void CloverExpertSum(const __nv_bfloat16 *parts, const int *indices, 
     if (d >= hidden) return;
     float sum = 0.f;
     for (int rank = 0; rank < topk; ++rank)
-        sum += __bfloat162float(parts[((size_t)row * topk + order[rank]) * hidden + d]);
-    auto result = __float2bfloat16(sum);
+        sum += CloverFloat(parts[((size_t)row * topk + order[rank]) * hidden + d]);
+    auto result = CloverCast<T>(sum);
     if constexpr (Shared) {
         // Preserve sigmoid, shared product, routed sum and final add rounding.
-        auto probability = __float2bfloat16(1.f / (1.f + expf(-__bfloat162float(sharedGate[(size_t)row * sharedGateStride]))));
-        auto contribution = __float2bfloat16(__bfloat162float(shared[(size_t)row * hidden + d]) *
-                                             __bfloat162float(probability));
-        result = __float2bfloat16(__bfloat162float(result) + __bfloat162float(contribution));
+        auto probability = CloverCast<T>(1.f / (1.f + expf(-CloverFloat(sharedGate[(size_t)row * sharedGateStride]))));
+        auto contribution = CloverCast<T>(CloverFloat(shared[(size_t)row * hidden + d]) *
+                                             CloverFloat(probability));
+        result = CloverCast<T>(CloverFloat(result) + CloverFloat(contribution));
     }
     output[(size_t)row * hidden + d] = result;
 }
 
-template <bool Shared>
-__global__ void CloverExpertSumVector(const __nv_bfloat16 *parts, const int *indices, __nv_bfloat16 *output,
-                                      int rows, int hidden, int topk, const __nv_bfloat16 *shared,
-                                      const __nv_bfloat16 *sharedGate, int sharedGateStride) {
+template<typename T, bool Shared>
+__global__ void CloverExpertSumVector(const T *parts, const int *indices, T *output,
+                                      int rows, int hidden, int topk, const T *shared,
+                                      const T *sharedGate, int sharedGateStride) {
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32, row = blockIdx.x * 4 + warp;
     if (row >= rows) return;
     __shared__ int order[4][16];
@@ -1323,7 +1366,7 @@ __global__ void CloverExpertSumVector(const __nv_bfloat16 *parts, const int *ind
     float probability = 0.f;
     if constexpr (Shared)
         probability =
-            __bfloat162float(__float2bfloat16(1.f / (1.f + expf(-__bfloat162float(sharedGate[(size_t)row * sharedGateStride])))));
+            CloverFloat(CloverCast<T>(1.f / (1.f + expf(-CloverFloat(sharedGate[(size_t)row * sharedGateStride])))));
     for (int d = lane * 8; d < hidden; d += 32 * 8) {
         float sums[8] = {};
         for (int k = 0; k < topk; ++k) {
@@ -1331,70 +1374,72 @@ __global__ void CloverExpertSumVector(const __nv_bfloat16 *parts, const int *ind
                 parts + ((size_t)row * topk + order[warp][k]) * hidden + d);
 #pragma unroll
             for (int j = 0; j < 8; ++j)
-                sums[j] += __bfloat162float(reinterpret_cast<__nv_bfloat16 *>(&value)[j]);
+                sums[j] += CloverFloat(reinterpret_cast<T *>(&value)[j]);
         }
         uint4 value;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            auto result = __float2bfloat16(sums[j]);
+            auto result = CloverCast<T>(sums[j]);
             if constexpr (Shared) {
                 auto contribution =
-                    __float2bfloat16(__bfloat162float(shared[(size_t)row * hidden + d + j]) * probability);
-                result = __float2bfloat16(__bfloat162float(result) + __bfloat162float(contribution));
+                    CloverCast<T>(CloverFloat(shared[(size_t)row * hidden + d + j]) * probability);
+                result = CloverCast<T>(CloverFloat(result) + CloverFloat(contribution));
             }
-            reinterpret_cast<__nv_bfloat16 *>(&value)[j] = result;
+            reinterpret_cast<T *>(&value)[j] = result;
         }
         *reinterpret_cast<uint4 *>(output + (size_t)row * hidden + d) = value;
     }
 }
-template <bool Shared>
-void CloverSumExperts(const __nv_bfloat16 *parts, const int *indices, __nv_bfloat16 *output, int rows,
-                      int hidden, int topk, cudaStream_t stream, const __nv_bfloat16 *shared,
-                      const __nv_bfloat16 *sharedGate, int sharedGateStride) {
+template<typename T, bool Shared>
+void CloverSumExperts(const T *parts, const int *indices, T *output, int rows,
+                      int hidden, int topk, cudaStream_t stream, const T *shared,
+                      const T *sharedGate, int sharedGateStride) {
     // A warp per row reduces prefill scheduling overhead. Small decode blocks
     // need the original wider grid; unaligned views retain scalar accesses.
     if (rows >= 1024 && hidden >= 512 && hidden % 8 == 0 &&
         ((reinterpret_cast<uintptr_t>(parts) | reinterpret_cast<uintptr_t>(output)) & 15) == 0)
-        CloverExpertSumVector<Shared><<<(rows + 3) / 4, 128, 0, stream>>>(parts, indices, output, rows,
+        CloverExpertSumVector<T, Shared><<<(rows + 3) / 4, 128, 0, stream>>>(parts, indices, output, rows,
                                                                           hidden, topk, shared, sharedGate, sharedGateStride);
     else
-        CloverExpertSum<Shared><<<dim3((hidden + 255) / 256, rows), 256, 0, stream>>>(
+        CloverExpertSum<T, Shared><<<dim3((hidden + 255) / 256, rows), 256, 0, stream>>>(
             parts, indices, output, hidden, topk, shared, sharedGate, sharedGateStride);
 }
 }
 
 #include "clover-moe-sm90.cuh"
 
-bool FastllmCudaCloverNorm(const void *input, const float *weight, const void *gate, void *output, int rows,
+template<typename T>
+bool FastllmCudaCloverNormImpl(const void *input, const float *weight, const void *gate, void *output, int rows,
                            int width, float eps, bool zeroCentered, void *stream) {
     if (!input || !weight || !output || rows < 1 || width < 1 || eps <= 0.f)
         return false;
     if (width == 2048 && rows <= 256 &&
         ((reinterpret_cast<uintptr_t>(input) | reinterpret_cast<uintptr_t>(output) |
           reinterpret_cast<uintptr_t>(gate)) & 3) == 0) {
-        return CloverLaunch<CloverHiddenNorm<false>>(rows, 128, 0, Stream(stream),
-            (const __nv_bfloat16 *)input, (__nv_bfloat16 *)nullptr, weight,
-            (const __nv_bfloat16 *)gate, (__nv_bfloat16 *)output, eps, zeroCentered);
+        return CloverLaunch<CloverHiddenNorm<T, false>>(rows, 128, 0, Stream(stream),
+            (const T *)input, (T *)nullptr, weight,
+            (const T *)gate, (T *)output, eps, zeroCentered);
     }
     if (rows >= 1024 && width == 128) {
-        if (!CloverLaunch<CloverWarpNorm<128>>(
-                (rows + 3) / 4, 128, 0, Stream(stream), (const __nv_bfloat16 *)input, weight,
-                (const __nv_bfloat16 *)gate, (__nv_bfloat16 *)output, rows, eps, zeroCentered))
+        if (!CloverLaunch<CloverWarpNorm<T, 128>>(
+                (rows + 3) / 4, 128, 0, Stream(stream), (const T *)input, weight,
+                (const T *)gate, (T *)output, rows, eps, zeroCentered))
             return false;
     } else if (rows >= 1024 && width == 256) {
-        if (!CloverLaunch<CloverWarpNorm<256>>(
-                (rows + 3) / 4, 128, 0, Stream(stream), (const __nv_bfloat16 *)input, weight,
-                (const __nv_bfloat16 *)gate, (__nv_bfloat16 *)output, rows, eps, zeroCentered))
+        if (!CloverLaunch<CloverWarpNorm<T, 256>>(
+                (rows + 3) / 4, 128, 0, Stream(stream), (const T *)input, weight,
+                (const T *)gate, (T *)output, rows, eps, zeroCentered))
             return false;
     } else {
-        if (!CloverLaunch<CloverNorm>(rows, 256, 0, Stream(stream), (const __nv_bfloat16 *)input, weight,
-                                      (const __nv_bfloat16 *)gate, (__nv_bfloat16 *)output, width, eps,
+        if (!CloverLaunch<CloverNorm<T>>(rows, 256, 0, Stream(stream), (const T *)input, weight,
+                                      (const T *)gate, (T *)output, width, eps,
                                       zeroCentered))
             return false;
     }
     return true;
 }
-bool FastllmCudaCloverAddNorm(void *residual, const void *input, const float *weight, void *output, int rows,
+template<typename T>
+bool FastllmCudaCloverAddNormImpl(void *residual, const void *input, const float *weight, void *output, int rows,
                               int width, float eps, bool zeroCentered, void *stream) {
     if (!residual || !input || !weight || !output || output == residual || output == input || rows < 1 ||
         width < 1 || eps <= 0.f)
@@ -1402,33 +1447,35 @@ bool FastllmCudaCloverAddNorm(void *residual, const void *input, const float *we
     if (width == 2048 && rows <= 256 &&
         ((reinterpret_cast<uintptr_t>(input) | reinterpret_cast<uintptr_t>(output) |
           reinterpret_cast<uintptr_t>(residual)) & 3) == 0) {
-        return CloverLaunch<CloverHiddenNorm<true>>(rows, 128, 0, Stream(stream),
-            (const __nv_bfloat16 *)input, (__nv_bfloat16 *)residual, weight,
-            (const __nv_bfloat16 *)nullptr, (__nv_bfloat16 *)output, eps, zeroCentered);
+        return CloverLaunch<CloverHiddenNorm<T, true>>(rows, 128, 0, Stream(stream),
+            (const T *)input, (T *)residual, weight,
+            (const T *)nullptr, (T *)output, eps, zeroCentered);
     }
     if (width == 2048) {
-        if (!CloverLaunch<CloverAddNorm<2048>>(rows, 256, 0, Stream(stream), (__nv_bfloat16 *)residual,
-                                               (const __nv_bfloat16 *)input, weight, (__nv_bfloat16 *)output,
+        if (!CloverLaunch<CloverAddNorm<T, 2048>>(rows, 256, 0, Stream(stream), (T *)residual,
+                                               (const T *)input, weight, (T *)output,
                                                width, eps, zeroCentered))
             return false;
     } else {
-        if (!CloverLaunch<CloverAddNorm<0>>(rows, 256, 0, Stream(stream), (__nv_bfloat16 *)residual,
-                                            (const __nv_bfloat16 *)input, weight, (__nv_bfloat16 *)output,
+        if (!CloverLaunch<CloverAddNorm<T, 0>>(rows, 256, 0, Stream(stream), (T *)residual,
+                                            (const T *)input, weight, (T *)output,
                                             width, eps, zeroCentered))
             return false;
     }
     return true;
 }
-bool FastllmCudaCloverRotary(void *input, int tokens, int heads, int dim, int rotaryDim, int position,
+template<typename T>
+bool FastllmCudaCloverRotaryImpl(void *input, int tokens, int heads, int dim, int rotaryDim, int position,
                              float theta, void *stream) {
     if (!input || tokens < 1 || tokens > 65535 || heads < 1 || rotaryDim < 2 || rotaryDim > dim ||
         rotaryDim % 2 || position < 0 || theta <= 0.f)
         return false;
-    return CloverLaunch<CloverRotary>(dim3((heads * rotaryDim / 2 + 255) / 256, tokens), 256, 0,
+    return CloverLaunch<CloverRotary<T>>(dim3((heads * rotaryDim / 2 + 255) / 256, tokens), 256, 0,
                                       stream ? (cudaStream_t)stream : cudaStreamPerThread,
-                                      (__nv_bfloat16 *)input, heads, dim, rotaryDim, position, theta);
+                                      (T *)input, heads, dim, rotaryDim, position, theta);
 }
-bool FastllmCudaCloverPrepareAttention(const void *qgate, const void *key, const float *qWeight,
+template<typename T>
+bool FastllmCudaCloverPrepareAttentionImpl(const void *qgate, const void *key, const float *qWeight,
         const float *kWeight, void *query, void *normalizedKey, void *gate, int tokens,
         int queryHeads, int keyHeads, int rotaryDim, int position, float theta, float eps, void *stream,
         int qkvStride, void *value) {
@@ -1438,12 +1485,13 @@ bool FastllmCudaCloverPrepareAttention(const void *qgate, const void *key, const
         rotaryDim % 2 || position < 0 || theta <= 0.f || eps <= 0.f ||
         qkvStride < 0 || (qkvStride && (qkvStride < (queryHeads + keyHeads) * 512 || !value)) ||
         (!qkvStride && value)) return false;
-    return CloverLaunch<CloverPrepareAttention>(dim3(queryHeads + keyHeads, tokens), 256, 0, Stream(stream),
-        (const __nv_bfloat16 *)qgate, (const __nv_bfloat16 *)key, qWeight, kWeight,
-        (__nv_bfloat16 *)query, (__nv_bfloat16 *)normalizedKey, (__nv_bfloat16 *)gate,
-        queryHeads, keyHeads, rotaryDim, position, theta, eps, qkvStride, (__nv_bfloat16 *)value);
+    return CloverLaunch<CloverPrepareAttention<T>>(dim3(queryHeads + keyHeads, tokens), 256, 0, Stream(stream),
+        (const T *)qgate, (const T *)key, qWeight, kWeight,
+        (T *)query, (T *)normalizedKey, (T *)gate,
+        queryHeads, keyHeads, rotaryDim, position, theta, eps, qkvStride, (T *)value);
 }
-bool FastllmCudaCloverRoute(const void *logits, int *indices, float *scores,
+template<typename T>
+bool FastllmCudaCloverRouteImpl(const void *logits, int *indices, float *scores,
         int *scratchIds, float *scratchScores, unsigned char *allowed,
         int batch, int tokens, int experts, int topk, float coresetTopP, void *stream, int logitsStride) {
     bool coreset = coresetTopP > 0.f;
@@ -1455,16 +1503,17 @@ bool FastllmCudaCloverRoute(const void *logits, int *indices, float *scores,
                      coresetTopP > 1.f || !ValidBlock(batch, tokens)))) return false;
     cudaStream_t s = stream ? (cudaStream_t)stream : cudaStreamPerThread;
     if (coreset) {
-        CloverRoute<<<batch * tokens, 256, 0, s>>>((const __nv_bfloat16 *)logits,
+        CloverRoute<T><<<batch * tokens, 256, 0, s>>>((const T *)logits,
             nullptr, scratchIds, scratchScores, tokens, experts, topk, false, logitsStride);
         CloverCoreset<<<batch, 256, 0, s>>>(scratchIds, scratchScores, allowed,
             tokens, experts, topk, coresetTopP);
     }
-    CloverRoute<<<batch * tokens, 256, 0, s>>>((const __nv_bfloat16 *)logits,
+    CloverRoute<T><<<batch * tokens, 256, 0, s>>>((const T *)logits,
         coreset ? allowed : nullptr, indices, scores, tokens, experts, topk, true, logitsStride);
     return cudaGetLastError() == cudaSuccess;
 }
-bool FastllmCudaCloverExperts(const void *input, const void *gateUp, const void *down, const int *indices,
+template<typename T>
+bool FastllmCudaCloverExpertsImpl(const void *input, const void *gateUp, const void *down, const int *indices,
     const float *scores, void *middle, void *parts, void *output, int rows, int hidden,
     int intermediate, int experts, int topk, void *stream, int *workspace, void *packed,
     const void *shared, const void *sharedGate, int sharedGateStride) {
@@ -1475,6 +1524,7 @@ bool FastllmCudaCloverExperts(const void *input, const void *gateUp, const void 
         topk > experts || topk > 16 || rows > 65535 / topk) return false;
     cudaStream_t s = stream ? (cudaStream_t)stream : cudaStreamPerThread;
 #if CUDART_VERSION >= 12000
+    if constexpr (std::is_same_v<T, __nv_bfloat16>)
     if (workspace && packed &&
         FastllmCudaCloverExpertsPackedBytes(rows, hidden, intermediate, experts, topk) &&
         CloverExpertsTma(input, gateUp, down, indices, scores, middle, parts, output, rows, hidden,
@@ -1482,39 +1532,39 @@ bool FastllmCudaCloverExperts(const void *input, const void *gateUp, const void 
         return cudaGetLastError() == cudaSuccess;
 #endif
     bool grouped = workspace && rows >= 4 && hidden >= 512 && intermediate >= 128 &&
-        experts <= 256 && CloverTensorCores();
+        experts <= 256 && CloverTensorCores<T>();
     if (grouped) {
         CloverBuildExpertTiles(indices, workspace, rows, topk, experts, s);
         int tiles = min(experts, rows * topk) + (rows * topk + 15) / 16;
         if (rows <= 32) {
-            CloverExpertGemm<true, 32, 128><<<dim3((intermediate + 31) / 32, tiles), 64, 0, s>>>(
-                (const __nv_bfloat16 *)input, (const __nv_bfloat16 *)gateUp, scores, workspace,
-                (__nv_bfloat16 *)middle, rows, hidden, intermediate, experts, topk);
-            CloverExpertGemm<false, 32, 128><<<dim3((hidden + 31) / 32, tiles), 64, 0, s>>>(
-                (const __nv_bfloat16 *)middle, (const __nv_bfloat16 *)down, scores, workspace,
-                (__nv_bfloat16 *)parts, rows, hidden, intermediate, experts, topk);
+            CloverExpertGemm<T, true, 32, 128><<<dim3((intermediate + 31) / 32, tiles), 64, 0, s>>>(
+                (const T *)input, (const T *)gateUp, scores, workspace,
+                (T *)middle, rows, hidden, intermediate, experts, topk);
+            CloverExpertGemm<T, false, 32, 128><<<dim3((hidden + 31) / 32, tiles), 64, 0, s>>>(
+                (const T *)middle, (const T *)down, scores, workspace,
+                (T *)parts, rows, hidden, intermediate, experts, topk);
         } else {
-            CloverExpertGemm<true, 64, 64><<<dim3((intermediate + 63) / 64, tiles), 128, 0, s>>>(
-                (const __nv_bfloat16 *)input, (const __nv_bfloat16 *)gateUp, scores, workspace,
-                (__nv_bfloat16 *)middle, rows, hidden, intermediate, experts, topk);
-            CloverExpertGemm<false, 64, 64><<<dim3((hidden + 63) / 64, tiles), 128, 0, s>>>(
-                (const __nv_bfloat16 *)middle, (const __nv_bfloat16 *)down, scores, workspace,
-                (__nv_bfloat16 *)parts, rows, hidden, intermediate, experts, topk);
+            CloverExpertGemm<T, true, 64, 64><<<dim3((intermediate + 63) / 64, tiles), 128, 0, s>>>(
+                (const T *)input, (const T *)gateUp, scores, workspace,
+                (T *)middle, rows, hidden, intermediate, experts, topk);
+            CloverExpertGemm<T, false, 64, 64><<<dim3((hidden + 63) / 64, tiles), 128, 0, s>>>(
+                (const T *)middle, (const T *)down, scores, workspace,
+                (T *)parts, rows, hidden, intermediate, experts, topk);
         }
     }
     if (!grouped) {
-        CloverExpertGate<<<dim3((intermediate + 7) / 8, rows * topk), 256, 0, s>>>(
-            (const __nv_bfloat16 *)input, (const __nv_bfloat16 *)gateUp, indices,
-            (__nv_bfloat16 *)middle, hidden, intermediate, experts, topk);
-        CloverExpertDown<<<dim3((hidden + 7) / 8, rows * topk), 256, 0, s>>>(
-            (const __nv_bfloat16 *)middle, (const __nv_bfloat16 *)down, indices, scores,
-            (__nv_bfloat16 *)parts, hidden, intermediate, experts);
+        CloverExpertGate<T><<<dim3((intermediate + 7) / 8, rows * topk), 256, 0, s>>>(
+            (const T *)input, (const T *)gateUp, indices,
+            (T *)middle, hidden, intermediate, experts, topk);
+        CloverExpertDown<T><<<dim3((hidden + 7) / 8, rows * topk), 256, 0, s>>>(
+            (const T *)middle, (const T *)down, indices, scores,
+            (T *)parts, hidden, intermediate, experts);
     }
     if (shared)
-        CloverSumExperts<true>((const __nv_bfloat16 *)parts, indices, (__nv_bfloat16 *)output, rows, hidden,
-                               topk, s, (const __nv_bfloat16 *)shared, (const __nv_bfloat16 *)sharedGate, sharedGateStride);
+        CloverSumExperts<T, true>((const T *)parts, indices, (T *)output, rows, hidden,
+                               topk, s, (const T *)shared, (const T *)sharedGate, sharedGateStride);
     else
-        CloverSumExperts<false>((const __nv_bfloat16 *)parts, indices, (__nv_bfloat16 *)output, rows, hidden,
+        CloverSumExperts<T, false>((const T *)parts, indices, (T *)output, rows, hidden,
                                 topk, s, nullptr, nullptr, 1);
     return cudaGetLastError() == cudaSuccess;
 }
@@ -1770,9 +1820,9 @@ bool FastllmCudaCloverTokenStats(const float *logits, const int *candidates, Clo
 }
 
 namespace {
-template<int Vector = 1>
-__global__ void CloverUnpackGdn(const __nv_bfloat16 *input, const float *aLog, const float *bias,
-        __nv_bfloat16 *qkv, __nv_bfloat16 *z, float *g, __nv_bfloat16 *beta,
+template<typename T, int Vector = 1>
+__global__ void CloverUnpackGdn(const T *input, const float *aLog, const float *bias,
+        T *qkv, T *z, float *g, T *beta,
         int channels, int heads) {
     CloverDependencyStart();
     int d = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
@@ -1790,16 +1840,17 @@ __global__ void CloverUnpackGdn(const __nv_bfloat16 *input, const float *aLog, c
         if (d < values) z[(size_t)row * values + d] = input[offset + channels + d];
     }
     if (d < heads) {
-        float a = __bfloat162float(input[offset + channels + values + d]) + bias[d];
+        float a = CloverFloat(input[offset + channels + values + d]) + bias[d];
         g[(size_t)row * heads + d] = -expf(aLog[d]) * (a > 20.f ? a : log1pf(expf(a)));
         if (beta) {
-            float b = __bfloat162float(input[offset + channels + values + heads + d]);
-            beta[(size_t)row * heads + d] = __float2bfloat16(1.f / (1.f + expf(-b)));
+            float b = CloverFloat(input[offset + channels + values + heads + d]);
+            beta[(size_t)row * heads + d] = CloverCast<T>(1.f / (1.f + expf(-b)));
         }
     }
 }
 }
-bool FastllmCudaCloverUnpackGdn(const void *input, const float *aLog, const float *bias, void *qkv, void *z,
+template<typename T>
+bool FastllmCudaCloverUnpackGdnImpl(const void *input, const float *aLog, const float *bias, void *qkv, void *z,
                                 float *g, void *beta, int rows, int channels, int heads, void *stream) {
     if (!input || !aLog || !bias || !qkv || !z || !g || rows < 1 || rows > 65535 || channels < 1 || heads < 1)
         return false;
@@ -1810,15 +1861,92 @@ bool FastllmCudaCloverUnpackGdn(const void *input, const float *aLog, const floa
         ((reinterpret_cast<uintptr_t>(input) | reinterpret_cast<uintptr_t>(qkv) |
           reinterpret_cast<uintptr_t>(z)) &
          15) == 0) {
-        if (!CloverLaunch<CloverUnpackGdn<8>>(dim3((width / 8 + 255) / 256, rows), 256, 0, Stream(stream),
-                                              (const __nv_bfloat16 *)input, aLog, bias, (__nv_bfloat16 *)qkv,
-                                              (__nv_bfloat16 *)z, g, (__nv_bfloat16 *)beta, channels, heads))
+        if (!CloverLaunch<CloverUnpackGdn<T, 8>>(dim3((width / 8 + 255) / 256, rows), 256, 0, Stream(stream),
+                                              (const T *)input, aLog, bias, (T *)qkv,
+                                              (T *)z, g, (T *)beta, channels, heads))
             return false;
     } else {
-        if (!CloverLaunch<CloverUnpackGdn<1>>(dim3((width + 255) / 256, rows), 256, 0, Stream(stream),
-                                              (const __nv_bfloat16 *)input, aLog, bias, (__nv_bfloat16 *)qkv,
-                                              (__nv_bfloat16 *)z, g, (__nv_bfloat16 *)beta, channels, heads))
+        if (!CloverLaunch<CloverUnpackGdn<T, 1>>(dim3((width + 255) / 256, rows), 256, 0, Stream(stream),
+                                              (const T *)input, aLog, bias, (T *)qkv,
+                                              (T *)z, g, (T *)beta, channels, heads))
             return false;
     }
     return true;
+}
+
+bool FastllmCudaCloverPreviewConv(const void *input, const void *history, const void *weight,
+                                  const void *rightWeight, const int *slots, const unsigned char *valid,
+                                  void *output, int batch, int tokens, int channels, void *stream, const CloverCudaGdnCaches *caches, bool fp16) {
+    return fp16 ? FastllmCudaCloverPreviewConvImpl<__half>(input, history, weight, rightWeight, slots, valid, output, batch, tokens, channels, stream, caches)
+                : FastllmCudaCloverPreviewConvImpl<__nv_bfloat16>(input, history, weight, rightWeight, slots, valid, output, batch, tokens, channels, stream, caches);
+}
+
+bool FastllmCudaCloverPreviewGdn(const void *query, const void *key, const void *value, const float *g,
+                                 const float *state, const float *logitScale, const float *historyBias,
+                                 const float *historyScale, const int *slots, const unsigned char *valid,
+                                 void *output, int batch, int tokens, int keyHeads, int valueHeads,
+                                 void *stream, int qkvRowStride, const CloverCudaGdnCaches *caches, bool fp16) {
+    return fp16 ? FastllmCudaCloverPreviewGdnImpl<__half>(query, key, value, g, state, logitScale, historyBias, historyScale, slots, valid, output, batch, tokens, keyHeads, valueHeads, stream, qkvRowStride, caches)
+                : FastllmCudaCloverPreviewGdnImpl<__nv_bfloat16>(query, key, value, g, state, logitScale, historyBias, historyScale, slots, valid, output, batch, tokens, keyHeads, valueHeads, stream, qkvRowStride, caches);
+}
+
+bool FastllmCudaCloverCausalConv(const void *input, void *history, const void *weight, void *output,
+                                 void *snapshots, int batch, int tokens, int channels, void *stream, const CloverCudaGdnCaches *caches, bool fp16) {
+    return fp16 ? FastllmCudaCloverCausalConvImpl<__half>(input, history, weight, output, snapshots, batch, tokens, channels, stream, caches)
+                : FastllmCudaCloverCausalConvImpl<__nv_bfloat16>(input, history, weight, output, snapshots, batch, tokens, channels, stream, caches);
+}
+
+bool FastllmCudaCloverCausalGdn(const void *query, const void *key, const void *value, const float *g,
+                                const void *beta, float *state, void *output, float *snapshots, int batch,
+                                int tokens, int keyHeads, int valueHeads, void *stream, float *workspace,
+                                int qkvRowStride, const CloverCudaGdnCaches *caches, bool fp16) {
+    return fp16 ? FastllmCudaCloverCausalGdnImpl<__half>(query, key, value, g, beta, state, output, snapshots, batch, tokens, keyHeads, valueHeads, stream, workspace, qkvRowStride, caches)
+                : FastllmCudaCloverCausalGdnImpl<__nv_bfloat16>(query, key, value, g, beta, state, output, snapshots, batch, tokens, keyHeads, valueHeads, stream, workspace, qkvRowStride, caches);
+}
+
+bool FastllmCudaCloverNorm(const void *input, const float *weight, const void *gate, void *output, int rows,
+                           int width, float eps, bool zeroCentered, void *stream, bool fp16) {
+    return fp16 ? FastllmCudaCloverNormImpl<__half>(input, weight, gate, output, rows, width, eps, zeroCentered, stream)
+                : FastllmCudaCloverNormImpl<__nv_bfloat16>(input, weight, gate, output, rows, width, eps, zeroCentered, stream);
+}
+
+bool FastllmCudaCloverAddNorm(void *residual, const void *input, const float *weight, void *output, int rows,
+                              int width, float eps, bool zeroCentered, void *stream, bool fp16) {
+    return fp16 ? FastllmCudaCloverAddNormImpl<__half>(residual, input, weight, output, rows, width, eps, zeroCentered, stream)
+                : FastllmCudaCloverAddNormImpl<__nv_bfloat16>(residual, input, weight, output, rows, width, eps, zeroCentered, stream);
+}
+
+bool FastllmCudaCloverRotary(void *input, int tokens, int heads, int dim, int rotaryDim, int position,
+                             float theta, void *stream, bool fp16) {
+    return fp16 ? FastllmCudaCloverRotaryImpl<__half>(input, tokens, heads, dim, rotaryDim, position, theta, stream)
+                : FastllmCudaCloverRotaryImpl<__nv_bfloat16>(input, tokens, heads, dim, rotaryDim, position, theta, stream);
+}
+
+bool FastllmCudaCloverPrepareAttention(const void *qgate, const void *key, const float *qWeight,
+        const float *kWeight, void *query, void *normalizedKey, void *gate, int tokens,
+        int queryHeads, int keyHeads, int rotaryDim, int position, float theta, float eps, void *stream,
+        int qkvStride, void *value, bool fp16) {
+    return fp16 ? FastllmCudaCloverPrepareAttentionImpl<__half>(qgate, key, qWeight, kWeight, query, normalizedKey, gate, tokens, queryHeads, keyHeads, rotaryDim, position, theta, eps, stream, qkvStride, value)
+                : FastllmCudaCloverPrepareAttentionImpl<__nv_bfloat16>(qgate, key, qWeight, kWeight, query, normalizedKey, gate, tokens, queryHeads, keyHeads, rotaryDim, position, theta, eps, stream, qkvStride, value);
+}
+
+bool FastllmCudaCloverRoute(const void *logits, int *indices, float *scores,
+        int *scratchIds, float *scratchScores, unsigned char *allowed,
+        int batch, int tokens, int experts, int topk, float coresetTopP, void *stream, int logitsStride, bool fp16) {
+    return fp16 ? FastllmCudaCloverRouteImpl<__half>(logits, indices, scores, scratchIds, scratchScores, allowed, batch, tokens, experts, topk, coresetTopP, stream, logitsStride)
+                : FastllmCudaCloverRouteImpl<__nv_bfloat16>(logits, indices, scores, scratchIds, scratchScores, allowed, batch, tokens, experts, topk, coresetTopP, stream, logitsStride);
+}
+
+bool FastllmCudaCloverExperts(const void *input, const void *gateUp, const void *down, const int *indices,
+    const float *scores, void *middle, void *parts, void *output, int rows, int hidden,
+    int intermediate, int experts, int topk, void *stream, int *workspace, void *packed,
+    const void *shared, const void *sharedGate, int sharedGateStride, bool fp16) {
+    return fp16 ? FastllmCudaCloverExpertsImpl<__half>(input, gateUp, down, indices, scores, middle, parts, output, rows, hidden, intermediate, experts, topk, stream, workspace, packed, shared, sharedGate, sharedGateStride)
+                : FastllmCudaCloverExpertsImpl<__nv_bfloat16>(input, gateUp, down, indices, scores, middle, parts, output, rows, hidden, intermediate, experts, topk, stream, workspace, packed, shared, sharedGate, sharedGateStride);
+}
+
+bool FastllmCudaCloverUnpackGdn(const void *input, const float *aLog, const float *bias, void *qkv, void *z,
+                                float *g, void *beta, int rows, int channels, int heads, void *stream, bool fp16) {
+    return fp16 ? FastllmCudaCloverUnpackGdnImpl<__half>(input, aLog, bias, qkv, z, g, beta, rows, channels, heads, stream)
+                : FastllmCudaCloverUnpackGdnImpl<__nv_bfloat16>(input, aLog, bias, qkv, z, g, beta, rows, channels, heads, stream);
 }

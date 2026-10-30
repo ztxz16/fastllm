@@ -1796,6 +1796,9 @@ bool FastllmCudaDFlashAttention(
                           int runtimeBlockSize, int slidingWindow);
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited = false);
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1);
+// Contiguous FP16 [n,m] x [k,m]^T, FP32 accumulation, FP16 output.
+// Explicit opt-in for models whose routing requires FP32 reductions.
+bool FastllmCudaHalfMatMulFloat16Fp32(const void *input, const void *weight, void *output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo = false);
 // Runs up to four independent no-bias FP16 linears that share the same one-to-
 // eight-row input. Each output row keeps the native compensated reduction

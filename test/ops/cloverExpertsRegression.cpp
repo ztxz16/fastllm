@@ -1,5 +1,6 @@
 #include "devices/cuda/fastllm-clover.h"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <vector>
 namespace {
+bool fp16 = false;
 void Check(cudaError_t code) {
     if (code != cudaSuccess) throw std::runtime_error(cudaGetErrorString(code));
 }
@@ -27,12 +29,14 @@ struct Buffer {
         return x;
     }
 };
-uint16_t BF16(float value) {
+uint16_t Round16(float value) {
+    if (fp16) return __half_raw(__float2half_rn(value)).x;
     uint32_t bits; std::memcpy(&bits, &value, 4);
     bits += 0x7fff + ((bits >> 16) & 1);
     return bits >> 16;
 }
 float Float(uint16_t value) {
+    if (fp16) return __half2float(__half(__half_raw{value}));
     uint32_t bits = uint32_t(value) << 16; float result;
     std::memcpy(&result, &bits, 4); return result;
 }
@@ -47,12 +51,12 @@ void Router(int tokens, int experts, int topk, float topP, bool ties, int stride
     std::mt19937 rng(tokens + 123 * experts);
     std::normal_distribution<float> normal(0.f, 3.f);
     std::vector<uint16_t> logits(tokens * experts);
-    for (size_t i = 0; i < logits.size(); ++i) logits[i] = BF16(ties ? float(i % experts % 5 == 0) : normal(rng));
+    for (size_t i = 0; i < logits.size(); ++i) logits[i] = Round16(ties ? float(i % experts % 5 == 0) : normal(rng));
     Buffer x((size_t)tokens * stride * 2), ids(tokens * topk * 4), scores(tokens * topk * 4),
         tempIds(tokens * topk * 4), tempScores(tokens * topk * 4), mask(experts);
     auto launch = [&]() {
         Require(FastllmCudaCloverRoute(x.p, (int *)ids.p, (float *)scores.p, (int *)tempIds.p,
-            (float *)tempScores.p, (unsigned char *)mask.p, 1, tokens, experts, topk, topP, nullptr, stride), "router launch");
+            (float *)tempScores.p, (unsigned char *)mask.p, 1, tokens, experts, topk, topP, nullptr, stride, fp16), "router launch");
     };
     auto reference = [&]() {
         std::vector<float> masses(experts, 0.f);
@@ -89,7 +93,7 @@ void Router(int tokens, int experts, int topk, float topP, bool ties, int stride
         }
     };
     auto upload = [&]() {
-        std::vector<uint16_t> packed((size_t)tokens * stride, BF16(123.f));
+        std::vector<uint16_t> packed((size_t)tokens * stride, Round16(123.f));
         for (int row = 0; row < tokens; ++row)
             std::copy_n(logits.begin() + row * experts, experts, packed.begin() + row * stride);
         x.Put(packed);
@@ -98,7 +102,7 @@ void Router(int tokens, int experts, int topk, float topP, bool ties, int stride
     cudaGraph_t graph; cudaGraphExec_t executable;
     Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); launch();
     Check(cudaStreamEndCapture(cudaStreamPerThread, &graph)); Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
-    for (auto &v : logits) v = BF16(normal(rng));
+    for (auto &v : logits) v = Round16(normal(rng));
     upload(); Check(cudaGraphLaunch(executable, cudaStreamPerThread)); reference();
     Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
 }
@@ -107,7 +111,7 @@ void ProjectionUnpack(int rows, int channels, int heads, bool preview, int input
     std::mt19937 rng(132 + rows); std::normal_distribution<float> normal(0.f, 1.f);
     std::vector<uint16_t> input(rows * width);
     std::vector<float> aLog(heads), bias(heads);
-    for (auto &v : input) v = BF16(normal(rng));
+    for (auto &v : input) v = Round16(normal(rng));
     for (auto &v : aLog) v = normal(rng);
     for (auto &v : bias) v = normal(rng);
     Buffer x((input.size() + inputOffset) * 2), a(heads * 4), b(heads * 4), qkv(rows * channels * 2),
@@ -115,7 +119,7 @@ void ProjectionUnpack(int rows, int channels, int heads, bool preview, int input
     a.Put(aLog); b.Put(bias);
     auto launch = [&]() {
         Require(FastllmCudaCloverUnpackGdn((uint16_t *)x.p + inputOffset, (float *)a.p, (float *)b.p, qkv.p, z.p,
-            (float *)g.p, preview ? nullptr : beta.p, rows, channels, heads), "projection unpack launch");
+            (float *)g.p, preview ? nullptr : beta.p, rows, channels, heads, nullptr, fp16), "projection unpack launch");
     };
     auto reference = [&]() {
         auto actualQkv = qkv.Get<uint16_t>(rows * channels), actualZ = z.Get<uint16_t>(rows * values);
@@ -130,7 +134,7 @@ void ProjectionUnpack(int rows, int channels, int heads, bool preview, int input
                 Close(actualG[row * heads + h], expected, 2.e-6f, 2.e-6f);
                 if (!preview) {
                     float bv = Float(input[row * width + channels + values + heads + h]);
-                    Close(Float(actualBeta[row * heads + h]), Float(BF16(1.f / (1.f + std::exp(-bv)))), 0.f, .008f);
+                    Close(Float(actualBeta[row * heads + h]), Float(Round16(1.f / (1.f + std::exp(-bv)))), 0.f, .008f);
                 }
             }
         }
@@ -142,7 +146,7 @@ void ProjectionUnpack(int rows, int channels, int heads, bool preview, int input
     cudaGraph_t graph; cudaGraphExec_t executable;
     Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); launch();
     Check(cudaStreamEndCapture(cudaStreamPerThread, &graph)); Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
-    for (auto &v : input) v = BF16(normal(rng) * 20.f);
+    for (auto &v : input) v = Round16(normal(rng) * 20.f);
     upload(); Check(cudaGraphLaunch(executable, cudaStreamPerThread)); reference();
     Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
 }
@@ -151,7 +155,7 @@ void Experts(int rows, int hidden, int inter, int experts, int topk, bool cluste
     std::mt19937 rng(734 + hidden);
     std::normal_distribution<float> normal(0.f, 1.f);
     auto random = [&](size_t n, float scale) {
-        std::vector<uint16_t> out(n); for (auto &v : out) v = BF16(normal(rng) * scale); return out;
+        std::vector<uint16_t> out(n); for (auto &v : out) v = Round16(normal(rng) * scale); return out;
     };
     auto input = random(rows * hidden, .3f);
     auto gate = random((size_t)experts * 2 * inter * hidden, .03f);
@@ -168,13 +172,13 @@ void Experts(int rows, int hidden, int inter, int experts, int topk, bool cluste
     std::vector<uint16_t> sharedGate(rows);
     const float gateValues[] = {-8.f, -1.f, 0.f, 1.f, 8.f};
     for (int row = 0; row < rows; ++row)
-        sharedGate[row] = BF16(gateValues[row % 5]);
+        sharedGate[row] = Round16(gateValues[row % 5]);
     Buffer sharedData((shared.size() + sharedOffset) * 2), sharedGateData((size_t)rows * gateStride * 2);
     auto uploadShared = [&]() {
         auto padded = shared;
-        padded.insert(padded.begin(), sharedOffset, BF16(123.f));
+        padded.insert(padded.begin(), sharedOffset, Round16(123.f));
         sharedData.Put(padded);
-        std::vector<uint16_t> strided((size_t)rows * gateStride, BF16(123.f));
+        std::vector<uint16_t> strided((size_t)rows * gateStride, Round16(123.f));
         for (int row = 0; row < rows; ++row) strided[(size_t)row * gateStride] = sharedGate[row];
         sharedGateData.Put(strided);
     };
@@ -186,13 +190,13 @@ void Experts(int rows, int hidden, int inter, int experts, int topk, bool cluste
         weights(scores.size() * 4), mid((rows * topk * inter + outputPadding) * 2),
         parts((rows * topk * hidden + outputPadding) * 2),
         y((rows * hidden + outputPadding) * 2), workspace(guard.size() * 4);
-    auto paddedInput = input; paddedInput.insert(paddedInput.begin(), inputOffset, BF16(123.f));
+    auto paddedInput = input; paddedInput.insert(paddedInput.begin(), inputOffset, Round16(123.f));
     x.Put(paddedInput); gu.Put(gate); dw.Put(down); weights.Put(scores); workspace.Put(guard);
     const auto *inputPointer = (const char *)x.p + inputOffset * 2;
     const size_t packedBytes = FastllmCudaCloverExpertsPackedBytes(rows, hidden, inter, experts, topk);
-    // The generic WMMA loader requires aligned inputs. Exercise the packed
-    // path's scalar read fallback only when that architecture is available.
-    if ((inputOffset || outputOffset) && !packedBytes) return;
+    // Exercise the packed BF16 path and the FP16 scalar/WMMA loaders with
+    // unaligned views; the legacy BF16-only configurations are skipped.
+    if ((inputOffset || outputOffset) && !packedBytes && !fp16) return;
     if (outputOffset) {
         mid.Put(std::vector<uint16_t>(rows * topk * inter + outputPadding, 0x5a5a));
         parts.Put(std::vector<uint16_t>(rows * topk * hidden + outputPadding, 0x5a5a));
@@ -207,7 +211,7 @@ void Experts(int rows, int hidden, int inter, int experts, int topk, bool cluste
                     (uint16_t *)mid.p + outputOffset, (uint16_t *)parts.p + outputOffset,
                     (uint16_t *)y.p + outputOffset, rows, hidden, inter, experts, topk, nullptr,
                     (int *)workspace.p + 64, usePacked && packedBytes ? (char *)packed.p + 128 : nullptr,
-                    fusedShared ? sharedPointer : nullptr, fusedShared ? sharedGateData.p : nullptr, gateStride),
+                    fusedShared ? sharedPointer : nullptr, fusedShared ? sharedGateData.p : nullptr, gateStride, fp16),
                 "expert launch");
     };
     auto reference = [&]() {
@@ -226,21 +230,21 @@ void Experts(int rows, int hidden, int inter, int experts, int topk, bool cluste
                     float v = Float(input[row * hidden + k]);
                     g += v * Float(gate[w + k]); u += v * Float(gate[w + (size_t)inter * hidden + k]);
                 }
-                float gv = Float(BF16(float(g))), uv = Float(BF16(float(u)));
-                middle[d] = Float(BF16(gv / (1.f + std::exp(-gv)) * uv));
+                float gv = Float(Round16(float(g))), uv = Float(Round16(float(u)));
+                middle[d] = Float(Round16(gv / (1.f + std::exp(-gv)) * uv));
                 Close(Float(actualMiddle[task * inter + d]), middle[d], .004f, .008f);
             }
             for (int d = 0; d < hidden; ++d) {
                 double sum = 0.; size_t w = ((size_t)expert * hidden + d) * inter;
                 for (int k = 0; k < inter; ++k) sum += middle[k] * Float(down[w + k]);
-                sums[row * hidden + d] += Float(BF16(float(sum) * scores[task]));
+                sums[row * hidden + d] += Float(Round16(float(sum) * scores[task]));
             }
         }
         auto actual = y.Get<uint16_t>(sums.size(), outputOffset);
         if (fusedShared) {
             auto contribution = [&](size_t i) {
-                float probability = Float(BF16(1.f / (1.f + std::exp(-Float(sharedGate[i / hidden])))));
-                return Float(BF16(Float(shared[i]) * probability));
+                float probability = Float(Round16(1.f / (1.f + std::exp(-Float(sharedGate[i / hidden])))));
+                return Float(Round16(Float(shared[i]) * probability));
             };
             // Compare the fused output bit-for-bit with the ordinary expert
             // output plus separately rounded shared sigmoid/product/add.
@@ -248,25 +252,26 @@ void Experts(int rows, int hidden, int inter, int experts, int topk, bool cluste
                         inputPointer, gu.p, dw.p, (int *)ids.p, (float *)weights.p,
                         (uint16_t *)mid.p + outputOffset, (uint16_t *)parts.p + outputOffset,
                         (uint16_t *)y.p + outputOffset, rows, hidden, inter, experts, topk, nullptr,
-                        (int *)workspace.p + 64, packedBytes ? (char *)packed.p + 128 : nullptr),
+                        (int *)workspace.p + 64, packedBytes ? (char *)packed.p + 128 : nullptr, nullptr, nullptr, 1, fp16),
                     "unfused reference launch");
             auto routed = y.Get<uint16_t>(sums.size(), outputOffset);
             for (size_t i = 0; i < sums.size(); ++i) {
-                Require(actual[i] == BF16(Float(routed[i]) + contribution(i)),
+                Require(actual[i] == Round16(Float(routed[i]) + contribution(i)),
                         "shared epilogue differs bitwise");
-                sums[i] = Float(BF16(sums[i])) + contribution(i);
+                sums[i] = Float(Round16(sums[i])) + contribution(i);
             }
             Require(sharedData.Get<uint16_t>(shared.size(), sharedOffset) == shared, "shared input modified");
             auto strided = sharedGateData.Get<uint16_t>((size_t)rows * gateStride);
             for (int row = 0; row < rows; ++row) for (int d = 0; d < gateStride; ++d)
-                Require(strided[(size_t)row * gateStride + d] == (d ? BF16(123.f) : sharedGate[row]),
+                Require(strided[(size_t)row * gateStride + d] == (d ? Round16(123.f) : sharedGate[row]),
                         "shared gate or padding modified");
         }
-        for (size_t i = 0; i < sums.size(); ++i) Close(Float(actual[i]), Float(BF16(sums[i])), .0005f, .02f);
+        for (size_t i = 0; i < sums.size(); ++i) Close(Float(actual[i]), Float(Round16(sums[i])), .0005f, .02f);
         auto actualGuard = workspace.Get<int>(guard.size());
-        int major = 0;
-        Check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0));
-        if (major >= 8 && rows >= 4 && rows * topk <= 512 && hidden >= 512 && inter >= 128 && experts <= 256) {
+        // Scalar GEMV leaves this workspace untouched. Inspect the dispatch's
+        // output rather than the physical GPU: tests may JIT older PTX.
+        bool grouped = actualGuard[64 + rows] != guard[64 + rows];
+        if (grouped && rows >= 4 && rows * topk <= 512 && hidden >= 512 && inter >= 128 && experts <= 256) {
             std::vector<int> expectedTiles;
             for (int e = 0; e < experts; ++e) {
                 std::vector<int> tasks;
@@ -280,6 +285,8 @@ void Experts(int rows, int hidden, int inter, int experts, int topk, bool cluste
             const size_t offset = 64 + (size_t)experts * (rows + 1);
             Require(actualGuard[offset] == (int)expectedTiles.size(), "fused expert tile count differs");
             Require(std::equal(expectedTiles.begin(), expectedTiles.end(), actualGuard.begin() + offset + 1), "fused expert tiles differ");
+        } else if (!grouped) {
+            Require(actualGuard == guard, "scalar expert workspace modified");
         }
 
         for (int i = 0; i < 64; ++i) Require(actualGuard[i] == guard[i] && actualGuard[n + 64 + i] == guard[i], "expert workspace overrun");
@@ -316,16 +323,17 @@ void Experts(int rows, int hidden, int inter, int experts, int topk, bool cluste
     for (int task = 0; task < rows * topk; ++task) routes[task] = task % topk;
     if (fusedShared) {
         for (auto &v : shared)
-            v = BF16(normal(rng));
+            v = Round16(normal(rng));
         for (int row = 0; row < rows; ++row)
-            sharedGate[row] = BF16(gateValues[(row + 2) % 5]);
+            sharedGate[row] = Round16(gateValues[(row + 2) % 5]);
         uploadShared();
     }
     ids.Put(routes); Check(cudaGraphLaunch(executable, cudaStreamPerThread)); reference();
     Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
 }
 }
-int main() {
+int main(int argc, char **argv) {
+    fp16 = argc > 1 && std::string(argv[1]) == "fp16";
     try {
         int count = 0; if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
         Check(cudaSetDevice(0));

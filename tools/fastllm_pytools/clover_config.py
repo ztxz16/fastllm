@@ -9,14 +9,32 @@ def prepare(args, config):
     """Reject settings that the native Clover implementation cannot honor."""
     if "enable_thinking" not in getattr(args, "_auto_explicit", ()):
         args.enable_thinking = "true"
-    for key in ("dtype", "atype", "kv_cache_dtype", "moe_dtype", "moe_atype"):
+    precision_keys = ("dtype", "atype", "kv_cache_dtype", "moe_dtype", "moe_atype")
+    requested = set()
+    for key in precision_keys:
         value = getattr(args, key, "")
-        if value not in ("", "auto", "bf16", "bfloat16"):
-            raise ValueError("Clover currently requires BF16: --" + key)
-        setattr(args, key, "bfloat16")
+        if value not in ("", "auto", "bf16", "bfloat16", "fp16", "float16"):
+            raise ValueError("Clover requires BF16 or FP16: --" + key)
+        if value not in ("", "auto"):
+            requested.add("float16" if value in ("fp16", "float16") else "bfloat16")
+    if len(requested) > 1:
+        raise ValueError("Clover weights, activations and attention KV must use the same precision")
+    precision = next(iter(requested), "bfloat16")
+    # The native model also enforces FP16 below SM80 for direct C++ callers.
+    if not getattr(args, "auto", False):
+        from .auto_config import cuda_hardware
+        try:
+            info, _ = cuda_hardware()
+        except ValueError:
+            info = {}  # Native initialization reports missing CUDA support.
+        match = re.fullmatch(r"cuda(?::(\d+))?", args.device or "cuda")
+        if match and 0 < info.get(int(match[1] or 0), {}).get("capability", 0) < 80:
+            precision = "float16"
+    for key in precision_keys:
+        setattr(args, key, precision)
     if (args.tp or args.mtp or args.dspark or args.speculative_draft_model_path or
             args.lora or args.dtype_config or args.mmproj or args.kvmem):
-        raise ValueError("Clover requires one GPU, original BF16 weights and no external draft/adapter/KVMem")
+        raise ValueError("Clover requires one GPU, original weights and no external draft/adapter/KVMem")
     if args.speculative_algorithm not in ("", "clover"):
         raise ValueError("Clover supports --speculative_algorithm clover or off")
     if args.low_gpu_mem or args.moe_experts > 0 or args.prefill_batch_tokens > 0:
@@ -91,8 +109,6 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
     limit = memory._memory_limit_bytes(getattr(args, "auto_gpu_memory_limit", None), "auto_gpu_memory_limit")
     choices = []
     for d in devices:
-        if info[d].get("capability", 0) < 80:
-            continue
         available = query_gpu(d)
         budget = min(available["free"] - 512 * memory.MiB, int(available["total"] * ratio))
         if limit is not None:
@@ -100,9 +116,12 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
         if budget >= required:
             choices.append((budget, d))
     if not choices:
-        raise ValueError("Clover needs one SM80+ GPU with at least %.2f GiB available under the memory budget" %
+        raise ValueError("Clover needs one CUDA GPU with at least %.2f GiB available under the memory budget" %
                          (required / memory.GiB))
     _, device = max(choices)
+    if info[device].get("capability", 0) < 80:
+        for key in ("dtype", "atype", "kv_cache_dtype", "moe_dtype", "moe_atype"):
+            setattr(args, key, "float16")
     device = "cuda:%d" % device
     if args.moe_device and args.moe_device != device:
         raise ValueError("Clover experts must reside on the same GPU as the main model")
@@ -127,11 +146,11 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
         args.speculative_algorithm = "clover"
     args.speculative_num_draft_tokens = width
     result = dict(model="clover_moe", mode="single_gpu", device=device, max_batch=args.max_batch,
-                  dtype="bfloat16", max_context_length=context, weights_bytes=weights,
+                  dtype=args.atype, max_context_length=context, weights_bytes=weights,
                   recurrent_state_bytes=state, snapshot_bytes=snapshots,
                   kv_bytes=kv, workspace_reserve_bytes=reserve, estimated_gpu_bytes=required,
                   speculative_algorithm=args.speculative_algorithm, block_size=width,
-                  automatic={"policy": "single GPU; original BF16; native context", "cuda_graph": False,
+                  automatic={"policy": "single GPU; BF16 or legacy FP16; native context", "cuda_graph": False,
                              "moe_cuda_graph": os.environ.get("FASTLLM_CUDA_GRAPH", "").lower() not in ("0", "false", "off", "no")})
     print("[auto] " + json.dumps(result, sort_keys=True), flush=True)
     return result

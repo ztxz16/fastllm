@@ -47,6 +47,21 @@ class CloverAutoTest(unittest.TestCase):
         self.assertEqual(result["snapshot_bytes"], 16 * result["recurrent_state_bytes"])
         self.assertEqual(args.chunked_prefill_size, 4096)
 
+    def test_explicit_fp16(self):
+        args = self.args("--atype", "float16")
+        result = self.resolve(args)
+        self.assertEqual(result["dtype"], "float16")
+        self.assertEqual((args.dtype, args.atype, args.kv_cache_dtype), ("float16",) * 3)
+
+    def test_legacy_auto_fp16(self):
+        for capability in (60, 61, 70, 75):
+            args = self.args()
+            with patch.object(hybrid_auto, "inventory", return_value=(self.config, self.weights)), redirect_stdout(io.StringIO()):
+                result = auto_config.resolve(args, lambda d: dict(free=140 << 30, total=144 << 30),
+                    hardware=({0: {"capability": capability}}, {}), ram=dict(total=512 << 30, available=400 << 30))
+            self.assertEqual(result["dtype"], "float16")
+            self.assertEqual((args.dtype, args.atype, args.kv_cache_dtype), ("float16",) * 3)
+
     def test_batch_capacity_is_accounted_per_request(self):
         single = self.resolve(self.args())
         for size in (2, 4, 8):
@@ -76,17 +91,18 @@ class CloverAutoTest(unittest.TestCase):
 
     def test_insufficient_memory_is_transactional(self):
         args = self.args(); original = copy.deepcopy(vars(args))
-        with self.assertRaisesRegex(ValueError, "one SM80"):
+        with self.assertRaisesRegex(ValueError, "one CUDA"):
             self.resolve(args, free=40 << 30)
         self.assertEqual(vars(args), original)
 
     def test_unsupported_settings_fail_before_loading(self):
-        for options in (("--dtype", "float16"), ("--max_batch", "9"),
+        for options in (("--dtype", "int8"), ("--max_batch", "9"),
                         ("--max_context_length", "131073"), ("--speculative_num_draft_tokens", "7"),
                         ("--device", "cuda:0,1"), ("--prefix_cache", "true"),
                         ("--max_batch", "2", "--speculative_num_draft_tokens", "8")):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.resolve(self.args(*options))
+
 
 
 class CloverSamplingModel(SamplingModel):

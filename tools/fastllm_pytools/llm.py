@@ -3501,8 +3501,8 @@ class model:
         fastllm_lib.set_save_history(self.model, save)
 
     def set_atype(self, atype: str):
-        if self._is_clover() and atype not in ("bf16", "bfloat16"):
-            raise ValueError("Clover activations must be BF16")
+        if self._is_clover() and atype not in ("bf16", "bfloat16", "fp16", "float16"):
+            raise ValueError("Clover activations must be BF16 or FP16")
         if getattr(self, "kvmem_enabled", False):
             raise ValueError("Set compute dtype before configuring KVMem")
         fastllm_lib.set_model_atype(self.model, str(atype).encode())
@@ -3511,8 +3511,8 @@ class model:
         fastllm_lib.set_model_moe_atype(self.model, str(moe_atype).encode())
 
     def set_kv_cache_dtype(self, kv_cache_dtype: str):
-        if self._is_clover() and kv_cache_dtype not in ("bf16", "bfloat16"):
-            raise ValueError("Clover attention KV must be BF16")
+        if self._is_clover() and kv_cache_dtype not in ("bf16", "bfloat16", "fp16", "float16"):
+            raise ValueError("Clover attention KV must be BF16 or FP16")
         if getattr(self, "kvmem_enabled", False):
             raise ValueError("Set KV dtype before configuring KVMem")
         fastllm_lib.set_model_kv_cache_dtype(self.model, str(kv_cache_dtype).encode())

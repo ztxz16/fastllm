@@ -107,8 +107,8 @@ __global__ void Prepare(const float *prepared, const __nv_bfloat16 *values, cons
     }
 }
 
-using namespace nvcuda;
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+using namespace nvcuda;
 using A = wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::col_major>;
 using B = wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major>;
 using Acc = wmma::fragment<wmma::accumulator, 16, 16, 8, float>;
