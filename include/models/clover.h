@@ -65,6 +65,8 @@ private:
     // released with the model after ShutdownRuntime has joined the worker.
     Data gdnPrefillWorkspace;
     int maskToken = 151669, vocabSize = 248320;
+    std::shared_ptr<class HybridMoeBF16> hybridMoe;
+    std::vector<bool> hostExperts;
     struct MoeGraphs;
     std::shared_ptr<MoeGraphs> moeGraphs;
     struct Request;

@@ -1,4 +1,5 @@
 #include "clover.h"
+#include "utils/hybrid_moe.h"
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
@@ -181,7 +182,24 @@ void CloverModel::EnsureResident() {
         }
     }
     FastllmCudaSetDevice(cudaDevice);
-    for (auto &item : weight.weight) item.second.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice});
+    hostExperts.resize(block_cnt, false);
+    std::vector<std::pair<Data *, Data *>> hostLayers(block_cnt);
+    for (int i = 0; i < block_cnt; ++i) {
+        const auto device = SelectMoeDeviceForLayer(i);
+        hostExperts[i] = IsSharedHostMoeDevice(device);
+        Check(hostExperts[i] || device.empty() || device == "cuda" || device == "cuda:" + std::to_string(cudaDevice),
+              "unsupported routed expert placement");
+        if (hostExperts[i]) hostLayers[i] = {&weight[Layer(i) + "mlp.experts.gate_up_proj"],
+                                           &weight[Layer(i) + "mlp.experts.down_proj"]};
+    }
+    for (auto &item : weight.weight) {
+        bool host = false;
+        for (const auto &pair : hostLayers) host |= pair.first == &item.second || pair.second == &item.second;
+        if (host) item.second.ToDevice(DataDevice::CPU);
+        else item.second.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice});
+    }
+    if (std::any_of(hostExperts.begin(), hostExperts.end(), [](bool host) { return host; }))
+        hybridMoe = std::make_shared<HybridMoeBF16>(hostLayers, cudaDevice);
     std::vector<std::pair<Data *, void *>> mergedSources;
     auto merge = [&](const std::string &destination, const std::vector<std::string> &sources,
                      int alignment = 1, bool keepViews = false) {
@@ -443,6 +461,16 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
             (int *)scratchIds.cudaData, (float *)scratchScores.cudaData, (unsigned char *)allowed.cudaData,
             batch, t / batch, num_experts, num_experts_per_tok, preview && coresetEnabled ? coresetTopP : 0.f,
             nullptr, routerStride), "routing failed");
+        if (hostExperts[layer]) {
+            if (fusedGate) Split(router, 1, num_experts, num_experts + 1, sharedScale);
+            hybridMoe->SetPrefill(!graphAllowed && t > blockSize);
+            hybridMoe->Run(input, ids, scores, output, layer);
+            Data probability;
+            Sigmoid(sharedScale, probability);
+            MulTo(shared, probability);
+            AddTo(output, shared);
+            return;
+        }
         PrepareCloverData(middle, BFLOAT16, {t, num_experts_per_tok, intermediate}, cudaDevice);
         PrepareCloverData(parts, BFLOAT16, {t, num_experts_per_tok, embed_dim}, cudaDevice);
         PrepareCloverData(output, BFLOAT16, input.dims, cudaDevice);
@@ -461,7 +489,7 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
               "experts failed");
     };
     const int width = t / batch;
-    if (!graphAllowed || batch > 8 || width < 4 || width > blockSize || blockSize % width ||
+    if (hostExperts[layer] || !graphAllowed || batch > 8 || width < 4 || width > blockSize || blockSize % width ||
         FastllmCudaGraphIsCapturingFast()) {
         eager(input, output);
         return;

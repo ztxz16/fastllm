@@ -57,6 +57,24 @@ ftllm server /path/to/Clover-35B-A3B-Preview --auto --speculative_algorithm off
 
 默认采样参数读取 checkpoint 的 `generation_config.json`；原版配置为贪婪、`top_k=0`、`top_p=1`、`temperature=1`、`repetition_penalty=1.05`、`presence_penalty=0.9`、`frequency_penalty=0`。显式传入正温度可启用随机采样，`temperature=0` 为贪婪。惩罚只统计已输出 token。随机数实现与 PyTorch 不同，相同 seed 不保证跨框架生成相同序列。
 
+## NUMA 混合推理
+
+编译时启用 `USE_CUDA` 和 `USE_NUMAS`，可将路由专家放在主存，主干、router 和共享专家仍在单张 GPU 上计算。此路径使用原生 BF16 专家，不需要额外的算子库。
+
+```bash
+ftllm server /path/to/Clover-35B-A3B-Preview \
+  --device cuda:0 --moe_device numa --moe_cuda_cache 0 \
+  --cuda_embedding --threads 32 --max_batch 1 \
+  --max_context_length 4096 --chunked_prefill_size 256 \
+  --speculative_algorithm clover --speculative_num_draft_tokens 16
+```
+
+线程数需按 CPU 核数调整。`--moe_cuda_cache 0` 使用纯 NUMA 路由专家；显式设置如 `--moe_cuda_cache 3g` 可启用 GPU 专家缓存和动态分流。该值限制专家缓存及临时上传区，**不是进程总显存上限**；还需为主干权重、KV、FP32 循环状态、推测快照和工作区留出空间。当前 `--auto` 仍选择全部权重驻留 GPU 的方案，混推使用上述显式配置。
+
+CPU 按整个请求块归并同一专家的路由；缓存与动态分流复用通用混推的热度策略、搬运成本判断和整专家调度。同一专家在当前块内统一分配到 CPU 或 GPU，临时上传一次，最后按原专家编号归约。CPU/GPU 都保留 gate/up、SwiGLU 和加权专家结果的 BF16 舍入边界，但矩阵乘累加顺序不同，完整模型不保证与全部 GPU 驻留路径逐 token 相同。NUMA 层不捕获包含 CPU 工作的 MoE 子图。
+
+当前主存同时保留原始专家与 NUMA 分片，原版模型需要约 120 GiB 的专家存储，另加加载暂存与运行工作区。缓存是否提速取决于命中率、CPU、PCIe 和请求块大小，应以实际负载测量为准。
+
 ## 实现范围
 
 - 权重、激活和注意力 KV 为 BF16，GDN 循环状态保持 FP32。

@@ -487,6 +487,7 @@ if (USE_CUDA)
         src/devices/cuda/models/deepseekv41-engram.cu
         src/devices/cuda/models/deepseekv41-reference.cu
         src/devices/cuda/models/deepseekv41-dspark-kernels.cu
+        src/devices/cuda/moe/fastllm-moe-bf16.cu
         src/devices/cuda/models/clover-kernels.cu
         src/devices/cuda/models/clover-attention.cu
         src/devices/cuda/models/qwen4-kernels.cu)
@@ -2996,6 +2997,15 @@ if (UNIT_TEST)
                 LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77)
         endforeach()
         set_tests_properties(clover_graph PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+
+        if (USE_NUMAS)
+            add_executable(hybridBF16Regression test/ops/hybridBF16Regression.cpp)
+            target_link_libraries(hybridBF16Regression fastllm)
+            target_include_directories(hybridBF16Regression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME hybrid_bf16 COMMAND hybridBF16Regression)
+            add_test(NAME hybrid_bf16_cache COMMAND hybridBF16Regression 67108864)
+            set_tests_properties(hybrid_bf16 hybrid_bf16_cache PROPERTIES LABELS "cuda;numa" TIMEOUT 180 SKIP_RETURN_CODE 77)
+        endif()
 
         add_executable(bf16MoeRegression test/ops/bf16MoeRegression.cpp)
         target_link_libraries(bf16MoeRegression fastllm)
