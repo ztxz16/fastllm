@@ -13,3 +13,8 @@ set_target_properties(fastllm_lingbot PROPERTIES CUDA_STANDARD 17 CXX_STANDARD 1
 add_executable(lingbot_world_generate ${PROJECT_SOURCE_DIR}/tools/lingbot_world/generate.cpp)
 target_link_libraries(lingbot_world_generate PRIVATE fastllm_lingbot)
 set_target_properties(lingbot_world_generate PROPERTIES CXX_STANDARD 17)
+add_library(lingbot_world_test_ops SHARED EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/test/lingbot_world/operator_bridge.cpp)
+target_link_libraries(lingbot_world_test_ops PRIVATE fastllm_lingbot)
+set_target_properties(lingbot_world_test_ops PROPERTIES CXX_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
