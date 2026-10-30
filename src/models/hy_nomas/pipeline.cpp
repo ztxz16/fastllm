@@ -144,9 +144,11 @@ std::unique_ptr<WorldState> Pipeline::createWorld(const std::string &prompt,int 
 Tensor Pipeline::encodeWorldPrompt(const std::string &prompt) {
     if(prompt.empty() || prompt.size()>16384)
         throw std::invalid_argument("world prompt must be nonempty and at most 16384 bytes");
+    // PE emits structured scene JSON. Allow it within the released 1280-token
+    // text budget, checking before videoPrompt can silently truncate input.
+    if(tokenizer_.encode(prompt).size()>1200)
+        throw std::invalid_argument("world prompt exceeds 1200 encoded tokens; shorten the scene description");
     int crop=0; auto ids=tokenizer_.videoPrompt(prompt,crop);
-    if(int(ids.size())-crop>256)
-        throw std::invalid_argument("world prompt exceeds 256 encoded tokens; shorten the scene description");
     // Reuse the native encoder. Keep world KV/decoder history while switching
     // resident weights so that a live edit fits the same GPU memory budget.
     dit_.unload(); decoder_.unload();

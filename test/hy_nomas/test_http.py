@@ -53,6 +53,27 @@ class FakeBackend:
         self.closed = True
 
 
+class FakeEnhancer:
+    model = "test-pe"
+
+    def __init__(self):
+        self.calls = []
+        self.fail = False
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.release.set()
+
+    def enhance(self, caption, **kwargs):
+        self.calls.append((caption, kwargs))
+        self.started.set()
+        while not self.release.wait(.01):
+            if kwargs["cancelled"]():
+                raise RuntimeError("generation cancelled")
+        if self.fail:
+            raise RuntimeError("test PE failure")
+        return {"model": self.model, "prompt": json.dumps({"expanded": caption})}
+
+
 class HTTPTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -127,6 +148,68 @@ class HTTPTests(unittest.TestCase):
         for _ in range(4):
             self.submit()
         self.assertEqual(self.client.post("/v1/videos", json=self.request).status_code, 429)
+
+    def test_expansion_is_applied_once_then_cached_for_navigation(self):
+        enhancer = FakeEnhancer()
+        self.client.app.state.jobs.enhancer = enhancer
+        self.backend.release.set()
+        world = self.world(); url = '/v1/worlds/' + world['id']
+        first = self.terminal(world['current_job'])
+        self.assertEqual(first['action'], 'follow_prompt')
+        self.assertEqual(first['enhancement_status'], 'completed')
+        expanded = json.dumps({'expanded': 'A red ball'})
+        self.assertEqual(self.backend.requests[-1].caption(), expanded)
+        for action in ('left', 'look_right', 'follow_prompt'):
+            job = self.client.post(url+'/actions', json={'action': action}).json()
+            self.assertEqual(self.terminal(job['id'])['enhancement_status'], 'cached')
+        self.assertEqual(len(enhancer.calls), 1)
+        self.client.patch(url, json={'prompt': 'The ball turns blue'})
+        job = self.client.post(url+'/actions', json={'action': 'follow_prompt'}).json()
+        self.assertEqual(self.terminal(job['id'])['status'], 'completed')
+        self.assertEqual(len(enhancer.calls), 2)
+        self.assertEqual(enhancer.calls[-1][1]['previous'], expanded)
+        state = self.client.get(url).json()
+        self.assertEqual(state['prompt'], 'The ball turns blue')
+        self.assertEqual(state['applied_prompt'], 'The ball turns blue')
+        self.assertEqual(json.loads(state['enhanced_prompt']), {'expanded': 'The ball turns blue'})
+        job = self.client.post(url+'/actions', json={'action': 'right'}).json()
+        result = self.terminal(job['id'])
+        self.assertEqual(result['text_condition'], 'camera_continuation')
+        self.assertEqual(len(enhancer.calls), 2)
+        self.assertTrue((Path(self.directory.name)/job['id']/'generation.json').exists())
+
+    def test_expansion_failure_and_cancel_do_not_advance_world(self):
+        enhancer = FakeEnhancer(); enhancer.fail = True
+        self.client.app.state.jobs.enhancer = enhancer
+        self.backend.release.set()
+        world = self.world(); url = '/v1/worlds/' + world['id']
+        result = self.terminal(world['current_job'])
+        self.assertEqual(result['status'], 'failed')
+        self.assertIn('test PE failure', result['error']['message'])
+        self.assertEqual(self.backend.requests, [])
+        self.assertEqual(self.client.get(url).json()['segments'], 0)
+        enhancer.fail = False; enhancer.started.clear(); enhancer.release.clear()
+        job = self.client.post(url+'/actions', json={'action': 'stay'}).json()
+        try:
+            self.assertTrue(enhancer.started.wait(2))
+            self.assertEqual(self.client.get('/v1/videos/'+job['id']).json()['stage'], 'prompt_enhancement')
+            self.client.post('/v1/videos/'+job['id']+'/cancel')
+            self.assertEqual(self.terminal(job['id'])['status'], 'cancelled')
+            self.assertEqual(self.backend.requests, [])
+            state = self.client.get(url).json()
+            self.assertIsNone(state['enhanced_prompt'])
+            self.assertEqual(state['segments'], 0)
+        finally:
+            enhancer.release.set()
+
+    def test_expansion_can_be_disabled_per_request(self):
+        enhancer = FakeEnhancer()
+        self.client.app.state.jobs.enhancer = enhancer
+        self.backend.release.set()
+        response = self.client.post('/v1/videos', json={**self.request, 'enhance_prompt': False})
+        self.assertEqual(self.terminal(response.json()['id'])['status'], 'completed')
+        self.assertEqual(enhancer.calls, [])
+        self.assertEqual(self.backend.requests[0].caption(), 'A red ball')
 
     def test_incremental_frames_sse_and_timing(self):
         encoding = threading.Event()

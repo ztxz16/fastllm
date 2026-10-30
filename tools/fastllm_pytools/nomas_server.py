@@ -51,6 +51,8 @@ class PromptRequest(BaseModel):
 
 class GenerateRequest(PromptRequest):
     model: Literal["hy-nomas"] = "hy-nomas"
+    enhance_prompt: bool = True
+    perspective: Literal["auto", "first-person", "second-person", "third-person follow", "third-person observer"] = "auto"
     width: int = Field(default=128, ge=64, le=512, multiple_of=32, strict=True)
     height: int = Field(default=128, ge=64, le=512, multiple_of=32, strict=True)
     num_frames: int = Field(default=16, ge=4, le=40, multiple_of=4, strict=True)
@@ -166,8 +168,9 @@ def png_rgb(rgb, width, height):
 
 
 class Jobs:
-    def __init__(self, backend, output, max_queue=4, max_results=16):
+    def __init__(self, backend, output, max_queue=4, max_results=16, enhancer=None):
         self.backend, self.output = backend, Path(output)
+        self.enhancer = enhancer
         self.output.mkdir(parents=True, exist_ok=True)
         self.pending = queue.Queue(maxsize=max_queue)
         self.jobs, self.lock = {}, threading.RLock()
@@ -229,10 +232,12 @@ class Jobs:
             world_id = "world_" + uuid.uuid4().hex
             world = dict(id=world_id, object="world", status="ready", width=request.width, height=request.height,
                          seed=request.seed, history_segments=6, segments=0, generated_frames=0, current_job=None, latest_video=None,
-                         prompt=request.caption(), prompt_revision=1, applied_prompt=None, applied_prompt_revision=0, request=request)
+                         prompt=request.caption(), prompt_revision=1, applied_prompt=None, applied_prompt_revision=0,
+                         enhanced_prompt=None, enhancer_model=None, enhance_prompt=bool(self.enhancer and request.enhance_prompt),
+                         perspective=request.perspective, request=request)
             self.worlds[world_id] = world
             try:
-                self.action_world(world_id, "stay")
+                self.action_world(world_id, "follow_prompt" if world["enhance_prompt"] else "stay")
             except Exception:
                 del self.worlds[world_id]
                 raise
@@ -307,6 +312,31 @@ class Jobs:
                 job["status"] = "cancelling" if job["status"] in ("in_progress", "cancelling") else "cancelled"
             return self.public(job)
 
+    def prepare_request(self, job):
+        request = job["request"]
+        if not self.enhancer or not request.enhance_prompt:
+            return request
+        with self.lock:
+            world = self.worlds.get(job.get("world_id"))
+            previous = world.get("enhanced_prompt") if world else None
+            cached = previous if world and world["applied_prompt"] == request.caption() else None
+            job["enhancement_status"] = "cached" if cached else "in_progress"
+            if not cached:
+                job["stage"] = "prompt_enhancement"
+        if cached:
+            enhancement = {"model": self.enhancer.model, "prompt": cached, "source_prompt": request.caption()}
+        else:
+            enhancement = self.enhancer.enhance(request.caption(), seed=request.seed,
+                                               num_frames=request.num_frames, perspective=request.perspective,
+                                               previous=previous,
+                                               cancelled=lambda: self.stopping.is_set() or job["cancel"].is_set())
+        if self.stopping.is_set() or job["cancel"].is_set():
+            raise RuntimeError("generation cancelled")
+        with self.lock:
+            job.update(enhanced_prompt=enhancement["prompt"], enhancer_model=enhancement["model"],
+                       enhancement_status="cached" if cached else "completed")
+        return request.model_copy(update={"prompt": enhancement["prompt"], "messages": None})
+
     def run(self):
         while not self.stopping.is_set():
             try:
@@ -333,7 +363,8 @@ class Jobs:
 
             try:
                 started = time.monotonic()
-                rgb = self.backend.generate(job["request"], progress)
+                effective_request = self.prepare_request(job)
+                rgb = self.backend.generate(effective_request, progress)
                 with self.lock:
                     job["generation_seconds"] = round(time.monotonic()-started, 4)
                     job["generation_fps"] = round(job["num_frames"]/max(job["generation_seconds"], .0001), 2)
@@ -355,7 +386,11 @@ class Jobs:
                                      segments=world["segments"]+1, generated_frames=world["generated_frames"]+20,
                                      latest_video=job_id, last_action=job["action"],
                                      last_text_condition=job["text_condition"],
+                                     enhanced_prompt=job.get("enhanced_prompt"), enhancer_model=job.get("enhancer_model"),
                                      applied_prompt=job["request"].caption(), applied_prompt_revision=job["prompt_revision"])
+                    (directory / "generation.json").write_text(
+                        json.dumps({"request": job["request"].model_dump(), "result": self.public(job)}, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
             except Exception as exc:
                 shutil.rmtree(directory, ignore_errors=True)
                 with self.lock:
@@ -370,8 +405,8 @@ class Jobs:
                 self.pending.task_done()
 
 
-def create_app(backend, output, precision="bf16"):
-    jobs = Jobs(backend, output)
+def create_app(backend, output, precision="bf16", enhancer=None):
+    jobs = Jobs(backend, output, enhancer=enhancer)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -394,6 +429,7 @@ def create_app(backend, output, precision="bf16"):
     def health():
         return {"status": "ok", "backend": "native_cpp_cuda", "precision": precision,
                 "precision_status": "default" if precision == "bf16" else "reference",
+                "prompt_enhancer": {"enabled": enhancer is not None, "model": enhancer.model if enhancer else None},
                 "torch_loaded": "torch" in sys.modules}
 
     @app.get("/v1/models")
@@ -490,7 +526,18 @@ if __name__ == "__main__":
     parser.add_argument("--precision", choices=["fp32", "bf16"], default="bf16")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8007)
+    parser.add_argument("--prompt-enhancer-url", help="Chat Completions endpoint for optional Nomas-PE")
+    parser.add_argument("--prompt-enhancer-model", default="Nomas-PE")
+    parser.add_argument("--prompt-enhancer-prompts", help="Official Hy-Nomas apps/prompts directory")
+    parser.add_argument("--prompt-enhancer-timeout", type=int, default=180)
     args = parser.parse_args()
+    enhancer = None
+    if args.prompt_enhancer_url:
+        if not args.prompt_enhancer_prompts:
+            parser.error("--prompt-enhancer-prompts is required with --prompt-enhancer-url")
+        from nomas_prompt import PromptEnhancer
+        enhancer = PromptEnhancer(args.prompt_enhancer_url, args.prompt_enhancer_model,
+                                  args.prompt_enhancer_prompts, args.prompt_enhancer_timeout)
     os.environ["FASTLLM_NOMAS_PRECISION"] = args.precision
-    uvicorn.run(create_app(NativeBackend(args.library, args.model, args.text_encoder, args.device), args.output, args.precision),
+    uvicorn.run(create_app(NativeBackend(args.library, args.model, args.text_encoder, args.device), args.output, args.precision, enhancer),
                 host=args.host, port=args.port, workers=1)

@@ -9,6 +9,9 @@
 <div class="layout" id="layout"><section class="card"><form id="form">
 <label for="mode">模式</label><select id="mode"><option value="world">交互世界</option><option value="video">独立短视频</option></select>
 <label for="prompt">场景描述</label><textarea id="prompt" required>First-person view inside a spacious wooden cabin, a table and chairs in the center, large windows overlooking a green forest, warm daylight, realistic details.</textarea>
+<label id="enhance-option" hidden><input id="enhance-prompt" type="checkbox" checked style="width:auto"> 自动扩写场景描述</label>
+<div id="perspective-option" hidden><label for="perspective">观察方式</label><select id="perspective" disabled><option value="auto">根据描述选择</option><option value="first-person">第一人称</option><option value="second-person">正面近景</option><option value="third-person follow">跟随主体</option><option value="third-person observer">外部观察</option></select></div>
+<details id="expanded" hidden><summary>查看扩写后的场景描述</summary><p id="expanded-text" class="muted hint" style="white-space:pre-wrap;overflow-wrap:anywhere"></p></details>
 <div class="row"><div><label for="size">画面尺寸</label><select id="size"><option>128 × 128</option><option>256 × 160</option><option>256 × 256</option><option selected>384 × 224</option><option>512 × 288</option></select></div><div><label for="frames">每次帧数</label><select id="frames"><option value="20">20 帧</option><option value="16">16 帧</option><option value="32">32 帧</option><option value="40">40 帧</option></select></div></div>
 <label for="seed">随机种子</label><input id="seed" type="number" min="0" max="4294967295" value="42" required>
 <button id="apply-scene" type="button" disabled>修改当前场景</button><p id="prompt-status" class="muted hint">创建场景后，可修改描述来调整场景。</p>
@@ -26,6 +29,22 @@ const $=id=>document.getElementById(id);
 const actions={forward:'前进',backward:'后退',left:'左移',right:'右移',look_left:'左转',look_right:'右转',look_up:'抬头',look_down:'低头',stay:'原地观察',follow_prompt:'按描述继续生成'};
 let active=null,world=null,busy=false,images=[],timer=null,playing=false,currentFrame=0,fps=24,epoch=0,originFrame=0,loop=true;
 let continuous=false,desiredAction="stay",pendingAction=null,adaptiveRate=1,promptUpdate=null,promptError='',activePromptRevision=0;
+let enhancerAvailable=null;
+function configureEnhancer(available){
+  enhancerAvailable=Boolean(available);
+  $('enhance-option').hidden=!enhancerAvailable;
+  $('perspective-option').hidden=!enhancerAvailable;
+  controls();
+}
+function showEnhancement(item){
+  $('expanded').hidden=!item?.enhanced_prompt;
+  if(!item?.enhanced_prompt){$('expanded-text').textContent='';return;}
+  try{
+    const scene=JSON.parse(item.enhanced_prompt),segment=scene.segments?.[0]||{};
+    $('expanded-text').textContent=[...(scene.subject_list||[]).map(s=>s.subject_attribute),segment.visual_description_long,
+      ...(segment.contained_actions||[]).map(a=>a.action_description.replace(/<\/?Action\d+>/g,'').replaceAll('<|Subject1|>',scene.subject_list?.[0]?.display_name||'Subject'))].filter(Boolean).join('\n\n');
+  }catch{$('expanded-text').textContent=item.enhanced_prompt;}
+}
 const heldActions=new Map();
 const frameLoads=new Map();
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -39,6 +58,9 @@ function controls() {
   const interactive=$('mode').value==='world';
   $('layout').classList.toggle('has-world',Boolean(world)&&interactive);
   for(const id of ['generate','mode','size','seed'])$(id).disabled=busy||Boolean(promptUpdate);
+  $('generate').disabled=busy||Boolean(promptUpdate)||enhancerAvailable===null;
+  $('enhance-prompt').disabled=busy||Boolean(promptUpdate)||Boolean(world)||!enhancerAvailable;
+  $('perspective').disabled=$('enhance-prompt').disabled||!$('enhance-prompt').checked;
   $('prompt').disabled=busy&&!(interactive&&world);
   $('apply-scene').hidden=!interactive;
   $('edit-scene').hidden=!interactive;
@@ -99,6 +121,7 @@ function preload(job){
   }
 }
 async function showResult(job) {
+  showEnhancement(job);
   $('status').textContent='正在加载画面…';
   preload(job);
   const loaded=await Promise.all(job.output.frames.map(url=>frameLoads.get(url)));
@@ -116,7 +139,7 @@ async function refreshWorld() {
   if(world)world=await api('/v1/worlds/'+world.id);
 }
 function showProgress(job){
-  const stages={queued:'排队中…',text_encoding:'准备场景…',denoising:job.world_id?'生成场景…':'生成视频…',decoding:'处理画面…',saving:'加载画面…'};
+  const stages={queued:'排队中…',prompt_enhancement:'正在扩写场景描述…',text_encoding:'准备场景…',denoising:job.world_id?'生成场景…':'生成视频…',decoding:'处理画面…',saving:'加载画面…'};
   $('status').textContent=(continuous?'连续探索 · '+(actions[job.action]||'')+' · ':'')+(stages[job.stage]||job.status);$('progress').value=job.progress;preload(job);
 }
 async function awaitJob(job){
@@ -172,11 +195,12 @@ $('continuous').onclick=async()=>{
   stopContinuous();
 };
 $('form').onsubmit=async event=>{
-  event.preventDefault();if(busy||promptUpdate)return;
+  event.preventDefault();if(busy||promptUpdate||enhancerAvailable===null)return;
   busy=true;controls();setPlaying(false);$('progress').value=0;$('status').textContent='正在提交…';
   try {
     const [width,height]=$('size').value.split(' × ').map(Number);
-    const body={model:'hy-nomas',messages:[{role:'user',content:$('prompt').value}],width,height,num_frames:Number($('frames').value),seed:Number($('seed').value),steps:8};
+    const enhancePrompt=enhancerAvailable&&$('enhance-prompt').checked;
+    const body={model:'hy-nomas',messages:[{role:'user',content:$('prompt').value}],width,height,num_frames:Number($('frames').value),seed:Number($('seed').value),steps:8,enhance_prompt:enhancePrompt,perspective:enhancePrompt?$('perspective').value:'auto'};
     if($('mode').value==='world') {
       if(world){await api('/v1/worlds/'+world.id,{method:'DELETE'});world=null;}
       world=await post('/v1/worlds',body);
@@ -238,6 +262,7 @@ $('reset').onclick=async()=>{
   finally{idle();}
 };
 $('mode').onchange=controls;
+$('enhance-prompt').onchange=controls;
 $('cancel').onclick=async()=>{
   stopContinuous();
   if(active)try{await post('/v1/videos/'+encodeURIComponent(active)+'/cancel',{});$('status').textContent='正在取消…';}
@@ -262,7 +287,9 @@ async function restore() {
 }
 function restoreWorldInputs(){
   if(world.prompt!==undefined)$('prompt').value=world.prompt;
+  $('enhance-prompt').checked=Boolean(world.enhance_prompt);$('perspective').value=world.perspective||'auto';showEnhancement(world);
   $('size').value=`${world.width} × ${world.height}`;$('seed').value=world.seed;
 }
+api('/health').then(health=>configureEnhancer(health.prompt_enhancer?.enabled)).catch(()=>configureEnhancer(false));
 controls();restore();
 </script></html>

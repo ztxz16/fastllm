@@ -23,10 +23,11 @@ const context = vm.createContext({
     setTimeout(callback) { timers.set(++nextTimer, callback); return nextTimer; },
     clearTimeout(id) { timers.delete(id); },
     Image: class {set src(value) { this.url = value; this.onload(); } get src() { return this.url; }},
-    fetch: async () => ({json: async () => ({precision:'fp32'})}),
+    fetch: async () => ({ok:true,json: async () => ({precision:'fp32',prompt_enhancer:{enabled:false}})}),
     location: {search:''}, history: {replaceState() {}}, URLSearchParams,
 });
 vm.runInContext(source, context);
+assert.equal(element('generate').disabled, true); // Wait for the initial capability check.
 function tickAt(time) {
     now = time;
     const [id, callback] = timers.entries().next().value;
@@ -93,6 +94,12 @@ function tickAt(time) {
     assert.equal(JSON.parse(calls[0][1].body).action,'forward');
     assert.equal(element('forward').disabled,false);
     assert.equal(element('session-info').textContent,'当前场景');
+    context.enhanced = {enhanced_prompt: JSON.stringify({subject_list:[{display_name:'baby skier',subject_attribute:'One baby on two skis.'}],segments:[{visual_description_long:'A snowy ski resort.',contained_actions:[]}]})};
+    vm.runInContext('showEnhancement(enhanced)', context);
+    assert.equal(element('expanded').hidden, false);
+    assert.match(element('expanded-text').textContent, /One baby on two skis/);
+    vm.runInContext('showEnhancement({})', context);
+    assert.equal(element('expanded').hidden, true);
     let prevented=false;
     listeners.keydown({repeat:false,key:'w',target:{tagName:'TEXTAREA'},preventDefault(){prevented=true;}});
     listeners.keydown({repeat:true,key:'w',target:{tagName:'CANVAS'},preventDefault(){prevented=true;}});
@@ -159,5 +166,45 @@ function tickAt(time) {
     assert.equal(calls[0][1].method,'PATCH');
     assert.equal(vm.runInContext('takeAction()',context),'follow_prompt');
     vm.runInContext('stopContinuous();busy=false;controls();',context);
-    console.log('PASS: playback, world final-frame hold, same-world actions, busy controls, keyboard input isolation');
+    // A hidden or unchecked PE option must not submit a stale perspective.
+    vm.runInContext('world=null;busy=false;configureEnhancer(false);',context);
+    element('mode').value='video';element('size').value='128 × 128';
+    element('frames').value='16';element('seed').value='42';
+    element('prompt').value='A quiet room';element('perspective').value='first-person';
+    element('enhance-prompt').checked=true;
+    element('enhance-prompt').onchange();
+    assert.equal(element('enhance-option').hidden,true);
+    assert.equal(element('perspective-option').hidden,true);
+    assert.equal(element('perspective').disabled,true);
+    context.fetch=async(url,options)=>{
+        calls.push([url,options]);
+        return {ok:true,json:async()=>({...job,id:'video_options',status:'completed'})};
+    };
+    async function submittedOptions(){
+        calls.length=0;
+        await element('form').onsubmit({preventDefault(){}});
+        assert.equal(calls.length,1);
+        assert.equal(calls[0][0],'/v1/videos');
+        return JSON.parse(calls[0][1].body);
+    }
+    let options=await submittedOptions();
+    assert.equal(options.enhance_prompt,false);
+    assert.equal(options.perspective,'auto');
+    vm.runInContext('configureEnhancer(true)',context);
+    assert.equal(element('perspective-option').hidden,false);
+    assert.equal(element('perspective').disabled,false);
+    element('enhance-prompt').checked=false;element('enhance-prompt').onchange();
+    assert.equal(element('perspective').disabled,true);
+    options=await submittedOptions();
+    assert.equal(options.enhance_prompt,false);
+    assert.equal(options.perspective,'auto');
+    element('enhance-prompt').checked=true;element('enhance-prompt').onchange();
+    assert.equal(element('perspective').disabled,false);
+    options=await submittedOptions();
+    assert.equal(options.enhance_prompt,true);
+    assert.equal(options.perspective,'first-person');
+    vm.runInContext("world={id:'world_restore',status:'ready',segments:1,width:128,height:128,seed:42,enhance_prompt:false,perspective:'third-person observer'};restoreWorldInputs();controls();",context);
+    assert.equal(element('enhance-prompt').checked,false);
+    assert.equal(element('perspective').disabled,true);
+    console.log('PASS: playback, world controls, scene edits, PE capability/toggle/restore and submitted options');
 })().catch(error => {console.error(error);process.exitCode=1;});

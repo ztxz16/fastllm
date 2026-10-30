@@ -89,6 +89,47 @@ curl http://127.0.0.1:8007/health
 
 正常返回 `status: "ok"`、`backend: "native_cpp_cuda"` 和 `torch_loaded: false`。
 
+### 可选：接入 Nomas-PE 场景扩写
+
+准备 HY-Nomas 发布的 `PE/` 完整权重目录，并下载官方仓库的提示词文件（不需要安装官方 Python 推理环境）：
+
+```bash
+mkdir -p /path/to/nomas-prompts
+for name in online_user_video_rewriter_system_prompt online_user_video_rewriter_first_turn; do
+  curl -fL "https://raw.githubusercontent.com/Tencent-Hunyuan/Hy-Nomas/9d80c58616538eef721b9c489cb1ec4e12cdb2a3/apps/prompts/${name}.md" \
+    -o "/path/to/nomas-prompts/${name}.md"
+done
+```
+
+先使用已安装的 fastllm 启动 PE 的 Chat Completions 服务：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ftllm server /path/to/Hy-Nomas/PE \
+  --model_name Nomas-PE --host 127.0.0.1 --port 8008 \
+  --device cuda --tp off --dtype int8 --atype float16 \
+  --low_gpu_mem --vision_device cpu --max_batch 1 --mtp 0 \
+  --max_context_length 32768 --tokens 32768 --kv_cache_limit 2g \
+  --chunked_prefill_size 512 --gpu_mem_ratio 0.48 --enable_thinking false
+```
+
+上述配置使用 INT8 权重、FP16 激活；原始权重无需转换。当前 INT8 Linear 路径不支持 BF16 激活。两个服务共卡时，需要为生成模型保留足够显存；`CUDA_VISIBLE_DEVICES` 与资源预算应按部署环境设置。
+
+在 HY-Nomas HTTP 服务启动命令中追加：
+
+```bash
+  --prompt-enhancer-url http://127.0.0.1:8008/v1/chat/completions \
+  --prompt-enhancer-model Nomas-PE \
+  --prompt-enhancer-prompts /path/to/nomas-prompts
+```
+
+若服务分别运行在容器中，应使用容器内可达的 PE 地址，并挂载提示词目录。`/health` 的 `prompt_enhancer.enabled` 表示是否配置扩写。调用只使用 Python 标准库 HTTP 客户端，PE 推理仍由 fastllm 执行。
+
+开启后，Demo 默认自动扩写，也可以在创建前取消勾选。“观察方式”仅在启用扩写时可选；没有配置 PE 时隐藏，取消勾选扩写后禁用。API 创建请求可传 `enhance_prompt: false` 关闭扩写；`perspective` 仅用于扩写，可选择 `auto`、`first-person`、`second-person`、`third-person follow`、`third-person observer`。`auto` 保留描述中明确的第一人称要求，否则使用外部观察视角；修改沿用当前场景视角。
+
+扩写在后台任务中执行，进度阶段为 `prompt_enhancement`。创建和修改描述时调用 PE，移动、转向和重复按描述继续生成复用已完成的扩写。原始 `prompt` 保留用于编辑，`enhanced_prompt` 返回实际送入生成模型的场景 JSON；页面提供展开查看入口。扩写失败会令任务失败，不会悄悄退回原提示词。
+
+当前接入使用官方系统提示词和首轮格式，场景修改参考上一份扩写文本，尚未输入历史画面。原生 Demo 每次生成固定帧数，因此仅保留本次时间窗内的动作，不将 PE 的未来动作压缩到当前片段。场景文本最多接受 1200 个编码 token，超限会报错；这不是官方完整的多轮视觉扩写流程。
+
 ## 5. 使用网页 Demo
 
 输入场景描述并创建世界后，使用 W/A/S/D 移动、方向键调整视角，也可点击界面按钮。“连续探索”会自动提交后续动作，点击停止可结束自动探索。
