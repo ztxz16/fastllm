@@ -65,6 +65,10 @@ ftllm server /path/to/Clover-35B-A3B-Preview --auto --speculative_algorithm off
 
 默认采样参数读取 checkpoint 的 `generation_config.json`；原版配置为贪婪、`top_k=0`、`top_p=1`、`temperature=1`、`repetition_penalty=1.05`、`presence_penalty=0.9`、`frequency_penalty=0`。显式传入正温度可启用随机采样，`temperature=0` 为贪婪。惩罚只统计已输出 token。随机数实现与 PyTorch 不同，相同 seed 不保证跨框架生成相同序列。
 
+工具调用使用 checkpoint 的聊天模板及 Qwen XML 解析器，支持流式返回、多个工具调用和工具结果回填。工具名称、参数和 `tool_choice` 由 API 解析校验；Clover 的块生成后端尚未实现逐 token 约束采样。
+
+此 checkpoint 只接受文本，图片输入会返回请求错误。
+
 ## NUMA 混合推理
 
 编译时启用 `USE_CUDA` 和 `USE_NUMAS`，可将路由专家放在主存，主干、router 和共享专家仍在单张 GPU 上计算。此路径使用原生 BF16 专家，不需要额外的算子库。

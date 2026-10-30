@@ -1764,6 +1764,10 @@ class FastLLmCompletion:
       return payload
 
   def _model_supports_tool_call_constraint(self) -> bool:
+      # Clover generates blocks and has no constrained decoder. Its tools are
+      # prompted and validated by FunctionCallParser, without a native mask.
+      if (getattr(self.model, "config", None) or {}).get("model_type") == "clover_moe":
+          return False
       launch_fn = getattr(self.model, "launch_stream_response", None)
       if launch_fn is None:
           return False

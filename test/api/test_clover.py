@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
@@ -106,6 +107,9 @@ class CloverAutoTest(unittest.TestCase):
 
 
 class CloverSamplingModel(SamplingModel):
+    default_generation_config = dict(top_k=0, top_p=1., temperature=1.,
+        do_sample=False, repetition_penalty=1.05, presence_penalty=.9, frequency_penalty=0.)
+
     def launch_stream_response(self, query, **kwargs):
         self.sampling_args = dict(kwargs)
         kwargs.pop("clover_options", None)
@@ -113,6 +117,29 @@ class CloverSamplingModel(SamplingModel):
 
 
 class CloverSamplingAPITest(unittest.IsolatedAsyncioTestCase):
+    async def test_tools_use_xml_parser_without_native_constraint(self):
+        tool = {"type": "function", "function": {"name": "lookup_stock",
+            "parameters": {"type": "object", "properties": {
+                "sku": {"type": "string"}}, "required": ["sku"]}}}
+        for choice in ("auto", "required", {"type": "function", "function": {"name": "lookup_stock"}}):
+            with self.subTest(tool_choice=choice):
+                model = CloverSamplingModel(output='</think><tool_call>\n<function=lookup_stock>\n'
+                    '<parameter=sku>SKU-42</parameter>\n</function>\n</tool_call>')
+                model.config = {"model_type": "clover_moe", "vocab_size": 248320}
+                model.get_type = lambda: "clover_moe"
+                model.hf_tokenizer = SimpleNamespace(chat_template='<tool_call><function=',
+                    get_vocab=lambda: {"<tool_call>": 1, "</tool_call>": 2})
+                server = completion(model)
+                request = ChatCompletionRequest(model=server.model_name,
+                    messages=[{"role": "user", "content": "查询 SKU-42 库存"}],
+                    tools=[tool], tool_choice=choice, max_tokens=128)
+                response = await server.create_chat_completion(request, RawRequest())
+                self.assertNotIn("tool_call_constraint", model.sampling_args)
+                self.assertEqual(response.choices[0].finish_reason, "tool_calls")
+                call = response.choices[0].message.tool_calls[0]
+                self.assertEqual(call.function.name, "lookup_stock")
+                self.assertEqual(json.loads(call.function.arguments), {"sku": "SKU-42"})
+
     async def test_defaults_and_independent_additive_penalties(self):
         for overrides, presence, frequency, repetition, sample in (
                 ({}, .9, 0., 1.05, False),
