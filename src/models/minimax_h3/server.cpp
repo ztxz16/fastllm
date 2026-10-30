@@ -70,12 +70,12 @@ Json metadata(const std::shared_ptr<Job> &job) {
 }
 class Service {
   public:
-    Service(std::string model, std::string output, int device, bool fp32, std::string ffmpeg)
-        : output_(std::move(output)), fp32_(fp32) {
+    Service(std::string model, std::string output, int device, bool fp32, DType videoType, std::string ffmpeg)
+        : output_(std::move(output)), fp32_(fp32), videoType_(videoType) {
         std::filesystem::create_directories(output_);
-        worker_ = std::thread([this, model, device, fp32, ffmpeg] {
+        worker_ = std::thread([this, model, device, fp32, videoType, ffmpeg] {
             try {
-                Pipeline pipeline(model, device, fp32);
+                Pipeline pipeline(model, device, fp32, videoType);
                 ready_ = true;
                 for (;;) {
                     std::shared_ptr<Job> job;
@@ -158,7 +158,8 @@ class Service {
                                        : startupError_.empty() ? "loading"
                                                                : "failed"},
                             {"error", startupError_},
-                            {"precision", fp32_ ? "fp32" : "bf16"}};
+                            {"precision", fp32_ ? "fp32" : "bf16"},
+                            {"vae_precision", precisionName(videoType_)}};
     }
     std::shared_ptr<Job> submit(const Json &j) {
         if (!ready_)
@@ -240,6 +241,7 @@ class Service {
   private:
     std::string output_, startupError_;
     const bool fp32_;
+    const DType videoType_;
     std::atomic<bool> ready_{false}, stopping_{false};
     std::atomic<int> pending_{0};
     uint64_t sequence_ = 0;
@@ -253,7 +255,7 @@ class Service {
 int main(int argc, char **argv) {
     try {
         std::string model, output = "minimax-h3-output", host = "127.0.0.1", key,
-                           demo = "tools/minimax_h3/demo.html", ffmpeg = "ffmpeg";
+                           demo = "tools/minimax_h3/demo.html", ffmpeg = "ffmpeg", vaePrecision;
         int port = 8009, device = 0;
         bool fp32 = false;
         for (int i = 1; i < argc; ++i) {
@@ -281,12 +283,15 @@ int main(int argc, char **argv) {
                 if (v != "fp32" && v != "bf16")
                     throw std::invalid_argument("precision must be fp32 or bf16");
                 fp32 = v == "fp32";
-            } else
+            } else if (arg == "--vae-precision")
+                vaePrecision = v;
+            else
                 throw std::invalid_argument("unknown argument " + arg);
         }
         if (model.empty())
             throw std::invalid_argument("--model is required");
-        Service service(model, output, device, fp32, ffmpeg);
+        auto videoType = parseVideoPrecision(vaePrecision, fp32);
+        Service service(model, output, device, fp32, videoType, ffmpeg);
         httplib::Server server;
         server.new_task_queue = [] { return new httplib::ThreadPool(8); };
         server.set_payload_max_length(1024 * 1024);

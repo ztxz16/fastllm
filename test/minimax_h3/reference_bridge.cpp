@@ -114,10 +114,13 @@ int h3_audio_decode(const char *model, int rows, const float *input, const char 
     }
 }
 int h3_video_decode(const char *model, int frames, int height, int width, const float *input,
-                    const char *directory, float *output, int tiled) {
+                    const char *directory, float *output, int tiled, int precision) {
     try {
         Runtime rt(0, true);
-        VideoVAE vae(rt, model);
+        if (precision < 0 || precision > 2)
+            throw std::invalid_argument("invalid video precision");
+        Runtime compute(0, precision == 0 ? DType::FP32 : precision == 1 ? DType::FP16 : DType::BF16);
+        VideoVAE vae(compute, rt, model);
         auto trace = [&](const std::string &name, const Tensor &x) {
             if (directory && *directory)
                 save(rt, x, std::string(directory) + "/" + name + ".f32");

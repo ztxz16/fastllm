@@ -12,8 +12,10 @@ FlashInfer、json11、cpp-httplib。推理服务不加载 Python、PyTorch、Dif
 
 默认使用 **BF16 混合精度**：文本编码器和 DiT 的权重、激活与残差使用 BF16，
 GEMM 保持 FP32 累加。时间嵌入、视频/音频输入输出投影和采样状态保留 FP32；
-视频、音频 VAE 当前仍使用 FP32。CLI 与 HTTP 服务均可通过 `--precision fp32`
-切回全 FP32 对比模式，无需环境变量。`GET /health` 返回当前 `precision`。
+视频 VAE 默认使用 FP16 GEMM/attention，归一化、缩放参数与残差流保留 FP32；音频 VAE
+保持 FP32。CLI 与 HTTP 服务均可通过 `--precision fp32` 切回全 FP32 对比模式，
+也可用 `--vae-precision fp16|bf16|fp32` 单独覆盖视频 VAE，无需环境变量。
+`GET /health` 返回当前 `precision` 和 `vae_precision`。
 
 文本编码只执行 Qwen3-VL 的前 50 层，读取 final norm 之前的残差，权重按层释放。
 DiT 按每次前向的时间点数预计算 AdaLN 表，随后释放这些投影权重；BF16 主干约
@@ -68,7 +70,9 @@ CUDA_VISIBLE_DEVICES=7 build-h3/src/models/minimax_h3/minimax_h3_generate \
 - 宽高须为 32 的倍数，各自介于 64..4096，总像素不超过 1344×768。
 - 24 fps，帧数为 `17*n+5`，支持 124、141、…、345 帧。
 - `--steps` 指包含终点的采样网格点数，50 点通常执行 49 次 DiT 前向。
-- `--precision bf16|fp32` 默认为 `bf16`；HTTP 服务在启动时选择精度，生成请求结构保持不变。
+- `--precision bf16|fp32` 默认为 `bf16`；分别对应默认 FP16、FP32 视频 VAE。
+- `--vae-precision fp16|bf16|fp32` 可单独覆盖视频 VAE 精度，优先于上述默认值。
+  HTTP 服务在启动时选择精度，生成请求结构保持不变；BF16 VAE 是可选对照路径。
 - 音频为 32 kHz 双声道；分别使用视频 shift=12、音频 shift=3 的官方调度。
 - 随机数使用本地 C++ 生成器，同一实现内种子可复现；同一个 seed 不保证与 PyTorch
   得到同一初始噪声。差分测试通过 `--initial-video` / `--initial-audio` 共享 FP32 噪声。

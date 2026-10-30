@@ -36,7 +36,14 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "status": {"type": "string", "enum": ["loading", "ready", "failed"]},
+                    "error": {"type": "string"},
+                    "precision": {"type": "string", "enum": ["bf16", "fp32"]},
+                    "vae_precision": {"type": "string", "enum": ["fp16", "bf16", "fp32"]}
+                  },
+                  "required": ["status", "error", "precision", "vae_precision"]
                 }
               }
             }

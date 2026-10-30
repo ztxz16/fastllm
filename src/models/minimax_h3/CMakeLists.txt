@@ -1,6 +1,7 @@
 set_directory_properties(PROPERTIES COMPILE_OPTIONS "" COMPILE_DEFINITIONS "" INCLUDE_DIRECTORIES "")
 add_library(fastllm_minimax_h3 SHARED ops.cu transformer.cpp audio.cpp video.cpp text.cpp pipeline.cpp media.cpp)
 target_link_libraries(fastllm_minimax_h3 PUBLIC fastllm_continuous)
+target_include_directories(fastllm_minimax_h3 PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 target_compile_options(fastllm_minimax_h3 PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
     $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)

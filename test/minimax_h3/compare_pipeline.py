@@ -35,6 +35,7 @@ p.add_argument("--model", default="/model")
 p.add_argument("--binary", required=True)
 p.add_argument("--text-fixture")
 p.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
+p.add_argument("--vae-precision", choices=["fp16", "bf16", "fp32"])
 p.add_argument("--output", required=True)
 p.add_argument("--width", type=int, default=64)
 p.add_argument("--height", type=int, default=64)
@@ -44,6 +45,7 @@ p.add_argument("--prompt", default="A cat plays piano on a wooden stage. The aud
 p.add_argument("--skip-reference", action="store_true")
 p.add_argument("--attention-backend", choices=["auto", "math"], default="auto")
 a = p.parse_args()
+a.vae_precision = a.vae_precision or ("fp32" if a.precision == "fp32" else "fp16")
 if a.attention_backend == "math":
     torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(False)
@@ -59,17 +61,20 @@ configuration = {
     "steps": a.steps,
     "attention_backend": a.attention_backend,
     "precision": a.precision,
+    "vae_precision": a.vae_precision,
 }
 manifest = out / "reference-config.json"
 if a.skip_reference:
     assert manifest.exists(), "Reference manifest missing; regenerate the reference"
     saved = json.loads(manifest.read_text())
     saved.setdefault("precision", "fp32")
+    saved.setdefault("vae_precision", "fp32")
     assert saved == configuration, "Reference configuration mismatch"
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 dtype = torch.float32 if a.precision == "fp32" else torch.bfloat16
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 text_dir = Path(a.text_fixture or f"/work/text-{a.precision}")
 tokens = json.loads((text_dir / "tokens.json").read_text())
 nt = len(tokens)
@@ -157,7 +162,8 @@ if not a.skip_reference:
     vae = AutoencoderKLMiniMaxH3.from_pretrained(root / "vae", torch_dtype=torch.float32).cuda().eval()
     mean = torch.tensor(vae.config.latents_mean, device="cuda").view(1, -1, 1, 1, 1)
     std = torch.tensor(vae.config.latents_std, device="cuda").view(1, -1, 1, 1, 1)
-    with torch.inference_mode():
+    video_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[a.vae_precision]
+    with torch.inference_mode(), torch.autocast("cuda", dtype=video_dtype, enabled=a.vae_precision != "fp32"):
         pixels = vae.decode(z * std + mean).sample
         pixels = (
             pixels * torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1, 1)
@@ -191,6 +197,8 @@ subprocess.run(
         a.binary,
         "--precision",
         a.precision,
+        "--vae-precision",
+        a.vae_precision,
         "--model",
         str(root),
         "--prompt",

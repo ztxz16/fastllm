@@ -111,16 +111,21 @@ class TextEncoder {
 };
 class VideoVAE {
   public:
-    VideoVAE(Runtime &, const std::string &directory);
+    VideoVAE(Runtime &compute, Runtime &fp32, const std::string &directory);
     Tensor decodeTile(const Tensor &, int frames, int height, int width, Trace trace = {});
     VideoTensor decode(const VideoTensor &, std::function<void(int, int)> progress = {});
-    void unload() { weights_.clear(); }
+    void unload() {
+        weights_.clear();
+        fullWeights_.clear();
+    }
 
   private:
     VideoTensor decodeClip(const VideoTensor &, std::function<void()> checkpoint = {});
-    Runtime &rt_;
-    Weights weights_;
+    Runtime &rt_, &full_;
+    Weights weights_, fullWeights_;
 };
+DType parseVideoPrecision(const std::string &name, bool fp32 = false);
+const char *precisionName(DType);
 using Progress = std::function<void(const std::string &, int, int)>;
 struct GenerateOptions {
     std::string prompt;
@@ -139,12 +144,13 @@ std::vector<float> sigmaSchedule(int steps, float shift);
 class Pipeline {
   public:
     Pipeline(const std::string &directory, int device, bool fp32 = false);
+    Pipeline(const std::string &directory, int device, bool fp32, DType videoPrecision);
     Generation generate(const GenerateOptions &, Progress progress = {}, Trace trace = {},
                         const std::vector<float> *initialVideo = nullptr,
                         const std::vector<float> *initialAudio = nullptr);
 
   private:
-    Runtime rt_, full_;
+    Runtime rt_, full_, videoRuntime_;
     nomas::QwenTokenizer tokenizer_;
     TextEncoder text_;
     Transformer transformer_;

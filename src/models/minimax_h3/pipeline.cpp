@@ -73,9 +73,12 @@ PackedLayout textToVideoLayout(int nt, int frames, int h, int w, int audio) {
     return out;
 }
 Pipeline::Pipeline(const std::string &dir, int device, bool fp32)
-    : rt_(device, fp32), full_(device, true), tokenizer_(dir + "/tokenizer"),
-      text_(rt_, dir + "/text_encoder"), transformer_(rt_, full_, dir + "/transformer"),
-      video_(full_, dir + "/vae"), audio_(full_, dir + "/audio_vae") {
+    : Pipeline(dir, device, fp32, parseVideoPrecision({}, fp32)) {}
+Pipeline::Pipeline(const std::string &dir, int device, bool fp32, DType videoPrecision)
+    : rt_(device, fp32), full_(device, true), videoRuntime_(device, videoPrecision),
+      tokenizer_(dir + "/tokenizer"), text_(rt_, dir + "/text_encoder"),
+      transformer_(rt_, full_, dir + "/transformer"), video_(videoRuntime_, full_, dir + "/vae"),
+      audio_(full_, dir + "/audio_vae") {
     auto stats = [&](const std::string &path, int channels, std::vector<float> &mean,
                      std::vector<float> &std) {
         std::ifstream file(path + "/config.json");

@@ -10,7 +10,7 @@ int main(int argc, char **argv) {
     try {
         GenerateOptions options;
         std::string model, output = "minimax-h3.mp4", ffmpeg = "ffmpeg", traceDirectory, initialVideo,
-                           initialAudio;
+                           initialAudio, vaePrecision;
         int device = 0;
         bool fp32 = false;
         for (int i = 1; i < argc; ++i) {
@@ -44,7 +44,9 @@ int main(int argc, char **argv) {
                 if (v != "fp32" && v != "bf16")
                     throw std::invalid_argument("precision must be fp32 or bf16");
                 fp32 = v == "fp32";
-            } else if (arg == "--initial-video")
+            } else if (arg == "--vae-precision")
+                vaePrecision = v;
+            else if (arg == "--initial-video")
                 initialVideo = v;
             else if (arg == "--initial-audio")
                 initialAudio = v;
@@ -53,6 +55,7 @@ int main(int argc, char **argv) {
         }
         if (model.empty())
             throw std::invalid_argument("--model is required");
+        auto videoType = parseVideoPrecision(vaePrecision, fp32);
         options.validate();
         if (!traceDirectory.empty())
             std::filesystem::create_directories(traceDirectory);
@@ -84,10 +87,11 @@ int main(int argc, char **argv) {
             return out;
         };
         auto video = read(initialVideo), audio = read(initialAudio);
-        Pipeline pipeline(model, device, fp32);
+        Pipeline pipeline(model, device, fp32, videoType);
         std::string last;
         int current = -1;
-        std::cerr << "Precision: " << (fp32 ? "fp32" : "bf16") << "\n";
+        std::cerr << "Precision: " << (fp32 ? "fp32" : "bf16") << ", video VAE: " << precisionName(videoType)
+                  << "\n";
         auto start = std::chrono::steady_clock::now();
         auto result = pipeline.generate(
             options,

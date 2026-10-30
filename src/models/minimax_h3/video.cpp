@@ -1,15 +1,47 @@
 #include "models/minimax_h3/runtime.h"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#ifdef __F16C__
+#include <immintrin.h>
+#endif
 
 namespace fastllm {
 namespace minimax_h3 {
-VideoVAE::VideoVAE(Runtime &rt, const std::string &dir) : rt_(rt), weights_(rt, componentWeights(dir)) {}
+DType parseVideoPrecision(const std::string &name, bool fp32) {
+    if (name.empty())
+        return fp32 ? DType::FP32 : DType::FP16;
+    if (name == "fp16")
+        return DType::FP16;
+    if (name == "bf16")
+        return DType::BF16;
+    if (name == "fp32")
+        return DType::FP32;
+    throw std::invalid_argument("VAE precision must be fp16, bf16 or fp32");
+}
+const char *precisionName(DType type) {
+    switch (type) {
+    case DType::FP16:
+        return "fp16";
+    case DType::BF16:
+        return "bf16";
+    case DType::FP32:
+        return "fp32";
+    }
+    throw std::invalid_argument("invalid precision");
+}
+VideoVAE::VideoVAE(Runtime &rt, Runtime &full, const std::string &dir)
+    : rt_(rt), full_(full), weights_(rt, componentWeights(dir)), fullWeights_(full, componentWeights(dir)) {
+    if (!full.isFloat32())
+        throw std::invalid_argument("video VAE residual runtime must be FP32");
+}
 Tensor VideoVAE::decodeTile(const Tensor &latent, int frames, int height, int width, Trace trace) {
     if (latent.rows != frames * height * width || latent.cols != 24)
         throw std::invalid_argument("invalid H3 VAE tile");
-    auto x = weights_.linear(weights_.linear(latent, "post_quant_conv"), "decoder.proj_in");
+    auto x =
+        weights_.linear(weights_.linear(rt_.cast(latent, rt_.dtype()), "post_quant_conv"), "decoder.proj_in");
     auto registers = weights_.get("decoder.register_tokens");
     registers.rows = 4;
     registers.cols = 2048;
@@ -24,16 +56,25 @@ Tensor VideoVAE::decodeTile(const Tensor &latent, int frames, int height, int wi
             }
     auto rope = rt_.ropeTable(positions, 8, 100.f);
     x = rt_.concat({x, registers, rt_.upload(zeros.data(), 1, 2048)});
+    // Released decode uses low-precision projections, FP32 norms/scales and residuals.
+    x = rt_.cast(x, DType::FP32);
     for (int layer = 0; layer < 36; ++layer) {
         auto p = "decoder.transformer_blocks." + std::to_string(layer);
-        auto y = rt_.norm(x, true, &weights_.get(p + ".norm1.weight"), nullptr, 1e-5f);
+        auto y = rt_.cast(full_.norm(x, true, &fullWeights_.get(p + ".norm1.weight"), nullptr, 1e-5f),
+                          rt_.dtype());
         auto q = weights_.linear(y, p + ".attn.to_q"), k = weights_.linear(y, p + ".attn.to_k"),
              v = weights_.linear(y, p + ".attn.to_v");
-        q = rt_.rotary(rt_.norm(q, true, nullptr, nullptr, 1e-5f, 64), rope.first, rope.second, 64);
-        k = rt_.rotary(rt_.norm(k, true, nullptr, nullptr, 1e-5f, 64), rope.first, rope.second, 64);
+        q = rt_.rotary(
+            rt_.cast(full_.norm(rt_.cast(q, DType::FP32), true, nullptr, nullptr, 1e-5f, 64), rt_.dtype()),
+            rope.first, rope.second, 64);
+        k = rt_.rotary(
+            rt_.cast(full_.norm(rt_.cast(k, DType::FP32), true, nullptr, nullptr, 1e-5f, 64), rt_.dtype()),
+            rope.first, rope.second, 64);
         y = weights_.linear(rt_.selfAttention(q, k, v, 32), p + ".attn.to_out.0");
-        x = rt_.add(x, rt_.multiply(y, rt_.repeatRows(weights_.get(p + ".scale1"), x.rows)));
-        y = rt_.norm(x, true, &weights_.get(p + ".norm2.weight"), nullptr, 1e-5f);
+        x = full_.add(x, full_.multiply(rt_.cast(y, DType::FP32),
+                                        full_.repeatRows(fullWeights_.get(p + ".scale1"), x.rows)));
+        y = rt_.cast(full_.norm(x, true, &fullWeights_.get(p + ".norm2.weight"), nullptr, 1e-5f),
+                     rt_.dtype());
         std::vector<Tensor> chunks;
         for (int first = 0; first < y.rows; first += 512) {
             auto ff = weights_.linear(y.rowSlice(first, std::min(512, y.rows - first)), p + ".ff.net.0.proj");
@@ -41,14 +82,15 @@ Tensor VideoVAE::decodeTile(const Tensor &latent, int frames, int height, int wi
             chunks.push_back(weights_.linear(ff, p + ".ff.net.2"));
         }
         y = chunks.size() == 1 ? chunks[0] : rt_.concat(chunks);
-        x = rt_.add(x, rt_.multiply(y, rt_.repeatRows(weights_.get(p + ".scale2"), x.rows)));
+        x = full_.add(x, full_.multiply(rt_.cast(y, DType::FP32),
+                                        full_.repeatRows(fullWeights_.get(p + ".scale2"), x.rows)));
         if (trace)
             trace("block." + std::to_string(layer), x);
     }
-    x = rt_.norm(x.rowSlice(0, latent.rows), false, &weights_.get("decoder.norm_out.weight"),
-                 &weights_.get("decoder.norm_out.bias"), 1e-5f);
+    x = full_.norm(x.rowSlice(0, latent.rows), false, &fullWeights_.get("decoder.norm_out.weight"),
+                   &fullWeights_.get("decoder.norm_out.bias"), 1e-5f);
     // Output is patchified [T*H*W, 3*4*16*16].
-    return weights_.linear(x, "decoder.proj_out");
+    return weights_.linear(rt_.cast(x, rt_.dtype()), "decoder.proj_out");
 }
 namespace {
 struct Tiles {
@@ -82,7 +124,14 @@ VideoTensor crop(const VideoTensor &x, int t, int count, int y, int h, int z, in
                         size_t(w) * x.channels, out.values.data() + pixel(out, k, j, 0));
     return out;
 }
-void blend(const VideoTensor &a, VideoTensor &b, int extent, int axis) {
+template <class T> float rounded(float value) { return float(T(value)); }
+#ifdef __F16C__
+// CUDA's host half conversion is software-only; use the same nearest-even rounding in hardware.
+template <> float rounded<__half>(float value) {
+    return _cvtsh_ss(_cvtss_sh(value, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+}
+#endif
+template <class T> void blendTyped(const VideoTensor &a, VideoTensor &b, int extent, int axis) {
     for (int t = 0; t < b.frames; ++t)
         for (int y = 0; y < b.height; ++y)
             for (int x = 0; x < b.width; ++x) {
@@ -91,11 +140,21 @@ void blend(const VideoTensor &a, VideoTensor &b, int extent, int axis) {
                     continue;
                 int at = axis == 0 ? a.frames - extent + t : t, ay = axis == 1 ? a.height - extent + y : y,
                     ax = axis == 2 ? a.width - extent + x : x;
-                float wb = float(position) / extent, wa = 1.f - wb;
+                float wb = rounded<T>(float(position) / extent), wa = rounded<T>(1.f - wb);
                 for (int c = 0; c < b.channels; ++c)
                     b.values[pixel(b, t, y, x, c)] =
-                        a.values[pixel(a, at, ay, ax, c)] * wa + b.values[pixel(b, t, y, x, c)] * wb;
+                        rounded<T>(rounded<T>(a.values[pixel(a, at, ay, ax, c)] * wa) +
+                                   rounded<T>(b.values[pixel(b, t, y, x, c)] * wb));
             }
+}
+// Match eager rounding of the weights, both products and the sum, including temporal overlaps.
+void blend(const VideoTensor &a, VideoTensor &b, int extent, int axis, DType dtype) {
+    if (dtype == DType::FP16)
+        blendTyped<__half>(a, b, extent, axis);
+    else if (dtype == DType::BF16)
+        blendTyped<__nv_bfloat16>(a, b, extent, axis);
+    else
+        blendTyped<float>(a, b, extent, axis);
 }
 } // namespace
 VideoTensor VideoVAE::decodeClip(const VideoTensor &z, std::function<void()> checkpoint) {
@@ -105,7 +164,7 @@ VideoTensor VideoVAE::decodeClip(const VideoTensor &z, std::function<void()> che
         for (size_t j = 0; j < xs.start.size(); ++j) {
             auto latent = crop(z, 0, z.frames, ys.start[i], ys.length[i], xs.start[j], xs.length[j]);
             auto patches = rt_.download(decodeTile(
-                rt_.upload(latent.values.data(), latent.frames * latent.height * latent.width, 24),
+                full_.upload(latent.values.data(), latent.frames * latent.height * latent.width, 24),
                 latent.frames, latent.height, latent.width, [&](const std::string &, const Tensor &) {
                     if (checkpoint)
                         checkpoint();
@@ -127,9 +186,9 @@ VideoTensor VideoVAE::decodeClip(const VideoTensor &z, std::function<void()> che
             auto tile = tiles[i][j];
             // The reference blends against the raw adjacent tiles, not previously blended ones.
             if (i)
-                blend(tiles[i - 1][j], tile, ys.overlap[i - 1] * 16, 1);
+                blend(tiles[i - 1][j], tile, ys.overlap[i - 1] * 16, 1, rt_.dtype());
             if (j)
-                blend(tiles[i][j - 1], tile, xs.overlap[j - 1] * 16, 2);
+                blend(tiles[i][j - 1], tile, xs.overlap[j - 1] * 16, 2, rt_.dtype());
             int h = tile.height - (i + 1 < tiles.size() ? ys.overlap[i] * 16 : 0);
             int w = tile.width - (j + 1 < tiles[i].size() ? xs.overlap[j] * 16 : 0);
             for (int t = 0; t < out.frames; ++t)
@@ -152,7 +211,7 @@ VideoTensor VideoVAE::decode(const VideoTensor &z, std::function<void(int, int)>
         });
         auto chunk = crop(clip, 3, 17, 0, clip.height, 0, clip.width);
         if (overlap.frames)
-            blend(overlap, chunk, 5, 0);
+            blend(overlap, chunk, 5, 0, rt_.dtype());
         decoded.push_back(std::move(chunk));
         overlap = crop(clip, 23, 5, 0, clip.height, 0, clip.width);
     }
