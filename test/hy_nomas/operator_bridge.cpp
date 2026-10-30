@@ -8,11 +8,21 @@ using namespace fastllm::nomas;
 namespace { thread_local std::string error; }
 extern "C" {
 const char *nomas_test_error() { return error.c_str(); }
-void *nomas_test_create() {
-    try { return new Runtime(0, false); }
-    catch (const std::exception &e) { error=e.what(); return nullptr; }
+void *nomas_test_create_precision(int fp32) {
+    try { return new Runtime(0,fp32!=0); }
+    catch(const std::exception &e) { error=e.what(); return nullptr; }
 }
+void *nomas_test_create() { return nomas_test_create_precision(0); }
 void nomas_test_destroy(void *ctx) { delete static_cast<Runtime *>(ctx); }
+int nomas_test_pixel_noise(void *ctx,uint64_t seed,int firstFrame,int frames,
+                           int height,int width,float *output) {
+    try {
+        auto &rt=*static_cast<Runtime *>(ctx);
+        auto values=rt.download(rt.pixelNoise(seed,firstFrame,frames,height,width));
+        std::copy(values.begin(),values.end(),output);
+        return 0;
+    } catch(const std::exception &e) { error=e.what(); return -1; }
+}
 int nomas_test_op(void *ctx, const char *name, const int *shape,
                   const float *x, const float *y, const float *z, float *output) {
     try {

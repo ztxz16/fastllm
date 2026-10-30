@@ -56,23 +56,13 @@ std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int 
             trace("latent_"+std::to_string(step+1),latent);
         }
         dit_.unload(); update(2,steps,steps); update(3,0,1);
-        std::vector<float> noise(size_t(n)*4*3072);
-        for(int frame=0;frame<t;++frame) {
-            std::mt19937_64 pixelGenerator(seed*1000003+frame); normal.reset();
-            for(size_t i=size_t(frame)*h*w*4*3072;i<size_t(frame+1)*h*w*4*3072;++i) noise[i]=normal(pixelGenerator);
-        }
-        trace("pixel_noise",noise);
-        auto pixels=rt_.download(decoder_.forward(rt_.upload(latent.data(),n,32),rt_.upload(noise.data(),n*4,3072),t,h,w));
-        trace("pixels",pixels);
+        const char *traceDirectory=std::getenv("FASTLLM_NOMAS_PIPELINE_TRACE");
+        auto noise=rt_.pixelNoise(seed,0,t,height,width);
+        if(traceDirectory && *traceDirectory) trace("pixel_noise",rt_.download(noise));
+        auto pixels=decoder_.forward(rt_.upload(latent.data(),n,32),noise,t,h,w);
+        if(traceDirectory && *traceDirectory) trace("pixels",rt_.download(pixels));
+        auto rgb=rt_.downloadPixelRGB(pixels,width,height,0,frames);
         decoder_.unload(); update(3,1,1);
-        std::vector<uint8_t> rgb(size_t(frames)*height*width*3);
-        for(int f=0;f<frames;++f) for(int y=0;y<height;++y) for(int x=0;x<width;++x) for(int c=0;c<3;++c) {
-            size_t token=(size_t(f/4)*(height/16)+y/16)*(width/16)+x/16;
-            size_t channel=((f%4*16+y%16)*16+x%16)*3+c;
-            float value=pixels[token*3072+channel];
-            if(!std::isfinite(value)) throw std::runtime_error("non-finite PixelUMM output");
-            rgb[((size_t(f)*height+y)*width+x)*3+c]=uint8_t(std::nearbyint(std::clamp(value*.5f+.5f,0.f,1.f)*255.f));
-        }
         update(4,1,1); return rgb;
     } catch(...) {
         text_.unload(); dit_.unload(); decoder_.unload(); throw;
@@ -242,24 +232,13 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
     int previous=int(context.size()/(size_t(h)*w*32));
     context.insert(context.end(),latent.begin(),latent.end());
     int decodeT=previous+t,begin=world.frameOffset-previous;
-    std::vector<float> noise(size_t(decodeT)*h*w*4*3072);
-    for(int frame=0;frame<decodeT;++frame) {
-        std::mt19937_64 generator(world.seed*1000003+begin+frame); normal.reset();
-        for(size_t i=size_t(frame)*h*w*4*3072;i<size_t(frame+1)*h*w*4*3072;++i) noise[i]=normal(generator);
-    }
-    trace("decoder_latents",context); trace("pixel_noise",noise);
-    auto pixels=rt_.download(decoder_.forward(rt_.upload(context.data(),decodeT*h*w,32),
-                         rt_.upload(noise.data(),decodeT*h*w*4,3072),decodeT,h,w));
-    trace("pixels",pixels);
-    std::vector<uint8_t> rgb(size_t(20)*world.height*world.width*3);
-    for(int f=0;f<20;++f) for(int y=0;y<world.height;++y) for(int x=0;x<world.width;++x) for(int c=0;c<3;++c) {
-        int absolute=f+previous*4;
-        size_t token=(size_t(absolute/4)*(world.height/16)+y/16)*(world.width/16)+x/16;
-        size_t channel=((absolute%4*16+y%16)*16+x%16)*3+c;
-        float value=pixels[token*3072+channel];
-        if(!std::isfinite(value)) throw std::runtime_error("non-finite world pixel");
-        rgb[((size_t(f)*world.height+y)*world.width+x)*3+c]=uint8_t(std::nearbyint(std::clamp(value*.5f+.5f,0.f,1.f)*255.f));
-    }
+    const char *traceDirectory=std::getenv("FASTLLM_NOMAS_WORLD_TRACE");
+    auto noise=rt_.pixelNoise(world.seed,begin,decodeT,world.height,world.width);
+    trace("decoder_latents",context);
+    if(traceDirectory && *traceDirectory) trace("pixel_noise",rt_.download(noise));
+    auto pixels=decoder_.forward(rt_.upload(context.data(),decodeT*h*w,32),noise,decodeT,h,w);
+    if(traceDirectory && *traceDirectory) trace("pixels",rt_.download(pixels));
+    auto rgb=rt_.downloadPixelRGB(pixels,world.width,world.height,previous*4,20);
     next.decoderLatents=std::move(latent); next.frameOffset+=t;
     update(3,1,1); update(4,1,1);
     world=std::move(next);

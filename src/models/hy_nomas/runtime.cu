@@ -89,6 +89,22 @@ __global__ void toBF16(const float *x, B *y, size_t n) {
 __global__ void toFloat(const B *x, float *y, size_t n) {
     for (size_t i = size_t(blockIdx.x)*blockDim.x+threadIdx.x; i<n; i+=size_t(gridDim.x)*blockDim.x) y[i]=f(x[i]);
 }
+template<class T> __global__ void pixelRGBKernel(const T *x, uint8_t *rgb, int *invalid,
+                                                size_t n, int width, int height, int firstFrame) {
+    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
+        size_t pixel=i/3;
+        int c=i%3, px=pixel%width, py=pixel/width%height;
+        int frame=int(pixel/(size_t(width)*height))+firstFrame;
+        size_t token=(size_t(frame/4)*(height/16)+py/16)*(width/16)+px/16;
+        size_t channel=((frame%4*16+py%16)*16+px%16)*3+c;
+        float value=f(x[token*3072+channel]);
+        if(!isfinite(value)) { atomicExch(invalid,1); rgb[i]=0; continue; }
+        // Preserve the CPU path's separate FP32 operations and ties-to-even.
+        value=__fadd_rn(__fmul_rn(value,.5f),.5f);
+        value=__fmul_rn(fminf(fmaxf(value,0.f),1.f),255.f);
+        rgb[i]=uint8_t(__float2uint_rn(value));
+    }
+}
 template<class T> __global__ void element(const T *x, const T *y, T *z, size_t n, int op) {
     for (size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x; i<n; i+=size_t(gridDim.x)*blockDim.x) {
         float v=f(x[i]);
@@ -287,6 +303,29 @@ std::vector<float> Runtime::download(const Tensor &x) {
     auto tmp=allocate(x.size()*4);
     toFloat<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),static_cast<float *>(tmp.get()),x.size()); check(cudaGetLastError());
     copy(out.data(),tmp.get(),out.size()*4,cudaMemcpyDeviceToHost); return out;
+}
+std::vector<uint8_t> Runtime::downloadPixelRGB(const Tensor &x,int width,int height,int firstFrame,int frames) {
+    require(x.data && x.cols==3072 && x.rows>0 && width>0 && height>0 &&
+            width%16==0 && height%16==0 && firstFrame>=0 && frames>0,
+            "invalid PixelUMM RGB shape");
+    const size_t spatial=size_t(width/16)*(height/16);
+    require(size_t(x.rows)%spatial==0 &&
+            size_t(firstFrame)+size_t(frames)<=size_t(x.rows)/spatial*4,
+            "PixelUMM RGB frame range exceeds tensor");
+    std::vector<uint8_t> out(size_t(frames)*height*width*3);
+    auto packed=allocate(out.size()+sizeof(int));
+    auto invalid=static_cast<int *>(packed.get());
+    auto rgb=reinterpret_cast<uint8_t *>(invalid+1);
+    check(cudaMemsetAsync(invalid,0,sizeof(int),cudaStreamPerThread));
+    if(x.fp32) pixelRGBKernel<<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<float>(x),rgb,invalid,out.size(),width,height,firstFrame);
+    else pixelRGBKernel<<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr(x),rgb,invalid,out.size(),width,height,firstFrame);
+    check(cudaGetLastError());
+    int error=0;
+    check(cudaMemcpyAsync(out.data(),rgb,out.size(),cudaMemcpyDeviceToHost,cudaStreamPerThread));
+    check(cudaMemcpyAsync(&error,invalid,sizeof(error),cudaMemcpyDeviceToHost,cudaStreamPerThread));
+    check(cudaStreamSynchronize(cudaStreamPerThread));
+    if(error) throw std::runtime_error("non-finite PixelUMM output");
+    return out;
 }
 Tensor Runtime::linear(const Tensor &x,const Tensor &w,const Tensor *bias) {
     require(x.cols==w.cols,"linear dimension mismatch"); require(!bias || bias->size()==size_t(w.rows),"linear bias mismatch");

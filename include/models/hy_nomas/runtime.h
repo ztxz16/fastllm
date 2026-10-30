@@ -37,6 +37,12 @@ public:
     Runtime &operator=(const Runtime &) = delete;
     Tensor upload(const float *values, int rows, int cols);
     std::vector<float> download(const Tensor &x);
+    // Unpatchify selected PixelUMM frames and quantize on-device to THWC RGB8.
+    std::vector<uint8_t> downloadPixelRGB(const Tensor &x, int width, int height,
+                                          int firstFrame, int frames);
+    // Official per-latent-frame CUDA normal noise, already patchified. Height
+    // and width are output pixels; frame indices are in latent time units.
+    Tensor pixelNoise(uint64_t seed, int firstFrame, int frames, int height, int width);
     Tensor linear(const Tensor &x, const Tensor &weight, const Tensor *bias = nullptr);
     Tensor norm(const Tensor &x, bool rms, const Tensor *weight = nullptr,
                 const Tensor *bias = nullptr, float eps = 1e-6f, int width = 0);

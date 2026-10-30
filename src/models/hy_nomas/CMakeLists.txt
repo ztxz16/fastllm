@@ -25,11 +25,14 @@ set_target_properties(fastllm_continuous PROPERTIES
 target_link_libraries(fastllm_continuous PUBLIC cublas cublasLt)
 
 if(BUILD_HY_NOMAS)
-    add_library(fastllm_nomas SHARED bindings.cpp model.cpp pipeline.cpp)
+    add_library(fastllm_nomas SHARED bindings.cpp model.cpp pipeline.cpp noise.cu)
     target_link_libraries(fastllm_nomas PRIVATE fastllm_continuous)
     target_compile_options(fastllm_nomas PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
         $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+    # CUDA randn uses cuRAND's default fused arithmetic in its normal transform.
+    # Keep this exception local; the model operators retain their rounding rules.
+    set_source_files_properties(noise.cu PROPERTIES COMPILE_OPTIONS "--fmad=true")
     set_target_properties(fastllm_nomas PROPERTIES CUDA_STANDARD 17 CXX_STANDARD 17
         CUDA_ARCHITECTURES "${FASTLLM_CUDA_ARCHITECTURES}"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
