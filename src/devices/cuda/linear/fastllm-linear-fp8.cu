@@ -2354,10 +2354,10 @@ __device__ __forceinline__ void FastllmGemvBF16FP8E4M3RegisterRowsBody(
 #pragma unroll
     for (int x = 0; x < PART; x++) partial[x] = 0.0f;
     union_bf16_4_fp8 regA;
-    // Hopper batch-one projections benefit from overlapping address/decode
+    // Hopper and SM120 batch-one projections benefit from overlapping address/decode
     // work across consecutive iterations. Preserve every lane's FMA order
     // and the compensated reduction; other architectures keep the old loop.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1200)
 #pragma unroll (PART == 1 ? 4 : 1)
 #endif
     for (int i = tid * 4; i < m; i += 256) {
