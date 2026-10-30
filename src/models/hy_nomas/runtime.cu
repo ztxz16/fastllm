@@ -61,17 +61,12 @@ std::shared_ptr<MemoryPool> memoryPool(int device) {
 std::shared_ptr<void> allocate(size_t bytes) {
     require(bytes > 0, "empty CUDA allocation");
     int device; check(cudaGetDevice(&device));
-    const char *allocator=std::getenv("FASTLLM_NOMAS_ALLOCATOR");
-    bool pooled=!allocator || std::string(allocator)!="legacy";
-    std::shared_ptr<MemoryPool> pool;
+    auto pool = memoryPool(device);
     void *p = nullptr;
-    if(pooled) {
-        pool = memoryPool(device);
-        check(cudaMallocFromPoolAsync(&p,bytes,pool->handle,cudaStreamPerThread));
-    } else check(cudaMalloc(&p,bytes));
+    check(cudaMallocFromPoolAsync(&p,bytes,pool->handle,cudaStreamPerThread));
     return {p, [device,pool](void *x) {
         int previous = device; cudaGetDevice(&previous); cudaSetDevice(device);
-        if(pool) cudaFreeAsync(x,cudaStreamPerThread); else cudaFree(x);
+        cudaFreeAsync(x,cudaStreamPerThread);
         cudaSetDevice(previous);
     }};
 }
@@ -475,14 +470,12 @@ Tensor Runtime::attention(const Tensor &q,const Tensor &k,const Tensor &v,int he
     require(!causal || q.rows==k.rows,"causal attention requires equal lengths");
     require(tile>=0 && (!tile || (height>0 && width>0 && q.rows==k.rows && q.rows%(height*width)==0)),"invalid local attention grid");
     require(q.fp32==k.fp32 && q.fp32==v.fp32,"attention dtype mismatch");
-    bool math=mask || q.fp32;
     int dim=q.cols/heads; chunk=std::min(chunk,q.rows); Tensor out(q.rows,q.cols,q.fp32);
-    const char *backend=std::getenv("FASTLLM_NOMAS_ATTENTION");
-    if(!q.fp32 && !mask && dim==128 && (!backend || std::string(backend)!="legacy")) {
+    if(!q.fp32 && !mask && dim==128) {
         check(fusedAttention(q.data,k.data,v.data,out.data,q.rows,k.rows,heads,kvHeads,causal,tile,height,width,cudaStreamPerThread));
         return out;
     }
-    if(q.fp32 && (!backend || std::string(backend)!="legacy")) {
+    if(q.fp32) {
         // Reuse cuBLAS batched GEMM, also used by fastllm's general attention
         // implementation. All heads in a GQA group share one launch. FP32 QK,
         // softmax and PV retain the validated math path without a BF16 cast.
@@ -510,23 +503,16 @@ Tensor Runtime::attention(const Tensor &q,const Tensor &k,const Tensor &v,int he
     auto probabilities=allocate(size_t(chunk)*k.rows*2),inverse=allocate(size_t(chunk)*4);
     std::shared_ptr<void> maskDevice;
     if(mask) { maskDevice=allocate(size_t(q.rows)*k.rows); copy(maskDevice.get(),mask,size_t(q.rows)*k.rows,cudaMemcpyHostToDevice); }
-    if(v.fp32) copy(vf.get(),v.data,v.bytes(),cudaMemcpyDeviceToDevice);
-    else { toFloat<<<grid(v.size()),256,0,cudaStreamPerThread>>>(ptr(v),static_cast<float *>(vf.get()),v.size()); check(cudaGetLastError()); }
+    toFloat<<<grid(v.size()),256,0,cudaStreamPerThread>>>(ptr(v),static_cast<float *>(vf.get()),v.size()); check(cudaGetLastError());
     float alpha=1.f/std::sqrt(float(dim)),one=1,zero=0; auto h=static_cast<cublasHandle_t>(blas_);
     for(int head=0;head<heads;++head) for(int start=0;start<q.rows;start+=chunk) {
         int m=std::min(chunk,q.rows-start);
-        if(q.fp32) {
-            check(cublasSgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,k.rows,m,dim,&alpha,
-                as<float>(k)+(head/(heads/kvHeads))*dim,k.cols,as<float>(q)+size_t(start)*q.cols+head*dim,q.cols,
-                &zero,static_cast<float *>(scores.get()),k.rows));
-        } else {
-            check(cublasGemmEx(h,CUBLAS_OP_T,CUBLAS_OP_N,k.rows,m,dim,&alpha,
-                ptr(k)+(head/(heads/kvHeads))*dim,CUDA_R_16BF,k.cols,ptr(q)+size_t(start)*q.cols+head*dim,CUDA_R_16BF,q.cols,
-                &zero,scores.get(),CUDA_R_32F,k.rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
-        }
+        check(cublasGemmEx(h,CUBLAS_OP_T,CUBLAS_OP_N,k.rows,m,dim,&alpha,
+            ptr(k)+(head/(heads/kvHeads))*dim,CUDA_R_16BF,k.cols,ptr(q)+size_t(start)*q.cols+head*dim,CUDA_R_16BF,q.cols,
+            &zero,scores.get(),CUDA_R_32F,k.rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
         softmax<<<m,256,0,cudaStreamPerThread>>>(static_cast<float *>(scores.get()),static_cast<uint8_t *>(maskDevice.get()),k.rows,start,causal,tile,height,width,
-            math?nullptr:static_cast<float *>(inverse.get())); check(cudaGetLastError());
-        if(math) {
+            mask?nullptr:static_cast<float *>(inverse.get())); check(cudaGetLastError());
+        if(mask) {
             check(cublasSgemm(h,CUBLAS_OP_N,CUBLAS_OP_N,dim,m,k.rows,&one,
                 static_cast<float *>(vf.get())+(head/(heads/kvHeads))*dim,v.cols,static_cast<float *>(scores.get()),k.rows,
                 &zero,static_cast<float *>(values.get()),dim));
@@ -538,9 +524,8 @@ Tensor Runtime::attention(const Tensor &q,const Tensor &k,const Tensor &v,int he
                 ptr(v)+(head/(heads/kvHeads))*dim,CUDA_R_16BF,v.cols,probabilities.get(),CUDA_R_16BF,k.rows,
                 &zero,values.get(),CUDA_R_32F,dim,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
         }
-        if(q.fp32) scatterHead<float><<<grid(size_t(m)*dim),256,0,cudaStreamPerThread>>>(static_cast<float *>(values.get()),as<float>(out)+size_t(start)*q.cols+head*dim,m,dim,q.cols,nullptr);
-        else scatterHead<B><<<grid(size_t(m)*dim),256,0,cudaStreamPerThread>>>(static_cast<float *>(values.get()),ptr(out)+size_t(start)*q.cols+head*dim,m,dim,q.cols,
-            math?nullptr:static_cast<float *>(inverse.get())); check(cudaGetLastError());
+        scatterHead<B><<<grid(size_t(m)*dim),256,0,cudaStreamPerThread>>>(static_cast<float *>(values.get()),ptr(out)+size_t(start)*q.cols+head*dim,m,dim,q.cols,
+            mask?nullptr:static_cast<float *>(inverse.get())); check(cudaGetLastError());
     }
     return out;
 }
@@ -609,16 +594,6 @@ Tensor Weights::linear(const Tensor &x,const std::string &prefix,bool separateBi
     auto &w=get(prefix+".weight"); auto bias=optional(prefix+".bias");
     auto out=impl_->rt.linear(x,w,separateBias?nullptr:bias);
     if(separateBias && bias) out=impl_->rt.bias(out,*bias);
-    // Explicit developer diagnostic; disabled unless requested. Files contain
-    // raw float32 tensors and must never be enabled on a public server.
-    if(const char *directory=std::getenv("FASTLLM_NOMAS_TRACE")) {
-        for(auto &pair:std::vector<std::pair<std::string,Tensor>>{{"input",x},{"output",out}}) {
-            auto data=impl_->rt.download(pair.second);
-            std::ofstream file(std::string(directory)+"/"+prefix+"."+pair.first+".f32",std::ios::binary);
-            if(!file) throw std::runtime_error("cannot write requested HY-Nomas trace");
-            file.write(reinterpret_cast<const char *>(data.data()),data.size()*4);
-        }
-    }
     return out;
 }
 void Weights::clear() { impl_->cache.clear(); impl_->shards.clear(); }

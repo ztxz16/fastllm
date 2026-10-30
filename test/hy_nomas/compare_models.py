@@ -35,13 +35,6 @@ def load(module, weights, prefix):
     state = {key[len(prefix):]: weights.get_tensor(key).to(device="cuda", dtype=DTYPE)
              for key in weights.keys() if key.startswith(prefix)}
     module.load_state_dict(state, strict=True, assign=True)
-    if os.environ.get("NOMAS_REFERENCE_TRACE"):
-        for name, child in module.named_modules():
-            if isinstance(child, torch.nn.Linear):
-                def hook(mod, inputs, output, name=prefix+name):
-                    for suffix, tensor in [("input", inputs[0]), ("output", output)]:
-                        tensor.detach().float().cpu().contiguous().numpy().tofile(Path(os.environ["NOMAS_REFERENCE_TRACE"]) / f"{name}.{suffix}.f32")
-                child.register_forward_hook(hook)
     return module.eval()
 
 

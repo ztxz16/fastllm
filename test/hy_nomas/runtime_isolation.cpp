@@ -1,5 +1,5 @@
 // No checkpoints required. Also writes deterministic outputs for before/after
-// library comparisons; --math-only allows comparison with the old allocator.
+// library comparisons.
 #include "models/hy_nomas/runtime.h"
 #include <cuda_runtime.h>
 #include <cmath>
@@ -18,13 +18,11 @@ static void require(bool ok, const char *message) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2 || argc > 3) {
-        std::cerr << "runtime_isolation OUTPUT.f32 [--math-only]\n";
+    if (argc != 2) {
+        std::cerr << "runtime_isolation OUTPUT.f32\n";
         return 2;
     }
     try {
-        const bool mathOnly = argc == 3 && std::string(argv[2]) == "--math-only";
-        require(argc == 2 || mathOnly, "unknown option");
         check(cudaSetDevice(0));
         cudaMemPool_t defaultPool, currentPool;
         check(cudaDeviceGetDefaultMemPool(&defaultPool, 0));
@@ -32,7 +30,6 @@ int main(int argc, char **argv) {
         uint64_t threshold = 0;
         check(cudaMemPoolGetAttribute(defaultPool, cudaMemPoolAttrReleaseThreshold, &threshold));
         auto unchanged = [&] {
-            if (mathOnly) return;
             cudaMemPool_t current;
             uint64_t after = 0;
             check(cudaDeviceGetMemPool(&current, 0));
@@ -53,8 +50,7 @@ int main(int argc, char **argv) {
         for (int cycle = 0; cycle < 3; ++cycle) {
             Tensor survivor;
             {
-                Runtime runtime(0);
-                require(runtime.isFloat32(), "run with FASTLLM_NOMAS_PRECISION=fp32");
+                Runtime runtime(0,true);
                 auto x = runtime.upload(values, 4, 16);
                 auto weight = runtime.upload(weights, 16, 16);
                 auto linear = runtime.linear(x, weight);
@@ -93,8 +89,7 @@ int main(int argc, char **argv) {
         require(actual == sentinel, "unrelated CUDA allocation was corrupted");
         require(bool(output), "cannot write output");
         unchanged();
-        std::cout << "PASS: math, tensor lifetime, worker transfer"
-                  << (mathOnly ? "\n" : ", default pool isolation\n");
+        std::cout << "PASS: math, tensor lifetime, worker transfer, default pool isolation\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         return 1;

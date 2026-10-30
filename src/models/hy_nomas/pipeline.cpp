@@ -7,6 +7,28 @@
 #include <stdexcept>
 
 namespace fastllm { namespace nomas {
+namespace {
+// One opt-in trace for identical-input reference tests. Disabled tracing must
+// not download GPU tensors. The caller supplies an existing private directory.
+class PipelineTrace {
+    Runtime &rt_;
+    std::string directory_,prefix_;
+public:
+    explicit PipelineTrace(Runtime &rt,const std::string &prefix={}):rt_(rt),prefix_(prefix) {
+        if(const char *directory=std::getenv("FASTLLM_NOMAS_TRACE")) directory_=directory;
+    }
+    void operator()(const std::string &name,const std::vector<float> &values) const {
+        if(directory_.empty()) return;
+        std::ofstream file(directory_+"/"+prefix_+name+".f32",std::ios::binary);
+        file.write(reinterpret_cast<const char *>(values.data()),values.size()*sizeof(float));
+        if(!file) throw std::runtime_error("cannot write HY-Nomas pipeline trace");
+    }
+    void operator()(const std::string &name,const Tensor &values) const {
+        if(!directory_.empty()) (*this)(name,rt_.download(values));
+    }
+};
+}
+
 Pipeline::Pipeline(const std::string &model,const std::string &text,int device):
     rt_(device),tokenizer_(text),text_(rt_,text),
     dit_(rt_,model+"/DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors"),
@@ -22,15 +44,7 @@ std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int 
     auto update=[&](int stage,int current,int total) {
         if(progress && progress(stage,current,total,user)) throw std::runtime_error("generation cancelled");
     };
-    // Opt-in diagnostics for identical-input reference comparisons. The server
-    // never sets this variable; the destination must already exist.
-    auto trace=[](const std::string &name,const std::vector<float> &values) {
-        const char *directory=std::getenv("FASTLLM_NOMAS_PIPELINE_TRACE");
-        if(!directory || !*directory) return;
-        std::ofstream file(std::string(directory)+"/"+name+".f32",std::ios::binary);
-        file.write(reinterpret_cast<const char *>(values.data()),values.size()*sizeof(float));
-        if(!file) throw std::runtime_error("cannot write HY-Nomas pipeline trace");
-    };
+    PipelineTrace trace(rt_);
     try {
         // World sessions keep both networks resident between actions. Release
         // those weights before encoding an independent video prompt as well.
@@ -38,12 +52,12 @@ std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int 
         update(1,0,1);
         int crop=0; auto ids=tokenizer_.videoPrompt(prompt,crop);
         auto features=text_.encode(ids).rowSlice(crop,int(ids.size())-crop);
-        if(std::getenv("FASTLLM_NOMAS_PIPELINE_TRACE")) trace("features",rt_.download(features));
+        trace("features",features);
         text_.unload(); update(1,1,1);
         int t=frames/4,h=height/32,w=width/32,n=t*h*w;
         std::mt19937_64 generator(seed); std::normal_distribution<float> normal;
         std::vector<float> latent(size_t(n)*32);
-        // Native RNG is reproducible within this implementation. Precision
+        // DiT RNG is reproducible within this implementation. Precision
         // tests inject identical tensors, rather than assuming torch seed parity.
         for(auto &v:latent) v=normal(generator);
         trace("latent_0",latent);
@@ -56,11 +70,10 @@ std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int 
             trace("latent_"+std::to_string(step+1),latent);
         }
         dit_.unload(); update(2,steps,steps); update(3,0,1);
-        const char *traceDirectory=std::getenv("FASTLLM_NOMAS_PIPELINE_TRACE");
         auto noise=rt_.pixelNoise(seed,0,t,height,width);
-        if(traceDirectory && *traceDirectory) trace("pixel_noise",rt_.download(noise));
+        trace("pixel_noise",noise);
         auto pixels=decoder_.forward(rt_.upload(latent.data(),n,32),noise,t,h,w);
-        if(traceDirectory && *traceDirectory) trace("pixels",rt_.download(pixels));
+        trace("pixels",pixels);
         auto rgb=rt_.downloadPixelRGB(pixels,width,height,0,frames);
         decoder_.unload(); update(3,1,1);
         update(4,1,1); return rgb;
@@ -166,13 +179,7 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
     auto update=[&](int stage,int current,int total) {
         if(progress && progress(stage,current,total,user)) throw std::runtime_error("generation cancelled");
     };
-    auto trace=[&](const std::string &name,const std::vector<float> &values) {
-        const char *directory=std::getenv("FASTLLM_NOMAS_WORLD_TRACE");
-        if(!directory || !*directory) return;
-        std::ofstream file(std::string(directory)+"/step_"+std::to_string(world.frameOffset/5)+"_"+name+".f32",std::ios::binary);
-        file.write(reinterpret_cast<const char *>(values.data()),values.size()*sizeof(float));
-        if(!file) throw std::runtime_error("cannot write world trace");
-    };
+    PipelineTrace trace(rt_,"step_"+std::to_string(world.frameOffset/5)+"_");
     // All state changes are transactional, including RNG and the KV commit.
     // A cancelled/failed step can be retried without advancing the world.
     WorldState next=world;
@@ -195,7 +202,7 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
     Tensor camera;
     if(hasCamera) camera=dit_.cameraEmbedding(rt_.upload(poses.data(),t,64));
     trace("camera",poses); trace("latent_0",latent);
-    if(std::getenv("FASTLLM_NOMAS_WORLD_TRACE")) trace("features",rt_.download(segmentFeatures));
+    trace("features",segmentFeatures);
     auto sigma=[&](int i) { float s=1.f-float(i)/world.steps; return 5.f*s/(1.f+4.f*s); };
     for(int step=0;step<world.steps;++step) {
         update(2,step,world.steps+1);
@@ -232,12 +239,11 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
     int previous=int(context.size()/(size_t(h)*w*32));
     context.insert(context.end(),latent.begin(),latent.end());
     int decodeT=previous+t,begin=world.frameOffset-previous;
-    const char *traceDirectory=std::getenv("FASTLLM_NOMAS_WORLD_TRACE");
     auto noise=rt_.pixelNoise(world.seed,begin,decodeT,world.height,world.width);
     trace("decoder_latents",context);
-    if(traceDirectory && *traceDirectory) trace("pixel_noise",rt_.download(noise));
+    trace("pixel_noise",noise);
     auto pixels=decoder_.forward(rt_.upload(context.data(),decodeT*h*w,32),noise,decodeT,h,w);
-    if(traceDirectory && *traceDirectory) trace("pixels",rt_.download(pixels));
+    trace("pixels",pixels);
     auto rgb=rt_.downloadPixelRGB(pixels,world.width,world.height,previous*4,20);
     next.decoderLatents=std::move(latent); next.frameOffset+=t;
     update(3,1,1); update(4,1,1);

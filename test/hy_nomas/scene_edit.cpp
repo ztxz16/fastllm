@@ -74,20 +74,20 @@ int main(int argc,char **argv) {
         // A second branch reuses the identical first segment for the official
         // two-segment precision comparison. It does not reuse native KV on the
         // reference side; compare_world.py reconstructs that independently.
-        if(const char *traceEnv=std::getenv("FASTLLM_NOMAS_WORLD_TRACE")) {
+        if(const char *traceEnv=std::getenv("FASTLLM_NOMAS_TRACE")) {
             const std::string traceDir=traceEnv;
             const auto branchDir=std::filesystem::path(traceDir)/"exploration";
             std::filesystem::create_directories(branchDir);
             for(const auto &file:std::filesystem::directory_iterator(traceDir))
                 if(file.is_regular_file() && file.path().filename().string().rfind("step_0_",0)==0)
                     std::filesystem::copy_file(file.path(),branchDir/file.path().filename(),std::filesystem::copy_options::overwrite_existing);
-            setenv("FASTLLM_NOMAS_WORLD_TRACE",branchDir.c_str(),1);
+            setenv("FASTLLM_NOMAS_TRACE",branchDir.c_str(),1);
             auto branch=initial;
             auto rgb=pipeline.stepWorld(branch,1,noEncoding,&encoded);
             std::ofstream out(branchDir/"step_1_served.rgb",std::ios::binary);
             out.write(reinterpret_cast<const char *>(rgb.data()),rgb.size());
             require(bool(out) && !encoded,"exploration precision capture failed");
-            setenv("FASTLLM_NOMAS_WORLD_TRACE",traceDir.c_str(),1);
+            setenv("FASTLLM_NOMAS_TRACE",traceDir.c_str(),1);
         }
         std::ofstream report(std::string(argv[3])+"/scene_edit_state.json");
         report<<"{\"passed\":true,\"segments\":"<<world->frameOffset/5<<",\"old_text_tokens\":"<<initial.features.rows

@@ -1,6 +1,6 @@
 """Replay an actual native pipeline trace using official FP32 modules.
 
-Run native generation with FASTLLM_NOMAS_PIPELINE_TRACE pointing to an existing
+Run native generation with FASTLLM_NOMAS_TRACE pointing to an existing
 private directory. Compare the same initial latent and PixelUMM noise, avoiding
 any assumption that C++ and torch RNG seeds produce identical samples. Reference
 text features must be from compare_text.py with the same prompt. This validates
