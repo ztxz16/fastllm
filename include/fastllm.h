@@ -189,6 +189,12 @@ namespace fastllm {
         float tool_call_content_top_p = 1.0f;
         float tool_call_content_temperature = 1.0f;
 
+        // History is consumed only by repetition penalties. Keep every
+        // non-unit value: CPU and model-specific samplers use different epsilons.
+        bool NeedsTokenHistory() const {
+            return repeat_penalty != 1.0f;
+        }
+
         bool IsSimpleGreedy() const {
             if (!tool_call_allowed_token_ids.empty()) {
                 return false;

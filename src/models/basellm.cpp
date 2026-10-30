@@ -38,9 +38,16 @@ namespace fastllm {
             }
         }
 
-        static bool NeedRepeatPenalty(const GenerationConfig &config) {
-            float diff = config.repeat_penalty - 1.0f;
-            return diff > 1e-6f || diff < -1e-6f;
+        static void SetSamplingHistory(LastTokensManager &manager, size_t row,
+                                       const GenerationConfig &config, const LastTokensUnit &history) {
+            if (manager.units.size() <= row) manager.units.resize(row + 1);
+            if (config.NeedsTokenHistory()) {
+                manager.units[row] = history;
+            } else {
+                // Preserve row alignment and last_n for fallback samplers,
+                // without copying unused tree nodes or replacing the queue.
+                manager.units[row].Init(config.last_n);
+            }
         }
 
         static std::vector<float>* CreatePendingResultLogits(const GenerationConfig &config) {
@@ -65,42 +72,55 @@ namespace fastllm {
         }
 
         static void ReleasePagedCachePages(Data &cache, bool clearDims = false) {
-            std::set<std::pair<PagedCacheManager*, int> > releasedPages;
-            auto releaseUnique = [&](Data &pagedCache) {
-                if (ReleaseKvMemCache(pagedCache)) {
-                    return;
+            // A TP root can mirror a local shard, and views may partially
+            // overlap. Deduplicate by physical pool/page, preserving first-use
+            // release order without allocating a tree node for every page.
+            struct PageMarks {
+                std::vector<uint64_t> words;
+                std::vector<size_t> touched;
+                std::vector<int> pages;
+                void Begin(int count) {
+                    for (size_t word : touched) words[word] = 0;
+                    touched.clear(); pages.clear();
+                    if (words.size() < ((size_t)count + 63) / 64) words.resize(((size_t)count + 63) / 64);
                 }
-                if (!pagedCache.isPagedKVCache || pagedCache.pagedKVCacheData == nullptr ||
-                    pagedCache.pageIndex.empty()) {
-                    return;
+                void Add(int page) {
+                    const size_t word = (size_t)page / 64;
+                    const uint64_t bit = uint64_t(1) << (page % 64);
+                    if (words[word] & bit) return;
+                    if (!words[word]) touched.push_back(word);
+                    words[word] |= bit;
+                    pages.push_back(page);
                 }
-                std::vector<int> uniquePages;
-                for (int page : pagedCache.pageIndex) {
-                    std::pair<PagedCacheManager*, int> key = {pagedCache.pagedKVCacheData, page};
-                    if (releasedPages.insert(key).second) {
-                        uniquePages.push_back(page);
-                    }
-                }
-                if (!uniquePages.empty()) {
-                    pagedCache.pagedKVCacheData->ReleasePageIndices(uniquePages);
-                }
-                pagedCache.pageIndex.clear();
-                pagedCache.lastPageLen = 0;
             };
-            releaseUnique(cache);
-            if (cache.multiDeviceData) {
-                for (auto &it : cache.multiDeviceDatas) {
-                    if (it.second != nullptr) {
-                        releaseUnique(*it.second);
-                        if (clearDims) {
-                            it.second->dims.clear();
-                        }
-                    }
+            static thread_local PageMarks marks;
+            std::vector<Data *> descriptors;
+            descriptors.reserve(1 + cache.multiDeviceDatas.size());
+            descriptors.push_back(&cache);
+            if (cache.multiDeviceData)
+                for (auto &entry : cache.multiDeviceDatas)
+                    if (entry.second) descriptors.push_back(entry.second);
+            std::vector<PagedCacheManager *> pools;
+            pools.reserve(descriptors.size());
+            for (auto *view : descriptors) {
+                if (!ReleaseKvMemCache(*view) && view->isPagedKVCache &&
+                    view->pagedKVCacheData && !view->pageIndex.empty() &&
+                    std::find(pools.begin(), pools.end(), view->pagedKVCacheData) == pools.end())
+                    pools.push_back(view->pagedKVCacheData);
+            }
+            for (auto *pool : pools) {
+                marks.Begin(pool->maxPages);
+                for (auto *view : descriptors) {
+                    if (!view->isPagedKVCache || view->pagedKVCacheData != pool) continue;
+                    for (int page : view->pageIndex) marks.Add(page);
                 }
+                pool->ReleasePageIndices(marks.pages);
+                for (auto *view : descriptors)
+                    if (view->isPagedKVCache && view->pagedKVCacheData == pool) {
+                        view->pageIndex.clear(); view->lastPageLen = 0;
+                    }
             }
-            if (clearDims) {
-                cache.dims.clear();
-            }
+            if (clearDims) for (auto *view : descriptors) view->dims.clear();
         }
 
         static bool ToolCallConstraintStartsWith(const std::string &text, const std::string &prefix) {
@@ -2087,6 +2107,8 @@ namespace fastllm {
                    "(full idle burst, decode interleave enabled).\n",
                    activePrefillTokenLimit);
         }
+        LastTokensManager tokensManager;
+        tokensManager.units.reserve(std::max(1, maxBatch));
         while (true) {
             std::vector <Data*> attentionMasks;
             std::vector <Data*> positionIds;
@@ -2097,7 +2119,6 @@ namespace fastllm {
             std::vector <int> seqLens;
             std::vector <int> handles;
             std::vector <GenerationConfig> generationConfigs;
-            LastTokensManager tokensManager;
             std::vector <ResponseContext*> tokenContexts;
             std::vector <std::vector <float>* > logits;
             std::vector <float> decodePositionValues;
@@ -2395,7 +2416,7 @@ namespace fastllm {
 
                     generationConfigs.push_back(ctx->generationConfig);
                     model->PrepareToolCallConstraint(ctx, generationConfigs.back());
-                    bool ctxNeedRepeatPenalty = NeedRepeatPenalty(generationConfigs.back());
+                    bool ctxNeedRepeatPenalty = generationConfigs.back().NeedsTokenHistory();
                     selectedNeedLastTokens |= ctxNeedRepeatPenalty ||
                                               (generationConfigs.back().output_logits &&
                                                !generationConfigs.back().IsSimpleGreedy()) ||
@@ -2491,10 +2512,13 @@ namespace fastllm {
             }
 
             if (selectedNeedLastTokens) {
-                tokensManager.units.reserve(tokenContexts.size());
-                for (auto *ctx : tokenContexts) {
-                    tokensManager.units.push_back(ctx->tokens);
+                tokensManager.units.resize(tokenContexts.size());
+                for (size_t row = 0; row < tokenContexts.size(); ++row) {
+                    SetSamplingHistory(tokensManager, row, generationConfigs[row], tokenContexts[row]->tokens);
                 }
+            } else {
+                // Keep the existing empty-history fast path for GPU sampling.
+                tokensManager.units.clear();
             }
 
             // Decode阶段：检查空闲分页是否足够，不够时释放资源
@@ -2808,7 +2832,7 @@ namespace fastllm {
                         ctx->resultTokenQueue.push(curRet);
                         QueueGeneratedResultLogits(ctx, logits, i);
                         ctx->allTokens.push_back(curRet);
-                        if (NeedRepeatPenalty(ctx->generationConfig)) {
+                        if (ctx->generationConfig.NeedsTokenHistory()) {
                             ctx->tokens.Push(curRet);
                         }
                         ctx->curTokens++;
@@ -2965,6 +2989,10 @@ namespace fastllm {
                     const int maxPromptTokens = model->max_positions - (sharedKvPool ? 1 : 0);
                     const int prefillChunk = model->GetChunkedPrefillSize();
                     const int prefillBatchLimit = model->GetBatchedPrefillTokenLimit();
+                    // Keep empty per-request history slots for sampling fallbacks,
+                    // without allocating and destroying their queues every token.
+                    LastTokensManager tokensManager;
+                    tokensManager.units.reserve(maxBatch);
                     while (true) {
                         std::unique_ptr<inference_trace::Step> trace;
                         if (traceInference) trace.reset(new inference_trace::Step());
@@ -2977,8 +3005,6 @@ namespace fastllm {
                         int prefillTokens = 0;
                         std::vector <int> handles;
                         std::vector <GenerationConfig> generationConfigs;
-                        LastTokensManager tokensManager;
-                        tokensManager.units.reserve(maxBatch);
                         std::vector <std::vector <float>* > logits;
                         attentionMasks.reserve(maxBatch);
                         positionIds.reserve(maxBatch);
@@ -3368,14 +3394,8 @@ namespace fastllm {
                                 model->PrepareToolCallConstraint(it.second, generationConfigs.back());
                                 logits.push_back(CreatePendingResultLogits(it.second->generationConfig));
 
-                                // Keep one slot per request, but plain greedy decoding
-                                // does not consume repetition history. Avoid copying
-                                // its multiset/queue (including vector-growth copies).
-                                const auto &sampling = generationConfigs.back();
-                                if (sampling.IsSimpleGreedy() && !sampling.output_logits)
-                                    tokensManager.units.emplace_back(sampling.last_n);
-                                else
-                                    tokensManager.units.push_back(it.second->tokens);
+                                SetSamplingHistory(tokensManager, handles.size(),
+                                                   generationConfigs.back(), it.second->tokens);
                                 handles.push_back(it.first);
 
                                 if (it.second->preTokens == 0) {
@@ -3452,6 +3472,7 @@ namespace fastllm {
                                 }
                             }
                         }
+                        tokensManager.units.resize(handles.size());
                         if (trace) trace->Mark("batch_input_build_ms");
                         if (seqLens.size() > 0) {
                             if (trace) {
@@ -3654,7 +3675,8 @@ namespace fastllm {
                                     it.second->resultTokenQueue.push(curRet);
                                     QueueGeneratedResultLogits(it.second, logits, i);
                                     it.second->allTokens.push_back(curRet);
-                                    it.second->tokens.Push(curRet);
+                                    if (it.second->generationConfig.NeedsTokenHistory())
+                                        it.second->tokens.Push(curRet);
                                     it.second->curTokens++;
                                     if (it.second->curTokens == it.second->generationConfig.output_token_limit
                                         || (maxTotalLens > 0 && it.second->allTokens.size() >= maxTotalLens)
