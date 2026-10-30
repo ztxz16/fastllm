@@ -586,6 +586,14 @@ if (USE_CUDA)
         message(STATUS "GLM53 FlashInfer sparse prefill: OFF (BF16 DSA fallback)")
     endif()
 
+    # Keep DSV4.1's pinned headers and architecture-specific cubins isolated.
+    if ((FASTLLM_CUTLASS_FP8_SM120_ENABLED OR FASTLLM_CUTLASS_FP8_SM121_ENABLED)
+        AND NOT CUDA_NO_TENSOR_CORE AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        set(FASTLLM_DSV41_FLASHINFER_ENABLED ON)
+        set_property(SOURCE src/devices/cuda/models/deepseekv41-kernels.cu
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DSV41_FLASHINFER_SM120)
+    endif()
+
     # Marlin 内核需要 sm_75+，但通过 __CUDA_ARCH__ 宏保护可在低算力（如 sm_70）下编译为占位实现，
     # 运行期再根据设备算力回退到朴素 int4 linear，因此这里始终编译 marlin.cu 以兼容多 CUDA_ARCH 打包。
 
@@ -807,6 +815,19 @@ if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
     set(FASTLLM_GLM53_FLASHINFER_OBJECTS $<TARGET_OBJECTS:fastllm_glm53_flashinfer_sm120>)
 endif()
 
+if (FASTLLM_DSV41_FLASHINFER_ENABLED)
+    add_library(fastllm_dsv41_flashinfer_sm120 OBJECT
+        src/devices/cuda/models/deepseekv41-flashinfer-sm120.cu)
+    set_target_properties(fastllm_dsv41_flashinfer_sm120 PROPERTIES
+        CUDA_ARCHITECTURES OFF POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(fastllm_dsv41_flashinfer_sm120 PRIVATE
+        "--generate-code=arch=compute_120a,code=sm_120a"
+        "--generate-code=arch=compute_121a,code=sm_121a" "--use_fast_math")
+    target_include_directories(fastllm_dsv41_flashinfer_sm120 BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_dsv41/include")
+    set(FASTLLM_DSV41_FLASHINFER_OBJECTS $<TARGET_OBJECTS:fastllm_dsv41_flashinfer_sm120>)
+endif()
+
 # Disk loading also uses dlsym in CPU-only builds and the Python extension.
 list(APPEND FASTLLM_LINKED_LIBS ${CMAKE_DL_LIBS})
 
@@ -823,7 +844,7 @@ if (PY_API)
 
     include_directories(third_party/pybind11/include)
     file(GLOB FASTLLM_CXX_HEADERS include/**/*.h)
-    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_MIMO_EP8_MEGA_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
+    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_MIMO_EP8_MEGA_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_DSV41_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
@@ -854,6 +875,9 @@ endif()
 
 if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
     target_link_libraries(fastllm INTERFACE ${FASTLLM_GLM53_FLASHINFER_OBJECTS})
+endif()
+if (FASTLLM_DSV41_FLASHINFER_ENABLED)
+    target_link_libraries(fastllm INTERFACE ${FASTLLM_DSV41_FLASHINFER_OBJECTS})
 endif()
 
 add_executable(main main.cpp)
@@ -2649,6 +2673,14 @@ if (UNIT_TEST)
         set_target_properties(cuda_dsv41_compact_projections_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
         add_test(NAME cuda_dsv41_compact_projections COMMAND cuda_dsv41_compact_projections_test)
         set_tests_properties(cuda_dsv41_compact_projections PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+        if (FASTLLM_DSV41_FLASHINFER_ENABLED)
+            add_executable(cuda_dsv41_flashinfer_test test/basic/test_cuda_dsv41_flashinfer.cu)
+            target_link_libraries(cuda_dsv41_flashinfer_test PRIVATE fastllm)
+            set_target_properties(cuda_dsv41_flashinfer_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            fastllm_add_checked_test(cuda_dsv41_flashinfer cuda_dsv41_flashinfer_test "FLASHINFER_PASS" 300)
+            set_tests_properties(cuda_dsv41_flashinfer PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+        endif()
 
         if (NOT USE_ROCM)
             add_executable(cuda_dsv41_hc_graph_test test/basic/test_cuda_dsv41_hc_graph.cu)

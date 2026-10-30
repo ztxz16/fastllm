@@ -38,6 +38,9 @@ SOFTWARE.
 #include "devices/cuda/fastllm-cuda-hybrid-dsa.h"
 #include "../fastllm-hybrid-prefill.cuh"
 #include "deepseekv41-reference.cuh"
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+#include "deepseekv41-flashinfer.cuh"
+#endif
 #include "fastllm.h"
 
 #include <algorithm>
@@ -6732,6 +6735,9 @@ namespace {
 constexpr int kFullDecodeTransforms = 5;
 
 struct V41FullDecodePlan {
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+    void *flashInfer = nullptr;
+#endif
     bool indexPairs = false, indexPairNarrow = false;
     bool qkPrefetch = false, wideTopKMerge = false, indexPrefetch = false;
     bool fuseIndexBlocks = false, wideCandidateSelect = false;
@@ -6753,6 +6759,9 @@ struct V41FullDecodePlan {
         int old = 0; cudaGetDevice(&old); cudaSetDevice(device);
         // Graph ownership must be released before its operand storage.
         cudaStreamSynchronize(cudaStreamPerThread);
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+        FastllmV41FlashInferDestroy(flashInfer);
+#endif
         if (pending) cudaEventSynchronize(copied);
         if (copied) cudaEventDestroy(copied);
         if (host) cudaFreeHost(host);
@@ -7098,6 +7107,11 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         ok = ok && cudaHostAlloc(reinterpret_cast<void **>(&p->host), (size_t)c.batch * sizeof(*p->host), cudaHostAllocDefault) == cudaSuccess &&
              cudaEventCreateWithFlags(&p->copied, cudaEventDisableTiming) == cudaSuccess;
     if (!ok) { cudaGetLastError(); return nullptr; }
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+    const char *flashInfer = std::getenv("FASTLLM_DSV41_FLASHINFER");
+    if (flashInfer && std::strcmp(flashInfer, "1") == 0)
+        p->flashInfer = FastllmV41FlashInferCreate(c);
+#endif
     return p.release();
 }
 
@@ -7267,7 +7281,11 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
                 nullptr, nullptr, 1, 0, 0, c.blockSize, p->blockShift, 0, c.ratio, 0, p->listCap, nullptr, p->index, {});
         }
     }
-    const bool attentionOk = p->qkPrefetch ? V41FullDecodeAttention<8, true, true, true>(*p) :
+    const bool attentionOk =
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+        p->flashInfer ? FastllmV41FlashInferRun(p->flashInfer, b, p->requests, cudaStreamPerThread) == cudaSuccess :
+#endif
+        p->qkPrefetch ? V41FullDecodeAttention<8, true, true, true>(*p) :
         p->pvPipeline ? V41FullDecodeAttention<8, true, true>(*p) :
         p->splits == 8 ? V41FullDecodeAttention<8, true>(*p) :
         p->splits == 2 ? V41FullDecodeAttention<2, true>(*p) :
