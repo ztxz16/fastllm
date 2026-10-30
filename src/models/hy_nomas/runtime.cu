@@ -14,6 +14,11 @@
 #include <mutex>
 #include <stdexcept>
 #include <type_traits>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace fastllm { namespace nomas {
 cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,bool,int,int,int,cudaStream_t);
@@ -232,10 +237,10 @@ template<class T> __global__ void pixelQKKernel(const T *x,T *y,const T *wt,cons
         y[size_t(head)*128+lane]=cast<T>(normalized[lane]*cosf(angle)+rotated*sinf(angle));
     }
 }
-template<class T> __global__ void textRopeKernel(const T *x,T *y,size_t n,int cols) {
+template<class T> __global__ void textRopeKernel(const T *x,T *y,size_t n,int cols,float theta) {
     for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
         int d=i%128;
-        float angle=float(i/cols)*powf(1000000.f,-2.f*float(d%64)/128.f);
+        float angle=float(i/cols)*powf(theta,-2.f*float(d%64)/128.f);
         float rotated=d<64?-f(x[i+64]):f(x[i-64]);
         // Transformers' Qwen RoPE cos/sin are cast to BF16, and its eager
         // multiply and add each return BF16 (unlike the DiT/PixelUMM RoPE).
@@ -458,9 +463,10 @@ Tensor Runtime::embedding(const Tensor &weight,const std::vector<int> &tokens) {
     }
     return out;
 }
-Tensor Runtime::textRope(const Tensor &x) {
+Tensor Runtime::textRope(const Tensor &x) { return textRope(x,1000000.f); }
+Tensor Runtime::textRope(const Tensor &x,float theta) {
     require(x.cols%128==0,"invalid Qwen RoPE shape"); Tensor out(x.rows,x.cols,x.fp32);
-    if(x.fp32) { textRopeKernel<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(out),x.size(),x.cols); } else { textRopeKernel<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),x.size(),x.cols); } check(cudaGetLastError()); return out;
+    if(x.fp32) { textRopeKernel<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(out),x.size(),x.cols,theta); } else { textRopeKernel<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),x.size(),x.cols,theta); } check(cudaGetLastError()); return out;
 }
 Tensor Runtime::concat(const std::vector<Tensor> &xs) {
     require(!xs.empty(),"empty concat"); int rows=0;
@@ -490,12 +496,18 @@ Tensor Runtime::rope(const Tensor &x,const RopeTable &table) {
 }
 Tensor Runtime::attention(const Tensor &q,const Tensor &k,const Tensor &v,int heads,const uint8_t *mask,int chunk,
                           int kvHeads,bool causal,int tile,int height,int width) {
+    require(heads>0 && q.cols%heads==0,"invalid attention heads");
+    return attentionScaled(q,k,v,heads,1.f/std::sqrt(float(q.cols/heads)),mask,chunk,kvHeads,causal,tile,height,width);
+}
+Tensor Runtime::attentionScaled(const Tensor &q,const Tensor &k,const Tensor &v,int heads,float scoreScale,
+                                const uint8_t *mask,int chunk,int kvHeads,bool causal,int tile,int height,int width) {
     if(!kvHeads) kvHeads=heads;
     require(heads>0 && kvHeads>0 && heads%kvHeads==0 && q.cols%heads==0 && k.cols%kvHeads==0 && q.cols/heads==k.cols/kvHeads && k.rows==v.rows && k.cols==v.cols && chunk>0,"attention shape mismatch");
     require(!causal || q.rows==k.rows,"causal attention requires equal lengths");
     require(tile>=0 && (!tile || (height>0 && width>0 && q.rows==k.rows && q.rows%(height*width)==0)),"invalid local attention grid");
     require(q.fp32==k.fp32 && q.fp32==v.fp32,"attention dtype mismatch");
     int dim=q.cols/heads; chunk=std::min(chunk,q.rows); Tensor out(q.rows,q.cols,q.fp32);
+    require(std::isfinite(scoreScale) && (q.fp32 || scoreScale==1.f/std::sqrt(float(dim))),"custom attention scale requires FP32");
     if(!q.fp32 && !mask && dim==128) {
         check(fusedAttention(q.data,k.data,v.data,out.data,q.rows,k.rows,heads,kvHeads,causal,tile,height,width,cudaStreamPerThread));
         return out;
@@ -508,7 +520,7 @@ Tensor Runtime::attention(const Tensor &q,const Tensor &k,const Tensor &v,int he
         auto values=allocate(size_t(kvHeads)*chunk*dim*4);
         std::shared_ptr<void> maskDevice;
         if(mask) { maskDevice=allocate(size_t(q.rows)*k.rows); copy(maskDevice.get(),mask,size_t(q.rows)*k.rows,cudaMemcpyHostToDevice); }
-        float scale=1.f/std::sqrt(float(dim)),one=1,zero=0;
+        float scale=scoreScale,one=1,zero=0;
         auto h=static_cast<cublasHandle_t>(blas_); int groups=heads/kvHeads;
         for(int start=0;start<q.rows;start+=chunk) for(int group=0;group<groups;++group) {
             int m=std::min(chunk,q.rows-start);
@@ -529,7 +541,7 @@ Tensor Runtime::attention(const Tensor &q,const Tensor &k,const Tensor &v,int he
     std::shared_ptr<void> maskDevice;
     if(mask) { maskDevice=allocate(size_t(q.rows)*k.rows); copy(maskDevice.get(),mask,size_t(q.rows)*k.rows,cudaMemcpyHostToDevice); }
     toFloat<<<grid(v.size()),256,0,cudaStreamPerThread>>>(ptr(v),static_cast<float *>(vf.get()),v.size()); check(cudaGetLastError());
-    float alpha=1.f/std::sqrt(float(dim)),one=1,zero=0; auto h=static_cast<cublasHandle_t>(blas_);
+    float alpha=scoreScale,one=1,zero=0; auto h=static_cast<cublasHandle_t>(blas_);
     for(int head=0;head<heads;++head) for(int start=0;start<q.rows;start+=chunk) {
         int m=std::min(chunk,q.rows-start);
         check(cublasGemmEx(h,CUBLAS_OP_T,CUBLAS_OP_N,k.rows,m,dim,&alpha,
@@ -557,10 +569,16 @@ Tensor Runtime::attention(const Tensor &q,const Tensor &k,const Tensor &v,int he
 void Runtime::synchronize() { check(cudaDeviceSynchronize()); }
 
 struct Weights::Impl {
+    struct PackedCache {
+        std::unordered_map<std::string,Tensor> tensors;
+        size_t bytes=0,budget=0;
+    };
     Runtime &rt; std::ifstream file; json11::Json header; uint64_t base=0,fileSize=0;
+    std::shared_ptr<void> mapping;
     std::unordered_map<std::string,Tensor> cache;
     struct HostWeight { int rows,cols; bool fp32; std::vector<uint8_t> bytes; };
     std::unordered_map<std::string,HostWeight> host;
+    std::shared_ptr<PackedCache> packed;
     std::string directory;
     std::unordered_map<std::string,std::unique_ptr<Weights>> shards;
     Impl(Runtime &rt,const std::string &path):rt(rt) {
@@ -580,6 +598,16 @@ struct Weights::Impl {
         require(fileSize>=8 && len>0 && len<=64*1024*1024 && len<=fileSize-8,"invalid safetensors header length");
         std::string s(len,'\0'); file.read(&s[0],len); require(bool(file),"truncated safetensors header");
         std::string err; header=json11::Json::parse(s,err); require(err.empty() && header.is_object(),"invalid safetensors JSON"); base=8+len;
+#ifndef _WIN32
+        // Stream directly from the OS page cache instead of copying each layer through
+        // a second large host allocation. Mapping is read-only and optional.
+        int fd=open(path.c_str(),O_RDONLY|O_CLOEXEC);
+        if(fd>=0) {
+            void *address=mmap(nullptr,fileSize,PROT_READ,MAP_PRIVATE,fd,0);
+            close(fd);
+            if(address!=MAP_FAILED) mapping={address,[size=fileSize](void *p) { munmap(p,size); }};
+        }
+#endif
     }
 };
 Weights::Weights(Runtime &rt,const std::string &path):impl_(new Impl(rt,path)) {}
@@ -601,7 +629,11 @@ const Tensor &Weights::get(const std::string &name) {
     if(!i.directory.empty()) {
         auto file=meta.string_value();
         require(!file.empty() && file.find('/')==std::string::npos && file.find('\\')==std::string::npos && file!="..","invalid shard filename");
-        auto &shard=i.shards[file]; if(!shard) shard.reset(new Weights(i.rt,i.directory+"/"+file));
+        auto &shard=i.shards[file];
+        if(!shard) {
+            shard.reset(new Weights(i.rt,i.directory+"/"+file));
+            shard->impl_->packed=i.packed;
+        }
         return shard->get(name);
     }
     auto shape=meta["shape"].array_items(); require(!shape.empty(),"scalar weight unsupported");
@@ -613,14 +645,37 @@ const Tensor &Weights::get(const std::string &name) {
     double a=offsets[0].number_value(),z=offsets[1].number_value();
     require(a>=0 && z>=a && std::floor(a)==a && std::floor(z)==z && z<=double(i.fileSize-i.base),"weight offset outside file");
     require(z-a==double(n*(dtype=="F32"?4:2)),"weight size mismatch");
-    i.file.clear(); i.file.seekg(i.base+uint64_t(a)); Tensor value;
+    Tensor raw;
+    if(i.packed && dtype=="BF16" && i.rt.isFloat32()) {
+        auto cached=i.packed->tensors.find(name);
+        if(cached!=i.packed->tensors.end()) raw=cached->second;
+    }
+    std::vector<uint8_t> buffer;
+    const void *source=nullptr;
+    if(!raw.data && i.mapping) source=static_cast<const uint8_t *>(i.mapping.get())+i.base+uint64_t(a);
+    else if(!raw.data) {
+        buffer.resize(uint64_t(z-a)); i.file.clear(); i.file.seekg(i.base+uint64_t(a));
+        i.file.read(reinterpret_cast<char *>(buffer.data()),buffer.size()); require(bool(i.file),"truncated weight");
+        source=buffer.data();
+    }
+    Tensor value;
     if(dtype=="F32") {
-        std::vector<float> buf(n); i.file.read(reinterpret_cast<char *>(buf.data()),n*4); require(bool(i.file),"truncated weight"); value=i.rt.upload(buf.data(),rows,cols);
+        value=i.rt.upload(static_cast<const float *>(source),rows,cols);
     } else {
-        std::vector<uint16_t> buf(n); i.file.read(reinterpret_cast<char *>(buf.data()),n*2); require(bool(i.file),"truncated weight"); if(i.rt.isFloat32()) {
-            std::vector<float> values(n); for(size_t j=0;j<n;++j) { uint32_t bits=uint32_t(buf[j])<<16; std::memcpy(&values[j],&bits,4); }
-            value=i.rt.upload(values.data(),rows,cols);
-        } else { value=Tensor(rows,cols); copy(value.data,buf.data(),n*2,cudaMemcpyHostToDevice); }
+        if(i.rt.isFloat32()) {
+            // Transfer the checkpoint representation, then expand on device. This is exact
+            // and halves PCIe traffic for FP32 inference with streamed BF16 checkpoints.
+            if(!raw.data) {
+                raw=Tensor(rows,cols); copy(raw.data,source,n*2,cudaMemcpyHostToDevice);
+                if(i.packed && raw.bytes()<=i.packed->budget-i.packed->bytes) {
+                    i.packed->tensors.emplace(name,raw);
+                    i.packed->bytes+=raw.bytes();
+                }
+            }
+            value=Tensor(rows,cols,true);
+            toFloat<<<grid(n),256,0,cudaStreamPerThread>>>(ptr(raw),as<float>(value),n);
+            check(cudaGetLastError());
+        } else { value=Tensor(rows,cols); copy(value.data,source,n*2,cudaMemcpyHostToDevice); }
     }
     return i.cache.emplace(name,std::move(value)).first->second;
 }
@@ -630,7 +685,7 @@ Tensor Weights::linear(const Tensor &x,const std::string &prefix,bool separateBi
     if(separateBias && bias) out=impl_->rt.bias(out,*bias);
     return out;
 }
-void Weights::clear() { impl_->cache.clear(); impl_->host.clear(); impl_->shards.clear(); }
+void Weights::clear() { impl_->cache.clear(); impl_->host.clear(); impl_->shards.clear(); impl_->packed.reset(); }
 void Weights::offload() {
     impl_->rt.activate();
     for(const auto &entry:impl_->cache) {
@@ -642,6 +697,24 @@ void Weights::offload() {
     }
     impl_->cache.clear();
     for(auto &shard:impl_->shards) shard.second->offload();
+}
+void Weights::enablePackedCache(size_t reserveBytes) {
+    auto &i=*impl_;
+    if(!i.rt.isFloat32() || i.packed) return;
+    i.rt.activate();
+    size_t available=0,total=0; check(cudaMemGetInfo(&available,&total));
+    if(available<=reserveBytes) return;
+    i.packed=std::make_shared<Impl::PackedCache>();
+    i.packed->budget=std::min(available/2,available-reserveBytes);
+    // A single budget is shared by every shard, including those already opened.
+    for(auto &shard:i.shards) shard.second->impl_->packed=i.packed;
+}
+void Weights::erasePrefix(const std::string &prefix) {
+    for(auto it=impl_->cache.begin();it!=impl_->cache.end();) {
+        if(it->first.compare(0,prefix.size(),prefix)==0) it=impl_->cache.erase(it);
+        else ++it;
+    }
+    for(auto &shard:impl_->shards) shard.second->erasePrefix(prefix);
 }
 
 }} // namespace fastllm::nomas

@@ -84,6 +84,7 @@ public:
     Tensor columns(const Tensor &x, int first, int count);
     Tensor embedding(const Tensor &weight, const std::vector<int> &tokens);
     Tensor textRope(const Tensor &x);
+    Tensor textRope(const Tensor &x, float theta);
     Tensor concat(const std::vector<Tensor> &xs);
     Tensor rope(const Tensor &x, const float *cos, const float *sin, int headDim);
     RopeTable prepareRope(const float *cos, const float *sin, int rows, int headDim);
@@ -94,6 +95,11 @@ public:
                      int heads, const uint8_t *mask = nullptr, int queryChunk = 128,
                      int kvHeads = 0, bool causal = false, int tile = 0,
                      int gridHeight = 0, int gridWidth = 0);
+    // FP32 attention with an explicit score scale, including pre-scaled Q/K.
+    Tensor attentionScaled(const Tensor &q, const Tensor &k, const Tensor &v,
+                           int heads, float scoreScale, const uint8_t *mask = nullptr,
+                           int queryChunk = 128, int kvHeads = 0, bool causal = false,
+                           int tile = 0, int gridHeight = 0, int gridWidth = 0);
     void synchronize();
 private:
     struct LtState;
@@ -113,6 +119,13 @@ public:
     void clear();
     // Optional lossless host cache for callers that swap model stages.
     void offload();
+    // Optionally retain checkpoint BF16 tensors while streaming expanded FP32
+    // layers. Use at most half the currently free memory, leaving reserveBytes.
+    // clear() releases both representations; disabled unless explicitly enabled.
+    void enablePackedCache(size_t reserveBytes);
+    // Release selected projections after precomputing their schedule-dependent outputs.
+    // An explicitly enabled packed cache survives this operation.
+    void erasePrefix(const std::string &prefix);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
