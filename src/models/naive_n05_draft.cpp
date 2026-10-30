@@ -16,6 +16,14 @@
 
 namespace fastllm {
 namespace {
+    void ClearDraftPrefixHidden(Data &hidden) {
+        // Data's default assignment would discard the owning GPU pointer.
+        hidden.FreeSpace();
+        hidden.dims.clear();
+        hidden.strides.clear();
+        hidden.expansionDims.clear();
+    }
+
     void DraftLinear(Data &input, Data &weight, Data &output) {
         // The block backbone benefits from tensor-core GEMM even at 2..7 rows.
         // MatMulTransB uses the same BF16 weights and FP32 accumulation, and
@@ -991,8 +999,10 @@ void NaiveN05FlashModel::AppendDraftContext(Data &hidden, int start, DraftContex
         key.Reshape({1, length, draftKvHeads * draftHeadDim});
         pos.ToDevice(key.dataDevice, key.dataDeviceIds);
         FastllmCudaNaiveRope(key, pos, draftKvHeads, draftHeadDim, draftHeadDim, draftTheta);
-        AppendCache(context.kv[i].first, key, BFLOAT16, draftWindow + draftBlock);
-        AppendCache(context.kv[i].second, value, BFLOAT16, draftWindow + draftBlock);
+        // Draft KV is bounded per request and retains its existing allocation
+        // path; the target pool reserves only target pages and SWA slots.
+        AppendCache(context.kv[i].first, key, BFLOAT16, draftWindow + draftBlock, false);
+        AppendCache(context.kv[i].second, value, BFLOAT16, draftWindow + draftBlock, false);
         // Retain bounded draft KV storage between proposal/commit rounds.
         // Copying the suffix discards capacity and reallocates ten buffers
         // on every round once the draft window is full.
@@ -1032,6 +1042,30 @@ void NaiveN05FlashModel::CommitDraftContext(TargetCapture &capture, int tokens,
     KimiK3RMSNorm(projected, weight["dspark.hidden_norm.weight"], draftEps, hidden);
     AppendDraftContext(hidden, context.committed, context);
 #ifdef USE_CUDA
+    if (!capture.verifying && tokens > 1 && saveHistoryChat && prefixPool && prefixPool->draftSlotBytes) {
+        // Keep enough normalized prefill input for an aligned checkpoint's
+        // complete draft window, even when the final chunk is very short.
+        const int keep = draftWindow + GetPageLen() - 1;
+        Data joined;
+        if (hidden.dims[1] < keep && !context.prefixHidden.dims.empty())
+            Cat(context.prefixHidden, hidden, 1, joined);
+        else { joined.Resize(hidden.dims); joined.FakeFrom(hidden, 0); }
+        const int rows = std::min(keep, joined.dims[1]);
+        Data tail;
+        Split(joined, 1, joined.dims[1] - rows, joined.dims[1], tail);
+        context.prefixHidden.CopyFrom(tail);
+        const int start = context.committed - rows;
+        if (!capture.prefixes.empty()) for (const auto &snapshot : capture.prefixes.front()) {
+            const int count = std::min(snapshot->length, draftWindow - 1);
+            const int begin = snapshot->length - count - start;
+            if (begin < 0 || begin + count > rows) continue;
+            AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                (uint8_t *)prefixPool->draftStorage.cudaData + (size_t)snapshot->slot * prefixPool->draftSlotBytes,
+                (uint16_t *)context.prefixHidden.cudaData + (size_t)begin * embed_dim,
+                (size_t)count * embed_dim * sizeof(uint16_t)), "Draft prefix copy failed.");
+            snapshot->draftReady = true;
+        }
+    } else ClearDraftPrefixHidden(context.prefixHidden);
     // TP workers use other per-thread streams but share the allocation pool.
     // Finish draft KV writes before retiring captured features/temporaries:
     // the next prefill chunk may immediately reuse their storage on a worker.
@@ -1116,7 +1150,10 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
     }
     AssertInFastLLM(FastllmCudaNaiveBatchDraftKV(updates, draftKvHeads, draftHeadDim, draftWindow,
         draftWindow + draftBlock, draftEps, draftTheta), "Invalid draft context batch.");
-    for (size_t i = 0; i < contexts.size(); ++i) contexts[i]->committed += counts[i];
+    for (size_t i = 0; i < contexts.size(); ++i) {
+        contexts[i]->committed += counts[i];
+        ClearDraftPrefixHidden(contexts[i]->prefixHidden);
+    }
     if (tpDevices.size() > 1) FastllmCudaSyncCurrentThreadStream();
     return true;
 #else
@@ -2169,13 +2206,16 @@ int NaiveN05FlashModel::ForwardDraft(
         // Only the final draft window is used; there is no CPU prefix archive.
         // Preserve absolute position accounting while skipping invisible
         // prompt chunks' feature copies, projection and draft KV construction.
-        const int draftStart = std::max(0, config.input_token_length - draftWindow + 1);
+        const int draftStart = std::max(0, config.input_token_length - draftWindow - GetPageLen() + 1);
         capture.collectHidden = oldLength + inputIds.dims[1] > draftStart;
         auto selection = SelectLogits(config);
         capture.selection = &selection;
         Data logits = RunDraftTarget(inputIds, positions, kv, config, capture);
         if (capture.collectHidden) CommitDraftContext(capture, inputIds.dims[1], context, kv);
-        else context.committed += inputIds.dims[1];
+        else {
+            context.committed += inputIds.dims[1];
+            ClearDraftPrefixHidden(context.prefixHidden);
+        }
         if (isIntermediateChunkedPrefill) return 0;
         return SampleTarget(logits, kv, config, lastTokens, retLogits, &selection);
     }

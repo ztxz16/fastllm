@@ -9,13 +9,26 @@
 #include <cuda_runtime_api.h>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <numeric>
+#include <set>
 #include <stdexcept>
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
 #include <atomic>
 #include <dlfcn.h>
 static std::atomic<int> verifyGraphLaunches{0}, verifyGraphCaptures{0};
 static std::atomic<int> directAllocations{0};
+static std::mutex draftPrefixAllocationMutex;
+static std::set<void *> draftPrefixAllocations;
+static std::atomic<bool> inspectDraftPrefixAllocations{false};
+extern "C" void FastllmCudaFree(void *pointer) {
+    if (inspectDraftPrefixAllocations) {
+        std::lock_guard<std::mutex> guard(draftPrefixAllocationMutex);
+        draftPrefixAllocations.erase(pointer);
+    }
+    static auto fn = (void (*)(void *))dlsym(RTLD_NEXT, "FastllmCudaFree");
+    fn(pointer);
+}
 extern "C" void *FastllmCudaDirectMalloc(size_t bytes) {
     ++directAllocations;
     static auto fn = (void *(*)(size_t))dlsym(RTLD_NEXT, "FastllmCudaDirectMalloc");
@@ -67,6 +80,17 @@ extern "C" bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
 using namespace fastllm;
 namespace fastllm {
 struct NaiveN05GraphTestAccess {
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+    static void WatchDraftPrefix(NaiveN05FlashModel &model, const std::vector<std::pair<Data, Data>> &kv) {
+        if (!inspectDraftPrefixAllocations) return;
+        std::lock_guard<std::mutex> historyGuard(model.historyMutex);
+        auto it = model.draftContexts.find(&kv);
+        if (it != model.draftContexts.end() && it->second->prefixHidden.cudaData) {
+            std::lock_guard<std::mutex> guard(draftPrefixAllocationMutex);
+            draftPrefixAllocations.insert(it->second->prefixHidden.cudaData);
+        }
+    }
+#endif
     static void CheckSharedVerificationWorkspace(const NaiveN05FlashModel &model, int ranks) {
         // Acceptance tails and request churn must not consume one Lt lease
         // per graph: the bounded pool is shared with concurrent owners.
@@ -136,11 +160,69 @@ static void CheckLogitComparison() {
     if (CompareLogits(actual, reference, 4).acceptable)
         throw std::runtime_error("non-finite logit accepted");
 }
+// Shared deterministic draft weights; existing target embeddings stay untouched.
+static void AddDraftTestWeights(WeightMap &weight, int layers, int kvHeads, int vocab, bool merged) {
+    unsigned seed = 17;
+    auto add = [&](const std::string &name, std::vector<int> dims, bool norm = false) {
+        weight.AddEmptyWeight(name, dims, norm ? FLOAT32 : BFLOAT16);
+        Data &w = weight[name];
+        w.Allocate();
+        for (int i = 0; i < w.Count(0); ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            float value = norm ? 1.f : .04f * ((int)(seed >> 16) - 32768) / 32768.f;
+            if (norm)
+                ((float *)w.cpuData)[i] = value;
+            else
+                ((uint16_t *)w.cpuData)[i] = Float32ToBFloat16RNEBits(value);
+        }
+    };
+    if (!weight.weight.count("model.embed_tokens.weight"))
+        add("model.embed_tokens.weight", {256, 256});
+    add("dspark.mask_embedding", {256});
+    add("dspark.norm.weight", {256}, true);
+    add("dspark.markov_head.markov_w1.weight", {vocab, 256});
+    add("dspark.markov_head.markov_w2.weight", {vocab, 256});
+    add("dspark.fc.weight", {256, 512});
+    add("dspark.hidden_norm.weight", {256}, true);
+    for (int i = 0; i < layers; ++i) {
+        std::string p = "dspark.layers." + std::to_string(i) + ".";
+        add(p + "input_layernorm.weight", {256}, true);
+        add(p + "post_attention_layernorm.weight", {256}, true);
+        for (const char *n : {"q", "k", "v"})
+            add(p + "self_attn." + n + "_proj.weight", {n[0] == 'q' ? 256 : kvHeads * 32, 256});
+        add(p + "self_attn.o_proj.weight", {256, 256});
+        add(p + "self_attn.q_norm.weight", {32}, true);
+        add(p + "self_attn.k_norm.weight", {32}, true);
+        add(p + "mlp.gate_proj.weight", {512, 256});
+        add(p + "mlp.up_proj.weight", {512, 256});
+        add(p + "mlp.down_proj.weight", {256, 512});
+    }
+    if (merged) for (int i = 0; i < layers; ++i) {
+        const std::string p = "dspark.layers." + std::to_string(i) + ".";
+        auto merge = [&](std::vector<std::string> names, std::string out) {
+            int rows = 0;
+            for (auto &name : names) rows += weight[p + name].dims[0];
+            Data &w = weight[p + out];
+            w.dataType = BFLOAT16; w.isModelWeight = true; w.Resize({rows, 256}); w.Allocate();
+            size_t offset = 0;
+            for (auto &name : names) {
+                Data &part = weight[p + name];
+                memcpy(w.cpuData + offset, part.cpuData, part.GetBytes());
+                offset += part.GetBytes();
+                weight.weight.erase(p + name);
+            }
+        };
+        merge({"self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"}, "self_attn.mergeqkv.weight");
+        merge({"mlp.gate_proj.weight", "mlp.up_proj.weight"}, "mlp.gateup_proj.weight");
+    }
+}
 class Fixture : public NaiveN05FlashModel {
   public:
     int ranks;
     bool useRealScheduler = false;
     bool failDecodeAllocation = false;
+    bool inspectDraftPrefix = false;
+    std::vector<float> observedDraft;
     int Forward(const Data &inputIds, const Data &attentionMask, const Data &positionIds,
                 std::vector<std::pair<Data, Data>> &kv,
                 const GenerationConfig &config = GenerationConfig(),
@@ -150,7 +232,22 @@ class Fixture : public NaiveN05FlashModel {
             failDecodeAllocation = false;
             throw CudaWorkspaceExhausted("injected decode allocation failure");
         }
-        return NaiveN05FlashModel::Forward(inputIds, attentionMask, positionIds, kv, config, lastTokens, logits);
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        NaiveN05GraphTestAccess::WatchDraftPrefix(*this, kv);
+#endif
+        int token = NaiveN05FlashModel::Forward(inputIds, attentionMask, positionIds, kv, config, lastTokens, logits);
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        NaiveN05GraphTestAccess::WatchDraftPrefix(*this, kv);
+#endif
+        if (inspectDraftPrefix && !isIntermediateChunkedPrefill && config.output_logits) {
+            auto draft = draftContexts.at(&kv);
+            if (draft->committed == config.input_token_length) {
+                Data h = RunDraft(17, *draft), scores = RunDraftHead(h);
+                ToDataType(scores, FLOAT32); scores.ToDevice(DataDevice::CPU);
+                observedDraft.assign((float *)scores.cpuData, (float *)scores.cpuData + scores.Count(0));
+            }
+        }
+        return token;
     }
     explicit Fixture(int ranks, bool packed = false, bool graph = false, bool swaRing = false,
                      bool serving = false, bool secondDsa = false) : ranks(ranks) {
@@ -511,6 +608,120 @@ class Fixture : public NaiveN05FlashModel {
                   << " max_abs=" << largestLogitAbsolute << std::endl;
     }
 #endif
+    void DraftPrefixChecks() {
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        inspectDraftPrefixAllocations = true;
+#endif
+        draftEnabled = canDoConcurrentForward = true;
+        draftLayers = 2; draftBlock = 7; draftTokens = 5;
+        draftHeads = 8; draftKvHeads = 2; draftHeadDim = 32; draftWindow = 1024;
+        draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
+        AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
+        maxBatch = 16; SetMaxTokens(131072); SetChunkedPrefillSize(1024);
+        WarmUp(); useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();
+        auto prompt = [](int length, int salt = 0) {
+            std::vector<int> result(length);
+            for (int i = 0; i < length; ++i) result[i] = (i * 3 + salt) % 251;
+            return result;
+        };
+        auto infer = [&](const std::vector<int> &tokens, std::vector<float> &logits) {
+            GenerationConfig cfg; cfg.top_k = 1; cfg.output_logits = true;
+            cfg.output_token_limit = 1; cfg.input_token_length = tokens.size();
+            int handle = LaunchResponseTokens(tokens, cfg);
+            if (FetchResponseLogits(handle, logits) < 0) throw std::runtime_error("draft prefix request failed");
+            std::vector<float> unused;
+            if (FetchResponseLogits(handle, unused) >= 0) throw std::runtime_error("draft prefix did not finish");
+        };
+        inspectDraftPrefix = true;
+        for (int length : {127, 128, 1023, 1024, 1151, 1152, 2048, 2113, 4097}) {
+            SetSaveHistoryChat(false); SetSaveHistoryChat(true);
+            const auto tokens = prompt(length);
+            std::vector<float> cold, hot;
+            infer(tokens, cold); const auto draft = observedDraft;
+            if (draft.empty() || std::any_of(draft.begin(), draft.end(), [](float x) { return !std::isfinite(x); }))
+                throw std::runtime_error("cold draft logits are non-finite at prefix " + std::to_string(length));
+            const int before = pagedRestores;
+            infer(tokens, hot);
+            if (length > 128 && (pagedRestores != before + 1 ||
+                lastPrefixLength != (length - 1) / GetPageLen() * GetPageLen()))
+                throw std::runtime_error("draft prefix did not restore a complete checkpoint");
+            RequireCloseLogits(hot.data(), cold, "draft prefix target logits");
+            if (observedDraft.empty() || observedDraft.size() != draft.size())
+                throw std::runtime_error("draft prefix probabilities missing");
+            RequireCloseLogits(observedDraft.data(), draft, "restored draft logits");
+            auto fork = tokens; fork.back() = (fork.back() + 13) % 251; fork.push_back(252);
+            infer(fork, hot); const auto forkDraft = observedDraft;
+            SetSaveHistoryChat(false); infer(fork, cold);
+            RequireCloseLogits(hot.data(), cold, "forked speculative target logits");
+            if (forkDraft.empty() || observedDraft.empty())
+                throw std::runtime_error("fork draft logits missing at length " + std::to_string(length) +
+                    " hot=" + std::to_string(forkDraft.size()) + " cold=" + std::to_string(observedDraft.size()));
+            RequireCloseLogits(forkDraft.data(), observedDraft, "forked draft logits");
+        }
+        inspectDraftPrefix = false;
+        // Exercise actual speculative verification across a page boundary,
+        // with independent request lengths, shared prefixes and request churn.
+        auto batch = [&](const std::vector<std::vector<int>> &prompts) {
+            std::vector<int> handles;
+            for (const auto &tokens : prompts) {
+                GenerationConfig cfg; cfg.top_k = 1; cfg.output_token_limit = 20;
+                cfg.input_token_length = tokens.size();
+                handles.push_back(LaunchResponseTokens(tokens, cfg));
+            }
+            std::vector<std::vector<int>> result(handles.size());
+            for (size_t i = 0; i < handles.size(); ++i) {
+                int token;
+                while ((token = FetchResponseTokens(handles[i])) >= 0) result[i].push_back(token);
+                if (result[i].size() != 20) throw std::runtime_error("speculative prefix batch ended early");
+            }
+            return result;
+        };
+        for (int proposed : {1, 5, 7}) for (int count : {1, 2, 8, 16}) {
+            draftTokens = proposed;
+            std::vector<std::vector<int>> prompts;
+            for (int i = 0; i < count; ++i) prompts.push_back(prompt(2040 + i % 4, i % 3));
+            SetSaveHistoryChat(false); SetSaveHistoryChat(true);
+            batch(prompts); const int before = pagedRestores;
+            auto hot = batch(prompts);
+            if (pagedRestores - before != count) throw std::runtime_error("concurrent draft prefix miss");
+            SetSaveHistoryChat(false); auto cold = batch(prompts);
+            for (int row = 0; row < count; ++row) if (hot[row] != cold[row]) {
+                // Different prefill GEMM shapes can round near-tied BF16 logits
+                // differently (also with FP8 KV). Compare the same teacher-forced
+                // history at the first divergence, never unrelated continuations.
+                size_t first = 0;
+                while (hot[row][first] == cold[row][first]) ++first;
+                auto probe = prompts[row];
+                probe.insert(probe.end(), hot[row].begin(), hot[row].begin() + first);
+                SetSaveHistoryChat(true); batch({prompts[row]});
+                std::vector<float> h, c; infer(probe, h);
+                SetSaveHistoryChat(false); infer(probe, c);
+                RequireCloseLogits(h.data(), c, "speculative prefix first divergence");
+                for (const auto *values : {&h, &c}) {
+                    const float best = *std::max_element(values->begin(), values->end());
+                    const float ulp = std::ldexp(1.f, std::ilogb(std::fabs(best)) - 7);
+                    for (int token : {hot[row][first], cold[row][first]})
+                        if (best - values->at(token) > 2 * ulp + 1e-7f)
+                            throw std::runtime_error("speculative cached batch changed a non-tied greedy token");
+                }
+                std::cout << "DSPARK PREFIX near_tie batch=" << count << " draft=" << proposed
+                          << " row=" << row << " token=" << first << std::endl;
+            }
+            std::cout << "DSPARK PREFIX batch=" << count << " draft=" << proposed << " pass\n";
+        }
+        ShutdownRuntime();
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        idleDraftContext.reset();
+        inspectDraftPrefixAllocations = false;
+        std::lock_guard<std::mutex> guard(draftPrefixAllocationMutex);
+        if (!draftPrefixAllocations.empty())
+            throw std::runtime_error("DSpark leaked " + std::to_string(draftPrefixAllocations.size()) +
+                                     " prefill hidden allocations after request teardown");
+#endif
+        std::cout << "DSPARK PREFIX PASS target/draft logits, forks, page rollback, batches and draft lengths"
+                  << " max_relative=" << largestLogitRelative << " max_abs=" << largestLogitAbsolute << std::endl;
+    }
+
     void HistoryServingChecks(bool graph = true, bool sparse = false) {
         maxBatch = 32; SetMaxTokens(262144); SetChunkedPrefillSize(128);
         if (sparse) {
@@ -2188,59 +2399,8 @@ class DraftFixture : public NaiveN05FlashModel {
         draftHeadDim = 32;
         draftWindow = 1024;
         deviceMap = {{"cuda:" + std::to_string(owner), 1}};
-        unsigned seed = 17;
-        auto add = [&](const std::string &name, std::vector<int> dims, bool norm = false) {
-            weight.AddEmptyWeight(name, dims, norm ? FLOAT32 : BFLOAT16);
-            Data &w = weight[name];
-            w.Allocate();
-            for (int i = 0; i < w.Count(0); ++i) {
-                seed = seed * 1664525u + 1013904223u;
-                float value = norm ? 1.f : .04f * ((int)(seed >> 16) - 32768) / 32768.f;
-                if (norm)
-                    ((float *)w.cpuData)[i] = value;
-                else
-                    ((uint16_t *)w.cpuData)[i] = Float32ToBFloat16RNEBits(value);
-            }
-        };
-        add("model.embed_tokens.weight", {256, 256});
-        add("dspark.mask_embedding", {256});
-        add("dspark.norm.weight", {256}, true);
-        add("dspark.markov_head.markov_w1.weight", {513, 256});
-        add("dspark.markov_head.markov_w2.weight", {513, 256});
         draftTargetLayers = {0, 1};
-        add("dspark.fc.weight", {256, 512});
-        add("dspark.hidden_norm.weight", {256}, true);
-        for (int i = 0; i < draftLayers; ++i) {
-            std::string p = "dspark.layers." + std::to_string(i) + ".";
-            add(p + "input_layernorm.weight", {256}, true);
-            add(p + "post_attention_layernorm.weight", {256}, true);
-            for (const char *n : {"q", "k", "v"})
-                add(p + "self_attn." + n + "_proj.weight", {n[0] == 'q' ? 256 : draftKvHeads * draftHeadDim, 256});
-            add(p + "self_attn.o_proj.weight", {256, 256});
-            add(p + "self_attn.q_norm.weight", {32}, true);
-            add(p + "self_attn.k_norm.weight", {32}, true);
-            add(p + "mlp.gate_proj.weight", {512, 256});
-            add(p + "mlp.up_proj.weight", {512, 256});
-            add(p + "mlp.down_proj.weight", {256, 512});
-        }
-        if (merged) for (int i = 0; i < draftLayers; ++i) {
-            const std::string p = "dspark.layers." + std::to_string(i) + ".";
-            auto merge = [&](std::vector<std::string> names, std::string out) {
-                int rows = 0;
-                for (auto &name : names) rows += weight[p + name].dims[0];
-                Data &w = weight[p + out];
-                w.dataType = BFLOAT16; w.isModelWeight = true; w.Resize({rows, embed_dim}); w.Allocate();
-                size_t offset = 0;
-                for (auto &name : names) {
-                    Data &part = weight[p + name];
-                    memcpy(w.cpuData + offset, part.cpuData, part.GetBytes());
-                    offset += part.GetBytes();
-                    weight.weight.erase(p + name);
-                }
-            };
-            merge({"self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"}, "self_attn.mergeqkv.weight");
-            merge({"mlp.gate_proj.weight", "mlp.up_proj.weight"}, "mlp.gateup_proj.weight");
-        }
+        AddDraftTestWeights(weight, draftLayers, draftKvHeads, 513, merged);
         // Match the model loader's GPU embedding placement in both paths.
         weight["model.embed_tokens.weight"].ToDevice(DataDevice::CUDA, std::vector<int>{owner});
         weight["dspark.mask_embedding"].ToDevice(DataDevice::CUDA, std::vector<int>{owner});
@@ -2577,6 +2737,12 @@ int main(int argc, char **argv) {
         SetThreads(4);
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
+        if (argc > 2 && std::string(argv[2]) == "draft_prefix") {
+            SetCudaEmbedding(true); SetCudaGraph(!(argc > 4 && std::string(argv[4]) == "eager"));
+            Fixture fixture(ranks, false, true, true, true);
+            if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.DraftPrefixChecks(); return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "verify_batch") {
             SetCudaEmbedding(true); SetCudaGraph(true);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS

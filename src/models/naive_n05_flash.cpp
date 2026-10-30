@@ -133,7 +133,7 @@ int NaiveN05FlashModel::CacheReserveCapacity(const GenerationConfig &config) con
     return (int)std::min<int64_t>(capacity, limit);
 }
 
-void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity) {
+void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity, bool usePool) {
     int oldLength = cache.dims.empty() ? 0 : cache.dims[1];
     int length = oldLength + input.dims[1];
     cache.dataType = cacheType;
@@ -146,7 +146,7 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheTyp
     const int64_t wanted = std::max(length, reserveCapacity);
     if (cache.expansionDims.empty() || cache.expansionDims[1] < wanted) {
         const int capacity = (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128);
-        ReserveCache(cache, capacity, width);
+        ReserveCache(cache, capacity, width, usePool);
     }
     if (cache.dims.empty()) cache.Resize({1, 0, width});
     if (cache.isPagedKVCache || cache.dataType == FP8_E4M3 || cache.kvCacheFp8Indexer ||
@@ -160,11 +160,11 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheTyp
     cache.isKVCache = true;
 }
 
-void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width) {
+void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width, bool usePool) {
     if (cache.expansionDims.size() == 3 && cache.expansionDims[1] >= capacity) return;
     tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
 #ifdef USE_CUDA
-    auto pool = cache.dataDevice == DataDevice::CUDA && cache.dataDeviceIds.size() == 1
+    auto pool = usePool && cache.dataDevice == DataDevice::CUDA && cache.dataDeviceIds.size() == 1
         ? tpKVPool.find(cache.dataDeviceIds[0]) : tpKVPool.end();
     if (pool != tpKVPool.end()) {
         AssertInFastLLM(FastllmNaiveKVType(cache.dataType) && !cache.isFake && !cache.cudaDataBorrowed &&
@@ -1990,11 +1990,12 @@ std::shared_ptr<CudaWorkspace> NaiveN05FlashModel::RequestKVPool(int device, siz
 
 void NaiveN05FlashModel::InitTensorParallelKVPool() {
 #ifdef USE_CUDA
-    // Keep CPU/layer-serial and speculative execution on their existing cache
-    // paths. This pool serves ordinary BF16/FP8 TP, independently of GPU generation
-    // and whether CUDA Graph is enabled.
-    if (!tpKVPool.empty() || !tpPrepared || tpDevices.size() <= 1 ||
-        GetKVCacheInCPU() || !FastllmNaiveKVType(kvCacheDataType) || draftEnabled ||
+    // Keep CPU/layer-serial execution on its existing cache path. This pool
+    // serves BF16/FP8 TP, independently of GPU generation and CUDA Graph.
+    // A sharded draft retains its existing cache path; resident checkpoints
+    // are currently enabled for the owner-local draft implementation.
+    if (!tpKVPool.empty() || !tpPrepared || draftTP || tpDevices.size() <= 1 ||
+        GetKVCacheInCPU() || !FastllmNaiveKVType(kvCacheDataType) ||
         elementsInKVCachePerToken <= 0) return;
     const double gpuMemRatio = GetGpuMemRatio();
     AssertInFastLLM(std::isfinite(gpuMemRatio) && gpuMemRatio > 0 && gpuMemRatio <= 1,
@@ -2002,7 +2003,7 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     const int ranks = tpDevices.size();
     const int batch = maxBatch > 0 ? maxBatch : 512;
     const int chunk = std::max(1, GetChunkedPrefillSize());
-    const int64_t swaCapacity = ((int64_t)window + 127) / 128 * 128;
+    const int64_t swaCapacity = ((int64_t)window + (draftEnabled ? draftBlock : 0) + 127) / 128 * 128;
     if (std::count(slidingLayers.begin(), slidingLayers.end(), 1)) {
         tpSwaPrefillWorkspaces.resize(ranks);
         for (int rank = 0; rank < ranks; ++rank) PrepareSwaPrefillWorkspace(rank, chunk);
@@ -2056,8 +2057,9 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         }
     }
     prefixes->slotBytes = (prefixes->slotBytes + 255) / 256 * 256;
+    if (draftEnabled) prefixes->draftSlotBytes = (size_t)(draftWindow - 1) * embed_dim * sizeof(uint16_t);
     const int prefixSlots = prefixes->SlotCount(batch, budget);
-    const int64_t prefixBytes = (int64_t)prefixSlots * prefixes->slotBytes;
+    const int64_t prefixBytes = (int64_t)prefixSlots * (prefixes->slotBytes + prefixes->draftSlotBytes);
     fixedBytes += prefixBytes;
     int64_t tokens = GetMaxTokens() > 0 ? GetMaxTokens() :
         std::min<int64_t>((int64_t)max_positions * batch,
@@ -2123,8 +2125,17 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
             storage.Resize({prefixSlots, (int)prefixes->slotBytes});
             storage.dataDevice = DataDevice::CUDA;
             storage.dataDeviceIds = {tpDevices[rank]};
-            storage.cudaData = AllocateCudaWorkspace(tpKVPool.at(tpDevices[rank]), prefixBytes);
+            storage.cudaData = AllocateCudaWorkspace(tpKVPool.at(tpDevices[rank]), (size_t)prefixSlots * prefixes->slotBytes);
             if (!storage.cudaData) throw CudaWorkspaceExhausted("Naive GPU prefix pool exhausted.");
+            storage.directMemory = true;
+        }
+        if (prefixes->draftSlotBytes) {
+            Data &storage = prefixes->draftStorage;
+            storage.Resize({prefixSlots, draftWindow - 1, embed_dim});
+            storage.dataDevice = DataDevice::CUDA;
+            storage.dataDeviceIds = {tpDevices.front()};
+            storage.cudaData = AllocateCudaWorkspace(tpKVPool.at(tpDevices.front()), storage.GetBytes());
+            if (!storage.cudaData) throw CudaWorkspaceExhausted("Naive draft prefix pool exhausted.");
             storage.directMemory = true;
         }
         for (int slot = 0; slot < prefixSlots; ++slot) prefixes->freeSlots.push_back(slot);

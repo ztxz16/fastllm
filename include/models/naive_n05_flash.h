@@ -107,6 +107,8 @@ namespace fastllm {
             std::vector<Data> storage;
             std::vector<size_t> offsets;
             size_t slotBytes = 0;
+            size_t draftSlotBytes = 0;
+            Data draftStorage{BFLOAT16}; // Normalized draft inputs, only on the draft owner.
             // Serialized by historyMutex. Metadata previews never own slots.
             uint64_t historyVersion = 0;
             int SlotCount(int requests, int64_t budget) const {
@@ -115,12 +117,13 @@ namespace fastllm {
                 // on completed history. The caller must check the total fits.
                 return (int)std::max<int64_t>((int64_t)requests * PrefixSnapshotsPerRequest,
                     std::min<int64_t>((int64_t)requests * 8,
-                        std::max<int64_t>(0, budget) / 32 / slotBytes));
+                        std::max<int64_t>(0, budget) / 32 / (slotBytes + draftSlotBytes)));
             }
         };
         struct PrefixSnapshot {
             std::shared_ptr<PrefixPool> pool;
             int slot = -1, length = 0;
+            bool draftReady = false;
             std::vector<int> tokens;
             // Observe the resident full-prefix endpoint without pinning KV.
             // Generation checks prevent a recycled physical page from reviving
@@ -184,6 +187,7 @@ namespace fastllm {
         std::map<int, std::shared_ptr<void>> draftLinearGraphWorkspaces;
         struct DraftContext {
             int committed = 0;
+            Data prefixHidden; // Bounded prefill tail; never retained through speculative decode.
             std::vector<std::pair<Data, Data>> kv;
             std::shared_ptr<DraftWorkspace> workspace;
             Data proposalProbs{FLOAT32}; // Actual GPU proposal distributions, retained until verification.
@@ -198,8 +202,8 @@ namespace fastllm {
                        TargetCapture *capture, int tpRank = -1, const Data *embedding = nullptr,
                        TargetWorkspace *workspace = nullptr, const TargetBatch *batch = nullptr);
         int CacheReserveCapacity(const GenerationConfig &config) const;
-        void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0);
-        void ReserveCache(Data &cache, int capacity, int width);
+        void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0, bool usePool = true);
+        void ReserveCache(Data &cache, int capacity, int width, bool usePool = true);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end,
                                std::vector<Data *> *pendingPageTables);

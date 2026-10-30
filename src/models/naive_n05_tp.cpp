@@ -1568,7 +1568,8 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     }
     std::vector<PrefixSnapshots> prefixes(sequences);
     bool recording = false;
-    if (saveHistoryChat && !verify) {
+    if (saveHistoryChat && !verify && (!draftEnabled ||
+        (capture && capture->collectHidden && inputIds.dims[1] > 1))) {
         for (int sequence = 0; sequence < sequences; ++sequence) {
             const Data &first = key(sequence, 0);
             prefixes[sequence] = BeginPrefixSnapshots(first, first.dims.empty() ? 0 : first.dims[1],
@@ -1731,7 +1732,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                 for (Data *cache : {&key(sequence, layer), &value(sequence, layer)}) {
                     const int64_t past = cache->dims.empty() ? 0 : cache->dims[1];
                     const int64_t wanted = slidingLayers[layer] && !tpSwaPrefillWorkspaces.empty()
-                        ? window : std::max<int64_t>(past + length,
+                        ? window + (draftEnabled ? draftBlock : 0) : std::max<int64_t>(past + length,
                             slidingLayers[layer] ? std::min<int64_t>(reserve, (int64_t)window - 1 + length) : reserve);
                     if (cache->expansionDims.size() == 3 && cache->expansionDims[1] >= wanted) continue;
                     const bool isValue = cache == &value(sequence, layer);
@@ -1874,7 +1875,10 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             syncMeta(value(sequence, layer), cfg.kvHeads * cfg.valueDim);
         }
     });
-    if (capture) capture->hidden = std::move(captures[0].hidden);
+    if (capture) {
+        capture->hidden = std::move(captures[0].hidden);
+        capture->prefixes = std::move(prefixes);
+    }
     if (trace) trace->Mark("kv_commit_prefix_ms");
     if (isIntermediateChunkedPrefill) return Data();
     if (cudaSampling) {
