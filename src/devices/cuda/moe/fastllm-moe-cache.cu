@@ -56,11 +56,15 @@
 #include <cuda.h>
 #endif
 #include "fastllm-moe-deepseekv41-cache.cuh"
+#include "fastllm-moe-cache-publication.cuh"
 #include "fastllm-moe-glm5-cache.cuh"
 #include "fastllm-moe-fp8-scored.cuh"
 #include "fastllm-moe-prefill-restore.cuh"
 
 namespace {
+
+using fastllm::cuda::moe_admission::InvalidateCacheAdmissions;
+using fastllm::cuda::moe_admission::PublishCacheAdmissions;
 
 constexpr int kMaxTopK = fastllm::MoeDecodeScheduler::maxExperts;
 constexpr size_t kMinDeviceMemoryReserveBytes = 256ULL << 20;
@@ -1219,6 +1223,13 @@ void PrepareEpResidency(OffloadGroup &group, DeviceCache &cache) {
     } else FinishEpAdmissions(cache);
 }
 
+bool CanOverlapNativeAdmissions(const OffloadGroup &group, const DeviceCache &cache) {
+    // A mailbox can outlive its active mode. Never extend its acquire/release
+    // protocol to another cache owner or to an EP/PP transition.
+    return cache.nativeMailbox && group.deviceCaches.size() == 1 &&
+        group.expertDevices.empty() && cache.prefillOwnerCount == 1;
+}
+
 void WaitCacheAdmission(const DeviceCache &cache) {
     if (!cache.admissionDone) return;
     cudaStreamCaptureStatus capture;
@@ -1945,10 +1956,10 @@ bool FastllmCudaGlm5DiskExpert(const fastllm::Data &input, const fastllm::Data &
     output.dataType = FLOAT32;
     output.Resize({rows, hidden});
     output.ToDevice(CUDA, input.dataDeviceIds, false); output.Allocate(false);
-    cuda::glm5_cache::Gate<<<dim3(inter / 128, rows), 1024, 0, cudaStreamPerThread>>>(
+    fastllm::cuda::glm5_cache::Gate<<<dim3(inter / 128, rows), 1024, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16*)input.cudaData, nullptr, (const uint8_t*)gate.cudaData,
         (const float*)scores.cudaData, (__nv_bfloat16*)activation.cudaData, hidden, inter, 0, limit, 1);
-    cuda::glm5_cache::Down<<<dim3(hidden / 16, rows), 128, 0, cudaStreamPerThread>>>(
+    fastllm::cuda::glm5_cache::Down<<<dim3(hidden / 16, rows), 128, 0, cudaStreamPerThread>>>(
         (const __nv_bfloat16*)activation.cudaData, nullptr, (const uint8_t*)down.cudaData,
         (float*)output.cudaData, hidden, inter, 0, 0);
     checkCudaErrors("Disk compact GLM experts", cudaGetLastError());
@@ -2757,31 +2768,6 @@ __global__ void TouchSparseResidentRoutes(const int32_t *ids, const int32_t *slo
             atomicAdd(hits, 1ULL);
         } else atomicAdd(misses, 1ULL);
     }
-}
-
-// Update the device mapping and its host-visible mirror together. Call only
-// after the admitted payload and all readers of the previous record are done.
-__device__ void PublishAdmission(int32_t *keys, int32_t *slotKeys,
-        int32_t *mappedKeys, unsigned long long *lastUsed,
-        int key, int slot, unsigned long long age) {
-    const int old = slotKeys[slot];
-    if (old >= 0) {
-        keys[old] = -1;
-        if (mappedKeys) mappedKeys[old] = -1;
-    }
-    keys[key] = slot;
-    slotKeys[slot] = key;
-    lastUsed[slot] = age;
-    if (mappedKeys) mappedKeys[key] = slot;
-}
-
-__global__ void PublishCacheAdmissions(int32_t *keys, int32_t *slotKeys,
-        int32_t *mappedKeys, unsigned long long *lastUsed, unsigned long long *step,
-        const int32_t *changes, int count) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    PublishAdmission(keys, slotKeys, mappedKeys, lastUsed,
-        changes[i], changes[count + i], atomicAdd(step, 1ULL) + 1);
 }
 
 // Run after current GPU experts finish reading their slots. Protect/touch
@@ -4222,9 +4208,9 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
     }
     // Generic EP advances each rank's policy after its complete forward.
     if (!group->layout.glm5 && cache->prefillOwnerCount > 1) return nullptr;
-    // EP waits at its first expert lookup. Its preceding dense/attention work
-    // can overlap the previous token's admissions instead of waiting here.
-    WaitCacheAdmission(*cache);
+    // Native single-GPU readers acquire completed admissions individually.
+    // Generic/eager users still join at their first GetDeviceCache lookup.
+    if (!CanOverlapNativeAdmissions(*group, *cache)) WaitCacheAdmission(*cache);
     // GLM GGUF verification also needs an active scope when all experts fit.
     // Both native V4.1 layouts support cached and temporary GPU experts.
     // Auto-configured caches must not require a separate environment opt-in.
@@ -4282,8 +4268,8 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
     int previousDevice = -1;
     checkCudaErrors("MoE admission device", cudaGetDevice(&previousDevice));
     checkCudaErrors("MoE admission device", cudaSetDevice(cache.device));
-    // Reuse stable pinned metadata only after its preceding async copy has
-    // completed. Usually the current token's routing already waited for it.
+    // Payload readers are ordered below; metadata and upload scratch also
+    // need the preceding admission batch to finish before host-side reuse.
     if (!cache.epPending.empty()) FinishEpAdmissions(cache, true);
     else checkCudaErrors("MoE previous admission", cudaEventSynchronize(cache.admissionDone));
     if (!cache.epKeySlots.empty()) {
@@ -4334,7 +4320,20 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
         if(!cache.frequencyUploadBegin) checkCudaErrors("MoE upload timing",cudaEventCreate(&cache.frequencyUploadBegin));
         if(!cache.frequencyUploadEnd) checkCudaErrors("MoE upload timing",cudaEventCreate(&cache.frequencyUploadEnd));
     }
+    const bool concurrent = CanOverlapNativeAdmissions(group, cache);
+    auto *changes = static_cast<int32_t *>(cache.frequencyChanges.cudaData);
+    for (int i = 0; i < count; ++i) {
+        cache.frequencyHostChanges[i] = admissions[i].key;
+        cache.frequencyHostChanges[count + i] = admissions[i].slot;
+    }
     const auto stream = cache.admissionStream;
+    if (concurrent) {
+        checkCudaErrors("MoE eviction metadata", cudaMemcpyAsync(changes, cache.frequencyHostChanges,
+            2 * count * sizeof(int32_t), cudaMemcpyHostToDevice, cudaStreamPerThread));
+        InvalidateCacheAdmissions<<<(count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+            cache.keyToSlot, cache.slotKeys, cache.mappedKeyToSlot, changes, count);
+        checkCudaErrors("MoE eviction", cudaGetLastError());
+    }
     checkCudaErrors("MoE admission readers", cudaEventRecord(cache.frequencyReadersDone, cudaStreamPerThread));
     checkCudaErrors("MoE admission readers", cudaStreamWaitEvent(stream, cache.frequencyReadersDone, 0));
     if(budget) checkCudaErrors("MoE upload begin",cudaEventRecord(cache.frequencyUploadBegin,stream));
@@ -4383,14 +4382,11 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
         }
         cache.uploadedExpertBytes += layout.gateBytes + layout.downBytes;
         if(budget) cache.frequencyUploadBytes += layout.recordStride;
-        cache.frequencyHostChanges[i] = a.key;
-        cache.frequencyHostChanges[count + i] = a.slot;
     }
-    auto *changes = static_cast<int32_t *>(cache.frequencyChanges.cudaData);
-    checkCudaErrors("MoE admission metadata", cudaMemcpyAsync(changes, cache.frequencyHostChanges,
+    if (!concurrent) checkCudaErrors("MoE admission metadata", cudaMemcpyAsync(changes, cache.frequencyHostChanges,
         2 * count * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     PublishCacheAdmissions<<<(count + 255) / 256, 256, 0, stream>>>(
-        cache.keyToSlot, cache.slotKeys, cache.mappedKeyToSlot, cache.lastUsed, cache.step, changes, count);
+        cache.keyToSlot, cache.slotKeys, cache.mappedKeyToSlot, cache.lastUsed, cache.step, changes, count, concurrent);
     checkCudaErrors("MoE global admission publish", cudaGetLastError());
     if(budget) {
         checkCudaErrors("MoE upload end",cudaEventRecord(cache.frequencyUploadEnd,stream));

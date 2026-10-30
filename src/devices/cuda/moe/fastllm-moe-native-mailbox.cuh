@@ -1,8 +1,9 @@
 #pragma once
 
 // Native, single-GPU decode handoff. A CPU dispatcher owns NUMA execution;
-// the caller only submits graphs. Stream memory operations wait without
-// occupying an SM. Every layer owns its activation/result/control buffers.
+// the caller only submits graphs. Full replay uses an explicit one-thread
+// acquire wait; the split-layer path retains stream memory waits. Every layer
+// owns its activation/result/control buffers.
 #include <deque>
 
 namespace {
@@ -21,12 +22,29 @@ __global__ void PublishNativeMoe(NativeMoeControl *box, float *hostInput,
         const int32_t *keys, const int32_t *slotKeys, int32_t *slots,
         unsigned long long *hits, unsigned long long *misses,
         int base, int experts, int hidden, int topk, bool publish = false) {
-    for (int c = threadIdx.x; c < hidden; c += blockDim.x)
-        hostInput[c] = __bfloat162float(input[c]);
+    // Publish adjacent values together to amortize mapped-host store traffic.
+    // Keep the per-thread system fences and block-wide publication ordering.
+    if ((reinterpret_cast<uintptr_t>(input) & 7u) == 0 &&
+        (reinterpret_cast<uintptr_t>(hostInput) & 15u) == 0) {
+        for (int c = threadIdx.x * 4; c < hidden; c += blockDim.x * 4) {
+            if (c + 3 < hidden) {
+                const uint2 packed = *reinterpret_cast<const uint2 *>(input + c);
+                const auto *p = reinterpret_cast<const __nv_bfloat162 *>(&packed);
+                const float2 a = __bfloat1622float2(p[0]), b = __bfloat1622float2(p[1]);
+                *reinterpret_cast<float4 *>(hostInput + c) = make_float4(a.x, a.y, b.x, b.y);
+            } else {
+                for (int j = c; j < hidden; ++j) hostInput[j] = __bfloat162float(input[j]);
+            }
+        }
+    } else {
+        for (int c = threadIdx.x; c < hidden; c += blockDim.x)
+            hostInput[c] = __bfloat162float(input[c]);
+    }
     if (threadIdx.x < 32) {
         const int r = threadIdx.x, e = r < topk ? indices[r] : -1;
         const int key = base + e;
-        const int slot = e >= 0 && e < experts ? keys[key] : -1;
+        const int slot = e >= 0 && e < experts ?
+            fastllm::cuda::moe_admission::LoadAdmission(keys + key) : -1;
         const bool resident = slot >= 0 && slotKeys[slot] == key;
         const unsigned mask = __ballot_sync(0xffffffff, r < topk && resident);
         if (!r) { *hits += __popc(mask); *misses += topk - __popc(mask); }
@@ -58,6 +76,22 @@ __global__ void ReadNativeMoePlan(const NativeMoeControl *box, int32_t *staged, 
         staged[threadIdx.x] = box->staged[threadIdx.x];
         gpu[threadIdx.x] = box->gpu[threadIdx.x];
     }
+}
+
+// Full replay waits only for CPU arithmetic: its producer submits no CUDA.
+// One thread avoids issuing the same host-memory acquire from every Reduce CTA.
+// Keep this as an explicit graph node so profiling separates waiting from math.
+__global__ void WaitNativeMoe(const unsigned *ready) {
+    unsigned value;
+    do {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(value) : "l"(ready) : "memory");
+        if (!value) __nanosleep(64);
+#else
+        value = *reinterpret_cast<const volatile unsigned *>(ready);
+        __threadfence_system();
+#endif
+    } while (!value);
 }
 
 struct NativeMoeMemOps {
@@ -157,15 +191,21 @@ struct NativeMoeMailbox {
     std::unique_ptr<DecodeOverlapWorkspace> copy;
     std::map<int, std::unique_ptr<Layer>> layers, fullLayers;
     std::thread dispatcher;
+    std::vector<int> dispatcherCpus;
     std::mutex mutex;
     std::condition_variable wake, drained;
     std::deque<Request> queue;
     bool busy = false, stopping = false;
+    std::atomic<bool> launchCanceled{false};
     std::exception_ptr error;
     Layer *previous = nullptr, *fullLast = nullptr;
     bool failed = false;
 
-    NativeMoeMailbox(OffloadGroup &g, DeviceCache &c) : group(g), cache(c) {}
+    NativeMoeMailbox(OffloadGroup &g, DeviceCache &c) : group(g), cache(c) {
+        fastllm::HostMoePlacementScope placement(g.tableKeys.empty() ? nullptr : g.tableKeys.front());
+        const auto cpus = fastllm::GetNumasCudaWorkerCpuSets({c.device});
+        if (cpus.size() == 1) dispatcherCpus = cpus.front();
+    }
     void Finish(bool observe) {
         std::unique_lock<std::mutex> lock(mutex);
         drained.wait(lock, [&] { return queue.empty() && !busy; });
@@ -208,6 +248,8 @@ struct NativeMoeMailbox {
         w.pending = false;
     }
     void Run() {
+        // Excludes expert worker cores and respects the caller's allowed mask.
+        fastllm::BindNumasWorkerCpuSet(dispatcherCpus);
         cudaSetDevice(cache.device);
         for (;;) {
             Request r;
@@ -217,6 +259,15 @@ struct NativeMoeMailbox {
                 if (stopping && queue.empty()) return;
                 r = std::move(queue.front()); queue.pop_front(); busy = true;
             }
+            // Cancellation and normal/error completion release the dispatcher
+            // through one path, so a rejected launch cannot strand Finish().
+            struct CompleteRequest {
+                NativeMoeMailbox &mailbox;
+                ~CompleteRequest() {
+                    { std::lock_guard<std::mutex> lock(mailbox.mutex); mailbox.busy = false; }
+                    mailbox.drained.notify_all();
+                }
+            } completion{*this};
             auto &w = *r.work;
             auto &box = *w.host;
             const bool full = w.fullGraph != nullptr;
@@ -225,7 +276,12 @@ struct NativeMoeMailbox {
             try {
                 unsigned polls = 0;
                 const double deadline = HybridNowUs() + 30000000;
+                bool canceled = false;
                 while (!__atomic_load_n(&box.published, __ATOMIC_ACQUIRE)) {
+                    if (full && launchCanceled.load(std::memory_order_acquire)) {
+                        canceled = true;
+                        break;
+                    }
                     if ((++polls & 65535) == 0 && HybridNowUs() > deadline)
                         throw std::runtime_error("Native mailbox GPU publication timed out.");
 #if defined(__x86_64__)
@@ -234,6 +290,7 @@ struct NativeMoeMailbox {
                 std::this_thread::yield();
 #endif
                 }
+                if (canceled) continue;
                 if (!full) {
                     if (previous) Observe(*previous);
                     previous = &w;
@@ -312,8 +369,6 @@ struct NativeMoeMailbox {
                 }
             }
             __atomic_store_n(&box.computed, 1u, __ATOMIC_RELEASE);
-            { std::lock_guard<std::mutex> lock(mutex); busy = false; }
-            drained.notify_all();
         }
     }
     static void Compute(Layer &w, const OffloadLayout &layout, const uint8_t *records,
@@ -350,7 +405,7 @@ struct NativeMoeMailbox {
             return ready;
         };
         if (!capture(w.exec, [&] {
-            PublishNativeMoe<<<1, 256, 0, cudaStreamPerThread>>>(w.mapped, w.mappedData,
+            PublishNativeMoe<<<1, w.hidden >= 4096 ? 512 : 256, 0, cudaStreamPerThread>>>(w.mapped, w.mappedData,
                 static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const int32_t *>(index.cudaData),
                 static_cast<const float *>(score.cudaData), cache.keyToSlot, cache.slotKeys, w.slots,
                 cache.hitCount, cache.totalMissCount, table * layout.experts, layout.experts, w.hidden, w.topk);
@@ -378,7 +433,7 @@ struct NativeMoeMailbox {
     Layer *CreateFull(int table, const fastllm::Data &input, const fastllm::Data &index,
             const fastllm::Data &score, fastllm::Data &output, fastllm::Data **weights,
             int weightsBatch, int layer, cudaGraph_t sharedGraph) {
-        if (failed || !memops.ready || !sharedGraph) return nullptr;
+        if (failed || !sharedGraph) return nullptr;
         Finish(true);
         const auto &layout = group.LayerLayout(table);
         const int topk = index.dims.back();
@@ -399,7 +454,7 @@ struct NativeMoeMailbox {
         const auto launch = fastllm::cuda::RecordCopyConfiguration(layout.recordStride, topk, prop);
         if (cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return nullptr;
         bool ok = [&] {
-            PublishNativeMoe<<<1, 256, 0, cudaStreamPerThread>>>(w.mapped, w.mappedData,
+            PublishNativeMoe<<<1, w.hidden >= 4096 ? 512 : 256, 0, cudaStreamPerThread>>>(w.mapped, w.mappedData,
                 static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const int32_t *>(index.cudaData),
                 static_cast<const float *>(score.cudaData), cache.keyToSlot, cache.slotKeys, w.slots,
                 cache.hitCount, cache.totalMissCount, table * layout.experts, layout.experts, w.hidden, topk, true);
@@ -415,8 +470,16 @@ struct NativeMoeMailbox {
                 cudaGraphAddChildGraphNode(&shared, graph, nullptr, 0, sharedGraph) != cudaSuccess) return false;
             if (!FastllmCudaDeepSeekV41QuantizeActivation(input, w.quantized)) return false;
             if (cudaEventRecordWithFlags(w.begin, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
+            if (cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess) return false;
+            std::vector<cudaGraphNode_t> fork(deps, deps + count);
             Compute(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData), cudaStreamPerThread, true);
             if (cudaEventRecordWithFlags(w.residentDone, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
+            if (cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess) return false;
+            std::vector<cudaGraphNode_t> residentTail(deps, deps + count);
+            // Resident and staged routes write disjoint gate/partial rows.
+            // Both depend on publication and quantization, and join at Reduce.
+            if (cudaStreamUpdateCaptureDependencies(cudaStreamPerThread, fork.data(), fork.size(),
+                    cudaStreamSetCaptureDependencies) != cudaSuccess) return false;
             if (cudaEventRecordWithFlags(w.uploadBegin, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
             // GPU reads the selected pinned records using device-side IDs.
             // No CUDA work is submitted by the CPU dispatcher during replay.
@@ -437,11 +500,12 @@ struct NativeMoeMailbox {
             if (cudaEventRecordWithFlags(w.uploadDone, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
             Compute(w, layout, copy->records, w.slots + topk, static_cast<const float *>(score.cudaData), cudaStreamPerThread);
             if (cudaEventRecordWithFlags(w.done, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
-            if (!memops.Append(&w.mapped->computed, true, 1)) return false;
+            if (cudaStreamUpdateCaptureDependencies(cudaStreamPerThread, residentTail.data(), residentTail.size(),
+                    cudaStreamAddCaptureDependencies) != cudaSuccess) return false;
+            WaitNativeMoe<<<1, 1, 0, cudaStreamPerThread>>>(&w.mapped->computed);
             fastllm::cuda::dsv41_cache::Reduce<<<(w.hidden+255)/256, 256, 0, cudaStreamPerThread>>>(
                 w.mappedData+w.hidden, w.partial, w.slots+2*topk, static_cast<const int32_t *>(index.cudaData),
-                static_cast<__nv_bfloat16 *>(output.cudaData), w.hidden, topk,
-                &w.mapped->published, &w.mapped->computed);
+                static_cast<__nv_bfloat16 *>(output.cudaData), w.hidden, topk);
             if (cudaGetLastError() != cudaSuccess) return false;
             return cudaEventRecordWithFlags(w.completed, cudaStreamPerThread, cudaEventRecordExternal) == cudaSuccess;
         }();
@@ -517,8 +581,6 @@ struct NativeMoeMailbox {
             auto *w = static_cast<Layer *>(handles[i]);
             if (!w || w->owner != this || !w->fullGraph) return false;
         }
-        // Prepare owned requests before launch; allocation failures must
-        // not expose a partial queue to the dispatcher.
         std::deque<Request> requests;
         for (int i = 0; i < count; ++i)
             requests.push_back({static_cast<Layer *>(handles[i]), FastllmMoeRoutePhase::Decode});
@@ -527,27 +589,33 @@ struct NativeMoeMailbox {
             std::lock_guard<std::mutex> lock(mutex);
             for (int i = 0; i < count; ++i) {
                 auto &w = *static_cast<Layer *>(handles[i]);
-                // Costs are immutable for this layer until the dispatcher
-                // finishes its current request. Only residency is GPU-dynamic.
+                // Finish(true) retired every reduction. Reset before publishing
+                // the new CPU queue, so no dispatcher can consume an old flag.
+                __atomic_store_n(&w.host->published, 0u, __ATOMIC_RELEASE);
+                __atomic_store_n(&w.host->computed, 0u, __ATOMIC_RELEASE);
                 for (int hits = 0; hits <= w.topk; ++hits)
                     w.host->stagedByHits[hits] = w.cost.SelectDecodeMisses(w.topk - hits, hits);
             }
+            launchCanceled.store(false, std::memory_order_release);
             queue.swap(requests);
-            if (!FastllmCudaGraphLaunch(exec)) {
-                queue.clear();
-                // The FastLLM error flag still reports the rejected launch;
-                // consume the runtime error so cleanup/explicit retry cannot
-                // mistake it for a failure of the next admission kernel.
-                cudaGetLastError();
-                return false;
-            }
-            for (int i = 0; i < count; ++i) {
-                auto &w = *static_cast<Layer *>(handles[i]);
-                w.pending = true; w.timed = timed;
-            }
-            fullLast = static_cast<Layer *>(handles[count - 1]);
         }
+        // The first GPU publication can precede cudaGraphLaunch's return.
+        // Let the dispatcher consume it without waiting for the caller's lock.
         wake.notify_one();
+        if (!FastllmCudaGraphLaunch(exec)) {
+            launchCanceled.store(true, std::memory_order_release);
+            std::unique_lock<std::mutex> lock(mutex);
+            queue.clear();
+            drained.wait(lock, [&] { return !busy; });
+            // Preserve the FastLLM error flag while allowing an explicit retry.
+            cudaGetLastError();
+            return false;
+        }
+        for (int i = 0; i < count; ++i) {
+            auto &w = *static_cast<Layer *>(handles[i]);
+            w.pending = true; w.timed = timed;
+        }
+        fullLast = static_cast<Layer *>(handles[count - 1]);
         return true;
     }
     bool Submit(int table, const fastllm::Data &input, const fastllm::Data &index,

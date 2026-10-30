@@ -11,6 +11,7 @@
 #include "devices/numas/numasdevice.h"
 #include "devices/numas/numas.h"
 #include "../../src/devices/cuda/moe/fastllm-moe-deepseekv41-cache.cuh"
+#include "../../src/devices/cuda/moe/fastllm-moe-cache-publication.cuh"
 #include <cuda_bf16.h>
 #include "cuda_moe_prefill_test.h"
 #include <cuda_fp8.h>
@@ -221,6 +222,68 @@ static void TestResidentGate() {
     }
     std::printf("RESIDENT_GATE_PASS %zu graph replays: route masks, partial tiles and scale edges\n", cases);
 }
+
+#if !defined(USE_ROCM) && CUDART_VERSION >= 11070
+__global__ void CheckAdmissionReader(const int32_t *keys, const int32_t *slotKeys,
+        const int *payload, unsigned long long *counts, int key, int expected,
+        int requiredResident, int size) {
+    for (int repeat = 0; repeat < 8; ++repeat) {
+        const int slot = fastllm::cuda::moe_admission::LoadAdmission(keys + key);
+        if (slot < 0) {
+            atomicAdd(counts + 1, 1ULL);
+            if (requiredResident == 1) atomicAdd(counts + 2, 1ULL);
+            continue;
+        }
+        if (requiredResident == 0 || slotKeys[slot] != key) atomicAdd(counts + 2, 1ULL);
+        for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < size; i += blockDim.x * gridDim.x)
+            if (payload[i] != expected) atomicAdd(counts + 2, 1ULL);
+        atomicAdd(counts, 1ULL);
+    }
+}
+static void TestCachePublication() {
+    namespace admission = fastllm::cuda::moe_admission;
+    constexpr int size = 1 << 18;
+    int32_t *keys, *slotKeys, *changes; int *payload;
+    unsigned long long *used, *step, *counts;
+    Check(cudaMalloc(&keys, 2 * sizeof(int32_t))); Check(cudaMalloc(&slotKeys, sizeof(int32_t)));
+    Check(cudaMalloc(&changes, 2 * sizeof(int32_t))); Check(cudaMalloc(&payload, size * sizeof(int)));
+    Check(cudaMalloc(&used, sizeof(*used))); Check(cudaMalloc(&step, sizeof(*step)));
+    Check(cudaMalloc(&counts, 3 * sizeof(*counts)));
+    Check(cudaMemset(step, 0, sizeof(*step))); Check(cudaMemset(counts, 0, 3 * sizeof(*counts)));
+    cudaStream_t reader, writer; cudaEvent_t evicted;
+    Check(cudaStreamCreateWithFlags(&reader, cudaStreamNonBlocking));
+    Check(cudaStreamCreateWithFlags(&writer, cudaStreamNonBlocking));
+    Check(cudaEventCreateWithFlags(&evicted, cudaEventDisableTiming));
+    for (int repeat = 0; repeat < 128; ++repeat) {
+        const int32_t init[2] = {0, -1}, zero = 0, change[2] = {1, 0};
+        Check(cudaMemcpy(keys, init, sizeof(init), cudaMemcpyHostToDevice));
+        Check(cudaMemcpy(slotKeys, &zero, sizeof(zero), cudaMemcpyHostToDevice));
+        Check(cudaMemcpy(changes, change, sizeof(change), cudaMemcpyHostToDevice));
+        Check(cudaMemset(payload, 0x11, size * sizeof(int)));
+        CheckAdmissionReader<<<8, 128, 0, reader>>>(keys, slotKeys, payload, counts, 0, 0x11111111, 1, size);
+        admission::InvalidateCacheAdmissions<<<1, 32, 0, reader>>>(keys, slotKeys, nullptr, changes, 1);
+        // Both old and new keys must miss until the writer is allowed to run.
+        CheckAdmissionReader<<<1, 32, 0, reader>>>(keys, slotKeys, payload, counts, 0, 0, 0, size);
+        CheckAdmissionReader<<<1, 32, 0, reader>>>(keys, slotKeys, payload, counts, 1, 0, 0, size);
+        Check(cudaEventRecord(evicted, reader)); Check(cudaStreamWaitEvent(writer, evicted, 0));
+        Check(cudaMemsetAsync(payload, 0x22, size * sizeof(int), writer));
+        admission::PublishCacheAdmissions<<<1, 32, 0, writer>>>(keys, slotKeys, nullptr, used, step, changes, 1, true);
+        CheckAdmissionReader<<<8, 128, 0, reader>>>(keys, slotKeys, payload, counts, 1, 0x22222222, -1, size);
+        Check(cudaStreamSynchronize(writer));
+        CheckAdmissionReader<<<8, 128, 0, reader>>>(keys, slotKeys, payload, counts, 1, 0x22222222, 1, size);
+        Check(cudaStreamSynchronize(reader));
+    }
+    unsigned long long result[3];
+    Check(cudaMemcpy(result, counts, sizeof(result), cudaMemcpyDeviceToHost));
+    Require(result[0] && result[1] && !result[2], "cache publication exposed stale/partial payload");
+    Check(cudaEventDestroy(evicted)); Check(cudaStreamDestroy(reader)); Check(cudaStreamDestroy(writer));
+    for (void *p : {static_cast<void *>(keys), static_cast<void *>(slotKeys), static_cast<void *>(changes),
+            static_cast<void *>(payload), static_cast<void *>(used), static_cast<void *>(step), static_cast<void *>(counts)})
+        Check(cudaFree(p));
+    std::printf("CACHE_PUBLICATION_PASS 128 replacements, resident=%llu pending=%llu errors=%llu\n",
+        result[0], result[1], result[2]);
+}
+#endif
 
 static void Quant(std::vector<float> &v, int blockSize = 32) {
     for (size_t start = 0; start < v.size(); start += blockSize) {
@@ -1055,7 +1118,12 @@ int main(int argc, char **argv) {
                 chainOut[l].dataType = BFLOAT16; chainOut[l].Resize({1, hidden}); Gpu(chainOut[l]);
             }
             const bool full = option("--fullgraph");
-            if (full) { TestNativeRoutePlan(); TestHostCopyPublication(); }
+            if (full) {
+                TestNativeRoutePlan(); TestHostCopyPublication();
+#if !defined(USE_ROCM) && CUDART_VERSION >= 11070
+                TestCachePublication();
+#endif
+            }
             void *handles[2]{}, *graphs[2]{}, *composed = nullptr, *exec = nullptr, *untimed = nullptr;
             if (full) {
                 FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
@@ -1085,7 +1153,9 @@ int main(int argc, char **argv) {
                     "untimed full graph creation rejected");
             }
             std::vector<int32_t> none(topk, -1);
-            for (int repeat = 0; repeat < 24; ++repeat) {
+            const int chainReplays = option("--stress") ? 256 : 24;
+            int rejectedLaunches = 0;
+            for (int repeat = 0; repeat < chainReplays; ++repeat) {
                 std::vector<float> reference(hidden), partial(topk * hidden);
                 std::vector<uint16_t> start(hidden), result(hidden);
                 std::vector<float> expected[2];
@@ -1120,7 +1190,8 @@ int main(int argc, char **argv) {
                     // A rejected CUDA launch must drain immediately and
                     // leave the next valid replay usable, with no waiter
                     // polling for a publication that will never arrive.
-                    if (repeat == 0 || repeat == 12) {
+                    if (repeat % 12 == 0) {
+                        ++rejectedLaunches;
                         const auto start = std::chrono::steady_clock::now();
                         Require(!FastllmCudaLaunchNativeMoeFullGraph(nullptr, handles, 2),
                             "null full graph launch unexpectedly succeeded");
@@ -1150,12 +1221,12 @@ int main(int argc, char **argv) {
                     Compare(actual, expected[l], "mailbox dependent layers / NUMA mismatch");
                 }
             }
-            if (full) std::printf("FULL_GRAPH_FAILURE_PASS 2 rejected launches followed by valid replays\n");
+            if (full) std::printf("FULL_GRAPH_REJECTED_LAUNCH_PASS %d rejected launches followed by valid replays\n", rejectedLaunches);
             // Finish must also protect the common CPU pool at Engram boundaries.
             if (untimed) FastllmCudaGraphExecDestroy(untimed);
             if (exec) FastllmCudaGraphExecDestroy(exec);
             if (composed) FastllmCudaGraphDestroy(composed);
-            std::printf("%s_CHAIN_PASS 24 replays, 48 dependent layer comparisons\n", full ? "FULL_GRAPH" : "MAILBOX");
+            std::printf("%s_CHAIN_PASS %d replays, %d dependent layer comparisons\n", full ? "FULL_GRAPH" : "MAILBOX", chainReplays, 2 * chainReplays);
         }
 
         unsetenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH");

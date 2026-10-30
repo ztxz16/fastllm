@@ -40,24 +40,30 @@ __device__ __forceinline__ unsigned SelectBits(unsigned a, unsigned b, bool cond
     return result;
 }
 __device__ __forceinline__ float2 FP4Pair(unsigned packed, unsigned exponent) {
+#if defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && \
+    __CUDA_ARCH_FAMILY_SPECIFIC__ >= 1200 && __CUDA_ARCH_FAMILY_SPECIFIC__ < 1300
+    // As in FlashInfer sparse_mla_sm120, unpack and scale a pair in BF16.
+    // E2M1 values are exact; power-of-two scaling preserves the old FP32
+    // product followed by BF16 rounding, including UE8M0 edge encodings.
+    unsigned halves, scaleBits;
+    asm("{ .reg .b8 lo, hi; mov.b16 {lo,hi}, %1; cvt.rn.f16x2.e2m1x2 %0, lo; }"
+        : "=r"(halves) : "h"((unsigned short)packed));
+    asm("cvt.rn.bf16x2.ue8m0x2 %0,%1;" : "=r"(scaleBits)
+        : "h"((unsigned short)(exponent * 0x101u)));
+    const __nv_bfloat162 values = __float22bfloat162_rn(
+        __half22float2(*reinterpret_cast<const __half2 *>(&halves)));
+    const __nv_bfloat162 scale = *reinterpret_cast<const __nv_bfloat162 *>(&scaleBits);
+    return __bfloat1622float2(__hmul2(values, scale));
+#else
     unsigned bits = SelectBits(exponent << 23, 0x00400000u, exponent != 0);
     bits = SelectBits(bits, 0x7fc00000u, exponent != 255);
     const float scale = __uint_as_float(bits);
-    // SM12x family targets can unpack E2M1 directly. Generic/older targets
-    // retain the register LUT. Only exact, unscaled values pass through FP16;
-    // scaling, BF16 rounding and FP32 accumulation stay unchanged.
-#if defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && \
-    __CUDA_ARCH_FAMILY_SPECIFIC__ >= 1200 && __CUDA_ARCH_FAMILY_SPECIFIC__ < 1300
-    unsigned halves;
-    asm("{ .reg .b8 lo, hi; mov.b16 {lo,hi}, %1; cvt.rn.f16x2.e2m1x2 %0, lo; }"
-        : "=r"(halves) : "h"((unsigned short)packed));
-#else
     const unsigned lut = __byte_perm(0x3e3c3800u, 0x46444240u, packed & 0x77u);
     unsigned halves = __byte_perm(lut, 0u, 0x1404u);
     halves |= ((packed & 8u) << 12) | ((packed & 128u) << 24);
-#endif
     const float2 values = __half22float2(*reinterpret_cast<const __half2 *>(&halves));
     return make_float2(BFloat(__fmul_rn(values.x,scale)), BFloat(__fmul_rn(values.y,scale)));
+#endif
 }
 __device__ inline float Dot(const __nv_bfloat16 *input, const uint8_t *weight, int columns) {
     const int lane = threadIdx.x & 15;
@@ -226,41 +232,31 @@ static __global__ void Down(const __nv_bfloat16 *activation, const int32_t *slot
         output[route * hidden + column] = BFloat(value);
 }
 static __global__ void Reduce(const float *cpu, const float *gpu, const int32_t *gpuIndices, const int32_t *indices,
-                              __nv_bfloat16 *output, int hidden, int topk,
-                              unsigned *published = nullptr, unsigned *computed = nullptr) {
+                              __nv_bfloat16 *output, int hidden, int topk) {
     const int column = blockIdx.x * blockDim.x + threadIdx.x;
-    if (column >= hidden)
-        return;
     const int row = blockIdx.y;
     cpu += (size_t)row * topk * hidden;
     gpu += (size_t)row * topk * hidden;
     gpuIndices += row * topk;
     indices += row * topk;
     output += (size_t)row * hidden;
-    // CPU V4/V4.1 accumulates in ascending expert-id order (stable on ties).
-    int order[16];
-    for (int r = 0; r < topk; ++r) {
-        int pos = r;
-        while (pos && indices[order[pos - 1]] > indices[r]) {
-            order[pos] = order[pos - 1];
-            --pos;
-        }
-        order[pos] = r;
+    // Sort once per CTA, preserving ascending expert IDs and route order on
+    // ties. All threads must reach the barrier, including the final partial CTA.
+    __shared__ int order[16], fromGpu[16];
+    if (threadIdx.x < topk) {
+        const int route = threadIdx.x, id = indices[route];
+        int rank = 0;
+        for (int r = 0; r < topk; ++r)
+            rank += indices[r] < id || (indices[r] == id && r < route);
+        order[rank] = route;
+        fromGpu[rank] = gpuIndices[route] >= 0;
     }
+    __syncthreads();
+    if (column >= hidden) return;
     float sum = 0;
-    for (int r = 0; r < topk; ++r) {
-        const int route = order[r];
-        sum = __fadd_rn(sum, (gpuIndices[route] < 0 ? cpu : gpu)[route * hidden + column]);
-    }
+    for (int r = 0; r < topk; ++r)
+        sum = __fadd_rn(sum, (fromGpu[r] ? gpu : cpu)[order[r] * hidden + column]);
     output[column] = __float2bfloat16_rn(sum);
-#if !defined(USE_ROCM)
-    // Later layers/token reuse is ordered after this whole kernel. Other
-    // CTAs consume data only; they never read these completion flags.
-    if (!column && !row && published) {
-        atomicExch_system(published, 0u);
-        atomicExch_system(computed, 0u);
-    }
-#endif
 }
 }
 }

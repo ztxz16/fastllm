@@ -2154,6 +2154,51 @@ namespace fastllm {
         }
     };
 
+    // Native scored decode keeps the same contiguous row partition and fused
+    // arithmetic. Workers construct their short-lived jobs locally, avoiding
+    // per-layer task-vector construction on the GPU/CPU dispatcher thread.
+    struct NumasMoeNativeScoredContext {
+        Data **weights = nullptr;
+        const std::vector<int> *routes = nullptr;
+        const int32_t *indices = nullptr;
+        const float *scores = nullptr;
+        uint8_t *input = nullptr, *downInput = nullptr;
+        float *gateUp = nullptr, *swiglu = nullptr, *output = nullptr;
+        int hidden = 0, inter = 0, nodes = 0, phase = 0, quantBlock = 32;
+        size_t downBytes = 0;
+        float limit = 0;
+    };
+    struct NumasMoeNativeScoredWorker : MultiThreadBaseOp, NumasMoeWorkerTiming {
+        NumasMoeNativeScoredContext *context = nullptr;
+        int node = 0, first = 0, last = 0;
+        void Run() override {
+            auto &c = *context;
+            const bool gate = c.phase == 0;
+            const int columns = gate ? c.inter * 2 : c.hidden;
+            const int perNode = columns / c.nodes, base = node * perNode;
+            for (int start = first; start < last;) {
+                const int item = start / perNode, row = start % perNode;
+                const int rows = std::min(perNode - row, last - start);
+                const int route = (*c.routes)[item];
+                Data &weight = *c.weights[2 * (c.indices[route] + 1) + c.phase];
+                float *destination = gate ? c.gateUp + item * columns + base :
+                    c.output + route * c.hidden + base;
+                MultiThreadGemmOp gemm(gate ? c.input : c.downInput + item * c.downBytes,
+                    BFLOAT16, weight.numasData[node], weight.GetDataType(),
+                    reinterpret_cast<uint8_t *>(destination), FLOAT32, 1,
+                    gate ? c.hidden : c.inter, columns, row, row + rows);
+                MultiThreadDeepSeekV41NumasDecodeOp task(gemm,
+                    gate ? c.gateUp + item * columns : nullptr,
+                    gate ? c.swiglu + item * c.inter : nullptr,
+                    gate ? c.downInput + item * c.downBytes : nullptr,
+                    BFLOAT16, base, gate ? c.scores[route] : 0, c.limit, c.quantBlock);
+                task.Run();
+                start += rows;
+            }
+            Complete();
+        }
+    };
+
     // Reuse one descriptor per pool worker. Routing and activation pointers
     // are rebound for each row; workers construct their small GEMM views on
     // their own stacks instead of building vectors on the submitting thread.
@@ -2459,6 +2504,8 @@ namespace fastllm {
     };
 
     struct FastllmMoeDataManagerNumas {
+            NumasMoeNativeScoredContext nativeScoredContext;
+            std::vector<NumasMoeNativeScoredWorker> nativeScoredWorkers;
             NumasMoeDecodeContext decodeContext;
             std::vector<NumasMoeDecodeWorker> rowWorkers;
             std::vector<NumasMoeScoredPrepareWorker> scoredPrepareWorkers;
@@ -4300,6 +4347,45 @@ namespace fastllm {
                 if (stage == 0)
                     ConvertFromFloat32(work.downInput.data(), downAct,
                         work.swigluOutput.data(), count, inter);
+            }
+            finishCpu();
+            return;
+        }
+        if (scoredBfloat && !canonical && gateAct == BFLOAT16 && downAct == BFLOAT16 &&
+            weights[2]->dataType == NVFP4_BLOCK_32_E8M0 &&
+            weights[3]->dataType == NVFP4_BLOCK_32_E8M0) {
+            auto &context = work.nativeScoredContext;
+            context.weights = weights; context.routes = &routes;
+            context.indices = indices; context.scores = routeScores;
+            context.input = work.realInput.data(); context.downInput = work.downInput.data();
+            context.gateUp = work.gateUpOutput.data(); context.swiglu = work.swigluOutput.data();
+            context.output = output;
+            context.hidden = hidden; context.inter = inter; context.nodes = config->numaCnt;
+            context.downBytes = downBytes; context.limit = swigluLimit;
+            context.quantBlock = activationQuantBlock;
+            work.nativeScoredWorkers.resize(config->threads);
+            auto &active = work.activeDecodeWorkers;
+            active.reserve(config->threads);
+            for (int phase = 0; phase < 2; ++phase) {
+                context.phase = phase;
+                const int columns = phase == 0 ? inter * 2 : hidden;
+                const int perNode = columns / config->numaCnt;
+                const int granularity = phase == 0 ? 2 * activationQuantBlock : 4;
+                const int units = count * perNode / granularity;
+                active.clear();
+                for (int node = 0; node < config->numaCnt; ++node) {
+                    const auto &workers = config->numaToCpuDict[node];
+                    const int threads = workers.size();
+                    for (int t = 0; t < threads; ++t) {
+                        const int id = workers[t].first;
+                        auto &worker = work.nativeScoredWorkers[id];
+                        worker.context = &context; worker.node = node;
+                        worker.first = (t * (units / threads) + std::min(t, units % threads)) * granularity;
+                        worker.last = worker.first + (units / threads + (t < units % threads)) * granularity;
+                        if (worker.first < worker.last) active.push_back(id);
+                    }
+                }
+                runWorkers(work.nativeScoredWorkers, phase == 0, &active);
             }
             finishCpu();
             return;

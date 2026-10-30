@@ -238,12 +238,64 @@ __global__ void Scatter(SharedExpertLayout layout, void *const *pointers,
     }
 }
 
+// The uploaded row-sharded NVFP4 record is contiguous within each matrix.
+// Gate/up only needs an even/odd row permutation; down is already contiguous.
+// Vectorize across down rows as well, even when an individual row is not 16B
+// aligned. Other column/tile layouts keep the generic byte-view adapter.
+template<int FixedRowBytes = 0>
+__global__ void RestoreInterleavedRows(const uint8_t *gate, const uint8_t *down,
+        uint8_t *destination, size_t gateBytes, size_t totalBytes,
+        unsigned rowBytes, unsigned groupRows) {
+    const unsigned pitch = FixedRowBytes ? FixedRowBytes : rowBytes;
+    for (size_t byte = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 16;
+         byte < totalBytes; byte += size_t(gridDim.x) * blockDim.x * 16) {
+        const uint8_t *source;
+        if (byte < gateBytes) {
+            const size_t row = byte / pitch, column = byte - row * pitch;
+            const size_t physical = row < groupRows ? row * 2 : (row - groupRows) * 2 + 1;
+            source = gate + physical * pitch + column;
+        } else source = down + byte - gateBytes;
+        *reinterpret_cast<uint4 *>(destination + byte) = *reinterpret_cast<const uint4 *>(source);
+    }
+}
+
+inline bool ContiguousInterleavedRows(const SharedExpertLayout &layout) {
+    if (!layout.shards || layout.auxiliaryBytes || layout.weights[0].rowGroups != 2 ||
+        layout.weights[1].rowGroups != 1 || layout.weights[0].destinationOffset ||
+        (layout.weights[0].rowBytes & 15)) return false;
+    uint64_t bytes = 0;
+    for (const auto &view : layout.weights) {
+        if (!view.Valid(layout.shards, layout.recordBytes) || view.sourceOffset || view.tileRows != 1 ||
+            view.tileStride != view.rowBytes || view.rowStride != view.rowBytes ||
+            view.blockBytes != view.rowBytes || view.blockStride != view.rowBytes ||
+            view.rowsPerShard % view.rowGroups || view.groupRows != view.rows / view.rowGroups ||
+            uint64_t(view.shardBytes) != uint64_t(view.rowsPerShard) * view.rowBytes ||
+            view.destinationOffset != bytes) return false;
+        bytes += uint64_t(view.rows) * view.rowBytes;
+    }
+    return bytes == layout.recordBytes && !(bytes & 15);
+}
+
 } // namespace shared_weight_detail
 
 inline bool CopySharedExpertRecord(const SharedExpertLayout &layout, void *const *pointers,
         const uint8_t *gate, const uint8_t *down, const uint8_t *auxiliary,
         uint8_t *destination, cudaStream_t stream, int stage = -1) {
     if ((!pointers && (!gate || !down)) || !destination || (layout.auxiliaryBytes && !auxiliary)) return false;
+    if (!pointers && stage < 0 &&
+        !((reinterpret_cast<uintptr_t>(gate) | reinterpret_cast<uintptr_t>(down) |
+           reinterpret_cast<uintptr_t>(destination)) & 15) &&
+        shared_weight_detail::ContiguousInterleavedRows(layout)) {
+        const auto &view = layout.weights[0];
+        const size_t gateBytes = size_t(view.rows) * view.rowBytes;
+        if (view.rowBytes == 2720)
+            shared_weight_detail::RestoreInterleavedRows<2720><<<256, 256, 0, stream>>>(
+                gate, down, destination, gateBytes, layout.recordBytes, view.rowBytes, view.groupRows);
+        else
+            shared_weight_detail::RestoreInterleavedRows<><<<256, 256, 0, stream>>>(
+                gate, down, destination, gateBytes, layout.recordBytes, view.rowBytes, view.groupRows);
+        return cudaGetLastError() == cudaSuccess;
+    }
     uintptr_t alignment = layout.recordBytes | layout.auxiliaryBytes |
         reinterpret_cast<uintptr_t>(gate) | reinterpret_cast<uintptr_t>(down) |
         reinterpret_cast<uintptr_t>(auxiliary) | reinterpret_cast<uintptr_t>(destination);
