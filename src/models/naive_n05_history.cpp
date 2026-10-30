@@ -27,16 +27,22 @@ bool NaiveN05FlashModel::TryRestoreHistoryCache(std::vector<int> &, int &cacheLe
 }
 
 void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
-    tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
     RestoreTensorParallelCache(context);
+    if (!context->pastKeyValues.empty()) {
+        std::lock_guard<std::mutex> guard(tpRequestMutex);
+        tpRequestIds[&context->pastKeyValues.front().first] = ++tpNextRequestId;
+    }
     std::lock_guard<std::mutex> guard(historyMutex);
     if (saveHistoryChat && !draftEnabled && context->multimodalInput.empty())
         activePrefixes.try_emplace(&context->pastKeyValues.front().first);
 }
 
 void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
-    tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
     const Data *key = context->pastKeyValues.empty() ? nullptr : &context->pastKeyValues.front().first;
+    {
+        std::lock_guard<std::mutex> guard(tpRequestMutex);
+        tpRequestIds.erase(key);
+    }
     RecycleTensorParallelCache(context);
     std::lock_guard<std::mutex> guard(historyMutex);
     activePrefixes.erase(key);

@@ -65,8 +65,14 @@ struct NaiveN05FlashModel::TPServingState {
     DataType moeType = BFLOAT16, kvType = BFLOAT16;
     uint64_t generation = 0, cacheEpoch = UINT64_MAX;
     std::vector<const Data *> requests;
+    std::vector<uint64_t> requestIds;
     std::vector<int> expectedLengths, capacityLimits;
     std::vector<int *> cacheLengths, pageLengths;
+    std::vector<void *> cachePointers, pageTables;
+    std::vector<int> cacheCapacities;
+    bool bindingsDirty = false;
+    std::vector<size_t> bindingOrder;
+    size_t boundRowsBeforeCompaction = 0;
     std::vector<int> batchBuckets;
     std::map<std::pair<int, int>, std::shared_ptr<TPDecodeState>> graphs;
 };

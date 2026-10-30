@@ -258,7 +258,13 @@ namespace fastllm {
         struct TPServingState;
         std::shared_ptr<TPServingState> tpServingState;
         std::atomic<uint64_t> tpCacheEpoch{0};
+        // Request lifetimes are independent of tensor/pool layout changes.
+        // A fresh identity prevents a recycled Data address from reviving a plan.
+        mutable std::mutex tpRequestMutex;
+        std::unordered_map<const Data *, uint64_t> tpRequestIds;
+        uint64_t tpNextRequestId = 0;
         bool CanReuseTensorParallelServingCache(const TargetBatch *batch, bool checkCapacity = true) const;
+        void ReorderTensorParallelServingCache(const TargetBatch *batch);
         void PrepareTensorParallelServing();
         bool PrepareTensorParallelServingDecode(const Data &inputIds,
             const LogitsSelection &selection, std::vector<int *> &cacheLengths,

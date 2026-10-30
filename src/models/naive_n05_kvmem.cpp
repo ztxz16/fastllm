@@ -52,6 +52,10 @@ NaiveN05FlashModel::SparseKvState::~SparseKvState() {
 void NaiveN05FlashModel::OnResponseContextFinished(ResponseContext *context) {
     if (!sparseKv || !context->isEnding || context->pastKeyValues.empty() ||
         !context->pastKeyValues.front().first.kvStorageOwner) return;
+    {
+        std::lock_guard<std::mutex> guard(tpRequestMutex);
+        tpRequestIds.erase(&context->pastKeyValues.front().first);
+    }
     // Retain the lease until all borrowed descriptors are detached. Forward
     // completion already synchronized the rank streams before publication.
     auto lease = std::move(context->pastKeyValues.front().first.kvStorageOwner);
@@ -63,7 +67,6 @@ void NaiveN05FlashModel::OnResponseContextFinished(ResponseContext *context) {
         root->dims.clear(); root->expansionDims.clear(); root->strides.clear();
         root->expansionSize = root->expansionBytes = 0;
     }
-    tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 void NaiveN05FlashModel::InitSparseKv() {

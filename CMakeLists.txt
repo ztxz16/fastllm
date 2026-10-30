@@ -2104,6 +2104,12 @@ if (UNIT_TEST)
         set_tests_properties(naive_n05_prefix_cache PROPERTIES TIMEOUT 60
             PASS_REGULAR_EXPRESSION "PREFIX CACHE PASS")
 
+        add_executable(naive_n05_serving_metadata_test test/basic/test_naive_n05_serving_metadata.cpp)
+        target_link_libraries(naive_n05_serving_metadata_test PRIVATE fastllm_tools)
+        target_include_directories(naive_n05_serving_metadata_test PRIVATE src/models ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(naive_n05_serving_metadata naive_n05_serving_metadata_test "SERVING METADATA PASS" 120)
+        set_tests_properties(naive_n05_serving_metadata PROPERTIES ENVIRONMENT "FASTLLM_CUDA_GRAPH=1")
+
         add_executable(naive_n05_tp_model_test test/basic/test_naive_n05_tp_model.cpp)
         target_link_libraries(naive_n05_tp_model_test PRIVATE fastllm)
         target_include_directories(naive_n05_tp_model_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
