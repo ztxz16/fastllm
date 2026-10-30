@@ -13,6 +13,7 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <type_traits>
 
 namespace fastllm { namespace nomas {
 cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,bool,int,int,int,cudaStream_t);
@@ -91,7 +92,8 @@ __global__ void toFloat(const B *x, float *y, size_t n) {
 template<class T> __global__ void element(const T *x, const T *y, T *z, size_t n, int op) {
     for (size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x; i<n; i+=size_t(gridDim.x)*blockDim.x) {
         float v=f(x[i]);
-        z[i]=cast<T>(op==0 ? v+f(y[i]) : op==3 ? v*f(y[i]) : op==1 ? v/(1.f+expf(-v)) : .5f*v*(1.f+tanhf(.7978845608028654f*(v+.044715f*v*v*v))));
+        // Preserve the BF16 SiLU result before multiplying by the up branch.
+        z[i]=cast<T>(op==4 ? roundTo<T>(v/(1.f+expf(-v)))*f(y[i]) : op==0 ? v+f(y[i]) : op==3 ? v*f(y[i]) : op==1 ? v/(1.f+expf(-v)) : .5f*v*(1.f+tanhf(.7978845608028654f*(v+.044715f*v*v*v))));
     }
 }
 template<class T> __global__ void addBias(const T *x,const T *bias,T *y,size_t n,int cols) {
@@ -117,8 +119,10 @@ template<class T> __global__ void normKernel(const T *x, T *y, const T *weight, 
         float v=(f(x[size_t(row)*width+c])-mean)*inv;
         // Official RMSNorm casts before applying weight; LayerNorm has a fused affine.
         if(rms) v=roundTo<T>(v);
-        if(weight) v*=f(weight[c]);
-        if(bias) v+=f(bias[c]);
+        if constexpr (std::is_same_v<T,B>) {
+            if(!rms && weight && bias) v=__fmaf_rn(v,f(weight[c]),f(bias[c]));
+            else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
+        } else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
         y[size_t(row)*width+c]=cast<T>(v);
     }
 }
@@ -255,7 +259,7 @@ bool runtimePrecision() {
     const char *p = std::getenv("FASTLLM_NOMAS_PRECISION");
     if (p && std::string(p)!="fp32" && std::string(p)!="bf16")
         throw std::invalid_argument("FASTLLM_NOMAS_PRECISION must be fp32 or bf16");
-    return !p || std::string(p)=="fp32";
+    return p && std::string(p)=="fp32";
 }
 }
 Runtime::Runtime(int device):Runtime(device, runtimePrecision()) {}
@@ -346,6 +350,13 @@ Tensor Runtime::multiply(const Tensor &x,const Tensor &y) {
     require(x.rows==y.rows && x.cols==y.cols && x.fp32==y.fp32,"multiply shape/dtype mismatch"); Tensor out(x.rows,x.cols,x.fp32);
     if(x.fp32) { element<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(y),as<float>(out),x.size(),3); } else { element<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(y),ptr(out),x.size(),3); } check(cudaGetLastError()); return out;
 }
+Tensor Runtime::siluMultiply(const Tensor &x,const Tensor &y) {
+    require(x.rows==y.rows && x.cols==y.cols && x.fp32==y.fp32,"SiLU multiply shape/dtype mismatch");
+    Tensor out(x.rows,x.cols,x.fp32);
+    if(x.fp32) element<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(y),as<float>(out),x.size(),4);
+    else element<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(y),ptr(out),x.size(),4);
+    check(cudaGetLastError()); return out;
+}
 Tensor Runtime::bias(const Tensor &x,const Tensor &bias) {
     require(bias.size()==size_t(x.cols) && bias.fp32==x.fp32,"bias shape/dtype mismatch"); Tensor out(x.rows,x.cols,x.fp32);
     if(x.fp32) { addBias<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(bias),as<float>(out),x.size(),x.cols); } else { addBias<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(bias),ptr(out),x.size(),x.cols); } check(cudaGetLastError()); return out;
@@ -399,10 +410,24 @@ Tensor Runtime::concat(const std::vector<Tensor> &xs) {
     for(auto &x:xs) { copy(out.data+pos,x.data,x.bytes(),cudaMemcpyDeviceToDevice); pos+=x.size()*(x.fp32?2:1); } return out;
 }
 Tensor Runtime::rope(const Tensor &x,const float *cos,const float *sin,int dim) {
-    require(cos && sin && dim>0 && dim%2==0 && x.cols%dim==0,"invalid RoPE shape");
-    auto cs=allocate(size_t(x.rows)*dim*4), sn=allocate(size_t(x.rows)*dim*4);
-    copy(cs.get(),cos,size_t(x.rows)*dim*4,cudaMemcpyHostToDevice); copy(sn.get(),sin,size_t(x.rows)*dim*4,cudaMemcpyHostToDevice);
-    Tensor out(x.rows,x.cols,x.fp32); if(x.fp32) { ropeKernel<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(out),static_cast<float *>(cs.get()),static_cast<float *>(sn.get()),x.size(),x.cols,dim); } else { ropeKernel<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),static_cast<float *>(cs.get()),static_cast<float *>(sn.get()),x.size(),x.cols,dim); } check(cudaGetLastError()); return out;
+    return rope(x,prepareRope(cos,sin,x.rows,dim));
+}
+RopeTable Runtime::prepareRope(const float *cos,const float *sin,int rows,int dim) {
+    require(cos && sin && rows>0 && dim>0 && dim%2==0,"invalid RoPE table");
+    // Position tables stay FP32 even when the network's activations are BF16.
+    RopeTable table{Tensor(rows,dim,true),Tensor(rows,dim,true)};
+    copy(table.cos.data,cos,table.cos.bytes(),cudaMemcpyHostToDevice);
+    copy(table.sin.data,sin,table.sin.bytes(),cudaMemcpyHostToDevice);
+    return table;
+}
+Tensor Runtime::rope(const Tensor &x,const RopeTable &table) {
+    int dim=table.cos.cols;
+    require(dim>0 && dim%2==0 && x.cols%dim==0 && table.cos.rows==x.rows && table.sin.rows==x.rows &&
+            table.sin.cols==dim && table.cos.fp32 && table.sin.fp32,"invalid RoPE shape");
+    Tensor out(x.rows,x.cols,x.fp32);
+    if(x.fp32) ropeKernel<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(out),as<float>(table.cos),as<float>(table.sin),x.size(),x.cols,dim);
+    else ropeKernel<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),as<float>(table.cos),as<float>(table.sin),x.size(),x.cols,dim);
+    check(cudaGetLastError()); return out;
 }
 Tensor Runtime::attention(const Tensor &q,const Tensor &k,const Tensor &v,int heads,const uint8_t *mask,int chunk,
                           int kvHeads,bool causal,int tile,int height,int width) {

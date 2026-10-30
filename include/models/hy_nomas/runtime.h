@@ -24,6 +24,8 @@ struct Tensor {
     Tensor rowSlice(int first, int count) const;
 };
 
+struct RopeTable { Tensor cos, sin; };
+
 class Runtime {
 public:
     explicit Runtime(int device);
@@ -41,6 +43,7 @@ public:
     Tensor activation(const Tensor &x, bool gelu = false);
     Tensor add(const Tensor &x, const Tensor &y);
     Tensor multiply(const Tensor &x, const Tensor &y);
+    Tensor siluMultiply(const Tensor &gate, const Tensor &up);
     Tensor bias(const Tensor &x, const Tensor &bias);
     Tensor mean(const Tensor &x);
     Tensor repeatRows(const Tensor &x, int copies);
@@ -54,6 +57,8 @@ public:
     Tensor textRope(const Tensor &x);
     Tensor concat(const std::vector<Tensor> &xs);
     Tensor rope(const Tensor &x, const float *cos, const float *sin, int headDim);
+    RopeTable prepareRope(const float *cos, const float *sin, int rows, int headDim);
+    Tensor rope(const Tensor &x, const RopeTable &table);
     // mask is row-major [query_tokens, key_tokens], 1=visible. Null means full
     // attention. Scratch memory is O(query_chunk * keys), never O(queries*keys).
     Tensor attention(const Tensor &q, const Tensor &k, const Tensor &v,
@@ -90,6 +95,10 @@ public:
     DiT(Runtime &runtime, const std::string &checkpoint);
     BlockResult block(int layer, const Tensor &image, const Tensor &text,
                       const Tensor &time, const float *cos, const float *sin,
+                      const Tensor *historyK = nullptr, const Tensor *historyV = nullptr,
+                      const uint8_t *attentionMask = nullptr);
+    BlockResult block(int layer, const Tensor &image, const Tensor &text,
+                      const Tensor &time, const RopeTable &rope,
                       const Tensor *historyK = nullptr, const Tensor *historyV = nullptr,
                       const uint8_t *attentionMask = nullptr);
     Tensor forward(const Tensor &latent, const Tensor &textFeatures, float timestep,

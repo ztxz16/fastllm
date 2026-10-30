@@ -11,9 +11,19 @@ namespace {
 using B = __nv_bfloat16;
 using Base = flashinfer::SinglePrefillParams<B, B, B>;
 struct Params : Base { int tile, height, width; };
-struct LocalAttention : flashinfer::DefaultAttention<false, true, false, false> {
+struct BF16Attention : flashinfer::DefaultAttention<false, false, false, false> {
+    using DefaultAttention::DefaultAttention;
+    // Match the reference: FP32 softmax denominator, BF16 probabilities for PV.
+    static constexpr bool use_fp32_softmax_sum = true;
+    REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
+        return output * ((m != -flashinfer::math::inf && d > 0.f) ? 1.f / d : 0.f);
+    })
+};
+static_assert(!flashinfer::prefill_fp32_softmax_sum<flashinfer::DefaultAttention<false,false,false,false>>::value,
+              "HY-Nomas must not change the default attention accumulation");
+struct LocalAttention : BF16Attention {
     template<class P> __host__ __device__ LocalAttention(const P &p, unsigned batch, uint8_t *smem)
-        : flashinfer::DefaultAttention<false, true, false, false>(p, batch, smem) {}
+        : BF16Attention(p, batch, smem) {}
     REGISTER_LOGITS_MASK(p, batch, qi, ki, qh, kh, {
         int cy = max(1, min(int(qi) / p.width % p.height / p.tile, max((p.height+p.tile-1)/p.tile-2,1)));
         int cx = max(1, min(int(qi) % p.width / p.tile, max((p.width+p.tile-1)/p.tile-2,1)));
@@ -35,8 +45,8 @@ cudaError_t fusedAttention(const void *q,const void *k,const void *v,void *out,
             MaskMode::kCustom,LocalAttention,Params,false>(p,nullptr,stream);
     if(causal)
         return SinglePrefillWithKVCacheDispatched<128,128,PosEncodingMode::kNone,false,
-            MaskMode::kCausal,DefaultAttention<false,false,false,false>,Params,false>(p,nullptr,stream);
+            MaskMode::kCausal,BF16Attention,Params,false>(p,nullptr,stream);
     return SinglePrefillWithKVCacheDispatched<128,128,PosEncodingMode::kNone,false,
-        MaskMode::kNone,DefaultAttention<false,false,false,false>,Params,false>(p,nullptr,stream);
+        MaskMode::kNone,BF16Attention,Params,false>(p,nullptr,stream);
 }
 }} // namespace fastllm::nomas

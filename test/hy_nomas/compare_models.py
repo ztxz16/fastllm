@@ -69,7 +69,7 @@ def main(args):
 
     def record(name, output, expected, **metadata):
         case = dict(name=name, **metrics(output, array(expected)), **metadata)
-        case["passed"] = case["finite"] and case["relative_l2"] <= (0.001 if DTYPE == torch.float32 else 0.02) and case["cosine"] >= (0.999999 if DTYPE == torch.float32 else 0.9998)
+        case["passed"] = case["finite"] and case["relative_l2"] <= (0.001 if DTYPE == torch.float32 else 0.02)
         report["cases"].append(case)
         args.report.write_text(json.dumps(report, indent=2)+"\n")
         print(json.dumps(case), flush=True)

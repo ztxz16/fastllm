@@ -41,8 +41,8 @@ def camera_symbols(root):
 
 def preprocess(weights,extrinsics):
     def linear(x,name):
-        return F.linear(x,weights.get_tensor(name+'.weight').cuda().float(),weights.get_tensor(name+'.bias').cuda().float())
-    x=linear(extrinsics.reshape(1,-1,64),'extrinsics_embedding_camctrl')
+        return F.linear(x,weights.get_tensor(name+'.weight').cuda().to(common.DTYPE),weights.get_tensor(name+'.bias').cuda().to(common.DTYPE))
+    x=linear(extrinsics.reshape(1,-1,64).to(common.DTYPE),'extrinsics_embedding_camctrl')
     return x+linear(F.silu(linear(x,'c2ws_hidden_states_layer1')),'c2ws_hidden_states_layer2')
 
 

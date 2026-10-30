@@ -2,6 +2,7 @@
 import argparse
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -17,7 +18,7 @@ spec = importlib.util.spec_from_file_location('nomas_server', path)
 server = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = server
 spec.loader.exec_module(server)
-report = {'precision': 'fp32', 'steps': 8, 'frames_per_segment': 20, 'cases': []}
+report = {'precision': os.environ.get('FASTLLM_NOMAS_PRECISION','bf16'), 'steps': 8, 'frames_per_segment': 20, 'cases': []}
 backend = server.NativeBackend(args.library, args.weights, args.text)
 try:
     for size in args.sizes.split(','):

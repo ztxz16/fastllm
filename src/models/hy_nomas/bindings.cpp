@@ -9,6 +9,10 @@ namespace { void require(bool ok, const char *message) { if (!ok) throw std::inv
 DiT::DiT(Runtime &rt,const std::string &path):rt_(rt),weights_(rt,path) {}
 BlockResult DiT::block(int layer,const Tensor &image,const Tensor &text,const Tensor &time,
     const float *cos,const float *sin,const Tensor *historyK,const Tensor *historyV,const uint8_t *mask) {
+    return block(layer,image,text,time,rt_.prepareRope(cos,sin,image.rows,128),historyK,historyV,mask);
+}
+BlockResult DiT::block(int layer,const Tensor &image,const Tensor &text,const Tensor &time,
+    const RopeTable &rope,const Tensor *historyK,const Tensor *historyV,const uint8_t *mask) {
     require(layer>=0 && layer<54 && image.cols==2048 && text.cols==2048 && time.rows==1 && time.cols==2048,"invalid DiT block input");
     require(bool(historyK)==bool(historyV),"both K and V history required");
     auto p="double_blocks."+std::to_string(layer)+"."; auto act=rt_.activation(time);
@@ -18,7 +22,7 @@ BlockResult DiT::block(int layer,const Tensor &image,const Tensor &text,const Te
         auto q=weights_.linear(x,p+s+"_attn_q"),k=weights_.linear(x,p+s+"_attn_k"),v=weights_.linear(x,p+s+"_attn_v");
         q=rt_.norm(q,true,&weights_.get(p+s+"_attn_q_norm.weight"),nullptr,1e-6f,128);
         k=rt_.norm(k,true,&weights_.get(p+s+"_attn_k_norm.weight"),nullptr,1e-6f,128);
-        if(s=="img") { q=rt_.rope(q,cos,sin,128); k=rt_.rope(k,cos,sin,128); }
+        if(s=="img") { q=rt_.rope(q,rope); k=rt_.rope(k,rope); }
         return std::vector<Tensor>{q,k,v};
     };
     auto i=project(inputI,"img"),t=project(inputT,"txt");

@@ -65,10 +65,11 @@ Tensor DiT::forward(const Tensor &latent,const Tensor &features,float timestep,i
             base+=dims[axis];
         }
     }
+    auto rope=rt_.prepareRope(cos.data(),sin.data(),tokens,128);
     auto x=weights_.linear(latent,"img_in.proj"),vec=timeEmbedding(timestep,"time_in"),txt=refineText(features,timestep);
     DiTCache next;
     for(int layer=0;layer<54;++layer) {
-        auto out=block(layer,x,txt,vec,cos.data(),sin.data(),hasCache?&cache->key[layer]:nullptr,hasCache?&cache->value[layer]:nullptr);
+        auto out=block(layer,x,txt,vec,rope,hasCache?&cache->key[layer]:nullptr,hasCache?&cache->value[layer]:nullptr);
         x=out.image; txt=out.text;
         if(camera) x=cameraBlock(layer,x,*camera,h*w);
         if(commit) {
@@ -115,8 +116,8 @@ Tensor PixelDecoder::block(int layer,const Tensor &input,int t,int h,int w,int t
     auto a=rt_.attention(q,k,v,32,nullptr,128,8,false,tile,h,w);
     auto x=rt_.add(input,weights_.linear(a,p+"attn.o_proj"));
     norm=rt_.norm(x,true,&weights_.get(p+"post_attn_norm.weight"));
-    auto gate=rt_.activation(weights_.linear(norm,p+"mlp.gate_proj"));
-    auto mlp=weights_.linear(rt_.multiply(gate,weights_.linear(norm,p+"mlp.up_proj")),p+"mlp.down_proj");
+    auto gate=weights_.linear(norm,p+"mlp.gate_proj");
+    auto mlp=weights_.linear(rt_.siluMultiply(gate,weights_.linear(norm,p+"mlp.up_proj")),p+"mlp.down_proj");
     return rt_.add(x,mlp);
 }
 Tensor PixelDecoder::forward(const Tensor &latent,const Tensor &noise,int t,int h,int w) {
@@ -146,8 +147,8 @@ Tensor QwenTextEncoder::encode(const std::vector<int> &tokens) {
         auto v=weights_.linear(nx,p+"self_attn.v_proj");
         x=rt_.add(x,weights_.linear(rt_.attention(q,k,v,28,nullptr,128,4,true),p+"self_attn.o_proj"));
         nx=rt_.norm(x,true,&weights_.get(p+"post_attention_layernorm.weight"));
-        auto up=weights_.linear(nx,p+"mlp.up_proj"),gate=rt_.activation(weights_.linear(nx,p+"mlp.gate_proj"));
-        x=rt_.add(x,weights_.linear(rt_.multiply(gate,up),p+"mlp.down_proj"));
+        auto up=weights_.linear(nx,p+"mlp.up_proj"),gate=weights_.linear(nx,p+"mlp.gate_proj");
+        x=rt_.add(x,weights_.linear(rt_.siluMultiply(gate,up),p+"mlp.down_proj"));
     }
     return x;
 }

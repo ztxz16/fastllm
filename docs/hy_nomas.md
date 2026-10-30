@@ -64,13 +64,13 @@ CUDA_VISIBLE_DEVICES=0 python3 tools/fastllm_pytools/nomas_server.py \
   --model /path/to/Hy-Nomas \
   --text-encoder /path/to/Qwen2.5-VL-7B-Instruct \
   --output /path/to/nomas-output \
-  --precision fp32 --device 0 \
+  --precision bf16 --device 0 \
   --host 127.0.0.1 --port 8007
 ```
 
 - `CUDA_VISIBLE_DEVICES` 选择使用的 GPU；`--device 0` 表示可见 GPU 中的第一张。
 - `--output` 用于保存生成的 PNG 帧，服务进程需要有写入权限。
-- 使用 `--precision fp32`；BF16 目前为实验模式。
+- 默认使用 `--precision bf16`：权重、主激活和 KV 使用 BF16，矩阵乘法累加、归一化内部计算及采样更新保留 FP32。需要精度排查时，可显式使用 `--precision fp32`。
 - 从其他机器访问时，将 `--host` 改为 `0.0.0.0`，浏览器访问部署机器的 IP 和端口。服务没有内置认证，对外开放时可接入已有认证网关。
 
 启动后访问：

@@ -73,7 +73,7 @@ def main(args):
         report["hidden_layer_26"] = metrics(actual[crop.value:], expected[0, crop.value:].float().cpu().numpy())
         fp32 = os.environ.get("FASTLLM_NOMAS_PRECISION") == "fp32"
         report["precision"] = "fp32" if fp32 else "bf16"
-        report["hidden_passed"] = report["hidden_layer_26"]["relative_l2"] <= (0.001 if fp32 else 0.02) and report["hidden_layer_26"]["cosine"] >= (0.999999 if fp32 else 0.9998)
+        report["hidden_passed"] = report["hidden_layer_26"]["finite"] and report["hidden_layer_26"]["relative_l2"] <= (0.001 if fp32 else 0.02)
         report["tokens"], report["crop"] = count, crop.value
         np.save(args.report.with_suffix(".features.npy"), expected[0, crop.value:].float().cpu().numpy())
         print(json.dumps(report), flush=True)

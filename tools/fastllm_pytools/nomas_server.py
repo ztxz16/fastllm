@@ -370,7 +370,7 @@ class Jobs:
                 self.pending.task_done()
 
 
-def create_app(backend, output, precision="fp32"):
+def create_app(backend, output, precision="bf16"):
     jobs = Jobs(backend, output)
 
     @asynccontextmanager
@@ -393,7 +393,7 @@ def create_app(backend, output, precision="fp32"):
     @app.get("/health")
     def health():
         return {"status": "ok", "backend": "native_cpp_cuda", "precision": precision,
-                "precision_status": "baseline" if precision == "fp32" else "experimental",
+                "precision_status": "default" if precision == "bf16" else "reference",
                 "torch_loaded": "torch" in sys.modules}
 
     @app.get("/v1/models")
@@ -487,7 +487,7 @@ if __name__ == "__main__":
     parser.add_argument("--text-encoder", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--precision", choices=["fp32", "bf16"], default="fp32")
+    parser.add_argument("--precision", choices=["fp32", "bf16"], default="bf16")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8007)
     args = parser.parse_args()
