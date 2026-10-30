@@ -26,9 +26,10 @@ option(UNIT_TEST "build unit tests" OFF)
 
 option(BUILD_HY_NOMAS "build the native HY-Nomas continuous-tensor backend" OFF)
 option(BUILD_QWEN_IMAGE "build native Qwen-Image-2.1" OFF)
+option(BUILD_LINGBOT_WORLD "build native LingBot-World 2.0" OFF)
 
-if((BUILD_HY_NOMAS OR BUILD_QWEN_IMAGE) AND NOT USE_CUDA)
-    message(FATAL_ERROR "BUILD_HY_NOMAS / BUILD_QWEN_IMAGE requires USE_CUDA=ON")
+if((BUILD_HY_NOMAS OR BUILD_QWEN_IMAGE OR BUILD_LINGBOT_WORLD) AND NOT USE_CUDA)
+    message(FATAL_ERROR "Continuous-tensor models require USE_CUDA=ON")
 endif()
 
 if(NOT DEFINED CUDA_ARCH)
@@ -643,11 +644,14 @@ if (USE_CUDA)
     set(CMAKE_CUDA_ARCHITECTURES ${FASTLLM_CUDA_ARCHITECTURES})
 endif()
 
-if(BUILD_HY_NOMAS OR BUILD_QWEN_IMAGE)
+if(BUILD_HY_NOMAS OR BUILD_QWEN_IMAGE OR BUILD_LINGBOT_WORLD)
     add_subdirectory(src/models/hy_nomas)
 endif()
 if(BUILD_QWEN_IMAGE)
     add_subdirectory(src/models/qwen_image)
+endif()
+if(BUILD_LINGBOT_WORLD)
+    add_subdirectory(src/models/lingbot_world)
 endif()
 
 if(USE_ROCM)

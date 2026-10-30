@@ -143,6 +143,8 @@ private:
     Weights weights_;
 };
 
+std::string normalizeNFC(const std::string &text);
+
 class QwenTokenizer {
 public:
     explicit QwenTokenizer(const std::string &directory);

@@ -121,6 +121,8 @@ std::vector<std::string> preTokens(const std::string &text) {
 }
 }
 
+std::string normalizeNFC(const std::string &text) { return nfc(text); }
+
 QwenTokenizer::QwenTokenizer(const std::string &directory) {
     std::ifstream f(directory+"/tokenizer.json"); if(!f) throw std::runtime_error("missing Qwen tokenizer.json");
     std::string data((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>()),err;
