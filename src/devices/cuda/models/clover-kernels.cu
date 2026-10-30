@@ -100,100 +100,129 @@ __global__ void CloverPreviewConv(const __nv_bfloat16 *input,
     output[row * channels + channel] = __float2bfloat16(sum / (1.f + expf(-sum)));
 }
 
-template<int FixedTokens>
+// A CTA evaluates several queries against the same head. Key normalization,
+// value loads and state loads are shared; each query keeps the original FP32
+// accumulation order and BF16 output boundary.
+template<int FixedTokens, int Queries>
 __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
         const __nv_bfloat16 *key, const __nv_bfloat16 *value, const float *g,
         const float *state, const float *logitScale, const float *historyBias,
         const float *historyScale, const int *slots, const unsigned char *valid,
         __nv_bfloat16 *output, int runtimeTokens, int keyHeads, int valueHeads, int qkStride, int vStride) {
-    const int tokens = FixedTokens ? FixedTokens : runtimeTokens;
     CloverDependencyStart();
-    constexpr int dim = 128;
-    const int request = blockIdx.z, token = blockIdx.x, head = blockIdx.y;
+    constexpr int dim = 128, Capacity = FixedTokens ? FixedTokens : 32;
+    const int tokens = FixedTokens ? FixedTokens : runtimeTokens;
+    const int request = blockIdx.z, first = blockIdx.x * Queries, head = blockIdx.y;
     const int d = threadIdx.x, lane = d % 32, warp = d / 32;
     const int keyHead = head / (valueHeads / keyHeads);
     const int slot = slots ? slots[request] : request;
-    const size_t row = (size_t)request * tokens + token;
-    const size_t outOffset = (row * valueHeads + head) * dim + d;
-    if (slot < 0 || (valid && !valid[row])) {
-        output[outOffset] = __float2bfloat16(0.f);
+    if (slot < 0) {
+#pragma unroll
+        for (int qi = 0; qi < Queries; ++qi)
+            output[(((size_t)request * tokens + first + qi) * valueHeads + head) * dim + d] = __float2bfloat16(0.f);
         return;
     }
-    __shared__ float q[dim], k[32][dim], weights[32], partial[4], historyWeight;
-    float qv = __bfloat162float(query[row * qkStride + keyHead * dim + d]);
-    float norm = WarpSum(qv * qv);
-    if (lane == 0) partial[warp] = norm;
+    __shared__ float q[Queries][dim], k[Capacity][dim], weights[Queries][Capacity];
+    __shared__ float partial[Queries][4], historyWeight[Queries], histories[Queries][dim];
+    float qv[Queries];
+#pragma unroll
+    for (int qi = 0; qi < Queries; ++qi) {
+        const size_t row = (size_t)request * tokens + first + qi;
+        qv[qi] = !valid || valid[row] ? __bfloat162float(query[row * qkStride + keyHead * dim + d]) : 0.f;
+        float sum = WarpSum(qv[qi] * qv[qi]);
+        if (lane == 0) partial[qi][warp] = sum;
+    }
     __syncthreads();
-    norm = rsqrtf(partial[0] + partial[1] + partial[2] + partial[3] + 1.e-6f);
-    q[d] = qv * norm;
-    // Four warps normalize independent key rows. Q/K stay in FP32 like the
-    // standalone reference; the cache and all output rounding are unchanged.
+#pragma unroll
+    for (int qi = 0; qi < Queries; ++qi)
+        q[qi][d] = qv[qi] * rsqrtf(partial[qi][0] + partial[qi][1] + partial[qi][2] + partial[qi][3] + 1.e-6f);
 #pragma unroll
     for (int t = warp; t < tokens; t += 4) {
         float v[4], sum = 0.f;
         const size_t offset = ((size_t)request * tokens + t) * qkStride + keyHead * dim;
+#pragma unroll
         for (int i = 0; i < 4; ++i) {
             v[i] = __bfloat162float(key[offset + lane + i * 32]);
             sum += v[i] * v[i];
         }
         const float inv = rsqrtf(WarpSum(sum) + 1.e-6f);
+#pragma unroll
         for (int i = 0; i < 4; ++i) k[t][lane + i * 32] = v[i] * inv;
     }
     __syncthreads();
+    float qs[Queries][4];
+#pragma unroll
+    for (int qi = 0; qi < Queries; ++qi)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) qs[qi][i] = q[qi][lane + i * 32];
 #pragma unroll
     for (int t = warp; t < tokens; t += 4) {
-        float dot = 0.f;
-        for (int i = 0; i < 4; ++i) dot += q[lane + i * 32] * k[t][lane + i * 32];
-        dot = WarpSum(dot);
-        if (lane == 0)
-            weights[t] = (!valid || valid[(size_t)request * tokens + t])
+        float dots[Queries] = {};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float kv = k[t][lane + i * 32];
+#pragma unroll
+            for (int qi = 0; qi < Queries; ++qi) dots[qi] += qs[qi][i] * kv;
+        }
+#pragma unroll
+        for (int qi = 0; qi < Queries; ++qi) {
+            float dot = WarpSum(dots[qi]);
+            if (lane == 0) weights[qi][t] = !valid || valid[(size_t)request * tokens + t]
                 ? dot * logitScale[head] : -CUDART_INF_F;
+        }
     }
     __syncthreads();
-    if (d == 0) {
+    if (d < Queries) {
         int count = 0;
 #pragma unroll
         for (int t = 0; t < tokens; ++t) count += !valid || valid[(size_t)request * tokens + t];
         const float historyLogit = historyBias[head] + historyScale[head] * logf(fmaxf(count, 1) / 32.f);
         float maximum = historyLogit;
 #pragma unroll
-        for (int t = 0; t < tokens; ++t) maximum = fmaxf(maximum, weights[t]);
+        for (int t = 0; t < tokens; ++t) maximum = fmaxf(maximum, weights[d][t]);
         const float historyExp = expf(historyLogit - maximum);
         float denominator = historyExp;
 #pragma unroll
         for (int t = 0; t < tokens; ++t) {
-            weights[t] = expf(weights[t] - maximum);
-            denominator += weights[t];
+            weights[d][t] = expf(weights[d][t] - maximum);
+            denominator += weights[d][t];
         }
 #pragma unroll
-        for (int t = 0; t < tokens; ++t) weights[t] /= denominator;
-        historyWeight = historyExp / denominator;
+        for (int t = 0; t < tokens; ++t) weights[d][t] /= denominator;
+        historyWeight[d] = historyExp / denominator;
     }
     __syncthreads();
-    // State is value-major. A warp cooperates on one value row so adjacent
-    // lanes read adjacent keys, instead of 128-byte-strided value columns.
-    __shared__ float histories[dim];
-    float qs[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) qs[i] = q[lane + i * 32];
-    // Reuse the query in registers and expose independent value rows to the
-    // instruction scheduler, preserving each row's FP32 reduction order.
 #pragma unroll 4
     for (int valueIndex = warp; valueIndex < dim; valueIndex += 4) {
         const size_t stateOffset = (((size_t)slot * valueHeads + head) * dim + valueIndex) * dim;
-        float sum = 0.f;
-        for (int i = 0; i < 4; ++i)
-            sum += qs[i] * state[stateOffset + lane + i * 32];
-        sum = WarpSum(sum);
-        if (lane == 0) histories[valueIndex] = sum;
+        float sums[Queries] = {};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float sv = state[stateOffset + lane + i * 32];
+#pragma unroll
+            for (int qi = 0; qi < Queries; ++qi) sums[qi] += qs[qi][i] * sv;
+        }
+#pragma unroll
+        for (int qi = 0; qi < Queries; ++qi) {
+            float sum = WarpSum(sums[qi]);
+            if (lane == 0) histories[qi][valueIndex] = sum;
+        }
     }
     __syncthreads();
-    float history = histories[d], local = 0.f;
+    float locals[Queries] = {};
 #pragma unroll
-    for (int t = 0; t < tokens; ++t)
-        local += weights[t] * __bfloat162float(value[((size_t)request * tokens + t) * vStride + head * dim + d]);
-    const float result = historyWeight * history * (1.f / sqrtf(128.f)) * expf(g[row * valueHeads + head]) + local;
-    output[outOffset] = __float2bfloat16(result);
+    for (int t = 0; t < tokens; ++t) {
+        const float v = __bfloat162float(value[((size_t)request * tokens + t) * vStride + head * dim + d]);
+#pragma unroll
+        for (int qi = 0; qi < Queries; ++qi) locals[qi] += weights[qi][t] * v;
+    }
+#pragma unroll
+    for (int qi = 0; qi < Queries; ++qi) {
+        const size_t row = (size_t)request * tokens + first + qi;
+        const float result = historyWeight[qi] * histories[qi][d] * (1.f / sqrtf(128.f)) *
+            expf(g[row * valueHeads + head]) + locals[qi];
+        output[(row * valueHeads + head) * dim + d] = __float2bfloat16(!valid || valid[row] ? result : 0.f);
+    }
 }
 
 bool ValidBlock(int batch, int tokens) {
@@ -467,19 +496,29 @@ bool FastllmCudaCloverPreviewGdn(const void *query, const void *key, const void 
         !ValidBlock(batch, tokens) || keyHeads <= 0 || valueHeads <= 0 || valueHeads > 65535 ||
         valueHeads % keyHeads || qkvRowStride < 0 || (qkvRowStride && qkvRowStride < valueHeads * 128))
         return false;
-    // Fixed block widths expose the loop bounds without changing FP32
-    // accumulation order. Short blocks retain the generic implementation.
-    auto launch = [&](auto fixed) {
-        return CloverLaunch<CloverPreviewGdn<decltype(fixed)::value>>(
-            dim3(tokens, valueHeads, batch), 128, 0, Stream(stream), static_cast<const __nv_bfloat16 *>(query),
-            static_cast<const __nv_bfloat16 *>(key), static_cast<const __nv_bfloat16 *>(value), g, state,
-            logitScale, historyBias, historyScale, slots, valid, static_cast<__nv_bfloat16 *>(output), tokens,
-            keyHeads, valueHeads, qkvRowStride ? qkvRowStride : keyHeads * 128,
+    auto launch = [&](auto width, auto count) {
+        constexpr int queries = decltype(count)::value;
+        return CloverLaunch<CloverPreviewGdn<decltype(width)::value, queries>>(
+            dim3(tokens / queries, valueHeads, batch), 128, 0, Stream(stream),
+            (const __nv_bfloat16 *)query, (const __nv_bfloat16 *)key, (const __nv_bfloat16 *)value,
+            g, state, logitScale, historyBias, historyScale, slots, valid, (__nv_bfloat16 *)output,
+            tokens, keyHeads, valueHeads, qkvRowStride ? qkvRowStride : keyHeads * 128,
             qkvRowStride ? qkvRowStride : valueHeads * 128);
     };
-    if (tokens == 16) return launch(std::integral_constant<int, 16>{});
-    if (tokens == 32) return launch(std::integral_constant<int, 32>{});
-    return launch(std::integral_constant<int, 0>{});
+    auto grouped = [&](auto width) {
+        // Reusing a small, hot state helps microbenchmarks but reduces CTA
+        // parallelism with cold model state. Keep one query per CTA for the
+        // common single-request 16-token block; wider blocks retain reuse.
+        if (batch == 1) {
+            if constexpr (decltype(width)::value == 16)
+                return launch(width, std::integral_constant<int, 1>{});
+            else return launch(width, std::integral_constant<int, 2>{});
+        }
+        return launch(width, std::integral_constant<int, 4>{});
+    };
+    if (tokens == 16) return grouped(std::integral_constant<int, 16>{});
+    if (tokens == 32) return grouped(std::integral_constant<int, 32>{});
+    return launch(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{});
 }
 
 bool FastllmCudaCloverCausalConv(const void *input, void *history, const void *weight, void *output,
