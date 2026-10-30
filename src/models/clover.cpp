@@ -329,11 +329,23 @@ void CloverModel::FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
     std::string p = Layer(layer) + "self_attn.";
     Data q, gate, qn, kn, attentionWorkspace;
     k.Reshape({t, num_key_value_heads, head_dim}); v.Reshape(k.dims);
-    qgate.Reshape({t, num_attention_heads, 2 * head_dim});
-    Split(qgate, 2, 0, head_dim, q); Split(qgate, 2, head_dim, 2 * head_dim, gate);
-    Norm(q, p + "q_norm.weight", qn); Norm(k, p + "k_norm.weight", kn);
-    Check(FastllmCudaCloverRotary(qn.cudaData, t, num_attention_heads, head_dim, rotary_dim, position, ropeTheta), "Q rotary failed");
-    Check(FastllmCudaCloverRotary(kn.cudaData, t, num_key_value_heads, head_dim, rotary_dim, position, ropeTheta), "K rotary failed");
+    if (t <= blockSize) {
+        auto &qw = weight[p + "q_norm.weight"], &kw = weight[p + "k_norm.weight"];
+        Check(qw.dataType == FLOAT32 && kw.dataType == FLOAT32 &&
+            qw.Count(0) == head_dim && kw.Count(0) == head_dim, "invalid Q/K normalization weights");
+        PrepareCloverData(qn, BFLOAT16, {t, num_attention_heads, head_dim}, cudaDevice);
+        PrepareCloverData(kn, BFLOAT16, k.dims, cudaDevice);
+        PrepareCloverData(gate, BFLOAT16, qn.dims, cudaDevice);
+        Check(FastllmCudaCloverPrepareAttention(qgate.cudaData, k.cudaData, (float *)qw.cudaData,
+            (float *)kw.cudaData, qn.cudaData, kn.cudaData, gate.cudaData, t, num_attention_heads,
+            num_key_value_heads, rotary_dim, position, ropeTheta, rms_norm_eps), "attention preparation failed");
+    } else {
+        qgate.Reshape({t, num_attention_heads, 2 * head_dim});
+        Split(qgate, 2, 0, head_dim, q); Split(qgate, 2, head_dim, 2 * head_dim, gate);
+        Norm(q, p + "q_norm.weight", qn); Norm(k, p + "k_norm.weight", kn);
+        Check(FastllmCudaCloverRotary(qn.cudaData, t, num_attention_heads, head_dim, rotary_dim, position, ropeTheta), "Q rotary failed");
+        Check(FastllmCudaCloverRotary(kn.cudaData, t, num_key_value_heads, head_dim, rotary_dim, position, ropeTheta), "K rotary failed");
+    }
     auto append = [&](Data &dst, const Data &src) {
         dst.dataType = BFLOAT16; dst.UpdateUnitSize();
         dst.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice});

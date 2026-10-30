@@ -67,6 +67,13 @@ bool FastllmCudaCloverUnpackGdn(const void *input, const float *aLog, const floa
 // In-place partial rotary on [T,H,D], with the reference's BF16 products.
 bool FastllmCudaCloverRotary(void *input, int tokens, int heads, int dim,
     int rotaryDim, int position, float theta, void *stream = nullptr);
+// Fixed 256-wide attention heads. Split [Q,gate] per head, zero-centered
+// Q/K RMSNorm, then partial RoPE, preserving the separate operators' rounding.
+// Q/gate outputs are [T,QH,256], key output is [T,KH,256]. Outputs must be distinct.
+bool FastllmCudaCloverPrepareAttention(const void *qgate, const void *key, const float *qWeight,
+    const float *kWeight, void *query, void *normalizedKey, void *gate, int tokens,
+    int queryHeads, int keyHeads, int rotaryDim, int position, float theta, float eps,
+    void *stream = nullptr);
 
 // Stable expert-id tie breaking. Scratch: [B,T,K] INT32 ids and FP32 scores,
 // plus [B,E] byte mask; only needed for preview coreset filtering.

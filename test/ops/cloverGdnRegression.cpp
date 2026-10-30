@@ -372,6 +372,57 @@ void Normalization(int rows, int width, bool gated, bool centered) {
     Check(cudaGraphLaunch(executable, cudaStreamPerThread)); check();
     Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
 }
+void AttentionPreparation(int tokens, int qh, int kh, int rotaryDim, int position) {
+    std::mt19937 rng(271 + tokens + position);
+    std::normal_distribution<float> normal(0.f, .7f);
+    const size_t qcount = (size_t)tokens * qh * 256, kcount = (size_t)tokens * kh * 256;
+    std::vector<uint16_t> qgate(qcount * 2), key(kcount), query(qcount), gate(qcount);
+    std::vector<float> qw(256), kw(256);
+    for (auto &x : qgate) x = BF16(normal(rng));
+    for (auto &x : key) x = BF16(normal(rng));
+    for (int i = 0; i < 256; ++i) { qw[i] = normal(rng); kw[i] = normal(rng); }
+    for (size_t row = 0; row < qcount / 256; ++row) for (int d = 0; d < 256; ++d) {
+        query[row * 256 + d] = qgate[row * 512 + d];
+        gate[row * 256 + d] = qgate[row * 512 + 256 + d];
+    }
+    Buffer qg(qgate.size() * 2), k(kcount * 2), q(qcount * 2), wq(1024), wk(1024),
+        refQ(qcount * 2), refK(kcount * 2), outQ((qcount + 128) * 2), outK((kcount + 128) * 2), outG((qcount + 128) * 2);
+    qg.Put(qgate); k.Put(key); q.Put(query); wq.Put(qw); wk.Put(kw);
+    std::vector<uint16_t> qGuard(qcount + 128, BF16(123.f)), kGuard(kcount + 128, BF16(123.f));
+    outQ.Put(qGuard); outG.Put(qGuard); outK.Put(kGuard);
+    Require(FastllmCudaCloverNorm(q.p, (float *)wq.p, nullptr, refQ.p, tokens * qh, 256, 1.e-6f, true), "reference Q norm");
+    Require(FastllmCudaCloverNorm(k.p, (float *)wk.p, nullptr, refK.p, tokens * kh, 256, 1.e-6f, true), "reference K norm");
+    Require(FastllmCudaCloverRotary(refQ.p, tokens, qh, 256, rotaryDim, position, 1.e7f), "reference Q rotary");
+    Require(FastllmCudaCloverRotary(refK.p, tokens, kh, 256, rotaryDim, position, 1.e7f), "reference K rotary");
+    auto launch = [&]() {
+        return FastllmCudaCloverPrepareAttention(qg.p, k.p, (float *)wq.p, (float *)wk.p,
+            (uint16_t *)outQ.p + 64, (uint16_t *)outK.p + 64, (uint16_t *)outG.p + 64,
+            tokens, qh, kh, rotaryDim, position, 1.e7f, 1.e-6f);
+    };
+    auto check = [&]() {
+        auto a = outQ.Get<uint16_t>(qGuard.size()), b = outK.Get<uint16_t>(kGuard.size()), c = outG.Get<uint16_t>(qGuard.size());
+        auto eq = refQ.Get<uint16_t>(qcount), ek = refK.Get<uint16_t>(kcount);
+        Require(std::equal(eq.begin(), eq.end(), a.begin() + 64), "fused Q norm/rotary differs");
+        Require(std::equal(ek.begin(), ek.end(), b.begin() + 64), "fused K norm/rotary differs");
+        Require(std::equal(gate.begin(), gate.end(), c.begin() + 64), "fused gate split differs");
+        for (int i = 0; i < 64; ++i) {
+            Require(a[i] == qGuard[i] && a[qcount + 64 + i] == qGuard[i] &&
+                c[i] == qGuard[i] && c[qcount + 64 + i] == qGuard[i] &&
+                b[i] == kGuard[i] && b[kcount + 64 + i] == kGuard[i], "attention preparation output guard");
+        }
+        Require(qg.Get<uint16_t>(qgate.size()) == qgate && k.Get<uint16_t>(key.size()) == key,
+            "attention preparation changed inputs");
+    };
+    Require(launch(), "fused attention preparation launch"); check();
+    cudaGraph_t graph; cudaGraphExec_t executable;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    Require(launch(), "fused attention preparation capture");
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    outQ.Put(qGuard); outG.Put(qGuard); outK.Put(kGuard);
+    Check(cudaGraphLaunch(executable, cudaStreamPerThread)); check();
+    Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
+}
 void Preview(int batch, int tokens, int kh, int vh, bool masked) {
     std::mt19937 rng(42 + tokens); std::normal_distribution<float> normal(0.f, .2f);
     auto random = [&](size_t n) { std::vector<uint16_t> x(n); for (auto &v : x) v = BF16(normal(rng)); return x; };
@@ -494,6 +545,10 @@ int main() {
             ResidualNormalization(17, width, centered);
         ResidualNormalization(1025, 128, true);
         ResidualNormalization(1025, 256, false);
+        for (int tokens : {1, 2, 16, 32, 257}) for (int rotary : {2, 64, 128, 256}) {
+            AttentionPreparation(tokens, 16, 2, rotary, 4096);
+            AttentionPreparation(tokens, 1, 1, rotary, 0);
+        }
         for (int tokens : {1, 2, 4, 8, 16, 32}) for (bool masked : {false, true}) {
             Preview(3, tokens, 2, 4, masked); Preview(1, tokens, 16, 32, masked);
         }

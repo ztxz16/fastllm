@@ -679,6 +679,43 @@ __global__ void CloverRotary(__nv_bfloat16 *input, int heads, int dim,
     input[p + rotaryDim / 2] = __float2bfloat16(yc + xs);
 }
 
+// Decode Q/gate split, Q/K RMSNorm and partial RoPE share one CTA per head.
+// Retain the 256-thread norm tree and every BF16 rounding boundary.
+__global__ void CloverPrepareAttention(const __nv_bfloat16 *qgate, const __nv_bfloat16 *key,
+        const float *qWeight, const float *kWeight, __nv_bfloat16 *query,
+        __nv_bfloat16 *normalizedKey, __nv_bfloat16 *gate, int queryHeads, int keyHeads,
+        int rotaryDim, int position, float theta, float eps) {
+    CloverDependencyStart();
+    constexpr int dim = 256;
+    const int d = threadIdx.x, token = blockIdx.y;
+    const bool isQuery = blockIdx.x < queryHeads;
+    const int head = isQuery ? blockIdx.x : blockIdx.x - queryHeads;
+    const size_t row = (size_t)token * (isQuery ? queryHeads : keyHeads) + head;
+    const auto *source = isQuery ? qgate + row * dim * 2 : key + row * dim;
+    const auto *weight = isQuery ? qWeight : kWeight;
+    auto *destination = (isQuery ? query : normalizedKey) + row * dim;
+    __shared__ float scratch[8];
+    __shared__ __nv_bfloat16 normalized[dim];
+    const float x = __bfloat162float(source[d]);
+    const float inv = rsqrtf(BlockSum(x * x, scratch) / dim + eps);
+    normalized[d] = __float2bfloat16(x * inv * (weight[d] + 1.f));
+    if (isQuery) gate[row * dim + d] = source[dim + d];
+    __syncthreads();
+    if (d >= rotaryDim) destination[d] = normalized[d];
+    if (d < rotaryDim / 2) {
+        float phase = (position + token) * (1.f / powf(theta, 2.f * d / rotaryDim));
+        float c = __bfloat162float(__float2bfloat16(cosf(phase)));
+        float s = __bfloat162float(__float2bfloat16(sinf(phase)));
+        float a = __bfloat162float(normalized[d]), b = __bfloat162float(normalized[d + rotaryDim / 2]);
+        float ac = __bfloat162float(__float2bfloat16(a * c));
+        float bs = __bfloat162float(__float2bfloat16(b * s));
+        float bc = __bfloat162float(__float2bfloat16(b * c));
+        float as = __bfloat162float(__float2bfloat16(a * s));
+        destination[d] = __float2bfloat16(ac - bs);
+        destination[d + rotaryDim / 2] = __float2bfloat16(bc + as);
+    }
+}
+
 // Stable 256-way bitonic sorting, using shuffle within a warp and shared
 // exchange only for the three cross-warp stages. No external kernel library.
 __device__ void CloverSort256(float &value, int &id, float *sharedValue, int *sharedId, int count) {
@@ -1171,6 +1208,18 @@ bool FastllmCudaCloverRotary(void *input, int tokens, int heads, int dim, int ro
     return CloverLaunch<CloverRotary>(dim3((heads * rotaryDim / 2 + 255) / 256, tokens), 256, 0,
                                       stream ? (cudaStream_t)stream : cudaStreamPerThread,
                                       (__nv_bfloat16 *)input, heads, dim, rotaryDim, position, theta);
+}
+bool FastllmCudaCloverPrepareAttention(const void *qgate, const void *key, const float *qWeight,
+        const float *kWeight, void *query, void *normalizedKey, void *gate, int tokens,
+        int queryHeads, int keyHeads, int rotaryDim, int position, float theta, float eps, void *stream) {
+    if (!qgate || !key || !qWeight || !kWeight || !query || !normalizedKey || !gate ||
+        tokens < 1 || tokens > 65535 || queryHeads < 1 || keyHeads < 1 ||
+        queryHeads > 65535 || keyHeads > 65535 || rotaryDim < 2 || rotaryDim > 256 ||
+        rotaryDim % 2 || position < 0 || theta <= 0.f || eps <= 0.f) return false;
+    return CloverLaunch<CloverPrepareAttention>(dim3(queryHeads + keyHeads, tokens), 256, 0, Stream(stream),
+        (const __nv_bfloat16 *)qgate, (const __nv_bfloat16 *)key, qWeight, kWeight,
+        (__nv_bfloat16 *)query, (__nv_bfloat16 *)normalizedKey, (__nv_bfloat16 *)gate,
+        queryHeads, keyHeads, rotaryDim, position, theta, eps);
 }
 bool FastllmCudaCloverRoute(const void *logits, int *indices, float *scores,
         int *scratchIds, float *scratchScores, unsigned char *allowed,
