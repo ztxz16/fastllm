@@ -1,0 +1,17 @@
+set_directory_properties(PROPERTIES COMPILE_OPTIONS "" COMPILE_DEFINITIONS "" INCLUDE_DIRECTORIES "")
+add_library(fastllm_minimax_h3 SHARED ops.cu transformer.cpp audio.cpp video.cpp text.cpp pipeline.cpp media.cpp)
+target_link_libraries(fastllm_minimax_h3 PUBLIC fastllm_continuous)
+target_compile_options(fastllm_minimax_h3 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+    $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+set_target_properties(fastllm_minimax_h3 PROPERTIES CUDA_STANDARD 17 CXX_STANDARD 17
+    CUDA_ARCHITECTURES "${FASTLLM_CUDA_ARCHITECTURES}" LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+add_executable(minimax_h3_generate ${PROJECT_SOURCE_DIR}/tools/minimax_h3/generate.cpp)
+target_link_libraries(minimax_h3_generate PRIVATE fastllm_minimax_h3)
+set_target_properties(minimax_h3_generate PROPERTIES CXX_STANDARD 17)
+if(UNIT_TEST)
+    add_library(minimax_h3_reference SHARED ${PROJECT_SOURCE_DIR}/test/minimax_h3/reference_bridge.cpp)
+    target_link_libraries(minimax_h3_reference PRIVATE fastllm_minimax_h3)
+    set_target_properties(minimax_h3_reference PROPERTIES CXX_STANDARD 17
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
