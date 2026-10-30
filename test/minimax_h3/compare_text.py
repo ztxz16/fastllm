@@ -19,21 +19,24 @@ p.add_argument("--model", default="/model")
 p.add_argument("--library", required=True)
 p.add_argument("--output", required=True)
 p.add_argument("--prompt", default="A cat plays piano on a wooden stage. The audience applauds.")
+p.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
 a = p.parse_args()
+fp32 = a.precision == "fp32"
 root = Path(a.model)
 out = Path(a.output)
 out.mkdir(parents=True, exist_ok=True)
 cfg = json.loads((root / "text_encoder/config.json").read_text())["text_config"]
 cfg["num_hidden_layers"] = 50
 cfg["_attn_implementation"] = "sdpa"
-dtype = torch.float32
+dtype = torch.float32 if fp32 else torch.bfloat16
 torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 with torch.device("meta"):
     encoder = Qwen3VLTextModel(Qwen3VLTextConfig(**cfg))
 index = json.loads((root / "text_encoder/model.safetensors.index.json").read_text())["weight_map"]
 
 
-# FP32 diagnostics stream one layer at a time to stay within the single GPU.
+# Stream the reference one layer at a time for both precisions.
 def load(module, prefix):
     state = {}
     for name in module.state_dict():
@@ -69,7 +72,7 @@ lib = ctypes.CDLL(a.library)
 fp = ctypes.POINTER(ctypes.c_float)
 ip = ctypes.POINTER(ctypes.c_int)
 lib.h3_error.restype = ctypes.c_char_p
-lib.h3_text_encode.argtypes = [ctypes.c_char_p, ip, ctypes.c_int, ctypes.c_char_p, fp]
+lib.h3_text_encode.argtypes = [ctypes.c_char_p, ip, ctypes.c_int, ctypes.c_char_p, fp, ctypes.c_int]
 host = np.array(tokens, dtype=np.int32)
 native = np.empty_like(reference)
 if lib.h3_text_encode(
@@ -78,6 +81,7 @@ if lib.h3_text_encode(
     len(tokens),
     str(out).encode(),
     native.ctypes.data_as(fp),
+    fp32,
 ):
     raise RuntimeError(lib.h3_error().decode())
 report = {}
@@ -92,4 +96,4 @@ for name, ref in values.items():
 (out / "tokens.json").write_text(json.dumps(tokens))
 (out / "report.json").write_text(json.dumps(report, indent=2))
 print(json.dumps(report, indent=2))
-assert report["layer.49"]["relative_l2"] < 1e-5, report
+assert report["layer.49"]["relative_l2"] < (1e-5 if fp32 else 1e-2), report

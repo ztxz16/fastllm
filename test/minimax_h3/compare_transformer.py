@@ -25,8 +25,10 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--rows", type=int, default=67)
+    parser.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
     parser.add_argument("--attention-backend", choices=["auto", "math"], default="auto")
     args = parser.parse_args()
+    fp32 = args.precision == "fp32"
     if args.attention_backend == "math":
         torch.backends.cuda.enable_flash_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)
@@ -36,8 +38,9 @@ def main():
     root = Path(args.model)
     cfg = json.loads((root / "config.json").read_text())
     index = json.loads((root / "diffusion_pytorch_model.safetensors.index.json").read_text())["weight_map"]
-    dtype = torch.float32
+    dtype = torch.float32 if fp32 else torch.bfloat16
     torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.manual_seed(1701)
 
     def load(module, prefix, target_dtype):
@@ -128,7 +131,7 @@ def main():
     fp = ctypes.POINTER(ctypes.c_float)
     ip = ctypes.POINTER(ctypes.c_int)
     lib.h3_error.restype = ctypes.c_char_p
-    lib.h3_create.argtypes = [ctypes.c_char_p]
+    lib.h3_create.argtypes = [ctypes.c_char_p, ctypes.c_int]
     lib.h3_create.restype = ctypes.c_void_p
     lib.h3_destroy.argtypes = [ctypes.c_void_p]
     lib.h3_block.argtypes = [
@@ -143,7 +146,7 @@ def main():
         ctypes.c_char_p,
         fp,
     ]
-    handle = lib.h3_create(str(root).encode())
+    handle = lib.h3_create(str(root).encode(), int(fp32))
     if not handle:
         raise RuntimeError(lib.h3_error().decode())
     result = np.empty_like(host_x)
@@ -179,7 +182,7 @@ def main():
         reference.tofile(output / f"{name}.reference.f32")
     (output / "report.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
-    assert report["output"]["relative_l2"] < 1e-4, report
+    assert report["output"]["relative_l2"] < (1e-4 if fp32 else 1e-2), report
 
 
 if __name__ == "__main__":

@@ -8,16 +8,6 @@
 
 namespace fastllm {
 namespace minimax_h3 {
-namespace {
-Tensor timeProjection(Runtime &rt, Weights &weights, const Tensor &input, const std::string &prefix) {
-    // Each T2VA forward has at most two distinct noise levels. Keep that GEMM
-    // shape while caching the whole schedule, rather than changing its reduction.
-    std::vector<Tensor> rows;
-    for (int first = 0; first < input.rows; first += 2)
-        rows.push_back(weights.linear(input.rowSlice(first, std::min(2, input.rows - first)), prefix));
-    return rows.size() == 1 ? rows[0] : rt.concat(rows);
-}
-} // namespace
 std::string componentWeights(const std::string &dir) {
     for (const char *name : {"diffusion_pytorch_model.safetensors", "model.safetensors"})
         if (std::filesystem::is_regular_file(dir + "/" + name))
@@ -80,16 +70,20 @@ void PackedLayout::validate(int count) const {
         if (!seen[i] || timeIndices[i] < 0 || timeIndices[i] >= count)
             throw std::invalid_argument("invalid H3 timestep indices");
 }
-Transformer::Transformer(Runtime &rt, const std::string &dir)
-    : rt_(rt), weights_(rt, componentWeights(dir)), config_(dir) {}
-Tensor Transformer::timeEmbedding(const std::vector<float> &times) {
-    auto x = rt_.timestepEmbedding(times, config_.freqDim);
-    x = rt_.activation(timeProjection(rt_, weights_, x, "time_embedder.linear_1"));
-    return timeProjection(rt_, weights_, x, "time_embedder.linear_2");
+Transformer::Transformer(Runtime &rt, Runtime &fp32, const std::string &dir)
+    : rt_(rt), fp32_(fp32), weights_(rt, componentWeights(dir)), fullWeights_(fp32, componentWeights(dir)),
+      config_(dir) {
+    if (!fp32.isFloat32())
+        throw std::invalid_argument("H3 projection runtime must be FP32");
 }
-Tensor Transformer::modulation(int layer, const Tensor &temb) {
+Tensor Transformer::timeEmbedding(const std::vector<float> &times) {
+    auto x = fp32_.timestepEmbedding(times, config_.freqDim);
+    x = fp32_.activation(fullWeights_.linear(x, "time_embedder.linear_1"));
+    return fullWeights_.linear(x, "time_embedder.linear_2");
+}
+Tensor Transformer::projectModulation(int layer, const Tensor &input) {
     auto p = "transformer_blocks." + std::to_string(layer) + ".adaln_proj.linear";
-    auto x = timeProjection(rt_, weights_, rt_.activation(temb), p);
+    auto x = weights_.linear(input, p);
     x.rows *= 3;
     x.cols /= 3;
     return x;
@@ -124,7 +118,7 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
     return chunks.size() == 1 ? chunks[0] : rt_.concat(chunks);
 }
 Tensor Transformer::refine(const Tensor &input) {
-    auto x = weights_.linear(input, "context_embedder");
+    auto x = weights_.linear(rt_.cast(input, rt_.isFloat32()), "context_embedder");
     for (int i = 0; i < config_.refiners; ++i) {
         auto p = "token_refiner.refiner_blocks." + std::to_string(i);
         x = rt_.add(x,
@@ -158,19 +152,31 @@ Tensor Transformer::block(int layer, const Tensor &input, const Tensor &mod, con
         trace("ff_out", x);
     return rt_.residualRows(residual, x, mod, idx, 5);
 }
-void Transformer::prepare(const std::vector<float> &times, std::function<void(int, int)> progress) {
+void Transformer::prepare(const std::vector<std::vector<float>> &plans,
+                          std::function<void(int, int)> progress) {
+    if (plans.empty())
+        throw std::invalid_argument("empty H3 timestep plans");
     modulation_.clear();
-    auto temb = timeEmbedding(times);
+    // Keep each forward's GEMM batch size, including the first one-row plan.
+    // Combining plans can select a different cuBLAS reduction and change BF16 rounding.
+    std::vector<Tensor> inputs;
+    for (const auto &times : plans)
+        inputs.push_back(rt_.cast(fp32_.activation(timeEmbedding(times)), rt_.isFloat32()));
     for (int i = 0; i < config_.layers; ++i) {
         if (progress)
             progress(i, config_.layers);
-        modulation_.push_back(modulation(i, temb));
+        std::vector<Tensor> rows;
+        for (const auto &input : inputs)
+            rows.push_back(projectModulation(i, input));
+        modulation_.push_back(rows.size() == 1 ? rows[0] : rt_.concat(rows));
         weights_.erasePrefix("transformer_blocks." + std::to_string(i) + ".adaln_proj.");
     }
-    outputModulation_ = timeProjection(rt_, weights_, rt_.activation(temb), "norm_out.linear");
+    std::vector<Tensor> rows;
+    for (const auto &input : inputs)
+        rows.push_back(weights_.linear(input, "norm_out.linear"));
+    outputModulation_ = rows.size() == 1 ? rows[0] : rt_.concat(rows);
     weights_.erasePrefix("norm_out.linear.");
-    // Reuse spare VRAM across denoising steps without changing FP32 arithmetic.
-    // Enable only after the one-use AdaLN weights have been discarded.
+    // FP32 diagnostics can reuse packed weights across steps; BF16 weights stay resident.
     weights_.enablePackedCache(size_t(16) << 30);
 }
 std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor &audio, const Tensor &text,
@@ -182,10 +188,10 @@ std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor
         text.rows != int(layout.text.size()))
         throw std::invalid_argument("H3 input row counts disagree with layout");
     auto vi = rt_.indices(layout.video), ai = rt_.indices(layout.audio), ti = rt_.indices(layout.text);
-    Tensor x(layout.tags.size(), config_.hidden, true);
+    Tensor x(layout.tags.size(), config_.hidden, rt_.isFloat32());
     rt_.scatter(x, refine(text), ti);
-    rt_.scatter(x, weights_.linear(video, "proj_in"), vi);
-    rt_.scatter(x, weights_.linear(audio, "audio_proj_in"), ai);
+    rt_.scatter(x, rt_.cast(fullWeights_.linear(video, "proj_in"), x.fp32), vi);
+    rt_.scatter(x, rt_.cast(fullWeights_.linear(audio, "audio_proj_in"), x.fp32), ai);
     auto rope = rt_.ropeTable(layout.positions, config_.ropeFreq, config_.ropeTheta);
     auto adaln = layout.timeIndices;
     for (size_t i = 0; i < adaln.size(); ++i)
@@ -195,15 +201,17 @@ std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor
         x = block(i, x, modulation_[i], idx, rope.first, rope.second);
         if (trace)
             trace("block." + std::to_string(i), x);
-        weights_.erasePrefix("transformer_blocks." + std::to_string(i) + ".");
+        if (rt_.isFloat32())
+            weights_.erasePrefix("transformer_blocks." + std::to_string(i) + ".");
     }
     x = rt_.rms(x, weights_.get("norm_out.norm.weight"), config_.finalEps);
     x = rt_.modulateRows(x, outputModulation_, rt_.indices(layout.timeIndices), 0, 1);
-    return {weights_.linear(rt_.gather(x, vi), "proj_out"),
-            weights_.linear(rt_.gather(x, ai), "audio_proj_out")};
+    return {fullWeights_.linear(rt_.cast(rt_.gather(x, vi), true), "proj_out"),
+            fullWeights_.linear(rt_.cast(rt_.gather(x, ai), true), "audio_proj_out")};
 }
 void Transformer::unload() {
     weights_.clear();
+    fullWeights_.clear();
     modulation_.clear();
     outputModulation_ = {};
 }

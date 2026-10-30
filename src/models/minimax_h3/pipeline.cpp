@@ -72,9 +72,10 @@ PackedLayout textToVideoLayout(int nt, int frames, int h, int w, int audio) {
     }
     return out;
 }
-Pipeline::Pipeline(const std::string &dir, int device)
-    : rt_(device), tokenizer_(dir + "/tokenizer"), text_(rt_, dir + "/text_encoder"),
-      transformer_(rt_, dir + "/transformer"), video_(rt_, dir + "/vae"), audio_(rt_, dir + "/audio_vae") {
+Pipeline::Pipeline(const std::string &dir, int device, bool fp32)
+    : rt_(device, fp32), full_(device, true), tokenizer_(dir + "/tokenizer"),
+      text_(rt_, dir + "/text_encoder"), transformer_(rt_, full_, dir + "/transformer"),
+      video_(full_, dir + "/vae"), audio_(full_, dir + "/audio_vae") {
     auto stats = [&](const std::string &path, int channels, std::vector<float> &mean,
                      std::vector<float> &std) {
         std::ifstream file(path + "/config.json");
@@ -135,7 +136,8 @@ Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace
             for (auto &v : audio)
                 v = normal(rng);
         // Initial video fixture uses packed [T,H/2,W/2,C,2,2] layout, matching transformer rows.
-        auto v = rt_.upload(video.data(), layout.video.size(), 96), a = rt_.upload(audio.data(), at * 2, 32);
+        auto v = full_.upload(video.data(), layout.video.size(), 96),
+             a = full_.upload(audio.data(), at * 2, 32);
         if (trace) {
             trace("initial_video", v);
             trace("initial_audio", a);
@@ -143,19 +145,24 @@ Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace
         auto vs = sigmaSchedule(o.steps, 12), as = sigmaSchedule(o.steps, 3);
         if (vs.size() != as.size())
             throw std::runtime_error("H3 audio/video schedule lengths differ");
-        std::vector<float> times;
+        std::vector<std::vector<float>> plans;
+        std::vector<std::pair<int, int>> timeIndices;
+        int offset = 0;
         for (size_t i = 0; i + 1 < vs.size(); ++i) {
-            times.push_back(1.f - vs[i]);
-            times.push_back(1.f - as[i]);
+            std::vector<float> times{1.f - vs[i], 1.f - as[i]};
+            std::sort(times.begin(), times.end());
+            times.erase(std::unique(times.begin(), times.end()), times.end());
+            int vi = offset + std::lower_bound(times.begin(), times.end(), 1.f - vs[i]) - times.begin();
+            int ai = offset + std::lower_bound(times.begin(), times.end(), 1.f - as[i]) - times.begin();
+            timeIndices.emplace_back(vi, ai);
+            offset += times.size();
+            plans.push_back(std::move(times));
         }
-        std::sort(times.begin(), times.end());
-        times.erase(std::unique(times.begin(), times.end()), times.end());
         tick("prepare", 0, 50);
-        transformer_.prepare(times, [&](int current, int total) { tick("prepare", current, total); });
+        transformer_.prepare(plans, [&](int current, int total) { tick("prepare", current, total); });
         tick("prepare", 50, 50);
         for (size_t i = 0; i + 1 < vs.size(); ++i) {
-            int vi = std::lower_bound(times.begin(), times.end(), 1.f - vs[i]) - times.begin();
-            int ai = std::lower_bound(times.begin(), times.end(), 1.f - as[i]) - times.begin();
+            auto [vi, ai] = timeIndices[i];
             for (size_t row = 0; row < layout.tags.size(); ++row)
                 layout.timeIndices[row] = layout.tags[row] == 2 ? ai : vi;
             tick("denoise", i, vs.size() - 1);
@@ -163,15 +170,15 @@ Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace
                 transformer_.forward(v, a, text, layout, [&](const std::string &, const Tensor &) {
                     tick("denoise", i, vs.size() - 1);
                 });
-            v = rt_.step(v, velocity.first, 1.f - vs[i], vs[i], vs[i + 1]);
-            a = rt_.step(a, velocity.second, 1.f - as[i], as[i], as[i + 1]);
+            v = full_.step(v, velocity.first, 1.f - vs[i], vs[i], vs[i + 1]);
+            a = full_.step(a, velocity.second, 1.f - as[i], as[i], as[i + 1]);
             if (trace) {
                 trace("video_step." + std::to_string(i), v);
                 trace("audio_step." + std::to_string(i), a);
             }
         }
-        video = rt_.download(v);
-        audio = rt_.download(a);
+        video = full_.download(v);
+        audio = full_.download(a);
         v = {};
         a = {};
         text = {};
@@ -212,8 +219,8 @@ Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace
             for (int t = 0; t < at; ++t)
                 for (int c = 0; c < 32; ++c)
                     first[t * 32 + c] = first[t * 32 + c] * audioStd_[c] + audioMean_[c];
-            auto samples = rt_.download(
-                audio_.decode(rt_.upload(first, at, 32), [&](const std::string &, const Tensor &) {
+            auto samples = full_.download(
+                audio_.decode(full_.upload(first, at, 32), [&](const std::string &, const Tensor &) {
                     tick("audio_decode", channel, 2);
                 }));
             for (size_t i = 0; i < samples.size(); ++i)

@@ -1,4 +1,4 @@
-"""FP32 end-to-end differential test using identical native/reference noise tensors.
+"""Mixed-precision end-to-end differential test using identical native/reference noise tensors.
 
 Run compare_text.py for this prompt first. Reference-only dependencies stay
 outside the inference server. Both paths stream layers on the same selected GPU.
@@ -33,7 +33,8 @@ assert torch.cuda.device_count() == 1, "Expose only the permitted GPU"
 p = argparse.ArgumentParser()
 p.add_argument("--model", default="/model")
 p.add_argument("--binary", required=True)
-p.add_argument("--text-fixture", default="/work/text-fp32")
+p.add_argument("--text-fixture")
+p.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
 p.add_argument("--output", required=True)
 p.add_argument("--width", type=int, default=64)
 p.add_argument("--height", type=int, default=64)
@@ -57,14 +58,19 @@ configuration = {
     "frames": a.frames,
     "steps": a.steps,
     "attention_backend": a.attention_backend,
+    "precision": a.precision,
 }
 manifest = out / "reference-config.json"
 if a.skip_reference:
     assert manifest.exists(), "Reference manifest missing; regenerate the reference"
-    assert json.loads(manifest.read_text()) == configuration, "Reference configuration mismatch"
+    saved = json.loads(manifest.read_text())
+    saved.setdefault("precision", "fp32")
+    assert saved == configuration, "Reference configuration mismatch"
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
-text_dir = Path(a.text_fixture)
+dtype = torch.float32 if a.precision == "fp32" else torch.bfloat16
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+text_dir = Path(a.text_fixture or f"/work/text-{a.precision}")
 tokens = json.loads((text_dir / "tokens.json").read_text())
 nt = len(tokens)
 lt = (a.frames - 5) // 17 * 5 + 2
@@ -104,7 +110,12 @@ if not a.skip_reference:
         for name in module.state_dict():
             key = prefix + name
             with safe_open(str(root / "transformer" / index[key]), framework="pt", device="cpu") as f:
-                state[name] = f.get_tensor(key).cuda().float()
+                target = (
+                    torch.float32
+                    if any(s in key for s in MiniMaxH3Transformer3DModel._keep_in_fp32_modules)
+                    else dtype
+                )
+                state[name] = f.get_tensor(key).to(device="cuda", dtype=target)
         module.load_state_dict(state, assign=True)
 
     for name, child in transformer.named_children():
@@ -178,6 +189,8 @@ native.mkdir(exist_ok=True)
 subprocess.run(
     [
         a.binary,
+        "--precision",
+        a.precision,
         "--model",
         str(root),
         "--prompt",

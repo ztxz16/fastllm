@@ -12,6 +12,7 @@ int main(int argc, char **argv) {
         std::string model, output = "minimax-h3.mp4", ffmpeg = "ffmpeg", traceDirectory, initialVideo,
                            initialAudio;
         int device = 0;
+        bool fp32 = false;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (i + 1 >= argc)
@@ -39,7 +40,11 @@ int main(int argc, char **argv) {
                 device = std::stoi(v);
             else if (arg == "--trace")
                 traceDirectory = v;
-            else if (arg == "--initial-video")
+            else if (arg == "--precision") {
+                if (v != "fp32" && v != "bf16")
+                    throw std::invalid_argument("precision must be fp32 or bf16");
+                fp32 = v == "fp32";
+            } else if (arg == "--initial-video")
                 initialVideo = v;
             else if (arg == "--initial-audio")
                 initialAudio = v;
@@ -51,7 +56,7 @@ int main(int argc, char **argv) {
         options.validate();
         if (!traceDirectory.empty())
             std::filesystem::create_directories(traceDirectory);
-        Runtime reader(device);
+        Runtime reader(device, true);
         auto trace = [&](const std::string &name, const Tensor &x) {
             if (traceDirectory.empty())
                 return;
@@ -79,9 +84,10 @@ int main(int argc, char **argv) {
             return out;
         };
         auto video = read(initialVideo), audio = read(initialAudio);
-        Pipeline pipeline(model, device);
+        Pipeline pipeline(model, device, fp32);
         std::string last;
         int current = -1;
+        std::cerr << "Precision: " << (fp32 ? "fp32" : "bf16") << "\n";
         auto start = std::chrono::steady_clock::now();
         auto result = pipeline.generate(
             options,

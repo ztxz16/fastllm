@@ -11,7 +11,8 @@ using Trace = std::function<void(const std::string &, const Tensor &)>;
 
 class Runtime : public nomas::Runtime {
   public:
-    explicit Runtime(int device) : nomas::Runtime(device, true) {}
+    explicit Runtime(int device, bool fp32 = false) : nomas::Runtime(device, fp32) {}
+    Tensor cast(const Tensor &, bool fp32);
     Tensor rms(const Tensor &, const Tensor &weight, float eps, int width = 0);
     Tensor indices(const std::vector<int> &);
     Tensor gather(const Tensor &, const Tensor &indices);
@@ -47,14 +48,15 @@ struct PackedLayout {
 
 class Transformer {
   public:
-    Transformer(Runtime &, const std::string &directory);
+    Transformer(Runtime &, Runtime &fp32, const std::string &directory);
     const TransformerConfig &config() const { return config_; }
     Tensor timeEmbedding(const std::vector<float> &times);
-    Tensor modulation(int layer, const Tensor &temb);
+    // input is SiLU(temb), rounded to the main runtime's dtype after activation.
+    Tensor projectModulation(int layer, const Tensor &input);
     Tensor block(int layer, const Tensor &, const Tensor &mod, const Tensor &indices, const Tensor &cos,
                  const Tensor &sin, Trace trace = {});
     // Precompute all timestep/modality tables, freeing the large AdaLN weights layer by layer.
-    void prepare(const std::vector<float> &times, std::function<void(int, int)> progress = {});
+    void prepare(const std::vector<std::vector<float>> &plans, std::function<void(int, int)> progress = {});
     std::pair<Tensor, Tensor> forward(const Tensor &video, const Tensor &audio, const Tensor &text,
                                       const PackedLayout &, Trace trace = {});
     void unload();
@@ -64,8 +66,8 @@ class Transformer {
                      const Tensor *sin = nullptr, Trace trace = {});
     Tensor feedForward(const Tensor &, const std::string &);
     Tensor refine(const Tensor &);
-    Runtime &rt_;
-    Weights weights_;
+    Runtime &rt_, &fp32_;
+    Weights weights_, fullWeights_;
     TransformerConfig config_;
     std::vector<Tensor> modulation_;
     Tensor outputModulation_;
@@ -135,13 +137,13 @@ PackedLayout textToVideoLayout(int textTokens, int latentFrames, int latentHeigh
 std::vector<float> sigmaSchedule(int steps, float shift);
 class Pipeline {
   public:
-    Pipeline(const std::string &directory, int device);
+    Pipeline(const std::string &directory, int device, bool fp32 = false);
     Generation generate(const GenerateOptions &, Progress progress = {}, Trace trace = {},
                         const std::vector<float> *initialVideo = nullptr,
                         const std::vector<float> *initialAudio = nullptr);
 
   private:
-    Runtime rt_;
+    Runtime rt_, full_;
     nomas::QwenTokenizer tokenizer_;
     TextEncoder text_;
     Transformer transformer_;

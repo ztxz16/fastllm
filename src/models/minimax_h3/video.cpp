@@ -1,5 +1,6 @@
 #include "models/minimax_h3/runtime.h"
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 
 namespace fastllm {

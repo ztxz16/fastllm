@@ -6,9 +6,9 @@ using namespace fastllm::minimax_h3;
 namespace {
 thread_local std::string error;
 struct Model {
-    Runtime runtime;
+    Runtime runtime, full;
     Transformer transformer;
-    explicit Model(const char *path) : runtime(0), transformer(runtime, path) {}
+    Model(const char *path, bool fp32) : runtime(0, fp32), full(0, true), transformer(runtime, full, path) {}
 };
 void save(Runtime &rt, const Tensor &x, const std::string &path) {
     auto data = rt.download(x);
@@ -54,9 +54,9 @@ int h3_schedule(int steps, float shift, float *output) {
         return -1;
     }
 }
-void *h3_create(const char *path) {
+void *h3_create(const char *path, int fp32) {
     try {
-        return new Model(path);
+        return new Model(path, fp32);
     } catch (const std::exception &e) {
         error = e.what();
         return nullptr;
@@ -72,7 +72,7 @@ int h3_block(void *p, int layer, int rows, int timeCount, const float *input, co
         const auto &cfg = dit.config();
         auto x = rt.upload(input, rows, cfg.hidden);
         auto temb = dit.timeEmbedding(std::vector<float>(times, times + timeCount));
-        auto mod = dit.modulation(layer, temb);
+        auto mod = dit.projectModulation(layer, rt.cast(m.full.activation(temb), rt.isFloat32()));
         auto rope =
             rt.ropeTable(std::vector<float>(positions, positions + rows * 3), cfg.ropeFreq, cfg.ropeTheta);
         auto trace = [&](const std::string &name, const Tensor &value) {
@@ -86,6 +86,7 @@ int h3_block(void *p, int layer, int rows, int timeCount, const float *input, co
         auto result = dit.block(layer, x, mod, rt.indices(std::vector<int>(indices, indices + rows)),
                                 rope.first, rope.second, trace);
         auto host = rt.download(result);
+        dit.unload();
         std::copy(host.begin(), host.end(), output);
         return 0;
     } catch (const std::exception &e) {
@@ -95,7 +96,7 @@ int h3_block(void *p, int layer, int rows, int timeCount, const float *input, co
 }
 int h3_audio_decode(const char *model, int rows, const float *input, const char *directory, float *output) {
     try {
-        Runtime rt(0);
+        Runtime rt(0, true);
         AudioVAE vae(rt, model);
         auto trace = [&](const std::string &name, const Tensor &x) {
             if (directory && *directory)
@@ -115,7 +116,7 @@ int h3_audio_decode(const char *model, int rows, const float *input, const char 
 int h3_video_decode(const char *model, int frames, int height, int width, const float *input,
                     const char *directory, float *output, int tiled) {
     try {
-        Runtime rt(0);
+        Runtime rt(0, true);
         VideoVAE vae(rt, model);
         auto trace = [&](const std::string &name, const Tensor &x) {
             if (directory && *directory)
@@ -138,9 +139,10 @@ int h3_video_decode(const char *model, int frames, int height, int width, const 
         return -1;
     }
 }
-int h3_text_encode(const char *model, const int *tokens, int count, const char *directory, float *output) {
+int h3_text_encode(const char *model, const int *tokens, int count, const char *directory, float *output,
+                   int fp32) {
     try {
-        Runtime rt(0);
+        Runtime rt(0, fp32);
         TextEncoder encoder(rt, model);
         auto trace = [&](const std::string &name, const Tensor &x) {
             if (directory && *directory)
@@ -157,10 +159,11 @@ int h3_text_encode(const char *model, const int *tokens, int count, const char *
 }
 int h3_transformer(const char *model, int nt, int na, int nv, int timeCount, const float *text,
                    const float *audio, const float *video, const float *times, const int *indices,
-                   const float *positions, const char *directory, float *outVideo, float *outAudio) {
+                   const float *positions, const char *directory, float *outVideo, float *outAudio,
+                   int fp32) {
     try {
-        Runtime rt(0);
-        Transformer dit(rt, model);
+        Runtime rt(0, fp32), full(0, true);
+        Transformer dit(rt, full, model);
         PackedLayout layout;
         int n = nt + na + nv;
         layout.timeIndices.assign(indices, indices + n);
@@ -177,12 +180,12 @@ int h3_transformer(const char *model, int nt, int na, int nv, int timeCount, con
                 layout.tags.push_back(0);
             }
         }
-        dit.prepare(std::vector<float>(times, times + timeCount));
+        dit.prepare({std::vector<float>(times, times + timeCount)});
         auto trace = [&](const std::string &name, const Tensor &x) {
             if (directory && *directory)
                 save(rt, x, std::string(directory) + "/" + name + ".f32");
         };
-        auto result = dit.forward(rt.upload(video, nv, 96), rt.upload(audio, na, 32),
+        auto result = dit.forward(full.upload(video, nv, 96), full.upload(audio, na, 32),
                                   rt.upload(text, nt, 5120), layout, trace);
         auto v = rt.download(result.first), a = rt.download(result.second);
         std::copy(v.begin(), v.end(), outVideo);
