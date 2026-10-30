@@ -1,4 +1,5 @@
 #include "clover.h"
+#include "utils/recurrent_prefix_cache.h"
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -37,6 +38,22 @@ bool Boolean(const json11::Json &j, const char *key, bool value) {
 }
 }
 
+struct CloverModel::PrefixCache {
+    struct KVChunk {
+        int begin = 0, end = 0;
+        std::shared_ptr<const KVChunk> previous;
+        std::vector<std::pair<Data, Data>> layers;
+    };
+    struct Snapshot : RecurrentPrefixKey {
+        DataType type = BFLOAT16;
+        std::shared_ptr<const KVChunk> kv;
+        std::vector<std::pair<Data, Data>> recurrent;
+        Data logits;
+    };
+    std::vector<std::unique_ptr<Snapshot>> items;
+    long long timestamp = 0;
+};
+
 struct CloverModel::Request {
     CloverOptions options;
     std::vector<int> counts, stops, block, commit;
@@ -47,6 +64,10 @@ struct CloverModel::Request {
     CloverSnapshots snapshots;
     Data countsGpu, stopsGpu, biasGpu, candidatesGpu, statsGpu, statsWorkspace;
     int countsVersion = -1;
+    bool prefixChecked = false;
+    int restoredTokens = 0, lastSavedLength = 0;
+    long long cacheRequestId = 0;
+    std::shared_ptr<const PrefixCache::KVChunk> savedKV;
 #ifdef USE_CUDA
     void Upload(CloverModel &m, Data &data, DataType type, const std::vector<int> &dims, const void *source) {
         data.dataType = type; data.UpdateUnitSize(); data.Resize(dims);
@@ -118,6 +139,121 @@ struct CloverModel::Request {
     }
 #endif
 };
+
+void CloverModel::LoadPrefix(ResponseContext &ctx, Request &r, Data &logits) {
+    r.prefixChecked = true;
+    if (!RecurrentPrefixCacheEnabled()) {
+        prefixCache.reset();
+        return;
+    }
+    if (!prefixCache) return;
+#ifdef USE_CUDA
+    EnsureResident();
+    auto *snapshot = FindRecurrentPrefix(prefixCache->items, ctx.currentTokens,
+        int(ctx.currentTokens.size()), -1, [&](const PrefixCache::Snapshot &s) {
+            return s.type == dataType && (!r.options.speculative ||
+                s.cachedLen < int(ctx.currentTokens.size()) || !s.logits.dims.empty());
+        });
+    if (!snapshot) return;
+    FastllmCudaSetDevice(cudaDevice);
+    // Restore independent writable storage. Cached chunks and states are immutable.
+    auto restore = [&](const Data &src, Data &dst) {
+        dst.dataType = src.dataType; dst.UpdateUnitSize();
+        dst.Resize(src.dims);
+        dst.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice}, false);
+        dst.Allocate(false);
+        FastllmCudaCopyFromHostToDevice(dst.cudaData, src.cpuData, src.GetBytes());
+    };
+    std::vector<std::pair<Data, Data>> restored(block_cnt);
+    for (int i = 0; i < block_cnt; ++i) for (bool second : {false, true}) {
+        auto &dst = second ? restored[i].second : restored[i].first;
+        if (linearLayers[i]) {
+            const auto &src = second ? snapshot->recurrent[i].second : snapshot->recurrent[i].first;
+            restore(src, dst);
+        } else {
+            dst.dataType = dataType; dst.UpdateUnitSize();
+            dst.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice}, false);
+            dst.Expansion({(snapshot->cachedLen + 255) / 256 * 256, num_key_value_heads, head_dim});
+            dst.Resize({snapshot->cachedLen, num_key_value_heads, head_dim});
+            const size_t rowBytes = size_t(num_key_value_heads) * head_dim * 2;
+            for (auto chunk = snapshot->kv; chunk; chunk = chunk->previous) {
+                const auto &src = second ? chunk->layers[i].second : chunk->layers[i].first;
+                FastllmCudaCopyFromHostToDevice((char *)dst.cudaData + size_t(chunk->begin) * rowBytes,
+                    src.cpuData, size_t(chunk->end - chunk->begin) * rowBytes);
+            }
+        }
+        dst.isKVCache = true;
+        dst.isLinearAttention = linearLayers[i];
+    }
+    if (snapshot->cachedLen == int(ctx.currentTokens.size()) && r.options.speculative) {
+        restore(snapshot->logits, logits);
+    }
+    ctx.pastKeyValues.swap(restored);
+    r.prefilled = r.restoredTokens = r.lastSavedLength = snapshot->cachedLen;
+    r.savedKV = snapshot->kv;
+    snapshot->timestamp = ++prefixCache->timestamp;
+#endif
+}
+
+void CloverModel::SavePrefix(ResponseContext &ctx, Request &r, const Data *logits) {
+    if (!RecurrentPrefixCacheEnabled() || ctx.pastKeyValues.size() != size_t(block_cnt)) return;
+    const auto &key = ctx.pastKeyValues[kvCacheId].first;
+    int length = key.dims.empty() ? 0 : key.dims[0];
+    // Stop/length can truncate an emitted block before its already-committed
+    // state. Such a state must never be indexed under the shorter visible text.
+    if (length <= r.lastSavedLength || length > int(ctx.allTokens.size())) return;
+#ifdef USE_CUDA
+    if (!prefixCache) prefixCache = std::make_shared<PrefixCache>();
+    auto *existing = FindRecurrentPrefix(prefixCache->items, ctx.allTokens, length, length,
+        [&](const PrefixCache::Snapshot &s) { return s.type == dataType && (!logits || !s.logits.dims.empty()); });
+    if (existing) {
+        existing->timestamp = ++prefixCache->timestamp;
+        r.lastSavedLength = length;
+        return;
+    }
+    FastllmCudaSetDevice(cudaDevice);
+    auto snapshot = std::make_unique<PrefixCache::Snapshot>();
+    snapshot->cachedLen = length; snapshot->requestId = r.cacheRequestId;
+    snapshot->tokens.assign(ctx.allTokens.begin(), ctx.allTokens.begin() + length);
+    snapshot->type = dataType;
+    snapshot->recurrent.resize(block_cnt);
+    auto chunk = std::make_shared<PrefixCache::KVChunk>();
+    chunk->previous = r.savedKV;
+    chunk->begin = r.savedKV ? r.savedKV->end : 0;
+    chunk->end = length;
+    chunk->layers.resize(block_cnt);
+    // Host checkpoints do not consume the GPU inference budget. KV is copied
+    // incrementally, once per committed span, and shared by interval snapshots.
+    auto copy = [&](const Data &src, Data &dst, std::vector<int> shape, size_t offset = 0) {
+        dst.dataType = src.dataType; dst.UpdateUnitSize();
+        dst.Resize(shape); dst.Allocate();
+        dst.isLinearAttention = src.isLinearAttention;
+        FastllmCudaCopyFromDeviceToHost(dst.cpuData, (char *)src.cudaData + offset, dst.GetBytes());
+    };
+    for (int i = 0; i < block_cnt; ++i) for (bool second : {false, true}) {
+        const auto &src = second ? ctx.pastKeyValues[i].second : ctx.pastKeyValues[i].first;
+        if (linearLayers[i]) {
+            auto &dst = second ? snapshot->recurrent[i].second : snapshot->recurrent[i].first;
+            copy(src, dst, src.dims);
+        } else {
+            auto &dst = second ? chunk->layers[i].second : chunk->layers[i].first;
+            copy(src, dst, {length - chunk->begin, num_key_value_heads, head_dim},
+                size_t(chunk->begin) * num_key_value_heads * head_dim * 2);
+        }
+    }
+    if (logits) copy(*logits, snapshot->logits, logits->dims);
+    snapshot->kv = chunk;
+    snapshot->timestamp = ++prefixCache->timestamp;
+    auto &items = prefixCache->items;
+    items.erase(std::remove_if(items.begin(), items.end(), [&](const std::unique_ptr<PrefixCache::Snapshot> &s) {
+        return s->tokens == snapshot->tokens;
+    }), items.end());
+    items.push_back(std::move(snapshot));
+    TrimRecurrentPrefixes(items, r.cacheRequestId, RecurrentPrefixMaxPerRequest(), RecurrentPrefixMaxRecords());
+    r.savedKV = std::move(chunk);
+    r.lastSavedLength = length;
+#endif
+}
 
 CloverModel::~CloverModel() {
     ShutdownRuntime();
@@ -234,6 +370,7 @@ int CloverModel::LaunchClover(const std::vector<int> &tokens, const json11::Json
 
 void CloverModel::OnResponseContextCreated(ResponseContext *ctx) {
     auto r = std::make_shared<Request>();
+    r->cacheRequestId = ++nextRequestId;
     r->options = launchingOptions;
     r->counts.assign(vocabSize, 0);
     r->rng.seed(r->options.hasSeed ? r->options.seed : std::random_device{}());
@@ -259,6 +396,16 @@ std::vector<int> CloverModel::Step(ResponseContext &ctx, Request &r) {
     const auto &o = r.options;
     const auto &c = ctx.generationConfig;
 #ifdef USE_CUDA
+    if (!r.prefixChecked) {
+        Data logits;
+        LoadPrefix(ctx, r, logits);
+        if (r.prefilled == ctx.currentTokens.size() && o.speculative) {
+            r.Penalize(*this, ctx, logits, {}, false, true);
+            auto stats = r.Summarize(*this, logits, {}, false, false);
+            r.bonus = r.Sample(*this, ctx, logits, 0, stats[0].token);
+            return {r.bonus};
+        }
+    }
     if (r.prefilled < ctx.currentTokens.size()) {
         // Bounded chunks allow aborts between forwards and avoid prompt-wide
         // expert intermediates. All chunks commit causal state, never previews.
@@ -273,8 +420,11 @@ std::vector<int> CloverModel::Step(ResponseContext &ctx, Request &r) {
         std::vector<int> tokens(ctx.currentTokens.begin() + r.prefilled, ctx.currentTokens.begin() + end);
         bool last = end == ctx.currentTokens.size();
         Data logits;
-        ForwardLogits(tokens, ctx.pastKeyValues, false, logits, true, nullptr, last && o.speculative);
+        ForwardLogits(tokens, ctx.pastKeyValues, false, logits, true, nullptr,
+            last && (o.speculative || RecurrentPrefixCacheEnabled()));
         r.prefilled = end;
+        if (last || end - r.lastSavedLength >= size_t(RecurrentPrefixInterval(GetPageLen())))
+            SavePrefix(ctx, r, last ? &logits : nullptr);
         if (!last || !o.speculative) return {};
         r.Penalize(*this, ctx, logits, {}, false, true);
         auto stats = r.Summarize(*this, logits, {}, false, false);
@@ -386,6 +536,14 @@ std::vector<std::vector<int>> CloverModel::StepBatch(const std::vector<ResponseC
 }
 
 void CloverModel::Finish(ResponseContext *ctx) {
+    if (ctx->error == ResponseContextErrorNone) {
+        std::lock_guard<std::mutex> forward(forwardLocker);
+        try { SavePrefix(*ctx, *requests.at(ctx)); }
+        catch (const std::exception &e) {
+            prefixCache.reset();
+            std::cerr << "Clover: could not retain completed prefix: " << e.what() << std::endl;
+        }
+    }
     ctx->isEnding = true;
     ctx->pastKeyValues.clear();
     requests.erase(ctx);
@@ -427,6 +585,7 @@ void CloverModel::RunModelSpecificScheduler() {
         lock.lock();
         for (size_t b = 0; b < contexts.size(); ++b) {
             auto *ctx = contexts[b]; auto &request = batch[b];
+            ctx->cacheLen = request->restoredTokens;
             // Fetch cannot destroy a live context; Abort only marks it until here.
             if (ctx->isAbort || isFree) { RemoveResponseContext(handles[b]); continue; }
             if (!errors[b].empty()) {

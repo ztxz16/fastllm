@@ -39,9 +39,6 @@ def prepare(args, config):
         raise ValueError("Clover supports --speculative_algorithm clover or off")
     if args.low_gpu_mem or args.moe_experts > 0 or args.prefill_batch_tokens > 0:
         raise ValueError("Clover requires resident weights, the checkpoint expert count and serial prefill")
-    if any(str(getattr(args, key, "")).lower() not in ("", "0", "false", "off")
-           for key in ("cache_history", "prefix_cache")):
-        raise ValueError("Clover cross-request prefix caching is not implemented yet")
     if args.max_batch > 8:
         raise ValueError("Clover currently supports --max_batch up to 8")
     args.max_batch = max(1, args.max_batch)
@@ -129,8 +126,20 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
     available_host = (ram if ram is not None else memory.host_memory())["available"]
     if host_limit is not None:
         available_host = min(available_host, host_limit)
-    if available_host < weights + 2 * memory.GiB:
-        raise ValueError("Insufficient host RAM to load original Clover weights")
+    prefix_flag = args.prefix_cache or os.environ.get("FASTLLM_PREFIX_CACHE") or "true"
+    prefix_enabled = str(prefix_flag).lower() in ("1", "true", "yes", "on")
+    records = args.prefix_cache_snapshot_max_records
+    if records <= 0:
+        try:
+            records = max(1, int(os.environ.get("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", "8")))
+        except ValueError:
+            records = 8
+    # Conservative bound: immutable KV chunks are shared, but distinct cached
+    # conversations and active requests can each retain a full context.
+    prefix_host = (records + args.max_batch) * (kv // args.max_batch + state // args.max_batch +
+                   4 * int(config.get("vocab_size", 248320))) if prefix_enabled else 0
+    if available_host < weights + prefix_host + 2 * memory.GiB:
+        raise ValueError("Insufficient host RAM for Clover weights and prefix-cache budget")
     args.device = args.moe_device = device
     args.max_context_length = args.tokens = context
     args.cuda_embedding = True
@@ -149,6 +158,7 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
                   dtype=args.atype, max_context_length=context, weights_bytes=weights,
                   recurrent_state_bytes=state, snapshot_bytes=snapshots,
                   kv_bytes=kv, workspace_reserve_bytes=reserve, estimated_gpu_bytes=required,
+                  prefix_cache_host_bytes=prefix_host,
                   speculative_algorithm=args.speculative_algorithm, block_size=width,
                   automatic={"policy": "single GPU; BF16 or legacy FP16; native context", "cuda_graph": False,
                              "moe_cuda_graph": os.environ.get("FASTLLM_CUDA_GRAPH", "").lower() not in ("0", "false", "off", "no")})

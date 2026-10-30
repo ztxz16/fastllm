@@ -4,8 +4,8 @@
 #include "clover_sampling.h"
 
 namespace fastllm {
-// Clover has FP32 recurrent caches and read-only bidirectional previews;
-// it cannot share Qwen3.5's recurrent cache representation or generation loop.
+// Clover has FP32 recurrent caches and read-only bidirectional previews.
+// Prefix indexing is shared with Qwen3.5; tensor layouts remain model-specific.
 struct CloverSnapshots {
     int position = 0, tokens = 0;
     std::vector<std::pair<Data, Data>> layers;
@@ -70,6 +70,9 @@ private:
     struct MoeGraphs;
     std::shared_ptr<MoeGraphs> moeGraphs;
     struct Request;
+    struct PrefixCache;
+    std::shared_ptr<PrefixCache> prefixCache;
+    long long nextRequestId = 0;
     std::map<ResponseContext *, std::shared_ptr<Request>> requests;
     std::mutex launchLocker;
     CloverOptions defaults, launchingOptions;
@@ -81,6 +84,8 @@ private:
     std::vector<std::vector<int>> StepBatch(const std::vector<ResponseContext *> &contexts,
         const std::vector<std::shared_ptr<Request>> &batch);
     void Finish(ResponseContext *context);
+    void LoadPrefix(ResponseContext &context, Request &request, Data &logits);
+    void SavePrefix(ResponseContext &context, Request &request, const Data *logits = nullptr);
     void Norm(Data &input, const std::string &name, Data &output,
         Data *gate = nullptr, bool zeroCentered = true);
     void AddNorm(Data &residual, Data &input, const std::string &name, Data &output);

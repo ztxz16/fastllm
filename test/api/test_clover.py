@@ -2,6 +2,7 @@
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -99,11 +100,20 @@ class CloverAutoTest(unittest.TestCase):
     def test_unsupported_settings_fail_before_loading(self):
         for options in (("--dtype", "int8"), ("--max_batch", "9"),
                         ("--max_context_length", "131073"), ("--speculative_num_draft_tokens", "7"),
-                        ("--device", "cuda:0,1"), ("--prefix_cache", "true"),
+                        ("--device", "cuda:0,1"),
                         ("--max_batch", "2", "--speculative_num_draft_tokens", "8")):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.resolve(self.args(*options))
 
+    def test_prefix_cache_host_budget(self):
+        with patch.dict(os.environ, {"FASTLLM_PREFIX_CACHE": "true"}):
+            enabled = self.resolve(self.args("--prefix_cache_snapshot_max_records", "3"))
+            history = self.resolve(self.args("--cache_history", "true", "--prefix_cache_snapshot_max_records", "3"))
+            disabled = self.resolve(self.args("--prefix_cache", "false"))
+        self.assertGreater(enabled["prefix_cache_host_bytes"], 0)
+        self.assertEqual(enabled["prefix_cache_host_bytes"], history["prefix_cache_host_bytes"])
+        self.assertEqual(disabled["prefix_cache_host_bytes"], 0)
+        self.assertEqual(enabled["estimated_gpu_bytes"], disabled["estimated_gpu_bytes"])
 
 
 class CloverSamplingModel(SamplingModel):

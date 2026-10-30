@@ -2,6 +2,7 @@
 // Created by huangyuyang on 2/19/26.
 //
 
+#include "utils/recurrent_prefix_cache.h"
 #include "utils.h"
 
 #include "qwen3_5.h"
@@ -4827,11 +4828,7 @@ namespace fastllm {
             Qwen35LinearPrefixSnapshotCache second;
         };
 
-        struct Qwen35LinearPrefixSnapshot {
-            int cachedLen = 0;
-            int requestId = 0;
-            long long timestamp = 0;
-            std::vector<int> tokens;
+        struct Qwen35LinearPrefixSnapshot : RecurrentPrefixKey {
             std::vector<Qwen35LinearPrefixSnapshotLayer> layers;
             bool mtpValid = false;
             int mtpTokens = 0;
@@ -4864,36 +4861,20 @@ namespace fastllm {
             return *counter;
         }
 
-        static int Qwen35EnvInt(const char *name, int fallback) {
-            const char *value = std::getenv(name);
-            if (value == nullptr || value[0] == 0) {
-                return fallback;
-            }
-            char *end = nullptr;
-            long parsed = std::strtol(value, &end, 10);
-            if (end == value) {
-                return fallback;
-            }
-            return (int)parsed;
-        }
-
         static bool Qwen35LinearPrefixCacheEnabled() {
-            const char *enabled = std::getenv("FASTLLM_PREFIX_CACHE");
-            return enabled == nullptr || enabled[0] == 0 || Qwen35MoeIsTrueString(enabled);
+            return RecurrentPrefixCacheEnabled();
         }
 
         static int Qwen35LinearPrefixSnapshotIntervalTokens() {
-            int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 16);
-            pages = std::max(1, pages);
-            return pages * fastllm::GetPageLen();
+            return RecurrentPrefixInterval(fastllm::GetPageLen());
         }
 
         static int Qwen35LinearPrefixSnapshotMaxPerRequest() {
-            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST", 4));
+            return RecurrentPrefixMaxPerRequest();
         }
 
         static int Qwen35LinearPrefixSnapshotMaxRecords() {
-            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", 8));
+            return RecurrentPrefixMaxRecords();
         }
 
         static bool Qwen35LayerIsLinearAttention(const Qwen3_5Model *model, int layer) {
@@ -5304,44 +5285,16 @@ namespace fastllm {
             if (it == all.end()) {
                 return nullptr;
             }
-            const Qwen35LinearPrefixSnapshot *best = nullptr;
-            for (auto &snapshotPtr : it->second) {
-                Qwen35LinearPrefixSnapshot *snapshot = snapshotPtr.get();
-                if (snapshot == nullptr || snapshot->cachedLen <= 0 ||
-                    snapshot->cachedLen > maxCachedLen ||
-                    snapshot->cachedLen > (int)tokens.size()) {
-                    continue;
-                }
-                if (exactLen >= 0 && snapshot->cachedLen != exactLen) {
-                    continue;
-                }
-                if ((int)snapshot->tokens.size() != snapshot->cachedLen ||
-                    !std::equal(snapshot->tokens.begin(), snapshot->tokens.end(), tokens.begin())) {
-                    continue;
-                }
-                if (requireMtp &&
-                    (!snapshot->mtpValid || snapshot->mtpTokens != snapshot->cachedLen ||
-                     snapshot->mtpKey.dims.size() < 2 ||
-                     snapshot->mtpValue.dims.size() < 2 ||
-                     snapshot->mtpKey.dims[1] != snapshot->cachedLen ||
-                     snapshot->mtpValue.dims[1] != snapshot->cachedLen)) {
-                    continue;
-                }
-                if (requireDFlash &&
-                    !Qwen35DFlashSnapshotMatches(
-                        *snapshot, snapshot->cachedLen,
-                        dflashLayers, dflashKvHeads,
-                        dflashHeadDim)) {
-                    continue;
-                }
-                if (best == nullptr ||
-                    snapshot->cachedLen > best->cachedLen ||
-                    (snapshot->cachedLen == best->cachedLen &&
-                     snapshot->timestamp > best->timestamp)) {
-                    best = snapshot;
-                }
-            }
-            return best;
+            return FindRecurrentPrefix(it->second, tokens, maxCachedLen, exactLen,
+                [&](const Qwen35LinearPrefixSnapshot &snapshot) {
+                    if (requireMtp &&
+                        (!snapshot.mtpValid || snapshot.mtpTokens != snapshot.cachedLen ||
+                         snapshot.mtpKey.dims.size() < 2 || snapshot.mtpValue.dims.size() < 2 ||
+                         snapshot.mtpKey.dims[1] != snapshot.cachedLen ||
+                         snapshot.mtpValue.dims[1] != snapshot.cachedLen)) return false;
+                    return !requireDFlash || Qwen35DFlashSnapshotMatches(
+                        snapshot, snapshot.cachedLen, dflashLayers, dflashKvHeads, dflashHeadDim);
+                });
         }
 
         static void Qwen35EraseLinearPrefixSnapshots(const Qwen3_5Model *model) {
@@ -8147,11 +8100,7 @@ namespace fastllm {
             Qwen35LinearPrefixSnapshotCache second;
         };
 
-        struct Qwen35LinearPrefixSnapshot {
-            int cachedLen = 0;
-            int requestId = 0;
-            long long timestamp = 0;
-            std::vector<int> tokens;
+        struct Qwen35LinearPrefixSnapshot : RecurrentPrefixKey {
             std::vector<Qwen35LinearPrefixSnapshotLayer> layers;
             bool mtpValid = false;
             int mtpTokens = 0;
@@ -10317,35 +10266,8 @@ namespace fastllm {
             snapshot->requestId = requestId;
             snapshot->timestamp = ++Qwen35LinearPrefixSnapshotTimestamp();
             items.push_back(std::move(snapshot));
-            int maxPerRequest = Qwen35LinearPrefixSnapshotMaxPerRequest();
-            int requestRecords = 0;
-            for (auto &item : items) {
-                if (item != nullptr && item->requestId == requestId) {
-                    requestRecords++;
-                }
-            }
-            while (requestRecords > maxPerRequest) {
-                auto oldest = items.end();
-                for (auto it = items.begin(); it != items.end(); ++it) {
-                    Qwen35LinearPrefixSnapshot *old = it->get();
-                    if (old == nullptr || old->requestId != requestId) {
-                        continue;
-                    }
-                    if (oldest == items.end() ||
-                        old->timestamp < (*oldest)->timestamp) {
-                        oldest = it;
-                    }
-                }
-                if (oldest == items.end()) {
-                    break;
-                }
-                items.erase(oldest);
-                requestRecords--;
-            }
-            int maxRecords = Qwen35LinearPrefixSnapshotMaxRecords();
-            while ((int)items.size() > maxRecords) {
-                items.erase(items.begin());
-            }
+            TrimRecurrentPrefixes(items, requestId,
+                Qwen35LinearPrefixSnapshotMaxPerRequest(), Qwen35LinearPrefixSnapshotMaxRecords());
         }
         context->intParams["qwen35_linear_prefix_last_len"] = currentLen;
         context->intParams["qwen35_linear_prefix_count"] = snapshotCount + 1;

@@ -9,7 +9,7 @@ ftllm server /path/to/Clover-35B-A3B-Preview --auto \
   --model_name clover --host 127.0.0.1 --port 8080
 ```
 
-`--auto` 会选择一张显存足够的 CUDA GPU，检查权重、KV、FP32 循环状态、推测快照和工作空间的容量。默认使用模型的 131072-token 上下文、最多 4096-token 分块 prefill、16-token 自推测块；一次执行一个请求。可用 `--device cuda:0` 指定可见设备编号，用 `--max_context_length` 缩短上下文。
+`--auto` 会选择一张显存足够的 CUDA GPU，检查权重、KV、FP32 循环状态、推测快照和工作空间的容量，同时为主存前缀缓存估算容量。默认使用模型的 131072-token 上下文、最多 4096-token 分块 prefill、16-token 自推测块；一次执行一个请求。可用 `--device cuda:0` 指定可见设备编号，用 `--max_context_length` 缩短上下文。
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -69,6 +69,10 @@ ftllm server /path/to/Clover-35B-A3B-Preview --auto --speculative_algorithm off
 
 此 checkpoint 只接受文本，图片输入会返回请求错误。
 
+跨请求前缀缓存默认开启，使用 `--prefix_cache false` 关闭。Clover 与 Qwen3.5 共用前缀匹配及快照淘汰逻辑；快照同时包含已提交的 Attention KV、卷积历史和 FP32 GDN 状态。完整提示词命中时还会复用未施加采样惩罚的末尾 logits，采样参数和惩罚计数仍由新请求独立初始化。`usage.prompt_tokens_details.cached_tokens` 返回实际复用的输入 token 数。
+
+快照保存在主存，恢复时复制到请求独立的显存；KV 按新增区间保存，多个快照共享不可变区间。沿用 `--prefix_cache_snapshot_interval_pages`（默认 16 页）、`--prefix_cache_snapshot_max_per_request`（默认 4）和 `--prefix_cache_snapshot_max_records`（默认 8）。保存位置为达到间隔的 prefill 分块末尾、完整提示词末尾及可安全提交的完成位置；只能复用这些位置上的完整 GDN 状态，不能任意截断递归状态。停止或输出上限截断验证块时，不保存超出实际返回文本的状态。缓存作用域为当前模型实例，支持 BF16、FP16 和 NUMA 混推；不跨进程持久化。
+
 ## NUMA 混合推理
 
 编译时启用 `USE_CUDA` 和 `USE_NUMAS`，可将路由专家放在主存，主干、router 和共享专家仍在单张 GPU 上计算。此路径使用原生 BF16 专家，不需要额外的算子库。
@@ -107,7 +111,7 @@ CPU 按整个请求块归并同一专家的路由；缓存与动态分流复用�
 - 专家归约同时完成 shared expert 的 sigmoid 门控、乘法和相加，省去两次独立 kernel 发射；保留 sigmoid、shared 乘积、路由专家总和及最终相加各自的 BF16 舍入。通用与 SM90 路径共用该归约，可省略 shared 参数以仅计算路由专家。
 - Preview 只读已提交状态；部分接受从对应 token 的状态快照恢复，避免重复计算。
 - 支持流式 / 非流式文本 API、EOS、停止字符串、取消请求和运行时错误返回。
-- 当前不支持多卡、跨请求前缀缓存、BF16/FP16 以外的权重精度、多模态、LoRA 或约束解码。默认 `--max_batch 1`；自推测模式可设 `--max_batch 2`～`8`，相同 16/32-token 块宽的请求合批执行 MoE 和输出 head；attention 投影每组最多 32 行，状态计算与 prefill 保持按请求执行。不同请求的 KV、循环状态、coreset 和接受前缀相互独立；低置信度扩散模式仍限单请求。
+- 当前不支持多卡、BF16/FP16 以外的权重精度、多模态、LoRA 或约束解码。默认 `--max_batch 1`；自推测模式可设 `--max_batch 2`～`8`，相同 16/32-token 块宽的请求合批执行 MoE 和输出 head；attention 投影每组最多 32 行，状态计算与 prefill 保持按请求执行。不同请求的可写 KV、循环状态、coreset 和接受前缀相互独立；低置信度扩散模式仍限单请求。
 - 推测预览和验证使用模型持有的 MoE 子图，切换块宽会释放旧图；捕获失败回退到 eager。已有的 `FASTLLM_CUDA_GRAPH=0` 可关闭子图。当前未启用整模型 CUDA Graph。
 - SM90 及以上且实际加载的 PTX 支持时，GDN、归一化、旋转位置编码和采样辅助算子使用 CUDA PDL 隐藏相邻 kernel 的发射开销。每个 kernel 在读取前驱输出前等待依赖完成，计算及舍入顺序不变；旧架构或旧 PTX 保留普通 stream 发射，不增加环境变量或外部依赖。
 - MoE 子图回放时，归一化直接写入图的输入缓冲，残差加法直接读取图输出；视图仅在当前 forward 内使用，避免每层输入、输出各一次复制，计算和舍入顺序不变。
