@@ -61,7 +61,7 @@ namespace {
     // Copy stored KV bits between a request's window and chronological scratch.
     // At most one side wraps; copies are ordered with attention on the rank stream.
     void CopySwaWindow(const Data &key, const Data &value, Data &targetKey, Data &targetValue,
-                       int sourceFirst, int targetFirst, int rows) {
+                       int sourceFirst, int targetFirst, int rows, int sourceWindow = 0, int targetWindow = 0) {
         if (rows == 0) return;
         void *dsts[4]; const void *srcs[4]; size_t sizes[4];
         int copies = 0;
@@ -71,11 +71,15 @@ namespace {
             const size_t rowBytes = (size_t)source.expansionDims[2] * source.unitSize;
             AssertInFastLLM(source.dataType == target.dataType &&
                 source.expansionDims[2] == target.expansionDims[2], "Invalid SWA workspace layout.");
+            // Verification reserves staging rows after the ring. Its logical
+            // window stays unchanged even when the backing allocation grows.
+            const int sourceCapacity = sourceWindow ? sourceWindow : source.expansionDims[1];
+            const int targetCapacity = targetWindow ? targetWindow : target.expansionDims[1];
             for (int offset = 0; offset < rows;) {
-                int from = (sourceFirst + offset) % source.expansionDims[1];
-                int to = (targetFirst + offset) % target.expansionDims[1];
-                int count = std::min({rows - offset, source.expansionDims[1] - from,
-                                     target.expansionDims[1] - to});
+                int from = (sourceFirst + offset) % sourceCapacity;
+                int to = (targetFirst + offset) % targetCapacity;
+                int count = std::min({rows - offset, sourceCapacity - from,
+                                     targetCapacity - to});
                 AssertInFastLLM(copies < 4, "Invalid SWA window copy.");
                 dsts[copies] = (uint8_t *)target.cudaData + to * rowBytes;
                 srcs[copies] = (uint8_t *)source.cudaData + from * rowBytes;
@@ -938,7 +942,8 @@ Data NaiveN05FlashModel::RunTarget(
                 const int needed = slidingLayers[layer] && capture->ringVerify
                     ? window + count : key.dims[1] + count;
                 if (!decodeWorkspace) for (Data *cache : {&key, &value})
-                    ReserveCache(*cache, (needed + 127) / 128 * 128, cache->dims[2]);
+                    if (!cache->isPagedKVCache)
+                        ReserveCache(*cache, (needed + 127) / 128 * 128, cache->dims[2]);
                 for (int row = 0; row < count; ++row) {
                     Data *index = nullptr;
                     if (localIndexer) {
@@ -1108,7 +1113,7 @@ Data NaiveN05FlashModel::RunTarget(
                     pastKey.Resize({1, localPast, cfg.kvHeads * cfg.headDim});
                     pastValue.Resize({1, localPast, cfg.kvHeads * cfg.valueDim});
                     CopySwaWindow(cacheKey, cacheValue, pastKey, pastValue,
-                        ringCache ? (globalPast - localPast) % window : 0, 0, localPast);
+                        ringCache ? (globalPast - localPast) % window : 0, 0, localPast, ringCache ? window : 0);
                 }
                 // Graph replay reads/writes the ring directly. Eager prefill/fallback
                 // uses the existing contiguous kernels and restores the ring once.
@@ -1448,7 +1453,7 @@ Data NaiveN05FlashModel::RunTarget(
                     const int rows = std::min(localPast + length, window - 1);
                     CopySwaWindow(pastKey, pastValue, cacheKey, cacheValue,
                         localPast + length - rows,
-                        ringCache ? (globalPast + length - rows) % window : 0, rows);
+                        ringCache ? (globalPast + length - rows) % window : 0, rows, 0, ringCache ? window : 0);
                     cacheKey.Resize({1, rows, cfg.kvHeads * cfg.headDim});
                     cacheValue.Resize({1, rows, cfg.kvHeads * cfg.valueDim});
                 } else if (slidingLayers[layer] && !verifying)

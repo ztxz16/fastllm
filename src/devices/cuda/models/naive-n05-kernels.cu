@@ -5756,6 +5756,9 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
             r.keyPages = k.pages;
             r.valuePages = v.pages;
             r.pageLen = k.pageLen;
+            // TMA descriptors cover physical pool addresses, not the logical
+            // request length: a restored prefix can reference any pool page.
+            r.poolTokens = key.isPagedKVCache ? key.pagedKVCacheData->maxPages * key.pageLen : 0;
             r.fp8 = k.fp8;
             r.capacity = capacity;
             r.keyStride = key.dims[2];

@@ -749,6 +749,8 @@ void NaiveN05FlashModel::CommitTargetCache(std::vector<std::pair<Data, Data>> &k
             }
             key.Resize({1, length, key.dims[2]});
             value.Resize({1, length, value.dims[2]});
+            for (Data *cache : {&key, &value})
+                if (cache->isPagedKVCache) cache->lastPageLen = length ? (length - 1) % cache->pageLen + 1 : 0;
             if (slidingLayers[layer]) {
                 FastllmCudaSetDevice(key.dataDeviceIds.at(0));
                 FastllmCudaNaiveTrimCache(key, value, window - 1);
@@ -793,7 +795,11 @@ void NaiveN05FlashModel::CommitTargetCaches(const std::vector<std::vector<std::p
             Data &key = device < 0 ? pair.first : *pair.first.multiDeviceDatas.at(device);
             Data &value = device < 0 ? pair.second : *pair.second.multiDeviceDatas.at(device);
             if (slidingLayers[layer]) updates[key.dataDeviceIds.at(0)].push_back({&key, &value, past[i], counts[i]});
-            else { key.Resize({1, past[i] + counts[i], key.dims[2]}); value.Resize({1, past[i] + counts[i], value.dims[2]}); }
+            else for (Data *cache : {&key, &value}) {
+                const int length = past[i] + counts[i];
+                cache->Resize({1, length, cache->dims[2]});
+                if (cache->isPagedKVCache) cache->lastPageLen = length ? (length - 1) % cache->pageLen + 1 : 0;
+            }
         }
         for (auto &entry : updates) { FastllmCudaSetDevice(entry.first); FastllmCudaNaiveBatchCommitSwaVerify(entry.second); }
     };
