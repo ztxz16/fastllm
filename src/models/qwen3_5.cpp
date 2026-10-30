@@ -24337,6 +24337,7 @@ namespace fastllm {
                 std::vector<std::vector<int> > nextInputTokenLists;
                 std::vector<int> keptInputLens;
                 bool usedMtpForward = false;
+                bool cancelledLongPrefill = false;
                 std::set<int> gpuTokenHandoffSpeculatedHandles;
                 bool consumeGpuTokenHandoff = gpuTokenHandoffPending &&
                     !handles.empty() && seqLens.size() == handles.size() &&
@@ -24649,6 +24650,18 @@ namespace fastllm {
                         bool longPrefillDFlashSeeded = false;
                         auto prefillStartTime = std::chrono::system_clock::now();
                         for (int st = 0; st < len; ) {
+                            // AbortResponse writes isAbort under dictLocker.
+                            // Stop before starting another expensive chunk.
+                            {
+                                std::lock_guard<std::mutex> guard(model->dictLocker);
+                                cancelledLongPrefill = singleContext->isAbort;
+                            }
+                            if (cancelledLongPrefill) {
+                                releaseLongPrefillDFlashHidden();
+                                model->speculativeHiddenStates.FreeSpace();
+                                eraseLongPrefillDraftCache();
+                                break;
+                            }
                             int curLen = std::min(
                                 longPrefillChunkSize, len - st);
                             if (model->kvMemConfig.enabled && curLen > 1 && st + curLen == len) {
@@ -25041,6 +25054,17 @@ namespace fastllm {
 
                 forwardLocker.unlock();
                 dictLocker.lock();
+
+                if (cancelledLongPrefill) {
+                    // The context destructor releases paged KV references;
+                    // OnResponseContextRemoved drops remaining draft snapshots.
+                    model->RemoveResponseContext(handles[0]);
+                    model->dictCV.notify_all();
+                    releasePendingResultLogits(logits);
+                    for (auto *ptr : ownedAttentionMasks) delete ptr;
+                    for (auto *ptr : ownedPositionIds) delete ptr;
+                    continue;
+                }
 
                 std::set<int>
                     gpuTokenHandoffCacheAdvancedPastEndHandles;
