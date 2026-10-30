@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -46,6 +48,24 @@ inline double Rate(long long tokens, double milliseconds) {
     return milliseconds > 0 ? tokens * 1000.0 / milliseconds : 0;
 }
 template <typename T> inline void Array(std::ostream &out, const std::vector<T> &values) {
+    // Trace handles and token lengths are decimal ints. Keep the stream's
+    // existing formatting for other types, including characters and booleans.
+    if constexpr (std::is_same<T, int>::value) {
+        char buffer[4096];
+        char *end = buffer;
+        *end++ = '[';
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (buffer + sizeof(buffer) - end < 32) {
+                out.write(buffer, end - buffer);
+                end = buffer;
+            }
+            if (i) *end++ = ',';
+            end = std::to_chars(end, buffer + sizeof(buffer), values[i]).ptr;
+        }
+        *end++ = ']';
+        out.write(buffer, end - buffer);
+        return;
+    }
     out << '[';
     for (size_t i = 0; i < values.size(); ++i) {
         if (i) out << ',';
