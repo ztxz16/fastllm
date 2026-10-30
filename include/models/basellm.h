@@ -85,6 +85,7 @@ namespace fastllm {
     };
 
     struct ResponseContext {
+        uint64_t generation = 0; // Distinguish a reused handle while a consumer waits.
         std::unique_ptr<PrefillPrefixPreview> prefillPreview;
         PrefillBatchPolicy::Clock::time_point queuedAt = PrefillBatchPolicy::Clock::now();
         bool isEnding = false; // 代表这个请求已经处理完成了，不需要再forward了，但生成的token可能还没有被fetch
@@ -118,6 +119,7 @@ namespace fastllm {
     struct ResponseContextDict {
         std::mutex locker;
         std::map <int, ResponseContext*> dicts;
+        uint64_t nextGeneration = 0;
 
         int CreateHandle();
 

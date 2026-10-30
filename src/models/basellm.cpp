@@ -477,6 +477,7 @@ namespace fastllm {
             newId++;
         }
         dicts[newId] = new ResponseContext();
+        dicts[newId]->generation = ++nextGeneration;
         locker.unlock();
         return newId;
     }
@@ -3871,6 +3872,7 @@ namespace fastllm {
         if (context == nullptr) {
             return -1;
         } else {
+            const uint64_t generation = context->generation;
             while (true) {
                 if (context->resultTokenQueue.size() > 0) {
                     int ret = context->resultTokenQueue.front();
@@ -3888,9 +3890,9 @@ namespace fastllm {
                         return -1;
                     }
                 }
-                dictLocker.unlock();
-                MySleep(0);
-                dictLocker.lock();
+                dictCV.wait_for(dictLocker, std::chrono::seconds(1));
+                context = responseContextDict.GetHandle(handleId);
+                if (!context || context->generation != generation) return -1;
             }
         }
     }
@@ -3913,6 +3915,7 @@ namespace fastllm {
         if (context == nullptr) {
             return -1;
         }
+        const uint64_t generation = context->generation;
         while (true) {
             if (statistics != nullptr) {
                 CopyResponseStatistics(*context, statistics);
@@ -3940,14 +3943,12 @@ namespace fastllm {
             // speculative block.  Wait for the scheduler notification instead.
             // The bounded timeout preserves the server's periodic prefill
             // keepalive even if a legacy scheduler misses a notification.
-            if (dictCV.wait_for(dictLocker, std::chrono::seconds(1)) ==
-                std::cv_status::timeout) {
-                return 0;
-            }
+            const auto status = dictCV.wait_for(dictLocker, std::chrono::seconds(1));
             context = responseContextDict.GetHandle(handleId);
-            if (context == nullptr) {
+            if (context == nullptr || context->generation != generation) {
                 return -1;
             }
+            if (status == std::cv_status::timeout) return 0;
         }
     }
 
@@ -3957,6 +3958,7 @@ namespace fastllm {
         if (context == nullptr) {
             return -1;
         } else {
+            const uint64_t generation = context->generation;
             while (true) {
                 if (context->resultTokenQueue.size() > 0) {
                     int ret = context->resultTokenQueue.front();
@@ -3975,9 +3977,9 @@ namespace fastllm {
                         return -1;
                     }
                 }
-                dictLocker.unlock();
-                MySleep(0);
-                dictLocker.lock();
+                dictCV.wait_for(dictLocker, std::chrono::seconds(1));
+                context = responseContextDict.GetHandle(handleId);
+                if (!context || context->generation != generation) return -1;
             }
         }
     }
