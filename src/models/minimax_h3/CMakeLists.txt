@@ -15,6 +15,13 @@ target_include_directories(minimax_h3_server PRIVATE ${PROJECT_SOURCE_DIR}/examp
 target_link_libraries(minimax_h3_server PRIVATE fastllm_minimax_h3 pthread)
 set_target_properties(minimax_h3_server PROPERTIES CXX_STANDARD 17)
 if(UNIT_TEST)
+    enable_testing()
+    add_executable(minimax_h3_fused_ops ${PROJECT_SOURCE_DIR}/test/minimax_h3/test_fused_ops.cpp)
+    target_include_directories(minimax_h3_fused_ops PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(minimax_h3_fused_ops PRIVATE fastllm_minimax_h3 cudart)
+    set_target_properties(minimax_h3_fused_ops PROPERTIES CXX_STANDARD 17)
+    add_test(NAME minimax_h3_fused_ops COMMAND minimax_h3_fused_ops)
+    set_tests_properties(minimax_h3_fused_ops PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
     add_library(minimax_h3_reference SHARED ${PROJECT_SOURCE_DIR}/test/minimax_h3/reference_bridge.cpp)
     target_link_libraries(minimax_h3_reference PRIVATE fastllm_minimax_h3)
     set_target_properties(minimax_h3_reference PROPERTIES CXX_STANDARD 17

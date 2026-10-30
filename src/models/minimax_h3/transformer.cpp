@@ -92,11 +92,15 @@ Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tenso
                               Trace trace) {
     auto q = weights_.linear(x, p + ".to_q"), k = weights_.linear(x, p + ".to_k"),
          v = weights_.linear(x, p + ".to_v");
-    q = rt_.rms(q, weights_.get(p + ".norm_q.weight"), config_.qkEps, config_.headDim);
-    k = rt_.rms(k, weights_.get(p + ".norm_k.weight"), config_.qkEps, config_.headDim);
     if (cs) {
-        q = rt_.rotary(q, *cs, *sn, config_.headDim);
-        k = rt_.rotary(k, *cs, *sn, config_.headDim);
+        auto qk = rt_.qkNormRotary(q, k, weights_.get(p + ".norm_q.weight"),
+                                 weights_.get(p + ".norm_k.weight"), config_.qkEps, *cs, *sn,
+                                 config_.headDim);
+        q = qk.first;
+        k = qk.second;
+    } else {
+        q = rt_.rms(q, weights_.get(p + ".norm_q.weight"), config_.qkEps, config_.headDim);
+        k = rt_.rms(k, weights_.get(p + ".norm_k.weight"), config_.qkEps, config_.headDim);
     }
     if (trace) {
         trace("q", q);
@@ -110,10 +114,17 @@ Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tenso
 }
 Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
     std::vector<Tensor> chunks;
-    for (int first = 0; first < x.rows; first += 512) {
-        auto y = weights_.linear(x.rowSlice(first, std::min(512, x.rows - first)), p + ".net.0.proj");
-        auto hidden = rt_.columns(y, 0, config_.ffn), gate = rt_.columns(y, config_.ffn, config_.ffn);
-        chunks.push_back(weights_.linear(rt_.multiply(hidden, rt_.activation(gate)), p + ".net.2"));
+    // Bound BF16 scratch and preserve the original sub-512 tail GEMM: folding
+    // it into a larger batch selects a different reduction/rounding algorithm.
+    // FP32 diagnostics retain all their original GEMM shapes.
+    int chunk = x.isFloat32() ? 512 : 4096;
+    for (int first = 0; first < x.rows;) {
+        int count = std::min(chunk, x.rows - first);
+        if (count > 512)
+            count -= count % 512;
+        auto y = weights_.linear(x.rowSlice(first, count), p + ".net.0.proj");
+        chunks.push_back(weights_.linear(rt_.siluMultiply(y), p + ".net.2"));
+        first += count;
     }
     return chunks.size() == 1 ? chunks[0] : rt_.concat(chunks);
 }
@@ -131,10 +142,9 @@ Tensor Transformer::refine(const Tensor &input) {
 Tensor Transformer::block(int layer, const Tensor &input, const Tensor &mod, const Tensor &idx,
                           const Tensor &cs, const Tensor &sn, Trace trace) {
     auto p = "transformer_blocks." + std::to_string(layer);
-    auto x = rt_.rms(input, weights_.get(p + ".norm1.weight"), config_.normEps);
     if (trace)
-        trace("norm1", x);
-    x = rt_.modulateRows(x, mod, idx, 0, 1);
+        trace("norm1", rt_.rms(input, weights_.get(p + ".norm1.weight"), config_.normEps));
+    auto x = rt_.rmsModulateRows(input, weights_.get(p + ".norm1.weight"), config_.normEps, mod, idx, 0, 1);
     if (trace)
         trace("modulated1", x);
     x = attention(x, p + ".attn", &cs, &sn, trace);
@@ -143,8 +153,7 @@ Tensor Transformer::block(int layer, const Tensor &input, const Tensor &mod, con
     auto residual = rt_.residualRows(input, x, mod, idx, 2);
     if (trace)
         trace("residual1", residual);
-    x = rt_.rms(residual, weights_.get(p + ".norm2.weight"), config_.normEps);
-    x = rt_.modulateRows(x, mod, idx, 3, 4);
+    x = rt_.rmsModulateRows(residual, weights_.get(p + ".norm2.weight"), config_.normEps, mod, idx, 3, 4);
     if (trace)
         trace("modulated2", x);
     x = feedForward(x, p + ".ff");
@@ -204,8 +213,8 @@ std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor
         if (rt_.isFloat32())
             weights_.erasePrefix("transformer_blocks." + std::to_string(i) + ".");
     }
-    x = rt_.rms(x, weights_.get("norm_out.norm.weight"), config_.finalEps);
-    x = rt_.modulateRows(x, outputModulation_, rt_.indices(layout.timeIndices), 0, 1);
+    x = rt_.rmsModulateRows(x, weights_.get("norm_out.norm.weight"), config_.finalEps,
+                           outputModulation_, rt_.indices(layout.timeIndices), 0, 1);
     return {fullWeights_.linear(rt_.cast(rt_.gather(x, vi), DType::FP32), "proj_out"),
             fullWeights_.linear(rt_.cast(rt_.gather(x, ai), DType::FP32), "audio_proj_out")};
 }

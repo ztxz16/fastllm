@@ -15,12 +15,18 @@ class Runtime : public nomas::Runtime {
     explicit Runtime(int device, bool fp32 = false) : nomas::Runtime(device, fp32) {}
     Runtime(int device, DType dtype) : nomas::Runtime(device, dtype) {}
     Tensor rms(const Tensor &, const Tensor &weight, float eps, int width = 0);
+    Tensor rmsModulateRows(const Tensor &, const Tensor &weight, float eps, const Tensor &table,
+                           const Tensor &indices, int shift, int scale);
+    Tensor siluMultiply(const Tensor &hiddenAndGate);
     Tensor indices(const std::vector<int> &);
     Tensor gather(const Tensor &, const Tensor &indices);
     void scatter(Tensor &out, const Tensor &input, const Tensor &indices);
     Tensor modulateRows(const Tensor &, const Tensor &table, const Tensor &indices, int shift, int scale);
     Tensor residualRows(const Tensor &, const Tensor &, const Tensor &table, const Tensor &indices, int gate);
     Tensor rotary(const Tensor &, const Tensor &cos, const Tensor &sin, int headDim);
+    std::pair<Tensor, Tensor> qkNormRotary(const Tensor &q, const Tensor &k, const Tensor &qWeight,
+                                         const Tensor &kWeight, float eps, const Tensor &cos,
+                                         const Tensor &sin, int headDim);
     std::pair<Tensor, Tensor> ropeTable(const std::vector<float> &positions, int frequencies, float theta);
     Tensor timestepEmbedding(const std::vector<float> &times, int dimensions);
     Tensor selfAttention(const Tensor &q, const Tensor &k, const Tensor &v, int heads);

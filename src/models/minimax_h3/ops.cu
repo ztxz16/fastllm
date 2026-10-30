@@ -25,7 +25,9 @@ template <class T> __device__ float value(T x) { return float(x); }
 template <class T> __device__ float rounded(float x) { return value(T(x)); }
 // H3 nn.RMSNorm rounds after multiplying the weight. The shared Qwen RMSNorm
 // rounds before it, so reusing that BF16 kernel would change the model's arithmetic.
-__global__ void rmsFused(const B *x, const B *w, B *out, int width, float eps) {
+template <bool Modulate>
+__global__ void rmsFused(const B *x, const B *w, B *out, int width, float eps, const B *mod,
+                         const int *indices, int modCols, int shift, int scale) {
     __shared__ float sums[256];
     float sum = 0;
     size_t row = size_t(blockIdx.x) * width;
@@ -41,8 +43,15 @@ __global__ void rmsFused(const B *x, const B *w, B *out, int width, float eps) {
         __syncthreads();
     }
     float inv = rsqrtf(sums[0] / width + eps);
-    for (int c = threadIdx.x; c < width; c += 256)
-        out[row + c] = B(value(x[row + c]) * inv * value(w[c]));
+    for (int c = threadIdx.x; c < width; c += 256) {
+        float v = rounded<B>(value(x[row + c]) * inv * value(w[c]));
+        if constexpr (Modulate) {
+            size_t p = size_t(indices[blockIdx.x]) * modCols + c;
+            v = rounded<B>(v * rounded<B>(1.f + value(mod[p + scale * width]))) +
+                value(mod[p + shift * width]);
+        }
+        out[row + c] = B(v);
+    }
 }
 template <class T>
 __global__ void selectRows(const T *x, T *out, const int *indices, size_t n, int c, bool scatter) {
@@ -52,6 +61,14 @@ __global__ void selectRows(const T *x, T *out, const int *indices, size_t n, int
             out[other] = x[i];
         else
             out[i] = x[other];
+    }
+}
+__global__ void siluMultiplyBf16(const B *x, B *out, size_t n, int width) {
+    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
+        size_t p = (i / width) * (2 * width) + i % width;
+        float gate = value(x[p + width]);
+        // Preserve activation's BF16 result before the elementwise multiply.
+        out[i] = B(value(x[p]) * rounded<B>(gate / (1.f + expf(-gate))));
     }
 }
 template <class T>
@@ -88,6 +105,44 @@ __global__ void positionsToRope(const float *pos, const float *inv, float *cs, f
         sn[i] = sinf(angle);
     }
 }
+// One warp per 128-wide head. Match rmsFused's reduction tree and all eager
+// BF16 rounding boundaries, including the norm result before applying RoPE.
+__global__ void qkNormRope128(const B *q, const B *k, const B *qw, const B *kw, const float *cs,
+                            const float *sn, B *qo, B *ko, size_t heads, int headsPerToken,
+                            int rotaryDim, float eps) {
+    int lane = threadIdx.x % 32;
+    for (size_t h = size_t(blockIdx.x) * 8 + threadIdx.x / 32; h < 2 * heads;
+         h += size_t(gridDim.x) * 8) {
+        bool isQ = h < heads;
+        size_t head = isQ ? h : h - heads, offset = head * 128;
+        const B *x = (isQ ? q : k) + offset, *w = isQ ? qw : kw;
+        B *out = (isQ ? qo : ko) + offset;
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            v[j] = value(x[lane + j * 32]);
+        float sum = (v[0] * v[0] + v[2] * v[2]) + (v[1] * v[1] + v[3] * v[3]);
+#pragma unroll
+        for (int step = 16; step; step /= 2)
+            sum += __shfl_down_sync(0xffffffff, sum, step);
+        float inv = rsqrtf(__shfl_sync(0xffffffff, sum, 0) / 128.f + eps);
+        size_t pos = head / headsPerToken * rotaryDim;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int d = lane + j * 32;
+            float normalized = rounded<B>(v[j] * inv * value(w[d]));
+            if (d < rotaryDim) {
+                int other = d < rotaryDim / 2 ? d + rotaryDim / 2 : d - rotaryDim / 2;
+                float rotated = rounded<B>(value(x[other]) * inv * value(w[other]));
+                if (d < rotaryDim / 2)
+                    rotated = -rotated;
+                normalized = rounded<B>(normalized * rounded<B>(cs[pos + d])) +
+                             rounded<B>(rotated * rounded<B>(sn[pos + d]));
+            }
+            out[d] = B(normalized);
+        }
+    }
+}
 __global__ void timeFeatures(const float *times, float *out, size_t n, int d) {
     for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
         int j = i % d;
@@ -106,10 +161,55 @@ Tensor Runtime::rms(const Tensor &x, const Tensor &w, float eps, int width) {
     if (x.isFloat32())
         return norm(x, true, &w, nullptr, eps, width);
     Tensor out(x.rows, x.cols, x.dtype);
-    rmsFused<<<x.size() / width, 256, 0, cudaStreamPerThread>>>(ptr<B>(x), ptr<B>(w), ptr<B>(out), width,
-                                                                eps);
+    rmsFused<false><<<x.size() / width, 256, 0, cudaStreamPerThread>>>(
+        ptr<B>(x), ptr<B>(w), ptr<B>(out), width, eps, nullptr, nullptr, 0, 0, 0);
     check(cudaGetLastError());
     return out;
+}
+Tensor Runtime::rmsModulateRows(const Tensor &x, const Tensor &w, float eps, const Tensor &m,
+                               const Tensor &idx, int shift, int scale) {
+    require(x.dtype != DType::FP16 && x.dtype == w.dtype && x.dtype == m.dtype &&
+                w.size() == size_t(x.cols) && idx.isFloat32() && idx.cols == 1 && idx.rows == x.rows &&
+                shift >= 0 && scale >= 0 && m.cols >= (std::max(shift, scale) + 1) * x.cols,
+            "invalid H3 RMSNorm/modulation shape/dtype");
+    if (x.isFloat32())
+        return modulateRows(rms(x, w, eps), m, idx, shift, scale);
+    Tensor out(x.rows, x.cols, x.dtype);
+    rmsFused<true><<<x.rows, 256, 0, cudaStreamPerThread>>>(ptr<B>(x), ptr<B>(w), ptr<B>(out), x.cols,
+                                                        eps, ptr<B>(m), ptr<int>(idx), m.cols, shift, scale);
+    check(cudaGetLastError());
+    return out;
+}
+Tensor Runtime::siluMultiply(const Tensor &x) {
+    require(x.cols % 2 == 0, "invalid H3 gated activation width");
+    int width = x.cols / 2;
+    if (x.dtype != DType::BF16)
+        return multiply(columns(x, 0, width), activation(columns(x, width, width)));
+    Tensor out(x.rows, width, x.dtype);
+    siluMultiplyBf16<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(ptr<B>(x), ptr<B>(out),
+                                                                   out.size(), width);
+    check(cudaGetLastError());
+    return out;
+}
+std::pair<Tensor, Tensor> Runtime::qkNormRotary(const Tensor &q, const Tensor &k, const Tensor &qw,
+                                             const Tensor &kw, float eps, const Tensor &cs,
+                                             const Tensor &sn, int headDim) {
+    require(headDim > 0 && q.rows == k.rows && q.cols == k.cols && q.cols % headDim == 0 &&
+                q.dtype == k.dtype && qw.dtype == q.dtype && kw.dtype == q.dtype &&
+                qw.size() == size_t(headDim) && kw.size() == size_t(headDim) &&
+                cs.isFloat32() && sn.isFloat32() && cs.rows == q.rows && sn.rows == q.rows &&
+                cs.cols == sn.cols && cs.cols > 0 && cs.cols <= headDim && cs.cols % 2 == 0,
+            "invalid H3 QK norm/RoPE shape/dtype");
+    if (q.dtype != DType::BF16 || headDim != 128)
+        return {rotary(rms(q, qw, eps, headDim), cs, sn, headDim),
+                rotary(rms(k, kw, eps, headDim), cs, sn, headDim)};
+    Tensor qo(q.rows, q.cols, q.dtype), ko(k.rows, k.cols, k.dtype);
+    size_t heads = q.size() / 128;
+    qkNormRope128<<<std::min<size_t>((2 * heads + 7) / 8, 4096), 256, 0, cudaStreamPerThread>>>(
+        ptr<B>(q), ptr<B>(k), ptr<B>(qw), ptr<B>(kw), ptr<float>(cs), ptr<float>(sn), ptr<B>(qo),
+        ptr<B>(ko), heads, q.cols / 128, cs.cols, eps);
+    check(cudaGetLastError());
+    return {qo, ko};
 }
 Tensor Runtime::indices(const std::vector<int> &values) {
     require(!values.empty(), "empty H3 indices");
