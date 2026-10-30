@@ -629,6 +629,52 @@ __global__ void CloverAddNorm(__nv_bfloat16 *residual, const __nv_bfloat16 *inpu
         output[offset + d] = __float2bfloat16(x * inv * (weight[d] + (zeroCentered ? 1.f : 0.f)));
     }
 }
+// Two adjacent columns per lane preserve the original 256-thread RMS
+// reduction while using vectorized BF16 accesses and only one CTA barrier.
+template<bool Add>
+__global__ void CloverHiddenNorm(const __nv_bfloat16 *input, __nv_bfloat16 *residual,
+        const float *weight, const __nv_bfloat16 *gate, __nv_bfloat16 *output,
+        float eps, bool zeroCentered) {
+    CloverDependencyStart();
+    const int tid = threadIdx.x, lane = tid % 32;
+    const size_t offset = (size_t)blockIdx.x * 2048;
+    float2 values[8];
+    float a = 0.f, b = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int d = tid * 2 + j * 256;
+        float2 x = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(input + offset + d));
+        if constexpr (Add) {
+            float2 h = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(residual + offset + d));
+            x = __bfloat1622float2(__floats2bfloat162_rn(x.x + h.x, x.y + h.y));
+        }
+        values[j] = x;
+        a += x.x * x.x; b += x.y * x.y;
+    }
+#pragma unroll
+    for (int step = 8; step; step >>= 1) {
+        a += __shfl_down_sync(0xffffffff, a, step, 16);
+        b += __shfl_down_sync(0xffffffff, b, step, 16);
+    }
+    __shared__ float partial[8];
+    if (lane % 16 == 0) partial[tid / 16] = a + b;
+    __syncthreads();
+    const float inv = rsqrtf(WarpSum(lane < 8 ? partial[lane] : 0.f) / 2048.f + eps);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int d = tid * 2 + j * 256;
+        const float2 x = values[j];
+        if constexpr (Add)
+            *reinterpret_cast<__nv_bfloat162 *>(residual + offset + d) = __floats2bfloat162_rn(x.x, x.y);
+        float u = x.x * inv * (weight[d] + (zeroCentered ? 1.f : 0.f));
+        float v = x.y * inv * (weight[d + 1] + (zeroCentered ? 1.f : 0.f));
+        if (gate) {
+            float2 z = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(gate + offset + d));
+            u *= z.x / (1.f + expf(-z.x)); v *= z.y / (1.f + expf(-z.y));
+        }
+        *reinterpret_cast<__nv_bfloat162 *>(output + offset + d) = __floats2bfloat162_rn(u, v);
+    }
+}
 // Small normalization widths use one warp per row for bulk prefill. Each
 // 32-element partial and its reduction order match CloverNorm's CTA tree.
 template<int Width>
@@ -1167,6 +1213,13 @@ bool FastllmCudaCloverNorm(const void *input, const float *weight, const void *g
                            int width, float eps, bool zeroCentered, void *stream) {
     if (!input || !weight || !output || rows < 1 || width < 1 || eps <= 0.f)
         return false;
+    if (width == 2048 && rows <= 256 &&
+        ((reinterpret_cast<uintptr_t>(input) | reinterpret_cast<uintptr_t>(output) |
+          reinterpret_cast<uintptr_t>(gate)) & 3) == 0) {
+        return CloverLaunch<CloverHiddenNorm<false>>(rows, 128, 0, Stream(stream),
+            (const __nv_bfloat16 *)input, (__nv_bfloat16 *)nullptr, weight,
+            (const __nv_bfloat16 *)gate, (__nv_bfloat16 *)output, eps, zeroCentered);
+    }
     if (rows >= 1024 && width == 128) {
         if (!CloverLaunch<CloverWarpNorm<128>>(
                 (rows + 3) / 4, 128, 0, Stream(stream), (const __nv_bfloat16 *)input, weight,
@@ -1190,6 +1243,13 @@ bool FastllmCudaCloverAddNorm(void *residual, const void *input, const float *we
     if (!residual || !input || !weight || !output || output == residual || output == input || rows < 1 ||
         width < 1 || eps <= 0.f)
         return false;
+    if (width == 2048 && rows <= 256 &&
+        ((reinterpret_cast<uintptr_t>(input) | reinterpret_cast<uintptr_t>(output) |
+          reinterpret_cast<uintptr_t>(residual)) & 3) == 0) {
+        return CloverLaunch<CloverHiddenNorm<true>>(rows, 128, 0, Stream(stream),
+            (const __nv_bfloat16 *)input, (__nv_bfloat16 *)residual, weight,
+            (const __nv_bfloat16 *)nullptr, (__nv_bfloat16 *)output, eps, zeroCentered);
+    }
     if (width == 2048) {
         if (!CloverLaunch<CloverAddNorm<2048>>(rows, 256, 0, Stream(stream), (__nv_bfloat16 *)residual,
                                                (const __nv_bfloat16 *)input, weight, (__nv_bfloat16 *)output,

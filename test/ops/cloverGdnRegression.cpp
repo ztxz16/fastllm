@@ -264,8 +264,8 @@ void BlockPrefill(int batch, int tokens, int kh, int vh, bool weakDecay) {
     Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
 }
 
-void ResidualNormalization(int rows, int width, bool centered) {
-    const int offset = width % 2 ? 1 : 64;
+void ResidualNormalization(int rows, int width, bool centered, bool unaligned = false) {
+    const int offset = unaligned || width % 2 ? 1 : 64;
     const size_t count = (size_t)rows * width, size = count + 2 * offset;
     std::mt19937 rng(1201 + rows + width);
     std::normal_distribution<float> normal(0.f, .7f);
@@ -559,8 +559,12 @@ int main() {
                 Normalization(rows, width, gated, centered);
         Normalization(1025, 131, true, false);
         Normalization(1025, 2048, false, true);
-        for (int rows : {1, 2, 16, 32, 128, 4096}) for (bool centered : {false, true})
+        for (int rows : {1, 2, 16, 32, 64, 128, 256, 4096}) for (bool centered : {false, true})
             ResidualNormalization(rows, 2048, centered);
+        ResidualNormalization(17, 2048, true, true);
+        for (int rows : {1, 16, 32, 64, 128, 256})
+            for (bool gated : {false, true}) for (bool centered : {false, true})
+                Normalization(rows, 2048, gated, centered);
         for (int width : {1, 127, 128, 256, 517, 4096}) for (bool centered : {false, true})
             ResidualNormalization(17, width, centered);
         ResidualNormalization(1025, 128, true);
