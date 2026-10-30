@@ -488,7 +488,9 @@ namespace fastllm {
         ForwardState frame(*this, inputSegments, inputIds, inputEmbeds, imageMask, generationConfigsIn,
             lastTokens, retLogits, samplingPastKeyValues);
         frame.BeginHybridStep();
+        if (frame.FullGraph(false)) return frame.Finish();
         frame.PrepareInputs();
+        if (frame.FullGraph()) return frame.Finish();
         for (int layer=0; layer<frame.Layers(); ++layer) {
             frame.BeginLayer(layer);
             frame.HybridExperts(layer);

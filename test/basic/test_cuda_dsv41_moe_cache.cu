@@ -2,6 +2,9 @@
 #include "executor.h"
 #include "utils.h"
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-v41-full-decode.h"
+#include <thread>
+#include <chrono>
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
 #include "moe_cache_config.h"
@@ -33,6 +36,76 @@ static void Require(bool value, const char *message) {
 }
 static void Check(cudaError_t state) {
     Require(state == cudaSuccess, cudaGetErrorString(state));
+}
+__global__ void CheckNativeRoutePlan(int *slots, int topk) {
+    const int mask = blockIdx.x, selected = blockIdx.y, route = threadIdx.x;
+    if (route < topk) slots[(mask * (topk + 1) + selected) * topk + route] =
+        fastllm::cuda::dsv41_cache::NativeStagedSlot(mask, route, selected);
+}
+static void TestNativeRoutePlan() {
+    size_t comparisons = 0;
+    for (int topk : {1, 6, 16}) {
+        const int masks = 1 << topk;
+        const size_t count = size_t(masks) * (topk + 1) * topk;
+        int *device = nullptr;
+        Check(cudaMalloc(&device, count * sizeof(int)));
+        CheckNativeRoutePlan<<<dim3(masks, topk + 1), 32>>>(device, topk);
+        std::vector<int> actual(count);
+        Check(cudaMemcpy(actual.data(), device, count * sizeof(int), cudaMemcpyDeviceToHost));
+        for (int mask = 0; mask < masks; ++mask) for (int staged = 0; staged <= topk; ++staged) {
+            int next = 0;
+            for (int route = 0; route < topk; ++route) {
+                int expected = -1;
+                if (!(mask & (1 << route))) { if (next < staged) expected = next; ++next; }
+                Require(actual[(size_t(mask) * (topk + 1) + staged) * topk + route] == expected,
+                    "GPU route plan differs from CPU stable miss prefix");
+                ++comparisons;
+            }
+        }
+        Check(cudaFree(device));
+    }
+    std::printf("NATIVE_PLAN_PASS %zu exact comparisons, every residency mask at topk 1/6/16\n", comparisons);
+}
+static void TestHostCopyPublication() {
+    constexpr size_t bytes = 12288;
+    void *host[2]{}, *graphs[2]{}, *dst[2]{}, *composed = nullptr, *exec = nullptr;
+    std::atomic<unsigned> *ready[2]{};
+    for (int i = 0; i < 2; ++i) {
+        Check(cudaMalloc(&dst[i], bytes));
+        Require(FastllmCudaV41CreateHostCopy(dst[i], bytes, &host[i], &ready[i], &graphs[i]),
+            "Engram publication graph creation");
+    }
+    Require(FastllmCudaGraphCompose(const_cast<const void *const *>(graphs), 2, &composed, &exec),
+        "Engram publication graph composition");
+    std::vector<unsigned char> actual(bytes), expected[2];
+    for (int replay = 0; replay < 64; ++replay) {
+        for (int i = 0; i < 2; ++i) {
+            expected[i].resize(bytes);
+            for (size_t j = 0; j < bytes; ++j) expected[i][j] = (replay * 19 + i * 7 + j * 13) & 255;
+            ready[i]->store(0u, std::memory_order_release);
+        }
+        Require(FastllmCudaGraphLaunch(exec), "Engram publication replay");
+        std::thread producer([&] {
+            // Reverse publication order too, and delay until after launch.
+            for (int j = 0; j < 2; ++j) {
+                const int i = (j + replay) % 2;
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                std::memcpy(host[i], expected[i].data(), bytes);
+                ready[i]->store(1u, std::memory_order_release);
+            }
+        });
+        Check(cudaStreamSynchronize(cudaStreamPerThread));
+        producer.join();
+        for (int i = 0; i < 2; ++i) {
+            Check(cudaMemcpy(actual.data(), dst[i], bytes, cudaMemcpyDeviceToHost));
+            Require(actual == expected[i], "Engram graph consumed stale/partial rows");
+        }
+    }
+    FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(composed);
+    for (int i = 0; i < 2; ++i) {
+        FastllmCudaGraphDestroy(graphs[i]); FastllmCudaHostFree(ready[i]); Check(cudaFree(dst[i]));
+    }
+    std::printf("ENGRAM_HANDOFF_PASS 128 delayed/reordered publication copies, byte exact\n");
 }
 static float Bf(float x) {
     return RoundFloat32ToBFloat16RNE(x);
@@ -200,6 +273,7 @@ int main(int argc, char **argv) {
             return false;
         };
         const bool dual = option("--dual"), fp8 = option("--fp8");
+        if (option("--mailbox")) SetCudaGraph(true);
         std::printf("V4.1 cache weights: %s\n", fp8 ? "FP8 block128" : "NVFP4 block32");
         int devices = 0;
         Check(cudaGetDeviceCount(&devices));
@@ -864,6 +938,123 @@ int main(int argc, char **argv) {
             }
         }
         std::printf("VERIFY_PASS %d multirow CPU/GPU oracle checks\n", verifyChecks);
+        if ((option("--mailbox") || option("--fullgraph")) && !fp8 && !dual) {
+            // Two GPU-dependent layers in one scope. Inputs, routes and scores
+            // change between replays, while pointer tables go out of scope as
+            // soon as submission returns. Compare every layer to NUMA arithmetic.
+            Check(cudaSetDevice(0));
+            Data chainInput(BFLOAT16, {1, hidden}), chainOut[2];
+            Data chainIds[2], chainScores[2];
+            Gpu(chainInput);
+            for (int l = 0; l < 2; ++l) {
+                chainIds[l].dataType = INT32; chainIds[l].Resize({1, topk}); Gpu(chainIds[l]);
+                chainScores[l].dataType = FLOAT32; chainScores[l].Resize({1, topk}); Gpu(chainScores[l]);
+                chainOut[l].dataType = BFLOAT16; chainOut[l].Resize({1, hidden}); Gpu(chainOut[l]);
+            }
+            const bool full = option("--fullgraph");
+            if (full) { TestNativeRoutePlan(); TestHostCopyPublication(); }
+            void *handles[2]{}, *graphs[2]{}, *composed = nullptr, *exec = nullptr, *untimed = nullptr;
+            if (full) {
+                FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+                Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "full graph cache preparation");
+                void *step = FastllmCudaBeginMoeDecode(weights[0].data(), weights[0].size(), topk);
+                Require(step != nullptr, "full graph initial scope");
+                FastllmCudaEndMoeDecode(step);
+                cudaGraph_t shared; cudaGraphNode_t empty;
+                Check(cudaGraphCreate(&shared, 0));
+                Check(cudaGraphAddEmptyNode(&empty, shared, nullptr, 0));
+                setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "gpu", 1);
+                void *rejectedGraph = nullptr;
+                Require(!FastllmCudaCreateNativeMoeFullGraph(chainInput, chainIds[0], chainScores[0],
+                    chainOut[0], weights[0].data(), weights[0].size(), 0, shared, &rejectedGraph) && !rejectedGraph,
+                    "pure GPU mode silently entered the CPU mailbox");
+                unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
+                for (int l = 0; l < 2; ++l) {
+                    handles[l] = FastllmCudaCreateNativeMoeFullGraph(l ? chainOut[0] : chainInput,
+                        chainIds[l], chainScores[l], chainOut[l], weights[l].data(), weights[l].size(),
+                        l, shared, &graphs[l]);
+                    Require(handles[l] && graphs[l], "full graph creation rejected");
+                }
+                Check(cudaGraphDestroy(shared));
+                Require(FastllmCudaGraphCompose(const_cast<const void *const *>(graphs), 2, &composed, &exec),
+                    "full graph composition rejected");
+                Require(FastllmCudaCreateNativeMoeReplayGraph(composed, handles, 2, &untimed),
+                    "untimed full graph creation rejected");
+            }
+            std::vector<int32_t> none(topk, -1);
+            for (int repeat = 0; repeat < 24; ++repeat) {
+                std::vector<float> reference(hidden), partial(topk * hidden);
+                std::vector<uint16_t> start(hidden), result(hidden);
+                std::vector<float> expected[2];
+                for (int c = 0; c < hidden; ++c) {
+                    reference[c] = Bf((int(rng() % 61) - 30) / 32.f);
+                    start[c] = Float32ToBFloat16RNEBits(reference[c]);
+                }
+                Check(cudaMemcpy(chainInput.cudaData, start.data(), hidden * 2, cudaMemcpyHostToDevice));
+                for (int l = 0; l < 2; ++l) {
+                    std::vector<int32_t> ids(topk), order(topk);
+                    std::vector<float> scores(topk);
+                    for (int j = 0; j < topk; ++j) {
+                        ids[j] = (repeat * 7 + l * 3 + j * 5) % experts;
+                        scores[j] = j == 0 ? 0.f : (j + repeat % 3 + 1) / 32.f;
+                    }
+                    if (repeat % 3 == 1) ids[1] = ids[2];
+                    NumasMoeDecodeExperts(reference.data(), partial.data(), weights[l].data(),
+                        ids.data(), none.data(), topk, l, scores.data(), 10, 32);
+                    std::iota(order.begin(), order.end(), 0);
+                    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return ids[a] < ids[b]; });
+                    std::fill(reference.begin(), reference.end(), 0.f);
+                    for (int j : order) for (int c = 0; c < hidden; ++c) reference[c] += partial[j * hidden + c];
+                    for (auto &v : reference) v = Bf(v);
+                    expected[l] = reference;
+                    Check(cudaMemcpy(chainIds[l].cudaData, ids.data(), topk * 4, cudaMemcpyHostToDevice));
+                    Check(cudaMemcpy(chainScores[l].cudaData, scores.data(), topk * 4, cudaMemcpyHostToDevice));
+                }
+                void *step = FastllmCudaBeginMoeDecode(weights[0].data(), weights[0].size(), topk);
+                Require(step != nullptr, "mailbox chain scope rejected");
+                int callbacks = 0;
+                if (full) {
+                    // A rejected CUDA launch must drain immediately and
+                    // leave the next valid replay usable, with no waiter
+                    // polling for a publication that will never arrive.
+                    if (repeat == 0 || repeat == 12) {
+                        const auto start = std::chrono::steady_clock::now();
+                        Require(!FastllmCudaLaunchNativeMoeFullGraph(nullptr, handles, 2),
+                            "null full graph launch unexpectedly succeeded");
+                        FastllmCudaClearThreadError(); FastllmCudaClearGraphError();
+                        FastllmCudaWaitMoeDecodeCpu(step);
+                        Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(5),
+                            "failed launch stranded the CPU dispatcher");
+                    }
+                    Require(FastllmCudaLaunchNativeMoeFullGraph(repeat % 3 == 0 ? exec : untimed,
+                        handles, 2, repeat % 3 == 0), "full graph replay failed");
+                    callbacks = 2;
+                } else for (int l = 0; l < 2; ++l) {
+                    auto temporaryWeights = weights[l];
+                    Require(FastllmCudaMergeMOEHybrid(l ? chainOut[0] : chainInput,
+                        chainIds[l], chainScores[l], chainOut[l], temporaryWeights.data(), temporaryWeights.size(), l,
+                        [&] { ++callbacks; }), "mailbox chain rejected");
+                }
+                FastllmCudaEndMoeDecode(step);
+                Require(callbacks == 2, "mailbox chain callback count");
+                for (int l = 0; l < 2; ++l) {
+                    Check(cudaMemcpy(result.data(), chainOut[l].cudaData, hidden * 2, cudaMemcpyDeviceToHost));
+                    std::vector<float> actual(hidden);
+                    for (int c = 0; c < hidden; ++c) {
+                        const uint32_t bits = uint32_t(result[c]) << 16;
+                        memcpy(&actual[c], &bits, 4);
+                    }
+                    Compare(actual, expected[l], "mailbox dependent layers / NUMA mismatch");
+                }
+            }
+            if (full) std::printf("FULL_GRAPH_FAILURE_PASS 2 rejected launches followed by valid replays\n");
+            // Finish must also protect the common CPU pool at Engram boundaries.
+            if (untimed) FastllmCudaGraphExecDestroy(untimed);
+            if (exec) FastllmCudaGraphExecDestroy(exec);
+            if (composed) FastllmCudaGraphDestroy(composed);
+            std::printf("%s_CHAIN_PASS 24 replays, 48 dependent layer comparisons\n", full ? "FULL_GRAPH" : "MAILBOX");
+        }
+
         unsetenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");

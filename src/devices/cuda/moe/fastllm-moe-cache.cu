@@ -52,6 +52,9 @@
 #include <vector>
 
 #include <cuda_bf16.h>
+#ifndef USE_ROCM
+#include <cuda.h>
+#endif
 #include "fastllm-moe-deepseekv41-cache.cuh"
 #include "fastllm-moe-glm5-cache.cuh"
 #include "fastllm-moe-fp8-scored.cuh"
@@ -302,6 +305,9 @@ struct DecodePolicyState {
     }
 };
 
+struct NativeMoeMailbox;
+void FinishNativeMoeMailbox(struct DeviceCache &cache, bool observe);
+
 struct DeviceCache {
     OffloadGroup *tensorParallelOwner = nullptr;
     bool attempted = false;
@@ -357,6 +363,7 @@ struct DeviceCache {
     void *ggufWorkspace = nullptr;
     size_t ggufWorkspaceBytes = 0;
     std::unique_ptr<HybridWorkspace> hybrid;
+    std::shared_ptr<NativeMoeMailbox> nativeMailbox;
     std::shared_ptr<FastllmCudaMoeExpertParallel> batchHybrid;
     std::array<uint64_t, 8> cooperativeStats{};
     std::array<std::array<uint64_t, 8>, 4> phaseStats{};
@@ -1074,6 +1081,7 @@ void ReleaseDeviceCache(DeviceCache &cache) {
         cudaSetDevice(cache.device);
     }
     if (cache.admissionStream) cudaStreamSynchronize(cache.admissionStream);
+    cache.nativeMailbox.reset();
     cache.hybrid.reset();
     cache.batchHybrid.reset();
     cache.decode.reset();
@@ -4396,6 +4404,7 @@ static int EndMoeFrequencyStep(DeviceCache &cache) {
 }
 
 static void EndDeviceMoeDecode(DeviceCache &cache) {
+    FinishNativeMoeMailbox(cache, true);
     if (cache.frequency && cache.frequencyActive) {
         EndMoeFrequencyStep(cache);
         return;
@@ -4467,12 +4476,14 @@ namespace { void WaitMailboxMoe(OffloadGroup &group); }
 #include "fastllm-moe-cooperative.cuh"
 #include "fastllm-moe-mailbox.cuh"
 #endif
+#include "fastllm-moe-native-mailbox.cuh"
 
 void FastllmCudaWaitMoeDecodeCpu(void *state) {
 #ifdef USE_NUMAS
     if (!state) return;
     auto *group = static_cast<DeviceCache *>(state)->frequencyGroup;
     if (group) WaitCooperativeCpu(*group);
+    FinishNativeMoeMailbox(*static_cast<DeviceCache *>(state), false);
 #endif
 }
 
@@ -4545,6 +4556,9 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
     const bool scoredBfloat = layout.deepSeekV41 || layout.glm5;
     if (scoredBfloat != (input.dataType == fastllm::DataType::BFLOAT16)) return false;
     const int hidden = layout.hidden, topk = index.dims[1];
+    if (TryNativeMoeMailbox(*group, *cache, tableId, input, index, score, output,
+            weights, weightsBatch, layer, launchParallel, devices)) return true;
+    FinishNativeMoeMailbox(*cache, true);
     if (!cache->hybrid) {
         auto work = std::make_unique<HybridWorkspace>();
         // GGUF layers can have different hidden widths in the same pool.
@@ -5215,4 +5229,59 @@ extern "C" bool fastllm_moe_cuda_cache_prefill_stats(int device, uint64_t *value
     }
     ok &= cudaSetDevice(previous) == cudaSuccess;
     return ok;
+}
+
+void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fastllm::Data &index,
+        const fastllm::Data &score, fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+        int layer, const void *sharedGraph, void **graph) {
+#if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
+    if (!graph) return nullptr;
+    *graph = nullptr;
+    // An explicit pure-GPU request must retain its refill policy instead of
+    // silently switching back to the hybrid CPU/GPU scheduler during capture.
+    const char *mode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
+    if (mode && std::strcmp(mode, "gpu") == 0) return nullptr;
+    if (!sharedGraph || FastllmCudaGraphIsCapturingFast() || !SupportedCacheInput(input) ||
+        input.dims[0] != 1 || input.dataType != fastllm::BFLOAT16 ||
+        index.dims.size() != 2 || index.dims[0] != 1 || index.dataType != fastllm::INT32 ||
+        score.dims != index.dims || score.dataType != fastllm::FLOAT32 ||
+        !index.cudaData || !score.cudaData ||
+        index.dims.back() < 1 || index.dims.back() > kMaxTopK) return nullptr;
+    int table = -1;
+    auto *group = FindHybridGroup(weights, weightsBatch, &table);
+    if (!group || !group->cpuDecodeReady || !group->expertDevices.empty() ||
+        group->tensorParallelRequested || group->deviceCaches.size() != 1 ||
+        group->LayerLayout(table).weightType != fastllm::NVFP4_BLOCK_32_E8M0 ||
+        !group->LayerLayout(table).deepSeekV41) return nullptr;
+    auto *cache = GetDeviceCache(*group, false);
+    if (!cache || !cache->frequency) return nullptr;
+    if (!cache->nativeMailbox) cache->nativeMailbox = std::make_shared<NativeMoeMailbox>(*group, *cache);
+    auto *handle = cache->nativeMailbox->CreateFull(table, input, index, score, output,
+        weights, weightsBatch, layer, reinterpret_cast<cudaGraph_t>(const_cast<void *>(sharedGraph)));
+    if (handle) *graph = handle->fullGraph;
+    return handle;
+#else
+    return nullptr;
+#endif
+}
+
+bool FastllmCudaLaunchNativeMoeFullGraph(void *exec, void *const *handles, int count, bool timed) {
+#if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
+    if (!handles || count <= 0 || !handles[0]) return false;
+    auto *first = static_cast<NativeMoeMailbox::Layer *>(handles[0]);
+    return first->owner->LaunchFull(exec, handles, count, timed);
+#else
+    return false;
+#endif
+}
+
+bool FastllmCudaCreateNativeMoeReplayGraph(void *graph, void *const *handles, int count, void **exec) {
+#if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
+    if (!graph || !exec || !handles || count <= 0 || !handles[0]) return false;
+    *exec = nullptr;
+    auto *first = static_cast<NativeMoeMailbox::Layer *>(handles[0]);
+    return first->owner->CreateReplay(reinterpret_cast<cudaGraph_t>(graph), handles, count, exec);
+#else
+    return false;
+#endif
 }

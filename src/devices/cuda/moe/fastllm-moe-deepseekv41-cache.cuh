@@ -11,6 +11,12 @@
 namespace fastllm {
 namespace cuda {
 namespace dsv41_cache {
+// Stable prefix of nonresident routes, matching the CPU admission order.
+__device__ inline int NativeStagedSlot(unsigned resident, int route, int selected) {
+    if (resident & (1u << route)) return -1;
+    const int slot = route - __popc(resident & ((1u << route) - 1));
+    return slot < selected ? slot : -1;
+}
 __device__ inline float FP4(unsigned value, unsigned exponent) {
     // Normal E2M1 magnitudes 2..7 map to consecutive FP32 bit
     // patterns spaced by 1 << 22. Handle zero and the .5 subnormal
@@ -123,7 +129,8 @@ static __global__ void Down(const __nv_bfloat16 *activation, const int32_t *slot
         output[route * hidden + column] = BFloat(value);
 }
 static __global__ void Reduce(const float *cpu, const float *gpu, const int32_t *gpuIndices, const int32_t *indices,
-                              __nv_bfloat16 *output, int hidden, int topk) {
+                              __nv_bfloat16 *output, int hidden, int topk,
+                              unsigned *published = nullptr, unsigned *computed = nullptr) {
     const int column = blockIdx.x * blockDim.x + threadIdx.x;
     if (column >= hidden)
         return;
@@ -149,6 +156,14 @@ static __global__ void Reduce(const float *cpu, const float *gpu, const int32_t 
         sum = __fadd_rn(sum, (gpuIndices[route] < 0 ? cpu : gpu)[route * hidden + column]);
     }
     output[column] = __float2bfloat16_rn(sum);
+#if !defined(USE_ROCM)
+    // Later layers/token reuse is ordered after this whole kernel. Other
+    // CTAs consume data only; they never read these completion flags.
+    if (!column && !row && published) {
+        atomicExch_system(published, 0u);
+        atomicExch_system(computed, 0u);
+    }
+#endif
 }
 }
 }

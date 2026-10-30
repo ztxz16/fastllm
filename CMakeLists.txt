@@ -2655,6 +2655,14 @@ if (UNIT_TEST)
             target_link_libraries(cuda_dsv41_moe_cache_test PRIVATE fastllm)
             set_target_properties(cuda_dsv41_moe_cache_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
             add_test(NAME cuda_dsv41_moe_cache COMMAND cuda_dsv41_moe_cache_test)
+            if (NOT USE_ROCM AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.7)
+                fastllm_add_checked_test(cuda_dsv41_moe_mailbox cuda_dsv41_moe_cache_test
+                    "MAILBOX_CHAIN_PASS" 180 --mailbox)
+                fastllm_add_checked_test(cuda_dsv41_moe_fullgraph cuda_dsv41_moe_cache_test
+                    "FULL_GRAPH_CHAIN_PASS" 180 --fullgraph)
+                set_tests_properties(cuda_dsv41_moe_mailbox cuda_dsv41_moe_fullgraph PROPERTIES
+                    LABELS "cuda;moe;numa" RUN_SERIAL TRUE ENVIRONMENT "OMP_NUM_THREADS=1")
+            endif()
             add_executable(cuda_dsv41_mxfp4_grouped_test test/basic/test_cuda_dsv41_mxfp4_grouped.cu)
             target_link_libraries(cuda_dsv41_mxfp4_grouped_test PRIVATE fastllm)
             set_target_properties(cuda_dsv41_mxfp4_grouped_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

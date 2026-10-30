@@ -40,6 +40,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <climits>
 #include <cstdio>
@@ -53,6 +54,7 @@
 #include <set>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 #if !defined(_WIN32) && !defined(_WIN64)
 #include <fcntl.h>

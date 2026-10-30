@@ -7232,3 +7232,48 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
         V41FullDecodeStorePackedRing<<<c.batch, 256, 0, cudaStreamPerThread>>>(c, b, p->requests);
     return V41CheckLaunch("FullDecodeFinish");
 }
+
+
+bool FastllmCudaV41CreateHostCopy(void *dst, size_t bytes, void **hostData,
+        std::atomic<unsigned> **ready, void **result) {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 11070
+    if (!dst || !bytes || bytes > SIZE_MAX - 64 || !hostData || !ready || !result) return false;
+    *hostData = nullptr; *ready = nullptr; *result = nullptr;
+    decltype(&cuCtxGetCurrent) context = nullptr;
+    decltype(&cuGraphAddBatchMemOpNode) add = nullptr;
+    if (cudaGetDriverEntryPoint("cuCtxGetCurrent", reinterpret_cast<void **>(&context),
+            cudaEnableDefault) != cudaSuccess || !context ||
+        cudaGetDriverEntryPoint("cuGraphAddBatchMemOpNode", reinterpret_cast<void **>(&add),
+            cudaEnableDefault) != cudaSuccess || !add) { cudaGetLastError(); return false; }
+    void *host = nullptr, *mapped = nullptr;
+    cudaGraph_t graph = nullptr;
+    CUcontext ctx = nullptr;
+    auto fail = [&] {
+        if (graph) cudaGraphDestroy(graph);
+        if (host) cudaFreeHost(host);
+        cudaGetLastError(); return false;
+    };
+    if (cudaHostAlloc(&host, bytes + 64, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer(&mapped, host, 0) != cudaSuccess ||
+        cudaGraphCreate(&graph, 0) != cudaSuccess || context(&ctx) != CUDA_SUCCESS) return fail();
+    CUstreamBatchMemOpParams op{};
+    op.waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
+    op.waitValue.address = reinterpret_cast<CUdeviceptr>(mapped);
+    op.waitValue.value = 1; op.waitValue.flags = CU_STREAM_WAIT_VALUE_EQ;
+    CUDA_BATCH_MEM_OP_NODE_PARAMS params{ctx, 1, &op, 0};
+    CUgraphNode wait = nullptr;
+    if (add(&wait, reinterpret_cast<CUgraph>(graph), nullptr, 0, &params) != CUDA_SUCCESS) return fail();
+    auto dependency = reinterpret_cast<cudaGraphNode_t>(wait);
+    cudaGraphNode_t copy = nullptr;
+    auto *data = static_cast<char *>(host) + 64;
+    if (cudaGraphAddMemcpyNode1D(&copy, graph, &dependency, 1, dst, data, bytes,
+            cudaMemcpyHostToDevice) != cudaSuccess) return fail();
+    static_assert(sizeof(std::atomic<unsigned>) == sizeof(unsigned) &&
+                  std::atomic<unsigned>::is_always_lock_free, "mapped flag must be a lock-free word");
+    new (host) std::atomic<unsigned>(1u);
+    *hostData = data; *ready = static_cast<std::atomic<unsigned> *>(host); *result = graph;
+    return true;
+#else
+    return false;
+#endif
+}

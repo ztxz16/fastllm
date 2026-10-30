@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 
 // Fixed tensor addresses and launch shapes; request-dependent values are
 // uploaded separately before replay. The caller owns all tensor buffers.
@@ -74,3 +75,10 @@ struct FastllmV41HostCopy { void *dst; const void *src; size_t bytes; };
 bool FastllmCudaV41UploadFullDecodeInputs(void *storage, void *const *plans, size_t layers,
     const FastllmV41FullDecodeRequest *requests, size_t batch,
     const FastllmV41HostCopy *extra, size_t extraCount);
+
+// A graph-owned wait/copy pair for CPU-produced rows. The caller owns the
+// mapped ready allocation (free with FastllmCudaHostFree) and the graph.
+// Before replay: reset ready, fill hostData, release-store ready = 1.
+// Do not reuse either buffer until the previous graph has consumed it.
+bool FastllmCudaV41CreateHostCopy(void *dst, size_t bytes, void **hostData,
+    std::atomic<unsigned> **ready, void **graph);

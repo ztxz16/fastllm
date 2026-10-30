@@ -248,6 +248,7 @@ inline int FastllmCudaGraphOptimizeParallelRegions(void *graph) {
 // 内存池块保留到 Graph 销毁。Begin/End 之间允许正常复用，以保持逐层 workspace
 // 的峰值而不是把整步所有临时张量累加起来。
 bool FastllmCudaGraphMemoryPoolBegin();
+bool FastllmCudaGraphMemoryPoolActive();
 bool FastllmCudaGraphMemoryPoolEnd(std::vector<void*> &reservedPointers);
 void FastllmCudaGraphMemoryPoolAbort();
 void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointers);
@@ -2737,5 +2738,17 @@ extern "C" bool FastllmCudaTritonMxfp4Grouped(
     const fastllm::Data &input, fastllm::Data &activation,
     const unsigned char *records, const int *slots, const int *routes,
     const float *scores, float *output, void *scratch, int count);
+
+// Native single-GPU NUMA MoE child graph. The model keeps the source buffers
+// and weight objects alive; the cache owns the returned handle and graph.
+void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fastllm::Data &index,
+    const fastllm::Data &score, fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+    int layer, const void *sharedGraph, void **graph);
+// Handles must follow the composed graph's sequential layer order. The
+// exec must contain exactly these children; timed must match that exec.
+// Queue ownership and CUDA launch are atomic with respect to the CPU
+// dispatcher: a rejected launch leaves no pending CPU requests.
+bool FastllmCudaLaunchNativeMoeFullGraph(void *exec, void *const *handles, int count, bool timed = true);
+bool FastllmCudaCreateNativeMoeReplayGraph(void *graph, void *const *handles, int count, void **exec);
 
 #endif // FASTLLM_CUDA_CUH

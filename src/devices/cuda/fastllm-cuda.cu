@@ -5401,6 +5401,10 @@ static bool FastllmCudaRetryMallocAfterReleasingIdle(
     return state == cudaSuccess;
 }
 
+bool FastllmCudaGraphMemoryPoolActive() {
+    return fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) != FASTLLM_CUDA_GRAPH_POOL_IDLE;
+}
+
 bool FastllmCudaGraphMemoryPoolBegin() {
     FastllmCudaClearGraphError();
     std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
