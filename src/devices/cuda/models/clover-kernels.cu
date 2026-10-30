@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mma.h>
+#include <type_traits>
 
 namespace {
 // PDL hides launch/prologue latency without changing the dependency or
@@ -99,11 +100,13 @@ __global__ void CloverPreviewConv(const __nv_bfloat16 *input,
     output[row * channels + channel] = __float2bfloat16(sum / (1.f + expf(-sum)));
 }
 
+template<int FixedTokens>
 __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
         const __nv_bfloat16 *key, const __nv_bfloat16 *value, const float *g,
         const float *state, const float *logitScale, const float *historyBias,
         const float *historyScale, const int *slots, const unsigned char *valid,
-        __nv_bfloat16 *output, int tokens, int keyHeads, int valueHeads, int qkStride, int vStride) {
+        __nv_bfloat16 *output, int runtimeTokens, int keyHeads, int valueHeads, int qkStride, int vStride) {
+    const int tokens = FixedTokens ? FixedTokens : runtimeTokens;
     CloverDependencyStart();
     constexpr int dim = 128;
     const int request = blockIdx.z, token = blockIdx.x, head = blockIdx.y;
@@ -125,6 +128,7 @@ __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
     q[d] = qv * norm;
     // Four warps normalize independent key rows. Q/K stay in FP32 like the
     // standalone reference; the cache and all output rounding are unchanged.
+#pragma unroll
     for (int t = warp; t < tokens; t += 4) {
         float v[4], sum = 0.f;
         const size_t offset = ((size_t)request * tokens + t) * qkStride + keyHead * dim;
@@ -136,6 +140,7 @@ __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
         for (int i = 0; i < 4; ++i) k[t][lane + i * 32] = v[i] * inv;
     }
     __syncthreads();
+#pragma unroll
     for (int t = warp; t < tokens; t += 4) {
         float dot = 0.f;
         for (int i = 0; i < 4; ++i) dot += q[lane + i * 32] * k[t][lane + i * 32];
@@ -147,16 +152,20 @@ __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
     __syncthreads();
     if (d == 0) {
         int count = 0;
+#pragma unroll
         for (int t = 0; t < tokens; ++t) count += !valid || valid[(size_t)request * tokens + t];
         const float historyLogit = historyBias[head] + historyScale[head] * logf(fmaxf(count, 1) / 32.f);
         float maximum = historyLogit;
+#pragma unroll
         for (int t = 0; t < tokens; ++t) maximum = fmaxf(maximum, weights[t]);
         const float historyExp = expf(historyLogit - maximum);
         float denominator = historyExp;
+#pragma unroll
         for (int t = 0; t < tokens; ++t) {
             weights[t] = expf(weights[t] - maximum);
             denominator += weights[t];
         }
+#pragma unroll
         for (int t = 0; t < tokens; ++t) weights[t] /= denominator;
         historyWeight = historyExp / denominator;
     }
@@ -180,6 +189,7 @@ __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
     }
     __syncthreads();
     float history = histories[d], local = 0.f;
+#pragma unroll
     for (int t = 0; t < tokens; ++t)
         local += weights[t] * __bfloat162float(value[((size_t)request * tokens + t) * vStride + head * dim + d]);
     const float result = historyWeight * history * (1.f / sqrtf(128.f)) * expf(g[row * valueHeads + head]) + local;
@@ -457,12 +467,19 @@ bool FastllmCudaCloverPreviewGdn(const void *query, const void *key, const void 
         !ValidBlock(batch, tokens) || keyHeads <= 0 || valueHeads <= 0 || valueHeads > 65535 ||
         valueHeads % keyHeads || qkvRowStride < 0 || (qkvRowStride && qkvRowStride < valueHeads * 128))
         return false;
-    return CloverLaunch<CloverPreviewGdn>(
-        dim3(tokens, valueHeads, batch), 128, 0, Stream(stream), static_cast<const __nv_bfloat16 *>(query),
-        static_cast<const __nv_bfloat16 *>(key), static_cast<const __nv_bfloat16 *>(value), g, state,
-        logitScale, historyBias, historyScale, slots, valid, static_cast<__nv_bfloat16 *>(output), tokens,
-        keyHeads, valueHeads, qkvRowStride ? qkvRowStride : keyHeads * 128,
-        qkvRowStride ? qkvRowStride : valueHeads * 128);
+    // Fixed block widths expose the loop bounds without changing FP32
+    // accumulation order. Short blocks retain the generic implementation.
+    auto launch = [&](auto fixed) {
+        return CloverLaunch<CloverPreviewGdn<decltype(fixed)::value>>(
+            dim3(tokens, valueHeads, batch), 128, 0, Stream(stream), static_cast<const __nv_bfloat16 *>(query),
+            static_cast<const __nv_bfloat16 *>(key), static_cast<const __nv_bfloat16 *>(value), g, state,
+            logitScale, historyBias, historyScale, slots, valid, static_cast<__nv_bfloat16 *>(output), tokens,
+            keyHeads, valueHeads, qkvRowStride ? qkvRowStride : keyHeads * 128,
+            qkvRowStride ? qkvRowStride : valueHeads * 128);
+    };
+    if (tokens == 16) return launch(std::integral_constant<int, 16>{});
+    if (tokens == 32) return launch(std::integral_constant<int, 32>{});
+    return launch(std::integral_constant<int, 0>{});
 }
 
 bool FastllmCudaCloverCausalConv(const void *input, void *history, const void *weight, void *output,
