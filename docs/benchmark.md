@@ -6,6 +6,7 @@ Benchmark 按模型分别整理。测试硬件、推荐启动命令、实测速�
 
 ## 模型
 
+- [MiniMax-H3 音视频生成](benchmarks/minimax_h3.md)
 - [Qwen4-Exp / Qwen3.8-Flash-Next](benchmarks/qwen4_exp.md)
 - [Qwen3.5 / Qwen3.6 / Qwen3.8](benchmarks/qwen3.md)
 - [DeepSeek-V4 / DeepSeek-V4-Flash](benchmarks/deepseek_v4.md)
