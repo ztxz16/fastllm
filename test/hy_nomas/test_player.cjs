@@ -92,7 +92,7 @@ function tickAt(time) {
     assert.equal(calls[0][0],'/v1/worlds/world_test/actions');
     assert.equal(JSON.parse(calls[0][1].body).action,'forward');
     assert.equal(element('forward').disabled,false);
-    assert.match(element('session-info').textContent,/2 段 \/ 40 帧/);
+    assert.equal(element('session-info').textContent,'当前场景');
     let prevented=false;
     listeners.keydown({repeat:false,key:'w',target:{tagName:'TEXTAREA'},preventDefault(){prevented=true;}});
     listeners.keydown({repeat:true,key:'w',target:{tagName:'CANVAS'},preventDefault(){prevented=true;}});
