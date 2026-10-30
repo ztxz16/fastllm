@@ -67,10 +67,11 @@ __device__ __forceinline__ float WarpSum(float x) {
     return __shfl_sync(0xffffffff, x, 0);
 }
 
+template<bool Indirect>
 __global__ void CloverPreviewConv(const __nv_bfloat16 *input,
         const __nv_bfloat16 *history, const __nv_bfloat16 *weight,
         const __nv_bfloat16 *rightWeight, const int *slots,
-        const unsigned char *valid, __nv_bfloat16 *output, int tokens, int channels) {
+        const unsigned char *valid, __nv_bfloat16 *output, int tokens, int channels, CloverCudaGdnCaches caches) {
     CloverDependencyStart();
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= channels) return;
@@ -81,12 +82,14 @@ __global__ void CloverPreviewConv(const __nv_bfloat16 *input,
         output[row * channels + channel] = __float2bfloat16(0.f);
         return;
     }
+    if constexpr (Indirect) history = (const __nv_bfloat16 *)caches.conv[slot];
+    const int cacheSlot = Indirect ? 0 : slot;
     float sum = 0.f;
     for (int tap = 0; tap < 4; ++tap) {
         const int source = token + tap - 3;
         float x = 0.f;
         if (source < 0)
-            x = __bfloat162float(history[((size_t)slot * channels + channel) * 3 + source + 3]);
+            x = __bfloat162float(history[((size_t)cacheSlot * channels + channel) * 3 + source + 3]);
         else if (!valid || valid[(size_t)request * tokens + source])
             x = __bfloat162float(input[((size_t)request * tokens + source) * channels + channel]);
         sum += x * __bfloat162float(weight[channel * 4 + tap]);
@@ -103,12 +106,12 @@ __global__ void CloverPreviewConv(const __nv_bfloat16 *input,
 // A CTA evaluates several queries against the same head. Key normalization,
 // value loads and state loads are shared; each query keeps the original FP32
 // accumulation order and BF16 output boundary.
-template<int FixedTokens, int Queries>
+template<int FixedTokens, int Queries, bool Indirect>
 __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
         const __nv_bfloat16 *key, const __nv_bfloat16 *value, const float *g,
         const float *state, const float *logitScale, const float *historyBias,
         const float *historyScale, const int *slots, const unsigned char *valid,
-        __nv_bfloat16 *output, int runtimeTokens, int keyHeads, int valueHeads, int qkStride, int vStride) {
+        __nv_bfloat16 *output, int runtimeTokens, int keyHeads, int valueHeads, int qkStride, int vStride, CloverCudaGdnCaches caches) {
     CloverDependencyStart();
     constexpr int dim = 128, Capacity = FixedTokens ? FixedTokens : 32;
     const int tokens = FixedTokens ? FixedTokens : runtimeTokens;
@@ -122,6 +125,8 @@ __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
             output[(((size_t)request * tokens + first + qi) * valueHeads + head) * dim + d] = __float2bfloat16(0.f);
         return;
     }
+    if constexpr (Indirect) state = caches.state[slot];
+    const int cacheSlot = Indirect ? 0 : slot;
     __shared__ float q[Queries][dim], k[Capacity][dim], weights[Queries][Capacity];
     __shared__ float partial[Queries][4], historyWeight[Queries], histories[Queries][dim];
     float qv[Queries];
@@ -194,7 +199,7 @@ __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
     __syncthreads();
 #pragma unroll 4
     for (int valueIndex = warp; valueIndex < dim; valueIndex += 4) {
-        const size_t stateOffset = (((size_t)slot * valueHeads + head) * dim + valueIndex) * dim;
+        const size_t stateOffset = (((size_t)cacheSlot * valueHeads + head) * dim + valueIndex) * dim;
         float sums[Queries] = {};
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -225,22 +230,36 @@ __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
     }
 }
 
+bool ValidCaches(const CloverCudaGdnCaches *caches, int batch, bool conv) {
+    if (!caches) return true;
+    if (batch < 1 || batch > CloverCudaGdnCaches::Capacity) return false;
+    for (int b = 0; b < batch; ++b)
+        if (conv ? !caches->conv[b] : !caches->state[b]) return false;
+    return true;
+}
+
 bool ValidBlock(int batch, int tokens) {
     return batch > 0 && batch <= 65535 && tokens > 0 && tokens <= 32 && 32 % tokens == 0;
 }
 
+template<bool Indirect>
 __global__ void CloverCausalConv(const __nv_bfloat16 *input,
         const __nv_bfloat16 *history, const __nv_bfloat16 *weight,
-        __nv_bfloat16 *output, __nv_bfloat16 *snapshots, int batch, int tokens, int channels) {
+        __nv_bfloat16 *output, __nv_bfloat16 *snapshots, int batch, int tokens, int channels, CloverCudaGdnCaches caches) {
     CloverDependencyStart();
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= channels) return;
     const int request = blockIdx.z, token = blockIdx.y;
+    if constexpr (Indirect) {
+        history = (const __nv_bfloat16 *)caches.conv[request];
+        snapshots = (__nv_bfloat16 *)caches.convSnapshots[request];
+    }
+    const int cacheSlot = Indirect ? 0 : request, cacheBatch = Indirect ? 1 : batch;
     float sum = 0.f;
     for (int tap = 0; tap < 4; ++tap) {
         const int source = token + tap - 3;
         const __nv_bfloat16 x = source < 0
-            ? history[((size_t)request * channels + channel) * 3 + source + 3]
+            ? history[((size_t)cacheSlot * channels + channel) * 3 + source + 3]
             : input[((size_t)request * tokens + source) * channels + channel];
         // The official causal convolution rounds each product to input dtype
         // before its FP32 accumulation. Preview intentionally uses FP32 products.
@@ -252,8 +271,8 @@ __global__ void CloverCausalConv(const __nv_bfloat16 *input,
     if (snapshots) {
         for (int tap = 0; tap < 3; ++tap) {
             const int source = token + tap - 2;
-            snapshots[(((size_t)token * batch + request) * channels + channel) * 3 + tap] = source < 0
-                ? history[((size_t)request * channels + channel) * 3 + source + 3]
+            snapshots[(((size_t)token * cacheBatch + cacheSlot) * channels + channel) * 3 + tap] = source < 0
+                ? history[((size_t)cacheSlot * channels + channel) * 3 + source + 3]
                 : input[((size_t)request * tokens + source) * channels + channel];
         }
     }
@@ -292,21 +311,24 @@ __global__ void CloverTiledCausalConv(const __nv_bfloat16 *input, const __nv_bfl
     }
 }
 
+template<bool Indirect>
 __global__ void CloverCommitConv(const __nv_bfloat16 *input, __nv_bfloat16 *history,
-        int tokens, int channels) {
+        int tokens, int channels, CloverCudaGdnCaches caches) {
     CloverDependencyStart();
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= channels) return;
     const int request = blockIdx.y;
+    if constexpr (Indirect) history = (__nv_bfloat16 *)caches.conv[request];
+    const int cacheSlot = Indirect ? 0 : request;
     __nv_bfloat16 tail[3];
     for (int tap = 0; tap < 3; ++tap) {
         const int source = tokens + tap - 3;
         tail[tap] = source < 0
-            ? history[((size_t)request * channels + channel) * 3 + source + 3]
+            ? history[((size_t)cacheSlot * channels + channel) * 3 + source + 3]
             : input[((size_t)request * tokens + source) * channels + channel];
     }
     for (int tap = 0; tap < 3; ++tap)
-        history[((size_t)request * channels + channel) * 3 + tap] = tail[tap];
+        history[((size_t)cacheSlot * channels + channel) * 3 + tap] = tail[tap];
 }
 
 __global__ void CloverPrepareCausalGdn(const __nv_bfloat16 *query, const __nv_bfloat16 *key,
@@ -333,16 +355,21 @@ __global__ void CloverPrepareCausalGdn(const __nv_bfloat16 *query, const __nv_bf
     for (int i = lane; i < ratio; i += 32)
         decay[row * valueHeads + head * ratio + i] = expf(g[row * valueHeads + head * ratio + i]);
 }
-template<bool Prepared>
+template<bool Prepared, bool Indirect>
 __global__ void CloverCausalGdn(const __nv_bfloat16 *query, const __nv_bfloat16 *key,
         const __nv_bfloat16 *value, const float *g, const __nv_bfloat16 *beta,
         float *state, __nv_bfloat16 *output, float *snapshots,
-        int batch, int tokens, int keyHeads, int valueHeads, const float *prepared, int qkStride, int vStride) {
+        int batch, int tokens, int keyHeads, int valueHeads, const float *prepared, int qkStride, int vStride, CloverCudaGdnCaches caches) {
     CloverDependencyStart();
     const int lane = threadIdx.x % 32, valueIndex = blockIdx.x * 8 + threadIdx.x / 32;
     const int head = blockIdx.y, request = blockIdx.z;
     const int keyHead = head / (valueHeads / keyHeads);
-    const size_t stateOffset = (((size_t)request * valueHeads + head) * 128 + valueIndex) * 128;
+    if constexpr (Indirect) {
+        state = caches.state[request];
+        snapshots = caches.stateSnapshots[request];
+    }
+    const int cacheSlot = Indirect ? 0 : request, cacheBatch = Indirect ? 1 : batch;
+    const size_t stateOffset = (((size_t)cacheSlot * valueHeads + head) * 128 + valueIndex) * 128;
     const size_t qkCount = (size_t)batch * tokens * keyHeads * 128;
     float s[4];
     for (int j = 0; j < 4; ++j) s[j] = state[stateOffset + lane + j * 32];
@@ -378,7 +405,7 @@ __global__ void CloverCausalGdn(const __nv_bfloat16 *query, const __nv_bfloat16 
             s[j] += k[j] * delta;
             y += s[j] * q[j];
             if (snapshots)
-                snapshots[(size_t)token * batch * valueHeads * 128 * 128 + stateOffset + lane + j * 32] = s[j];
+                snapshots[(size_t)token * cacheBatch * valueHeads * 128 * 128 + stateOffset + lane + j * 32] = s[j];
         }
         y = WarpSum(y);
         if (lane == 0) output[(row * valueHeads + head) * 128 + valueIndex] = __float2bfloat16(y);
@@ -476,74 +503,83 @@ cudaStream_t Stream(void *stream) {
 
 bool FastllmCudaCloverPreviewConv(const void *input, const void *history, const void *weight,
                                   const void *rightWeight, const int *slots, const unsigned char *valid,
-                                  void *output, int batch, int tokens, int channels, void *stream) {
-    if (!input || !history || !weight || !rightWeight || !output || !ValidBlock(batch, tokens) ||
-        channels <= 0)
+                                  void *output, int batch, int tokens, int channels, void *stream, const CloverCudaGdnCaches *caches) {
+    if (!input || (!history && !caches) || !weight || !rightWeight || !output || !ValidBlock(batch, tokens) ||
+        channels <= 0 || !ValidCaches(caches, batch, true))
         return false;
-    return CloverLaunch<CloverPreviewConv>(
-        dim3((channels + 255) / 256, tokens, batch), 256, 0, Stream(stream),
-        static_cast<const __nv_bfloat16 *>(input), static_cast<const __nv_bfloat16 *>(history),
-        static_cast<const __nv_bfloat16 *>(weight), static_cast<const __nv_bfloat16 *>(rightWeight), slots,
-        valid, static_cast<__nv_bfloat16 *>(output), tokens, channels);
+    auto launch = [&](auto indirect) {
+        return CloverLaunch<CloverPreviewConv<decltype(indirect)::value>>(
+            dim3((channels + 255) / 256, tokens, batch), 256, 0, Stream(stream),
+            static_cast<const __nv_bfloat16 *>(input), static_cast<const __nv_bfloat16 *>(history),
+            static_cast<const __nv_bfloat16 *>(weight), static_cast<const __nv_bfloat16 *>(rightWeight), slots,
+            valid, static_cast<__nv_bfloat16 *>(output), tokens, channels, caches ? *caches : CloverCudaGdnCaches{});
+    };
+    return caches ? launch(std::true_type{}) : launch(std::false_type{});
 }
 
 bool FastllmCudaCloverPreviewGdn(const void *query, const void *key, const void *value, const float *g,
                                  const float *state, const float *logitScale, const float *historyBias,
                                  const float *historyScale, const int *slots, const unsigned char *valid,
                                  void *output, int batch, int tokens, int keyHeads, int valueHeads,
-                                 void *stream, int qkvRowStride) {
-    if (!query || !key || !value || !g || !state || !logitScale || !historyBias || !historyScale || !output ||
-        !ValidBlock(batch, tokens) || keyHeads <= 0 || valueHeads <= 0 || valueHeads > 65535 ||
+                                 void *stream, int qkvRowStride, const CloverCudaGdnCaches *caches) {
+    if (!query || !key || !value || !g || (!state && !caches) || !logitScale || !historyBias || !historyScale || !output ||
+        !ValidBlock(batch, tokens) || !ValidCaches(caches, batch, false) || keyHeads <= 0 || valueHeads <= 0 || valueHeads > 65535 ||
         valueHeads % keyHeads || qkvRowStride < 0 || (qkvRowStride && qkvRowStride < valueHeads * 128))
         return false;
-    auto launch = [&](auto width, auto count) {
-        constexpr int queries = decltype(count)::value;
-        return CloverLaunch<CloverPreviewGdn<decltype(width)::value, queries>>(
-            dim3(tokens / queries, valueHeads, batch), 128, 0, Stream(stream),
-            (const __nv_bfloat16 *)query, (const __nv_bfloat16 *)key, (const __nv_bfloat16 *)value,
-            g, state, logitScale, historyBias, historyScale, slots, valid, (__nv_bfloat16 *)output,
-            tokens, keyHeads, valueHeads, qkvRowStride ? qkvRowStride : keyHeads * 128,
-            qkvRowStride ? qkvRowStride : valueHeads * 128);
+    auto dispatch = [&](auto indirect) {
+        auto launch = [&](auto width, auto count) {
+            constexpr int queries = decltype(count)::value;
+            return CloverLaunch<CloverPreviewGdn<decltype(width)::value, queries, decltype(indirect)::value>>(
+                dim3(tokens / queries, valueHeads, batch), 128, 0, Stream(stream),
+                (const __nv_bfloat16 *)query, (const __nv_bfloat16 *)key, (const __nv_bfloat16 *)value,
+                g, state, logitScale, historyBias, historyScale, slots, valid, (__nv_bfloat16 *)output,
+                tokens, keyHeads, valueHeads, qkvRowStride ? qkvRowStride : keyHeads * 128,
+                qkvRowStride ? qkvRowStride : valueHeads * 128, caches ? *caches : CloverCudaGdnCaches{});
+        };
+        auto grouped = [&](auto width) {
+            // Reusing a small, hot state helps microbenchmarks but reduces CTA
+            // parallelism with cold model state. Keep one query per CTA for the
+            // common single-request 16-token block; wider blocks retain reuse.
+            if (batch == 1) {
+                if constexpr (decltype(width)::value == 16)
+                    return launch(width, std::integral_constant<int, 1>{});
+                else return launch(width, std::integral_constant<int, 2>{});
+            }
+            return launch(width, std::integral_constant<int, 4>{});
+        };
+        if (tokens == 16) return grouped(std::integral_constant<int, 16>{});
+        if (tokens == 32) return grouped(std::integral_constant<int, 32>{});
+        return launch(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{});
     };
-    auto grouped = [&](auto width) {
-        // Reusing a small, hot state helps microbenchmarks but reduces CTA
-        // parallelism with cold model state. Keep one query per CTA for the
-        // common single-request 16-token block; wider blocks retain reuse.
-        if (batch == 1) {
-            if constexpr (decltype(width)::value == 16)
-                return launch(width, std::integral_constant<int, 1>{});
-            else return launch(width, std::integral_constant<int, 2>{});
-        }
-        return launch(width, std::integral_constant<int, 4>{});
-    };
-    if (tokens == 16) return grouped(std::integral_constant<int, 16>{});
-    if (tokens == 32) return grouped(std::integral_constant<int, 32>{});
-    return launch(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{});
+    return caches ? dispatch(std::true_type{}) : dispatch(std::false_type{});
 }
 
 bool FastllmCudaCloverCausalConv(const void *input, void *history, const void *weight, void *output,
-                                 void *snapshots, int batch, int tokens, int channels, void *stream) {
-    if (!input || !history || !weight || !output || batch <= 0 || batch > 65535 || tokens <= 0 ||
-        tokens > 65535 || channels <= 0)
+                                 void *snapshots, int batch, int tokens, int channels, void *stream, const CloverCudaGdnCaches *caches) {
+    if (!input || (!history && !caches) || !weight || !output || batch <= 0 || batch > 65535 || tokens <= 0 ||
+        tokens > 65535 || channels <= 0 || !ValidCaches(caches, batch, true))
         return false;
-    if (!snapshots && tokens >= 128 && channels >= 2048) {
-        if (!CloverLaunch<CloverTiledCausalConv>(dim3((channels + 255) / 256, (tokens + 7) / 8, batch), 256,
-                                                 0, Stream(stream), static_cast<const __nv_bfloat16 *>(input),
-                                                 static_cast<const __nv_bfloat16 *>(history),
-                                                 static_cast<const __nv_bfloat16 *>(weight),
-                                                 static_cast<__nv_bfloat16 *>(output), tokens, channels))
-            return false;
-    } else {
-        if (!CloverLaunch<CloverCausalConv>(
-                dim3((channels + 255) / 256, tokens, batch), 256, 0, Stream(stream),
-                static_cast<const __nv_bfloat16 *>(input), static_cast<const __nv_bfloat16 *>(history),
-                static_cast<const __nv_bfloat16 *>(weight), static_cast<__nv_bfloat16 *>(output),
-                static_cast<__nv_bfloat16 *>(snapshots), batch, tokens, channels))
-            return false;
-    }
-    return CloverLaunch<CloverCommitConv>(dim3((channels + 255) / 256, batch), 256, 0, Stream(stream),
-                                          static_cast<const __nv_bfloat16 *>(input),
-                                          static_cast<__nv_bfloat16 *>(history), tokens, channels);
+    auto dispatch = [&](auto indirect) {
+        if (!caches && !snapshots && tokens >= 128 && channels >= 2048) {
+            if (!CloverLaunch<CloverTiledCausalConv>(dim3((channels + 255) / 256, (tokens + 7) / 8, batch), 256,
+                                                     0, Stream(stream), static_cast<const __nv_bfloat16 *>(input),
+                                                     static_cast<const __nv_bfloat16 *>(history),
+                                                     static_cast<const __nv_bfloat16 *>(weight),
+                                                     static_cast<__nv_bfloat16 *>(output), tokens, channels))
+                return false;
+        } else {
+            if (!CloverLaunch<CloverCausalConv<decltype(indirect)::value>>(
+                    dim3((channels + 255) / 256, tokens, batch), 256, 0, Stream(stream),
+                    static_cast<const __nv_bfloat16 *>(input), static_cast<const __nv_bfloat16 *>(history),
+                    static_cast<const __nv_bfloat16 *>(weight), static_cast<__nv_bfloat16 *>(output),
+                    static_cast<__nv_bfloat16 *>(snapshots), batch, tokens, channels, caches ? *caches : CloverCudaGdnCaches{}))
+                return false;
+        }
+        return CloverLaunch<CloverCommitConv<decltype(indirect)::value>>(dim3((channels + 255) / 256, batch), 256, 0, Stream(stream),
+                                              static_cast<const __nv_bfloat16 *>(input),
+                                              static_cast<__nv_bfloat16 *>(history), tokens, channels, caches ? *caches : CloverCudaGdnCaches{});
+    };
+    return caches ? dispatch(std::true_type{}) : dispatch(std::false_type{});
 }
 
 #include "clover-gdn-prefill.cuh"
@@ -564,44 +600,47 @@ bool FastllmCudaCloverPrefillGdn(const void *query, const void *key, const void 
 bool FastllmCudaCloverCausalGdn(const void *query, const void *key, const void *value, const float *g,
                                 const void *beta, float *state, void *output, float *snapshots, int batch,
                                 int tokens, int keyHeads, int valueHeads, void *stream, float *workspace,
-                                int qkvRowStride) {
-    if (!query || !key || !value || !g || !beta || !state || !output || batch <= 0 || batch > 65535 ||
+                                int qkvRowStride, const CloverCudaGdnCaches *caches) {
+    if (!query || !key || !value || !g || !beta || (!state && !caches) || !output || batch <= 0 || batch > 65535 || !ValidCaches(caches, batch, false) ||
         tokens <= 0 || keyHeads <= 0 || valueHeads <= 0 || valueHeads > 65535 || valueHeads % keyHeads ||
         qkvRowStride < 0 || (qkvRowStride && qkvRowStride < valueHeads * 128))
         return false;
     const int qkStride = qkvRowStride ? qkvRowStride : keyHeads * 128;
     const int vStride = qkvRowStride ? qkvRowStride : valueHeads * 128;
-    if (workspace && tokens >= 16 && tokens <= 65535) {
-        size_t qk = (size_t)batch * tokens * keyHeads * 128;
-        if (!CloverLaunch<CloverPrepareCausalGdn>(dim3(keyHeads, tokens, batch), 32, 0, Stream(stream),
-                                                  (const __nv_bfloat16 *)query, (const __nv_bfloat16 *)key, g,
-                                                  workspace, workspace + qk, workspace + 2 * qk, tokens,
-                                                  keyHeads, valueHeads, qkStride))
-            return false;
-        if (!snapshots && tokens >= 128 && valueHeads >= 16) {
-            if (!CloverLaunch<CloverPrefillGdn>(dim3(8, valueHeads, batch), 128, 0, Stream(stream), workspace,
-                                                (const __nv_bfloat16 *)value, (const __nv_bfloat16 *)beta,
-                                                state, (__nv_bfloat16 *)output, batch, tokens, keyHeads,
-                                                valueHeads, vStride))
+    auto dispatch = [&](auto indirect) {
+        if (workspace && tokens >= 16 && tokens <= 65535) {
+            size_t qk = (size_t)batch * tokens * keyHeads * 128;
+            if (!CloverLaunch<CloverPrepareCausalGdn>(dim3(keyHeads, tokens, batch), 32, 0, Stream(stream),
+                                                      (const __nv_bfloat16 *)query, (const __nv_bfloat16 *)key, g,
+                                                      workspace, workspace + qk, workspace + 2 * qk, tokens,
+                                                      keyHeads, valueHeads, qkStride))
                 return false;
+            if (!caches && !snapshots && tokens >= 128 && valueHeads >= 16) {
+                if (!CloverLaunch<CloverPrefillGdn>(dim3(8, valueHeads, batch), 128, 0, Stream(stream), workspace,
+                                                    (const __nv_bfloat16 *)value, (const __nv_bfloat16 *)beta,
+                                                    state, (__nv_bfloat16 *)output, batch, tokens, keyHeads,
+                                                    valueHeads, vStride))
+                    return false;
+            } else {
+                if (!CloverLaunch<CloverCausalGdn<true, decltype(indirect)::value>>(
+                        dim3(16, valueHeads, batch), 256, 0, Stream(stream), (const __nv_bfloat16 *)query,
+                        (const __nv_bfloat16 *)key, (const __nv_bfloat16 *)value, g, (const __nv_bfloat16 *)beta,
+                        state, (__nv_bfloat16 *)output, snapshots, batch, tokens, keyHeads, valueHeads, workspace,
+                        qkStride, vStride, caches ? *caches : CloverCudaGdnCaches{}))
+                    return false;
+            }
         } else {
-            if (!CloverLaunch<CloverCausalGdn<true>>(
-                    dim3(16, valueHeads, batch), 256, 0, Stream(stream), (const __nv_bfloat16 *)query,
-                    (const __nv_bfloat16 *)key, (const __nv_bfloat16 *)value, g, (const __nv_bfloat16 *)beta,
-                    state, (__nv_bfloat16 *)output, snapshots, batch, tokens, keyHeads, valueHeads, workspace,
-                    qkStride, vStride))
+            if (!CloverLaunch<CloverCausalGdn<false, decltype(indirect)::value>>(
+                    dim3(16, valueHeads, batch), 256, 0, Stream(stream),
+                    static_cast<const __nv_bfloat16 *>(query), static_cast<const __nv_bfloat16 *>(key),
+                    static_cast<const __nv_bfloat16 *>(value), g, static_cast<const __nv_bfloat16 *>(beta), state,
+                    static_cast<__nv_bfloat16 *>(output), snapshots, batch, tokens, keyHeads, valueHeads, nullptr,
+                    qkStride, vStride, caches ? *caches : CloverCudaGdnCaches{}))
                 return false;
         }
-    } else {
-        if (!CloverLaunch<CloverCausalGdn<false>>(
-                dim3(16, valueHeads, batch), 256, 0, Stream(stream),
-                static_cast<const __nv_bfloat16 *>(query), static_cast<const __nv_bfloat16 *>(key),
-                static_cast<const __nv_bfloat16 *>(value), g, static_cast<const __nv_bfloat16 *>(beta), state,
-                static_cast<__nv_bfloat16 *>(output), snapshots, batch, tokens, keyHeads, valueHeads, nullptr,
-                qkStride, vStride))
-            return false;
-    }
-    return true;
+        return true;
+    };
+    return caches ? dispatch(std::true_type{}) : dispatch(std::false_type{});
 }
 
 namespace {

@@ -259,72 +259,82 @@ void CloverModel::Gdn(Data &input, int layer, std::pair<Data, Data> &cache, bool
     std::string p = Layer(layer) + "linear_attn.";
     Data projected, normalized;
     Linear(input, weight[p + "fused_in_proj.weight"], *GetEmptyData(), projected);
-    GdnCore(projected, layer, cache, preview, normalized, snapshots);
+    auto *cachePointer = &cache;
+    GdnCoreBatch(projected, layer, &cachePointer, 1, preview, normalized, snapshots ? &snapshots : nullptr);
     Linear(normalized, weight[p + "out_proj.weight"], *GetEmptyData(), output);
 #endif
 }
-void CloverModel::GdnCore(Data &projected, int layer, std::pair<Data, Data> &cache,
-        bool preview, Data &normalized, std::pair<Data, Data> *snapshots) {
+void CloverModel::GdnCoreBatch(Data &projected, int layer, std::pair<Data, Data> *const *caches, int batch,
+        bool preview, Data &normalized, std::pair<Data, Data> *const *snapshots) {
 #ifdef USE_CUDA
     std::string p = Layer(layer) + "linear_attn.";
-    const int t = projected.dims[0], channels = (2 * keyHeads + valueHeads) * 128;
-    auto &conv = cache.first; auto &state = cache.second;
-    if (conv.dims.empty()) PrepareCloverData(conv, BFLOAT16, {1, channels, 3}, cudaDevice, true);
-    if (state.dims.empty()) PrepareCloverData(state, FLOAT32, {1, valueHeads, 128, 128}, cudaDevice, true);
-    if (snapshots) {
-        PrepareCloverData(snapshots->first, BFLOAT16, {t, 1, channels, 3}, cudaDevice);
-        PrepareCloverData(snapshots->second, FLOAT32, {t, 1, valueHeads, 128, 128}, cudaDevice);
+    Check(batch > 0 && batch <= CloverCudaGdnCaches::Capacity && projected.dims[0] % batch == 0,
+        "invalid GDN batch shape");
+    const int rows = projected.dims[0], t = rows / batch, channels = (2 * keyHeads + valueHeads) * 128;
+    CloverCudaGdnCaches pointers;
+    for (int b = 0; b < batch; ++b) {
+        auto &conv = caches[b]->first; auto &state = caches[b]->second;
+        if (conv.dims.empty()) PrepareCloverData(conv, BFLOAT16, {1, channels, 3}, cudaDevice, true);
+        if (state.dims.empty()) PrepareCloverData(state, FLOAT32, {1, valueHeads, 128, 128}, cudaDevice, true);
+        pointers.conv[b] = conv.cudaData; pointers.state[b] = (float *)state.cudaData;
+        if (snapshots) {
+            PrepareCloverData(snapshots[b]->first, BFLOAT16, {t, 1, channels, 3}, cudaDevice);
+            PrepareCloverData(snapshots[b]->second, FLOAT32, {t, 1, valueHeads, 128, 128}, cudaDevice);
+            pointers.convSnapshots[b] = snapshots[b]->first.cudaData;
+            pointers.stateSnapshots[b] = (float *)snapshots[b]->second.cudaData;
+        }
     }
+    const auto *indirect = batch > 1 ? &pointers : nullptr;
     Data raw, mixed, g, beta, y, z, causalWorkspace;
-    PrepareCloverData(raw, BFLOAT16, {t, channels}, cudaDevice);
-    PrepareCloverData(z, BFLOAT16, {t, valueHeads, 128}, cudaDevice);
-    PrepareCloverData(g, FLOAT32, {t, valueHeads}, cudaDevice);
-    if (!preview) PrepareCloverData(beta, BFLOAT16, {t, valueHeads}, cudaDevice);
+    PrepareCloverData(raw, BFLOAT16, {rows, channels}, cudaDevice);
+    PrepareCloverData(z, BFLOAT16, {rows, valueHeads, 128}, cudaDevice);
+    PrepareCloverData(g, FLOAT32, {rows, valueHeads}, cudaDevice);
+    if (!preview) PrepareCloverData(beta, BFLOAT16, {rows, valueHeads}, cudaDevice);
     Check(FastllmCudaCloverUnpackGdn(projected.cudaData, (float *)weight[p + "A_log"].cudaData,
         (float *)weight[p + "dt_bias"].cudaData, raw.cudaData, z.cudaData, (float *)g.cudaData,
-        beta.cudaData, t, channels, valueHeads, nullptr), "GDN projection unpack failed");
-    PrepareCloverData(mixed, BFLOAT16, {t, channels}, cudaDevice);
+        beta.cudaData, rows, channels, valueHeads, nullptr), "GDN projection unpack failed");
+    PrepareCloverData(mixed, BFLOAT16, {rows, channels}, cudaDevice);
     if (preview)
-        Check(FastllmCudaCloverPreviewConv(raw.cudaData, conv.cudaData,
+        Check(FastllmCudaCloverPreviewConv(raw.cudaData, pointers.conv[0],
             weight[p + "conv1d.weight"].cudaData, weight[p + "conv_right_weight"].cudaData,
-            nullptr, nullptr, mixed.cudaData, 1, t, channels), "preview convolution failed");
+            nullptr, nullptr, mixed.cudaData, batch, t, channels, nullptr, indirect), "preview convolution failed");
     else
-        Check(FastllmCudaCloverCausalConv(raw.cudaData, conv.cudaData,
-            weight[p + "conv1d.weight"].cudaData, mixed.cudaData, snapshots ? snapshots->first.cudaData : nullptr, 1, t, channels), "causal convolution failed");
+        Check(FastllmCudaCloverCausalConv(raw.cudaData, pointers.conv[0],
+            weight[p + "conv1d.weight"].cudaData, mixed.cudaData, pointers.convSnapshots[0], batch, t, channels, nullptr, indirect), "causal convolution failed");
     // Read strided views directly from the convolved QKV buffer. This removes
     // three copies while keeping the BF16 values and FP32 recurrence unchanged.
     const auto *q = static_cast<const uint16_t *>(mixed.cudaData);
     const auto *k = q + keyHeads * 128;
     const auto *v = q + keyHeads * 256;
-    PrepareCloverData(y, BFLOAT16, {t, valueHeads, 128}, cudaDevice);
+    PrepareCloverData(y, BFLOAT16, {rows, valueHeads, 128}, cudaDevice);
     if (preview)
         Check(FastllmCudaCloverPreviewGdn(q, k, v, (float *)g.cudaData,
-            (float *)state.cudaData, (float *)weight[p + "bd_softmax_logit_scale"].cudaData,
+            pointers.state[0], (float *)weight[p + "bd_softmax_logit_scale"].cudaData,
             (float *)weight[p + "bd_softmax_history_bias"].cudaData,
             (float *)weight[p + "bd_softmax_history_c"].cudaData,
-            nullptr, nullptr, y.cudaData, 1, t, keyHeads, valueHeads, nullptr, channels), "preview GDN failed");
+            nullptr, nullptr, y.cudaData, batch, t, keyHeads, valueHeads, nullptr, channels, indirect), "preview GDN failed");
     else {
-        size_t blockBytes = !snapshots && t >= 2048 && valueHeads >= 16
+        size_t blockBytes = batch == 1 && !snapshots && t >= 2048 && valueHeads >= 16
             ? FastllmCudaCloverPrefillGdnWorkspaceBytes(1, t, keyHeads, valueHeads) : 0;
         if (blockBytes) {
             if (gdnPrefillWorkspace.GetBytes() < blockBytes)
                 PrepareCloverData(gdnPrefillWorkspace, INT32,
                     {int((blockBytes + 3) / 4)}, cudaDevice);
             Check(FastllmCudaCloverPrefillGdn(q, k, v, (float *)g.cudaData,
-                beta.cudaData, (float *)state.cudaData, y.cudaData, 1, t, keyHeads, valueHeads,
+                beta.cudaData, pointers.state[0], y.cudaData, 1, t, keyHeads, valueHeads,
                 gdnPrefillWorkspace.cudaData, gdnPrefillWorkspace.GetBytes(), nullptr, channels),
                 "block prefill GDN failed");
         } else {
             if (t >= 16) PrepareCloverData(causalWorkspace, FLOAT32,
-                {t, 2 * keyHeads * 128 + valueHeads}, cudaDevice);
+                {rows, 2 * keyHeads * 128 + valueHeads}, cudaDevice);
             Check(FastllmCudaCloverCausalGdn(q, k, v, (float *)g.cudaData,
-                beta.cudaData, (float *)state.cudaData, y.cudaData, snapshots ? (float *)snapshots->second.cudaData : nullptr,
-                1, t, keyHeads, valueHeads, nullptr, (float *)causalWorkspace.cudaData, channels), "causal GDN failed");
+                beta.cudaData, pointers.state[0], y.cudaData, pointers.stateSnapshots[0],
+                batch, t, keyHeads, valueHeads, nullptr, (float *)causalWorkspace.cudaData, channels, indirect), "causal GDN failed");
         }
     }
     z.Reshape(y.dims);
     Norm(y, p + "norm.weight", normalized, &z, false);
-    normalized.Reshape({t, valueHeads * 128});
+    normalized.Reshape({rows, valueHeads * 128});
 #endif
 }
 void CloverModel::FullAttention(Data &input, int layer, std::pair<Data, Data> &cache,
@@ -632,8 +642,8 @@ void CloverModel::ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens
     for (int layer = 0; layer < block_cnt; ++layer) {
         Data attention, post, moe;
         if (layer == 0) Norm(hidden, Layer(layer) + "input_layernorm.weight", norm);
-        // Project all request rows together. Only the stateful attention core
-        // uses per-request views; it writes directly into the combined buffer.
+        // Project all request rows together. GDN accesses independent request
+        // caches through a pointer table; full attention retains request views.
         const std::string p = Layer(layer) + (linearLayers[layer] ? "linear_attn." : "self_attn.");
         const int attentionDim = linearLayers[layer] ? valueHeads * 128 : num_attention_heads * head_dim;
         Data projected, attended;
@@ -642,14 +652,20 @@ void CloverModel::ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens
             project(norm, weight[p + "fused_in_proj.weight"], projected);
         else
             project(norm, weight[p + "qkv_proj.weight"], projected);
-        for (int b = 0; b < batch; ++b) {
-            Data input(BFLOAT16, {width, projected.dims.back()}), output(BFLOAT16, {width, attentionDim});
-            input.FakeFrom(projected, (size_t)b * width * projected.dims.back() * sizeof(uint16_t));
-            output.FakeFrom(attended, (size_t)b * width * attentionDim * sizeof(uint16_t));
-            if (linearLayers[layer])
-                GdnCore(input, layer, (*caches[b])[layer], preview, output,
-                    snapshots.empty() ? nullptr : &snapshots[b]->layers[layer]);
-            else {
+        if (linearLayers[layer]) {
+            std::pair<Data, Data> *cachePointers[CloverCudaGdnCaches::Capacity],
+                                  *snapshotPointers[CloverCudaGdnCaches::Capacity];
+            for (int b = 0; b < batch; ++b) {
+                cachePointers[b] = &(*caches[b])[layer];
+                snapshotPointers[b] = snapshots.empty() ? nullptr : &snapshots[b]->layers[layer];
+            }
+            GdnCoreBatch(projected, layer, cachePointers, batch, preview, attended,
+                snapshots.empty() ? nullptr : snapshotPointers);
+        } else {
+            for (int b = 0; b < batch; ++b) {
+                Data input(BFLOAT16, {width, projected.dims.back()}), output(BFLOAT16, {width, attentionDim});
+                input.FakeFrom(projected, (size_t)b * width * projected.dims.back() * sizeof(uint16_t));
+                output.FakeFrom(attended, (size_t)b * width * attentionDim * sizeof(uint16_t));
                 Data k, v;
                 FullAttentionCore(input, k, v, layer, (*caches[b])[layer], positions[b], preview, output);
             }

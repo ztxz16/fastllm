@@ -2,6 +2,17 @@
 #define FASTLLM_CUDA_CLOVER_H
 #include <cstddef>
 
+// Host-side pointer table copied into kernel arguments. Each request retains
+// its own cache allocation and [T,...] snapshots; no state gather/scatter is
+// needed. Null snapshot entries disable snapshots for that request.
+struct CloverCudaGdnCaches {
+    static constexpr int Capacity = 8;
+    void *conv[Capacity] = {};
+    float *state[Capacity] = {};
+    void *convSnapshots[Capacity] = {};
+    float *stateSnapshots[Capacity] = {};
+};
+
 // Clover preview reads committed history without modifying it. Activations and
 // convolution weights are BF16; recurrent states, gates and head scalars are FP32.
 // The optional stream defaults to cudaStreamPerThread. Negative cache slots and
@@ -9,7 +20,8 @@
 bool FastllmCudaCloverPreviewConv(
     const void *input, const void *history, const void *weight, const void *rightWeight,
     const int *slots, const unsigned char *valid, void *output,
-    int batch, int tokens, int channels, void *stream = nullptr);
+    int batch, int tokens, int channels, void *stream = nullptr,
+    const CloverCudaGdnCaches *caches = nullptr);
 
 // Q/K: [B,T,KH,128], V/output: [B,T,VH,128], state: [slot,VH,128,128]
 // (value-major), g: [B,T,VH], scalars: [VH]. Block width is a divisor of 32.
@@ -20,21 +32,21 @@ bool FastllmCudaCloverPreviewGdn(
     const float *state, const float *logitScale, const float *historyBias,
     const float *historyScale, const int *slots, const unsigned char *valid,
     void *output, int batch, int tokens, int keyHeads, int valueHeads,
-    void *stream = nullptr, int qkvRowStride = 0);
+    void *stream = nullptr, int qkvRowStride = 0, const CloverCudaGdnCaches *caches = nullptr);
 
 // Causal replay commits BF16 convolution history and FP32 recurrent state.
 // Optional snapshots hold the state after each token, laid out [T,B,...], for
 // accepting any prefix of a speculative block without recomputing the model.
 bool FastllmCudaCloverCausalConv(const void *input, void *history, const void *weight,
     void *output, void *snapshots, int batch, int tokens, int channels,
-    void *stream = nullptr);
+    void *stream = nullptr, const CloverCudaGdnCaches *caches = nullptr);
 // Optional FP32 workspace has B*T*(2*KH*128+VH) elements. For T>=16 it
 // reuses normalized Q/K and decay without changing the recurrent arithmetic.
 // qkvRowStride has the same meaning as in preview; outputs remain contiguous.
 bool FastllmCudaCloverCausalGdn(const void *query, const void *key, const void *value,
     const float *g, const void *beta, float *state, void *output, float *snapshots,
     int batch, int tokens, int keyHeads, int valueHeads, void *stream = nullptr,
-    float *workspace = nullptr, int qkvRowStride = 0);
+    float *workspace = nullptr, int qkvRowStride = 0, const CloverCudaGdnCaches *caches = nullptr);
 
 // Block prefill uses BF16 Tensor Core products, FP32 accumulation/state and
 // FP64 decay prefixes. It commits the entire input; calls requiring accepted-

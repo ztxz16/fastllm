@@ -86,8 +86,8 @@ private:
         bool preview, Data &output, std::pair<Data, Data> *snapshots = nullptr);
     void FullAttention(Data &input, int layer, std::pair<Data, Data> &cache,
         int position, bool preview, Data &output);
-    void GdnCore(Data &projected, int layer, std::pair<Data, Data> &cache,
-        bool preview, Data &normalized, std::pair<Data, Data> *snapshots);
+    void GdnCoreBatch(Data &projected, int layer, std::pair<Data, Data> *const *caches, int batch,
+        bool preview, Data &normalized, std::pair<Data, Data> *const *snapshots);
     void FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
         std::pair<Data, Data> &cache, int position, bool preview, Data &output);
     void Moe(Data &input, int layer, bool preview, Data &output, bool graphAllowed, int batch = 1);

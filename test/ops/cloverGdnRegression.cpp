@@ -6,6 +6,7 @@
 #include <cstring>
 #include <iostream>
 #include <random>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 namespace {
@@ -533,11 +534,100 @@ void Preview(int batch, int tokens, int kh, int vh, bool masked) {
     Check(cudaGraphLaunch(executable, cudaStreamPerThread)); check();
     Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
 }
+void IndirectCaches(int batch, int tokens) {
+    const int kh = 2, vh = 4, channels = (2 * kh + vh) * 128, rows = batch * tokens;
+    const size_t hist = channels * 3, stateSize = vh * 128 * 128;
+    std::mt19937 rng(1257 + batch * tokens); std::normal_distribution<float> normal(0.f, .2f);
+    auto random = [&](size_t n) { std::vector<uint16_t> x(n); for (auto &v : x) v = BF16(normal(rng)); return x; };
+    auto input = random((size_t)rows * channels), weight = random(channels * 4), right = random(channels * 3);
+    auto beta = random(rows * vh);
+    std::vector<float> g(rows * vh, -.1f), scale(vh, 2.f), bias(vh, -.3f), hc(vh, .2f);
+    Buffer x(input.size() * 2), w(weight.size() * 2), rw(right.size() * 2), db(beta.size() * 2),
+        dg(g.size() * 4), ds(vh * 4), dh(vh * 4), dc(vh * 4),
+        mixed(input.size() * 2), refMixed(input.size() * 2), output(rows * vh * 128 * 2), refOutput(rows * vh * 128 * 2),
+        workspace((size_t)rows * (2 * kh * 128 + vh) * 4);
+    x.Put(input); w.Put(weight); rw.Put(right); db.Put(beta); dg.Put(g); ds.Put(scale); dh.Put(bias); dc.Put(hc);
+    std::vector<std::unique_ptr<Buffer>> actual, reference;
+    std::vector<std::vector<uint16_t>> histories(batch);
+    std::vector<std::vector<float>> states(batch);
+    CloverCudaGdnCaches caches;
+    for (int b = 0; b < batch; ++b) {
+        histories[b] = random(hist + 128); states[b].resize(stateSize + 128);
+        for (auto &v : states[b]) v = normal(rng);
+        for (size_t bytes : {(hist + 128) * 2, (stateSize + 128) * 4,
+                             (tokens * hist + 128) * 2, (tokens * stateSize + 128) * 4}) {
+            actual.emplace_back(new Buffer(bytes)); reference.emplace_back(new Buffer(bytes));
+        }
+        caches.conv[b] = (uint16_t *)actual[4*b]->p + 64;
+        caches.state[b] = (float *)actual[4*b+1]->p + 64;
+        caches.convSnapshots[b] = (uint16_t *)actual[4*b+2]->p + 64;
+        caches.stateSnapshots[b] = (float *)actual[4*b+3]->p + 64;
+    }
+    auto reset = [&]() {
+        for (auto *buffers : {&actual, &reference}) for (int b = 0; b < batch; ++b) {
+            (*buffers)[4*b]->Put(histories[b]); (*buffers)[4*b+1]->Put(states[b]);
+            (*buffers)[4*b+2]->Put(std::vector<uint16_t>(tokens * hist + 128, BF16(123.f)));
+            (*buffers)[4*b+3]->Put(std::vector<float>(tokens * stateSize + 128, 123.f));
+        }
+    };
+    for (bool preview : {true, false}) {
+        auto serial = [&]() {
+            for (int b = 0; b < batch; ++b) {
+                auto *h = (uint16_t *)reference[4*b]->p + 64;
+                auto *s = (float *)reference[4*b+1]->p + 64;
+                auto *mx = (uint16_t *)refMixed.p + (size_t)b * tokens * channels;
+                auto *y = (uint16_t *)refOutput.p + (size_t)b * tokens * vh * 128;
+                auto *in = (uint16_t *)x.p + (size_t)b * tokens * channels;
+                if (preview) {
+                    Require(FastllmCudaCloverPreviewConv(in, h, w.p, rw.p, nullptr, nullptr, mx, 1, tokens, channels), "serial preview conv");
+                    Require(FastllmCudaCloverPreviewGdn(mx, mx+kh*128, mx+kh*256, (float *)dg.p+b*tokens*vh,
+                        s, (float *)ds.p, (float *)dh.p, (float *)dc.p, nullptr, nullptr, y, 1, tokens, kh, vh, nullptr, channels), "serial preview GDN");
+                } else {
+                    Require(FastllmCudaCloverCausalConv(in, h, w.p, mx, (uint16_t *)reference[4*b+2]->p+64, 1, tokens, channels), "serial causal conv");
+                    Require(FastllmCudaCloverCausalGdn(mx, mx+kh*128, mx+kh*256, (float *)dg.p+b*tokens*vh,
+                        (uint16_t *)db.p+b*tokens*vh, s, y, (float *)reference[4*b+3]->p+64, 1, tokens, kh, vh,
+                        nullptr, (float *)workspace.p, channels), "serial causal GDN");
+                }
+            }
+        };
+        auto launch = [&]() {
+            auto *mx = (uint16_t *)mixed.p;
+            if (preview) {
+                Require(FastllmCudaCloverPreviewConv(x.p, nullptr, w.p, rw.p, nullptr, nullptr, mx, batch, tokens, channels, nullptr, &caches), "indirect preview conv");
+                Require(FastllmCudaCloverPreviewGdn(mx, mx+kh*128, mx+kh*256, (float *)dg.p, nullptr,
+                    (float *)ds.p, (float *)dh.p, (float *)dc.p, nullptr, nullptr, output.p, batch, tokens, kh, vh,
+                    nullptr, channels, &caches), "indirect preview GDN");
+            } else {
+                Require(FastllmCudaCloverCausalConv(x.p, nullptr, w.p, mx, nullptr, batch, tokens, channels, nullptr, &caches), "indirect causal conv");
+                Require(FastllmCudaCloverCausalGdn(mx, mx+kh*128, mx+kh*256, (float *)dg.p, db.p, nullptr,
+                    output.p, nullptr, batch, tokens, kh, vh, nullptr, (float *)workspace.p, channels, &caches), "indirect causal GDN");
+            }
+        };
+        auto check = [&]() {
+            Require(output.Get<uint16_t>(rows*vh*128) == refOutput.Get<uint16_t>(rows*vh*128), "indirect GDN differs from serial");
+            Require(mixed.Get<uint16_t>(input.size()) == refMixed.Get<uint16_t>(input.size()), "indirect conv differs from serial");
+            for (int b = 0; b < batch; ++b) {
+                Require(actual[4*b]->Get<uint16_t>(hist+128) == reference[4*b]->Get<uint16_t>(hist+128), "indirect history/guard changed");
+                Require(actual[4*b+1]->Get<float>(stateSize+128) == reference[4*b+1]->Get<float>(stateSize+128), "indirect state/guard changed");
+                Require(actual[4*b+2]->Get<uint16_t>(tokens*hist+128) == reference[4*b+2]->Get<uint16_t>(tokens*hist+128), "indirect conv snapshot/guard changed");
+                Require(actual[4*b+3]->Get<float>(tokens*stateSize+128) == reference[4*b+3]->Get<float>(tokens*stateSize+128), "indirect state snapshot/guard changed");
+            }
+        };
+        reset(); serial(); launch(); check();
+        cudaGraph_t graph; cudaGraphExec_t executable;
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); launch();
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph)); Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+        reset(); serial(); Check(cudaGraphLaunch(executable, cudaStreamPerThread)); check();
+        Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
+    }
+}
+
 }
 int main() {
     try {
         int count = 0; if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
         Check(cudaSetDevice(0));
+        for (int batch : {2, 3, 8}) for (int tokens : {1, 16, 32}) IndirectCaches(batch, tokens);
         for (int tokens : {1, 2, 3, 127, 128, 129}) Convolution(2, tokens, 2048);
         Convolution(2, 129, 2051);
         Convolution(2, 129, 2047);
