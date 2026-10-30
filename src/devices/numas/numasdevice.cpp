@@ -2465,6 +2465,7 @@ namespace fastllm {
             std::vector<std::unique_ptr<NumasMoeHybridDecodeQueue>> hybridDecodeQueues;
             std::vector<NumasMoeHybridDecodeWorker> hybridDecodeWorkers;
             std::vector<NumasMoeTaskList> decodeWorkers;
+            std::vector<int> activeDecodeWorkers;
             std::vector<std::vector<MultiThreadDeepSeekV41NumasDecodeOp>> fusedDecodeTasks;
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
             std::vector <float, alignedAllocator<float, 64> > inputFloat32;  // 当 input 非 FLOAT32 时暂存转成 float32 的数据
@@ -4191,22 +4192,24 @@ namespace fastllm {
             if (scoredBfloat && activationQuantBlock == 32)
                 QuantizeNumasV41Input(work.realInput.data(), gateAct, 1, hidden);
         }
-        auto runWorkers = [&](auto &workers, bool overlap) {
+        auto runWorkers = [&](auto &workers, bool overlap, const std::vector<int> *active = nullptr) {
+            const int workerCount = active ? int(active->size()) : config->threads;
+            auto id = [&](int t) { return active ? (*active)[t] : t; };
             const double start = cpuElapsedUs ? NumasProfileNowMs() * 1000 : 0;
             if (cpuElapsedUs) cpuWorkUs += start - cpuHostStart;
-            for (auto &worker : workers) worker.measureTime = cpuElapsedUs != nullptr;
-            for (int t = 0; t < config->threads; ++t) pool->PushOp(t, &workers[t]);
+            for (int t = 0; t < workerCount; ++t) workers[id(t)].measureTime = cpuElapsedUs != nullptr;
+            for (int t = 0; t < workerCount; ++t) pool->PushOp(id(t), &workers[id(t)]);
             try {
                 if (overlap && submitGpu) submitGpu();
             } catch (...) {
                 // Jobs borrow the layer workspace; drain them before unwinding.
-                for (int t = 0; t < config->threads; ++t) pool->Wait(t);
+                for (int t = 0; t < workerCount; ++t) pool->Wait(id(t));
                 throw;
             }
-            for (int t = 0; t < config->threads; ++t) pool->Wait(t);
+            for (int t = 0; t < workerCount; ++t) pool->Wait(id(t));
             if (cpuElapsedUs) {
                 double completed = start;
-                for (const auto &worker : workers) completed = std::max(completed, worker.completedUs);
+                for (int t = 0; t < workerCount; ++t) completed = std::max(completed, workers[id(t)].completedUs);
                 cpuWorkUs += completed - start;
                 cpuHostStart = NumasProfileNowMs() * 1000;
             }
@@ -4379,7 +4382,14 @@ namespace fastllm {
                     }
                 }
             }
-            runWorkers(work.decodeWorkers, phase == 0);
+            // Small CPU subsets have fewer complete gate blocks than workers.
+            // Preserve the partition and arithmetic, but never wake or await a
+            // worker with no tasks (nor include its stale timing sample).
+            auto &active = work.activeDecodeWorkers;
+            active.clear(); active.reserve(config->threads);
+            for (int t = 0; t < config->threads; ++t)
+                if (!work.decodeWorkers[t].tasks.empty()) active.push_back(t);
+            runWorkers(work.decodeWorkers, phase == 0, &active);
             // Q8_K/Q8_1 and other GGUF activation formats retain the normal
             // whole-row quantizer after all gate/up tasks have completed.
             if (phase == 0 && quantizeDownRows)
