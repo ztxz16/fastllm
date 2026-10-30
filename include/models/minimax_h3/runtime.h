@@ -6,13 +6,14 @@
 namespace fastllm {
 namespace minimax_h3 {
 using Tensor = nomas::Tensor;
+using DType = nomas::DType;
 using Weights = nomas::Weights;
 using Trace = std::function<void(const std::string &, const Tensor &)>;
 
 class Runtime : public nomas::Runtime {
   public:
     explicit Runtime(int device, bool fp32 = false) : nomas::Runtime(device, fp32) {}
-    Tensor cast(const Tensor &, bool fp32);
+    Runtime(int device, DType dtype) : nomas::Runtime(device, dtype) {}
     Tensor rms(const Tensor &, const Tensor &weight, float eps, int width = 0);
     Tensor indices(const std::vector<int> &);
     Tensor gather(const Tensor &, const Tensor &indices);

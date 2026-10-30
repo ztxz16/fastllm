@@ -118,7 +118,7 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
     return chunks.size() == 1 ? chunks[0] : rt_.concat(chunks);
 }
 Tensor Transformer::refine(const Tensor &input) {
-    auto x = weights_.linear(rt_.cast(input, rt_.isFloat32()), "context_embedder");
+    auto x = weights_.linear(rt_.cast(input, rt_.dtype()), "context_embedder");
     for (int i = 0; i < config_.refiners; ++i) {
         auto p = "token_refiner.refiner_blocks." + std::to_string(i);
         x = rt_.add(x,
@@ -161,7 +161,7 @@ void Transformer::prepare(const std::vector<std::vector<float>> &plans,
     // Combining plans can select a different cuBLAS reduction and change BF16 rounding.
     std::vector<Tensor> inputs;
     for (const auto &times : plans)
-        inputs.push_back(rt_.cast(fp32_.activation(timeEmbedding(times)), rt_.isFloat32()));
+        inputs.push_back(rt_.cast(fp32_.activation(timeEmbedding(times)), rt_.dtype()));
     for (int i = 0; i < config_.layers; ++i) {
         if (progress)
             progress(i, config_.layers);
@@ -190,8 +190,8 @@ std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor
     auto vi = rt_.indices(layout.video), ai = rt_.indices(layout.audio), ti = rt_.indices(layout.text);
     Tensor x(layout.tags.size(), config_.hidden, rt_.isFloat32());
     rt_.scatter(x, refine(text), ti);
-    rt_.scatter(x, rt_.cast(fullWeights_.linear(video, "proj_in"), x.fp32), vi);
-    rt_.scatter(x, rt_.cast(fullWeights_.linear(audio, "audio_proj_in"), x.fp32), ai);
+    rt_.scatter(x, rt_.cast(fullWeights_.linear(video, "proj_in"), x.dtype), vi);
+    rt_.scatter(x, rt_.cast(fullWeights_.linear(audio, "audio_proj_in"), x.dtype), ai);
     auto rope = rt_.ropeTable(layout.positions, config_.ropeFreq, config_.ropeTheta);
     auto adaln = layout.timeIndices;
     for (size_t i = 0; i < adaln.size(); ++i)
@@ -206,8 +206,8 @@ std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor
     }
     x = rt_.rms(x, weights_.get("norm_out.norm.weight"), config_.finalEps);
     x = rt_.modulateRows(x, outputModulation_, rt_.indices(layout.timeIndices), 0, 1);
-    return {fullWeights_.linear(rt_.cast(rt_.gather(x, vi), true), "proj_out"),
-            fullWeights_.linear(rt_.cast(rt_.gather(x, ai), true), "audio_proj_out")};
+    return {fullWeights_.linear(rt_.cast(rt_.gather(x, vi), DType::FP32), "proj_out"),
+            fullWeights_.linear(rt_.cast(rt_.gather(x, ai), DType::FP32), "audio_proj_out")};
 }
 void Transformer::unload() {
     weights_.clear();

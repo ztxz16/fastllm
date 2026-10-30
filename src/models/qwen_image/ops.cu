@@ -12,7 +12,7 @@ void check(cudaError_t s) {
         throw std::runtime_error(cudaGetErrorString(s));
 }
 float *ptr(const Tensor &x) {
-    if (!x.fp32)
+    if (!x.isFloat32())
         throw std::invalid_argument("Qwen-Image kernels require FP32 tensors");
     return reinterpret_cast<float *>(x.data);
 }
@@ -109,7 +109,7 @@ __global__ void avgDown(const float *x, float *out, size_t n, int w, int ic, int
 } // namespace
 Runtime::Runtime(int device) : nomas::Runtime(device, true) {}
 Tensor Runtime::specialNorm(const Tensor &x, const Tensor &w, int mode, float eps) {
-    if (w.size() != size_t(x.cols) || w.fp32 != x.fp32)
+    if (w.size() != size_t(x.cols) || w.dtype != x.dtype)
         throw std::invalid_argument("special norm shape");
     Tensor out(x.rows, x.cols, true);
     specialNormKernel<<<x.rows, 256, 0, cudaStreamPerThread>>>(ptr(x), ptr(w), ptr(out), x.cols, mode, eps);
@@ -117,7 +117,7 @@ Tensor Runtime::specialNorm(const Tensor &x, const Tensor &w, int mode, float ep
     return out;
 }
 Tensor Runtime::scale(const Tensor &x, const Tensor &m, int first, int offset) {
-    if (m.cols < (offset + 1) * x.cols || (m.rows != 1 && m.rows != 2) || m.fp32 != x.fp32)
+    if (m.cols < (offset + 1) * x.cols || (m.rows != 1 && m.rows != 2) || m.dtype != x.dtype)
         throw std::invalid_argument("modulation shape");
     Tensor out(x.rows, x.cols, true);
     modulationKernel<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
@@ -126,7 +126,7 @@ Tensor Runtime::scale(const Tensor &x, const Tensor &m, int first, int offset) {
     return out;
 }
 Tensor Runtime::gatedAdd(const Tensor &x, const Tensor &y, const Tensor &m, int first, int offset) {
-    if (x.rows != y.rows || x.cols != y.cols || x.fp32 != y.fp32 || m.fp32 != x.fp32 ||
+    if (x.rows != y.rows || x.cols != y.cols || x.dtype != y.dtype || m.dtype != x.dtype ||
         m.cols < (offset + 1) * x.cols || (m.rows != 1 && m.rows != 2))
         throw std::invalid_argument("gated residual shape");
     Tensor out(x.rows, x.cols, true);

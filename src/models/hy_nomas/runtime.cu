@@ -2,6 +2,7 @@
 #include "json11.hpp"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <algorithm>
@@ -21,9 +22,10 @@
 #endif
 
 namespace fastllm { namespace nomas {
-cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,bool,int,int,int,cudaStream_t);
+cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,int,bool,bool,int,int,int,cudaStream_t);
 namespace {
 using B = __nv_bfloat16;
+using H = __half;
 void check(cudaError_t s) { if (s != cudaSuccess) throw std::runtime_error(cudaGetErrorString(s)); }
 void check(cublasStatus_t s) { if (s != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("HY-Nomas cuBLAS error " + std::to_string(int(s))); }
 void require(bool ok, const char *message) { if (!ok) throw std::invalid_argument(message); }
@@ -81,16 +83,11 @@ template<class T> T *as(const Tensor &x) { return reinterpret_cast<T *>(x.data);
 B *ptr(const Tensor &x) { return reinterpret_cast<B *>(x.data); }
 __device__ float f(float x) { return x; }
 __device__ float f(B x) { return __bfloat162float(x); }
+__device__ float f(H x) { return __half2float(x); }
 __device__ B b(float x) { return __float2bfloat16_rn(x); }
 template<class T> __device__ T cast(float x) { return T(x); }
 template<> __device__ B cast<B>(float x) { return b(x); }
 template<class T> __device__ float roundTo(float x) { return f(cast<T>(x)); }
-__global__ void toBF16(const float *x, B *y, size_t n) {
-    for (size_t i = size_t(blockIdx.x)*blockDim.x+threadIdx.x; i<n; i+=size_t(gridDim.x)*blockDim.x) y[i]=b(x[i]);
-}
-__global__ void toFloat(const B *x, float *y, size_t n) {
-    for (size_t i = size_t(blockIdx.x)*blockDim.x+threadIdx.x; i<n; i+=size_t(gridDim.x)*blockDim.x) y[i]=f(x[i]);
-}
 template<class T> __global__ void pixelRGBKernel(const T *x, uint8_t *rgb, int *invalid,
                                                 size_t n, int width, int height, int firstFrame) {
     for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
@@ -204,6 +201,14 @@ __global__ void scatterHeads(const float *x,float *y,int rows,int dim,int heads,
     }
 }
 int grid(size_t n) { return int(std::min<size_t>((n+255)/256,4096)); }
+#define DISPATCH_TENSOR(TYPE, T, ...) \
+    if ((TYPE)==DType::FP32) { using T=float; __VA_ARGS__; } \
+    else if ((TYPE)==DType::FP16) { using T=H; __VA_ARGS__; } \
+    else { using T=B; __VA_ARGS__; }
+template<class T,class U> __global__ void castKernel(const T *x,U *y,size_t n) {
+    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) y[i]=cast<U>(f(x[i]));
+}
+
 template<class T> __global__ void meanKernel(const T *x,T *y,int rows,int cols) {
     for(int c=blockIdx.x*blockDim.x+threadIdx.x;c<cols;c+=gridDim.x*blockDim.x) {
         float sum=0; for(int r=0;r<rows;++r) sum+=f(x[size_t(r)*cols+c]);
@@ -280,13 +285,15 @@ struct Runtime::LtState {
     std::shared_ptr<void> blasWorkspace=allocate(32*1024*1024);
     std::unordered_map<std::string,std::unique_ptr<Plan>> plans;
 };
-Tensor::Tensor(int r,int c,bool full):rows(r),cols(c),fp32(full) {
+Tensor::Tensor(int r,int c,bool full):Tensor(r,c,full ? DType::FP32 : DType::BF16) {}
+Tensor::Tensor(int r,int c,DType type):rows(r),cols(c),dtype(type) {
+    require(type==DType::FP32 || type==DType::FP16 || type==DType::BF16,"invalid tensor dtype");
     require(r>0 && c>0 && size_t(r)<=SIZE_MAX/size_t(c)/4,"invalid tensor shape");
     storage=allocate(bytes()); data=static_cast<uint16_t *>(storage.get());
 }
 Tensor Tensor::rowSlice(int first,int count) const {
     require(first>=0 && count>0 && first<=rows-count,"row slice out of range");
-    Tensor out=*this; out.data+=size_t(first)*cols*(fp32?2:1); out.rows=count; return out;
+    Tensor out=*this; out.data+=size_t(first)*cols*(isFloat32()?2:1); out.rows=count; return out;
 }
 namespace {
 bool runtimePrecision() {
@@ -297,7 +304,9 @@ bool runtimePrecision() {
 }
 }
 Runtime::Runtime(int device):Runtime(device, runtimePrecision()) {}
-Runtime::Runtime(int device, bool fp32):device_(device),fp32_(fp32) {
+Runtime::Runtime(int device, bool fp32):Runtime(device,fp32 ? DType::FP32 : DType::BF16) {}
+Runtime::Runtime(int device, DType type):device_(device),dtype_(type) {
+    require(type==DType::FP32 || type==DType::FP16 || type==DType::BF16,"invalid runtime dtype");
     check(cudaSetDevice(device)); cublasHandle_t h; check(cublasCreate(&h)); blas_=h;
     check(cublasSetStream(h,cudaStreamPerThread));
     check(cublasSetMathMode(h,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));
@@ -308,26 +317,26 @@ Runtime::Runtime(int device, bool fp32):device_(device),fp32_(fp32) {
 }
 Runtime::~Runtime() { cudaSetDevice(device_); lt_.reset(); if(blas_) cublasDestroy(static_cast<cublasHandle_t>(blas_)); }
 void Runtime::activate() { check(cudaSetDevice(device_)); }
-Tensor Runtime::upload(const float *x,int r,int c) {
-    require(x,"null tensor input"); check(cudaSetDevice(device_)); Tensor out(r,c,fp32_);
-    if(fp32_) { copy(out.data,x,out.bytes(),cudaMemcpyHostToDevice); return out; }
-    auto tmp=allocate(out.size()*4);
-    copy(tmp.get(),x,out.size()*4,cudaMemcpyHostToDevice);
-    toBF16<<<grid(out.size()),256,0,cudaStreamPerThread>>>(static_cast<float *>(tmp.get()),ptr(out),out.size()); check(cudaGetLastError()); return out;
-}
-Tensor Runtime::cast(const Tensor &x,bool full) {
-    if(x.fp32==full) return x;
-    Tensor out(x.rows,x.cols,full);
-    if(full) toFloat<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),as<float>(out),x.size());
-    else toBF16<<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),ptr(out),x.size());
+Tensor Runtime::cast(const Tensor &x,DType type) {
+    if(x.dtype==type) return x;
+    Tensor out(x.rows,x.cols,type);
+    DISPATCH_TENSOR(type, U,
+        if(x.dtype==DType::FP32) { castKernel<float,U><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<U>(out),x.size()); }
+        else if(x.dtype==DType::FP16) { castKernel<H,U><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<H>(x),as<U>(out),x.size()); }
+        else { castKernel<B,U><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<B>(x),as<U>(out),x.size()); });
     check(cudaGetLastError()); return out;
 }
+Tensor Runtime::upload(const float *x,int r,int c) {
+    require(x,"null tensor input"); check(cudaSetDevice(device_)); Tensor tmp(r,c,true);
+    copy(tmp.data,x,tmp.bytes(),cudaMemcpyHostToDevice);
+    return cast(tmp,dtype_);
+}
+Tensor Runtime::cast(const Tensor &x,bool full) {
+    return cast(x,full ? DType::FP32 : DType::BF16);
+}
 std::vector<float> Runtime::download(const Tensor &x) {
-    std::vector<float> out(x.size());
-    if(x.fp32) { copy(out.data(),x.data,x.bytes(),cudaMemcpyDeviceToHost); return out; }
-    auto tmp=allocate(x.size()*4);
-    toFloat<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),static_cast<float *>(tmp.get()),x.size()); check(cudaGetLastError());
-    copy(out.data(),tmp.get(),out.size()*4,cudaMemcpyDeviceToHost); return out;
+    auto tmp=cast(x,DType::FP32); std::vector<float> out(x.size());
+    copy(out.data(),tmp.data,tmp.bytes(),cudaMemcpyDeviceToHost); return out;
 }
 std::vector<uint8_t> Runtime::downloadPixelRGB(const Tensor &x,int width,int height,int firstFrame,int frames) {
     require(x.data && x.cols==3072 && x.rows>0 && width>0 && height>0 &&
@@ -342,8 +351,7 @@ std::vector<uint8_t> Runtime::downloadPixelRGB(const Tensor &x,int width,int hei
     auto invalid=static_cast<int *>(packed.get());
     auto rgb=reinterpret_cast<uint8_t *>(invalid+1);
     check(cudaMemsetAsync(invalid,0,sizeof(int),cudaStreamPerThread));
-    if(x.fp32) pixelRGBKernel<<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<float>(x),rgb,invalid,out.size(),width,height,firstFrame);
-    else pixelRGBKernel<<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr(x),rgb,invalid,out.size(),width,height,firstFrame);
+    DISPATCH_TENSOR(x.dtype, T, pixelRGBKernel<<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<T>(x),rgb,invalid,out.size(),width,height,firstFrame));
     check(cudaGetLastError());
     int error=0;
     check(cudaMemcpyAsync(out.data(),rgb,out.size(),cudaMemcpyDeviceToHost,cudaStreamPerThread));
@@ -354,16 +362,17 @@ std::vector<uint8_t> Runtime::downloadPixelRGB(const Tensor &x,int width,int hei
 }
 Tensor Runtime::linear(const Tensor &x,const Tensor &w,const Tensor *bias) {
     require(x.cols==w.cols,"linear dimension mismatch"); require(!bias || bias->size()==size_t(w.rows),"linear bias mismatch");
-    require(x.fp32==w.fp32 && (!bias || bias->fp32==x.fp32),"linear dtype mismatch");
-    Tensor out(x.rows,w.rows,x.fp32); float one=1,zero=0;
-    if(x.fp32) {
+    require(x.dtype==w.dtype && (!bias || bias->dtype==x.dtype),"linear dtype mismatch");
+    Tensor out(x.rows,w.rows,x.dtype); float one=1,zero=0;
+    if(x.isFloat32()) {
         check(cublasSgemm(static_cast<cublasHandle_t>(blas_),CUBLAS_OP_T,CUBLAS_OP_N,w.rows,x.rows,x.cols,
             &one,as<float>(w),w.cols,as<float>(x),x.cols,&zero,as<float>(out),out.cols));
         if(bias) addBias<float><<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<float>(out),as<float>(*bias),as<float>(out),out.size(),out.cols);
         check(cudaGetLastError()); return out;
     }
+    auto scalarType=x.dtype==DType::FP16 ? CUDA_R_16F : CUDA_R_16BF;
     if(bias) {
-        auto key=std::to_string(x.rows)+":"+std::to_string(x.cols)+":"+std::to_string(w.rows);
+        auto key=std::to_string(int(x.dtype))+":"+std::to_string(x.rows)+":"+std::to_string(x.cols)+":"+std::to_string(w.rows);
         auto &plan=lt_->plans[key];
         if(!plan) {
             auto p=std::make_unique<LtState::Plan>();
@@ -372,9 +381,9 @@ Tensor Runtime::linear(const Tensor &x,const Tensor &w,const Tensor *bias) {
             cublasLtEpilogue_t epilogue=CUBLASLT_EPILOGUE_BIAS;
             check(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_EPILOGUE,&epilogue,sizeof(epilogue)));
             check(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_BIAS_POINTER,&bias->data,sizeof(void *)));
-            check(cublasLtMatrixLayoutCreate(&p->a,CUDA_R_16BF,w.cols,w.rows,w.cols));
-            check(cublasLtMatrixLayoutCreate(&p->b,CUDA_R_16BF,x.cols,x.rows,x.cols));
-            check(cublasLtMatrixLayoutCreate(&p->c,CUDA_R_16BF,w.rows,x.rows,w.rows));
+            check(cublasLtMatrixLayoutCreate(&p->a,scalarType,w.cols,w.rows,w.cols));
+            check(cublasLtMatrixLayoutCreate(&p->b,scalarType,x.cols,x.rows,x.cols));
+            check(cublasLtMatrixLayoutCreate(&p->c,scalarType,w.rows,x.rows,w.rows));
             check(cublasLtMatmulPreferenceCreate(&p->preference));
             check(cublasLtMatmulPreferenceSetAttribute(p->preference,CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&lt_->workspaceBytes,sizeof(size_t)));
             uint32_t reduction=CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE|CUBLASLT_REDUCTION_SCHEME_NONE,alignment=256;
@@ -383,96 +392,95 @@ Tensor Runtime::linear(const Tensor &x,const Tensor &w,const Tensor *bias) {
                 check(cublasLtMatmulPreferenceSetAttribute(p->preference,attr,&alignment,sizeof(alignment)));
             int count=0; cublasLtMatmulHeuristicResult_t choice{};
             check(cublasLtMatmulAlgoGetHeuristic(reinterpret_cast<cublasLtHandle_t>(blas_),p->op,p->a,p->b,p->c,p->c,p->preference,1,&choice,&count));
-            require(count>0,"no cuBLASLt BF16 linear algorithm"); p->algorithm=choice.algo; plan=std::move(p);
+            require(count>0,"no cuBLASLt 16-bit linear algorithm"); p->algorithm=choice.algo; plan=std::move(p);
         }
         check(cublasLtMatmulDescSetAttribute(plan->op,CUBLASLT_MATMUL_DESC_BIAS_POINTER,&bias->data,sizeof(void *)));
-        check(cublasLtMatmul(reinterpret_cast<cublasLtHandle_t>(blas_),plan->op,&one,ptr(w),plan->a,ptr(x),plan->b,&zero,
-            ptr(out),plan->c,ptr(out),plan->c,&plan->algorithm,lt_->workspace.get(),lt_->workspaceBytes,cudaStreamPerThread));
+        check(cublasLtMatmul(reinterpret_cast<cublasLtHandle_t>(blas_),plan->op,&one,w.data,plan->a,x.data,plan->b,&zero,
+            out.data,plan->c,out.data,plan->c,&plan->algorithm,lt_->workspace.get(),lt_->workspaceBytes,cudaStreamPerThread));
     } else {
         check(cublasGemmEx(static_cast<cublasHandle_t>(blas_),CUBLAS_OP_T,CUBLAS_OP_N,
-            w.rows,x.rows,x.cols,&one,ptr(w),CUDA_R_16BF,w.cols,ptr(x),CUDA_R_16BF,x.cols,
-            &zero,ptr(out),CUDA_R_16BF,w.rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+            w.rows,x.rows,x.cols,&one,w.data,scalarType,w.cols,x.data,scalarType,x.cols,
+            &zero,out.data,scalarType,w.rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
     }
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::norm(const Tensor &x,bool rms,const Tensor *w,const Tensor *bias,float eps,int width) {
     if(!width) width=x.cols;
     require(width>0 && x.cols%width==0,"norm dimension mismatch");
-    require((!w || w->fp32==x.fp32) && (!bias || bias->fp32==x.fp32),"norm dtype mismatch");
+    require((!w || w->dtype==x.dtype) && (!bias || bias->dtype==x.dtype),"norm dtype mismatch");
     require((!w || w->size()==size_t(width)) && (!bias || bias->size()==size_t(width)),"norm weight mismatch");
-    Tensor out(x.rows,x.cols,x.fp32);
-    if(x.fp32) { normKernel<float><<<x.size()/width,256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(out),w?as<float>(*w):nullptr,bias?as<float>(*bias):nullptr,width,rms,eps); } else { normKernel<B><<<x.size()/width,256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),w?ptr(*w):nullptr,bias?ptr(*bias):nullptr,width,rms,eps); } check(cudaGetLastError()); return out;
+    Tensor out(x.rows,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, normKernel<T><<<x.size()/width,256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),w?as<T>(*w):nullptr,bias?as<T>(*bias):nullptr,width,rms,eps)); check(cudaGetLastError()); return out;
 }
 Tensor Runtime::activation(const Tensor &x,bool gelu) {
-    Tensor out(x.rows,x.cols,x.fp32); if(x.fp32) { element<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),nullptr,as<float>(out),x.size(),gelu?2:1); } else { element<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),nullptr,ptr(out),x.size(),gelu?2:1); } check(cudaGetLastError()); return out;
+    Tensor out(x.rows,x.cols,x.dtype); DISPATCH_TENSOR(x.dtype, T, element<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),nullptr,as<T>(out),x.size(),gelu?2:1)); check(cudaGetLastError()); return out;
 }
 Tensor Runtime::add(const Tensor &x,const Tensor &y) {
-    require(x.rows==y.rows && x.cols==y.cols && x.fp32==y.fp32,"add shape/dtype mismatch"); Tensor out(x.rows,x.cols,x.fp32);
-    if(x.fp32) { element<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(y),as<float>(out),x.size(),0); } else { element<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(y),ptr(out),x.size(),0); } check(cudaGetLastError()); return out;
+    require(x.rows==y.rows && x.cols==y.cols && x.dtype==y.dtype,"add shape/dtype mismatch"); Tensor out(x.rows,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, element<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(y),as<T>(out),x.size(),0)); check(cudaGetLastError()); return out;
 }
 Tensor Runtime::multiply(const Tensor &x,const Tensor &y) {
-    require(x.rows==y.rows && x.cols==y.cols && x.fp32==y.fp32,"multiply shape/dtype mismatch"); Tensor out(x.rows,x.cols,x.fp32);
-    if(x.fp32) { element<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(y),as<float>(out),x.size(),3); } else { element<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(y),ptr(out),x.size(),3); } check(cudaGetLastError()); return out;
+    require(x.rows==y.rows && x.cols==y.cols && x.dtype==y.dtype,"multiply shape/dtype mismatch"); Tensor out(x.rows,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, element<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(y),as<T>(out),x.size(),3)); check(cudaGetLastError()); return out;
 }
 Tensor Runtime::siluMultiply(const Tensor &x,const Tensor &y) {
-    require(x.rows==y.rows && x.cols==y.cols && x.fp32==y.fp32,"SiLU multiply shape/dtype mismatch");
-    Tensor out(x.rows,x.cols,x.fp32);
-    if(x.fp32) element<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(y),as<float>(out),x.size(),4);
-    else element<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(y),ptr(out),x.size(),4);
+    require(x.rows==y.rows && x.cols==y.cols && x.dtype==y.dtype,"SiLU multiply shape/dtype mismatch");
+    Tensor out(x.rows,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, element<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(y),as<T>(out),x.size(),4));
     check(cudaGetLastError()); return out;
 }
+
 Tensor Runtime::bias(const Tensor &x,const Tensor &bias) {
-    require(bias.size()==size_t(x.cols) && bias.fp32==x.fp32,"bias shape/dtype mismatch"); Tensor out(x.rows,x.cols,x.fp32);
-    if(x.fp32) { addBias<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(bias),as<float>(out),x.size(),x.cols); } else { addBias<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(bias),ptr(out),x.size(),x.cols); } check(cudaGetLastError()); return out;
+    require(bias.size()==size_t(x.cols) && bias.dtype==x.dtype,"bias shape/dtype mismatch"); Tensor out(x.rows,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, addBias<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(bias),as<T>(out),x.size(),x.cols)); check(cudaGetLastError()); return out;
 }
 Tensor Runtime::repeatRows(const Tensor &x,int copies) {
     require(copies>0 && int64_t(x.rows)*copies<=16384,"invalid row replication");
-    Tensor out(x.rows*copies,x.cols,x.fp32);
-    if(x.fp32) repeatRowsKernel<float><<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(out),out.size(),x.cols,copies);
-    else repeatRowsKernel<B><<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),out.size(),x.cols,copies);
+    Tensor out(x.rows*copies,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, repeatRowsKernel<T><<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),out.size(),x.cols,copies));
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::mean(const Tensor &x) {
-    Tensor out(1,x.cols,x.fp32); if(x.fp32) { meanKernel<float><<<grid(x.cols),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(out),x.rows,x.cols); } else { meanKernel<B><<<grid(x.cols),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),x.rows,x.cols); } check(cudaGetLastError()); return out;
+    Tensor out(1,x.cols,x.dtype); DISPATCH_TENSOR(x.dtype, T, meanKernel<T><<<grid(x.cols),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),x.rows,x.cols)); check(cudaGetLastError()); return out;
 }
 Tensor Runtime::pixelCondition(const Tensor &x,int t,int h,int w) {
-    require(x.rows==t*h*w && x.cols==16384,"invalid pixel condition shape"); Tensor out(x.rows*4,4096,x.fp32);
-    if(x.fp32) { conditionKernel<float><<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(out),out.rows,h,w); } else { conditionKernel<B><<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),out.rows,h,w); } check(cudaGetLastError()); return out;
+    require(x.rows==t*h*w && x.cols==16384,"invalid pixel condition shape"); Tensor out(x.rows*4,4096,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, conditionKernel<T><<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),out.rows,h,w)); check(cudaGetLastError()); return out;
 }
 Tensor Runtime::pixelQKRope(const Tensor &x,const Tensor &nt,const Tensor &nh,int t,int h,int w) {
-    require(t>0 && h>0 && w>0 && x.rows==t*h*w && x.cols%128==0 && nt.size()==64 && nh.size()==64 && x.fp32==nt.fp32 && x.fp32==nh.fp32,"invalid PixelUMM QK shape");
-    Tensor out(x.rows,x.cols,x.fp32); if(x.fp32) { pixelQKKernel<float><<<x.size()/128,256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(out),as<float>(nt),as<float>(nh),x.cols,h,w); } else { pixelQKKernel<B><<<x.size()/128,256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),ptr(nt),ptr(nh),x.cols,h,w); } check(cudaGetLastError()); return out;
+    require(t>0 && h>0 && w>0 && x.rows==t*h*w && x.cols%128==0 && nt.size()==64 && nh.size()==64 && x.dtype==nt.dtype && x.dtype==nh.dtype,"invalid PixelUMM QK shape");
+    Tensor out(x.rows,x.cols,x.dtype); DISPATCH_TENSOR(x.dtype, T, pixelQKKernel<T><<<x.size()/128,256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),as<T>(nt),as<T>(nh),x.cols,h,w)); check(cudaGetLastError()); return out;
 }
 Tensor Runtime::modulate(const Tensor &x,const Tensor &m,int shift,int scale) {
-    require(m.fp32==x.fp32 && m.rows==1 && shift>=0 && scale>=0 && m.cols>=(std::max(shift,scale)+1)*x.cols,"modulation dimension mismatch");
-    Tensor out(x.rows,x.cols,x.fp32); if(x.fp32) { modulation<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),nullptr,as<float>(m),as<float>(out),x.size(),x.cols,shift,scale,false); } else { modulation<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),nullptr,ptr(m),ptr(out),x.size(),x.cols,shift,scale,false); } check(cudaGetLastError()); return out;
+    require(m.dtype==x.dtype && m.rows==1 && shift>=0 && scale>=0 && m.cols>=(std::max(shift,scale)+1)*x.cols,"modulation dimension mismatch");
+    Tensor out(x.rows,x.cols,x.dtype); DISPATCH_TENSOR(x.dtype, T, modulation<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),nullptr,as<T>(m),as<T>(out),x.size(),x.cols,shift,scale,false)); check(cudaGetLastError()); return out;
 }
 Tensor Runtime::residual(const Tensor &x,const Tensor &y,const Tensor &m,int gate) {
-    require(x.fp32==y.fp32 && x.fp32==m.fp32 && x.rows==y.rows && x.cols==y.cols && m.rows==1 && gate>=0 && m.cols>=(gate+1)*x.cols,"residual dimension mismatch");
-    Tensor out(x.rows,x.cols,x.fp32); if(x.fp32) { modulation<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(y),as<float>(m),as<float>(out),x.size(),x.cols,gate,0,true); } else { modulation<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(y),ptr(m),ptr(out),x.size(),x.cols,gate,0,true); } check(cudaGetLastError()); return out;
+    require(x.dtype==y.dtype && x.dtype==m.dtype && x.rows==y.rows && x.cols==y.cols && m.rows==1 && gate>=0 && m.cols>=(gate+1)*x.cols,"residual dimension mismatch");
+    Tensor out(x.rows,x.cols,x.dtype); DISPATCH_TENSOR(x.dtype, T, modulation<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(y),as<T>(m),as<T>(out),x.size(),x.cols,gate,0,true)); check(cudaGetLastError()); return out;
 }
 Tensor Runtime::columns(const Tensor &x,int first,int count) {
-    require(first>=0 && count>0 && first<=x.cols-count,"column slice out of range"); Tensor out(x.rows,count,x.fp32);
-    if(x.fp32) { columnKernel<float><<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(out),x.rows,x.cols,first,count); } else { columnKernel<B><<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),x.rows,x.cols,first,count); } check(cudaGetLastError()); return out;
+    require(first>=0 && count>0 && first<=x.cols-count,"column slice out of range"); Tensor out(x.rows,count,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, columnKernel<T><<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),x.rows,x.cols,first,count)); check(cudaGetLastError()); return out;
 }
 Tensor Runtime::embedding(const Tensor &weight,const std::vector<int> &tokens) {
-    require(!tokens.empty() && tokens.size()<=4096,"invalid token count"); Tensor out(tokens.size(),weight.cols,weight.fp32);
+    require(!tokens.empty() && tokens.size()<=4096,"invalid token count"); Tensor out(tokens.size(),weight.cols,weight.dtype);
     for(size_t i=0;i<tokens.size();++i) {
         require(tokens[i]>=0 && tokens[i]<weight.rows,"token out of vocabulary");
-        copy(out.data+i*weight.cols*(weight.fp32?2:1),weight.data+size_t(tokens[i])*weight.cols*(weight.fp32?2:1),weight.cols*(weight.fp32?4:2),cudaMemcpyDeviceToDevice);
+        copy(out.data+i*weight.cols*(weight.isFloat32()?2:1),weight.data+size_t(tokens[i])*weight.cols*(weight.isFloat32()?2:1),weight.cols*(weight.isFloat32()?4:2),cudaMemcpyDeviceToDevice);
     }
     return out;
 }
 Tensor Runtime::textRope(const Tensor &x) { return textRope(x,1000000.f); }
 Tensor Runtime::textRope(const Tensor &x,float theta) {
-    require(x.cols%128==0,"invalid Qwen RoPE shape"); Tensor out(x.rows,x.cols,x.fp32);
-    if(x.fp32) { textRopeKernel<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(out),x.size(),x.cols,theta); } else { textRopeKernel<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),x.size(),x.cols,theta); } check(cudaGetLastError()); return out;
+    require(x.cols%128==0,"invalid Qwen RoPE shape"); Tensor out(x.rows,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, textRopeKernel<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),x.size(),x.cols,theta)); check(cudaGetLastError()); return out;
 }
 Tensor Runtime::concat(const std::vector<Tensor> &xs) {
     require(!xs.empty(),"empty concat"); int rows=0;
-    for(auto &x:xs) { require(x.cols==xs[0].cols && x.fp32==xs[0].fp32 && x.rows<=INT32_MAX-rows,"concat shape mismatch"); rows+=x.rows; }
-    Tensor out(rows,xs[0].cols,xs[0].fp32); size_t pos=0;
-    for(auto &x:xs) { copy(out.data+pos,x.data,x.bytes(),cudaMemcpyDeviceToDevice); pos+=x.size()*(x.fp32?2:1); } return out;
+    for(auto &x:xs) { require(x.cols==xs[0].cols && x.dtype==xs[0].dtype && x.rows<=INT32_MAX-rows,"concat shape mismatch"); rows+=x.rows; }
+    Tensor out(rows,xs[0].cols,xs[0].dtype); size_t pos=0;
+    for(auto &x:xs) { copy(out.data+pos,x.data,x.bytes(),cudaMemcpyDeviceToDevice); pos+=x.size()*(x.isFloat32()?2:1); } return out;
 }
 Tensor Runtime::rope(const Tensor &x,const float *cos,const float *sin,int dim) {
     return rope(x,prepareRope(cos,sin,x.rows,dim));
@@ -489,11 +497,11 @@ Tensor Runtime::rope(const Tensor &x,const RopeTable &table) {
     int dim=table.cos.cols;
     require(dim>0 && dim%2==0 && x.cols%dim==0 && table.cos.rows==x.rows && table.sin.rows==x.rows &&
             table.sin.cols==dim && table.cos.fp32 && table.sin.fp32,"invalid RoPE shape");
-    Tensor out(x.rows,x.cols,x.fp32);
-    if(x.fp32) ropeKernel<float><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),as<float>(out),as<float>(table.cos),as<float>(table.sin),x.size(),x.cols,dim);
-    else ropeKernel<B><<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),as<float>(table.cos),as<float>(table.sin),x.size(),x.cols,dim);
+    Tensor out(x.rows,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, ropeKernel<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),as<float>(table.cos),as<float>(table.sin),x.size(),x.cols,dim));
     check(cudaGetLastError()); return out;
 }
+#undef DISPATCH_TENSOR
 Tensor Runtime::attention(const Tensor &q,const Tensor &k,const Tensor &v,int heads,const uint8_t *mask,int chunk,
                           int kvHeads,bool causal,int tile,int height,int width) {
     require(heads>0 && q.cols%heads==0,"invalid attention heads");
@@ -505,14 +513,15 @@ Tensor Runtime::attentionScaled(const Tensor &q,const Tensor &k,const Tensor &v,
     require(heads>0 && kvHeads>0 && heads%kvHeads==0 && q.cols%heads==0 && k.cols%kvHeads==0 && q.cols/heads==k.cols/kvHeads && k.rows==v.rows && k.cols==v.cols && chunk>0,"attention shape mismatch");
     require(!causal || q.rows==k.rows,"causal attention requires equal lengths");
     require(tile>=0 && (!tile || (height>0 && width>0 && q.rows==k.rows && q.rows%(height*width)==0)),"invalid local attention grid");
-    require(q.fp32==k.fp32 && q.fp32==v.fp32,"attention dtype mismatch");
-    int dim=q.cols/heads; chunk=std::min(chunk,q.rows); Tensor out(q.rows,q.cols,q.fp32);
-    require(std::isfinite(scoreScale) && (q.fp32 || scoreScale==1.f/std::sqrt(float(dim))),"custom attention scale requires FP32");
-    if(!q.fp32 && !mask && dim==128) {
-        check(fusedAttention(q.data,k.data,v.data,out.data,q.rows,k.rows,heads,kvHeads,causal,tile,height,width,cudaStreamPerThread));
+    require(q.dtype==k.dtype && q.dtype==v.dtype,"attention dtype mismatch");
+    int dim=q.cols/heads; chunk=std::min(chunk,q.rows); Tensor out(q.rows,q.cols,q.dtype);
+    require(std::isfinite(scoreScale) && (q.isFloat32() || scoreScale==1.f/std::sqrt(float(dim))),"custom attention scale requires FP32");
+    if(!q.isFloat32() && !mask && (dim==64 || dim==128)) {
+        check(fusedAttention(q.data,k.data,v.data,out.data,q.rows,k.rows,heads,kvHeads,dim,q.dtype==DType::FP16,causal,tile,height,width,cudaStreamPerThread));
         return out;
     }
-    if(q.fp32) {
+    require(q.dtype!=DType::FP16,"FP16 attention requires the fused 64/128-dimensional backend");
+    if(q.isFloat32()) {
         // Reuse cuBLAS batched GEMM, also used by fastllm's general attention
         // implementation. All heads in a GQA group share one launch. FP32 QK,
         // softmax and PV retain the validated math path without a BF16 cast.
@@ -540,7 +549,7 @@ Tensor Runtime::attentionScaled(const Tensor &q,const Tensor &k,const Tensor &v,
     auto probabilities=allocate(size_t(chunk)*k.rows*2),inverse=allocate(size_t(chunk)*4);
     std::shared_ptr<void> maskDevice;
     if(mask) { maskDevice=allocate(size_t(q.rows)*k.rows); copy(maskDevice.get(),mask,size_t(q.rows)*k.rows,cudaMemcpyHostToDevice); }
-    toFloat<<<grid(v.size()),256,0,cudaStreamPerThread>>>(ptr(v),static_cast<float *>(vf.get()),v.size()); check(cudaGetLastError());
+    castKernel<B,float><<<grid(v.size()),256,0,cudaStreamPerThread>>>(ptr(v),static_cast<float *>(vf.get()),v.size()); check(cudaGetLastError());
     float alpha=scoreScale,one=1,zero=0; auto h=static_cast<cublasHandle_t>(blas_);
     for(int head=0;head<heads;++head) for(int start=0;start<q.rows;start+=chunk) {
         int m=std::min(chunk,q.rows-start);
@@ -556,7 +565,7 @@ Tensor Runtime::attentionScaled(const Tensor &q,const Tensor &k,const Tensor &v,
         } else {
             // FlashAttention's BF16 path rounds the unnormalized exponentials
             // before PV, then divides the FP32 accumulator by the FP32 row sum.
-            toBF16<<<grid(size_t(m)*k.rows),256,0,cudaStreamPerThread>>>(static_cast<float *>(scores.get()),static_cast<B *>(probabilities.get()),size_t(m)*k.rows);
+            castKernel<float,B><<<grid(size_t(m)*k.rows),256,0,cudaStreamPerThread>>>(static_cast<float *>(scores.get()),static_cast<B *>(probabilities.get()),size_t(m)*k.rows);
             check(cublasGemmEx(h,CUBLAS_OP_N,CUBLAS_OP_N,dim,m,k.rows,&one,
                 ptr(v)+(head/(heads/kvHeads))*dim,CUDA_R_16BF,v.cols,probabilities.get(),CUDA_R_16BF,k.rows,
                 &zero,values.get(),CUDA_R_32F,dim,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
@@ -576,7 +585,7 @@ struct Weights::Impl {
     Runtime &rt; std::ifstream file; json11::Json header; uint64_t base=0,fileSize=0;
     std::shared_ptr<void> mapping;
     std::unordered_map<std::string,Tensor> cache;
-    struct HostWeight { int rows,cols; bool fp32; std::vector<uint8_t> bytes; };
+    struct HostWeight { int rows,cols; DType dtype; std::vector<uint8_t> bytes; };
     std::unordered_map<std::string,HostWeight> host;
     std::shared_ptr<PackedCache> packed;
     std::string directory;
@@ -621,7 +630,7 @@ const Tensor &Weights::get(const std::string &name) {
     auto saved=i.host.find(name);
     if(saved!=i.host.end()) {
         const auto &h=saved->second;
-        Tensor value(h.rows,h.cols,h.fp32);
+        Tensor value(h.rows,h.cols,h.dtype);
         copy(value.data,h.bytes.data(),h.bytes.size(),cudaMemcpyHostToDevice);
         return i.cache.emplace(name,std::move(value)).first->second;
     }
@@ -662,20 +671,15 @@ const Tensor &Weights::get(const std::string &name) {
     if(dtype=="F32") {
         value=i.rt.upload(static_cast<const float *>(source),rows,cols);
     } else {
-        if(i.rt.isFloat32()) {
-            // Transfer the checkpoint representation, then expand on device. This is exact
-            // and halves PCIe traffic for FP32 inference with streamed BF16 checkpoints.
-            if(!raw.data) {
-                raw=Tensor(rows,cols); copy(raw.data,source,n*2,cudaMemcpyHostToDevice);
-                if(i.packed && raw.bytes()<=i.packed->budget-i.packed->bytes) {
-                    i.packed->tensors.emplace(name,raw);
-                    i.packed->bytes+=raw.bytes();
-                }
+        // Transfer BF16 once, then convert only when the compute dtype differs.
+        if(!raw.data) {
+            raw=Tensor(rows,cols); copy(raw.data,source,n*2,cudaMemcpyHostToDevice);
+            if(i.packed && raw.bytes()<=i.packed->budget-i.packed->bytes) {
+                i.packed->tensors.emplace(name,raw);
+                i.packed->bytes+=raw.bytes();
             }
-            value=Tensor(rows,cols,true);
-            toFloat<<<grid(n),256,0,cudaStreamPerThread>>>(ptr(raw),as<float>(value),n);
-            check(cudaGetLastError());
-        } else { value=Tensor(rows,cols); copy(value.data,source,n*2,cudaMemcpyHostToDevice); }
+        }
+        value=i.rt.cast(raw,i.rt.dtype());
     }
     return i.cache.emplace(name,std::move(value)).first->second;
 }
@@ -691,7 +695,7 @@ void Weights::offload() {
     for(const auto &entry:impl_->cache) {
         if(impl_->host.count(entry.first)) continue;
         const auto &x=entry.second;
-        Impl::HostWeight h{x.rows,x.cols,x.fp32,std::vector<uint8_t>(x.bytes())};
+        Impl::HostWeight h{x.rows,x.cols,x.dtype,std::vector<uint8_t>(x.bytes())};
         copy(h.bytes.data(),x.data,x.bytes(),cudaMemcpyDeviceToHost);
         impl_->host.emplace(entry.first,std::move(h));
     }

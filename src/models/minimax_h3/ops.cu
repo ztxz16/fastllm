@@ -1,5 +1,6 @@
 #include "models/minimax_h3/runtime.h"
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -9,6 +10,7 @@ namespace fastllm {
 namespace minimax_h3 {
 namespace {
 using B = __nv_bfloat16;
+using H = __half;
 void check(cudaError_t e) {
     if (e != cudaSuccess)
         throw std::runtime_error(cudaGetErrorString(e));
@@ -42,10 +44,6 @@ __global__ void rmsFused(const B *x, const B *w, B *out, int width, float eps) {
     for (int c = threadIdx.x; c < width; c += 256)
         out[row + c] = B(value(x[row + c]) * inv * value(w[c]));
 }
-template <class T, class U> __global__ void convert(const T *x, U *y, size_t n) {
-    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256)
-        y[i] = U(value(x[i]));
-}
 template <class T>
 __global__ void selectRows(const T *x, T *out, const int *indices, size_t n, int c, bool scatter) {
     for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
@@ -77,7 +75,7 @@ __global__ void rotate(const T *x, const float *cs, const float *sn, T *out, siz
         }
         size_t p = (i / c) * rd + j;
         float other = j < rd / 2 ? -value(x[i + rd / 2]) : value(x[i - rd / 2]);
-        // Eager PyTorch rounds cos/sin, both products, then the sum at BF16.
+        // Eager PyTorch rounds cos/sin, both products, then the sum in the activation dtype.
         out[i] = T(rounded<T>(value(x[i]) * rounded<T>(cs[p])) + rounded<T>(other * rounded<T>(sn[p])));
     }
 }
@@ -99,25 +97,15 @@ __global__ void timeFeatures(const float *times, float *out, size_t n, int d) {
     }
 }
 } // namespace
-Tensor Runtime::cast(const Tensor &x, bool fp32) {
-    if (x.fp32 == fp32)
-        return x;
-    Tensor out(x.rows, x.cols, fp32);
-    if (fp32)
-        convert<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(ptr<B>(x), ptr<float>(out), x.size());
-    else
-        convert<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(ptr<float>(x), ptr<B>(out), x.size());
-    check(cudaGetLastError());
-    return out;
-}
 Tensor Runtime::rms(const Tensor &x, const Tensor &w, float eps, int width) {
     if (!width)
         width = x.cols;
-    require(width > 0 && x.cols % width == 0 && w.size() == size_t(width) && w.fp32 == x.fp32,
-            "invalid H3 RMSNorm shape");
-    if (x.fp32)
+    require(x.dtype != DType::FP16 && width > 0 && x.cols % width == 0 && w.size() == size_t(width) &&
+                w.dtype == x.dtype,
+            "invalid H3 RMSNorm shape/dtype");
+    if (x.isFloat32())
         return norm(x, true, &w, nullptr, eps, width);
-    Tensor out(x.rows, x.cols, false);
+    Tensor out(x.rows, x.cols, x.dtype);
     rmsFused<<<x.size() / width, 256, 0, cudaStreamPerThread>>>(ptr<B>(x), ptr<B>(w), ptr<B>(out), width,
                                                                 eps);
     check(cudaGetLastError());
@@ -132,34 +120,36 @@ Tensor Runtime::indices(const std::vector<int> &values) {
     return out;
 }
 Tensor Runtime::gather(const Tensor &x, const Tensor &idx) {
-    require(idx.fp32 && idx.cols == 1, "invalid H3 row indices");
-    Tensor out(idx.rows, x.cols, x.fp32);
-    if (x.fp32)
+    require(idx.isFloat32() && idx.cols == 1, "invalid H3 row indices");
+    Tensor out(idx.rows, x.cols, x.dtype);
+    if (x.isFloat32())
         selectRows<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(
             ptr<float>(x), ptr<float>(out), ptr<int>(idx), out.size(), x.cols, false);
     else
-        selectRows<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(ptr<B>(x), ptr<B>(out), ptr<int>(idx),
-                                                                      out.size(), x.cols, false);
+        selectRows<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(
+            ptr<uint16_t>(x), ptr<uint16_t>(out), ptr<int>(idx), out.size(), x.cols, false);
     check(cudaGetLastError());
     return out;
 }
 void Runtime::scatter(Tensor &out, const Tensor &x, const Tensor &idx) {
-    require(idx.fp32 && idx.cols == 1 && idx.rows == x.rows && out.cols == x.cols && out.fp32 == x.fp32,
+    require(idx.isFloat32() && idx.cols == 1 && idx.rows == x.rows && out.cols == x.cols &&
+                out.dtype == x.dtype,
             "invalid H3 scatter shape");
-    if (x.fp32)
+    if (x.isFloat32())
         selectRows<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(ptr<float>(x), ptr<float>(out),
                                                                     ptr<int>(idx), x.size(), x.cols, true);
     else
-        selectRows<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(ptr<B>(x), ptr<B>(out), ptr<int>(idx),
-                                                                    x.size(), x.cols, true);
+        selectRows<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(ptr<uint16_t>(x), ptr<uint16_t>(out),
+                                                                    ptr<int>(idx), x.size(), x.cols, true);
     check(cudaGetLastError());
 }
 Tensor Runtime::modulateRows(const Tensor &x, const Tensor &m, const Tensor &idx, int shift, int scale) {
-    require(x.fp32 == m.fp32 && idx.fp32 && idx.cols == 1 && idx.rows == x.rows && shift >= 0 && scale >= 0 &&
+    require(x.dtype != DType::FP16 && x.dtype == m.dtype && idx.isFloat32() && idx.cols == 1 &&
+                idx.rows == x.rows && shift >= 0 && scale >= 0 &&
                 m.cols >= (std::max(shift, scale) + 1) * x.cols,
-            "invalid H3 modulation shape");
-    Tensor out(x.rows, x.cols, x.fp32);
-    if (x.fp32)
+            "invalid H3 modulation shape/dtype");
+    Tensor out(x.rows, x.cols, x.dtype);
+    if (x.isFloat32())
         modulation<float><<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
             ptr<float>(x), nullptr, ptr<float>(m), ptr<int>(idx), ptr<float>(out), x.size(), x.cols, m.cols,
             shift, scale);
@@ -171,11 +161,12 @@ Tensor Runtime::modulateRows(const Tensor &x, const Tensor &m, const Tensor &idx
     return out;
 }
 Tensor Runtime::residualRows(const Tensor &x, const Tensor &y, const Tensor &m, const Tensor &idx, int gate) {
-    require(x.fp32 == y.fp32 && x.fp32 == m.fp32 && x.rows == y.rows && x.cols == y.cols && idx.fp32 &&
-                idx.cols == 1 && idx.rows == x.rows && gate >= 0 && m.cols >= (gate + 1) * x.cols,
-            "invalid H3 residual shape");
-    Tensor out(x.rows, x.cols, x.fp32);
-    if (x.fp32)
+    require(x.dtype != DType::FP16 && x.dtype == y.dtype && x.dtype == m.dtype && x.rows == y.rows &&
+                x.cols == y.cols && idx.isFloat32() && idx.cols == 1 && idx.rows == x.rows && gate >= 0 &&
+                m.cols >= (gate + 1) * x.cols,
+            "invalid H3 residual shape/dtype");
+    Tensor out(x.rows, x.cols, x.dtype);
+    if (x.isFloat32())
         modulation<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
             ptr<float>(x), ptr<float>(y), ptr<float>(m), ptr<int>(idx), ptr<float>(out), x.size(), x.cols,
             m.cols, gate, 0);
@@ -186,13 +177,16 @@ Tensor Runtime::residualRows(const Tensor &x, const Tensor &y, const Tensor &m, 
     return out;
 }
 Tensor Runtime::rotary(const Tensor &x, const Tensor &cs, const Tensor &sn, int dim) {
-    require(dim > 0 && x.cols % dim == 0 && cs.fp32 && sn.fp32 && cs.rows == x.rows && sn.rows == x.rows &&
-                cs.cols == sn.cols && cs.cols <= dim && cs.cols % 2 == 0,
+    require(dim > 0 && x.cols % dim == 0 && cs.isFloat32() && sn.isFloat32() && cs.rows == x.rows &&
+                sn.rows == x.rows && cs.cols == sn.cols && cs.cols <= dim && cs.cols % 2 == 0,
             "invalid H3 rotary shape");
-    Tensor out(x.rows, x.cols, x.fp32);
-    if (x.fp32)
+    Tensor out(x.rows, x.cols, x.dtype);
+    if (x.isFloat32())
         rotate<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
             ptr<float>(x), ptr<float>(cs), ptr<float>(sn), ptr<float>(out), x.size(), x.cols, dim, cs.cols);
+    else if (x.dtype == DType::FP16)
+        rotate<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(ptr<H>(x), ptr<float>(cs), ptr<float>(sn),
+                                                                ptr<H>(out), x.size(), x.cols, dim, cs.cols);
     else
         rotate<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(ptr<B>(x), ptr<float>(cs), ptr<float>(sn),
                                                                 ptr<B>(out), x.size(), x.cols, dim, cs.cols);
@@ -228,7 +222,7 @@ Tensor Runtime::timestepEmbedding(const std::vector<float> &times, int dimension
 }
 Tensor Runtime::selfAttention(const Tensor &q, const Tensor &k, const Tensor &v, int heads) {
     require(heads > 0 && q.cols % heads == 0, "invalid H3 attention heads");
-    if (!q.fp32)
+    if (!q.isFloat32())
         return attention(q, k, v, heads);
     // Match PyTorch's FP32 math SDPA: scale each input before the dot product.
     float scale = float(std::sqrt(1.0 / std::sqrt(double(q.cols / heads))));
@@ -306,7 +300,8 @@ __global__ void affineValues(const float *x, float *out, float scale, float bias
 } // namespace
 Tensor Runtime::conv1d(const Tensor &x, const Tensor &w, const Tensor *bias, int kernel, int stride, int pad,
                        int dilation, bool transposed) {
-    require(x.fp32 && w.fp32 && kernel > 0 && stride > 0 && dilation > 0 && w.cols == x.cols * kernel,
+    require(x.isFloat32() && w.isFloat32() && kernel > 0 && stride > 0 && dilation > 0 &&
+                w.cols == x.cols * kernel,
             "invalid H3 audio convolution");
     int length = transposed ? (x.rows - 1) * stride - 2 * pad + kernel
                             : (x.rows + 2 * pad - dilation * (kernel - 1) - 1) / stride + 1;
@@ -326,7 +321,7 @@ Tensor Runtime::conv1d(const Tensor &x, const Tensor &w, const Tensor *bias, int
     return out;
 }
 Tensor Runtime::weightNorm(const Tensor &w, const Tensor &g) {
-    require(w.fp32 && g.fp32 && g.size() == size_t(w.rows), "invalid H3 weight norm");
+    require(w.isFloat32() && g.isFloat32() && g.size() == size_t(w.rows), "invalid H3 weight norm");
     Tensor out(w.rows, w.cols, true);
     normalizeWeight<<<w.rows, 256, 0, cudaStreamPerThread>>>(ptr<float>(w), ptr<float>(g), ptr<float>(out),
                                                              w.cols);
@@ -334,7 +329,7 @@ Tensor Runtime::weightNorm(const Tensor &w, const Tensor &g) {
     return out;
 }
 Tensor Runtime::transposeConvWeight(const Tensor &w, int kernel) {
-    require(w.fp32 && kernel > 0 && w.cols % kernel == 0, "invalid H3 transposed convolution weight");
+    require(w.isFloat32() && kernel > 0 && w.cols % kernel == 0, "invalid H3 transposed convolution weight");
     Tensor out(w.cols / kernel, w.rows * kernel, true);
     transposeWeight<<<grid(w.size()), 256, 0, cudaStreamPerThread>>>(ptr<float>(w), ptr<float>(out), w.rows,
                                                                      out.rows, kernel, w.size());
@@ -342,7 +337,7 @@ Tensor Runtime::transposeConvWeight(const Tensor &w, int kernel) {
     return out;
 }
 Tensor Runtime::audioFilter(const Tensor &x, const Tensor &filter, bool up) {
-    require(x.fp32 && filter.fp32 && filter.size() == 12, "invalid H3 alias-free filter");
+    require(x.isFloat32() && filter.isFloat32() && filter.size() == 12, "invalid H3 alias-free filter");
     Tensor out(up ? x.rows * 2 : (x.rows + 1) / 2, x.cols, true);
     filterAudio<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(
         ptr<float>(x), ptr<float>(filter), ptr<float>(out), x.rows, x.cols, filter.size(), up, out.size());
@@ -350,7 +345,7 @@ Tensor Runtime::audioFilter(const Tensor &x, const Tensor &filter, bool up) {
     return out;
 }
 Tensor Runtime::snake(const Tensor &x, const Tensor &alpha, const Tensor &beta) {
-    require(x.fp32 && alpha.fp32 && beta.fp32 && alpha.size() == size_t(x.cols) &&
+    require(x.isFloat32() && alpha.isFloat32() && beta.isFloat32() && alpha.size() == size_t(x.cols) &&
                 beta.size() == alpha.size(),
             "invalid H3 Snake shape");
     Tensor out(x.rows, x.cols, true);
@@ -360,7 +355,7 @@ Tensor Runtime::snake(const Tensor &x, const Tensor &alpha, const Tensor &beta) 
     return out;
 }
 Tensor Runtime::affine(const Tensor &x, float scale, float bias, bool clamp) {
-    require(x.fp32, "H3 affine requires FP32");
+    require(x.isFloat32(), "H3 affine requires FP32");
     Tensor out(x.rows, x.cols, true);
     affineValues<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(ptr<float>(x), ptr<float>(out), scale, bias,
                                                                   clamp, x.size());
@@ -377,7 +372,7 @@ __global__ void schedulerStep(const float *x, const float *v, float *out, float 
 }
 } // namespace
 Tensor Runtime::step(const Tensor &x, const Tensor &v, float time, float sigma, float next) {
-    require(x.fp32 && v.fp32 && x.rows == v.rows && x.cols == v.cols && sigma > 0,
+    require(x.isFloat32() && v.isFloat32() && x.rows == v.rows && x.cols == v.cols && sigma > 0,
             "invalid H3 scheduler input");
     Tensor out(x.rows, x.cols, true);
     schedulerStep<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(

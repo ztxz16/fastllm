@@ -72,7 +72,7 @@ int h3_block(void *p, int layer, int rows, int timeCount, const float *input, co
         const auto &cfg = dit.config();
         auto x = rt.upload(input, rows, cfg.hidden);
         auto temb = dit.timeEmbedding(std::vector<float>(times, times + timeCount));
-        auto mod = dit.projectModulation(layer, rt.cast(m.full.activation(temb), rt.isFloat32()));
+        auto mod = dit.projectModulation(layer, rt.cast(m.full.activation(temb), rt.dtype()));
         auto rope =
             rt.ropeTable(std::vector<float>(positions, positions + rows * 3), cfg.ropeFreq, cfg.ropeTheta);
         auto trace = [&](const std::string &name, const Tensor &value) {

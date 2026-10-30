@@ -32,16 +32,19 @@ public:
 private:
     std::shared_ptr<void> pool_;
 };
+enum class DType { BF16, FP16, FP32 };
 
 struct Tensor {
     std::shared_ptr<void> storage;
     uint16_t *data = nullptr;
     int rows = 0, cols = 0;
-    bool fp32 = false;
+    DType dtype = DType::BF16;
     Tensor() = default;
     Tensor(int rows, int cols, bool fp32 = false);
+    Tensor(int rows, int cols, DType dtype);
+    bool isFloat32() const { return dtype == DType::FP32; }
     size_t size() const { return size_t(rows) * cols; }
-    size_t bytes() const { return size() * (fp32 ? 4 : 2); }
+    size_t bytes() const { return size() * (isFloat32() ? 4 : 2); }
     Tensor rowSlice(int first, int count) const;
 };
 
@@ -51,8 +54,10 @@ class Runtime {
 public:
     explicit Runtime(int device);
     Runtime(int device, bool fp32);
+    Runtime(int device, DType dtype);
     void activate();
-    bool isFloat32() const { return fp32_; }
+    bool isFloat32() const { return dtype_ == DType::FP32; }
+    DType dtype() const { return dtype_; }
     ~Runtime();
     Runtime(const Runtime &) = delete;
     Runtime &operator=(const Runtime &) = delete;
@@ -66,6 +71,7 @@ public:
     // Official per-latent-frame CUDA normal noise, already patchified. Height
     // and width are output pixels; frame indices are in latent time units.
     Tensor pixelNoise(uint64_t seed, int firstFrame, int frames, int height, int width);
+    Tensor cast(const Tensor &, DType dtype);
     Tensor linear(const Tensor &x, const Tensor &weight, const Tensor *bias = nullptr);
     Tensor norm(const Tensor &x, bool rms, const Tensor *weight = nullptr,
                 const Tensor *bias = nullptr, float eps = 1e-6f, int width = 0);
@@ -106,7 +112,7 @@ private:
     std::unique_ptr<LtState> lt_;
     void *blas_ = nullptr;
     int device_;
-    bool fp32_ = false;
+    DType dtype_;
 };
 
 class Weights {
