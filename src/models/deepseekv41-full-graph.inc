@@ -1,6 +1,24 @@
 // Included after ForwardWorkspace: reuses the ordinary model's arithmetic and
 // captured projection/MoE graphs, replacing only dynamic decode orchestration.
 namespace {
+// Keep the hybrid graph coordinator near its GPU without changing the NUMA
+// expert pool or the serving thread's affinity outside this operation.
+struct V41FullCallerAffinity {
+#if defined(USE_NUMAS) && defined(__linux__)
+    cpu_set_t original;
+    bool restore = false;
+    explicit V41FullCallerAffinity(const std::vector<int> &cpus) {
+        if (!cpus.empty() && sched_getaffinity(0, sizeof(original), &original) == 0)
+            restore = fastllm::BindNumasWorkerCpuSet(cpus);
+    }
+    ~V41FullCallerAffinity() {
+        if (restore) sched_setaffinity(0, sizeof(original), &original);
+    }
+#else
+    explicit V41FullCallerAffinity(const std::vector<int> &) {}
+#endif
+};
+
 Data &V41FullLocal(Data &d, int device) {
     if (!d.multiDeviceData) return d;
     return *d.multiDeviceDatas.at(device);
@@ -91,11 +109,11 @@ struct V41FullEngramWorker {
     }
 };
 struct V41FullGraph {
-    std::vector<int> devices;
+    std::vector<int> devices, coordinatorCpus;
     int batch = 1, maxKeys = 131072;
     bool verifying = false, capturesInput = false, hybrid = false, tensorParallel = true;
     std::vector<void *> moeHandles;
-    Data inputIds, embedding;
+    Data inputIds, embedding, deferredHcMix;
     std::vector<float> hostTokens;
     std::vector<std::unique_ptr<V41FullLayer>> layers;
     std::map<int, std::unique_ptr<V41FullEngram>> engrams;
@@ -347,6 +365,14 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     auto g = std::make_shared<V41FullGraph>();
     g->devices = state->devices;
     g->hybrid = hybrid; g->tensorParallel = state->tensorParallel;
+#ifdef USE_NUMAS
+    if (hybrid && !weights.empty() && weights[0].size() > 2 && weights[0][2]) {
+        HostMoePlacementScope placement(weights[0][2]);
+        const auto cpus = GetNumasCudaWorkerCpuSets(g->devices);
+        if (cpus.size() == 1) g->coordinatorCpus = cpus.front();
+    }
+#endif
+    V41FullCallerAffinity affinity(g->coordinatorCpus);
     g->hostRequests.resize(g->devices.size());
     g->hostPlans.resize(g->devices.size());
     g->batch = batch;
@@ -382,6 +408,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         g->hostTokens.assign(batch, 0.f);
         if (!verifying) alloc(g->inputIds, DataType::FLOAT32, {1, batch});
     }
+    if (hybrid) alloc(g->deferredHcMix, DataType::FLOAT32, {2 * block_cnt, 32});
+    std::vector<int> hcStart, hcJoin;
     const int blockSize = std::max(1, candidate_block_size);
     alloc(g->topk, DataType::INT32, {1, batch, index_topk});
     alloc(g->candidates, DataType::INT8, {1, batch, (g->maxKeys + blockSize - 1) / blockSize});
@@ -582,6 +610,9 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                     V41HcApplyPre(ws.hiddenStates, ws.dsparkPreMix, g->mainHidden[l]);
                 });
             }
+            // Delayed-pre normalization consumes the preceding layer's pre.
+            // This attention mix is first read by the attention residual below.
+            if (hybrid) { hcStart.push_back(children[0].size()); hcJoin.push_back(-1); }
             for (size_t rank = 0; rank < children.size(); ++rank)
                 children[rank].push_back(state->segments[l * 4].graphs[rank]);
             auto &layer = *g->layers[l];
@@ -661,6 +692,10 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                                     "full graph attention failed");
                 });
             });
+            if (hybrid) {
+                hcJoin.back() = children[0].size();
+                hcStart.push_back(children[0].size()); hcJoin.push_back(-1);
+            }
             for (int piece = 1; piece < (hybrid ? 3 : 4); ++piece)
                 for (size_t rank = 0; rank < children.size(); ++rank)
                     children[rank].push_back(state->segments[l * 4 + piece].graphs[rank]);
@@ -677,6 +712,9 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 if (!handle || !moeGraph) throw std::runtime_error("native MoE full graph rejected");
                 g->moeHandles.push_back(handle);
                 children[0].push_back(moeGraph);
+                // Router and expert computation read ffnInput, not ffnPre /
+                // ffnPost / ffnComb. Join before the residual consumes them.
+                hcJoin.back() = children[0].size();
                 capture([&] {
                     AssertInFastLLM(FastllmCudaDeepSeekV41MoeHcPost(ws.ffnOut, ws.sharedExpertOut,
                         ws.hiddenTemp, ws.ffnPost, ws.ffnComb, ws.hiddenStates),
@@ -728,7 +766,11 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 g->ready[rank] = FastllmCudaEventCreate();
                 if (!g->ready[rank]) throw std::runtime_error("full verify completion event");
             }
-            if (!FastllmCudaGraphCompose(children[rank].data(), children[rank].size(),
+            const bool deferred = hybrid && FastllmCudaV41ComposeHcGraph(
+                children[rank].data(), children[rank].size(), hcStart.data(), hcJoin.data(),
+                hcStart.size(), static_cast<float *>(g->deferredHcMix.cudaData),
+                &g->graphs[rank], &g->execs[rank]);
+            if (!deferred && !FastllmCudaGraphCompose(children[rank].data(), children[rank].size(),
                                          &g->graphs[rank], &g->execs[rank]))
                 throw std::runtime_error("full graph composition failed");
         }
@@ -818,6 +860,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     }
     if (!f.graphState->fullDecode) return false;
     auto g = std::static_pointer_cast<V41FullGraph>(f.graphState->fullDecode);
+    V41FullCallerAffinity affinity(g->coordinatorCpus);
     if (g->capturesInput) {
         if ((int)f.tokenIds.size() != g->batch) return false;
         const int vocab = weight["embed.weight"].dims[0];

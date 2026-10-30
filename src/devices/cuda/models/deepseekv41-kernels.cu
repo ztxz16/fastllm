@@ -647,15 +647,15 @@ namespace {
 
     // Ascending reduction tree matches FastllmGemvFp32Fp32Kernel2.
     // BF16 converts exactly to FP32 in registers; no activation cast buffer.
-    template<int Tokens>
-    __global__ void V41RouterScoresKernel(const __nv_bfloat16 *input, const float *weight,
+    template<int Tokens, typename Weight = float>
+    __global__ void V41RouterScoresKernel(const __nv_bfloat16 *input, const Weight *weight,
                                           float *scores, int dim, int experts, float invTemp, int rows) {
         const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
         const int expert = blockIdx.x, first = blockIdx.y * Tokens;
         float sums[Tokens] = {};
 #pragma unroll 4
         for (int i = tid; i < dim; i += 256) {
-            const float coefficient = weight[(size_t)expert * dim + i];
+            const float coefficient = V41Load(weight, (size_t)expert * dim + i);
 #pragma unroll
             for (int t=0;t<Tokens;++t)
                 if (first+t<rows) sums[t] += __bfloat162float(input[(size_t)(first+t)*dim+i]) * coefficient;
@@ -962,13 +962,13 @@ namespace {
         mix += (uint64_t)blockIdx.y * 25;
         float acc = 0.0f;
         int k = threadIdx.x;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
-        // Every launch uses exactly 256 threads. Expose that index range to
-        // NVCC without changing any lane's FMA or reduction order.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1200)
+        // Exactly 256 threads participate in these dots, including the dot
+        // CTAs of the combined SM120 kernel. Expose their range to NVCC.
         k &= kHcThreads - 1;
         if constexpr (TILE > 0) {
-            // The SM90 BF16 launcher checks shape eligibility. Preserve each
-            // lane's FMA order; partial tiles use the original loop below.
+            // Tiled launchers check shape eligibility. Preserve each lane's
+            // FMA order; partial tiles use the original loop below.
             for (; k + (TILE - 1) * kHcThreads < flatDim; k += TILE * kHcThreads) {
                 float values[TILE], weights[TILE];
 #pragma unroll
@@ -1270,9 +1270,9 @@ namespace {
     //     都与 RMSNorm kernel 一致。
     // 所以 THREAD_PER_BLOCK 必须与 LaunchFastllmRMSNormBFloat16 对同一个 channels 的选择相同。
     template <int THREAD_PER_BLOCK, int MAX_ITER, bool FINISH_MIX = false, bool QUANTIZE_OUTPUT = false, int MIX_WARPS = 1>
-    __global__ void __launch_bounds__(THREAD_PER_BLOCK)
-    V41HcPreNormKernel(const __nv_bfloat16 *x, const float *pre, const float *weight,
-                       __nv_bfloat16 *out, int hcMult, int channels, float eps,
+    __device__ __forceinline__ void
+    V41HcPreNormBody(const __nv_bfloat16 *x, const float *pre, const float *weight,
+                       __nv_bfloat16 *out, int hcMult, int channels, float eps, int token,
                        const float *mix = nullptr, const float *mixScale = nullptr,
                        const float *mixBase = nullptr, int sinkhornIters = 0,
                        float mixEps = 0, float *post = nullptr, float *comb = nullptr, float *nextPre = nullptr,
@@ -1315,11 +1315,10 @@ namespace {
         constexpr int NUM_WARPS = THREAD_PER_BLOCK / WARP_SIZE;
         __shared__ float warp_sums[NUM_WARPS];
 
-        const int o = FINISH_MIX ? blockIdx.x / 2 : blockIdx.x;
         const int bf2 = channels / 2;
-        const __nv_bfloat162 *xb = reinterpret_cast<const __nv_bfloat162*>(x) + (uint64_t)o * hcMult * bf2;
-        const float *preRow = pre + (uint64_t)o * hcMult;
-        __nv_bfloat162 *outb = reinterpret_cast<__nv_bfloat162*>(out) + (uint64_t)o * bf2;
+        const __nv_bfloat162 *xb = reinterpret_cast<const __nv_bfloat162*>(x) + (uint64_t)token * hcMult * bf2;
+        const float *preRow = pre + (uint64_t)token * hcMult;
+        __nv_bfloat162 *outb = reinterpret_cast<__nv_bfloat162*>(out) + (uint64_t)token * bf2;
 
         const unsigned tid = threadIdx.x;
         const int warp_id = (int)tid / WARP_SIZE, lane_id = (int)tid % WARP_SIZE;
@@ -1383,9 +1382,40 @@ namespace {
                     __nv_bfloat162 qv;
                     qv.x = __float2bfloat16_rn(V41QuantValueDev(__bfloat162float(ov.x), qs, 1));
                     qv.y = __float2bfloat16_rn(V41QuantValueDev(__bfloat162float(ov.y), qs, 1));
-                    reinterpret_cast<__nv_bfloat162 *>(quantized)[(uint64_t)o * bf2 + i] = qv;
+                    reinterpret_cast<__nv_bfloat162 *>(quantized)[(uint64_t)token * bf2 + i] = qv;
                 }
             }
+        }
+    }
+
+    template <int THREAD_PER_BLOCK, int MAX_ITER, bool FINISH_MIX = false, bool QUANTIZE_OUTPUT = false, int MIX_WARPS = 1>
+    __global__ void __launch_bounds__(THREAD_PER_BLOCK)
+    V41HcPreNormKernel(const __nv_bfloat16 *x, const float *pre, const float *weight,
+                       __nv_bfloat16 *out, int hcMult, int channels, float eps,
+                       const float *mix = nullptr, const float *mixScale = nullptr,
+                       const float *mixBase = nullptr, int sinkhornIters = 0,
+                       float mixEps = 0, float *post = nullptr, float *comb = nullptr, float *nextPre = nullptr,
+                       __nv_bfloat16 *quantized = nullptr) {
+        V41HcPreNormBody<THREAD_PER_BLOCK, MAX_ITER, FINISH_MIX, QUANTIZE_OUTPUT, MIX_WARPS>(
+            x, pre, weight, out, hcMult, channels, eps, FINISH_MIX ? blockIdx.x / 2 : blockIdx.x,
+            mix, mixScale, mixBase,
+            sinkhornIters, mixEps, post, comb, nextPre, quantized);
+    }
+
+    // The delayed-pre normalization reads previousPre, not this layer's mix.
+    // Run it alongside the 25 independent dots, retaining both reduction trees.
+    // Only the small single-token SM120 path uses this combined launch.
+    template <bool QUANTIZE>
+    __global__ void __launch_bounds__(1024)
+    V41HcDotsPreNormKernel(const __nv_bfloat16 *x, const float *fn, float *mix,
+            const float *previousPre, const float *normWeight, __nv_bfloat16 *out,
+            __nv_bfloat16 *quantized, float eps) {
+        if (blockIdx.x == 25) {
+            V41HcPreNormBody<1024, 3, false, QUANTIZE>(x, previousPre, normWeight,
+                out, 4, 5120, eps, 0, nullptr, nullptr, nullptr, 0, 0.f,
+                nullptr, nullptr, nullptr, quantized);
+        } else if (threadIdx.x < kHcThreads) {
+            V41HcDecodeDotsBody<__nv_bfloat16, 16>(x, fn, 4 * 5120, mix);
         }
     }
 
@@ -4916,6 +4946,16 @@ extern "C" bool FastllmCudaV41RouterScores(const Data &input, Data &weight,
 #undef V41_ROUTER_ROWS
         return V41CheckLaunch("RouterScoresRows");
     }
+    // Checkpoint router weights are BF16 promoted to FP32. Compact only
+    // exactly representable weights; retain every FP32 FMA/reduction step.
+    if (rows == 1 && V41IsSm<12, 0>()) {
+        if (Data *compact = FastllmCudaExactRouterBFloat16Weight(weight)) {
+            V41RouterScoresKernel<1, __nv_bfloat16><<<weight.dims[0], 256>>>(
+                (const __nv_bfloat16*)input.cudaData, (const __nv_bfloat16*)compact->cudaData,
+                (float*)scores.cudaData, weight.dims[1], weight.dims[0], invTemp, rows);
+            return V41CheckLaunch("RouterScoresCompact");
+        }
+    }
     if (rows == 1)
         V41RouterScoresKernel<1><<<dim3(weight.dims[0],rows),256>>>(
             (const __nv_bfloat16 *)input.cudaData,(const float *)weight.cudaData,
@@ -4953,6 +4993,17 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &pr
         !V41PrepareOutput(output, DataType::BFLOAT16, {b, n, d})) return false;
     if (quantizedOutput != nullptr &&
         !V41PrepareOutput(*quantizedOutput, DataType::BFLOAT16, {b, n, d})) return false;
+    if (tokens == 1 && d == 5120 && V41IsSm<12, 0>()) {
+        const auto kernel = quantizedOutput ? V41HcDotsPreNormKernel<true> : V41HcDotsPreNormKernel<false>;
+        kernel<<<26, 1024>>>((const __nv_bfloat16*)x.cudaData, (const float*)fn.cudaData,
+            (float*)scratch.cudaData, (const float*)previousPre.cudaData, (const float*)normWeight.cudaData,
+            (__nv_bfloat16*)output.cudaData,
+            quantizedOutput ? (__nv_bfloat16*)quantizedOutput->cudaData : nullptr, normEps);
+        V41HcDecodeFinish<<<tokens, 32>>>((const float*)scratch.cudaData,
+            (const float*)scale.cudaData, (const float*)base.cudaData, 4 * d,
+            sinkhornIters, mixEps, normEps, (float*)pre.cudaData, (float*)post.cudaData, (float*)comb.cudaData);
+        return V41CheckLaunch("HcDotsPreNorm");
+    }
     V41LaunchHcDecodeDots((const __nv_bfloat16 *)x.cudaData, (const float *)fn.cudaData,
                          tokens, 4 * d, (float *)scratch.cudaData);
 #define V41_MIX_NORM(I, Q) V41HcPreNormKernel<1024, I, true, Q><<<tokens * 2, 1024>>>( \
@@ -7273,6 +7324,19 @@ bool FastllmCudaV41CreateHostCopy(void *dst, size_t bytes, void **hostData,
     new (host) std::atomic<unsigned>(1u);
     *hostData = data; *ready = static_cast<std::atomic<unsigned> *>(host); *result = graph;
     return true;
+#else
+    return false;
+#endif
+}
+
+#ifndef USE_ROCM
+#include "deepseekv41-hc-graph.cuh"
+#endif
+extern "C" bool FastllmCudaV41ComposeHcGraph(const void *const *children, int count,
+        const int *start, const int *join, int branches, float *saved,
+        void **outGraph, void **outExec) {
+#ifndef USE_ROCM
+    return fastllm_v41_hc_graph::Compose(children, count, start, join, branches, saved, outGraph, outExec);
 #else
     return false;
 #endif

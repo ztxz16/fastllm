@@ -15,6 +15,10 @@
 #include "devices/cuda/fastllm-v41-full-decode.h"
 #endif
 #include "utils/hybrid_moe.h"
+#if defined(USE_NUMAS) && defined(__linux__)
+#include "devices/numas/numasdevice.h"
+#include <sched.h>
+#endif
 #include <optional>
 
 #include "baseblock.h"
