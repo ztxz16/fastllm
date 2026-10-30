@@ -15,7 +15,8 @@ Apache-2.0 许可。原生实现按其张量布局、运算顺序、调度与分
 
 当前覆盖文字生成音视频（T2VA）。首尾帧、参考图像/视频/音频条件尚未实现。
 默认 BF16 混合精度，另保留 `--precision fp32` 严格数值基线，关闭 TF32。
-BF16 下保留官方的 FP32 输入/输出投影与时间嵌入，采样状态、视频/音频 VAE 也保持 FP32。
+BF16 下保留官方的 FP32 输入/输出投影、时间嵌入与采样状态；视频 VAE 默认 FP16
+混合精度，音频 VAE 保持 FP32。视频 VAE 的具体精度边界和验证结果见文末。
 这不等同于声称与官方默认输出逐位相同。
 
 文本编码器为 Qwen3-VL 前 50 层的 pre-final-norm 残差。视频和音频分开归一化、使用不同
@@ -135,7 +136,8 @@ FP32 原始权重缓存优化的短任务和完整 49 步回归分别保持 11/1
 的 `load_components(dtype=torch.bfloat16)` 与
 [SGLang 精度配置](https://github.com/sgl-project/sglang/blob/3b6c28b0b9aff784115bafeecc67f37e1fe43454/python/sglang/multimodal_gen/configs/pipeline_configs/minimax_h3.py)：
 DiT、文本编码器默认 BF16；SGLang 的视频 VAE 权重为 FP32、解码默认 FP16 autocast，音频 VAE 为 FP32。
-本实现首先切换文本和 DiT；视频 VAE 仍是 FP32，未声称复刻 SGLang 的全部精度策略。
+该次提交首先切换文本和 DiT；以下历史测试的视频 VAE 仍为 FP32。
+后续的视频 VAE 混合精度测试单独记录于文末。
 
 复用连续张量运行时的 BF16 GEMM、FlashInfer attention、激活、切片和张量操作。
 H3 RMSNorm 在 FP32 归约和乘权重之后舍入，RoPE、调制与残差保留 eager BF16 的舍入边界。
@@ -177,3 +179,68 @@ BF16 的 `UNIT_TEST=ON/OFF` 构建及 HTTP 回归通过，包含已驻留完整 
 11 个原始文件全部逐位一致（文本、初始噪声、3 步音视频 latent、RGB 与音频波形）。
 参考模型改成统一流式加载后，文本的 50 个、DiT 的 52 个参考张量也与原记录逐位一致。
 因此上述清理不改变已测精度，完整 BF16 未通过项仍然保留。
+
+## 视频 VAE 混合精度（2026-10-30，5b75955b 之后）
+
+默认主干仍为 BF16，视频 VAE 改为 FP16。`--precision fp32` 默认同时保留 FP32 VAE；
+`--vae-precision fp16|bf16|fp32` 可以独立覆盖视频解码精度。HTTP `/health` 额外返回
+`vae_precision`。音频 VAE 未改动。
+
+视频解码使用如下精度边界：投影、FFN、RoPE 和 attention 为选定的低精度，GEMM
+使用 FP32 累加；norm1/norm2、QK normalization、norm_out、scale1/scale2 与残差流
+保持 FP32。复用公共连续张量运行时，扩展已有 FlashInfer adapter 支持 head_dim=64，
+没有添加推理依赖或环境变量。空间与时间 overlap 的混合权重、乘积和和式也分别舍入，
+与官方 eager 计算一致；不是仅在输出端强制转换类型。
+
+参考模型以 FP32 权重加载，使用 `torch.autocast("cuda", dtype=...)` 解码；关闭 TF32
+以及 FP16/BF16 GEMM 的低精度归约。这对应已发布的 FP16 autocast 配方，并可独立
+检查 BF16。比较双方使用相同 latent，排除 DiT 的累积误差。
+
+| 用例，相对 L2 | FP32 | FP16 | BF16 |
+|---|---:|---:|---:|
+| 单 tile，latent 7×16×16，1797 tokens，36 层 | 1.85728e-6 | 6.09056e-4 | 4.84972e-3 |
+| 真实 latent，37×8×8 → 124 帧 128×128，时间拼接 | 1.13960e-6 | 9.78525e-4 | 7.58088e-3 |
+| 空间与时间拼接，latent 12×18×4 | 1.06633e-6（此前基线） | 5.96701e-4 | 4.78319e-3 |
+
+真实 latent 来自已验证的 FP32 128×128、124 帧、50 点官方参考的最后一步，先按模型
+mean/std 反归一化；没有重新运行整段采样。低精度行对比相同 autocast 精度的参考。
+`compare_video.py` 保留 FP32 `<1e-4`，新增 FP16 `<5e-3`、BF16 `<1e-2` 的输出阈值，
+检查有限值及拼接输出仍可由目标 dtype 精确表示；单 tile 还保存每层残差的比较结果。
+
+在同一真实 latent 上，原生 FP16 输出相对官方 FP32 解码的 RGB 平均通道差
+`0.056406/255`、最大差 `3/255`、PSNR `60.61 dB`；原生 BF16 对应为
+`0.465564/255`、`36/255`、`49.60 dB`。FP16 对相同精度参考的 RGB 平均差为
+`0.049958/255`，最大差 `2/255`。这些是单用例数值指标，不代表通用视觉质量评测，
+也不是逐位一致。结合近似的解码速度，默认采用误差较小的 FP16。
+
+复现视频 VAE 组件对齐：
+
+```bash
+for H3_VAE_PRECISION in fp32 fp16 bf16; do
+  python3 test/minimax_h3/compare_video.py --model "$H3_MODEL/vae" \
+    --library "$H3_LIB" --precision "$H3_VAE_PRECISION" \
+    --frames 7 --height 16 --width 16 --output "$H3_OUT/video-$H3_VAE_PRECISION-tile"
+done
+```
+
+`--tiled` 验证完整空间/时间拼接；`--input FILE` 可以读取 `[T,H,W,24]` 顺序的 FP32
+反归一化 latent。`compare_pipeline.py` 同样支持 `--vae-precision`，其完整流程的严格
+阈值保持不变；重用旧 BF16 参考目录时需显式指定 `--vae-precision fp32`。
+
+回归使用 128×128、124 帧、4 点和已有初始噪声：FP32 的 11 个输出文件与修改前逐位
+相同；BF16 主干的文本、噪声、逐步音视频 latent 与音频波形共 10 个文件也逐位相同，
+仅视频解码输出按新精度变化。已有 BF16 主干完整轨迹的精度未通过项不因此消失。
+Qwen-Image 的文本、DiT、VAE 回归仍分别为 `2.02954e-6`、`2.74033e-6`、`2.91727e-6`。
+连续张量运行时的生命周期、跨线程转移、默认 CUDA pool 隔离检查通过。
+`UNIT_TEST=ON/OFF` 两种构建通过，服务依赖仍仅为原生项目库、CUDA/cuBLAS 与系统库。
+
+FP16 overlap 的 F16C host 转换与 CUDA 软件 host 转换在真实 latent、跨空间边界两组
+测试中逐位一致；不支持 F16C 的编译目标保留软件实现。默认 BF16 主干 + FP16 VAE
+通过 HTTP 鉴权、参数校验、队列上限、驻留 DiT 后取消、恢复生成、multipart 和视频下载
+回归；`/health` 确认为 `precision=bf16, vae_precision=fp16`。
+
+提交前整理统一了公共 dtype 转换与 BF16 权重加载，合并 16 位 gather/scatter 复制，
+删除视频 VAE 不使用的 FP16 DiT 分支和重复的 bool cast 接口；精度默认值统一解析，
+H3 未新增运行时环境变量。整理前后 116 个 VAE 逐层/输出张量、FP32/BF16 两种主干
+短流程共 22 个输出文件，以及 Qwen-Image 三个组件输出均逐位一致。测试仍只使用
+物理 GPU 7；两种构建、运行时隔离、精度默认值/覆盖/非法参数与 HTTP 回归再次通过。
