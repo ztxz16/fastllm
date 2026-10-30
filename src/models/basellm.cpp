@@ -1353,9 +1353,41 @@ namespace fastllm {
         exit(0);
     }
 
-    // Preview while scheduling is locked, without restoring KV or companion state.
+    // Manager topology is stable while one scheduling pass holds dictLocker.
+    // Enumerate/deduplicate it once for all waiting prompts in that pass.
+    struct ResidentPrefixManagers {
+        bool initialized = false;
+        PagedCacheManager *probe = nullptr;
+        std::vector<PagedCacheManager *> managers;
+        void Init(basellm *model) {
+            if (initialized) return;
+            initialized = true;
+            for (int li = 0; li < model->block_cnt && !probe; ++li) {
+                if (model->GetKVCacheRetainedTokens(li) >= 0) continue;
+                for (auto &ref : model->GetPagedKVCacheManagers(li, true))
+                    if (ref.second) { probe = ref.second; break; }
+            }
+            const bool unboundedOnly = probe != nullptr;
+            if (!probe) for (auto &ref : model->GetPagedKVCacheManagers(model->kvCacheId, true))
+                if (ref.second) { probe = ref.second; break; }
+            if (!probe || probe->pageLen <= 0) return;
+            std::unordered_set<PagedCacheManager *> queried{probe};
+            managers.push_back(probe);
+            for (int li = 0; li < model->block_cnt; ++li) {
+                if (unboundedOnly && model->GetKVCacheRetainedTokens(li) >= 0) continue;
+                for (int part = 0; part < 2; ++part)
+                    for (auto &ref : model->GetPagedKVCacheManagers(li, part == 0))
+                        if (ref.second && ref.second->pageLen == probe->pageLen && queried.insert(ref.second).second)
+                            managers.push_back(ref.second);
+            }
+        }
+    };
+
+    // Preview without restoring KV or companion state. References and endpoint
+    // generations are checked afresh; only topology and immutable paths are reused.
     static int PreviewResidentPrefix(basellm *model, ResponseContext *ctx,
-                                     PagedCacheManager *budgetManager, std::vector<int> &unreferenced) {
+                                     PagedCacheManager *budgetManager, std::vector<int> &unreferenced,
+                                     ResidentPrefixManagers &plan) {
         unreferenced.clear();
         if (!model->DeferHistoryCacheRestore() || ctx->cacheLen || !ctx->multimodalInput.empty() ||
             (model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) ||
@@ -1363,38 +1395,27 @@ namespace fastllm {
         if (!ctx->prefillPreview) ctx->prefillPreview.reset(new PrefillPrefixPreview());
         auto &preview = *ctx->prefillPreview;
         preview.Reset(ctx->currentTokens);
-        PagedCacheManager *probe = nullptr;
-        for (int li = 0; li < model->block_cnt && !probe; ++li) {
-            if (model->GetKVCacheRetainedTokens(li) >= 0) continue;
-            for (auto &ref : model->GetPagedKVCacheManagers(li, true))
-                if (ref.second) { probe = ref.second; break; }
-        }
-        const bool unboundedOnly = probe != nullptr;
-        if (!probe) for (auto &ref : model->GetPagedKVCacheManagers(model->kvCacheId, true))
-            if (ref.second) { probe = ref.second; break; }
+        plan.Init(model);
+        auto *probe = plan.probe;
         int length = 0;
         if (probe && probe->pageLen > 0) {
             const auto &hashes = preview.Hashes(probe->pageLen);
             int pages = probe->PreviewPrefix(hashes, preview.matches[probe]);
             // A full prompt match must leave at least one token for logits.
             if ((size_t)pages * probe->pageLen >= ctx->currentTokens.size()) --pages;
-            std::set<PagedCacheManager *> queried{probe};
-            for (int li = 0; li < model->block_cnt && pages > 0; ++li) {
-                if (unboundedOnly && model->GetKVCacheRetainedTokens(li) >= 0) continue;
-                for (int part = 0; part < 2; ++part)
-                    for (auto &ref : model->GetPagedKVCacheManagers(li, part == 0)) {
-                        auto *manager = ref.second;
-                        if (manager && manager->pageLen == probe->pageLen && queried.insert(manager).second)
-                            pages = std::min(pages, manager->PreviewPrefix(hashes, preview.matches[manager]));
-                    }
+            for (size_t i = 1; i < plan.managers.size() && pages > 0; ++i) {
+                auto *manager = plan.managers[i];
+                pages = std::min(pages, manager->PreviewPrefix(hashes, preview.matches[manager]));
             }
             if (pages > 0) {
                 length = model->PreviewPagedPrefixCacheExtra(ctx, pages * probe->pageLen, preview);
                 length = std::max(0, std::min(length, pages * probe->pageLen)) / probe->pageLen * probe->pageLen;
-                if (length && budgetManager &&
-                    (budgetManager->pageLen != probe->pageLen || !queried.count(budgetManager) ||
-                     !budgetManager->PreviewUnreferencedPrefixPages(preview.matches[budgetManager],
-                         length / probe->pageLen, unreferenced))) length = 0;
+                if (length && budgetManager) {
+                    if (budgetManager->pageLen != probe->pageLen ||
+                        std::find(plan.managers.begin(), plan.managers.end(), budgetManager) == plan.managers.end() ||
+                        !budgetManager->PreviewUnreferencedPrefixPages(preview.matches[budgetManager],
+                            length / probe->pageLen, unreferenced, preview.budgetPath)) length = 0;
+                }
             }
         }
         return std::max(0, std::min(length, (int)ctx->currentTokens.size() - 1));
@@ -3178,6 +3199,7 @@ namespace fastllm {
                                 long long previewReserved = reservedPages;
                                 const long long available = sharedKvPool ? freePagedPages() : 0;
                                 std::unordered_set<int> protectedPages;
+                                ResidentPrefixManagers previewManagers;
                                 for (auto &order : orders) {
                                     auto *ctx = model->responseContextDict.dicts.at(order.second);
                                     if (ctx->isEnding || ctx->curTokens != 0) continue;
@@ -3186,7 +3208,7 @@ namespace fastllm {
                                     if (candidates >= slots) { capacityLimited = true; break; }
                                     std::vector<int> unreferenced;
                                     const int prefix = PreviewResidentPrefix(model, ctx,
-                                        sharedKvPool ? pagedManager : nullptr, unreferenced);
+                                        sharedKvPool ? pagedManager : nullptr, unreferenced, previewManagers);
                                     const int count = (int)ctx->currentTokens.size() - prefix;
                                     const bool single = count > prefillChunk || !ctx->multimodalInput.empty();
                                     if (candidates && (single || pendingTokens + count > prefillBatchLimit)) {

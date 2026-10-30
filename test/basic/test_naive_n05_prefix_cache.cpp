@@ -106,6 +106,38 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
                 "preview trusted token equality after full KV eviction");
     }
 
+    static void PublicationHashCollision() {
+        NaiveN05PrefixCacheTestAccess model(8);
+        auto first = model.Request(0), second = model.Request(1);
+        model.Checkpoint(*first, 0, 8192); model.Publish(*first);
+        model.Checkpoint(*second, 0, 8192); model.Publish(*second);
+        const size_t count = model.prefixHistory.size();
+        auto distinct = model.prefixHistory.front();
+        auto published = model.prefixHistory.back();
+        const uint64_t original = distinct->tokenHash;
+        // Fingerprints are only a filter: a collision must not retire a
+        // different conversation or alter the most-recent publication order.
+        distinct->tokenHash = published->tokenHash;
+        model.Publish(*second);
+        Require(model.prefixHistory.size() == count, "hash collision retired a different prefix");
+        Require(model.prefixHistory.back() == published, "publication LRU changed");
+        distinct->tokenHash = original;
+        model.Drain(*first); model.Drain(*second);
+    }
+
+    static void PrefixFingerprints() {
+        std::vector<int> input(200017);
+        for (size_t i = 0; i < input.size(); ++i) input[i] = int((i * 731 + 17) % 151000);
+        PrefillPrefixPreview preview;
+        for (int pass = 0; pass < 2; ++pass) {
+            preview.Reset(input);
+            for (int length : {0, 1, 127, 128, 129, 200017, 81920, 98304, 65537, 130})
+                Require(preview.TokenHash(length) == PagedCacheManager::HashTokenPage(input.data(), length),
+                        "incremental fingerprint differs from full token hash");
+            input[32]++;
+        }
+    }
+
     static void Capacity() {
         PrefixPool pool;
         pool.slotBytes = 3194880;
@@ -264,6 +296,8 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
 int main() {
     try {
         fastllm::NaiveN05PrefixCacheTestAccess::BudgetPreviewOwnership();
+        fastllm::NaiveN05PrefixCacheTestAccess::PublicationHashCollision();
+        fastllm::NaiveN05PrefixCacheTestAccess::PrefixFingerprints();
         fastllm::NaiveN05PrefixCacheTestAccess::Capacity();
         fastllm::NaiveN05PrefixCacheTestAccess::PinnedPressure();
         fastllm::NaiveN05PrefixCacheTestAccess::FourPerRequest();

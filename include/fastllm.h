@@ -727,6 +727,13 @@ namespace fastllm {
         long long generation = 0;
     };
 
+    struct PagedPrefixPath {
+        const PagedCacheManager *manager = nullptr;
+        PagedPrefixMatch anchor;
+        uint64_t bindingVersion = 0;
+        std::vector<int> pageIds; // Metadata only; does not acquire references.
+    };
+
     struct CacheTrieNode {
         uint64_t nodeId = 0;
         long long timestamp = 0;
@@ -815,6 +822,7 @@ namespace fastllm {
             void ReleasePageIndices(const std::vector<int> &pageIndices);
             void Pick(std::vector<int> &pageIds);
 
+            static constexpr uint64_t TokenHashMultiplier = 1000000007ULL;
             static uint64_t HashTokenPage(const int *tokens, int len);
             void Record(const std::vector<int> &tokens, const std::vector<int> &pages);
             void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds);
@@ -828,6 +836,8 @@ namespace fastllm {
             void RecordPrefix(const std::vector<uint64_t> &hashes, const std::vector<int> &pages);
             bool PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
                                                std::vector<int> &unreferenced);
+            bool PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
+                                               std::vector<int> &unreferenced, PagedPrefixPath &path);
 
 
             // Materialize free pages in the same order used by allocation.
@@ -837,6 +847,7 @@ namespace fastllm {
 
         private:
             uint64_t nextTrieNodeId = 0;
+            uint64_t prefixBindingVersion = 0;
             CacheTrieNode *FindPrefixLocked(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match);
             std::set<std::pair<long long, int>> evictableLeaves;
             void UpdateEvictableLeaf(CacheTrieNode *node);

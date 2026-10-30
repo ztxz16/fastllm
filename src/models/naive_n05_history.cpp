@@ -76,13 +76,13 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
         const Data &key, int past, int length) {
     PrefixSnapshots result;
     if (length <= 0 || !prefixPool) return result;
-    std::lock_guard<std::mutex> guard(historyMutex);
-    auto active = activePrefixes.find(&key);
-    if (!saveHistoryChat || active == activePrefixes.end()) return result;
     const int page = GetPageLen(), end = past + length;
     // Decode only copies a window at a page boundary. Prefill also retains the
     // preceding boundary so exact prompt repeats can leave a token for logits.
     if (length == 1 && end % page) return result;
+    std::lock_guard<std::mutex> guard(historyMutex);
+    auto active = activePrefixes.find(&key);
+    if (!saveHistoryChat || active == activePrefixes.end()) return result;
     std::vector<int> boundaries;
     const int last = end / page * page;
     if (length > 1 && last == end && last - page >= past && last > page)
@@ -229,8 +229,10 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
     if (active->second.decode) snapshots.push_back(active->second.decode);
     for (const auto &snapshot : snapshots) {
         if ((int)context->allTokens.size() < snapshot->length) continue;
-        if (snapshot->tokens.empty())
+        if (snapshot->tokens.empty()) {
             snapshot->tokens.assign(context->allTokens.begin(), context->allTokens.begin() + snapshot->length);
+            snapshot->tokenHash = PagedCacheManager::HashTokenPage(snapshot->tokens.data(), snapshot->length);
+        }
         if (!snapshot->fullPool) {
             for (int layer = 0; layer < block_cnt; ++layer) {
                 auto *manager = GetPagedKVCacheManager(layer, true);
@@ -251,7 +253,8 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
         // A checkpoint is immutable after publication. Repeated calls refresh
         // its LRU position; an equivalent new checkpoint replaces the old one.
         prefixHistory.erase(std::remove_if(prefixHistory.begin(), prefixHistory.end(), [&](const auto &entry) {
-            return entry == snapshot || entry->tokens == snapshot->tokens;
+            return entry == snapshot || (entry->tokenHash == snapshot->tokenHash &&
+                                         entry->tokens == snapshot->tokens);
         }), prefixHistory.end());
         prefixHistory.push_back(snapshot);
     }
@@ -276,20 +279,10 @@ bool NaiveN05FlashModel::TryRecordPagedPrefixCacheExtra(ResponseContext *context
 
 int NaiveN05FlashModel::QueryPagedPrefixCacheExtra(ResponseContext *context, int length) const {
     if (!saveHistoryChat || !context || !prefixPool) return 0;
-    if (context->prefillPreview) {
-        context->prefillPreview->Reset(context->currentTokens);
-        return PreviewPagedPrefixCacheExtra(context, length, *context->prefillPreview);
-    }
-    std::lock_guard<std::mutex> guard(historyMutex);
-    int best = 0;
-    for (const auto &entry : prefixHistory) {
-        if (entry->length > best && entry->length <= length &&
-            entry->HasResidentPrefix() &&
-            entry->tokens.size() <= context->currentTokens.size() &&
-            std::equal(entry->tokens.begin(), entry->tokens.end(), context->currentTokens.begin()))
-            best = entry->length;
-    }
-    return best;
+    PrefillPrefixPreview temporary;
+    auto &preview = context->prefillPreview ? *context->prefillPreview : temporary;
+    preview.Reset(context->currentTokens);
+    return PreviewPagedPrefixCacheExtra(context, length, preview);
 }
 
 int NaiveN05FlashModel::PreviewPagedPrefixCacheExtra(ResponseContext *context, int length,
@@ -318,7 +311,8 @@ int NaiveN05FlashModel::PreviewPagedPrefixCacheExtra(ResponseContext *context, i
             auto &match = memo.matches[entry.get()];
             if (match.snapshot.lock() != entry) {
                 match.snapshot = entry;
-                match.equal = std::equal(entry->tokens.begin(), entry->tokens.end(), preview.tokens.begin());
+                match.equal = entry->tokenHash == preview.TokenHash(entry->tokens.size()) &&
+                    std::equal(entry->tokens.begin(), entry->tokens.end(), preview.tokens.begin());
             }
             if (match.equal) memo.candidates.push_back(entry);
         }
@@ -338,10 +332,13 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
 #ifdef USE_CUDA
     auto *self = const_cast<NaiveN05FlashModel *>(this);
     std::shared_ptr<PrefixSnapshot> snapshot;
+    if (length < 0 || (size_t)length > context->currentTokens.size()) return false;
+    const uint64_t tokenHash = PagedCacheManager::HashTokenPage(context->currentTokens.data(), length);
     {
         std::lock_guard<std::mutex> guard(historyMutex);
         for (auto it = self->prefixHistory.begin(); it != self->prefixHistory.end(); ++it) {
-            if ((*it)->length == length && (*it)->tokens.size() <= context->currentTokens.size() &&
+            if ((*it)->length == length && (*it)->tokenHash == tokenHash &&
+                (*it)->tokens.size() <= context->currentTokens.size() &&
                 (*it)->HasResidentPrefix() &&
                 std::equal((*it)->tokens.begin(), (*it)->tokens.end(), context->currentTokens.begin())) {
                 snapshot = *it;

@@ -37,15 +37,40 @@ namespace fastllm {
         // Query identity is checked once per request/pass, not once per layer.
         std::vector<int> tokens;
         std::map<int, std::vector<uint64_t>> pageHashes;
+        std::vector<uint64_t> tokenHashes;
         std::map<PagedCacheManager *, PagedPrefixMatch> matches;
+        PagedPrefixPath budgetPath;
         std::shared_ptr<void> modelState; // metadata only; never owns KV or checkpoints
         void Reset(const std::vector<int> &input) {
             if (tokens != input) {
                 tokens = input;
                 pageHashes.clear();
+                tokenHashes.clear();
                 matches.clear();
+                budgetPath = {};
                 modelState.reset();
             }
+        }
+        // One fingerprint per 128 tokens keeps the first scan linear in the
+        // prompt, even when history contains many different checkpoint lengths.
+        uint64_t TokenHash(size_t length) {
+            AssertInFastLLM(length <= tokens.size(), "Prefix fingerprint exceeds query.");
+            constexpr size_t stride = 128;
+            static const uint64_t factor = [] {
+                uint64_t value = 1;
+                for (size_t i = 0; i < stride; ++i) value *= PagedCacheManager::TokenHashMultiplier;
+                return value;
+            }();
+            if (tokenHashes.empty()) tokenHashes.push_back(0);
+            while (tokenHashes.size() <= length / stride) {
+                const size_t offset = (tokenHashes.size() - 1) * stride;
+                tokenHashes.push_back(tokenHashes.back() * factor +
+                    PagedCacheManager::HashTokenPage(tokens.data() + offset, stride));
+            }
+            uint64_t hash = tokenHashes[length / stride];
+            for (size_t i = length / stride * stride; i < length; ++i)
+                hash = hash * PagedCacheManager::TokenHashMultiplier + (uint64_t)tokens[i];
+            return hash;
         }
         const std::vector<uint64_t> &Hashes(int pageLen) {
             auto it = pageHashes.find(pageLen);

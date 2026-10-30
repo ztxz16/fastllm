@@ -6158,9 +6158,8 @@ namespace fastllm {
 
     uint64_t PagedCacheManager::HashTokenPage(const int *tokens, int len) {
         uint64_t hash = 0;
-        const uint64_t P = 1000000007ULL;
         for (int i = 0; i < len; i++) {
-            hash = hash * P + (uint64_t)tokens[i];
+            hash = hash * TokenHashMultiplier + (uint64_t)tokens[i];
         }
         return hash;
     }
@@ -6212,6 +6211,10 @@ namespace fastllm {
                 if (child->evictable) evictableLeaves.erase({child->lastAccess, child->pageId});
                 child->evictable = false;
                 if (child->pageId >= 0 && child->pageId != pid) {
+                    // Identical prefix contents can move to another physical
+                    // page without removing descendant trie nodes. Invalidate
+                    // cached ancestor page lists even if their endpoint lives.
+                    ++prefixBindingVersion;
                     int old = child->pageId;
                     RemoveTriePage(old);
                     pageToTrieNode[old] = nullptr;
@@ -6298,6 +6301,12 @@ namespace fastllm {
 
     bool PagedCacheManager::PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
                                                           std::vector<int> &unreferenced) {
+        PagedPrefixPath path;
+        return PreviewUnreferencedPrefixPages(match, pages, unreferenced, path);
+    }
+
+    bool PagedCacheManager::PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
+                                                          std::vector<int> &unreferenced, PagedPrefixPath &path) {
         std::lock_guard<std::mutex> guard(pageIndexLocker);
         unreferenced.clear();
         if (pages == 0) return true;
@@ -6305,15 +6314,30 @@ namespace fastllm {
         if (pages < 0 || pages > match.pages || !node ||
             node->nodeId != match.nodeId || node->timestamp != match.generation ||
             pageTimestamp[match.pageId] != match.generation) return false;
-        for (int depth = match.pages; depth > 0; --depth, node = node->parent) {
-            if (node == nullptr || node == trieRoot || node->pageId < 0 ||
-                pageTimestamp[node->pageId] != node->timestamp) {
-                unreferenced.clear();
-                return false;
+        if (path.manager != this || path.anchor.nodeId != match.nodeId || path.anchor.generation != match.generation ||
+            path.anchor.pageId != match.pageId || path.bindingVersion != prefixBindingVersion ||
+            path.pageIds.size() != (size_t)match.pages) {
+            path.manager = nullptr;
+            path.anchor = {};
+            path.pageIds.resize(match.pages);
+            for (int depth = match.pages; depth > 0; --depth, node = node->parent) {
+                if (node == nullptr || node == trieRoot || node->pageId < 0 ||
+                    pageTimestamp[node->pageId] != node->timestamp) {
+                    path.pageIds.clear();
+                    return false;
+                }
+                path.pageIds[depth - 1] = node->pageId;
             }
-            if (depth <= pages && pageRefCount[node->pageId] == 0)
-                unreferenced.push_back(node->pageId);
+            path.manager = this;
+            path.anchor = match;
+            path.bindingVersion = prefixBindingVersion;
         }
+        // Manager identity scopes node/page IDs to their pool. The endpoint
+        // guards trie lifetime; bindingVersion additionally guards
+        // same-content physical-page replacement along its ancestor path.
+        // Reference counts remain live: never memoize whether a page is pinned.
+        for (int i = pages - 1; i >= 0; --i)
+            if (pageRefCount[path.pageIds[i]] == 0) unreferenced.push_back(path.pageIds[i]);
         return true;
     }
 

@@ -122,6 +122,7 @@ namespace fastllm {
             std::shared_ptr<PrefixPool> pool;
             int slot = -1, length = 0;
             std::vector<int> tokens;
+            uint64_t tokenHash = 0; // Immutable with tokens after publication.
             // Observe the resident full-prefix endpoint without pinning KV.
             // Generation checks prevent a recycled physical page from reviving
             // a stale window checkpoint.
