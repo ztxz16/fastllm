@@ -24,15 +24,19 @@ def prepare(args, config):
     if any(str(getattr(args, key, "")).lower() not in ("", "0", "false", "off")
            for key in ("cache_history", "prefix_cache")):
         raise ValueError("Clover cross-request prefix caching is not implemented yet")
-    if args.max_batch > 1:
-        raise ValueError("Clover currently executes one request at a time (--max_batch 1)")
-    args.max_batch = 1
+    if args.max_batch > 8:
+        raise ValueError("Clover currently supports --max_batch up to 8")
+    args.max_batch = max(1, args.max_batch)
+    if args.max_batch > 1 and "speculative_algorithm" in getattr(args, "_auto_explicit", ()) and not args.speculative_algorithm:
+        raise ValueError("Clover batch generation requires self_speculative mode")
     if args.rope_scaling:
         raise ValueError("Clover currently uses the checkpoint's native RoPE")
     native_context = int(config["max_position_embeddings"])
     if args.max_context_length > native_context:
         raise ValueError("Clover context exceeds the checkpoint's native window")
     width = args.speculative_num_draft_tokens
+    if args.max_batch > 1 and width != -1 and width < 16:
+        raise ValueError("Clover batch generation requires block_size 16 or 32")
     if width != -1 and (width <= 0 or int(config["block_size"]) % width):
         raise ValueError("Clover block width must divide the checkpoint block_size")
 
@@ -76,10 +80,13 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
         width = 16 if speculative else int(config["block_size"])
     # Native weights, clean recurrent state, accepted-prefix snapshots, full
     # KV capacity, and scratch/allocator reserve. This is a capacity estimate,
-    # not a throughput prediction. Only one request holds GPU caches at a time.
+    # not a throughput prediction. Every active request owns independent caches.
     kv = math.ceil(context / 256) * 256 * kv_per_token
-    reserve = 3 * memory.GiB
+    reserve = (args.max_batch + 2) * memory.GiB
     snapshots = state * width if speculative else 0
+    state *= args.max_batch
+    snapshots *= args.max_batch
+    kv *= args.max_batch
     required = weights + state + snapshots + kv + reserve
     limit = memory._memory_limit_bytes(getattr(args, "auto_gpu_memory_limit", None), "auto_gpu_memory_limit")
     choices = []
@@ -119,7 +126,7 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
     if "speculative_algorithm" not in explicit:
         args.speculative_algorithm = "clover"
     args.speculative_num_draft_tokens = width
-    result = dict(model="clover_moe", mode="single_gpu", device=device, max_batch=1,
+    result = dict(model="clover_moe", mode="single_gpu", device=device, max_batch=args.max_batch,
                   dtype="bfloat16", max_context_length=context, weights_bytes=weights,
                   recurrent_state_bytes=state, snapshot_bytes=snapshots,
                   kv_bytes=kv, workspace_reserve_bytes=reserve, estimated_gpu_bytes=required,

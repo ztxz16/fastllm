@@ -77,7 +77,7 @@ ftllm server /path/to/Clover-35B-A3B-Preview --auto --speculative_algorithm off
 - 专家归约同时完成 shared expert 的 sigmoid 门控、乘法和相加，省去两次独立 kernel 发射；保留 sigmoid、shared 乘积、路由专家总和及最终相加各自的 BF16 舍入。通用与 SM90 路径共用该归约，可省略 shared 参数以仅计算路由专家。
 - Preview 只读已提交状态；部分接受从对应 token 的状态快照恢复，避免重复计算。
 - 支持流式 / 非流式文本 API、EOS、停止字符串、取消请求和运行时错误返回。
-- 当前不支持多卡、跨请求前缀缓存、其他权重精度、多模态、LoRA 或约束解码。请求按序执行。
+- 当前不支持多卡、跨请求前缀缓存、其他权重精度、多模态、LoRA 或约束解码。默认 `--max_batch 1`；自推测模式可设 `--max_batch 2`～`8`，相同 16/32-token 块宽的请求合批执行 MoE 和输出 head；attention 投影每组最多 32 行，状态计算与 prefill 保持按请求执行。不同请求的 KV、循环状态、coreset 和接受前缀相互独立；低置信度扩散模式仍限单请求。
 - 推测预览和验证使用模型持有的 MoE 子图，切换块宽会释放旧图；捕获失败回退到 eager。已有的 `FASTLLM_CUDA_GRAPH=0` 可关闭子图。当前未启用整模型 CUDA Graph。
 - SM90 及以上且实际加载的 PTX 支持时，GDN、归一化、旋转位置编码和采样辅助算子使用 CUDA PDL 隐藏相邻 kernel 的发射开销。每个 kernel 在读取前驱输出前等待依赖完成，计算及舍入顺序不变；旧架构或旧 PTX 保留普通 stream 发射，不增加环境变量或外部依赖。
 - MoE 子图回放时，归一化直接写入图的输入缓冲，残差加法直接读取图输出；视图仅在当前 forward 内使用，避免每层输入、输出各一次复制，计算和舍入顺序不变。

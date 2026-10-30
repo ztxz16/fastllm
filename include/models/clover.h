@@ -30,6 +30,12 @@ public:
         std::vector<std::pair<Data, Data>> &cache, bool preview,
         Data &logits, bool lastOnly = false, CloverSnapshots *snapshots = nullptr,
         bool needLogits = true);
+    // Equal-width request blocks share dense/MoE work; caches and coreset
+    // selection remain independent for each request.
+    void ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens,
+        const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+        bool preview, std::vector<Data> &logits,
+        const std::vector<CloverSnapshots *> &snapshots = {});
     void RestorePrefix(std::vector<std::pair<Data, Data>> &cache,
         const CloverSnapshots &snapshots, int acceptedInputs);
     ModelContextSpec GetContextSpec() const override { return {true, false, ""}; }
@@ -70,6 +76,8 @@ private:
     void ValidateRequest(const std::vector<int> &tokens, const GenerationConfig &config,
         const CloverOptions &options) const;
     std::vector<int> Step(ResponseContext &context, Request &request);
+    std::vector<std::vector<int>> StepBatch(const std::vector<ResponseContext *> &contexts,
+        const std::vector<std::shared_ptr<Request>> &batch);
     void Finish(ResponseContext *context);
     void Norm(Data &input, const std::string &name, Data &output,
         Data *gate = nullptr, bool zeroCentered = true);
@@ -78,7 +86,11 @@ private:
         bool preview, Data &output, std::pair<Data, Data> *snapshots = nullptr);
     void FullAttention(Data &input, int layer, std::pair<Data, Data> &cache,
         int position, bool preview, Data &output);
-    void Moe(Data &input, int layer, bool preview, Data &output, bool graphAllowed);
+    void GdnCore(Data &projected, int layer, std::pair<Data, Data> &cache,
+        bool preview, Data &normalized, std::pair<Data, Data> *snapshots);
+    void FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
+        std::pair<Data, Data> &cache, int position, bool preview, Data &output);
+    void Moe(Data &input, int layer, bool preview, Data &output, bool graphAllowed, int batch = 1);
 };
 }
 #endif

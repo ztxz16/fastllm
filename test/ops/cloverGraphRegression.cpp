@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -87,6 +88,69 @@ std::vector<std::vector<unsigned char>> Run(int seed, bool graphs, bool busyPool
     }
     return results;
 }
+std::vector<std::vector<unsigned char>> RunBatch(int seed, bool graphs, int batch = 2) {
+    setenv("FASTLLM_CUDA_GRAPH", graphs ? "1" : "0", 1);
+    CloverModel model; Populate(model, seed);
+    using Cache = std::vector<std::pair<Data, Data>>;
+    std::vector<Cache> caches(batch), reference(batch);
+    for (int b = 0; b < batch; ++b) {
+        Data ignored;
+        std::vector<int> prefix(5 + 3 * b);
+        for (int i = 0; i < (int)prefix.size(); ++i) prefix[i] = (b * 31 + i * 7) % 127;
+        model.ForwardLogits(prefix, caches[b], false, ignored);
+    }
+    std::vector<Cache *> cachePtrs;
+    for (auto &cache : caches) cachePtrs.push_back(&cache);
+    std::vector<std::vector<unsigned char>> results;
+    auto compare = [&](Data &actual, Data &expected) {
+        auto a = Bytes(actual), e = Bytes(expected);
+        Require(a.size() == e.size(), "batch logits size");
+        double diff2 = 0, ref2 = 0; float maximum = 0;
+        for (size_t i = 0; i < a.size(); i += sizeof(float)) {
+            float x, y; std::memcpy(&x, a.data() + i, 4); std::memcpy(&y, e.data() + i, 4);
+            Require(std::isfinite(x) && std::isfinite(y), "nonfinite batch logits");
+            maximum = std::max(maximum, std::abs(x-y));
+            diff2 += (x-y)*(x-y); ref2 += y*y;
+        }
+        Require(maximum <= .04f && diff2 <= 2.5e-5 * std::max(ref2, 1e-10), "batch/serial BF16 logits differ");
+    };
+    for (int width : {2, 4, 8, 16, 32, 16}) {
+        std::vector<std::vector<int>> tokens(batch, std::vector<int>(width));
+        std::vector<Data> logits;
+        std::vector<CloverSnapshots> snapshots(batch), serialSnapshots(batch);
+        std::vector<CloverSnapshots *> snapshotPtrs;
+        for (auto &snapshot : snapshots) snapshotPtrs.push_back(&snapshot);
+        for (int b = 0; b < batch; ++b) {
+            for (int i = 0; i < width; ++i) tokens[b][i] = (seed + b * 47 + i * 11) % 127;
+            reference[b].resize(caches[b].size());
+            for (size_t i = 0; i < caches[b].size(); ++i) {
+                reference[b][i].first.CopyFrom(caches[b][i].first);
+                reference[b][i].second.CopyFrom(caches[b][i].second);
+            }
+        }
+        model.ForwardLogitsBatch(tokens, cachePtrs, true, logits);
+        for (int b = 0; b < batch; ++b) {
+            Data expected; model.ForwardLogits(tokens[b], reference[b], true, expected);
+            compare(logits[b], expected); results.push_back(Bytes(logits[b]));
+            Require(Bytes(caches[b][0].first) == Bytes(reference[b][0].first) &&
+                    Bytes(caches[b][0].second) == Bytes(reference[b][0].second), "batch preview changed KV");
+        }
+        // Serial width=32 and batch=2,width=16 share 32 rows but different
+        // coreset partitions: graph cache keys must distinguish them.
+        model.ForwardLogitsBatch(tokens, cachePtrs, false, logits, snapshotPtrs);
+        for (int b = 0; b < batch; ++b) {
+            Data expected; model.ForwardLogits(tokens[b], reference[b], false, expected, false, &serialSnapshots[b]);
+            compare(logits[b], expected); results.push_back(Bytes(logits[b]));
+            int accepted = b % 2 ? width : 1;
+            model.RestorePrefix(caches[b], snapshots[b], accepted);
+            model.RestorePrefix(reference[b], serialSnapshots[b], accepted);
+            Require(Bytes(caches[b][0].first) == Bytes(reference[b][0].first) &&
+                    Bytes(caches[b][0].second) == Bytes(reference[b][0].second), "batch rollback crossed request state");
+        }
+    }
+    return results;
+}
+
 }
 int main() {
     const char *env = std::getenv("FASTLLM_CUDA_GRAPH");
@@ -96,10 +160,14 @@ int main() {
         int count = 0; if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
         cudaSetDevice(0); SetThreads(2); SetDeviceMap({{"cuda:0", 1}}); SetCudaEmbedding(true);
         for (int seed : {13, 29, 71}) {
+            auto batched = RunBatch(seed, false);
+            Require(RunBatch(seed, true) == batched, "batch graph replay differs from eager");
             auto eager = Run(seed, false, false);
             Require(Run(seed, true, false) == eager, "graph replay differs from eager");
             Require(Run(seed, true, true) == eager, "capture-unavailable fallback differs from eager");
         }
+        for (int batch : {3, 4, 8})
+            Require(RunBatch(13, true, batch) == RunBatch(13, false, batch), "larger batch graph replay differs from eager");
         restore();
         std::cout << "Clover MoE graphs: changing inputs/widths, model destruction, read-only preview KV, verification and capture fallback PASS" << std::endl;
     } catch (const std::exception &e) { restore(); std::cerr << e.what() << std::endl; return 1; }

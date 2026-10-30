@@ -47,6 +47,76 @@ struct CloverModel::Request {
     CloverSnapshots snapshots;
     Data countsGpu, stopsGpu, biasGpu, candidatesGpu, statsGpu, statsWorkspace;
     int countsVersion = -1;
+#ifdef USE_CUDA
+    void Upload(CloverModel &m, Data &data, DataType type, const std::vector<int> &dims, const void *source) {
+        data.dataType = type; data.UpdateUnitSize(); data.Resize(dims);
+        data.ToDevice(DataDevice::CUDA, std::vector<int>{m.cudaDevice}, false);
+        data.Allocate(false);
+        if (source) FastllmCudaCopyFromHostToDevice(data.cudaData, (void *)source, data.GetBytes());
+    }
+    void Penalize(CloverModel &m, ResponseContext &ctx, Data &logits, const std::vector<int> &visible, bool preview, bool initial = false) {
+        const auto &o = options; const auto &c = ctx.generationConfig;
+        if (countsVersion != ctx.curTokens) {
+            Upload(m, countsGpu, INT32, {m.vocabSize}, counts.data());
+            countsVersion = ctx.curTokens;
+        }
+        if (stopsGpu.dims.empty() && !stops.empty())
+            Upload(m, stopsGpu, INT32, {int(stops.size())}, stops.data());
+        int rows = logits.Count(0) / m.vocabSize;
+        auto bias = CloverRowBias(rows, m.vocabSize, counts, ctx.curTokens, visible, o, preview, initial);
+        Upload(m, biasGpu, FLOAT32, {rows, 2}, bias.data());
+        CloverCudaPenalty p{c.repeat_penalty, o.presence, o.frequency, o.speculative ? -1 : m.maskToken,
+            o.thinkToken, ctx.curTokens + (o.speculative && preview ? 0 : 1), c.output_token_least};
+        if (!FastllmCudaCloverPenalize((float *)logits.cudaData, (int *)countsGpu.cudaData,
+            (int *)stopsGpu.cudaData, stops.size(), (float *)biasGpu.cudaData, rows, m.vocabSize, p))
+            throw std::runtime_error("Clover: GPU penalties failed");
+    }
+    std::vector<CloverCudaTokenStats> Summarize(CloverModel &m, Data &logits, const std::vector<int> &candidates, bool confidence, bool entropy) {
+        int rows = logits.Count(0) / m.vocabSize;
+        if (!candidates.empty()) Upload(m, candidatesGpu, INT32, {rows}, candidates.data());
+        static_assert(sizeof(CloverCudaTokenStats) == 5 * sizeof(int), "GPU token statistics layout");
+        Upload(m, statsGpu, INT32, {rows, 5}, nullptr);
+        size_t bytes = FastllmCudaCloverTokenStatsWorkspaceBytes(rows, m.vocabSize);
+        if (bytes) Upload(m, statsWorkspace, INT32, {int((bytes + 3) / 4)}, nullptr);
+        if (!FastllmCudaCloverTokenStats((float *)logits.cudaData,
+            candidates.empty() ? nullptr : (int *)candidatesGpu.cudaData,
+            (CloverCudaTokenStats *)statsGpu.cudaData, rows, m.vocabSize, confidence, entropy,
+            nullptr, bytes ? statsWorkspace.cudaData : nullptr))
+            throw std::runtime_error("Clover: GPU sampling statistics failed");
+        std::vector<CloverCudaTokenStats> result(rows);
+        FastllmCudaCopyFromDeviceToHost(result.data(), statsGpu.cudaData, result.size() * sizeof(result[0]));
+        for (const auto &x : result) if (x.error) throw std::runtime_error("Clover: invalid sampling logits");
+        return result;
+    }
+    int Sample(CloverModel &m, ResponseContext &ctx, Data &logits, int row, int greedyToken) {
+        const auto &c = ctx.generationConfig;
+        if (!c.do_sample) return greedyToken;
+        // The stochastic bonus needs one row only; draft/acceptance remain on GPU.
+        std::vector<float> scores(m.vocabSize);
+        FastllmCudaCopyFromDeviceToHost(scores.data(), (float *)logits.cudaData + (size_t)row * m.vocabSize,
+            scores.size() * sizeof(float));
+        return CloverSample(scores.data(), m.vocabSize, c, rng);
+    }
+    std::vector<int> Accept(CloverModel &m, ResponseContext &ctx, Data &logits,
+            const std::vector<int> &candidates) {
+        Penalize(m, ctx, logits, candidates, false);
+        auto stats = Summarize(m, logits, candidates, !options.exact, !options.exact);
+        int accepted = 0;
+        while (accepted + 1 < (int)candidates.size()) {
+            const auto &s = stats[accepted];
+            bool accept = options.exact ? candidates[accepted + 1] == s.token :
+                s.probability > 0.f && s.probability >= std::min(options.acceptRatio,
+                    options.acceptDelta * std::exp(-s.entropy));
+            if (!accept) break;
+            ++accepted;
+        }
+        bonus = Sample(m, ctx, logits, accepted, stats[accepted].token);
+        m.RestorePrefix(ctx.pastKeyValues, snapshots, accepted + 1);
+        std::vector<int> output(candidates.begin() + 1, candidates.begin() + accepted + 1);
+        output.push_back(bonus);
+        return output;
+    }
+#endif
 };
 
 CloverModel::~CloverModel() {
@@ -106,6 +176,8 @@ void CloverModel::ConfigureClover(const json11::Json &j) {
 void CloverModel::ValidateRequest(const std::vector<int> &tokens, const GenerationConfig &c,
         const CloverOptions &o) const {
     const int capacity = contextPlan.configured ? contextPlan.effectiveLength : max_positions;
+    Require(maxBatch <= 1 || o.speculative, "batch generation currently requires self_speculative mode");
+    Require(maxBatch <= 1 || o.width >= 16, "batch generation requires block_size 16 or 32");
     Require(!tokens.empty(), "empty prompt");
     for (int t : tokens) Require(t >= 0 && t < vocabSize, "invalid prompt token");
     for (int t : c.stop_token_ids) Require(t >= 0 && t < vocabSize, "invalid stop token");
@@ -187,57 +259,6 @@ std::vector<int> CloverModel::Step(ResponseContext &ctx, Request &r) {
     const auto &o = r.options;
     const auto &c = ctx.generationConfig;
 #ifdef USE_CUDA
-    auto run = [&](const std::vector<int> &tokens, bool preview, Data &logits,
-                   bool lastOnly = false, CloverSnapshots *snapshots = nullptr, bool head = true) {
-        ForwardLogits(tokens, ctx.pastKeyValues, preview, logits, lastOnly, snapshots, head);
-    };
-    auto upload = [&](Data &data, DataType type, const std::vector<int> &dims, const void *source) {
-        data.dataType = type; data.UpdateUnitSize(); data.Resize(dims);
-        data.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice}, false);
-        data.Allocate(false);
-        if (source) FastllmCudaCopyFromHostToDevice(data.cudaData, (void *)source, data.GetBytes());
-    };
-    auto penalize = [&](Data &logits, const std::vector<int> &visible, bool preview, bool initial = false) {
-        if (r.countsVersion != ctx.curTokens) {
-            upload(r.countsGpu, INT32, {vocabSize}, r.counts.data());
-            r.countsVersion = ctx.curTokens;
-        }
-        if (r.stopsGpu.dims.empty() && !r.stops.empty())
-            upload(r.stopsGpu, INT32, {int(r.stops.size())}, r.stops.data());
-        int rows = logits.Count(0) / vocabSize;
-        auto bias = CloverRowBias(rows, vocabSize, r.counts, ctx.curTokens, visible, o, preview, initial);
-        upload(r.biasGpu, FLOAT32, {rows, 2}, bias.data());
-        CloverCudaPenalty p{c.repeat_penalty, o.presence, o.frequency, o.speculative ? -1 : maskToken,
-            o.thinkToken, ctx.curTokens + (o.speculative && preview ? 0 : 1), c.output_token_least};
-        if (!FastllmCudaCloverPenalize((float *)logits.cudaData, (int *)r.countsGpu.cudaData,
-            (int *)r.stopsGpu.cudaData, r.stops.size(), (float *)r.biasGpu.cudaData, rows, vocabSize, p))
-            throw std::runtime_error("Clover: GPU penalties failed");
-    };
-    auto summarize = [&](Data &logits, const std::vector<int> &candidates, bool confidence, bool entropy) {
-        int rows = logits.Count(0) / vocabSize;
-        if (!candidates.empty()) upload(r.candidatesGpu, INT32, {rows}, candidates.data());
-        static_assert(sizeof(CloverCudaTokenStats) == 5 * sizeof(int), "GPU token statistics layout");
-        upload(r.statsGpu, INT32, {rows, 5}, nullptr);
-        size_t bytes = FastllmCudaCloverTokenStatsWorkspaceBytes(rows, vocabSize);
-        if (bytes) upload(r.statsWorkspace, INT32, {int((bytes + 3) / 4)}, nullptr);
-        if (!FastllmCudaCloverTokenStats((float *)logits.cudaData,
-            candidates.empty() ? nullptr : (int *)r.candidatesGpu.cudaData,
-            (CloverCudaTokenStats *)r.statsGpu.cudaData, rows, vocabSize, confidence, entropy,
-            nullptr, bytes ? r.statsWorkspace.cudaData : nullptr))
-            throw std::runtime_error("Clover: GPU sampling statistics failed");
-        std::vector<CloverCudaTokenStats> result(rows);
-        FastllmCudaCopyFromDeviceToHost(result.data(), r.statsGpu.cudaData, result.size() * sizeof(result[0]));
-        for (const auto &x : result) if (x.error) throw std::runtime_error("Clover: invalid sampling logits");
-        return result;
-    };
-    auto sample = [&](Data &logits, int row, int greedyToken) {
-        if (!c.do_sample) return greedyToken;
-        // The stochastic bonus needs one row only; draft/acceptance remain on GPU.
-        std::vector<float> scores(vocabSize);
-        FastllmCudaCopyFromDeviceToHost(scores.data(), (float *)logits.cudaData + (size_t)row * vocabSize,
-            scores.size() * sizeof(float));
-        return CloverSample(scores.data(), vocabSize, c, r.rng);
-    };
     if (r.prefilled < ctx.currentTokens.size()) {
         // Bounded chunks allow aborts between forwards and avoid prompt-wide
         // expert intermediates. All chunks commit causal state, never previews.
@@ -252,18 +273,18 @@ std::vector<int> CloverModel::Step(ResponseContext &ctx, Request &r) {
         std::vector<int> tokens(ctx.currentTokens.begin() + r.prefilled, ctx.currentTokens.begin() + end);
         bool last = end == ctx.currentTokens.size();
         Data logits;
-        run(tokens, false, logits, true, nullptr, last && o.speculative);
+        ForwardLogits(tokens, ctx.pastKeyValues, false, logits, true, nullptr, last && o.speculative);
         r.prefilled = end;
         if (!last || !o.speculative) return {};
-        penalize(logits, {}, false, true);
-        auto stats = summarize(logits, {}, false, false);
-        r.bonus = sample(logits, 0, stats[0].token);
+        r.Penalize(*this, ctx, logits, {}, false, true);
+        auto stats = r.Summarize(*this, logits, {}, false, false);
+        r.bonus = r.Sample(*this, ctx, logits, 0, stats[0].token);
         return {r.bonus};
     }
     if (!o.speculative) {
         if (!r.commit.empty()) {
             Data ignored;
-            run(r.commit, false, ignored, false, nullptr, false);
+            ForwardLogits(r.commit, ctx.pastKeyValues, false, ignored, false, nullptr, false);
             r.commit.clear();
             return {};
         }
@@ -272,8 +293,8 @@ std::vector<int> CloverModel::Step(ResponseContext &ctx, Request &r) {
             r.pending.assign(o.width, true);
         }
         Data logits;
-        run(r.block, true, logits);
-        penalize(logits, r.block, true);
+        ForwardLogits(r.block, ctx.pastKeyValues, true, logits);
+        r.Penalize(*this, ctx, logits, r.block, true);
         std::vector<int> predicted(o.width);
         std::vector<float> confidence(o.width);
         int best = -1;
@@ -284,7 +305,7 @@ std::vector<int> CloverModel::Step(ResponseContext &ctx, Request &r) {
                 predicted[i] = CloverSample((float *)logits.cpuData + (size_t)i * vocabSize,
                     vocabSize, c, r.rng, &confidence[i]);
         } else {
-            auto stats = summarize(logits, {}, true, false);
+            auto stats = r.Summarize(*this, logits, {}, true, false);
             for (int i = 0; i < o.width; ++i) {
                 predicted[i] = stats[i].token; confidence[i] = stats[i].confidence;
             }
@@ -309,29 +330,58 @@ std::vector<int> CloverModel::Step(ResponseContext &ctx, Request &r) {
     candidates[0] = r.bonus;
     Data logits;
     if (width > 1) {
-        run(candidates, true, logits);
-        penalize(logits, candidates, true);
-        auto stats = summarize(logits, {}, false, false);
+        ForwardLogits(candidates, ctx.pastKeyValues, true, logits);
+        r.Penalize(*this, ctx, logits, candidates, true);
+        auto stats = r.Summarize(*this, logits, {}, false, false);
         for (int i = 1; i < width; ++i) candidates[i] = stats[i].token;
     }
-    run(candidates, false, logits, false, &r.snapshots);
-    penalize(logits, candidates, false);
-    auto stats = summarize(logits, candidates, !o.exact, !o.exact);
-    int accepted = 0;
-    while (accepted + 1 < width) {
-        const auto &s = stats[accepted];
-        bool accept = o.exact ? candidates[accepted + 1] == s.token :
-            s.probability > 0.f && s.probability >= std::min(o.acceptRatio, o.acceptDelta * std::exp(-s.entropy));
-        if (!accept) break;
-        ++accepted;
-    }
-    r.bonus = sample(logits, accepted, stats[accepted].token);
-    RestorePrefix(ctx.pastKeyValues, r.snapshots, accepted + 1);
-    std::vector<int> output(candidates.begin() + 1, candidates.begin() + accepted + 1);
-    output.push_back(r.bonus);
-    return output;
+    ForwardLogits(candidates, ctx.pastKeyValues, false, logits, false, &r.snapshots);
+    return r.Accept(*this, ctx, logits, candidates);
 #else
     throw std::runtime_error("Clover: block generation requires CUDA");
+#endif
+}
+
+std::vector<std::vector<int>> CloverModel::StepBatch(const std::vector<ResponseContext *> &contexts,
+        const std::vector<std::shared_ptr<Request>> &batch) {
+    const int size = contexts.size();
+    Require(size >= 2 && size <= 8 && batch.size() == contexts.size(), "invalid active request batch");
+    const int capacity = contextPlan.configured ? contextPlan.effectiveLength : max_positions;
+    std::vector<std::vector<int>> candidates(size), output(size);
+    std::vector<std::vector<std::pair<Data, Data>> *> caches;
+    std::vector<CloverSnapshots *> snapshots;
+    for (int b = 0; b < size; ++b) {
+        auto &ctx = *contexts[b]; auto &r = *batch[b];
+        int width = r.options.width;
+        int position = ctx.pastKeyValues[kvCacheId].first.dims[0];
+        while (width > capacity - position) width /= 2;
+        Require(width > 0 && r.bonus >= 0, "no room for the pending token");
+        candidates[b].assign(width, maskToken); candidates[b][0] = r.bonus;
+        caches.push_back(&ctx.pastKeyValues); snapshots.push_back(&r.snapshots);
+    }
+    for (int b = 1; b < size; ++b)
+        if (candidates[b].size() != candidates[0].size()) {
+            for (int i = 0; i < size; ++i) output[i] = Step(*contexts[i], *batch[i]);
+            return output;
+        }
+#ifdef USE_CUDA
+    const int width = candidates[0].size();
+    std::vector<Data> logits;
+    if (width > 1) {
+        ForwardLogitsBatch(candidates, caches, true, logits);
+        for (int b = 0; b < size; ++b) {
+            auto &r = *batch[b];
+            r.Penalize(*this, *contexts[b], logits[b], candidates[b], true);
+            auto stats = r.Summarize(*this, logits[b], {}, false, false);
+            for (int i = 1; i < width; ++i) candidates[b][i] = stats[i].token;
+        }
+    }
+    ForwardLogitsBatch(candidates, caches, false, logits, snapshots);
+    for (int b = 0; b < size; ++b)
+        output[b] = batch[b]->Accept(*this, *contexts[b], logits[b], candidates[b]);
+    return output;
+#else
+    throw std::runtime_error("Clover: batch generation requires CUDA");
 #endif
 }
 
@@ -344,39 +394,55 @@ void CloverModel::Finish(ResponseContext *ctx) {
 void CloverModel::RunModelSpecificScheduler() {
     std::unique_lock<std::mutex> lock(dictLocker);
     while (!isFree) {
-        ResponseContext *ctx = nullptr;
-        int handle = -1;
-        std::vector<int> aborted;
+        std::vector<ResponseContext *> contexts;
+        std::vector<std::shared_ptr<Request>> batch;
+        std::vector<int> handles, aborted;
         for (const auto &entry : responseContextDict.dicts) {
             if (entry.second->isAbort) aborted.push_back(entry.first);
-            else if (!ctx && !entry.second->isEnding) { handle = entry.first; ctx = entry.second; }
+            else if (!entry.second->isEnding && contexts.size() < (size_t)std::max(1, std::min(8, maxBatch))) {
+                handles.push_back(entry.first); contexts.push_back(entry.second);
+                batch.push_back(requests.at(entry.second));
+            }
         }
         for (int id : aborted) RemoveResponseContext(id);
-        if (!ctx) { dictCV.wait(lock); continue; }
-        auto request = requests.at(ctx);
+        if (contexts.empty()) { dictCV.wait(lock); continue; }
         lock.unlock();
-        std::vector<int> output;
-        std::string error;
-        try {
+        std::vector<std::vector<int>> output(contexts.size());
+        std::vector<std::string> errors(contexts.size());
+        {
             std::lock_guard<std::mutex> forward(forwardLocker);
-            output = Step(*ctx, *request);
-        } catch (const std::exception &e) { error = e.what(); }
+            // Prefill stays chunked and independent. Once all requests are
+            // ready, their preview/verify MoE and head execute as one batch.
+            bool ready = contexts.size() > 1;
+            for (size_t b = 0; b < contexts.size(); ++b)
+                ready = ready && batch[b]->options.speculative && batch[b]->prefilled == contexts[b]->currentTokens.size();
+            if (ready) {
+                try { output = StepBatch(contexts, batch); }
+                catch (const std::exception &e) { for (auto &error : errors) error = e.what(); }
+            } else for (size_t b = 0; b < contexts.size(); ++b) {
+                try { output[b] = Step(*contexts[b], *batch[b]); }
+                catch (const std::exception &e) { errors[b] = e.what(); }
+            }
+        }
         lock.lock();
-        // Fetch cannot destroy a live context; Abort only marks it until here.
-        if (ctx->isAbort || isFree) { RemoveResponseContext(handle); continue; }
-        if (!error.empty()) {
-            std::cerr << "Clover request " << handle << " failed: " << error << std::endl;
-            ctx->error = ResponseContextErrorRuntime;
-            Finish(ctx);
-        } else {
-            for (int token : output) {
-                bool eos = !request->options.ignoreEos && (token == eos_token_id || eos_token_ids.count(token));
-                if (eos || ctx->generationConfig.stop_token_ids.count(token)) { Finish(ctx); break; }
-                ctx->resultTokenQueue.push(token);
-                ctx->allTokens.push_back(token);
-                ++ctx->curTokens;
-                ++request->counts[token];
-                if (ctx->curTokens >= request->limit) { Finish(ctx); break; }
+        for (size_t b = 0; b < contexts.size(); ++b) {
+            auto *ctx = contexts[b]; auto &request = batch[b];
+            // Fetch cannot destroy a live context; Abort only marks it until here.
+            if (ctx->isAbort || isFree) { RemoveResponseContext(handles[b]); continue; }
+            if (!errors[b].empty()) {
+                std::cerr << "Clover request " << handles[b] << " failed: " << errors[b] << std::endl;
+                ctx->error = ResponseContextErrorRuntime;
+                Finish(ctx);
+            } else {
+                for (int token : output[b]) {
+                    bool eos = !request->options.ignoreEos && (token == eos_token_id || eos_token_ids.count(token));
+                    if (eos || ctx->generationConfig.stop_token_ids.count(token)) { Finish(ctx); break; }
+                    ctx->resultTokenQueue.push(token);
+                    ctx->allTokens.push_back(token);
+                    ++ctx->curTokens;
+                    ++request->counts[token];
+                    if (ctx->curTokens >= request->limit) { Finish(ctx); break; }
+                }
             }
         }
         dictCV.notify_all();

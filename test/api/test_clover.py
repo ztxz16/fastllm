@@ -47,6 +47,21 @@ class CloverAutoTest(unittest.TestCase):
         self.assertEqual(result["snapshot_bytes"], 16 * result["recurrent_state_bytes"])
         self.assertEqual(args.chunked_prefill_size, 4096)
 
+    def test_batch_capacity_is_accounted_per_request(self):
+        single = self.resolve(self.args())
+        for size in (2, 4, 8):
+            with self.subTest(size=size):
+                args = self.args("--max_batch", str(size))
+                batch = self.resolve(args)
+                self.assertEqual((args.max_batch, batch["max_batch"]), (size, size))
+                self.assertEqual(batch["weights_bytes"], single["weights_bytes"])
+                for key in ("recurrent_state_bytes", "snapshot_bytes", "kv_bytes"):
+                    self.assertEqual(batch[key], size * single[key])
+        with self.assertRaisesRegex(ValueError, "self_speculative"):
+            off = self.args("--max_batch", "2", "--speculative_algorithm", "off")
+            off.speculative_algorithm = ""
+            self.resolve(off)
+
     def test_explicit_off_uses_hf_block_width(self):
         args = self.args("--speculative_algorithm", "off", "--max_context_length", "4096",
                          "--chunked_prefill_size", "512")
@@ -66,9 +81,10 @@ class CloverAutoTest(unittest.TestCase):
         self.assertEqual(vars(args), original)
 
     def test_unsupported_settings_fail_before_loading(self):
-        for options in (("--dtype", "float16"), ("--max_batch", "2"),
+        for options in (("--dtype", "float16"), ("--max_batch", "9"),
                         ("--max_context_length", "131073"), ("--speculative_num_draft_tokens", "7"),
-                        ("--device", "cuda:0,1"), ("--prefix_cache", "true")):
+                        ("--device", "cuda:0,1"), ("--prefix_cache", "true"),
+                        ("--max_batch", "2", "--speculative_num_draft_tokens", "8")):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.resolve(self.args(*options))
 
