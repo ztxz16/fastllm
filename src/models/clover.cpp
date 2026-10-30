@@ -182,8 +182,9 @@ void CloverModel::EnsureResident() {
     }
     FastllmCudaSetDevice(cudaDevice);
     for (auto &item : weight.weight) item.second.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice});
-    std::vector<std::string> mergedSources;
-    auto merge = [&](const std::string &destination, const std::vector<std::string> &sources) {
+    std::vector<std::pair<Data *, void *>> mergedSources;
+    auto merge = [&](const std::string &destination, const std::vector<std::string> &sources,
+                     int alignment = 1, bool keepViews = false) {
         int rows = 0;
         for (const auto &name : sources) {
             auto &w = weight[name];
@@ -191,13 +192,15 @@ void CloverModel::EnsureResident() {
             rows += w.dims[0];
         }
         auto &fused = weight[destination];
-        PrepareCloverData(fused, BFLOAT16, {rows, embed_dim}, cudaDevice);
+        PrepareCloverData(fused, BFLOAT16, {(rows + alignment - 1) / alignment * alignment, embed_dim},
+                         cudaDevice, rows % alignment != 0);
         fused.name = destination; fused.isModelWeight = true; fused.weightType = WeightType::LINEAR;
         size_t offset = 0;
         for (const auto &name : sources) {
             auto &w = weight[name];
             FastllmCudaCopyFromDeviceToDevice((char *)fused.cudaData + offset, w.cudaData, w.GetBytes());
-            offset += w.GetBytes(); mergedSources.push_back(name);
+            mergedSources.emplace_back(&w, keepViews ? (char *)fused.cudaData + offset : nullptr);
+            offset += w.GetBytes();
         }
     };
     for (int i = 0; i < block_cnt; ++i) {
@@ -205,12 +208,24 @@ void CloverModel::EnsureResident() {
         if (linearLayers[i]) merge(p + "linear_attn.fused_in_proj.weight", {
             p + "linear_attn.in_proj_qkv.weight", p + "linear_attn.in_proj_z.weight",
             p + "linear_attn.in_proj_a.weight", p + "linear_attn.in_proj_b.weight"});
+        merge(p + "mlp.router_shared_gate.weight", {
+            p + "mlp.gate.weight", p + "mlp.shared_expert_gate.weight"}, 64, true);
         merge(p + "mlp.shared_expert.gate_up_proj.weight", {
             p + "mlp.shared_expert.gate_proj.weight", p + "mlp.shared_expert.up_proj.weight"});
     }
     FastllmCudaStreamSynchronize(nullptr);
-    // Keep checkpoint tensors available on the host, without duplicate resident weights.
-    for (const auto &name : mergedSources) weight[name].ToDevice(DataDevice::CPU);
+    // Keep checkpoint tensors on the host. Original projection shapes borrow
+    // slices of the packed CUDA weights for prefill and short-tail dispatch.
+    // Persistent Data objects also retain their GEMM auxiliary allocations.
+    for (const auto &entry : mergedSources) {
+        auto &view = *entry.first;
+        view.ToDevice(DataDevice::CPU);
+        if (!entry.second) continue;
+        view.cudaData = entry.second;
+        view.cudaDataBorrowed = true;
+        view.dataDevice = DataDevice::CUDA;
+        view.dataDeviceIds = {cudaDevice};
+    }
     resident = true;
 #else
     Check(false, "requires a CUDA build");
@@ -383,13 +398,17 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
     std::string p = Layer(layer) + "mlp.";
     auto eager = [&](Data &input, Data &output, bool graphPath = false) {
         Data sharedGateUp, sharedMiddle, shared, sharedScale;
+        // Keep the established prefill/short-tail reduction geometry.
+        const bool fusedGate = graphAllowed && t >= 16;
         Linear(input, weight[p + "shared_expert.gate_up_proj.weight"], *GetEmptyData(), sharedGateUp);
         Swiglu(sharedGateUp, sharedMiddle);
         Linear(sharedMiddle, weight[p + "shared_expert.down_proj.weight"], *GetEmptyData(), shared);
-        Linear(input, weight[p + "shared_expert_gate.weight"], *GetEmptyData(), sharedScale);
         Data router, ids, scores, scratchIds, scratchScores, allowed, middle, parts, expertWorkspace,
             packedExperts;
-        Linear(input, weight[p + "gate.weight"], *GetEmptyData(), router);
+        if (!fusedGate)
+            Linear(input, weight[p + "shared_expert_gate.weight"], *GetEmptyData(), sharedScale);
+        Linear(input, weight[p + (fusedGate ? "router_shared_gate.weight" : "gate.weight")], *GetEmptyData(), router);
+        const int routerStride = router.dims.back();
         PrepareCloverData(ids, INT32, {t, num_experts_per_tok}, cudaDevice);
         PrepareCloverData(scores, FLOAT32, ids.dims, cudaDevice);
         if (preview && coresetEnabled) {
@@ -400,7 +419,8 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
         }
         Check(FastllmCudaCloverRoute(router.cudaData, (int *)ids.cudaData, (float *)scores.cudaData,
             (int *)scratchIds.cudaData, (float *)scratchScores.cudaData, (unsigned char *)allowed.cudaData,
-            batch, t / batch, num_experts, num_experts_per_tok, preview && coresetEnabled ? coresetTopP : 0.f), "routing failed");
+            batch, t / batch, num_experts, num_experts_per_tok, preview && coresetEnabled ? coresetTopP : 0.f,
+            nullptr, routerStride), "routing failed");
         PrepareCloverData(middle, BFLOAT16, {t, num_experts_per_tok, intermediate}, cudaDevice);
         PrepareCloverData(parts, BFLOAT16, {t, num_experts_per_tok, embed_dim}, cudaDevice);
         PrepareCloverData(output, BFLOAT16, input.dims, cudaDevice);
@@ -413,7 +433,9 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
                                        (float *)scores.cudaData, middle.cudaData, parts.cudaData,
                                        output.cudaData, t, embed_dim, intermediate, num_experts,
                                        num_experts_per_tok, nullptr, (int *)expertWorkspace.cudaData,
-                                       packedExperts.cudaData, shared.cudaData, sharedScale.cudaData),
+                                       packedExperts.cudaData, shared.cudaData,
+                                       fusedGate ? (uint16_t *)router.cudaData + num_experts : sharedScale.cudaData,
+                                       fusedGate ? routerStride : 1),
               "experts failed");
     };
     const int width = t / batch;

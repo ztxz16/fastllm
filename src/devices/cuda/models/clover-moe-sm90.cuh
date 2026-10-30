@@ -227,7 +227,7 @@ int CloverExpertTileRows(int rows, int experts, int topk) {
 bool CloverExpertsTma(const void *input, const void *gateUp, const void *down, const int *indices,
                       const float *scores, void *middle, void *parts, void *output, int rows, int hidden,
                       int intermediate, int experts, int topk, cudaStream_t stream, int *workspace,
-                      void *packed, const void *shared, const void *sharedGate) {
+                      void *packed, const void *shared, const void *sharedGate, int sharedGateStride) {
     int tileRows = CloverExpertTileRows(rows, experts, topk);
     int tiles = min(experts, rows * topk) + (rows * topk + tileRows - 1) / tileRows, device;
     if (cudaGetDevice(&device) != cudaSuccess) return false;
@@ -287,10 +287,10 @@ bool CloverExpertsTma(const void *input, const void *gateUp, const void *down, c
     if (shared)
         CloverSumExperts<true>((const __nv_bfloat16 *)parts, indices, (__nv_bfloat16 *)output, rows, hidden,
                                topk, stream, (const __nv_bfloat16 *)shared,
-                               (const __nv_bfloat16 *)sharedGate);
+                               (const __nv_bfloat16 *)sharedGate, sharedGateStride);
     else
         CloverSumExperts<false>((const __nv_bfloat16 *)parts, indices, (__nv_bfloat16 *)output, rows, hidden,
-                                topk, stream, nullptr, nullptr);
+                                topk, stream, nullptr, nullptr, 1);
     return true;
 }
 }

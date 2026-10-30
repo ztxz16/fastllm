@@ -742,11 +742,11 @@ __device__ void CloverSort256(float &value, int &id, float *sharedValue, int *sh
     }
 }
 __global__ void CloverRoute(const __nv_bfloat16 *logits, const unsigned char *allowed,
-        int *indices, float *scores, int tokens, int experts, int topk, bool normalizeTopK) {
+        int *indices, float *scores, int tokens, int experts, int topk, bool normalizeTopK, int stride) {
     __shared__ float values[256], reduction[8], maximum;
     __shared__ int sortedIds[256], ranks[256];
     int e = threadIdx.x, row = blockIdx.x;
-    float x = e < experts ? __bfloat162float(logits[(size_t)row * experts + e]) : -CUDART_INF_F;
+    float x = e < experts ? __bfloat162float(logits[(size_t)row * stride + e]) : -CUDART_INF_F;
     if (allowed && e < experts && !allowed[(row / tokens) * experts + e]) x = -CUDART_INF_F;
     float sorted = x; int id = e;
     CloverSort256(sorted, id, values, sortedIds, experts);
@@ -1076,7 +1076,7 @@ bool CloverTensorCores() {
 template <bool Shared>
 __global__ void CloverExpertSum(const __nv_bfloat16 *parts, const int *indices, __nv_bfloat16 *output,
                                 int hidden, int topk, const __nv_bfloat16 *shared,
-                                const __nv_bfloat16 *sharedGate) {
+                                const __nv_bfloat16 *sharedGate, int sharedGateStride) {
     int d = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
     __shared__ int order[16];
     // Sort the routes once per CTA, preserving the reference accumulation order.
@@ -1094,7 +1094,7 @@ __global__ void CloverExpertSum(const __nv_bfloat16 *parts, const int *indices, 
     auto result = __float2bfloat16(sum);
     if constexpr (Shared) {
         // Preserve sigmoid, shared product, routed sum and final add rounding.
-        auto probability = __float2bfloat16(1.f / (1.f + expf(-__bfloat162float(sharedGate[row]))));
+        auto probability = __float2bfloat16(1.f / (1.f + expf(-__bfloat162float(sharedGate[(size_t)row * sharedGateStride]))));
         auto contribution = __float2bfloat16(__bfloat162float(shared[(size_t)row * hidden + d]) *
                                              __bfloat162float(probability));
         result = __float2bfloat16(__bfloat162float(result) + __bfloat162float(contribution));
@@ -1105,7 +1105,7 @@ __global__ void CloverExpertSum(const __nv_bfloat16 *parts, const int *indices, 
 template <bool Shared>
 __global__ void CloverExpertSumVector(const __nv_bfloat16 *parts, const int *indices, __nv_bfloat16 *output,
                                       int rows, int hidden, int topk, const __nv_bfloat16 *shared,
-                                      const __nv_bfloat16 *sharedGate) {
+                                      const __nv_bfloat16 *sharedGate, int sharedGateStride) {
     int warp = threadIdx.x / 32, lane = threadIdx.x % 32, row = blockIdx.x * 4 + warp;
     if (row >= rows) return;
     __shared__ int order[4][16];
@@ -1118,7 +1118,7 @@ __global__ void CloverExpertSumVector(const __nv_bfloat16 *parts, const int *ind
     float probability = 0.f;
     if constexpr (Shared)
         probability =
-            __bfloat162float(__float2bfloat16(1.f / (1.f + expf(-__bfloat162float(sharedGate[row])))));
+            __bfloat162float(__float2bfloat16(1.f / (1.f + expf(-__bfloat162float(sharedGate[(size_t)row * sharedGateStride])))));
     for (int d = lane * 8; d < hidden; d += 32 * 8) {
         float sums[8] = {};
         for (int k = 0; k < topk; ++k) {
@@ -1145,16 +1145,16 @@ __global__ void CloverExpertSumVector(const __nv_bfloat16 *parts, const int *ind
 template <bool Shared>
 void CloverSumExperts(const __nv_bfloat16 *parts, const int *indices, __nv_bfloat16 *output, int rows,
                       int hidden, int topk, cudaStream_t stream, const __nv_bfloat16 *shared,
-                      const __nv_bfloat16 *sharedGate) {
+                      const __nv_bfloat16 *sharedGate, int sharedGateStride) {
     // A warp per row reduces prefill scheduling overhead. Small decode blocks
     // need the original wider grid; unaligned views retain scalar accesses.
     if (rows >= 1024 && hidden >= 512 && hidden % 8 == 0 &&
         ((reinterpret_cast<uintptr_t>(parts) | reinterpret_cast<uintptr_t>(output)) & 15) == 0)
         CloverExpertSumVector<Shared><<<(rows + 3) / 4, 128, 0, stream>>>(parts, indices, output, rows,
-                                                                          hidden, topk, shared, sharedGate);
+                                                                          hidden, topk, shared, sharedGate, sharedGateStride);
     else
         CloverExpertSum<Shared><<<dim3((hidden + 255) / 256, rows), 256, 0, stream>>>(
-            parts, indices, output, hidden, topk, shared, sharedGate);
+            parts, indices, output, hidden, topk, shared, sharedGate, sharedGateStride);
 }
 }
 
@@ -1223,8 +1223,10 @@ bool FastllmCudaCloverPrepareAttention(const void *qgate, const void *key, const
 }
 bool FastllmCudaCloverRoute(const void *logits, int *indices, float *scores,
         int *scratchIds, float *scratchScores, unsigned char *allowed,
-        int batch, int tokens, int experts, int topk, float coresetTopP, void *stream) {
+        int batch, int tokens, int experts, int topk, float coresetTopP, void *stream, int logitsStride) {
     bool coreset = coresetTopP > 0.f;
+    if (logitsStride == 0) logitsStride = experts;
+    if (logitsStride < experts) return false;
     if (!logits || !indices || !scores || batch < 1 || tokens < 1 || experts < 1 ||
         experts > 256 || topk < 1 || topk > experts || topk > 16 ||
         (coreset && (!scratchIds || !scratchScores || !allowed ||
@@ -1232,19 +1234,19 @@ bool FastllmCudaCloverRoute(const void *logits, int *indices, float *scores,
     cudaStream_t s = stream ? (cudaStream_t)stream : cudaStreamPerThread;
     if (coreset) {
         CloverRoute<<<batch * tokens, 256, 0, s>>>((const __nv_bfloat16 *)logits,
-            nullptr, scratchIds, scratchScores, tokens, experts, topk, false);
+            nullptr, scratchIds, scratchScores, tokens, experts, topk, false, logitsStride);
         CloverCoreset<<<batch, 256, 0, s>>>(scratchIds, scratchScores, allowed,
             tokens, experts, topk, coresetTopP);
     }
     CloverRoute<<<batch * tokens, 256, 0, s>>>((const __nv_bfloat16 *)logits,
-        coreset ? allowed : nullptr, indices, scores, tokens, experts, topk, true);
+        coreset ? allowed : nullptr, indices, scores, tokens, experts, topk, true, logitsStride);
     return cudaGetLastError() == cudaSuccess;
 }
 bool FastllmCudaCloverExperts(const void *input, const void *gateUp, const void *down, const int *indices,
     const float *scores, void *middle, void *parts, void *output, int rows, int hidden,
     int intermediate, int experts, int topk, void *stream, int *workspace, void *packed,
-    const void *shared, const void *sharedGate) {
-    if ((shared == nullptr) != (sharedGate == nullptr))
+    const void *shared, const void *sharedGate, int sharedGateStride) {
+    if ((shared == nullptr) != (sharedGate == nullptr) || sharedGateStride < 1)
         return false;
     if (!input || !gateUp || !down || !indices || !scores || !middle || !parts || !output ||
         rows < 1 || hidden < 1 || intermediate < 1 || experts < 1 || topk < 1 ||
@@ -1254,7 +1256,7 @@ bool FastllmCudaCloverExperts(const void *input, const void *gateUp, const void 
     if (workspace && packed &&
         FastllmCudaCloverExpertsPackedBytes(rows, hidden, intermediate, experts, topk) &&
         CloverExpertsTma(input, gateUp, down, indices, scores, middle, parts, output, rows, hidden,
-                         intermediate, experts, topk, s, workspace, packed, shared, sharedGate))
+                         intermediate, experts, topk, s, workspace, packed, shared, sharedGate, sharedGateStride))
         return cudaGetLastError() == cudaSuccess;
 #endif
     bool grouped = workspace && rows >= 4 && hidden >= 512 && intermediate >= 128 &&
@@ -1289,10 +1291,10 @@ bool FastllmCudaCloverExperts(const void *input, const void *gateUp, const void 
     }
     if (shared)
         CloverSumExperts<true>((const __nv_bfloat16 *)parts, indices, (__nv_bfloat16 *)output, rows, hidden,
-                               topk, s, (const __nv_bfloat16 *)shared, (const __nv_bfloat16 *)sharedGate);
+                               topk, s, (const __nv_bfloat16 *)shared, (const __nv_bfloat16 *)sharedGate, sharedGateStride);
     else
         CloverSumExperts<false>((const __nv_bfloat16 *)parts, indices, (__nv_bfloat16 *)output, rows, hidden,
-                                topk, s, nullptr, nullptr);
+                                topk, s, nullptr, nullptr, 1);
     return cudaGetLastError() == cudaSuccess;
 }
 

@@ -77,10 +77,11 @@ bool FastllmCudaCloverPrepareAttention(const void *qgate, const void *key, const
 
 // Stable expert-id tie breaking. Scratch: [B,T,K] INT32 ids and FP32 scores,
 // plus [B,E] byte mask; only needed for preview coreset filtering.
+// logitsStride defaults to E; a larger stride supports a fused gate projection.
 bool FastllmCudaCloverRoute(const void *logits, int *indices, float *scores,
     int *scratchIds, float *scratchScores, unsigned char *allowed,
     int batch, int tokens, int experts, int topk, float coresetTopP,
-    void *stream = nullptr);
+    void *stream = nullptr, int logitsStride = 0);
 // Resident packed BF16 [E,2I,H] / [E,H,I] experts. Scratch is BF16
 // [M,K,I] and [M,K,H]. Each down contribution rounds AFTER route weighting.
 // Optional INT32 workspace: E*(M+1) + E + ceil(M*K/16) + 1 elements.
@@ -90,12 +91,12 @@ bool FastllmCudaCloverRoute(const void *logits, int *indices, float *scores,
 // the shape/compiled architecture requires the generic path.
 std::size_t FastllmCudaCloverExpertsPackedBytes(int rows, int hidden, int intermediate, int experts, int topk);
 // Fused shared expert epilogue. shared is ungated BF16 [rows,hidden],
-// sharedGate is BF16 [rows]. Both must be null or both supplied. Retain
+// sharedGate is BF16 [rows], optionally strided. Both must be null or both supplied. Retain
 // the BF16 sigmoid, product, routed-sum and final-add rounding boundaries.
 bool FastllmCudaCloverExperts(const void *input, const void *gateUp, const void *down, const int *indices,
     const float *scores, void *middle, void *parts, void *output, int rows, int hidden,
     int intermediate, int experts, int topk, void *stream = nullptr, int *workspace = nullptr,
-    void *packed = nullptr, const void *shared = nullptr, const void *sharedGate = nullptr);
+    void *packed = nullptr, const void *shared = nullptr, const void *sharedGate = nullptr, int sharedGateStride = 1);
 
 // Response-only penalties apply in FP32 before sampling. rowBias stores
 // [stop-token bias, thinking-end bias] per row; counts never include the prompt.
