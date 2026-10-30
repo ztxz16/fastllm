@@ -17,6 +17,7 @@
 #include "models/qwen4_paged_cache.h"
 
 #include "devices/cpu/alivethreadpool.h"
+#include "devices/disk/diskdevice.h"
 #include "executor.h"
 #include "gguf.h"
 #include "json11.hpp"
@@ -11364,6 +11365,16 @@ namespace fastllm {
             throw;
         }
         ClearWarmupCache(cache);
+        if (!threadTpState && threadTpRank < 0 && GetMoeCpuCacheBytes() &&
+            std::any_of(weights.begin(), weights.end(), [](const auto &layer) {
+                return layer.size() > 3 && layer[2] && layer[3] &&
+                    layer[2]->isDiskWeight && layer[3]->isDiskWeight &&
+                    layer[2]->dataType == DATA_GGUF_FORMAT && layer[3]->dataType == DATA_GGUF_FORMAT;
+            })) {
+            const uint64_t added = PreloadDiskMoeCache(weights);
+            if (added) std::printf("[Fastllm] Qwen4 disk GGUF RAM preload: %.2f MiB within configured cache budget.\n",
+                added / double(1ULL << 20));
+        }
 #if defined(__GLIBC__)
         if (threadTpState) malloc_trim(0);
 #endif

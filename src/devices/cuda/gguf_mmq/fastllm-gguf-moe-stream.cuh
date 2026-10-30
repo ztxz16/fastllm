@@ -8,6 +8,7 @@ struct StreamedMoeBatch {
     int experts = 0, rows = 0;
     const uint8_t *const *weights = nullptr;
     const int *counts = nullptr, *offsets = nullptr, *tileExperts = nullptr, *routes = nullptr;
+    bool diskIQ1M = false; // Ordinary canonical disk gate; other callers retain MMQ policy.
 };
 enum class StreamedMoePhase { Prepare, Compute, Finish };
 size_t StreamedMoeWorkspaceBytes(int rows, int hidden, int inter, int topk, int capacity, bool nativeV41 = false);

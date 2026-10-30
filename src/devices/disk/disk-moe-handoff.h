@@ -28,7 +28,7 @@ class DiskMoeHandoffWorkspace {
         return host != nullptr;
     }
 public:
-    Data cpuInput, cpuIndex, cpuScore, cpuOutput{BFLOAT16};
+    Data cpuInput, cpuIndex, cpuScore, cpuOutput{BFLOAT16}, cpuOrdinaryOutput{FLOAT32};
     explicit DiskMoeHandoffWorkspace(int device) : device(device) {}
     ~DiskMoeHandoffWorkspace() {
         DeviceGuard guard(device);
@@ -48,7 +48,8 @@ public:
     }
     bool Stage(const Data &input, const Data &index, const Data &score,
                Data &hostInput, Data &hostIndex, Data &hostScore) {
-        if (input.dataType != BFLOAT16 || input.dims.size() != 2 || input.dims[0] != 1 ||
+        if ((input.dataType != BFLOAT16 && input.dataType != FLOAT16 && input.dataType != FLOAT32) ||
+                input.dims.size() != 2 || input.dims[0] != 1 ||
                 input.dims[1] <= 0 || input.dims[1] > 24576 ||
                 (index.dataType != INT32 && index.dataType != INT32PARAM) ||
                 score.dataType != FLOAT32 || index.dims != score.dims ||
