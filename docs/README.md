@@ -5,6 +5,7 @@
 - [快速开始](../README.md)
 - [模型部署指南](../README.md#模型部署指南)
 - [HY-Nomas 世界模型与 HTTP Demo](hy_nomas.md)：原生库构建、权重准备和服务启动
+- [LingBot World 2.0 世界模型与 HTTP Demo](lingbot_world.md)：权重转换、原生推理和世界会话接口
 - [`--auto` 参数调节与启动器](auto.md)：常用参数的影响、命令示例和日志检查
 - [启动器与工作室](launcher.md)：配置管理、聊天和 Agent
 - [手动部署与完整参数参考](deployment.md)：设备配置、模型格式、下载导出和源码安装
