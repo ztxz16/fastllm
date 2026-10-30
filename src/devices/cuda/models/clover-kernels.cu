@@ -230,6 +230,8 @@ __global__ void CloverPreviewGdn(const __nv_bfloat16 *query,
     }
 }
 
+#include "clover-gdn-preview.cuh"
+
 bool ValidCaches(const CloverCudaGdnCaches *caches, int batch, bool conv) {
     if (!caches) return true;
     if (batch < 1 || batch > CloverCudaGdnCaches::Capacity) return false;
@@ -526,6 +528,20 @@ bool FastllmCudaCloverPreviewGdn(const void *query, const void *key, const void 
         !ValidBlock(batch, tokens) || !ValidCaches(caches, batch, false) || keyHeads <= 0 || valueHeads <= 0 || valueHeads > 65535 ||
         valueHeads % keyHeads || qkvRowStride < 0 || (qkvRowStride && qkvRowStride < valueHeads * 128))
         return false;
+    if ((tokens == 16 || tokens == 32) && CloverPreviewMmaAvailable()) {
+        auto launch = [&](auto width, auto indirect) {
+            return CloverLaunch<CloverPreviewGdnMma<decltype(width)::value, decltype(indirect)::value>>(
+                dim3(tokens / 16, valueHeads, batch), 256, 0, Stream(stream),
+                (const __nv_bfloat16 *)query, (const __nv_bfloat16 *)key, (const __nv_bfloat16 *)value,
+                g, state, logitScale, historyBias, historyScale, slots, valid, (__nv_bfloat16 *)output,
+                keyHeads, valueHeads, qkvRowStride ? qkvRowStride : keyHeads * 128,
+                qkvRowStride ? qkvRowStride : valueHeads * 128, caches ? *caches : CloverCudaGdnCaches{});
+        };
+        if (tokens == 16) return caches ? launch(std::integral_constant<int, 16>{}, std::true_type{})
+                                        : launch(std::integral_constant<int, 16>{}, std::false_type{});
+        return caches ? launch(std::integral_constant<int, 32>{}, std::true_type{})
+                      : launch(std::integral_constant<int, 32>{}, std::false_type{});
+    }
     auto dispatch = [&](auto indirect) {
         auto launch = [&](auto width, auto count) {
             constexpr int queries = decltype(count)::value;

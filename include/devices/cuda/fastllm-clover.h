@@ -25,6 +25,9 @@ bool FastllmCudaCloverPreviewConv(
 
 // Q/K: [B,T,KH,128], V/output: [B,T,VH,128], state: [slot,VH,128,128]
 // (value-major), g: [B,T,VH], scalars: [VH]. Block width is a divisor of 32.
+// SM80+ blocks of 16/32 use BF16 normalized Q/K, state read operands and local
+// probabilities with FP32 accumulation, matching SGLang preview precision.
+// The persistent FP32 state remains read-only; other dispatches retain FP32.
 // Optional qkvRowStride is in BF16 elements, allowing Q/K/V views into a
 // fused projection. Zero selects the contiguous stride of each input tensor.
 bool FastllmCudaCloverPreviewGdn(

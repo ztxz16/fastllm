@@ -447,6 +447,9 @@ void AttentionPreparation(int tokens, int qh, int kh, int rotaryDim, int positio
 void Preview(int batch, int tokens, int kh, int vh, bool masked) {
     std::mt19937 rng(42 + tokens); std::normal_distribution<float> normal(0.f, .2f);
     auto random = [&](size_t n) { std::vector<uint16_t> x(n); for (auto &v : x) v = BF16(normal(rng)); return x; };
+    int major = 0;
+    Check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0));
+    const bool tensorPreview = major >= 8 && (tokens == 16 || tokens == 32);
     const int rows = batch * tokens, stride = (2 * kh + vh) * 128 + 17;
     auto q = random((size_t)rows * kh * 128), k = random(q.size()), v = random((size_t)rows * vh * 128);
     auto packed = Pack(q, k, v, rows, kh, vh, stride);
@@ -480,7 +483,9 @@ void Preview(int batch, int tokens, int kh, int vh, bool masked) {
             for (int d = 0; d < vh * 128; ++d) Require(expected[(size_t)row * vh * 128 + d] == 0, "inactive preview row nonzero");
         // Independent scalar form of the published bidirectional local-memory
         // equation: normalize Q/K, softmax local and history logits together,
-        // then mix local values with the read-only FP32 recurrent state.
+        // then mix local values with the read-only FP32 recurrent state. SM80+
+        // full blocks round normalized Q/K, state operands and probabilities
+        // to BF16 as in SGLang; accumulation and stored state remain FP32.
         for (int b = 0; b < batch; ++b) for (int t = 0; t < tokens; ++t) for (int h = 0; h < vh; ++h) {
             const int row = b * tokens + t, slot = masked ? slots[b] : b, keyHead = h / (vh / kh);
             if (slot < 0 || (masked && !valid[row])) continue;
@@ -489,7 +494,10 @@ void Preview(int batch, int tokens, int kh, int vh, bool masked) {
                 qn[d] = Float(q[((size_t)row * kh + keyHead) * 128 + d]);
                 qs += double(qn[d]) * qn[d];
             }
-            for (auto &x : qn) x = float(x / std::sqrt(qs + 1.e-6));
+            for (auto &x : qn) {
+                x = float(x / std::sqrt(qs + 1.e-6));
+                if (tensorPreview) x = Float(BF16(x));
+            }
             int count = 0; for (int j = 0; j < tokens; ++j) count += !masked || valid[b * tokens + j];
             std::vector<double> weights(tokens + 1);
             weights[tokens] = bias[h] + hc[h] * std::log(std::max(count, 1) / 32.);
@@ -502,7 +510,11 @@ void Preview(int batch, int tokens, int kh, int vh, bool masked) {
                     ks += double(kn[d]) * kn[d];
                 }
                 double dot = 0.;
-                for (int d = 0; d < 128; ++d) dot += qn[d] * (kn[d] / std::sqrt(ks + 1.e-6));
+                for (int d = 0; d < 128; ++d) {
+                    double normalized = kn[d] / std::sqrt(ks + 1.e-6);
+                    if (tensorPreview) normalized = Float(BF16(float(normalized)));
+                    dot += double(qn[d]) * normalized;
+                }
                 weights[j] = dot * scale[h]; maximum = std::max(maximum, weights[j]);
             }
             double denominator = 0.;
@@ -511,9 +523,9 @@ void Preview(int batch, int tokens, int kh, int vh, bool masked) {
             for (int d = 0; d < 128; ++d) {
                 double history = 0., local = 0.;
                 const float *s = state.data() + (((size_t)slot * vh + h) * 128 + d) * 128;
-                for (int j = 0; j < 128; ++j) history += double(qn[j]) * s[j];
+                for (int j = 0; j < 128; ++j) history += double(qn[j]) * (tensorPreview ? Float(BF16(s[j])) : s[j]);
                 for (int j = 0; j < tokens; ++j)
-                    local += weights[j] * Float(v[(((size_t)b * tokens + j) * vh + h) * 128 + d]);
+                    local += (tensorPreview ? Float(BF16(float(weights[j]))) : weights[j]) * Float(v[(((size_t)b * tokens + j) * vh + h) * 128 + d]);
                 float reference = float(weights[tokens] * history / std::sqrt(128.) * std::exp(g[row * vh + h]) + local);
                 Close(Float(expected[((size_t)row * vh + h) * 128 + d]), Float(BF16(reference)), .001f, .01f);
             }
