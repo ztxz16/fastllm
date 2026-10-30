@@ -120,6 +120,51 @@ __global__ void CheckFP4Pair(float *output) {
     output[2 * i] = pair.x;
     output[2 * i + 1] = pair.y;
 }
+__global__ void CheckDotGateUp(const __nv_bfloat16 *input, const uint8_t *weights,
+        float *output, int columns) {
+    const int row = blockIdx.x * 32 + threadIdx.x / 16;
+    const size_t pitch = size_t(columns / 32) * 17;
+    const auto *gate = weights + 2 * row * pitch, *up = gate + pitch;
+    const float2 pair = fastllm::cuda::dsv41_cache::DotGateUp(input, gate, up, columns);
+    const float g = fastllm::cuda::dsv41_cache::Dot(input, gate, columns);
+    const float u = fastllm::cuda::dsv41_cache::Dot(input, up, columns);
+    if ((threadIdx.x & 15) == 0) {
+        output[4 * row] = pair.x; output[4 * row + 1] = pair.y;
+        output[4 * row + 2] = g; output[4 * row + 3] = u;
+    }
+}
+static void TestDotGateUp() {
+    constexpr int rows = 128;
+    std::mt19937 rng(127);
+    for (int columns : {32, 256, 2304, 5120}) {
+        const size_t pitch = size_t(columns / 32) * 17;
+        std::vector<uint8_t> weights(2 * rows * pitch);
+        std::vector<uint16_t> input(columns);
+        for (auto &v : input) v = Float32ToBFloat16RNEBits((int(rng() % 2001) - 1000) / 128.f);
+        for (int row = 0; row < 2 * rows; ++row) for (int block = 0; block < columns / 32; ++block) {
+            auto *w = weights.data() + row * pitch + block * 17;
+            for (int i = 0; i < 16; ++i) w[i] = row < 2 ? 0x80 : rng() % 256;
+            w[16] = row < 8 ? (row < 4 ? 0 : row < 6 ? 254 : 255) : 112 + rng() % 22;
+        }
+        uint8_t *deviceWeights; __nv_bfloat16 *deviceInput; float *deviceOutput;
+        Check(cudaMalloc(&deviceWeights, weights.size()));
+        Check(cudaMalloc(&deviceInput, input.size() * 2));
+        Check(cudaMalloc(&deviceOutput, rows * 4 * sizeof(float)));
+        Check(cudaMemcpy(deviceWeights, weights.data(), weights.size(), cudaMemcpyHostToDevice));
+        Check(cudaMemcpy(deviceInput, input.data(), input.size() * 2, cudaMemcpyHostToDevice));
+        CheckDotGateUp<<<rows / 32, 512>>>(deviceInput, deviceWeights, deviceOutput, columns);
+        std::vector<float> values(rows * 4);
+        Check(cudaMemcpy(values.data(), deviceOutput, values.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        for (int row = 0; row < rows; ++row) for (int part = 0; part < 2; ++part) {
+            const float &a = values[4 * row + part], &b = values[4 * row + part + 2];
+            Require((std::isnan(a) && std::isnan(b)) || std::memcmp(&a, &b, sizeof(float)) == 0,
+                "paired dot changed independent accumulation bits");
+        }
+        Check(cudaFree(deviceOutput)); Check(cudaFree(deviceInput)); Check(cudaFree(deviceWeights));
+    }
+    std::printf("DOT_GATE_UP_PASS 512 projection pairs: finite bits and NaN cases\n");
+}
+
 static void Quant(std::vector<float> &v, int blockSize = 32) {
     for (size_t start = 0; start < v.size(); start += blockSize) {
         float maximum = 1e-4f;
@@ -330,6 +375,7 @@ int main(int argc, char **argv) {
             }
             std::printf("FP4_PAIR_PASS pairs=%d values=%d\n", pairs, 2 * pairs);
         }
+        if (!fp8) TestDotGateUp();
         // Preserve the existing V4 block-128 helper while extending V4.1.
         for (int block : {32, 128})
             for (bool quantize : {false, true}) {

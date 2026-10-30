@@ -77,6 +77,27 @@ __device__ inline float Dot(const __nv_bfloat16 *input, const uint8_t *weight, i
         sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, delta, 16));
     return sum;
 }
+// Reuse each input pair for both projections without changing either dot's
+// accumulation order. Dot remains the independent single-projection path.
+__device__ inline float2 DotGateUp(const __nv_bfloat16 *input, const uint8_t *gate,
+        const uint8_t *up, int columns) {
+    const int lane = threadIdx.x & 15;
+    float gs = 0, us = 0;
+    #pragma unroll 4
+    for (int block = 0; block < columns / 32; ++block) {
+        const uint8_t *g = gate + block * 17, *u = up + block * 17;
+        const float2 gv = FP4Pair(g[lane], g[16]), uv = FP4Pair(u[lane], u[16]);
+        const unsigned x = reinterpret_cast<const unsigned *>(input)[block * 16 + lane];
+        const float x0 = __uint_as_float(x << 16), x1 = __uint_as_float(x & 0xffff0000u);
+        gs = __fadd_rn(gs, __fadd_rn(__fmul_rn(x0, gv.x), __fmul_rn(x1, gv.y)));
+        us = __fadd_rn(us, __fadd_rn(__fmul_rn(x0, uv.x), __fmul_rn(x1, uv.y)));
+    }
+    for (int delta = 8; delta; delta >>= 1) {
+        gs = __fadd_rn(gs, __shfl_down_sync(0xffffffff, gs, delta, 16));
+        us = __fadd_rn(us, __shfl_down_sync(0xffffffff, us, delta, 16));
+    }
+    return make_float2(gs, us);
+}
 template <bool Batched = false>
 __global__ void Gate(const __nv_bfloat16 *input, const int32_t *slots, const uint8_t *records, const float *scores,
                      __nv_bfloat16 *activation, int hidden, int inter, size_t stride, float limit, int topk = 1,
@@ -90,8 +111,8 @@ __global__ void Gate(const __nv_bfloat16 *input, const int32_t *slots, const uin
     const int column = blockIdx.x * 32 + threadIdx.x / 16;
     const size_t pitch = size_t(hidden / 32) * 17;
     const uint8_t *record = records + size_t(slot) * stride;
-    float gate = BFloat(Dot(input, record + column * pitch, hidden));
-    float up = BFloat(Dot(input, record + (column + inter) * pitch, hidden));
+    const float2 pair = DotGateUp(input, record + column * pitch, record + (column + inter) * pitch, hidden);
+    float gate = BFloat(pair.x), up = BFloat(pair.y);
     __shared__ float values[32];
     if ((threadIdx.x & 15) == 0) {
         if (limit > 0) {
