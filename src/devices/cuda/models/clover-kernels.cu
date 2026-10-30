@@ -1074,6 +1074,68 @@ __global__ void CloverExpertTiles(int *workspace, int rows, int experts) {
     for (int m = 0; m < count; ++m) tiles[1 + before + m] = e * (rows + 1) + m * TileRows;
 }
 
+// Small decode batches build stable expert rows and tile descriptors in one
+// CTA. Warp peer masks give each route its rank; preceding warp/chunk counts
+// preserve token order without atomically scattering the output list.
+__global__ void CloverExpertRowsAndTiles(const int *indices, int *workspace,
+        int rows, int topk, int experts) {
+    const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    __shared__ int counts[8][256], totals[256], warpTotals[8];
+    totals[tid] = 0;
+    for (int start = 0; start < rows * topk; start += 256) {
+#pragma unroll
+        for (int w = 0; w < 8; ++w) counts[w][tid] = 0;
+        __syncthreads();
+        const int task = start + tid, expert = task < rows * topk ? indices[task] : -1;
+        unsigned peers;
+#if __CUDA_ARCH__ >= 700
+        peers = __match_any_sync(0xffffffff, expert);
+#else
+        peers = 0;
+        for (int i = 0; i < 32; ++i)
+            if (__shfl_sync(0xffffffff, expert, i) == expert) peers |= 1u << i;
+#endif
+        if (expert >= 0 && lane == __ffs(peers) - 1) counts[warp][expert] = __popc(peers);
+        __syncthreads();
+        if (expert >= 0) {
+            int rank = totals[expert] + __popc(peers & ((1u << lane) - 1));
+            for (int w = 0; w < warp; ++w) rank += counts[w][expert];
+            workspace[(size_t)expert * (rows + 1) + rank] = task;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int w = 0; w < 8; ++w) totals[tid] += counts[w][tid];
+        __syncthreads();
+    }
+    const int count = (totals[tid] + 15) / 16;
+    if (tid < experts) workspace[(size_t)tid * (rows + 1) + rows] = totals[tid];
+    int inclusive = count;
+    for (int d = 1; d < 32; d *= 2) {
+        int v = __shfl_up_sync(0xffffffff, inclusive, d);
+        if (lane >= d) inclusive += v;
+    }
+    if (lane == 31) warpTotals[warp] = inclusive;
+    __syncthreads();
+    int before = inclusive - count, total = 0;
+    for (int w = 0; w < 8; ++w) {
+        total += warpTotals[w];
+        if (w < warp) before += warpTotals[w];
+    }
+    int *tiles = workspace + (size_t)experts * (rows + 1);
+    if (tid == 0) tiles[0] = total;
+    for (int m = 0; m < count; ++m) tiles[1 + before + m] = tid * (rows + 1) + m * 16;
+}
+
+void CloverBuildExpertTiles(const int *indices, int *workspace, int rows, int topk,
+                           int experts, cudaStream_t stream) {
+    if (rows * topk <= 512)
+        CloverExpertRowsAndTiles<<<1, 256, 0, stream>>>(indices, workspace, rows, topk, experts);
+    else {
+        CloverBuildExpertRows(indices, workspace, rows, topk, experts, stream);
+        CloverExpertTiles<16><<<1, 256, 0, stream>>>(workspace, rows, experts);
+    }
+}
+
 __device__ __forceinline__ void CloverCopyAsync16(void *destination, const void *source, bool valid) {
 #if __CUDA_ARCH__ >= 800
     unsigned address = (unsigned)__cvta_generic_to_shared(destination);
@@ -1406,8 +1468,7 @@ bool FastllmCudaCloverExperts(const void *input, const void *gateUp, const void 
     bool grouped = workspace && rows >= 4 && hidden >= 512 && intermediate >= 128 &&
         experts <= 256 && CloverTensorCores();
     if (grouped) {
-        CloverBuildExpertRows(indices, workspace, rows, topk, experts, s);
-        CloverExpertTiles<16><<<1, 256, 0, s>>>(workspace, rows, experts);
+        CloverBuildExpertTiles(indices, workspace, rows, topk, experts, s);
         int tiles = min(experts, rows * topk) + (rows * topk + 15) / 16;
         if (rows <= 32) {
             CloverExpertGemm<true, 32, 128><<<dim3((intermediate + 31) / 32, tiles), 64, 0, s>>>(

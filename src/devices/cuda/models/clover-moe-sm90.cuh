@@ -248,9 +248,9 @@ bool CloverExpertsTma(const void *input, const void *gateUp, const void *down, c
         if (cached.size() >= 256) cached.clear();
         it = cached.emplace(key, std::make_pair(gateMaps, downMaps)).first;
     }
-    CloverBuildExpertRows(indices, workspace, rows, topk, experts, stream);
 #ifdef FASTLLM_ENABLE_CLOVER_MOE_SM90
     if (tileRows == 64) {
+        CloverBuildExpertRows(indices, workspace, rows, topk, experts, stream);
         CloverExpertTiles<64><<<1, 256, 0, stream>>>(workspace, rows, experts);
         CloverPackExpertInput<4, 64><<<dim3(16, tiles), 128, 0, stream>>>(
             (const __nv_bfloat16 *)input, workspace, packedInput, rows, hidden, experts, topk);
@@ -259,7 +259,7 @@ bool CloverExpertsTma(const void *input, const void *gateUp, const void *down, c
             middle, parts, packedMiddle, rows, hidden, intermediate, experts, tiles, stream);
     } else {
 #endif
-    CloverExpertTiles<16><<<1, 256, 0, stream>>>(workspace, rows, experts);
+    CloverBuildExpertTiles(indices, workspace, rows, topk, experts, stream);
     if (rows >= 1024)
         CloverPackExpertInput<4><<<dim3(4, tiles), 128, 0, stream>>>(
             (const __nv_bfloat16 *)input, workspace, packedInput, rows, hidden, experts, topk);

@@ -264,6 +264,24 @@ void Experts(int rows, int hidden, int inter, int experts, int topk, bool cluste
         }
         for (size_t i = 0; i < sums.size(); ++i) Close(Float(actual[i]), Float(BF16(sums[i])), .0005f, .02f);
         auto actualGuard = workspace.Get<int>(guard.size());
+        int major = 0;
+        Check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0));
+        if (major >= 8 && rows >= 4 && rows * topk <= 512 && hidden >= 512 && inter >= 128 && experts <= 256) {
+            std::vector<int> expectedTiles;
+            for (int e = 0; e < experts; ++e) {
+                std::vector<int> tasks;
+                for (int task = 0; task < rows * topk; ++task) if (routes[task] == e) tasks.push_back(task);
+                const size_t offset = 64 + (size_t)e * (rows + 1);
+                Require(actualGuard[offset + rows] == (int)tasks.size(), "fused expert count differs");
+                Require(std::equal(tasks.begin(), tasks.end(), actualGuard.begin() + offset), "fused expert order differs");
+                for (int first = 0; first < (int)tasks.size(); first += 16)
+                    expectedTiles.push_back(e * (rows + 1) + first);
+            }
+            const size_t offset = 64 + (size_t)experts * (rows + 1);
+            Require(actualGuard[offset] == (int)expectedTiles.size(), "fused expert tile count differs");
+            Require(std::equal(expectedTiles.begin(), expectedTiles.end(), actualGuard.begin() + offset + 1), "fused expert tiles differ");
+        }
+
         for (int i = 0; i < 64; ++i) Require(actualGuard[i] == guard[i] && actualGuard[n + 64 + i] == guard[i], "expert workspace overrun");
         auto actualPacked = packed.Get<unsigned char>(packedGuard.size());
         for (int i = 0; i < 128; ++i)
