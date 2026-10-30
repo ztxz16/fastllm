@@ -10,9 +10,11 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 import traceback
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from typing import (Any, AsyncGenerator, AsyncIterator, Dict, Iterable, List,
@@ -79,6 +81,78 @@ ConversationContent = Union[str, List[Dict[str, Any]]]
 # Threads start lazily and are joined by ThreadPoolExecutor at process exit.
 _input_preparation_executor = ThreadPoolExecutor(
     max_workers=min(4, os.cpu_count() or 1), thread_name_prefix="fastllm-input")
+
+# #776: every turn of a multi-turn chat re-sent its history images, and each
+# turn downloaded and decoded them again -- inside the FastAPI event loop, so a
+# slow image host stalled unrelated requests too.  Cache the raw bytes per URL
+# (never the decoded PIL object: callers convert and may mutate what they get
+# back) so a repeat turn skips the HTTP GET while the decode stays per request.
+# URLs are compared verbatim, which is exactly what a client re-sends.
+#   FASTLLM_IMAGE_URL_CACHE_BYTES=0    turn the cache off
+#   FASTLLM_IMAGE_URL_CACHE_TTL=600    seconds; 0 = never expire
+_IMAGE_URL_CACHE_LIMIT = int(
+    os.environ.get("FASTLLM_IMAGE_URL_CACHE_BYTES", str(256 * 1024 * 1024)) or 0)
+_IMAGE_URL_CACHE_TTL = float(
+    os.environ.get("FASTLLM_IMAGE_URL_CACHE_TTL", "600") or 0)
+_IMAGE_URL_CACHE: "OrderedDict[str, Tuple[float, bytes]]" = OrderedDict()
+_IMAGE_URL_CACHE_USED = 0
+_IMAGE_URL_CACHE_LOCK = threading.Lock()
+_IMAGE_URL_CACHE_STATS = {"hit": 0, "miss": 0}
+
+
+def _image_url_cache_drop_locked(image_url: str, payload: bytes) -> None:
+    global _IMAGE_URL_CACHE_USED
+    _IMAGE_URL_CACHE.pop(image_url, None)
+    _IMAGE_URL_CACHE_USED = max(0, _IMAGE_URL_CACHE_USED - len(payload))
+
+
+def _image_url_cache_get(image_url: str) -> Optional[bytes]:
+    if _IMAGE_URL_CACHE_LIMIT <= 0:
+        return None
+    now = time.monotonic()
+    with _IMAGE_URL_CACHE_LOCK:
+        entry = _IMAGE_URL_CACHE.get(image_url)
+        if entry is None:
+            _IMAGE_URL_CACHE_STATS["miss"] += 1
+            return None
+        stored_at, payload = entry
+        if _IMAGE_URL_CACHE_TTL > 0 and now - stored_at > _IMAGE_URL_CACHE_TTL:
+            _image_url_cache_drop_locked(image_url, payload)
+            _IMAGE_URL_CACHE_STATS["miss"] += 1
+            return None
+        _IMAGE_URL_CACHE.move_to_end(image_url)
+        _IMAGE_URL_CACHE_STATS["hit"] += 1
+        return payload
+
+
+def _image_url_cache_put(image_url: str, payload: bytes) -> None:
+    global _IMAGE_URL_CACHE_USED
+    if _IMAGE_URL_CACHE_LIMIT <= 0 or len(payload) > _IMAGE_URL_CACHE_LIMIT:
+        return
+    with _IMAGE_URL_CACHE_LOCK:
+        previous = _IMAGE_URL_CACHE.pop(image_url, None)
+        if previous is not None:
+            _IMAGE_URL_CACHE_USED = max(
+                0, _IMAGE_URL_CACHE_USED - len(previous[1]))
+        _IMAGE_URL_CACHE[image_url] = (time.monotonic(), payload)
+        _IMAGE_URL_CACHE_USED += len(payload)
+        while _IMAGE_URL_CACHE_USED > _IMAGE_URL_CACHE_LIMIT and _IMAGE_URL_CACHE:
+            _, (_, evicted) = _IMAGE_URL_CACHE.popitem(last=False)
+            _IMAGE_URL_CACHE_USED = max(0, _IMAGE_URL_CACHE_USED - len(evicted))
+
+
+def image_url_cache_statistics() -> Dict[str, int]:
+    """Hit/miss counters, for tests and for logging a slow-image diagnosis.
+
+    used_bytes is recomputed from the live entries rather than reported from the
+    running counter: the counter drives O(1) LRU accounting and would drift if
+    anything cleared the dict directly.
+    """
+    with _IMAGE_URL_CACHE_LOCK:
+        return dict(_IMAGE_URL_CACHE_STATS,
+                    entries=len(_IMAGE_URL_CACHE),
+                    used_bytes=sum(len(payload)
+                                   for _, payload in _IMAGE_URL_CACHE.values()))
 
 _KIMI_K3_THINK_OPEN = "<|open|>think<|sep|>"
 _KIMI_K3_THINK_CLOSE = "<|close|>think<|sep|>"
@@ -1200,9 +1274,18 @@ class FastLLmCompletion:
       scheme = parsed.scheme.lower()
       try:
           if scheme in ("http", "https"):
+              # #776: a repeat turn re-sends the same history image URL, so serve
+              # the bytes from the cache instead of downloading them again.
+              cached = _image_url_cache_get(image_url)
+              if cached is not None:
+                  return self._load_image_from_bytes(cached)
               with urlopen(image_url, timeout = 20) as response:
-                  return self._load_image_from_bytes(response.read())
+                  image_bytes = response.read()
+              _image_url_cache_put(image_url, image_bytes)
+              return self._load_image_from_bytes(image_bytes)
           if scheme == "data":
+              # Not cached: the URL itself carries the payload, so keying on it
+              # would spend as much memory as the decoded image saves.
               if not image_url.startswith("data:image/"):
                   raise ValueError("Only image data URLs are supported.")
               header, encoded = image_url.split(",", 1)
@@ -1218,8 +1301,13 @@ class FastLLmCompletion:
               if (os.name == "nt" and len(file_path) >= 3 and file_path[0] == "/"
                       and file_path[2] == ":"):
                   file_path = file_path[1:]
-              with Image.open(file_path) as image:
-                  return image.convert("RGB")
+              cached = _image_url_cache_get(image_url)
+              if cached is not None:
+                  return self._load_image_from_bytes(cached)
+              with open(file_path, "rb") as handle:
+                  image_bytes = handle.read()
+              _image_url_cache_put(image_url, image_bytes)
+              return self._load_image_from_bytes(image_bytes)
       except ValueError:
           raise
       except Exception as exc:
@@ -3033,19 +3121,25 @@ class FastLLmCompletion:
           return error_check_ret
 
       try:
-          conversation: List[ConversationMessage] = []
-          media = LoadedMedia()
-          if request.system is not None:
-              system_messages, system_media = self._parse_anthropic_message_content(
-                  "system", request.system)
-              conversation.extend(system_messages)
-              media.extend(system_media)
+          # #776: same reason as create_chat_completion -- decoding the images
+          # this turn carries is blocking work, so do it off the event loop.
+          def parse_anthropic_messages():
+              parsed: List[ConversationMessage] = []
+              parsed_media = LoadedMedia()
+              if request.system is not None:
+                  system_messages, system_media = self._parse_anthropic_message_content(
+                      "system", request.system)
+                  parsed.extend(system_messages)
+                  parsed_media.extend(system_media)
 
-          for m in request.messages:
-              messages, message_media = self._parse_anthropic_message_content(
-                  m.role, m.content)
-              conversation.extend(messages)
-              media.extend(message_media)
+              for m in request.messages:
+                  part_messages, message_media = self._parse_anthropic_message_content(
+                      m.role, m.content)
+                  parsed.extend(part_messages)
+                  parsed_media.extend(message_media)
+              return parsed, parsed_media
+
+          conversation, media = await asyncio.to_thread(parse_anthropic_messages)
 
           conversation = self._normalize_system_messages(conversation)
           if len(conversation) == 0:
@@ -3220,19 +3314,28 @@ class FastLLmCompletion:
          request.messages.append({"role": "user", "content": request.prompt})
       try:
           # print("request", str(request))
-          conversation: List[ConversationMessage] = []
-          media = LoadedMedia()
-          for m in request.messages:
-              messages, message_media = self._parse_chat_message_content(
-                  m["role"], m.get("content"),
-                  tool_calls=m.get("tool_calls"),
-                  tool_call_id=m.get("tool_call_id"),
-                  name=m.get("name"),
-                  reasoning_content=m.get(
-                      "reasoning_content", m.get("reasoning")))
+          # #776: message parsing decodes every image the turn carries, and a
+          # client re-sends its history images on every turn.  That is blocking
+          # URL/PIL work happening on the event loop, so a single slow image
+          # host used to stall unrelated text-only requests for its whole
+          # download.  Parse off-loop; the native launch below stays on the
+          # main thread because its pending state is TLS.
+          def parse_request_messages():
+              parsed: List[ConversationMessage] = []
+              parsed_media = LoadedMedia()
+              for m in request.messages:
+                  part_messages, message_media = self._parse_chat_message_content(
+                      m["role"], m.get("content"),
+                      tool_calls=m.get("tool_calls"),
+                      tool_call_id=m.get("tool_call_id"),
+                      name=m.get("name"),
+                      reasoning_content=m.get(
+                          "reasoning_content", m.get("reasoning")))
+                  parsed.extend(part_messages)
+                  parsed_media.extend(message_media)
+              return parsed, parsed_media
 
-              conversation.extend(messages)
-              media.extend(message_media)
+          conversation, media = await asyncio.to_thread(parse_request_messages)
 
           if self._is_qwen3_5_model() and any(
                   message.role == "developer" for message in conversation):
