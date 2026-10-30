@@ -1985,6 +1985,8 @@ namespace {
         bool writeCandidates, useCandidates;
         int *candidateBlocks = nullptr, *candidateCount = nullptr;
         int candidateBlockSize = 0;
+        const uint8_t *packedKeys = nullptr;
+        int keyMode = 0, keyRowBytes = 0, keyVectorUnpack = 0;
     };
 
     // Preserve every selected block, including threshold ties. Unlike a fixed
@@ -2052,6 +2054,8 @@ namespace {
         if (BATCHED) {
             const auto item = items[b];
             q = item.query; k = item.keys; weights = item.weights; out = item.scores;
+            k8 = item.packedKeys; kMode = item.keyMode; kRowBytes = item.keyRowBytes;
+            vecUnpack = item.keyVectorUnpack;
             heads = item.heads; m = item.count; startPos = item.position; b = 0;
             if constexpr (BLOCK_MAX) {
                 blockScores = item.blockScores; scoreBlocks = item.blocks;
@@ -4513,18 +4517,12 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
     // Reuse the fake-quantization grid, including the subnormal E4M3 case
     // where the quantized maximum alone would otherwise halve the scale.
     template <typename T>
-    __global__ void V41QuantizeKVKernel(const T *input, uint8_t *output, int rows, int dim,
-                                        int quantMode, int blockSize, int rowBytes) {
-        const int row = blockIdx.x;
-        if (row >= rows) {
-            return;
-        }
+    __device__ __forceinline__ void V41QuantizeKVRow(const T *src, uint8_t *dst, int dim,
+                                   int quantMode, int blockSize) {
         const int nblocks = dim / blockSize;
         const int groups = kKvQuantThreads / blockSize;
         const int gid = threadIdx.x / blockSize;
         const int lane = threadIdx.x % blockSize;
-        const T *src = input + (uint64_t)row * dim;
-        uint8_t *dst = output + (uint64_t)row * rowBytes;
         uint8_t *scales = dst + (quantMode == 1 ? dim : dim / 2);
         const float qmax = quantMode == 1 ? 448.0f : 6.0f;
         // 固定迭代次数，保证组内所有 lane 都参与 __shfl（否则归约会读到未定义值）
@@ -4566,6 +4564,15 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
                 }
             }
         }
+    }
+
+    template <typename T>
+    __global__ void V41QuantizeKVKernel(const T *input, uint8_t *output, int rows, int dim,
+                                      int quantMode, int blockSize, int rowBytes) {
+        const int row = blockIdx.x;
+        if (row < rows)
+            V41QuantizeKVRow(input + (uint64_t)row * dim,
+                            output + (uint64_t)row * rowBytes, dim, quantMode, blockSize);
     }
 
     // ---------------- WindowStore ----------------
@@ -6746,6 +6753,13 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
             indexScores + (size_t)i * c.maxKeys, blockScores + (size_t)i * maxBlocks,
             cand, tk, c.indexHeads, count, min(count, c.topK), r.position, blocks,
             c.writeCandidates, c.useCandidates};
+        if (c.indexMode) {
+            index[i].keys = nullptr;
+            index[i].packedKeys = static_cast<const uint8_t *>(r.indexK);
+            index[i].keyMode = c.indexMode;
+            index[i].keyRowBytes = c.indexRowBytes;
+            index[i].keyVectorUnpack = c.vectorUnpack;
+        }
         index[i].candidateBlockSize = c.blockSize;
         if (candidateBlocks) {
             index[i].candidateBlocks = candidateBlocks + (size_t)i * maxBlocks;
@@ -6758,6 +6772,14 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
     a.chunkOffset = c.verifying ? i : 0;
     a.ringKV = static_cast<const __nv_bfloat16 *>(r.windowKV);
     a.compressedKV = static_cast<const __nv_bfloat16 *>(r.compressedKV);
+    if (c.ringMode) {
+        a.ringKV = nullptr; a.compressedKV = nullptr;
+        a.ringKV8 = static_cast<const uint8_t *>(r.windowKV);
+        a.compressedKV8 = static_cast<const uint8_t *>(r.compressedKV);
+        a.ringMode = c.ringMode; a.ringRowBytes = c.ringRowBytes;
+        a.cmpMode = c.cmpMode; a.cmpRowBytes = c.cmpRowBytes;
+        a.vecUnpack = c.vectorUnpack && c.ringRowBytes % 16 == 0 && c.cmpRowBytes % 16 == 0;
+    }
     a.indices = tk; a.output = out;
     a.scores = attentionScores + (size_t)i * c.heads * tiles * kMmaNC;
     a.cap = count; a.topWidth = min(count, c.topK); a.startPos = r.position;
@@ -6787,7 +6809,7 @@ __global__ void V41FullDecodePrepareKernel(
     // This lane owns the transformed element. Saving it here preserves the
     // exact KV bytes and avoids a separate launch after attention. The saved
     // rows are speculative scratch; committed ring/tail storage is untouched.
-    if (kv && c.verifying)
+    if (kv && c.verifying && !c.ringMode)
         static_cast<__nv_bfloat16 *>(b.savedKV)[(size_t)token * 512 + threadIdx.x] = input[threadIdx.x];
 }
 
@@ -6821,6 +6843,42 @@ __global__ void V41FullDecodeAppend(const FastllmV41FullDecodeRequest *requests,
     if (indexSource && d < 128)
         static_cast<__nv_bfloat16 *>(r.indexK)[(size_t)row * 128 + d] =
             keys[(size_t)blockIdx.x * 128 + d];
+}
+
+// Quantization uses the ordinary storage encoder, including scale edge cases.
+// Only complete compressor groups are appended; speculative ring rows remain
+// in scratch until acceptance selects the prefix to commit.
+__global__ void V41FullVerifyPackWindow(FastllmV41FullDecodeConfig c,
+                                      FastllmV41FullDecodeBuffers b) {
+    const int row = blockIdx.x;
+    V41QuantizeKVRow(static_cast<const __nv_bfloat16 *>(b.kv) + (size_t)row * 512,
+        static_cast<uint8_t *>(b.savedKV) + (size_t)row * c.ringRowBytes, 512, 1, 32);
+}
+
+__global__ void V41FullDecodeAppendPacked(FastllmV41FullDecodeConfig c,
+        FastllmV41FullDecodeBuffers b, const FastllmV41FullDecodeRequest *requests) {
+    const int token = blockIdx.x;
+    const auto r = requests[token];
+    if ((r.position + 1) % c.ratio) return;
+    const int row = r.position / c.ratio;
+    V41QuantizeKVRow(static_cast<const __nv_bfloat16 *>(b.latents) + (size_t)token * 512,
+        static_cast<uint8_t *>(r.compressedKV) + (size_t)row * c.cmpRowBytes,
+        512, c.cmpMode, c.cmpMode == 3 ? 16 : 32);
+    if (c.indexSource)
+        V41QuantizeKVRow(static_cast<const __nv_bfloat16 *>(b.newIndexKeys) + (size_t)token * 128,
+            static_cast<uint8_t *>(r.indexK) + (size_t)row * c.indexRowBytes, 128, c.indexMode, 32);
+}
+
+// Store after attention has consumed the old ring. The current row remains
+// BF16 during attention, matching ordinary decode's quantization boundary.
+__global__ void V41FullDecodeStorePackedRing(FastllmV41FullDecodeConfig c,
+        FastllmV41FullDecodeBuffers b, const FastllmV41FullDecodeRequest *requests) {
+    const int row = blockIdx.x;
+    const auto request = requests[row];
+    auto *dst = static_cast<uint8_t *>(request.windowKV) +
+        size_t(request.position % c.window) * c.ringRowBytes;
+    const auto *src = static_cast<const uint8_t *>(b.savedKV) + size_t(row) * c.ringRowBytes;
+    for (int i = threadIdx.x; i < c.ringRowBytes; i += blockDim.x) dst[i] = src[i];
 }
 
 // Verification never overwrites the committed ring or compressor tail.
@@ -6883,6 +6941,9 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         c.indexHeads <= 0 || c.ratio < 0 || c.ratio > 2 || c.window <= 0 ||
         c.maxKeys <= 0 || c.topK <= 0 || c.topK > c.maxKeys || c.blockSize <= 0 ||
         c.ropeDim <= 0 || c.ropeDim > 128 || (c.ropeDim & 1) ||
+        (c.ringMode && (!b.savedKV || c.ringMode != 1 || c.ringRowBytes != 528 ||
+            !((c.cmpMode == 3 && c.cmpRowBytes == 288 && c.indexMode == 2 && c.indexRowBytes == 68) ||
+              (c.cmpMode == 1 && c.cmpRowBytes == 528 && c.indexMode == 1 && c.indexRowBytes == 132)))) ||
         !b.q || !b.kv || !b.output || !b.sink ||
         (c.verifying && (!b.savedKV || (c.kvSource &&
             (!b.savedRawKV || (c.ratio == 2 && !b.savedRawScore))))) ||
@@ -6895,7 +6956,8 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         (b.candidateBlocks && (!c.indexSource || !c.useCandidates || c.writeCandidates)))
         return nullptr;
     auto p = std::make_unique<V41FullDecodePlan>();
-    p->config = c; p->buffers = b; p->device = FastllmCudaGetDevice();
+    p->config = c; p->config.vectorUnpack = V41Fp4VecUnpack();
+    p->buffers = b; p->device = FastllmCudaGetDevice();
     p->tiles = (c.window + (c.ratio ? c.topK : 0) + kMmaNC - 1) / kMmaNC;
     const int heads = (c.heads + kMmaHeads - 1) / kMmaHeads;
     // Verification rows use the same independent QK tiles and value-dimension
@@ -6918,7 +6980,7 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
     // The full verification plan uses BF16 KV. On SM90, overlap each
     // 64-candidate tile's math with the next KV/score gather. Keep the
     // existing path for other architectures, decode and other head groups.
-    p->pvPipeline = c.verifying && c.batch >= 2 && c.batch <= 8 && c.heads == 8 &&
+    p->pvPipeline = !c.ringMode && c.verifying && c.batch >= 2 && c.batch <= 8 && c.heads == 8 &&
         V41IsSm<9, 0>() && V41MmaKernelReady<
             V41SparseAttentionMmaKernel<8, true, true, true>, kMmaThreads,
             sizeof(V41MmaPvPipelineShared<8>)>();
@@ -6929,7 +6991,7 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         sizeof(V41MmaScoresPrefetchShared)>();
     p->wideTopKMerge = c.batch <= 8 &&
         V41MmaKernelReady<V41TopKKernel<true, 2, 1024>, 1024>();
-    p->indexPrefetch = c.indexSource && !c.useCandidates && c.indexHeads <= 32 &&
+    p->indexPrefetch = !c.indexMode && c.indexSource && !c.useCandidates && c.indexHeads <= 32 &&
         V41IsSm<9, 0>() && V41MmaKernelReady<
             V41IndexerScoreDecodeMmaKernel<true, true, false, false, true>, 256>();
     p->wideCandidateSelect = c.writeCandidates && c.batch <= 8 &&
@@ -6939,7 +7001,7 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<true, true, false, false, false, true>, 256>();
     if (p->fuseIndexBlocks && p->indexPrefetch &&
         !V41MmaKernelReady<V41IndexerScoreDecodeMmaKernel<true, true, false, false, true, true>, 256>()) p->indexPrefetch = false;
-    p->indexPairs = c.verifying && c.batch >= 2 && c.batch <= 8 && c.indexSource &&
+    p->indexPairs = !c.indexMode && c.verifying && c.batch >= 2 && c.batch <= 8 && c.indexSource &&
         !c.useCandidates && c.indexHeads <= 32 &&
         V41MmaKernelReady<V41IndexerScorePairKernel<false>, 256, sizeof(V41PairedIndexShared)>() &&
         (!p->fuseIndexBlocks ||
@@ -7058,6 +7120,8 @@ bool FastllmCudaV41PrepareFullDecode(void *handle) {
         c, b, p->requests, p->transforms, p->index, p->attention,
         p->indexScores, p->blockScores, p->attentionScores, p->tiles, p->rope,
         p->candidateBlocks, p->candidateCounts);
+    if (c.ringMode)
+        V41FullVerifyPackWindow<<<c.batch, kKvQuantThreads, 0, cudaStreamPerThread>>>(c, b);
     if (c.kvSource) {
         if (c.verifying)
             V41FullVerifyGather<<<c.batch, 512, 0, cudaStreamPerThread>>>(c, b, p->requests);
@@ -7081,7 +7145,9 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
         V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3(1, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 2, p->rope, c.ropeDim, c.window);
         if (c.indexSource)
             V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3(1, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms + 3, p->rope, c.ropeDim, c.window);
-        V41FullDecodeAppend<<<c.batch, 512, 0, cudaStreamPerThread>>>(p->requests,
+        if (c.ringMode)
+            V41FullDecodeAppendPacked<<<c.batch, kKvQuantThreads, 0, cudaStreamPerThread>>>(c, b, p->requests);
+        else V41FullDecodeAppend<<<c.batch, 512, 0, cudaStreamPerThread>>>(p->requests,
             static_cast<const __nv_bfloat16 *>(b.latents), static_cast<const __nv_bfloat16 *>(b.newIndexKeys), c.ratio, c.indexSource);
     }
     if (c.indexSource) {
@@ -7157,10 +7223,12 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
         p->fused ? V41FullDecodeAttention<1, false>(*p) : V41FullDecodeAttention<1, true>(*p);
     if (!attentionOk) return false;
     // Independent descriptors share one launch; each row retains its original math.
-    if (c.verifying) {
+    if (c.verifying || c.ringMode) {
         V41DecodeTransformsKernel<kFullDecodeTransforms><<<dim3(c.heads, c.batch), 512, 0, cudaStreamPerThread>>>(p->transforms, p->rope, c.ropeDim, c.window);
     } else {
         V41DecodeTransformsKernel<kFullDecodeTransforms, 2><<<dim3(c.heads, c.batch * 2), 512, 0, cudaStreamPerThread>>>(p->transforms, p->rope, c.ropeDim, c.window);
     }
+    if (!c.verifying && c.ringMode)
+        V41FullDecodeStorePackedRing<<<c.batch, 256, 0, cudaStreamPerThread>>>(c, b, p->requests);
     return V41CheckLaunch("FullDecodeFinish");
 }

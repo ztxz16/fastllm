@@ -6,14 +6,15 @@ namespace {
 __global__ void V41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layers, int accepted) {
     const auto layer = layers[blockIdx.x];
     const auto request = layer.requests[0];
-    const auto *input = static_cast<const uint16_t *>(layer.savedKV);
-    auto *window = static_cast<uint16_t *>(request.windowKV);
+    const auto *input = static_cast<const uint8_t *>(layer.savedKV);
+    auto *window = static_cast<uint8_t *>(request.windowKV);
     // Only the last window rows survive if a future configuration uses a
     // smaller ring than the accepted prefix; each destination is written once.
     const int firstRow = accepted > layer.window ? accepted - layer.window : 0;
-    for (int i = firstRow * 512 + threadIdx.x; i < accepted * 512; i += blockDim.x) {
-        const int row = i / 512, column = i % 512;
-        window[((request.position + row) % layer.window) * 512 + column] = input[i];
+    const int bytes = layer.ringRowBytes;
+    for (int i = firstRow * bytes + threadIdx.x; i < accepted * bytes; i += blockDim.x) {
+        const int row = i / bytes, column = i % bytes;
+        window[((request.position + row) % layer.window) * bytes + column] = input[i];
     }
     // Full-verify plans only use compression ratios 1 and 2. The saved raw
     // stream includes the preceding uncompressed row when the start is odd.
