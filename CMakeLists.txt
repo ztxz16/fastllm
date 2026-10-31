@@ -1241,6 +1241,11 @@ if (UNIT_TEST)
     target_link_libraries(paged_cache_lru_test PRIVATE fastllm)
     add_test(NAME paged_cache_lru COMMAND paged_cache_lru_test)
 
+    add_executable(paged_cache_batch_test test/basic/test_paged_cache_batch.cpp)
+    target_link_libraries(paged_cache_batch_test PRIVATE fastllm)
+    add_test(NAME paged_cache_batch COMMAND paged_cache_batch_test)
+    set_tests_properties(paged_cache_batch PROPERTIES TIMEOUT 30)
+
     add_executable(paged_prefix_preview_test test/basic/test_paged_prefix_preview.cpp)
     target_link_libraries(paged_prefix_preview_test PRIVATE fastllm)
     add_test(NAME paged_prefix_preview COMMAND paged_prefix_preview_test)

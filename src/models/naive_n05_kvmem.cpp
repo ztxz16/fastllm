@@ -63,6 +63,10 @@ void NaiveN05FlashModel::OnResponseContextFinished(ResponseContext *context) {
     finishTrace.Next("finish.detach_descriptors");
     // Retain the lease until all borrowed descriptors are detached. Forward
     // completion already synchronized the rank streams before publication.
+    std::vector<Data *> leaves;
+    for (auto &pair : context->pastKeyValues) for (Data *root : {&pair.first, &pair.second})
+        for (auto &entry : root->multiDeviceDatas) leaves.push_back(entry.second);
+    pagedCacheExecutor.ReleaseReferences(leaves, GetThreads());
     auto lease = std::move(context->pastKeyValues.front().first.kvStorageOwner);
     for (auto &pair : context->pastKeyValues) for (Data *root : {&pair.first, &pair.second}) {
         // The root only mirrors rank zero after generic prefix restoration.

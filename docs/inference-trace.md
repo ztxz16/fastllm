@@ -92,3 +92,20 @@ python -m unittest discover -s test/api -p 'test_inference_trace.py' -v
 不分配内存、不读时钟；采样时使用固定 128 项存储，超限在 `dropped_metrics` 计数。
 计时本身仍有成本，应同时检查抽样/未抽样步骤；该日志用于归因，不改变调度、采样
 或 KV 生命周期。序列化成本仍计入下一步的 `previous_step_trace_emit_ms`。
+
+
+### Paged-cache publication and retirement
+
+Long prefix publication and page-reference release can use a model-owned persistent
+CPU worker group, bounded by the existing thread setting and at most eight workers
+including the caller. Small jobs stay serial. Jobs for the same cache manager keep
+their input order; manager locks, page generations and LRU updates are unchanged.
+Request/cache ownership remains with the caller until the group completes. CUDA
+frees and descriptor destruction remain on the calling thread.
+
+Sampled diagnostics use `paged_publish_workers_sum` and `paged_release_workers_sum`
+for concurrent worker intervals. These are summed work, not elapsed scheduler time;
+do not add them to the parent `postprocess`/`retire_requests` intervals. The existing
+trace/detail switches remain default-off; no additional environment setting is
+required. `history.snapshot_hashes` measures shared-prefix hashing for multiple SWA
+checkpoints; per-snapshot token copies still appear in `history.snapshot_copy_hash`.

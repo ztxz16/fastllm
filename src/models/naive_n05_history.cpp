@@ -235,13 +235,29 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
         detail->Count("history.snapshots", snapshots.size());
         detail->Count("history.entries_before_publish", prefixHistory.size());
     }
+    // Several checkpoints share the same immutable token prefix. Hash it
+    // once in increasing length order, retaining the exact uint64 polynomial
+    // and token vectors used by collision checks and published snapshots.
+    recordTrace.Next("history.snapshot_hashes");
+    std::map<int, uint64_t> tokenHashes;
+    for (const auto &snapshot : snapshots)
+        if (snapshot->tokens.empty() && (int)context->allTokens.size() >= snapshot->length)
+            tokenHashes.emplace(snapshot->length, 0);
+    size_t hashed = 0;
+    uint64_t tokenHash = 0;
+    for (auto &entry : tokenHashes) {
+        for (; hashed < (size_t)entry.first; ++hashed)
+            tokenHash = tokenHash * PagedCacheManager::TokenHashMultiplier +
+                        (uint64_t)context->allTokens[hashed];
+        entry.second = tokenHash;
+    }
     for (const auto &snapshot : snapshots) {
         recordTrace.Next("history.snapshot_copy_hash");
         if ((int)context->allTokens.size() < snapshot->length) continue;
         if (snapshot->tokens.empty()) {
             if (detail) detail->Count("history.copied_tokens", snapshot->length);
             snapshot->tokens.assign(context->allTokens.begin(), context->allTokens.begin() + snapshot->length);
-            snapshot->tokenHash = PagedCacheManager::HashTokenPage(snapshot->tokens.data(), snapshot->length);
+            snapshot->tokenHash = tokenHashes.at(snapshot->length);
         }
         recordTrace.Next("history.snapshot_pool");
         if (!snapshot->fullPool) {

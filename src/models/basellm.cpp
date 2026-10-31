@@ -734,6 +734,7 @@ namespace fastllm {
 
         recordTrace.Next("record.paged_publish");
         std::map<int, std::vector<uint64_t>> recordHashes;
+        std::vector<PagedCacheBatchExecutor::Publication> publications;
         std::function<void(Data&)> recordPagedCache = [&](Data &cache) {
             if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
                 bool recordedLocal = false;
@@ -758,8 +759,7 @@ namespace fastllm {
                 for (int i = hashes.size(); i < count; ++i)
                     hashes.push_back(PagedCacheManager::HashTokenPage(this->allTokens.data() + i * pageLen, pageLen));
                 if (detail) detail->Count("record.page_count", pages.size());
-                descriptorTrace.Next("record.trie_publish");
-                cache.pagedKVCacheData->RecordPrefix(hashes, pages);
+                publications.push_back({cache.pagedKVCacheData, &hashes, std::move(pages)});
             }
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -774,6 +774,9 @@ namespace fastllm {
             recordPagedCache(kvFirst);
             recordPagedCache(kvSecond);
         }
+        // Hashes are complete and stable before workers access them. Each
+        // manager retains its lock, page-generation checks and publication LRU.
+        model->pagedCacheExecutor.Publish(publications, GetThreads());
     }
 
     PagedCacheManager* basellm::GetPagedKVCacheManager(int layerIndex, bool isKey) const {

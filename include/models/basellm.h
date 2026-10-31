@@ -3,6 +3,7 @@
 #define FASTLLM_BASELLM_H
 
 #include "fastllm.h"
+#include "utils/paged_cache_batch.h"
 #include "kvmem.h"
 #include "contextconfig.h"
 #include "baseblock.h"
@@ -675,6 +676,8 @@ namespace fastllm {
 
         void RemoveResponseContext(int handleId);
 
+        // Shared by publication/retirement; tasks finish before request ownership changes.
+        PagedCacheBatchExecutor pagedCacheExecutor;
         std::thread *mainLoop = nullptr;
         std::mutex mainLoopLocker, dictLocker, forwardLocker;
         std::condition_variable dictCV;
