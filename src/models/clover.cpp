@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include "devices/cuda/fastllm-clover.h"
 #include "devices/cuda/fastllm-cuda-norm.h"
+#include "devices/cuda/fastllm-moe.h"
 #endif
 
 namespace fastllm {
@@ -498,12 +499,15 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
         PrepareCloverData(middle, dataType, {t, num_experts_per_tok, intermediate}, cudaDevice);
         PrepareCloverData(parts, dataType, {t, num_experts_per_tok, embed_dim}, cudaDevice);
         PrepareCloverData(output, dataType, input.dims, cudaDevice);
-        if (t >= 4) PrepareCloverData(expertWorkspace, INT32,
-            {num_experts * (t + 1) + num_experts + (t * num_experts_per_tok + 15) / 16 + 1}, cudaDevice);
-        size_t packedBytes = dataType == BFLOAT16
-            ? FastllmCudaCloverExpertsPackedBytes(t, embed_dim, intermediate, num_experts, num_experts_per_tok) : 0;
+        if (t >= 4) {
+            size_t bytes = FastllmCudaMoe16WorkspaceBytes(t, embed_dim, intermediate,
+                num_experts, num_experts_per_tok, dataType == FLOAT16);
+            PrepareCloverData(expertWorkspace, INT32, {int((bytes + 3) / 4)}, cudaDevice);
+        }
+        size_t packedBytes = FastllmCudaMoe16PackedBytes(t, embed_dim, intermediate,
+            num_experts, num_experts_per_tok, dataType == FLOAT16);
         if (packedBytes && (t > blockSize || graphPath)) PrepareCloverData(packedExperts, INT32, {int((packedBytes + 3) / 4)}, cudaDevice);
-        Check(FastllmCudaCloverExperts(input.cudaData, weight[p + "experts.gate_up_proj"].cudaData,
+        Check(FastllmCudaMoe16(input.cudaData, weight[p + "experts.gate_up_proj"].cudaData,
                                        weight[p + "experts.down_proj"].cudaData, (int *)ids.cudaData,
                                        (float *)scores.cudaData, middle.cudaData, parts.cudaData,
                                        output.cudaData, t, embed_dim, intermediate, num_experts,

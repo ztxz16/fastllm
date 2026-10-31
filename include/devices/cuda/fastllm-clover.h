@@ -91,22 +91,6 @@ bool FastllmCudaCloverRoute(const void *logits, int *indices, float *scores,
     int *scratchIds, float *scratchScores, unsigned char *allowed,
     int batch, int tokens, int experts, int topk, float coresetTopP,
     void *stream = nullptr, int logitsStride = 0, bool fp16 = false);
-// Resident packed 16-bit [E,2I,H] / [E,H,I] experts. Scratch uses the same type,
-// [M,K,I] and [M,K,H]. Each down contribution rounds AFTER route weighting.
-// Optional INT32 workspace: E*(M+1) + E + ceil(M*K/16) + 1 elements.
-// It enables grouped Tensor Core products for blocks with at least four rows.
-// Optional 128-byte-aligned packed scratch enables native SM90 TMA for
-// aligned blocks. The caller may omit it for small eager blocks; zero means
-// the shape/compiled architecture requires the generic path.
-std::size_t FastllmCudaCloverExpertsPackedBytes(int rows, int hidden, int intermediate, int experts, int topk);
-// Fused shared expert epilogue. shared is ungated [rows,hidden], sharedGate
-// is [rows], optionally strided; both use the selected 16-bit type and must
-// be null together. Retain sigmoid, product, routed-sum and final-add rounding.
-bool FastllmCudaCloverExperts(const void *input, const void *gateUp, const void *down, const int *indices,
-    const float *scores, void *middle, void *parts, void *output, int rows, int hidden,
-    int intermediate, int experts, int topk, void *stream = nullptr, int *workspace = nullptr,
-    void *packed = nullptr, const void *shared = nullptr, const void *sharedGate = nullptr, int sharedGateStride = 1, bool fp16 = false);
-
 // Response-only penalties apply in FP32 before sampling. rowBias stores
 // [stop-token bias, thinking-end bias] per row; counts never include the prompt.
 struct CloverCudaPenalty {

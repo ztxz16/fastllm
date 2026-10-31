@@ -488,6 +488,7 @@ if (USE_CUDA)
         src/devices/cuda/models/deepseekv41-reference.cu
         src/devices/cuda/models/deepseekv41-dspark-kernels.cu
         src/devices/cuda/moe/fastllm-moe-bf16.cu
+        src/devices/cuda/moe/fastllm-moe16.cu
         src/devices/cuda/fastllm-norm.cu
         src/devices/cuda/fastllm-router.cu
         src/devices/cuda/models/clover-kernels.cu
@@ -516,12 +517,12 @@ if (USE_CUDA)
         list(APPEND FASTLLM_CUDA_SM90_SOURCES
             src/devices/cuda/models/naive-n05-qkv.cu
             src/devices/cuda/models/naive-n05-indexer.cu
-            src/devices/cuda/models/clover-moe-wgmma.cu)
+            src/devices/cuda/moe/fastllm-moe16-wgmma.cu)
         set_property(SOURCE src/devices/cuda/models/naive-n05-kernels.cu
             APPEND PROPERTY COMPILE_DEFINITIONS
                 FASTLLM_ENABLE_NAIVE_QKV_SM90 FASTLLM_ENABLE_NAIVE_INDEXER_SM90)
-        set_property(SOURCE src/devices/cuda/models/clover-kernels.cu
-            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_CLOVER_MOE_SM90)
+        set_property(SOURCE src/devices/cuda/moe/fastllm-moe16.cu
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_MOE16_SM90)
     endif()
 
     # EP4/EP8 uses an isolated, pinned DeepGEMM source subset. Compile the kernel
@@ -2990,6 +2991,14 @@ if (UNIT_TEST)
         add_test(NAME qwen4TpMtpCollective COMMAND qwen4TpMtpCollectiveRegression)
         set_tests_properties(qwen4TpMtpCollective PROPERTIES
             LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(moe16Regression test/ops/moe16Regression.cpp)
+        target_link_libraries(moe16Regression fastllm)
+        target_include_directories(moe16Regression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME moe16_bf16 COMMAND moe16Regression)
+        add_test(NAME moe16_fp16 COMMAND moe16Regression fp16)
+        set_tests_properties(moe16_bf16 moe16_fp16 PROPERTIES
+            LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
         foreach(component Sampling Gdn Experts Graph)
             set(target clover${component}Regression)

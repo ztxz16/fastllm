@@ -5,39 +5,39 @@
 #include <cuda_bf16.h>
 
 namespace {
-constexpr int CloverWgmmaRows = 64, CloverWgmmaColumns = 64, CloverWgmmaK = 64, CloverWgmmaStages = 3;
-template<bool Gate> constexpr int CloverWgmmaSharedBytes() {
-    return CloverWgmmaStages * (CloverWgmmaRows + CloverWgmmaColumns * (Gate ? 2 : 1)) *
-        CloverWgmmaK * sizeof(__nv_bfloat16);
+constexpr int Moe16WgmmaRows = 64, Moe16WgmmaColumns = 64, Moe16WgmmaK = 64, Moe16WgmmaStages = 3;
+template<bool Gate> constexpr int Moe16WgmmaSharedBytes() {
+    return Moe16WgmmaStages * (Moe16WgmmaRows + Moe16WgmmaColumns * (Gate ? 2 : 1)) *
+        Moe16WgmmaK * sizeof(__nv_bfloat16);
 }
-struct CloverExpertMaps { CUtensorMap input, weight; };
-__device__ __forceinline__ unsigned CloverSharedAddress(const void *p) {
+struct Moe16ExpertMaps { CUtensorMap input, weight; };
+__device__ __forceinline__ unsigned Moe16SharedAddress(const void *p) {
     return (unsigned)__cvta_generic_to_shared(p);
 }
-__device__ __forceinline__ void CloverTmaLoad(void *dst, const CUtensorMap *map,
+__device__ __forceinline__ void Moe16TmaLoad(void *dst, const CUtensorMap *map,
         int k, int row, unsigned long long *barrier) {
 #if __CUDA_ARCH__ >= 900
     asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2,%3}], [%4];" ::
-        "r"(CloverSharedAddress(dst)), "l"(map), "r"(k), "r"(row),
-        "r"(CloverSharedAddress(barrier)) : "memory");
+        "r"(Moe16SharedAddress(dst)), "l"(map), "r"(k), "r"(row),
+        "r"(Moe16SharedAddress(barrier)) : "memory");
 #endif
 }
-__device__ __forceinline__ void CloverTmaWait(unsigned long long *barrier, int phase) {
+__device__ __forceinline__ void Moe16TmaWait(unsigned long long *barrier, int phase) {
 #if __CUDA_ARCH__ >= 900
     asm volatile("{ .reg .pred p; wait_loop: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1; @!p bra wait_loop; }" ::
-        "r"(CloverSharedAddress(barrier)), "r"(phase) : "memory");
+        "r"(Moe16SharedAddress(barrier)), "r"(phase) : "memory");
 #endif
 }
 // Instruction and shared-descriptor encoding follow NVIDIA PTX ISA:
 // https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-instructions
 // CUDA/PTX implementation; no CUTLASS or SGLang runtime dependency.
-__device__ __forceinline__ unsigned long long CloverWgmmaDescriptor(const void *p) {
+__device__ __forceinline__ unsigned long long Moe16WgmmaDescriptor(const void *p) {
     // 128-byte swizzle, K-major BF16: one 16-byte leading unit and a
     // 64-unit stride between eight-row groups. Each K slice starts at p.
     return (1ull << 62) | (64ull << 32) | (1ull << 16) |
-        ((CloverSharedAddress(p) >> 4) & 0x3fff);
+        ((Moe16SharedAddress(p) >> 4) & 0x3fff);
 }
-__device__ __forceinline__ void CloverWgmma64(float *c, unsigned long long a, unsigned long long b) {
+__device__ __forceinline__ void Moe16Wgmma64(float *c, unsigned long long a, unsigned long long b) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
     asm volatile("wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, %32, %33, 1, 1, 1, 0, 0;" :
         "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7]),
@@ -47,7 +47,7 @@ __device__ __forceinline__ void CloverWgmma64(float *c, unsigned long long a, un
 #endif
 }
 
-__device__ __forceinline__ void CloverStoreExpertPair(__nv_bfloat16 *p, float x, float y) {
+__device__ __forceinline__ void Moe16StoreExpertPair(__nv_bfloat16 *p, float x, float y) {
     // Preserve both BF16 rounding boundaries; tensor views may be unaligned.
     auto v = __floats2bfloat162_rn(x, y);
     if ((reinterpret_cast<uintptr_t>(p) & 3) == 0)
@@ -59,11 +59,11 @@ __device__ __forceinline__ void CloverStoreExpertPair(__nv_bfloat16 *p, float x,
 }
 
 template<bool Gate>
-__global__ void CloverWgmmaExpertGemm(const __grid_constant__ CloverExpertMaps maps,
+__global__ void Moe16WgmmaExpertGemm(const __grid_constant__ Moe16ExpertMaps maps,
         const float *scores, const int *workspace, __nv_bfloat16 *output,
         __nv_bfloat16 *packedMiddle, int rows, int hidden, int intermediate, int experts) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
-    constexpr int M = CloverWgmmaRows, N = CloverWgmmaColumns, K = CloverWgmmaK, Stages = CloverWgmmaStages;
+    constexpr int M = Moe16WgmmaRows, N = Moe16WgmmaColumns, K = Moe16WgmmaK, Stages = Moe16WgmmaStages;
     constexpr int StageElements = (M + N * (Gate ? 2 : 1)) * K;
     const int *tiles = workspace + (size_t)experts * (rows + 1);
     if (blockIdx.y >= tiles[0]) return;
@@ -77,7 +77,7 @@ __global__ void CloverWgmmaExpertGemm(const __grid_constant__ CloverExpertMaps m
     if (tid == 0) {
 #pragma unroll
         for (int i = 0; i < Stages; ++i)
-            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(CloverSharedAddress(barriers + i)) : "memory");
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(Moe16SharedAddress(barriers + i)) : "memory");
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
     __syncthreads();
@@ -87,10 +87,10 @@ __global__ void CloverWgmmaExpertGemm(const __grid_constant__ CloverExpertMaps m
             auto *ptr = storage + stage * StageElements;
             int weightRow = expert * outputWidth * (Gate ? 2 : 1) + column;
             asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::
-                "r"(CloverSharedAddress(barriers + stage)), "r"(StageElements * 2) : "memory");
-            CloverTmaLoad(ptr, &maps.input, step * K, blockIdx.y * M, barriers + stage);
-            CloverTmaLoad(ptr + M * K, &maps.weight, step * K, weightRow, barriers + stage);
-            if (Gate) CloverTmaLoad(ptr + (M + N) * K, &maps.weight, step * K, weightRow + outputWidth, barriers + stage);
+                "r"(Moe16SharedAddress(barriers + stage)), "r"(StageElements * 2) : "memory");
+            Moe16TmaLoad(ptr, &maps.input, step * K, blockIdx.y * M, barriers + stage);
+            Moe16TmaLoad(ptr + M * K, &maps.weight, step * K, weightRow, barriers + stage);
+            if (Gate) Moe16TmaLoad(ptr + (M + N) * K, &maps.weight, step * K, weightRow + outputWidth, barriers + stage);
         }
     };
     load(0); load(1);
@@ -98,13 +98,13 @@ __global__ void CloverWgmmaExpertGemm(const __grid_constant__ CloverExpertMaps m
     asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
     for (int step = 0; step * K < inputWidth; ++step) {
         int stage = step % Stages;
-        CloverTmaWait(barriers + stage, (step / Stages) & 1);
+        Moe16TmaWait(barriers + stage, (step / Stages) & 1);
         auto *a = storage + stage * StageElements, *b = a + M * K;
 #pragma unroll
         for (int j = 0; j < K; j += 16) {
-            auto ad = CloverWgmmaDescriptor(a + j), bd = CloverWgmmaDescriptor(b + j);
-            CloverWgmma64(acc, ad, bd);
-            if (Gate) CloverWgmma64(up, ad, CloverWgmmaDescriptor(b + N * K + j));
+            auto ad = Moe16WgmmaDescriptor(a + j), bd = Moe16WgmmaDescriptor(b + j);
+            Moe16Wgmma64(acc, ad, bd);
+            if (Gate) Moe16Wgmma64(up, ad, Moe16WgmmaDescriptor(b + N * K + j));
         }
         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
         // Keep the newest group in flight. At step zero, stage two is unused;
@@ -132,16 +132,16 @@ __global__ void CloverWgmmaExpertGemm(const __grid_constant__ CloverExpertMaps m
                 values[h] *= scores[task];
         }
         if (task >= 0)
-            CloverStoreExpertPair(output + (size_t)task * outputWidth + col, values[0], values[1]);
+            Moe16StoreExpertPair(output + (size_t)task * outputWidth + col, values[0], values[1]);
         if (Gate)
-            CloverStoreExpertPair(packedMiddle + ((size_t)blockIdx.y * M + row) * intermediate + col,
+            Moe16StoreExpertPair(packedMiddle + ((size_t)blockIdx.y * M + row) * intermediate + col,
                                   task >= 0 ? values[0] : 0.f, task >= 0 ? values[1] : 0.f);
     }
 #endif
 }
 }
 
-bool FastllmCudaCloverWgmmaAvailable() {
+bool FastllmCudaMoe16WgmmaAvailable() {
     int device;
     if (cudaGetDevice(&device) != cudaSuccess) return false;
     static thread_local int previous = -1;
@@ -155,11 +155,11 @@ bool FastllmCudaCloverWgmmaAvailable() {
         // different architecture: that can leave a no-kernel-image error.
         if (major == 9 && minor == 0) {
             cudaFuncAttributes attributes;
-            if (cudaFuncGetAttributes(&attributes, CloverWgmmaExpertGemm<true>) != cudaSuccess ||
-                cudaFuncSetAttribute(CloverWgmmaExpertGemm<true>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, CloverWgmmaSharedBytes<true>()) != cudaSuccess ||
-                cudaFuncSetAttribute(CloverWgmmaExpertGemm<false>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, CloverWgmmaSharedBytes<false>()) != cudaSuccess) return false;
+            if (cudaFuncGetAttributes(&attributes, Moe16WgmmaExpertGemm<true>) != cudaSuccess ||
+                cudaFuncSetAttribute(Moe16WgmmaExpertGemm<true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, Moe16WgmmaSharedBytes<true>()) != cudaSuccess ||
+                cudaFuncSetAttribute(Moe16WgmmaExpertGemm<false>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, Moe16WgmmaSharedBytes<false>()) != cudaSuccess) return false;
             available = attributes.binaryVersion == 90 && attributes.ptxVersion >= 90;
         }
         previous = device;
@@ -167,14 +167,14 @@ bool FastllmCudaCloverWgmmaAvailable() {
     return available;
 }
 
-void FastllmCudaCloverWgmmaExperts(const CUtensorMap *inputMap, const CUtensorMap *gateMap,
+void FastllmCudaMoe16WgmmaExperts(const CUtensorMap *inputMap, const CUtensorMap *gateMap,
         const CUtensorMap *middleMap, const CUtensorMap *downMap, const float *scores,
         const int *workspace, void *middle, void *parts, void *packedMiddle,
         int rows, int hidden, int intermediate, int experts, int tiles, cudaStream_t stream) {
-    CloverExpertMaps gate{*inputMap, *gateMap}, down{*middleMap, *downMap};
-    CloverWgmmaExpertGemm<true><<<dim3(intermediate / 64, tiles), 128, CloverWgmmaSharedBytes<true>(), stream>>>(gate,
+    Moe16ExpertMaps gate{*inputMap, *gateMap}, down{*middleMap, *downMap};
+    Moe16WgmmaExpertGemm<true><<<dim3(intermediate / 64, tiles), 128, Moe16WgmmaSharedBytes<true>(), stream>>>(gate,
         scores, workspace, (__nv_bfloat16 *)middle, (__nv_bfloat16 *)packedMiddle,
         rows, hidden, intermediate, experts);
-    CloverWgmmaExpertGemm<false><<<dim3(hidden / 64, tiles), 128, CloverWgmmaSharedBytes<false>(), stream>>>(down,
+    Moe16WgmmaExpertGemm<false><<<dim3(hidden / 64, tiles), 128, Moe16WgmmaSharedBytes<false>(), stream>>>(down,
         scores, workspace, (__nv_bfloat16 *)parts, nullptr, rows, hidden, intermediate, experts);
 }
