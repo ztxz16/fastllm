@@ -16,13 +16,31 @@ uint32_t be(const uint8_t *p) {
     return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
 }
 uint32_t crc(const uint8_t *p, size_t n) {
+    static const auto table = [] {
+        std::array<uint32_t, 256> values{};
+        for (uint32_t i = 0; i < values.size(); ++i) {
+            uint32_t c = i;
+            for (int b = 0; b < 8; ++b)
+                c = (c >> 1) ^ (0xedb88320u & uint32_t(-int(c & 1)));
+            values[i] = c;
+        }
+        return values;
+    }();
     uint32_t c = ~0u;
-    for (size_t i = 0; i < n; ++i) {
-        c ^= p[i];
-        for (int b = 0; b < 8; ++b)
-            c = (c >> 1) ^ (0xedb88320u & uint32_t(-int(c & 1)));
-    }
+    for (size_t i = 0; i < n; ++i)
+        c = (c >> 8) ^ table[(c ^ p[i]) & 255];
     return ~c;
+}
+uint32_t adler(const uint8_t *p, size_t n) {
+    uint32_t a = 1, b = 0;
+    while (n) {
+        // At most 5552 bytes keep both sums inside uint32_t before modulo.
+        size_t count = std::min<size_t>(n, 5552);
+        for (size_t i = 0; i < count; ++i) { a += p[i]; b += a; }
+        a %= 65521; b %= 65521;
+        p += count; n -= count;
+    }
+    return (b << 16) | a;
 }
 void append32(std::vector<uint8_t> &v, uint32_t x) {
     for (int i = 3; i >= 0; --i)
@@ -167,12 +185,7 @@ std::vector<uint8_t> inflate(const std::vector<uint8_t> &z, size_t size) {
         }
     }
     check(out.size() == size, "PNG decompressed size mismatch");
-    uint32_t a = 1, b = 0;
-    for (auto c : out) {
-        a = (a + c) % 65521;
-        b = (b + a) % 65521;
-    }
-    check(be(z.data() + z.size() - 4) == ((b << 16) | a), "PNG Adler checksum mismatch");
+    check(be(z.data() + z.size() - 4) == adler(out.data(), out.size()), "PNG Adler checksum mismatch");
     return out;
 }
 int paeth(int a, int b, int c) {
@@ -201,7 +214,6 @@ std::vector<uint8_t> encodePNG(const Image &image) {
     }
     // PNG's stored DEFLATE blocks need no image codec or zlib dependency.
     std::vector<uint8_t> z{0x78, 0x01};
-    uint32_t a = 1, b = 0;
     for (size_t p = 0; p < raw.size();) {
         uint16_t n = std::min<size_t>(65535, raw.size() - p);
         z.push_back(p + n == raw.size() ? 1 : 0);
@@ -211,13 +223,9 @@ std::vector<uint8_t> encodePNG(const Image &image) {
         z.push_back(inv & 255);
         z.push_back(inv >> 8);
         z.insert(z.end(), raw.begin() + p, raw.begin() + p + n);
-        for (size_t j = p; j < p + n; ++j) {
-            a = (a + raw[j]) % 65521;
-            b = (b + a) % 65521;
-        }
         p += n;
     }
-    append32(z, (b << 16) | a);
+    append32(z, adler(raw.data(), raw.size()));
     std::vector<uint8_t> out{137, 80, 78, 71, 13, 10, 26, 10}, header;
     append32(header, image.width);
     append32(header, image.height);

@@ -4,6 +4,16 @@
 #include <iostream>
 int main(int argc, char **argv) {
     try {
+        if (argc == 6 && std::string(argv[1]) == "--encode") {
+            std::ifstream f(argv[2], std::ios::binary);
+            fastllm::qwen_image::Image image;
+            image.width = std::stoi(argv[4]); image.height = std::stoi(argv[5]);
+            image.rgba.assign(std::istreambuf_iterator<char>(f), {});
+            auto bytes = fastllm::qwen_image::encodePNG(image);
+            std::ofstream out(argv[3], std::ios::binary);
+            out.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+            return !out;
+        }
         if (argc != 5)
             return 2;
         std::ifstream f(argv[1], std::ios::binary);

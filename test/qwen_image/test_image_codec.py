@@ -32,6 +32,23 @@ with tempfile.TemporaryDirectory() as tmp:
     def chunk(kind, data):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
+    # Exact encoder bytes, including Adler reduction and DEFLATE boundaries.
+    for width, height in [(1,1), (17,31), (1387,1), (1388,1), (16383,1), (16384,1), (576,320)]:
+        rgba = rng.integers(0, 256, (height, width, 4), dtype=np.uint8).tobytes()
+        (root / "input.raw").write_bytes(rgba)
+        subprocess.run([a.binary, "--encode", str(root / "input.raw"), str(root / "encoded.png"),
+                        str(width), str(height)], check=True)
+        raw = b"".join(b"\0"+rgba[y*width*4:(y+1)*width*4] for y in range(height))
+        stored = bytearray(b"\x78\x01")
+        for start in range(0, len(raw), 65535):
+            part = raw[start:start+65535]
+            stored += struct.pack("<BHH", int(start+len(part)==len(raw)), len(part), len(part)^65535)+part
+        stored += struct.pack(">I", zlib.adler32(raw))
+        expected = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB",width,height,8,6,0,0,0))
+                    + chunk(b"IDAT",stored) + chunk(b"IEND",b""))
+        assert (root / "encoded.png").read_bytes() == expected
+        assert np.array(Image.open(root / "encoded.png")).tobytes() == rgba
+
     # Exercise every DEFLATE block kind with exact raw RGBA bytes.
     raw = b"\0" + bytes(range(128)) * 2
     for level, strategy in [(0, zlib.Z_DEFAULT_STRATEGY), (9, zlib.Z_FIXED), (6, zlib.Z_DEFAULT_STRATEGY)]:
@@ -54,4 +71,4 @@ with tempfile.TemporaryDirectory() as tmp:
             ).returncode
             != 0
         )
-print("PASS: decode, RGBA Lanczos, stored/fixed/dynamic DEFLATE, malformed PNG rejection")
+print("PASS: exact encode, decode, RGBA Lanczos, stored/fixed/dynamic DEFLATE, malformed PNG rejection")
