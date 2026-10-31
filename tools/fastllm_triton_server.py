@@ -29,6 +29,34 @@ except Exception as exc:  # pragma: no cover - this is reported through /compile
 
 if triton is not None:
     @triton.jit
+    def _fastllm_mxfp4_decode_pair(packed, exponent):
+        return tl.inline_asm_elementwise(
+            """{
+              .reg .b8 lo, hi;
+              .reg .b16 h0, h1, b0, b1;
+              .reg .b32 halves, sc, vals, result;
+              .reg .f32 f0, f1;
+              mov.b16 {lo,hi}, $2;
+              cvt.rn.f16x2.e2m1x2 halves, lo;
+              mov.b32 {h0,h1}, halves;
+              cvt.f32.f16 f0, h0;
+              cvt.f32.f16 f1, h1;
+              cvt.rn.bf16.f32 b0, f0;
+              cvt.rn.bf16.f32 b1, f1;
+              mov.b32 vals, {b0,b1};
+              cvt.rn.bf16x2.ue8m0x2 sc, $3;
+              mul.rn.bf16x2 result, vals, sc;
+              mov.b32 {$0,$1}, result;
+            }""",
+            constraints="=h,=h,h,h",
+            args=[packed.to(tl.uint16), (exponent * 257).to(tl.uint16)],
+            dtype=(tl.bfloat16, tl.bfloat16),
+            is_pure=True,
+            pack=1,
+        )
+
+
+    @triton.jit
     def fastllm_mxfp4_grouped_gemm(
         X,
         W,
@@ -72,19 +100,9 @@ if triton is not None:
                     W + offset + (k[None, :] % 32) // 2, (n[:, None] < N) & (k[None, :] < K), other=0
                 ).to(tl.uint32)
                 exponent = tl.load(W + offset + 16, (n[:, None] < N) & (k[None, :] < K), other=127).to(tl.uint32)
-                scale = (
-                    tl.where(exponent == 0, 0x00400000, tl.where(exponent == 255, 0x7FC00000, exponent << 23))
-                    .to(tl.uint32)
-                    .to(tl.float32, bitcast=True)
-                )
-                code = packed & 15
-                mag = code & 7
-                bits = tl.where(mag >= 2, (mag + 252) << 22, mag * 0x3F000000) | ((code & 8) << 28)
-                even = (bits.to(tl.float32, bitcast=True) * scale).to(tl.bfloat16)
-                code = packed >> 4
-                mag = code & 7
-                bits = tl.where(mag >= 2, (mag + 252) << 22, mag * 0x3F000000) | ((code & 8) << 28)
-                odd = (bits.to(tl.float32, bitcast=True) * scale).to(tl.bfloat16)
+                # Same BF16 pair conversion as dsv41_cache::FP4Pair. Keep
+                # the original BF16 operands and FP32 Tensor Core accumulation.
+                even, odd = _fastllm_mxfp4_decode_pair(packed, exponent)
                 acc = tl.dot(xe, tl.trans(even), acc)
                 acc = tl.dot(xo, tl.trans(odd), acc)
             rounded = acc.to(tl.bfloat16)
@@ -4637,7 +4655,7 @@ def compile_merge_moe_fp8(payload):
 def mxfp4_grouped_cache_paths(payload):
     arch = require_int(payload, "arch")
     # Fixed original DSV4.1 layout and rounding, with runtime route count.
-    base = f"mxfp4_grouped_v2_sm{arch}_h5120_i2304_k6_n64_k64_w4_s3"
+    base = f"mxfp4_grouped_v3_sm{arch}_h5120_i2304_k6_n64_k128_w4_s3"
     root = Path(payload["cache_dir"])
     return {
         name: root / f"{base}_{name}.cubin" for name in ("gate", "activate", "down")
@@ -4673,7 +4691,7 @@ def compile_mxfp4_grouped(payload):
         BN="constexpr",
         BK="constexpr",
     )
-    constants = dict(H=h, I=i, TOPK=topk, STRIDE=stride, DOWN=down, BN=64, BK=64)
+    constants = dict(H=h, I=i, TOPK=topk, STRIDE=stride, DOWN=down, BN=64, BK=128)
     infos = {}
     for name in ("gate", "down"):
         sig = dict(signature, Y="*bf16" if name == "gate" else "*fp32")
@@ -4708,7 +4726,7 @@ def compile_mxfp4_grouped(payload):
     meta = dict(
         ok=True,
         op="mxfp4_grouped",
-        version=2,
+        version=3,
         arch=arch,
         kernels={
             k: dict(

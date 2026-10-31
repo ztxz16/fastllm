@@ -1264,7 +1264,7 @@ namespace fastllm {
             return false;
         int arch = CudaTritonRuntimeArch();
         std::string dir = CudaTritonCacheDir();
-        std::string base = "mxfp4_grouped_v2_sm" + std::to_string(arch) + "_h5120_i2304_k6_n64_k64_w4_s3";
+        std::string base = "mxfp4_grouped_v3_sm" + std::to_string(arch) + "_h5120_i2304_k6_n64_k128_w4_s3";
         std::string path = CudaTritonJoinPath(dir, base + ".json");
         struct Meta {
             CudaTritonKernelMeta kernels[3];
@@ -1300,7 +1300,7 @@ namespace fastllm {
                     }
                     json = json11::Json::parse(body, error);
                 }
-                bool valid = error.empty() && json["ok"].bool_value() && json["version"].int_value() == 2 &&
+                bool valid = error.empty() && json["ok"].bool_value() && json["version"].int_value() == 3 &&
                              json["arch"].int_value() == arch;
                 const char *keys[] = {"gate", "activate", "down"};
                 for (int i = 0; i < 3; ++i) {

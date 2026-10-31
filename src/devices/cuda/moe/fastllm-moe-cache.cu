@@ -3777,7 +3777,11 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             return left != right ? left < right : a < b;
         });
         for (int i = 0; i < hits; ++i) work.BatchSlots()[i] = work.Resident()[work.BatchRoutes()[i]];
-        if (groupedEnabled) {
+        if (groupedEnabled && hits >= 12) {
+            // Larger resident batches amortize padded rows across enough
+            // experts. Keep small singleton batches on the CUDA GEMV path.
+            groupedResident = hits;
+        } else if (groupedEnabled) {
             // Keep repeated slots together at the front. Singleton experts
             // retain GEMV instead of wasting a padded Tensor Core tile.
             std::array<int, maxRoutes> slots, maps;
@@ -3978,7 +3982,8 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
                 temporary.routeMap = batchView.routeMap + stagedOffsets[i];
                 temporary.routeCount = stagedOffsets[i + 1] - stagedOffsets[i];
                 const bool computed = ComputeBatchExperts(*gpuInput, work.gate, output,
-                    layout, temporary, static_cast<float *>(work.scores.cudaData), topk, work.GpuOutput());
+                    layout, temporary, static_cast<float *>(work.scores.cudaData), topk, work.GpuOutput(),
+                    groupedEnabled && temporary.routeCount >= 4);
                 AssertInFastLLM(computed, "Verify staged expert batch failed.\n");
                 temporary.q8InputPrepared = true;
                 checkCudaErrors("Verify staged done", cudaEventRecord(overlap->stagedDone[i], cudaStreamPerThread));
