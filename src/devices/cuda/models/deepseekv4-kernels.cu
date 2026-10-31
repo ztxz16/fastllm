@@ -10333,7 +10333,10 @@ extern "C" bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::
     }
 
     fastllm::Data &mutableWoA = const_cast<fastllm::Data&>(woA);
-    if (allowTriton && woA.dataType == fastllm::DataType::BFLOAT16 &&
+    // Preserve the FP8 path's existing activation quantization. Small grouped
+    // matrices can reuse each restored weight tile across several token rows.
+    if (allowTriton && (woA.dataType == fastllm::DataType::BFLOAT16 ||
+                       woA.dataType == fastllm::DataType::FP8_E4M3) &&
         fastllm::TryCudaTritonSmallProjection(*projectionInput, mutableWoA, output, groups)) return true;
     if (allowTriton && fastllm::FastllmCudaTryTritonDeepSeekV4WoA(
             *projectionInput, mutableWoA, groups, oRank, output)) {

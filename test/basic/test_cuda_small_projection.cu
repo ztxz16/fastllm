@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <random>
 #include <vector>
+#include <cstring>
 using namespace fastllm;
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); std::exit(1); } } while(0)
 static std::mt19937 rng(481);
@@ -65,12 +66,16 @@ static void run(int rows,int n,int k,int groups,bool fp8,bool graph) {
     input.strides[0]++;CHECK(!TryCudaTritonSmallProjection(input,weight,out,groups));input.strides[0]--;
     if(fp8){weight.blockK=128;CHECK(!TryCudaTritonSmallProjection(input,weight,out,groups));weight.blockK=32;}
 }
-int main(){
+int main(int argc, char **argv){
+    const bool wideOnly = argc == 2 && std::strcmp(argv[1], "--wide") == 0;
     int count=0;if(cudaGetDeviceCount(&count)!=cudaSuccess||!count)return 77;
     cudaSetDevice(0);FastllmCudaSetDevice(0);
     if(FastllmCudaRuntimeArch()!=120&&FastllmCudaRuntimeArch()!=121)return 77;
     setenv("FASTLLM_CUDA_TRITON","1",1);
-    for(bool fp8:{false,true})for(auto shape:std::vector<std::vector<int>>{{32,32},{96,160},{128,256},{512,1280}})
+    if (!wideOnly) for(bool fp8:{false,true})for(auto shape:std::vector<std::vector<int>>{{32,32},{96,160},{128,256},{512,1280}})
         for(int rows:{2,3,5,6,8,9,16})for(int groups:{1,2,8})run(rows,shape[0],shape[1],groups,fp8,rows==6||rows==16);
+    // Wide FP8 tiles include a partial N tile and a masked K tail.
+    for (int rows : {3, 6, 16}) run(rows, 16416, 96, 1, true, true);
+    run(6, 32768, 1280, 1, true, true);
     std::printf("SMALL_PROJECTION_PASS cases=%d max_l2=%.10g\n",cases,maxL2);
 }

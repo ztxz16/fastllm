@@ -4882,7 +4882,7 @@ def compile_small_projection(payload):
     fp8 = int(payload["fp8"])
     if arch not in {120, 121} or n <= 0 or k <= 0 or n % 32 or k % 32 or fp8 not in {0, 1}:
         raise ValueError("small projection requires SM12x, aligned BF16 / block-32 FP8 weights")
-    if (bn, bk) not in {(64, 64), (32, 128), (32, 256)}:
+    if (bn, bk) not in {(64, 64), (64, 128), (32, 128), (32, 256)}:
         raise ValueError("unsupported small projection tile")
     root = Path(payload["cache_dir"])
     base = f"small_projection_v1_sm{arch}_fp8{fp8}_n{n}_k{k}_bn{bn}_bk{bk}_w4_s3"

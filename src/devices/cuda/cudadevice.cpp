@@ -1274,7 +1274,7 @@ namespace fastllm {
             (reinterpret_cast<uintptr_t>(weight.extraCudaData[0]) & 15))) return false;
         // Small N needs more CTAs; wider K benefits from a larger reduction tile.
         const int bn = groups == 1 && n >= 16384 && k <= 2048 ? 64 : 32;
-        const int bk = bn == 64 ? 64 : (groups > 1 ? 128 : 256);
+        const int bk = bn == 64 ? (fp8 ? 128 : 64) : (groups > 1 ? 128 : 256);
         const std::string dir = CudaTritonCacheDir();
         const std::string base = "small_projection_v1_sm" + std::to_string(arch) + "_fp8" +
             std::to_string(fp8) + "_n" + std::to_string(n) + "_k" + std::to_string(k) +
