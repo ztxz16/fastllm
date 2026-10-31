@@ -32,11 +32,11 @@ template<class Attention> struct LocalAttention : Attention {
 };
 template<class T,int D> cudaError_t dispatchAttention(const void *q,const void *k,const void *v,void *out,
                            int queries,int keys,int heads,int kvHeads,bool causal,
-                           int tile,int height,int width,cudaStream_t stream) {
+                           int tile,int height,int width,float scoreScale,cudaStream_t stream) {
     Params<T> p;
     static_cast<Base<T> &>(p)=Base<T>((T*)q,(T*)k,(T*)v,nullptr,(T*)out,nullptr,nullptr,
         heads,kvHeads,queries,keys,heads*D,D,kvHeads*D,D,D,-1,0,
-        1.f/std::sqrt(float(D)),1,10000);
+        scoreScale,1,10000);
     p.tile=tile; p.height=height; p.width=width;
     using namespace flashinfer;
     using Attention = std::conditional_t<std::is_same_v<T, __nv_bfloat16>, BF16Attention,
@@ -53,8 +53,8 @@ template<class T,int D> cudaError_t dispatchAttention(const void *q,const void *
 } // namespace
 cudaError_t fusedAttention(const void *q,const void *k,const void *v,void *out,
                            int queries,int keys,int heads,int kvHeads,int dim,bool fp16,bool causal,
-                           int tile,int height,int width,cudaStream_t stream) {
-#define ATTENTION(T,D) dispatchAttention<T,D>(q,k,v,out,queries,keys,heads,kvHeads,causal,tile,height,width,stream)
+                           int tile,int height,int width,float scoreScale,cudaStream_t stream) {
+#define ATTENTION(T,D) dispatchAttention<T,D>(q,k,v,out,queries,keys,heads,kvHeads,causal,tile,height,width,scoreScale,stream)
     if(dim==64) return fp16 ? ATTENTION(__half,64) : ATTENTION(__nv_bfloat16,64);
     if(dim==128) return fp16 ? ATTENTION(__half,128) : ATTENTION(__nv_bfloat16,128);
 #undef ATTENTION

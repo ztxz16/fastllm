@@ -50,30 +50,6 @@ __global__ void modulationKernel(const float *x, const float *y, const float *m,
         out[i] = y ? x[i] + y[i] * tanhf(v) : x[i] * (1.f + v);
     }
 }
-__global__ void textRopeKernel(const float *x, float *y, const int *positions, size_t n, int c, int d,
-                               float theta, bool multimodal) {
-    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
-        int j = i % d, half = d / 2, freq = j % half;
-        int axis = multimodal && freq < 60 ? freq % 3 : 0;
-        float angle = positions[axis * (n / c) + i / c] * powf(theta, -2.f * freq / d);
-        float v = j < half ? -x[i + half] : x[i - half];
-        y[i] = x[i] * cosf(angle) + v * sinf(angle);
-    }
-}
-__global__ void visionRopeKernel(const float *x, float *y, const int *positions, size_t n, int c, int d) {
-    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
-        int j = i % d, half = d / 2, freq = j % half, axis = freq / (d / 4);
-        float angle = positions[axis * (n / c) + i / c] * powf(10000.f, -2.f * (freq % (d / 4)) / half);
-        float v = j < half ? -x[i + half] : x[i - half];
-        y[i] = x[i] * cosf(angle) + v * sinf(angle);
-    }
-}
-__global__ void geluKernel(const float *x, float *y, size_t n) {
-    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
-        float v = x[i];
-        y[i] = .5f * v * (1.f + erff(v * .7071067811865475f));
-    }
-}
 __global__ void im2col(const float *x, float *out, int h, int w, int c, int kernel, int stride, int pad,
                        int ow, int start, size_t n) {
     int kc = c * kernel * kernel;
@@ -132,38 +108,6 @@ Tensor Runtime::gatedAdd(const Tensor &x, const Tensor &y, const Tensor &m, int 
     Tensor out(x.rows, x.cols, true);
     modulationKernel<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
         ptr(x), ptr(y), ptr(m), ptr(out), x.size(), x.cols, m.cols, m.rows, first, offset);
-    check(cudaGetLastError());
-    return out;
-}
-Tensor Runtime::textRope(const Tensor &x, const std::vector<int> &pos, float theta, int dim) {
-    if ((pos.size() != size_t(x.rows) && pos.size() != size_t(x.rows) * 3) || dim <= 0 || dim % 2 ||
-        x.cols % dim)
-        throw std::invalid_argument("text RoPE shape");
-    Tensor positions(pos.size(), 1, true), out(x.rows, x.cols, true);
-    check(cudaMemcpyAsync(positions.data, pos.data(), pos.size() * 4, cudaMemcpyHostToDevice,
-                          cudaStreamPerThread));
-    textRopeKernel<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
-        ptr(x), ptr(out), reinterpret_cast<int *>(positions.data), x.size(), x.cols, dim, theta,
-        pos.size() != size_t(x.rows));
-    check(cudaGetLastError());
-    check(cudaStreamSynchronize(cudaStreamPerThread));
-    return out;
-}
-Tensor Runtime::visionRope(const Tensor &x, const std::vector<int> &pos, int dim) {
-    if (pos.size() != size_t(x.rows) * 2 || dim <= 0 || dim % 4 || x.cols % dim)
-        throw std::invalid_argument("vision RoPE shape");
-    Tensor positions(pos.size(), 1, true), out(x.rows, x.cols, true);
-    check(cudaMemcpyAsync(positions.data, pos.data(), pos.size() * 4, cudaMemcpyHostToDevice,
-                          cudaStreamPerThread));
-    visionRopeKernel<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
-        ptr(x), ptr(out), reinterpret_cast<int *>(positions.data), x.size(), x.cols, dim);
-    check(cudaGetLastError());
-    check(cudaStreamSynchronize(cudaStreamPerThread));
-    return out;
-}
-Tensor Runtime::geluExact(const Tensor &x) {
-    Tensor out(x.rows, x.cols, true);
-    geluKernel<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(ptr(x), ptr(out), x.size());
     check(cudaGetLastError());
     return out;
 }

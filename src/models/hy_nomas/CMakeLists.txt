@@ -7,7 +7,8 @@ set_directory_properties(PROPERTIES
     INCLUDE_DIRECTORIES "")
 
 add_library(fastllm_continuous STATIC
-    attention.cu runtime.cu tokenizer.cpp
+    attention.cu runtime.cu tokenizer.cpp vision.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen_image/image.cpp
     ${PROJECT_SOURCE_DIR}/third_party/json11/json11.cpp)
 target_include_directories(fastllm_continuous PUBLIC
     ${PROJECT_SOURCE_DIR}/include

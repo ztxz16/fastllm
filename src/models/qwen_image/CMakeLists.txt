@@ -1,5 +1,5 @@
 set_directory_properties(PROPERTIES COMPILE_OPTIONS "" COMPILE_DEFINITIONS "" INCLUDE_DIRECTORIES "")
-add_library(fastllm_qwen_image SHARED ops.cu model.cpp pipeline.cpp image.cpp)
+add_library(fastllm_qwen_image SHARED ops.cu model.cpp pipeline.cpp)
 target_link_libraries(fastllm_qwen_image PUBLIC fastllm_continuous)
 target_compile_options(fastllm_qwen_image PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>

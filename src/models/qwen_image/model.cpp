@@ -16,75 +16,9 @@ std::string componentWeights(const std::string &dir) {
 TextEncoder::TextEncoder(Runtime &rt, const std::string &dir)
     : rt_(rt), weights_(rt, componentWeights(dir)) {}
 std::vector<Tensor> TextEncoder::vision(const Image &image) {
-    const int gh = image.height / 16, gw = image.width / 16, n = gh * gw;
-    if (image.width % 32 || image.height % 32 || image.rgba.size() != size_t(image.width) * image.height * 4)
-        throw std::invalid_argument("vision input must be RGBA with dimensions divisible by 32");
-    const std::string root = "model.visual.";
-    std::vector<float> patches(size_t(n) * 1536), positionsEmbedding(size_t(n) * 1152);
-    std::vector<int> positions(size_t(n) * 2);
-    auto learned = rt_.download(weights_.get(root + "pos_embed.weight"));
-    for (int by = 0, i = 0; by < gh / 2; ++by)
-        for (int bx = 0; bx < gw / 2; ++bx)
-            for (int dy = 0; dy < 2; ++dy)
-                for (int dx = 0; dx < 2; ++dx, ++i) {
-                    int py = by * 2 + dy, px = bx * 2 + dx;
-                    positions[i] = py;
-                    positions[n + i] = px;
-                    for (int c = 0; c < 3; ++c)
-                        for (int t = 0; t < 2; ++t)
-                            for (int y = 0; y < 16; ++y)
-                                for (int x = 0; x < 16; ++x) {
-                                    size_t source = (size_t(py * 16 + y) * image.width + px * 16 + x) * 4;
-                                    int alpha = image.rgba[source + 3],
-                                        value = (image.rgba[source + c] * alpha + 255 * (255 - alpha) + 127) /
-                                                255;
-                                    patches[size_t(i) * 1536 + ((c * 2 + t) * 16 + y) * 16 + x] =
-                                        (value * (1.f / 255.f) - .5f) * 2.f;
-                                }
-                    float fy = gh == 1 ? 0 : float(py) * 47.f / (gh - 1),
-                          fx = gw == 1 ? 0 : float(px) * 47.f / (gw - 1);
-                    int y0 = int(fy), x0 = int(fx), y1 = std::min(y0 + 1, 47), x1 = std::min(x0 + 1, 47);
-                    float wy = fy - y0, wx = fx - x0;
-                    for (int c = 0; c < 1152; ++c)
-                        positionsEmbedding[size_t(i) * 1152 + c] =
-                            learned[(y0 * 48 + x0) * 1152 + c] * (1 - wy) * (1 - wx) +
-                            learned[(y0 * 48 + x1) * 1152 + c] * (1 - wy) * wx +
-                            learned[(y1 * 48 + x0) * 1152 + c] * wy * (1 - wx) +
-                            learned[(y1 * 48 + x1) * 1152 + c] * wy * wx;
-                }
-    auto x = weights_.linear(rt_.upload(patches.data(), n, 1536), root + "patch_embed.proj");
-    x = rt_.add(x, rt_.upload(positionsEmbedding.data(), n, 1152));
-    auto merge = [&](Tensor input, const std::string &p, bool post) {
-        if (post) {
-            input.rows /= 4;
-            input.cols *= 4;
-        }
-        input = rt_.norm(input, false, &weights_.get(p + ".norm.weight"), &weights_.get(p + ".norm.bias"));
-        if (!post) {
-            input.rows /= 4;
-            input.cols *= 4;
-        }
-        return weights_.linear(rt_.geluExact(weights_.linear(input, p + ".linear_fc1")), p + ".linear_fc2");
-    };
-    std::vector<Tensor> result(4);
-    for (int layer = 0; layer < 27; ++layer) {
-        auto p = root + "blocks." + std::to_string(layer) + ".";
-        auto nx = rt_.norm(x, false, &weights_.get(p + "norm1.weight"), &weights_.get(p + "norm1.bias"));
-        auto qkv = weights_.linear(nx, p + "attn.qkv");
-        auto q = rt_.visionRope(rt_.columns(qkv, 0, 1152), positions),
-             k = rt_.visionRope(rt_.columns(qkv, 1152, 1152), positions), v = rt_.columns(qkv, 2304, 1152);
-        x = rt_.add(x, weights_.linear(rt_.attention(q, k, v, 16), p + "attn.proj"));
-        nx = rt_.norm(x, false, &weights_.get(p + "norm2.weight"), &weights_.get(p + "norm2.bias"));
-        x = rt_.add(x, weights_.linear(rt_.activation(weights_.linear(nx, p + "mlp.linear_fc1"), true),
-                                       p + "mlp.linear_fc2"));
-        if (layer == 8 || layer == 16 || layer == 24) {
-            int i = layer / 8 - 1;
-            result[i + 1] = merge(x, root + "deepstack_merger_list." + std::to_string(i), true);
-        }
-    }
-    result[0] = merge(x, root + "merger", false);
-    return result;
+    return nomas::qwenVision(rt_, weights_, image.width, image.height, image.rgba);
 }
+
 Tensor TextEncoder::encode(const std::vector<int> &tokens, const std::vector<Image> &images) {
     if (tokens.empty() || tokens.size() > 4096)
         throw std::invalid_argument("prompt requires 1..4096 tokens");

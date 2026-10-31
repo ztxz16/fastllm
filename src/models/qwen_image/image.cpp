@@ -329,11 +329,11 @@ Image decodePNG(const std::string &bytes) {
     }
     return image;
 }
-Image resizeImage(const Image &source, int width, int height) {
+Image resizeImage(const Image &source, int width, int height, ImageResizeFilter filter, int maximum) {
     check(source.width > 0 && source.height > 0 &&
               source.rgba.size() == size_t(source.width) * source.height * 4,
           "invalid source image");
-    check(width > 0 && height > 0 && width <= 4096 && height <= 4096,
+    check(width > 0 && height > 0 && width <= maximum && height <= maximum,
           "reference aspect ratio is too extreme");
     if (width == source.width && height == source.height)
         return source;
@@ -342,32 +342,61 @@ Image resizeImage(const Image &source, int width, int height) {
     for (size_t i = 0; i < current.rgba.size(); i += 4)
         for (int c = 0; c < 3; ++c)
             current.rgba[i + c] = (int(current.rgba[i + c]) * current.rgba[i + 3] + 127) / 255;
-    for (int axis = 0; axis < 2; ++axis) {
+    bool torch = filter == ImageResizeFilter::TorchBicubic;
+    bool bicubic = filter != ImageResizeFilter::Lanczos;
+    bool verticalFirst =
+        !torch && source.height - height > 0 && source.height - height > (source.width - width) * 2;
+    for (int pass = 0; pass < 2; ++pass) {
+        int axis = verticalFirst ? 1 - pass : pass;
         int from = axis ? current.height : current.width, to = axis ? height : width;
         if (from == to)
             continue;
         Image result{axis ? current.width : width, axis ? height : current.height, {}};
         result.rgba.resize(size_t(result.width) * result.height * 4);
-        double scale = double(from) / to, filterScale = std::max(1., scale), support = 3 * filterScale;
+        double scale = double(from) / to, filterScale = std::max(1., scale),
+               support = (bicubic ? 2 : 3) * filterScale;
+        std::vector<int> starts(to);
+        std::vector<std::vector<double>> coefficients(to);
+        double maximumWeight = 0;
         for (int j = 0; j < to; ++j) {
             double center = (j + .5) * scale;
             int begin = std::max(0, int(center - support + .5)),
                 end = std::min(from, int(center + support + .5));
-            std::vector<double> weights(end - begin);
+            starts[j] = begin;
+            auto &weights = coefficients[j];
+            weights.resize(end - begin);
             double sum = 0;
             for (int i = begin; i < end; ++i) {
-                weights[i - begin] = lanczos((i - center + .5) / filterScale);
+                double x = std::abs((i - center + .5) / filterScale);
+                weights[i - begin] = bicubic ? (x < 1   ? ((1.5 * x - 2.5) * x) * x + 1
+                                                : x < 2 ? (((x - 5) * x + 8) * x - 4) * -.5
+                                                        : 0)
+                                             : lanczos(x);
                 sum += weights[i - begin];
             }
+            for (double &value : weights) {
+                value /= sum;
+                maximumWeight = std::max(maximumWeight, std::abs(value));
+            }
+        }
+        int precision = 22;
+        if (torch) {
+            precision = 1;
+            for (int bits = 2; bits < 22 && .5 + maximumWeight * (1 << bits) < (1 << 15); ++bits)
+                precision = bits;
+        }
+        for (int j = 0; j < to; ++j) {
+            const auto &weights = coefficients[j];
+            int begin = starts[j], end = begin + weights.size();
             std::vector<int> fixed(weights.size());
             for (size_t i = 0; i < fixed.size(); ++i) {
-                double v = weights[i] / sum * (1 << 22);
+                double v = weights[i] * (1 << precision);
                 fixed[i] = int(v + (v >= 0 ? .5 : -.5));
             }
             int outer = axis ? result.width : result.height;
             for (int k = 0; k < outer; ++k)
                 for (int c = 0; c < 4; ++c) {
-                    int64_t value = 1 << 21;
+                    int64_t value = 1 << (precision - 1);
                     for (int i = begin; i < end; ++i)
                         value += int64_t(current.rgba[(axis ? size_t(i) * current.width + k
                                                             : size_t(k) * current.width + i) *
@@ -376,7 +405,7 @@ Image resizeImage(const Image &source, int width, int height) {
                                  fixed[i - begin];
                     result
                         .rgba[(axis ? size_t(j) * result.width + k : size_t(k) * result.width + j) * 4 + c] =
-                        std::clamp<int64_t>(value >> 22, 0, 255);
+                        std::clamp<int64_t>(value >> precision, 0, 255);
                 }
         }
         current = std::move(result);

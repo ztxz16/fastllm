@@ -22,9 +22,6 @@ class Runtime : public nomas::Runtime {
     Tensor specialNorm(const Tensor &, const Tensor &weight, int mode, float eps = 1e-6f);
     Tensor scale(const Tensor &, const Tensor &mod, int firstTarget, int offset);
     Tensor gatedAdd(const Tensor &, const Tensor &, const Tensor &mod, int firstTarget, int offset);
-    Tensor textRope(const Tensor &, const std::vector<int> &positions, float theta, int dim = 128);
-    Tensor visionRope(const Tensor &, const std::vector<int> &positions, int dim = 72);
-    Tensor geluExact(const Tensor &);
     Tensor conv2d(const Tensor &, const Tensor &weight, const Tensor *bias, int height, int width, int kernel,
                   int stride = 1, int pad = 0, int padEnd = 0);
     Tensor resize2x(const Tensor &, int height, int width);
@@ -114,7 +111,9 @@ class Pipeline {
 std::string componentWeights(const std::string &directory);
 std::vector<uint8_t> encodePNG(const Image &);
 Image decodePNG(const std::string &);
-Image resizeImage(const Image &, int width, int height);
+enum class ImageResizeFilter { Lanczos, Bicubic, TorchBicubic };
+Image resizeImage(const Image &, int width, int height, ImageResizeFilter filter = ImageResizeFilter::Lanczos,
+                  int maximum = 4096);
 
 } // namespace qwen_image
 } // namespace fastllm

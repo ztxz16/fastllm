@@ -22,7 +22,7 @@
 #endif
 
 namespace fastllm { namespace nomas {
-cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,int,bool,bool,int,int,int,cudaStream_t);
+cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,int,bool,bool,int,int,int,float,cudaStream_t);
 namespace {
 using B = __nv_bfloat16;
 using H = __half;
@@ -209,6 +209,11 @@ template<class T,class U> __global__ void castKernel(const T *x,U *y,size_t n) {
     for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) y[i]=cast<U>(f(x[i]));
 }
 
+template<class T> __global__ void resizeHeads(const T *x,T *out,size_t n,int from,int to) {
+    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
+        int d=i%to; out[i]=d<from ? x[i/to*from+d] : cast<T>(0.f);
+    }
+}
 template<class T> __global__ void meanKernel(const T *x,T *y,int rows,int cols) {
     for(int c=blockIdx.x*blockDim.x+threadIdx.x;c<cols;c+=gridDim.x*blockDim.x) {
         float sum=0; for(int r=0;r<rows;++r) sum+=f(x[size_t(r)*cols+c]);
@@ -240,6 +245,52 @@ template<class T> __global__ void pixelQKKernel(const T *x,T *y,const T *wt,cons
         float angle=float(position)*powf(theta,-2.f*float(local%(dim/2))/dim);
         float rotated=local<dim/2?-normalized[base+local+dim/2]:normalized[base+local-dim/2];
         y[size_t(head)*128+lane]=cast<T>(normalized[lane]*cosf(angle)+rotated*sinf(angle));
+    }
+}
+template<class T> __global__ void qwenVisionPatches(const uint8_t *first,const uint8_t *second,T *out,int width,int gw) {
+    int i=blockIdx.x,py=(i/4/(gw/2))*2+i/2%2,px=(i/4%(gw/2))*2+i%2;
+    for(int j=threadIdx.x;j<1536;j+=blockDim.x) {
+        int c=j/512,t=j/256%2,y=j/16%16,x=j%16;
+        size_t source=(size_t(py*16+y)*width+px*16+x)*4;
+        const auto *pixels=t && second?second:first;
+        int alpha=pixels[source+3],value=(pixels[source+c]*alpha+255*(255-alpha)+127)/255;
+        float v=(value*(1.f/255.f)-.5f)*2.f;
+        out[size_t(i)*1536+j]=cast<T>(v);
+    }
+}
+template<class T> __global__ void qwenVisionPositions(const T *learned,T *out,int *positions,int gh,int gw) {
+    int i=blockIdx.x,py=(i/4/(gw/2))*2+i/2%2,px=(i/4%(gw/2))*2+i%2;
+    if(!threadIdx.x) { positions[i]=py; positions[gh*gw+i]=px; }
+    float fy=float(py)*47.f/(gh-1),fx=float(px)*47.f/(gw-1);
+    int y0=int(fy),x0=int(fx),y1=min(y0+1,47),x1=min(x0+1,47);
+    float wy=fy-y0,wx=fx-x0;
+    for(int c=threadIdx.x;c<1152;c+=blockDim.x) {
+        float v=f(learned[(y0*48+x0)*1152+c])*(1-wy)*(1-wx)+
+                f(learned[(y0*48+x1)*1152+c])*(1-wy)*wx+
+                f(learned[(y1*48+x0)*1152+c])*wy*(1-wx)+
+                f(learned[(y1*48+x1)*1152+c])*wy*wx;
+        out[size_t(i)*1152+c]=cast<T>(v);
+    }
+}
+template<class T, bool Vision>
+__global__ void qwenRopeKernel(const T *x,T *y,const int *positions,size_t n,int cols,int dim,
+                               float theta,bool multimodal) {
+    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
+        int j=i%dim, half=dim/2, freq=j%half;
+        int axis=Vision ? freq/(dim/4) : (multimodal && freq<60 ? freq%3 : 0);
+        float power=Vision ? -2.f*(freq%(dim/4))/half : -2.f*freq/dim;
+        float angle=positions[axis*(n/cols)+i/cols]*powf(theta,power);
+        float rotated=j<half ? -f(x[i+half]) : f(x[i-half]);
+        if constexpr(Vision)
+            y[i]=cast<T>(f(x[i])*cosf(angle)+rotated*sinf(angle));
+        else
+            y[i]=cast<T>(roundTo<T>(f(x[i])*roundTo<T>(cosf(angle)))+
+                          roundTo<T>(rotated*roundTo<T>(sinf(angle))));
+    }
+}
+template<class T> __global__ void geluExactKernel(const T *x,T *y,size_t n) {
+    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
+        float v=f(x[i]); y[i]=cast<T>(.5f*v*(1.f+erff(v*.7071067811865475f)));
     }
 }
 template<class T> __global__ void textRopeKernel(const T *x,T *y,size_t n,int cols,float theta) {
@@ -474,12 +525,72 @@ Tensor Runtime::columns(const Tensor &x,int first,int count) {
     DISPATCH_TENSOR(x.dtype, T, columnKernel<T><<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),x.rows,x.cols,first,count)); check(cudaGetLastError()); return out;
 }
 Tensor Runtime::embedding(const Tensor &weight,const std::vector<int> &tokens) {
-    require(!tokens.empty() && tokens.size()<=4096,"invalid token count"); Tensor out(tokens.size(),weight.cols,weight.dtype);
+    require(!tokens.empty() && tokens.size()<=65536,"invalid token count"); Tensor out(tokens.size(),weight.cols,weight.dtype);
     for(size_t i=0;i<tokens.size();++i) {
         require(tokens[i]>=0 && tokens[i]<weight.rows,"token out of vocabulary");
         copy(out.data+i*weight.cols*(weight.isFloat32()?2:1),weight.data+size_t(tokens[i])*weight.cols*(weight.isFloat32()?2:1),weight.cols*(weight.isFloat32()?4:2),cudaMemcpyDeviceToDevice);
     }
     return out;
+}
+Tensor Runtime::indices(const std::vector<int> &values) {
+    require(!values.empty() && values.size()<=INT32_MAX,"invalid index count");
+    Tensor out(values.size(),1,true);
+    copy(out.data,values.data(),values.size()*sizeof(int),cudaMemcpyHostToDevice);
+    return out;
+}
+Tensor Runtime::textRope(const Tensor &x,const std::vector<int> &pos,float theta,int dim) {
+    return textRope(x,indices(pos),theta,dim);
+}
+Tensor Runtime::textRope(const Tensor &x,const Tensor &positions,float theta,int dim) {
+    require(positions.isFloat32() && positions.cols==1 && positions.data &&
+            (positions.size()==size_t(x.rows) || positions.size()==size_t(x.rows)*3) &&
+            dim>0 && dim%2==0 && x.cols%dim==0,"text RoPE shape");
+    Tensor out(x.rows,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype,T,(qwenRopeKernel<T,false><<<grid(x.size()),256,0,cudaStreamPerThread>>>(
+        as<T>(x),as<T>(out),reinterpret_cast<int *>(positions.data),x.size(),x.cols,dim,theta,
+        positions.size()!=size_t(x.rows))));
+    check(cudaGetLastError()); return out;
+}
+Tensor Runtime::visionRope(const Tensor &x,const std::vector<int> &pos,int dim) {
+    return visionRope(x,indices(pos),dim);
+}
+Tensor Runtime::visionRope(const Tensor &x,const Tensor &positions,int dim) {
+    require(positions.isFloat32() && positions.cols==1 && positions.data &&
+            positions.size()==size_t(x.rows)*2 && dim>0 && dim%4==0 && x.cols%dim==0,"vision RoPE shape");
+    Tensor out(x.rows,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype,T,(qwenRopeKernel<T,true><<<grid(x.size()),256,0,cudaStreamPerThread>>>(
+        as<T>(x),as<T>(out),reinterpret_cast<int *>(positions.data),x.size(),x.cols,dim,10000.f,true)));
+    check(cudaGetLastError()); return out;
+}
+std::array<Tensor,3> Runtime::visionInputs(int width,int height,const std::vector<uint8_t> &rgba,
+                                          const Tensor &learned,const std::vector<uint8_t> *secondFrame) {
+    require(width>0 && height>0 && width%32==0 && height%32==0 &&
+            rgba.size()==size_t(width)*height*4 && (!secondFrame || secondFrame->size()==rgba.size()),
+            "vision input must be aligned RGBA");
+    require(learned.dtype==dtype_ && learned.rows==48*48 && learned.cols==1152,"vision position embedding shape");
+    int gh=height/16,gw=width/16;
+    require(int64_t(gh)*gw<=INT32_MAX/1536,"vision input too large");
+    activate();
+    int n=gh*gw;
+    Tensor first(width*height,1,true),second;
+    copy(first.data,rgba.data(),rgba.size(),cudaMemcpyHostToDevice);
+    if(secondFrame) {
+        second=Tensor(width*height,1,true);
+        copy(second.data,secondFrame->data(),secondFrame->size(),cudaMemcpyHostToDevice);
+    }
+    std::array<Tensor,3> out{Tensor(n,1536,dtype_),Tensor(n,1152,dtype_),Tensor(n*2,1,true)};
+    DISPATCH_TENSOR(dtype_,T,qwenVisionPatches<T><<<n,256,0,cudaStreamPerThread>>>(
+        reinterpret_cast<const uint8_t *>(first.data),reinterpret_cast<const uint8_t *>(second.data),
+        as<T>(out[0]),width,gw));
+    DISPATCH_TENSOR(dtype_,T,qwenVisionPositions<T><<<n,256,0,cudaStreamPerThread>>>(
+        as<T>(learned),as<T>(out[1]),reinterpret_cast<int *>(out[2].data),gh,gw));
+    check(cudaGetLastError()); return out;
+}
+Tensor Runtime::geluExact(const Tensor &x) {
+    Tensor out(x.rows,x.cols,x.dtype);
+    DISPATCH_TENSOR(x.dtype,T,geluExactKernel<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(
+        as<T>(x),as<T>(out),x.size()));
+    check(cudaGetLastError()); return out;
 }
 Tensor Runtime::textRope(const Tensor &x) { return textRope(x,1000000.f); }
 Tensor Runtime::textRope(const Tensor &x,float theta) {
@@ -527,8 +638,26 @@ Tensor Runtime::attentionScaled(const Tensor &q,const Tensor &k,const Tensor &v,
     int dim=q.cols/heads; chunk=std::min(chunk,q.rows); Tensor out(q.rows,q.cols,q.dtype);
     require(std::isfinite(scoreScale) && (q.isFloat32() || scoreScale==1.f/std::sqrt(float(dim))),"custom attention scale requires FP32");
     if(!q.isFloat32() && !mask && (dim==64 || dim==128)) {
-        check(fusedAttention(q.data,k.data,v.data,out.data,q.rows,k.rows,heads,kvHeads,dim,q.dtype==DType::FP16,causal,tile,height,width,cudaStreamPerThread));
+        check(fusedAttention(q.data,k.data,v.data,out.data,q.rows,k.rows,heads,kvHeads,dim,q.dtype==DType::FP16,causal,tile,height,width,scoreScale,cudaStreamPerThread));
         return out;
+    }
+    if(!q.isFloat32() && !mask && dim==72 && !tile) {
+        // Qwen3-VL uses 72-wide heads. Pad the dot-product axes, retaining the
+        // original softmax scale, to reuse the existing 128-wide fused kernel.
+        Tensor qp(q.rows,heads*128,q.dtype),kp(k.rows,kvHeads*128,k.dtype),vp(v.rows,kvHeads*128,v.dtype),
+               result(q.rows,heads*128,q.dtype);
+        for(auto pair : {std::make_pair(&q,&qp),std::make_pair(&k,&kp),std::make_pair(&v,&vp)}) {
+            if(q.dtype==DType::BF16) resizeHeads<B><<<grid(pair.second->size()),256,0,cudaStreamPerThread>>>(
+                as<B>(*pair.first),as<B>(*pair.second),pair.second->size(),72,128);
+            else resizeHeads<H><<<grid(pair.second->size()),256,0,cudaStreamPerThread>>>(
+                as<H>(*pair.first),as<H>(*pair.second),pair.second->size(),72,128);
+        }
+        check(cudaGetLastError());
+        check(fusedAttention(qp.data,kp.data,vp.data,result.data,q.rows,k.rows,heads,kvHeads,128,
+            q.dtype==DType::FP16,causal,0,height,width,scoreScale,cudaStreamPerThread));
+        if(q.dtype==DType::BF16) resizeHeads<B><<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<B>(result),as<B>(out),out.size(),128,72);
+        else resizeHeads<H><<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<H>(result),as<H>(out),out.size(),128,72);
+        check(cudaGetLastError()); return out;
     }
     require(q.dtype!=DType::FP16,"FP16 attention requires the fused 64/128-dimensional backend");
     if(q.isFloat32()) {
@@ -634,9 +763,9 @@ struct Weights::Impl {
     std::unordered_map<std::string,HostWeight> offloaded;
     std::shared_ptr<PackedCache> packed;
     std::shared_ptr<HostCache> host;
-    std::string directory;
+    std::string directory,checkpoint;
     std::unordered_map<std::string,std::unique_ptr<Weights>> shards;
-    Impl(Runtime &rt,const std::string &path):rt(rt) {
+    Impl(Runtime &rt,const std::string &path):rt(rt),checkpoint(path) {
         if(std::filesystem::is_directory(path)) {
             directory=path;
             std::ifstream index(path+"/model.safetensors.index.json");
@@ -805,6 +934,12 @@ void Weights::enableHostCache(size_t maxBytes) {
         break;
     }
     for(auto &shard:i.shards) shard.second->impl_->host=i.host;
+}
+void Weights::shareHostCache(const Weights &source) {
+    require(&impl_->rt==&source.impl_->rt && impl_->checkpoint==source.impl_->checkpoint,
+            "shared host cache requires the same runtime and checkpoint");
+    impl_->host=source.impl_->host;
+    for(auto &shard:impl_->shards) shard.second->impl_->host=impl_->host;
 }
 void Weights::enablePackedCache(size_t reserveBytes) {
     auto &i=*impl_;

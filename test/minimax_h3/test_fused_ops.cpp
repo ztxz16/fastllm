@@ -48,6 +48,95 @@ template <class F> static void rejects(F fn) {
     }
     throw std::runtime_error("invalid linear output was accepted");
 }
+static void visionInputPreparation() {
+    for (auto dtype : {DType::FP32, DType::FP16, DType::BF16}) {
+        Runtime rt(0, dtype);
+        auto learned = randomTensor(rt, 48 * 48, 1152);
+        auto values = rt.download(learned);
+        for (int width : {32, 96}) {
+            int height = 64, gh = height / 16, gw = width / 16, n = gh * gw;
+            std::vector<uint8_t> first(width * height * 4), second(first.size());
+            for (size_t i = 0; i < first.size(); ++i) {
+                first[i] = uint8_t(i * 37 + 11);
+                second[i] = uint8_t(i * 13 + 89);
+            }
+            const uint8_t alpha[] = {0, 127, 128, 255};
+            for (int i = 0; i < width * height; ++i) {
+                first[i * 4 + 3] = alpha[i % 4];
+                second[i * 4 + 3] = alpha[(i + 1) % 4];
+            }
+            for (bool paired : {false, true}) {
+                std::vector<float> patches(n * 1536), embedded(n * 1152);
+                std::vector<int> positions(n * 2);
+                for (int by = 0, i = 0; by < gh / 2; ++by)
+                    for (int bx = 0; bx < gw / 2; ++bx)
+                        for (int dy = 0; dy < 2; ++dy)
+                            for (int dx = 0; dx < 2; ++dx, ++i) {
+                                int py = by * 2 + dy, px = bx * 2 + dx;
+                                positions[i] = py;
+                                positions[n + i] = px;
+                                for (int c = 0; c < 3; ++c)
+                                    for (int t = 0; t < 2; ++t)
+                                        for (int y = 0; y < 16; ++y)
+                                            for (int x = 0; x < 16; ++x) {
+                                                size_t src = (size_t(py * 16 + y) * width + px * 16 + x) * 4;
+                                                const auto &pixels = paired && t ? second : first;
+                                                int alpha = pixels[src + 3];
+                                                int v = (pixels[src + c] * alpha + 255 * (255 - alpha) + 127) / 255;
+                                                patches[size_t(i) * 1536 + ((c * 2 + t) * 16 + y) * 16 + x] =
+                                                    (v * (1.f / 255.f) - .5f) * 2.f;
+                                            }
+                                float fy = float(py) * 47.f / (gh - 1), fx = float(px) * 47.f / (gw - 1);
+                                int y0 = int(fy), x0 = int(fx), y1 = std::min(y0 + 1, 47), x1 = std::min(x0 + 1, 47);
+                                float wy = fy - y0, wx = fx - x0;
+                                for (int c = 0; c < 1152; ++c)
+                                    embedded[size_t(i) * 1152 + c] =
+                                        values[(y0 * 48 + x0) * 1152 + c] * (1 - wy) * (1 - wx) +
+                                        values[(y0 * 48 + x1) * 1152 + c] * (1 - wy) * wx +
+                                        values[(y1 * 48 + x0) * 1152 + c] * wy * (1 - wx) +
+                                        values[(y1 * 48 + x1) * 1152 + c] * wy * wx;
+                            }
+                auto actual = rt.visionInputs(width, height, first, learned, paired ? &second : nullptr);
+                std::cout << "vision_inputs dtype=" << int(dtype) << " width=" << width << " paired=" << paired;
+                equal(rt, rt.upload(patches.data(), n, 1536), actual[0]);
+                equal(rt, rt.upload(embedded.data(), n, 1152), actual[1]);
+                rt.synchronize();
+                std::vector<int> indices(n * 2);
+                if (cudaMemcpy(indices.data(), actual[2].data, indices.size() * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess || indices != positions)
+                    throw std::runtime_error("vision RoPE coordinates changed");
+                std::cout << std::endl;
+            }
+            auto invalid = first;
+            invalid.pop_back();
+            rejects([&] { rt.visionInputs(width, height, invalid, learned); });
+            rejects([&] { rt.visionInputs(width, height, first, learned, &invalid); });
+        }
+    }
+}
+static void longPresentationEmbedding() {
+    // A default 2048-square reference already contributes 4096 visual tokens,
+    // before the presentation labels and prompt are added.
+    for (auto dtype : {DType::FP32, DType::FP16, DType::BF16}) {
+        Runtime rt(0, dtype);
+        const std::vector<float> values{1, 2, 3, 4, 5, 6};
+        auto weight = rt.upload(values.data(), 3, 2);
+        for (int count : {4096, 4097, 65536}) {
+            std::vector<int> tokens(count);
+            for (int i = 0; i < count; ++i)
+                tokens[i] = i % 3;
+            auto output = rt.download(rt.embedding(weight, tokens));
+            for (int i = 0; i < count; ++i)
+                for (int c = 0; c < 2; ++c)
+                    if (output[i * 2 + c] != values[tokens[i] * 2 + c])
+                        throw std::runtime_error("long presentation embedding mismatch");
+        }
+        rejects([&] { rt.embedding(weight, {}); });
+        rejects([&] { rt.embedding(weight, std::vector<int>(65537)); });
+        rejects([&] { rt.embedding(weight, {-1}); });
+        rejects([&] { rt.embedding(weight, {3}); });
+    }
+    std::cout << "PASS long presentation embedding" << std::endl;
+}
 static void linearOutputs() {
     for (auto dtype : {DType::FP32, DType::FP16, DType::BF16}) {
         Runtime rt(0, dtype);
@@ -213,6 +302,36 @@ static void hostWeightCache() {
         weights.clear();
     }
     equal(rt, first, second);
+    if (std::filesystem::exists("/proc/meminfo")) {
+        Weights staging(rt, path.string());
+        {
+            Weights source(rt, path.string());
+            source.enableHostCache(1024);
+            source.get("a");
+            Weights other(rt, (path / "a.safetensors").string());
+            rejects([&] { other.shareHostCache(source); });
+            staging.shareHostCache(source);
+        }
+        // The staging buffer must retain the original CPU cache after its owner
+        // dies. Changing the file distinguishes sharing from a second file load.
+        std::fstream file(path / "a.safetensors", std::ios::binary | std::ios::in | std::ios::out);
+        uint16_t zeros[8]{};
+        file.seekp(-std::streamoff(sizeof(zeros)), std::ios::end);
+        file.write(reinterpret_cast<const char *>(zeros), sizeof(zeros));
+        file.close();
+        for (int round = 0; round < 2; ++round) {
+            Tensor value;
+            std::exception_ptr error;
+            std::thread worker([&] {
+                try { value = staging.get("a"); } catch (...) { error = std::current_exception(); }
+            });
+            worker.join();
+            if (error)
+                std::rethrow_exception(error);
+            equal(rt, first, value);
+            staging.clear();
+        }
+    }
     std::cout << "host cache: dtype/shard/budget/clear/disable/worker/lifetime PASS" << std::endl;
 }
 template <class T> static float videoRound(float v) { return float(T(v)); }
@@ -426,6 +545,8 @@ int main() {
         videoStitch<__half>(DType::FP16);
         videoStitch<__nv_bfloat16>(DType::BF16);
         hostWeightCache();
+        visionInputPreparation();
+        longPresentationEmbedding();
         linearOutputs();
         Runtime rt(0, false), full(0, true);
         residuals(rt);

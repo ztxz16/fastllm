@@ -2,8 +2,10 @@
 
 // HY-Nomas continuous-tensor inference. This API deliberately has no dependency
 // on a Python tensor library or on the token sampling / LLM KV-cache APIs.
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <random>
 #include <string>
@@ -92,8 +94,18 @@ public:
     Tensor residual(const Tensor &x, const Tensor &y, const Tensor &mod, int gate);
     Tensor columns(const Tensor &x, int first, int count);
     Tensor embedding(const Tensor &weight, const std::vector<int> &tokens);
+    // Integer indices use 32-bit storage and must not be passed to floating-point operators.
+    Tensor indices(const std::vector<int> &values);
     Tensor textRope(const Tensor &x);
     Tensor textRope(const Tensor &x, float theta);
+    Tensor textRope(const Tensor &, const std::vector<int> &positions, float theta, int dim = 128);
+    Tensor textRope(const Tensor &, const Tensor &positions, float theta, int dim = 128);
+    Tensor visionRope(const Tensor &, const std::vector<int> &positions, int dim = 72);
+    Tensor visionRope(const Tensor &, const Tensor &positions, int dim = 72);
+    // Qwen3-VL patch pixels, interpolated position embeddings, and integer RoPE positions.
+    std::array<Tensor, 3> visionInputs(int width, int height, const std::vector<uint8_t> &rgba,
+                                      const Tensor &learned, const std::vector<uint8_t> *secondFrame = nullptr);
+    Tensor geluExact(const Tensor &);
     Tensor concat(const std::vector<Tensor> &xs);
     Tensor rope(const Tensor &x, const float *cos, const float *sin, int headDim);
     RopeTable prepareRope(const float *cos, const float *sin, int rows, int headDim);
@@ -138,6 +150,10 @@ public:
     // memory. Capped by one quarter of available host RAM; rejected pinning
     // uses ordinary memory, exhaustion uses files. Zero releases the cache.
     void enableHostCache(size_t maxBytes);
+    // Share the immutable CPU cache and its budget with another GPU staging buffer
+    // for the same runtime and checkpoint.
+    // The callers must serialize cache population.
+    void shareHostCache(const Weights &source);
     // Release selected projections after precomputing their schedule-dependent outputs.
     // An explicitly enabled packed cache survives this operation.
     void erasePrefix(const std::string &prefix);
@@ -145,6 +161,11 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// Shared Qwen3-VL vision tower: main merger and three DeepStack outputs.
+std::vector<Tensor> qwenVision(Runtime &, Weights &, int width, int height, const std::vector<uint8_t> &rgba,
+                               std::function<void(const std::string &, const Tensor &)> trace = {},
+                               const std::vector<uint8_t> *secondFrame = nullptr);
 
 struct BlockResult { Tensor image, text, key, value; };
 struct DiTCache { std::vector<Tensor> key, value; };
