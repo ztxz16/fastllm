@@ -3,6 +3,10 @@
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <thread>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -147,6 +151,67 @@ static void residuals(Runtime &rt) {
         std::cout << std::endl;
     }
 }
+static void hostWeightCache() {
+    auto path = std::filesystem::temp_directory_path() /
+                ("fastllm-h3-weights-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code error; std::filesystem::remove_all(path, error); }
+    } cleanup{path};
+    std::filesystem::create_directory(path);
+    for (bool bf16 : {false, true}) {
+        std::string name = bf16 ? "a" : "b";
+        std::string header = "{\"" + name + "\":{\"dtype\":\"" + (bf16 ? "BF16" : "F32") +
+                             "\",\"shape\":[2,4],\"data_offsets\":[0," + (bf16 ? "16" : "32") + "]}}";
+        uint64_t length = header.size();
+        float floats[] = {1, 2, 3, 4, 5, 6, 7, 8};
+        uint16_t halves[] = {0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0, 0x40e0, 0x4100};
+        std::ofstream file(path / (name + ".safetensors"), std::ios::binary);
+        file.write(reinterpret_cast<const char *>(&length), 8);
+        file.write(header.data(), header.size());
+        file.write(bf16 ? reinterpret_cast<const char *>(halves) : reinterpret_cast<const char *>(floats), bf16 ? 16 : 32);
+    }
+    std::ofstream(path / "model.safetensors.index.json") <<
+        "{\"weight_map\":{\"a\":\"a.safetensors\",\"b\":\"b.safetensors\"}}";
+    for (auto dtype : {DType::FP32, DType::BF16, DType::FP16}) {
+        Runtime rt(0, dtype);
+        for (size_t budget : {size_t(16), size_t(1024)}) {
+            Weights weights(rt, path.string());
+            weights.enableHostCache(budget);
+            for (int round = 0; round < 3; ++round) {
+                for (auto name : {"a", "b"}) {
+                    auto result = rt.download(weights.get(name));
+                    for (int i = 0; i < 8; ++i)
+                        if (result[i] != float(i + 1))
+                            throw std::runtime_error("host weight cache changed values");
+                }
+                weights.erasePrefix("a");
+                weights.clear();
+                if (round == 1)
+                    weights.enableHostCache(0);
+            }
+        }
+    }
+    Runtime rt(0, false);
+    Tensor first, second;
+    {
+        Weights weights(rt, path.string());
+        weights.enableHostCache(1024);
+        std::exception_ptr error;
+        std::thread worker([&] {
+            try { first = weights.get("a"); } catch (...) { error = std::current_exception(); }
+        });
+        worker.join();
+        if (error)
+            std::rethrow_exception(error);
+        weights.erasePrefix("a");
+        second = weights.get("a");
+        // Destroy the host cache immediately after enqueueing its last upload.
+        weights.clear();
+    }
+    equal(rt, first, second);
+    std::cout << "host cache: dtype/shard/budget/clear/disable/worker/lifetime PASS" << std::endl;
+}
 int main() {
     try {
         int count = 0;
@@ -157,6 +222,7 @@ int main() {
             std::cerr << "Expose only the permitted GPU" << std::endl;
             return 77;
         }
+        hostWeightCache();
         linearOutputs();
         Runtime rt(0, false), full(0, true);
         residuals(rt);

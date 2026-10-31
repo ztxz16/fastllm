@@ -1,6 +1,6 @@
 set_directory_properties(PROPERTIES COMPILE_OPTIONS "" COMPILE_DEFINITIONS "" INCLUDE_DIRECTORIES "")
 add_library(fastllm_minimax_h3 SHARED ops.cu transformer.cpp audio.cpp video.cpp text.cpp pipeline.cpp media.cpp)
-target_link_libraries(fastllm_minimax_h3 PUBLIC fastllm_continuous)
+target_link_libraries(fastllm_minimax_h3 PUBLIC fastllm_continuous pthread)
 target_include_directories(fastllm_minimax_h3 PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 target_compile_options(fastllm_minimax_h3 PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
@@ -12,7 +12,7 @@ target_link_libraries(minimax_h3_generate PRIVATE fastllm_minimax_h3)
 set_target_properties(minimax_h3_generate PROPERTIES CXX_STANDARD 17)
 add_executable(minimax_h3_server server.cpp)
 target_include_directories(minimax_h3_server PRIVATE ${PROJECT_SOURCE_DIR}/example/webui)
-target_link_libraries(minimax_h3_server PRIVATE fastllm_minimax_h3 pthread)
+target_link_libraries(minimax_h3_server PRIVATE fastllm_minimax_h3)
 set_target_properties(minimax_h3_server PROPERTIES CXX_STANDARD 17)
 if(UNIT_TEST)
     enable_testing()

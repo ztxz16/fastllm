@@ -5,7 +5,9 @@
 namespace fastllm {
 namespace minimax_h3 {
 TextEncoder::TextEncoder(Runtime &rt, const std::string &dir)
-    : rt_(rt), weights_(rt, componentWeights(dir)) {}
+    : rt_(rt), weights_(rt, componentWeights(dir)) {
+    weights_.enableHostCache(size_t(64) << 30);
+}
 Tensor TextEncoder::encode(const std::vector<int> &tokens, Trace trace) {
     if (tokens.empty() || tokens.size() > 4096)
         throw std::invalid_argument("H3 prompt requires 1..4096 tokens");

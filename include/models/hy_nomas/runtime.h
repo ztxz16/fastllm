@@ -134,6 +134,10 @@ public:
     // layers. Use at most half the currently free memory, leaving reserveBytes.
     // clear() releases both representations; disabled unless explicitly enabled.
     void enablePackedCache(size_t reserveBytes);
+    // Retain immutable CPU checkpoint bytes across clear(), preferring pinned
+    // memory. Capped by one quarter of available host RAM; rejected pinning
+    // uses ordinary memory, exhaustion uses files. Zero releases the cache.
+    void enableHostCache(size_t maxBytes);
     // Release selected projections after precomputing their schedule-dependent outputs.
     // An explicitly enabled packed cache survives this operation.
     void erasePrefix(const std::string &prefix);

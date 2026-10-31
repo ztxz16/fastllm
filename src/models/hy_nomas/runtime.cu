@@ -588,6 +588,41 @@ Tensor Runtime::attentionScaled(const Tensor &q,const Tensor &k,const Tensor &v,
 void Runtime::synchronize() { check(cudaDeviceSynchronize()); }
 
 struct Weights::Impl {
+    struct HostCache {
+        struct Buffer { std::shared_ptr<void> data; bool pinned; };
+        std::unordered_map<std::string,Buffer> tensors;
+        size_t bytes=0,budget=0;
+        cudaEvent_t copied=nullptr;
+        int device=0;
+        std::shared_ptr<void> thread;
+        ~HostCache() {
+            if(!copied) return;
+            int previous=device; cudaGetDevice(&previous); cudaSetDevice(device);
+            cudaEventSynchronize(copied);
+            cudaEventDestroy(copied);
+            tensors.clear();
+            cudaSetDevice(previous);
+        }
+        void upload(void *dst,const void *src,size_t count) {
+            // Hold a unique per-thread token: OS thread IDs can be reused even
+            // though the replacement thread has a different CUDA stream.
+            static thread_local auto current=std::make_shared<int>(0);
+            if(!copied) {
+                check(cudaGetDevice(&device));
+                check(cudaEventCreateWithFlags(&copied,cudaEventDisableTiming));
+            } else if(thread!=current) {
+                check(cudaEventSynchronize(copied));
+            }
+            auto status=cudaMemcpyAsync(dst,src,count,cudaMemcpyHostToDevice,cudaStreamPerThread);
+            if(status==cudaSuccess) status=cudaEventRecord(copied,cudaStreamPerThread);
+            if(status!=cudaSuccess) {
+                // An unsuccessful record must not leave the source unprotected.
+                cudaStreamSynchronize(cudaStreamPerThread);
+                check(status);
+            }
+            thread=current;
+        }
+    };
     struct PackedCache {
         std::unordered_map<std::string,Tensor> tensors;
         size_t bytes=0,budget=0;
@@ -596,8 +631,9 @@ struct Weights::Impl {
     std::shared_ptr<void> mapping;
     std::unordered_map<std::string,Tensor> cache;
     struct HostWeight { int rows,cols; DType dtype; std::vector<uint8_t> bytes; };
-    std::unordered_map<std::string,HostWeight> host;
+    std::unordered_map<std::string,HostWeight> offloaded;
     std::shared_ptr<PackedCache> packed;
+    std::shared_ptr<HostCache> host;
     std::string directory;
     std::unordered_map<std::string,std::unique_ptr<Weights>> shards;
     Impl(Runtime &rt,const std::string &path):rt(rt) {
@@ -637,8 +673,8 @@ const Tensor *Weights::optional(const std::string &name) {
 const Tensor &Weights::get(const std::string &name) {
     impl_->rt.activate();
     auto &i=*impl_; auto cached=i.cache.find(name); if(cached!=i.cache.end()) return cached->second;
-    auto saved=i.host.find(name);
-    if(saved!=i.host.end()) {
+    auto saved=i.offloaded.find(name);
+    if(saved!=i.offloaded.end()) {
         const auto &h=saved->second;
         Tensor value(h.rows,h.cols,h.dtype);
         copy(value.data,h.bytes.data(),h.bytes.size(),cudaMemcpyHostToDevice);
@@ -652,6 +688,7 @@ const Tensor &Weights::get(const std::string &name) {
         if(!shard) {
             shard.reset(new Weights(i.rt,i.directory+"/"+file));
             shard->impl_->packed=i.packed;
+            shard->impl_->host=i.host;
         }
         return shard->get(name);
     }
@@ -671,26 +708,57 @@ const Tensor &Weights::get(const std::string &name) {
     }
     std::vector<uint8_t> buffer;
     const void *source=nullptr;
-    if(!raw.data && i.mapping) source=static_cast<const uint8_t *>(i.mapping.get())+i.base+uint64_t(a);
-    else if(!raw.data) {
+    bool pinned=false;
+    if(!raw.data && i.host) {
+        auto cached=i.host->tensors.find(name);
+        if(cached!=i.host->tensors.end()) {
+            source=cached->second.data.get(); pinned=cached->second.pinned;
+        }
+    }
+    if(!raw.data && !source && i.mapping) source=static_cast<const uint8_t *>(i.mapping.get())+i.base+uint64_t(a);
+    else if(!raw.data && !source) {
         buffer.resize(uint64_t(z-a)); i.file.clear(); i.file.seekg(i.base+uint64_t(a));
         i.file.read(reinterpret_cast<char *>(buffer.data()),buffer.size()); require(bool(i.file),"truncated weight");
         source=buffer.data();
     }
-    Tensor value;
-    if(dtype=="F32") {
-        value=i.rt.upload(static_cast<const float *>(source),rows,cols);
-    } else {
-        // Transfer BF16 once, then convert only when the compute dtype differs.
-        if(!raw.data) {
-            raw=Tensor(rows,cols); copy(raw.data,source,n*2,cudaMemcpyHostToDevice);
-            if(i.packed && raw.bytes()<=i.packed->budget-i.packed->bytes) {
-                i.packed->tensors.emplace(name,raw);
-                i.packed->bytes+=raw.bytes();
-            }
+    if(source && i.host && !i.host->tensors.count(name) && uint64_t(z-a)<=i.host->budget-i.host->bytes) {
+        void *p=nullptr;
+        auto status=cudaHostAlloc(&p,uint64_t(z-a),cudaHostAllocPortable);
+        pinned=status==cudaSuccess;
+        if(status==cudaErrorInvalidValue) {
+            // Large pinned allocations can be rejected despite valid size/flags.
+            // Cache ordinary host bytes instead, avoiding expensive retries and
+            // file-backed uploads on subsequent requests.
+            cudaGetLastError();
+            p=std::malloc(uint64_t(z-a));
+            if(!p) i.host->budget=i.host->bytes;
+        } else if(status==cudaErrorMemoryAllocation) {
+            cudaGetLastError();
+            p=nullptr;
+            i.host->budget=i.host->bytes;
+        } else check(status);
+        if(p) {
+            std::shared_ptr<void> storage(p,[pinned](void *x) {
+                if(pinned) cudaFreeHost(x); else std::free(x);
+            });
+            std::memcpy(p,source,uint64_t(z-a));
+            i.host->tensors.emplace(name,Impl::HostCache::Buffer{std::move(storage),pinned});
+            i.host->bytes+=uint64_t(z-a);
+            source=p;
         }
-        value=i.rt.cast(raw,i.rt.dtype());
     }
+    if(!raw.data) {
+        raw=Tensor(rows,cols,dtype=="F32" ? DType::FP32 : DType::BF16);
+        // Immutable cached host buffers outlive the last recorded upload. Keep
+        // inference stream ordering without a host barrier for every weight.
+        if(pinned) i.host->upload(raw.data,source,raw.bytes());
+        else copy(raw.data,source,raw.bytes(),cudaMemcpyHostToDevice);
+        if(i.packed && dtype=="BF16" && raw.bytes()<=i.packed->budget-i.packed->bytes) {
+            i.packed->tensors.emplace(name,raw);
+            i.packed->bytes+=raw.bytes();
+        }
+    }
+    auto value=i.rt.cast(raw,i.rt.dtype());
     return i.cache.emplace(name,std::move(value)).first->second;
 }
 Tensor Weights::linear(const Tensor &x,const std::string &prefix,bool separateBias) {
@@ -709,18 +777,34 @@ Tensor Weights::linear(const Tensor &x,const std::string &prefix,bool separateBi
     if(separateBias && bias) out=impl_->rt.bias(out,*bias);
     return out;
 }
-void Weights::clear() { impl_->cache.clear(); impl_->host.clear(); impl_->shards.clear(); impl_->packed.reset(); }
+void Weights::clear() { impl_->cache.clear(); impl_->offloaded.clear(); impl_->shards.clear(); impl_->packed.reset(); }
 void Weights::offload() {
     impl_->rt.activate();
     for(const auto &entry:impl_->cache) {
-        if(impl_->host.count(entry.first)) continue;
+        if(impl_->offloaded.count(entry.first)) continue;
         const auto &x=entry.second;
         Impl::HostWeight h{x.rows,x.cols,x.dtype,std::vector<uint8_t>(x.bytes())};
         copy(h.bytes.data(),x.data,x.bytes(),cudaMemcpyDeviceToHost);
-        impl_->host.emplace(entry.first,std::move(h));
+        impl_->offloaded.emplace(entry.first,std::move(h));
     }
     impl_->cache.clear();
     for(auto &shard:impl_->shards) shard.second->offload();
+}
+void Weights::enableHostCache(size_t maxBytes) {
+    auto &i=*impl_;
+    i.host.reset();
+    // Leave most host RAM available to concurrent services and the file cache.
+    // If the platform cannot report available RAM, retain the existing upload path.
+    std::ifstream memory("/proc/meminfo");
+    std::string line;
+    while(maxBytes && std::getline(memory,line)) {
+        if(line.compare(0,13,"MemAvailable:")!=0) continue;
+        size_t available=std::stoull(line.substr(13))*1024;
+        i.host=std::make_shared<Impl::HostCache>();
+        i.host->budget=std::min(maxBytes,available/4);
+        break;
+    }
+    for(auto &shard:i.shards) shard.second->impl_->host=i.host;
 }
 void Weights::enablePackedCache(size_t reserveBytes) {
     auto &i=*impl_;

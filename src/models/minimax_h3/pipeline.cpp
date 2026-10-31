@@ -1,5 +1,6 @@
 #include "models/minimax_h3/runtime.h"
 #include "json11.hpp"
+#include <cuda_runtime_api.h>
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -93,6 +94,15 @@ Pipeline::Pipeline(const std::string &dir, int device, bool fp32, DType videoPre
     };
     stats(dir + "/vae", 24, videoMean_, videoStd_);
     stats(dir + "/audio_vae", 32, audioMean_, audioStd_);
+    // The BF16 DiT and mixed-precision VAEs fit together on 72/80 GiB devices.
+    // Leave at least 60 GiB initially free before enabling cross-request residency;
+    // smaller/shared devices and FP32 diagnostics retain the streaming lifecycle.
+    size_t available = 0, total = 0;
+    auto status = cudaMemGetInfo(&available, &total);
+    if (status != cudaSuccess)
+        throw std::runtime_error(cudaGetErrorString(status));
+    retainWeights_ = !fp32 && videoPrecision != DType::FP32 && total >= (size_t(68) << 30) &&
+                     available >= (size_t(60) << 30);
 }
 Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace trace,
                               const std::vector<float> *initialVideo,
@@ -185,7 +195,8 @@ Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace
         v = {};
         a = {};
         text = {};
-        transformer_.unload();
+        if (!retainWeights_)
+            transformer_.unload();
         VideoTensor latents(lt, lh, lw, 24);
         for (int t = 0; t < lt; ++t)
             for (int y = 0; y < lh; ++y)
@@ -199,7 +210,8 @@ Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace
         tick("video_decode", 0, 1);
         auto pixels =
             video_.decode(latents, [&](int current, int total) { tick("video_decode", current, total); });
-        video_.unload();
+        if (!retainWeights_)
+            video_.unload();
         tick("video_decode", 1, 1);
         if (pixels.frames != o.frames)
             throw std::runtime_error("decoded H3 frame count mismatch");
@@ -229,7 +241,8 @@ Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace
             for (size_t i = 0; i < samples.size(); ++i)
                 result.audio[i * 2 + channel] = samples[i];
         }
-        audio_.unload();
+        if (!retainWeights_)
+            audio_.unload();
         tick("completed", 1, 1);
         return result;
     } catch (...) {

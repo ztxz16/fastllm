@@ -63,6 +63,7 @@ class Transformer {
     Tensor block(int layer, const Tensor &, const Tensor &mod, const Tensor &indices, const Tensor &cos,
                  const Tensor &sin, Trace trace = {});
     // Precompute all timestep/modality tables, freeing the large AdaLN weights layer by layer.
+    // Identical plans reuse the exact tables until unload(), independent of the prompt.
     void prepare(const std::vector<std::vector<float>> &plans, std::function<void(int, int)> progress = {});
     std::pair<Tensor, Tensor> forward(const Tensor &video, const Tensor &audio, const Tensor &text,
                                       const PackedLayout &, Trace trace = {});
@@ -78,6 +79,7 @@ class Transformer {
     TransformerConfig config_;
     std::vector<Tensor> modulation_;
     Tensor outputModulation_;
+    std::vector<std::vector<float>> plans_;
 };
 std::string componentWeights(const std::string &directory);
 class AudioVAE {
@@ -163,6 +165,7 @@ class Pipeline {
     VideoVAE video_;
     AudioVAE audio_;
     std::vector<float> videoMean_, videoStd_, audioMean_, audioStd_;
+    bool retainWeights_ = false;
 };
 // FFmpeg is only a media encoder; model inference remains entirely C++/CUDA.
 void writeMP4(const Generation &, const std::string &path, const std::string &ffmpeg = "ffmpeg");

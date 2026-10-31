@@ -175,6 +175,12 @@ void Transformer::prepare(const std::vector<std::vector<float>> &plans,
                           std::function<void(int, int)> progress) {
     if (plans.empty())
         throw std::invalid_argument("empty H3 timestep plans");
+    if (plans == plans_ && modulation_.size() == size_t(config_.layers) && outputModulation_.data) {
+        if (progress)
+            progress(config_.layers, config_.layers);
+        return;
+    }
+    plans_.clear();
     modulation_.clear();
     // Keep each forward's GEMM batch size, including the first one-row plan.
     // Combining plans can select a different cuBLAS reduction and change BF16 rounding.
@@ -197,6 +203,7 @@ void Transformer::prepare(const std::vector<std::vector<float>> &plans,
     weights_.erasePrefix("norm_out.linear.");
     // FP32 diagnostics can reuse packed weights across steps; BF16 weights stay resident.
     weights_.enablePackedCache(size_t(16) << 30);
+    plans_ = plans;
 }
 std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor &audio, const Tensor &text,
                                                const PackedLayout &layout, Trace trace) {
@@ -233,6 +240,7 @@ void Transformer::unload() {
     fullWeights_.clear();
     modulation_.clear();
     outputModulation_ = {};
+    plans_.clear();
 }
 } // namespace minimax_h3
 } // namespace fastllm
