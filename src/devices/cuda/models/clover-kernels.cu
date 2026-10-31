@@ -2,6 +2,7 @@
 // Diffuspace/Clover-35B-A3B-Preview, modeling_clover_moe.py (bd_gdn_*).
 // Native CUDA implementation; no Transformers, Triton or SGLang runtime needed.
 #include "devices/cuda/fastllm-clover.h"
+#include "devices/cuda/fastllm-cuda-rope.cuh"
 #include "devices/cuda/fastllm-cuda-launch.cuh"
 #include "devices/cuda/fastllm-cuda-ordered-reduce.cuh"
 #include "devices/cuda/fastllm-cuda-router.h"
@@ -636,17 +637,9 @@ __global__ void CloverRotary(T *input, int heads, int dim,
     if (i >= heads * rotaryDim / 2) return;
     int h = i / (rotaryDim / 2), d = i % (rotaryDim / 2);
     float phase = (position + blockIdx.y) * (1.f / powf(theta, 2.f * d / rotaryDim));
-    float c = CloverFloat(CloverCast<T>(cosf(phase)));
-    float s = CloverFloat(CloverCast<T>(sinf(phase)));
     size_t p = ((size_t)blockIdx.y * heads + h) * dim + d;
-    float x = CloverFloat(input[p]), y = CloverFloat(input[p + rotaryDim / 2]);
-    // Eager BF16 rotary rounds each multiply before adding/subtracting.
-    float xc = CloverFloat(CloverCast<T>(x * c));
-    float ys = CloverFloat(CloverCast<T>(y * s));
-    float yc = CloverFloat(CloverCast<T>(y * c));
-    float xs = CloverFloat(CloverCast<T>(x * s));
-    input[p] = CloverCast<T>(xc - ys);
-    input[p + rotaryDim / 2] = CloverCast<T>(yc + xs);
+    FastllmRopePair<T, true>(input[p], input[p + rotaryDim / 2], cosf(phase), sinf(phase),
+                            input[p], input[p + rotaryDim / 2]);
 }
 
 // Decode Q/gate split, Q/K RMSNorm and partial RoPE share one CTA per head.
@@ -678,15 +671,8 @@ __global__ void CloverPrepareAttention(const T *qgate, const T *key,
     if (d >= rotaryDim) destination[d] = normalized[d];
     if (d < rotaryDim / 2) {
         float phase = (position + token) * (1.f / powf(theta, 2.f * d / rotaryDim));
-        float c = CloverFloat(CloverCast<T>(cosf(phase)));
-        float s = CloverFloat(CloverCast<T>(sinf(phase)));
-        float a = CloverFloat(normalized[d]), b = CloverFloat(normalized[d + rotaryDim / 2]);
-        float ac = CloverFloat(CloverCast<T>(a * c));
-        float bs = CloverFloat(CloverCast<T>(b * s));
-        float bc = CloverFloat(CloverCast<T>(b * c));
-        float as = CloverFloat(CloverCast<T>(a * s));
-        destination[d] = CloverCast<T>(ac - bs);
-        destination[d + rotaryDim / 2] = CloverCast<T>(bc + as);
+        FastllmRopePair<T, true>(normalized[d], normalized[d + rotaryDim / 2], cosf(phase), sinf(phase),
+                                destination[d], destination[d + rotaryDim / 2]);
     }
 }
 
@@ -1140,12 +1126,6 @@ bool FastllmCudaCloverCausalGdn(const void *query, const void *key, const void *
                 : FastllmCudaCloverCausalGdnImpl<__nv_bfloat16>(query, key, value, g, beta, state, output, snapshots, batch, tokens, keyHeads, valueHeads, stream, workspace, qkvRowStride, caches);
 }
 
-bool FastllmCudaCloverRotary(void *input, int tokens, int heads, int dim, int rotaryDim, int position,
-                             float theta, void *stream, bool fp16) {
-    return fp16 ? FastllmCudaCloverRotaryImpl<__half>(input, tokens, heads, dim, rotaryDim, position, theta, stream)
-                : FastllmCudaCloverRotaryImpl<__nv_bfloat16>(input, tokens, heads, dim, rotaryDim, position, theta, stream);
-}
-
 bool FastllmCudaCloverPrepareAttention(const void *qgate, const void *key, const float *qWeight,
         const float *kWeight, void *query, void *normalizedKey, void *gate, int tokens,
         int queryHeads, int keyHeads, int rotaryDim, int position, float theta, float eps, void *stream,
@@ -1166,4 +1146,10 @@ bool FastllmCudaCloverUnpackGdn(const void *input, const float *aLog, const floa
                                 float *g, void *beta, int rows, int channels, int heads, void *stream, bool fp16) {
     return fp16 ? FastllmCudaCloverUnpackGdnImpl<__half>(input, aLog, bias, qkv, z, g, beta, rows, channels, heads, stream)
                 : FastllmCudaCloverUnpackGdnImpl<__nv_bfloat16>(input, aLog, bias, qkv, z, g, beta, rows, channels, heads, stream);
+}
+
+bool FastllmCudaCloverRotary(void *input, int tokens, int heads, int dim, int rotaryDim, int position,
+                             float theta, void *stream, bool fp16) {
+    return fp16 ? FastllmCudaCloverRotaryImpl<__half>(input, tokens, heads, dim, rotaryDim, position, theta, stream)
+                : FastllmCudaCloverRotaryImpl<__nv_bfloat16>(input, tokens, heads, dim, rotaryDim, position, theta, stream);
 }

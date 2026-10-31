@@ -2880,68 +2880,27 @@ __global__ void FastllmLlamaRotatePosition2DKernel(__nv_bfloat16 *data, float *p
     d[i * m + m / 2] = __float2bfloat16(va * curSin + vb * curCos);
 }
 
-__global__ void FastllmRopeEncodingKernel(float *data, float *positionIds,
+template<class T>
+__global__ void FastllmRopeEncodingKernel(T *data, float *positionIds,
                                                    int len, int bs, int spatial, int n, int m, int partStride, int rotateDim,
                                                    float ropeTheta, float ropeScale, bool preciseFreq) {
     int o = (blockIdx.x / n);
     int l = o % len;
     int b = o / len;
     int j = threadIdx.x;
-    int half = rotateDim / 2;
+    int halfDim = rotateDim / 2;
     int index = (int) (positionIds[b * partStride + l]);
     float position = (float)index / ropeScale;
     float freq = preciseFreq ? FastllmPreciseRopeAngle(position, j, rotateDim, ropeTheta)
                              : position / powf(ropeTheta, (float)(2 * j) / rotateDim);
     float curSin = sinf(freq);
     float curCos = cosf(freq);
-    float *d = (float *) data + o * spatial + j;
+    T *d = data + o * spatial + j;
     int i = blockIdx.x % n;
-    float va = d[i * m], vb = d[i * m + half];
-    d[i * m] = va * curCos - vb * curSin;
-    d[i * m + half] = va * curSin + vb * curCos;
+    FastllmRopePair(d[i * m], d[i * m + halfDim], curCos, curSin,
+                   d[i * m], d[i * m + halfDim]);
 }
 
-__global__ void FastllmRopeEncodingKernel(half *data, float *positionIds,
-                                                   int len, int bs, int spatial, int n, int m, int partStride, int rotateDim,
-                                                   float ropeTheta, float ropeScale, bool preciseFreq) {
-    int o = (blockIdx.x / n);
-    int l = o % len;
-    int b = o / len;
-    int j = threadIdx.x;
-    int half_dim = rotateDim / 2;
-    int index = (int) (positionIds[b * partStride + l]);
-    float position = (float)index / ropeScale;
-    float freq = preciseFreq ? FastllmPreciseRopeAngle(position, j, rotateDim, ropeTheta)
-                             : position / powf(ropeTheta, (float)(2 * j) / rotateDim);
-    float curSin = sinf(freq);
-    float curCos = cosf(freq);
-    half *d = (half *) data + o * spatial + j;
-    int i = blockIdx.x % n;
-    float va = __half2float(d[i * m]), vb = __half2float(d[i * m + half_dim]);
-    d[i * m] = __float2half(va * curCos - vb * curSin);
-    d[i * m + half_dim] = __float2half(va * curSin + vb * curCos);
-}
-
-__global__ void FastllmRopeEncodingKernel(__nv_bfloat16 *data, float *positionIds,
-                                                   int len, int bs, int spatial, int n, int m, int partStride, int rotateDim,
-                                                   float ropeTheta, float ropeScale, bool preciseFreq) {
-    int o = (blockIdx.x / n);
-    int l = o % len;
-    int b = o / len;
-    int j = threadIdx.x;
-    int half_dim = rotateDim / 2;
-    int index = (int) (positionIds[b * partStride + l]);
-    float position = (float)index / ropeScale;
-    float freq = preciseFreq ? FastllmPreciseRopeAngle(position, j, rotateDim, ropeTheta)
-                             : position / powf(ropeTheta, (float)(2 * j) / rotateDim);
-    float curSin = sinf(freq);
-    float curCos = cosf(freq);
-    __nv_bfloat16 *d = (__nv_bfloat16 *) data + o * spatial + j;
-    int i = blockIdx.x % n;
-    float va = __bfloat162float(d[i * m]), vb = __bfloat162float(d[i * m + half_dim]);
-    d[i * m] = __float2bfloat16(va * curCos - vb * curSin);
-    d[i * m + half_dim] = __float2bfloat16(va * curSin + vb * curCos);
-}
 
 __device__ __forceinline__ float FastllmYarnInvFreq(int dim, int rotateDim,
                                                     float ropeTheta, float factor,
