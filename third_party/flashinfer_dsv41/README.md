@@ -60,3 +60,19 @@ sequences. Environment-policy checks and 26 dispatch guards cover rejection.
 SM121 is compile-checked only. Model execution and mailbox replay stress pass;
 bitwise model-logit identity is not claimed. Unsupported devices and layouts
 retain the native implementation.
+
+Selected-KV reuse:
+- Eligible full decode/verification plans decode each selected FP8/FP4 KV row
+  once into BF16 and reuse it across head groups. The packed kernel has an
+  optional BF16-input gather specialization; QK/PV arithmetic, FP32 accumulation,
+  split/merge, causal masks and BF16 output precision remain unchanged.
+- Reuse requires at least 32 heads and compressed top-k at least 128. Additional
+  storage is limited to 32 MiB per plan. Unsupported setup or allocation failure
+  retains the packed path. Ordinary chunks and small plans retain that path too.
+  Both paths support graph replay with changing request pointers and indices.
+  No new environment variable is introduced.
+- Added 180 dynamic graph checks for partial head groups, top-k tails, and absent
+  compressed-cache pointers. They pass the independent FP64 oracle (maximum
+  relative L2 0.002665). Existing 1,156 decode/verification/ordinary cases pass;
+  192 paired configurations, including absent caches and workspace-budget
+  fallback, match the previous packed path bitwise with zero memcheck errors.

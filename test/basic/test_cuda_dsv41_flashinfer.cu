@@ -183,7 +183,7 @@ void CheckGuards() {
     }
 }
 double RunCase(Cache &first, Cache &second, std::mt19937 &rng, int heads, int batch, int width, int ratio,
-               int replays, bool verifying = false, int denseBatches = 0) {
+               int replays, bool verifying = false, int denseBatches = 0, bool missingCompressed = false) {
     auto config = Config(heads, batch, width, ratio);
     config.verifying = verifying;
     const int length = denseBatches ? batch / denseBatches : batch;
@@ -233,7 +233,7 @@ double RunCase(Cache &first, Cache &second, std::mt19937 &rng, int heads, int ba
         for (int token = 0; token < batch; ++token) {
             Cache &cache = (replay + (denseBatches ? token / length : verifying ? 0 : token)) % 2 ? first : second;
             requests[token].windowKV = cache.gpuRing.data;
-            requests[token].compressedKV = cache.gpuCompressed.data;
+            requests[token].compressedKV = missingCompressed && (replay & 1) ? nullptr : cache.gpuCompressed.data;
             requests[token].position = verifying ?
                 std::min(positions[replay % 16], 2047 * std::max(ratio, 1) - length) + token % length :
                 std::min(positions[(replay + token) % 16], 2047 * std::max(ratio, 1));
@@ -308,7 +308,7 @@ double RunCase(Cache &first, Cache &second, std::mt19937 &rng, int heads, int ba
             const int listCount = ratio ? (verifying ? requests[0].position + length : position + 1) / ratio : 0;
             for (int k = 0; k < std::min(width, listCount); ++k) {
                 const int id = indices[token * width + k];
-                if (id >= 0 && id < count)
+                if (id >= 0 && id < count && !(missingCompressed && (replay & 1)))
                     rows.push_back(cache.compressedValues.data() + id * kDim);
             }
             double numerator = 0, denominator = 0, maxError = 0, maxReference = 0;
@@ -429,6 +429,17 @@ int main() {
                     chunkCases, chunkWorst);
         std::printf("FLASHINFER_PASS %d graph cases, 26 dispatch guards, environment policy, worst relative L2 %.9g\n", cases,
                     worst);
+        // Exercise reuse selection boundaries, partial head groups, and a
+        // compressed cache disappearing/reappearing within the same graph.
+        double reuseWorst = 0;
+        int reuseCases = 0;
+        for (int width : {127, 128, 129, 511, 513, 1023})
+            for (auto shape : {std::pair<int,int>{33,3}, {64,6}, {127,17}}) {
+                reuseWorst = std::max(reuseWorst, RunCase(first, second, rng,
+                    shape.first, shape.second, width, 2, 10, true, 0, true));
+                reuseCases += 10;
+            }
+        std::printf("FLASHINFER_REUSE_PASS %d dynamic graph cases, worst relative L2 %.9g\n",reuseCases,reuseWorst);
         return 0;
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s\n", e.what());

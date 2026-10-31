@@ -16,6 +16,9 @@ struct Plan {
     float scale = 1.f;
     bool verifying = false;
     void *storage = nullptr;
+    bool gathered = false;
+    bf16 *decoded = nullptr;
+    int32_t *decodedIndices = nullptr;
     bf16 *mid = nullptr;
     float *midLse = nullptr;
     ~Plan() {
@@ -23,6 +26,51 @@ struct Plan {
             cudaFree(storage);
     }
 };
+
+// Decode each selected packed row once, then reuse it across query-head groups.
+// This performs the same BF16 multiply as the packed attention gather.
+template <bool Verify>
+__global__ void GatherAttentionKV(const FastllmV41FullDecodeRequest *requests,
+        const int32_t *selected, bf16 *decoded, int32_t *indices,
+        int width, int rows, int ratio) {
+    const int count = 128 + width;
+    const int task = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = task / 64, vector = task % 64;
+    if (row >= rows * count) return;
+    const int token = row / count, logical = row % count, d = vector * 8;
+    const auto request = requests[token];
+    const bool compressed = logical >= 128;
+    int id = -1;
+    if (compressed && request.compressedKV) {
+        const int k = logical - 128;
+        const int visible = ratio ? (request.position + 1) / ratio : 0;
+        const int end = Verify ? requests[0].position + rows : request.position + 1;
+        if (k < (ratio ? min(end / ratio, width) : 0)) {
+            id = selected[size_t(token) * width + k];
+            if (id < 0 || id >= visible) id = -1;
+        }
+    } else if (!compressed) {
+        const int p = request.position - 127 + logical;
+        const int end = Verify ? requests[0].position : request.position;
+        if (p >= 0 && p < end) id = p % 128;
+    }
+    if (!vector) indices[row] = id < 0 ? -1 : row;
+    uint64_t raw = 0;
+    __nv_bfloat162 scale = __floats2bfloat162_rn(0.f, 0.f);
+    if (id >= 0) {
+        const auto *src = static_cast<const uint8_t *>(compressed ? request.compressedKV : request.windowKV)
+            + size_t(id) * (compressed ? 288 : 528);
+        raw = compressed ? uint64_t(*reinterpret_cast<const uint32_t *>(src + d / 2))
+                         : *reinterpret_cast<const uint64_t *>(src + d);
+        scale = decode_e4m3_or_ue8m0_scale_bf16(src[(compressed ? 256 : 512) + d / (compressed ? 16 : 32)], compressed);
+    }
+    __nv_bfloat162 values[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+        values[j] = __hmul2(
+            decode_e2m1_or_e4m3_pair_bf16(uint32_t(raw >> (j * (compressed ? 8 : 16))), compressed), scale);
+    *reinterpret_cast<uint4 *>(decoded + size_t(row) * 512 + d) = *reinterpret_cast<uint4 *>(values);
+}
 
 // Merge old-KV splits, sink, and the unquantized current token in one pass.
 // Only the final result is rounded to BF16; QK and the weighted sum use FP32.
@@ -167,15 +215,15 @@ __global__ void MergeVerify(const bf16 *q, const bf16 *chunk, const bf16 *partia
     *reinterpret_cast<uint2 *>(output + t * 4) = result;
 }
 
-template <bool Verify, bool Requests = true>
+template <bool Verify, bool Requests = true, bool Decoded = false>
 auto AttentionKernel(int heads, bool compressed) {
-    return heads == 64 ? (compressed ? sparse_mla_decode_dsv41_bf16_kernel<64, true, Requests, Verify>
-                                    : sparse_mla_decode_dsv41_bf16_kernel<64, false, Requests, Verify>)
-                       : (compressed ? sparse_mla_decode_dsv41_bf16_kernel<0, true, Requests, Verify>
-                                     : sparse_mla_decode_dsv41_bf16_kernel<0, false, Requests, Verify>);
+    return heads == 64 ? (compressed ? sparse_mla_decode_dsv41_bf16_kernel<64, true, Requests, Verify, Decoded>
+                                    : sparse_mla_decode_dsv41_bf16_kernel<64, false, Requests, Verify, Decoded>)
+                       : (compressed ? sparse_mla_decode_dsv41_bf16_kernel<0, true, Requests, Verify, Decoded>
+                                     : sparse_mla_decode_dsv41_bf16_kernel<0, false, Requests, Verify, Decoded>);
 }
 
-template <bool Verify, bool Requests = true>
+template <bool Verify, bool Requests = true, bool Decoded = false>
 bool KernelReady(int heads, bool compressed) {
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess)
@@ -195,7 +243,7 @@ bool KernelReady(int heads, bool compressed) {
               cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
               major == 12 && minor >= 0 && minor <= 1;
     if (ok)
-        ok = cudaFuncSetAttribute(AttentionKernel<Verify, Requests>(heads, compressed),
+        ok = cudaFuncSetAttribute(AttentionKernel<Verify, Requests, Decoded>(heads, compressed),
             cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Dsv41Bf16Smem)) == cudaSuccess;
     if (!ok)
         cudaGetLastError();
@@ -215,6 +263,12 @@ void *FastllmV41FlashInferCreate(const FastllmV41FullDecodeConfig &c) {
                       : KernelReady<false>(c.heads, c.ratio != 0)))
         return nullptr;
     auto p = std::make_unique<Plan>();
+    // Head groups share the same selected KV. Bound temporary storage so
+    // long chunks retain the packed path without a large per-layer allocation.
+    const size_t decodedRows = size_t(c.batch) * (128 + c.topK);
+    p->gathered = c.ratio && c.heads >= 32 && c.topK >= 128 &&
+        decodedRows * (1024 + sizeof(int32_t)) <= (32u << 20);
+    if (p->gathered && !KernelReady<false, false, true>(c.heads, true)) p->gathered = false;
     p->width = c.ratio ? c.topK : 0;
     p->splits = 2 + (p->width + 63) / 64;
     p->ratio = c.ratio;
@@ -225,13 +279,24 @@ void *FastllmV41FlashInferCreate(const FastllmV41FullDecodeConfig &c) {
     p->scratchHeads = (c.heads + 15) / 16 * 16;
     // cudaMalloc aligns the BF16 split tensor; each split occupies 1024 bytes.
     const size_t midCount = size_t(c.batch) * p->scratchHeads * p->splits;
-    const size_t bytes = midCount * (512 * sizeof(bf16) + sizeof(float));
+    const size_t selectedRows = p->gathered ? decodedRows : 0;
+    const size_t baseBytes = midCount * (512 * sizeof(bf16) + sizeof(float));
+    const size_t bytes = baseBytes + selectedRows * (1024 + sizeof(int32_t));
     if (cudaMalloc(&p->storage, bytes) != cudaSuccess) {
         cudaGetLastError();
-        return nullptr;
+        // Optional decoded KV must not make a formerly supported plan fail.
+        if (!p->gathered || cudaMalloc(&p->storage, baseBytes) != cudaSuccess) {
+            cudaGetLastError();
+            return nullptr;
+        }
+        p->gathered = false;
     }
     p->mid = static_cast<bf16 *>(p->storage);
     p->midLse = reinterpret_cast<float *>(p->mid + midCount * 512);
+    if (p->gathered) {
+        p->decoded = reinterpret_cast<bf16 *>(p->midLse + midCount);
+        p->decodedIndices = reinterpret_cast<int32_t *>(p->decoded + selectedRows * 512);
+    }
     return p.release();
 }
 
@@ -244,13 +309,28 @@ cudaError_t FastllmV41FlashInferRun(void *handle, const FastllmV41FullDecodeBuff
     auto *p = static_cast<Plan *>(handle);
     if (!p || !request || !b.q || !b.kv || !b.output || !b.sink || (p->width && !b.topk))
         return cudaErrorInvalidValue;
-    auto kernel = p->verifying ? AttentionKernel<true>(p->heads, p->width != 0)
-                               : AttentionKernel<false>(p->heads, p->width != 0);
-    kernel<<<dim3(p->batch, p->scratchHeads / 16, p->splits), 256, sizeof(Dsv41Bf16Smem), stream>>>(
-        static_cast<const bf16 *>(b.q), nullptr, nullptr, p->mid, p->midLse, nullptr, nullptr,
-        p->width ? static_cast<const int32_t *>(b.topk) : nullptr, nullptr, p->width, 1, 288, p->batch,
-        p->heads, 128, p->splits, 1, p->scale, 528, 128, p->width, Dsv41Pages{1, false}, &request->windowKV,
-        p->width ? &request->compressedKV : nullptr, sizeof(*request), &request->position, p->ratio);
+    if (p->gathered) {
+        const int n = p->batch * (128 + p->width);
+        auto gather = p->verifying ? GatherAttentionKV<true> : GatherAttentionKV<false>;
+        gather<<<(n * 64 + 255) / 256, 256, 0, stream>>>(request,
+            static_cast<const int32_t *>(b.topk), p->decoded, p->decodedIndices, p->width, p->batch, p->ratio);
+        const cudaError_t gathered = cudaGetLastError();
+        if (gathered != cudaSuccess) return gathered;
+        auto kernel = AttentionKernel<false, false, true>(p->heads, true);
+        kernel<<<dim3(p->batch, p->scratchHeads / 16, p->splits), Dsv41Bf16Resources::BLOCK_THREADS, sizeof(Dsv41Bf16Smem), stream>>>(
+            static_cast<const bf16 *>(b.q), reinterpret_cast<const uint8_t *>(p->decoded), p->decodedIndices,
+            p->mid, p->midLse, nullptr, reinterpret_cast<const uint8_t *>(p->decoded), p->decodedIndices + 128,
+            nullptr, p->width, 1, 1024, p->batch, p->heads, 128, p->splits, 1, p->scale, 1024,
+            128 + p->width, 128 + p->width, Dsv41Pages{1, false}, nullptr, nullptr, sizeof(void *), nullptr, 0);
+    } else {
+        auto kernel = p->verifying ? AttentionKernel<true>(p->heads, p->width != 0)
+                                   : AttentionKernel<false>(p->heads, p->width != 0);
+        kernel<<<dim3(p->batch, p->scratchHeads / 16, p->splits), Dsv41Bf16Resources::BLOCK_THREADS, sizeof(Dsv41Bf16Smem), stream>>>(
+            static_cast<const bf16 *>(b.q), nullptr, nullptr, p->mid, p->midLse, nullptr, nullptr,
+            p->width ? static_cast<const int32_t *>(b.topk) : nullptr, nullptr, p->width, 1, 288, p->batch,
+            p->heads, 128, p->splits, 1, p->scale, 528, 128, p->width, Dsv41Pages{1, false}, &request->windowKV,
+            p->width ? &request->compressedKV : nullptr, sizeof(*request), &request->position, p->ratio);
+    }
     const cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess)
         return status;
@@ -321,7 +401,7 @@ cudaError_t FastllmV41FlashInferChunkRun(const FastllmV41FlashInferChunkConfig &
     auto status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     auto kernel = AttentionKernel<false, false>(c.heads, c.topK != 0);
-    kernel<<<dim3(l.tokens, l.heads / 16, l.splits), 256, sizeof(Dsv41Bf16Smem), stream>>>(
+    kernel<<<dim3(l.tokens, l.heads / 16, l.splits), Dsv41Bf16Resources::BLOCK_THREADS, sizeof(Dsv41Bf16Smem), stream>>>(
         static_cast<const bf16 *>(b.q), static_cast<const uint8_t *>(ring), ringIndices, mid, lse, nullptr,
         static_cast<const uint8_t *>(compressed), c.topK ? cmpIndices : nullptr, nullptr,
         c.topK, 1, 288, l.tokens, c.heads, 128, l.splits, 1, c.scale, 528, 128, c.topK, Dsv41Pages{1, false},

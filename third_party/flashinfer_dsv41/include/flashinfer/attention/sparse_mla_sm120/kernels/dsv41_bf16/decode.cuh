@@ -11,7 +11,7 @@
 
 namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16 {
 
-template <int NUM_HEADS, bool EXTRA_FP4, bool REQUEST_INDICES = false, bool VERIFY = false>
+template <int NUM_HEADS, bool EXTRA_FP4, bool REQUEST_INDICES = false, bool VERIFY = false, bool BF16_INPUT = false>
 __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
     sparse_mla_decode_dsv41_bf16_kernel(
         const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
@@ -108,29 +108,35 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
       for (int task = tidx; task < R::CANDIDATES * R::QK_VECTORS; task += R::BLOCK_THREADS) {
         const int row = task / R::QK_VECTORS, d = task % R::QK_VECTORS * R::VECTOR_ELEMS;
         const int index = sm.valid[row];
-        uint64_t raw = 0;
-        __nv_bfloat162 scale = __floats2bfloat162_rn(0.f, 0.f);
-        if (index >= 0) {
-          const int page = power_of_two ? (index >> (__ffs(pbs) - 1)) : (index / pbs);
-          const int slot = index - page * pbs;
-          const uint8_t* base = cache + (size_t)page * stride;
-          const auto data_offset =
-              Dsv41Fp4Layout::selected_data_offset<Dsv41Fp8Layout>(fp4, interleaved, size_t(slot));
-          const uint8_t* src = base + data_offset + (fp4 ? d / 2 : d);
-          raw = fp4 ? uint64_t(*reinterpret_cast<const uint32_t*>(src))
-                    : *reinterpret_cast<const uint64_t*>(src);
-          const auto scale_offset = Dsv41Fp4Layout::selected_scale_offset<Dsv41Fp8Layout>(
-              fp4, interleaved, size_t(pbs), size_t(slot));
-          const uint8_t sc = base[scale_offset + d / (fp4 ? Dsv41Fp4Layout::SCALE_GROUP
-                                                          : Dsv41Fp8Layout::QUANT_TILE)];
-          scale = decode_e4m3_or_ue8m0_scale_bf16(sc, fp4);
-        }
-        __nv_bfloat162 pairs[4];
+        if constexpr (BF16_INPUT) {
+          const uint4 data = index >= 0 ? *reinterpret_cast<const uint4 *>(cache + size_t(index) * 1024 + d * 2)
+                                       : make_uint4(0, 0, 0, 0);
+          *reinterpret_cast<uint4*>(&sm.kv[row][d]) = data;
+        } else {
+          uint64_t raw = 0;
+          __nv_bfloat162 scale = __floats2bfloat162_rn(0.f, 0.f);
+          if (index >= 0) {
+            const int page = power_of_two ? (index >> (__ffs(pbs) - 1)) : (index / pbs);
+            const int slot = index - page * pbs;
+            const uint8_t* base = cache + (size_t)page * stride;
+            const auto data_offset =
+                Dsv41Fp4Layout::selected_data_offset<Dsv41Fp8Layout>(fp4, interleaved, size_t(slot));
+            const uint8_t* src = base + data_offset + (fp4 ? d / 2 : d);
+            raw = fp4 ? uint64_t(*reinterpret_cast<const uint32_t*>(src))
+                      : *reinterpret_cast<const uint64_t*>(src);
+            const auto scale_offset = Dsv41Fp4Layout::selected_scale_offset<Dsv41Fp8Layout>(
+                fp4, interleaved, size_t(pbs), size_t(slot));
+            const uint8_t sc = base[scale_offset + d / (fp4 ? Dsv41Fp4Layout::SCALE_GROUP
+                                                            : Dsv41Fp8Layout::QUANT_TILE)];
+            scale = decode_e4m3_or_ue8m0_scale_bf16(sc, fp4);
+          }
+          __nv_bfloat162 pairs[4];
 #pragma unroll
-        for (int j = 0; j < 4; ++j)
-          pairs[j] = __hmul2(
-              decode_e2m1_or_e4m3_pair_bf16(uint32_t(raw >> (j * (fp4 ? 8 : 16))), fp4), scale);
-        *reinterpret_cast<uint4*>(&sm.kv[row][d]) = *reinterpret_cast<uint4*>(pairs);
+          for (int j = 0; j < 4; ++j)
+            pairs[j] = __hmul2(
+                decode_e2m1_or_e4m3_pair_bf16(uint32_t(raw >> (j * (fp4 ? 8 : 16))), fp4), scale);
+          *reinterpret_cast<uint4*>(&sm.kv[row][d]) = *reinterpret_cast<uint4*>(pairs);
+        }
       }
     };
     if ((pbs & (pbs - 1)) == 0)
