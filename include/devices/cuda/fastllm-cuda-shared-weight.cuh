@@ -36,7 +36,7 @@ struct SharedWeightView {
             uint64_t(destinationOffset) + uint64_t(rows) * rowBytes <= recordBytes;
     }
     uint32_t Alignment() const {
-        // Separating 16-byte payloads from 1-byte scales requires byte gather.
+        // The generic adapter cannot copy a word across a planar boundary.
         return rowBytes | tileStride | rowStride | blockBytes | blockStride |
                sourceOffset | destinationOffset | uint32_t(block32Planar);
     }
@@ -91,6 +91,81 @@ struct SharedExpertLayout {
 };
 
 namespace shared_weight_detail {
+// A block32 record contains sixteen payload bytes and one scale byte. Resolve
+// its NUMA/row address once, then load aligned words and publish one uint4.
+// Shard extents are word-aligned, so the final word containing the scale is
+// in bounds even when the 17-byte block starts at an unaligned address.
+template<bool Batch>
+__global__ void RestoreBlock32Planar(SharedExpertLayout layout,
+        const uint8_t *gate, const uint8_t *down, uint8_t *destination,
+        void *const *pointers, const int32_t *sourceIds,
+        const int32_t *destinationIds, const int32_t *count, int stage) {
+    const unsigned request = Batch ? blockIdx.y / 2 : 0;
+    const unsigned part = Batch ? blockIdx.y % 2 : (stage < 0 ? blockIdx.y : stage);
+    if (Batch && int(request) >= *count) return;
+    const int expert = Batch ? sourceIds[request] : 0;
+    const int slot = Batch ? destinationIds[request] : 0;
+    const auto &view = layout.weights[part];
+    const unsigned blocksPerRow = view.rowBytes / 17;
+    const size_t blocks = size_t(view.rows) * blocksPerRow;
+    uint8_t *record = destination + size_t(slot) * layout.recordBytes + view.destinationOffset;
+    for (size_t block = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         block < blocks; block += size_t(gridDim.x) * blockDim.x) {
+        unsigned row = block / blocksPerRow;
+        const unsigned column = (block - size_t(row) * blocksPerRow) * 17;
+        const unsigned group = row / view.groupRows;
+        row = row * view.rowGroups - group * (view.rows - 1);
+        const unsigned shard = row / view.rowsPerShard;
+        row -= shard * view.rowsPerShard;
+        const unsigned tile = row / view.tileRows;
+        const size_t offset = view.sourceOffset + size_t(tile) * view.tileStride +
+            size_t(row - tile * view.tileRows) * view.rowStride + column;
+        const auto *base = pointers ? static_cast<const uint8_t *>(
+            pointers[(expert * 2 + part) * layout.shards + shard]) :
+            (part ? down : gate) + size_t(shard) * view.shardBytes;
+        // Borrowed views may start inside an allocation. Do not round such a
+        // pointer down and read bytes outside the owner's declared extent.
+        if (reinterpret_cast<uintptr_t>(base) & 3) {
+            #pragma unroll
+            for (unsigned byte = 0; byte < 16; ++byte)
+                record[block * 16 + byte] = base[offset + byte];
+            record[blocks * 16 + block] = base[offset + 16];
+            continue;
+        }
+        const unsigned shift = (offset & 3) * 8;
+        const auto *words = reinterpret_cast<const uint32_t *>(base + (offset & ~size_t(3)));
+        const uint32_t a = words[0], b = words[1], c = words[2], d = words[3];
+        uint4 value = make_uint4(a, b, c, d);
+        if (shift) {
+            const uint32_t e = words[4];
+            value = make_uint4(__funnelshift_r(a, b, shift), __funnelshift_r(b, c, shift),
+                              __funnelshift_r(c, d, shift), __funnelshift_r(d, e, shift));
+        }
+        reinterpret_cast<uint4 *>(record)[block] = value;
+        record[blocks * 16 + block] = base[offset + 16];
+    }
+}
+
+inline bool ContiguousBlock32Planar(const SharedExpertLayout &layout) {
+    if (!layout.shards || layout.auxiliaryBytes) return false;
+    uint64_t bytes = 0;
+    for (const auto &view : layout.weights) {
+        if (!view.block32Planar || !view.Valid(layout.shards, layout.recordBytes) ||
+            view.destinationOffset != bytes || (view.destinationOffset & 15) ||
+            (view.shardBytes & 3) || view.blockBytes != view.rowBytes ||
+            view.blockStride != view.rowBytes || view.groupRows != view.rows / view.rowGroups)
+            return false;
+        bytes += uint64_t(view.rows) * view.rowBytes;
+    }
+    return bytes == layout.recordBytes && !(bytes & 15);
+}
+
+inline unsigned Block32PlanarGrid(const SharedExpertLayout &layout, unsigned blocks, unsigned threads) {
+    const size_t work = std::max(size_t(layout.weights[0].rows) * (layout.weights[0].rowBytes / 17),
+                                 size_t(layout.weights[1].rows) * (layout.weights[1].rowBytes / 17));
+    return unsigned(std::min(size_t(blocks), (work + threads - 1) / threads));
+}
+
 // Resolve the same byte view for mapped NUMA shards and concatenated uploads.
 __device__ inline size_t SourceOffset(const SharedWeightView &view, uint32_t offset,
                                      uint32_t &shard) {
@@ -291,6 +366,15 @@ inline bool CopySharedExpertRecord(const SharedExpertLayout &layout, void *const
         const uint8_t *gate, const uint8_t *down, const uint8_t *auxiliary,
         uint8_t *destination, cudaStream_t stream, int stage = -1) {
     if ((!pointers && (!gate || !down)) || !destination || (layout.auxiliaryBytes && !auxiliary)) return false;
+    if (stage >= -1 && stage <= 1 &&
+        !((reinterpret_cast<uintptr_t>(gate) | reinterpret_cast<uintptr_t>(down) |
+           reinterpret_cast<uintptr_t>(destination)) & 15) &&
+        shared_weight_detail::ContiguousBlock32Planar(layout)) {
+        const unsigned blocks = shared_weight_detail::Block32PlanarGrid(layout, 256, 256);
+        shared_weight_detail::RestoreBlock32Planar<false><<<dim3(blocks, stage < 0 ? 2 : 1), 256, 0, stream>>>(
+            layout, gate, down, destination, pointers, nullptr, nullptr, nullptr, stage);
+        return cudaGetLastError() == cudaSuccess;
+    }
     if (!pointers && stage < 0 &&
         !((reinterpret_cast<uintptr_t>(gate) | reinterpret_cast<uintptr_t>(down) |
            reinterpret_cast<uintptr_t>(destination)) & 15) &&
@@ -358,8 +442,16 @@ inline bool CopySharedExpertRecords(const SharedExpertLayout &layout,
         const int32_t *sourceIds, const int32_t *destinationIds, const int32_t *count,
         int maxRecords, RecordCopyLaunch launch, cudaStream_t stream) {
     if (!pointers || !destination || !sourceIds || !destinationIds || !count ||
-        maxRecords <= 0 || layout.recordBytes > UINT32_MAX / uint32_t(maxRecords) ||
+        maxRecords <= 0 || launch.blocks <= 0 || launch.threads <= 0 ||
+        layout.recordBytes > UINT32_MAX / uint32_t(maxRecords) ||
         (layout.auxiliaryBytes && !auxiliary)) return false;
+    if (maxRecords <= 32767 && !(reinterpret_cast<uintptr_t>(destination) & 15) &&
+        shared_weight_detail::ContiguousBlock32Planar(layout)) {
+        const unsigned blocks = shared_weight_detail::Block32PlanarGrid(layout, launch.blocks, launch.threads);
+        shared_weight_detail::RestoreBlock32Planar<true><<<dim3(blocks, 2 * maxRecords), launch.threads, 0, stream>>>(
+            layout, nullptr, nullptr, destination, pointers, sourceIds, destinationIds, count, -1);
+        return cudaGetLastError() == cudaSuccess;
+    }
     if (layout.scatter && layout.readBytes <= UINT32_MAX / uint32_t(maxRecords)) {
         shared_weight_detail::Scatter<><<<launch.blocks, launch.threads, 0, stream>>>(
             layout, pointers, auxiliary, destination, sourceIds, destinationIds, count);

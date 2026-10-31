@@ -12,7 +12,7 @@ static void Require(bool ok, const char *message) {
     if (!ok) throw std::runtime_error(message);
 }
 
-static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar) {
+static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar, unsigned sourceSkew = 0) {
     using namespace fastllm::cuda;
     SharedExpertLayout layout;
     layout.shards = shards;
@@ -25,10 +25,12 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar) {
     const size_t bytes = size_t(layout.sourceBytes[0]) + layout.sourceBytes[1];
     constexpr unsigned records = 2, guard = 32;
     const size_t stride = size_t(layout.recordBytes) + 2 * guard;
-    std::vector<void *> host(records * 2 * shards), mapped(host.size());
+    std::vector<void *> host(records * 2 * shards), mapped(host.size()), owners(host.size());
     for (unsigned i = 0; i < host.size(); ++i) {
-        Check(cudaHostAlloc(&host[i], layout.weights[(i / shards) % 2].shardBytes, cudaHostAllocMapped));
-        Check(cudaHostGetDevicePointer(&mapped[i], host[i], 0));
+        Check(cudaHostAlloc(&owners[i], layout.weights[(i / shards) % 2].shardBytes + sourceSkew, cudaHostAllocMapped));
+        Check(cudaHostGetDevicePointer(&mapped[i], owners[i], 0));
+        host[i] = static_cast<uint8_t *>(owners[i]) + sourceSkew;
+        mapped[i] = static_cast<uint8_t *>(mapped[i]) + sourceSkew;
     }
     void **devicePointers;
     uint8_t *scratch, *actual, *legacy;
@@ -77,8 +79,9 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar) {
                     }
                 }
             }
-            Require(CopySharedExpertRecord(layout, devicePointers + record * 2 * shards,
-                nullptr, nullptr, nullptr, legacy + record * layout.recordBytes, stream), "legacy copy rejected");
+            for (int stage : {0, 1})
+                Require(CopySharedExpertRecord(layout, devicePointers + record * 2 * shards,
+                    nullptr, nullptr, nullptr, legacy + record * layout.recordBytes, stream, stage), "staged copy rejected");
         }
         Check(cudaMemsetAsync(actual, 0xa5, output.size(), stream));
         Check(cudaGraphLaunch(exec, stream));
@@ -93,12 +96,37 @@ static void Run(unsigned hidden, unsigned inter, unsigned shards, bool planar) {
             for (unsigned j = 0; j < guard; ++j)
                 Require(result[j] == 0xa5 && result[layout.recordBytes + guard + j] == 0xa5, "guard overwritten");
         }
+        // Batched graph replay reads its count and route IDs on the device.
+        // Change both between replays, including zero work and a repeated source.
+        int32_t *ids;
+        Check(cudaMalloc(&ids, 5 * sizeof(int32_t)));
+        cudaGraph_t batchGraph;
+        cudaGraphExec_t batchExec;
+        Check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        Require(CopySharedExpertRecords(layout, devicePointers, nullptr, legacy,
+            ids, ids + 2, ids + 4, records, {32, 256}, stream), "batch copy rejected");
+        Check(cudaStreamEndCapture(stream, &batchGraph));
+        Check(cudaGraphInstantiate(&batchExec, batchGraph, nullptr, nullptr, 0));
+        for (int count : {0, 1, 2}) {
+            const int32_t mapping[5] = {1, pass == 1 ? 1 : 0, 1, 0, count};
+            Check(cudaMemsetAsync(legacy, 0xa5, old.size(), stream));
+            Check(cudaMemcpyAsync(ids, mapping, sizeof(mapping), cudaMemcpyHostToDevice, stream));
+            Check(cudaGraphLaunch(batchExec, stream));
+            Check(cudaStreamSynchronize(stream));
+            Check(cudaMemcpy(old.data(), legacy, old.size(), cudaMemcpyDeviceToHost));
+            std::vector<uint8_t> batchExpected(old.size(), 0xa5);
+            for (int i = 0; i < count; ++i)
+                std::memcpy(batchExpected.data() + mapping[2 + i] * layout.recordBytes,
+                    expected.data() + mapping[i] * layout.recordBytes, layout.recordBytes);
+            Require(old == batchExpected, "batch dynamic-count/CPU oracle mismatch");
+        }
+        cudaGraphExecDestroy(batchExec); cudaGraphDestroy(batchGraph); cudaFree(ids);
     }
     cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
     cudaFree(devicePointers); cudaFree(scratch); cudaFree(actual); cudaFree(legacy);
-    for (auto p : host) cudaFreeHost(p);
-    std::printf("PASS shared upload hidden=%u inter=%u shards=%u bytes=%u two records, three graph replays\n",
-        hidden, inter, shards, layout.recordBytes);
+    for (auto p : owners) cudaFreeHost(p);
+    std::printf("PASS shared upload hidden=%u inter=%u shards=%u skew=%u bytes=%u staged and dynamic batch graphs\n",
+        hidden, inter, shards, sourceSkew, layout.recordBytes);
 }
 
 int main(int argc, char **argv) {
@@ -106,11 +134,13 @@ int main(int argc, char **argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
     try {
-        for (unsigned shards : {1u, 2u, 4u}) {
+        for (unsigned shards : {1u, 2u, 4u, 8u}) {
+            Run(96, 96, shards, planar);
             Run(128, 128, shards, planar);
             Run(512, 256, shards, planar);
             Run(5120, 2304, shards, planar);
         }
+        if (planar) for (unsigned skew : {1u, 2u, 3u}) Run(128, 96, 2, true, skew);
         std::puts("ALL_PASS shared expert DMA upload");
         return 0;
     } catch (const std::exception &e) {
