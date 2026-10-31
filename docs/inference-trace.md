@@ -81,6 +81,13 @@ python -m unittest discover -s test/api -p 'test_inference_trace.py' -v
 仅含调度线程，wall 与 CPU 的差额可能包括等待、抢占以及其他线程/GPU 的工作，不能
 直接当作 GPU 空闲。异步 TP worker 和 API worker 不继承此线程局部记录。
 
+长前缀预览会按独立 KV manager 使用常驻 worker，最多使用 `min(threads, 8)` 路，
+其中一路由调度线程执行；短查询和热锚点仍串行处理。采样时这些 worker 各有独立记录，
+合并到 `prefill_preview_workers_sum` 区域：其中 wall/CPU 时间是并行 worker 的累计时间，
+不能与主线程 elapsed 时间相加，也不能作为单步耗时。`preview.trie_queries` 保留调用者
+看到的完整墙钟时间，`preview.parallel_managers` 记录本步交给并行路径的 manager 数。
+原 `prefill_preview` 内的页计数仅属于串行部分；全部页计数需加上 worker 区域对应计数。
+
 细分日志没有额外 CUDA 调用、同步或逐页时钟读取。关闭或未采样时探针只检查指针，
 不分配内存、不读时钟；采样时使用固定 128 项存储，超限在 `dropped_metrics` 计数。
 计时本身仍有成本，应同时检查抽样/未抽样步骤；该日志用于归因，不改变调度、采样

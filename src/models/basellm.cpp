@@ -6,6 +6,8 @@
 #include "utils.h"
 #include "utils/cuda_cache_budget.h"
 #include "utils/inference_trace.h"
+#include "utils/dense_id_set.h"
+#include "utils/paged_prefix_preview.h"
 #include <sstream>
 #include <cstring>
 #include <cstdlib>
@@ -1405,7 +1407,7 @@ namespace fastllm {
     // generations are checked afresh; only topology and immutable paths are reused.
     static int PreviewResidentPrefix(basellm *model, ResponseContext *ctx,
                                      PagedCacheManager *budgetManager, std::vector<int> &unreferenced,
-                                     ResidentPrefixManagers &plan) {
+                                     ResidentPrefixManagers &plan, PagedPrefixPreviewExecutor &executor) {
         auto *detail = inference_trace::CurrentDetail();
         inference_trace::DetailSpan previewTrace("preview.reset", detail);
         if (detail) detail->Count("preview.query_tokens", ctx->currentTokens.size());
@@ -1428,10 +1430,7 @@ namespace fastllm {
             int pages = probe->PreviewPrefix(hashes, preview.matches[probe]);
             // A full prompt match must leave at least one token for logits.
             if ((size_t)pages * probe->pageLen >= ctx->currentTokens.size()) --pages;
-            for (size_t i = 1; i < plan.managers.size() && pages > 0; ++i) {
-                auto *manager = plan.managers[i];
-                pages = std::min(pages, manager->PreviewPrefix(hashes, preview.matches[manager]));
-            }
+            pages = executor.Query(plan.managers, hashes, preview.matches, pages, GetThreads());
             if (pages > 0) {
                 previewTrace.Next("preview.model_history");
                 length = model->PreviewPagedPrefixCacheExtra(ctx, pages * probe->pageLen, preview);
@@ -3041,6 +3040,8 @@ namespace fastllm {
                     // without allocating and destroying their queues every token.
                     LastTokensManager tokensManager;
                     tokensManager.units.reserve(maxBatch);
+                    DenseIdSet<> protectedPages;
+                    PagedPrefixPreviewExecutor prefixPreviewExecutor;
                     while (true) {
                         std::unique_ptr<inference_trace::Step> trace;
                         if (traceInference) trace.reset(new inference_trace::Step());
@@ -3236,7 +3237,7 @@ namespace fastllm {
                             if (policy.maxWaitMs > 0 && activeDecode >= std::max(1, policy.minDecodeRequests)) {
                                 long long previewReserved = reservedPages;
                                 const long long available = sharedKvPool ? freePagedPages() : 0;
-                                std::unordered_set<int> protectedPages;
+                                protectedPages.Reset(sharedKvPool ? pagedManager->maxPages : 0);
                                 ResidentPrefixManagers previewManagers;
                                 for (auto &order : orders) {
                                     auto *ctx = model->responseContextDict.dicts.at(order.second);
@@ -3246,7 +3247,8 @@ namespace fastllm {
                                     if (candidates >= slots) { capacityLimited = true; break; }
                                     std::vector<int> unreferenced;
                                     const int prefix = PreviewResidentPrefix(model, ctx,
-                                        sharedKvPool ? pagedManager : nullptr, unreferenced, previewManagers);
+                                        sharedKvPool ? pagedManager : nullptr, unreferenced, previewManagers,
+                                        prefixPreviewExecutor);
                                     const int count = (int)ctx->currentTokens.size() - prefix;
                                     const bool single = count > prefillChunk || !ctx->multimodalInput.empty();
                                     if (candidates && (single || pendingTokens + count > prefillBatchLimit)) {
@@ -3257,14 +3259,14 @@ namespace fastllm {
                                         inference_trace::DetailSpan capacityTrace("capacity_and_dedup", detail);
                                         if (detail) detail->Count("unreferenced_pages", unreferenced.size());
                                         long long pins = 0;
-                                        for (int page : unreferenced) pins += !protectedPages.count(page);
+                                        for (int page : unreferenced) pins += !protectedPages.Contains(page);
                                         const long long growth = std::max(0LL, remainingPages(ctx) - prefix / pageLen);
                                         if (previewReserved + growth + pins > available) {
                                             capacityLimited = true;
                                             break;
                                         }
                                         previewReserved += growth + pins;
-                                        protectedPages.insert(unreferenced.begin(), unreferenced.end());
+                                        for (int page : unreferenced) protectedPages.Insert(page);
                                     }
                                     ++candidates;
                                     pendingTokens += std::min(count, prefillChunk);
