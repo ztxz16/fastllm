@@ -2189,6 +2189,12 @@ if (UNIT_TEST)
                 set_tests_properties(naive_n05_kvmem_${NAIVE_SPARSE_KV_TYPE}
                     PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                     PASS_REGULAR_EXPRESSION "KVMEM MODEL PASS")
+                add_test(NAME naive_n05_kvmem_transition_${NAIVE_SPARSE_KV_TYPE}
+                    COMMAND naive_n05_verify_graph_test 4 serving_kvmem_transition ${NAIVE_SPARSE_KV_TYPE} context_shard fp8)
+                set_tests_properties(naive_n05_kvmem_transition_${NAIVE_SPARSE_KV_TYPE} PROPERTIES
+                    LABELS cuda RUN_SERIAL TRUE TIMEOUT 120 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "SERVING PAGE GROWTH PASS"
+                    ENVIRONMENT "FASTLLM_CUDA_GRAPH=1")
                 add_test(NAME naive_n05_kvmem_prefix_${NAIVE_SPARSE_KV_TYPE}
                     COMMAND naive_n05_verify_graph_test 4 kvmem_prefix ${NAIVE_SPARSE_KV_TYPE} fp8 layer_shard)
                 set_tests_properties(naive_n05_kvmem_prefix_${NAIVE_SPARSE_KV_TYPE}

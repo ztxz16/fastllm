@@ -192,10 +192,10 @@ namespace fastllm {
                        TargetWorkspace *workspace = nullptr, const TargetBatch *batch = nullptr);
         int CacheReserveCapacity(const GenerationConfig &config) const;
         void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0);
-        void ReserveCache(Data &cache, int capacity, int width);
+        void ReserveCache(Data &cache, int capacity, int width, const Data *requestKey = nullptr);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end,
-                               std::vector<Data *> *pendingPageTables);
+                               std::vector<Data *> *pendingPageTables, const Data *requestKey = nullptr);
         void UploadPagedCacheTables(const std::vector<Data *> &pendingPageTables);
         static void TrimCache(Data &cache, int length);
         int SampleTarget(Data &logits, std::vector<std::pair<Data, Data>> &kv,
@@ -259,12 +259,15 @@ namespace fastllm {
         struct TPServingState;
         std::shared_ptr<TPServingState> tpServingState;
         std::atomic<uint64_t> tpCacheEpoch{0};
-        // Request lifetimes are independent of tensor/pool layout changes.
-        // A fresh identity prevents a recycled Data address from reviving a plan.
+        // A fresh identity protects both request lifetime and owned KV layout.
+        // Unknown/global changes still invalidate every plan through tpCacheEpoch.
         mutable std::mutex tpRequestMutex;
         std::unordered_map<const Data *, uint64_t> tpRequestIds;
         uint64_t tpNextRequestId = 0;
+        void InvalidateTensorParallelCache(const Data *requestKey = nullptr);
         bool CanReuseTensorParallelServingCache(const TargetBatch *batch, bool checkCapacity = true) const;
+        std::vector<unsigned char> ReusableTensorParallelServingRows(const TargetBatch *batch,
+                                                                    bool checkCapacity = true) const;
         void ReorderTensorParallelServingCache(const TargetBatch *batch);
         void PrepareTensorParallelServing();
         bool PrepareTensorParallelServingDecode(const Data &inputIds,

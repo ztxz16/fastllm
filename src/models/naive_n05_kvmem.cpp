@@ -223,6 +223,7 @@ void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data
     if (!sparseKv) return;
     auto lease = std::static_pointer_cast<SparseKvState::Lease>(roots.front().first->kvStorageOwner);
     if (lease) return;
+    InvalidateTensorParallelCache(roots.front().first);
     {
         lease = std::make_shared<SparseKvState::Lease>();
         lease->storage = sparseKv;
@@ -327,7 +328,6 @@ void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data
             root.Resize({1, past, width});
         }
     }
-    tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
 #endif
 }
 

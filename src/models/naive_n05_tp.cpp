@@ -588,6 +588,46 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
 #endif
 }
 
+void NaiveN05FlashModel::InvalidateTensorParallelCache(const Data *requestKey) {
+    // A non-null key must be the owning request's first K root. Call before
+    // changing its descriptors, including paths that may subsequently throw.
+    if (requestKey) {
+        std::lock_guard<std::mutex> guard(tpRequestMutex);
+        auto request = tpRequestIds.find(requestKey);
+        if (request != tpRequestIds.end()) {
+            request->second = ++tpNextRequestId;
+            return;
+        }
+    }
+    tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::vector<unsigned char> NaiveN05FlashModel::ReusableTensorParallelServingRows(
+        const TargetBatch *batch, bool checkCapacity) const {
+    std::vector<unsigned char> valid(batch ? batch->Size() : 0, 0);
+#ifdef USE_CUDA
+    if (!tpServingState || tpServingState->preparing || !batch || !batch->Decode() ||
+        !mainLoop || mainLoop->get_id() != std::this_thread::get_id()) return valid;
+    const auto &s = *tpServingState;
+    const size_t rows = batch->Size(), stride = (size_t)block_cnt * tpDevices.size() * 2;
+    if (s.cacheEpoch != tpCacheEpoch.load(std::memory_order_relaxed) || s.requests.size() != rows ||
+        s.requestIds.size() != rows || s.expectedLengths.size() != rows || s.capacityLimits.size() != rows ||
+        s.cacheLengths.size() != rows * (stride + block_cnt * 2) || s.pageLengths.size() != rows * stride ||
+        s.cachePointers.size() != rows * stride || s.pageTables.size() != rows * stride ||
+        s.cacheCapacities.size() != rows * stride) return valid;
+    std::lock_guard<std::mutex> guard(tpRequestMutex);
+    for (size_t row = 0; row < rows; ++row) {
+        const Data &root = batch->Key(row, 0);
+        auto identity = tpRequestIds.find(&root);
+        valid[row] = &root == s.requests[row] && identity != tpRequestIds.end() &&
+            identity->second == s.requestIds[row] && root.dims.size() == 3 &&
+            root.dims[1] == s.expectedLengths[row] &&
+            (!checkCapacity || root.dims[1] < s.capacityLimits[row]);
+    }
+#endif
+    return valid;
+}
+
 bool NaiveN05FlashModel::CanReuseTensorParallelServingCache(const TargetBatch *batch, bool checkCapacity) const {
 #ifdef USE_CUDA
     // Only the owned scheduler promises that descriptors cannot be mutated
@@ -619,17 +659,20 @@ void NaiveN05FlashModel::ReorderTensorParallelServingCache(const TargetBatch *ba
         !mainLoop || mainLoop->get_id() != std::this_thread::get_id()) return;
     auto &s = *tpServingState;
     const size_t rows = batch->Size(), oldRows = s.requests.size();
-    if (!rows || rows > oldRows || s.cacheEpoch != tpCacheEpoch.load(std::memory_order_relaxed) ||
+    if (!rows || !oldRows || s.cacheEpoch != tpCacheEpoch.load(std::memory_order_relaxed) ||
         s.requestIds.size() != oldRows) return;
     bool sameOrder = rows == oldRows;
     for (size_t row = 0; sameOrder && row < rows; ++row)
         sameOrder = &batch->Key(row, 0) == s.requests[row];
-    if (sameOrder) return; // The ordinary reuse check still verifies identities.
+    if (sameOrder && CanReuseTensorParallelServingCache(batch, false)) return;
     const size_t stride = (size_t)block_cnt * tpDevices.size() * 2;
     const size_t rootStride = (size_t)block_cnt * 2;
     if (s.cacheLengths.size() != oldRows * (stride + rootStride) ||
         s.pageLengths.size() != oldRows * stride || s.cachePointers.size() != oldRows * stride ||
         s.pageTables.size() != oldRows * stride || s.cacheCapacities.size() != oldRows * stride) return;
+    // Repeated preparation before publishing the table must retain its original
+    // row mapping. Dirty request identities are checked again during validation.
+    if (sameOrder && s.bindingsDirty) return;
     std::unordered_map<const Data *, size_t> positions;
     for (size_t row = 0; row < oldRows; ++row) positions.emplace(s.requests[row], row);
     std::vector<size_t> order;
@@ -640,20 +683,21 @@ void NaiveN05FlashModel::ReorderTensorParallelServingCache(const TargetBatch *ba
             const Data &root = batch->Key(row, 0);
             auto previous = positions.find(&root);
             auto identity = tpRequestIds.find(&root);
-            if (previous == positions.end() || identity == tpRequestIds.end() ||
-                identity->second != s.requestIds[previous->second] || root.dims.size() != 3 ||
-                root.dims[1] != s.expectedLengths[previous->second]) return;
-            order.push_back(previous->second);
-            positions.erase(previous); // A request may not occupy two rows.
+            const bool retained = previous != positions.end() && identity != tpRequestIds.end() &&
+                identity->second == s.requestIds[previous->second] && root.dims.size() == 3 &&
+                root.dims[1] == s.expectedLengths[previous->second];
+            order.push_back(retained ? previous->second : SIZE_MAX);
+            if (previous != positions.end()) positions.erase(previous);
         }
     }
     // Copy descriptors only; never dereference pointers belonging to departed
     // requests. The retained identities were checked above, including ABA reuse.
-    const bool compact = std::is_sorted(order.begin(), order.end());
+    const bool compact = std::find(order.begin(), order.end(), SIZE_MAX) == order.end() &&
+                         std::is_sorted(order.begin(), order.end());
     // Graph variants share one table per rank. A monotone subset can compact
     // its already validated rows directly, including sparse-indexer bindings.
     // Do not compose with an earlier, still-unpublished table permutation.
-    if (compact && !s.bindingsDirty) {
+    if (!s.bindingsDirty) {
         s.bindingOrder = order;
         s.boundRowsBeforeCompaction = oldRows;
     } else {
@@ -667,9 +711,10 @@ void NaiveN05FlashModel::ReorderTensorParallelServingCache(const TargetBatch *ba
             values.resize(rows * width);
         } else {
             auto old = std::move(values);
-            values.resize(rows * width);
+            values.assign(rows * width, {});
             for (size_t row = 0; row < rows; ++row)
-                std::copy_n(old.begin() + order[row] * width, width, values.begin() + row * width);
+                if (order[row] != SIZE_MAX)
+                    std::copy_n(old.begin() + order[row] * width, width, values.begin() + row * width);
         }
     };
     if (compact) {
@@ -681,8 +726,9 @@ void NaiveN05FlashModel::ReorderTensorParallelServingCache(const TargetBatch *ba
         s.cacheLengths.resize(rows * (stride + rootStride));
     } else {
         auto lengths = std::move(s.cacheLengths);
-        s.cacheLengths.resize(rows * (stride + rootStride));
+        s.cacheLengths.assign(rows * (stride + rootStride), nullptr);
         for (size_t row = 0; row < rows; ++row) {
+            if (order[row] == SIZE_MAX) continue;
             std::copy_n(lengths.begin() + order[row] * stride, stride, s.cacheLengths.begin() + row * stride);
             std::copy_n(lengths.begin() + oldRows * stride + order[row] * rootStride, rootStride,
                         s.cacheLengths.begin() + rows * stride + row * rootStride);
@@ -692,6 +738,7 @@ void NaiveN05FlashModel::ReorderTensorParallelServingCache(const TargetBatch *ba
     reorder(s.expectedLengths, 1); reorder(s.capacityLimits, 1);
     reorder(s.pageLengths, stride); reorder(s.cachePointers, stride);
     reorder(s.pageTables, stride); reorder(s.cacheCapacities, stride);
+    for (size_t row = 0; row < rows; ++row) s.requests[row] = &batch->Key(row, 0);
     s.bindingsDirty = true;
 #endif
 }
@@ -746,13 +793,35 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
     const uint64_t epoch = tpCacheEpoch.load(std::memory_order_relaxed);
     if (reuse) cacheLengths = serving.cacheLengths;
     else {
-        serving.bindingOrder.clear();
+        auto retained = ReusableTensorParallelServingRows(batch);
+        const bool partial = std::find(retained.begin(), retained.end(), 1) != retained.end();
+        if (!partial) serving.bindingOrder.clear();
+        else if (!serving.bindingOrder.empty())
+            for (int row = 0; row < rows; ++row)
+                if (!retained[row]) serving.bindingOrder[row] = SIZE_MAX;
         cacheLengths.resize(slots + (size_t)rows * block_cnt * 2);
-        std::vector<void *> pointers(slots), pageTables(slots);
-        std::vector<int *> pageLengths(slots);
-        std::vector<int> capacities(slots), valid(rows, 1), limits(rows, INT_MAX);
+        auto &pointers = serving.cachePointers;
+        auto &pageTables = serving.pageTables;
+        auto &pageLengths = serving.pageLengths;
+        auto &capacities = serving.cacheCapacities;
+        auto &limits = serving.capacityLimits;
+        std::vector<int> valid(rows, 1);
+        if (partial) cacheLengths = serving.cacheLengths;
+        else {
+            pointers.resize(slots); pageTables.resize(slots);
+            pageLengths.resize(slots); capacities.resize(slots);
+            limits.assign(rows, INT_MAX);
+            serving.requestIds.assign(rows, 0);
+        }
+        // Dirty rows are never reusable until every validation succeeds. This
+        // lets workers update disjoint rows in place without copying the whole
+        // retained plan; an allocation/validation failure cannot publish it.
+        for (int row = 0; row < rows; ++row)
+            if (!retained[row]) serving.requestIds[row] = 0;
         ForSequenceRanges(tpWorkers, tpDevices, rows, true, [&](int begin, int end) {
             for (int row = begin; row < end; ++row) {
+                if (retained[row]) continue;
+                limits[row] = INT_MAX;
                 const int next = batch->Key(row, 0).dims[1] + 1;
                 auto validate = [&]() {
                     for (int layer = 0; layer < block_cnt; ++layer) {
@@ -799,12 +868,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
             }
         });
         if (std::find(valid.begin(), valid.end(), 0) != valid.end()) { cacheLengths.clear(); return false; }
-        serving.capacityLimits = std::move(limits);
         serving.cacheLengths = cacheLengths;
-        serving.pageLengths = std::move(pageLengths);
-        serving.cachePointers = std::move(pointers);
-        serving.pageTables = std::move(pageTables);
-        serving.cacheCapacities = std::move(capacities);
         serving.cacheEpoch = epoch;
         serving.requests.resize(rows);
         serving.requestIds.assign(rows, 0);
@@ -826,15 +890,32 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
         // must be rebound even when returning to a previously used graph variant.
         for (int rank = 0; rank < ranks; ++rank) {
             auto &storage = *state->ranks[rank]->storage;
-            if (!serving.bindingOrder.empty() &&
-                (storage.hostMaps.empty() || (!tpPagedCaches.empty() && !serving.preparing))) {
+            const bool partialBindings = !serving.bindingOrder.empty() &&
+                (storage.hostMaps.empty() || (!tpPagedCaches.empty() && !serving.preparing));
+            if (partialBindings) {
                 // Merge adjacent source rows into memmove spans. A one-row
                 // departure normally needs a single move per layer, rather
                 // than reinterpreting every request/layer/K/V descriptor.
+                const bool compact =
+                    std::find(serving.bindingOrder.begin(), serving.bindingOrder.end(), SIZE_MAX) == serving.bindingOrder.end() &&
+                    std::is_sorted(serving.bindingOrder.begin(), serving.bindingOrder.end());
+                std::vector<void *> oldTable;
                 for (int layer = 0; layer < block_cnt; ++layer) {
                     const size_t width = sparseKv && !slidingLayers[layer] ? 8 : 4;
                     auto *table = storage.hostCache.data() +
                         (size_t)layer * storage.maxRows * (sparseKv ? 8 : 4);
+                    if (!compact) {
+                        // Insertion/permutation can move rows backwards as well
+                        // as forwards. Copy validated bindings before overwriting.
+                        oldTable.assign(table, table + serving.boundRowsBeforeCompaction * width);
+                        for (int row = 0; row < rows; ++row) {
+                            const size_t from = serving.bindingOrder[row];
+                            if (from == SIZE_MAX) std::fill_n(table + row * width, width, nullptr);
+                            else std::copy_n(oldTable.data() + from * width, width, table + row * width);
+                        }
+                        std::fill(table + (size_t)rows * width, table + storage.maxRows * width, nullptr);
+                        continue;
+                    }
                     for (size_t begin = 0, end; begin < (size_t)rows; begin = end) {
                         end = begin + 1;
                         while (end < (size_t)rows &&
@@ -847,7 +928,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
                               table + serving.boundRowsBeforeCompaction * width, nullptr);
                 }
                 storage.cacheDirty = true;
-                continue; // Paged tensor maps describe the unchanged pool.
+                if (compact) continue; // Paged tensor maps describe the unchanged pool.
             }
             // Never retain bindings to requests that left the batch. Inactive
             // device lengths prevent kernels from dereferencing these slots.
@@ -859,7 +940,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
                 if (pointer) { pointer = nullptr; storage.cacheDirty = true; }
             }
             for (int layer = 0; layer < block_cnt; ++layer)
-            for (int row = 0; row < rows; ++row)
+            for (int row = 0; row < rows; ++row) if (!partialBindings || serving.bindingOrder[row] == SIZE_MAX)
             for (int part = 0; part < 2; ++part) {
                 const size_t src = ((size_t)row * block_cnt + layer) * ranks * 2 + rank * 2 + part;
                 const size_t dst = (size_t)layer * storage.maxRows * (sparseKv ? 8 : 4) +
@@ -1405,10 +1486,13 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         for (auto error : errors) if (error) std::rethrow_exception(error);
     };
     ReorderTensorParallelServingCache(batch);
-    if (!tpPagedCaches.empty() && !(tpServingState && tpServingState->preparing) && CanReuseTensorParallelServingCache(batch, false)) {
+    if (!tpPagedCaches.empty() && tpServingState && !tpServingState->preparing) {
         auto &serving = *tpServingState;
+        const bool reuseAll = CanReuseTensorParallelServingCache(batch, false);
+        const auto retained = reuseAll ? std::vector<unsigned char>() : ReusableTensorParallelServingRows(batch, false);
         std::vector<int> growing;
         for (int row = 0; row < sequences; ++row) {
+            if (!reuseAll && (row >= (int)retained.size() || !retained[row])) continue;
             const int past = key(row, 0).dims[1];
             // A full SWA ring is stable. Only the physical page lists need
             // extending at this boundary; tensor/table addresses stay fixed.
@@ -1451,8 +1535,16 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         }
     }
     const bool reuseServingCache = CanReuseTensorParallelServingCache(batch);
-    if (!reuseServingCache)
+    const auto retained = reuseServingCache ? std::vector<unsigned char>() : ReusableTensorParallelServingRows(batch);
+    auto reuseRow = [&](int row) {
+        return reuseServingCache || (row < (int)retained.size() && retained[row]);
+    };
+    // Invalidate before mutation, including failures during cache allocation.
+    // Requests absent from the serving plan do not invalidate surviving rows.
     for (int sequence = 0; sequence < sequences; ++sequence)
+        if (!reuseRow(sequence)) InvalidateTensorParallelCache(&key(sequence, 0));
+    if (!reuseServingCache)
+    for (int sequence = 0; sequence < sequences; ++sequence) if (!reuseRow(sequence))
     for (int layer = 0; layer < block_cnt; ++layer) {
         for (Data *cache : {&key(sequence, layer), &value(sequence, layer)}) {
             cache->kvCacheFp8Indexer = !sparseKv && cache == &key(sequence, layer) && !slidingLayers[layer] && fp8IndexerCache;
@@ -1480,7 +1572,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         }
     }
     if (sparseKv && !reuseServingCache) {
-        for (int sequence = 0; sequence < sequences; ++sequence) {
+        for (int sequence = 0; sequence < sequences; ++sequence) if (!reuseRow(sequence)) {
             std::vector<std::pair<Data *, Data *>> roots;
             for (int layer = 0; layer < block_cnt; ++layer)
                 roots.emplace_back(&key(sequence, layer), &value(sequence, layer));
@@ -1491,7 +1583,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         // Own only rank-local page references. The generic prefix restore's
         // root is a borrowed view of rank zero; publish the model's packed
         // global shape without releasing that view a second time.
-        for (int sequence = 0; sequence < sequences; ++sequence)
+        for (int sequence = 0; sequence < sequences; ++sequence) if (!reuseRow(sequence))
         for (int layer = 0; layer < block_cnt; ++layer) {
             if (slidingLayers[layer]) continue;
             for (int part = 0; part < 2; ++part) {
@@ -1508,14 +1600,14 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         }
         runRanks([&](int rank) {
             FastllmCudaSetDevice(tpDevices[rank]);
-            for (int sequence = 0; sequence < sequences; ++sequence)
+            for (int sequence = 0; sequence < sequences; ++sequence) if (!reuseRow(sequence))
             for (int layer = 0; layer < block_cnt; ++layer) {
                 if (slidingLayers[layer]) continue;
                 for (int part = 0; part < 2; ++part) {
                     Data &root = part ? value(sequence, layer) : key(sequence, layer);
                     const int next = root.dims[1] + (batch ? batch->lengths[sequence] : inputIds.dims[1]);
                     PreparePagedCache(*root.multiDeviceDatas.at(tpDevices[rank]),
-                        *tpPagedCaches[rank][layer * 2 + part], next);
+                        *tpPagedCaches[rank][layer * 2 + part], next, nullptr, &key(sequence, 0));
                 }
             }
         });
@@ -1707,12 +1799,14 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     // pages. A failed shape is simply unavailable; eager fallback starts with
     // real requests after preparation, never with this private warmup backing.
     if (!graphDecode && tpServingState && tpServingState->preparing) return Data();
-    if (!graphDecode || verify) tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
+    if (!graphDecode || verify)
+        for (int sequence = 0; sequence < sequences; ++sequence)
+            InvalidateTensorParallelCache(&key(sequence, 0));
     if (!graphDecode && !tpKVPool.empty()) {
         // Graph preparation already validates every rank's existing capacity.
         // Eager paths must finish all KV allocations before any collective, so
         // one exhausted rank cannot leave the others waiting in all-reduce.
-        struct Reservation { Data *cache; int capacity, width, indexerLayer; };
+        struct Reservation { Data *cache; int capacity, width, indexerLayer; const Data *requestKey; };
         std::vector<Reservation> reservations;
         for (int sequence = 0; sequence < sequences; ++sequence) {
             const int length = batch ? batch->lengths[sequence] : inputIds.dims[1];
@@ -1730,7 +1824,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                         (isValue ? cfg.valueDim : cfg.headDim);
                     reservations.push_back({cache,
                         (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128), width,
-                        isValue ? -1 : layer});
+                        isValue ? -1 : layer, &key(sequence, 0)});
                 }
             }
         }
@@ -1748,7 +1842,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             if (growScratch) PrepareSwaPrefillWorkspace(rank, prefillLength);
             for (const auto &item : reservations)
                 ReserveCache(*item.cache->multiDeviceDatas.at(tpDevices[rank]), item.capacity,
-                    item.width + (item.indexerLayer < 0 ? 0 : LocalIndexerCacheWidth(item.indexerLayer, rank)));
+                    item.width + (item.indexerLayer < 0 ? 0 : LocalIndexerCacheWidth(item.indexerLayer, rank)), item.requestKey);
         });
     }
     if (graphDecode)
@@ -1780,7 +1874,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                 const int lastPageLength = (nextLength - 1) % GetPageLen() + 1;
                 // After a validated replay, a full SWA ring retains the same
                 // host shape. Only full-attention lengths continue to grow.
-                const bool stableSwa = reuseServingCache && !verify && oldLength >= window;
+                const bool stableSwa = reuseRow(sequence) && !verify && oldLength >= window;
                 size_t slot = (size_t)sequence * block_cnt * tpDevices.size() * 2;
                 // Graph kernels append/trim on the device. Commit host metadata once,
                 // only after all ranks finish a successful warmup or replay.

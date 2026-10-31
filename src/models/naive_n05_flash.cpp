@@ -156,9 +156,9 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheTyp
     cache.isKVCache = true;
 }
 
-void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width) {
+void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width, const Data *requestKey) {
     if (cache.expansionDims.size() == 3 && cache.expansionDims[1] >= capacity) return;
-    tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
+    InvalidateTensorParallelCache(requestKey);
 #ifdef USE_CUDA
     auto pool = cache.dataDevice == DataDevice::CUDA && cache.dataDeviceIds.size() == 1
         ? tpKVPool.find(cache.dataDeviceIds[0]) : tpKVPool.end();
@@ -213,7 +213,7 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
 }
 
 bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manager, int end,
-                                         std::vector<Data *> *pendingPageTables) {
+                                         std::vector<Data *> *pendingPageTables, const Data *requestKey) {
 #ifdef USE_CUDA
     const int width = manager.dims[3], capacity = std::min(max_positions,
         std::min(tokensLimit > 0 ? tokensLimit : INT_MAX, manager.maxPages * manager.pageLen));
@@ -281,7 +281,7 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
             pendingPageTables->push_back(&cache);
         else
             FastllmCudaCopyFromHostToDevice(cache.cudaData, cache.pageIndex.data(), cache.pageIndex.size() * sizeof(int));
-        tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
+        InvalidateTensorParallelCache(requestKey);
     }
     cache.lastPageLen = previous ? (previous - 1) % cache.pageLen + 1 : 0;
     return changed;

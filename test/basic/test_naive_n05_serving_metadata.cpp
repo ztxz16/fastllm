@@ -150,7 +150,45 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
     void Run() {
         std::vector<int> order(maxBatch);
         std::iota(order.begin(), order.end(), 0);
+        // Model a live decode batch interrupted by prefill on twelve other
+        // requests, including rows inserted ahead of surviving graph bindings.
+        std::vector<int> initial(order.begin() + 12, order.end());
+        Batch beforePrefill(*this, initial);
+        Prepare(beforePrefill, false);
+        for (int i = 0; i < 12; ++i)
+            InvalidateTensorParallelCache(&contexts[i]->pastKeyValues.front().first);
         Batch first(*this, order);
+        ReorderTensorParallelServingCache(&first.target);
+        auto retainedRows = ReusableTensorParallelServingRows(&first.target);
+        Check(std::count(retainedRows.begin(), retainedRows.end(), 1) == maxBatch - 12,
+              "new prefill invalidated surviving rows");
+        Prepare(first, false);
+        // An owned layout mutation revalidates only that request and binds its
+        // actual replacement addresses, even if the row order did not change.
+        InvalidateTensorParallelCache(&first.target.Key(7, 0));
+        for (int layer = 0; layer < block_cnt; ++layer)
+            for (Data *root : {&first.target.Key(7, layer), &first.target.Value(7, layer)})
+                for (auto &entry : root->multiDeviceDatas)
+                    entry.second->cudaData = (void *)(uintptr_t(entry.second->cudaData) + 16);
+        ReorderTensorParallelServingCache(&first.target);
+        retainedRows = ReusableTensorParallelServingRows(&first.target);
+        Check(std::count(retainedRows.begin(), retainedRows.end(), 1) == maxBatch - 1,
+              "owned mutation invalidated unrelated rows");
+        // A failed dirty-row validation must not publish stale descriptors.
+        auto *local = first.target.Key(7, 0).multiDeviceDatas.at(0);
+        void *address = local->cudaData;
+        local->cudaData = nullptr;
+        std::vector<int *> rejectedLengths;
+        LogitsSelection selection;
+        Check(!PrepareTensorParallelServingDecode(first.ids, selection, rejectedLengths, &first.target, false),
+              "invalid new row accepted");
+        Check(rejectedLengths.empty(), "failed validation published cache lengths");
+        local->cudaData = address;
+        Prepare(first, false);
+        InvalidateTensorParallelCache();
+        retainedRows = ReusableTensorParallelServingRows(&first.target);
+        Check(std::count(retainedRows.begin(), retainedRows.end(), 1) == 0,
+              "unknown layout mutation did not invalidate all rows");
         Prepare(first, false);
         Check(CanReuseTensorParallelServingCache(&first.target), "stable batch not reusable");
         // A retired row is physically destroyed; surviving cache lengths must

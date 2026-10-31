@@ -395,6 +395,7 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
         }
     }
     if (!snapshot) return false;
+    self->InvalidateTensorParallelCache(&context->pastKeyValues.front().first);
     // A queued hit pins only the immutable checkpoint and page references.
     // Its private hot/SWA slot is attached when the scheduler admits it.
     if (!sparseKv) {
@@ -434,7 +435,7 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
                     cache->isKVCache = true;
                     cache->dataDevice = DataDevice::CUDA;
                     cache->dataDeviceIds = {tpDevices[rank]};
-                    self->ReserveCache(*cache, capacity, width);
+                    self->ReserveCache(*cache, capacity, width, &context->pastKeyValues.front().first);
                     cache->Resize({1, rows, width});
                     const size_t rowBytes = (size_t)width * cache->unitSize;
                     auto *source = (uint8_t *)snapshot->pool->storage.at(rank).cudaData +
@@ -466,7 +467,6 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
         std::lock_guard<std::mutex> guard(historyMutex);
         self->activePrefixes[&context->pastKeyValues.front().first].prefill = {snapshot};
     }
-    self->tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
     return true;
 #else
     return false;
