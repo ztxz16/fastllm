@@ -11,7 +11,7 @@ int main(int argc, char **argv) {
         GenerateOptions options;
         std::string model, output = "minimax-h3.mp4", ffmpeg = "ffmpeg", traceDirectory, initialVideo,
                            initialAudio, vaePrecision;
-        int device = 0;
+        std::vector<int> devices{0};
         bool fp32 = false;
         std::string firstFrame, lastFrame;
         std::vector<std::pair<Reference::Kind, std::string>> references;
@@ -38,8 +38,8 @@ int main(int argc, char **argv) {
                 options.steps = std::stoi(v);
             else if (arg == "--seed")
                 options.seed = std::stoull(v);
-            else if (arg == "--device")
-                device = std::stoi(v);
+            else if (arg == "--device" || arg == "--devices")
+                devices = fastllm::nomas::parseParallelDevices(v);
             else if (arg == "--trace")
                 traceDirectory = v;
             else if (arg == "--precision") {
@@ -84,7 +84,7 @@ int main(int argc, char **argv) {
         options.validate();
         if (!traceDirectory.empty())
             std::filesystem::create_directories(traceDirectory);
-        Runtime reader(device, true);
+        Runtime reader(devices[0], true);
         auto trace = [&](const std::string &name, const Tensor &x) {
             if (traceDirectory.empty())
                 return;
@@ -112,11 +112,11 @@ int main(int argc, char **argv) {
             return out;
         };
         auto video = read(initialVideo), audio = read(initialAudio);
-        Pipeline pipeline(model, device, fp32, videoType);
+        Pipeline pipeline(model, devices, fp32, videoType);
         std::string last;
         int current = -1;
         std::cerr << "Precision: " << (fp32 ? "fp32" : "bf16") << ", video VAE: " << precisionName(videoType)
-                  << "\n";
+                  << ", TP: " << devices.size() << "\n";
         auto start = std::chrono::steady_clock::now();
         auto result = pipeline.generateMP4(
             options, output, ffmpeg,

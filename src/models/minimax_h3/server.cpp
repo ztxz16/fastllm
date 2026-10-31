@@ -80,8 +80,8 @@ Json metadata(const std::shared_ptr<Job> &job) {
 }
 class Service {
   public:
-    Service(std::string model, std::string output, int device, bool fp32, DType videoType, std::string ffmpeg)
-        : output_(std::move(output)), fp32_(fp32), videoType_(videoType) {
+    Service(std::string model, std::string output, std::vector<int> devices, bool fp32, DType videoType, std::string ffmpeg)
+        : output_(std::move(output)), fp32_(fp32), videoType_(videoType), devices_(devices) {
         std::filesystem::create_directories(output_);
         referencesAvailable_ = std::filesystem::is_regular_file(model + "/transformer_ref/config.json");
         // Completed jobs have a small sidecar, so updating the inference service
@@ -121,9 +121,9 @@ class Service {
             job->referenceCount = data["reference_count"].int_value();
             jobs_[id] = job;
         }
-        worker_ = std::thread([this, model, device, fp32, videoType, ffmpeg] {
+        worker_ = std::thread([this, model, devices, fp32, videoType, ffmpeg] {
             try {
-                Pipeline pipeline(model, device, fp32, videoType);
+                Pipeline pipeline(model, devices, fp32, videoType);
                 ready_ = true;
                 for (;;) {
                     std::shared_ptr<Job> job;
@@ -223,6 +223,8 @@ class Service {
                             {"error", startupError_},
                             {"precision", fp32_ ? "fp32" : "bf16"},
                             {"vae_precision", precisionName(videoType_)},
+                            {"tensor_parallel_size", int(devices_.size())},
+                            {"devices", devices_},
                             {"conditioning", true},
                             {"reference_model_available", referencesAvailable_}};
     }
@@ -380,6 +382,7 @@ class Service {
     bool referencesAvailable_ = false;
     const bool fp32_;
     const DType videoType_;
+    const std::vector<int> devices_;
     std::atomic<bool> ready_{false}, stopping_{false};
     std::atomic<int> pending_{0};
     uint64_t sequence_ = 0;
@@ -394,7 +397,8 @@ int main(int argc, char **argv) {
     try {
         std::string model, output = "minimax-h3-output", host = "127.0.0.1", key,
                            demo = "tools/minimax_h3/demo.html", ffmpeg = "ffmpeg", vaePrecision;
-        int port = 8009, device = 0;
+        int port = 8009;
+        std::vector<int> devices{0};
         bool fp32 = false;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
@@ -409,8 +413,8 @@ int main(int argc, char **argv) {
                 host = v;
             else if (arg == "--port")
                 port = std::stoi(v);
-            else if (arg == "--device")
-                device = std::stoi(v);
+            else if (arg == "--device" || arg == "--devices")
+                devices = fastllm::nomas::parseParallelDevices(v);
             else if (arg == "--api-key")
                 key = v;
             else if (arg == "--demo")
@@ -429,7 +433,7 @@ int main(int argc, char **argv) {
         if (model.empty())
             throw std::invalid_argument("--model is required");
         auto videoType = parseVideoPrecision(vaePrecision, fp32);
-        Service service(model, output, device, fp32, videoType, ffmpeg);
+        Service service(model, output, devices, fp32, videoType, ffmpeg);
         httplib::Server server;
         server.new_task_queue = [] { return new httplib::ThreadPool(8); };
         server.set_payload_max_length(size_t(256) << 20);

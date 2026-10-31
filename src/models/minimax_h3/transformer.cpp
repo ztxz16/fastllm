@@ -70,11 +70,28 @@ void PackedLayout::validate(int count) const {
         if (!seen[i] || timeIndices[i] < 0 || timeIndices[i] >= count)
             throw std::invalid_argument("invalid H3 timestep indices");
 }
-Transformer::Transformer(Runtime &rt, Runtime &fp32, const std::string &dir)
+Transformer::Transformer(Runtime &rt, Runtime &fp32, const std::string &dir, nomas::ParallelContext parallel)
     : rt_(rt), fp32_(fp32), weights_(rt, componentWeights(dir)), fullWeights_(fp32, componentWeights(dir)),
-      config_(dir) {
+      config_(dir), parallel_(parallel) {
     if (!fp32.isFloat32())
         throw std::invalid_argument("H3 projection runtime must be FP32");
+    if (config_.heads % parallel_.size() || config_.ffn % parallel_.size())
+        throw std::invalid_argument("H3 attention heads and FFN width must divide TP size");
+    auto block = [&](const std::string &p) {
+        for (const char *name : {"to_q", "to_k", "to_v"})
+            parallel_.columnWeights(weights_, p + ".attn." + name);
+        parallel_.rowWeights(weights_, p + ".attn.to_out.0");
+        parallel_.columnWeights(weights_, p + ".ff.net.0.proj", 2);
+        parallel_.rowWeights(weights_, p + ".ff.net.2");
+    };
+    for (int i = 0; i < config_.layers; ++i) {
+        auto p = "transformer_blocks." + std::to_string(i);
+        block(p);
+        parallel_.columnWeights(weights_, p + ".adaln_proj.linear");
+    }
+    for (int i = 0; i < config_.refiners; ++i)
+        block("token_refiner.refiner_blocks." + std::to_string(i));
+    parallel_.columnWeights(weights_, "norm_out.linear");
 }
 Tensor Transformer::timeEmbedding(const std::vector<float> &times) {
     auto x = fp32_.timestepEmbedding(times, config_.freqDim);
@@ -83,7 +100,7 @@ Tensor Transformer::timeEmbedding(const std::vector<float> &times) {
 }
 Tensor Transformer::projectModulation(int layer, const Tensor &input) {
     auto p = "transformer_blocks." + std::to_string(layer) + ".adaln_proj.linear";
-    auto x = weights_.linear(input, p);
+    auto x = parallel_.column(weights_, input, p, true);
     x.rows *= 3;
     x.cols /= 3;
     return x;
@@ -107,16 +124,20 @@ Tensor Transformer::attention(const Tensor &x, const std::string &p, const Tenso
         trace("k", k);
         trace("v", v);
     }
-    auto out = rt_.selfAttention(q, k, v, config_.heads);
+    auto out = rt_.selfAttention(q, k, v, config_.heads / parallel_.size());
     if (trace)
         trace("attention", out);
-    return weights_.linear(out, p + ".to_out.0");
+    return parallel_.row(rt_, weights_, out, p + ".to_out.0");
 }
 Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
     std::vector<Tensor> chunks;
     Tensor out;
-    if (!x.isFloat32())
-        out = Tensor(x.rows, config_.hidden, x.dtype);
+    const bool overlap = parallel_.size() > 1 && !x.isFloat32() && x.rows > 4096;
+    Tensor reduced;
+    if (overlap)
+        reduced = Tensor(x.rows, config_.hidden, x.dtype);
+    if (!x.isFloat32() || parallel_.size() > 1)
+        out = Tensor(x.rows, config_.hidden, parallel_.size() > 1 ? DType::FP32 : x.dtype);
     // Bound BF16 scratch and preserve the original sub-512 tail GEMM: folding
     // it into a larger batch selects a different reduction/rounding algorithm.
     // FP32 diagnostics retain all their original GEMM shapes.
@@ -128,14 +149,25 @@ Tensor Transformer::feedForward(const Tensor &x, const std::string &p) {
         auto y = weights_.linear(x.rowSlice(first, count), p + ".net.0.proj");
         if (out.data) {
             auto target = out.rowSlice(first, count);
-            weights_.linear(rt_.siluMultiply(y), p + ".net.2", false, &target);
+            if (parallel_.size() > 1) {
+                rt_.linearInto(rt_.siluMultiply(y), weights_.get(p + ".net.2.weight"), target);
+                if (overlap) {
+                    auto result = reduced.rowSlice(first, count);
+                    parallel_.finishRowAsync(rt_, weights_, target, p + ".net.2", result);
+                }
+            } else
+                weights_.linear(rt_.siluMultiply(y), p + ".net.2", false, &target);
         } else {
-            chunks.push_back(weights_.linear(rt_.siluMultiply(y), p + ".net.2"));
+            chunks.push_back(parallel_.row(rt_, weights_, rt_.siluMultiply(y), p + ".net.2"));
         }
         first += count;
     }
+    if (overlap) {
+        parallel_.group->wait(parallel_.rank);
+        return reduced;
+    }
     if (out.data)
-        return out;
+        return parallel_.size() > 1 ? parallel_.finishRow(rt_, weights_, out, p + ".net.2", x.dtype) : out;
     return chunks.size() == 1 ? chunks[0] : rt_.concat(chunks);
 }
 Tensor Transformer::refine(const Tensor &input) {
@@ -198,11 +230,12 @@ void Transformer::prepare(const std::vector<std::vector<float>> &plans,
     }
     std::vector<Tensor> rows;
     for (const auto &input : inputs)
-        rows.push_back(weights_.linear(input, "norm_out.linear"));
+        rows.push_back(parallel_.column(weights_, input, "norm_out.linear", true));
     outputModulation_ = rows.size() == 1 ? rows[0] : rt_.concat(rows);
     weights_.erasePrefix("norm_out.linear.");
     // FP32 diagnostics can reuse packed weights across steps; BF16 weights stay resident.
-    weights_.enablePackedCache(size_t(16) << 30);
+    if (rt_.isFloat32())
+        weights_.enablePackedCache(size_t(16) << 30);
     plans_ = plans;
 }
 std::pair<Tensor, Tensor> Transformer::forward(const Tensor &video, const Tensor &audio, const Tensor &text,

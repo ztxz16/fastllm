@@ -2,7 +2,7 @@
 
 面向 Linux + NVIDIA GPU 的纯 C++17 / CUDA 音视频推理，使用 CUDA Runtime、cuBLAS/cuBLASLt 和仓库已有的
 FlashInfer、json11、cpp-httplib。推理服务不加载 Python、PyTorch、Diffusers、Triton
-或 cuDNN；媒体编解码调用已有的 FFmpeg / ffprobe，不参与模型计算。
+或 cuDNN；多卡通信使用仓库已有的 NCCL。媒体编解码调用已有的 FFmpeg / ffprobe，不参与模型计算。
 
 支持文字生成、首帧、尾帧、首尾帧，以及有序的参考图片／视频／音频条件。
 文字和关键帧使用 `transformer/`；参考素材使用 `transformer_ref/`，切换时卸载另一套 DiT。
@@ -17,7 +17,7 @@ GEMM 保持 FP32 累加。时间嵌入、视频/音频输入输出投影和采�
 视频 VAE 默认使用 FP16 GEMM/attention，归一化、缩放参数与残差流保留 FP32；音频 VAE
 保持 FP32。CLI 与 HTTP 服务均可通过 `--precision fp32` 切回全 FP32 对比模式，
 也可用 `--vae-precision fp16|bf16|fp32` 单独覆盖视频 VAE，无需环境变量。
-`GET /health` 返回当前 `precision` 和 `vae_precision`。
+`GET /health` 返回当前 `precision`、`vae_precision`、`tensor_parallel_size` 和可见设备索引 `devices`。
 
 文本编码只执行 Qwen3-VL 的前 50 层，读取 final norm 之前的残差，权重按层释放。
 DiT 按每次前向的时间点数预计算 AdaLN 表，随后释放这些投影权重；BF16 主干约
@@ -29,7 +29,7 @@ DiT 按每次前向的时间点数预计算 AdaLN 表，随后释放这些投影
 
 FP32 对比模式仍按层加载 DiT，并利用部分空闲显存缓存原始 BF16 权重，使用时精确
 展开为 FP32。此缓存不改变运算精度，预算不超过启用时空闲显存的一半，预留至少
-16 GiB 给工作张量。BF16 驻留模式需要比 FP32 流式模式更多显存；本次只验证 72GB 单卡。
+16 GiB 给工作张量。BF16 驻留模式需要比 FP32 流式模式更多显存；单卡基线在 72GB 设备上验证，多卡见下文。
 
 官方 Diffusers 与 SGLang 均默认使用 BF16 主干，但混合精度、attention 内核与算子
 融合方式不同，不能宣称最终输出逐位相同。使用原生输入的 BF16 独立算子／模块检查通过，
@@ -71,6 +71,50 @@ CUDA_VISIBLE_DEVICES=7 build-h3/src/models/minimax_h3/minimax_h3_generate \
 
 可见设备设置后，物理 7 号卡在进程中为逻辑 0 号。容器必须同时用 `--gpus device=7`
 限制设备，不要直接把进程中的 `--device` 设置成 7。
+
+### 张量并行
+
+CLI 和 HTTP 服务均接受 `--devices 0,1`。例如使用物理 6、7 号卡：
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 build-h3/src/models/minimax_h3/minimax_h3_server \
+  --model /workspace2/hfmodels/MiniMax-H3 --devices 0,1 \
+  --host 127.0.0.1 --port 8009 --output ./h3-output \
+  --demo tools/minimax_h3/demo.html
+```
+
+容器需同时使用 `--gpus '"device=6,7"'` 限制物理设备；容器内设置
+`CUDA_VISIBLE_DEVICES=0,1`。HTTP 请求和 Demo 的模式、步数等参数不变。
+单卡继续使用 `--device 0`。多卡需要 NCCL；CMake 自动查找已有的 NCCL，非标准安装位置
+可指定 `FASTLLM_NCCL_INCLUDE_DIR` 和 `FASTLLM_NCCL_LIBRARY`。没有 NCCL 时仍可构建和使用单卡。
+
+每卡独立 runtime、cuBLAS 工作区和权重缓存，复用 LLM 的 `PersistentWorkerGroup`：
+rank 0 在调用线程前向，其余 rank 使用常驻线程。共享后端的 `ParallelContext` 负责
+列切分、行切分、打包投影分组切分及通信，模型代码只声明权重布局。
+
+| 部分 | 双卡划分 |
+| --- | --- |
+| 文本编码器 | 每卡 32 个 Q 头、4 个 KV 头、12800 维 FFN；CPU 缓存也只存本卡分片 |
+| DiT／文本 refiner | 每卡 28 个注意力头、7168 维 FFN；up/gate 分别切分 |
+| AdaLN | 投影按输出维度切分，汇集后缓存完整调制表 |
+| 时间嵌入、输入／输出投影 | 保留完整 FP32 投影副本及原 GEMM 形状 |
+| Norm、残差、采样器 | 隐藏维度保持完整；采样器在 rank 0 执行 |
+| 视频 VAE | 按原有 tile 批次分配到各卡，在 rank 0 拼接；VAE 权重为副本 |
+| 视觉文本塔、音频 VAE | 视觉塔在文本 rank 上复制；音频 VAE 在 rank 0 执行 |
+
+BF16 GEMM 仍为 FP32 累加；行切分保留 FP32 部分结果，大张量先做 FP32 reduce-scatter，
+加一次偏置并舍入，再 all-gather BF16/FP16 结果。小张量、非整除大小和 FP32 对照保留
+FP32 all-reduce。大行投影与 FFN 按行分块，在独立通信流上归并，与后续分块的 GEMM
+重叠；算子返回前建立流依赖。列切分权重直接从 safetensors 的 CPU 字节切片，
+无需先在各卡加载完整权重。当前模型的头数和 FFN 维度要求 TP 数整除，维度允许
+1、2、4、8；目前实测单卡和双卡，4/8 卡尚未运行验证。
+
+双卡文本权重复用已有的有界 GPU 缓存，跨请求保留 BF16 分片；为 DiT、VAE 和激活
+预留显存，缓存放不下的权重继续使用 CPU 缓存与原有上传路径。取消和完整卸载释放
+GPU 缓存。没有新增配置项或环境变量。
+
+FP32 双卡已通过小场景严格对照；BF16 单层误差较小，但完整轨迹仍有累积偏差，
+不能作为逐位等价替换。测试配置、误差及速度见 [VALIDATION.md](VALIDATION.md)。
 
 - 宽高须为 32 的倍数，各自介于 64..4096，总像素不超过 1344×768。
 - 24 fps，帧数为 `17*n+5`，支持 124、141、…、345 帧。

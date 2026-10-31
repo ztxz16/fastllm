@@ -196,17 +196,26 @@ VideoTensor VideoVAE::encodeMoments(const VideoTensor &pixels, std::function<voi
     int done = 0, total = chunks * ys.start.size() * xs.start.size();
     for (int chunk = 0; chunk < chunks; ++chunk) {
         std::vector<VideoTensor> tiles;
+        auto encode = [&](VideoVAE &worker, size_t job) {
+            size_t yi = job / xs.start.size(), xi = job % xs.start.size();
+            auto input = crop(pixels, chunk * 17, clipFrames, ys.start[yi], ys.length[yi], xs.start[xi],
+                              xs.length[xi]);
+            return worker.encodeTile(
+                worker.full_.upload(input.values.data(), clipFrames * input.height * input.width, 3),
+                clipFrames, input.height, input.width, [&](const std::string &, const Tensor &) {
+                    if (progress && &worker == this)
+                        progress(done, total);
+                });
+        };
+        std::vector<Tensor> encoded;
+        size_t count = ys.start.size() * xs.start.size();
+        if (tileRunner_ && count > 1)
+            encoded = tileRunner_(count, encode);
         for (size_t yi = 0; yi < ys.start.size(); ++yi)
             for (size_t xi = 0; xi < xs.start.size(); ++xi) {
-                auto input = crop(pixels, chunk * 17, clipFrames, ys.start[yi], ys.length[yi], xs.start[xi],
-                                  xs.length[xi]);
-                auto moments = encodeTile(
-                    full_.upload(input.values.data(), clipFrames * input.height * input.width, 3), clipFrames,
-                    input.height, input.width, [&](const std::string &, const Tensor &) {
-                        if (progress)
-                            progress(done, total);
-                    });
-                VideoTensor tile(latentFrames, input.height / 16, input.width / 16, 48);
+                size_t job = yi * xs.start.size() + xi;
+                auto moments = encoded.empty() ? encode(*this, job) : encoded[job];
+                VideoTensor tile(latentFrames, ys.length[yi] / 16, xs.length[xi] / 16, 48);
                 tile.values = full_.download(moments);
                 // Blend against the original neighbouring tiles, before cropping overlaps.
                 int oh = yi ? ys.overlap[yi - 1] / 16 : 0, ow = xi ? xs.overlap[xi - 1] / 16 : 0;
@@ -247,7 +256,8 @@ Tensor VideoVAE::decodeClip(const VideoTensor &z, std::function<void()> checkpoi
     // Tiles remain independent attention sequences; only row-wise projections share a batch.
     const size_t capacity = rt_.isFloat32() ? 1 : 4;
     const size_t count = ys.start.size() * xs.start.size();
-    for (size_t first = 0; first < count; first += capacity) {
+    auto decode = [&](VideoVAE &worker, size_t job) {
+        size_t first = job * capacity;
         size_t batch = std::min(capacity, count - first);
         std::vector<float> values;
         int rows = z.frames * ys.length[0] * xs.length[0];
@@ -257,12 +267,21 @@ Tensor VideoVAE::decodeClip(const VideoTensor &z, std::function<void()> checkpoi
             auto latent = crop(z, 0, z.frames, ys.start[yi], ys.length[yi], xs.start[xi], xs.length[xi]);
             values.insert(values.end(), latent.values.begin(), latent.values.end());
         }
-        auto output = decodeTiles(full_.upload(values.data(), int(batch) * rows, 24), z.frames,
+        return worker.decodeTiles(worker.full_.upload(values.data(), int(batch) * rows, 24), z.frames,
                                   ys.length[0], xs.length[0], int(batch),
                                   [&](const std::string &, const Tensor &) {
-                                      if (checkpoint)
+                                      if (checkpoint && &worker == this)
                                           checkpoint();
                                   });
+    };
+    const size_t jobs = (count + capacity - 1) / capacity;
+    std::vector<Tensor> decoded;
+    if (tileRunner_ && jobs > 1)
+        decoded = tileRunner_(jobs, decode);
+    for (size_t job = 0; job < jobs; ++job) {
+        auto output = decoded.empty() ? decode(*this, job) : decoded[job];
+        size_t batch = std::min(capacity, count - job * capacity);
+        int rows = z.frames * ys.length[0] * xs.length[0];
         for (size_t i = 0; i < batch; ++i)
             patches.push_back(output.rowSlice(int(i) * rows, rows));
     }
