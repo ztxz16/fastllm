@@ -8,13 +8,17 @@
 
 namespace {
 #if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
+constexpr int kNativeMoeMaxRows = 32;
+constexpr int kNativeMoeMaxRoutes = kNativeMoeMaxRows * kMaxTopK;
 struct NativeMoeControl {
     alignas(64) unsigned published = 0;
     alignas(64) unsigned computed = 0;
+    alignas(64) unsigned planned = 0;
     int stagedCount = 0;
     alignas(64) int stagedByHits[kMaxTopK + 1];
-    alignas(64) int32_t ids[kMaxTopK], resident[kMaxTopK], staged[kMaxTopK], gpu[kMaxTopK];
-    float scores[kMaxTopK];
+    alignas(64) int32_t ids[kNativeMoeMaxRoutes], resident[kNativeMoeMaxRoutes], staged[kNativeMoeMaxRoutes], gpu[kNativeMoeMaxRoutes];
+    float scores[kNativeMoeMaxRoutes];
+    int32_t stagedExperts[kMaxTopK], stagedSlots[kMaxTopK];
 };
 
 __global__ void PublishNativeMoe(NativeMoeControl *box, float *hostInput,
@@ -68,6 +72,44 @@ __global__ void PublishNativeMoe(NativeMoeControl *box, float *hostInput,
     if (publish) {
         __syncthreads();
         if (!threadIdx.x) atomicExch_system(&box->published, 1u);
+    }
+}
+
+// Route order is local to an eight-row compute tile, matching both the
+// grouped CUDA implementation and its exact native fallback.
+__device__ int NativeBatchRouteRank(const int32_t *indices, int r, int rows, int topk) {
+    const int first = r / (8 * topk) * (8 * topk);
+    const int end = min(rows * topk, first + 8 * topk);
+    int rank = first;
+    for (int j = first; j < end; ++j)
+        rank += indices[j] < indices[r] || (indices[j] == indices[r] && j < r);
+    return rank;
+}
+__global__ void PublishNativeBatchMoe(NativeMoeControl *box, uint16_t *hostInput,
+        const uint16_t *input, const int32_t *indices, const float *scores,
+        const int32_t *keys, const int32_t *slotKeys, int32_t *slots, int32_t *routeMap,
+        unsigned long long *hits, unsigned long long *misses,
+        int base, int experts, int hidden, int rows, int topk) {
+    for (int c = threadIdx.x; c < rows * hidden; c += blockDim.x) hostInput[c] = input[c];
+    for (int r = threadIdx.x; r < rows * topk; r += blockDim.x) {
+        const int expert = indices[r], key = base + expert;
+        int slot = expert >= 0 && expert < experts ?
+            fastllm::cuda::moe_admission::LoadAdmission(keys + key) : -1;
+        if (slot >= 0 && slotKeys[slot] != key) slot = -1;
+        const int at = NativeBatchRouteRank(indices, r, rows, topk);
+        slots[at] = slot;
+        routeMap[at] = r % (8 * topk);
+        box->ids[r] = expert; box->resident[r] = slot; box->scores[r] = scores[r];
+        atomicAdd(slot >= 0 ? hits : misses, 1ULL);
+    }
+    __threadfence_system(); __syncthreads();
+    if (!threadIdx.x) atomicExch_system(&box->published, 1u);
+}
+__global__ void ReadNativeBatchPlan(const NativeMoeControl *box, const int32_t *indices,
+        int32_t *staged, int32_t *gpu, int rows, int topk) {
+    for (int r = threadIdx.x; r < rows * topk; r += blockDim.x) {
+        staged[NativeBatchRouteRank(indices, r, rows, topk)] = box->staged[r];
+        gpu[r] = box->gpu[r];
     }
 }
 
@@ -140,6 +182,7 @@ struct NativeMoeMailbox {
         float *hostData = nullptr, *mappedData = nullptr;
         float *partial = nullptr;
         int32_t *slots = nullptr; // resident, staged, GPU route IDs
+        int32_t *routeMap = nullptr;
         fastllm::Data quantized, gate;
         cudaGraphExec_t exec = nullptr, finishExec = nullptr;
         cudaGraph_t fullGraph = nullptr;
@@ -150,7 +193,7 @@ struct NativeMoeMailbox {
         cudaEvent_t begin = nullptr, residentDone = nullptr, stagedBegin = nullptr, done = nullptr, completed = nullptr;
         std::array<const void *, 4> pointers{};
         fastllm::MoeDecodeOverlapScheduler cost;
-        int hidden = 0, topk = 0, hits = 0, staged = 0;
+        int hidden = 0, topk = 0, rows = 1, routes = 0, hits = 0, staged = 0, stagedRoutes = 0;
         bool timed = true;
         std::atomic<bool> pending{false}, submitted{false};
         ~Layer() {
@@ -159,23 +202,24 @@ struct NativeMoeMailbox {
             if (exec) cudaGraphExecDestroy(exec);
             if (finishExec) cudaGraphExecDestroy(finishExec);
             for (auto e : {begin, residentDone, stagedBegin, done, completed, uploadBegin, uploadDone}) if (e) cudaEventDestroy(e);
-            cudaFreeHost(host); cudaFreeHost(hostData); cudaFree(partial); cudaFree(slots);
+            cudaFreeHost(host); cudaFreeHost(hostData); cudaFree(partial); cudaFree(slots); cudaFree(routeMap);
         }
-        bool Init(const OffloadLayout &layout, int routes, int device) {
-            hidden = layout.hidden; topk = routes;
+        bool Init(const OffloadLayout &layout, int selected, int device, int inputRows = 1) {
+            hidden = layout.hidden; topk = selected; rows = inputRows; routes = rows * topk;
             if (cudaHostAlloc(&host, sizeof(*host), cudaHostAllocMapped) != cudaSuccess ||
                 cudaHostGetDevicePointer(&mapped, host, 0) != cudaSuccess ||
-                cudaHostAlloc(&hostData, (topk + 1) * hidden * sizeof(float), cudaHostAllocMapped) != cudaSuccess ||
+                cudaHostAlloc(&hostData, (routes + rows) * hidden * sizeof(float), cudaHostAllocMapped) != cudaSuccess ||
                 cudaHostGetDevicePointer(&mappedData, hostData, 0) != cudaSuccess ||
-                cudaMalloc(&partial, topk * hidden * sizeof(float)) != cudaSuccess ||
-                cudaMalloc(&slots, (5 * topk + 1) * sizeof(int32_t)) != cudaSuccess) return false;
+                cudaMalloc(&partial, routes * hidden * sizeof(float)) != cudaSuccess ||
+                cudaMalloc(&slots, (rows > 1 ? 3 * routes : 5 * routes + 1) * sizeof(int32_t)) != cudaSuccess ||
+                (rows > 1 && cudaMalloc(&routeMap, routes * sizeof(int32_t)) != cudaSuccess)) return false;
             new (host) NativeMoeControl{};
-            std::fill_n(hostData, (topk + 1) * hidden, 0.0f);
+            std::fill_n(hostData, (routes + rows) * hidden, 0.0f);
             for (auto *e : {&begin, &residentDone, &stagedBegin, &done, &completed, &uploadBegin, &uploadDone})
                 if (cudaEventCreate(e) != cudaSuccess) return false;
             for (auto *d : {&quantized, &gate}) {
                 d->dataType = fastllm::BFLOAT16;
-                d->Resize(d == &quantized ? std::vector<int>{1, hidden} : std::vector<int>{topk, layout.inter});
+                d->Resize(d == &quantized ? std::vector<int>{rows, hidden} : std::vector<int>{routes, layout.inter});
                 d->ToDevice(fastllm::CUDA, {device}, false); d->Allocate(false);
             }
             return true;
@@ -188,8 +232,11 @@ struct NativeMoeMailbox {
     OffloadGroup &group;
     DeviceCache &cache;
     NativeMoeMemOps memops;
-    std::unique_ptr<DecodeOverlapWorkspace> copy;
-    std::map<int, std::unique_ptr<Layer>> layers, fullLayers;
+    std::unique_ptr<DecodeOverlapWorkspace> copy, fullCopy;
+    std::map<int, std::unique_ptr<Layer>> layers;
+    // Graphs for different verifier lengths coexist; never replace buffers
+    // still referenced by an older captured graph.
+    std::vector<std::unique_ptr<Layer>> fullLayers;
     std::thread dispatcher;
     std::vector<int> dispatcherCpus;
     std::mutex mutex;
@@ -216,7 +263,7 @@ struct NativeMoeMailbox {
             // The full graph orders all routed reductions before the last one.
             // One completion protects every CPU result and timing sample.
             checkCudaErrors("Native full completion", cudaEventSynchronize(fullLast->completed));
-            for (auto &entry : fullLayers) Observe(*entry.second, false);
+            for (auto &entry : fullLayers) Observe(*entry, false);
             fullLast = nullptr;
         }
         if (failure) std::rethrow_exception(failure);
@@ -227,7 +274,7 @@ struct NativeMoeMailbox {
         wake.notify_one();
         if (dispatcher.joinable()) dispatcher.join();
         cudaSetDevice(cache.device);
-        layers.clear(); fullLayers.clear(); copy.reset();
+        layers.clear(); fullLayers.clear(); fullCopy.reset(); copy.reset();
     }
     void Observe(Layer &w, bool synchronize = true) {
         if (!w.pending) return;
@@ -243,7 +290,7 @@ struct NativeMoeMailbox {
                 w.fullGraph ? w.uploadDone : copy->copyDone));
             w.cost.copiedExpert.Observe(ms * 1000 / w.staged);
             checkCudaErrors("Native staged timing", cudaEventElapsedTime(&ms, w.fullGraph ? w.uploadDone : w.stagedBegin, w.done));
-            w.cost.stagedExpert.Observe(ms * 1000 / w.staged);
+            w.cost.stagedExpert.Observe(ms * 1000 / (w.rows > 1 ? w.stagedRoutes : w.staged));
         }
         w.pending = false;
     }
@@ -296,6 +343,11 @@ struct NativeMoeMailbox {
                     previous = &w;
                 }
                 const auto &layout = group.LayerLayout(w.table);
+                if (w.rows > 1) {
+                    RunBatch(w, r.phase, layout);
+                    __atomic_store_n(&box.computed, 1u, __ATOMIC_RELEASE);
+                    continue;
+                }
                 int hits = 0;
                 std::array<int, kMaxTopK> order{};
                 for (int i = 0; i < w.topk; ++i) {
@@ -359,7 +411,12 @@ struct NativeMoeMailbox {
                 if (!error) error = std::current_exception();
                 // Release the graph before reporting the failure on the main
                 // thread. Invalid output is never returned as a successful step.
-                std::fill_n(w.hostData + w.hidden, w.topk * w.hidden, 0.0f);
+                std::fill_n(w.hostData + w.rows * w.hidden, w.routes * w.hidden, 0.0f);
+                if (w.rows > 1 && !__atomic_load_n(&box.planned, __ATOMIC_ACQUIRE)) {
+                    std::fill_n(box.staged, w.routes, -1); std::fill_n(box.gpu, w.routes, -1);
+                    box.stagedCount = 0;
+                    __atomic_store_n(&box.planned, 1u, __ATOMIC_RELEASE);
+                }
                 if (!full) {
                     std::fill_n(box.gpu, w.topk, -1); std::fill_n(box.staged, w.topk, -1);
                     ReadNativeMoePlan<<<1, 32, 0, copy->copyStream>>>(w.mapped,
@@ -370,6 +427,64 @@ struct NativeMoeMailbox {
             }
             __atomic_store_n(&box.computed, 1u, __ATOMIC_RELEASE);
         }
+    }
+    void RunBatch(Layer &w, FastllmMoeRoutePhase phase, const OffloadLayout &layout) {
+        auto &box = *w.host;
+        std::vector<int> missed, reuse;
+        w.hits = 0;
+        for (int r = 0; r < w.routes; ++r) {
+            fastllm::AssertInFastLLM(box.ids[r] >= 0 && box.ids[r] < layout.experts,
+                                   "Native verifier mailbox invalid expert ID.");
+            box.staged[r] = -1;
+            box.gpu[r] = box.resident[r] >= 0 ? box.ids[r] : -1;
+            if (box.resident[r] >= 0) { ++w.hits; continue; }
+            auto found = std::find(missed.begin(), missed.end(), box.ids[r]);
+            if (found == missed.end()) { missed.push_back(box.ids[r]); reuse.push_back(1); }
+            else ++reuse[found - missed.begin()];
+        }
+        for (size_t i = 0; i < missed.size(); ++i) for (size_t j = i + 1; j < missed.size(); ++j)
+            if (reuse[j] > reuse[i]) { std::swap(reuse[i], reuse[j]); std::swap(missed[i], missed[j]); }
+        cache.frequency->Observe(w.table * layout.experts, box.ids, w.routes);
+        w.staged = std::min(kMaxTopK, w.cost.SelectMisses(missed.size(), w.hits, reuse.data()));
+        w.stagedRoutes = 0;
+        for (int i = 0; i < w.staged; ++i) {
+            box.stagedExperts[i] = missed[i]; box.stagedSlots[i] = i;
+            for (int r = 0; r < w.routes; ++r) if (box.ids[r] == missed[i]) {
+                box.staged[r] = i; box.gpu[r] = box.ids[r]; ++w.stagedRoutes;
+            }
+        }
+        box.stagedCount = w.staged;
+        // The CPU producer publishes a complete immutable plan and submits no
+        // CUDA work. The graph can already execute shared and resident experts.
+        __atomic_store_n(&box.planned, 1u, __ATOMIC_RELEASE);
+        const double begin = HybridNowUs();
+        fastllm::NumasMoeVerifyExperts(reinterpret_cast<const uint16_t *>(w.hostData),
+            w.hostData + w.rows * w.hidden, w.rows, w.weights.data(), w.weights.size(),
+            box.ids, box.gpu, box.scores, w.topk, w.modelLayer, layout.swigluLimit, true);
+        const int cpuRoutes = w.routes - w.hits - w.stagedRoutes;
+        if (cpuRoutes > 0) w.cost.cpuExpert.Observe((HybridNowUs() - begin) / cpuRoutes);
+        ++w.cost.calls;
+        const uint64_t d[8] = {1, uint64_t(w.routes), uint64_t(w.hits), uint64_t(w.routes-w.hits),
+            uint64_t(w.hits+w.stagedRoutes), uint64_t(cpuRoutes), uint64_t(w.hits), 0};
+        for (int i = 0; i < 8; ++i) {
+            cache.cooperativeStats[i] += d[i];
+            if (phase != FastllmMoeRoutePhase::Unspecified) cache.phaseStats[int(phase)][i] += d[i];
+        }
+    }
+    static bool ComputeBatch(Layer &w, const OffloadLayout &layout, const uint8_t *records,
+            const int32_t *slots, const float *scores) {
+        for (int first = 0; first < w.rows; first += 8) {
+            const int rows = std::min(8, w.rows - first), base = first * w.topk;
+            fastllm::Data input, gate, dummy;
+            input.FakeFrom(w.quantized, size_t(first) * w.hidden * 2); input.Resize({rows, w.hidden});
+            gate.FakeFrom(w.gate, size_t(base) * layout.inter * 2); gate.Resize({rows*w.topk, layout.inter});
+            FastllmCudaMoeGGUFCacheView view{};
+            view.records = records; view.routeSlots = const_cast<int32_t *>(slots + base);
+            view.routeMap = w.routeMap + base; view.routeCount = rows * w.topk;
+            if (!ComputeBatchExperts(input, gate, dummy, layout, view, scores + base,
+                    w.topk, w.partial + size_t(base) * w.hidden, true)) return false;
+        }
+        return true;
     }
     static void Compute(Layer &w, const OffloadLayout &layout, const uint8_t *records,
             const int32_t *slots, const float *scores, cudaStream_t stream, bool resident = false) {
@@ -437,24 +552,29 @@ struct NativeMoeMailbox {
         Finish(true);
         const auto &layout = group.LayerLayout(table);
         const int topk = index.dims.back();
-        if (!copy) copy = MakeDecodeOverlap(group, group.tableKeys.size(), topk);
-        if (!copy) return nullptr;
+        if (!fullCopy) fullCopy = MakeDecodeOverlap(group, group.tableKeys.size(), kMaxTopK);
+        if (!fullCopy) return nullptr;
         auto fresh = std::make_unique<Layer>();
-        if (!fresh->Init(layout, topk, cache.device)) return nullptr;
+        if (!fresh->Init(layout, topk, cache.device, input.dims[0])) return nullptr;
         auto &w = *fresh;
         w.owner = this; w.table = table; w.modelLayer = layer;
         w.weights.assign(weights, weights + weightsBatch);
         auto measured = layers.find(table);
         if (measured != layers.end()) w.cost = measured->second->cost;
-        output.dataType = input.dataType; output.Resize({1, w.hidden});
+        output.dataType = input.dataType; output.Resize({w.rows, w.hidden});
         output.ToDevice(fastllm::CUDA, {cache.device}, false); output.Allocate(false);
         w.pointers = {input.cudaData, index.cudaData, score.cudaData, output.cudaData};
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, cache.device) != cudaSuccess) return nullptr;
-        const auto launch = fastllm::cuda::RecordCopyConfiguration(layout.recordStride, topk, prop);
+        const auto launch = fastllm::cuda::RecordCopyConfiguration(layout.recordStride, kMaxTopK, prop);
         if (cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return nullptr;
         bool ok = [&] {
-            PublishNativeMoe<<<1, w.hidden >= 4096 ? 512 : 256, 0, cudaStreamPerThread>>>(w.mapped, w.mappedData,
+            if (w.rows > 1) PublishNativeBatchMoe<<<1, 256, 0, cudaStreamPerThread>>>(w.mapped,
+                reinterpret_cast<uint16_t *>(w.mappedData), static_cast<const uint16_t *>(input.cudaData),
+                static_cast<const int32_t *>(index.cudaData), static_cast<const float *>(score.cudaData),
+                cache.keyToSlot, cache.slotKeys, w.slots, w.routeMap, cache.hitCount, cache.totalMissCount,
+                table * layout.experts, layout.experts, w.hidden, w.rows, topk);
+            else PublishNativeMoe<<<1, w.hidden >= 4096 ? 512 : 256, 0, cudaStreamPerThread>>>(w.mapped, w.mappedData,
                 static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const int32_t *>(index.cudaData),
                 static_cast<const float *>(score.cudaData), cache.keyToSlot, cache.slotKeys, w.slots,
                 cache.hitCount, cache.totalMissCount, table * layout.experts, layout.experts, w.hidden, topk, true);
@@ -472,7 +592,9 @@ struct NativeMoeMailbox {
             if (cudaEventRecordWithFlags(w.begin, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
             if (cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess) return false;
             std::vector<cudaGraphNode_t> fork(deps, deps + count);
-            Compute(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData), cudaStreamPerThread, true);
+            if (w.rows > 1) {
+                if (!ComputeBatch(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData))) return false;
+            } else Compute(w, layout, cache.records, w.slots, static_cast<const float *>(score.cudaData), cudaStreamPerThread, true);
             if (cudaEventRecordWithFlags(w.residentDone, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
             if (cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, &deps, &count) != cudaSuccess) return false;
             std::vector<cudaGraphNode_t> residentTail(deps, deps + count);
@@ -480,31 +602,42 @@ struct NativeMoeMailbox {
             // Both depend on publication and quantization, and join at Reduce.
             if (cudaStreamUpdateCaptureDependencies(cudaStreamPerThread, fork.data(), fork.size(),
                     cudaStreamSetCaptureDependencies) != cudaSuccess) return false;
+            if (w.rows > 1) {
+                WaitNativeMoe<<<1, 1, 0, cudaStreamPerThread>>>(&w.mapped->planned);
+                ReadNativeBatchPlan<<<1, 256, 0, cudaStreamPerThread>>>(w.mapped,
+                    static_cast<const int32_t *>(index.cudaData), w.slots + w.routes,
+                    w.slots + 2 * w.routes, w.rows, topk);
+            }
             if (cudaEventRecordWithFlags(w.uploadBegin, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
             // GPU reads the selected pinned records using device-side IDs.
             // No CUDA work is submitted by the CPU dispatcher during replay.
+            const int32_t *stagedExperts = w.rows > 1 ? w.mapped->stagedExperts : w.slots + 3 * topk;
+            const int32_t *stagedSlots = w.rows > 1 ? w.mapped->stagedSlots : w.slots + 4 * topk;
+            const int32_t *stagedCount = w.rows > 1 ? &w.mapped->stagedCount : w.slots + 5 * topk;
+            const int maxStaged = w.rows > 1 ? kMaxTopK : topk;
             if (group.sharedLayout.shards) {
                 const auto &shared = group.sharedLayout;
                 auto *pointers = cache.numaPointers + size_t(table) * layout.experts * 2 * shared.shards;
                 const auto *auxiliary = shared.auxiliaryBytes ? group.deviceHostRecords +
                     size_t(table) * layout.experts * shared.auxiliaryBytes : nullptr;
-                if (!fastllm::cuda::CopySharedExpertRecords(shared, pointers, auxiliary, copy->records,
-                        w.slots + 3 * topk, w.slots + 4 * topk, w.slots + 5 * topk, topk,
-                        launch, cudaStreamPerThread)) return false;
+                if (!fastllm::cuda::CopySharedExpertRecords(shared, pointers, auxiliary, fullCopy->records,
+                        stagedExperts, stagedSlots, stagedCount, maxStaged, launch, cudaStreamPerThread)) return false;
             } else {
                 fastllm::cuda::RecordCopyView view{group.deviceHostRecords + group.layerHostOffsets[table],
-                    copy->records, layout.recordStride, layout.recordStride, layout.recordStride};
-                if (!fastllm::cuda::CopyRecords(view, w.slots + 3 * topk, w.slots + 4 * topk,
-                        w.slots + 5 * topk, topk, launch, cudaStreamPerThread)) return false;
+                    fullCopy->records, layout.recordStride, layout.recordStride, layout.recordStride};
+                if (!fastllm::cuda::CopyRecords(view, stagedExperts, stagedSlots, stagedCount,
+                        maxStaged, launch, cudaStreamPerThread)) return false;
             }
             if (cudaEventRecordWithFlags(w.uploadDone, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
-            Compute(w, layout, copy->records, w.slots + topk, static_cast<const float *>(score.cudaData), cudaStreamPerThread);
+            if (w.rows > 1) {
+                if (!ComputeBatch(w, layout, fullCopy->records, w.slots + w.routes, static_cast<const float *>(score.cudaData))) return false;
+            } else Compute(w, layout, fullCopy->records, w.slots + topk, static_cast<const float *>(score.cudaData), cudaStreamPerThread);
             if (cudaEventRecordWithFlags(w.done, cudaStreamPerThread, cudaEventRecordExternal) != cudaSuccess) return false;
             if (cudaStreamUpdateCaptureDependencies(cudaStreamPerThread, residentTail.data(), residentTail.size(),
                     cudaStreamAddCaptureDependencies) != cudaSuccess) return false;
             WaitNativeMoe<<<1, 1, 0, cudaStreamPerThread>>>(&w.mapped->computed);
-            fastllm::cuda::dsv41_cache::Reduce<<<(w.hidden+255)/256, 256, 0, cudaStreamPerThread>>>(
-                w.mappedData+w.hidden, w.partial, w.slots+2*topk, static_cast<const int32_t *>(index.cudaData),
+            fastllm::cuda::dsv41_cache::Reduce<<<dim3((w.hidden+255)/256, w.rows), 256, 0, cudaStreamPerThread>>>(
+                w.mappedData+w.rows*w.hidden, w.partial, w.slots+2*w.routes, static_cast<const int32_t *>(index.cudaData),
                 static_cast<__nv_bfloat16 *>(output.cudaData), w.hidden, topk);
             if (cudaGetLastError() != cudaSuccess) return false;
             return cudaEventRecordWithFlags(w.completed, cudaStreamPerThread, cudaEventRecordExternal) == cudaSuccess;
@@ -512,7 +645,7 @@ struct NativeMoeMailbox {
         const auto end = cudaStreamEndCapture(cudaStreamPerThread, &w.fullGraph);
         if (!ok || end != cudaSuccess || !w.fullGraph) { cudaGetLastError(); return nullptr; }
         auto *handle = fresh.get();
-        fullLayers[table] = std::move(fresh);
+        fullLayers.push_back(std::move(fresh));
         return handle;
     }
     static bool StripTiming(cudaGraph_t graph, const std::vector<cudaEvent_t> &events) {
@@ -583,7 +716,8 @@ struct NativeMoeMailbox {
         }
         std::deque<Request> requests;
         for (int i = 0; i < count; ++i)
-            requests.push_back({static_cast<Layer *>(handles[i]), FastllmMoeRoutePhase::Decode});
+            requests.push_back({static_cast<Layer *>(handles[i]),
+                static_cast<Layer *>(handles[i])->rows > 1 ? FastllmMoeRoutePhase::Verify : FastllmMoeRoutePhase::Decode});
         if (!dispatcher.joinable()) dispatcher = std::thread([this] { Run(); });
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -593,8 +727,12 @@ struct NativeMoeMailbox {
                 // the new CPU queue, so no dispatcher can consume an old flag.
                 __atomic_store_n(&w.host->published, 0u, __ATOMIC_RELEASE);
                 __atomic_store_n(&w.host->computed, 0u, __ATOMIC_RELEASE);
-                for (int hits = 0; hits <= w.topk; ++hits)
-                    w.host->stagedByHits[hits] = w.cost.SelectDecodeMisses(w.topk - hits, hits);
+                if (w.rows > 1) {
+                    __atomic_store_n(&w.host->planned, 0u, __ATOMIC_RELEASE);
+                } else {
+                    for (int hits = 0; hits <= w.topk; ++hits)
+                        w.host->stagedByHits[hits] = w.cost.SelectDecodeMisses(w.topk - hits, hits);
+                }
             }
             launchCanceled.store(false, std::memory_order_release);
             queue.swap(requests);

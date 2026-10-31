@@ -34,7 +34,7 @@ __global__ void V41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layer
 
 bool FastllmCudaV41CommitVerifiedPrefix(const FastllmV41VerifyCommitLayer *layers, int layerCount,
                                         int accepted, int forwarded) {
-    if (!layers || layerCount <= 0 || forwarded < 1 || forwarded > 8 || accepted < 1 || accepted > forwarded)
+    if (!layers || layerCount <= 0 || forwarded < 1 || forwarded > 128 || accepted < 1 || accepted > forwarded)
         return false;
     V41CommitVerifiedPrefix<<<layerCount, 256, 0, cudaStreamPerThread>>>(layers, accepted);
     return cudaGetLastError() == cudaSuccess;

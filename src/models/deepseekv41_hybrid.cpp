@@ -128,7 +128,7 @@ namespace fastllm {
         // Otherwise every layer can independently replace a cache entry, and
         // the next layer drains that upload before launching its experts.
         const bool nativeVerify = v41DsparkEnabled && weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0 &&
-                                  seqlen > 1 && seqlen <= 8;
+                                  seqlen > 1 && seqlen <= 32;
         if (!tp && single && (seqlen == 1 || nativeVerify) && nativeFrequency &&
             FastllmCudaMoeCacheRequested() &&
             !V41ReferenceMathEnabled() && GetCudaSharedExpert() &&

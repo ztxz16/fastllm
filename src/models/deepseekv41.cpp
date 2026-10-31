@@ -13,6 +13,7 @@
 #include "deepseekv41_execution.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-v41-full-decode.h"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #endif
 #include "utils/hybrid_moe.h"
 #if defined(USE_NUMAS) && defined(__linux__)
@@ -4694,6 +4695,7 @@ namespace fastllm {
             std::vector<DeepSeekV41GraphDeviceState> deviceStates;
             std::vector<DeepSeekV41GraphSegment> segments;
             std::vector<void*> reservedPointers;
+            std::vector<size_t> captureAllocations;
             // 捕获时工作区里各边界张量的设备地址。回放前逐一核对，任何一个搬了家
             // 都说明图里烤死的地址已经失效，销毁重捕获；反复失效就彻底关掉。
             std::vector<const void*> boundaryPointers;
@@ -4764,6 +4766,7 @@ namespace fastllm {
                 replaying = false;
                 captureFailed = false;
                 warmupRounds = 0;
+                captureAllocations.clear();
             }
 
             void ResetWorkspace() {
@@ -5115,6 +5118,7 @@ namespace fastllm {
         bool graphCapture = false;
         Data *fullGraphHead = nullptr, *fullGraphLogits = nullptr;
         bool graphPoolOpen = false;
+        std::unique_ptr<FastllmCudaAllocationRecorder> allocationRecorder;
         bool workerOrderedGraphReplay = false;
         bool decodeQkvViewsPrepared = false;
         bool decodeOutputViewsPrepared = false;
@@ -5482,7 +5486,8 @@ namespace fastllm {
                         (int)graphState->segments.size() == kV41GraphSegmentsPerLayer * block_cnt) {
                         graphReplay = true;
                     } else if ((v41CudaGraphWarmingUp || verifyGraph) &&
-                               graphState->warmupRounds >= V41DecodeCudaGraphWarmupRounds()) {
+                               graphState->warmupRounds >= std::max(graphState->devices.size() == 1 ? 2 : 1,
+                                                                  V41DecodeCudaGraphWarmupRounds())) {
                         graphCapture = true;
                     }
                 }
@@ -5517,12 +5522,20 @@ namespace fastllm {
             tp && (executionMode == ExecutionMode::Gpu || (single && seqlen == 1) ||
                    graphActive || tpVerifyWorkspaceActive), tpDevices));
         graphPoolOpen = false;
+        if (graphActive && !graphCapture && !graphReplay && graphState->devices.size() == 1 &&
+            graphState->warmupRounds > 0) {
+            // Persistent weights are ready after the first warmup. Reserve the
+            // complete transient allocation sequence before graph capture.
+            graphState->captureAllocations.clear();
+            f.allocationRecorder.reset(new FastllmCudaAllocationRecorder(&graphState->captureAllocations));
+        }
         if (graphCapture) {
             const int oriDevice = FastllmCudaGetDevice();
             for (int device : graphState->devices) {
                 FastllmCudaSyncDevice(device);
             }
-            bool prepared = true;
+            bool prepared = graphState->devices.size() != 1 ||
+                FastllmCudaReserveGraphWorkspace(graphState->captureAllocations);
             for (int device : graphState->devices) {
                 FastllmCudaSetDevice(device);
                 if (!FastllmCudaGraphPrepareCaptureDevice()) {

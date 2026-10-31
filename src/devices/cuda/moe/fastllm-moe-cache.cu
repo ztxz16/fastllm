@@ -5411,9 +5411,16 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
     // silently switching back to the hybrid CPU/GPU scheduler during capture.
     const char *mode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
     if (mode && std::strcmp(mode, "gpu") == 0) return nullptr;
-    if (!sharedGraph || FastllmCudaGraphIsCapturingFast() || !SupportedCacheInput(input) ||
-        input.dims[0] != 1 || input.dataType != fastllm::BFLOAT16 ||
-        index.dims.size() != 2 || index.dims[0] != 1 || index.dataType != fastllm::INT32 ||
+    const std::vector<int> device{FastllmCudaGetDevice()};
+    if (!sharedGraph || FastllmCudaGraphIsCapturingFast() ||
+        !PackedCacheRows(input) || !PackedCacheRows(index) || !PackedCacheRows(score) ||
+        !input.cudaData || input.dataDevice != fastllm::CUDA ||
+        index.dataDevice != fastllm::CUDA || score.dataDevice != fastllm::CUDA ||
+        input.dataDeviceIds != device || index.dataDeviceIds != device || score.dataDeviceIds != device ||
+        input.multiDeviceData || index.multiDeviceData || score.multiDeviceData || output.multiDeviceData ||
+        &output == &input || &output == &index || &output == &score ||
+        input.dims[0] < 1 || input.dims[0] > kNativeMoeMaxRows || input.dataType != fastllm::BFLOAT16 ||
+        index.dims[0] != input.dims[0] || index.dataType != fastllm::INT32 ||
         score.dims != index.dims || score.dataType != fastllm::FLOAT32 ||
         !index.cudaData || !score.cudaData ||
         index.dims.back() < 1 || index.dims.back() > kMaxTopK) return nullptr;
@@ -5422,7 +5429,8 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
     if (!group || !group->cpuDecodeReady || !group->expertDevices.empty() ||
         group->tensorParallelRequested || group->deviceCaches.size() != 1 ||
         group->LayerLayout(table).weightType != fastllm::NVFP4_BLOCK_32_E8M0 ||
-        !group->LayerLayout(table).deepSeekV41) return nullptr;
+        !group->LayerLayout(table).deepSeekV41 ||
+        input.dims[1] != group->LayerLayout(table).hidden) return nullptr;
     auto *cache = GetDeviceCache(*group, false);
     if (!cache || !cache->frequency) return nullptr;
     if (!cache->nativeMailbox) cache->nativeMailbox = std::make_shared<NativeMoeMailbox>(*group, *cache);

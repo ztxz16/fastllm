@@ -152,7 +152,7 @@ struct V41FullGraph {
     }
 };
 
-bool V41FullDispatch(V41FullGraph &g, const std::function<void(int, int)> &body) {
+bool V41FullDispatch(const V41FullGraph &g, const std::function<void(int, int)> &body) {
     if (g.tensorParallel) return MultiCudaRunDeviceCallbacks(g.devices, body);
     FastllmCudaSetDevice(g.devices.front());
     body(0, g.devices.front());
@@ -295,8 +295,17 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
     // Scratch views borrow graph buffers until commit/draft completes,
     // before the next target forward can overwrite them.
     auto borrow = [&](Data &view, const Data &source, int rows) {
-        AssertInFastLLM(V41DecodeSliceView(view, source, 0, g.devices, rows),
-                        "full verify buffer view failed");
+        if (g.tensorParallel) {
+            AssertInFastLLM(V41DecodeSliceView(view, source, 0, g.devices, rows),
+                            "full verify buffer view failed");
+        } else {
+            AssertInFastLLM(!source.multiDeviceData && source.cudaData &&
+                source.dims.size() >= 3 && source.dims[0] == 1 && source.dims[1] >= rows,
+                "full verify local buffer view failed");
+            view.FakeFrom(source, 0);
+            auto dims = source.dims; dims[1] = rows;
+            view.Resize(dims);
+        }
     };
     auto &scratch = *segment.spec;
     const int layers = g.layers.size();
@@ -311,7 +320,7 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
     scratch.commitKV = [owner](int accepted) {
         const auto &graph = *owner;
         std::vector<int> ok(graph.devices.size(), 0);
-        const bool submitted = MultiCudaRunDeviceCallbacks(graph.devices, [&](int rank, int) {
+        const bool submitted = V41FullDispatch(graph, [&](int rank, int) {
             ok[rank] = FastllmCudaV41CommitVerifiedPrefix(
                 static_cast<const FastllmV41VerifyCommitLayer *>(graph.commitDescriptors[rank].cudaData),
                 (int)graph.layers.size(), accepted, graph.batch);
@@ -329,12 +338,12 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
 
 void DeepSeekV41Model::BuildFullDecodeGraph(
     int batch, const std::vector<DeepSeekV41Segment> &segments) {
-    const bool hybrid = executionMode == ExecutionMode::Hybrid && batch == 1 &&
-        !v41DsparkEnabled && FastllmCudaMoeCacheRequested();
     const bool verifying = segments.size() == 1 && segments[0].spec && segments[0].spec->deferWindow;
+    const bool hybrid = executionMode == ExecutionMode::Hybrid &&
+        (verifying || (batch == 1 && !v41DsparkEnabled)) && FastllmCudaMoeCacheRequested();
     // Small target chunks share decode's fixed operands and dynamic
     // request descriptors. Other shapes keep the segmented/eager path.
-    if (batch < 1 || batch > (verifying ? 8 : 16) || (!hybrid && executionMode != ExecutionMode::Gpu) ||
+    if (batch < 1 || batch > (verifying ? (hybrid ? 32 : 8) : 16) || (!hybrid && executionMode != ExecutionMode::Gpu) ||
         (!verifying && v41DsparkEnabled) ||
         (!hybrid && (kvCacheDataType == DataType::FP8_E4M3 || kvCacheDataType == DataType::FP4_E2M1)) ||
         (!verifying && !v41CudaGraphWarmingUp) || head_dim_full != 512 || hc_mult != 4 || index_head_dim != 128 ||
@@ -408,7 +417,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         g->hostTokens.assign(batch, 0.f);
         if (!verifying) alloc(g->inputIds, DataType::FLOAT32, {1, batch});
     }
-    if (hybrid) alloc(g->deferredHcMix, DataType::FLOAT32, {2 * block_cnt, 32});
+    if (hybrid && batch == 1) alloc(g->deferredHcMix, DataType::FLOAT32, {2 * block_cnt, 32});
     std::vector<int> hcStart, hcJoin;
     const int blockSize = std::max(1, candidate_block_size);
     alloc(g->topk, DataType::INT32, {1, batch, index_topk});
@@ -487,7 +496,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         if (!e->table->gpuTable)
             GatherEngramRows(engram_layer_ids[i], e->hostRows, batch, e->hostGathered);
         const auto &t = *e->table;
-        if (hybrid && batch == 1 && !t.gpuTable && !t.ggufWeight &&
+        if (hybrid && !t.gpuTable && !t.ggufWeight &&
             ((t.data && t.scale) || (t.diskValueReader && t.diskScaleReader))) {
             // Unsupported devices keep the existing synchronous gather path.
             if (FastllmCudaV41CreateHostCopy(e->gathered.cudaData, e->gathered.GetBytes(),
@@ -508,19 +517,24 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     if (g->verifying) {
         size_t offset = block_cnt * batch * sizeof(FastllmV41FullDecodeRequest);
         auto view = [&](Data &data, DataType dtype, const std::vector<int> &dims) {
-            data.multiDeviceData = true;
-            for (int device : g->devices) {
-                auto *local = new Data();
-                local->FakeFrom(V41FullLocal(g->requests, device), offset);
-                local->dataType = dtype;
-                local->UpdateUnitSize();
-                local->Resize(dims);
-                local->expansionDims = dims;
-                local->expansionSize = local->Count(0);
-                local->expansionBytes = local->GetBytes();
-                data.multiDeviceDatas[device] = local;
-            }
-            V41SyncRootFromReplica(data, g->devices);
+            auto bind = [&](Data &local, int device) {
+                local.FakeFrom(V41FullLocal(g->requests, device), offset);
+                local.dataType = dtype;
+                local.UpdateUnitSize();
+                local.Resize(dims);
+                local.expansionDims = dims;
+                local.expansionSize = local.Count(0);
+                local.expansionBytes = local.GetBytes();
+            };
+            if (g->tensorParallel) {
+                data.multiDeviceData = true;
+                for (int device : g->devices) {
+                    auto *local = new Data();
+                    bind(*local, device);
+                    data.multiDeviceDatas[device] = local;
+                }
+                V41SyncRootFromReplica(data, g->devices);
+            } else bind(data, g->devices.front());
             offset += data.GetBytes();
         };
         // All int64 rows precede float masks, preserving alignment for odd M.
@@ -702,7 +716,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             if (hybrid) {
                 auto routed = weights[l]; routed[0] = routed[1] = nullptr;
                 Data input;
-                input.FakeFrom(ws.ffnInput, 0); input.Resize({1, embed_dim});
+                input.FakeFrom(ws.ffnInput, 0); input.Resize({batch, embed_dim});
                 ws.expertIndex.Reshape(state->segments[l * 4 + 2].expertIndexDims);
                 ws.expertScore.Reshape(state->segments[l * 4 + 2].expertScoreDims);
                 void *moeGraph = nullptr;
@@ -730,7 +744,9 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 ToDataType(g->norm, g->normFloat, DataType::FLOAT32);
                 Linear(g->normFloat, weight["head.weight"], *GetEmptyData(), g->logits);
             }
-            if (verifying) {
+            if (verifying && !g->tensorParallel) {
+                g->gatheredLogits.CopyFrom(g->logits);
+            } else if (verifying) {
                 if (g->gatheredLogits.dims.empty()) {
                     FastllmCudaSetDevice(g->devices.front());
                     g->gatheredLogits.dataType = DataType::FLOAT32;
@@ -766,7 +782,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 g->ready[rank] = FastllmCudaEventCreate();
                 if (!g->ready[rank]) throw std::runtime_error("full verify completion event");
             }
-            const bool deferred = hybrid && FastllmCudaV41ComposeHcGraph(
+            const bool deferred = hybrid && batch == 1 && FastllmCudaV41ComposeHcGraph(
                 children[rank].data(), children[rank].size(), hcStart.data(), hcJoin.data(),
                 hcStart.size(), static_cast<float *>(g->deferredHcMix.cudaData),
                 &g->graphs[rank], &g->execs[rank]);
@@ -783,8 +799,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 const int device = g->devices[rank];
                 FastllmCudaSetDevice(device);
                 auto ptr = [device](const Data &data) -> void * {
-                    auto it = data.multiDeviceDatas.find(device);
-                    return it == data.multiDeviceDatas.end() || !it->second ? nullptr : it->second->cudaData;
+                    return V41FullLocal(data, device).cudaData;
                 };
                 const auto *requests = static_cast<const FastllmV41FullDecodeRequest *>(ptr(g->requests));
                 std::vector<FastllmV41VerifyCommitLayer> descriptors;
@@ -827,8 +842,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     if (verifying) {
         V41FullDispatch(*g, [&](int, int device) {
             FastllmCudaCopyFromDeviceToDevice(V41FullLocal(ws.hiddenStates, device).cudaData,
-                initialHidden.multiDeviceDatas.at(device)->cudaData,
-                initialHidden.multiDeviceDatas.at(device)->GetBytes());
+                V41FullLocal(initialHidden, device).cudaData,
+                V41FullLocal(initialHidden, device).GetBytes());
         });
         for (int device : g->devices) FastllmCudaSyncDevice(device);
     }

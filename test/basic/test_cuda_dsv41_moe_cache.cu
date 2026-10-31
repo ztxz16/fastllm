@@ -397,6 +397,70 @@ static void CheckCompleteNativeGraphs(std::vector<Data *> &weights, int layer) {
     std::printf("COMPLETE_NATIVE_GRAPH_PASS %d replays, rows 1..32, topk 1/3/6/16\n", checks);
 }
 
+static void CheckVerifierMailbox(std::vector<Data *> *weights) {
+    const int hidden=weights[0][2]->dims[1], experts=weights[0].size()/2-1, topk=6;
+    int checks=0;
+    for (int rows : {2,3,5,6,8,9,16,32}) {
+        Data input(BFLOAT16,{rows,hidden}), ids[2], scores[2], output[2]; Gpu(input);
+        for(int l=0;l<2;++l){ids[l].dataType=INT32;ids[l].Resize({rows,topk});Gpu(ids[l]);
+            scores[l].dataType=FLOAT32;scores[l].Resize({rows,topk});Gpu(scores[l]);
+            output[l].dataType=BFLOAT16;output[l].Resize({rows,hidden});Gpu(output[l]);}
+        void *handles[2]{}, *children[2]{}, *graph=nullptr,*exec=nullptr,*untimed=nullptr;
+        cudaGraph_t shared;cudaGraphNode_t empty;Check(cudaGraphCreate(&shared,0));
+        Check(cudaGraphAddEmptyNode(&empty,shared,nullptr,0));
+        void *scope=FastllmCudaBeginMoeDecode(weights[0].data(),weights[0].size(),topk);
+        Require(scope,"verifier mailbox initial scope");FastllmCudaEndMoeDecode(scope);
+        // Invalid views must be rejected before capturing a device access.
+        auto rejected = [&](Data &destination) {
+            void *child = nullptr;
+            Require(!FastllmCudaCreateNativeMoeFullGraph(input, ids[0], scores[0], destination,
+                weights[0].data(), weights[0].size(), 0, shared, &child) && !child,
+                "invalid verifier mailbox view accepted");
+        };
+        for (Data *view : {&input, &ids[0], &scores[0]}) {
+            ++view->strides[0]; rejected(output[0]); --view->strides[0];
+            const auto devices = view->dataDeviceIds;
+            view->dataDeviceIds = {1}; rejected(output[0]); view->dataDeviceIds = devices;
+            view->multiDeviceData = true; rejected(output[0]); view->multiDeviceData = false;
+        }
+        input.Resize({rows, hidden - 32}); rejected(output[0]); input.Resize({rows, hidden});
+        rejected(input); rejected(ids[0]); rejected(scores[0]);
+        for(int l=0;l<2;++l){
+            handles[l]=FastllmCudaCreateNativeMoeFullGraph(l?output[0]:input,ids[l],scores[l],output[l],
+                weights[l].data(),weights[l].size(),l,shared,&children[l]);
+            Require(handles[l]&&children[l],"verifier mailbox creation");}
+        Check(cudaGraphDestroy(shared));
+        Require(FastllmCudaGraphCompose(const_cast<const void *const *>(children),2,&graph,&exec),"verifier compose");
+        Require(FastllmCudaCreateNativeMoeReplayGraph(graph,handles,2,&untimed),"verifier untimed compose");
+        for(int pass=0;pass<24;++pass){
+            std::vector<uint16_t> reference(rows*hidden),result(reference.size());
+            std::vector<float> expected[2];
+            for(size_t i=0;i<reference.size();++i)reference[i]=Float32ToBFloat16RNEBits(float(int((i*7+pass*13)%61)-30)/32);
+            Check(cudaMemcpy(input.cudaData,reference.data(),reference.size()*2,cudaMemcpyHostToDevice));
+            for(int l=0;l<2;++l){
+                std::vector<int32_t> selected(rows*topk),none(selected.size(),-1);
+                std::vector<float> scale(selected.size());
+                for(size_t i=0;i<selected.size();++i){selected[i]=(pass*7+l*3+(i%topk)*5+i/topk)%experts;scale[i]=i%5==0?0.f:float(i%4+1)/32;}
+                if(pass%3==1)for(int row=0;row<rows;++row)selected[row*topk+1]=selected[row*topk+2];
+                NumasMoeVerifyExperts(reference.data(),result.data(),rows,weights[l].data(),weights[l].size(),
+                    selected.data(),none.data(),scale.data(),topk,l,10,false);
+                reference=result;expected[l].resize(reference.size());
+                for(size_t i=0;i<reference.size();++i)expected[l][i]=__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&reference[i]));
+                Check(cudaMemcpy(ids[l].cudaData,selected.data(),selected.size()*4,cudaMemcpyHostToDevice));
+                Check(cudaMemcpy(scores[l].cudaData,scale.data(),scale.size()*4,cudaMemcpyHostToDevice));
+            }
+            scope=FastllmCudaBeginMoeDecode(weights[0].data(),weights[0].size(),topk);Require(scope,"verifier scope");
+            Require(FastllmCudaLaunchNativeMoeFullGraph(pass%3==0?exec:untimed,handles,2,pass%3==0),"verifier launch");
+            FastllmCudaEndMoeDecode(scope);
+            for(int l=0;l<2;++l){Check(cudaMemcpy(result.data(),output[l].cudaData,result.size()*2,cudaMemcpyDeviceToHost));
+                std::vector<float> actual(result.size());for(size_t i=0;i<result.size();++i)actual[i]=__bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&result[i]));
+                Compare(actual,expected[l],"verifier mailbox/NUMA oracle mismatch");++checks;}
+        }
+        FastllmCudaGraphExecDestroy(untimed);FastllmCudaGraphExecDestroy(exec);FastllmCudaGraphDestroy(graph);
+    }
+    std::printf("VERIFY_MAILBOX_GRAPH_PASS %d dependent layer checks; rows 2/3/5/6/8/9/16/32\n",checks);
+}
+
 // A cache concentrated on one GPU must not disable the other prefill worker.
 // Keep all selected experts resident on GPU 0 and GPU 1 empty, then compare the
 // two-worker result with uncached projections and the same BF16 partial
@@ -1310,6 +1374,7 @@ int main(int argc, char **argv) {
             std::printf("%s_CHAIN_PASS %d replays, %d dependent layer comparisons\n", full ? "FULL_GRAPH" : "MAILBOX", chainReplays, 2 * chainReplays);
         }
 
+        if (option("--verify-mailbox") && !fp8 && !dual) CheckVerifierMailbox(weights);
         unsetenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
