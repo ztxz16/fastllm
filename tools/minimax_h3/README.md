@@ -20,7 +20,10 @@ GEMM 保持 FP32 累加。时间嵌入、视频/音频输入输出投影和采�
 文本编码只执行 Qwen3-VL 的前 50 层，读取 final norm 之前的残差，权重按层释放。
 DiT 按每次前向的时间点数预计算 AdaLN 表，随后释放这些投影权重；BF16 主干约
 37.5 GiB 权重驻留到本次去噪结束，后续采样步不再重复传输。视频和音频解码按阶段加载。
-生成结束或取消时清空权重，不跨请求保留。
+当非 FP32 主干、非 FP32 视频 VAE、总显存至少 68 GiB 且创建时空闲至少 60 GiB 时，
+跨请求保留 DiT、视频/音频 VAE 权重，并复用完全相同的 AdaLN 时间表。其他配置按阶段
+释放；取消或异常仍清空 GPU 权重。文本 checkpoint 字节保留在有界 CPU 缓存中，优先
+使用 pinned 内存，按层上传 GPU；不缓存 prompt 的编码结果。
 
 FP32 对比模式仍按层加载 DiT，并利用部分空闲显存缓存原始 BF16 权重，使用时精确
 展开为 FP32。此缓存不改变运算精度，预算不超过启用时空闲显存的一半，预留至少
@@ -80,6 +83,13 @@ CUDA_VISIBLE_DEVICES=7 build-h3/src/models/minimax_h3/minimax_h3_generate \
 
 开发调优先用 `--width 256 --height 256 --steps 4`（实际 3 次 DiT）快速比较，确认
 收益后再跑完整精度回归。少步数输出只用于测速和数值检查，不用于评判最终生成质量。
+
+CLI 和 HTTP 默认先解码音频，再将视频 VAE 已完成拼接的帧分段交给后台 FFmpeg，
+让编码与后续解码重叠。队列有容量上限，取消和编码失败会回收子进程与临时文件；
+完成后才原子发布 MP4。编码参数保持 libx264、fast、CRF 18、4 线程及 AAC 192k。
+C++ 调用 `Pipeline::generateMP4` 可使用相同路径；`Pipeline::generate` 仍返回原始
+RGB/音频，`writeMP4` 仍可单独编码。视频 VAE 的中间投影按最多 4 个空间 tile 合批，
+各 tile 的 attention 保持独立；FP32 对照保留原分块与矩阵形状。
 
 ## HTTP 与 Demo
 
