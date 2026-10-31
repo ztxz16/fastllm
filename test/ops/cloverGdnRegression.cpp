@@ -641,9 +641,49 @@ void Preview(int batch, int tokens, int kh, int vh, bool masked) {
     Check(cudaGraphLaunch(executable, cudaStreamPerThread)); check();
     Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
 }
-void IndirectCaches(int batch, int tokens) {
+void PreviewConvolutionTiles(int tokens) {
+    constexpr int batch = 3, channels = 1027;
+    size_t count = size_t(batch) * tokens * channels, historySize = size_t(batch) * channels * 3;
+    std::mt19937 rng(3167 + tokens); std::normal_distribution<float> normal(0.f, .3f);
+    auto random = [&](size_t n) { std::vector<uint16_t> v(n); for (auto &x : v) x = Round16(normal(rng)); return v; };
+    auto input = random(count), history = random(historySize), weight = random(channels * 4), right = random(channels * 3);
+    std::vector<int> slots{2, -1, 0}; std::vector<unsigned char> valid(batch * tokens);
+    for (int i = 0; i < batch * tokens; ++i) valid[i] = i % 4 != 0;
+    Buffer x(count * 2), h(historySize * 2), w(weight.size() * 2), rw(right.size() * 2),
+        ds(batch * 4), dv(valid.size()), y((count + 128) * 2), ref((count + 128) * 2);
+    auto guard = std::vector<uint16_t>(count + 128, Round16(123.f));
+    x.Put(input); h.Put(history); w.Put(weight); rw.Put(right); ds.Put(slots); dv.Put(valid); y.Put(guard); ref.Put(guard);
+    auto launch = [&]() {
+        Require(FastllmCudaCloverPreviewConv(x.p, h.p, w.p, rw.p, (int *)ds.p,
+            (unsigned char *)dv.p, (uint16_t *)y.p + 64, batch, tokens, channels, nullptr, nullptr, fp16), "tiled preview convolution");
+    };
+    auto check = [&]() {
+        for (int b = 0; b < batch; ++b) {
+            int slot = slots[b] < 0 ? -1 : 0; Buffer selected(sizeof(int)); selected.Put(std::vector<int>{slot});
+            Require(FastllmCudaCloverPreviewConv((uint16_t *)x.p + size_t(b) * tokens * channels,
+                (uint16_t *)h.p + size_t(std::max(0, slots[b])) * channels * 3, w.p, rw.p,
+                (int *)selected.p, (unsigned char *)dv.p + b * tokens,
+                (uint16_t *)ref.p + 64 + size_t(b) * tokens * channels,
+                1, tokens, channels, nullptr, nullptr, fp16), "serial masked preview convolution");
+        }
+        Require(y.Get<uint16_t>(count + 128) == ref.Get<uint16_t>(count + 128), "tiled preview convolution or guard differs");
+        Require(x.Get<uint16_t>(count) == input && h.Get<uint16_t>(historySize) == history, "preview convolution mutated input/history");
+    };
+    launch(); check();
+    cudaGraph_t graph; cudaGraphExec_t executable;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); launch();
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &graph)); Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    input = random(count); history = random(historySize); slots = {1, 0, 2};
+    for (auto &v : valid) v = !v;
+    x.Put(input); h.Put(history); ds.Put(slots); dv.Put(valid);
+    Check(cudaGraphLaunch(executable, cudaStreamPerThread)); check();
+    Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
+}
+
+void IndirectCaches(int batch, int tokens, bool compact = false) {
     const int kh = 2, vh = 4, channels = (2 * kh + vh) * 128, rows = batch * tokens;
     const size_t hist = channels * 3, stateSize = vh * 128 * 128;
+    const size_t recordSize = compact ? FastllmCudaCloverGdnSnapshotBytes(tokens, kh, vh) / 4 : tokens * stateSize;
     std::mt19937 rng(1257 + batch * tokens); std::normal_distribution<float> normal(0.f, .2f);
     auto random = [&](size_t n) { std::vector<uint16_t> x(n); for (auto &v : x) v = Round16(normal(rng)); return x; };
     auto input = random((size_t)rows * channels), weight = random(channels * 4), right = random(channels * 3);
@@ -663,7 +703,8 @@ void IndirectCaches(int batch, int tokens) {
         for (auto &v : states[b]) v = normal(rng);
         for (size_t bytes : {(hist + 128) * 2, (stateSize + 128) * 4,
                              (tokens * hist + 128) * 2, (tokens * stateSize + 128) * 4}) {
-            actual.emplace_back(new Buffer(bytes)); reference.emplace_back(new Buffer(bytes));
+            actual.emplace_back(new Buffer(actual.size() % 4 == 3 ? (recordSize + 128) * 4 : bytes));
+            reference.emplace_back(new Buffer(bytes));
         }
         caches.conv[b] = (uint16_t *)actual[4*b]->p + 64;
         caches.state[b] = (float *)actual[4*b+1]->p + 64;
@@ -674,10 +715,11 @@ void IndirectCaches(int batch, int tokens) {
         for (auto *buffers : {&actual, &reference}) for (int b = 0; b < batch; ++b) {
             (*buffers)[4*b]->Put(histories[b]); (*buffers)[4*b+1]->Put(states[b]);
             (*buffers)[4*b+2]->Put(std::vector<uint16_t>(tokens * hist + 128, Round16(123.f)));
-            (*buffers)[4*b+3]->Put(std::vector<float>(tokens * stateSize + 128, 123.f));
+            (*buffers)[4*b+3]->Put(std::vector<float>((buffers == &actual ? recordSize : tokens * stateSize) + 128, 123.f));
         }
     };
     for (bool preview : {true, false}) {
+        if (compact && preview) continue;
         auto serial = [&]() {
             for (int b = 0; b < batch; ++b) {
                 auto *h = (uint16_t *)reference[4*b]->p + 64;
@@ -707,7 +749,7 @@ void IndirectCaches(int batch, int tokens) {
             } else {
                 Require(FastllmCudaCloverCausalConv(x.p, nullptr, w.p, mx, nullptr, batch, tokens, channels, nullptr, &caches, fp16), "indirect causal conv");
                 Require(FastllmCudaCloverCausalGdn(mx, mx+kh*128, mx+kh*256, (float *)dg.p, db.p, nullptr,
-                    output.p, nullptr, batch, tokens, kh, vh, nullptr, (float *)workspace.p, channels, &caches, fp16), "indirect causal GDN");
+                    output.p, nullptr, batch, tokens, kh, vh, nullptr, (float *)workspace.p, channels, &caches, fp16, compact), "indirect causal GDN");
             }
         };
         auto check = [&]() {
@@ -717,7 +759,33 @@ void IndirectCaches(int batch, int tokens) {
                 Require(actual[4*b]->Get<uint16_t>(hist+128) == reference[4*b]->Get<uint16_t>(hist+128), "indirect history/guard changed");
                 Require(actual[4*b+1]->Get<float>(stateSize+128) == reference[4*b+1]->Get<float>(stateSize+128), "indirect state/guard changed");
                 Require(actual[4*b+2]->Get<uint16_t>(tokens*hist+128) == reference[4*b+2]->Get<uint16_t>(tokens*hist+128), "indirect conv snapshot/guard changed");
-                Require(actual[4*b+3]->Get<float>(tokens*stateSize+128) == reference[4*b+3]->Get<float>(tokens*stateSize+128), "indirect state snapshot/guard changed");
+                if (!compact)
+                    Require(actual[4*b+3]->Get<float>(tokens*stateSize+128) == reference[4*b+3]->Get<float>(tokens*stateSize+128), "indirect state snapshot/guard changed");
+            }
+            if (compact) {
+                auto unaligned = caches; unaligned.state[0] += 1;
+                Require(!FastllmCudaCloverRestoreGdn(unaligned, batch, 1, tokens, kh, vh),
+                        "unaligned compact restore accepted");
+                std::vector<std::vector<float>> full(batch);
+                for (int b = 0; b < batch; ++b) {
+                    full[b] = reference[4*b+3]->Get<float>(tokens * stateSize + 128);
+                    auto record = actual[4*b+3]->Get<float>(recordSize + 128);
+                    for (int i = 0; i < 64; ++i)
+                        Require(record[i] == 123.f && record[recordSize + 64 + i] == 123.f, "compact snapshot guard changed");
+                    Require(std::memcmp(record.data() + 64, states[b].data() + 64, stateSize * 4) == 0,
+                            "compact initial state differs");
+                }
+                for (int accepted = 1; accepted <= tokens; ++accepted) {
+                    Require(FastllmCudaCloverRestoreGdn(caches, batch, accepted, tokens, kh, vh), "compact prefix restore");
+                    for (int b = 0; b < batch; ++b) {
+                        auto restored = actual[4*b+1]->Get<float>(stateSize + 128);
+                        Require(std::memcmp(restored.data() + 64, full[b].data() + 64 + (accepted - 1) * stateSize,
+                            stateSize * 4) == 0, "compact prefix does not reproduce full snapshot bits");
+                        for (int i = 0; i < 64; ++i)
+                            Require(restored[i] == states[b][i] && restored[stateSize + 64 + i] == states[b][stateSize + 64 + i],
+                                    "compact restore state guard changed");
+                    }
+                }
             }
         };
         reset(); serial(); launch(); check();
@@ -763,12 +831,15 @@ int main(int argc, char **argv) {
     try {
         int count = 0; if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
         Check(cudaSetDevice(0));
+        for (int tokens : {8, 16, 32}) PreviewConvolutionTiles(tokens);
         for (int batch : {2, 3, 32, 64}) for (int tokens : {1, 16, 32})
             AttentionPreparationBatch(batch, tokens);
         for (int tokens : {1, 16, 65}) for (int cached : {0, 137, 513})
             for (bool preview : {false, true}) Attention(tokens, cached, preview);
         for (int batch : {2, 3, 8, 9, 50, CloverCudaGdnCaches::Capacity})
             for (int tokens : {1, 16, 32}) IndirectCaches(batch, tokens);
+        for (int batch : {2, 8, 32, CloverCudaGdnCaches::Capacity})
+            for (int tokens : {16, 32}) IndirectCaches(batch, tokens, true);
         for (int tokens : {1, 2, 3, 127, 128, 129}) Convolution(2, tokens, 2048);
         Convolution(2, 129, 2051);
         Convolution(2, 129, 2047);

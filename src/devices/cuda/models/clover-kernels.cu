@@ -5,6 +5,7 @@
 // Diffuspace/Clover-35B-A3B-Preview, modeling_clover_moe.py (bd_gdn_*).
 // Native CUDA implementation; no Transformers, Triton or SGLang runtime needed.
 #include "devices/cuda/fastllm-clover.h"
+#include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-rope.cuh"
 #include "devices/cuda/fastllm-cuda-launch.cuh"
 #include "devices/cuda/fastllm-cuda-ordered-reduce.cuh"
@@ -31,7 +32,9 @@ using fastllm::cuda_launch::Launch;
 using fastllm::cuda::WarpSum;
 using fastllm::cuda::WarpFirstBlockSum256;
 
-template<typename T, bool Indirect>
+// Adjacent tokens reuse the same channel's weights and sliding input window.
+// Tile=1 retains the small-request path and the same FP32 tap order.
+template<typename T, bool Indirect, int Tile = 1>
 __global__ void CloverPreviewConv(const T *input,
         const T *history, const T *weight,
         const T *rightWeight, const int *slots,
@@ -39,32 +42,46 @@ __global__ void CloverPreviewConv(const T *input,
     DependencyStart();
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= channels) return;
-    const int request = blockIdx.z, token = blockIdx.y;
-    const size_t row = (size_t)request * tokens + token;
+    const int request = blockIdx.z, base = blockIdx.y * Tile;
     const int slot = slots ? slots[request] : request;
-    if (slot < 0 || (valid && !valid[row])) {
-        output[row * channels + channel] = CloverCast<T>(0.f);
+    if (slot < 0) {
+#pragma unroll
+        for (int t = 0; t < Tile && base + t < tokens; ++t)
+            output[((size_t)request * tokens + base + t) * channels + channel] = CloverCast<T>(0.f);
         return;
     }
     if constexpr (Indirect) history = (const T *)caches.conv[slot];
     const int cacheSlot = Indirect ? 0 : slot;
-    float sum = 0.f;
-    for (int tap = 0; tap < 4; ++tap) {
-        const int source = token + tap - 3;
-        float x = 0.f;
-        if (source < 0)
-            x = CloverFloat(history[((size_t)cacheSlot * channels + channel) * 3 + source + 3]);
-        else if (!valid || valid[(size_t)request * tokens + source])
-            x = CloverFloat(input[((size_t)request * tokens + source) * channels + channel]);
-        sum += x * CloverFloat(weight[channel * 4 + tap]);
+    float window[Tile + 6], left[4], right[3];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) left[j] = CloverFloat(weight[channel * 4 + j]);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) right[j] = CloverFloat(rightWeight[channel * 3 + j]);
+#pragma unroll
+    for (int j = 0; j < Tile + 6; ++j) {
+        int source = base + j - 3;
+        window[j] = source < 0
+            ? CloverFloat(history[((size_t)cacheSlot * channels + channel) * 3 + source + 3])
+            : (source < tokens && (!valid || valid[(size_t)request * tokens + source])
+                ? CloverFloat(input[((size_t)request * tokens + source) * channels + channel]) : 0.f);
     }
-    for (int distance = 1; distance < 4; ++distance) {
-        const int source = token + distance;
-        if (source < tokens && (!valid || valid[(size_t)request * tokens + source]))
-            sum += CloverFloat(input[((size_t)request * tokens + source) * channels + channel]) *
-                   CloverFloat(rightWeight[channel * 3 + distance - 1]);
+#pragma unroll
+    for (int t = 0; t < Tile; ++t) {
+        int token = base + t;
+        if (token >= tokens) break;
+        size_t row = (size_t)request * tokens + token;
+        if (valid && !valid[row]) { output[row * channels + channel] = CloverCast<T>(0.f); continue; }
+        float sum = 0.f;
+#pragma unroll
+        for (int tap = 0; tap < 4; ++tap) sum += window[t + tap] * left[tap];
+#pragma unroll
+        for (int distance = 1; distance < 4; ++distance) {
+            int source = token + distance;
+            if (source < tokens && (!valid || valid[(size_t)request * tokens + source]))
+                sum += window[t + 3 + distance] * right[distance - 1];
+        }
+        output[row * channels + channel] = CloverCast<T>(sum / (1.f + expf(-sum)));
     }
-    output[row * channels + channel] = CloverCast<T>(sum / (1.f + expf(-sum)));
 }
 
 // A CTA evaluates several queries against the same head. Key normalization,
@@ -240,21 +257,24 @@ __global__ void CloverCausalConv(const T *input,
 // Reuse each input and weight across eight adjacent outputs. Each thread
 // retains three BF16 samples; multiplication rounding and tap order match
 // CloverCausalConv<T>. A separate commit keeps old history readable by all CTAs.
-template<typename T>
+template<typename T, bool Indirect = false>
 __global__ void CloverTiledCausalConv(const T *input, const T *history,
-        const T *weight, T *output, int tokens, int channels) {
+        const T *weight, T *output, T *snapshots, int batches, int tokens, int channels,
+        CloverCudaGdnCaches caches) {
     DependencyStart();
     constexpr int Tile = 8;
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     int batch = blockIdx.z, base = blockIdx.y * Tile;
+    if constexpr (Indirect) { history = (const T *)caches.conv[batch]; snapshots = (T *)caches.convSnapshots[batch]; }
+    const int cacheSlot = Indirect ? 0 : batch, cacheBatch = Indirect ? 1 : batches;
     T x[4], w[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) w[j] = weight[c * 4 + j];
 #pragma unroll
     for (int j = 0; j < 3; ++j) {
         int source = base + j - 3;
-        x[j] = source < 0 ? history[((size_t)batch * channels + c) * 3 + source + 3]
+        x[j] = source < 0 ? history[((size_t)cacheSlot * channels + c) * 3 + source + 3]
                          : input[((size_t)batch * tokens + source) * channels + c];
     }
 #pragma unroll
@@ -264,6 +284,10 @@ __global__ void CloverTiledCausalConv(const T *input, const T *history,
         float sum = fastllm::cuda_conv::Dot<T, T, true>(x, w, 4);
         output[((size_t)batch * tokens + base + t) * channels + c] =
             CloverCast<T>(sum / (1.f + expf(-sum)));
+        if (snapshots)
+#pragma unroll
+            for (int j = 0; j < 3; ++j)
+                snapshots[(((size_t)(base + t) * cacheBatch + cacheSlot) * channels + c) * 3 + j] = x[j + 1];
         x[0] = x[1]; x[1] = x[2]; x[2] = x[3];
     }
 }
@@ -363,25 +387,77 @@ __global__ void CloverCausalGdn(const T *query, const T *key,
     }
     for (int j = 0; j < 4; ++j) state[stateOffset + lane + j * 32] = s[j];
 }
+
+__global__ void CloverRestoreGdn(CloverCudaGdnCaches records, int accepted,
+        int keyHeads, int valueHeads) {
+    constexpr int Elements = 16, Values = 32;
+    int index = (blockIdx.x * blockDim.x + threadIdx.x) * Elements;
+    size_t stateSize = size_t(valueHeads) * 128 * 128;
+    const auto *record = records.stateSnapshots[blockIdx.y];
+    int key = (threadIdx.x % 8) * Elements, localValue = threadIdx.x / 8;
+    int firstValue = (blockIdx.x % 4) * Values, head = blockIdx.x / 4;
+    int keyHead = head / (valueHeads / keyHeads);
+    size_t stride = size_t(keyHeads + valueHeads) * 128 + valueHeads;
+    // The whole CTA shares K/decay. Transpose K in shared memory so each
+    // update broadcasts eight consecutive banks instead of conflicting rows.
+    __shared__ float keys[32 * 128], residuals[32 * Values], decays[32];
+    for (int i = threadIdx.x; i < accepted * 128; i += blockDim.x) {
+        int t = i / 128, k = i % 128;
+        keys[t * 128 + (k % Elements) * 8 + k / Elements] = record[stateSize + t * stride + keyHead * 128 + k];
+    }
+    for (int i = threadIdx.x; i < accepted * Values; i += blockDim.x) {
+        int t = i / Values, v = firstValue + i % Values;
+        residuals[i] = record[stateSize + t * stride + keyHeads * 128 + head * 128 + v];
+    }
+    if (threadIdx.x < accepted)
+        decays[threadIdx.x] = record[stateSize + threadIdx.x * stride + (keyHeads + valueHeads) * 128 + head];
+    alignas(16) float state[Elements];
+#pragma unroll
+    for (int j = 0; j < Elements; j += 4)
+        *reinterpret_cast<float4 *>(state + j) = *reinterpret_cast<const float4 *>(record + index + j);
+    __syncthreads();
+    for (int t = 0; t < accepted; ++t) {
+        float decay = decays[t], residual = residuals[t * Values + localValue];
+#pragma unroll
+        for (int j = 0; j < Elements; ++j)
+            state[j] = __fmul_rn(state[j], decay) + keys[t * 128 + j * 8 + key / Elements] * residual;
+    }
+#pragma unroll
+    for (int j = 0; j < Elements; j += 4)
+        *reinterpret_cast<float4 *>(records.state[blockIdx.y] + index + j) = *reinterpret_cast<float4 *>(state + j);
+}
+
 // Long prefill reuses a 32-token Q/K/V tile across sixteen value rows.
 // Eight lanes own each row, retaining the original four-term partial sums.
 // The first two levels of the old 32-lane reduction move into registers;
 // the remaining shuffle tree and the FP32 state recurrence are unchanged.
-template<typename T>
+template<typename T, bool Indirect = false, bool Compact = false, int Group = 8>
 __global__ void CloverPrefillGdn(const float *prepared, const T *value,
         const T *beta, float *state, T *output,
-        int batch, int tokens, int keyHeads, int valueHeads, int vStride) {
+        int batch, int tokens, int keyHeads, int valueHeads, int vStride,
+        float *snapshots, CloverCudaGdnCaches caches) {
     DependencyStart();
-    constexpr int Group = 8, Threads = 128, Tile = 32, Values = Threads / Group, Parts = 32 / Group;
+    constexpr int Threads = 128, Tile = Compact && Group == 4 ? 16 : 32;
+    constexpr int Values = Threads / Group, Parts = 32 / Group;
     const int lane = threadIdx.x % Group, localValue = threadIdx.x / Group;
     const int valueIndex = blockIdx.x * Values + localValue;
     const int head = blockIdx.y, request = blockIdx.z, keyHead = head / (valueHeads / keyHeads);
-    const size_t stateOffset = (((size_t)request * valueHeads + head) * 128 + valueIndex) * 128;
+    if constexpr (Indirect) {
+        state = caches.state[request]; snapshots = caches.stateSnapshots[request];
+    }
+    const size_t localOffset = ((size_t)head * 128 + valueIndex) * 128;
+    const size_t stateSize = size_t(valueHeads) * 128 * 128;
+    const size_t stateOffset = (Indirect ? 0 : request * stateSize) + localOffset;
     const size_t qkCount = (size_t)batch * tokens * keyHeads * 128;
+    const size_t recordStride = size_t(keyHeads + valueHeads) * 128 + valueHeads;
+    if constexpr (Compact) if (!Indirect) snapshots += request * (stateSize + tokens * recordStride);
     float s[Parts][4];
 #pragma unroll
     for (int p = 0; p < Parts; ++p)
-        for (int j = 0; j < 4; ++j) s[p][j] = state[stateOffset + lane + p * Group + j * 32];
+        for (int j = 0; j < 4; ++j) {
+            s[p][j] = state[stateOffset + lane + p * Group + j * 32];
+            if constexpr (Compact) snapshots[localOffset + lane + p * Group + j * 32] = s[p][j];
+        }
     __shared__ float qtile[Tile * 128], ktile[Tile * 128], vtile[Tile * Values], decays[Tile], rates[Tile];
     for (int base = 0; base < tokens; base += Tile) {
         for (int i = threadIdx.x; i < Tile * 128; i += Threads) {
@@ -389,6 +465,8 @@ __global__ void CloverPrefillGdn(const float *prepared, const T *value,
             if (token < tokens) {
                 size_t pos = (((size_t)request * tokens + token) * keyHeads + keyHead) * 128 + i % 128;
                 qtile[i] = prepared[pos]; ktile[i] = prepared[qkCount + pos];
+                if constexpr (Compact) if (blockIdx.x == 0 && head % (valueHeads / keyHeads) == 0)
+                    snapshots[stateSize + token * recordStride + keyHead * 128 + i % 128] = prepared[qkCount + pos];
             }
         }
         for (int i = threadIdx.x; i < Tile * Values; i += Threads) {
@@ -400,6 +478,8 @@ __global__ void CloverPrefillGdn(const float *prepared, const T *value,
             size_t pos = ((size_t)request * tokens + base + threadIdx.x) * valueHeads + head;
             decays[threadIdx.x] = prepared[2 * qkCount + pos];
             rates[threadIdx.x] = CloverFloat(beta[pos]);
+            if constexpr (Compact) if (blockIdx.x == 0)
+                snapshots[stateSize + (base + threadIdx.x) * recordStride + (keyHeads + valueHeads) * 128 + head] = decays[threadIdx.x];
         }
         __syncthreads();
         for (int t = 0; t < Tile && base + t < tokens; ++t) {
@@ -422,6 +502,8 @@ __global__ void CloverPrefillGdn(const float *prepared, const T *value,
                 rem += __shfl_down_sync(0xffffffff, rem, step, Group);
             rem = __shfl_sync(0xffffffff, rem, 0, Group);
             float delta = (vtile[t * Values + localValue] - rem) * rates[t];
+            if constexpr (Compact) if (lane == 0)
+                snapshots[stateSize + (base + t) * recordStride + keyHeads * 128 + head * 128 + valueIndex] = delta;
             float y[Parts] = {};
 #pragma unroll
             for (int p = 0; p < Parts; ++p) {
@@ -461,11 +543,16 @@ bool FastllmCudaCloverPreviewConvImpl(const void *input, const void *history, co
         channels <= 0 || !ValidCaches(caches, batch, true))
         return false;
     auto launch = [&](auto indirect) {
-        return Launch<CloverPreviewConv<T, decltype(indirect)::value>>(
-            dim3((channels + 255) / 256, tokens, batch), 256, 0, Stream(stream),
-            static_cast<const T *>(input), static_cast<const T *>(history),
-            static_cast<const T *>(weight), static_cast<const T *>(rightWeight), slots,
-            valid, static_cast<T *>(output), tokens, channels, caches ? *caches : CloverCudaGdnCaches{});
+        auto tiled = [&](auto tile) {
+            constexpr int width = decltype(tile)::value;
+            return Launch<CloverPreviewConv<T, decltype(indirect)::value, width>>(
+                dim3((channels + 255) / 256, (tokens + width - 1) / width, batch), 256, 0, Stream(stream),
+                static_cast<const T *>(input), static_cast<const T *>(history),
+                static_cast<const T *>(weight), static_cast<const T *>(rightWeight), slots,
+                valid, static_cast<T *>(output), tokens, channels, caches ? *caches : CloverCudaGdnCaches{});
+        };
+        return batch > 1 && tokens >= 8 && channels >= 1024
+            ? tiled(std::integral_constant<int, 8>{}) : tiled(std::integral_constant<int, 1>{});
     };
     return caches ? launch(std::true_type{}) : launch(std::false_type{});
 }
@@ -530,12 +617,14 @@ bool FastllmCudaCloverCausalConvImpl(const void *input, void *history, const voi
         tokens > 65535 || channels <= 0 || !ValidCaches(caches, batch, true))
         return false;
     auto dispatch = [&](auto indirect) {
-        if (!caches && !snapshots && tokens >= 128 && channels >= 2048) {
-            if (!Launch<CloverTiledCausalConv<T>>(dim3((channels + 255) / 256, (tokens + 7) / 8, batch), 256,
+        if ((!caches && !snapshots && tokens >= 128 && channels >= 2048) ||
+            (batch > 1 && tokens >= 8 && channels >= 1024)) {
+            if (!Launch<CloverTiledCausalConv<T, decltype(indirect)::value>>(dim3((channels + 255) / 256, (tokens + 7) / 8, batch), 256,
                                                      0, Stream(stream), static_cast<const T *>(input),
                                                      static_cast<const T *>(history),
                                                      static_cast<const T *>(weight),
-                                                     static_cast<T *>(output), tokens, channels))
+                                                     static_cast<T *>(output), static_cast<T *>(snapshots), batch, tokens, channels,
+                                                     caches ? *caches : CloverCudaGdnCaches{}))
                 return false;
         } else {
             if (!Launch<CloverCausalConv<T, decltype(indirect)::value>>(
@@ -571,11 +660,15 @@ template<typename T>
 bool FastllmCudaCloverCausalGdnImpl(const void *query, const void *key, const void *value, const float *g,
                                 const void *beta, float *state, void *output, float *snapshots, int batch,
                                 int tokens, int keyHeads, int valueHeads, void *stream, float *workspace,
-                                int qkvRowStride, const CloverCudaGdnCaches *caches) {
+                                int qkvRowStride, const CloverCudaGdnCaches *caches, bool compactSnapshots) {
     if (!query || !key || !value || !g || !beta || (!state && !caches) || !output || batch <= 0 || batch > 65535 || !ValidCaches(caches, batch, false) ||
         tokens <= 0 || keyHeads <= 0 || valueHeads <= 0 || valueHeads > 65535 || valueHeads % keyHeads ||
         qkvRowStride < 0 || (qkvRowStride && qkvRowStride < valueHeads * 128))
         return false;
+    if (compactSnapshots) {
+        if (!workspace || tokens < 16 || tokens > 32 || (!caches && !snapshots)) return false;
+        if (caches) for (int b = 0; b < batch; ++b) if (!caches->stateSnapshots[b]) return false;
+    }
     const int qkStride = qkvRowStride ? qkvRowStride : keyHeads * 128;
     const int vStride = qkvRowStride ? qkvRowStride : valueHeads * 128;
     auto dispatch = [&](auto indirect) {
@@ -590,8 +683,21 @@ bool FastllmCudaCloverCausalGdnImpl(const void *query, const void *key, const vo
                 if (!Launch<CloverPrefillGdn<T>>(dim3(8, valueHeads, batch), 128, 0, Stream(stream), workspace,
                                                     (const T *)value, (const T *)beta,
                                                     state, (T *)output, batch, tokens, keyHeads,
-                                                    valueHeads, vStride))
+                                                    valueHeads, vStride, (float *)nullptr, CloverCudaGdnCaches{}))
                     return false;
+            } else if (compactSnapshots) {
+                // SM90 reuses each Q/K tile across 32 value rows. Moving the
+                // first three warp-reduction levels into registers retains
+                // the original FP32 sum tree and every snapshot bit.
+                auto compact = [&](auto group) {
+                    constexpr int width = decltype(group)::value;
+                    return Launch<CloverPrefillGdn<T, decltype(indirect)::value, true, width>>(
+                        dim3(width, valueHeads, batch), 128, 0, Stream(stream), workspace,
+                        (const T *)value, (const T *)beta, state, (T *)output, batch, tokens,
+                        keyHeads, valueHeads, vStride, snapshots, caches ? *caches : CloverCudaGdnCaches{});
+                };
+                if (!(FastllmCudaRuntimeArch() == 90 ? compact(std::integral_constant<int, 4>{})
+                                                   : compact(std::integral_constant<int, 8>{}))) return false;
             } else {
                 if (!Launch<CloverCausalGdn<T, true, decltype(indirect)::value>>(
                         dim3(16, valueHeads, batch), 256, 0, Stream(stream), (const T *)query,
@@ -1131,9 +1237,27 @@ bool FastllmCudaCloverCausalConv(const void *input, void *history, const void *w
 bool FastllmCudaCloverCausalGdn(const void *query, const void *key, const void *value, const float *g,
                                 const void *beta, float *state, void *output, float *snapshots, int batch,
                                 int tokens, int keyHeads, int valueHeads, void *stream, float *workspace,
-                                int qkvRowStride, const CloverCudaGdnCaches *caches, bool fp16) {
-    return fp16 ? FastllmCudaCloverCausalGdnImpl<__half>(query, key, value, g, beta, state, output, snapshots, batch, tokens, keyHeads, valueHeads, stream, workspace, qkvRowStride, caches)
-                : FastllmCudaCloverCausalGdnImpl<__nv_bfloat16>(query, key, value, g, beta, state, output, snapshots, batch, tokens, keyHeads, valueHeads, stream, workspace, qkvRowStride, caches);
+                                int qkvRowStride, const CloverCudaGdnCaches *caches, bool fp16, bool compactSnapshots) {
+    return fp16 ? FastllmCudaCloverCausalGdnImpl<__half>(query, key, value, g, beta, state, output, snapshots, batch, tokens, keyHeads, valueHeads, stream, workspace, qkvRowStride, caches, compactSnapshots)
+                : FastllmCudaCloverCausalGdnImpl<__nv_bfloat16>(query, key, value, g, beta, state, output, snapshots, batch, tokens, keyHeads, valueHeads, stream, workspace, qkvRowStride, caches, compactSnapshots);
+}
+
+std::size_t FastllmCudaCloverGdnSnapshotBytes(int tokens, int keyHeads, int valueHeads) {
+    if (tokens < 16 || tokens > 32 || keyHeads < 1 || valueHeads < 1 ||
+        valueHeads > 65535 || valueHeads % keyHeads) return 0;
+    return (size_t(valueHeads) * 128 * 128 + size_t(tokens) *
+        ((size_t(keyHeads) + valueHeads) * 128 + valueHeads)) * sizeof(float);
+}
+bool FastllmCudaCloverRestoreGdn(const CloverCudaGdnCaches &records, int count,
+        int accepted, int tokens, int keyHeads, int valueHeads, void *stream) {
+    if (count < 1 || count > CloverCudaGdnCaches::Capacity || accepted < 1 || accepted > tokens ||
+        !FastllmCudaCloverGdnSnapshotBytes(tokens, keyHeads, valueHeads)) return false;
+    for (int i = 0; i < count; ++i)
+        if (!records.state[i] || !records.stateSnapshots[i] ||
+            ((reinterpret_cast<uintptr_t>(records.state[i]) |
+              reinterpret_cast<uintptr_t>(records.stateSnapshots[i])) & 15)) return false;
+    return Launch<CloverRestoreGdn>(dim3(valueHeads * 4, count), 256, 0,
+        Stream(stream), records, accepted, keyHeads, valueHeads);
 }
 
 bool FastllmCudaCloverPrepareAttention(const void *qgate, const void *key, const float *qWeight,

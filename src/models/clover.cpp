@@ -329,6 +329,8 @@ void CloverModel::GdnCoreBatch(Data &projected, int layer, std::pair<Data, Data>
     Check(batch > 0 && batch <= CloverCudaGdnCaches::Capacity && projected.dims[0] % batch == 0,
         "invalid GDN batch shape");
     const int rows = projected.dims[0], t = rows / batch, channels = (2 * keyHeads + valueHeads) * 128;
+    const size_t compactBytes = snapshots && batch >= 8 && t >= 16
+        ? FastllmCudaCloverGdnSnapshotBytes(t, keyHeads, valueHeads) : 0;
     CloverCudaGdnCaches pointers;
     for (int b = 0; b < batch; ++b) {
         auto &conv = caches[b]->first; auto &state = caches[b]->second;
@@ -337,7 +339,11 @@ void CloverModel::GdnCoreBatch(Data &projected, int layer, std::pair<Data, Data>
         pointers.conv[b] = conv.cudaData; pointers.state[b] = (float *)state.cudaData;
         if (snapshots) {
             PrepareCloverData(snapshots[b]->first, dataType, {t, 1, channels, 3}, cudaDevice);
-            PrepareCloverData(snapshots[b]->second, FLOAT32, {t, 1, valueHeads, 128, 128}, cudaDevice);
+            // A one-dimensional record denotes the compact initial-state /
+            // update journal; the existing five-dimensional layout is full.
+            PrepareCloverData(snapshots[b]->second, FLOAT32, compactBytes
+                ? std::vector<int>{int(compactBytes / sizeof(float))}
+                : std::vector<int>{t, 1, valueHeads, 128, 128}, cudaDevice);
             pointers.convSnapshots[b] = snapshots[b]->first.cudaData;
             pointers.stateSnapshots[b] = (float *)snapshots[b]->second.cudaData;
         }
@@ -387,7 +393,8 @@ void CloverModel::GdnCoreBatch(Data &projected, int layer, std::pair<Data, Data>
                 {rows, 2 * keyHeads * 128 + valueHeads}, cudaDevice);
             Check(FastllmCudaCloverCausalGdn(q, k, v, (float *)g.cudaData,
                 beta.cudaData, pointers.state[0], y.cudaData, pointers.stateSnapshots[0],
-                batch, t, keyHeads, valueHeads, nullptr, (float *)causalWorkspace.cudaData, channels, indirect, dataType == FLOAT16), "causal GDN failed");
+                batch, t, keyHeads, valueHeads, nullptr, (float *)causalWorkspace.cudaData, channels,
+                indirect, dataType == FLOAT16, compactBytes != 0), "causal GDN failed");
         }
     }
     z.Reshape(y.dims);
@@ -820,14 +827,33 @@ void CloverModel::RestorePrefix(std::vector<std::pair<Data, Data>> &cache,
           cache.size() == (size_t)block_cnt && snapshots.layers.size() == cache.size(), "invalid accepted prefix");
     if (acceptedInputs == snapshots.tokens) return;
 #ifdef USE_CUDA
+    std::vector<void *> destinations;
+    std::vector<const void *> sources;
+    std::vector<size_t> sizes;
+    CloverCudaGdnCaches records;
+    int recordCount = 0;
+    auto restoreRecords = [&]() {
+        if (recordCount) Check(FastllmCudaCloverRestoreGdn(records, recordCount, acceptedInputs,
+            snapshots.tokens, keyHeads, valueHeads), "accepted-prefix GDN reconstruction failed");
+        recordCount = 0;
+    };
     for (int i = 0; i < block_cnt; ++i) {
         if (linearLayers[i]) {
             for (bool state : {false, true}) {
                 auto &dst = state ? cache[i].second : cache[i].first;
                 const auto &src = state ? snapshots.layers[i].second : snapshots.layers[i].first;
+                if (state && src.dims.size() == 1) {
+                    Check(src.GetBytes() == FastllmCudaCloverGdnSnapshotBytes(snapshots.tokens,
+                        keyHeads, valueHeads), "invalid compact GDN snapshot");
+                    if (recordCount == CloverCudaGdnCaches::Capacity) restoreRecords();
+                    records.state[recordCount] = (float *)dst.cudaData;
+                    records.stateSnapshots[recordCount++] = (float *)src.cudaData;
+                    continue;
+                }
                 const size_t bytes = dst.GetBytes();
-                FastllmCudaCopyFromDeviceToDevice(dst.cudaData,
-                    (char *)src.cudaData + (size_t)(acceptedInputs - 1) * bytes, bytes);
+                destinations.push_back(dst.cudaData);
+                sources.push_back((char *)src.cudaData + (size_t)(acceptedInputs - 1) * bytes);
+                sizes.push_back(bytes);
             }
         } else {
             const int length = snapshots.position + acceptedInputs;
@@ -835,6 +861,9 @@ void CloverModel::RestorePrefix(std::vector<std::pair<Data, Data>> &cache,
             cache[i].second.Resize({length, num_key_value_heads, head_dim});
         }
     }
+    Check(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(destinations.data(),
+        sources.data(), sizes.data(), sizes.size()), "accepted-prefix state copy failed");
+    restoreRecords();
 #endif
 }
 

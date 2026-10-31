@@ -62,7 +62,15 @@ bool FastllmCudaCloverCausalConv(const void *input, void *history, const void *w
 bool FastllmCudaCloverCausalGdn(const void *query, const void *key, const void *value,
     const float *g, const void *beta, float *state, void *output, float *snapshots,
     int batch, int tokens, int keyHeads, int valueHeads, void *stream = nullptr,
-    float *workspace = nullptr, int qkvRowStride = 0, const CloverCudaGdnCaches *caches = nullptr, bool fp16 = false);
+    float *workspace = nullptr, int qkvRowStride = 0, const CloverCudaGdnCaches *caches = nullptr,
+    bool fp16 = false, bool compactSnapshots = false);
+// Compact records keep the initial FP32 state and each token's normalized K,
+// update residual and decay. Replaying these updates reproduces any accepted
+// prefix exactly, without writing one full recurrent matrix per token.
+std::size_t FastllmCudaCloverGdnSnapshotBytes(int tokens, int keyHeads, int valueHeads);
+// Record/state pointers must be aligned to 16 bytes for vectorized replay.
+bool FastllmCudaCloverRestoreGdn(const CloverCudaGdnCaches &records, int count,
+    int accepted, int tokens, int keyHeads, int valueHeads, void *stream = nullptr);
 
 // Block prefill uses BF16 Tensor Core products, FP32 accumulation/state and
 // FP64 decay prefixes. It commits the entire input; calls requiring accepted-
