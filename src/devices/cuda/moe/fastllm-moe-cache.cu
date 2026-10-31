@@ -3247,6 +3247,8 @@ struct FastllmCudaMoeExpertParallel {
         int32_t *routes = nullptr, *mappedRoutes = nullptr;
         float *mappedHost = nullptr;
         cudaEvent_t done = nullptr, copyStart = nullptr, copyEnd = nullptr;
+        cudaStream_t cpuOutputStream = nullptr;
+        cudaEvent_t cpuOutputReady = nullptr;
         int cudaDevice = -1, hidden = 0, rows = 0, topk = 0, table = -1, frequencyTable = -1;
         bool pending = false, ready = false, admitted = false;
         OffloadGroup *group = nullptr;
@@ -3287,6 +3289,8 @@ struct FastllmCudaMoeExpertParallel {
             if (done) cudaEventDestroy(done);
             if (copyStart) cudaEventDestroy(copyStart);
             if (copyEnd) cudaEventDestroy(copyEnd);
+            if (cpuOutputReady) cudaEventDestroy(cpuOutputReady);
+            if (cpuOutputStream) cudaStreamDestroy(cpuOutputStream);
             cudaSetDevice(previous);
         }
 
@@ -4056,9 +4060,28 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             // The reduction reads only CPU-owned routes. Mapping avoids uploading
             // every Top-K row when most experts are already resident on a GPU.
             // Prepare() waits for done before these host rows can be overwritten.
-            if (!mappedCpuOutput)
+            if (!mappedCpuOutput) {
+                auto stream = cudaStreamPerThread;
+                const bool overlapOutput = v41Batch && count == 1 && gpuCount > 0;
+                if (overlapOutput) {
+                    if (!work.cpuOutputStream)
+                        checkCudaErrors("CPU output stream", cudaStreamCreateWithFlags(
+                            &work.cpuOutputStream, cudaStreamNonBlocking));
+                    if (!work.cpuOutputReady)
+                        checkCudaErrors("CPU output event", cudaEventCreateWithFlags(
+                            &work.cpuOutputReady, cudaEventDisableTiming));
+                    stream = work.cpuOutputStream;
+                }
+                // CPU computation has returned and Prepare() joined the prior
+                // iteration before reusing either buffer. Upload beside the
+                // already-submitted GPU experts, then join before reduction.
                 checkCudaErrors("EP CPU output", cudaMemcpyAsync(work.device, root.CpuOutput(),
-                    size_t(routes) * hidden * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
+                    size_t(routes) * hidden * sizeof(float), cudaMemcpyHostToDevice, stream));
+                if (overlapOutput) {
+                    checkCudaErrors("CPU output ready", cudaEventRecord(work.cpuOutputReady, stream));
+                    checkCudaErrors("CPU output join", cudaStreamWaitEvent(cudaStreamPerThread, work.cpuOutputReady, 0));
+                }
+            }
         }
         ++state.steps;
         state.cpuRoutes += cpuCount;
