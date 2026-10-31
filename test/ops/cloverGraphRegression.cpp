@@ -9,6 +9,7 @@
 #include <iostream>
 #include <random>
 #include <stdexcept>
+#include <thread>
 using namespace fastllm;
 namespace {
 bool fp16 = false;
@@ -59,6 +60,7 @@ void Populate(CloverModel &m, int seed, bool zeroHead = false, int maxPositions 
         w.UpdateUnitSize(); w.Resize(shape); w.Allocate(false);
         for (int i = 0; i < w.Count(0); ++i) {
             float value = normal(rng);
+            if (zeroHead && name == "lm_head.weight") value = 0.f;
             if (norm) ((float *)w.cpuData)[i] = value;
             else ((uint16_t *)w.cpuData)[i] = Bf16(value);
         }
@@ -222,6 +224,54 @@ std::vector<std::vector<unsigned char>> RunBatch(int seed, bool graphs, int batc
     return results;
 }
 
+void SamplingMetadataBatch(int batch, bool sample) {
+    // A zero head makes every raw logit identical. Output differences can then
+    // only come from request metadata/sampling, not GEMM reduction geometry.
+    CloverModel model; Populate(model, 19, true);
+    model.eos_token_id = 3; model.eos_token_ids = {3};
+    auto config = [&](int b) {
+        return json11::Json::object{{"mode", "self_speculative"}, {"block_size", 16},
+            {"max_new_tokens", 19 + (b % 4) * 7}, {"ignore_eos", true},
+            {"temperature", sample ? .8 : 0.}, {"do_sample", sample}, {"seed", 27 + b},
+            {"top_k", -1}, {"top_p", 1.}, {"presence_penalty", .3 * (b % 4)},
+            {"frequency_penalty", .13 * (b % 3)}, {"repetition_penalty", b % 2 ? 1.05 : 1.},
+            {"accept_rule", b % 2 ? "exact" : "threshold"}, {"accept_delta", b % 3 ? .6 : 1.4},
+            {"dllm_think_end_token_id", 17}, {"dllm_think_end_start", 1},
+            {"dllm_think_end_window", 3}, {"dllm_think_end_bias", 2.},
+            {"dllm_length_penalty_start", 2}, {"dllm_length_penalty_window", 4},
+            {"dllm_length_penalty", .5}};
+    };
+    auto launch = [&](int b) { return model.LaunchClover({1, 17, 3, 1 + b % 11}, config(b)); };
+    auto collect = [&](int handle) {
+        std::vector<int> result;
+        for (;;) {
+            int tokens[64], stats[3];
+            int n = model.FetchResponseTokensBatch(handle, tokens, 64, stats);
+            if (n == -1) break;
+            Require(n >= 0, "metadata generation failed");
+            result.insert(result.end(), tokens, tokens + n);
+        }
+        return result;
+    };
+    model.maxBatch = 1;
+    std::vector<std::vector<int>> reference(batch), actual(batch);
+    for (int b = 0; b < batch; ++b) reference[b] = collect(launch(b));
+    model.maxBatch = batch;
+    std::vector<int> handles;
+    for (int b = 0; b < batch; ++b) handles.push_back(launch(b));
+    std::vector<std::thread> readers;
+    std::vector<std::exception_ptr> errors(batch);
+    for (int b = 0; b < batch; ++b) readers.emplace_back([&, b] {
+        try { actual[b] = collect(handles[b]); } catch (...) { errors[b] = std::current_exception(); }
+    });
+    for (auto &reader : readers) reader.join();
+    for (int b = 0; b < batch; ++b) {
+        if (errors[b]) std::rethrow_exception(errors[b]);
+        Require(actual[b].size() == size_t(19 + (b % 4) * 7), "metadata generation incomplete");
+        Require(actual[b] == reference[b], "batched penalties/counts differ from serial");
+    }
+}
+
 void CacheGrowth() {
     constexpr int limit = 2065, budget = 2304, width = 32;
     CloverModel model; Populate(model, 23, false, limit);
@@ -287,6 +337,8 @@ int main(int argc, char **argv) {
     try {
         int count = 0; if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
         cudaSetDevice(0); SetThreads(2); SetDeviceMap({{"cuda:0", 1}}); SetCudaEmbedding(true);
+        for (int batch : {2, 8, 33}) for (bool sample : {false, true}) SamplingMetadataBatch(batch, sample);
+        SamplingMetadataBatch(64, false);
         CacheGrowth();
         ProjectionPrecision();
         FixedRowProjection();

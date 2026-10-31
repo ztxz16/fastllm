@@ -908,12 +908,23 @@ bool FastllmCudaCloverRouteImpl(const void *logits, int *indices, float *scores,
 }
 
 namespace {
-__global__ void CloverPenalizeLogits(float *logits, const int *counts,
-        const int *stops, int numStops, const float *rowBias, int vocab, CloverCudaPenalty p) {
-    DependencyStart();
-    int token = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
-    if (token >= vocab) return;
-    float value = logits[(size_t)row * vocab + token];
+struct CloverSamplingBatch {
+    static constexpr int Capacity = 32;
+    CloverCudaSamplingRequest requests[Capacity];
+};
+static_assert(sizeof(CloverSamplingBatch) + 64 < 4096, "sampling kernel argument limit");
+__device__ __forceinline__ CloverCudaSamplingRequest CloverSamplingRecord(const CloverCudaSamplingRequest &request) {
+    return request;
+}
+__device__ __forceinline__ CloverCudaSamplingRequest CloverSamplingRecord(const CloverSamplingBatch &batch) {
+    return batch.requests[blockIdx.z];
+}
+__device__ __forceinline__ float CloverPenaltyValue(float value, int token, int row,
+        const CloverCudaSamplingRequest &request) {
+    const int *counts = request.counts, *stops = request.stops;
+    const float *rowBias = request.rowBias;
+    int numStops = request.numStops;
+    auto p = request.penalty;
     if (counts[token]) {
         value = __fsub_rn(value, __fmul_rn(float(counts[token]), p.frequency));
         value = __fsub_rn(value, p.presence);
@@ -924,7 +935,17 @@ __global__ void CloverPenalizeLogits(float *logits, const int *counts,
     if (stop) value += rowBias[row * 2];
     if (token == p.thinkToken) value += rowBias[row * 2 + 1];
     if ((stop && p.firstPosition + row <= p.minTokens) || token == p.maskToken) value = -CUDART_INF_F;
-    logits[(size_t)row * vocab + token] = value;
+    return value;
+}
+template<typename Params>
+__global__ void CloverPenalizeLogits(Params params, int vocab) {
+    DependencyStart();
+    auto request = CloverSamplingRecord(params);
+    int token = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
+    if (token < vocab) {
+        auto &value = request.logits[(size_t)row * vocab + token];
+        value = CloverPenaltyValue(value, token, row, request);
+    }
 }
 __device__ void CloverWarpArgmax(float &value, int &index) {
     for (int d = 16; d; d >>= 1) {
@@ -943,9 +964,14 @@ __device__ double CloverBlockSum64(double value, double *scratch) {
     __syncthreads();
     return scratch[0];
 }
-__global__ void CloverSummarizeLogits(const float *logits, const int *candidates,
-        CloverCudaTokenStats *output, int rows, int vocab, bool confidence, bool entropy) {
+template<typename Params>
+__global__ void CloverSummarizeLogits(Params params, int rows, int vocab) {
     DependencyStart();
+    auto request = CloverSamplingRecord(params);
+    const float *logits = request.logits;
+    const int *candidates = request.candidates;
+    auto *output = request.output;
+    bool confidence = request.confidence, entropy = request.entropy;
     const float *scores = logits + (size_t)blockIdx.x * vocab;
     int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     float best = -CUDART_INF_F;
@@ -1005,8 +1031,11 @@ bool FastllmCudaCloverPenalize(float *logits, const int *counts, const int *stop
     if (!logits || !counts || !rowBias || rows < 1 || rows > 65535 || vocab < 1 || numStops < 0 ||
         (numStops && !stops))
         return false;
-    return Launch<CloverPenalizeLogits>(dim3((vocab + 255) / 256, rows), 256, 0, Stream(stream), logits,
-                                              counts, stops, numStops, rowBias, vocab, penalty);
+    CloverCudaSamplingRequest request;
+    request.logits = logits; request.counts = counts; request.stops = stops;
+    request.numStops = numStops; request.rowBias = rowBias; request.penalty = penalty;
+    return Launch<CloverPenalizeLogits<CloverCudaSamplingRequest>>(
+        dim3((vocab + 255) / 256, rows), 256, 0, Stream(stream), request, vocab);
 }
 namespace {
 // Each row has a global summary followed by one partial per 8192 logits.
@@ -1027,13 +1056,22 @@ __device__ void CloverStatsMaximum(float &best, int &index) {
     index = threadIdx.x < 8 ? indices[threadIdx.x] : 0x7fffffff;
     CloverWarpArgmax(best, index);
 }
-__global__ void CloverStatsMaxTiles(const float *logits, CloverStatsTile *workspace, int vocab, int tiles) {
+template<typename Params, bool Penalize = false>
+__global__ void CloverStatsMaxTiles(Params params, int vocab, int tiles) {
     DependencyStart();
+    auto request = CloverSamplingRecord(params);
+    float *logits = request.logits;
+    auto *workspace = static_cast<CloverStatsTile *>(request.workspace);
     int begin = blockIdx.x * 8192, end = min(vocab, begin + 8192);
-    const float *scores = logits + (size_t)blockIdx.y * vocab;
+    float *scores = logits + (size_t)blockIdx.y * vocab;
     float best = -CUDART_INF_F; int index = 0x7fffffff; bool nan = false;
     for (int i = begin + threadIdx.x; i < end; i += 256) {
-        float v = scores[i]; nan |= isnan(v);
+        float v = scores[i];
+        if constexpr (Penalize) {
+            v = CloverPenaltyValue(v, i, blockIdx.y, request);
+            scores[i] = v;
+        }
+        nan |= isnan(v);
         if (v > best || (v == best && i < index)) { best = v; index = i; }
     }
     int error = __syncthreads_or(nan);
@@ -1048,9 +1086,15 @@ __device__ CloverCudaTokenStats CloverStatsResult(const float *scores, const int
     float p = proposed >= 0 && proposed < vocab ? float(double(expf(scores[proposed] - summary.maximum)) / summary.sum) : 0.f;
     return {summary.index, 0, float(1. / summary.sum), p, 0.f};
 }
-__global__ void CloverStatsMergeMax(const float *logits, const int *candidates,
-        CloverStatsTile *workspace, CloverCudaTokenStats *output, int rows, int vocab, int tiles, bool greedy) {
+template<typename Params>
+__global__ void CloverStatsMergeMax(Params params, int rows, int vocab, int tiles) {
     DependencyStart();
+    auto request = CloverSamplingRecord(params);
+    const float *logits = request.logits;
+    const int *candidates = request.candidates;
+    auto *workspace = static_cast<CloverStatsTile *>(request.workspace);
+    auto *output = request.output;
+    bool greedy = !request.confidence && !request.entropy;
     CloverStatsTile *work = workspace + (size_t)blockIdx.x * (tiles + 1);
     float best = -CUDART_INF_F; int index = 0x7fffffff; bool invalid = false;
     for (int i = threadIdx.x; i < tiles; i += 256) {
@@ -1064,9 +1108,13 @@ __global__ void CloverStatsMergeMax(const float *logits, const int *candidates,
         if (greedy) output[blockIdx.x] = CloverStatsResult(logits + (size_t)blockIdx.x * vocab, candidates, work[0], blockIdx.x, rows, vocab);
     }
 }
-template<bool Entropy>
-__global__ void CloverStatsSumTiles(const float *logits, CloverStatsTile *workspace, int vocab, int tiles) {
+template<bool Entropy, typename Params>
+__global__ void CloverStatsSumTiles(Params params, int vocab, int tiles) {
     DependencyStart();
+    auto request = CloverSamplingRecord(params);
+    if (Entropy ? !request.entropy : (!request.confidence && !request.entropy)) return;
+    const float *logits = request.logits;
+    auto *workspace = static_cast<CloverStatsTile *>(request.workspace);
     CloverStatsTile *work = workspace + (size_t)blockIdx.y * (tiles + 1);
     auto summary = work[0];
     if (summary.error) return;
@@ -1089,10 +1137,15 @@ __global__ void CloverStatsSumTiles(const float *logits, CloverStatsTile *worksp
         else work[blockIdx.x + 1].sum = sum;
     }
 }
-template<bool Entropy>
-__global__ void CloverStatsMergeSum(const float *logits, const int *candidates,
-        CloverStatsTile *workspace, CloverCudaTokenStats *output, int rows, int vocab, int tiles) {
+template<bool Entropy, typename Params>
+__global__ void CloverStatsMergeSum(Params params, int rows, int vocab, int tiles) {
     DependencyStart();
+    auto request = CloverSamplingRecord(params);
+    if (Entropy ? !request.entropy : (!request.confidence && !request.entropy)) return;
+    const float *logits = request.logits;
+    const int *candidates = request.candidates;
+    auto *workspace = static_cast<CloverStatsTile *>(request.workspace);
+    auto *output = request.output;
     CloverStatsTile *work = workspace + (size_t)blockIdx.x * (tiles + 1);
     if (work[0].error) {
         if (threadIdx.x == 0) output[blockIdx.x] = {-1, 1, 0.f, 0.f, 0.f};
@@ -1111,30 +1164,24 @@ __global__ void CloverStatsMergeSum(const float *logits, const int *candidates,
     }
 }
 }
-static bool CloverTokenStatsSplit(const float *logits, const int *candidates,
-        CloverCudaTokenStats *output, int rows, int vocab, bool confidence, bool entropy, void *stream, void *scratch) {
-    if (!logits || !output || !scratch || rows < 1 || vocab < 1) return false;
-    auto s = Stream(stream); auto *work = (CloverStatsTile *)scratch;
+template<typename Params, bool Penalize = false>
+static bool CloverTokenStatsLaunch(const Params &params, int batch, int rows, int vocab,
+        bool confidence, bool entropy, void *stream, bool split) {
+    auto s = Stream(stream);
+    if (!split)
+        return Launch<CloverSummarizeLogits<Params>>(dim3(rows, 1, batch), 256, 0, s, params, rows, vocab);
     int tiles = (vocab - 1) / 8192 + 1;
-    if (!Launch<CloverStatsMaxTiles>(dim3(tiles, rows), 256, 0, s, logits, work, vocab, tiles))
-        return false;
-    if (!Launch<CloverStatsMergeMax>(rows, 256, 0, s, logits, candidates, work, output, rows, vocab,
-                                           tiles, !confidence && !entropy))
+    if (!Launch<CloverStatsMaxTiles<Params, Penalize>>(dim3(tiles, rows, batch), 256, 0, s, params, vocab, tiles) ||
+        !Launch<CloverStatsMergeMax<Params>>(dim3(rows, 1, batch), 256, 0, s, params, rows, vocab, tiles))
         return false;
     if (confidence || entropy) {
-        if (!Launch<CloverStatsSumTiles<false>>(dim3(tiles, rows), 256, 0, s, logits, work, vocab,
-                                                      tiles))
-            return false;
-        if (!Launch<CloverStatsMergeSum<false>>(rows, 256, 0, s, logits, candidates, work, output, rows,
-                                                      vocab, tiles))
+        if (!Launch<CloverStatsSumTiles<false, Params>>(dim3(tiles, rows, batch), 256, 0, s, params, vocab, tiles) ||
+            !Launch<CloverStatsMergeSum<false, Params>>(dim3(rows, 1, batch), 256, 0, s, params, rows, vocab, tiles))
             return false;
     }
     if (entropy) {
-        if (!Launch<CloverStatsSumTiles<true>>(dim3(tiles, rows), 256, 0, s, logits, work, vocab,
-                                                     tiles))
-            return false;
-        if (!Launch<CloverStatsMergeSum<true>>(rows, 256, 0, s, logits, candidates, work, output, rows,
-                                                     vocab, tiles))
+        if (!Launch<CloverStatsSumTiles<true, Params>>(dim3(tiles, rows, batch), 256, 0, s, params, vocab, tiles) ||
+            !Launch<CloverStatsMergeSum<true, Params>>(dim3(rows, 1, batch), 256, 0, s, params, rows, vocab, tiles))
             return false;
     }
     return cudaGetLastError() == cudaSuccess;
@@ -1150,11 +1197,41 @@ bool FastllmCudaCloverTokenStats(const float *logits, const int *candidates, Clo
                                  void *workspace) {
     if (!logits || !output || rows < 1 || vocab < 1)
         return false;
-    if (workspace && FastllmCudaCloverTokenStatsWorkspaceBytes(rows, vocab))
-        return CloverTokenStatsSplit(logits, candidates, output, rows, vocab, confidence, entropy, stream,
-                                     workspace);
-    return Launch<CloverSummarizeLogits>(rows, 256, 0, Stream(stream), logits, candidates, output, rows,
-                                               vocab, confidence, entropy);
+    CloverCudaSamplingRequest request;
+    request.logits = const_cast<float *>(logits); request.candidates = candidates;
+    request.output = output; request.workspace = workspace;
+    request.confidence = confidence; request.entropy = entropy;
+    return CloverTokenStatsLaunch(request, 1, rows, vocab, confidence, entropy, stream,
+                                  workspace && FastllmCudaCloverTokenStatsWorkspaceBytes(rows, vocab));
+}
+
+bool FastllmCudaCloverSampleBatch(const CloverCudaSamplingRequest *requests,
+        int batch, int rows, int vocab, void *stream) {
+    if (!requests || batch < 1 || rows < 1 || rows > 65535 || vocab < 1) return false;
+    bool split = FastllmCudaCloverTokenStatsWorkspaceBytes(rows, vocab) != 0;
+    // Validate every request before mutating any logits.
+    for (int b = 0; b < batch; ++b) {
+        const auto &r = requests[b];
+        if (!r.logits || !r.counts || !r.rowBias || !r.output || r.numStops < 0 ||
+            (r.numStops && !r.stops) || (split && !r.workspace)) return false;
+    }
+    for (int begin = 0; begin < batch; begin += CloverSamplingBatch::Capacity) {
+        CloverSamplingBatch params;
+        int count = std::min(batch - begin, CloverSamplingBatch::Capacity);
+        bool confidence = false, entropy = false;
+        for (int b = 0; b < count; ++b) {
+            params.requests[b] = requests[begin + b];
+            confidence |= params.requests[b].confidence;
+            entropy |= params.requests[b].entropy;
+        }
+        // Large-vocabulary argmax consumes each penalized value immediately;
+        // write it back for confidence/entropy and the eventual bonus sampler.
+        if (!split && !Launch<CloverPenalizeLogits<CloverSamplingBatch>>(
+                dim3((vocab + 255) / 256, rows, count), 256, 0, Stream(stream), params, vocab)) return false;
+        if (!CloverTokenStatsLaunch<CloverSamplingBatch, true>(params, count, rows, vocab,
+                confidence, entropy, stream, split)) return false;
+    }
+    return true;
 }
 
 namespace {

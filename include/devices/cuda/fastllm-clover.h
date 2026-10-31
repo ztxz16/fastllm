@@ -135,6 +135,23 @@ bool FastllmCudaCloverTokenStats(const float *logits, const int *candidates,
     CloverCudaTokenStats *output, int rows, int vocab, bool confidence,
     bool entropy, void *stream = nullptr, void *workspace = nullptr);
 
+// Independent request buffers/penalties, with equal row and vocabulary sizes.
+// Requests live on the host; all pointers inside them refer to CUDA storage.
+// Bounded kernel-argument batches avoid a metadata upload or logits copies.
+struct CloverCudaSamplingRequest {
+    float *logits = nullptr;
+    const int *counts = nullptr, *stops = nullptr;
+    const float *rowBias = nullptr;
+    const int *candidates = nullptr;
+    CloverCudaTokenStats *output = nullptr;
+    void *workspace = nullptr;
+    CloverCudaPenalty penalty{};
+    int numStops = 0;
+    bool confidence = false, entropy = false;
+};
+bool FastllmCudaCloverSampleBatch(const CloverCudaSamplingRequest *requests,
+    int batch, int rows, int vocab, void *stream = nullptr);
+
 // BF16/FP16 NHD attention, fixed checkpoint head dimension 256. Optional split-KV
 // scratch: ceil((cachedTokens+tokens)/256)*tokens*heads*(256*2+4) bytes.
 bool FastllmCudaCloverAttention(const void *query, const void *key,

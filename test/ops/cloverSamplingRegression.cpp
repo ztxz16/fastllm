@@ -193,12 +193,96 @@ void InvalidAndTies(int vocab, bool confidence, bool entropy) {
             "NaN/infinity/empty-candidate/tie handling differs");
     }
 }
+void Batched(int batch, int rows, int vocab) {
+    // Separate request ranges, mixed flags/penalties and guards expose request
+    // boundary mistakes, including the last proposal and argument-batch tail.
+    const size_t stride = size_t(rows) * vocab + 16;
+    const size_t workBytes = FastllmCudaCloverTokenStatsWorkspaceBytes(rows, vocab);
+    std::mt19937 random(519 + batch + vocab);
+    std::uniform_real_distribution<float> uniform(-8.f, 8.f);
+    std::vector<float> input(batch * stride, 123.f), biases(batch * rows * 2);
+    std::vector<int> counts(size_t(batch) * vocab), stops(batch * 2), candidates(batch * rows);
+    std::vector<CloverCudaTokenStats> guards(batch * (rows + 2), {-17, -19, 123.f, 456.f, 789.f});
+    Buffer x(input.size() * 4), ref(input.size() * 4), c(counts.size() * 4), st(stops.size() * 4),
+        bias(biases.size() * 4), ids(candidates.size() * 4), y(guards.size() * sizeof(guards[0])),
+        expected(guards.size() * sizeof(guards[0])), work(std::max(size_t(32), batch * workBytes));
+    std::vector<CloverCudaSamplingRequest> requests(batch);
+    for (int b = 0; b < batch; ++b) {
+        auto &r = requests[b];
+        r.logits = (float *)x.p + b * stride + 8;
+        r.counts = (int *)c.p + size_t(b) * vocab; r.stops = (int *)st.p + b * 2;
+        r.rowBias = (float *)bias.p + b * rows * 2;
+        r.candidates = b % 5 ? (int *)ids.p + b * rows : nullptr;
+        r.output = (CloverCudaTokenStats *)y.p + b * (rows + 2) + 1;
+        r.workspace = workBytes ? (char *)work.p + b * workBytes : nullptr;
+        r.numStops = b % 3;
+        r.penalty = {b % 3 == 0 ? 1.f : 1.05f, .13f * (b % 4), .07f * (b % 3),
+                     b % 4 ? -1 : vocab / 2, vocab - 2, b % 7, 3};
+        r.confidence = b % 4 == 1 || b % 4 == 3;
+        r.entropy = b % 4 >= 2;
+    }
+    auto prepare = [&]() {
+        for (int b = 0; b < batch; ++b) {
+            for (size_t j = 0; j < size_t(rows) * vocab; ++j) input[b * stride + 8 + j] = uniform(random);
+            for (int j = 0; j < vocab; ++j) counts[size_t(b) * vocab + j] = random() % 4;
+            stops[b * 2] = b % vocab; stops[b * 2 + 1] = vocab - 1;
+            for (int j = 0; j < rows; ++j) {
+                candidates[b * rows + j] = int(random() % (vocab + 2)) - 1;
+                biases[(b * rows + j) * 2] = uniform(random);
+                biases[(b * rows + j) * 2 + 1] = uniform(random);
+            }
+            // Invalid logits remain local to their row/request.
+            if (b % 11 == 7) input[b * stride + 8] = std::numeric_limits<float>::quiet_NaN();
+            if (b % 11 == 8) input[b * stride + 8] = std::numeric_limits<float>::infinity();
+            if (b % 11 == 9) std::fill_n(input.data() + b * stride + 8, vocab, -std::numeric_limits<float>::infinity());
+        }
+        x.Put(input.data(), input.size() * 4); ref.Put(input.data(), input.size() * 4);
+        c.Put(counts.data(), counts.size() * 4); st.Put(stops.data(), stops.size() * 4);
+        bias.Put(biases.data(), biases.size() * 4); ids.Put(candidates.data(), candidates.size() * 4);
+        y.Put(guards.data(), guards.size() * sizeof(guards[0]));
+        expected.Put(guards.data(), guards.size() * sizeof(guards[0]));
+    };
+    auto launch = [&]() { Require(FastllmCudaCloverSampleBatch(requests.data(), batch, rows, vocab), "batch sampling launch"); };
+    auto verify = [&]() {
+        for (int b = 0; b < batch; ++b) {
+            const auto &r = requests[b];
+            float *logits = (float *)ref.p + b * stride + 8;
+            auto *out = (CloverCudaTokenStats *)expected.p + b * (rows + 2) + 1;
+            Require(FastllmCudaCloverPenalize(logits, r.counts, r.stops, r.numStops, r.rowBias,
+                                            rows, vocab, r.penalty), "serial batch penalties");
+            Require(FastllmCudaCloverTokenStats(logits, r.candidates, out, rows, vocab,
+                    r.confidence, r.entropy, nullptr, r.workspace), "serial batch statistics");
+        }
+        std::vector<float> a(input.size()), b(input.size());
+        Check(cudaMemcpy(a.data(), x.p, a.size() * 4, cudaMemcpyDeviceToHost));
+        Check(cudaMemcpy(b.data(), ref.p, b.size() * 4, cudaMemcpyDeviceToHost));
+        Require(std::memcmp(a.data(), b.data(), a.size() * 4) == 0, "batch penalties or input guards differ");
+        std::vector<CloverCudaTokenStats> actual(guards.size()), baseline(guards.size());
+        Check(cudaMemcpy(actual.data(), y.p, actual.size() * sizeof(actual[0]), cudaMemcpyDeviceToHost));
+        Check(cudaMemcpy(baseline.data(), expected.p, baseline.size() * sizeof(baseline[0]), cudaMemcpyDeviceToHost));
+        Require(std::memcmp(actual.data(), baseline.data(), actual.size() * sizeof(actual[0])) == 0,
+                "batch stats or guards differ bitwise");
+        for (int b = 0; b < batch; ++b) for (int edge : {0, rows + 1})
+            Require(std::memcmp(&actual[b * (rows + 2) + edge], &guards[0], sizeof(guards[0])) == 0, "batch output guard changed");
+    };
+    prepare(); launch(); verify();
+    cudaGraph_t graph; cudaGraphExec_t executable;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); launch();
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    prepare(); Check(cudaGraphLaunch(executable, cudaStreamPerThread)); verify();
+    Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
+}
+
 }
 int main() {
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
         Check(cudaSetDevice(0));
+        for (int batch : {1, 2, 7, 31, 32, 33, 64}) Batched(batch, 16, 513);
+        Batched(3, 16, 248320); Batched(33, 1, 248320);
+        Batched(32, 16, 16385); Batched(2, 32, 16383);
         for (int rows : {1, 16, 32}) for (bool spec : {false, true}) for (bool preview : {false, true}) {
             Run(rows, 513, spec, preview, false, 4);
             Run(rows, 31, spec, preview, true, 0);

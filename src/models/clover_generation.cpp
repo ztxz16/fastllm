@@ -2,6 +2,7 @@
 #include "devices/cuda/fastllm-clover.h"
 #include "utils/recurrent_prefix_cache.h"
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -68,40 +69,87 @@ struct CloverModel::Request {
     long long cacheRequestId = 0;
     std::shared_ptr<PrefixCache::Snapshot> prefixSnapshot;
 #ifdef USE_CUDA
-    void Upload(CloverModel &m, Data &data, DataType type, const std::vector<int> &dims, const void *source) {
+    // Stage small request metadata in one host transfer, then reuse the common
+    // device-copy backend. Destinations remain owned by individual requests.
+    struct Uploads {
+        std::vector<uint32_t> words;
+        std::vector<void *> destinations;
+        std::vector<size_t> offsets, sizes;
+        Data buffer;
+        void Add(void *destination, const void *source, size_t bytes) {
+            Require(bytes % sizeof(uint32_t) == 0, "unaligned sampling metadata");
+            size_t offset = words.size();
+            words.resize(offset + bytes / sizeof(uint32_t));
+            std::memcpy(words.data() + offset, source, bytes);
+            destinations.push_back(destination); offsets.push_back(offset); sizes.push_back(bytes);
+        }
+        void Submit(Request &request, CloverModel &m) {
+            if (words.empty()) return;
+            Require(words.size() <= size_t(std::numeric_limits<int>::max()), "sampling metadata too large");
+            request.Upload(m, buffer, INT32, {int(words.size())}, words.data());
+            std::vector<const void *> sources;
+            for (size_t offset : offsets) sources.push_back((uint32_t *)buffer.cudaData + offset);
+            Require(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(destinations.data(),
+                sources.data(), sizes.data(), sizes.size()), "sampling metadata copy failed");
+        }
+    };
+    void Upload(CloverModel &m, Data &data, DataType type, const std::vector<int> &dims,
+            const void *source, Uploads *uploads = nullptr) {
         data.dataType = type; data.UpdateUnitSize(); data.Resize(dims);
         data.ToDevice(DataDevice::CUDA, std::vector<int>{m.cudaDevice}, false);
         data.Allocate(false);
-        if (source) FastllmCudaCopyFromHostToDevice(data.cudaData, (void *)source, data.GetBytes());
+        if (source) {
+            if (uploads) uploads->Add(data.cudaData, source, data.GetBytes());
+            else FastllmCudaCopyFromHostToDevice(data.cudaData, (void *)source, data.GetBytes());
+        }
     }
-    void Penalize(CloverModel &m, ResponseContext &ctx, Data &logits, const std::vector<int> &visible, bool preview, bool initial = false) {
+    CloverCudaPenalty PreparePenalty(CloverModel &m, ResponseContext &ctx, Data &logits,
+            const std::vector<int> &visible, bool preview, bool initial = false, Uploads *uploads = nullptr) {
         const auto &o = options; const auto &c = ctx.generationConfig;
         if (countsVersion != ctx.curTokens) {
-            Upload(m, countsGpu, INT32, {m.vocabSize}, counts.data());
+            const int added = ctx.curTokens - countsVersion;
+            if (uploads && countsGpu.cudaData && countsVersion >= 0 && added > 0 &&
+                size_t(added) <= ctx.allTokens.size()) {
+                // Only emitted response tokens enter counts. Rejected draft
+                // tokens and prompt/cache-prefix tokens are never included.
+                std::vector<int> changed(ctx.allTokens.end() - added, ctx.allTokens.end());
+                std::sort(changed.begin(), changed.end());
+                changed.erase(std::unique(changed.begin(), changed.end()), changed.end());
+                for (int token : changed)
+                    uploads->Add((int *)countsGpu.cudaData + token, &counts[token], sizeof(int));
+            } else Upload(m, countsGpu, INT32, {m.vocabSize}, counts.data(), uploads);
             countsVersion = ctx.curTokens;
         }
         if (stopsGpu.dims.empty() && !stops.empty())
-            Upload(m, stopsGpu, INT32, {int(stops.size())}, stops.data());
+            Upload(m, stopsGpu, INT32, {int(stops.size())}, stops.data(), uploads);
         int rows = logits.Count(0) / m.vocabSize;
         auto bias = CloverRowBias(rows, m.vocabSize, counts, ctx.curTokens, visible, o, preview, initial);
-        Upload(m, biasGpu, FLOAT32, {rows, 2}, bias.data());
-        CloverCudaPenalty p{c.repeat_penalty, o.presence, o.frequency, o.speculative ? -1 : m.maskToken,
+        Upload(m, biasGpu, FLOAT32, {rows, 2}, bias.data(), uploads);
+        return {c.repeat_penalty, o.presence, o.frequency, o.speculative ? -1 : m.maskToken,
             o.thinkToken, ctx.curTokens + (o.speculative && preview ? 0 : 1), c.output_token_least};
+    }
+    void Penalize(CloverModel &m, ResponseContext &ctx, Data &logits, const std::vector<int> &visible, bool preview, bool initial = false) {
+        auto penalty = PreparePenalty(m, ctx, logits, visible, preview, initial);
+        int rows = logits.Count(0) / m.vocabSize;
         if (!FastllmCudaCloverPenalize((float *)logits.cudaData, (int *)countsGpu.cudaData,
-            (int *)stopsGpu.cudaData, stops.size(), (float *)biasGpu.cudaData, rows, m.vocabSize, p))
+            (int *)stopsGpu.cudaData, stops.size(), (float *)biasGpu.cudaData, rows, m.vocabSize, penalty))
             throw std::runtime_error("Clover: GPU penalties failed");
+    }
+    size_t PrepareStats(CloverModel &m, int rows, const std::vector<int> &candidates, Uploads *uploads = nullptr) {
+        if (!candidates.empty()) Upload(m, candidatesGpu, INT32, {rows}, candidates.data(), uploads);
+        static_assert(sizeof(CloverCudaTokenStats) == 5 * sizeof(int), "GPU token statistics layout");
+        size_t bytes = FastllmCudaCloverTokenStatsWorkspaceBytes(rows, m.vocabSize);
+        if (bytes) Upload(m, statsWorkspace, INT32, {int((bytes + 3) / 4)}, nullptr);
+        return bytes;
     }
     std::vector<CloverCudaTokenStats> Summarize(CloverModel &m, Data &logits, const std::vector<int> &candidates, bool confidence, bool entropy) {
         int rows = logits.Count(0) / m.vocabSize;
-        if (!candidates.empty()) Upload(m, candidatesGpu, INT32, {rows}, candidates.data());
-        static_assert(sizeof(CloverCudaTokenStats) == 5 * sizeof(int), "GPU token statistics layout");
+        size_t workspaceBytes = PrepareStats(m, rows, candidates);
         Upload(m, statsGpu, INT32, {rows, 5}, nullptr);
-        size_t bytes = FastllmCudaCloverTokenStatsWorkspaceBytes(rows, m.vocabSize);
-        if (bytes) Upload(m, statsWorkspace, INT32, {int((bytes + 3) / 4)}, nullptr);
         if (!FastllmCudaCloverTokenStats((float *)logits.cudaData,
             candidates.empty() ? nullptr : (int *)candidatesGpu.cudaData,
             (CloverCudaTokenStats *)statsGpu.cudaData, rows, m.vocabSize, confidence, entropy,
-            nullptr, bytes ? statsWorkspace.cudaData : nullptr))
+            nullptr, workspaceBytes ? statsWorkspace.cudaData : nullptr))
             throw std::runtime_error("Clover: GPU sampling statistics failed");
         std::vector<CloverCudaTokenStats> result(rows);
         FastllmCudaCopyFromDeviceToHost(result.data(), statsGpu.cudaData, result.size() * sizeof(result[0]));
@@ -121,6 +169,10 @@ struct CloverModel::Request {
             const std::vector<int> &candidates) {
         Penalize(m, ctx, logits, candidates, false);
         auto stats = Summarize(m, logits, candidates, !options.exact, !options.exact);
+        return AcceptStats(m, ctx, logits, candidates, stats.data());
+    }
+    std::vector<int> AcceptStats(CloverModel &m, ResponseContext &ctx, Data &logits,
+            const std::vector<int> &candidates, const CloverCudaTokenStats *stats) {
         int accepted = 0;
         while (accepted + 1 < (int)candidates.size()) {
             const auto &s = stats[accepted];
@@ -510,18 +562,44 @@ std::vector<std::vector<int>> CloverModel::StepBatch(const std::vector<ResponseC
 #ifdef USE_CUDA
     const int width = candidates[0].size();
     std::vector<Data> logits;
-    if (width > 1) {
-        ForwardLogitsBatch(candidates, caches, true, logits);
+    Data joined;
+    batch[0]->Upload(*this, joined, INT32, {size, width, 5}, nullptr);
+    auto summarize = [&](bool preview) {
+        std::vector<CloverCudaSamplingRequest> sampling(size);
+        Request::Uploads uploads;
+        // Upload every request's metadata before launching statistics. A
+        // synchronous upload/readback between requests would serialize them.
         for (int b = 0; b < size; ++b) {
             auto &r = *batch[b];
-            r.Penalize(*this, *contexts[b], logits[b], candidates[b], true);
-            auto stats = r.Summarize(*this, logits[b], {}, false, false);
-            for (int i = 1; i < width; ++i) candidates[b][i] = stats[i].token;
+            auto &s = sampling[b];
+            s.penalty = r.PreparePenalty(*this, *contexts[b], logits[b], candidates[b], preview, false, &uploads);
+            r.PrepareStats(*this, width, preview ? std::vector<int>{} : candidates[b], &uploads);
+            s.logits = (float *)logits[b].cudaData;
+            s.counts = (int *)r.countsGpu.cudaData; s.stops = (int *)r.stopsGpu.cudaData;
+            s.numStops = r.stops.size(); s.rowBias = (float *)r.biasGpu.cudaData;
+            s.candidates = preview ? nullptr : (int *)r.candidatesGpu.cudaData;
+            s.output = (CloverCudaTokenStats *)joined.cudaData + b * width;
+            s.workspace = r.statsWorkspace.cudaData;
+            s.confidence = s.entropy = !preview && !r.options.exact;
         }
+        uploads.Submit(*batch[0], *this);
+        Require(FastllmCudaCloverSampleBatch(sampling.data(), size, width, vocabSize),
+                "batch sampling statistics failed");
+        std::vector<CloverCudaTokenStats> stats(size * width);
+        FastllmCudaCopyFromDeviceToHost(stats.data(), joined.cudaData, stats.size() * sizeof(stats[0]));
+        for (const auto &s : stats) Require(!s.error, "invalid sampling logits");
+        return stats;
+    };
+    if (width > 1) {
+        ForwardLogitsBatch(candidates, caches, true, logits);
+        auto stats = summarize(true);
+        for (int b = 0; b < size; ++b) for (int i = 1; i < width; ++i)
+            candidates[b][i] = stats[b * width + i].token;
     }
     ForwardLogitsBatch(candidates, caches, false, logits, snapshots);
+    auto stats = summarize(false);
     for (int b = 0; b < size; ++b)
-        output[b] = batch[b]->Accept(*this, *contexts[b], logits[b], candidates[b]);
+        output[b] = batch[b]->AcceptStats(*this, *contexts[b], logits[b], candidates[b], stats.data() + b * width);
     return output;
 #else
     throw std::runtime_error("Clover: batch generation requires CUDA");
