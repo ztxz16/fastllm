@@ -342,17 +342,25 @@ int NaiveN05FlashModel::PreviewPagedPrefixCacheExtra(ResponseContext *context, i
                 if (it->second.snapshot.expired()) it = memo.matches.erase(it); else ++it;
         }
         memo.candidates.clear();
+        size_t fingerprintRejects = 0;
         for (const auto &entry : prefixHistory) {
             if (entry->tokens.size() > preview.tokens.size()) continue;
+            // Most history belongs to unrelated conversations. Reject it with
+            // the immutable fingerprint before allocating a memo entry or
+            // touching a weak_ptr control block. Equality still checks tokens.
+            if (entry->tokenHash != preview.TokenHash(entry->tokens.size())) {
+                ++fingerprintRejects;
+                continue;
+            }
             auto &match = memo.matches[entry.get()];
             if (match.snapshot.lock() != entry) {
                 if (detail) detail->Count("history.new_match_checks");
                 match.snapshot = entry;
-                match.equal = entry->tokenHash == preview.TokenHash(entry->tokens.size()) &&
-                    std::equal(entry->tokens.begin(), entry->tokens.end(), preview.tokens.begin());
+                match.equal = std::equal(entry->tokens.begin(), entry->tokens.end(), preview.tokens.begin());
             }
             if (match.equal) memo.candidates.push_back(entry);
         }
+        if (detail) detail->Count("history.fingerprint_rejects", fingerprintRejects);
         memo.version = prefixPool->historyVersion;
         memo.initialized = true;
     }

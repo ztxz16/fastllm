@@ -109,3 +109,10 @@ do not add them to the parent `postprocess`/`retire_requests` intervals. The exi
 trace/detail switches remain default-off; no additional environment setting is
 required. `history.snapshot_hashes` measures shared-prefix hashing for multiple SWA
 checkpoints; per-snapshot token copies still appear in `history.snapshot_copy_hash`.
+
+Pending-prefill history previews reject unrelated token fingerprints before
+creating per-request equality memo entries. `history.fingerprint_rejects` counts
+these rejections; fingerprint matches still require exact token equality, and
+residency is checked on every pass. Admission sorting captures request pointers
+under the request-table lock instead of looking them up for each comparison;
+queue-time, phase, length and handle ordering are unchanged.

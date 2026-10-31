@@ -3200,11 +3200,19 @@ namespace fastllm {
                             reservedPages += needed;
                             return true;
                         };
-                        std::vector <std::pair <int, int> > orders;
+                        struct ScheduleOrder {
+                            int first, second;
+                            ResponseContext *context;
+                            bool operator<(const ScheduleOrder &other) const {
+                                return first != other.first ? first < other.first : second < other.second;
+                            }
+                        };
+                        std::vector<ScheduleOrder> orders;
+                        orders.reserve(model->responseContextDict.dicts.size());
                         bool hasPrefillRequests = false;
                         for (auto &it : model->responseContextDict.dicts) {
                             hasPrefillRequests |= it.second->curTokens == 0;
-                            orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
+                            orders.push_back({-(int)it.second->currentTokens.size(), it.first, it.second});
                         }
                         // Without prefill requests the admission comparator reduces
                         // to pair ordering; avoid a map lookup on every comparison.
@@ -3213,8 +3221,11 @@ namespace fastllm {
                             // prefix shortens currentTokens; sorting by that length
                             // would otherwise keep pinning new requests' KV pages.
                             std::sort(orders.begin(), orders.end(), [&](const auto &a, const auto &b) {
-                                auto *left = model->responseContextDict.dicts.at(a.second);
-                                auto *right = model->responseContextDict.dicts.at(b.second);
+                                // dictLocker pins request lifetimes throughout scheduling.
+                                // Sort the captured pointers without O(log N) map lookups
+                                // for both sides of every comparator invocation.
+                                auto *left = a.context;
+                                auto *right = b.context;
                                 const bool lp = left->curTokens == 0, rp = right->curTokens == 0;
                                 if (lp != rp) return lp;
                                 if (lp && left->queuedAt != right->queuedAt) return left->queuedAt < right->queuedAt;
