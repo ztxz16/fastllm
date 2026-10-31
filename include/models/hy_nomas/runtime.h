@@ -83,6 +83,7 @@ public:
     Tensor linear(const Tensor &x, const Tensor &weight, const Tensor *bias = nullptr);
     // Output storage must not be shared with inputs. For 16-bit biased GEMM,
     // its address must retain the cuBLASLt plan's 256-byte alignment.
+    // Without bias, FP32 output also preserves partial sums for tensor parallelism.
     void linearInto(const Tensor &x, const Tensor &weight, Tensor &out, const Tensor *bias = nullptr);
     Tensor norm(const Tensor &x, bool rms, const Tensor *weight = nullptr,
                 const Tensor *bias = nullptr, float eps = 1e-6f, int width = 0);
@@ -152,16 +153,23 @@ public:
     ~Weights();
     const Tensor &get(const std::string &name);
     const Tensor *optional(const std::string &name);
+    // Slice checkpoint bytes before upload. Axis 0 splits output channels (also
+    // 1D biases), axis 1 input channels. Packed projections split each group
+    // independently, e.g. [up, gate] uses groups=2. Configure before first get().
+    void shard(const std::string &name, int axis, int rank, int size, int groups = 1);
+    int shardGroups(const std::string &name) const;
     Tensor linear(const Tensor &x, const std::string &prefix, bool separateBias = false);
     // A supplied output cannot be combined with separateBias.
     Tensor linear(const Tensor &x, const std::string &prefix, bool separateBias, Tensor *out);
-    void clear();
+    void clear(bool keepPackedCache = false);
     // Optional lossless host cache for callers that swap model stages.
     void offload();
-    // Optionally retain checkpoint BF16 tensors while streaming expanded FP32
-    // layers. Use at most half the currently free memory, leaving reserveBytes.
-    // clear() releases both representations; disabled unless explicitly enabled.
+    // Retain checkpoint BF16 tensors for resident inference or streamed FP32
+    // expansion. Use at most half the free memory, leaving reserveBytes.
+    // clear() releases both representations; clear(true) retains this cache.
     void enablePackedCache(size_t reserveBytes);
+    // Same rank/partition; cache population must be serialized, as for host caches.
+    void sharePackedCache(const Weights &source);
     // Retain immutable CPU checkpoint bytes across clear(), preferring pinned
     // memory. Capped by one quarter of available host RAM; rejected pinning
     // uses ordinary memory, exhaustion uses files. Zero releases the cache.

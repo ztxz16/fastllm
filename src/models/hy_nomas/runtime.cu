@@ -443,7 +443,8 @@ Tensor Runtime::linear(const Tensor &x,const Tensor &w,const Tensor *bias) {
 void Runtime::linearInto(const Tensor &x,const Tensor &w,Tensor &out,const Tensor *bias) {
     require(x.cols==w.cols,"linear dimension mismatch"); require(!bias || bias->size()==size_t(w.rows),"linear bias mismatch");
     require(x.dtype==w.dtype && (!bias || bias->dtype==x.dtype),"linear dtype mismatch");
-    require(out.data && out.rows==x.rows && out.cols==w.rows && out.dtype==x.dtype,"linear output shape/dtype mismatch");
+    require(out.data && out.rows==x.rows && out.cols==w.rows &&
+            (out.dtype==x.dtype || (!bias && out.isFloat32())),"linear output shape/dtype mismatch");
     require(out.storage!=x.storage && out.storage!=w.storage && (!bias || out.storage!=bias->storage),
             "linear output must not share input storage");
     require(x.isFloat32() || !bias || reinterpret_cast<uintptr_t>(out.data)%256==0,
@@ -485,7 +486,7 @@ void Runtime::linearInto(const Tensor &x,const Tensor &w,Tensor &out,const Tenso
     } else {
         check(cublasGemmEx(static_cast<cublasHandle_t>(blas_),CUBLAS_OP_T,CUBLAS_OP_N,
             w.rows,x.rows,x.cols,&one,w.data,scalarType,w.cols,x.data,scalarType,x.cols,
-            &zero,out.data,scalarType,w.rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+            &zero,out.data,out.isFloat32()?CUDA_R_32F:scalarType,w.rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
     }
     check(cudaGetLastError());
 }
@@ -849,12 +850,23 @@ struct Weights::Impl {
     Runtime &rt; std::ifstream file; json11::Json header; uint64_t base=0,fileSize=0;
     std::shared_ptr<void> mapping;
     std::unordered_map<std::string,Tensor> cache;
+    struct Partition {
+        int axis,rank,size,groups;
+        bool operator==(const Partition &b) const {
+            return axis==b.axis && rank==b.rank && size==b.size && groups==b.groups;
+        }
+    };
+    std::unordered_map<std::string,Partition> partitions;
     struct HostWeight { int rows,cols; DType dtype; std::vector<uint8_t> bytes; };
     std::unordered_map<std::string,HostWeight> offloaded;
     std::shared_ptr<PackedCache> packed;
     std::shared_ptr<HostCache> host;
     std::string directory,checkpoint;
     std::unordered_map<std::string,std::unique_ptr<Weights>> shards;
+    void checkCacheSource(const Impl &source) const {
+        require(&rt==&source.rt && checkpoint==source.checkpoint && partitions==source.partitions,
+                "shared weight cache requires the same runtime, checkpoint and partitions");
+    }
     Impl(Runtime &rt,const std::string &path):rt(rt),checkpoint(path) {
         if(std::filesystem::is_directory(path)) {
             directory=path;
@@ -886,6 +898,19 @@ struct Weights::Impl {
 };
 Weights::Weights(Runtime &rt,const std::string &path):impl_(new Impl(rt,path)) {}
 Weights::~Weights()=default;
+void Weights::shard(const std::string &name,int axis,int rank,int size,int groups) {
+    auto &i=*impl_;
+    require((axis==0 || axis==1) && size>0 && rank>=0 && rank<size && groups>0,
+            "invalid weight partition");
+    require(i.cache.empty() && i.offloaded.empty() && i.shards.empty() &&
+            (!i.host || i.host->tensors.empty()) && (!i.packed || i.packed->tensors.empty()),
+            "configure weight partitions before loading");
+    i.partitions[name]={axis,rank,size,groups};
+}
+int Weights::shardGroups(const std::string &name) const {
+    auto found=impl_->partitions.find(name);
+    return found==impl_->partitions.end()?1:found->second.groups;
+}
 const Tensor *Weights::optional(const std::string &name) {
     if(impl_->header[name].is_null()) return nullptr; return &get(name);
 }
@@ -908,6 +933,7 @@ const Tensor &Weights::get(const std::string &name) {
             shard.reset(new Weights(i.rt,i.directory+"/"+file));
             shard->impl_->packed=i.packed;
             shard->impl_->host=i.host;
+            shard->impl_->partitions=i.partitions;
         }
         return shard->get(name);
     }
@@ -920,8 +946,23 @@ const Tensor &Weights::get(const std::string &name) {
     double a=offsets[0].number_value(),z=offsets[1].number_value();
     require(a>=0 && z>=a && std::floor(a)==a && std::floor(z)==z && z<=double(i.fileSize-i.base),"weight offset outside file");
     require(z-a==double(n*(dtype=="F32"?4:2)),"weight size mismatch");
+    const auto partition=i.partitions.find(name);
+    bool sliced=partition!=i.partitions.end() && partition->second.size>1;
+    const int originalRows=rows,originalCols=cols;
+    int axis=0,groupWidth=0,partWidth=0;
+    if(sliced) {
+        const auto &p=partition->second;
+        require(shape.size()<=2,"partition requires a matrix or vector");
+        axis=shape.size()==1?1:p.axis;
+        int width=axis==0?rows:cols;
+        require(width%p.groups==0 && (width/p.groups)%p.size==0,
+                "weight dimension must divide partition groups and ranks");
+        groupWidth=width/p.groups; partWidth=groupWidth/p.size;
+        if(axis==0) rows/=p.size; else cols/=p.size;
+    }
+    const size_t weightBytes=size_t(rows)*cols*(dtype=="F32"?4:2);
     Tensor raw;
-    if(i.packed && dtype=="BF16" && i.rt.isFloat32()) {
+    if(i.packed && dtype=="BF16") {
         auto cached=i.packed->tensors.find(name);
         if(cached!=i.packed->tensors.end()) raw=cached->second;
     }
@@ -940,16 +981,35 @@ const Tensor &Weights::get(const std::string &name) {
         i.file.read(reinterpret_cast<char *>(buffer.data()),buffer.size()); require(bool(i.file),"truncated weight");
         source=buffer.data();
     }
-    if(source && i.host && !i.host->tensors.count(name) && uint64_t(z-a)<=i.host->budget-i.host->bytes) {
+    std::vector<uint8_t> partitionBytes;
+    if(source && sliced && !(i.host && i.host->tensors.count(name))) {
+        const auto &p=partition->second;
+        const size_t scalarBytes=dtype=="F32"?4:2;
+        partitionBytes.resize(weightBytes);
+        if(axis==0) {
+            size_t chunk=size_t(partWidth)*originalCols*scalarBytes;
+            for(int g=0;g<p.groups;++g)
+                std::memcpy(partitionBytes.data()+g*chunk,
+                    static_cast<const uint8_t *>(source)+size_t(g*groupWidth+p.rank*partWidth)*originalCols*scalarBytes,chunk);
+        } else {
+            for(int row=0;row<originalRows;++row)
+                for(int g=0;g<p.groups;++g)
+                    std::memcpy(partitionBytes.data()+(size_t(row)*cols+g*partWidth)*scalarBytes,
+                        static_cast<const uint8_t *>(source)+(size_t(row)*originalCols+g*groupWidth+p.rank*partWidth)*scalarBytes,
+                        size_t(partWidth)*scalarBytes);
+        }
+        source=partitionBytes.data();
+    }
+    if(source && i.host && !i.host->tensors.count(name) && weightBytes<=i.host->budget-i.host->bytes) {
         void *p=nullptr;
-        auto status=cudaHostAlloc(&p,uint64_t(z-a),cudaHostAllocPortable);
+        auto status=cudaHostAlloc(&p,weightBytes,cudaHostAllocPortable);
         pinned=status==cudaSuccess;
         if(status==cudaErrorInvalidValue) {
             // Large pinned allocations can be rejected despite valid size/flags.
             // Cache ordinary host bytes instead, avoiding expensive retries and
             // file-backed uploads on subsequent requests.
             cudaGetLastError();
-            p=std::malloc(uint64_t(z-a));
+            p=std::malloc(weightBytes);
             if(!p) i.host->budget=i.host->bytes;
         } else if(status==cudaErrorMemoryAllocation) {
             cudaGetLastError();
@@ -960,9 +1020,9 @@ const Tensor &Weights::get(const std::string &name) {
             std::shared_ptr<void> storage(p,[pinned](void *x) {
                 if(pinned) cudaFreeHost(x); else std::free(x);
             });
-            std::memcpy(p,source,uint64_t(z-a));
+            std::memcpy(p,source,weightBytes);
             i.host->tensors.emplace(name,Impl::HostCache::Buffer{std::move(storage),pinned});
-            i.host->bytes+=uint64_t(z-a);
+            i.host->bytes+=weightBytes;
             source=p;
         }
     }
@@ -996,7 +1056,10 @@ Tensor Weights::linear(const Tensor &x,const std::string &prefix,bool separateBi
     if(separateBias && bias) out=impl_->rt.bias(out,*bias);
     return out;
 }
-void Weights::clear() { impl_->cache.clear(); impl_->offloaded.clear(); impl_->shards.clear(); impl_->packed.reset(); }
+void Weights::clear(bool keepPackedCache) {
+    impl_->cache.clear(); impl_->offloaded.clear(); impl_->shards.clear();
+    if(!keepPackedCache) impl_->packed.reset();
+}
 void Weights::offload() {
     impl_->rt.activate();
     for(const auto &entry:impl_->cache) {
@@ -1026,14 +1089,13 @@ void Weights::enableHostCache(size_t maxBytes) {
     for(auto &shard:i.shards) shard.second->impl_->host=i.host;
 }
 void Weights::shareHostCache(const Weights &source) {
-    require(&impl_->rt==&source.impl_->rt && impl_->checkpoint==source.impl_->checkpoint,
-            "shared host cache requires the same runtime and checkpoint");
+    impl_->checkCacheSource(*source.impl_);
     impl_->host=source.impl_->host;
     for(auto &shard:impl_->shards) shard.second->impl_->host=impl_->host;
 }
 void Weights::enablePackedCache(size_t reserveBytes) {
     auto &i=*impl_;
-    if(!i.rt.isFloat32() || i.packed) return;
+    if(i.packed) return;
     i.rt.activate();
     size_t available=0,total=0; check(cudaMemGetInfo(&available,&total));
     if(available<=reserveBytes) return;
@@ -1041,6 +1103,11 @@ void Weights::enablePackedCache(size_t reserveBytes) {
     i.packed->budget=std::min(available/2,available-reserveBytes);
     // A single budget is shared by every shard, including those already opened.
     for(auto &shard:i.shards) shard.second->impl_->packed=i.packed;
+}
+void Weights::sharePackedCache(const Weights &source) {
+    impl_->checkCacheSource(*source.impl_);
+    impl_->packed=source.impl_->packed;
+    for(auto &shard:impl_->shards) shard.second->impl_->packed=impl_->packed;
 }
 void Weights::erasePrefix(const std::string &prefix) {
     for(auto it=impl_->cache.begin();it!=impl_->cache.end();) {

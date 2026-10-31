@@ -7,7 +7,7 @@ set_directory_properties(PROPERTIES
     INCLUDE_DIRECTORIES "")
 
 add_library(fastllm_continuous STATIC
-    attention.cu runtime.cu tokenizer.cpp vision.cpp
+    attention.cu runtime.cu parallel.cu tokenizer.cpp vision.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen_image/image.cpp
     ${PROJECT_SOURCE_DIR}/third_party/json11/json11.cpp)
 target_include_directories(fastllm_continuous PUBLIC
@@ -23,7 +23,29 @@ set_target_properties(fastllm_continuous PROPERTIES
     CXX_STANDARD 17
     CUDA_ARCHITECTURES "${FASTLLM_CUDA_ARCHITECTURES}"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-target_link_libraries(fastllm_continuous PUBLIC cublas cublasLt)
+target_link_libraries(fastllm_continuous PUBLIC cublas cublasLt pthread)
+# NCCL is already used by the LLM CUDA backend. Keep single-device continuous
+# builds possible without it; only the opt-in multi-device path requires NCCL.
+find_path(FASTLLM_NCCL_INCLUDE_DIR nccl.h)
+find_library(FASTLLM_NCCL_LIBRARY NAMES nccl libnccl.so.2)
+if(FASTLLM_NCCL_INCLUDE_DIR AND FASTLLM_NCCL_LIBRARY)
+    target_compile_definitions(fastllm_continuous PRIVATE FASTLLM_CONTINUOUS_NCCL)
+    target_include_directories(fastllm_continuous PRIVATE ${FASTLLM_NCCL_INCLUDE_DIR})
+    target_link_libraries(fastllm_continuous PUBLIC ${FASTLLM_NCCL_LIBRARY})
+endif()
+
+if(UNIT_TEST)
+    enable_testing()
+    add_executable(continuous_parallel ${PROJECT_SOURCE_DIR}/test/hy_nomas/test_parallel.cpp)
+    target_include_directories(continuous_parallel PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(continuous_parallel PRIVATE fastllm_continuous cudart)
+    set_target_properties(continuous_parallel PROPERTIES CXX_STANDARD 17)
+    if(FASTLLM_NCCL_INCLUDE_DIR AND FASTLLM_NCCL_LIBRARY)
+        target_compile_definitions(continuous_parallel PRIVATE FASTLLM_TEST_NCCL)
+    endif()
+    add_test(NAME continuous_parallel COMMAND continuous_parallel)
+    set_tests_properties(continuous_parallel PROPERTIES LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77)
+endif()
 
 if(BUILD_HY_NOMAS)
     add_library(fastllm_nomas SHARED bindings.cpp model.cpp pipeline.cpp noise.cu)
