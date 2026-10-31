@@ -4,7 +4,9 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
+#include <cfenv>
 #include <stdexcept>
+#include <type_traits>
 
 namespace fastllm {
 namespace minimax_h3 {
@@ -25,8 +27,8 @@ template <class T> __device__ float value(T x) { return float(x); }
 template <class T> __device__ float rounded(float x) { return value(T(x)); }
 // H3 nn.RMSNorm rounds after multiplying the weight. The shared Qwen RMSNorm
 // rounds before it, so reusing that BF16 kernel would change the model's arithmetic.
-template <bool Modulate>
-__global__ void rmsFused(const B *x, const B *w, B *out, int width, float eps, const B *mod,
+template <bool Modulate, class Input, class T>
+__global__ void rmsFused(const Input *x, const Input *w, T *out, int width, float eps, const T *mod,
                          const int *indices, int modCols, int shift, int scale) {
     __shared__ float sums[256];
     float sum = 0;
@@ -44,13 +46,13 @@ __global__ void rmsFused(const B *x, const B *w, B *out, int width, float eps, c
     }
     float inv = rsqrtf(sums[0] / width + eps);
     for (int c = threadIdx.x; c < width; c += 256) {
-        float v = rounded<B>(value(x[row + c]) * inv * value(w[c]));
+        float v = rounded<T>(value(x[row + c]) * inv * value(w[c]));
         if constexpr (Modulate) {
             size_t p = size_t(indices[blockIdx.x]) * modCols + c;
-            v = rounded<B>(v * rounded<B>(1.f + value(mod[p + scale * width]))) +
+            v = rounded<T>(v * rounded<T>(1.f + value(mod[p + scale * width]))) +
                 value(mod[p + shift * width]);
         }
-        out[row + c] = B(v);
+        out[row + c] = T(v);
     }
 }
 template <class T>
@@ -63,12 +65,92 @@ __global__ void selectRows(const T *x, T *out, const int *indices, size_t n, int
             out[i] = x[other];
     }
 }
-__global__ void siluMultiplyBf16(const B *x, B *out, size_t n, int width) {
+template <class T>
+__global__ void siluMultiplyTyped(const T *x, T *out, size_t n, int width) {
     for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
         size_t p = (i / width) * (2 * width) + i % width;
         float gate = value(x[p + width]);
-        // Preserve activation's BF16 result before the elementwise multiply.
-        out[i] = B(value(x[p]) * rounded<B>(gate / (1.f + expf(-gate))));
+        // Preserve activation's low-precision result before the multiply.
+        out[i] = T(value(x[p]) * rounded<T>(gate / (1.f + expf(-gate))));
+    }
+}
+template <class T>
+__global__ void scaledResidualKernel(const float *x, const T *y, const float *scale, float *out,
+                                     size_t n, int width) {
+    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256)
+        out[i] = x[i] + value(y[i]) * scale[i % width];
+}
+template <class T>
+__device__ float blendVideo(float a, float b, int position, int extent) {
+    float wb = rounded<T>(float(position) / extent), wa = rounded<T>(1.f - wb);
+    return rounded<T>(rounded<T>(a * wa) + rounded<T>(b * wb));
+}
+template <class T>
+__device__ float patchPixel(const T *patches, int t, int y, int x, int c, int height, int width) {
+    size_t row = (size_t(t / 4) * height + y / 16) * width + x / 16;
+    int column = ((c * 4 + t % 4) * 16 + y % 16) * 16 + x % 16;
+    return value(patches[row * 3072 + column]);
+}
+template <class T>
+__global__ void stitchVideoKernel(const T *tile, const T *above, const T *left, float *out,
+                                  size_t n, int tileH, int tileW, int height, int width,
+                                  int y0, int x0, int h, int w, int overlapY, int overlapX) {
+    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
+        int c = i % 3, x = i / 3 % w, y = i / (size_t(3) * w) % h;
+        int t = i / (size_t(3) * w * h);
+        float v = patchPixel(tile, t, y, x, c, tileH, tileW);
+        // Both neighbours are raw tiles; vertical blending precedes horizontal blending.
+        if (y < overlapY)
+            v = blendVideo<T>(patchPixel(above, t, tileH * 16 - overlapY + y, x, c, tileH, tileW),
+                              v, y, overlapY);
+        if (x < overlapX)
+            v = blendVideo<T>(patchPixel(left, t, y, tileW * 16 - overlapX + x, c, tileH, tileW),
+                              v, x, overlapX);
+        out[((size_t(t) * height + y0 + y) * width + x0 + x) * 3 + c] = v;
+    }
+}
+template <class T>
+__global__ void copyVideoFramesKernel(float *out, const float *clip, const float *overlap,
+                                      size_t n, int framePixels, int overlapFrames) {
+    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
+        int t = i / (size_t(framePixels) * 3);
+        out[i] = t < overlapFrames ? blendVideo<T>(overlap[i], clip[i], t, overlapFrames) : clip[i];
+    }
+}
+template <int Mode> __device__ float pixelMultiply(float a, float b) {
+    if constexpr (Mode == FE_DOWNWARD)
+        return __fmul_rd(a, b);
+    else if constexpr (Mode == FE_UPWARD)
+        return __fmul_ru(a, b);
+    else if constexpr (Mode == FE_TOWARDZERO)
+        return __fmul_rz(a, b);
+    else
+        return __fmul_rn(a, b);
+}
+template <int Mode> __device__ float pixelAdd(float a, float b) {
+    if constexpr (Mode == FE_DOWNWARD)
+        return __fadd_rd(a, b);
+    else if constexpr (Mode == FE_UPWARD)
+        return __fadd_ru(a, b);
+    else if constexpr (Mode == FE_TOWARDZERO)
+        return __fadd_rz(a, b);
+    else
+        return __fadd_rn(a, b);
+}
+template <int Mode>
+__global__ void videoRGBKernel(const float *pixels, uint8_t *rgb, size_t n) {
+    const float mean[] = {.485f, .456f, .406f}, scale[] = {.229f, .224f, .225f};
+    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
+        float v = pixelAdd<Mode>(pixelMultiply<Mode>(pixels[i], scale[i % 3]), mean[i % 3]);
+        v = pixelMultiply<Mode>(fminf(fmaxf(v, 0.f), 1.f), 255.f);
+        if constexpr (Mode == FE_DOWNWARD)
+            rgb[i] = __float2int_rd(v);
+        else if constexpr (Mode == FE_UPWARD)
+            rgb[i] = __float2int_ru(v);
+        else if constexpr (Mode == FE_TOWARDZERO)
+            rgb[i] = __float2int_rz(v);
+        else
+            rgb[i] = __float2int_rn(v);
     }
 }
 template <class T>
@@ -153,6 +235,52 @@ __global__ void qkNormRope128(const B *q, const B *k, const B *qw, const B *kw, 
         }
     }
 }
+// VAE Q/K normalization accumulates in FP32 and rounds only its output.
+// A warp owns a 64-wide head, preserving normKernel's 32,16,...,1 reduction tree.
+template <class T, bool packed = false>
+__global__ void videoQkNormRope64(const T *q, const T *k, const float *cs, const float *sn,
+                                 T *qo, T *ko, size_t heads, int headsPerToken, int rotaryDim,
+                                 T *vo = nullptr, int sequenceRows = 0) {
+    int lane = threadIdx.x % 32;
+    for (size_t h = size_t(blockIdx.x) * 8 + threadIdx.x / 32; h < (packed ? 3 : 2) * heads;
+         h += size_t(gridDim.x) * 8) {
+        size_t head = h % heads;
+        size_t token = head / headsPerToken;
+        const T *x;
+        if constexpr (packed)
+            x = q + (token * 3 * headsPerToken + (h / heads) * headsPerToken + head % headsPerToken) * 64;
+        else
+            x = (h < heads ? q : k) + head * 64;
+        T *out = (h < heads ? qo : h < 2 * heads ? ko : vo) + head * 64;
+        if constexpr (packed) {
+            if (h >= 2 * heads) {
+                out[lane] = x[lane];
+                out[lane + 32] = x[lane + 32];
+                continue;
+            }
+        }
+        float a = value(x[lane]), b = value(x[lane + 32]);
+        float sum = a * a + b * b;
+        for (int step = 16; step; step /= 2)
+            sum += __shfl_down_sync(0xffffffff, sum, step);
+        float inv = rsqrtf(__shfl_sync(0xffffffff, sum, 0) / 64.f + 1e-5f);
+        size_t pos = (packed ? token % sequenceRows : token) * rotaryDim;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            int d = lane + j * 32;
+            float normalized = rounded<T>(value(x[d]) * inv);
+            if (d < rotaryDim) {
+                int other = d < rotaryDim / 2 ? d + rotaryDim / 2 : d - rotaryDim / 2;
+                float rotated = rounded<T>(value(x[other]) * inv);
+                if (d < rotaryDim / 2)
+                    rotated = -rotated;
+                normalized = rounded<T>(normalized * rounded<T>(cs[pos + d])) +
+                             rounded<T>(rotated * rounded<T>(sn[pos + d]));
+            }
+            out[d] = T(normalized);
+        }
+    }
+}
 __global__ void timeFeatures(const float *times, float *out, size_t n, int d) {
     for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
         int j = i % d;
@@ -162,6 +290,70 @@ __global__ void timeFeatures(const float *times, float *out, size_t n, int d) {
     }
 }
 } // namespace
+Tensor Runtime::videoRms(const Tensor &x, const Tensor &w) {
+    require(x.isFloat32() && w.isFloat32() && w.size() == size_t(x.cols), "invalid VAE RMSNorm");
+    Tensor out(x.rows, x.cols, dtype());
+    if (out.dtype == DType::FP16)
+        rmsFused<false, float, H><<<x.rows, 256, 0, cudaStreamPerThread>>>(
+            ptr<float>(x), ptr<float>(w), ptr<H>(out), x.cols, 1e-5f, nullptr, nullptr, 0, 0, 0);
+    else if (out.dtype == DType::BF16)
+        rmsFused<false, float, B><<<x.rows, 256, 0, cudaStreamPerThread>>>(
+            ptr<float>(x), ptr<float>(w), ptr<B>(out), x.cols, 1e-5f, nullptr, nullptr, 0, 0, 0);
+    else
+        rmsFused<false, float, float><<<x.rows, 256, 0, cudaStreamPerThread>>>(
+            ptr<float>(x), ptr<float>(w), ptr<float>(out), x.cols, 1e-5f, nullptr, nullptr, 0, 0, 0);
+    check(cudaGetLastError());
+    return out;
+}
+std::pair<Tensor, Tensor> Runtime::videoQkNormRotary(const Tensor &q, const Tensor &k,
+                                                   const Tensor &cs, const Tensor &sn) {
+    require(q.rows == k.rows && q.cols == k.cols && q.cols % 64 == 0 && q.dtype == k.dtype &&
+                cs.isFloat32() && sn.isFloat32() && cs.rows == q.rows && sn.rows == q.rows &&
+                cs.cols == sn.cols && cs.cols > 0 && cs.cols <= 64 && cs.cols % 2 == 0,
+            "invalid VAE Q/K norm and rotary inputs");
+    Tensor qo(q.rows, q.cols, q.dtype), ko(k.rows, k.cols, k.dtype);
+    size_t heads = q.size() / 64;
+    int blocks = std::min<size_t>((2 * heads + 7) / 8, 4096);
+    if (q.dtype == DType::FP16)
+        videoQkNormRope64<<<blocks, 256, 0, cudaStreamPerThread>>>(
+            ptr<H>(q), ptr<H>(k), ptr<float>(cs), ptr<float>(sn), ptr<H>(qo), ptr<H>(ko),
+            heads, q.cols / 64, cs.cols);
+    else if (q.dtype == DType::BF16)
+        videoQkNormRope64<<<blocks, 256, 0, cudaStreamPerThread>>>(
+            ptr<B>(q), ptr<B>(k), ptr<float>(cs), ptr<float>(sn), ptr<B>(qo), ptr<B>(ko),
+            heads, q.cols / 64, cs.cols);
+    else
+        videoQkNormRope64<<<blocks, 256, 0, cudaStreamPerThread>>>(
+            ptr<float>(q), ptr<float>(k), ptr<float>(cs), ptr<float>(sn), ptr<float>(qo), ptr<float>(ko),
+            heads, q.cols / 64, cs.cols);
+    check(cudaGetLastError());
+    return {qo, ko};
+}
+std::array<Tensor, 3> Runtime::videoQkvNormRotary(const Tensor &qkv, const Tensor &cs, const Tensor &sn) {
+    require(qkv.rows > 0 && qkv.cols > 0 && qkv.cols % 192 == 0 && cs.isFloat32() && sn.isFloat32() &&
+                cs.rows > 0 && qkv.rows % cs.rows == 0 && cs.rows == sn.rows && cs.cols == sn.cols &&
+                cs.cols > 0 && cs.cols <= 64 && cs.cols % 2 == 0,
+            "invalid packed VAE QKV inputs");
+    int width = qkv.cols / 3;
+    std::array<Tensor, 3> out{Tensor(qkv.rows, width, qkv.dtype), Tensor(qkv.rows, width, qkv.dtype),
+                               Tensor(qkv.rows, width, qkv.dtype)};
+    size_t heads = out[0].size() / 64;
+    int blocks = std::min<size_t>((3 * heads + 7) / 8, 4096);
+    auto launch = [&](auto *type) {
+        using T = std::remove_pointer_t<decltype(type)>;
+        videoQkNormRope64<T, true><<<blocks, 256, 0, cudaStreamPerThread>>>(
+            ptr<T>(qkv), nullptr, ptr<float>(cs), ptr<float>(sn), ptr<T>(out[0]), ptr<T>(out[1]),
+            heads, width / 64, cs.cols, ptr<T>(out[2]), cs.rows);
+    };
+    if (qkv.dtype == DType::FP16)
+        launch(static_cast<H *>(nullptr));
+    else if (qkv.dtype == DType::BF16)
+        launch(static_cast<B *>(nullptr));
+    else
+        launch(static_cast<float *>(nullptr));
+    check(cudaGetLastError());
+    return out;
+}
 Tensor Runtime::rms(const Tensor &x, const Tensor &w, float eps, int width) {
     if (!width)
         width = x.cols;
@@ -171,7 +363,7 @@ Tensor Runtime::rms(const Tensor &x, const Tensor &w, float eps, int width) {
     if (x.isFloat32())
         return norm(x, true, &w, nullptr, eps, width);
     Tensor out(x.rows, x.cols, x.dtype);
-    rmsFused<false><<<x.size() / width, 256, 0, cudaStreamPerThread>>>(
+    rmsFused<false, B, B><<<x.size() / width, 256, 0, cudaStreamPerThread>>>(
         ptr<B>(x), ptr<B>(w), ptr<B>(out), width, eps, nullptr, nullptr, 0, 0, 0);
     check(cudaGetLastError());
     return out;
@@ -193,13 +385,121 @@ Tensor Runtime::rmsModulateRows(const Tensor &x, const Tensor &w, float eps, con
 Tensor Runtime::siluMultiply(const Tensor &x) {
     require(x.cols % 2 == 0, "invalid H3 gated activation width");
     int width = x.cols / 2;
-    if (x.dtype != DType::BF16)
+    if (x.isFloat32())
         return multiply(columns(x, 0, width), activation(columns(x, width, width)));
     Tensor out(x.rows, width, x.dtype);
-    siluMultiplyBf16<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(ptr<B>(x), ptr<B>(out),
-                                                                   out.size(), width);
+    if (x.dtype == DType::FP16)
+        siluMultiplyTyped<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(ptr<H>(x), ptr<H>(out),
+                                                                          out.size(), width);
+    else
+        siluMultiplyTyped<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(ptr<B>(x), ptr<B>(out),
+                                                                          out.size(), width);
     check(cudaGetLastError());
     return out;
+}
+Tensor Runtime::scaledResidual(const Tensor &x, const Tensor &y, const Tensor &scale) {
+    require(x.isFloat32() && scale.isFloat32() && x.rows == y.rows && x.cols == y.cols &&
+                scale.size() == size_t(x.cols), "invalid H3 scaled residual");
+    Tensor out(x.rows, x.cols, DType::FP32);
+    // --fmad=false retains the separate FP32 product and sum in the released VAE.
+    if (y.dtype == DType::FP16)
+        scaledResidualKernel<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
+            ptr<float>(x), ptr<H>(y), ptr<float>(scale), ptr<float>(out), x.size(), x.cols);
+    else if (y.dtype == DType::BF16)
+        scaledResidualKernel<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
+            ptr<float>(x), ptr<B>(y), ptr<float>(scale), ptr<float>(out), x.size(), x.cols);
+    else
+        scaledResidualKernel<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
+            ptr<float>(x), ptr<float>(y), ptr<float>(scale), ptr<float>(out), x.size(), x.cols);
+    check(cudaGetLastError());
+    return out;
+}
+Tensor Runtime::stitchVideo(const std::vector<Tensor> &patches, int frames, int tileHeight, int tileWidth,
+                            int height, int width, const std::vector<int> &ys, const std::vector<int> &xs) {
+    require(frames > 0 && tileHeight > 0 && tileWidth > 0 && height >= tileHeight && width >= tileWidth &&
+                int64_t(frames) * height * width <= INT32_MAX / 1024 &&
+                !ys.empty() && !xs.empty() && patches.size() == ys.size() * xs.size(), "invalid video tiles");
+    auto valid = [](const std::vector<int> &starts, int size, int tile) {
+        if (starts.front() != 0 || starts.back() != size - tile)
+            return false;
+        for (size_t i = 1; i < starts.size(); ++i)
+            if (starts[i] <= starts[i - 1] || starts[i] > starts[i - 1] + tile)
+                return false;
+        return true;
+    };
+    require(valid(ys, height, tileHeight) && valid(xs, width, tileWidth), "invalid video tile positions");
+    for (const auto &p : patches)
+        require(p.rows == int64_t(frames) * tileHeight * tileWidth && p.cols == 3072 && p.dtype == dtype(),
+                "invalid video tile shape/dtype");
+    Tensor out(frames * height * width * 1024, 3, DType::FP32);
+    for (size_t y = 0; y < ys.size(); ++y)
+        for (size_t x = 0; x < xs.size(); ++x) {
+            const auto &tile = patches[y * xs.size() + x];
+            const auto &above = y ? patches[(y - 1) * xs.size() + x] : tile;
+            const auto &left = x ? patches[y * xs.size() + x - 1] : tile;
+            int h = (y + 1 < ys.size() ? ys[y + 1] - ys[y] : tileHeight) * 16;
+            int w = (x + 1 < xs.size() ? xs[x + 1] - xs[x] : tileWidth) * 16;
+            int oy = y ? (ys[y - 1] + tileHeight - ys[y]) * 16 : 0;
+            int ox = x ? (xs[x - 1] + tileWidth - xs[x]) * 16 : 0;
+            size_t n = size_t(frames) * 4 * h * w * 3;
+            auto launch = [&](auto *p) {
+                using T = std::remove_pointer_t<decltype(p)>;
+                stitchVideoKernel<<<grid(n), 256, 0, cudaStreamPerThread>>>(
+                    p, ptr<T>(above), ptr<T>(left), ptr<float>(out), n, tileHeight, tileWidth,
+                    height * 16, width * 16, ys[y] * 16, xs[x] * 16, h, w, oy, ox);
+            };
+            if (dtype() == DType::FP16)
+                launch(ptr<H>(tile));
+            else if (dtype() == DType::BF16)
+                launch(ptr<B>(tile));
+            else
+                launch(ptr<float>(tile));
+        }
+    check(cudaGetLastError());
+    return out;
+}
+void Runtime::copyVideoFrames(Tensor &out, const Tensor &clip, const Tensor *overlap, int framePixels,
+                              int start) {
+    require(framePixels > 0 && start >= 0 && out.isFloat32() && clip.isFloat32() &&
+                out.cols == 3 && clip.cols == 3 && out.rows % framePixels == 0 &&
+                clip.rows % framePixels == 0 && int64_t(start) * framePixels + out.rows <= clip.rows &&
+                (!overlap || (overlap->isFloat32() && overlap->cols == 3 &&
+                              overlap->rows % framePixels == 0)), "invalid video frame copy");
+    const float *source = ptr<float>(clip) + size_t(start) * framePixels * 3;
+    int overlapFrames = overlap ? overlap->rows / framePixels : 0;
+    auto launch = [&](auto *p) {
+        using T = std::remove_pointer_t<decltype(p)>;
+        copyVideoFramesKernel<T><<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(
+            ptr<float>(out), source, overlap ? ptr<float>(*overlap) : nullptr, out.size(), framePixels,
+            overlapFrames);
+    };
+    if (dtype() == DType::FP16)
+        launch(static_cast<H *>(nullptr));
+    else if (dtype() == DType::BF16)
+        launch(static_cast<B *>(nullptr));
+    else
+        launch(static_cast<float *>(nullptr));
+    check(cudaGetLastError());
+}
+std::vector<uint8_t> Runtime::downloadVideoRGB(const Tensor &pixels) {
+    require(pixels.isFloat32() && pixels.cols == 3 && pixels.rows > 0, "invalid video RGB input");
+    // Byte scratch uses the existing allocator; Tensor's public dtypes remain floating point.
+    Tensor scratch(int((pixels.size() + 3) / 4), 1, DType::FP32);
+    auto launch = [&](auto mode) {
+        videoRGBKernel<decltype(mode)::value><<<grid(pixels.size()), 256, 0, cudaStreamPerThread>>>(
+            ptr<float>(pixels), ptr<uint8_t>(scratch), pixels.size());
+    };
+    switch (std::fegetround()) {
+    case FE_DOWNWARD: launch(std::integral_constant<int, FE_DOWNWARD>{}); break;
+    case FE_UPWARD: launch(std::integral_constant<int, FE_UPWARD>{}); break;
+    case FE_TOWARDZERO: launch(std::integral_constant<int, FE_TOWARDZERO>{}); break;
+    default: launch(std::integral_constant<int, FE_TONEAREST>{}); break;
+    }
+    check(cudaGetLastError());
+    std::vector<uint8_t> rgb(pixels.size());
+    check(cudaMemcpyAsync(rgb.data(), scratch.data, rgb.size(), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    check(cudaStreamSynchronize(cudaStreamPerThread));
+    return rgb;
 }
 std::pair<Tensor, Tensor> Runtime::qkNormRotary(const Tensor &q, const Tensor &k, const Tensor &qw,
                                              const Tensor &kw, float eps, const Tensor &cs,
@@ -423,16 +723,19 @@ Tensor Runtime::conv1d(const Tensor &x, const Tensor &w, const Tensor *bias, int
                             : (x.rows + 2 * pad - dilation * (kernel - 1) - 1) / stride + 1;
     require(length > 0, "empty H3 convolution output");
     Tensor out(length, w.rows, true);
-    for (int first = 0; first < length; first += 2048) {
-        int count = std::min(2048, length - first);
+    for (int first = 0; first < length;) {
+        // Narrow late-stage convolutions are launch-bound. Keep the small tail separate.
+        int count = std::min(w.rows <= 64 ? 16384 : 2048, length - first);
+        if (count > 2048)
+            count -= count % 2048;
         Tensor col(count, w.cols, true);
         audioColumns<<<grid(col.size()), 256, 0, cudaStreamPerThread>>>(
             ptr<float>(x), ptr<float>(col), x.rows, x.cols, kernel, stride, pad, dilation, transposed, first,
             col.size());
         check(cudaGetLastError());
-        auto y = linear(col, w, bias);
-        check(cudaMemcpyAsync(out.rowSlice(first, count).data, y.data, y.bytes(), cudaMemcpyDeviceToDevice,
-                              cudaStreamPerThread));
+        auto target = out.rowSlice(first, count);
+        linearInto(col, w, target, bias);
+        first += count;
     }
     return out;
 }

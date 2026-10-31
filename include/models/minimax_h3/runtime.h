@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/hy_nomas/runtime.h"
+#include <array>
 #include <functional>
 
 namespace fastllm {
@@ -18,6 +19,15 @@ class Runtime : public nomas::Runtime {
     Tensor rmsModulateRows(const Tensor &, const Tensor &weight, float eps, const Tensor &table,
                            const Tensor &indices, int shift, int scale);
     Tensor siluMultiply(const Tensor &hiddenAndGate);
+    Tensor scaledResidual(const Tensor &fp32Residual, const Tensor &, const Tensor &fp32Scale);
+    Tensor stitchVideo(const std::vector<Tensor> &patches, int frames, int tileHeight, int tileWidth,
+                       int height, int width, const std::vector<int> &ys, const std::vector<int> &xs);
+    void copyVideoFrames(Tensor &out, const Tensor &clip, const Tensor *overlap, int framePixels, int start);
+    std::vector<uint8_t> downloadVideoRGB(const Tensor &fp32Pixels);
+    Tensor videoRms(const Tensor &fp32Input, const Tensor &fp32Weight);
+    std::pair<Tensor, Tensor> videoQkNormRotary(const Tensor &q, const Tensor &k,
+                                               const Tensor &cos, const Tensor &sin);
+    std::array<Tensor, 3> videoQkvNormRotary(const Tensor &qkv, const Tensor &cos, const Tensor &sin);
     Tensor indices(const std::vector<int> &);
     Tensor gather(const Tensor &, const Tensor &indices);
     void scatter(Tensor &out, const Tensor &input, const Tensor &indices);
@@ -122,15 +132,27 @@ class VideoVAE {
     VideoVAE(Runtime &compute, Runtime &fp32, const std::string &directory);
     Tensor decodeTile(const Tensor &, int frames, int height, int width, Trace trace = {});
     VideoTensor decode(const VideoTensor &, std::function<void(int, int)> progress = {});
+    std::vector<uint8_t> decodeRGB(const VideoTensor &, std::function<void(int, int)> progress = {},
+                                   std::function<void(const std::vector<uint8_t> &)> onFrames = {});
     void unload() {
         weights_.clear();
         fullWeights_.clear();
+        qkv_.clear();
+        rope_ = {};
+        zero_ = {};
     }
 
   private:
-    VideoTensor decodeClip(const VideoTensor &, std::function<void()> checkpoint = {});
+    Tensor decodeTiles(const Tensor &, int frames, int height, int width, int batch, Trace trace = {});
+    Tensor decodeClip(const VideoTensor &, std::function<void()> checkpoint = {});
+    Tensor decodeDevice(const VideoTensor &, std::function<void(int, int)> progress,
+                         std::function<void(const Tensor &)> onFrames = {});
     Runtime &rt_, &full_;
     Weights weights_, fullWeights_;
+    std::vector<std::pair<Tensor, Tensor>> qkv_;
+    std::array<int, 3> ropeShape_{};
+    std::pair<Tensor, Tensor> rope_;
+    Tensor zero_;
 };
 DType parseVideoPrecision(const std::string &name, bool fp32 = false);
 const char *precisionName(DType);

@@ -207,25 +207,18 @@ Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace
                         latents.values[((size_t(t) * lh + y) * lw + x) * 24 + c] =
                             video[src] * videoStd_[c] + videoMean_[c];
                     }
-        tick("video_decode", 0, 1);
-        auto pixels =
-            video_.decode(latents, [&](int current, int total) { tick("video_decode", current, total); });
-        if (!retainWeights_)
-            video_.unload();
-        tick("video_decode", 1, 1);
-        if (pixels.frames != o.frames)
-            throw std::runtime_error("decoded H3 frame count mismatch");
         Generation result;
         result.width = o.width;
         result.height = o.height;
         result.frames = o.frames;
-        result.rgb.resize(pixels.values.size());
-        const float mean[] = {.485f, .456f, .406f}, std[] = {.229f, .224f, .225f};
-        for (size_t i = 0; i < pixels.values.size(); ++i) {
-            float value = std::clamp(pixels.values[i] * std[i % 3] + mean[i % 3], 0.f, 1.f);
-            result.rgb[i] = uint8_t(std::nearbyint(value * 255.f));
-        }
-        pixels = {};
+        tick("video_decode", 0, 1);
+        result.rgb = video_.decodeRGB(
+            latents, [&](int current, int total) { tick("video_decode", current, total); });
+        if (!retainWeights_)
+            video_.unload();
+        tick("video_decode", 1, 1);
+        if (result.rgb.size() != size_t(o.frames) * o.width * o.height * 3)
+            throw std::runtime_error("decoded H3 frame count mismatch");
         latents = {};
         result.audio.resize(size_t(at) * 800 * 2);
         for (int channel = 0; channel < 2; ++channel) {
