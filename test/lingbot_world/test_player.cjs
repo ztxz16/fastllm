@@ -12,11 +12,13 @@ let now = 1000.5, nextTimer = 0, nextImage = 0, reply;
 function element(id) {
   if (!elements.has(id)) elements.set(id, {
     value: id === 'size' ? '576,320' : id === 'seed' ? '42' : '', style:{},
+    clicks:0,click(){this.clicks++;},toDataURL(){return 'data:image/png;base64,test';},
     classList:{toggle(){}}, getContext(){return {drawImage(image){assert.ok(image);drawn.push(image.id);}};}
   });
   return elements.get(id);
 }
-const document = {getElementById:element,querySelectorAll:()=>buttons,activeElement:{tagName:'BODY'},
+const document = {getElementById:element,createElement:()=>element('temporary-canvas'),
+  querySelectorAll:()=>buttons,activeElement:{tagName:'BODY'},
   addEventListener(name, callback){listeners[name]=callback;}};
 const context = vm.createContext({document,URL,location:{href:'http://localhost/'},
   history:{replaceState(){}},performance:{now:()=>now},setTimeout,
@@ -39,8 +41,10 @@ function completed(frames=3) {
 }
 (async()=>{
   assert.ok(buttons.every(b=>b.disabled));
+  assert.equal(element('create').textContent,'选择起始图片');
   await element('create').onclick();
-  assert.match(element('statusText').textContent,/选择起始图片/);
+  assert.match(element('createStatus').textContent,/请选择一张起始图片/);
+  assert.equal(element('image').clicks,1);
   assert.equal(calls.length,0);
   vm.runInContext("png='data:image/png;base64,test'",context);
   reply=async()=>completed();
@@ -63,6 +67,7 @@ function completed(frames=3) {
   release(completed(4));await move;
   assert.deepEqual(closed,[1,2,3]);
   assert.equal(element('create').disabled,false);
+  assert.equal(element('create').textContent,'创建新场景');
   reply=async()=>completed();
   element('editPrompt').value='A sunny garden';
   await element('edit').onclick();
@@ -83,5 +88,28 @@ function completed(frames=3) {
   assert.match(element('statusText').textContent,/重新创建场景/);
   assert.ok(buttons.every(b=>b.disabled));
   assert.equal(element('create').disabled,false);
-  console.log('LingBot playback, controls, editing, focus, locking and failure recovery passed');
+
+  // Reading a new file clears the previous image and blocks creation until it
+  // finishes. A failed read must not silently reuse the old image.
+  let finishImage;
+  context.createImageBitmap=()=>new Promise(resolve=>{finishImage=resolve;});
+  element('image').files=[{}];
+  const selecting=element('image').onchange();
+  assert.equal(element('create').disabled,true);
+  assert.equal(element('create').textContent,'正在读取图片…');
+  const requestsBefore=calls.length;
+  await element('create').onclick();
+  assert.equal(calls.length,requestsBefore);
+  finishImage({id:99,width:576,height:320,close(){}});await selecting;
+  assert.equal(element('create').disabled,false);
+  assert.equal(element('create').textContent,'创建并进入');
+  assert.match(element('createStatus').textContent,/图片已准备好/);
+  context.createImageBitmap=async()=>{throw Error('invalid image');};
+  await element('image').onchange();
+  assert.equal(element('create').textContent,'选择起始图片');
+  assert.match(element('createStatus').textContent,/无法读取/);
+  await element('create').onclick();
+  assert.equal(element('image').clicks,2);
+  assert.equal(calls.length,requestsBefore);
+  console.log('LingBot image selection, playback, controls, editing, locking and failure recovery passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});
