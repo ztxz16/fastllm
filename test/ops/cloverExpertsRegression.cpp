@@ -341,6 +341,11 @@ int main(int argc, char **argv) {
         for (float p : {0.f, .9f}) for (bool ties : {false, true})
             Router(16, 256, 8, p, ties, 320);
         Router(16, 17, 16, .9f, false); Router(8, 16, 4, .9f, true);
+        for (bool ties : {false, true}) {
+            Router(16, 256, 8, 0.f, ties, 257);
+            Router(16, 256, 8, 1.e-5f, ties, 257);
+            Router(1, 1, 1, 0.f, ties); Router(4, 2, 2, .5f, ties);
+        }
         for (int rows : {1, 16, 512}) for (bool preview : {false, true}) ProjectionUnpack(rows, 8192, 32, preview);
         ProjectionUnpack(7, 383, 3, false);
         for (int rows : {127, 128, 129}) for (bool preview : {false, true})

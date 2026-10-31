@@ -5,6 +5,21 @@
 namespace fastllm {
 namespace cuda {
 
+// Warp-first FP32 reduction, distinct from OrderedBlockReduce's lane-first
+// tree below. All 256 threads participate; scratch contains eight floats.
+__device__ __forceinline__ float WarpSum(float x) {
+    for (int offset = 16; offset; offset >>= 1) x += __shfl_down_sync(0xffffffff, x, offset);
+    return __shfl_sync(0xffffffff, x, 0);
+}
+__device__ __forceinline__ float WarpFirstBlockSum256(float x, float *scratch) {
+    x = WarpSum(x);
+    if (threadIdx.x % 32 == 0) scratch[threadIdx.x / 32] = x;
+    __syncthreads();
+    x = WarpSum(threadIdx.x < 8 ? scratch[threadIdx.x] : 0.f);
+    if (threadIdx.x == 0) scratch[0] = x;
+    __syncthreads();
+    return scratch[0];
+}
 struct OrderedSum {
     __device__ __forceinline__ float operator()(float a, float b) const { return a + b; }
 };

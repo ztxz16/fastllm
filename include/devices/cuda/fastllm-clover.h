@@ -67,16 +67,6 @@ bool FastllmCudaCloverPrefillGdn(const void *query, const void *key, const void 
     int batch, int tokens, int keyHeads, int valueHeads,
     void *workspace, size_t workspaceBytes, void *stream = nullptr, int qkvRowStride = 0);
 
-// Selected 16-bit input/output, FP32 norm weights. The optional gate is SiLU-gated
-// before the single output cast, as required by the GDN output norm.
-bool FastllmCudaCloverNorm(const void *input, const float *weight, const void *gate,
-    void *output, int rows, int width, float eps, bool zeroCentered,
-    void *stream = nullptr, bool fp16 = false);
-// Update 16-bit residual += input before normalization, including its
-// residual rounding. Output must not overlap either input allocation.
-bool FastllmCudaCloverAddNorm(void *residual, const void *input, const float *weight,
-    void *output, int rows, int width, float eps, bool zeroCentered,
-    void *stream = nullptr, bool fp16 = false);
 // Unpack fused [QKV, Z, A, B] projections and compute FP32 decay / 16-bit beta.
 // beta may be null for previews. QKV channels and Z [heads,128] stay 16-bit.
 bool FastllmCudaCloverUnpackGdn(const void *input, const float *aLog, const float *bias,

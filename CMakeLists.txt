@@ -488,6 +488,8 @@ if (USE_CUDA)
         src/devices/cuda/models/deepseekv41-reference.cu
         src/devices/cuda/models/deepseekv41-dspark-kernels.cu
         src/devices/cuda/moe/fastllm-moe-bf16.cu
+        src/devices/cuda/fastllm-norm.cu
+        src/devices/cuda/fastllm-router.cu
         src/devices/cuda/models/clover-kernels.cu
         src/devices/cuda/models/clover-attention.cu
         src/devices/cuda/models/qwen4-kernels.cu)

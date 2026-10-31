@@ -39,7 +39,7 @@ __global__ void CloverPreviewGdnMma(const __nv_bfloat16 *query, const __nv_bfloa
                                     const unsigned char *valid, __nv_bfloat16 *output, int kh, int vh,
                                     int qstride, int vstride, CloverCudaGdnCaches caches) {
 #if __CUDA_ARCH__ >= 800
-    CloverDependencyStart();
+    DependencyStart();
     int tid = threadIdx.x, lane = tid % 32, warp = tid / 32, request = blockIdx.z, head = blockIdx.y,
         first = blockIdx.x * 16, keyHead = head / (vh / kh), slot = slots ? slots[request] : request;
     if (slot < 0) {

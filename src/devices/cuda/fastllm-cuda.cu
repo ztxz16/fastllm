@@ -16,6 +16,7 @@
 #ifndef USE_ROCM
 #include "fastllm-cuda-ordered-reduce.cuh"
 #include "fastllm-rmsnorm-decode.cuh"
+#include "fastllm-cuda-norm.cuh"
 #include "attention/fastllm-kda-prefill.cuh"
 #endif
 #include "fastllm.h"
@@ -4115,32 +4116,6 @@ __global__ void FastllmRMSNormKernelInner1(__nv_bfloat16 *input, float *weight, 
 }
 
 #ifndef USE_ROCM
-// Odd row strides are not aligned for float4/half2/bfloat162 accesses. Scalar
-// loads preserve arbitrary row alignment; the general even-width path stays
-// unchanged. No tensor-core instructions are required.
-template <typename T>
-__global__ void FastllmRMSNormUnalignedKernel(const T *input, const float *weight,
-                                            T *output, int channels, float eps) {
-    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    input += (uint64_t)blockIdx.x * channels;
-    output += (uint64_t)blockIdx.x * channels;
-    __shared__ float partial[8], scale;
-    float sum = 0.0f;
-    for (int i = tid; i < channels; i += 256) {
-        float v = (float)input[i]; sum += v * v;
-    }
-    for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffff, sum, offset);
-    if (lane == 0) partial[warp] = sum;
-    __syncthreads();
-    if (warp == 0) {
-        sum = lane < 8 ? partial[lane] : 0.0f;
-        for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffff, sum, offset);
-        if (lane == 0) scale = rsqrtf(sum / channels + eps);
-    }
-    __syncthreads();
-    for (int i = tid; i < channels; i += 256) output[i] = (T)((float)input[i] * scale * weight[i]);
-}
-
 // Emulate the original 1024 lanes with fewer physical threads. Independent
 // virtual-lane sums are interleaved to hide shuffle latency; inputs stay in
 // registers until the scale is ready. The reduction tree is unchanged.
@@ -8338,7 +8313,7 @@ static bool LaunchFastllmRMSNormFloat16(
         int outer, int channels, float eps, int threadCount) {
 #ifndef USE_ROCM
     if (threadCount == 0 && ((channels & 1) || ((uintptr_t)input | (uintptr_t)output) % 4)) {
-        FastllmRMSNormUnalignedKernel<half><<<outer, 256>>>(input, weight, output, channels, eps);
+        fastllm::cuda_norm::RMSNorm<half><<<outer, 256>>>(input, weight, output, channels, eps);
         return true;
     }
 #endif
@@ -8397,7 +8372,7 @@ static bool LaunchFastllmRMSNormBFloat16(
         int outer, int channels, float eps, int threadCount) {
 #ifndef USE_ROCM
     if (threadCount == 0 && ((channels & 1) || ((uintptr_t)input | (uintptr_t)output) % 4)) {
-        FastllmRMSNormUnalignedKernel<__nv_bfloat16><<<outer, 256>>>(input, weight, output, channels, eps);
+        fastllm::cuda_norm::RMSNorm<__nv_bfloat16><<<outer, 256>>>(input, weight, output, channels, eps);
         return true;
     }
     if (threadCount == 0 && channels == 5120 && outer > 0 &&
@@ -8494,7 +8469,7 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
     if (input.dataType == fastllm::DataType::FLOAT32) {
 #ifndef USE_ROCM
         if (channels % 4 || ((uintptr_t)cudaInput | (uintptr_t)cudaOutput | (uintptr_t)weight.cudaData) % 16) {
-            FastllmRMSNormUnalignedKernel<float><<<outer, 256>>>(
+            fastllm::cuda_norm::RMSNorm<float><<<outer, 256>>>(
                 cudaInput, (const float*)weight.cudaData, cudaOutput, channels, eps);
         } else
 #endif

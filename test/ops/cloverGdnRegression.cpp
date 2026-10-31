@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-cuda-norm.h"
 #include "devices/cuda/fastllm-clover.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -292,7 +293,7 @@ void ResidualNormalization(int rows, int width, bool centered, bool unaligned = 
         auto rounded = residual;
         for (size_t i = offset; i < offset + count; ++i) rounded[i] = Round16(Float(residual[i]) + Float(input[i]));
         expectedH.Put(rounded);
-        Require(FastllmCudaCloverNorm((uint16_t *)expectedH.p + offset, (float *)w.p, nullptr,
+        Require(FastllmCudaRMSNorm((uint16_t *)expectedH.p + offset, (float *)w.p, nullptr,
             (uint16_t *)expectedY.p + offset, rows, width, 1.e-6f, centered, nullptr, fp16), "residual norm reference launch");
         auto expected = expectedY.Get<uint16_t>(size);
         // Independent RMS equation checks the original normalization path;
@@ -309,7 +310,7 @@ void ResidualNormalization(int rows, int width, bool centered, bool unaligned = 
         }
         return std::make_pair(rounded, expected);
     };
-    auto launch = [&]() { return FastllmCudaCloverAddNorm((uint16_t *)h.p + offset,
+    auto launch = [&]() { return FastllmCudaAddRMSNorm((uint16_t *)h.p + offset,
         (uint16_t *)x.p + offset, (float *)w.p, (uint16_t *)y.p + offset, rows, width, 1.e-6f, centered, nullptr, fp16); };
     auto expected = refresh();
     auto check = [&]() {
@@ -318,9 +319,9 @@ void ResidualNormalization(int rows, int width, bool centered, bool unaligned = 
         Require(x.Get<uint16_t>(size) == input, "fused normalization changed addition input");
     };
     Require(launch(), "residual norm launch"); check();
-    Require(!FastllmCudaCloverAddNorm(h.p, x.p, (float *)w.p, h.p, rows, width, 1.e-6f, centered, nullptr, fp16),
+    Require(!FastllmCudaAddRMSNorm(h.p, x.p, (float *)w.p, h.p, rows, width, 1.e-6f, centered, nullptr, fp16),
         "residual/output alias accepted");
-    Require(!FastllmCudaCloverAddNorm(h.p, x.p, (float *)w.p, y.p, 0, width, 1.e-6f, centered, nullptr, fp16),
+    Require(!FastllmCudaAddRMSNorm(h.p, x.p, (float *)w.p, y.p, 0, width, 1.e-6f, centered, nullptr, fp16),
         "invalid residual norm shape accepted");
     cudaGraph_t graph; cudaGraphExec_t executable;
     Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
@@ -345,7 +346,7 @@ void Normalization(int rows, int width, bool gated, bool centered) {
     auto launch = [&](bool bulk) {
         for (int row = 0; row < rows; row += bulk ? rows : 511) {
             size_t offset = (size_t)row * width;
-            Require(FastllmCudaCloverNorm((uint16_t *)x.p + offset, (float *)w.p,
+            Require(FastllmCudaRMSNorm((uint16_t *)x.p + offset, (float *)w.p,
                 gated ? (uint16_t *)g.p + offset : nullptr,
                 bulk ? (uint16_t *)out.p + 64 : (uint16_t *)ref.p + offset,
                 bulk ? rows : std::min(511, rows - row), width, 1.e-6f, centered, nullptr, fp16), "norm launch");
@@ -398,8 +399,8 @@ void AttentionPreparation(int tokens, int qh, int kh, int rotaryDim, int positio
     qg.Put(qgate); k.Put(key); q.Put(query); wq.Put(qw); wk.Put(kw);
     std::vector<uint16_t> qGuard(qcount + 128, Round16(123.f)), kGuard(kcount + 128, Round16(123.f));
     outQ.Put(qGuard); outG.Put(qGuard); outK.Put(kGuard);
-    Require(FastllmCudaCloverNorm(q.p, (float *)wq.p, nullptr, refQ.p, tokens * qh, 256, 1.e-6f, true, nullptr, fp16), "reference Q norm");
-    Require(FastllmCudaCloverNorm(k.p, (float *)wk.p, nullptr, refK.p, tokens * kh, 256, 1.e-6f, true, nullptr, fp16), "reference K norm");
+    Require(FastllmCudaRMSNorm(q.p, (float *)wq.p, nullptr, refQ.p, tokens * qh, 256, 1.e-6f, true, nullptr, fp16), "reference Q norm");
+    Require(FastllmCudaRMSNorm(k.p, (float *)wk.p, nullptr, refK.p, tokens * kh, 256, 1.e-6f, true, nullptr, fp16), "reference K norm");
     Require(FastllmCudaCloverRotary(refQ.p, tokens, qh, 256, rotaryDim, position, 1.e7f, nullptr, fp16), "reference Q rotary");
     Require(FastllmCudaCloverRotary(refK.p, tokens, kh, 256, rotaryDim, position, 1.e7f, nullptr, fp16), "reference K rotary");
     const int stride = (qh + kh) * 512 + 17;

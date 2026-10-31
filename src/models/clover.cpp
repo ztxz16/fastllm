@@ -9,6 +9,7 @@
 #include "fastllm-cuda.cuh"
 #include <cuda_runtime.h>
 #include "devices/cuda/fastllm-clover.h"
+#include "devices/cuda/fastllm-cuda-norm.h"
 #endif
 
 namespace fastllm {
@@ -279,7 +280,7 @@ void CloverModel::Norm(Data &input, const std::string &name, Data &output, Data 
     auto &w = weight[name];
     Check(w.dataType == FLOAT32 && w.Count(0) == input.dims.back(), "invalid normalization weight");
     PrepareCloverData(output, dataType, input.dims, cudaDevice);
-    Check(FastllmCudaCloverNorm(input.cudaData, (float *)w.cudaData,
+    Check(FastllmCudaRMSNorm(input.cudaData, (float *)w.cudaData,
         gate ? gate->cudaData : nullptr, output.cudaData, input.Count(0) / input.dims.back(),
         input.dims.back(), rms_norm_eps, zeroCentered, nullptr, dataType == FLOAT16), "normalization failed");
 #endif
@@ -290,7 +291,7 @@ void CloverModel::AddNorm(Data &residual, Data &input, const std::string &name, 
     Check(residual.dims == input.dims && w.dataType == FLOAT32 && w.Count(0) == input.dims.back(),
         "invalid residual normalization shape or weight");
     PrepareCloverData(output, dataType, input.dims, cudaDevice);
-    Check(FastllmCudaCloverAddNorm(residual.cudaData, input.cudaData, (float *)w.cudaData,
+    Check(FastllmCudaAddRMSNorm(residual.cudaData, input.cudaData, (float *)w.cudaData,
         output.cudaData, input.Count(0) / input.dims.back(), input.dims.back(), rms_norm_eps, true, nullptr, dataType == FLOAT16),
         "residual normalization failed");
 #endif
