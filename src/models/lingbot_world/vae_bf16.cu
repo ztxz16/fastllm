@@ -16,10 +16,6 @@ void check(cudaError_t status) {
 }
 int grid(size_t n) { return int(std::min<size_t>((n+255)/256,4096)); }
 template<class T> T *ptr(const Tensor &x) { return reinterpret_cast<T *>(x.data); }
-template<class Out,class In> __global__ void convert(const In *x,Out *out,size_t n) {
-    for(size_t i=size_t(blockIdx.x)*256+threadIdx.x;i<n;i+=size_t(gridDim.x)*256)
-        out[i]=Out(float(x[i]));
-}
 template<class T> __global__ void im2col(const T *x,B *out,int frames,int h,int w,int channels,
     int kt,int kernel,int strideT,int padT,int strideS,int padS,int oh,int ow,int start,size_t n) {
     int inner=channels*kt*kernel*kernel;
@@ -70,26 +66,6 @@ __global__ void packWeight(const uint16_t *x,uint16_t *out,size_t n,int channels
         out[i]=x[(i/inner)*inner+(k%channels)*spatial+k/channels];
     }
 }
-__global__ void resize(const uint16_t *x,uint16_t *out,size_t n,int w,int channels) {
-    for(size_t i=size_t(blockIdx.x)*256+threadIdx.x;i<n;i+=size_t(gridDim.x)*256) {
-        size_t p=i/channels;
-        out[i]=x[((p/(2*w)/2)*w+(p%(2*w))/2)*channels+i%channels];
-    }
-}
-}
-Tensor VAERuntime::cast(const Tensor &x,bool full) {
-    if(x.fp32==full) return x;
-    Tensor out(x.rows,x.cols,full);
-    if(full) convert<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<B>(x),ptr<float>(out),x.size());
-    else convert<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(x),ptr<B>(out),x.size());
-    check(cudaGetLastError()); return out;
-}
-Tensor VAERuntime::resize2x(const Tensor &x,int h,int w) {
-    if(x.fp32) return qwen_image::Runtime::resize2x(x,h,w);
-    if(x.rows!=h*w) throw std::invalid_argument("Wan resize shape");
-    Tensor out(x.rows*4,x.cols,false);
-    resize<<<grid(out.size()),256,0,cudaStreamPerThread>>>(x.data,out.data,out.size(),w,x.cols);
-    check(cudaGetLastError()); return out;
 }
 Tensor VAERuntime::convolutionBF16(const Tensor &x,const Tensor &weight,const Tensor *bias,
     int frames,int h,int w,int kt,int kernel,int strideT,int padT,int strideS,int padS,int oh,int ow) {

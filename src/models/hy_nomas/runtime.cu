@@ -292,6 +292,13 @@ Tensor Runtime::upload(const float *x,int r,int c) {
     copy(tmp.get(),x,out.size()*4,cudaMemcpyHostToDevice);
     toBF16<<<grid(out.size()),256,0,cudaStreamPerThread>>>(static_cast<float *>(tmp.get()),ptr(out),out.size()); check(cudaGetLastError()); return out;
 }
+Tensor Runtime::cast(const Tensor &x,bool full) {
+    if(x.fp32==full) return x;
+    Tensor out(x.rows,x.cols,full);
+    if(full) toFloat<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr(x),as<float>(out),x.size());
+    else toBF16<<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<float>(x),ptr(out),x.size());
+    check(cudaGetLastError()); return out;
+}
 std::vector<float> Runtime::download(const Tensor &x) {
     std::vector<float> out(x.size());
     if(x.fp32) { copy(out.data(),x.data,x.bytes(),cudaMemcpyDeviceToHost); return out; }

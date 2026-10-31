@@ -15,7 +15,6 @@ class Runtime : public nomas::Runtime {
 public:
     explicit Runtime(int device);
     ~Runtime();
-    Tensor cast(const Tensor &, bool full);
     Tensor join(const Tensor &, const Tensor &);
     Tensor affine(const Tensor &, const Tensor &scale, const Tensor &shift,
                   bool roundOnePlus = false);

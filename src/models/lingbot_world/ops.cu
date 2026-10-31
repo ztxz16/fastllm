@@ -21,10 +21,6 @@ void require(bool ok, const char *message) { if (!ok) throw std::invalid_argumen
 int grid(size_t n) { return int(std::min<size_t>((n + 255) / 256, 65535)); }
 template<class T> T *ptr(const Tensor &x) { return reinterpret_cast<T *>(x.data); }
 template<class T> __device__ float value(T x) { return float(x); }
-template<class Out, class In> __global__ void convert(const In *x, Out *y, size_t n) {
-    for (size_t i = size_t(blockIdx.x)*blockDim.x+threadIdx.x; i<n; i+=size_t(gridDim.x)*blockDim.x)
-        y[i] = Out(value(x[i]));
-}
 template<class T> __global__ void joinKernel(const T *x,const T *y,T *out,size_t n,int a,int b) {
     for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
         size_t row=i/(a+b); int col=i%(a+b);
@@ -351,13 +347,6 @@ Tensor Runtime::wanLinearFP32(const Tensor &x,const Tensor &w,const Tensor &bias
     check(cublasLtMatmul(state.handle,plan->op,&one,w.data,plan->a,x.data,plan->b,
         &zero,out.data,plan->c,out.data,plan->c,&plan->algorithm,state.workspace.data,state.workspace.bytes(),cudaStreamPerThread));
     return out;
-}
-Tensor Runtime::cast(const Tensor &x,bool full) {
-    if(x.fp32==full) return x;
-    Tensor out(x.rows,x.cols,full);
-    if(full) convert<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<B>(x),ptr<float>(out),x.size());
-    else convert<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(x),ptr<B>(out),x.size());
-    check(cudaGetLastError()); return out;
 }
 Tensor Runtime::patchConv2d(const Tensor &x,const Tensor &w,const Tensor &bias,int frames,int height,int width) {
     require(!x.fp32 && !w.fp32 && !bias.fp32 && frames>0 && height>0 && width>0 &&

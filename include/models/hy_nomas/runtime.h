@@ -36,6 +36,8 @@ public:
     Runtime(const Runtime &) = delete;
     Runtime &operator=(const Runtime &) = delete;
     Tensor upload(const float *values, int rows, int cols);
+    // Same precision returns a shared view; conversion stays on the inference stream.
+    Tensor cast(const Tensor &, bool fp32);
     std::vector<float> download(const Tensor &x);
     // Unpatchify selected PixelUMM frames and quantize on-device to THWC RGB8.
     std::vector<uint8_t> downloadPixelRGB(const Tensor &x, int width, int height,

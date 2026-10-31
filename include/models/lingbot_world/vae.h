@@ -11,8 +11,6 @@ public:
     explicit VAERuntime(int device, bool bf16 = false)
         : qwen_image::Runtime(device), low_(bf16 ? new nomas::Runtime(device, false) : nullptr) {}
     nomas::Runtime &convolutionRuntime() { return low_ ? *low_ : *this; }
-    nomas::Tensor cast(const nomas::Tensor &, bool full);
-    nomas::Tensor resize2x(const nomas::Tensor &, int height, int width);
     nomas::Tensor channelNorm(const nomas::Tensor &, const nomas::Tensor &weight);
     nomas::Tensor spatialAttention(const nomas::Tensor &queries, const nomas::Tensor &keys,
                                   const nomas::Tensor &values);

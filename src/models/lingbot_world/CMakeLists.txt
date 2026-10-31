@@ -26,3 +26,7 @@ add_executable(lingbot_world_test_pipeline_state EXCLUDE_FROM_ALL
     ${PROJECT_SOURCE_DIR}/test/lingbot_world/test_pipeline_state.cpp)
 target_link_libraries(lingbot_world_test_pipeline_state PRIVATE fastllm_lingbot)
 set_target_properties(lingbot_world_test_pipeline_state PROPERTIES CXX_STANDARD 17)
+add_executable(lingbot_world_test_shared_tensor_ops EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/test/lingbot_world/test_shared_tensor_ops.cpp)
+target_link_libraries(lingbot_world_test_shared_tensor_ops PRIVATE fastllm_lingbot)
+set_target_properties(lingbot_world_test_shared_tensor_ops PROPERTIES CXX_STANDARD 17)

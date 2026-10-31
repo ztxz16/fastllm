@@ -83,7 +83,7 @@ __global__ void im2col(const float *x, float *out, int h, int w, int c, int kern
         out[i] = (ih >= 0 && ih < h && iw >= 0 && iw < w) ? x[(size_t(ih) * w + iw) * c + channel] : 0.f;
     }
 }
-__global__ void upsample(const float *x, float *out, size_t n, int h, int w, int ic, int oc, int ft,
+template<class T> __global__ void upsample(const T *x, T *out, size_t n, int h, int w, int ic, int oc, int ft,
                          bool shortcut) {
     int repeats = oc * ft * 4 / ic;
     for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
@@ -192,9 +192,11 @@ Tensor Runtime::resize2x(const Tensor &x, int h, int w) { return duplicateUpsamp
 Tensor Runtime::duplicateUpsample(const Tensor &x, int h, int w, int channels, int ft) {
     if (x.rows != h * w || channels < 1 || (ft && (channels * ft * 4) % x.cols))
         throw std::invalid_argument("upsample shape");
-    Tensor out(h * w * 4, channels, true);
-    upsample<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(ptr(x), ptr(out), out.size(), h, w, x.cols,
-                                                                channels, std::max(ft, 1), ft != 0);
+    Tensor out(h * w * 4, channels, x.fp32);
+    if(x.fp32) upsample<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(
+        ptr(x), ptr(out), out.size(), h, w, x.cols, channels, std::max(ft, 1), ft != 0);
+    else upsample<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(
+        x.data, out.data, out.size(), h, w, x.cols, channels, std::max(ft, 1), ft != 0);
     check(cudaGetLastError());
     return out;
 }
