@@ -630,23 +630,32 @@ __global__ void CloverRotary(T *input, int heads, int dim,
 
 // Decode Q/gate split, Q/K RMSNorm and partial RoPE share one CTA per head.
 // Retain the 256-thread norm tree and every BF16 rounding boundary.
-template<typename T>
+template<typename T, bool Cached = false>
 __global__ void CloverPrepareAttention(const T *qgate, const T *key,
         const float *qWeight, const float *kWeight, T *query,
         T *normalizedKey, T *gate, int queryHeads, int keyHeads,
-        int rotaryDim, int position, float theta, float eps, int qkvStride, T *value) {
+        int rotaryDim, int position, float theta, float eps, int qkvStride, T *value,
+        CloverCudaAttentionCaches caches = {}) {
     DependencyStart();
     constexpr int dim = 256;
-    const int d = threadIdx.x, token = blockIdx.y;
+    const int d = threadIdx.x, token = blockIdx.y + blockIdx.z * gridDim.y;
     const bool isQuery = blockIdx.x < queryHeads;
     const int head = isQuery ? blockIdx.x : blockIdx.x - queryHeads;
     const size_t row = (size_t)token * (isQuery ? queryHeads : keyHeads) + head;
     const auto *source = isQuery
         ? qgate + (size_t)token * (qkvStride ? qkvStride : queryHeads * dim * 2) + head * dim * 2
         : key + (size_t)token * (qkvStride ? qkvStride : keyHeads * dim) + head * dim;
-    if (!isQuery && value) value[row * dim + d] = source[keyHeads * dim + d];
+    size_t keyRow = row;
+    int rotaryPosition = position + token;
+    if constexpr (Cached) {
+        rotaryPosition = caches.position[blockIdx.z] + blockIdx.y;
+        keyRow = (size_t)rotaryPosition * keyHeads + head;
+        normalizedKey = (T *)caches.key[blockIdx.z];
+        value = (T *)caches.value[blockIdx.z];
+    }
+    if (!isQuery && value) value[keyRow * dim + d] = source[keyHeads * dim + d];
     const auto *weight = isQuery ? qWeight : kWeight;
-    auto *destination = (isQuery ? query : normalizedKey) + row * dim;
+    auto *destination = isQuery ? query + row * dim : normalizedKey + keyRow * dim;
     __shared__ float scratch[8];
     __shared__ T normalized[dim];
     const float x = CloverFloat(source[d]);
@@ -656,7 +665,7 @@ __global__ void CloverPrepareAttention(const T *qgate, const T *key,
     __syncthreads();
     if (d >= rotaryDim) destination[d] = normalized[d];
     if (d < rotaryDim / 2) {
-        float phase = (position + token) * (1.f / powf(theta, 2.f * d / rotaryDim));
+        float phase = rotaryPosition * (1.f / powf(theta, 2.f * d / rotaryDim));
         FastllmRopePair<T, true>(normalized[d], normalized[d + rotaryDim / 2], cosf(phase), sinf(phase),
                                 destination[d], destination[d + rotaryDim / 2]);
     }
@@ -750,7 +759,22 @@ bool FastllmCudaCloverPrepareAttentionImpl(const void *qgate, const void *key, c
     return Launch<CloverPrepareAttention<T>>(dim3(queryHeads + keyHeads, tokens), 256, 0, Stream(stream),
         (const T *)qgate, (const T *)key, qWeight, kWeight,
         (T *)query, (T *)normalizedKey, (T *)gate,
-        queryHeads, keyHeads, rotaryDim, position, theta, eps, qkvStride, (T *)value);
+        queryHeads, keyHeads, rotaryDim, position, theta, eps, qkvStride, (T *)value, CloverCudaAttentionCaches{});
+}
+template<typename T>
+bool PrepareAttentionBatch(const void *qkv, const float *qWeight, const float *kWeight,
+        void *query, void *gate, int batch, int tokens, int queryHeads, int keyHeads,
+        int rotaryDim, float theta, float eps, const CloverCudaAttentionCaches &caches, void *stream) {
+    if (!qkv || !qWeight || !kWeight || !query || !gate || batch < 1 ||
+        batch > CloverCudaAttentionCaches::Capacity || tokens < 1 || tokens > 32 ||
+        queryHeads < 1 || keyHeads < 1 || rotaryDim < 2 || rotaryDim > 256 ||
+        rotaryDim % 2 || theta <= 0.f || eps <= 0.f) return false;
+    for (int b = 0; b < batch; ++b)
+        if (!caches.key[b] || !caches.value[b] || caches.position[b] < 0) return false;
+    return Launch<CloverPrepareAttention<T, true>>(dim3(queryHeads + keyHeads, tokens, batch),
+        256, 0, Stream(stream), (const T *)qkv, (const T *)qkv + queryHeads * 512,
+        qWeight, kWeight, (T *)query, (T *)nullptr, (T *)gate, queryHeads, keyHeads,
+        rotaryDim, 0, theta, eps, (queryHeads + keyHeads) * 512, (T *)nullptr, caches);
 }
 template<typename T>
 bool FastllmCudaCloverRouteImpl(const void *logits, int *indices, float *scores,
@@ -1118,6 +1142,16 @@ bool FastllmCudaCloverPrepareAttention(const void *qgate, const void *key, const
         int qkvStride, void *value, bool fp16) {
     return fp16 ? FastllmCudaCloverPrepareAttentionImpl<__half>(qgate, key, qWeight, kWeight, query, normalizedKey, gate, tokens, queryHeads, keyHeads, rotaryDim, position, theta, eps, stream, qkvStride, value)
                 : FastllmCudaCloverPrepareAttentionImpl<__nv_bfloat16>(qgate, key, qWeight, kWeight, query, normalizedKey, gate, tokens, queryHeads, keyHeads, rotaryDim, position, theta, eps, stream, qkvStride, value);
+}
+
+bool FastllmCudaCloverPrepareAttentionBatch(const void *qkv, const float *qWeight,
+        const float *kWeight, void *query, void *gate, int batch, int tokens,
+        int queryHeads, int keyHeads, int rotaryDim, float theta, float eps,
+        const CloverCudaAttentionCaches &caches, void *stream, bool fp16) {
+    return fp16 ? PrepareAttentionBatch<__half>(qkv, qWeight, kWeight, query, gate, batch,
+        tokens, queryHeads, keyHeads, rotaryDim, theta, eps, caches, stream)
+        : PrepareAttentionBatch<__nv_bfloat16>(qkv, qWeight, kWeight, query, gate, batch,
+        tokens, queryHeads, keyHeads, rotaryDim, theta, eps, caches, stream);
 }
 
 bool FastllmCudaCloverRoute(const void *logits, int *indices, float *scores,

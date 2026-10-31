@@ -5,6 +5,18 @@ import os
 import re
 
 
+def workspace_reserve(config, batch, width):
+    """Small batches retain MoE graphs; larger batches reuse eager scratch."""
+    graph_batch = min(batch, 32)  # CloverModel::MoeGraphs::MaxBatch
+    extra_rows = (batch - graph_batch) * width
+    # Two FP32 logits sets and the 16-bit head output may overlap. Include
+    # projections, routing and expert scratch; prefill runs one request at a time.
+    per_row = (12 * int(config["vocab_size"]) + 32 * int(config["hidden_size"]) +
+               4 * int(config["num_experts"]) + 4 * int(config["num_experts_per_tok"]) *
+               (int(config["hidden_size"]) + int(config["moe_intermediate_size"])))
+    return (graph_batch + 2) * (1 << 30) + extra_rows * per_row
+
+
 def prepare(args, config):
     """Reject settings that the native Clover implementation cannot honor."""
     if "enable_thinking" not in getattr(args, "_auto_explicit", ()):
@@ -39,8 +51,8 @@ def prepare(args, config):
         raise ValueError("Clover supports --speculative_algorithm clover or off")
     if args.low_gpu_mem or args.moe_experts > 0 or args.prefill_batch_tokens > 0:
         raise ValueError("Clover requires resident weights, the checkpoint expert count and serial prefill")
-    if args.max_batch > 8:
-        raise ValueError("Clover currently supports --max_batch up to 8")
+    if args.max_batch > 64:
+        raise ValueError("Clover currently supports --max_batch up to 64")
     args.max_batch = max(1, args.max_batch)
     if args.max_batch > 1 and "speculative_algorithm" in getattr(args, "_auto_explicit", ()) and not args.speculative_algorithm:
         raise ValueError("Clover batch generation requires self_speculative mode")
@@ -97,7 +109,9 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
     # KV capacity, and scratch/allocator reserve. This is a capacity estimate,
     # not a throughput prediction. Every active request owns independent caches.
     kv = math.ceil(context / 256) * 256 * kv_per_token
-    reserve = (args.max_batch + 2) * memory.GiB
+    reserve = workspace_reserve(config, args.max_batch, width)
+    # Keep the full-snapshot bound: mixed widths or a shrinking active batch
+    # can select the original layout even when compact records usually fit.
     snapshots = state * width if speculative else 0
     state *= args.max_batch
     snapshots *= args.max_batch

@@ -1,5 +1,6 @@
 #include "models/clover.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-linear-output.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdlib>
@@ -18,32 +19,38 @@ uint16_t Bf16(float value) {
     return bits >> 16;
 }
 void ProjectionPrecision() {
-    // FP16 inputs with large cancelling partial sums. FP16 accumulation can
-    // overflow even though every expected output is exactly representable.
-    for (int rows : {1, 2, 8, 16}) {
+    // Large cancelling partial sums detect reduced-precision accumulation.
+    // Cover full projections through 64 requests with a 16-token block.
+    auto encode = [](float x) { return fp16 ? __half_raw(__float2half_rn(x)).x : Bf16(x); };
+    for (int rows : {1, 2, 8, 16, 32, 64, 128, 512, 1024}) {
         constexpr int width = 512, columns = 16;
-        Data x(FLOAT16, {rows, width}), w(FLOAT16, {columns, width}), y(FLOAT16, {rows, columns});
+        const auto type = fp16 ? FLOAT16 : BFLOAT16;
+        Data x(type, {rows, width}), w(type, {columns, width}), y(type, {rows, columns});
         x.Allocate(); w.Allocate(); y.Allocate();
         for (int r = 0; r < rows; ++r) for (int d = 0; d < width; ++d)
-            ((uint16_t *)x.cpuData)[r * width + d] = __half_raw(__float2half_rn(d == width - 1 ? 1.f + (r % 4) * .25f : 1.f)).x;
+            ((uint16_t *)x.cpuData)[r * width + d] = encode(d == width - 1 ? 1.f + (r % 4) * .25f : 1.f);
         for (int c = 0; c < columns; ++c) for (int d = 0; d < width; ++d)
-            ((uint16_t *)w.cpuData)[c * width + d] = __half_raw(__float2half_rn((2048.f + c * 16) * (d < width / 2 ? 1.f : -1.f))).x;
+            ((uint16_t *)w.cpuData)[c * width + d] = encode((2048.f + c * 16) * (d < width / 2 ? 1.f : -1.f));
         for (auto *v : {&x, &w, &y}) v->ToDevice(DataDevice::CUDA, std::vector<int>{0});
-        Require(FastllmCudaHalfMatMulFloat16Fp32(x.cudaData, w.cudaData, y.cudaData, rows, width, columns), "FP16 FP32-accumulating projection");
+        if (fp16)
+            Require(FastllmCudaHalfMatMulFloat16Fp32(x.cudaData, w.cudaData, y.cudaData, rows, width, columns), "FP16 FP32-accumulating projection");
+        else
+            Linear(x, w, *GetEmptyData(), y);
         y.ToDevice(DataDevice::CPU);
         for (int r = 0; r < rows; ++r) for (int c = 0; c < columns; ++c) {
-            uint16_t expected = __half_raw(__float2half_rn(-(2048.f + c * 16) * (r % 4) * .25f)).x;
-            float value = __half2float(__half(__half_raw{((uint16_t *)y.cpuData)[r * columns + c]}));
-            Require(value == __half2float(__half(__half_raw{expected})), "projection lost FP32 accumulation");
+            uint16_t expected = encode(-(2048.f + c * 16) * (r % 4) * .25f);
+            auto actual = ((uint16_t *)y.cpuData)[r * columns + c];
+            Require(actual == expected || ((actual & 0x7fff) == 0 && (expected & 0x7fff) == 0),
+                    "projection lost FP32 accumulation");
         }
     }
 }
-void Populate(CloverModel &m, int seed) {
+void Populate(CloverModel &m, int seed, bool zeroHead = false, int maxPositions = 1024) {
     m.weight.dicts = {{"hidden_size", "512"}, {"num_hidden_layers", "1"},
         {"num_attention_heads", "1"}, {"num_key_value_heads", "1"},
         {"head_dim", "256"}, {"moe_intermediate_size", "128"},
         {"num_experts", "16"}, {"num_experts_per_tok", "4"},
-        {"max_position_embeddings", "1024"}, {"vocab_size", "128"},
+        {"max_position_embeddings", std::to_string(maxPositions)}, {"vocab_size", "128"},
         {"mask_token_id", "127"}, {"layer_types", "[\"full_attention\"]"}};
     m.InitParams();
     std::mt19937 rng(seed); std::normal_distribution<float> normal(0.f, .03f);
@@ -80,6 +87,43 @@ void Populate(CloverModel &m, int seed) {
 std::vector<unsigned char> Bytes(const Data &x) {
     Data host; host.CopyFrom(x); host.ToDevice(DataDevice::CPU);
     return {host.cpuData, host.cpuData + host.GetBytes()};
+}
+void FixedRowProjection() {
+    if (fp16 || FastllmCudaRuntimeArch() != 90) return;
+    std::mt19937 rng(1607); std::normal_distribution<float> normal;
+    for (int inner : {1024, 4096}) for (int rows : {64, 96, 128, 256, 288, 512, 1024}) {
+        const int columns = inner == 4096 ? 2048 : 1024;
+        Data x(BFLOAT16, {rows, inner}), w(BFLOAT16, {columns, inner}),
+            y(BFLOAT16, {rows, columns}), reference(BFLOAT16, {rows, columns});
+        for (auto *v : {&x, &w, &y, &reference}) {
+            v->Allocate();
+            for (uint64_t i = 0; i < v->Count(0); ++i) ((uint16_t *)v->cpuData)[i] = Bf16(normal(rng));
+            v->ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        }
+        auto serial = [&]() {
+            for (int row = 0; row < rows; row += 32) {
+                Data a(BFLOAT16, {32, inner}), b(BFLOAT16, {32, columns});
+                a.FakeFrom(x, size_t(row) * inner * 2); b.FakeFrom(reference, size_t(row) * columns * 2);
+                Linear(a, w, *GetEmptyData(), b);
+            }
+        };
+        auto combined = [&]() {
+            Require(FastllmCudaBFloat16LinearFixedRows(x, w, y), "fixed-row projection dispatch");
+        };
+        serial(); combined();
+        Require(Bytes(y) == Bytes(reference), "fixed-row projection changed reduction");
+        cudaGraph_t graph; cudaGraphExec_t executable;
+        Require(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) == cudaSuccess, "fixed-row capture begin");
+        combined();
+        Require(cudaStreamEndCapture(cudaStreamPerThread, &graph) == cudaSuccess, "fixed-row capture end");
+        Require(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0) == cudaSuccess, "fixed-row graph instantiate");
+        std::vector<uint16_t> fresh(x.Count(0)); for (auto &v : fresh) v = Bf16(normal(rng));
+        Require(cudaMemcpy(x.cudaData, fresh.data(), fresh.size() * 2, cudaMemcpyHostToDevice) == cudaSuccess, "fixed-row refreshed input");
+        serial();
+        Require(cudaGraphLaunch(executable, cudaStreamPerThread) == cudaSuccess, "fixed-row graph launch");
+        Require(Bytes(y) == Bytes(reference), "fixed-row graph changed reduction");
+        cudaGraphExecDestroy(executable); cudaGraphDestroy(graph);
+    }
 }
 std::vector<std::vector<unsigned char>> Run(int seed, bool graphs, bool busyPool) {
     setenv("FASTLLM_CUDA_GRAPH", graphs ? "1" : "0", 1);
@@ -178,6 +222,62 @@ std::vector<std::vector<unsigned char>> RunBatch(int seed, bool graphs, int batc
     return results;
 }
 
+void CacheGrowth() {
+    constexpr int limit = 2065, budget = 2304, width = 32;
+    CloverModel model; Populate(model, 23, false, limit);
+    using Cache = std::vector<std::pair<Data, Data>>;
+    std::vector<Cache> caches(3), reference(3);
+    std::vector<Cache *> ptrs, refs;
+    const int positions[] = {251, 1009, 2033};
+    const int capacities[] = {1024, 2048, budget};
+    std::vector<std::vector<int>> tokens(3, std::vector<int>(width));
+    for (int b = 0; b < 3; ++b) {
+        std::vector<int> prefix(positions[b]);
+        for (int i = 0; i < positions[b]; ++i) prefix[i] = (i * 7 + b * 13) % 127;
+        for (int i = 0; i < width; ++i) tokens[b][i] = (i * 3 + b * 11) % 127;
+        Data out; model.ForwardLogits(prefix, caches[b], false, out, true);
+        reference[b].resize(1);
+        reference[b][0].first.CopyFrom(caches[b][0].first);
+        reference[b][0].second.CopyFrom(caches[b][0].second);
+        reference[b][0].first.Expansion({budget, 1, 256});
+        reference[b][0].second.Expansion({budget, 1, 256});
+        ptrs.push_back(&caches[b]); refs.push_back(&reference[b]);
+    }
+    // Compare a growing cache against a pre-reserved cache with the same
+    // logical contents. Preview may grow storage but must not commit tokens.
+    std::vector<Data> actual, expected;
+    model.ForwardLogitsBatch(tokens, ptrs, true, actual);
+    model.ForwardLogitsBatch(tokens, refs, true, expected);
+    for (int b = 0; b < 3; ++b) {
+        Require(Bytes(actual[b]) == Bytes(expected[b]), "KV growth changed preview logits");
+        for (bool value : {false, true}) {
+            auto &a = value ? caches[b][0].second : caches[b][0].first;
+            auto &r = value ? reference[b][0].second : reference[b][0].first;
+            Require(a.dims[0] == positions[b] && a.expansionDims[0] == capacities[b], "KV growth capacity/logical length");
+            Require(Bytes(a) == Bytes(r), "KV growth changed committed prefix");
+        }
+    }
+    std::vector<CloverSnapshots> snapshots(3), referenceSnapshots(3);
+    std::vector<CloverSnapshots *> sp, rp;
+    for (int b = 0; b < 3; ++b) { sp.push_back(&snapshots[b]); rp.push_back(&referenceSnapshots[b]); }
+    model.ForwardLogitsBatch(tokens, ptrs, false, actual, sp);
+    model.ForwardLogitsBatch(tokens, refs, false, expected, rp);
+    for (int b = 0; b < 3; ++b) {
+        Require(Bytes(actual[b]) == Bytes(expected[b]), "KV growth changed verify logits");
+        int accepted = b == 0 ? 1 : b == 1 ? 16 : 32;
+        model.RestorePrefix(caches[b], snapshots[b], accepted);
+        model.RestorePrefix(reference[b], referenceSnapshots[b], accepted);
+        Require(Bytes(caches[b][0].first) == Bytes(reference[b][0].first) &&
+                Bytes(caches[b][0].second) == Bytes(reference[b][0].second), "KV growth rollback changed prefix");
+        if (positions[b] + accepted + 2 <= limit) {
+            Data a, r;
+            model.ForwardLogits({11, 19}, caches[b], false, a);
+            model.ForwardLogits({11, 19}, reference[b], false, r);
+            Require(Bytes(a) == Bytes(r), "KV growth continuation changed logits");
+        }
+    }
+}
+
 }
 int main(int argc, char **argv) {
     fp16 = argc > 1 && std::string(argv[1]) == "fp16";
@@ -187,7 +287,9 @@ int main(int argc, char **argv) {
     try {
         int count = 0; if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
         cudaSetDevice(0); SetThreads(2); SetDeviceMap({{"cuda:0", 1}}); SetCudaEmbedding(true);
-        if (fp16) ProjectionPrecision();
+        CacheGrowth();
+        ProjectionPrecision();
+        FixedRowProjection();
         for (int seed : {13, 29, 71}) {
             auto batched = RunBatch(seed, false);
             Require(RunBatch(seed, true) == batched, "batch graph replay differs from eager");
@@ -195,7 +297,7 @@ int main(int argc, char **argv) {
             Require(Run(seed, true, false) == eager, "graph replay differs from eager");
             Require(Run(seed, true, true) == eager, "capture-unavailable fallback differs from eager");
         }
-        for (int batch : {3, 4, 8})
+        for (int batch : {3, 4, 8, 9, 32, 50, 64})
             Require(RunBatch(13, true, batch) == RunBatch(13, false, batch), "larger batch graph replay differs from eager");
         restore();
         std::cout << "Clover MoE graphs: changing inputs/widths, model destruction, read-only preview KV, verification and capture fallback PASS" << std::endl;

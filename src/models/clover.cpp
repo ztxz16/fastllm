@@ -1,16 +1,18 @@
 #include "clover.h"
+#include "devices/cuda/fastllm-clover.h"
 #include "utils/hybrid_moe.h"
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <climits>
 #include <stdexcept>
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include <cuda_runtime.h>
-#include "devices/cuda/fastllm-clover.h"
 #include "devices/cuda/fastllm-cuda-norm.h"
 #include "devices/cuda/fastllm-moe.h"
+#include "devices/cuda/fastllm-cuda-linear-output.h"
 #endif
 
 namespace fastllm {
@@ -19,6 +21,16 @@ void Check(bool condition, const char *message) {
     if (!condition) throw std::runtime_error(std::string("Clover: ") + message);
 }
 #ifdef USE_CUDA
+int CloverAttentionCapacity(int required, int limit) {
+    Check(required > 0 && required <= limit, "invalid attention capacity");
+    // Amortize contiguous KV growth without reserving the entire context.
+    // Keep small histories compact and never exceed the existing 256-aligned
+    // context budget used by --auto. Logical lengths still advance separately.
+    const int64_t quantum = required <= 256 ? 256 : 1024;
+    const int64_t wanted = (int64_t(required) + quantum - 1) / quantum * quantum;
+    const int64_t budget = std::min<int64_t>(INT_MAX, (int64_t(limit) + 255) / 256 * 256);
+    return int(std::min(wanted, budget));
+}
 void PrepareCloverData(Data &data, DataType type, const std::vector<int> &dims, int device, bool zero = false) {
     data.dataType = type;
     data.UpdateUnitSize();
@@ -50,6 +62,9 @@ std::string Layer(int i) { return "model.layers." + std::to_string(i) + "."; }
 // joins its worker, before the resident weights are destroyed.
 struct CloverModel::MoeGraphs {
 #ifdef USE_CUDA
+    // Bound retained graph workspaces; larger request batches keep the eager
+    // fallback. This is a graph memory policy, not a request admission limit.
+    static constexpr int MaxBatch = 32;
     struct Entry {
         Data input, output;
         void *graph = nullptr, *executable = nullptr;
@@ -431,7 +446,7 @@ void CloverModel::FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
         dst.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice});
         int required = position + t;
         if (dst.expansionDims.empty() || dst.expansionDims[0] < required)
-            dst.Expansion({(required + 255) / 256 * 256, num_key_value_heads, head_dim});
+            dst.Expansion({CloverAttentionCapacity(required, max_positions), num_key_value_heads, head_dim});
         CatDirect(dst, src, 0);
     };
     append(cache.first, kn); append(cache.second, v);
@@ -456,6 +471,57 @@ void CloverModel::FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
     y.Reshape({t, num_attention_heads * head_dim});
 #endif
 }
+void CloverModel::FullAttentionCoreBatch(Data &projected, int layer,
+        const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+        const std::vector<int> &positions, int width, bool preview, Data &output) {
+#ifdef USE_CUDA
+    const int batch = caches.size(), rows = batch * width;
+    const std::string p = Layer(layer) + "self_attn.";
+    auto &qw = weight[p + "q_norm.weight"], &kw = weight[p + "k_norm.weight"];
+    Check(qw.dataType == FLOAT32 && kw.dataType == FLOAT32 &&
+        qw.Count(0) == head_dim && kw.Count(0) == head_dim, "invalid Q/K normalization weights");
+    Check(projected.dims.back() == (num_attention_heads + num_key_value_heads) * head_dim * 2,
+          "invalid batched attention projection");
+    CloverCudaAttentionCaches table;
+    for (int b = 0; b < batch; ++b) {
+        auto &cache = (*caches[b])[layer];
+        const int required = positions[b] + width;
+        for (auto *dst : {&cache.first, &cache.second}) {
+            dst->dataType = dataType; dst->UpdateUnitSize();
+            dst->ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice});
+            if (dst->expansionDims.empty() || dst->expansionDims[0] < required)
+                dst->Expansion({CloverAttentionCapacity(required, max_positions), num_key_value_heads, head_dim});
+        }
+        table.key[b] = cache.first.cudaData; table.value[b] = cache.second.cudaData;
+        table.position[b] = positions[b];
+    }
+    Data query, gate, workspace;
+    PrepareCloverData(query, dataType, {rows, num_attention_heads, head_dim}, cudaDevice);
+    PrepareCloverData(gate, dataType, query.dims, cudaDevice);
+    Check(FastllmCudaCloverPrepareAttentionBatch(projected.cudaData, (float *)qw.cudaData,
+        (float *)kw.cudaData, query.cudaData, gate.cudaData, batch, width, num_attention_heads,
+        num_key_value_heads, rotary_dim, ropeTheta, rms_norm_eps, table, nullptr, dataType == FLOAT16),
+        "batch attention preparation failed");
+    size_t bytes = FastllmCudaCloverAttentionBatchWorkspaceBytes(batch, width,
+        num_attention_heads, num_key_value_heads, table);
+    Check(bytes && (bytes + 3) / 4 <= INT_MAX, "invalid batch attention workspace");
+    PrepareCloverData(workspace, INT32, {int((bytes + 3) / 4)}, cudaDevice);
+    Check(FastllmCudaCloverAttentionBatch(query.cudaData, output.cudaData, batch, width,
+        num_attention_heads, num_key_value_heads, table, preview, workspace.cudaData,
+        nullptr, dataType == FLOAT16), "batch attention dispatch failed");
+    // Preparation touched only spare tail storage. Preview never changes the
+    // logical lengths, and verification publishes each request's own length.
+    if (!preview) for (int b = 0; b < batch; ++b) {
+        auto &cache = (*caches[b])[layer];
+        cache.first.Resize({positions[b] + width, num_key_value_heads, head_dim});
+        cache.second.Resize(cache.first.dims);
+    }
+    output.Reshape(query.dims);
+    SigmoidMulTo(output, gate);
+    output.Reshape({rows, num_attention_heads * head_dim});
+#endif
+}
+
 void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool graphAllowed, int batch) {
 #ifdef USE_CUDA
     const int t = input.dims[0];
@@ -518,7 +584,9 @@ void CloverModel::Moe(Data &input, int layer, bool preview, Data &output, bool g
               "experts failed");
     };
     const int width = t / batch;
-    if (hostExperts[layer] || !graphAllowed || batch > 8 || width < 4 || width > blockSize || blockSize % width ||
+    if (batch > MoeGraphs::MaxBatch && moeGraphs && !moeGraphs->entries.empty() &&
+        !FastllmCudaGraphIsCapturingFast()) moeGraphs->SetRows(t, batch);
+    if (hostExperts[layer] || !graphAllowed || batch > MoeGraphs::MaxBatch || width < 4 || width > blockSize || blockSize % width ||
         FastllmCudaGraphIsCapturingFast()) {
         eager(input, output);
         return;
@@ -638,7 +706,7 @@ void CloverModel::ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens
         bool preview, std::vector<Data> &logits,
         const std::vector<CloverSnapshots *> &snapshots) {
     const int batch = tokens.size();
-    Check(batch >= 2 && batch <= 8 && caches.size() == tokens.size(), "invalid request batch size");
+    Check(batch >= 2 && batch <= CloverCudaGdnCaches::Capacity && caches.size() == tokens.size(), "invalid request batch size");
     const int width = tokens[0].size(), rows = batch * width;
     Check(width > 0 && width <= blockSize && blockSize % width == 0, "invalid batch block width");
     Check(snapshots.empty() || (!preview && snapshots.size() == tokens.size()), "invalid batch snapshots");
@@ -680,22 +748,6 @@ void CloverModel::ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens
     ToDataType(hidden, dataType);
     hidden.ToDevice(DataDevice::CUDA, std::vector<int>{cudaDevice});
     hidden.Reshape({rows, embed_dim});
-    auto project = [&](Data &input, Data &matrix, Data &output) {
-        if (rows <= 32) {
-            CloverLinear(input, matrix, *GetEmptyData(), output);
-            return;
-        }
-        // Larger M selects a different BF16 reduction. Preserve the validated
-        // M=16/32 dispatch while writing into one combined allocation.
-        PrepareCloverData(output, dataType, {rows, matrix.dims[0]}, cudaDevice);
-        for (int row = 0; row < rows; row += 32) {
-            const int count = std::min(32, rows - row);
-            Data x(dataType, {count, input.dims.back()}), y(dataType, {count, matrix.dims[0]});
-            x.FakeFrom(input, (size_t)row * input.dims.back() * sizeof(uint16_t));
-            y.FakeFrom(output, (size_t)row * matrix.dims[0] * sizeof(uint16_t));
-            CloverLinear(x, matrix, *GetEmptyData(), y);
-        }
-    };
     for (int layer = 0; layer < block_cnt; ++layer) {
         Data attention, post, moe;
         if (layer == 0) Norm(hidden, Layer(layer) + "input_layernorm.weight", norm);
@@ -706,9 +758,9 @@ void CloverModel::ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens
         Data projected, attended;
         PrepareCloverData(attended, dataType, {rows, attentionDim}, cudaDevice);
         if (linearLayers[layer])
-            project(norm, weight[p + "fused_in_proj.weight"], projected);
+            CloverLinear(norm, weight[p + "fused_in_proj.weight"], *GetEmptyData(), projected);
         else
-            project(norm, weight[p + "qkv_proj.weight"], projected);
+            CloverLinear(norm, weight[p + "qkv_proj.weight"], *GetEmptyData(), projected);
         if (linearLayers[layer]) {
             std::pair<Data, Data> *cachePointers[CloverCudaGdnCaches::Capacity],
                                   *snapshotPointers[CloverCudaGdnCaches::Capacity];
@@ -718,16 +770,22 @@ void CloverModel::ForwardLogitsBatch(const std::vector<std::vector<int>> &tokens
             }
             GdnCoreBatch(projected, layer, cachePointers, batch, preview, attended,
                 snapshots.empty() ? nullptr : snapshotPointers);
-        } else {
-            for (int b = 0; b < batch; ++b) {
-                Data input(dataType, {width, projected.dims.back()}), output(dataType, {width, attentionDim});
-                input.FakeFrom(projected, (size_t)b * width * projected.dims.back() * sizeof(uint16_t));
-                output.FakeFrom(attended, (size_t)b * width * attentionDim * sizeof(uint16_t));
-                Data k, v;
-                FullAttentionCore(input, k, v, layer, (*caches[b])[layer], positions[b], preview, output);
+        } else
+            FullAttentionCoreBatch(projected, layer, caches, positions, width, preview, attended);
+        // Preserve the output projection's reduction geometry: its wider
+        // inner dimension is sensitive to a different split-K summation tree.
+        // Input projections above still amortize launches over the whole batch.
+        auto &outWeight = weight[p + (linearLayers[layer] ? "out_proj.weight" : "o_proj.weight")];
+        PrepareCloverData(attention, dataType, {rows, embed_dim}, cudaDevice);
+        if (!FastllmCudaBFloat16LinearFixedRows(attended, outWeight, attention)) {
+            for (int start = 0; start < rows; start += 32) {
+                int count = std::min(32, rows - start);
+                Data input(dataType, {count, attentionDim}), output(dataType, {count, embed_dim});
+                input.FakeFrom(attended, (size_t)start * attentionDim * sizeof(uint16_t));
+                output.FakeFrom(attention, (size_t)start * embed_dim * sizeof(uint16_t));
+                CloverLinear(input, outWeight, *GetEmptyData(), output);
             }
         }
-        project(attended, weight[p + (linearLayers[layer] ? "out_proj.weight" : "o_proj.weight")], attention);
         if (moeGraphs && moeGraphs->enabled && moeGraphs->rows == rows && moeGraphs->batch == batch &&
             !FastllmCudaGraphIsCapturingFast()) {
             auto found = moeGraphs->entries.find({layer, preview});

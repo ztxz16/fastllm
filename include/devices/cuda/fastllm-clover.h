@@ -9,11 +9,21 @@
 // its own cache allocation and [T,...] snapshots; no state gather/scatter is
 // needed. Null snapshot entries disable snapshots for that request.
 struct CloverCudaGdnCaches {
-    static constexpr int Capacity = 8;
+    // 2 KiB of pointers leaves room for the other arguments under the 4 KiB
+    // kernel-parameter limit of older CUDA architectures.
+    static constexpr int Capacity = 64;
     void *conv[Capacity] = {};
     float *state[Capacity] = {};
     void *convSnapshots[Capacity] = {};
     float *stateSnapshots[Capacity] = {};
+};
+
+// Separate NHD allocations and committed lengths for each request. Preparation
+// writes only the appended block; preview leaves the committed prefix intact.
+struct CloverCudaAttentionCaches {
+    static constexpr int Capacity = CloverCudaGdnCaches::Capacity;
+    void *key[Capacity] = {}, *value[Capacity] = {};
+    int position[Capacity] = {};
 };
 
 // Clover preview reads committed history without modifying it. Activations and
@@ -83,6 +93,10 @@ bool FastllmCudaCloverPrepareAttention(const void *qgate, const void *key, const
     const float *kWeight, void *query, void *normalizedKey, void *gate, int tokens,
     int queryHeads, int keyHeads, int rotaryDim, int position, float theta, float eps,
     void *stream = nullptr, int qkvStride = 0, void *value = nullptr, bool fp16 = false);
+bool FastllmCudaCloverPrepareAttentionBatch(const void *qkv, const float *qWeight,
+    const float *kWeight, void *query, void *gate, int batch, int tokens,
+    int queryHeads, int keyHeads, int rotaryDim, float theta, float eps,
+    const CloverCudaAttentionCaches &caches, void *stream = nullptr, bool fp16 = false);
 
 // Stable expert-id tie breaking. Scratch: [B,T,K] INT32 ids and FP32 scores,
 // plus [B,E] byte mask; only needed for preview coreset filtering.
@@ -119,5 +133,10 @@ bool FastllmCudaCloverAttention(const void *query, const void *key,
     const void *value, void *output, int tokens, int cachedTokens,
     int heads, int kvHeads, bool preview, void *stream = nullptr,
     void *workspace = nullptr, bool fp16 = false);
+std::size_t FastllmCudaCloverAttentionBatchWorkspaceBytes(int batch, int tokens,
+    int heads, int kvHeads, const CloverCudaAttentionCaches &caches);
+bool FastllmCudaCloverAttentionBatch(const void *query, void *output, int batch,
+    int tokens, int heads, int kvHeads, const CloverCudaAttentionCaches &caches,
+    bool preview, void *workspace, void *stream = nullptr, bool fp16 = false);
 
 #endif

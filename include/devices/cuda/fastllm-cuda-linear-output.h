@@ -5,6 +5,11 @@ bool FastllmCudaTryCompactBFloat16Weight(const fastllm::Data &source, fastllm::D
 // BF16 operands, FP32 accumulation and FP32 logits (no output rounding to BF16).
 bool FastllmCudaBFloat16LinearFloat32(const fastllm::Data &input, const fastllm::Data &weight,
                                      fastllm::Data &output);
+// Combine adjacent 32-row BF16 projections using the same Lt algorithm and
+// FP32 split-K reduction. Unsupported shapes/architectures retain the caller's
+// ordinary Linear loop. Output must already own enough CUDA storage.
+bool FastllmCudaBFloat16LinearFixedRows(const fastllm::Data &input,
+    const fastllm::Data &weight, fastllm::Data &output);
 // Pack one or two immutable FP32 matrices only when every value is exactly BF16.
 // Preparation is eager-only; the owned packed allocation must outlive captured graphs.
 bool FastllmCudaTryPackBFloat16Weights(const fastllm::Data &first,

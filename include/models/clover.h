@@ -97,6 +97,9 @@ private:
         bool preview, Data &normalized, std::pair<Data, Data> *const *snapshots);
     void FullAttentionCore(Data &qgate, Data &k, Data &v, int layer,
         std::pair<Data, Data> &cache, int position, bool preview, Data &output);
+    void FullAttentionCoreBatch(Data &projected, int layer,
+        const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+        const std::vector<int> &positions, int width, bool preview, Data &output);
     void Moe(Data &input, int layer, bool preview, Data &output, bool graphAllowed, int batch = 1);
 };
 }

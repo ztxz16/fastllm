@@ -1,4 +1,5 @@
 #include "clover.h"
+#include "devices/cuda/fastllm-clover.h"
 #include "utils/recurrent_prefix_cache.h"
 #include <cmath>
 #include <iostream>
@@ -6,7 +7,6 @@
 #include <stdexcept>
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
-#include "devices/cuda/fastllm-clover.h"
 #endif
 
 namespace fastllm {
@@ -312,6 +312,7 @@ void CloverModel::ConfigureClover(const json11::Json &j) {
 void CloverModel::ValidateRequest(const std::vector<int> &tokens, const GenerationConfig &c,
         const CloverOptions &o) const {
     const int capacity = contextPlan.configured ? contextPlan.effectiveLength : max_positions;
+    Require(maxBatch <= CloverCudaGdnCaches::Capacity, "max_batch exceeds the Clover cache capacity (64)");
     Require(maxBatch <= 1 || o.speculative, "batch generation currently requires self_speculative mode");
     Require(maxBatch <= 1 || o.width >= 16, "batch generation requires block_size 16 or 32");
     Require(!tokens.empty(), "empty prompt");
@@ -495,7 +496,7 @@ std::vector<int> CloverModel::Step(ResponseContext &ctx, Request &r) {
 std::vector<std::vector<int>> CloverModel::StepBatch(const std::vector<ResponseContext *> &contexts,
         const std::vector<std::shared_ptr<Request>> &batch) {
     const int size = contexts.size();
-    Require(size >= 2 && size <= 8 && batch.size() == contexts.size(), "invalid active request batch");
+    Require(size >= 2 && size <= CloverCudaGdnCaches::Capacity && batch.size() == contexts.size(), "invalid active request batch");
     const int capacity = contextPlan.configured ? contextPlan.effectiveLength : max_positions;
     std::vector<std::vector<int>> candidates(size), output(size);
     std::vector<std::vector<std::pair<Data, Data>> *> caches;
@@ -557,7 +558,7 @@ void CloverModel::RunModelSpecificScheduler() {
         std::vector<int> handles, aborted;
         for (const auto &entry : responseContextDict.dicts) {
             if (entry.second->isAbort) aborted.push_back(entry.first);
-            else if (!entry.second->isEnding && contexts.size() < (size_t)std::max(1, std::min(8, maxBatch))) {
+            else if (!entry.second->isEnding && contexts.size() < (size_t)std::max(1, std::min(CloverCudaGdnCaches::Capacity, maxBatch))) {
                 handles.push_back(entry.first); contexts.push_back(entry.second);
                 batch.push_back(requests.at(entry.second));
             }

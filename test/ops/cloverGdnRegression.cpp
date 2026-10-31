@@ -452,6 +452,93 @@ void AttentionPreparation(int tokens, int qh, int kh, int rotaryDim, int positio
     Check(cudaGraphLaunch(executable, cudaStreamPerThread)); check();
     Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
 }
+void AttentionPreparationBatch(int batch, int tokens) {
+    constexpr int qh = 16, kh = 2, stride = (qh + kh) * 512;
+    const size_t qsize = size_t(batch) * tokens * qh * 256;
+    std::mt19937 rng(1781 + batch + tokens);
+    std::normal_distribution<float> normal(0.f, .7f);
+    std::vector<uint16_t> input(size_t(batch) * tokens * stride);
+    std::vector<float> qw(256), kw(256);
+    for (auto &x : qw) x = normal(rng);
+    for (auto &x : kw) x = normal(rng);
+    Buffer x(input.size() * 2), wq(1024), wk(1024), q(qsize * 2), gate(qsize * 2),
+        refQ(qsize * 2), refGate(qsize * 2);
+    wq.Put(qw); wk.Put(kw);
+    CloverCudaAttentionCaches table;
+    std::vector<std::unique_ptr<Buffer>> keys, values;
+    std::vector<size_t> lengths;
+    for (int b = 0; b < batch; ++b) {
+        table.position[b] = b % 3 ? 4093 + b * 7 : 0;
+        lengths.push_back(size_t(table.position[b] + tokens + 3) * kh * 256);
+        keys.emplace_back(new Buffer(lengths.back() * 2));
+        values.emplace_back(new Buffer(lengths.back() * 2));
+        keys.back()->Put(std::vector<uint16_t>(lengths.back(), Round16(123.f)));
+        values.back()->Put(std::vector<uint16_t>(lengths.back(), Round16(123.f)));
+        table.key[b] = keys.back()->p; table.value[b] = values.back()->p;
+    }
+    auto launch = [&]() {
+        Require(FastllmCudaCloverPrepareAttentionBatch(x.p, (float *)wq.p, (float *)wk.p,
+            q.p, gate.p, batch, tokens, qh, kh, 64, 1.e7f, 1.e-6f, table, nullptr, fp16),
+            "batched attention preparation launch");
+    };
+    auto check = [&]() {
+        for (int b = 0; b < batch; ++b) {
+            size_t offset = size_t(b) * tokens * qh * 256, count = size_t(tokens) * kh * 256;
+            auto *source = (uint16_t *)x.p + size_t(b) * tokens * stride;
+            Buffer k(count * 2), v(count * 2);
+            Require(FastllmCudaCloverPrepareAttention(source, source + qh * 512, (float *)wq.p,
+                (float *)wk.p, (uint16_t *)refQ.p + offset, k.p, (uint16_t *)refGate.p + offset,
+                tokens, qh, kh, 64, table.position[b], 1.e7f, 1.e-6f, nullptr, stride, v.p, fp16),
+                "serial attention preparation reference");
+            for (bool value : {false, true}) {
+                auto expected = (value ? v : k).Get<uint16_t>(count);
+                auto actual = (value ? values[b] : keys[b])->Get<uint16_t>(lengths[b]);
+                size_t first = size_t(table.position[b]) * kh * 256;
+                for (size_t i = 0; i < actual.size(); ++i)
+                    Require(actual[i] == (i >= first && i < first + count ? expected[i - first] : Round16(123.f)),
+                            "batched attention KV write or prefix/tail guard differs");
+            }
+        }
+        Require(q.Get<uint16_t>(qsize) == refQ.Get<uint16_t>(qsize), "batched attention query differs");
+        Require(gate.Get<uint16_t>(qsize) == refGate.Get<uint16_t>(qsize), "batched attention gate differs");
+        Require(x.Get<uint16_t>(input.size()) == input, "batched attention changed projection");
+        size_t bytes = FastllmCudaCloverAttentionBatchWorkspaceBytes(batch, tokens, qh, kh, table);
+        Require(bytes > 0, "batched attention workspace size");
+        Buffer workspace(bytes), output(qsize * 2), reference(qsize * 2);
+        for (bool preview : {false, true}) {
+            auto attend = [&]() {
+                Require(FastllmCudaCloverAttentionBatch(q.p, output.p, batch, tokens, qh, kh,
+                    table, preview, workspace.p, nullptr, fp16), "batched attention launch");
+            };
+            attend();
+            for (int b = 0; b < batch; ++b) {
+                size_t offset = size_t(b) * tokens * qh * 256;
+                Require(FastllmCudaCloverAttention((uint16_t *)q.p + offset, table.key[b],
+                    table.value[b], (uint16_t *)reference.p + offset, tokens, table.position[b],
+                    qh, kh, preview, nullptr, workspace.p, fp16), "serial attention reference");
+            }
+            Require(output.Get<uint16_t>(qsize) == reference.Get<uint16_t>(qsize),
+                    "batched attention changed split-KV arithmetic");
+            cudaGraph_t graph; cudaGraphExec_t executable;
+            Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); attend();
+            Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+            Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+            Check(cudaGraphLaunch(executable, cudaStreamPerThread));
+            Require(output.Get<uint16_t>(qsize) == reference.Get<uint16_t>(qsize), "batched attention graph differs");
+            Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
+        }
+    };
+    for (auto &v : input) v = Round16(normal(rng));
+    x.Put(input); launch(); check();
+    cudaGraph_t graph; cudaGraphExec_t executable;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)); launch();
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    for (auto &v : input) v = Round16(normal(rng));
+    x.Put(input); Check(cudaGraphLaunch(executable, cudaStreamPerThread)); check();
+    Check(cudaGraphExecDestroy(executable)); Check(cudaGraphDestroy(graph));
+}
+
 void Preview(int batch, int tokens, int kh, int vh, bool masked) {
     std::mt19937 rng(42 + tokens); std::normal_distribution<float> normal(0.f, .2f);
     auto random = [&](size_t n) { std::vector<uint16_t> x(n); for (auto &v : x) v = Round16(normal(rng)); return x; };
@@ -676,9 +763,12 @@ int main(int argc, char **argv) {
     try {
         int count = 0; if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
         Check(cudaSetDevice(0));
+        for (int batch : {2, 3, 32, 64}) for (int tokens : {1, 16, 32})
+            AttentionPreparationBatch(batch, tokens);
         for (int tokens : {1, 16, 65}) for (int cached : {0, 137, 513})
             for (bool preview : {false, true}) Attention(tokens, cached, preview);
-        for (int batch : {2, 3, 8}) for (int tokens : {1, 16, 32}) IndirectCaches(batch, tokens);
+        for (int batch : {2, 3, 8, 9, 50, CloverCudaGdnCaches::Capacity})
+            for (int tokens : {1, 16, 32}) IndirectCaches(batch, tokens);
         for (int tokens : {1, 2, 3, 127, 128, 129}) Convolution(2, tokens, 2048);
         Convolution(2, 129, 2051);
         Convolution(2, 129, 2047);

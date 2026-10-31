@@ -1132,6 +1132,31 @@ bool FastllmCudaHalfMatMulBFloat16(const fastllm::Data &input, fastllm::Data &we
 }
 
 // BF16 input × BF16 weight -> BF16 output
+bool FastllmCudaBFloat16LinearFixedRows(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output) {
+    auto dense = [](const fastllm::Data &x) {
+        return x.dataType == fastllm::BFLOAT16 && x.dataDevice == fastllm::CUDA &&
+            x.cudaData && x.dims.size() == 2 && x.strides.size() == 2 &&
+            x.dims[0] > 0 && x.dims[1] > 0 && x.strides[1] == 1 &&
+            x.strides[0] == (uint64_t)x.dims[1] && !x.multiDeviceData;
+    };
+    if (!dense(input) || !dense(weight) || !dense(output) ||
+        input.dataDeviceIds != weight.dataDeviceIds || input.dataDeviceIds != output.dataDeviceIds ||
+        input.dims[1] != weight.dims[1] || output.dims[0] != input.dims[0] ||
+        output.dims[1] != weight.dims[0] || input.dims[0] <= 32 || input.dims[0] % 32 ||
+        input.dims[1] < 1024 || weight.dims[0] < 1024 || input.dims[1] % 4 || weight.dims[0] % 4 ||
+        output.cudaData == input.cudaData || output.cudaData == weight.cudaData ||
+        FastllmCudaRuntimeArch() != 90) return false;
+    const int rows = input.dims[0], in = input.dims[1], out = weight.dims[0];
+    // The shared Lt workspace is bounded at 8 MiB. Larger inputs are covered
+    // in 256-row groups, without retaining another per-layer allocation.
+    for (int row = 0; row < rows; row += 256)
+        if (!fastllm_bf16_lt::Matmul((const uint16_t *)input.cudaData + size_t(row) * in,
+                weight.cudaData, (uint16_t *)output.cudaData + size_t(row) * out,
+                std::min(256, rows - row), in, out, CUDA_R_16BF, 32)) return false;
+    return true;
+}
+
 bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaBF16EnsureBiasOnDevice(weight, bias, k);
     FastllmCudaBF16EnsureBiasBf16OnDevice(weight, bias, k);

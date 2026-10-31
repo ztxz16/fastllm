@@ -25,7 +25,9 @@ class CloverAutoTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.config = dict(model_type="clover_moe", block_size=32,
             max_position_embeddings=131072, layer_types=["linear_attention"] * 30 + ["full_attention"] * 10,
-            linear_num_key_heads=16, linear_num_value_heads=32, num_key_value_heads=2, head_dim=256)
+            linear_num_key_heads=16, linear_num_value_heads=32, num_key_value_heads=2, head_dim=256,
+            hidden_size=2048, moe_intermediate_size=512, shared_expert_intermediate_size=512,
+            num_experts=256, num_experts_per_tok=8, vocab_size=248320)
         (Path(self.temp.name) / "config.json").write_text(json.dumps(self.config))
         self.weights = [hybrid_auto.Tensor("model.layers.0.mlp.experts.gate_up_proj", (), 65 << 30, "BF16")]
 
@@ -91,6 +93,27 @@ class CloverAutoTest(unittest.TestCase):
         self.assertEqual(args.tokens, 4096)
         self.assertEqual(args.chunked_prefill_size, 512)
 
+    def test_large_batch_keeps_full_cache_budget(self):
+        single = self.resolve(self.args("--max_context_length", "4096"))
+        for size in (9, 16, 32, 50, 64):
+            with self.subTest(size=size):
+                args = self.args("--max_batch", str(size), "--max_context_length", "4096")
+                with patch.object(hybrid_auto, "inventory", return_value=(self.config, self.weights)), redirect_stdout(io.StringIO()):
+                    result = auto_config.resolve(args, lambda d: dict(free=256 << 30, total=256 << 30),
+                        hardware=({0: {"capability": 90}}, {}), ram=dict(total=512 << 30, available=400 << 30))
+                for key in ("recurrent_state_bytes", "snapshot_bytes", "kv_bytes"):
+                    self.assertEqual(result[key], size * single[key])
+        short = self.resolve(self.args("--max_batch", "32", "--max_context_length", "4096",
+                                       "--gpu_mem_ratio", "0.98"))
+        self.assertLess(short["estimated_gpu_bytes"], 140 << 30)
+        # Larger runs can drain through a 32-request MoE graph batch. Account
+        # for those retained allocations even while their peak batch is eager.
+        with self.assertRaisesRegex(ValueError, "one CUDA"):
+            self.resolve(self.args("--max_batch", "50", "--max_context_length", "4096",
+                                   "--gpu_mem_ratio", "0.98"))
+        with self.assertRaisesRegex(ValueError, "one CUDA"):
+            self.resolve(self.args("--max_batch", "50", "--gpu_mem_ratio", "0.98"))
+
     def test_insufficient_memory_is_transactional(self):
         args = self.args(); original = copy.deepcopy(vars(args))
         with self.assertRaisesRegex(ValueError, "one CUDA"):
@@ -98,7 +121,7 @@ class CloverAutoTest(unittest.TestCase):
         self.assertEqual(vars(args), original)
 
     def test_unsupported_settings_fail_before_loading(self):
-        for options in (("--dtype", "int8"), ("--max_batch", "9"),
+        for options in (("--dtype", "int8"), ("--max_batch", "65"),
                         ("--max_context_length", "131073"), ("--speculative_num_draft_tokens", "7"),
                         ("--device", "cuda:0,1"),
                         ("--max_batch", "2", "--speculative_num_draft_tokens", "8")):
