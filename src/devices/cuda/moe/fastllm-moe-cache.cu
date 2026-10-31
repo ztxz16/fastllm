@@ -1241,6 +1241,45 @@ void WaitCacheAdmission(const DeviceCache &cache) {
         capture == cudaStreamCaptureStatusActive ? cudaEventWaitExternal : cudaEventWaitDefault));
 }
 
+// Populate a complete uniform native group before publishing residency.
+// Allocating slots alone leaves cold experts on the CPU until admitted.
+void PreloadCompleteNativeCache(OffloadGroup &group, DeviceCache &cache) {
+    if (!group.layout.planarMxfp4 || !group.cpuDecodeReady || !cache.admissionDone ||
+        size_t(cache.slots) != group.totalRecords || !group.layerLayouts.empty() ||
+        !group.expertDevices.empty() || !group.sharedLayout.shards || group.sharedLayout.auxiliaryBytes)
+        return;
+    const auto &shared = group.sharedLayout;
+    const size_t bytes = size_t(shared.sourceBytes[0]) + shared.sourceBytes[1];
+    auto &scratch = cache.frequencyUpload;
+    scratch.dataType = fastllm::INT8;
+    scratch.Resize({int(bytes)});
+    scratch.ToDevice(fastllm::CUDA, {cache.device}, false);
+    scratch.Allocate(false);
+    std::vector<int32_t> changes(2 * cache.slots);
+    for (int key = 0; key < cache.slots; ++key) {
+        fastllm::AssertInFastLLM(fastllm::cuda::UploadSharedExpertRecord(shared,
+            group.numaPointers.data() + size_t(key) * 2 * shared.shards,
+            static_cast<uint8_t *>(scratch.cudaData), scratch.expansionBytes,
+            cache.records + size_t(key) * group.layout.recordStride, cudaStreamPerThread),
+            "MoE full-resident initial upload failed.");
+        changes[key] = changes[cache.slots + key] = key;
+    }
+    auto &metadata = cache.prefillChanges;
+    metadata.dataType = fastllm::INT32;
+    metadata.Resize({2, cache.slots});
+    metadata.ToDevice(fastllm::CUDA, {cache.device}, false);
+    metadata.Allocate(false);
+    checkCudaErrors("MoE full-resident metadata", cudaMemcpyAsync(metadata.cudaData,
+        changes.data(), changes.size() * sizeof(int32_t), cudaMemcpyHostToDevice, cudaStreamPerThread));
+    PublishCacheAdmissions<<<(cache.slots + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        cache.keyToSlot, cache.slotKeys, cache.mappedKeyToSlot, cache.lastUsed, cache.step,
+        static_cast<int32_t *>(metadata.cudaData), cache.slots);
+    checkCudaErrors("MoE full-resident publication", cudaGetLastError());
+    checkCudaErrors("MoE full-resident fence", cudaEventRecord(cache.admissionDone, cudaStreamPerThread));
+    checkCudaErrors("MoE full-resident completion", cudaEventSynchronize(cache.admissionDone));
+    cache.uploadedExpertBytes += cache.recordBytes;
+}
+
 DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
     if (group.tensorParallelRequested) return nullptr;
     int device = -1;
@@ -1440,6 +1479,7 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
     // SM75 reaches host-link bandwidth with fewer background restore CTAs.
     // Leave room for the output head and the next token's foreground kernels.
     if (properties.major == 7 && properties.minor == 5) cache.admissionCopyBlocks = 16;
+    if (!ppPlacement) PreloadCompleteNativeCache(group, cache);
     cache.ready = true;
 
     std::fprintf(stderr,

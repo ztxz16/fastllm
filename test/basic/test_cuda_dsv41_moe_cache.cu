@@ -644,6 +644,37 @@ int main(int argc, char **argv) {
         Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "V4.1 cache preparation failed");
         Require(FastllmCudaCanRunMoeHybrid(weights[0].data(), weights[0].size()), "V4.1 hybrid unavailable");
         Require(!FastllmCudaCanRunMoeCache(weights[0].data(), weights[0].size()), "generic math accepted V4.1");
+        if (option("--full-resident")) {
+            Require(!fp8 && !dual, "full-resident test uses single-GPU native MXFP4");
+            FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+            SetMoeCudaCacheBytes(record * experts * tables);
+            Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "full-resident preparation");
+            const float magnitudes[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
+            size_t checked = 0;
+            for (int t = 0; t < tables; ++t) {
+                FastllmCudaMoePrefillResidents resident;
+                Require(FastllmCudaGetMoePrefillResidents(weights[t].data(), experts, resident, true),
+                    "full-resident snapshot");
+                for (int e = 0; e < experts; ++e) for (int part = 0; part < 2; ++part) {
+                    Require(resident.weights[2 * e + part] != nullptr, "initial expert missing");
+                    const int nr = part ? hidden : 2 * inter, nc = part ? inter : hidden;
+                    std::vector<uint8_t> packed(size_t(nr) * (nc / 32) * 17);
+                    Check(cudaMemcpy(packed.data(), resident.weights[2 * e + part], packed.size(), cudaMemcpyDeviceToHost));
+                    for (int row = 0; row < nr; ++row) for (int c = 0; c < nc; ++c) {
+                        const int code = (packed[size_t(row) * (nc / 2) + c / 2] >> (4 * (c % 2))) & 15;
+                        const int exponent = packed[size_t(nr) * (nc / 2) + size_t(row) * (nc / 32) + c / 32];
+                        const float value = Bf(std::ldexp((code & 8 ? -1 : 1) * magnitudes[code & 7], exponent - 127));
+                        const float expected = Bf(dense[t][2 * e + part][size_t(row) * nc + c]);
+                        Require(std::memcmp(&value, &expected, sizeof(float)) == 0, "full-resident payload mismatch");
+                        ++checked;
+                    }
+                }
+            }
+            std::printf("FULL_RESIDENT_PASS %zu exact values, %d initial expert mappings\n", checked, tables * experts);
+            FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+            SetMoeCudaCacheBytes(record * 16);
+            Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "restore partial cache");
+        }
         if (option("--prefill")) {
             if (dual) CheckResidentAssist(weights[0]);
             fastllm_prefill_test::Run(layers, weights, tables, true, 32);
