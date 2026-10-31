@@ -13,6 +13,8 @@ int main(int argc, char **argv) {
                            initialAudio, vaePrecision;
         int device = 0;
         bool fp32 = false;
+        std::string firstFrame, lastFrame;
+        std::vector<std::pair<Reference::Kind, std::string>> references;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (i + 1 >= argc)
@@ -50,12 +52,35 @@ int main(int argc, char **argv) {
                 initialVideo = v;
             else if (arg == "--initial-audio")
                 initialAudio = v;
+            else if (arg == "--first-frame")
+                firstFrame = v;
+            else if (arg == "--last-frame")
+                lastFrame = v;
+            else if (arg == "--reference-image-short-edge")
+                options.referenceImageShortEdge = std::stoi(v);
+            else if (arg == "--reference-video-short-edge")
+                options.referenceVideoShortEdge = std::stoi(v);
+            else if (arg == "--reference-image")
+                references.push_back({Reference::Kind::Image, v});
+            else if (arg == "--reference-video")
+                references.push_back({Reference::Kind::Video, v});
+            else if (arg == "--reference-audio")
+                references.push_back({Reference::Kind::Audio, v});
             else
                 throw std::invalid_argument("unknown argument " + arg);
         }
         if (model.empty())
             throw std::invalid_argument("--model is required");
         auto videoType = parseVideoPrecision(vaePrecision, fp32);
+        if (!firstFrame.empty())
+            options.firstFrame =
+                readReference(firstFrame, Reference::Kind::Image, options.frames, ffmpeg).frames[0];
+        if (!lastFrame.empty())
+            options.lastFrame =
+                readReference(lastFrame, Reference::Kind::Image, options.frames, ffmpeg).frames[0];
+        for (const auto &ref : references)
+            options.references.push_back(readReference(ref.second, ref.first, options.frames, ffmpeg,
+                                                       "ffprobe", options.referenceVideoShortEdge));
         options.validate();
         if (!traceDirectory.empty())
             std::filesystem::create_directories(traceDirectory);

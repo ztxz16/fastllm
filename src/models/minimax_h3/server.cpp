@@ -12,6 +12,7 @@
 #include <mutex>
 #include <regex>
 #include <thread>
+#include <unistd.h>
 
 using namespace fastllm::minimax_h3;
 using Json = json11::Json;
@@ -39,40 +40,87 @@ int integer(const Json &j, const std::string &key, int fallback, int minimum, in
 }
 struct Job {
     GenerateOptions options;
+    std::string mode = "t2va";
+    int referenceCount = 0;
     std::string id, status = "queued", stage = "queued", failure;
     int current = 0, total = 0, progress = 0;
     int64_t created = now(), completed = 0;
     bool cancelled = false, done = false;
     std::mutex mutex;
 };
-Json metadata(const std::shared_ptr<Job> &job) {
-    std::lock_guard<std::mutex> lock(job->mutex);
+// Caller holds job.mutex while reading or persisting this snapshot.
+Json metadata(const Job &job) {
     return Json::object{
-        {"id", job->id},
+        {"id", job.id},
         {"object", "video"},
         {"model", "minimax-h3"},
-        {"status", job->status},
-        {"created_at", double(job->created)},
-        {"completed_at", job->completed ? Json(double(job->completed)) : Json()},
-        {"size", std::to_string(job->options.width) + "x" + std::to_string(job->options.height)},
-        {"seconds", std::to_string(job->options.frames / 24.0)},
-        {"frames", job->options.frames},
+        {"mode", job.mode},
+        {"reference_count", job.referenceCount},
+        {"status", job.status},
+        {"created_at", double(job.created)},
+        {"completed_at", job.completed ? Json(double(job.completed)) : Json()},
+        {"size", std::to_string(job.options.width) + "x" + std::to_string(job.options.height)},
+        {"seconds", std::to_string(job.options.frames / 24.0)},
+        {"frames", job.options.frames},
         {"fps", 24},
-        {"seed", double(job->options.seed)},
-        {"prompt", job->options.prompt},
-        {"progress", job->progress},
-        {"stage", job->stage},
-        {"current", job->current},
-        {"total", job->total},
-        {"error", job->failure.empty()
+        {"seed", double(job.options.seed)},
+        {"num_inference_steps", job.options.steps},
+        {"prompt", job.options.prompt},
+        {"progress", job.progress},
+        {"stage", job.stage},
+        {"current", job.current},
+        {"total", job.total},
+        {"error", job.failure.empty()
                       ? Json()
-                      : Json(Json::object{{"message", job->failure}, {"code", "generation_failed"}})}};
+                      : Json(Json::object{{"message", job.failure}, {"code", "generation_failed"}})}};
+}
+Json metadata(const std::shared_ptr<Job> &job) {
+    std::lock_guard<std::mutex> lock(job->mutex);
+    return metadata(*job);
 }
 class Service {
   public:
     Service(std::string model, std::string output, int device, bool fp32, DType videoType, std::string ffmpeg)
         : output_(std::move(output)), fp32_(fp32), videoType_(videoType) {
         std::filesystem::create_directories(output_);
+        referencesAvailable_ = std::filesystem::is_regular_file(model + "/transformer_ref/config.json");
+        // Completed jobs have a small sidecar, so updating the inference service
+        // preserves the IDs of videos already shown in the demo.
+        for (const auto &entry : std::filesystem::directory_iterator(output_)) {
+            auto name = entry.path().filename().string();
+            if (jobs_.size() >= 1024 || !std::regex_match(name, std::regex("video_[0-9]+_[0-9]+[.]json")) ||
+                !entry.is_regular_file() || entry.file_size() > 1024 * 1024)
+                continue;
+            std::ifstream file(entry.path());
+            std::string bytes((std::istreambuf_iterator<char>(file)), {}), error;
+            auto data = Json::parse(bytes, error);
+            auto id = data["id"].string_value();
+            if (!error.empty() || id + ".json" != name || data["status"].string_value() != "completed" ||
+                !std::filesystem::is_regular_file(output_ + "/" + id + ".mp4"))
+                continue;
+            auto job = std::make_shared<Job>();
+            job->id = id;
+            job->status = job->stage = "completed";
+            job->done = true;
+            job->progress = 100;
+            job->created = data["created_at"].number_value();
+            job->completed = data["completed_at"].number_value();
+            job->options.prompt = data["prompt"].string_value();
+            job->options.frames = data["frames"].int_value();
+            job->options.seed = data["seed"].number_value();
+            if (data["num_inference_steps"].is_number())
+                job->options.steps = data["num_inference_steps"].int_value();
+            std::smatch match;
+            auto size = data["size"].string_value();
+            if (!std::regex_match(size, match, std::regex("([0-9]{2,4})x([0-9]{2,4})")))
+                continue;
+            job->options.width = std::stoi(match[1]);
+            job->options.height = std::stoi(match[2]);
+            if (data["mode"].is_string())
+                job->mode = data["mode"].string_value();
+            job->referenceCount = data["reference_count"].int_value();
+            jobs_[id] = job;
+        }
         worker_ = std::thread([this, model, device, fp32, videoType, ffmpeg] {
             try {
                 Pipeline pipeline(model, device, fp32, videoType);
@@ -94,44 +142,64 @@ class Service {
                                 throw std::runtime_error("cancelled");
                             job->status = "in_progress";
                         }
-                        pipeline.generateMP4(
-                            job->options, output_ + "/" + job->id + ".mp4", ffmpeg,
-                            [&](const std::string &stage, int current, int total) {
-                                std::lock_guard<std::mutex> lock(job->mutex);
-                                if (job->cancelled || stopping_)
-                                    throw std::runtime_error("cancelled");
-                                job->stage = stage;
-                                job->current = current;
-                                job->total = total;
-                                int first = stage == "text"           ? 0
-                                            : stage == "prepare"      ? 10
-                                            : stage == "denoise"      ? 15
-                                            : stage == "audio_decode" ? 85
-                                            : stage == "video_decode" ? 89
-                                                                      : 99;
-                                int span = stage == "text"           ? 10
-                                           : stage == "prepare"      ? 5
-                                           : stage == "denoise"      ? 70
-                                           : stage == "audio_decode" ? 4
-                                           : stage == "video_decode" ? 10
-                                                                     : 0;
-                                job->progress = first + (total ? span * current / total : 0);
-                            });
+                        pipeline.generateMP4(job->options, output_ + "/" + job->id + ".mp4", ffmpeg,
+                                             [&](const std::string &stage, int current, int total) {
+                                                 std::lock_guard<std::mutex> lock(job->mutex);
+                                                 if (job->cancelled || stopping_)
+                                                     throw std::runtime_error("cancelled");
+                                                 job->stage = stage;
+                                                 job->current = current;
+                                                 job->total = total;
+                                                 int first = stage == "text" || stage == "vision" ||
+                                                                     stage.compare(0, 10, "condition_") == 0
+                                                                 ? 0
+                                                             : stage == "prepare"      ? 10
+                                                             : stage == "denoise"      ? 15
+                                                             : stage == "audio_decode" ? 85
+                                                             : stage == "video_decode" ? 89
+                                                                                       : 99;
+                                                 int span = stage == "text"           ? 10
+                                                            : stage == "prepare"      ? 5
+                                                            : stage == "denoise"      ? 70
+                                                            : stage == "audio_decode" ? 4
+                                                            : stage == "video_decode" ? 10
+                                                                                      : 0;
+                                                 job->progress = first + (total ? span * current / total : 0);
+                                             });
                         std::lock_guard<std::mutex> lock(job->mutex);
                         if (job->cancelled) {
                             std::filesystem::remove(output_ + "/" + job->id + ".mp4");
                             throw std::runtime_error("cancelled");
                         }
                         job->status = "completed";
-                        job->done = true;
                         job->completed = now();
                         job->progress = 100;
                         job->stage = "completed";
+                        // Publish completion only after the sidecar is saved, so a
+                        // concurrent DELETE cannot race with metadata creation.
+                        try {
+                            std::string path = output_ + "/" + job->id + ".json";
+                            std::ofstream file(path + ".tmp");
+                            file << metadata(*job).dump();
+                            file.close();
+                            if (!file)
+                                throw std::runtime_error("cannot write video metadata");
+                            std::filesystem::rename(path + ".tmp", path);
+                        } catch (const std::exception &e) {
+                            std::cerr << e.what() << "\n";
+                        }
+                        job->done = true;
                     } catch (const std::exception &e) {
                         std::lock_guard<std::mutex> lock(job->mutex);
                         job->status = job->cancelled ? "cancelled" : "failed";
                         job->failure = e.what();
                         job->done = true;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(job->mutex);
+                        job->options.firstFrame.reset();
+                        job->options.lastFrame.reset();
+                        job->options.references.clear();
                     }
                     --pending_;
                 }
@@ -154,16 +222,24 @@ class Service {
                                                                : "failed"},
                             {"error", startupError_},
                             {"precision", fp32_ ? "fp32" : "bf16"},
-                            {"vae_precision", precisionName(videoType_)}};
+                            {"vae_precision", precisionName(videoType_)},
+                            {"conditioning", true},
+                            {"reference_model_available", referencesAvailable_}};
     }
-    std::shared_ptr<Job> submit(const Json &j) {
+    std::shared_ptr<Job>
+    submit(const Json &j,
+           const std::vector<std::pair<std::string, const httplib::MultipartFormData *>> &uploads,
+           const std::string &ffmpeg) {
         if (!ready_)
             throw std::runtime_error("model is not ready");
+        if (pending_ >= 4)
+            throw std::overflow_error("generation queue is full");
         if (!j.is_object())
             throw std::invalid_argument("expected a JSON object");
         for (auto &kv : j.object_items())
             if (kv.first != "model" && kv.first != "prompt" && kv.first != "size" && kv.first != "seconds" &&
-                kv.first != "frames" && kv.first != "seed" && kv.first != "num_inference_steps")
+                kv.first != "frames" && kv.first != "seed" && kv.first != "num_inference_steps" &&
+                kv.first != "reference_image_short_edge" && kv.first != "reference_video_short_edge")
                 throw std::invalid_argument("unsupported parameter: " + kv.first);
         if (!j["model"].is_null() && j["model"].string_value() != "minimax-h3")
             throw std::invalid_argument("unknown model");
@@ -194,14 +270,79 @@ class Service {
         job->options.seed =
             integer(j, "seed", int(std::chrono::steady_clock::now().time_since_epoch().count() & 0x7fffffff),
                     0, 2147483647);
+        job->options.referenceImageShortEdge = integer(j, "reference_image_short_edge", 2048, 64, 2048);
+        job->options.referenceVideoShortEdge = integer(j, "reference_video_short_edge", 768, 64, 768);
+        if (!uploads.empty()) {
+            struct Temporary {
+                std::string path;
+                ~Temporary() {
+                    if (!path.empty()) {
+                        std::error_code ec;
+                        std::filesystem::remove_all(path, ec);
+                    }
+                }
+            } temp;
+            std::string pattern =
+                (std::filesystem::temp_directory_path() / "fastllm-h3-input-XXXXXX").string();
+            std::vector<char> name(pattern.begin(), pattern.end());
+            name.push_back(0);
+            auto created = mkdtemp(name.data());
+            if (!created)
+                throw std::runtime_error("cannot create upload directory");
+            temp.path = created;
+            int index = 0;
+            for (const auto &upload : uploads) {
+                const auto &part = *upload.second;
+                bool reference = upload.first == "reference";
+                Reference::Kind kind = Reference::Kind::Image;
+                if (reference) {
+                    if (part.content_type.compare(0, 6, "video/") == 0)
+                        kind = Reference::Kind::Video;
+                    else if (part.content_type.compare(0, 6, "audio/") == 0)
+                        kind = Reference::Kind::Audio;
+                    else if (part.content_type.compare(0, 6, "image/") != 0)
+                        throw std::invalid_argument(
+                            "reference upload requires an image/*, video/* or audio/* content type");
+                }
+                if (part.content.empty() || part.content.size() > (size_t(128) << 20))
+                    throw std::invalid_argument("each upload must contain 1..128 MiB");
+                std::string path = temp.path + "/" + std::to_string(index++);
+                std::ofstream file(path, std::ios::binary);
+                file.write(part.content.data(), part.content.size());
+                file.close();
+                if (!file)
+                    throw std::runtime_error("cannot save uploaded media");
+                auto decoded = readReference(path, kind, frames, ffmpeg, "ffprobe",
+                                             job->options.referenceVideoShortEdge);
+                if (reference)
+                    job->options.references.push_back(std::move(decoded));
+                else {
+                    auto &frame =
+                        upload.first == "last_frame" ? job->options.lastFrame : job->options.firstFrame;
+                    if (frame)
+                        throw std::invalid_argument("duplicate first/last frame");
+                    frame = std::move(decoded.frames[0]);
+                }
+            }
+        }
         job->options.validate();
+        if (!job->options.references.empty() && !referencesAvailable_)
+            throw std::invalid_argument("Ref2VA requires transformer_ref weights in the model directory");
+        job->mode = !job->options.references.empty()                    ? "ref2va"
+                    : job->options.firstFrame && job->options.lastFrame ? "first_last"
+                    : job->options.firstFrame                           ? "first_frame"
+                    : job->options.lastFrame                            ? "last_frame"
+                                                                        : "t2va";
+        job->referenceCount = job->options.references.size();
         std::lock_guard<std::mutex> lock(mutex_);
         if (pending_ >= 4)
             throw std::overflow_error("generation queue is full");
         if (jobs_.size() >= 1024)
             throw std::overflow_error(
                 "video history is full; delete completed videos before submitting more");
-        job->id = "video_" + std::to_string(now()) + "_" + std::to_string(++sequence_);
+        do {
+            job->id = "video_" + std::to_string(now()) + "_" + std::to_string(++sequence_);
+        } while (jobs_.count(job->id));
         jobs_[job->id] = job;
         queue_.push_back(job);
         ++pending_;
@@ -230,11 +371,13 @@ class Service {
         if (!job->done)
             throw std::logic_error("cancel the running video before deleting it");
         std::filesystem::remove(output_ + "/" + id + ".mp4");
+        std::filesystem::remove(output_ + "/" + id + ".json");
         jobs_.erase(i);
     }
 
   private:
     std::string output_, startupError_;
+    bool referencesAvailable_ = false;
     const bool fp32_;
     const DType videoType_;
     std::atomic<bool> ready_{false}, stopping_{false};
@@ -289,7 +432,7 @@ int main(int argc, char **argv) {
         Service service(model, output, device, fp32, videoType, ffmpeg);
         httplib::Server server;
         server.new_task_queue = [] { return new httplib::ThreadPool(8); };
-        server.set_payload_max_length(1024 * 1024);
+        server.set_payload_max_length(size_t(256) << 20);
         auto auth = [&](const httplib::Request &r, httplib::Response &s) {
             if (key.empty() || r.get_header_value("Authorization") == "Bearer " + key)
                 return true;
@@ -328,13 +471,25 @@ int main(int argc, char **argv) {
             try {
                 std::string error;
                 Json j;
+                std::vector<std::pair<std::string, const httplib::MultipartFormData *>> uploads;
                 if (r.is_multipart_form_data()) {
                     Json::object fields;
                     for (auto &part : r.files) {
+                        if (part.first == "input_reference" || part.first == "first_frame" ||
+                            part.first == "last_frame" || part.first == "reference") {
+                            uploads.push_back({part.first, &part.second});
+                            if (uploads.size() > 12)
+                                throw std::invalid_argument("too many media uploads");
+                            continue;
+                        }
+                        if (part.second.content.size() > 32768)
+                            throw std::invalid_argument("form field too large");
                         if (fields.count(part.first))
                             throw std::invalid_argument("duplicate parameter: " + part.first);
                         bool numeric = part.first == "seed" || part.first == "frames" ||
-                                       part.first == "num_inference_steps";
+                                       part.first == "num_inference_steps" ||
+                                       part.first == "reference_image_short_edge" ||
+                                       part.first == "reference_video_short_edge";
                         fields[part.first] =
                             numeric ? Json::parse(part.second.content, error) : Json(part.second.content);
                         if (!error.empty())
@@ -342,11 +497,13 @@ int main(int argc, char **argv) {
                     }
                     j = fields;
                 } else {
+                    if (r.body.size() > 1024 * 1024)
+                        throw std::invalid_argument("JSON request exceeds 1 MiB");
                     j = Json::parse(r.body, error);
                     if (!error.empty())
                         throw std::invalid_argument("invalid JSON");
                 }
-                reply(s, metadata(service.submit(j)), 202);
+                reply(s, metadata(service.submit(j, uploads, ffmpeg)), 202);
             } catch (const std::invalid_argument &e) {
                 fail(s, e.what(), 400);
             } catch (const std::out_of_range &e) {

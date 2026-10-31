@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "FastLLM MiniMax-H3 native API",
-    "version": "0.1.0",
-    "description": "Asynchronous text-to-video with stereo audio. Reference media inputs are not supported by this version."
+    "version": "0.2.0",
+    "description": "Asynchronous video and stereo audio generation: text, first/last keyframes, or ordered image/video/audio references. Media uses multipart uploads; keyframes and references are mutually exclusive."
   },
   "security": [
     {
@@ -38,12 +38,45 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "status": {"type": "string", "enum": ["loading", "ready", "failed"]},
-                    "error": {"type": "string"},
-                    "precision": {"type": "string", "enum": ["bf16", "fp32"]},
-                    "vae_precision": {"type": "string", "enum": ["fp16", "bf16", "fp32"]}
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "loading",
+                        "ready",
+                        "failed"
+                      ]
+                    },
+                    "error": {
+                      "type": "string"
+                    },
+                    "precision": {
+                      "type": "string",
+                      "enum": [
+                        "bf16",
+                        "fp32"
+                      ]
+                    },
+                    "vae_precision": {
+                      "type": "string",
+                      "enum": [
+                        "fp16",
+                        "bf16",
+                        "fp32"
+                      ]
+                    },
+                    "conditioning": {
+                      "type": "boolean"
+                    },
+                    "reference_model_available": {
+                      "type": "boolean"
+                    }
                   },
-                  "required": ["status", "error", "precision", "vae_precision"]
+                  "required": [
+                    "status",
+                    "error",
+                    "precision",
+                    "vae_precision"
+                  ]
                 }
               }
             }
@@ -66,7 +99,14 @@
             },
             "multipart/form-data": {
               "schema": {
-                "$ref": "#/components/schemas/VideoRequest"
+                "$ref": "#/components/schemas/VideoMultipartRequest"
+              },
+              "encoding": {
+                "reference": {
+                  "style": "form",
+                  "explode": true,
+                  "contentType": "image/png, image/jpeg, video/mp4, video/webm, audio/wav, audio/mpeg, audio/flac, audio/ogg"
+                }
               }
             }
           }
@@ -270,6 +310,26 @@
               "object",
               "null"
             ]
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "t2va",
+              "first_frame",
+              "last_frame",
+              "first_last",
+              "ref2va"
+            ]
+          },
+          "reference_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 12
+          },
+          "num_inference_steps": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 100
           }
         }
       },
@@ -317,6 +377,109 @@
             "maximum": 100,
             "default": 50,
             "description": "Schedule points including terminal zero; normally N-1 denoising evaluations."
+          },
+          "reference_image_short_edge": {
+            "type": "integer",
+            "default": 2048,
+            "minimum": 64,
+            "maximum": 2048,
+            "multipleOf": 32,
+            "description": "Ref2VA image reference short edge. 2048 matches the released preprocessing; smaller values are explicit diagnostic/quality tradeoffs."
+          },
+          "reference_video_short_edge": {
+            "type": "integer",
+            "default": 768,
+            "minimum": 64,
+            "maximum": 768,
+            "multipleOf": 32,
+            "description": "Reference video short edge before the native area cap. Default 768 matches the released preprocessing; lower values explicitly trade condition quality for cost."
+          }
+        }
+      },
+      "VideoMultipartRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "prompt"
+        ],
+        "properties": {
+          "model": {
+            "const": "minimax-h3",
+            "default": "minimax-h3"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1
+          },
+          "size": {
+            "type": "string",
+            "default": "768x448",
+            "pattern": "^[0-9]+x[0-9]+$"
+          },
+          "seconds": {
+            "type": [
+              "string",
+              "number"
+            ],
+            "description": "5..15 seconds, rounded up to 17*n+5 frames; resulting frames must not exceed 345."
+          },
+          "frames": {
+            "type": "integer",
+            "minimum": 120,
+            "maximum": 345,
+            "description": "Alternative to seconds; rounded up to 17*n+5."
+          },
+          "seed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "num_inference_steps": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 100,
+            "default": 50,
+            "description": "Schedule points including terminal zero; normally N-1 denoising evaluations."
+          },
+          "reference_image_short_edge": {
+            "type": "integer",
+            "default": 2048,
+            "minimum": 64,
+            "maximum": 2048,
+            "multipleOf": 32,
+            "description": "Ref2VA image reference short edge. 2048 matches the released preprocessing; smaller values are explicit diagnostic/quality tradeoffs."
+          },
+          "input_reference": {
+            "type": "string",
+            "format": "binary",
+            "description": "First-frame PNG/JPEG. Alias: first_frame."
+          },
+          "first_frame": {
+            "type": "string",
+            "format": "binary",
+            "description": "Alias of input_reference; specify only one."
+          },
+          "last_frame": {
+            "type": "string",
+            "format": "binary",
+            "description": "Last-frame PNG/JPEG; may be used alone or with input_reference."
+          },
+          "reference": {
+            "type": "array",
+            "maxItems": 12,
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "description": "Repeated reference parts, in request order. Set each Content-Type to image/*, video/* or audio/*. Up to 9 images, 3 videos and 3 audio clips; clips are 2..15s, video/audio each total <=15s; audio requires an image/video. Each part <=128 MiB, request <=256 MiB."
+          },
+          "reference_video_short_edge": {
+            "type": "integer",
+            "default": 768,
+            "minimum": 64,
+            "maximum": 768,
+            "multipleOf": 32,
+            "description": "Reference video short edge before the native area cap. Default 768 matches the released preprocessing; lower values explicitly trade condition quality for cost."
           }
         }
       }

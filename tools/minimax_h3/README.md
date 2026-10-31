@@ -2,11 +2,13 @@
 
 面向 Linux + NVIDIA GPU 的纯 C++17 / CUDA 音视频推理，使用 CUDA Runtime、cuBLAS/cuBLASLt 和仓库已有的
 FlashInfer、json11、cpp-httplib。推理服务不加载 Python、PyTorch、Diffusers、Triton
-或 cuDNN；MP4 封装调用已有的 FFmpeg（H.264 / AAC），不参与模型计算。
+或 cuDNN；媒体编解码调用已有的 FFmpeg / ffprobe，不参与模型计算。
 
-当前接口支持 **T2VA：文字生成视频与立体声音轨**。使用 `transformer/` 权重；
-首尾帧条件与 `transformer_ref/` 的参考图像、视频、音频条件尚未接入公开接口。
-服务会拒绝未知参数，不会默默忽略参考媒体。
+支持文字生成、首帧、尾帧、首尾帧，以及有序的参考图片／视频／音频条件。
+文字和关键帧使用 `transformer/`；参考素材使用 `transformer_ref/`，切换时卸载另一套 DiT。
+两种条件不能混用；音频参考须搭配图片或视频。服务拒绝未知参数。
+视觉条件经过 Qwen3-VL 视觉塔及视频 VAE；音频条件经过音频 VAE 的编码器。
+视频编码器与音频编码器保持原生 FP32；视觉 posterior 按原生规则采样、舍入到 FP16 后归一化。
 
 ## 精度与单卡内存
 
@@ -30,8 +32,8 @@ FP32 对比模式仍按层加载 DiT，并利用部分空闲显存缓存原始 B
 16 GiB 给工作张量。BF16 驻留模式需要比 FP32 流式模式更多显存；本次只验证 72GB 单卡。
 
 官方 Diffusers 与 SGLang 均默认使用 BF16 主干，但混合精度、attention 内核与算子
-融合方式不同，不能宣称最终输出逐位相同。当前 BF16 逐层检查通过，**完整流程尚未
-通过严格精度回归**；FP32 保留严格数值对比。实测误差和限制见 [VALIDATION.md](VALIDATION.md)。
+融合方式不同，不能宣称最终输出逐位相同。使用原生输入的 BF16 独立算子／模块检查通过，
+**完整流程尚未通过严格精度回归**；FP32 保留严格数值对比。实测误差和限制见 [VALIDATION.md](VALIDATION.md)。
 
 ## 构建
 
@@ -51,7 +53,7 @@ cmake --build build-h3 --target minimax_h3_generate minimax_h3_server -j4
 ```text
 MiniMax-H3/
   text_encoder/ tokenizer/
-  transformer/
+  transformer/ transformer_ref/  # 参考素材模式需要后者
   vae/ audio_vae/
 ```
 
@@ -77,8 +79,13 @@ CUDA_VISIBLE_DEVICES=7 build-h3/src/models/minimax_h3/minimax_h3_generate \
 - `--vae-precision fp16|bf16|fp32` 可单独覆盖视频 VAE 精度，优先于上述默认值。
   HTTP 服务在启动时选择精度，生成请求结构保持不变；BF16 VAE 是可选对照路径。
 - 音频为 32 kHz 双声道；分别使用视频 shift=12、音频 shift=3 的官方调度。
-- 随机数使用本地 C++ 生成器，同一实现内种子可复现；同一个 seed 不保证与 PyTorch
-  得到同一初始噪声。差分测试通过 `--initial-video` / `--initial-audio` 共享 FP32 噪声。
+- 条件模式使用与 PyTorch CPU Generator 相同顺序的 MT19937／Box-Muller 随机数；先条件、再视频、再音频。
+  纯文字模式保留既有随机序列。差分测试也可通过 `--initial-video` / `--initial-audio` 共享 FP32 噪声。
+- `--first-frame FILE`、`--last-frame FILE` 可单独或同时指定，支持 PNG/JPEG。
+- `--reference-image FILE`、`--reference-video FILE`、`--reference-audio FILE` 可重复，参数顺序即参考顺序。
+  图像短边默认 2048；`--reference-image-short-edge 256` 可显式降低到诊断尺寸（改变条件语义与质量）。
+  `--reference-video-short-edge` 默认 768，可显式降低以做小尺寸验证。视频参考会解码至 24 fps、
+  自身比例的原生画布，再由纯 C++ 音频重采样器转换音轨至 32 kHz。
 - `--trace DIR` 仅供本地开发验证，会保存中间张量、原始 RGB 与音频；HTTP 不开放此参数。
 
 开发调优先用 `--width 256 --height 256 --steps 4`（实际 3 次 DiT）快速比较，确认
@@ -114,6 +121,31 @@ curl http://127.0.0.1:8009/v1/videos/VIDEO_ID
 curl http://127.0.0.1:8009/v1/videos/VIDEO_ID/content -o video.mp4
 ```
 
+首尾帧使用 multipart（`input_reference` 与 `first_frame` 是同一参数的别名）：
+
+```bash
+curl http://127.0.0.1:8009/v1/videos \
+  --form-string 'prompt=A slow camera move between the two scenes.' \
+  -F 'input_reference=@first.png;type=image/png' \
+  -F 'last_frame=@last.jpg;type=image/jpeg' \
+  -F 'size=768x448' -F 'seconds=5' -F 'seed=42'
+```
+
+参考素材使用重复的 `reference` 文件字段；每个 part 的媒体类型必须明确，保持上传顺序：
+
+```bash
+curl http://127.0.0.1:8009/v1/videos \
+  --form-string 'prompt=The subject in Picture 1 moves like Video 1.' \
+  -F 'reference=@subject.png;type=image/png' \
+  -F 'reference=@motion.mp4;type=video/mp4' \
+  -F 'reference=@voice.wav;type=audio/wav' \
+  -F 'size=768x448' -F 'seconds=5' -F 'seed=42'
+```
+
+最多 9 张图片、3 段视频、3 段音频、共 12 份。音视频每段 2..15 秒，视频总长和独立音频总长分别不超过
+15 秒；视频自带音轨归属于该视频。每个上传文件最多 128 MiB，请求最多 256 MiB。
+不接受服务端路径或远程 URL。任务返回 `mode` 和 `reference_count`；Demo 提供模式选择、上传和参考顺序调整。
+
 | 方法与路径 | 功能 |
 |---|---|
 | `GET /health` | 服务初始化状态 |
@@ -131,4 +163,4 @@ curl http://127.0.0.1:8009/v1/videos/VIDEO_ID/content -o video.mp4
 每次生成一个视频，不支持负面提示词或 CFG 参数。
 
 一条工作线程执行 GPU 推理，总待处理任务上限 4；超限返回 429。历史记录保留在内存中，
-最多 1024 条，重启不会恢复任务索引；完成的视频文件仍保留在输出目录。
+最多 1024 条；已完成任务的 JSON 元数据与 MP4 一起保存，重启会恢复这些任务。未完成任务不自动续跑。

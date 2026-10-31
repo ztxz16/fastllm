@@ -31,6 +31,10 @@ assert os.environ.get("CUDA_VISIBLE_DEVICES"), "Select the permitted GPU explici
 assert torch.cuda.device_count() == 1, "Expose only the permitted GPU"
 
 p = argparse.ArgumentParser()
+p.add_argument("--reference-image")
+p.add_argument("--reference-image-short-edge", type=int, default=2048)
+p.add_argument("--first-frame")
+p.add_argument("--last-frame")
 p.add_argument("--model", default="/model")
 p.add_argument("--binary", required=True)
 p.add_argument("--text-fixture")
@@ -41,7 +45,9 @@ p.add_argument("--width", type=int, default=64)
 p.add_argument("--height", type=int, default=64)
 p.add_argument("--frames", type=int, default=124)
 p.add_argument("--steps", type=int, default=4)
-p.add_argument("--prompt", default="A cat plays piano on a wooden stage. The audience applauds.")
+p.add_argument(
+    "--prompt", default="A cat plays piano on a wooden stage. The audience applauds."
+)
 p.add_argument("--skip-reference", action="store_true")
 p.add_argument("--attention-backend", choices=["auto", "math"], default="auto")
 a = p.parse_args()
@@ -54,6 +60,10 @@ root = Path(a.model)
 out = Path(a.output)
 out.mkdir(parents=True, exist_ok=True)
 configuration = {
+    "reference_image": a.reference_image,
+    "reference_image_short_edge": a.reference_image_short_edge,
+    "first_frame": a.first_frame,
+    "last_frame": a.last_frame,
     "prompt": a.prompt,
     "width": a.width,
     "height": a.height,
@@ -95,18 +105,121 @@ def save(name, tensor):
 
 if not a.skip_reference:
     text = torch.from_numpy(
-        np.fromfile(text_dir / "layer.49.reference.f32", dtype=np.float32).reshape(1, nt, 5120)
+        np.fromfile(text_dir / "layer.49.reference.f32", dtype=np.float32).reshape(
+            1, nt, 5120
+        )
     ).cuda()
     save("text", text)
-    packed = MiniMaxH3PrepareLayoutStep.build_packed_sequence(
-        torch.ones(nt, dtype=torch.long), lt, lh, lw, at, (1, 2, 2), 2, 2, 0
-    )
+    if a.reference_image:
+        from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+            MiniMaxH3Ref2VAPrepareLayoutStep,
+        )
+        from types import SimpleNamespace
+
+        packed = MiniMaxH3Ref2VAPrepareLayoutStep.build_ref2va_packed_sequence(
+            torch.tensor([0 if 151652 <= t <= 151656 else 1 for t in tokens]),
+            [SimpleNamespace(kind="image", has_audio=False)],
+            [
+                torch.empty(
+                    1,
+                    24,
+                    1,
+                    a.reference_image_short_edge // 16,
+                    a.reference_image_short_edge // 16,
+                )
+            ],
+            [],
+            lt,
+            lh,
+            lw,
+            at,
+            (1, 2, 2),
+            2,
+            2,
+            0,
+        )
+    else:
+        packed = MiniMaxH3PrepareLayoutStep.build_packed_sequence(
+            torch.tensor([0 if 151652 <= t <= 151656 else 1 for t in tokens]),
+            lt,
+            lh,
+            lw,
+            at,
+            (1, 2, 2),
+            2,
+            2,
+            0,
+            tuple(
+                k for k, p in (("first", a.first_frame), ("last", a.last_frame)) if p
+            ),
+        )
     positions, tags, vi, ai, ti, _, _ = packed
     positions, tags, vi, ai, ti = [x.cuda() for x in (positions, tags, vi, ai, ti)]
-    cfg = json.loads((root / "transformer/config.json").read_text())
-    index = json.loads((root / "transformer/diffusion_pytorch_model.safetensors.index.json").read_text())[
-        "weight_map"
-    ]
+    condition = []
+    if a.first_frame or a.last_frame or a.reference_image:
+        from PIL import Image
+        from diffusers.modular_pipelines.minimax_h3.encoders import encode_vae_condition
+        from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+            patchify_video_latents,
+        )
+
+        vae = (
+            AutoencoderKLMiniMaxH3.from_pretrained(
+                root / "vae", torch_dtype=torch.float32
+            )
+            .cuda()
+            .eval()
+        )
+        generator = torch.Generator().manual_seed(0)
+        with torch.inference_mode():
+            for path in (a.first_frame, a.last_frame, a.reference_image):
+                if not path:
+                    continue
+                image = Image.open(path).convert("RGB")
+                if a.reference_image:
+                    assert image.width == image.height, (
+                        "This reference fixture uses a square image"
+                    )
+                    image = image.resize(
+                        (a.reference_image_short_edge, a.reference_image_short_edge),
+                        Image.Resampling.LANCZOS,
+                    )
+                elif not condition:
+                    image = image.resize((a.width, a.height), Image.Resampling.LANCZOS)
+                else:
+                    scale = max(a.width / image.width, a.height / image.height)
+                    w, h = round(image.width * scale), round(image.height * scale)
+                    image = image.resize((w, h), Image.Resampling.LANCZOS)
+                    image = image.crop(
+                        (
+                            (w - a.width) // 2,
+                            (h - a.height) // 2,
+                            (w + a.width) // 2,
+                            (h + a.height) // 2,
+                        )
+                    )
+                pixels = (
+                    torch.from_numpy(np.array(image))
+                    .cuda()
+                    .permute(2, 0, 1)[None, :, None]
+                )
+                z = encode_vae_condition(
+                    vae, pixels, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+                )
+                noise = torch.randn(z.shape, generator=generator)
+                z = 0.999 * z + (1 - 0.999) * noise
+                condition.append(patchify_video_latents(z, (1, 2, 2)))
+        del vae, pixels, z
+        gc.collect()
+        torch.cuda.empty_cache()
+    condition_rows = sum(x.shape[0] for x in condition)
+    if condition:
+        save("condition_video", torch.cat(condition))
+    dit_directory = root / ("transformer_ref" if a.reference_image else "transformer")
+    cfg = json.loads((dit_directory / "config.json").read_text())
+    index = json.loads(
+        (dit_directory / "diffusion_pytorch_model.safetensors.index.json").read_text()
+    )["weight_map"]
     with torch.device("meta"):
         transformer = MiniMaxH3Transformer3DModel.from_config(cfg)
 
@@ -114,10 +227,15 @@ if not a.skip_reference:
         state = {}
         for name in module.state_dict():
             key = prefix + name
-            with safe_open(str(root / "transformer" / index[key]), framework="pt", device="cpu") as f:
+            with safe_open(
+                str(dit_directory / index[key]), framework="pt", device="cpu"
+            ) as f:
                 target = (
                     torch.float32
-                    if any(s in key for s in MiniMaxH3Transformer3DModel._keep_in_fp32_modules)
+                    if any(
+                        s in key
+                        for s in MiniMaxH3Transformer3DModel._keep_in_fp32_modules
+                    )
                     else dtype
                 )
                 state[name] = f.get_tensor(key).to(device="cuda", dtype=target)
@@ -128,13 +246,19 @@ if not a.skip_reference:
             continue
         if name == "transformer_blocks":
             for i, block in enumerate(child):
-                block.register_forward_pre_hook(lambda m, args, i=i: load(m, f"transformer_blocks.{i}."))
-                block.register_forward_hook(lambda m, args, result: m.to_empty(device="meta") and None)
+                block.register_forward_pre_hook(
+                    lambda m, args, i=i: load(m, f"transformer_blocks.{i}.")
+                )
+                block.register_forward_hook(
+                    lambda m, args, result: m.to_empty(device="meta") and None
+                )
         else:
             load(child, name + ".")
-    transformer.rope = MiniMaxH3RotaryPosEmbed(cfg["rope_freq_dim"], cfg["rope_theta"]).cuda()
+    transformer.rope = MiniMaxH3RotaryPosEmbed(
+        cfg["rope_freq_dim"], cfg["rope_theta"]
+    ).cuda()
     transformer.eval()
-    video = torch.from_numpy(v).cuda()
+    video = torch.cat(condition + [torch.from_numpy(v)]).cuda()
     audio = torch.from_numpy(aud).cuda()
     vs = MiniMaxH3Scheduler(12)
     aas = MiniMaxH3Scheduler(3)
@@ -144,38 +268,88 @@ if not a.skip_reference:
     with torch.inference_mode():
         for i, (t, ta) in enumerate(zip(vs.timesteps, aas.timesteps)):
             times, indices = MiniMaxH3SetTimestepsStep.build_row_timesteps(
-                vi.cpu(), ai.cpu(), 0, 0, nt, float(t), float(ta), 0.999, 1.0
+                vi.cpu(),
+                ai.cpu(),
+                condition_rows,
+                0,
+                nt,
+                float(t),
+                float(ta),
+                0.999,
+                1.0,
             )
             pred = transformer(
-                video[None], audio[None], text, times.cuda(), indices.cuda(), tags, positions, vi, ai, ti
+                video[None],
+                audio[None],
+                text,
+                times.cuda(),
+                indices.cuda(),
+                tags,
+                positions,
+                vi,
+                ai,
+                ti,
             )
-            video = vs.step(pred.sample[0], t, video).prev_sample
+            generated = vs.step(
+                pred.sample[0, condition_rows:], t, video[condition_rows:]
+            ).prev_sample
+            video = torch.cat((video[:condition_rows], generated))
             audio = aas.step(pred.audio_sample[0], ta, audio).prev_sample
             save(f"video_step.{i}", video)
             save(f"audio_step.{i}", audio)
-            print(f"reference denoise {i + 1}/{a.steps - 1}: {time.monotonic() - start:.1f}s", flush=True)
-    z = video.reshape(lt, lh // 2, lw // 2, 24, 2, 2).permute(3, 0, 1, 4, 2, 5).reshape(1, 24, lt, lh, lw)
+            print(
+                f"reference denoise {i + 1}/{a.steps - 1}: {time.monotonic() - start:.1f}s",
+                flush=True,
+            )
+    z = (
+        video[condition_rows:]
+        .reshape(lt, lh // 2, lw // 2, 24, 2, 2)
+        .permute(3, 0, 1, 4, 2, 5)
+        .reshape(1, 24, lt, lh, lw)
+    )
     az = audio.reshape(2, at, 32).permute(0, 2, 1)
     del transformer, child, block, pred, text, video, audio
     gc.collect()
     torch.cuda.empty_cache()
-    vae = AutoencoderKLMiniMaxH3.from_pretrained(root / "vae", torch_dtype=torch.float32).cuda().eval()
+    vae = (
+        AutoencoderKLMiniMaxH3.from_pretrained(root / "vae", torch_dtype=torch.float32)
+        .cuda()
+        .eval()
+    )
     mean = torch.tensor(vae.config.latents_mean, device="cuda").view(1, -1, 1, 1, 1)
     std = torch.tensor(vae.config.latents_std, device="cuda").view(1, -1, 1, 1, 1)
-    video_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[a.vae_precision]
-    with torch.inference_mode(), torch.autocast("cuda", dtype=video_dtype, enabled=a.vae_precision != "fp32"):
+    video_dtype = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }[a.vae_precision]
+    with (
+        torch.inference_mode(),
+        torch.autocast("cuda", dtype=video_dtype, enabled=a.vae_precision != "fp32"),
+    ):
         pixels = vae.decode(z * std + mean).sample
         pixels = (
-            pixels * torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1, 1)
+            pixels
+            * torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1, 1)
             + torch.tensor([0.485, 0.456, 0.406], device="cuda").view(1, 3, 1, 1, 1)
         ).clamp(0, 1)
-        rgb = (pixels * 255).round().byte().permute(0, 2, 3, 4, 1).contiguous().cpu().numpy()
+        rgb = (
+            (pixels * 255)
+            .round()
+            .byte()
+            .permute(0, 2, 3, 4, 1)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
     rgb.tofile(out / "output.reference.rgb")
     del vae, z, pixels
     gc.collect()
     torch.cuda.empty_cache()
     avae = (
-        AutoencoderKLMiniMaxH3Audio.from_pretrained(root / "audio_vae", torch_dtype=torch.float32)
+        AutoencoderKLMiniMaxH3Audio.from_pretrained(
+            root / "audio_vae", torch_dtype=torch.float32
+        )
         .cuda()
         .eval()
     )
@@ -219,7 +393,19 @@ subprocess.run(
         str(out / "initial_audio.f32"),
         "--output",
         str(out / "native.mp4"),
-    ],
+    ]
+    + (["--first-frame", a.first_frame] if a.first_frame else [])
+    + (["--last-frame", a.last_frame] if a.last_frame else [])
+    + (
+        [
+            "--reference-image",
+            a.reference_image,
+            "--reference-image-short-edge",
+            str(a.reference_image_short_edge),
+        ]
+        if a.reference_image
+        else []
+    ),
     check=True,
 )
 report = {"configuration": configuration}
@@ -229,7 +415,9 @@ for ref in out.glob("*.reference.f32"):
     expected = np.fromfile(ref, dtype=np.float32)
     diff = actual.astype(np.float64) - expected
     report[name] = {
-        "relative_l2": float(np.linalg.norm(diff) / np.linalg.norm(expected.astype(np.float64))),
+        "relative_l2": float(
+            np.linalg.norm(diff) / np.linalg.norm(expected.astype(np.float64))
+        ),
         "max_abs": float(np.max(np.abs(diff))),
     }
 rgb = np.fromfile(native / "output.rgb", dtype=np.uint8).astype(np.int16)
