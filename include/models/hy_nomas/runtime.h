@@ -89,7 +89,13 @@ public:
     Tensor activation(const Tensor &x, bool gelu = false);
     Tensor add(const Tensor &x, const Tensor &y);
     Tensor multiply(const Tensor &x, const Tensor &y);
+    // Round SiLU to the input dtype before multiplying by up.
     Tensor siluMultiply(const Tensor &gate, const Tensor &up);
+    // Packed columns are [up, gate]; no intermediate slices or copies.
+    Tensor siluMultiply(const Tensor &upAndGate);
+    // FP32 residual/output and scale; branch may be FP32/BF16/FP16.
+    // Scale is [1,cols] or [rows,cols]. Product and sum round separately.
+    Tensor scaledResidual(const Tensor &fp32Residual, const Tensor &branch, const Tensor &fp32Scale);
     Tensor bias(const Tensor &x, const Tensor &bias);
     Tensor mean(const Tensor &x);
     Tensor repeatRows(const Tensor &x, int copies);
@@ -98,6 +104,9 @@ public:
     Tensor pixelCondition(const Tensor &x, int frames, int height, int width);
     Tensor modulate(const Tensor &x, const Tensor &mod, int shift, int scale);
     Tensor residual(const Tensor &x, const Tensor &y, const Tensor &mod, int gate);
+    // Indexed BF16/FP32 modulation; each token selects one row of the table.
+    Tensor modulateRows(const Tensor &, const Tensor &table, const Tensor &indices, int shift, int scale);
+    Tensor residualRows(const Tensor &, const Tensor &, const Tensor &table, const Tensor &indices, int gate);
     Tensor columns(const Tensor &x, int first, int count);
     Tensor embedding(const Tensor &weight, const std::vector<int> &tokens);
     // Integer indices use 32-bit storage and must not be passed to floating-point operators.

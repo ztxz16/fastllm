@@ -586,3 +586,44 @@ H3 保留已验证的舍入顺序；两者仍复用同一底层 Attention 与 no
 没有新增运行依赖或环境变量。以上验证用于保证上游整合不改变现有 H3 输出；
 此前记录的完整 BF16 流程相对原生的累积偏差仍需单独处理。
 记录位于仓库外 `upstream-reuse-20261031`。
+
+## 共享算子复用验证（2026-10-31）
+
+本轮复用 SiLU×up、打包 SiLU、混合精度残差和索引调制，精度门槛采用相对修改前
+逐字节一致，不引入新的误差容限。保留模型数值策略，不改变精度、累加类型或权重。
+
+- 73 组新旧算子输出 SHA-256 一致：覆盖 FP32/BF16/FP16、单行/逐行 scale、
+  打包/独立输入 SiLU、单行/索引调制及 BF16 双元素快路径。
+- H3 fused-ops/media CTest 通过。补充了独立输入融合 SiLU 与分步实现对照，以及
+  混合残差逐行 scale 和非法形状检查；现有非对齐、奇数 stride 和 BF16 边界测试保留。
+- LingBot shared tensor 检查通过；新增 FP32/BF16 residual、branch、gate 的不同组合，
+  以独立 CPU oracle 检查单行和逐行广播，显式禁止 host 乘加融合。
+- 原生 BF16 单 Transformer block 检查通过，末端相对 L2 为 0.001017588，和本轮前相同。
+- 768×448/124 帧/4 点的文生视频、参考图＋音频两种场景，RGB/audio/MP4 共 6 个
+  输出文件均与修改前对应场景逐字节一致，新增相对 L2 为 0。
+- H3、HY-Nomas、Qwen Image、LingBot 的库及相关生成、服务、reference/test 目标编译
+  通过；`git diff --check` 通过。所有 CUDA 验证仅使用物理 GPU 7。
+
+上述零新增误差是相对本轮前 FastLLM 的结论，不表示完整 BF16 生成与原生完全一致；
+此前记录的原生累积偏差结论保持不变。其他三个模型未重跑完整生成。
+纯 C++/CUDA 实现，没有新增运行依赖和环境变量。生产代码净减少 33 行，测试和
+记录单独增加；执行路径退化的尝试未保留。数据、源码快照、逐算子耗时、输出哈希和
+成对热测记录保存在仓库外 `operator-reuse-20261031`。
+
+## 提交前整理与 DType 边界检查（2026-10-31）
+
+清理融合测试中重复的列切片，更新已过时的环境变量说明。保留仍被 HY-Nomas 使用的
+`FASTLLM_NOMAS_PRECISION`、`FASTLLM_NOMAS_TRACE`，没有新增 H3 开关或运行依赖。
+补齐 LingBot 的 BF16 算子类型检查，避免 DType 迁移后把 FP16 指针按 BF16 解读；
+纯布局操作保留输入 dtype，FP16 affine 参数通过已有 FP32 cast 路径处理。
+
+- H3、HY-Nomas、Qwen Image、LingBot 相关库与生成、服务、测试目标编译通过。
+- 仅 GPU 7：H3 fused-ops/media CTest 2/2 通过，LingBot shared tensor 检查通过。
+  新增 FP32/BF16/FP16 布局、混合 dtype 拒绝、BF16 专用算子拒绝 FP16、
+  FP16 affine 参数检查；输入 patch 与输出 head 按各自布局独立验证。
+- 73 组算子输出与本次整理前逐字节一致。H3/LingBot 库中提取的全部 13 个
+  sm_120 CUDA cubin 也逐字节一致，未改变 GPU 内核指令。
+- `git diff --check` 通过。本次未重跑完整视频生成；性能及端到端精度结论沿用
+  上节有明确配置与范围的实测，不将本次算子验证等同于完整原生精度对齐。
+
+编译、测试、输出哈希及 CUDA 二进制对照记录保存在仓库外 `commit-cleanup-20261031`。

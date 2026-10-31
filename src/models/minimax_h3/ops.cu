@@ -66,21 +66,6 @@ __global__ void selectRows(const T *x, T *out, const int *indices, size_t n, int
     }
 }
 template <class T>
-__global__ void siluMultiplyTyped(const T *x, T *out, size_t n, int width) {
-    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
-        size_t p = (i / width) * (2 * width) + i % width;
-        float gate = value(x[p + width]);
-        // Preserve activation's low-precision result before the multiply.
-        out[i] = T(value(x[p]) * rounded<T>(gate / (1.f + expf(-gate))));
-    }
-}
-template <class T>
-__global__ void scaledResidualKernel(const float *x, const T *y, const float *scale, float *out,
-                                     size_t n, int width) {
-    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256)
-        out[i] = x[i] + value(y[i]) * scale[i % width];
-}
-template <class T>
 __device__ float blendVideo(float a, float b, int position, int extent) {
     float wb = rounded<T>(float(position) / extent), wa = rounded<T>(1.f - wb);
     return rounded<T>(rounded<T>(a * wa) + rounded<T>(b * wb));
@@ -151,27 +136,6 @@ __global__ void videoRGBKernel(const float *pixels, uint8_t *rgb, size_t n) {
             rgb[i] = __float2int_rz(v);
         else
             rgb[i] = __float2int_rn(v);
-    }
-}
-template <class T>
-__global__ void modulation(const T *x, const T *y, const T *m, const int *indices, T *out, size_t n, int c,
-                           int mc, int shift, int scale) {
-    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
-        size_t p = size_t(indices[i / c]) * mc + i % c;
-        float v =
-            y ? value(x[i]) + rounded<T>(value(y[i]) * value(m[p + shift * c]))
-              : rounded<T>(value(x[i]) * rounded<T>(1.f + value(m[p + scale * c]))) + value(m[p + shift * c]);
-        out[i] = T(v);
-    }
-}
-__global__ void residualBf16Pairs(const __nv_bfloat162 *x, const __nv_bfloat162 *y,
-                                  const __nv_bfloat162 *m, const int *indices, __nv_bfloat162 *out,
-                                  int width, int modCols, int gate) {
-    size_t row = size_t(blockIdx.x) * width;
-    size_t mod = size_t(indices[blockIdx.x]) * modCols + gate * width;
-    for (int c = threadIdx.x; c < width; c += blockDim.x) {
-        // Keep BF16 multiplication and addition separate, matching eager rounding.
-        out[row + c] = __hadd2(x[row + c], __hmul2(y[row + c], m[mod + c]));
     }
 }
 template <class T>
@@ -382,38 +346,6 @@ Tensor Runtime::rmsModulateRows(const Tensor &x, const Tensor &w, float eps, con
     check(cudaGetLastError());
     return out;
 }
-Tensor Runtime::siluMultiply(const Tensor &x) {
-    require(x.cols % 2 == 0, "invalid H3 gated activation width");
-    int width = x.cols / 2;
-    if (x.isFloat32())
-        return multiply(columns(x, 0, width), activation(columns(x, width, width)));
-    Tensor out(x.rows, width, x.dtype);
-    if (x.dtype == DType::FP16)
-        siluMultiplyTyped<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(ptr<H>(x), ptr<H>(out),
-                                                                          out.size(), width);
-    else
-        siluMultiplyTyped<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(ptr<B>(x), ptr<B>(out),
-                                                                          out.size(), width);
-    check(cudaGetLastError());
-    return out;
-}
-Tensor Runtime::scaledResidual(const Tensor &x, const Tensor &y, const Tensor &scale) {
-    require(x.isFloat32() && scale.isFloat32() && x.rows == y.rows && x.cols == y.cols &&
-                scale.size() == size_t(x.cols), "invalid H3 scaled residual");
-    Tensor out(x.rows, x.cols, DType::FP32);
-    // --fmad=false retains the separate FP32 product and sum in the released VAE.
-    if (y.dtype == DType::FP16)
-        scaledResidualKernel<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
-            ptr<float>(x), ptr<H>(y), ptr<float>(scale), ptr<float>(out), x.size(), x.cols);
-    else if (y.dtype == DType::BF16)
-        scaledResidualKernel<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
-            ptr<float>(x), ptr<B>(y), ptr<float>(scale), ptr<float>(out), x.size(), x.cols);
-    else
-        scaledResidualKernel<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
-            ptr<float>(x), ptr<float>(y), ptr<float>(scale), ptr<float>(out), x.size(), x.cols);
-    check(cudaGetLastError());
-    return out;
-}
 Tensor Runtime::stitchVideo(const std::vector<Tensor> &patches, int frames, int tileHeight, int tileWidth,
                             int height, int width, const std::vector<int> &ys, const std::vector<int> &xs) {
     require(frames > 0 && tileHeight > 0 && tileWidth > 0 && height >= tileHeight && width >= tileWidth &&
@@ -544,45 +476,6 @@ void Runtime::scatter(Tensor &out, const Tensor &x, const Tensor &idx) {
         selectRows<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(ptr<uint16_t>(x), ptr<uint16_t>(out),
                                                                     ptr<int>(idx), x.size(), x.cols, true);
     check(cudaGetLastError());
-}
-Tensor Runtime::modulateRows(const Tensor &x, const Tensor &m, const Tensor &idx, int shift, int scale) {
-    require(x.dtype != DType::FP16 && x.dtype == m.dtype && idx.isFloat32() && idx.cols == 1 &&
-                idx.rows == x.rows && shift >= 0 && scale >= 0 &&
-                m.cols >= (std::max(shift, scale) + 1) * x.cols,
-            "invalid H3 modulation shape/dtype");
-    Tensor out(x.rows, x.cols, x.dtype);
-    if (x.isFloat32())
-        modulation<float><<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
-            ptr<float>(x), nullptr, ptr<float>(m), ptr<int>(idx), ptr<float>(out), x.size(), x.cols, m.cols,
-            shift, scale);
-    else
-        modulation<B><<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(ptr<B>(x), nullptr, ptr<B>(m),
-                                                                       ptr<int>(idx), ptr<B>(out), x.size(),
-                                                                       x.cols, m.cols, shift, scale);
-    check(cudaGetLastError());
-    return out;
-}
-Tensor Runtime::residualRows(const Tensor &x, const Tensor &y, const Tensor &m, const Tensor &idx, int gate) {
-    require(x.dtype != DType::FP16 && x.dtype == y.dtype && x.dtype == m.dtype && x.rows == y.rows &&
-                x.cols == y.cols && idx.isFloat32() && idx.cols == 1 && idx.rows == x.rows && gate >= 0 &&
-                m.cols >= (gate + 1) * x.cols,
-            "invalid H3 residual shape/dtype");
-    Tensor out(x.rows, x.cols, x.dtype);
-    if (x.isFloat32())
-        modulation<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
-            ptr<float>(x), ptr<float>(y), ptr<float>(m), ptr<int>(idx), ptr<float>(out), x.size(), x.cols,
-            m.cols, gate, 0);
-    else if (x.cols >= 512 && x.cols % 2 == 0 && m.cols % 2 == 0 &&
-             ((reinterpret_cast<uintptr_t>(x.data) | reinterpret_cast<uintptr_t>(y.data) |
-               reinterpret_cast<uintptr_t>(m.data)) % alignof(__nv_bfloat162) == 0))
-        residualBf16Pairs<<<x.rows, 256, 0, cudaStreamPerThread>>>(
-            ptr<__nv_bfloat162>(x), ptr<__nv_bfloat162>(y), ptr<__nv_bfloat162>(m), ptr<int>(idx),
-            ptr<__nv_bfloat162>(out), x.cols / 2, m.cols / 2, gate);
-    else
-        modulation<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
-            ptr<B>(x), ptr<B>(y), ptr<B>(m), ptr<int>(idx), ptr<B>(out), x.size(), x.cols, m.cols, gate, 0);
-    check(cudaGetLastError());
-    return out;
 }
 Tensor Runtime::rotary(const Tensor &x, const Tensor &cs, const Tensor &sn, int dim) {
     require(dim > 0 && x.cols % dim == 0 && cs.isFloat32() && sn.isFloat32() && cs.rows == x.rows &&

@@ -22,8 +22,6 @@ class Runtime : public nomas::Runtime {
     Tensor rms(const Tensor &, const Tensor &weight, float eps, int width = 0);
     Tensor rmsModulateRows(const Tensor &, const Tensor &weight, float eps, const Tensor &table,
                            const Tensor &indices, int shift, int scale);
-    Tensor siluMultiply(const Tensor &hiddenAndGate);
-    Tensor scaledResidual(const Tensor &fp32Residual, const Tensor &, const Tensor &fp32Scale);
     Tensor stitchVideo(const std::vector<Tensor> &patches, int frames, int tileHeight, int tileWidth,
                        int height, int width, const std::vector<int> &ys, const std::vector<int> &xs);
     void copyVideoFrames(Tensor &out, const Tensor &clip, const Tensor *overlap, int framePixels, int start);
@@ -34,8 +32,6 @@ class Runtime : public nomas::Runtime {
     std::array<Tensor, 3> videoQkvNormRotary(const Tensor &qkv, const Tensor &cos, const Tensor &sin);
     Tensor gather(const Tensor &, const Tensor &indices);
     void scatter(Tensor &out, const Tensor &input, const Tensor &indices);
-    Tensor modulateRows(const Tensor &, const Tensor &table, const Tensor &indices, int shift, int scale);
-    Tensor residualRows(const Tensor &, const Tensor &, const Tensor &table, const Tensor &indices, int gate);
     Tensor rotary(const Tensor &, const Tensor &cos, const Tensor &sin, int headDim);
     std::pair<Tensor, Tensor> qkNormRotary(const Tensor &q, const Tensor &k, const Tensor &qWeight,
                                          const Tensor &kWeight, float eps, const Tensor &cos,

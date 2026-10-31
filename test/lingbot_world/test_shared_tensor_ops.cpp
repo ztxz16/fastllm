@@ -38,6 +38,26 @@ void checkCast(fastllm::nomas::Runtime &rt) {
                           std::vector<float>(expected.begin()+1,expected.end()));
     }
 }
+void checkGated(fastllm::lingbot::Runtime &rt) {
+    fastllm::nomas::Runtime full(0,true),low(0,false);
+    for(int rows:{1,47,513}) for(int width:{67,1536})
+        for(int scaleRows:{1,rows}) for(bool fullX:{false,true})
+            for(bool fullY:{false,true}) for(bool fullScale:{false,true}) {
+                auto make=[&](int rows,bool fp32,int salt) {
+                    std::vector<float> v(size_t(rows)*width);
+                    for(size_t i=0;i<v.size();++i) v[i]=(int((i+salt)%113)-56)*.0137f;
+                    return (fp32?full:low).upload(v.data(),rows,width);
+                };
+                auto x=make(rows,fullX,1),y=make(rows,fullY,17),g=make(scaleRows,fullScale,31);
+                auto a=rt.download(x),b=rt.download(y),c=rt.download(g);
+                for(size_t i=0;i<a.size();++i) {
+                    // Volatile prevents host FMA contraction in this FP32 oracle.
+                    volatile float product=b[i]*c[scaleRows==1?i%width:i];
+                    a[i]+=product;
+                }
+                equal(rt.download(rt.gated(x,y,g)),a);
+            }
+}
 void checkDTypes(fastllm::lingbot::Runtime &rt,fastllm::lingbot::VAERuntime &vae) {
     using fastllm::nomas::DType;
     // Layout-only operations preserve the dtype, including FP16's raw bits.
@@ -111,7 +131,7 @@ int main() { try {
     fastllm::lingbot::VAERuntime vae(0,true);
     fastllm::qwen_image::Runtime qwen(0);
     checkCast(common); checkCast(dit); checkCast(vae);
-    checkResize(vae); checkResize(qwen); checkDTypes(dit,vae);
-    std::cout<<"shared cast / nearest upsample / Qwen shortcut / dtype boundaries: bitwise passed\n";
+    checkResize(vae); checkResize(qwen); checkGated(dit); checkDTypes(dit,vae);
+    std::cout<<"shared cast / nearest upsample / Qwen shortcut / mixed residual / dtype boundaries: bitwise passed\n";
     return 0;
 } catch(const std::exception &e) { std::cerr<<e.what()<<'\n'; return 1; } }

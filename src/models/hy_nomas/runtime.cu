@@ -141,13 +141,36 @@ template<class T, bool FusedAffine=true> __global__ void normKernel(const T *x, 
         y[size_t(row)*width+c]=cast<T>(v);
     }
 }
-template<class T> __global__ void modulation(const T *x, const T *y, const T *mod, T *z, size_t n, int c, int a, int d, bool residual) {
+template<class T> __global__ void packedSiluMultiply(const T *x,T *out,size_t n,int width) {
     for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
-        int j=i%c;
+        size_t p=(i/width)*(2*width)+i%width;
+        float gate=f(x[p+width]);
+        out[i]=cast<T>(f(x[p])*roundTo<T>(gate/(1.f+expf(-gate))));
+    }
+}
+template<class T,bool Broadcast> __global__ void scaledResidualKernel(const float *x,const T *y,const float *scale,
+                                                       float *out,size_t n,int width) {
+    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x)
+        out[i]=x[i]+f(y[i])*scale[Broadcast?i%width:i];
+}
+template<class T,bool Indexed=false> __global__ void modulation(const T *x, const T *y, const T *mod, T *z, size_t n, int c, int a, int d, bool residual, const int *indices=nullptr, int modCols=0) {
+    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
+        size_t j=i%c;
+        if constexpr(Indexed) j+=size_t(indices[i/c])*modCols;
         // Match eager BF16 boundaries, including the rounding of (1 + scale).
         float v=residual ? f(x[i])+roundTo<T>(f(y[i])*f(mod[a*c+j]))
                          : roundTo<T>(f(x[i])*roundTo<T>(1.f+f(mod[d*c+j])))+f(mod[a*c+j]);
         z[i]=cast<T>(v);
+    }
+}
+__global__ void residualBf16Pairs(const __nv_bfloat162 *x, const __nv_bfloat162 *y,
+                                  const __nv_bfloat162 *m, const int *indices, __nv_bfloat162 *out,
+                                  int width, int modCols, int gate) {
+    size_t row = size_t(blockIdx.x) * width;
+    size_t mod = size_t(indices[blockIdx.x]) * modCols + gate * width;
+    for (int c = threadIdx.x; c < width; c += blockDim.x) {
+        // Keep BF16 multiplication and addition separate, matching eager rounding.
+        out[row + c] = __hadd2(x[row + c], __hmul2(y[row + c], m[mod + c]));
     }
 }
 template<class T> __global__ void repeatRowsKernel(const T *x,T *y,size_t n,int cols,int copies) {
@@ -497,6 +520,31 @@ Tensor Runtime::siluMultiply(const Tensor &x,const Tensor &y) {
     check(cudaGetLastError()); return out;
 }
 
+Tensor Runtime::siluMultiply(const Tensor &x) {
+    require(x.cols%2==0,"invalid packed SiLU width");
+    Tensor out(x.rows,x.cols/2,x.dtype);
+    DISPATCH_TENSOR(x.dtype, T, packedSiluMultiply<T><<<grid(out.size()),256,0,cudaStreamPerThread>>>(
+        as<T>(x),as<T>(out),out.size(),out.cols));
+    check(cudaGetLastError()); return out;
+}
+Tensor Runtime::scaledResidual(const Tensor &x,const Tensor &y,const Tensor &scale) {
+    require(x.isFloat32() && scale.isFloat32() && x.rows==y.rows && x.cols==y.cols &&
+            scale.cols==x.cols && (scale.rows==1 || scale.rows==x.rows),"scaled residual shape/dtype mismatch");
+    Tensor out(x.rows,x.cols,DType::FP32);
+    // Large streaming tensors benefit from more blocks; smaller tensors retain
+    // the shared backend's grid to avoid scheduling overhead.
+    int blocks=x.size()>(1u<<24) ? int(std::min<size_t>((x.size()+255)/256,65535)) : grid(x.size());
+    // --fmad=false preserves the separate FP32 product and sum.
+    if(scale.rows==1) {
+        DISPATCH_TENSOR(y.dtype, T, scaledResidualKernel<T,true><<<blocks,256,0,cudaStreamPerThread>>>(
+            as<float>(x),as<T>(y),as<float>(scale),as<float>(out),x.size(),x.cols));
+    } else {
+        DISPATCH_TENSOR(y.dtype, T, scaledResidualKernel<T,false><<<blocks,256,0,cudaStreamPerThread>>>(
+            as<float>(x),as<T>(y),as<float>(scale),as<float>(out),x.size(),x.cols));
+    }
+    check(cudaGetLastError()); return out;
+}
+
 Tensor Runtime::bias(const Tensor &x,const Tensor &bias) {
     require(bias.size()==size_t(x.cols) && bias.dtype==x.dtype,"bias shape/dtype mismatch"); Tensor out(x.rows,x.cols,x.dtype);
     DISPATCH_TENSOR(x.dtype, T, addBias<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(bias),as<T>(out),x.size(),x.cols)); check(cudaGetLastError()); return out;
@@ -525,6 +573,42 @@ Tensor Runtime::modulate(const Tensor &x,const Tensor &m,int shift,int scale) {
 Tensor Runtime::residual(const Tensor &x,const Tensor &y,const Tensor &m,int gate) {
     require(x.dtype==y.dtype && x.dtype==m.dtype && x.rows==y.rows && x.cols==y.cols && m.rows==1 && gate>=0 && m.cols>=(gate+1)*x.cols,"residual dimension mismatch");
     Tensor out(x.rows,x.cols,x.dtype); DISPATCH_TENSOR(x.dtype, T, modulation<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(y),as<T>(m),as<T>(out),x.size(),x.cols,gate,0,true)); check(cudaGetLastError()); return out;
+}
+Tensor Runtime::modulateRows(const Tensor &x, const Tensor &m, const Tensor &idx, int shift, int scale) {
+    require(x.dtype != DType::FP16 && x.dtype == m.dtype && idx.isFloat32() && idx.cols == 1 &&
+                idx.rows == x.rows && shift >= 0 && scale >= 0 &&
+                m.cols >= (std::max(shift, scale) + 1) * x.cols,
+            "invalid indexed modulation shape/dtype");
+    Tensor out(x.rows, x.cols, x.dtype);
+    if (x.isFloat32())
+        modulation<float,true><<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
+            as<float>(x), nullptr, as<float>(m), as<float>(out), x.size(), x.cols, shift, scale, false, as<int>(idx), m.cols);
+    else
+        modulation<B,true><<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(as<B>(x), nullptr, as<B>(m),
+            as<B>(out), x.size(), x.cols, shift, scale, false, as<int>(idx), m.cols);
+    check(cudaGetLastError());
+    return out;
+}
+Tensor Runtime::residualRows(const Tensor &x, const Tensor &y, const Tensor &m, const Tensor &idx, int gate) {
+    require(x.dtype != DType::FP16 && x.dtype == y.dtype && x.dtype == m.dtype && x.rows == y.rows &&
+                x.cols == y.cols && idx.isFloat32() && idx.cols == 1 && idx.rows == x.rows && gate >= 0 &&
+                m.cols >= (gate + 1) * x.cols,
+            "invalid indexed residual shape/dtype");
+    Tensor out(x.rows, x.cols, x.dtype);
+    if (x.isFloat32())
+        modulation<float,true><<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
+            as<float>(x), as<float>(y), as<float>(m), as<float>(out), x.size(), x.cols, gate, 0, true, as<int>(idx), m.cols);
+    else if (x.cols >= 512 && x.cols % 2 == 0 && m.cols % 2 == 0 &&
+             ((reinterpret_cast<uintptr_t>(x.data) | reinterpret_cast<uintptr_t>(y.data) |
+               reinterpret_cast<uintptr_t>(m.data)) % alignof(__nv_bfloat162) == 0))
+        residualBf16Pairs<<<x.rows, 256, 0, cudaStreamPerThread>>>(
+            as<__nv_bfloat162>(x), as<__nv_bfloat162>(y), as<__nv_bfloat162>(m), as<int>(idx),
+            as<__nv_bfloat162>(out), x.cols / 2, m.cols / 2, gate);
+    else
+        modulation<B,true><<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
+            as<B>(x), as<B>(y), as<B>(m), as<B>(out), x.size(), x.cols, gate, 0, true, as<int>(idx), m.cols);
+    check(cudaGetLastError());
+    return out;
 }
 Tensor Runtime::columns(const Tensor &x,int first,int count) {
     require(first>=0 && count>0 && first<=x.cols-count,"column slice out of range"); Tensor out(x.rows,count,x.dtype);

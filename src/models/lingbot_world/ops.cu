@@ -37,11 +37,6 @@ template<class T> __global__ void affineKernel(const float *x, const T *s, const
         y[i]=x[i]*a+value(b[j]);
     }
 }
-template<class T> __global__ void gateKernel(const float *x,const T *y,const float *g,float *out,
-                           size_t n,int width,int rows) {
-    for (size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x)
-        out[i]=x[i]+value(y[i])*g[rows==1?i%width:i];
-}
 template<class T> __global__ void patchKernel(const T *x,T *y,size_t n,int height,int width,
                                              int channels,bool unpack) {
     for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
@@ -432,14 +427,7 @@ Tensor Runtime::affine(const Tensor &x,const Tensor &scale,const Tensor &shift,b
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::gated(const Tensor &x,const Tensor &branch,const Tensor &gate) {
-    require(x.rows==branch.rows && x.cols==branch.cols && gate.cols==x.cols &&
-            (gate.rows==1 || gate.rows==x.rows),"LingBot gated residual shape mismatch");
-    auto a=cast(x,true),g=cast(gate,true); Tensor out(x.rows,x.cols,true);
-    if(branch.isFloat32()) gateKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(a),ptr<float>(branch),ptr<float>(g),
-        ptr<float>(out),x.size(),x.cols,g.rows);
-    else gateKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(a),ptr<B>(branch),ptr<float>(g),
-        ptr<float>(out),x.size(),x.cols,g.rows);
-    check(cudaGetLastError()); return out;
+    return scaledResidual(cast(x,true),branch,cast(gate,true));
 }
 Tensor Runtime::patch(const Tensor &x,int frames,int height,int width,bool unpack) {
     require(frames>0 && height>0 && width>0 && height%2==0 && width%2==0 &&

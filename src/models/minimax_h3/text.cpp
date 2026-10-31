@@ -130,9 +130,9 @@ Tensor TextEncoder::encodeVisual(const std::vector<int> &tokens, const std::vect
             if (count > 256)
                 count -= count % 256;
             auto input = y.rowSlice(first, count);
-            auto gate = rt_.activation(weights.linear(input, p + "mlp.gate_proj"));
+            auto gate = weights.linear(input, p + "mlp.gate_proj");
             auto target = output.rowSlice(first, count);
-            weights.linear(rt_.multiply(gate, weights.linear(input, p + "mlp.up_proj")), p + "mlp.down_proj",
+            weights.linear(rt_.siluMultiply(gate, weights.linear(input, p + "mlp.up_proj")), p + "mlp.down_proj",
                            false, &target);
             first += count;
         }

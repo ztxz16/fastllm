@@ -46,7 +46,7 @@ template <class F> static void rejects(F fn) {
     } catch (const std::invalid_argument &) {
         return;
     }
-    throw std::runtime_error("invalid linear output was accepted");
+    throw std::runtime_error("invalid operator input was accepted");
 }
 static void visionInputPreparation() {
     for (auto dtype : {DType::FP32, DType::FP16, DType::BF16}) {
@@ -608,19 +608,29 @@ int main() {
                 }
                 for (int width : {67, 2048}) {
                     auto x = randomTensor(full, rows, width), y = randomTensor(r, rows, width);
-                    auto scale = randomTensor(full, 1, width);
-                    auto reference = full.add(x, full.multiply(full.cast(y, DType::FP32), full.repeatRows(scale, rows)));
-                    std::cout << "scaled_residual dtype=" << int(dtype) << " rows=" << rows << " width=" << width;
-                    equal(full, reference, r.scaledResidual(x, y, scale));
-                    std::cout << std::endl;
+                    for (int scaleRows : {1, rows}) {
+                        auto scale = randomTensor(full, scaleRows, width);
+                        auto expanded = scaleRows == 1 ? full.repeatRows(scale, rows) : scale;
+                        auto reference = full.add(x, full.multiply(full.cast(y, DType::FP32), expanded));
+                        std::cout << "scaled_residual dtype=" << int(dtype) << " rows=" << rows
+                                  << " width=" << width << " scale_rows=" << scaleRows;
+                        equal(full, reference, r.scaledResidual(x, y, scale));
+                        std::cout << std::endl;
+                    }
+                    rejects([&] { r.scaledResidual(x, y, randomTensor(full, 2, width)); });
+                    rejects([&] { r.scaledResidual(x, y, randomTensor(full, 1, width + 1)); });
                 }
             }
             for (int rows : {1, 47, 513, 12847}) {
                 int width = rows == 12847 ? 14336 : 67;
                 auto x = randomTensor(r, rows, width * 2);
-                auto reference = r.multiply(r.columns(x, 0, width), r.activation(r.columns(x, width, width)));
+                auto hidden = r.columns(x, 0, width), gate = r.columns(x, width, width);
+                auto reference = r.multiply(hidden, r.activation(gate));
                 std::cout << "silu dtype=" << int(dtype) << " rows=" << rows;
                 equal(r, reference, r.siluMultiply(x));
+                std::cout << std::endl;
+                std::cout << "separate SiLU multiply rows=" << rows << " dtype=" << int(dtype);
+                equal(r, reference, r.siluMultiply(gate, hidden));
                 std::cout << std::endl;
             }
         }
