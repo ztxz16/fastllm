@@ -1298,6 +1298,7 @@ namespace fastllm {
                         cache[path] = meta;
                         return false;
                     }
+                    error.clear();
                     json = json11::Json::parse(body, error);
                 }
                 bool valid = error.empty() && json["ok"].bool_value() && json["version"].int_value() == 3 &&
