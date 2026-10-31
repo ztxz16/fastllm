@@ -93,8 +93,8 @@ int main(int argc, char **argv) {
         std::cerr << "Precision: " << (fp32 ? "fp32" : "bf16") << ", video VAE: " << precisionName(videoType)
                   << "\n";
         auto start = std::chrono::steady_clock::now();
-        auto result = pipeline.generate(
-            options,
+        auto result = pipeline.generateMP4(
+            options, output, ffmpeg,
             [&](const std::string &stage, int i, int n) {
                 if (stage != last || i != current)
                     std::cerr << stage << " " << i << "/" << n << "\n";
@@ -110,7 +110,6 @@ int main(int argc, char **argv) {
             if (!rgb || !audioOut)
                 throw std::runtime_error("cannot write media diagnostics");
         }
-        writeMP4(result, output, ffmpeg);
         std::cerr << "Saved " << output << " in "
                   << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
                   << " seconds\n";

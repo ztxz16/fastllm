@@ -107,6 +107,20 @@ Pipeline::Pipeline(const std::string &dir, int device, bool fp32, DType videoPre
 Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace trace,
                               const std::vector<float> *initialVideo,
                               const std::vector<float> *initialAudio) {
+    return generateImpl(o, std::move(progress), std::move(trace), initialVideo, initialAudio, {}, {});
+}
+Generation Pipeline::generateMP4(const GenerateOptions &o, const std::string &path,
+                                 const std::string &ffmpeg, Progress progress, Trace trace,
+                                 const std::vector<float> *initialVideo,
+                                 const std::vector<float> *initialAudio) {
+    if (path.empty())
+        throw std::invalid_argument("MP4 output path is empty");
+    return generateImpl(o, std::move(progress), std::move(trace), initialVideo, initialAudio, path, ffmpeg);
+}
+Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, Trace trace,
+                                   const std::vector<float> *initialVideo,
+                                   const std::vector<float> *initialAudio,
+                                   const std::string &path, const std::string &ffmpeg) {
     o.validate();
     rt_.activate();
     auto tick = [&](const std::string &stage, int i, int n) {
@@ -211,15 +225,6 @@ Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace
         result.width = o.width;
         result.height = o.height;
         result.frames = o.frames;
-        tick("video_decode", 0, 1);
-        result.rgb = video_.decodeRGB(
-            latents, [&](int current, int total) { tick("video_decode", current, total); });
-        if (!retainWeights_)
-            video_.unload();
-        tick("video_decode", 1, 1);
-        if (result.rgb.size() != size_t(o.frames) * o.width * o.height * 3)
-            throw std::runtime_error("decoded H3 frame count mismatch");
-        latents = {};
         result.audio.resize(size_t(at) * 800 * 2);
         for (int channel = 0; channel < 2; ++channel) {
             tick("audio_decode", channel, 2);
@@ -236,7 +241,34 @@ Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace
         }
         if (!retainWeights_)
             audio_.unload();
-        tick("completed", 1, 1);
+        tick("video_decode", 0, 1);
+        std::unique_ptr<MP4Writer> writer;
+        int videoCurrent = 0, videoTotal = 1;
+        if (!path.empty())
+            writer = std::make_unique<MP4Writer>(result, path, ffmpeg);
+        std::function<void(const std::vector<uint8_t> &)> onFrames;
+        if (writer)
+            onFrames = [&](const std::vector<uint8_t> &rgb) {
+                writer->write(rgb.data(), rgb.size(), [&] { tick("video_decode", videoCurrent, videoTotal); });
+            };
+        result.rgb = video_.decodeRGB(
+            latents, [&](int current, int total) {
+                videoCurrent = current;
+                videoTotal = total;
+                tick("video_decode", current, total);
+            },
+            std::move(onFrames));
+        if (!retainWeights_)
+            video_.unload();
+        tick("video_decode", 1, 1);
+        if (result.rgb.size() != size_t(o.frames) * o.width * o.height * 3)
+            throw std::runtime_error("decoded H3 frame count mismatch");
+        latents = {};
+        if (writer) {
+            tick("encode", 0, 1);
+            writer->finish([&] { tick("encode", 0, 1); });
+        } else
+            tick("completed", 1, 1);
         return result;
     } catch (...) {
         unload();

@@ -178,8 +178,14 @@ class Pipeline {
     Generation generate(const GenerateOptions &, Progress progress = {}, Trace trace = {},
                         const std::vector<float> *initialVideo = nullptr,
                         const std::vector<float> *initialAudio = nullptr);
+    Generation generateMP4(const GenerateOptions &, const std::string &path,
+                           const std::string &ffmpeg = "ffmpeg", Progress progress = {}, Trace trace = {},
+                           const std::vector<float> *initialVideo = nullptr,
+                           const std::vector<float> *initialAudio = nullptr);
 
   private:
+    Generation generateImpl(const GenerateOptions &, Progress, Trace, const std::vector<float> *,
+                            const std::vector<float> *, const std::string &path, const std::string &ffmpeg);
     Runtime rt_, full_, videoRuntime_;
     nomas::QwenTokenizer tokenizer_;
     TextEncoder text_;
@@ -190,6 +196,18 @@ class Pipeline {
     bool retainWeights_ = false;
 };
 // FFmpeg is only a media encoder; model inference remains entirely C++/CUDA.
+class MP4Writer {
+  public:
+    MP4Writer(const Generation &metadataAndAudio, const std::string &path,
+              const std::string &ffmpeg = "ffmpeg");
+    ~MP4Writer();
+    void write(const uint8_t *rgb, size_t bytes, std::function<void()> checkpoint = {});
+    void finish(std::function<void()> checkpoint = {});
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 void writeMP4(const Generation &, const std::string &path, const std::string &ffmpeg = "ffmpeg");
 } // namespace minimax_h3
 } // namespace fastllm

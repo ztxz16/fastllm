@@ -94,8 +94,9 @@ class Service {
                                 throw std::runtime_error("cancelled");
                             job->status = "in_progress";
                         }
-                        auto result = pipeline.generate(
-                            job->options, [&](const std::string &stage, int current, int total) {
+                        pipeline.generateMP4(
+                            job->options, output_ + "/" + job->id + ".mp4", ffmpeg,
+                            [&](const std::string &stage, int current, int total) {
                                 std::lock_guard<std::mutex> lock(job->mutex);
                                 if (job->cancelled || stopping_)
                                     throw std::runtime_error("cancelled");
@@ -105,23 +106,17 @@ class Service {
                                 int first = stage == "text"           ? 0
                                             : stage == "prepare"      ? 10
                                             : stage == "denoise"      ? 15
-                                            : stage == "video_decode" ? 85
-                                                                      : 95;
+                                            : stage == "audio_decode" ? 85
+                                            : stage == "video_decode" ? 89
+                                                                      : 99;
                                 int span = stage == "text"           ? 10
                                            : stage == "prepare"      ? 5
                                            : stage == "denoise"      ? 70
+                                           : stage == "audio_decode" ? 4
                                            : stage == "video_decode" ? 10
-                                                                     : 4;
+                                                                     : 0;
                                 job->progress = first + (total ? span * current / total : 0);
                             });
-                        {
-                            std::lock_guard<std::mutex> lock(job->mutex);
-                            if (job->cancelled)
-                                throw std::runtime_error("cancelled");
-                            job->stage = "encode";
-                            job->progress = 99;
-                        }
-                        writeMP4(result, output_ + "/" + job->id + ".mp4", ffmpeg);
                         std::lock_guard<std::mutex> lock(job->mutex);
                         if (job->cancelled) {
                             std::filesystem::remove(output_ + "/" + job->id + ".mp4");
