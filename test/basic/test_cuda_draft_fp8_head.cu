@@ -1,5 +1,6 @@
 #include "fastllm.h"
 #include "fastllm-cuda.cuh"
+#include "fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-draft-head.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -53,13 +54,30 @@ static void test(int m,int n,int k){
  for(size_t i=0;i<half.size();i++)CHECK(std::abs(half[i]-.5f*actual[i])<1e-5f);
  setenv("FASTLLM_DSPARK_FP8_HEAD","0",1);CHECK(!FastllmCudaTryFp8DraftHead(input,weight,out));unsetenv("FASTLLM_DSPARK_FP8_HEAD");
  CHECK(!FastllmCudaTryFp8DraftHead(input,weight,input));
- cudaGraph_t graph;CHECK(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)==cudaSuccess);
- CHECK(!FastllmCudaTryFp8DraftHead(input,weight,out));CHECK(cudaStreamEndCapture(cudaStreamPerThread,&graph)==cudaSuccess);cudaGraphDestroy(graph);
+ // Record/retain transient operands exactly as the model graph does.
+ std::vector<size_t> allocations;
+ {FastllmCudaAllocationRecorder recorder(&allocations);CHECK(FastllmCudaTryFp8DraftHead(input,weight,out));}
+ CHECK(cudaDeviceSynchronize()==cudaSuccess);CHECK(FastllmCudaReserveGraphWorkspace(allocations));
+ std::vector<void*> retained;void *graph=nullptr,*exec=nullptr;
+ CHECK(FastllmCudaGraphPrepareCaptureDevice());CHECK(FastllmCudaGraphMemoryPoolBegin());
+ CHECK(FastllmCudaGraphBeginCapture());CHECK(FastllmCudaTryFp8DraftHead(input,weight,out));
+ CHECK(FastllmCudaGraphEndCapture(&graph));CHECK(FastllmCudaGraphMemoryPoolEnd(retained));
+ CHECK(FastllmCudaGraphInstantiate(graph,&exec));
+ for(int replay=0;replay<4;++replay){
+  // Power-of-two scaling gives an exact independent replay oracle.
+  for(auto &v:x)v=__float2bfloat16_rn(float(v)*0.5f);
+  CHECK(cudaMemcpy(input.cudaData,x.data(),input.GetBytes(),cudaMemcpyHostToDevice)==cudaSuccess);
+  CHECK(FastllmCudaGraphLaunch(exec));CHECK(cudaDeviceSynchronize()==cudaSuccess);
+  CHECK(cudaMemcpy(half.data(),out.cudaData,out.GetBytes(),cudaMemcpyDeviceToHost)==cudaSuccess);
+  for(size_t i=0;i<half.size();++i)CHECK(std::abs(half[i]-std::ldexp(actual[i],-replay-2))<1e-5f);
+ }
+ FastllmCudaGraphExecDestroy(exec);FastllmCudaGraphDestroy(graph);
+ for(void *ptr:retained)FastllmCudaFree(ptr);
  std::printf("HEAD m=%d n=%d k=%d math_l2=%.8g quantization_l2=%.8g\n",m,n,k,rel,loss);
 }
 int main(){
  int count=0;if(cudaGetDeviceCount(&count)!=cudaSuccess||!count)return 77;FastllmCudaSetDevice(0);
  if(FastllmCudaRuntimeArch()!=120&&FastllmCudaRuntimeArch()!=121)return 77;
- for(int m:{1,2,5,8,16})for(auto shape:std::vector<std::vector<int>>{{32,32},{160,96},{256,1280},{512,5120}})test(m,shape[0],shape[1]);
- puts("DRAFT_HEAD_PASS cases=20");
+ for(int m:{1,2,3,5,7,8,9,16})for(auto shape:std::vector<std::vector<int>>{{32,32},{160,96},{256,1280},{512,5120}})test(m,shape[0],shape[1]);
+ puts("DRAFT_HEAD_PASS cases=32 graph_replays=128");
 }

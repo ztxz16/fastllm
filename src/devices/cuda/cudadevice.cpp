@@ -1347,7 +1347,7 @@ namespace fastllm {
         int arch = CudaTritonRuntimeArch();
         std::string dir = CudaTritonCacheDir();
         std::string base = planar ?
-            "mxfp4_grouped_v5_planar_sm" + std::to_string(arch) + "_h5120_i2304_k" + std::to_string(topk) + "_n32_64_k256_w4_s2" :
+            "mxfp4_grouped_v6_planar_sm" + std::to_string(arch) + "_h5120_i2304_k" + std::to_string(topk) + "_n32_64_k256_w4_s2" :
             "mxfp4_grouped_v3_sm" + std::to_string(arch) + "_h5120_i2304_k6_n64_k128_w4_s3";
         std::string path = CudaTritonJoinPath(dir, base + ".json");
         struct Meta {
@@ -1386,7 +1386,7 @@ namespace fastllm {
                     error.clear();
                     json = json11::Json::parse(body, error);
                 }
-                bool valid = error.empty() && json["ok"].bool_value() && json["version"].int_value() == (planar ? 5 : 3) &&
+                bool valid = error.empty() && json["ok"].bool_value() && json["version"].int_value() == (planar ? 6 : 3) &&
                              json["arch"].int_value() == arch && json["planar"].bool_value() == planar &&
                              (!planar || json["topk"].int_value() == topk);
                 const char *keys[] = {"gate", planar ? "down" : "activate", "down"};

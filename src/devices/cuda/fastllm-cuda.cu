@@ -17449,6 +17449,67 @@ bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
                        [vocabSize](int id) { return id >= 0 && id < vocabSize; });
 }
 
+namespace {
+__global__ void PrepareMtpDeviceSampling(float *temperature, int *topK, float *topP,
+        float t, int k, float p) {
+    *temperature = t; *topK = k; *topP = p;
+}
+__global__ void AdvanceMtpDeviceSampling(uint64_t *offset) { ++*offset; }
+}
+
+bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
+        float temperature, int topK, float topP, int *output, int vocabSize,
+        fastllm::Data &workspace) {
+    if (!logits || !proposalProbs || !output || vocabSize <= 0 ||
+        !std::isfinite(temperature) || temperature <= 0 ||
+        !std::isfinite(topP) || topP <= 0 || topP > 1) return false;
+    const size_t row = FastllmCudaAlignBytes(size_t(vocabSize) * sizeof(float), 256);
+    const size_t bytes = 2 * row + 512 + FastllmCudaAlignBytes(sizeof(flashinfer::sampling::RadixRowState), 256);
+    if (bytes > INT_MAX) return false;
+    const int device = FastllmCudaGetDevice();
+    if (workspace.dataType != fastllm::INT8 || workspace.dims != std::vector<int>{int(bytes)} ||
+        workspace.dataDevice != fastllm::CUDA || workspace.dataDeviceIds != std::vector<int>{device} || !workspace.cudaData) {
+        if (FastllmCudaGraphIsCapturing()) return false;
+        workspace.dataType = fastllm::INT8; workspace.UpdateUnitSize(); workspace.Resize({int(bytes)});
+        workspace.ToDevice(fastllm::CUDA, {device}, false); workspace.Allocate(false);
+        uint64_t state[2] = {FastllmMtpSamplingSeed(), 0};
+        if (cudaMemcpy(static_cast<uint8_t *>(workspace.cudaData) + 2 * row + 256,
+                state, sizeof(state), cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    }
+    auto *base = static_cast<uint8_t *>(workspace.cudaData);
+    float *a = reinterpret_cast<float *>(base), *b = reinterpret_cast<float *>(base + row);
+    auto *t = reinterpret_cast<float *>(base + 2 * row);
+    auto *k = reinterpret_cast<int *>(t + 1);
+    auto *p = t + 2;
+    auto *valid = reinterpret_cast<bool *>(t + 3);
+    auto *seed = reinterpret_cast<uint64_t *>(base + 2 * row + 256);
+    auto *states = reinterpret_cast<flashinfer::sampling::RadixRowState *>(base + 2 * row + 512);
+    topK = topK <= 0 ? vocabSize : std::min(topK, vocabSize);
+    cudaStream_t stream = cudaStreamPerThread;
+    PrepareMtpDeviceSampling<<<1, 1, 0, stream>>>(t, k, p, temperature, topK, topP);
+    FastllmTemperatureSoftmaxKernel<1024><<<1, 1024, 0, stream>>>(logits, a, t, vocabSize);
+    cudaError_t status = cudaGetLastError();
+    if (status == cudaSuccess && topP < 1) {
+        status = flashinfer::sampling::TopPRenormProb<float>(a, b, p, 1, 1.0f, vocabSize, stream);
+        std::swap(a, b);
+    }
+    if (status == cudaSuccess && topK < vocabSize) {
+        status = cudaMemsetAsync(states, 0, sizeof(*states), stream);
+        if (status == cudaSuccess) {
+            status = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
+                a, b, k, 1, 0, vocabSize, states, stream);
+            std::swap(a, b);
+        }
+    }
+    if (status == cudaSuccess) status = cudaMemcpyAsync(proposalProbs, a,
+        size_t(vocabSize) * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    if (status == cudaSuccess) status = flashinfer::sampling::SamplingFromProb<float, int, 1>(
+        proposalProbs, output, valid, nullptr, 1, vocabSize, true, seed, 0, seed + 1, 0, stream);
+    if (status != cudaSuccess) return false;
+    AdvanceMtpDeviceSampling<<<1, 1, 0, stream>>>(seed + 1);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
                                     const float *temperatures, const int *topKs,
                                     const float *topPs, const int *draftTokenIds,

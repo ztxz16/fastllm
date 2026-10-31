@@ -317,6 +317,7 @@ struct DeviceCache {
     OffloadGroup *tensorParallelOwner = nullptr;
     bool attempted = false;
     bool ready = false;
+    bool completeNative = false;
     int device = -1;
     int slots = 0;
     fastllm::cuda::RecordCopyLaunch copyLaunch{0, 0};
@@ -1278,6 +1279,7 @@ void PreloadCompleteNativeCache(OffloadGroup &group, DeviceCache &cache) {
     checkCudaErrors("MoE full-resident fence", cudaEventRecord(cache.admissionDone, cudaStreamPerThread));
     checkCudaErrors("MoE full-resident completion", cudaEventSynchronize(cache.admissionDone));
     cache.uploadedExpertBytes += cache.recordBytes;
+    cache.completeNative = true;
 }
 
 DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
@@ -3495,6 +3497,93 @@ static bool ComputeBatchExperts(const fastllm::Data &input, fastllm::Data &activ
 
 static int EndMoeFrequencyStep(DeviceCache &cache);
 
+// Complete immutable native caches do not need a CPU routing round trip.
+// Stable expert ordering groups weight reads while routeMap retains each
+// original token/top-k slot for activation storage and the ordered reduction.
+__global__ void PrepareCompleteNativeRoutes(const int32_t *indices, const int32_t *keys,
+        int32_t *slots, int32_t *routeMap, int base, int experts, int routes) {
+    const int r = threadIdx.x;
+    if (r >= routes) return;
+    const int expert = indices[r];
+    int rank = 0;
+    for (int j = 0; j < routes; ++j)
+        rank += indices[j] < expert || (indices[j] == expert && j < r);
+    slots[rank] = expert >= 0 && expert < experts ? keys[base + expert] : -1;
+    routeMap[rank] = r;
+}
+
+static bool RunCompleteNativeCache(OffloadGroup &group, DeviceCache &cache, int table,
+        const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
+        fastllm::Data &output, const std::function<void()> &parallel) {
+    using namespace fastllm;
+    const auto &layout = group.LayerLayout(table);
+    if (!cache.completeNative || !layout.deepSeekV41 || !layout.planarMxfp4 ||
+        cache.device != FastllmCudaGetDevice() || !group.expertDevices.empty() ||
+        input.multiDeviceData || index.multiDeviceData || score.multiDeviceData || output.multiDeviceData ||
+        &output == &input || &output == &index || &output == &score ||
+        input.dataDeviceIds != std::vector<int>{cache.device} ||
+        index.dataDeviceIds != input.dataDeviceIds || score.dataDeviceIds != input.dataDeviceIds ||
+        input.dataDevice != CUDA || input.dataType != BFLOAT16 ||
+        input.dims.size() != 2 || input.dims[0] < 1 || input.dims[1] != layout.hidden ||
+        index.dims.size() != 2 || index.dims[0] != input.dims[0] || index.dims != score.dims ||
+        index.dims[1] < 1 || index.dims[1] > kMaxTopK ||
+        index.dataDevice != CUDA || index.dataType != INT32 || score.dataDevice != CUDA ||
+        score.dataType != FLOAT32 || !input.cudaData || !index.cudaData || !score.cudaData ||
+        !PackedCacheRows(input) || !PackedCacheRows(index) || !PackedCacheRows(score)) return false;
+    auto aliases = [&](const Data &source) {
+        if (!output.cudaData) return false;
+        const uintptr_t out = reinterpret_cast<uintptr_t>(output.cudaData);
+        const uintptr_t in = reinterpret_cast<uintptr_t>(source.cudaData);
+        return out < in + source.GetBytes() && in < out + output.GetBytes();
+    };
+    if (aliases(input) || aliases(index) || aliases(score)) return false;
+    auto allocate = [&](Data &data, DataType type, const std::vector<int> &shape) {
+        data.dataType = type; data.Resize(shape);
+        data.ToDevice(CUDA, {cache.device}, false); data.Allocate(false);
+    };
+    allocate(output, BFLOAT16, input.dims);
+    if (parallel) { parallel(); FastllmCudaSetDevice(cache.device); }
+    const int topk = index.dims[1], hidden = layout.hidden;
+    // A bounded per-tile workspace supports arbitrary positive row counts,
+    // including draft lengths larger than the grouped kernel's eight rows.
+    for (int first = 0; first < input.dims[0]; first += 8) {
+        const int rows = std::min(8, input.dims[0] - first), routes = rows * topk;
+        Data x, ids, scores, result, quantized, gate, partial, slots, routeMap;
+        x.FakeFrom(input, size_t(first) * hidden * sizeof(uint16_t)); x.Resize({rows, hidden});
+        ids.FakeFrom(index, size_t(first) * topk * sizeof(int)); ids.Resize({rows, topk});
+        scores.FakeFrom(score, size_t(first) * topk * sizeof(float)); scores.Resize({rows, topk});
+        result.FakeFrom(output, size_t(first) * hidden * sizeof(uint16_t)); result.Resize({rows, hidden});
+        allocate(quantized, BFLOAT16, {rows, hidden}); allocate(gate, BFLOAT16, {routes, layout.inter});
+        allocate(partial, FLOAT32, {routes, hidden}); allocate(slots, INT32, {routes});
+        allocate(routeMap, INT32, {routes});
+        PrepareCompleteNativeRoutes<<<1, 256, 0, cudaStreamPerThread>>>(
+            static_cast<const int32_t *>(ids.cudaData), cache.keyToSlot,
+            static_cast<int32_t *>(slots.cudaData), static_cast<int32_t *>(routeMap.cudaData),
+            table * layout.experts, layout.experts, routes);
+        checkCudaErrors("Complete MoE partial reset", cudaMemsetAsync(partial.cudaData, 0,
+            size_t(routes) * hidden * sizeof(float), cudaStreamPerThread));
+        if (!FastllmCudaDeepSeekV41QuantizeActivation(x, quantized)) return false;
+        FastllmCudaMoeGGUFCacheView view{};
+        view.records = cache.records; view.routeSlots = static_cast<int32_t *>(slots.cudaData);
+        view.routeMap = static_cast<int32_t *>(routeMap.cudaData); view.routeCount = routes;
+        if (!ComputeBatchExperts(quantized, gate, result, layout, view,
+                static_cast<const float *>(scores.cudaData), topk, static_cast<float *>(partial.cudaData), true)) return false;
+        fastllm::cuda::dsv41_cache::Reduce<<<dim3((hidden + 255) / 256, rows), 256, 0, cudaStreamPerThread>>>(
+            static_cast<const float *>(partial.cudaData), static_cast<const float *>(partial.cudaData),
+            static_cast<const int32_t *>(ids.cudaData), static_cast<const int32_t *>(ids.cudaData),
+            static_cast<__nv_bfloat16 *>(result.cudaData), hidden, topk);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaMoeCacheFullyResident(fastllm::Data **weights, int weightsBatch) {
+    auto *group = FindHybridGroup(weights, weightsBatch);
+    if (!group || !group->layout.deepSeekV41 || !group->layout.planarMxfp4 ||
+        !group->expertDevices.empty()) return false;
+    auto *cache = GetDeviceCache(*group, false);
+    return cache && cache->completeNative;
+}
+
 bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int rank,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
@@ -4563,6 +4652,15 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
         const std::function<void()> &launchParallel, const std::vector<int> *devices) {
 #ifdef USE_NUMAS
+    if (!devices || devices->size() <= 1) {
+        int table = -1;
+        auto *group = FindHybridGroup(weights, weightsBatch, &table);
+        if (group && group->layout.deepSeekV41 && group->layout.planarMxfp4) {
+            auto *cache = GetDeviceCache(*group, false);
+            if (cache && RunCompleteNativeCache(*group, *cache, table, input, index, score, output, launchParallel))
+                return true;
+        }
+    }
     {
         int table = -1;
         auto *group = FindHybridGroup(weights, weightsBatch, &table);
@@ -5045,6 +5143,7 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
     // activation quantization and reduction; short prefill tails need not use
     // the CPU-only backend just because they exceed the verifier row count.
     if (input.dims.size() == 2 && input.dims[0] > 8 && input.dims[0] < 32 &&
+        !FastllmCudaMoeCacheFullyResident(weights, weightsBatch) &&
         input.dataDevice == fastllm::DataDevice::CUDA && index.dataDevice == fastllm::DataDevice::CUDA &&
         score.dataDevice == fastllm::DataDevice::CUDA && input.dataType == fastllm::BFLOAT16 &&
         index.dims.size() == 2 && index.dims == score.dims && index.dims[0] == input.dims[0] &&

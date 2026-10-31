@@ -190,7 +190,15 @@ if triton is not None:
         first = tl.program_id(1)
         slot = tl.load(Slots + first)
         previous = tl.load(Slots + first - 1, first > 0, other=-2)
-        if slot >= 0 and slot != previous:
+        # A tile covers eight routes. Repeated indices can make an expert's
+        # run longer than eight even with at most eight input rows.
+        start = slot != previous
+        earlier = tl.load(Slots + first - 8, first >= 8, other=-2)
+        if slot >= 0 and slot == earlier:
+            prior = tl.arange(0, 64)
+            same = (prior < first) & (tl.load(Slots + prior, prior < first, other=-2) == slot)
+            start = (tl.sum(same.to(tl.int32), 0) % 8) == 0
+        if slot >= 0 and start:
             m = tl.arange(0, 16)
             valid = (first + m < COUNT) & (m < 8)
             active = tl.load(Slots + first + m, valid, other=-2) == slot
@@ -4762,7 +4770,7 @@ def mxfp4_grouped_cache_paths(payload):
     topk = payload.get("topk", 6)
     if type(topk) is not int or topk not in ((3, 6) if planar else (6,)):
         raise ValueError("unsupported grouped MXFP4 topk")
-    base = (f"mxfp4_grouped_v5_planar_sm{arch}_h5120_i2304_k{topk}_n32_64_k256_w4_s2" if planar else
+    base = (f"mxfp4_grouped_v6_planar_sm{arch}_h5120_i2304_k{topk}_n32_64_k256_w4_s2" if planar else
             f"mxfp4_grouped_v3_sm{arch}_h5120_i2304_k6_n64_k128_w4_s3")
     root = Path(payload["cache_dir"])
     return {
@@ -4793,7 +4801,7 @@ def compile_mxfp4_grouped(payload):
                      DOWN="constexpr", GATE="constexpr", BN="constexpr", BK="constexpr"),
                 dict(H=h, I=i, TOPK=topk, STRIDE=stride, DOWN=down, GATE=name == "gate", BN=bn, BK=256),
                 arch, 4, 2, paths[name], enable_fp_fusion=False)
-        meta = dict(ok=True, op="mxfp4_grouped", version=5, planar=True, arch=arch, topk=topk,
+        meta = dict(ok=True, op="mxfp4_grouped", version=6, planar=True, arch=arch, topk=topk,
                     kernels={k: dict(cubin=str(paths[k]), kernel=v.metadata.name,
                                      shared=int(v.metadata.shared), num_warps=int(v.metadata.num_warps))
                              for k,v in infos.items()})

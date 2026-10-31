@@ -348,6 +348,55 @@ static void Compare(const std::vector<float> &actual, const std::vector<float> &
     }
 }
 
+static void CheckCompleteNativeGraphs(std::vector<Data *> &weights, int layer) {
+    const int hidden = weights[2]->dims[1], experts = weights.size() / 2 - 1;
+    Require(FastllmCudaMoeCacheFullyResident(weights.data(), weights.size()), "complete cache not recognized");
+    int checks = 0;
+    for (int rows : {1, 2, 3, 5, 7, 8, 9, 16, 31, 32}) for (int topk : {1, 3, 6, 16}) {
+        Data input(BFLOAT16, {rows, hidden}), ids(INT32, {rows, topk}), scores(FLOAT32, {rows, topk}), output;
+        Gpu(input); Gpu(ids); Gpu(scores);
+        std::vector<uint16_t> x(rows * hidden), expected(x.size()), actual(x.size());
+        std::vector<int> selected(rows * topk), cpu(selected.size(), -1);
+        std::vector<float> scales(selected.size());
+        auto update = [&](int pass) {
+            for (size_t i = 0; i < x.size(); ++i) x[i] = Float32ToBFloat16RNEBits(float(int((i * 7 + pass * 13) % 47) - 23) / 32);
+            for (size_t i = 0; i < selected.size(); ++i) {
+                selected[i] = (i * 3 + pass * 7) % experts;
+                scales[i] = (i + pass) % 5 == 0 ? 0 : .125f + (i % 3) * .0625f;
+            }
+            Check(cudaMemcpy(input.cudaData, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+            Check(cudaMemcpy(ids.cudaData, selected.data(), selected.size() * 4, cudaMemcpyHostToDevice));
+            Check(cudaMemcpy(scores.cudaData, scales.data(), scales.size() * 4, cudaMemcpyHostToDevice));
+        };
+        auto run = [&] { return FastllmCudaMergeMOEHybrid(input, ids, scores, output,
+            weights.data(), weights.size(), layer); };
+        update(0); Require(run(), "complete cache warmup rejected"); Check(cudaDeviceSynchronize());
+        Require(FastllmCudaGraphPrepareCaptureDevice() && FastllmCudaGraphMemoryPoolBegin(), "complete capture pool");
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        Require(run(), "complete cache capture rejected");
+        cudaGraph_t graph; cudaGraphExec_t exec;
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        std::vector<void *> reserved;
+        Require(FastllmCudaGraphMemoryPoolEnd(reserved), "complete capture pool end");
+        Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        for (int pass = 0; pass < 3; ++pass) {
+            update(pass);
+            NumasMoeVerifyExperts(x.data(), expected.data(), rows, weights.data(), weights.size(),
+                selected.data(), cpu.data(), scales.data(), topk, layer, 10, false);
+            Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+            Check(cudaMemcpy(actual.data(), output.cudaData, actual.size() * 2, cudaMemcpyDeviceToHost));
+            std::vector<float> a(actual.size()), e(expected.size());
+            for (size_t i = 0; i < a.size(); ++i) {
+                a[i] = __bfloat162float(*reinterpret_cast<__nv_bfloat16 *>(&actual[i]));
+                e[i] = __bfloat162float(*reinterpret_cast<__nv_bfloat16 *>(&expected[i]));
+            }
+            Compare(a, e, "complete cache graph/NUMA oracle mismatch"); ++checks;
+        }
+        cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); FastllmCudaGraphMemoryPoolRelease(reserved);
+    }
+    std::printf("COMPLETE_NATIVE_GRAPH_PASS %d replays, rows 1..32, topk 1/3/6/16\n", checks);
+}
+
 // A cache concentrated on one GPU must not disable the other prefill worker.
 // Keep all selected experts resident on GPU 0 and GPU 1 empty, then compare the
 // two-worker result with uncached projections and the same BF16 partial
@@ -671,6 +720,7 @@ int main(int argc, char **argv) {
                 }
             }
             std::printf("FULL_RESIDENT_PASS %zu exact values, %d initial expert mappings\n", checked, tables * experts);
+            CheckCompleteNativeGraphs(weights[0], 0);
             FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
             SetMoeCudaCacheBytes(record * 16);
             Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "restore partial cache");

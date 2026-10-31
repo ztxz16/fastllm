@@ -4,6 +4,7 @@
 #include "deepseekv41_hybrid.h"
 #include "baseblock.h"
 #include "utils.h"
+#include "moe_cache_config.h"
 #include "utils/hybrid_parallel.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
 #include "devices/disk/diskdevice.h"
@@ -77,7 +78,20 @@ namespace fastllm {
                 return bytes;
             };
             const uint64_t mainBytes = payload(routedWeights), draftBytes = payload(draftWeights);
-            const double draftFraction = draftBytes ? double(draftBytes) / (mainBytes + draftBytes) : 0;
+            double draftFraction = draftBytes ? double(draftBytes) / (mainBytes + draftBytes) : 0;
+            // On a single GPU, a small native draft group can fit completely
+            // inside the existing expert budget. Avoid recurrent CPU misses
+            // without increasing the model's total cache allocation.
+            if (!tp && FastllmCudaGetDeviceCount() == 1 && CudaTritonMxfp4GroupedEnabled() && draftBytes &&
+                weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0 &&
+                !draftWeights.empty() && draftWeights[0][2]->dataType == NVFP4_BLOCK_32_E8M0) {
+                const uint64_t budget = GetMoeCudaCacheDeviceBytes(0);
+                // One record of slack also avoids a lost slot after rounding
+                // the fractional byte budget in GetDeviceCache.
+                const uint64_t record = draftWeights[0][2]->GetBytes() + draftWeights[0][3]->GetBytes();
+                if (budget && draftBytes <= budget / 4 && record <= budget / 4 - draftBytes)
+                    draftFraction = double(draftBytes + record) / budget;
+            }
             HybridMoeCachePlan cache(HybridMoeMath::DeepSeekV41, swiglu_limit, 1.0 - draftFraction);
             for (int layer = 0; layer < block_cnt; ++layer) {
                 const auto device = SelectMoeDeviceForLayer(layer);

@@ -1661,6 +1661,11 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
 bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
                               const float *temperatures, const int *topKs,
                               const float *topPs, int *output, int batch, int vocabSize);
+// Graph-safe single-row sampler. Output/proposal are device buffers; workspace
+// owns stable scratch and a device RNG counter for the lifetime of the graph.
+bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
+    float temperature, int topK, float topP, int *output, int vocabSize,
+    fastllm::Data &workspace);
 bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
                                     const float *temperatures, const int *topKs,
                                     const float *topPs, const int *draftTokenIds,
@@ -2082,6 +2087,7 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
 // Eager single-token decode: generic FP32 or explicitly registered V4.1
 // BF16 math. Adapters execute disjoint CPU/CUDA subsets with shared scheduling.
 bool FastllmCudaCanRunMoeHybrid(fastllm::Data **weights, int weightsBatch);
+bool FastllmCudaMoeCacheFullyResident(fastllm::Data **weights, int weightsBatch);
 // Optional single-token callback runs once after routing copies, never on
 // rejection. It must not reenter the cache or alter its tensor allocations.
 bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,

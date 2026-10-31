@@ -239,6 +239,9 @@ bool EnsureMxfp8Weight(const fastllm::Data &weight, int rows, int cols,
             return true;
         }
     }
+    // Graphs may reuse a fully initialized immutable weight, never allocate
+    // or synchronize a new conversion during capture.
+    if (FastllmCudaGraphIsCapturingFast()) return false;
     const size_t quantBytes = (size_t)rows * cols;
     const size_t scaleBytes = (size_t)((rows + 127) / 128) * ((cols + 127) / 128) * 512;
     const size_t total = quantBytes + scaleBytes + (allowLossy ? 0 : sizeof(int));
@@ -329,14 +332,14 @@ extern "C" void FastllmCudaReleaseMxfp8CutlassCache(const fastllm::Data *weight)
 }
 
 // Draft only: block-32 W8A8 with FP32 accumulation and FP32 logits.
-// The shared target BF16 weight remains intact. Capture retains the established
-// BF16 path until the draft owns a persistent graph workspace.
+// The shared target BF16 weight remains intact. Warm the immutable conversion
+// before capture; transient operands use the graph-owned allocation pool.
 extern "C" bool FastllmCudaTryFp8DraftHead(const fastllm::Data &input,
         const fastllm::Data &weight, fastllm::Data &output) {
     using namespace fastllm;
     const char *flag = std::getenv("FASTLLM_DSPARK_FP8_HEAD");
     if ((flag && flag[0] && std::strcmp(flag, "1") != 0) || !Mxfp8EnvEnabled() ||
-        FastllmCudaGraphIsCapturing() || FastllmCudaRuntimeArch() < 120 || FastllmCudaRuntimeArch() > 121 ||
+        FastllmCudaRuntimeArch() < 120 || FastllmCudaRuntimeArch() > 121 ||
         &input == &output || &weight == &output || input.multiDeviceData || weight.multiDeviceData || output.multiDeviceData ||
         input.dataType != BFLOAT16 || weight.dataType != BFLOAT16 || weight.isFake ||
         input.dataDevice != CUDA || weight.dataDevice != CUDA || !input.cudaData || !weight.cudaData ||
@@ -370,11 +373,15 @@ extern "C" bool FastllmCudaTryFp8DraftHead(const fastllm::Data &input,
     try { workspaceBytes = Mxfp8DispatchWorkspace<float>(config, int(rows), n, k); }
     catch (...) { FastllmCudaClearThreadError(); return false; }
     const size_t quantBytes = rows * k, scaleBytes = size_t((k + 127) / 128) * 512;
-    size_t borrowed = 0; bool owned = false;
-    auto *scratch = static_cast<uint8_t *>(FastllmBorrowCudaTempBuffer(quantBytes + scaleBytes + workspaceBytes, &borrowed, &owned));
-    if (!scratch || borrowed < quantBytes + scaleBytes + workspaceBytes) {
-        FastllmReleaseCudaTempBuffer(scratch, owned); return false;
-    }
+    const size_t totalBytes = quantBytes + scaleBytes + workspaceBytes;
+    if (totalBytes > INT_MAX) return false;
+    // A shared temporary buffer can grow after capture and invalidate replay
+    // addresses. Pooled Data storage is instead retained by the graph owner.
+    Data scratchData(INT8, {int(totalBytes)});
+    scratchData.ToDevice(CUDA, input.dataDeviceIds, false);
+    scratchData.Allocate(false);
+    auto *scratch = static_cast<uint8_t *>(scratchData.cudaData);
+    if (!scratch) return false;
     auto dims = input.dims; dims.back() = n;
     output.dataType = FLOAT32; output.UpdateUnitSize(); output.Resize(dims);
     output.ToDevice(CUDA, input.dataDeviceIds); output.Allocate();
@@ -388,7 +395,6 @@ extern "C" bool FastllmCudaTryFp8DraftHead(const fastllm::Data &input,
                                 int(rows), n, k, reinterpret_cast<char *>(scratch + quantBytes + scaleBytes), workspaceBytes, stream);
         ok = cudaGetLastError() == cudaSuccess;
     } catch (...) { FastllmCudaClearThreadError(); ok = false; }
-    FastllmReleaseCudaTempBuffer(scratch, owned);
     return ok;
 }
 

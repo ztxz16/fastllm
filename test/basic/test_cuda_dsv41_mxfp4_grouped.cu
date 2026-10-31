@@ -101,7 +101,7 @@ int main(int argc, char **argv) {
     CUDA(cudaEventCreate(&start));
     CUDA(cudaEventCreate(&end));
     for (int rows : {2, 3, 4, 6, 8})
-        for (int shift : {0, 2, 6})
+        for (int shift : {0, 2, 6, -1, -2})
             for (int active : {0, 4}) {
                 int n = rows * K;
                 const int count = active ? active : n;
@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
                 std::vector<int> order(n), ss(n);
                 for (int i = 0; i < n; ++i)
                     order[i] = i;
-                auto slot = [&](int r) { return (r % K + (r / K) * shift) % S; };
+                auto slot = [&](int r) { return shift == -1 ? 0 : shift == -2 ? r % 2 : (r % K + (r / K) * shift) % S; };
                 std::sort(order.begin(), order.end(), [&](int l, int r) { return slot(l) < slot(r); });
                 for (int i = 0; i < n; ++i)
                     ss[i] = slot(order[i]);
@@ -205,7 +205,7 @@ int main(int argc, char **argv) {
                 printf("rows=%d shift=%d active=%d rel_l2=%g mismatch=%d/%d baseline_ms=%.4f triton_ms=%.4f\n", rows, shift,
                        count, rel, unequal, n * H, times[0] / 20, times[1] / 20);
                 fflush(stdout);
-                if (rows == 8 && shift == 2 && active == 0) {
+                if (rows == 8 && (shift == 2 || shift < 0) && active == 0) {
                     cudaGraph_t graph;
                     cudaGraphExec_t executable;
                     CUDA(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
