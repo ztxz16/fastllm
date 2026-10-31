@@ -62,15 +62,23 @@ template<class T> __global__ void patchKernel(const T *x,T *y,size_t n,int heigh
         }
     }
 }
-template<class T> __global__ void ropeKernel(const T *x,B *y,size_t n,int width,int gh,int gw,int offset) {
-    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
-        int pair=i%128/2,axis=pair<22?0:(pair<43?1:2);
+__global__ void ropeTable(double2 *table,int rows,int gh,int gw,int offset) {
+    for(size_t i=size_t(blockIdx.x)*256+threadIdx.x;i<size_t(rows)*64;i+=size_t(gridDim.x)*256) {
+        int pair=i%64,axis=pair<22?0:(pair<43?1:2);
         int local=pair-(axis==0?0:(axis==1?22:43)),count=axis==0?22:21;
-        size_t token=i/width;
+        size_t token=i/64;
         int pos=axis==0?int(token/(gh*gw))+offset:(axis==1?int(token/gw%gh):int(token%gw));
         double angle=double(pos)*pow(10000.0,-double(local)/count);
-        double a=double(value(x[i])),b=double(value(x[i%2?i-1:i+1]));
-        y[i]=B(float(a*cos(angle)+(i%2?b:-b)*sin(angle)));
+        table[i]=make_double2(cos(angle),sin(angle));
+    }
+}
+template<class T> __global__ void ropeKernel(const T *x,B *y,const double2 *table,size_t pairs,int width) {
+    for(size_t pair=size_t(blockIdx.x)*256+threadIdx.x;pair<pairs;pair+=size_t(gridDim.x)*256) {
+        size_t i=pair*2;
+        auto angle=table[(i/width)*64+pair%64];
+        double a=double(value(x[i])),b=double(value(x[i+1]));
+        y[i]=B(float(a*angle.x-b*angle.y));
+        y[i+1]=B(float(b*angle.x+a*angle.y));
     }
 }
 template<bool Weights> __global__ void convPatchKernel(const B *x,B *out,size_t n,
@@ -181,96 +189,105 @@ __global__ void headsToRows(const B *x,B *y,size_t n,int rows,int heads,int dim)
         y[i]=x[(size_t(c/dim)*rows+row)*dim+c%dim];
     }
 }
+
+// A fused version of the Wan FA2-compatible path. Keep reverse 64-key tiles
+// and four FP32 denominator sums: changing these changes BF16 PV rounding in
+// recurrent rollouts. MMA and exp/reciprocal use the existing FlashInfer code.
 __device__ uint32_t packed(B a,B b) {
     return uint32_t(__bfloat16_as_ushort(a)) | (uint32_t(__bfloat16_as_ushort(b))<<16);
 }
-__global__ void attentionScores(const B *q,const B *k,float *scores,int rows,int keys,int width) {
-    int lane=threadIdx.x%32,warp=threadIdx.x/32,head=blockIdx.z;
-    int firstRow=blockIdx.x*16,firstCol=warp*16;
-    if(firstCol>=keys) return;
-    float acc[8]={};
-    // Reuse the vendored MMA primitive. The fixed K traversal keeps the
-    // BF16 probability rounding consistent with the reference attention.
-    for(int inner=0;inner<128;inner+=16) {
-        uint32_t a[4],b[4];
-        for(int j=0;j<4;++j) {
-            int row=firstRow+lane/4+(j%2)*8,dim=inner+(lane%4)*2+(j/2)*8;
-            a[j]=row<rows?packed(q[size_t(row)*width+head*128+dim],q[size_t(row)*width+head*128+dim+1]):0;
-            int key=firstCol+lane/4+(j/2)*8;
-            dim=inner+(lane%4)*2+(j%2)*8;
-            b[j]=key<keys?packed(k[size_t(key)*width+head*128+dim],k[size_t(key)*width+head*128+dim+1]):0;
+__global__ void wanAttentionKernel(const B *q,const B *k,const B *v,B *out,int rows,int keys) {
+    constexpr int width=1536;
+    __shared__ float scores[16][64],stats[16][5],rescale[16];
+    __shared__ B prob[16][64];
+    int lane=threadIdx.x%32,warp=threadIdx.x/32,head=blockIdx.y;
+    int firstRow=blockIdx.x*16;
+    float acc[2][8]={};
+    bool first=true;
+    for(int base=(keys-1)/64*64;base>=0;base-=64) {
+        float dot[8]={};
+        #pragma unroll
+        for(int inner=0;inner<128;inner+=16) {
+            uint32_t a[4],b[4];
+            #pragma unroll
+            for(int j=0;j<4;++j) {
+                int row=firstRow+lane/4+(j%2)*8,dim=inner+(lane%4)*2+(j/2)*8;
+                a[j]=row<rows?packed(q[size_t(row)*width+head*128+dim],q[size_t(row)*width+head*128+dim+1]):0;
+                int key=base+warp*16+lane/4+(j/2)*8;
+                dim=inner+(lane%4)*2+(j%2)*8;
+                b[j]=key<keys?packed(k[size_t(key)*width+head*128+dim],k[size_t(key)*width+head*128+dim+1]):0;
+            }
+            flashinfer::mma::mma_sync_m16n16k16_row_col_f16f16f32<B>(dot,a,b);
         }
-        flashinfer::mma::mma_sync_m16n16k16_row_col_f16f16f32<B>(acc,a,b);
-    }
-    for(int j=0;j<8;++j) {
-        int row=firstRow+lane/4+(j%4/2)*8,col=firstCol+(lane%4)*2+(j/4)*8+j%2;
-        if(row<rows && col<keys) scores[(size_t(head)*rows+row)*keys+col]=acc[j];
-    }
-}
-__global__ void attentionValues(const B *prob,const B *v,float *output,int rows,int keys,int width) {
-    int lane=threadIdx.x%32,warp=threadIdx.x/32,head=blockIdx.z;
-    int firstRow=blockIdx.x*16,firstCol=blockIdx.y*64+warp*16;
-    float acc[8];
-    for(int j=0;j<8;++j) {
-        int row=firstRow+lane/4+(j%4/2)*8,col=firstCol+(lane%4)*2+(j/4)*8+j%2;
-        acc[j]=row<rows?output[(size_t(head)*rows+row)*128+col]:0.f;
-    }
-    // Accumulate into the rescaled running output at every MMA. A separate
-    // GEMM followed by beta*C changes the order across successive key tiles.
-    for(int inner=0;inner<64;inner+=16) {
-        uint32_t a[4],b[4];
-        for(int j=0;j<4;++j) {
-            int row=firstRow+lane/4+(j%2)*8,key=inner+(lane%4)*2+(j/2)*8;
-            auto p=prob+(size_t(head)*rows+row)*keys;
-            a[j]=packed(row<rows && key<keys?p[key]:B(0.f),row<rows && key+1<keys?p[key+1]:B(0.f));
-            int col=firstCol+lane/4+(j/2)*8;
-            key=inner+(lane%4)*2+(j%2)*8;
-            b[j]=packed(key<keys?v[size_t(key)*width+head*128+col]:B(0.f),
+        #pragma unroll
+        for(int j=0;j<8;++j) {
+            int row=lane/4+(j%4/2)*8,col=warp*16+(lane%4)*2+(j/4)*8+j%2;
+            scores[row][col]=base+col<keys?dot[j]:-INFINITY;
+        }
+        __syncthreads();
+        int r=threadIdx.x/8,l=threadIdx.x%8;
+        float maximum=-INFINITY;
+        #pragma unroll
+        for(int i=0;i<8;++i) maximum=fmaxf(maximum,scores[r][l+i*8]);
+        for(int d=4;d;d/=2) maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffff,maximum,d,8));
+        float previous=first?-INFINITY:stats[r][0];
+        maximum=fmaxf(previous,maximum);
+        constexpr float scale=0.08838834764831844f*1.4426950408889634f;
+        float factor=first?0.f:flashinfer::math::ptx_exp2((previous-maximum)*scale);
+        if(l==0) { stats[r][0]=maximum; rescale[r]=factor; }
+        #pragma unroll
+        for(int i=0;i<8;++i) {
+            int col=l+i*8;
+            float p=base+col<keys?flashinfer::math::ptx_exp2(__fmaf_rn(scores[r][col],scale,-maximum*scale)):0.f;
+            scores[r][col]=p; prob[r][col]=B(p);
+        }
+        __syncthreads();
+        if(l<4) {
+            float sum=first?scores[r][l*2]:__fmaf_rn(stats[r][1+l],factor,scores[r][l*2]);
+            #pragma unroll
+            for(int i=1;i<16;++i) sum+=scores[r][(i/2)*8+l*2+i%2];
+            stats[r][1+l]=sum;
+        }
+        #pragma unroll
+        for(int part=0;part<2;++part) {
+            #pragma unroll
+            for(int j=0;j<8;++j) acc[part][j]*=rescale[lane/4+(j%4/2)*8];
+            #pragma unroll
+            for(int inner=0;inner<64;inner+=16) {
+                uint32_t a[4],b[4];
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    int row=lane/4+(j%2)*8,key=inner+(lane%4)*2+(j/2)*8;
+                    a[j]=packed(prob[row][key],prob[row][key+1]);
+                    int col=part*64+warp*16+lane/4+(j/2)*8;
+                    key=base+inner+(lane%4)*2+(j%2)*8;
+                    b[j]=packed(key<keys?v[size_t(key)*width+head*128+col]:B(0.f),
                         key+1<keys?v[size_t(key+1)*width+head*128+col]:B(0.f));
+                }
+                flashinfer::mma::mma_sync_m16n16k16_row_col_f16f16f32<B>(acc[part],a,b);
+            }
         }
-        flashinfer::mma::mma_sync_m16n16k16_row_col_f16f16f32<B>(acc,a,b);
+        __syncthreads();
+        first=false;
     }
-    for(int j=0;j<8;++j) {
-        int row=firstRow+lane/4+(j%4/2)*8,col=firstCol+(lane%4)*2+(j/4)*8+j%2;
-        if(row<rows) output[(size_t(head)*rows+row)*128+col]=acc[j];
-    }
-}
-__global__ void onlineSoftmax(const float *scores,B *prob,float *stats,float *acc,int keys,bool first) {
-    __shared__ float partial[64],maximum,inverseScale;
-    int row=blockIdx.x,lane=threadIdx.x;
-    float x=lane<keys?scores[size_t(row)*keys+lane]:-INFINITY;
-    partial[lane]=x; __syncthreads();
-    for(int d=32;d;d/=2) { if(lane<d) partial[lane]=fmaxf(partial[lane],partial[lane+d]); __syncthreads(); }
-    constexpr float scale=0.08838834764831844f*1.4426950408889634f;
-    if(lane==0) {
-        float previous=first?-INFINITY:stats[row*5];
-        maximum=fmaxf(previous,partial[0]);
-        inverseScale=first?0.f:flashinfer::math::ptx_exp2((previous-maximum)*scale);
-        stats[row*5]=maximum;
-    }
-    __syncthreads();
-    float p=lane<keys?flashinfer::math::ptx_exp2(__fmaf_rn(x,scale,-maximum*scale)):0.f;
-    if(lane<keys) prob[size_t(row)*keys+lane]=B(p);
-    partial[lane]=p; __syncthreads();
-    // Keep the four Tensor Core lane sums separate across key tiles, as in
-    // FA2. Reducing each tile before rescaling changes BF16 output rounding.
-    if(lane<4) {
-        float sum=first?partial[lane*2]:__fmaf_rn(stats[row*5+1+lane],inverseScale,partial[lane*2]);
-        for(int i=1;i<16;++i) sum+=partial[(i/2)*8+lane*2+i%2];
-        stats[row*5+1+lane]=sum;
-    }
-    for(int j=lane;j<128;j+=64) acc[size_t(row)*128+j]=first?0.f:acc[size_t(row)*128+j]*inverseScale;
-}
-__global__ void finishAttention(const float *x,const float *stats,B *out,size_t n,int rows,int first,int width) {
-    for(size_t i=size_t(blockIdx.x)*256+threadIdx.x;i<n;i+=size_t(gridDim.x)*256) {
-        int c=i%width,row=i/width,head=c/128;
-        int source=head*rows+row;
-        auto sums=stats+source*5+1;
-        float inverse=flashinfer::math::ptx_rcp((sums[0]+sums[2])+(sums[1]+sums[3]));
-        out[size_t(row+first)*width+c]=B(x[size_t(source)*128+c%128]*inverse);
+    #pragma unroll
+    for(int part=0;part<2;++part) {
+        #pragma unroll
+        for(int j=0;j<8;++j) {
+            int r=lane/4+(j%4/2)*8,row=firstRow+r,col=part*64+warp*16+(lane%4)*2+(j/4)*8+j%2;
+            float inverse=flashinfer::math::ptx_rcp((stats[r][1]+stats[r][3])+(stats[r][2]+stats[r][4]));
+            if(row<rows) out[size_t(row)*width+head*128+col]=B(acc[part][j]*inverse);
+        }
     }
 }
+
 }
+struct Runtime::Rotary {
+    // Tensor owns aligned device storage; each row holds 64 FP64 (cos,sin)
+    // pairs. Keep the official complex128 arithmetic and cache only one grid.
+    Tensor table;
+    int frames=0,height=0,width=0,offset=0;
+};
 struct Runtime::FullLinear {
     struct Plan {
         cublasLtMatmulDesc_t op=nullptr;
@@ -390,9 +407,17 @@ Tensor Runtime::patch(const Tensor &x,int frames,int height,int width,bool unpac
 }
 Tensor Runtime::rope3d(const Tensor &x,int frames,int height,int width,int offset) {
     require(frames>0 && height>0 && width>0 && offset>=0 && x.rows==frames*height*width && x.cols%128==0,"LingBot RoPE shape mismatch");
+    if(!rotary_) rotary_=std::make_unique<Rotary>();
+    auto &r=*rotary_;
+    if(r.frames!=frames || r.height!=height || r.width!=width || r.offset!=offset) {
+        r.table=Tensor(x.rows,256,true);
+        ropeTable<<<grid(size_t(x.rows)*64),256,0,cudaStreamPerThread>>>(ptr<double2>(r.table),x.rows,height,width,offset);
+        check(cudaGetLastError());
+        r.frames=frames; r.height=height; r.width=width; r.offset=offset;
+    }
     Tensor out(x.rows,x.cols,false);
-    if(x.fp32) ropeKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(x),ptr<B>(out),x.size(),x.cols,height,width,offset);
-    else ropeKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<B>(x),ptr<B>(out),x.size(),x.cols,height,width,offset);
+    if(x.fp32) ropeKernel<<<grid(x.size()/2),256,0,cudaStreamPerThread>>>(ptr<float>(x),ptr<B>(out),ptr<double2>(r.table),x.size()/2,x.cols);
+    else ropeKernel<<<grid(x.size()/2),256,0,cudaStreamPerThread>>>(ptr<B>(x),ptr<B>(out),ptr<double2>(r.table),x.size()/2,x.cols);
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::t5Gelu(const Tensor &x) {
@@ -441,30 +466,11 @@ Tensor Runtime::relativeAttention(const Tensor &q,const Tensor &k,const Tensor &
 Tensor Runtime::wanAttention(const Tensor &q,const Tensor &k,const Tensor &v) {
     require(!q.fp32 && !k.fp32 && !v.fp32 && q.cols==1536 && k.cols==q.cols && v.cols==q.cols &&
             k.rows==v.rows && q.rows>0 && k.rows>0,"invalid Wan attention shape");
-    constexpr int heads=12,dim=128;
+    // The continuous backend already provides BF16 FlashInfer attention with
+    // FP32 accumulation. Reuse its fused path instead of launching separate
+    // QK / softmax / PV kernels for each 128-query by 64-key tile.
     Tensor out(q.rows,q.cols,false);
-    for(int start=0;start<q.rows;start+=128) {
-        int rows=std::min(128,q.rows-start);
-        Tensor acc(heads*rows,dim,true),stats(heads*rows,5,true);
-        // The official FA2 path visits 64-key tiles from the end. BF16 PV
-        // probabilities depend on each tile's running maximum, so retaining
-        // that traversal reduces drift in long recurrent world rollouts.
-        bool first=true;
-        for(int key=((k.rows-1)/64)*64;key>=0;key-=64) {
-            int count=std::min(64,k.rows-key);
-            Tensor logits(heads*rows,count,true),prob(heads*rows,count,false);
-            attentionScores<<<dim3((rows+15)/16,1,heads),128,0,cudaStreamPerThread>>>(
-                ptr<B>(q)+size_t(start)*q.cols,ptr<B>(k)+size_t(key)*k.cols,ptr<float>(logits),rows,count,q.cols);
-            onlineSoftmax<<<heads*rows,64,0,cudaStreamPerThread>>>(ptr<float>(logits),ptr<B>(prob),ptr<float>(stats),ptr<float>(acc),count,first);
-            check(cudaGetLastError());
-            attentionValues<<<dim3((rows+15)/16,2,heads),128,0,cudaStreamPerThread>>>(
-                ptr<B>(prob),ptr<B>(v)+size_t(key)*v.cols,ptr<float>(acc),rows,count,q.cols);
-            check(cudaGetLastError());
-            first=false;
-        }
-        finishAttention<<<grid(size_t(rows)*q.cols),256,0,cudaStreamPerThread>>>(ptr<float>(acc),ptr<float>(stats),ptr<B>(out),size_t(rows)*q.cols,rows,start,q.cols);
-        check(cudaGetLastError());
-    }
-    return out;
+    wanAttentionKernel<<<dim3((q.rows+15)/16,12),128,0,cudaStreamPerThread>>>(ptr<B>(q),ptr<B>(k),ptr<B>(v),ptr<B>(out),q.rows,k.rows);
+    check(cudaGetLastError()); return out;
 }
 }} // namespace fastllm::lingbot

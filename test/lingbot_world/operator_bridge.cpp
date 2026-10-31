@@ -128,6 +128,16 @@ int lingbot_test_activation(const float *input,float *output,int rows,int cols,i
         std::memcpy(output,values.data(),values.size()*sizeof(float));
     });
 }
+int lingbot_test_rope(const float *input,float *output,int frames,int height,int width,int offset,int full) {
+    return checked([&] {
+        Runtime rt(0);
+        auto x=full?rt.fp32.upload(input,frames*height*width,1536):rt.upload(input,frames*height*width,1536);
+        rt.rope3d(x,frames,height,width,offset+1);
+        rt.rope3d(x,frames,height,width,offset);
+        auto result=rt.download(rt.rope3d(x,frames,height,width,offset));
+        std::memcpy(output,result.data(),result.size()*sizeof(float));
+    });
+}
 int lingbot_test_attention(const float *queries,const float *keys,const float *values,
                            float *output,int rows,int count) {
     return checked([&] {

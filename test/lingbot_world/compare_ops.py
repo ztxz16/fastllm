@@ -25,6 +25,7 @@ def main():
     lib.lingbot_test_norm.argtypes = [pointer]*4 + [ctypes.c_int]*3
     lib.lingbot_test_activation.argtypes = [pointer]*2 + [ctypes.c_int]*4
     lib.lingbot_test_linear.argtypes = [pointer]*4 + [ctypes.c_int]*4
+    lib.lingbot_test_rope.argtypes = [pointer]*2 + [ctypes.c_int]*5
     lib.lingbot_test_attention.argtypes = [pointer]*4 + [ctypes.c_int]*2
     lib.lingbot_test_patch.argtypes = [pointer]*4 + [ctypes.c_int]*3
     lib.lingbot_test_image.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
@@ -85,11 +86,24 @@ def main():
              rows, inner, outer, full)
         record(f'linear/{rows}x{inner}x{outer}/full={full}', out, F.linear(x, w, b),
                2e-6 if full else 5e-4)
+    for f, h, w, offset in [(1,1,1,0), (2,3,5,3), (3,20,36,21), (1,2,7,999)]:
+        axes = torch.stack(torch.meshgrid(torch.arange(f,device='cuda')+offset,
+            torch.arange(h,device='cuda'),torch.arange(w,device='cuda'),indexing='ij'),dim=-1).reshape(-1,3)
+        angle = torch.cat([axes[:,i:i+1].double()*10000.**(-torch.arange(n,device='cuda').double()/n)
+                           for i,n in enumerate([22,21,21])],dim=-1)[:,None,:]
+        for full in [False, True]:
+            x=torch.randn(f*h*w,1536,device='cuda').to(torch.float32 if full else torch.bfloat16)
+            pairs=x.double().reshape(-1,12,64,2)
+            a,b=pairs[...,0],pairs[...,1]
+            expected=torch.stack([a*angle.cos()-b*angle.sin(),b*angle.cos()+a*angle.sin()],dim=-1).float().bfloat16().reshape(x.shape)
+            source,out=cpu(x),np.empty(x.shape,np.float32)
+            call(lib.lingbot_test_rope,ptr(source),ptr(out),f,h,w,offset,full)
+            record(f'rope/{f}x{h}x{w}/offset={offset}/full={full}',out,expected,5e-4)
     if args.attention == 'vllm-fa2':
         from vllm.vllm_flash_attn import flash_attn_varlen_func
     else:
         from flash_attn import flash_attn_varlen_func
-    for rows, count in [(1,1), (17,48), (48,64), (48,65), (129,180), (180,512), (180,1080)]:
+    for rows, count in [(1,1), (17,48), (48,64), (48,65), (129,180), (180,512), (180,1080), (2160,2160), (2160,12960)]:
         q = torch.randn(rows,12,128,device='cuda').bfloat16()
         k = torch.randn(count,12,128,device='cuda').bfloat16()
         v = torch.randn_like(k)

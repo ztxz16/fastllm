@@ -36,6 +36,8 @@ public:
     Tensor addNoise(const Tensor &clean, const Tensor &noise, float sigma);
     nomas::Runtime fp32;
 private:
+    struct Rotary;
+    std::unique_ptr<Rotary> rotary_;
     struct FullLinear;
     std::unique_ptr<FullLinear> fullLinear_;
     void *blas_ = nullptr;

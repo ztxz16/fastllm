@@ -11,7 +11,7 @@
 | 脚本 | 范围 | 判定 |
 | --- | --- | --- |
 | `compare_tokenizer.py` | 英文、中文、Unicode、HTML 实体、特殊 token、截断 | token ID 完全一致 |
-| `compare_ops.py` | 相同输入的归一化、激活、Linear、注意力，以及官方图像预处理 | FP32 L2 < 2e-6、BF16 L2 < 5e-4、图像 L2 < 1e-5 |
+| `compare_ops.py` | 相同输入的归一化、激活、Linear、跨 tile 边界及满历史窗口的注意力、三维 RoPE，以及官方图像预处理 | FP32 L2 < 2e-6、BF16 L2 < 5e-4、图像 L2 < 1e-5 |
 | `compare_vae_ops.py` | VAE 的 FP32/BF16 归一化、时空卷积、空间卷积、1×1 投影及注意力 | FP32 L2 < 2e-6，BF16 L2 < 0.005；FP32 卷积使用 FP64 数值参考 |
 | `compare_camera.py` | 连续平移、转向的相对位姿与 BF16 射线特征 | 相对 L2 < 2e-6 |
 | `compare_text.py` | 官方 UMT5 编码器及完整 padding/mask | 相对 L2 < 0.01 |
@@ -137,3 +137,5 @@ build-lingbot/src/models/lingbot_world/lingbot_world_test_pipeline_state \
 ```
 
 第二项使用生成器 trace 中的 `first_image.f32`、`0.text.f32`，宽高应与该 trace 一致。它检查不同场景分支交替执行、生成完成前取消、重试和旧快照恢复，要求画面与成功路径逐位一致。图像条件缓存不能用于任意视频输入；通用 `VAE::encode` 仍保留独立路径。
+
+DiT 融合注意力复用仓库中的 MMA 基础实现，保留参考 FA2 的逆序 64-key 分块与 FP32 softmax 归约。BF16 解码卷积复用已有 CUTLASS；不支持的形状回退到原有展开加 GEMM。算子对照和连续推演的误差门槛均不因优化而放宽。
