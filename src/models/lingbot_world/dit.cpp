@@ -43,7 +43,7 @@ Tensor DiT::block(int layer,const Tensor &input,const Tensor &time,
                   const Tensor &context,const Tensor *camera,int frames,
                   int gh,int gw,Cache &cache,bool commit) {
     require(layer>=0 && layer<Layers && input.cols==Dim && input.rows==frames*gh*gw &&
-        time.rows==1 && time.cols==6*Dim && time.fp32 && context.cols==Dim,
+        time.rows==1 && time.cols==6*Dim && time.isFloat32() && context.cols==Dim,
         "invalid LingBot block input");
     if(cache.keys.empty()) { cache.keys.resize(Layers); cache.values.resize(Layers); }
     if(cache.textKeys.empty()) { cache.textKeys.resize(Layers); cache.textValues.resize(Layers); }

@@ -34,7 +34,7 @@ Tensor restoreTensor(const HostTensor &host) {
     return value;
 }
 HostTensor snapshotTensor(const Tensor &value) {
-    return {value.rows,value.cols,value.fp32,value,{}};
+    return {value.rows,value.cols,value.isFloat32(),value,{}};
 }
 void offloadTensor(const HostTensor &host) {
     if(!host.device.data) return;

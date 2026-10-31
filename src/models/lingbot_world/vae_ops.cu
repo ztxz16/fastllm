@@ -10,7 +10,7 @@ namespace {
 using Tensor = nomas::Tensor;
 void check(cudaError_t s) { if(s!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(s)); }
 float *ptr(const Tensor &x) {
-    if(!x.fp32) throw std::invalid_argument("Wan VAE requires FP32 tensors");
+    if(!x.isFloat32()) throw std::invalid_argument("Wan VAE requires FP32 tensors");
     return reinterpret_cast<float *>(x.data);
 }
 int grid(size_t n) { return int(std::min<size_t>((n+255)/256,4096)); }
@@ -142,7 +142,7 @@ __global__ void clamp(const float *x,float *out,size_t n) {
 }
 }
 nomas::Tensor VAERuntime::channelNorm(const Tensor &x,const Tensor &weight) {
-    if(!x.fp32) return channelNorm(cast(x,true),weight);
+    if(!x.isFloat32()) return channelNorm(cast(x,true),weight);
     if(x.rows<=0 || x.cols<=0 || weight.size()!=size_t(x.cols))
         throw std::invalid_argument("Wan VAE channel norm shape");
     if(x.rows<16 || x.rows%4) return specialNorm(x,weight,1);
@@ -152,19 +152,20 @@ nomas::Tensor VAERuntime::channelNorm(const Tensor &x,const Tensor &weight) {
     check(cudaGetLastError()); return out;
 }
 nomas::Tensor VAERuntime::channelNormForConv(const Tensor &x,const Tensor &weight,bool silu) {
+    if(x.dtype==nomas::DType::FP16) throw std::invalid_argument("Wan VAE normalization requires FP32/BF16");
     if(!low_ || x.rows<16 || x.rows%4) {
         auto out=channelNorm(x,weight);
         if(silu) out=activation(out);
         return cast(out,!low_);
     }
-    if(x.cols<=0 || !weight.fp32 || weight.size()!=size_t(x.cols))
+    if(x.cols<=0 || !weight.isFloat32() || weight.size()!=size_t(x.cols))
         throw std::invalid_argument("Wan VAE channel norm shape");
     // Keep the FP32 reduction and activation arithmetic; round only where
     // the separate convolution input cast previously rounded to BF16.
     Tensor out(x.rows,x.cols,false);
     int groups=normalizationGroups(x.rows,x.cols);
     auto result=reinterpret_cast<__nv_bfloat16 *>(out.data);
-    if(x.fp32) channelNormKernel<<<(x.rows+3)/4,128,0,cudaStreamPerThread>>>(
+    if(x.isFloat32()) channelNormKernel<<<(x.rows+3)/4,128,0,cudaStreamPerThread>>>(
         ptr(x),ptr(weight),result,x.rows,x.cols,groups,silu);
     else channelNormKernel<<<(x.rows+3)/4,128,0,cudaStreamPerThread>>>(
         reinterpret_cast<const __nv_bfloat16 *>(x.data),ptr(weight),result,x.rows,x.cols,groups,silu);
@@ -194,8 +195,8 @@ nomas::Tensor VAERuntime::conv2d(const Tensor &x,const Tensor &w,const Tensor *b
 }
 nomas::Tensor VAERuntime::temporalShuffle(const Tensor &x,int frames,int h,int w) {
     if(x.rows!=frames*h*w || x.cols%2) throw std::invalid_argument("Wan temporal shuffle shape");
-    Tensor out(x.rows*2,x.cols/2,x.fp32);
-    if(!x.fp32) {
+    Tensor out(x.rows*2,x.cols/2,x.dtype);
+    if(!x.isFloat32()) {
         timeShuffle<<<grid(out.size()),256,0,cudaStreamPerThread>>>(x.data,out.data,out.size(),h*w,out.cols);
         check(cudaGetLastError()); return out;
     }
@@ -203,14 +204,14 @@ nomas::Tensor VAERuntime::temporalShuffle(const Tensor &x,int frames,int h,int w
     check(cudaGetLastError()); return out;
 }
 nomas::Tensor VAERuntime::latentScale(const Tensor &x,bool decode) {
-    if(!x.fp32) return latentScale(cast(x,true),decode);
+    if(!x.isFloat32()) return latentScale(cast(x,true),decode);
     if(x.cols!=16) throw std::invalid_argument("Wan latent channels");
     Tensor out(x.rows,x.cols,true);
     scaleLatent<<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),out.size(),decode);
     check(cudaGetLastError()); return out;
 }
 nomas::Tensor VAERuntime::clampPixels(const Tensor &x) {
-    if(!x.fp32) return clampPixels(cast(x,true));
+    if(!x.isFloat32()) return clampPixels(cast(x,true));
     Tensor out(x.rows,x.cols,true);
     clamp<<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),out.size());
     check(cudaGetLastError()); return out;

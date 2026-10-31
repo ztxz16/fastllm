@@ -45,6 +45,7 @@ template<class T> __global__ void pixelNoiseKernel(T *output,uint64_t seed,int f
 }
 
 Tensor Runtime::pixelNoise(uint64_t seed,int firstFrame,int frames,int height,int width) {
+    if(dtype()==DType::FP16) throw std::invalid_argument("PixelUMM noise supports FP32/BF16");
     if(firstFrame<0 || frames<=0 || frames>65535 || height<=0 || width<=0 || height%16 || width%16)
         throw std::invalid_argument("invalid PixelUMM noise shape");
     const int64_t spatial=int64_t(height/16)*(width/16);
@@ -56,8 +57,8 @@ Tensor Runtime::pixelNoise(uint64_t seed,int firstFrame,int frames,int height,in
     const size_t count=size_t(spatial)*3072;
     const int blocks=std::min<size_t>((count+255)/256,
         props.multiProcessorCount*(props.maxThreadsPerMultiProcessor/256));
-    Tensor out(int(spatial*frames),3072,fp32_);
-    if(fp32_) pixelNoiseKernel<<<dim3(blocks,frames),256,0,cudaStreamPerThread>>>(
+    Tensor out(int(spatial*frames),3072,isFloat32());
+    if(isFloat32()) pixelNoiseKernel<<<dim3(blocks,frames),256,0,cudaStreamPerThread>>>(
         reinterpret_cast<float *>(out.data),seed,firstFrame,height,width,count);
     else pixelNoiseKernel<<<dim3(blocks,frames),256,0,cudaStreamPerThread>>>(
         reinterpret_cast<__nv_bfloat16 *>(out.data),seed,firstFrame,height,width,count);

@@ -68,7 +68,7 @@ VAE::Tensor VAE::resample(const Tensor &input,const std::string &p,int &t,int &h
             Tensor next=rt_.concat({joined.rowSlice(std::max(0,joined.rows-2*h*w),std::min(joined.rows,2*h*w))});
             if(next.rows<h*w*2) {
                 std::vector<float> zeros(size_t(h)*w*x.cols,0.f);
-                next=rt_.concat({rt_.cast(rt_.upload(zeros.data(),h*w,x.cols),next.fp32),next});
+                next=rt_.concat({rt_.cast(rt_.upload(zeros.data(),h*w,x.cols),next.isFloat32()),next});
             }
             x=rt_.conv3d(joined,convWeights_.get(key+".weight"),convWeights_.optional(key+".bias"),
                          t+history,h,w,3,1,1,2-history);
@@ -180,7 +180,7 @@ VAE::Tensor VAE::decodeChunk(const Tensor &input,int h,int w,VAEState &s) {
 VAE::Tensor VAE::encode(const Tensor &pixels,int t,int h,int w,VAEState &s) {
     require(s.conditionFrames<0,"condition-only VAE state cannot encode arbitrary video");
     bool first=s.features.empty();
-    require(t>0 && h>=8 && w>=8 && h%8==0 && w%8==0 && pixels.fp32 && pixels.cols==3 &&
+    require(t>0 && h>=8 && w>=8 && h%8==0 && w%8==0 && pixels.isFloat32() && pixels.cols==3 &&
             pixels.rows==t*h*w && (t-(first?1:0))%4==0,"invalid Wan VAE encoder input");
     validateState(s,h,w);
     std::vector<Tensor> chunks;
@@ -195,7 +195,7 @@ VAE::Tensor VAE::encodeCondition(const Tensor &image,int count,int h,int w,VAESt
     bool first=s.features.empty();
     require(count>0 && h>=8 && w>=8 && h%8==0 && w%8==0,
             "invalid Wan image condition shape");
-    require(first ? image.fp32 && image.cols==3 && image.rows==h*w : s.conditionFrames>=0,
+    require(first ? image.isFloat32() && image.cols==3 && image.rows==h*w : s.conditionFrames>=0,
             "invalid Wan image condition state");
     validateState(s,h,w);
     std::vector<Tensor> chunks;
@@ -216,7 +216,7 @@ VAE::Tensor VAE::encodeCondition(const Tensor &image,int count,int h,int w,VAESt
     return rt_.concat(chunks);
 }
 VAE::Tensor VAE::decode(const Tensor &latent,int t,int h,int w,VAEState &s) {
-    require(t>0 && h>0 && w>0 && latent.fp32 && latent.cols==16 && latent.rows==t*h*w,
+    require(t>0 && h>0 && w>0 && latent.isFloat32() && latent.cols==16 && latent.rows==t*h*w,
             "invalid Wan VAE decoder input");
     validateState(s,h,w);
     auto x=pointwise(rt_.latentScale(latent,true),"conv2");

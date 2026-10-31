@@ -15,8 +15,10 @@ using Trace = std::function<void(const std::string &, const Tensor &)>;
 
 class Runtime : public nomas::Runtime {
   public:
-    explicit Runtime(int device, bool fp32 = false) : nomas::Runtime(device, fp32) {}
-    Runtime(int device, DType dtype) : nomas::Runtime(device, dtype) {}
+    explicit Runtime(int device, bool fp32 = false)
+        : Runtime(device, fp32 ? DType::FP32 : DType::BF16) {}
+    // H3 sums rounded exponentials in FP32 and keeps LayerNorm affine separate.
+    Runtime(int device, DType dtype) : nomas::Runtime(device, dtype, {false, false}) {}
     Tensor rms(const Tensor &, const Tensor &weight, float eps, int width = 0);
     Tensor rmsModulateRows(const Tensor &, const Tensor &weight, float eps, const Tensor &table,
                            const Tensor &indices, int shift, int scale);

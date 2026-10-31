@@ -11,7 +11,7 @@ void check(cudaError_t status) {
     if(status!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
 float *ptr(const Tensor &x) {
-    if(!x.fp32) throw std::invalid_argument("Wan VAE attention requires FP32");
+    if(!x.isFloat32()) throw std::invalid_argument("Wan VAE attention requires FP32");
     return reinterpret_cast<float *>(x.data);
 }
 // Reuse the repository's CUTLASS primitives. The official FP32 SDPA backend
@@ -75,8 +75,8 @@ __global__ void merge(const float *value,const float *state,float *out,
 nomas::Tensor VAERuntime::spatialAttention(const Tensor &q,const Tensor &k,const Tensor &v) {
     if(q.rows<=0 || k.rows<=0 || q.cols!=384 || k.cols!=q.cols || v.cols!=q.cols || k.rows!=v.rows)
         throw std::invalid_argument("Wan VAE attention shape");
-    if(!q.fp32) {
-        if(!low_ || k.fp32 || v.fp32) throw std::invalid_argument("Wan attention precision mismatch");
+    if(!q.isFloat32()) {
+        if(!low_ || q.dtype!=nomas::DType::BF16 || k.dtype!=q.dtype || v.dtype!=q.dtype) throw std::invalid_argument("Wan attention precision mismatch");
         return low_->attention(q,k,v,1);
     }
     Tensor out(q.rows,q.cols,true),state(q.rows,3,true);

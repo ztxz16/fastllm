@@ -78,7 +78,8 @@ __global__ void unpackConvolution(const B *input,const B *bias,B *out,size_t n,i
 }
 Tensor VAERuntime::convolutionBF16(const Tensor &x,const Tensor &weight,const Tensor *bias,
     int frames,int h,int w,int kt,int kernel,int strideT,int padT,int strideS,int padS,int oh,int ow) {
-    if(!low_ || weight.fp32 || (bias && bias->fp32))
+    if(!low_ || x.dtype==nomas::DType::FP16 || weight.dtype!=nomas::DType::BF16 ||
+       (bias && bias->dtype!=nomas::DType::BF16))
         throw std::invalid_argument("Wan BF16 convolution precision mismatch");
     auto packed=weight;
     if(kt*kernel*kernel>1) {
@@ -116,7 +117,7 @@ Tensor VAERuntime::convolutionBF16(const Tensor &x,const Tensor &weight,const Te
             columns=cast(x.rowSlice(start,count),false);
         else {
             columns=Tensor(count,weight.cols,false);
-            if(x.fp32) im2col<<<grid(columns.size()),256,0,cudaStreamPerThread>>>(ptr<float>(x),ptr<B>(columns),
+            if(x.isFloat32()) im2col<<<grid(columns.size()),256,0,cudaStreamPerThread>>>(ptr<float>(x),ptr<B>(columns),
                 frames,h,w,x.cols,kt,kernel,strideT,padT,strideS,padS,oh,ow,start,columns.size());
             else im2col<<<grid(columns.size()),256,0,cudaStreamPerThread>>>(ptr<B>(x),ptr<B>(columns),
                 frames,h,w,x.cols,kt,kernel,strideT,padT,strideS,padS,oh,ow,start,columns.size());

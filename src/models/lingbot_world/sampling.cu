@@ -8,7 +8,7 @@
 namespace fastllm { namespace lingbot {
 namespace {
 float *ptr(const Tensor &t) {
-    if(!t.fp32) throw std::invalid_argument("LingBot sampler requires FP32 tensors");
+    if(!t.isFloat32()) throw std::invalid_argument("LingBot sampler requires FP32 tensors");
     return reinterpret_cast<float *>(t.data);
 }
 int grid(size_t n) { return int(std::min<size_t>((n+255)/256,4096)); }

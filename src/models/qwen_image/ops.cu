@@ -136,8 +136,8 @@ Tensor Runtime::resize2x(const Tensor &x, int h, int w) { return duplicateUpsamp
 Tensor Runtime::duplicateUpsample(const Tensor &x, int h, int w, int channels, int ft) {
     if (x.rows != h * w || channels < 1 || (ft && (channels * ft * 4) % x.cols))
         throw std::invalid_argument("upsample shape");
-    Tensor out(h * w * 4, channels, x.fp32);
-    if(x.fp32) upsample<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(
+    Tensor out(h * w * 4, channels, x.dtype);
+    if(x.isFloat32()) upsample<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(
         ptr(x), ptr(out), out.size(), h, w, x.cols, channels, std::max(ft, 1), ft != 0);
     else upsample<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(
         x.data, out.data, out.size(), h, w, x.cols, channels, std::max(ft, 1), ft != 0);

@@ -22,7 +22,7 @@
 #endif
 
 namespace fastllm { namespace nomas {
-cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,int,bool,bool,int,int,int,float,cudaStream_t);
+cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,int,bool,bool,int,int,int,float,bool,cudaStream_t);
 namespace {
 using B = __nv_bfloat16;
 using H = __half;
@@ -119,7 +119,7 @@ __device__ float sumBlock(float v, float *scratch) {
     for (int d=blockDim.x/2; d; d/=2) { if(threadIdx.x<d) scratch[threadIdx.x]+=scratch[threadIdx.x+d]; __syncthreads(); }
     return scratch[0];
 }
-template<class T> __global__ void normKernel(const T *x, T *y, const T *weight, const T *bias, int width, bool rms, float eps) {
+template<class T, bool FusedAffine=true> __global__ void normKernel(const T *x, T *y, const T *weight, const T *bias, int width, bool rms, float eps) {
     __shared__ float scratch[256]; __shared__ float mean, inv;
     int row=blockIdx.x; float s=0;
     for(int c=threadIdx.x;c<width;c+=blockDim.x) s+=f(x[size_t(row)*width+c]);
@@ -134,7 +134,7 @@ template<class T> __global__ void normKernel(const T *x, T *y, const T *weight, 
         float v=(f(x[size_t(row)*width+c])-mean)*inv;
         // Official RMSNorm casts before applying weight; LayerNorm has a fused affine.
         if(rms) v=roundTo<T>(v);
-        if constexpr (std::is_same_v<T,B>) {
+        if constexpr (std::is_same_v<T,B> && FusedAffine) {
             if(!rms && weight && bias) v=__fmaf_rn(v,f(weight[c]),f(bias[c]));
             else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
         } else { if(weight) v*=f(weight[c]); if(bias) v+=f(bias[c]); }
@@ -356,7 +356,8 @@ bool runtimePrecision() {
 }
 Runtime::Runtime(int device):Runtime(device, runtimePrecision()) {}
 Runtime::Runtime(int device, bool fp32):Runtime(device,fp32 ? DType::FP32 : DType::BF16) {}
-Runtime::Runtime(int device, DType type):device_(device),dtype_(type) {
+Runtime::Runtime(int device, DType type):Runtime(device,type,Numerics{}) {}
+Runtime::Runtime(int device, DType type, Numerics numerics):device_(device),dtype_(type),numerics_(numerics) {
     require(type==DType::FP32 || type==DType::FP16 || type==DType::BF16,"invalid runtime dtype");
     check(cudaSetDevice(device)); cublasHandle_t h; check(cublasCreate(&h)); blas_=h;
     check(cublasSetStream(h,cudaStreamPerThread));
@@ -471,7 +472,12 @@ Tensor Runtime::norm(const Tensor &x,bool rms,const Tensor *w,const Tensor *bias
     require((!w || w->dtype==x.dtype) && (!bias || bias->dtype==x.dtype),"norm dtype mismatch");
     require((!w || w->size()==size_t(width)) && (!bias || bias->size()==size_t(width)),"norm weight mismatch");
     Tensor out(x.rows,x.cols,x.dtype);
-    DISPATCH_TENSOR(x.dtype, T, normKernel<T><<<x.size()/width,256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),w?as<T>(*w):nullptr,bias?as<T>(*bias):nullptr,width,rms,eps)); check(cudaGetLastError()); return out;
+    if(x.dtype==DType::BF16 && !numerics_.layerNormFMA) {
+        normKernel<B,false><<<x.size()/width,256,0,cudaStreamPerThread>>>(as<B>(x),as<B>(out),w?as<B>(*w):nullptr,bias?as<B>(*bias):nullptr,width,rms,eps);
+    } else {
+        DISPATCH_TENSOR(x.dtype, T, normKernel<T><<<x.size()/width,256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),w?as<T>(*w):nullptr,bias?as<T>(*bias):nullptr,width,rms,eps));
+    }
+    check(cudaGetLastError()); return out;
 }
 Tensor Runtime::activation(const Tensor &x,bool gelu) {
     Tensor out(x.rows,x.cols,x.dtype); DISPATCH_TENSOR(x.dtype, T, element<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),nullptr,as<T>(out),x.size(),gelu?2:1)); check(cudaGetLastError()); return out;
@@ -617,7 +623,7 @@ RopeTable Runtime::prepareRope(const float *cos,const float *sin,int rows,int di
 Tensor Runtime::rope(const Tensor &x,const RopeTable &table) {
     int dim=table.cos.cols;
     require(dim>0 && dim%2==0 && x.cols%dim==0 && table.cos.rows==x.rows && table.sin.rows==x.rows &&
-            table.sin.cols==dim && table.cos.fp32 && table.sin.fp32,"invalid RoPE shape");
+            table.sin.cols==dim && table.cos.isFloat32() && table.sin.isFloat32(),"invalid RoPE shape");
     Tensor out(x.rows,x.cols,x.dtype);
     DISPATCH_TENSOR(x.dtype, T, ropeKernel<T><<<grid(x.size()),256,0,cudaStreamPerThread>>>(as<T>(x),as<T>(out),as<float>(table.cos),as<float>(table.sin),x.size(),x.cols,dim));
     check(cudaGetLastError()); return out;
@@ -638,7 +644,7 @@ Tensor Runtime::attentionScaled(const Tensor &q,const Tensor &k,const Tensor &v,
     int dim=q.cols/heads; chunk=std::min(chunk,q.rows); Tensor out(q.rows,q.cols,q.dtype);
     require(std::isfinite(scoreScale) && (q.isFloat32() || scoreScale==1.f/std::sqrt(float(dim))),"custom attention scale requires FP32");
     if(!q.isFloat32() && !mask && (dim==64 || dim==128)) {
-        check(fusedAttention(q.data,k.data,v.data,out.data,q.rows,k.rows,heads,kvHeads,dim,q.dtype==DType::FP16,causal,tile,height,width,scoreScale,cudaStreamPerThread));
+        check(fusedAttention(q.data,k.data,v.data,out.data,q.rows,k.rows,heads,kvHeads,dim,q.dtype==DType::FP16,causal,tile,height,width,scoreScale,numerics_.fp32SoftmaxSum,cudaStreamPerThread));
         return out;
     }
     if(!q.isFloat32() && !mask && dim==72 && !tile) {
@@ -654,7 +660,7 @@ Tensor Runtime::attentionScaled(const Tensor &q,const Tensor &k,const Tensor &v,
         }
         check(cudaGetLastError());
         check(fusedAttention(qp.data,kp.data,vp.data,result.data,q.rows,k.rows,heads,kvHeads,128,
-            q.dtype==DType::FP16,causal,0,height,width,scoreScale,cudaStreamPerThread));
+            q.dtype==DType::FP16,causal,0,height,width,scoreScale,numerics_.fp32SoftmaxSum,cudaStreamPerThread));
         if(q.dtype==DType::BF16) resizeHeads<B><<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<B>(result),as<B>(out),out.size(),128,72);
         else resizeHeads<H><<<grid(out.size()),256,0,cudaStreamPerThread>>>(as<H>(result),as<H>(out),out.size(),128,72);
         check(cudaGetLastError()); return out;

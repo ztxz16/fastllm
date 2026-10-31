@@ -38,6 +38,52 @@ void checkCast(fastllm::nomas::Runtime &rt) {
                           std::vector<float>(expected.begin()+1,expected.end()));
     }
 }
+void checkDTypes(fastllm::lingbot::Runtime &rt,fastllm::lingbot::VAERuntime &vae) {
+    using fastllm::nomas::DType;
+    // Layout-only operations preserve the dtype, including FP16's raw bits.
+    const std::vector<float> values{1,2,3,4,5,6,7,8};
+    for(auto dtype:{DType::FP32,DType::BF16,DType::FP16}) {
+        auto x=rt.cast(rt.upload(values.data(),4,2),dtype);
+        auto joined=rt.join(x,x),patched=rt.patch(x,1,2,2),shuffled=vae.temporalShuffle(x,1,2,2);
+        // Encoder patches use [channel,dy,dx]; the output head uses [dy,dx,channel].
+        auto head=rt.cast(rt.upload(values.data(),1,8),dtype),unpacked=rt.patch(head,1,2,2,true);
+        if(joined.dtype!=dtype || patched.dtype!=dtype || unpacked.dtype!=dtype || shuffled.dtype!=dtype)
+            throw std::runtime_error("layout operation changed dtype");
+        equal(rt.download(joined),{1,2,1,2,3,4,3,4,5,6,5,6,7,8,7,8});
+        equal(rt.download(patched),{1,3,5,7,2,4,6,8});
+        equal(rt.download(unpacked),values);
+        equal(rt.download(shuffled),{1,3,5,7,2,4,6,8});
+    }
+    auto make=[&](int rows,int cols,DType dtype) {
+        std::vector<float> values(size_t(rows)*cols,.5f);
+        return rt.cast(rt.upload(values.data(),rows,cols),dtype);
+    };
+    auto rejects=[](auto fn) {
+        try { fn(); } catch(const std::invalid_argument &) { return; }
+        throw std::runtime_error("FP16 was interpreted as BF16");
+    };
+    auto h=make(1,4096,DType::FP16),b=rt.cast(h,false);
+    rejects([&]{rt.t5Gelu(h);});
+    rejects([&]{rt.t5Norm(h,b);});
+    rejects([&]{rt.t5Norm(b,h);});
+    rejects([&]{rt.relativeAttention(h,b,b,make(32,64,DType::BF16),1);});
+    h=make(1,1536,DType::FP16); b=rt.cast(h,false);
+    rejects([&]{rt.wanRms(h,rt.cast(h,true));});
+    rejects([&]{rt.wanLayerNorm(h);});
+    rejects([&]{rt.wanAttention(h,b,b);});
+    rejects([&]{rt.rope3d(h,1,1,1,0);});
+    h=make(4,1,DType::FP16); b=rt.cast(h,false);
+    rejects([&]{rt.patchConv2d(h,make(1,4,DType::BF16),make(1,1,DType::BF16),1,2,2);});
+    rejects([&]{vae.conv2d(h,make(1,9,DType::BF16),nullptr,2,2,3);});
+    rejects([&]{vae.conv2d(b,make(1,9,DType::FP16),nullptr,2,2,3);});
+    rejects([&]{vae.channelNormForConv(h,make(1,1,DType::FP32),true);});
+    h=make(1,384,DType::FP16); b=rt.cast(h,false);
+    rejects([&]{vae.spatialAttention(h,b,b);});
+    auto low=make(4,2,DType::BF16),half=rt.cast(low,DType::FP16);
+    rejects([&]{rt.join(low,half);});
+    // FP16 modulation uses the existing FP32 cast path, never the BF16 kernel.
+    equal(rt.download(rt.affine(rt.cast(low,true),half,half)),std::vector<float>(8,1.25f));
+}
 void checkResize(fastllm::qwen_image::Runtime &rt) {
     for(bool full:{false,true}) for(int h:{1,7,16}) for(int w:{1,5,32}) for(int channels:{3,96}) {
         std::vector<float> input(h*w*channels),expected(h*w*channels*4);
@@ -65,7 +111,7 @@ int main() { try {
     fastllm::lingbot::VAERuntime vae(0,true);
     fastllm::qwen_image::Runtime qwen(0);
     checkCast(common); checkCast(dit); checkCast(vae);
-    checkResize(vae); checkResize(qwen);
-    std::cout<<"shared cast / nearest upsample / Qwen shortcut: bitwise passed\n";
+    checkResize(vae); checkResize(qwen); checkDTypes(dit,vae);
+    std::cout<<"shared cast / nearest upsample / Qwen shortcut / dtype boundaries: bitwise passed\n";
     return 0;
 } catch(const std::exception &e) { std::cerr<<e.what()<<'\n'; return 1; } }

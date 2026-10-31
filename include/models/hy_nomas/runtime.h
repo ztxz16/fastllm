@@ -54,9 +54,15 @@ struct RopeTable { Tensor cos, sin; };
 
 class Runtime {
 public:
+    // These rounding boundaries belong to the model, not the tensor dtype.
+    struct Numerics {
+        bool fp32SoftmaxSum = true;
+        bool layerNormFMA = true;
+    };
     explicit Runtime(int device);
     Runtime(int device, bool fp32);
     Runtime(int device, DType dtype);
+    Runtime(int device, DType dtype, Numerics numerics);
     void activate();
     bool isFloat32() const { return dtype_ == DType::FP32; }
     DType dtype() const { return dtype_; }
@@ -128,6 +134,7 @@ private:
     void *blas_ = nullptr;
     int device_;
     DType dtype_;
+    Numerics numerics_;
 };
 
 class Weights {

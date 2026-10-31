@@ -359,7 +359,7 @@ Runtime::Runtime(int device):nomas::Runtime(device,false),fp32(device,true) {
 }
 Runtime::~Runtime() { activate(); fullLinear_.reset(); if(blas_) cublasDestroy(static_cast<cublasHandle_t>(blas_)); }
 Tensor Runtime::wanLinearFP32(const Tensor &x,const Tensor &w,const Tensor &bias) {
-    require(x.fp32 && w.fp32 && bias.fp32 && x.cols==w.cols && bias.size()==size_t(w.rows),
+    require(x.isFloat32() && w.isFloat32() && bias.isFloat32() && x.cols==w.cols && bias.size()==size_t(w.rows),
             "invalid Wan FP32 linear shape/dtype");
     if(!fullLinear_) fullLinear_=std::make_unique<FullLinear>();
     auto &state=*fullLinear_;
@@ -396,7 +396,7 @@ Tensor Runtime::wanLinearFP32(const Tensor &x,const Tensor &w,const Tensor &bias
     return out;
 }
 Tensor Runtime::patchConv2d(const Tensor &x,const Tensor &w,const Tensor &bias,int frames,int height,int width) {
-    require(!x.fp32 && !w.fp32 && !bias.fp32 && frames>0 && height>0 && width>0 &&
+    require(x.dtype==nomas::DType::BF16 && w.dtype==nomas::DType::BF16 && bias.dtype==nomas::DType::BF16 && frames>0 && height>0 && width>0 &&
             height%2==0 && width%2==0 && x.rows==frames*height*width && w.cols==x.cols*4 &&
             bias.size()==size_t(w.rows),"invalid Wan patch convolution");
     // Conv3d's 1x2x2 BF16 path traverses spatial positions with channels
@@ -410,9 +410,9 @@ Tensor Runtime::patchConv2d(const Tensor &x,const Tensor &w,const Tensor &bias,i
     return this->bias(linear(input,weight),bias);
 }
 Tensor Runtime::join(const Tensor &x,const Tensor &y) {
-    require(x.rows==y.rows && x.fp32==y.fp32,"LingBot join shape/dtype mismatch");
-    Tensor out(x.rows,x.cols+y.cols,x.fp32);
-    if(x.fp32) joinKernel<<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr<float>(x),ptr<float>(y),ptr<float>(out),out.size(),x.cols,y.cols);
+    require(x.rows==y.rows && x.dtype==y.dtype,"LingBot join shape/dtype mismatch");
+    Tensor out(x.rows,x.cols+y.cols,x.dtype);
+    if(x.isFloat32()) joinKernel<<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr<float>(x),ptr<float>(y),ptr<float>(out),out.size(),x.cols,y.cols);
     else joinKernel<<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr<B>(x),ptr<B>(y),ptr<B>(out),out.size(),x.cols,y.cols);
     check(cudaGetLastError()); return out;
 }
@@ -421,7 +421,7 @@ Tensor Runtime::affine(const Tensor &x,const Tensor &scale,const Tensor &shift,b
             (scale.rows==1 || scale.rows==x.rows),"LingBot affine shape mismatch");
     auto a=cast(x,true); Tensor out(x.rows,x.cols,true);
     // Read BF16 modulation directly while retaining FP32 arithmetic.
-    if(!scale.fp32 && !shift.fp32)
+    if(scale.dtype==nomas::DType::BF16 && shift.dtype==nomas::DType::BF16)
         affineKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(a),ptr<B>(scale),ptr<B>(shift),
             ptr<float>(out),x.size(),x.cols,scale.rows,roundScale);
     else {
@@ -435,7 +435,7 @@ Tensor Runtime::gated(const Tensor &x,const Tensor &branch,const Tensor &gate) {
     require(x.rows==branch.rows && x.cols==branch.cols && gate.cols==x.cols &&
             (gate.rows==1 || gate.rows==x.rows),"LingBot gated residual shape mismatch");
     auto a=cast(x,true),g=cast(gate,true); Tensor out(x.rows,x.cols,true);
-    if(branch.fp32) gateKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(a),ptr<float>(branch),ptr<float>(g),
+    if(branch.isFloat32()) gateKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(a),ptr<float>(branch),ptr<float>(g),
         ptr<float>(out),x.size(),x.cols,g.rows);
     else gateKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(a),ptr<B>(branch),ptr<float>(g),
         ptr<float>(out),x.size(),x.cols,g.rows);
@@ -445,13 +445,13 @@ Tensor Runtime::patch(const Tensor &x,int frames,int height,int width,bool unpac
     require(frames>0 && height>0 && width>0 && height%2==0 && width%2==0 &&
         x.rows==frames*height*width/(unpack?4:1) && (!unpack || x.cols%4==0),"LingBot patch shape mismatch");
     int channels=x.cols/(unpack?4:1);
-    Tensor out(frames*height*width/(unpack?1:4),channels*(unpack?1:4),x.fp32);
-    if(x.fp32) patchKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(x),ptr<float>(out),x.size(),height,width,channels,unpack);
+    Tensor out(frames*height*width/(unpack?1:4),channels*(unpack?1:4),x.dtype);
+    if(x.isFloat32()) patchKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(x),ptr<float>(out),x.size(),height,width,channels,unpack);
     else patchKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<B>(x),ptr<B>(out),x.size(),height,width,channels,unpack);
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::rope3d(const Tensor &x,int frames,int height,int width,int offset) {
-    require(frames>0 && height>0 && width>0 && offset>=0 && x.rows==frames*height*width && x.cols%128==0,"LingBot RoPE shape mismatch");
+    require(x.dtype!=nomas::DType::FP16 && frames>0 && height>0 && width>0 && offset>=0 && x.rows==frames*height*width && x.cols%128==0,"LingBot RoPE shape mismatch");
     if(!rotary_) rotary_=std::make_unique<Rotary>();
     auto &r=*rotary_;
     if(r.frames!=frames || r.height!=height || r.width!=width || r.offset!=offset) {
@@ -461,37 +461,37 @@ Tensor Runtime::rope3d(const Tensor &x,int frames,int height,int width,int offse
         r.frames=frames; r.height=height; r.width=width; r.offset=offset;
     }
     Tensor out(x.rows,x.cols,false);
-    if(x.fp32) ropeKernel<<<grid(x.size()/2),256,0,cudaStreamPerThread>>>(ptr<float>(x),ptr<B>(out),ptr<double2>(r.table),x.size()/2,x.cols);
+    if(x.isFloat32()) ropeKernel<<<grid(x.size()/2),256,0,cudaStreamPerThread>>>(ptr<float>(x),ptr<B>(out),ptr<double2>(r.table),x.size()/2,x.cols);
     else ropeKernel<<<grid(x.size()/2),256,0,cudaStreamPerThread>>>(ptr<B>(x),ptr<B>(out),ptr<double2>(r.table),x.size()/2,x.cols);
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::t5Gelu(const Tensor &x) {
-    require(!x.fp32,"T5 GELU requires BF16"); Tensor out(x.rows,x.cols,false);
+    require(x.dtype==nomas::DType::BF16,"T5 GELU requires BF16"); Tensor out(x.rows,x.cols,false);
     t5GeluKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<B>(x),ptr<B>(out),x.size());
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::t5Norm(const Tensor &x,const Tensor &w) {
-    require(!x.fp32 && !w.fp32 && x.cols==4096 && w.size()==4096,"invalid T5 norm shape");
+    require(x.dtype==nomas::DType::BF16 && w.dtype==nomas::DType::BF16 && x.cols==4096 && w.size()==4096,"invalid T5 norm shape");
     Tensor out(x.rows,x.cols,false);
     eagerRmsKernel<<<x.rows,32,0,cudaStreamPerThread>>>(ptr<B>(x),ptr<B>(w),ptr<B>(out),x.cols);
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::wanRms(const Tensor &x,const Tensor &w) {
-    require(!x.fp32 && w.fp32 && x.cols==1536 && w.size()==1536,"invalid Wan RMS norm shape");
+    require(x.dtype==nomas::DType::BF16 && w.isFloat32() && x.cols==1536 && w.size()==1536,"invalid Wan RMS norm shape");
     Tensor out(x.rows,x.cols,true);
     eagerRmsKernel<<<x.rows,32,0,cudaStreamPerThread>>>(ptr<B>(x),ptr<float>(w),ptr<float>(out),x.cols);
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::wanLayerNorm(const Tensor &x,const Tensor *w,const Tensor *b) {
-    require(x.cols==1536 && (!w || (w->fp32 && w->size()==1536)) &&
-            (!b || (b->fp32 && b->size()==1536)),"invalid Wan LayerNorm shape");
-    Tensor out(x.rows,x.cols,x.fp32);
-    if(x.fp32) wanLayerNormKernel<<<x.rows,128,0,cudaStreamPerThread>>>(ptr<float>(x),w?ptr<float>(*w):nullptr,b?ptr<float>(*b):nullptr,ptr<float>(out),x.cols);
+    require(x.dtype!=nomas::DType::FP16 && x.cols==1536 && (!w || (w->isFloat32() && w->size()==1536)) &&
+            (!b || (b->isFloat32() && b->size()==1536)),"invalid Wan LayerNorm shape");
+    Tensor out(x.rows,x.cols,x.isFloat32());
+    if(x.isFloat32()) wanLayerNormKernel<<<x.rows,128,0,cudaStreamPerThread>>>(ptr<float>(x),w?ptr<float>(*w):nullptr,b?ptr<float>(*b):nullptr,ptr<float>(out),x.cols);
     else wanLayerNormKernel<<<x.rows,128,0,cudaStreamPerThread>>>(ptr<B>(x),w?ptr<float>(*w):nullptr,b?ptr<float>(*b):nullptr,ptr<B>(out),x.cols);
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::relativeAttention(const Tensor &q,const Tensor &k,const Tensor &v,const Tensor &bias,int validKeys) {
-    require(!q.fp32 && !k.fp32 && !v.fp32 && !bias.fp32 && q.cols==4096 && k.cols==q.cols &&
+    require(q.dtype==nomas::DType::BF16 && k.dtype==nomas::DType::BF16 && v.dtype==nomas::DType::BF16 && bias.dtype==nomas::DType::BF16 && q.cols==4096 && k.cols==q.cols &&
         v.cols==q.cols && q.rows==k.rows && k.rows==v.rows && q.rows<=512 && bias.rows==32 && bias.cols==64 && validKeys>0 && validKeys<=q.rows,
         "invalid UMT5 attention shape");
     constexpr int heads=64,dim=64;
@@ -509,7 +509,7 @@ Tensor Runtime::relativeAttention(const Tensor &q,const Tensor &k,const Tensor &
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::wanAttention(const Tensor &q,const Tensor &k,const Tensor &v) {
-    require(!q.fp32 && !k.fp32 && !v.fp32 && q.cols==1536 && k.cols==q.cols && v.cols==q.cols &&
+    require(q.dtype==nomas::DType::BF16 && k.dtype==nomas::DType::BF16 && v.dtype==nomas::DType::BF16 && q.cols==1536 && k.cols==q.cols && v.cols==q.cols &&
             k.rows==v.rows && q.rows>0 && k.rows>0,"invalid Wan attention shape");
     Tensor out(q.rows,q.cols,false);
     wanAttentionKernel<<<dim3((q.rows+63)/64,12),128,0,cudaStreamPerThread>>>(ptr<B>(q),ptr<B>(k),ptr<B>(v),ptr<B>(out),q.rows,k.rows);

@@ -555,9 +555,34 @@ HTTP 在同一把任务锁内完成元数据保存和完成状态发布，避免
   使用独立测试服务，只映射物理 GPU 7，未操作其他卡。
 - Python 语法、Demo JavaScript 语法、OpenAPI JSON 与 `git diff --check` 通过。
 
-没有新增 H3 运行时环境变量。共享后端已有的 `FASTLLM_NOMAS_*` 分配器、精度、
-attention 与诊断开关仍有调用，保留这些有效配置。最初 HTTP 验证包装误用了 `--key`，
+没有新增 H3 运行时环境变量。当前共享后端保留 `FASTLLM_NOMAS_PRECISION`，
+HY-Nomas pipeline 保留 `FASTLLM_NOMAS_TRACE`；上游已删除的分配器/attention 开关不再适用。
+最初 HTTP 验证包装误用了 `--key`，
 改为实际的 `--api-key` 后只重跑 HTTP 部分；该包装不属于生产代码。
 
 以上检查验证整理没有改变输出，不改变上一节对完整 BF16 原生精度的限制结论。
 记录、输出哈希、环境变量审计和建议提交分组保存在仓库外 `conditioning-cleanup`。
+
+## 上游合并后的数值隔离（2026-10-31）
+
+同步 `a9075766` 后，HY-Nomas 的共用 BF16 Attention 新增 FP32 softmax 分母规则，
+LayerNorm affine 也新增 FMA 舍入边界。直接作用于 H3 时，4 点文生视频相对更新前
+FastLLM 的 RGB/audio L2 分别为 0.0828176 / 0.151783；这不是相对原生模型的误差。
+
+共享 `Runtime::Numerics` 显式选择上述两项规则，默认保留 HY-Nomas 上游行为，
+H3 保留已验证的舍入顺序；两者仍复用同一底层 Attention 与 norm 实现。
+同时把新 LingBot/HY-Nomas 的旧 FP32 字段访问适配到已有 DType 接口。
+
+- H3、HY-Nomas、Qwen Image、LingBot 的库及相关可执行目标编译通过；未重新执行其他
+  三个模型的完整生成流程。
+- H3 fused-ops/media CTest、LingBot shared cast/upsample 检查通过。
+- 6 个相同输入 Attention 案例覆盖 BF16 GQA/causal、自注意力、FP16 解码与 FP32；
+  H3 策略与更新前逐字节一致，默认策略与上游新行为逐字节一致。独立 PyTorch 对照
+  最大相对 L2 为 0.002952，FP32 为 6.62e-7；原生 BF16 单 block 检查通过。
+- 文生视频 768×448/124 帧/4 点，以及默认参考图＋音频条件的 RGB/audio/MP4 共
+  6 个文件，与此前对应 FastLLM 输出逐字节一致。参考条件覆盖视觉 LayerNorm 和
+  72 维 head 的共享 Attention 路径。
+
+没有新增运行依赖或环境变量。以上验证用于保证上游整合不改变现有 H3 输出；
+此前记录的完整 BF16 流程相对原生的累积偏差仍需单独处理。
+记录位于仓库外 `upstream-reuse-20261031`。

@@ -30,7 +30,7 @@ template<class Attention> struct LocalAttention : Attention {
         return abs(int(ki)/p.width%p.height/p.tile-cy)<=1 && abs(int(ki)%p.width/p.tile-cx)<=1;
     })
 };
-template<class T,int D> cudaError_t dispatchAttention(const void *q,const void *k,const void *v,void *out,
+template<class T,int D,bool FP32Sum> cudaError_t dispatchAttention(const void *q,const void *k,const void *v,void *out,
                            int queries,int keys,int heads,int kvHeads,bool causal,
                            int tile,int height,int width,float scoreScale,cudaStream_t stream) {
     Params<T> p;
@@ -39,7 +39,7 @@ template<class T,int D> cudaError_t dispatchAttention(const void *q,const void *
         scoreScale,1,10000);
     p.tile=tile; p.height=height; p.width=width;
     using namespace flashinfer;
-    using Attention = std::conditional_t<std::is_same_v<T, __nv_bfloat16>, BF16Attention,
+    using Attention = std::conditional_t<FP32Sum, BF16Attention,
                                          DefaultAttention<false,false,false,false>>;
     if(tile && (height>tile*3 || width>tile*3))
         return SinglePrefillWithKVCacheDispatched<D,D,PosEncodingMode::kNone,false,
@@ -53,10 +53,12 @@ template<class T,int D> cudaError_t dispatchAttention(const void *q,const void *
 } // namespace
 cudaError_t fusedAttention(const void *q,const void *k,const void *v,void *out,
                            int queries,int keys,int heads,int kvHeads,int dim,bool fp16,bool causal,
-                           int tile,int height,int width,float scoreScale,cudaStream_t stream) {
-#define ATTENTION(T,D) dispatchAttention<T,D>(q,k,v,out,queries,keys,heads,kvHeads,causal,tile,height,width,scoreScale,stream)
-    if(dim==64) return fp16 ? ATTENTION(__half,64) : ATTENTION(__nv_bfloat16,64);
-    if(dim==128) return fp16 ? ATTENTION(__half,128) : ATTENTION(__nv_bfloat16,128);
+                           int tile,int height,int width,float scoreScale,bool fp32Sum,cudaStream_t stream) {
+#define ATTENTION(T,D,SUM) dispatchAttention<T,D,SUM>(q,k,v,out,queries,keys,heads,kvHeads,causal,tile,height,width,scoreScale,stream)
+    if(dim==64) return fp16 ? ATTENTION(__half,64,false) :
+        fp32Sum ? ATTENTION(__nv_bfloat16,64,true) : ATTENTION(__nv_bfloat16,64,false);
+    if(dim==128) return fp16 ? ATTENTION(__half,128,false) :
+        fp32Sum ? ATTENTION(__nv_bfloat16,128,true) : ATTENTION(__nv_bfloat16,128,false);
 #undef ATTENTION
     return cudaErrorInvalidValue;
 }
