@@ -6108,6 +6108,45 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     int cap = hasCmp ? compressedKV->dims[1] : 0;
     int topWidth = hasCmp ? cmpIdx->dims[2] : 0;
     const bool legacyAttention = V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN");
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+    // Shared FlashInfer backend for ordinary small causal chunks, including
+    // per-layer DSpark verification. Preserve native index-list semantics;
+    // the model's indexer already masks future compressed rows.
+    if (!referenceMath && !legacyAttention && FastllmV41FlashInferEnabled() &&
+        q.dataType == DataType::BFLOAT16 && !q.multiDeviceData && !chunkKV.multiDeviceData &&
+        chunkKV.dims == std::vector<int>({bsz, seqlen, dim}) && windowSize == 128 &&
+        (!hasRing || (ringFp8 && ringMode == 1 && ringRowBytes == 528 &&
+            ringKV->dims[0] == bsz && !ringKV->multiDeviceData)) &&
+        (!hasCmp || (cmpFp8 && cmpMode == 3 && cmpRowBytes == 288 &&
+            compressedKV->dims[0] == bsz && cmpIdx->dims[0] == bsz && cmpIdx->dims[1] == seqlen &&
+            !compressedKV->multiDeviceData && !cmpIdx->multiDeviceData)) &&
+        !attnSink.multiDeviceData && attnSink.Count(0) >= heads) {
+        const FastllmV41FlashInferChunkConfig config{bsz, seqlen, heads, topWidth, cap, startPos, softmaxScale};
+        const size_t bytes = FastllmV41FlashInferChunkWorkspace(config);
+        void *allocation = nullptr;
+        if (bytes) {
+            const auto status = FastllmCudaTryMalloc(&allocation, bytes);
+            if (status == FASTLLM_CUDA_TRY_MALLOC_ERROR) return false;
+            if (status == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+                struct Scratch {
+                    void *ptr;
+                    ~Scratch() {
+                        if (!FastllmCudaFreeAfterCurrentThreadStream(ptr)) FastllmCudaFree(ptr);
+                    }
+                } scratch{allocation};
+                FastllmV41FullDecodeBuffers b;
+                b.q = q.cudaData; b.kv = chunkKV.cudaData; b.output = output.cudaData;
+                b.sink = attnSink.cudaData; b.topk = hasCmp ? cmpIdx->cudaData : nullptr;
+                const auto launched = FastllmV41FlashInferChunkRun(config, b,
+                    hasRing ? ringKV->cudaData : nullptr, hasCmp ? compressedKV->cudaData : nullptr,
+                    allocation, cudaStreamPerThread);
+                return launched == cudaSuccess && V41CheckLaunch("SparseAttentionFlashInfer");
+            }
+            // Optional workspace did not fit. Native attention remains valid.
+        }
+    }
+#endif
+
     if (!legacyAttention && !referenceMath &&
         V41TrySm75PrefillAttention(q, chunkKV, hasRing ? ringKV : nullptr,
             hasCmp ? compressedKV : nullptr, hasCmp ? cmpIdx : nullptr, attnSink,
@@ -7108,8 +7147,7 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
              cudaEventCreateWithFlags(&p->copied, cudaEventDisableTiming) == cudaSuccess;
     if (!ok) { cudaGetLastError(); return nullptr; }
 #ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
-    const char *flashInfer = std::getenv("FASTLLM_DSV41_FLASHINFER");
-    if (flashInfer && std::strcmp(flashInfer, "1") == 0)
+    if (FastllmV41FlashInferEnabled())
         p->flashInfer = FastllmV41FlashInferCreate(c);
 #endif
     return p.release();

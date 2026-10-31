@@ -11,7 +11,7 @@
 
 namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16 {
 
-template <int NUM_HEADS, bool EXTRA_FP4, bool REQUEST_INDICES = false>
+template <int NUM_HEADS, bool EXTRA_FP4, bool REQUEST_INDICES = false, bool VERIFY = false>
 __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
     sparse_mla_decode_dsv41_bf16_kernel(
         const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
@@ -81,13 +81,19 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
         if (logical < n) {
           if (extra) {
             const int count = compression_ratio ? (pos + 1) / compression_ratio : 0;
-            if (logical < min(count, extra_topk)) {
+            // Verification indices span the complete chunk's compressed
+            // cache. Mask by the query's causal count, not by index-list rank.
+            const int end = VERIFY ? *position_ptr + num_tokens : pos + 1;
+            const int list_count = compression_ratio ? end / compression_ratio : 0;
+            if (logical < min(list_count, extra_topk)) {
               id = extra_indices[size_t(t) * extra_indices_stride_elems + logical];
               if (id < 0 || id >= count) id = -1;
             }
           } else {
             const int p = pos - 127 + logical;
-            if (p >= 0 && p < pos) id = p % 128;
+            // Deferred verification rows remain BF16 outside this ring.
+            const int ring_end = VERIFY ? *position_ptr : pos;
+            if (p >= 0 && p < ring_end) id = p % 128;
           }
         }
         sm.valid[tidx] = id;

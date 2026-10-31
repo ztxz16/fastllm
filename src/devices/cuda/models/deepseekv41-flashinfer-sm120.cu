@@ -5,6 +5,8 @@
 #include <flashinfer/attention/sparse_mla_sm120/kernels/dsv41_bf16/decode.cuh>
 #include <cmath>
 #include <memory>
+#include <map>
+#include <climits>
 
 namespace {
 using namespace flashinfer::sparse_mla_sm120;
@@ -12,6 +14,7 @@ using namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16;
 struct Plan {
     int width = 0, splits = 0, ratio = 0, heads = 0, batch = 0, scratchHeads = 0;
     float scale = 1.f;
+    bool verifying = false;
     void *storage = nullptr;
     bf16 *mid = nullptr;
     float *midLse = nullptr;
@@ -88,30 +91,129 @@ __global__ void MergeCurrent(const bf16 *q, const bf16 *current, const bf16 *par
     pairs[1] = __floats2bfloat162_rn(acc[2], acc[3]);
     *reinterpret_cast<uint2 *>(output + t * 4) = result;
 }
+
+// Each verification row attends to the BF16 prefix of the same causal chunk.
+// The packed-cache kernel excludes those rows, so no ring commit or temporary
+// quantization is needed. Keep QK, softmax and the weighted sum in FP32.
+__global__ void MergeVerify(const bf16 *q, const bf16 *chunk, const bf16 *partial, const float *lse,
+                            const float *sink, bf16 *output, float scale, int heads, int scratchHeads,
+                            int splits, int length) {
+    const int h = blockIdx.x, rowIndex = blockIdx.y, token = rowIndex % length, t = threadIdx.x;
+    const int lane = t & 31, warp = t / 32;
+    chunk += size_t(rowIndex - token) * 512;
+    q += (size_t(rowIndex) * heads + h) * 512;
+    partial += (size_t(rowIndex) * scratchHeads + h) * splits * 512;
+    lse += (size_t(rowIndex) * scratchHeads + h) * splits;
+    output += (size_t(rowIndex) * heads + h) * 512;
+    // Plan creation bounds both the causal chunk and the split count.
+    __shared__ float prefixWeights[128], splitWeights[18];
+    for (int row = warp; row <= token; row += 4) {
+        float dot = 0.f;
+#pragma unroll
+        for (int d = lane; d < 512; d += 32)
+            dot = fmaf(float(q[d]), float(chunk[size_t(row) * 512 + d]), dot);
+        for (int s = 16; s; s >>= 1)
+            dot += __shfl_down_sync(0xffffffff, dot, s);
+        if (!lane)
+            prefixWeights[row] = dot * scale * 1.4426950408889634f;
+    }
+    __syncthreads();
+    if (t < 32) {
+        const float sinkScore = sink[h] * 1.4426950408889634f;
+        float maximum = sinkScore;
+        for (int row = t; row <= token; row += 32)
+            maximum = fmaxf(maximum, prefixWeights[row]);
+        for (int i = t; i < splits; i += 32)
+            maximum = fmaxf(maximum, lse[i]);
+        for (int s = 16; s; s >>= 1)
+            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, s));
+        float denominator = 0.f;
+        for (int row = t; row <= token; row += 32) {
+            const float w = exp2f(prefixWeights[row] - maximum);
+            prefixWeights[row] = w;
+            denominator += w;
+        }
+        for (int i = t; i < splits; i += 32) {
+            const float w = lse[i] > -1e29f ? exp2f(lse[i] - maximum) : 0.f;
+            splitWeights[i] = w;
+            denominator += w;
+        }
+        for (int s = 16; s; s >>= 1)
+            denominator += __shfl_xor_sync(0xffffffff, denominator, s);
+        const float inv = 1.f / (denominator + exp2f(sinkScore - maximum));
+        for (int row = t; row <= token; row += 32)
+            prefixWeights[row] *= inv;
+        for (int i = t; i < splits; i += 32)
+            splitWeights[i] *= inv;
+    }
+    __syncthreads();
+    float acc[4] = {};
+    for (int row = 0; row <= token; ++row) {
+#pragma unroll
+        for (int d = 0; d < 4; ++d)
+            acc[d] = fmaf(prefixWeights[row], float(chunk[size_t(row) * 512 + t * 4 + d]), acc[d]);
+    }
+    for (int i = 0; i < splits; ++i) {
+        if (splitWeights[i] == 0.f)
+            continue;
+#pragma unroll
+        for (int d = 0; d < 4; ++d)
+            acc[d] = fmaf(splitWeights[i], float(partial[size_t(i) * 512 + t * 4 + d]), acc[d]);
+    }
+    uint2 result;
+    auto *pairs = reinterpret_cast<__nv_bfloat162 *>(&result);
+    pairs[0] = __floats2bfloat162_rn(acc[0], acc[1]);
+    pairs[1] = __floats2bfloat162_rn(acc[2], acc[3]);
+    *reinterpret_cast<uint2 *>(output + t * 4) = result;
+}
+
+template <bool Verify, bool Requests = true>
+auto AttentionKernel(int heads, bool compressed) {
+    return heads == 64 ? (compressed ? sparse_mla_decode_dsv41_bf16_kernel<64, true, Requests, Verify>
+                                    : sparse_mla_decode_dsv41_bf16_kernel<64, false, Requests, Verify>)
+                       : (compressed ? sparse_mla_decode_dsv41_bf16_kernel<0, true, Requests, Verify>
+                                     : sparse_mla_decode_dsv41_bf16_kernel<0, false, Requests, Verify>);
+}
+
+template <bool Verify, bool Requests = true>
+bool KernelReady(int heads, bool compressed) {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess)
+        return false;
+    // Initialize each device/specialization once per host worker, outside capture.
+    static thread_local std::map<std::pair<int, int>, bool> ready;
+    const auto key = std::make_pair(device, (heads == 64 ? 2 : 0) + int(compressed));
+    auto found = ready.find(key);
+    if (found != ready.end())
+        return found->second;
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone)
+        return false;
+    int major = 0, minor = 0;
+    bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+              cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
+              major == 12 && minor >= 0 && minor <= 1;
+    if (ok)
+        ok = cudaFuncSetAttribute(AttentionKernel<Verify, Requests>(heads, compressed),
+            cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Dsv41Bf16Smem)) == cudaSuccess;
+    if (!ok)
+        cudaGetLastError();
+    ready.emplace(key, ok);
+    return ok;
+}
 } // namespace
 
 void *FastllmV41FlashInferCreate(const FastllmV41FullDecodeConfig &c) {
-    // Packed full-decode is currently the single-GPU hybrid path. Verification,
-    // BF16/FP8 compressed cache and other windows keep native math.
-    if (c.verifying || c.batch < 1 || c.batch > 128 || c.heads < 1 || c.heads > 128 || c.window != 128 ||
+    // Independent decode requests and one contiguous causal verification
+    // chunk share the packed-cache kernel. Other cache formats retain native math.
+    if (c.batch < 1 || c.batch > 128 || c.heads < 1 || c.heads > 128 || c.window != 128 ||
         c.ringMode != 1 || c.ringRowBytes != 528 || c.cmpMode != 3 || c.cmpRowBytes != 288 || c.ratio < 0 ||
         c.ratio > 2 || c.topK < 1 || c.topK > 1024 || !std::isfinite(c.softmaxScale) || c.softmaxScale <= 0.f)
         return nullptr;
-    int device = 0, major = 0, minor = 0;
-    if (cudaGetDevice(&device) != cudaSuccess ||
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess ||
-        major != 12 || minor < 0 || minor > 1)
+    if (!(c.verifying ? KernelReady<true>(c.heads, c.ratio != 0)
+                      : KernelReady<false>(c.heads, c.ratio != 0)))
         return nullptr;
-    auto kernel = c.heads == 64 ? (c.ratio ? sparse_mla_decode_dsv41_bf16_kernel<64, true, true>
-                                           : sparse_mla_decode_dsv41_bf16_kernel<64, false, true>)
-                                : (c.ratio ? sparse_mla_decode_dsv41_bf16_kernel<0, true, true>
-                                           : sparse_mla_decode_dsv41_bf16_kernel<0, false, true>);
-    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Dsv41Bf16Smem)) !=
-        cudaSuccess) {
-        cudaGetLastError();
-        return nullptr;
-    }
     auto p = std::make_unique<Plan>();
     p->width = c.ratio ? c.topK : 0;
     p->splits = 2 + (p->width + 63) / 64;
@@ -119,6 +221,7 @@ void *FastllmV41FlashInferCreate(const FastllmV41FullDecodeConfig &c) {
     p->scale = c.softmaxScale;
     p->heads = c.heads;
     p->batch = c.batch;
+    p->verifying = c.verifying;
     p->scratchHeads = (c.heads + 15) / 16 * 16;
     // cudaMalloc aligns the BF16 split tensor; each split occupies 1024 bytes.
     const size_t midCount = size_t(c.batch) * p->scratchHeads * p->splits;
@@ -141,10 +244,8 @@ cudaError_t FastllmV41FlashInferRun(void *handle, const FastllmV41FullDecodeBuff
     auto *p = static_cast<Plan *>(handle);
     if (!p || !request || !b.q || !b.kv || !b.output || !b.sink || (p->width && !b.topk))
         return cudaErrorInvalidValue;
-    auto kernel = p->heads == 64 ? (p->width ? sparse_mla_decode_dsv41_bf16_kernel<64, true, true>
-                                             : sparse_mla_decode_dsv41_bf16_kernel<64, false, true>)
-                                 : (p->width ? sparse_mla_decode_dsv41_bf16_kernel<0, true, true>
-                                             : sparse_mla_decode_dsv41_bf16_kernel<0, false, true>);
+    auto kernel = p->verifying ? AttentionKernel<true>(p->heads, p->width != 0)
+                               : AttentionKernel<false>(p->heads, p->width != 0);
     kernel<<<dim3(p->batch, p->scratchHeads / 16, p->splits), 256, sizeof(Dsv41Bf16Smem), stream>>>(
         static_cast<const bf16 *>(b.q), nullptr, nullptr, p->mid, p->midLse, nullptr, nullptr,
         p->width ? static_cast<const int32_t *>(b.topk) : nullptr, nullptr, p->width, 1, 288, p->batch,
@@ -153,9 +254,82 @@ cudaError_t FastllmV41FlashInferRun(void *handle, const FastllmV41FullDecodeBuff
     const cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess)
         return status;
-    MergeCurrent<<<dim3(p->heads, p->batch), 128, 0, stream>>>(
-        static_cast<const bf16 *>(b.q), static_cast<const bf16 *>(b.kv), p->mid, p->midLse,
-        static_cast<const float *>(b.sink), static_cast<bf16 *>(b.output), p->scale, p->heads,
-        p->scratchHeads, p->splits);
+    if (p->verifying) {
+        MergeVerify<<<dim3(p->heads, p->batch), 128, 0, stream>>>(
+            static_cast<const bf16 *>(b.q), static_cast<const bf16 *>(b.kv), p->mid, p->midLse,
+            static_cast<const float *>(b.sink), static_cast<bf16 *>(b.output), p->scale, p->heads,
+            p->scratchHeads, p->splits, p->batch);
+    } else {
+        MergeCurrent<<<dim3(p->heads, p->batch), 128, 0, stream>>>(
+            static_cast<const bf16 *>(b.q), static_cast<const bf16 *>(b.kv), p->mid, p->midLse,
+            static_cast<const float *>(b.sink), static_cast<bf16 *>(b.output), p->scale, p->heads,
+            p->scratchHeads, p->splits);
+    }
+    return cudaGetLastError();
+}
+
+namespace {
+// Dense caches use batch-major storage. Convert local row IDs to global IDs
+// for FlashInfer's ordinary gather; no host upload or temporary KV copy.
+__global__ void PrepareChunkIndices(FastllmV41FlashInferChunkConfig c, const int32_t *selected,
+                                    int32_t *ring, int32_t *compressed) {
+    const int token = blockIdx.x, i = threadIdx.x;
+    const int batch = token / c.length, position = c.startPosition + token % c.length;
+    if (i < 128) {
+        const int p = position - 127 + i;
+        ring[size_t(token) * 128 + i] = p >= 0 && p < c.startPosition ? batch * 128 + p % 128 : -1;
+    }
+    for (int k = i; k < c.topK; k += blockDim.x) {
+        const int id = selected[size_t(token) * c.topK + k];
+        compressed[size_t(token) * c.topK + k] = id >= 0 && id < c.compressedRows ?
+            batch * c.compressedRows + id : -1;
+    }
+}
+struct ChunkLayout {
+    int heads, splits, tokens;
+    size_t count, bytes;
+    explicit ChunkLayout(const FastllmV41FlashInferChunkConfig &c)
+        : heads((c.heads + 15) / 16 * 16), splits(2 + (c.topK + 63) / 64), tokens(c.batches * c.length),
+          count(size_t(tokens) * heads * splits),
+          bytes(count * (512 * sizeof(bf16) + sizeof(float)) + size_t(tokens) * (128 + c.topK) * sizeof(int32_t)) {}
+};
+
+bool ValidChunkConfig(const FastllmV41FlashInferChunkConfig &c) {
+    return c.batches >= 1 && c.length >= 1 && c.length <= 128 && int64_t(c.batches) * c.length <= 128 &&
+           c.heads >= 1 && c.heads <= 128 && c.topK >= 0 && c.topK <= 1024 && c.compressedRows >= 0 &&
+           (!c.topK || c.compressedRows > 0) && c.compressedRows <= INT_MAX / c.batches &&
+           c.startPosition >= 0 && c.startPosition <= INT_MAX - c.length &&
+           std::isfinite(c.scale) && c.scale > 0.f;
+}
+} // namespace
+
+size_t FastllmV41FlashInferChunkWorkspace(const FastllmV41FlashInferChunkConfig &c) {
+    return ValidChunkConfig(c) && KernelReady<false, false>(c.heads, c.topK != 0) ? ChunkLayout(c).bytes : 0;
+}
+
+cudaError_t FastllmV41FlashInferChunkRun(const FastllmV41FlashInferChunkConfig &c,
+    const FastllmV41FullDecodeBuffers &b, const void *ring, const void *compressed,
+    void *workspace, cudaStream_t stream) {
+    if (!ValidChunkConfig(c) || !workspace || !b.q || !b.kv || !b.output || !b.sink || (c.startPosition && !ring) ||
+        (c.topK && (!compressed || !b.topk))) return cudaErrorInvalidValue;
+    const ChunkLayout l(c);
+    auto *mid = static_cast<bf16 *>(workspace);
+    auto *lse = reinterpret_cast<float *>(mid + l.count * 512);
+    auto *ringIndices = reinterpret_cast<int32_t *>(lse + l.count);
+    auto *cmpIndices = ringIndices + size_t(l.tokens) * 128;
+    PrepareChunkIndices<<<l.tokens, 128, 0, stream>>>(c, static_cast<const int32_t *>(b.topk), ringIndices, cmpIndices);
+    auto status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    auto kernel = AttentionKernel<false, false>(c.heads, c.topK != 0);
+    kernel<<<dim3(l.tokens, l.heads / 16, l.splits), 256, sizeof(Dsv41Bf16Smem), stream>>>(
+        static_cast<const bf16 *>(b.q), static_cast<const uint8_t *>(ring), ringIndices, mid, lse, nullptr,
+        static_cast<const uint8_t *>(compressed), c.topK ? cmpIndices : nullptr, nullptr,
+        c.topK, 1, 288, l.tokens, c.heads, 128, l.splits, 1, c.scale, 528, 128, c.topK, Dsv41Pages{1, false},
+        nullptr, nullptr, sizeof(void *), nullptr, 0);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    MergeVerify<<<dim3(c.heads, l.tokens), 128, 0, stream>>>(static_cast<const bf16 *>(b.q),
+        static_cast<const bf16 *>(b.kv), mid, lse, static_cast<const float *>(b.sink),
+        static_cast<bf16 *>(b.output), c.scale, c.heads, l.heads, l.splits, c.length);
     return cudaGetLastError();
 }
