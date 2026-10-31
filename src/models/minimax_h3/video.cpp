@@ -80,7 +80,7 @@ Tensor VideoVAE::decodeTiles(const Tensor &latent, int frames, int height, int w
     for (int layer = 0; layer < 36; ++layer) {
         auto p = "decoder.transformer_blocks." + std::to_string(layer);
         auto y = rt_.videoRms(x, fullWeights_.get(p + ".norm1.weight"));
-        Tensor q, k, v;
+        Tensor q, k, v, attention;
         if (rt_.isFloat32()) {
             q = weights_.linear(y, p + ".attn.to_q");
             k = weights_.linear(y, p + ".attn.to_k");
@@ -112,17 +112,18 @@ Tensor VideoVAE::decodeTiles(const Tensor &latent, int frames, int height, int w
                     weights_.erasePrefix(p + ".attn.to_" + name);
             }
             auto projections = rt_.linear(y, packed.first, packed.second.data ? &packed.second : nullptr);
-            auto qkv = rt_.videoQkvNormRotary(projections, rope.first, rope.second);
-            q = qkv[0];
-            k = qkv[1];
-            v = qkv[2];
+            rt_.videoQkvNormRotaryInPlace(projections, rope.first, rope.second);
+            attention = rt_.packedSelfAttention(projections, 32, batch);
         }
-        std::vector<Tensor> attention;
-        for (int i = 0; i < batch; ++i)
-            attention.push_back(rt_.selfAttention(q.rowSlice(i * sequence, sequence),
-                                                 k.rowSlice(i * sequence, sequence),
-                                                 v.rowSlice(i * sequence, sequence), 32));
-        y = weights_.linear(batch == 1 ? attention[0] : rt_.concat(attention), p + ".attn.to_out.0");
+        if (rt_.isFloat32()) {
+            std::vector<Tensor> outputs;
+            for (int i = 0; i < batch; ++i)
+                outputs.push_back(rt_.selfAttention(q.rowSlice(i * sequence, sequence),
+                                                     k.rowSlice(i * sequence, sequence),
+                                                     v.rowSlice(i * sequence, sequence), 32));
+            attention = batch == 1 ? outputs[0] : rt_.concat(outputs);
+        }
+        y = weights_.linear(attention, p + ".attn.to_out.0");
         x = rt_.scaledResidual(x, y, fullWeights_.get(p + ".scale1"));
         y = rt_.videoRms(x, fullWeights_.get(p + ".norm2.weight"));
         Tensor output(y.rows, 2048, y.dtype);
@@ -288,8 +289,11 @@ Tensor VideoVAE::decodeClip(const VideoTensor &z, std::function<void()> checkpoi
     return rt_.stitchVideo(patches, z.frames, ys.length[0], xs.length[0], z.height, z.width,
                            ys.start, xs.start);
 }
-Tensor VideoVAE::decodeDevice(const VideoTensor &z, std::function<void(int, int)> progress,
-                              std::function<void(const Tensor &)> onFrames) {
+namespace {
+struct DecodedVideoShape {
+    int chunks, frames, framePixels;
+};
+DecodedVideoShape decodedVideoShape(const VideoTensor &z) {
     if (z.channels != 24 || z.frames < 2 || z.height < 1 || z.width < 1 ||
         z.values.size() != size_t(z.frames) * z.height * z.width * 24)
         throw std::invalid_argument("invalid H3 video latents");
@@ -303,6 +307,13 @@ Tensor VideoVAE::decodeDevice(const VideoTensor &z, std::function<void(int, int)
     int64_t framePixels = int64_t(z.height) * z.width * 256;
     if (framePixels * frames > INT32_MAX)
         throw std::invalid_argument("H3 video output is too large");
+    return {chunks, frames, int(framePixels)};
+}
+} // namespace
+Tensor VideoVAE::decodeDevice(const VideoTensor &z, std::function<void(int, int)> progress,
+                              std::function<void(const Tensor &)> onFrames) {
+    auto shape = decodedVideoShape(z);
+    int chunks = shape.chunks, frames = shape.frames, framePixels = shape.framePixels;
     Tensor out(int(framePixels * frames), 3, DType::FP32), overlap;
     for (int i = 0; i < chunks; ++i) {
         auto clip = decodeClip(crop(z, i * 5, 7, 0, z.height, 0, z.width), [&] {
@@ -336,14 +347,20 @@ VideoTensor VideoVAE::decode(const VideoTensor &z, std::function<void(int, int)>
     return out;
 }
 std::vector<uint8_t> VideoVAE::decodeRGB(const VideoTensor &z, std::function<void(int, int)> progress,
-                                       std::function<void(const std::vector<uint8_t> &)> onFrames) {
+                                       std::function<void(std::vector<uint8_t>)> onFrames, bool retainRGB) {
+    if (!onFrames && !retainRGB)
+        throw std::invalid_argument("RGB streaming requires a frame consumer");
     if (!onFrames)
         return rt_.downloadVideoRGB(decodeDevice(z, progress));
+    auto shape = decodedVideoShape(z);
     std::vector<uint8_t> rgb;
+    if (retainRGB)
+        rgb.reserve(size_t(shape.frames) * shape.framePixels * 3);
     decodeDevice(z, progress, [&](const Tensor &frames) {
         auto chunk = rt_.downloadVideoRGB(frames);
-        onFrames(chunk);
-        rgb.insert(rgb.end(), chunk.begin(), chunk.end());
+        if (retainRGB)
+            rgb.insert(rgb.end(), chunk.begin(), chunk.end());
+        onFrames(std::move(chunk));
     });
     return rgb;
 }

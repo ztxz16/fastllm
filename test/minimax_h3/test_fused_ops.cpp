@@ -178,7 +178,7 @@ static void linearOutputs() {
             auto wrongShape = randomTensor(rt, rows, width + 1);
             rejects([&] { rt.linearInto(input, weight, wrongShape); });
             rejects([&] { rt.linearInto(input, weight, input); });
-            Tensor wrongType(rows, width, dtype == DType::FP32 ? DType::BF16 : DType::FP32);
+            Tensor wrongType(rows, width, dtype == DType::BF16 ? DType::FP16 : DType::BF16);
             rejects([&] { rt.linearInto(input, weight, wrongType); });
         }
         if (dtype != DType::FP32) {
@@ -439,14 +439,17 @@ static void packedVideoQkv() {
             auto cs = randomTensor(full, rows, 48), sn = randomTensor(full, rows, 48);
             auto q = rt.columns(packed, 0, 128), k = rt.columns(packed, 128, 128);
             auto expected = rt.videoQkNormRotary(q, k, cs, sn);
-            auto actual = rt.videoQkvNormRotary(packed, cs, sn);
+            std::array<Tensor, 3> actual{expected.first, expected.second, rt.columns(packed, 256, 128)};
+            auto inplace = rt.concat({packed});
+            rt.videoQkvNormRotaryInPlace(inplace, cs, sn);
+            for (int part = 0; part < 3; ++part)
+                equal(rt, actual[part], rt.columns(inplace, part * 128, 128));
             std::cout << "packed_video_qkv dtype=" << int(dtype) << " rows=" << rows;
-            equal(rt, expected.first, actual[0]);
-            equal(rt, expected.second, actual[1]);
-            equal(rt, rt.columns(packed, 256, 128), actual[2]);
-            auto batch = rt.videoQkvNormRotary(rt.concat({packed, packed}), cs, sn);
-            for (int i = 0; i < 3; ++i)
-                equal(rt, rt.concat({actual[i], actual[i]}), batch[i]);
+            auto stacked = rt.concat({packed, packed});
+            rt.videoQkvNormRotaryInPlace(stacked, cs, sn);
+            for (int i = 0; i < 3; ++i) {
+                equal(rt, rt.concat({actual[i], actual[i]}), rt.columns(stacked, i * 128, 128));
+            }
             std::cout << std::endl;
         }
     }
@@ -621,8 +624,44 @@ int main() {
                     rejects([&] { r.scaledResidual(x, y, randomTensor(full, 1, width + 1)); });
                 }
             }
-            for (int rows : {1, 47, 513, 12847}) {
-                int width = rows == 12847 ? 14336 : 67;
+            {
+                auto storage = randomTensor(r, 1, 257);
+                auto x = storage;
+                x.rows = 2;
+                x.cols = 128;
+                x.data += x.isFloat32() ? 2 : 1;
+                auto hidden = r.columns(x, 0, 64), gate = r.columns(x, 64, 64);
+                std::cout << "unaligned SiLU dtype=" << int(dtype);
+                equal(r, r.multiply(hidden, r.activation(gate)), r.siluMultiply(x));
+                std::cout << std::endl;
+            }
+            for (int dim : {64, 128}) {
+                for (int batch : {1, 4}) {
+                    auto packed = randomTensor(r, batch * 19, dim * 6);
+                    auto q = r.columns(packed, 0, dim * 2), k = r.columns(packed, dim * 2, dim * 2),
+                         v = r.columns(packed, dim * 4, dim * 2);
+                    std::vector<Tensor> outputs;
+                    for (int i = 0; i < batch; ++i)
+                        outputs.push_back(r.attention(q.rowSlice(i * 19, 19), k.rowSlice(i * 19, 19),
+                                                      v.rowSlice(i * 19, 19), 2));
+                    std::cout << "packed_attention dtype=" << int(dtype) << " dim=" << dim << " batch=" << batch;
+                    equal(r, r.concat(outputs), r.packedSelfAttention(packed, 2, batch));
+                    std::cout << std::endl;
+                    rejects([&] { r.packedSelfAttention(packed, 2, 0); });
+                    rejects([&] { r.packedSelfAttention(packed, 2, 3); });
+                    auto unaligned = randomTensor(r, 1, int(packed.size()) + 1);
+                    unaligned.data += unaligned.isFloat32() ? 2 : 1;
+                    unaligned.rows = packed.rows;
+                    unaligned.cols = packed.cols;
+                    auto aligned = r.concat({unaligned});
+                    std::cout << "unaligned packed attention dtype=" << int(dtype);
+                    equal(r, r.packedSelfAttention(aligned, 2, batch),
+                          r.packedSelfAttention(unaligned, 2, batch));
+                    std::cout << std::endl;
+                }
+            }
+            for (int rows : {1, 47, 64, 68, 513, 12847}) {
+                int width = rows == 12847 ? 14336 : (rows == 64 || rows == 68 ? rows : 67);
                 auto x = randomTensor(r, rows, width * 2);
                 auto hidden = r.columns(x, 0, width), gate = r.columns(x, width, width);
                 auto reference = r.multiply(hidden, r.activation(gate));

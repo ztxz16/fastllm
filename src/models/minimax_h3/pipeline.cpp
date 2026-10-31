@@ -137,19 +137,19 @@ Pipeline::~Pipeline() = default;
 Generation Pipeline::generate(const GenerateOptions &o, Progress progress, Trace trace,
                               const std::vector<float> *initialVideo,
                               const std::vector<float> *initialAudio) {
-    return generateImpl(o, std::move(progress), std::move(trace), initialVideo, initialAudio, {}, {});
+    return generateImpl(o, std::move(progress), std::move(trace), initialVideo, initialAudio, {}, {}, true);
 }
 Generation Pipeline::generateMP4(const GenerateOptions &o, const std::string &path, const std::string &ffmpeg,
                                  Progress progress, Trace trace, const std::vector<float> *initialVideo,
-                                 const std::vector<float> *initialAudio) {
+                                 const std::vector<float> *initialAudio, bool retainRGB) {
     if (path.empty())
         throw std::invalid_argument("MP4 output path is empty");
-    return generateImpl(o, std::move(progress), std::move(trace), initialVideo, initialAudio, path, ffmpeg);
+    return generateImpl(o, std::move(progress), std::move(trace), initialVideo, initialAudio, path, ffmpeg, retainRGB);
 }
 Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, Trace trace,
                                   const std::vector<float> *initialVideo,
                                   const std::vector<float> *initialAudio, const std::string &path,
-                                  const std::string &ffmpeg) {
+                                  const std::string &ffmpeg, bool retainRGB) {
     o.validate();
     rt_.activate();
     auto tick = [&](const std::string &stage, int i, int n) {
@@ -470,10 +470,10 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
         int videoCurrent = 0, videoTotal = 1;
         if (!path.empty())
             writer = std::make_unique<MP4Writer>(result, path, ffmpeg);
-        std::function<void(const std::vector<uint8_t> &)> onFrames;
+        std::function<void(std::vector<uint8_t>)> onFrames;
         if (writer)
-            onFrames = [&](const std::vector<uint8_t> &rgb) {
-                writer->write(rgb.data(), rgb.size(),
+            onFrames = [&](std::vector<uint8_t> rgb) {
+                writer->write(std::move(rgb),
                               [&] { tick("video_decode", videoCurrent, videoTotal); });
             };
         result.rgb = video_.decodeRGB(
@@ -483,13 +483,13 @@ Generation Pipeline::generateImpl(const GenerateOptions &o, Progress progress, T
                 videoTotal = total;
                 tick("video_decode", current, total);
             },
-            std::move(onFrames));
+            std::move(onFrames), retainRGB);
         if (!retainWeights_) {
             if (parallel_) parallel_->unloadVideo();
             else video_.unload();
         }
         tick("video_decode", 1, 1);
-        if (result.rgb.size() != size_t(o.frames) * o.width * o.height * 3)
+        if (retainRGB && result.rgb.size() != size_t(o.frames) * o.width * o.height * 3)
             throw std::runtime_error("decoded H3 frame count mismatch");
         latents = {};
         if (writer) {

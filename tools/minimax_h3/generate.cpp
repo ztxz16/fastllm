@@ -126,7 +126,8 @@ int main(int argc, char **argv) {
                 last = stage;
                 current = i;
             },
-            trace, initialVideo.empty() ? nullptr : &video, initialAudio.empty() ? nullptr : &audio);
+            trace, initialVideo.empty() ? nullptr : &video, initialAudio.empty() ? nullptr : &audio,
+            !traceDirectory.empty());
         if (!traceDirectory.empty()) {
             std::ofstream rgb(traceDirectory + "/output.rgb", std::ios::binary),
                 audioOut(traceDirectory + "/output.audio.f32", std::ios::binary);

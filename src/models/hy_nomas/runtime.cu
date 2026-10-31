@@ -22,7 +22,7 @@
 #endif
 
 namespace fastllm { namespace nomas {
-cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,int,bool,bool,int,int,int,float,bool,cudaStream_t);
+cudaError_t fusedAttention(const void *,const void *,const void *,void *,int,int,int,int,int,bool,bool,int,int,int,float,bool,cudaStream_t,int=0,int=0);
 namespace {
 using B = __nv_bfloat16;
 using H = __half;
@@ -141,11 +141,21 @@ template<class T, bool FusedAffine=true> __global__ void normKernel(const T *x, 
         y[size_t(row)*width+c]=cast<T>(v);
     }
 }
-template<class T> __global__ void packedSiluMultiply(const T *x,T *out,size_t n,int width) {
-    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
-        size_t p=(i/width)*(2*width)+i%width;
-        float gate=f(x[p+width]);
-        out[i]=cast<T>(f(x[p])*roundTo<T>(gate/(1.f+expf(-gate))));
+template<class T,int Pack> struct alignas(sizeof(T)*Pack) ElementPack { T value[Pack]; };
+template<class T,class Index,int Pack=1>
+__global__ void packedSiluMultiply(const T *x,T *out,Index n,int width) {
+    auto input=reinterpret_cast<const ElementPack<T,Pack> *>(x);
+    auto output=reinterpret_cast<ElementPack<T,Pack> *>(out);
+    for(Index i=Index(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=Index(gridDim.x)*blockDim.x) {
+        Index p=(i/width)*(Index(2)*width)+i%width;
+        auto hidden=input[p], gates=input[p+width];
+        ElementPack<T,Pack> result;
+#pragma unroll
+        for(int j=0;j<Pack;++j) {
+            float gate=f(gates.value[j]);
+            result.value[j]=cast<T>(f(hidden.value[j])*roundTo<T>(gate/(1.f+expf(-gate))));
+        }
+        output[i]=result;
     }
 }
 template<class T,bool Broadcast> __global__ void scaledResidualKernel(const float *x,const T *y,const float *scale,
@@ -524,8 +534,22 @@ Tensor Runtime::siluMultiply(const Tensor &x,const Tensor &y) {
 Tensor Runtime::siluMultiply(const Tensor &x) {
     require(x.cols%2==0,"invalid packed SiLU width");
     Tensor out(x.rows,x.cols/2,x.dtype);
-    DISPATCH_TENSOR(x.dtype, T, packedSiluMultiply<T><<<grid(out.size()),256,0,cudaStreamPerThread>>>(
-        as<T>(x),as<T>(out),out.size(),out.cols));
+    // Vectorize 16-bit loads/stores without changing the scalar FP32 arithmetic or
+    // activation rounding. Odd widths and unaligned views retain the scalar path.
+    DISPATCH_TENSOR(x.dtype, T,
+        if(sizeof(T)==2 && out.cols%8==0 && uintptr_t(as<T>(x))%16==0 && out.size()<=size_t(INT32_MAX)) {
+            packedSiluMultiply<T,uint32_t,8><<<grid(out.size()/8),256,0,cudaStreamPerThread>>>(
+                as<T>(x),as<T>(out),uint32_t(out.size()/8),out.cols/8);
+        } else if(sizeof(T)==2 && out.cols%2==0 && uintptr_t(as<T>(x))%4==0 && out.size()<=size_t(INT32_MAX)) {
+            packedSiluMultiply<T,uint32_t,2><<<grid(out.size()/2),256,0,cudaStreamPerThread>>>(
+                as<T>(x),as<T>(out),uint32_t(out.size()/2),out.cols/2);
+        } else if(out.size()<=size_t(INT32_MAX)) {
+            packedSiluMultiply<T,uint32_t><<<grid(out.size()),256,0,cudaStreamPerThread>>>(
+                as<T>(x),as<T>(out),uint32_t(out.size()),out.cols);
+        } else {
+            packedSiluMultiply<T,size_t><<<grid(out.size()),256,0,cudaStreamPerThread>>>(
+                as<T>(x),as<T>(out),out.size(),out.cols);
+        });
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::scaledResidual(const Tensor &x,const Tensor &y,const Tensor &scale) {
@@ -718,6 +742,28 @@ Tensor Runtime::attention(const Tensor &q,const Tensor &k,const Tensor &v,int he
                           int kvHeads,bool causal,int tile,int height,int width) {
     require(heads>0 && q.cols%heads==0,"invalid attention heads");
     return attentionScaled(q,k,v,heads,1.f/std::sqrt(float(q.cols/heads)),mask,chunk,kvHeads,causal,tile,height,width);
+}
+Tensor Runtime::packedSelfAttention(const Tensor &qkv,int heads,int batch) {
+    require(batch>0 && qkv.rows>0 && qkv.rows%batch==0 && heads>0 && qkv.cols>0 &&
+            qkv.cols%3==0 && (qkv.cols/3)%heads==0,"invalid packed self-attention shape");
+    int width=qkv.cols/3,dim=width/heads,tokens=qkv.rows/batch;
+    if(!qkv.isFloat32() && (dim==64 || dim==128) && uintptr_t(qkv.data)%16==0) {
+        Tensor out(qkv.rows,width,qkv.dtype);
+        for(int i=0;i<batch;++i) {
+            const auto *p=qkv.data+size_t(i)*tokens*qkv.cols;
+            auto target=out.rowSlice(i*tokens,tokens);
+            check(fusedAttention(p,p+width,p+2*width,target.data,tokens,tokens,heads,heads,dim,
+                qkv.dtype==DType::FP16,false,0,0,0,1.f/std::sqrt(float(dim)),numerics_.fp32SoftmaxSum,
+                cudaStreamPerThread,qkv.cols,qkv.cols));
+        }
+        return out;
+    }
+    auto q=columns(qkv,0,width),k=columns(qkv,width,width),v=columns(qkv,2*width,width);
+    std::vector<Tensor> outputs;
+    for(int i=0;i<batch;++i)
+        outputs.push_back(attention(q.rowSlice(i*tokens,tokens),k.rowSlice(i*tokens,tokens),
+                                    v.rowSlice(i*tokens,tokens),heads));
+    return batch==1 ? outputs[0] : concat(outputs);
 }
 Tensor Runtime::attentionScaled(const Tensor &q,const Tensor &k,const Tensor &v,int heads,float scoreScale,
                                 const uint8_t *mask,int chunk,int kvHeads,bool causal,int tile,int height,int width) {

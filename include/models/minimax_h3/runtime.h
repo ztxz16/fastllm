@@ -30,7 +30,8 @@ class Runtime : public nomas::Runtime {
     Tensor videoRms(const Tensor &fp32Input, const Tensor &fp32Weight);
     std::pair<Tensor, Tensor> videoQkNormRotary(const Tensor &q, const Tensor &k,
                                                const Tensor &cos, const Tensor &sin);
-    std::array<Tensor, 3> videoQkvNormRotary(const Tensor &qkv, const Tensor &cos, const Tensor &sin);
+    // Preserve packed QKV for strided attention; V is left untouched.
+    void videoQkvNormRotaryInPlace(Tensor &, const Tensor &cos, const Tensor &sin);
     Tensor gather(const Tensor &, const Tensor &indices);
     void scatter(Tensor &out, const Tensor &input, const Tensor &indices);
     Tensor rotary(const Tensor &, const Tensor &cos, const Tensor &sin, int headDim);
@@ -165,7 +166,7 @@ class VideoVAE {
     Tensor decodeTile(const Tensor &, int frames, int height, int width, Trace trace = {});
     VideoTensor decode(const VideoTensor &, std::function<void(int, int)> progress = {});
     std::vector<uint8_t> decodeRGB(const VideoTensor &, std::function<void(int, int)> progress = {},
-                                   std::function<void(const std::vector<uint8_t> &)> onFrames = {});
+                                   std::function<void(std::vector<uint8_t>)> onFrames = {}, bool retainRGB = true);
     void unload() {
         weights_.clear();
         fullWeights_.clear();
@@ -236,14 +237,15 @@ class Pipeline {
     Generation generate(const GenerateOptions &, Progress progress = {}, Trace trace = {},
                         const std::vector<float> *initialVideo = nullptr,
                         const std::vector<float> *initialAudio = nullptr);
+    // File-only callers may omit the full RGB return buffer; C++ defaults retain it.
     Generation generateMP4(const GenerateOptions &, const std::string &path,
                            const std::string &ffmpeg = "ffmpeg", Progress progress = {}, Trace trace = {},
                            const std::vector<float> *initialVideo = nullptr,
-                           const std::vector<float> *initialAudio = nullptr);
+                           const std::vector<float> *initialAudio = nullptr, bool retainRGB = true);
 
   private:
     Generation generateImpl(const GenerateOptions &, Progress, Trace, const std::vector<float> *,
-                            const std::vector<float> *, const std::string &path, const std::string &ffmpeg);
+                            const std::vector<float> *, const std::string &path, const std::string &ffmpeg, bool retainRGB);
     Runtime rt_, full_, videoRuntime_;
     nomas::QwenTokenizer tokenizer_;
     TextEncoder text_;
@@ -263,6 +265,8 @@ class MP4Writer {
               const std::string &ffmpeg = "ffmpeg");
     ~MP4Writer();
     void write(const uint8_t *rgb, size_t bytes, std::function<void()> checkpoint = {});
+    // Transfer ownership of a decoded chunk to the bounded encoder queue.
+    void write(std::vector<uint8_t> rgb, std::function<void()> checkpoint = {});
     void finish(std::function<void()> checkpoint = {});
 
   private:

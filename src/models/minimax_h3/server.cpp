@@ -165,7 +165,7 @@ class Service {
                                                             : stage == "video_decode" ? 10
                                                                                       : 0;
                                                  job->progress = first + (total ? span * current / total : 0);
-                                             });
+                                             }, {}, nullptr, nullptr, false);
                         std::lock_guard<std::mutex> lock(job->mutex);
                         if (job->cancelled) {
                             std::filesystem::remove(output_ + "/" + job->id + ".mp4");

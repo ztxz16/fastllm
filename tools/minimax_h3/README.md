@@ -141,6 +141,8 @@ CLI 和 HTTP 默认先解码音频，再将视频 VAE 已完成拼接的帧分�
 C++ 调用 `Pipeline::generateMP4` 可使用相同路径；`Pipeline::generate` 仍返回原始
 RGB/音频，`writeMP4` 仍可单独编码。视频 VAE 的中间投影按最多 4 个空间 tile 合批，
 各 tile 的 attention 保持独立；FP32 对照保留原分块与矩阵形状。
+HTTP 与普通 CLI 只保留 MP4，不再额外积累完整 RGB。C++ `generateMP4` 默认仍返回
+RGB；仅需文件时可将最后一个参数 `retainRGB` 设为 `false`。CLI `--trace` 保留 RGB 输出。
 
 ## HTTP 与 Demo
 

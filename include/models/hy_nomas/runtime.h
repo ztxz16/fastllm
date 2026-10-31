@@ -132,6 +132,9 @@ public:
                      int heads, const uint8_t *mask = nullptr, int queryChunk = 128,
                      int kvHeads = 0, bool causal = false, int tile = 0,
                      int gridHeight = 0, int gridWidth = 0);
+    // Bidirectional self-attention on [batch * tokens, 3 * heads * dim] QKV.
+    // Read the interleaved rows directly and write one contiguous output.
+    Tensor packedSelfAttention(const Tensor &qkv, int heads, int batch = 1);
     // FP32 attention with an explicit score scale, including pre-scaled Q/K.
     Tensor attentionScaled(const Tensor &q, const Tensor &k, const Tensor &v,
                            int heads, float scoreScale, const uint8_t *mask = nullptr,
