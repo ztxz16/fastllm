@@ -71,7 +71,7 @@ ftllm server /path/to/Clover-35B-A3B-Preview --auto --speculative_algorithm off
 
 跨请求前缀缓存默认开启，使用 `--prefix_cache false` 关闭。Clover 与 Qwen3.5 共用前缀匹配及快照淘汰逻辑；快照同时包含已提交的 Attention KV、卷积历史和 FP32 GDN 状态。完整提示词命中时还会复用未施加采样惩罚的末尾 logits，采样参数和惩罚计数仍由新请求独立初始化。`usage.prompt_tokens_details.cached_tokens` 返回实际复用的输入 token 数。
 
-快照保存在主存，恢复时复制到请求独立的显存；KV 按新增区间保存，多个快照共享不可变区间。沿用 `--prefix_cache_snapshot_interval_pages`（默认 16 页）、`--prefix_cache_snapshot_max_per_request`（默认 4）和 `--prefix_cache_snapshot_max_records`（默认 8）。保存位置为达到间隔的 prefill 分块末尾、完整提示词末尾及可安全提交的完成位置；只能复用这些位置上的完整 GDN 状态，不能任意截断递归状态。停止或输出上限截断验证块时，不保存超出实际返回文本的状态。缓存作用域为当前模型实例，支持 BF16、FP16 和 NUMA 混推；不跨进程持久化。
+快照保存在主存，恢复时复制到请求独立的显存；KV 按新增区间保存，多个快照共享不可变区间。沿用 `--prefix_cache_snapshot_interval_pages`（默认 16 页）、`--prefix_cache_snapshot_max_per_request`（默认 4）和 `--prefix_cache_snapshot_max_records`。未指定总快照上限时，Clover 使用 `max(8, max_batch × 每请求快照上限)`，`--auto` 会将其计入主存预算；显式上限仍然生效。连续请求按实际 token 前缀关联，优先回收同一分支的冗余旧快照，再淘汰其他未引用的历史。活动请求持有的检查点不可被其他请求回收；容量不足时跳过保存。保存位置为达到间隔的 prefill 分块末尾、完整提示词末尾及可安全提交的完成位置；只能复用这些位置上的完整 GDN 状态，不能任意截断递归状态。停止或输出上限截断验证块时，不保存超出实际返回文本的状态。缓存作用域为当前模型实例，支持 BF16、FP16 和 NUMA 混推；不跨进程持久化。
 
 ## NUMA 混合推理
 

@@ -138,6 +138,23 @@ class CloverAutoTest(unittest.TestCase):
         self.assertEqual(disabled["prefix_cache_host_bytes"], 0)
         self.assertEqual(enabled["estimated_gpu_bytes"], disabled["estimated_gpu_bytes"])
 
+    def test_prefix_capacity_tracks_concurrency_and_explicit_limits(self):
+        with patch.dict(os.environ, {}, clear=True):
+            args = self.args("--max_batch", "13", "--max_context_length", "8192")
+            automatic = self.resolve(args)
+            self.assertEqual(automatic["prefix_cache_max_records"], 52)
+            with patch.dict(os.environ, {"FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST": "6"}):
+                self.assertEqual(self.resolve(args)["prefix_cache_max_records"], 78)
+            with patch.dict(os.environ, {"FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS": "7 "}):
+                self.assertEqual(self.resolve(args)["prefix_cache_max_records"], 52)
+            with patch.dict(os.environ, {"FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS": "7"}):
+                self.assertEqual(self.resolve(args)["prefix_cache_max_records"], 7)
+                args.prefix_cache_snapshot_max_records = 9
+                self.assertEqual(self.resolve(args)["prefix_cache_max_records"], 9)
+            args.prefix_cache_snapshot_max_records = 1 << 30
+            with self.assertRaisesRegex(ValueError, "host RAM"):
+                self.resolve(args)
+
 
 class CloverSamplingModel(SamplingModel):
     default_generation_config = dict(top_k=0, top_p=1., temperature=1.,

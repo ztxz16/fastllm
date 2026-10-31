@@ -142,15 +142,25 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
         available_host = min(available_host, host_limit)
     prefix_flag = args.prefix_cache or os.environ.get("FASTLLM_PREFIX_CACHE") or "true"
     prefix_enabled = str(prefix_flag).lower() in ("1", "true", "yes", "on")
-    records = args.prefix_cache_snapshot_max_records
-    if records <= 0:
+    def prefix_limit(option, fallback):
+        value = getattr(args, option)
+        if value > 0:
+            return min(value, 2147483647)
+        value = os.environ.get("FASTLLM_" + option.upper(), "")
+        # Match the native strtol/end check, including invalid trailing text.
+        if not re.fullmatch(r"\s*[+-]?[0-9]+", value, flags=re.ASCII):
+            return fallback
         try:
-            records = max(1, int(os.environ.get("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", "8")))
+            return min(2147483647, max(1, int(value)))
         except ValueError:
-            records = 8
+            return fallback
+    per_request = prefix_limit("prefix_cache_snapshot_max_per_request", 4)
+    records = prefix_limit("prefix_cache_snapshot_max_records", min(2147483647, max(8, args.max_batch * per_request)))
     # Conservative bound: immutable KV chunks are shared, but distinct cached
     # conversations and active requests can each retain a full context.
-    prefix_host = (records + args.max_batch) * (kv // args.max_batch + state // args.max_batch +
+    # Readers can retain replaced checkpoints; allow one transactional publish
+    # in addition to cached entries and each request's held checkpoint.
+    prefix_host = (records + args.max_batch + 1) * (kv // args.max_batch + state // args.max_batch +
                    4 * int(config.get("vocab_size", 248320))) if prefix_enabled else 0
     if available_host < weights + prefix_host + 2 * memory.GiB:
         raise ValueError("Insufficient host RAM for Clover weights and prefix-cache budget")
@@ -173,6 +183,7 @@ def resolve(args, query_gpu, config, *, hardware=None, ram=None):
                   recurrent_state_bytes=state, snapshot_bytes=snapshots,
                   kv_bytes=kv, workspace_reserve_bytes=reserve, estimated_gpu_bytes=required,
                   prefix_cache_host_bytes=prefix_host,
+                  prefix_cache_max_records=records if prefix_enabled else 0,
                   speculative_algorithm=args.speculative_algorithm, block_size=width,
                   automatic={"policy": "single GPU; BF16 or legacy FP16; native context", "cuda_graph": False,
                              "moe_cuda_graph": os.environ.get("FASTLLM_CUDA_GRAPH", "").lower() not in ("0", "false", "off", "no")})

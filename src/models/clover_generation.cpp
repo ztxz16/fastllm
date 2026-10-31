@@ -50,8 +50,7 @@ struct CloverModel::PrefixCache {
         std::vector<std::pair<Data, Data>> recurrent;
         Data logits;
     };
-    std::vector<std::unique_ptr<Snapshot>> items;
-    long long timestamp = 0;
+    RecurrentPrefixStore<Snapshot> store;
 };
 
 struct CloverModel::Request {
@@ -67,7 +66,7 @@ struct CloverModel::Request {
     bool prefixChecked = false;
     int restoredTokens = 0, lastSavedLength = 0;
     long long cacheRequestId = 0;
-    std::shared_ptr<const PrefixCache::KVChunk> savedKV;
+    std::shared_ptr<PrefixCache::Snapshot> prefixSnapshot;
 #ifdef USE_CUDA
     void Upload(CloverModel &m, Data &data, DataType type, const std::vector<int> &dims, const void *source) {
         data.dataType = type; data.UpdateUnitSize(); data.Resize(dims);
@@ -149,7 +148,7 @@ void CloverModel::LoadPrefix(ResponseContext &ctx, Request &r, Data &logits) {
     if (!prefixCache) return;
 #ifdef USE_CUDA
     EnsureResident();
-    auto *snapshot = FindRecurrentPrefix(prefixCache->items, ctx.currentTokens,
+    auto snapshot = prefixCache->store.Find(ctx.currentTokens,
         int(ctx.currentTokens.size()), -1, [&](const PrefixCache::Snapshot &s) {
             return s.type == dataType && (!r.options.speculative ||
                 s.cachedLen < int(ctx.currentTokens.size()) || !s.logits.dims.empty());
@@ -190,8 +189,7 @@ void CloverModel::LoadPrefix(ResponseContext &ctx, Request &r, Data &logits) {
     }
     ctx.pastKeyValues.swap(restored);
     r.prefilled = r.restoredTokens = r.lastSavedLength = snapshot->cachedLen;
-    r.savedKV = snapshot->kv;
-    snapshot->timestamp = ++prefixCache->timestamp;
+    r.prefixSnapshot = std::move(snapshot);
 #endif
 }
 
@@ -204,22 +202,22 @@ void CloverModel::SavePrefix(ResponseContext &ctx, Request &r, const Data *logit
     if (length <= r.lastSavedLength || length > int(ctx.allTokens.size())) return;
 #ifdef USE_CUDA
     if (!prefixCache) prefixCache = std::make_shared<PrefixCache>();
-    auto *existing = FindRecurrentPrefix(prefixCache->items, ctx.allTokens, length, length,
+    auto existing = prefixCache->store.Find(ctx.allTokens, length, length,
         [&](const PrefixCache::Snapshot &s) { return s.type == dataType && (!logits || !s.logits.dims.empty()); });
     if (existing) {
-        existing->timestamp = ++prefixCache->timestamp;
+        r.prefixSnapshot = std::move(existing);
         r.lastSavedLength = length;
         return;
     }
     FastllmCudaSetDevice(cudaDevice);
-    auto snapshot = std::make_unique<PrefixCache::Snapshot>();
+    auto snapshot = std::make_shared<PrefixCache::Snapshot>();
     snapshot->cachedLen = length; snapshot->requestId = r.cacheRequestId;
     snapshot->tokens.assign(ctx.allTokens.begin(), ctx.allTokens.begin() + length);
     snapshot->type = dataType;
     snapshot->recurrent.resize(block_cnt);
     auto chunk = std::make_shared<PrefixCache::KVChunk>();
-    chunk->previous = r.savedKV;
-    chunk->begin = r.savedKV ? r.savedKV->end : 0;
+    chunk->previous = r.prefixSnapshot ? r.prefixSnapshot->kv : nullptr;
+    chunk->begin = chunk->previous ? chunk->previous->end : 0;
     chunk->end = length;
     chunk->layers.resize(block_cnt);
     // Host checkpoints do not consume the GPU inference budget. KV is copied
@@ -243,14 +241,8 @@ void CloverModel::SavePrefix(ResponseContext &ctx, Request &r, const Data *logit
     }
     if (logits) copy(*logits, snapshot->logits, logits->dims);
     snapshot->kv = chunk;
-    snapshot->timestamp = ++prefixCache->timestamp;
-    auto &items = prefixCache->items;
-    items.erase(std::remove_if(items.begin(), items.end(), [&](const std::unique_ptr<PrefixCache::Snapshot> &s) {
-        return s->tokens == snapshot->tokens;
-    }), items.end());
-    items.push_back(std::move(snapshot));
-    TrimRecurrentPrefixes(items, r.cacheRequestId, RecurrentPrefixMaxPerRequest(), RecurrentPrefixMaxRecords());
-    r.savedKV = std::move(chunk);
+    prefixCache->store.Publish(std::move(snapshot), r.prefixSnapshot,
+        RecurrentPrefixMaxPerRequest(), RecurrentPrefixMaxRecords(maxBatch));
     r.lastSavedLength = length;
 #endif
 }
