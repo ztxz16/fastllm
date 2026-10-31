@@ -184,6 +184,62 @@ VideoTensor crop(const VideoTensor &x, int t, int count, int y, int h, int z, in
     return out;
 }
 } // namespace
+VideoTensor VideoVAE::encodeMoments(const VideoTensor &pixels, std::function<void(int, int)> progress) {
+    if (pixels.channels != 3 || pixels.frames < 1 || pixels.height < 32 || pixels.width < 32 ||
+        pixels.height % 16 || pixels.width % 16 ||
+        pixels.values.size() != size_t(pixels.frames) * pixels.height * pixels.width * 3)
+        throw std::invalid_argument("invalid H3 VAE encoder input");
+    auto ys = split(pixels.height, 256, 64, 16), xs = split(pixels.width, 256, 64, 16);
+    int chunks = pixels.frames == 1 ? 1 : (pixels.frames + 16) / 17;
+    int clipFrames = pixels.frames == 1 ? 1 : 17, latentFrames = pixels.frames == 1 ? 1 : 5;
+    VideoTensor result(pixels.frames == 1 ? 1 : chunks * 5 - 3, pixels.height / 16, pixels.width / 16, 48);
+    int done = 0, total = chunks * ys.start.size() * xs.start.size();
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        std::vector<VideoTensor> tiles;
+        for (size_t yi = 0; yi < ys.start.size(); ++yi)
+            for (size_t xi = 0; xi < xs.start.size(); ++xi) {
+                auto input = crop(pixels, chunk * 17, clipFrames, ys.start[yi], ys.length[yi], xs.start[xi],
+                                  xs.length[xi]);
+                auto moments = encodeTile(
+                    full_.upload(input.values.data(), clipFrames * input.height * input.width, 3), clipFrames,
+                    input.height, input.width, [&](const std::string &, const Tensor &) {
+                        if (progress)
+                            progress(done, total);
+                    });
+                VideoTensor tile(latentFrames, input.height / 16, input.width / 16, 48);
+                tile.values = full_.download(moments);
+                // Blend against the original neighbouring tiles, before cropping overlaps.
+                int oh = yi ? ys.overlap[yi - 1] / 16 : 0, ow = xi ? xs.overlap[xi - 1] / 16 : 0;
+                int takeH = tile.height - (yi + 1 < ys.start.size() ? ys.overlap[yi] / 16 : 0);
+                int takeW = tile.width - (xi + 1 < xs.start.size() ? xs.overlap[xi] / 16 : 0);
+                for (int t = 0; t < latentFrames && chunk * 5 + t < result.frames; ++t)
+                    for (int y = 0; y < takeH; ++y)
+                        for (int x = 0; x < takeW; ++x)
+                            for (int c = 0; c < 48; ++c) {
+                                float v = tile.values[pixel(tile, t, y, x, c)];
+                                if (y < oh) {
+                                    const auto &above = tiles[(yi - 1) * xs.start.size() + xi];
+                                    float b = float(y) / oh;
+                                    v = above.values[pixel(above, t, above.height - oh + y, x, c)] *
+                                            (1.f - b) +
+                                        v * b;
+                                }
+                                if (x < ow) {
+                                    const auto &left = tiles.back();
+                                    float b = float(x) / ow;
+                                    v = left.values[pixel(left, t, y, left.width - ow + x, c)] * (1.f - b) +
+                                        v * b;
+                                }
+                                result.values[pixel(result, chunk * 5 + t, ys.start[yi] / 16 + y,
+                                                    xs.start[xi] / 16 + x, c)] = v;
+                            }
+                tiles.push_back(std::move(tile));
+                if (progress)
+                    progress(++done, total);
+            }
+    }
+    return result;
+}
 Tensor VideoVAE::decodeClip(const VideoTensor &z, std::function<void()> checkpoint) {
     auto ys = split(z.height, 16, 4, 1), xs = split(z.width, 16, 4, 1);
     std::vector<Tensor> patches;

@@ -106,6 +106,27 @@ int main() {
         } catch (const std::runtime_error &) { incomplete = true; }
         check(incomplete, "incomplete stream accepted");
         check(read(destination) == "preserve", "incomplete stream replaced destination");
+        auto reference = g;
+        reference.frames = 48;
+        reference.rgb.resize(frameBytes * 48, 96);
+        reference.audio.resize(2 * 32000 * 2, 0.f);
+        writeMP4(reference, (dir / "reference.mp4").string());
+        auto decoded = readReference((dir / "reference.mp4").string(), Reference::Kind::Video, 124);
+        check(decoded.frames.size() == 48 && decoded.frames[0].width == 768 &&
+                  decoded.frames[0].height == 768,
+              "reference video geometry/fps mismatch");
+        check(decoded.sampleRate == 32000 && decoded.channels == 2 && !decoded.audio.empty(),
+              "missing reference audio");
+        auto audio = readReference((dir / "reference.mp4").string(), Reference::Kind::Audio, 124);
+        check(audio.frames.empty() && audio.audio == decoded.audio, "audio stream decoding differs");
+        bool invalid = false;
+        try {
+            readReference(destination, Reference::Kind::Video);
+        } catch (const std::invalid_argument &) {
+            invalid = true;
+        }
+        check(invalid && descriptors() == initialFDs, "invalid input accepted or decoder leaked descriptor");
+        check(waitpid(-1, nullptr, WNOHANG) == -1 && errno == ECHILD, "decoder child not reaped");
         g.audio.resize(32000 * 2 / 4);
         writeMP4(g, (dir / "short-audio.mp4").string());
         for (const auto &entry : std::filesystem::directory_iterator(dir))

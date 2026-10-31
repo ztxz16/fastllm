@@ -521,14 +521,6 @@ std::pair<Tensor, Tensor> Runtime::qkNormRotary(const Tensor &q, const Tensor &k
     check(cudaGetLastError());
     return {qo, ko};
 }
-Tensor Runtime::indices(const std::vector<int> &values) {
-    require(!values.empty(), "empty H3 indices");
-    Tensor out(values.size(), 1, true);
-    check(cudaMemcpyAsync(out.data, values.data(), values.size() * sizeof(int), cudaMemcpyHostToDevice,
-                          cudaStreamPerThread));
-    check(cudaStreamSynchronize(cudaStreamPerThread));
-    return out;
-}
 Tensor Runtime::gather(const Tensor &x, const Tensor &idx) {
     require(idx.isFloat32() && idx.cols == 1, "invalid H3 row indices");
     Tensor out(idx.rows, x.cols, x.dtype);
@@ -699,12 +691,26 @@ __global__ void filterAudio(const float *x, const float *filter, float *out, int
         out[i] = up ? sum * 2 : sum;
     }
 }
-__global__ void snakeAudio(const float *x, const float *alpha, const float *beta, float *out, int c,
-                           size_t n) {
+__global__ void snakeAudio(const float *x, const float *alpha, const float *beta, float *out, int c, size_t n,
+                           bool logarithmic) {
     for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
-        float a = expf(alpha[i % c]), b = expf(beta[i % c]);
+        float a = logarithmic ? expf(alpha[i % c]) : alpha[i % c];
+        float b = logarithmic ? expf(beta[i % c]) : beta[i % c];
         float s = sinf(a * x[i]);
         out[i] = x[i] + (1.f / (b + 1e-9f)) * (s * s);
+    }
+}
+__global__ void poolHeads(const float *x, float *out, size_t n, int heads, int dim, int target) {
+    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
+        int c = i % target, first = c * dim / target, end = ((c + 1) * dim + target - 1) / target;
+        float sum = 0;
+        for (int d = first; d < end; ++d) {
+            float value = 0;
+            for (int head = 0; head < heads; ++head)
+                value += x[(i / target * heads + head) * dim + d];
+            sum += value / heads;
+        }
+        out[i] = sum / (end - first);
     }
 }
 __global__ void affineValues(const float *x, float *out, float scale, float bias, bool clamp, size_t n) {
@@ -763,13 +769,22 @@ Tensor Runtime::audioFilter(const Tensor &x, const Tensor &filter, bool up) {
     check(cudaGetLastError());
     return out;
 }
-Tensor Runtime::snake(const Tensor &x, const Tensor &alpha, const Tensor &beta) {
+Tensor Runtime::poolAudioHeads(const Tensor &x, int heads, int dimensions) {
+    require(x.isFloat32() && heads > 0 && x.cols % heads == 0 && dimensions > 0,
+            "invalid H3 audio pooling shape");
+    Tensor out(x.rows, dimensions, true);
+    poolHeads<<<grid(out.size()), 256, 0, cudaStreamPerThread>>>(ptr<float>(x), ptr<float>(out), out.size(),
+                                                                 heads, x.cols / heads, dimensions);
+    check(cudaGetLastError());
+    return out;
+}
+Tensor Runtime::snake(const Tensor &x, const Tensor &alpha, const Tensor &beta, bool logarithmic) {
     require(x.isFloat32() && alpha.isFloat32() && beta.isFloat32() && alpha.size() == size_t(x.cols) &&
                 beta.size() == alpha.size(),
             "invalid H3 Snake shape");
     Tensor out(x.rows, x.cols, true);
     snakeAudio<<<grid(x.size()), 256, 0, cudaStreamPerThread>>>(
-        ptr<float>(x), ptr<float>(alpha), ptr<float>(beta), ptr<float>(out), x.cols, x.size());
+        ptr<float>(x), ptr<float>(alpha), ptr<float>(beta), ptr<float>(out), x.cols, x.size(), logarithmic);
     check(cudaGetLastError());
     return out;
 }

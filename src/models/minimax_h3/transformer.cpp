@@ -61,7 +61,7 @@ void PackedLayout::validate(int count) const {
     for (auto group : {&video, &text, &audio}) {
         int tag = group == &video ? 0 : group == &text ? 1 : 2;
         for (int i : *group) {
-            if (i < 0 || size_t(i) >= n || seen[i] || tags[i] != tag)
+            if (i < 0 || size_t(i) >= n || seen[i] || (tags[i] != tag && !(group == &text && tags[i] == 0)))
                 throw std::invalid_argument("invalid H3 modality indices");
             seen[i] = true;
         }
