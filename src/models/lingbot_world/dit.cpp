@@ -9,6 +9,25 @@ void require(bool ok,const char *message) { if(!ok) throw std::invalid_argument(
 }
 DiT::DiT(Runtime &rt,const std::string &directory)
     :rt_(rt),weights_(rt,directory),full_(rt.fp32,directory) {}
+void DiT::clearCamera() {
+    cameraInput_={}; cameraFeatures_={}; cameraModulation_.clear();
+}
+Tensor DiT::projectCamera(const Tensor &camera,int frames,int h,int w) {
+    auto cam=linear(rt_.patch(rt_.cast(camera,false),frames,h,w),"patch_embedding_wancamctrl");
+    return rt_.add(cam,linear(rt_.activation(linear(cam,"c2ws_hidden_states_layer1")),"c2ws_hidden_states_layer2"));
+}
+void DiT::prepareCamera(const Tensor &camera,int frames,int h,int w) {
+    require(camera.rows==frames*h*w && camera.cols==384,"invalid LingBot camera tensor");
+    clearCamera();
+    cameraFeatures_=projectCamera(camera,frames,h,w);
+    for(int layer=0;layer<Layers;++layer) {
+        auto p="blocks."+std::to_string(layer)+".";
+        auto cam=linear(rt_.activation(linear(cameraFeatures_,p+"cam_injector_layer1")),p+"cam_injector_layer2");
+        cam=rt_.add(cam,cameraFeatures_);
+        cameraModulation_.emplace_back(linear(cam,p+"cam_scale_layer"),linear(cam,p+"cam_shift_layer"));
+    }
+    cameraInput_=camera; cameraFrames_=frames; cameraHeight_=h; cameraWidth_=w;
+}
 Tensor DiT::linear(const Tensor &x,const std::string &prefix) {
     return weights_.linear(rt_.cast(x,false),prefix);
 }
@@ -56,9 +75,14 @@ Tensor DiT::block(int layer,const Tensor &input,const Tensor &time,
     if(commit) { cache.keys[layer]=allK; cache.values[layer]=allV; }
 
     if(camera) {
-        auto cam=linear(rt_.activation(linear(*camera,p+"cam_injector_layer1")),p+"cam_injector_layer2");
-        cam=rt_.add(cam,*camera);
-        x=rt_.affine(x,linear(cam,p+"cam_scale_layer"),linear(cam,p+"cam_shift_layer"),true);
+        if(cameraInput_.rows && camera->data==cameraFeatures_.data) {
+            const auto &mod=cameraModulation_[layer];
+            x=rt_.affine(x,mod.first,mod.second,true);
+        } else {
+            auto cam=linear(rt_.activation(linear(*camera,p+"cam_injector_layer1")),p+"cam_injector_layer2");
+            cam=rt_.add(cam,*camera);
+            x=rt_.affine(x,linear(cam,p+"cam_scale_layer"),linear(cam,p+"cam_shift_layer"),true);
+        }
     }
     auto cross=rt_.wanLayerNorm(x,&full_.get(p+"norm3.weight"),&full_.get(p+"norm3.bias"));
     q=rt_.cast(rms(linear(cross,p+"cross_attn.q"),p+"cross_attn.norm_q"),false);
@@ -105,8 +129,8 @@ Tensor DiT::forward(const Tensor &latent,const Tensor &condition,const Tensor &t
     Tensor cam;
     if(camera) {
         require(camera->rows==latent.rows && camera->cols==384,"invalid LingBot camera tensor");
-        cam=linear(rt_.patch(rt_.cast(*camera,false),frames,h,w),"patch_embedding_wancamctrl");
-        cam=rt_.add(cam,linear(rt_.activation(linear(cam,"c2ws_hidden_states_layer1")),"c2ws_hidden_states_layer2"));
+        cam=camera->data==cameraInput_.data && frames==cameraFrames_ && h==cameraHeight_ && w==cameraWidth_
+            ?cameraFeatures_:projectCamera(*camera,frames,h,w);
     }
     for(int i=0;i<Layers;++i) {
         x=block(i,x,mod,context,camera?&cam:nullptr,frames,h/2,w/2,cache,commit);

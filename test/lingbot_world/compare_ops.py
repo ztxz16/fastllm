@@ -27,6 +27,7 @@ def main():
     lib.lingbot_test_linear.argtypes = [pointer]*4 + [ctypes.c_int]*4
     lib.lingbot_test_rope.argtypes = [pointer]*2 + [ctypes.c_int]*5
     lib.lingbot_test_attention.argtypes = [pointer]*4 + [ctypes.c_int]*2
+    lib.lingbot_test_modulation.argtypes = [pointer]*4 + [ctypes.c_int]*5
     lib.lingbot_test_patch.argtypes = [pointer]*4 + [ctypes.c_int]*3
     lib.lingbot_test_image.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
                                      pointer, ctypes.c_int, ctypes.c_int]
@@ -74,6 +75,27 @@ def main():
             expected = F.gelu(x, approximate='tanh') if gelu else F.silu(x)
             call(lib.lingbot_test_activation, ptr(a), ptr(out), *a.shape, full, gelu)
             record(f'activation/full={full}/gelu={gelu}', out, expected, 2e-6 if full else 5e-4)
+    for rows, cols in [(1, 7), (17, 1536), (128, 1536)]:
+        for mod_rows in sorted({1, rows}):
+            for flags in range(8):
+                for mode in range(3):
+                    dtype = lambda flag: torch.float32 if flags & flag else torch.bfloat16
+                    x = torch.randn(rows, cols, device='cuda').to(dtype(1))
+                    a = torch.randn(rows if mode == 2 else mod_rows, cols, device='cuda').to(dtype(2))
+                    b = torch.randn(mod_rows, cols, device='cuda').to(dtype(4))
+                    if mode == 2:
+                        expected = x.float()+a.float()*b.float()
+                    else:
+                        scale = 1.+a.float()
+                        if mode == 1:
+                            scale = scale.bfloat16().float()
+                        expected = x.float()*scale+b.float()
+                    source, first, second = map(cpu, [x, a, b])
+                    out = np.empty_like(source)
+                    call(lib.lingbot_test_modulation, ptr(source), ptr(first), ptr(second), ptr(out),
+                         rows, cols, mod_rows, flags, mode)
+                    record(f'modulation/{rows}x{cols}/broadcast={mod_rows == 1}/flags={flags}/mode={mode}',
+                           out, expected, 1e-7)
     for full, rows, inner, outer in [(True, 48, 256, 1536), (True, 48, 1536, 9216),
                                     (False, 48, 1536, 1536), (False, 180, 1536, 8960)]:
         dtype = torch.float32 if full else torch.bfloat16
@@ -103,9 +125,16 @@ def main():
         from vllm.vllm_flash_attn import flash_attn_varlen_func
     else:
         from flash_attn import flash_attn_varlen_func
-    for rows, count in [(1,1), (17,48), (48,64), (48,65), (129,180), (180,512), (180,1080), (2160,2160), (2160,12960)]:
-        q = torch.randn(rows,12,128,device='cuda').bfloat16()
-        k = torch.randn(count,12,128,device='cuda').bfloat16()
+    # Partial query/key tiles, long recurrent history, and extreme softmax
+    # distributions catch masking, shared-memory layout and reduction errors.
+    attention_cases = [(rows, count, 1., 0.) for rows, count in [
+        (1,1), (17,48), (48,64), (48,65), (129,180), (180,512), (180,1080),
+        (2160,2160), (2160,12960), (15,63), (16,64), (63,63), (64,64),
+        (65,65), (127,127), (128,128), (129,129), (2160,17280), (4680,28080)]]
+    attention_cases += [(65,129,0.,0.), (65,129,8.,0.), (129,513,.1,4.)]
+    for rows, count, scale, offset in attention_cases:
+        q = (torch.randn(rows,12,128,device='cuda')*scale+offset).bfloat16()
+        k = (torch.randn(count,12,128,device='cuda')*scale+offset).bfloat16()
         v = torch.randn_like(k)
         expected = flash_attn_varlen_func(q=q,k=k,v=v,
             cu_seqlens_q=torch.tensor([0,rows],device='cuda',dtype=torch.int32),
@@ -114,7 +143,7 @@ def main():
         queries, keys, values = map(cpu, [q,k,v])
         out = np.empty_like(queries)
         call(lib.lingbot_test_attention, ptr(queries),ptr(keys),ptr(values),ptr(out),rows,count)
-        record(f'attention/{rows}x{count}',out,expected,5e-4)
+        record(f'attention/{rows}x{count}/scale={scale}/offset={offset}',out,expected,5e-4)
     for height, width in [(8,8), (12,20), (16,16)]:
         x = torch.randn(3,height,width,36,device='cuda').bfloat16()
         weights = (torch.randn(1536,36,1,2,2,device='cuda')/12).bfloat16()

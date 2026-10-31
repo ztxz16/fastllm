@@ -197,6 +197,7 @@ Segment Pipeline::step(WorldState &world,const std::string &action,const std::st
     if(changedPrompt) { cache.textKeys.clear(); cache.textValues.clear(); }
     for(size_t step=0;step<schedule_.size();++step) {
         if(progress) progress("denoise",step,schedule_.size());
+        if(step==0) dit_.prepareCamera(camera,3,lh,lw);
         auto flow=dit_.forward(latent,condition,next.text,&camera,float(schedule_[step].timestep),3,lh,lw,cache,false);
         emit("flow."+std::to_string(step),flow);
         latent=rt_.flowToClean(latent,flow,schedule_[step].flowSigma);
@@ -211,6 +212,7 @@ Segment Pipeline::step(WorldState &world,const std::string &action,const std::st
     if(progress) progress("denoise",schedule_.size(),schedule_.size());
     if(progress) progress("history",0,1);
     dit_.forward(latent,condition,next.text,&camera,0,3,lh,lw,cache,true);
+    dit_.clearCamera();
     // Cache updates replace tensors; the previous world remains immutable.
     next.cache=snapshot(cache);
     cacheStates_.push_back(next.cache);

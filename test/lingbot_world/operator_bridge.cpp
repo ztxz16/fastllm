@@ -13,6 +13,18 @@ template<class F> int checked(F function) {
 }
 extern "C" {
 const char *lingbot_test_error() { return error.c_str(); }
+int lingbot_test_modulation(const float *input,const float *first,const float *second,float *output,
+                            int rows,int cols,int modRows,int fullFlags,int mode) {
+    return checked([&] {
+        Runtime rt(0);
+        auto x=rt.cast(rt.fp32.upload(input,rows,cols),fullFlags&1);
+        auto a=rt.cast(rt.fp32.upload(first,mode==2?rows:modRows,cols),fullFlags&2);
+        auto b=rt.cast(rt.fp32.upload(second,modRows,cols),fullFlags&4);
+        auto out=mode==2?rt.gated(x,a,b):rt.affine(x,a,b,mode==1);
+        auto values=rt.download(out);
+        std::memcpy(output,values.data(),values.size()*sizeof(float));
+    });
+}
 int lingbot_test_camera(const float *poses,const float *intrinsics,float *output,int frames,int height,int width) {
     return checked([&] {
         Runtime rt(0);

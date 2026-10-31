@@ -5,6 +5,7 @@
 #include <cublasLt.h>
 #include "mma.cuh"
 #include "math.cuh"
+#include "permuted_smem.cuh"
 #include <algorithm>
 #include <stdexcept>
 
@@ -27,19 +28,19 @@ template<class T> __global__ void joinKernel(const T *x,const T *y,T *out,size_t
         out[i]=col<a?x[row*a+col]:y[row*b+col-a];
     }
 }
-__global__ void affineKernel(const float *x, const float *s, const float *b, float *y,
+template<class T> __global__ void affineKernel(const float *x, const T *s, const T *b, float *y,
                              size_t n, int width, int rows, bool roundScale) {
     for (size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x) {
         size_t j=rows==1?i%width:i;
-        float a=1.f+s[j];
+        float a=1.f+value(s[j]);
         if (roundScale) a=value(B(a));
-        y[i]=x[i]*a+b[j];
+        y[i]=x[i]*a+value(b[j]);
     }
 }
-__global__ void gateKernel(const float *x,const float *y,const float *g,float *out,
+template<class T> __global__ void gateKernel(const float *x,const T *y,const float *g,float *out,
                            size_t n,int width,int rows) {
     for (size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x)
-        out[i]=x[i]+y[i]*g[rows==1?i%width:i];
+        out[i]=x[i]+value(y[i])*g[rows==1?i%width:i];
 }
 template<class T> __global__ void patchKernel(const T *x,T *y,size_t n,int height,int width,
                                              int channels,bool unpack) {
@@ -192,87 +193,133 @@ __global__ void headsToRows(const B *x,B *y,size_t n,int rows,int heads,int dim)
 __device__ uint32_t packed(B a,B b) {
     return uint32_t(__bfloat16_as_ushort(a)) | (uint32_t(__bfloat16_as_ushort(b))<<16);
 }
+__device__ void loadAttentionTile(B *tile,const B *input,int base,int keys,int head) {
+    using Smem=flashinfer::smem_t<flashinfer::SwizzleMode::k128B>;
+    Smem smem(tile);
+    #pragma unroll
+    for(int i=threadIdx.x;i<64*16;i+=128) {
+        int row=i/16,col=i%16;
+        size_t offset=size_t(base+row)*1536+head*128+col*8;
+        smem.load_128b_async<flashinfer::cp_async::SharedMemFillMode::kFillZero>(
+            Smem::get_permuted_offset<16>(row,col),input+offset,base+row<keys);
+    }
+}
+// Four warps reuse a coalesced K/V tile; each warp owns sixteen queries.
+// Q and online softmax state stay in registers. Preserve the FA2 reduction
+// order even though the old kernel split one query tile across four warps.
 __global__ void wanAttentionKernel(const B *q,const B *k,const B *v,B *out,int rows,int keys) {
-    constexpr int width=1536;
-    __shared__ float scores[16][64],stats[16][5],rescale[16];
-    __shared__ B prob[16][64];
+    constexpr int width=1536,queryRows=64;
+    using Smem=flashinfer::smem_t<flashinfer::SwizzleMode::k128B>;
+    __shared__ __align__(16) B keyTile[64*128],valueTile[64*128],probTile[queryRows*64];
+    Smem ks(keyTile),vs(valueTile),ps(probTile);
     int lane=threadIdx.x%32,warp=threadIdx.x/32,head=blockIdx.y;
-    int firstRow=blockIdx.x*16;
-    float acc[2][8]={};
+    int firstRow=blockIdx.x*queryRows+warp*16;
+    uint32_t query[8][4];
+    #pragma unroll
+    for(int inner=0;inner<8;++inner) {
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            int row=firstRow+lane/4+(j%2)*8,dim=inner*16+(lane%4)*2+(j/2)*8;
+            query[inner][j]=row<rows?packed(q[size_t(row)*width+head*128+dim],q[size_t(row)*width+head*128+dim+1]):0;
+        }
+    }
+    float acc[8][8]={},maximum[2]={-INFINITY,-INFINITY},sum[2]={};
     bool first=true;
+    loadAttentionTile(keyTile,k,(keys-1)/64*64,keys,head);
+    flashinfer::cp_async::commit_group();
     for(int base=(keys-1)/64*64;base>=0;base-=64) {
-        float dot[8]={};
+        flashinfer::cp_async::wait_group<0>();
+        __syncthreads();
+        // V loads overlap QK; the next K loads overlap softmax and PV.
+        // Reuse the same shared buffers only after all readers finish.
+        loadAttentionTile(valueTile,v,base,keys,head);
+        flashinfer::cp_async::commit_group();
+        float dot[4][8]={};
         #pragma unroll
-        for(int inner=0;inner<128;inner+=16) {
-            uint32_t a[4],b[4];
+        for(int inner=0;inner<8;++inner) {
             #pragma unroll
-            for(int j=0;j<4;++j) {
-                int row=firstRow+lane/4+(j%2)*8,dim=inner+(lane%4)*2+(j/2)*8;
-                a[j]=row<rows?packed(q[size_t(row)*width+head*128+dim],q[size_t(row)*width+head*128+dim+1]):0;
-                int key=base+warp*16+lane/4+(j/2)*8;
-                dim=inner+(lane%4)*2+(j%2)*8;
-                b[j]=key<keys?packed(k[size_t(key)*width+head*128+dim],k[size_t(key)*width+head*128+dim+1]):0;
+            for(int part=0;part<4;++part) {
+                uint32_t b[4];
+                int row=part*16+lane%8+(lane/16)*8,col=inner*2+(lane/8)%2;
+                ks.ldmatrix_m8n8x4(Smem::get_permuted_offset<16>(row,col),b);
+                flashinfer::mma::mma_sync_m16n16k16_row_col_f16f16f32<B>(dot[part],query[inner],b);
             }
-            flashinfer::mma::mma_sync_m16n16k16_row_col_f16f16f32<B>(dot,a,b);
-        }
-        #pragma unroll
-        for(int j=0;j<8;++j) {
-            int row=lane/4+(j%4/2)*8,col=warp*16+(lane%4)*2+(j/4)*8+j%2;
-            scores[row][col]=base+col<keys?dot[j]:-INFINITY;
         }
         __syncthreads();
-        int r=threadIdx.x/8,l=threadIdx.x%8;
-        float maximum=-INFINITY;
-        #pragma unroll
-        for(int i=0;i<8;++i) maximum=fmaxf(maximum,scores[r][l+i*8]);
-        for(int d=4;d;d/=2) maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffff,maximum,d,8));
-        float previous=first?-INFINITY:stats[r][0];
-        maximum=fmaxf(previous,maximum);
+        if(base) {
+            loadAttentionTile(keyTile,k,base-64,keys,head);
+            flashinfer::cp_async::commit_group();
+        }
+        float factor[2];
         constexpr float scale=0.08838834764831844f*1.4426950408889634f;
-        float factor=first?0.f:flashinfer::math::ptx_exp2((previous-maximum)*scale);
-        if(l==0) { stats[r][0]=maximum; rescale[r]=factor; }
         #pragma unroll
-        for(int i=0;i<8;++i) {
-            int col=l+i*8;
-            float p=base+col<keys?flashinfer::math::ptx_exp2(__fmaf_rn(scores[r][col],scale,-maximum*scale)):0.f;
-            scores[r][col]=p; prob[r][col]=B(p);
-        }
-        __syncthreads();
-        if(l<4) {
-            float sum=first?scores[r][l*2]:__fmaf_rn(stats[r][1+l],factor,scores[r][l*2]);
+        for(int r=0;r<2;++r) {
+            float next=maximum[r];
             #pragma unroll
-            for(int i=1;i<16;++i) sum+=scores[r][(i/2)*8+l*2+i%2];
-            stats[r][1+l]=sum;
-        }
-        #pragma unroll
-        for(int part=0;part<2;++part) {
-            #pragma unroll
-            for(int j=0;j<8;++j) acc[part][j]*=rescale[lane/4+(j%4/2)*8];
-            #pragma unroll
-            for(int inner=0;inner<64;inner+=16) {
-                uint32_t a[4],b[4];
+            for(int part=0;part<4;++part) {
                 #pragma unroll
                 for(int j=0;j<4;++j) {
-                    int row=lane/4+(j%2)*8,key=inner+(lane%4)*2+(j/2)*8;
-                    a[j]=packed(prob[row][key],prob[row][key+1]);
-                    int col=part*64+warp*16+lane/4+(j/2)*8;
-                    key=base+inner+(lane%4)*2+(j%2)*8;
-                    b[j]=packed(key<keys?v[size_t(key)*width+head*128+col]:B(0.f),
-                        key+1<keys?v[size_t(key+1)*width+head*128+col]:B(0.f));
+                    int index=(j/2)*4+r*2+j%2,col=part*16+(lane%4)*2+(j/2)*8+j%2;
+                    dot[part][index]=base+col<keys?dot[part][index]:-INFINITY;
+                    next=fmaxf(next,dot[part][index]);
                 }
+            }
+            for(int d=2;d;d/=2) next=fmaxf(next,__shfl_xor_sync(0xffffffff,next,d,4));
+            factor[r]=first?0.f:flashinfer::math::ptx_exp2((maximum[r]-next)*scale);
+            maximum[r]=next;
+            #pragma unroll
+            for(int part=0;part<4;++part) {
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    int index=(j/2)*4+r*2+j%2,col=part*16+(lane%4)*2+(j/2)*8+j%2;
+                    float p=base+col<keys?flashinfer::math::ptx_exp2(__fmaf_rn(dot[part][index],scale,-next*scale)):0.f;
+                    if(part==0 && j==0) sum[r]=first?p:__fmaf_rn(sum[r],factor[r],p);
+                    else sum[r]+=p;
+                    dot[part][index]=p;
+                }
+                #pragma unroll
+                for(int j=0;j<2;++j) {
+                    int row=warp*16+lane/4+r*8,col=part*16+(lane%4)*2+j*8;
+                    uint32_t *dst=reinterpret_cast<uint32_t *>(ps.base+Smem::get_permuted_offset<8>(row,col/8));
+                    dst[(col%8)/2]=packed(B(dot[part][j*4+r*2]),B(dot[part][j*4+r*2+1]));
+                }
+            }
+        }
+        if(base) flashinfer::cp_async::wait_group<1>();
+        else flashinfer::cp_async::wait_group<0>();
+        __syncthreads();
+        #pragma unroll
+        for(int part=0;part<8;++part) {
+            #pragma unroll
+            for(int j=0;j<8;++j) acc[part][j]*=factor[j%4/2];
+        }
+        #pragma unroll
+        for(int inner=0;inner<4;++inner) {
+            uint32_t a[4];
+            ps.ldmatrix_m8n8x4(Smem::get_permuted_offset<8>(warp*16+lane%16,inner*2+lane/16),a);
+            #pragma unroll
+            for(int part=0;part<8;++part) {
+                uint32_t b[4];
+                vs.ldmatrix_m8n8x4_trans(Smem::get_permuted_offset<16>(inner*16+lane%16,part*2+lane/16),b);
                 flashinfer::mma::mma_sync_m16n16k16_row_col_f16f16f32<B>(acc[part],a,b);
             }
         }
         __syncthreads();
         first=false;
     }
+    float inverse[2];
     #pragma unroll
-    for(int part=0;part<2;++part) {
+    for(int r=0;r<2;++r) {
+        float even=__shfl_sync(0xffffffff,sum[r],0,4)+__shfl_sync(0xffffffff,sum[r],2,4);
+        float odd=__shfl_sync(0xffffffff,sum[r],1,4)+__shfl_sync(0xffffffff,sum[r],3,4);
+        inverse[r]=flashinfer::math::ptx_rcp(even+odd);
+    }
+    #pragma unroll
+    for(int part=0;part<8;++part) {
         #pragma unroll
         for(int j=0;j<8;++j) {
-            int r=lane/4+(j%4/2)*8,row=firstRow+r,col=part*64+warp*16+(lane%4)*2+(j/4)*8+j%2;
-            float inverse=flashinfer::math::ptx_rcp((stats[r][1]+stats[r][3])+(stats[r][2]+stats[r][4]));
-            if(row<rows) out[size_t(row)*width+head*128+col]=B(acc[part][j]*inverse);
+            int r=j%4/2,row=firstRow+lane/4+r*8,col=part*16+(lane%4)*2+(j/4)*8+j%2;
+            if(row<rows) out[size_t(row)*width+head*128+col]=B(acc[part][j]*inverse[r]);
         }
     }
 }
@@ -372,16 +419,25 @@ Tensor Runtime::join(const Tensor &x,const Tensor &y) {
 Tensor Runtime::affine(const Tensor &x,const Tensor &scale,const Tensor &shift,bool roundScale) {
     require(scale.cols==x.cols && shift.cols==x.cols && scale.rows==shift.rows &&
             (scale.rows==1 || scale.rows==x.rows),"LingBot affine shape mismatch");
-    auto a=cast(x,true),s=cast(scale,true),b=cast(shift,true); Tensor out(x.rows,x.cols,true);
-    affineKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(a),ptr<float>(s),ptr<float>(b),
-        ptr<float>(out),x.size(),x.cols,s.rows,roundScale);
+    auto a=cast(x,true); Tensor out(x.rows,x.cols,true);
+    // Read BF16 modulation directly while retaining FP32 arithmetic.
+    if(!scale.fp32 && !shift.fp32)
+        affineKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(a),ptr<B>(scale),ptr<B>(shift),
+            ptr<float>(out),x.size(),x.cols,scale.rows,roundScale);
+    else {
+        auto s=cast(scale,true),b=cast(shift,true);
+        affineKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(a),ptr<float>(s),ptr<float>(b),
+            ptr<float>(out),x.size(),x.cols,s.rows,roundScale);
+    }
     check(cudaGetLastError()); return out;
 }
 Tensor Runtime::gated(const Tensor &x,const Tensor &branch,const Tensor &gate) {
     require(x.rows==branch.rows && x.cols==branch.cols && gate.cols==x.cols &&
             (gate.rows==1 || gate.rows==x.rows),"LingBot gated residual shape mismatch");
-    auto a=cast(x,true),b=cast(branch,true),g=cast(gate,true); Tensor out(x.rows,x.cols,true);
-    gateKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(a),ptr<float>(b),ptr<float>(g),
+    auto a=cast(x,true),g=cast(gate,true); Tensor out(x.rows,x.cols,true);
+    if(branch.fp32) gateKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(a),ptr<float>(branch),ptr<float>(g),
+        ptr<float>(out),x.size(),x.cols,g.rows);
+    else gateKernel<<<grid(x.size()),256,0,cudaStreamPerThread>>>(ptr<float>(a),ptr<B>(branch),ptr<float>(g),
         ptr<float>(out),x.size(),x.cols,g.rows);
     check(cudaGetLastError()); return out;
 }
@@ -455,11 +511,8 @@ Tensor Runtime::relativeAttention(const Tensor &q,const Tensor &k,const Tensor &
 Tensor Runtime::wanAttention(const Tensor &q,const Tensor &k,const Tensor &v) {
     require(!q.fp32 && !k.fp32 && !v.fp32 && q.cols==1536 && k.cols==q.cols && v.cols==q.cols &&
             k.rows==v.rows && q.rows>0 && k.rows>0,"invalid Wan attention shape");
-    // The continuous backend already provides BF16 FlashInfer attention with
-    // FP32 accumulation. Reuse its fused path instead of launching separate
-    // QK / softmax / PV kernels for each 128-query by 64-key tile.
     Tensor out(q.rows,q.cols,false);
-    wanAttentionKernel<<<dim3((q.rows+15)/16,12),128,0,cudaStreamPerThread>>>(ptr<B>(q),ptr<B>(k),ptr<B>(v),ptr<B>(out),q.rows,k.rows);
+    wanAttentionKernel<<<dim3((q.rows+63)/64,12),128,0,cudaStreamPerThread>>>(ptr<B>(q),ptr<B>(k),ptr<B>(v),ptr<B>(out),q.rows,k.rows);
     check(cudaGetLastError()); return out;
 }
 }} // namespace fastllm::lingbot

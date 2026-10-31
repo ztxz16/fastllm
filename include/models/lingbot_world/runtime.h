@@ -79,7 +79,10 @@ public:
     Tensor forward(const Tensor &latent, const Tensor &condition, const Tensor &text,
                    const Tensor *camera, float timestep, int frames, int height,
                    int width, Cache &cache, bool commit);
-    void unload() { weights_.offload(); full_.offload(); }
+    // Prepare the immutable camera conditioning once for a sampling chunk.
+    void prepareCamera(const Tensor &,int frames,int height,int width);
+    void clearCamera();
+    void unload() { clearCamera(); weights_.offload(); full_.offload(); }
 private:
     Tensor block(int layer, const Tensor &input, const Tensor &time,
                  const Tensor &context, const Tensor *camera, int frames,
@@ -87,8 +90,12 @@ private:
     Tensor linear(const Tensor &, const std::string &);
     Tensor fullLinear(const Tensor &, const std::string &);
     Tensor rms(const Tensor &, const std::string &);
+    Tensor projectCamera(const Tensor &,int frames,int height,int width);
     Runtime &rt_;
     Weights weights_, full_;
+    Tensor cameraInput_,cameraFeatures_;
+    std::vector<std::pair<Tensor,Tensor>> cameraModulation_;
+    int cameraFrames_=0,cameraHeight_=0,cameraWidth_=0;
 };
 
 }} // namespace fastllm::lingbot
