@@ -95,7 +95,7 @@ __device__ __forceinline__ void Moe16StoreExpertPair(T *p, float x, float y) {
 template<bool Gate, int K> constexpr int Moe16TmaExpertSharedBytes() {
     return 2 * (16 + 64 * (Gate ? 2 : 1)) * K * sizeof(uint16_t);
 }
-template<typename T, bool Gate, int K = 64>
+template<typename T, bool Gate, int K = 64, bool Gather = false>
 __global__ void Moe16TmaExpertGemm(
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
         const __grid_constant__ Moe16ExpertMaps maps,
@@ -103,7 +103,7 @@ __global__ void Moe16TmaExpertGemm(
         const Moe16ExpertMaps maps,
 #endif
         const float *scores, const int *workspace, T *output,
-        T *packedMiddle, int rows, int hidden, int intermediate, int experts) {
+        T *packedMiddle, int rows, int hidden, int intermediate, int experts, const T *input = nullptr, int topk = 1) {
 #if __CUDA_ARCH__ >= 900
     constexpr int M = 16, N = 64, Stages = 2;
     constexpr int StageElements = (M + N * (Gate ? 2 : 1)) * K;
@@ -120,10 +120,16 @@ __global__ void Moe16TmaExpertGemm(
     if (tid == 0) {
 #pragma unroll
         for (int i = 0; i < Stages; ++i)
-            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(Moe16SharedAddress(barriers + i)) : "memory");
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(Moe16SharedAddress(barriers + i)), "r"(Gather ? 129 : 1) : "memory");
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
     __syncthreads();
+    // Gather the original token rows directly into the existing MMA layout.
+    // The barrier tracks 128 per-thread copies plus the TMA weight issuer, so
+    // all input/weight data is ready before consumers reuse this stage.
+    static_assert(!Gather || (Gate && K == 64));
+    const int gatherTask = Gather ? tasks[tid / 8] : 0;
+    const T *gatherSource = Gather ? input + (size_t)(gatherTask < 0 ? 0 : gatherTask / topk) * hidden + (tid % 8) * 8 : nullptr;
     auto load = [&](int step) {
         bool valid = step * K < inputWidth;
         int stage = step % Stages;
@@ -131,14 +137,22 @@ __global__ void Moe16TmaExpertGemm(
         int weightRow = expert * outputWidth * (Gate ? 2 : 1) + column;
         if (tid == 0 && valid)
             asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::
-                "r"(Moe16SharedAddress(barriers + stage)), "r"(StageElements * 2) : "memory");
+                "r"(Moe16SharedAddress(barriers + stage)), "r"((StageElements - (Gather ? M * K : 0)) * 2) : "memory");
+        if constexpr (Gather) {
+            if (valid) {
+                Moe16CopyAsync16(ptr + Moe16Swizzle128((tid / 8) * 64 + (tid % 8) * 8),
+                    gatherSource + step * K, gatherTask >= 0);
+                asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::
+                    "r"(Moe16SharedAddress(barriers + stage)) : "memory");
+            }
+        }
         // K=128 assigns its two64-element TMA chunks to different warps.
         // Publish the total transaction count before either warp issues a load.
         // K=64 retains its single issuer and needs no extra CTA barrier.
         if constexpr (K > 64) __syncthreads();
         if ((K == 64 ? tid == 0 : lane == 0) && valid) {
             for (int chunk = K == 64 ? 0 : warp; chunk < K / 64; chunk += 4) {
-                Moe16TmaLoad(ptr + chunk * M * 64, &maps.input,
+                if constexpr (!Gather) Moe16TmaLoad(ptr + chunk * M * 64, &maps.input,
                     step * K + chunk * 64, blockIdx.y * M, barriers + stage);
                 Moe16TmaLoad(ptr + M * K + chunk * N * 64, &maps.weight,
                     step * K + chunk * 64, weightRow, barriers + stage);
@@ -279,17 +293,25 @@ bool Moe16ExpertsTma(const void *input, const void *gateUp, const void *down, co
     } else {
 #endif
     Moe16BuildExpertTiles(indices, workspace, rows, topk, experts, stream);
-    if (rows >= 1024)
-        Moe16PackExpertInput<T, 4><<<dim3(4, tiles), 128, 0, stream>>>(
-            (const T *)input, workspace, packedInput, rows, hidden, experts, topk);
-    else if (rows >= 16 && rows <= 64 && hidden == 2048)
-        Moe16PackExpertInput<T, 2><<<dim3(8, tiles), 256, 0, stream>>>(
-            (const T *)input, workspace, packedInput, rows, hidden, experts, topk);
-    else Moe16PackExpertInput<T><<<dim3(16, tiles), min(256, hidden / 8), 0, stream>>>(
-            (const T *)input, workspace, packedInput, rows, hidden, experts, topk);
+    const bool gather = std::is_same_v<T, __nv_bfloat16> && rows >= 256 && rows <= 512 &&
+        (reinterpret_cast<uintptr_t>(input) & 15) == 0;
+    if (!gather) {
+        if (rows >= 1024 || (rows >= 256 && hidden >= 1024))
+            Moe16PackExpertInput<T, 4><<<dim3(4, tiles), 128, 0, stream>>>(
+                (const T *)input, workspace, packedInput, rows, hidden, experts, topk);
+        else if (rows >= 16 && rows <= 64 && hidden == 2048)
+            Moe16PackExpertInput<T, 2><<<dim3(8, tiles), 256, 0, stream>>>(
+                (const T *)input, workspace, packedInput, rows, hidden, experts, topk);
+        else Moe16PackExpertInput<T><<<dim3(16, tiles), min(256, hidden / 8), 0, stream>>>(
+                (const T *)input, workspace, packedInput, rows, hidden, experts, topk);
+    }
     // Wider K amortizes setup for small captured blocks. Large prefills and
     // widths not divisible by128 retain the established64-element kernel.
-    if (rows <= 32 && hidden % 128 == 0)
+    if (gather)
+        Moe16TmaExpertGemm<T, true, 64, true><<<dim3(intermediate / 64, tiles), 128,
+            Moe16TmaExpertSharedBytes<true, 64>(), stream>>>(it->second.first,
+            scores, workspace, (T *)middle, packedMiddle, rows, hidden, intermediate, experts, (const T *)input, topk);
+    else if (rows <= 32 && hidden % 128 == 0)
         Moe16TmaExpertGemm<T, true, 128><<<dim3(intermediate / 64, tiles), 128,
             Moe16TmaExpertSharedBytes<true, 128>(), stream>>>(it->second.first,
             scores, workspace, (T *)middle, packedMiddle, rows, hidden, intermediate, experts);

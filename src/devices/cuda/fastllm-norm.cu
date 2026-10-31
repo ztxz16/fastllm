@@ -11,7 +11,7 @@ bool FastllmCudaRMSNormImpl(const void *input, const float *weight, const void *
                            int width, float eps, bool zeroCentered, void *stream) {
     if (!input || !weight || !output || rows < 1 || width < 1 || eps <= 0.f)
         return false;
-    if (width == 2048 && rows <= 256 &&
+    if (width == 2048 &&
         ((reinterpret_cast<uintptr_t>(input) | reinterpret_cast<uintptr_t>(output) |
           reinterpret_cast<uintptr_t>(gate)) & 3) == 0) {
         return Launch<HiddenRMSNorm<T, false>>(rows, 128, 0, Stream(stream),
@@ -33,7 +33,7 @@ bool FastllmCudaAddRMSNormImpl(void *residual, const void *input, const float *w
     if (!residual || !input || !weight || !output || output == residual || output == input || rows < 1 ||
         width < 1 || eps <= 0.f)
         return false;
-    if (width == 2048 && rows <= 256 &&
+    if (width == 2048 &&
         ((reinterpret_cast<uintptr_t>(input) | reinterpret_cast<uintptr_t>(output) |
           reinterpret_cast<uintptr_t>(residual)) & 3) == 0) {
         return Launch<HiddenRMSNorm<T, true>>(rows, 128, 0, Stream(stream),

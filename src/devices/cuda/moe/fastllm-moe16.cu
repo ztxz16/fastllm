@@ -150,7 +150,7 @@ __global__ void Moe16ScatterExpertRows(const int *indices, int *workspace, int r
 }
 void Moe16BuildExpertRows(const int *indices, int *workspace, int rows, int topk,
         int experts, cudaStream_t stream) {
-    if (rows >= 1024 && experts >= 32) {
+    if (rows >= 256 && experts >= 32) {
         // Bucket independent token rows without rescanning every route for
         // every expert. Row order may vary; GEMMs scatter back by task id and
         // the final sum still follows ascending expert id.
@@ -502,7 +502,7 @@ __global__ void Moe16ExpertSumVector(const T *parts, const int *indices, T *outp
     if constexpr (Shared)
         probability =
             Moe16Float(Moe16Cast<T>(1.f / (1.f + expf(-Moe16Float(sharedGate[(size_t)row * sharedGateStride])))));
-    for (int d = lane * 8; d < hidden; d += 32 * 8) {
+    for (int d = (blockIdx.y * 32 + lane) * 8; d < hidden; d += gridDim.y * 32 * 8) {
         float sums[8] = {};
         for (int k = 0; k < topk; ++k) {
             uint4 value = *reinterpret_cast<const uint4 *>(
@@ -529,13 +529,16 @@ template<typename T, bool Shared>
 void Moe16SumExperts(const T *parts, const int *indices, T *output, int rows,
                       int hidden, int topk, cudaStream_t stream, const T *shared,
                       const T *sharedGate, int sharedGateStride) {
-    // A warp per row reduces prefill scheduling overhead. Small decode blocks
-    // need the original wider grid; unaligned views retain scalar accesses.
-    if (rows >= 1024 && hidden >= 512 && hidden % 8 == 0 &&
-        ((reinterpret_cast<uintptr_t>(parts) | reinterpret_cast<uintptr_t>(output)) & 15) == 0)
-        Moe16ExpertSumVector<T, Shared><<<(rows + 3) / 4, 128, 0, stream>>>(parts, indices, output, rows,
+    // A warp per row amortizes route sorting and vectorizes expert reads.
+    // Split wider rows across CTAs when row parallelism alone is insufficient;
+    // long prefills retain one CTA per four rows. Small/unaligned views keep
+    // the scalar path and every element retains its expert accumulation order.
+    if (rows >= 128 && hidden >= 512 && hidden % 8 == 0 &&
+        ((reinterpret_cast<uintptr_t>(parts) | reinterpret_cast<uintptr_t>(output)) & 15) == 0) {
+        int stripes = std::min((hidden + 255) / 256, (2048 + rows - 1) / rows);
+        Moe16ExpertSumVector<T, Shared><<<dim3((rows + 3) / 4, stripes), 128, 0, stream>>>(parts, indices, output, rows,
                                                                           hidden, topk, shared, sharedGate, sharedGateStride);
-    else
+    } else
         Moe16ExpertSum<T, Shared><<<dim3((hidden + 255) / 256, rows), 256, 0, stream>>>(
             parts, indices, output, hidden, topk, shared, sharedGate, sharedGateStride);
 }

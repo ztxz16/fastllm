@@ -271,6 +271,20 @@ int main(int argc, char **argv) {
         Experts(1025, 520, 136, 33, 2, false);
         Experts(1024, 512, 128, 33, 2, false, 1);
         Experts(1024, 512, 128, 17, 1, true);
+        // Verification batches use the same atomic buckets and four-row
+        // packing as prefill. Cover threshold edges, sparse/clustered routes,
+        // dynamic graph updates and unaligned input/output views.
+        for (int rows : {255, 256, 257}) Experts(rows, 512, 128, 33, 2, false);
+        Experts(512, 2048, 512, 33, 8, false, 0, 0, true, 1, 320);
+        // Direct TMA-gate input gather keeps the original MMA ordering.
+        // Exercise its upper boundary and an unaligned-input fallback.
+        Experts(513, 512, 128, 33, 2, false);
+        Experts(256, 2048, 128, 33, 4, false, 1);
+        Experts(256, 1024, 128, 33, 4, true, 1, 1);
+        // Vector reduction threshold and partial column stripe; preserve the
+        // sorted-expert sum and separately rounded shared contribution.
+        for (int rows : {127, 128, 129})
+            Experts(rows, 520, 136, 17, 4, false, 0, 0, true, 1, 320);
         // SM90 WGMMA dispatch boundaries, partial tiles, unaligned views and
         // shapes that must retain the generic implementation. Graph replays
         // also change the routes from sparse to concentrated experts.

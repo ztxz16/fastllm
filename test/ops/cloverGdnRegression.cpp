@@ -863,10 +863,11 @@ int main(int argc, char **argv) {
                 Normalization(rows, width, gated, centered);
         Normalization(1025, 131, true, false);
         Normalization(1025, 2048, false, true);
-        for (int rows : {1, 2, 16, 32, 64, 128, 256, 4096}) for (bool centered : {false, true})
+        for (int rows : {1, 2, 16, 32, 64, 128, 256, 511, 512, 513, 1023, 1024, 1025, 4096}) for (bool centered : {false, true})
             ResidualNormalization(rows, 2048, centered);
         ResidualNormalization(17, 2048, true, true);
-        for (int rows : {1, 16, 32, 64, 128, 256})
+        ResidualNormalization(513, 2048, false, true);
+        for (int rows : {1, 16, 32, 64, 128, 256, 511, 512, 513, 1024, 4096})
             for (bool gated : {false, true}) for (bool centered : {false, true})
                 Normalization(rows, 2048, gated, centered);
         for (int width : {1, 127, 128, 256, 517, 4096}) for (bool centered : {false, true})
