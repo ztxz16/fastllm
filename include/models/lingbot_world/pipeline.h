@@ -43,7 +43,7 @@ using Progress = std::function<void(const std::string &,int,int)>;
 using Trace = std::function<void(const std::string &,const Tensor &)>;
 class Pipeline {
 public:
-    Pipeline(const std::string &directory,int device);
+    Pipeline(const std::string &directory,int device,bool bf16Decode=true);
     std::unique_ptr<WorldState> create(const std::string &prompt,const std::vector<float> &firstPixels,
         int height,int width,uint64_t seed,const Intrinsics *intrinsics=nullptr,Progress progress={});
     // Calls are transactional. The caller serializes access to this pipeline.
@@ -53,11 +53,11 @@ public:
 private:
     Tensor encodePrompt(const std::string &);
     Runtime rt_;
-    VAERuntime vaeRt_;
+    VAERuntime vaeRt_, decoderRt_;
     Tokenizer tokenizer_;
     TextEncoder text_;
     DiT dit_;
-    VAE vae_;
+    VAE vae_, decoder_;
     std::vector<SamplingStep> schedule_;
 };
 
@@ -66,6 +66,7 @@ private:
 extern "C" {
 using LingBotProgress = int (*)(const char *stage,int current,int total,void *user);
 void *fastllm_lingbot_pipeline_create(const char *directory,int device);
+void *fastllm_lingbot_pipeline_create_ex(const char *directory,int device,int bf16Decode);
 void fastllm_lingbot_pipeline_destroy(void *);
 void *fastllm_lingbot_world_create_png(void *,const char *prompt,const uint8_t *png,size_t length,
     int height,int width,uint64_t seed,const float *intrinsics,LingBotProgress,void *user);

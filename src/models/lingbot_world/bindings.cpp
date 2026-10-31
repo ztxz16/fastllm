@@ -26,13 +26,13 @@ struct VAEHandle {
     fastllm::lingbot::VAERuntime runtime;
     fastllm::lingbot::VAE model;
     fastllm::lingbot::VAEState encoder,decoder;
-    VAEHandle(const char *path,int device):runtime(device),model(runtime,path) {}
+    VAEHandle(const char *path,int device,bool bf16=false):runtime(device,bf16),model(runtime,path) {}
 };
 struct PipelineHandle {
     std::mutex mutex;
     fastllm::lingbot::Pipeline model;
     std::unordered_map<void *,std::unique_ptr<fastllm::lingbot::WorldState>> worlds;
-    PipelineHandle(const char *path,int device):model(path,device) {}
+    PipelineHandle(const char *path,int device,bool bf16):model(path,device,bf16) {}
 };
 struct ResultHandle { std::vector<std::vector<uint8_t>> frames; };
 fastllm::lingbot::Progress progressCallback(LingBotProgress callback,void *user) {
@@ -45,8 +45,15 @@ fastllm::lingbot::Progress progressCallback(LingBotProgress callback,void *user)
 extern "C" {
 const char *fastllm_lingbot_error() { return error.c_str(); }
 void *fastllm_lingbot_pipeline_create(const char *path,int device) {
-    try { error.clear(); if(!path) throw std::invalid_argument("null LingBot model directory"); return new PipelineHandle(path,device); }
-    catch(const std::exception &e) { error=e.what(); return nullptr; }
+    return fastllm_lingbot_pipeline_create_ex(path,device,1);
+}
+void *fastllm_lingbot_pipeline_create_ex(const char *path,int device,int bf16Decode) {
+    try {
+        error.clear();
+        if(!path) throw std::invalid_argument("null LingBot model directory");
+        if(bf16Decode!=0 && bf16Decode!=1) throw std::invalid_argument("invalid LingBot precision");
+        return new PipelineHandle(path,device,bf16Decode!=0);
+    } catch(const std::exception &e) { error=e.what(); return nullptr; }
 }
 void fastllm_lingbot_pipeline_destroy(void *p) { delete static_cast<PipelineHandle *>(p); }
 void *fastllm_lingbot_world_create_png(void *p,const char *prompt,const uint8_t *png,size_t length,
@@ -99,6 +106,12 @@ void *fastllm_lingbot_vae_create(const char *path,int device) {
     try {
         error.clear(); if(!path) throw std::invalid_argument("null LingBot VAE checkpoint");
         return new VAEHandle(path,device);
+    } catch(const std::exception &e) { error=e.what(); return nullptr; }
+}
+void *fastllm_lingbot_vae_create_bf16(const char *path,int device) {
+    try {
+        error.clear(); if(!path) throw std::invalid_argument("null LingBot VAE checkpoint");
+        return new VAEHandle(path,device,true);
     } catch(const std::exception &e) { error=e.what(); return nullptr; }
 }
 void fastllm_lingbot_vae_destroy(void *p) { delete static_cast<VAEHandle *>(p); }

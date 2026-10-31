@@ -154,7 +154,11 @@ def main():
     torch.cuda.empty_cache()
     vae_module = importlib.import_module('wan.modules.vae2_1')
     vae = vae_module.Wan2_1_VAE(vae_pth=str(a.model/'Wan2.1_VAE.pth'))
-    pixels = vae.model.decode(torch.cat(final_latents, dim=1)[None].cuda(), vae.scale).clamp(-1, 1)
+    decode_precision = meta.get('vae_decode_precision', 'fp32')
+    if decode_precision not in ('bf16', 'fp32'):
+        raise ValueError('invalid trace decode precision')
+    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=decode_precision == 'bf16'):
+        pixels = vae.model.decode(torch.cat(final_latents, dim=1)[None].cuda(), vae.scale).float().clamp(-1, 1)
     pixels = thwc(pixels)
     start = 0
     for segment in range(len(meta['actions'])):
@@ -165,7 +169,7 @@ def main():
     # Whole denoising gates remain separate from the more sensitive pixel decoder.
     component_ok = all(r['finite'] and r['relative_l2'] < .01 for name, r in results.items() if not name.endswith('.pixels'))
     pixels_ok = all(r['finite'] and r['relative_l2'] < .03 for name, r in results.items() if name.endswith('.pixels'))
-    report = dict(schedule_exact=bool(schedule_ok), reference_weight_offload=a.offload_reference,
+    report = dict(decode_precision=decode_precision, schedule_exact=bool(schedule_ok), reference_weight_offload=a.offload_reference,
                   results=results, passed=bool(schedule_ok and component_ok and pixels_ok))
     a.output.write_text(json.dumps(report, indent=2))
     if not report['passed']:

@@ -4,20 +4,19 @@
 #include <stdexcept>
 
 namespace fastllm { namespace lingbot {
+struct HostTensor {
+    int rows=0,cols=0;
+    bool fp32=true;
+    std::vector<uint8_t> bytes;
+};
 // Causal VAE history is large at image resolution. Store it losslessly between
 // stages so transactional world snapshots do not duplicate it on the GPU.
 struct HostVAEState {
-    struct Feature { int rows=0,cols=0; std::vector<float> values; };
-    std::unordered_map<std::string,Feature> features;
+    std::unordered_map<std::string,HostTensor> features;
     int height=0,width=0;
 };
 struct HostDiTState {
-    struct Feature {
-        int rows=0,cols=0;
-        bool fp32=false;
-        std::vector<uint8_t> bytes;
-    };
-    std::vector<Feature> keys,values,textKeys,textValues;
+    std::vector<HostTensor> keys,values,textKeys,textValues;
     int frames=0,window=18,sink=6;
 };
 namespace {
@@ -26,16 +25,22 @@ void copyBytes(void *destination,const void *source,size_t bytes,cudaMemcpyKind 
     auto status=cudaMemcpyAsync(destination,source,bytes,kind,cudaStreamPerThread);
     if(status!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
+Tensor restoreTensor(const HostTensor &host) {
+    auto value=host.rows?Tensor(host.rows,host.cols,host.fp32):Tensor{};
+    copyBytes(value.data,host.bytes.data(),host.bytes.size(),cudaMemcpyHostToDevice);
+    return value;
+}
+void offloadTensor(const Tensor &value,HostTensor &host) {
+    host={value.rows,value.cols,value.fp32,std::vector<uint8_t>(value.bytes())};
+    copyBytes(host.bytes.data(),value.data,value.bytes(),cudaMemcpyDeviceToHost);
+}
 Cache restore(Runtime &rt,const std::shared_ptr<const HostDiTState> &host) {
     Cache cache;
     if(!host) return cache;
     cache.frames=host->frames; cache.window=host->window; cache.sink=host->sink;
-    auto upload=[](const std::vector<HostDiTState::Feature> &source,std::vector<Tensor> &target) {
+    auto upload=[](const std::vector<HostTensor> &source,std::vector<Tensor> &target) {
         target.reserve(source.size());
-        for(const auto &feature:source) {
-            target.push_back(feature.rows?Tensor(feature.rows,feature.cols,feature.fp32):Tensor{});
-            copyBytes(target.back().data,feature.bytes.data(),feature.bytes.size(),cudaMemcpyHostToDevice);
-        }
+        for(const auto &feature:source) target.push_back(restoreTensor(feature));
     };
     try {
         upload(host->keys,cache.keys); upload(host->values,cache.values);
@@ -47,11 +52,11 @@ Cache restore(Runtime &rt,const std::shared_ptr<const HostDiTState> &host) {
 std::shared_ptr<const HostDiTState> offload(Runtime &rt,Cache &cache) {
     auto host=std::make_shared<HostDiTState>();
     host->frames=cache.frames; host->window=cache.window; host->sink=cache.sink;
-    auto download=[](const std::vector<Tensor> &source,std::vector<HostDiTState::Feature> &target) {
+    auto download=[](const std::vector<Tensor> &source,std::vector<HostTensor> &target) {
         target.reserve(source.size());
         for(const auto &value:source) {
-            target.push_back({value.rows,value.cols,value.fp32,std::vector<uint8_t>(value.bytes())});
-            copyBytes(target.back().bytes.data(),value.data,value.bytes(),cudaMemcpyDeviceToHost);
+            target.emplace_back();
+            offloadTensor(value,target.back());
         }
     };
     try {
@@ -66,27 +71,28 @@ VAEState restore(VAERuntime &rt,const std::shared_ptr<const HostVAEState> &host)
     VAEState state;
     if(!host) return state;
     state.height=host->height; state.width=host->width;
-    for(const auto &entry:host->features) {
-        const auto &feature=entry.second;
-        state.features[entry.first]=feature.rows?rt.upload(feature.values.data(),feature.rows,feature.cols):Tensor{};
-    }
+    try {
+        for(const auto &entry:host->features) state.features[entry.first]=restoreTensor(entry.second);
+        rt.synchronize();
+    } catch(...) { try { rt.synchronize(); } catch(...) {} throw; }
     return state;
 }
 std::shared_ptr<const HostVAEState> offload(VAERuntime &rt,VAEState &state) {
     auto host=std::make_shared<HostVAEState>();
     host->height=state.height; host->width=state.width;
-    for(const auto &entry:state.features) {
-        const auto &value=entry.second;
-        host->features.emplace(entry.first,HostVAEState::Feature{
-            value.rows,value.cols,value.rows?rt.download(value):std::vector<float>{}});
-    }
+    try {
+        for(const auto &entry:state.features) offloadTensor(entry.second,host->features[entry.first]);
+        rt.synchronize();
+    } catch(...) { try { rt.synchronize(); } catch(...) {} throw; }
     state.features.clear();
     return host;
 }
 }
-Pipeline::Pipeline(const std::string &directory,int device):rt_(device),vaeRt_(device),
+Pipeline::Pipeline(const std::string &directory,int device,bool bf16Decode)
+    :rt_(device),vaeRt_(device),decoderRt_(device,bf16Decode),
     tokenizer_(directory+"/google/umt5-xxl"),text_(rt_,directory+"/native/t5.safetensors"),
-    dit_(rt_,directory+"/transformers"),vae_(vaeRt_,directory+"/native/vae.safetensors"),schedule_(fastSchedule()) {}
+    dit_(rt_,directory+"/transformers"),vae_(vaeRt_,directory+"/native/vae.safetensors"),
+    decoder_(decoderRt_,directory+"/native/vae.safetensors"),schedule_(fastSchedule()) {}
 Tensor Pipeline::encodePrompt(const std::string &prompt) {
     if(prompt.size()>16384) throw std::invalid_argument("LingBot prompt exceeds 16384 bytes");
     try {
@@ -176,11 +182,11 @@ Segment Pipeline::step(WorldState &world,const std::string &action,const std::st
     dit_.unload();
     rt_.synchronize();
     if(progress) progress("decode",0,1);
-    auto decoder=restore(vaeRt_,next.decoder);
-    auto pixels=vae_.decode(latent,3,lh,lw,decoder);
-    next.decoder=offload(vaeRt_,decoder);
+    auto decoder=restore(decoderRt_,next.decoder);
+    auto pixels=decoder_.decode(latent,3,lh,lw,decoder);
+    next.decoder=offload(decoderRt_,decoder);
     emit("pixels",pixels);
-    Segment result{vaeRt_.download(pixels),next.segments?12:9,h,w};
+    Segment result{decoderRt_.download(pixels),next.segments?12:9,h,w};
     for(float value:result.pixels) if(!std::isfinite(value)) throw std::runtime_error("nonfinite LingBot output");
     next.segments++; next.firstPixels={};
     if(progress) progress("decode",1,1);

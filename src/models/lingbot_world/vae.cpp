@@ -11,10 +11,10 @@ void validateState(VAEState &s,int h,int w) {
 }
 }
 VAE::Tensor VAE::pointwise(const Tensor &x,const std::string &p) {
-    return rt_.conv2d(x,weights_.get(p+".weight"),weights_.optional(p+".bias"),1,x.rows,1);
+    return rt_.conv2d(x,convWeights_.get(p+".weight"),convWeights_.optional(p+".bias"),1,x.rows,1);
 }
 VAE::Tensor VAE::causal(const Tensor &x,const std::string &p,int t,int h,int w,VAEState &s) {
-    auto &weight=weights_.get(p+".weight");
+    auto &weight=convWeights_.get(p+".weight");
     if(weight.cols==x.cols) return pointwise(x,p);
     require(weight.cols==x.cols*27,"unsupported Wan VAE causal kernel");
     auto found=s.features.find(p);
@@ -24,10 +24,10 @@ VAE::Tensor VAE::causal(const Tensor &x,const std::string &p,int t,int h,int w,V
     // A rowSlice retains its complete backing allocation. Copy just the
     // causal history so a two-frame cache does not pin a six-frame chunk.
     s.features[p]=rt_.concat({input.rowSlice(std::max(0,input.rows-2*h*w),std::min(input.rows,2*h*w))});
-    return rt_.conv3d(input,weight,weights_.optional(p+".bias"),t+history,h,w,3,3,1,2-history);
+    return rt_.conv3d(input,weight,convWeights_.optional(p+".bias"),t+history,h,w,3,3,1,2-history);
 }
 VAE::Tensor VAE::residual(const Tensor &x,const std::string &p,int t,int h,int w,VAEState &s) {
-    auto skip=weights_.optional(p+".shortcut.weight")?pointwise(x,p+".shortcut"):x;
+    auto skip=convWeights_.optional(p+".shortcut.weight")?pointwise(x,p+".shortcut"):x;
     auto y=rt_.activation(rt_.channelNorm(x,weights_.get(p+".residual.0.gamma")));
     y=causal(y,p+".residual.2",t,h,w,s);
     y=rt_.activation(rt_.channelNorm(y,weights_.get(p+".residual.3.gamma")));
@@ -63,17 +63,17 @@ VAE::Tensor VAE::resample(const Tensor &input,const std::string &p,int &t,int &h
             Tensor next=rt_.concat({joined.rowSlice(std::max(0,joined.rows-2*h*w),std::min(joined.rows,2*h*w))});
             if(next.rows<h*w*2) {
                 std::vector<float> zeros(size_t(h)*w*x.cols,0.f);
-                next=rt_.concat({rt_.upload(zeros.data(),h*w,x.cols),next});
+                next=rt_.concat({rt_.cast(rt_.upload(zeros.data(),h*w,x.cols),x.fp32),next});
             }
-            x=rt_.conv3d(joined,weights_.get(key+".weight"),weights_.optional(key+".bias"),
+            x=rt_.conv3d(joined,convWeights_.get(key+".weight"),convWeights_.optional(key+".bias"),
                          t+history,h,w,3,1,1,2-history);
             s.features[key]=next;
             x=rt_.temporalShuffle(x,t,h,w); t*=2;
         }
     }
     std::vector<Tensor> frames;
-    auto &weight=weights_.get(p+".resample.1.weight");
-    auto bias=weights_.optional(p+".resample.1.bias");
+    auto &weight=convWeights_.get(p+".resample.1.weight");
+    auto bias=convWeights_.optional(p+".resample.1.bias");
     for(int i=0;i<t;++i) {
         auto frame=x.rowSlice(i*h*w,h*w);
         if(up) frame=rt_.conv2d(rt_.resize2x(frame,h,w),weight,bias,h*2,w*2,3,1,1);
@@ -86,7 +86,7 @@ VAE::Tensor VAE::resample(const Tensor &input,const std::string &p,int &t,int &h
         auto last=rt_.concat({x.rowSlice((t-1)*h*w,h*w)});
         if(found!=s.features.end()) {
             auto joined=rt_.concat({found->second,x});
-            x=rt_.conv3d(joined,weights_.get(key+".weight"),weights_.optional(key+".bias"),t+1,h,w,3,1,2,0);
+            x=rt_.conv3d(joined,convWeights_.get(key+".weight"),convWeights_.optional(key+".bias"),t+1,h,w,3,1,2,0);
             t/=2;
         }
         s.features[key]=last;

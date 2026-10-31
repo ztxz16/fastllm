@@ -21,6 +21,7 @@ def metrics(a, b):
     mse = np.mean(delta ** 2)
     return dict(relative_l2=float(np.linalg.norm(delta) / max(np.linalg.norm(b.astype(np.float64)), 1e-12)),
                 max_abs=float(np.abs(delta).max()), finite=bool(np.isfinite(a).all()),
+                normalized_rmse=float(np.sqrt(mse)/2),
                 psnr_db=float(10 * np.log10(4 / max(mse, 1e-30))))
 
 
@@ -35,6 +36,7 @@ def main():
     parser.add_argument('--height', type=int, default=64)
     parser.add_argument('--width', type=int, default=64)
     parser.add_argument('--frames', type=int, default=9)
+    parser.add_argument('--decode-precision', choices=['bf16', 'fp32'], default='bf16')
     args = parser.parse_args()
     if args.frames < 5 or (args.frames-1) % 4:
         parser.error('frames must be 1+4k, k>=1')
@@ -56,7 +58,8 @@ def main():
     else:
         pixels = torch.rand((1, 3, args.frames, args.height, args.width), generator=gen, device='cuda')*2-1
     encoded = vae.model.encode(pixels, vae.scale)
-    decoded = vae.model.decode(encoded, vae.scale).clamp(-1, 1)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.decode_precision == "bf16"):
+        decoded = vae.model.decode(encoded, vae.scale).float().clamp(-1, 1)
     pixels, encoded, decoded = map(thwc, [pixels, encoded, decoded])
     del vae
     torch.cuda.empty_cache()
@@ -67,6 +70,8 @@ def main():
     lib.fastllm_lingbot_error.restype = ctypes.c_char_p
     lib.fastllm_lingbot_vae_create.argtypes = [ctypes.c_char_p, ctypes.c_int]
     lib.fastllm_lingbot_vae_create.restype = ctypes.c_void_p
+    lib.fastllm_lingbot_vae_create_bf16.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    lib.fastllm_lingbot_vae_create_bf16.restype = ctypes.c_void_p
     lib.fastllm_lingbot_vae_destroy.argtypes = [ctypes.c_void_p]
     lib.fastllm_lingbot_vae_reset.argtypes = [ctypes.c_void_p]
     for op in ['encode', 'decode']:
@@ -75,12 +80,19 @@ def main():
     handle = lib.fastllm_lingbot_vae_create(str(args.model/'native/vae.safetensors').encode(), 0)
     if not handle:
         raise RuntimeError(lib.fastllm_lingbot_error().decode())
-    def reset():
-        if lib.fastllm_lingbot_vae_reset(handle):
+    decoder = handle
+    if args.decode_precision == 'bf16':
+        decoder = lib.fastllm_lingbot_vae_create_bf16(str(args.model/'native/vae.safetensors').encode(), 0)
+        if not decoder:
+            lib.fastllm_lingbot_vae_destroy(handle)
             raise RuntimeError(lib.fastllm_lingbot_error().decode())
+    def reset():
+        for value in {handle, decoder}:
+            if lib.fastllm_lingbot_vae_reset(value):
+                raise RuntimeError(lib.fastllm_lingbot_error().decode())
     def run(op, value, shape):
         out = np.empty(shape, dtype=np.float32)
-        count = getattr(lib, 'fastllm_lingbot_vae_'+op)(handle, *value.shape[:3],
+        count = getattr(lib, 'fastllm_lingbot_vae_'+op)(decoder if op == 'decode' else handle, *value.shape[:3],
             value.ctypes.data_as(ptr), out.ctypes.data_as(ptr), out.size)
         if count != shape[0]:
             raise RuntimeError(f'{op}: expected {shape[0]} frames, got {count}: '+lib.fastllm_lingbot_error().decode())
@@ -110,13 +122,27 @@ def main():
         results['stream_decode'] = metrics(np.concatenate(dec_chunks), decoded)
         results['decode_partition'] = metrics(np.concatenate(dec_chunks), native_decoded)
     finally:
+        if decoder != handle:
+            lib.fastllm_lingbot_vae_destroy(decoder)
         lib.fastllm_lingbot_vae_destroy(handle)
-    passed = all(v['finite'] and v['relative_l2'] < .001 for v in results.values())
-    report = dict(shape=pixels.shape, results=results, passed=passed)
+    # Pixel range is [-1, 1]. Relative L2 becomes ill-conditioned for low-
+    # contrast reconstructions near zero, so BF16 pixel tests use range-
+    # normalized RMS <= 1% (PSNR >= 40 dB). Keep reporting relative L2;
+    # primitives have their own relative-L2 gates in compare_vae_ops.py.
+    # FP32 encoding and streaming partition gates are unchanged.
+    limits = {}
+    for name, result in results.items():
+        bf16_pixels = args.decode_precision == 'bf16' and name in ('decode', 'stream_decode', 'roundtrip')
+        metric, limit = ('normalized_rmse', .01) if bf16_pixels else ('relative_l2', .001)
+        limits[name] = {metric: limit}
+        result['passed'] = result['finite'] and result[metric] < limit
+    passed = all(v['passed'] for v in results.values())
+    report = dict(shape=pixels.shape, decode_precision=args.decode_precision,
+        limits=limits, results=results, passed=passed)
     args.output.write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2), flush=True)
     if not passed:
-        raise SystemExit('Wan VAE relative L2 exceeded 0.001')
+        raise SystemExit('Wan VAE precision gate failed')
 
 
 if __name__ == '__main__':

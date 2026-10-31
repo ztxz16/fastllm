@@ -109,7 +109,7 @@ Tensor convolution(const Tensor &x,const Tensor &w,const Tensor *bias,int frames
     }
     return out;
 }
-__global__ void timeShuffle(const float *x,float *out,size_t n,int hw,int c) {
+template<class T> __global__ void timeShuffle(const T *x,T *out,size_t n,int hw,int c) {
     for(size_t i=size_t(blockIdx.x)*256+threadIdx.x;i<n;i+=size_t(gridDim.x)*256) {
         size_t p=i/c,t=p/hw;
         out[i]=x[((t/2)*hw+p%hw)*2*c+(t%2)*c+i%c];
@@ -131,6 +131,7 @@ __global__ void clamp(const float *x,float *out,size_t n) {
 }
 }
 nomas::Tensor VAERuntime::channelNorm(const Tensor &x,const Tensor &weight) {
+    if(!x.fp32) return channelNorm(cast(x,true),weight);
     if(x.rows<=0 || x.cols<=0 || weight.size()!=size_t(x.cols))
         throw std::invalid_argument("Wan VAE channel norm shape");
     if(x.rows<16 || x.rows%4) return specialNorm(x,weight,1);
@@ -149,6 +150,7 @@ nomas::Tensor VAERuntime::conv3d(const Tensor &x,const Tensor &w,const Tensor *b
         throw std::invalid_argument("Wan VAE convolution shape");
     int ot=(frames+padT-kt)/strideT+1;
     if(frames+padT<kt || ot<1) throw std::invalid_argument("empty Wan VAE convolution");
+    if(low_) return convolutionBF16(x,w,bias,frames,h,width,kt,kernel,strideT,padT,1,kernel/2,h,width);
     return convolution(x,w,bias,frames,h,width,kt,kernel,strideT,padT,1,kernel/2,h,width);
 }
 nomas::Tensor VAERuntime::conv2d(const Tensor &x,const Tensor &w,const Tensor *bias,
@@ -159,21 +161,28 @@ nomas::Tensor VAERuntime::conv2d(const Tensor &x,const Tensor &w,const Tensor *b
     int oh=(h+2*pad+padEnd-kernel)/stride+1,ow=(width+2*pad+padEnd-kernel)/stride+1;
     if(h+2*pad+padEnd<kernel || width+2*pad+padEnd<kernel)
         throw std::invalid_argument("empty Wan VAE spatial convolution");
+    if(low_) return convolutionBF16(x,w,bias,1,h,width,1,kernel,1,0,stride,pad,oh,ow);
     return convolution(x,w,bias,1,h,width,1,kernel,1,0,stride,pad,oh,ow);
 }
 nomas::Tensor VAERuntime::temporalShuffle(const Tensor &x,int frames,int h,int w) {
     if(x.rows!=frames*h*w || x.cols%2) throw std::invalid_argument("Wan temporal shuffle shape");
-    Tensor out(x.rows*2,x.cols/2,true);
+    Tensor out(x.rows*2,x.cols/2,x.fp32);
+    if(!x.fp32) {
+        timeShuffle<<<grid(out.size()),256,0,cudaStreamPerThread>>>(x.data,out.data,out.size(),h*w,out.cols);
+        check(cudaGetLastError()); return out;
+    }
     timeShuffle<<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),out.size(),h*w,out.cols);
     check(cudaGetLastError()); return out;
 }
 nomas::Tensor VAERuntime::latentScale(const Tensor &x,bool decode) {
+    if(!x.fp32) return latentScale(cast(x,true),decode);
     if(x.cols!=16) throw std::invalid_argument("Wan latent channels");
     Tensor out(x.rows,x.cols,true);
     scaleLatent<<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),out.size(),decode);
     check(cudaGetLastError()); return out;
 }
 nomas::Tensor VAERuntime::clampPixels(const Tensor &x) {
+    if(!x.fp32) return clampPixels(cast(x,true));
     Tensor out(x.rows,x.cols,true);
     clamp<<<grid(out.size()),256,0,cudaStreamPerThread>>>(ptr(x),ptr(out),out.size());
     check(cudaGetLastError()); return out;

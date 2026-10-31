@@ -1,6 +1,6 @@
 set_directory_properties(PROPERTIES COMPILE_OPTIONS "" COMPILE_DEFINITIONS "" INCLUDE_DIRECTORIES "")
 add_library(fastllm_lingbot SHARED ops.cu dit.cpp text.cpp tokenizer.cpp bindings.cpp
-    vae.cpp vae_ops.cu vae_attention.cu sampling.cu camera.cpp camera.cu pipeline.cpp image.cpp ../qwen_image/ops.cu ../qwen_image/image.cpp)
+    vae.cpp vae_ops.cu vae_bf16.cu vae_attention.cu sampling.cu camera.cpp camera.cu pipeline.cpp image.cpp ../qwen_image/ops.cu ../qwen_image/image.cpp)
 target_link_libraries(fastllm_lingbot PUBLIC fastllm_continuous)
 target_include_directories(fastllm_lingbot PRIVATE ${PROJECT_SOURCE_DIR}/third_party/cutlass/include
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

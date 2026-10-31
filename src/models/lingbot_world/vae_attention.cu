@@ -75,6 +75,10 @@ __global__ void merge(const float *value,const float *state,float *out,
 nomas::Tensor VAERuntime::spatialAttention(const Tensor &q,const Tensor &k,const Tensor &v) {
     if(q.rows<=0 || k.rows<=0 || q.cols!=384 || k.cols!=q.cols || v.cols!=q.cols || k.rows!=v.rows)
         throw std::invalid_argument("Wan VAE attention shape");
+    if(!q.fp32) {
+        if(!low_ || k.fp32 || v.fp32) throw std::invalid_argument("Wan attention precision mismatch");
+        return low_->attention(q,k,v,1);
+    }
     Tensor out(q.rows,q.cols,true),state(q.rows,3,true);
     float scale=float(1./std::sqrt(double(q.cols)));
     for(int start=0;start<k.rows;start+=128) {

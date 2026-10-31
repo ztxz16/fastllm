@@ -42,7 +42,7 @@ class ServiceTests(unittest.TestCase):
         self.native = FakeNative()
         with patch.object(server, 'Native', return_value=self.native):
             self.service = server.Service(SimpleNamespace(output=self.directory.name,
-                library='unused', model='unused', device=0, max_worlds=2))
+                library='unused', model='unused', device=0, vae_decode_precision='bf16', max_worlds=2))
             deadline = time.monotonic()+5
             while self.service.status == 'loading' and time.monotonic() < deadline:
                 time.sleep(.01)

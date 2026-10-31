@@ -11,17 +11,17 @@
 | 脚本 | 范围 | 判定 |
 | --- | --- | --- |
 | `compare_tokenizer.py` | 英文、中文、Unicode、HTML 实体、特殊 token、截断 | token ID 完全一致 |
-| `compare_ops.py` | 相同输入的归一化、激活、Linear、跨 tile 边界的注意力，以及官方图像预处理 | FP32 L2 < 2e-6、BF16 L2 < 5e-4、图像 L2 < 1e-5 |
-| `compare_vae_ops.py` | VAE 的 FP32 归一化、时空卷积、空间卷积、1×1 投影及注意力 | 相对 L2 < 2e-6；卷积使用 FP64 数值参考 |
+| `compare_ops.py` | 相同输入的归一化、激活、Linear、注意力，以及官方图像预处理 | FP32 L2 < 2e-6、BF16 L2 < 5e-4、图像 L2 < 1e-5 |
+| `compare_vae_ops.py` | VAE 的 FP32/BF16 归一化、时空卷积、空间卷积、1×1 投影及注意力 | FP32 L2 < 2e-6，BF16 L2 < 0.005；FP32 卷积使用 FP64 数值参考 |
 | `compare_camera.py` | 连续平移、转向的相对位姿与 BF16 射线特征 | 相对 L2 < 2e-6 |
 | `compare_text.py` | 官方 UMT5 编码器及完整 padding/mask | 相对 L2 < 0.01 |
-| `compare_vae.py` | Wan 编码、解码、往返及分段缓存 | 相对 L2 < 0.001 |
+| `compare_vae.py` | Wan 编码、解码、往返及分段缓存 | 编码与分块一致性 L2 < 0.001；BF16 画面归一化 RMSE < 0.01；FP32 解码 L2 < 0.001 |
 | `compare_dit.py` | 去噪与提交历史的前向，跨缓存淘汰 | 相对 L2 < 0.01 |
 | `compare_pipeline.py` | 相同噪声下四步采样、连续历史和最终画面 | 中间结果 L2 < 0.01，画面 L2 < 0.03 |
 
 所有数值测试同时检查有限值。相对 L2 为 `norm(native - reference) / norm(reference)`。不要将通过单个算子的测试解释为整条链路通过。
 
-cuDNN 会按形状选择不同卷积算法，其中 FP32 Winograd 的误差可能超过算子门槛。卷积用相同输入的 FP64 结果判定数值精度，并同时保留原生对官方 FP32 的误差、官方 FP32 对 FP64 的误差。完整 VAE 和连续推演仍以官方 FP32 实现为参考，不用高精度卷积替换官方生成结果。
+cuDNN 会按形状选择不同卷积算法，其中 FP32 Winograd 的误差可能超过算子门槛。FP32 卷积用相同输入的 FP64 结果判定数值精度，并同时保留原生对官方 FP32 的误差、官方 FP32 对 FP64 的误差。BF16 算子以官方 CUDA autocast 为参考。完整 VAE 和连续推演使用与原生路径相同的解码精度，不用高精度卷积替换官方生成结果。
 
 DiT 参考直接构造官方 `WanModelFast`，严格加载原始 FP32 checkpoint，主投影使用 BF16 autocast，时间与输出 head 保留代码明确要求的 FP32。当前官方辅助加载器会整体转换 BF16，这与 forward 中关闭 autocast 的 FP32 时间路径不一致；该辅助加载器不是数值参考入口。对照关闭 TF32 及 BF16 GEMM 的低精度归约，使用 FP32 累加。测试输出记录所用 attention 后端。
 
@@ -61,11 +61,16 @@ python3 test/lingbot_world/compare_ops.py \
 python3 test/lingbot_world/compare_vae_ops.py \
   --bridge build-lingbot/liblingbot_world_test_ops.so \
   --output "$RESULT_DIR/vae-operators.json"
+python3 test/lingbot_world/compare_vae_ops.py \
+  --bridge build-lingbot/liblingbot_world_test_ops.so --precision bf16 \
+  --output "$RESULT_DIR/vae-operators-bf16.json"
 node test/lingbot_world/test_player.cjs
 python3 test/lingbot_world/test_server.py
 ```
 
-`test_player.cjs` 使用 Node 内置模块检查页面实际脚本的播放、移动、编辑和错误恢复，不替代浏览器的视觉验收。VAE 对照可额外传入 `--condition-inputs "$RESULT_DIR/inputs.npz"`，验证真实起始图片后接零帧的图像条件，并记录转成 BF16 后不同的值数。
+`test_player.cjs` 使用 Node 内置模块检查页面实际脚本的播放、移动、编辑和错误恢复，不替代浏览器的视觉验收。VAE 对照默认使用 BF16 autocast 解码、FP32 编码；BF16 单算子用 `compare_vae_ops.py --precision bf16` 检查，相对 L2 门槛为 0.005。解码与整段重建同时报告相对 L2 和 PSNR，门槛采用像素范围归一化 RMSE < 0.01（PSNR > 40 dB），避免接近零的低对比度输出使相对 L2 失真；编码与分块一致性仍使用相对 L2 < 0.001。传入 `--decode-precision fp32` 可回归原有 FP32 路径（全部门槛为 0.001）。连续推演对照读取 trace 中的 `vae_decode_precision`，使用相同精度解码；旧 trace 缺省为 FP32。
+
+VAE 对照可额外传入 `--condition-inputs "$RESULT_DIR/inputs.npz"`，验证真实起始图片后接零帧的图像条件，并记录转成 BF16 后不同的值数。
 
 `test_server.py` 使用 Python 标准库和模拟原生入口检查任务失败后的会话状态：推理失败保留已有会话，推理成功但画面写入失败则删除已前进的会话及不完整文件，避免客户端继续使用错误的片段编号。
 

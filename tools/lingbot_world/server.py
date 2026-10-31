@@ -21,11 +21,11 @@ CALLBACK = C.CFUNCTYPE(C.c_int, C.c_char_p, C.c_int, C.c_int, C.c_void_p)
 
 
 class Native:
-    def __init__(self, library, directory, device):
+    def __init__(self, library, directory, device, decode_precision="bf16"):
         self.lib = lib = C.CDLL(str(Path(library).resolve()))
         lib.fastllm_lingbot_error.restype = C.c_char_p
-        lib.fastllm_lingbot_pipeline_create.argtypes = [C.c_char_p, C.c_int]
-        lib.fastllm_lingbot_pipeline_create.restype = C.c_void_p
+        lib.fastllm_lingbot_pipeline_create_ex.argtypes = [C.c_char_p, C.c_int, C.c_int]
+        lib.fastllm_lingbot_pipeline_create_ex.restype = C.c_void_p
         lib.fastllm_lingbot_pipeline_destroy.argtypes = [C.c_void_p]
         lib.fastllm_lingbot_world_create_png.argtypes = [C.c_void_p, C.c_char_p, C.c_char_p, C.c_size_t,
             C.c_int, C.c_int, C.c_uint64, C.POINTER(C.c_float), CALLBACK, C.c_void_p]
@@ -37,7 +37,7 @@ class Native:
         lib.fastllm_lingbot_result_png.argtypes = [C.c_void_p, C.c_int, C.POINTER(C.c_size_t)]
         lib.fastllm_lingbot_result_png.restype = C.c_void_p
         lib.fastllm_lingbot_result_destroy.argtypes = [C.c_void_p]
-        self.handle = lib.fastllm_lingbot_pipeline_create(str(Path(directory).resolve()).encode(), device)
+        self.handle = lib.fastllm_lingbot_pipeline_create_ex(str(Path(directory).resolve()).encode(), device, int(decode_precision == "bf16"))
         if not self.handle:
             self.fail()
 
@@ -204,7 +204,7 @@ class Service:
 
     def run(self):
         try:
-            native = Native(self.args.library, self.args.model, self.args.device)
+            native = Native(self.args.library, self.args.model, self.args.device, self.args.vae_decode_precision)
             with self.lock:
                 self.status = 'ready'
             while True:
@@ -360,6 +360,7 @@ def main():
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=18009)
     parser.add_argument('--device', type=int, default=0)
+    parser.add_argument('--vae-decode-precision', choices=['bf16', 'fp32'], default='bf16')
     parser.add_argument('--output', default='lingbot-http-output')
     parser.add_argument('--api-key', default='')
     parser.add_argument('--max-worlds', type=int, default=2)

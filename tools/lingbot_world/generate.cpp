@@ -24,7 +24,7 @@ void write(const std::string &path,const void *data,size_t size) {
 int main(int argc,char **argv) {
     try {
         std::string directory,input,inputFloat,prompt,output="lingbot-output",traceDir,actions="stay",intrinsics;
-        int width=832,height=480,device=0; uint64_t seed=42;
+        int width=832,height=480,device=0; uint64_t seed=42; bool bf16Decode=true;
         for(int i=1;i<argc;++i) {
             std::string key=argv[i];
             if(i+1>=argc) throw std::invalid_argument("missing value for "+key);
@@ -39,6 +39,10 @@ int main(int argc,char **argv) {
             else if(key=="--width") width=std::stoi(value);
             else if(key=="--height") height=std::stoi(value);
             else if(key=="--device") device=std::stoi(value);
+            else if(key=="--vae-decode-precision") {
+                if(value!="bf16" && value!="fp32") throw std::invalid_argument("VAE precision must be bf16 or fp32");
+                bf16Decode=value=="bf16";
+            }
             else if(key=="--seed") seed=std::stoull(value);
             else if(key=="--actions") actions=value;
             else if(key=="--intrinsics") intrinsics=value;
@@ -68,7 +72,7 @@ int main(int argc,char **argv) {
         if(commands.empty()) throw std::invalid_argument("at least one action required");
         std::filesystem::create_directories(output);
         if(!traceDir.empty()) std::filesystem::create_directories(traceDir);
-        Pipeline pipeline(directory,device);
+        Pipeline pipeline(directory,device,bf16Decode);
         auto progress=[](const std::string &stage,int n,int total) { std::cerr<<stage<<" "<<n<<"/"<<total<<std::endl; };
         auto world=pipeline.create(prompt,pixels,height,width,seed,intrinsics.empty()?nullptr:&k,progress);
         Json::array schedule,commandJson,kJson;
@@ -76,7 +80,7 @@ int main(int argc,char **argv) {
         for(const auto &a:commands) commandJson.push_back(a);
         for(float v:world->intrinsics) kJson.push_back(v);
         auto metadata=Json(Json::object{{"prompt",prompt},{"width",width},{"height",height},{"seed",double(seed)},
-            {"fps",16},{"actions",commandJson},{"intrinsics",kJson},{"schedule",schedule}}).dump();
+            {"vae_decode_precision",bf16Decode?"bf16":"fp32"},{"fps",16},{"actions",commandJson},{"intrinsics",kJson},{"schedule",schedule}}).dump();
         write(output+"/metadata.json",metadata.data(),metadata.size());
         if(!traceDir.empty()) {
             write(traceDir+"/metadata.json",metadata.data(),metadata.size());

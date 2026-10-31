@@ -4,12 +4,15 @@
 
 namespace fastllm { namespace lingbot {
 
-// The Wan VAE uses FP32, like the official implementation. Reuse the existing
-// tensor runtime, pointwise operations and resampling; preserve the reference
-// convolution, normalization and attention rounding within this model.
+// FP32 encoding preserves image conditioning. BF16 decoding follows CUDA
+// autocast: BF16 convolutions/attention, FP32 normalization and latent scaling.
 class VAERuntime : public qwen_image::Runtime {
 public:
-    explicit VAERuntime(int device) : qwen_image::Runtime(device) {}
+    explicit VAERuntime(int device, bool bf16 = false)
+        : qwen_image::Runtime(device), low_(bf16 ? new nomas::Runtime(device, false) : nullptr) {}
+    nomas::Runtime &convolutionRuntime() { return low_ ? *low_ : *this; }
+    nomas::Tensor cast(const nomas::Tensor &, bool full);
+    nomas::Tensor resize2x(const nomas::Tensor &, int height, int width);
     nomas::Tensor channelNorm(const nomas::Tensor &, const nomas::Tensor &weight);
     nomas::Tensor spatialAttention(const nomas::Tensor &queries, const nomas::Tensor &keys,
                                   const nomas::Tensor &values);
@@ -22,17 +25,25 @@ public:
     nomas::Tensor temporalShuffle(const nomas::Tensor &, int frames, int height, int width);
     nomas::Tensor latentScale(const nomas::Tensor &, bool decode);
     nomas::Tensor clampPixels(const nomas::Tensor &);
+private:
+    std::unique_ptr<nomas::Runtime> low_;
+    std::unordered_map<const void *, std::pair<nomas::Tensor,nomas::Tensor>> packedWeights_;
+    nomas::Tensor convolutionBF16(const nomas::Tensor &, const nomas::Tensor &,
+        const nomas::Tensor *, int frames, int height, int width, int kt, int kernel,
+        int strideT, int padT, int strideS, int padS, int outHeight, int outWidth);
 };
 
 struct VAEState {
     std::unordered_map<std::string, nomas::Tensor> features;
     int height = 0, width = 0;
+
 };
 
 class VAE {
 public:
     using Tensor = nomas::Tensor;
-    VAE(VAERuntime &rt, const std::string &checkpoint) : rt_(rt), weights_(rt, checkpoint) {}
+    VAE(VAERuntime &rt, const std::string &checkpoint)
+        : rt_(rt), weights_(rt, checkpoint), convWeights_(rt.convolutionRuntime(), checkpoint) {}
     // THWC rows: first encoder call consumes 1+4k frames, continuations 4k.
     // Decoder consumes any positive number of latent frames. Initial output
     // contains 1+4(k-1) frames, subsequent outputs contain 4k frames.
@@ -48,13 +59,15 @@ private:
     Tensor encodeChunk(const Tensor &, int frames, int h, int w, VAEState &);
     Tensor decodeChunk(const Tensor &, int h, int w, VAEState &);
     VAERuntime &rt_;
-    nomas::Weights weights_;
+    nomas::Weights weights_, convWeights_;
 };
 
 }} // namespace fastllm::lingbot
 
 extern "C" {
 void *fastllm_lingbot_vae_create(const char *checkpoint, int device);
+// Explicit autocast decoder entry used by precision comparisons.
+void *fastllm_lingbot_vae_create_bf16(const char *checkpoint, int device);
 void fastllm_lingbot_vae_destroy(void *);
 int fastllm_lingbot_vae_reset(void *);
 // Returns the number of output frames, or -1 on error. Capacities count floats.

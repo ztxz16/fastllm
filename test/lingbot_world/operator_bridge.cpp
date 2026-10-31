@@ -70,6 +70,43 @@ int lingbot_test_vae_conv2d(const float *input,const float *weight,const float *
         std::memcpy(output,values.data(),values.size()*sizeof(float));
     });
 }
+int lingbot_test_vae_bf16_norm(const float *input,const float *weight,float *output,int rows,int cols) {
+    return checked([&] {
+        VAERuntime rt(0,true);
+        auto x=rt.convolutionRuntime().upload(input,rows,cols),w=rt.upload(weight,1,cols);
+        auto values=rt.download(rt.channelNorm(x,w));
+        std::memcpy(output,values.data(),values.size()*sizeof(float));
+    });
+}
+int lingbot_test_vae_bf16_attention(const float *input,float *output,int rows) {
+    return checked([&] {
+        VAERuntime rt(0,true);
+        auto x=rt.convolutionRuntime().upload(input,rows,1152);
+        auto values=rt.download(rt.spatialAttention(rt.columns(x,0,384),rt.columns(x,384,384),rt.columns(x,768,384)));
+        std::memcpy(output,values.data(),values.size()*sizeof(float));
+    });
+}
+int lingbot_test_vae_bf16_conv(const float *input,const float *weight,const float *bias,float *output,
+                          int frames,int height,int width,int in,int out,int kt,int kernel,int stride,int pad) {
+    return checked([&] {
+        VAERuntime rt(0,true);
+        auto x=rt.upload(input,frames*height*width,in),w=rt.convolutionRuntime().upload(weight,out,in*kt*kernel*kernel);
+        Tensor b;
+        if(bias) b=rt.convolutionRuntime().upload(bias,1,out);
+        auto values=rt.download(rt.conv3d(x,w,bias?&b:nullptr,frames,height,width,kt,kernel,stride,pad));
+        std::memcpy(output,values.data(),values.size()*sizeof(float));
+    });
+}
+int lingbot_test_vae_bf16_conv2d(const float *input,const float *weight,const float *bias,float *output,
+                            int height,int width,int in,int out,int kernel,int stride,int pad,int padEnd) {
+    return checked([&] {
+        VAERuntime rt(0,true);
+        auto x=rt.upload(input,height*width,in),w=rt.convolutionRuntime().upload(weight,out,in*kernel*kernel);
+        auto b=rt.convolutionRuntime().upload(bias,1,out);
+        auto values=rt.download(rt.conv2d(x,w,&b,height,width,kernel,stride,pad,padEnd));
+        std::memcpy(output,values.data(),values.size()*sizeof(float));
+    });
+}
 int lingbot_test_norm(const float *input,const float *weight,const float *bias,
                       float *output,int rows,int full,int rms) {
     return checked([&] {
