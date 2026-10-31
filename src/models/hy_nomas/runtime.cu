@@ -32,13 +32,13 @@ void copy(void *dst,const void *src,size_t bytes,cudaMemcpyKind kind) {
 // Tensors retain this pool so their storage may safely outlive Runtime.
 struct MemoryPool {
     cudaMemPool_t handle = nullptr;
-    explicit MemoryPool(int device) {
+    int device;
+    explicit MemoryPool(int device, uint64_t retained=2ULL*1024*1024*1024):device(device) {
         cudaMemPoolProps props{};
         props.allocType = cudaMemAllocationTypePinned;
         props.location.type = cudaMemLocationTypeDevice;
         props.location.id = device;
         check(cudaMemPoolCreate(&handle, &props));
-        uint64_t retained = 2ULL * 1024 * 1024 * 1024;
         auto status = cudaMemPoolSetAttribute(handle, cudaMemPoolAttrReleaseThreshold, &retained);
         if (status != cudaSuccess) {
             cudaMemPoolDestroy(handle);
@@ -47,7 +47,9 @@ struct MemoryPool {
     }
     ~MemoryPool() { cudaMemPoolDestroy(handle); }
 };
+thread_local std::shared_ptr<MemoryPool> activePool;
 std::shared_ptr<MemoryPool> memoryPool(int device) {
+    if(activePool && activePool->device==device) return activePool;
     static std::mutex mutex;
     static std::unordered_map<int, std::weak_ptr<MemoryPool>> pools;
     std::lock_guard<std::mutex> lock(mutex);
@@ -240,6 +242,22 @@ template<class T> __global__ void textRopeKernel(const T *x,T *y,size_t n,int co
         y[i]=cast<T>(roundTo<T>(f(x[i])*roundTo<T>(cosf(angle)))+roundTo<T>(rotated*roundTo<T>(sinf(angle))));
     }
 }
+}
+
+TensorPool::TensorPool(int device):pool_(std::make_shared<MemoryPool>(device,UINT64_MAX)) {}
+TensorPool::Scope::Scope(const TensorPool &pool):previous_(activePool) {
+    activePool=std::static_pointer_cast<MemoryPool>(pool.pool_);
+}
+TensorPool::Scope::~Scope() { activePool=std::static_pointer_cast<MemoryPool>(previous_); }
+size_t TensorPool::reusableBytes() const {
+    auto pool=std::static_pointer_cast<MemoryPool>(pool_);
+    uint64_t reserved=0,used=0;
+    check(cudaMemPoolGetAttribute(pool->handle,cudaMemPoolAttrReservedMemCurrent,&reserved));
+    check(cudaMemPoolGetAttribute(pool->handle,cudaMemPoolAttrUsedMemCurrent,&used));
+    return reserved>used?reserved-used:0;
+}
+void TensorPool::trim() {
+    check(cudaMemPoolTrimTo(std::static_pointer_cast<MemoryPool>(pool_)->handle,0));
 }
 
 struct Runtime::LtState {

@@ -6,6 +6,32 @@
 #include <stdexcept>
 using namespace fastllm::lingbot;
 namespace {
+void allocationScopes(Runtime &rt) {
+    fastllm::nomas::TensorPool outer(0),inner(0);
+    auto allocate=[&](int rows) { Tensor scratch(rows,1024); };
+    {
+        fastllm::nomas::TensorPool::Scope scope(outer);
+        allocate(512);
+        {
+            fastllm::nomas::TensorPool::Scope nested(inner);
+            allocate(512); rt.synchronize();
+        }
+        // Pool reservation granularity is driver-dependent. Exceed the
+        // actual inner reservation instead of assuming a fixed page size.
+        allocate(int(inner.reusableBytes()/2048)+4096);
+    }
+    rt.synchronize();
+    if(outer.reusableBytes()<=inner.reusableBytes() || !inner.reusableBytes())
+        throw std::runtime_error("nested allocation scope was not restored");
+    outer.trim(); inner.trim();
+    try {
+        fastllm::nomas::TensorPool::Scope scope(outer);
+        throw std::runtime_error("allocation scope cancellation");
+    } catch(const std::runtime_error &) {}
+    allocate(4096); rt.synchronize();
+    if(outer.reusableBytes() || inner.reusableBytes())
+        throw std::runtime_error("allocation scope leaked into another model");
+}
 std::vector<float> read(const std::string &path) {
     std::ifstream f(path,std::ios::binary|std::ios::ate);
     if(!f || f.tellg()%4) throw std::runtime_error("invalid fixture: "+path);
@@ -25,7 +51,9 @@ int main(int argc,char **argv) { try {
     int h=std::stoi(argv[3]),w=std::stoi(argv[4]);
     auto image=read(std::string(argv[2])+"/first_image.f32"),text=read(std::string(argv[2])+"/0.text.f32");
     if(image.size()!=size_t(h)*w*3 || text.empty() || text.size()%4096) throw std::runtime_error("fixture shape");
-    Pipeline pipeline(argv[1],0);WorldState world;
+    Pipeline pipeline(argv[1],0);
+    allocationScopes(pipeline.runtime());
+    WorldState world;
     world.height=h;world.width=w;world.seed=42;world.intrinsics={float(w),float(w),w*.5f,h*.5f};
     world.firstPixels=pipeline.runtime().fp32.upload(image.data(),h*w,3);
     world.text=pipeline.runtime().upload(text.data(),text.size()/4096,4096);
@@ -36,6 +64,7 @@ int main(int argc,char **argv) { try {
     auto branch=saved;
     pipeline.step(branch,"look_left"); // switches active state while the original snapshot survives
     world=saved;
+    pipeline.offloadState(); // force lossless host fallback before rollback
     bool aborted=false;
     try {
         pipeline.step(world,"forward",nullptr,[](const std::string &stage,int current,int total) {
@@ -53,6 +82,7 @@ int main(int argc,char **argv) { try {
     pipeline.step(branch,"right");
     auto resumed=pipeline.step(world,"look_up");
     world=advanced;
+    pipeline.offloadState(); // revisit an older snapshot after eviction
     equal(resumed,pipeline.step(world,"look_up"));
     std::cout<<"world switching, cancelled-step rollback and deterministic replay: passed\n";
 } catch(const std::exception &e) { std::cerr<<e.what()<<'\n';return 1; } }

@@ -50,15 +50,17 @@ public:
     Segment step(WorldState &,const std::string &action="stay",const std::string *prompt=nullptr,
         Progress progress={},Trace trace={});
     Runtime &runtime() { return rt_; }
+    // Release saved GPU state losslessly; all worlds and rollback snapshots
+    // remain usable. Useful when yielding device memory to another model.
+    void offloadState();
 private:
     Tensor encodePrompt(const std::string &);
     void reserveWorkingMemory(size_t bytes);
-    // One active world may retain its immutable GPU snapshots. CPU snapshots
-    // remain authoritative for rollback, world switching and low-memory eviction.
-    std::weak_ptr<const HostDiTState> residentCacheHost_;
-    std::weak_ptr<const HostVAEState> residentEncoderHost_;
-    Cache residentCache_;
-    VAEState residentEncoder_;
+    // Weak references permit pressure-driven eviction without extending the
+    // lifetime of deleted worlds or snapshots from completed transactions.
+    std::vector<std::weak_ptr<const HostDiTState>> cacheStates_;
+    std::vector<std::weak_ptr<const HostVAEState>> vaeStates_;
+    nomas::TensorPool tensorPool_;
     Runtime rt_;
     VAERuntime vaeRt_, decoderRt_;
     Tokenizer tokenizer_;

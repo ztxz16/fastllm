@@ -12,6 +12,27 @@
 
 namespace fastllm { namespace nomas {
 
+// An opt-in allocation pool for a serialized inference pipeline. A scope
+// affects only allocations on its thread/device; other models keep the default.
+class TensorPool {
+public:
+    explicit TensorPool(int device);
+    class Scope {
+    public:
+        explicit Scope(const TensorPool &);
+        ~Scope();
+        Scope(const Scope &)=delete;
+        Scope &operator=(const Scope &)=delete;
+    private:
+        std::shared_ptr<void> previous_;
+    };
+    // Call after synchronizing the inference stream.
+    size_t reusableBytes() const;
+    void trim();
+private:
+    std::shared_ptr<void> pool_;
+};
+
 struct Tensor {
     std::shared_ptr<void> storage;
     uint16_t *data = nullptr;
