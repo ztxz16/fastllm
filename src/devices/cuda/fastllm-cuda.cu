@@ -11,6 +11,8 @@
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "fastllm-cuda-rope.cuh"
+#include "fastllm-cuda-activation.cuh"
+#include "fastllm-cuda-gdn-step.cuh"
 #include "devices/cuda/cudaworkspace.h"
 #include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
@@ -2072,10 +2074,6 @@ __global__ void FastllmBFloat16ElementwisePackedKernel(
 }
 #endif
 
-__device__ float softplus(float x) {
-    return  x > 20.0f ? x : log1p(expf(x));
-}
-
 __device__ __forceinline__ float softplus_fast(float x) {
     if (x > 20.0f) {
         return x;
@@ -2089,14 +2087,14 @@ __device__ __forceinline__ float softplus_fast(float x) {
 __global__ void FastllmMambaSoftplusKernel(float* inputData, float *outputData, float *aLog, float *dtBias, int channels, float outputScale) {
     int o = blockIdx.x;
     for (int i = threadIdx.x; i < channels; i += blockDim.x) {
-        outputData[o * channels + i] = outputScale * -expf((double)aLog[i]) * softplus(inputData[o * channels + i] + dtBias[i]);
+        outputData[o * channels + i] = outputScale * -expf((double)aLog[i]) * FastllmSoftplus(inputData[o * channels + i] + dtBias[i]);
     }
 }
 
 __global__ void FastllmMambaSoftplusKernel(half* inputData, half *outputData, float *aLog, float *dtBias, int channels, float outputScale) {
     int o = blockIdx.x;
     for (int i = threadIdx.x; i < channels; i += blockDim.x) {
-        outputData[o * channels + i] = __float2half(outputScale * -exp((double)aLog[i]) * softplus(__half2float(inputData[o * channels + i]) + dtBias[i]));
+        outputData[o * channels + i] = __float2half(outputScale * -exp((double)aLog[i]) * FastllmSoftplus(__half2float(inputData[o * channels + i]) + dtBias[i]));
     }
 }
 
@@ -2106,7 +2104,7 @@ __global__ void FastllmMambaSoftplusKernel(__nv_bfloat16* inputData, __nv_bfloat
     for (int i = threadIdx.x; i < channels; i += blockDim.x) {
         int idx = o * channels + i;
         outputData[idx] = __float2bfloat16_rn(outputScale * -expf(aLog[i]) *
-            softplus(__bfloat162float(inputData[idx]) + dtBias[i]));
+            FastllmSoftplus(__bfloat162float(inputData[idx]) + dtBias[i]));
     }
 }
 
@@ -2117,7 +2115,7 @@ __global__ void FastllmSigmoidMambaSoftplusKernel(float *sigmoidData, const floa
         int idx = o * channels + i;
         float x = sigmoidData[idx];
         sigmoidData[idx] = 1.0f / (1.0f + expf(-x));
-        softplusOutputData[idx] = -expf((double)aLog[i]) * softplus(softplusInputData[idx] + dtBias[i]);
+        softplusOutputData[idx] = -expf((double)aLog[i]) * FastllmSoftplus(softplusInputData[idx] + dtBias[i]);
     }
 }
 
@@ -2133,7 +2131,7 @@ __global__ void FastllmSigmoidMambaSoftplusKernel(half *sigmoidData, const half 
         half x = sigmoidData[idx];
         sigmoidData[idx] = __hdiv(__float2half(1.0f), __hadd(__float2half(1.0f), hexp(-x)));
 #endif
-        softplusOutputData[idx] = __float2half(-exp((double)aLog[i]) * softplus(__half2float(softplusInputData[idx]) + dtBias[i]));
+        softplusOutputData[idx] = __float2half(-exp((double)aLog[i]) * FastllmSoftplus(__half2float(softplusInputData[idx]) + dtBias[i]));
     }
 }
 
@@ -2146,7 +2144,7 @@ __global__ void FastllmSigmoidMambaSoftplusKernel(
         float x = __bfloat162float(sigmoidData[idx]);
         sigmoidData[idx] = __float2bfloat16_rn(1.0f / (1.0f + expf(-x)));
         softplusOutputData[idx] = __float2bfloat16_rn(-expf(aLog[i]) *
-            softplus(__bfloat162float(softplusInputData[idx]) + dtBias[i]));
+            FastllmSoftplus(__bfloat162float(softplusInputData[idx]) + dtBias[i]));
     }
 }
 
@@ -2171,7 +2169,7 @@ __global__ void FastllmSigmoidMambaSoftplusCombinedHalfKernel(
 #endif
         softplusOutputData[outputIdx] = __float2half(
             -exp((double)aLog[i]) *
-            softplus(__half2float(inputData[inputIdx + channels]) +
+            FastllmSoftplus(__half2float(inputData[inputIdx + channels]) +
                      dtBias[i]));
     }
 }
@@ -3976,7 +3974,7 @@ void FastllmQwen35GdnPostConvRaggedExactHalf128Kernel(
 #endif
         half gateValue = __float2half(
             -exp((double)aLog[valueHead]) *
-            softplus(__half2float(
+            FastllmSoftplus(__half2float(
                 baRow[baOffset + valueHeads + valueHead]) +
                 dtBias[valueHead]));
         half2 beta2 = __halves2half2(betaValue, betaValue);
@@ -6700,17 +6698,6 @@ void FastllmCudaShiftAppendWindow(uint8_t *cache, const uint8_t *newToken, int c
     FastllmShiftAppendWindowKernel<kThreads>
         <<< (channels + kThreads - 1) / kThreads, kThreads >>>(cache, newToken, channels, window, unitSize);
     DeviceSync();
-}
-
-template <int THREAD_PER_BLOCK>
-__global__ void FastllmMemcpy2DKernel (uint8_t * 	dst, size_t 	dpitch, uint8_t * 	src,
-                                       size_t 	spitch, size_t 	width, size_t 	height) {
-    int id = blockIdx.x;
-    dst += id * dpitch;
-    src += id * spitch;
-    for (int i = threadIdx.x; i < width; i += THREAD_PER_BLOCK) {
-        dst[i] = src[i];
-    }
 }
 
 template <int THREAD_PER_BLOCK>
@@ -10205,7 +10192,7 @@ __global__ void FastllmGdnNormBaBf16KV128Kernel(
         float br = __bfloat162float(b[head]);
         float ar = __bfloat162float(a[head]);
         gate[0] = __bfloat162float(__float2bfloat16_rn(1.0f/(1.0f+expf(-br))));
-        float g = -expf(aLog[head])*softplus(ar+dtBias[head]);
+        float g = -expf(aLog[head])*FastllmSoftplus(ar+dtBias[head]);
         gate[1] = expf(__bfloat162float(__float2bfloat16_rn(g)));
     }
     __syncthreads();
@@ -21831,7 +21818,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaHalfKernel(
     float bVal = __half2float(__hdiv(__float2half(1.0f), __hadd(__float2half(1.0f), hexp(-bHalfRaw))));
 #endif
     float aRaw = __half2float(baRow[numVHeads + head_idx]);
-    float gStored = __half2float(__float2half_rn(-exp((double)aLog[head_idx]) * softplus(aRaw + dtBias[head_idx])));
+    float gStored = __half2float(__float2half_rn(-exp((double)aLog[head_idx]) * FastllmSoftplus(aRaw + dtBias[head_idx])));
     float gVal = expf(gStored);
 
     half *last_recurrent_state = statePool != nullptr ?
@@ -22389,18 +22376,13 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
             const float *qToken = qValues + token * qTokenStride;
             const float *kToken = kValues + token * qTokenStride;
             float gVal = gateValues[token * gateTokenStride + 1];
-            float sumK = 0.0f;
+            float q[4], k[4];
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                sumK += (__half2float(stateValues[j]) * gVal) * kToken[lane_id + j * 32];
+            for (int j = 0; j < 4; ++j) {
+                q[j] = qToken[lane_id + j * 32]; k[j] = kToken[lane_id + j * 32];
             }
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                sumK += __shfl_down_sync(0xffffffff, sumK, offset);
-            }
-            float delta = (__half2float(convOutput[vOffset + v_col]) -
-                           __shfl_sync(0xffffffff, sumK, 0)) * gateValues[token * gateTokenStride];
-
-            float sumQ = 0.0f;
+            float sumQ = fastllm::cuda_gdn::Step128<half, true>(stateValues, q, k,
+                __half2float(convOutput[vOffset + v_col]), gateValues[token * gateTokenStride], gVal, qScale);
             half *snapBase = nullptr;
             if (token < numSnaps && snapshotPointers != nullptr) {
                 snapBase = snapshotPointers[batchIndex * numSnaps + token];
@@ -22418,19 +22400,9 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
             }
             half *snap_row = snapBase != nullptr ?
                 snapBase + stateHeadBase + (size_t)v_col * headKDim : nullptr;
+            if (snap_row != nullptr) {
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                int channel = lane_id + j * 32;
-                float updated = __half2float(stateValues[j]) * gVal + kToken[channel] * delta;
-                half updatedHalf = __float2half_rn(updated);
-                stateValues[j] = updatedHalf;
-                if (snap_row != nullptr) {
-                    snap_row[channel] = updatedHalf;
-                }
-                sumQ += updated * (qToken[channel] * qScale);
-            }
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                sumQ += __shfl_down_sync(0xffffffff, sumQ, offset);
+                for (int j = 0; j < 4; ++j) snap_row[lane_id + j * 32] = stateValues[j];
             }
             if (!RESTORE && lane_id == 0) {
                 core_attn_out[outBase + v_col] = __float2half_rn(sumQ);

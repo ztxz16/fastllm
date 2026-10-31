@@ -1,3 +1,6 @@
+#include "devices/cuda/fastllm-cuda-gdn-step.cuh"
+#include "devices/cuda/fastllm-cuda-activation.cuh"
+#include "devices/cuda/fastllm-cuda-conv.cuh"
 // Clover's preview equations are described by the Apache-2.0 reference:
 // Diffuspace/Clover-35B-A3B-Preview, modeling_clover_moe.py (bd_gdn_*).
 // Native CUDA implementation; no Transformers, Triton or SGLang runtime needed.
@@ -218,17 +221,10 @@ __global__ void CloverCausalConv(const T *input,
         snapshots = (T *)caches.convSnapshots[request];
     }
     const int cacheSlot = Indirect ? 0 : request, cacheBatch = Indirect ? 1 : batch;
-    float sum = 0.f;
-    for (int tap = 0; tap < 4; ++tap) {
-        const int source = token + tap - 3;
-        const T x = source < 0
-            ? history[((size_t)cacheSlot * channels + channel) * 3 + source + 3]
-            : input[((size_t)request * tokens + source) * channels + channel];
-        // The official causal convolution rounds each product to input dtype
-        // before its FP32 accumulation. Preview intentionally uses FP32 products.
-        sum += CloverFloat(CloverCast<T>(CloverFloat(x) *
-                                               CloverFloat(weight[channel * 4 + tap])));
-    }
+    float sum = fastllm::cuda_conv::At<T, T, T, true>(
+        input + (size_t)request * tokens * channels + channel,
+        history + ((size_t)cacheSlot * channels + channel) * 3,
+        weight + channel * 4, token, channels, 4, 3);
     output[((size_t)request * tokens + token) * channels + channel] =
         CloverCast<T>(sum / (1.f + expf(-sum)));
     if (snapshots) {
@@ -265,10 +261,7 @@ __global__ void CloverTiledCausalConv(const T *input, const T *history,
     for (int t = 0; t < Tile; ++t) {
         if (base + t >= tokens) break;
         x[3] = input[((size_t)batch * tokens + base + t) * channels + c];
-        float sum = 0.f;
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-            sum += CloverFloat(CloverCast<T>(CloverFloat(x[j]) * CloverFloat(w[j])));
+        float sum = fastllm::cuda_conv::Dot<T, T, true>(x, w, 4);
         output[((size_t)batch * tokens + base + t) * channels + c] =
             CloverCast<T>(sum / (1.f + expf(-sum)));
         x[0] = x[1]; x[1] = x[2]; x[2] = x[3];
@@ -357,22 +350,15 @@ __global__ void CloverCausalGdn(const T *query, const T *key,
         const float kinv = Prepared ? 1.f : rsqrtf(WarpSum(ks) + 1.e-6f);
         const float decay = Prepared ? prepared[2 * qkCount + row * valueHeads + head] :
             expf(g[row * valueHeads + head]);
-        float remembered = 0.f;
-        for (int j = 0; j < 4; ++j) {
-            if (!Prepared) { q[j] *= qinv; k[j] *= kinv; }
-            s[j] *= decay;
-            remembered += s[j] * k[j];
+        if constexpr (!Prepared) {
+            for (int j = 0; j < 4; ++j) { q[j] *= qinv; k[j] *= kinv; }
         }
-        const float delta = (CloverFloat(value[row * vStride + head * 128 + valueIndex]) -
-                             WarpSum(remembered)) * CloverFloat(beta[row * valueHeads + head]);
-        float y = 0.f;
-        for (int j = 0; j < 4; ++j) {
-            s[j] += k[j] * delta;
-            y += s[j] * q[j];
-            if (snapshots)
+        float y = fastllm::cuda_gdn::Step128(s, q, k,
+            CloverFloat(value[row * vStride + head * 128 + valueIndex]),
+            CloverFloat(beta[row * valueHeads + head]), decay);
+        if (snapshots)
+            for (int j = 0; j < 4; ++j)
                 snapshots[(size_t)token * cacheBatch * valueHeads * 128 * 128 + stateOffset + lane + j * 32] = s[j];
-        }
-        y = WarpSum(y);
         if (lane == 0) output[(row * valueHeads + head) * 128 + valueIndex] = CloverCast<T>(y);
     }
     for (int j = 0; j < 4; ++j) state[stateOffset + lane + j * 32] = s[j];
@@ -1063,7 +1049,7 @@ __global__ void CloverUnpackGdn(const T *input, const float *aLog, const float *
     }
     if (d < heads) {
         float a = CloverFloat(input[offset + channels + values + d]) + bias[d];
-        g[(size_t)row * heads + d] = -expf(aLog[d]) * (a > 20.f ? a : log1pf(expf(a)));
+        g[(size_t)row * heads + d] = -expf(aLog[d]) * FastllmSoftplus<true>(a);
         if (beta) {
             float b = CloverFloat(input[offset + channels + values + heads + d]);
             beta[(size_t)row * heads + d] = CloverCast<T>(1.f / (1.f + expf(-b)));
@@ -1140,6 +1126,7 @@ bool FastllmCudaCloverRoute(const void *logits, int *indices, float *scores,
     return fp16 ? FastllmCudaCloverRouteImpl<__half>(logits, indices, scores, scratchIds, scratchScores, allowed, batch, tokens, experts, topk, coresetTopP, stream, logitsStride)
                 : FastllmCudaCloverRouteImpl<__nv_bfloat16>(logits, indices, scores, scratchIds, scratchScores, allowed, batch, tokens, experts, topk, coresetTopP, stream, logitsStride);
 }
+
 
 
 bool FastllmCudaCloverUnpackGdn(const void *input, const float *aLog, const float *bias, void *qkv, void *z,
