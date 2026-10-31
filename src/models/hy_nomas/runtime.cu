@@ -534,6 +534,8 @@ void Runtime::synchronize() { check(cudaDeviceSynchronize()); }
 struct Weights::Impl {
     Runtime &rt; std::ifstream file; json11::Json header; uint64_t base=0,fileSize=0;
     std::unordered_map<std::string,Tensor> cache;
+    struct HostWeight { int rows,cols; bool fp32; std::vector<uint8_t> bytes; };
+    std::unordered_map<std::string,HostWeight> host;
     std::string directory;
     std::unordered_map<std::string,std::unique_ptr<Weights>> shards;
     Impl(Runtime &rt,const std::string &path):rt(rt) {
@@ -563,6 +565,13 @@ const Tensor *Weights::optional(const std::string &name) {
 const Tensor &Weights::get(const std::string &name) {
     impl_->rt.activate();
     auto &i=*impl_; auto cached=i.cache.find(name); if(cached!=i.cache.end()) return cached->second;
+    auto saved=i.host.find(name);
+    if(saved!=i.host.end()) {
+        const auto &h=saved->second;
+        Tensor value(h.rows,h.cols,h.fp32);
+        copy(value.data,h.bytes.data(),h.bytes.size(),cudaMemcpyHostToDevice);
+        return i.cache.emplace(name,std::move(value)).first->second;
+    }
     auto meta=i.header[name]; if(meta.is_null()) throw std::runtime_error("missing HY-Nomas weight: "+name);
     if(!i.directory.empty()) {
         auto file=meta.string_value();
@@ -596,6 +605,18 @@ Tensor Weights::linear(const Tensor &x,const std::string &prefix,bool separateBi
     if(separateBias && bias) out=impl_->rt.bias(out,*bias);
     return out;
 }
-void Weights::clear() { impl_->cache.clear(); impl_->shards.clear(); }
+void Weights::clear() { impl_->cache.clear(); impl_->host.clear(); impl_->shards.clear(); }
+void Weights::offload() {
+    impl_->rt.activate();
+    for(const auto &entry:impl_->cache) {
+        if(impl_->host.count(entry.first)) continue;
+        const auto &x=entry.second;
+        Impl::HostWeight h{x.rows,x.cols,x.fp32,std::vector<uint8_t>(x.bytes())};
+        copy(h.bytes.data(),x.data,x.bytes(),cudaMemcpyDeviceToHost);
+        impl_->host.emplace(entry.first,std::move(h));
+    }
+    impl_->cache.clear();
+    for(auto &shard:impl_->shards) shard.second->offload();
+}
 
 }} // namespace fastllm::nomas

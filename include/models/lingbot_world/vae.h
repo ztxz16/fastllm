@@ -36,7 +36,9 @@ private:
 struct VAEState {
     std::unordered_map<std::string, nomas::Tensor> features;
     int height = 0, width = 0;
-
+    // -1 for arbitrary video; otherwise the processed image/zero-tail prefix,
+    // saturated after the encoder's 113-frame temporal receptive field.
+    int conditionFrames = -1;
 };
 
 class VAE {
@@ -48,6 +50,9 @@ public:
     // Decoder consumes any positive number of latent frames. Initial output
     // contains 1+4(k-1) frames, subsequent outputs contain 4k frames.
     Tensor encode(const Tensor &, int frames, int height, int width, VAEState &);
+    // Initial image followed exclusively by zero frames. The image is required
+    // only for an empty state. Stable encoder prefixes are reused exactly.
+    Tensor encodeCondition(const Tensor &image, int latentFrames, int height, int width, VAEState &);
     Tensor decode(const Tensor &, int frames, int height, int width, VAEState &);
 private:
     Tensor pointwise(const Tensor &, const std::string &);

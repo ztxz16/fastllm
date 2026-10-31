@@ -78,7 +78,7 @@ public:
     Tensor forward(const Tensor &latent, const Tensor &condition, const Tensor &text,
                    const Tensor *camera, float timestep, int frames, int height,
                    int width, Cache &cache, bool commit);
-    void unload() { weights_.clear(); full_.clear(); }
+    void unload() { weights_.offload(); full_.offload(); }
 private:
     Tensor block(int layer, const Tensor &input, const Tensor &time,
                  const Tensor &context, const Tensor *camera, int frames,

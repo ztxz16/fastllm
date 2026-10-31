@@ -94,9 +94,30 @@ VAE::Tensor VAE::resample(const Tensor &input,const std::string &p,int &t,int &h
     return x;
 }
 VAE::Tensor VAE::encodeChunk(const Tensor &input,int t,int h,int w,VAEState &s) {
-    auto x=causal(input,"encoder.conv1",t,h,w,s);
-    int layer=0;
-    for(int stage=0;stage<4;++stage) {
+    // Temporal receptive fields after the four encoder stages: 11, 21, 41,
+    // 73 input frames; middle + head extend this to 113. Spatial attention and
+    // normalization do not mix time. Once an entire four-frame input chunk
+    // lies beyond that prefix's receptive field, its output is stationary.
+    constexpr int stableAfter[]={10,20,40,72};
+    bool condition=s.conditionFrames>=0 && t==4;
+    auto key=[](int stage){return "condition.prefix."+std::to_string(stage);};
+    if(condition) {
+        auto found=s.features.find(key(4));
+        if(found!=s.features.end()) return found->second;
+    }
+    Tensor x;
+    int firstStage=0;
+    if(condition) for(int stage=3;stage>=0;--stage) {
+        auto found=s.features.find(key(stage));
+        if(found==s.features.end()) continue;
+        x=found->second; firstStage=stage+1;
+        h>>=std::min(firstStage,3); w>>=std::min(firstStage,3);
+        t>>=std::min(stage,2);
+        break;
+    }
+    if(!x.rows) x=causal(input,"encoder.conv1",t,h,w,s);
+    int layer=firstStage*3;
+    for(int stage=firstStage;stage<4;++stage) {
         for(int block=0;block<2;++block) {
             auto p="encoder.downsamples."+std::to_string(layer++);
             x=residual(x,p,t,h,w,s);
@@ -105,12 +126,32 @@ VAE::Tensor VAE::encodeChunk(const Tensor &input,int t,int h,int w,VAEState &s) 
             auto p="encoder.downsamples."+std::to_string(layer++);
             x=resample(x,p,t,h,w,false,stage>0,s);
         }
+        if(condition && s.conditionFrames>=stableAfter[stage]) {
+            s.features[key(stage)]=x;
+            // A stable prefix permanently replaces its upstream causal state.
+            // Do not keep high-resolution history alive or copy it each move.
+            const std::string down="encoder.downsamples.";
+            for(auto it=s.features.begin();it!=s.features.end();) {
+                const auto &name=it->first;
+                bool upstream=name=="encoder.conv1";
+                if(name.compare(0,down.size(),down)==0)
+                    upstream=std::stoi(name.substr(down.size()))<(stage+1)*3;
+                for(int earlier=0;earlier<stage;++earlier) upstream|=name==key(earlier);
+                if(upstream) it=s.features.erase(it); else ++it;
+            }
+        }
     }
     x=middle(x,"encoder.middle",t,h,w,s);
     x=rt_.activation(rt_.channelNorm(x,weights_.get("encoder.head.0.gamma")));
     x=causal(x,"encoder.head.2",t,h,w,s);
     x=pointwise(x,"conv1");
-    return rt_.latentScale(rt_.columns(x,0,16),false);
+    auto result=rt_.latentScale(rt_.columns(x,0,16),false);
+    if(condition && s.conditionFrames>=112) {
+        // No later condition chunk needs the causal history or larger prefix
+        // tensors. The remaining immutable latent also survives world rollback.
+        s.features.clear(); s.features.emplace(key(4),result);
+    }
+    return result;
 }
 VAE::Tensor VAE::decodeChunk(const Tensor &input,int h,int w,VAEState &s) {
     int t=1;
@@ -132,6 +173,7 @@ VAE::Tensor VAE::decodeChunk(const Tensor &input,int h,int w,VAEState &s) {
     return rt_.clampPixels(x);
 }
 VAE::Tensor VAE::encode(const Tensor &pixels,int t,int h,int w,VAEState &s) {
+    require(s.conditionFrames<0,"condition-only VAE state cannot encode arbitrary video");
     bool first=s.features.empty();
     require(t>0 && h>=8 && w>=8 && h%8==0 && w%8==0 && pixels.fp32 && pixels.cols==3 &&
             pixels.rows==t*h*w && (t-(first?1:0))%4==0,"invalid Wan VAE encoder input");
@@ -141,6 +183,30 @@ VAE::Tensor VAE::encode(const Tensor &pixels,int t,int h,int w,VAEState &s) {
         int frames=first && start==0?1:4;
         chunks.push_back(encodeChunk(pixels.rowSlice(start*h*w,frames*h*w),frames,h,w,s));
         start+=frames;
+    }
+    return rt_.concat(chunks);
+}
+VAE::Tensor VAE::encodeCondition(const Tensor &image,int count,int h,int w,VAEState &s) {
+    bool first=s.features.empty();
+    require(count>0 && h>=8 && w>=8 && h%8==0 && w%8==0,
+            "invalid Wan image condition shape");
+    require(first ? image.fp32 && image.cols==3 && image.rows==h*w : s.conditionFrames>=0,
+            "invalid Wan image condition state");
+    validateState(s,h,w);
+    std::vector<Tensor> chunks;
+    if(first) {
+        s.conditionFrames=0;
+        chunks.push_back(encodeChunk(image,1,h,w,s));
+        s.conditionFrames=1;
+    }
+    Tensor zeros;
+    while(int(chunks.size())<count) {
+        if(!zeros.rows && !s.features.count("condition.prefix.4")) {
+            std::vector<float> values(size_t(4)*h*w*3,0.f);
+            zeros=rt_.upload(values.data(),4*h*w,3);
+        }
+        chunks.push_back(encodeChunk(zeros,4,h,w,s));
+        s.conditionFrames=std::min(s.conditionFrames+4,113);
     }
     return rt_.concat(chunks);
 }

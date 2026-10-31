@@ -18,3 +18,11 @@ add_library(lingbot_world_test_ops SHARED EXCLUDE_FROM_ALL
 target_link_libraries(lingbot_world_test_ops PRIVATE fastllm_lingbot)
 set_target_properties(lingbot_world_test_ops PROPERTIES CXX_STANDARD 17
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+add_executable(lingbot_world_test_condition_cache EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/test/lingbot_world/test_condition_cache.cpp)
+target_link_libraries(lingbot_world_test_condition_cache PRIVATE fastllm_lingbot)
+set_target_properties(lingbot_world_test_condition_cache PROPERTIES CXX_STANDARD 17)
+add_executable(lingbot_world_test_pipeline_state EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/test/lingbot_world/test_pipeline_state.cpp)
+target_link_libraries(lingbot_world_test_pipeline_state PRIVATE fastllm_lingbot)
+set_target_properties(lingbot_world_test_pipeline_state PROPERTIES CXX_STANDARD 17)

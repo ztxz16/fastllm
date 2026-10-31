@@ -13,7 +13,7 @@ struct HostTensor {
 // stages so transactional world snapshots do not duplicate it on the GPU.
 struct HostVAEState {
     std::unordered_map<std::string,HostTensor> features;
-    int height=0,width=0;
+    int height=0,width=0,conditionFrames=-1;
 };
 struct HostDiTState {
     std::vector<HostTensor> keys,values,textKeys,textValues;
@@ -70,7 +70,7 @@ std::shared_ptr<const HostDiTState> offload(Runtime &rt,Cache &cache) {
 VAEState restore(VAERuntime &rt,const std::shared_ptr<const HostVAEState> &host) {
     VAEState state;
     if(!host) return state;
-    state.height=host->height; state.width=host->width;
+    state.height=host->height; state.width=host->width; state.conditionFrames=host->conditionFrames;
     try {
         for(const auto &entry:host->features) state.features[entry.first]=restoreTensor(entry.second);
         rt.synchronize();
@@ -79,7 +79,7 @@ VAEState restore(VAERuntime &rt,const std::shared_ptr<const HostVAEState> &host)
 }
 std::shared_ptr<const HostVAEState> offload(VAERuntime &rt,VAEState &state) {
     auto host=std::make_shared<HostVAEState>();
-    host->height=state.height; host->width=state.width;
+    host->height=state.height; host->width=state.width; host->conditionFrames=state.conditionFrames;
     try {
         for(const auto &entry:state.features) offloadTensor(entry.second,host->features[entry.first]);
         rt.synchronize();
@@ -93,8 +93,24 @@ Pipeline::Pipeline(const std::string &directory,int device,bool bf16Decode)
     tokenizer_(directory+"/google/umt5-xxl"),text_(rt_,directory+"/native/t5.safetensors"),
     dit_(rt_,directory+"/transformers"),vae_(vaeRt_,directory+"/native/vae.safetensors"),
     decoder_(decoderRt_,directory+"/native/vae.safetensors"),schedule_(fastSchedule()) {}
+void Pipeline::reserveWorkingMemory(size_t bytes) {
+    auto available=[&] {
+        rt_.synchronize();
+        size_t free=0,total=0;
+        auto status=cudaMemGetInfo(&free,&total);
+        if(status!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+        return free;
+    };
+    if(available()>=bytes) return;
+    residentCache_={}; residentCacheHost_.reset();
+    residentEncoder_={}; residentEncoderHost_.reset();
+    if(available()<bytes) dit_.unload();
+}
 Tensor Pipeline::encodePrompt(const std::string &prompt) {
     if(prompt.size()>16384) throw std::invalid_argument("LingBot prompt exceeds 16384 bytes");
+    residentCache_={}; residentCacheHost_.reset();
+    residentEncoder_={}; residentEncoderHost_.reset();
+    dit_.unload();
     try {
         auto features=text_.encode(tokenizer_.encode(prompt));
         text_.unload(); return features;
@@ -132,15 +148,15 @@ Segment Pipeline::step(WorldState &world,const std::string &action,const std::st
     auto emit=[&](const std::string &name,const Tensor &x) { if(trace) trace(name,x); };
     int h=next.height,w=next.width,lh=h/8,lw=w/8,n=3*lh*lw;
     if(progress) progress("image",0,1);
-    std::vector<float> zero(size_t(h)*w*3,0.f);
-    auto zeroFrame=rt_.fp32.upload(zero.data(),h*w,3);
-    std::vector<Tensor> inputs;
-    if(next.segments==0) inputs.push_back(next.firstPixels);
-    int frames=next.segments==0?9:12;
-    while(int(inputs.size())<frames) inputs.push_back(zeroFrame);
-    auto encoder=restore(vaeRt_,next.encoder);
-    auto condition=vae_.encode(rt_.concat(inputs),frames,h,w,encoder);
+    // Bound retained memory before the spatial encoder's working set grows.
+    reserveWorkingMemory(size_t(h)*w*16384 + (size_t(512)<<20));
+    auto encoder=next.encoder && residentEncoderHost_.lock()==next.encoder
+        ?residentEncoder_:restore(vaeRt_,next.encoder);
+    residentEncoder_={}; residentEncoderHost_.reset();
+    auto condition=vae_.encodeCondition(next.firstPixels,3,h,w,encoder);
+    residentEncoder_=encoder;
     next.encoder=offload(vaeRt_,encoder);
+    residentEncoderHost_=next.encoder;
     std::vector<float> mask(size_t(n)*4,0.f);
     if(next.segments==0) std::fill(mask.begin(),mask.begin()+size_t(lh)*lw*4,1.f);
     condition=rt_.join(rt_.fp32.upload(mask.data(),n,4),condition);
@@ -155,7 +171,9 @@ Segment Pipeline::step(WorldState &world,const std::string &action,const std::st
     auto camera=cameraEmbedding(rt_,relative,next.intrinsics,h,w);
     auto latent=rt_.normal(n,16,next.seed,next.noiseSequence++);
     emit("text",next.text); emit("condition",condition); emit("camera",camera); emit("latent.0",latent);
-    auto cache=restore(rt_,next.cache);
+    auto cache=next.cache && residentCacheHost_.lock()==next.cache
+        ?residentCache_:restore(rt_,next.cache);
+    residentCache_={}; residentCacheHost_.reset();
     if(changedPrompt) { cache.textKeys.clear(); cache.textValues.clear(); }
     for(size_t step=0;step<schedule_.size();++step) {
         if(progress) progress("denoise",step,schedule_.size());
@@ -175,11 +193,14 @@ Segment Pipeline::step(WorldState &world,const std::string &action,const std::st
     dit_.forward(latent,condition,next.text,&camera,0,3,lh,lw,cache,true);
     // Preserve raw BF16/FP32 bytes in an immutable world snapshot. Keeping the
     // rollback state on the host avoids duplicating full KV history on GPU.
+    residentCache_=cache;
     next.cache=offload(rt_,cache);
+    residentCacheHost_=next.cache;
     if(progress) progress("history",1,1);
-    // Pixel decoding expands the spatial working set substantially. Keep the
-    // persistent world history, but release DiT weights between model stages.
-    dit_.unload();
+    // Prefer keeping DiT weights over KV snapshots: reloading the FP32
+    // checkpoint also converts and uploads several GB on every move. Retain
+    // them only when the decoder has a conservative spatial memory reserve.
+    reserveWorkingMemory(size_t(h)*w*32768 + (size_t(512)<<20));
     rt_.synchronize();
     if(progress) progress("decode",0,1);
     auto decoder=restore(decoderRt_,next.decoder);

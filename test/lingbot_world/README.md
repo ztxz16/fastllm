@@ -123,3 +123,17 @@ python3 test/lingbot_world/compare_pipeline.py \
 连续推演的 `--trace` 仅用于上述同输入、同噪声的精度回归，不启用逐层张量导出。原始张量、日志和生成帧应保存在仓库外，不提交到源码。
 
 当验证设备的空闲显存不足以常驻官方 DiT 权重时，连续推演对照可加 `--offload-reference`。它在每个官方 Transformer 块调用前后搬运权重，并关闭 autocast 的权重副本缓存；权重类型、算子及误差门槛不变。
+
+## 条件缓存与状态回归
+
+图像条件使用首帧加补零帧。`lingbot_world_test_condition_cache` 对比通用因果编码器与逐层条件缓存，覆盖两张独立图片、不同分块方式、超过完整时间感受野的序列，以及快照重放；全部结果要求逐位一致。
+
+```bash
+cmake --build build-lingbot --target lingbot_world_test_condition_cache lingbot_world_test_pipeline_state -j
+build-lingbot/src/models/lingbot_world/lingbot_world_test_condition_cache \
+  "$MODEL_DIR/native/vae.safetensors" 64 96
+build-lingbot/src/models/lingbot_world/lingbot_world_test_pipeline_state \
+  "$MODEL_DIR" "$RESULT_DIR/trace" 320 576
+```
+
+第二项使用生成器 trace 中的 `first_image.f32`、`0.text.f32`，宽高应与该 trace 一致。它检查不同场景分支交替执行、生成完成前取消、重试和旧快照恢复，要求画面与成功路径逐位一致。图像条件缓存不能用于任意视频输入；通用 `VAE::encode` 仍保留独立路径。

@@ -52,6 +52,13 @@ public:
     Runtime &runtime() { return rt_; }
 private:
     Tensor encodePrompt(const std::string &);
+    void reserveWorkingMemory(size_t bytes);
+    // One active world may retain its immutable GPU snapshots. CPU snapshots
+    // remain authoritative for rollback, world switching and low-memory eviction.
+    std::weak_ptr<const HostDiTState> residentCacheHost_;
+    std::weak_ptr<const HostVAEState> residentEncoderHost_;
+    Cache residentCache_;
+    VAEState residentEncoder_;
     Runtime rt_;
     VAERuntime vaeRt_, decoderRt_;
     Tokenizer tokenizer_;

@@ -88,6 +88,8 @@ public:
     const Tensor *optional(const std::string &name);
     Tensor linear(const Tensor &x, const std::string &prefix, bool separateBias = false);
     void clear();
+    // Optional lossless host cache for callers that swap model stages.
+    void offload();
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
